@@ -1,0 +1,14 @@
+{
+  "name": "@native-im/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/copy-renderer.mjs",
+    "start": "electron dist/main.js"
+  },
+  "devDependencies": {
+    "electron": "^37.2.6"
+  }
+}
+
