@@ -8,6 +8,7 @@ type RendererUnderTest = {
     messages: readonly unknown[],
     actorsById: ReadonlyMap<string, unknown>,
   ) => void;
+  renderVisualSeparationPreview?: (root: HTMLElement) => void;
 };
 
 const app = importedApp as unknown as RendererUnderTest;
@@ -26,6 +27,107 @@ describe("empty group chat renderer", () => {
 });
 
 describe("message timeline renderer", () => {
+  it("renders a review fixture with both message forms and an overflow agent", () => {
+    const root = document.createElement("main");
+
+    expect(app.renderVisualSeparationPreview).toBeTypeOf("function");
+    app.renderVisualSeparationPreview?.(root);
+
+    expect(root.dataset.testid).toBe("visual-separation-preview");
+    expect(root.querySelector("[data-message-kind='human'] .message-bubble")).not.toBeNull();
+    expect(root.querySelector("[data-message-kind='agent'] .message-role-rail")).not.toBeNull();
+    const agents = Array.from(root.querySelectorAll<HTMLElement>("[data-message-kind='agent']"));
+
+    expect(agents).toHaveLength(6);
+    expect(agents[4]?.querySelector(".message-avatar--agent-overflow")).toBeNull();
+    expect(agents[5]?.querySelector(".message-avatar--agent-overflow")).not.toBeNull();
+  });
+
+  it("renders the same text as different DOM forms for a human and an agent", () => {
+    const root = document.createElement("main");
+    const sharedBody = "请确认这项协作约定。";
+    const messages = [
+      {
+        id: "message-human-shared-body",
+        roomId: "room-product",
+        authorId: "human-li",
+        authorKind: "human" as const,
+        body: sharedBody,
+        sentAt: "2026-08-06T15:00:00.000Z",
+      },
+      {
+        id: "message-agent-shared-body",
+        roomId: "room-product",
+        authorId: "agent-security",
+        authorKind: "agent" as const,
+        body: sharedBody,
+        sentAt: "2026-08-06T15:01:00.000Z",
+      },
+    ];
+    const actorsById = new Map<string, unknown>([
+      [
+        "human-li",
+        { id: "human-li", kind: "human", displayName: "李乐", reachability: "online" },
+      ],
+      [
+        "agent-security",
+        {
+          id: "agent-security",
+          kind: "agent",
+          displayName: "安全 Agent",
+          readiness: "ready",
+          toolPermissions: ["knowledge-base"],
+        },
+      ],
+    ]);
+
+    app.renderMessageTimeline?.(root, messages, actorsById);
+
+    const human = root.querySelector<HTMLElement>("[data-message-kind='human']");
+    const agent = root.querySelector<HTMLElement>("[data-message-kind='agent']");
+
+    expect(human?.textContent).toContain(sharedBody);
+    expect(agent?.textContent).toContain(sharedBody);
+    expect(human?.classList.contains("message--human")).toBe(true);
+    expect(agent?.classList.contains("message--agent")).toBe(true);
+    expect(human?.querySelector(".message-bubble")).not.toBeNull();
+    expect(agent?.querySelector(".message-role-rail")).not.toBeNull();
+  });
+
+  it("uses five role-colour slots before adding an overflow identity pattern", () => {
+    const root = document.createElement("main");
+    const messages = Array.from({ length: 6 }, (_, index) => ({
+      id: `message-agent-${index + 1}`,
+      roomId: "room-product",
+      authorId: `agent-${index + 1}`,
+      authorKind: "agent" as const,
+      body: "视觉编码检查。",
+      sentAt: `2026-08-06T15:0${index}:00.000Z`,
+    }));
+    const actorsById = new Map<string, unknown>(
+      Array.from({ length: 6 }, (_, index) => [
+        `agent-${index + 1}`,
+        {
+          id: `agent-${index + 1}`,
+          kind: "agent",
+          displayName: `Role ${index + 1} Agent`,
+          readiness: "ready",
+          toolPermissions: ["knowledge-base"],
+        },
+      ]),
+    );
+
+    app.renderMessageTimeline?.(root, messages, actorsById);
+
+    const agents = Array.from(root.querySelectorAll<HTMLElement>("[data-message-kind='agent']"));
+    const paletteSlots = new Set(agents.map((agent) => agent.dataset.agentPaletteSlot));
+
+    expect(agents).toHaveLength(6);
+    expect(paletteSlots.size).toBe(5);
+    expect(agents[5]?.dataset.agentIdentityFallback).toBe("pattern-and-initial");
+    expect(agents[5]?.querySelector(".message-avatar--agent-overflow")).not.toBeNull();
+  });
+
   it("renders people and agents as deliberately different message forms", () => {
     const root = document.createElement("main");
     const humanMessage = {
@@ -218,6 +320,7 @@ describe("message timeline renderer", () => {
 
     const rendered = root.querySelectorAll<HTMLElement>("[data-message-kind='agent']");
     expect(rendered).toHaveLength(2);
+    expect(rendered[0]?.querySelector(".message-author")?.textContent).toBe("Agent");
     expect(rendered[0]?.querySelector(".message-role-label")?.textContent).toBe("Research Agent");
     expect(rendered[1]?.querySelector(".message-role-label")?.textContent).toBe("Security Agent");
     expect(rendered[0]?.style.getPropertyValue("--message-role-colour")).not.toBe(
