@@ -38,6 +38,13 @@ export interface Message {
   readonly sentAt: string;
 }
 
+export interface MessageAcceptedAck {
+  readonly type: "message.accepted";
+  readonly requestId: string;
+  readonly messageId: string;
+  readonly persistedAt: string;
+}
+
 export interface Room {
   readonly id: string;
   readonly name: string;
@@ -123,6 +130,16 @@ export function isMessage(value: unknown): value is Message {
     isActorKind(value.authorKind) &&
     hasString(value, "body") &&
     hasString(value, "sentAt")
+  );
+}
+
+export function isMessageAcceptedAck(value: unknown): value is MessageAcceptedAck {
+  return (
+    isRecord(value) &&
+    value.type === "message.accepted" &&
+    hasString(value, "requestId") &&
+    hasString(value, "messageId") &&
+    hasString(value, "persistedAt")
   );
 }
 

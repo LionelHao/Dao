@@ -6,6 +6,7 @@ type DomainUnderTest = {
   isAgentActor?: (value: unknown) => boolean;
   isEvent?: (value: unknown) => boolean;
   isHumanActor?: (value: unknown) => boolean;
+  isMessageAcceptedAck?: (value: unknown) => boolean;
   isMessage?: (value: unknown) => boolean;
   isRoom?: (value: unknown) => boolean;
 };
@@ -69,5 +70,23 @@ describe("domain kernel guards", () => {
         createdAt: "2026-08-06T00:00:00.000Z",
       }),
     ).toBe(true);
+  });
+
+  it("accepts acknowledgements only after message persistence", () => {
+    expect(
+      domain.isMessageAcceptedAck?.({
+        type: "message.accepted",
+        requestId: "req-1",
+        messageId: "message-1",
+        persistedAt: "2026-08-06T00:00:00.000Z",
+      }),
+    ).toBe(true);
+    expect(
+      domain.isMessageAcceptedAck?.({
+        type: "message.accepted",
+        requestId: "req-1",
+        messageId: "message-1",
+      }),
+    ).toBe(false);
   });
 });
