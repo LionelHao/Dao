@@ -3,7 +3,19 @@ import type { StateStore } from "./state-store.js";
 
 const DEFAULT_ACCESS_TTL_MS = 15 * 60 * 1_000;
 const DEFAULT_REFRESH_TTL_MS = 30 * 24 * 60 * 60 * 1_000;
-const SHA256_BASE64URL = /^[A-Za-z0-9_-]{43}$/;
+const DUMMY_SCRYPT_SALT = Buffer.from("native-im-auth-dummy-salt-v1", "utf8");
+const DUMMY_SCRYPT_HASH = Buffer.alloc(64);
+const SESSION_STATE_FIELDS = new Set(["version", "sessions"]);
+const SESSION_RECORD_FIELDS = new Set([
+  "familyId",
+  "accountId",
+  "actorId",
+  "accessTokenHash",
+  "refreshTokenHash",
+  "accessExpiresAt",
+  "refreshExpiresAt",
+  "revokedAt",
+]);
 
 export interface LoginCredentials {
   readonly accountId: string;
@@ -95,17 +107,35 @@ function isFiniteTimestamp(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
+function hasOnlyFields(
+  value: Record<string, unknown>,
+  allowedFields: ReadonlySet<string>,
+): boolean {
+  return Reflect.ownKeys(value).every(
+    (key) => typeof key === "string" && allowedFields.has(key),
+  );
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
 function isTokenHash(value: unknown): value is string {
-  return typeof value === "string" && SHA256_BASE64URL.test(value);
+  if (typeof value !== "string") {
+    return false;
+  }
+
+  const decoded = Buffer.from(value, "base64url");
+  return decoded.length === 32 && decoded.toString("base64url") === value;
 }
 
 function isSessionRecord(value: unknown): value is SessionRecord {
   return (
     isRecord(value) &&
-    typeof value.familyId === "string" &&
+    hasOnlyFields(value, SESSION_RECORD_FIELDS) &&
     isTokenHash(value.familyId) &&
-    typeof value.accountId === "string" &&
-    typeof value.actorId === "string" &&
+    isNonEmptyString(value.accountId) &&
+    isNonEmptyString(value.actorId) &&
     isTokenHash(value.accessTokenHash) &&
     isTokenHash(value.refreshTokenHash) &&
     isFiniteTimestamp(value.accessExpiresAt) &&
@@ -115,12 +145,46 @@ function isSessionRecord(value: unknown): value is SessionRecord {
 }
 
 export function isSessionState(value: unknown): value is SessionState {
-  return (
-    isRecord(value) &&
-    value.version === 1 &&
-    Array.isArray(value.sessions) &&
-    value.sessions.every(isSessionRecord)
-  );
+  if (
+    !isRecord(value) ||
+    !hasOnlyFields(value, SESSION_STATE_FIELDS) ||
+    value.version !== 1 ||
+    !Array.isArray(value.sessions) ||
+    !value.sessions.every(isSessionRecord)
+  ) {
+    return false;
+  }
+
+  const tokenHashes = new Set<string>();
+  const familyPrincipals = new Map<
+    string,
+    { readonly accountId: string; readonly actorId: string }
+  >();
+  for (const session of value.sessions) {
+    if (
+      session.accessTokenHash === session.refreshTokenHash ||
+      tokenHashes.has(session.accessTokenHash) ||
+      tokenHashes.has(session.refreshTokenHash)
+    ) {
+      return false;
+    }
+    tokenHashes.add(session.accessTokenHash);
+    tokenHashes.add(session.refreshTokenHash);
+
+    const principal = familyPrincipals.get(session.familyId);
+    if (
+      principal !== undefined &&
+      (principal.accountId !== session.accountId || principal.actorId !== session.actorId)
+    ) {
+      return false;
+    }
+    familyPrincipals.set(session.familyId, {
+      accountId: session.accountId,
+      actorId: session.actorId,
+    });
+  }
+
+  return true;
 }
 
 function derivePassword(secret: string, salt: Buffer, keyLength: number): Promise<Buffer> {
@@ -143,21 +207,25 @@ export function createScryptIdentityAdapter(
   return {
     async verify(credentials: LoginCredentials) {
       const account = accountsById.get(credentials.accountId);
-      if (account === undefined) {
-        return undefined;
-      }
-
-      const expectedHash = Buffer.from(account.hash, "base64url");
-      if (expectedHash.length === 0) {
-        return undefined;
-      }
+      const configuredHash =
+        account === undefined ? undefined : Buffer.from(account.hash, "base64url");
+      const hasUsableRecord =
+        account !== undefined && configuredHash !== undefined && configuredHash.length !== 0;
+      const expectedHash =
+        configuredHash !== undefined && configuredHash.length !== 0
+          ? configuredHash
+          : DUMMY_SCRYPT_HASH;
+      const salt =
+        account !== undefined && configuredHash !== undefined && configuredHash.length !== 0
+        ? Buffer.from(account.salt, "base64url")
+        : DUMMY_SCRYPT_SALT;
 
       const actualHash = await derivePassword(
         credentials.secret,
-        Buffer.from(account.salt, "base64url"),
+        salt,
         expectedHash.length,
       );
-      if (!timingSafeEqual(actualHash, expectedHash)) {
+      if (!timingSafeEqual(actualHash, expectedHash) || !hasUsableRecord) {
         return undefined;
       }
 
@@ -195,9 +263,15 @@ export function createAuthenticationService(
   }
 
   let state: SessionState | undefined;
-  const initialized = options.sessions.load().then((loaded) => {
-    state = loaded ?? { version: 1, sessions: [] };
-  });
+  let initializationFailure: { readonly error: unknown } | undefined;
+  const initialized = options.sessions.load().then(
+    (loaded) => {
+      state = loaded ?? { version: 1, sessions: [] };
+    },
+    (error: unknown) => {
+      initializationFailure = { error };
+    },
+  );
   let operationQueue = Promise.resolve();
 
   function runExclusive<Result>(
@@ -205,6 +279,9 @@ export function createAuthenticationService(
   ): Promise<Result> {
     const result = operationQueue.then(async () => {
       await initialized;
+      if (initializationFailure !== undefined) {
+        throw initializationFailure.error;
+      }
       if (state === undefined) {
         throw new Error("authentication state failed to initialize");
       }

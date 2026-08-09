@@ -1,16 +1,20 @@
+import { createHook } from "node:async_hooks";
 import { createHash, scryptSync } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   createAuthenticationService,
   createJsonStateStore,
   createScryptIdentityAdapter,
   isSessionState,
+  StateStoreCorruptionError,
   type IdentityAdapter,
   type LoginCredentials,
   type PasswordIdentityRecord,
+  type SessionState,
+  type StateStore,
 } from "./index.js";
 
 const accounts = new Map([
@@ -34,8 +38,289 @@ function createTokenFactory(prefix: string): () => string {
   return () => `${prefix}-${++sequence}`;
 }
 
+function tokenHash(value: string): string {
+  return createHash("sha256").update(value).digest("base64url");
+}
+
+function sessionRecord(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    familyId: tokenHash("family-access-token"),
+    accountId: "account-li",
+    actorId: "human-li",
+    accessTokenHash: tokenHash("access-token"),
+    refreshTokenHash: tokenHash("refresh-token"),
+    accessExpiresAt: 1_000,
+    refreshExpiresAt: 10_000,
+    ...overrides,
+  };
+}
+
+async function countScryptRequests(operation: () => Promise<unknown>): Promise<number> {
+  let requests = 0;
+  const hook = createHook({
+    init(_asyncId, type) {
+      if (type === "SCRYPTREQUEST") {
+        requests += 1;
+      }
+    },
+  });
+
+  hook.enable();
+  try {
+    await operation();
+  } finally {
+    hook.disable();
+  }
+  return requests;
+}
+
+class FailingSessionStore implements StateStore<SessionState> {
+  private state: SessionState | undefined;
+  private nextSaveError: unknown;
+
+  async load(): Promise<SessionState | undefined> {
+    return this.state;
+  }
+
+  async save(value: SessionState): Promise<void> {
+    if (this.nextSaveError !== undefined) {
+      const error = this.nextSaveError;
+      this.nextSaveError = undefined;
+      throw error;
+    }
+    this.state = value;
+  }
+
+  failNextSave(error: unknown): void {
+    this.nextSaveError = error;
+  }
+}
+
+describe("session state authority guard", () => {
+  it("rejects unexpected top-level fields", () => {
+    expect(
+      isSessionState({ version: 1, sessions: [], secret: "must-not-be-state" }),
+    ).toBe(false);
+  });
+
+  it.each([
+    { field: "accessToken", value: "raw-access-token" },
+    { field: "refreshToken", value: "raw-refresh-token" },
+    { field: "secret", value: "raw-credential" },
+  ])("rejects a raw $field field on a session record", ({ field, value }) => {
+    expect(
+      isSessionState({
+        version: 1,
+        sessions: [sessionRecord({ [field]: value })],
+      }),
+    ).toBe(false);
+  });
+
+  it.each([
+    { field: "accountId", value: "" },
+    { field: "actorId", value: "   " },
+  ])("rejects an empty $field binding", ({ field, value }) => {
+    expect(
+      isSessionState({
+        version: 1,
+        sessions: [sessionRecord({ [field]: value })],
+      }),
+    ).toBe(false);
+  });
+
+  it.each([
+    { field: "familyId", value: `${"A".repeat(42)}B` },
+    { field: "accessTokenHash", value: `${"A".repeat(42)}B` },
+    { field: "refreshTokenHash", value: `${"A".repeat(42)}B` },
+  ])("rejects a non-canonical $field", ({ field, value }) => {
+    expect(
+      isSessionState({
+        version: 1,
+        sessions: [sessionRecord({ [field]: value })],
+      }),
+    ).toBe(false);
+  });
+
+  it("rejects the same hash used for access and refresh within one record", () => {
+    const duplicateHash = tokenHash("duplicate-token");
+    expect(
+      isSessionState({
+        version: 1,
+        sessions: [
+          sessionRecord({
+            accessTokenHash: duplicateHash,
+            refreshTokenHash: duplicateHash,
+          }),
+        ],
+      }),
+    ).toBe(false);
+  });
+
+  it("rejects duplicate access hashes across records", () => {
+    const duplicateHash = tokenHash("duplicate-access-token");
+    expect(
+      isSessionState({
+        version: 1,
+        sessions: [
+          sessionRecord({ accessTokenHash: duplicateHash }),
+          sessionRecord({
+            familyId: tokenHash("second-family"),
+            accessTokenHash: duplicateHash,
+            refreshTokenHash: tokenHash("second-refresh-token"),
+          }),
+        ],
+      }),
+    ).toBe(false);
+  });
+
+  it("rejects duplicate refresh hashes across records", () => {
+    const duplicateHash = tokenHash("duplicate-refresh-token");
+    expect(
+      isSessionState({
+        version: 1,
+        sessions: [
+          sessionRecord({ refreshTokenHash: duplicateHash }),
+          sessionRecord({
+            familyId: tokenHash("second-family"),
+            accessTokenHash: tokenHash("second-access-token"),
+            refreshTokenHash: duplicateHash,
+          }),
+        ],
+      }),
+    ).toBe(false);
+  });
+
+  it("rejects a cross-kind collision between refresh and access hashes", () => {
+    const collision = tokenHash("cross-kind-token");
+    expect(
+      isSessionState({
+        version: 1,
+        sessions: [
+          sessionRecord({ refreshTokenHash: collision }),
+          sessionRecord({
+            familyId: tokenHash("second-family"),
+            accessTokenHash: collision,
+            refreshTokenHash: tokenHash("second-refresh-token"),
+          }),
+        ],
+      }),
+    ).toBe(false);
+  });
+
+  it.each([
+    { field: "accountId", value: "account-ada" },
+    { field: "actorId", value: "human-ada" },
+  ])("rejects a conflicting family $field binding", ({ field, value }) => {
+    const familyId = tokenHash("shared-family");
+    expect(
+      isSessionState({
+        version: 1,
+        sessions: [
+          sessionRecord({ familyId }),
+          sessionRecord({
+            familyId,
+            accessTokenHash: tokenHash("second-access-token"),
+            refreshTokenHash: tokenHash("second-refresh-token"),
+            [field]: value,
+          }),
+        ],
+      }),
+    ).toBe(false);
+  });
+
+  it("rejects persisted ambiguous session state as corruption", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-auth-guard-"));
+    const sessionPath = join(directory, "sessions", "state.json");
+    const duplicateHash = tokenHash("persisted-duplicate-token");
+
+    try {
+      await mkdir(dirname(sessionPath), { recursive: true });
+      await writeFile(
+        sessionPath,
+        JSON.stringify({
+          version: 1,
+          sessions: [
+            sessionRecord({ accessTokenHash: duplicateHash }),
+            sessionRecord({
+              familyId: tokenHash("persisted-second-family"),
+              accessTokenHash: duplicateHash,
+              refreshTokenHash: tokenHash("persisted-second-refresh"),
+            }),
+          ],
+        }),
+        "utf8",
+      );
+
+      const store = createJsonStateStore(sessionPath, isSessionState);
+      await expect(store.load()).rejects.toMatchObject({
+        name: "StateStoreCorruptionError",
+        filePath: sessionPath,
+      });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("authentication service", () => {
-  it("survives restart, rotates refresh tokens, detects replay, and revokes the family", async () => {
+  it("handles initialization corruption before the first operation and reuses the exact error", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-auth-init-"));
+    const sessionPath = join(directory, "sessions.json");
+    const unhandledReasons: unknown[] = [];
+    const listenerCountBefore = process.listenerCount("unhandledRejection");
+    const onUnhandledRejection = (reason: unknown) => {
+      unhandledReasons.push(reason);
+    };
+    let loadSettled!: () => void;
+    const loadWasAttempted = new Promise<void>((resolve) => {
+      loadSettled = resolve;
+    });
+    let initializationError: unknown;
+
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      await writeFile(sessionPath, "{not-json}", "utf8");
+      const jsonStore = createJsonStateStore(sessionPath, isSessionState);
+      const service = createAuthenticationService({
+        identities: testIdentityAdapter,
+        sessions: {
+          async load() {
+            try {
+              return await jsonStore.load();
+            } catch (error: unknown) {
+              initializationError = error;
+              throw error;
+            } finally {
+              loadSettled();
+            }
+          },
+          save: (value) => jsonStore.save(value),
+        },
+        tokenFactory: createTokenFactory("corrupt-state-token"),
+      });
+
+      await loadWasAttempted;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(unhandledReasons).toEqual([]);
+      expect(initializationError).toBeInstanceOf(StateStoreCorruptionError);
+
+      for (const operation of [
+        () => service.login({ accountId: "account-li", secret: "correct-li" }),
+        () => service.authenticate("access-token"),
+        () => service.refresh("refresh-token"),
+        () => service.revoke("access-token"),
+      ]) {
+        await expect(operation()).rejects.toBe(initializationError);
+      }
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+      await rm(directory, { recursive: true, force: true });
+    }
+
+    expect(process.listenerCount("unhandledRejection")).toBe(listenerCountBefore);
+  });
+
+  it("survives restart and revokes the rotated family after refresh replay", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-auth-"));
     const sessionPath = join(directory, "sessions", "state.json");
     const tokenFactory = createTokenFactory("restart-token");
@@ -89,9 +374,44 @@ describe("authentication service", () => {
         status: 403,
         code: "session_revoked",
       });
-
-      await afterServerRestart.revoke(rotated.accessToken);
       await expect(afterServerRestart.authenticate(rotated.accessToken)).rejects.toMatchObject({
+        status: 403,
+        code: "session_revoked",
+      });
+      await expect(afterServerRestart.refresh(rotated.refreshToken)).rejects.toMatchObject({
+        status: 403,
+        code: "session_revoked",
+      });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("explicitly revokes both tokens in a fresh active family", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-auth-revoke-"));
+    const sessionPath = join(directory, "sessions.json");
+
+    try {
+      const service = createAuthenticationService({
+        identities: testIdentityAdapter,
+        sessions: createJsonStateStore(sessionPath, isSessionState),
+        tokenFactory: createTokenFactory("explicit-revoke-token"),
+      });
+      const issued = await service.login({
+        accountId: "account-ada",
+        secret: "correct-ada",
+      });
+
+      await expect(service.authenticate(issued.accessToken)).resolves.toEqual({
+        accountId: "account-ada",
+        actorId: "human-ada",
+      });
+      await service.revoke(issued.accessToken);
+      await expect(service.authenticate(issued.accessToken)).rejects.toMatchObject({
+        status: 403,
+        code: "session_revoked",
+      });
+      await expect(service.refresh(issued.refreshToken)).rejects.toMatchObject({
         status: 403,
         code: "session_revoked",
       });
@@ -211,9 +531,155 @@ describe("authentication service", () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+
+  it("does not publish a login session when persistence rejects", async () => {
+    const sessions = new FailingSessionStore();
+    const persistenceError = new Error("login persistence failed");
+    const service = createAuthenticationService({
+      identities: testIdentityAdapter,
+      sessions,
+      tokenFactory: createTokenFactory("failed-login-token"),
+    });
+
+    sessions.failNextSave(persistenceError);
+    await expect(
+      service.login({ accountId: "account-li", secret: "correct-li" }),
+    ).rejects.toBe(persistenceError);
+    await expect(service.authenticate("failed-login-token-1")).rejects.toMatchObject({
+      status: 401,
+      code: "invalid_token",
+    });
+
+    const retried = await service.login({
+      accountId: "account-li",
+      secret: "correct-li",
+    });
+    await expect(service.authenticate(retried.accessToken)).resolves.toMatchObject({
+      actorId: "human-li",
+    });
+  });
+
+  it("does not publish refresh rotation when persistence rejects", async () => {
+    const sessions = new FailingSessionStore();
+    const persistenceError = new Error("refresh persistence failed");
+    const service = createAuthenticationService({
+      identities: testIdentityAdapter,
+      sessions,
+      tokenFactory: createTokenFactory("failed-refresh-token"),
+    });
+    const issued = await service.login({
+      accountId: "account-li",
+      secret: "correct-li",
+    });
+
+    sessions.failNextSave(persistenceError);
+    await expect(service.refresh(issued.refreshToken)).rejects.toBe(persistenceError);
+    await expect(service.authenticate(issued.accessToken)).resolves.toMatchObject({
+      actorId: "human-li",
+    });
+    await expect(service.authenticate("failed-refresh-token-3")).rejects.toMatchObject({
+      status: 401,
+      code: "invalid_token",
+    });
+    await expect(service.refresh(issued.refreshToken)).resolves.toMatchObject({
+      actorId: "human-li",
+    });
+  });
+
+  it("does not publish family revocation when persistence rejects", async () => {
+    const sessions = new FailingSessionStore();
+    const persistenceError = new Error("revoke persistence failed");
+    const service = createAuthenticationService({
+      identities: testIdentityAdapter,
+      sessions,
+      tokenFactory: createTokenFactory("failed-revoke-token"),
+    });
+    const issued = await service.login({
+      accountId: "account-ada",
+      secret: "correct-ada",
+    });
+
+    sessions.failNextSave(persistenceError);
+    await expect(service.revoke(issued.accessToken)).rejects.toBe(persistenceError);
+    await expect(service.authenticate(issued.accessToken)).resolves.toMatchObject({
+      actorId: "human-ada",
+    });
+    await expect(service.refresh(issued.refreshToken)).resolves.toMatchObject({
+      actorId: "human-ada",
+    });
+  });
+
+  it("expires an access token at its exact expiry boundary", async () => {
+    const sessions = new FailingSessionStore();
+    let now = 1_000;
+    const service = createAuthenticationService({
+      identities: testIdentityAdapter,
+      sessions,
+      clock: () => now,
+      tokenFactory: createTokenFactory("boundary-expiry-token"),
+      accessTtlMs: 1_000,
+      refreshTtlMs: 2_000,
+    });
+    const issued = await service.login({
+      accountId: "account-li",
+      secret: "correct-li",
+    });
+
+    now = 2_000;
+    await expect(service.authenticate(issued.accessToken)).rejects.toMatchObject({
+      status: 401,
+      code: "token_expired",
+    });
+  });
+
+  it("expires a refresh token at its exact expiry boundary", async () => {
+    const sessions = new FailingSessionStore();
+    let now = 1_000;
+    const service = createAuthenticationService({
+      identities: testIdentityAdapter,
+      sessions,
+      clock: () => now,
+      tokenFactory: createTokenFactory("refresh-boundary-expiry-token"),
+      accessTtlMs: 1_000,
+      refreshTtlMs: 2_000,
+    });
+    const issued = await service.login({
+      accountId: "account-li",
+      secret: "correct-li",
+    });
+
+    now = 3_000;
+    await expect(service.refresh(issued.refreshToken)).rejects.toMatchObject({
+      status: 401,
+      code: "token_expired",
+    });
+  });
 });
 
 describe("scrypt identity adapter", () => {
+  it("performs the same scrypt workload before rejecting a missing account", async () => {
+    const salt = Buffer.from("identity-salt", "utf8").toString("base64url");
+    const record: PasswordIdentityRecord = {
+      accountId: "account-li",
+      actorId: "human-li",
+      salt,
+      hash: scryptSync("correct-li", Buffer.from(salt, "base64url"), 64).toString(
+        "base64url",
+      ),
+    };
+    const identities = createScryptIdentityAdapter([record]);
+
+    const knownAccountRequests = await countScryptRequests(() =>
+      identities.verify({ accountId: "account-li", secret: "wrong" }),
+    );
+    const missingAccountRequests = await countScryptRequests(() =>
+      identities.verify({ accountId: "missing", secret: "wrong" }),
+    );
+
+    expect(knownAccountRequests).toBe(1);
+    expect(missingAccountRequests).toBe(knownAccountRequests);
+  });
+
   it("verifies a salt/hash password record without storing plaintext credentials", async () => {
     const salt = Buffer.from("identity-salt", "utf8").toString("base64url");
     const record: PasswordIdentityRecord = {

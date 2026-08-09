@@ -61,6 +61,7 @@ describe("JSON state store", () => {
 
       await expect(store.load()).rejects.toBeInstanceOf(StateStoreCorruptionError);
       await expect(store.load()).rejects.toMatchObject({ filePath });
+      await expect(store.load()).rejects.toThrow(`Invalid state at ${filePath}`);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

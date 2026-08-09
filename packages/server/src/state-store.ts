@@ -10,7 +10,7 @@ export class StateStoreCorruptionError extends Error {
   readonly filePath: string;
 
   constructor(filePath: string) {
-    super(`Invalid JSON state at ${filePath}`);
+    super(`Invalid state at ${filePath}`);
     this.name = "StateStoreCorruptionError";
     this.filePath = filePath;
   }
