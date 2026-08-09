@@ -115,21 +115,38 @@ describe("domain kernel guards", () => {
     expect(domain.isAgentConfigurationRequest?.(agentJoin)).toBe(true);
     expect(domain.isHumanInvitationRequest?.(agentJoin)).toBe(false);
     expect(domain.isAgentConfigurationRequest?.(humanJoin)).toBe(false);
+  });
+
+  it.each([
+    ["agentId", "agent-search"],
+    ["participation", "active"],
+    ["toolPermissions", ["search"]],
+  ])("rejects %s on human invitations", (field, value) => {
     expect(
       domain.isHumanInvitationRequest?.({
-        ...humanJoin,
-        agentId: "agent-search",
-        participation: "active",
-        toolPermissions: ["search"],
-      }),
-    ).toBe(false);
-    expect(
-      domain.isAgentConfigurationRequest?.({
-        ...agentJoin,
+        kind: "human-invitation",
+        roomId: "room-1",
         inviteeActorId: "human-2",
+        [field]: value,
       }),
     ).toBe(false);
   });
+
+  it.each([["inviteeActorId", "human-2"]])(
+    "rejects %s on agent configurations",
+    (field, value) => {
+      expect(
+        domain.isAgentConfigurationRequest?.({
+          kind: "agent-configuration",
+          roomId: "room-1",
+          agentId: "agent-search",
+          participation: "active",
+          toolPermissions: ["search"],
+          [field]: value,
+        }),
+      ).toBe(false);
+    },
+  );
 
   it("keeps human and agent room memberships distinct", () => {
     const humanMembership = {
@@ -152,18 +169,36 @@ describe("domain kernel guards", () => {
     expect(domain.isAgentRoomMembership?.(agentMembership)).toBe(true);
     expect(domain.isHumanRoomMembership?.(agentMembership)).toBe(false);
     expect(domain.isAgentRoomMembership?.(humanMembership)).toBe(false);
+  });
+
+  it.each([
+    ["participation", "active"],
+    ["toolPermissions", ["search"]],
+    ["configuredAt", "2026-08-09T00:00:00.000Z"],
+  ])("rejects %s on human room memberships", (field, value) => {
     expect(
       domain.isHumanRoomMembership?.({
-        ...humanMembership,
-        participation: "active",
-        toolPermissions: ["search"],
-      }),
-    ).toBe(false);
-    expect(
-      domain.isAgentRoomMembership?.({
-        ...agentMembership,
+        kind: "human",
+        actorId: "human-2",
         role: "member",
         joinedAt: "2026-08-09T00:00:00.000Z",
+        [field]: value,
+      }),
+    ).toBe(false);
+  });
+
+  it.each([
+    ["role", "member"],
+    ["joinedAt", "2026-08-09T00:00:00.000Z"],
+  ])("rejects %s on agent room memberships", (field, value) => {
+    expect(
+      domain.isAgentRoomMembership?.({
+        kind: "agent",
+        actorId: "agent-search",
+        participation: "active",
+        toolPermissions: ["search"],
+        configuredAt: "2026-08-09T00:00:00.000Z",
+        [field]: value,
       }),
     ).toBe(false);
   });

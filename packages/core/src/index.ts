@@ -63,6 +63,7 @@ export interface HumanRoomMembership {
   readonly joinedAt: string;
   readonly participation?: never;
   readonly toolPermissions?: never;
+  readonly configuredAt?: never;
 }
 
 export interface AgentRoomMembership {
