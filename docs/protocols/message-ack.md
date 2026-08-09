@@ -13,8 +13,8 @@
 
 ## 历史与实时订阅
 
-对 `room.subscribe`，服务端必须先注册该连接的实时订阅，再查询并返回 `message.history`。这样在订阅注册和历史查询之间新写入的消息会以 `message.created` 推送给连接，不会落在两条链路的间隙中。
+对 `room.subscribe`，服务端必须先注册该连接的实时订阅，再查询并返回 `room.history`。这样在订阅注册和历史查询之间新写入的消息会以 `message.created` 推送给连接，不会落在两条链路的间隙中。
 
-这也意味着客户端可能先收到 `message.created`，后收到包含同一条消息的 `message.history`。客户端必须以 `Message.id` 为去重键合并两种帧；不得把历史帧当作覆盖实时状态的较新快照。
+这也意味着客户端可能先收到 `message.created`，后收到包含同一条消息的 `room.history`。客户端必须以 `Message.id` 为去重键合并两种帧；不得把历史帧当作覆盖实时状态的较新快照。
 
 同一房间重新订阅时，服务端以最新订阅为准，旧订阅尚未完成的 history 或错误不会再发送给客户端。
