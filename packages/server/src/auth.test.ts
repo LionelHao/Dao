@@ -22,6 +22,27 @@ const accounts = new Map([
   ["account-ada", { actorId: "human-ada", secret: "correct-ada" }],
 ]);
 
+const validIdentitySalt = Buffer.from("identity-salt-v1!", "utf8").toString(
+  "base64url",
+);
+const validIdentityHash = scryptSync(
+  "correct-li",
+  Buffer.from(validIdentitySalt, "base64url"),
+  64,
+).toString("base64url");
+
+function passwordIdentityRecord(
+  overrides: Partial<PasswordIdentityRecord> = {},
+): PasswordIdentityRecord {
+  return {
+    accountId: "account-li",
+    actorId: "human-li",
+    salt: validIdentitySalt,
+    hash: validIdentityHash,
+    ...overrides,
+  };
+}
+
 const testIdentityAdapter: IdentityAdapter = {
   async verify(credentials: LoginCredentials) {
     const account = accounts.get(credentials.accountId);
@@ -657,16 +678,67 @@ describe("authentication service", () => {
 });
 
 describe("scrypt identity adapter", () => {
+  it.each([
+    {
+      description: "one-byte",
+      hash: Buffer.from([7]).toString("base64url"),
+    },
+    {
+      description: "truncated 63-byte",
+      hash: Buffer.alloc(63, 7).toString("base64url"),
+    },
+  ])("rejects a $description password hash synchronously", ({ hash }) => {
+    expect(() =>
+      createScryptIdentityAdapter([passwordIdentityRecord({ hash })]),
+    ).toThrow(/hash.*64 bytes/);
+  });
+
+  it("rejects a non-canonical password hash synchronously", () => {
+    expect(() =>
+      createScryptIdentityAdapter([
+        passwordIdentityRecord({ hash: `${validIdentityHash}=` }),
+      ]),
+    ).toThrow(/hash.*canonical base64url/);
+  });
+
+  it.each([
+    { description: "empty", salt: "" },
+    {
+      description: "short",
+      salt: Buffer.alloc(15, 7).toString("base64url"),
+    },
+    {
+      description: "non-canonical",
+      salt: `${validIdentitySalt}=`,
+    },
+  ])("rejects an $description password salt synchronously", ({ salt }) => {
+    expect(() =>
+      createScryptIdentityAdapter([passwordIdentityRecord({ salt })]),
+    ).toThrow(/salt/);
+  });
+
+  it("rejects duplicate account IDs synchronously", () => {
+    expect(() =>
+      createScryptIdentityAdapter([
+        passwordIdentityRecord(),
+        passwordIdentityRecord({ actorId: "human-duplicate" }),
+      ]),
+    ).toThrow(/duplicate accountId/);
+  });
+
+  it.each([
+    { field: "accountId", value: "" },
+    { field: "actorId", value: "   " },
+  ])("rejects an empty $field synchronously", ({ field, value }) => {
+    expect(() =>
+      createScryptIdentityAdapter([
+        passwordIdentityRecord({ [field]: value }),
+      ]),
+    ).toThrow(new RegExp(field));
+  });
+
   it("performs the same scrypt workload before rejecting a missing account", async () => {
-    const salt = Buffer.from("identity-salt", "utf8").toString("base64url");
-    const record: PasswordIdentityRecord = {
-      accountId: "account-li",
-      actorId: "human-li",
-      salt,
-      hash: scryptSync("correct-li", Buffer.from(salt, "base64url"), 64).toString(
-        "base64url",
-      ),
-    };
+    const record = passwordIdentityRecord();
     const identities = createScryptIdentityAdapter([record]);
 
     const knownAccountRequests = await countScryptRequests(() =>
@@ -681,15 +753,7 @@ describe("scrypt identity adapter", () => {
   });
 
   it("verifies a salt/hash password record without storing plaintext credentials", async () => {
-    const salt = Buffer.from("identity-salt", "utf8").toString("base64url");
-    const record: PasswordIdentityRecord = {
-      accountId: "account-li",
-      actorId: "human-li",
-      salt,
-      hash: scryptSync("correct-li", Buffer.from(salt, "base64url"), 64).toString(
-        "base64url",
-      ),
-    };
+    const record = passwordIdentityRecord();
     const identities = createScryptIdentityAdapter([record]);
 
     await expect(

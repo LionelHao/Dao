@@ -3,8 +3,10 @@ import type { StateStore } from "./state-store.js";
 
 const DEFAULT_ACCESS_TTL_MS = 15 * 60 * 1_000;
 const DEFAULT_REFRESH_TTL_MS = 30 * 24 * 60 * 60 * 1_000;
+const SCRYPT_HASH_BYTES = 64;
+const MIN_SCRYPT_SALT_BYTES = 16;
 const DUMMY_SCRYPT_SALT = Buffer.from("native-im-auth-dummy-salt-v1", "utf8");
-const DUMMY_SCRYPT_HASH = Buffer.alloc(64);
+const DUMMY_SCRYPT_HASH = Buffer.alloc(SCRYPT_HASH_BYTES);
 const SESSION_STATE_FIELDS = new Set(["version", "sessions"]);
 const SESSION_RECORD_FIELDS = new Set([
   "familyId",
@@ -120,13 +122,17 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
-function isTokenHash(value: unknown): value is string {
+function decodeCanonicalBase64Url(value: unknown): Buffer | undefined {
   if (typeof value !== "string") {
-    return false;
+    return undefined;
   }
 
   const decoded = Buffer.from(value, "base64url");
-  return decoded.length === 32 && decoded.toString("base64url") === value;
+  return decoded.toString("base64url") === value ? decoded : undefined;
+}
+
+function isTokenHash(value: unknown): value is string {
+  return decodeCanonicalBase64Url(value)?.length === 32;
 }
 
 function isSessionRecord(value: unknown): value is SessionRecord {
@@ -199,33 +205,71 @@ function derivePassword(secret: string, salt: Buffer, keyLength: number): Promis
   });
 }
 
+function validatePasswordIdentityRecords(
+  accounts: readonly PasswordIdentityRecord[],
+): void {
+  const accountIds = new Set<string>();
+
+  for (const account of accounts) {
+    if (!isNonEmptyString(account.accountId)) {
+      throw new TypeError("password identity accountId must be non-empty");
+    }
+    if (!isNonEmptyString(account.actorId)) {
+      throw new TypeError("password identity actorId must be non-empty");
+    }
+
+    const salt = decodeCanonicalBase64Url(account.salt);
+    if (salt === undefined) {
+      throw new TypeError("password identity salt must use canonical base64url");
+    }
+    if (salt.length < MIN_SCRYPT_SALT_BYTES) {
+      throw new TypeError(
+        `password identity salt must decode to at least ${MIN_SCRYPT_SALT_BYTES} bytes`,
+      );
+    }
+
+    const hash = decodeCanonicalBase64Url(account.hash);
+    if (hash === undefined) {
+      throw new TypeError("password identity hash must use canonical base64url");
+    }
+    if (hash.length !== SCRYPT_HASH_BYTES) {
+      throw new TypeError(
+        `password identity hash must decode to exactly ${SCRYPT_HASH_BYTES} bytes`,
+      );
+    }
+
+    if (accountIds.has(account.accountId)) {
+      throw new TypeError(`duplicate accountId: ${account.accountId}`);
+    }
+    accountIds.add(account.accountId);
+  }
+}
+
 export function createScryptIdentityAdapter(
   accounts: readonly PasswordIdentityRecord[],
 ): IdentityAdapter {
+  validatePasswordIdentityRecords(accounts);
   const accountsById = new Map(accounts.map((account) => [account.accountId, account]));
 
   return {
     async verify(credentials: LoginCredentials) {
       const account = accountsById.get(credentials.accountId);
-      const configuredHash =
-        account === undefined ? undefined : Buffer.from(account.hash, "base64url");
-      const hasUsableRecord =
-        account !== undefined && configuredHash !== undefined && configuredHash.length !== 0;
       const expectedHash =
-        configuredHash !== undefined && configuredHash.length !== 0
-          ? configuredHash
-          : DUMMY_SCRYPT_HASH;
+        account === undefined
+          ? DUMMY_SCRYPT_HASH
+          : Buffer.from(account.hash, "base64url");
       const salt =
-        account !== undefined && configuredHash !== undefined && configuredHash.length !== 0
-        ? Buffer.from(account.salt, "base64url")
-        : DUMMY_SCRYPT_SALT;
+        account === undefined
+          ? DUMMY_SCRYPT_SALT
+          : Buffer.from(account.salt, "base64url");
 
       const actualHash = await derivePassword(
         credentials.secret,
         salt,
         expectedHash.length,
       );
-      if (!timingSafeEqual(actualHash, expectedHash) || !hasUsableRecord) {
+      const verified = timingSafeEqual(actualHash, expectedHash);
+      if (account === undefined || !verified) {
         return undefined;
       }
 
