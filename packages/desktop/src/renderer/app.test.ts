@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import type {
   AgentActor,
@@ -395,6 +396,55 @@ function submit(form: HTMLFormElement): void {
   form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
 }
 
+function relativeLuminance(hexColour: string): number {
+  const channels = [1, 3, 5].map((start) => Number.parseInt(hexColour.slice(start, start + 2), 16));
+  const linearChannels = channels.map((channel) => {
+    const normalised = channel / 255;
+
+    return normalised <= 0.04045
+      ? normalised / 12.92
+      : ((normalised + 0.055) / 1.055) ** 2.4;
+  });
+
+  return (
+    0.2126 * (linearChannels[0] ?? 0) +
+    0.7152 * (linearChannels[1] ?? 0) +
+    0.0722 * (linearChannels[2] ?? 0)
+  );
+}
+
+function contrastRatio(foreground: string, background: string): number {
+  const foregroundLuminance = relativeLuminance(foreground);
+  const backgroundLuminance = relativeLuminance(background);
+  const lighter = Math.max(foregroundLuminance, backgroundLuminance);
+  const darker = Math.min(foregroundLuminance, backgroundLuminance);
+
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
+describe("join control visual accessibility tokens", () => {
+  it("uses AA dark status colours and a three-to-one control boundary", () => {
+    const styles = readFileSync("packages/desktop/src/renderer/styles.css", "utf8");
+    const darkStatusBackground = "#202c40";
+    const controlBorder = "#64748b";
+
+    expect(contrastRatio("#6ce9a6", darkStatusBackground)).toBeGreaterThanOrEqual(4.5);
+    expect(contrastRatio("#fda29b", darkStatusBackground)).toBeGreaterThanOrEqual(4.5);
+    expect(contrastRatio("#fec84b", darkStatusBackground)).toBeGreaterThanOrEqual(4.5);
+    for (const adjacentSurface of ["#ffffff", "#f5f8ff", "#111827", "#162945", "#182235"]) {
+      expect(contrastRatio(controlBorder, adjacentSurface)).toBeGreaterThanOrEqual(3);
+    }
+
+    expect(styles).toContain("--join-control-border: #64748b;");
+    expect(styles).toContain("--semantic-success: #6ce9a6;");
+    expect(styles).toContain("--semantic-warning: #fec84b;");
+    expect(styles).toContain("--semantic-danger: #fda29b;");
+    expect(styles).toContain("color-scheme: light;");
+    expect(styles).toContain("color-scheme: dark;");
+    expect(styles.match(/border: 1px solid var\(--join-control-border\);/g)).toHaveLength(3);
+  });
+});
+
 describe("room join controls", () => {
   it("renders adjacent and accessible human invitation and agent configuration modules", () => {
     const root = document.createElement("main");
@@ -444,6 +494,28 @@ describe("room join controls", () => {
     expect(agent?.querySelector("[role='status'][aria-live='polite']")).not.toBeNull();
   });
 
+  it("assigns unique persistent status ids across multiple control instances", () => {
+    const roots = [document.createElement("main"), document.createElement("main")];
+
+    for (const root of roots) {
+      app.renderRoomJoinControls?.(root, {
+        roomId: "room-product",
+        agents: joinControlAgents,
+        onInviteHuman: () => undefined,
+        onConfigureAgent: () => undefined,
+      });
+    }
+
+    const statuses = roots.flatMap((root) =>
+      Array.from(root.querySelectorAll<HTMLElement>("[data-join-kind] [role='status']")),
+    );
+    const statusIds = statuses.map((status) => status.id);
+
+    expect(statuses).toHaveLength(4);
+    expect(statusIds.every((id) => id.length > 0)).toBe(true);
+    expect(new Set(statusIds).size).toBe(statusIds.length);
+  });
+
   it("validates a trimmed human actor id and emits only a human invitation payload", () => {
     const root = document.createElement("main");
     const humanRequests: HumanInvitationRequest[] = [];
@@ -466,13 +538,26 @@ describe("room join controls", () => {
 
     expect(form).not.toBeNull();
     expect(actorInput).not.toBeNull();
+    expect(status?.id).not.toBe("");
+    expect(actorInput?.getAttribute("aria-describedby")?.split(" ")).toEqual(
+      expect.arrayContaining([`${actorInput?.id.replace("actor-id", "hint")}`, status!.id]),
+    );
+    expect(actorInput?.getAttribute("aria-errormessage")).toBe(status?.id);
+    expect(actorInput?.getAttribute("aria-invalid")).toBe("false");
     actorInput!.value = "   ";
     submit(form!);
     expect(humanRequests).toEqual([]);
     expect(agentRequests).toEqual([]);
     expect(status?.textContent).toContain("成员 ID");
+    expect(actorInput?.getAttribute("aria-invalid")).toBe("true");
+
+    actorInput!.value = " ";
+    actorInput!.dispatchEvent(new Event("input", { bubbles: true }));
+    expect(actorInput?.getAttribute("aria-invalid")).toBe("true");
 
     actorInput!.value = "  human-lin  ";
+    actorInput!.dispatchEvent(new Event("input", { bubbles: true }));
+    expect(actorInput?.getAttribute("aria-invalid")).toBe("false");
     submit(form!);
 
     expect(humanRequests).toEqual([
@@ -489,6 +574,7 @@ describe("room join controls", () => {
       "roomId",
     ]);
     expect(status?.textContent).toContain("等待对方接受");
+    expect(actorInput?.getAttribute("aria-invalid")).toBe("false");
   });
 
   it("requires an agent, participation, and declared permission before emitting only agent configuration", () => {
@@ -511,24 +597,58 @@ describe("room join controls", () => {
     const status = root.querySelector<HTMLElement>(
       "[data-join-kind='agent-configuration'] [role='status']",
     );
+    const permissionFieldset = form?.querySelector<HTMLFieldSetElement>("fieldset");
 
     expect(form).not.toBeNull();
+    expect(status?.id).not.toBe("");
+    for (const control of [agentSelect, participation, permissionFieldset]) {
+      expect(control?.getAttribute("aria-describedby")).toContain(status?.id);
+      expect(control?.getAttribute("aria-errormessage")).toBe(status?.id);
+      expect(control?.getAttribute("aria-invalid")).toBe("false");
+    }
     submit(form!);
     expect(agentRequests).toEqual([]);
     expect(status?.textContent).toContain("Agent");
+    expect(agentSelect?.getAttribute("aria-invalid")).toBe("true");
+    expect(participation?.getAttribute("aria-invalid")).toBe("false");
+    expect(permissionFieldset?.getAttribute("aria-invalid")).toBe("false");
 
     agentSelect!.value = "agent-research";
     agentSelect!.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(agentSelect?.getAttribute("aria-invalid")).toBe("false");
+    submit(form!);
+    expect(agentRequests).toEqual([]);
+    expect(status?.textContent).toContain("参与度");
+    expect(participation?.getAttribute("aria-invalid")).toBe("true");
+
     participation!.value = "on-mention";
+    participation!.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(participation?.getAttribute("aria-invalid")).toBe("false");
     submit(form!);
     expect(agentRequests).toEqual([]);
     expect(status?.textContent).toContain("工具权限");
+    expect(permissionFieldset?.getAttribute("aria-invalid")).toBe("true");
 
-    const searchPermission = form?.querySelector<HTMLInputElement>(
+    let searchPermission = form?.querySelector<HTMLInputElement>(
       "input[name='toolPermissions'][value='search']",
     );
     expect(searchPermission).not.toBeNull();
     searchPermission!.checked = true;
+    searchPermission!.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(permissionFieldset?.getAttribute("aria-invalid")).toBe("false");
+
+    searchPermission!.value = "shell";
+    submit(form!);
+    expect(agentRequests).toEqual([]);
+    expect(status?.textContent).toContain("工具权限");
+    expect(permissionFieldset?.getAttribute("aria-invalid")).toBe("true");
+
+    searchPermission = form?.querySelector<HTMLInputElement>(
+      "input[name='toolPermissions'][value='search']",
+    );
+    searchPermission!.checked = true;
+    searchPermission!.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(permissionFieldset?.getAttribute("aria-invalid")).toBe("false");
     submit(form!);
 
     expect(agentRequests).toEqual([
@@ -549,6 +669,9 @@ describe("room join controls", () => {
       "toolPermissions",
     ]);
     expect(status?.textContent).toContain("立即生效");
+    expect(agentSelect?.getAttribute("aria-invalid")).toBe("false");
+    expect(participation?.getAttribute("aria-invalid")).toBe("false");
+    expect(permissionFieldset?.getAttribute("aria-invalid")).toBe("false");
   });
 
   it("deduplicates agent options and permissions, then resets permissions when the agent changes", () => {
@@ -665,6 +788,7 @@ describe("room join controls", () => {
       validRoot.querySelector("[data-join-kind='agent-configuration'] [role='status']")
         ?.textContent,
     ).toContain("有效的 Agent");
+    expect(validAgentSelect?.getAttribute("aria-invalid")).toBe("true");
   });
 
   it("keeps empty and blank-only tool agents visible but unavailable", () => {
@@ -710,6 +834,7 @@ describe("room join controls", () => {
     expect(options[2]?.textContent).toContain("未声明工具");
     expect(participation?.disabled).toBe(true);
     expect(submitButton?.disabled).toBe(true);
+    expect(agentSelect?.getAttribute("aria-invalid")).toBe("false");
     expect(root.querySelector("[data-join-kind='agent-configuration'] [role='status']")?.textContent)
       .toContain("均未声明工具权限");
 
@@ -724,6 +849,7 @@ describe("room join controls", () => {
       expect(
         root.querySelector("[data-join-kind='agent-configuration'] [role='status']")?.textContent,
       ).toContain("没有已声明的工具权限");
+      expect(agentSelect?.getAttribute("aria-invalid")).toBe("true");
     }
   });
 
@@ -758,6 +884,7 @@ describe("room join controls", () => {
     expect(noToolOption?.disabled).toBe(true);
     agentSelect!.value = "agent-research";
     agentSelect!.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(agentSelect?.getAttribute("aria-invalid")).toBe("false");
     participation!.value = "active";
     const searchPermission = form?.querySelector<HTMLInputElement>(
       "input[name='toolPermissions'][value='search']",
@@ -770,6 +897,7 @@ describe("room join controls", () => {
     expect(form?.querySelectorAll("input[name='toolPermissions']")).toHaveLength(0);
     expect(form?.querySelector("fieldset")?.textContent).toContain("没有已声明的工具权限");
     expect(submitButton?.disabled).toBe(true);
+    expect(agentSelect?.getAttribute("aria-invalid")).toBe("true");
     submit(form!);
 
     expect(requests).toEqual([]);
@@ -779,6 +907,7 @@ describe("room join controls", () => {
     agentSelect!.value = "agent-research";
     agentSelect!.dispatchEvent(new Event("change", { bubbles: true }));
     expect(submitButton?.disabled).toBe(false);
+    expect(agentSelect?.getAttribute("aria-invalid")).toBe("false");
     expect(
       Array.from(form?.querySelectorAll<HTMLInputElement>("input[name='toolPermissions']") ?? [])
         .every((input) => !input.checked),

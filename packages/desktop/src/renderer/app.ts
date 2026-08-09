@@ -407,10 +407,13 @@ function createLabel(labelText: string, control: HTMLInputElement | HTMLSelectEl
   return label;
 }
 
-function createStatus(initialText: string): HTMLElement {
+function createStatus(initialText: string, id?: string): HTMLElement {
   const status = document.createElement("p");
 
   status.className = "join-status";
+  if (id !== undefined) {
+    status.id = id;
+  }
   status.setAttribute("role", "status");
   status.setAttribute("aria-live", "polite");
   status.dataset.state = "idle";
@@ -421,6 +424,16 @@ function createStatus(initialText: string): HTMLElement {
 function updateStatus(status: HTMLElement, state: "idle" | "error" | "success", text: string): void {
   status.dataset.state = state;
   status.textContent = text;
+}
+
+function associateValidationStatus(control: HTMLElement, statusId: string): void {
+  control.setAttribute("aria-describedby", statusId);
+  control.setAttribute("aria-errormessage", statusId);
+  control.setAttribute("aria-invalid", "false");
+}
+
+function setControlInvalid(control: HTMLElement, invalid: boolean): void {
+  control.setAttribute("aria-invalid", invalid ? "true" : "false");
 }
 
 function createModuleHeader(
@@ -464,7 +477,7 @@ function renderHumanInvitationModule(
   const actorLabel = createLabel("成员 ID", actorInput);
   const hint = document.createElement("p");
   const button = document.createElement("button");
-  const status = createStatus("输入成员 ID 后发送邀请。");
+  const status = createStatus("输入成员 ID 后发送邀请。", `${sequence}-human-status`);
 
   module.className = "join-module join-module--human";
   module.dataset.joinKind = "human-invitation";
@@ -477,7 +490,12 @@ function renderHumanInvitationModule(
   actorInput.type = "text";
   actorInput.required = true;
   actorInput.autocomplete = "off";
-  actorInput.setAttribute("aria-describedby", `${sequence}-human-hint`);
+  actorInput.setAttribute(
+    "aria-describedby",
+    `${sequence}-human-hint ${status.id}`,
+  );
+  actorInput.setAttribute("aria-errormessage", status.id);
+  actorInput.setAttribute("aria-invalid", "false");
   actorLabel.htmlFor = actorInput.id;
   hint.id = `${sequence}-human-hint`;
   hint.className = "join-field-hint";
@@ -491,6 +509,15 @@ function renderHumanInvitationModule(
     updateStatus(status, "error", "当前房间无法发送邀请，请检查运行参数。");
   }
 
+  actorInput.addEventListener("input", () => {
+    if (actorInput.value.trim().length > 0) {
+      setControlInvalid(actorInput, false);
+      if (status.dataset.state === "error") {
+        updateStatus(status, "idle", "成员 ID 已填写，可以发送邀请。");
+      }
+    }
+  });
+
   form.addEventListener("submit", (event) => {
     event.preventDefault();
     const inviteeActorId = actorInput.value.trim();
@@ -501,6 +528,7 @@ function renderHumanInvitationModule(
     }
 
     if (inviteeActorId.length === 0) {
+      setControlInvalid(actorInput, true);
       updateStatus(status, "error", "请输入有效的成员 ID。");
       actorInput.focus();
       return;
@@ -512,6 +540,7 @@ function renderHumanInvitationModule(
       inviteeActorId,
     };
 
+    setControlInvalid(actorInput, false);
     try {
       callback(request);
       updateStatus(status, "success", `邀请已发送给 ${inviteeActorId}，等待对方接受。`);
@@ -547,7 +576,7 @@ function renderAgentConfigurationModule(
   const permissionLegend = document.createElement("legend");
   const permissionList = document.createElement("div");
   const button = document.createElement("button");
-  const status = createStatus("选择配置项后提交。");
+  const status = createStatus("选择配置项后提交。", `${sequence}-agent-status`);
   const agentsById = new Map(agents.map((agent) => [agent.id, agent]));
   const configurableAgentCount = agents.filter(
     (agent) => agent.toolPermissions.length > 0,
@@ -591,6 +620,9 @@ function renderAgentConfigurationModule(
   permissionList.className = "join-permission-list";
   permissionList.textContent = "请先选择 Agent。";
   permissionFieldset.append(permissionLegend, permissionList);
+  for (const control of [agentSelect, participationSelect, permissionFieldset]) {
+    associateValidationStatus(control, status.id);
+  }
   button.className = "join-action join-action--agent";
   button.type = "submit";
   button.textContent = "配置 Agent";
@@ -646,11 +678,25 @@ function renderAgentConfigurationModule(
     const selectedAgent = agentsById.get(agentSelect.value);
 
     renderPermissions(selectedAgent);
-    if (selectedAgent !== undefined && selectedAgent.toolPermissions.length === 0) {
+    setControlInvalid(permissionFieldset, false);
+    if (selectedAgent === undefined) {
+      const hasInvalidSelection = agentSelect.value.length > 0;
+
+      setControlInvalid(agentSelect, hasInvalidSelection);
+      participationSelect.disabled = configurableAgentCount === 0;
+      button.disabled = configurableAgentCount === 0 || !hasValidRuntime || hasInvalidSelection;
+      updateStatus(
+        status,
+        hasInvalidSelection ? "error" : "idle",
+        "请选择有效的 Agent。",
+      );
+    } else if (selectedAgent.toolPermissions.length === 0) {
+      setControlInvalid(agentSelect, true);
       participationSelect.disabled = true;
       button.disabled = true;
       updateStatus(status, "error", "此 Agent 没有已声明的工具权限，无法配置。");
     } else {
+      setControlInvalid(agentSelect, false);
       participationSelect.disabled = configurableAgentCount === 0;
       button.disabled = configurableAgentCount === 0 || !hasValidRuntime;
       updateStatus(
@@ -658,6 +704,29 @@ function renderAgentConfigurationModule(
         "idle",
         selectedAgent === undefined ? "请选择有效的 Agent。" : "选择参与度与工具权限后提交。",
       );
+    }
+  });
+
+  participationSelect.addEventListener("change", () => {
+    if (agentParticipationValues.has(participationSelect.value as AgentParticipation)) {
+      setControlInvalid(participationSelect, false);
+    }
+  });
+
+  permissionList.addEventListener("change", () => {
+    const agent = agentsById.get(agentSelect.value);
+    const selectedPermissions = Array.from(
+      permissionList.querySelectorAll<HTMLInputElement>("input[name='toolPermissions']:checked"),
+      (input) => input.value,
+    );
+    const isValidCorrection =
+      agent !== undefined &&
+      selectedPermissions.length > 0 &&
+      new Set(selectedPermissions).size === selectedPermissions.length &&
+      selectedPermissions.every((permission) => agent.toolPermissions.includes(permission));
+
+    if (isValidCorrection) {
+      setControlInvalid(permissionFieldset, false);
     }
   });
 
@@ -671,26 +740,31 @@ function renderAgentConfigurationModule(
 
     const agent = agentsById.get(agentSelect.value);
     if (agent === undefined) {
+      setControlInvalid(agentSelect, true);
       updateStatus(status, "error", "请选择有效的 Agent。");
       agentSelect.focus();
       return;
     }
 
     if (agent.toolPermissions.length === 0) {
+      setControlInvalid(agentSelect, true);
       renderPermissions(agent);
       participationSelect.disabled = true;
       button.disabled = true;
       updateStatus(status, "error", "此 Agent 没有已声明的工具权限，无法配置。");
       return;
     }
+    setControlInvalid(agentSelect, false);
 
     const participationValue = participationSelect.value;
     if (!agentParticipationValues.has(participationValue as AgentParticipation)) {
+      setControlInvalid(participationSelect, true);
       updateStatus(status, "error", "请选择参与度。");
       participationSelect.focus();
       return;
     }
     const participation = participationValue as AgentParticipation;
+    setControlInvalid(participationSelect, false);
     const selectedPermissions = Array.from(
       permissionList.querySelectorAll<HTMLInputElement>("input[name='toolPermissions']:checked"),
       (input) => input.value,
@@ -700,12 +774,14 @@ function renderAgentConfigurationModule(
       selectedPermissions.every((permission) => agent.toolPermissions.includes(permission));
 
     if (!hasOnlyDeclaredPermissions) {
+      setControlInvalid(permissionFieldset, true);
       updateStatus(status, "error", "工具权限已失效，请重新选择。");
       renderPermissions(agent);
       return;
     }
 
     if (selectedPermissions.length === 0) {
+      setControlInvalid(permissionFieldset, true);
       updateStatus(status, "error", "请至少选择一项工具权限。");
       permissionList.querySelector<HTMLInputElement>("input")?.focus();
       return;
@@ -719,6 +795,7 @@ function renderAgentConfigurationModule(
       toolPermissions: selectedPermissions,
     };
 
+    setControlInvalid(permissionFieldset, false);
     try {
       callback(request);
       updateStatus(status, "success", `${agent.displayName} 的配置已提交并立即生效。`);
