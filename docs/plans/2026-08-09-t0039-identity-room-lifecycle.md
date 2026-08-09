@@ -612,7 +612,7 @@ Run: `test -f docs/protocols/identity-room-lifecycle.md && test -f docs/deliveri
 
 Expected: all artifacts exist and diff check emits no output.
 
-- [ ] **Step 6: Commit documentation, publish the review branch, then deliver only to `delivered`.**
+- [x] **Step 6: Commit documentation, publish the review branch, then deliver only to `delivered`.**
 
 Stage only the protocol, delivery note, and executed plan. Commit with subject `docs: document T-0039 identity lifecycle`; the body includes the final checked self-test list and AI review summary. Use `superpowers:commit-rebase-pr` for commit/push/PR operations. Do not merge before @lionel verifies T-0039.
 
