@@ -115,6 +115,12 @@ describe("domain kernel guards", () => {
     expect(domain.isAgentConfigurationRequest?.(agentJoin)).toBe(true);
     expect(domain.isHumanInvitationRequest?.(agentJoin)).toBe(false);
     expect(domain.isAgentConfigurationRequest?.(humanJoin)).toBe(false);
+    expect(
+      domain.isAgentConfigurationRequest?.({
+        ...agentJoin,
+        toolPermissions: [],
+      }),
+    ).toBe(false);
   });
 
   it.each([
@@ -169,6 +175,12 @@ describe("domain kernel guards", () => {
     expect(domain.isAgentRoomMembership?.(agentMembership)).toBe(true);
     expect(domain.isHumanRoomMembership?.(agentMembership)).toBe(false);
     expect(domain.isAgentRoomMembership?.(humanMembership)).toBe(false);
+    expect(
+      domain.isAgentRoomMembership?.({
+        ...agentMembership,
+        toolPermissions: [],
+      }),
+    ).toBe(false);
   });
 
   it.each([

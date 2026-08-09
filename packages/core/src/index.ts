@@ -134,6 +134,10 @@ function hasStringArray(value: UnknownRecord, key: string): boolean {
   return Array.isArray(value[key]) && value[key].every((entry) => typeof entry === "string");
 }
 
+function hasNonEmptyStringArray(value: UnknownRecord, key: string): boolean {
+  return hasStringArray(value, key) && (value[key] as readonly string[]).length > 0;
+}
+
 function isActorKind(value: unknown): value is ActorKind {
   return value === "human" || value === "agent";
 }
@@ -247,7 +251,7 @@ export function isAgentRoomMembership(value: unknown): value is AgentRoomMembers
     value.kind === "agent" &&
     hasString(value, "actorId") &&
     isAgentParticipation(value.participation) &&
-    hasStringArray(value, "toolPermissions") &&
+    hasNonEmptyStringArray(value, "toolPermissions") &&
     hasString(value, "configuredAt") &&
     !("role" in value) &&
     !("joinedAt" in value)
@@ -277,7 +281,7 @@ export function isAgentConfigurationRequest(
     hasString(value, "roomId") &&
     hasString(value, "agentId") &&
     isAgentParticipation(value.participation) &&
-    hasStringArray(value, "toolPermissions") &&
+    hasNonEmptyStringArray(value, "toolPermissions") &&
     !("inviteeActorId" in value)
   );
 }

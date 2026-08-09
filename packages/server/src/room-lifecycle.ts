@@ -315,6 +315,10 @@ function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every(isNonEmptyString);
 }
 
+function isNonEmptyStringArray(value: unknown): value is string[] {
+  return isStringArray(value) && value.length > 0;
+}
+
 function hasUniqueStrings(values: readonly string[]): boolean {
   return new Set(values).size === values.length;
 }
@@ -388,7 +392,7 @@ function isAgentMembership(value: unknown): value is AgentRoomMembership {
     isNonEmptyString(value.actorId) &&
     typeof value.participation === "string" &&
     agentParticipations.has(value.participation as AgentParticipation) &&
-    isStringArray(value.toolPermissions) &&
+    isNonEmptyStringArray(value.toolPermissions) &&
     hasUniqueStrings(value.toolPermissions) &&
     isIsoTimestamp(value.configuredAt)
   );
@@ -497,7 +501,7 @@ function isAuditShape(value: unknown): value is RoomAuditRecord {
       (typeof value.participation === "string" &&
         agentParticipations.has(value.participation as AgentParticipation))) &&
     (!expectation.fields.has("toolPermissions") ||
-      (isStringArray(value.toolPermissions) &&
+      (isNonEmptyStringArray(value.toolPermissions) &&
         hasUniqueStrings(value.toolPermissions)))
   );
 }
@@ -1518,6 +1522,7 @@ export async function createRoomLifecycleService(
           throw new RoomLifecycleError(400, "agent_required");
         }
         if (
+          request.toolPermissions.length === 0 ||
           !hasUniqueStrings(request.toolPermissions) ||
           !request.toolPermissions.every((permission) =>
             agent.toolPermissions.includes(permission),

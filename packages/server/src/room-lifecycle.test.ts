@@ -601,6 +601,31 @@ describe("room lifecycle authority state guard", () => {
     expect(isRoomLifecycleState(removed)).toBe(true);
   });
 
+  it("rejects zero-grant agent authority snapshots", () => {
+    const emptyMembership = agentAuthorityFixture();
+    const membershipRooms = emptyMembership.rooms as Record<string, unknown>[];
+    const memberships = membershipRooms[0]?.members as Record<string, unknown>[];
+    const agentMembership = memberships.find(
+      (membership) => membership.actorId === searchAgent.id,
+    );
+    if (agentMembership === undefined) {
+      throw new Error("agent authority fixture must contain an agent membership");
+    }
+    agentMembership.toolPermissions = [];
+    expect(isRoomLifecycleState(emptyMembership)).toBe(false);
+
+    const emptyAudit = agentAuthorityFixture();
+    const audits = emptyAudit.audit as Record<string, unknown>[];
+    const configuredAudit = audits.find(
+      (record) => record.type === "room.agent.configured",
+    );
+    if (configuredAudit === undefined) {
+      throw new Error("agent authority fixture must contain a configuration audit");
+    }
+    configuredAudit.toolPermissions = [];
+    expect(isRoomLifecycleState(emptyAudit)).toBe(false);
+  });
+
   it("rejects an agent membership without configuration evidence", () => {
     const candidate = agentAuthorityFixture();
     candidate.audit = (candidate.audit as Record<string, unknown>[]).filter(
@@ -1261,7 +1286,7 @@ describe("room lifecycle service", () => {
       roomId: room.id,
       agentId: searchAgent.id,
       participation: "silent",
-      toolPermissions: [],
+      toolPermissions: ["search"],
     });
     await expect(
       rooms.setHumanRole(owner.id, room.id, searchAgent.id, "admin"),
@@ -1671,6 +1696,13 @@ describe("room lifecycle service", () => {
     ]);
 
     for (const request of [
+      {
+        kind: "agent-configuration",
+        roomId: room.id,
+        agentId: searchAgent.id,
+        participation: "active",
+        toolPermissions: [],
+      },
       {
         kind: "agent-configuration",
         roomId: room.id,
