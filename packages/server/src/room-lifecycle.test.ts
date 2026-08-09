@@ -12,6 +12,7 @@ import {
   createJsonStateStore,
   createRoomLifecycleService,
   isRoomLifecycleState,
+  RoomLifecycleError,
   StateStoreCorruptionError,
   type RoomLifecycleState,
   type StateStore,
@@ -53,6 +54,11 @@ const actors = [owner, admin, member, invitee, searchAgent] as const;
 function sequenceFactory(prefix: string): () => string {
   let sequence = 0;
   return () => `${prefix}-${++sequence}`;
+}
+
+function valuesFactory(values: readonly string[]): () => string {
+  let index = 0;
+  return () => values[index++] ?? `unexpected-id-${index}`;
 }
 
 function createOptions(state: StateStore<RoomLifecycleState>) {
@@ -99,6 +105,61 @@ function adminFixture(): RoomLifecycleState {
   };
 }
 
+function invitationAuthorityFixture(
+  status: "pending" | "accepted" | "rejected",
+): Record<string, unknown> {
+  const invitationId = "invitation-linked";
+  const createdAt = "2026-08-09T08:01:00.000Z";
+  const decidedAt = "2026-08-09T08:02:00.000Z";
+  const invitation = {
+    id: invitationId,
+    roomId: "fixture-room",
+    inviterActorId: owner.id,
+    inviteeActorId: invitee.id,
+    tokenHash: createHash("sha256")
+      .update("linked-invitation-token")
+      .digest("base64url"),
+    status,
+    createdAt,
+    ...(status === "pending"
+      ? {}
+      : { decisionActorId: invitee.id, decidedAt }),
+  };
+  const issuanceAudit = {
+    id: "audit-invitation-issued",
+    type: "room.human.invited",
+    roomId: "fixture-room",
+    actorId: owner.id,
+    targetActorId: invitee.id,
+    invitationId,
+    result: "pending",
+    timestamp: createdAt,
+  };
+  const decisionAudit = {
+    id: "audit-invitation-decided",
+    type:
+      status === "accepted"
+        ? "room.invitation.accepted"
+        : "room.invitation.rejected",
+    roomId: "fixture-room",
+    actorId: invitee.id,
+    targetActorId: invitee.id,
+    inviterActorId: owner.id,
+    invitationId,
+    result: status,
+    timestamp: decidedAt,
+  };
+
+  return {
+    ...adminFixture(),
+    invitations: [invitation],
+    audit:
+      status === "pending"
+        ? [issuanceAudit]
+        : [issuanceAudit, decisionAudit],
+  };
+}
+
 class MemoryRoomStore implements StateStore<RoomLifecycleState> {
   current: RoomLifecycleState | undefined;
   private nextSaveError: unknown;
@@ -141,6 +202,157 @@ async function addHumanMember(
 describe("room lifecycle authority state guard", () => {
   it("accepts a closed, internally consistent fixture", () => {
     expect(isRoomLifecycleState(adminFixture())).toBe(true);
+  });
+
+  it.each(["pending", "accepted", "rejected"] as const)(
+    "accepts a %s invitation with exactly linked issuance and decision evidence",
+    (status) => {
+      expect(isRoomLifecycleState(invitationAuthorityFixture(status))).toBe(true);
+    },
+  );
+
+  it.each([
+    {
+      description: "terminal invitation without a decision audit",
+      mutate(state: Record<string, unknown>) {
+        (state.audit as unknown[]).pop();
+      },
+    },
+    {
+      description: "accepted invitation with a rejected decision audit",
+      mutate(state: Record<string, unknown>) {
+        const audit = state.audit as Record<string, unknown>[];
+        audit[1] = {
+          ...audit[1],
+          type: "room.invitation.rejected",
+          result: "rejected",
+        };
+      },
+    },
+    {
+      description: "orphan decision audit",
+      mutate(state: Record<string, unknown>) {
+        const audit = state.audit as Record<string, unknown>[];
+        audit[1] = { ...audit[1], invitationId: "invitation-missing" };
+      },
+    },
+    {
+      description: "duplicate decision audit",
+      mutate(state: Record<string, unknown>) {
+        const audit = state.audit as Record<string, unknown>[];
+        audit.push({ ...audit[1], id: "audit-invitation-decided-again" });
+      },
+    },
+    {
+      description: "decision audit by the wrong actor",
+      mutate(state: Record<string, unknown>) {
+        const audit = state.audit as Record<string, unknown>[];
+        audit[1] = { ...audit[1], actorId: admin.id };
+      },
+    },
+    {
+      description: "decision audit for the wrong existing room",
+      mutate(state: Record<string, unknown>) {
+        const fixtureRooms = state.rooms as Record<string, unknown>[];
+        fixtureRooms.push({ ...fixtureRooms[0], id: "fixture-room-other" });
+        const audit = state.audit as Record<string, unknown>[];
+        audit[1] = { ...audit[1], roomId: "fixture-room-other" };
+      },
+    },
+  ])("rejects $description", ({ mutate }) => {
+    const candidate = structuredClone(invitationAuthorityFixture("accepted"));
+    mutate(candidate);
+    expect(isRoomLifecycleState(candidate)).toBe(false);
+  });
+
+  it("rejects a pending invitation with decision evidence", () => {
+    const candidate = invitationAuthorityFixture("pending");
+    const terminal = invitationAuthorityFixture("accepted");
+    (candidate.audit as unknown[]).push((terminal.audit as unknown[])[1]);
+    expect(isRoomLifecycleState(candidate)).toBe(false);
+  });
+
+  it("rejects a terminal decision timestamp before invitation issuance", () => {
+    const candidate = invitationAuthorityFixture("accepted");
+    const invitations = candidate.invitations as Record<string, unknown>[];
+    invitations[0] = {
+      ...invitations[0],
+      decidedAt: "2026-08-09T07:59:00.000Z",
+    };
+    const audit = candidate.audit as Record<string, unknown>[];
+    audit[1] = {
+      ...audit[1],
+      timestamp: "2026-08-09T07:59:00.000Z",
+    };
+
+    expect(isRoomLifecycleState(candidate)).toBe(false);
+  });
+
+  it.each([
+    {
+      description: "missing issuance audit",
+      mutate(state: Record<string, unknown>) {
+        (state.audit as unknown[]).shift();
+      },
+    },
+    {
+      description: "orphan issuance audit",
+      mutate(state: Record<string, unknown>) {
+        const audit = state.audit as Record<string, unknown>[];
+        audit[0] = { ...audit[0], invitationId: "invitation-missing" };
+      },
+    },
+    {
+      description: "issuance audit with a mismatched inviter",
+      mutate(state: Record<string, unknown>) {
+        const audit = state.audit as Record<string, unknown>[];
+        audit[0] = { ...audit[0], actorId: admin.id };
+      },
+    },
+  ])("rejects $description", ({ mutate }) => {
+    const candidate = structuredClone(invitationAuthorityFixture("pending"));
+    mutate(candidate);
+    expect(isRoomLifecycleState(candidate)).toBe(false);
+  });
+
+  it.each([
+    {
+      description: "accepted versus rejected mismatch",
+      mutate(state: Record<string, unknown>) {
+        const audit = state.audit as Record<string, unknown>[];
+        audit[1] = {
+          ...audit[1],
+          type: "room.invitation.rejected",
+          result: "rejected",
+        };
+      },
+    },
+    {
+      description: "terminal invitation missing its decision audit",
+      mutate(state: Record<string, unknown>) {
+        (state.audit as unknown[]).pop();
+      },
+    },
+    {
+      description: "orphan decision audit",
+      mutate(state: Record<string, unknown>) {
+        const audit = state.audit as Record<string, unknown>[];
+        audit[1] = { ...audit[1], invitationId: "invitation-missing" };
+      },
+    },
+  ])("loads $description as corruption", async ({ mutate }) => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-room-link-guard-"));
+    const filePath = join(directory, "rooms.json");
+    try {
+      const candidate = structuredClone(invitationAuthorityFixture("accepted"));
+      mutate(candidate);
+      await writeFile(filePath, JSON.stringify(candidate), "utf8");
+      await expect(
+        createJsonStateStore(filePath, isRoomLifecycleState).load(),
+      ).rejects.toBeInstanceOf(StateStoreCorruptionError);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it.each([
@@ -256,6 +468,65 @@ describe("room lifecycle authority state guard", () => {
     ).toBe(false);
   });
 
+  it.each([
+    {
+      description: "room ID colliding with an actor ID",
+      candidate() {
+        const state = structuredClone(adminFixture()) as unknown as Record<
+          string,
+          unknown
+        >;
+        const rooms = state.rooms as Record<string, unknown>[];
+        rooms[0] = { ...rooms[0], id: owner.id };
+        return state;
+      },
+    },
+    {
+      description: "invitation ID colliding with an actor ID",
+      candidate() {
+        const state = invitationAuthorityFixture("pending");
+        const invitations = state.invitations as Record<string, unknown>[];
+        invitations[0] = { ...invitations[0], id: admin.id };
+        const audit = state.audit as Record<string, unknown>[];
+        audit[0] = { ...audit[0], invitationId: admin.id };
+        return state;
+      },
+    },
+    {
+      description: "audit ID colliding with an actor ID",
+      candidate() {
+        const state = invitationAuthorityFixture("pending");
+        const audit = state.audit as Record<string, unknown>[];
+        audit[0] = { ...audit[0], id: searchAgent.id };
+        return state;
+      },
+    },
+    {
+      description: "invitation ID colliding with its room ID",
+      candidate() {
+        const state = invitationAuthorityFixture("pending");
+        const invitations = state.invitations as Record<string, unknown>[];
+        invitations[0] = { ...invitations[0], id: "fixture-room" };
+        const audit = state.audit as Record<string, unknown>[];
+        audit[0] = { ...audit[0], invitationId: "fixture-room" };
+        return state;
+      },
+    },
+    {
+      description: "audit ID colliding with its invitation ID",
+      candidate() {
+        const state = invitationAuthorityFixture("pending");
+        const invitations = state.invitations as Record<string, unknown>[];
+        const invitationId = invitations[0]?.id;
+        const audit = state.audit as Record<string, unknown>[];
+        audit[0] = { ...audit[0], id: invitationId };
+        return state;
+      },
+    },
+  ])("rejects $description in the global entity namespace", ({ candidate }) => {
+    expect(isRoomLifecycleState(candidate())).toBe(false);
+  });
+
   it("rejects a pending invitation for an existing room member", () => {
     const candidate = {
       ...adminFixture(),
@@ -365,6 +636,155 @@ describe("room lifecycle authority state guard", () => {
 });
 
 describe("room lifecycle service", () => {
+  it.each([
+    { description: "null input", input: null },
+    { description: "numeric input", input: 42 },
+    { description: "missing name", input: {} },
+    { description: "numeric name", input: { name: 42 } },
+    { description: "empty name", input: { name: "" } },
+    { description: "whitespace name", input: { name: "   " } },
+  ])("rejects createRoom $description with a stable typed error", async ({ input }) => {
+    const store = new MemoryRoomStore();
+    const rooms = await createRoomLifecycleService(createOptions(store));
+    const operation = rooms.createRoom(
+      owner.id,
+      input as unknown as { readonly name: string },
+    );
+
+    await expect(operation).rejects.toBeInstanceOf(RoomLifecycleError);
+    await expect(operation).rejects.toMatchObject({
+      status: 400,
+      code: "room_name_invalid",
+    });
+    expect(store.current).toBeUndefined();
+  });
+
+  it.each([
+    { description: "null", name: null },
+    { description: "numeric", name: 42 },
+    { description: "empty", name: "" },
+    { description: "whitespace", name: "   " },
+  ])("rejects a $description rename before mutation", async ({ name }) => {
+    const store = new MemoryRoomStore();
+    const rooms = await createRoomLifecycleService(createOptions(store));
+    const room = await rooms.createRoom(owner.id, { name: "Original name" });
+    const persistedBeforeRename = store.current;
+    const auditBeforeRename = rooms.audit(room.id);
+    const operation = rooms.renameRoom(
+      owner.id,
+      room.id,
+      name as unknown as string,
+    );
+
+    await expect(operation).rejects.toBeInstanceOf(RoomLifecycleError);
+    await expect(operation).rejects.toMatchObject({
+      status: 400,
+      code: "room_name_invalid",
+    });
+    expect(store.current).toBe(persistedBeforeRename);
+    expect(rooms.getRoom(room.id)?.name).toBe("Original name");
+    expect(rooms.audit(room.id)).toEqual(auditBeforeRename);
+  });
+
+  it("authorizes rename before validating its name", async () => {
+    const rooms = await createRoomLifecycleService(
+      createOptions(new MemoryRoomStore()),
+    );
+    const room = await rooms.createRoom(owner.id, { name: "Protected name" });
+    await addHumanMember(rooms, room.id, member.id);
+
+    await expect(
+      rooms.renameRoom(member.id, room.id, 42 as unknown as string),
+    ).rejects.toMatchObject({ status: 403, code: "room_forbidden" });
+    expect(rooms.getRoom(room.id)?.name).toBe("Protected name");
+  });
+
+  it("stores a trimmed valid room name", async () => {
+    const rooms = await createRoomLifecycleService(
+      createOptions(new MemoryRoomStore()),
+    );
+    const room = await rooms.createRoom(owner.id, { name: "  Trimmed room  " });
+    await expect(
+      rooms.renameRoom(owner.id, room.id, "  Trimmed rename  "),
+    ).resolves.toMatchObject({ name: "Trimmed rename" });
+  });
+
+  it("rejects an actor ID emitted as a room ID before persistence", async () => {
+    const store = new MemoryRoomStore();
+    const rooms = await createRoomLifecycleService({
+      ...createOptions(store),
+      idFactory: valuesFactory([owner.id]),
+    });
+
+    await expect(
+      rooms.createRoom(owner.id, { name: "Colliding room" }),
+    ).rejects.toMatchObject({ status: 409, code: "lifecycle_id_conflict" });
+    expect(store.current).toBeUndefined();
+    expect(rooms.getRoom(owner.id)).toBeUndefined();
+  });
+
+  it.each([
+    {
+      description: "room audit ID",
+      ids: ["generated-room", admin.id],
+      invitation: false,
+    },
+    {
+      description: "invitation ID",
+      ids: ["generated-room", "generated-create-audit", invitee.id],
+      invitation: true,
+    },
+    {
+      description: "invitation audit ID",
+      ids: [
+        "generated-room",
+        "generated-create-audit",
+        "generated-invitation",
+        searchAgent.id,
+      ],
+      invitation: true,
+    },
+  ])("rejects an actor ID emitted as a $description", async ({ ids, invitation }) => {
+    const store = new MemoryRoomStore();
+    const rooms = await createRoomLifecycleService({
+      ...createOptions(store),
+      idFactory: valuesFactory(ids),
+    });
+
+    if (!invitation) {
+      await expect(
+        rooms.createRoom(owner.id, { name: "Audit collision" }),
+      ).rejects.toMatchObject({ status: 409, code: "lifecycle_id_conflict" });
+      expect(store.current).toBeUndefined();
+      return;
+    }
+
+    const room = await rooms.createRoom(owner.id, { name: "Invite collision" });
+    const stateBeforeInvite = store.current;
+    await expect(
+      rooms.inviteHuman(owner.id, {
+        kind: "human-invitation",
+        roomId: room.id,
+        inviteeActorId: invitee.id,
+      }),
+    ).rejects.toMatchObject({ status: 409, code: "lifecycle_id_conflict" });
+    expect(store.current).toBe(stateBeforeInvite);
+    expect(store.current?.invitations).toEqual([]);
+  });
+
+  it("rejects a room/audit cross-kind ID collision deterministically", async () => {
+    const store = new MemoryRoomStore();
+    const rooms = await createRoomLifecycleService({
+      ...createOptions(store),
+      idFactory: valuesFactory(["same-entity-id", "same-entity-id"]),
+    });
+
+    await expect(
+      rooms.createRoom(owner.id, { name: "Cross-kind collision" }),
+    ).rejects.toMatchObject({ status: 409, code: "lifecycle_id_conflict" });
+    expect(store.current).toBeUndefined();
+  });
+
   it("persists targeted human invitation decisions without raw tokens and restores them", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-room-restart-"));
     const filePath = join(directory, "rooms.json");

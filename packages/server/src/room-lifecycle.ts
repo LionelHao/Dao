@@ -59,9 +59,14 @@ const BASE_AUDIT_FIELDS = new Set([
   "timestamp",
 ]);
 const TARGET_AUDIT_FIELDS = new Set([...BASE_AUDIT_FIELDS, "targetActorId"]);
+const INVITATION_ISSUANCE_AUDIT_FIELDS = new Set([
+  ...TARGET_AUDIT_FIELDS,
+  "invitationId",
+]);
 const INVITATION_DECISION_AUDIT_FIELDS = new Set([
   ...TARGET_AUDIT_FIELDS,
   "inviterActorId",
+  "invitationId",
 ]);
 const HUMAN_INVITATION_REQUEST_FIELDS = new Set([
   "kind",
@@ -128,16 +133,48 @@ export type RoomAuditResult =
   | "configured"
   | "removed";
 
-export interface RoomAuditRecord {
+interface BaseRoomAuditRecord<
+  Type extends RoomAuditType,
+  Result extends RoomAuditResult,
+> {
   readonly id: string;
-  readonly type: RoomAuditType;
+  readonly type: Type;
   readonly roomId: string;
   readonly actorId: string;
-  readonly targetActorId?: string;
-  readonly inviterActorId?: string;
-  readonly result: RoomAuditResult;
+  readonly result: Result;
   readonly timestamp: string;
 }
+
+interface TargetRoomAuditRecord<
+  Type extends RoomAuditType,
+  Result extends RoomAuditResult,
+> extends BaseRoomAuditRecord<Type, Result> {
+  readonly targetActorId: string;
+}
+
+export type RoomAuditRecord =
+  | BaseRoomAuditRecord<"room.created", "created">
+  | BaseRoomAuditRecord<"room.renamed", "renamed">
+  | BaseRoomAuditRecord<"room.archived", "archived">
+  | (TargetRoomAuditRecord<"room.human.invited", "pending"> & {
+      readonly invitationId: string;
+    })
+  | (TargetRoomAuditRecord<"room.invitation.accepted", "accepted"> & {
+      readonly invitationId: string;
+      readonly inviterActorId: string;
+    })
+  | (TargetRoomAuditRecord<"room.invitation.rejected", "rejected"> & {
+      readonly invitationId: string;
+      readonly inviterActorId: string;
+    })
+  | TargetRoomAuditRecord<"room.agent.configured", "configured">
+  | TargetRoomAuditRecord<"room.member.removed", "removed">;
+
+type RoomAuditInput = RoomAuditRecord extends infer RecordType
+  ? RecordType extends RoomAuditRecord
+    ? Omit<RecordType, "id">
+    : never
+  : never;
 
 export interface RoomLifecycleState {
   readonly version: 1;
@@ -387,7 +424,7 @@ function auditExpectation(type: unknown): {
     case "room.archived":
       return { fields: BASE_AUDIT_FIELDS, result: "archived" };
     case "room.human.invited":
-      return { fields: TARGET_AUDIT_FIELDS, result: "pending" };
+      return { fields: INVITATION_ISSUANCE_AUDIT_FIELDS, result: "pending" };
     case "room.invitation.accepted":
       return {
         fields: INVITATION_DECISION_AUDIT_FIELDS,
@@ -423,7 +460,9 @@ function isAuditShape(value: unknown): value is RoomAuditRecord {
     (!expectation.fields.has("targetActorId") ||
       isNonEmptyString(value.targetActorId)) &&
     (!expectation.fields.has("inviterActorId") ||
-      isNonEmptyString(value.inviterActorId))
+      isNonEmptyString(value.inviterActorId)) &&
+    (!expectation.fields.has("invitationId") ||
+      isNonEmptyString(value.invitationId))
   );
 }
 
@@ -453,7 +492,7 @@ export function isRoomLifecycleState(value: unknown): value is RoomLifecycleStat
   }
 
   const roomsById = new Map<string, ManagedRoom>();
-  const entityIds = new Set<string>();
+  const entityIds = new Set(actorsById.keys());
   for (const room of value.rooms) {
     if (entityIds.has(room.id)) {
       return false;
@@ -496,6 +535,7 @@ export function isRoomLifecycleState(value: unknown): value is RoomLifecycleStat
 
   const tokenHashes = new Set<string>();
   const pendingInvitees = new Set<string>();
+  const invitationsById = new Map<string, HumanInvitationRecord>();
   for (const invitation of value.invitations) {
     if (
       entityIds.has(invitation.id) ||
@@ -510,7 +550,9 @@ export function isRoomLifecycleState(value: unknown): value is RoomLifecycleStat
       inviter?.kind !== "human" ||
       invitee?.kind !== "human" ||
       (invitation.status !== "pending" &&
-        invitation.decisionActorId !== invitation.inviteeActorId)
+        (invitation.decisionActorId !== invitation.inviteeActorId ||
+          invitation.decidedAt === undefined ||
+          Date.parse(invitation.decidedAt) < Date.parse(invitation.createdAt)))
     ) {
       return false;
     }
@@ -529,22 +571,74 @@ export function isRoomLifecycleState(value: unknown): value is RoomLifecycleStat
     }
     entityIds.add(invitation.id);
     tokenHashes.add(invitation.tokenHash);
+    invitationsById.set(invitation.id, invitation);
   }
 
+  const issuanceAuditCounts = new Map<string, number>();
+  const decisionAuditCounts = new Map<string, number>();
   for (const record of value.audit) {
     if (
       entityIds.has(record.id) ||
       !roomsById.has(record.roomId) ||
       !actorsById.has(record.actorId) ||
-      (record.targetActorId !== undefined &&
+      ("targetActorId" in record &&
         !actorsById.has(record.targetActorId)) ||
-      (record.inviterActorId !== undefined &&
+      ("inviterActorId" in record &&
         actorsById.get(record.inviterActorId)?.kind !== "human") ||
       !isAuditSemanticallyConsistent(record, actorsById)
     ) {
       return false;
     }
+    if (record.type === "room.human.invited") {
+      const invitation = invitationsById.get(record.invitationId);
+      if (
+        invitation === undefined ||
+        record.roomId !== invitation.roomId ||
+        record.actorId !== invitation.inviterActorId ||
+        record.targetActorId !== invitation.inviteeActorId ||
+        record.timestamp !== invitation.createdAt
+      ) {
+        return false;
+      }
+      issuanceAuditCounts.set(
+        invitation.id,
+        (issuanceAuditCounts.get(invitation.id) ?? 0) + 1,
+      );
+    } else if (
+      record.type === "room.invitation.accepted" ||
+      record.type === "room.invitation.rejected"
+    ) {
+      const invitation = invitationsById.get(record.invitationId);
+      const expectedStatus =
+        record.type === "room.invitation.accepted" ? "accepted" : "rejected";
+      if (
+        invitation === undefined ||
+        invitation.status !== expectedStatus ||
+        record.roomId !== invitation.roomId ||
+        record.actorId !== invitation.inviteeActorId ||
+        record.targetActorId !== invitation.inviteeActorId ||
+        record.inviterActorId !== invitation.inviterActorId ||
+        record.timestamp !== invitation.decidedAt
+      ) {
+        return false;
+      }
+      decisionAuditCounts.set(
+        invitation.id,
+        (decisionAuditCounts.get(invitation.id) ?? 0) + 1,
+      );
+    }
     entityIds.add(record.id);
+  }
+
+  for (const invitation of value.invitations) {
+    if (
+      issuanceAuditCounts.get(invitation.id) !== 1 ||
+      (invitation.status === "pending"
+        ? (decisionAuditCounts.get(invitation.id) ?? 0) !== 0
+        : decisionAuditCounts.get(invitation.id) !== 1)
+    ) {
+      return false;
+    }
   }
 
   return true;
@@ -555,10 +649,6 @@ function isAuditSemanticallyConsistent(
   actorsById: ReadonlyMap<string, Actor>,
 ): boolean {
   const actor = actorsById.get(record.actorId);
-  const target =
-    record.targetActorId === undefined
-      ? undefined
-      : actorsById.get(record.targetActorId);
 
   switch (record.type) {
     case "room.created":
@@ -566,18 +656,26 @@ function isAuditSemanticallyConsistent(
     case "room.archived":
       return actor?.kind === "human";
     case "room.human.invited":
-      return actor?.kind === "human" && target?.kind === "human";
+      return (
+        actor?.kind === "human" &&
+        actorsById.get(record.targetActorId)?.kind === "human"
+      );
     case "room.invitation.accepted":
     case "room.invitation.rejected":
       return (
         actor?.kind === "human" &&
-        target?.kind === "human" &&
+        actorsById.get(record.targetActorId)?.kind === "human" &&
         record.actorId === record.targetActorId
       );
     case "room.agent.configured":
-      return actor?.kind === "human" && target?.kind === "agent";
+      return (
+        actor?.kind === "human" &&
+        actorsById.get(record.targetActorId)?.kind === "agent"
+      );
     case "room.member.removed":
-      return actor?.kind === "human" && target !== undefined;
+      return (
+        actor?.kind === "human" && actorsById.has(record.targetActorId)
+      );
   }
 }
 
@@ -648,7 +746,10 @@ function hashToken(token: string): string {
   return createHash("sha256").update(token).digest("base64url");
 }
 
-function normalizedName(name: string): string {
+function normalizedName(name: unknown): string {
+  if (typeof name !== "string") {
+    throw new RoomLifecycleError(400, "room_name_invalid");
+  }
   const normalized = name.trim();
   if (normalized.length === 0) {
     throw new RoomLifecycleError(400, "room_name_invalid");
@@ -774,6 +875,7 @@ export async function createRoomLifecycleService(
 
   function usedEntityIds(current: RoomLifecycleState): Set<string> {
     return new Set([
+      ...current.actors.map((actor) => actor.id),
       ...current.rooms.map((room) => room.id),
       ...current.invitations.map((invitation) => invitation.id),
       ...current.audit.map((record) => record.id),
@@ -791,9 +893,9 @@ export async function createRoomLifecycleService(
 
   function auditRecord(
     usedIds: Set<string>,
-    input: Omit<RoomAuditRecord, "id">,
+    input: RoomAuditInput,
   ): RoomAuditRecord {
-    return { id: nextEntityId(usedIds), ...input };
+    return { id: nextEntityId(usedIds), ...input } as RoomAuditRecord;
   }
 
   return {
@@ -803,7 +905,7 @@ export async function createRoomLifecycleService(
         if (actor.kind !== "human") {
           throw new RoomLifecycleError(400, "human_required");
         }
-        const name = normalizedName(input.name);
+        const name = normalizedName(isRecord(input) ? input.name : undefined);
         const now = timestamp();
         const usedIds = usedEntityIds(current);
         const room: ManagedRoom = {
@@ -947,6 +1049,7 @@ export async function createRoomLifecycleService(
           roomId: room.id,
           actorId,
           targetActorId: invitee.id,
+          invitationId: invitation.id,
           result: "pending",
           timestamp: now,
         });
@@ -1020,18 +1123,28 @@ export async function createRoomLifecycleService(
               }
             : room;
         const usedIds = usedEntityIds(current);
-        const audit = auditRecord(usedIds, {
-          type:
-            decision === "accept"
-              ? "room.invitation.accepted"
-              : "room.invitation.rejected",
-          roomId: room.id,
-          actorId,
-          targetActorId: actorId,
-          inviterActorId: invitation.inviterActorId,
-          result: decision === "accept" ? "accepted" : "rejected",
-          timestamp: now,
-        });
+        const audit =
+          decision === "accept"
+            ? auditRecord(usedIds, {
+                type: "room.invitation.accepted",
+                roomId: room.id,
+                actorId,
+                targetActorId: actorId,
+                inviterActorId: invitation.inviterActorId,
+                invitationId: invitation.id,
+                result: "accepted",
+                timestamp: now,
+              })
+            : auditRecord(usedIds, {
+                type: "room.invitation.rejected",
+                roomId: room.id,
+                actorId,
+                targetActorId: actorId,
+                inviterActorId: invitation.inviterActorId,
+                invitationId: invitation.id,
+                result: "rejected",
+                timestamp: now,
+              });
         await persist({
           ...current,
           rooms:
