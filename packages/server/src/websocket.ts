@@ -92,15 +92,21 @@ function sendFrame(socket: WebSocket, frame: ServerFrame): void {
   if (socket.readyState !== WebSocket.OPEN) {
     return;
   }
-  const maxBufferedAmount =
-    maxBufferedAmountBySocket.get(socket) ??
-    MESSAGE_WEBSOCKET_MAX_BUFFERED_AMOUNT_BYTES;
-  if (socket.bufferedAmount >= maxBufferedAmount) {
-    abortAndTerminate(socket);
-    return;
-  }
   try {
-    socket.send(JSON.stringify(frame));
+    const serialized = JSON.stringify(frame);
+    if (serialized === undefined) {
+      abortAndTerminate(socket);
+      return;
+    }
+    const maxBufferedAmount =
+      maxBufferedAmountBySocket.get(socket) ??
+      MESSAGE_WEBSOCKET_MAX_BUFFERED_AMOUNT_BYTES;
+    const frameBytes = Buffer.byteLength(serialized, "utf8");
+    if (frameBytes > maxBufferedAmount - socket.bufferedAmount) {
+      abortAndTerminate(socket);
+      return;
+    }
+    socket.send(serialized);
   } catch {
     abortAndTerminate(socket);
   }
@@ -370,10 +376,6 @@ async function handleRefresh(
   options: StartMessageWebSocketServerOptions,
   context: ConnectionContext,
 ): Promise<void> {
-  const principal = await requirePrincipal(socket, frame.requestId, options, context);
-  if (principal === undefined) {
-    return;
-  }
   if (context.authOperationPending) {
     sendFrame(
       socket,
@@ -387,9 +389,10 @@ async function handleRefresh(
     return;
   }
 
+  const expectedPrincipal = context.principal;
   context.authOperationPending = true;
   try {
-    const session = await options.auth.refresh(frame.refreshToken, principal);
+    const session = await options.auth.refresh(frame.refreshToken, expectedPrincipal);
     if (context.closed) {
       return;
     }
@@ -397,7 +400,10 @@ async function handleRefresh(
       accountId: session.accountId,
       actorId: session.actorId,
     };
-    if (!samePrincipal(principal, refreshedPrincipal)) {
+    if (
+      expectedPrincipal !== undefined &&
+      !samePrincipal(expectedPrincipal, refreshedPrincipal)
+    ) {
       sendFrame(
         socket,
         errorFrame(

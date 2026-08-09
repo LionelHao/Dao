@@ -435,6 +435,9 @@ async function populateRoom(rooms: RoomLifecycleService): Promise<void> {
     await rooms.respondToHumanInvitation(human.id, invitation.token, "accept");
   }
   for (const agent of agents) {
+    if (agent.toolPermissions.length === 0) {
+      continue;
+    }
     await rooms.configureAgent(humans[0].id, {
       kind: "agent-configuration",
       roomId,
@@ -856,6 +859,147 @@ describe("authenticated message WebSocket service", () => {
     await expect(client.waitForClose()).resolves.toBeUndefined();
   });
 
+  it("terminates before sending one outbound frame larger than the configured bound", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "oversized-outbound");
+    let historyCalls = 0;
+    let sendCalls = 0;
+    let subscribeCalls = 0;
+    const auth: AuthenticationService = {
+      async login() {
+        return session;
+      },
+      async authenticate() {
+        return principal;
+      },
+      async refresh() {
+        return session;
+      },
+      async revoke() {},
+    };
+    const service: MessageService = {
+      async send(_actorId, message) {
+        sendCalls += 1;
+        return {
+          type: "message.accepted",
+          requestId: message.id,
+          messageId: message.id,
+          persistedAt: "2026-08-10T00:00:00.000Z",
+        };
+      },
+      subscribe() {
+        subscribeCalls += 1;
+        return () => undefined;
+      },
+      async history() {
+        historyCalls += 1;
+        return [
+          {
+            ...messageFor(humans[0], "oversized-history-message"),
+            body: "界".repeat(512),
+          },
+        ];
+      },
+    };
+    const server = await startMessageWebSocketServer({
+      auth,
+      service,
+      maxBufferedAmountBytes: 512,
+    });
+    const client = await LoopbackClient.connect(server.url);
+
+    try {
+      await client.login(humans[0]);
+      client.send({ type: "room.history", requestId: "oversized-history", roomId });
+      client.send({
+        type: "message.send",
+        requestId: "queued-after-oversized-history",
+        message: draftFor("queued-after-oversized-history"),
+      });
+      client.send({
+        type: "room.subscribe",
+        requestId: "subscribe-after-oversized-history",
+        roomId,
+      });
+
+      await expect(client.waitForClose()).resolves.toBeUndefined();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(historyCalls).toBe(1);
+      expect(sendCalls).toBe(0);
+      expect(subscribeCalls).toBe(0);
+      expect(client.historyFrames("oversized-history")).toHaveLength(0);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("sends an outbound frame whose UTF-8 payload exactly equals the configured bound", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "exact-outbound");
+    const authenticated = {
+      type: "auth.authenticated",
+      requestId: "exact-outbound-login",
+      accountId: principal.accountId,
+      actorId: principal.actorId,
+      accessToken: session.accessToken,
+      refreshToken: session.refreshToken,
+      expiresAt: session.expiresAt,
+      refreshExpiresAt: session.refreshExpiresAt,
+    } as const;
+    const auth: AuthenticationService = {
+      async login() {
+        return session;
+      },
+      async authenticate() {
+        return principal;
+      },
+      async refresh() {
+        return session;
+      },
+      async revoke() {},
+    };
+    const service: MessageService = {
+      async send(_actorId, message) {
+        return {
+          type: "message.accepted",
+          requestId: message.id,
+          messageId: message.id,
+          persistedAt: "2026-08-10T00:00:00.000Z",
+        };
+      },
+      subscribe() {
+        return () => undefined;
+      },
+      async history() {
+        return [];
+      },
+    };
+    const server = await startMessageWebSocketServer({
+      auth,
+      service,
+      maxBufferedAmountBytes: Buffer.byteLength(JSON.stringify(authenticated), "utf8"),
+    });
+    const client = await LoopbackClient.connect(server.url);
+
+    try {
+      client.send({
+        type: "auth.login",
+        requestId: authenticated.requestId,
+        accountId: principal.accountId,
+        secret: "correct-secret",
+      });
+
+      await expect(client.waitForAuthentication(authenticated.requestId)).resolves.toMatchObject({
+        frame: authenticated,
+      });
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
   it("aborts queued actions synchronously before an outbound-bound termination", async () => {
     const principal = { accountId: "account-human-1", actorId: humans[0].id };
     const session = issuedSession(principal, "outbound-abort");
@@ -1220,11 +1364,12 @@ describe("authenticated message WebSocket service", () => {
     const clients = await Promise.all(humans.map(() => fixture.connect()));
     await Promise.all(clients.map((client, index) => client.login(humans[index]!)));
     await Promise.all(clients.map((client) => client.subscribe(roomId)));
+    const configuredAgents = agents.filter((agent) => agent.toolPermissions.length > 0);
 
     for (const [index, human] of humans.entries()) {
       await clients[index]!.sendDraft(draftFor(`message-${human.kind}-${index + 1}`));
     }
-    for (const [index, agent] of agents.entries()) {
+    for (const [index, agent] of configuredAgents.entries()) {
       await fixture.service().send(agent.id, draftFor(`message-${agent.kind}-${index + 1}`));
     }
 
@@ -1233,9 +1378,9 @@ describe("authenticated message WebSocket service", () => {
     await historyClient.history(roomId, "all-actors-history");
     const history = historyClient.messages(roomId);
 
-    expect(history).toHaveLength(7);
+    expect(history).toHaveLength(6);
     expect(history.filter((message) => message.authorKind === "human")).toHaveLength(3);
-    expect(history.filter((message) => message.authorKind === "agent")).toHaveLength(4);
+    expect(history.filter((message) => message.authorKind === "agent")).toHaveLength(3);
   });
 
   it("resumes after durable restart and rejects a revoked access token with 403", async () => {
@@ -1309,6 +1454,127 @@ describe("authenticated message WebSocket service", () => {
     await expect(fixture.messages()).resolves.toEqual([messageFor(humans[1], laterMessage.id)]);
   });
 
+  it("refreshes an authenticated socket after its access token expires", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const expiredSession = issuedSession(principal, "expired-access");
+    const refreshedSession = issuedSession(principal, "refreshed-access");
+    let accessExpired = false;
+    const auth: AuthenticationService = {
+      async login() {
+        return expiredSession;
+      },
+      async authenticate(accessToken) {
+        if (accessToken === expiredSession.accessToken && accessExpired) {
+          throw new AuthenticationError(401, "token_expired");
+        }
+        return principal;
+      },
+      async refresh(refreshToken, expectedPrincipal) {
+        expect(refreshToken).toBe(expiredSession.refreshToken);
+        expect(expectedPrincipal).toEqual(principal);
+        return refreshedSession;
+      },
+      async revoke() {},
+    };
+    const service: MessageService = {
+      async send(_actorId, message) {
+        return {
+          type: "message.accepted",
+          requestId: message.id,
+          messageId: message.id,
+          persistedAt: "2026-08-10T00:00:00.000Z",
+        };
+      },
+      subscribe() {
+        return () => undefined;
+      },
+      async history() {
+        return [];
+      },
+    };
+    const server = await startMessageWebSocketServer({ auth, service });
+    const client = await LoopbackClient.connect(server.url);
+
+    try {
+      await client.login(humans[0]);
+      accessExpired = true;
+
+      await expect(
+        client.refresh(expiredSession.refreshToken, "refresh-expired-access"),
+      ).resolves.toMatchObject({
+        frame: {
+          type: "auth.authenticated",
+          requestId: "refresh-expired-access",
+          actorId: humans[0].id,
+          accessToken: refreshedSession.accessToken,
+        },
+      });
+      await expect(client.history(roomId, "history-after-expired-refresh")).resolves.toMatchObject({
+        frame: { type: "room.history", requestId: "history-after-expired-refresh" },
+      });
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("authenticates a fresh socket from a still-valid refresh token", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const originalSession = issuedSession(principal, "fresh-original");
+    const refreshedSession = issuedSession(principal, "fresh-refreshed");
+    const auth: AuthenticationService = {
+      async login() {
+        return originalSession;
+      },
+      async authenticate() {
+        return principal;
+      },
+      async refresh(refreshToken, expectedPrincipal) {
+        expect(refreshToken).toBe(originalSession.refreshToken);
+        expect(expectedPrincipal).toBeUndefined();
+        return refreshedSession;
+      },
+      async revoke() {},
+    };
+    const service: MessageService = {
+      async send(_actorId, message) {
+        return {
+          type: "message.accepted",
+          requestId: message.id,
+          messageId: message.id,
+          persistedAt: "2026-08-10T00:00:00.000Z",
+        };
+      },
+      subscribe() {
+        return () => undefined;
+      },
+      async history() {
+        return [];
+      },
+    };
+    const server = await startMessageWebSocketServer({ auth, service });
+    const fresh = await LoopbackClient.connect(server.url);
+
+    try {
+      await expect(
+        fresh.refresh(originalSession.refreshToken, "refresh-fresh-socket"),
+      ).resolves.toMatchObject({
+        frame: {
+          type: "auth.authenticated",
+          requestId: "refresh-fresh-socket",
+          actorId: humans[0].id,
+          accessToken: refreshedSession.accessToken,
+        },
+      });
+      await expect(fresh.history(roomId, "history-after-fresh-refresh")).resolves.toMatchObject({
+        frame: { type: "room.history", requestId: "history-after-fresh-refresh" },
+      });
+    } finally {
+      await fresh.close();
+      await server.close();
+    }
+  });
+
   it("keeps refresh bound to the current actor and rotates the socket credential", async () => {
     const fixture = await createFixture();
     fixtures.push(fixture);
@@ -1322,10 +1588,15 @@ describe("authenticated message WebSocket service", () => {
       requestId: "cross-session-refresh",
       refreshToken: adaSession.refreshToken,
     });
-    await expect(lionel.waitForError("identity_forbidden", "cross-session-refresh")).resolves.toMatchObject({
+    await expect(
+      lionel.waitForError("identity_forbidden", "cross-session-refresh"),
+    ).resolves.toMatchObject({
       frame: { status: 403 },
     });
 
+    await expect(lionel.history(roomId, "lionel-after-cross-refresh")).resolves.toMatchObject({
+      frame: { type: "room.history", requestId: "lionel-after-cross-refresh" },
+    });
     await expect(ada.history(roomId, "ada-after-cross-refresh")).resolves.toMatchObject({
       frame: { type: "room.history", requestId: "ada-after-cross-refresh" },
     });
