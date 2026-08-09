@@ -38,6 +38,12 @@ export const MESSAGE_WEBSOCKET_MAX_PAYLOAD_BYTES = 64 * 1_024;
 export const MESSAGE_WEBSOCKET_MAX_BUFFERED_AMOUNT_BYTES = 1 * 1_024 * 1_024;
 
 const maxBufferedAmountBySocket = new WeakMap<WebSocket, number>();
+const abortConnectionBySocket = new WeakMap<WebSocket, () => void>();
+
+function abortAndTerminate(socket: WebSocket): void {
+  abortConnectionBySocket.get(socket)?.();
+  socket.terminate();
+}
 
 interface ConnectionContext {
   principal: AuthenticatedPrincipal | undefined;
@@ -86,13 +92,13 @@ function sendFrame(socket: WebSocket, frame: ServerFrame): void {
     maxBufferedAmountBySocket.get(socket) ??
     MESSAGE_WEBSOCKET_MAX_BUFFERED_AMOUNT_BYTES;
   if (socket.bufferedAmount >= maxBufferedAmount) {
-    socket.terminate();
+    abortAndTerminate(socket);
     return;
   }
   try {
     socket.send(JSON.stringify(frame));
   } catch {
-    // A closing socket cannot affect another client's accepted message.
+    abortAndTerminate(socket);
   }
 }
 
@@ -633,7 +639,6 @@ export async function startMessageWebSocketServer(
     maxPayload: MESSAGE_WEBSOCKET_MAX_PAYLOAD_BYTES,
   });
   const activeSockets = new Set<WebSocket>();
-  const contextsBySocket = new Map<WebSocket, ConnectionContext>();
   let closePromise: Promise<void> | undefined;
 
   webSocketServer.on("connection", (socket) => {
@@ -662,12 +667,11 @@ export async function startMessageWebSocketServer(
       abortConnection(context);
     };
 
+    abortConnectionBySocket.set(socket, abort);
     activeSockets.add(socket);
-    contextsBySocket.set(socket, context);
     socket.on("close", () => {
       abort();
       activeSockets.delete(socket);
-      contextsBySocket.delete(socket);
     });
     socket.on("error", abort);
     socket.on("message", (raw, isBinary) => {
@@ -722,11 +726,7 @@ export async function startMessageWebSocketServer(
     close(): Promise<void> {
       closePromise ??= (async () => {
         for (const socket of activeSockets) {
-          const context = contextsBySocket.get(socket);
-          if (context !== undefined) {
-            abortConnection(context);
-          }
-          socket.terminate();
+          abortAndTerminate(socket);
         }
         await closeWebSocketServer(webSocketServer);
         await closeHttpServer(httpServer);

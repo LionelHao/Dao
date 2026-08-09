@@ -622,6 +622,183 @@ describe("authenticated message WebSocket service", () => {
     await expect(client.waitForClose()).resolves.toBeUndefined();
   });
 
+  it("aborts queued actions synchronously before an outbound-bound termination", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "outbound-abort");
+    const terminationCalled = deferred<void>();
+    const originalTerminate = WebSocket.prototype.terminate;
+    let terminateCalls = 0;
+    let sendCalls = 0;
+    let persistedMessages = 0;
+    let historyCalls = 0;
+    let subscribeCalls = 0;
+    let activeSubscriptions = 0;
+    let unsubscribeCalls = 0;
+    const auth: AuthenticationService = {
+      async login() {
+        return session;
+      },
+      async authenticate() {
+        return principal;
+      },
+      async refresh() {
+        return session;
+      },
+      async revoke() {},
+    };
+    const service: MessageService = {
+      async send(_actorId, message) {
+        sendCalls += 1;
+        persistedMessages += 1;
+        return {
+          type: "message.accepted",
+          requestId: message.id,
+          messageId: message.id,
+          persistedAt: "2026-08-10T00:00:00.000Z",
+        };
+      },
+      subscribe() {
+        subscribeCalls += 1;
+        activeSubscriptions += 1;
+        return () => {
+          activeSubscriptions -= 1;
+          unsubscribeCalls += 1;
+        };
+      },
+      async history() {
+        historyCalls += 1;
+        return [];
+      },
+    };
+    const server = await startMessageWebSocketServer({
+      auth,
+      service,
+      maxBufferedAmountBytes: 0,
+    });
+    const client = await LoopbackClient.connect(server.url);
+
+    WebSocket.prototype.terminate = function terminateWithoutClosing() {
+      terminateCalls += 1;
+      terminationCalled.resolve();
+    };
+    try {
+      client.send({
+        type: "auth.login",
+        requestId: "terminate-login",
+        accountId: principal.accountId,
+        secret: "correct-secret",
+      });
+      client.send({
+        type: "message.send",
+        requestId: "queued-send",
+        message: draftFor("queued-after-terminate"),
+      });
+      client.send({ type: "room.history", requestId: "queued-history", roomId });
+      client.send({ type: "room.subscribe", requestId: "queued-subscribe", roomId });
+
+      await terminationCalled.promise;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(terminateCalls).toBe(1);
+      expect(sendCalls).toBe(0);
+      expect(persistedMessages).toBe(0);
+      expect(historyCalls).toBe(0);
+      expect(subscribeCalls).toBe(0);
+      expect(activeSubscriptions).toBe(0);
+      expect(unsubscribeCalls).toBe(0);
+    } finally {
+      WebSocket.prototype.terminate = originalTerminate;
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("aborts queued actions when an outbound send throws synchronously", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "send-failure-abort");
+    const loginStarted = deferred<void>();
+    const login = deferred<IssuedSession>();
+    const originalSend = WebSocket.prototype.send;
+    const originalTerminate = WebSocket.prototype.terminate;
+    let terminateCalls = 0;
+    let sendCalls = 0;
+    let historyCalls = 0;
+    let subscribeCalls = 0;
+    const auth: AuthenticationService = {
+      login() {
+        loginStarted.resolve();
+        return login.promise;
+      },
+      async authenticate() {
+        return principal;
+      },
+      async refresh() {
+        return session;
+      },
+      async revoke() {},
+    };
+    const service: MessageService = {
+      async send(_actorId, message) {
+        sendCalls += 1;
+        return {
+          type: "message.accepted",
+          requestId: message.id,
+          messageId: message.id,
+          persistedAt: "2026-08-10T00:00:00.000Z",
+        };
+      },
+      subscribe() {
+        subscribeCalls += 1;
+        return () => undefined;
+      },
+      async history() {
+        historyCalls += 1;
+        return [];
+      },
+    };
+    const server = await startMessageWebSocketServer({ auth, service });
+    const client = await LoopbackClient.connect(server.url);
+
+    try {
+      client.send({
+        type: "auth.login",
+        requestId: "throwing-login",
+        accountId: principal.accountId,
+        secret: "correct-secret",
+      });
+      client.send({
+        type: "message.send",
+        requestId: "queued-send",
+        message: draftFor("queued-after-send-failure"),
+      });
+      client.send({ type: "room.history", requestId: "queued-history", roomId });
+      client.send({ type: "room.subscribe", requestId: "queued-subscribe", roomId });
+      await loginStarted.promise;
+
+      WebSocket.prototype.send = function throwOnSend() {
+        throw new Error("injected synchronous send failure");
+      };
+      WebSocket.prototype.terminate = function terminateWithoutClosing() {
+        terminateCalls += 1;
+      };
+      login.resolve(session);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(terminateCalls).toBe(1);
+      expect(sendCalls).toBe(0);
+      expect(historyCalls).toBe(0);
+      expect(subscribeCalls).toBe(0);
+    } finally {
+      WebSocket.prototype.send = originalSend;
+      WebSocket.prototype.terminate = originalTerminate;
+      login.resolve(session);
+      await client.close();
+      await server.close();
+    }
+  });
+
   it("returns 401 for each pre-auth action and 403 for each authenticated non-member action", async () => {
     const fixture = await createFixture();
     fixtures.push(fixture);
