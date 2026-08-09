@@ -11,6 +11,7 @@ import {
   RoomAccessError,
   type MessageService,
 } from "./service.js";
+import { MessageIdConflictError } from "./store.js";
 import {
   parseClientFrame,
   type AuthenticatedFrame,
@@ -29,13 +30,21 @@ export interface StartMessageWebSocketServerOptions {
   readonly service: MessageService;
   readonly host?: string;
   readonly port?: number;
+  readonly maxBufferedAmountBytes?: number;
   readonly afterSubscribeRegistered?: (roomId: string) => void | Promise<void>;
 }
+
+export const MESSAGE_WEBSOCKET_MAX_PAYLOAD_BYTES = 64 * 1_024;
+export const MESSAGE_WEBSOCKET_MAX_BUFFERED_AMOUNT_BYTES = 1 * 1_024 * 1_024;
+
+const maxBufferedAmountBySocket = new WeakMap<WebSocket, number>();
 
 interface ConnectionContext {
   principal: AuthenticatedPrincipal | undefined;
   accessToken: string | undefined;
+  credentialGeneration: number;
   authOperationPending: boolean;
+  closed: boolean;
   readonly unsubscribersByRoom: Map<string, () => void>;
   readonly subscriptionGenerationsByRoom: Map<string, number>;
   readonly unsubscribeAll: () => void;
@@ -63,11 +72,21 @@ function mappedError(error: unknown, requestId: string): ProtocolErrorFrame {
   if (error instanceof MessageValidationError) {
     return errorFrame(error.status, error.code, error.code, requestId);
   }
+  if (error instanceof MessageIdConflictError) {
+    return errorFrame(error.status, error.code, error.code, requestId);
+  }
   return errorFrame(500, "internal_error", "Unable to process request", requestId);
 }
 
 function sendFrame(socket: WebSocket, frame: ServerFrame): void {
   if (socket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  const maxBufferedAmount =
+    maxBufferedAmountBySocket.get(socket) ??
+    MESSAGE_WEBSOCKET_MAX_BUFFERED_AMOUNT_BYTES;
+  if (socket.bufferedAmount >= maxBufferedAmount) {
+    socket.terminate();
     return;
   }
   try {
@@ -119,6 +138,17 @@ function safelyUnsubscribe(unsubscribe: (() => void) | undefined): void {
   }
 }
 
+function onceUnsubscribe(unsubscribe: () => void): () => void {
+  let active = true;
+  return () => {
+    if (!active) {
+      return;
+    }
+    active = false;
+    safelyUnsubscribe(unsubscribe);
+  };
+}
+
 function samePrincipal(
   left: AuthenticatedPrincipal,
   right: AuthenticatedPrincipal,
@@ -150,10 +180,43 @@ function authenticatedFrame(
       };
 }
 
-function clearAuthentication(context: ConnectionContext): void {
+function installAuthentication(
+  context: ConnectionContext,
+  principal: AuthenticatedPrincipal,
+  accessToken: string,
+): boolean {
+  if (context.closed) {
+    return false;
+  }
+  context.credentialGeneration += 1;
+  context.principal = principal;
+  context.accessToken = accessToken;
+  return true;
+}
+
+function clearAuthentication(
+  context: ConnectionContext,
+  expectedGeneration?: number,
+): boolean {
+  if (
+    expectedGeneration !== undefined &&
+    context.credentialGeneration !== expectedGeneration
+  ) {
+    return false;
+  }
+  context.credentialGeneration += 1;
   context.principal = undefined;
   context.accessToken = undefined;
   context.unsubscribeAll();
+  return true;
+}
+
+function abortConnection(context: ConnectionContext): void {
+  if (context.closed) {
+    return;
+  }
+  context.closed = true;
+  clearAuthentication(context);
 }
 
 async function authenticateCurrent(
@@ -162,19 +225,27 @@ async function authenticateCurrent(
 ): Promise<AuthenticatedPrincipal> {
   const storedPrincipal = context.principal;
   const accessToken = context.accessToken;
+  const credentialGeneration = context.credentialGeneration;
   if (storedPrincipal === undefined || accessToken === undefined) {
     throw errorFrame(401, "unauthenticated", "Authentication is required");
   }
 
   try {
     const principal = await options.auth.authenticate(accessToken);
+    if (
+      context.closed ||
+      context.credentialGeneration !== credentialGeneration ||
+      context.accessToken !== accessToken
+    ) {
+      throw errorFrame(401, "unauthenticated", "Authentication is required");
+    }
     if (!samePrincipal(principal, storedPrincipal)) {
-      clearAuthentication(context);
+      clearAuthentication(context, credentialGeneration);
       throw errorFrame(403, "identity_forbidden", "Session identity changed");
     }
     return principal;
   } catch (error: unknown) {
-    clearAuthentication(context);
+    clearAuthentication(context, credentialGeneration);
     throw error;
   }
 }
@@ -196,6 +267,9 @@ async function requirePrincipal(
   options: StartMessageWebSocketServerOptions,
   context: ConnectionContext,
 ): Promise<AuthenticatedPrincipal | undefined> {
+  if (context.closed) {
+    return undefined;
+  }
   if (context.principal === undefined || context.accessToken === undefined) {
     sendFrame(
       socket,
@@ -205,8 +279,12 @@ async function requirePrincipal(
   }
 
   try {
-    return await authenticateCurrent(options, context);
+    const principal = await authenticateCurrent(options, context);
+    return context.closed ? undefined : principal;
   } catch (error: unknown) {
+    if (context.closed) {
+      return undefined;
+    }
     sendFrame(
       socket,
       isProtocolErrorFrame(error)
@@ -248,18 +326,22 @@ async function handleLoginOrResume(
         secret: frame.secret,
       });
       const principal = { accountId: session.accountId, actorId: session.actorId };
-      context.principal = principal;
-      context.accessToken = session.accessToken;
+      if (!installAuthentication(context, principal, session.accessToken)) {
+        return;
+      }
       sendFrame(socket, authenticatedFrame(frame.requestId, principal, session));
       return;
     }
 
     const principal = await options.auth.authenticate(frame.accessToken);
-    context.principal = principal;
-    context.accessToken = frame.accessToken;
+    if (!installAuthentication(context, principal, frame.accessToken)) {
+      return;
+    }
     sendFrame(socket, authenticatedFrame(frame.requestId, principal));
   } catch (error: unknown) {
-    sendFrame(socket, mappedError(error, frame.requestId));
+    if (!context.closed) {
+      sendFrame(socket, mappedError(error, frame.requestId));
+    }
   } finally {
     context.authOperationPending = false;
   }
@@ -291,6 +373,9 @@ async function handleRefresh(
   context.authOperationPending = true;
   try {
     const session = await options.auth.refresh(frame.refreshToken, principal);
+    if (context.closed) {
+      return;
+    }
     const refreshedPrincipal = {
       accountId: session.accountId,
       actorId: session.actorId,
@@ -308,14 +393,17 @@ async function handleRefresh(
       return;
     }
 
-    context.principal = refreshedPrincipal;
-    context.accessToken = session.accessToken;
+    if (!installAuthentication(context, refreshedPrincipal, session.accessToken)) {
+      return;
+    }
     sendFrame(
       socket,
       authenticatedFrame(frame.requestId, refreshedPrincipal, session),
     );
   } catch (error: unknown) {
-    sendFrame(socket, mappedError(error, frame.requestId));
+    if (!context.closed) {
+      sendFrame(socket, mappedError(error, frame.requestId));
+    }
   } finally {
     context.authOperationPending = false;
   }
@@ -340,10 +428,14 @@ async function handleRevoke(
   try {
     await options.auth.revoke(accessToken);
     clearAuthentication(context);
-    sendFrame(socket, { type: "auth.revoked", requestId: frame.requestId });
+    if (!context.closed) {
+      sendFrame(socket, { type: "auth.revoked", requestId: frame.requestId });
+    }
   } catch (error: unknown) {
     clearAuthentication(context);
-    sendFrame(socket, mappedError(error, frame.requestId));
+    if (!context.closed) {
+      sendFrame(socket, mappedError(error, frame.requestId));
+    }
   } finally {
     context.authOperationPending = false;
   }
@@ -356,6 +448,9 @@ async function handleSubscribe(
   options: StartMessageWebSocketServerOptions,
   context: ConnectionContext,
 ): Promise<void> {
+  if (context.closed) {
+    return;
+  }
   const generation = (context.subscriptionGenerationsByRoom.get(frame.roomId) ?? 0) + 1;
   context.subscriptionGenerationsByRoom.set(frame.roomId, generation);
 
@@ -366,33 +461,51 @@ async function handleSubscribe(
   let unsubscribe: (() => void) | undefined;
   let deliveryQueue = Promise.resolve();
   try {
-    unsubscribe = options.service.subscribe(actorId, frame.roomId, (message) => {
-      deliveryQueue = deliveryQueue.then(async () => {
-        if (context.subscriptionGenerationsByRoom.get(frame.roomId) !== generation) {
-          return;
-        }
-        try {
-          await authenticateCurrent(options, context);
-        } catch {
-          return;
-        }
-        if (context.subscriptionGenerationsByRoom.get(frame.roomId) === generation) {
-          sendFrame(socket, { type: "message.created", message });
-        }
-      });
-      return deliveryQueue;
-    });
+    unsubscribe = onceUnsubscribe(
+      options.service.subscribe(actorId, frame.roomId, (message) => {
+        deliveryQueue = deliveryQueue.then(async () => {
+          if (
+            context.closed ||
+            context.subscriptionGenerationsByRoom.get(frame.roomId) !== generation
+          ) {
+            return;
+          }
+          try {
+            await authenticateCurrent(options, context);
+          } catch {
+            return;
+          }
+          if (
+            !context.closed &&
+            context.subscriptionGenerationsByRoom.get(frame.roomId) === generation
+          ) {
+            sendFrame(socket, { type: "message.created", message });
+          }
+        });
+        return deliveryQueue;
+      }),
+    );
+    if (context.closed) {
+      safelyUnsubscribe(unsubscribe);
+      return;
+    }
     context.unsubscribersByRoom.set(frame.roomId, unsubscribe);
 
     await options.afterSubscribeRegistered?.(frame.roomId);
     await deliveryQueue;
-    if (context.subscriptionGenerationsByRoom.get(frame.roomId) !== generation) {
+    if (
+      context.closed ||
+      context.subscriptionGenerationsByRoom.get(frame.roomId) !== generation
+    ) {
       safelyUnsubscribe(unsubscribe);
       return;
     }
 
     const messages = await options.service.history(actorId, frame.roomId);
-    if (context.subscriptionGenerationsByRoom.get(frame.roomId) !== generation) {
+    if (
+      context.closed ||
+      context.subscriptionGenerationsByRoom.get(frame.roomId) !== generation
+    ) {
       safelyUnsubscribe(unsubscribe);
       return;
     }
@@ -410,6 +523,9 @@ async function handleSubscribe(
     });
   } catch (error: unknown) {
     safelyUnsubscribe(unsubscribe);
+    if (context.closed) {
+      return;
+    }
     if (context.subscriptionGenerationsByRoom.get(frame.roomId) !== generation) {
       return;
     }
@@ -445,9 +561,13 @@ async function handleFrame(
       }
       try {
         const acknowledgement = await options.service.send(principal.actorId, frame.message);
-        sendFrame(socket, { ...acknowledgement, requestId: frame.requestId });
+        if (!context.closed) {
+          sendFrame(socket, { ...acknowledgement, requestId: frame.requestId });
+        }
       } catch (error: unknown) {
-        sendFrame(socket, mappedError(error, frame.requestId));
+        if (!context.closed) {
+          sendFrame(socket, mappedError(error, frame.requestId));
+        }
       }
       return;
     }
@@ -458,14 +578,18 @@ async function handleFrame(
       }
       try {
         const messages = await options.service.history(principal.actorId, frame.roomId);
-        sendFrame(socket, {
-          type: "room.history",
-          requestId: frame.requestId,
-          roomId: frame.roomId,
-          messages,
-        });
+        if (!context.closed) {
+          sendFrame(socket, {
+            type: "room.history",
+            requestId: frame.requestId,
+            roomId: frame.roomId,
+            messages,
+          });
+        }
       } catch (error: unknown) {
-        sendFrame(socket, mappedError(error, frame.requestId));
+        if (!context.closed) {
+          sendFrame(socket, mappedError(error, frame.requestId));
+        }
       }
       return;
     }
@@ -498,12 +622,22 @@ export async function startMessageWebSocketServer(
 ): Promise<MessageWebSocketServer> {
   const host = options.host ?? "127.0.0.1";
   const port = options.port ?? 0;
+  const maxBufferedAmountBytes =
+    options.maxBufferedAmountBytes ?? MESSAGE_WEBSOCKET_MAX_BUFFERED_AMOUNT_BYTES;
+  if (!Number.isFinite(maxBufferedAmountBytes) || maxBufferedAmountBytes < 0) {
+    throw new RangeError("maxBufferedAmountBytes must be a non-negative finite number");
+  }
   const httpServer = createServer();
-  const webSocketServer = new WebSocketServer({ server: httpServer });
+  const webSocketServer = new WebSocketServer({
+    server: httpServer,
+    maxPayload: MESSAGE_WEBSOCKET_MAX_PAYLOAD_BYTES,
+  });
   const activeSockets = new Set<WebSocket>();
+  const contextsBySocket = new Map<WebSocket, ConnectionContext>();
   let closePromise: Promise<void> | undefined;
 
   webSocketServer.on("connection", (socket) => {
+    maxBufferedAmountBySocket.set(socket, maxBufferedAmountBytes);
     const unsubscribersByRoom = new Map<string, () => void>();
     const subscriptionGenerationsByRoom = new Map<string, number>();
     const unsubscribeAll = () => {
@@ -516,44 +650,62 @@ export async function startMessageWebSocketServer(
     const context: ConnectionContext = {
       principal: undefined,
       accessToken: undefined,
+      credentialGeneration: 0,
       authOperationPending: false,
+      closed: false,
       unsubscribersByRoom,
       subscriptionGenerationsByRoom,
       unsubscribeAll,
     };
+    let frameQueue = Promise.resolve();
+    const abort = () => {
+      abortConnection(context);
+    };
 
     activeSockets.add(socket);
-    socket.on("close", unsubscribeAll);
+    contextsBySocket.set(socket, context);
     socket.on("close", () => {
+      abort();
       activeSockets.delete(socket);
+      contextsBySocket.delete(socket);
     });
-    socket.on("error", unsubscribeAll);
+    socket.on("error", abort);
     socket.on("message", (raw, isBinary) => {
-      if (isBinary) {
-        sendFrame(
-          socket,
-          errorFrame(400, "invalid_request", "Binary requests are not supported"),
-        );
-        return;
-      }
+      const queued = frameQueue.then(async () => {
+        if (context.closed) {
+          return;
+        }
+        if (isBinary) {
+          sendFrame(
+            socket,
+            errorFrame(400, "invalid_request", "Binary requests are not supported"),
+          );
+          return;
+        }
 
-      const parsed = parseClientFrame(rawDataToString(raw));
-      if (!parsed.ok) {
-        sendFrame(socket, parsed.error);
-        return;
-      }
+        const parsed = parseClientFrame(rawDataToString(raw));
+        if (!parsed.ok) {
+          sendFrame(socket, parsed.error);
+          return;
+        }
 
-      void handleFrame(socket, parsed.frame, options, context).catch(() => {
-        sendFrame(
-          socket,
-          errorFrame(
-            500,
-            "internal_error",
-            "Unable to process request",
-            parsed.frame.requestId,
-          ),
-        );
+        try {
+          await handleFrame(socket, parsed.frame, options, context);
+        } catch {
+          if (!context.closed) {
+            sendFrame(
+              socket,
+              errorFrame(
+                500,
+                "internal_error",
+                "Unable to process request",
+                parsed.frame.requestId,
+              ),
+            );
+          }
+        }
       });
+      frameQueue = queued.catch(() => undefined);
     });
   });
 
@@ -570,6 +722,10 @@ export async function startMessageWebSocketServer(
     close(): Promise<void> {
       closePromise ??= (async () => {
         for (const socket of activeSockets) {
+          const context = contextsBySocket.get(socket);
+          if (context !== undefined) {
+            abortConnection(context);
+          }
           socket.terminate();
         }
         await closeWebSocketServer(webSocketServer);

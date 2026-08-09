@@ -13,7 +13,11 @@ import {
   isRoomLifecycleState,
   isSessionState,
   startMessageWebSocketServer,
+  AuthenticationError,
+  type AuthenticatedPrincipal,
+  type AuthenticationService,
   type IdentityAdapter,
+  type IssuedSession,
   type LoginCredentials,
   type MessageService,
   type MessageStore,
@@ -179,18 +183,18 @@ class LoopbackClient {
       accountId,
       secret: `secret-${actor.id}`,
     });
-    const received = await this.waitForAuthenticated(requestId);
+    const received = await this.waitForAuthentication(requestId);
     return received.frame as SessionFrame;
   }
 
   async resume(accessToken: string, requestId = "resume"): Promise<ReceivedFrame> {
     this.send({ type: "auth.resume", requestId, accessToken });
-    return this.waitForAuthenticated(requestId);
+    return this.waitForAuthentication(requestId);
   }
 
   async refresh(refreshToken: string, requestId = "refresh"): Promise<ReceivedFrame> {
     this.send({ type: "auth.refresh", requestId, refreshToken });
-    return this.waitForAuthenticated(requestId);
+    return this.waitForAuthentication(requestId);
   }
 
   async revoke(requestId = "revoke"): Promise<ReceivedFrame> {
@@ -277,6 +281,19 @@ class LoopbackClient {
     });
   }
 
+  async waitForClose(timeoutMs = 1_000): Promise<void> {
+    if (this.socket.readyState === WebSocket.CLOSED) {
+      return;
+    }
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Timed out waiting for socket close")), timeoutMs);
+      this.socket.once("close", () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+    });
+  }
+
   frameIndex(predicate: (frame: unknown) => boolean): number {
     return this.receivedFrames.findIndex((entry) => predicate(entry.frame));
   }
@@ -289,10 +306,11 @@ class LoopbackClient {
     return this.receivedFrames.filter((entry) => hasHistory(entry.frame, requestId));
   }
 
-  private waitForAuthenticated(requestId: string): Promise<ReceivedFrame> {
+  waitForAuthentication(requestId: string, timeoutMs?: number): Promise<ReceivedFrame> {
     return this.waitFor(
       (frame) => hasType(frame, "auth.authenticated") && frame.requestId === requestId,
       `authentication ${requestId}`,
+      timeoutMs,
     );
   }
 
@@ -378,6 +396,29 @@ function settlesWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   });
 }
 
+function deferred<Value>() {
+  let resolve!: (value: Value | PromiseLike<Value>) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<Value>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function issuedSession(
+  principal: AuthenticatedPrincipal,
+  tokenPrefix: string,
+): IssuedSession {
+  return {
+    ...principal,
+    accessToken: `${tokenPrefix}-access`,
+    refreshToken: `${tokenPrefix}-refresh`,
+    expiresAt: "2026-08-10T01:00:00.000Z",
+    refreshExpiresAt: "2026-08-11T00:00:00.000Z",
+  };
+}
+
 async function populateRoom(rooms: RoomLifecycleService): Promise<void> {
   if (rooms.getRoom(roomId) !== undefined) {
     return;
@@ -404,7 +445,9 @@ async function populateRoom(rooms: RoomLifecycleService): Promise<void> {
   }
 }
 
-async function createFixture(): Promise<{
+async function createFixture(options: {
+  readonly maxBufferedAmountBytes?: number;
+} = {}): Promise<{
   readonly connect: () => Promise<LoopbackClient>;
   readonly clients: readonly LoopbackClient[];
   readonly close: () => Promise<void>;
@@ -414,6 +457,7 @@ async function createFixture(): Promise<{
   readonly advanceClock: (milliseconds: number) => void;
   readonly messages: () => Promise<readonly Message[]>;
   readonly rooms: () => RoomLifecycleService;
+  readonly service: () => MessageService;
 }> {
   const directory = await mkdtemp(join(tmpdir(), "native-im-websocket-"));
   const sessionsPath = join(directory, "sessions.json");
@@ -424,6 +468,7 @@ async function createFixture(): Promise<{
   let now = Date.parse("2026-08-09T08:00:00.000Z");
   let activeServer: MessageWebSocketServer | undefined;
   let activeRooms: RoomLifecycleService | undefined;
+  let activeService: MessageService | undefined;
   let afterSubscribeRegistered: (() => Promise<void>) | undefined;
 
   async function start(): Promise<void> {
@@ -436,6 +481,7 @@ async function createFixture(): Promise<{
     });
     await populateRoom(rooms);
     const auth = createAuthenticationService({
+      actors: rooms,
       identities: identityAdapter,
       sessions: createJsonStateStore(sessionsPath, isSessionState),
       clock: () => now,
@@ -447,9 +493,11 @@ async function createFixture(): Promise<{
       store: createJsonlMessageStore(messagesPath),
     });
     activeRooms = rooms;
+    activeService = service;
     activeServer = await startMessageWebSocketServer({
       auth,
       service,
+      maxBufferedAmountBytes: options.maxBufferedAmountBytes,
       afterSubscribeRegistered: async () => {
         const hook = afterSubscribeRegistered;
         afterSubscribeRegistered = undefined;
@@ -497,6 +545,12 @@ async function createFixture(): Promise<{
         throw new Error("room directory is unavailable");
       }
       return activeRooms;
+    },
+    service: () => {
+      if (activeService === undefined) {
+        throw new Error("message service is unavailable");
+      }
+      return activeService;
     },
   };
 }
@@ -546,6 +600,26 @@ describe("authenticated message WebSocket service", () => {
     await expect(client.waitForError("invalid_request", "extra-field")).resolves.toMatchObject({
       frame: { status: 400 },
     });
+  });
+
+  it("closes an inbound frame larger than 64 KiB", async () => {
+    const fixture = await createFixture();
+    fixtures.push(fixture);
+    const client = await fixture.connect();
+
+    client.sendRaw("x".repeat(64 * 1_024 + 1));
+
+    await expect(client.waitForClose()).resolves.toBeUndefined();
+  });
+
+  it("terminates a socket before sending when its outbound buffer reaches the configured bound", async () => {
+    const fixture = await createFixture({ maxBufferedAmountBytes: 0 });
+    fixtures.push(fixture);
+    const client = await fixture.connect();
+
+    client.sendRaw("{not-json");
+
+    await expect(client.waitForClose()).resolves.toBeUndefined();
   });
 
   it("returns 401 for each pre-auth action and 403 for each authenticated non-member action", async () => {
@@ -627,6 +701,27 @@ describe("authenticated message WebSocket service", () => {
     ]);
   });
 
+  it("acknowledges exact replay once and rejects cross-author message ID reuse", async () => {
+    const fixture = await createFixture();
+    fixtures.push(fixture);
+    const lionel = await fixture.connect();
+    const ada = await fixture.connect();
+    await Promise.all([lionel.login(humans[0]), ada.login(humans[1])]);
+    await ada.subscribe(roomId);
+    const message = draftFor("transport-idempotent-message");
+
+    await lionel.sendDraft(message, "first-send");
+    await ada.waitForMessage(message.id);
+    await lionel.sendDraft(message, "exact-replay");
+    ada.send({ type: "message.send", requestId: "cross-author-id", message });
+    await expect(ada.waitForError("message_id_conflict", "cross-author-id")).resolves.toMatchObject({
+      frame: { status: 409 },
+    });
+
+    expect(ada.frameCount((frame) => hasMessageCreated(frame, message.id))).toBe(1);
+    await expect(fixture.messages()).resolves.toEqual([messageFor(humans[0], message.id)]);
+  });
+
   it("delivers one persisted message to three subscribed authenticated clients within one second", async () => {
     const fixture = await createFixture();
     fixtures.push(fixture);
@@ -697,16 +792,29 @@ describe("authenticated message WebSocket service", () => {
     ).toHaveLength(1);
   });
 
-  it("supports all existing human and agent actors through authenticated sessions", async () => {
+  it("keeps WebSocket sessions human-only while the trusted service can author agent messages", async () => {
     const fixture = await createFixture();
     fixtures.push(fixture);
-    const roomActors = [...humans, ...agents];
-    const clients = await Promise.all(roomActors.map(() => fixture.connect()));
-    await Promise.all(clients.map((client, index) => client.login(roomActors[index]!)));
+    const agentClient = await fixture.connect();
+    agentClient.send({
+      type: "auth.login",
+      requestId: "agent-login",
+      accountId: `account-${agents[0].id}`,
+      secret: `secret-${agents[0].id}`,
+    });
+    await expect(agentClient.waitForError("identity_forbidden", "agent-login")).resolves.toMatchObject({
+      frame: { status: 403 },
+    });
+
+    const clients = await Promise.all(humans.map(() => fixture.connect()));
+    await Promise.all(clients.map((client, index) => client.login(humans[index]!)));
     await Promise.all(clients.map((client) => client.subscribe(roomId)));
 
-    for (const [index, actor] of roomActors.entries()) {
-      await clients[index]!.sendDraft(draftFor(`message-${actor.kind}-${index + 1}`));
+    for (const [index, human] of humans.entries()) {
+      await clients[index]!.sendDraft(draftFor(`message-${human.kind}-${index + 1}`));
+    }
+    for (const [index, agent] of agents.entries()) {
+      await fixture.service().send(agent.id, draftFor(`message-${agent.kind}-${index + 1}`));
     }
 
     const historyClient = await fixture.connect();
@@ -777,19 +885,17 @@ describe("authenticated message WebSocket service", () => {
     const sender = await fixture.connect();
     await expired.login(humans[0]);
     await expired.subscribe(roomId);
-    await sender.login(humans[1]);
     fixture.advanceClock(1_001);
 
     expired.send({ type: "room.history", requestId: "expired-history", roomId });
     await expect(expired.waitForError("token_expired", "expired-history")).resolves.toMatchObject({
       frame: { status: 401 },
     });
+    await sender.login(humans[1], "login-valid-sender");
     const laterMessage = draftFor("message-after-expiry");
-    sender.send({ type: "message.send", requestId: laterMessage.id, message: laterMessage });
-    await expect(sender.waitForError("token_expired", laterMessage.id)).resolves.toMatchObject({
-      frame: { status: 401 },
-    });
+    await sender.sendDraft(laterMessage);
     await expect(expired.waitForMessage(laterMessage.id, 100)).rejects.toThrow("Timed out");
+    await expect(fixture.messages()).resolves.toEqual([messageFor(humans[1], laterMessage.id)]);
   });
 
   it("keeps refresh bound to the current actor and rotates the socket credential", async () => {
@@ -823,6 +929,311 @@ describe("authenticated message WebSocket service", () => {
     await expect(fixture.messages()).resolves.toEqual([
       messageFor(humans[0], "message-after-refresh"),
     ]);
+  });
+
+  it.each(["message.send", "room.history", "room.subscribe"] as const)(
+    "serializes a deferred %s before a later refresh and uses the new credential next",
+    async (actionType) => {
+      const principal = { accountId: "account-human-1", actorId: humans[0].id };
+      const oldSession = issuedSession(principal, "serial-old");
+      const newSession = issuedSession(principal, "serial-new");
+      const actionGate = deferred<void>();
+      const authenticatedTokens: string[] = [];
+      const auth: AuthenticationService = {
+        async login() {
+          return oldSession;
+        },
+        async authenticate(accessToken) {
+          authenticatedTokens.push(accessToken);
+          return principal;
+        },
+        async refresh() {
+          return newSession;
+        },
+        async revoke() {},
+      };
+      let actionReleased = false;
+      const service: MessageService = {
+        async send(_actorId, message) {
+          if (actionType === "message.send" && !actionReleased) {
+            await actionGate.promise;
+          }
+          return {
+            type: "message.accepted",
+            requestId: message.id,
+            messageId: message.id,
+            persistedAt: "2026-08-10T00:00:00.000Z",
+          };
+        },
+        subscribe() {
+          return () => undefined;
+        },
+        async history() {
+          if (actionType === "room.history" && !actionReleased) {
+            await actionGate.promise;
+          }
+          return [];
+        },
+      };
+      const server = await startMessageWebSocketServer({
+        auth,
+        service,
+        afterSubscribeRegistered:
+          actionType === "room.subscribe"
+            ? async () => {
+                if (!actionReleased) {
+                  await actionGate.promise;
+                }
+              }
+            : undefined,
+      });
+      const client = await LoopbackClient.connect(server.url);
+      const actionRequestId = `deferred-${actionType}`;
+
+      try {
+        await client.login(humans[0]);
+        if (actionType === "message.send") {
+          client.send({
+            type: actionType,
+            requestId: actionRequestId,
+            message: draftFor("serial-action-message"),
+          });
+        } else {
+          client.send({ type: actionType, requestId: actionRequestId, roomId });
+        }
+        client.send({
+          type: "auth.refresh",
+          requestId: "queued-refresh",
+          refreshToken: oldSession.refreshToken,
+        });
+
+        await expect(client.waitForAuthentication("queued-refresh", 100)).rejects.toThrow(
+          "Timed out",
+        );
+        actionReleased = true;
+        actionGate.resolve();
+        if (actionType === "message.send") {
+          await client.waitForAcceptance("serial-action-message");
+        } else {
+          await client.waitForHistory(actionRequestId);
+        }
+        const refreshed = await client.waitForAuthentication("queued-refresh");
+        expect(refreshed.frame).toMatchObject({ accessToken: newSession.accessToken });
+
+        await client.history(roomId, "after-serialized-refresh");
+        expect(authenticatedTokens.at(-1)).toBe(newSession.accessToken);
+      } finally {
+        actionReleased = true;
+        actionGate.resolve();
+        await client.close();
+        await server.close();
+      }
+    },
+  );
+
+  it("does not let a failed live check for an old credential clear a refreshed session", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const oldSession = issuedSession(principal, "live-old");
+    const newSession = issuedSession(principal, "live-new");
+    const oldLiveAuthentication = deferred<AuthenticatedPrincipal>();
+    let oldAuthenticationCalls = 0;
+    const auth: AuthenticationService = {
+      async login() {
+        return oldSession;
+      },
+      authenticate(accessToken) {
+        if (accessToken === newSession.accessToken) {
+          return Promise.resolve(principal);
+        }
+        oldAuthenticationCalls += 1;
+        if (oldAuthenticationCalls === 2) {
+          return oldLiveAuthentication.promise;
+        }
+        return Promise.resolve(principal);
+      },
+      async refresh() {
+        return newSession;
+      },
+      async revoke() {},
+    };
+    let liveListener: ((message: Message) => void | Promise<void>) | undefined;
+    const service: MessageService = {
+      async send(_actorId, message) {
+        return {
+          type: "message.accepted",
+          requestId: message.id,
+          messageId: message.id,
+          persistedAt: "2026-08-10T00:00:00.000Z",
+        };
+      },
+      subscribe(_actorId, _targetRoomId, listener) {
+        liveListener = listener;
+        return () => {
+          liveListener = undefined;
+        };
+      },
+      async history() {
+        return [];
+      },
+    };
+    const server = await startMessageWebSocketServer({ auth, service });
+    const client = await LoopbackClient.connect(server.url);
+
+    try {
+      await client.login(humans[0]);
+      await client.subscribe(roomId);
+      const liveDelivery = Promise.resolve(
+        liveListener?.(messageFor(humans[1], "stale-live-message")),
+      );
+
+      await client.refresh(oldSession.refreshToken, "refresh-during-live-check");
+      oldLiveAuthentication.reject(new AuthenticationError(401, "invalid_token"));
+      await liveDelivery;
+
+      await expect(client.history(roomId, "after-live-race")).resolves.toMatchObject({
+        frame: { type: "room.history", requestId: "after-live-race" },
+      });
+      await expect(client.waitForMessage("stale-live-message", 100)).rejects.toThrow(
+        "Timed out",
+      );
+    } finally {
+      oldLiveAuthentication.reject(new AuthenticationError(401, "invalid_token"));
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("aborts deferred authentication and queued frames when the socket closes", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "close-race");
+    const authentication = deferred<AuthenticatedPrincipal>();
+    const authenticationStarted = deferred<void>();
+    const auth: AuthenticationService = {
+      async login() {
+        return session;
+      },
+      authenticate() {
+        authenticationStarted.resolve();
+        return authentication.promise;
+      },
+      async refresh() {
+        return session;
+      },
+      async revoke() {},
+    };
+    let subscribeCalls = 0;
+    let historyCalls = 0;
+    let unsubscribeCalls = 0;
+    const service: MessageService = {
+      async send(_actorId, message) {
+        return {
+          type: "message.accepted",
+          requestId: message.id,
+          messageId: message.id,
+          persistedAt: "2026-08-10T00:00:00.000Z",
+        };
+      },
+      subscribe() {
+        subscribeCalls += 1;
+        return () => {
+          unsubscribeCalls += 1;
+        };
+      },
+      async history() {
+        historyCalls += 1;
+        return [];
+      },
+    };
+    const server = await startMessageWebSocketServer({ auth, service });
+    const client = await LoopbackClient.connect(server.url);
+
+    try {
+      await client.login(humans[0]);
+      client.send({ type: "room.subscribe", requestId: "deferred-close", roomId });
+      await authenticationStarted.promise;
+      client.send({ type: "room.history", requestId: "queued-after-close", roomId });
+      await client.close();
+      await server.close();
+      authentication.resolve(principal);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(subscribeCalls).toBe(0);
+      expect(historyCalls).toBe(0);
+      expect(unsubscribeCalls).toBe(0);
+    } finally {
+      authentication.resolve(principal);
+      await server.close();
+    }
+  });
+
+  it("unsubscribes exactly once when close races a registered subscription", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "registered-close-race");
+    const subscriptionRegistered = deferred<void>();
+    const releaseSubscribeHandler = deferred<void>();
+    const auth: AuthenticationService = {
+      async login() {
+        return session;
+      },
+      async authenticate() {
+        return principal;
+      },
+      async refresh() {
+        return session;
+      },
+      async revoke() {},
+    };
+    let activeSubscriptions = 0;
+    let unsubscribeCalls = 0;
+    let historyCalls = 0;
+    const service: MessageService = {
+      async send(_actorId, message) {
+        return {
+          type: "message.accepted",
+          requestId: message.id,
+          messageId: message.id,
+          persistedAt: "2026-08-10T00:00:00.000Z",
+        };
+      },
+      subscribe() {
+        activeSubscriptions += 1;
+        subscriptionRegistered.resolve();
+        return () => {
+          activeSubscriptions -= 1;
+          unsubscribeCalls += 1;
+        };
+      },
+      async history() {
+        historyCalls += 1;
+        return [];
+      },
+    };
+    const server = await startMessageWebSocketServer({
+      auth,
+      service,
+      afterSubscribeRegistered: () => releaseSubscribeHandler.promise,
+    });
+    const client = await LoopbackClient.connect(server.url);
+
+    try {
+      await client.login(humans[0]);
+      client.send({ type: "room.subscribe", requestId: "registered-close", roomId });
+      await subscriptionRegistered.promise;
+
+      await client.close();
+      await server.close();
+      releaseSubscribeHandler.resolve();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(activeSubscriptions).toBe(0);
+      expect(unsubscribeCalls).toBe(1);
+      expect(historyCalls).toBe(0);
+    } finally {
+      releaseSubscribeHandler.resolve();
+      await server.close();
+    }
   });
 
   it("rejects login and resume on an authenticated socket without switching identity", async () => {
@@ -898,6 +1309,7 @@ describe("authenticated message WebSocket service", () => {
     });
     await populateRoom(rooms);
     const auth = createAuthenticationService({
+      actors: rooms,
       identities: identityAdapter,
       sessions: createJsonStateStore(join(directory, "sessions.json"), isSessionState),
     });
@@ -937,7 +1349,7 @@ describe("authenticated message WebSocket service", () => {
     }
   });
 
-  it("does not emit obsolete history when a newer subscription supersedes it", async () => {
+  it("serializes overlapping subscriptions in arrival order", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-overlapping-subscribe-"));
     const rooms = await createRoomLifecycleService({
       actors,
@@ -947,6 +1359,7 @@ describe("authenticated message WebSocket service", () => {
     });
     await populateRoom(rooms);
     const auth = createAuthenticationService({
+      actors: rooms,
       identities: identityAdapter,
       sessions: createJsonStateStore(join(directory, "sessions.json"), isSessionState),
     });
@@ -962,8 +1375,9 @@ describe("authenticated message WebSocket service", () => {
       releaseFirstHistory = resolve;
     });
     const store: MessageStore = {
-      async append(message): Promise<void> {
+      async append(message) {
         storedMessages.push(message);
+        return "appended" as const;
       },
       async list(targetRoomId): Promise<readonly Message[]> {
         listCalls += 1;
@@ -984,15 +1398,27 @@ describe("authenticated message WebSocket service", () => {
       await firstHistoryStartedPromise;
 
       client.send({ type: "room.subscribe", requestId: "subscribe-current", roomId });
+      await expect(client.waitForHistory("subscribe-current", 100)).rejects.toThrow(
+        "Timed out",
+      );
+
+      releaseFirstHistory?.();
+      const obsoleteHistory = await client.waitForHistory("subscribe-obsolete");
       const currentHistory = await client.waitForHistory("subscribe-current");
+      expect(obsoleteHistory.frame).toMatchObject({
+        type: "room.history",
+        requestId: "subscribe-obsolete",
+        messages: [historicalMessage],
+      });
       expect(currentHistory.frame).toMatchObject({
         type: "room.history",
         requestId: "subscribe-current",
         messages: [historicalMessage],
       });
-
-      releaseFirstHistory?.();
-      await expect(client.waitForHistory("subscribe-obsolete", 100)).rejects.toThrow("Timed out");
+      expect(client.frameIndex((frame) => frame === obsoleteHistory.frame)).toBeLessThan(
+        client.frameIndex((frame) => frame === currentHistory.frame),
+      );
+      expect(client.historyFrames("subscribe-obsolete")).toHaveLength(1);
       expect(client.historyFrames("subscribe-current")).toHaveLength(1);
     } finally {
       releaseFirstHistory?.();

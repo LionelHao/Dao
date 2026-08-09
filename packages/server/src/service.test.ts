@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -7,10 +7,12 @@ import {
   createJsonlMessageStore,
   createMessageService,
   createRoomLifecycleService,
+  MessageIdConflictError,
   MessageStoreCorruptionError,
   MessageValidationError,
   RoomAccessError,
   type MessageDirectory,
+  type MessageAppendResult,
   type MessageErrorCode,
   type MessageService,
   type MessageStore,
@@ -63,12 +65,13 @@ class DeferredMemoryStore implements MessageStore {
   readonly messages: Message[] = [];
   private resolveAppend: (() => void) | undefined;
 
-  async append(value: Message): Promise<void> {
+  async append(value: Message): Promise<MessageAppendResult> {
     this.events.push(`append:${value.id}`);
     this.messages.push(value);
     await new Promise<void>((resolve) => {
       this.resolveAppend = resolve;
     });
+    return "appended";
   }
 
   async list(roomId: string): Promise<readonly Message[]> {
@@ -90,8 +93,16 @@ class MemoryStore implements MessageStore {
     this.messages = [...messages];
   }
 
-  async append(message: Message): Promise<void> {
+  async append(message: Message): Promise<MessageAppendResult> {
+    const existing = this.messages.find((candidate) => candidate.id === message.id);
+    if (existing !== undefined) {
+      if (JSON.stringify(existing) === JSON.stringify(message)) {
+        return "replayed";
+      }
+      throw new MessageIdConflictError(message.id);
+    }
     this.messages.push(message);
+    return "appended";
   }
 
   async list(roomId: string): Promise<readonly Message[]> {
@@ -219,6 +230,55 @@ describe("message service", () => {
       persistedAt: "2026-08-06T00:02:00.000Z",
     });
     expect(received).toEqual([authoritativeMessage(owner, roomId)]);
+  });
+
+  it("acknowledges an exact replay without a second record or fanout", async () => {
+    const store = new MemoryStore();
+    const { service, roomId } = await createService(store);
+    const received: Message[] = [];
+    service.subscribe(member.id, roomId, (message) => {
+      received.push(message);
+    });
+    const replayed = draftFor(roomId, "message-replay");
+
+    await expect(service.send(owner.id, replayed)).resolves.toMatchObject({
+      type: "message.accepted",
+      messageId: replayed.id,
+    });
+    await expect(service.send(owner.id, replayed)).resolves.toMatchObject({
+      type: "message.accepted",
+      messageId: replayed.id,
+    });
+
+    expect(store.messages).toEqual([authoritativeMessage(owner, roomId, replayed.id)]);
+    expect(received).toEqual([authoritativeMessage(owner, roomId, replayed.id)]);
+  });
+
+  it("rejects cross-author, body, sentAt, and room reuse without append or fanout", async () => {
+    const store = new MemoryStore();
+    const { service, directory, roomId } = await createService(store);
+    const secondRoom = await directory.createRoom(owner.id, { name: "Second" });
+    const received: Message[] = [];
+    service.subscribe(owner.id, roomId, (message) => {
+      received.push(message);
+    });
+    const original = draftFor(roomId, "message-conflict");
+    await service.send(owner.id, original);
+
+    for (const [actorId, candidate] of [
+      [member.id, original],
+      [owner.id, { ...original, body: "different body" }],
+      [owner.id, { ...original, sentAt: "2026-08-06T00:02:00.000Z" }],
+      [owner.id, { ...original, roomId: secondRoom.id }],
+    ] as const) {
+      await expect(service.send(actorId, candidate)).rejects.toMatchObject({
+        status: 409,
+        code: "message_id_conflict",
+      });
+    }
+
+    expect(store.messages).toEqual([authoritativeMessage(owner, roomId, original.id)]);
+    expect(received).toEqual([authoritativeMessage(owner, roomId, original.id)]);
   });
 
   it.each([
@@ -388,9 +448,91 @@ describe("message service", () => {
       expect(listenerErrors).toEqual([listenerError]);
     }
   });
+
+  it("rejects a persisted duplicate message ID as corruption", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-server-"));
+    const filePath = join(directory, "messages", "message-log.jsonl");
+    const first = authoritativeMessage(owner, draft.roomId, "persisted-duplicate");
+    const conflicting = { ...first, roomId: "another-room" };
+
+    try {
+      await mkdir(dirname(filePath), { recursive: true });
+      await writeFile(
+        filePath,
+        `${JSON.stringify(first)}\n${JSON.stringify(conflicting)}\n`,
+        "utf8",
+      );
+      const store = createJsonlMessageStore(filePath);
+
+      await expect(store.list(draft.roomId)).rejects.toMatchObject({
+        name: "MessageStoreCorruptionError",
+        filePath,
+        lineNumber: 2,
+      });
+      await expect(store.append(first)).rejects.toMatchObject({
+        name: "MessageStoreCorruptionError",
+        filePath,
+        lineNumber: 2,
+      });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("JSONL message store", () => {
+  it("atomically deduplicates exact replay under concurrency", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-server-"));
+    const filePath = join(directory, "messages", "message-log.jsonl");
+    const message = authoritativeMessage(owner, draft.roomId, "concurrent-replay");
+
+    try {
+      const store = createJsonlMessageStore(filePath);
+      await expect(Promise.all([
+        store.append(message),
+        store.append(message),
+        store.append(message),
+      ])).resolves.toEqual(["appended", "replayed", "replayed"]);
+      const content = await readFile(filePath, "utf8");
+      expect(content.trim().split("\n")).toEqual([JSON.stringify(message)]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("enforces the global message ID across rooms and restart", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-server-"));
+    const filePath = join(directory, "messages", "message-log.jsonl");
+    const message = authoritativeMessage(owner, draft.roomId, "restart-conflict");
+
+    try {
+      const first = createJsonlMessageStore(filePath);
+      await expect(first.append(message)).resolves.toBe("appended");
+      await expect(first.append(message)).resolves.toBe("replayed");
+
+      const restarted = createJsonlMessageStore(filePath);
+      await expect(restarted.append(message)).resolves.toBe("replayed");
+      for (const conflict of [
+        { ...message, authorId: member.id },
+        { ...message, body: "different body" },
+        { ...message, roomId: "another-room" },
+      ]) {
+        await expect(restarted.append(conflict)).rejects.toBeInstanceOf(
+          MessageIdConflictError,
+        );
+        await expect(restarted.append(conflict)).rejects.toMatchObject({
+          status: 409,
+          code: "message_id_conflict",
+          messageId: message.id,
+        });
+      }
+      await expect(restarted.list(draft.roomId)).resolves.toEqual([message]);
+      await expect(restarted.list("another-room")).resolves.toEqual([]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("reopens persisted messages in append order for their exact room", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-server-"));
     const filePath = join(directory, "messages", "message-log.jsonl");

@@ -6,6 +6,7 @@ import {
 } from "@native-im/core";
 import type { AuthenticationErrorCode } from "./auth.js";
 import type { MessageErrorCode } from "./service.js";
+import type { MessageStoreErrorCode } from "./store.js";
 
 const AUTH_LOGIN_FIELDS = new Set(["type", "requestId", "accountId", "secret"]);
 const AUTH_RESUME_FIELDS = new Set(["type", "requestId", "accessToken"]);
@@ -14,6 +15,17 @@ const AUTH_REVOKE_FIELDS = new Set(["type", "requestId"]);
 const MESSAGE_SEND_FIELDS = new Set(["type", "requestId", "message"]);
 const ROOM_FIELDS = new Set(["type", "requestId", "roomId"]);
 const MESSAGE_DRAFT_FIELDS = new Set(["id", "roomId", "body", "sentAt"]);
+
+export const PROTOCOL_FIELD_LIMITS = Object.freeze({
+  requestId: 128,
+  accountId: 256,
+  secret: 4_096,
+  token: 4_096,
+  roomId: 256,
+  messageId: 256,
+  body: 32 * 1_024,
+  sentAt: 64,
+});
 
 export interface AuthLoginFrame {
   readonly type: "auth.login";
@@ -103,6 +115,7 @@ export interface RoomSubscribedFrame {
 export type ProtocolErrorCode =
   | AuthenticationErrorCode
   | MessageErrorCode
+  | MessageStoreErrorCode
   | "unauthenticated"
   | "room_forbidden"
   | "identity_forbidden"
@@ -150,7 +163,11 @@ function isStrictMessageDraft(value: unknown): value is MessageDraft {
   return (
     isRecord(value) &&
     hasOnlyFields(value, MESSAGE_DRAFT_FIELDS) &&
-    isMessageDraft(value)
+    isMessageDraft(value) &&
+    isBoundedString(value.id, PROTOCOL_FIELD_LIMITS.messageId) &&
+    isBoundedString(value.roomId, PROTOCOL_FIELD_LIMITS.roomId) &&
+    isBoundedString(value.body, PROTOCOL_FIELD_LIMITS.body) &&
+    isBoundedString(value.sentAt, PROTOCOL_FIELD_LIMITS.sentAt)
   );
 }
 
@@ -166,8 +183,12 @@ function protocolError(
   return { type: "error", status, code, message, requestId };
 }
 
-function hasStringFields(value: UnknownRecord, fields: readonly string[]): boolean {
-  return fields.every((field) => typeof value[field] === "string");
+function isBoundedString(value: unknown, maximumBytes: number): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    Buffer.byteLength(value, "utf8") <= maximumBytes
+  );
 }
 
 export function parseClientFrame(raw: string): ClientFrameParseResult {
@@ -183,12 +204,19 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
     return { ok: false, error: protocolError("Request must be an object") };
   }
 
-  const requestId = typeof value.requestId === "string" ? value.requestId : undefined;
+  const requestId = isBoundedString(
+    value.requestId,
+    PROTOCOL_FIELD_LIMITS.requestId,
+  )
+    ? value.requestId
+    : undefined;
   switch (value.type) {
     case "auth.login":
       if (
         !hasOnlyFields(value, AUTH_LOGIN_FIELDS) ||
-        !hasStringFields(value, ["requestId", "accountId", "secret"])
+        requestId === undefined ||
+        !isBoundedString(value.accountId, PROTOCOL_FIELD_LIMITS.accountId) ||
+        !isBoundedString(value.secret, PROTOCOL_FIELD_LIMITS.secret)
       ) {
         return {
           ok: false,
@@ -202,15 +230,16 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
         ok: true,
         frame: {
           type: "auth.login",
-          requestId: value.requestId as string,
-          accountId: value.accountId as string,
-          secret: value.secret as string,
+          requestId,
+          accountId: value.accountId,
+          secret: value.secret,
         },
       };
     case "auth.resume":
       if (
         !hasOnlyFields(value, AUTH_RESUME_FIELDS) ||
-        !hasStringFields(value, ["requestId", "accessToken"])
+        requestId === undefined ||
+        !isBoundedString(value.accessToken, PROTOCOL_FIELD_LIMITS.token)
       ) {
         return {
           ok: false,
@@ -224,14 +253,15 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
         ok: true,
         frame: {
           type: "auth.resume",
-          requestId: value.requestId as string,
-          accessToken: value.accessToken as string,
+          requestId,
+          accessToken: value.accessToken,
         },
       };
     case "auth.refresh":
       if (
         !hasOnlyFields(value, AUTH_REFRESH_FIELDS) ||
-        !hasStringFields(value, ["requestId", "refreshToken"])
+        requestId === undefined ||
+        !isBoundedString(value.refreshToken, PROTOCOL_FIELD_LIMITS.token)
       ) {
         return {
           ok: false,
@@ -245,8 +275,8 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
         ok: true,
         frame: {
           type: "auth.refresh",
-          requestId: value.requestId as string,
-          refreshToken: value.refreshToken as string,
+          requestId,
+          refreshToken: value.refreshToken,
         },
       };
     case "auth.revoke":
@@ -299,7 +329,8 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
     case "room.subscribe":
       if (
         !hasOnlyFields(value, ROOM_FIELDS) ||
-        !hasStringFields(value, ["requestId", "roomId"])
+        requestId === undefined ||
+        !isBoundedString(value.roomId, PROTOCOL_FIELD_LIMITS.roomId)
       ) {
         return {
           ok: false,
@@ -313,8 +344,8 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
         ok: true,
         frame: {
           type: value.type,
-          requestId: value.requestId as string,
-          roomId: value.roomId as string,
+          requestId,
+          roomId: value.roomId,
         },
       };
     default:

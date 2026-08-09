@@ -6,6 +6,7 @@ export {
 } from "./auth.js";
 export type {
   AuthenticatedPrincipal,
+  AuthenticationActorDirectory,
   AuthenticationErrorCode,
   AuthenticationService,
   AuthenticationServiceOptions,
@@ -47,9 +48,17 @@ export type {
   MessageService,
   MessageServiceOptions,
 } from "./service.js";
-export { createJsonlMessageStore, MessageStoreCorruptionError } from "./store.js";
-export type { MessageStore } from "./store.js";
-export { parseClientFrame } from "./protocol.js";
+export {
+  createJsonlMessageStore,
+  MessageIdConflictError,
+  MessageStoreCorruptionError,
+} from "./store.js";
+export type {
+  MessageAppendResult,
+  MessageStore,
+  MessageStoreErrorCode,
+} from "./store.js";
+export { parseClientFrame, PROTOCOL_FIELD_LIMITS } from "./protocol.js";
 export type {
   AuthenticatedFrame,
   AuthLoginFrame,
@@ -69,5 +78,9 @@ export type {
   RoomSubscribedFrame,
   ServerFrame,
 } from "./protocol.js";
-export { startMessageWebSocketServer } from "./websocket.js";
+export {
+  MESSAGE_WEBSOCKET_MAX_BUFFERED_AMOUNT_BYTES,
+  MESSAGE_WEBSOCKET_MAX_PAYLOAD_BYTES,
+  startMessageWebSocketServer,
+} from "./websocket.js";
 export type { MessageWebSocketServer, StartMessageWebSocketServerOptions } from "./websocket.js";

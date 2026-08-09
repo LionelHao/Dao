@@ -121,7 +121,7 @@ export function createMessageService(options: MessageServiceOptions): MessageSer
         authorId: actor.id,
         authorKind: actor.kind,
       };
-      await options.store.append(message);
+      const appendResult = await options.store.append(message);
 
       const acknowledgement: MessageAcceptedAck = {
         type: "message.accepted",
@@ -129,6 +129,10 @@ export function createMessageService(options: MessageServiceOptions): MessageSer
         messageId: message.id,
         persistedAt: clock(),
       };
+
+      if (appendResult === "replayed") {
+        return acknowledgement;
+      }
 
       const subscriptions = subscribersByRoom.get(message.roomId);
       if (subscriptions !== undefined) {

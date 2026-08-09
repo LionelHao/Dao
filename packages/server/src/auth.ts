@@ -1,4 +1,5 @@
 import { createHash, randomBytes, scrypt, timingSafeEqual } from "node:crypto";
+import type { Actor } from "@native-im/core";
 import type { StateStore } from "./state-store.js";
 
 const DEFAULT_ACCESS_TTL_MS = 15 * 60 * 1_000;
@@ -80,6 +81,10 @@ export interface AuthenticationService {
   revoke(accessToken: string): Promise<void>;
 }
 
+export interface AuthenticationActorDirectory {
+  getActor(actorId: string): Actor | undefined;
+}
+
 interface SessionRecord {
   readonly familyId: string;
   readonly accountId: string;
@@ -97,6 +102,7 @@ export interface SessionState {
 }
 
 export interface AuthenticationServiceOptions {
+  readonly actors: AuthenticationActorDirectory;
   readonly identities: IdentityAdapter;
   readonly sessions: StateStore<SessionState>;
   readonly clock?: () => number;
@@ -418,6 +424,12 @@ export function createAuthenticationService(
     }
   }
 
+  function requireHumanActor(actorId: string): void {
+    if (options.actors.getActor(actorId)?.kind !== "human") {
+      throw new AuthenticationError(403, "identity_forbidden");
+    }
+  }
+
   return {
     async login(credentials: LoginCredentials): Promise<IssuedSession> {
       const identity = await options.identities.verify(credentials);
@@ -426,6 +438,7 @@ export function createAuthenticationService(
       }
 
       return runExclusive(async (current) => {
+        requireHumanActor(identity.actorId);
         const now = clock();
         const { issued, record } = createIssuedRecord(
           current,
@@ -452,6 +465,7 @@ export function createAuthenticationService(
         if (session === undefined) {
           throw invalidToken();
         }
+        requireHumanActor(session.actorId);
         if (session.revokedAt !== undefined) {
           throw revokedSession();
         }
@@ -479,6 +493,7 @@ export function createAuthenticationService(
         if (session === undefined) {
           throw invalidToken();
         }
+        requireHumanActor(session.actorId);
         if (
           expectedPrincipal !== undefined &&
           (session.accountId !== expectedPrincipal.accountId ||
@@ -524,6 +539,7 @@ export function createAuthenticationService(
         if (session === undefined) {
           throw invalidToken();
         }
+        requireHumanActor(session.actorId);
 
         await revokeFamily(current, session.familyId, clock());
       });

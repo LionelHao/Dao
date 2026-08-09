@@ -4,13 +4,15 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
+import type { Actor } from "@native-im/core";
 import {
-  createAuthenticationService,
+  createAuthenticationService as createAuthenticationServiceWithActors,
   createJsonStateStore,
   createScryptIdentityAdapter,
   isSessionState,
   StateStoreCorruptionError,
   type IdentityAdapter,
+  type AuthenticationServiceOptions,
   type LoginCredentials,
   type PasswordIdentityRecord,
   type SessionState,
@@ -21,6 +23,45 @@ const accounts = new Map([
   ["account-li", { actorId: "human-li", secret: "correct-li" }],
   ["account-ada", { actorId: "human-ada", secret: "correct-ada" }],
 ]);
+
+const authenticationActors = [
+  {
+    id: "human-li",
+    kind: "human",
+    displayName: "Lionel",
+    reachability: "online",
+  },
+  {
+    id: "human-ada",
+    kind: "human",
+    displayName: "Ada",
+    reachability: "online",
+  },
+  {
+    id: "agent-auth",
+    kind: "agent",
+    displayName: "Automation",
+    readiness: "ready",
+    toolPermissions: [],
+  },
+] as const satisfies readonly Actor[];
+
+const actorDirectory = {
+  getActor(actorId: string): Actor | undefined {
+    return authenticationActors.find((actor) => actor.id === actorId);
+  },
+};
+
+function createAuthenticationService(
+  options: Omit<AuthenticationServiceOptions, "actors"> & {
+    readonly actors?: AuthenticationServiceOptions["actors"];
+  },
+) {
+  return createAuthenticationServiceWithActors({
+    ...options,
+    actors: options.actors ?? actorDirectory,
+  });
+}
 
 const validIdentitySalt = Buffer.from("identity-salt-v1!", "utf8").toString(
   "base64url",
@@ -99,6 +140,10 @@ class FailingSessionStore implements StateStore<SessionState> {
   private state: SessionState | undefined;
   private nextSaveError: unknown;
   saveAttempts = 0;
+
+  constructor(state?: SessionState) {
+    this.state = state;
+  }
 
   async load(): Promise<SessionState | undefined> {
     return this.state;
@@ -286,6 +331,62 @@ describe("session state authority guard", () => {
 });
 
 describe("authentication service", () => {
+  it("rejects an account mapped to an agent without issuing or persisting a session", async () => {
+    const sessions = new FailingSessionStore();
+    const service = createAuthenticationService({
+      actors: actorDirectory,
+      identities: {
+        async verify() {
+          return { accountId: "account-agent", actorId: "agent-auth" };
+        },
+      },
+      sessions,
+      tokenFactory: createTokenFactory("agent-session-token"),
+    });
+
+    await expect(
+      service.login({ accountId: "account-agent", secret: "valid-agent-secret" }),
+    ).rejects.toMatchObject({ status: 403, code: "identity_forbidden" });
+    expect(sessions.saveAttempts).toBe(0);
+    await expect(service.authenticate("agent-session-token-1")).rejects.toMatchObject({
+      status: 401,
+      code: "invalid_token",
+    });
+  });
+
+  it.each([
+    { description: "agent", actorId: "agent-auth" },
+    { description: "stale", actorId: "missing-human" },
+  ])("rejects a persisted $description actor session for every credential decision", async ({ actorId }) => {
+    const persisted = sessionRecord({ actorId });
+    expect(isSessionState({ version: 1, sessions: [persisted] })).toBe(true);
+    const sessions = new FailingSessionStore({
+      version: 1,
+      sessions: [persisted as unknown as SessionState["sessions"][number]],
+    });
+    const service = createAuthenticationService({
+      actors: actorDirectory,
+      identities: testIdentityAdapter,
+      sessions,
+      clock: () => 0,
+      tokenFactory: createTokenFactory("persisted-invalid-actor"),
+    });
+
+    await expect(service.authenticate("access-token")).rejects.toMatchObject({
+      status: 403,
+      code: "identity_forbidden",
+    });
+    await expect(service.refresh("refresh-token")).rejects.toMatchObject({
+      status: 403,
+      code: "identity_forbidden",
+    });
+    await expect(service.revoke("access-token")).rejects.toMatchObject({
+      status: 403,
+      code: "identity_forbidden",
+    });
+    expect(sessions.saveAttempts).toBe(0);
+  });
+
   it("handles initialization corruption before the first operation and reuses the exact error", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-auth-init-"));
     const sessionPath = join(directory, "sessions.json");
