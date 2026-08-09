@@ -98,12 +98,14 @@ async function countScryptRequests(operation: () => Promise<unknown>): Promise<n
 class FailingSessionStore implements StateStore<SessionState> {
   private state: SessionState | undefined;
   private nextSaveError: unknown;
+  saveAttempts = 0;
 
   async load(): Promise<SessionState | undefined> {
     return this.state;
   }
 
   async save(value: SessionState): Promise<void> {
+    this.saveAttempts += 1;
     if (this.nextSaveError !== undefined) {
       const error = this.nextSaveError;
       this.nextSaveError = undefined;
@@ -551,6 +553,45 @@ describe("authentication service", () => {
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
+  });
+
+  it("rejects a bound cross-principal refresh without mutating either session", async () => {
+    const sessions = new FailingSessionStore();
+    const service = createAuthenticationService({
+      identities: testIdentityAdapter,
+      sessions,
+      tokenFactory: createTokenFactory("bound-refresh-token"),
+    });
+    const lionel = await service.login({
+      accountId: "account-li",
+      secret: "correct-li",
+    });
+    const ada = await service.login({
+      accountId: "account-ada",
+      secret: "correct-ada",
+    });
+    const saveAttemptsBeforeMismatch = sessions.saveAttempts;
+
+    await expect(
+      service.refresh(ada.refreshToken, {
+        accountId: lionel.accountId,
+        actorId: lionel.actorId,
+      }),
+    ).rejects.toMatchObject({ status: 403, code: "identity_forbidden" });
+    expect(sessions.saveAttempts).toBe(saveAttemptsBeforeMismatch);
+
+    await expect(service.authenticate(lionel.accessToken)).resolves.toEqual({
+      accountId: lionel.accountId,
+      actorId: lionel.actorId,
+    });
+    await expect(service.authenticate(ada.accessToken)).resolves.toEqual({
+      accountId: ada.accountId,
+      actorId: ada.actorId,
+    });
+    await expect(service.refresh(ada.refreshToken)).resolves.toMatchObject({
+      accountId: ada.accountId,
+      actorId: ada.actorId,
+    });
   });
 
   it("does not publish a login session when persistence rejects", async () => {

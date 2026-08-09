@@ -55,7 +55,8 @@ export type AuthenticationErrorCode =
   | "invalid_credentials"
   | "invalid_token"
   | "token_expired"
-  | "session_revoked";
+  | "session_revoked"
+  | "identity_forbidden";
 
 export class AuthenticationError extends Error {
   readonly status: 401 | 403;
@@ -72,7 +73,10 @@ export class AuthenticationError extends Error {
 export interface AuthenticationService {
   login(credentials: LoginCredentials): Promise<IssuedSession>;
   authenticate(accessToken: string): Promise<AuthenticatedPrincipal>;
-  refresh(refreshToken: string): Promise<IssuedSession>;
+  refresh(
+    refreshToken: string,
+    expectedPrincipal?: AuthenticatedPrincipal,
+  ): Promise<IssuedSession>;
   revoke(accessToken: string): Promise<void>;
 }
 
@@ -459,7 +463,10 @@ export function createAuthenticationService(
       });
     },
 
-    refresh(refreshToken: string): Promise<IssuedSession> {
+    refresh(
+      refreshToken: string,
+      expectedPrincipal?: AuthenticatedPrincipal,
+    ): Promise<IssuedSession> {
       return runExclusive(async (current) => {
         if (refreshToken.length === 0) {
           throw invalidToken();
@@ -471,6 +478,13 @@ export function createAuthenticationService(
         );
         if (session === undefined) {
           throw invalidToken();
+        }
+        if (
+          expectedPrincipal !== undefined &&
+          (session.accountId !== expectedPrincipal.accountId ||
+            session.actorId !== expectedPrincipal.actorId)
+        ) {
+          throw new AuthenticationError(403, "identity_forbidden");
         }
 
         const now = clock();

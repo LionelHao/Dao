@@ -290,17 +290,12 @@ async function handleRefresh(
 
   context.authOperationPending = true;
   try {
-    const session = await options.auth.refresh(frame.refreshToken);
+    const session = await options.auth.refresh(frame.refreshToken, principal);
     const refreshedPrincipal = {
       accountId: session.accountId,
       actorId: session.actorId,
     };
     if (!samePrincipal(principal, refreshedPrincipal)) {
-      try {
-        await options.auth.revoke(session.accessToken);
-      } catch {
-        // A rejected cross-session refresh never exposes the rotated credential.
-      }
       sendFrame(
         socket,
         errorFrame(

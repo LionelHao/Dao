@@ -809,6 +809,13 @@ describe("authenticated message WebSocket service", () => {
       frame: { status: 403 },
     });
 
+    await expect(ada.history(roomId, "ada-after-cross-refresh")).resolves.toMatchObject({
+      frame: { type: "room.history", requestId: "ada-after-cross-refresh" },
+    });
+    await expect(ada.refresh(adaSession.refreshToken!, "ada-own-refresh")).resolves.toMatchObject({
+      frame: { type: "auth.authenticated", actorId: humans[1].id },
+    });
+
     const refreshed = await lionel.refresh(lionelSession.refreshToken!, "own-refresh");
     expect(refreshed.frame).toMatchObject({ actorId: humans[0].id });
     expect((refreshed.frame as SessionFrame).accessToken).not.toBe(lionelSession.accessToken);
