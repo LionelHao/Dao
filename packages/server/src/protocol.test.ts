@@ -158,4 +158,20 @@ describe("client protocol resource bounds", () => {
   ])("accepts maximum-length $field", ({ frame }) => {
     expect(parse(frame)).toMatchObject({ ok: true });
   });
+
+  it.each([
+    ["authorId", { authorId: "human-forged" }],
+    ["authorKind", { authorKind: "agent" }],
+  ])("rejects a client-selected %s as unauthenticated identity tampering", (_field, identity) => {
+    expect(
+      parse({
+        type: "message.send",
+        requestId: "identity-tamper",
+        message: { ...validDraft, ...identity },
+      }),
+    ).toMatchObject({
+      ok: false,
+      error: { type: "error", status: 401, code: "identity_forbidden" },
+    });
+  });
 });

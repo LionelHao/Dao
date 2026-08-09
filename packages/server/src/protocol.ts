@@ -306,7 +306,7 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
           error: protocolError(
             "Message identity is server-controlled",
             requestId,
-            403,
+            401,
             "identity_forbidden",
           ),
         };

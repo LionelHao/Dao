@@ -1204,7 +1204,7 @@ describe("authenticated message WebSocket service", () => {
     }
   });
 
-  it("rejects forged authorId and authorKind with 403 and persists nothing", async () => {
+  it("rejects forged authorId and authorKind with 401 and persists nothing", async () => {
     const fixture = await createFixture();
     fixtures.push(fixture);
     const client = await fixture.connect();
@@ -1220,7 +1220,7 @@ describe("authenticated message WebSocket service", () => {
         message: { ...draftFor(requestId), ...field },
       });
       await expect(client.waitForError("identity_forbidden", requestId)).resolves.toMatchObject({
-        frame: { status: 403 },
+        frame: { status: 401 },
       });
     }
     await expect(fixture.messages()).resolves.toEqual([]);

@@ -1,7 +1,5 @@
 # T-0039 Identity and Room Lifecycle Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Build server-authoritative human authentication, durable sessions, governed room membership, human invitations, agent configuration, and authenticated message access without collapsing human and agent join semantics.
 
 **Architecture:** Keep `@native-im/core` zero-I/O and add only discriminated collaboration contracts there. Put credentials, session persistence, room lifecycle state, authorization, and audit behind three server modules: `AuthenticationService`, `RoomLifecycleService`, and the existing `MessageService`; the WebSocket adapter composes them and never accepts a client-selected author identity. Persist T-0039 identity/session/room state as atomically replaced JSON documents through injected stores; T-0040 will later unify all event durability, cursors, migrations, and outbox behavior.
@@ -21,9 +19,9 @@
 
 ## Inputs and boundaries
 
-- PRD 2.3 #6 is the primary primitive: a human joins through an invitation that can be accepted or rejected; an agent joins through immediate capability configuration containing participation and tool permissions. Their data types, service methods, protocol frames, and renderer entry points must remain different.
+- PRD 2.3 #6 is the primary primitive: a human joins through an invitation that can be accepted or rejected; an agent joins through immediate capability configuration containing participation and tool permissions. Their data types, service methods, renderer entry points, and typed submit callbacks must remain different. Public room-management transport frames are deferred with the full onboarding/network integration boundary.
 - PRD 2.3 #13 applies to membership data: human membership carries a social role and join time; agent membership carries participation and granted tool permissions.
-- Acceptance General §2 requires data, interface, and renderer separation. The server must return 401 for missing/invalid authentication and 403 for authenticated identity substitution or insufficient room permission.
+- Acceptance General §2 requires data, interface, and renderer separation. T-0039's own criterion requires client-selected actor identity to return 401 and revoked sessions to return 403; authenticated room permission failures also return 403.
 - The current message WebSocket trusts `Message.authorId`; T-0039 removes that trust. Clients send a `MessageDraft` without author fields, and the server derives `authorId` / `authorKind` from the authenticated session.
 - Sessions and room lifecycle survive process restart here because the task explicitly requires it. Message/event-wide authority, schema migration, replay cursors, and outbox failure injection remain T-0040.
 - The desktop UI only provides working invite/configuration entry modules and typed submit callbacks. Full onboarding, remote deployment, and production login screens remain T-0042 / T-0043.
@@ -258,7 +256,10 @@ export interface IdentityAdapter {
 export interface AuthenticationService {
   login(credentials: LoginCredentials): Promise<IssuedSession>;
   authenticate(accessToken: string): Promise<AuthenticatedPrincipal>;
-  refresh(refreshToken: string): Promise<IssuedSession>;
+  refresh(
+    refreshToken: string,
+    expectedPrincipal?: AuthenticatedPrincipal,
+  ): Promise<IssuedSession>;
   revoke(accessToken: string): Promise<void>;
 }
 
@@ -267,7 +268,7 @@ export function createScryptIdentityAdapter(
 ): IdentityAdapter;
 ```
 
-Use `scrypt` plus `timingSafeEqual` for credential verification. Generate opaque access/refresh tokens from injected `tokenFactory` (default `randomBytes(32).toString("base64url")`); persist only SHA-256 token hashes. Refresh rotates and revokes the prior token family. Access TTL is 15 minutes and refresh TTL is 30 days by defaults exposed in options; tests use injected values and clock.
+Use `scrypt` plus `timingSafeEqual` for credential verification. Generate opaque access/refresh tokens from injected `tokenFactory` (default `randomBytes(32).toString("base64url")`); persist only SHA-256 token hashes. When a socket already has a principal, refresh passes it as `expectedPrincipal` and checks ownership inside the serialized auth mutation before token generation, rotation, or persistence; a mismatch returns 403 without changing either session. Normal refresh rotates and revokes the prior token pair; explicit revoke or refresh replay revokes the token family. Access TTL is 15 minutes and refresh TTL is 30 days by defaults exposed in options; tests use injected values and clock.
 
 - [x] **Step 5: Run GREEN and the existing server tests.**
 
@@ -437,7 +438,7 @@ await lionel.send({
   message: { ...draft, authorId: "human-ada" },
 });
 await expect(lionel.waitForError("identity_forbidden", "forged")).resolves.toMatchObject({
-  frame: { status: 403 },
+  frame: { status: 401 },
 });
 
 await stopServer();
@@ -491,7 +492,7 @@ export type ClientFrame =
   | { readonly type: "room.subscribe"; readonly requestId: string; readonly roomId: string };
 ```
 
-`StartMessageWebSocketServerOptions` receives both `auth` and `service`. Each socket owns at most one authenticated principal. Auth frames establish/rotate/revoke it. Non-auth frames without a principal return `{ type:"error", status:401, code:"unauthenticated" }`; invalid/tampered tokens return 401, revoked tokens or client-supplied author fields return 403; room access failures return 403. Keep subscription registration-before-history ordering for `room.subscribe`, and make `room.history` a separate one-shot query.
+`StartMessageWebSocketServerOptions` receives both `auth` and `service`. Each socket owns at most one authenticated principal. Auth frames establish/rotate/revoke it. Non-auth frames without a principal return `{ type:"error", status:401, code:"unauthenticated" }`; invalid/tampered tokens and client-supplied author fields return 401, while revoked tokens and room access failures return 403. Keep subscription registration-before-history ordering for `room.subscribe`, and make `room.history` a separate one-shot query.
 
 - [x] **Step 6: Run GREEN and regression suites.**
 

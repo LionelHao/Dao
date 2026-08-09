@@ -6,9 +6,9 @@
 
 1. `IdentityAdapter.verify({ accountId, secret })` 验证账户凭据，并把账户映射到一个既有真人 actor。
 2. `AuthenticationService.login()` 仅为 `kind: "human"` 的 actor 签发会话；账户错误返回 401，账户映射到 agent 等身份替换返回 403。
-3. 服务端签发不可推导的 access token 与 refresh token，只把 SHA-256 token hash、账户、actor、token family 和过期时间写入状态。
+3. 服务端签发不可推导的 access token 与 refresh token，只把 SHA-256 token hash、账户、actor、token family、过期时间和可选撤销时间写入状态。
 4. `auth.resume`、消息发送、历史查询和订阅都从当前 access token 恢复同一个 principal。业务帧没有 actor 字段；`message.send.message` 只能包含 `id`、`roomId`、`body`、`sentAt`。
-5. `MessageService` 根据已认证 `actorId` 和当前成员目录补全 `authorId` / `authorKind`。客户端传入任一作者字段都以 `identity_forbidden` / 403 拒绝，而不是覆盖服务端身份。
+5. `MessageService` 根据已认证 `actorId` 和当前成员目录补全 `authorId` / `authorKind`。客户端传入任一作者字段都按 T-0039 标准以 `identity_forbidden` / 401 拒绝，而不是覆盖服务端身份。
 
 当前密码适配器使用 scrypt 和 `timingSafeEqual`；盐至少 16 bytes，派生 hash 固定为 64 bytes。缺失账户也执行同等 scrypt 工作量，状态与日志不保存明文密码或原始会话 token。
 
@@ -18,17 +18,18 @@
 | --- | --- | --- | --- |
 | 登录 | `auth.login` + 账户凭据 | `auth.authenticated`，带账户、actor 和新 token 对 | actor 必须由身份适配器映射，客户端不能选择 |
 | 恢复 | `auth.resume` + access token | `auth.authenticated`，不重新下发 token | 服务重启或新客户端均从持久化 hash 恢复 principal |
-| 刷新 | 已认证连接上的 `auth.refresh` + refresh token | 旋转后的新 token 对 | refresh 所属 principal 必须与当前连接一致；旧记录标记撤销 |
+| 刷新 | 新连接或既有连接上的 `auth.refresh` + refresh token | 旋转后的新 token 对并安装其 principal | refresh token 自身完成认证；连接已有 principal 时必须原子匹配，旧记录标记撤销 |
 | 撤销 | 已认证连接上的 `auth.revoke` | `auth.revoked` | 整个 token family 立即撤销，并清除该连接身份与订阅 |
 
-默认 access TTL 为 15 分钟，refresh TTL 为 30 天；过期边界使用 `now >= expiresAt`。access 过期不会删除仍有效的 refresh 会话。刷新 token 单次旋转；复用已撤销 refresh 会撤销其 token family。access/refresh TTL 可由服务端注入配置，客户端声明不生效。
+默认 access TTL 为 15 分钟，refresh TTL 为 30 天；过期边界使用 `now >= expiresAt`。access 过期不会删除仍有效的 refresh 会话，因此原连接或全新连接都可以只凭有效 refresh token 恢复。连接仍保有 principal 时，刷新会把该 principal 作为原子 ownership 条件传入认证服务；跨账户 token 在轮换和持久化之前返回 403，不影响 token 所有者。刷新 token 单次旋转；复用已撤销 refresh 会撤销其 token family。access/refresh TTL 可由服务端注入配置，客户端声明不生效。
 
 会话状态使用 version 1 JSON 文档和原子临时文件替换，因此服务进程重启后仍按原过期时间、撤销状态和 token family 恢复。每次业务动作和实时投递前都会重新验证 access token；从另一连接撤销后，旧连接不能继续读写或接收实时事件。
 
 ## 3. 401 与 403
 
-- **401** 表示无法建立有效认证：未登录、错误账户凭据、空/未知/篡改 token、access 或 refresh 已过期。此时没有可供业务授权使用的 principal。
-- **403** 表示服务器识别到了受保护身份或会话，但本次行为被拒绝：已撤销会话、登录映射到非真人 actor、在已认证连接上用其他 principal 的 refresh token、客户端尝试提交 `authorId` / `authorKind`，或已认证 actor 没有房间权限。
+- **400** 表示 transport 输入本身不成帧：缺少或传入空的 `auth.resume.accessToken` / `auth.refresh.refreshToken` 会在协议解析阶段返回 `invalid_request`，不会进入认证服务。
+- **401** 表示无法采用客户端声称的身份：未登录、错误账户凭据、未知/篡改 token、access 或 refresh 已过期，或消息草稿试图提交服务端控制的 `authorId` / `authorKind`。直接调用 `AuthenticationService` 时，空 token 同样按未知凭据返回 401。
+- **403** 表示服务器已经识别受保护身份或会话，但行为被拒绝：已撤销会话、登录映射到非真人 actor、在已认证连接上用其他 principal 的 refresh token，或已认证 actor 没有房间权限。
 - 房间生命周期的普通成员越权统一为 `room_forbidden` / 403；未提供或不存在的 actor 身份为 401。有效身份访问不存在的生命周期资源可以返回 404，非法输入可以返回 400，状态冲突可以返回 409。
 
 ## 4. 两条互不合并的加入路径
@@ -69,7 +70,7 @@ owner/admin 调用 `configureAgent()` 后立即创建或替换 agent 成员关�
 
 创建房间的真人自动成为 owner。服务端在每个方法内部执行权限检查：
 
-`RoomLifecycleService` 方法中的 caller `actorId` 是服务端适配层传入的已认证 principal，不是 wire client 可选择的请求字段；未来暴露房间管理 transport 时也必须从会话注入，不能把 caller actor 原样开放给客户端。
+T-0039 的 `RoomLifecycleService` 当前只暴露服务端内部方法，caller `actorId` 是必须由可信 composition adapter 提供的授权上下文，不是 wire client 可选择的请求字段；本任务没有新增公开的房间管理 transport frame。未来暴露该 transport 时必须从会话 principal 注入 caller，不能把 caller actor 原样开放给客户端。
 
 | 操作 | owner | admin | member |
 | --- | --- | --- | --- |
@@ -113,4 +114,13 @@ T-0039 为完成重启恢复，分别持久化 session version 1 JSON、room lif
 - 协调锁是进程内的，不提供多进程 writer lease；消息列表仍需重读 JSONL；
 - 没有统一事件游标、outbox、投递确认或失败恢复编排。
 
-**T-0040 必须接手的准确范围**：把身份/会话、群成员与审计、消息写入纳入统一的 SQLite 持久化和迁移边界；定义 schema 版本升级与回滚/恢复；把“状态变更 + 待发布事件”写入同一事务 outbox；提供稳定事件游标、重放与 ACK；覆盖进程崩溃、持久化失败、outbox 重试和并发 writer 的故障注入。T-0040 不得重新允许客户端选择 actor，也不得合并真人邀请与 agent 配置语义。
+**T-0040 的 Blueprint 已定范围**：
+
+- 身份、群、成员、消息、已读、已判定、待答项、agent 执行和校准信号全部写入服务端权威持久存储，服务重启后逐类读回一致；具体存储技术由 T-0040 决策；
+- 写入使用稳定事件 ID 或幂等键，客户端重试不会生成重复消息或重复承诺；
+- 客户端按服务端游标断线重连：保留范围内增量恢复不漏不重，游标过期返回明确状态并触发全量历史修复，最终水位与服务端一致，且至少覆盖三客户端并发；
+- ACK 只表示 durable acceptance；故障注入必须覆盖持久提交后、实时分发前终止服务，并通过事务 outbox 或等价耐久机制让遗漏客户端补齐且只出现一次；
+- 持久化结构有版本化迁移，上一版升级后历史可读，失败不留下部分迁移状态；
+- 历史查询和实时订阅继续执行群权限，客户端缓存不是权威源，清空后可从服务端完整恢复。
+
+T-0039 为上述范围提供身份、成员权限和消息入口契约；T-0040 不得重新允许客户端选择 actor，也不得合并真人邀请与 agent 配置语义。分页、单页字节上限、跨进程 writer lease 与进行中操作的统一取消模型是本次提出的 `criteria-tighten` 建议，不冒充 T-0040 已有标准。
