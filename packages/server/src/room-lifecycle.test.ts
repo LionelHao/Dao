@@ -74,16 +74,17 @@ function createOptions(state: StateStore<RoomLifecycleState>) {
 function humanMembership(
   actorId: string,
   role: "owner" | "admin" | "member",
+  joinedAt = "2026-08-09T08:00:00.000Z",
 ) {
   return {
     kind: "human" as const,
     actorId,
     role,
-    joinedAt: "2026-08-09T08:00:00.000Z",
+    joinedAt,
   };
 }
 
-function adminFixture(): RoomLifecycleState {
+function ownerFixture(): RoomLifecycleState {
   return {
     version: 1,
     actors,
@@ -92,16 +93,131 @@ function adminFixture(): RoomLifecycleState {
         id: "fixture-room",
         name: "Fixture",
         status: "active",
-        members: [
-          humanMembership(owner.id, "owner"),
-          humanMembership(admin.id, "admin"),
-          humanMembership(member.id, "member"),
-        ],
+        members: [humanMembership(owner.id, "owner")],
         createdAt: "2026-08-09T08:00:00.000Z",
       },
     ],
     invitations: [],
-    audit: [],
+    audit: [
+      {
+        id: "audit-room-created",
+        type: "room.created",
+        roomId: "fixture-room",
+        actorId: owner.id,
+        result: "created",
+        timestamp: "2026-08-09T08:00:00.000Z",
+      },
+    ],
+  };
+}
+
+function adminFixture(): RoomLifecycleState {
+  const state = ownerFixture();
+  const adminInvitationId = "invitation-admin";
+  const memberInvitationId = "invitation-member";
+  return {
+    ...state,
+    rooms: [
+      {
+        ...state.rooms[0]!,
+        members: [
+          humanMembership(owner.id, "owner"),
+          humanMembership(
+            admin.id,
+            "admin",
+            "2026-08-09T08:02:00.000Z",
+          ),
+          humanMembership(
+            member.id,
+            "member",
+            "2026-08-09T08:05:00.000Z",
+          ),
+        ],
+      },
+    ],
+    invitations: [
+      {
+        id: adminInvitationId,
+        roomId: "fixture-room",
+        inviterActorId: owner.id,
+        inviteeActorId: admin.id,
+        tokenHash: createHash("sha256")
+          .update("admin-fixture-token")
+          .digest("base64url"),
+        status: "accepted",
+        createdAt: "2026-08-09T08:01:00.000Z",
+        decisionActorId: admin.id,
+        decidedAt: "2026-08-09T08:02:00.000Z",
+      },
+      {
+        id: memberInvitationId,
+        roomId: "fixture-room",
+        inviterActorId: owner.id,
+        inviteeActorId: member.id,
+        tokenHash: createHash("sha256")
+          .update("member-fixture-token")
+          .digest("base64url"),
+        status: "accepted",
+        createdAt: "2026-08-09T08:04:00.000Z",
+        decisionActorId: member.id,
+        decidedAt: "2026-08-09T08:05:00.000Z",
+      },
+    ],
+    audit: [
+      ...state.audit,
+      {
+        id: "audit-admin-invited",
+        type: "room.human.invited",
+        roomId: "fixture-room",
+        actorId: owner.id,
+        targetActorId: admin.id,
+        invitationId: adminInvitationId,
+        result: "pending",
+        timestamp: "2026-08-09T08:01:00.000Z",
+      },
+      {
+        id: "audit-admin-accepted",
+        type: "room.invitation.accepted",
+        roomId: "fixture-room",
+        actorId: admin.id,
+        targetActorId: admin.id,
+        inviterActorId: owner.id,
+        invitationId: adminInvitationId,
+        result: "accepted",
+        timestamp: "2026-08-09T08:02:00.000Z",
+      },
+      {
+        id: "audit-admin-role",
+        type: "room.member.role.changed",
+        roomId: "fixture-room",
+        actorId: owner.id,
+        targetActorId: admin.id,
+        role: "admin",
+        result: "role-changed",
+        timestamp: "2026-08-09T08:03:00.000Z",
+      },
+      {
+        id: "audit-member-invited",
+        type: "room.human.invited",
+        roomId: "fixture-room",
+        actorId: owner.id,
+        targetActorId: member.id,
+        invitationId: memberInvitationId,
+        result: "pending",
+        timestamp: "2026-08-09T08:04:00.000Z",
+      },
+      {
+        id: "audit-member-accepted",
+        type: "room.invitation.accepted",
+        roomId: "fixture-room",
+        actorId: member.id,
+        targetActorId: member.id,
+        inviterActorId: owner.id,
+        invitationId: memberInvitationId,
+        result: "accepted",
+        timestamp: "2026-08-09T08:05:00.000Z",
+      },
+    ],
   };
 }
 
@@ -151,13 +267,106 @@ function invitationAuthorityFixture(
   };
 
   return {
-    ...adminFixture(),
+    ...ownerFixture(),
+    rooms: [
+      {
+        ...ownerFixture().rooms[0]!,
+        members:
+          status === "accepted"
+            ? [
+                humanMembership(owner.id, "owner"),
+                humanMembership(invitee.id, "member", decidedAt),
+              ]
+            : [humanMembership(owner.id, "owner")],
+      },
+    ],
     invitations: [invitation],
     audit:
       status === "pending"
-        ? [issuanceAudit]
-        : [issuanceAudit, decisionAudit],
+        ? [...ownerFixture().audit, issuanceAudit]
+        : [...ownerFixture().audit, issuanceAudit, decisionAudit],
   };
+}
+
+function mutableAuditByType(
+  state: Record<string, unknown>,
+  type: string,
+): Record<string, unknown> {
+  const record = (state.audit as Record<string, unknown>[]).find(
+    (candidate) => candidate.type === type,
+  );
+  if (record === undefined) {
+    throw new Error(`missing ${type} fixture audit`);
+  }
+  return record;
+}
+
+function archivedAuthorityFixture(): Record<string, unknown> {
+  const state = structuredClone(ownerFixture()) as unknown as Record<
+    string,
+    unknown
+  >;
+  const fixtureRooms = state.rooms as Record<string, unknown>[];
+  fixtureRooms[0] = { ...fixtureRooms[0], status: "archived" };
+  (state.audit as unknown[]).push({
+    id: "audit-room-archived",
+    type: "room.archived",
+    roomId: "fixture-room",
+    actorId: owner.id,
+    result: "archived",
+    timestamp: "2026-08-09T08:01:00.000Z",
+  });
+  return state;
+}
+
+function acceptedThenRemovedFixture(): Record<string, unknown> {
+  const state = invitationAuthorityFixture("accepted");
+  const fixtureRooms = state.rooms as Record<string, unknown>[];
+  const memberships = fixtureRooms[0]?.members as Record<string, unknown>[];
+  fixtureRooms[0] = {
+    ...fixtureRooms[0],
+    members: memberships.filter(
+      (membership) => membership.actorId !== invitee.id,
+    ),
+  };
+  (state.audit as unknown[]).push({
+    id: "audit-invitee-removed",
+    type: "room.member.removed",
+    roomId: "fixture-room",
+    actorId: owner.id,
+    targetActorId: invitee.id,
+    result: "removed",
+    timestamp: "2026-08-09T08:03:00.000Z",
+  });
+  return state;
+}
+
+function agentAuthorityFixture(): Record<string, unknown> {
+  const state = structuredClone(ownerFixture()) as unknown as Record<
+    string,
+    unknown
+  >;
+  const fixtureRooms = state.rooms as Record<string, unknown>[];
+  const memberships = fixtureRooms[0]?.members as unknown[];
+  memberships.push({
+    kind: "agent",
+    actorId: searchAgent.id,
+    participation: "active",
+    toolPermissions: ["search"],
+    configuredAt: "2026-08-09T08:01:00.000Z",
+  });
+  (state.audit as unknown[]).push({
+    id: "audit-agent-configured",
+    type: "room.agent.configured",
+    roomId: "fixture-room",
+    actorId: owner.id,
+    targetActorId: searchAgent.id,
+    participation: "active",
+    toolPermissions: ["search"],
+    result: "configured",
+    timestamp: "2026-08-09T08:01:00.000Z",
+  });
+  return state;
 }
 
 class MemoryRoomStore implements StateStore<RoomLifecycleState> {
@@ -204,6 +413,216 @@ describe("room lifecycle authority state guard", () => {
     expect(isRoomLifecycleState(adminFixture())).toBe(true);
   });
 
+  it.each([
+    {
+      description: "room without creation evidence",
+      mutate(state: Record<string, unknown>) {
+        state.audit = (state.audit as Record<string, unknown>[]).filter(
+          (record) => record.type !== "room.created",
+        );
+      },
+    },
+    {
+      description: "room with duplicate creation evidence",
+      mutate(state: Record<string, unknown>) {
+        (state.audit as unknown[]).push({
+          ...mutableAuditByType(state, "room.created"),
+          id: "audit-room-created-again",
+        });
+      },
+    },
+    {
+      description: "room created by someone other than its owner",
+      mutate(state: Record<string, unknown>) {
+        mutableAuditByType(state, "room.created").actorId = admin.id;
+      },
+    },
+    {
+      description: "room creation timestamp different from owner join time",
+      mutate(state: Record<string, unknown>) {
+        mutableAuditByType(state, "room.created").timestamp =
+          "2026-08-09T07:59:00.000Z";
+      },
+    },
+  ])("rejects a $description", ({ mutate }) => {
+    const candidate = structuredClone(adminFixture()) as unknown as Record<
+      string,
+      unknown
+    >;
+    mutate(candidate);
+    expect(isRoomLifecycleState(candidate)).toBe(false);
+  });
+
+  it("accepts exactly one archive transition for an archived room", () => {
+    expect(isRoomLifecycleState(archivedAuthorityFixture())).toBe(true);
+  });
+
+  it("rejects an archive audit while the room remains active", () => {
+    const candidate = archivedAuthorityFixture();
+    const fixtureRooms = candidate.rooms as Record<string, unknown>[];
+    fixtureRooms[0] = { ...fixtureRooms[0], status: "active" };
+    expect(isRoomLifecycleState(candidate)).toBe(false);
+  });
+
+  it("rejects an archived room without archive evidence", () => {
+    const candidate = archivedAuthorityFixture();
+    candidate.audit = (candidate.audit as Record<string, unknown>[]).filter(
+      (record) => record.type !== "room.archived",
+    );
+    expect(isRoomLifecycleState(candidate)).toBe(false);
+  });
+
+  it("rejects duplicate archive evidence", () => {
+    const candidate = archivedAuthorityFixture();
+    (candidate.audit as unknown[]).push({
+      ...mutableAuditByType(candidate, "room.archived"),
+      id: "audit-room-archived-again",
+      timestamp: "2026-08-09T08:02:00.000Z",
+    });
+    expect(isRoomLifecycleState(candidate)).toBe(false);
+  });
+
+  it("rejects multiple owner memberships without an ownership model", () => {
+    const candidate = structuredClone(adminFixture()) as unknown as Record<
+      string,
+      unknown
+    >;
+    const fixtureRooms = candidate.rooms as Record<string, unknown>[];
+    const memberships = fixtureRooms[0]?.members as Record<string, unknown>[];
+    memberships[1] = { ...memberships[1], role: "owner" };
+    expect(isRoomLifecycleState(candidate)).toBe(false);
+  });
+
+  it("rejects an accepted invitee absent without subsequent removal", () => {
+    const candidate = invitationAuthorityFixture("accepted");
+    const fixtureRooms = candidate.rooms as Record<string, unknown>[];
+    const memberships = fixtureRooms[0]?.members as Record<string, unknown>[];
+    fixtureRooms[0] = {
+      ...fixtureRooms[0],
+      members: memberships.filter(
+        (membership) => membership.actorId !== invitee.id,
+      ),
+    };
+    expect(isRoomLifecycleState(candidate)).toBe(false);
+  });
+
+  it("accepts an accepted invitee removed after acceptance", () => {
+    expect(isRoomLifecycleState(acceptedThenRemovedFixture())).toBe(true);
+  });
+
+  it("rejects removal evidence ordered before invitation acceptance", () => {
+    const candidate = acceptedThenRemovedFixture();
+    mutableAuditByType(candidate, "room.member.removed").timestamp =
+      "2026-08-09T08:01:30.000Z";
+    expect(isRoomLifecycleState(candidate)).toBe(false);
+  });
+
+  it("rejects an arbitrary admin membership without a role transition", () => {
+    const candidate = structuredClone(adminFixture()) as unknown as Record<
+      string,
+      unknown
+    >;
+    candidate.audit = (candidate.audit as Record<string, unknown>[]).filter(
+      (record) => record.type !== "room.member.role.changed",
+    );
+    expect(isRoomLifecycleState(candidate)).toBe(false);
+  });
+
+  it("rejects a role transition sequence whose final role mismatches membership", () => {
+    const candidate = structuredClone(adminFixture()) as unknown as Record<
+      string,
+      unknown
+    >;
+    mutableAuditByType(candidate, "room.member.role.changed").role = "member";
+    expect(isRoomLifecycleState(candidate)).toBe(false);
+  });
+
+  it("rejects a redundant role-change audit that the service cannot emit", () => {
+    const candidate = structuredClone(adminFixture()) as unknown as Record<
+      string,
+      unknown
+    >;
+    (candidate.audit as unknown[]).push({
+      id: "audit-admin-role-redundant",
+      type: "room.member.role.changed",
+      roomId: "fixture-room",
+      actorId: owner.id,
+      targetActorId: admin.id,
+      role: "admin",
+      result: "role-changed",
+      timestamp: "2026-08-09T08:06:00.000Z",
+    });
+    expect(isRoomLifecycleState(candidate)).toBe(false);
+  });
+
+  it("accepts a replayable admin demotion back to member", () => {
+    const candidate = structuredClone(adminFixture()) as unknown as Record<
+      string,
+      unknown
+    >;
+    const fixtureRooms = candidate.rooms as Record<string, unknown>[];
+    const memberships = fixtureRooms[0]?.members as Record<string, unknown>[];
+    memberships[1] = { ...memberships[1], role: "member" };
+    (candidate.audit as unknown[]).push({
+      id: "audit-admin-demoted",
+      type: "room.member.role.changed",
+      roomId: "fixture-room",
+      actorId: owner.id,
+      targetActorId: admin.id,
+      role: "member",
+      result: "role-changed",
+      timestamp: "2026-08-09T08:06:00.000Z",
+    });
+    expect(isRoomLifecycleState(candidate)).toBe(true);
+  });
+
+  it("accepts agent configuration and subsequent removal as reachable", () => {
+    const configured = agentAuthorityFixture();
+    expect(isRoomLifecycleState(configured)).toBe(true);
+
+    const removed = agentAuthorityFixture();
+    const fixtureRooms = removed.rooms as Record<string, unknown>[];
+    const memberships = fixtureRooms[0]?.members as Record<string, unknown>[];
+    fixtureRooms[0] = {
+      ...fixtureRooms[0],
+      members: memberships.filter(
+        (membership) => membership.actorId !== searchAgent.id,
+      ),
+    };
+    (removed.audit as unknown[]).push({
+      id: "audit-agent-removed",
+      type: "room.member.removed",
+      roomId: "fixture-room",
+      actorId: owner.id,
+      targetActorId: searchAgent.id,
+      result: "removed",
+      timestamp: "2026-08-09T08:02:00.000Z",
+    });
+    expect(isRoomLifecycleState(removed)).toBe(true);
+  });
+
+  it("rejects an agent membership without configuration evidence", () => {
+    const candidate = agentAuthorityFixture();
+    candidate.audit = (candidate.audit as Record<string, unknown>[]).filter(
+      (record) => record.type !== "room.agent.configured",
+    );
+    expect(isRoomLifecycleState(candidate)).toBe(false);
+  });
+
+  it("rejects an agent membership differing from its latest configuration", () => {
+    const candidate = agentAuthorityFixture();
+    const fixtureRooms = candidate.rooms as Record<string, unknown>[];
+    const memberships = fixtureRooms[0]?.members as Record<string, unknown>[];
+    const agentMembership = memberships.find(
+      (membership) => membership.actorId === searchAgent.id,
+    );
+    if (agentMembership === undefined) {
+      throw new Error("agent fixture membership is missing");
+    }
+    agentMembership.participation = "silent";
+    expect(isRoomLifecycleState(candidate)).toBe(false);
+  });
+
   it.each(["pending", "accepted", "rejected"] as const)(
     "accepts a %s invitation with exactly linked issuance and decision evidence",
     (status) => {
@@ -221,33 +640,36 @@ describe("room lifecycle authority state guard", () => {
     {
       description: "accepted invitation with a rejected decision audit",
       mutate(state: Record<string, unknown>) {
-        const audit = state.audit as Record<string, unknown>[];
-        audit[1] = {
-          ...audit[1],
+        Object.assign(
+          mutableAuditByType(state, "room.invitation.accepted"),
+          {
           type: "room.invitation.rejected",
           result: "rejected",
-        };
+          },
+        );
       },
     },
     {
       description: "orphan decision audit",
       mutate(state: Record<string, unknown>) {
-        const audit = state.audit as Record<string, unknown>[];
-        audit[1] = { ...audit[1], invitationId: "invitation-missing" };
+        mutableAuditByType(state, "room.invitation.accepted").invitationId =
+          "invitation-missing";
       },
     },
     {
       description: "duplicate decision audit",
       mutate(state: Record<string, unknown>) {
         const audit = state.audit as Record<string, unknown>[];
-        audit.push({ ...audit[1], id: "audit-invitation-decided-again" });
+        audit.push({
+          ...mutableAuditByType(state, "room.invitation.accepted"),
+          id: "audit-invitation-decided-again",
+        });
       },
     },
     {
       description: "decision audit by the wrong actor",
       mutate(state: Record<string, unknown>) {
-        const audit = state.audit as Record<string, unknown>[];
-        audit[1] = { ...audit[1], actorId: admin.id };
+        mutableAuditByType(state, "room.invitation.accepted").actorId = admin.id;
       },
     },
     {
@@ -255,8 +677,8 @@ describe("room lifecycle authority state guard", () => {
       mutate(state: Record<string, unknown>) {
         const fixtureRooms = state.rooms as Record<string, unknown>[];
         fixtureRooms.push({ ...fixtureRooms[0], id: "fixture-room-other" });
-        const audit = state.audit as Record<string, unknown>[];
-        audit[1] = { ...audit[1], roomId: "fixture-room-other" };
+        mutableAuditByType(state, "room.invitation.accepted").roomId =
+          "fixture-room-other";
       },
     },
   ])("rejects $description", ({ mutate }) => {
@@ -268,7 +690,11 @@ describe("room lifecycle authority state guard", () => {
   it("rejects a pending invitation with decision evidence", () => {
     const candidate = invitationAuthorityFixture("pending");
     const terminal = invitationAuthorityFixture("accepted");
-    (candidate.audit as unknown[]).push((terminal.audit as unknown[])[1]);
+    (candidate.audit as unknown[]).push(
+      structuredClone(
+        mutableAuditByType(terminal, "room.invitation.accepted"),
+      ),
+    );
     expect(isRoomLifecycleState(candidate)).toBe(false);
   });
 
@@ -279,11 +705,8 @@ describe("room lifecycle authority state guard", () => {
       ...invitations[0],
       decidedAt: "2026-08-09T07:59:00.000Z",
     };
-    const audit = candidate.audit as Record<string, unknown>[];
-    audit[1] = {
-      ...audit[1],
-      timestamp: "2026-08-09T07:59:00.000Z",
-    };
+    mutableAuditByType(candidate, "room.invitation.accepted").timestamp =
+      "2026-08-09T07:59:00.000Z";
 
     expect(isRoomLifecycleState(candidate)).toBe(false);
   });
@@ -292,21 +715,22 @@ describe("room lifecycle authority state guard", () => {
     {
       description: "missing issuance audit",
       mutate(state: Record<string, unknown>) {
-        (state.audit as unknown[]).shift();
+        state.audit = (state.audit as Record<string, unknown>[]).filter(
+          (record) => record.type !== "room.human.invited",
+        );
       },
     },
     {
       description: "orphan issuance audit",
       mutate(state: Record<string, unknown>) {
-        const audit = state.audit as Record<string, unknown>[];
-        audit[0] = { ...audit[0], invitationId: "invitation-missing" };
+        mutableAuditByType(state, "room.human.invited").invitationId =
+          "invitation-missing";
       },
     },
     {
       description: "issuance audit with a mismatched inviter",
       mutate(state: Record<string, unknown>) {
-        const audit = state.audit as Record<string, unknown>[];
-        audit[0] = { ...audit[0], actorId: admin.id };
+        mutableAuditByType(state, "room.human.invited").actorId = admin.id;
       },
     },
   ])("rejects $description", ({ mutate }) => {
@@ -319,12 +743,13 @@ describe("room lifecycle authority state guard", () => {
     {
       description: "accepted versus rejected mismatch",
       mutate(state: Record<string, unknown>) {
-        const audit = state.audit as Record<string, unknown>[];
-        audit[1] = {
-          ...audit[1],
+        Object.assign(
+          mutableAuditByType(state, "room.invitation.accepted"),
+          {
           type: "room.invitation.rejected",
           result: "rejected",
-        };
+          },
+        );
       },
     },
     {
@@ -336,8 +761,8 @@ describe("room lifecycle authority state guard", () => {
     {
       description: "orphan decision audit",
       mutate(state: Record<string, unknown>) {
-        const audit = state.audit as Record<string, unknown>[];
-        audit[1] = { ...audit[1], invitationId: "invitation-missing" };
+        mutableAuditByType(state, "room.invitation.accepted").invitationId =
+          "invitation-missing";
       },
     },
   ])("loads $description as corruption", async ({ mutate }) => {
@@ -487,8 +912,7 @@ describe("room lifecycle authority state guard", () => {
         const state = invitationAuthorityFixture("pending");
         const invitations = state.invitations as Record<string, unknown>[];
         invitations[0] = { ...invitations[0], id: admin.id };
-        const audit = state.audit as Record<string, unknown>[];
-        audit[0] = { ...audit[0], invitationId: admin.id };
+        mutableAuditByType(state, "room.human.invited").invitationId = admin.id;
         return state;
       },
     },
@@ -507,8 +931,8 @@ describe("room lifecycle authority state guard", () => {
         const state = invitationAuthorityFixture("pending");
         const invitations = state.invitations as Record<string, unknown>[];
         invitations[0] = { ...invitations[0], id: "fixture-room" };
-        const audit = state.audit as Record<string, unknown>[];
-        audit[0] = { ...audit[0], invitationId: "fixture-room" };
+        mutableAuditByType(state, "room.human.invited").invitationId =
+          "fixture-room";
         return state;
       },
     },
@@ -636,6 +1060,216 @@ describe("room lifecycle authority state guard", () => {
 });
 
 describe("room lifecycle service", () => {
+  it("authorizes a routed invite and agent configuration before validating their payload", async () => {
+    const rooms = await createRoomLifecycleService(
+      createOptions(new MemoryRoomStore()),
+    );
+    const room = await rooms.createRoom(owner.id, { name: "Payload authz" });
+    await addHumanMember(rooms, room.id, member.id);
+
+    await expect(
+      rooms.inviteHuman(
+        member.id,
+        {
+          kind: "human-invitation",
+          roomId: room.id,
+          inviteeActorId: 42,
+        } as never,
+      ),
+    ).rejects.toMatchObject({ status: 403, code: "room_forbidden" });
+    await expect(
+      rooms.configureAgent(
+        member.id,
+        {
+          kind: "agent-configuration",
+          roomId: room.id,
+          agentId: 42,
+          participation: "invalid",
+          toolPermissions: "search",
+        } as never,
+      ),
+    ).rejects.toMatchObject({ status: 403, code: "room_forbidden" });
+  });
+
+  it.each(["", "human-missing"])(
+    "authenticates caller %j before routed payload validation",
+    async (actorId) => {
+      const rooms = await createRoomLifecycleService(
+        createOptions(new MemoryRoomStore()),
+      );
+      const room = await rooms.createRoom(owner.id, { name: "Payload authn" });
+
+      await expect(
+        rooms.inviteHuman(
+          actorId,
+          { roomId: room.id, inviteeActorId: 42 } as never,
+        ),
+      ).rejects.toMatchObject({ status: 401, code: "unauthenticated" });
+      await expect(
+        rooms.configureAgent(
+          actorId,
+          { roomId: room.id, agentId: 42 } as never,
+        ),
+      ).rejects.toMatchObject({ status: 401, code: "unauthenticated" });
+    },
+  );
+
+  it.each(["", "human-missing"])(
+    "authenticates invitation respondent %j before validating its decision",
+    async (actorId) => {
+      const rooms = await createRoomLifecycleService(
+        createOptions(new MemoryRoomStore()),
+      );
+
+      await expect(
+        rooms.respondToHumanInvitation(
+          actorId,
+          "unknown-token",
+          "invalid" as never,
+        ),
+      ).rejects.toMatchObject({ status: 401, code: "unauthenticated" });
+    },
+  );
+
+  it("returns typed payload errors for an authenticated owner without raw TypeErrors", async () => {
+    const rooms = await createRoomLifecycleService(
+      createOptions(new MemoryRoomStore()),
+    );
+
+    await expect(rooms.inviteHuman(owner.id, null as never)).rejects.toMatchObject({
+      status: 400,
+      code: "human_invitation_invalid",
+    });
+    await expect(
+      rooms.configureAgent(owner.id, null as never),
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "agent_configuration_invalid",
+    });
+  });
+
+  it("promotes an invited member into an admin who can perform every manager action", async () => {
+    const rooms = await createRoomLifecycleService(
+      createOptions(new MemoryRoomStore()),
+    );
+    const room = await rooms.createRoom(owner.id, { name: "Reachable admin" });
+    await addHumanMember(rooms, room.id, member.id);
+    await addHumanMember(rooms, room.id, invitee.id);
+
+    await expect(
+      rooms.setHumanRole(owner.id, room.id, member.id, "admin"),
+    ).resolves.toMatchObject({
+      members: expect.arrayContaining([
+        expect.objectContaining({ actorId: member.id, role: "admin" }),
+      ]),
+    });
+    expect(rooms.audit(room.id)).toContainEqual(
+      expect.objectContaining({
+        type: "room.member.role.changed",
+        actorId: owner.id,
+        targetActorId: member.id,
+        role: "admin",
+        result: "role-changed",
+      }),
+    );
+
+    await expect(
+      rooms.renameRoom(member.id, room.id, "Admin renamed"),
+    ).resolves.toMatchObject({ name: "Admin renamed" });
+    await expect(
+      rooms.inviteHuman(member.id, {
+        kind: "human-invitation",
+        roomId: room.id,
+        inviteeActorId: admin.id,
+      }),
+    ).resolves.toMatchObject({ inviterActorId: member.id });
+    await expect(
+      rooms.configureAgent(member.id, {
+        kind: "agent-configuration",
+        roomId: room.id,
+        agentId: searchAgent.id,
+        participation: "active",
+        toolPermissions: ["search"],
+      }),
+    ).resolves.toMatchObject({ id: room.id });
+    await expect(
+      rooms.removeMember(member.id, room.id, invitee.id),
+    ).resolves.toMatchObject({ id: room.id });
+    await expect(rooms.archiveRoom(member.id, room.id)).resolves.toMatchObject({
+      status: "archived",
+    });
+  });
+
+  it("allows only the owner to change a current non-owner human role", async () => {
+    const rooms = await createRoomLifecycleService(
+      createOptions(new MemoryRoomStore()),
+    );
+    const room = await rooms.createRoom(owner.id, { name: "Role authority" });
+    await addHumanMember(rooms, room.id, admin.id);
+    await addHumanMember(rooms, room.id, member.id);
+    await rooms.setHumanRole(owner.id, room.id, admin.id, "admin");
+
+    await expect(
+      rooms.setHumanRole(admin.id, room.id, member.id, "admin"),
+    ).rejects.toMatchObject({ status: 403, code: "room_forbidden" });
+    await expect(
+      rooms.setHumanRole(member.id, room.id, admin.id, "member"),
+    ).rejects.toMatchObject({ status: 403, code: "room_forbidden" });
+    await expect(
+      rooms.setHumanRole(owner.id, room.id, owner.id, "member"),
+    ).rejects.toMatchObject({ status: 409, code: "room_owner_required" });
+
+    await rooms.configureAgent(owner.id, {
+      kind: "agent-configuration",
+      roomId: room.id,
+      agentId: searchAgent.id,
+      participation: "silent",
+      toolPermissions: [],
+    });
+    await expect(
+      rooms.setHumanRole(owner.id, room.id, searchAgent.id, "admin"),
+    ).rejects.toMatchObject({ status: 400, code: "human_member_required" });
+  });
+
+  it("restores a promoted admin and its role audit from JSON", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-room-role-"));
+    const filePath = join(directory, "rooms.json");
+    const options = {
+      actors,
+      state: createJsonStateStore(filePath, isRoomLifecycleState),
+      clock: () => Date.parse("2026-08-09T09:00:00.000Z"),
+      idFactory: sequenceFactory("role-restart-entity"),
+      tokenFactory: sequenceFactory("role-restart-token"),
+    };
+
+    try {
+      const rooms = await createRoomLifecycleService(options);
+      const room = await rooms.createRoom(owner.id, { name: "Role restart" });
+      await addHumanMember(rooms, room.id, member.id);
+      await rooms.setHumanRole(owner.id, room.id, member.id, "admin");
+
+      const restarted = await createRoomLifecycleService({
+        ...options,
+        state: createJsonStateStore(filePath, isRoomLifecycleState),
+      });
+      expect(restarted.getRoom(room.id)?.members).toContainEqual(
+        expect.objectContaining({ actorId: member.id, role: "admin" }),
+      );
+      expect(restarted.audit(room.id)).toContainEqual(
+        expect.objectContaining({
+          type: "room.member.role.changed",
+          targetActorId: member.id,
+          role: "admin",
+        }),
+      );
+      await expect(
+        restarted.renameRoom(member.id, room.id, "Admin survived restart"),
+      ).resolves.toMatchObject({ name: "Admin survived restart" });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it.each([
     { description: "null input", input: null },
     { description: "numeric input", input: 42 },
@@ -979,6 +1613,74 @@ describe("room lifecycle service", () => {
     ).rejects.toMatchObject({ status: 400, code: "agent_configuration_invalid" });
   });
 
+  it("restores the latest agent reconfiguration and its complete audits from JSON", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-room-agent-"));
+    const filePath = join(directory, "rooms.json");
+    let now = Date.parse("2026-08-09T10:00:00.000Z");
+    const options = {
+      actors,
+      state: createJsonStateStore(filePath, isRoomLifecycleState),
+      clock: () => now,
+      idFactory: sequenceFactory("agent-restart-entity"),
+      tokenFactory: sequenceFactory("agent-restart-token"),
+    };
+
+    try {
+      const rooms = await createRoomLifecycleService(options);
+      const room = await rooms.createRoom(owner.id, { name: "Agent restart" });
+      now += 1_000;
+      await rooms.configureAgent(owner.id, {
+        kind: "agent-configuration",
+        roomId: room.id,
+        agentId: searchAgent.id,
+        participation: "active",
+        toolPermissions: ["search"],
+      });
+      now += 1_000;
+      await rooms.configureAgent(owner.id, {
+        kind: "agent-configuration",
+        roomId: room.id,
+        agentId: searchAgent.id,
+        participation: "silent",
+        toolPermissions: ["summarize"],
+      });
+
+      const restarted = await createRoomLifecycleService({
+        ...options,
+        state: createJsonStateStore(filePath, isRoomLifecycleState),
+      });
+      expect(restarted.getRoom(room.id)?.members).toContainEqual(
+        expect.objectContaining({
+          kind: "agent",
+          actorId: searchAgent.id,
+          participation: "silent",
+          toolPermissions: ["summarize"],
+          configuredAt: "2026-08-09T10:00:02.000Z",
+        }),
+      );
+      expect(
+        restarted
+          .audit(room.id)
+          .filter((record) => record.type === "room.agent.configured"),
+      ).toEqual([
+        expect.objectContaining({
+          targetActorId: searchAgent.id,
+          participation: "active",
+          toolPermissions: ["search"],
+          timestamp: "2026-08-09T10:00:01.000Z",
+        }),
+        expect.objectContaining({
+          targetActorId: searchAgent.id,
+          participation: "silent",
+          toolPermissions: ["summarize"],
+          timestamp: "2026-08-09T10:00:02.000Z",
+        }),
+      ]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("rejects every manager action from an ordinary member with room_forbidden", async () => {
     const rooms = await createRoomLifecycleService(
       createOptions(new MemoryRoomStore()),
@@ -1017,7 +1719,10 @@ describe("room lifecycle service", () => {
 
   it("allows an existing human admin to execute every manager action", async () => {
     const store = new MemoryRoomStore(adminFixture());
-    const rooms = await createRoomLifecycleService(createOptions(store));
+    const rooms = await createRoomLifecycleService({
+      ...createOptions(store),
+      clock: () => Date.parse("2026-08-09T09:00:00.000Z"),
+    });
 
     await expect(
       rooms.renameRoom(admin.id, "fixture-room", "Admin renamed"),
@@ -1125,6 +1830,17 @@ describe("room lifecycle service", () => {
         code: "room_archived",
       });
     }
+
+    await expect(
+      rooms.respondToHumanInvitation(invitee.id, pending.token, "reject"),
+    ).resolves.toMatchObject({ status: "rejected" });
+    expect(rooms.audit(room.id)).toContainEqual(
+      expect.objectContaining({
+        type: "room.invitation.rejected",
+        targetActorId: invitee.id,
+        result: "rejected",
+      }),
+    );
   });
 
   it("publishes no mutation or audit record when persistence fails", async () => {
