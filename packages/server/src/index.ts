@@ -34,9 +34,14 @@ export type {
   RoomLifecycleServiceOptions,
   RoomLifecycleState,
 } from "./room-lifecycle.js";
-export { createMessageService, MessageValidationError } from "./service.js";
+export {
+  createMessageService,
+  MessageValidationError,
+  RoomAccessError,
+} from "./service.js";
 export type {
   ListenerErrorHandler,
+  MessageDirectory,
   MessageErrorCode,
   MessageListener,
   MessageService,
@@ -46,14 +51,22 @@ export { createJsonlMessageStore, MessageStoreCorruptionError } from "./store.js
 export type { MessageStore } from "./store.js";
 export { parseClientFrame } from "./protocol.js";
 export type {
+  AuthenticatedFrame,
+  AuthLoginFrame,
+  AuthRefreshFrame,
+  AuthResumeFrame,
+  AuthRevokeFrame,
+  AuthRevokedFrame,
   ClientFrame,
   ClientFrameParseResult,
   MessageCreatedFrame,
-  MessageHistoryFrame,
   MessageSendFrame,
   ProtocolErrorCode,
   ProtocolErrorFrame,
+  RoomHistoryFrame,
+  RoomHistoryRequestFrame,
   RoomSubscribeFrame,
+  RoomSubscribedFrame,
   ServerFrame,
 } from "./protocol.js";
 export { startMessageWebSocketServer } from "./websocket.js";
