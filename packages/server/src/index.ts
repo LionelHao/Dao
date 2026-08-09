@@ -1,3 +1,22 @@
+export {
+  AuthenticationError,
+  createAuthenticationService,
+  createScryptIdentityAdapter,
+  isSessionState,
+} from "./auth.js";
+export type {
+  AuthenticatedPrincipal,
+  AuthenticationErrorCode,
+  AuthenticationService,
+  AuthenticationServiceOptions,
+  IdentityAdapter,
+  IssuedSession,
+  LoginCredentials,
+  PasswordIdentityRecord,
+  SessionState,
+} from "./auth.js";
+export { createJsonStateStore, StateStoreCorruptionError } from "./state-store.js";
+export type { StateStore } from "./state-store.js";
 export { createMessageService, MessageValidationError } from "./service.js";
 export type {
   ListenerErrorHandler,
