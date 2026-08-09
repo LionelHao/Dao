@@ -26,6 +26,7 @@ export function renderEmptyGroupChat(root: HTMLElement): void {
   description.textContent = "邀请真人或编制 agent 后开始协作";
 
   section.append(title, description);
+  root.setAttribute("aria-label", "空群聊");
   root.replaceChildren(section);
 }
 
@@ -810,5 +811,6 @@ export function renderRoomJoinReview(root: HTMLElement): void {
   });
   review.append(header, controlsRoot, callbackStatus);
   root.dataset.testid = "room-join-review";
+  root.setAttribute("aria-label", "添加房间参与者");
   root.replaceChildren(review);
 }

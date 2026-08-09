@@ -14,6 +14,7 @@ type RendererUnderTest = {
     actorsById: ReadonlyMap<string, unknown>,
   ) => void;
   renderVisualSeparationPreview?: (root: HTMLElement) => void;
+  renderRoomJoinReview?: (root: HTMLElement) => void;
   renderRoomJoinControls?: (
     root: HTMLElement,
     options: {
@@ -37,6 +38,36 @@ describe("empty group chat renderer", () => {
     expect(root.querySelector("[data-testid='empty-group-chat']")).not.toBeNull();
     expect(root.textContent).toContain("还没有消息");
     expect(root.textContent).toContain("邀请真人或编制 agent 后开始协作");
+  });
+});
+
+describe("renderer landmark labels", () => {
+  it("labels the join review root for adding room participants", () => {
+    const root = document.createElement("main");
+
+    root.setAttribute("aria-label", "空群聊");
+    expect(app.renderRoomJoinReview).toBeTypeOf("function");
+    app.renderRoomJoinReview?.(root);
+
+    expect(root.getAttribute("aria-label")).toBe("添加房间参与者");
+  });
+
+  it("restores the empty-room root label after rendering another view", () => {
+    const root = document.createElement("main");
+
+    root.setAttribute("aria-label", "添加房间参与者");
+    app.renderEmptyGroupChat?.(root);
+
+    expect(root.getAttribute("aria-label")).toBe("空群聊");
+  });
+
+  it("restores the visual review label when reusing the same root", () => {
+    const root = document.createElement("main");
+
+    root.setAttribute("aria-label", "添加房间参与者");
+    app.renderVisualSeparationPreview?.(root);
+
+    expect(root.getAttribute("aria-label")).toBe("人和 agent 的视觉分离预览");
   });
 });
 
