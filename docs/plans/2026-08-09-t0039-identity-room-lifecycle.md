@@ -592,13 +592,13 @@ Check:
 [ ] No .skip/.only; every @ts-expect-error explains the intended compile failure
 ```
 
-- [ ] **Step 3: Run the complete mandatory gate in prescribed order.**
+- [x] **Step 3: Run the complete mandatory gate in prescribed order.**
 
 Run: `pnpm install && pnpm typecheck && pnpm lint && pnpm test && pnpm build`
 
 Expected: all five commands exit 0 with no warnings; core boundary passes; no skipped tests.
 
-- [ ] **Step 4: Run Blueprint validation.**
+- [x] **Step 4: Run Blueprint validation.**
 
 Run: `python3 /Users/lionel/project/articles/prd/drafts/context/gbp.py check /Users/lionel/project/articles/prd/drafts/2026-08-原生人机协作IM-蓝图.html --links`
 
