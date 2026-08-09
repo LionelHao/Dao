@@ -81,6 +81,8 @@ export type {
 export {
   MESSAGE_WEBSOCKET_MAX_BUFFERED_AMOUNT_BYTES,
   MESSAGE_WEBSOCKET_MAX_PAYLOAD_BYTES,
+  MESSAGE_WEBSOCKET_MAX_QUEUED_FRAME_BYTES,
+  MESSAGE_WEBSOCKET_MAX_QUEUED_FRAME_COUNT,
   startMessageWebSocketServer,
 } from "./websocket.js";
 export type { MessageWebSocketServer, StartMessageWebSocketServerOptions } from "./websocket.js";

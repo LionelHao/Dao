@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { Actor, Message, MessageDraft } from "@native-im/core";
 import {
@@ -481,6 +481,94 @@ describe("message service", () => {
 });
 
 describe("JSONL message store", () => {
+  it("coordinates exact replay across canonical paths and store instances", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-server-"));
+    const absolutePath = join(directory, "messages", "message-log.jsonl");
+    const relativePath = relative(process.cwd(), absolutePath);
+    const message = authoritativeMessage(owner, draft.roomId, "multi-store-replay");
+
+    try {
+      const absoluteStore = createJsonlMessageStore(absolutePath);
+      const relativeStore = createJsonlMessageStore(relativePath);
+
+      await expect(
+        Promise.all([absoluteStore.append(message), relativeStore.append(message)]),
+      ).resolves.toEqual(["appended", "replayed"]);
+      expect((await readFile(absolutePath, "utf8")).trim().split("\n")).toEqual([
+        JSON.stringify(message),
+      ]);
+      await expect(relativeStore.list(draft.roomId)).resolves.toEqual([message]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("serializes conflicting IDs across store instances without corrupting the log", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-server-"));
+    const filePath = join(directory, "messages", "message-log.jsonl");
+    const first = authoritativeMessage(owner, draft.roomId, "multi-store-conflict");
+    const conflicting = { ...first, body: "conflicting body" };
+
+    try {
+      const firstStore = createJsonlMessageStore(filePath);
+      const secondStore = createJsonlMessageStore(filePath);
+      const results = await Promise.allSettled([
+        firstStore.append(first),
+        secondStore.append(conflicting),
+      ]);
+
+      expect(results[0]).toMatchObject({ status: "fulfilled", value: "appended" });
+      expect(results[1]).toMatchObject({
+        status: "rejected",
+        reason: { status: 409, code: "message_id_conflict" },
+      });
+      await expect(firstStore.list(draft.roomId)).resolves.toEqual([first]);
+      expect((await readFile(filePath, "utf8")).trim().split("\n")).toHaveLength(1);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("serializes a list requested while another instance is appending", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-server-"));
+    const filePath = join(directory, "messages", "message-log.jsonl");
+    const message = authoritativeMessage(owner, draft.roomId, "list-during-append");
+
+    try {
+      const writer = createJsonlMessageStore(filePath);
+      const reader = createJsonlMessageStore(filePath);
+      const append = writer.append(message);
+      const list = reader.list(draft.roomId);
+
+      await expect(Promise.all([append, list])).resolves.toEqual([
+        "appended",
+        [message],
+      ]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers the shared coordinator after a rejected operation", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-server-"));
+    const parentPath = join(directory, "blocked-parent");
+    const filePath = join(parentPath, "message-log.jsonl");
+    const message = authoritativeMessage(owner, draft.roomId, "shared-recovery");
+
+    try {
+      await writeFile(parentPath, "not a directory", "utf8");
+      const firstStore = createJsonlMessageStore(filePath);
+      const secondStore = createJsonlMessageStore(filePath);
+
+      await expect(firstStore.append(message)).rejects.toThrow();
+      await rm(parentPath);
+      await expect(secondStore.append(message)).resolves.toBe("appended");
+      await expect(firstStore.list(draft.roomId)).resolves.toEqual([message]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("atomically deduplicates exact replay under concurrency", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-server-"));
     const filePath = join(directory, "messages", "message-log.jsonl");

@@ -31,11 +31,15 @@ export interface StartMessageWebSocketServerOptions {
   readonly host?: string;
   readonly port?: number;
   readonly maxBufferedAmountBytes?: number;
+  readonly maxQueuedFrameCount?: number;
+  readonly maxQueuedFrameBytes?: number;
   readonly afterSubscribeRegistered?: (roomId: string) => void | Promise<void>;
 }
 
 export const MESSAGE_WEBSOCKET_MAX_PAYLOAD_BYTES = 64 * 1_024;
 export const MESSAGE_WEBSOCKET_MAX_BUFFERED_AMOUNT_BYTES = 1 * 1_024 * 1_024;
+export const MESSAGE_WEBSOCKET_MAX_QUEUED_FRAME_COUNT = 64;
+export const MESSAGE_WEBSOCKET_MAX_QUEUED_FRAME_BYTES = 256 * 1_024;
 
 const maxBufferedAmountBySocket = new WeakMap<WebSocket, number>();
 const abortConnectionBySocket = new WeakMap<WebSocket, () => void>();
@@ -110,6 +114,13 @@ function rawDataToString(raw: RawData): string {
     return Buffer.from(raw).toString("utf8");
   }
   return raw.toString("utf8");
+}
+
+function rawDataByteLength(raw: RawData): number {
+  if (Array.isArray(raw)) {
+    return raw.reduce((total, chunk) => total + chunk.byteLength, 0);
+  }
+  return raw.byteLength;
 }
 
 function closeHttpServer(server: HttpServer): Promise<void> {
@@ -633,6 +644,16 @@ export async function startMessageWebSocketServer(
   if (!Number.isFinite(maxBufferedAmountBytes) || maxBufferedAmountBytes < 0) {
     throw new RangeError("maxBufferedAmountBytes must be a non-negative finite number");
   }
+  const maxQueuedFrameCount =
+    options.maxQueuedFrameCount ?? MESSAGE_WEBSOCKET_MAX_QUEUED_FRAME_COUNT;
+  if (!Number.isSafeInteger(maxQueuedFrameCount) || maxQueuedFrameCount <= 0) {
+    throw new RangeError("maxQueuedFrameCount must be a positive safe integer");
+  }
+  const maxQueuedFrameBytes =
+    options.maxQueuedFrameBytes ?? MESSAGE_WEBSOCKET_MAX_QUEUED_FRAME_BYTES;
+  if (!Number.isSafeInteger(maxQueuedFrameBytes) || maxQueuedFrameBytes <= 0) {
+    throw new RangeError("maxQueuedFrameBytes must be a positive safe integer");
+  }
   const httpServer = createServer();
   const webSocketServer = new WebSocketServer({
     server: httpServer,
@@ -663,6 +684,8 @@ export async function startMessageWebSocketServer(
       unsubscribeAll,
     };
     let frameQueue = Promise.resolve();
+    let queuedFrameCount = 0;
+    let queuedFrameBytes = 0;
     const abort = () => {
       abortConnection(context);
     };
@@ -675,40 +698,58 @@ export async function startMessageWebSocketServer(
     });
     socket.on("error", abort);
     socket.on("message", (raw, isBinary) => {
-      const queued = frameQueue.then(async () => {
-        if (context.closed) {
-          return;
-        }
-        if (isBinary) {
-          sendFrame(
-            socket,
-            errorFrame(400, "invalid_request", "Binary requests are not supported"),
-          );
-          return;
-        }
-
-        const parsed = parseClientFrame(rawDataToString(raw));
-        if (!parsed.ok) {
-          sendFrame(socket, parsed.error);
-          return;
-        }
-
-        try {
-          await handleFrame(socket, parsed.frame, options, context);
-        } catch {
-          if (!context.closed) {
+      if (context.closed) {
+        return;
+      }
+      const rawBytes = rawDataByteLength(raw);
+      if (
+        queuedFrameCount >= maxQueuedFrameCount ||
+        rawBytes > maxQueuedFrameBytes - queuedFrameBytes
+      ) {
+        abortAndTerminate(socket);
+        return;
+      }
+      queuedFrameCount += 1;
+      queuedFrameBytes += rawBytes;
+      const queued = frameQueue
+        .then(async () => {
+          if (context.closed) {
+            return;
+          }
+          if (isBinary) {
             sendFrame(
               socket,
-              errorFrame(
-                500,
-                "internal_error",
-                "Unable to process request",
-                parsed.frame.requestId,
-              ),
+              errorFrame(400, "invalid_request", "Binary requests are not supported"),
             );
+            return;
           }
-        }
-      });
+
+          const parsed = parseClientFrame(rawDataToString(raw));
+          if (!parsed.ok) {
+            sendFrame(socket, parsed.error);
+            return;
+          }
+
+          try {
+            await handleFrame(socket, parsed.frame, options, context);
+          } catch {
+            if (!context.closed) {
+              sendFrame(
+                socket,
+                errorFrame(
+                  500,
+                  "internal_error",
+                  "Unable to process request",
+                  parsed.frame.requestId,
+                ),
+              );
+            }
+          }
+        })
+        .finally(() => {
+          queuedFrameCount -= 1;
+          queuedFrameBytes -= rawBytes;
+        });
       frameQueue = queued.catch(() => undefined);
     });
   });

@@ -562,6 +562,63 @@ afterEach(async () => {
 });
 
 describe("authenticated message WebSocket service", () => {
+  it("exports finite aggregate inbound queue defaults", async () => {
+    const serverModule = await import("./index.js");
+
+    expect(serverModule.MESSAGE_WEBSOCKET_MAX_QUEUED_FRAME_COUNT).toBe(64);
+    expect(serverModule.MESSAGE_WEBSOCKET_MAX_QUEUED_FRAME_BYTES).toBe(256 * 1_024);
+  });
+
+  it.each([
+    { option: "maxQueuedFrameCount", value: 0 },
+    { option: "maxQueuedFrameCount", value: 1.5 },
+    { option: "maxQueuedFrameCount", value: Number.POSITIVE_INFINITY },
+    { option: "maxQueuedFrameBytes", value: 0 },
+    { option: "maxQueuedFrameBytes", value: 1.5 },
+    { option: "maxQueuedFrameBytes", value: Number.POSITIVE_INFINITY },
+  ] as const)("rejects invalid $option=$value", async ({ option, value }) => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "invalid-inbound-bound");
+    const auth: AuthenticationService = {
+      async login() {
+        return session;
+      },
+      async authenticate() {
+        return principal;
+      },
+      async refresh() {
+        return session;
+      },
+      async revoke() {},
+    };
+    const service: MessageService = {
+      async send(_actorId, message) {
+        return {
+          type: "message.accepted",
+          requestId: message.id,
+          messageId: message.id,
+          persistedAt: "2026-08-10T00:00:00.000Z",
+        };
+      },
+      subscribe() {
+        return () => undefined;
+      },
+      async history() {
+        return [];
+      },
+    };
+    const attempt = startMessageWebSocketServer({
+      auth,
+      service,
+      [option]: value,
+    }).then(async (server) => {
+      await server.close();
+      return server;
+    });
+
+    await expect(attempt).rejects.toBeInstanceOf(RangeError);
+  });
+
   it("returns closed structured errors without echoing credentials or tokens", async () => {
     const fixture = await createFixture();
     fixtures.push(fixture);
@@ -610,6 +667,183 @@ describe("authenticated message WebSocket service", () => {
     client.sendRaw("x".repeat(64 * 1_024 + 1));
 
     await expect(client.waitForClose()).resolves.toBeUndefined();
+  });
+
+  it("terminates at the aggregate queued-frame count bound without later side effects", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "queued-count-bound");
+    const loginStarted = deferred<void>();
+    const login = deferred<IssuedSession>();
+    const terminationCalled = deferred<void>();
+    const originalTerminate = WebSocket.prototype.terminate;
+    let terminateCalls = 0;
+    let sendCalls = 0;
+    let historyCalls = 0;
+    let subscribeCalls = 0;
+    const auth: AuthenticationService = {
+      login() {
+        loginStarted.resolve();
+        return login.promise;
+      },
+      async authenticate() {
+        return principal;
+      },
+      async refresh() {
+        return session;
+      },
+      async revoke() {},
+    };
+    const service: MessageService = {
+      async send(_actorId, message) {
+        sendCalls += 1;
+        return {
+          type: "message.accepted",
+          requestId: message.id,
+          messageId: message.id,
+          persistedAt: "2026-08-10T00:00:00.000Z",
+        };
+      },
+      subscribe() {
+        subscribeCalls += 1;
+        return () => undefined;
+      },
+      async history() {
+        historyCalls += 1;
+        return [];
+      },
+    };
+    const server = await startMessageWebSocketServer({
+      auth,
+      service,
+      maxQueuedFrameCount: 3,
+      maxQueuedFrameBytes: 1_024 * 1_024,
+    });
+    const client = await LoopbackClient.connect(server.url);
+
+    WebSocket.prototype.terminate = function terminateWithoutClosing() {
+      terminateCalls += 1;
+      terminationCalled.resolve();
+    };
+    try {
+      client.send({
+        type: "auth.login",
+        requestId: "count-bound-login",
+        accountId: principal.accountId,
+        secret: "correct-secret",
+      });
+      await loginStarted.promise;
+      client.send({
+        type: "message.send",
+        requestId: "count-queued-send",
+        message: draftFor("count-queued-message"),
+      });
+      client.send({ type: "room.subscribe", requestId: "count-queued-subscribe", roomId });
+      client.send({ type: "room.history", requestId: "count-overflow", roomId });
+      client.send({ type: "room.history", requestId: "count-after-overflow", roomId });
+
+      await settlesWithin(terminationCalled.promise, 250);
+      login.resolve(session);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(terminateCalls).toBe(1);
+      expect(sendCalls).toBe(0);
+      expect(historyCalls).toBe(0);
+      expect(subscribeCalls).toBe(0);
+    } finally {
+      WebSocket.prototype.terminate = originalTerminate;
+      login.resolve(session);
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("terminates at the aggregate queued-byte bound with only a few large frames", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "queued-byte-bound");
+    const loginStarted = deferred<void>();
+    const login = deferred<IssuedSession>();
+    const terminationCalled = deferred<void>();
+    const originalTerminate = WebSocket.prototype.terminate;
+    let terminateCalls = 0;
+    let sendCalls = 0;
+    const auth: AuthenticationService = {
+      login() {
+        loginStarted.resolve();
+        return login.promise;
+      },
+      async authenticate() {
+        return principal;
+      },
+      async refresh() {
+        return session;
+      },
+      async revoke() {},
+    };
+    const service: MessageService = {
+      async send(_actorId, message) {
+        sendCalls += 1;
+        return {
+          type: "message.accepted",
+          requestId: message.id,
+          messageId: message.id,
+          persistedAt: "2026-08-10T00:00:00.000Z",
+        };
+      },
+      subscribe() {
+        return () => undefined;
+      },
+      async history() {
+        return [];
+      },
+    };
+    const loginFrame = JSON.stringify({
+      type: "auth.login",
+      requestId: "byte-bound-login",
+      accountId: principal.accountId,
+      secret: "correct-secret",
+    });
+    const largeFrame = JSON.stringify({
+      type: "message.send",
+      requestId: "byte-queued-send",
+      message: {
+        ...draftFor("byte-queued-message"),
+        body: "x".repeat(32 * 1_024),
+      },
+    });
+    const maxQueuedFrameBytes =
+      Buffer.byteLength(loginFrame) + Buffer.byteLength(largeFrame);
+    const server = await startMessageWebSocketServer({
+      auth,
+      service,
+      maxQueuedFrameCount: 10,
+      maxQueuedFrameBytes,
+    });
+    const client = await LoopbackClient.connect(server.url);
+
+    WebSocket.prototype.terminate = function terminateWithoutClosing() {
+      terminateCalls += 1;
+      terminationCalled.resolve();
+    };
+    try {
+      client.sendRaw(loginFrame);
+      await loginStarted.promise;
+      client.sendRaw(largeFrame);
+      client.sendRaw(largeFrame.replace("byte-queued-message", "byte-overflow-message"));
+
+      await settlesWithin(terminationCalled.promise, 250);
+      login.resolve(session);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(terminateCalls).toBe(1);
+      expect(sendCalls).toBe(0);
+    } finally {
+      WebSocket.prototype.terminate = originalTerminate;
+      login.resolve(session);
+      await client.close();
+      await server.close();
+    }
   });
 
   it("terminates a socket before sending when its outbound buffer reaches the configured bound", async () => {

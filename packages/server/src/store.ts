@@ -1,5 +1,5 @@
 import { appendFile, mkdir, readFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 import { isMessage, type Message } from "@native-im/core";
 
 export type MessageAppendResult = "appended" | "replayed";
@@ -8,6 +8,34 @@ export type MessageStoreErrorCode = "message_id_conflict";
 export interface MessageStore {
   append(message: Message): Promise<MessageAppendResult>;
   list(roomId: string): Promise<readonly Message[]>;
+}
+
+interface MessageStoreCoordinator {
+  queue: Promise<void>;
+}
+
+const coordinatorsByFilePath = new Map<string, MessageStoreCoordinator>();
+
+function coordinatorFor(filePath: string): MessageStoreCoordinator {
+  const existing = coordinatorsByFilePath.get(filePath);
+  if (existing !== undefined) {
+    return existing;
+  }
+  const coordinator = { queue: Promise.resolve() };
+  coordinatorsByFilePath.set(filePath, coordinator);
+  return coordinator;
+}
+
+function runExclusive<Result>(
+  coordinator: MessageStoreCoordinator,
+  operation: () => Promise<Result>,
+): Promise<Result> {
+  const result = coordinator.queue.then(operation);
+  coordinator.queue = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
 }
 
 export class MessageIdConflictError extends Error {
@@ -98,26 +126,18 @@ async function readAllMessages(filePath: string): Promise<readonly Message[]> {
 }
 
 export function createJsonlMessageStore(filePath: string): MessageStore {
-  let appendQueue = Promise.resolve();
-  let messagesById: Map<string, Message> | undefined;
-
-  async function indexedMessages(): Promise<Map<string, Message>> {
-    if (messagesById === undefined) {
-      const messages = await readAllMessages(filePath);
-      messagesById = new Map(messages.map((message) => [message.id, message]));
-    }
-    return messagesById;
-  }
+  const canonicalFilePath = resolve(filePath);
+  const coordinator = coordinatorFor(canonicalFilePath);
 
   return {
     append(message: Message): Promise<MessageAppendResult> {
-      if (!isMessage(message)) {
-        return Promise.reject(new TypeError("message store only persists valid messages"));
-      }
+      return runExclusive(coordinator, async () => {
+        if (!isMessage(message)) {
+          throw new TypeError("message store only persists valid messages");
+        }
 
-      const write = appendQueue.then(async () => {
-        const index = await indexedMessages();
-        const existing = index.get(message.id);
+        const messages = await readAllMessages(canonicalFilePath);
+        const existing = messages.find((candidate) => candidate.id === message.id);
         if (existing !== undefined) {
           if (sameMessage(existing, message)) {
             return "replayed" as const;
@@ -125,25 +145,20 @@ export function createJsonlMessageStore(filePath: string): MessageStore {
           throw new MessageIdConflictError(message.id);
         }
 
-        await mkdir(dirname(filePath), { recursive: true });
-        await appendFile(filePath, `${JSON.stringify(message)}\n`, {
+        await mkdir(dirname(canonicalFilePath), { recursive: true });
+        await appendFile(canonicalFilePath, `${JSON.stringify(message)}\n`, {
           encoding: "utf8",
           flush: true,
         });
-        index.set(message.id, message);
         return "appended" as const;
       });
-      appendQueue = write.then(
-        () => undefined,
-        () => undefined,
-      );
-      return write;
     },
 
-    async list(roomId: string): Promise<readonly Message[]> {
-      await appendQueue;
-      const messages = await readAllMessages(filePath);
-      return messages.filter((message) => message.roomId === roomId);
+    list(roomId: string): Promise<readonly Message[]> {
+      return runExclusive(coordinator, async () => {
+        const messages = await readAllMessages(canonicalFilePath);
+        return messages.filter((message) => message.roomId === roomId);
+      });
     },
   };
 }
