@@ -17,6 +17,23 @@ export type {
 } from "./auth.js";
 export { createJsonStateStore, StateStoreCorruptionError } from "./state-store.js";
 export type { StateStore } from "./state-store.js";
+export {
+  createRoomLifecycleService,
+  isRoomLifecycleState,
+  RoomLifecycleError,
+} from "./room-lifecycle.js";
+export type {
+  HumanInvitationRecord,
+  HumanInvitationStatus,
+  IssuedHumanInvitation,
+  RoomAuditRecord,
+  RoomAuditResult,
+  RoomAuditType,
+  RoomLifecycleErrorCode,
+  RoomLifecycleService,
+  RoomLifecycleServiceOptions,
+  RoomLifecycleState,
+} from "./room-lifecycle.js";
 export { createMessageService, MessageValidationError } from "./service.js";
 export type {
   ListenerErrorHandler,

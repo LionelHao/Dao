@@ -1,0 +1,1196 @@
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import type {
+  Actor,
+  AgentActor,
+  AgentConfigurationRequest,
+  AgentParticipation,
+  AgentRoomMembership,
+  HumanActor,
+  HumanInvitationRequest,
+  HumanRoomMembership,
+  ManagedRoom,
+  Room,
+} from "@native-im/core";
+import type { StateStore } from "./state-store.js";
+
+const STATE_FIELDS = new Set(["version", "actors", "rooms", "invitations", "audit"]);
+const HUMAN_ACTOR_FIELDS = new Set([
+  "id",
+  "kind",
+  "displayName",
+  "reachability",
+]);
+const AGENT_ACTOR_FIELDS = new Set([
+  "id",
+  "kind",
+  "displayName",
+  "readiness",
+  "toolPermissions",
+]);
+const ROOM_FIELDS = new Set(["id", "name", "status", "members", "createdAt"]);
+const HUMAN_MEMBERSHIP_FIELDS = new Set(["kind", "actorId", "role", "joinedAt"]);
+const AGENT_MEMBERSHIP_FIELDS = new Set([
+  "kind",
+  "actorId",
+  "participation",
+  "toolPermissions",
+  "configuredAt",
+]);
+const PENDING_INVITATION_FIELDS = new Set([
+  "id",
+  "roomId",
+  "inviterActorId",
+  "inviteeActorId",
+  "tokenHash",
+  "status",
+  "createdAt",
+]);
+const TERMINAL_INVITATION_FIELDS = new Set([
+  ...PENDING_INVITATION_FIELDS,
+  "decisionActorId",
+  "decidedAt",
+]);
+const BASE_AUDIT_FIELDS = new Set([
+  "id",
+  "type",
+  "roomId",
+  "actorId",
+  "result",
+  "timestamp",
+]);
+const TARGET_AUDIT_FIELDS = new Set([...BASE_AUDIT_FIELDS, "targetActorId"]);
+const INVITATION_DECISION_AUDIT_FIELDS = new Set([
+  ...TARGET_AUDIT_FIELDS,
+  "inviterActorId",
+]);
+const HUMAN_INVITATION_REQUEST_FIELDS = new Set([
+  "kind",
+  "roomId",
+  "inviteeActorId",
+]);
+const AGENT_CONFIGURATION_REQUEST_FIELDS = new Set([
+  "kind",
+  "roomId",
+  "agentId",
+  "participation",
+  "toolPermissions",
+]);
+
+const humanReachability = new Set(["online", "dnd", "offline"]);
+const agentReadiness = new Set(["ready", "busy", "paused", "noauth"]);
+const humanRoles = new Set(["owner", "admin", "member"]);
+const agentParticipations = new Set<AgentParticipation>([
+  "active",
+  "on-mention",
+  "silent",
+]);
+
+export type HumanInvitationStatus = "pending" | "accepted" | "rejected";
+
+export interface HumanInvitationRecord {
+  readonly id: string;
+  readonly roomId: string;
+  readonly inviterActorId: string;
+  readonly inviteeActorId: string;
+  readonly tokenHash: string;
+  readonly status: HumanInvitationStatus;
+  readonly createdAt: string;
+  readonly decisionActorId?: string;
+  readonly decidedAt?: string;
+}
+
+export interface IssuedHumanInvitation {
+  readonly invitationId: string;
+  readonly roomId: string;
+  readonly inviterActorId: string;
+  readonly inviteeActorId: string;
+  readonly token: string;
+  readonly createdAt: string;
+}
+
+export type RoomAuditType =
+  | "room.created"
+  | "room.renamed"
+  | "room.archived"
+  | "room.human.invited"
+  | "room.invitation.accepted"
+  | "room.invitation.rejected"
+  | "room.agent.configured"
+  | "room.member.removed";
+
+export type RoomAuditResult =
+  | "created"
+  | "renamed"
+  | "archived"
+  | "pending"
+  | "accepted"
+  | "rejected"
+  | "configured"
+  | "removed";
+
+export interface RoomAuditRecord {
+  readonly id: string;
+  readonly type: RoomAuditType;
+  readonly roomId: string;
+  readonly actorId: string;
+  readonly targetActorId?: string;
+  readonly inviterActorId?: string;
+  readonly result: RoomAuditResult;
+  readonly timestamp: string;
+}
+
+export interface RoomLifecycleState {
+  readonly version: 1;
+  readonly actors: readonly Actor[];
+  readonly rooms: readonly ManagedRoom[];
+  readonly invitations: readonly HumanInvitationRecord[];
+  readonly audit: readonly RoomAuditRecord[];
+}
+
+export type RoomLifecycleErrorCode =
+  | "unauthenticated"
+  | "actor_not_found"
+  | "human_required"
+  | "room_name_invalid"
+  | "room_not_found"
+  | "room_forbidden"
+  | "room_archived"
+  | "human_invitation_invalid"
+  | "invitee_required"
+  | "room_member_exists"
+  | "invitation_pending"
+  | "invitation_not_found"
+  | "invitation_forbidden"
+  | "invitation_consumed"
+  | "invitation_decision_invalid"
+  | "agent_configuration_invalid"
+  | "agent_required"
+  | "agent_permissions_invalid"
+  | "room_member_not_found"
+  | "room_owner_required"
+  | "lifecycle_id_conflict"
+  | "invitation_token_conflict";
+
+export class RoomLifecycleError extends Error {
+  readonly status: 400 | 401 | 403 | 404 | 409;
+  readonly code: RoomLifecycleErrorCode;
+
+  constructor(
+    status: 400 | 401 | 403 | 404 | 409,
+    code: RoomLifecycleErrorCode,
+  ) {
+    super(code);
+    this.name = "RoomLifecycleError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
+export interface RoomLifecycleServiceOptions {
+  readonly actors: readonly Actor[];
+  readonly state: StateStore<RoomLifecycleState>;
+  readonly clock?: () => number;
+  readonly idFactory?: () => string;
+  readonly tokenFactory?: () => string;
+}
+
+export interface RoomLifecycleService {
+  createRoom(
+    actorId: string,
+    input: { readonly name: string },
+  ): Promise<ManagedRoom>;
+  renameRoom(
+    actorId: string,
+    roomId: string,
+    name: string,
+  ): Promise<ManagedRoom>;
+  archiveRoom(actorId: string, roomId: string): Promise<ManagedRoom>;
+  inviteHuman(
+    actorId: string,
+    request: HumanInvitationRequest,
+  ): Promise<IssuedHumanInvitation>;
+  respondToHumanInvitation(
+    actorId: string,
+    token: string,
+    decision: "accept" | "reject",
+  ): Promise<HumanInvitationRecord>;
+  configureAgent(
+    actorId: string,
+    request: AgentConfigurationRequest,
+  ): Promise<ManagedRoom>;
+  removeMember(
+    actorId: string,
+    roomId: string,
+    targetActorId: string,
+  ): Promise<ManagedRoom>;
+  canAccess(actorId: string, roomId: string): boolean;
+  getActor(actorId: string): Actor | undefined;
+  getRoom(roomId: string): ManagedRoom | undefined;
+  messageRoom(roomId: string): Room | undefined;
+  audit(roomId: string): readonly RoomAuditRecord[];
+}
+
+type UnknownRecord = Record<string, unknown>;
+
+function isRecord(value: unknown): value is UnknownRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasOnlyFields(
+  value: UnknownRecord,
+  allowedFields: ReadonlySet<string>,
+): boolean {
+  return Reflect.ownKeys(value).every(
+    (key) => typeof key === "string" && allowedFields.has(key),
+  );
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every(isNonEmptyString);
+}
+
+function hasUniqueStrings(values: readonly string[]): boolean {
+  return new Set(values).size === values.length;
+}
+
+function isIsoTimestamp(value: unknown): value is string {
+  if (typeof value !== "string") {
+    return false;
+  }
+  try {
+    return new Date(value).toISOString() === value;
+  } catch {
+    return false;
+  }
+}
+
+function isTokenHash(value: unknown): value is string {
+  if (typeof value !== "string") {
+    return false;
+  }
+  const decoded = Buffer.from(value, "base64url");
+  return decoded.length === 32 && decoded.toString("base64url") === value;
+}
+
+function isStrictHumanActor(value: unknown): value is HumanActor {
+  return (
+    isRecord(value) &&
+    hasOnlyFields(value, HUMAN_ACTOR_FIELDS) &&
+    value.kind === "human" &&
+    isNonEmptyString(value.id) &&
+    isNonEmptyString(value.displayName) &&
+    typeof value.reachability === "string" &&
+    humanReachability.has(value.reachability)
+  );
+}
+
+function isStrictAgentActor(value: unknown): value is AgentActor {
+  return (
+    isRecord(value) &&
+    hasOnlyFields(value, AGENT_ACTOR_FIELDS) &&
+    value.kind === "agent" &&
+    isNonEmptyString(value.id) &&
+    isNonEmptyString(value.displayName) &&
+    typeof value.readiness === "string" &&
+    agentReadiness.has(value.readiness) &&
+    isStringArray(value.toolPermissions) &&
+    hasUniqueStrings(value.toolPermissions)
+  );
+}
+
+function isStrictActor(value: unknown): value is Actor {
+  return isStrictHumanActor(value) || isStrictAgentActor(value);
+}
+
+function isHumanMembership(value: unknown): value is HumanRoomMembership {
+  return (
+    isRecord(value) &&
+    hasOnlyFields(value, HUMAN_MEMBERSHIP_FIELDS) &&
+    value.kind === "human" &&
+    isNonEmptyString(value.actorId) &&
+    typeof value.role === "string" &&
+    humanRoles.has(value.role) &&
+    isIsoTimestamp(value.joinedAt)
+  );
+}
+
+function isAgentMembership(value: unknown): value is AgentRoomMembership {
+  return (
+    isRecord(value) &&
+    hasOnlyFields(value, AGENT_MEMBERSHIP_FIELDS) &&
+    value.kind === "agent" &&
+    isNonEmptyString(value.actorId) &&
+    typeof value.participation === "string" &&
+    agentParticipations.has(value.participation as AgentParticipation) &&
+    isStringArray(value.toolPermissions) &&
+    hasUniqueStrings(value.toolPermissions) &&
+    isIsoTimestamp(value.configuredAt)
+  );
+}
+
+function isManagedRoomShape(value: unknown): value is ManagedRoom {
+  return (
+    isRecord(value) &&
+    hasOnlyFields(value, ROOM_FIELDS) &&
+    isNonEmptyString(value.id) &&
+    isNonEmptyString(value.name) &&
+    (value.status === "active" || value.status === "archived") &&
+    Array.isArray(value.members) &&
+    value.members.every(
+      (membership) =>
+        isHumanMembership(membership) || isAgentMembership(membership),
+    ) &&
+    isIsoTimestamp(value.createdAt)
+  );
+}
+
+function isInvitationShape(value: unknown): value is HumanInvitationRecord {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const pending = value.status === "pending";
+  const terminal = value.status === "accepted" || value.status === "rejected";
+  if (
+    (!pending && !terminal) ||
+    !hasOnlyFields(
+      value,
+      pending ? PENDING_INVITATION_FIELDS : TERMINAL_INVITATION_FIELDS,
+    ) ||
+    !isNonEmptyString(value.id) ||
+    !isNonEmptyString(value.roomId) ||
+    !isNonEmptyString(value.inviterActorId) ||
+    !isNonEmptyString(value.inviteeActorId) ||
+    !isTokenHash(value.tokenHash) ||
+    !isIsoTimestamp(value.createdAt)
+  ) {
+    return false;
+  }
+  return (
+    pending ||
+    (isNonEmptyString(value.decisionActorId) && isIsoTimestamp(value.decidedAt))
+  );
+}
+
+function auditExpectation(type: unknown): {
+  readonly fields: ReadonlySet<string>;
+  readonly result: RoomAuditResult;
+} | undefined {
+  switch (type) {
+    case "room.created":
+      return { fields: BASE_AUDIT_FIELDS, result: "created" };
+    case "room.renamed":
+      return { fields: BASE_AUDIT_FIELDS, result: "renamed" };
+    case "room.archived":
+      return { fields: BASE_AUDIT_FIELDS, result: "archived" };
+    case "room.human.invited":
+      return { fields: TARGET_AUDIT_FIELDS, result: "pending" };
+    case "room.invitation.accepted":
+      return {
+        fields: INVITATION_DECISION_AUDIT_FIELDS,
+        result: "accepted",
+      };
+    case "room.invitation.rejected":
+      return {
+        fields: INVITATION_DECISION_AUDIT_FIELDS,
+        result: "rejected",
+      };
+    case "room.agent.configured":
+      return { fields: TARGET_AUDIT_FIELDS, result: "configured" };
+    case "room.member.removed":
+      return { fields: TARGET_AUDIT_FIELDS, result: "removed" };
+    default:
+      return undefined;
+  }
+}
+
+function isAuditShape(value: unknown): value is RoomAuditRecord {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const expectation = auditExpectation(value.type);
+  return (
+    expectation !== undefined &&
+    hasOnlyFields(value, expectation.fields) &&
+    isNonEmptyString(value.id) &&
+    isNonEmptyString(value.roomId) &&
+    isNonEmptyString(value.actorId) &&
+    value.result === expectation.result &&
+    isIsoTimestamp(value.timestamp) &&
+    (!expectation.fields.has("targetActorId") ||
+      isNonEmptyString(value.targetActorId)) &&
+    (!expectation.fields.has("inviterActorId") ||
+      isNonEmptyString(value.inviterActorId))
+  );
+}
+
+export function isRoomLifecycleState(value: unknown): value is RoomLifecycleState {
+  if (
+    !isRecord(value) ||
+    !hasOnlyFields(value, STATE_FIELDS) ||
+    value.version !== 1 ||
+    !Array.isArray(value.actors) ||
+    !value.actors.every(isStrictActor) ||
+    !Array.isArray(value.rooms) ||
+    !value.rooms.every(isManagedRoomShape) ||
+    !Array.isArray(value.invitations) ||
+    !value.invitations.every(isInvitationShape) ||
+    !Array.isArray(value.audit) ||
+    !value.audit.every(isAuditShape)
+  ) {
+    return false;
+  }
+
+  const actorsById = new Map<string, Actor>();
+  for (const actor of value.actors) {
+    if (actorsById.has(actor.id)) {
+      return false;
+    }
+    actorsById.set(actor.id, actor);
+  }
+
+  const roomsById = new Map<string, ManagedRoom>();
+  const entityIds = new Set<string>();
+  for (const room of value.rooms) {
+    if (entityIds.has(room.id)) {
+      return false;
+    }
+    entityIds.add(room.id);
+    roomsById.set(room.id, room);
+
+    const memberIds = new Set<string>();
+    let ownerCount = 0;
+    for (const membership of room.members) {
+      const actor = actorsById.get(membership.actorId);
+      if (
+        memberIds.has(membership.actorId) ||
+        actor === undefined ||
+        actor.kind !== membership.kind
+      ) {
+        return false;
+      }
+      memberIds.add(membership.actorId);
+
+      if (membership.kind === "human") {
+        if (membership.role === "owner") {
+          ownerCount += 1;
+        }
+      } else {
+        if (
+          actor.kind !== "agent" ||
+          !membership.toolPermissions.every((permission) =>
+            actor.toolPermissions.includes(permission),
+          )
+        ) {
+          return false;
+        }
+      }
+    }
+    if (ownerCount === 0) {
+      return false;
+    }
+  }
+
+  const tokenHashes = new Set<string>();
+  const pendingInvitees = new Set<string>();
+  for (const invitation of value.invitations) {
+    if (
+      entityIds.has(invitation.id) ||
+      tokenHashes.has(invitation.tokenHash) ||
+      !roomsById.has(invitation.roomId)
+    ) {
+      return false;
+    }
+    const inviter = actorsById.get(invitation.inviterActorId);
+    const invitee = actorsById.get(invitation.inviteeActorId);
+    if (
+      inviter?.kind !== "human" ||
+      invitee?.kind !== "human" ||
+      (invitation.status !== "pending" &&
+        invitation.decisionActorId !== invitation.inviteeActorId)
+    ) {
+      return false;
+    }
+    if (invitation.status === "pending") {
+      const pendingKey = `${invitation.roomId}\u0000${invitation.inviteeActorId}`;
+      const room = roomsById.get(invitation.roomId);
+      if (
+        pendingInvitees.has(pendingKey) ||
+        room?.members.some(
+          (membership) => membership.actorId === invitation.inviteeActorId,
+        )
+      ) {
+        return false;
+      }
+      pendingInvitees.add(pendingKey);
+    }
+    entityIds.add(invitation.id);
+    tokenHashes.add(invitation.tokenHash);
+  }
+
+  for (const record of value.audit) {
+    if (
+      entityIds.has(record.id) ||
+      !roomsById.has(record.roomId) ||
+      !actorsById.has(record.actorId) ||
+      (record.targetActorId !== undefined &&
+        !actorsById.has(record.targetActorId)) ||
+      (record.inviterActorId !== undefined &&
+        actorsById.get(record.inviterActorId)?.kind !== "human") ||
+      !isAuditSemanticallyConsistent(record, actorsById)
+    ) {
+      return false;
+    }
+    entityIds.add(record.id);
+  }
+
+  return true;
+}
+
+function isAuditSemanticallyConsistent(
+  record: RoomAuditRecord,
+  actorsById: ReadonlyMap<string, Actor>,
+): boolean {
+  const actor = actorsById.get(record.actorId);
+  const target =
+    record.targetActorId === undefined
+      ? undefined
+      : actorsById.get(record.targetActorId);
+
+  switch (record.type) {
+    case "room.created":
+    case "room.renamed":
+    case "room.archived":
+      return actor?.kind === "human";
+    case "room.human.invited":
+      return actor?.kind === "human" && target?.kind === "human";
+    case "room.invitation.accepted":
+    case "room.invitation.rejected":
+      return (
+        actor?.kind === "human" &&
+        target?.kind === "human" &&
+        record.actorId === record.targetActorId
+      );
+    case "room.agent.configured":
+      return actor?.kind === "human" && target?.kind === "agent";
+    case "room.member.removed":
+      return actor?.kind === "human" && target !== undefined;
+  }
+}
+
+function cloneActor(actor: Actor): Actor {
+  return actor.kind === "human"
+    ? { ...actor }
+    : { ...actor, toolPermissions: [...actor.toolPermissions] };
+}
+
+function cloneMembership(
+  membership: HumanRoomMembership | AgentRoomMembership,
+): HumanRoomMembership | AgentRoomMembership {
+  return membership.kind === "human"
+    ? { ...membership }
+    : { ...membership, toolPermissions: [...membership.toolPermissions] };
+}
+
+function cloneRoom(room: ManagedRoom): ManagedRoom {
+  return { ...room, members: room.members.map(cloneMembership) };
+}
+
+function cloneInvitation(invitation: HumanInvitationRecord): HumanInvitationRecord {
+  return { ...invitation };
+}
+
+function cloneAudit(record: RoomAuditRecord): RoomAuditRecord {
+  return { ...record };
+}
+
+function cloneState(value: RoomLifecycleState): RoomLifecycleState {
+  return {
+    version: 1,
+    actors: value.actors.map(cloneActor),
+    rooms: value.rooms.map(cloneRoom),
+    invitations: value.invitations.map(cloneInvitation),
+    audit: value.audit.map(cloneAudit),
+  };
+}
+
+function isHumanInvitationRequestStrict(
+  value: unknown,
+): value is HumanInvitationRequest {
+  return (
+    isRecord(value) &&
+    hasOnlyFields(value, HUMAN_INVITATION_REQUEST_FIELDS) &&
+    value.kind === "human-invitation" &&
+    isNonEmptyString(value.roomId) &&
+    isNonEmptyString(value.inviteeActorId)
+  );
+}
+
+function isAgentConfigurationRequestStrict(
+  value: unknown,
+): value is AgentConfigurationRequest {
+  return (
+    isRecord(value) &&
+    hasOnlyFields(value, AGENT_CONFIGURATION_REQUEST_FIELDS) &&
+    value.kind === "agent-configuration" &&
+    isNonEmptyString(value.roomId) &&
+    isNonEmptyString(value.agentId) &&
+    typeof value.participation === "string" &&
+    agentParticipations.has(value.participation as AgentParticipation) &&
+    isStringArray(value.toolPermissions)
+  );
+}
+
+function hashToken(token: string): string {
+  return createHash("sha256").update(token).digest("base64url");
+}
+
+function normalizedName(name: string): string {
+  const normalized = name.trim();
+  if (normalized.length === 0) {
+    throw new RoomLifecycleError(400, "room_name_invalid");
+  }
+  return normalized;
+}
+
+export async function createRoomLifecycleService(
+  options: RoomLifecycleServiceOptions,
+): Promise<RoomLifecycleService> {
+  const seedActors = options.actors.map(cloneActor);
+  const emptyState: RoomLifecycleState = {
+    version: 1,
+    actors: seedActors,
+    rooms: [],
+    invitations: [],
+    audit: [],
+  };
+  if (!isRoomLifecycleState(emptyState)) {
+    throw new TypeError("actors must be unique, closed, valid authority records");
+  }
+
+  const clock = options.clock ?? Date.now;
+  const idFactory = options.idFactory ?? randomUUID;
+  const tokenFactory =
+    options.tokenFactory ?? (() => randomBytes(32).toString("base64url"));
+
+  let loadedState: RoomLifecycleState | undefined;
+  let initializationFailure: { readonly error: unknown } | undefined;
+  await options.state.load().then(
+    (loaded) => {
+      if (loaded !== undefined && !isRoomLifecycleState(loaded)) {
+        initializationFailure = {
+          error: new TypeError("room lifecycle store returned invalid state"),
+        };
+        return;
+      }
+      loadedState = loaded;
+    },
+    (error: unknown) => {
+      initializationFailure = { error };
+    },
+  );
+  if (initializationFailure !== undefined) {
+    throw initializationFailure.error;
+  }
+  let state = cloneState(loadedState ?? emptyState);
+  let operationQueue = Promise.resolve();
+
+  function runExclusive<Result>(
+    operation: (current: RoomLifecycleState) => Promise<Result> | Result,
+  ): Promise<Result> {
+    const result = operationQueue.then(async () => {
+      return operation(state);
+    });
+    operationQueue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  async function persist(nextState: RoomLifecycleState): Promise<void> {
+    if (!isRoomLifecycleState(nextState)) {
+      throw new TypeError("room lifecycle mutation produced invalid state");
+    }
+    await options.state.save(cloneState(nextState));
+    state = cloneState(nextState);
+  }
+
+  function timestamp(): string {
+    const value = clock();
+    if (!Number.isFinite(value)) {
+      throw new RangeError("clock must return a finite timestamp");
+    }
+    return new Date(value).toISOString();
+  }
+
+  function requireActor(current: RoomLifecycleState, actorId: string): Actor {
+    if (!isNonEmptyString(actorId)) {
+      throw new RoomLifecycleError(401, "unauthenticated");
+    }
+    const actor = current.actors.find((candidate) => candidate.id === actorId);
+    if (actor === undefined) {
+      throw new RoomLifecycleError(404, "actor_not_found");
+    }
+    return actor;
+  }
+
+  function requireRoom(current: RoomLifecycleState, roomId: string): ManagedRoom {
+    const room = current.rooms.find((candidate) => candidate.id === roomId);
+    if (room === undefined) {
+      throw new RoomLifecycleError(404, "room_not_found");
+    }
+    return room;
+  }
+
+  function requireManager(
+    current: RoomLifecycleState,
+    actorId: string,
+    roomId: string,
+  ): ManagedRoom {
+    const actor = requireActor(current, actorId);
+    const room = requireRoom(current, roomId);
+    const membership = room.members.find(
+      (candidate) => candidate.actorId === actor.id,
+    );
+    if (
+      actor.kind !== "human" ||
+      membership?.kind !== "human" ||
+      (membership.role !== "owner" && membership.role !== "admin")
+    ) {
+      throw new RoomLifecycleError(403, "room_forbidden");
+    }
+    return room;
+  }
+
+  function requireActive(room: ManagedRoom): void {
+    if (room.status === "archived") {
+      throw new RoomLifecycleError(409, "room_archived");
+    }
+  }
+
+  function usedEntityIds(current: RoomLifecycleState): Set<string> {
+    return new Set([
+      ...current.rooms.map((room) => room.id),
+      ...current.invitations.map((invitation) => invitation.id),
+      ...current.audit.map((record) => record.id),
+    ]);
+  }
+
+  function nextEntityId(usedIds: Set<string>): string {
+    const id = idFactory();
+    if (!isNonEmptyString(id) || usedIds.has(id)) {
+      throw new RoomLifecycleError(409, "lifecycle_id_conflict");
+    }
+    usedIds.add(id);
+    return id;
+  }
+
+  function auditRecord(
+    usedIds: Set<string>,
+    input: Omit<RoomAuditRecord, "id">,
+  ): RoomAuditRecord {
+    return { id: nextEntityId(usedIds), ...input };
+  }
+
+  return {
+    createRoom(actorId, input): Promise<ManagedRoom> {
+      return runExclusive(async (current) => {
+        const actor = requireActor(current, actorId);
+        if (actor.kind !== "human") {
+          throw new RoomLifecycleError(400, "human_required");
+        }
+        const name = normalizedName(input.name);
+        const now = timestamp();
+        const usedIds = usedEntityIds(current);
+        const room: ManagedRoom = {
+          id: nextEntityId(usedIds),
+          name,
+          status: "active",
+          members: [
+            {
+              kind: "human",
+              actorId: actor.id,
+              role: "owner",
+              joinedAt: now,
+            },
+          ],
+          createdAt: now,
+        };
+        const audit = auditRecord(usedIds, {
+          type: "room.created",
+          roomId: room.id,
+          actorId: actor.id,
+          result: "created",
+          timestamp: now,
+        });
+        await persist({
+          ...current,
+          rooms: [...current.rooms, room],
+          audit: [...current.audit, audit],
+        });
+        return cloneRoom(room);
+      });
+    },
+
+    renameRoom(actorId, roomId, requestedName): Promise<ManagedRoom> {
+      return runExclusive(async (current) => {
+        const room = requireManager(current, actorId, roomId);
+        requireActive(room);
+        const name = normalizedName(requestedName);
+        const now = timestamp();
+        const usedIds = usedEntityIds(current);
+        const renamed = { ...room, name };
+        const audit = auditRecord(usedIds, {
+          type: "room.renamed",
+          roomId,
+          actorId,
+          result: "renamed",
+          timestamp: now,
+        });
+        await persist({
+          ...current,
+          rooms: current.rooms.map((candidate) =>
+            candidate.id === roomId ? renamed : candidate,
+          ),
+          audit: [...current.audit, audit],
+        });
+        return cloneRoom(renamed);
+      });
+    },
+
+    archiveRoom(actorId, roomId): Promise<ManagedRoom> {
+      return runExclusive(async (current) => {
+        const room = requireManager(current, actorId, roomId);
+        if (room.status === "archived") {
+          return cloneRoom(room);
+        }
+        const now = timestamp();
+        const usedIds = usedEntityIds(current);
+        const archived: ManagedRoom = { ...room, status: "archived" };
+        const audit = auditRecord(usedIds, {
+          type: "room.archived",
+          roomId,
+          actorId,
+          result: "archived",
+          timestamp: now,
+        });
+        await persist({
+          ...current,
+          rooms: current.rooms.map((candidate) =>
+            candidate.id === roomId ? archived : candidate,
+          ),
+          audit: [...current.audit, audit],
+        });
+        return cloneRoom(archived);
+      });
+    },
+
+    inviteHuman(actorId, request): Promise<IssuedHumanInvitation> {
+      return runExclusive(async (current) => {
+        if (!isHumanInvitationRequestStrict(request)) {
+          throw new RoomLifecycleError(400, "human_invitation_invalid");
+        }
+        const room = requireManager(current, actorId, request.roomId);
+        requireActive(room);
+        const invitee = requireActor(current, request.inviteeActorId);
+        if (invitee.kind !== "human") {
+          throw new RoomLifecycleError(400, "invitee_required");
+        }
+        if (
+          room.members.some(
+            (membership) => membership.actorId === request.inviteeActorId,
+          )
+        ) {
+          throw new RoomLifecycleError(409, "room_member_exists");
+        }
+        if (
+          current.invitations.some(
+            (invitation) =>
+              invitation.roomId === room.id &&
+              invitation.inviteeActorId === invitee.id &&
+              invitation.status === "pending",
+          )
+        ) {
+          throw new RoomLifecycleError(409, "invitation_pending");
+        }
+
+        const token = tokenFactory();
+        if (!isNonEmptyString(token)) {
+          throw new RoomLifecycleError(409, "invitation_token_conflict");
+        }
+        const tokenHash = hashToken(token);
+        if (
+          current.invitations.some(
+            (invitation) => invitation.tokenHash === tokenHash,
+          )
+        ) {
+          throw new RoomLifecycleError(409, "invitation_token_conflict");
+        }
+
+        const now = timestamp();
+        const usedIds = usedEntityIds(current);
+        const invitation: HumanInvitationRecord = {
+          id: nextEntityId(usedIds),
+          roomId: room.id,
+          inviterActorId: actorId,
+          inviteeActorId: invitee.id,
+          tokenHash,
+          status: "pending",
+          createdAt: now,
+        };
+        const audit = auditRecord(usedIds, {
+          type: "room.human.invited",
+          roomId: room.id,
+          actorId,
+          targetActorId: invitee.id,
+          result: "pending",
+          timestamp: now,
+        });
+        await persist({
+          ...current,
+          invitations: [...current.invitations, invitation],
+          audit: [...current.audit, audit],
+        });
+        return {
+          invitationId: invitation.id,
+          roomId: invitation.roomId,
+          inviterActorId: invitation.inviterActorId,
+          inviteeActorId: invitation.inviteeActorId,
+          token,
+          createdAt: invitation.createdAt,
+        };
+      });
+    },
+
+    respondToHumanInvitation(actorId, token, decision): Promise<HumanInvitationRecord> {
+      return runExclusive(async (current) => {
+        if (decision !== "accept" && decision !== "reject") {
+          throw new RoomLifecycleError(400, "invitation_decision_invalid");
+        }
+        requireActor(current, actorId);
+        if (!isNonEmptyString(token)) {
+          throw new RoomLifecycleError(404, "invitation_not_found");
+        }
+        const tokenHash = hashToken(token);
+        const invitation = current.invitations.find(
+          (candidate) => candidate.tokenHash === tokenHash,
+        );
+        if (invitation === undefined) {
+          throw new RoomLifecycleError(404, "invitation_not_found");
+        }
+        if (invitation.inviteeActorId !== actorId) {
+          throw new RoomLifecycleError(403, "invitation_forbidden");
+        }
+        if (invitation.status !== "pending") {
+          throw new RoomLifecycleError(409, "invitation_consumed");
+        }
+        const room = requireRoom(current, invitation.roomId);
+        requireActive(room);
+        if (
+          decision === "accept" &&
+          room.members.some((membership) => membership.actorId === actorId)
+        ) {
+          throw new RoomLifecycleError(409, "room_member_exists");
+        }
+
+        const now = timestamp();
+        const terminal: HumanInvitationRecord = {
+          ...invitation,
+          status: decision === "accept" ? "accepted" : "rejected",
+          decisionActorId: actorId,
+          decidedAt: now,
+        };
+        const updatedRoom: ManagedRoom =
+          decision === "accept"
+            ? {
+                ...room,
+                members: [
+                  ...room.members,
+                  {
+                    kind: "human",
+                    actorId,
+                    role: "member",
+                    joinedAt: now,
+                  },
+                ],
+              }
+            : room;
+        const usedIds = usedEntityIds(current);
+        const audit = auditRecord(usedIds, {
+          type:
+            decision === "accept"
+              ? "room.invitation.accepted"
+              : "room.invitation.rejected",
+          roomId: room.id,
+          actorId,
+          targetActorId: actorId,
+          inviterActorId: invitation.inviterActorId,
+          result: decision === "accept" ? "accepted" : "rejected",
+          timestamp: now,
+        });
+        await persist({
+          ...current,
+          rooms:
+            decision === "accept"
+              ? current.rooms.map((candidate) =>
+                  candidate.id === room.id ? updatedRoom : candidate,
+                )
+              : current.rooms,
+          invitations: current.invitations.map((candidate) =>
+            candidate.id === invitation.id ? terminal : candidate,
+          ),
+          audit: [...current.audit, audit],
+        });
+        return cloneInvitation(terminal);
+      });
+    },
+
+    configureAgent(actorId, request): Promise<ManagedRoom> {
+      return runExclusive(async (current) => {
+        if (!isAgentConfigurationRequestStrict(request)) {
+          throw new RoomLifecycleError(400, "agent_configuration_invalid");
+        }
+        const room = requireManager(current, actorId, request.roomId);
+        requireActive(room);
+        const agent = requireActor(current, request.agentId);
+        if (agent.kind !== "agent") {
+          throw new RoomLifecycleError(400, "agent_required");
+        }
+        if (
+          !hasUniqueStrings(request.toolPermissions) ||
+          !request.toolPermissions.every((permission) =>
+            agent.toolPermissions.includes(permission),
+          )
+        ) {
+          throw new RoomLifecycleError(400, "agent_permissions_invalid");
+        }
+
+        const now = timestamp();
+        const membership: AgentRoomMembership = {
+          kind: "agent",
+          actorId: agent.id,
+          participation: request.participation,
+          toolPermissions: [...request.toolPermissions],
+          configuredAt: now,
+        };
+        const memberIndex = room.members.findIndex(
+          (candidate) => candidate.actorId === agent.id,
+        );
+        const members = [...room.members];
+        if (memberIndex === -1) {
+          members.push(membership);
+        } else {
+          members[memberIndex] = membership;
+        }
+        const configured: ManagedRoom = { ...room, members };
+        const usedIds = usedEntityIds(current);
+        const audit = auditRecord(usedIds, {
+          type: "room.agent.configured",
+          roomId: room.id,
+          actorId,
+          targetActorId: agent.id,
+          result: "configured",
+          timestamp: now,
+        });
+        await persist({
+          ...current,
+          rooms: current.rooms.map((candidate) =>
+            candidate.id === room.id ? configured : candidate,
+          ),
+          audit: [...current.audit, audit],
+        });
+        return cloneRoom(configured);
+      });
+    },
+
+    removeMember(actorId, roomId, targetActorId): Promise<ManagedRoom> {
+      return runExclusive(async (current) => {
+        const room = requireManager(current, actorId, roomId);
+        requireActive(room);
+        const target = room.members.find(
+          (membership) => membership.actorId === targetActorId,
+        );
+        if (target === undefined) {
+          throw new RoomLifecycleError(404, "room_member_not_found");
+        }
+        if (
+          target.kind === "human" &&
+          target.role === "owner" &&
+          room.members.filter(
+            (membership) =>
+              membership.kind === "human" && membership.role === "owner",
+          ).length === 1
+        ) {
+          throw new RoomLifecycleError(409, "room_owner_required");
+        }
+
+        const removed: ManagedRoom = {
+          ...room,
+          members: room.members.filter(
+            (membership) => membership.actorId !== targetActorId,
+          ),
+        };
+        const now = timestamp();
+        const usedIds = usedEntityIds(current);
+        const audit = auditRecord(usedIds, {
+          type: "room.member.removed",
+          roomId,
+          actorId,
+          targetActorId,
+          result: "removed",
+          timestamp: now,
+        });
+        await persist({
+          ...current,
+          rooms: current.rooms.map((candidate) =>
+            candidate.id === roomId ? removed : candidate,
+          ),
+          audit: [...current.audit, audit],
+        });
+        return cloneRoom(removed);
+      });
+    },
+
+    canAccess(actorId, roomId): boolean {
+      const room = state.rooms.find((candidate) => candidate.id === roomId);
+      return (
+        state.actors.some((actor) => actor.id === actorId) &&
+        room?.status === "active" &&
+        room.members.some((membership) => membership.actorId === actorId)
+      );
+    },
+
+    getActor(actorId): Actor | undefined {
+      const actor = state.actors.find((candidate) => candidate.id === actorId);
+      return actor === undefined ? undefined : cloneActor(actor);
+    },
+
+    getRoom(roomId): ManagedRoom | undefined {
+      const room = state.rooms.find((candidate) => candidate.id === roomId);
+      return room === undefined ? undefined : cloneRoom(room);
+    },
+
+    messageRoom(roomId): Room | undefined {
+      const room = state.rooms.find((candidate) => candidate.id === roomId);
+      if (room === undefined || room.status === "archived") {
+        return undefined;
+      }
+      return {
+        id: room.id,
+        name: room.name,
+        memberIds: room.members.map((membership) => membership.actorId),
+        createdAt: room.createdAt,
+      };
+    },
+
+    audit(roomId): readonly RoomAuditRecord[] {
+      return state.audit
+        .filter((record) => record.roomId === roomId)
+        .map(cloneAudit);
+    },
+  };
+}
