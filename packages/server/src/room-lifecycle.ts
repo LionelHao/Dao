@@ -1115,6 +1115,37 @@ export async function createRoomLifecycleService(
     return new Date(value).toISOString();
   }
 
+  function roomNow(current: RoomLifecycleState, roomId: string): string {
+    const wallClock = timestamp();
+    const room = current.rooms.find((candidate) => candidate.id === roomId);
+    const authorityTimestamps = [
+      wallClock,
+      ...(room === undefined
+        ? []
+        : [
+            room.createdAt,
+            ...room.members.map((membership) =>
+              membership.kind === "human"
+                ? membership.joinedAt
+                : membership.configuredAt,
+            ),
+          ]),
+      ...current.invitations
+        .filter((invitation) => invitation.roomId === roomId)
+        .flatMap((invitation) =>
+          invitation.decidedAt === undefined
+            ? [invitation.createdAt]
+            : [invitation.createdAt, invitation.decidedAt],
+        ),
+      ...current.audit
+        .filter((record) => record.roomId === roomId)
+        .map((record) => record.timestamp),
+    ];
+    return new Date(
+      Math.max(...authorityTimestamps.map((value) => Date.parse(value))),
+    ).toISOString();
+  }
+
   function requireActor(current: RoomLifecycleState, actorId: string): Actor {
     if (!isNonEmptyString(actorId)) {
       throw new RoomLifecycleError(401, "unauthenticated");
@@ -1244,7 +1275,7 @@ export async function createRoomLifecycleService(
         const room = requireManager(current, actorId, roomId);
         requireActive(room);
         const name = normalizedName(requestedName);
-        const now = timestamp();
+        const now = roomNow(current, roomId);
         const usedIds = usedEntityIds(current);
         const renamed = { ...room, name };
         const audit = auditRecord(usedIds, {
@@ -1271,7 +1302,7 @@ export async function createRoomLifecycleService(
         if (room.status === "archived") {
           return cloneRoom(room);
         }
-        const now = timestamp();
+        const now = roomNow(current, room.id);
         const usedIds = usedEntityIds(current);
         const archived: ManagedRoom = { ...room, status: "archived" };
         const audit = auditRecord(usedIds, {
@@ -1339,7 +1370,7 @@ export async function createRoomLifecycleService(
           throw new RoomLifecycleError(409, "invitation_token_conflict");
         }
 
-        const now = timestamp();
+        const now = roomNow(current, room.id);
         const usedIds = usedEntityIds(current);
         const invitation: HumanInvitationRecord = {
           id: nextEntityId(usedIds),
@@ -1378,9 +1409,6 @@ export async function createRoomLifecycleService(
     respondToHumanInvitation(actorId, token, decision): Promise<HumanInvitationRecord> {
       return runExclusive(async (current) => {
         requireAuthenticatedActor(current, actorId);
-        if (decision !== "accept" && decision !== "reject") {
-          throw new RoomLifecycleError(400, "invitation_decision_invalid");
-        }
         if (!isNonEmptyString(token)) {
           throw new RoomLifecycleError(404, "invitation_not_found");
         }
@@ -1393,6 +1421,9 @@ export async function createRoomLifecycleService(
         }
         if (invitation.inviteeActorId !== actorId) {
           throw new RoomLifecycleError(403, "invitation_forbidden");
+        }
+        if (decision !== "accept" && decision !== "reject") {
+          throw new RoomLifecycleError(400, "invitation_decision_invalid");
         }
         if (invitation.status !== "pending") {
           throw new RoomLifecycleError(409, "invitation_consumed");
@@ -1408,7 +1439,7 @@ export async function createRoomLifecycleService(
           throw new RoomLifecycleError(409, "room_member_exists");
         }
 
-        const now = timestamp();
+        const now = roomNow(current, room.id);
         const terminal: HumanInvitationRecord = {
           ...invitation,
           status: decision === "accept" ? "accepted" : "rejected",
@@ -1495,7 +1526,7 @@ export async function createRoomLifecycleService(
           throw new RoomLifecycleError(400, "agent_permissions_invalid");
         }
 
-        const now = timestamp();
+        const now = roomNow(current, roomId);
         const membership: AgentRoomMembership = {
           kind: "agent",
           actorId: agent.id,
@@ -1575,7 +1606,7 @@ export async function createRoomLifecycleService(
               : membership,
           ),
         };
-        const now = timestamp();
+        const now = roomNow(current, roomId);
         const usedIds = usedEntityIds(current);
         const audit = auditRecord(usedIds, {
           type: "room.member.role.changed",
@@ -1624,7 +1655,7 @@ export async function createRoomLifecycleService(
             (membership) => membership.actorId !== targetActorId,
           ),
         };
-        const now = timestamp();
+        const now = roomNow(current, roomId);
         const usedIds = usedEntityIds(current);
         const audit = auditRecord(usedIds, {
           type: "room.member.removed",

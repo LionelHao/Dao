@@ -1131,6 +1131,43 @@ describe("room lifecycle service", () => {
     },
   );
 
+  it("authorizes the targeted invitation actor before validating the decision", async () => {
+    const rooms = await createRoomLifecycleService(
+      createOptions(new MemoryRoomStore()),
+    );
+    const room = await rooms.createRoom(owner.id, { name: "Decision authz" });
+    const invitation = await rooms.inviteHuman(owner.id, {
+      kind: "human-invitation",
+      roomId: room.id,
+      inviteeActorId: invitee.id,
+    });
+
+    await expect(
+      rooms.respondToHumanInvitation(
+        member.id,
+        invitation.token,
+        "invalid" as never,
+      ),
+    ).rejects.toMatchObject({ status: 403, code: "invitation_forbidden" });
+    await expect(
+      rooms.respondToHumanInvitation(
+        "human-missing",
+        invitation.token,
+        "invalid" as never,
+      ),
+    ).rejects.toMatchObject({ status: 401, code: "unauthenticated" });
+    await expect(
+      rooms.respondToHumanInvitation(
+        invitee.id,
+        invitation.token,
+        "invalid" as never,
+      ),
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invitation_decision_invalid",
+    });
+  });
+
   it("returns typed payload errors for an authenticated owner without raw TypeErrors", async () => {
     const rooms = await createRoomLifecycleService(
       createOptions(new MemoryRoomStore()),
@@ -1265,6 +1302,77 @@ describe("room lifecycle service", () => {
       await expect(
         restarted.renameRoom(member.id, room.id, "Admin survived restart"),
       ).resolves.toMatchObject({ name: "Admin survived restart" });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("clamps existing-room mutation time when the wall clock rolls backward", async () => {
+    let now = Date.parse("2026-08-09T08:00:00.000Z");
+    const store = new MemoryRoomStore();
+    const rooms = await createRoomLifecycleService({
+      ...createOptions(store),
+      clock: () => now,
+    });
+    const room = await rooms.createRoom(owner.id, { name: "Clock rollback" });
+
+    now = Date.parse("2026-08-09T10:00:00.000Z");
+    await rooms.renameRoom(owner.id, room.id, "Future rename");
+    now = Date.parse("2026-08-09T09:00:00.000Z");
+
+    await expect(
+      rooms.renameRoom(owner.id, room.id, "Rollback rename"),
+    ).resolves.toMatchObject({ name: "Rollback rename" });
+    expect(
+      rooms.audit(room.id).slice(-2).map((record) => record.timestamp),
+    ).toEqual([
+      "2026-08-09T10:00:00.000Z",
+      "2026-08-09T10:00:00.000Z",
+    ]);
+    expect(isRoomLifecycleState(store.current)).toBe(true);
+  });
+
+  it("clamps mutation time to future persisted authority after a JSON restart", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-room-clock-"));
+    const filePath = join(directory, "rooms.json");
+    let now = Date.parse("2026-08-09T08:00:00.000Z");
+    const idFactory = sequenceFactory("clock-restart-entity");
+    const tokenFactory = sequenceFactory("clock-restart-token");
+    const options = {
+      actors,
+      clock: () => now,
+      idFactory,
+      tokenFactory,
+    };
+
+    try {
+      const rooms = await createRoomLifecycleService({
+        ...options,
+        state: createJsonStateStore(filePath, isRoomLifecycleState),
+      });
+      const room = await rooms.createRoom(owner.id, { name: "Restart clock" });
+      now = Date.parse("2026-08-09T10:00:00.000Z");
+      await rooms.renameRoom(owner.id, room.id, "Future persisted rename");
+
+      now = Date.parse("2026-08-09T09:00:00.000Z");
+      const restarted = await createRoomLifecycleService({
+        ...options,
+        state: createJsonStateStore(filePath, isRoomLifecycleState),
+      });
+      await expect(
+        restarted.renameRoom(owner.id, room.id, "Restarted rollback rename"),
+      ).resolves.toMatchObject({ name: "Restarted rollback rename" });
+      expect(restarted.audit(room.id).at(-1)?.timestamp).toBe(
+        "2026-08-09T10:00:00.000Z",
+      );
+
+      const loadedAgain = await createRoomLifecycleService({
+        ...options,
+        state: createJsonStateStore(filePath, isRoomLifecycleState),
+      });
+      expect(loadedAgain.getRoom(room.id)?.name).toBe(
+        "Restarted rollback rename",
+      );
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
