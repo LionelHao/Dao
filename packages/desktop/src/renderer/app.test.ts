@@ -636,7 +636,67 @@ describe("room join controls", () => {
     ).toContain("有效的 Agent");
   });
 
-  it("allows a declared no-tool agent to be configured with an empty permission list", () => {
+  it("keeps empty and blank-only tool agents visible but unavailable", () => {
+    const root = document.createElement("main");
+    const requests: AgentConfigurationRequest[] = [];
+    const noToolAgent: AgentActor = {
+      id: "agent-observer",
+      kind: "agent",
+      displayName: "观察 Agent",
+      readiness: "paused",
+      toolPermissions: [],
+    };
+    const blankToolAgent: AgentActor = {
+      id: "agent-blank-tools",
+      kind: "agent",
+      displayName: "空白权限 Agent",
+      readiness: "ready",
+      toolPermissions: [" ", "   "],
+    };
+
+    app.renderRoomJoinControls?.(root, {
+      roomId: "room-product",
+      agents: [noToolAgent, blankToolAgent],
+      onInviteHuman: () => undefined,
+      onConfigureAgent: (request) => requests.push(request),
+    });
+
+    const form = root.querySelector<HTMLFormElement>(
+      "[data-join-kind='agent-configuration'] form",
+    );
+    const agentSelect = form?.elements.namedItem("agentId") as HTMLSelectElement | null;
+    const participation = form?.elements.namedItem("participation") as HTMLSelectElement | null;
+    const submitButton = form?.querySelector<HTMLButtonElement>("button[type='submit']");
+    const options = Array.from(agentSelect?.options ?? []);
+
+    expect(options.map((option) => option.value)).toEqual([
+      "",
+      "agent-observer",
+      "agent-blank-tools",
+    ]);
+    expect(options.slice(1).every((option) => option.disabled)).toBe(true);
+    expect(options[1]?.textContent).toContain("未声明工具");
+    expect(options[2]?.textContent).toContain("未声明工具");
+    expect(participation?.disabled).toBe(true);
+    expect(submitButton?.disabled).toBe(true);
+    expect(root.querySelector("[data-join-kind='agent-configuration'] [role='status']")?.textContent)
+      .toContain("均未声明工具权限");
+
+    for (const agentId of ["agent-observer", "agent-blank-tools"]) {
+      agentSelect!.value = agentId;
+      agentSelect!.dispatchEvent(new Event("change", { bubbles: true }));
+      participation!.disabled = false;
+      participation!.value = "silent";
+      submit(form!);
+
+      expect(requests).toEqual([]);
+      expect(
+        root.querySelector("[data-join-kind='agent-configuration'] [role='status']")?.textContent,
+      ).toContain("没有已声明的工具权限");
+    }
+  });
+
+  it("resets grants and blocks a tampered switch from a configurable agent to a no-tool agent", () => {
     const root = document.createElement("main");
     const requests: AgentConfigurationRequest[] = [];
     const noToolAgent: AgentActor = {
@@ -649,7 +709,7 @@ describe("room join controls", () => {
 
     app.renderRoomJoinControls?.(root, {
       roomId: "room-product",
-      agents: [noToolAgent],
+      agents: [joinControlAgents[0]!, noToolAgent],
       onInviteHuman: () => undefined,
       onConfigureAgent: (request) => requests.push(request),
     });
@@ -659,20 +719,41 @@ describe("room join controls", () => {
     );
     const agentSelect = form?.elements.namedItem("agentId") as HTMLSelectElement | null;
     const participation = form?.elements.namedItem("participation") as HTMLSelectElement | null;
+    const submitButton = form?.querySelector<HTMLButtonElement>("button[type='submit']");
+    const noToolOption = Array.from(agentSelect?.options ?? []).find(
+      (option) => option.value === "agent-observer",
+    );
+
+    expect(noToolOption?.disabled).toBe(true);
+    agentSelect!.value = "agent-research";
+    agentSelect!.dispatchEvent(new Event("change", { bubbles: true }));
+    participation!.value = "active";
+    const searchPermission = form?.querySelector<HTMLInputElement>(
+      "input[name='toolPermissions'][value='search']",
+    );
+    searchPermission!.checked = true;
+
     agentSelect!.value = "agent-observer";
     agentSelect!.dispatchEvent(new Event("change", { bubbles: true }));
-    participation!.value = "silent";
+
+    expect(form?.querySelectorAll("input[name='toolPermissions']")).toHaveLength(0);
+    expect(form?.querySelector("fieldset")?.textContent).toContain("没有已声明的工具权限");
+    expect(submitButton?.disabled).toBe(true);
     submit(form!);
 
-    expect(form?.querySelector("fieldset")?.textContent).toContain("无需工具权限");
-    expect(requests).toEqual([
-      {
-        kind: "agent-configuration",
-        roomId: "room-product",
-        agentId: "agent-observer",
-        participation: "silent",
-        toolPermissions: [],
-      },
-    ]);
+    expect(requests).toEqual([]);
+    expect(root.querySelector("[data-join-kind='agent-configuration'] [role='status']")?.textContent)
+      .toContain("没有已声明的工具权限");
+
+    agentSelect!.value = "agent-research";
+    agentSelect!.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(submitButton?.disabled).toBe(false);
+    expect(
+      Array.from(form?.querySelectorAll<HTMLInputElement>("input[name='toolPermissions']") ?? [])
+        .every((input) => !input.checked),
+    ).toBe(true);
+
+    submit(form!);
+    expect(requests).toEqual([]);
   });
 });

@@ -366,6 +366,10 @@ body {
   opacity: 0.58;
 }
 
+.join-control option:disabled {
+  color: var(--muted-ink);
+}
+
 .join-field-hint {
   color: var(--muted-ink);
   font-size: 0.75rem;

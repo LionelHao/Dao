@@ -548,6 +548,10 @@ function renderAgentConfigurationModule(
   const button = document.createElement("button");
   const status = createStatus("选择配置项后提交。");
   const agentsById = new Map(agents.map((agent) => [agent.id, agent]));
+  const configurableAgentCount = agents.filter(
+    (agent) => agent.toolPermissions.length > 0,
+  ).length;
+  const hasValidRuntime = roomId.length > 0 && typeof callback === "function";
 
   module.className = "join-module join-module--agent";
   module.dataset.joinKind = "agent-configuration";
@@ -561,7 +565,14 @@ function renderAgentConfigurationModule(
   agentLabel.htmlFor = agentSelect.id;
   agentSelect.append(new Option("选择 Agent", ""));
   for (const agent of agents) {
-    agentSelect.append(new Option(agent.displayName, agent.id));
+    const hasDeclaredTools = agent.toolPermissions.length > 0;
+    const option = new Option(
+      hasDeclaredTools ? agent.displayName : `${agent.displayName}（未声明工具，不可配置）`,
+      agent.id,
+    );
+
+    option.disabled = !hasDeclaredTools;
+    agentSelect.append(option);
   }
 
   participationSelect.id = `${sequence}-participation`;
@@ -592,7 +603,7 @@ function renderAgentConfigurationModule(
     }
 
     if (agent.toolPermissions.length === 0) {
-      permissionList.textContent = "此 Agent 无需工具权限。";
+      permissionList.textContent = "此 Agent 没有已声明的工具权限，无法配置。";
       return;
     }
 
@@ -619,7 +630,13 @@ function renderAgentConfigurationModule(
     button.disabled = true;
     permissionList.textContent = "没有可配置的 Agent，请检查可用 Agent 数据。";
     updateStatus(status, "error", "没有可配置的 Agent。");
-  } else if (roomId.length === 0 || typeof callback !== "function") {
+  } else if (configurableAgentCount === 0) {
+    participationSelect.disabled = true;
+    permissionFieldset.disabled = true;
+    button.disabled = true;
+    permissionList.textContent = "这些 Agent 均未声明工具权限，无法配置。";
+    updateStatus(status, "error", "所有 Agent 均未声明工具权限，无法配置。");
+  } else if (!hasValidRuntime) {
     button.disabled = true;
     updateStatus(status, "error", "当前房间无法配置 Agent，请检查运行参数。");
   }
@@ -628,11 +645,19 @@ function renderAgentConfigurationModule(
     const selectedAgent = agentsById.get(agentSelect.value);
 
     renderPermissions(selectedAgent);
-    updateStatus(
-      status,
-      "idle",
-      selectedAgent === undefined ? "请选择有效的 Agent。" : "选择参与度与工具权限后提交。",
-    );
+    if (selectedAgent !== undefined && selectedAgent.toolPermissions.length === 0) {
+      participationSelect.disabled = true;
+      button.disabled = true;
+      updateStatus(status, "error", "此 Agent 没有已声明的工具权限，无法配置。");
+    } else {
+      participationSelect.disabled = configurableAgentCount === 0;
+      button.disabled = configurableAgentCount === 0 || !hasValidRuntime;
+      updateStatus(
+        status,
+        "idle",
+        selectedAgent === undefined ? "请选择有效的 Agent。" : "选择参与度与工具权限后提交。",
+      );
+    }
   });
 
   form.addEventListener("submit", (event) => {
@@ -647,6 +672,14 @@ function renderAgentConfigurationModule(
     if (agent === undefined) {
       updateStatus(status, "error", "请选择有效的 Agent。");
       agentSelect.focus();
+      return;
+    }
+
+    if (agent.toolPermissions.length === 0) {
+      renderPermissions(agent);
+      participationSelect.disabled = true;
+      button.disabled = true;
+      updateStatus(status, "error", "此 Agent 没有已声明的工具权限，无法配置。");
       return;
     }
 
@@ -671,7 +704,7 @@ function renderAgentConfigurationModule(
       return;
     }
 
-    if (agent.toolPermissions.length > 0 && selectedPermissions.length === 0) {
+    if (selectedPermissions.length === 0) {
       updateStatus(status, "error", "请至少选择一项工具权限。");
       permissionList.querySelector<HTMLInputElement>("input")?.focus();
       return;
