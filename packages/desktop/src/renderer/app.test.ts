@@ -1,4 +1,9 @@
 import { describe, expect, it } from "vitest";
+import type {
+  AgentActor,
+  AgentConfigurationRequest,
+  HumanInvitationRequest,
+} from "@native-im/core";
 import * as importedApp from "./app.js";
 
 type RendererUnderTest = {
@@ -9,6 +14,15 @@ type RendererUnderTest = {
     actorsById: ReadonlyMap<string, unknown>,
   ) => void;
   renderVisualSeparationPreview?: (root: HTMLElement) => void;
+  renderRoomJoinControls?: (
+    root: HTMLElement,
+    options: {
+      readonly roomId: string;
+      readonly agents: readonly AgentActor[];
+      readonly onInviteHuman: (request: HumanInvitationRequest) => void;
+      readonly onConfigureAgent: (request: AgentConfigurationRequest) => void;
+    },
+  ) => void;
 };
 
 const app = importedApp as unknown as RendererUnderTest;
@@ -326,5 +340,339 @@ describe("message timeline renderer", () => {
     expect(rendered[0]?.style.getPropertyValue("--message-role-colour")).not.toBe(
       rendered[1]?.style.getPropertyValue("--message-role-colour"),
     );
+  });
+});
+
+const joinControlAgents: readonly AgentActor[] = [
+  {
+    id: "agent-research",
+    kind: "agent",
+    displayName: "研究 Agent",
+    readiness: "ready",
+    toolPermissions: ["search", "summarize"],
+  },
+  {
+    id: "agent-ops",
+    kind: "agent",
+    displayName: "运维 Agent",
+    readiness: "busy",
+    toolPermissions: ["deploy"],
+  },
+];
+
+function submit(form: HTMLFormElement): void {
+  form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+}
+
+describe("room join controls", () => {
+  it("renders adjacent and accessible human invitation and agent configuration modules", () => {
+    const root = document.createElement("main");
+
+    app.renderRoomJoinControls?.(root, {
+      roomId: "room-product",
+      agents: joinControlAgents,
+      onInviteHuman: () => undefined,
+      onConfigureAgent: () => undefined,
+    });
+
+    expect(app.renderRoomJoinControls).toBeTypeOf("function");
+    const human = root.querySelector<HTMLElement>("[data-join-kind='human-invitation']");
+    const agent = root.querySelector<HTMLElement>("[data-join-kind='agent-configuration']");
+
+    expect(human).not.toBeNull();
+    expect(agent).not.toBeNull();
+    expect(human?.parentElement).toBe(agent?.parentElement);
+    expect(human?.nextElementSibling).toBe(agent);
+    expect(human?.textContent).toContain("接受或拒绝");
+    expect(human?.textContent).toContain("等待对方接受");
+    expect(agent?.textContent).toContain("立即生效");
+    expect(agent?.textContent).toContain("无需接受");
+    expect(agent?.textContent).toContain("参与度");
+    expect(agent?.textContent).toContain("工具权限");
+
+    const actorInput = human?.querySelector<HTMLInputElement>("input[name='inviteeActorId']");
+    const actorLabel = actorInput === null ? null : human?.querySelector(`label[for='${actorInput.id}']`);
+    const agentSelect = agent?.querySelector<HTMLSelectElement>("select[name='agentId']");
+    const participationSelect = agent?.querySelector<HTMLSelectElement>(
+      "select[name='participation']",
+    );
+    const permissionLegend = agent?.querySelector("fieldset legend");
+
+    expect(actorInput).not.toBeNull();
+    expect(actorLabel?.textContent).toContain("成员 ID");
+    expect(human?.querySelector("button[type='submit']")?.textContent).toContain("邀请真人");
+    expect(human?.querySelector("[role='status'][aria-live='polite']")).not.toBeNull();
+    expect(agentSelect).not.toBeNull();
+    expect(agent?.querySelector(`label[for='${agentSelect?.id}']`)?.textContent).toContain("Agent");
+    expect(participationSelect).not.toBeNull();
+    expect(agent?.querySelector(`label[for='${participationSelect?.id}']`)?.textContent).toContain(
+      "参与度",
+    );
+    expect(permissionLegend?.textContent).toContain("工具权限");
+    expect(agent?.querySelector("button[type='submit']")?.textContent).toContain("配置 Agent");
+    expect(agent?.querySelector("[role='status'][aria-live='polite']")).not.toBeNull();
+  });
+
+  it("validates a trimmed human actor id and emits only a human invitation payload", () => {
+    const root = document.createElement("main");
+    const humanRequests: HumanInvitationRequest[] = [];
+    const agentRequests: AgentConfigurationRequest[] = [];
+
+    app.renderRoomJoinControls?.(root, {
+      roomId: "room-product",
+      agents: joinControlAgents,
+      onInviteHuman: (request) => humanRequests.push(request),
+      onConfigureAgent: (request) => agentRequests.push(request),
+    });
+
+    const form = root.querySelector<HTMLFormElement>(
+      "[data-join-kind='human-invitation'] form",
+    );
+    const actorInput = form?.elements.namedItem("inviteeActorId") as HTMLInputElement | null;
+    const status = root.querySelector<HTMLElement>(
+      "[data-join-kind='human-invitation'] [role='status']",
+    );
+
+    expect(form).not.toBeNull();
+    expect(actorInput).not.toBeNull();
+    actorInput!.value = "   ";
+    submit(form!);
+    expect(humanRequests).toEqual([]);
+    expect(agentRequests).toEqual([]);
+    expect(status?.textContent).toContain("成员 ID");
+
+    actorInput!.value = "  human-lin  ";
+    submit(form!);
+
+    expect(humanRequests).toEqual([
+      {
+        kind: "human-invitation",
+        roomId: "room-product",
+        inviteeActorId: "human-lin",
+      },
+    ]);
+    expect(agentRequests).toEqual([]);
+    expect(Object.keys(humanRequests[0] ?? {}).sort()).toEqual([
+      "inviteeActorId",
+      "kind",
+      "roomId",
+    ]);
+    expect(status?.textContent).toContain("等待对方接受");
+  });
+
+  it("requires an agent, participation, and declared permission before emitting only agent configuration", () => {
+    const root = document.createElement("main");
+    const humanRequests: HumanInvitationRequest[] = [];
+    const agentRequests: AgentConfigurationRequest[] = [];
+
+    app.renderRoomJoinControls?.(root, {
+      roomId: "room-product",
+      agents: joinControlAgents,
+      onInviteHuman: (request) => humanRequests.push(request),
+      onConfigureAgent: (request) => agentRequests.push(request),
+    });
+
+    const form = root.querySelector<HTMLFormElement>(
+      "[data-join-kind='agent-configuration'] form",
+    );
+    const agentSelect = form?.elements.namedItem("agentId") as HTMLSelectElement | null;
+    const participation = form?.elements.namedItem("participation") as HTMLSelectElement | null;
+    const status = root.querySelector<HTMLElement>(
+      "[data-join-kind='agent-configuration'] [role='status']",
+    );
+
+    expect(form).not.toBeNull();
+    submit(form!);
+    expect(agentRequests).toEqual([]);
+    expect(status?.textContent).toContain("Agent");
+
+    agentSelect!.value = "agent-research";
+    agentSelect!.dispatchEvent(new Event("change", { bubbles: true }));
+    participation!.value = "on-mention";
+    submit(form!);
+    expect(agentRequests).toEqual([]);
+    expect(status?.textContent).toContain("工具权限");
+
+    const searchPermission = form?.querySelector<HTMLInputElement>(
+      "input[name='toolPermissions'][value='search']",
+    );
+    expect(searchPermission).not.toBeNull();
+    searchPermission!.checked = true;
+    submit(form!);
+
+    expect(agentRequests).toEqual([
+      {
+        kind: "agent-configuration",
+        roomId: "room-product",
+        agentId: "agent-research",
+        participation: "on-mention",
+        toolPermissions: ["search"],
+      },
+    ]);
+    expect(humanRequests).toEqual([]);
+    expect(Object.keys(agentRequests[0] ?? {}).sort()).toEqual([
+      "agentId",
+      "kind",
+      "participation",
+      "roomId",
+      "toolPermissions",
+    ]);
+    expect(status?.textContent).toContain("立即生效");
+  });
+
+  it("deduplicates agent options and permissions, then resets permissions when the agent changes", () => {
+    const root = document.createElement("main");
+    const agents = [
+      {
+        ...joinControlAgents[0]!,
+        toolPermissions: ["search", "search", "summarize"],
+      },
+      { ...joinControlAgents[0]!, displayName: "重复 Agent", toolPermissions: ["tampered"] },
+      joinControlAgents[1]!,
+    ];
+
+    app.renderRoomJoinControls?.(root, {
+      roomId: "room-product",
+      agents,
+      onInviteHuman: () => undefined,
+      onConfigureAgent: () => undefined,
+    });
+
+    const form = root.querySelector<HTMLFormElement>(
+      "[data-join-kind='agent-configuration'] form",
+    );
+    const select = form?.elements.namedItem("agentId") as HTMLSelectElement | null;
+
+    expect(Array.from(select?.options ?? []).map((option) => option.value)).toEqual([
+      "",
+      "agent-research",
+      "agent-ops",
+    ]);
+    select!.value = "agent-research";
+    select!.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(
+      Array.from(form?.querySelectorAll<HTMLInputElement>("input[name='toolPermissions']") ?? []).map(
+        (input) => input.value,
+      ),
+    ).toEqual(["search", "summarize"]);
+
+    const searchPermission = form?.querySelector<HTMLInputElement>(
+      "input[name='toolPermissions'][value='search']",
+    );
+    searchPermission!.checked = true;
+    select!.value = "agent-ops";
+    select!.dispatchEvent(new Event("change", { bubbles: true }));
+
+    const permissionsAfterChange = Array.from(
+      form?.querySelectorAll<HTMLInputElement>("input[name='toolPermissions']") ?? [],
+    );
+    expect(permissionsAfterChange.map((input) => input.value)).toEqual(["deploy"]);
+    expect(permissionsAfterChange.every((input) => !input.checked)).toBe(true);
+  });
+
+  it("disables invalid agent data and rejects tampered values without calling either callback", () => {
+    const root = document.createElement("main");
+    const humanRequests: HumanInvitationRequest[] = [];
+    const agentRequests: AgentConfigurationRequest[] = [];
+    const invalidAgents = [
+      null,
+      { id: "", kind: "agent", displayName: "Broken", readiness: "ready", toolPermissions: [] },
+      { id: "agent-broken", kind: "agent", displayName: "", readiness: "ready" },
+      {
+        id: "agent-wrong-readiness",
+        kind: "agent",
+        displayName: "错误状态 Agent",
+        readiness: "online",
+        toolPermissions: [],
+      },
+    ] as unknown as readonly AgentActor[];
+
+    expect(() =>
+      app.renderRoomJoinControls?.(root, {
+        roomId: "room-product",
+        agents: invalidAgents,
+        onInviteHuman: (request) => humanRequests.push(request),
+        onConfigureAgent: (request) => agentRequests.push(request),
+      }),
+    ).not.toThrow();
+
+    const form = root.querySelector<HTMLFormElement>(
+      "[data-join-kind='agent-configuration'] form",
+    );
+    const agentSelect = form?.elements.namedItem("agentId") as HTMLSelectElement | null;
+    const submitButton = form?.querySelector<HTMLButtonElement>("button[type='submit']");
+
+    expect(agentSelect?.disabled).toBe(true);
+    expect(submitButton?.disabled).toBe(true);
+    expect(root.textContent).toContain("没有可配置的 Agent");
+    expect(() => submit(form!)).not.toThrow();
+    expect(humanRequests).toEqual([]);
+    expect(agentRequests).toEqual([]);
+
+    const validRoot = document.createElement("main");
+    app.renderRoomJoinControls?.(validRoot, {
+      roomId: "room-product",
+      agents: joinControlAgents,
+      onInviteHuman: (request) => humanRequests.push(request),
+      onConfigureAgent: (request) => agentRequests.push(request),
+    });
+    const validForm = validRoot.querySelector<HTMLFormElement>(
+      "[data-join-kind='agent-configuration'] form",
+    );
+    const validAgentSelect = validForm?.elements.namedItem("agentId") as HTMLSelectElement | null;
+    const validParticipation = validForm?.elements.namedItem(
+      "participation",
+    ) as HTMLSelectElement | null;
+    validAgentSelect!.append(new Option("伪造 Agent", "agent-tampered"));
+    validAgentSelect!.value = "agent-tampered";
+    validParticipation!.value = "active";
+
+    expect(() => submit(validForm!)).not.toThrow();
+    expect(humanRequests).toEqual([]);
+    expect(agentRequests).toEqual([]);
+    expect(
+      validRoot.querySelector("[data-join-kind='agent-configuration'] [role='status']")
+        ?.textContent,
+    ).toContain("有效的 Agent");
+  });
+
+  it("allows a declared no-tool agent to be configured with an empty permission list", () => {
+    const root = document.createElement("main");
+    const requests: AgentConfigurationRequest[] = [];
+    const noToolAgent: AgentActor = {
+      id: "agent-observer",
+      kind: "agent",
+      displayName: "观察 Agent",
+      readiness: "paused",
+      toolPermissions: [],
+    };
+
+    app.renderRoomJoinControls?.(root, {
+      roomId: "room-product",
+      agents: [noToolAgent],
+      onInviteHuman: () => undefined,
+      onConfigureAgent: (request) => requests.push(request),
+    });
+
+    const form = root.querySelector<HTMLFormElement>(
+      "[data-join-kind='agent-configuration'] form",
+    );
+    const agentSelect = form?.elements.namedItem("agentId") as HTMLSelectElement | null;
+    const participation = form?.elements.namedItem("participation") as HTMLSelectElement | null;
+    agentSelect!.value = "agent-observer";
+    agentSelect!.dispatchEvent(new Event("change", { bubbles: true }));
+    participation!.value = "silent";
+    submit(form!);
+
+    expect(form?.querySelector("fieldset")?.textContent).toContain("无需工具权限");
+    expect(requests).toEqual([
+      {
+        kind: "agent-configuration",
+        roomId: "room-product",
+        agentId: "agent-observer",
+        participation: "silent",
+        toolPermissions: [],
+      },
+    ]);
   });
 });

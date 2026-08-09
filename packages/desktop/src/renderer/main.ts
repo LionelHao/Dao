@@ -1,4 +1,8 @@
-import { renderEmptyGroupChat, renderVisualSeparationPreview } from "./app.js";
+import {
+  renderEmptyGroupChat,
+  renderRoomJoinReview,
+  renderVisualSeparationPreview,
+} from "./app.js";
 
 const root = document.querySelector<HTMLElement>("#app");
 
@@ -6,7 +10,11 @@ if (root === null) {
   throw new Error("Desktop renderer requires an #app root element.");
 }
 
-if (new URLSearchParams(window.location.search).has("visual-review")) {
+const reviewRoute = new URLSearchParams(window.location.search);
+
+if (reviewRoute.has("join-review")) {
+  renderRoomJoinReview(root);
+} else if (reviewRoute.has("visual-review")) {
   renderVisualSeparationPreview(root);
 } else {
   renderEmptyGroupChat(root);
