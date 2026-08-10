@@ -431,6 +431,7 @@ describe("authentication service", () => {
       for (const operation of [
         () => service.login({ accountId: "account-li", secret: "correct-li" }),
         () => service.authenticate("access-token"),
+        () => service.authenticateSession("access-token"),
         () => service.refresh("refresh-token"),
         () => service.revoke("access-token"),
       ]) {
@@ -463,6 +464,7 @@ describe("authentication service", () => {
       });
 
       expect(issued).toMatchObject({ accountId: "account-li", actorId: "human-li" });
+      const firstSessionContext = await first.authenticateSession(issued.accessToken);
 
       const persisted = await readFile(sessionPath, "utf8");
       expect(persisted).toContain(
@@ -486,6 +488,9 @@ describe("authentication service", () => {
         accountId: "account-li",
         actorId: "human-li",
       });
+      await expect(
+        afterServerRestart.authenticateSession(issued.accessToken),
+      ).resolves.toEqual(firstSessionContext);
 
       const rotated = await afterServerRestart.refresh(issued.refreshToken);
       expect(rotated.accessToken).not.toBe(issued.accessToken);

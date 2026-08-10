@@ -49,7 +49,7 @@ The implementer must not edit or weaken these six Blueprint criteria:
 - Create `packages/core/src/sync.ts` and tests — pure closed event/cursor/snapshot/wire value types shared by server and desktop without I/O.
 - Create `packages/server/src/persistence/contracts.ts` — authenticated/internal contexts, closed commands/events, cursor, outbox, snapshot records and guards.
 - Create `packages/server/src/persistence/contracts.test.ts` — closed-schema, cross-primitive, human/agent authority rejection.
-- Create `packages/server/src/persistence/sqlite-authoritative-store.ts` — worker-only command transactions, idempotency, facts, events, outbox, permission-aware queries.
+- Create `packages/server/src/persistence/sqlite-authoritative-store.ts` — business-side asynchronous authority facade; all calls route through the single AuthorityWorker, which owns command transactions, idempotency, facts, events, outbox, and permission-aware queries. Before Task 6 grows the command surface, extract worker-only SQL handlers from the worker entrypoint without introducing another connection owner.
 - Create `packages/server/src/persistence/sqlite-authoritative-store.test.ts` — all durable facts, concurrency, restart, authorization, idempotency.
 - Create `packages/server/src/invitation-secret-protector.ts` and test — AES-GCM protection for replayable invitation responses without plaintext at rest.
 - Create `packages/server/src/subscription-registry.ts` — target-kind indexed subscriptions and revocation.
@@ -172,6 +172,7 @@ export function listAuthorityTables(database: DatabaseSync): readonly string[];
 `configureAuthorityConnection` must set and verify `foreign_keys=ON`, `journal_mode=WAL`, `synchronous=FULL`, and a bounded `busy_timeout`. `migrateAuthorityDatabase` must open one outer `BEGIN IMMEDIATE`, apply missing numbered migrations in order, write `(version,name,checksum,applied_at)` to `schema_migrations`, set `user_version`, run integrity checks, and either COMMIT the whole chain or ROLLBACK it.
 
 The v1 DDL contains actors, sessions, rooms, memberships, invitations, audit, and messages. The v2 DDL adds the five collaboration-fact tables plus streams/events/idempotency/outbox and deterministically initializes both revision columns and both stream kinds.
+Task 5 treats the v2 migration already merged to `main` as immutable and advances the current schema to v3, rebuilding only the outbox target envelope.
 
 - [ ] **Step 4: Pin and verify the supported runtime.**
 
@@ -272,8 +273,8 @@ Stage only the five listed files and propose `feat(server): isolate authority da
 - Create: `packages/server/src/persistence/legacy-importer.ts`
 - Create: `packages/server/src/persistence/legacy-importer.test.ts`
 - Modify: `packages/server/src/persistence/authority-worker.ts`
-- Modify: `packages/server/src/persistence/worker-protocol.ts`
 - Modify: `packages/server/src/persistence/worker-database-client.ts`
+- Modify: `packages/server/src/persistence/worker-protocol.ts`
 
 - [ ] **Step 1: Write importer RED tests.**
 
@@ -565,9 +566,17 @@ Use the commit workflow and propose `feat(server): define authoritative command 
 - Modify: `packages/server/src/persistence/contracts.ts`
 - Modify: `packages/server/src/persistence/worker-protocol.ts`
 - Modify: `packages/server/src/persistence/authority-worker.ts`
+- Modify: `packages/server/src/persistence/worker-database-client.ts`
+- Modify: `packages/server/src/persistence/worker-database-client.test.ts`
+- Modify: `packages/server/src/persistence/schema.ts`
+- Modify: `packages/server/src/persistence/schema.test.ts`
+- Modify: `packages/server/src/persistence/legacy-importer.ts`
+- Modify: `packages/server/src/persistence/legacy-importer.test.ts`
 - Create: `packages/server/src/persistence/sqlite-authoritative-store.ts`
 - Create: `packages/server/src/persistence/sqlite-authoritative-store.test.ts`
 - Modify: `packages/server/src/index.ts`
+- Modify: `docs/plans/2026-08-10-t0040-authoritative-persistence-design.md`
+- Modify: `docs/plans/2026-08-10-t0040-authoritative-persistence-implementation.md`
 
 - [ ] **Step 1: Write auth authority RED tests.**
 
@@ -589,7 +598,7 @@ await expect(restarted.auth.authenticateSession(session.accessToken)).resolves.t
 });
 ```
 
-Add deterministic interleavings for: refresh with expected principal, old refresh replay revoking the whole family, explicit revoke, access expiry, and a human command paused after socket authentication while another connection revokes the family. The paused command must return `session_revoked` with zero facts/events/outbox rows.
+Add deterministic interleavings for: refresh with expected principal, old refresh replay revoking the whole family, explicit revoke, access expiry, and a human command paused after socket authentication but before it is enqueued to the single AuthorityWorker while another connection revokes the family. The queued command must return `session_revoked` with zero facts/events/outbox rows.
 
 - [ ] **Step 2: Run RED.**
 
@@ -640,11 +649,11 @@ export interface AuthenticationService {
 }
 ```
 
-Keep plaintext tokens in `auth.ts`; send only SHA-256 hashes to the worker. Add an explicit startup `registerActors(actors)` operation: it inserts missing human/Agent actors with `catalog_revision=0` and stable `identity.actor.registered` events, treats a byte-equivalent repeat as idempotent, and rejects a changed kind/display/capability payload for an existing ID. Rotation must run under `BEGIN IMMEDIATE`, validate expected principal before token generation is persisted, revoke only the prior record on normal refresh, append a new record in the same family, and revoke the whole family on refresh replay. Revoke/rotate writes identity events; only family revoke creates terminal session-family outbox.
+Keep plaintext tokens in `auth.ts`; send only canonical SHA-256 base64url hashes to the worker. Add an explicit startup `registerActors(actors)` operation: it inserts missing human/Agent actors with `catalog_revision=0` and stable `identity.actor.registered` events, treats a byte-equivalent repeat as idempotent, and rejects a changed kind/display/capability payload for an existing ID. Rotation must run under `BEGIN IMMEDIATE`, validate expected principal before token generation is persisted, revoke only the prior record on normal refresh, append a new record in the same family, and revoke the whole family on refresh replay. Revoke/rotate writes identity events; only family revoke creates terminal session-family outbox. Because v2 was already merged, add immutable migration v3 that rebuilds `outbox_deliveries` from `destination` into closed `target_kind / target_id / stream_seq` columns and proves v2 rows survive the upgrade.
 
 - [ ] **Step 4: Make human command session validation transactional.**
 
-At the start of every `executeHuman`, re-read `sessions.id = context.sessionId` inside the same transaction as the command and require family/account/actor match, unexpired access, and no family revoke. Add the test-only pause immediately after `BEGIN IMMEDIATE` so the revoke-vs-command order is deterministic rather than timing-based.
+At the start of every `executeHuman`, re-read `sessions.access_token_hash = context.sessionId` inside the same transaction as the command and require family/account/actor match, unexpired access, and no family revoke. Because one AuthorityWorker serializes all writes, a revoke cannot overtake a command after that command has begun its transaction. Add the test-only pause after socket authentication but before command enqueue, then commit revoke first; this deterministically proves the other legal serial order without holding a transaction open across test I/O.
 
 Run: `pnpm typecheck && pnpm exec vitest run packages/server/src/auth.test.ts packages/server/src/persistence/sqlite-authoritative-store.test.ts packages/server/src/websocket.test.ts && pnpm lint`
 
@@ -1288,7 +1297,7 @@ Run `gbp.py check --links` once more. Report the six criteria, current claimable
 | 2. Stable event/idempotency | 4, 6 | Sequential/concurrent/cross-restart replay and conflict table |
 | 3. Three-client cursor recovery | 8-13 | Retained/expired cursor suites and three real WebSocket replicas |
 | 4. Durable ACK/outbox crash window | 6, 7, 13 | Four fault points, especially child exit after COMMIT before outbox |
-| 5. Versioned migration | 1, 3 | v1→v2 fixture, injected rollback, import activation crash |
+| 5. Versioned migration | 1, 3, 5 | fresh/v1→v2→v3, existing v2→v3, unknown-target/injected rollback, import activation crash |
 | 6. Permissions and cache-clear restore | 8-13 | Current-state authorization races and all-client cache deletion/rebuild |
 
 - [x] Every one of the six T-0040 criteria maps to at least one production task and one automated test.

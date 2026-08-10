@@ -1,6 +1,11 @@
 import { createHash, randomBytes, scrypt, timingSafeEqual } from "node:crypto";
 import type { Actor } from "@native-im/core";
 import type { StateStore } from "./state-store.js";
+import type {
+  AuthenticatedSessionContext,
+  HashedSessionIssue,
+  SessionAuthority,
+} from "./persistence/contracts.js";
 
 const DEFAULT_ACCESS_TTL_MS = 15 * 60 * 1_000;
 const DEFAULT_REFRESH_TTL_MS = 30 * 24 * 60 * 60 * 1_000;
@@ -74,6 +79,7 @@ export class AuthenticationError extends Error {
 export interface AuthenticationService {
   login(credentials: LoginCredentials): Promise<IssuedSession>;
   authenticate(accessToken: string): Promise<AuthenticatedPrincipal>;
+  authenticateSession(accessToken: string): Promise<AuthenticatedSessionContext>;
   refresh(
     refreshToken: string,
     expectedPrincipal?: AuthenticatedPrincipal,
@@ -104,7 +110,8 @@ export interface SessionState {
 export interface AuthenticationServiceOptions {
   readonly actors: AuthenticationActorDirectory;
   readonly identities: IdentityAdapter;
-  readonly sessions: StateStore<SessionState>;
+  readonly sessions?: StateStore<SessionState>;
+  readonly authority?: SessionAuthority;
   readonly clock?: () => number;
   readonly tokenFactory?: () => string;
   readonly accessTtlMs?: number;
@@ -315,17 +322,20 @@ export function createAuthenticationService(
   if (refreshTtlMs <= 0 || !Number.isFinite(refreshTtlMs)) {
     throw new RangeError("refreshTtlMs must be a positive finite number");
   }
+  if ((options.sessions === undefined) === (options.authority === undefined)) {
+    throw new TypeError("exactly one authentication session authority is required");
+  }
 
   let state: SessionState | undefined;
   let initializationFailure: { readonly error: unknown } | undefined;
-  const initialized = options.sessions.load().then(
+  const initialized = options.sessions?.load().then(
     (loaded) => {
       state = loaded ?? { version: 1, sessions: [] };
     },
     (error: unknown) => {
       initializationFailure = { error };
     },
-  );
+  ) ?? Promise.resolve();
   let operationQueue = Promise.resolve();
 
   function runExclusive<Result>(
@@ -349,8 +359,71 @@ export function createAuthenticationService(
   }
 
   async function persist(nextState: SessionState): Promise<void> {
+    if (options.sessions === undefined) {
+      throw new Error("JSON session persistence is unavailable");
+    }
     await options.sessions.save(nextState);
     state = nextState;
+  }
+
+  function createAuthorityIssue(
+    accountId: string,
+    actorId: string,
+    now: number,
+  ): {
+    readonly issued: IssuedSession;
+    readonly input: HashedSessionIssue;
+  } {
+    const accessToken = tokenFactory();
+    const refreshToken = tokenFactory();
+    if (accessToken.length === 0 || refreshToken.length === 0) {
+      throw new Error("tokenFactory must return non-empty tokens");
+    }
+    const accessTokenHash = hashToken(accessToken);
+    const refreshTokenHash = hashToken(refreshToken);
+    if (accessTokenHash === refreshTokenHash) {
+      throw new Error("tokenFactory produced a duplicate token");
+    }
+    const accessExpiresAt = now + accessTtlMs;
+    const refreshExpiresAt = now + refreshTtlMs;
+    return {
+      input: {
+        accountId,
+        actorId,
+        accessTokenHash,
+        refreshTokenHash,
+        accessExpiresAt,
+        refreshExpiresAt,
+      },
+      issued: {
+        accountId,
+        actorId,
+        accessToken,
+        refreshToken,
+        expiresAt: new Date(accessExpiresAt).toISOString(),
+        refreshExpiresAt: new Date(refreshExpiresAt).toISOString(),
+      },
+    };
+  }
+
+  function translateAuthorityError(error: unknown): never {
+    const code =
+      typeof error === "object" && error !== null && "code" in error
+        ? (error as { readonly code?: unknown }).code
+        : undefined;
+    if (code === "invalid_token") {
+      throw invalidToken();
+    }
+    if (code === "token_expired") {
+      throw new AuthenticationError(401, "token_expired");
+    }
+    if (code === "session_revoked") {
+      throw revokedSession();
+    }
+    if (code === "identity_forbidden") {
+      throw new AuthenticationError(403, "identity_forbidden");
+    }
+    throw error;
   }
 
   function createIssuedRecord(
@@ -437,9 +510,23 @@ export function createAuthenticationService(
         throw new AuthenticationError(401, "invalid_credentials");
       }
 
+      requireHumanActor(identity.actorId);
+      const now = clock();
+      if (options.authority !== undefined) {
+        const authorityIssue = createAuthorityIssue(
+          identity.accountId,
+          identity.actorId,
+          now,
+        );
+        try {
+          await options.authority.issue(authorityIssue.input);
+          return authorityIssue.issued;
+        } catch (error: unknown) {
+          return translateAuthorityError(error);
+        }
+      }
+
       return runExclusive(async (current) => {
-        requireHumanActor(identity.actorId);
-        const now = clock();
         const { issued, record } = createIssuedRecord(
           current,
           identity.accountId,
@@ -453,6 +540,15 @@ export function createAuthenticationService(
     },
 
     authenticate(accessToken: string): Promise<AuthenticatedPrincipal> {
+      if (options.authority !== undefined) {
+        if (accessToken.length === 0) {
+          return Promise.reject(invalidToken());
+        }
+        return options.authority
+          .authenticate(hashToken(accessToken), clock())
+          .then(({ principal }) => principal)
+          .catch((error: unknown) => translateAuthorityError(error));
+      }
       return runExclusive((current) => {
         if (accessToken.length === 0) {
           throw invalidToken();
@@ -477,10 +573,84 @@ export function createAuthenticationService(
       });
     },
 
+    authenticateSession(accessToken: string): Promise<AuthenticatedSessionContext> {
+      if (accessToken.length === 0) {
+        return Promise.reject(invalidToken());
+      }
+      const accessTokenHash = hashToken(accessToken);
+      if (options.authority !== undefined) {
+        return options.authority.authenticate(accessTokenHash, clock()).catch(
+          (error: unknown) => translateAuthorityError(error),
+        );
+      }
+      return runExclusive((current) => {
+        const session = current.sessions.find(
+          (candidate) => candidate.accessTokenHash === accessTokenHash,
+        );
+        if (session === undefined) {
+          throw invalidToken();
+        }
+        requireHumanActor(session.actorId);
+        if (session.revokedAt !== undefined) {
+          throw revokedSession();
+        }
+        if (clock() >= session.accessExpiresAt) {
+          throw new AuthenticationError(401, "token_expired");
+        }
+        return {
+          sessionId: session.accessTokenHash,
+          sessionFamilyId: session.familyId,
+          principal: {
+            accountId: session.accountId,
+            actorId: session.actorId,
+          },
+        };
+      });
+    },
+
     refresh(
       refreshToken: string,
       expectedPrincipal?: AuthenticatedPrincipal,
     ): Promise<IssuedSession> {
+      if (options.authority !== undefined) {
+        const authority = options.authority;
+        if (refreshToken.length === 0) {
+          return Promise.reject(invalidToken());
+        }
+        const now = clock();
+        return authority
+          .validateRefresh(hashToken(refreshToken), expectedPrincipal, now)
+          .then(() => {
+            const accessToken = tokenFactory();
+            const nextRefreshToken = tokenFactory();
+            if (accessToken.length === 0 || nextRefreshToken.length === 0) {
+              throw new Error("tokenFactory must return non-empty tokens");
+            }
+            const accessTokenHash = hashToken(accessToken);
+            const refreshTokenHash = hashToken(nextRefreshToken);
+            if (accessTokenHash === refreshTokenHash) {
+              throw new Error("tokenFactory produced a duplicate token");
+            }
+            return authority.rotate({
+              currentRefreshTokenHash: hashToken(refreshToken),
+              accessTokenHash,
+              refreshTokenHash,
+              accessExpiresAt: now + accessTtlMs,
+              refreshExpiresAt: now + refreshTtlMs,
+              ...(expectedPrincipal === undefined ? {} : { expectedPrincipal }),
+              now,
+            }).then((record) => ({ record, accessToken, nextRefreshToken }));
+          })
+          .then(({ record, accessToken, nextRefreshToken }) => ({
+            accountId: record.accountId,
+            actorId: record.actorId,
+            accessToken,
+            refreshToken: nextRefreshToken,
+            expiresAt: new Date(record.accessExpiresAt).toISOString(),
+            refreshExpiresAt: new Date(record.refreshExpiresAt).toISOString(),
+          }))
+          .catch((error: unknown) => translateAuthorityError(error));
+      }
       return runExclusive(async (current) => {
         if (refreshToken.length === 0) {
           throw invalidToken();
@@ -527,6 +697,14 @@ export function createAuthenticationService(
     },
 
     revoke(accessToken: string): Promise<void> {
+      if (options.authority !== undefined) {
+        if (accessToken.length === 0) {
+          return Promise.reject(invalidToken());
+        }
+        return options.authority
+          .revoke(hashToken(accessToken), clock())
+          .catch((error: unknown) => translateAuthorityError(error));
+      }
       return runExclusive(async (current) => {
         if (accessToken.length === 0) {
           throw invalidToken();

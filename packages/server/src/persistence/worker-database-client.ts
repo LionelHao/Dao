@@ -3,6 +3,7 @@ import { lstat, readdir, readFile, readlink, realpath, stat } from "node:fs/prom
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
+import type { Actor } from "@native-im/core";
 import {
   isAuthorityWorkerResponse,
   type AuthorityWorkerRequest,
@@ -14,19 +15,47 @@ import type {
   LegacyImportRecovery,
   LegacyImportResult,
 } from "./legacy-importer.js";
+import type {
+  AuthenticatedSessionContext,
+  AuthenticatedCommandContext,
+  CommandAcknowledgement,
+  HashedSessionIssue,
+  HashedSessionRotation,
+  HumanCollaborationCommand,
+  IssuedSessionRecord,
+  RoomGovernanceCommand,
+} from "./contracts.js";
 
 export interface CreateWorkerDatabaseClientOptions {
   readonly databasePath: string;
 }
 
 export interface AuthoritySchemaInspection {
-  readonly version: 2;
+  readonly version: 3;
 }
 
 export interface WorkerDatabaseClient {
   inspectSchema(): Promise<AuthoritySchemaInspection>;
   importLegacyState(paths: LegacyImportPaths): Promise<LegacyImportResult>;
   inspectLegacyImport(): Promise<LegacyImportInspection>;
+  registerActors(actors: readonly Actor[]): Promise<number>;
+  issueSession(input: HashedSessionIssue): Promise<IssuedSessionRecord>;
+  authenticateSession(
+    accessTokenHash: string,
+    now: number,
+  ): Promise<AuthenticatedSessionContext>;
+  validateSessionRefresh(
+    currentRefreshTokenHash: string,
+    expectedPrincipal: { readonly accountId: string; readonly actorId: string } | undefined,
+    now: number,
+  ): Promise<void>;
+  rotateSession(input: HashedSessionRotation): Promise<IssuedSessionRecord>;
+  revokeSession(accessTokenHash: string, now: number): Promise<void>;
+  executeHuman(
+    context: AuthenticatedCommandContext,
+    command: HumanCollaborationCommand | RoomGovernanceCommand,
+    now: number,
+  ): Promise<CommandAcknowledgement>;
   close(): Promise<void>;
 }
 
@@ -498,6 +527,158 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
     );
   }
 
+  registerActors(actors: readonly Actor[]): Promise<number> {
+    if (this.#terminalError !== undefined) {
+      return this.#rejectTerminal();
+    }
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) {
+      return Promise.reject(unavailable);
+    }
+    return this.#send({ type: "authority.register-actors", actors }).then(
+      (response) => {
+        if (response.type !== "authority.actors-registered") {
+          this.#failProtocol("Authority worker returned the wrong actor response");
+          throw this.#terminalError;
+        }
+        return response.actorCount;
+      },
+    );
+  }
+
+  issueSession(input: HashedSessionIssue): Promise<IssuedSessionRecord> {
+    if (this.#terminalError !== undefined) {
+      return this.#rejectTerminal();
+    }
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) {
+      return Promise.reject(unavailable);
+    }
+    return this.#send({ type: "authority.session-issue", input }).then(
+      (response) => {
+        if (response.type !== "authority.session-issued") {
+          this.#failProtocol("Authority worker returned the wrong session issue response");
+          throw this.#terminalError;
+        }
+        return response.session;
+      },
+    );
+  }
+
+  authenticateSession(
+    accessTokenHash: string,
+    now: number,
+  ): Promise<AuthenticatedSessionContext> {
+    if (this.#terminalError !== undefined) {
+      return this.#rejectTerminal();
+    }
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) {
+      return Promise.reject(unavailable);
+    }
+    return this.#send({
+      type: "authority.session-authenticate",
+      accessTokenHash,
+      now,
+    }).then((response) => {
+      if (response.type !== "authority.session-authenticated") {
+        this.#failProtocol("Authority worker returned the wrong authentication response");
+        throw this.#terminalError;
+      }
+      return response.context;
+    });
+  }
+
+  rotateSession(input: HashedSessionRotation): Promise<IssuedSessionRecord> {
+    if (this.#terminalError !== undefined) {
+      return this.#rejectTerminal();
+    }
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) {
+      return Promise.reject(unavailable);
+    }
+    return this.#send({ type: "authority.session-rotate", input }).then(
+      (response) => {
+        if (response.type !== "authority.session-rotated") {
+          this.#failProtocol("Authority worker returned the wrong session rotation response");
+          throw this.#terminalError;
+        }
+        return response.session;
+      },
+    );
+  }
+
+  validateSessionRefresh(
+    currentRefreshTokenHash: string,
+    expectedPrincipal: { readonly accountId: string; readonly actorId: string } | undefined,
+    now: number,
+  ): Promise<void> {
+    if (this.#terminalError !== undefined) {
+      return this.#rejectTerminal();
+    }
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) {
+      return Promise.reject(unavailable);
+    }
+    return this.#send({
+      type: "authority.session-validate-refresh",
+      currentRefreshTokenHash,
+      ...(expectedPrincipal === undefined ? {} : { expectedPrincipal }),
+      now,
+    }).then((response) => {
+      if (response.type !== "authority.session-refresh-valid") {
+        this.#failProtocol("Authority worker returned the wrong refresh validation response");
+        throw this.#terminalError;
+      }
+    });
+  }
+
+  revokeSession(accessTokenHash: string, now: number): Promise<void> {
+    if (this.#terminalError !== undefined) {
+      return this.#rejectTerminal();
+    }
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) {
+      return Promise.reject(unavailable);
+    }
+    return this.#send({
+      type: "authority.session-revoke",
+      accessTokenHash,
+      now,
+    }).then((response) => {
+      if (response.type !== "authority.session-revoked") {
+        this.#failProtocol("Authority worker returned the wrong session revoke response");
+        throw this.#terminalError;
+      }
+    });
+  }
+
+  executeHuman(
+    context: AuthenticatedCommandContext,
+    command: HumanCollaborationCommand | RoomGovernanceCommand,
+    now: number,
+  ): Promise<CommandAcknowledgement> {
+    if (this.#terminalError !== undefined) {
+      return this.#rejectTerminal();
+    }
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) {
+      return Promise.reject(unavailable);
+    }
+    return this.#send({
+      type: "authority.execute-human",
+      context,
+      command,
+      now,
+    }).then((response) => {
+      if (response.type !== "authority.command-acknowledged") {
+        this.#failProtocol("Authority worker returned the wrong command response");
+        throw this.#terminalError;
+      }
+      return response.acknowledgement;
+    });
+  }
+
   close(): Promise<void> {
     if (this.#closePromise !== undefined) {
       return this.#closePromise;
@@ -642,6 +823,20 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
         responseType === "authority.legacy-imported") ||
       (requestType === "authority.inspect-legacy-import" &&
         responseType === "authority.legacy-import") ||
+      (requestType === "authority.register-actors" &&
+        responseType === "authority.actors-registered") ||
+      (requestType === "authority.session-issue" &&
+        responseType === "authority.session-issued") ||
+      (requestType === "authority.session-authenticate" &&
+        responseType === "authority.session-authenticated") ||
+      (requestType === "authority.session-rotate" &&
+        responseType === "authority.session-rotated") ||
+      (requestType === "authority.session-validate-refresh" &&
+        responseType === "authority.session-refresh-valid") ||
+      (requestType === "authority.session-revoke" &&
+        responseType === "authority.session-revoked") ||
+      (requestType === "authority.execute-human" &&
+        responseType === "authority.command-acknowledged") ||
       (requestType === "authority.close" && responseType === "authority.closed")
     );
   }

@@ -28,6 +28,49 @@ export interface AuthenticatedSessionContext {
   readonly principal: AuthenticatedPrincipal;
 }
 
+export interface HashedSessionIssue {
+  readonly accountId: string;
+  readonly actorId: string;
+  readonly accessTokenHash: string;
+  readonly refreshTokenHash: string;
+  readonly accessExpiresAt: number;
+  readonly refreshExpiresAt: number;
+}
+
+export interface HashedSessionRotation {
+  readonly currentRefreshTokenHash: string;
+  readonly accessTokenHash: string;
+  readonly refreshTokenHash: string;
+  readonly accessExpiresAt: number;
+  readonly refreshExpiresAt: number;
+  readonly expectedPrincipal?: AuthenticatedPrincipal;
+  readonly now: number;
+}
+
+export interface IssuedSessionRecord {
+  readonly sessionId: string;
+  readonly familyId: string;
+  readonly accountId: string;
+  readonly actorId: string;
+  readonly accessExpiresAt: number;
+  readonly refreshExpiresAt: number;
+}
+
+export interface SessionAuthority {
+  issue(input: HashedSessionIssue): Promise<IssuedSessionRecord>;
+  authenticate(
+    accessTokenHash: string,
+    now: number,
+  ): Promise<AuthenticatedSessionContext>;
+  validateRefresh(
+    currentRefreshTokenHash: string,
+    expectedPrincipal: AuthenticatedPrincipal | undefined,
+    now: number,
+  ): Promise<void>;
+  rotate(input: HashedSessionRotation): Promise<IssuedSessionRecord>;
+  revoke(accessTokenHash: string, now: number): Promise<void>;
+}
+
 export interface AuthenticatedCommandContext extends AuthenticatedSessionContext {
   readonly kind: "human";
   readonly requestId: string;
