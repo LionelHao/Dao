@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.1.0",
   "packageManager": "pnpm@10.14.0",
+  "engines": {
+    "node": ">=22.13"
+  },
   "scripts": {
     "typecheck": "tsc -b && tsc --noEmit -p packages/core/tsconfig.type-test.json",
     "lint": "eslint . --max-warnings=0",
@@ -21,4 +24,3 @@
     "vitest": "^3.2.4"
   }
 }
-
