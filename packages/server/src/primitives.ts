@@ -1,59 +1,33 @@
-import type { Actor, AgentActor, AgentReadiness, HumanActor, Message, Room } from "@native-im/core";
+import type {
+  Actor,
+  AgentActor,
+  AgentExecution,
+  AgentExecutionStatus,
+  AgentJudgement,
+  AgentJudgementOutcome,
+  AgentReadiness,
+  CalibrationSignal,
+  HumanActor,
+  HumanReadReceipt,
+  Message,
+  OpenItem,
+  OpenItemTransfer,
+  Room,
+  SocialReaction,
+} from "@native-im/core";
 
-export interface HumanReadReceipt {
-  readonly id: string;
-  readonly messageId: string;
-  readonly readerId: string;
-  readonly readAt: string;
-}
-
-export type AgentJudgementOutcome = "will_respond" | "no_response_needed" | "suppressed";
-
-export interface AgentJudgement {
-  readonly id: string;
-  readonly messageId: string;
-  readonly agentId: string;
-  readonly outcome: AgentJudgementOutcome;
-  readonly reason: string;
-  readonly decidedAt: string;
-}
-
-export type OpenItemStatus = "pending_response" | "responded" | "deferred" | "transferred";
-
-export interface OpenItemTransfer {
-  readonly fromId: string;
-  readonly toId: string;
-  readonly reason: string;
-  readonly transferredAt: string;
-}
-
-export interface OpenItem {
-  readonly id: string;
-  readonly roomId: string;
-  readonly sourceMessageId: string;
-  readonly requesterId: string;
-  readonly ownerId: string;
-  readonly content: string;
-  readonly status: OpenItemStatus;
-  readonly createdAt: string;
-  readonly respondedAt?: string;
-  readonly transferChain: readonly OpenItemTransfer[];
-}
-
-export type AgentExecutionStatus = "running" | "completed" | "interrupted" | "failed";
-
-export interface AgentExecution {
-  readonly id: string;
-  readonly roomId: string;
-  readonly sourceMessageId: string;
-  readonly requesterId: string;
-  readonly agentId: string;
-  readonly toolName: string;
-  readonly status: AgentExecutionStatus;
-  readonly startedAt: string;
-  readonly completedAt?: string;
-  readonly result?: string;
-}
+export type {
+  AgentExecution,
+  AgentExecutionStatus,
+  AgentJudgement,
+  AgentJudgementOutcome,
+  CalibrationSignal,
+  HumanReadReceipt,
+  OpenItem,
+  OpenItemStatus,
+  OpenItemTransfer,
+  SocialReaction,
+} from "@native-im/core";
 
 export interface AgentToolInvocation {
   readonly agentId: string;
@@ -78,23 +52,6 @@ export interface MessageState {
   readonly body: string;
   readonly edited: boolean;
   readonly recalled: boolean;
-}
-
-export interface SocialReaction {
-  readonly id: string;
-  readonly sourceMessageId: string;
-  readonly actorId: string;
-  readonly emoji: string;
-  readonly createdAt: string;
-}
-
-export interface CalibrationSignal {
-  readonly id: string;
-  readonly sourceMessageId: string;
-  readonly actorId: string;
-  readonly agentId: string;
-  readonly emoji: "👍" | "👎";
-  readonly createdAt: string;
 }
 
 export type PrimitiveErrorCode =

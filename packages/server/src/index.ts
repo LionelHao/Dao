@@ -115,3 +115,25 @@ export type {
   CreateWorkerDatabaseClientOptions,
   WorkerDatabaseClient,
 } from "./persistence/worker-database-client.js";
+export {
+  parsePersistedIdentityEvent,
+  parsePersistedRoomEvent,
+  parsePersistentCommand,
+} from "./persistence/contracts.js";
+export type {
+  AgentCollaborationCommand,
+  AgentPrincipal,
+  AuthenticatedCommandContext,
+  AuthenticatedSessionContext,
+  CollaborationCommand,
+  CommandAcknowledgement,
+  CommandStore,
+  ContractParseResult,
+  HumanCollaborationCommand,
+  InternalAgentCommandContext,
+  JsonValue,
+  OutboxDelivery,
+  PersistentCommand,
+  RoomGovernanceCommand,
+  SyncQueryStore,
+} from "./persistence/contracts.js";

@@ -1,0 +1,350 @@
+import type {
+  Actor,
+  AgentRoomMembership,
+  HumanRoomMembership,
+  HumanRoomRole,
+  ManagedRoom,
+  Message,
+  RoomStatus,
+} from "./index.js";
+import {
+  isAgentExecution,
+  isAgentJudgement,
+  isCalibrationSignal,
+  isHumanReadReceipt,
+  isOpenItem,
+  type AgentExecution,
+  type AgentJudgement,
+  type CalibrationSignal,
+  type HumanReadReceipt,
+  type OpenItem,
+} from "./collaboration.js";
+
+export interface RoomSummary {
+  readonly roomId: string;
+  readonly name: string;
+  readonly status: RoomStatus;
+  readonly role: HumanRoomRole;
+}
+
+export type SnapshotDeliveryMode =
+  | { readonly mode: "materialized"; readonly expiresAt: string; readonly idleExpiresAt?: never }
+  | { readonly mode: "streaming"; readonly idleExpiresAt: string; readonly expiresAt?: never };
+
+export type RoomRepairRecord =
+  | { readonly kind: "room"; readonly value: Omit<ManagedRoom, "members"> }
+  | { readonly kind: "membership"; readonly value: HumanRoomMembership | AgentRoomMembership }
+  | { readonly kind: "message"; readonly value: Message }
+  | { readonly kind: "human-read"; readonly value: HumanReadReceipt }
+  | { readonly kind: "agent-judgement"; readonly value: AgentJudgement }
+  | { readonly kind: "open-item"; readonly value: OpenItem }
+  | { readonly kind: "agent-execution"; readonly value: AgentExecution }
+  | { readonly kind: "calibration"; readonly value: CalibrationSignal };
+
+export type SnapshotVersion =
+  | { readonly kind: "room"; readonly roomId: string; readonly watermark: number }
+  | { readonly kind: "catalog"; readonly catalogRevision: number };
+
+export type WorkspaceBootstrapPage = {
+  readonly type: "workspace.bootstrap.page";
+  readonly requestId: string;
+  readonly snapshotId: string;
+  readonly page: number;
+  readonly rooms: readonly RoomSummary[];
+  readonly catalogRevision: number;
+  readonly snapshotChecksum: string;
+  readonly hasMore: boolean;
+} & SnapshotDeliveryMode;
+
+export type RoomRepairPage = {
+  readonly type: "room.repair.page";
+  readonly requestId: string;
+  readonly snapshotId: string;
+  readonly roomId: string;
+  readonly page: number;
+  readonly records: readonly RoomRepairRecord[];
+  readonly watermark: number;
+  readonly snapshotChecksum: string;
+  readonly hasMore: boolean;
+} & SnapshotDeliveryMode;
+
+export interface SnapshotCompleted {
+  readonly type: "snapshot.completed";
+  readonly requestId: string;
+  readonly snapshotId: string;
+  readonly version: SnapshotVersion;
+}
+
+export interface RoomCursor {
+  readonly version: 1;
+  readonly roomId: string;
+  readonly afterSeq: number;
+}
+
+export interface RoomSyncRequest {
+  readonly type: "room.sync";
+  readonly requestId: string;
+  readonly roomId: string;
+  readonly cursor?: RoomCursor;
+  readonly limit?: number;
+}
+
+interface PersistedEventBase {
+  readonly eventId: string;
+  readonly streamSeq: number;
+  readonly actorId: string;
+  readonly occurredAt: string;
+}
+
+type RoomEvent<TType extends string, TPayload> = PersistedEventBase & {
+  readonly streamKind: "room";
+  readonly streamId: string;
+  readonly roomId: string;
+  readonly type: TType;
+  readonly payload: TPayload;
+};
+
+export type PersistedRoomEvent =
+  | RoomEvent<"room.created" | "room.renamed" | "room.archived", { readonly room: ManagedRoom }>
+  | RoomEvent<"human.invitation.issued", { readonly invitationId: string; readonly inviteeActorId: string }>
+  | RoomEvent<"human.invitation.accepted", { readonly invitationId: string; readonly membership: HumanRoomMembership }>
+  | RoomEvent<"human.invitation.rejected", { readonly invitationId: string; readonly targetActorId: string }>
+  | RoomEvent<"human.role.changed", { readonly membership: HumanRoomMembership }>
+  | RoomEvent<"member.removed", { readonly targetActorId: string }>
+  | RoomEvent<"agent.configured", { readonly membership: AgentRoomMembership }>
+  | RoomEvent<"room.message.accepted", Message>
+  | RoomEvent<"room.human_read.recorded", HumanReadReceipt>
+  | RoomEvent<"room.agent_judgment.recorded", AgentJudgement>
+  | RoomEvent<"room.open_item.changed", OpenItem>
+  | RoomEvent<"room.agent_execution.changed", AgentExecution>
+  | RoomEvent<"room.calibration.recorded", CalibrationSignal>;
+
+type IdentityEvent<TType extends string, TPayload> = PersistedEventBase & {
+  readonly streamKind: "identity";
+  readonly streamId: string;
+  readonly roomId?: never;
+  readonly type: TType;
+  readonly payload: TPayload;
+};
+
+export type PersistedIdentityEvent =
+  | IdentityEvent<"identity.actor.registered", { readonly actor: Actor }>
+  | IdentityEvent<
+      "identity.session.issued" | "identity.session.rotated" | "identity.session.revoked",
+      { readonly sessionId: string; readonly familyId: string; readonly accountId: string }
+    >
+  | IdentityEvent<
+      "identity.room-access.changed",
+      { readonly roomId: string; readonly change: "joined" | "updated" | "removed" | "archived" }
+    >;
+
+export type RoomSyncResult =
+  | {
+      readonly type: "room.sync.result";
+      readonly requestId: string;
+      readonly mode: "delta";
+      readonly events: readonly PersistedRoomEvent[];
+      readonly nextCursor: RoomCursor;
+      readonly watermark: number;
+      readonly hasMore: boolean;
+    }
+  | {
+      readonly type: "room.sync.result";
+      readonly requestId: string;
+      readonly mode: "repair_required";
+      readonly reason: "cursor_absent" | "cursor_expired";
+      readonly retainedFromSeq: number;
+      readonly watermark: number;
+    };
+
+type UnknownRecord = Record<string, unknown>;
+
+function isRecord(value: unknown): value is UnknownRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function exact(value: UnknownRecord, required: readonly string[], optional: readonly string[] = []): boolean {
+  const allowed = new Set([...required, ...optional]);
+  return required.every((key) => Object.hasOwn(value, key)) && Object.keys(value).every((key) => allowed.has(key));
+}
+
+function text(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function count(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isRoomSummary(value: unknown): value is RoomSummary {
+  return isRecord(value) && exact(value, ["roomId", "name", "status", "role"]) &&
+    text(value.roomId) && text(value.name) &&
+    (value.status === "active" || value.status === "archived") &&
+    (value.role === "owner" || value.role === "admin" || value.role === "member");
+}
+
+function stringList(value: unknown): value is readonly string[] {
+  return Array.isArray(value) && value.length > 0 && value.every(text) && new Set(value).size === value.length;
+}
+
+function isHumanMembershipValue(value: unknown): value is HumanRoomMembership {
+  return isRecord(value) && exact(value, ["kind", "actorId", "role", "joinedAt"]) && value.kind === "human" &&
+    text(value.actorId) && (value.role === "owner" || value.role === "admin" || value.role === "member") && text(value.joinedAt);
+}
+
+function isAgentMembershipValue(value: unknown): value is AgentRoomMembership {
+  return isRecord(value) && exact(value, ["kind", "actorId", "participation", "toolPermissions", "configuredAt"]) &&
+    value.kind === "agent" && text(value.actorId) &&
+    (value.participation === "active" || value.participation === "on-mention" || value.participation === "silent") &&
+    stringList(value.toolPermissions) && text(value.configuredAt);
+}
+
+function isMessageValue(value: unknown): value is Message {
+  return isRecord(value) && exact(value, ["id", "roomId", "authorId", "authorKind", "body", "sentAt"]) &&
+    text(value.id) && text(value.roomId) && text(value.authorId) &&
+    (value.authorKind === "human" || value.authorKind === "agent") && text(value.body) && text(value.sentAt);
+}
+
+function isRoomMetadata(value: unknown): value is Omit<ManagedRoom, "members"> {
+  return isRecord(value) && exact(value, ["id", "name", "status", "createdAt"]) && text(value.id) && text(value.name) &&
+    (value.status === "active" || value.status === "archived") && text(value.createdAt);
+}
+
+function isManagedRoomValue(value: unknown): value is ManagedRoom {
+  return isRecord(value) && exact(value, ["id", "name", "status", "members", "createdAt"]) &&
+    text(value.id) && text(value.name) && (value.status === "active" || value.status === "archived") &&
+    Array.isArray(value.members) && value.members.every((entry) => isHumanMembershipValue(entry) || isAgentMembershipValue(entry)) &&
+    text(value.createdAt);
+}
+
+function isDeliveryMode(value: UnknownRecord): boolean {
+  return value.mode === "materialized"
+    ? text(value.expiresAt) && !Object.hasOwn(value, "idleExpiresAt")
+    : value.mode === "streaming" && text(value.idleExpiresAt) && !Object.hasOwn(value, "expiresAt");
+}
+
+export function isRoomCursor(value: unknown): value is RoomCursor {
+  return isRecord(value) && exact(value, ["version", "roomId", "afterSeq"]) &&
+    value.version === 1 && text(value.roomId) && count(value.afterSeq);
+}
+
+export function isSnapshotVersion(value: unknown): value is SnapshotVersion {
+  return isRecord(value) && (
+    (exact(value, ["kind", "roomId", "watermark"]) && value.kind === "room" && text(value.roomId) && count(value.watermark)) ||
+    (exact(value, ["kind", "catalogRevision"]) && value.kind === "catalog" && count(value.catalogRevision))
+  );
+}
+
+export function isSnapshotCompleted(value: unknown): value is SnapshotCompleted {
+  return isRecord(value) && exact(value, ["type", "requestId", "snapshotId", "version"]) &&
+    value.type === "snapshot.completed" && text(value.requestId) && text(value.snapshotId) &&
+    isSnapshotVersion(value.version);
+}
+
+function isRepairRecord(value: unknown): value is RoomRepairRecord {
+  if (!isRecord(value) || !exact(value, ["kind", "value"])) {
+    return false;
+  }
+  if (value.kind === "human-read") return isHumanReadReceipt(value.value);
+  if (value.kind === "agent-judgement") return isAgentJudgement(value.value);
+  if (value.kind === "open-item") return isOpenItem(value.value);
+  if (value.kind === "agent-execution") return isAgentExecution(value.value);
+  if (value.kind === "calibration") return isCalibrationSignal(value.value);
+  if (value.kind === "room") return isRoomMetadata(value.value);
+  if (value.kind === "membership") return isHumanMembershipValue(value.value) || isAgentMembershipValue(value.value);
+  return value.kind === "message" && isMessageValue(value.value);
+}
+
+function isPersistedRoomEventValue(value: unknown): value is PersistedRoomEvent {
+  if (!isRecord(value) || !exact(
+    value,
+    ["eventId", "streamKind", "streamId", "streamSeq", "roomId", "actorId", "occurredAt", "type", "payload"],
+  ) || value.streamKind !== "room" || !text(value.eventId) || !text(value.streamId) || value.streamId !== value.roomId ||
+    !count(value.streamSeq) || value.streamSeq === 0 || !text(value.actorId) || !text(value.occurredAt) || !isRecord(value.payload)) {
+    return false;
+  }
+  const payload = value.payload;
+  if (value.type === "room.created" || value.type === "room.renamed" || value.type === "room.archived") {
+    return exact(payload, ["room"]) && isManagedRoomValue(payload.room) && payload.room.id === value.roomId;
+  }
+  if (value.type === "human.invitation.issued") {
+    return exact(payload, ["invitationId", "inviteeActorId"]) && text(payload.invitationId) && text(payload.inviteeActorId);
+  }
+  if (value.type === "human.invitation.accepted") {
+    return exact(payload, ["invitationId", "membership"]) && text(payload.invitationId) && isHumanMembershipValue(payload.membership);
+  }
+  if (value.type === "human.invitation.rejected") {
+    return exact(payload, ["invitationId", "targetActorId"]) && text(payload.invitationId) && text(payload.targetActorId);
+  }
+  if (value.type === "human.role.changed") {
+    return exact(payload, ["membership"]) && isHumanMembershipValue(payload.membership);
+  }
+  if (value.type === "member.removed") {
+    return exact(payload, ["targetActorId"]) && text(payload.targetActorId);
+  }
+  if (value.type === "agent.configured") {
+    return exact(payload, ["membership"]) && isAgentMembershipValue(payload.membership);
+  }
+  if (value.type === "room.message.accepted") {
+    return isMessageValue(payload) && payload.roomId === value.roomId && payload.authorId === value.actorId;
+  }
+  if (value.type === "room.human_read.recorded") {
+    return isHumanReadReceipt(payload) && payload.readerId === value.actorId;
+  }
+  if (value.type === "room.agent_judgment.recorded") {
+    return isAgentJudgement(payload) && payload.agentId === value.actorId;
+  }
+  if (value.type === "room.open_item.changed") {
+    return isOpenItem(payload) && payload.roomId === value.roomId;
+  }
+  if (value.type === "room.agent_execution.changed") {
+    return isAgentExecution(payload) && payload.roomId === value.roomId && payload.agentId === value.actorId;
+  }
+  return value.type === "room.calibration.recorded" && isCalibrationSignal(payload) && payload.actorId === value.actorId;
+}
+
+export function isWorkspaceBootstrapPage(value: unknown): value is WorkspaceBootstrapPage {
+  return isRecord(value) &&
+    exact(
+      value,
+      ["type", "requestId", "snapshotId", "page", "rooms", "catalogRevision", "snapshotChecksum", "hasMore", "mode"],
+      ["expiresAt", "idleExpiresAt"],
+    ) &&
+    value.type === "workspace.bootstrap.page" && text(value.requestId) && text(value.snapshotId) && count(value.page) &&
+    Array.isArray(value.rooms) && value.rooms.every(isRoomSummary) && count(value.catalogRevision) &&
+    text(value.snapshotChecksum) && typeof value.hasMore === "boolean" && isDeliveryMode(value);
+}
+
+export function isRoomRepairPage(value: unknown): value is RoomRepairPage {
+  return isRecord(value) &&
+    exact(
+      value,
+      ["type", "requestId", "snapshotId", "roomId", "page", "records", "watermark", "snapshotChecksum", "hasMore", "mode"],
+      ["expiresAt", "idleExpiresAt"],
+    ) &&
+    value.type === "room.repair.page" && text(value.requestId) && text(value.snapshotId) && text(value.roomId) && count(value.page) &&
+    Array.isArray(value.records) && value.records.every(isRepairRecord) && count(value.watermark) &&
+    text(value.snapshotChecksum) && typeof value.hasMore === "boolean" && isDeliveryMode(value);
+}
+
+export function isRoomSyncResult(value: unknown): value is RoomSyncResult {
+  if (!isRecord(value) || value.type !== "room.sync.result" || !text(value.requestId)) {
+    return false;
+  }
+  if (value.mode === "repair_required") {
+    return exact(value, ["type", "requestId", "mode", "reason", "retainedFromSeq", "watermark"]) &&
+      (value.reason === "cursor_absent" || value.reason === "cursor_expired") &&
+      count(value.retainedFromSeq) && count(value.watermark);
+  }
+  if (value.mode === "delta") {
+    const nextCursor = value.nextCursor;
+    if (!exact(value, ["type", "requestId", "mode", "events", "nextCursor", "watermark", "hasMore"]) ||
+      !Array.isArray(value.events) || !isRoomCursor(nextCursor) || !count(value.watermark) ||
+      typeof value.hasMore !== "boolean") {
+      return false;
+    }
+    return value.events.every(isPersistedRoomEventValue) &&
+      value.events.every((event) => event.roomId === nextCursor.roomId);
+  }
+  return false;
+}
