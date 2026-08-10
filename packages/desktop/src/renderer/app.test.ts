@@ -15,6 +15,7 @@ type RendererUnderTest = {
     actorsById: ReadonlyMap<string, unknown>,
   ) => void;
   renderVisualSeparationPreview?: (root: HTMLElement) => void;
+  renderM2PrimitivesPreview?: (root: HTMLElement) => void;
   renderRoomJoinReview?: (root: HTMLElement) => void;
   renderRoomJoinControls?: (
     root: HTMLElement,
@@ -39,6 +40,61 @@ describe("empty group chat renderer", () => {
     expect(root.querySelector("[data-testid='empty-group-chat']")).not.toBeNull();
     expect(root.textContent).toContain("还没有消息");
     expect(root.textContent).toContain("邀请真人或编制 agent 后开始协作");
+  });
+});
+
+describe("verified collaboration primitive renderer", () => {
+  it("T-0012 separates human reads from explainable agent judgements", () => {
+    const root = document.createElement("main");
+
+    expect(app.renderM2PrimitivesPreview).toBeTypeOf("function");
+    app.renderM2PrimitivesPreview?.(root);
+
+    const humanRead = root.querySelector("[data-receipt-kind='human-read']");
+    const agentContent = root.querySelector<HTMLElement>("[data-message-kind='agent'] .message-content");
+    const judgements = agentContent?.querySelectorAll(".agent-judgement");
+    expect(humanRead?.classList.contains("human-read-receipt")).toBe(true);
+    expect(humanRead?.textContent).toContain("周安全、陈研发");
+    expect(judgements).toHaveLength(3);
+    expect(judgements?.[0]?.textContent).toContain("未命中我的领域");
+    expect(judgements?.[2]?.textContent).toContain("同话题冷却期内，还剩 7 分钟");
+    expect(root.querySelectorAll("[data-message-kind='agent'] > .agent-judgement")).toHaveLength(0);
+  });
+
+  it("T-0013 distinguishes request and invocation mentions and exposes interruption", () => {
+    const root = document.createElement("main");
+
+    app.renderM2PrimitivesPreview?.(root);
+
+    const humanMention = root.querySelector(".mention--human");
+    const agentMention = root.querySelector(".mention--agent");
+    const interrupt = root.querySelector<HTMLButtonElement>("[data-testid='interrupt-agent-execution']");
+    expect(humanMention?.classList.contains("mention--agent")).toBe(false);
+    expect(agentMention?.classList.contains("mention--human")).toBe(false);
+    expect(root.querySelector("[data-open-item-status='transferred']")?.textContent).toContain("周安全 → 陈研发");
+    expect(root.textContent).toContain("@all 只调用 Agent");
+    expect(root.textContent).toContain("@here 仅群主可用");
+    expect(root.querySelector("[data-agent-invocation] [data-action='reject']")).toBeNull();
+
+    interrupt?.click();
+
+    expect(root.querySelector("[data-agent-invocation]")?.getAttribute("data-execution-status")).toBe("interrupted");
+    expect(root.querySelector("[data-member-id='agent-data']")?.textContent).toBe("可用");
+  });
+
+  it("T-0014 exposes human mutation controls, append-only correction, and separate calibration", () => {
+    const root = document.createElement("main");
+
+    app.renderM2PrimitivesPreview?.(root);
+
+    expect(root.querySelector("[data-message-kind='human'] [data-action='edit']")).not.toBeNull();
+    expect(root.querySelector("[data-message-kind='human'] [data-action='recall']")).not.toBeNull();
+    expect(root.querySelector("[data-message-kind='agent'] [data-action='edit']")).toBeNull();
+    expect(root.querySelector("[data-message-kind='agent'] [data-action='recall']")).toBeNull();
+    expect(root.querySelector("[data-correction-for='preview-agent-data']")?.textContent)
+      .toContain("原消息保留不变，更正追加在后");
+    expect(root.querySelector("[data-reaction-kind='social']")?.textContent).toContain("纯社交");
+    expect(root.querySelector("[data-reaction-kind='calibration']")?.textContent).toContain("校准");
   });
 });
 

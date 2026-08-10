@@ -891,3 +891,145 @@ export function renderRoomJoinReview(root: HTMLElement): void {
   root.setAttribute("aria-label", "添加房间参与者");
   root.replaceChildren(review);
 }
+
+function primitiveElement<K extends keyof HTMLElementTagNameMap>(
+  tagName: K,
+  className?: string,
+  text?: string,
+): HTMLElementTagNameMap[K] {
+  const node = document.createElement(tagName);
+  if (className !== undefined) {
+    node.className = className;
+  }
+  if (text !== undefined) {
+    node.textContent = text;
+  }
+  return node;
+}
+
+function appendPrimitiveButton(parent: HTMLElement, label: string, action: string): HTMLButtonElement {
+  const button = primitiveElement("button", "primitive-action", label);
+  button.type = "button";
+  button.dataset.action = action;
+  parent.append(button);
+  return button;
+}
+
+function appendReceiptRecords(humanMessage: HTMLElement, agentMessage: HTMLElement): void {
+  const humanRead = primitiveElement("div", "human-read-receipt", "✓✓ 已读：周安全、陈研发");
+  const agentContent = agentMessage.querySelector<HTMLElement>(".message-content");
+  if (agentContent === null) {
+    throw new Error("Agent judgement requires a message content column.");
+  }
+  humanRead.dataset.receiptKind = "human-read";
+  humanMessage.append(humanRead);
+
+  for (const [status, reason] of [
+    ["无需回应", "未命中我的领域"],
+    ["将回应", "命中领域，准备回应"],
+    ["被抑制", "同话题冷却期内，还剩 7 分钟"],
+  ] as const) {
+    const judgement = primitiveElement("div", "agent-judgement", `已判定 · ${status} · ${reason}`);
+    judgement.dataset.receiptKind = "agent-judgement";
+    agentContent.append(judgement);
+  }
+}
+
+function appendAddressingPreview(container: HTMLElement): void {
+  const section = primitiveElement("section", "addressing-preview");
+  const humanLine = primitiveElement("p", "addressing-line");
+  const humanMention = primitiveElement("span", "mention mention--human", "@周安全");
+  const agentLine = primitiveElement("p", "addressing-line");
+  const agentMention = primitiveElement("span", "mention mention--agent", "@数据 Agent");
+  const openItem = primitiveElement("div", "open-item", "待答项 · 周安全 → 陈研发 · 已转交");
+  const invocation = primitiveElement("div", "agent-invocation", "数据 Agent 正在调用 warehouse.query");
+  const status = primitiveElement("span", "member-status-label", "执行中");
+  const interrupt = appendPrimitiveButton(invocation, "中断", "interrupt");
+  const audience = primitiveElement("p", "audience-addressing", "@all 只调用 Agent · @here 仅群主可用且有频率限制");
+
+  humanLine.append(humanMention, document.createTextNode(" 请确认权限边界（请求，可搁置、可转交）"));
+  agentLine.append(agentMention, document.createTextNode(" 拉取失败记录（调用，必响应、可中断）"));
+  openItem.dataset.openItemStatus = "transferred";
+  invocation.dataset.agentInvocation = "agent-data";
+  invocation.dataset.executionStatus = "running";
+  status.dataset.memberId = "agent-data";
+  interrupt.dataset.testid = "interrupt-agent-execution";
+  interrupt.addEventListener("click", () => {
+    invocation.dataset.executionStatus = "interrupted";
+    invocation.firstChild!.textContent = "数据 Agent 已中断";
+    status.textContent = "可用";
+    interrupt.remove();
+  });
+  section.append(humanLine, agentLine, openItem, invocation, status, audience);
+  container.append(section);
+}
+
+function appendReactionAndCorrectionPreview(container: HTMLElement): void {
+  const correction = primitiveElement(
+    "aside",
+    "agent-correction",
+    "更正 · 复核后为 36 条，其中 2 条重复计数。原消息保留不变，更正追加在后",
+  );
+  const social = primitiveElement("span", "reaction reaction--social", "👍 纯社交");
+  const calibration = primitiveElement("span", "reaction reaction--calibration", "👎 校准：影响后续发言判定");
+
+  correction.dataset.correctionFor = "preview-agent-data";
+  social.dataset.reactionKind = "social";
+  calibration.dataset.reactionKind = "calibration";
+  container.append(correction, social, calibration);
+}
+
+export function renderM2PrimitivesPreview(root: HTMLElement): void {
+  const preview = primitiveElement("main", "m2-primitives-preview");
+  const heading = primitiveElement("h1", undefined, "原生人机协作 IM · 已验收原语预览");
+  const timelineRoot = primitiveElement("div", "m2-primitives-timeline");
+  const messages: readonly Message[] = [
+    {
+      id: "preview-human-mention",
+      roomId: "preview-room",
+      authorId: "human-li",
+      authorKind: "human",
+      body: "请周安全确认权限边界。",
+      sentAt: "2026-08-08T10:00:00.000Z",
+    },
+    {
+      id: "preview-agent-data",
+      roomId: "preview-room",
+      authorId: "agent-data",
+      authorKind: "agent",
+      body: "归因完成：50 条中 38 条属召回问题。",
+      sentAt: "2026-08-08T10:01:00.000Z",
+    },
+  ];
+  const actorsById = new Map<string, Actor>([
+    ["human-li", { id: "human-li", kind: "human", displayName: "李乐", reachability: "online" }],
+    [
+      "agent-data",
+      {
+        id: "agent-data",
+        kind: "agent",
+        displayName: "数据 Agent",
+        readiness: "busy",
+        toolPermissions: ["warehouse.query"],
+      },
+    ],
+  ]);
+
+  renderMessageTimeline(timelineRoot, messages, actorsById);
+  const humanMessage = timelineRoot.querySelector<HTMLElement>("[data-message-kind='human']");
+  const agentMessage = timelineRoot.querySelector<HTMLElement>("[data-message-kind='agent']");
+  if (humanMessage === null || agentMessage === null) {
+    throw new Error("Primitive preview requires both message forms.");
+  }
+  const humanActions = primitiveElement("div", "message-actions message-actions--human");
+  appendPrimitiveButton(humanActions, "编辑", "edit");
+  appendPrimitiveButton(humanActions, "撤回", "recall");
+  humanMessage.append(humanActions);
+  appendReceiptRecords(humanMessage, agentMessage);
+  appendAddressingPreview(timelineRoot);
+  appendReactionAndCorrectionPreview(timelineRoot);
+  preview.append(heading, timelineRoot);
+  root.dataset.testid = "m2-primitives-review";
+  root.setAttribute("aria-label", "已验收人机协作原语预览");
+  root.replaceChildren(preview);
+}
