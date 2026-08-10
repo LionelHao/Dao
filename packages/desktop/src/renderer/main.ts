@@ -1,5 +1,6 @@
 import {
   renderEmptyGroupChat,
+  renderM2PrimitivesPreview,
   renderRoomJoinReview,
   renderVisualSeparationPreview,
 } from "./app.js";
@@ -12,7 +13,9 @@ if (root === null) {
 
 const reviewRoute = new URLSearchParams(window.location.search);
 
-if (reviewRoute.has("join-review")) {
+if (reviewRoute.has("m2-primitives")) {
+  renderM2PrimitivesPreview(root);
+} else if (reviewRoute.has("join-review")) {
   renderRoomJoinReview(root);
 } else if (reviewRoute.has("visual-review")) {
   renderVisualSeparationPreview(root);

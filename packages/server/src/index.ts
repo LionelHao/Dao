@@ -86,3 +86,23 @@ export {
   startMessageWebSocketServer,
 } from "./websocket.js";
 export type { MessageWebSocketServer, StartMessageWebSocketServerOptions } from "./websocket.js";
+export { CollaborationPrimitiveError, createCollaborationPrimitives } from "./primitives.js";
+export type {
+  AgentCorrection,
+  AgentExecution,
+  AgentExecutionStatus,
+  AgentJudgement,
+  AgentJudgementOutcome,
+  AgentToolInvocation,
+  AgentToolInvoker,
+  CalibrationSignal,
+  CollaborationPrimitives,
+  CollaborationPrimitivesOptions,
+  HumanReadReceipt,
+  MessageState,
+  OpenItem,
+  OpenItemStatus,
+  OpenItemTransfer,
+  PrimitiveErrorCode,
+  SocialReaction,
+} from "./primitives.js";
