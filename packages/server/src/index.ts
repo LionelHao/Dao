@@ -106,3 +106,12 @@ export type {
   PrimitiveErrorCode,
   SocialReaction,
 } from "./primitives.js";
+export {
+  AuthorityWorkerClientError,
+  createWorkerDatabaseClient,
+} from "./persistence/worker-database-client.js";
+export type {
+  AuthoritySchemaInspection,
+  CreateWorkerDatabaseClientOptions,
+  WorkerDatabaseClient,
+} from "./persistence/worker-database-client.js";
