@@ -1,4 +1,5 @@
-import { lstat, readlink, realpath, stat } from "node:fs/promises";
+import type { BigIntStats } from "node:fs";
+import { lstat, readdir, readFile, readlink, realpath, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
@@ -7,6 +8,12 @@ import {
   type AuthorityWorkerRequest,
   type AuthorityWorkerResponse,
 } from "./worker-protocol.js";
+import type {
+  LegacyImportInspection,
+  LegacyImportPaths,
+  LegacyImportRecovery,
+  LegacyImportResult,
+} from "./legacy-importer.js";
 
 export interface CreateWorkerDatabaseClientOptions {
   readonly databasePath: string;
@@ -18,6 +25,8 @@ export interface AuthoritySchemaInspection {
 
 export interface WorkerDatabaseClient {
   inspectSchema(): Promise<AuthoritySchemaInspection>;
+  importLegacyState(paths: LegacyImportPaths): Promise<LegacyImportResult>;
+  inspectLegacyImport(): Promise<LegacyImportInspection>;
   close(): Promise<void>;
 }
 
@@ -43,10 +52,19 @@ interface PendingRequest {
   readonly reject: (error: AuthorityWorkerClientError) => void;
 }
 
+type AuthorityWorkerCommand = AuthorityWorkerRequest extends infer Request
+  ? Request extends AuthorityWorkerRequest
+    ? Omit<Request, "requestId">
+    : never
+  : never;
+
 type ClientState = "initializing" | "open" | "closing" | "closed" | "failed";
 
 const authorityCoordinatorPaths = new Set<string>();
 const MAX_DATABASE_SYMLINK_DEPTH = 32;
+const MAX_RECOVERY_MANIFEST_BYTES = 1_024n;
+const RECOVERY_NONCE_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 function databasePathResolutionError(): AuthorityWorkerClientError {
   return new AuthorityWorkerClientError(
@@ -63,11 +81,160 @@ function isMissingPathError(error: unknown): boolean {
   return code === "ENOENT" || code === "ENOTDIR";
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasExactKeys(
+  value: Record<string, unknown>,
+  expectedKeys: readonly string[],
+): boolean {
+  const actualKeys = Object.keys(value).sort();
+  const sortedExpectedKeys = [...expectedKeys].sort();
+  return (
+    actualKeys.length === sortedExpectedKeys.length &&
+    actualKeys.every((key, index) => key === sortedExpectedKeys[index])
+  );
+}
+
+async function controlledLegacyRecovery(
+  databasePath: string,
+  databaseMetadata: BigIntStats | undefined,
+): Promise<LegacyImportRecovery | undefined> {
+  let entries: readonly string[];
+  try {
+    entries = await readdir(dirname(databasePath));
+  } catch (error: unknown) {
+    if (isMissingPathError(error)) {
+      return undefined;
+    }
+    throw databasePathResolutionError();
+  }
+  const recoveryPrefix = `.${basename(databasePath)}.`;
+  const recoverySuffix = ".legacy-import.recovery.json";
+  const recoveryFileNames = entries.filter(
+    (entry) => entry.startsWith(recoveryPrefix) && entry.endsWith(recoverySuffix),
+  );
+  if (recoveryFileNames.length === 0) {
+    return undefined;
+  }
+  if (recoveryFileNames.length !== 1) {
+    throw databasePathResolutionError();
+  }
+
+  const recoveryFileName = recoveryFileNames[0];
+  if (recoveryFileName === undefined) {
+    throw databasePathResolutionError();
+  }
+  const nonce = recoveryFileName.slice(
+    recoveryPrefix.length,
+    -recoverySuffix.length,
+  );
+  if (!RECOVERY_NONCE_PATTERN.test(nonce)) {
+    throw databasePathResolutionError();
+  }
+  const recoveryBase = `.${basename(databasePath)}.${nonce}.legacy-import`;
+  const stagingFileName = `${recoveryBase}.sqlite`;
+  const stagingFilePath = join(dirname(databasePath), stagingFileName);
+  const recoveryFilePath = join(dirname(databasePath), recoveryFileName);
+
+  try {
+    const [recoveryMetadata, stagingMetadata] = await Promise.all([
+      lstat(recoveryFilePath, { bigint: true }),
+      lstatIfPresent(stagingFilePath),
+    ]);
+    let state: LegacyImportRecovery["state"];
+    let authorityMetadata: BigIntStats;
+    if (databaseMetadata === undefined) {
+      if (
+        stagingMetadata === undefined ||
+        !stagingMetadata.isFile() ||
+        stagingMetadata.nlink !== 1n
+      ) {
+        throw databasePathResolutionError();
+      }
+      state = "pre-link";
+      authorityMetadata = stagingMetadata;
+    } else if (
+      databaseMetadata.isFile() &&
+      databaseMetadata.nlink === 2n &&
+      stagingMetadata !== undefined &&
+      stagingMetadata.isFile() &&
+      stagingMetadata.nlink === 2n &&
+      stagingMetadata.dev === databaseMetadata.dev &&
+      stagingMetadata.ino === databaseMetadata.ino &&
+      stagingMetadata.uid === databaseMetadata.uid
+    ) {
+      state = "linked";
+      authorityMetadata = databaseMetadata;
+    } else if (
+      databaseMetadata.isFile() &&
+      databaseMetadata.nlink === 1n &&
+      stagingMetadata === undefined
+    ) {
+      state = "post-unlink";
+      authorityMetadata = databaseMetadata;
+    } else {
+      throw databasePathResolutionError();
+    }
+
+    if (
+      !recoveryMetadata.isFile() ||
+      recoveryMetadata.nlink !== 1n ||
+      recoveryMetadata.size <= 0n ||
+      recoveryMetadata.size > MAX_RECOVERY_MANIFEST_BYTES ||
+      (recoveryMetadata.mode & 0o7777n) !== 0o600n ||
+      recoveryMetadata.dev !== authorityMetadata.dev ||
+      recoveryMetadata.uid !== authorityMetadata.uid
+    ) {
+      throw databasePathResolutionError();
+    }
+    const value = JSON.parse(await readFile(recoveryFilePath, "utf8")) as unknown;
+    if (
+      !isRecord(value) ||
+      !hasExactKeys(value, [
+        "version",
+        "databaseFileName",
+        "stagingFileName",
+        "nonce",
+      ]) ||
+      value.version !== 1 ||
+      value.databaseFileName !== basename(databasePath) ||
+      value.stagingFileName !== stagingFileName ||
+      value.nonce !== nonce
+    ) {
+      throw databasePathResolutionError();
+    }
+    return { stagingFilePath, recoveryFilePath, nonce, state };
+  } catch (error: unknown) {
+    if (error instanceof AuthorityWorkerClientError) {
+      throw error;
+    }
+    throw databasePathResolutionError();
+  }
+}
+
+async function lstatIfPresent(path: string): Promise<BigIntStats | undefined> {
+  try {
+    return await lstat(path, { bigint: true });
+  } catch (error: unknown) {
+    if (isMissingPathError(error)) {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+interface CanonicalDatabaseTarget {
+  readonly databasePath: string;
+  readonly recovery?: LegacyImportRecovery;
+}
+
 async function canonicalizeDatabasePath(
   absolutePath: string,
   visitedSymlinks: Set<string>,
   depth: number,
-): Promise<string> {
+): Promise<CanonicalDatabaseTarget> {
   if (depth > MAX_DATABASE_SYMLINK_DEPTH) {
     throw databasePathResolutionError();
   }
@@ -81,6 +248,10 @@ async function canonicalizeDatabasePath(
   if (canonicalPath !== undefined) {
     try {
       const pathMetadata = await stat(canonicalPath, { bigint: true });
+      const recovery = await controlledLegacyRecovery(canonicalPath, pathMetadata);
+      if (recovery !== undefined) {
+        return { databasePath: canonicalPath, recovery };
+      }
       if (pathMetadata.isFile() && pathMetadata.nlink > 1n) {
         throw databasePathResolutionError();
       }
@@ -90,7 +261,7 @@ async function canonicalizeDatabasePath(
       }
       throw databasePathResolutionError();
     }
-    return canonicalPath;
+    return { databasePath: canonicalPath };
   }
 
   let pathMetadata: Awaited<ReturnType<typeof lstat>>;
@@ -100,12 +271,18 @@ async function canonicalizeDatabasePath(
     if (!isMissingPathError(error)) {
       throw databasePathResolutionError();
     }
+    let canonicalParent: string;
     try {
-      const canonicalParent = await realpath(dirname(absolutePath));
-      return join(canonicalParent, basename(absolutePath));
+      canonicalParent = await realpath(dirname(absolutePath));
     } catch {
-      return absolutePath;
+      return { databasePath: absolutePath };
     }
+    const databasePath = join(canonicalParent, basename(absolutePath));
+    const recovery = await controlledLegacyRecovery(databasePath, undefined);
+    return {
+      databasePath,
+      ...(recovery === undefined ? {} : { recovery }),
+    };
   }
 
   if (!pathMetadata.isSymbolicLink()) {
@@ -129,12 +306,15 @@ async function canonicalizeDatabasePath(
   );
 }
 
-async function canonicalDatabasePath(databasePath: string): Promise<string> {
+async function canonicalDatabasePath(
+  databasePath: string,
+): Promise<CanonicalDatabaseTarget> {
   return canonicalizeDatabasePath(resolve(databasePath), new Set<string>(), 0);
 }
 
 interface AuthorityCoordinatorReservation {
   readonly databasePath: string;
+  readonly recovery?: LegacyImportRecovery;
   release(): void;
 }
 
@@ -149,7 +329,8 @@ async function terminateTransport(worker: AuthorityWorkerTransport): Promise<voi
 async function reserveAuthorityCoordinator(
   databasePath: string,
 ): Promise<AuthorityCoordinatorReservation> {
-  const canonicalPath = await canonicalDatabasePath(databasePath);
+  const target = await canonicalDatabasePath(databasePath);
+  const canonicalPath = target.databasePath;
   if (authorityCoordinatorPaths.has(canonicalPath)) {
     throw new AuthorityWorkerClientError(
       "authority_coordinator_exists",
@@ -161,6 +342,7 @@ async function reserveAuthorityCoordinator(
   let reserved = true;
   return {
     databasePath: canonicalPath,
+    ...(target.recovery === undefined ? {} : { recovery: target.recovery }),
     release(): void {
       if (!reserved) {
         return;
@@ -186,9 +368,13 @@ function authorityWorkerUrl(): URL {
 
 function createAuthorityWorker(
   options: CreateWorkerDatabaseClientOptions,
+  recovery: LegacyImportRecovery | undefined,
 ): AuthorityWorkerTransport {
   return new Worker(authorityWorkerUrl(), {
-    workerData: { databasePath: options.databasePath },
+    workerData: {
+      databasePath: options.databasePath,
+      ...(recovery === undefined ? {} : { recovery }),
+    },
   });
 }
 
@@ -236,7 +422,7 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
   }
 
   async initialize(): Promise<void> {
-    const response = await this.#send("authority.initialize");
+    const response = await this.#send({ type: "authority.initialize" });
     if (response.type !== "authority.ready") {
       this.#failProtocol("Authority worker returned the wrong initialization response");
       throw this.#terminalError;
@@ -253,13 +439,63 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
       return Promise.reject(unavailable);
     }
 
-    return this.#send("authority.inspect-schema").then((response) => {
+    return this.#send({ type: "authority.inspect-schema" }).then((response) => {
       if (response.type !== "authority.schema") {
         this.#failProtocol("Authority worker returned the wrong schema response");
         throw this.#terminalError;
       }
       return { version: response.schemaVersion };
     });
+  }
+
+  importLegacyState(paths: LegacyImportPaths): Promise<LegacyImportResult> {
+    if (this.#terminalError !== undefined) {
+      return this.#rejectTerminal();
+    }
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) {
+      return Promise.reject(unavailable);
+    }
+    return this.#send({ type: "authority.import-legacy", ...paths }).then(
+      (response) => {
+        if (response.type !== "authority.legacy-imported") {
+          this.#failProtocol("Authority worker returned the wrong import response");
+          throw this.#terminalError;
+        }
+        return {
+          imported: response.imported,
+          actors: response.actors,
+          rooms: response.rooms,
+          messages: response.messages,
+        };
+      },
+    );
+  }
+
+  inspectLegacyImport(): Promise<LegacyImportInspection> {
+    if (this.#terminalError !== undefined) {
+      return this.#rejectTerminal();
+    }
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) {
+      return Promise.reject(unavailable);
+    }
+    return this.#send({ type: "authority.inspect-legacy-import" }).then(
+      (response) => {
+        if (response.type !== "authority.legacy-import") {
+          this.#failProtocol("Authority worker returned the wrong import inspection");
+          throw this.#terminalError;
+        }
+        return {
+          markerVersion: response.markerVersion,
+          actors: response.actors,
+          rooms: response.rooms,
+          messages: response.messages,
+          roomHeadSeq: response.roomHeadSeq,
+          identityHeadSeq: response.identityHeadSeq,
+        };
+      },
+    );
   }
 
   close(): Promise<void> {
@@ -274,7 +510,7 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
     }
 
     this.#state = "closing";
-    this.#closePromise = this.#send("authority.close")
+    this.#closePromise = this.#send({ type: "authority.close" })
       .then((response) => {
         if (response.type !== "authority.closed") {
           this.#failProtocol("Authority worker returned the wrong close response");
@@ -316,17 +552,17 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
     return this.#closedError;
   }
 
-  #send(requestType: AuthorityWorkerRequest["type"]): Promise<AuthorityWorkerResponse> {
+  #send(command: AuthorityWorkerCommand): Promise<AuthorityWorkerResponse> {
     if (this.#terminalError !== undefined) {
       return this.#rejectTerminal();
     }
 
     const requestId = String(this.#nextRequestId);
     this.#nextRequestId += 1n;
-    const request = { type: requestType, requestId } as AuthorityWorkerRequest;
+    const request = { ...command, requestId } as AuthorityWorkerRequest;
 
     return new Promise<AuthorityWorkerResponse>((resolve, reject) => {
-      this.#pending.set(requestId, { requestType, resolve, reject });
+      this.#pending.set(requestId, { requestType: request.type, resolve, reject });
       try {
         this.#worker.postMessage(request);
       } catch {
@@ -363,7 +599,9 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
       const error = new AuthorityWorkerClientError(message.code, message.message);
       if (
         pending.requestType === "authority.initialize" ||
-        pending.requestType === "authority.close"
+        pending.requestType === "authority.close" ||
+        (pending.requestType === "authority.inspect-schema" &&
+          message.code === "storage_unavailable")
       ) {
         this.#failTerminal(error);
       } else {
@@ -400,6 +638,10 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
       (requestType === "authority.initialize" && responseType === "authority.ready") ||
       (requestType === "authority.inspect-schema" &&
         responseType === "authority.schema") ||
+      (requestType === "authority.import-legacy" &&
+        responseType === "authority.legacy-imported") ||
+      (requestType === "authority.inspect-legacy-import" &&
+        responseType === "authority.legacy-import") ||
       (requestType === "authority.close" && responseType === "authority.closed")
     );
   }
@@ -445,7 +687,10 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
   }
 }
 
-type AuthorityWorkerFactory = (databasePath: string) => AuthorityWorkerTransport;
+type AuthorityWorkerFactory = (
+  databasePath: string,
+  recovery?: LegacyImportRecovery,
+) => AuthorityWorkerTransport;
 
 async function createClient(
   options: CreateWorkerDatabaseClientOptions,
@@ -454,7 +699,7 @@ async function createClient(
   const reservation = await reserveAuthorityCoordinator(options.databasePath);
   let worker: AuthorityWorkerTransport;
   try {
-    worker = workerFactory(reservation.databasePath);
+    worker = workerFactory(reservation.databasePath, reservation.recovery);
   } catch {
     reservation.release();
     throw new AuthorityWorkerClientError(
@@ -494,8 +739,8 @@ async function createClient(
 export function createWorkerDatabaseClient(
   options: CreateWorkerDatabaseClientOptions,
 ): Promise<WorkerDatabaseClient> {
-  return createClient(options, (databasePath) =>
-    createAuthorityWorker({ databasePath }),
+  return createClient(options, (databasePath, recovery) =>
+    createAuthorityWorker({ databasePath }, recovery),
   );
 }
 

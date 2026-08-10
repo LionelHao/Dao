@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { parentPort, workerData } from "node:worker_threads";
 import {
@@ -6,6 +7,13 @@ import {
   readSchemaVersion,
 } from "./schema.js";
 import {
+  importLegacyState,
+  inspectLegacyImport,
+  recoverLegacyImportRemainder,
+  replayLegacyImport,
+  type LegacyImportRecovery,
+} from "./legacy-importer.js";
+import {
   isAuthorityWorkerRequest,
   type AuthorityWorkerRequest,
   type AuthorityWorkerResponse,
@@ -13,6 +21,7 @@ import {
 
 interface AuthorityWorkerData {
   readonly databasePath: string;
+  readonly recovery?: LegacyImportRecovery;
 }
 
 function isAuthorityWorkerData(value: unknown): value is AuthorityWorkerData {
@@ -20,10 +29,41 @@ function isAuthorityWorkerData(value: unknown): value is AuthorityWorkerData {
     return false;
   }
   const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  if (
+    (keys.length !== 1 && keys.length !== 2) ||
+    keys[0] !== "databasePath" ||
+    (keys.length === 2 && keys[1] !== "recovery") ||
+    typeof record.databasePath !== "string" ||
+    record.databasePath.length === 0
+  ) {
+    return false;
+  }
+  if (record.recovery === undefined) {
+    return keys.length === 1;
+  }
+  if (
+    typeof record.recovery !== "object" ||
+    record.recovery === null ||
+    Array.isArray(record.recovery)
+  ) {
+    return false;
+  }
+  const recovery = record.recovery as Record<string, unknown>;
   return (
-    Object.keys(record).length === 1 &&
-    typeof record.databasePath === "string" &&
-    record.databasePath.length > 0
+    Object.keys(recovery).sort().join("\u0000") ===
+      ["nonce", "recoveryFilePath", "stagingFilePath", "state"]
+        .sort()
+        .join("\u0000") &&
+    typeof recovery.nonce === "string" &&
+    recovery.nonce.length > 0 &&
+    typeof recovery.recoveryFilePath === "string" &&
+    recovery.recoveryFilePath.length > 0 &&
+    typeof recovery.stagingFilePath === "string" &&
+    recovery.stagingFilePath.length > 0 &&
+    (recovery.state === "pre-link" ||
+      recovery.state === "linked" ||
+      recovery.state === "post-unlink")
   );
 }
 
@@ -45,6 +85,7 @@ const authorityPort = parentPort;
 const requests: unknown[] = [];
 let processing = false;
 let database: DatabaseSync | undefined;
+let workerInitialized = false;
 let workerClosed = false;
 
 function respond(response: AuthorityWorkerResponse): void {
@@ -60,6 +101,24 @@ function respondWithError(requestId: string, code: string, message: string): voi
   });
 }
 
+function openAuthorityDatabase(): DatabaseSync {
+  if (!isAuthorityWorkerData(workerData)) {
+    throw new Error("Invalid authority worker data");
+  }
+  const openedDatabase = new DatabaseSync(workerData.databasePath);
+  try {
+    migrateAuthorityDatabase(openedDatabase);
+    return openedDatabase;
+  } catch (error: unknown) {
+    try {
+      openedDatabase.close();
+    } catch {
+      // Preserve the original open or migration failure.
+    }
+    throw error;
+  }
+}
+
 function initialize(request: AuthorityWorkerRequest): void {
   if (request.type !== "authority.initialize") {
     throw new TypeError("initialize received the wrong request type");
@@ -72,7 +131,7 @@ function initialize(request: AuthorityWorkerRequest): void {
     );
     return;
   }
-  if (database !== undefined) {
+  if (workerInitialized) {
     respondWithError(
       request.requestId,
       "authority_already_initialized",
@@ -89,24 +148,20 @@ function initialize(request: AuthorityWorkerRequest): void {
     return;
   }
 
-  let openedDatabase: DatabaseSync | undefined;
   try {
-    openedDatabase = new DatabaseSync(workerData.databasePath);
-    migrateAuthorityDatabase(openedDatabase);
-    database = openedDatabase;
+    if (workerData.recovery !== undefined) {
+      recoverLegacyImportRemainder(workerData.databasePath, workerData.recovery);
+    }
+    if (existsSync(workerData.databasePath)) {
+      database = openAuthorityDatabase();
+    }
+    workerInitialized = true;
     respond({
       type: "authority.ready",
       requestId: request.requestId,
       schemaVersion: AUTHORITY_SCHEMA_VERSION,
     });
   } catch {
-    if (openedDatabase !== undefined) {
-      try {
-        openedDatabase.close();
-      } catch {
-        // Initialization already failed; never expose database internals to the caller.
-      }
-    }
     respondWithError(
       request.requestId,
       "storage_unavailable",
@@ -119,7 +174,7 @@ function inspectSchema(request: AuthorityWorkerRequest): void {
   if (request.type !== "authority.inspect-schema") {
     throw new TypeError("inspectSchema received the wrong request type");
   }
-  if (database === undefined || workerClosed) {
+  if (!workerInitialized || workerClosed) {
     respondWithError(
       request.requestId,
       workerClosed ? "authority_worker_closed" : "authority_not_initialized",
@@ -129,6 +184,7 @@ function inspectSchema(request: AuthorityWorkerRequest): void {
   }
 
   try {
+    database ??= openAuthorityDatabase();
     const schemaVersion = readSchemaVersion(database);
     if (schemaVersion !== AUTHORITY_SCHEMA_VERSION) {
       throw new Error("Authority schema version changed after initialization");
@@ -147,6 +203,88 @@ function inspectSchema(request: AuthorityWorkerRequest): void {
   }
 }
 
+async function importLegacy(request: AuthorityWorkerRequest): Promise<void> {
+  if (request.type !== "authority.import-legacy") {
+    throw new TypeError("importLegacy received the wrong request type");
+  }
+  if (!workerInitialized || workerClosed) {
+    respondWithError(
+      request.requestId,
+      workerClosed ? "authority_worker_closed" : "authority_not_initialized",
+      workerClosed ? "Authority worker is closed" : "Authority worker is not initialized",
+    );
+    return;
+  }
+  if (!isAuthorityWorkerData(workerData)) {
+    respondWithError(
+      request.requestId,
+      "legacy_import_failed",
+      "Legacy authority import failed",
+    );
+    return;
+  }
+
+  try {
+    if (database !== undefined || existsSync(workerData.databasePath)) {
+      database ??= openAuthorityDatabase();
+      const existing = replayLegacyImport(database);
+      respond({
+        type: "authority.legacy-imported",
+        requestId: request.requestId,
+        ...existing,
+      });
+      return;
+    }
+
+    const result = await importLegacyState({
+      databasePath: workerData.databasePath,
+      sessionFilePath: request.sessionFilePath,
+      roomFilePath: request.roomFilePath,
+      messageFilePath: request.messageFilePath,
+    });
+    database = openAuthorityDatabase();
+    respond({
+      type: "authority.legacy-imported",
+      requestId: request.requestId,
+      ...result,
+    });
+  } catch {
+    respondWithError(
+      request.requestId,
+      "legacy_import_failed",
+      "Legacy authority import failed",
+    );
+  }
+}
+
+function inspectImport(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.inspect-legacy-import") {
+    throw new TypeError("inspectImport received the wrong request type");
+  }
+  if (!workerInitialized || workerClosed) {
+    respondWithError(
+      request.requestId,
+      workerClosed ? "authority_worker_closed" : "authority_not_initialized",
+      workerClosed ? "Authority worker is closed" : "Authority worker is not initialized",
+    );
+    return;
+  }
+  try {
+    database ??= openAuthorityDatabase();
+    respond({
+      type: "authority.legacy-import",
+      requestId: request.requestId,
+      ...inspectLegacyImport(database),
+    });
+  } catch {
+    respondWithError(
+      request.requestId,
+      "legacy_import_unavailable",
+      "Legacy authority import inspection failed",
+    );
+  }
+}
+
 function closeAuthority(request: AuthorityWorkerRequest): void {
   if (request.type !== "authority.close") {
     throw new TypeError("closeAuthority received the wrong request type");
@@ -159,7 +297,7 @@ function closeAuthority(request: AuthorityWorkerRequest): void {
     );
     return;
   }
-  if (database === undefined) {
+  if (!workerInitialized) {
     respondWithError(
       request.requestId,
       "authority_not_initialized",
@@ -169,8 +307,10 @@ function closeAuthority(request: AuthorityWorkerRequest): void {
   }
 
   try {
-    database.close();
-    database = undefined;
+    if (database !== undefined) {
+      database.close();
+      database = undefined;
+    }
     workerClosed = true;
     respond({ type: "authority.closed", requestId: request.requestId });
     authorityPort.close();
@@ -183,7 +323,7 @@ function closeAuthority(request: AuthorityWorkerRequest): void {
   }
 }
 
-function dispatch(value: unknown): void {
+async function dispatch(value: unknown): Promise<void> {
   if (!isAuthorityWorkerRequest(value)) {
     respondWithError(
       requestIdFromMalformedRequest(value),
@@ -200,12 +340,18 @@ function dispatch(value: unknown): void {
     case "authority.inspect-schema":
       inspectSchema(value);
       return;
+    case "authority.import-legacy":
+      await importLegacy(value);
+      return;
+    case "authority.inspect-legacy-import":
+      inspectImport(value);
+      return;
     case "authority.close":
       closeAuthority(value);
   }
 }
 
-function drainRequests(): void {
+async function drainRequests(): Promise<void> {
   if (processing) {
     return;
   }
@@ -213,7 +359,7 @@ function drainRequests(): void {
   try {
     while (requests.length > 0) {
       const request = requests.shift();
-      dispatch(request);
+      await dispatch(request);
     }
   } finally {
     processing = false;
@@ -222,7 +368,7 @@ function drainRequests(): void {
 
 authorityPort.on("message", (request: unknown) => {
   requests.push(request);
-  drainRequests();
+  void drainRequests();
 });
 
 authorityPort.on("messageerror", () => {

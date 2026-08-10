@@ -1,12 +1,22 @@
-import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { EventEmitter, once } from "node:events";
-import { linkSync, mkdtempSync, rmSync, symlinkSync, unlinkSync } from "node:fs";
-import { createRequire } from "node:module";
+import {
+  existsSync,
+  linkSync,
+  mkdtempSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it } from "vitest";
 import {
   createWorkerDatabaseClient,
   createWorkerDatabaseClientForTest,
@@ -24,18 +34,42 @@ const temporaryDirectories = new Set<string>();
 const clients = new Set<WorkerDatabaseClient>();
 const workers = new Set<Worker>();
 
-beforeAll(() => {
-  try {
-    const requireFromWorkspace = createRequire(resolve(process.cwd(), "package.json"));
-    const typescriptPath = requireFromWorkspace.resolve("typescript/bin/tsc");
-    execFileSync(
-      process.execPath,
-      [typescriptPath, "-b", "--force", "packages/server/tsconfig.json"],
-      { cwd: process.cwd(), stdio: "pipe" },
-    );
-  } catch {
-    throw new Error("Authority worker test build failed");
+function authorityArtifactSnapshot(): string {
+  const workspaceRoot = process.cwd();
+  const artifactRoots = [
+    resolve(workspaceRoot, "packages/core/dist"),
+    resolve(workspaceRoot, "packages/server/dist"),
+  ];
+  const paths: string[] = [];
+  const collect = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        collect(path);
+      } else if (entry.isFile()) {
+        paths.push(path);
+      }
+    }
+  };
+  for (const artifactRoot of artifactRoots) {
+    collect(artifactRoot);
   }
+
+  const hash = createHash("sha256");
+  for (const path of paths.sort()) {
+    const metadata = statSync(path, { bigint: true });
+    hash.update(relative(workspaceRoot, path));
+    hash.update(metadata.mtimeNs.toString());
+    hash.update(metadata.size.toString());
+    hash.update(readFileSync(path));
+  }
+  return hash.digest("hex");
+}
+
+const collectedAuthorityArtifactSnapshot = authorityArtifactSnapshot();
+
+afterAll(() => {
+  expect(authorityArtifactSnapshot()).toBe(collectedAuthorityArtifactSnapshot);
 });
 
 function temporaryDirectory(): string {
@@ -482,6 +516,7 @@ describe("authority database coordinator registry", () => {
     const initialized = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
+    await expect(initialized.inspectSchema()).resolves.toEqual({ version: 2 });
     await initialized.close();
     linkSync(path, aliasPath);
 
@@ -521,6 +556,7 @@ describe("authority database coordinator registry", () => {
     const original = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
+    await expect(original.inspectSchema()).resolves.toEqual({ version: 2 });
     linkSync(path, aliasPath);
 
     let spawnCount = 0;
@@ -1017,14 +1053,20 @@ describe("WorkerDatabaseClient", () => {
     process.on("unhandledRejection", onUnhandled);
 
     try {
-      const error = await rejectionOf(
-        createWorkerDatabaseClient({ databasePath: invalidDatabasePath }),
+      const client = trackClient(
+        await createWorkerDatabaseClient({ databasePath: invalidDatabasePath }),
       );
+      expect(existsSync(invalidDatabasePath)).toBe(false);
+      const error = await rejectionOf(client.inspectSchema());
       await new Promise<void>((resolve) => setImmediate(resolve));
+      const laterError = await rejectionOf(client.inspectSchema());
 
       expect(error).toMatchObject({ code: "storage_unavailable" });
+      expect(laterError).toBe(error);
       expect(String(error)).not.toContain(invalidDatabasePath);
       expect(unhandled).toEqual([]);
+      mkdirSync(dirname(invalidDatabasePath), { recursive: true });
+      await expectDatabasePathEventuallyReusable(invalidDatabasePath);
     } finally {
       process.off("unhandledRejection", onUnhandled);
     }
