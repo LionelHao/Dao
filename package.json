@@ -3,8 +3,11 @@
   "private": true,
   "version": "0.1.0",
   "packageManager": "pnpm@10.14.0",
+  "engines": {
+    "node": ">=22.13"
+  },
   "scripts": {
-    "typecheck": "tsc -b && tsc --noEmit -p packages/core/tsconfig.type-test.json",
+    "typecheck": "tsc -b && tsc --noEmit -p packages/core/tsconfig.type-test.json && tsc --noEmit -p packages/server/tsconfig.type-test.json",
     "lint": "eslint . --max-warnings=0",
     "verify:core-boundary": "node scripts/verify-core-boundary.mjs",
     "test": "pnpm verify:core-boundary && vitest run",
@@ -21,4 +24,3 @@
     "vitest": "^3.2.4"
   }
 }
-

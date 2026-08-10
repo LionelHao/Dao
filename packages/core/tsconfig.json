@@ -8,7 +8,6 @@
     "outDir": "dist",
     "tsBuildInfoFile": "dist/tsconfig.tsbuildinfo"
   },
-  "include": ["src/index.ts"],
+  "include": ["src/index.ts", "src/collaboration.ts", "src/sync.ts"],
   "exclude": ["src/**/*.test.ts", "src/**/*.type-test.ts"]
 }
-

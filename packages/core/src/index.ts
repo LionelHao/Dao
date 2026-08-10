@@ -297,3 +297,46 @@ export function isMessageDraft(value: unknown): value is MessageDraft {
     !("authorKind" in value)
   );
 }
+
+export {
+  isAgentExecution,
+  isAgentJudgement,
+  isCalibrationSignal,
+  isHumanReadReceipt,
+  isOpenItem,
+  isSocialReaction,
+} from "./collaboration.js";
+export type {
+  AgentExecution,
+  AgentExecutionStatus,
+  AgentJudgement,
+  AgentJudgementOutcome,
+  CalibrationSignal,
+  HumanReadReceipt,
+  OpenItem,
+  OpenItemStatus,
+  OpenItemTransfer,
+  SocialReaction,
+} from "./collaboration.js";
+export {
+  isRoomCursor,
+  isRoomRepairPage,
+  isRoomSyncResult,
+  isSnapshotCompleted,
+  isSnapshotVersion,
+  isWorkspaceBootstrapPage,
+} from "./sync.js";
+export type {
+  PersistedIdentityEvent,
+  PersistedRoomEvent,
+  RoomCursor,
+  RoomRepairPage,
+  RoomRepairRecord,
+  RoomSummary,
+  RoomSyncRequest,
+  RoomSyncResult,
+  SnapshotCompleted,
+  SnapshotDeliveryMode,
+  SnapshotVersion,
+  WorkspaceBootstrapPage,
+} from "./sync.js";

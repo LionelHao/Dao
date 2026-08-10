@@ -1,0 +1,1005 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { describe, expect, it } from "vitest";
+import {
+  AUTHORITY_SCHEMA_VERSION,
+  configureAuthorityConnection,
+  listAuthorityTables,
+  migrateAuthorityDatabase,
+  readSchemaVersion,
+} from "./schema.js";
+
+const AUTHORITY_TABLES = [
+  "actors",
+  "agent_executions",
+  "agent_judgments",
+  "calibration_signals",
+  "events",
+  "human_read_receipts",
+  "idempotency_records",
+  "messages",
+  "open_items",
+  "outbox_deliveries",
+  "room_audit",
+  "room_invitations",
+  "room_memberships",
+  "rooms",
+  "schema_migrations",
+  "sessions",
+  "streams",
+] as const;
+const V1_MIGRATION_CHECKSUM =
+  "34117e7de4fb7c8eb36b5363bc178e45a82b08c668ca712a7b7e5e82343a6358";
+
+interface LogicalSnapshot {
+  readonly schemaVersion: number;
+  readonly tables: readonly {
+    readonly name: string;
+    readonly sql: string | null;
+    readonly rows: readonly Record<string, unknown>[];
+  }[];
+}
+
+function withDatabase<Result>(operation: (database: DatabaseSync) => Result): Result {
+  const directory = mkdtempSync(join(tmpdir(), "native-im-authority-schema-"));
+  const database = new DatabaseSync(join(directory, "authority.sqlite"));
+
+  try {
+    return operation(database);
+  } finally {
+    database.close();
+    rmSync(directory, { force: true, recursive: true });
+  }
+}
+
+function tableColumns(database: DatabaseSync, tableName: string): readonly string[] {
+  return database
+    .prepare(`PRAGMA table_info('${tableName}')`)
+    .all()
+    .map((row) => String(row.name));
+}
+
+function databaseWithoutTransactionState(database: DatabaseSync): DatabaseSync {
+  return new Proxy(database, {
+    get(target, property) {
+      if (property === "isTransaction") {
+        throw new Error("Node 22.13 does not expose DatabaseSync.isTransaction");
+      }
+      const value: unknown = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+function databaseWithFailingRollback(database: DatabaseSync): DatabaseSync {
+  return new Proxy(database, {
+    get(target, property) {
+      if (property === "exec") {
+        return (sql: string): void => {
+          if (sql === "ROLLBACK") {
+            throw new Error("simulated rollback failure");
+          }
+          target.exec(sql);
+        };
+      }
+      const value: unknown = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+function databaseWithSchemaChangeBeforeBegin(database: DatabaseSync): DatabaseSync {
+  let changed = false;
+  return new Proxy(database, {
+    get(target, property) {
+      if (property === "exec") {
+        return (sql: string): void => {
+          if (!changed && sql === "BEGIN IMMEDIATE") {
+            changed = true;
+            target.exec("DROP TABLE sessions");
+          }
+          target.exec(sql);
+        };
+      }
+      const value: unknown = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+function databaseWithCorruptedOutboxDdl(database: DatabaseSync): DatabaseSync {
+  return new Proxy(database, {
+    get(target, property) {
+      if (property === "exec") {
+        return (sql: string): void => {
+          const statement = sql.startsWith("CREATE TABLE outbox_deliveries")
+            ? sql.replace("    last_error TEXT,\n", "")
+            : sql;
+          target.exec(statement);
+        };
+      }
+      const value: unknown = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+function tamperSchemaSql(
+  database: DatabaseSync,
+  tableName: string,
+  search: string,
+  replacement: string,
+): void {
+  const row = database
+    .prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?")
+    .get(tableName);
+  if (row === undefined || typeof row.sql !== "string") {
+    throw new Error(`missing schema SQL for ${tableName}`);
+  }
+  const tampered = row.sql.replace(search, replacement);
+  if (tampered === row.sql) {
+    throw new Error(`schema probe did not match ${tableName}`);
+  }
+
+  if (!/^[a-z_]+$/.test(tableName)) {
+    throw new Error("unsafe schema probe table name");
+  }
+  const triggers = database
+    .prepare(
+      `SELECT sql FROM sqlite_schema
+       WHERE type = 'trigger' AND tbl_name = ? ORDER BY name`,
+    )
+    .all(tableName)
+    .map((trigger) => String(trigger.sql));
+  database.exec("PRAGMA foreign_keys = OFF");
+  database.exec(`DROP TABLE "${tableName}"`);
+  database.exec(tampered);
+  for (const trigger of triggers) {
+    database.exec(trigger);
+  }
+}
+
+function expectSqlRejected(database: DatabaseSync, sql: string): void {
+  expect(() => database.exec(sql)).toThrow();
+}
+
+function createV1Fixture(
+  database: DatabaseSync,
+  checksum = V1_MIGRATION_CHECKSUM,
+): void {
+  database.exec(`
+    CREATE TABLE schema_migrations (
+      version INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      checksum TEXT NOT NULL,
+      applied_at TEXT NOT NULL
+    ) STRICT;
+
+    CREATE TABLE actors (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL CHECK (kind IN ('human', 'agent')),
+      display_name TEXT NOT NULL,
+      reachability TEXT,
+      readiness TEXT,
+      tool_permissions_json TEXT NOT NULL DEFAULT '[]'
+    ) STRICT;
+
+    CREATE TABLE sessions (
+      family_id TEXT NOT NULL,
+      account_id TEXT NOT NULL,
+      actor_id TEXT NOT NULL REFERENCES actors(id),
+      access_token_hash TEXT PRIMARY KEY,
+      refresh_token_hash TEXT NOT NULL UNIQUE,
+      access_expires_at INTEGER NOT NULL,
+      refresh_expires_at INTEGER NOT NULL,
+      revoked_at INTEGER
+    ) STRICT;
+
+    CREATE TABLE rooms (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('active', 'archived')),
+      created_at TEXT NOT NULL
+    ) STRICT;
+
+    CREATE TABLE room_memberships (
+      room_id TEXT NOT NULL REFERENCES rooms(id),
+      actor_id TEXT NOT NULL REFERENCES actors(id),
+      kind TEXT NOT NULL CHECK (kind IN ('human', 'agent')),
+      role TEXT,
+      participation TEXT,
+      tool_permissions_json TEXT NOT NULL DEFAULT '[]',
+      joined_at TEXT,
+      configured_at TEXT,
+      PRIMARY KEY (room_id, actor_id)
+    ) STRICT;
+
+    CREATE TABLE room_invitations (
+      id TEXT PRIMARY KEY,
+      room_id TEXT NOT NULL REFERENCES rooms(id),
+      inviter_actor_id TEXT NOT NULL REFERENCES actors(id),
+      invitee_actor_id TEXT NOT NULL REFERENCES actors(id),
+      token_hash TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL CHECK (status IN ('pending', 'accepted', 'rejected')),
+      created_at TEXT NOT NULL,
+      decision_actor_id TEXT REFERENCES actors(id),
+      decided_at TEXT
+    ) STRICT;
+
+    CREATE TABLE room_audit (
+      id TEXT PRIMARY KEY,
+      type TEXT NOT NULL CHECK (type IN (
+        'room.created', 'room.renamed', 'room.archived', 'room.human.invited',
+        'room.invitation.accepted', 'room.invitation.rejected',
+        'room.agent.configured', 'room.member.removed', 'room.member.role.changed'
+      )),
+      room_id TEXT NOT NULL REFERENCES rooms(id),
+      actor_id TEXT NOT NULL REFERENCES actors(id),
+      result TEXT NOT NULL CHECK (result IN (
+        'created', 'renamed', 'archived', 'pending', 'accepted', 'rejected',
+        'configured', 'removed', 'role-changed'
+      )),
+      timestamp TEXT NOT NULL,
+      details_json TEXT NOT NULL DEFAULT '{}'
+    ) STRICT;
+
+    CREATE TABLE messages (
+      id TEXT PRIMARY KEY,
+      room_id TEXT NOT NULL REFERENCES rooms(id),
+      author_id TEXT NOT NULL REFERENCES actors(id),
+      author_kind TEXT NOT NULL CHECK (author_kind IN ('human', 'agent')),
+      body TEXT NOT NULL,
+      sent_at TEXT NOT NULL
+    ) STRICT;
+  `);
+  database
+    .prepare(
+      `INSERT INTO schema_migrations (version, name, checksum, applied_at)
+       VALUES (1, 'initial-authority', ?, '2026-08-10T00:00:00.000Z')`,
+    )
+    .run(checksum);
+  database.exec("PRAGMA user_version = 1");
+}
+
+function seedV1History(database: DatabaseSync): void {
+  database.exec(`
+    INSERT INTO actors (
+      id, kind, display_name, reachability, readiness, tool_permissions_json
+    ) VALUES
+      ('human-1', 'human', 'Ada', 'online', NULL, '[]'),
+      ('agent-1', 'agent', 'Sage', NULL, 'ready', '["summarize"]');
+
+    INSERT INTO rooms (id, name, status, created_at) VALUES
+      ('room-1', 'Launch', 'active', '2026-08-09T00:00:00.000Z'),
+      ('room-2', 'Review', 'active', '2026-08-09T01:00:00.000Z');
+
+    INSERT INTO room_memberships (
+      room_id, actor_id, kind, role, participation, tool_permissions_json,
+      joined_at, configured_at
+    ) VALUES
+      ('room-1', 'human-1', 'human', 'owner', NULL, '[]',
+       '2026-08-09T00:00:00.000Z', NULL),
+      ('room-1', 'agent-1', 'agent', NULL, 'active', '["summarize"]',
+       NULL, '2026-08-09T00:01:00.000Z');
+
+    INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+    VALUES (
+      'message-1', 'room-1', 'human-1', 'human', 'legacy history',
+      '2026-08-09T00:02:00.000Z'
+    );
+  `);
+}
+
+function snapshot(database: DatabaseSync): LogicalSnapshot {
+  const tables = listAuthorityTables(database).map((name) => {
+    const schema = database
+      .prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?")
+      .get(name);
+    return {
+      name,
+      sql: schema === undefined ? null : String(schema.sql),
+      rows: database.prepare(`SELECT * FROM "${name}" ORDER BY rowid`).all(),
+    };
+  });
+
+  return { schemaVersion: readSchemaVersion(database), tables };
+}
+
+describe("authority SQLite schema", () => {
+  it("configures and verifies the durability and concurrency pragmas", () => {
+    withDatabase((database) => {
+      database.exec("PRAGMA foreign_keys = OFF");
+
+      configureAuthorityConnection(database);
+
+      expect(database.prepare("PRAGMA foreign_keys").get()).toEqual({
+        foreign_keys: 1,
+      });
+      expect(database.prepare("PRAGMA journal_mode").get()).toEqual({
+        journal_mode: "wal",
+      });
+      expect(database.prepare("PRAGMA synchronous").get()).toEqual({
+        synchronous: 2,
+      });
+      const busyTimeout = Number(database.prepare("PRAGMA busy_timeout").get()?.timeout);
+      expect(busyTimeout).toBeGreaterThan(0);
+      expect(busyTimeout).toBeLessThanOrEqual(5_000);
+    });
+  });
+
+  it("migrates a fresh database through v1 and v2 to the complete schema", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabase(database);
+
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(2);
+      expect(readSchemaVersion(database)).toBe(2);
+      expect(listAuthorityTables(database)).toEqual(AUTHORITY_TABLES);
+      expect(
+        database
+          .prepare(
+            "SELECT version, name, checksum, applied_at FROM schema_migrations ORDER BY version",
+          )
+          .all(),
+      ).toEqual([
+        {
+          version: 1,
+          name: "initial-authority",
+          checksum: V1_MIGRATION_CHECKSUM,
+          applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+        },
+        {
+          version: 2,
+          name: "collaboration-facts-and-streams",
+          checksum: expect.stringMatching(/^[a-f0-9]{64}$/),
+          applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+        },
+      ]);
+      expect(tableColumns(database, "actors")).toContain("catalog_revision");
+      expect(tableColumns(database, "room_memberships")).toContain(
+        "access_revision",
+      );
+      expect(tableColumns(database, "streams")).toEqual([
+        "stream_kind",
+        "stream_id",
+        "head_seq",
+        "retained_from_seq",
+      ]);
+      expect(tableColumns(database, "events")).toEqual([
+        "event_id",
+        "stream_kind",
+        "stream_id",
+        "stream_seq",
+        "room_id",
+        "actor_id",
+        "event_type",
+        "occurred_at",
+        "payload_json",
+      ]);
+      expect(tableColumns(database, "idempotency_records")).toEqual([
+        "scope",
+        "key",
+        "request_hash",
+        "response_json",
+        "status_code",
+        "created_at",
+        "expires_at",
+      ]);
+      expect(tableColumns(database, "outbox_deliveries")).toEqual([
+        "id",
+        "event_id",
+        "destination",
+        "status",
+        "attempts",
+        "available_at",
+        "delivered_at",
+        "last_error",
+      ]);
+      expect(() => migrateAuthorityDatabase(database)).not.toThrow();
+    });
+  });
+
+  it("upgrades v1 history with zero revisions and one stream per room and actor", () => {
+    withDatabase((database) => {
+      createV1Fixture(database);
+      seedV1History(database);
+
+      migrateAuthorityDatabase(database);
+
+      expect(readSchemaVersion(database)).toBe(2);
+      expect(
+        database.prepare("SELECT id, catalog_revision FROM actors ORDER BY id").all(),
+      ).toEqual([
+        { id: "agent-1", catalog_revision: 0 },
+        { id: "human-1", catalog_revision: 0 },
+      ]);
+      expect(
+        database
+          .prepare(
+            `SELECT room_id, actor_id, access_revision
+             FROM room_memberships ORDER BY room_id, actor_id`,
+          )
+          .all(),
+      ).toEqual([
+        { room_id: "room-1", actor_id: "agent-1", access_revision: 0 },
+        { room_id: "room-1", actor_id: "human-1", access_revision: 0 },
+      ]);
+      expect(
+        database
+          .prepare(
+            `SELECT stream_kind, stream_id, head_seq, retained_from_seq
+             FROM streams ORDER BY stream_kind, stream_id`,
+          )
+          .all(),
+      ).toEqual([
+        { stream_kind: "identity", stream_id: "agent-1", head_seq: 0, retained_from_seq: 1 },
+        { stream_kind: "identity", stream_id: "human-1", head_seq: 0, retained_from_seq: 1 },
+        { stream_kind: "room", stream_id: "room-1", head_seq: 0, retained_from_seq: 1 },
+        { stream_kind: "room", stream_id: "room-2", head_seq: 0, retained_from_seq: 1 },
+      ]);
+      expect(
+        database.prepare("SELECT id, body, sent_at FROM messages").get(),
+      ).toEqual({
+        id: "message-1",
+        body: "legacy history",
+        sent_at: "2026-08-09T00:02:00.000Z",
+      });
+    });
+  });
+
+  it("rolls back a failed v2 migration without changing v1 schema or data", () => {
+    withDatabase((database) => {
+      createV1Fixture(database);
+      seedV1History(database);
+      const before = snapshot(database);
+
+      expect(() =>
+        migrateAuthorityDatabase(database, { failAfterStatement: 11 }),
+      ).toThrow(/injected migration failure/i);
+
+      expect(snapshot(database)).toEqual(before);
+      expect(listAuthorityTables(database)).not.toContain("outbox_deliveries");
+      expect(tableColumns(database, "actors")).not.toContain("catalog_revision");
+    });
+  });
+
+  it("owns transaction state without requiring post-22.13 DatabaseSync APIs", () => {
+    withDatabase((database) => {
+      createV1Fixture(database);
+      seedV1History(database);
+      const before = snapshot(database);
+
+      expect(() =>
+        migrateAuthorityDatabase(databaseWithoutTransactionState(database), {
+          failAfterStatement: 11,
+        }),
+      ).toThrow(/injected migration failure/i);
+
+      expect(snapshot(database)).toEqual(before);
+    });
+  });
+
+  it("preserves the migration error and exposes a secondary rollback failure", () => {
+    withDatabase((database) => {
+      createV1Fixture(database);
+
+      let thrown: unknown;
+      try {
+        migrateAuthorityDatabase(databaseWithFailingRollback(database), {
+          failAfterStatement: 11,
+        });
+      } catch (error: unknown) {
+        thrown = error;
+      }
+
+      expect(thrown).toBeInstanceOf(AggregateError);
+      if (!(thrown instanceof AggregateError)) {
+        throw new Error("expected migration and rollback failures");
+      }
+      expect(thrown.cause).toMatchObject({
+        message: expect.stringMatching(/injected migration failure/i),
+      });
+      expect(thrown.errors).toEqual([
+        expect.objectContaining({
+          message: expect.stringMatching(/injected migration failure/i),
+        }),
+        expect.objectContaining({ message: "simulated rollback failure" }),
+      ]);
+    });
+  });
+
+  it("validates the starting schema only after acquiring the write transaction", () => {
+    withDatabase((database) => {
+      createV1Fixture(database);
+
+      expect(() =>
+        migrateAuthorityDatabase(databaseWithSchemaChangeBeforeBegin(database)),
+      ).toThrow(/unknown schema/i);
+
+      expect(readSchemaVersion(database)).toBe(1);
+      expect(listAuthorityTables(database)).not.toContain("outbox_deliveries");
+    });
+  });
+
+  it("rolls back when final schema integrity fails before commit", () => {
+    withDatabase((database) => {
+      createV1Fixture(database);
+      seedV1History(database);
+      const before = snapshot(database);
+
+      expect(() =>
+        migrateAuthorityDatabase(databaseWithCorruptedOutboxDdl(database)),
+      ).toThrow(/unknown schema/i);
+
+      expect(snapshot(database)).toEqual(before);
+    });
+  });
+
+  it("rejects invalid v1 authority data without advancing or changing history", () => {
+    withDatabase((database) => {
+      createV1Fixture(database);
+      database.exec(`
+        INSERT INTO actors (
+          id, kind, display_name, reachability, readiness, tool_permissions_json
+        ) VALUES ('agent-session', 'agent', 'Agent', NULL, 'ready', '[]');
+        INSERT INTO sessions (
+          family_id, account_id, actor_id, access_token_hash, refresh_token_hash,
+          access_expires_at, refresh_expires_at, revoked_at
+        ) VALUES (
+          'family-1', 'agent-account', 'agent-session', 'access-1', 'refresh-1',
+          1, 2, NULL
+        );
+      `);
+      const before = snapshot(database);
+
+      expect(() => migrateAuthorityDatabase(database)).toThrow(/integrity|invariant/i);
+
+      expect(snapshot(database)).toEqual(before);
+    });
+
+    withDatabase((database) => {
+      createV1Fixture(database);
+      seedV1History(database);
+      database.exec(`
+        INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+        VALUES (
+          'message-kind-mismatch', 'room-1', 'human-1', 'agent', 'invalid',
+          '2026-08-09T00:03:00.000Z'
+        )
+      `);
+      const before = snapshot(database);
+
+      expect(() => migrateAuthorityDatabase(database)).toThrow(/integrity|invariant/i);
+
+      expect(snapshot(database)).toEqual(before);
+    });
+
+    withDatabase((database) => {
+      createV1Fixture(database);
+      database.exec("PRAGMA foreign_keys = OFF");
+      database.exec(`
+        INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+        VALUES (
+          'message-orphan', 'missing-room', 'missing-actor', 'human', 'invalid',
+          '2026-08-09T00:04:00.000Z'
+        )
+      `);
+      const before = snapshot(database);
+
+      expect(() => migrateAuthorityDatabase(database)).toThrow(/integrity|invariant/i);
+
+      expect(snapshot(database)).toEqual(before);
+    });
+  });
+
+  it("rejects missing, orphaned, mistyped, or negative v2 authority state", () => {
+    const corruptions: readonly ((database: DatabaseSync) => void)[] = [
+      (database) => {
+        database.exec(
+          "DELETE FROM streams WHERE stream_kind = 'identity' AND stream_id = 'human-1'",
+        );
+      },
+      (database) => {
+        database.exec(
+          "DELETE FROM streams WHERE stream_kind = 'room' AND stream_id = 'room-1'",
+        );
+      },
+      (database) => {
+        database.exec(
+          `INSERT INTO streams (
+             stream_kind, stream_id, head_seq, retained_from_seq
+           ) VALUES ('identity', 'orphan-actor', 0, 1)`,
+        );
+      },
+      (database) => {
+        database.exec(
+          `UPDATE streams SET stream_kind = 'identity'
+           WHERE stream_kind = 'room' AND stream_id = 'room-1'`,
+        );
+      },
+      (database) => {
+        database.exec("PRAGMA ignore_check_constraints = ON");
+        database.exec("UPDATE actors SET catalog_revision = -1 WHERE id = 'human-1'");
+        database.exec("PRAGMA ignore_check_constraints = OFF");
+      },
+      (database) => {
+        database.exec("PRAGMA ignore_check_constraints = ON");
+        database.exec(
+          `UPDATE room_memberships SET access_revision = -1
+           WHERE room_id = 'room-1' AND actor_id = 'human-1'`,
+        );
+        database.exec("PRAGMA ignore_check_constraints = OFF");
+      },
+    ];
+
+    for (const corrupt of corruptions) {
+      withDatabase((database) => {
+        createV1Fixture(database);
+        seedV1History(database);
+        migrateAuthorityDatabase(database);
+        corrupt(database);
+        const before = snapshot(database);
+
+        expect(() => migrateAuthorityDatabase(database)).toThrow(/integrity|invariant/i);
+
+        expect(snapshot(database)).toEqual(before);
+      });
+    }
+  });
+
+  it("rejects physical schema tampering beyond matching table and column names", () => {
+    const probes = [
+      ["rooms", "status TEXT NOT NULL", "status BLOB NOT NULL"],
+      ["rooms", "status TEXT NOT NULL", "status TEXT"],
+      [
+        "actors",
+        "tool_permissions_json TEXT NOT NULL DEFAULT '[]'",
+        "tool_permissions_json TEXT NOT NULL DEFAULT '{}'",
+      ],
+      ["rooms", "id TEXT PRIMARY KEY", "id TEXT UNIQUE"],
+      [
+        "messages",
+        "room_id TEXT NOT NULL REFERENCES rooms(id)",
+        "room_id TEXT NOT NULL REFERENCES actors(id)",
+      ],
+      [
+        "sessions",
+        "refresh_token_hash TEXT NOT NULL UNIQUE",
+        "refresh_token_hash TEXT NOT NULL",
+      ],
+      [
+        "streams",
+        "retained_from_seq <= head_seq + 1",
+        "retained_from_seq <= head_seq + 2",
+      ],
+    ] as const;
+
+    for (const [tableName, search, replacement] of probes) {
+      withDatabase((database) => {
+        migrateAuthorityDatabase(database);
+        tamperSchemaSql(database, tableName, search, replacement);
+
+        expect(() => migrateAuthorityDatabase(database)).toThrow(/unknown schema/i);
+      });
+    }
+  });
+
+  it("enforces actor-kind and cross-room semantics at each database statement", () => {
+    withDatabase((database) => {
+      createV1Fixture(database);
+      seedV1History(database);
+      migrateAuthorityDatabase(database);
+      database.exec(`
+        INSERT INTO actors (
+          id, kind, display_name, reachability, readiness, tool_permissions_json
+        ) VALUES ('agent-2', 'agent', 'Second Agent', NULL, 'ready', '[]');
+        INSERT INTO streams (
+          stream_kind, stream_id, head_seq, retained_from_seq
+        ) VALUES ('identity', 'agent-2', 0, 1);
+      `);
+
+      expectSqlRejected(
+        database,
+        `INSERT INTO sessions (
+           family_id, account_id, actor_id, access_token_hash, refresh_token_hash,
+           access_expires_at, refresh_expires_at, revoked_at
+         ) VALUES ('family-agent', 'agent', 'agent-1', 'access-agent',
+                   'refresh-agent', 1, 2, NULL)`,
+      );
+      expectSqlRejected(
+        database,
+        `INSERT INTO room_memberships (
+           room_id, actor_id, kind, role, participation, tool_permissions_json,
+           joined_at, configured_at, access_revision
+         ) VALUES ('room-2', 'human-1', 'agent', NULL, 'active', '[]', NULL,
+                   '2026-08-09T01:01:00.000Z', 0)`,
+      );
+      expectSqlRejected(
+        database,
+        `INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+         VALUES ('message-kind-invalid', 'room-1', 'human-1', 'agent', 'invalid',
+                 '2026-08-09T01:02:00.000Z')`,
+      );
+      expectSqlRejected(
+        database,
+        `INSERT INTO room_invitations (
+           id, room_id, inviter_actor_id, invitee_actor_id, token_hash, status,
+           created_at, decision_actor_id, decided_at
+         ) VALUES ('invite-agent-source', 'room-1', 'agent-1', 'human-1',
+                   'token-agent-source', 'pending',
+                   '2026-08-09T01:03:00.000Z', NULL, NULL)`,
+      );
+      expectSqlRejected(
+        database,
+        `INSERT INTO room_invitations (
+           id, room_id, inviter_actor_id, invitee_actor_id, token_hash, status,
+           created_at, decision_actor_id, decided_at
+         ) VALUES ('invite-agent-target', 'room-1', 'human-1', 'agent-1',
+                   'token-agent-target', 'pending',
+                   '2026-08-09T01:04:00.000Z', NULL, NULL)`,
+      );
+      expectSqlRejected(
+        database,
+        `INSERT INTO human_read_receipts (room_id, actor_id, message_id, read_at)
+         VALUES ('room-1', 'agent-1', 'message-1',
+                 '2026-08-09T01:05:00.000Z')`,
+      );
+      expectSqlRejected(
+        database,
+        `INSERT INTO human_read_receipts (room_id, actor_id, message_id, read_at)
+         VALUES ('room-2', 'human-1', 'message-1',
+                 '2026-08-09T01:06:00.000Z')`,
+      );
+      expectSqlRejected(
+        database,
+        `INSERT INTO agent_judgments (
+           id, room_id, agent_id, message_id, judgment_json, created_at
+         ) VALUES ('judgment-human', 'room-1', 'human-1', 'message-1', '{}',
+                   '2026-08-09T01:07:00.000Z')`,
+      );
+      expectSqlRejected(
+        database,
+        `INSERT INTO agent_judgments (
+           id, room_id, agent_id, message_id, judgment_json, created_at
+         ) VALUES ('judgment-room', 'room-2', 'agent-1', 'message-1', '{}',
+                   '2026-08-09T01:08:00.000Z')`,
+      );
+      expectSqlRejected(
+        database,
+        `INSERT INTO agent_executions (
+           id, room_id, agent_id, trigger_message_id, status, started_at,
+           completed_at, result_json
+         ) VALUES ('execution-human', 'room-1', 'human-1', 'message-1',
+                   'running', '2026-08-09T01:09:00.000Z', NULL, NULL)`,
+      );
+      expectSqlRejected(
+        database,
+        `INSERT INTO agent_executions (
+           id, room_id, agent_id, trigger_message_id, status, started_at,
+           completed_at, result_json
+         ) VALUES ('execution-room', 'room-2', 'agent-1', 'message-1',
+                   'running', '2026-08-09T01:10:00.000Z', NULL, NULL)`,
+      );
+
+      database.exec(`
+        INSERT INTO sessions (
+          family_id, account_id, actor_id, access_token_hash, refresh_token_hash,
+          access_expires_at, refresh_expires_at, revoked_at
+        ) VALUES ('family-human', 'human', 'human-1', 'access-human',
+                  'refresh-human', 1, 2, NULL);
+        INSERT INTO room_invitations (
+          id, room_id, inviter_actor_id, invitee_actor_id, token_hash, status,
+          created_at, decision_actor_id, decided_at
+        ) VALUES ('invite-valid', 'room-1', 'human-1', 'human-1', 'token-valid',
+                  'pending', '2026-08-09T01:11:00.000Z', NULL, NULL);
+        INSERT INTO human_read_receipts (room_id, actor_id, message_id, read_at)
+        VALUES ('room-1', 'human-1', 'message-1',
+                '2026-08-09T01:12:00.000Z');
+        INSERT INTO agent_judgments (
+          id, room_id, agent_id, message_id, judgment_json, created_at
+        ) VALUES ('judgment-valid', 'room-1', 'agent-1', 'message-1', '{}',
+                  '2026-08-09T01:13:00.000Z');
+        INSERT INTO agent_executions (
+          id, room_id, agent_id, trigger_message_id, status, started_at,
+          completed_at, result_json
+        ) VALUES ('execution-valid', 'room-1', 'agent-1', 'message-1', 'running',
+                  '2026-08-09T01:14:00.000Z', NULL, NULL);
+        INSERT INTO calibration_signals (
+          id, room_id, agent_id, judgment_id, signal, created_at
+        ) VALUES ('signal-valid', 'room-1', 'agent-1', 'judgment-valid', 'up',
+                  '2026-08-09T01:15:00.000Z');
+      `);
+
+      expectSqlRejected(
+        database,
+        "UPDATE sessions SET actor_id = 'agent-1' WHERE access_token_hash = 'access-human'",
+      );
+      expectSqlRejected(
+        database,
+        `UPDATE room_memberships SET kind = 'agent', role = NULL,
+           participation = 'active', joined_at = NULL,
+           configured_at = '2026-08-09T01:16:00.000Z'
+         WHERE room_id = 'room-1' AND actor_id = 'human-1'`,
+      );
+      expectSqlRejected(
+        database,
+        "UPDATE messages SET author_kind = 'agent' WHERE id = 'message-1'",
+      );
+      expectSqlRejected(
+        database,
+        "UPDATE room_invitations SET inviter_actor_id = 'agent-1' WHERE id = 'invite-valid'",
+      );
+      expectSqlRejected(
+        database,
+        `UPDATE human_read_receipts SET actor_id = 'agent-1'
+         WHERE room_id = 'room-1' AND actor_id = 'human-1'`,
+      );
+      expectSqlRejected(
+        database,
+        "UPDATE agent_judgments SET room_id = 'room-2' WHERE id = 'judgment-valid'",
+      );
+      expectSqlRejected(
+        database,
+        "UPDATE agent_executions SET agent_id = 'human-1' WHERE id = 'execution-valid'",
+      );
+      expectSqlRejected(
+        database,
+        "UPDATE calibration_signals SET agent_id = 'agent-2' WHERE id = 'signal-valid'",
+      );
+      expectSqlRejected(
+        database,
+        "UPDATE actors SET kind = 'agent' WHERE id = 'human-1'",
+      );
+    });
+  });
+
+  it("enforces event bounds and JSON payloads at each database statement", () => {
+    withDatabase((database) => {
+      createV1Fixture(database);
+      seedV1History(database);
+      migrateAuthorityDatabase(database);
+
+      expectSqlRejected(
+        database,
+        `INSERT INTO events (
+           event_id, stream_kind, stream_id, stream_seq, room_id, actor_id,
+           event_type, occurred_at, payload_json
+         ) VALUES ('event-early', 'room', 'room-1', 1, 'room-1', 'human-1',
+                   'room.message.accepted', '2026-08-09T02:00:00.000Z', '{}')`,
+      );
+
+      database.exec(
+        `UPDATE streams SET head_seq = 1
+         WHERE stream_kind = 'room' AND stream_id = 'room-1'`,
+      );
+      expectSqlRejected(
+        database,
+        `INSERT INTO events (
+           event_id, stream_kind, stream_id, stream_seq, room_id, actor_id,
+           event_type, occurred_at, payload_json
+         ) VALUES ('event-json', 'room', 'room-1', 1, 'room-1', 'human-1',
+                   'room.message.accepted', '2026-08-09T02:01:00.000Z', 'not-json')`,
+      );
+    });
+  });
+
+  it("rejects committed event gaps, out-of-bounds rows, and corrupt payloads", () => {
+    const corruptions: readonly ((database: DatabaseSync) => void)[] = [
+      (database) => {
+        database.exec(
+          `UPDATE streams SET head_seq = 2
+           WHERE stream_kind = 'room' AND stream_id = 'room-1'`,
+        );
+      },
+      (database) => {
+        database.exec(
+          `UPDATE streams SET head_seq = 1
+           WHERE stream_kind = 'room' AND stream_id = 'room-1'`,
+        );
+        database.exec("PRAGMA ignore_check_constraints = ON");
+        database.exec(`
+          INSERT INTO events (
+            event_id, stream_kind, stream_id, stream_seq, room_id, actor_id,
+            event_type, occurred_at, payload_json
+          ) VALUES ('event-corrupt-json', 'room', 'room-1', 1, 'room-1',
+                    'human-1', 'room.message.accepted',
+                    '2026-08-09T02:02:00.000Z', 'not-json')
+        `);
+        database.exec("PRAGMA ignore_check_constraints = OFF");
+      },
+    ];
+
+    for (const corrupt of corruptions) {
+      withDatabase((database) => {
+        createV1Fixture(database);
+        seedV1History(database);
+        migrateAuthorityDatabase(database);
+        corrupt(database);
+        const before = snapshot(database);
+
+        expect(() => migrateAuthorityDatabase(database)).toThrow(/integrity|invariant|unknown schema/i);
+
+        expect(snapshot(database)).toEqual(before);
+      });
+    }
+  });
+
+  it("rejects invalid fault options before changing the database", () => {
+    const invalidValues = [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY];
+
+    for (const failAfterStatement of invalidValues) {
+      withDatabase((database) => {
+        expect(() =>
+          migrateAuthorityDatabase(database, { failAfterStatement }),
+        ).toThrow(TypeError);
+        expect(readSchemaVersion(database)).toBe(0);
+        expect(listAuthorityTables(database)).toEqual([]);
+      });
+    }
+  });
+
+  it("refuses unknown and future schemas", () => {
+    withDatabase((database) => {
+      database.exec("CREATE TABLE unknown_history (id TEXT PRIMARY KEY) STRICT");
+      expect(() => migrateAuthorityDatabase(database)).toThrow(/unknown schema/i);
+      expect(listAuthorityTables(database)).toEqual(["unknown_history"]);
+    });
+
+    withDatabase((database) => {
+      database.exec("PRAGMA user_version = 3");
+      expect(() => migrateAuthorityDatabase(database)).toThrow(/future schema/i);
+      expect(readSchemaVersion(database)).toBe(3);
+    });
+  });
+
+  it("refuses v2 schemas with missing or unexpected authority tables", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabase(database);
+      database.exec("DROP TABLE calibration_signals");
+
+      expect(() => migrateAuthorityDatabase(database)).toThrow(/unknown schema/i);
+    });
+
+    withDatabase((database) => {
+      migrateAuthorityDatabase(database);
+      database.exec("CREATE TABLE unexpected_authority_data (id TEXT) STRICT");
+
+      expect(() => migrateAuthorityDatabase(database)).toThrow(/unknown schema/i);
+    });
+  });
+
+  it("refuses v2 tables that are missing required contract columns", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabase(database);
+      database.exec("ALTER TABLE outbox_deliveries DROP COLUMN last_error");
+
+      expect(() => migrateAuthorityDatabase(database)).toThrow(/unknown schema/i);
+    });
+  });
+
+  it("refuses altered migration history and computes deterministic checksums", () => {
+    const first = withDatabase((database) => {
+      migrateAuthorityDatabase(database);
+      return database
+        .prepare("SELECT version, name, checksum FROM schema_migrations ORDER BY version")
+        .all();
+    });
+    const second = withDatabase((database) => {
+      migrateAuthorityDatabase(database);
+      return database
+        .prepare("SELECT version, name, checksum FROM schema_migrations ORDER BY version")
+        .all();
+    });
+    expect(second).toEqual(first);
+
+    withDatabase((database) => {
+      createV1Fixture(database, "0".repeat(64));
+      const before = snapshot(database);
+
+      expect(() => migrateAuthorityDatabase(database)).toThrow(/checksum/i);
+
+      expect(snapshot(database)).toEqual(before);
+    });
+  });
+});
