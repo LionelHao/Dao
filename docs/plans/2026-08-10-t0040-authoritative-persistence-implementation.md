@@ -518,6 +518,11 @@ export interface CommandStore {
 export interface SyncQueryStore {
   syncRoom(context: AuthenticatedSessionContext, request: RoomSyncRequest): Promise<RoomSyncResult>;
   readHistory(context: AuthenticatedSessionContext, roomId: string): Promise<readonly Message[]>;
+  // Server-internal point lookups; not exported through the package root.
+  readActor(actorId: string): Promise<Actor | undefined>;
+  readRoom(roomId: string): Promise<ManagedRoom | undefined>;
+  canAccessRoom(context: AuthenticatedSessionContext, roomId: string): Promise<boolean>;
+  readRoomAudit(context: AuthenticatedSessionContext, roomId: string): Promise<readonly RoomAuditRecord[]>;
   listPendingOutbox(limit: number): Promise<readonly OutboxDelivery[]>;
   markOutboxDispatched(deliveryId: string): Promise<void>;
 }
@@ -669,6 +674,17 @@ Stage only listed files and propose `feat(server): persist authoritative session
 
 - Modify: `packages/server/src/persistence/sqlite-authoritative-store.ts`
 - Modify: `packages/server/src/persistence/sqlite-authoritative-store.test.ts`
+- Modify: `packages/server/src/persistence/authority-worker.ts`
+- Modify: `packages/server/src/persistence/worker-protocol.ts`
+- Modify: `packages/server/src/persistence/worker-database-client.ts`
+- Modify: `packages/server/src/persistence/worker-database-client.test.ts`
+- Create: `packages/server/src/persistence/authority-database-handler.ts`
+- Modify: `packages/server/src/persistence/schema.ts`
+- Modify: `packages/server/src/persistence/schema.test.ts`
+- Modify: `packages/server/src/persistence/legacy-importer.test.ts`
+- Modify: `packages/server/src/persistence/contracts.ts`
+- Modify: `packages/server/src/persistence/contracts.test.ts`
+- Modify: `packages/server/src/persistence/contracts.type-test.ts`
 - Modify: `packages/server/src/room-lifecycle.ts`
 - Modify: `packages/server/src/room-lifecycle.test.ts`
 - Modify: `packages/server/src/service.ts`
@@ -678,6 +694,8 @@ Stage only listed files and propose `feat(server): persist authoritative session
 - Create: `packages/server/src/invitation-secret-protector.ts`
 - Create: `packages/server/src/invitation-secret-protector.test.ts`
 - Modify: `packages/server/src/index.ts`
+
+Task 6 advances the immutable authority schema from v3 to v4. The migration adds the missing canonical OpenItem, AgentExecution, and CalibrationSignal columns without changing v1-v3 checksums/fingerprints. Legacy calibration rows keep both actor and source fields `NULL`; migration must not infer only source from the old judgment and create a half-known row. V4 triggers require every new authoritative calibration write to carry a valid human actor and same-room source Agent message; the v4 triggers are included in the physical fingerprint/startup validation.
 
 - [ ] **Step 1: Write parameterized RED tests for all accepted facts.**
 
@@ -695,6 +713,8 @@ expect(await fixture.countEvents(first.eventIds)).toBe(first.eventIds.length);
 ```
 
 Run each case sequentially, concurrently with the same key, after worker restart, and with the same key plus changed canonical payload. The conflict case must be 409 and leave row counts unchanged. Add separate tests proving human/agent cross-authority calls fail and all three Agent judgement outcomes persist a non-empty reason.
+
+Changed-payload 409 applies only when a command has two or more legal canonical business payloads within the same idempotency scope. `room.archive` has a closed empty payload, so it instead proves sequential, concurrent, and cross-restart exact replay; an unknown or extra payload field is rejected as closed-schema 400 with zero writes, while a changed `roomId` is a different aggregate scope. Do not change the archive scope and do not add a synthetic reason field.
 
 For `human.invitation.issue`, drop the first ACK after COMMIT, restart, and replay the same key. The service must return the byte-identical invitation token without inserting another invitation. Scan SQLite text/blob values and prove the plaintext token is absent.
 
@@ -726,7 +746,7 @@ Hash canonical business payload only; exclude `requestId` and `idempotencyKey`. 
 
 - [ ] **Step 4: Implement room governance and catalog/access revisions.**
 
-Add create/rename/archive/invite/decision/configure-agent/change-role/remove-member handlers one at a time. After each handler, run its parameterized test case before adding the next. Preserve authored messages after removal. Increment all affected human catalog revisions for room create/rename/join/role/remove/archive and the target membership access revision for permission changes.
+Add create/rename/archive/invite/decision/configure-agent/change-role/remove-member handlers one at a time. After each handler, run its parameterized test case before adding the next. Preserve authored messages after removal. Increment all affected human catalog revisions for room create/rename/join/role/remove/archive and the target membership access revision for permission changes. Agent configure appends `identity.room-access.changed` with `joined` or `updated`, and Agent removal appends `removed`; include those identity event IDs in the acknowledgement, advance the Agent identity stream, and intentionally create no principal outbox delivery because Agents have no principal observer.
 
 Create an explicit secret port and AES-256-GCM adapter:
 
@@ -757,7 +777,13 @@ Expected: all canonical records and closed events persist exactly once; human/Ag
 
 - [ ] **Step 6: Convert services to authority facades.**
 
-`RoomLifecycleService` methods call `CommandStore` and async query methods instead of saving whole JSON documents. `MessageService.send/history` use authenticated/internal contexts; `send` no longer invokes listeners directly. The primitive service keeps its pure decision logic but delegates accepted persistent facts through injected writers; T-0041 remains responsible for real Agent runtime invocation.
+`RoomLifecycleService` methods call `CommandStore` and async query methods instead of saving whole JSON documents. `MessageService.send/history` use authenticated/internal contexts; `send` no longer invokes listeners directly. Keep the synchronous T-0039 primitive as a pure compatibility decision model. Add a separate asynchronous authoritative primitive facade that maps human/Agent contexts to `CommandStore`, awaits the committed acknowledgement, strictly parses the canonical result, and only then publishes the accepted fact; a failed commit must publish nothing. T-0041 remains responsible for real Agent runtime invocation.
+
+Owner-approved transition: implement a separate authoritative RoomLifecycle facade whose mutations use `CommandStore` and whose `readActor/readRoom/canAccessRoom/readRoomAudit` calls use the corresponding asynchronous `SyncQueryStore` methods. `readActor` and `readRoom` are explicitly server-internal point lookups for composition/lifecycle, not public permission queries: do not export raw `SyncQueryStore`, the SQLite authority factory, an authoritative lifecycle factory whose options expose them, or worker-client point-query methods from the package root. `canAccessRoom` and `readRoomAudit` retain session, membership, active-room, and authorization checks in the worker. Keep the T-0039 synchronous JSON implementation only as an explicitly named compatibility adapter; it must not participate in authoritative MessageService, authoritative mutations, or security decisions. Do not change WebSocket composition in Task 6 and do not pull Task 7 outbox dispatch forward.
+
+Keep the package-root worker client physically narrowed as well as type-narrowed: it must omit `executeHuman`, `executeAgent`, `readActor`, and `readRoom`, and it must not expose rollback/transport test seams. The deep client accepts `InternalAgentCommandContext`, validates its runtime capability internally, and only then constructs `AgentWorkerCommandContext`; never accept plain worker wire context at a public command boundary. Invitation secret material is prepared only by the internal SQLite authority facade.
+
+Use one closed `AuthorityWorkerErrorCode` union across database handlers, worker serialization, and response parsing. Map every member exhaustively to `400 | 401 | 403 | 404 | 409 | 503`; an unknown worker code must become one sanitized terminal `storage_unavailable` error shared by pending and later calls. If `ROLLBACK` fails after a transaction error, throw an internal `AggregateError` preserving both causes, close/poison the worker-owned `DatabaseSync`, reject all client work with that same sanitized terminal error, and release the coordinator only after `terminate()` resolves or an explicit `exit` arrives; terminate rejection without exit must retain the reservation. Fault seams remain internal test-only exports. Registration, session, and governance identity events must share one deep canonical identity stream/event writer whose input is derived from the closed `PersistedIdentityEvent` union; when an event ID depends on payload, derive it from the exact canonical bytes that the same writer persists. A synchronous `publishAccepted` observer runs after commit and its exception cannot change the durable ACK into a failure.
 
 - [ ] **Step 7: Run the complete authority regression.**
 

@@ -12,6 +12,13 @@ import type {
   Room,
 } from "@native-im/core";
 import type { StateStore } from "./state-store.js";
+import type {
+  AuthenticatedCommandContext,
+  AuthenticatedSessionContext,
+  CommandAcknowledgement,
+  CommandStore,
+  SyncQueryStore,
+} from "./persistence/contracts.js";
 
 const STATE_FIELDS = new Set(["version", "actors", "rooms", "invitations", "audit"]);
 const HUMAN_ACTOR_FIELDS = new Set([
@@ -250,6 +257,7 @@ export interface RoomLifecycleServiceOptions {
   readonly tokenFactory?: () => string;
 }
 
+/** T-0039 JSON compatibility adapter. Not an authoritative mutation/query surface. */
 export interface RoomLifecycleService {
   createRoom(
     actorId: string,
@@ -290,6 +298,66 @@ export interface RoomLifecycleService {
   getRoom(roomId: string): ManagedRoom | undefined;
   messageRoom(roomId: string): Room | undefined;
   audit(roomId: string): readonly RoomAuditRecord[];
+}
+
+export type T0039CompatibilityRoomLifecycleService = RoomLifecycleService;
+
+export interface AuthoritativeRoomLifecycleServiceOptions {
+  readonly commandStore: CommandStore;
+  readonly queryStore: Pick<
+    SyncQueryStore,
+    "readActor" | "readRoom" | "canAccessRoom" | "readRoomAudit"
+  >;
+}
+
+export interface AuthoritativeRoomLifecycleService {
+  createRoom(
+    context: AuthenticatedCommandContext,
+    input: { readonly name: string },
+  ): Promise<ManagedRoom>;
+  renameRoom(
+    context: AuthenticatedCommandContext,
+    roomId: string,
+    name: string,
+  ): Promise<ManagedRoom>;
+  archiveRoom(
+    context: AuthenticatedCommandContext,
+    roomId: string,
+  ): Promise<ManagedRoom>;
+  inviteHuman(
+    context: AuthenticatedCommandContext,
+    request: HumanInvitationRequest,
+  ): Promise<IssuedHumanInvitation>;
+  respondToHumanInvitation(
+    context: AuthenticatedCommandContext,
+    token: string,
+    decision: "accept" | "reject",
+  ): Promise<HumanInvitationRecord>;
+  configureAgent(
+    context: AuthenticatedCommandContext,
+    request: AgentConfigurationRequest,
+  ): Promise<ManagedRoom>;
+  setHumanRole(
+    context: AuthenticatedCommandContext,
+    roomId: string,
+    targetActorId: string,
+    role: "admin" | "member",
+  ): Promise<ManagedRoom>;
+  removeMember(
+    context: AuthenticatedCommandContext,
+    roomId: string,
+    targetActorId: string,
+  ): Promise<ManagedRoom>;
+  getActor(actorId: string): Promise<Actor | undefined>;
+  getRoom(roomId: string): Promise<ManagedRoom | undefined>;
+  canAccess(
+    context: AuthenticatedCommandContext,
+    roomId: string,
+  ): Promise<boolean>;
+  audit(
+    context: AuthenticatedCommandContext,
+    roomId: string,
+  ): Promise<readonly RoomAuditRecord[]>;
 }
 
 type UnknownRecord = Record<string, unknown>;
@@ -398,7 +466,7 @@ function isAgentMembership(value: unknown): value is AgentRoomMembership {
   );
 }
 
-function isManagedRoomShape(value: unknown): value is ManagedRoom {
+export function isManagedRoomShape(value: unknown): value is ManagedRoom {
   return (
     isRecord(value) &&
     hasOnlyFields(value, ROOM_FIELDS) &&
@@ -475,7 +543,7 @@ function auditExpectation(type: unknown): {
   }
 }
 
-function isAuditShape(value: unknown): value is RoomAuditRecord {
+export function isRoomAuditRecord(value: unknown): value is RoomAuditRecord {
   if (!isRecord(value)) {
     return false;
   }
@@ -518,7 +586,7 @@ export function isRoomLifecycleState(value: unknown): value is RoomLifecycleStat
     !Array.isArray(value.invitations) ||
     !value.invitations.every(isInvitationShape) ||
     !Array.isArray(value.audit) ||
-    !value.audit.every(isAuditShape)
+    !value.audit.every(isRoomAuditRecord)
   ) {
     return false;
   }
@@ -1048,6 +1116,218 @@ function normalizedName(name: unknown): string {
   return normalized;
 }
 
+function authoritativeSession(
+  context: AuthenticatedCommandContext,
+): AuthenticatedSessionContext {
+  return {
+    sessionId: context.sessionId,
+    sessionFamilyId: context.sessionFamilyId,
+    principal: context.principal,
+  };
+}
+
+function acknowledgementRecord(
+  acknowledgement: CommandAcknowledgement,
+  key: "room" | "invitation",
+): unknown {
+  return isRecord(acknowledgement.result)
+    ? acknowledgement.result[key]
+    : undefined;
+}
+
+function authoritativeRoom(acknowledgement: CommandAcknowledgement): ManagedRoom {
+  const room = acknowledgementRecord(acknowledgement, "room");
+  if (!isManagedRoomShape(room)) {
+    throw new TypeError("Authoritative room acknowledgement is invalid");
+  }
+  return cloneRoom(room);
+}
+
+function authoritativeIssuedInvitation(
+  acknowledgement: CommandAcknowledgement,
+): IssuedHumanInvitation {
+  const invitation = acknowledgementRecord(acknowledgement, "invitation");
+  if (
+    !isRecord(invitation) ||
+    !hasOnlyFields(
+      invitation,
+      new Set([
+        "invitationId",
+        "roomId",
+        "inviterActorId",
+        "inviteeActorId",
+        "token",
+        "createdAt",
+      ]),
+    ) ||
+    !isNonEmptyString(invitation.invitationId) ||
+    !isNonEmptyString(invitation.roomId) ||
+    !isNonEmptyString(invitation.inviterActorId) ||
+    !isNonEmptyString(invitation.inviteeActorId) ||
+    !isNonEmptyString(invitation.token) ||
+    !isIsoTimestamp(invitation.createdAt)
+  ) {
+    throw new TypeError("Authoritative invitation acknowledgement is invalid");
+  }
+  return {
+    invitationId: invitation.invitationId,
+    roomId: invitation.roomId,
+    inviterActorId: invitation.inviterActorId,
+    inviteeActorId: invitation.inviteeActorId,
+    token: invitation.token,
+    createdAt: invitation.createdAt,
+  };
+}
+
+function authoritativeInvitationDecision(
+  acknowledgement: CommandAcknowledgement,
+  token: string,
+): HumanInvitationRecord {
+  const invitation = acknowledgementRecord(acknowledgement, "invitation");
+  if (
+    !isRecord(invitation) ||
+    !hasOnlyFields(
+      invitation,
+      new Set([
+        "id",
+        "roomId",
+        "inviterActorId",
+        "inviteeActorId",
+        "status",
+        "createdAt",
+        "decisionActorId",
+        "decidedAt",
+      ]),
+    ) ||
+    !isNonEmptyString(invitation.id) ||
+    !isNonEmptyString(invitation.roomId) ||
+    !isNonEmptyString(invitation.inviterActorId) ||
+    !isNonEmptyString(invitation.inviteeActorId) ||
+    (invitation.status !== "accepted" && invitation.status !== "rejected") ||
+    !isIsoTimestamp(invitation.createdAt) ||
+    !isNonEmptyString(invitation.decisionActorId) ||
+    !isIsoTimestamp(invitation.decidedAt)
+  ) {
+    throw new TypeError("Authoritative invitation decision is invalid");
+  }
+  return {
+    id: invitation.id,
+    roomId: invitation.roomId,
+    inviterActorId: invitation.inviterActorId,
+    inviteeActorId: invitation.inviteeActorId,
+    tokenHash: hashToken(token),
+    status: invitation.status,
+    createdAt: invitation.createdAt,
+    decisionActorId: invitation.decisionActorId,
+    decidedAt: invitation.decidedAt,
+  };
+}
+
+export function createAuthoritativeRoomLifecycleService(
+  options: AuthoritativeRoomLifecycleServiceOptions,
+): AuthoritativeRoomLifecycleService {
+  return {
+    async createRoom(context, input) {
+      return authoritativeRoom(await options.commandStore.executeHuman(context, {
+        type: "room.create",
+        payload: { name: normalizedName(isRecord(input) ? input.name : undefined) },
+      }));
+    },
+
+    async renameRoom(context, roomId, name) {
+      return authoritativeRoom(await options.commandStore.executeHuman(context, {
+        type: "room.rename",
+        roomId,
+        payload: { name: normalizedName(name) },
+      }));
+    },
+
+    async archiveRoom(context, roomId) {
+      return authoritativeRoom(await options.commandStore.executeHuman(context, {
+        type: "room.archive",
+        roomId,
+        payload: {},
+      }));
+    },
+
+    async inviteHuman(context, request) {
+      if (!isHumanInvitationRequestStrict(request)) {
+        throw new RoomLifecycleError(400, "human_invitation_invalid");
+      }
+      return authoritativeIssuedInvitation(await options.commandStore.executeHuman(context, {
+        type: "human.invitation.issue",
+        roomId: request.roomId,
+        payload: { inviteeActorId: request.inviteeActorId },
+      }));
+    },
+
+    async respondToHumanInvitation(context, token, decision) {
+      if (!isNonEmptyString(token) || (decision !== "accept" && decision !== "reject")) {
+        throw new RoomLifecycleError(400, "invitation_decision_invalid");
+      }
+      const acknowledgement = await options.commandStore.executeHuman(context, {
+        type: "human.invitation.decide",
+        payload: { token, decision },
+      });
+      return authoritativeInvitationDecision(acknowledgement, token);
+    },
+
+    async configureAgent(context, request) {
+      if (!isAgentConfigurationRequestStrict(request)) {
+        throw new RoomLifecycleError(400, "agent_configuration_invalid");
+      }
+      return authoritativeRoom(await options.commandStore.executeHuman(context, {
+        type: "agent.configure",
+        roomId: request.roomId,
+        payload: {
+          agentId: request.agentId,
+          participation: request.participation,
+          toolPermissions: request.toolPermissions,
+        },
+      }));
+    },
+
+    async setHumanRole(context, roomId, targetActorId, role) {
+      if (!isNonEmptyString(targetActorId) || (role !== "admin" && role !== "member")) {
+        throw new RoomLifecycleError(400, "human_role_invalid");
+      }
+      return authoritativeRoom(await options.commandStore.executeHuman(context, {
+        type: "human.role.change",
+        roomId,
+        payload: { targetActorId, role },
+      }));
+    },
+
+    async removeMember(context, roomId, targetActorId) {
+      if (!isNonEmptyString(targetActorId)) {
+        throw new RoomLifecycleError(400, "room_member_not_found");
+      }
+      return authoritativeRoom(await options.commandStore.executeHuman(context, {
+        type: "member.remove",
+        roomId,
+        payload: { targetActorId },
+      }));
+    },
+
+    getActor(actorId) {
+      return options.queryStore.readActor(actorId);
+    },
+
+    getRoom(roomId) {
+      return options.queryStore.readRoom(roomId);
+    },
+
+    canAccess(context, roomId) {
+      return options.queryStore.canAccessRoom(authoritativeSession(context), roomId);
+    },
+
+    audit(context, roomId) {
+      return options.queryStore.readRoomAudit(authoritativeSession(context), roomId);
+    },
+  };
+}
+
+/** Creates the isolated T-0039 JSON compatibility adapter. */
 export async function createRoomLifecycleService(
   options: RoomLifecycleServiceOptions,
 ): Promise<RoomLifecycleService> {

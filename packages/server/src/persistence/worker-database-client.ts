@@ -3,9 +3,12 @@ import { lstat, readdir, readFile, readlink, realpath, stat } from "node:fs/prom
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
-import type { Actor } from "@native-im/core";
+import type { Actor, ManagedRoom, Message } from "@native-im/core";
+import type { RoomAuditRecord } from "../room-lifecycle.js";
 import {
   isAuthorityWorkerResponse,
+  isAuthorityWorkerErrorCode,
+  type AuthorityWorkerErrorCode,
   type AuthorityWorkerRequest,
   type AuthorityWorkerResponse,
 } from "./worker-protocol.js";
@@ -16,22 +19,25 @@ import type {
   LegacyImportResult,
 } from "./legacy-importer.js";
 import type {
+  AgentCollaborationCommand,
   AuthenticatedSessionContext,
   AuthenticatedCommandContext,
   CommandAcknowledgement,
   HashedSessionIssue,
   HashedSessionRotation,
   HumanCollaborationCommand,
+  InternalAgentCommandContext,
   IssuedSessionRecord,
   RoomGovernanceCommand,
 } from "./contracts.js";
+import { toAgentWorkerCommandContext } from "./contracts.js";
 
 export interface CreateWorkerDatabaseClientOptions {
   readonly databasePath: string;
 }
 
 export interface AuthoritySchemaInspection {
-  readonly version: 3;
+  readonly version: 4;
 }
 
 export interface WorkerDatabaseClient {
@@ -55,7 +61,33 @@ export interface WorkerDatabaseClient {
     context: AuthenticatedCommandContext,
     command: HumanCollaborationCommand | RoomGovernanceCommand,
     now: number,
+    invitationSecret?: {
+      readonly tokenHash: string;
+      readonly sealedToken: string;
+    },
   ): Promise<CommandAcknowledgement>;
+  executeAgent(
+    context: InternalAgentCommandContext,
+    command: AgentCollaborationCommand,
+    now: number,
+  ): Promise<CommandAcknowledgement>;
+  readHistory(
+    context: AuthenticatedSessionContext,
+    roomId: string,
+    now: number,
+  ): Promise<readonly Message[]>;
+  readActor(actorId: string): Promise<Actor | undefined>;
+  readRoom(roomId: string): Promise<ManagedRoom | undefined>;
+  canAccessRoom(
+    context: AuthenticatedSessionContext,
+    roomId: string,
+    now: number,
+  ): Promise<boolean>;
+  readRoomAudit(
+    context: AuthenticatedSessionContext,
+    roomId: string,
+    now: number,
+  ): Promise<readonly RoomAuditRecord[]>;
   close(): Promise<void>;
 }
 
@@ -69,9 +101,83 @@ export interface AuthorityWorkerTransport {
 }
 
 export class AuthorityWorkerClientError extends Error {
-  constructor(readonly code: string, message: string) {
+  readonly status: number;
+
+  constructor(readonly code: AuthorityWorkerClientErrorCode, message: string) {
     super(message);
     this.name = "AuthorityWorkerClientError";
+    this.status = authorityWorkerClientErrorStatus(code);
+  }
+}
+
+type AuthorityWorkerClientLocalErrorCode =
+  | "authority_coordinator_exists"
+  | "authority_worker_error"
+  | "authority_worker_exited"
+  | "authority_worker_message_error"
+  | "authority_worker_not_ready"
+  | "authority_worker_post_failed"
+  | "authority_worker_protocol_error";
+
+export type AuthorityWorkerClientErrorCode =
+  | AuthorityWorkerErrorCode
+  | AuthorityWorkerClientLocalErrorCode;
+
+function authorityWorkerClientErrorStatus(
+  code: AuthorityWorkerClientErrorCode,
+): 400 | 401 | 403 | 404 | 409 | 503 {
+  switch (code) {
+    case "agent_permissions_invalid":
+    case "agent_required":
+    case "calibration_source_invalid":
+    case "invalid_request":
+    case "invitee_required":
+      return 400;
+    case "invalid_token":
+    case "token_expired":
+      return 401;
+    case "agent_missing_permission":
+    case "identity_forbidden":
+    case "invitation_forbidden":
+    case "room_forbidden":
+    case "session_revoked":
+      return 403;
+    case "invitation_not_found":
+    case "member_not_found":
+    case "message_not_found":
+    case "open_item_not_found":
+    case "room_member_not_found":
+    case "room_not_found":
+      return 404;
+    case "actor_conflict":
+    case "authority_already_initialized":
+    case "authority_coordinator_exists":
+    case "execution_conflict":
+    case "execution_not_running":
+    case "idempotency_conflict":
+    case "invitation_consumed":
+    case "invitation_pending":
+    case "room_archived":
+    case "room_member_exists":
+    case "room_owner_required":
+      return 409;
+    case "authority_not_initialized":
+    case "authority_worker_closed":
+    case "authority_worker_error":
+    case "authority_worker_exited":
+    case "authority_worker_message_error":
+    case "authority_worker_not_ready":
+    case "authority_worker_post_failed":
+    case "authority_worker_protocol_error":
+    case "invitation_secret_unavailable":
+    case "legacy_import_failed":
+    case "legacy_import_unavailable":
+    case "storage_unavailable":
+      return 503;
+    default: {
+      const unreachable: never = code;
+      return unreachable;
+    }
   }
 }
 
@@ -347,11 +453,12 @@ interface AuthorityCoordinatorReservation {
   release(): void;
 }
 
-async function terminateTransport(worker: AuthorityWorkerTransport): Promise<void> {
+async function terminateTransport(worker: AuthorityWorkerTransport): Promise<boolean> {
   try {
     await worker.terminate();
+    return true;
   } catch {
-    // Transport teardown is best-effort after its public error is already fixed.
+    return false;
   }
 }
 
@@ -398,11 +505,13 @@ function authorityWorkerUrl(): URL {
 function createAuthorityWorker(
   options: CreateWorkerDatabaseClientOptions,
   recovery: LegacyImportRecovery | undefined,
+  rollbackFailureForTest = false,
 ): AuthorityWorkerTransport {
   return new Worker(authorityWorkerUrl(), {
     workerData: {
       databasePath: options.databasePath,
       ...(recovery === undefined ? {} : { recovery }),
+      ...(rollbackFailureForTest ? { rollbackFailureForTest: true } : {}),
     },
   });
 }
@@ -438,6 +547,7 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
       );
     });
     worker.on("exit", (exitCode: number) => {
+      this.#releaseCoordinator();
       if (this.#state === "closed") {
         return;
       }
@@ -657,6 +767,10 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
     context: AuthenticatedCommandContext,
     command: HumanCollaborationCommand | RoomGovernanceCommand,
     now: number,
+    invitationSecret?: {
+      readonly tokenHash: string;
+      readonly sealedToken: string;
+    },
   ): Promise<CommandAcknowledgement> {
     if (this.#terminalError !== undefined) {
       return this.#rejectTerminal();
@@ -669,6 +783,7 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
       type: "authority.execute-human",
       context,
       command,
+      ...(invitationSecret === undefined ? {} : { invitationSecret }),
       now,
     }).then((response) => {
       if (response.type !== "authority.command-acknowledged") {
@@ -677,6 +792,110 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
       }
       return response.acknowledgement;
     });
+  }
+
+  executeAgent(
+    context: InternalAgentCommandContext,
+    command: AgentCollaborationCommand,
+    now: number,
+  ): Promise<CommandAcknowledgement> {
+    let wireContext: ReturnType<typeof toAgentWorkerCommandContext>;
+    try {
+      wireContext = toAgentWorkerCommandContext(context);
+    } catch (error: unknown) {
+      return Promise.reject(error);
+    }
+    if (this.#terminalError !== undefined) {
+      return this.#rejectTerminal();
+    }
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) {
+      return Promise.reject(unavailable);
+    }
+    return this.#send({
+      type: "authority.execute-agent",
+      context: wireContext,
+      command,
+      now,
+    }).then((response) => {
+      if (response.type !== "authority.command-acknowledged") {
+        this.#failProtocol("Authority worker returned the wrong Agent command response");
+        throw this.#terminalError;
+      }
+      return response.acknowledgement;
+    });
+  }
+
+  readHistory(
+    context: AuthenticatedSessionContext,
+    roomId: string,
+    now: number,
+  ): Promise<readonly Message[]> {
+    if (this.#terminalError !== undefined) {
+      return this.#rejectTerminal();
+    }
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) {
+      return Promise.reject(unavailable);
+    }
+    return this.#send({ type: "authority.read-history", context, roomId, now })
+      .then((response) => {
+        if (response.type !== "authority.history") {
+          this.#failProtocol("Authority worker returned the wrong history response");
+          throw this.#terminalError;
+        }
+        return response.messages;
+      });
+  }
+
+  readActor(actorId: string): Promise<Actor | undefined> {
+    return this.#send({ type: "authority.read-actor", actorId }).then((response) => {
+      if (response.type !== "authority.actor") {
+        this.#failProtocol("Authority worker returned the wrong actor response");
+        throw this.#terminalError;
+      }
+      return response.actor;
+    });
+  }
+
+  readRoom(roomId: string): Promise<ManagedRoom | undefined> {
+    return this.#send({ type: "authority.read-room", roomId }).then((response) => {
+      if (response.type !== "authority.room") {
+        this.#failProtocol("Authority worker returned the wrong room response");
+        throw this.#terminalError;
+      }
+      return response.room;
+    });
+  }
+
+  canAccessRoom(
+    context: AuthenticatedSessionContext,
+    roomId: string,
+    now: number,
+  ): Promise<boolean> {
+    return this.#send({ type: "authority.can-access-room", context, roomId, now })
+      .then((response) => {
+        if (response.type !== "authority.room-access") {
+          this.#failProtocol("Authority worker returned the wrong room-access response");
+          throw this.#terminalError;
+        }
+        return response.allowed;
+      });
+  }
+
+  readRoomAudit(
+    context: AuthenticatedSessionContext,
+    roomId: string,
+    now: number,
+  ): Promise<readonly RoomAuditRecord[]> {
+    return this.#send({ type: "authority.read-room-audit", context, roomId, now })
+      .then((response) => {
+        if (response.type !== "authority.room-audit") {
+          this.#failProtocol("Authority worker returned the wrong room-audit response");
+          throw this.#terminalError;
+        }
+        return response.audit;
+      });
   }
 
   close(): Promise<void> {
@@ -761,6 +980,20 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
     if (this.#terminalError !== undefined || this.#state === "closed") {
       return;
     }
+    if (
+      isRecord(message) &&
+      hasExactKeys(message, ["type", "requestId", "code", "message"]) &&
+      message.type === "authority.error" &&
+      typeof message.requestId === "string" &&
+      typeof message.code === "string" &&
+      !isAuthorityWorkerErrorCode(message.code)
+    ) {
+      this.#failTerminal(new AuthorityWorkerClientError(
+        "storage_unavailable",
+        "Authority storage became unavailable",
+      ));
+      return;
+    }
     if (!isAuthorityWorkerResponse(message)) {
       this.#failProtocol("Authority worker sent a malformed response");
       return;
@@ -779,10 +1012,9 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
     if (message.type === "authority.error") {
       const error = new AuthorityWorkerClientError(message.code, message.message);
       if (
+        message.code === "storage_unavailable" ||
         pending.requestType === "authority.initialize" ||
-        pending.requestType === "authority.close" ||
-        (pending.requestType === "authority.inspect-schema" &&
-          message.code === "storage_unavailable")
+        pending.requestType === "authority.close"
       ) {
         this.#failTerminal(error);
       } else {
@@ -837,6 +1069,14 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
         responseType === "authority.session-revoked") ||
       (requestType === "authority.execute-human" &&
         responseType === "authority.command-acknowledged") ||
+      (requestType === "authority.execute-agent" &&
+        responseType === "authority.command-acknowledged") ||
+      (requestType === "authority.read-history" &&
+        responseType === "authority.history") ||
+      (requestType === "authority.read-actor" && responseType === "authority.actor") ||
+      (requestType === "authority.read-room" && responseType === "authority.room") ||
+      (requestType === "authority.can-access-room" && responseType === "authority.room-access") ||
+      (requestType === "authority.read-room-audit" && responseType === "authority.room-audit") ||
       (requestType === "authority.close" && responseType === "authority.closed")
     );
   }
@@ -875,8 +1115,10 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
     for (const request of pending) {
       request.reject(error);
     }
-    void terminateTransport(this.#worker).then(() => {
-      this.#releaseCoordinator();
+    void terminateTransport(this.#worker).then((terminated) => {
+      if (terminated) {
+        this.#releaseCoordinator();
+      }
     });
     return error;
   }
@@ -907,8 +1149,9 @@ async function createClient(
   try {
     client = new WorkerDatabaseClientImplementation(worker, reservation.release);
   } catch {
-    await terminateTransport(worker);
-    reservation.release();
+    if (await terminateTransport(worker)) {
+      reservation.release();
+    }
     throw new AuthorityWorkerClientError(
       "authority_worker_error",
       "Authority worker failed",
@@ -922,8 +1165,9 @@ async function createClient(
     if (error instanceof AuthorityWorkerClientError) {
       throw error;
     }
-    await terminateTransport(worker);
-    reservation.release();
+    if (await terminateTransport(worker)) {
+      reservation.release();
+    }
     throw new AuthorityWorkerClientError(
       "authority_worker_error",
       "Authority worker failed",
@@ -945,4 +1189,13 @@ export function createWorkerDatabaseClientForTest(
   workerFactory: AuthorityWorkerFactory,
 ): Promise<WorkerDatabaseClient> {
   return createClient(_options, workerFactory);
+}
+
+// Module-local integration seam. It is intentionally absent from the package root export.
+export function createWorkerDatabaseClientWithRollbackFailureForTest(
+  options: CreateWorkerDatabaseClientOptions,
+): Promise<WorkerDatabaseClient> {
+  return createClient(options, (databasePath, recovery) =>
+    createAuthorityWorker({ databasePath }, recovery, true),
+  );
 }

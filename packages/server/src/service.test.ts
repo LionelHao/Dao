@@ -20,6 +20,11 @@ import {
   type RoomLifecycleState,
   type StateStore,
 } from "./index.js";
+import type {
+  AuthenticatedCommandContext,
+  CommandStore,
+  SyncQueryStore,
+} from "./persistence/contracts.js";
 
 const owner = {
   id: "human-owner",
@@ -204,6 +209,84 @@ async function expectAllRoomActionsForbidden(
 }
 
 describe("message service", () => {
+  it("uses authenticated authority ports for send/history without direct listener fanout", async () => {
+    const fixture = await createDirectory();
+    const context: AuthenticatedCommandContext = {
+      kind: "human",
+      sessionId: "session-owner",
+      sessionFamilyId: "family-owner",
+      principal: { accountId: "account-owner", actorId: owner.id },
+      requestId: "message-authority-request",
+      idempotencyKey: "message-authority-key",
+    };
+    const authoritative = authoritativeMessage(owner, fixture.roomId, "message-authority");
+    const commands: CommandStore = {
+      async executeHuman(receivedContext, command) {
+        expect(receivedContext).toEqual(context);
+        expect(command).toEqual({
+          type: "message.send",
+          roomId: fixture.roomId,
+          payload: draftFor(fixture.roomId, "message-authority"),
+        });
+        return {
+          aggregateId: authoritative.id,
+          eventIds: ["event-authority"],
+          acceptedAt: "2026-08-10T14:00:00.000Z",
+          result: { message: authoritative },
+        };
+      },
+      executeAgent() {
+        throw new Error("unexpected Agent command");
+      },
+    };
+    const queries: SyncQueryStore = {
+      readActor() {
+        throw new Error("unexpected actor query");
+      },
+      readRoom() {
+        throw new Error("unexpected room query");
+      },
+      canAccessRoom() {
+        throw new Error("unexpected access query");
+      },
+      readRoomAudit() {
+        throw new Error("unexpected audit query");
+      },
+      syncRoom() {
+        throw new Error("unexpected sync");
+      },
+      async readHistory(receivedContext, roomId) {
+        expect(receivedContext).toEqual({
+          sessionId: context.sessionId,
+          sessionFamilyId: context.sessionFamilyId,
+          principal: context.principal,
+        });
+        expect(roomId).toBe(fixture.roomId);
+        return [authoritative];
+      },
+      async listPendingOutbox() {
+        return [];
+      },
+      async markOutboxDispatched() {},
+    };
+    const service = createMessageService({
+      commandStore: commands,
+      queryStore: queries,
+    });
+    expect(() => service.subscribe(owner.id, fixture.roomId, () => undefined))
+      .toThrowError("Authoritative message subscriptions require outbox delivery");
+
+    await expect(
+      service.send(context, draftFor(fixture.roomId, "message-authority")),
+    ).resolves.toEqual({
+      type: "message.accepted",
+      requestId: context.requestId,
+      messageId: "message-authority",
+      persistedAt: "2026-08-10T14:00:00.000Z",
+    });
+    await expect(service.history(context, fixture.roomId)).resolves.toEqual([authoritative]);
+  });
+
   it("derives authoritative authorship and persists before acknowledgement or fanout", async () => {
     const store = new DeferredMemoryStore();
     const { service, roomId } = await createService(store, {

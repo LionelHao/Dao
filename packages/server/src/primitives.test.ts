@@ -1,6 +1,20 @@
 import type { Actor, Message, Room } from "@native-im/core";
 import { describe, expect, it } from "vitest";
-import { CollaborationPrimitiveError, createCollaborationPrimitives } from "./primitives.js";
+import {
+  createAuthoritativeCollaborationPrimitives,
+  CollaborationPrimitiveError,
+  createCollaborationPrimitives,
+  type AcceptedCollaborationFact,
+} from "./primitives.js";
+import {
+  mintInternalAgentCommandContext,
+  type AuthenticatedCommandContext,
+  type CommandAcknowledgement,
+  type CommandStore,
+  type HumanCollaborationCommand,
+  type RoomGovernanceCommand,
+  type AgentCollaborationCommand,
+} from "./persistence/contracts.js";
 
 const humans: readonly Actor[] = [
   { id: "human-lionel", kind: "human", displayName: "Lionel", reachability: "online" },
@@ -102,6 +116,187 @@ function createFixture() {
 }
 
 describe("T-0012 read receipts and agent judgements", () => {
+  it("keeps the T-0039 synchronous primitive as a pure compatibility decision model", () => {
+    const primitives = createCollaborationPrimitives({
+      actors: [...humans, ...agents],
+      rooms: [room],
+      messages: [humanMessage, agentMessage],
+      now: () => "2026-08-07T09:02:00.000Z",
+    });
+
+    const receipt = primitives.recordHumanRead({
+      messageId: humanMessage.id,
+      readerId: "human-chen",
+    });
+
+    expect(receipt).toMatchObject({ messageId: humanMessage.id, readerId: "human-chen" });
+    expect(primitives.humanReadReceiptsFor(humanMessage.id)).toEqual([receipt]);
+  });
+
+  it("awaits authoritative human and Agent writes before publishing canonical facts", async () => {
+    const accepted: AcceptedCollaborationFact[] = [];
+    const commands: string[] = [];
+    const humanContext: AuthenticatedCommandContext = {
+      kind: "human",
+      requestId: "request-authoritative-human",
+      idempotencyKey: "key-authoritative-human",
+      sessionId: "session-authoritative-human",
+      sessionFamilyId: "family-authoritative-human",
+      principal: { accountId: "account-lionel", actorId: "human-lionel" },
+    };
+    const agentContext = mintInternalAgentCommandContext({
+      agentId: "agent-data",
+      requestId: "request-authoritative-agent",
+      idempotencyKey: "key-authoritative-agent",
+    });
+    const receipt = {
+      id: "read-1", messageId: humanMessage.id, readerId: "human-lionel",
+      readAt: "2026-08-07T09:02:00.000Z",
+    };
+    const judgment = {
+      id: "judgment-1", messageId: humanMessage.id, agentId: "agent-data",
+      outcome: "will_respond" as const, reason: "命中领域",
+      decidedAt: "2026-08-07T09:02:00.000Z",
+    };
+    const item = {
+      id: "open-item-1", roomId: room.id, sourceMessageId: humanMessage.id,
+      requesterId: "human-lionel", ownerId: "human-zhou", content: "确认权限边界",
+      status: "pending_response" as const, createdAt: "2026-08-07T09:02:00.000Z",
+      transferChain: [],
+    };
+    const execution = {
+      id: "execution-1", roomId: room.id, sourceMessageId: humanMessage.id,
+      requesterId: "human-lionel", agentId: "agent-data", toolName: "warehouse.query",
+      status: "running" as const, startedAt: "2026-08-07T09:02:00.000Z",
+    };
+    const signal = {
+      id: "calibration-1", sourceMessageId: agentMessage.id, actorId: "human-lionel",
+      agentId: "agent-data", emoji: "👍" as const, createdAt: "2026-08-07T09:02:00.000Z",
+    };
+    function acknowledgement(result: CommandAcknowledgement["result"]): CommandAcknowledgement {
+      return { aggregateId: "aggregate-1", eventIds: ["event-1"], acceptedAt: "2026-08-07T09:02:00.000Z", result };
+    }
+    const commandStore: CommandStore = {
+      async executeHuman(_context, command: HumanCollaborationCommand | RoomGovernanceCommand) {
+        commands.push(`human:${command.type}`);
+        if (command.type === "human.read.record") return acknowledgement({ receipt });
+        if (command.type === "open-item.create" || command.type === "open-item.transition") return acknowledgement({ item });
+        if (command.type === "calibration.record") return acknowledgement({ signal });
+        throw new Error("unexpected human command");
+      },
+      async executeAgent(_context, command: AgentCollaborationCommand) {
+        commands.push(`agent:${command.type}`);
+        if (command.type === "agent.judgment.record") return acknowledgement({ judgment });
+        if (command.type === "open-item.create" || command.type === "open-item.transition") return acknowledgement({ item });
+        if (command.type === "agent.execution.transition") return acknowledgement({ execution });
+        throw new Error("unexpected Agent command");
+      },
+    };
+    const primitives = createAuthoritativeCollaborationPrimitives({
+      commandStore,
+      publishAccepted: (fact) => accepted.push(fact),
+    });
+
+    await primitives.recordHumanRead(humanContext, room.id, { messageId: humanMessage.id });
+    await primitives.recordAgentJudgement(agentContext, room.id, {
+      messageId: humanMessage.id, outcome: "will_respond", reason: "命中领域",
+    });
+    await primitives.createOpenItem(humanContext, room.id, {
+      sourceMessageId: humanMessage.id, ownerId: "human-zhou", content: "确认权限边界",
+    });
+    await primitives.transitionOpenItem(agentContext, room.id, {
+      itemId: item.id, action: "respond",
+    });
+    await primitives.transitionAgentExecution(agentContext, room.id, {
+      executionId: execution.id, sourceMessageId: humanMessage.id,
+      toolName: "warehouse.query", status: "running",
+    });
+    await primitives.recordCalibration(humanContext, room.id, {
+      sourceMessageId: agentMessage.id, emoji: "👍",
+    });
+
+    expect(commands).toEqual([
+      "human:human.read.record",
+      "agent:agent.judgment.record",
+      "human:open-item.create",
+      "agent:open-item.transition",
+      "agent:agent.execution.transition",
+      "human:calibration.record",
+    ]);
+    expect(accepted.map((fact) => fact.kind)).toEqual([
+      "human-read", "agent-judgment", "open-item", "open-item", "agent-execution", "calibration",
+    ]);
+  });
+
+  it("does not publish an authoritative primitive when commit fails", async () => {
+    const accepted: AcceptedCollaborationFact[] = [];
+    const context: AuthenticatedCommandContext = {
+      kind: "human",
+      requestId: "request-failed-commit",
+      idempotencyKey: "key-failed-commit",
+      sessionId: "session-failed-commit",
+      sessionFamilyId: "family-failed-commit",
+      principal: { accountId: "account-lionel", actorId: "human-lionel" },
+    };
+    const failure = new Error("commit failed");
+    const commandStore: CommandStore = {
+      executeHuman: async () => { throw failure; },
+      executeAgent: async () => { throw failure; },
+    };
+    const primitives = createAuthoritativeCollaborationPrimitives({
+      commandStore,
+      publishAccepted: (fact) => accepted.push(fact),
+    });
+
+    await expect(primitives.recordHumanRead(context, room.id, {
+      messageId: humanMessage.id,
+    })).rejects.toBe(failure);
+    expect(accepted).toEqual([]);
+  });
+
+  it("keeps the durable acknowledgement successful when the post-commit publisher throws", async () => {
+    let commandCount = 0;
+    let publishCount = 0;
+    const receipt = {
+      id: "read-publisher-throws",
+      messageId: humanMessage.id,
+      readerId: "human-lionel",
+      readAt: "2026-08-07T09:02:00.000Z",
+    };
+    const commandStore: CommandStore = {
+      async executeHuman() {
+        commandCount += 1;
+        return {
+          aggregateId: humanMessage.id,
+          eventIds: ["event-human-read"],
+          acceptedAt: receipt.readAt,
+          result: { receipt },
+        };
+      },
+      async executeAgent() {
+        throw new Error("unexpected Agent command");
+      },
+    };
+    const primitives = createAuthoritativeCollaborationPrimitives({
+      commandStore,
+      publishAccepted() {
+        publishCount += 1;
+        throw new Error("observer failed");
+      },
+    });
+
+    await expect(primitives.recordHumanRead({
+      kind: "human",
+      requestId: "publisher-throws",
+      idempotencyKey: "publisher-throws",
+      sessionId: "session-publisher-throws",
+      sessionFamilyId: "family-publisher-throws",
+      principal: { accountId: "account-lionel", actorId: "human-lionel" },
+    }, room.id, { messageId: humanMessage.id })).resolves.toEqual(receipt);
+    expect(commandCount).toBe(1);
+    expect(publishCount).toBe(1);
+  });
+
   it("stores human reads separately and records an explainable judgement when an agent will not speak", () => {
     const { primitives } = createFixture();
 

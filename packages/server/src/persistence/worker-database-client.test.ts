@@ -15,14 +15,20 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { DatabaseSync } from "node:sqlite";
 import { Worker } from "node:worker_threads";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import {
   createWorkerDatabaseClient,
+  createWorkerDatabaseClientWithRollbackFailureForTest,
   createWorkerDatabaseClientForTest,
   type AuthorityWorkerTransport,
   type WorkerDatabaseClient,
 } from "./worker-database-client.js";
+import {
+  AuthorityRollbackFatalError,
+  runAuthorityImmediateTransaction,
+} from "./authority-database-handler.js";
 import {
   isAuthorityWorkerRequest,
   isAuthorityWorkerResponse,
@@ -91,7 +97,7 @@ async function expectDatabasePathReusable(path: string): Promise<void> {
   const replacement = trackClient(
     await createWorkerDatabaseClient({ databasePath: path }),
   );
-  await expect(replacement.inspectSchema()).resolves.toEqual({ version: 3 });
+  await expect(replacement.inspectSchema()).resolves.toEqual({ version: 4 });
 }
 
 async function expectDatabasePathEventuallyReusable(path: string): Promise<void> {
@@ -129,7 +135,7 @@ function workerThatRuns(scriptBody: string): Worker {
         parentPort.postMessage({
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 3,
+          schemaVersion: 4,
         });
         return;
       }
@@ -195,12 +201,42 @@ class MessageErrorTransport extends EventEmitter implements AuthorityWorkerTrans
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 3,
+          schemaVersion: 4,
         } satisfies AuthorityWorkerResponse);
       });
       return;
     }
     queueMicrotask(() => this.emit("messageerror", this.failure));
+  }
+
+  async terminate(): Promise<number> {
+    return 0;
+  }
+}
+
+class CapabilityProbeTransport extends EventEmitter implements AuthorityWorkerTransport {
+  readonly requests: AuthorityWorkerRequest[] = [];
+
+  postMessage(request: AuthorityWorkerRequest): void {
+    this.requests.push(request);
+    if (request.type === "authority.initialize") {
+      queueMicrotask(() => this.emit("message", {
+        type: "authority.ready",
+        requestId: request.requestId,
+        schemaVersion: 4,
+      } satisfies AuthorityWorkerResponse));
+      return;
+    }
+    queueMicrotask(() => this.emit("message", {
+      type: "authority.command-acknowledged",
+      requestId: request.requestId,
+      acknowledgement: {
+        aggregateId: "forged-write",
+        eventIds: ["forged-event"],
+        acceptedAt: "2026-08-10T00:00:00.000Z",
+        result: {},
+      },
+    } satisfies AuthorityWorkerResponse));
   }
 
   async terminate(): Promise<number> {
@@ -225,7 +261,7 @@ class ThrowingPostTransport extends EventEmitter implements AuthorityWorkerTrans
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 3,
+          schemaVersion: 4,
         } satisfies AuthorityWorkerResponse);
       });
     }
@@ -248,7 +284,7 @@ class DeferredTerminationTransport
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 3,
+          schemaVersion: 4,
         } satisfies AuthorityWorkerResponse);
       });
       return;
@@ -267,6 +303,33 @@ class DeferredTerminationTransport
   }
 }
 
+class RejectingTerminationTransport
+  extends EventEmitter
+  implements AuthorityWorkerTransport
+{
+  postMessage(request: AuthorityWorkerRequest): void {
+    if (request.type === "authority.initialize") {
+      queueMicrotask(() => {
+        this.emit("message", {
+          type: "authority.ready",
+          requestId: request.requestId,
+          schemaVersion: 4,
+        } satisfies AuthorityWorkerResponse);
+      });
+      return;
+    }
+    queueMicrotask(() => this.emit("messageerror", secretTransportError()));
+  }
+
+  async terminate(): Promise<number> {
+    throw new Error("transport termination rejected");
+  }
+
+  signalExit(): void {
+    this.emit("exit", 1);
+  }
+}
+
 class CloseRaceTransport extends EventEmitter implements AuthorityWorkerTransport {
   #closeRequest: AuthorityWorkerRequest | undefined;
   #inspectRequest: AuthorityWorkerRequest | undefined;
@@ -278,7 +341,7 @@ class CloseRaceTransport extends EventEmitter implements AuthorityWorkerTranspor
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 3,
+          schemaVersion: 4,
         } satisfies AuthorityWorkerResponse);
       });
       return;
@@ -307,7 +370,7 @@ class CloseRaceTransport extends EventEmitter implements AuthorityWorkerTranspor
     this.emit("message", {
       type: "authority.schema",
       requestId: this.#inspectRequest.requestId,
-      schemaVersion: 3,
+      schemaVersion: 4,
     } satisfies AuthorityWorkerResponse);
   }
 
@@ -379,14 +442,14 @@ describe("AuthorityWorker closed protocol", () => {
       isAuthorityWorkerResponse({
         type: "authority.ready",
         requestId: "1",
-        schemaVersion: 3,
+        schemaVersion: 4,
       }),
     ).toBe(true);
     expect(
       isAuthorityWorkerResponse({
         type: "authority.schema",
         requestId: "2",
-        schemaVersion: 3,
+        schemaVersion: 4,
       }),
     ).toBe(true);
     expect(
@@ -408,7 +471,7 @@ describe("AuthorityWorker closed protocol", () => {
       isAuthorityWorkerResponse({
         type: "authority.schema",
         requestId: "5",
-        schemaVersion: 3,
+        schemaVersion: 4,
         rows: [],
       }),
     ).toBe(false);
@@ -432,7 +495,7 @@ describe("AuthorityWorker closed protocol", () => {
     let response = once(worker, "message");
     worker.postMessage({ type: "authority.initialize", requestId: "1" });
     await expect(response).resolves.toEqual([
-      { type: "authority.ready", requestId: "1", schemaVersion: 3 },
+      { type: "authority.ready", requestId: "1", schemaVersion: 4 },
     ]);
 
     response = once(worker, "message");
@@ -449,7 +512,7 @@ describe("AuthorityWorker closed protocol", () => {
     response = once(worker, "message");
     worker.postMessage({ type: "authority.inspect-schema", requestId: "2" });
     await expect(response).resolves.toEqual([
-      { type: "authority.schema", requestId: "2", schemaVersion: 3 },
+      { type: "authority.schema", requestId: "2", schemaVersion: 4 },
     ]);
   });
 });
@@ -516,7 +579,7 @@ describe("authority database coordinator registry", () => {
     const initialized = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
-    await expect(initialized.inspectSchema()).resolves.toEqual({ version: 3 });
+    await expect(initialized.inspectSchema()).resolves.toEqual({ version: 4 });
     await initialized.close();
     linkSync(path, aliasPath);
 
@@ -547,7 +610,7 @@ describe("authority database coordinator registry", () => {
     const replacement = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
-    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 3 });
+    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 4 });
   });
 
   it("rejects a hardlink added while the original database is live", async () => {
@@ -556,7 +619,7 @@ describe("authority database coordinator registry", () => {
     const original = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
-    await expect(original.inspectSchema()).resolves.toEqual({ version: 3 });
+    await expect(original.inspectSchema()).resolves.toEqual({ version: 4 });
     linkSync(path, aliasPath);
 
     let spawnCount = 0;
@@ -575,7 +638,7 @@ describe("authority database coordinator registry", () => {
     expect((aliasError as { cause?: unknown }).cause).toBeUndefined();
     expect(publicErrorSurface(aliasError)).not.toContain(path);
     expect(publicErrorSurface(aliasError)).not.toContain(aliasPath);
-    await expect(original.inspectSchema()).resolves.toEqual({ version: 3 });
+    await expect(original.inspectSchema()).resolves.toEqual({ version: 4 });
   });
 
   it("atomically reserves a dangling relative symlink chain with its future target", async () => {
@@ -617,7 +680,7 @@ describe("authority database coordinator registry", () => {
     const replacement = trackClient(
       await createWorkerDatabaseClient({ databasePath: otherPath }),
     );
-    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 3 });
+    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 4 });
   });
 
   it("rejects a symlink cycle with a stable path-free error", async () => {
@@ -650,7 +713,7 @@ describe("authority database coordinator registry", () => {
     const replacement = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
-    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 3 });
+    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 4 });
   });
 
   it("releases the path after initialization failure so a retry can succeed", async () => {
@@ -690,7 +753,7 @@ describe("authority database coordinator registry", () => {
     const replacement = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
-    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 3 });
+    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 4 });
   });
 
   it("keeps the path reserved until terminal transport teardown completes", async () => {
@@ -747,6 +810,35 @@ describe("authority database coordinator registry", () => {
     }
   });
 
+  it("keeps a terminal reservation after terminate rejects until an explicit exit", async () => {
+    const path = databasePath();
+    const transport = new RejectingTerminationTransport();
+    const client = trackClient(
+      await createWorkerDatabaseClientForTest({ databasePath: path }, () => transport),
+    );
+
+    const terminalError = await rejectionOf(client.inspectSchema());
+    await new Promise<void>((resolveImmediate) => setImmediate(resolveImmediate));
+    const laterError = await rejectionOf(client.inspectSchema());
+    const duplicate = await Promise.allSettled([
+      createWorkerDatabaseClient({ databasePath: path }),
+    ]).then(([result]) => result!);
+    if (duplicate.status === "fulfilled") {
+      trackClient(duplicate.value);
+      await duplicate.value.close();
+    }
+
+    expect(terminalError).toMatchObject({ code: "authority_worker_message_error" });
+    expect(laterError).toBe(terminalError);
+    expect(duplicate.status).toBe("rejected");
+    if (duplicate.status === "rejected") {
+      expect(duplicate.reason).toMatchObject({ code: "authority_coordinator_exists" });
+    }
+
+    transport.signalExit();
+    await expectDatabasePathEventuallyReusable(path);
+  });
+
   it("allows different canonical database paths concurrently", async () => {
     const [first, second] = await Promise.all([
       createWorkerDatabaseClient({ databasePath: databasePath() }),
@@ -757,7 +849,7 @@ describe("authority database coordinator registry", () => {
 
     await expect(
       Promise.all([first.inspectSchema(), second.inspectSchema()]),
-    ).resolves.toEqual([{ version: 3 }, { version: 3 }]);
+    ).resolves.toEqual([{ version: 4 }, { version: 4 }]);
   });
 });
 
@@ -836,6 +928,95 @@ describe("public worker transport errors", () => {
 });
 
 describe("WorkerDatabaseClient", () => {
+  it("preserves both transaction and rollback failures in one internal fatal error", () => {
+    const original = new Error("SELECT secret FROM authority at /private/original.sqlite");
+    const rollback = new Error("ROLLBACK failed at /private/rollback.sqlite");
+    const database = {
+      exec(sql: string) {
+        if (sql === "ROLLBACK") throw rollback;
+      },
+    };
+
+    let failure: unknown;
+    try {
+      runAuthorityImmediateTransaction(database as never, () => { throw original; });
+    } catch (error: unknown) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(AuthorityRollbackFatalError);
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toEqual([original, rollback]);
+    expect(String(failure)).not.toContain("SELECT secret");
+    expect(String(failure)).not.toContain("/private/");
+  });
+
+  it("poisons the worker after rollback failure and shares one terminal error", async () => {
+    const path = databasePath();
+    const client = trackClient(
+      await createWorkerDatabaseClientWithRollbackFailureForTest({ databasePath: path }),
+    );
+    const missingSession = createHash("sha256").update("missing-session").digest("base64url");
+    const missingFamily = createHash("sha256").update("missing-family").digest("base64url");
+    const current = rejectionOf(client.executeHuman(
+      {
+        kind: "human",
+        sessionId: missingSession,
+        sessionFamilyId: missingFamily,
+        principal: { accountId: "missing-account", actorId: "missing-actor" },
+        requestId: "rollback-current",
+        idempotencyKey: "rollback-current",
+      },
+      { type: "room.create", payload: { name: "must roll back" } },
+      1_000,
+    ));
+    const concurrentPending = rejectionOf(client.inspectSchema());
+
+    const currentError = await current;
+    const pendingError = await concurrentPending;
+    const laterError = await rejectionOf(client.inspectSchema());
+
+    expect(currentError).toMatchObject({
+      code: "storage_unavailable",
+      status: 503,
+      message: "Authority storage became unavailable",
+    });
+    expect(pendingError).toBe(currentError);
+    expect(laterError).toBe(currentError);
+    expect(String(currentError)).not.toContain(path);
+    await expectDatabasePathEventuallyReusable(path);
+  });
+
+  it("rejects a structurally forged Agent context before posting to the worker", async () => {
+    const transport = new CapabilityProbeTransport();
+    const client = trackClient(await createWorkerDatabaseClientForTest(
+      { databasePath: databasePath() },
+      () => transport,
+    ));
+
+    await expect(client.executeAgent(
+      {
+        kind: "agent",
+        agent: { actorId: "agent-forged", kind: "agent" },
+        requestId: "forged-request",
+        idempotencyKey: "forged-key",
+      } as never,
+      {
+        type: "agent.judgment.record",
+        roomId: "room-forged",
+        payload: {
+          messageId: "message-forged",
+          outcome: "will_respond",
+          reason: "forged",
+        },
+      },
+      1_000,
+    )).rejects.toMatchObject({ status: 403, code: "agent_capability_forbidden" });
+    expect(transport.requests.map((request) => request.type)).toEqual([
+      "authority.initialize",
+    ]);
+  });
+
   it("migrates in a real worker while the main event loop remains responsive", async () => {
     const path = databasePath();
     const opening = createWorkerDatabaseClient({ databasePath: path });
@@ -843,7 +1024,7 @@ describe("WorkerDatabaseClient", () => {
 
     await expect(heartbeat).resolves.toBeUndefined();
     const client = trackClient(await opening);
-    await expect(client.inspectSchema()).resolves.toEqual({ version: 3 });
+    await expect(client.inspectSchema()).resolves.toEqual({ version: 4 });
   });
 
   it("correlates concurrent responses to monotonically increasing request IDs", async () => {
@@ -856,7 +1037,7 @@ describe("WorkerDatabaseClient", () => {
           parentPort.postMessage({
             type: "authority.error",
             requestId: first.requestId,
-            code: "request_ids_not_monotonic",
+            code: "invalid_request",
             message: "Request IDs were not monotonic",
           });
           return;
@@ -864,13 +1045,13 @@ describe("WorkerDatabaseClient", () => {
         parentPort.postMessage({
           type: "authority.error",
           requestId: second.requestId,
-          code: "second_inspect_failed",
+          code: "invalid_request",
           message: "The second inspection failed",
         });
         setImmediate(() => parentPort.postMessage({
           type: "authority.schema",
           requestId: first.requestId,
-          schemaVersion: 3,
+          schemaVersion: 4,
         }));
       }
     `);
@@ -884,9 +1065,10 @@ describe("WorkerDatabaseClient", () => {
     const first = client.inspectSchema();
     const secondRejection = rejectionOf(client.inspectSchema());
 
-    await expect(first).resolves.toEqual({ version: 3 });
+    await expect(first).resolves.toEqual({ version: 4 });
     await expect(secondRejection).resolves.toMatchObject({
-      code: "second_inspect_failed",
+      code: "invalid_request",
+      status: 400,
     });
   });
 
@@ -951,7 +1133,7 @@ describe("WorkerDatabaseClient", () => {
       parentPort.postMessage({
         type: "authority.schema",
         requestId: request.requestId,
-        schemaVersion: 3,
+        schemaVersion: 4,
         extra: true,
       });
     `);
@@ -967,6 +1149,37 @@ describe("WorkerDatabaseClient", () => {
 
     expect(pendingError).toMatchObject({ code: "authority_worker_protocol_error" });
     expect(laterError).toBe(pendingError);
+    await expectDatabasePathEventuallyReusable(path);
+  });
+
+  it("fails terminally with a sanitized storage error for an unknown worker error code", async () => {
+    const path = databasePath();
+    const worker = workerThatRuns(`
+      parentPort.postMessage({
+        type: "authority.error",
+        requestId: request.requestId,
+        code: "future_unreviewed_error",
+        message: "SELECT secret FROM sessions at /private/authority.sqlite",
+      });
+    `);
+    const client = trackClient(
+      await createWorkerDatabaseClientForTest(
+        { databasePath: path },
+        () => worker,
+      ),
+    );
+
+    const pendingError = await rejectionOf(client.inspectSchema());
+    const laterError = await rejectionOf(client.inspectSchema());
+
+    expect(pendingError).toMatchObject({
+      code: "storage_unavailable",
+      status: 503,
+      message: "Authority storage became unavailable",
+    });
+    expect(laterError).toBe(pendingError);
+    expect(publicErrorSurface(pendingError)).not.toContain("future_unreviewed_error");
+    expect(publicErrorSurface(pendingError)).not.toContain("/private/authority.sqlite");
     await expectDatabasePathEventuallyReusable(path);
   });
 
@@ -1076,7 +1289,32 @@ describe("WorkerDatabaseClient", () => {
     const publicApi: Record<string, unknown> = await import("../index.js");
 
     expect(publicApi).not.toHaveProperty("createWorkerDatabaseClientForTest");
+    expect(publicApi).not.toHaveProperty(
+      "createWorkerDatabaseClientWithRollbackFailureForTest",
+    );
     expect(publicApi).not.toHaveProperty("isAuthorityWorkerRequest");
     expect(publicApi).not.toHaveProperty("isAuthorityWorkerResponse");
+  });
+
+  it("narrows the package-root worker client so raw point queries are absent at runtime", async () => {
+    const publicApi = await import("../index.js");
+    const path = databasePath();
+    const client = await publicApi.createWorkerDatabaseClient({ databasePath: path });
+    try {
+      expect(client).not.toHaveProperty("readActor");
+      expect(client).not.toHaveProperty("readRoom");
+      expect(client).not.toHaveProperty("executeHuman");
+      expect(client).not.toHaveProperty("executeAgent");
+      expect(publicApi).not.toHaveProperty("createSqliteAuthoritativeStore");
+      expect(publicApi).not.toHaveProperty("createAuthoritativeRoomLifecycleService");
+    } finally {
+      await client.close();
+    }
+    if (existsSync(path)) {
+      const database = new DatabaseSync(path, { readOnly: true });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM idempotency_records").get())
+        .toEqual({ count: 0 });
+      database.close();
+    }
   });
 });

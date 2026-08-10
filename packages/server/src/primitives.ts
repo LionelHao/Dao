@@ -1,3 +1,10 @@
+import {
+  isAgentExecution,
+  isAgentJudgement,
+  isCalibrationSignal,
+  isHumanReadReceipt,
+  isOpenItem,
+} from "@native-im/core";
 import type {
   Actor,
   AgentActor,
@@ -15,6 +22,14 @@ import type {
   Room,
   SocialReaction,
 } from "@native-im/core";
+import type {
+  AgentCollaborationCommand,
+  AuthenticatedCommandContext,
+  CommandAcknowledgement,
+  CommandStore,
+  HumanCollaborationCommand,
+  InternalAgentCommandContext,
+} from "./persistence/contracts.js";
 
 export type {
   AgentExecution,
@@ -54,6 +69,13 @@ export interface MessageState {
   readonly recalled: boolean;
 }
 
+export type AcceptedCollaborationFact =
+  | { readonly kind: "human-read"; readonly value: HumanReadReceipt }
+  | { readonly kind: "agent-judgment"; readonly value: AgentJudgement }
+  | { readonly kind: "open-item"; readonly value: OpenItem }
+  | { readonly kind: "agent-execution"; readonly value: AgentExecution }
+  | { readonly kind: "calibration"; readonly value: CalibrationSignal };
+
 export type PrimitiveErrorCode =
   | "unknown_actor"
   | "unknown_message"
@@ -89,6 +111,147 @@ export interface CollaborationPrimitivesOptions {
   readonly toolInvokers?: Readonly<Record<string, AgentToolInvoker>>;
   readonly now?: () => string;
   readonly hereRateLimitMs?: number;
+}
+
+type HumanReadCommand = Extract<HumanCollaborationCommand, { readonly type: "human.read.record" }>;
+type AgentJudgementCommand = Extract<AgentCollaborationCommand, { readonly type: "agent.judgment.record" }>;
+type OpenItemCreateCommand = Extract<HumanCollaborationCommand, { readonly type: "open-item.create" }>;
+type OpenItemTransitionCommand = Extract<HumanCollaborationCommand, { readonly type: "open-item.transition" }>;
+type AgentExecutionCommand = Extract<AgentCollaborationCommand, { readonly type: "agent.execution.transition" }>;
+type CalibrationCommand = Extract<HumanCollaborationCommand, { readonly type: "calibration.record" }>;
+
+export interface AuthoritativeCollaborationPrimitivesOptions {
+  readonly commandStore: CommandStore;
+  readonly publishAccepted?: (fact: AcceptedCollaborationFact) => void;
+}
+
+export interface AuthoritativeCollaborationPrimitives {
+  recordHumanRead(
+    context: AuthenticatedCommandContext,
+    roomId: string,
+    payload: HumanReadCommand["payload"],
+  ): Promise<HumanReadReceipt>;
+  recordAgentJudgement(
+    context: InternalAgentCommandContext,
+    roomId: string,
+    payload: AgentJudgementCommand["payload"],
+  ): Promise<AgentJudgement>;
+  createOpenItem(
+    context: AuthenticatedCommandContext | InternalAgentCommandContext,
+    roomId: string,
+    payload: OpenItemCreateCommand["payload"],
+  ): Promise<OpenItem>;
+  transitionOpenItem(
+    context: AuthenticatedCommandContext | InternalAgentCommandContext,
+    roomId: string,
+    payload: OpenItemTransitionCommand["payload"],
+  ): Promise<OpenItem>;
+  transitionAgentExecution(
+    context: InternalAgentCommandContext,
+    roomId: string,
+    payload: AgentExecutionCommand["payload"],
+  ): Promise<AgentExecution>;
+  recordCalibration(
+    context: AuthenticatedCommandContext,
+    roomId: string,
+    payload: CalibrationCommand["payload"],
+  ): Promise<CalibrationSignal>;
+}
+
+function authoritativeResult<T>(
+  acknowledgement: CommandAcknowledgement,
+  key: string,
+  guard: (value: unknown) => value is T,
+): T {
+  const result = acknowledgement.result;
+  if (typeof result !== "object" || result === null || Array.isArray(result)) {
+    throw new TypeError("Authoritative primitive acknowledgement is invalid");
+  }
+  const value = Reflect.get(result, key);
+  if (!guard(value)) {
+    throw new TypeError("Authoritative primitive acknowledgement is invalid");
+  }
+  return value;
+}
+
+export function createAuthoritativeCollaborationPrimitives(
+  options: AuthoritativeCollaborationPrimitivesOptions,
+): AuthoritativeCollaborationPrimitives {
+  async function publish<T>(
+    promise: Promise<CommandAcknowledgement>,
+    key: string,
+    guard: (value: unknown) => value is T,
+    toFact: (value: T) => AcceptedCollaborationFact,
+  ): Promise<T> {
+    const acknowledgement = await promise;
+    const value = authoritativeResult(acknowledgement, key, guard);
+    try {
+      options.publishAccepted?.(toFact(value));
+    } catch {
+      // Post-commit observation must not change the durable command acknowledgement.
+    }
+    return value;
+  }
+
+  function executeOpenItem(
+    context: AuthenticatedCommandContext | InternalAgentCommandContext,
+    command: OpenItemCreateCommand | OpenItemTransitionCommand,
+  ): Promise<CommandAcknowledgement> {
+    return context.kind === "human"
+      ? options.commandStore.executeHuman(context, command)
+      : options.commandStore.executeAgent(context, command);
+  }
+
+  return {
+    recordHumanRead(context, roomId, payload) {
+      return publish(
+        options.commandStore.executeHuman(context, { type: "human.read.record", roomId, payload }),
+        "receipt",
+        isHumanReadReceipt,
+        (value) => ({ kind: "human-read", value }),
+      );
+    },
+    recordAgentJudgement(context, roomId, payload) {
+      return publish(
+        options.commandStore.executeAgent(context, { type: "agent.judgment.record", roomId, payload }),
+        "judgment",
+        isAgentJudgement,
+        (value) => ({ kind: "agent-judgment", value }),
+      );
+    },
+    createOpenItem(context, roomId, payload) {
+      return publish(
+        executeOpenItem(context, { type: "open-item.create", roomId, payload }),
+        "item",
+        isOpenItem,
+        (value) => ({ kind: "open-item", value }),
+      );
+    },
+    transitionOpenItem(context, roomId, payload) {
+      return publish(
+        executeOpenItem(context, { type: "open-item.transition", roomId, payload }),
+        "item",
+        isOpenItem,
+        (value) => ({ kind: "open-item", value }),
+      );
+    },
+    transitionAgentExecution(context, roomId, payload) {
+      return publish(
+        options.commandStore.executeAgent(context, { type: "agent.execution.transition", roomId, payload }),
+        "execution",
+        isAgentExecution,
+        (value) => ({ kind: "agent-execution", value }),
+      );
+    },
+    recordCalibration(context, roomId, payload) {
+      return publish(
+        options.commandStore.executeHuman(context, { type: "calibration.record", roomId, payload }),
+        "signal",
+        isCalibrationSignal,
+        (value) => ({ kind: "calibration", value }),
+      );
+    },
+  };
 }
 
 export interface CollaborationPrimitives {

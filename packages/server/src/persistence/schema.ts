@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
-export const AUTHORITY_SCHEMA_VERSION = 3 as const;
+export const AUTHORITY_SCHEMA_VERSION = 4 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -21,10 +21,13 @@ const V2_MIGRATION_CHECKSUM =
   "b7521b7e6095e01834c2f4183dc5c04c52848f9c76483c344e111b5c03662c1c";
 const V3_MIGRATION_CHECKSUM =
   "0f4ba33b182ae9b5c84874961265a4739a23cc80db4d8c6675af47646ceb81ee";
+const V4_MIGRATION_CHECKSUM =
+  "28a42b0ccfdc0d5c2eb111bc783cdd30c2678eb162cf9d77dcc2b6b3823f169c";
 const SCHEMA_FINGERPRINTS = {
   1: "03f2bbba4aa7082ec01819824726ce1bd9b4bd14cebea71afc93c6821dbf405c",
   2: "01c37d92ec2f303613a7bb8b592ca846fbea7c829b3c81fe4521699db949dfcc",
   3: "8653114fb3c00fcbddc386c16693d98ce6f226695f1941ac73dc341aa5fc7a61",
+  4: "b2d08fa3332bf0dc7fd4f0594210550089ed867a51b5da63be0e89830743d3ac",
 } as const;
 
 const V1_STATEMENTS = [
@@ -145,6 +148,67 @@ const V3_STATEMENTS = [
    FROM outbox_deliveries_v2 AS delivery
    JOIN events AS event ON event.event_id = delivery.event_id`,
   `DROP TABLE outbox_deliveries_v2`,
+] as const;
+
+const V4_STATEMENTS = [
+  `ALTER TABLE open_items
+   ADD COLUMN requester_actor_id TEXT REFERENCES actors(id)`,
+  `ALTER TABLE open_items
+   ADD COLUMN transfer_chain_json TEXT NOT NULL DEFAULT '[]'
+   CHECK (json_valid(transfer_chain_json) AND json_type(transfer_chain_json) = 'array')`,
+  `ALTER TABLE open_items
+   ADD COLUMN responded_at TEXT`,
+  `UPDATE open_items
+   SET requester_actor_id = (
+     SELECT author_id FROM messages WHERE messages.id = open_items.source_message_id
+   ), responded_at = resolved_at`,
+  `ALTER TABLE agent_executions
+   ADD COLUMN requester_actor_id TEXT REFERENCES actors(id)`,
+  `ALTER TABLE agent_executions
+   ADD COLUMN tool_name TEXT NOT NULL DEFAULT 'legacy-unknown'
+   CHECK (length(trim(tool_name)) > 0)`,
+  `UPDATE agent_executions
+   SET requester_actor_id = (
+     SELECT author_id FROM messages
+     WHERE messages.id = agent_executions.trigger_message_id
+   )`,
+  `ALTER TABLE calibration_signals
+   ADD COLUMN source_message_id TEXT REFERENCES messages(id)`,
+  `ALTER TABLE calibration_signals
+   ADD COLUMN actor_id TEXT REFERENCES actors(id)`,
+  `CREATE TRIGGER calibration_signals_v4_validate_insert
+   BEFORE INSERT ON calibration_signals
+   WHEN NEW.source_message_id IS NULL
+      OR NEW.actor_id IS NULL
+      OR COALESCE((SELECT kind FROM actors WHERE id = NEW.actor_id), '') <> 'human'
+      OR NOT EXISTS (
+        SELECT 1 FROM messages
+        WHERE id = NEW.source_message_id
+          AND room_id = NEW.room_id
+          AND author_id = NEW.agent_id
+          AND author_kind = 'agent'
+      )
+      OR NEW.signal NOT IN ('👍', '👎')
+   BEGIN
+     SELECT RAISE(ABORT, 'canonical calibration signal is invalid');
+   END`,
+  `CREATE TRIGGER calibration_signals_v4_validate_update
+   BEFORE UPDATE OF room_id, agent_id, signal, source_message_id, actor_id
+   ON calibration_signals
+   WHEN NEW.source_message_id IS NULL
+      OR NEW.actor_id IS NULL
+      OR COALESCE((SELECT kind FROM actors WHERE id = NEW.actor_id), '') <> 'human'
+      OR NOT EXISTS (
+        SELECT 1 FROM messages
+        WHERE id = NEW.source_message_id
+          AND room_id = NEW.room_id
+          AND author_id = NEW.agent_id
+          AND author_kind = 'agent'
+      )
+      OR NEW.signal NOT IN ('👍', '👎')
+   BEGIN
+     SELECT RAISE(ABORT, 'canonical calibration signal is invalid');
+   END`,
 ] as const;
 
 const V2_STATEMENTS = [
@@ -516,6 +580,12 @@ const MIGRATIONS = [
     V3_STATEMENTS,
     V3_MIGRATION_CHECKSUM,
   ),
+  defineMigration(
+    4,
+    "canonical-collaboration-facts",
+    V4_STATEMENTS,
+    V4_MIGRATION_CHECKSUM,
+  ),
 ] as const satisfies readonly Migration[];
 
 const V1_SCHEMA_CONTRACT = {
@@ -667,10 +737,31 @@ const V3_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V4_SCHEMA_CONTRACT = {
+  ...V3_SCHEMA_CONTRACT,
+  agent_executions: [
+    ...V3_SCHEMA_CONTRACT.agent_executions,
+    "requester_actor_id",
+    "tool_name",
+  ],
+  calibration_signals: [
+    ...V3_SCHEMA_CONTRACT.calibration_signals,
+    "source_message_id",
+    "actor_id",
+  ],
+  open_items: [
+    ...V3_SCHEMA_CONTRACT.open_items,
+    "requester_actor_id",
+    "transfer_chain_json",
+    "responded_at",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
   3: V3_SCHEMA_CONTRACT,
+  4: V4_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -1002,6 +1093,27 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
      LIMIT 1`,
     "calibration signals must reference matching agent judgments",
   );
+  if (schemaVersion >= 4) {
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM calibration_signals AS signal
+       LEFT JOIN actors AS calibration_actor ON calibration_actor.id = signal.actor_id
+       LEFT JOIN messages AS source ON source.id = signal.source_message_id
+       WHERE (signal.source_message_id IS NULL AND signal.actor_id IS NOT NULL)
+          OR (signal.source_message_id IS NOT NULL AND signal.actor_id IS NULL)
+          OR (signal.source_message_id IS NOT NULL
+              AND signal.actor_id IS NOT NULL
+              AND (calibration_actor.kind <> 'human'
+                   OR source.id IS NULL
+                   OR source.room_id <> signal.room_id
+                   OR source.author_kind <> 'agent'
+                   OR source.author_id <> signal.agent_id
+                   OR signal.signal NOT IN ('👍', '👎')))
+       LIMIT 1`,
+      "canonical calibration signals must reference a human actor and same-room Agent message",
+    );
+  }
 }
 
 function validateExistingSchema(database: DatabaseSync, currentVersion: number): void {
@@ -1160,4 +1272,10 @@ export function migrateAuthorityDatabaseToPreviousVersionForTest(
   database: DatabaseSync,
 ): void {
   migrateAuthorityDatabaseToVersion(database, AUTHORITY_SCHEMA_VERSION - 1);
+}
+
+export function migrateAuthorityDatabaseToVersion2ForTest(
+  database: DatabaseSync,
+): void {
+  migrateAuthorityDatabaseToVersion(database, 2);
 }

@@ -13,6 +13,8 @@ import type {
   AgentExecutionStatus,
   AgentJudgementOutcome,
   AgentParticipation,
+  Actor,
+  ManagedRoom,
   Message,
   MessageDraft,
   PersistedIdentityEvent,
@@ -21,6 +23,7 @@ import type {
   RoomSyncResult,
 } from "@native-im/core";
 import type { AuthenticatedPrincipal } from "../auth.js";
+import type { RoomAuditRecord } from "../room-lifecycle.js";
 
 export interface AuthenticatedSessionContext {
   readonly sessionId: string;
@@ -82,7 +85,8 @@ export interface AgentPrincipal {
   readonly kind: "agent";
 }
 
-declare const internalCommandAuthority: unique symbol;
+const internalCommandAuthority: unique symbol = Symbol("internal-agent-command-authority");
+const internalAgentCommandContexts = new WeakSet<object>();
 
 export interface InternalAgentCommandContext {
   readonly kind: "agent";
@@ -90,6 +94,73 @@ export interface InternalAgentCommandContext {
   readonly agent: AgentPrincipal;
   readonly requestId: string;
   readonly idempotencyKey: string;
+}
+
+export interface AgentWorkerCommandContext {
+  readonly kind: "agent";
+  readonly agent: AgentPrincipal;
+  readonly requestId: string;
+  readonly idempotencyKey: string;
+}
+
+export interface InternalAgentCommandContextInput {
+  readonly agentId: string;
+  readonly requestId: string;
+  readonly idempotencyKey: string;
+}
+
+class AgentCapabilityForbiddenError extends Error {
+  readonly status = 403 as const;
+  readonly code = "agent_capability_forbidden" as const;
+
+  constructor() {
+    super("agent_capability_forbidden");
+    this.name = "AgentCapabilityForbiddenError";
+  }
+}
+
+export function mintInternalAgentCommandContext(
+  input: InternalAgentCommandContextInput,
+): InternalAgentCommandContext {
+  if (
+    typeof input.agentId !== "string" ||
+    input.agentId.trim().length === 0 ||
+    typeof input.requestId !== "string" ||
+    input.requestId.trim().length === 0 ||
+    typeof input.idempotencyKey !== "string" ||
+    input.idempotencyKey.trim().length === 0
+  ) {
+    throw new TypeError("Internal Agent command context fields must be non-empty");
+  }
+  const context: InternalAgentCommandContext = Object.freeze({
+    kind: "agent",
+    [internalCommandAuthority]: true as const,
+    agent: Object.freeze({ actorId: input.agentId, kind: "agent" }),
+    requestId: input.requestId,
+    idempotencyKey: input.idempotencyKey,
+  });
+  internalAgentCommandContexts.add(context);
+  return context;
+}
+
+export function isInternalAgentCommandContext(
+  value: unknown,
+): value is InternalAgentCommandContext {
+  return typeof value === "object" && value !== null && internalAgentCommandContexts.has(value);
+}
+
+export function toAgentWorkerCommandContext(
+  context: InternalAgentCommandContext,
+): AgentWorkerCommandContext {
+  if (!isInternalAgentCommandContext(context)) {
+    throw new AgentCapabilityForbiddenError();
+  }
+  return Object.freeze({
+    kind: "agent",
+    agent: Object.freeze({ ...context.agent }),
+    requestId: context.requestId,
+    idempotencyKey: context.idempotencyKey,
+  });
 }
 
 type CommandActorFreePayload = {
@@ -237,6 +308,13 @@ export interface CommandStore {
 export interface SyncQueryStore {
   syncRoom(context: AuthenticatedSessionContext, request: RoomSyncRequest): Promise<RoomSyncResult>;
   readHistory(context: AuthenticatedSessionContext, roomId: string): Promise<readonly Message[]>;
+  readActor(actorId: string): Promise<Actor | undefined>;
+  readRoom(roomId: string): Promise<ManagedRoom | undefined>;
+  canAccessRoom(context: AuthenticatedSessionContext, roomId: string): Promise<boolean>;
+  readRoomAudit(
+    context: AuthenticatedSessionContext,
+    roomId: string,
+  ): Promise<readonly RoomAuditRecord[]>;
   listPendingOutbox(limit: number): Promise<readonly OutboxDelivery[]>;
   markOutboxDispatched(deliveryId: string): Promise<void>;
 }

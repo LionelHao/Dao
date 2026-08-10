@@ -1,3 +1,10 @@
+import {
+  createWorkerDatabaseClient as createInternalWorkerDatabaseClient,
+  type AuthoritySchemaInspection,
+  type CreateWorkerDatabaseClientOptions,
+  type WorkerDatabaseClient as InternalWorkerDatabaseClient,
+} from "./persistence/worker-database-client.js";
+
 export {
   AuthenticationError,
   createAuthenticationService,
@@ -34,6 +41,7 @@ export type {
   RoomLifecycleService,
   RoomLifecycleServiceOptions,
   RoomLifecycleState,
+  T0039CompatibilityRoomLifecycleService,
 } from "./room-lifecycle.js";
 export {
   createMessageService,
@@ -86,8 +94,13 @@ export {
   startMessageWebSocketServer,
 } from "./websocket.js";
 export type { MessageWebSocketServer, StartMessageWebSocketServerOptions } from "./websocket.js";
-export { CollaborationPrimitiveError, createCollaborationPrimitives } from "./primitives.js";
+export {
+  CollaborationPrimitiveError,
+  createAuthoritativeCollaborationPrimitives,
+  createCollaborationPrimitives,
+} from "./primitives.js";
 export type {
+  AcceptedCollaborationFact,
   AgentCorrection,
   AgentExecution,
   AgentExecutionStatus,
@@ -95,6 +108,8 @@ export type {
   AgentJudgementOutcome,
   AgentToolInvocation,
   AgentToolInvoker,
+  AuthoritativeCollaborationPrimitives,
+  AuthoritativeCollaborationPrimitivesOptions,
   CalibrationSignal,
   CollaborationPrimitives,
   CollaborationPrimitivesOptions,
@@ -106,15 +121,34 @@ export type {
   PrimitiveErrorCode,
   SocialReaction,
 } from "./primitives.js";
-export {
-  AuthorityWorkerClientError,
-  createWorkerDatabaseClient,
-} from "./persistence/worker-database-client.js";
-export type {
-  AuthoritySchemaInspection,
-  CreateWorkerDatabaseClientOptions,
-  WorkerDatabaseClient,
-} from "./persistence/worker-database-client.js";
+export { AuthorityWorkerClientError } from "./persistence/worker-database-client.js";
+export type { AuthoritySchemaInspection, CreateWorkerDatabaseClientOptions };
+export type WorkerDatabaseClient = Omit<
+  InternalWorkerDatabaseClient,
+  "executeHuman" | "executeAgent" | "readActor" | "readRoom"
+>;
+export async function createWorkerDatabaseClient(
+  options: CreateWorkerDatabaseClientOptions,
+): Promise<WorkerDatabaseClient> {
+  const internal = await createInternalWorkerDatabaseClient(options);
+  return {
+    inspectSchema: () => internal.inspectSchema(),
+    importLegacyState: (paths) => internal.importLegacyState(paths),
+    inspectLegacyImport: () => internal.inspectLegacyImport(),
+    registerActors: (actors) => internal.registerActors(actors),
+    issueSession: (input) => internal.issueSession(input),
+    authenticateSession: (accessTokenHash, now) =>
+      internal.authenticateSession(accessTokenHash, now),
+    validateSessionRefresh: (currentRefreshTokenHash, expectedPrincipal, now) =>
+      internal.validateSessionRefresh(currentRefreshTokenHash, expectedPrincipal, now),
+    rotateSession: (input) => internal.rotateSession(input),
+    revokeSession: (accessTokenHash, now) => internal.revokeSession(accessTokenHash, now),
+    readHistory: (context, roomId, now) => internal.readHistory(context, roomId, now),
+    canAccessRoom: (context, roomId, now) => internal.canAccessRoom(context, roomId, now),
+    readRoomAudit: (context, roomId, now) => internal.readRoomAudit(context, roomId, now),
+    close: () => internal.close(),
+  };
+}
 export {
   parsePersistedIdentityEvent,
   parsePersistedRoomEvent,
@@ -132,17 +166,10 @@ export type {
   HumanCollaborationCommand,
   HashedSessionIssue,
   HashedSessionRotation,
-  InternalAgentCommandContext,
   IssuedSessionRecord,
   JsonValue,
   OutboxDelivery,
   PersistentCommand,
   RoomGovernanceCommand,
   SessionAuthority,
-  SyncQueryStore,
 } from "./persistence/contracts.js";
-export { createSqliteAuthoritativeStore } from "./persistence/sqlite-authoritative-store.js";
-export type {
-  SqliteAuthoritativeStore,
-  SqliteAuthoritativeStoreOptions,
-} from "./persistence/sqlite-authoritative-store.js";

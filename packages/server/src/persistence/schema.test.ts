@@ -9,6 +9,7 @@ import {
   listAuthorityTables,
   migrateAuthorityDatabase,
   migrateAuthorityDatabaseToPreviousVersionForTest,
+  migrateAuthorityDatabaseToVersion2ForTest,
   readSchemaVersion,
 } from "./schema.js";
 
@@ -37,6 +38,8 @@ const V2_MIGRATION_CHECKSUM =
   "b7521b7e6095e01834c2f4183dc5c04c52848f9c76483c344e111b5c03662c1c";
 const V3_MIGRATION_CHECKSUM =
   "0f4ba33b182ae9b5c84874961265a4739a23cc80db4d8c6675af47646ceb81ee";
+const V4_MIGRATION_CHECKSUM =
+  "28a42b0ccfdc0d5c2eb111bc783cdd30c2678eb162cf9d77dcc2b6b3823f169c";
 
 interface LogicalSnapshot {
   readonly schemaVersion: number;
@@ -334,12 +337,12 @@ describe("authority SQLite schema", () => {
     });
   });
 
-  it("migrates a fresh database through v1, v2, and v3 to the complete schema", () => {
+  it("migrates a fresh database through v1, v2, v3, and v4 to the complete schema", () => {
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
 
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(3);
-      expect(readSchemaVersion(database)).toBe(3);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(4);
+      expect(readSchemaVersion(database)).toBe(4);
       expect(listAuthorityTables(database)).toEqual(AUTHORITY_TABLES);
       expect(
         database
@@ -364,6 +367,12 @@ describe("authority SQLite schema", () => {
           version: 3,
           name: "closed-outbox-targets",
           checksum: V3_MIGRATION_CHECKSUM,
+          applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+        },
+        {
+          version: 4,
+          name: "canonical-collaboration-facts",
+          checksum: V4_MIGRATION_CHECKSUM,
           applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
         },
       ]);
@@ -413,6 +422,99 @@ describe("authority SQLite schema", () => {
     });
   });
 
+  it("adds complete canonical collaboration columns in immutable v4", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      expect(readSchemaVersion(database)).toBe(3);
+
+      migrateAuthorityDatabase(database);
+
+      expect(readSchemaVersion(database)).toBe(4);
+      expect(tableColumns(database, "open_items")).toEqual(
+        expect.arrayContaining([
+          "requester_actor_id",
+          "transfer_chain_json",
+          "responded_at",
+        ]),
+      );
+      expect(tableColumns(database, "agent_executions")).toEqual(
+        expect.arrayContaining(["requester_actor_id", "tool_name"]),
+      );
+      expect(tableColumns(database, "calibration_signals")).toEqual(
+        expect.arrayContaining(["source_message_id", "actor_id"]),
+      );
+    });
+  });
+
+  it("keeps a valid legacy v3 calibration explicitly unknown across v4 migration", () => {
+    withDatabase((database) => {
+      createV1Fixture(database);
+      seedV1History(database);
+      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      database.exec(`
+        INSERT INTO agent_judgments (
+          id, room_id, agent_id, message_id, judgment_json, created_at
+        ) VALUES (
+          'judgment-v3', 'room-1', 'agent-1', 'message-1',
+          '{"outcome":"will_respond","reason":"legacy reason"}',
+          '2026-08-09T03:00:00.000Z'
+        );
+        INSERT INTO calibration_signals (
+          id, room_id, agent_id, judgment_id, signal, created_at
+        ) VALUES (
+          'signal-v3', 'room-1', 'agent-1', 'judgment-v3', '👍',
+          '2026-08-09T03:01:00.000Z'
+        );
+      `);
+
+      migrateAuthorityDatabase(database);
+
+      expect(readSchemaVersion(database)).toBe(4);
+      expect(database.prepare(
+        `SELECT source_message_id AS sourceMessageId, actor_id AS actorId
+         FROM calibration_signals WHERE id = 'signal-v3'`,
+      ).get()).toEqual({ sourceMessageId: null, actorId: null });
+    });
+  });
+
+  it("rejects canonical calibration corruption inserted while v4 triggers were absent", () => {
+    withDatabase((database) => {
+      createV1Fixture(database);
+      seedV1History(database);
+      migrateAuthorityDatabase(database);
+      const triggerNames = [
+        "calibration_signals_v4_validate_insert",
+        "calibration_signals_v4_validate_update",
+      ] as const;
+      const triggerSql = triggerNames.map((name) => {
+        const row = database.prepare(
+          "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?",
+        ).get(name);
+        if (typeof row?.sql !== "string") {
+          throw new Error(`missing v4 calibration trigger ${name}`);
+        }
+        return row.sql;
+      });
+      for (const name of triggerNames) {
+        database.exec(`DROP TRIGGER "${name}"`);
+      }
+      database.exec(`
+        INSERT INTO calibration_signals (
+          id, room_id, agent_id, judgment_id, signal, created_at,
+          source_message_id, actor_id
+        ) VALUES (
+          'corrupt-canonical-signal', 'room-1', 'agent-1', NULL, '👍',
+          '2026-08-10T00:00:00.000Z', 'message-1', 'agent-1'
+        )
+      `);
+      for (const sql of triggerSql) {
+        database.exec(sql);
+      }
+
+      expect(() => migrateAuthorityDatabase(database)).toThrow(/invariant/i);
+    });
+  });
+
   it("upgrades v1 history with zero revisions and one stream per room and actor", () => {
     withDatabase((database) => {
       createV1Fixture(database);
@@ -420,7 +522,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(3);
+      expect(readSchemaVersion(database)).toBe(4);
       expect(
         database.prepare("SELECT id, catalog_revision FROM actors ORDER BY id").all(),
       ).toEqual([
@@ -463,7 +565,7 @@ describe("authority SQLite schema", () => {
 
   it("upgrades immutable v2 outbox destinations into closed v3 targets", () => {
     withDatabase((database) => {
-      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      migrateAuthorityDatabaseToVersion2ForTest(database);
       expect(readSchemaVersion(database)).toBe(2);
       expect(tableColumns(database, "outbox_deliveries")).toContain("destination");
       expect(
@@ -499,7 +601,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(3);
+      expect(readSchemaVersion(database)).toBe(4);
       expect(
         database
           .prepare(
@@ -530,7 +632,7 @@ describe("authority SQLite schema", () => {
 
   it("rolls back v3 when a legacy outbox target is not closed", () => {
     withDatabase((database) => {
-      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      migrateAuthorityDatabaseToVersion2ForTest(database);
       database.exec(`
         INSERT INTO actors (
           id, kind, display_name, reachability, readiness,
@@ -918,14 +1020,27 @@ describe("authority SQLite schema", () => {
                   '2026-08-09T01:13:00.000Z');
         INSERT INTO agent_executions (
           id, room_id, agent_id, trigger_message_id, status, started_at,
-          completed_at, result_json
+          completed_at, result_json, requester_actor_id, tool_name
         ) VALUES ('execution-valid', 'room-1', 'agent-1', 'message-1', 'running',
-                  '2026-08-09T01:14:00.000Z', NULL, NULL);
+                  '2026-08-09T01:14:00.000Z', NULL, NULL, 'human-1',
+                  'summarize');
+        INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+        VALUES ('message-agent', 'room-1', 'agent-1', 'agent', 'agent answer',
+                '2026-08-09T01:14:30.000Z');
         INSERT INTO calibration_signals (
-          id, room_id, agent_id, judgment_id, signal, created_at
-        ) VALUES ('signal-valid', 'room-1', 'agent-1', 'judgment-valid', 'up',
-                  '2026-08-09T01:15:00.000Z');
+          id, room_id, agent_id, judgment_id, signal, created_at,
+          source_message_id, actor_id
+        ) VALUES ('signal-valid', 'room-1', 'agent-1', NULL, '👍',
+                  '2026-08-09T01:15:00.000Z', 'message-agent', 'human-1');
       `);
+
+      expectSqlRejected(
+        database,
+        `INSERT INTO calibration_signals (
+           id, room_id, agent_id, judgment_id, signal, created_at
+         ) VALUES ('signal-missing-canonical', 'room-1', 'agent-1',
+                   'judgment-valid', '👍', '2026-08-09T01:15:30.000Z')`,
+      );
 
       expectSqlRejected(
         database,
@@ -1063,9 +1178,9 @@ describe("authority SQLite schema", () => {
     });
 
     withDatabase((database) => {
-      database.exec("PRAGMA user_version = 4");
+      database.exec("PRAGMA user_version = 5");
       expect(() => migrateAuthorityDatabase(database)).toThrow(/future schema/i);
-      expect(readSchemaVersion(database)).toBe(4);
+      expect(readSchemaVersion(database)).toBe(5);
     });
   });
 

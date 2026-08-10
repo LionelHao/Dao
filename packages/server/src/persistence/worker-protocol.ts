@@ -1,9 +1,16 @@
-import { isActor } from "@native-im/core";
-import type { Actor } from "@native-im/core";
+import { isActor, isMessage } from "@native-im/core";
+import type { Actor, ManagedRoom, Message } from "@native-im/core";
+import {
+  isManagedRoomShape,
+  isRoomAuditRecord,
+  type RoomAuditRecord,
+} from "../room-lifecycle.js";
 import {
   parsePersistentCommand,
 } from "./contracts.js";
 import type {
+  AgentCollaborationCommand,
+  AgentWorkerCommandContext,
   AuthenticatedSessionContext,
   AuthenticatedCommandContext,
   CommandAcknowledgement,
@@ -13,6 +20,86 @@ import type {
   IssuedSessionRecord,
   RoomGovernanceCommand,
 } from "./contracts.js";
+
+export type AuthorityWorkerErrorCode =
+  | "actor_conflict"
+  | "agent_missing_permission"
+  | "agent_permissions_invalid"
+  | "agent_required"
+  | "authority_already_initialized"
+  | "authority_not_initialized"
+  | "authority_worker_closed"
+  | "calibration_source_invalid"
+  | "execution_conflict"
+  | "execution_not_running"
+  | "idempotency_conflict"
+  | "identity_forbidden"
+  | "invalid_request"
+  | "invalid_token"
+  | "invitation_consumed"
+  | "invitation_forbidden"
+  | "invitation_not_found"
+  | "invitation_pending"
+  | "invitation_secret_unavailable"
+  | "invitee_required"
+  | "legacy_import_failed"
+  | "legacy_import_unavailable"
+  | "member_not_found"
+  | "message_not_found"
+  | "open_item_not_found"
+  | "room_archived"
+  | "room_forbidden"
+  | "room_member_exists"
+  | "room_member_not_found"
+  | "room_not_found"
+  | "room_owner_required"
+  | "session_revoked"
+  | "storage_unavailable"
+  | "token_expired";
+
+export function isAuthorityWorkerErrorCode(
+  value: unknown,
+): value is AuthorityWorkerErrorCode {
+  switch (value) {
+    case "actor_conflict":
+    case "agent_missing_permission":
+    case "agent_permissions_invalid":
+    case "agent_required":
+    case "authority_already_initialized":
+    case "authority_not_initialized":
+    case "authority_worker_closed":
+    case "calibration_source_invalid":
+    case "execution_conflict":
+    case "execution_not_running":
+    case "idempotency_conflict":
+    case "identity_forbidden":
+    case "invalid_request":
+    case "invalid_token":
+    case "invitation_consumed":
+    case "invitation_forbidden":
+    case "invitation_not_found":
+    case "invitation_pending":
+    case "invitation_secret_unavailable":
+    case "invitee_required":
+    case "legacy_import_failed":
+    case "legacy_import_unavailable":
+    case "member_not_found":
+    case "message_not_found":
+    case "open_item_not_found":
+    case "room_archived":
+    case "room_forbidden":
+    case "room_member_exists":
+    case "room_member_not_found":
+    case "room_not_found":
+    case "room_owner_required":
+    case "session_revoked":
+    case "storage_unavailable":
+    case "token_expired":
+      return true;
+    default:
+      return false;
+  }
+}
 
 export type AuthorityWorkerRequest =
   | { readonly type: "authority.initialize"; readonly requestId: string }
@@ -67,6 +154,40 @@ export type AuthorityWorkerRequest =
       readonly requestId: string;
       readonly context: AuthenticatedCommandContext;
       readonly command: HumanCollaborationCommand | RoomGovernanceCommand;
+      readonly invitationSecret?: {
+        readonly tokenHash: string;
+        readonly sealedToken: string;
+      };
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.execute-agent";
+      readonly requestId: string;
+      readonly context: AgentWorkerCommandContext;
+      readonly command: AgentCollaborationCommand;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.read-history";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly roomId: string;
+      readonly now: number;
+    }
+  | { readonly type: "authority.read-actor"; readonly requestId: string; readonly actorId: string }
+  | { readonly type: "authority.read-room"; readonly requestId: string; readonly roomId: string }
+  | {
+      readonly type: "authority.can-access-room";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly roomId: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.read-room-audit";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly roomId: string;
       readonly now: number;
     }
   | { readonly type: "authority.close"; readonly requestId: string };
@@ -75,12 +196,12 @@ export type AuthorityWorkerResponse =
   | {
       readonly type: "authority.ready";
       readonly requestId: string;
-      readonly schemaVersion: 3;
+      readonly schemaVersion: 4;
     }
   | {
       readonly type: "authority.schema";
       readonly requestId: string;
-      readonly schemaVersion: 3;
+      readonly schemaVersion: 4;
     }
   | {
       readonly type: "authority.legacy-imported";
@@ -133,11 +254,24 @@ export type AuthorityWorkerResponse =
       readonly requestId: string;
       readonly acknowledgement: CommandAcknowledgement;
     }
+  | {
+      readonly type: "authority.history";
+      readonly requestId: string;
+      readonly messages: readonly Message[];
+    }
+  | { readonly type: "authority.actor"; readonly requestId: string; readonly actor?: Actor }
+  | { readonly type: "authority.room"; readonly requestId: string; readonly room?: ManagedRoom }
+  | { readonly type: "authority.room-access"; readonly requestId: string; readonly allowed: boolean }
+  | {
+      readonly type: "authority.room-audit";
+      readonly requestId: string;
+      readonly audit: readonly RoomAuditRecord[];
+    }
   | { readonly type: "authority.closed"; readonly requestId: string }
   | {
       readonly type: "authority.error";
       readonly requestId: string;
-      readonly code: string;
+      readonly code: AuthorityWorkerErrorCode;
       readonly message: string;
     };
 
@@ -300,6 +434,20 @@ function isAuthenticatedCommandContext(
   );
 }
 
+function isAgentWorkerCommandContext(value: unknown): value is AgentWorkerCommandContext {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, ["kind", "agent", "requestId", "idempotencyKey"]) &&
+    value.kind === "agent" &&
+    isRecord(value.agent) &&
+    hasExactKeys(value.agent, ["actorId", "kind"]) &&
+    value.agent.kind === "agent" &&
+    isText(value.agent.actorId) &&
+    isText(value.requestId) &&
+    isText(value.idempotencyKey)
+  );
+}
+
 function isHumanCommand(value: unknown): value is HumanCollaborationCommand | RoomGovernanceCommand {
   const parsed = parsePersistentCommand(value);
   if (!parsed.ok) {
@@ -307,6 +455,18 @@ function isHumanCommand(value: unknown): value is HumanCollaborationCommand | Ro
   }
   return parsed.value.type !== "agent.judgment.record" &&
     parsed.value.type !== "agent.execution.transition";
+}
+
+function isAgentCommand(value: unknown): value is AgentCollaborationCommand {
+  const parsed = parsePersistentCommand(value);
+  if (!parsed.ok) {
+    return false;
+  }
+  return parsed.value.type === "message.send" ||
+    parsed.value.type === "agent.judgment.record" ||
+    parsed.value.type === "open-item.create" ||
+    parsed.value.type === "open-item.transition" ||
+    parsed.value.type === "agent.execution.transition";
 }
 
 function isJsonValue(value: unknown): boolean {
@@ -410,11 +570,45 @@ export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWork
       );
     case "authority.execute-human":
       return (
-        hasExactKeys(value, ["type", "requestId", "context", "command", "now"]) &&
+        hasExactKeys(value, [
+          "type",
+          "requestId",
+          "context",
+          "command",
+          "now",
+          ...(Object.hasOwn(value, "invitationSecret") ? ["invitationSecret"] : []),
+        ]) &&
         isAuthenticatedCommandContext(value.context) &&
         isHumanCommand(value.command) &&
+        ((value.command.type === "human.invitation.issue" &&
+          isRecord(value.invitationSecret) &&
+          hasExactKeys(value.invitationSecret, ["tokenHash", "sealedToken"]) &&
+          isTokenHash(value.invitationSecret.tokenHash) &&
+          isText(value.invitationSecret.sealedToken)) ||
+          (value.command.type !== "human.invitation.issue" &&
+            !Object.hasOwn(value, "invitationSecret"))) &&
         isNonNegativeSafeInteger(value.now)
       );
+    case "authority.execute-agent":
+      return (
+        hasExactKeys(value, ["type", "requestId", "context", "command", "now"]) &&
+        isAgentWorkerCommandContext(value.context) &&
+        isAgentCommand(value.command) &&
+        isNonNegativeSafeInteger(value.now)
+      );
+    case "authority.read-history":
+      return hasExactKeys(value, ["type", "requestId", "context", "roomId", "now"]) &&
+        isAuthenticatedSessionContext(value.context) && isText(value.roomId) &&
+        isNonNegativeSafeInteger(value.now);
+    case "authority.read-actor":
+      return hasExactKeys(value, ["type", "requestId", "actorId"]) && isText(value.actorId);
+    case "authority.read-room":
+      return hasExactKeys(value, ["type", "requestId", "roomId"]) && isText(value.roomId);
+    case "authority.can-access-room":
+    case "authority.read-room-audit":
+      return hasExactKeys(value, ["type", "requestId", "context", "roomId", "now"]) &&
+        isAuthenticatedSessionContext(value.context) && isText(value.roomId) &&
+        isNonNegativeSafeInteger(value.now);
     default:
       return false;
   }
@@ -432,7 +626,7 @@ export function isAuthorityWorkerResponse(
     case "authority.schema":
       return (
         hasExactKeys(value, ["type", "requestId", "schemaVersion"]) &&
-        value.schemaVersion === 3
+        value.schemaVersion === 4
       );
     case "authority.closed":
       return hasExactKeys(value, ["type", "requestId"]);
@@ -465,6 +659,25 @@ export function isAuthorityWorkerResponse(
         hasExactKeys(value, ["type", "requestId", "acknowledgement"]) &&
         isCommandAcknowledgement(value.acknowledgement)
       );
+    case "authority.history":
+      return hasExactKeys(value, ["type", "requestId", "messages"]) &&
+        Array.isArray(value.messages) && value.messages.every(isMessage);
+    case "authority.actor":
+      return hasExactKeys(
+        value,
+        ["type", "requestId", ...(Object.hasOwn(value, "actor") ? ["actor"] : [])],
+      ) && (!Object.hasOwn(value, "actor") || isStrictActor(value.actor));
+    case "authority.room":
+      return hasExactKeys(
+        value,
+        ["type", "requestId", ...(Object.hasOwn(value, "room") ? ["room"] : [])],
+      ) && (!Object.hasOwn(value, "room") || isManagedRoomShape(value.room));
+    case "authority.room-access":
+      return hasExactKeys(value, ["type", "requestId", "allowed"]) &&
+        typeof value.allowed === "boolean";
+    case "authority.room-audit":
+      return hasExactKeys(value, ["type", "requestId", "audit"]) &&
+        Array.isArray(value.audit) && value.audit.every(isRoomAuditRecord);
     case "authority.legacy-imported":
       return (
         hasExactKeys(value, [
@@ -502,8 +715,7 @@ export function isAuthorityWorkerResponse(
     case "authority.error":
       return (
         hasExactKeys(value, ["type", "requestId", "code", "message"]) &&
-        typeof value.code === "string" &&
-        value.code.length > 0 &&
+        isAuthorityWorkerErrorCode(value.code) &&
         typeof value.message === "string" &&
         value.message.length > 0
       );
