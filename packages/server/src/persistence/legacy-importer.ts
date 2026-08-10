@@ -22,7 +22,11 @@ import {
   type RoomLifecycleState,
 } from "../room-lifecycle.js";
 import { createJsonlMessageStore } from "../store.js";
-import { migrateAuthorityDatabase, readSchemaVersion } from "./schema.js";
+import {
+  AUTHORITY_SCHEMA_VERSION,
+  migrateAuthorityDatabase,
+  readSchemaVersion,
+} from "./schema.js";
 
 const IMPORT_MARKER_SCOPE = "__authority_legacy_import__";
 const IMPORT_MARKER_KEY = "t0039-v1";
@@ -647,7 +651,7 @@ function readLegacyImportMarker(database: DatabaseSync): LegacyImportMarker {
 }
 
 export function replayLegacyImport(database: DatabaseSync): LegacyImportResult {
-  if (readSchemaVersion(database) !== 2) {
+  if (readSchemaVersion(database) !== AUTHORITY_SCHEMA_VERSION) {
     throw new Error("Legacy import marker schema is unavailable");
   }
   const marker = readLegacyImportMarker(database);
@@ -798,7 +802,7 @@ export function recoverLegacyImportRemainder(
 
   const database = new DatabaseSync(authorityPath, { readOnly: true });
   try {
-    if (readSchemaVersion(database) !== 2) {
+    if (readSchemaVersion(database) !== AUTHORITY_SCHEMA_VERSION) {
       throw new Error("Legacy import recovery database has the wrong schema");
     }
     const marker = readLegacyImportMarker(database);

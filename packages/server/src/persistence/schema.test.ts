@@ -8,6 +8,7 @@ import {
   configureAuthorityConnection,
   listAuthorityTables,
   migrateAuthorityDatabase,
+  migrateAuthorityDatabaseToPreviousVersionForTest,
   readSchemaVersion,
 } from "./schema.js";
 
@@ -32,6 +33,10 @@ const AUTHORITY_TABLES = [
 ] as const;
 const V1_MIGRATION_CHECKSUM =
   "34117e7de4fb7c8eb36b5363bc178e45a82b08c668ca712a7b7e5e82343a6358";
+const V2_MIGRATION_CHECKSUM =
+  "b7521b7e6095e01834c2f4183dc5c04c52848f9c76483c344e111b5c03662c1c";
+const V3_MIGRATION_CHECKSUM =
+  "0f4ba33b182ae9b5c84874961265a4739a23cc80db4d8c6675af47646ceb81ee";
 
 interface LogicalSnapshot {
   readonly schemaVersion: number;
@@ -329,12 +334,12 @@ describe("authority SQLite schema", () => {
     });
   });
 
-  it("migrates a fresh database through v1 and v2 to the complete schema", () => {
+  it("migrates a fresh database through v1, v2, and v3 to the complete schema", () => {
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
 
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(2);
-      expect(readSchemaVersion(database)).toBe(2);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(3);
+      expect(readSchemaVersion(database)).toBe(3);
       expect(listAuthorityTables(database)).toEqual(AUTHORITY_TABLES);
       expect(
         database
@@ -352,7 +357,13 @@ describe("authority SQLite schema", () => {
         {
           version: 2,
           name: "collaboration-facts-and-streams",
-          checksum: expect.stringMatching(/^[a-f0-9]{64}$/),
+          checksum: V2_MIGRATION_CHECKSUM,
+          applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+        },
+        {
+          version: 3,
+          name: "closed-outbox-targets",
+          checksum: V3_MIGRATION_CHECKSUM,
           applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
         },
       ]);
@@ -389,7 +400,9 @@ describe("authority SQLite schema", () => {
       expect(tableColumns(database, "outbox_deliveries")).toEqual([
         "id",
         "event_id",
-        "destination",
+        "target_kind",
+        "target_id",
+        "stream_seq",
         "status",
         "attempts",
         "available_at",
@@ -407,7 +420,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(2);
+      expect(readSchemaVersion(database)).toBe(3);
       expect(
         database.prepare("SELECT id, catalog_revision FROM actors ORDER BY id").all(),
       ).toEqual([
@@ -445,6 +458,109 @@ describe("authority SQLite schema", () => {
         body: "legacy history",
         sent_at: "2026-08-09T00:02:00.000Z",
       });
+    });
+  });
+
+  it("upgrades immutable v2 outbox destinations into closed v3 targets", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      expect(readSchemaVersion(database)).toBe(2);
+      expect(tableColumns(database, "outbox_deliveries")).toContain("destination");
+      expect(
+        database
+          .prepare("SELECT checksum FROM schema_migrations WHERE version = 2")
+          .get(),
+      ).toEqual({ checksum: V2_MIGRATION_CHECKSUM });
+
+      database.exec(`
+        INSERT INTO actors (
+          id, kind, display_name, reachability, readiness,
+          tool_permissions_json, catalog_revision
+        ) VALUES ('human-v2', 'human', 'V2 Human', 'online', NULL, '[]', 0);
+        INSERT INTO streams (
+          stream_kind, stream_id, head_seq, retained_from_seq
+        ) VALUES ('identity', 'human-v2', 1, 1);
+        INSERT INTO events (
+          event_id, stream_kind, stream_id, stream_seq, room_id,
+          actor_id, event_type, occurred_at, payload_json
+        ) VALUES (
+          'event-v2', 'identity', 'human-v2', 1, NULL,
+          'human-v2', 'identity.session.revoked',
+          '2026-08-10T00:00:00.000Z', '{}'
+        );
+        INSERT INTO outbox_deliveries (
+          id, event_id, destination, status, attempts,
+          available_at, delivered_at, last_error
+        ) VALUES (
+          'outbox-v2', 'event-v2', 'session-family:family-v2',
+          'pending', 2, '2026-08-10T00:00:00.000Z', NULL, 'retry'
+        );
+      `);
+
+      migrateAuthorityDatabase(database);
+
+      expect(readSchemaVersion(database)).toBe(3);
+      expect(
+        database
+          .prepare(
+            `SELECT
+               id,
+               event_id AS eventId,
+               target_kind AS targetKind,
+               target_id AS targetId,
+               stream_seq AS streamSeq,
+               status,
+               attempts,
+               last_error AS lastError
+             FROM outbox_deliveries`,
+          )
+          .get(),
+      ).toEqual({
+        id: "outbox-v2",
+        eventId: "event-v2",
+        targetKind: "session-family",
+        targetId: "family-v2",
+        streamSeq: 1,
+        status: "pending",
+        attempts: 2,
+        lastError: "retry",
+      });
+    });
+  });
+
+  it("rolls back v3 when a legacy outbox target is not closed", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      database.exec(`
+        INSERT INTO actors (
+          id, kind, display_name, reachability, readiness,
+          tool_permissions_json, catalog_revision
+        ) VALUES ('human-v2', 'human', 'V2 Human', 'online', NULL, '[]', 0);
+        INSERT INTO streams (
+          stream_kind, stream_id, head_seq, retained_from_seq
+        ) VALUES ('identity', 'human-v2', 1, 1);
+        INSERT INTO events (
+          event_id, stream_kind, stream_id, stream_seq, room_id,
+          actor_id, event_type, occurred_at, payload_json
+        ) VALUES (
+          'event-v2', 'identity', 'human-v2', 1, NULL,
+          'human-v2', 'identity.session.revoked',
+          '2026-08-10T00:00:00.000Z', '{}'
+        );
+        INSERT INTO outbox_deliveries (
+          id, event_id, destination, status, attempts,
+          available_at, delivered_at, last_error
+        ) VALUES (
+          'outbox-v2', 'event-v2', 'broadcast:everyone',
+          'pending', 0, '2026-08-10T00:00:00.000Z', NULL, NULL
+        );
+      `);
+      const before = snapshot(database);
+
+      expect(() => migrateAuthorityDatabase(database)).toThrow();
+
+      expect(readSchemaVersion(database)).toBe(2);
+      expect(snapshot(database)).toEqual(before);
     });
   });
 
@@ -530,7 +646,7 @@ describe("authority SQLite schema", () => {
 
       expect(() =>
         migrateAuthorityDatabase(databaseWithCorruptedOutboxDdl(database)),
-      ).toThrow(/unknown schema/i);
+      ).toThrow(/unknown schema|no column/i);
 
       expect(snapshot(database)).toEqual(before);
     });
@@ -947,13 +1063,13 @@ describe("authority SQLite schema", () => {
     });
 
     withDatabase((database) => {
-      database.exec("PRAGMA user_version = 3");
+      database.exec("PRAGMA user_version = 4");
       expect(() => migrateAuthorityDatabase(database)).toThrow(/future schema/i);
-      expect(readSchemaVersion(database)).toBe(3);
+      expect(readSchemaVersion(database)).toBe(4);
     });
   });
 
-  it("refuses v2 schemas with missing or unexpected authority tables", () => {
+  it("refuses v3 schemas with missing or unexpected authority tables", () => {
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
       database.exec("DROP TABLE calibration_signals");
@@ -969,7 +1085,7 @@ describe("authority SQLite schema", () => {
     });
   });
 
-  it("refuses v2 tables that are missing required contract columns", () => {
+  it("refuses v3 tables that are missing required contract columns", () => {
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
       database.exec("ALTER TABLE outbox_deliveries DROP COLUMN last_error");

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
-export const AUTHORITY_SCHEMA_VERSION = 2 as const;
+export const AUTHORITY_SCHEMA_VERSION = 3 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -17,9 +17,14 @@ interface Migration {
 const AUTHORITY_BUSY_TIMEOUT_MS = 5_000;
 const V1_MIGRATION_CHECKSUM =
   "34117e7de4fb7c8eb36b5363bc178e45a82b08c668ca712a7b7e5e82343a6358";
+const V2_MIGRATION_CHECKSUM =
+  "b7521b7e6095e01834c2f4183dc5c04c52848f9c76483c344e111b5c03662c1c";
+const V3_MIGRATION_CHECKSUM =
+  "0f4ba33b182ae9b5c84874961265a4739a23cc80db4d8c6675af47646ceb81ee";
 const SCHEMA_FINGERPRINTS = {
   1: "03f2bbba4aa7082ec01819824726ce1bd9b4bd14cebea71afc93c6821dbf405c",
   2: "01c37d92ec2f303613a7bb8b592ca846fbea7c829b3c81fe4521699db949dfcc",
+  3: "8653114fb3c00fcbddc386c16693d98ce6f226695f1941ac73dc341aa5fc7a61",
 } as const;
 
 const V1_STATEMENTS = [
@@ -99,6 +104,47 @@ const V1_STATEMENTS = [
     body TEXT NOT NULL,
     sent_at TEXT NOT NULL
   ) STRICT`,
+] as const;
+
+const V3_STATEMENTS = [
+  `CREATE UNIQUE INDEX events_event_id_stream_seq
+   ON events(event_id, stream_seq)`,
+  `ALTER TABLE outbox_deliveries RENAME TO outbox_deliveries_v2`,
+  `CREATE TABLE outbox_deliveries (
+    id TEXT NOT NULL UNIQUE,
+    event_id TEXT NOT NULL REFERENCES events(event_id),
+    target_kind TEXT NOT NULL CHECK (
+      target_kind IN ('room', 'principal', 'session-family')
+    ),
+    target_id TEXT NOT NULL CHECK (length(target_id) > 0),
+    stream_seq INTEGER NOT NULL CHECK (stream_seq >= 1),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'dispatched')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    available_at TEXT NOT NULL,
+    delivered_at TEXT,
+    last_error TEXT,
+    PRIMARY KEY (event_id, target_kind, target_id),
+    FOREIGN KEY (event_id, stream_seq)
+      REFERENCES events(event_id, stream_seq)
+  ) STRICT`,
+  `INSERT INTO outbox_deliveries (
+     id, event_id, target_kind, target_id, stream_seq, status,
+     attempts, available_at, delivered_at, last_error
+   )
+   SELECT
+     delivery.id,
+     delivery.event_id,
+     substr(delivery.destination, 1, instr(delivery.destination, ':') - 1),
+     substr(delivery.destination, instr(delivery.destination, ':') + 1),
+     event.stream_seq,
+     delivery.status,
+     delivery.attempts,
+     delivery.available_at,
+     delivery.delivered_at,
+     delivery.last_error
+   FROM outbox_deliveries_v2 AS delivery
+   JOIN events AS event ON event.event_id = delivery.event_id`,
+  `DROP TABLE outbox_deliveries_v2`,
 ] as const;
 
 const V2_STATEMENTS = [
@@ -458,7 +504,18 @@ function defineMigration(
 
 const MIGRATIONS = [
   defineMigration(1, "initial-authority", V1_STATEMENTS, V1_MIGRATION_CHECKSUM),
-  defineMigration(2, "collaboration-facts-and-streams", V2_STATEMENTS),
+  defineMigration(
+    2,
+    "collaboration-facts-and-streams",
+    V2_STATEMENTS,
+    V2_MIGRATION_CHECKSUM,
+  ),
+  defineMigration(
+    3,
+    "closed-outbox-targets",
+    V3_STATEMENTS,
+    V3_MIGRATION_CHECKSUM,
+  ),
 ] as const satisfies readonly Migration[];
 
 const V1_SCHEMA_CONTRACT = {
@@ -594,9 +651,26 @@ const V2_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V3_SCHEMA_CONTRACT = {
+  ...V2_SCHEMA_CONTRACT,
+  outbox_deliveries: [
+    "id",
+    "event_id",
+    "target_kind",
+    "target_id",
+    "stream_seq",
+    "status",
+    "attempts",
+    "available_at",
+    "delivered_at",
+    "last_error",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
+  3: V3_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -999,11 +1073,19 @@ function appliedAt(): string {
   return new Date().toISOString();
 }
 
-export function migrateAuthorityDatabase(
+function migrateAuthorityDatabaseToVersion(
   database: DatabaseSync,
+  targetVersion: number,
   fault?: MigrationFaultOptions,
 ): void {
   validateFaultOptions(fault);
+  if (
+    !Number.isSafeInteger(targetVersion) ||
+    targetVersion < 1 ||
+    targetVersion > AUTHORITY_SCHEMA_VERSION
+  ) {
+    throw new TypeError("targetVersion must name a supported authority schema");
+  }
   configureAuthorityConnection(database);
 
   let statementCount = 0;
@@ -1014,14 +1096,17 @@ export function migrateAuthorityDatabase(
   try {
     const currentVersion = readSchemaVersion(database);
     validateExistingSchema(database, currentVersion);
-    if (currentVersion === AUTHORITY_SCHEMA_VERSION) {
+    if (currentVersion > targetVersion) {
+      throw new Error(`Refusing to downgrade schema version ${currentVersion}`);
+    }
+    if (currentVersion === targetVersion) {
       database.exec("COMMIT");
       transactionOpen = false;
       return;
     }
 
     for (const migration of MIGRATIONS) {
-      if (migration.version <= currentVersion) {
+      if (migration.version <= currentVersion || migration.version > targetVersion) {
         continue;
       }
 
@@ -1044,7 +1129,7 @@ export function migrateAuthorityDatabase(
       database.exec(`PRAGMA user_version = ${migration.version}`);
     }
 
-    validateExistingSchema(database, AUTHORITY_SCHEMA_VERSION);
+    validateExistingSchema(database, targetVersion);
     database.exec("COMMIT");
     transactionOpen = false;
   } catch (error: unknown) {
@@ -1062,4 +1147,17 @@ export function migrateAuthorityDatabase(
     }
     throw error;
   }
+}
+
+export function migrateAuthorityDatabase(
+  database: DatabaseSync,
+  fault?: MigrationFaultOptions,
+): void {
+  migrateAuthorityDatabaseToVersion(database, AUTHORITY_SCHEMA_VERSION, fault);
+}
+
+export function migrateAuthorityDatabaseToPreviousVersionForTest(
+  database: DatabaseSync,
+): void {
+  migrateAuthorityDatabaseToVersion(database, AUTHORITY_SCHEMA_VERSION - 1);
 }

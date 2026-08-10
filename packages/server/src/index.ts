@@ -130,10 +130,19 @@ export type {
   CommandStore,
   ContractParseResult,
   HumanCollaborationCommand,
+  HashedSessionIssue,
+  HashedSessionRotation,
   InternalAgentCommandContext,
+  IssuedSessionRecord,
   JsonValue,
   OutboxDelivery,
   PersistentCommand,
   RoomGovernanceCommand,
+  SessionAuthority,
   SyncQueryStore,
 } from "./persistence/contracts.js";
+export { createSqliteAuthoritativeStore } from "./persistence/sqlite-authoritative-store.js";
+export type {
+  SqliteAuthoritativeStore,
+  SqliteAuthoritativeStoreOptions,
+} from "./persistence/sqlite-authoritative-store.js";
