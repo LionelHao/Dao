@@ -1,5 +1,11 @@
-import { isActor, isMessage } from "@native-im/core";
-import type { Actor, ManagedRoom, Message } from "@native-im/core";
+import { isActor, isMessage, isRoomSyncResult } from "@native-im/core";
+import type {
+  Actor,
+  ManagedRoom,
+  Message,
+  RoomSyncRequest,
+  RoomSyncResult,
+} from "@native-im/core";
 import {
   isManagedRoomShape,
   isRoomAuditRecord,
@@ -9,6 +15,7 @@ import {
   parsePersistedIdentityEvent,
   parsePersistedRoomEvent,
   parsePersistentCommand,
+  parseRoomSyncRequest,
 } from "./contracts.js";
 import type {
   AgentCollaborationCommand,
@@ -52,6 +59,7 @@ export type AuthorityWorkerErrorCode =
   | "message_not_found"
   | "open_item_not_found"
   | "room_archived"
+  | "room_compaction_blocked"
   | "room_forbidden"
   | "room_member_exists"
   | "room_member_not_found"
@@ -91,6 +99,7 @@ export function isAuthorityWorkerErrorCode(
     case "message_not_found":
     case "open_item_not_found":
     case "room_archived":
+    case "room_compaction_blocked":
     case "room_forbidden":
     case "room_member_exists":
     case "room_member_not_found":
@@ -219,6 +228,19 @@ export type AuthorityWorkerRequest =
       readonly deliveryId: string;
       readonly reason: "closed" | "backpressure" | "send_rejected";
     }
+  | {
+      readonly type: "authority.sync-room";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly request: RoomSyncRequest;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.compact-room-stream";
+      readonly requestId: string;
+      readonly roomId: string;
+      readonly retainedFromSeq: number;
+    }
   | { readonly type: "authority.close"; readonly requestId: string };
 
 export type AuthorityWorkerResponse =
@@ -307,6 +329,18 @@ export type AuthorityWorkerResponse =
       readonly authorized: boolean;
     }
   | { readonly type: "authority.outbox-updated"; readonly requestId: string }
+  | {
+      readonly type: "authority.room-synced";
+      readonly requestId: string;
+      readonly result: RoomSyncResult;
+    }
+  | {
+      readonly type: "authority.room-stream-compacted";
+      readonly requestId: string;
+      readonly roomId: string;
+      readonly retainedFromSeq: number;
+      readonly headSeq: number;
+    }
   | { readonly type: "authority.closed"; readonly requestId: string }
   | {
       readonly type: "authority.error";
@@ -730,6 +764,18 @@ export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWork
         (value.reason === "closed" ||
           value.reason === "backpressure" ||
           value.reason === "send_rejected");
+    case "authority.sync-room": {
+      const parsed = parseRoomSyncRequest(value.request);
+      return hasExactKeys(value, ["type", "requestId", "context", "request", "now"]) &&
+        isAuthenticatedSessionContext(value.context) && parsed.ok &&
+        (parsed.value.cursor === undefined ||
+          parsed.value.cursor.roomId === parsed.value.roomId) &&
+        isNonNegativeSafeInteger(value.now);
+    }
+    case "authority.compact-room-stream":
+      return hasExactKeys(value, ["type", "requestId", "roomId", "retainedFromSeq"]) &&
+        isText(value.roomId) && isNonNegativeSafeInteger(value.retainedFromSeq) &&
+        value.retainedFromSeq >= 1;
     default:
       return false;
   }
@@ -807,6 +853,17 @@ export function isAuthorityWorkerResponse(
         typeof value.authorized === "boolean";
     case "authority.outbox-updated":
       return hasExactKeys(value, ["type", "requestId"]);
+    case "authority.room-synced":
+      return hasExactKeys(value, ["type", "requestId", "result"]) &&
+        isRoomSyncResult(value.result);
+    case "authority.room-stream-compacted":
+      return hasExactKeys(
+        value,
+        ["type", "requestId", "roomId", "retainedFromSeq", "headSeq"],
+      ) && isText(value.roomId) &&
+        isNonNegativeSafeInteger(value.retainedFromSeq) && value.retainedFromSeq >= 1 &&
+        isNonNegativeSafeInteger(value.headSeq) &&
+        value.retainedFromSeq <= value.headSeq + 1;
     case "authority.legacy-imported":
       return (
         hasExactKeys(value, [

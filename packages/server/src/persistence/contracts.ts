@@ -5,6 +5,7 @@ import {
   isAgentRoomMembership,
   isCalibrationSignal,
   isHumanReadReceipt,
+  isRoomCursor,
   isHumanRoomMembership,
   isMessage,
   isOpenItem,
@@ -361,6 +362,10 @@ export interface SyncQueryStore {
   ): Promise<void>;
 }
 
+export const ROOM_SYNC_DEFAULT_LIMIT = 100;
+export const ROOM_SYNC_MAX_LIMIT = 1_000;
+export const ROOM_SYNC_MAX_PAGE_BYTES = 256 * 1_024;
+
 export type ContractParseResult<T, TCode extends string> =
   | { readonly ok: true; readonly value: T }
   | { readonly ok: false; readonly code: TCode };
@@ -386,6 +391,30 @@ function count(value: unknown, minimum = 0): value is number {
 
 function stringList(value: unknown): value is readonly string[] {
   return Array.isArray(value) && value.length > 0 && value.every(text) && new Set(value).size === value.length;
+}
+
+export function parseRoomSyncRequest(
+  value: unknown,
+): ContractParseResult<RoomSyncRequest, "invalid_request"> {
+  if (!isRecord(value)) {
+    return { ok: false, code: "invalid_request" };
+  }
+  const optional = [
+    ...(Object.hasOwn(value, "cursor") ? ["cursor"] : []),
+    ...(Object.hasOwn(value, "limit") ? ["limit"] : []),
+  ];
+  if (
+    !exact(value, ["type", "requestId", "roomId"], optional) ||
+    value.type !== "room.sync" ||
+    !text(value.requestId) ||
+    !text(value.roomId) ||
+    (Object.hasOwn(value, "cursor") && !isRoomCursor(value.cursor)) ||
+    (Object.hasOwn(value, "limit") &&
+      (!count(value.limit, 1) || value.limit > ROOM_SYNC_MAX_LIMIT))
+  ) {
+    return { ok: false, code: "invalid_request" };
+  }
+  return { ok: true, value: value as unknown as RoomSyncRequest };
 }
 
 function messageDraft(value: unknown, roomId: string): value is MessageDraft {

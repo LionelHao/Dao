@@ -28,6 +28,7 @@ import {
   executeHumanDatabaseCommand,
   authorizeOutboxCandidateDatabaseQuery,
   canAccessRoomDatabaseQuery,
+  compactRoomStreamDatabaseCommand,
   listPendingOutboxDatabaseQuery,
   markOutboxDispatchedDatabaseCommand,
   markOutboxFailedDatabaseCommand,
@@ -36,6 +37,7 @@ import {
   readRoomAuditDatabaseQuery,
   readRoomDatabaseQuery,
   runAuthorityImmediateTransaction,
+  syncRoomDatabaseQuery,
 } from "./authority-database-handler.js";
 
 interface AuthorityWorkerData {
@@ -1164,6 +1166,58 @@ function markOutboxFailed(request: AuthorityWorkerRequest): void {
   }
 }
 
+function syncRoom(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.sync-room") {
+    throw new TypeError("syncRoom received the wrong request type");
+  }
+  try {
+    const result = syncRoomDatabaseQuery(
+      requireAuthorityTransactionDatabase(),
+      request.context,
+      request.request,
+      request.now,
+    );
+    respond({ type: "authority.room-synced", requestId: request.requestId, result });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithError(request.requestId, "storage_unavailable", "Authority room sync failed");
+  }
+}
+
+function compactRoomStream(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.compact-room-stream") {
+    throw new TypeError("compactRoomStream received the wrong request type");
+  }
+  try {
+    const compacted = compactRoomStreamDatabaseCommand(
+      requireAuthorityTransactionDatabase(),
+      request.roomId,
+      request.retainedFromSeq,
+    );
+    respond({
+      type: "authority.room-stream-compacted",
+      requestId: request.requestId,
+      roomId: request.roomId,
+      ...compacted,
+    });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithError(
+      request.requestId,
+      "storage_unavailable",
+      "Authority room stream compaction failed",
+    );
+  }
+}
+
 function closeAuthority(request: AuthorityWorkerRequest): void {
   if (request.type !== "authority.close") {
     throw new TypeError("closeAuthority received the wrong request type");
@@ -1275,6 +1329,12 @@ async function dispatch(value: unknown): Promise<void> {
       return;
     case "authority.outbox-failed":
       markOutboxFailed(value);
+      return;
+    case "authority.sync-room":
+      syncRoom(value);
+      return;
+    case "authority.compact-room-stream":
+      compactRoomStream(value);
       return;
     case "authority.close":
       closeAuthority(value);

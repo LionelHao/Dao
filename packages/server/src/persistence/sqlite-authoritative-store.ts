@@ -1,5 +1,11 @@
 import { createHash, randomBytes } from "node:crypto";
-import type { Actor, ManagedRoom, Message } from "@native-im/core";
+import type {
+  Actor,
+  ManagedRoom,
+  Message,
+  RoomSyncRequest,
+  RoomSyncResult,
+} from "@native-im/core";
 import type { RoomAuditRecord } from "../room-lifecycle.js";
 import type { InvitationSecretProtector } from "../invitation-secret-protector.js";
 import type {
@@ -27,6 +33,7 @@ export interface SqliteAuthoritativeStore extends
   CommandStore,
   Pick<
     SyncQueryStore,
+    | "syncRoom"
     | "readHistory"
     | "readActor"
     | "readRoom"
@@ -50,6 +57,11 @@ export interface SqliteAuthoritativeStore extends
     context: AuthenticatedSessionContext,
     roomId: string,
   ): Promise<readonly Message[]>;
+  syncRoom(
+    context: AuthenticatedSessionContext,
+    request: RoomSyncRequest,
+  ): Promise<RoomSyncResult>;
+  compactRoomStream(roomId: string, retainedFromSeq: number): Promise<void>;
   readActor(actorId: string): Promise<Actor | undefined>;
   readRoom(roomId: string): Promise<ManagedRoom | undefined>;
   canAccessRoom(
@@ -223,6 +235,17 @@ export function createSqliteAuthoritativeStore(
       roomId: string,
     ): Promise<readonly Message[]> {
       return client.readHistory(context, roomId, clock());
+    },
+
+    syncRoom(
+      context: AuthenticatedSessionContext,
+      request: RoomSyncRequest,
+    ): Promise<RoomSyncResult> {
+      return client.syncRoom(context, request, clock());
+    },
+
+    async compactRoomStream(roomId: string, retainedFromSeq: number): Promise<void> {
+      await client.compactRoomStream(roomId, retainedFromSeq);
     },
 
     readActor(actorId: string): Promise<Actor | undefined> {

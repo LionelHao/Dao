@@ -49,6 +49,14 @@ export {
   RoomAccessError,
 } from "./service.js";
 export { createOutboxDispatcher } from "./outbox-dispatcher.js";
+export {
+  createSyncService,
+  ROOM_SYNC_DEFAULT_LIMIT,
+  ROOM_SYNC_MAX_LIMIT,
+  ROOM_SYNC_MAX_PAGE_BYTES,
+  SyncServiceError,
+} from "./sync-service.js";
+export type { SyncService, SyncServiceOptions } from "./sync-service.js";
 export type {
   OutboxDispatcher,
   OutboxDispatcherOptions,
@@ -152,6 +160,8 @@ export type WorkerDatabaseClient = Omit<
   | "authorizeOutboxCandidate"
   | "markOutboxDispatched"
   | "markOutboxFailed"
+  | "syncRoom"
+  | "compactRoomStream"
 >;
 export async function createWorkerDatabaseClient(
   options: CreateWorkerDatabaseClientOptions,

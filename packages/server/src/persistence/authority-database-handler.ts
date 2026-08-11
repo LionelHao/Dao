@@ -6,6 +6,8 @@ import type {
   Message,
   PersistedIdentityEvent,
   PersistedRoomEvent,
+  RoomSyncRequest,
+  RoomSyncResult,
 } from "@native-im/core";
 import {
   isManagedRoomShape,
@@ -16,6 +18,8 @@ import {
   parsePersistedIdentityEvent,
   parsePersistedRoomEvent,
   parsePersistentCommand,
+  ROOM_SYNC_DEFAULT_LIMIT,
+  ROOM_SYNC_MAX_PAGE_BYTES,
   type AgentCollaborationCommand,
   type AgentWorkerCommandContext,
   type AuthenticatedCommandContext,
@@ -115,6 +119,13 @@ function canonicalJson(value: unknown): string {
       .join(",")}}`;
   }
   throw new TypeError("Canonical JSON rejects unsupported values");
+}
+
+function roomSyncResultWithinPageLimit<Result extends RoomSyncResult>(result: Result): Result {
+  if (Buffer.byteLength(canonicalJson(result), "utf8") > ROOM_SYNC_MAX_PAGE_BYTES) {
+    return fail("storage_unavailable", "Authority room sync result exceeds the page limit");
+  }
+  return result;
 }
 
 function stableId(...parts: readonly string[]): string {
@@ -285,6 +296,270 @@ export function readHistoryDatabaseQuery(
       body: row.body,
       sentAt: row.sentAt,
     };
+  });
+}
+
+function runAuthorityReadTransaction<Result>(
+  database: DatabaseSync,
+  operation: () => Result,
+): Result {
+  database.exec("BEGIN");
+  try {
+    const result = operation();
+    database.exec("COMMIT");
+    return result;
+  } catch (error: unknown) {
+    try {
+      database.exec("ROLLBACK");
+    } catch (rollbackError: unknown) {
+      throw new AuthorityRollbackFatalError(error, rollbackError);
+    }
+    throw error;
+  }
+}
+
+function requireActiveHumanRoomMembership(
+  database: DatabaseSync,
+  actorId: string,
+  roomId: string,
+): void {
+  const row = database.prepare(
+    `SELECT room.status AS roomStatus
+     FROM room_memberships AS membership
+     JOIN rooms AS room ON room.id = membership.room_id
+     WHERE membership.room_id = ?
+       AND membership.actor_id = ?
+       AND membership.kind = 'human'`,
+  ).get(roomId, actorId);
+  if (row?.roomStatus !== "active") {
+    fail("room_forbidden", "Authority room sync access was rejected");
+  }
+}
+
+function parseRoomSyncEvent(row: Record<string, unknown>): PersistedRoomEvent {
+  let payload: unknown;
+  try {
+    payload = typeof row.payloadJson === "string"
+      ? JSON.parse(row.payloadJson) as unknown
+      : undefined;
+  } catch {
+    return fail("storage_unavailable", "Stored room sync event is corrupt");
+  }
+  const parsed = parsePersistedRoomEvent({
+    eventId: row.eventId,
+    streamKind: row.streamKind,
+    streamId: row.streamId,
+    streamSeq: row.streamSeq,
+    roomId: row.roomId,
+    actorId: row.actorId,
+    occurredAt: row.occurredAt,
+    type: row.eventType,
+    payload,
+  });
+  return parsed.ok
+    ? parsed.value
+    : fail("storage_unavailable", "Stored room sync event is corrupt");
+}
+
+export function syncRoomDatabaseQuery(
+  database: DatabaseSync,
+  context: AuthenticatedSessionContext,
+  request: RoomSyncRequest,
+  now: number,
+): RoomSyncResult {
+  return runAuthorityReadTransaction(database, () => {
+    const actorId = requireHumanSession(database, context, now);
+    requireActiveHumanRoomMembership(database, actorId, request.roomId);
+    const stream = database.prepare(
+      `SELECT head_seq AS headSeq, retained_from_seq AS retainedFromSeq
+       FROM streams WHERE stream_kind = 'room' AND stream_id = ?`,
+    ).get(request.roomId);
+    if (
+      typeof stream?.headSeq !== "number" ||
+      !Number.isSafeInteger(stream.headSeq) ||
+      stream.headSeq < 0 ||
+      typeof stream.retainedFromSeq !== "number" ||
+      !Number.isSafeInteger(stream.retainedFromSeq) ||
+      stream.retainedFromSeq < 1 ||
+      stream.retainedFromSeq > stream.headSeq + 1
+    ) {
+      return fail("storage_unavailable", "Authority room stream is corrupt");
+    }
+    const currentHeadSeq = stream.headSeq;
+    const retainedFromSeq = stream.retainedFromSeq;
+    if (request.cursor === undefined) {
+      return roomSyncResultWithinPageLimit({
+        type: "room.sync.result",
+        requestId: request.requestId,
+        mode: "repair_required",
+        reason: "cursor_absent",
+        retainedFromSeq,
+        watermark: currentHeadSeq,
+      });
+    }
+    if (
+      request.cursor.roomId !== request.roomId ||
+      request.cursor.afterSeq > currentHeadSeq ||
+      (request.cursor.watermark !== undefined &&
+        request.cursor.watermark > currentHeadSeq)
+    ) {
+      return fail("invalid_request", "Authority room sync cursor was rejected");
+    }
+    if (request.cursor.afterSeq < retainedFromSeq - 1) {
+      return roomSyncResultWithinPageLimit({
+        type: "room.sync.result",
+        requestId: request.requestId,
+        mode: "repair_required",
+        reason: "cursor_expired",
+        retainedFromSeq,
+        watermark: currentHeadSeq,
+      });
+    }
+    const watermark = request.cursor.watermark ?? currentHeadSeq;
+
+    const limit = request.limit ?? ROOM_SYNC_DEFAULT_LIMIT;
+    const rows = database.prepare(
+      `SELECT event_id AS eventId, stream_kind AS streamKind,
+              stream_id AS streamId, stream_seq AS streamSeq, room_id AS roomId,
+              actor_id AS actorId, event_type AS eventType,
+              occurred_at AS occurredAt, payload_json AS payloadJson
+       FROM events
+       WHERE stream_kind = 'room' AND stream_id = ?
+         AND stream_seq > ? AND stream_seq <= ?
+       ORDER BY stream_seq
+       LIMIT ?`,
+    ).all(request.roomId, request.cursor.afterSeq, watermark, limit);
+    const events: PersistedRoomEvent[] = [];
+    let expectedSeq = request.cursor.afterSeq + 1;
+    let eventBytesTotal = 0;
+    for (const row of rows) {
+      const event = parseRoomSyncEvent(row);
+      if (
+        event.streamSeq !== expectedSeq ||
+        event.streamId !== request.roomId ||
+        event.roomId !== request.roomId
+      ) {
+        return fail("storage_unavailable", "Authority room sync sequence is corrupt");
+      }
+      const eventBytes = Buffer.byteLength(canonicalJson(event), "utf8");
+      if (eventBytes > ROOM_SYNC_MAX_PAGE_BYTES) {
+        return fail("storage_unavailable", "Authority room sync event exceeds the page limit");
+      }
+      const candidateAfterSeq = event.streamSeq;
+      const candidateHasMore = candidateAfterSeq < watermark;
+      const candidateWithoutEvents = {
+        type: "room.sync.result" as const,
+        requestId: request.requestId,
+        mode: "delta" as const,
+        events: [],
+        nextCursor: {
+          version: 1 as const,
+          roomId: request.roomId,
+          afterSeq: candidateAfterSeq,
+          ...(candidateHasMore ? { watermark } : {}),
+        },
+        watermark,
+        hasMore: candidateHasMore,
+      };
+      const envelopeBytes = Buffer.byteLength(canonicalJson(candidateWithoutEvents), "utf8") - 2;
+      const candidateEventsBytes = 2 + eventBytesTotal + eventBytes + events.length;
+      if (envelopeBytes + candidateEventsBytes > ROOM_SYNC_MAX_PAGE_BYTES) {
+        if (events.length === 0) {
+          return fail("storage_unavailable", "Authority room sync result exceeds the page limit");
+        }
+        break;
+      }
+      events.push(event);
+      eventBytesTotal += eventBytes;
+      expectedSeq += 1;
+    }
+    const afterSeq = events.at(-1)?.streamSeq ?? request.cursor.afterSeq;
+    if (events.length === 0 && afterSeq < watermark) {
+      return fail("storage_unavailable", "Authority room sync sequence is corrupt");
+    }
+    const hasMore = afterSeq < watermark;
+    return roomSyncResultWithinPageLimit({
+      type: "room.sync.result",
+      requestId: request.requestId,
+      mode: "delta",
+      events,
+      nextCursor: {
+        version: 1,
+        roomId: request.roomId,
+        afterSeq,
+        ...(hasMore ? { watermark } : {}),
+      },
+      watermark,
+      hasMore,
+    });
+  });
+}
+
+export function compactRoomStreamDatabaseCommand(
+  database: DatabaseSync,
+  roomId: string,
+  retainedFromSeq: number,
+): { readonly retainedFromSeq: number; readonly headSeq: number } {
+  return runAuthorityImmediateTransaction(database, () => {
+    const room = database.prepare("SELECT status FROM rooms WHERE id = ?").get(roomId);
+    if (room === undefined) {
+      return fail("room_not_found", "Authority room was not found");
+    }
+    if (room.status === "archived") {
+      return fail("room_archived", "Authority archived room cannot be compacted");
+    }
+    if (room.status !== "active") {
+      return fail("storage_unavailable", "Authority room is corrupt");
+    }
+    const stream = database.prepare(
+      `SELECT head_seq AS headSeq, retained_from_seq AS currentRetainedFromSeq
+       FROM streams
+       WHERE stream_kind = 'room' AND stream_id = ?`,
+    ).get(roomId);
+    if (
+      typeof stream?.headSeq !== "number" ||
+      !Number.isSafeInteger(stream.headSeq) ||
+      typeof stream.currentRetainedFromSeq !== "number" ||
+      !Number.isSafeInteger(stream.currentRetainedFromSeq)
+    ) {
+      return fail("storage_unavailable", "Authority room stream is corrupt");
+    }
+    if (
+      retainedFromSeq < stream.currentRetainedFromSeq ||
+      retainedFromSeq > stream.headSeq + 1
+    ) {
+      return fail("invalid_request", "Authority room stream retention was rejected");
+    }
+    const pendingDelivery = database.prepare(
+      `SELECT 1 AS present
+       FROM outbox_deliveries AS delivery
+       JOIN events AS event ON event.event_id = delivery.event_id
+       WHERE event.stream_kind = 'room' AND event.stream_id = ?
+         AND event.stream_seq < ? AND delivery.status <> 'dispatched'
+       LIMIT 1`,
+    ).get(roomId, retainedFromSeq);
+    if (pendingDelivery?.present === 1) {
+      return fail(
+        "room_compaction_blocked",
+        "Authority room stream compaction is waiting for pending delivery",
+      );
+    }
+    database.prepare(
+      `UPDATE streams SET retained_from_seq = ?
+       WHERE stream_kind = 'room' AND stream_id = ?`,
+    ).run(retainedFromSeq, roomId);
+    database.prepare(
+      `DELETE FROM outbox_deliveries
+       WHERE status = 'dispatched' AND event_id IN (
+         SELECT event_id FROM events
+         WHERE stream_kind = 'room' AND stream_id = ? AND stream_seq < ?
+       )`,
+    ).run(roomId, retainedFromSeq);
+    database.prepare(
+      `DELETE FROM events
+       WHERE stream_kind = 'room' AND stream_id = ? AND stream_seq < ?`,
+    ).run(roomId, retainedFromSeq);
+    return { retainedFromSeq, headSeq: stream.headSeq };
   });
 }
 

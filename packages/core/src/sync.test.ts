@@ -11,9 +11,24 @@ import {
 describe("pure synchronization contracts", () => {
   it("accepts only versioned, non-negative room cursors", () => {
     expect(isRoomCursor({ version: 1, roomId: "room-1", afterSeq: 0 })).toBe(true);
+    expect(isRoomCursor({
+      version: 1,
+      roomId: "room-1",
+      afterSeq: 2,
+      watermark: 5,
+    })).toBe(true);
     expect(isRoomCursor({ version: 2, roomId: "room-1", afterSeq: 0 })).toBe(false);
     expect(isRoomCursor({ version: 1, roomId: "room-1", afterSeq: -1 })).toBe(false);
+    expect(isRoomCursor({ version: 1, roomId: "room-1", afterSeq: 2, watermark: -1 })).toBe(false);
+    expect(isRoomCursor({ version: 1, roomId: "room-1", afterSeq: 2, watermark: 1 })).toBe(false);
     expect(isRoomCursor({ version: 1, roomId: "room-1", afterSeq: 0, actorId: "human-1" })).toBe(false);
+    expect(isRoomCursor({
+      version: 1,
+      roomId: "room-1",
+      afterSeq: 2,
+      watermark: 5,
+      extra: true,
+    })).toBe(false);
   });
 
   it("keeps materialized and streaming snapshot expiry fields mutually exclusive", () => {
@@ -80,12 +95,89 @@ describe("pure synchronization contracts", () => {
     expect(isRoomSyncResult({
       type: "room.sync.result",
       requestId: "request-1",
+      mode: "repair_required",
+      reason: "cursor_expired",
+      retainedFromSeq: 0,
+      watermark: 8,
+    })).toBe(false);
+    expect(isRoomSyncResult({
+      type: "room.sync.result",
+      requestId: "request-1",
+      mode: "repair_required",
+      reason: "cursor_expired",
+      retainedFromSeq: 10,
+      watermark: 8,
+    })).toBe(false);
+    expect(isRoomSyncResult({
+      type: "room.sync.result",
+      requestId: "request-1",
       mode: "delta",
       events: [{ arbitrary: true }],
       nextCursor: { version: 1, roomId: "room-1", afterSeq: 1 },
       watermark: 1,
       hasMore: false,
     })).toBe(false);
+  });
+
+  it("rejects impossible delta envelopes", () => {
+    const event = (streamSeq: number, roomId = "room-1") => ({
+      eventId: `event-${streamSeq}`,
+      streamKind: "room",
+      streamId: roomId,
+      streamSeq,
+      roomId,
+      actorId: "human-1",
+      occurredAt: "2026-08-11T00:00:00.000Z",
+      type: "member.removed",
+      payload: { targetActorId: "human-2" },
+    });
+    const valid = {
+      type: "room.sync.result",
+      requestId: "request-1",
+      mode: "delta",
+      events: [event(1), event(2)],
+      nextCursor: { version: 1, roomId: "room-1", afterSeq: 2, watermark: 3 },
+      watermark: 3,
+      hasMore: true,
+    };
+    expect(isRoomSyncResult(valid)).toBe(true);
+    expect(isRoomSyncResult({
+      ...valid,
+      events: [event(1), { ...event(2), eventId: "event-1" }],
+    })).toBe(false);
+    expect(isRoomSyncResult({ ...valid, events: [event(1), event(3)] })).toBe(false);
+    expect(isRoomSyncResult({ ...valid, events: [event(1, "room-2"), event(2)] })).toBe(false);
+    expect(isRoomSyncResult({
+      ...valid,
+      nextCursor: { version: 1, roomId: "room-1", afterSeq: 1, watermark: 3 },
+    })).toBe(false);
+    expect(isRoomSyncResult({
+      ...valid,
+      nextCursor: { version: 1, roomId: "room-1", afterSeq: 4, watermark: 4 },
+    })).toBe(false);
+    expect(isRoomSyncResult({ ...valid, hasMore: false })).toBe(false);
+    expect(isRoomSyncResult({
+      ...valid,
+      nextCursor: { version: 1, roomId: "room-1", afterSeq: 2 },
+    })).toBe(false);
+    expect(isRoomSyncResult({
+      ...valid,
+      events: [event(1), event(2), event(3)],
+      nextCursor: { version: 1, roomId: "room-1", afterSeq: 3, watermark: 3 },
+      hasMore: false,
+    })).toBe(false);
+    expect(isRoomSyncResult({
+      ...valid,
+      events: [],
+      nextCursor: { version: 1, roomId: "room-1", afterSeq: 2 },
+      hasMore: false,
+    })).toBe(false);
+    expect(isRoomSyncResult({
+      ...valid,
+      events: [],
+      nextCursor: { version: 1, roomId: "room-1", afterSeq: 3 },
+      hasMore: false,
+    })).toBe(true);
   });
 
   it("does not interchange room and catalog snapshot versions", () => {

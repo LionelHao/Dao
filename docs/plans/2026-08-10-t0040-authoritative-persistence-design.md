@@ -544,6 +544,7 @@ v4 为 `open_items` 增加 requester、transfer chain 与 responded timestamp，
 - `403 room_forbidden`：当前 principal 没有房间权限；
 - `403 snapshot_forbidden`：snapshot 属于其他 principal 或 session family；不得透露 snapshot 内容或绑定主体；
 - `409 idempotency_conflict`：同 key 对应不同 canonical 请求；
+- `409 room_compaction_blocked`：compaction cutoff 之前仍有 non-dispatched outbox delivery；该请求以 request-level 错误失败，事务零更新、零删除，worker client 保持非终态并可继续处理后续请求；
 - `409 snapshot_stale`：catalog/access revision 已变化，客户端丢弃 staging 并重新 begin；
 - `410 snapshot_expired`：durable snapshot 已超过 TTL，客户端必须丢弃 staging 并重新 begin；
 - `429 snapshot_busy`：snapshot build 队列已满，客户端按服务端 retry hint 重试；

@@ -244,6 +244,66 @@ class CapabilityProbeTransport extends EventEmitter implements AuthorityWorkerTr
   }
 }
 
+class SyncResultProbeTransport extends EventEmitter implements AuthorityWorkerTransport {
+  constructor(
+    private readonly responseFor: (
+      request: Extract<AuthorityWorkerRequest, { readonly type: "authority.sync-room" }>,
+    ) => unknown,
+  ) {
+    super();
+  }
+
+  postMessage(request: AuthorityWorkerRequest): void {
+    if (request.type === "authority.initialize") {
+      queueMicrotask(() => this.emit("message", {
+        type: "authority.ready",
+        requestId: request.requestId,
+        schemaVersion: 4,
+      } satisfies AuthorityWorkerResponse));
+      return;
+    }
+    if (request.type !== "authority.sync-room") {
+      throw new Error("unexpected sync probe request");
+    }
+    queueMicrotask(() => this.emit("message", this.responseFor(request)));
+  }
+
+  async terminate(): Promise<number> {
+    return 0;
+  }
+}
+
+class CompactionResultProbeTransport extends EventEmitter implements AuthorityWorkerTransport {
+  constructor(
+    private readonly responseFor: (
+      request: Extract<AuthorityWorkerRequest, {
+        readonly type: "authority.compact-room-stream";
+      }>,
+    ) => unknown,
+  ) {
+    super();
+  }
+
+  postMessage(request: AuthorityWorkerRequest): void {
+    if (request.type === "authority.initialize") {
+      queueMicrotask(() => this.emit("message", {
+        type: "authority.ready",
+        requestId: request.requestId,
+        schemaVersion: 4,
+      } satisfies AuthorityWorkerResponse));
+      return;
+    }
+    if (request.type !== "authority.compact-room-stream") {
+      throw new Error("unexpected compaction probe request");
+    }
+    queueMicrotask(() => this.emit("message", this.responseFor(request)));
+  }
+
+  async terminate(): Promise<number> {
+    return 0;
+  }
+}
+
 class ThrowingPostTransport extends EventEmitter implements AuthorityWorkerTransport {
   constructor(
     private readonly failOn: AuthorityWorkerRequest["type"],
@@ -1270,6 +1330,154 @@ describe("WorkerDatabaseClient", () => {
     expect(laterError).toBe(pendingError);
     await expectDatabasePathEventuallyReusable(path);
   });
+
+  it.each([
+    "request-id",
+    "room-id",
+    "first-sequence",
+    "empty-skip",
+    "event-limit",
+    "continuation-watermark",
+    "repair-not-expired",
+    "duplicate-event-id",
+  ] as const)("terminally rejects a room sync result with mismatched %s", async (mismatch) => {
+    const path = databasePath();
+    const event = (streamSeq: number, roomId = "room-1") => ({
+      eventId: `event-${streamSeq}`,
+      streamKind: "room" as const,
+      streamId: roomId,
+      streamSeq,
+      roomId,
+      actorId: "human-1",
+      occurredAt: "2026-08-11T00:00:00.000Z",
+      type: "member.removed" as const,
+      payload: { targetActorId: "human-2" },
+    });
+    const transport = new SyncResultProbeTransport((request) => {
+      if (mismatch === "repair-not-expired") {
+        return {
+          type: "authority.room-synced",
+          requestId: request.requestId,
+          result: {
+            type: "room.sync.result",
+            requestId: request.request.requestId,
+            mode: "repair_required",
+            reason: "cursor_expired",
+            retainedFromSeq: 5,
+            watermark: 10,
+          },
+        };
+      }
+      if (mismatch === "room-id") {
+        return {
+          type: "authority.room-synced",
+          requestId: request.requestId,
+          result: {
+            type: "room.sync.result",
+            requestId: request.request.requestId,
+            mode: "delta",
+            events: [event(1, "room-2")],
+            nextCursor: { version: 1, roomId: "room-2", afterSeq: 1 },
+            watermark: 1,
+            hasMore: false,
+          },
+        };
+      }
+      const events = mismatch === "first-sequence"
+        ? [event(2)]
+        : mismatch === "empty-skip"
+          ? []
+        : mismatch === "duplicate-event-id"
+          ? [event(1), { ...event(2), eventId: "event-1" }]
+        : mismatch === "event-limit" || mismatch === "continuation-watermark"
+          ? [event(1), event(2)]
+          : [event(1)];
+      const watermark = mismatch === "first-sequence" || mismatch === "empty-skip"
+        ? 2
+        : events.length;
+      return {
+        type: "authority.room-synced",
+        requestId: request.requestId,
+        result: {
+          type: "room.sync.result",
+          requestId: mismatch === "request-id" ? "wrong-request" : request.request.requestId,
+          mode: "delta",
+          events,
+          nextCursor: { version: 1, roomId: "room-1", afterSeq: watermark },
+          watermark,
+          hasMore: false,
+        },
+      };
+    });
+    const client = trackClient(await createWorkerDatabaseClientForTest(
+      { databasePath: path },
+      () => transport,
+    ));
+    const continuation = mismatch === "continuation-watermark"
+      ? { watermark: 1 }
+      : {};
+    const error = await rejectionOf(client.syncRoom(
+      {
+        sessionId: createHash("sha256").update("access").digest("base64url"),
+        sessionFamilyId: createHash("sha256").update("family").digest("base64url"),
+        principal: { accountId: "account-1", actorId: "human-1" },
+      },
+      {
+        type: "room.sync",
+        requestId: "sync-request",
+        roomId: "room-1",
+        cursor: {
+          version: 1,
+          roomId: "room-1",
+          afterSeq: mismatch === "repair-not-expired" ? 5 : 0,
+          ...continuation,
+        },
+        limit: mismatch === "duplicate-event-id" ? 2 : 1,
+      },
+      1_000,
+    ));
+    const laterError = await rejectionOf(client.inspectSchema());
+    expect(error).toMatchObject({
+      status: 503,
+      code: "authority_worker_protocol_error",
+      message: mismatch === "duplicate-event-id"
+        ? "Authority worker sent a malformed response"
+        : "Authority worker returned an invalid room-sync result",
+    });
+    expect(laterError).toBe(error);
+    expect(publicErrorSurface(error)).not.toContain("wrong-request");
+  });
+
+  it.each(["room-id", "retained-from-seq"] as const)(
+    "terminally rejects a room stream compaction result with mismatched %s",
+    async (mismatch) => {
+      const path = databasePath();
+      const transport = new CompactionResultProbeTransport((request) => ({
+        type: "authority.room-stream-compacted",
+        requestId: request.requestId,
+        roomId: mismatch === "room-id" ? "wrong-room" : request.roomId,
+        retainedFromSeq: mismatch === "retained-from-seq"
+          ? request.retainedFromSeq + 1
+          : request.retainedFromSeq,
+        headSeq: 5,
+      }));
+      const client = trackClient(await createWorkerDatabaseClientForTest(
+        { databasePath: path },
+        () => transport,
+      ));
+
+      const error = await rejectionOf(client.compactRoomStream("room-1", 2));
+      const laterError = await rejectionOf(client.inspectSchema());
+
+      expect(error).toMatchObject({
+        status: 503,
+        code: "authority_worker_protocol_error",
+        message: "Authority worker returned an invalid room-stream compaction result",
+      });
+      expect(laterError).toBe(error);
+      expect(publicErrorSurface(error)).not.toContain("wrong-room");
+    },
+  );
 
   it("fails terminally with a sanitized storage error for an unknown worker error code", async () => {
     const path = databasePath();

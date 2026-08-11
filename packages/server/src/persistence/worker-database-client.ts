@@ -3,7 +3,13 @@ import { lstat, readdir, readFile, readlink, realpath, stat } from "node:fs/prom
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
-import type { Actor, ManagedRoom, Message } from "@native-im/core";
+import type {
+  Actor,
+  ManagedRoom,
+  Message,
+  RoomSyncRequest,
+  RoomSyncResult,
+} from "@native-im/core";
 import type { RoomAuditRecord } from "../room-lifecycle.js";
 import {
   isAuthorityWorkerResponse,
@@ -33,7 +39,10 @@ import type {
   OutboxDispatchCandidate,
   RoomGovernanceCommand,
 } from "./contracts.js";
-import { toAgentWorkerCommandContext } from "./contracts.js";
+import {
+  ROOM_SYNC_DEFAULT_LIMIT,
+  toAgentWorkerCommandContext,
+} from "./contracts.js";
 
 export interface CreateWorkerDatabaseClientOptions {
   readonly databasePath: string;
@@ -79,6 +88,15 @@ export interface WorkerDatabaseClient {
     roomId: string,
     now: number,
   ): Promise<readonly Message[]>;
+  syncRoom(
+    context: AuthenticatedSessionContext,
+    request: RoomSyncRequest,
+    now: number,
+  ): Promise<RoomSyncResult>;
+  compactRoomStream(
+    roomId: string,
+    retainedFromSeq: number,
+  ): Promise<{ readonly retainedFromSeq: number; readonly headSeq: number }>;
   readActor(actorId: string): Promise<Actor | undefined>;
   readRoom(roomId: string): Promise<ManagedRoom | undefined>;
   canAccessRoom(
@@ -172,6 +190,7 @@ function authorityWorkerClientErrorStatus(
     case "invitation_consumed":
     case "invitation_pending":
     case "room_archived":
+    case "room_compaction_blocked":
     case "room_member_exists":
     case "room_owner_required":
       return 409;
@@ -244,6 +263,37 @@ function hasExactKeys(
     actualKeys.length === sortedExpectedKeys.length &&
     actualKeys.every((key, index) => key === sortedExpectedKeys[index])
   );
+}
+
+function roomSyncResultMatchesRequest(
+  request: RoomSyncRequest,
+  result: RoomSyncResult,
+): boolean {
+  if (result.requestId !== request.requestId) {
+    return false;
+  }
+  if (result.mode === "repair_required") {
+    if (request.cursor === undefined) {
+      return result.reason === "cursor_absent";
+    }
+    return result.reason === "cursor_expired" &&
+      request.cursor.afterSeq < result.retainedFromSeq - 1 &&
+      result.watermark >= request.cursor.afterSeq;
+  }
+  if (
+    request.cursor === undefined ||
+    (request.cursor.watermark !== undefined &&
+      result.watermark !== request.cursor.watermark) ||
+    result.nextCursor.roomId !== request.roomId ||
+    result.watermark < request.cursor.afterSeq ||
+    result.events.length > (request.limit ?? ROOM_SYNC_DEFAULT_LIMIT)
+  ) {
+    return false;
+  }
+  const firstEvent = result.events[0];
+  return firstEvent === undefined
+    ? result.nextCursor.afterSeq === request.cursor.afterSeq
+    : firstEvent.streamSeq === request.cursor.afterSeq + 1;
 }
 
 async function controlledLegacyRecovery(
@@ -862,6 +912,52 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
       });
   }
 
+  syncRoom(
+    context: AuthenticatedSessionContext,
+    request: RoomSyncRequest,
+    now: number,
+  ): Promise<RoomSyncResult> {
+    return this.#send({ type: "authority.sync-room", context, request, now })
+      .then((response) => {
+        if (response.type !== "authority.room-synced") {
+          this.#failProtocol("Authority worker returned the wrong room-sync response");
+          throw this.#terminalError;
+        }
+        if (!roomSyncResultMatchesRequest(request, response.result)) {
+          this.#failProtocol("Authority worker returned an invalid room-sync result");
+          throw this.#terminalError;
+        }
+        return response.result;
+      });
+  }
+
+  compactRoomStream(
+    roomId: string,
+    retainedFromSeq: number,
+  ): Promise<{ readonly retainedFromSeq: number; readonly headSeq: number }> {
+    return this.#send({
+      type: "authority.compact-room-stream",
+      roomId,
+      retainedFromSeq,
+    }).then((response) => {
+      if (response.type !== "authority.room-stream-compacted") {
+        this.#failProtocol("Authority worker returned the wrong room-stream compaction response");
+        throw this.#terminalError;
+      }
+      if (
+        response.roomId !== roomId ||
+        response.retainedFromSeq !== retainedFromSeq
+      ) {
+        this.#failProtocol("Authority worker returned an invalid room-stream compaction result");
+        throw this.#terminalError;
+      }
+      return {
+        retainedFromSeq: response.retainedFromSeq,
+        headSeq: response.headSeq,
+      };
+    });
+  }
+
   readActor(actorId: string): Promise<Actor | undefined> {
     return this.#send({ type: "authority.read-actor", actorId }).then((response) => {
       if (response.type !== "authority.actor") {
@@ -1153,6 +1249,10 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
         responseType === "authority.outbox-updated") ||
       (requestType === "authority.outbox-failed" &&
         responseType === "authority.outbox-updated") ||
+      (requestType === "authority.sync-room" &&
+        responseType === "authority.room-synced") ||
+      (requestType === "authority.compact-room-stream" &&
+        responseType === "authority.room-stream-compacted") ||
       (requestType === "authority.close" && responseType === "authority.closed")
     );
   }

@@ -894,7 +894,21 @@ Propose `feat(server): dispatch transactional outbox`. The risk summary must dis
 - Modify: `packages/server/src/persistence/worker-protocol.ts`
 - Modify: `packages/server/src/persistence/authority-worker.ts`
 - Modify: `packages/server/src/persistence/sqlite-authoritative-store.ts`
+- Modify: `packages/server/src/persistence/worker-database-client.ts` (real RPC client)
+- Modify: `packages/server/src/persistence/authority-database-handler.ts` (worker-owned SQLite sync query and compaction transaction)
 - Modify: `packages/server/src/index.ts`
+- Modify: `packages/core/src/sync.ts` (mechanical cursor/result contract repair)
+- Modify: `packages/core/src/sync.test.ts` (closed guard regression coverage)
+
+This mechanical expansion keeps the Task 8 acceptance contract unchanged: the
+facade must reach the real worker RPC client, while all SQLite reads and
+compaction SQL remain owned by the authority worker.
+The core sync files are additionally in scope only to carry the fixed page
+watermark and close impossible result envelopes; acceptance semantics remain
+unchanged.
+Compaction blocked by a non-dispatched outbox delivery uses the closed,
+request-level `room_compaction_blocked` error (HTTP 409), leaves stream/event/
+outbox state unchanged, and does not poison the worker client.
 
 - [ ] **Step 1: Write three-cursor RED tests against the authority store.**
 
