@@ -3,6 +3,7 @@ import type {
   AuthenticatedCommandContext,
   HumanCollaborationCommand,
   InternalAgentCommandContext,
+  OutboxDelivery,
 } from "./contracts.js";
 import { mintInternalAgentCommandContext } from "./contracts.js";
 import type { CanonicalIdentityEventInput } from "./authority-database-handler.js";
@@ -25,6 +26,16 @@ export type PackageRootAuthoritativeLifecycleFactoryMustStayUnavailable =
   typeof publicCreateAuthoritativeRoomLifecycleService;
 
 type Assert<T extends true> = T;
+type DeliveryFor<Kind extends OutboxDelivery["targetKind"], Delivery = OutboxDelivery> =
+  Delivery extends { readonly targetKind: infer DeliveryKind }
+    ? Kind extends DeliveryKind ? Delivery : never
+    : never;
+type SessionFamilyEventType = DeliveryFor<"session-family"> extends {
+  readonly event: { readonly type: infer EventType };
+} ? EventType : never;
+type PrincipalEventType = DeliveryFor<"principal"> extends {
+  readonly event: { readonly type: infer EventType };
+} ? EventType : never;
 
 type ActorIdentityEventWithRoomAccessPayload = {
   readonly eventId: "event-invalid-pair";
@@ -95,6 +106,24 @@ export type PublicClientCannotReadActor = Assert<
 >;
 export type PublicClientCannotReadRoom = Assert<
   "readRoom" extends keyof PublicWorkerDatabaseClient ? false : true
+>;
+export type PublicClientCannotListOutbox = Assert<
+  "listPendingOutbox" extends keyof PublicWorkerDatabaseClient ? false : true
+>;
+export type PublicClientCannotAuthorizeOutbox = Assert<
+  "authorizeOutboxCandidate" extends keyof PublicWorkerDatabaseClient ? false : true
+>;
+export type PublicClientCannotMarkOutboxDispatched = Assert<
+  "markOutboxDispatched" extends keyof PublicWorkerDatabaseClient ? false : true
+>;
+export type PublicClientCannotMarkOutboxFailed = Assert<
+  "markOutboxFailed" extends keyof PublicWorkerDatabaseClient ? false : true
+>;
+export type SessionFamilyDeliveryCarriesOnlyRevocation = Assert<
+  Exclude<SessionFamilyEventType, "identity.session.revoked"> extends never ? true : false
+>;
+export type PrincipalDeliveryCarriesOnlyRoomAccess = Assert<
+  Exclude<PrincipalEventType, "identity.room-access.changed"> extends never ? true : false
 >;
 export type MintedContextIsInternal = Assert<
   ReturnType<typeof mintInternalAgentCommandContext> extends InternalAgentCommandContext

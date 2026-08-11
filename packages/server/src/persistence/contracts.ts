@@ -285,14 +285,48 @@ export interface CommandAcknowledgement {
   readonly result: JsonValue;
 }
 
-export interface OutboxDelivery {
+interface OutboxDeliveryBase {
   readonly deliveryId: string;
   readonly eventId: string;
-  readonly targetKind: "room" | "principal" | "session-family";
   readonly targetId: string;
   readonly streamSeq: number;
   readonly attempts: number;
 }
+
+type PersistedSessionRevokedEvent = PersistedIdentityEvent & {
+  readonly type: "identity.session.revoked";
+};
+
+type PersistedRoomAccessChangedEvent = PersistedIdentityEvent & {
+  readonly type: "identity.room-access.changed";
+};
+
+export type OutboxDelivery =
+  | (OutboxDeliveryBase & {
+      readonly targetKind: "room";
+      readonly event: PersistedRoomEvent;
+    })
+  | (OutboxDeliveryBase & {
+      readonly targetKind: "principal";
+      readonly event: PersistedRoomAccessChangedEvent;
+    })
+  | (OutboxDeliveryBase & {
+      readonly targetKind: "session-family";
+      readonly event: PersistedSessionRevokedEvent;
+    });
+
+export interface OutboxDispatchCandidate {
+  readonly connectionId: string;
+  readonly principal: AuthenticatedPrincipal;
+  readonly sessionId: string;
+  readonly sessionFamilyId: string;
+  readonly credentialGeneration: number;
+}
+
+export type OutboxDeliveryFailureReason =
+  | "closed"
+  | "backpressure"
+  | "send_rejected";
 
 export interface CommandStore {
   executeHuman(
@@ -316,7 +350,15 @@ export interface SyncQueryStore {
     roomId: string,
   ): Promise<readonly RoomAuditRecord[]>;
   listPendingOutbox(limit: number): Promise<readonly OutboxDelivery[]>;
+  authorizeOutboxCandidate(
+    delivery: OutboxDelivery,
+    candidate: OutboxDispatchCandidate,
+  ): Promise<boolean>;
   markOutboxDispatched(deliveryId: string): Promise<void>;
+  markOutboxFailed(
+    deliveryId: string,
+    reason: OutboxDeliveryFailureReason,
+  ): Promise<void>;
 }
 
 export type ContractParseResult<T, TCode extends string> =

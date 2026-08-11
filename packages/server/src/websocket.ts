@@ -7,6 +7,13 @@ import {
   type IssuedSession,
 } from "./auth.js";
 import {
+  createOutboxDispatcher,
+  type OutboxDispatchFrame,
+  type OutboxDispatchStore,
+  type OutboxSendResult,
+} from "./outbox-dispatcher.js";
+import type { AuthenticatedSessionContext } from "./persistence/contracts.js";
+import {
   MessageValidationError,
   RoomAccessError,
   type MessageService,
@@ -19,6 +26,11 @@ import {
   type ProtocolErrorFrame,
   type ServerFrame,
 } from "./protocol.js";
+import {
+  createSubscriptionRegistry,
+  type RegisteredConnection,
+  type SubscriptionRegistry,
+} from "./subscription-registry.js";
 
 export interface MessageWebSocketServer {
   readonly url: string;
@@ -34,6 +46,9 @@ export interface StartMessageWebSocketServerOptions {
   readonly maxQueuedFrameCount?: number;
   readonly maxQueuedFrameBytes?: number;
   readonly afterSubscribeRegistered?: (roomId: string) => void | Promise<void>;
+  readonly outboxStore?: OutboxDispatchStore;
+  readonly outboxPollIntervalMs?: number;
+  readonly subscriptionRegistry?: SubscriptionRegistry;
 }
 
 export const MESSAGE_WEBSOCKET_MAX_PAYLOAD_BYTES = 64 * 1_024;
@@ -51,13 +66,17 @@ function abortAndTerminate(socket: WebSocket): void {
 
 interface ConnectionContext {
   principal: AuthenticatedPrincipal | undefined;
+  session: AuthenticatedSessionContext | undefined;
   accessToken: string | undefined;
   credentialGeneration: number;
   authOperationPending: boolean;
+  terminalRevocationPending: boolean;
   closed: boolean;
   readonly unsubscribersByRoom: Map<string, () => void>;
+  readonly identityUnsubscribers: Set<() => void>;
   readonly subscriptionGenerationsByRoom: Map<string, number>;
   readonly unsubscribeAll: () => void;
+  registeredConnection: RegisteredConnection | undefined;
 }
 
 function errorFrame(
@@ -88,15 +107,18 @@ function mappedError(error: unknown, requestId: string): ProtocolErrorFrame {
   return errorFrame(500, "internal_error", "Unable to process request", requestId);
 }
 
-function sendFrame(socket: WebSocket, frame: ServerFrame): void {
+function sendFrameWithResult(
+  socket: WebSocket,
+  frame: ServerFrame,
+): Promise<OutboxSendResult> {
   if (socket.readyState !== WebSocket.OPEN) {
-    return;
+    return Promise.resolve({ accepted: false, reason: "closed" });
   }
   try {
     const serialized = JSON.stringify(frame);
     if (serialized === undefined) {
       abortAndTerminate(socket);
-      return;
+      return Promise.resolve({ accepted: false, reason: "send_rejected" });
     }
     const maxBufferedAmount =
       maxBufferedAmountBySocket.get(socket) ??
@@ -104,12 +126,31 @@ function sendFrame(socket: WebSocket, frame: ServerFrame): void {
     const frameBytes = Buffer.byteLength(serialized, "utf8");
     if (frameBytes > maxBufferedAmount - socket.bufferedAmount) {
       abortAndTerminate(socket);
-      return;
+      return Promise.resolve({ accepted: false, reason: "backpressure" });
     }
-    socket.send(serialized);
+    return new Promise<OutboxSendResult>((resolve) => {
+      try {
+        socket.send(serialized, (error) => {
+          if (error != null) {
+            abortAndTerminate(socket);
+            resolve({ accepted: false, reason: "send_rejected" });
+            return;
+          }
+          resolve({ accepted: true });
+        });
+      } catch {
+        abortAndTerminate(socket);
+        resolve({ accepted: false, reason: "send_rejected" });
+      }
+    });
   } catch {
     abortAndTerminate(socket);
+    return Promise.resolve({ accepted: false, reason: "send_rejected" });
   }
+}
+
+function sendFrame(socket: WebSocket, frame: ServerFrame): void {
+  void sendFrameWithResult(socket, frame);
 }
 
 function rawDataToString(raw: RawData): string {
@@ -207,14 +248,39 @@ function installAuthentication(
   context: ConnectionContext,
   principal: AuthenticatedPrincipal,
   accessToken: string,
+  session?: AuthenticatedSessionContext,
 ): boolean {
   if (context.closed) {
     return false;
   }
   context.credentialGeneration += 1;
   context.principal = principal;
+  context.session = session;
   context.accessToken = accessToken;
   return true;
+}
+
+function registerIdentitySubscriptions(
+  context: ConnectionContext,
+  registry: SubscriptionRegistry | undefined,
+): void {
+  for (const unsubscribe of context.identityUnsubscribers) {
+    safelyUnsubscribe(unsubscribe);
+  }
+  context.identityUnsubscribers.clear();
+  const connection = context.registeredConnection;
+  const session = context.session;
+  if (registry === undefined || connection === undefined || session === undefined) {
+    return;
+  }
+  context.identityUnsubscribers.add(registry.addPrincipal({
+    principalId: session.principal.actorId,
+    connection,
+  }));
+  context.identityUnsubscribers.add(registry.addSessionFamily({
+    familyId: session.sessionFamilyId,
+    connection,
+  }));
 }
 
 function clearAuthentication(
@@ -229,6 +295,7 @@ function clearAuthentication(
   }
   context.credentialGeneration += 1;
   context.principal = undefined;
+  context.session = undefined;
   context.accessToken = undefined;
   context.unsubscribeAll();
   return true;
@@ -254,7 +321,11 @@ async function authenticateCurrent(
   }
 
   try {
-    const principal = await options.auth.authenticate(accessToken);
+    const authenticatedSession = options.outboxStore === undefined
+      ? undefined
+      : await options.auth.authenticateSession(accessToken);
+    const principal = authenticatedSession?.principal ??
+      await options.auth.authenticate(accessToken);
     if (
       context.closed ||
       context.credentialGeneration !== credentialGeneration ||
@@ -266,9 +337,20 @@ async function authenticateCurrent(
       clearAuthentication(context, credentialGeneration);
       throw errorFrame(403, "identity_forbidden", "Session identity changed");
     }
+    if (authenticatedSession !== undefined) {
+      context.session = authenticatedSession;
+    }
     return principal;
   } catch (error: unknown) {
-    clearAuthentication(context, credentialGeneration);
+    if (
+      options.outboxStore !== undefined &&
+      error instanceof AuthenticationError &&
+      error.code === "session_revoked"
+    ) {
+      context.terminalRevocationPending = true;
+    } else {
+      clearAuthentication(context, credentialGeneration);
+    }
     throw error;
   }
 }
@@ -349,17 +431,37 @@ async function handleLoginOrResume(
         secret: frame.secret,
       });
       const principal = { accountId: session.accountId, actorId: session.actorId };
-      if (!installAuthentication(context, principal, session.accessToken)) {
+      const authenticatedSession = options.outboxStore === undefined
+        ? undefined
+        : await options.auth.authenticateSession(session.accessToken);
+      if (
+        authenticatedSession !== undefined &&
+        !samePrincipal(authenticatedSession.principal, principal)
+      ) {
+        throw new AuthenticationError(403, "identity_forbidden");
+      }
+      if (!installAuthentication(
+        context,
+        principal,
+        session.accessToken,
+        authenticatedSession,
+      )) {
         return;
       }
+      registerIdentitySubscriptions(context, options.subscriptionRegistry);
       sendFrame(socket, authenticatedFrame(frame.requestId, principal, session));
       return;
     }
 
-    const principal = await options.auth.authenticate(frame.accessToken);
-    if (!installAuthentication(context, principal, frame.accessToken)) {
+    const authenticatedSession = options.outboxStore === undefined
+      ? undefined
+      : await options.auth.authenticateSession(frame.accessToken);
+    const principal = authenticatedSession?.principal ??
+      await options.auth.authenticate(frame.accessToken);
+    if (!installAuthentication(context, principal, frame.accessToken, authenticatedSession)) {
       return;
     }
+    registerIdentitySubscriptions(context, options.subscriptionRegistry);
     sendFrame(socket, authenticatedFrame(frame.requestId, principal));
   } catch (error: unknown) {
     if (!context.closed) {
@@ -416,9 +518,24 @@ async function handleRefresh(
       return;
     }
 
-    if (!installAuthentication(context, refreshedPrincipal, session.accessToken)) {
+    const authenticatedSession = options.outboxStore === undefined
+      ? undefined
+      : await options.auth.authenticateSession(session.accessToken);
+    if (
+      authenticatedSession !== undefined &&
+      !samePrincipal(authenticatedSession.principal, refreshedPrincipal)
+    ) {
+      throw new AuthenticationError(403, "identity_forbidden");
+    }
+    if (!installAuthentication(
+      context,
+      refreshedPrincipal,
+      session.accessToken,
+      authenticatedSession,
+    )) {
       return;
     }
+    registerIdentitySubscriptions(context, options.subscriptionRegistry);
     sendFrame(
       socket,
       authenticatedFrame(frame.requestId, refreshedPrincipal, session),
@@ -450,12 +567,16 @@ async function handleRevoke(
   context.authOperationPending = true;
   try {
     await options.auth.revoke(accessToken);
-    clearAuthentication(context);
-    if (!context.closed) {
+    if (options.outboxStore === undefined) {
+      clearAuthentication(context);
       sendFrame(socket, { type: "auth.revoked", requestId: frame.requestId });
+    } else {
+      context.terminalRevocationPending = true;
     }
   } catch (error: unknown) {
-    clearAuthentication(context);
+    if (options.outboxStore === undefined) {
+      clearAuthentication(context);
+    }
     if (!context.closed) {
       sendFrame(socket, mappedError(error, frame.requestId));
     }
@@ -480,6 +601,67 @@ async function handleSubscribe(
   const previousUnsubscribe = context.unsubscribersByRoom.get(frame.roomId);
   context.unsubscribersByRoom.delete(frame.roomId);
   safelyUnsubscribe(previousUnsubscribe);
+
+  if (options.outboxStore !== undefined) {
+    const session = context.session;
+    const connection = context.registeredConnection;
+    const registry = options.subscriptionRegistry;
+    if (session === undefined || connection === undefined || registry === undefined) {
+      sendFrame(socket, errorFrame(
+        401,
+        "unauthenticated",
+        "Authentication is required",
+        frame.requestId,
+      ));
+      return;
+    }
+    let unsubscribe: (() => void) | undefined;
+    try {
+      unsubscribe = onceUnsubscribe(registry.addRoom({
+        roomId: frame.roomId,
+        connection,
+      }));
+      context.unsubscribersByRoom.set(frame.roomId, unsubscribe);
+      await options.afterSubscribeRegistered?.(frame.roomId);
+      if (
+        context.closed ||
+        context.subscriptionGenerationsByRoom.get(frame.roomId) !== generation
+      ) {
+        safelyUnsubscribe(unsubscribe);
+        return;
+      }
+      const messages = await options.service.history(session, frame.roomId);
+      if (
+        context.closed ||
+        context.subscriptionGenerationsByRoom.get(frame.roomId) !== generation
+      ) {
+        safelyUnsubscribe(unsubscribe);
+        return;
+      }
+      sendFrame(socket, {
+        type: "room.history",
+        requestId: frame.requestId,
+        roomId: frame.roomId,
+        messages,
+      });
+      sendFrame(socket, {
+        type: "room.subscribed",
+        requestId: frame.requestId,
+        roomId: frame.roomId,
+      });
+      return;
+    } catch (error: unknown) {
+      safelyUnsubscribe(unsubscribe);
+      if (context.unsubscribersByRoom.get(frame.roomId) === unsubscribe) {
+        context.unsubscribersByRoom.delete(frame.roomId);
+      }
+      context.subscriptionGenerationsByRoom.delete(frame.roomId);
+      if (!context.closed) {
+        sendFrame(socket, mappedError(error, frame.requestId));
+      }
+      return;
+    }
+  }
 
   let unsubscribe: (() => void) | undefined;
   let deliveryQueue = Promise.resolve();
@@ -566,6 +748,9 @@ async function handleFrame(
   options: StartMessageWebSocketServerOptions,
   context: ConnectionContext,
 ): Promise<void> {
+  if (context.terminalRevocationPending) {
+    return;
+  }
   switch (frame.type) {
     case "auth.login":
     case "auth.resume":
@@ -583,7 +768,16 @@ async function handleFrame(
         return;
       }
       try {
-        const acknowledgement = await options.service.send(principal.actorId, frame.message);
+        const acknowledgement = options.outboxStore === undefined
+          ? await options.service.send(principal.actorId, frame.message)
+          : context.session === undefined
+            ? (() => { throw new RoomAccessError(); })()
+            : await options.service.send({
+                ...context.session,
+                kind: "human",
+                requestId: frame.requestId,
+                idempotencyKey: frame.message.id,
+              }, frame.message);
         if (!context.closed) {
           sendFrame(socket, { ...acknowledgement, requestId: frame.requestId });
         }
@@ -600,7 +794,11 @@ async function handleFrame(
         return;
       }
       try {
-        const messages = await options.service.history(principal.actorId, frame.roomId);
+        const messages = options.outboxStore === undefined
+          ? await options.service.history(principal.actorId, frame.roomId)
+          : context.session === undefined
+            ? (() => { throw new RoomAccessError(); })()
+            : await options.service.history(context.session, frame.roomId);
         if (!context.closed) {
           sendFrame(socket, {
             type: "room.history",
@@ -665,30 +863,112 @@ export async function startMessageWebSocketServer(
     server: httpServer,
     maxPayload: MESSAGE_WEBSOCKET_MAX_PAYLOAD_BYTES,
   });
+  const subscriptionRegistry = options.outboxStore === undefined
+    ? undefined
+    : options.subscriptionRegistry ?? createSubscriptionRegistry();
+  if (options.subscriptionRegistry !== undefined && options.outboxStore === undefined) {
+    throw new TypeError("subscriptionRegistry requires outboxStore");
+  }
+  const runtimeOptions: StartMessageWebSocketServerOptions = {
+    ...options,
+    ...(subscriptionRegistry === undefined ? {} : { subscriptionRegistry }),
+  };
   const activeSockets = new Set<WebSocket>();
+  const liveConnections = new Map<
+    string,
+    { readonly socket: WebSocket; readonly context: ConnectionContext }
+  >();
+  let nextConnectionId = 0;
+  const outboxDispatcher = options.outboxStore === undefined || subscriptionRegistry === undefined
+    ? undefined
+    : createOutboxDispatcher({
+        store: options.outboxStore,
+        registry: subscriptionRegistry,
+        ...(options.outboxPollIntervalMs === undefined
+          ? {}
+          : { pollIntervalMs: options.outboxPollIntervalMs }),
+        async send(candidate, frame: OutboxDispatchFrame) {
+          const live = liveConnections.get(candidate.connectionId);
+          const session = live?.context.session;
+          if (
+            live === undefined ||
+            live.context.closed ||
+            session === undefined ||
+            live.context.credentialGeneration !== candidate.credentialGeneration ||
+            session.sessionId !== candidate.sessionId ||
+            session.sessionFamilyId !== candidate.sessionFamilyId ||
+            !samePrincipal(session.principal, candidate.principal)
+          ) {
+            return { accepted: false, reason: "closed" };
+          }
+          return sendFrameWithResult(live.socket, frame);
+        },
+      });
   let closePromise: Promise<void> | undefined;
 
   webSocketServer.on("connection", (socket) => {
     maxBufferedAmountBySocket.set(socket, maxBufferedAmountBytes);
     const unsubscribersByRoom = new Map<string, () => void>();
+    const identityUnsubscribers = new Set<() => void>();
     const subscriptionGenerationsByRoom = new Map<string, number>();
     const unsubscribeAll = () => {
       for (const unsubscribe of unsubscribersByRoom.values()) {
         safelyUnsubscribe(unsubscribe);
       }
       unsubscribersByRoom.clear();
+      for (const unsubscribe of identityUnsubscribers) {
+        safelyUnsubscribe(unsubscribe);
+      }
+      identityUnsubscribers.clear();
       subscriptionGenerationsByRoom.clear();
     };
     const context: ConnectionContext = {
       principal: undefined,
+      session: undefined,
       accessToken: undefined,
       credentialGeneration: 0,
       authOperationPending: false,
+      terminalRevocationPending: false,
       closed: false,
       unsubscribersByRoom,
+      identityUnsubscribers,
       subscriptionGenerationsByRoom,
       unsubscribeAll,
+      registeredConnection: undefined,
     };
+    const connectionId = `websocket-${++nextConnectionId}`;
+    const registeredConnection: RegisteredConnection = {
+      connectionId,
+      get principal() {
+        if (context.session === undefined) {
+          throw new TypeError("Connection is not authenticated");
+        }
+        return context.session.principal;
+      },
+      get sessionId() {
+        if (context.session === undefined) {
+          throw new TypeError("Connection is not authenticated");
+        }
+        return context.session.sessionId;
+      },
+      get sessionFamilyId() {
+        if (context.session === undefined) {
+          throw new TypeError("Connection is not authenticated");
+        }
+        return context.session.sessionFamilyId;
+      },
+      get credentialGeneration() {
+        return context.credentialGeneration;
+      },
+      revoke() {
+        abortConnection(context);
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.close(4001, "session revoked");
+        }
+      },
+    };
+    context.registeredConnection = registeredConnection;
+    liveConnections.set(connectionId, { socket, context });
     let frameQueue = Promise.resolve();
     let queuedFrameCount = 0;
     let queuedFrameBytes = 0;
@@ -701,6 +981,7 @@ export async function startMessageWebSocketServer(
     socket.on("close", () => {
       abort();
       activeSockets.delete(socket);
+      liveConnections.delete(connectionId);
     });
     socket.on("error", abort);
     socket.on("message", (raw, isBinary) => {
@@ -737,7 +1018,7 @@ export async function startMessageWebSocketServer(
           }
 
           try {
-            await handleFrame(socket, parsed.frame, options, context);
+            await handleFrame(socket, parsed.frame, runtimeOptions, context);
           } catch {
             if (!context.closed) {
               sendFrame(
@@ -767,11 +1048,13 @@ export async function startMessageWebSocketServer(
     await closeHttpServer(httpServer);
     throw new Error("Message WebSocket server did not expose a TCP address");
   }
+  outboxDispatcher?.start();
 
   return {
     url: `ws://${host}:${address.port}`,
     close(): Promise<void> {
       closePromise ??= (async () => {
+        await outboxDispatcher?.close();
         for (const socket of activeSockets) {
           abortAndTerminate(socket);
         }

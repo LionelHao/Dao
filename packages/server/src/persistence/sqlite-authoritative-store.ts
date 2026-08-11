@@ -13,6 +13,9 @@ import type {
   HumanCollaborationCommand,
   InternalAgentCommandContext,
   IssuedSessionRecord,
+  OutboxDelivery,
+  OutboxDeliveryFailureReason,
+  OutboxDispatchCandidate,
   RoomGovernanceCommand,
   SessionAuthority,
   SyncQueryStore,
@@ -24,7 +27,15 @@ export interface SqliteAuthoritativeStore extends
   CommandStore,
   Pick<
     SyncQueryStore,
-    "readHistory" | "readActor" | "readRoom" | "canAccessRoom" | "readRoomAudit"
+    | "readHistory"
+    | "readActor"
+    | "readRoom"
+    | "canAccessRoom"
+    | "readRoomAudit"
+    | "listPendingOutbox"
+    | "authorizeOutboxCandidate"
+    | "markOutboxDispatched"
+    | "markOutboxFailed"
   > {
   registerActors(actors: readonly Actor[]): Promise<void>;
   executeHuman(
@@ -49,6 +60,16 @@ export interface SqliteAuthoritativeStore extends
     context: AuthenticatedSessionContext,
     roomId: string,
   ): Promise<readonly RoomAuditRecord[]>;
+  listPendingOutbox(limit: number): Promise<readonly OutboxDelivery[]>;
+  authorizeOutboxCandidate(
+    delivery: OutboxDelivery,
+    candidate: OutboxDispatchCandidate,
+  ): Promise<boolean>;
+  markOutboxDispatched(deliveryId: string): Promise<void>;
+  markOutboxFailed(
+    deliveryId: string,
+    reason: OutboxDeliveryFailureReason,
+  ): Promise<void>;
 }
 
 export interface SqliteAuthoritativeStoreOptions {
@@ -224,6 +245,28 @@ export function createSqliteAuthoritativeStore(
       roomId: string,
     ): Promise<readonly RoomAuditRecord[]> {
       return client.readRoomAudit(context, roomId, clock());
+    },
+
+    listPendingOutbox(limit: number): Promise<readonly OutboxDelivery[]> {
+      return client.listPendingOutbox(limit, clock());
+    },
+
+    authorizeOutboxCandidate(
+      delivery: OutboxDelivery,
+      candidate: OutboxDispatchCandidate,
+    ): Promise<boolean> {
+      return client.authorizeOutboxCandidate(delivery.deliveryId, candidate, clock());
+    },
+
+    markOutboxDispatched(deliveryId: string): Promise<void> {
+      return client.markOutboxDispatched(deliveryId, clock());
+    },
+
+    markOutboxFailed(
+      deliveryId: string,
+      reason: OutboxDeliveryFailureReason,
+    ): Promise<void> {
+      return client.markOutboxFailed(deliveryId, reason);
     },
 
   };

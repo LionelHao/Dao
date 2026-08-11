@@ -28,6 +28,9 @@ import type {
   HumanCollaborationCommand,
   InternalAgentCommandContext,
   IssuedSessionRecord,
+  OutboxDelivery,
+  OutboxDeliveryFailureReason,
+  OutboxDispatchCandidate,
   RoomGovernanceCommand,
 } from "./contracts.js";
 import { toAgentWorkerCommandContext } from "./contracts.js";
@@ -88,6 +91,17 @@ export interface WorkerDatabaseClient {
     roomId: string,
     now: number,
   ): Promise<readonly RoomAuditRecord[]>;
+  listPendingOutbox(limit: number, now: number): Promise<readonly OutboxDelivery[]>;
+  authorizeOutboxCandidate(
+    deliveryId: string,
+    candidate: OutboxDispatchCandidate,
+    now: number,
+  ): Promise<boolean>;
+  markOutboxDispatched(deliveryId: string, now: number): Promise<void>;
+  markOutboxFailed(
+    deliveryId: string,
+    reason: OutboxDeliveryFailureReason,
+  ): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -898,6 +912,61 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
       });
   }
 
+  listPendingOutbox(limit: number, now: number): Promise<readonly OutboxDelivery[]> {
+    return this.#send({ type: "authority.outbox-list", limit, now }).then((response) => {
+      if (response.type !== "authority.outbox") {
+        this.#failProtocol("Authority worker returned the wrong outbox response");
+        throw this.#terminalError;
+      }
+      return response.deliveries;
+    });
+  }
+
+  authorizeOutboxCandidate(
+    deliveryId: string,
+    candidate: OutboxDispatchCandidate,
+    now: number,
+  ): Promise<boolean> {
+    return this.#send({
+      type: "authority.outbox-authorize",
+      deliveryId,
+      candidate,
+      now,
+    }).then((response) => {
+      if (response.type !== "authority.outbox-authorized") {
+        this.#failProtocol("Authority worker returned the wrong outbox authorization response");
+        throw this.#terminalError;
+      }
+      return response.authorized;
+    });
+  }
+
+  markOutboxDispatched(deliveryId: string, now: number): Promise<void> {
+    return this.#send({
+      type: "authority.outbox-dispatched",
+      deliveryId,
+      now,
+    }).then((response) => {
+      if (response.type !== "authority.outbox-updated") {
+        this.#failProtocol("Authority worker returned the wrong dispatched-outbox response");
+        throw this.#terminalError;
+      }
+    });
+  }
+
+  markOutboxFailed(
+    deliveryId: string,
+    reason: OutboxDeliveryFailureReason,
+  ): Promise<void> {
+    return this.#send({ type: "authority.outbox-failed", deliveryId, reason })
+      .then((response) => {
+        if (response.type !== "authority.outbox-updated") {
+          this.#failProtocol("Authority worker returned the wrong failed-outbox response");
+          throw this.#terminalError;
+        }
+      });
+  }
+
   close(): Promise<void> {
     if (this.#closePromise !== undefined) {
       return this.#closePromise;
@@ -1077,6 +1146,13 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
       (requestType === "authority.read-room" && responseType === "authority.room") ||
       (requestType === "authority.can-access-room" && responseType === "authority.room-access") ||
       (requestType === "authority.read-room-audit" && responseType === "authority.room-audit") ||
+      (requestType === "authority.outbox-list" && responseType === "authority.outbox") ||
+      (requestType === "authority.outbox-authorize" &&
+        responseType === "authority.outbox-authorized") ||
+      (requestType === "authority.outbox-dispatched" &&
+        responseType === "authority.outbox-updated") ||
+      (requestType === "authority.outbox-failed" &&
+        responseType === "authority.outbox-updated") ||
       (requestType === "authority.close" && responseType === "authority.closed")
     );
   }

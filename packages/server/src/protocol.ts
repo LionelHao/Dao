@@ -3,6 +3,8 @@ import {
   type Message,
   type MessageAcceptedAck,
   type MessageDraft,
+  type PersistedIdentityEvent,
+  type PersistedRoomEvent,
 } from "@native-im/core";
 import type { AuthenticationErrorCode } from "./auth.js";
 import type { MessageErrorCode } from "./service.js";
@@ -99,6 +101,21 @@ export interface MessageCreatedFrame {
   readonly message: Message;
 }
 
+export interface RoomEventFrame {
+  readonly type: "room.event";
+  readonly event: Exclude<PersistedRoomEvent, { readonly type: "room.message.accepted" }>;
+}
+
+export type IdentityRoomAccessChangedFrame = Extract<
+  PersistedIdentityEvent,
+  { readonly type: "identity.room-access.changed" }
+>;
+
+export interface AuthSessionRevokedFrame {
+  readonly type: "auth.session-revoked";
+  readonly eventId: string;
+}
+
 export interface RoomHistoryFrame {
   readonly type: "room.history";
   readonly requestId: string;
@@ -134,8 +151,11 @@ export interface ProtocolErrorFrame {
 export type ServerFrame =
   | AuthenticatedFrame
   | AuthRevokedFrame
+  | AuthSessionRevokedFrame
   | MessageAcceptedAck
   | MessageCreatedFrame
+  | RoomEventFrame
+  | IdentityRoomAccessChangedFrame
   | RoomHistoryFrame
   | RoomSubscribedFrame
   | ProtocolErrorFrame;

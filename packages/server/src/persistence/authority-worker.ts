@@ -26,7 +26,11 @@ import {
   appendCanonicalIdentityEvent,
   executeAgentDatabaseCommand,
   executeHumanDatabaseCommand,
+  authorizeOutboxCandidateDatabaseQuery,
   canAccessRoomDatabaseQuery,
+  listPendingOutboxDatabaseQuery,
+  markOutboxDispatchedDatabaseCommand,
+  markOutboxFailedDatabaseCommand,
   readActorDatabaseQuery,
   readHistoryDatabaseQuery,
   readRoomAuditDatabaseQuery,
@@ -1083,6 +1087,83 @@ function readRoomAudit(request: AuthorityWorkerRequest): void {
   }
 }
 
+function listPendingOutbox(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.outbox-list") {
+    throw new TypeError("listPendingOutbox received the wrong request type");
+  }
+  try {
+    const deliveries = listPendingOutboxDatabaseQuery(
+      requireAuthorityDatabase(),
+      request.limit,
+      request.now,
+    );
+    respond({ type: "authority.outbox", requestId: request.requestId, deliveries });
+  } catch (error: unknown) {
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithError(request.requestId, "storage_unavailable", "Authority outbox query failed");
+  }
+}
+
+function authorizeOutboxCandidate(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.outbox-authorize") {
+    throw new TypeError("authorizeOutboxCandidate received the wrong request type");
+  }
+  try {
+    const authorized = authorizeOutboxCandidateDatabaseQuery(
+      requireAuthorityDatabase(),
+      request.deliveryId,
+      request.candidate,
+      request.now,
+    );
+    respond({
+      type: "authority.outbox-authorized",
+      requestId: request.requestId,
+      authorized,
+    });
+  } catch {
+    respondWithError(
+      request.requestId,
+      "storage_unavailable",
+      "Authority outbox authorization failed",
+    );
+  }
+}
+
+function markOutboxDispatched(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.outbox-dispatched") {
+    throw new TypeError("markOutboxDispatched received the wrong request type");
+  }
+  try {
+    markOutboxDispatchedDatabaseCommand(
+      requireAuthorityTransactionDatabase(),
+      request.deliveryId,
+      request.now,
+    );
+    respond({ type: "authority.outbox-updated", requestId: request.requestId });
+  } catch {
+    respondWithError(request.requestId, "storage_unavailable", "Authority outbox update failed");
+  }
+}
+
+function markOutboxFailed(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.outbox-failed") {
+    throw new TypeError("markOutboxFailed received the wrong request type");
+  }
+  try {
+    markOutboxFailedDatabaseCommand(
+      requireAuthorityTransactionDatabase(),
+      request.deliveryId,
+      request.reason,
+    );
+    respond({ type: "authority.outbox-updated", requestId: request.requestId });
+  } catch {
+    respondWithError(request.requestId, "storage_unavailable", "Authority outbox update failed");
+  }
+}
+
 function closeAuthority(request: AuthorityWorkerRequest): void {
   if (request.type !== "authority.close") {
     throw new TypeError("closeAuthority received the wrong request type");
@@ -1182,6 +1263,18 @@ async function dispatch(value: unknown): Promise<void> {
       return;
     case "authority.read-room-audit":
       readRoomAudit(value);
+      return;
+    case "authority.outbox-list":
+      listPendingOutbox(value);
+      return;
+    case "authority.outbox-authorize":
+      authorizeOutboxCandidate(value);
+      return;
+    case "authority.outbox-dispatched":
+      markOutboxDispatched(value);
+      return;
+    case "authority.outbox-failed":
+      markOutboxFailed(value);
       return;
     case "authority.close":
       closeAuthority(value);

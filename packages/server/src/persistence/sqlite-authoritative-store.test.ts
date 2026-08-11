@@ -2158,6 +2158,129 @@ describe("SQLite authoritative sessions", () => {
     });
   });
 
+  it("reads, authorizes, retries, and marks durable outbox deliveries", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-outbox-store-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const fixture = await createRoomGovernanceFixture(databasePath);
+    const candidate = {
+      connectionId: "connection-owner",
+      principal: fixture.context.principal,
+      sessionId: fixture.context.sessionId,
+      sessionFamilyId: fixture.context.sessionFamilyId,
+      credentialGeneration: 1,
+    };
+
+    const initial = await fixture.authority.listPendingOutbox(10);
+    expect(initial.map((item) => item.targetKind).sort()).toEqual(["principal", "room"]);
+    expect(initial.every((item) => item.event.eventId === item.eventId)).toBe(true);
+    await fixture.client.close();
+
+    const membershipDatabase = new DatabaseSync(databasePath);
+    membershipDatabase
+      .prepare("DELETE FROM room_memberships WHERE room_id = ? AND actor_id = ?")
+      .run(fixture.roomId, candidate.principal.actorId);
+    membershipDatabase.close();
+
+    const restartedClient = await createWorkerDatabaseClient({ databasePath });
+    const restartedAuthority = createSqliteAuthoritativeStore(restartedClient, {
+      clock: () => 3_000,
+    });
+    const replayed = await restartedAuthority.listPendingOutbox(10);
+    expect(replayed).toEqual(initial);
+    await expect(
+      restartedAuthority.authorizeOutboxCandidate(
+        replayed.find((item) => item.targetKind === "room")!,
+        candidate,
+      ),
+    ).resolves.toBe(false);
+    await expect(
+      restartedAuthority.authorizeOutboxCandidate(
+        replayed.find((item) => item.targetKind === "principal")!,
+        candidate,
+      ),
+    ).resolves.toBe(true);
+
+    await restartedAuthority.revoke(candidate.sessionId, 3_000);
+    const afterRevoke = await restartedAuthority.listPendingOutbox(10);
+    const terminal = afterRevoke.find((item) => item.targetKind === "session-family")!;
+    await expect(
+      restartedAuthority.authorizeOutboxCandidate(terminal, candidate),
+    ).resolves.toBe(true);
+    await expect(
+      restartedAuthority.authorizeOutboxCandidate(
+        initial.find((item) => item.targetKind === "principal")!,
+        candidate,
+      ),
+    ).resolves.toBe(false);
+
+    const retry = initial.find((item) => item.targetKind === "room")!;
+    await restartedAuthority.markOutboxFailed(retry.deliveryId, "closed");
+    expect(
+      (await restartedAuthority.listPendingOutbox(10))
+        .find((item) => item.deliveryId === retry.deliveryId)?.attempts,
+    ).toBe(1);
+    await restartedClient.close();
+
+    const failedDatabase = new DatabaseSync(databasePath, { readOnly: true });
+    expect(failedDatabase.prepare(
+      `SELECT attempts, last_error AS lastError, status
+       FROM outbox_deliveries WHERE id = ?`,
+    ).get(retry.deliveryId)).toEqual({ attempts: 1, lastError: "closed", status: "pending" });
+    failedDatabase.close();
+
+    const finalClient = await createWorkerDatabaseClient({ databasePath });
+    const finalAuthority = createSqliteAuthoritativeStore(finalClient, { clock: () => 9_000 });
+    for (const item of await finalAuthority.listPendingOutbox(10)) {
+      await finalClient.markOutboxDispatched(item.deliveryId, 9_000);
+      await finalClient.markOutboxDispatched(item.deliveryId, 10_000);
+    }
+    await expect(finalAuthority.listPendingOutbox(10)).resolves.toEqual([]);
+
+    const dispatchedDatabase = new DatabaseSync(databasePath, { readOnly: true });
+    expect(dispatchedDatabase.prepare(
+      `SELECT attempts, delivered_at AS deliveredAt, last_error AS lastError, status
+       FROM outbox_deliveries WHERE id = ?`,
+    ).get(retry.deliveryId)).toEqual({
+      attempts: 1,
+      deliveredAt: "1970-01-01T00:00:09.000Z",
+      lastError: null,
+      status: "dispatched",
+    });
+    dispatchedDatabase.close();
+
+    await expect(
+      finalClient.markOutboxDispatched("delivery-missing", 10_000),
+    ).rejects.toMatchObject({ status: 503, code: "storage_unavailable" });
+    await expect(finalClient.close()).rejects.toMatchObject({
+      status: 503,
+      code: "storage_unavailable",
+    });
+  });
+
+  it("fails closed when a session-family delivery does not join to a revoked-session event", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-outbox-pairing-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const fixture = await createRoomGovernanceFixture(databasePath);
+    await fixture.client.close();
+
+    const database = new DatabaseSync(databasePath);
+    database.prepare(
+      `UPDATE outbox_deliveries
+       SET target_kind = 'session-family', target_id = 'family-corrupt'
+       WHERE target_kind = 'principal'`,
+    ).run();
+    database.close();
+
+    const restartedClient = await createWorkerDatabaseClient({ databasePath });
+    const restartedAuthority = createSqliteAuthoritativeStore(restartedClient);
+    await expect(restartedAuthority.listPendingOutbox(10)).rejects.toMatchObject({
+      code: "storage_unavailable",
+    });
+    await restartedClient.close().catch(() => undefined);
+  });
+
   it("authenticates the same session context after a worker restart", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-session-authority-"));
     temporaryDirectories.push(directory);

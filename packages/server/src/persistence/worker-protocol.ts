@@ -6,6 +6,8 @@ import {
   type RoomAuditRecord,
 } from "../room-lifecycle.js";
 import {
+  parsePersistedIdentityEvent,
+  parsePersistedRoomEvent,
   parsePersistentCommand,
 } from "./contracts.js";
 import type {
@@ -18,6 +20,8 @@ import type {
   HashedSessionRotation,
   HumanCollaborationCommand,
   IssuedSessionRecord,
+  OutboxDelivery,
+  OutboxDispatchCandidate,
   RoomGovernanceCommand,
 } from "./contracts.js";
 
@@ -190,6 +194,31 @@ export type AuthorityWorkerRequest =
       readonly roomId: string;
       readonly now: number;
     }
+  | {
+      readonly type: "authority.outbox-list";
+      readonly requestId: string;
+      readonly limit: number;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.outbox-authorize";
+      readonly requestId: string;
+      readonly deliveryId: string;
+      readonly candidate: OutboxDispatchCandidate;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.outbox-dispatched";
+      readonly requestId: string;
+      readonly deliveryId: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.outbox-failed";
+      readonly requestId: string;
+      readonly deliveryId: string;
+      readonly reason: "closed" | "backpressure" | "send_rejected";
+    }
   | { readonly type: "authority.close"; readonly requestId: string };
 
 export type AuthorityWorkerResponse =
@@ -267,6 +296,17 @@ export type AuthorityWorkerResponse =
       readonly requestId: string;
       readonly audit: readonly RoomAuditRecord[];
     }
+  | {
+      readonly type: "authority.outbox";
+      readonly requestId: string;
+      readonly deliveries: readonly OutboxDelivery[];
+    }
+  | {
+      readonly type: "authority.outbox-authorized";
+      readonly requestId: string;
+      readonly authorized: boolean;
+    }
+  | { readonly type: "authority.outbox-updated"; readonly requestId: string }
   | { readonly type: "authority.closed"; readonly requestId: string }
   | {
       readonly type: "authority.error";
@@ -498,6 +538,70 @@ function isCommandAcknowledgement(value: unknown): value is CommandAcknowledgeme
   );
 }
 
+function isOutboxDispatchCandidate(value: unknown): value is OutboxDispatchCandidate {
+  return isRecord(value) &&
+    hasExactKeys(value, [
+      "connectionId",
+      "principal",
+      "sessionId",
+      "sessionFamilyId",
+      "credentialGeneration",
+    ]) &&
+    isText(value.connectionId) &&
+    isPrincipal(value.principal) &&
+    isTokenHash(value.sessionId) &&
+    isTokenHash(value.sessionFamilyId) &&
+    isNonNegativeSafeInteger(value.credentialGeneration);
+}
+
+function isOutboxDelivery(value: unknown): value is OutboxDelivery {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "deliveryId",
+      "eventId",
+      "targetKind",
+      "targetId",
+      "streamSeq",
+      "attempts",
+      "event",
+    ]) ||
+    !isText(value.deliveryId) ||
+    !isText(value.eventId) ||
+    (value.targetKind !== "room" &&
+      value.targetKind !== "principal" &&
+      value.targetKind !== "session-family") ||
+    !isText(value.targetId) ||
+    !isNonNegativeSafeInteger(value.streamSeq) ||
+    value.streamSeq < 1 ||
+    !isNonNegativeSafeInteger(value.attempts)
+  ) {
+    return false;
+  }
+  const parsedEvent = value.targetKind === "room"
+    ? parsePersistedRoomEvent(value.event)
+    : parsePersistedIdentityEvent(value.event);
+  const event = parsedEvent.ok ? parsedEvent.value : undefined;
+  if (
+    event === undefined ||
+    event.eventId !== value.eventId ||
+    event.streamSeq !== value.streamSeq
+  ) {
+    return false;
+  }
+  if (value.targetKind === "room") {
+    return event.streamKind === "room" && event.roomId === value.targetId;
+  }
+  if (value.targetKind === "principal") {
+    return event.streamKind === "identity" &&
+      event.streamId === value.targetId &&
+      event.type === "identity.room-access.changed";
+  }
+  return event.streamKind === "identity" &&
+    event.type === "identity.session.revoked" &&
+    event.payload.familyId === value.targetId;
+}
+
 export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWorkerRequest {
   if (!isRecord(value) || !hasRequestId(value) || typeof value.type !== "string") {
     return false;
@@ -609,6 +713,23 @@ export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWork
       return hasExactKeys(value, ["type", "requestId", "context", "roomId", "now"]) &&
         isAuthenticatedSessionContext(value.context) && isText(value.roomId) &&
         isNonNegativeSafeInteger(value.now);
+    case "authority.outbox-list":
+      return hasExactKeys(value, ["type", "requestId", "limit", "now"]) &&
+        isNonNegativeSafeInteger(value.limit) && value.limit > 0 && value.limit <= 1_000 &&
+        isNonNegativeSafeInteger(value.now);
+    case "authority.outbox-authorize":
+      return hasExactKeys(value, ["type", "requestId", "deliveryId", "candidate", "now"]) &&
+        isText(value.deliveryId) && isOutboxDispatchCandidate(value.candidate) &&
+        isNonNegativeSafeInteger(value.now);
+    case "authority.outbox-dispatched":
+      return hasExactKeys(value, ["type", "requestId", "deliveryId", "now"]) &&
+        isText(value.deliveryId) && isNonNegativeSafeInteger(value.now);
+    case "authority.outbox-failed":
+      return hasExactKeys(value, ["type", "requestId", "deliveryId", "reason"]) &&
+        isText(value.deliveryId) &&
+        (value.reason === "closed" ||
+          value.reason === "backpressure" ||
+          value.reason === "send_rejected");
     default:
       return false;
   }
@@ -678,6 +799,14 @@ export function isAuthorityWorkerResponse(
     case "authority.room-audit":
       return hasExactKeys(value, ["type", "requestId", "audit"]) &&
         Array.isArray(value.audit) && value.audit.every(isRoomAuditRecord);
+    case "authority.outbox":
+      return hasExactKeys(value, ["type", "requestId", "deliveries"]) &&
+        Array.isArray(value.deliveries) && value.deliveries.every(isOutboxDelivery);
+    case "authority.outbox-authorized":
+      return hasExactKeys(value, ["type", "requestId", "authorized"]) &&
+        typeof value.authorized === "boolean";
+    case "authority.outbox-updated":
+      return hasExactKeys(value, ["type", "requestId"]);
     case "authority.legacy-imported":
       return (
         hasExactKeys(value, [

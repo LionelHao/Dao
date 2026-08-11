@@ -1,9 +1,16 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
-import { isMessage, type Actor, type Message, type MessageDraft } from "@native-im/core";
+import {
+  isMessage,
+  type Actor,
+  type Message,
+  type MessageDraft,
+  type PersistedIdentityEvent,
+  type PersistedRoomEvent,
+} from "@native-im/core";
 import {
   createAuthenticationService,
   createJsonlMessageStore,
@@ -22,6 +29,9 @@ import {
   type MessageService,
   type MessageStore,
   type MessageWebSocketServer,
+  type OutboxDelivery,
+  type OutboxDispatchCandidate,
+  type OutboxDispatchStore,
   type RoomLifecycleService,
 } from "./index.js";
 
@@ -269,6 +279,14 @@ class LoopbackClient {
         (requestId === undefined || frame.requestId === requestId),
       `error ${code}`,
     );
+  }
+
+  waitForFrame(
+    predicate: (frame: unknown) => boolean,
+    description: string,
+    timeoutMs?: number,
+  ): Promise<ReceivedFrame> {
+    return this.waitFor(predicate, description, timeoutMs);
   }
 
   async close(): Promise<void> {
@@ -565,6 +583,258 @@ afterEach(async () => {
 });
 
 describe("authenticated message WebSocket service", () => {
+  it("dispatches the owner-approved closed outbox wire without legacy listeners", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "outbox-wire");
+    const sessionContext = {
+      sessionId: "session-outbox-wire",
+      sessionFamilyId: "family-outbox-wire",
+      principal,
+    };
+    let revoked = false;
+    let resolveRevokeCommitted!: () => void;
+    const revokeCommitted = new Promise<void>((resolve) => {
+      resolveRevokeCommitted = resolve;
+    });
+    let afterRevoke = () => {};
+    const auth: AuthenticationService = {
+      async login() {
+        return session;
+      },
+      async authenticate() {
+        return principal;
+      },
+      async authenticateSession() {
+        if (revoked) {
+          throw new AuthenticationError(403, "session_revoked");
+        }
+        return sessionContext;
+      },
+      async refresh() {
+        return session;
+      },
+      async revoke() {
+        revoked = true;
+        afterRevoke();
+      },
+    };
+    let subscribeCalls = 0;
+    const service: MessageService = {
+      async send(_context, message) {
+        return {
+          type: "message.accepted",
+          requestId: message.id,
+          messageId: message.id,
+          persistedAt: "2026-08-11T00:00:00.000Z",
+        };
+      },
+      subscribe() {
+        subscribeCalls += 1;
+        throw new Error("legacy listener must not be used");
+      },
+      async history(context) {
+        expect(context).toEqual(sessionContext);
+        return [];
+      },
+    };
+    const pending = new Map<string, OutboxDelivery>();
+    const dispatched: string[] = [];
+    const store: OutboxDispatchStore = {
+      async listPendingOutbox(limit) {
+        return [...pending.values()].slice(0, limit);
+      },
+      async authorizeOutboxCandidate(_delivery, candidate) {
+        expect(candidate).toMatchObject<Partial<OutboxDispatchCandidate>>({
+          principal,
+          sessionId: sessionContext.sessionId,
+          sessionFamilyId: sessionContext.sessionFamilyId,
+        });
+        return true;
+      },
+      async markOutboxDispatched(deliveryId) {
+        dispatched.push(deliveryId);
+        pending.delete(deliveryId);
+      },
+      async markOutboxFailed() {
+        throw new Error("outbox send must not fail");
+      },
+    };
+    const message = messageFor(humans[0], "outbox-wire-message");
+    const messageEvent: PersistedRoomEvent = {
+      eventId: "event-outbox-message",
+      streamKind: "room",
+      streamId: roomId,
+      streamSeq: 1,
+      roomId,
+      actorId: humans[0].id,
+      occurredAt: message.sentAt,
+      type: "room.message.accepted",
+      payload: message,
+    };
+    const readEvent: PersistedRoomEvent = {
+      eventId: "event-outbox-read",
+      streamKind: "room",
+      streamId: roomId,
+      streamSeq: 2,
+      roomId,
+      actorId: humans[0].id,
+      occurredAt: "2026-08-11T00:00:01.000Z",
+      type: "room.human_read.recorded",
+      payload: {
+        id: "read-outbox-wire",
+        messageId: message.id,
+        readerId: humans[0].id,
+        readAt: "2026-08-11T00:00:01.000Z",
+      },
+    };
+    const accessEvent: PersistedIdentityEvent = {
+      eventId: "event-outbox-access",
+      streamKind: "identity",
+      streamId: humans[0].id,
+      streamSeq: 3,
+      actorId: humans[0].id,
+      occurredAt: "2026-08-11T00:00:02.000Z",
+      type: "identity.room-access.changed",
+      payload: { roomId, change: "updated" },
+    };
+    const revokedEvent: PersistedIdentityEvent & {
+      readonly type: "identity.session.revoked";
+    } = {
+      eventId: "event-outbox-revoked",
+      streamKind: "identity",
+      streamId: humans[0].id,
+      streamSeq: 4,
+      actorId: humans[0].id,
+      occurredAt: "2026-08-11T00:00:03.000Z",
+      type: "identity.session.revoked",
+      payload: {
+        sessionId: sessionContext.sessionId,
+        familyId: sessionContext.sessionFamilyId,
+        accountId: principal.accountId,
+      },
+    };
+    const queue = (delivery: OutboxDelivery) => pending.set(delivery.deliveryId, delivery);
+    afterRevoke = () => {
+      queue({
+        deliveryId: "delivery-outbox-revoked",
+        eventId: revokedEvent.eventId,
+        targetKind: "session-family",
+        targetId: sessionContext.sessionFamilyId,
+        streamSeq: revokedEvent.streamSeq,
+        attempts: 0,
+        event: revokedEvent,
+      });
+      resolveRevokeCommitted();
+    };
+    const server = await startMessageWebSocketServer({
+      auth,
+      service,
+      outboxStore: store,
+      outboxPollIntervalMs: 50,
+    });
+    const client = await LoopbackClient.connect(server.url);
+    const peer = await LoopbackClient.connect(server.url);
+
+    try {
+      await client.login(humans[0]);
+      await peer.login(humans[0], "login-outbox-peer");
+      client.send({ type: "room.subscribe", requestId: "outbox-subscribe", roomId });
+      const subscribeResult = await client.waitForFrame(
+        (frame) => isRecord(frame) && frame.requestId === "outbox-subscribe",
+        "outbox subscribe result",
+      );
+      expect(subscribeResult.frame).toMatchObject({
+        type: "room.history",
+        requestId: "outbox-subscribe",
+      });
+      expect(subscribeCalls).toBe(0);
+
+      queue({
+        deliveryId: "delivery-outbox-message",
+        eventId: messageEvent.eventId,
+        targetKind: "room",
+        targetId: roomId,
+        streamSeq: messageEvent.streamSeq,
+        attempts: 0,
+        event: messageEvent,
+      });
+      await expect(client.waitForMessage(message.id)).resolves.toMatchObject({
+        frame: { type: "message.created", message },
+      });
+
+      queue({
+        deliveryId: "delivery-outbox-read",
+        eventId: readEvent.eventId,
+        targetKind: "room",
+        targetId: roomId,
+        streamSeq: readEvent.streamSeq,
+        attempts: 0,
+        event: readEvent,
+      });
+      await expect(
+        client.waitForFrame(
+          (frame) => hasType(frame, "room.event") && isRecord(frame.event) &&
+            frame.event.eventId === readEvent.eventId,
+          "closed room event",
+        ),
+      ).resolves.toMatchObject({ frame: { type: "room.event", event: readEvent } });
+
+      queue({
+        deliveryId: "delivery-outbox-access",
+        eventId: accessEvent.eventId,
+        targetKind: "principal",
+        targetId: humans[0].id,
+        streamSeq: accessEvent.streamSeq,
+        attempts: 0,
+        event: accessEvent,
+      });
+      await expect(
+        client.waitForFrame(
+          (frame) => hasType(frame, "identity.room-access.changed") &&
+            frame.eventId === accessEvent.eventId,
+          "room access identity event",
+        ),
+      ).resolves.toMatchObject({ frame: accessEvent });
+
+      client.send({ type: "auth.revoke", requestId: "outbox-revoke" });
+      await revokeCommitted;
+      peer.send({ type: "room.history", requestId: "peer-after-revoke", roomId });
+      await expect(
+        client.waitForFrame(
+          (frame) => hasType(frame, "auth.session-revoked") &&
+            frame.eventId === revokedEvent.eventId && frame.requestId === undefined,
+          "terminal session-family frame",
+        ),
+      ).resolves.toMatchObject({
+        frame: { type: "auth.session-revoked", eventId: revokedEvent.eventId },
+      });
+      await expect(
+        peer.waitForFrame(
+          (frame) => hasType(frame, "auth.session-revoked") &&
+            frame.eventId === revokedEvent.eventId && frame.requestId === undefined,
+          "peer terminal session-family frame",
+        ),
+      ).resolves.toMatchObject({
+        frame: { type: "auth.session-revoked", eventId: revokedEvent.eventId },
+      });
+      expect(client.frameCount(
+        (frame) => hasType(frame, "auth.revoked") && frame.requestId === "outbox-revoke",
+      )).toBe(0);
+      await client.waitForClose();
+      await peer.waitForClose();
+      await vi.waitFor(() => expect(dispatched).toEqual([
+        "delivery-outbox-message",
+        "delivery-outbox-read",
+        "delivery-outbox-access",
+        "delivery-outbox-revoked",
+      ]));
+    } finally {
+      await client.close();
+      await peer.close();
+      await server.close();
+    }
+  });
+
   it("exports finite aggregate inbound queue defaults", async () => {
     const serverModule = await import("./index.js");
 

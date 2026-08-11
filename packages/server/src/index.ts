@@ -48,6 +48,22 @@ export {
   MessageValidationError,
   RoomAccessError,
 } from "./service.js";
+export { createOutboxDispatcher } from "./outbox-dispatcher.js";
+export type {
+  OutboxDispatcher,
+  OutboxDispatcherOptions,
+  OutboxDispatchFrame,
+  OutboxDispatchStore,
+  OutboxSendResult,
+} from "./outbox-dispatcher.js";
+export { createSubscriptionRegistry } from "./subscription-registry.js";
+export type {
+  PrincipalSubscription,
+  RegisteredConnection,
+  RoomSubscription,
+  SessionFamilySubscription,
+  SubscriptionRegistry,
+} from "./subscription-registry.js";
 export type {
   ListenerErrorHandler,
   MessageDirectory,
@@ -74,14 +90,17 @@ export type {
   AuthResumeFrame,
   AuthRevokeFrame,
   AuthRevokedFrame,
+  AuthSessionRevokedFrame,
   ClientFrame,
   ClientFrameParseResult,
   MessageCreatedFrame,
+  IdentityRoomAccessChangedFrame,
   MessageSendFrame,
   ProtocolErrorCode,
   ProtocolErrorFrame,
   RoomHistoryFrame,
   RoomHistoryRequestFrame,
+  RoomEventFrame,
   RoomSubscribeFrame,
   RoomSubscribedFrame,
   ServerFrame,
@@ -125,7 +144,14 @@ export { AuthorityWorkerClientError } from "./persistence/worker-database-client
 export type { AuthoritySchemaInspection, CreateWorkerDatabaseClientOptions };
 export type WorkerDatabaseClient = Omit<
   InternalWorkerDatabaseClient,
-  "executeHuman" | "executeAgent" | "readActor" | "readRoom"
+  | "executeHuman"
+  | "executeAgent"
+  | "readActor"
+  | "readRoom"
+  | "listPendingOutbox"
+  | "authorizeOutboxCandidate"
+  | "markOutboxDispatched"
+  | "markOutboxFailed"
 >;
 export async function createWorkerDatabaseClient(
   options: CreateWorkerDatabaseClientOptions,
@@ -169,6 +195,8 @@ export type {
   IssuedSessionRecord,
   JsonValue,
   OutboxDelivery,
+  OutboxDeliveryFailureReason,
+  OutboxDispatchCandidate,
   PersistentCommand,
   RoomGovernanceCommand,
   SessionAuthority,

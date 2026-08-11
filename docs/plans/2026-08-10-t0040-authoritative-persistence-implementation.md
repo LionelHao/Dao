@@ -809,7 +809,25 @@ Propose `feat(server): persist collaboration authority`. Reviewer focus: transac
 - Modify: `packages/server/src/websocket.test.ts`
 - Modify: `packages/server/src/index.ts`
 
-- [ ] **Step 1: Write target-kind and replay RED tests.**
+Implementation-required hard expansion: the dispatcher needs durable pending reads, per-candidate
+authorization against the worker-owned current SQLite view, and idempotent dispatch/failure
+marks. Task 7 may therefore also modify `worker-protocol.ts`,
+`worker-database-client.ts` and its tests, `authority-worker.ts`,
+`authority-database-handler.ts`, the SQLite authoritative store/tests, and contract/type
+tests. `OutboxDelivery` remains a target-kind discriminated union reconstructed from an
+`events` JOIN; authorization requests carry only delivery ID, candidate credential snapshot,
+credential generation, and current time, while the worker re-reads the pending delivery and
+applies the target-specific rule. Failure reasons remain the closed
+`closed | backpressure | send_rejected` union, attempts advance once per dispatcher round,
+marks are idempotent, and the package-root worker wrapper exposes none of these management
+operations. Owner-approved public wire contract: keep `room.message.accepted` delivery
+byte-compatible with the existing `{ type: "message.created", message }` frame; wrap every
+other room event as `{ type: "room.event", event }`; deliver the complete closed
+`identity.room-access.changed` event as its frame; and deliver session-family revocation as
+the unsolicited `{ type: "auth.session-revoked", eventId }` terminal frame without a fake
+`requestId`. Do not expose arbitrary persisted events as new top-level frame types.
+
+- [x] **Step 1: Write target-kind and replay RED tests.**
 
 ```ts
 registry.addRoom({ roomId: "room-1", connection: memberConnection });
@@ -828,13 +846,13 @@ expect(revokedConnection.frames).toContainEqual(expect.objectContaining({
 
 Remove the first actor from the room before dispatch: room delivery must skip it, principal delivery must still reach it, and revoked-family terminal delivery must not require a currently valid session. Simulate send failure and restart; pending delivery remains. Simulate send success before mark-dispatched crash; replay may send twice but the event ID stays identical.
 
-- [ ] **Step 2: Run RED.**
+- [x] **Step 2: Run RED.**
 
 Run: `pnpm typecheck && pnpm exec vitest run packages/server/src/subscription-registry.test.ts packages/server/src/outbox-dispatcher.test.ts packages/server/src/websocket.test.ts`
 
 Expected: missing registry/dispatcher tests fail; existing direct listener tests identify behavior that must move.
 
-- [ ] **Step 3: Implement indexed subscriptions and durable dispatch.**
+- [x] **Step 3: Implement indexed subscriptions and durable dispatch.**
 
 ```ts
 export interface SubscriptionRegistry {
@@ -854,7 +872,7 @@ export interface OutboxDispatcher {
 
 Before each send, `OutboxDispatcher` asks the authority store to authorize the candidate using target-specific rules. Change the internal bounded `sendFrame` seam to report accepted/rejected delivery: if any eligible connection is closed, over backpressure limit, or rejects the frame, keep the row pending and increment attempts; already-sent peers may receive the same event ID again. Mark dispatched only after every eligible local connection accepted the frame, or when no eligible connection exists and durable cursor replay is the only remaining path. A process crash leaves pending rows; event/outbox unique keys make replay stable.
 
-- [ ] **Step 4: Remove direct post-append fanout and verify.**
+- [x] **Step 4: Remove direct post-append fanout and verify.**
 
 `MessageService.send` returns immediately after durable COMMIT/ACK. WebSocket composition starts the dispatcher and registers connection principal/family/rooms. Close, error, unsubscribe, and family revoke remove registry entries exactly once.
 

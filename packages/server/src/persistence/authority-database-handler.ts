@@ -5,6 +5,7 @@ import type {
   ManagedRoom,
   Message,
   PersistedIdentityEvent,
+  PersistedRoomEvent,
 } from "@native-im/core";
 import {
   isManagedRoomShape,
@@ -12,6 +13,8 @@ import {
   type RoomAuditRecord,
 } from "../room-lifecycle.js";
 import {
+  parsePersistedIdentityEvent,
+  parsePersistedRoomEvent,
   parsePersistentCommand,
   type AgentCollaborationCommand,
   type AgentWorkerCommandContext,
@@ -20,6 +23,9 @@ import {
   type CommandAcknowledgement,
   type HumanCollaborationCommand,
   type JsonValue,
+  type OutboxDelivery,
+  type OutboxDeliveryFailureReason,
+  type OutboxDispatchCandidate,
   type PersistentCommand,
   type RoomGovernanceCommand,
 } from "./contracts.js";
@@ -393,6 +399,259 @@ export function readRoomAuditDatabaseQuery(
     }
     return record;
   });
+}
+
+function parseOutboxEvent(row: Record<string, unknown>): PersistedRoomEvent | PersistedIdentityEvent {
+  let payload: unknown;
+  try {
+    payload = typeof row.payloadJson === "string" ? JSON.parse(row.payloadJson) : undefined;
+  } catch {
+    return fail("storage_unavailable", "Stored outbox event payload is corrupt");
+  }
+  const envelope = {
+    eventId: row.eventId,
+    streamKind: row.streamKind,
+    streamId: row.streamId,
+    streamSeq: row.streamSeq,
+    actorId: row.actorId,
+    occurredAt: row.occurredAt,
+    type: row.eventType,
+    payload,
+  };
+  if (row.streamKind === "room") {
+    const parsed = parsePersistedRoomEvent({ ...envelope, roomId: row.roomId });
+    if (parsed.ok) return parsed.value;
+  } else if (row.streamKind === "identity") {
+    const parsed = parsePersistedIdentityEvent(envelope);
+    if (parsed.ok) return parsed.value;
+  }
+  return fail("storage_unavailable", "Stored outbox event is corrupt");
+}
+
+function isSessionRevokedEvent(
+  event: PersistedIdentityEvent,
+): event is PersistedIdentityEvent & { readonly type: "identity.session.revoked" } {
+  return event.type === "identity.session.revoked";
+}
+
+function isRoomAccessChangedEvent(
+  event: PersistedIdentityEvent,
+): event is PersistedIdentityEvent & { readonly type: "identity.room-access.changed" } {
+  return event.type === "identity.room-access.changed";
+}
+
+export function listPendingOutboxDatabaseQuery(
+  database: DatabaseSync,
+  limit: number,
+  now: number,
+): readonly OutboxDelivery[] {
+  const rows = database
+    .prepare(
+      `SELECT
+         delivery.id AS deliveryId,
+         delivery.event_id AS eventId,
+         delivery.target_kind AS targetKind,
+         delivery.target_id AS targetId,
+         delivery.stream_seq AS streamSeq,
+         delivery.attempts,
+         event.stream_kind AS streamKind,
+         event.stream_id AS streamId,
+         event.room_id AS roomId,
+         event.actor_id AS actorId,
+         event.event_type AS eventType,
+         event.occurred_at AS occurredAt,
+         event.payload_json AS payloadJson
+       FROM outbox_deliveries AS delivery
+       JOIN events AS event
+         ON event.event_id = delivery.event_id
+        AND event.stream_seq = delivery.stream_seq
+       WHERE delivery.status = 'pending'
+         AND delivery.available_at <= ?
+       ORDER BY delivery.stream_seq, delivery.id
+       LIMIT ?`,
+    )
+    .all(new Date(now).toISOString(), limit) as Record<string, unknown>[];
+  return rows.map((row) => {
+    if (
+      typeof row.deliveryId !== "string" ||
+      typeof row.eventId !== "string" ||
+      (row.targetKind !== "room" &&
+        row.targetKind !== "principal" &&
+        row.targetKind !== "session-family") ||
+      typeof row.targetId !== "string" ||
+      typeof row.streamSeq !== "number" ||
+      !Number.isSafeInteger(row.streamSeq) ||
+      row.streamSeq < 1 ||
+      typeof row.attempts !== "number" ||
+      !Number.isSafeInteger(row.attempts) ||
+      row.attempts < 0
+    ) {
+      return fail("storage_unavailable", "Stored outbox delivery is corrupt");
+    }
+    const event = parseOutboxEvent(row);
+    if (event.eventId !== row.eventId || event.streamSeq !== row.streamSeq) {
+      return fail("storage_unavailable", "Stored outbox delivery event does not match");
+    }
+    if (
+      row.targetKind === "room" &&
+      event.streamKind === "room" &&
+      event.roomId === row.targetId
+    ) {
+      return {
+        deliveryId: row.deliveryId,
+        eventId: row.eventId,
+        targetKind: "room",
+        targetId: row.targetId,
+        streamSeq: row.streamSeq,
+        attempts: row.attempts,
+        event,
+      };
+    }
+    if (
+      row.targetKind === "principal" &&
+      event.streamKind === "identity" &&
+      isRoomAccessChangedEvent(event) &&
+      event.streamId === row.targetId
+    ) {
+      return {
+        deliveryId: row.deliveryId,
+        eventId: row.eventId,
+        targetKind: "principal",
+        targetId: row.targetId,
+        streamSeq: row.streamSeq,
+        attempts: row.attempts,
+        event,
+      };
+    }
+    if (
+      row.targetKind === "session-family" &&
+      event.streamKind === "identity" &&
+      isSessionRevokedEvent(event) &&
+      event.payload.familyId === row.targetId
+    ) {
+      return {
+        deliveryId: row.deliveryId,
+        eventId: row.eventId,
+        targetKind: "session-family",
+        targetId: row.targetId,
+        streamSeq: row.streamSeq,
+        attempts: row.attempts,
+        event,
+      };
+    }
+    return fail("storage_unavailable", "Stored outbox target does not match its event stream");
+  });
+}
+
+export function authorizeOutboxCandidateDatabaseQuery(
+  database: DatabaseSync,
+  deliveryId: string,
+  candidate: OutboxDispatchCandidate,
+  now: number,
+): boolean {
+  const delivery = database
+    .prepare(
+      `SELECT target_kind AS targetKind, target_id AS targetId
+       FROM outbox_deliveries
+       WHERE id = ? AND status = 'pending'`,
+    )
+    .get(deliveryId);
+  if (
+    typeof delivery?.targetKind !== "string" ||
+    typeof delivery.targetId !== "string"
+  ) {
+    return false;
+  }
+  if (delivery.targetKind === "session-family") {
+    return candidate.sessionFamilyId === delivery.targetId;
+  }
+  const sessionParameters = [
+    candidate.sessionId,
+    candidate.sessionFamilyId,
+    candidate.principal.accountId,
+    candidate.principal.actorId,
+    now,
+  ] as const;
+  if (delivery.targetKind === "principal") {
+    if (candidate.principal.actorId !== delivery.targetId) return false;
+    return database
+      .prepare(
+        `SELECT 1 AS allowed
+         FROM sessions AS session
+         JOIN actors AS actor ON actor.id = session.actor_id
+         WHERE session.access_token_hash = ?
+           AND session.family_id = ?
+           AND session.account_id = ?
+           AND session.actor_id = ?
+           AND session.access_expires_at > ?
+           AND session.revoked_at IS NULL
+           AND actor.kind = 'human'`,
+      )
+      .get(...sessionParameters)?.allowed === 1;
+  }
+  if (delivery.targetKind !== "room") return false;
+  return database
+    .prepare(
+      `SELECT 1 AS allowed
+       FROM sessions AS session
+       JOIN actors AS actor ON actor.id = session.actor_id
+       JOIN room_memberships AS membership ON membership.actor_id = session.actor_id
+       JOIN rooms AS room ON room.id = membership.room_id
+       WHERE session.access_token_hash = ?
+         AND session.family_id = ?
+         AND session.account_id = ?
+         AND session.actor_id = ?
+         AND session.access_expires_at > ?
+         AND session.revoked_at IS NULL
+         AND actor.kind = 'human'
+         AND membership.room_id = ?
+         AND room.status = 'active'`,
+    )
+    .get(...sessionParameters, delivery.targetId)?.allowed === 1;
+}
+
+export function markOutboxDispatchedDatabaseCommand(
+  database: DatabaseSync,
+  deliveryId: string,
+  now: number,
+): void {
+  const result = database
+    .prepare(
+      `UPDATE outbox_deliveries
+       SET status = 'dispatched', delivered_at = ?, last_error = NULL
+       WHERE id = ? AND status = 'pending'`,
+    )
+    .run(new Date(now).toISOString(), deliveryId);
+  if (result.changes === 0) {
+    const existing = database
+      .prepare("SELECT status FROM outbox_deliveries WHERE id = ?")
+      .get(deliveryId);
+    if (existing?.status !== "dispatched") {
+      return fail("storage_unavailable", "Authority outbox delivery does not exist");
+    }
+  }
+}
+
+export function markOutboxFailedDatabaseCommand(
+  database: DatabaseSync,
+  deliveryId: string,
+  reason: OutboxDeliveryFailureReason,
+): void {
+  const result = database
+    .prepare(
+      `UPDATE outbox_deliveries
+       SET attempts = attempts + 1, last_error = ?
+       WHERE id = ? AND status = 'pending'`,
+    )
+    .run(reason, deliveryId);
+  if (result.changes === 0) {
+    const existing = database
+      .prepare("SELECT status FROM outbox_deliveries WHERE id = ?")
+      .get(deliveryId);
+    if (existing?.status !== "dispatched") {
+      return fail("storage_unavailable", "Authority outbox delivery does not exist");
+    }
+  }
 }
 
 function requireRoomMembership(

@@ -421,6 +421,21 @@ describe("AuthorityWorker closed protocol", () => {
         requestId: "3",
       }),
     ).toBe(true);
+    expect(
+      isAuthorityWorkerRequest({
+        type: "authority.outbox-authorize",
+        requestId: "outbox-authorize",
+        deliveryId: "delivery-room",
+        candidate: {
+          connectionId: "connection-1",
+          principal: { accountId: "account-li", actorId: "human-li" },
+          sessionId: createHash("sha256").update("session-1").digest("base64url"),
+          sessionFamilyId: createHash("sha256").update("family-1").digest("base64url"),
+          credentialGeneration: 1,
+        },
+        now: 1_000,
+      }),
+    ).toBe(true);
 
     expect(
       isAuthorityWorkerRequest({
@@ -435,6 +450,30 @@ describe("AuthorityWorker closed protocol", () => {
         requestId: "5",
       }),
     ).toBe(false);
+    expect(
+      isAuthorityWorkerRequest({
+        type: "authority.outbox-authorize",
+        requestId: "outbox-authorize-extra",
+        deliveryId: "delivery-room",
+        candidate: {
+          connectionId: "connection-1",
+          principal: { accountId: "account-li", actorId: "human-li" },
+          sessionId: createHash("sha256").update("session-1").digest("base64url"),
+          sessionFamilyId: createHash("sha256").update("family-1").digest("base64url"),
+          credentialGeneration: 1,
+          accessToken: "must-not-cross-worker-boundary",
+        },
+        now: 1_000,
+      }),
+    ).toBe(false);
+    expect(
+      isAuthorityWorkerRequest({
+        type: "authority.outbox-failed",
+        requestId: "outbox-failed-open-reason",
+        deliveryId: "delivery-room",
+        reason: "network_error",
+      }),
+    ).toBe(false);
   });
 
   it("accepts only exact response variants", () => {
@@ -443,6 +482,34 @@ describe("AuthorityWorker closed protocol", () => {
         type: "authority.ready",
         requestId: "1",
         schemaVersion: 4,
+      }),
+    ).toBe(true);
+    expect(
+      isAuthorityWorkerResponse({
+        type: "authority.outbox",
+        requestId: "outbox-valid",
+        deliveries: [{
+          deliveryId: "delivery-family",
+          eventId: "event-family",
+          targetKind: "session-family",
+          targetId: "family-revoked",
+          streamSeq: 1,
+          attempts: 0,
+          event: {
+            eventId: "event-family",
+            streamKind: "identity",
+            streamId: "human-revoked",
+            streamSeq: 1,
+            actorId: "human-revoked",
+            occurredAt: "2026-08-11T00:00:00.000Z",
+            type: "identity.session.revoked",
+            payload: {
+              sessionId: "session-revoked",
+              familyId: "family-revoked",
+              accountId: "account-revoked",
+            },
+          },
+        }],
       }),
     ).toBe(true);
     expect(
@@ -473,6 +540,58 @@ describe("AuthorityWorker closed protocol", () => {
         requestId: "5",
         schemaVersion: 4,
         rows: [],
+      }),
+    ).toBe(false);
+    expect(
+      isAuthorityWorkerResponse({
+        type: "authority.outbox",
+        requestId: "outbox-invalid-family-event",
+        deliveries: [{
+          deliveryId: "delivery-family",
+          eventId: "event-access",
+          targetKind: "session-family",
+          targetId: "family-revoked",
+          streamSeq: 1,
+          attempts: 0,
+          event: {
+            eventId: "event-access",
+            streamKind: "identity",
+            streamId: "human-revoked",
+            streamSeq: 1,
+            actorId: "human-revoked",
+            occurredAt: "2026-08-11T00:00:00.000Z",
+            type: "identity.room-access.changed",
+            payload: { roomId: "room-1", change: "removed" },
+          },
+        }],
+      }),
+    ).toBe(false);
+    expect(
+      isAuthorityWorkerResponse({
+        type: "authority.outbox",
+        requestId: "outbox-invalid-principal-event",
+        deliveries: [{
+          deliveryId: "delivery-principal",
+          eventId: "event-principal-revoked",
+          targetKind: "principal",
+          targetId: "human-revoked",
+          streamSeq: 1,
+          attempts: 0,
+          event: {
+            eventId: "event-principal-revoked",
+            streamKind: "identity",
+            streamId: "human-revoked",
+            streamSeq: 1,
+            actorId: "human-revoked",
+            occurredAt: "2026-08-11T00:00:00.000Z",
+            type: "identity.session.revoked",
+            payload: {
+              sessionId: "session-revoked",
+              familyId: "family-revoked",
+              accountId: "account-revoked",
+            },
+          },
+        }],
       }),
     ).toBe(false);
     expect(
@@ -1305,6 +1424,10 @@ describe("WorkerDatabaseClient", () => {
       expect(client).not.toHaveProperty("readRoom");
       expect(client).not.toHaveProperty("executeHuman");
       expect(client).not.toHaveProperty("executeAgent");
+      expect(client).not.toHaveProperty("listPendingOutbox");
+      expect(client).not.toHaveProperty("authorizeOutboxCandidate");
+      expect(client).not.toHaveProperty("markOutboxDispatched");
+      expect(client).not.toHaveProperty("markOutboxFailed");
       expect(publicApi).not.toHaveProperty("createSqliteAuthoritativeStore");
       expect(publicApi).not.toHaveProperty("createAuthoritativeRoomLifecycleService");
     } finally {
