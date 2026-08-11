@@ -76,6 +76,26 @@ describe("pure synchronization contracts", () => {
       ...repairPage,
       records: [{ kind: "message", value: { id: "message-1", arbitrary: true } }],
     })).toBe(false);
+    expect(isRoomRepairPage({
+      ...repairPage,
+      records: [{
+        kind: "legacy-unknown-calibration",
+        value: {
+          id: "calibration-v3", sourceMessageId: null, actorId: null,
+          agentId: "agent-1", emoji: "👍", createdAt: "2026-08-09T03:01:00.000Z",
+        },
+      }],
+    })).toBe(true);
+    expect(isRoomRepairPage({
+      ...repairPage,
+      records: [{
+        kind: "legacy-unknown-calibration",
+        value: {
+          id: "calibration-v3", sourceMessageId: "null", actorId: "null",
+          agentId: "agent-1", emoji: "👍", createdAt: "2026-08-09T03:01:00.000Z",
+        },
+      }],
+    })).toBe(false);
     expect(isRoomSyncResult({
       type: "room.sync.result",
       requestId: "request-1",

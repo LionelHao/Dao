@@ -20,9 +20,13 @@ import type {
   MessageDraft,
   PersistedIdentityEvent,
   PersistedRoomEvent,
+  RoomRepairPage,
   RoomSyncRequest,
   RoomSyncResult,
+  WorkspaceBootstrapPage,
 } from "@native-im/core";
+
+export const SNAPSHOT_REQUEST_ID_MAX_BYTES = 128;
 import type { AuthenticatedPrincipal } from "../auth.js";
 import type { RoomAuditRecord } from "../room-lifecycle.js";
 
@@ -30,6 +34,125 @@ export interface AuthenticatedSessionContext {
   readonly sessionId: string;
   readonly sessionFamilyId: string;
   readonly principal: AuthenticatedPrincipal;
+}
+
+export type MaterializedSnapshotManifest = {
+  readonly snapshotId: string;
+  readonly principalId: string;
+  readonly sessionFamilyId: string;
+  readonly checksum: string;
+  readonly pageCount: number;
+  readonly expiresAt: string;
+} & (
+  | {
+      readonly kind: "room";
+      readonly roomId: string;
+      readonly accessRevision: number;
+      readonly watermark: number;
+    }
+  | { readonly kind: "catalog"; readonly catalogRevision: number }
+);
+
+export type SnapshotRevalidationRequest =
+  | {
+      readonly kind: "room";
+      readonly context: AuthenticatedSessionContext;
+      readonly roomId: string;
+      readonly accessRevision: number;
+    }
+  | {
+      readonly kind: "catalog";
+      readonly context: AuthenticatedSessionContext;
+      readonly catalogRevision: number;
+    };
+
+export type SnapshotMaterializedPage = RoomRepairPage | WorkspaceBootstrapPage;
+export type SnapshotFallbackReason = "quota" | "deadline" | "wal-growth";
+
+export type SnapshotWorkerRequest =
+  | { readonly type: "snapshot.initialize"; readonly requestId: string }
+  | {
+      readonly type: "snapshot.begin-room";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly responseRequestId: string;
+      readonly roomId: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "snapshot.begin-catalog";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly responseRequestId: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "snapshot.read-page";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly responseRequestId: string;
+      readonly snapshotId: string;
+      readonly afterPage: number;
+      readonly now: number;
+    }
+  | {
+      readonly type: "snapshot.invalidate";
+      readonly requestId: string;
+      readonly snapshotId: string;
+    }
+  | { readonly type: "snapshot.cache-count"; readonly requestId: string }
+  | { readonly type: "snapshot.full-validation-count"; readonly requestId: string }
+  | { readonly type: "snapshot.close"; readonly requestId: string };
+
+export type SnapshotWorkerErrorCode =
+  | "invalid_request"
+  | "invalid_token"
+  | "token_expired"
+  | "session_revoked"
+  | "snapshot_family_revoked"
+  | "snapshot_expired"
+  | "snapshot_forbidden"
+  | "snapshot_not_found"
+  | "snapshot_stale"
+  | "room_archived"
+  | "room_forbidden"
+  | "room_not_found"
+  | "storage_unavailable";
+
+export type SnapshotWorkerResponse =
+  | { readonly type: "snapshot.ready"; readonly requestId: string }
+  | {
+      readonly type: "snapshot.page";
+      readonly requestId: string;
+      readonly page: SnapshotMaterializedPage;
+      readonly manifest: MaterializedSnapshotManifest;
+    }
+  | {
+      readonly type: "snapshot.fallback";
+      readonly requestId: string;
+      readonly reason: SnapshotFallbackReason;
+    }
+  | {
+      readonly type: "snapshot.cache-count";
+      readonly requestId: string;
+      readonly count: number;
+    }
+  | {
+      readonly type: "snapshot.full-validation-count";
+      readonly requestId: string;
+      readonly count: number;
+    }
+  | { readonly type: "snapshot.invalidated"; readonly requestId: string }
+  | { readonly type: "snapshot.closed"; readonly requestId: string }
+  | {
+      readonly type: "snapshot.error";
+      readonly requestId: string;
+      readonly code: SnapshotWorkerErrorCode;
+      readonly message: string;
+    };
+
+export interface SnapshotRevalidationStore {
+  revalidateSnapshot(validation: SnapshotRevalidationRequest): Promise<void>;
 }
 
 export interface HashedSessionIssue {

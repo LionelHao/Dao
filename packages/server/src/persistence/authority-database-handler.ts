@@ -32,6 +32,7 @@ import {
   type OutboxDispatchCandidate,
   type PersistentCommand,
   type RoomGovernanceCommand,
+  type SnapshotRevalidationRequest,
 } from "./contracts.js";
 import type { AuthorityWorkerErrorCode } from "./worker-protocol.js";
 
@@ -267,6 +268,66 @@ function requireHumanSession(
     return fail("token_expired", "Authority command session expired");
   }
   return context.principal.actorId;
+}
+
+export function revalidateSnapshotDatabaseQuery(
+  database: DatabaseSync,
+  validation: SnapshotRevalidationRequest,
+  now: number,
+): void {
+  runAuthorityImmediateTransaction(database, () => {
+    let actorId: string;
+    try {
+      actorId = requireHumanSession(database, validation.context, now);
+    } catch (error: unknown) {
+      if (error instanceof AuthorityDatabaseError && error.code === "identity_forbidden") {
+        return fail("snapshot_forbidden", "Snapshot session family was rejected");
+      }
+      if (error instanceof AuthorityDatabaseError && error.code === "session_revoked") {
+        const familyStillActive = database.prepare(
+          `SELECT 1 AS present FROM sessions
+           WHERE family_id = ? AND account_id = ? AND actor_id = ? AND revoked_at IS NULL
+           LIMIT 1`,
+        ).get(validation.context.sessionFamilyId,
+          validation.context.principal.accountId, validation.context.principal.actorId);
+        if (familyStillActive === undefined) {
+          return fail("snapshot_family_revoked", "Snapshot session family was revoked");
+        }
+      }
+      throw error;
+    }
+    if (validation.kind === "catalog") {
+      const actor = database.prepare(
+        "SELECT catalog_revision AS catalogRevision FROM actors WHERE id = ?",
+      ).get(actorId);
+      if (typeof actor?.catalogRevision !== "number") {
+        return fail("snapshot_forbidden", "Snapshot catalog principal was rejected");
+      }
+      if (actor.catalogRevision !== validation.catalogRevision) {
+        return fail("snapshot_stale", "Snapshot catalog revision changed");
+      }
+      return;
+    }
+    const room = database.prepare("SELECT status FROM rooms WHERE id = ?")
+      .get(validation.roomId);
+    if (room === undefined) {
+      return fail("room_not_found", "Snapshot room was not found");
+    }
+    if (room.status !== "active") {
+      return fail("room_archived", "Snapshot room is archived");
+    }
+    const membership = database.prepare(
+      `SELECT access_revision AS accessRevision
+       FROM room_memberships
+       WHERE room_id = ? AND actor_id = ? AND kind = 'human'`,
+    ).get(validation.roomId, actorId);
+    if (membership === undefined) {
+      return fail("room_forbidden", "Snapshot room membership was rejected");
+    }
+    if (membership.accessRevision !== validation.accessRevision) {
+      return fail("snapshot_stale", "Snapshot room access revision changed");
+    }
+  });
 }
 
 export function readHistoryDatabaseQuery(

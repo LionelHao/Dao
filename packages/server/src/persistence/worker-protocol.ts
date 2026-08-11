@@ -30,6 +30,7 @@ import type {
   OutboxDelivery,
   OutboxDispatchCandidate,
   RoomGovernanceCommand,
+  SnapshotRevalidationRequest,
 } from "./contracts.js";
 
 export type AuthorityWorkerErrorCode =
@@ -66,6 +67,9 @@ export type AuthorityWorkerErrorCode =
   | "room_not_found"
   | "room_owner_required"
   | "session_revoked"
+  | "snapshot_family_revoked"
+  | "snapshot_forbidden"
+  | "snapshot_stale"
   | "storage_unavailable"
   | "token_expired";
 
@@ -106,6 +110,9 @@ export function isAuthorityWorkerErrorCode(
     case "room_not_found":
     case "room_owner_required":
     case "session_revoked":
+    case "snapshot_family_revoked":
+    case "snapshot_forbidden":
+    case "snapshot_stale":
     case "storage_unavailable":
     case "token_expired":
       return true;
@@ -236,6 +243,12 @@ export type AuthorityWorkerRequest =
       readonly now: number;
     }
   | {
+      readonly type: "authority.snapshot-revalidate";
+      readonly requestId: string;
+      readonly validation: SnapshotRevalidationRequest;
+      readonly now: number;
+    }
+  | {
       readonly type: "authority.compact-room-stream";
       readonly requestId: string;
       readonly roomId: string;
@@ -334,6 +347,7 @@ export type AuthorityWorkerResponse =
       readonly requestId: string;
       readonly result: RoomSyncResult;
     }
+  | { readonly type: "authority.snapshot-revalidated"; readonly requestId: string }
   | {
       readonly type: "authority.room-stream-compacted";
       readonly requestId: string;
@@ -484,6 +498,21 @@ function isAuthenticatedSessionContext(
     isText(value.principal.accountId) &&
     isText(value.principal.actorId)
   );
+}
+
+function isSnapshotRevalidationRequest(
+  value: unknown,
+): value is SnapshotRevalidationRequest {
+  if (!isRecord(value) || !isAuthenticatedSessionContext(value.context)) {
+    return false;
+  }
+  if (value.kind === "room") {
+    return hasExactKeys(value, ["kind", "context", "roomId", "accessRevision"]) &&
+      isText(value.roomId) && isNonNegativeSafeInteger(value.accessRevision);
+  }
+  return value.kind === "catalog" &&
+    hasExactKeys(value, ["kind", "context", "catalogRevision"]) &&
+    isNonNegativeSafeInteger(value.catalogRevision);
 }
 
 function isAuthenticatedCommandContext(
@@ -772,6 +801,10 @@ export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWork
           parsed.value.cursor.roomId === parsed.value.roomId) &&
         isNonNegativeSafeInteger(value.now);
     }
+    case "authority.snapshot-revalidate":
+      return hasExactKeys(value, ["type", "requestId", "validation", "now"]) &&
+        isSnapshotRevalidationRequest(value.validation) &&
+        isNonNegativeSafeInteger(value.now);
     case "authority.compact-room-stream":
       return hasExactKeys(value, ["type", "requestId", "roomId", "retainedFromSeq"]) &&
         isText(value.roomId) && isNonNegativeSafeInteger(value.retainedFromSeq) &&
@@ -856,6 +889,8 @@ export function isAuthorityWorkerResponse(
     case "authority.room-synced":
       return hasExactKeys(value, ["type", "requestId", "result"]) &&
         isRoomSyncResult(value.result);
+    case "authority.snapshot-revalidated":
+      return hasExactKeys(value, ["type", "requestId"]);
     case "authority.room-stream-compacted":
       return hasExactKeys(
         value,

@@ -35,6 +35,7 @@ import {
   type AuthorityWorkerRequest,
   type AuthorityWorkerResponse,
 } from "./worker-protocol.js";
+import { migrateAuthorityDatabase } from "./schema.js";
 
 const temporaryDirectories = new Set<string>();
 const clients = new Set<WorkerDatabaseClient>();
@@ -469,6 +470,36 @@ describe("AuthorityWorker closed protocol", () => {
         requestId: "1",
       }),
     ).toBe(true);
+    expect(isAuthorityWorkerRequest({
+      type: "authority.snapshot-revalidate",
+      requestId: "snapshot-revalidate",
+      validation: {
+        kind: "room",
+        context: {
+          sessionId: createHash("sha256").update("snapshot-session").digest("base64url"),
+          sessionFamilyId: createHash("sha256").update("snapshot-family").digest("base64url"),
+          principal: { accountId: "account", actorId: "actor" },
+        },
+        roomId: "room",
+        accessRevision: 1,
+      },
+      now: 1_000,
+    })).toBe(true);
+    expect(isAuthorityWorkerRequest({
+      type: "authority.snapshot-revalidate",
+      requestId: "snapshot-revalidate-extra",
+      validation: {
+        kind: "catalog",
+        context: {
+          sessionId: createHash("sha256").update("snapshot-session").digest("base64url"),
+          sessionFamilyId: createHash("sha256").update("snapshot-family").digest("base64url"),
+          principal: { accountId: "account", actorId: "actor" },
+        },
+        catalogRevision: 1,
+        watermark: 2,
+      },
+      now: 1_000,
+    })).toBe(false);
     expect(
       isAuthorityWorkerRequest({
         type: "authority.inspect-schema",
@@ -544,6 +575,15 @@ describe("AuthorityWorker closed protocol", () => {
         schemaVersion: 4,
       }),
     ).toBe(true);
+    expect(isAuthorityWorkerResponse({
+      type: "authority.snapshot-revalidated",
+      requestId: "snapshot-revalidated",
+    })).toBe(true);
+    expect(isAuthorityWorkerResponse({
+      type: "authority.snapshot-revalidated",
+      requestId: "snapshot-revalidated-extra",
+      allowed: true,
+    })).toBe(false);
     expect(
       isAuthorityWorkerResponse({
         type: "authority.outbox",
@@ -1107,6 +1147,66 @@ describe("public worker transport errors", () => {
 });
 
 describe("WorkerDatabaseClient", () => {
+  it("serializes live snapshot revalidation with current session and revision state", async () => {
+    const path = databasePath();
+    const context = {
+      sessionId: createHash("sha256").update("snapshot-access").digest("base64url"),
+      sessionFamilyId: createHash("sha256").update("snapshot-family").digest("base64url"),
+      principal: { accountId: "snapshot-account", actorId: "snapshot-human" },
+    };
+    const database = new DatabaseSync(path);
+    migrateAuthorityDatabase(database);
+    database.prepare(
+      `INSERT INTO actors (
+         id, kind, display_name, reachability, readiness, tool_permissions_json,
+         catalog_revision
+       ) VALUES (?, 'human', 'Snapshot Human', 'online', NULL, '[]', 4)`,
+    ).run(context.principal.actorId);
+    database.prepare(
+      `INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+       VALUES ('identity', ?, 0, 1)`,
+    ).run(context.principal.actorId);
+    database.prepare(
+      `INSERT INTO sessions (
+         family_id, account_id, actor_id, access_token_hash, refresh_token_hash,
+         access_expires_at, refresh_expires_at, revoked_at
+       ) VALUES (?, ?, ?, ?, ?, 10000, 20000, NULL)`,
+    ).run(context.sessionFamilyId, context.principal.accountId,
+      context.principal.actorId, context.sessionId,
+      createHash("sha256").update("snapshot-refresh").digest("base64url"));
+    database.prepare(
+      "INSERT INTO rooms (id, name, status, created_at) VALUES ('snapshot-room', 'Room', 'active', 't')",
+    ).run();
+    database.prepare(
+      `INSERT INTO room_memberships (
+         room_id, actor_id, kind, role, participation, tool_permissions_json,
+         joined_at, configured_at, access_revision
+       ) VALUES ('snapshot-room', ?, 'human', 'member', NULL, '[]', 't', NULL, 3)`,
+    ).run(context.principal.actorId);
+    database.prepare(
+      `INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+       VALUES ('room', 'snapshot-room', 0, 1)`,
+    ).run();
+    database.close();
+
+    const client = trackClient(await createWorkerDatabaseClient({ databasePath: path }));
+    await expect(client.revalidateSnapshot({
+      kind: "room", context, roomId: "snapshot-room", accessRevision: 3,
+    }, 1_000)).resolves.toBeUndefined();
+    await expect(client.revalidateSnapshot({
+      kind: "catalog", context, catalogRevision: 4,
+    }, 1_000)).resolves.toBeUndefined();
+
+    const writer = new DatabaseSync(path);
+    writer.prepare(
+      "UPDATE room_memberships SET access_revision = 4 WHERE room_id = 'snapshot-room' AND actor_id = ?",
+    ).run(context.principal.actorId);
+    writer.close();
+    await expect(client.revalidateSnapshot({
+      kind: "room", context, roomId: "snapshot-room", accessRevision: 3,
+    }, 1_000)).rejects.toMatchObject({ status: 409, code: "snapshot_stale" });
+  });
+
   it("preserves both transaction and rollback failures in one internal fatal error", () => {
     const original = new Error("SELECT secret FROM authority at /private/original.sqlite");
     const rollback = new Error("ROLLBACK failed at /private/rollback.sqlite");
@@ -1632,6 +1732,7 @@ describe("WorkerDatabaseClient", () => {
       expect(client).not.toHaveProperty("readRoom");
       expect(client).not.toHaveProperty("executeHuman");
       expect(client).not.toHaveProperty("executeAgent");
+      expect(client).not.toHaveProperty("revalidateSnapshot");
       expect(client).not.toHaveProperty("listPendingOutbox");
       expect(client).not.toHaveProperty("authorizeOutboxCandidate");
       expect(client).not.toHaveProperty("markOutboxDispatched");

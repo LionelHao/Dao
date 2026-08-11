@@ -56,7 +56,11 @@ export {
   ROOM_SYNC_MAX_PAGE_BYTES,
   SyncServiceError,
 } from "./sync-service.js";
-export type { SyncService, SyncServiceOptions } from "./sync-service.js";
+export type {
+  MaterializedSnapshotStore,
+  SyncService,
+  SyncServiceOptions,
+} from "./sync-service.js";
 export type {
   OutboxDispatcher,
   OutboxDispatcherOptions,
@@ -162,6 +166,7 @@ export type WorkerDatabaseClient = Omit<
   | "markOutboxFailed"
   | "syncRoom"
   | "compactRoomStream"
+  | "revalidateSnapshot"
 >;
 export async function createWorkerDatabaseClient(
   options: CreateWorkerDatabaseClientOptions,

@@ -31,6 +31,15 @@ export type SnapshotDeliveryMode =
   | { readonly mode: "materialized"; readonly expiresAt: string; readonly idleExpiresAt?: never }
   | { readonly mode: "streaming"; readonly idleExpiresAt: string; readonly expiresAt?: never };
 
+export interface LegacyUnknownCalibrationSignal {
+  readonly id: string;
+  readonly sourceMessageId: null;
+  readonly actorId: null;
+  readonly agentId: string;
+  readonly emoji: "👍" | "👎";
+  readonly createdAt: string;
+}
+
 export type RoomRepairRecord =
   | { readonly kind: "room"; readonly value: Omit<ManagedRoom, "members"> }
   | { readonly kind: "membership"; readonly value: HumanRoomMembership | AgentRoomMembership }
@@ -39,7 +48,9 @@ export type RoomRepairRecord =
   | { readonly kind: "agent-judgement"; readonly value: AgentJudgement }
   | { readonly kind: "open-item"; readonly value: OpenItem }
   | { readonly kind: "agent-execution"; readonly value: AgentExecution }
-  | { readonly kind: "calibration"; readonly value: CalibrationSignal };
+  | { readonly kind: "calibration"; readonly value: CalibrationSignal }
+  | { readonly kind: "legacy-unknown-calibration";
+      readonly value: LegacyUnknownCalibrationSignal };
 
 export type SnapshotVersion =
   | { readonly kind: "room"; readonly roomId: string; readonly watermark: number }
@@ -258,6 +269,14 @@ function isRepairRecord(value: unknown): value is RoomRepairRecord {
   if (value.kind === "open-item") return isOpenItem(value.value);
   if (value.kind === "agent-execution") return isAgentExecution(value.value);
   if (value.kind === "calibration") return isCalibrationSignal(value.value);
+  if (value.kind === "legacy-unknown-calibration") {
+    const legacy = value.value;
+    return isRecord(legacy) && exact(legacy,
+      ["id", "sourceMessageId", "actorId", "agentId", "emoji", "createdAt"]) &&
+      text(legacy.id) && legacy.sourceMessageId === null && legacy.actorId === null &&
+      text(legacy.agentId) && (legacy.emoji === "👍" || legacy.emoji === "👎") &&
+      text(legacy.createdAt);
+  }
   if (value.kind === "room") return isRoomMetadata(value.value);
   if (value.kind === "membership") return isHumanMembershipValue(value.value) || isAgentMembershipValue(value.value);
   return value.kind === "message" && isMessageValue(value.value);

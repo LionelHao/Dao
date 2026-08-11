@@ -226,6 +226,58 @@ function request(
 }
 
 describe("permission-aware retained room sync", () => {
+  it("exposes only materialized bootstrap/repair page APIs and preserves current request ids", async () => {
+    const fixture = await createFixture();
+    const context = fixture.contexts[0];
+    if (context === undefined) throw new Error("missing fixture context");
+    const snapshotId = "snapshot-service";
+    const snapshots = {
+      async beginRoomRepair(_context: AuthenticatedSessionContext, requestId: string, roomId: string) {
+        return { type: "room.repair.page" as const, requestId, snapshotId, roomId,
+          page: 0, records: [], watermark: 0, snapshotChecksum: "checksum",
+          hasMore: false, mode: "materialized" as const,
+          expiresAt: "2026-08-11T00:05:00.000Z" };
+      },
+      async readRoomRepairPage(_context: AuthenticatedSessionContext, requestId: string,
+        _snapshotId: string, afterPage: number) {
+        return { type: "room.repair.page" as const, requestId, snapshotId,
+          roomId: fixture.roomId, page: afterPage + 1, records: [], watermark: 0,
+          snapshotChecksum: "checksum", hasMore: false, mode: "materialized" as const,
+          expiresAt: "2026-08-11T00:05:00.000Z" };
+      },
+      async beginWorkspaceBootstrap(_context: AuthenticatedSessionContext, requestId: string) {
+        return { type: "workspace.bootstrap.page" as const, requestId, snapshotId,
+          page: 0, rooms: [], catalogRevision: 0, snapshotChecksum: "checksum",
+          hasMore: false, mode: "materialized" as const,
+          expiresAt: "2026-08-11T00:05:00.000Z" };
+      },
+      async readWorkspaceBootstrapPage(_context: AuthenticatedSessionContext, requestId: string,
+        _snapshotId: string, afterPage: number) {
+        return { type: "workspace.bootstrap.page" as const, requestId, snapshotId,
+          page: afterPage + 1, rooms: [], catalogRevision: 0,
+          snapshotChecksum: "checksum", hasMore: false, mode: "materialized" as const,
+          expiresAt: "2026-08-11T00:05:00.000Z" };
+      },
+    };
+    const sync = createSyncService({ store: fixture.store, snapshots });
+
+    await expect(sync.beginRoomRepair(context, "room-begin", fixture.roomId))
+      .resolves.toMatchObject({ type: "room.repair.page", requestId: "room-begin", page: 0 });
+    await expect(sync.readRoomRepairPage(context, "room-next", snapshotId, 0))
+      .resolves.toMatchObject({ requestId: "room-next", page: 1 });
+    await expect(sync.beginWorkspaceBootstrap(context, "catalog-begin"))
+      .resolves.toMatchObject({ type: "workspace.bootstrap.page", requestId: "catalog-begin", page: 0 });
+    await expect(sync.readWorkspaceBootstrapPage(context, "catalog-next", snapshotId, 0))
+      .resolves.toMatchObject({ requestId: "catalog-next", page: 1 });
+    for (const invalid of ["", " "]) {
+      await expect(sync.beginWorkspaceBootstrap(context, invalid))
+        .rejects.toMatchObject({ status: 400, code: "invalid_request" });
+    }
+    await expect(sync.readRoomRepairPage(context, "bad-page", snapshotId, -1))
+      .rejects.toMatchObject({ status: 400, code: "invalid_request" });
+    await fixture.client.close();
+  });
+
   it("paginates without gaps and retains three independent client cursors", async () => {
     const fixture = await createFixture({ eventCount: 5 });
     const [contextA, contextB, contextC] = fixture.contexts;

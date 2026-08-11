@@ -24,6 +24,8 @@ import type {
   OutboxDispatchCandidate,
   RoomGovernanceCommand,
   SessionAuthority,
+  SnapshotRevalidationRequest,
+  SnapshotRevalidationStore,
   SyncQueryStore,
 } from "./contracts.js";
 import type { WorkerDatabaseClient } from "./worker-database-client.js";
@@ -31,6 +33,7 @@ import type { WorkerDatabaseClient } from "./worker-database-client.js";
 export interface SqliteAuthoritativeStore extends
   SessionAuthority,
   CommandStore,
+  SnapshotRevalidationStore,
   Pick<
     SyncQueryStore,
     | "syncRoom"
@@ -242,6 +245,10 @@ export function createSqliteAuthoritativeStore(
       request: RoomSyncRequest,
     ): Promise<RoomSyncResult> {
       return client.syncRoom(context, request, clock());
+    },
+
+    revalidateSnapshot(validation: SnapshotRevalidationRequest): Promise<void> {
+      return client.revalidateSnapshot(validation, clock());
     },
 
     async compactRoomStream(roomId: string, retainedFromSeq: number): Promise<void> {

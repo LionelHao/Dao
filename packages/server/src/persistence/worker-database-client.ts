@@ -38,6 +38,7 @@ import type {
   OutboxDeliveryFailureReason,
   OutboxDispatchCandidate,
   RoomGovernanceCommand,
+  SnapshotRevalidationRequest,
 } from "./contracts.js";
 import {
   ROOM_SYNC_DEFAULT_LIMIT,
@@ -97,6 +98,10 @@ export interface WorkerDatabaseClient {
     roomId: string,
     retainedFromSeq: number,
   ): Promise<{ readonly retainedFromSeq: number; readonly headSeq: number }>;
+  revalidateSnapshot(
+    validation: SnapshotRevalidationRequest,
+    now: number,
+  ): Promise<void>;
   readActor(actorId: string): Promise<Actor | undefined>;
   readRoom(roomId: string): Promise<ManagedRoom | undefined>;
   canAccessRoom(
@@ -173,6 +178,7 @@ function authorityWorkerClientErrorStatus(
     case "invitation_forbidden":
     case "room_forbidden":
     case "session_revoked":
+    case "snapshot_family_revoked":
       return 403;
     case "invitation_not_found":
     case "member_not_found":
@@ -193,7 +199,10 @@ function authorityWorkerClientErrorStatus(
     case "room_compaction_blocked":
     case "room_member_exists":
     case "room_owner_required":
+    case "snapshot_stale":
       return 409;
+    case "snapshot_forbidden":
+      return 403;
     case "authority_not_initialized":
     case "authority_worker_closed":
     case "authority_worker_error":
@@ -958,6 +967,19 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
     });
   }
 
+  revalidateSnapshot(
+    validation: SnapshotRevalidationRequest,
+    now: number,
+  ): Promise<void> {
+    return this.#send({ type: "authority.snapshot-revalidate", validation, now })
+      .then((response) => {
+        if (response.type !== "authority.snapshot-revalidated") {
+          this.#failProtocol("Authority worker returned the wrong snapshot revalidation response");
+          throw this.#terminalError;
+        }
+      });
+  }
+
   readActor(actorId: string): Promise<Actor | undefined> {
     return this.#send({ type: "authority.read-actor", actorId }).then((response) => {
       if (response.type !== "authority.actor") {
@@ -1251,6 +1273,8 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
         responseType === "authority.outbox-updated") ||
       (requestType === "authority.sync-room" &&
         responseType === "authority.room-synced") ||
+      (requestType === "authority.snapshot-revalidate" &&
+        responseType === "authority.snapshot-revalidated") ||
       (requestType === "authority.compact-room-stream" &&
         responseType === "authority.room-stream-compacted") ||
       (requestType === "authority.close" && responseType === "authority.closed")

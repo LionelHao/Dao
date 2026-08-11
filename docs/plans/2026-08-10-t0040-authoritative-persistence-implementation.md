@@ -978,8 +978,18 @@ Propose `feat(server): add authoritative room cursors`. Reviewer focus: watermar
 - Create: `packages/server/src/persistence/snapshot-worker-client.test.ts`
 - Modify: `packages/server/src/persistence/schema.ts`
 - Modify: `packages/server/src/persistence/contracts.ts`
+- Modify: `packages/server/src/persistence/worker-protocol.ts`
+- Modify: `packages/server/src/persistence/worker-database-client.ts`
+- Modify: `packages/server/src/persistence/worker-database-client.test.ts`
+- Modify: `packages/server/src/persistence/authority-worker.ts`
+- Modify: `packages/server/src/persistence/authority-database-handler.ts`
+- Modify: `packages/server/src/persistence/sqlite-authoritative-store.ts`
 - Modify: `packages/server/src/sync-service.ts`
 - Modify: `packages/server/src/sync-service.test.ts`
+- Modify: `packages/server/src/index.ts`
+- Modify: `packages/core/src/index.ts`
+- Modify: `packages/core/src/sync.ts`
+- Modify: `packages/core/src/sync.test.ts`
 
 - [ ] **Step 1: Write materialized snapshot RED tests.**
 

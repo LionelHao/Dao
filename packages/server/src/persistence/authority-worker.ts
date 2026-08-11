@@ -36,6 +36,7 @@ import {
   readHistoryDatabaseQuery,
   readRoomAuditDatabaseQuery,
   readRoomDatabaseQuery,
+  revalidateSnapshotDatabaseQuery,
   runAuthorityImmediateTransaction,
   syncRoomDatabaseQuery,
 } from "./authority-database-handler.js";
@@ -1188,6 +1189,31 @@ function syncRoom(request: AuthorityWorkerRequest): void {
   }
 }
 
+function revalidateSnapshot(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.snapshot-revalidate") {
+    throw new TypeError("revalidateSnapshot received the wrong request type");
+  }
+  try {
+    revalidateSnapshotDatabaseQuery(
+      requireAuthorityTransactionDatabase(),
+      request.validation,
+      request.now,
+    );
+    respond({ type: "authority.snapshot-revalidated", requestId: request.requestId });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithError(
+      request.requestId,
+      "storage_unavailable",
+      "Authority snapshot revalidation failed",
+    );
+  }
+}
+
 function compactRoomStream(request: AuthorityWorkerRequest): void {
   if (request.type !== "authority.compact-room-stream") {
     throw new TypeError("compactRoomStream received the wrong request type");
@@ -1332,6 +1358,9 @@ async function dispatch(value: unknown): Promise<void> {
       return;
     case "authority.sync-room":
       syncRoom(value);
+      return;
+    case "authority.snapshot-revalidate":
+      revalidateSnapshot(value);
       return;
     case "authority.compact-room-stream":
       compactRoomStream(value);

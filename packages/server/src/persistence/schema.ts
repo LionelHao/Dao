@@ -1279,3 +1279,145 @@ export function migrateAuthorityDatabaseToVersion2ForTest(
 ): void {
   migrateAuthorityDatabaseToVersion(database, 2);
 }
+
+export const SNAPSHOT_CACHE_SCHEMA_VERSION = 1 as const;
+export const SNAPSHOT_CACHE_BUSY_TIMEOUT_MS = 5_000;
+const SNAPSHOT_CACHE_SCHEMA_FINGERPRINT =
+  "bc416cc7c65942d8eb36036eb43d70e039eea6703b94222d5185147f309a01dc";
+
+const SNAPSHOT_CACHE_TABLES = [
+  "expired_snapshot_tombstones",
+  "repair_snapshot_pages",
+  "repair_snapshots",
+] as const;
+
+export function configureSnapshotCacheConnection(database: DatabaseSync): void {
+  database.exec("PRAGMA foreign_keys = ON");
+  database.prepare("PRAGMA journal_mode = WAL").get();
+  database.exec("PRAGMA synchronous = FULL");
+  database.exec(`PRAGMA busy_timeout = ${SNAPSHOT_CACHE_BUSY_TIMEOUT_MS}`);
+  if (
+    readPragmaNumber(database, "foreign_keys", "foreign_keys") !== 1 ||
+    readPragmaString(database, "journal_mode", "journal_mode").toLowerCase() !== "wal" ||
+    readPragmaNumber(database, "synchronous", "synchronous") !== 2 ||
+    readPragmaNumber(database, "busy_timeout", "timeout") !== SNAPSHOT_CACHE_BUSY_TIMEOUT_MS
+  ) {
+    throw new Error("Snapshot cache SQLite configuration could not be verified");
+  }
+}
+
+export function listSnapshotCacheTables(database: DatabaseSync): readonly string[] {
+  return database.prepare(
+    `SELECT name FROM sqlite_schema
+     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+     ORDER BY name`,
+  ).all().map((row) => String(row.name));
+}
+
+function snapshotCacheColumns(database: DatabaseSync, table: string): readonly string[] {
+  return database.prepare(`PRAGMA table_info(${table})`).all()
+    .map((row) => String(row.name));
+}
+
+function validateSnapshotCacheIntegrity(database: DatabaseSync): void {
+  try {
+    const integrity = database.prepare("PRAGMA integrity_check").all();
+    if (integrity.length !== 1 || integrity[0]?.integrity_check !== "ok") {
+      throw new Error("PRAGMA integrity_check did not return exactly ok");
+    }
+    if (database.prepare("PRAGMA foreign_key_check").get() !== undefined) {
+      throw new Error("PRAGMA foreign_key_check returned violations");
+    }
+  } catch (error: unknown) {
+    throw new Error("Snapshot cache integrity check failed", { cause: error });
+  }
+}
+
+export function validateSnapshotCachePhysicalSchema(database: DatabaseSync): void {
+  if (readSchemaVersion(database) !== SNAPSHOT_CACHE_SCHEMA_VERSION) {
+    throw new Error("Snapshot cache schema version is incompatible");
+  }
+  if (!sameStrings(listSnapshotCacheTables(database), SNAPSHOT_CACHE_TABLES)) {
+    throw new Error("Snapshot cache table contract is corrupt");
+  }
+  if (!sameStrings(snapshotCacheColumns(database, "repair_snapshots"), [
+    "snapshot_id", "kind", "principal_id", "session_family_id", "room_id",
+    "access_revision", "watermark", "catalog_revision", "checksum",
+    "page_count", "expires_at", "reuse_key", "complete", "invalid",
+  ]) || !sameStrings(snapshotCacheColumns(database, "repair_snapshot_pages"), [
+    "snapshot_id", "page_number", "payload_json", "canonical_bytes",
+  ]) || !sameStrings(snapshotCacheColumns(database, "expired_snapshot_tombstones"), [
+    "snapshot_id", "retain_until",
+  ])) {
+    throw new Error("Snapshot cache column contract is corrupt");
+  }
+  if (readSchemaFingerprint(database) !== SNAPSHOT_CACHE_SCHEMA_FINGERPRINT) {
+    throw new Error("Snapshot cache physical contract is corrupt");
+  }
+}
+
+export function validateSnapshotCacheSchema(database: DatabaseSync): void {
+  validateSnapshotCachePhysicalSchema(database);
+  validateSnapshotCacheIntegrity(database);
+}
+
+export function migrateSnapshotCacheDatabase(database: DatabaseSync): void {
+  configureSnapshotCacheConnection(database);
+  const version = readSchemaVersion(database);
+  if (version === SNAPSHOT_CACHE_SCHEMA_VERSION) {
+    validateSnapshotCacheSchema(database);
+    return;
+  }
+  if (version !== 0 || listSnapshotCacheTables(database).length !== 0) {
+    throw new Error("Snapshot cache schema version is incompatible");
+  }
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    database.exec(`CREATE TABLE repair_snapshots (
+      snapshot_id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL CHECK (kind IN ('room', 'catalog')),
+      principal_id TEXT NOT NULL,
+      session_family_id TEXT NOT NULL,
+      room_id TEXT,
+      access_revision INTEGER,
+      watermark INTEGER,
+      catalog_revision INTEGER,
+      checksum TEXT NOT NULL,
+      page_count INTEGER NOT NULL CHECK (page_count >= 1),
+      expires_at INTEGER NOT NULL,
+      reuse_key TEXT NOT NULL,
+      complete INTEGER NOT NULL CHECK (complete IN (0, 1)),
+      invalid INTEGER NOT NULL DEFAULT 0 CHECK (invalid IN (0, 1)),
+      CHECK (
+        (kind = 'room' AND room_id IS NOT NULL AND access_revision IS NOT NULL
+          AND watermark IS NOT NULL AND catalog_revision IS NULL)
+        OR
+        (kind = 'catalog' AND room_id IS NULL AND access_revision IS NULL
+          AND watermark IS NULL AND catalog_revision IS NOT NULL)
+      )
+    ) STRICT`);
+    database.exec(`CREATE INDEX repair_snapshots_reuse
+      ON repair_snapshots(reuse_key, complete, invalid, expires_at)`);
+    database.exec(`CREATE TABLE repair_snapshot_pages (
+      snapshot_id TEXT NOT NULL REFERENCES repair_snapshots(snapshot_id) ON DELETE CASCADE,
+      page_number INTEGER NOT NULL CHECK (page_number >= 0),
+      payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+      canonical_bytes INTEGER NOT NULL CHECK (canonical_bytes >= 0),
+      PRIMARY KEY (snapshot_id, page_number)
+    ) STRICT`);
+    database.exec(`CREATE TABLE expired_snapshot_tombstones (
+      snapshot_id TEXT PRIMARY KEY,
+      retain_until INTEGER NOT NULL
+    ) STRICT`);
+    database.exec(`PRAGMA user_version = ${SNAPSHOT_CACHE_SCHEMA_VERSION}`);
+    validateSnapshotCacheSchema(database);
+    database.exec("COMMIT");
+  } catch (error: unknown) {
+    try {
+      database.exec("ROLLBACK");
+    } catch {
+      // Preserve the schema failure.
+    }
+    throw error;
+  }
+}

@@ -11,6 +11,11 @@ import {
   migrateAuthorityDatabaseToPreviousVersionForTest,
   migrateAuthorityDatabaseToVersion2ForTest,
   readSchemaVersion,
+  listSnapshotCacheTables,
+  migrateSnapshotCacheDatabase,
+  SNAPSHOT_CACHE_BUSY_TIMEOUT_MS,
+  SNAPSHOT_CACHE_SCHEMA_VERSION,
+  validateSnapshotCacheSchema,
 } from "./schema.js";
 
 const AUTHORITY_TABLES = [
@@ -1231,6 +1236,76 @@ describe("authority SQLite schema", () => {
       expect(() => migrateAuthorityDatabase(database)).toThrow(/checksum/i);
 
       expect(snapshot(database)).toEqual(before);
+    });
+  });
+});
+
+describe("derived snapshot cache schema", () => {
+  it("creates independent v1 WAL/FULL tables without changing authority v4", () => {
+    withDatabase((database) => {
+      migrateSnapshotCacheDatabase(database);
+      expect(SNAPSHOT_CACHE_SCHEMA_VERSION).toBe(1);
+      expect(readSchemaVersion(database)).toBe(1);
+      expect(listSnapshotCacheTables(database)).toEqual([
+        "expired_snapshot_tombstones",
+        "repair_snapshot_pages",
+        "repair_snapshots",
+      ]);
+      expect(database.prepare("PRAGMA journal_mode").get()?.journal_mode).toBe("wal");
+      expect(database.prepare("PRAGMA synchronous").get()?.synchronous).toBe(2);
+      expect(database.prepare("PRAGMA busy_timeout").get()?.timeout)
+        .toBe(SNAPSHOT_CACHE_BUSY_TIMEOUT_MS);
+      expect(() => validateSnapshotCacheSchema(database)).not.toThrow();
+    });
+    expect(AUTHORITY_SCHEMA_VERSION).toBe(4);
+  });
+
+  it("fails closed on version-one corruption and refuses future versions", () => {
+    withDatabase((database) => {
+      migrateSnapshotCacheDatabase(database);
+      database.exec("ALTER TABLE repair_snapshot_pages DROP COLUMN canonical_bytes");
+      expect(() => validateSnapshotCacheSchema(database)).toThrow(/column contract/i);
+      expect(() => migrateSnapshotCacheDatabase(database)).toThrow(/column contract/i);
+    });
+    withDatabase((database) => {
+      database.exec("PRAGMA user_version = 2");
+      expect(() => migrateSnapshotCacheDatabase(database)).toThrow(/incompatible/i);
+      expect(readSchemaVersion(database)).toBe(2);
+    });
+  });
+
+  it("rejects same-column physical contract and foreign-key corruption", () => {
+    withDatabase((database) => {
+      migrateSnapshotCacheDatabase(database);
+      database.exec("DROP INDEX repair_snapshots_reuse");
+      expect(() => validateSnapshotCacheSchema(database)).toThrow(/physical contract/i);
+    });
+    withDatabase((database) => {
+      migrateSnapshotCacheDatabase(database);
+      database.exec(`
+        PRAGMA foreign_keys = OFF;
+        ALTER TABLE repair_snapshot_pages RENAME TO repair_snapshot_pages_old;
+        CREATE TABLE repair_snapshot_pages (
+          snapshot_id TEXT,
+          page_number INTEGER,
+          payload_json TEXT,
+          canonical_bytes INTEGER
+        ) STRICT;
+        DROP TABLE repair_snapshot_pages_old;
+        PRAGMA foreign_keys = ON;
+      `);
+      expect(() => validateSnapshotCacheSchema(database)).toThrow(/physical contract/i);
+    });
+    withDatabase((database) => {
+      migrateSnapshotCacheDatabase(database);
+      database.exec("PRAGMA foreign_keys = OFF");
+      database.prepare(
+        `INSERT INTO repair_snapshot_pages (
+           snapshot_id, page_number, payload_json, canonical_bytes
+         ) VALUES ('missing', 0, '[]', 2)`,
+      ).run();
+      database.exec("PRAGMA foreign_keys = ON");
+      expect(() => validateSnapshotCacheSchema(database)).toThrow(/integrity/i);
     });
   });
 });
