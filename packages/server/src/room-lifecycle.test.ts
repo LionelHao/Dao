@@ -17,6 +17,12 @@ import {
   type RoomLifecycleState,
   type StateStore,
 } from "./index.js";
+import { createAuthoritativeRoomLifecycleService } from "./room-lifecycle.js";
+import type {
+  AuthenticatedCommandContext,
+  CommandStore,
+  SyncQueryStore,
+} from "./persistence/contracts.js";
 
 const owner = {
   id: "human-owner",
@@ -220,6 +226,145 @@ function adminFixture(): RoomLifecycleState {
     ],
   };
 }
+
+describe("authoritative RoomLifecycle facade", () => {
+  it("routes every mutation and query through authority ports", async () => {
+    const commandsSeen: string[] = [];
+    const state = ownerFixture();
+    const managedRoom = state.rooms[0]!;
+    const context: AuthenticatedCommandContext = {
+      kind: "human",
+      sessionId: "session-authority",
+      sessionFamilyId: "family-authority",
+      principal: { accountId: "account-owner", actorId: owner.id },
+      requestId: "lifecycle-request",
+      idempotencyKey: "lifecycle-key",
+    };
+    const commands: CommandStore = {
+      async executeHuman(received, command) {
+        expect(received).toBe(context);
+        commandsSeen.push(command.type);
+        if (command.type === "human.invitation.issue") {
+          return {
+            aggregateId: "invitation-authority",
+            eventIds: ["event-invitation"],
+            acceptedAt: "2026-08-10T15:00:00.000Z",
+            result: {
+              invitation: {
+                invitationId: "invitation-authority",
+                roomId: managedRoom.id,
+                inviterActorId: owner.id,
+                inviteeActorId: invitee.id,
+                token: "authority-token",
+                createdAt: "2026-08-10T15:00:00.000Z",
+              },
+            },
+          };
+        }
+        if (command.type === "human.invitation.decide") {
+          return {
+            aggregateId: "invitation-authority",
+            eventIds: ["event-decision"],
+            acceptedAt: "2026-08-10T15:01:00.000Z",
+            result: {
+              invitation: {
+                id: "invitation-authority",
+                roomId: managedRoom.id,
+                inviterActorId: owner.id,
+                inviteeActorId: invitee.id,
+                status: "accepted",
+                createdAt: "2026-08-10T15:00:00.000Z",
+                decisionActorId: invitee.id,
+                decidedAt: "2026-08-10T15:01:00.000Z",
+              },
+            },
+          };
+        }
+        return {
+          aggregateId: managedRoom.id,
+          eventIds: [`event-${command.type}`],
+          acceptedAt: "2026-08-10T15:00:00.000Z",
+          result: { room: managedRoom },
+        };
+      },
+      executeAgent() {
+        throw new Error("unexpected Agent governance");
+      },
+    };
+    const queries: SyncQueryStore = {
+      async readActor(actorId) {
+        expect(actorId).toBe(owner.id);
+        return owner;
+      },
+      async readRoom(roomId) {
+        expect(roomId).toBe(managedRoom.id);
+        return managedRoom;
+      },
+      async canAccessRoom(received, roomId) {
+        expect(received).toEqual({
+          sessionId: context.sessionId,
+          sessionFamilyId: context.sessionFamilyId,
+          principal: context.principal,
+        });
+        expect(roomId).toBe(managedRoom.id);
+        return true;
+      },
+      async readRoomAudit(received, roomId) {
+        expect(received.principal).toEqual(context.principal);
+        expect(roomId).toBe(managedRoom.id);
+        return state.audit;
+      },
+      syncRoom() {
+        throw new Error("unexpected sync");
+      },
+      readHistory() {
+        throw new Error("unexpected history");
+      },
+      async listPendingOutbox() {
+        return [];
+      },
+      async markOutboxDispatched() {},
+    };
+    const lifecycle = createAuthoritativeRoomLifecycleService({
+      commandStore: commands,
+      queryStore: queries,
+    });
+
+    await lifecycle.createRoom(context, { name: "Governance" });
+    await lifecycle.renameRoom(context, managedRoom.id, "Renamed");
+    await lifecycle.archiveRoom(context, managedRoom.id);
+    await lifecycle.inviteHuman(context, {
+      kind: "human-invitation",
+      roomId: managedRoom.id,
+      inviteeActorId: invitee.id,
+    });
+    await lifecycle.respondToHumanInvitation(context, "authority-token", "accept");
+    await lifecycle.configureAgent(context, {
+      kind: "agent-configuration",
+      roomId: managedRoom.id,
+      agentId: searchAgent.id,
+      participation: "active",
+      toolPermissions: ["search"],
+    });
+    await lifecycle.setHumanRole(context, managedRoom.id, member.id, "admin");
+    await lifecycle.removeMember(context, managedRoom.id, member.id);
+
+    expect(commandsSeen).toEqual([
+      "room.create",
+      "room.rename",
+      "room.archive",
+      "human.invitation.issue",
+      "human.invitation.decide",
+      "agent.configure",
+      "human.role.change",
+      "member.remove",
+    ]);
+    await expect(lifecycle.getActor(owner.id)).resolves.toEqual(owner);
+    await expect(lifecycle.getRoom(managedRoom.id)).resolves.toEqual(managedRoom);
+    await expect(lifecycle.canAccess(context, managedRoom.id)).resolves.toBe(true);
+    await expect(lifecycle.audit(context, managedRoom.id)).resolves.toEqual(state.audit);
+  });
+});
 
 function invitationAuthorityFixture(
   status: "pending" | "accepted" | "rejected",

@@ -1,12 +1,33 @@
-import type {
-  Actor,
-  AgentActor,
-  AgentConfigurationRequest,
-  AgentParticipation,
-  HumanActor,
-  HumanInvitationRequest,
-  Message,
+import {
+  isAgentExecution,
+  isAgentJudgement,
+  isCalibrationSignal,
+  isHumanReadReceipt,
+  isOpenItem,
+  isSocialReaction,
+  type Actor,
+  type AgentActor,
+  type AgentConfigurationRequest,
+  type AgentExecution,
+  type AgentJudgement,
+  type AgentParticipation,
+  type CalibrationSignal,
+  type HumanActor,
+  type HumanInvitationRequest,
+  type HumanReadReceipt,
+  type Message,
+  type OpenItem,
+  type SocialReaction,
 } from "@native-im/core";
+
+export interface RestoredPrimitivePreviewRecords {
+  readonly humanReads: readonly HumanReadReceipt[];
+  readonly agentJudgements: readonly AgentJudgement[];
+  readonly openItems: readonly OpenItem[];
+  readonly agentExecutions: readonly AgentExecution[];
+  readonly socialReactions: readonly SocialReaction[];
+  readonly calibrations: readonly CalibrationSignal[];
+}
 
 export interface RoomJoinControlOptions {
   readonly roomId: string;
@@ -124,6 +145,7 @@ function renderHumanMessage(message: Message, actor: HumanActor | undefined): HT
 
   article.className = "message message--human";
   article.dataset.messageKind = "human";
+  article.dataset.messageId = message.id;
   avatar.className = "message-avatar message-avatar--human";
   avatar.setAttribute("aria-hidden", "true");
   avatar.textContent = initialFor(displayName);
@@ -154,6 +176,7 @@ function renderAgentMessage(
 
   article.className = "message message--agent";
   article.dataset.messageKind = "agent";
+  article.dataset.messageId = message.id;
   article.dataset.agentPaletteSlot = `${presentation.paletteSlot}`;
   article.dataset.agentIdentityFallback = presentation.identityFallback;
   article.style.setProperty("--message-role-colour", presentation.colour);
@@ -915,71 +938,258 @@ function appendPrimitiveButton(parent: HTMLElement, label: string, action: strin
   return button;
 }
 
-function appendReceiptRecords(humanMessage: HTMLElement, agentMessage: HTMLElement): void {
-  const humanRead = primitiveElement("div", "human-read-receipt", "✓✓ 已读：周安全、陈研发");
-  const agentContent = agentMessage.querySelector<HTMLElement>(".message-content");
-  if (agentContent === null) {
-    throw new Error("Agent judgement requires a message content column.");
+function appendReceiptRecords(
+  messagesById: ReadonlyMap<string, HTMLElement>,
+  records: RestoredPrimitivePreviewRecords,
+): void {
+  for (const record of records.humanReads) {
+    const humanRead = primitiveElement(
+      "div",
+      "human-read-receipt",
+      `✓✓ 已读：${record.readerId}`,
+    );
+    humanRead.dataset.receiptKind = "human-read";
+    humanRead.dataset.messageId = record.messageId;
+    messagesById.get(record.messageId)!.append(humanRead);
   }
-  humanRead.dataset.receiptKind = "human-read";
-  humanMessage.append(humanRead);
 
-  for (const [status, reason] of [
-    ["无需回应", "未命中我的领域"],
-    ["将回应", "命中领域，准备回应"],
-    ["被抑制", "同话题冷却期内，还剩 7 分钟"],
-  ] as const) {
-    const judgement = primitiveElement("div", "agent-judgement", `已判定 · ${status} · ${reason}`);
+  const outcomeLabels: Readonly<Record<AgentJudgement["outcome"], string>> = {
+    no_response_needed: "无需回应",
+    will_respond: "将回应",
+    suppressed: "被抑制",
+  };
+  for (const record of records.agentJudgements) {
+    const judgement = primitiveElement(
+      "div",
+      "agent-judgement",
+      `已判定 · ${outcomeLabels[record.outcome]} · ${record.reason}`,
+    );
     judgement.dataset.receiptKind = "agent-judgement";
-    agentContent.append(judgement);
+    judgement.dataset.messageId = record.messageId;
+    const content = messagesById.get(record.messageId)!
+      .querySelector<HTMLElement>(".message-content");
+    if (content === null) throw new Error("Message judgement target has no content column");
+    content.append(judgement);
   }
 }
 
-function appendAddressingPreview(container: HTMLElement): void {
+function appendAddressingPreview(
+  container: HTMLElement,
+  records: RestoredPrimitivePreviewRecords,
+): void {
   const section = primitiveElement("section", "addressing-preview");
   const humanLine = primitiveElement("p", "addressing-line");
   const humanMention = primitiveElement("span", "mention mention--human", "@周安全");
   const agentLine = primitiveElement("p", "addressing-line");
   const agentMention = primitiveElement("span", "mention mention--agent", "@数据 Agent");
-  const openItem = primitiveElement("div", "open-item", "待答项 · 周安全 → 陈研发 · 已转交");
-  const invocation = primitiveElement("div", "agent-invocation", "数据 Agent 正在调用 warehouse.query");
-  const status = primitiveElement("span", "member-status-label", "执行中");
-  const interrupt = appendPrimitiveButton(invocation, "中断", "interrupt");
   const audience = primitiveElement("p", "audience-addressing", "@all 只调用 Agent · @here 仅群主可用且有频率限制");
 
   humanLine.append(humanMention, document.createTextNode(" 请确认权限边界（请求，可搁置、可转交）"));
   agentLine.append(agentMention, document.createTextNode(" 拉取失败记录（调用，必响应、可中断）"));
-  openItem.dataset.openItemStatus = "transferred";
-  invocation.dataset.agentInvocation = "agent-data";
-  invocation.dataset.executionStatus = "running";
-  status.dataset.memberId = "agent-data";
-  interrupt.dataset.testid = "interrupt-agent-execution";
-  interrupt.addEventListener("click", () => {
-    invocation.dataset.executionStatus = "interrupted";
-    invocation.firstChild!.textContent = "数据 Agent 已中断";
-    status.textContent = "可用";
-    interrupt.remove();
-  });
-  section.append(humanLine, agentLine, openItem, invocation, status, audience);
+  section.append(humanLine, agentLine);
+  const openStatusLabels: Readonly<Record<OpenItem["status"], string>> = {
+    pending_response: "待回应",
+    responded: "已回应",
+    deferred: "已搁置",
+    transferred: "已转交",
+  };
+  for (const record of records.openItems) {
+    const openItem = primitiveElement(
+      "div",
+      "open-item",
+      `待答项 · ${record.content} · ${record.requesterId} → ${record.ownerId} · ${openStatusLabels[record.status]}`,
+    );
+    openItem.dataset.openItemStatus = record.status;
+    section.append(openItem);
+  }
+  const executionStatusLabels: Readonly<Record<AgentExecution["status"], string>> = {
+    running: "正在调用",
+    completed: "已完成调用",
+    interrupted: "已中断",
+    failed: "调用失败",
+  };
+  for (const record of records.agentExecutions) {
+    const agentLabel = record.agentId === "agent-data" ? "数据 Agent" : record.agentId;
+    const invocation = primitiveElement(
+      "div",
+      "agent-invocation",
+      `Agent 执行 · ${agentLabel} ${executionStatusLabels[record.status]} ${record.toolName}`,
+    );
+    invocation.dataset.agentInvocation = record.agentId;
+    invocation.dataset.executionStatus = record.status;
+    const status = primitiveElement(
+      "span",
+      "member-status-label",
+      record.status === "running" ? "执行中" : "可用",
+    );
+    status.dataset.memberId = record.agentId;
+    if (record.status === "running") {
+      const interrupt = appendPrimitiveButton(invocation, "中断", "interrupt");
+      interrupt.dataset.testid = "interrupt-agent-execution";
+      interrupt.addEventListener("click", () => {
+        invocation.dataset.executionStatus = "interrupted";
+        invocation.firstChild!.textContent = `Agent 执行 · ${agentLabel} 已中断`;
+        status.textContent = "可用";
+        interrupt.remove();
+      });
+    }
+    section.append(invocation, status);
+  }
+  section.append(audience);
   container.append(section);
 }
 
-function appendReactionAndCorrectionPreview(container: HTMLElement): void {
+function appendReactionAndCorrectionPreview(
+  container: HTMLElement,
+  records: RestoredPrimitivePreviewRecords,
+): void {
   const correction = primitiveElement(
     "aside",
     "agent-correction",
     "更正 · 复核后为 36 条，其中 2 条重复计数。原消息保留不变，更正追加在后",
   );
-  const social = primitiveElement("span", "reaction reaction--social", "👍 纯社交");
-  const calibration = primitiveElement("span", "reaction reaction--calibration", "👎 校准：影响后续发言判定");
-
   correction.dataset.correctionFor = "preview-agent-data";
-  social.dataset.reactionKind = "social";
-  calibration.dataset.reactionKind = "calibration";
-  container.append(correction, social, calibration);
+  container.append(correction);
+  for (const record of records.socialReactions) {
+    const social = primitiveElement(
+      "span",
+      "reaction reaction--social",
+      `${record.emoji} 纯社交`,
+    );
+    social.dataset.reactionKind = "social";
+    social.dataset.sourceMessageId = record.sourceMessageId;
+    container.append(social);
+  }
+  for (const record of records.calibrations) {
+    const calibration = primitiveElement(
+      "span",
+      "reaction reaction--calibration",
+      `${record.emoji} 校准：影响后续发言判定`,
+    );
+    calibration.dataset.reactionKind = "calibration";
+    calibration.dataset.sourceMessageId = record.sourceMessageId;
+    container.append(calibration);
+  }
 }
 
-export function renderM2PrimitivesPreview(root: HTMLElement): void {
+const defaultRestoredPrimitiveRecords: RestoredPrimitivePreviewRecords = {
+  humanReads: [{
+    id: "preview-human-read",
+    messageId: "preview-agent-data",
+    readerId: "周安全、陈研发",
+    readAt: "2026-08-08T10:02:00.000Z",
+  }],
+  agentJudgements: [
+    {
+      id: "preview-agent-judgement-no-response",
+      messageId: "preview-human-mention",
+      agentId: "agent-data",
+      outcome: "no_response_needed",
+      reason: "未命中我的领域",
+      decidedAt: "2026-08-08T10:02:01.000Z",
+    },
+    {
+      id: "preview-agent-judgement-will-respond",
+      messageId: "preview-human-mention",
+      agentId: "agent-data",
+      outcome: "will_respond",
+      reason: "命中领域，准备回应",
+      decidedAt: "2026-08-08T10:02:02.000Z",
+    },
+    {
+      id: "preview-agent-judgement-suppressed",
+      messageId: "preview-human-mention",
+      agentId: "agent-data",
+      outcome: "suppressed",
+      reason: "同话题冷却期内，还剩 7 分钟",
+      decidedAt: "2026-08-08T10:02:03.000Z",
+    },
+  ],
+  openItems: [{
+    id: "preview-open-item",
+    roomId: "preview-room",
+    sourceMessageId: "preview-agent-data",
+    requesterId: "周安全",
+    ownerId: "陈研发",
+    content: "权限边界",
+    status: "transferred",
+    createdAt: "2026-08-08T10:03:00.000Z",
+    transferChain: [{
+      fromId: "周安全",
+      toId: "陈研发",
+      reason: "转交领域负责人",
+      transferredAt: "2026-08-08T10:03:01.000Z",
+    }],
+  }],
+  agentExecutions: [{
+    id: "preview-agent-execution",
+    roomId: "preview-room",
+    sourceMessageId: "preview-human-mention",
+    requesterId: "human-li",
+    agentId: "agent-data",
+    toolName: "warehouse.query",
+    status: "running",
+    startedAt: "2026-08-08T10:04:00.000Z",
+  }],
+  socialReactions: [{
+    id: "preview-social-reaction",
+    sourceMessageId: "preview-human-mention",
+    actorId: "human-li",
+    emoji: "👍",
+    createdAt: "2026-08-08T10:05:00.000Z",
+  }],
+  calibrations: [{
+    id: "preview-calibration",
+    sourceMessageId: "preview-agent-data",
+    actorId: "human-li",
+    agentId: "agent-data",
+    emoji: "👎",
+    createdAt: "2026-08-08T10:05:01.000Z",
+  }],
+};
+
+function validateRestoredPrimitiveRecords(records: RestoredPrimitivePreviewRecords): void {
+  if (typeof records !== "object" || records === null ||
+      Object.keys(records).sort().join(",") !== [
+        "agentExecutions", "agentJudgements", "calibrations", "humanReads",
+        "openItems", "socialReactions",
+      ].join(",") ||
+      !Array.isArray(records.humanReads) || !Array.isArray(records.agentJudgements) ||
+      !Array.isArray(records.openItems) || !Array.isArray(records.agentExecutions) ||
+      !Array.isArray(records.socialReactions) || !Array.isArray(records.calibrations)) {
+    throw new TypeError("Restored collaboration record envelope is not closed");
+  }
+  const messageIds = new Set(["preview-human-mention", "preview-agent-data"]);
+  const primitiveIds = [
+    ...records.humanReads, ...records.agentJudgements, ...records.openItems,
+    ...records.agentExecutions, ...records.socialReactions, ...records.calibrations,
+  ].map((record) => record.id);
+  if (new Set(primitiveIds).size !== primitiveIds.length) {
+    throw new TypeError("Restored collaboration records contain duplicate IDs");
+  }
+  if (!records.humanReads.every((record) =>
+    isHumanReadReceipt(record) && messageIds.has(record.messageId)) ||
+      !records.agentJudgements.every((record) =>
+        isAgentJudgement(record) && messageIds.has(record.messageId)) ||
+      !records.openItems.every((record) =>
+        isOpenItem(record) && record.roomId === "preview-room" &&
+        messageIds.has(record.sourceMessageId)) ||
+      !records.agentExecutions.every((record) =>
+        isAgentExecution(record) && record.roomId === "preview-room" &&
+        messageIds.has(record.sourceMessageId)) ||
+      !records.socialReactions.every((record) =>
+        isSocialReaction(record) && messageIds.has(record.sourceMessageId)) ||
+      !records.calibrations.every((record) =>
+        isCalibrationSignal(record) && record.sourceMessageId === "preview-agent-data")) {
+    throw new TypeError("Restored collaboration records are invalid or unrelated to the preview");
+  }
+}
+
+export function renderM2PrimitivesPreview(
+  root: HTMLElement,
+  restored: RestoredPrimitivePreviewRecords = defaultRestoredPrimitiveRecords,
+): void {
+  validateRestoredPrimitiveRecords(restored);
   const preview = primitiveElement("main", "m2-primitives-preview");
   const heading = primitiveElement("h1", undefined, "原生人机协作 IM · 已验收原语预览");
   const timelineRoot = primitiveElement("div", "m2-primitives-timeline");
@@ -1016,18 +1226,27 @@ export function renderM2PrimitivesPreview(root: HTMLElement): void {
   ]);
 
   renderMessageTimeline(timelineRoot, messages, actorsById);
-  const humanMessage = timelineRoot.querySelector<HTMLElement>("[data-message-kind='human']");
-  const agentMessage = timelineRoot.querySelector<HTMLElement>("[data-message-kind='agent']");
-  if (humanMessage === null || agentMessage === null) {
+  const messageArticles = timelineRoot.querySelectorAll<HTMLElement>("[data-message-id]");
+  const messagesById = new Map<string, HTMLElement>();
+  for (const article of messageArticles) {
+    const messageId = article.dataset.messageId;
+    if (messageId === undefined || messagesById.has(messageId)) {
+      throw new TypeError("Primitive preview requires unique message targets");
+    }
+    messagesById.set(messageId, article);
+  }
+  const humanMessage = messagesById.get("preview-human-mention");
+  const agentMessage = messagesById.get("preview-agent-data");
+  if (humanMessage === undefined || agentMessage === undefined) {
     throw new Error("Primitive preview requires both message forms.");
   }
   const humanActions = primitiveElement("div", "message-actions message-actions--human");
   appendPrimitiveButton(humanActions, "编辑", "edit");
   appendPrimitiveButton(humanActions, "撤回", "recall");
   humanMessage.append(humanActions);
-  appendReceiptRecords(humanMessage, agentMessage);
-  appendAddressingPreview(timelineRoot);
-  appendReactionAndCorrectionPreview(timelineRoot);
+  appendReceiptRecords(messagesById, restored);
+  appendAddressingPreview(timelineRoot, restored);
+  appendReactionAndCorrectionPreview(timelineRoot, restored);
   preview.append(heading, timelineRoot);
   root.dataset.testid = "m2-primitives-review";
   root.setAttribute("aria-label", "已验收人机协作原语预览");

@@ -108,6 +108,10 @@ OutboxDispatcher ──► SubscriptionRegistry ──► clients
 - `CommandStore` 运行领域命令事务，维护事实、事件、幂等结果与 outbox 的原子性；
 - `SyncQueryStore` 提供权限感知的房间目录、历史、物化快照和增量读取。
 
+Task 6 经 owner 明确批准采用双实现过渡：新增 authoritative `RoomLifecycle` facade，八类 mutation 全部接收 authenticated human command context 并调用 `CommandStore`；actor/room/access/audit 查询调用 `SyncQueryStore` 的异步 `readActor`、`readRoom`、`canAccessRoom`、`readRoomAudit`。其中 `readActor` / `readRoom` 是仅供 server composition 与 authoritative lifecycle 使用的内部 point lookup，不是 public permission query；package root 不导出 raw `SyncQueryStore`、SQLite authority factory 或包含这两个方法的 worker client surface。`canAccessRoom` / `readRoomAudit` 才是 session-authenticated 查询，并在 AuthorityWorker 持有的同一 SQLite 读视图内重新验证 session、当前 membership 与 active room 状态。原 T-0039 JSON `RoomLifecycleService` 仅作为显式 compatibility adapter 保留，不能参与 authoritative MessageService、权威 mutation 或安全裁决；本过渡不提前修改 WebSocket adapter，也不实现 Task 7 outbox dispatcher。
+
+Task 6 的 package-root `WorkerDatabaseClient` 只保留启动、session 与权限感知 query 能力；`executeHuman`、`executeAgent`、`readActor`、`readRoom` 以及所有 fault-injection seam 都只存在于 server-internal 深模块。Agent command capability 由同一内部模块运行时铸造和验证，低层 client 验证成功后才生成可 structured-clone 的 plain wire context；外部 JSON 或结构相似对象不能直接进入 worker command handler。Invitation secret protector 同样只注入 SQLite authority facade，不进入 root client，也不由 raw transport 接收明文 token。
+
 业务服务不拼 SQL，不直接管理 SQLite transaction。Migration、legacy import 和故障注入都不是业务端口：前两者只在适配器启动期使用，故障注入只通过测试构造参数启用。
 
 ### 5.2 Worker 隔离与 `SqliteAuthoritativeStore`
@@ -115,6 +119,7 @@ OutboxDispatcher ──► SubscriptionRegistry ──► clients
 生产实现使用 `node:sqlite` 的 `DatabaseSync`，但 main thread 不运行任何 SQLite 调用。`WorkerDatabaseClient` 通过 worker message channel 暴露异步端口：
 
 - 单一 `AuthorityWorker` 独占 read-write authority connection；每个数据库路径只有一个 coordinator，所有领域写使用 `BEGIN IMMEDIATE`，事务保持短小且禁止网络 I/O；
+- `BEGIN IMMEDIATE` 的业务失败必须成功 `ROLLBACK` 后才能继续复用连接；若 rollback 本身失败，worker 立即关闭并 poison 该连接，当前请求、并发 pending 与后续调用共享同一个脱敏 `503 storage_unavailable` 终态错误。内部 `AggregateError` 保留原始业务错误与 rollback 错误供测试证明，但 SQL、路径和 secret 不得进入公开错误；coordinator reservation 只有在 `terminate()` 成功或收到明确 worker `exit` 后释放，terminate reject 且没有 exit 时继续锁定同一路径；
 - 单一 `SnapshotWorker` 用 read-only WAL connection 固定 authority 视图，同时把 canonical pages 写入独立的 `snapshot-cache.sqlite`；它不取得 authority write lock，因此完整扫描不会阻塞领域 writer，也不会阻塞 WebSocket heartbeat；
 - Snapshot build 全局一次只运行一个；room 请求以 `(principalId, sessionFamilyId, roomId, headSeq, accessRevision)`、catalog 请求以 `(principalId, sessionFamilyId, catalogRevision)` single-flight。只复用同一 session family 内、剩余 TTL 不少于 60 秒的已完成 snapshot。等待队列上限 16，超过返回 `429 snapshot_busy`；
 - Materialized snapshot TTL 固定 5 分钟，没有 complete/release 删除动作；多个消费者可在 TTL 内独立、幂等重读任意 page，一个消费者完成不会影响其他消费者。只有过期 manifest/pages 会被清理，启动时另清理未 COMMIT transaction。Streaming snapshot 使用 `snapshot.complete` 或失效条件释放 scoped barrier，不写入可复用 pages；
@@ -147,6 +152,8 @@ Snapshot cache 是可丢弃派生数据，不是权威存储；删除它只会�
 
 AuthorityWorker 负责设置上述安全 pragma。Snapshot cache connection 使用独立 WAL/FULL 配置；authority read-only connection 不尝试修改 `journal_mode`，只验证它已经是 WAL，否则拒绝启动 snapshot worker。`package.json` 的 Node engine 下限声明为 `>=22.13`；CI 必须覆盖该下限或更高的 Node 22 版本。
 
+Worker response error code 是 closed union，worker handler、数据库 handler 与 runtime parser 共用同一类型；HTTP-like status 使用穷举映射到 `400 | 401 | 403 | 404 | 409 | 503`。未知 code 不是可透传业务错误：client 必须终止 worker，并把它收敛成不含原 message 的稳定 `503 storage_unavailable`。
+
 ### 5.4 `SyncService`
 
 负责解析服务端游标、权限检查、增量分页、全量修复和 watermark。它不拥有事实状态，只从 `SyncQueryStore` 读取一致快照。
@@ -176,6 +183,8 @@ AuthorityWorker 负责设置上述安全 pragma。Snapshot cache connection 使�
 - `streams`、`events`、`idempotency_records`、`outbox_deliveries`
 
 所有外键和 kind 约束在数据库与 TypeScript closed-schema guard 两层校验。真人已读与 Agent 判定是两个表；待答项与 Agent 执行是两个表；校准信号不能伪装成普通 reaction。这些分离直接落实 PRD 第 2 章的原语分裂。
+
+v3 calibration 没有 canonical human actor/source Agent message 语义；v4 migration 不从旧 judgment 猜测其中任何一个字段，而是让 `source_message_id` 与 `actor_id` 同时保持 `NULL`，读取时标记为 legacy unknown。v4 之后的新写由 trigger 与启动 invariant 强制两个字段同时非空且关系正确。
 
 每个 human actor 维护 `catalog_revision`，每条 room membership 维护 `access_revision`。建房、重命名、真人加入/角色变化/移除和归档会在同一治理事务内递增所有受影响 human actor 的 catalog revision；成员自身的权限变化同时递增对应 access revision。Agent 配置和普通房间事实不改变 catalog，因为 catalog 不包含参与者列表或消息水位。Snapshot manifest 绑定这些 revision，用于在物化完成及每次发送前判断当前授权是否仍与固定视图一致。
 
@@ -213,7 +222,7 @@ AuthorityWorker 负责设置上述安全 pragma。Snapshot cache connection 使�
 
 `AgentJudgement.outcome` 必须复用 T-0012 verified 后的 canonical union；当前 delivered artifact 为 `will_respond | no_response_needed | suppressed`。三个 outcome 的 `reason` 都是非空必填字段，不只 suppressed 有原因。OpenItem、AgentExecution 和 CalibrationSignal 同样直接复用 T-0013/T-0014 verified 后的 canonical types；持久层只能增加 event ID/stream sequence 等 envelope 元数据，不能私自改 status 字面量或另造 renderer model。
 
-房间治理事件同样是 closed union：`room.created/renamed/archived`、`human.invitation.issued/accepted/rejected`、`human.role.changed`、`member.removed`、`agent.configured`。身份事件为 `identity.actor.registered`、`identity.session.issued/rotated/revoked` 和 `identity.room-access.changed`；最后一种只包含 room ID 与 `joined | updated | removed | archived`，用于让指定 actor 刷新房间目录，不携带消息历史。实现不得退回现有宽松的 `Event.type: string` 作为持久化边界。
+房间治理事件同样是 closed union：`room.created/renamed/archived`、`human.invitation.issued/accepted/rejected`、`human.role.changed`、`member.removed`、`agent.configured`。身份事件为 `identity.actor.registered`、`identity.session.issued/rotated/revoked` 和 `identity.room-access.changed`；最后一种只包含 room ID 与 `joined | updated | removed | archived`，用于让指定 actor 刷新房间目录，不携带消息历史。Agent configure 写 `joined | updated`、Agent remove 写 `removed` 并推进 Agent identity stream；由于 Agent 没有 principal observer，不创建空 principal delivery，但 business ACK 仍包含 identity event ID。实现不得退回现有宽松的 `Event.type: string` 作为持久化边界。
 
 这些类型分别落入独立领域表并以同名 event 同步，因此“已读/已判定”“待答项/Agent 执行”“社交 reaction/校准信号”在数据层和接口层都不共用类型。T-0040 不定义 T-0041 的工具调用参数、重试策略或 dead-letter，只冻结执行事实的持久 envelope。
 
@@ -253,7 +262,7 @@ type InternalAgentCommandContext = {
 
 `outbox_deliveries` 以 `(event_id, target_kind, target_id)` 为联合主键，保存 `target_kind: room | principal | session-family`、target ID、stream sequence、状态、attempt 次数和最近错误。同一事件可以有多个投递目标；一个领域命令也可以在同一事务内生成多个事件。
 
-Schema v2 已随持久化基础设施合入 `main`，其中 outbox 仍使用过渡字段 `destination`。该历史 migration 不再改写；Task 5 通过 schema v3 在单一外层事务中 rebuild/copy/rename 为上述闭合列，并以固定 v2 checksum、v2→v3 数据迁移测试和 v3 physical fingerprint 防止静默破坏已有 authority 数据库。
+Schema v2 已随持久化基础设施合入 `main`，其中 outbox 仍使用过渡字段 `destination`。该历史 migration 不再改写；Task 5 通过 schema v3 在单一外层事务中 rebuild/copy/rename 为上述闭合列，并以固定 v2 checksum、v2→v3 数据迁移测试和 v3 physical fingerprint 防止静默破坏已有 authority 数据库。Task 6 再新增 immutable schema v4，补齐 canonical `OpenItem`、`AgentExecution`、`CalibrationSignal` 所需列；Task 8 新增 immutable schema v5 的 scoped keyset indexes，服务 streaming 稀疏交错扫描。v1-v4 checksum 与 physical fingerprint 均保持不变，authority 当前最终版本为 v5。
 
 所有 accepted mutation 都在事务内更新领域表并写稳定 event。房间创建、重命名、真人成员加入/更新/移除或归档时，同一事务写一个 room event，并为每个受影响 actor 写独立 `identity.room-access.changed` event；各事件拥有自己的稳定 event ID。房间可见 event 写 room target；human 目录 event 写 principal target，Agent identity event 在没有 runtime observer 时只持久化、不制造空 delivery；正常 refresh 的 `identity.session.rotated` 由当前 ACK 返回新 token，只持久化而不创建 terminal delivery；显式 revoke 或 refresh replay 触发的 `identity.session.revoked` 才写 session-family target。纯 session issuance 同样没有提交后的远端观察者。需要 outbox 的命令，其领域写、多事件映射和全部 delivery rows 必须在同一事务完成。
 
@@ -500,7 +509,7 @@ type RoomSubscribeV2Retry = {
 
 ### 10.1 Schema migration
 
-`schema_migrations` 保存版本、名称、checksum 和应用时间。v1、已合入 `main` 的 v2 与当前 v3 都是 checksum 和 physical fingerprint 固定的不可变历史；任何后续结构变化必须新增版本，不能改写已有 migration。v1 fixture 包含身份、session、房间、成员、审计和消息等已有权威事实；v2 在一个 migration 中执行以下确定性步骤：
+`schema_migrations` 保存版本、名称、checksum 和应用时间。v1、已合入 `main` 的 v2、v3、v4 与当前 v5 都是 checksum 和 physical fingerprint 固定的不可变历史；任何后续结构变化必须新增版本，不能改写已有 migration。v1 fixture 包含身份、session、房间、成员、审计和消息等已有权威事实；v2 在一个 migration 中执行以下确定性步骤：
 
 1. 创建六类协作事实表、`streams`、`events`、`idempotency_records` 与 `outbox_deliveries`；
 2. 为 actor 增加非空 `catalog_revision`，为 membership 增加非空 `access_revision`，所有 v1 既有记录确定性初始化为 0；
@@ -510,9 +519,11 @@ type RoomSubscribeV2Retry = {
 
 v3 只重建 outbox envelope：把 v2 的 canonical `destination` 拆为 `target_kind / target_id`，从引用 event 复制 `stream_seq`，建立闭合 kind CHECK、`(event_id, target_kind, target_id)` 主键和 `(event_id, stream_seq)` 复合外键，然后删除旧表。无法映射的旧 target、非法状态或引用不一致会让整个 migration 回滚并保留原 v2 数据库。
 
-既有历史不伪造 event，v2 升级后的首次客户端恢复走 repair snapshot，新变更从 stream sequence 1 开始。新数据库按 v1 → v2 → v3 顺序创建；已有 v2 数据库只运行 v3，避免另写一套只用于空库的 schema。Derived `snapshot-cache.sqlite` 使用独立 schema version 1；它不参与 authority migration，版本不兼容时可以删除重建，因为客户端会重新 begin repair。
+v4 为 `open_items` 增加 requester、transfer chain 与 responded timestamp，为 `agent_executions` 增加 requester 与 tool name，为 `calibration_signals` 增加 source message 与 human actor。旧 calibration 行允许历史 `NULL`，读取时只能表示 legacy unknown，不能伪造 actor/source；v4 的 INSERT/UPDATE triggers 强制所有新 authoritative calibration write 的 actor/source 非空、actor 为 human、source 为同房间目标 Agent 的消息，且 signal 只能为 `👍` 或 `👎`。这些 triggers 纳入 v4 physical fingerprint 和启动校验。
 
-一次启动所需的完整升级链放在同一个外层事务中；任一 migration 失败则整条链回滚，数据库版本、表结构和原数据均保持启动前状态。服务拒绝以未知或未达到当前版本的 schema 启动。测试 fixture 同时覆盖 fresh/v1 → v2 → v3、已有 v2 → v3、未知 v2 target 的整笔回滚，以及人为注入失败后的表、版本和数据均保持原样。
+v5 只增加 streaming 所需 scoped keyset indexes，不改写领域事实；新数据库按 v1 → v2 → v3 → v4 → v5 顺序创建，已有 v4 数据库只运行 v5。既有历史不伪造 event，升级后的首次客户端恢复走 repair snapshot，新变更从 stream sequence 1 开始。Derived `snapshot-cache.sqlite` 使用独立 schema version 1；它不参与 authority migration，版本不兼容时可以删除重建，因为客户端会重新 begin repair。
+
+一次启动所需的完整升级链放在同一个外层事务中；任一 migration 失败则整条链回滚，数据库版本、表结构和原数据均保持启动前状态。服务拒绝以未知、未来或未达到当前 v5 的 schema 启动。测试 fixture 覆盖 fresh v1 → v2 → v3 → v4 → v5、带历史事实的 v1 → current、已有 v2 → v3 → v4 → v5、已有 v3 legacy-unknown calibration → v4 → v5 与已有 v4 → v5；未知/未来版本拒绝、无法映射的 v2 outbox target、注入的 v2 失败和最终完整性检查失败分别证明整笔回滚且原表、版本、数据不变。
 
 ### 10.2 T-0039 legacy import
 
@@ -533,6 +544,7 @@ v3 只重建 outbox envelope：把 v2 的 canonical `destination` 拆为 `target
 - `403 room_forbidden`：当前 principal 没有房间权限；
 - `403 snapshot_forbidden`：snapshot 属于其他 principal 或 session family；不得透露 snapshot 内容或绑定主体；
 - `409 idempotency_conflict`：同 key 对应不同 canonical 请求；
+- `409 room_compaction_blocked`：compaction cutoff 之前仍有 non-dispatched outbox delivery；该请求以 request-level 错误失败，事务零更新、零删除，worker client 保持非终态并可继续处理后续请求；
 - `409 snapshot_stale`：catalog/access revision 已变化，客户端丢弃 staging 并重新 begin；
 - `410 snapshot_expired`：durable snapshot 已超过 TTL，客户端必须丢弃 staging 并重新 begin；
 - `429 snapshot_busy`：snapshot build 队列已满，客户端按服务端 retry hint 重试；

@@ -5,6 +5,7 @@ import {
   isAgentRoomMembership,
   isCalibrationSignal,
   isHumanReadReceipt,
+  isRoomCursor,
   isHumanRoomMembership,
   isMessage,
   isOpenItem,
@@ -13,19 +14,205 @@ import type {
   AgentExecutionStatus,
   AgentJudgementOutcome,
   AgentParticipation,
+  Actor,
+  ManagedRoom,
   Message,
   MessageDraft,
   PersistedIdentityEvent,
   PersistedRoomEvent,
+  RoomRepairPage,
   RoomSyncRequest,
   RoomSyncResult,
+  WorkspaceBootstrapPage,
+  SnapshotVersion,
 } from "@native-im/core";
+
+export const SNAPSHOT_REQUEST_ID_MAX_BYTES = 128;
 import type { AuthenticatedPrincipal } from "../auth.js";
+import type { RoomAuditRecord } from "../room-lifecycle.js";
 
 export interface AuthenticatedSessionContext {
   readonly sessionId: string;
   readonly sessionFamilyId: string;
   readonly principal: AuthenticatedPrincipal;
+}
+
+export type RepairScope =
+  | { readonly kind: "room"; readonly roomId: string }
+  | { readonly kind: "catalog"; readonly principalId: string };
+
+export interface StreamingRepairLease {
+  readonly snapshotId: string;
+  readonly principalId: string;
+  readonly accountId: string;
+  readonly sessionFamilyId: string;
+  readonly scope: RepairScope;
+  readonly version: SnapshotVersion;
+  readonly authorizationRevision: number;
+  readonly checksum?: string;
+  readonly pageCount?: number;
+  readonly lastPage?: number;
+  readonly highestAuthorizedPage?: number;
+  readonly idleExpiresAt: string;
+}
+
+export type MaterializedSnapshotManifest = {
+  readonly snapshotId: string;
+  readonly principalId: string;
+  readonly sessionFamilyId: string;
+  readonly checksum: string;
+  readonly pageCount: number;
+  readonly expiresAt: string;
+} & (
+  | {
+      readonly kind: "room";
+      readonly roomId: string;
+      readonly accessRevision: number;
+      readonly watermark: number;
+    }
+  | { readonly kind: "catalog"; readonly catalogRevision: number }
+);
+
+export type SnapshotRevalidationRequest =
+  | {
+      readonly kind: "room";
+      readonly context: AuthenticatedSessionContext;
+      readonly roomId: string;
+      readonly accessRevision: number;
+    }
+  | {
+      readonly kind: "catalog";
+      readonly context: AuthenticatedSessionContext;
+      readonly catalogRevision: number;
+    };
+
+export type SnapshotMaterializedPage = RoomRepairPage | WorkspaceBootstrapPage;
+export type StreamingSnapshotManifest = {
+  readonly snapshotId: string;
+  readonly principalId: string;
+  readonly sessionFamilyId: string;
+  readonly checksum: string;
+  readonly pageCount: number;
+} & (
+  | {
+      readonly kind: "room";
+      readonly roomId: string;
+      readonly accessRevision: number;
+      readonly watermark: number;
+    }
+  | { readonly kind: "catalog"; readonly catalogRevision: number }
+);
+export type SnapshotFallbackReason = "quota" | "deadline" | "wal-growth";
+
+export type SnapshotWorkerRequest =
+  | { readonly type: "snapshot.initialize"; readonly requestId: string }
+  | {
+      readonly type: "snapshot.begin-room";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly responseRequestId: string;
+      readonly roomId: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "snapshot.begin-catalog";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly responseRequestId: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "snapshot.read-page";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly responseRequestId: string;
+      readonly snapshotId: string;
+      readonly afterPage: number;
+      readonly now: number;
+    }
+  | {
+      readonly type: "snapshot.begin-streaming";
+      readonly requestId: string;
+      readonly lease: StreamingRepairLease;
+      readonly responseRequestId: string;
+    }
+  | {
+      readonly type: "snapshot.read-streaming-page";
+      readonly requestId: string;
+      readonly lease: StreamingRepairLease;
+      readonly responseRequestId: string;
+      readonly afterPage: number;
+    }
+  | {
+      readonly type: "snapshot.release-streaming";
+      readonly requestId: string;
+      readonly snapshotId: string;
+    }
+  | {
+      readonly type: "snapshot.invalidate";
+      readonly requestId: string;
+      readonly snapshotId: string;
+    }
+  | { readonly type: "snapshot.cache-count"; readonly requestId: string }
+  | { readonly type: "snapshot.full-validation-count"; readonly requestId: string }
+  | { readonly type: "snapshot.close"; readonly requestId: string };
+
+export type SnapshotWorkerErrorCode =
+  | "invalid_request"
+  | "invalid_token"
+  | "token_expired"
+  | "session_revoked"
+  | "snapshot_family_revoked"
+  | "snapshot_expired"
+  | "snapshot_forbidden"
+  | "snapshot_not_found"
+  | "snapshot_stale"
+  | "room_archived"
+  | "room_forbidden"
+  | "room_not_found"
+  | "storage_unavailable";
+
+export type SnapshotWorkerResponse =
+  | { readonly type: "snapshot.ready"; readonly requestId: string }
+  | {
+      readonly type: "snapshot.page";
+      readonly requestId: string;
+      readonly page: SnapshotMaterializedPage;
+      readonly manifest: MaterializedSnapshotManifest;
+    }
+  | {
+      readonly type: "snapshot.fallback";
+      readonly requestId: string;
+      readonly reason: SnapshotFallbackReason;
+    }
+  | {
+      readonly type: "snapshot.streaming-page";
+      readonly requestId: string;
+      readonly page: SnapshotMaterializedPage;
+      readonly manifest: StreamingSnapshotManifest;
+    }
+  | {
+      readonly type: "snapshot.cache-count";
+      readonly requestId: string;
+      readonly count: number;
+    }
+  | {
+      readonly type: "snapshot.full-validation-count";
+      readonly requestId: string;
+      readonly count: number;
+    }
+  | { readonly type: "snapshot.invalidated"; readonly requestId: string }
+  | { readonly type: "snapshot.streaming-released"; readonly requestId: string }
+  | { readonly type: "snapshot.closed"; readonly requestId: string }
+  | {
+      readonly type: "snapshot.error";
+      readonly requestId: string;
+      readonly code: SnapshotWorkerErrorCode;
+      readonly message: string;
+    };
+
+export interface SnapshotRevalidationStore {
+  revalidateSnapshot(validation: SnapshotRevalidationRequest): Promise<void>;
 }
 
 export interface HashedSessionIssue {
@@ -82,7 +269,8 @@ export interface AgentPrincipal {
   readonly kind: "agent";
 }
 
-declare const internalCommandAuthority: unique symbol;
+const internalCommandAuthority: unique symbol = Symbol("internal-agent-command-authority");
+const internalAgentCommandContexts = new WeakSet<object>();
 
 export interface InternalAgentCommandContext {
   readonly kind: "agent";
@@ -90,6 +278,73 @@ export interface InternalAgentCommandContext {
   readonly agent: AgentPrincipal;
   readonly requestId: string;
   readonly idempotencyKey: string;
+}
+
+export interface AgentWorkerCommandContext {
+  readonly kind: "agent";
+  readonly agent: AgentPrincipal;
+  readonly requestId: string;
+  readonly idempotencyKey: string;
+}
+
+export interface InternalAgentCommandContextInput {
+  readonly agentId: string;
+  readonly requestId: string;
+  readonly idempotencyKey: string;
+}
+
+class AgentCapabilityForbiddenError extends Error {
+  readonly status = 403 as const;
+  readonly code = "agent_capability_forbidden" as const;
+
+  constructor() {
+    super("agent_capability_forbidden");
+    this.name = "AgentCapabilityForbiddenError";
+  }
+}
+
+export function mintInternalAgentCommandContext(
+  input: InternalAgentCommandContextInput,
+): InternalAgentCommandContext {
+  if (
+    typeof input.agentId !== "string" ||
+    input.agentId.trim().length === 0 ||
+    typeof input.requestId !== "string" ||
+    input.requestId.trim().length === 0 ||
+    typeof input.idempotencyKey !== "string" ||
+    input.idempotencyKey.trim().length === 0
+  ) {
+    throw new TypeError("Internal Agent command context fields must be non-empty");
+  }
+  const context: InternalAgentCommandContext = Object.freeze({
+    kind: "agent",
+    [internalCommandAuthority]: true as const,
+    agent: Object.freeze({ actorId: input.agentId, kind: "agent" }),
+    requestId: input.requestId,
+    idempotencyKey: input.idempotencyKey,
+  });
+  internalAgentCommandContexts.add(context);
+  return context;
+}
+
+export function isInternalAgentCommandContext(
+  value: unknown,
+): value is InternalAgentCommandContext {
+  return typeof value === "object" && value !== null && internalAgentCommandContexts.has(value);
+}
+
+export function toAgentWorkerCommandContext(
+  context: InternalAgentCommandContext,
+): AgentWorkerCommandContext {
+  if (!isInternalAgentCommandContext(context)) {
+    throw new AgentCapabilityForbiddenError();
+  }
+  return Object.freeze({
+    kind: "agent",
+    agent: Object.freeze({ ...context.agent }),
+    requestId: context.requestId,
+    idempotencyKey: context.idempotencyKey,
+  });
 }
 
 type CommandActorFreePayload = {
@@ -214,14 +469,48 @@ export interface CommandAcknowledgement {
   readonly result: JsonValue;
 }
 
-export interface OutboxDelivery {
+interface OutboxDeliveryBase {
   readonly deliveryId: string;
   readonly eventId: string;
-  readonly targetKind: "room" | "principal" | "session-family";
   readonly targetId: string;
   readonly streamSeq: number;
   readonly attempts: number;
 }
+
+type PersistedSessionRevokedEvent = PersistedIdentityEvent & {
+  readonly type: "identity.session.revoked";
+};
+
+type PersistedRoomAccessChangedEvent = PersistedIdentityEvent & {
+  readonly type: "identity.room-access.changed";
+};
+
+export type OutboxDelivery =
+  | (OutboxDeliveryBase & {
+      readonly targetKind: "room";
+      readonly event: PersistedRoomEvent;
+    })
+  | (OutboxDeliveryBase & {
+      readonly targetKind: "principal";
+      readonly event: PersistedRoomAccessChangedEvent;
+    })
+  | (OutboxDeliveryBase & {
+      readonly targetKind: "session-family";
+      readonly event: PersistedSessionRevokedEvent;
+    });
+
+export interface OutboxDispatchCandidate {
+  readonly connectionId: string;
+  readonly principal: AuthenticatedPrincipal;
+  readonly sessionId: string;
+  readonly sessionFamilyId: string;
+  readonly credentialGeneration: number;
+}
+
+export type OutboxDeliveryFailureReason =
+  | "closed"
+  | "backpressure"
+  | "send_rejected";
 
 export interface CommandStore {
   executeHuman(
@@ -237,9 +526,28 @@ export interface CommandStore {
 export interface SyncQueryStore {
   syncRoom(context: AuthenticatedSessionContext, request: RoomSyncRequest): Promise<RoomSyncResult>;
   readHistory(context: AuthenticatedSessionContext, roomId: string): Promise<readonly Message[]>;
+  readActor(actorId: string): Promise<Actor | undefined>;
+  readRoom(roomId: string): Promise<ManagedRoom | undefined>;
+  canAccessRoom(context: AuthenticatedSessionContext, roomId: string): Promise<boolean>;
+  readRoomAudit(
+    context: AuthenticatedSessionContext,
+    roomId: string,
+  ): Promise<readonly RoomAuditRecord[]>;
   listPendingOutbox(limit: number): Promise<readonly OutboxDelivery[]>;
+  authorizeOutboxCandidate(
+    delivery: OutboxDelivery,
+    candidate: OutboxDispatchCandidate,
+  ): Promise<boolean>;
   markOutboxDispatched(deliveryId: string): Promise<void>;
+  markOutboxFailed(
+    deliveryId: string,
+    reason: OutboxDeliveryFailureReason,
+  ): Promise<void>;
 }
+
+export const ROOM_SYNC_DEFAULT_LIMIT = 100;
+export const ROOM_SYNC_MAX_LIMIT = 1_000;
+export const ROOM_SYNC_MAX_PAGE_BYTES = 256 * 1_024;
 
 export type ContractParseResult<T, TCode extends string> =
   | { readonly ok: true; readonly value: T }
@@ -266,6 +574,30 @@ function count(value: unknown, minimum = 0): value is number {
 
 function stringList(value: unknown): value is readonly string[] {
   return Array.isArray(value) && value.length > 0 && value.every(text) && new Set(value).size === value.length;
+}
+
+export function parseRoomSyncRequest(
+  value: unknown,
+): ContractParseResult<RoomSyncRequest, "invalid_request"> {
+  if (!isRecord(value)) {
+    return { ok: false, code: "invalid_request" };
+  }
+  const optional = [
+    ...(Object.hasOwn(value, "cursor") ? ["cursor"] : []),
+    ...(Object.hasOwn(value, "limit") ? ["limit"] : []),
+  ];
+  if (
+    !exact(value, ["type", "requestId", "roomId"], optional) ||
+    value.type !== "room.sync" ||
+    !text(value.requestId) ||
+    !text(value.roomId) ||
+    (Object.hasOwn(value, "cursor") && !isRoomCursor(value.cursor)) ||
+    (Object.hasOwn(value, "limit") &&
+      (!count(value.limit, 1) || value.limit > ROOM_SYNC_MAX_LIMIT))
+  ) {
+    return { ok: false, code: "invalid_request" };
+  }
+  return { ok: true, value: value as unknown as RoomSyncRequest };
 }
 
 function messageDraft(value: unknown, roomId: string): value is MessageDraft {

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -11,7 +11,18 @@ import {
   type IdentityAdapter,
   type LoginCredentials,
 } from "../auth.js";
+import { createAesGcmInvitationSecretProtector } from "../invitation-secret-protector.js";
 import { createSqliteAuthoritativeStore } from "./sqlite-authoritative-store.js";
+import {
+  mintInternalAgentCommandContext,
+  type AgentCollaborationCommand,
+  type AuthenticatedCommandContext,
+  type CommandAcknowledgement,
+  type CommandStore,
+  type HumanCollaborationCommand,
+  type RoomGovernanceCommand,
+} from "./contracts.js";
+import { migrateAuthorityDatabase } from "./schema.js";
 import { createWorkerDatabaseClient } from "./worker-database-client.js";
 import { isAuthorityWorkerRequest } from "./worker-protocol.js";
 
@@ -69,6 +80,434 @@ const identities: IdentityAdapter = {
   },
 };
 
+const invitationActors = [
+  ...actors,
+  {
+    id: "human-chen",
+    kind: "human",
+    displayName: "Chen",
+    reachability: "online",
+  },
+] as const satisfies readonly Actor[];
+
+const invitationActorDirectory = {
+  getActor(actorId: string): Actor | undefined {
+    return invitationActors.find((actor) => actor.id === actorId);
+  },
+};
+
+const invitationIdentities: IdentityAdapter = {
+  async verify(credentials: LoginCredentials) {
+    if (credentials.secret !== "correct") {
+      return undefined;
+    }
+    if (credentials.accountId === "account-li") {
+      return { accountId: "account-li", actorId: "human-li" };
+    }
+    if (credentials.accountId === "account-chen") {
+      return { accountId: "account-chen", actorId: "human-chen" };
+    }
+    return undefined;
+  },
+};
+
+const messageCommand = {
+  type: "message.send",
+  roomId: "room-command",
+  payload: {
+    id: "message-command",
+    roomId: "room-command",
+    body: "persist exactly once",
+    sentAt: "2026-08-10T12:00:00.000Z",
+  },
+} as const;
+
+async function createHumanCommandFixture(databasePath: string) {
+  const bootstrapClient = await createWorkerDatabaseClient({ databasePath });
+  const bootstrapAuthority = createSqliteAuthoritativeStore(bootstrapClient);
+  await bootstrapAuthority.registerActors(actors);
+  const auth = createAuthenticationService({
+    actors: actorDirectory,
+    identities,
+    authority: bootstrapAuthority,
+    clock: () => 1_000,
+    tokenFactory: tokenSequence("command-access-token", "command-refresh-token"),
+  });
+  const issued = await auth.login({ accountId: "account-li", secret: "correct" });
+  const session = await auth.authenticateSession(issued.accessToken);
+  await bootstrapClient.close();
+
+  const database = new DatabaseSync(databasePath);
+  migrateAuthorityDatabase(database);
+  database.exec(`
+    INSERT INTO rooms (id, name, status, created_at)
+    VALUES ('room-command', 'Command Room', 'active', '2026-08-10T11:00:00.000Z');
+    INSERT INTO room_memberships (
+      room_id, actor_id, kind, role, participation, tool_permissions_json,
+      joined_at, configured_at, access_revision
+    ) VALUES (
+      'room-command', 'human-li', 'human', 'owner', NULL, '[]',
+      '2026-08-10T11:00:00.000Z', NULL, 0
+    );
+    INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+    VALUES ('room', 'room-command', 0, 1);
+  `);
+  database.close();
+
+  const client = await createWorkerDatabaseClient({ databasePath });
+  const authority = createSqliteAuthoritativeStore(client, { clock: () => 2_000 });
+  return {
+    authority,
+    client,
+    context: {
+      ...session,
+      kind: "human" as const,
+      requestId: "message-request-first",
+      idempotencyKey: "message-idempotency-key",
+    },
+  };
+}
+
+async function createRoomGovernanceFixture(databasePath: string) {
+  const client = await createWorkerDatabaseClient({ databasePath });
+  const authority = createSqliteAuthoritativeStore(client, { clock: () => 2_000 });
+  await authority.registerActors(actors);
+  const auth = createAuthenticationService({
+    actors: actorDirectory,
+    identities,
+    authority,
+    clock: () => 1_000,
+    tokenFactory: tokenSequence("governance-access", "governance-refresh"),
+  });
+  const issued = await auth.login({ accountId: "account-li", secret: "correct" });
+  const session = await auth.authenticateSession(issued.accessToken);
+  const context = {
+    ...session,
+    kind: "human" as const,
+    requestId: "governance-setup-request",
+    idempotencyKey: "governance-setup-room",
+  };
+  const created = await authority.executeHuman(
+    context,
+    { type: "room.create", payload: { name: "Governance" } },
+  );
+  return {
+    authority,
+    client,
+    context,
+    roomId: created.aggregateId,
+  };
+}
+
+async function createAgentFactFixture(databasePath: string) {
+  const bootstrapClient = await createWorkerDatabaseClient({ databasePath });
+  const bootstrapAuthority = createSqliteAuthoritativeStore(bootstrapClient);
+  await bootstrapAuthority.registerActors(actors);
+  const auth = createAuthenticationService({
+    actors: actorDirectory,
+    identities,
+    authority: bootstrapAuthority,
+    clock: () => 1_000,
+    tokenFactory: tokenSequence("facts-access", "facts-refresh"),
+  });
+  const issued = await auth.login({ accountId: "account-li", secret: "correct" });
+  const humanSession = await auth.authenticateSession(issued.accessToken);
+  await bootstrapClient.close();
+
+  const database = new DatabaseSync(databasePath);
+  migrateAuthorityDatabase(database);
+  database.exec(`
+    INSERT INTO rooms (id, name, status, created_at)
+    VALUES ('room-facts', 'Facts', 'active', '2026-08-10T13:00:00.000Z');
+    INSERT INTO room_memberships (
+      room_id, actor_id, kind, role, participation, tool_permissions_json,
+      joined_at, configured_at, access_revision
+    ) VALUES
+      ('room-facts', 'human-li', 'human', 'owner', NULL, '[]',
+       '2026-08-10T13:00:00.000Z', NULL, 0),
+      ('room-facts', 'agent-review', 'agent', NULL, 'active', '["review.read"]',
+       NULL, '2026-08-10T13:00:00.000Z', 1);
+    INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+    VALUES ('room', 'room-facts', 0, 1);
+    INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+    VALUES
+      ('message-human-source', 'room-facts', 'human-li', 'human', 'please review',
+       '2026-08-10T13:01:00.000Z'),
+      ('message-agent-source', 'room-facts', 'agent-review', 'agent', 'review complete',
+       '2026-08-10T13:02:00.000Z');
+  `);
+  database.close();
+
+  const client = await createWorkerDatabaseClient({ databasePath });
+  const authority = createSqliteAuthoritativeStore(client, { clock: () => 3_000 });
+  return {
+    authority,
+    client,
+    humanContext: {
+      ...humanSession,
+      kind: "human" as const,
+      requestId: "facts-human-request",
+      idempotencyKey: "facts-human-key",
+    },
+  };
+}
+
+function readMessageCommandCounts(databasePath: string): {
+  readonly messages: number;
+  readonly events: number;
+  readonly outbox: number;
+  readonly idempotency: number;
+} {
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    return {
+      messages: Number(database.prepare("SELECT COUNT(*) AS count FROM messages").get()?.count),
+      events: Number(
+        database
+          .prepare("SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.message.accepted'")
+          .get()?.count,
+      ),
+      outbox: Number(
+        database
+          .prepare("SELECT COUNT(*) AS count FROM outbox_deliveries WHERE target_kind = 'room'")
+          .get()?.count,
+      ),
+      idempotency: Number(
+        database.prepare("SELECT COUNT(*) AS count FROM idempotency_records").get()?.count,
+      ),
+    };
+  } finally {
+    database.close();
+  }
+}
+
+function invitationTokenFrom(acknowledgement: {
+  readonly result: unknown;
+}): string {
+  const result = acknowledgement.result as {
+    readonly invitation?: { readonly token?: unknown };
+  };
+  if (typeof result.invitation?.token !== "string") {
+    throw new Error("invitation token missing from acknowledgement");
+  }
+  return result.invitation.token;
+}
+
+const matrixActors = [
+  ...invitationActors,
+  {
+    id: "human-invitee",
+    kind: "human",
+    displayName: "Invitee",
+    reachability: "online",
+  },
+  {
+    id: "human-alternate",
+    kind: "human",
+    displayName: "Alternate",
+    reachability: "online",
+  },
+] as const satisfies readonly Actor[];
+
+const matrixActorDirectory = {
+  getActor(actorId: string): Actor | undefined {
+    return matrixActors.find((actor) => actor.id === actorId);
+  },
+};
+
+const matrixIdentities: IdentityAdapter = {
+  async verify(credentials: LoginCredentials) {
+    if (credentials.secret !== "correct") return undefined;
+    if (credentials.accountId === "account-li") {
+      return { accountId: "account-li", actorId: "human-li" };
+    }
+    if (credentials.accountId === "account-invitee") {
+      return { accountId: "account-invitee", actorId: "human-invitee" };
+    }
+    return undefined;
+  },
+};
+
+interface MatrixContexts {
+  readonly roomId: string;
+  readonly owner: AuthenticatedCommandContext;
+  readonly invitee: AuthenticatedCommandContext;
+}
+
+interface CommandMatrixCase {
+  readonly label: string;
+  readonly eventType: string;
+  readonly factSql: string;
+  readonly factCount?: number;
+  readonly deliveryTargets: readonly ("room" | "principal" | null)[];
+  execute(
+    store: CommandStore,
+    contexts: MatrixContexts,
+    variant: "exact" | "changed",
+    requestSuffix: string,
+  ): Promise<CommandAcknowledgement>;
+}
+
+function humanMatrixCase(
+  label: string,
+  eventType: string,
+  factSql: string,
+  command: (contexts: MatrixContexts) => HumanCollaborationCommand | RoomGovernanceCommand,
+  changed: (contexts: MatrixContexts) => HumanCollaborationCommand | RoomGovernanceCommand,
+  actor: "owner" | "invitee" = "owner",
+  factCount = 1,
+  deliveryTargets: readonly ("room" | "principal" | null)[] = ["room"],
+): CommandMatrixCase {
+  return {
+    label,
+    eventType,
+    factSql,
+    factCount,
+    deliveryTargets,
+    execute(store, contexts, variant, requestSuffix) {
+      const context = contexts[actor];
+      return store.executeHuman(
+        { ...context, requestId: `${label}-${requestSuffix}`, idempotencyKey: `${label}-matrix-key` },
+        variant === "exact" ? command(contexts) : changed(contexts),
+      );
+    },
+  };
+}
+
+function agentMatrixCase(
+  label: string,
+  eventType: string,
+  factSql: string,
+  command: (contexts: MatrixContexts) => AgentCollaborationCommand,
+  changed: (contexts: MatrixContexts) => AgentCollaborationCommand,
+): CommandMatrixCase {
+  return {
+    label,
+    eventType,
+    factSql,
+    deliveryTargets: ["room"],
+    execute(store, contexts, variant, requestSuffix) {
+      return store.executeAgent(
+        mintInternalAgentCommandContext({
+          agentId: "agent-review",
+          requestId: `${label}-${requestSuffix}`,
+          idempotencyKey: `${label}-matrix-key`,
+        }),
+        variant === "exact" ? command(contexts) : changed(contexts),
+      );
+    },
+  };
+}
+
+async function createCommandMatrixFixture(databasePath: string): Promise<{
+  readonly store: ReturnType<typeof createSqliteAuthoritativeStore>;
+  readonly client: Awaited<ReturnType<typeof createWorkerDatabaseClient>>;
+  readonly contexts: MatrixContexts;
+}> {
+  const bootstrapClient = await createWorkerDatabaseClient({ databasePath });
+  const bootstrapStore = createSqliteAuthoritativeStore(bootstrapClient);
+  await bootstrapStore.registerActors(matrixActors);
+  const authentication = createAuthenticationService({
+    actors: matrixActorDirectory,
+    identities: matrixIdentities,
+    authority: bootstrapStore,
+    clock: () => 1_000,
+    tokenFactory: tokenSequence(
+      "matrix-owner-access", "matrix-owner-refresh",
+      "matrix-invitee-access", "matrix-invitee-refresh",
+    ),
+  });
+  const ownerIssued = await authentication.login({ accountId: "account-li", secret: "correct" });
+  const inviteeIssued = await authentication.login({ accountId: "account-invitee", secret: "correct" });
+  const ownerSession = await authentication.authenticateSession(ownerIssued.accessToken);
+  const inviteeSession = await authentication.authenticateSession(inviteeIssued.accessToken);
+  await bootstrapClient.close();
+
+  const database = new DatabaseSync(databasePath);
+  database.exec(`
+    INSERT INTO rooms (id, name, status, created_at)
+    VALUES ('room-matrix', 'Matrix Room', 'active', '2026-08-10T14:00:00.000Z');
+    INSERT INTO room_memberships (
+      room_id, actor_id, kind, role, participation, tool_permissions_json,
+      joined_at, configured_at, access_revision
+    ) VALUES
+      ('room-matrix', 'human-li', 'human', 'owner', NULL, '[]',
+       '2026-08-10T14:00:00.000Z', NULL, 0),
+      ('room-matrix', 'human-chen', 'human', 'member', NULL, '[]',
+       '2026-08-10T14:00:00.000Z', NULL, 0),
+      ('room-matrix', 'agent-review', 'agent', NULL, 'active', '["review.read"]',
+       NULL, '2026-08-10T14:00:00.000Z', 1);
+    INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+    VALUES ('room', 'room-matrix', 0, 1);
+    INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+    VALUES
+      ('matrix-human-source', 'room-matrix', 'human-li', 'human', 'please review',
+       '2026-08-10T14:01:00.000Z'),
+      ('matrix-agent-source', 'room-matrix', 'agent-review', 'agent', 'review complete',
+       '2026-08-10T14:02:00.000Z');
+    INSERT INTO room_invitations (
+      id, room_id, inviter_actor_id, invitee_actor_id, token_hash, status,
+      created_at, decision_actor_id, decided_at
+    ) VALUES (
+      'matrix-decision-invitation', 'room-matrix', 'human-li', 'human-invitee',
+      '${tokenHash("matrix-decision-token")}', 'pending',
+      '2026-08-10T14:03:00.000Z', NULL, NULL
+    );
+    INSERT INTO open_items (
+      id, room_id, source_message_id, assigned_actor_id, status, body,
+      created_at, resolved_at, requester_actor_id, transfer_chain_json, responded_at
+    ) VALUES (
+      'matrix-open-existing', 'room-matrix', 'matrix-human-source', 'agent-review',
+      'pending_response', 'respond to this', '2026-08-10T14:04:00.000Z', NULL,
+      'human-li', '[]', NULL
+    );
+  `);
+  database.close();
+
+  const client = await createWorkerDatabaseClient({ databasePath });
+  const store = createSqliteAuthoritativeStore(client, {
+    clock: () => 5_000,
+    invitationSecretProtector: createAesGcmInvitationSecretProtector(new Uint8Array(32).fill(47)),
+    invitationTokenFactory: () => "matrix-issued-token",
+  });
+  return {
+    store,
+    client,
+    contexts: {
+      roomId: "room-matrix",
+      owner: {
+        ...ownerSession,
+        kind: "human",
+        requestId: "matrix-owner",
+        idempotencyKey: "matrix-owner",
+      },
+      invitee: {
+        ...inviteeSession,
+        kind: "human",
+        requestId: "matrix-invitee",
+        idempotencyKey: "matrix-invitee",
+      },
+    },
+  };
+}
+
+function authoritativeCountSnapshot(databasePath: string): Readonly<Record<string, number>> {
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    const tables = [
+      "rooms", "room_memberships", "room_invitations", "room_audit", "messages",
+      "human_read_receipts", "agent_judgments", "open_items", "agent_executions",
+      "calibration_signals", "events", "outbox_deliveries", "idempotency_records",
+    ] as const;
+    return Object.fromEntries(tables.map((table) => [
+      table,
+      Number(database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get()?.count),
+    ]));
+  } finally {
+    database.close();
+  }
+}
+
 describe("SQLite authoritative sessions", () => {
   const temporaryDirectories: string[] = [];
 
@@ -78,6 +517,1768 @@ describe("SQLite authoritative sessions", () => {
         rm(directory, { recursive: true, force: true }),
       ),
     );
+  });
+
+  it("persists a room.create command through the authoritative worker", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-room-command-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const client = await createWorkerDatabaseClient({ databasePath });
+    const authority = createSqliteAuthoritativeStore(client, { clock: () => 2_000 });
+    await authority.registerActors(actors);
+    const auth = createAuthenticationService({
+      actors: actorDirectory,
+      identities,
+      authority,
+      clock: () => 1_000,
+      tokenFactory: tokenSequence("command-access", "command-refresh"),
+    });
+    const issued = await auth.login({ accountId: "account-li", secret: "correct" });
+    const session = await auth.authenticateSession(issued.accessToken);
+
+    const acknowledgement = await authority.executeHuman(
+      {
+        ...session,
+        kind: "human",
+        requestId: "request-create-room",
+        idempotencyKey: "create-room-once",
+      },
+      { type: "room.create", payload: { name: "Persistence" } },
+    );
+
+    expect(acknowledgement.aggregateId).toEqual(expect.any(String));
+    expect(acknowledgement.eventIds).toHaveLength(2);
+    await client.close();
+  });
+
+  describe("message.send shared idempotency", () => {
+    it("returns one stable acknowledgement for sequential exact replay", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-message-sequential-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createHumanCommandFixture(databasePath);
+
+      const first = await fixture.authority.executeHuman(fixture.context, messageCommand);
+      const replay = await fixture.authority.executeHuman(
+        {
+          ...fixture.context,
+          requestId: "message-request-replay",
+          idempotencyKey: "different-transport-key",
+        },
+        messageCommand,
+      );
+
+      expect(replay).toEqual(first);
+      expect(first).toMatchObject({
+        aggregateId: "message-command",
+        eventIds: [expect.any(String)],
+      });
+      await fixture.client.close();
+      expect(readMessageCommandCounts(databasePath)).toEqual({
+        messages: 1,
+        events: 1,
+        outbox: 1,
+        idempotency: 1,
+      });
+    });
+
+    it("serializes concurrent exact replay to one fact and event", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-message-concurrent-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createHumanCommandFixture(databasePath);
+
+      const [first, replay] = await Promise.all([
+        fixture.authority.executeHuman(fixture.context, messageCommand),
+        fixture.authority.executeHuman(
+          { ...fixture.context, requestId: "message-request-concurrent" },
+          messageCommand,
+        ),
+      ]);
+
+      expect(replay).toEqual(first);
+      await fixture.client.close();
+      expect(readMessageCommandCounts(databasePath)).toEqual({
+        messages: 1,
+        events: 1,
+        outbox: 1,
+        idempotency: 1,
+      });
+    });
+
+    it("rejects a changed canonical payload without changing counts", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-message-conflict-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createHumanCommandFixture(databasePath);
+      await fixture.authority.executeHuman(fixture.context, messageCommand);
+
+      await expect(
+        fixture.authority.executeHuman(
+          {
+            ...fixture.context,
+            requestId: "message-request-conflict",
+            idempotencyKey: "changed-transport-key",
+          },
+          {
+            ...messageCommand,
+            payload: { ...messageCommand.payload, body: "changed payload" },
+          },
+        ),
+      ).rejects.toMatchObject({ status: 409, code: "idempotency_conflict" });
+
+      await fixture.client.close();
+      expect(readMessageCommandCounts(databasePath)).toEqual({
+        messages: 1,
+        events: 1,
+        outbox: 1,
+        idempotency: 1,
+      });
+    });
+
+    it("replays the stable acknowledgement after a worker restart", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-message-restart-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createHumanCommandFixture(databasePath);
+      const first = await fixture.authority.executeHuman(fixture.context, messageCommand);
+      await fixture.client.close();
+
+      const restartedClient = await createWorkerDatabaseClient({ databasePath });
+      const restartedAuthority = createSqliteAuthoritativeStore(restartedClient, {
+        clock: () => 9_000,
+      });
+      const replay = await restartedAuthority.executeHuman(
+        { ...fixture.context, requestId: "message-request-after-restart" },
+        messageCommand,
+      );
+
+      expect(replay).toEqual(first);
+      await restartedClient.close();
+      expect(readMessageCommandCounts(databasePath)).toEqual({
+        messages: 1,
+        events: 1,
+        outbox: 1,
+        idempotency: 1,
+      });
+    });
+  });
+
+  it("reads message history through an authenticated authority query", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-history-query-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const fixture = await createAgentFactFixture(databasePath);
+
+    await expect(
+      fixture.authority.readHistory(
+        {
+          sessionId: fixture.humanContext.sessionId,
+          sessionFamilyId: fixture.humanContext.sessionFamilyId,
+          principal: fixture.humanContext.principal,
+        },
+        "room-facts",
+      ),
+    ).resolves.toEqual([
+      {
+        id: "message-human-source",
+        roomId: "room-facts",
+        authorId: "human-li",
+        authorKind: "human",
+        body: "please review",
+        sentAt: "2026-08-10T13:01:00.000Z",
+      },
+      {
+        id: "message-agent-source",
+        roomId: "room-facts",
+        authorId: "agent-review",
+        authorKind: "agent",
+        body: "review complete",
+        sentAt: "2026-08-10T13:02:00.000Z",
+      },
+    ]);
+    await fixture.client.close();
+  });
+
+  it("serves actor, room, access, and audit through closed authoritative queries", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-lifecycle-query-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const fixture = await createRoomGovernanceFixture(databasePath);
+    const session = {
+      sessionId: fixture.context.sessionId,
+      sessionFamilyId: fixture.context.sessionFamilyId,
+      principal: fixture.context.principal,
+    };
+    expect(isAuthorityWorkerRequest({
+      type: "authority.read-actor",
+      requestId: "query-extra",
+      actorId: "human-li",
+      extra: true,
+    })).toBe(false);
+    expect(isAuthorityWorkerRequest({
+      type: "authority.read-room-audit",
+      requestId: "query-extra",
+      context: session,
+      roomId: fixture.roomId,
+      now: 2_000,
+      extra: true,
+    })).toBe(false);
+
+    await expect(fixture.authority.readActor("human-li")).resolves.toEqual(actors[0]);
+    await expect(fixture.authority.readRoom(fixture.roomId)).resolves.toMatchObject({
+      id: fixture.roomId,
+      name: "Governance",
+      status: "active",
+      members: [expect.objectContaining({ actorId: "human-li", role: "owner" })],
+    });
+    await expect(fixture.authority.canAccessRoom(session, fixture.roomId)).resolves.toBe(true);
+    await expect(fixture.authority.readRoomAudit(session, fixture.roomId)).resolves.toEqual([
+      expect.objectContaining({
+        type: "room.created",
+        roomId: fixture.roomId,
+        actorId: "human-li",
+        result: "created",
+      }),
+    ]);
+    await expect(
+      fixture.authority.canAccessRoom(
+        { ...session, principal: { ...session.principal, actorId: "agent-review" } },
+        fixture.roomId,
+      ),
+    ).rejects.toMatchObject({ status: 403, code: "identity_forbidden" });
+    await fixture.client.close();
+
+    const archivedDatabase = new DatabaseSync(databasePath);
+    archivedDatabase.prepare("UPDATE rooms SET status = 'archived' WHERE id = ?")
+      .run(fixture.roomId);
+    archivedDatabase.close();
+    const archivedClient = await createWorkerDatabaseClient({ databasePath });
+    const archivedAuthority = createSqliteAuthoritativeStore(archivedClient, { clock: () => 2_000 });
+    await expect(archivedAuthority.canAccessRoom(session, fixture.roomId)).resolves.toBe(false);
+    await expect(archivedAuthority.readRoomAudit(session, fixture.roomId))
+      .rejects.toMatchObject({ status: 403, code: "room_forbidden" });
+    await archivedClient.close();
+
+    const removedDatabase = new DatabaseSync(databasePath);
+    removedDatabase.prepare("UPDATE rooms SET status = 'active' WHERE id = ?").run(fixture.roomId);
+    removedDatabase.prepare("DELETE FROM room_memberships WHERE room_id = ? AND actor_id = ?")
+      .run(fixture.roomId, "human-li");
+    removedDatabase.close();
+    const removedClient = await createWorkerDatabaseClient({ databasePath });
+    const removedAuthority = createSqliteAuthoritativeStore(removedClient, { clock: () => 2_000 });
+    await expect(removedAuthority.canAccessRoom(session, fixture.roomId)).resolves.toBe(false);
+    await expect(removedAuthority.readRoomAudit(session, fixture.roomId))
+      .rejects.toMatchObject({ status: 403, code: "room_forbidden" });
+    await removedClient.close();
+  });
+
+  it("rejects expired and revoked sessions before permission-sensitive queries", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-query-session-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const fixture = await createRoomGovernanceFixture(databasePath);
+    const session = {
+      sessionId: fixture.context.sessionId,
+      sessionFamilyId: fixture.context.sessionFamilyId,
+      principal: fixture.context.principal,
+    };
+    await fixture.client.close();
+
+    const expiredClient = await createWorkerDatabaseClient({ databasePath });
+    const expiredAuthority = createSqliteAuthoritativeStore(expiredClient, {
+      clock: () => 1_000_000_000,
+    });
+    await expect(expiredAuthority.canAccessRoom(session, fixture.roomId))
+      .rejects.toMatchObject({ status: 401, code: "token_expired" });
+    await expiredClient.close();
+
+    const revokedClient = await createWorkerDatabaseClient({ databasePath });
+    const revokedAuthority = createSqliteAuthoritativeStore(revokedClient, { clock: () => 2_000 });
+    await revokedAuthority.revoke(session.sessionId, 1_500);
+    await expect(revokedAuthority.readRoomAudit(session, fixture.roomId))
+      .rejects.toMatchObject({ status: 403, code: "session_revoked" });
+    await revokedClient.close();
+  });
+
+  it("fails closed when audit details attempt to override authoritative envelope fields", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-query-audit-corrupt-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const fixture = await createRoomGovernanceFixture(databasePath);
+    const session = {
+      sessionId: fixture.context.sessionId,
+      sessionFamilyId: fixture.context.sessionFamilyId,
+      principal: fixture.context.principal,
+    };
+    await fixture.client.close();
+    const database = new DatabaseSync(databasePath);
+    database.prepare("UPDATE room_audit SET details_json = ? WHERE room_id = ?")
+      .run('{"actorId":"agent-review"}', fixture.roomId);
+    database.close();
+
+    const client = await createWorkerDatabaseClient({ databasePath });
+    const authority = createSqliteAuthoritativeStore(client, { clock: () => 2_000 });
+    const storageError = await authority.readRoomAudit(session, fixture.roomId).then(
+      () => new Error("expected corrupt audit to fail"),
+      (error: unknown) => error,
+    );
+    expect(storageError).toMatchObject({ status: 503, code: "storage_unavailable" });
+    await expect(client.close()).rejects.toBe(storageError);
+  });
+
+  it("persists a human read separately with stable replay and conflict semantics", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-human-read-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const fixture = await createHumanCommandFixture(databasePath);
+    await fixture.authority.executeHuman(fixture.context, messageCommand);
+    const context = {
+      ...fixture.context,
+      requestId: "human-read-first",
+      idempotencyKey: "human-read-key",
+    };
+    const command = {
+      type: "human.read.record",
+      roomId: messageCommand.roomId,
+      payload: { messageId: messageCommand.payload.id },
+    } as const;
+
+    await expect(
+      fixture.authority.executeHuman(
+        { ...context, requestId: "human-read-missing", idempotencyKey: "human-read-missing-key" },
+        { ...command, payload: { messageId: "missing-message" } },
+      ),
+    ).rejects.toMatchObject({ status: 404, code: "message_not_found" });
+
+    const first = await fixture.authority.executeHuman(context, command);
+    expect(
+      await fixture.authority.executeHuman(
+        { ...context, requestId: "human-read-replay" },
+        command,
+      ),
+    ).toEqual(first);
+    await expect(
+      fixture.authority.executeHuman(
+        { ...context, requestId: "human-read-conflict" },
+        { ...command, payload: { messageId: "different-message" } },
+      ),
+    ).rejects.toMatchObject({ status: 409, code: "idempotency_conflict" });
+    await fixture.client.close();
+
+    const restartedClient = await createWorkerDatabaseClient({ databasePath });
+    const restartedAuthority = createSqliteAuthoritativeStore(restartedClient, {
+      clock: () => 9_000,
+    });
+    await expect(
+      restartedAuthority.executeHuman(
+        { ...context, requestId: "human-read-restart" },
+        command,
+      ),
+    ).resolves.toEqual(first);
+    await restartedClient.close();
+
+    const database = new DatabaseSync(databasePath, { readOnly: true });
+    expect(database.prepare("SELECT COUNT(*) AS count FROM human_read_receipts").get())
+      .toEqual({ count: 1 });
+    expect(database.prepare("SELECT COUNT(*) AS count FROM agent_judgments").get())
+      .toEqual({ count: 0 });
+    expect(database.prepare("SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.human_read.recorded'").get())
+      .toEqual({ count: 1 });
+    database.close();
+  });
+
+  describe("Agent judgment authority and persistence", () => {
+    it("persists Agent-authored messages from the opaque capability context", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-agent-message-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const command = {
+        type: "message.send",
+        roomId: "room-facts",
+        payload: {
+          id: "message-agent-authoritative",
+          roomId: "room-facts",
+          body: "agent authoritative reply",
+          sentAt: "2026-08-10T13:03:00.000Z",
+        },
+      } as const;
+      const context = mintInternalAgentCommandContext({
+        agentId: "agent-review",
+        requestId: "agent-message-first",
+        idempotencyKey: "agent-message-key",
+      });
+
+      const first = await fixture.authority.executeAgent(context, command);
+      await expect(fixture.authority.executeAgent(
+        mintInternalAgentCommandContext({
+          agentId: "agent-review",
+          requestId: "agent-message-replay",
+          idempotencyKey: "agent-message-other-transport-key",
+        }),
+        command,
+      )).resolves.toEqual(first);
+      await expect(fixture.authority.executeAgent(
+        mintInternalAgentCommandContext({
+          agentId: "agent-review",
+          requestId: "agent-message-conflict",
+          idempotencyKey: "agent-message-conflict-transport-key",
+        }),
+        { ...command, payload: { ...command.payload, body: "changed body" } },
+      )).rejects.toMatchObject({ status: 409, code: "idempotency_conflict" });
+      await fixture.client.close();
+
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      expect(database.prepare(
+        "SELECT author_id AS authorId, author_kind AS authorKind FROM messages WHERE id = ?",
+      ).get(command.payload.id)).toEqual({ authorId: "agent-review", authorKind: "agent" });
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.message.accepted'",
+      ).get()).toEqual({ count: 1 });
+      database.close();
+    });
+
+    it.each([
+      ["will_respond", "matches domain and will answer"],
+      ["no_response_needed", "does not match domain"],
+      ["suppressed", "cooldown is active"],
+    ] as const)("persists %s with a non-empty reason", async (outcome, reason) => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-agent-judgment-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const context = mintInternalAgentCommandContext({
+        agentId: "agent-review",
+        requestId: `judgment-${outcome}-first`,
+        idempotencyKey: `judgment-${outcome}-key`,
+      });
+      const command = {
+        type: "agent.judgment.record",
+        roomId: "room-facts",
+        payload: {
+          messageId: "message-human-source",
+          outcome,
+          reason,
+        },
+      } as const;
+
+      const first = await fixture.authority.executeAgent(context, command);
+      expect(
+        await fixture.authority.executeAgent(
+          mintInternalAgentCommandContext({
+            agentId: "agent-review",
+            requestId: `judgment-${outcome}-replay`,
+            idempotencyKey: `judgment-${outcome}-key`,
+          }),
+          command,
+        ),
+      ).toEqual(first);
+      await expect(
+        fixture.authority.executeAgent(
+          mintInternalAgentCommandContext({
+            agentId: "agent-review",
+            requestId: `judgment-${outcome}-conflict`,
+            idempotencyKey: `judgment-${outcome}-key`,
+          }),
+          { ...command, payload: { ...command.payload, reason: `${reason} changed` } },
+        ),
+      ).rejects.toMatchObject({ status: 409, code: "idempotency_conflict" });
+      await fixture.client.close();
+
+      const restartedClient = await createWorkerDatabaseClient({ databasePath });
+      const restartedAuthority = createSqliteAuthoritativeStore(restartedClient, {
+        clock: () => 9_000,
+      });
+      await expect(
+        restartedAuthority.executeAgent(
+          mintInternalAgentCommandContext({
+            agentId: "agent-review",
+            requestId: `judgment-${outcome}-restart`,
+            idempotencyKey: `judgment-${outcome}-key`,
+          }),
+          command,
+        ),
+      ).resolves.toEqual(first);
+      await restartedClient.close();
+
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      const row = database
+        .prepare("SELECT judgment_json AS judgmentJson FROM agent_judgments")
+        .get();
+      expect(JSON.parse(String(row?.judgmentJson))).toMatchObject({ outcome, reason });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM agent_judgments").get())
+        .toEqual({ count: 1 });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM human_read_receipts").get())
+        .toEqual({ count: 0 });
+      database.close();
+    });
+
+    it("rejects forged capabilities and human/Agent primitive crossover", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-agent-authority-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const judgment = {
+        type: "agent.judgment.record",
+        roomId: "room-facts",
+        payload: {
+          messageId: "message-human-source",
+          outcome: "will_respond",
+          reason: "will answer",
+        },
+      } as const;
+
+      await expect(
+        fixture.authority.executeAgent(
+          {
+            kind: "agent",
+            agent: { actorId: "agent-review", kind: "agent" },
+            requestId: "forged",
+            idempotencyKey: "forged",
+          } as never,
+          judgment,
+        ),
+      ).rejects.toMatchObject({ status: 403, code: "agent_capability_forbidden" });
+      await expect(
+        fixture.authority.executeHuman(
+          { ...fixture.humanContext, requestId: "human-agent-crossover" },
+          judgment as never,
+        ),
+      ).rejects.toMatchObject({ status: 400, code: "invalid_request" });
+      await expect(
+        fixture.authority.executeAgent(
+          mintInternalAgentCommandContext({
+            agentId: "agent-review",
+            requestId: "agent-human-crossover",
+            idempotencyKey: "agent-human-crossover",
+          }),
+          {
+            type: "human.read.record",
+            roomId: "room-facts",
+            payload: { messageId: "message-human-source" },
+          } as never,
+        ),
+      ).rejects.toMatchObject({ status: 400, code: "invalid_request" });
+      await fixture.client.close();
+    });
+  });
+
+  describe("open-item authoritative facts", () => {
+    it("persists human create and Agent transition with stable replay acknowledgements", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-open-item-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const createCommand = {
+        type: "open-item.create",
+        roomId: "room-facts",
+        payload: {
+          sourceMessageId: "message-human-source",
+          ownerId: "agent-review",
+          content: "Review the authoritative result",
+        },
+      } as const;
+      const createContext = {
+        ...fixture.humanContext,
+        requestId: "open-item-create-first",
+        idempotencyKey: "open-item-create-key",
+      };
+
+      const created = await fixture.authority.executeHuman(createContext, createCommand);
+      await expect(
+        fixture.authority.executeHuman(
+          { ...createContext, requestId: "open-item-create-replay" },
+          createCommand,
+        ),
+      ).resolves.toEqual(created);
+      await expect(
+        fixture.authority.executeHuman(
+          { ...createContext, requestId: "open-item-create-conflict" },
+          { ...createCommand, payload: { ...createCommand.payload, content: "changed" } },
+        ),
+      ).rejects.toMatchObject({ status: 409, code: "idempotency_conflict" });
+
+      const transitionCommand = {
+        type: "open-item.transition",
+        roomId: "room-facts",
+        payload: { itemId: created.aggregateId, action: "respond" },
+      } as const;
+      const agentContext = mintInternalAgentCommandContext({
+        agentId: "agent-review",
+        requestId: "open-item-respond-first",
+        idempotencyKey: "open-item-respond-key",
+      });
+      const transitioned = await fixture.authority.executeAgent(agentContext, transitionCommand);
+      await expect(
+        fixture.authority.executeAgent(
+          mintInternalAgentCommandContext({
+            agentId: "agent-review",
+            requestId: "open-item-respond-replay",
+            idempotencyKey: "open-item-respond-key",
+          }),
+          transitionCommand,
+        ),
+      ).resolves.toEqual(transitioned);
+      await fixture.client.close();
+
+      const restartedClient = await createWorkerDatabaseClient({ databasePath });
+      const restartedAuthority = createSqliteAuthoritativeStore(restartedClient, {
+        clock: () => 9_000,
+      });
+      await expect(
+        restartedAuthority.executeHuman(
+          { ...createContext, requestId: "open-item-create-restart" },
+          createCommand,
+        ),
+      ).resolves.toEqual(created);
+      await restartedClient.close();
+
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      const item = database.prepare(
+        `SELECT status, requester_actor_id AS requesterId,
+                assigned_actor_id AS ownerId, transfer_chain_json AS transferChain,
+                responded_at AS respondedAt
+         FROM open_items`,
+      ).get();
+      expect(item).toEqual({
+        status: "responded",
+        requesterId: "human-li",
+        ownerId: "agent-review",
+        transferChain: "[]",
+        respondedAt: "1970-01-01T00:00:03.000Z",
+      });
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.open_item.changed'",
+      ).get()).toEqual({ count: 2 });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM open_items").get())
+        .toEqual({ count: 1 });
+      database.close();
+    });
+  });
+
+  describe("Agent execution authoritative facts", () => {
+    it("persists running and terminal transitions without duplicating the execution", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-agent-execution-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const running = {
+        type: "agent.execution.transition",
+        roomId: "room-facts",
+        payload: {
+          executionId: "execution-review-1",
+          sourceMessageId: "message-human-source",
+          toolName: "review.read",
+          status: "running",
+        },
+      } as const;
+      const runningContext = mintInternalAgentCommandContext({
+        agentId: "agent-review",
+        requestId: "execution-running-first",
+        idempotencyKey: "execution-running-key",
+      });
+      const started = await fixture.authority.executeAgent(runningContext, running);
+      await expect(
+        fixture.authority.executeAgent(
+          mintInternalAgentCommandContext({
+            agentId: "agent-review",
+            requestId: "execution-running-replay",
+            idempotencyKey: "execution-running-key",
+          }),
+          running,
+        ),
+      ).resolves.toEqual(started);
+      await expect(
+        fixture.authority.executeAgent(
+          mintInternalAgentCommandContext({
+            agentId: "agent-review",
+            requestId: "execution-running-conflict",
+            idempotencyKey: "execution-running-key",
+          }),
+          { ...running, payload: { ...running.payload, toolName: "review.changed" } },
+        ),
+      ).rejects.toMatchObject({ status: 409, code: "idempotency_conflict" });
+
+      const completed = {
+        ...running,
+        payload: { ...running.payload, status: "completed", result: "approved" },
+      } as const;
+      const completedContext = mintInternalAgentCommandContext({
+        agentId: "agent-review",
+        requestId: "execution-completed-first",
+        idempotencyKey: "execution-completed-key",
+      });
+      const finished = await fixture.authority.executeAgent(completedContext, completed);
+      await fixture.client.close();
+
+      const restartedClient = await createWorkerDatabaseClient({ databasePath });
+      const restartedAuthority = createSqliteAuthoritativeStore(restartedClient, {
+        clock: () => 9_000,
+      });
+      await expect(
+        restartedAuthority.executeAgent(
+          mintInternalAgentCommandContext({
+            agentId: "agent-review",
+            requestId: "execution-completed-restart",
+            idempotencyKey: "execution-completed-key",
+          }),
+          completed,
+        ),
+      ).resolves.toEqual(finished);
+      await restartedClient.close();
+
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      expect(database.prepare(
+        `SELECT status, requester_actor_id AS requesterId, agent_id AS agentId,
+                tool_name AS toolName, result_json AS result
+         FROM agent_executions`,
+      ).get()).toEqual({
+        status: "completed",
+        requesterId: "human-li",
+        agentId: "agent-review",
+        toolName: "review.read",
+        result: "\"approved\"",
+      });
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.agent_execution.changed'",
+      ).get()).toEqual({ count: 2 });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM agent_executions").get())
+        .toEqual({ count: 1 });
+      database.close();
+    });
+  });
+
+  describe("calibration authoritative facts", () => {
+    it("derives the target Agent from its source message and rejects social emoji", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-calibration-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const command = {
+        type: "calibration.record",
+        roomId: "room-facts",
+        payload: { sourceMessageId: "message-agent-source", emoji: "👎" },
+      } as const;
+      const context = {
+        ...fixture.humanContext,
+        requestId: "calibration-first",
+        idempotencyKey: "calibration-key",
+      };
+      const first = await fixture.authority.executeHuman(context, command);
+      await expect(
+        fixture.authority.executeHuman(
+          { ...context, requestId: "calibration-replay" },
+          command,
+        ),
+      ).resolves.toEqual(first);
+      await expect(
+        fixture.authority.executeHuman(
+          { ...context, requestId: "calibration-conflict" },
+          { ...command, payload: { ...command.payload, emoji: "👍" } },
+        ),
+      ).rejects.toMatchObject({ status: 409, code: "idempotency_conflict" });
+      await expect(
+        fixture.authority.executeHuman(
+          { ...context, requestId: "calibration-social", idempotencyKey: "calibration-social" },
+          { ...command, payload: { ...command.payload, emoji: "❤️" } } as never,
+        ),
+      ).rejects.toMatchObject({ status: 400, code: "invalid_request" });
+      await fixture.client.close();
+
+      const restartedClient = await createWorkerDatabaseClient({ databasePath });
+      const restartedAuthority = createSqliteAuthoritativeStore(restartedClient, {
+        clock: () => 9_000,
+      });
+      await expect(
+        restartedAuthority.executeHuman(
+          { ...context, requestId: "calibration-restart" },
+          command,
+        ),
+      ).resolves.toEqual(first);
+      await restartedClient.close();
+
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      expect(database.prepare(
+        `SELECT actor_id AS actorId, agent_id AS agentId,
+                source_message_id AS sourceMessageId, signal
+         FROM calibration_signals`,
+      ).get()).toEqual({
+        actorId: "human-li",
+        agentId: "agent-review",
+        sourceMessageId: "message-agent-source",
+        signal: "👎",
+      });
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.calibration.recorded'",
+      ).get()).toEqual({ count: 1 });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM calibration_signals").get())
+        .toEqual({ count: 1 });
+      database.close();
+    });
+  });
+
+  describe("accepted command four-quadrant matrix", () => {
+    const cases: readonly CommandMatrixCase[] = [
+      humanMatrixCase(
+        "room.create",
+        "room.created",
+        "SELECT COUNT(*) AS count FROM rooms WHERE name = 'Matrix Created'",
+        () => ({ type: "room.create", payload: { name: "Matrix Created" } }),
+        () => ({ type: "room.create", payload: { name: "Matrix Changed" } }),
+        "owner",
+        1,
+        ["room", "principal"],
+      ),
+      humanMatrixCase(
+        "room.rename",
+        "room.renamed",
+        "SELECT COUNT(*) AS count FROM rooms WHERE id = 'room-matrix' AND name = 'Matrix Renamed'",
+        ({ roomId }) => ({ type: "room.rename", roomId, payload: { name: "Matrix Renamed" } }),
+        ({ roomId }) => ({ type: "room.rename", roomId, payload: { name: "Matrix Changed" } }),
+        "owner",
+        1,
+        ["room", "principal", "principal"],
+      ),
+      humanMatrixCase(
+        "human.invitation.issue",
+        "human.invitation.issued",
+        "SELECT COUNT(*) AS count FROM room_invitations WHERE invitee_actor_id = 'human-alternate'",
+        ({ roomId }) => ({
+          type: "human.invitation.issue", roomId, payload: { inviteeActorId: "human-alternate" },
+        }),
+        ({ roomId }) => ({
+          type: "human.invitation.issue", roomId, payload: { inviteeActorId: "human-invitee" },
+        }),
+      ),
+      humanMatrixCase(
+        "human.invitation.decide",
+        "human.invitation.rejected",
+        "SELECT COUNT(*) AS count FROM room_invitations WHERE id = 'matrix-decision-invitation' AND status = 'rejected'",
+        () => ({
+          type: "human.invitation.decide",
+          payload: { token: "matrix-decision-token", decision: "reject" },
+        }),
+        () => ({
+          type: "human.invitation.decide",
+          payload: { token: "matrix-decision-token", decision: "accept" },
+        }),
+        "invitee",
+      ),
+      humanMatrixCase(
+        "agent.configure",
+        "agent.configured",
+        "SELECT COUNT(*) AS count FROM room_memberships WHERE actor_id = 'agent-review' AND participation = 'silent'",
+        ({ roomId }) => ({
+          type: "agent.configure", roomId,
+          payload: { agentId: "agent-review", participation: "silent", toolPermissions: ["review.read"] },
+        }),
+        ({ roomId }) => ({
+          type: "agent.configure", roomId,
+          payload: { agentId: "agent-review", participation: "on-mention", toolPermissions: ["review.read"] },
+        }),
+        "owner",
+        1,
+        ["room", null],
+      ),
+      humanMatrixCase(
+        "human.role.change",
+        "human.role.changed",
+        "SELECT COUNT(*) AS count FROM room_memberships WHERE actor_id = 'human-chen' AND role = 'admin'",
+        ({ roomId }) => ({
+          type: "human.role.change", roomId, payload: { targetActorId: "human-chen", role: "admin" },
+        }),
+        ({ roomId }) => ({
+          type: "human.role.change", roomId, payload: { targetActorId: "human-chen", role: "member" },
+        }),
+        "owner",
+        1,
+        ["room", "principal"],
+      ),
+      humanMatrixCase(
+        "member.remove",
+        "member.removed",
+        "SELECT COUNT(*) AS count FROM room_memberships WHERE actor_id = 'human-chen'",
+        ({ roomId }) => ({
+          type: "member.remove", roomId, payload: { targetActorId: "human-chen" },
+        }),
+        ({ roomId }) => ({
+          type: "member.remove", roomId, payload: { targetActorId: "agent-review" },
+        }),
+        "owner",
+        0,
+        ["room", "principal"],
+      ),
+      humanMatrixCase(
+        "human.message.send",
+        "room.message.accepted",
+        "SELECT COUNT(*) AS count FROM messages WHERE id = 'matrix-human-message'",
+        ({ roomId }) => ({
+          type: "message.send", roomId,
+          payload: { id: "matrix-human-message", roomId, body: "human matrix body", sentAt: "2026-08-10T14:10:00.000Z" },
+        }),
+        ({ roomId }) => ({
+          type: "message.send", roomId,
+          payload: { id: "matrix-human-message", roomId, body: "human changed body", sentAt: "2026-08-10T14:10:00.000Z" },
+        }),
+      ),
+      agentMatrixCase(
+        "agent.message.send",
+        "room.message.accepted",
+        "SELECT COUNT(*) AS count FROM messages WHERE id = 'matrix-agent-message'",
+        ({ roomId }) => ({
+          type: "message.send", roomId,
+          payload: { id: "matrix-agent-message", roomId, body: "Agent matrix body", sentAt: "2026-08-10T14:11:00.000Z" },
+        }),
+        ({ roomId }) => ({
+          type: "message.send", roomId,
+          payload: { id: "matrix-agent-message", roomId, body: "Agent changed body", sentAt: "2026-08-10T14:11:00.000Z" },
+        }),
+      ),
+      humanMatrixCase(
+        "human.read.record",
+        "room.human_read.recorded",
+        "SELECT COUNT(*) AS count FROM human_read_receipts WHERE message_id = 'matrix-human-source'",
+        ({ roomId }) => ({ type: "human.read.record", roomId, payload: { messageId: "matrix-human-source" } }),
+        ({ roomId }) => ({ type: "human.read.record", roomId, payload: { messageId: "matrix-agent-source" } }),
+      ),
+      agentMatrixCase(
+        "agent.judgment.record",
+        "room.agent_judgment.recorded",
+        "SELECT COUNT(*) AS count FROM agent_judgments WHERE message_id = 'matrix-human-source'",
+        ({ roomId }) => ({
+          type: "agent.judgment.record", roomId,
+          payload: { messageId: "matrix-human-source", outcome: "will_respond", reason: "matrix reason" },
+        }),
+        ({ roomId }) => ({
+          type: "agent.judgment.record", roomId,
+          payload: { messageId: "matrix-human-source", outcome: "suppressed", reason: "matrix changed reason" },
+        }),
+      ),
+      humanMatrixCase(
+        "open-item.create",
+        "room.open_item.changed",
+        "SELECT COUNT(*) AS count FROM open_items WHERE body = 'matrix open item'",
+        ({ roomId }) => ({
+          type: "open-item.create", roomId,
+          payload: { sourceMessageId: "matrix-human-source", ownerId: "human-chen", content: "matrix open item" },
+        }),
+        ({ roomId }) => ({
+          type: "open-item.create", roomId,
+          payload: { sourceMessageId: "matrix-human-source", ownerId: "human-chen", content: "matrix changed item" },
+        }),
+      ),
+      agentMatrixCase(
+        "open-item.transition",
+        "room.open_item.changed",
+        "SELECT COUNT(*) AS count FROM open_items WHERE id = 'matrix-open-existing' AND status = 'responded'",
+        ({ roomId }) => ({
+          type: "open-item.transition", roomId,
+          payload: { itemId: "matrix-open-existing", action: "respond" },
+        }),
+        ({ roomId }) => ({
+          type: "open-item.transition", roomId,
+          payload: { itemId: "matrix-open-existing", action: "defer" },
+        }),
+      ),
+      agentMatrixCase(
+        "agent.execution.transition",
+        "room.agent_execution.changed",
+        "SELECT COUNT(*) AS count FROM agent_executions WHERE id = 'matrix-execution' AND status = 'running'",
+        ({ roomId }) => ({
+          type: "agent.execution.transition", roomId,
+          payload: {
+            executionId: "matrix-execution", sourceMessageId: "matrix-human-source",
+            toolName: "review.read", status: "running",
+          },
+        }),
+        ({ roomId }) => ({
+          type: "agent.execution.transition", roomId,
+          payload: {
+            executionId: "matrix-execution", sourceMessageId: "matrix-agent-source",
+            toolName: "review.read", status: "running",
+          },
+        }),
+      ),
+      humanMatrixCase(
+        "calibration.record",
+        "room.calibration.recorded",
+        "SELECT COUNT(*) AS count FROM calibration_signals WHERE source_message_id = 'matrix-agent-source' AND signal = '👎'",
+        ({ roomId }) => ({
+          type: "calibration.record", roomId,
+          payload: { sourceMessageId: "matrix-agent-source", emoji: "👎" },
+        }),
+        ({ roomId }) => ({
+          type: "calibration.record", roomId,
+          payload: { sourceMessageId: "matrix-agent-source", emoji: "👍" },
+        }),
+      ),
+    ];
+
+    it.each(cases)(
+      "$label: concurrent/sequential/restart replay and changed-payload conflict",
+      async (testCase) => {
+        const directory = await mkdtemp(join(tmpdir(), "native-im-command-matrix-"));
+        temporaryDirectories.push(directory);
+        const databasePath = join(directory, "authority.sqlite");
+        const fixture = await createCommandMatrixFixture(databasePath);
+
+        const [first, concurrentReplay] = await Promise.all([
+          testCase.execute(fixture.store, fixture.contexts, "exact", "first"),
+          testCase.execute(fixture.store, fixture.contexts, "exact", "concurrent"),
+        ]);
+        expect(concurrentReplay).toEqual(first);
+        await expect(
+          testCase.execute(fixture.store, fixture.contexts, "exact", "sequential"),
+        ).resolves.toEqual(first);
+        await fixture.client.close();
+
+        const restartedClient = await createWorkerDatabaseClient({ databasePath });
+        const restartedStore = createSqliteAuthoritativeStore(restartedClient, {
+          clock: () => 9_000,
+          invitationSecretProtector: createAesGcmInvitationSecretProtector(new Uint8Array(32).fill(47)),
+          invitationTokenFactory: () => "matrix-issued-token-after-restart",
+        });
+        await expect(
+          testCase.execute(restartedStore, fixture.contexts, "exact", "restart"),
+        ).resolves.toEqual(first);
+        const beforeConflict = authoritativeCountSnapshot(databasePath);
+        await expect(
+          testCase.execute(restartedStore, fixture.contexts, "changed", "conflict"),
+        ).rejects.toMatchObject({ status: 409, code: "idempotency_conflict" });
+        await restartedClient.close();
+        expect(authoritativeCountSnapshot(databasePath)).toEqual(beforeConflict);
+
+        const database = new DatabaseSync(databasePath, { readOnly: true });
+        expect(database.prepare(testCase.factSql).get()).toEqual({
+          count: testCase.factCount ?? 1,
+        });
+        expect(database.prepare(
+          "SELECT COUNT(*) AS count FROM events WHERE event_type = ?",
+        ).get(testCase.eventType)).toEqual({ count: 1 });
+        expect(database.prepare(
+          `SELECT COUNT(*) AS count
+           FROM outbox_deliveries AS delivery
+           JOIN events AS event ON event.event_id = delivery.event_id
+           WHERE event.event_type = ?`,
+        ).get(testCase.eventType)).toEqual({ count: 1 });
+        expect(database.prepare("SELECT COUNT(*) AS count FROM idempotency_records").get())
+          .toEqual({ count: 1 });
+        expect(new Set(first.eventIds).size).toBe(first.eventIds.length);
+        expect(testCase.deliveryTargets).toHaveLength(first.eventIds.length);
+        for (const [index, eventId] of first.eventIds.entries()) {
+          expect(database.prepare(
+            "SELECT COUNT(*) AS count FROM events WHERE event_id = ?",
+          ).get(eventId)).toEqual({ count: 1 });
+          const deliveries = database.prepare(
+            `SELECT target_kind AS targetKind, target_id AS targetId
+             FROM outbox_deliveries WHERE event_id = ?`,
+          ).all(eventId);
+          const expectedTarget = testCase.deliveryTargets[index];
+          if (expectedTarget === null) {
+            expect(deliveries).toEqual([]);
+          } else {
+            expect(deliveries).toEqual([
+              { targetKind: expectedTarget, targetId: expect.stringMatching(/\S/) },
+            ]);
+          }
+        }
+        const eventPlaceholders = first.eventIds.map(() => "?").join(", ");
+        expect(database.prepare(
+          `SELECT COUNT(*) AS count FROM events WHERE event_id IN (${eventPlaceholders})`,
+        ).get(...first.eventIds)).toEqual({ count: first.eventIds.length });
+        expect(database.prepare(
+          `SELECT COUNT(*) AS count FROM outbox_deliveries
+           WHERE event_id IN (${eventPlaceholders})`,
+        ).get(...first.eventIds)).toEqual({
+          count: testCase.deliveryTargets.filter((target) => target !== null).length,
+        });
+        database.close();
+      },
+    );
+  });
+
+  describe("room governance idempotency", () => {
+    it.each([
+      {
+        label: "room.rename",
+        eventType: "room.renamed",
+        command(roomId: string) {
+          return { type: "room.rename", roomId, payload: { name: "Renamed" } } as const;
+        },
+        changed(roomId: string) {
+          return { type: "room.rename", roomId, payload: { name: "Changed" } } as const;
+        },
+        factSql: "SELECT COUNT(*) AS count FROM rooms WHERE name = 'Renamed'",
+        eventCount: 2,
+      },
+      {
+        label: "agent.configure",
+        eventType: "agent.configured",
+        command(roomId: string) {
+          return {
+            type: "agent.configure",
+            roomId,
+            payload: {
+              agentId: "agent-review",
+              participation: "active",
+              toolPermissions: ["review.read"],
+            },
+          } as const;
+        },
+        changed(roomId: string) {
+          return {
+            type: "agent.configure",
+            roomId,
+            payload: {
+              agentId: "agent-review",
+              participation: "silent",
+              toolPermissions: ["review.read"],
+            },
+          } as const;
+        },
+        factSql:
+          "SELECT COUNT(*) AS count FROM room_memberships WHERE actor_id = 'agent-review' AND participation = 'active' AND access_revision = 1",
+        eventCount: 2,
+      },
+    ])("persists $label once and rejects a changed payload", async (testCase) => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-governance-command-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createRoomGovernanceFixture(databasePath);
+      const context = {
+        ...fixture.context,
+        requestId: `${testCase.label}-first`,
+        idempotencyKey: `${testCase.label}-key`,
+      };
+      const command = testCase.command(fixture.roomId);
+
+      const first = await fixture.authority.executeHuman(context, command);
+      const replay = await fixture.authority.executeHuman(
+        { ...context, requestId: `${testCase.label}-replay` },
+        command,
+      );
+      expect(replay).toEqual(first);
+      expect(first.eventIds).toHaveLength(testCase.eventCount);
+      await expect(
+        fixture.authority.executeHuman(
+          { ...context, requestId: `${testCase.label}-conflict` },
+          testCase.changed(fixture.roomId),
+        ),
+      ).rejects.toMatchObject({ status: 409, code: "idempotency_conflict" });
+
+      await fixture.client.close();
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      expect(database.prepare(testCase.factSql).get()).toEqual({ count: 1 });
+      expect(
+        database
+          .prepare("SELECT COUNT(*) AS count FROM events WHERE event_type = ?")
+          .get(testCase.eventType),
+      ).toEqual({ count: 1 });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM idempotency_records").get())
+        .toEqual({ count: 2 });
+      database.close();
+    });
+
+    it("writes joined, updated, and removed Agent identity events without empty deliveries", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-agent-identity-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createRoomGovernanceFixture(databasePath);
+      const baseContext = {
+        ...fixture.context,
+        requestId: "agent-identity",
+        idempotencyKey: "agent-identity-joined",
+      };
+      const configured = await fixture.authority.executeHuman(baseContext, {
+        type: "agent.configure",
+        roomId: fixture.roomId,
+        payload: {
+          agentId: "agent-review",
+          participation: "active",
+          toolPermissions: ["review.read"],
+        },
+      });
+      const updated = await fixture.authority.executeHuman(
+        { ...baseContext, requestId: "agent-updated", idempotencyKey: "agent-identity-updated" },
+        {
+          type: "agent.configure",
+          roomId: fixture.roomId,
+          payload: {
+            agentId: "agent-review",
+            participation: "silent",
+            toolPermissions: ["review.read"],
+          },
+        },
+      );
+      const removed = await fixture.authority.executeHuman(
+        { ...baseContext, requestId: "agent-removed", idempotencyKey: "agent-identity-removed" },
+        {
+          type: "member.remove",
+          roomId: fixture.roomId,
+          payload: { targetActorId: "agent-review" },
+        },
+      );
+      expect(configured.eventIds).toHaveLength(2);
+      expect(updated.eventIds).toHaveLength(2);
+      expect(removed.eventIds).toHaveLength(2);
+      await fixture.client.close();
+
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      const identityEvents = database.prepare(
+        `SELECT payload_json AS payload
+         FROM events
+         WHERE stream_kind = 'identity' AND stream_id = 'agent-review'
+           AND event_type = 'identity.room-access.changed'
+         ORDER BY stream_seq`,
+      ).all().map((row) => JSON.parse(String(row.payload)));
+      expect(identityEvents).toEqual([
+        { roomId: fixture.roomId, change: "joined" },
+        { roomId: fixture.roomId, change: "updated" },
+        { roomId: fixture.roomId, change: "removed" },
+      ]);
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM outbox_deliveries WHERE target_kind = 'principal' AND target_id = 'agent-review'",
+      ).get()).toEqual({ count: 0 });
+      database.close();
+    });
+
+    it("replays room.archive sequentially, concurrently, and after restart while rejecting extra payload fields", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-archive-command-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createRoomGovernanceFixture(databasePath);
+      const context = {
+        ...fixture.context,
+        requestId: "archive-first",
+        idempotencyKey: "archive-key",
+      };
+      const command = {
+        type: "room.archive",
+        roomId: fixture.roomId,
+        payload: {},
+      } as const;
+
+      const [first, concurrentReplay] = await Promise.all([
+        fixture.authority.executeHuman(context, command),
+        fixture.authority.executeHuman(
+          { ...context, requestId: "archive-concurrent" },
+          command,
+        ),
+      ]);
+      expect(concurrentReplay).toEqual(first);
+      expect(
+        await fixture.authority.executeHuman(
+          { ...context, requestId: "archive-sequential" },
+          command,
+        ),
+      ).toEqual(first);
+      const beforeInvalidPayload = authoritativeCountSnapshot(databasePath);
+      await expect(
+        fixture.authority.executeHuman(
+          { ...context, requestId: "archive-invalid" },
+          {
+            ...command,
+            payload: { reason: "not part of the closed command" },
+          } as never,
+        ),
+      ).rejects.toMatchObject({ status: 400, code: "invalid_request" });
+      expect(authoritativeCountSnapshot(databasePath)).toEqual(beforeInvalidPayload);
+      await fixture.client.close();
+
+      const restartedClient = await createWorkerDatabaseClient({ databasePath });
+      const restartedAuthority = createSqliteAuthoritativeStore(restartedClient, {
+        clock: () => 9_000,
+      });
+      await expect(
+        restartedAuthority.executeHuman(
+          { ...context, requestId: "archive-restart" },
+          command,
+        ),
+      ).resolves.toEqual(first);
+      await expect(
+        restartedAuthority.executeHuman(
+          { ...context, requestId: "archive-other-scope" },
+          { ...command, roomId: `${fixture.roomId}-other` },
+        ),
+      ).rejects.toMatchObject({ status: 403, code: "room_forbidden" });
+      await restartedClient.close();
+
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM rooms WHERE status = 'archived'").get())
+        .toEqual({ count: 1 });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.archived'").get())
+        .toEqual({ count: 1 });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM idempotency_records").get())
+        .toEqual({ count: 2 });
+      expect(first.eventIds).toHaveLength(2);
+      expect(new Set(first.eventIds).size).toBe(first.eventIds.length);
+      const expectedTargets = ["room", "principal"] as const;
+      for (const [index, eventId] of first.eventIds.entries()) {
+        expect(database.prepare(
+          "SELECT COUNT(*) AS count FROM events WHERE event_id = ?",
+        ).get(eventId)).toEqual({ count: 1 });
+        expect(database.prepare(
+          `SELECT target_kind AS targetKind, target_id AS targetId
+           FROM outbox_deliveries WHERE event_id = ?`,
+        ).all(eventId)).toEqual([
+          { targetKind: expectedTargets[index], targetId: expect.stringMatching(/\S/) },
+        ]);
+      }
+      const placeholders = first.eventIds.map(() => "?").join(", ");
+      expect(database.prepare(
+        `SELECT COUNT(*) AS count FROM events WHERE event_id IN (${placeholders})`,
+      ).get(...first.eventIds)).toEqual({ count: first.eventIds.length });
+      expect(database.prepare(
+        `SELECT COUNT(*) AS count FROM outbox_deliveries WHERE event_id IN (${placeholders})`,
+      ).get(...first.eventIds)).toEqual({ count: expectedTargets.length });
+      database.close();
+    });
+  });
+
+  it("seals invitation replay state and returns the same token after a lost acknowledgement and restart", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-invitation-secret-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const key = new Uint8Array(32).fill(23);
+    const protector = createAesGcmInvitationSecretProtector(key);
+    let dropFirstAcknowledgement = true;
+    const firstClient = await createWorkerDatabaseClient({ databasePath });
+    const firstAuthority = createSqliteAuthoritativeStore(firstClient, {
+      clock: () => 2_000,
+      invitationSecretProtector: protector,
+      invitationTokenFactory: () => "private-invitation-token",
+      afterCommitHuman(command) {
+        if (command.type === "human.invitation.issue" && dropFirstAcknowledgement) {
+          dropFirstAcknowledgement = false;
+          throw new Error("injected_ack_loss");
+        }
+      },
+    });
+    await firstAuthority.registerActors(invitationActors);
+    const ownerAuth = createAuthenticationService({
+      actors: invitationActorDirectory,
+      identities: invitationIdentities,
+      authority: firstAuthority,
+      clock: () => 1_000,
+      tokenFactory: tokenSequence("invite-owner-access", "invite-owner-refresh"),
+    });
+    const ownerIssued = await ownerAuth.login({
+      accountId: "account-li",
+      secret: "correct",
+    });
+    const ownerSession = await ownerAuth.authenticateSession(ownerIssued.accessToken);
+    const ownerContext = {
+      ...ownerSession,
+      kind: "human" as const,
+      requestId: "invite-room-create",
+      idempotencyKey: "invite-room-create-key",
+    };
+    const created = await firstAuthority.executeHuman(
+      ownerContext,
+      { type: "room.create", payload: { name: "Invitations" } },
+    );
+    const issueCommand = {
+      type: "human.invitation.issue",
+      roomId: created.aggregateId,
+      payload: { inviteeActorId: "human-chen" },
+    } as const;
+    const issueContext = {
+      ...ownerContext,
+      requestId: "invite-issue-first",
+      idempotencyKey: "invite-issue-key",
+    };
+
+    await expect(firstAuthority.executeHuman(issueContext, issueCommand)).rejects.toThrow(
+      "injected_ack_loss",
+    );
+    await firstClient.close();
+
+    const restartedClient = await createWorkerDatabaseClient({ databasePath });
+    const restartedAuthority = createSqliteAuthoritativeStore(restartedClient, {
+      clock: () => 9_000,
+      invitationSecretProtector: protector,
+      invitationTokenFactory: () => "different-retry-candidate",
+    });
+    const replay = await restartedAuthority.executeHuman(
+      { ...issueContext, requestId: "invite-issue-restart" },
+      issueCommand,
+    );
+    expect(replay.eventIds).toHaveLength(1);
+    expect(replay.result).toMatchObject({
+      invitation: {
+        invitationId: expect.any(String),
+        roomId: created.aggregateId,
+        inviteeActorId: "human-chen",
+        token: "private-invitation-token",
+      },
+    });
+    await restartedClient.close();
+
+    const database = new DatabaseSync(databasePath, { readOnly: true });
+    expect(database.prepare("SELECT COUNT(*) AS count FROM room_invitations").get())
+      .toEqual({ count: 1 });
+    expect(database.prepare("SELECT COUNT(*) AS count FROM events WHERE event_type = 'human.invitation.issued'").get())
+      .toEqual({ count: 1 });
+    expect(database.prepare("SELECT COUNT(*) AS count FROM idempotency_records").get())
+      .toEqual({ count: 2 });
+    database.close();
+
+    for (const fileName of await readdir(directory)) {
+      if (!fileName.startsWith("authority.sqlite")) {
+        continue;
+      }
+      const bytes = await readFile(join(directory, fileName));
+      expect(bytes.includes(Buffer.from("private-invitation-token", "utf8"))).toBe(false);
+    }
+
+    const wrongKeyClient = await createWorkerDatabaseClient({ databasePath });
+    const wrongKeyAuthority = createSqliteAuthoritativeStore(wrongKeyClient, {
+      clock: () => 10_000,
+      invitationSecretProtector: createAesGcmInvitationSecretProtector(
+        new Uint8Array(32).fill(24),
+      ),
+      invitationTokenFactory: () => "unused-wrong-key-candidate",
+    });
+    await expect(
+      wrongKeyAuthority.executeHuman(
+        { ...issueContext, requestId: "invite-issue-wrong-key" },
+        issueCommand,
+      ),
+    ).rejects.toMatchObject({ status: 503, code: "invitation_secret_unavailable" });
+    await wrongKeyClient.close();
+  });
+
+  it("persists invitation acceptance, role change, and removal while preserving authored messages", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-member-governance-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const client = await createWorkerDatabaseClient({ databasePath });
+    const authority = createSqliteAuthoritativeStore(client, {
+      clock: () => 2_000,
+      invitationSecretProtector: createAesGcmInvitationSecretProtector(
+        new Uint8Array(32).fill(31),
+      ),
+      invitationTokenFactory: () => "member-governance-token",
+    });
+    await authority.registerActors(invitationActors);
+    const ownerAuth = createAuthenticationService({
+      actors: invitationActorDirectory,
+      identities: invitationIdentities,
+      authority,
+      clock: () => 1_000,
+      tokenFactory: tokenSequence("member-owner-access", "member-owner-refresh"),
+    });
+    const inviteeAuth = createAuthenticationService({
+      actors: invitationActorDirectory,
+      identities: invitationIdentities,
+      authority,
+      clock: () => 1_000,
+      tokenFactory: tokenSequence("member-chen-access", "member-chen-refresh"),
+    });
+    const ownerIssued = await ownerAuth.login({ accountId: "account-li", secret: "correct" });
+    const inviteeIssued = await inviteeAuth.login({ accountId: "account-chen", secret: "correct" });
+    const ownerSession = await ownerAuth.authenticateSession(ownerIssued.accessToken);
+    const inviteeSession = await inviteeAuth.authenticateSession(inviteeIssued.accessToken);
+    const ownerContext = {
+      ...ownerSession,
+      kind: "human" as const,
+      requestId: "member-room-create",
+      idempotencyKey: "member-room-create-key",
+    };
+    const created = await authority.executeHuman(
+      ownerContext,
+      { type: "room.create", payload: { name: "Members" } },
+    );
+    const issuedInvitation = await authority.executeHuman(
+      {
+        ...ownerContext,
+        requestId: "member-invite-issue",
+        idempotencyKey: "member-invite-issue-key",
+      },
+      {
+        type: "human.invitation.issue",
+        roomId: created.aggregateId,
+        payload: { inviteeActorId: "human-chen" },
+      },
+    );
+    const invitationToken = invitationTokenFrom(issuedInvitation);
+    const decideContext = {
+      ...inviteeSession,
+      kind: "human" as const,
+      requestId: "member-invite-accept",
+      idempotencyKey: "member-invite-decision-key",
+    };
+    const acceptCommand = {
+      type: "human.invitation.decide",
+      payload: { token: invitationToken, decision: "accept" },
+    } as const;
+
+    const accepted = await authority.executeHuman(decideContext, acceptCommand);
+    expect(
+      await authority.executeHuman(
+        { ...decideContext, requestId: "member-invite-accept-replay" },
+        acceptCommand,
+      ),
+    ).toEqual(accepted);
+    expect(accepted.eventIds).toHaveLength(2);
+    await expect(
+      authority.executeHuman(
+        { ...decideContext, requestId: "member-invite-decision-conflict" },
+        { ...acceptCommand, payload: { ...acceptCommand.payload, decision: "reject" } },
+      ),
+    ).rejects.toMatchObject({ status: 409, code: "idempotency_conflict" });
+
+    const roleContext = {
+      ...ownerContext,
+      requestId: "member-role-admin",
+      idempotencyKey: "member-role-key",
+    };
+    const roleCommand = {
+      type: "human.role.change",
+      roomId: created.aggregateId,
+      payload: { targetActorId: "human-chen", role: "admin" },
+    } as const;
+    const roleChanged = await authority.executeHuman(roleContext, roleCommand);
+    expect(
+      await authority.executeHuman(
+        { ...roleContext, requestId: "member-role-replay" },
+        roleCommand,
+      ),
+    ).toEqual(roleChanged);
+    expect(roleChanged.eventIds).toHaveLength(2);
+    await expect(
+      authority.executeHuman(
+        { ...roleContext, requestId: "member-role-conflict" },
+        { ...roleCommand, payload: { ...roleCommand.payload, role: "member" } },
+      ),
+    ).rejects.toMatchObject({ status: 409, code: "idempotency_conflict" });
+
+    const inviteeMessage = {
+      type: "message.send",
+      roomId: created.aggregateId,
+      payload: {
+        id: "message-by-removed-member",
+        roomId: created.aggregateId,
+        body: "retain this authored message",
+        sentAt: "2026-08-10T12:30:00.000Z",
+      },
+    } as const;
+    await authority.executeHuman(
+      {
+        ...inviteeSession,
+        kind: "human",
+        requestId: "member-message",
+        idempotencyKey: "member-message-key",
+      },
+      inviteeMessage,
+    );
+
+    const removeContext = {
+      ...ownerContext,
+      requestId: "member-remove",
+      idempotencyKey: "member-remove-key",
+    };
+    const removeCommand = {
+      type: "member.remove",
+      roomId: created.aggregateId,
+      payload: { targetActorId: "human-chen" },
+    } as const;
+    const removed = await authority.executeHuman(removeContext, removeCommand);
+    expect(
+      await authority.executeHuman(
+        { ...removeContext, requestId: "member-remove-replay" },
+        removeCommand,
+      ),
+    ).toEqual(removed);
+    expect(removed.eventIds).toHaveLength(2);
+    await expect(
+      authority.executeHuman(
+        { ...removeContext, requestId: "member-remove-conflict" },
+        { ...removeCommand, payload: { targetActorId: "agent-review" } },
+      ),
+    ).rejects.toMatchObject({ status: 409, code: "idempotency_conflict" });
+    await client.close();
+
+    const database = new DatabaseSync(databasePath, { readOnly: true });
+    expect(
+      database
+        .prepare("SELECT COUNT(*) AS count FROM room_memberships WHERE actor_id = 'human-chen'")
+        .get(),
+    ).toEqual({ count: 0 });
+    expect(
+      database
+        .prepare("SELECT COUNT(*) AS count FROM messages WHERE id = 'message-by-removed-member'")
+        .get(),
+    ).toEqual({ count: 1 });
+    expect(
+      database
+        .prepare("SELECT catalog_revision AS catalogRevision FROM actors WHERE id = 'human-chen'")
+        .get(),
+    ).toEqual({ catalogRevision: 3 });
+    expect(
+      database
+        .prepare("SELECT COUNT(*) AS count FROM events WHERE event_type IN ('human.invitation.accepted', 'human.role.changed', 'member.removed')")
+        .get(),
+    ).toEqual({ count: 3 });
+    database.close();
+  });
+
+  it("rechecks current room membership before replaying an old exact message acknowledgement", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-replay-after-removal-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const fixture = await createHumanCommandFixture(databasePath);
+    await fixture.authority.executeHuman(fixture.context, messageCommand);
+    await fixture.client.close();
+
+    const database = new DatabaseSync(databasePath);
+    database
+      .prepare("DELETE FROM room_memberships WHERE room_id = ? AND actor_id = ?")
+      .run(messageCommand.roomId, fixture.context.principal.actorId);
+    database.close();
+
+    const restartedClient = await createWorkerDatabaseClient({ databasePath });
+    const restartedAuthority = createSqliteAuthoritativeStore(restartedClient, {
+      clock: () => 9_000,
+    });
+    await expect(
+      restartedAuthority.executeHuman(
+        { ...fixture.context, requestId: "message-replay-after-removal" },
+        messageCommand,
+      ),
+    ).rejects.toMatchObject({ status: 403, code: "room_forbidden" });
+    await restartedClient.close();
+
+    expect(readMessageCommandCounts(databasePath)).toEqual({
+      messages: 1,
+      events: 1,
+      outbox: 1,
+      idempotency: 1,
+    });
+  });
+
+  it("reads, authorizes, retries, and marks durable outbox deliveries", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-outbox-store-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const fixture = await createRoomGovernanceFixture(databasePath);
+    const candidate = {
+      connectionId: "connection-owner",
+      principal: fixture.context.principal,
+      sessionId: fixture.context.sessionId,
+      sessionFamilyId: fixture.context.sessionFamilyId,
+      credentialGeneration: 1,
+    };
+
+    const initial = await fixture.authority.listPendingOutbox(10);
+    expect(initial.map((item) => item.targetKind).sort()).toEqual(["principal", "room"]);
+    expect(initial.every((item) => item.event.eventId === item.eventId)).toBe(true);
+    await fixture.client.close();
+
+    const membershipDatabase = new DatabaseSync(databasePath);
+    membershipDatabase
+      .prepare("DELETE FROM room_memberships WHERE room_id = ? AND actor_id = ?")
+      .run(fixture.roomId, candidate.principal.actorId);
+    membershipDatabase.close();
+
+    const restartedClient = await createWorkerDatabaseClient({ databasePath });
+    const restartedAuthority = createSqliteAuthoritativeStore(restartedClient, {
+      clock: () => 3_000,
+    });
+    const replayed = await restartedAuthority.listPendingOutbox(10);
+    expect(replayed).toEqual(initial);
+    await expect(
+      restartedAuthority.authorizeOutboxCandidate(
+        replayed.find((item) => item.targetKind === "room")!,
+        candidate,
+      ),
+    ).resolves.toBe(false);
+    await expect(
+      restartedAuthority.authorizeOutboxCandidate(
+        replayed.find((item) => item.targetKind === "principal")!,
+        candidate,
+      ),
+    ).resolves.toBe(true);
+
+    await restartedAuthority.revoke(candidate.sessionId, 3_000);
+    const afterRevoke = await restartedAuthority.listPendingOutbox(10);
+    const terminal = afterRevoke.find((item) => item.targetKind === "session-family")!;
+    await expect(
+      restartedAuthority.authorizeOutboxCandidate(terminal, candidate),
+    ).resolves.toBe(true);
+    await expect(
+      restartedAuthority.authorizeOutboxCandidate(
+        initial.find((item) => item.targetKind === "principal")!,
+        candidate,
+      ),
+    ).resolves.toBe(false);
+
+    const retry = initial.find((item) => item.targetKind === "room")!;
+    await restartedAuthority.markOutboxFailed(retry.deliveryId, "closed");
+    expect(
+      (await restartedAuthority.listPendingOutbox(10))
+        .find((item) => item.deliveryId === retry.deliveryId)?.attempts,
+    ).toBe(1);
+    await restartedClient.close();
+
+    const failedDatabase = new DatabaseSync(databasePath, { readOnly: true });
+    expect(failedDatabase.prepare(
+      `SELECT attempts, last_error AS lastError, status
+       FROM outbox_deliveries WHERE id = ?`,
+    ).get(retry.deliveryId)).toEqual({ attempts: 1, lastError: "closed", status: "pending" });
+    failedDatabase.close();
+
+    const finalClient = await createWorkerDatabaseClient({ databasePath });
+    const finalAuthority = createSqliteAuthoritativeStore(finalClient, { clock: () => 9_000 });
+    for (const item of await finalAuthority.listPendingOutbox(10)) {
+      await finalClient.markOutboxDispatched(item.deliveryId, 9_000);
+      await finalClient.markOutboxDispatched(item.deliveryId, 10_000);
+    }
+    await expect(finalAuthority.listPendingOutbox(10)).resolves.toEqual([]);
+
+    const dispatchedDatabase = new DatabaseSync(databasePath, { readOnly: true });
+    expect(dispatchedDatabase.prepare(
+      `SELECT attempts, delivered_at AS deliveredAt, last_error AS lastError, status
+       FROM outbox_deliveries WHERE id = ?`,
+    ).get(retry.deliveryId)).toEqual({
+      attempts: 1,
+      deliveredAt: "1970-01-01T00:00:09.000Z",
+      lastError: null,
+      status: "dispatched",
+    });
+    dispatchedDatabase.close();
+
+    await expect(
+      finalClient.markOutboxDispatched("delivery-missing", 10_000),
+    ).rejects.toMatchObject({ status: 503, code: "storage_unavailable" });
+    await expect(finalClient.close()).rejects.toMatchObject({
+      status: 503,
+      code: "storage_unavailable",
+    });
+  });
+
+  it("fails closed when a session-family delivery does not join to a revoked-session event", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-outbox-pairing-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const fixture = await createRoomGovernanceFixture(databasePath);
+    await fixture.client.close();
+
+    const database = new DatabaseSync(databasePath);
+    database.prepare(
+      `UPDATE outbox_deliveries
+       SET target_kind = 'session-family', target_id = 'family-corrupt'
+       WHERE target_kind = 'principal'`,
+    ).run();
+    database.close();
+
+    const restartedClient = await createWorkerDatabaseClient({ databasePath });
+    const restartedAuthority = createSqliteAuthoritativeStore(restartedClient);
+    await expect(restartedAuthority.listPendingOutbox(10)).rejects.toMatchObject({
+      code: "storage_unavailable",
+    });
+    await restartedClient.close().catch(() => undefined);
   });
 
   it("authenticates the same session context after a worker restart", async () => {
@@ -225,7 +2426,54 @@ describe("SQLite authoritative sessions", () => {
         )
         .get(),
     ).toEqual({ count: 2 });
+    expect(database.prepare(
+      `SELECT payload_json AS payloadJson FROM events
+       WHERE stream_kind = 'identity' AND stream_id = 'human-li'
+         AND event_type = 'identity.actor.registered'`,
+    ).get()).toEqual({
+      payloadJson:
+        '{"actor":{"displayName":"Lionel","id":"human-li","kind":"human","reachability":"online"}}',
+    });
     database.close();
+  });
+
+  it("derives the same canonical registration event ID across Actor property orderings", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-actor-canonical-id-"));
+    temporaryDirectories.push(directory);
+    const firstPath = join(directory, "first.sqlite");
+    const secondPath = join(directory, "second.sqlite");
+    const firstClient = await createWorkerDatabaseClient({ databasePath: firstPath });
+    const secondClient = await createWorkerDatabaseClient({ databasePath: secondPath });
+    const firstAuthority = createSqliteAuthoritativeStore(firstClient);
+    const secondAuthority = createSqliteAuthoritativeStore(secondClient);
+
+    await firstAuthority.registerActors([{
+      id: "human-canonical",
+      kind: "human",
+      displayName: "Canonical Human",
+      reachability: "online",
+    }]);
+    await secondAuthority.registerActors([{
+      reachability: "online",
+      displayName: "Canonical Human",
+      kind: "human",
+      id: "human-canonical",
+    }]);
+    await firstClient.close();
+    await secondClient.close();
+
+    const readIdentityEvent = (databasePath: string): unknown => {
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      try {
+        return database.prepare(
+          `SELECT event_id AS eventId, payload_json AS payloadJson
+           FROM events WHERE event_type = 'identity.actor.registered'`,
+        ).get();
+      } finally {
+        database.close();
+      }
+    };
+    expect(readIdentityEvent(secondPath)).toEqual(readIdentityEvent(firstPath));
   });
 
   it("rotates within one family and revokes the family on refresh replay", async () => {

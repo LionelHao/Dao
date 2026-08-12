@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  isInternalAgentCommandContext,
+  mintInternalAgentCommandContext,
   parsePersistedIdentityEvent,
   parsePersistedRoomEvent,
   parsePersistentCommand,
+  toAgentWorkerCommandContext,
 } from "./contracts.js";
 
 const acceptedCommands: readonly unknown[] = [
@@ -52,6 +55,32 @@ const acceptedCommands: readonly unknown[] = [
   { type: "human.role.change", roomId: "room-1", payload: { targetActorId: "human-2", role: "admin" } },
   { type: "member.remove", roomId: "room-1", payload: { targetActorId: "human-2" } },
 ];
+
+describe("server-private Agent command capability", () => {
+  it("rejects JSON and structurally similar objects but emits a closed cloneable worker context after minting", () => {
+    const forged = {
+      kind: "agent",
+      agent: { actorId: "agent-1", kind: "agent" },
+      requestId: "request-1",
+      idempotencyKey: "key-1",
+    };
+    expect(isInternalAgentCommandContext(forged)).toBe(false);
+    expect(() => toAgentWorkerCommandContext(forged as never)).toThrowError(
+      expect.objectContaining({ code: "agent_capability_forbidden" }),
+    );
+
+    const capability = mintInternalAgentCommandContext({
+      agentId: "agent-1",
+      requestId: "request-1",
+      idempotencyKey: "key-1",
+    });
+    expect(isInternalAgentCommandContext(capability)).toBe(true);
+    const wire = toAgentWorkerCommandContext(capability);
+    expect(wire).toEqual(forged);
+    expect(structuredClone(wire)).toEqual(wire);
+    expect(isInternalAgentCommandContext(structuredClone(capability))).toBe(false);
+  });
+});
 
 const roomEventBase = {
   eventId: "event-1",

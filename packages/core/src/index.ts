@@ -329,6 +329,7 @@ export {
 export type {
   PersistedIdentityEvent,
   PersistedRoomEvent,
+  LegacyUnknownCalibrationSignal,
   RoomCursor,
   RoomRepairPage,
   RoomRepairRecord,

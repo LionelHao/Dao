@@ -31,6 +31,15 @@ export type SnapshotDeliveryMode =
   | { readonly mode: "materialized"; readonly expiresAt: string; readonly idleExpiresAt?: never }
   | { readonly mode: "streaming"; readonly idleExpiresAt: string; readonly expiresAt?: never };
 
+export interface LegacyUnknownCalibrationSignal {
+  readonly id: string;
+  readonly sourceMessageId: null;
+  readonly actorId: null;
+  readonly agentId: string;
+  readonly emoji: "👍" | "👎";
+  readonly createdAt: string;
+}
+
 export type RoomRepairRecord =
   | { readonly kind: "room"; readonly value: Omit<ManagedRoom, "members"> }
   | { readonly kind: "membership"; readonly value: HumanRoomMembership | AgentRoomMembership }
@@ -39,7 +48,9 @@ export type RoomRepairRecord =
   | { readonly kind: "agent-judgement"; readonly value: AgentJudgement }
   | { readonly kind: "open-item"; readonly value: OpenItem }
   | { readonly kind: "agent-execution"; readonly value: AgentExecution }
-  | { readonly kind: "calibration"; readonly value: CalibrationSignal };
+  | { readonly kind: "calibration"; readonly value: CalibrationSignal }
+  | { readonly kind: "legacy-unknown-calibration";
+      readonly value: LegacyUnknownCalibrationSignal };
 
 export type SnapshotVersion =
   | { readonly kind: "room"; readonly roomId: string; readonly watermark: number }
@@ -79,6 +90,7 @@ export interface RoomCursor {
   readonly version: 1;
   readonly roomId: string;
   readonly afterSeq: number;
+  readonly watermark?: number;
 }
 
 export interface RoomSyncRequest {
@@ -224,8 +236,15 @@ function isDeliveryMode(value: UnknownRecord): boolean {
 }
 
 export function isRoomCursor(value: unknown): value is RoomCursor {
-  return isRecord(value) && exact(value, ["version", "roomId", "afterSeq"]) &&
-    value.version === 1 && text(value.roomId) && count(value.afterSeq);
+  return isRecord(value) &&
+    exact(
+      value,
+      ["version", "roomId", "afterSeq"],
+      Object.hasOwn(value, "watermark") ? ["watermark"] : [],
+    ) &&
+    value.version === 1 && text(value.roomId) && count(value.afterSeq) &&
+    (!Object.hasOwn(value, "watermark") ||
+      (count(value.watermark) && value.watermark >= value.afterSeq));
 }
 
 export function isSnapshotVersion(value: unknown): value is SnapshotVersion {
@@ -250,6 +269,14 @@ function isRepairRecord(value: unknown): value is RoomRepairRecord {
   if (value.kind === "open-item") return isOpenItem(value.value);
   if (value.kind === "agent-execution") return isAgentExecution(value.value);
   if (value.kind === "calibration") return isCalibrationSignal(value.value);
+  if (value.kind === "legacy-unknown-calibration") {
+    const legacy = value.value;
+    return isRecord(legacy) && exact(legacy,
+      ["id", "sourceMessageId", "actorId", "agentId", "emoji", "createdAt"]) &&
+      text(legacy.id) && legacy.sourceMessageId === null && legacy.actorId === null &&
+      text(legacy.agentId) && (legacy.emoji === "👍" || legacy.emoji === "👎") &&
+      text(legacy.createdAt);
+  }
   if (value.kind === "room") return isRoomMetadata(value.value);
   if (value.kind === "membership") return isHumanMembershipValue(value.value) || isAgentMembershipValue(value.value);
   return value.kind === "message" && isMessageValue(value.value);
@@ -334,7 +361,8 @@ export function isRoomSyncResult(value: unknown): value is RoomSyncResult {
   if (value.mode === "repair_required") {
     return exact(value, ["type", "requestId", "mode", "reason", "retainedFromSeq", "watermark"]) &&
       (value.reason === "cursor_absent" || value.reason === "cursor_expired") &&
-      count(value.retainedFromSeq) && count(value.watermark);
+      count(value.retainedFromSeq) && value.retainedFromSeq >= 1 &&
+      count(value.watermark) && value.retainedFromSeq <= value.watermark + 1;
   }
   if (value.mode === "delta") {
     const nextCursor = value.nextCursor;
@@ -343,8 +371,32 @@ export function isRoomSyncResult(value: unknown): value is RoomSyncResult {
       typeof value.hasMore !== "boolean") {
       return false;
     }
-    return value.events.every(isPersistedRoomEventValue) &&
-      value.events.every((event) => event.roomId === nextCursor.roomId);
+    const events = value.events;
+    const eventIds = new Set<string>();
+    if (
+      nextCursor.afterSeq > value.watermark ||
+      value.hasMore !== (nextCursor.afterSeq < value.watermark) ||
+      (value.hasMore
+        ? nextCursor.watermark !== value.watermark
+        : Object.hasOwn(nextCursor, "watermark")) ||
+      !events.every(isPersistedRoomEventValue) ||
+      !events.every((event) => {
+        if (eventIds.has(event.eventId)) return false;
+        eventIds.add(event.eventId);
+        return true;
+      }) ||
+      !events.every((event) =>
+        event.roomId === nextCursor.roomId && event.streamId === nextCursor.roomId)
+    ) {
+      return false;
+    }
+    if (events.length === 0) {
+      return nextCursor.afterSeq === value.watermark;
+    }
+    const lastEvent = events.at(-1);
+    return lastEvent?.streamSeq === nextCursor.afterSeq &&
+      events.every((event, index) =>
+        index === 0 || event.streamSeq === events[index - 1]!.streamSeq + 1);
   }
   return false;
 }

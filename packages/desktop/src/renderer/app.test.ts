@@ -3,9 +3,24 @@ import { describe, expect, it } from "vitest";
 import type {
   AgentActor,
   AgentConfigurationRequest,
+  AgentExecution,
+  AgentJudgement,
+  CalibrationSignal,
+  HumanReadReceipt,
   HumanInvitationRequest,
+  OpenItem,
+  SocialReaction,
 } from "@native-im/core";
 import * as importedApp from "./app.js";
+
+interface RestoredPrimitivePreviewRecords {
+  readonly humanReads: readonly HumanReadReceipt[];
+  readonly agentJudgements: readonly AgentJudgement[];
+  readonly openItems: readonly OpenItem[];
+  readonly agentExecutions: readonly AgentExecution[];
+  readonly socialReactions: readonly SocialReaction[];
+  readonly calibrations: readonly CalibrationSignal[];
+}
 
 type RendererUnderTest = {
   renderEmptyGroupChat?: (root: HTMLElement) => void;
@@ -15,7 +30,10 @@ type RendererUnderTest = {
     actorsById: ReadonlyMap<string, unknown>,
   ) => void;
   renderVisualSeparationPreview?: (root: HTMLElement) => void;
-  renderM2PrimitivesPreview?: (root: HTMLElement) => void;
+  renderM2PrimitivesPreview?: (
+    root: HTMLElement,
+    restored?: RestoredPrimitivePreviewRecords,
+  ) => void;
   renderRoomJoinReview?: (root: HTMLElement) => void;
   renderRoomJoinControls?: (
     root: HTMLElement,
@@ -44,6 +62,139 @@ describe("empty group chat renderer", () => {
 });
 
 describe("verified collaboration primitive renderer", () => {
+  it("rejects malformed or unrelated restored records before mutating the DOM", () => {
+    const empty = (): RestoredPrimitivePreviewRecords => ({
+      humanReads: [], agentJudgements: [], openItems: [], agentExecutions: [],
+      socialReactions: [], calibrations: [],
+    });
+    const read: HumanReadReceipt = {
+      id: "closed-read", messageId: "preview-agent-data", readerId: "human-a",
+      readAt: "2026-08-12T00:00:00.000Z",
+    };
+    const judgement: AgentJudgement = {
+      id: "closed-judgement", messageId: "preview-human-mention", agentId: "agent-a",
+      outcome: "will_respond", reason: "closed", decidedAt: "2026-08-12T00:00:00.000Z",
+    };
+    const wrongEnum = structuredClone(judgement);
+    Reflect.set(wrongEnum, "outcome", "invented");
+    const extraEnvelope = empty();
+    Reflect.set(extraEnvelope, "extra", []);
+    const missingEnvelope = empty();
+    Reflect.deleteProperty(missingEnvelope, "calibrations");
+    const nonArrayEnvelope = empty();
+    Reflect.set(nonArrayEnvelope, "humanReads", {});
+    const cases: RestoredPrimitivePreviewRecords[] = [
+      extraEnvelope, missingEnvelope, nonArrayEnvelope,
+      { ...empty(), humanReads: [Object.assign(structuredClone(read), { extra: true })] },
+      { ...empty(), agentJudgements: [wrongEnum] },
+      { ...empty(), humanReads: [{ ...read, messageId: "other-message" }] },
+      { ...empty(), openItems: [{
+        id: "wrong-room", roomId: "other-room", sourceMessageId: "preview-agent-data",
+        requesterId: "human-a", ownerId: "human-a", content: "closed",
+        status: "pending_response", createdAt: "2026-08-12T00:00:00.000Z",
+        transferChain: [],
+      }] },
+      { ...empty(), humanReads: [read], agentJudgements: [{ ...judgement, id: read.id }] },
+    ];
+
+    for (const restored of cases) {
+      const root = document.createElement("main");
+      root.innerHTML = "<p>unchanged</p>";
+      expect(() => app.renderM2PrimitivesPreview?.(root, restored)).toThrow(TypeError);
+      expect(root.innerHTML).toBe("<p>unchanged</p>");
+    }
+  });
+
+  it("keeps restored human, Agent, request, execution, social, and calibration facts visibly separate", () => {
+    const root = document.createElement("main");
+    const restored: RestoredPrimitivePreviewRecords = {
+      humanReads: [{
+        id: "read-restored",
+        messageId: "preview-agent-data",
+        readerId: "恢复用户甲",
+        readAt: "2026-08-12T13:00:00.000Z",
+      }],
+      agentJudgements: [{
+        id: "judgement-restored",
+        messageId: "preview-human-mention",
+        agentId: "恢复 Agent",
+        outcome: "will_respond",
+        reason: "恢复后仍会回应",
+        decidedAt: "2026-08-12T13:00:01.000Z",
+      }],
+      openItems: [{
+        id: "open-restored",
+        roomId: "preview-room",
+        sourceMessageId: "preview-agent-data",
+        requesterId: "恢复请求者",
+        ownerId: "恢复负责人",
+        content: "恢复后的待答问题",
+        status: "pending_response",
+        createdAt: "2026-08-12T13:00:02.000Z",
+        transferChain: [],
+      }],
+      agentExecutions: [{
+        id: "execution-restored",
+        roomId: "preview-room",
+        sourceMessageId: "preview-human-mention",
+        requesterId: "恢复请求者",
+        agentId: "恢复 Agent",
+        toolName: "restore.inspect",
+        status: "running",
+        startedAt: "2026-08-12T13:00:03.000Z",
+      }],
+      socialReactions: [{
+        id: "social-restored",
+        sourceMessageId: "preview-human-mention",
+        actorId: "恢复用户甲",
+        emoji: "🎉",
+        createdAt: "2026-08-12T13:00:04.000Z",
+      }],
+      calibrations: [{
+        id: "calibration-restored",
+        sourceMessageId: "preview-agent-data",
+        actorId: "恢复用户甲",
+        agentId: "恢复 Agent",
+        emoji: "👍",
+        createdAt: "2026-08-12T13:00:05.000Z",
+      }],
+    };
+
+    app.renderM2PrimitivesPreview?.(root, restored);
+
+    const humanRead = root.querySelector(".human-read-receipt");
+    const agentJudgement = root.querySelector(".agent-judgement");
+    const openItem = root.querySelector(".open-item");
+    const agentExecution = root.querySelector(".agent-invocation");
+    const social = root.querySelector(".reaction--social");
+    const calibration = root.querySelector(".reaction--calibration");
+
+    expect(humanRead?.textContent).toContain("恢复用户甲");
+    expect(humanRead?.textContent).toContain("已读");
+    expect(agentJudgement?.textContent).toContain("恢复后仍会回应");
+    expect(agentJudgement?.textContent).toContain("已判定");
+    expect(openItem?.textContent).toContain("恢复后的待答问题");
+    expect(openItem?.textContent).toContain("待答项");
+    expect(agentExecution?.textContent).toContain("恢复 Agent 正在调用 restore.inspect");
+    expect(agentExecution?.textContent).toContain("Agent 执行");
+    expect(social?.textContent).toContain("🎉 纯社交");
+    expect(calibration?.textContent).toContain("👍 校准：影响后续发言判定");
+    expect(humanRead?.getAttribute("data-receipt-kind")).toBe("human-read");
+    expect(agentJudgement?.getAttribute("data-receipt-kind")).toBe("agent-judgement");
+    expect(openItem?.getAttribute("data-open-item-status")).toBe("pending_response");
+    expect(agentExecution?.getAttribute("data-agent-invocation")).toBe("恢复 Agent");
+    expect(agentExecution?.getAttribute("data-execution-status")).toBe("running");
+    expect(social?.getAttribute("data-reaction-kind")).toBe("social");
+    expect(calibration?.getAttribute("data-reaction-kind")).toBe("calibration");
+    expect(humanRead?.classList.contains("agent-judgement")).toBe(false);
+    expect(openItem?.classList.contains("agent-invocation")).toBe(false);
+    expect(social?.classList.contains("reaction--calibration")).toBe(false);
+    expect(humanRead?.closest("article")?.getAttribute("data-message-id"))
+      .toBe("preview-agent-data");
+    expect(agentJudgement?.closest("article")?.getAttribute("data-message-id"))
+      .toBe("preview-human-mention");
+  });
+
   it("T-0012 separates human reads from explainable agent judgements", () => {
     const root = document.createElement("main");
 
@@ -51,8 +202,10 @@ describe("verified collaboration primitive renderer", () => {
     app.renderM2PrimitivesPreview?.(root);
 
     const humanRead = root.querySelector("[data-receipt-kind='human-read']");
-    const agentContent = root.querySelector<HTMLElement>("[data-message-kind='agent'] .message-content");
-    const judgements = agentContent?.querySelectorAll(".agent-judgement");
+    const judgedContent = root.querySelector<HTMLElement>(
+      "[data-message-id='preview-human-mention'] .message-content",
+    );
+    const judgements = judgedContent?.querySelectorAll(".agent-judgement");
     expect(humanRead?.classList.contains("human-read-receipt")).toBe(true);
     expect(humanRead?.textContent).toContain("周安全、陈研发");
     expect(judgements).toHaveLength(3);

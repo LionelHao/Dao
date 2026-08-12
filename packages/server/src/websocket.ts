@@ -1,17 +1,35 @@
 import { createServer, type Server as HttpServer } from "node:http";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import {
+  isRoomRepairPage,
+  isRoomSyncResult,
+  isSnapshotCompleted,
+  isWorkspaceBootstrapPage,
+  type PersistedRoomEvent,
+  type RoomCursor,
+  type SnapshotVersion,
+} from "@native-im/core";
+import {
   AuthenticationError,
   type AuthenticatedPrincipal,
   type AuthenticationService,
   type IssuedSession,
 } from "./auth.js";
 import {
+  createOutboxDispatcher,
+  type OutboxDispatchFrame,
+  type OutboxDispatchStore,
+  type OutboxSendResult,
+} from "./outbox-dispatcher.js";
+import type { AuthenticatedSessionContext } from "./persistence/contracts.js";
+import type { OutboxDelivery } from "./persistence/contracts.js";
+import {
   MessageValidationError,
   RoomAccessError,
   type MessageService,
 } from "./service.js";
 import { MessageIdConflictError } from "./store.js";
+import type { SyncService } from "./sync-service.js";
 import {
   parseClientFrame,
   type AuthenticatedFrame,
@@ -19,6 +37,11 @@ import {
   type ProtocolErrorFrame,
   type ServerFrame,
 } from "./protocol.js";
+import {
+  createSubscriptionRegistry,
+  type RegisteredConnection,
+  type SubscriptionRegistry,
+} from "./subscription-registry.js";
 
 export interface MessageWebSocketServer {
   readonly url: string;
@@ -34,12 +57,24 @@ export interface StartMessageWebSocketServerOptions {
   readonly maxQueuedFrameCount?: number;
   readonly maxQueuedFrameBytes?: number;
   readonly afterSubscribeRegistered?: (roomId: string) => void | Promise<void>;
+  readonly outboxStore?: OutboxDispatchStore;
+  readonly outboxPollIntervalMs?: number;
+  readonly subscriptionRegistry?: SubscriptionRegistry;
+  readonly sync?: SyncService;
+  readonly v2GateMaxEvents?: number;
+  readonly v2GateMaxBytes?: number;
 }
+
+type RuntimeMessageWebSocketServerOptions = StartMessageWebSocketServerOptions & {
+  readonly streamingOwners: Map<string, StreamingSnapshotOwners>;
+};
 
 export const MESSAGE_WEBSOCKET_MAX_PAYLOAD_BYTES = 64 * 1_024;
 export const MESSAGE_WEBSOCKET_MAX_BUFFERED_AMOUNT_BYTES = 1 * 1_024 * 1_024;
 export const MESSAGE_WEBSOCKET_MAX_QUEUED_FRAME_COUNT = 64;
 export const MESSAGE_WEBSOCKET_MAX_QUEUED_FRAME_BYTES = 256 * 1_024;
+export const MESSAGE_WEBSOCKET_V2_GATE_MAX_EVENTS = 256;
+export const MESSAGE_WEBSOCKET_V2_GATE_MAX_BYTES = 256 * 1_024;
 
 const maxBufferedAmountBySocket = new WeakMap<WebSocket, number>();
 const abortConnectionBySocket = new WeakMap<WebSocket, () => void>();
@@ -51,13 +86,38 @@ function abortAndTerminate(socket: WebSocket): void {
 
 interface ConnectionContext {
   principal: AuthenticatedPrincipal | undefined;
+  session: AuthenticatedSessionContext | undefined;
   accessToken: string | undefined;
   credentialGeneration: number;
   authOperationPending: boolean;
+  terminalRevocationPending: boolean;
   closed: boolean;
   readonly unsubscribersByRoom: Map<string, () => void>;
+  readonly identityUnsubscribers: Set<() => void>;
   readonly subscriptionGenerationsByRoom: Map<string, number>;
+  readonly ownedStreamingSnapshots: Map<string, AuthenticatedSessionContext>;
+  readonly connectionId: string;
+  readonly v2GatesByRoom: Map<string, V2SubscriptionGate>;
+  readonly clearLiveSubscriptions: () => void;
+  readonly clearRoomSubscriptions: () => void;
+  readonly releaseSnapshotOwners: () => void;
   readonly unsubscribeAll: () => void;
+  registeredConnection: RegisteredConnection | undefined;
+}
+
+interface V2SubscriptionGate {
+  readonly requestId: string;
+  readonly roomId: string;
+  credentialGeneration: number;
+  readonly subscriptionGeneration: number;
+  readonly seenEventIds: Set<string>;
+  readonly bufferedEvents: PersistedRoomEvent[];
+  bufferedBytes: number;
+  overflowed: boolean;
+  active: boolean;
+  cursor: RoomCursor;
+  lastContiguousEventId: string | undefined;
+  unsubscribe: (() => void) | undefined;
 }
 
 function errorFrame(
@@ -85,18 +145,84 @@ function mappedError(error: unknown, requestId: string): ProtocolErrorFrame {
   if (error instanceof MessageIdConflictError) {
     return errorFrame(error.status, error.code, error.code, requestId);
   }
+  const mapped = normalizeServiceError(error);
+  if (mapped !== undefined) {
+    return errorFrame(mapped.status, mapped.code, mapped.code, requestId);
+  }
   return errorFrame(500, "internal_error", "Unable to process request", requestId);
 }
 
-function sendFrame(socket: WebSocket, frame: ServerFrame): void {
+const MAPPED_SERVICE_ERROR_STATUSES = new Map<ProtocolErrorFrame["code"], ProtocolErrorFrame["status"]>([
+  ["invalid_token", 401],
+  ["token_expired", 401],
+  ["session_revoked", 403],
+  ["snapshot_family_revoked", 403],
+  ["invalid_request", 400],
+  ["unauthenticated", 401],
+  ["room_forbidden", 403],
+  ["snapshot_forbidden", 403],
+  ["snapshot_not_found", 404],
+  ["room_not_found", 404],
+  ["room_archived", 409],
+  ["snapshot_stale", 409],
+  ["snapshot_expired", 410],
+  ["snapshot_busy", 429],
+  ["repair_barrier_active", 503],
+  ["storage_unavailable", 503],
+]);
+
+const STORAGE_UNAVAILABLE_ERROR_CODES = new Set([
+  "authority_not_initialized",
+  "authority_worker_closed",
+  "authority_worker_error",
+  "authority_worker_exited",
+  "authority_worker_message_error",
+  "authority_worker_not_ready",
+  "authority_worker_post_failed",
+  "authority_worker_protocol_error",
+  "invitation_secret_unavailable",
+  "legacy_import_failed",
+  "legacy_import_unavailable",
+  "snapshot_worker_closed",
+  "snapshot_worker_error",
+  "snapshot_worker_exited",
+  "snapshot_worker_message_error",
+  "snapshot_worker_protocol_error",
+]);
+
+function normalizeServiceError(error: unknown): {
+  readonly status: ProtocolErrorFrame["status"];
+  readonly code: ProtocolErrorFrame["code"];
+} | undefined {
+  if (
+    typeof error !== "object" ||
+    error === null ||
+    !("status" in error) ||
+    !("code" in error) ||
+    typeof error.code !== "string"
+  ) {
+    return undefined;
+  }
+  if (STORAGE_UNAVAILABLE_ERROR_CODES.has(error.code) && error.status === 503) {
+    return { status: 503, code: "storage_unavailable" };
+  }
+  const code = error.code as ProtocolErrorFrame["code"];
+  const status = MAPPED_SERVICE_ERROR_STATUSES.get(code);
+  return status !== undefined && status === error.status ? { status, code } : undefined;
+}
+
+function sendFrameWithResult(
+  socket: WebSocket,
+  frame: ServerFrame,
+): Promise<OutboxSendResult> {
   if (socket.readyState !== WebSocket.OPEN) {
-    return;
+    return Promise.resolve({ accepted: false, reason: "closed" });
   }
   try {
     const serialized = JSON.stringify(frame);
     if (serialized === undefined) {
       abortAndTerminate(socket);
-      return;
+      return Promise.resolve({ accepted: false, reason: "send_rejected" });
     }
     const maxBufferedAmount =
       maxBufferedAmountBySocket.get(socket) ??
@@ -104,12 +230,31 @@ function sendFrame(socket: WebSocket, frame: ServerFrame): void {
     const frameBytes = Buffer.byteLength(serialized, "utf8");
     if (frameBytes > maxBufferedAmount - socket.bufferedAmount) {
       abortAndTerminate(socket);
-      return;
+      return Promise.resolve({ accepted: false, reason: "backpressure" });
     }
-    socket.send(serialized);
+    return new Promise<OutboxSendResult>((resolve) => {
+      try {
+        socket.send(serialized, (error) => {
+          if (error != null) {
+            abortAndTerminate(socket);
+            resolve({ accepted: false, reason: "send_rejected" });
+            return;
+          }
+          resolve({ accepted: true });
+        });
+      } catch {
+        abortAndTerminate(socket);
+        resolve({ accepted: false, reason: "send_rejected" });
+      }
+    });
   } catch {
     abortAndTerminate(socket);
+    return Promise.resolve({ accepted: false, reason: "send_rejected" });
   }
+}
+
+function sendFrame(socket: WebSocket, frame: ServerFrame): void {
+  void sendFrameWithResult(socket, frame);
 }
 
 function rawDataToString(raw: RawData): string {
@@ -153,6 +298,14 @@ function closeWebSocketServer(server: WebSocketServer): Promise<void> {
   });
 }
 
+function throwCleanupFailures(message: string, results: readonly PromiseSettledResult<void>[]): void {
+  const failures = results.flatMap((result) =>
+    result.status === "rejected" ? [result.reason] : []);
+  if (failures.length > 0) {
+    throw new AggregateError(failures, message);
+  }
+}
+
 function safelyUnsubscribe(unsubscribe: (() => void) | undefined): void {
   try {
     unsubscribe?.();
@@ -170,6 +323,109 @@ function onceUnsubscribe(unsubscribe: () => void): () => void {
     active = false;
     safelyUnsubscribe(unsubscribe);
   };
+}
+
+function canonicalEventBytes(event: PersistedRoomEvent): number {
+  return Buffer.byteLength(JSON.stringify(event), "utf8");
+}
+
+function cleanupV2Gate(context: ConnectionContext, gate: V2SubscriptionGate): void {
+  if (context.v2GatesByRoom.get(gate.roomId) === gate) {
+    context.v2GatesByRoom.delete(gate.roomId);
+  }
+  if (context.unsubscribersByRoom.get(gate.roomId) === gate.unsubscribe) {
+    context.unsubscribersByRoom.delete(gate.roomId);
+  }
+  safelyUnsubscribe(gate.unsubscribe);
+  gate.unsubscribe = undefined;
+}
+
+function unsubscribeV2Gate(context: ConnectionContext, gate: V2SubscriptionGate): void {
+  if (context.unsubscribersByRoom.get(gate.roomId) === gate.unsubscribe) {
+    context.unsubscribersByRoom.delete(gate.roomId);
+  }
+  safelyUnsubscribe(gate.unsubscribe);
+  gate.unsubscribe = undefined;
+}
+
+function captureV2Delivery(
+  gate: V2SubscriptionGate,
+  event: PersistedRoomEvent,
+  maxEvents: number,
+  maxBytes: number,
+): "captured" | "duplicate" | "overflow" | "corrupt" {
+  if (gate.seenEventIds.has(event.eventId)) {
+    return "duplicate";
+  }
+  if (event.streamSeq < gate.cursor.afterSeq) {
+    return "duplicate";
+  }
+  if (event.streamSeq === gate.cursor.afterSeq) {
+    return gate.lastContiguousEventId === undefined ||
+      gate.lastContiguousEventId === event.eventId
+      ? "duplicate"
+      : "corrupt";
+  }
+  if (gate.bufferedEvents.some((buffered) => buffered.streamSeq === event.streamSeq)) {
+    return "corrupt";
+  }
+  const eventBytes = canonicalEventBytes(event);
+  if (
+    gate.bufferedEvents.length >= maxEvents ||
+    eventBytes > maxBytes - gate.bufferedBytes
+  ) {
+    gate.overflowed = true;
+    return "overflow";
+  }
+  gate.seenEventIds.add(event.eventId);
+  gate.bufferedEvents.push(event);
+  gate.bufferedBytes += eventBytes;
+  return "captured";
+}
+
+function removeBufferedEvent(gate: V2SubscriptionGate, event: PersistedRoomEvent): void {
+  const index = gate.bufferedEvents.indexOf(event);
+  if (index < 0) {
+    return;
+  }
+  gate.bufferedEvents.splice(index, 1);
+  gate.bufferedBytes -= canonicalEventBytes(event);
+  gate.seenEventIds.delete(event.eventId);
+}
+
+async function drainContiguousV2Events(
+  socket: WebSocket,
+  context: ConnectionContext,
+  gate: V2SubscriptionGate,
+): Promise<OutboxSendResult> {
+  while (true) {
+    const nextSequence = gate.cursor.afterSeq + 1;
+    const event = gate.bufferedEvents.find(
+      (buffered) => buffered.streamSeq === nextSequence,
+    );
+    if (event === undefined) {
+      return { accepted: true };
+    }
+    if (
+      context.closed ||
+      context.credentialGeneration !== gate.credentialGeneration ||
+      context.subscriptionGenerationsByRoom.get(gate.roomId) !==
+        gate.subscriptionGeneration
+    ) {
+      return { accepted: false, reason: "closed" };
+    }
+    const result = await sendFrameWithResult(socket, { type: "room.event", event });
+    if (!result.accepted) {
+      return result;
+    }
+    removeBufferedEvent(gate, event);
+    gate.cursor = {
+      version: 1,
+      roomId: gate.roomId,
+      afterSeq: event.streamSeq,
+    };
+    gate.lastContiguousEventId = event.eventId;
+  }
 }
 
 function samePrincipal(
@@ -207,19 +463,52 @@ function installAuthentication(
   context: ConnectionContext,
   principal: AuthenticatedPrincipal,
   accessToken: string,
+  session?: AuthenticatedSessionContext,
 ): boolean {
   if (context.closed) {
     return false;
   }
   context.credentialGeneration += 1;
+  for (const gate of [...context.v2GatesByRoom.values()]) {
+    if (gate.active) {
+      gate.credentialGeneration = context.credentialGeneration;
+    } else {
+      cleanupV2Gate(context, gate);
+    }
+  }
   context.principal = principal;
+  context.session = session;
   context.accessToken = accessToken;
   return true;
+}
+
+function registerIdentitySubscriptions(
+  context: ConnectionContext,
+  registry: SubscriptionRegistry | undefined,
+): void {
+  for (const unsubscribe of context.identityUnsubscribers) {
+    safelyUnsubscribe(unsubscribe);
+  }
+  context.identityUnsubscribers.clear();
+  const connection = context.registeredConnection;
+  const session = context.session;
+  if (registry === undefined || connection === undefined || session === undefined) {
+    return;
+  }
+  context.identityUnsubscribers.add(registry.addPrincipal({
+    principalId: session.principal.actorId,
+    connection,
+  }));
+  context.identityUnsubscribers.add(registry.addSessionFamily({
+    familyId: session.sessionFamilyId,
+    connection,
+  }));
 }
 
 function clearAuthentication(
   context: ConnectionContext,
   expectedGeneration?: number,
+  preserveRefreshState = false,
 ): boolean {
   if (
     expectedGeneration !== undefined &&
@@ -228,9 +517,17 @@ function clearAuthentication(
     return false;
   }
   context.credentialGeneration += 1;
-  context.principal = undefined;
+  if (!preserveRefreshState) {
+    context.principal = undefined;
+    context.session = undefined;
+  }
   context.accessToken = undefined;
-  context.unsubscribeAll();
+  if (preserveRefreshState) {
+    context.clearRoomSubscriptions();
+  } else {
+    context.clearLiveSubscriptions();
+    context.releaseSnapshotOwners();
+  }
   return true;
 }
 
@@ -254,7 +551,11 @@ async function authenticateCurrent(
   }
 
   try {
-    const principal = await options.auth.authenticate(accessToken);
+    const authenticatedSession = options.outboxStore === undefined
+      ? undefined
+      : await options.auth.authenticateSession(accessToken);
+    const principal = authenticatedSession?.principal ??
+      await options.auth.authenticate(accessToken);
     if (
       context.closed ||
       context.credentialGeneration !== credentialGeneration ||
@@ -266,9 +567,24 @@ async function authenticateCurrent(
       clearAuthentication(context, credentialGeneration);
       throw errorFrame(403, "identity_forbidden", "Session identity changed");
     }
+    if (authenticatedSession !== undefined) {
+      context.session = authenticatedSession;
+    }
     return principal;
   } catch (error: unknown) {
-    clearAuthentication(context, credentialGeneration);
+    if (
+      options.outboxStore !== undefined &&
+      error instanceof AuthenticationError &&
+      error.code === "session_revoked"
+    ) {
+      context.terminalRevocationPending = true;
+    } else {
+      clearAuthentication(
+        context,
+        credentialGeneration,
+        error instanceof AuthenticationError && error.code === "token_expired",
+      );
+    }
     throw error;
   }
 }
@@ -318,6 +634,303 @@ async function requirePrincipal(
   }
 }
 
+async function requireSession(
+  socket: WebSocket,
+  requestId: string,
+  options: StartMessageWebSocketServerOptions,
+  context: ConnectionContext,
+): Promise<AuthenticatedSessionContext | undefined> {
+  const principal = await requirePrincipal(socket, requestId, options, context);
+  if (principal === undefined) {
+    return undefined;
+  }
+  if (context.session !== undefined) {
+    return context.session;
+  }
+  const accessToken = context.accessToken;
+  const generation = context.credentialGeneration;
+  if (accessToken === undefined) {
+    return undefined;
+  }
+  try {
+    const session = await options.auth.authenticateSession(accessToken);
+    if (
+      context.closed ||
+      context.credentialGeneration !== generation ||
+      context.accessToken !== accessToken
+    ) {
+      return undefined;
+    }
+    if (!samePrincipal(session.principal, principal)) {
+      clearAuthentication(context, generation);
+      sendFrame(
+        socket,
+        errorFrame(403, "identity_forbidden", "Session identity changed", requestId),
+      );
+      return undefined;
+    }
+    context.session = session;
+    return session;
+  } catch (error: unknown) {
+    if (!context.closed && context.credentialGeneration === generation) {
+      sendFrame(socket, mappedError(error, requestId));
+    }
+    return undefined;
+  }
+}
+
+function sendCurrentGeneration(
+  socket: WebSocket,
+  frame: ServerFrame,
+  expectedGeneration: number,
+  context: ConnectionContext,
+): boolean {
+  if (context.closed || context.credentialGeneration !== expectedGeneration) {
+    return false;
+  }
+  sendFrame(socket, frame);
+  return true;
+}
+
+function rememberStreamingSnapshot(
+  frame: ServerFrame,
+  session: AuthenticatedSessionContext,
+  context: ConnectionContext,
+  streamingOwners: Map<string, StreamingSnapshotOwners>,
+): void {
+  if (
+    (frame.type === "room.repair.page" || frame.type === "workspace.bootstrap.page") &&
+    frame.mode === "streaming"
+  ) {
+    context.ownedStreamingSnapshots.set(frame.snapshotId, session);
+    const key = `${session.sessionFamilyId}\u0000${frame.snapshotId}`;
+    const owners = streamingOwners.get(key) ?? {
+      session,
+      snapshotId: frame.snapshotId,
+      connections: new Map<string, ConnectionContext>(),
+    };
+    owners.connections.set(context.connectionId, context);
+    streamingOwners.set(key, owners);
+  }
+}
+
+interface StreamingSnapshotOwners {
+  readonly session: AuthenticatedSessionContext;
+  readonly snapshotId: string;
+  readonly connections: Map<string, ConnectionContext>;
+}
+
+const TERMINAL_SNAPSHOT_ERROR_CODES = new Set([
+  "snapshot_stale",
+  "snapshot_expired",
+  "snapshot_not_found",
+  "snapshot_family_revoked",
+  "snapshot_forbidden",
+]);
+
+function forgetSharedStreamingSnapshot(
+  session: AuthenticatedSessionContext,
+  snapshotId: string,
+  streamingOwners: Map<string, StreamingSnapshotOwners>,
+): void {
+  const key = `${session.sessionFamilyId}\u0000${snapshotId}`;
+  const owners = streamingOwners.get(key);
+  if (owners === undefined) {
+    return;
+  }
+  streamingOwners.delete(key);
+  for (const ownerContext of owners.connections.values()) {
+    ownerContext.ownedStreamingSnapshots.delete(snapshotId);
+  }
+}
+
+function isCorrelatedRecoveryResponse(
+  frame: Exclude<ClientFrame, {
+    readonly type:
+      | "auth.login"
+      | "auth.resume"
+      | "auth.refresh"
+      | "auth.revoke"
+      | "message.send"
+      | "room.history"
+      | "room.subscribe"
+      | "room.subscribe.v2";
+  }>,
+  response: unknown,
+): response is ServerFrame {
+  if (frame.type === "workspace.bootstrap.begin") {
+    return isWorkspaceBootstrapPage(response) &&
+      response.requestId === frame.requestId && response.page === 0;
+  }
+  if (frame.type === "workspace.bootstrap.page") {
+    return isWorkspaceBootstrapPage(response) &&
+      response.requestId === frame.requestId &&
+      response.snapshotId === frame.snapshotId &&
+      response.page === frame.afterPage + 1;
+  }
+  if (frame.type === "room.sync") {
+    return isRoomSyncResult(response) &&
+      response.requestId === frame.requestId &&
+      (response.mode !== "delta" || response.nextCursor.roomId === frame.roomId);
+  }
+  if (frame.type === "room.repair.begin") {
+    return isRoomRepairPage(response) &&
+      response.requestId === frame.requestId &&
+      response.roomId === frame.roomId && response.page === 0;
+  }
+  if (frame.type === "room.repair.page") {
+    return isRoomRepairPage(response) &&
+      response.requestId === frame.requestId &&
+      response.snapshotId === frame.snapshotId &&
+      response.page === frame.afterPage + 1;
+  }
+  return isSnapshotCompleted(response) &&
+    response.requestId === frame.requestId &&
+    response.snapshotId === frame.snapshotId &&
+    sameSnapshotVersion(response.version, frame.version);
+}
+
+function sameSnapshotVersion(left: SnapshotVersion, right: SnapshotVersion): boolean {
+  if (left.kind !== right.kind) {
+    return false;
+  }
+  if (left.kind === "catalog" && right.kind === "catalog") {
+    return left.catalogRevision === right.catalogRevision;
+  }
+  return left.kind === "room" && right.kind === "room" &&
+    left.roomId === right.roomId && left.watermark === right.watermark;
+}
+
+function detachStreamingSnapshot(
+  context: ConnectionContext,
+  session: AuthenticatedSessionContext,
+  snapshotId: string,
+  streamingOwners: Map<string, StreamingSnapshotOwners>,
+): boolean {
+  context.ownedStreamingSnapshots.delete(snapshotId);
+  const key = `${session.sessionFamilyId}\u0000${snapshotId}`;
+  const owners = streamingOwners.get(key);
+  if (owners === undefined) return true;
+  owners.connections.delete(context.connectionId);
+  if (owners.connections.size > 0) return false;
+  streamingOwners.delete(key);
+  return true;
+}
+
+async function handleRecoveryFrame(
+  socket: WebSocket,
+  frame: Exclude<ClientFrame, {
+    readonly type:
+      | "auth.login"
+      | "auth.resume"
+      | "auth.refresh"
+      | "auth.revoke"
+      | "message.send"
+      | "room.history"
+      | "room.subscribe"
+      | "room.subscribe.v2";
+  }>,
+  options: StartMessageWebSocketServerOptions,
+  context: ConnectionContext,
+  streamingOwners: Map<string, StreamingSnapshotOwners>,
+): Promise<void> {
+  const session = await requireSession(socket, frame.requestId, options, context);
+  if (session === undefined) {
+    return;
+  }
+  const generation = context.credentialGeneration;
+  if (options.sync === undefined) {
+    sendCurrentGeneration(
+      socket,
+      errorFrame(503, "storage_unavailable", "storage_unavailable", frame.requestId),
+      generation,
+      context,
+    );
+    return;
+  }
+  try {
+    const response = await (() => {
+      switch (frame.type) {
+        case "workspace.bootstrap.begin":
+          return options.sync.beginWorkspaceBootstrap(session, frame.requestId);
+        case "workspace.bootstrap.page":
+          return options.sync.readWorkspaceBootstrapPage(
+            session,
+            frame.requestId,
+            frame.snapshotId,
+            frame.afterPage,
+          );
+        case "room.sync":
+          return options.sync.syncRoom(session, frame);
+        case "room.repair.begin":
+          return options.sync.beginRoomRepair(session, frame.requestId, frame.roomId);
+        case "room.repair.page":
+          return options.sync.readRoomRepairPage(
+            session,
+            frame.requestId,
+            frame.snapshotId,
+            frame.afterPage,
+          );
+        case "snapshot.complete":
+          return options.sync.completeSnapshot(
+            session,
+            frame.requestId,
+            frame.snapshotId,
+            frame.version,
+            frame.snapshotChecksum,
+          );
+      }
+    })();
+    if (!isCorrelatedRecoveryResponse(frame, response)) {
+      sendCurrentGeneration(
+        socket,
+        errorFrame(503, "storage_unavailable", "storage_unavailable", frame.requestId),
+        generation,
+        context,
+      );
+      return;
+    }
+    rememberStreamingSnapshot(response, session, context, streamingOwners);
+    if (sendCurrentGeneration(socket, response, generation, context)) {
+      if (response.type === "snapshot.completed") {
+        const key = `${session.sessionFamilyId}\u0000${response.snapshotId}`;
+        const owners = streamingOwners.get(key);
+        if (owners !== undefined) {
+          streamingOwners.delete(key);
+          for (const ownerContext of owners.connections.values()) {
+            ownerContext.ownedStreamingSnapshots.delete(response.snapshotId);
+          }
+        }
+        context.ownedStreamingSnapshots.delete(response.snapshotId);
+      }
+    } else if (
+      (response.type === "room.repair.page" ||
+        response.type === "workspace.bootstrap.page") &&
+      response.mode === "streaming"
+    ) {
+      const owner = context.ownedStreamingSnapshots.get(response.snapshotId);
+      const lastOwner = owner === undefined || detachStreamingSnapshot(
+        context, owner, response.snapshotId, streamingOwners,
+      );
+      if (owner !== undefined && lastOwner) {
+        void options.sync.releaseSnapshot(owner, response.snapshotId).catch(() => undefined);
+      }
+    }
+  } catch (error: unknown) {
+    if (
+      "snapshotId" in frame &&
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      typeof error.code === "string" &&
+      TERMINAL_SNAPSHOT_ERROR_CODES.has(error.code)
+    ) {
+      forgetSharedStreamingSnapshot(session, frame.snapshotId, streamingOwners);
+    }
+    sendCurrentGeneration(socket, mappedError(error, frame.requestId), generation, context);
+  }
+}
+
 async function handleLoginOrResume(
   socket: WebSocket,
   frame: Extract<ClientFrame, { type: "auth.login" | "auth.resume" }>,
@@ -349,17 +962,37 @@ async function handleLoginOrResume(
         secret: frame.secret,
       });
       const principal = { accountId: session.accountId, actorId: session.actorId };
-      if (!installAuthentication(context, principal, session.accessToken)) {
+      const authenticatedSession = options.outboxStore === undefined
+        ? undefined
+        : await options.auth.authenticateSession(session.accessToken);
+      if (
+        authenticatedSession !== undefined &&
+        !samePrincipal(authenticatedSession.principal, principal)
+      ) {
+        throw new AuthenticationError(403, "identity_forbidden");
+      }
+      if (!installAuthentication(
+        context,
+        principal,
+        session.accessToken,
+        authenticatedSession,
+      )) {
         return;
       }
+      registerIdentitySubscriptions(context, options.subscriptionRegistry);
       sendFrame(socket, authenticatedFrame(frame.requestId, principal, session));
       return;
     }
 
-    const principal = await options.auth.authenticate(frame.accessToken);
-    if (!installAuthentication(context, principal, frame.accessToken)) {
+    const authenticatedSession = options.outboxStore === undefined
+      ? undefined
+      : await options.auth.authenticateSession(frame.accessToken);
+    const principal = authenticatedSession?.principal ??
+      await options.auth.authenticate(frame.accessToken);
+    if (!installAuthentication(context, principal, frame.accessToken, authenticatedSession)) {
       return;
     }
+    registerIdentitySubscriptions(context, options.subscriptionRegistry);
     sendFrame(socket, authenticatedFrame(frame.requestId, principal));
   } catch (error: unknown) {
     if (!context.closed) {
@@ -416,9 +1049,24 @@ async function handleRefresh(
       return;
     }
 
-    if (!installAuthentication(context, refreshedPrincipal, session.accessToken)) {
+    const authenticatedSession = options.outboxStore === undefined
+      ? undefined
+      : await options.auth.authenticateSession(session.accessToken);
+    if (
+      authenticatedSession !== undefined &&
+      !samePrincipal(authenticatedSession.principal, refreshedPrincipal)
+    ) {
+      throw new AuthenticationError(403, "identity_forbidden");
+    }
+    if (!installAuthentication(
+      context,
+      refreshedPrincipal,
+      session.accessToken,
+      authenticatedSession,
+    )) {
       return;
     }
+    registerIdentitySubscriptions(context, options.subscriptionRegistry);
     sendFrame(
       socket,
       authenticatedFrame(frame.requestId, refreshedPrincipal, session),
@@ -450,12 +1098,16 @@ async function handleRevoke(
   context.authOperationPending = true;
   try {
     await options.auth.revoke(accessToken);
-    clearAuthentication(context);
-    if (!context.closed) {
+    if (options.outboxStore === undefined) {
+      clearAuthentication(context);
       sendFrame(socket, { type: "auth.revoked", requestId: frame.requestId });
+    } else {
+      context.terminalRevocationPending = true;
     }
   } catch (error: unknown) {
-    clearAuthentication(context);
+    if (options.outboxStore === undefined) {
+      clearAuthentication(context);
+    }
     if (!context.closed) {
       sendFrame(socket, mappedError(error, frame.requestId));
     }
@@ -480,6 +1132,71 @@ async function handleSubscribe(
   const previousUnsubscribe = context.unsubscribersByRoom.get(frame.roomId);
   context.unsubscribersByRoom.delete(frame.roomId);
   safelyUnsubscribe(previousUnsubscribe);
+  const previousGate = context.v2GatesByRoom.get(frame.roomId);
+  if (previousGate !== undefined) {
+    cleanupV2Gate(context, previousGate);
+  }
+
+  if (options.outboxStore !== undefined) {
+    const session = context.session;
+    const connection = context.registeredConnection;
+    const registry = options.subscriptionRegistry;
+    if (session === undefined || connection === undefined || registry === undefined) {
+      sendFrame(socket, errorFrame(
+        401,
+        "unauthenticated",
+        "Authentication is required",
+        frame.requestId,
+      ));
+      return;
+    }
+    let unsubscribe: (() => void) | undefined;
+    try {
+      unsubscribe = onceUnsubscribe(registry.addRoom({
+        roomId: frame.roomId,
+        connection,
+      }));
+      context.unsubscribersByRoom.set(frame.roomId, unsubscribe);
+      await options.afterSubscribeRegistered?.(frame.roomId);
+      if (
+        context.closed ||
+        context.subscriptionGenerationsByRoom.get(frame.roomId) !== generation
+      ) {
+        safelyUnsubscribe(unsubscribe);
+        return;
+      }
+      const messages = await options.service.history(session, frame.roomId);
+      if (
+        context.closed ||
+        context.subscriptionGenerationsByRoom.get(frame.roomId) !== generation
+      ) {
+        safelyUnsubscribe(unsubscribe);
+        return;
+      }
+      sendFrame(socket, {
+        type: "room.history",
+        requestId: frame.requestId,
+        roomId: frame.roomId,
+        messages,
+      });
+      sendFrame(socket, {
+        type: "room.subscribed",
+        requestId: frame.requestId,
+        roomId: frame.roomId,
+      });
+      return;
+    } catch (error: unknown) {
+      safelyUnsubscribe(unsubscribe);
+      if (context.unsubscribersByRoom.get(frame.roomId) === unsubscribe) {
+        context.unsubscribersByRoom.delete(frame.roomId);
+      }
+      context.subscriptionGenerationsByRoom.delete(frame.roomId);
+      if (!context.closed) {
+        sendFrame(socket, mappedError(error, frame.requestId));
+      }
+      return;
+    }
+  }
 
   let unsubscribe: (() => void) | undefined;
   let deliveryQueue = Promise.resolve();
@@ -560,12 +1277,189 @@ async function handleSubscribe(
   }
 }
 
-async function handleFrame(
+async function handleSubscribeV2(
   socket: WebSocket,
-  frame: ClientFrame,
+  frame: Extract<ClientFrame, { type: "room.subscribe.v2" }>,
   options: StartMessageWebSocketServerOptions,
   context: ConnectionContext,
 ): Promise<void> {
+  const session = await requireSession(socket, frame.requestId, options, context);
+  if (session === undefined) {
+    return;
+  }
+  const registry = options.subscriptionRegistry;
+  const connection = context.registeredConnection;
+  if (
+    options.sync === undefined ||
+    options.outboxStore === undefined ||
+    registry === undefined ||
+    connection === undefined
+  ) {
+    sendFrame(
+      socket,
+      errorFrame(503, "storage_unavailable", "storage_unavailable", frame.requestId),
+    );
+    return;
+  }
+  const credentialGeneration = context.credentialGeneration;
+  const subscriptionGeneration =
+    (context.subscriptionGenerationsByRoom.get(frame.roomId) ?? 0) + 1;
+  context.subscriptionGenerationsByRoom.set(frame.roomId, subscriptionGeneration);
+  const previousUnsubscribe = context.unsubscribersByRoom.get(frame.roomId);
+  context.unsubscribersByRoom.delete(frame.roomId);
+  safelyUnsubscribe(previousUnsubscribe);
+  const previousGate = context.v2GatesByRoom.get(frame.roomId);
+  if (previousGate !== undefined) {
+    cleanupV2Gate(context, previousGate);
+  }
+  const gate: V2SubscriptionGate = {
+    requestId: frame.requestId,
+    roomId: frame.roomId,
+    credentialGeneration,
+    subscriptionGeneration,
+    seenEventIds: new Set(),
+    bufferedEvents: [],
+    bufferedBytes: 0,
+    overflowed: false,
+    active: false,
+    cursor: frame.cursor,
+    lastContiguousEventId: undefined,
+    unsubscribe: undefined,
+  };
+  context.v2GatesByRoom.set(frame.roomId, gate);
+  try {
+    gate.unsubscribe = onceUnsubscribe(registry.addRoom({ roomId: frame.roomId, connection }));
+    context.unsubscribersByRoom.set(frame.roomId, gate.unsubscribe);
+    await options.afterSubscribeRegistered?.(frame.roomId);
+    if (
+      context.closed ||
+      context.credentialGeneration !== credentialGeneration ||
+      context.subscriptionGenerationsByRoom.get(frame.roomId) !== subscriptionGeneration
+    ) {
+      cleanupV2Gate(context, gate);
+      return;
+    }
+    let syncCursor = frame.cursor;
+    let watermark: number | undefined;
+    while (true) {
+      const result = await options.sync.syncRoom(session, {
+        type: "room.sync",
+        requestId: frame.requestId,
+        roomId: frame.roomId,
+        cursor: syncCursor,
+      });
+      if (!isRoomSyncResult(result) || result.requestId !== frame.requestId) {
+        cleanupV2Gate(context, gate);
+        sendCurrentGeneration(
+          socket,
+          errorFrame(503, "storage_unavailable", "storage_unavailable", frame.requestId),
+          credentialGeneration,
+          context,
+        );
+        return;
+      }
+      if (
+        context.closed ||
+        context.credentialGeneration !== credentialGeneration ||
+        context.subscriptionGenerationsByRoom.get(frame.roomId) !== subscriptionGeneration
+      ) {
+        cleanupV2Gate(context, gate);
+        return;
+      }
+      if (result.mode !== "delta") {
+        cleanupV2Gate(context, gate);
+        sendCurrentGeneration(socket, result, credentialGeneration, context);
+        return;
+      }
+      if (
+        result.nextCursor.roomId !== frame.roomId ||
+        (result.hasMore && result.nextCursor.afterSeq <= syncCursor.afterSeq) ||
+        (watermark !== undefined && result.watermark !== watermark)
+      ) {
+        cleanupV2Gate(context, gate);
+        sendCurrentGeneration(
+          socket,
+          errorFrame(503, "storage_unavailable", "storage_unavailable", frame.requestId),
+          credentialGeneration,
+          context,
+        );
+        return;
+      }
+      watermark ??= result.watermark;
+      sendCurrentGeneration(socket, result, credentialGeneration, context);
+      for (const event of result.events) {
+        if (event.streamSeq === result.nextCursor.afterSeq) {
+          gate.lastContiguousEventId = event.eventId;
+        }
+      }
+      syncCursor = result.nextCursor;
+      gate.cursor = result.nextCursor;
+      if (!result.hasMore) {
+        break;
+      }
+    }
+    if (Object.hasOwn(gate.cursor, "watermark")) {
+      cleanupV2Gate(context, gate);
+      sendCurrentGeneration(
+        socket,
+        errorFrame(503, "storage_unavailable", "storage_unavailable", frame.requestId),
+        credentialGeneration,
+        context,
+      );
+      return;
+    }
+    if (gate.overflowed) {
+      cleanupV2Gate(context, gate);
+      sendCurrentGeneration(socket, {
+        type: "room.subscribe.v2.retry",
+        requestId: frame.requestId,
+        roomId: frame.roomId,
+        reason: "gate_overflow",
+        restartFrom: gate.cursor,
+      }, credentialGeneration, context);
+      return;
+    }
+    for (const event of [...gate.bufferedEvents]) {
+      if (event.streamSeq <= (watermark ?? gate.cursor.afterSeq)) {
+        removeBufferedEvent(gate, event);
+      }
+    }
+    gate.active = true;
+    const drainResult = await drainContiguousV2Events(socket, context, gate);
+    if (!drainResult.accepted) {
+      cleanupV2Gate(context, gate);
+      return;
+    }
+    if (
+      context.closed ||
+      context.credentialGeneration !== credentialGeneration ||
+      context.subscriptionGenerationsByRoom.get(frame.roomId) !== subscriptionGeneration
+    ) {
+      cleanupV2Gate(context, gate);
+      return;
+    }
+    sendCurrentGeneration(socket, {
+      type: "room.subscribed.v2",
+      requestId: frame.requestId,
+      roomId: frame.roomId,
+      cursor: gate.cursor,
+      watermark: Math.max(watermark ?? gate.cursor.afterSeq, gate.cursor.afterSeq),
+    }, credentialGeneration, context);
+  } catch (error: unknown) {
+    cleanupV2Gate(context, gate);
+    sendCurrentGeneration(socket, mappedError(error, frame.requestId), credentialGeneration, context);
+  }
+}
+
+async function handleFrame(
+  socket: WebSocket,
+  frame: ClientFrame,
+  options: RuntimeMessageWebSocketServerOptions,
+  context: ConnectionContext,
+): Promise<void> {
+  if (context.terminalRevocationPending) {
+    return;
+  }
   switch (frame.type) {
     case "auth.login":
     case "auth.resume":
@@ -583,7 +1477,16 @@ async function handleFrame(
         return;
       }
       try {
-        const acknowledgement = await options.service.send(principal.actorId, frame.message);
+        const acknowledgement = options.outboxStore === undefined
+          ? await options.service.send(principal.actorId, frame.message)
+          : context.session === undefined
+            ? (() => { throw new RoomAccessError(); })()
+            : await options.service.send({
+                ...context.session,
+                kind: "human",
+                requestId: frame.requestId,
+                idempotencyKey: frame.message.id,
+              }, frame.message);
         if (!context.closed) {
           sendFrame(socket, { ...acknowledgement, requestId: frame.requestId });
         }
@@ -600,7 +1503,11 @@ async function handleFrame(
         return;
       }
       try {
-        const messages = await options.service.history(principal.actorId, frame.roomId);
+        const messages = options.outboxStore === undefined
+          ? await options.service.history(principal.actorId, frame.roomId)
+          : context.session === undefined
+            ? (() => { throw new RoomAccessError(); })()
+            : await options.service.history(context.session, frame.roomId);
         if (!context.closed) {
           sendFrame(socket, {
             type: "room.history",
@@ -622,7 +1529,19 @@ async function handleFrame(
         return;
       }
       await handleSubscribe(socket, frame, principal.actorId, options, context);
+      return;
     }
+    case "room.subscribe.v2":
+      await handleSubscribeV2(socket, frame, options, context);
+      return;
+    case "workspace.bootstrap.begin":
+    case "workspace.bootstrap.page":
+    case "room.sync":
+    case "room.repair.begin":
+    case "room.repair.page":
+    case "snapshot.complete":
+      await handleRecoveryFrame(socket, frame, options, context, options.streamingOwners);
+      return;
   }
 }
 
@@ -660,35 +1579,203 @@ export async function startMessageWebSocketServer(
   if (!Number.isSafeInteger(maxQueuedFrameBytes) || maxQueuedFrameBytes <= 0) {
     throw new RangeError("maxQueuedFrameBytes must be a positive safe integer");
   }
+  const v2GateMaxEvents = options.v2GateMaxEvents ?? MESSAGE_WEBSOCKET_V2_GATE_MAX_EVENTS;
+  if (!Number.isSafeInteger(v2GateMaxEvents) || v2GateMaxEvents <= 0) {
+    throw new RangeError("v2GateMaxEvents must be a positive safe integer");
+  }
+  const v2GateMaxBytes = options.v2GateMaxBytes ?? MESSAGE_WEBSOCKET_V2_GATE_MAX_BYTES;
+  if (!Number.isSafeInteger(v2GateMaxBytes) || v2GateMaxBytes <= 0) {
+    throw new RangeError("v2GateMaxBytes must be a positive safe integer");
+  }
   const httpServer = createServer();
   const webSocketServer = new WebSocketServer({
     server: httpServer,
     maxPayload: MESSAGE_WEBSOCKET_MAX_PAYLOAD_BYTES,
   });
+  const subscriptionRegistry = options.outboxStore === undefined
+    ? undefined
+    : options.subscriptionRegistry ?? createSubscriptionRegistry();
+  if (options.subscriptionRegistry !== undefined && options.outboxStore === undefined) {
+    throw new TypeError("subscriptionRegistry requires outboxStore");
+  }
+  const runtimeOptions: RuntimeMessageWebSocketServerOptions = {
+    ...options,
+    streamingOwners: new Map(),
+    ...(subscriptionRegistry === undefined ? {} : { subscriptionRegistry }),
+  };
   const activeSockets = new Set<WebSocket>();
+  const liveConnections = new Map<
+    string,
+    { readonly socket: WebSocket; readonly context: ConnectionContext }
+  >();
+  let nextConnectionId = 0;
+  const outboxDispatcher = options.outboxStore === undefined || subscriptionRegistry === undefined
+    ? undefined
+    : createOutboxDispatcher({
+        store: options.outboxStore,
+        registry: subscriptionRegistry,
+        ...(options.outboxPollIntervalMs === undefined
+          ? {}
+          : { pollIntervalMs: options.outboxPollIntervalMs }),
+        async send(candidate, frame: OutboxDispatchFrame, delivery: OutboxDelivery) {
+          const live = liveConnections.get(candidate.connectionId);
+          const session = live?.context.session;
+          if (
+            live === undefined ||
+            live.context.closed ||
+            session === undefined ||
+            live.context.credentialGeneration !== candidate.credentialGeneration ||
+            session.sessionId !== candidate.sessionId ||
+            session.sessionFamilyId !== candidate.sessionFamilyId ||
+            !samePrincipal(session.principal, candidate.principal)
+          ) {
+            return { accepted: false, reason: "closed" };
+          }
+          if (delivery.targetKind === "room" && delivery.event.streamKind === "room") {
+            const gate = live.context.v2GatesByRoom.get(delivery.targetId);
+            if (gate !== undefined) {
+              if (
+                gate.credentialGeneration !== candidate.credentialGeneration ||
+                live.context.subscriptionGenerationsByRoom.get(gate.roomId) !==
+                  gate.subscriptionGeneration
+              ) {
+                return { accepted: false, reason: "closed" };
+              }
+              const capture = captureV2Delivery(
+                gate,
+                delivery.event,
+                v2GateMaxEvents,
+                v2GateMaxBytes,
+              );
+              if (capture === "overflow" || capture === "corrupt") {
+                gate.overflowed = true;
+                unsubscribeV2Gate(live.context, gate);
+                if (gate.active) {
+                  if (
+                    !live.context.closed &&
+                    live.context.credentialGeneration === gate.credentialGeneration &&
+                    live.context.subscriptionGenerationsByRoom.get(gate.roomId) ===
+                      gate.subscriptionGeneration
+                  ) {
+                    await sendFrameWithResult(live.socket, {
+                      type: "room.subscribe.v2.retry",
+                      requestId: gate.requestId,
+                      roomId: gate.roomId,
+                      reason: "gate_overflow",
+                      restartFrom: gate.cursor,
+                    });
+                  }
+                  cleanupV2Gate(live.context, gate);
+                }
+              }
+              if (!gate.active || gate.overflowed) {
+                return { accepted: true };
+              }
+              return drainContiguousV2Events(live.socket, live.context, gate);
+            }
+          }
+          return sendFrameWithResult(live.socket, frame);
+        },
+      });
   let closePromise: Promise<void> | undefined;
 
   webSocketServer.on("connection", (socket) => {
     maxBufferedAmountBySocket.set(socket, maxBufferedAmountBytes);
     const unsubscribersByRoom = new Map<string, () => void>();
+    const identityUnsubscribers = new Set<() => void>();
     const subscriptionGenerationsByRoom = new Map<string, number>();
-    const unsubscribeAll = () => {
+    const ownedStreamingSnapshots = new Map<string, AuthenticatedSessionContext>();
+    const v2GatesByRoom = new Map<string, V2SubscriptionGate>();
+    const clearRoomSubscriptions = () => {
       for (const unsubscribe of unsubscribersByRoom.values()) {
         safelyUnsubscribe(unsubscribe);
       }
       unsubscribersByRoom.clear();
       subscriptionGenerationsByRoom.clear();
+      for (const gate of v2GatesByRoom.values()) {
+        safelyUnsubscribe(gate.unsubscribe);
+      }
+      v2GatesByRoom.clear();
     };
+    const clearLiveSubscriptions = () => {
+      clearRoomSubscriptions();
+      for (const unsubscribe of identityUnsubscribers) {
+        safelyUnsubscribe(unsubscribe);
+      }
+      identityUnsubscribers.clear();
+    };
+    const releaseSnapshotOwners = () => {
+      if (options.sync !== undefined && runtimeOptions.streamingOwners !== undefined) {
+        for (const [snapshotId, session] of ownedStreamingSnapshots) {
+          if (detachStreamingSnapshot(
+            context,
+            session,
+            snapshotId,
+            runtimeOptions.streamingOwners,
+          )) {
+            void options.sync.releaseSnapshot(session, snapshotId).catch(() => undefined);
+          }
+        }
+      }
+      ownedStreamingSnapshots.clear();
+    };
+    const unsubscribeAll = () => {
+      clearLiveSubscriptions();
+      releaseSnapshotOwners();
+    };
+    const connectionId = `websocket-${++nextConnectionId}`;
     const context: ConnectionContext = {
       principal: undefined,
+      session: undefined,
       accessToken: undefined,
       credentialGeneration: 0,
       authOperationPending: false,
+      terminalRevocationPending: false,
       closed: false,
       unsubscribersByRoom,
+      identityUnsubscribers,
       subscriptionGenerationsByRoom,
+      ownedStreamingSnapshots,
+      connectionId,
+      v2GatesByRoom,
+      clearRoomSubscriptions,
+      clearLiveSubscriptions,
+      releaseSnapshotOwners,
       unsubscribeAll,
+      registeredConnection: undefined,
     };
+    const registeredConnection: RegisteredConnection = {
+      connectionId,
+      get principal() {
+        if (context.session === undefined) {
+          throw new TypeError("Connection is not authenticated");
+        }
+        return context.session.principal;
+      },
+      get sessionId() {
+        if (context.session === undefined) {
+          throw new TypeError("Connection is not authenticated");
+        }
+        return context.session.sessionId;
+      },
+      get sessionFamilyId() {
+        if (context.session === undefined) {
+          throw new TypeError("Connection is not authenticated");
+        }
+        return context.session.sessionFamilyId;
+      },
+      get credentialGeneration() {
+        return context.credentialGeneration;
+      },
+      revoke() {
+        abortConnection(context);
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.close(4001, "session revoked");
+        }
+      },
+    };
+    context.registeredConnection = registeredConnection;
+    liveConnections.set(connectionId, { socket, context });
     let frameQueue = Promise.resolve();
     let queuedFrameCount = 0;
     let queuedFrameBytes = 0;
@@ -701,6 +1788,7 @@ export async function startMessageWebSocketServer(
     socket.on("close", () => {
       abort();
       activeSockets.delete(socket);
+      liveConnections.delete(connectionId);
     });
     socket.on("error", abort);
     socket.on("message", (raw, isBinary) => {
@@ -737,7 +1825,7 @@ export async function startMessageWebSocketServer(
           }
 
           try {
-            await handleFrame(socket, parsed.frame, options, context);
+            await handleFrame(socket, parsed.frame, runtimeOptions, context);
           } catch {
             if (!context.closed) {
               sendFrame(
@@ -767,16 +1855,23 @@ export async function startMessageWebSocketServer(
     await closeHttpServer(httpServer);
     throw new Error("Message WebSocket server did not expose a TCP address");
   }
+  outboxDispatcher?.start();
 
   return {
     url: `ws://${host}:${address.port}`,
     close(): Promise<void> {
       closePromise ??= (async () => {
+        // Calling close first synchronously fences future dispatcher scheduling.
+        const dispatcherClose = outboxDispatcher?.close() ?? Promise.resolve();
         for (const socket of activeSockets) {
           abortAndTerminate(socket);
         }
-        await closeWebSocketServer(webSocketServer);
-        await closeHttpServer(httpServer);
+        const results = await Promise.allSettled([
+          dispatcherClose,
+          closeWebSocketServer(webSocketServer),
+          closeHttpServer(httpServer),
+        ]);
+        throwCleanupFailures("Message WebSocket server cleanup failed", results);
       })();
       return closePromise;
     },

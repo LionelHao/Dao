@@ -15,20 +15,28 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { DatabaseSync } from "node:sqlite";
 import { Worker } from "node:worker_threads";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import {
   createWorkerDatabaseClient,
+  createWorkerDatabaseClientWithRollbackFailureForTest,
   createWorkerDatabaseClientForTest,
   type AuthorityWorkerTransport,
   type WorkerDatabaseClient,
 } from "./worker-database-client.js";
+import {
+  AuthorityRollbackFatalError,
+  executeHumanDatabaseCommand,
+  runAuthorityImmediateTransaction,
+} from "./authority-database-handler.js";
 import {
   isAuthorityWorkerRequest,
   isAuthorityWorkerResponse,
   type AuthorityWorkerRequest,
   type AuthorityWorkerResponse,
 } from "./worker-protocol.js";
+import { migrateAuthorityDatabase } from "./schema.js";
 
 const temporaryDirectories = new Set<string>();
 const clients = new Set<WorkerDatabaseClient>();
@@ -91,7 +99,7 @@ async function expectDatabasePathReusable(path: string): Promise<void> {
   const replacement = trackClient(
     await createWorkerDatabaseClient({ databasePath: path }),
   );
-  await expect(replacement.inspectSchema()).resolves.toEqual({ version: 3 });
+  await expect(replacement.inspectSchema()).resolves.toEqual({ version: 5 });
 }
 
 async function expectDatabasePathEventuallyReusable(path: string): Promise<void> {
@@ -129,7 +137,7 @@ function workerThatRuns(scriptBody: string): Worker {
         parentPort.postMessage({
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 3,
+          schemaVersion: 5,
         });
         return;
       }
@@ -195,12 +203,102 @@ class MessageErrorTransport extends EventEmitter implements AuthorityWorkerTrans
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 3,
+          schemaVersion: 5,
         } satisfies AuthorityWorkerResponse);
       });
       return;
     }
     queueMicrotask(() => this.emit("messageerror", this.failure));
+  }
+
+  async terminate(): Promise<number> {
+    return 0;
+  }
+}
+
+class CapabilityProbeTransport extends EventEmitter implements AuthorityWorkerTransport {
+  readonly requests: AuthorityWorkerRequest[] = [];
+
+  postMessage(request: AuthorityWorkerRequest): void {
+    this.requests.push(request);
+    if (request.type === "authority.initialize") {
+      queueMicrotask(() => this.emit("message", {
+        type: "authority.ready",
+        requestId: request.requestId,
+        schemaVersion: 5,
+      } satisfies AuthorityWorkerResponse));
+      return;
+    }
+    queueMicrotask(() => this.emit("message", {
+      type: "authority.command-acknowledged",
+      requestId: request.requestId,
+      acknowledgement: {
+        aggregateId: "forged-write",
+        eventIds: ["forged-event"],
+        acceptedAt: "2026-08-10T00:00:00.000Z",
+        result: {},
+      },
+    } satisfies AuthorityWorkerResponse));
+  }
+
+  async terminate(): Promise<number> {
+    return 0;
+  }
+}
+
+class SyncResultProbeTransport extends EventEmitter implements AuthorityWorkerTransport {
+  constructor(
+    private readonly responseFor: (
+      request: Extract<AuthorityWorkerRequest, { readonly type: "authority.sync-room" }>,
+    ) => unknown,
+  ) {
+    super();
+  }
+
+  postMessage(request: AuthorityWorkerRequest): void {
+    if (request.type === "authority.initialize") {
+      queueMicrotask(() => this.emit("message", {
+        type: "authority.ready",
+        requestId: request.requestId,
+        schemaVersion: 5,
+      } satisfies AuthorityWorkerResponse));
+      return;
+    }
+    if (request.type !== "authority.sync-room") {
+      throw new Error("unexpected sync probe request");
+    }
+    queueMicrotask(() => this.emit("message", this.responseFor(request)));
+  }
+
+  async terminate(): Promise<number> {
+    return 0;
+  }
+}
+
+class CompactionResultProbeTransport extends EventEmitter implements AuthorityWorkerTransport {
+  constructor(
+    private readonly responseFor: (
+      request: Extract<AuthorityWorkerRequest, {
+        readonly type: "authority.compact-room-stream";
+      }>,
+    ) => unknown,
+  ) {
+    super();
+  }
+
+  postMessage(request: AuthorityWorkerRequest): void {
+    if (request.type === "authority.initialize") {
+      queueMicrotask(() => this.emit("message", {
+        type: "authority.ready",
+        requestId: request.requestId,
+        schemaVersion: 5,
+      } satisfies AuthorityWorkerResponse));
+      return;
+    }
+    if (request.type !== "authority.compact-room-stream") {
+      throw new Error("unexpected compaction probe request");
+    }
+    queueMicrotask(() => this.emit("message", this.responseFor(request)));
   }
 
   async terminate(): Promise<number> {
@@ -225,7 +323,7 @@ class ThrowingPostTransport extends EventEmitter implements AuthorityWorkerTrans
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 3,
+          schemaVersion: 5,
         } satisfies AuthorityWorkerResponse);
       });
     }
@@ -248,7 +346,7 @@ class DeferredTerminationTransport
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 3,
+          schemaVersion: 5,
         } satisfies AuthorityWorkerResponse);
       });
       return;
@@ -267,6 +365,33 @@ class DeferredTerminationTransport
   }
 }
 
+class RejectingTerminationTransport
+  extends EventEmitter
+  implements AuthorityWorkerTransport
+{
+  postMessage(request: AuthorityWorkerRequest): void {
+    if (request.type === "authority.initialize") {
+      queueMicrotask(() => {
+        this.emit("message", {
+          type: "authority.ready",
+          requestId: request.requestId,
+          schemaVersion: 5,
+        } satisfies AuthorityWorkerResponse);
+      });
+      return;
+    }
+    queueMicrotask(() => this.emit("messageerror", secretTransportError()));
+  }
+
+  async terminate(): Promise<number> {
+    throw new Error("transport termination rejected");
+  }
+
+  signalExit(): void {
+    this.emit("exit", 1);
+  }
+}
+
 class CloseRaceTransport extends EventEmitter implements AuthorityWorkerTransport {
   #closeRequest: AuthorityWorkerRequest | undefined;
   #inspectRequest: AuthorityWorkerRequest | undefined;
@@ -278,7 +403,7 @@ class CloseRaceTransport extends EventEmitter implements AuthorityWorkerTranspor
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 3,
+          schemaVersion: 5,
         } satisfies AuthorityWorkerResponse);
       });
       return;
@@ -307,7 +432,7 @@ class CloseRaceTransport extends EventEmitter implements AuthorityWorkerTranspor
     this.emit("message", {
       type: "authority.schema",
       requestId: this.#inspectRequest.requestId,
-      schemaVersion: 3,
+      schemaVersion: 5,
     } satisfies AuthorityWorkerResponse);
   }
 
@@ -339,13 +464,94 @@ afterEach(async () => {
 });
 
 describe("AuthorityWorker closed protocol", () => {
-  it("accepts only the three exact request variants", () => {
+  it("accepts only exact request variants", () => {
+    const repairContext = {
+      sessionId: createHash("sha256").update("repair-session").digest("base64url"),
+      sessionFamilyId: createHash("sha256").update("repair-family").digest("base64url"),
+      principal: { accountId: "repair-account", actorId: "repair-actor" },
+    };
     expect(
       isAuthorityWorkerRequest({
         type: "authority.initialize",
         requestId: "1",
       }),
     ).toBe(true);
+    expect(isAuthorityWorkerRequest({
+      type: "authority.snapshot-revalidate",
+      requestId: "snapshot-revalidate",
+      validation: {
+        kind: "room",
+        context: {
+          sessionId: createHash("sha256").update("snapshot-session").digest("base64url"),
+          sessionFamilyId: createHash("sha256").update("snapshot-family").digest("base64url"),
+          principal: { accountId: "account", actorId: "actor" },
+        },
+        roomId: "room",
+        accessRevision: 1,
+      },
+      now: 1_000,
+    })).toBe(true);
+    expect(isAuthorityWorkerRequest({
+      type: "authority.snapshot-revalidate",
+      requestId: "snapshot-revalidate-extra",
+      validation: {
+        kind: "catalog",
+        context: {
+          sessionId: createHash("sha256").update("snapshot-session").digest("base64url"),
+          sessionFamilyId: createHash("sha256").update("snapshot-family").digest("base64url"),
+          principal: { accountId: "account", actorId: "actor" },
+        },
+        catalogRevision: 1,
+        watermark: 2,
+      },
+      now: 1_000,
+    })).toBe(false);
+    expect(isAuthorityWorkerRequest({
+      type: "authority.repair-acquire",
+      requestId: "repair-acquire",
+      context: repairContext,
+      scope: { kind: "room", roomId: "repair-room" },
+      now: 1_000,
+    })).toBe(true);
+    expect(isAuthorityWorkerRequest({
+      type: "authority.repair-register",
+      requestId: "repair-register",
+      snapshotId: "repair-snapshot",
+      checksum: "repair-checksum",
+      pageCount: 3,
+      now: 1_001,
+    })).toBe(true);
+    expect(isAuthorityWorkerRequest({
+      type: "authority.repair-authorize-page",
+      requestId: "repair-page",
+      context: repairContext,
+      snapshotId: "repair-snapshot",
+      page: 1,
+      now: 1_002,
+    })).toBe(true);
+    expect(isAuthorityWorkerRequest({
+      type: "authority.repair-complete",
+      requestId: "repair-complete",
+      context: repairContext,
+      snapshotId: "repair-snapshot",
+      version: { kind: "room", roomId: "repair-room", watermark: 3 },
+      checksum: "repair-checksum",
+      now: 1_003,
+    })).toBe(true);
+    expect(isAuthorityWorkerRequest({
+      type: "authority.repair-release",
+      requestId: "repair-release",
+      context: repairContext,
+      snapshotId: "repair-snapshot",
+      now: 1_004,
+    })).toBe(true);
+    expect(isAuthorityWorkerRequest({
+      type: "authority.repair-acquire",
+      requestId: "repair-acquire-extra",
+      context: repairContext,
+      scope: { kind: "catalog", principalId: "repair-actor", global: true },
+      now: 1_000,
+    })).toBe(false);
     expect(
       isAuthorityWorkerRequest({
         type: "authority.inspect-schema",
@@ -356,6 +562,21 @@ describe("AuthorityWorker closed protocol", () => {
       isAuthorityWorkerRequest({
         type: "authority.close",
         requestId: "3",
+      }),
+    ).toBe(true);
+    expect(
+      isAuthorityWorkerRequest({
+        type: "authority.outbox-authorize",
+        requestId: "outbox-authorize",
+        deliveryId: "delivery-room",
+        candidate: {
+          connectionId: "connection-1",
+          principal: { accountId: "account-li", actorId: "human-li" },
+          sessionId: createHash("sha256").update("session-1").digest("base64url"),
+          sessionFamilyId: createHash("sha256").update("family-1").digest("base64url"),
+          credentialGeneration: 1,
+        },
+        now: 1_000,
       }),
     ).toBe(true);
 
@@ -372,6 +593,30 @@ describe("AuthorityWorker closed protocol", () => {
         requestId: "5",
       }),
     ).toBe(false);
+    expect(
+      isAuthorityWorkerRequest({
+        type: "authority.outbox-authorize",
+        requestId: "outbox-authorize-extra",
+        deliveryId: "delivery-room",
+        candidate: {
+          connectionId: "connection-1",
+          principal: { accountId: "account-li", actorId: "human-li" },
+          sessionId: createHash("sha256").update("session-1").digest("base64url"),
+          sessionFamilyId: createHash("sha256").update("family-1").digest("base64url"),
+          credentialGeneration: 1,
+          accessToken: "must-not-cross-worker-boundary",
+        },
+        now: 1_000,
+      }),
+    ).toBe(false);
+    expect(
+      isAuthorityWorkerRequest({
+        type: "authority.outbox-failed",
+        requestId: "outbox-failed-open-reason",
+        deliveryId: "delivery-room",
+        reason: "network_error",
+      }),
+    ).toBe(false);
   });
 
   it("accepts only exact response variants", () => {
@@ -379,14 +624,88 @@ describe("AuthorityWorker closed protocol", () => {
       isAuthorityWorkerResponse({
         type: "authority.ready",
         requestId: "1",
-        schemaVersion: 3,
+        schemaVersion: 5,
+      }),
+    ).toBe(true);
+    expect(isAuthorityWorkerResponse({
+      type: "authority.snapshot-revalidated",
+      requestId: "snapshot-revalidated",
+    })).toBe(true);
+    expect(isAuthorityWorkerResponse({
+      type: "authority.snapshot-revalidated",
+      requestId: "snapshot-revalidated-extra",
+      allowed: true,
+    })).toBe(false);
+    expect(isAuthorityWorkerResponse({
+      type: "authority.repair-lease",
+      requestId: "repair-lease",
+      lease: {
+        snapshotId: "repair-snapshot",
+        principalId: "repair-actor",
+        accountId: "repair-account",
+        sessionFamilyId: createHash("sha256").update("repair-family").digest("base64url"),
+        scope: { kind: "catalog", principalId: "repair-actor" },
+        version: { kind: "catalog", catalogRevision: 4 },
+        authorizationRevision: 4,
+        checksum: "repair-checksum",
+        pageCount: 3,
+        lastPage: 2,
+        highestAuthorizedPage: 0,
+        idleExpiresAt: "2026-08-11T00:00:30.000Z",
+      },
+    })).toBe(true);
+    expect(isAuthorityWorkerResponse({
+      type: "authority.snapshot-completed",
+      requestId: "repair-completed",
+      completed: {
+        type: "snapshot.completed",
+        requestId: "repair-completed",
+        snapshotId: "repair-snapshot",
+        version: { kind: "catalog", catalogRevision: 4 },
+      },
+    })).toBe(true);
+    expect(isAuthorityWorkerResponse({
+      type: "authority.repair-released",
+      requestId: "repair-released",
+    })).toBe(true);
+    expect(isAuthorityWorkerResponse({
+      type: "authority.repair-released",
+      requestId: "repair-released-extra",
+      released: true,
+    })).toBe(false);
+    expect(
+      isAuthorityWorkerResponse({
+        type: "authority.outbox",
+        requestId: "outbox-valid",
+        deliveries: [{
+          deliveryId: "delivery-family",
+          eventId: "event-family",
+          targetKind: "session-family",
+          targetId: "family-revoked",
+          streamSeq: 1,
+          attempts: 0,
+          event: {
+            eventId: "event-family",
+            streamKind: "identity",
+            streamId: "human-revoked",
+            streamSeq: 1,
+            actorId: "human-revoked",
+            occurredAt: "2026-08-11T00:00:00.000Z",
+            type: "identity.session.revoked",
+            payload: {
+              sessionId: "session-revoked",
+              familyId: "family-revoked",
+              accountId: "account-revoked",
+            },
+          },
+        }],
       }),
     ).toBe(true);
     expect(
       isAuthorityWorkerResponse({
         type: "authority.schema",
         requestId: "2",
-        schemaVersion: 3,
+        schemaVersion: 5,
       }),
     ).toBe(true);
     expect(
@@ -408,8 +727,60 @@ describe("AuthorityWorker closed protocol", () => {
       isAuthorityWorkerResponse({
         type: "authority.schema",
         requestId: "5",
-        schemaVersion: 3,
+        schemaVersion: 5,
         rows: [],
+      }),
+    ).toBe(false);
+    expect(
+      isAuthorityWorkerResponse({
+        type: "authority.outbox",
+        requestId: "outbox-invalid-family-event",
+        deliveries: [{
+          deliveryId: "delivery-family",
+          eventId: "event-access",
+          targetKind: "session-family",
+          targetId: "family-revoked",
+          streamSeq: 1,
+          attempts: 0,
+          event: {
+            eventId: "event-access",
+            streamKind: "identity",
+            streamId: "human-revoked",
+            streamSeq: 1,
+            actorId: "human-revoked",
+            occurredAt: "2026-08-11T00:00:00.000Z",
+            type: "identity.room-access.changed",
+            payload: { roomId: "room-1", change: "removed" },
+          },
+        }],
+      }),
+    ).toBe(false);
+    expect(
+      isAuthorityWorkerResponse({
+        type: "authority.outbox",
+        requestId: "outbox-invalid-principal-event",
+        deliveries: [{
+          deliveryId: "delivery-principal",
+          eventId: "event-principal-revoked",
+          targetKind: "principal",
+          targetId: "human-revoked",
+          streamSeq: 1,
+          attempts: 0,
+          event: {
+            eventId: "event-principal-revoked",
+            streamKind: "identity",
+            streamId: "human-revoked",
+            streamSeq: 1,
+            actorId: "human-revoked",
+            occurredAt: "2026-08-11T00:00:00.000Z",
+            type: "identity.session.revoked",
+            payload: {
+              sessionId: "session-revoked",
+              familyId: "family-revoked",
+              accountId: "account-revoked",
+            },
+          },
+        }],
       }),
     ).toBe(false);
     expect(
@@ -432,7 +803,7 @@ describe("AuthorityWorker closed protocol", () => {
     let response = once(worker, "message");
     worker.postMessage({ type: "authority.initialize", requestId: "1" });
     await expect(response).resolves.toEqual([
-      { type: "authority.ready", requestId: "1", schemaVersion: 3 },
+      { type: "authority.ready", requestId: "1", schemaVersion: 5 },
     ]);
 
     response = once(worker, "message");
@@ -449,7 +820,7 @@ describe("AuthorityWorker closed protocol", () => {
     response = once(worker, "message");
     worker.postMessage({ type: "authority.inspect-schema", requestId: "2" });
     await expect(response).resolves.toEqual([
-      { type: "authority.schema", requestId: "2", schemaVersion: 3 },
+      { type: "authority.schema", requestId: "2", schemaVersion: 5 },
     ]);
   });
 });
@@ -516,7 +887,7 @@ describe("authority database coordinator registry", () => {
     const initialized = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
-    await expect(initialized.inspectSchema()).resolves.toEqual({ version: 3 });
+    await expect(initialized.inspectSchema()).resolves.toEqual({ version: 5 });
     await initialized.close();
     linkSync(path, aliasPath);
 
@@ -547,7 +918,7 @@ describe("authority database coordinator registry", () => {
     const replacement = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
-    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 3 });
+    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 5 });
   });
 
   it("rejects a hardlink added while the original database is live", async () => {
@@ -556,7 +927,7 @@ describe("authority database coordinator registry", () => {
     const original = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
-    await expect(original.inspectSchema()).resolves.toEqual({ version: 3 });
+    await expect(original.inspectSchema()).resolves.toEqual({ version: 5 });
     linkSync(path, aliasPath);
 
     let spawnCount = 0;
@@ -575,7 +946,7 @@ describe("authority database coordinator registry", () => {
     expect((aliasError as { cause?: unknown }).cause).toBeUndefined();
     expect(publicErrorSurface(aliasError)).not.toContain(path);
     expect(publicErrorSurface(aliasError)).not.toContain(aliasPath);
-    await expect(original.inspectSchema()).resolves.toEqual({ version: 3 });
+    await expect(original.inspectSchema()).resolves.toEqual({ version: 5 });
   });
 
   it("atomically reserves a dangling relative symlink chain with its future target", async () => {
@@ -617,7 +988,7 @@ describe("authority database coordinator registry", () => {
     const replacement = trackClient(
       await createWorkerDatabaseClient({ databasePath: otherPath }),
     );
-    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 3 });
+    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 5 });
   });
 
   it("rejects a symlink cycle with a stable path-free error", async () => {
@@ -650,7 +1021,7 @@ describe("authority database coordinator registry", () => {
     const replacement = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
-    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 3 });
+    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 5 });
   });
 
   it("releases the path after initialization failure so a retry can succeed", async () => {
@@ -690,7 +1061,7 @@ describe("authority database coordinator registry", () => {
     const replacement = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
-    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 3 });
+    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 5 });
   });
 
   it("keeps the path reserved until terminal transport teardown completes", async () => {
@@ -747,6 +1118,35 @@ describe("authority database coordinator registry", () => {
     }
   });
 
+  it("keeps a terminal reservation after terminate rejects until an explicit exit", async () => {
+    const path = databasePath();
+    const transport = new RejectingTerminationTransport();
+    const client = trackClient(
+      await createWorkerDatabaseClientForTest({ databasePath: path }, () => transport),
+    );
+
+    const terminalError = await rejectionOf(client.inspectSchema());
+    await new Promise<void>((resolveImmediate) => setImmediate(resolveImmediate));
+    const laterError = await rejectionOf(client.inspectSchema());
+    const duplicate = await Promise.allSettled([
+      createWorkerDatabaseClient({ databasePath: path }),
+    ]).then(([result]) => result!);
+    if (duplicate.status === "fulfilled") {
+      trackClient(duplicate.value);
+      await duplicate.value.close();
+    }
+
+    expect(terminalError).toMatchObject({ code: "authority_worker_message_error" });
+    expect(laterError).toBe(terminalError);
+    expect(duplicate.status).toBe("rejected");
+    if (duplicate.status === "rejected") {
+      expect(duplicate.reason).toMatchObject({ code: "authority_coordinator_exists" });
+    }
+
+    transport.signalExit();
+    await expectDatabasePathEventuallyReusable(path);
+  });
+
   it("allows different canonical database paths concurrently", async () => {
     const [first, second] = await Promise.all([
       createWorkerDatabaseClient({ databasePath: databasePath() }),
@@ -757,7 +1157,7 @@ describe("authority database coordinator registry", () => {
 
     await expect(
       Promise.all([first.inspectSchema(), second.inspectSchema()]),
-    ).resolves.toEqual([{ version: 3 }, { version: 3 }]);
+    ).resolves.toEqual([{ version: 5 }, { version: 5 }]);
   });
 });
 
@@ -836,6 +1236,218 @@ describe("public worker transport errors", () => {
 });
 
 describe("WorkerDatabaseClient", () => {
+  it("fires after-domain-write after the message fact but before event, outbox, and idempotency", () => {
+    const path = databasePath();
+    const context = {
+      kind: "human" as const,
+      sessionId: "domain-probe-access",
+      sessionFamilyId: "domain-probe-family",
+      principal: { accountId: "domain-probe-account", actorId: "domain-probe-human" },
+      requestId: "domain-probe-request",
+      idempotencyKey: "domain-probe-message",
+    };
+    const database = new DatabaseSync(path);
+    migrateAuthorityDatabase(database);
+    database.prepare(
+      `INSERT INTO actors (id, kind, display_name, reachability, readiness,
+         tool_permissions_json, catalog_revision)
+       VALUES (?, 'human', 'Probe', 'online', NULL, '[]', 0)`,
+    ).run(context.principal.actorId);
+    database.prepare(
+      "INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq) VALUES ('identity', ?, 0, 1)",
+    ).run(context.principal.actorId);
+    database.prepare(
+      `INSERT INTO sessions (family_id, account_id, actor_id, access_token_hash,
+         refresh_token_hash, access_expires_at, refresh_expires_at, revoked_at)
+       VALUES (?, ?, ?, ?, 'refresh', 10000, 20000, NULL)`,
+    ).run(context.sessionFamilyId, context.principal.accountId,
+      context.principal.actorId, context.sessionId);
+    database.prepare(
+      "INSERT INTO rooms (id, name, status, created_at) VALUES ('domain-probe-room', 'Probe', 'active', 't')",
+    ).run();
+    database.prepare(
+      `INSERT INTO room_memberships (room_id, actor_id, kind, role, participation,
+         tool_permissions_json, joined_at, configured_at, access_revision)
+       VALUES ('domain-probe-room', ?, 'human', 'owner', NULL, '[]', 't', NULL, 0)`,
+    ).run(context.principal.actorId);
+    database.prepare(
+      "INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq) VALUES ('room', 'domain-probe-room', 0, 1)",
+    ).run();
+    const probe = new Error("after-domain-write-probe");
+    expect(() => executeHumanDatabaseCommand(database, {
+      context,
+      command: {
+        type: "message.send",
+        roomId: "domain-probe-room",
+        payload: {
+          id: "domain-probe-message",
+          roomId: "domain-probe-room",
+          body: "probe",
+          sentAt: "2026-08-12T00:00:00.000Z",
+        },
+      },
+      now: 1_000,
+      afterDomainWrite() {
+        expect(database.prepare("SELECT COUNT(*) AS count FROM messages").get()).toEqual({ count: 1 });
+        expect(database.prepare("SELECT COUNT(*) AS count FROM events").get()).toEqual({ count: 0 });
+        expect(database.prepare("SELECT COUNT(*) AS count FROM outbox_deliveries").get()).toEqual({ count: 0 });
+        expect(database.prepare("SELECT COUNT(*) AS count FROM idempotency_records").get()).toEqual({ count: 0 });
+        throw probe;
+      },
+    })).toThrow(probe);
+    expect(database.prepare("SELECT COUNT(*) AS count FROM messages").get()).toEqual({ count: 0 });
+    database.close();
+  });
+
+  it("serializes live snapshot revalidation with current session and revision state", async () => {
+    const path = databasePath();
+    const context = {
+      sessionId: createHash("sha256").update("snapshot-access").digest("base64url"),
+      sessionFamilyId: createHash("sha256").update("snapshot-family").digest("base64url"),
+      principal: { accountId: "snapshot-account", actorId: "snapshot-human" },
+    };
+    const database = new DatabaseSync(path);
+    migrateAuthorityDatabase(database);
+    database.prepare(
+      `INSERT INTO actors (
+         id, kind, display_name, reachability, readiness, tool_permissions_json,
+         catalog_revision
+       ) VALUES (?, 'human', 'Snapshot Human', 'online', NULL, '[]', 4)`,
+    ).run(context.principal.actorId);
+    database.prepare(
+      `INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+       VALUES ('identity', ?, 0, 1)`,
+    ).run(context.principal.actorId);
+    database.prepare(
+      `INSERT INTO sessions (
+         family_id, account_id, actor_id, access_token_hash, refresh_token_hash,
+         access_expires_at, refresh_expires_at, revoked_at
+       ) VALUES (?, ?, ?, ?, ?, 10000, 20000, NULL)`,
+    ).run(context.sessionFamilyId, context.principal.accountId,
+      context.principal.actorId, context.sessionId,
+      createHash("sha256").update("snapshot-refresh").digest("base64url"));
+    database.prepare(
+      "INSERT INTO rooms (id, name, status, created_at) VALUES ('snapshot-room', 'Room', 'active', 't')",
+    ).run();
+    database.prepare(
+      `INSERT INTO room_memberships (
+         room_id, actor_id, kind, role, participation, tool_permissions_json,
+         joined_at, configured_at, access_revision
+       ) VALUES ('snapshot-room', ?, 'human', 'member', NULL, '[]', 't', NULL, 3)`,
+    ).run(context.principal.actorId);
+    database.prepare(
+      `INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+       VALUES ('room', 'snapshot-room', 0, 1)`,
+    ).run();
+    database.close();
+
+    const client = trackClient(await createWorkerDatabaseClient({ databasePath: path }));
+    await expect(client.revalidateSnapshot({
+      kind: "room", context, roomId: "snapshot-room", accessRevision: 3,
+    }, 1_000)).resolves.toBeUndefined();
+    await expect(client.revalidateSnapshot({
+      kind: "catalog", context, catalogRevision: 4,
+    }, 1_000)).resolves.toBeUndefined();
+
+    const writer = new DatabaseSync(path);
+    writer.prepare(
+      "UPDATE room_memberships SET access_revision = 4 WHERE room_id = 'snapshot-room' AND actor_id = ?",
+    ).run(context.principal.actorId);
+    writer.close();
+    await expect(client.revalidateSnapshot({
+      kind: "room", context, roomId: "snapshot-room", accessRevision: 3,
+    }, 1_000)).rejects.toMatchObject({ status: 409, code: "snapshot_stale" });
+  });
+
+  it("preserves both transaction and rollback failures in one internal fatal error", () => {
+    const original = new Error("SELECT secret FROM authority at /private/original.sqlite");
+    const rollback = new Error("ROLLBACK failed at /private/rollback.sqlite");
+    const database = {
+      exec(sql: string) {
+        if (sql === "ROLLBACK") throw rollback;
+      },
+    };
+
+    let failure: unknown;
+    try {
+      runAuthorityImmediateTransaction(database as never, () => { throw original; });
+    } catch (error: unknown) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(AuthorityRollbackFatalError);
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toEqual([original, rollback]);
+    expect(String(failure)).not.toContain("SELECT secret");
+    expect(String(failure)).not.toContain("/private/");
+  });
+
+  it("poisons the worker after rollback failure and shares one terminal error", async () => {
+    const path = databasePath();
+    const client = trackClient(
+      await createWorkerDatabaseClientWithRollbackFailureForTest({ databasePath: path }),
+    );
+    const missingSession = createHash("sha256").update("missing-session").digest("base64url");
+    const missingFamily = createHash("sha256").update("missing-family").digest("base64url");
+    const current = rejectionOf(client.executeHuman(
+      {
+        kind: "human",
+        sessionId: missingSession,
+        sessionFamilyId: missingFamily,
+        principal: { accountId: "missing-account", actorId: "missing-actor" },
+        requestId: "rollback-current",
+        idempotencyKey: "rollback-current",
+      },
+      { type: "room.create", payload: { name: "must roll back" } },
+      1_000,
+    ));
+    const concurrentPending = rejectionOf(client.inspectSchema());
+
+    const currentError = await current;
+    const pendingError = await concurrentPending;
+    const laterError = await rejectionOf(client.inspectSchema());
+
+    expect(currentError).toMatchObject({
+      code: "storage_unavailable",
+      status: 503,
+      message: "Authority storage became unavailable",
+    });
+    expect(pendingError).toBe(currentError);
+    expect(laterError).toBe(currentError);
+    expect(String(currentError)).not.toContain(path);
+    await expectDatabasePathEventuallyReusable(path);
+  });
+
+  it("rejects a structurally forged Agent context before posting to the worker", async () => {
+    const transport = new CapabilityProbeTransport();
+    const client = trackClient(await createWorkerDatabaseClientForTest(
+      { databasePath: databasePath() },
+      () => transport,
+    ));
+
+    await expect(client.executeAgent(
+      {
+        kind: "agent",
+        agent: { actorId: "agent-forged", kind: "agent" },
+        requestId: "forged-request",
+        idempotencyKey: "forged-key",
+      } as never,
+      {
+        type: "agent.judgment.record",
+        roomId: "room-forged",
+        payload: {
+          messageId: "message-forged",
+          outcome: "will_respond",
+          reason: "forged",
+        },
+      },
+      1_000,
+    )).rejects.toMatchObject({ status: 403, code: "agent_capability_forbidden" });
+    expect(transport.requests.map((request) => request.type)).toEqual([
+      "authority.initialize",
+    ]);
+  });
+
   it("migrates in a real worker while the main event loop remains responsive", async () => {
     const path = databasePath();
     const opening = createWorkerDatabaseClient({ databasePath: path });
@@ -843,7 +1455,7 @@ describe("WorkerDatabaseClient", () => {
 
     await expect(heartbeat).resolves.toBeUndefined();
     const client = trackClient(await opening);
-    await expect(client.inspectSchema()).resolves.toEqual({ version: 3 });
+    await expect(client.inspectSchema()).resolves.toEqual({ version: 5 });
   });
 
   it("correlates concurrent responses to monotonically increasing request IDs", async () => {
@@ -856,7 +1468,7 @@ describe("WorkerDatabaseClient", () => {
           parentPort.postMessage({
             type: "authority.error",
             requestId: first.requestId,
-            code: "request_ids_not_monotonic",
+            code: "invalid_request",
             message: "Request IDs were not monotonic",
           });
           return;
@@ -864,13 +1476,13 @@ describe("WorkerDatabaseClient", () => {
         parentPort.postMessage({
           type: "authority.error",
           requestId: second.requestId,
-          code: "second_inspect_failed",
+          code: "invalid_request",
           message: "The second inspection failed",
         });
         setImmediate(() => parentPort.postMessage({
           type: "authority.schema",
           requestId: first.requestId,
-          schemaVersion: 3,
+          schemaVersion: 5,
         }));
       }
     `);
@@ -884,9 +1496,10 @@ describe("WorkerDatabaseClient", () => {
     const first = client.inspectSchema();
     const secondRejection = rejectionOf(client.inspectSchema());
 
-    await expect(first).resolves.toEqual({ version: 3 });
+    await expect(first).resolves.toEqual({ version: 5 });
     await expect(secondRejection).resolves.toMatchObject({
-      code: "second_inspect_failed",
+      code: "invalid_request",
+      status: 400,
     });
   });
 
@@ -951,7 +1564,7 @@ describe("WorkerDatabaseClient", () => {
       parentPort.postMessage({
         type: "authority.schema",
         requestId: request.requestId,
-        schemaVersion: 3,
+        schemaVersion: 5,
         extra: true,
       });
     `);
@@ -967,6 +1580,185 @@ describe("WorkerDatabaseClient", () => {
 
     expect(pendingError).toMatchObject({ code: "authority_worker_protocol_error" });
     expect(laterError).toBe(pendingError);
+    await expectDatabasePathEventuallyReusable(path);
+  });
+
+  it.each([
+    "request-id",
+    "room-id",
+    "first-sequence",
+    "empty-skip",
+    "event-limit",
+    "continuation-watermark",
+    "repair-not-expired",
+    "duplicate-event-id",
+  ] as const)("terminally rejects a room sync result with mismatched %s", async (mismatch) => {
+    const path = databasePath();
+    const event = (streamSeq: number, roomId = "room-1") => ({
+      eventId: `event-${streamSeq}`,
+      streamKind: "room" as const,
+      streamId: roomId,
+      streamSeq,
+      roomId,
+      actorId: "human-1",
+      occurredAt: "2026-08-11T00:00:00.000Z",
+      type: "member.removed" as const,
+      payload: { targetActorId: "human-2" },
+    });
+    const transport = new SyncResultProbeTransport((request) => {
+      if (mismatch === "repair-not-expired") {
+        return {
+          type: "authority.room-synced",
+          requestId: request.requestId,
+          result: {
+            type: "room.sync.result",
+            requestId: request.request.requestId,
+            mode: "repair_required",
+            reason: "cursor_expired",
+            retainedFromSeq: 5,
+            watermark: 10,
+          },
+        };
+      }
+      if (mismatch === "room-id") {
+        return {
+          type: "authority.room-synced",
+          requestId: request.requestId,
+          result: {
+            type: "room.sync.result",
+            requestId: request.request.requestId,
+            mode: "delta",
+            events: [event(1, "room-2")],
+            nextCursor: { version: 1, roomId: "room-2", afterSeq: 1 },
+            watermark: 1,
+            hasMore: false,
+          },
+        };
+      }
+      const events = mismatch === "first-sequence"
+        ? [event(2)]
+        : mismatch === "empty-skip"
+          ? []
+        : mismatch === "duplicate-event-id"
+          ? [event(1), { ...event(2), eventId: "event-1" }]
+        : mismatch === "event-limit" || mismatch === "continuation-watermark"
+          ? [event(1), event(2)]
+          : [event(1)];
+      const watermark = mismatch === "first-sequence" || mismatch === "empty-skip"
+        ? 2
+        : events.length;
+      return {
+        type: "authority.room-synced",
+        requestId: request.requestId,
+        result: {
+          type: "room.sync.result",
+          requestId: mismatch === "request-id" ? "wrong-request" : request.request.requestId,
+          mode: "delta",
+          events,
+          nextCursor: { version: 1, roomId: "room-1", afterSeq: watermark },
+          watermark,
+          hasMore: false,
+        },
+      };
+    });
+    const client = trackClient(await createWorkerDatabaseClientForTest(
+      { databasePath: path },
+      () => transport,
+    ));
+    const continuation = mismatch === "continuation-watermark"
+      ? { watermark: 1 }
+      : {};
+    const error = await rejectionOf(client.syncRoom(
+      {
+        sessionId: createHash("sha256").update("access").digest("base64url"),
+        sessionFamilyId: createHash("sha256").update("family").digest("base64url"),
+        principal: { accountId: "account-1", actorId: "human-1" },
+      },
+      {
+        type: "room.sync",
+        requestId: "sync-request",
+        roomId: "room-1",
+        cursor: {
+          version: 1,
+          roomId: "room-1",
+          afterSeq: mismatch === "repair-not-expired" ? 5 : 0,
+          ...continuation,
+        },
+        limit: mismatch === "duplicate-event-id" ? 2 : 1,
+      },
+      1_000,
+    ));
+    const laterError = await rejectionOf(client.inspectSchema());
+    expect(error).toMatchObject({
+      status: 503,
+      code: "authority_worker_protocol_error",
+      message: mismatch === "duplicate-event-id"
+        ? "Authority worker sent a malformed response"
+        : "Authority worker returned an invalid room-sync result",
+    });
+    expect(laterError).toBe(error);
+    expect(publicErrorSurface(error)).not.toContain("wrong-request");
+  });
+
+  it.each(["room-id", "retained-from-seq"] as const)(
+    "terminally rejects a room stream compaction result with mismatched %s",
+    async (mismatch) => {
+      const path = databasePath();
+      const transport = new CompactionResultProbeTransport((request) => ({
+        type: "authority.room-stream-compacted",
+        requestId: request.requestId,
+        roomId: mismatch === "room-id" ? "wrong-room" : request.roomId,
+        retainedFromSeq: mismatch === "retained-from-seq"
+          ? request.retainedFromSeq + 1
+          : request.retainedFromSeq,
+        headSeq: 5,
+      }));
+      const client = trackClient(await createWorkerDatabaseClientForTest(
+        { databasePath: path },
+        () => transport,
+      ));
+
+      const error = await rejectionOf(client.compactRoomStream("room-1", 2));
+      const laterError = await rejectionOf(client.inspectSchema());
+
+      expect(error).toMatchObject({
+        status: 503,
+        code: "authority_worker_protocol_error",
+        message: "Authority worker returned an invalid room-stream compaction result",
+      });
+      expect(laterError).toBe(error);
+      expect(publicErrorSurface(error)).not.toContain("wrong-room");
+    },
+  );
+
+  it("fails terminally with a sanitized storage error for an unknown worker error code", async () => {
+    const path = databasePath();
+    const worker = workerThatRuns(`
+      parentPort.postMessage({
+        type: "authority.error",
+        requestId: request.requestId,
+        code: "future_unreviewed_error",
+        message: "SELECT secret FROM sessions at /private/authority.sqlite",
+      });
+    `);
+    const client = trackClient(
+      await createWorkerDatabaseClientForTest(
+        { databasePath: path },
+        () => worker,
+      ),
+    );
+
+    const pendingError = await rejectionOf(client.inspectSchema());
+    const laterError = await rejectionOf(client.inspectSchema());
+
+    expect(pendingError).toMatchObject({
+      code: "storage_unavailable",
+      status: 503,
+      message: "Authority storage became unavailable",
+    });
+    expect(laterError).toBe(pendingError);
+    expect(publicErrorSurface(pendingError)).not.toContain("future_unreviewed_error");
+    expect(publicErrorSurface(pendingError)).not.toContain("/private/authority.sqlite");
     await expectDatabasePathEventuallyReusable(path);
   });
 
@@ -1076,7 +1868,37 @@ describe("WorkerDatabaseClient", () => {
     const publicApi: Record<string, unknown> = await import("../index.js");
 
     expect(publicApi).not.toHaveProperty("createWorkerDatabaseClientForTest");
+    expect(publicApi).not.toHaveProperty(
+      "createWorkerDatabaseClientWithRollbackFailureForTest",
+    );
     expect(publicApi).not.toHaveProperty("isAuthorityWorkerRequest");
     expect(publicApi).not.toHaveProperty("isAuthorityWorkerResponse");
+  });
+
+  it("narrows the package-root worker client so raw point queries are absent at runtime", async () => {
+    const publicApi = await import("../index.js");
+    const path = databasePath();
+    const client = await publicApi.createWorkerDatabaseClient({ databasePath: path });
+    try {
+      expect(client).not.toHaveProperty("readActor");
+      expect(client).not.toHaveProperty("readRoom");
+      expect(client).not.toHaveProperty("executeHuman");
+      expect(client).not.toHaveProperty("executeAgent");
+      expect(client).not.toHaveProperty("revalidateSnapshot");
+      expect(client).not.toHaveProperty("listPendingOutbox");
+      expect(client).not.toHaveProperty("authorizeOutboxCandidate");
+      expect(client).not.toHaveProperty("markOutboxDispatched");
+      expect(client).not.toHaveProperty("markOutboxFailed");
+      expect(publicApi).not.toHaveProperty("createSqliteAuthoritativeStore");
+      expect(publicApi).not.toHaveProperty("createAuthoritativeRoomLifecycleService");
+    } finally {
+      await client.close();
+    }
+    if (existsSync(path)) {
+      const database = new DatabaseSync(path, { readOnly: true });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM idempotency_records").get())
+        .toEqual({ count: 0 });
+      database.close();
+    }
   });
 });

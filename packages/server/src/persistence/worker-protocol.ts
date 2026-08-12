@@ -1,9 +1,33 @@
-import { isActor } from "@native-im/core";
-import type { Actor } from "@native-im/core";
 import {
+  isActor,
+  isMessage,
+  isRoomSyncResult,
+  isSnapshotCompleted,
+  isSnapshotVersion,
+} from "@native-im/core";
+import type {
+  Actor,
+  ManagedRoom,
+  Message,
+  RoomSyncRequest,
+  RoomSyncResult,
+  SnapshotCompleted,
+  SnapshotVersion,
+} from "@native-im/core";
+import {
+  isManagedRoomShape,
+  isRoomAuditRecord,
+  type RoomAuditRecord,
+} from "../room-lifecycle.js";
+import {
+  parsePersistedIdentityEvent,
+  parsePersistedRoomEvent,
   parsePersistentCommand,
+  parseRoomSyncRequest,
 } from "./contracts.js";
 import type {
+  AgentCollaborationCommand,
+  AgentWorkerCommandContext,
   AuthenticatedSessionContext,
   AuthenticatedCommandContext,
   CommandAcknowledgement,
@@ -11,8 +35,109 @@ import type {
   HashedSessionRotation,
   HumanCollaborationCommand,
   IssuedSessionRecord,
+  OutboxDelivery,
+  OutboxDispatchCandidate,
   RoomGovernanceCommand,
+  SnapshotRevalidationRequest,
+  RepairScope,
+  StreamingRepairLease,
 } from "./contracts.js";
+
+export type AuthorityWorkerErrorCode =
+  | "actor_conflict"
+  | "agent_missing_permission"
+  | "agent_permissions_invalid"
+  | "agent_required"
+  | "authority_already_initialized"
+  | "authority_not_initialized"
+  | "authority_worker_closed"
+  | "calibration_source_invalid"
+  | "execution_conflict"
+  | "execution_not_running"
+  | "idempotency_conflict"
+  | "identity_forbidden"
+  | "invalid_request"
+  | "invalid_token"
+  | "invitation_consumed"
+  | "invitation_forbidden"
+  | "invitation_not_found"
+  | "invitation_pending"
+  | "invitation_secret_unavailable"
+  | "invitee_required"
+  | "legacy_import_failed"
+  | "legacy_import_unavailable"
+  | "member_not_found"
+  | "message_not_found"
+  | "open_item_not_found"
+  | "room_archived"
+  | "room_compaction_blocked"
+  | "room_forbidden"
+  | "room_member_exists"
+  | "room_member_not_found"
+  | "room_not_found"
+  | "room_owner_required"
+  | "repair_barrier_active"
+  | "session_revoked"
+  | "snapshot_busy"
+  | "snapshot_expired"
+  | "snapshot_family_revoked"
+  | "snapshot_forbidden"
+  | "snapshot_not_found"
+  | "snapshot_stale"
+  | "storage_unavailable"
+  | "token_expired";
+
+export function isAuthorityWorkerErrorCode(
+  value: unknown,
+): value is AuthorityWorkerErrorCode {
+  switch (value) {
+    case "actor_conflict":
+    case "agent_missing_permission":
+    case "agent_permissions_invalid":
+    case "agent_required":
+    case "authority_already_initialized":
+    case "authority_not_initialized":
+    case "authority_worker_closed":
+    case "calibration_source_invalid":
+    case "execution_conflict":
+    case "execution_not_running":
+    case "idempotency_conflict":
+    case "identity_forbidden":
+    case "invalid_request":
+    case "invalid_token":
+    case "invitation_consumed":
+    case "invitation_forbidden":
+    case "invitation_not_found":
+    case "invitation_pending":
+    case "invitation_secret_unavailable":
+    case "invitee_required":
+    case "legacy_import_failed":
+    case "legacy_import_unavailable":
+    case "member_not_found":
+    case "message_not_found":
+    case "open_item_not_found":
+    case "room_archived":
+    case "room_compaction_blocked":
+    case "room_forbidden":
+    case "room_member_exists":
+    case "room_member_not_found":
+    case "room_not_found":
+    case "room_owner_required":
+    case "repair_barrier_active":
+    case "session_revoked":
+    case "snapshot_busy":
+    case "snapshot_expired":
+    case "snapshot_family_revoked":
+    case "snapshot_forbidden":
+    case "snapshot_not_found":
+    case "snapshot_stale":
+    case "storage_unavailable":
+    case "token_expired":
+      return true;
+    default:
+      return false;
+  }
+}
 
 export type AuthorityWorkerRequest =
   | { readonly type: "authority.initialize"; readonly requestId: string }
@@ -67,7 +192,124 @@ export type AuthorityWorkerRequest =
       readonly requestId: string;
       readonly context: AuthenticatedCommandContext;
       readonly command: HumanCollaborationCommand | RoomGovernanceCommand;
+      readonly invitationSecret?: {
+        readonly tokenHash: string;
+        readonly sealedToken: string;
+      };
       readonly now: number;
+    }
+  | {
+      readonly type: "authority.execute-agent";
+      readonly requestId: string;
+      readonly context: AgentWorkerCommandContext;
+      readonly command: AgentCollaborationCommand;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.read-history";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly roomId: string;
+      readonly now: number;
+    }
+  | { readonly type: "authority.read-actor"; readonly requestId: string; readonly actorId: string }
+  | { readonly type: "authority.read-room"; readonly requestId: string; readonly roomId: string }
+  | {
+      readonly type: "authority.can-access-room";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly roomId: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.read-room-audit";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly roomId: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.outbox-list";
+      readonly requestId: string;
+      readonly limit: number;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.outbox-authorize";
+      readonly requestId: string;
+      readonly deliveryId: string;
+      readonly candidate: OutboxDispatchCandidate;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.outbox-dispatched";
+      readonly requestId: string;
+      readonly deliveryId: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.outbox-failed";
+      readonly requestId: string;
+      readonly deliveryId: string;
+      readonly reason: "closed" | "backpressure" | "send_rejected";
+    }
+  | {
+      readonly type: "authority.sync-room";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly request: RoomSyncRequest;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.snapshot-revalidate";
+      readonly requestId: string;
+      readonly validation: SnapshotRevalidationRequest;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.repair-acquire";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly scope: RepairScope;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.repair-register";
+      readonly requestId: string;
+      readonly snapshotId: string;
+      readonly checksum: string;
+      readonly pageCount: number;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.repair-authorize-page";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly snapshotId: string;
+      readonly page: number;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.repair-complete";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly snapshotId: string;
+      readonly version: SnapshotVersion;
+      readonly checksum: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.repair-release";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly snapshotId: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.compact-room-stream";
+      readonly requestId: string;
+      readonly roomId: string;
+      readonly retainedFromSeq: number;
     }
   | { readonly type: "authority.close"; readonly requestId: string };
 
@@ -75,12 +317,12 @@ export type AuthorityWorkerResponse =
   | {
       readonly type: "authority.ready";
       readonly requestId: string;
-      readonly schemaVersion: 3;
+      readonly schemaVersion: 5;
     }
   | {
       readonly type: "authority.schema";
       readonly requestId: string;
-      readonly schemaVersion: 3;
+      readonly schemaVersion: 5;
     }
   | {
       readonly type: "authority.legacy-imported";
@@ -133,11 +375,59 @@ export type AuthorityWorkerResponse =
       readonly requestId: string;
       readonly acknowledgement: CommandAcknowledgement;
     }
+  | {
+      readonly type: "authority.history";
+      readonly requestId: string;
+      readonly messages: readonly Message[];
+    }
+  | { readonly type: "authority.actor"; readonly requestId: string; readonly actor?: Actor }
+  | { readonly type: "authority.room"; readonly requestId: string; readonly room?: ManagedRoom }
+  | { readonly type: "authority.room-access"; readonly requestId: string; readonly allowed: boolean }
+  | {
+      readonly type: "authority.room-audit";
+      readonly requestId: string;
+      readonly audit: readonly RoomAuditRecord[];
+    }
+  | {
+      readonly type: "authority.outbox";
+      readonly requestId: string;
+      readonly deliveries: readonly OutboxDelivery[];
+    }
+  | {
+      readonly type: "authority.outbox-authorized";
+      readonly requestId: string;
+      readonly authorized: boolean;
+    }
+  | { readonly type: "authority.outbox-updated"; readonly requestId: string }
+  | {
+      readonly type: "authority.room-synced";
+      readonly requestId: string;
+      readonly result: RoomSyncResult;
+    }
+  | { readonly type: "authority.snapshot-revalidated"; readonly requestId: string }
+  | {
+      readonly type: "authority.repair-lease";
+      readonly requestId: string;
+      readonly lease: StreamingRepairLease;
+    }
+  | {
+      readonly type: "authority.snapshot-completed";
+      readonly requestId: string;
+      readonly completed: SnapshotCompleted;
+    }
+  | { readonly type: "authority.repair-released"; readonly requestId: string }
+  | {
+      readonly type: "authority.room-stream-compacted";
+      readonly requestId: string;
+      readonly roomId: string;
+      readonly retainedFromSeq: number;
+      readonly headSeq: number;
+    }
   | { readonly type: "authority.closed"; readonly requestId: string }
   | {
       readonly type: "authority.error";
       readonly requestId: string;
-      readonly code: string;
+      readonly code: AuthorityWorkerErrorCode;
       readonly message: string;
     };
 
@@ -278,6 +568,54 @@ function isAuthenticatedSessionContext(
   );
 }
 
+function isSnapshotRevalidationRequest(
+  value: unknown,
+): value is SnapshotRevalidationRequest {
+  if (!isRecord(value) || !isAuthenticatedSessionContext(value.context)) {
+    return false;
+  }
+  if (value.kind === "room") {
+    return hasExactKeys(value, ["kind", "context", "roomId", "accessRevision"]) &&
+      isText(value.roomId) && isNonNegativeSafeInteger(value.accessRevision);
+  }
+  return value.kind === "catalog" &&
+    hasExactKeys(value, ["kind", "context", "catalogRevision"]) &&
+    isNonNegativeSafeInteger(value.catalogRevision);
+}
+
+function isRepairScope(value: unknown): value is RepairScope {
+  return isRecord(value) && (
+    (value.kind === "room" && hasExactKeys(value, ["kind", "roomId"]) &&
+      isText(value.roomId)) ||
+    (value.kind === "catalog" && hasExactKeys(value, ["kind", "principalId"]) &&
+      isText(value.principalId))
+  );
+}
+
+function isStreamingRepairLease(value: unknown): value is StreamingRepairLease {
+  if (!isRecord(value) || !hasExactKeys(value, [
+    "snapshotId", "principalId", "accountId", "sessionFamilyId", "scope",
+    "version", "authorizationRevision", "idleExpiresAt",
+    ...(Object.hasOwn(value, "checksum") ? ["checksum"] : []),
+    ...(Object.hasOwn(value, "pageCount") ? ["pageCount"] : []),
+    ...(Object.hasOwn(value, "lastPage") ? ["lastPage"] : []),
+    ...(Object.hasOwn(value, "highestAuthorizedPage") ? ["highestAuthorizedPage"] : []),
+  ])) return false;
+  const attached = Object.hasOwn(value, "checksum") || Object.hasOwn(value, "pageCount") ||
+    Object.hasOwn(value, "lastPage") || Object.hasOwn(value, "highestAuthorizedPage");
+  return isText(value.snapshotId) && isText(value.principalId) &&
+    isText(value.accountId) && isTokenHash(value.sessionFamilyId) &&
+    isRepairScope(value.scope) && isSnapshotVersion(value.version) &&
+    isNonNegativeSafeInteger(value.authorizationRevision) &&
+    isText(value.idleExpiresAt) &&
+    (!attached || (isText(value.checksum) && isNonNegativeSafeInteger(value.pageCount) &&
+      value.pageCount > 0 && isNonNegativeSafeInteger(value.lastPage) &&
+      value.lastPage === value.pageCount - 1 &&
+      typeof value.highestAuthorizedPage === "number" &&
+      Number.isSafeInteger(value.highestAuthorizedPage) && value.highestAuthorizedPage >= -1 &&
+      value.highestAuthorizedPage <= value.lastPage));
+}
+
 function isAuthenticatedCommandContext(
   value: unknown,
 ): value is AuthenticatedCommandContext {
@@ -300,6 +638,20 @@ function isAuthenticatedCommandContext(
   );
 }
 
+function isAgentWorkerCommandContext(value: unknown): value is AgentWorkerCommandContext {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, ["kind", "agent", "requestId", "idempotencyKey"]) &&
+    value.kind === "agent" &&
+    isRecord(value.agent) &&
+    hasExactKeys(value.agent, ["actorId", "kind"]) &&
+    value.agent.kind === "agent" &&
+    isText(value.agent.actorId) &&
+    isText(value.requestId) &&
+    isText(value.idempotencyKey)
+  );
+}
+
 function isHumanCommand(value: unknown): value is HumanCollaborationCommand | RoomGovernanceCommand {
   const parsed = parsePersistentCommand(value);
   if (!parsed.ok) {
@@ -307,6 +659,18 @@ function isHumanCommand(value: unknown): value is HumanCollaborationCommand | Ro
   }
   return parsed.value.type !== "agent.judgment.record" &&
     parsed.value.type !== "agent.execution.transition";
+}
+
+function isAgentCommand(value: unknown): value is AgentCollaborationCommand {
+  const parsed = parsePersistentCommand(value);
+  if (!parsed.ok) {
+    return false;
+  }
+  return parsed.value.type === "message.send" ||
+    parsed.value.type === "agent.judgment.record" ||
+    parsed.value.type === "open-item.create" ||
+    parsed.value.type === "open-item.transition" ||
+    parsed.value.type === "agent.execution.transition";
 }
 
 function isJsonValue(value: unknown): boolean {
@@ -336,6 +700,70 @@ function isCommandAcknowledgement(value: unknown): value is CommandAcknowledgeme
     isText(value.acceptedAt) &&
     isJsonValue(value.result)
   );
+}
+
+function isOutboxDispatchCandidate(value: unknown): value is OutboxDispatchCandidate {
+  return isRecord(value) &&
+    hasExactKeys(value, [
+      "connectionId",
+      "principal",
+      "sessionId",
+      "sessionFamilyId",
+      "credentialGeneration",
+    ]) &&
+    isText(value.connectionId) &&
+    isPrincipal(value.principal) &&
+    isTokenHash(value.sessionId) &&
+    isTokenHash(value.sessionFamilyId) &&
+    isNonNegativeSafeInteger(value.credentialGeneration);
+}
+
+function isOutboxDelivery(value: unknown): value is OutboxDelivery {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "deliveryId",
+      "eventId",
+      "targetKind",
+      "targetId",
+      "streamSeq",
+      "attempts",
+      "event",
+    ]) ||
+    !isText(value.deliveryId) ||
+    !isText(value.eventId) ||
+    (value.targetKind !== "room" &&
+      value.targetKind !== "principal" &&
+      value.targetKind !== "session-family") ||
+    !isText(value.targetId) ||
+    !isNonNegativeSafeInteger(value.streamSeq) ||
+    value.streamSeq < 1 ||
+    !isNonNegativeSafeInteger(value.attempts)
+  ) {
+    return false;
+  }
+  const parsedEvent = value.targetKind === "room"
+    ? parsePersistedRoomEvent(value.event)
+    : parsePersistedIdentityEvent(value.event);
+  const event = parsedEvent.ok ? parsedEvent.value : undefined;
+  if (
+    event === undefined ||
+    event.eventId !== value.eventId ||
+    event.streamSeq !== value.streamSeq
+  ) {
+    return false;
+  }
+  if (value.targetKind === "room") {
+    return event.streamKind === "room" && event.roomId === value.targetId;
+  }
+  if (value.targetKind === "principal") {
+    return event.streamKind === "identity" &&
+      event.streamId === value.targetId &&
+      event.type === "identity.room-access.changed";
+  }
+  return event.streamKind === "identity" &&
+    event.type === "identity.session.revoked" &&
+    event.payload.familyId === value.targetId;
 }
 
 export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWorkerRequest {
@@ -410,11 +838,101 @@ export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWork
       );
     case "authority.execute-human":
       return (
-        hasExactKeys(value, ["type", "requestId", "context", "command", "now"]) &&
+        hasExactKeys(value, [
+          "type",
+          "requestId",
+          "context",
+          "command",
+          "now",
+          ...(Object.hasOwn(value, "invitationSecret") ? ["invitationSecret"] : []),
+        ]) &&
         isAuthenticatedCommandContext(value.context) &&
         isHumanCommand(value.command) &&
+        ((value.command.type === "human.invitation.issue" &&
+          isRecord(value.invitationSecret) &&
+          hasExactKeys(value.invitationSecret, ["tokenHash", "sealedToken"]) &&
+          isTokenHash(value.invitationSecret.tokenHash) &&
+          isText(value.invitationSecret.sealedToken)) ||
+          (value.command.type !== "human.invitation.issue" &&
+            !Object.hasOwn(value, "invitationSecret"))) &&
         isNonNegativeSafeInteger(value.now)
       );
+    case "authority.execute-agent":
+      return (
+        hasExactKeys(value, ["type", "requestId", "context", "command", "now"]) &&
+        isAgentWorkerCommandContext(value.context) &&
+        isAgentCommand(value.command) &&
+        isNonNegativeSafeInteger(value.now)
+      );
+    case "authority.read-history":
+      return hasExactKeys(value, ["type", "requestId", "context", "roomId", "now"]) &&
+        isAuthenticatedSessionContext(value.context) && isText(value.roomId) &&
+        isNonNegativeSafeInteger(value.now);
+    case "authority.read-actor":
+      return hasExactKeys(value, ["type", "requestId", "actorId"]) && isText(value.actorId);
+    case "authority.read-room":
+      return hasExactKeys(value, ["type", "requestId", "roomId"]) && isText(value.roomId);
+    case "authority.can-access-room":
+    case "authority.read-room-audit":
+      return hasExactKeys(value, ["type", "requestId", "context", "roomId", "now"]) &&
+        isAuthenticatedSessionContext(value.context) && isText(value.roomId) &&
+        isNonNegativeSafeInteger(value.now);
+    case "authority.outbox-list":
+      return hasExactKeys(value, ["type", "requestId", "limit", "now"]) &&
+        isNonNegativeSafeInteger(value.limit) && value.limit > 0 && value.limit <= 1_000 &&
+        isNonNegativeSafeInteger(value.now);
+    case "authority.outbox-authorize":
+      return hasExactKeys(value, ["type", "requestId", "deliveryId", "candidate", "now"]) &&
+        isText(value.deliveryId) && isOutboxDispatchCandidate(value.candidate) &&
+        isNonNegativeSafeInteger(value.now);
+    case "authority.outbox-dispatched":
+      return hasExactKeys(value, ["type", "requestId", "deliveryId", "now"]) &&
+        isText(value.deliveryId) && isNonNegativeSafeInteger(value.now);
+    case "authority.outbox-failed":
+      return hasExactKeys(value, ["type", "requestId", "deliveryId", "reason"]) &&
+        isText(value.deliveryId) &&
+        (value.reason === "closed" ||
+          value.reason === "backpressure" ||
+          value.reason === "send_rejected");
+    case "authority.sync-room": {
+      const parsed = parseRoomSyncRequest(value.request);
+      return hasExactKeys(value, ["type", "requestId", "context", "request", "now"]) &&
+        isAuthenticatedSessionContext(value.context) && parsed.ok &&
+        (parsed.value.cursor === undefined ||
+          parsed.value.cursor.roomId === parsed.value.roomId) &&
+        isNonNegativeSafeInteger(value.now);
+    }
+    case "authority.snapshot-revalidate":
+      return hasExactKeys(value, ["type", "requestId", "validation", "now"]) &&
+        isSnapshotRevalidationRequest(value.validation) &&
+        isNonNegativeSafeInteger(value.now);
+    case "authority.repair-acquire":
+      return hasExactKeys(value, ["type", "requestId", "context", "scope", "now"]) &&
+        isAuthenticatedSessionContext(value.context) && isRepairScope(value.scope) &&
+        isNonNegativeSafeInteger(value.now);
+    case "authority.repair-register":
+      return hasExactKeys(value, ["type", "requestId", "snapshotId", "checksum", "pageCount", "now"]) &&
+        isText(value.snapshotId) &&
+        isText(value.checksum) && isNonNegativeSafeInteger(value.pageCount) &&
+        value.pageCount > 0 &&
+        isNonNegativeSafeInteger(value.now);
+    case "authority.repair-authorize-page":
+      return hasExactKeys(value, ["type", "requestId", "context", "snapshotId", "page", "now"]) &&
+        isAuthenticatedSessionContext(value.context) && isText(value.snapshotId) &&
+        isNonNegativeSafeInteger(value.page) && isNonNegativeSafeInteger(value.now);
+    case "authority.repair-complete":
+      return hasExactKeys(value, ["type", "requestId", "context", "snapshotId", "version", "checksum", "now"]) &&
+        isAuthenticatedSessionContext(value.context) && isText(value.snapshotId) &&
+        isSnapshotVersion(value.version) && isText(value.checksum) &&
+        isNonNegativeSafeInteger(value.now);
+    case "authority.repair-release":
+      return hasExactKeys(value, ["type", "requestId", "context", "snapshotId", "now"]) &&
+        isAuthenticatedSessionContext(value.context) && isText(value.snapshotId) &&
+        isNonNegativeSafeInteger(value.now);
+    case "authority.compact-room-stream":
+      return hasExactKeys(value, ["type", "requestId", "roomId", "retainedFromSeq"]) &&
+        isText(value.roomId) && isNonNegativeSafeInteger(value.retainedFromSeq) &&
+        value.retainedFromSeq >= 1;
     default:
       return false;
   }
@@ -432,7 +950,7 @@ export function isAuthorityWorkerResponse(
     case "authority.schema":
       return (
         hasExactKeys(value, ["type", "requestId", "schemaVersion"]) &&
-        value.schemaVersion === 3
+        value.schemaVersion === 5
       );
     case "authority.closed":
       return hasExactKeys(value, ["type", "requestId"]);
@@ -465,6 +983,54 @@ export function isAuthorityWorkerResponse(
         hasExactKeys(value, ["type", "requestId", "acknowledgement"]) &&
         isCommandAcknowledgement(value.acknowledgement)
       );
+    case "authority.history":
+      return hasExactKeys(value, ["type", "requestId", "messages"]) &&
+        Array.isArray(value.messages) && value.messages.every(isMessage);
+    case "authority.actor":
+      return hasExactKeys(
+        value,
+        ["type", "requestId", ...(Object.hasOwn(value, "actor") ? ["actor"] : [])],
+      ) && (!Object.hasOwn(value, "actor") || isStrictActor(value.actor));
+    case "authority.room":
+      return hasExactKeys(
+        value,
+        ["type", "requestId", ...(Object.hasOwn(value, "room") ? ["room"] : [])],
+      ) && (!Object.hasOwn(value, "room") || isManagedRoomShape(value.room));
+    case "authority.room-access":
+      return hasExactKeys(value, ["type", "requestId", "allowed"]) &&
+        typeof value.allowed === "boolean";
+    case "authority.room-audit":
+      return hasExactKeys(value, ["type", "requestId", "audit"]) &&
+        Array.isArray(value.audit) && value.audit.every(isRoomAuditRecord);
+    case "authority.outbox":
+      return hasExactKeys(value, ["type", "requestId", "deliveries"]) &&
+        Array.isArray(value.deliveries) && value.deliveries.every(isOutboxDelivery);
+    case "authority.outbox-authorized":
+      return hasExactKeys(value, ["type", "requestId", "authorized"]) &&
+        typeof value.authorized === "boolean";
+    case "authority.outbox-updated":
+      return hasExactKeys(value, ["type", "requestId"]);
+    case "authority.room-synced":
+      return hasExactKeys(value, ["type", "requestId", "result"]) &&
+        isRoomSyncResult(value.result);
+    case "authority.snapshot-revalidated":
+      return hasExactKeys(value, ["type", "requestId"]);
+    case "authority.repair-lease":
+      return hasExactKeys(value, ["type", "requestId", "lease"]) &&
+        isStreamingRepairLease(value.lease);
+    case "authority.snapshot-completed":
+      return hasExactKeys(value, ["type", "requestId", "completed"]) &&
+        isSnapshotCompleted(value.completed);
+    case "authority.repair-released":
+      return hasExactKeys(value, ["type", "requestId"]);
+    case "authority.room-stream-compacted":
+      return hasExactKeys(
+        value,
+        ["type", "requestId", "roomId", "retainedFromSeq", "headSeq"],
+      ) && isText(value.roomId) &&
+        isNonNegativeSafeInteger(value.retainedFromSeq) && value.retainedFromSeq >= 1 &&
+        isNonNegativeSafeInteger(value.headSeq) &&
+        value.retainedFromSeq <= value.headSeq + 1;
     case "authority.legacy-imported":
       return (
         hasExactKeys(value, [
@@ -502,8 +1068,7 @@ export function isAuthorityWorkerResponse(
     case "authority.error":
       return (
         hasExactKeys(value, ["type", "requestId", "code", "message"]) &&
-        typeof value.code === "string" &&
-        value.code.length > 0 &&
+        isAuthorityWorkerErrorCode(value.code) &&
         typeof value.message === "string" &&
         value.message.length > 0
       );

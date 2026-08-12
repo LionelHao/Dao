@@ -194,7 +194,7 @@ Run: `pnpm typecheck && pnpm exec vitest run packages/server/src/persistence/sch
 
 Expected: schema tests pass on the local runtime; typecheck and lint exit 0. CI later proves the lower bound.
 
-- [ ] **Step 5: Preview and commit.**
+- [x] **Step 5: Preview and commit.**
 
 Use `superpowers:commit-rebase-pr`, stage only the five listed files, and propose `feat(server): add versioned authority schema`. The Chinese preview must call out the experimental `node:sqlite` risk and the fact that CI, not the local Node 25 runtime, is the Node 22.13 proof.
 
@@ -518,6 +518,11 @@ export interface CommandStore {
 export interface SyncQueryStore {
   syncRoom(context: AuthenticatedSessionContext, request: RoomSyncRequest): Promise<RoomSyncResult>;
   readHistory(context: AuthenticatedSessionContext, roomId: string): Promise<readonly Message[]>;
+  // Server-internal point lookups; not exported through the package root.
+  readActor(actorId: string): Promise<Actor | undefined>;
+  readRoom(roomId: string): Promise<ManagedRoom | undefined>;
+  canAccessRoom(context: AuthenticatedSessionContext, roomId: string): Promise<boolean>;
+  readRoomAudit(context: AuthenticatedSessionContext, roomId: string): Promise<readonly RoomAuditRecord[]>;
   listPendingOutbox(limit: number): Promise<readonly OutboxDelivery[]>;
   markOutboxDispatched(deliveryId: string): Promise<void>;
 }
@@ -669,6 +674,17 @@ Stage only listed files and propose `feat(server): persist authoritative session
 
 - Modify: `packages/server/src/persistence/sqlite-authoritative-store.ts`
 - Modify: `packages/server/src/persistence/sqlite-authoritative-store.test.ts`
+- Modify: `packages/server/src/persistence/authority-worker.ts`
+- Modify: `packages/server/src/persistence/worker-protocol.ts`
+- Modify: `packages/server/src/persistence/worker-database-client.ts`
+- Modify: `packages/server/src/persistence/worker-database-client.test.ts`
+- Create: `packages/server/src/persistence/authority-database-handler.ts`
+- Modify: `packages/server/src/persistence/schema.ts`
+- Modify: `packages/server/src/persistence/schema.test.ts`
+- Modify: `packages/server/src/persistence/legacy-importer.test.ts`
+- Modify: `packages/server/src/persistence/contracts.ts`
+- Modify: `packages/server/src/persistence/contracts.test.ts`
+- Modify: `packages/server/src/persistence/contracts.type-test.ts`
 - Modify: `packages/server/src/room-lifecycle.ts`
 - Modify: `packages/server/src/room-lifecycle.test.ts`
 - Modify: `packages/server/src/service.ts`
@@ -678,6 +694,8 @@ Stage only listed files and propose `feat(server): persist authoritative session
 - Create: `packages/server/src/invitation-secret-protector.ts`
 - Create: `packages/server/src/invitation-secret-protector.test.ts`
 - Modify: `packages/server/src/index.ts`
+
+Task 6 advances the immutable authority schema from v3 to v4. The migration adds the missing canonical OpenItem, AgentExecution, and CalibrationSignal columns without changing v1-v3 checksums/fingerprints. Legacy calibration rows keep both actor and source fields `NULL`; migration must not infer only source from the old judgment and create a half-known row. V4 triggers require every new authoritative calibration write to carry a valid human actor and same-room source Agent message; the v4 triggers are included in the physical fingerprint/startup validation.
 
 - [ ] **Step 1: Write parameterized RED tests for all accepted facts.**
 
@@ -695,6 +713,8 @@ expect(await fixture.countEvents(first.eventIds)).toBe(first.eventIds.length);
 ```
 
 Run each case sequentially, concurrently with the same key, after worker restart, and with the same key plus changed canonical payload. The conflict case must be 409 and leave row counts unchanged. Add separate tests proving human/agent cross-authority calls fail and all three Agent judgement outcomes persist a non-empty reason.
+
+Changed-payload 409 applies only when a command has two or more legal canonical business payloads within the same idempotency scope. `room.archive` has a closed empty payload, so it instead proves sequential, concurrent, and cross-restart exact replay; an unknown or extra payload field is rejected as closed-schema 400 with zero writes, while a changed `roomId` is a different aggregate scope. Do not change the archive scope and do not add a synthetic reason field.
 
 For `human.invitation.issue`, drop the first ACK after COMMIT, restart, and replay the same key. The service must return the byte-identical invitation token without inserting another invitation. Scan SQLite text/blob values and prove the plaintext token is absent.
 
@@ -726,7 +746,7 @@ Hash canonical business payload only; exclude `requestId` and `idempotencyKey`. 
 
 - [ ] **Step 4: Implement room governance and catalog/access revisions.**
 
-Add create/rename/archive/invite/decision/configure-agent/change-role/remove-member handlers one at a time. After each handler, run its parameterized test case before adding the next. Preserve authored messages after removal. Increment all affected human catalog revisions for room create/rename/join/role/remove/archive and the target membership access revision for permission changes.
+Add create/rename/archive/invite/decision/configure-agent/change-role/remove-member handlers one at a time. After each handler, run its parameterized test case before adding the next. Preserve authored messages after removal. Increment all affected human catalog revisions for room create/rename/join/role/remove/archive and the target membership access revision for permission changes. Agent configure appends `identity.room-access.changed` with `joined` or `updated`, and Agent removal appends `removed`; include those identity event IDs in the acknowledgement, advance the Agent identity stream, and intentionally create no principal outbox delivery because Agents have no principal observer.
 
 Create an explicit secret port and AES-256-GCM adapter:
 
@@ -757,7 +777,13 @@ Expected: all canonical records and closed events persist exactly once; human/Ag
 
 - [ ] **Step 6: Convert services to authority facades.**
 
-`RoomLifecycleService` methods call `CommandStore` and async query methods instead of saving whole JSON documents. `MessageService.send/history` use authenticated/internal contexts; `send` no longer invokes listeners directly. The primitive service keeps its pure decision logic but delegates accepted persistent facts through injected writers; T-0041 remains responsible for real Agent runtime invocation.
+`RoomLifecycleService` methods call `CommandStore` and async query methods instead of saving whole JSON documents. `MessageService.send/history` use authenticated/internal contexts; `send` no longer invokes listeners directly. Keep the synchronous T-0039 primitive as a pure compatibility decision model. Add a separate asynchronous authoritative primitive facade that maps human/Agent contexts to `CommandStore`, awaits the committed acknowledgement, strictly parses the canonical result, and only then publishes the accepted fact; a failed commit must publish nothing. T-0041 remains responsible for real Agent runtime invocation.
+
+Owner-approved transition: implement a separate authoritative RoomLifecycle facade whose mutations use `CommandStore` and whose `readActor/readRoom/canAccessRoom/readRoomAudit` calls use the corresponding asynchronous `SyncQueryStore` methods. `readActor` and `readRoom` are explicitly server-internal point lookups for composition/lifecycle, not public permission queries: do not export raw `SyncQueryStore`, the SQLite authority factory, an authoritative lifecycle factory whose options expose them, or worker-client point-query methods from the package root. `canAccessRoom` and `readRoomAudit` retain session, membership, active-room, and authorization checks in the worker. Keep the T-0039 synchronous JSON implementation only as an explicitly named compatibility adapter; it must not participate in authoritative MessageService, authoritative mutations, or security decisions. Do not change WebSocket composition in Task 6 and do not pull Task 7 outbox dispatch forward.
+
+Keep the package-root worker client physically narrowed as well as type-narrowed: it must omit `executeHuman`, `executeAgent`, `readActor`, and `readRoom`, and it must not expose rollback/transport test seams. The deep client accepts `InternalAgentCommandContext`, validates its runtime capability internally, and only then constructs `AgentWorkerCommandContext`; never accept plain worker wire context at a public command boundary. Invitation secret material is prepared only by the internal SQLite authority facade.
+
+Use one closed `AuthorityWorkerErrorCode` union across database handlers, worker serialization, and response parsing. Map every member exhaustively to `400 | 401 | 403 | 404 | 409 | 503`; an unknown worker code must become one sanitized terminal `storage_unavailable` error shared by pending and later calls. If `ROLLBACK` fails after a transaction error, throw an internal `AggregateError` preserving both causes, close/poison the worker-owned `DatabaseSync`, reject all client work with that same sanitized terminal error, and release the coordinator only after `terminate()` resolves or an explicit `exit` arrives; terminate rejection without exit must retain the reservation. Fault seams remain internal test-only exports. Registration, session, and governance identity events must share one deep canonical identity stream/event writer whose input is derived from the closed `PersistedIdentityEvent` union; when an event ID depends on payload, derive it from the exact canonical bytes that the same writer persists. A synchronous `publishAccepted` observer runs after commit and its exception cannot change the durable ACK into a failure.
 
 - [ ] **Step 7: Run the complete authority regression.**
 
@@ -783,7 +809,25 @@ Propose `feat(server): persist collaboration authority`. Reviewer focus: transac
 - Modify: `packages/server/src/websocket.test.ts`
 - Modify: `packages/server/src/index.ts`
 
-- [ ] **Step 1: Write target-kind and replay RED tests.**
+Implementation-required hard expansion: the dispatcher needs durable pending reads, per-candidate
+authorization against the worker-owned current SQLite view, and idempotent dispatch/failure
+marks. Task 7 may therefore also modify `worker-protocol.ts`,
+`worker-database-client.ts` and its tests, `authority-worker.ts`,
+`authority-database-handler.ts`, the SQLite authoritative store/tests, and contract/type
+tests. `OutboxDelivery` remains a target-kind discriminated union reconstructed from an
+`events` JOIN; authorization requests carry only delivery ID, candidate credential snapshot,
+credential generation, and current time, while the worker re-reads the pending delivery and
+applies the target-specific rule. Failure reasons remain the closed
+`closed | backpressure | send_rejected` union, attempts advance once per dispatcher round,
+marks are idempotent, and the package-root worker wrapper exposes none of these management
+operations. Owner-approved public wire contract: keep `room.message.accepted` delivery
+byte-compatible with the existing `{ type: "message.created", message }` frame; wrap every
+other room event as `{ type: "room.event", event }`; deliver the complete closed
+`identity.room-access.changed` event as its frame; and deliver session-family revocation as
+the unsolicited `{ type: "auth.session-revoked", eventId }` terminal frame without a fake
+`requestId`. Do not expose arbitrary persisted events as new top-level frame types.
+
+- [x] **Step 1: Write target-kind and replay RED tests.**
 
 ```ts
 registry.addRoom({ roomId: "room-1", connection: memberConnection });
@@ -802,13 +846,13 @@ expect(revokedConnection.frames).toContainEqual(expect.objectContaining({
 
 Remove the first actor from the room before dispatch: room delivery must skip it, principal delivery must still reach it, and revoked-family terminal delivery must not require a currently valid session. Simulate send failure and restart; pending delivery remains. Simulate send success before mark-dispatched crash; replay may send twice but the event ID stays identical.
 
-- [ ] **Step 2: Run RED.**
+- [x] **Step 2: Run RED.**
 
 Run: `pnpm typecheck && pnpm exec vitest run packages/server/src/subscription-registry.test.ts packages/server/src/outbox-dispatcher.test.ts packages/server/src/websocket.test.ts`
 
 Expected: missing registry/dispatcher tests fail; existing direct listener tests identify behavior that must move.
 
-- [ ] **Step 3: Implement indexed subscriptions and durable dispatch.**
+- [x] **Step 3: Implement indexed subscriptions and durable dispatch.**
 
 ```ts
 export interface SubscriptionRegistry {
@@ -828,7 +872,7 @@ export interface OutboxDispatcher {
 
 Before each send, `OutboxDispatcher` asks the authority store to authorize the candidate using target-specific rules. Change the internal bounded `sendFrame` seam to report accepted/rejected delivery: if any eligible connection is closed, over backpressure limit, or rejects the frame, keep the row pending and increment attempts; already-sent peers may receive the same event ID again. Mark dispatched only after every eligible local connection accepted the frame, or when no eligible connection exists and durable cursor replay is the only remaining path. A process crash leaves pending rows; event/outbox unique keys make replay stable.
 
-- [ ] **Step 4: Remove direct post-append fanout and verify.**
+- [x] **Step 4: Remove direct post-append fanout and verify.**
 
 `MessageService.send` returns immediately after durable COMMIT/ACK. WebSocket composition starts the dispatcher and registers connection principal/family/rooms. Close, error, unsubscribe, and family revoke remove registry entries exactly once.
 
@@ -850,7 +894,21 @@ Propose `feat(server): dispatch transactional outbox`. The risk summary must dis
 - Modify: `packages/server/src/persistence/worker-protocol.ts`
 - Modify: `packages/server/src/persistence/authority-worker.ts`
 - Modify: `packages/server/src/persistence/sqlite-authoritative-store.ts`
+- Modify: `packages/server/src/persistence/worker-database-client.ts` (real RPC client)
+- Modify: `packages/server/src/persistence/authority-database-handler.ts` (worker-owned SQLite sync query and compaction transaction)
 - Modify: `packages/server/src/index.ts`
+- Modify: `packages/core/src/sync.ts` (mechanical cursor/result contract repair)
+- Modify: `packages/core/src/sync.test.ts` (closed guard regression coverage)
+
+This mechanical expansion keeps the Task 8 acceptance contract unchanged: the
+facade must reach the real worker RPC client, while all SQLite reads and
+compaction SQL remain owned by the authority worker.
+The core sync files are additionally in scope only to carry the fixed page
+watermark and close impossible result envelopes; acceptance semantics remain
+unchanged.
+Compaction blocked by a non-dispatched outbox delivery uses the closed,
+request-level `room_compaction_blocked` error (HTTP 409), leaves stream/event/
+outbox state unchanged, and does not poison the worker client.
 
 - [ ] **Step 1: Write three-cursor RED tests against the authority store.**
 
@@ -920,8 +978,18 @@ Propose `feat(server): add authoritative room cursors`. Reviewer focus: watermar
 - Create: `packages/server/src/persistence/snapshot-worker-client.test.ts`
 - Modify: `packages/server/src/persistence/schema.ts`
 - Modify: `packages/server/src/persistence/contracts.ts`
+- Modify: `packages/server/src/persistence/worker-protocol.ts`
+- Modify: `packages/server/src/persistence/worker-database-client.ts`
+- Modify: `packages/server/src/persistence/worker-database-client.test.ts`
+- Modify: `packages/server/src/persistence/authority-worker.ts`
+- Modify: `packages/server/src/persistence/authority-database-handler.ts`
+- Modify: `packages/server/src/persistence/sqlite-authoritative-store.ts`
 - Modify: `packages/server/src/sync-service.ts`
 - Modify: `packages/server/src/sync-service.test.ts`
+- Modify: `packages/server/src/index.ts`
+- Modify: `packages/core/src/index.ts`
+- Modify: `packages/core/src/sync.ts`
+- Modify: `packages/core/src/sync.test.ts`
 
 - [ ] **Step 1: Write materialized snapshot RED tests.**
 
@@ -984,11 +1052,18 @@ Propose `feat(server): materialize repair snapshots`. Risks: experimental read-o
 
 - Create: `packages/server/src/fallback-repair-coordinator.ts`
 - Create: `packages/server/src/fallback-repair-coordinator.test.ts`
+- Modify: `packages/server/src/index.ts` (keep Task 10 server-internal APIs off the package root)
+- Modify: `packages/server/src/persistence/contracts.ts` (closed internal repair scope/lease contract)
 - Modify: `packages/server/src/persistence/worker-protocol.ts`
+- Modify: `packages/server/src/persistence/worker-database-client.ts`
+- Modify: `packages/server/src/persistence/worker-database-client.test.ts`
+- Modify: `packages/server/src/persistence/authority-database-handler.ts`
 - Modify: `packages/server/src/persistence/authority-worker.ts`
-- Modify: `packages/server/src/persistence/sqlite-authoritative-store.ts`
+- Modify: `packages/server/src/persistence/schema.ts` (immutable v5 scoped keyset indexes only)
+- Modify: `packages/server/src/persistence/schema.test.ts`
 - Modify: `packages/server/src/persistence/snapshot-worker.ts`
 - Modify: `packages/server/src/persistence/snapshot-worker-client.ts`
+- Modify: `packages/server/src/persistence/snapshot-worker-client.test.ts`
 - Modify: `packages/server/src/sync-service.ts`
 - Modify: `packages/server/src/sync-service.test.ts`
 
@@ -1034,6 +1109,24 @@ AuthorityWorker serializes acquire/normal-command/preempt/complete. A normal mut
 
 SnapshotWorker does one stable checksum pass and then reads pages in primary-key order while the scope is frozen. It keeps only one page in memory and has no total record/byte/time limit; only 30 seconds between page/complete requests. The client keeps staging until `snapshot.completed`. A 30-second tombstone replays completed only after current same-family/permission/version validation; revoke or revision change rejects the old completion.
 
+Authority schema v5 adds only the composite indexes required by those closed
+keyset scans: `(room_id, id)` on the five streamed fact tables and
+`(actor_id, kind, room_id)` for catalog membership. V1-v4 statements,
+checksums, and fingerprints stay immutable. `EXPLAIN QUERY PLAN` plus sparse,
+interleaved room/catalog fixtures prove that later pages seek within the target
+scope instead of skipping unrelated rows from the beginning.
+
+Immediately after acquire, the client tracks the lease with a process-local operation epoch, before the checksum pass starts. Checksum registration and page authorization use that epoch as an ownership CAS, so close, terminal failure, or explicit release cannot be followed by a late barrier resurrection. Once the checksum is attached, an expired access token leaves that lease available for a same-family refreshed session to authorize and replay page zero without another materialized or checksum scan.
+
+Buzz translation is explicit at this boundary: Buzz's stored-event query becomes
+primary-key/keyset-ordered room and catalog segments; its per-event visibility
+recheck becomes AuthorityWorker lease authorization before every page; and its
+EOSE completion boundary becomes `snapshot.completed` only after the final page
+is continuously authorized. We deliberately deviate from Buzz's Nostr
+filter/subscription model: repair uses closed room/catalog scopes, a frozen
+authority version, and client staging followed by one atomic replacement because
+human/Agent IM repair must never expose a partially rebuilt cache.
+
 Run: `pnpm typecheck && pnpm exec vitest run packages/server/src/fallback-repair-coordinator.test.ts packages/server/src/persistence/snapshot-worker-client.test.ts packages/server/src/sync-service.test.ts && pnpm lint`
 
 Expected: all bounded-path failures fall back; any finite fixture completes; unrelated writes and refresh continue; preemptive governance cannot be frozen.
@@ -1051,8 +1144,10 @@ Propose `feat(server): guarantee scoped streaming repair`. Reviewer focus: no gl
 - Modify: `packages/server/src/websocket.ts`
 - Modify: `packages/server/src/websocket.test.ts`
 - Modify: `packages/server/src/index.ts`
+- Modify: `packages/server/src/outbox-dispatcher.ts`
+- Modify: `packages/server/src/outbox-dispatcher.test.ts`
 
-- [ ] **Step 1: Write protocol RED tests for every new request/result.**
+- [x] **Step 1: Write protocol RED tests for every new request/result.**
 
 Cover `workspace.bootstrap.begin/page`, `room.sync`, `room.repair.begin/page`, `snapshot.complete`, and `room.subscribe.v2`. Each parser test must reject extra fields, wrong cursor version/room, negative/future page, room/catalog version interchange, missing `requestId`, and over-limit IDs.
 
@@ -1074,21 +1169,23 @@ expect(parseClientFrame(JSON.stringify({
 }))).toMatchObject({ ok: false });
 ```
 
-- [ ] **Step 2: Run RED.**
+- [x] **Step 2: Run RED.**
 
 Run: `pnpm typecheck && pnpm exec vitest run packages/server/src/protocol.test.ts packages/server/src/websocket.test.ts`
 
 Expected: new protocol cases fail; legacy auth/message/history/subscribe tests stay green.
 
-- [ ] **Step 3: Extend closed ClientFrame/ServerFrame unions.**
+- [x] **Step 3: Extend closed ClientFrame/ServerFrame unions.**
 
 Use the exact types from the approved design: every successful server frame has a literal `type` and current request's `requestId`; bootstrap pages include `mode`, `catalogRevision`, checksum, and mode-specific expiry; repair pages include room watermark; complete uses `SnapshotVersion`. Extend protocol status to 410, 429, and 503 with stable codes.
 
-- [ ] **Step 4: Wire v2 sync and bounded subscription gate.**
+- [x] **Step 4: Wire v2 sync and bounded subscription gate.**
 
 `requirePrincipal` returns `AuthenticatedSessionContext`. v2 operations call `SyncService`, recheck connection credential generation immediately before send, and use the existing inbound/outbound byte limits. `room.subscribe.v2` registers an inactive gate, reads delta to a watermark, drains higher events by event ID, then activates. Gate limits are 256 events or 256 KiB; overflow removes the temporary subscription and returns `room.subscribe.v2.retry` with `restartFrom`.
 
 Keep legacy `room.history` and cursorless `room.subscribe` behavior byte-for-byte compatible: register first, return history, then continue live delivery. Do not make a missing cursor a legacy 400.
+
+Buzz 的 `register_scoped → stored ordered query → EVENT/EOSE` 在这里翻译为 inactive bounded room gate、authoritative cursor delta/watermark、按 durable `eventId` 去重后 drain/activate。为保留 `room.message.accepted` 的 `eventId + streamSeq`，OutboxDispatcher 的内部 send callback 同时传递完整 delivery envelope；它不进入 `ServerFrame` 或 package-root wire，legacy 客户端仍收到原有 `message.created`。这是 closed room cursor/requestId 合同对 Buzz Nostr filter/kind/community 模型的明确偏离。
 
 Run: `pnpm typecheck && pnpm exec vitest run packages/server/src/protocol.test.ts packages/server/src/websocket.test.ts packages/server/src/sync-service.test.ts && pnpm lint`
 
@@ -1179,6 +1276,9 @@ Propose `feat(desktop): restore authoritative client replica`. Risks: staging cl
 
 **Files:**
 
+- Modify: `docs/plans/2026-08-10-t0040-authoritative-persistence-implementation.md`（机械记录 Task 13 实际扩围与理由）
+- Modify: `package.json`（把独立 Vitest ProjectConfig strict `tsc` 合同纳入常规 `typecheck`，防止 unsupported project option 回归）
+- Modify: `vitest.config.ts`（将 authority E2E、snapshot worker client 与 1,001-event sync-service 压力测试放入后置 heavy project，用 Vitest 3.2.7 project-supported `poolOptions.forks.singleFork` 只在该 project 内单 worker 串行，并设置 project-local 15 秒预算；其他 22 个测试文件仍并行且保持默认 5 秒）
 - Create: `packages/server/src/authoritative-server.ts`
 - Create: `packages/server/src/authority.e2e.test.ts`
 - Create: `packages/server/src/fixtures/authority-child.ts`
@@ -1186,6 +1286,21 @@ Propose `feat(desktop): restore authoritative client replica`. Risks: staging cl
 - Modify: `packages/desktop/src/renderer/app.test.ts`
 - Create: `docs/protocols/authoritative-sync.md`
 - Create: `docs/deliveries/T-0040-服务端权威持久化多客户端同步与故障恢复-交付说明.md`
+- Modify: `packages/server/src/persistence/authority-database-handler.ts`
+- Modify: `packages/server/src/persistence/authority-worker.ts`
+- Modify: `packages/server/src/persistence/worker-database-client.ts`
+- Modify: `packages/server/src/persistence/worker-database-client.test.ts`
+- Modify: `packages/server/src/persistence/contracts.type-test.ts`
+- Modify: `packages/desktop/src/renderer/app.ts`
+- Modify: `packages/server/src/websocket.ts`
+- Modify: `packages/server/src/websocket.test.ts`
+- Modify: `packages/desktop/src/sync/client-sync-replica.ts`
+- Modify: `packages/desktop/src/sync/client-sync-replica.test.ts`
+- Modify: `docs/plans/2026-08-10-t0040-authoritative-persistence-design.md`（机械同步 authority 当前 schema v5 事实）
+
+Task 13 实现时，真实事务内的 `after-domain-write` / `before-commit` 故障点无法由原七个文件到达，因此经范围批准增加以上三个 persistence 生产文件，并机械修改相邻 worker test 与 package-root type-test 锁住 hook 时点和 public seam 不泄漏；renderer 原接口又只生成固定 preview、无法消费恢复记录，因此另批准 `app.ts` 增加闭合 typed verified-fixture 输入。Node 22.13.1 standard full 并行时，既有 10k snapshot 与本任务 10k E2E 竞争导致原生 5 秒 timeout，因此把 `authority.e2e.test.ts`、`snapshot-worker-client.test.ts` 和同样使用真实 SQLite/Worker 的 1,001-event `sync-service.test.ts` 放入后置 heavy project，并以 `pool: "forks"` + project-supported `poolOptions.forks.singleFork: true` 让该 project 共用一个 fork。GitHub `ubuntu-latest` 上这些压力验收在默认 5 秒边界超时，因此只为 heavy project 设置 15 秒 test budget；其余 22 个 files 保持并行和默认 5 秒，不减少压力数据或放宽任何业务 deadline。独立 strict `tsc` 配置合同锁住 `defineProject` 合法，runtime reporter 证明 heavy modules 的最大同时活跃数为 1。接缝仅由 workerData/deep-only test factory 传递，未修改 public wire、schema 或 `worker-protocol.ts`，renderer 无参数行为保持兼容。
+
+最终质量审查又批准最小扩围 WebSocket close 与 `ClientSyncReplica`：transport close 先封 dispatcher 并穷尽 socket/ws/http cleanup，composition 即使上游失败也依序关闭 snapshot/worker；replica 不再额外累计全量 records/rooms，而把 staging canonical checksum、catalog room IDs 与最终 commit 交给 cache port，保持 replica 自身 O(page)。相邻测试机械更新；E2E memory cache 则作为测试 adapter 刻意保存完整 10k values 并独立重算 checksum。renderer typed 输入在改 DOM 前经 core closed guards、顶层 exact envelope、unique message target 与 preview 关联校验，恢复的 read/judgement 按 `messageId` 挂载而不按作者 kind 猜测。E2E/loopback helper 对 JSON、child exit、TERM→KILL、WebSocket connect/close/wait 都使用有界 deadline 并清理 listener，fixture 故障不能无限挂住门禁。
 
 - [ ] **Step 1: Build a real-process test harness.**
 
@@ -1203,11 +1318,10 @@ export interface StartAuthoritativeServerOptions {
   readonly actors: readonly Actor[];
   readonly identities: IdentityAdapter;
   readonly invitationSecretKey: Uint8Array;
-  readonly faultPoint?: "after-domain-write" | "before-commit" | "after-commit-before-outbox" | "after-send-before-dispatch-mark";
 }
 ```
 
-`authority-child.ts` reads one closed JSON-line startup command from stdin, emits `{ "type": "ready", "url": string }`, and exits with documented test-only codes at fault points. Tests must spawn compiled `packages/server/dist/fixtures/authority-child.js`; run `pnpm build` before the focused e2e test.
+`authority-child.ts` reads one closed JSON-line startup command from stdin, emits `{ "type": "ready", "url": string }`, and exits with documented test-only codes at fault points. Fault、snapshot quota、初始化、只读回读、inspection/compact 与 mixed fixture builder 都只通过 deep `startAuthoritativeServerForTest` 或 compiled-child closed flag 到达；package root 的 runtime/type declaration 不暴露任何 test seam，正常 `startAuthoritativeServer` 不含退出分支。Child 不使用 warning 类别抑制；harness 只从捕获的 `stderr` 剥离格式/文本精确匹配的 SQLite ExperimentalWarning 行，任何其他 warning 或产品错误仍失败。Tests must spawn compiled `packages/server/dist/fixtures/authority-child.js`; run `pnpm build` before the focused e2e test.
 
 - [ ] **Step 2: Write RED child-process durability tests.**
 
@@ -1231,7 +1345,7 @@ Use three actual `ws` connections and three independent `ClientSyncReplica` inst
 - A remains online and receives live v2 events.
 - B disconnects, misses several events, then resumes from a retained cursor without gaps or duplicates.
 - C deletes catalog, room cache, and cursors; bootstrap rediscovers rooms, an expired cursor produces `repair_required`, paginated repair restores all facts, delta reaches the current watermark, then v2 subscribe becomes active.
-- Force materialized fallback with 10,000 mixed closed records; verify C's live cache remains its prior complete version until `snapshot.completed`.
+- Force materialized fallback with 10,000 mixed closed records；compiled-child fixture builder 先用 production core guard 逐类验证 closed actor/membership/read/message/judgement/open/execution/calibration，并在 `foreign_keys=ON` 的单事务中批量落测试数据。其目标只证明 mixed snapshot/streaming，不冒充 10,000 次 command/event/outbox E2E。精确分布为 1 room、2,000 memberships（2,000 个不同合法 actor）、3,500 messages、1,999 reads、500 judgments、500 open items、500 executions、1,000 calibrations；三连接属于同一 session family，A 用更严格的 deep-only 50 records/page 完成 200 页 streaming fallback，B/C 在正常 quota 下各完成 100 页 materialized repair。A 的 live cache 直到 `snapshot.completed` 前保持旧完整版本；C 在 transport 已收到 materialized 最后一页、尚未把该页返回 `ClientSyncReplica` 的暂停边界证明 10,000 records 已收齐但 live cache 仍为空，释放后才原子 commit。
 - Clear all three caches and restore them again; their fact sets and final room watermarks must equal the authority DB.
 
 Run: `pnpm build && pnpm exec vitest run packages/server/src/authority.e2e.test.ts`
@@ -1297,7 +1411,7 @@ Run `gbp.py check --links` once more. Report the six criteria, current claimable
 | 2. Stable event/idempotency | 4, 6 | Sequential/concurrent/cross-restart replay and conflict table |
 | 3. Three-client cursor recovery | 8-13 | Retained/expired cursor suites and three real WebSocket replicas |
 | 4. Durable ACK/outbox crash window | 6, 7, 13 | Four fault points, especially child exit after COMMIT before outbox |
-| 5. Versioned migration | 1, 3, 5 | fresh/v1→v2→v3, existing v2→v3, unknown-target/injected rollback, import activation crash |
+| 5. Versioned migration | 1, 3, 5 | fresh v1→v2→v3→v4→v5；historical v1、existing v2/v3/v4→current v5；unknown/future refusal；unknown-target、injected-v2、final-integrity rollback；import activation crash |
 | 6. Permissions and cache-clear restore | 8-13 | Current-state authorization races and all-client cache deletion/rebuild |
 
 - [x] Every one of the six T-0040 criteria maps to at least one production task and one automated test.

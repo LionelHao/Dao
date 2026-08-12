@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { parseClientFrame, PROTOCOL_FIELD_LIMITS } from "./index.js";
+import {
+  parseClientFrame,
+  PROTOCOL_FIELD_LIMITS,
+  ROOM_SYNC_MAX_LIMIT,
+} from "./index.js";
 
 function parse(value: unknown) {
   return parseClientFrame(JSON.stringify(value));
@@ -173,5 +177,177 @@ describe("client protocol resource bounds", () => {
       ok: false,
       error: { type: "error", status: 401, code: "identity_forbidden" },
     });
+  });
+});
+
+describe("closed v2 recovery protocol", () => {
+  const cursor = { version: 1, roomId: "room-1", afterSeq: 7 } as const;
+
+  it.each([
+    { type: "workspace.bootstrap.begin", requestId: "bootstrap-begin" },
+    {
+      type: "workspace.bootstrap.page",
+      requestId: "bootstrap-page",
+      snapshotId: "catalog-snapshot",
+      afterPage: 0,
+    },
+    {
+      type: "room.sync",
+      requestId: "sync",
+      roomId: "room-1",
+      cursor,
+      limit: ROOM_SYNC_MAX_LIMIT,
+    },
+    { type: "room.repair.begin", requestId: "repair-begin", roomId: "room-1" },
+    {
+      type: "room.repair.page",
+      requestId: "repair-page",
+      snapshotId: "room-snapshot",
+      afterPage: 0,
+    },
+    {
+      type: "snapshot.complete",
+      requestId: "complete-room",
+      snapshotId: "room-snapshot",
+      version: { kind: "room", roomId: "room-1", watermark: 7 },
+      snapshotChecksum: "sha256-room",
+    },
+    {
+      type: "snapshot.complete",
+      requestId: "complete-catalog",
+      snapshotId: "catalog-snapshot",
+      version: { kind: "catalog", catalogRevision: 3 },
+      snapshotChecksum: "sha256-catalog",
+    },
+    {
+      type: "room.subscribe.v2",
+      requestId: "subscribe-v2",
+      roomId: "room-1",
+      cursor,
+    },
+  ])("accepts $type as a closed frame", (frame) => {
+    expect(parse(frame)).toEqual({ ok: true, frame });
+  });
+
+  it.each([
+    {
+      name: "an extra bootstrap field",
+      frame: { type: "workspace.bootstrap.begin", requestId: "r", roomId: "room-1" },
+    },
+    {
+      name: "a missing requestId",
+      frame: { type: "room.repair.begin", roomId: "room-1" },
+    },
+    {
+      name: "a negative page",
+      frame: {
+        type: "room.repair.page",
+        requestId: "r",
+        snapshotId: "snapshot-1",
+        afterPage: -1,
+      },
+    },
+    {
+      name: "a non-safe future page",
+      frame: {
+        type: "workspace.bootstrap.page",
+        requestId: "r",
+        snapshotId: "snapshot-1",
+        afterPage: Number.MAX_SAFE_INTEGER + 1,
+      },
+    },
+    {
+      name: "an unknown cursor version",
+      frame: {
+        type: "room.sync",
+        requestId: "r",
+        roomId: "room-1",
+        cursor: { version: 2, roomId: "room-1", afterSeq: 0 },
+      },
+    },
+    {
+      name: "a cursor for another room",
+      frame: {
+        type: "room.sync",
+        requestId: "r",
+        roomId: "room-1",
+        cursor: { version: 1, roomId: "room-2", afterSeq: 0 },
+      },
+    },
+    {
+      name: "an over-limit sync page size",
+      frame: {
+        type: "room.sync",
+        requestId: "r",
+        roomId: "room-1",
+        limit: ROOM_SYNC_MAX_LIMIT + 1,
+      },
+    },
+    {
+      name: "a cursorless v2 subscription",
+      frame: { type: "room.subscribe.v2", requestId: "r", roomId: "room-1" },
+    },
+    {
+      name: "a catalog version with room fields",
+      frame: {
+        type: "snapshot.complete",
+        requestId: "r",
+        snapshotId: "snapshot-1",
+        version: { kind: "catalog", catalogRevision: 3, roomId: "room-1" },
+        snapshotChecksum: "sha256-value",
+      },
+    },
+    {
+      name: "a room version with catalog fields",
+      frame: {
+        type: "snapshot.complete",
+        requestId: "r",
+        snapshotId: "snapshot-1",
+        version: {
+          kind: "room",
+          roomId: "room-1",
+          watermark: 3,
+          catalogRevision: 3,
+        },
+        snapshotChecksum: "sha256-value",
+      },
+    },
+    {
+      name: "an oversized snapshot ID",
+      frame: {
+        type: "room.repair.page",
+        requestId: "r",
+        snapshotId: "s".repeat(PROTOCOL_FIELD_LIMITS.snapshotId + 1),
+        afterPage: 0,
+      },
+    },
+    {
+      name: "an oversized checksum",
+      frame: {
+        type: "snapshot.complete",
+        requestId: "r",
+        snapshotId: "snapshot-1",
+        version: { kind: "catalog", catalogRevision: 3 },
+        snapshotChecksum: "c".repeat(PROTOCOL_FIELD_LIMITS.snapshotChecksum + 1),
+      },
+    },
+  ])("rejects $name", ({ frame }) => {
+    expect(parse(frame)).toMatchObject({
+      ok: false,
+      error: { type: "error", status: 400, code: "invalid_request" },
+    });
+  });
+
+  it("keeps T-0039 cursorless history and subscribe frames valid", () => {
+    expect(parse({ type: "room.history", requestId: "history", roomId: "room-1" }))
+      .toEqual({
+        ok: true,
+        frame: { type: "room.history", requestId: "history", roomId: "room-1" },
+      });
+    expect(parse({ type: "room.subscribe", requestId: "subscribe", roomId: "room-1" }))
+      .toEqual({
+        ok: true,
+        frame: { type: "room.subscribe", requestId: "subscribe", roomId: "room-1" },
+      });
   });
 });

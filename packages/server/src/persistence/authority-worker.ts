@@ -18,11 +18,42 @@ import {
   isAuthorityWorkerRequest,
   type AuthorityWorkerRequest,
   type AuthorityWorkerResponse,
+  type AuthorityWorkerErrorCode,
 } from "./worker-protocol.js";
+import {
+  AuthorityDatabaseError,
+  AuthorityRollbackFatalError,
+  appendCanonicalIdentityEvent,
+  executeAgentDatabaseCommand,
+  executeHumanDatabaseCommand,
+  authorizeOutboxCandidateDatabaseQuery,
+  canAccessRoomDatabaseQuery,
+  compactRoomStreamDatabaseCommand,
+  listPendingOutboxDatabaseQuery,
+  markOutboxDispatchedDatabaseCommand,
+  markOutboxFailedDatabaseCommand,
+  readActorDatabaseQuery,
+  readHistoryDatabaseQuery,
+  readRoomAuditDatabaseQuery,
+  readRoomDatabaseQuery,
+  repairMutationImpactDatabaseQuery,
+  revalidateSnapshotDatabaseQuery,
+  runAuthorityImmediateTransaction,
+  syncRoomDatabaseQuery,
+  inspectStreamingRepairScopeDatabaseQuery,
+} from "./authority-database-handler.js";
+import {
+  FallbackRepairCoordinator,
+  FallbackRepairError,
+  type RepairPreemptionCode,
+  type StreamingRepairLease,
+} from "../fallback-repair-coordinator.js";
 
 interface AuthorityWorkerData {
   readonly databasePath: string;
   readonly recovery?: LegacyImportRecovery;
+  readonly rollbackFailureForTest?: true;
+  readonly transactionFaultPoint?: "after-domain-write" | "before-commit";
 }
 
 function isAuthorityWorkerData(value: unknown): value is AuthorityWorkerData {
@@ -31,17 +62,18 @@ function isAuthorityWorkerData(value: unknown): value is AuthorityWorkerData {
   }
   const record = value as Record<string, unknown>;
   const keys = Object.keys(record).sort();
-  if (
-    (keys.length !== 1 && keys.length !== 2) ||
-    keys[0] !== "databasePath" ||
-    (keys.length === 2 && keys[1] !== "recovery") ||
-    typeof record.databasePath !== "string" ||
-    record.databasePath.length === 0
-  ) {
+  if (typeof record.databasePath !== "string" || record.databasePath.length === 0 ||
+      keys.some((key) =>
+        key !== "databasePath" && key !== "recovery" && key !== "rollbackFailureForTest" &&
+        key !== "transactionFaultPoint") ||
+      (record.rollbackFailureForTest !== undefined && record.rollbackFailureForTest !== true) ||
+      (record.transactionFaultPoint !== undefined &&
+        record.transactionFaultPoint !== "after-domain-write" &&
+        record.transactionFaultPoint !== "before-commit")) {
     return false;
   }
   if (record.recovery === undefined) {
-    return keys.length === 1;
+    return true;
   }
   if (
     typeof record.recovery !== "object" ||
@@ -88,12 +120,19 @@ let processing = false;
 let database: DatabaseSync | undefined;
 let workerInitialized = false;
 let workerClosed = false;
+let rollbackFailureForTestAvailable =
+  isAuthorityWorkerData(workerData) && workerData.rollbackFailureForTest === true;
+const repairs = new FallbackRepairCoordinator();
 
 function respond(response: AuthorityWorkerResponse): void {
   authorityPort.postMessage(response);
 }
 
-function respondWithError(requestId: string, code: string, message: string): void {
+function respondWithError(
+  requestId: string,
+  code: AuthorityWorkerErrorCode,
+  message: string,
+): void {
   respond({
     type: "authority.error",
     requestId,
@@ -296,74 +335,60 @@ function requireAuthorityDatabase(): DatabaseSync {
   return database;
 }
 
-function runImmediate<Result>(
-  openedDatabase: DatabaseSync,
-  operation: () => Result,
-): Result {
-  openedDatabase.exec("BEGIN IMMEDIATE");
-  try {
-    const result = operation();
-    openedDatabase.exec("COMMIT");
-    return result;
-  } catch (error: unknown) {
-    try {
-      openedDatabase.exec("ROLLBACK");
-    } catch {
-      // Preserve the operation failure.
-    }
-    throw error;
+function requireAuthorityTransactionDatabase(): DatabaseSync {
+  const openedDatabase = requireAuthorityDatabase();
+  if (!rollbackFailureForTestAvailable) {
+    return openedDatabase;
   }
+  rollbackFailureForTestAvailable = false;
+  return new Proxy(openedDatabase, {
+    get(target, property) {
+      if (property === "exec") {
+        return (sql: string): void => {
+          if (sql === "ROLLBACK") {
+            throw new Error(
+              "ROLLBACK failed after SELECT secret at /private/authority.sqlite",
+            );
+          }
+          target.exec(sql);
+        };
+      }
+      const value: unknown = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+function poisonAuthorityStorage(requestId: string): void {
+  const poisonedDatabase = database;
+  database = undefined;
+  workerClosed = true;
+  requests.length = 0;
+  if (poisonedDatabase !== undefined) {
+    try {
+      poisonedDatabase.close();
+    } catch {
+      // The public terminal error is already fixed and sanitized.
+    }
+  }
+  respondWithError(
+    requestId,
+    "storage_unavailable",
+    "Authority storage became unavailable",
+  );
+  authorityPort.close();
+}
+
+function handleRollbackFatal(requestId: string, error: unknown): boolean {
+  if (!(error instanceof AuthorityRollbackFatalError)) {
+    return false;
+  }
+  poisonAuthorityStorage(requestId);
+  return true;
 }
 
 function stableId(...parts: readonly string[]): string {
   return createHash("sha256").update(parts.join("\u0000")).digest("base64url");
-}
-
-function appendIdentityEvent(
-  openedDatabase: DatabaseSync,
-  input: {
-    readonly actorId: string;
-    readonly eventId: string;
-    readonly eventType: string;
-    readonly occurredAt: string;
-    readonly payload: unknown;
-  },
-): number {
-  const stream = openedDatabase
-    .prepare(
-      `SELECT head_seq AS headSeq
-       FROM streams
-       WHERE stream_kind = 'identity' AND stream_id = ?`,
-    )
-    .get(input.actorId);
-  if (typeof stream?.headSeq !== "number") {
-    throw new Error("identity_stream_missing");
-  }
-  const streamSeq = stream.headSeq + 1;
-  openedDatabase
-    .prepare(
-      `UPDATE streams
-       SET head_seq = ?
-       WHERE stream_kind = 'identity' AND stream_id = ?`,
-    )
-    .run(streamSeq, input.actorId);
-  openedDatabase
-    .prepare(
-      `INSERT INTO events (
-         event_id, stream_kind, stream_id, stream_seq, room_id,
-         actor_id, event_type, occurred_at, payload_json
-       ) VALUES (?, 'identity', ?, ?, NULL, ?, ?, ?, ?)`,
-    )
-    .run(
-      input.eventId,
-      input.actorId,
-      streamSeq,
-      input.actorId,
-      input.eventType,
-      input.occurredAt,
-      JSON.stringify(input.payload),
-    );
-  return streamSeq;
 }
 
 function registerActors(request: AuthorityWorkerRequest): void {
@@ -371,8 +396,8 @@ function registerActors(request: AuthorityWorkerRequest): void {
     throw new TypeError("registerActors received the wrong request type");
   }
   try {
-    const openedDatabase = requireAuthorityDatabase();
-    runImmediate(openedDatabase, () => {
+    const openedDatabase = requireAuthorityTransactionDatabase();
+    runAuthorityImmediateTransaction(openedDatabase, () => {
       const selectActor = openedDatabase.prepare(
         `SELECT
            kind,
@@ -424,12 +449,10 @@ function registerActors(request: AuthorityWorkerRequest): void {
         );
         insertStream.run(actor.id);
         const payload = { actor };
-        appendIdentityEvent(openedDatabase, {
-          actorId: actor.id,
-          eventId: stableId(
-            "identity.actor.registered",
-            actor.id,
-            JSON.stringify(payload),
+        appendCanonicalIdentityEvent(openedDatabase, {
+          principalId: actor.id,
+          eventId: (canonicalPayloadJson) => stableId(
+            "identity.actor.registered", actor.id, canonicalPayloadJson,
           ),
           eventType: "identity.actor.registered",
           occurredAt: new Date().toISOString(),
@@ -443,6 +466,7 @@ function registerActors(request: AuthorityWorkerRequest): void {
       actorCount: request.actors.length,
     });
   } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
     const code = error instanceof Error && error.message === "actor_conflict"
       ? "actor_conflict"
       : "storage_unavailable";
@@ -461,8 +485,8 @@ function issueSession(request: AuthorityWorkerRequest): void {
     throw new TypeError("issueSession received the wrong request type");
   }
   try {
-    const openedDatabase = requireAuthorityDatabase();
-    const session = runImmediate(openedDatabase, () => {
+    const openedDatabase = requireAuthorityTransactionDatabase();
+    const session = runAuthorityImmediateTransaction(openedDatabase, () => {
       const actor = openedDatabase
         .prepare("SELECT kind FROM actors WHERE id = ?")
         .get(request.input.actorId);
@@ -487,8 +511,8 @@ function issueSession(request: AuthorityWorkerRequest): void {
           request.input.accessExpiresAt,
           request.input.refreshExpiresAt,
         );
-      appendIdentityEvent(openedDatabase, {
-        actorId: request.input.actorId,
+      appendCanonicalIdentityEvent(openedDatabase, {
+        principalId: request.input.actorId,
         eventId: stableId("identity.session.issued", sessionId),
         eventType: "identity.session.issued",
         occurredAt: new Date().toISOString(),
@@ -513,6 +537,7 @@ function issueSession(request: AuthorityWorkerRequest): void {
       session,
     });
   } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
     const code = error instanceof Error && error.message === "identity_forbidden"
       ? "identity_forbidden"
       : "storage_unavailable";
@@ -594,7 +619,8 @@ function authenticateSession(request: AuthorityWorkerRequest): void {
         },
       },
     });
-  } catch {
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
     respondWithError(
       request.requestId,
       "storage_unavailable",
@@ -678,8 +704,8 @@ function revokeSessionFamily(
     if (typeof canonicalSession?.sessionId !== "string") {
       throw new Error("session_family_corrupt");
     }
-    const streamSeq = appendIdentityEvent(openedDatabase, {
-      actorId: session.actorId,
+    const streamSeq = appendCanonicalIdentityEvent(openedDatabase, {
+      principalId: session.actorId,
       eventId,
       eventType: "identity.session.revoked",
       occurredAt: new Date(now).toISOString(),
@@ -718,28 +744,28 @@ function validateSessionRefresh(request: AuthorityWorkerRequest): void {
     throw new TypeError("validateSessionRefresh received the wrong request type");
   }
   try {
-    const openedDatabase = requireAuthorityDatabase();
-    const result = runImmediate(openedDatabase, () => {
+    const openedDatabase = requireAuthorityTransactionDatabase();
+    const result = runAuthorityImmediateTransaction(openedDatabase, () => {
       const current = readSessionByRefreshHash(
         openedDatabase,
         request.currentRefreshTokenHash,
       );
       if (current === undefined) {
-        return { ok: false as const, code: "invalid_token" };
+        return { ok: false as const, code: "invalid_token" as const };
       }
       if (
         request.expectedPrincipal !== undefined &&
         (current.accountId !== request.expectedPrincipal.accountId ||
           current.actorId !== request.expectedPrincipal.actorId)
       ) {
-        return { ok: false as const, code: "identity_forbidden" };
+        return { ok: false as const, code: "identity_forbidden" as const };
       }
       if (current.revokedAt !== null) {
         revokeSessionFamily(openedDatabase, current, request.now);
-        return { ok: false as const, code: "session_revoked" };
+        return { ok: false as const, code: "session_revoked" as const };
       }
       if (request.now >= current.refreshExpiresAt) {
-        return { ok: false as const, code: "token_expired" };
+        return { ok: false as const, code: "token_expired" as const };
       }
       return { ok: true as const };
     });
@@ -755,7 +781,8 @@ function validateSessionRefresh(request: AuthorityWorkerRequest): void {
       type: "authority.session-refresh-valid",
       requestId: request.requestId,
     });
-  } catch {
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
     respondWithError(
       request.requestId,
       "storage_unavailable",
@@ -769,28 +796,28 @@ function rotateSession(request: AuthorityWorkerRequest): void {
     throw new TypeError("rotateSession received the wrong request type");
   }
   try {
-    const openedDatabase = requireAuthorityDatabase();
-    const result = runImmediate(openedDatabase, () => {
+    const openedDatabase = requireAuthorityTransactionDatabase();
+    const result = runAuthorityImmediateTransaction(openedDatabase, () => {
       const current = readSessionByRefreshHash(
         openedDatabase,
         request.input.currentRefreshTokenHash,
       );
       if (current === undefined) {
-        return { kind: "error" as const, code: "invalid_token" };
+        return { kind: "error" as const, code: "invalid_token" as const };
       }
       if (
         request.input.expectedPrincipal !== undefined &&
         (current.accountId !== request.input.expectedPrincipal.accountId ||
           current.actorId !== request.input.expectedPrincipal.actorId)
       ) {
-        return { kind: "error" as const, code: "identity_forbidden" };
+        return { kind: "error" as const, code: "identity_forbidden" as const };
       }
       if (current.revokedAt !== null) {
         revokeSessionFamily(openedDatabase, current, request.input.now);
-        return { kind: "error" as const, code: "session_revoked" };
+        return { kind: "error" as const, code: "session_revoked" as const };
       }
       if (request.input.now >= current.refreshExpiresAt) {
-        return { kind: "error" as const, code: "token_expired" };
+        return { kind: "error" as const, code: "token_expired" as const };
       }
 
       openedDatabase
@@ -815,8 +842,8 @@ function rotateSession(request: AuthorityWorkerRequest): void {
           request.input.accessExpiresAt,
           request.input.refreshExpiresAt,
         );
-      appendIdentityEvent(openedDatabase, {
-        actorId: current.actorId,
+      appendCanonicalIdentityEvent(openedDatabase, {
+        principalId: current.actorId,
         eventId: stableId("identity.session.rotated", request.input.accessTokenHash),
         eventType: "identity.session.rotated",
         occurredAt: new Date(request.input.now).toISOString(),
@@ -851,7 +878,8 @@ function rotateSession(request: AuthorityWorkerRequest): void {
       requestId: request.requestId,
       session: result.session,
     });
-  } catch {
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
     respondWithError(
       request.requestId,
       "storage_unavailable",
@@ -865,8 +893,11 @@ function revokeSession(request: AuthorityWorkerRequest): void {
     throw new TypeError("revokeSession received the wrong request type");
   }
   try {
-    const openedDatabase = requireAuthorityDatabase();
-    const result = runImmediate(openedDatabase, () => {
+    const openedDatabase = requireAuthorityTransactionDatabase();
+    const family = openedDatabase.prepare(
+      "SELECT family_id AS familyId FROM sessions WHERE access_token_hash = ?",
+    ).get(request.accessTokenHash);
+    const result = runAuthorityImmediateTransaction(openedDatabase, () => {
       const row = openedDatabase
         .prepare(
           `SELECT
@@ -882,7 +913,7 @@ function revokeSession(request: AuthorityWorkerRequest): void {
         )
         .get(request.accessTokenHash);
       if (row === undefined) {
-        return { kind: "error" as const, code: "invalid_token" };
+        return { kind: "error" as const, code: "invalid_token" as const };
       }
       const session = row as unknown as SessionAuthorityRow;
       if (
@@ -905,7 +936,14 @@ function revokeSession(request: AuthorityWorkerRequest): void {
       return;
     }
     respond({ type: "authority.session-revoked", requestId: request.requestId });
-  } catch {
+    if (typeof family?.familyId === "string") {
+      repairs.preemptAfterCommit({
+        roomIds: [], catalogPrincipalIds: [], familyIds: [family.familyId],
+        code: "snapshot_family_revoked", now: request.now,
+      });
+    }
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
     respondWithError(
       request.requestId,
       "storage_unavailable",
@@ -914,63 +952,533 @@ function revokeSession(request: AuthorityWorkerRequest): void {
   }
 }
 
+function respondRepairFailure(requestId: string, cause: unknown, fallbackMessage: string): void {
+  if (cause instanceof FallbackRepairError) {
+    respondWithError(requestId, cause.code, cause.message);
+    return;
+  }
+  if (cause instanceof AuthorityDatabaseError) {
+    respondWithError(requestId, cause.code, cause.message);
+    return;
+  }
+  respondWithError(requestId, "storage_unavailable", fallbackMessage);
+}
+
+function revalidateRepairLease(
+  lease: StreamingRepairLease,
+  context: Extract<AuthorityWorkerRequest, { readonly type: "authority.repair-authorize-page" }>["context"],
+  now: number,
+): void {
+  revalidateSnapshotDatabaseQuery(
+    requireAuthorityTransactionDatabase(),
+    lease.scope.kind === "room"
+      ? {
+          kind: "room",
+          context,
+          roomId: lease.scope.roomId,
+          accessRevision: lease.authorizationRevision,
+        }
+      : {
+          kind: "catalog",
+          context,
+          catalogRevision: lease.authorizationRevision,
+        },
+    now,
+  );
+}
+
+function acquireRepair(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.repair-acquire") throw new TypeError("wrong repair acquire");
+  try {
+    const inspected = inspectStreamingRepairScopeDatabaseQuery(
+      requireAuthorityTransactionDatabase(), request.context, request.scope, request.now,
+    );
+    const lease = repairs.acquire({
+      context: request.context,
+      scope: request.scope,
+      version: inspected.version,
+      authorizationRevision: inspected.authorizationRevision,
+      now: request.now,
+    });
+    respond({ type: "authority.repair-lease", requestId: request.requestId, lease });
+  } catch (cause: unknown) {
+    respondRepairFailure(request.requestId, cause, "Streaming repair acquire failed");
+  }
+}
+
+function registerRepair(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.repair-register") throw new TypeError("wrong repair register");
+  try {
+    const lease = repairs.registerChecksum(
+      request.snapshotId, request.checksum, request.pageCount, request.now,
+    );
+    respond({ type: "authority.repair-lease", requestId: request.requestId, lease });
+  } catch (cause: unknown) {
+    respondRepairFailure(request.requestId, cause, "Streaming repair registration failed");
+  }
+}
+
+function authorizeRepairPage(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.repair-authorize-page") throw new TypeError("wrong repair page authorization");
+  try {
+    const current = repairs.describe({
+      context: request.context, snapshotId: request.snapshotId, now: request.now,
+    });
+    revalidateRepairLease(current, request.context, request.now);
+    const lease = repairs.authorizePage({
+      context: request.context, snapshotId: request.snapshotId,
+      page: request.page, now: request.now,
+    });
+    respond({ type: "authority.repair-lease", requestId: request.requestId, lease });
+  } catch (cause: unknown) {
+    respondRepairFailure(request.requestId, cause, "Streaming repair page authorization failed");
+  }
+}
+
+function completeRepair(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.repair-complete") throw new TypeError("wrong repair completion");
+  try {
+    const current = repairs.describe({
+      context: request.context, snapshotId: request.snapshotId, now: request.now,
+    });
+    revalidateRepairLease(current, request.context, request.now);
+    const completed = repairs.complete({
+      context: request.context,
+      snapshotId: request.snapshotId,
+      version: request.version,
+      checksum: request.checksum,
+      now: request.now,
+    });
+    respond({
+      type: "authority.snapshot-completed",
+      requestId: request.requestId,
+      completed: {
+        type: "snapshot.completed",
+        requestId: request.requestId,
+        snapshotId: completed.snapshotId,
+        version: completed.version,
+      },
+    });
+  } catch (cause: unknown) {
+    respondRepairFailure(request.requestId, cause, "Streaming repair completion failed");
+  }
+}
+
+function releaseRepair(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.repair-release") throw new TypeError("wrong repair release");
+  try {
+    repairs.releaseOwned({
+      context: request.context, snapshotId: request.snapshotId, now: request.now,
+    });
+    respond({ type: "authority.repair-released", requestId: request.requestId });
+  } catch (cause: unknown) {
+    respondRepairFailure(request.requestId, cause, "Streaming repair release failed");
+  }
+}
+
+function isAccessReducingForLease(
+  command: Extract<AuthorityWorkerRequest, { readonly type: "authority.execute-human" }>["command"],
+  lease: StreamingRepairLease,
+  roleDowngradeTargetId: string | undefined,
+): boolean {
+  if (command.type === "room.archive") return true;
+  if (command.type === "member.remove") {
+    return command.payload.targetActorId === lease.principalId;
+  }
+  return command.type === "human.role.change" &&
+    roleDowngradeTargetId === lease.principalId;
+}
+
+function humanRepairGate(
+  opened: DatabaseSync,
+  request: Extract<AuthorityWorkerRequest, { readonly type: "authority.execute-human" }>,
+  actorId: string,
+): {
+  readonly impact: ReturnType<typeof repairMutationImpactDatabaseQuery>;
+  readonly preemption?: {
+    readonly code: RepairPreemptionCode;
+    readonly roomPrincipalIds?: readonly string[];
+  };
+} {
+  const impact = repairMutationImpactDatabaseQuery(opened, actorId, request.command);
+  let roleDowngradeTargetId: string | undefined;
+  if (request.command.type === "human.role.change" && request.command.payload.role === "member") {
+    const current = opened.prepare(
+      `SELECT role FROM room_memberships
+       WHERE room_id = ? AND actor_id = ? AND kind = 'human'`,
+    ).get(request.command.roomId, request.command.payload.targetActorId);
+    if (current?.role === "admin") {
+      roleDowngradeTargetId = request.command.payload.targetActorId;
+    }
+  }
+  const blockers = repairs.blockingLeases(impact, request.now);
+  if (blockers.some((lease) =>
+    !isAccessReducingForLease(request.command, lease, roleDowngradeTargetId))) {
+    throw new FallbackRepairError("repair_barrier_active");
+  }
+  if (request.command.type === "room.archive") {
+    return { impact, preemption: { code: "room_archived" } };
+  }
+  if (request.command.type === "member.remove") {
+    return { impact, preemption: {
+      code: "snapshot_stale",
+      roomPrincipalIds: [request.command.payload.targetActorId],
+    } };
+  }
+  if (request.command.type === "human.role.change" && roleDowngradeTargetId !== undefined) {
+    return { impact, preemption: {
+      code: "snapshot_stale",
+      roomPrincipalIds: [request.command.payload.targetActorId],
+    } };
+  }
+  return { impact };
+}
+
 function executeHuman(request: AuthorityWorkerRequest): void {
   if (request.type !== "authority.execute-human") {
     throw new TypeError("executeHuman received the wrong request type");
   }
   try {
-    const openedDatabase = requireAuthorityDatabase();
-    const code = runImmediate(openedDatabase, () => {
-      const session = openedDatabase
-        .prepare(
-          `SELECT
-             session.family_id AS familyId,
-             session.account_id AS accountId,
-             session.actor_id AS actorId,
-             session.access_expires_at AS accessExpiresAt,
-             session.revoked_at AS revokedAt,
-             actor.kind AS actorKind
-           FROM sessions AS session
-           JOIN actors AS actor ON actor.id = session.actor_id
-           WHERE session.access_token_hash = ?`,
-        )
-        .get(request.context.sessionId);
-      if (session === undefined) {
-        return "invalid_token";
-      }
-      if (session.actorKind !== "human") {
-        return "identity_forbidden";
-      }
-      if (
-        session.familyId !== request.context.sessionFamilyId ||
-        session.accountId !== request.context.principal.accountId ||
-        session.actorId !== request.context.principal.actorId
-      ) {
-        return "identity_forbidden";
-      }
-      if (typeof session.revokedAt === "number") {
-        return "session_revoked";
-      }
-      if (
-        typeof session.accessExpiresAt !== "number" ||
-        request.now >= session.accessExpiresAt
-      ) {
-        return "token_expired";
-      }
-      return "command_not_implemented";
+    const openedDatabase = requireAuthorityTransactionDatabase();
+    let gate: ReturnType<typeof humanRepairGate> | undefined;
+    const result = executeHumanDatabaseCommand(openedDatabase, {
+      context: request.context,
+      command: request.command,
+      ...(request.invitationSecret === undefined
+        ? {}
+        : { invitationSecret: request.invitationSecret }),
+      now: request.now,
+      beforeApply(actorId) {
+        gate = humanRepairGate(openedDatabase, request, actorId);
+      },
+      ...(isAuthorityWorkerData(workerData) &&
+        workerData.transactionFaultPoint === "after-domain-write"
+        ? { afterDomainWrite: () => process.exit(81) }
+        : {}),
+      ...(isAuthorityWorkerData(workerData) &&
+        workerData.transactionFaultPoint === "before-commit"
+        ? { beforeCommit: () => process.exit(82) }
+        : {}),
     });
-    respondWithError(
-      request.requestId,
-      code,
-      code === "command_not_implemented"
-        ? "Authority command is not implemented"
-        : "Authority command session was rejected",
-    );
-  } catch {
+    respond({
+      type: "authority.command-acknowledged",
+      requestId: request.requestId,
+      acknowledgement: result.acknowledgement,
+    });
+    if (result.disposition === "applied" && gate?.preemption !== undefined) {
+      repairs.preemptAfterCommit({
+        ...gate.impact,
+        familyIds: [],
+        ...gate.preemption,
+        now: request.now,
+      });
+    }
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    if (error instanceof FallbackRepairError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
     respondWithError(
       request.requestId,
       "storage_unavailable",
       "Authority command validation failed",
+    );
+  }
+}
+
+function executeAgent(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.execute-agent") {
+    throw new TypeError("executeAgent received the wrong request type");
+  }
+  try {
+    const impact = { roomIds: [request.command.roomId], catalogPrincipalIds: [] };
+    const result = executeAgentDatabaseCommand(requireAuthorityTransactionDatabase(), {
+      context: request.context,
+      command: request.command,
+      now: request.now,
+      beforeApply() {
+        if (repairs.blockingLease(impact, request.now) !== undefined) {
+          throw new FallbackRepairError("repair_barrier_active");
+        }
+      },
+    });
+    respond({
+      type: "authority.command-acknowledged",
+      requestId: request.requestId,
+      acknowledgement: result.acknowledgement,
+    });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    if (error instanceof FallbackRepairError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithError(
+      request.requestId,
+      "storage_unavailable",
+      "Authority Agent command failed",
+    );
+  }
+}
+
+function readHistory(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.read-history") {
+    throw new TypeError("readHistory received the wrong request type");
+  }
+  try {
+    const messages = readHistoryDatabaseQuery(
+      requireAuthorityDatabase(),
+      request.context,
+      request.roomId,
+      request.now,
+    );
+    respond({
+      type: "authority.history",
+      requestId: request.requestId,
+      messages,
+    });
+  } catch (error: unknown) {
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithError(request.requestId, "storage_unavailable", "Authority history query failed");
+  }
+}
+
+function readActor(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.read-actor") {
+    throw new TypeError("readActor received the wrong request type");
+  }
+  try {
+    const actor = readActorDatabaseQuery(requireAuthorityDatabase(), request.actorId);
+    respond({
+      type: "authority.actor",
+      requestId: request.requestId,
+      ...(actor === undefined ? {} : { actor }),
+    });
+  } catch {
+    respondWithError(request.requestId, "storage_unavailable", "Authority actor query failed");
+  }
+}
+
+function readRoom(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.read-room") {
+    throw new TypeError("readRoom received the wrong request type");
+  }
+  try {
+    const room = readRoomDatabaseQuery(requireAuthorityDatabase(), request.roomId);
+    respond({
+      type: "authority.room",
+      requestId: request.requestId,
+      ...(room === undefined ? {} : { room }),
+    });
+  } catch {
+    respondWithError(request.requestId, "storage_unavailable", "Authority room query failed");
+  }
+}
+
+function canAccessRoom(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.can-access-room") {
+    throw new TypeError("canAccessRoom received the wrong request type");
+  }
+  try {
+    const allowed = canAccessRoomDatabaseQuery(
+      requireAuthorityDatabase(),
+      request.context,
+      request.roomId,
+      request.now,
+    );
+    respond({ type: "authority.room-access", requestId: request.requestId, allowed });
+  } catch (error: unknown) {
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, "Authority room access query was rejected");
+      return;
+    }
+    respondWithError(request.requestId, "storage_unavailable", "Authority room access query failed");
+  }
+}
+
+function readRoomAudit(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.read-room-audit") {
+    throw new TypeError("readRoomAudit received the wrong request type");
+  }
+  try {
+    const audit = readRoomAuditDatabaseQuery(
+      requireAuthorityDatabase(),
+      request.context,
+      request.roomId,
+      request.now,
+    );
+    respond({ type: "authority.room-audit", requestId: request.requestId, audit });
+  } catch (error: unknown) {
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, "Authority room audit query was rejected");
+      return;
+    }
+    respondWithError(request.requestId, "storage_unavailable", "Authority room audit query failed");
+  }
+}
+
+function listPendingOutbox(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.outbox-list") {
+    throw new TypeError("listPendingOutbox received the wrong request type");
+  }
+  try {
+    const deliveries = listPendingOutboxDatabaseQuery(
+      requireAuthorityDatabase(),
+      request.limit,
+      request.now,
+    );
+    respond({ type: "authority.outbox", requestId: request.requestId, deliveries });
+  } catch (error: unknown) {
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithError(request.requestId, "storage_unavailable", "Authority outbox query failed");
+  }
+}
+
+function authorizeOutboxCandidate(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.outbox-authorize") {
+    throw new TypeError("authorizeOutboxCandidate received the wrong request type");
+  }
+  try {
+    const authorized = authorizeOutboxCandidateDatabaseQuery(
+      requireAuthorityDatabase(),
+      request.deliveryId,
+      request.candidate,
+      request.now,
+    );
+    respond({
+      type: "authority.outbox-authorized",
+      requestId: request.requestId,
+      authorized,
+    });
+  } catch {
+    respondWithError(
+      request.requestId,
+      "storage_unavailable",
+      "Authority outbox authorization failed",
+    );
+  }
+}
+
+function markOutboxDispatched(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.outbox-dispatched") {
+    throw new TypeError("markOutboxDispatched received the wrong request type");
+  }
+  try {
+    markOutboxDispatchedDatabaseCommand(
+      requireAuthorityTransactionDatabase(),
+      request.deliveryId,
+      request.now,
+    );
+    respond({ type: "authority.outbox-updated", requestId: request.requestId });
+  } catch {
+    respondWithError(request.requestId, "storage_unavailable", "Authority outbox update failed");
+  }
+}
+
+function markOutboxFailed(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.outbox-failed") {
+    throw new TypeError("markOutboxFailed received the wrong request type");
+  }
+  try {
+    markOutboxFailedDatabaseCommand(
+      requireAuthorityTransactionDatabase(),
+      request.deliveryId,
+      request.reason,
+    );
+    respond({ type: "authority.outbox-updated", requestId: request.requestId });
+  } catch {
+    respondWithError(request.requestId, "storage_unavailable", "Authority outbox update failed");
+  }
+}
+
+function syncRoom(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.sync-room") {
+    throw new TypeError("syncRoom received the wrong request type");
+  }
+  try {
+    const result = syncRoomDatabaseQuery(
+      requireAuthorityTransactionDatabase(),
+      request.context,
+      request.request,
+      request.now,
+    );
+    respond({ type: "authority.room-synced", requestId: request.requestId, result });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithError(request.requestId, "storage_unavailable", "Authority room sync failed");
+  }
+}
+
+function revalidateSnapshot(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.snapshot-revalidate") {
+    throw new TypeError("revalidateSnapshot received the wrong request type");
+  }
+  try {
+    revalidateSnapshotDatabaseQuery(
+      requireAuthorityTransactionDatabase(),
+      request.validation,
+      request.now,
+    );
+    respond({ type: "authority.snapshot-revalidated", requestId: request.requestId });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithError(
+      request.requestId,
+      "storage_unavailable",
+      "Authority snapshot revalidation failed",
+    );
+  }
+}
+
+function compactRoomStream(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.compact-room-stream") {
+    throw new TypeError("compactRoomStream received the wrong request type");
+  }
+  try {
+    const compacted = compactRoomStreamDatabaseCommand(
+      requireAuthorityTransactionDatabase(),
+      request.roomId,
+      request.retainedFromSeq,
+    );
+    respond({
+      type: "authority.room-stream-compacted",
+      requestId: request.requestId,
+      roomId: request.roomId,
+      ...compacted,
+    });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithError(
+      request.requestId,
+      "storage_unavailable",
+      "Authority room stream compaction failed",
     );
   }
 }
@@ -997,6 +1505,7 @@ function closeAuthority(request: AuthorityWorkerRequest): void {
   }
 
   try {
+    repairs.releaseAll();
     if (database !== undefined) {
       database.close();
       database = undefined;
@@ -1056,6 +1565,60 @@ async function dispatch(value: unknown): Promise<void> {
       return;
     case "authority.execute-human":
       executeHuman(value);
+      return;
+    case "authority.execute-agent":
+      executeAgent(value);
+      return;
+    case "authority.read-history":
+      readHistory(value);
+      return;
+    case "authority.read-actor":
+      readActor(value);
+      return;
+    case "authority.read-room":
+      readRoom(value);
+      return;
+    case "authority.can-access-room":
+      canAccessRoom(value);
+      return;
+    case "authority.read-room-audit":
+      readRoomAudit(value);
+      return;
+    case "authority.outbox-list":
+      listPendingOutbox(value);
+      return;
+    case "authority.outbox-authorize":
+      authorizeOutboxCandidate(value);
+      return;
+    case "authority.outbox-dispatched":
+      markOutboxDispatched(value);
+      return;
+    case "authority.outbox-failed":
+      markOutboxFailed(value);
+      return;
+    case "authority.sync-room":
+      syncRoom(value);
+      return;
+    case "authority.snapshot-revalidate":
+      revalidateSnapshot(value);
+      return;
+    case "authority.repair-acquire":
+      acquireRepair(value);
+      return;
+    case "authority.repair-register":
+      registerRepair(value);
+      return;
+    case "authority.repair-authorize-page":
+      authorizeRepairPage(value);
+      return;
+    case "authority.repair-complete":
+      completeRepair(value);
+      return;
+    case "authority.repair-release":
+      releaseRepair(value);
+      return;
+    case "authority.compact-room-stream":
+      compactRoomStream(value);
       return;
     case "authority.close":
       closeAuthority(value);

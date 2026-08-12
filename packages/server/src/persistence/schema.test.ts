@@ -9,7 +9,14 @@ import {
   listAuthorityTables,
   migrateAuthorityDatabase,
   migrateAuthorityDatabaseToPreviousVersionForTest,
+  migrateAuthorityDatabaseToVersion3ForTest,
+  migrateAuthorityDatabaseToVersion2ForTest,
   readSchemaVersion,
+  listSnapshotCacheTables,
+  migrateSnapshotCacheDatabase,
+  SNAPSHOT_CACHE_BUSY_TIMEOUT_MS,
+  SNAPSHOT_CACHE_SCHEMA_VERSION,
+  validateSnapshotCacheSchema,
 } from "./schema.js";
 
 const AUTHORITY_TABLES = [
@@ -37,6 +44,19 @@ const V2_MIGRATION_CHECKSUM =
   "b7521b7e6095e01834c2f4183dc5c04c52848f9c76483c344e111b5c03662c1c";
 const V3_MIGRATION_CHECKSUM =
   "0f4ba33b182ae9b5c84874961265a4739a23cc80db4d8c6675af47646ceb81ee";
+const V4_MIGRATION_CHECKSUM =
+  "28a42b0ccfdc0d5c2eb111bc783cdd30c2678eb162cf9d77dcc2b6b3823f169c";
+const V5_MIGRATION_CHECKSUM =
+  "3f90cdeb9b7c9e04f432aac809f340033f6d9a2ea1a6a5bd8d9ab50fab8d891d";
+
+const STREAMING_KEYSET_INDEXES = [
+  "agent_executions_room_id_id",
+  "agent_judgments_room_id_id",
+  "calibration_signals_room_id_id",
+  "messages_room_id_id",
+  "open_items_room_id_id",
+  "room_memberships_catalog_actor_kind_room",
+] as const;
 
 interface LogicalSnapshot {
   readonly schemaVersion: number;
@@ -64,6 +84,17 @@ function tableColumns(database: DatabaseSync, tableName: string): readonly strin
     .prepare(`PRAGMA table_info('${tableName}')`)
     .all()
     .map((row) => String(row.name));
+}
+
+function queryPlanDetails(
+  database: DatabaseSync,
+  sql: string,
+  ...parameters: readonly (string | number)[]
+): readonly string[] {
+  return database
+    .prepare(`EXPLAIN QUERY PLAN ${sql}`)
+    .all(...parameters)
+    .map((row) => String(row.detail));
 }
 
 function databaseWithoutTransactionState(database: DatabaseSync): DatabaseSync {
@@ -334,12 +365,12 @@ describe("authority SQLite schema", () => {
     });
   });
 
-  it("migrates a fresh database through v1, v2, and v3 to the complete schema", () => {
+  it("migrates a fresh database through immutable v1-v5 to the complete schema", () => {
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
 
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(3);
-      expect(readSchemaVersion(database)).toBe(3);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(5);
+      expect(readSchemaVersion(database)).toBe(5);
       expect(listAuthorityTables(database)).toEqual(AUTHORITY_TABLES);
       expect(
         database
@@ -364,6 +395,18 @@ describe("authority SQLite schema", () => {
           version: 3,
           name: "closed-outbox-targets",
           checksum: V3_MIGRATION_CHECKSUM,
+          applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+        },
+        {
+          version: 4,
+          name: "canonical-collaboration-facts",
+          checksum: V4_MIGRATION_CHECKSUM,
+          applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+        },
+        {
+          version: 5,
+          name: "streaming-keyset-indexes",
+          checksum: V5_MIGRATION_CHECKSUM,
           applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
         },
       ]);
@@ -413,6 +456,194 @@ describe("authority SQLite schema", () => {
     });
   });
 
+  it("adds immutable v5 scoped keyset indexes and uses them for sparse interleaved scans", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      expect(readSchemaVersion(database)).toBe(4);
+      migrateAuthorityDatabase(database);
+
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(5);
+      expect(readSchemaVersion(database)).toBe(5);
+      expect(
+        database
+          .prepare(
+            `SELECT name FROM sqlite_schema
+             WHERE type = 'index' AND name IN (${STREAMING_KEYSET_INDEXES.map(() => "?").join(", ")})
+             ORDER BY name`,
+          )
+          .all(...STREAMING_KEYSET_INDEXES)
+          .map((row) => String(row.name)),
+      ).toEqual([...STREAMING_KEYSET_INDEXES].sort());
+
+      database.exec(`
+        INSERT INTO actors (id, kind, display_name)
+        VALUES ('actor-a', 'human', 'Actor A'), ('actor-b', 'human', 'Actor B');
+        INSERT INTO rooms (id, name, status, created_at)
+        VALUES
+          ('room-a-1', 'A1', 'active', '2026-08-11T00:00:00.000Z'),
+          ('room-a-2', 'A2', 'active', '2026-08-11T00:00:01.000Z'),
+          ('room-b-1', 'B1', 'active', '2026-08-11T00:00:02.000Z');
+        INSERT INTO room_memberships (
+          room_id, actor_id, kind, role, participation, joined_at
+        ) VALUES
+          ('room-a-1', 'actor-a', 'human', 'member', NULL,
+           '2026-08-11T00:01:00.000Z'),
+          ('room-b-1', 'actor-b', 'human', 'member', NULL,
+           '2026-08-11T00:01:01.000Z'),
+          ('room-a-2', 'actor-a', 'human', 'member', NULL,
+           '2026-08-11T00:01:02.000Z');
+        INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+        VALUES
+          ('001', 'room-a-1', 'actor-a', 'human', 'a-1',
+           '2026-08-11T00:02:00.000Z'),
+          ('002', 'room-b-1', 'actor-b', 'human', 'b-1',
+           '2026-08-11T00:02:01.000Z'),
+          ('003', 'room-a-1', 'actor-a', 'human', 'a-2',
+           '2026-08-11T00:02:02.000Z');
+      `);
+
+      expect(
+        database
+          .prepare(
+            `SELECT id FROM messages
+             WHERE room_id = ? AND id > ? ORDER BY id LIMIT 1`,
+          )
+          .all("room-a-1", "001"),
+      ).toEqual([{ id: "003" }]);
+      expect(
+        database
+          .prepare(
+            `SELECT room_id AS roomId FROM room_memberships
+             WHERE actor_id = ? AND kind = 'human' AND room_id > ?
+             ORDER BY room_id LIMIT 1`,
+          )
+          .all("actor-a", "room-a-1"),
+      ).toEqual([{ roomId: "room-a-2" }]);
+
+      const roomScans = [
+        ["messages", "messages_room_id_id"],
+        ["agent_judgments", "agent_judgments_room_id_id"],
+        ["open_items", "open_items_room_id_id"],
+        ["agent_executions", "agent_executions_room_id_id"],
+        ["calibration_signals", "calibration_signals_room_id_id"],
+      ] as const;
+      for (const [table, index] of roomScans) {
+        expect(
+          queryPlanDetails(
+            database,
+            `SELECT id FROM ${table}
+             WHERE room_id = ? AND id > ? ORDER BY id LIMIT 50`,
+            "room-a-1",
+            "001",
+          ).join("\n"),
+        ).toContain(index);
+      }
+      expect(
+        queryPlanDetails(
+          database,
+          `SELECT room_id FROM room_memberships
+           WHERE actor_id = ? AND kind = 'human' AND room_id > ?
+           ORDER BY room_id LIMIT 50`,
+          "actor-a",
+          "room-a-1",
+        ).join("\n"),
+      ).toContain("room_memberships_catalog_actor_kind_room");
+    });
+  });
+
+  it("adds complete canonical collaboration columns in immutable v4", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabaseToVersion3ForTest(database);
+      expect(readSchemaVersion(database)).toBe(3);
+
+      migrateAuthorityDatabase(database);
+
+      expect(readSchemaVersion(database)).toBe(5);
+      expect(tableColumns(database, "open_items")).toEqual(
+        expect.arrayContaining([
+          "requester_actor_id",
+          "transfer_chain_json",
+          "responded_at",
+        ]),
+      );
+      expect(tableColumns(database, "agent_executions")).toEqual(
+        expect.arrayContaining(["requester_actor_id", "tool_name"]),
+      );
+      expect(tableColumns(database, "calibration_signals")).toEqual(
+        expect.arrayContaining(["source_message_id", "actor_id"]),
+      );
+    });
+  });
+
+  it("keeps a valid legacy v3 calibration explicitly unknown across v4 migration", () => {
+    withDatabase((database) => {
+      createV1Fixture(database);
+      seedV1History(database);
+      migrateAuthorityDatabaseToVersion3ForTest(database);
+      database.exec(`
+        INSERT INTO agent_judgments (
+          id, room_id, agent_id, message_id, judgment_json, created_at
+        ) VALUES (
+          'judgment-v3', 'room-1', 'agent-1', 'message-1',
+          '{"outcome":"will_respond","reason":"legacy reason"}',
+          '2026-08-09T03:00:00.000Z'
+        );
+        INSERT INTO calibration_signals (
+          id, room_id, agent_id, judgment_id, signal, created_at
+        ) VALUES (
+          'signal-v3', 'room-1', 'agent-1', 'judgment-v3', '👍',
+          '2026-08-09T03:01:00.000Z'
+        );
+      `);
+
+      migrateAuthorityDatabase(database);
+
+      expect(readSchemaVersion(database)).toBe(5);
+      expect(database.prepare(
+        `SELECT source_message_id AS sourceMessageId, actor_id AS actorId
+         FROM calibration_signals WHERE id = 'signal-v3'`,
+      ).get()).toEqual({ sourceMessageId: null, actorId: null });
+    });
+  });
+
+  it("rejects canonical calibration corruption inserted while v4 triggers were absent", () => {
+    withDatabase((database) => {
+      createV1Fixture(database);
+      seedV1History(database);
+      migrateAuthorityDatabase(database);
+      const triggerNames = [
+        "calibration_signals_v4_validate_insert",
+        "calibration_signals_v4_validate_update",
+      ] as const;
+      const triggerSql = triggerNames.map((name) => {
+        const row = database.prepare(
+          "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?",
+        ).get(name);
+        if (typeof row?.sql !== "string") {
+          throw new Error(`missing v4 calibration trigger ${name}`);
+        }
+        return row.sql;
+      });
+      for (const name of triggerNames) {
+        database.exec(`DROP TRIGGER "${name}"`);
+      }
+      database.exec(`
+        INSERT INTO calibration_signals (
+          id, room_id, agent_id, judgment_id, signal, created_at,
+          source_message_id, actor_id
+        ) VALUES (
+          'corrupt-canonical-signal', 'room-1', 'agent-1', NULL, '👍',
+          '2026-08-10T00:00:00.000Z', 'message-1', 'agent-1'
+        )
+      `);
+      for (const sql of triggerSql) {
+        database.exec(sql);
+      }
+
+      expect(() => migrateAuthorityDatabase(database)).toThrow(/invariant/i);
+    });
+  });
+
   it("upgrades v1 history with zero revisions and one stream per room and actor", () => {
     withDatabase((database) => {
       createV1Fixture(database);
@@ -420,7 +651,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(3);
+      expect(readSchemaVersion(database)).toBe(5);
       expect(
         database.prepare("SELECT id, catalog_revision FROM actors ORDER BY id").all(),
       ).toEqual([
@@ -463,7 +694,7 @@ describe("authority SQLite schema", () => {
 
   it("upgrades immutable v2 outbox destinations into closed v3 targets", () => {
     withDatabase((database) => {
-      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      migrateAuthorityDatabaseToVersion2ForTest(database);
       expect(readSchemaVersion(database)).toBe(2);
       expect(tableColumns(database, "outbox_deliveries")).toContain("destination");
       expect(
@@ -499,7 +730,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(3);
+      expect(readSchemaVersion(database)).toBe(5);
       expect(
         database
           .prepare(
@@ -530,7 +761,7 @@ describe("authority SQLite schema", () => {
 
   it("rolls back v3 when a legacy outbox target is not closed", () => {
     withDatabase((database) => {
-      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      migrateAuthorityDatabaseToVersion2ForTest(database);
       database.exec(`
         INSERT INTO actors (
           id, kind, display_name, reachability, readiness,
@@ -918,14 +1149,27 @@ describe("authority SQLite schema", () => {
                   '2026-08-09T01:13:00.000Z');
         INSERT INTO agent_executions (
           id, room_id, agent_id, trigger_message_id, status, started_at,
-          completed_at, result_json
+          completed_at, result_json, requester_actor_id, tool_name
         ) VALUES ('execution-valid', 'room-1', 'agent-1', 'message-1', 'running',
-                  '2026-08-09T01:14:00.000Z', NULL, NULL);
+                  '2026-08-09T01:14:00.000Z', NULL, NULL, 'human-1',
+                  'summarize');
+        INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+        VALUES ('message-agent', 'room-1', 'agent-1', 'agent', 'agent answer',
+                '2026-08-09T01:14:30.000Z');
         INSERT INTO calibration_signals (
-          id, room_id, agent_id, judgment_id, signal, created_at
-        ) VALUES ('signal-valid', 'room-1', 'agent-1', 'judgment-valid', 'up',
-                  '2026-08-09T01:15:00.000Z');
+          id, room_id, agent_id, judgment_id, signal, created_at,
+          source_message_id, actor_id
+        ) VALUES ('signal-valid', 'room-1', 'agent-1', NULL, '👍',
+                  '2026-08-09T01:15:00.000Z', 'message-agent', 'human-1');
       `);
+
+      expectSqlRejected(
+        database,
+        `INSERT INTO calibration_signals (
+           id, room_id, agent_id, judgment_id, signal, created_at
+         ) VALUES ('signal-missing-canonical', 'room-1', 'agent-1',
+                   'judgment-valid', '👍', '2026-08-09T01:15:30.000Z')`,
+      );
 
       expectSqlRejected(
         database,
@@ -1063,9 +1307,9 @@ describe("authority SQLite schema", () => {
     });
 
     withDatabase((database) => {
-      database.exec("PRAGMA user_version = 4");
+      database.exec("PRAGMA user_version = 6");
       expect(() => migrateAuthorityDatabase(database)).toThrow(/future schema/i);
-      expect(readSchemaVersion(database)).toBe(4);
+      expect(readSchemaVersion(database)).toBe(6);
     });
   });
 
@@ -1116,6 +1360,76 @@ describe("authority SQLite schema", () => {
       expect(() => migrateAuthorityDatabase(database)).toThrow(/checksum/i);
 
       expect(snapshot(database)).toEqual(before);
+    });
+  });
+});
+
+describe("derived snapshot cache schema", () => {
+  it("creates independent v1 WAL/FULL tables without changing authority v5", () => {
+    withDatabase((database) => {
+      migrateSnapshotCacheDatabase(database);
+      expect(SNAPSHOT_CACHE_SCHEMA_VERSION).toBe(1);
+      expect(readSchemaVersion(database)).toBe(1);
+      expect(listSnapshotCacheTables(database)).toEqual([
+        "expired_snapshot_tombstones",
+        "repair_snapshot_pages",
+        "repair_snapshots",
+      ]);
+      expect(database.prepare("PRAGMA journal_mode").get()?.journal_mode).toBe("wal");
+      expect(database.prepare("PRAGMA synchronous").get()?.synchronous).toBe(2);
+      expect(database.prepare("PRAGMA busy_timeout").get()?.timeout)
+        .toBe(SNAPSHOT_CACHE_BUSY_TIMEOUT_MS);
+      expect(() => validateSnapshotCacheSchema(database)).not.toThrow();
+    });
+    expect(AUTHORITY_SCHEMA_VERSION).toBe(5);
+  });
+
+  it("fails closed on version-one corruption and refuses future versions", () => {
+    withDatabase((database) => {
+      migrateSnapshotCacheDatabase(database);
+      database.exec("ALTER TABLE repair_snapshot_pages DROP COLUMN canonical_bytes");
+      expect(() => validateSnapshotCacheSchema(database)).toThrow(/column contract/i);
+      expect(() => migrateSnapshotCacheDatabase(database)).toThrow(/column contract/i);
+    });
+    withDatabase((database) => {
+      database.exec("PRAGMA user_version = 2");
+      expect(() => migrateSnapshotCacheDatabase(database)).toThrow(/incompatible/i);
+      expect(readSchemaVersion(database)).toBe(2);
+    });
+  });
+
+  it("rejects same-column physical contract and foreign-key corruption", () => {
+    withDatabase((database) => {
+      migrateSnapshotCacheDatabase(database);
+      database.exec("DROP INDEX repair_snapshots_reuse");
+      expect(() => validateSnapshotCacheSchema(database)).toThrow(/physical contract/i);
+    });
+    withDatabase((database) => {
+      migrateSnapshotCacheDatabase(database);
+      database.exec(`
+        PRAGMA foreign_keys = OFF;
+        ALTER TABLE repair_snapshot_pages RENAME TO repair_snapshot_pages_old;
+        CREATE TABLE repair_snapshot_pages (
+          snapshot_id TEXT,
+          page_number INTEGER,
+          payload_json TEXT,
+          canonical_bytes INTEGER
+        ) STRICT;
+        DROP TABLE repair_snapshot_pages_old;
+        PRAGMA foreign_keys = ON;
+      `);
+      expect(() => validateSnapshotCacheSchema(database)).toThrow(/physical contract/i);
+    });
+    withDatabase((database) => {
+      migrateSnapshotCacheDatabase(database);
+      database.exec("PRAGMA foreign_keys = OFF");
+      database.prepare(
+        `INSERT INTO repair_snapshot_pages (
+           snapshot_id, page_number, payload_json, canonical_bytes
+         ) VALUES ('missing', 0, '[]', 2)`,
+      ).run();
+      database.exec("PRAGMA foreign_keys = ON");
+      expect(() => validateSnapshotCacheSchema(database)).toThrow(/integrity/i);
     });
   });
 });

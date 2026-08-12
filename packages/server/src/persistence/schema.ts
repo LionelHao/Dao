@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
-export const AUTHORITY_SCHEMA_VERSION = 3 as const;
+export const AUTHORITY_SCHEMA_VERSION = 5 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -21,10 +21,16 @@ const V2_MIGRATION_CHECKSUM =
   "b7521b7e6095e01834c2f4183dc5c04c52848f9c76483c344e111b5c03662c1c";
 const V3_MIGRATION_CHECKSUM =
   "0f4ba33b182ae9b5c84874961265a4739a23cc80db4d8c6675af47646ceb81ee";
+const V4_MIGRATION_CHECKSUM =
+  "28a42b0ccfdc0d5c2eb111bc783cdd30c2678eb162cf9d77dcc2b6b3823f169c";
+const V5_MIGRATION_CHECKSUM =
+  "3f90cdeb9b7c9e04f432aac809f340033f6d9a2ea1a6a5bd8d9ab50fab8d891d";
 const SCHEMA_FINGERPRINTS = {
   1: "03f2bbba4aa7082ec01819824726ce1bd9b4bd14cebea71afc93c6821dbf405c",
   2: "01c37d92ec2f303613a7bb8b592ca846fbea7c829b3c81fe4521699db949dfcc",
   3: "8653114fb3c00fcbddc386c16693d98ce6f226695f1941ac73dc341aa5fc7a61",
+  4: "b2d08fa3332bf0dc7fd4f0594210550089ed867a51b5da63be0e89830743d3ac",
+  5: "b804592978b0afde52b64574534f355eaaf12db2d3401f0ebdf3d09373ca40a0",
 } as const;
 
 const V1_STATEMENTS = [
@@ -145,6 +151,78 @@ const V3_STATEMENTS = [
    FROM outbox_deliveries_v2 AS delivery
    JOIN events AS event ON event.event_id = delivery.event_id`,
   `DROP TABLE outbox_deliveries_v2`,
+] as const;
+
+const V4_STATEMENTS = [
+  `ALTER TABLE open_items
+   ADD COLUMN requester_actor_id TEXT REFERENCES actors(id)`,
+  `ALTER TABLE open_items
+   ADD COLUMN transfer_chain_json TEXT NOT NULL DEFAULT '[]'
+   CHECK (json_valid(transfer_chain_json) AND json_type(transfer_chain_json) = 'array')`,
+  `ALTER TABLE open_items
+   ADD COLUMN responded_at TEXT`,
+  `UPDATE open_items
+   SET requester_actor_id = (
+     SELECT author_id FROM messages WHERE messages.id = open_items.source_message_id
+   ), responded_at = resolved_at`,
+  `ALTER TABLE agent_executions
+   ADD COLUMN requester_actor_id TEXT REFERENCES actors(id)`,
+  `ALTER TABLE agent_executions
+   ADD COLUMN tool_name TEXT NOT NULL DEFAULT 'legacy-unknown'
+   CHECK (length(trim(tool_name)) > 0)`,
+  `UPDATE agent_executions
+   SET requester_actor_id = (
+     SELECT author_id FROM messages
+     WHERE messages.id = agent_executions.trigger_message_id
+   )`,
+  `ALTER TABLE calibration_signals
+   ADD COLUMN source_message_id TEXT REFERENCES messages(id)`,
+  `ALTER TABLE calibration_signals
+   ADD COLUMN actor_id TEXT REFERENCES actors(id)`,
+  `CREATE TRIGGER calibration_signals_v4_validate_insert
+   BEFORE INSERT ON calibration_signals
+   WHEN NEW.source_message_id IS NULL
+      OR NEW.actor_id IS NULL
+      OR COALESCE((SELECT kind FROM actors WHERE id = NEW.actor_id), '') <> 'human'
+      OR NOT EXISTS (
+        SELECT 1 FROM messages
+        WHERE id = NEW.source_message_id
+          AND room_id = NEW.room_id
+          AND author_id = NEW.agent_id
+          AND author_kind = 'agent'
+      )
+      OR NEW.signal NOT IN ('👍', '👎')
+   BEGIN
+     SELECT RAISE(ABORT, 'canonical calibration signal is invalid');
+   END`,
+  `CREATE TRIGGER calibration_signals_v4_validate_update
+   BEFORE UPDATE OF room_id, agent_id, signal, source_message_id, actor_id
+   ON calibration_signals
+   WHEN NEW.source_message_id IS NULL
+      OR NEW.actor_id IS NULL
+      OR COALESCE((SELECT kind FROM actors WHERE id = NEW.actor_id), '') <> 'human'
+      OR NOT EXISTS (
+        SELECT 1 FROM messages
+        WHERE id = NEW.source_message_id
+          AND room_id = NEW.room_id
+          AND author_id = NEW.agent_id
+          AND author_kind = 'agent'
+      )
+      OR NEW.signal NOT IN ('👍', '👎')
+   BEGIN
+     SELECT RAISE(ABORT, 'canonical calibration signal is invalid');
+   END`,
+] as const;
+
+const V5_STATEMENTS = [
+  `CREATE INDEX messages_room_id_id ON messages(room_id, id)`,
+  `CREATE INDEX agent_judgments_room_id_id ON agent_judgments(room_id, id)`,
+  `CREATE INDEX open_items_room_id_id ON open_items(room_id, id)`,
+  `CREATE INDEX agent_executions_room_id_id ON agent_executions(room_id, id)`,
+  `CREATE INDEX calibration_signals_room_id_id
+   ON calibration_signals(room_id, id)`,
+  `CREATE INDEX room_memberships_catalog_actor_kind_room
+   ON room_memberships(actor_id, kind, room_id)`,
 ] as const;
 
 const V2_STATEMENTS = [
@@ -516,6 +594,18 @@ const MIGRATIONS = [
     V3_STATEMENTS,
     V3_MIGRATION_CHECKSUM,
   ),
+  defineMigration(
+    4,
+    "canonical-collaboration-facts",
+    V4_STATEMENTS,
+    V4_MIGRATION_CHECKSUM,
+  ),
+  defineMigration(
+    5,
+    "streaming-keyset-indexes",
+    V5_STATEMENTS,
+    V5_MIGRATION_CHECKSUM,
+  ),
 ] as const satisfies readonly Migration[];
 
 const V1_SCHEMA_CONTRACT = {
@@ -667,10 +757,32 @@ const V3_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V4_SCHEMA_CONTRACT = {
+  ...V3_SCHEMA_CONTRACT,
+  agent_executions: [
+    ...V3_SCHEMA_CONTRACT.agent_executions,
+    "requester_actor_id",
+    "tool_name",
+  ],
+  calibration_signals: [
+    ...V3_SCHEMA_CONTRACT.calibration_signals,
+    "source_message_id",
+    "actor_id",
+  ],
+  open_items: [
+    ...V3_SCHEMA_CONTRACT.open_items,
+    "requester_actor_id",
+    "transfer_chain_json",
+    "responded_at",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
   3: V3_SCHEMA_CONTRACT,
+  4: V4_SCHEMA_CONTRACT,
+  5: V4_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -1002,6 +1114,27 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
      LIMIT 1`,
     "calibration signals must reference matching agent judgments",
   );
+  if (schemaVersion >= 4) {
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM calibration_signals AS signal
+       LEFT JOIN actors AS calibration_actor ON calibration_actor.id = signal.actor_id
+       LEFT JOIN messages AS source ON source.id = signal.source_message_id
+       WHERE (signal.source_message_id IS NULL AND signal.actor_id IS NOT NULL)
+          OR (signal.source_message_id IS NOT NULL AND signal.actor_id IS NULL)
+          OR (signal.source_message_id IS NOT NULL
+              AND signal.actor_id IS NOT NULL
+              AND (calibration_actor.kind <> 'human'
+                   OR source.id IS NULL
+                   OR source.room_id <> signal.room_id
+                   OR source.author_kind <> 'agent'
+                   OR source.author_id <> signal.agent_id
+                   OR signal.signal NOT IN ('👍', '👎')))
+       LIMIT 1`,
+      "canonical calibration signals must reference a human actor and same-room Agent message",
+    );
+  }
 }
 
 function validateExistingSchema(database: DatabaseSync, currentVersion: number): void {
@@ -1160,4 +1293,158 @@ export function migrateAuthorityDatabaseToPreviousVersionForTest(
   database: DatabaseSync,
 ): void {
   migrateAuthorityDatabaseToVersion(database, AUTHORITY_SCHEMA_VERSION - 1);
+}
+
+export function migrateAuthorityDatabaseToVersion3ForTest(
+  database: DatabaseSync,
+): void {
+  migrateAuthorityDatabaseToVersion(database, 3);
+}
+
+export function migrateAuthorityDatabaseToVersion2ForTest(
+  database: DatabaseSync,
+): void {
+  migrateAuthorityDatabaseToVersion(database, 2);
+}
+
+export const SNAPSHOT_CACHE_SCHEMA_VERSION = 1 as const;
+export const SNAPSHOT_CACHE_BUSY_TIMEOUT_MS = 5_000;
+const SNAPSHOT_CACHE_SCHEMA_FINGERPRINT =
+  "bc416cc7c65942d8eb36036eb43d70e039eea6703b94222d5185147f309a01dc";
+
+const SNAPSHOT_CACHE_TABLES = [
+  "expired_snapshot_tombstones",
+  "repair_snapshot_pages",
+  "repair_snapshots",
+] as const;
+
+export function configureSnapshotCacheConnection(database: DatabaseSync): void {
+  database.exec("PRAGMA foreign_keys = ON");
+  database.prepare("PRAGMA journal_mode = WAL").get();
+  database.exec("PRAGMA synchronous = FULL");
+  database.exec(`PRAGMA busy_timeout = ${SNAPSHOT_CACHE_BUSY_TIMEOUT_MS}`);
+  if (
+    readPragmaNumber(database, "foreign_keys", "foreign_keys") !== 1 ||
+    readPragmaString(database, "journal_mode", "journal_mode").toLowerCase() !== "wal" ||
+    readPragmaNumber(database, "synchronous", "synchronous") !== 2 ||
+    readPragmaNumber(database, "busy_timeout", "timeout") !== SNAPSHOT_CACHE_BUSY_TIMEOUT_MS
+  ) {
+    throw new Error("Snapshot cache SQLite configuration could not be verified");
+  }
+}
+
+export function listSnapshotCacheTables(database: DatabaseSync): readonly string[] {
+  return database.prepare(
+    `SELECT name FROM sqlite_schema
+     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+     ORDER BY name`,
+  ).all().map((row) => String(row.name));
+}
+
+function snapshotCacheColumns(database: DatabaseSync, table: string): readonly string[] {
+  return database.prepare(`PRAGMA table_info(${table})`).all()
+    .map((row) => String(row.name));
+}
+
+function validateSnapshotCacheIntegrity(database: DatabaseSync): void {
+  try {
+    const integrity = database.prepare("PRAGMA integrity_check").all();
+    if (integrity.length !== 1 || integrity[0]?.integrity_check !== "ok") {
+      throw new Error("PRAGMA integrity_check did not return exactly ok");
+    }
+    if (database.prepare("PRAGMA foreign_key_check").get() !== undefined) {
+      throw new Error("PRAGMA foreign_key_check returned violations");
+    }
+  } catch (error: unknown) {
+    throw new Error("Snapshot cache integrity check failed", { cause: error });
+  }
+}
+
+export function validateSnapshotCachePhysicalSchema(database: DatabaseSync): void {
+  if (readSchemaVersion(database) !== SNAPSHOT_CACHE_SCHEMA_VERSION) {
+    throw new Error("Snapshot cache schema version is incompatible");
+  }
+  if (!sameStrings(listSnapshotCacheTables(database), SNAPSHOT_CACHE_TABLES)) {
+    throw new Error("Snapshot cache table contract is corrupt");
+  }
+  if (!sameStrings(snapshotCacheColumns(database, "repair_snapshots"), [
+    "snapshot_id", "kind", "principal_id", "session_family_id", "room_id",
+    "access_revision", "watermark", "catalog_revision", "checksum",
+    "page_count", "expires_at", "reuse_key", "complete", "invalid",
+  ]) || !sameStrings(snapshotCacheColumns(database, "repair_snapshot_pages"), [
+    "snapshot_id", "page_number", "payload_json", "canonical_bytes",
+  ]) || !sameStrings(snapshotCacheColumns(database, "expired_snapshot_tombstones"), [
+    "snapshot_id", "retain_until",
+  ])) {
+    throw new Error("Snapshot cache column contract is corrupt");
+  }
+  if (readSchemaFingerprint(database) !== SNAPSHOT_CACHE_SCHEMA_FINGERPRINT) {
+    throw new Error("Snapshot cache physical contract is corrupt");
+  }
+}
+
+export function validateSnapshotCacheSchema(database: DatabaseSync): void {
+  validateSnapshotCachePhysicalSchema(database);
+  validateSnapshotCacheIntegrity(database);
+}
+
+export function migrateSnapshotCacheDatabase(database: DatabaseSync): void {
+  configureSnapshotCacheConnection(database);
+  const version = readSchemaVersion(database);
+  if (version === SNAPSHOT_CACHE_SCHEMA_VERSION) {
+    validateSnapshotCacheSchema(database);
+    return;
+  }
+  if (version !== 0 || listSnapshotCacheTables(database).length !== 0) {
+    throw new Error("Snapshot cache schema version is incompatible");
+  }
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    database.exec(`CREATE TABLE repair_snapshots (
+      snapshot_id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL CHECK (kind IN ('room', 'catalog')),
+      principal_id TEXT NOT NULL,
+      session_family_id TEXT NOT NULL,
+      room_id TEXT,
+      access_revision INTEGER,
+      watermark INTEGER,
+      catalog_revision INTEGER,
+      checksum TEXT NOT NULL,
+      page_count INTEGER NOT NULL CHECK (page_count >= 1),
+      expires_at INTEGER NOT NULL,
+      reuse_key TEXT NOT NULL,
+      complete INTEGER NOT NULL CHECK (complete IN (0, 1)),
+      invalid INTEGER NOT NULL DEFAULT 0 CHECK (invalid IN (0, 1)),
+      CHECK (
+        (kind = 'room' AND room_id IS NOT NULL AND access_revision IS NOT NULL
+          AND watermark IS NOT NULL AND catalog_revision IS NULL)
+        OR
+        (kind = 'catalog' AND room_id IS NULL AND access_revision IS NULL
+          AND watermark IS NULL AND catalog_revision IS NOT NULL)
+      )
+    ) STRICT`);
+    database.exec(`CREATE INDEX repair_snapshots_reuse
+      ON repair_snapshots(reuse_key, complete, invalid, expires_at)`);
+    database.exec(`CREATE TABLE repair_snapshot_pages (
+      snapshot_id TEXT NOT NULL REFERENCES repair_snapshots(snapshot_id) ON DELETE CASCADE,
+      page_number INTEGER NOT NULL CHECK (page_number >= 0),
+      payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+      canonical_bytes INTEGER NOT NULL CHECK (canonical_bytes >= 0),
+      PRIMARY KEY (snapshot_id, page_number)
+    ) STRICT`);
+    database.exec(`CREATE TABLE expired_snapshot_tombstones (
+      snapshot_id TEXT PRIMARY KEY,
+      retain_until INTEGER NOT NULL
+    ) STRICT`);
+    database.exec(`PRAGMA user_version = ${SNAPSHOT_CACHE_SCHEMA_VERSION}`);
+    validateSnapshotCacheSchema(database);
+    database.exec("COMMIT");
+  } catch (error: unknown) {
+    try {
+      database.exec("ROLLBACK");
+    } catch {
+      // Preserve the schema failure.
+    }
+    throw error;
+  }
 }
