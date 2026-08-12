@@ -1276,6 +1276,9 @@ Propose `feat(desktop): restore authoritative client replica`. Risks: staging cl
 
 **Files:**
 
+- Modify: `docs/plans/2026-08-10-t0040-authoritative-persistence-implementation.md`（机械记录 Task 13 实际扩围与理由）
+- Modify: `package.json`（把独立 Vitest ProjectConfig strict `tsc` 合同纳入常规 `typecheck`，防止 unsupported project option 回归）
+- Modify: `vitest.config.ts`（Node 22.13.1 下将 authority E2E 与 snapshot worker client 放入后置 heavy project，并用 Vitest 3.2.7 project-supported `poolOptions.forks.singleFork` 只在该 project 内单 worker 串行，其他 23 个测试文件仍并行；不改 timeout）
 - Create: `packages/server/src/authoritative-server.ts`
 - Create: `packages/server/src/authority.e2e.test.ts`
 - Create: `packages/server/src/fixtures/authority-child.ts`
@@ -1283,6 +1286,21 @@ Propose `feat(desktop): restore authoritative client replica`. Risks: staging cl
 - Modify: `packages/desktop/src/renderer/app.test.ts`
 - Create: `docs/protocols/authoritative-sync.md`
 - Create: `docs/deliveries/T-0040-服务端权威持久化多客户端同步与故障恢复-交付说明.md`
+- Modify: `packages/server/src/persistence/authority-database-handler.ts`
+- Modify: `packages/server/src/persistence/authority-worker.ts`
+- Modify: `packages/server/src/persistence/worker-database-client.ts`
+- Modify: `packages/server/src/persistence/worker-database-client.test.ts`
+- Modify: `packages/server/src/persistence/contracts.type-test.ts`
+- Modify: `packages/desktop/src/renderer/app.ts`
+- Modify: `packages/server/src/websocket.ts`
+- Modify: `packages/server/src/websocket.test.ts`
+- Modify: `packages/desktop/src/sync/client-sync-replica.ts`
+- Modify: `packages/desktop/src/sync/client-sync-replica.test.ts`
+- Modify: `docs/plans/2026-08-10-t0040-authoritative-persistence-design.md`（机械同步 authority 当前 schema v5 事实）
+
+Task 13 实现时，真实事务内的 `after-domain-write` / `before-commit` 故障点无法由原七个文件到达，因此经范围批准增加以上三个 persistence 生产文件，并机械修改相邻 worker test 与 package-root type-test 锁住 hook 时点和 public seam 不泄漏；renderer 原接口又只生成固定 preview、无法消费恢复记录，因此另批准 `app.ts` 增加闭合 typed verified-fixture 输入。Node 22.13.1 standard full 并行时，既有 10k snapshot 与本任务 10k E2E 竞争导致原生 5 秒 timeout，因此另批准把 `authority.e2e.test.ts` 与 `snapshot-worker-client.test.ts` 放入后置 heavy project，并以 `pool: "forks"` + project-supported `poolOptions.forks.singleFork: true` 让该 project 共用一个 fork；其余 23 个 files 保持并行且不改 timeout。独立 strict `tsc` 配置合同锁住 `defineProject` 合法，runtime reporter 证明两 heavy modules 的最大同时活跃数为 1。接缝仅由 workerData/deep-only test factory 传递，未修改 public wire、schema 或 `worker-protocol.ts`，renderer 无参数行为保持兼容。
+
+最终质量审查又批准最小扩围 WebSocket close 与 `ClientSyncReplica`：transport close 先封 dispatcher 并穷尽 socket/ws/http cleanup，composition 即使上游失败也依序关闭 snapshot/worker；replica 不再额外累计全量 records/rooms，而把 staging canonical checksum、catalog room IDs 与最终 commit 交给 cache port，保持 replica 自身 O(page)。相邻测试机械更新；E2E memory cache 则作为测试 adapter 刻意保存完整 10k values 并独立重算 checksum。renderer typed 输入在改 DOM 前经 core closed guards、顶层 exact envelope、unique message target 与 preview 关联校验，恢复的 read/judgement 按 `messageId` 挂载而不按作者 kind 猜测。E2E/loopback helper 对 JSON、child exit、TERM→KILL、WebSocket connect/close/wait 都使用有界 deadline 并清理 listener，fixture 故障不能无限挂住门禁。
 
 - [ ] **Step 1: Build a real-process test harness.**
 
@@ -1300,11 +1318,10 @@ export interface StartAuthoritativeServerOptions {
   readonly actors: readonly Actor[];
   readonly identities: IdentityAdapter;
   readonly invitationSecretKey: Uint8Array;
-  readonly faultPoint?: "after-domain-write" | "before-commit" | "after-commit-before-outbox" | "after-send-before-dispatch-mark";
 }
 ```
 
-`authority-child.ts` reads one closed JSON-line startup command from stdin, emits `{ "type": "ready", "url": string }`, and exits with documented test-only codes at fault points. Tests must spawn compiled `packages/server/dist/fixtures/authority-child.js`; run `pnpm build` before the focused e2e test.
+`authority-child.ts` reads one closed JSON-line startup command from stdin, emits `{ "type": "ready", "url": string }`, and exits with documented test-only codes at fault points. Fault、snapshot quota、初始化、只读回读、inspection/compact 与 mixed fixture builder 都只通过 deep `startAuthoritativeServerForTest` 或 compiled-child closed flag 到达；package root 的 runtime/type declaration 不暴露任何 test seam，正常 `startAuthoritativeServer` 不含退出分支。Child 不使用 warning 类别抑制；harness 只从捕获的 `stderr` 剥离格式/文本精确匹配的 SQLite ExperimentalWarning 行，任何其他 warning 或产品错误仍失败。Tests must spawn compiled `packages/server/dist/fixtures/authority-child.js`; run `pnpm build` before the focused e2e test.
 
 - [ ] **Step 2: Write RED child-process durability tests.**
 
@@ -1328,7 +1345,7 @@ Use three actual `ws` connections and three independent `ClientSyncReplica` inst
 - A remains online and receives live v2 events.
 - B disconnects, misses several events, then resumes from a retained cursor without gaps or duplicates.
 - C deletes catalog, room cache, and cursors; bootstrap rediscovers rooms, an expired cursor produces `repair_required`, paginated repair restores all facts, delta reaches the current watermark, then v2 subscribe becomes active.
-- Force materialized fallback with 10,000 mixed closed records; verify C's live cache remains its prior complete version until `snapshot.completed`.
+- Force materialized fallback with 10,000 mixed closed records；compiled-child fixture builder 先用 production core guard 逐类验证 closed actor/membership/read/message/judgement/open/execution/calibration，并在 `foreign_keys=ON` 的单事务中批量落测试数据。其目标只证明 mixed snapshot/streaming，不冒充 10,000 次 command/event/outbox E2E。精确分布为 1 room、2,000 memberships（2,000 个不同合法 actor）、3,500 messages、1,999 reads、500 judgments、500 open items、500 executions、1,000 calibrations；三连接属于同一 session family，A 用更严格的 deep-only 50 records/page 完成 200 页 streaming fallback，B/C 在正常 quota 下各完成 100 页 materialized repair。A 的 live cache 直到 `snapshot.completed` 前保持旧完整版本；C 在 transport 已收到 materialized 最后一页、尚未把该页返回 `ClientSyncReplica` 的暂停边界证明 10,000 records 已收齐但 live cache 仍为空，释放后才原子 commit。
 - Clear all three caches and restore them again; their fact sets and final room watermarks must equal the authority DB.
 
 Run: `pnpm build && pnpm exec vitest run packages/server/src/authority.e2e.test.ts`
@@ -1394,7 +1411,7 @@ Run `gbp.py check --links` once more. Report the six criteria, current claimable
 | 2. Stable event/idempotency | 4, 6 | Sequential/concurrent/cross-restart replay and conflict table |
 | 3. Three-client cursor recovery | 8-13 | Retained/expired cursor suites and three real WebSocket replicas |
 | 4. Durable ACK/outbox crash window | 6, 7, 13 | Four fault points, especially child exit after COMMIT before outbox |
-| 5. Versioned migration | 1, 3, 5 | fresh/v1→v2→v3, existing v2→v3, unknown-target/injected rollback, import activation crash |
+| 5. Versioned migration | 1, 3, 5 | fresh v1→v2→v3→v4→v5；historical v1、existing v2/v3/v4→current v5；unknown/future refusal；unknown-target、injected-v2、final-integrity rollback；import activation crash |
 | 6. Permissions and cache-clear restore | 8-13 | Current-state authorization races and all-client cache deletion/rebuild |
 
 - [x] Every one of the six T-0040 criteria maps to at least one production task and one automated test.

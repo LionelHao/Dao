@@ -262,7 +262,7 @@ type InternalAgentCommandContext = {
 
 `outbox_deliveries` 以 `(event_id, target_kind, target_id)` 为联合主键，保存 `target_kind: room | principal | session-family`、target ID、stream sequence、状态、attempt 次数和最近错误。同一事件可以有多个投递目标；一个领域命令也可以在同一事务内生成多个事件。
 
-Schema v2 已随持久化基础设施合入 `main`，其中 outbox 仍使用过渡字段 `destination`。该历史 migration 不再改写；Task 5 通过 schema v3 在单一外层事务中 rebuild/copy/rename 为上述闭合列，并以固定 v2 checksum、v2→v3 数据迁移测试和 v3 physical fingerprint 防止静默破坏已有 authority 数据库。Task 6 再新增 immutable schema v4，补齐 canonical `OpenItem`、`AgentExecution`、`CalibrationSignal` 所需列；v1-v3 checksum 与 physical fingerprint 均保持不变，authority 当前最终版本为 v4。
+Schema v2 已随持久化基础设施合入 `main`，其中 outbox 仍使用过渡字段 `destination`。该历史 migration 不再改写；Task 5 通过 schema v3 在单一外层事务中 rebuild/copy/rename 为上述闭合列，并以固定 v2 checksum、v2→v3 数据迁移测试和 v3 physical fingerprint 防止静默破坏已有 authority 数据库。Task 6 再新增 immutable schema v4，补齐 canonical `OpenItem`、`AgentExecution`、`CalibrationSignal` 所需列；Task 8 新增 immutable schema v5 的 scoped keyset indexes，服务 streaming 稀疏交错扫描。v1-v4 checksum 与 physical fingerprint 均保持不变，authority 当前最终版本为 v5。
 
 所有 accepted mutation 都在事务内更新领域表并写稳定 event。房间创建、重命名、真人成员加入/更新/移除或归档时，同一事务写一个 room event，并为每个受影响 actor 写独立 `identity.room-access.changed` event；各事件拥有自己的稳定 event ID。房间可见 event 写 room target；human 目录 event 写 principal target，Agent identity event 在没有 runtime observer 时只持久化、不制造空 delivery；正常 refresh 的 `identity.session.rotated` 由当前 ACK 返回新 token，只持久化而不创建 terminal delivery；显式 revoke 或 refresh replay 触发的 `identity.session.revoked` 才写 session-family target。纯 session issuance 同样没有提交后的远端观察者。需要 outbox 的命令，其领域写、多事件映射和全部 delivery rows 必须在同一事务完成。
 
@@ -509,7 +509,7 @@ type RoomSubscribeV2Retry = {
 
 ### 10.1 Schema migration
 
-`schema_migrations` 保存版本、名称、checksum 和应用时间。v1、已合入 `main` 的 v2、v3 与当前 v4 都是 checksum 和 physical fingerprint 固定的不可变历史；任何后续结构变化必须新增版本，不能改写已有 migration。v1 fixture 包含身份、session、房间、成员、审计和消息等已有权威事实；v2 在一个 migration 中执行以下确定性步骤：
+`schema_migrations` 保存版本、名称、checksum 和应用时间。v1、已合入 `main` 的 v2、v3、v4 与当前 v5 都是 checksum 和 physical fingerprint 固定的不可变历史；任何后续结构变化必须新增版本，不能改写已有 migration。v1 fixture 包含身份、session、房间、成员、审计和消息等已有权威事实；v2 在一个 migration 中执行以下确定性步骤：
 
 1. 创建六类协作事实表、`streams`、`events`、`idempotency_records` 与 `outbox_deliveries`；
 2. 为 actor 增加非空 `catalog_revision`，为 membership 增加非空 `access_revision`，所有 v1 既有记录确定性初始化为 0；
@@ -521,9 +521,9 @@ v3 只重建 outbox envelope：把 v2 的 canonical `destination` 拆为 `target
 
 v4 为 `open_items` 增加 requester、transfer chain 与 responded timestamp，为 `agent_executions` 增加 requester 与 tool name，为 `calibration_signals` 增加 source message 与 human actor。旧 calibration 行允许历史 `NULL`，读取时只能表示 legacy unknown，不能伪造 actor/source；v4 的 INSERT/UPDATE triggers 强制所有新 authoritative calibration write 的 actor/source 非空、actor 为 human、source 为同房间目标 Agent 的消息，且 signal 只能为 `👍` 或 `👎`。这些 triggers 纳入 v4 physical fingerprint 和启动校验。
 
-既有历史不伪造 event，v2 升级后的首次客户端恢复走 repair snapshot，新变更从 stream sequence 1 开始。新数据库按 v1 → v2 → v3 → v4 顺序创建；已有 v3 数据库只运行 v4，避免另写一套只用于空库的 schema。Derived `snapshot-cache.sqlite` 使用独立 schema version 1；它不参与 authority migration，版本不兼容时可以删除重建，因为客户端会重新 begin repair。
+v5 只增加 streaming 所需 scoped keyset indexes，不改写领域事实；新数据库按 v1 → v2 → v3 → v4 → v5 顺序创建，已有 v4 数据库只运行 v5。既有历史不伪造 event，升级后的首次客户端恢复走 repair snapshot，新变更从 stream sequence 1 开始。Derived `snapshot-cache.sqlite` 使用独立 schema version 1；它不参与 authority migration，版本不兼容时可以删除重建，因为客户端会重新 begin repair。
 
-一次启动所需的完整升级链放在同一个外层事务中；任一 migration 失败则整条链回滚，数据库版本、表结构和原数据均保持启动前状态。服务拒绝以未知或未达到当前版本的 schema 启动。测试 fixture 同时覆盖 fresh/v1 → v2 → v3、已有 v2 → v3、未知 v2 target 的整笔回滚，以及人为注入失败后的表、版本和数据均保持原样。
+一次启动所需的完整升级链放在同一个外层事务中；任一 migration 失败则整条链回滚，数据库版本、表结构和原数据均保持启动前状态。服务拒绝以未知、未来或未达到当前 v5 的 schema 启动。测试 fixture 覆盖 fresh v1 → v2 → v3 → v4 → v5、带历史事实的 v1 → current、已有 v2 → v3 → v4 → v5、已有 v3 legacy-unknown calibration → v4 → v5 与已有 v4 → v5；未知/未来版本拒绝、无法映射的 v2 outbox target、注入的 v2 失败和最终完整性检查失败分别证明整笔回滚且原表、版本、数据不变。
 
 ### 10.2 T-0039 legacy import
 
