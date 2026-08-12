@@ -1,12 +1,22 @@
 import {
+  isRoomCursor,
   isMessageDraft,
+  isSnapshotVersion,
   type Message,
   type MessageAcceptedAck,
   type MessageDraft,
   type PersistedIdentityEvent,
   type PersistedRoomEvent,
+  type RoomCursor,
+  type RoomRepairPage,
+  type RoomSyncRequest,
+  type RoomSyncResult,
+  type SnapshotCompleted,
+  type SnapshotVersion,
+  type WorkspaceBootstrapPage,
 } from "@native-im/core";
 import type { AuthenticationErrorCode } from "./auth.js";
+import { ROOM_SYNC_MAX_LIMIT } from "./persistence/contracts.js";
 import type { MessageErrorCode } from "./service.js";
 import type { MessageStoreErrorCode } from "./store.js";
 
@@ -16,6 +26,18 @@ const AUTH_REFRESH_FIELDS = new Set(["type", "requestId", "refreshToken"]);
 const AUTH_REVOKE_FIELDS = new Set(["type", "requestId"]);
 const MESSAGE_SEND_FIELDS = new Set(["type", "requestId", "message"]);
 const ROOM_FIELDS = new Set(["type", "requestId", "roomId"]);
+const WORKSPACE_BOOTSTRAP_BEGIN_FIELDS = new Set(["type", "requestId"]);
+const SNAPSHOT_PAGE_FIELDS = new Set(["type", "requestId", "snapshotId", "afterPage"]);
+const ROOM_SYNC_REQUIRED_FIELDS = new Set(["type", "requestId", "roomId"]);
+const ROOM_SYNC_OPTIONAL_FIELDS = new Set(["cursor", "limit"]);
+const SNAPSHOT_COMPLETE_FIELDS = new Set([
+  "type",
+  "requestId",
+  "snapshotId",
+  "version",
+  "snapshotChecksum",
+]);
+const ROOM_SUBSCRIBE_V2_FIELDS = new Set(["type", "requestId", "roomId", "cursor"]);
 const MESSAGE_DRAFT_FIELDS = new Set(["id", "roomId", "body", "sentAt"]);
 
 export const PROTOCOL_FIELD_LIMITS = Object.freeze({
@@ -27,6 +49,8 @@ export const PROTOCOL_FIELD_LIMITS = Object.freeze({
   messageId: 256,
   body: 32 * 1_024,
   sentAt: 64,
+  snapshotId: 256,
+  snapshotChecksum: 256,
 });
 
 export interface AuthLoginFrame {
@@ -71,6 +95,48 @@ export interface RoomSubscribeFrame {
   readonly roomId: string;
 }
 
+export interface WorkspaceBootstrapRequestFrame {
+  readonly type: "workspace.bootstrap.begin";
+  readonly requestId: string;
+}
+
+export interface WorkspaceBootstrapPageRequestFrame {
+  readonly type: "workspace.bootstrap.page";
+  readonly requestId: string;
+  readonly snapshotId: string;
+  readonly afterPage: number;
+}
+
+export type RoomSyncRequestFrame = RoomSyncRequest;
+
+export interface RoomRepairBeginRequestFrame {
+  readonly type: "room.repair.begin";
+  readonly requestId: string;
+  readonly roomId: string;
+}
+
+export interface RoomRepairPageRequestFrame {
+  readonly type: "room.repair.page";
+  readonly requestId: string;
+  readonly snapshotId: string;
+  readonly afterPage: number;
+}
+
+export interface SnapshotCompleteRequestFrame {
+  readonly type: "snapshot.complete";
+  readonly requestId: string;
+  readonly snapshotId: string;
+  readonly version: SnapshotVersion;
+  readonly snapshotChecksum: string;
+}
+
+export interface RoomSubscribeV2Frame {
+  readonly type: "room.subscribe.v2";
+  readonly requestId: string;
+  readonly roomId: string;
+  readonly cursor: RoomCursor;
+}
+
 export type ClientFrame =
   | AuthLoginFrame
   | AuthResumeFrame
@@ -78,7 +144,14 @@ export type ClientFrame =
   | AuthRevokeFrame
   | MessageSendFrame
   | RoomHistoryRequestFrame
-  | RoomSubscribeFrame;
+  | RoomSubscribeFrame
+  | WorkspaceBootstrapRequestFrame
+  | WorkspaceBootstrapPageRequestFrame
+  | RoomSyncRequestFrame
+  | RoomRepairBeginRequestFrame
+  | RoomRepairPageRequestFrame
+  | SnapshotCompleteRequestFrame
+  | RoomSubscribeV2Frame;
 
 export interface AuthenticatedFrame {
   readonly type: "auth.authenticated";
@@ -103,7 +176,7 @@ export interface MessageCreatedFrame {
 
 export interface RoomEventFrame {
   readonly type: "room.event";
-  readonly event: Exclude<PersistedRoomEvent, { readonly type: "room.message.accepted" }>;
+  readonly event: PersistedRoomEvent;
 }
 
 export type IdentityRoomAccessChangedFrame = Extract<
@@ -129,6 +202,22 @@ export interface RoomSubscribedFrame {
   readonly roomId: string;
 }
 
+export interface RoomSubscribedV2Frame {
+  readonly type: "room.subscribed.v2";
+  readonly requestId: string;
+  readonly roomId: string;
+  readonly cursor: RoomCursor;
+  readonly watermark: number;
+}
+
+export interface RoomSubscribeV2RetryFrame {
+  readonly type: "room.subscribe.v2.retry";
+  readonly requestId: string;
+  readonly roomId: string;
+  readonly reason: "gate_overflow";
+  readonly restartFrom: RoomCursor;
+}
+
 export type ProtocolErrorCode =
   | AuthenticationErrorCode
   | MessageErrorCode
@@ -138,11 +227,24 @@ export type ProtocolErrorCode =
   | "identity_forbidden"
   | "already_authenticated"
   | "invalid_request"
+  | "snapshot_forbidden"
+  | "snapshot_family_revoked"
+  | "snapshot_stale"
+  | "snapshot_not_found"
+  | "snapshot_expired"
+  | "snapshot_busy"
+  | "repair_barrier_active"
+  | "invalid_token"
+  | "token_expired"
+  | "session_revoked"
+  | "storage_unavailable"
+  | "room_not_found"
+  | "room_archived"
   | "internal_error";
 
 export interface ProtocolErrorFrame {
   readonly type: "error";
-  readonly status: 400 | 401 | 403 | 409 | 500;
+  readonly status: 400 | 401 | 403 | 404 | 409 | 410 | 429 | 500 | 503;
   readonly code: ProtocolErrorCode;
   readonly message: string;
   readonly requestId?: string;
@@ -158,6 +260,12 @@ export type ServerFrame =
   | IdentityRoomAccessChangedFrame
   | RoomHistoryFrame
   | RoomSubscribedFrame
+  | WorkspaceBootstrapPage
+  | RoomSyncResult
+  | RoomRepairPage
+  | SnapshotCompleted
+  | RoomSubscribedV2Frame
+  | RoomSubscribeV2RetryFrame
   | ProtocolErrorFrame;
 
 export type ClientFrameParseResult =
@@ -177,6 +285,40 @@ function hasOnlyFields(value: UnknownRecord, fields: ReadonlySet<string>): boole
       (key) => typeof key === "string" && fields.has(key),
     )
   );
+}
+
+function hasRequiredAndOptionalFields(
+  value: UnknownRecord,
+  required: ReadonlySet<string>,
+  optional: ReadonlySet<string>,
+): boolean {
+  return (
+    [...required].every((field) => Object.hasOwn(value, field)) &&
+    Reflect.ownKeys(value).every(
+      (key) =>
+        typeof key === "string" && (required.has(key) || optional.has(key)),
+    )
+  );
+}
+
+function isPageIndex(value: unknown): value is number {
+  return Number.isSafeInteger(value) && typeof value === "number" && value >= 0;
+}
+
+function isBoundedRoomCursor(value: unknown, roomId: string): value is RoomCursor {
+  return (
+    isRoomCursor(value) &&
+    value.roomId === roomId &&
+    isBoundedString(value.roomId, PROTOCOL_FIELD_LIMITS.roomId)
+  );
+}
+
+function isBoundedSnapshotVersion(value: unknown): value is SnapshotVersion {
+  if (!isSnapshotVersion(value)) {
+    return false;
+  }
+  return value.kind === "catalog" ||
+    isBoundedString(value.roomId, PROTOCOL_FIELD_LIMITS.roomId);
 }
 
 function isStrictMessageDraft(value: unknown): value is MessageDraft {
@@ -366,6 +508,133 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
           type: value.type,
           requestId,
           roomId: value.roomId,
+        },
+      };
+    case "workspace.bootstrap.begin":
+      if (!hasOnlyFields(value, WORKSPACE_BOOTSTRAP_BEGIN_FIELDS) || requestId === undefined) {
+        return {
+          ok: false,
+          error: protocolError("workspace.bootstrap.begin requires string requestId", requestId),
+        };
+      }
+      return { ok: true, frame: { type: "workspace.bootstrap.begin", requestId } };
+    case "workspace.bootstrap.page":
+    case "room.repair.page":
+      if (
+        !hasOnlyFields(value, SNAPSHOT_PAGE_FIELDS) ||
+        requestId === undefined ||
+        !isBoundedString(value.snapshotId, PROTOCOL_FIELD_LIMITS.snapshotId) ||
+        !isPageIndex(value.afterPage)
+      ) {
+        return {
+          ok: false,
+          error: protocolError(
+            `${value.type} requires string requestId, snapshotId, and non-negative afterPage`,
+            requestId,
+          ),
+        };
+      }
+      return {
+        ok: true,
+        frame: {
+          type: value.type,
+          requestId,
+          snapshotId: value.snapshotId,
+          afterPage: value.afterPage,
+        },
+      };
+    case "room.sync": {
+      if (
+        !hasRequiredAndOptionalFields(
+          value,
+          ROOM_SYNC_REQUIRED_FIELDS,
+          ROOM_SYNC_OPTIONAL_FIELDS,
+        ) ||
+        requestId === undefined ||
+        !isBoundedString(value.roomId, PROTOCOL_FIELD_LIMITS.roomId) ||
+        (value.cursor !== undefined && !isBoundedRoomCursor(value.cursor, value.roomId)) ||
+        (value.limit !== undefined &&
+          (!Number.isSafeInteger(value.limit) ||
+            typeof value.limit !== "number" ||
+            value.limit <= 0 ||
+            value.limit > ROOM_SYNC_MAX_LIMIT))
+      ) {
+        return {
+          ok: false,
+          error: protocolError("room.sync requires a closed sync request", requestId),
+        };
+      }
+      return {
+        ok: true,
+        frame: {
+          type: "room.sync",
+          requestId,
+          roomId: value.roomId,
+          ...(value.cursor === undefined ? {} : { cursor: value.cursor }),
+          ...(value.limit === undefined ? {} : { limit: value.limit }),
+        },
+      };
+    }
+    case "room.repair.begin":
+      if (
+        !hasOnlyFields(value, ROOM_FIELDS) ||
+        requestId === undefined ||
+        !isBoundedString(value.roomId, PROTOCOL_FIELD_LIMITS.roomId)
+      ) {
+        return {
+          ok: false,
+          error: protocolError("room.repair.begin requires string requestId and roomId", requestId),
+        };
+      }
+      return {
+        ok: true,
+        frame: { type: "room.repair.begin", requestId, roomId: value.roomId },
+      };
+    case "snapshot.complete":
+      if (
+        !hasOnlyFields(value, SNAPSHOT_COMPLETE_FIELDS) ||
+        requestId === undefined ||
+        !isBoundedString(value.snapshotId, PROTOCOL_FIELD_LIMITS.snapshotId) ||
+        !isBoundedSnapshotVersion(value.version) ||
+        !isBoundedString(
+          value.snapshotChecksum,
+          PROTOCOL_FIELD_LIMITS.snapshotChecksum,
+        )
+      ) {
+        return {
+          ok: false,
+          error: protocolError("snapshot.complete requires a closed snapshot completion", requestId),
+        };
+      }
+      return {
+        ok: true,
+        frame: {
+          type: "snapshot.complete",
+          requestId,
+          snapshotId: value.snapshotId,
+          version: value.version,
+          snapshotChecksum: value.snapshotChecksum,
+        },
+      };
+    case "room.subscribe.v2":
+      if (
+        !hasOnlyFields(value, ROOM_SUBSCRIBE_V2_FIELDS) ||
+        requestId === undefined ||
+        !isBoundedString(value.roomId, PROTOCOL_FIELD_LIMITS.roomId) ||
+        !isBoundedRoomCursor(value.cursor, value.roomId)
+      ) {
+        return {
+          ok: false,
+          error: protocolError("room.subscribe.v2 requires string requestId, roomId, and cursor", requestId),
+        };
+      }
+      return {
+        ok: true,
+        frame: {
+          type: "room.subscribe.v2",
+          requestId,
+          roomId: value.roomId,
+          cursor: value.cursor,
         },
       };
     default:

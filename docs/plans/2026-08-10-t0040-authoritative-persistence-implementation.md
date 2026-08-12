@@ -194,7 +194,7 @@ Run: `pnpm typecheck && pnpm exec vitest run packages/server/src/persistence/sch
 
 Expected: schema tests pass on the local runtime; typecheck and lint exit 0. CI later proves the lower bound.
 
-- [ ] **Step 5: Preview and commit.**
+- [x] **Step 5: Preview and commit.**
 
 Use `superpowers:commit-rebase-pr`, stage only the five listed files, and propose `feat(server): add versioned authority schema`. The Chinese preview must call out the experimental `node:sqlite` risk and the fact that CI, not the local Node 25 runtime, is the Node 22.13 proof.
 
@@ -1144,8 +1144,10 @@ Propose `feat(server): guarantee scoped streaming repair`. Reviewer focus: no gl
 - Modify: `packages/server/src/websocket.ts`
 - Modify: `packages/server/src/websocket.test.ts`
 - Modify: `packages/server/src/index.ts`
+- Modify: `packages/server/src/outbox-dispatcher.ts`
+- Modify: `packages/server/src/outbox-dispatcher.test.ts`
 
-- [ ] **Step 1: Write protocol RED tests for every new request/result.**
+- [x] **Step 1: Write protocol RED tests for every new request/result.**
 
 Cover `workspace.bootstrap.begin/page`, `room.sync`, `room.repair.begin/page`, `snapshot.complete`, and `room.subscribe.v2`. Each parser test must reject extra fields, wrong cursor version/room, negative/future page, room/catalog version interchange, missing `requestId`, and over-limit IDs.
 
@@ -1167,21 +1169,23 @@ expect(parseClientFrame(JSON.stringify({
 }))).toMatchObject({ ok: false });
 ```
 
-- [ ] **Step 2: Run RED.**
+- [x] **Step 2: Run RED.**
 
 Run: `pnpm typecheck && pnpm exec vitest run packages/server/src/protocol.test.ts packages/server/src/websocket.test.ts`
 
 Expected: new protocol cases fail; legacy auth/message/history/subscribe tests stay green.
 
-- [ ] **Step 3: Extend closed ClientFrame/ServerFrame unions.**
+- [x] **Step 3: Extend closed ClientFrame/ServerFrame unions.**
 
 Use the exact types from the approved design: every successful server frame has a literal `type` and current request's `requestId`; bootstrap pages include `mode`, `catalogRevision`, checksum, and mode-specific expiry; repair pages include room watermark; complete uses `SnapshotVersion`. Extend protocol status to 410, 429, and 503 with stable codes.
 
-- [ ] **Step 4: Wire v2 sync and bounded subscription gate.**
+- [x] **Step 4: Wire v2 sync and bounded subscription gate.**
 
 `requirePrincipal` returns `AuthenticatedSessionContext`. v2 operations call `SyncService`, recheck connection credential generation immediately before send, and use the existing inbound/outbound byte limits. `room.subscribe.v2` registers an inactive gate, reads delta to a watermark, drains higher events by event ID, then activates. Gate limits are 256 events or 256 KiB; overflow removes the temporary subscription and returns `room.subscribe.v2.retry` with `restartFrom`.
 
 Keep legacy `room.history` and cursorless `room.subscribe` behavior byte-for-byte compatible: register first, return history, then continue live delivery. Do not make a missing cursor a legacy 400.
+
+Buzz 的 `register_scoped → stored ordered query → EVENT/EOSE` 在这里翻译为 inactive bounded room gate、authoritative cursor delta/watermark、按 durable `eventId` 去重后 drain/activate。为保留 `room.message.accepted` 的 `eventId + streamSeq`，OutboxDispatcher 的内部 send callback 同时传递完整 delivery envelope；它不进入 `ServerFrame` 或 package-root wire，legacy 客户端仍收到原有 `message.created`。这是 closed room cursor/requestId 合同对 Buzz Nostr filter/kind/community 模型的明确偏离。
 
 Run: `pnpm typecheck && pnpm exec vitest run packages/server/src/protocol.test.ts packages/server/src/websocket.test.ts packages/server/src/sync-service.test.ts && pnpm lint`
 

@@ -45,6 +45,7 @@ export interface OutboxDispatcherOptions {
   readonly send: (
     candidate: OutboxDispatchCandidate,
     frame: OutboxDispatchFrame,
+    delivery: OutboxDelivery,
   ) => Promise<OutboxSendResult> | OutboxSendResult;
   readonly batchSize?: number;
   readonly pollIntervalMs?: number;
@@ -116,7 +117,7 @@ export function createOutboxDispatcher(
 
           let result: OutboxSendResult;
           try {
-            result = await options.send(candidateSnapshot, frame);
+            result = await options.send(candidateSnapshot, frame, delivery);
           } catch {
             result = { accepted: false, reason: "send_rejected" };
           }

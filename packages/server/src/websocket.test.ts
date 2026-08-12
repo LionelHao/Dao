@@ -3,6 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
+import { SnapshotWorkerClientError } from "./persistence/snapshot-worker-client.js";
+import { AuthorityWorkerClientError } from "./persistence/worker-database-client.js";
 import {
   isMessage,
   type Actor,
@@ -33,6 +35,8 @@ import {
   type OutboxDispatchCandidate,
   type OutboxDispatchStore,
   type RoomLifecycleService,
+  type SyncService,
+  createSubscriptionRegistry,
 } from "./index.js";
 
 const humans = [
@@ -583,6 +587,1813 @@ afterEach(async () => {
 });
 
 describe("authenticated message WebSocket service", () => {
+  it("routes closed recovery frames through SyncService with current request IDs", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "v2-recovery");
+    const sessionContext = {
+      sessionId: "session-v2-recovery",
+      sessionFamilyId: "family-v2-recovery",
+      principal,
+    };
+    const auth: AuthenticationService = {
+      async login() {
+        return session;
+      },
+      async authenticate() {
+        return principal;
+      },
+      async authenticateSession() {
+        return sessionContext;
+      },
+      async refresh() {
+        return session;
+      },
+      async revoke() {},
+    };
+    const service: MessageService = {
+      async send(_context, message) {
+        return {
+          type: "message.accepted",
+          requestId: message.id,
+          messageId: message.id,
+          persistedAt: "2026-08-12T00:00:00.000Z",
+        };
+      },
+      subscribe() {
+        return () => undefined;
+      },
+      async history() {
+        return [];
+      },
+    };
+    const calls: string[] = [];
+    const sync: SyncService = {
+      async syncRoom(context, request) {
+        expect(context).toEqual(sessionContext);
+        expect(request).toMatchObject({ type: "room.sync", roomId });
+        calls.push("sync");
+        return {
+          type: "room.sync.result",
+          requestId: (request as { readonly requestId: string }).requestId,
+          mode: "delta",
+          events: [],
+          nextCursor: { version: 1, roomId, afterSeq: 4 },
+          watermark: 4,
+          hasMore: false,
+        };
+      },
+      async beginRoomRepair(context, requestId, targetRoomId) {
+        expect(context).toEqual(sessionContext);
+        expect(targetRoomId).toBe(roomId);
+        calls.push("repair-begin");
+        return {
+          type: "room.repair.page",
+          requestId,
+          snapshotId: "room-snapshot",
+          roomId,
+          page: 0,
+          records: [],
+          watermark: 4,
+          snapshotChecksum: "room-checksum",
+          hasMore: true,
+          mode: "materialized",
+          expiresAt: "2026-08-12T00:05:00.000Z",
+        };
+      },
+      async readRoomRepairPage(context, requestId, snapshotId, afterPage) {
+        expect(context).toEqual(sessionContext);
+        expect([snapshotId, afterPage]).toEqual(["room-snapshot", 0]);
+        calls.push("repair-page");
+        return {
+          type: "room.repair.page",
+          requestId,
+          snapshotId,
+          roomId,
+          page: 1,
+          records: [],
+          watermark: 4,
+          snapshotChecksum: "room-checksum",
+          hasMore: false,
+          mode: "materialized",
+          expiresAt: "2026-08-12T00:05:00.000Z",
+        };
+      },
+      async beginWorkspaceBootstrap(context, requestId) {
+        expect(context).toEqual(sessionContext);
+        calls.push("bootstrap-begin");
+        return {
+          type: "workspace.bootstrap.page",
+          requestId,
+          snapshotId: "catalog-snapshot",
+          page: 0,
+          rooms: [],
+          catalogRevision: 2,
+          snapshotChecksum: "catalog-checksum",
+          hasMore: true,
+          mode: "materialized",
+          expiresAt: "2026-08-12T00:05:00.000Z",
+        };
+      },
+      async readWorkspaceBootstrapPage(context, requestId, snapshotId, afterPage) {
+        expect(context).toEqual(sessionContext);
+        expect([snapshotId, afterPage]).toEqual(["catalog-snapshot", 0]);
+        calls.push("bootstrap-page");
+        return {
+          type: "workspace.bootstrap.page",
+          requestId,
+          snapshotId,
+          page: 1,
+          rooms: [],
+          catalogRevision: 2,
+          snapshotChecksum: "catalog-checksum",
+          hasMore: false,
+          mode: "materialized",
+          expiresAt: "2026-08-12T00:05:00.000Z",
+        };
+      },
+      async completeSnapshot(context, requestId, snapshotId, version, checksum) {
+        expect(context).toEqual(sessionContext);
+        expect([snapshotId, version, checksum]).toEqual([
+          "catalog-snapshot",
+          { kind: "catalog", catalogRevision: 2 },
+          "catalog-checksum",
+        ]);
+        calls.push("complete");
+        return { type: "snapshot.completed", requestId, snapshotId, version };
+      },
+      async releaseSnapshot() {},
+    };
+    const server = await startMessageWebSocketServer({ auth, service, sync });
+    const client = await LoopbackClient.connect(server.url);
+
+    try {
+      await client.login(humans[0]);
+      const requests = [
+        { type: "workspace.bootstrap.begin", requestId: "bootstrap-begin" },
+        {
+          type: "workspace.bootstrap.page",
+          requestId: "bootstrap-page",
+          snapshotId: "catalog-snapshot",
+          afterPage: 0,
+        },
+        {
+          type: "room.sync",
+          requestId: "sync",
+          roomId,
+          cursor: { version: 1, roomId, afterSeq: 0 },
+        },
+        { type: "room.repair.begin", requestId: "repair-begin", roomId },
+        {
+          type: "room.repair.page",
+          requestId: "repair-page",
+          snapshotId: "room-snapshot",
+          afterPage: 0,
+        },
+        {
+          type: "snapshot.complete",
+          requestId: "complete",
+          snapshotId: "catalog-snapshot",
+          version: { kind: "catalog", catalogRevision: 2 },
+          snapshotChecksum: "catalog-checksum",
+        },
+      ] as const;
+      for (const request of requests) {
+        client.send(request);
+        await expect(client.waitForFrame(
+          (frame) => isRecord(frame) && frame.requestId === request.requestId,
+          request.type,
+        )).resolves.toMatchObject({ frame: { requestId: request.requestId } });
+      }
+      expect(calls).toEqual([
+        "bootstrap-begin",
+        "bootstrap-page",
+        "sync",
+        "repair-begin",
+        "repair-page",
+        "complete",
+      ]);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("rejects malformed or mis-correlated recovery responses without sending them", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "v2-correlation");
+    const sessionContext = {
+      sessionId: "session-v2-correlation",
+      sessionFamilyId: "family-v2-correlation",
+      principal,
+    };
+    const auth: AuthenticationService = {
+      async login() { return session; },
+      async authenticate() { return principal; },
+      async authenticateSession() { return sessionContext; },
+      async refresh() { return session; },
+      async revoke() {},
+    };
+    const service: MessageService = {
+      async send(_context, message) {
+        return { type: "message.accepted", requestId: message.id, messageId: message.id,
+          persistedAt: "2026-08-12T00:00:00.000Z" };
+      },
+      subscribe() { return () => undefined; },
+      async history() { return []; },
+    };
+    const sync: SyncService = {
+      async syncRoom(_context, request) {
+        const valid = request.requestId === "valid-after-invalid";
+        return { type: "room.sync.result",
+          requestId: valid ? request.requestId : "wrong-sync-request",
+          mode: "delta", events: [],
+          nextCursor: { version: 1, roomId: valid ? roomId : "wrong-room", afterSeq: 0 },
+          watermark: 0, hasMore: false };
+      },
+      async beginRoomRepair(_context, requestId) {
+        return { type: "room.repair.page", requestId, snapshotId: "repair-correlation",
+          roomId: "wrong-room", page: 1, records: [], watermark: 0,
+          snapshotChecksum: "repair-correlation-checksum", hasMore: false,
+          mode: "materialized", expiresAt: "2026-08-12T00:05:00.000Z" };
+      },
+      async readRoomRepairPage(_context, requestId) {
+        return { type: "room.repair.page", requestId, snapshotId: "wrong-repair-snapshot",
+          roomId, page: 7, records: [], watermark: 0,
+          snapshotChecksum: "repair-correlation-checksum", hasMore: false,
+          mode: "materialized", expiresAt: "2026-08-12T00:05:00.000Z" };
+      },
+      async beginWorkspaceBootstrap(_context, requestId) {
+        return { type: "workspace.bootstrap.page", requestId: `${requestId}-wrong`,
+          snapshotId: "catalog-correlation", page: 0, rooms: [], catalogRevision: 1,
+          snapshotChecksum: "catalog-correlation-checksum", hasMore: false,
+          mode: "materialized", expiresAt: "2026-08-12T00:05:00.000Z" };
+      },
+      async readWorkspaceBootstrapPage(_context, requestId) {
+        return { type: "workspace.bootstrap.page", requestId,
+          snapshotId: "wrong-catalog-snapshot", page: 9, rooms: [], catalogRevision: 1,
+          snapshotChecksum: "catalog-correlation-checksum", hasMore: false,
+          mode: "materialized", expiresAt: "2026-08-12T00:05:00.000Z" };
+      },
+      async completeSnapshot(_context, requestId, snapshotId) {
+        return { type: "snapshot.completed", requestId, snapshotId,
+          version: { kind: "catalog", catalogRevision: 999 } };
+      },
+      async releaseSnapshot() {},
+    };
+    const server = await startMessageWebSocketServer({ auth, service, sync });
+    const client = await LoopbackClient.connect(server.url);
+
+    try {
+      await client.login(humans[0]);
+      const invalidRequests = [
+        { type: "workspace.bootstrap.begin", requestId: "invalid-bootstrap-begin" },
+        { type: "workspace.bootstrap.page", requestId: "invalid-bootstrap-page",
+          snapshotId: "catalog-correlation", afterPage: 0 },
+        { type: "room.sync", requestId: "invalid-room-sync", roomId,
+          cursor: { version: 1, roomId, afterSeq: 0 } },
+        { type: "room.repair.begin", requestId: "invalid-repair-begin", roomId },
+        { type: "room.repair.page", requestId: "invalid-repair-page",
+          snapshotId: "repair-correlation", afterPage: 0 },
+        { type: "snapshot.complete", requestId: "invalid-complete",
+          snapshotId: "catalog-correlation",
+          version: { kind: "catalog", catalogRevision: 1 },
+          snapshotChecksum: "catalog-correlation-checksum" },
+      ] as const;
+      for (const request of invalidRequests) {
+        client.send(request);
+        await expect(client.waitForError("storage_unavailable", request.requestId))
+          .resolves.toMatchObject({ frame: { status: 503 } });
+        expect(client.frameCount((frame) => isRecord(frame) &&
+          frame.requestId === request.requestId && frame.type !== "error")).toBe(0);
+      }
+      client.send({ type: "room.sync", requestId: "valid-after-invalid", roomId,
+        cursor: { version: 1, roomId, afterSeq: 0 } });
+      await client.waitForFrame(
+        (frame) => hasType(frame, "room.sync.result") &&
+          frame.requestId === "valid-after-invalid",
+        "valid recovery after invalid responses",
+      );
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it.each(["catalog", "room"] as const)(
+    "compares %s SnapshotVersion by meaning instead of object field order",
+    async (kind) => {
+      const principal = { accountId: "account-human-1", actorId: humans[0].id };
+      const session = issuedSession(principal, `snapshot-version-${kind}`);
+      const sessionContext = { sessionId: `session-snapshot-version-${kind}`,
+        sessionFamilyId: `family-snapshot-version-${kind}`, principal };
+      const auth: AuthenticationService = {
+        async login() { return session; }, async authenticate() { return principal; },
+        async authenticateSession() { return sessionContext; },
+        async refresh() { return session; }, async revoke() {},
+      };
+      const service: MessageService = {
+        async send(_context, message) {
+          return { type: "message.accepted", requestId: message.id, messageId: message.id,
+            persistedAt: "2026-08-12T00:00:00.000Z" };
+        },
+        subscribe() { return () => undefined; }, async history() { return []; },
+      };
+      const requestVersion = kind === "catalog"
+        ? { kind: "catalog" as const, catalogRevision: 4 }
+        : { kind: "room" as const, roomId, watermark: 7 };
+      const responseVersion = kind === "catalog"
+        ? { catalogRevision: 4, kind: "catalog" as const }
+        : { watermark: 7, roomId, kind: "room" as const };
+      const sync: SyncService = {
+        async syncRoom() { throw new Error("unused"); },
+        async beginRoomRepair() { throw new Error("unused"); },
+        async readRoomRepairPage() { throw new Error("unused"); },
+        async beginWorkspaceBootstrap() { throw new Error("unused"); },
+        async readWorkspaceBootstrapPage() { throw new Error("unused"); },
+        async completeSnapshot(_context, requestId, snapshotId) {
+          return { type: "snapshot.completed", requestId, snapshotId,
+            version: responseVersion };
+        },
+        async releaseSnapshot() {},
+      };
+      const server = await startMessageWebSocketServer({ auth, service, sync });
+      const client = await LoopbackClient.connect(server.url);
+      try {
+        await client.login(humans[0]);
+        client.send({ type: "snapshot.complete", requestId: `version-order-${kind}`,
+          snapshotId: `snapshot-version-${kind}`, version: requestVersion,
+          snapshotChecksum: "snapshot-version-checksum" });
+        await client.waitForFrame(
+          (frame) => hasType(frame, "snapshot.completed") &&
+            frame.requestId === `version-order-${kind}`,
+          `${kind} version completion`,
+        );
+      } finally {
+        await client.close();
+        await server.close();
+      }
+    },
+  );
+
+  it.each([
+    [new SnapshotWorkerClientError("invalid_token", "secret token"), 401, "invalid_token"],
+    [new SnapshotWorkerClientError("token_expired", "secret token"), 401, "token_expired"],
+    [new SnapshotWorkerClientError("session_revoked", "secret session"), 403, "session_revoked"],
+    [new SnapshotWorkerClientError("snapshot_family_revoked", "secret family"), 403, "snapshot_family_revoked"],
+    [new SnapshotWorkerClientError("snapshot_forbidden", "secret principal"), 403, "snapshot_forbidden"],
+    [new SnapshotWorkerClientError("snapshot_not_found", "/private/cache.sqlite"), 404, "snapshot_not_found"],
+    [new SnapshotWorkerClientError("snapshot_stale", "SELECT secret"), 409, "snapshot_stale"],
+    [new SnapshotWorkerClientError("snapshot_expired", "expired secret"), 410, "snapshot_expired"],
+    [new SnapshotWorkerClientError("snapshot_busy", "queue internals"), 429, "snapshot_busy"],
+    [new SnapshotWorkerClientError("snapshot_worker_closed", "worker details"), 503, "storage_unavailable"],
+    [new SnapshotWorkerClientError("snapshot_worker_error", "worker details"), 503, "storage_unavailable"],
+    [new SnapshotWorkerClientError("snapshot_worker_protocol_error", "bad envelope"), 503, "storage_unavailable"],
+    [new AuthorityWorkerClientError("repair_barrier_active", "authority internals"), 503, "repair_barrier_active"],
+    [new AuthorityWorkerClientError("authority_worker_closed", "worker details"), 503, "storage_unavailable"],
+    [new AuthorityWorkerClientError("authority_worker_error", "worker details"), 503, "storage_unavailable"],
+    [new AuthorityWorkerClientError("authority_worker_protocol_error", "bad envelope"), 503, "storage_unavailable"],
+    [new AuthorityWorkerClientError("storage_unavailable", "SQL secret"), 503, "storage_unavailable"],
+  ] as const)(
+    "maps a real worker error to stable %s/%s without leaking its message",
+    async (workerError, status, code) => {
+      const principal = { accountId: "account-human-1", actorId: humans[0].id };
+      const session = issuedSession(principal, `worker-error-${code}`);
+      const sessionContext = {
+        sessionId: `session-worker-error-${code}`,
+        sessionFamilyId: `family-worker-error-${code}`,
+        principal,
+      };
+      const auth: AuthenticationService = {
+        async login() { return session; },
+        async authenticate() { return principal; },
+        async authenticateSession() { return sessionContext; },
+        async refresh() { return session; },
+        async revoke() {},
+      };
+      const service: MessageService = {
+        async send(_context, message) {
+          return {
+            type: "message.accepted",
+            requestId: message.id,
+            messageId: message.id,
+            persistedAt: "2026-08-12T00:00:00.000Z",
+          };
+        },
+        subscribe() { return () => undefined; },
+        async history() { return []; },
+      };
+      const sync = {
+        async syncRoom() { throw workerError; },
+        async beginRoomRepair() { throw new Error("unused"); },
+        async readRoomRepairPage() { throw new Error("unused"); },
+        async beginWorkspaceBootstrap() { throw new Error("unused"); },
+        async readWorkspaceBootstrapPage() { throw new Error("unused"); },
+        async completeSnapshot() { throw new Error("unused"); },
+        async releaseSnapshot() {},
+      } satisfies SyncService;
+      const server = await startMessageWebSocketServer({ auth, service, sync });
+      const client = await LoopbackClient.connect(server.url);
+
+      try {
+        await client.login(humans[0]);
+        client.send({ type: "room.sync", requestId: `worker-error-${code}`, roomId });
+        const received = await client.waitForFrame(
+          (frame) => hasType(frame, "error") && frame.requestId === `worker-error-${code}`,
+          `worker error ${code}`,
+        );
+        expect(received.frame).toEqual({
+          type: "error",
+          status,
+          code,
+          message: code,
+          requestId: `worker-error-${code}`,
+        });
+        expect(JSON.stringify(received.frame)).not.toContain(workerError.message);
+      } finally {
+        await client.close();
+        await server.close();
+      }
+    },
+  );
+
+  it("does not send a deferred v2 result after its credential generation is revoked", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "v2-generation");
+    const sessionContext = {
+      sessionId: "session-v2-generation",
+      sessionFamilyId: "family-v2-generation",
+      principal,
+    };
+    const auth: AuthenticationService = {
+      async login() { return session; },
+      async authenticate() { return principal; },
+      async authenticateSession() {
+        if (expired) throw new AuthenticationError(401, "token_expired");
+        return sessionContext;
+      },
+      async refresh() { return session; },
+      async revoke() {},
+    };
+    const service: MessageService = {
+      async send(_context, message) {
+        return {
+          type: "message.accepted",
+          requestId: message.id,
+          messageId: message.id,
+          persistedAt: "2026-08-12T00:00:00.000Z",
+        };
+      },
+      subscribe() { return () => undefined; },
+      async history() { return []; },
+    };
+    const result = deferred<{
+      readonly type: "room.sync.result";
+      readonly requestId: string;
+      readonly mode: "repair_required";
+      readonly reason: "cursor_absent";
+      readonly retainedFromSeq: number;
+      readonly watermark: number;
+    }>();
+    const sync = {
+      async syncRoom() { return result.promise; },
+      async beginRoomRepair() { throw new Error("unused"); },
+      async readRoomRepairPage() { throw new Error("unused"); },
+      async beginWorkspaceBootstrap() { throw new Error("unused"); },
+      async readWorkspaceBootstrapPage() { throw new Error("unused"); },
+      async completeSnapshot() { throw new Error("unused"); },
+      async releaseSnapshot() {},
+    } satisfies SyncService;
+    const server = await startMessageWebSocketServer({ auth, service, sync });
+    const client = await LoopbackClient.connect(server.url);
+
+    try {
+      await client.login(humans[0]);
+      client.send({ type: "room.sync", requestId: "deferred-sync", roomId });
+      await vi.waitFor(() => expect(result.promise).toBeInstanceOf(Promise));
+      await client.close();
+      result.resolve({
+        type: "room.sync.result",
+        requestId: "deferred-sync",
+        mode: "repair_required",
+        reason: "cursor_absent",
+        retainedFromSeq: 1,
+        watermark: 0,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(client.frameCount(
+        (frame) => isRecord(frame) && frame.requestId === "deferred-sync",
+      )).toBe(0);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("releases a shared streaming snapshot only after its final connection owner closes", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "v2-release");
+    const sessionContext = {
+      sessionId: "session-v2-release",
+      sessionFamilyId: "family-v2-release",
+      principal,
+    };
+    const releaseSnapshot = vi.fn(async () => undefined);
+    const auth: AuthenticationService = {
+      async login() { return session; },
+      async authenticate() { return principal; },
+      async authenticateSession() { return sessionContext; },
+      async refresh() { return session; },
+      async revoke() {},
+    };
+    const service: MessageService = {
+      async send(_context, message) {
+        return {
+          type: "message.accepted",
+          requestId: message.id,
+          messageId: message.id,
+          persistedAt: "2026-08-12T00:00:00.000Z",
+        };
+      },
+      subscribe() { return () => undefined; },
+      async history() { return []; },
+    };
+    const sync = {
+      async syncRoom() { throw new Error("unused"); },
+      async beginRoomRepair() { throw new Error("unused"); },
+      async readRoomRepairPage() { throw new Error("unused"); },
+      async beginWorkspaceBootstrap(_context, requestId) {
+        return {
+          type: "workspace.bootstrap.page",
+          requestId,
+          snapshotId: "owned-streaming-snapshot",
+          page: 0,
+          rooms: [],
+          catalogRevision: 1,
+          snapshotChecksum: "streaming-checksum",
+          hasMore: false,
+          mode: "streaming",
+          idleExpiresAt: "2026-08-12T00:00:30.000Z",
+        } as const;
+      },
+      async readWorkspaceBootstrapPage(_context, requestId) {
+        return {
+          type: "workspace.bootstrap.page",
+          requestId,
+          snapshotId: "owned-streaming-snapshot",
+          page: 1,
+          rooms: [],
+          catalogRevision: 1,
+          snapshotChecksum: "streaming-checksum",
+          hasMore: false,
+          mode: "streaming",
+          idleExpiresAt: "2026-08-12T00:00:30.000Z",
+        } as const;
+      },
+      async completeSnapshot() { throw new Error("unused"); },
+      releaseSnapshot,
+    } satisfies SyncService;
+    const server = await startMessageWebSocketServer({ auth, service, sync });
+    const owner = await LoopbackClient.connect(server.url);
+    const peer = await LoopbackClient.connect(server.url);
+
+    try {
+      await owner.login(humans[0]);
+      await peer.login(humans[0], "peer-v2-release");
+      owner.send({ type: "workspace.bootstrap.begin", requestId: "owned-begin" });
+      peer.send({ type: "workspace.bootstrap.begin", requestId: "peer-owned-begin" });
+      await Promise.all([owner.waitForFrame(
+        (frame) => hasType(frame, "workspace.bootstrap.page") &&
+          frame.requestId === "owned-begin",
+        "owned streaming page",
+      ), peer.waitForFrame(
+        (frame) => hasType(frame, "workspace.bootstrap.page") &&
+          frame.requestId === "peer-owned-begin",
+        "peer owned streaming page",
+      )]);
+      await owner.close();
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(releaseSnapshot).not.toHaveBeenCalled();
+      peer.send({
+        type: "workspace.bootstrap.page",
+        requestId: "peer-owned-page",
+        snapshotId: "owned-streaming-snapshot",
+        afterPage: 0,
+      });
+      await peer.waitForFrame(
+        (frame) => hasType(frame, "workspace.bootstrap.page") &&
+          frame.requestId === "peer-owned-page",
+        "peer streaming continuation",
+      );
+      await peer.close();
+      await vi.waitFor(() => expect(releaseSnapshot).toHaveBeenCalledTimes(1));
+      expect(releaseSnapshot).toHaveBeenCalledWith(
+        sessionContext,
+        "owned-streaming-snapshot",
+      );
+    } finally {
+      await owner.close();
+      await peer.close();
+      await server.close();
+    }
+  });
+
+  it("keeps a streaming snapshot lease across access-token expiry and same-family refresh", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const expiredSession = issuedSession(principal, "streaming-expired");
+    const refreshedSession = issuedSession(principal, "streaming-refreshed");
+    const sessionContext = {
+      sessionId: "session-streaming-refresh",
+      sessionFamilyId: "family-streaming-refresh",
+      principal,
+    };
+    let expired = false;
+    const releaseSnapshot = vi.fn(async () => undefined);
+    const auth: AuthenticationService = {
+      async login() { return expiredSession; },
+      async authenticate() {
+        if (expired) throw new AuthenticationError(401, "token_expired");
+        return principal;
+      },
+      async authenticateSession() { return sessionContext; },
+      async refresh(refreshToken, expectedPrincipal) {
+        expect(refreshToken).toBe(expiredSession.refreshToken);
+        expect(expectedPrincipal).toEqual(principal);
+        expired = false;
+        return refreshedSession;
+      },
+      async revoke() {},
+    };
+    const service: MessageService = {
+      async send(_context, message) {
+        return { type: "message.accepted", requestId: message.id, messageId: message.id,
+          persistedAt: "2026-08-12T00:00:00.000Z" };
+      },
+      subscribe() { return () => undefined; },
+      async history() { return []; },
+    };
+    const sync = {
+      async syncRoom() { throw new Error("unused"); },
+      async beginRoomRepair() { throw new Error("unused"); },
+      async readRoomRepairPage(_context, requestId, snapshotId, afterPage) {
+        return { type: "room.repair.page", requestId, snapshotId, roomId,
+          page: afterPage + 1, records: [], watermark: 1,
+          snapshotChecksum: "refresh-checksum", hasMore: false, mode: "streaming",
+          idleExpiresAt: "2026-08-12T00:00:30.000Z" } as const;
+      },
+      async beginWorkspaceBootstrap(_context, requestId) {
+        return { type: "workspace.bootstrap.page", requestId,
+          snapshotId: "refresh-streaming-snapshot", page: 0, rooms: [], catalogRevision: 1,
+          snapshotChecksum: "refresh-checksum", hasMore: true, mode: "streaming",
+          idleExpiresAt: "2026-08-12T00:00:30.000Z" } as const;
+      },
+      async readWorkspaceBootstrapPage(_context, requestId, snapshotId, afterPage) {
+        return { type: "workspace.bootstrap.page", requestId, snapshotId,
+          page: afterPage + 1, rooms: [], catalogRevision: 1,
+          snapshotChecksum: "refresh-checksum", hasMore: false, mode: "streaming",
+          idleExpiresAt: "2026-08-12T00:00:30.000Z" } as const;
+      },
+      async completeSnapshot() { throw new Error("unused"); },
+      releaseSnapshot,
+    } satisfies SyncService;
+    const server = await startMessageWebSocketServer({ auth, service, sync });
+    const client = await LoopbackClient.connect(server.url);
+
+    try {
+      await client.login(humans[0]);
+      client.send({ type: "workspace.bootstrap.begin", requestId: "refresh-stream-begin" });
+      await client.waitForFrame(
+        (frame) => hasType(frame, "workspace.bootstrap.page") && frame.page === 0,
+        "refresh streaming first page",
+      );
+      expired = true;
+      client.send({ type: "workspace.bootstrap.page", requestId: "expired-stream-page",
+        snapshotId: "refresh-streaming-snapshot", afterPage: 0 });
+      await client.waitForError("token_expired", "expired-stream-page");
+      expect(releaseSnapshot).not.toHaveBeenCalled();
+      await client.refresh(expiredSession.refreshToken!, "refresh-stream-credential");
+      client.send({ type: "workspace.bootstrap.page", requestId: "refreshed-stream-page",
+        snapshotId: "refresh-streaming-snapshot", afterPage: 0 });
+      await client.waitForFrame(
+        (frame) => hasType(frame, "workspace.bootstrap.page") &&
+          frame.requestId === "refreshed-stream-page" && frame.page === 1,
+        "refreshed streaming continuation",
+      );
+      expect(releaseSnapshot).not.toHaveBeenCalled();
+    } finally {
+      await client.close();
+      await server.close();
+    }
+    expect(releaseSnapshot).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the family terminal route but removes room delivery after token expiry", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "expired-terminal-route");
+    const sessionContext = { sessionId: "session-expired-terminal-route",
+      sessionFamilyId: "family-expired-terminal-route", principal };
+    let expired = false;
+    const releaseSnapshot = vi.fn(async () => undefined);
+    const auth: AuthenticationService = {
+      async login() { return session; },
+      async authenticate() {
+        if (expired) throw new AuthenticationError(401, "token_expired");
+        return principal;
+      },
+      async authenticateSession() {
+        if (expired) throw new AuthenticationError(401, "token_expired");
+        return sessionContext;
+      },
+      async refresh() { return session; }, async revoke() {},
+    };
+    const service: MessageService = {
+      async send(_context, message) {
+        return { type: "message.accepted", requestId: message.id, messageId: message.id,
+          persistedAt: "2026-08-12T00:00:00.000Z" };
+      },
+      subscribe() { throw new Error("legacy listener must not be used"); },
+      async history() { return []; },
+    };
+    const sync: SyncService = {
+      async syncRoom() { throw new Error("unused"); },
+      async beginRoomRepair() { throw new Error("unused"); },
+      async readRoomRepairPage() { throw new Error("unused"); },
+      async beginWorkspaceBootstrap(_context, requestId) {
+        return { type: "workspace.bootstrap.page", requestId,
+          snapshotId: "expired-terminal-snapshot", page: 0, rooms: [], catalogRevision: 1,
+          snapshotChecksum: "expired-terminal-checksum", hasMore: true, mode: "streaming",
+          idleExpiresAt: "2026-08-12T00:00:30.000Z" };
+      },
+      async readWorkspaceBootstrapPage() { throw new Error("unused"); },
+      async completeSnapshot() { throw new Error("unused"); }, releaseSnapshot,
+    };
+    const pending = new Map<string, OutboxDelivery>();
+    const dispatched: string[] = [];
+    const store: OutboxDispatchStore = {
+      async listPendingOutbox(limit) { return [...pending.values()].slice(0, limit); },
+      async authorizeOutboxCandidate() { return true; },
+      async markOutboxDispatched(deliveryId) { dispatched.push(deliveryId); pending.delete(deliveryId); },
+      async markOutboxFailed() { throw new Error("terminal route must dispatch"); },
+    };
+    const registry = createSubscriptionRegistry();
+    const roomEvent: PersistedRoomEvent = { eventId: "expired-room-event",
+      streamKind: "room", streamId: roomId, streamSeq: 1, roomId,
+      actorId: humans[0].id, occurredAt: "2026-08-12T00:00:01.000Z",
+      type: "room.message.accepted", payload: messageFor(humans[0], "expired-room") };
+    const revokedEvent: PersistedIdentityEvent & { readonly type: "identity.session.revoked" } = {
+      eventId: "expired-terminal-revoked", streamKind: "identity",
+      streamId: humans[0].id, streamSeq: 2, actorId: humans[0].id,
+      occurredAt: "2026-08-12T00:00:02.000Z", type: "identity.session.revoked",
+      payload: { sessionId: sessionContext.sessionId,
+        familyId: sessionContext.sessionFamilyId, accountId: principal.accountId },
+    };
+    const server = await startMessageWebSocketServer({ auth, service, sync,
+      outboxStore: store, subscriptionRegistry: registry, outboxPollIntervalMs: 10 });
+    const client = await LoopbackClient.connect(server.url);
+    try {
+      await client.login(humans[0]);
+      client.send({ type: "workspace.bootstrap.begin", requestId: "expired-terminal-begin" });
+      await client.waitForFrame((frame) => hasType(frame, "workspace.bootstrap.page"),
+        "expired terminal snapshot owner");
+      await client.subscribe(roomId, "expired-terminal-subscribe");
+      expired = true;
+      client.send({ type: "room.history", requestId: "expired-terminal-action", roomId });
+      await client.waitForError("token_expired", "expired-terminal-action");
+      expect(registry.candidates({ targetKind: "room", targetId: roomId })).toEqual([]);
+      expect(registry.candidates({ targetKind: "session-family",
+        targetId: sessionContext.sessionFamilyId })).toHaveLength(1);
+      pending.set("expired-room-delivery", { deliveryId: "expired-room-delivery",
+        eventId: roomEvent.eventId, targetKind: "room", targetId: roomId,
+        streamSeq: 1, attempts: 0, event: roomEvent });
+      pending.set("expired-terminal-delivery", { deliveryId: "expired-terminal-delivery",
+        eventId: revokedEvent.eventId, targetKind: "session-family",
+        targetId: sessionContext.sessionFamilyId, streamSeq: 2, attempts: 0,
+        event: revokedEvent });
+      await client.waitForFrame((frame) => hasType(frame, "auth.session-revoked") &&
+        frame.eventId === revokedEvent.eventId, "expired terminal family frame");
+      await client.waitForClose();
+      await vi.waitFor(() => expect(dispatched).toContain("expired-terminal-delivery"));
+      expect(client.frameCount((frame) => hasMessageCreated(frame, "expired-room"))).toBe(0);
+      await vi.waitFor(() => expect(releaseSnapshot).toHaveBeenCalledTimes(1));
+    } finally {
+      await client.close(); await server.close();
+    }
+  });
+
+  it.each([
+    "snapshot_stale",
+    "snapshot_expired",
+    "snapshot_not_found",
+    "snapshot_family_revoked",
+    "snapshot_forbidden",
+  ] as const)("forgets all shared owners after terminal snapshot error %s", async (code) => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, `terminal-${code}`);
+    const sessionContext = {
+      sessionId: `session-terminal-${code}`,
+      sessionFamilyId: `family-terminal-${code}`,
+      principal,
+    };
+    const releaseSnapshot = vi.fn(async () => undefined);
+    const auth: AuthenticationService = {
+      async login() { return session; },
+      async authenticate() { return principal; },
+      async authenticateSession() { return sessionContext; },
+      async refresh() { return session; },
+      async revoke() {},
+    };
+    const service: MessageService = {
+      async send(_context, message) {
+        return { type: "message.accepted", requestId: message.id, messageId: message.id,
+          persistedAt: "2026-08-12T00:00:00.000Z" };
+      },
+      subscribe() { return () => undefined; },
+      async history() { return []; },
+    };
+    const sync = {
+      async syncRoom() { throw new Error("unused"); },
+      async beginRoomRepair() { throw new Error("unused"); },
+      async readRoomRepairPage() { throw new Error("unused"); },
+      async beginWorkspaceBootstrap(_context, requestId) {
+        return { type: "workspace.bootstrap.page", requestId,
+          snapshotId: `terminal-snapshot-${code}`, page: 0, rooms: [], catalogRevision: 1,
+          snapshotChecksum: "terminal-checksum", hasMore: true, mode: "streaming",
+          idleExpiresAt: "2026-08-12T00:00:30.000Z" } as const;
+      },
+      async readWorkspaceBootstrapPage() {
+        throw new SnapshotWorkerClientError(code, "secret terminal details");
+      },
+      async completeSnapshot() { throw new Error("unused"); },
+      releaseSnapshot,
+    } satisfies SyncService;
+    const server = await startMessageWebSocketServer({ auth, service, sync });
+    const first = await LoopbackClient.connect(server.url);
+    const second = await LoopbackClient.connect(server.url);
+
+    try {
+      await first.login(humans[0]);
+      await second.login(humans[0], `terminal-peer-${code}`);
+      for (const [client, requestId] of [[first, "first"], [second, "second"]] as const) {
+        client.send({ type: "workspace.bootstrap.begin", requestId: `${requestId}-begin-${code}` });
+        await client.waitForFrame(
+          (frame) => hasType(frame, "workspace.bootstrap.page") &&
+            frame.requestId === `${requestId}-begin-${code}`,
+          `${requestId} terminal owner`,
+        );
+      }
+      first.send({ type: "workspace.bootstrap.page", requestId: `terminal-page-${code}`,
+        snapshotId: `terminal-snapshot-${code}`, afterPage: 0 });
+      await first.waitForError(code, `terminal-page-${code}`);
+      await first.close();
+      await second.close();
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(releaseSnapshot).not.toHaveBeenCalled();
+    } finally {
+      await first.close();
+      await second.close();
+      await server.close();
+    }
+  });
+
+  it("gates a durable accepted-message event by eventId and streamSeq before v2 activation", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "v2-gate");
+    const sessionContext = {
+      sessionId: "session-v2-gate",
+      sessionFamilyId: "family-v2-gate",
+      principal,
+    };
+    const auth: AuthenticationService = {
+      async login() { return session; },
+      async authenticate() { return principal; },
+      async authenticateSession() { return sessionContext; },
+      async refresh() { return session; },
+      async revoke() {},
+    };
+    const service: MessageService = {
+      async send(_context, message) {
+        return {
+          type: "message.accepted",
+          requestId: message.id,
+          messageId: message.id,
+          persistedAt: "2026-08-12T00:00:00.000Z",
+        };
+      },
+      subscribe() {
+        throw new Error("v2 must not use the legacy message listener");
+      },
+      async history() {
+        throw new Error("v2 must not use legacy history");
+      },
+    };
+    const pending = new Map<string, OutboxDelivery>();
+    const store: OutboxDispatchStore = {
+      async listPendingOutbox(limit) {
+        return [...pending.values()].slice(0, limit);
+      },
+      async authorizeOutboxCandidate() { return true; },
+      async markOutboxDispatched(deliveryId) { pending.delete(deliveryId); },
+      async markOutboxFailed() { throw new Error("gate delivery must not fail"); },
+    };
+    const syncStarted = deferred<void>();
+    const syncResult = deferred<{
+      readonly type: "room.sync.result";
+      readonly requestId: string;
+      readonly mode: "delta";
+      readonly events: readonly [];
+      readonly nextCursor: {
+        readonly version: 1;
+        readonly roomId: string;
+        readonly afterSeq: number;
+        readonly watermark: number;
+      };
+      readonly watermark: number;
+      readonly hasMore: false;
+    }>();
+    const sync = {
+      async syncRoom() {
+        syncStarted.resolve();
+        return syncResult.promise;
+      },
+      async beginRoomRepair() { throw new Error("unused"); },
+      async readRoomRepairPage() { throw new Error("unused"); },
+      async beginWorkspaceBootstrap() { throw new Error("unused"); },
+      async readWorkspaceBootstrapPage() { throw new Error("unused"); },
+      async completeSnapshot() { throw new Error("unused"); },
+      async releaseSnapshot() {},
+    } satisfies SyncService;
+    const message = messageFor(humans[0], "v2-gated-message");
+    const event: PersistedRoomEvent = {
+      eventId: "event-v2-gated-message",
+      streamKind: "room",
+      streamId: roomId,
+      streamSeq: 1,
+      roomId,
+      actorId: humans[0].id,
+      occurredAt: message.sentAt,
+      type: "room.message.accepted",
+      payload: message,
+    };
+    const server = await startMessageWebSocketServer({
+      auth,
+      service,
+      sync,
+      outboxStore: store,
+      outboxPollIntervalMs: 10,
+    });
+    const client = await LoopbackClient.connect(server.url);
+
+    try {
+      await client.login(humans[0]);
+      client.send({
+        type: "room.subscribe.v2",
+        requestId: "subscribe-v2-gate",
+        roomId,
+        cursor: { version: 1, roomId, afterSeq: 0 },
+      });
+      await settlesWithin(syncStarted.promise, 100);
+      const queueDuplicate = (deliveryId: string) => pending.set(deliveryId, {
+        deliveryId,
+        eventId: event.eventId,
+        targetKind: "room",
+        targetId: roomId,
+        streamSeq: event.streamSeq,
+        attempts: 0,
+        event,
+      });
+      queueDuplicate("delivery-v2-gated-message-1");
+      queueDuplicate("delivery-v2-gated-message-duplicate");
+      await vi.waitFor(() => expect(pending.size).toBe(0));
+      syncResult.resolve({
+        type: "room.sync.result",
+        requestId: "subscribe-v2-gate",
+        mode: "delta",
+        events: [],
+        nextCursor: { version: 1, roomId, afterSeq: 0 },
+        watermark: 0,
+        hasMore: false,
+      });
+      await expect(client.waitForFrame(
+        (frame) => hasType(frame, "room.event") &&
+          isRecord(frame.event) && frame.event.eventId === event.eventId,
+        "gated accepted-message event envelope",
+      )).resolves.toMatchObject({ frame: { type: "room.event", event } });
+      expect(client.frameCount(
+        (frame) => hasType(frame, "room.event") && isRecord(frame.event) &&
+          frame.event.eventId === event.eventId,
+      )).toBe(1);
+      await expect(client.waitForFrame(
+        (frame) => hasType(frame, "room.subscribed.v2") &&
+          frame.requestId === "subscribe-v2-gate",
+        "v2 subscription activation",
+      )).resolves.toMatchObject({
+        frame: {
+          type: "room.subscribed.v2",
+          cursor: { version: 1, roomId, afterSeq: 1 },
+          watermark: 1,
+        },
+      });
+    } finally {
+      syncResult.resolve({
+        type: "room.sync.result",
+        requestId: "subscribe-v2-gate",
+        mode: "delta",
+        events: [],
+        nextCursor: { version: 1, roomId, afterSeq: 0 },
+        watermark: 0,
+        hasMore: false,
+      });
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("reads every delta page before draining the v2 gate and activating", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "v2-paged");
+    const sessionContext = {
+      sessionId: "session-v2-paged",
+      sessionFamilyId: "family-v2-paged",
+      principal,
+    };
+    const auth: AuthenticationService = {
+      async login() { return session; },
+      async authenticate() { return principal; },
+      async authenticateSession() { return sessionContext; },
+      async refresh() { return session; },
+      async revoke() {},
+    };
+    const service: MessageService = {
+      async send(_context, message) {
+        return {
+          type: "message.accepted",
+          requestId: message.id,
+          messageId: message.id,
+          persistedAt: "2026-08-12T00:00:00.000Z",
+        };
+      },
+      subscribe() { throw new Error("v2 must not use legacy listeners"); },
+      async history() { throw new Error("v2 must not use legacy history"); },
+    };
+    const eventFor = (sequence: number): PersistedRoomEvent => ({
+      eventId: `event-v2-paged-${sequence}`,
+      streamKind: "room",
+      streamId: roomId,
+      streamSeq: sequence,
+      roomId,
+      actorId: humans[0].id,
+      occurredAt: `2026-08-12T00:00:0${sequence}.000Z`,
+      type: "room.message.accepted",
+      payload: messageFor(humans[0], `v2-paged-${sequence}`),
+    });
+    const syncCursors: number[] = [];
+    const secondPage = deferred<void>();
+    const sync = {
+      async syncRoom(_context, request) {
+        const cursor = (request as { readonly cursor: { readonly afterSeq: number } }).cursor;
+        syncCursors.push(cursor.afterSeq);
+        if (cursor.afterSeq === 0) {
+          return {
+            type: "room.sync.result",
+            requestId: "subscribe-v2-paged",
+            mode: "delta",
+            events: [eventFor(1)],
+            nextCursor: { version: 1, roomId, afterSeq: 1, watermark: 3 },
+            watermark: 3,
+            hasMore: true,
+          } as const;
+        }
+        await secondPage.promise;
+        return {
+          type: "room.sync.result",
+          requestId: "subscribe-v2-paged",
+          mode: "delta",
+          events: [eventFor(2), eventFor(3)],
+          nextCursor: { version: 1, roomId, afterSeq: 3 },
+          watermark: 3,
+          hasMore: false,
+        } as const;
+      },
+      async beginRoomRepair() { throw new Error("unused"); },
+      async readRoomRepairPage() { throw new Error("unused"); },
+      async beginWorkspaceBootstrap() { throw new Error("unused"); },
+      async readWorkspaceBootstrapPage() { throw new Error("unused"); },
+      async completeSnapshot() { throw new Error("unused"); },
+      async releaseSnapshot() {},
+    } satisfies SyncService;
+    const pending = new Map<string, OutboxDelivery>();
+    const store: OutboxDispatchStore = {
+      async listPendingOutbox(limit) { return [...pending.values()].slice(0, limit); },
+      async authorizeOutboxCandidate() { return true; },
+      async markOutboxDispatched(deliveryId) { pending.delete(deliveryId); },
+      async markOutboxFailed() { throw new Error("paged gate delivery must not fail"); },
+    };
+    const server = await startMessageWebSocketServer({
+      auth,
+      service,
+      sync,
+      outboxStore: store,
+      outboxPollIntervalMs: 10,
+    });
+    const client = await LoopbackClient.connect(server.url);
+
+    try {
+      await client.login(humans[0]);
+      client.send({
+        type: "room.subscribe.v2",
+        requestId: "subscribe-v2-paged",
+        roomId,
+        cursor: { version: 1, roomId, afterSeq: 0 },
+      });
+      await vi.waitFor(() => expect(syncCursors).toEqual([0, 1]));
+      const live = eventFor(4);
+      pending.set("delivery-v2-paged-live", {
+        deliveryId: "delivery-v2-paged-live",
+        eventId: live.eventId,
+        targetKind: "room",
+        targetId: roomId,
+        streamSeq: live.streamSeq,
+        attempts: 0,
+        event: live,
+      });
+      await vi.waitFor(() => expect(pending.size).toBe(0));
+      expect(client.frameCount((frame) => hasType(frame, "room.subscribed.v2"))).toBe(0);
+      secondPage.resolve();
+      const subscribed = await client.waitForFrame(
+        (frame) => hasType(frame, "room.subscribed.v2") &&
+          frame.requestId === "subscribe-v2-paged",
+        "paged v2 subscription",
+      );
+      expect(subscribed.frame).toMatchObject({
+        cursor: { version: 1, roomId, afterSeq: 4 },
+        watermark: 4,
+      });
+      expect(isRecord(subscribed.frame) && isRecord(subscribed.frame.cursor)
+        ? Object.hasOwn(subscribed.frame.cursor, "watermark")
+        : true).toBe(false);
+      const syncFrames = [1, 3].map((afterSeq) => client.frameIndex(
+        (frame) => hasType(frame, "room.sync.result") &&
+          isRecord(frame.nextCursor) && frame.nextCursor.afterSeq === afterSeq,
+      ));
+      const liveIndex = client.frameIndex(
+        (frame) => hasType(frame, "room.event") && isRecord(frame.event) &&
+          frame.event.eventId === "event-v2-paged-4",
+      );
+      expect(syncFrames.every((index) => index >= 0)).toBe(true);
+      expect(syncFrames[0]).toBeLessThan(syncFrames[1]!);
+      expect(syncFrames[1]).toBeLessThan(liveIndex);
+      expect(syncCursors).toEqual([0, 1]);
+    } finally {
+      secondPage.resolve();
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it.each(["first", "middle"] as const)(
+    "rejects a wrong requestId on the %s v2 sync page",
+    async (wrongPage) => {
+      const principal = { accountId: "account-human-1", actorId: humans[0].id };
+      const session = issuedSession(principal, `v2-wrong-request-${wrongPage}`);
+      const sessionContext = { sessionId: `session-v2-wrong-request-${wrongPage}`,
+        sessionFamilyId: `family-v2-wrong-request-${wrongPage}`, principal };
+      const auth: AuthenticationService = {
+        async login() { return session; }, async authenticate() { return principal; },
+        async authenticateSession() { return sessionContext; },
+        async refresh() { return session; }, async revoke() {},
+      };
+      const service: MessageService = {
+        async send(_context, message) {
+          return { type: "message.accepted", requestId: message.id, messageId: message.id,
+            persistedAt: "2026-08-12T00:00:00.000Z" };
+        },
+        subscribe() { throw new Error("v2 must not use legacy listeners"); },
+        async history() { throw new Error("v2 must not use legacy history"); },
+      };
+      let calls = 0;
+      const firstEvent: PersistedRoomEvent = {
+        eventId: `event-v2-wrong-${wrongPage}`,
+        streamKind: "room", streamId: roomId, streamSeq: 1, roomId,
+        actorId: humans[0].id, occurredAt: "2026-08-12T00:00:01.000Z",
+        type: "room.message.accepted",
+        payload: messageFor(humans[0], `v2-wrong-${wrongPage}`),
+      };
+      const secondEvent: PersistedRoomEvent = {
+        ...firstEvent,
+        eventId: `${firstEvent.eventId}-2`,
+        streamSeq: 2,
+        occurredAt: "2026-08-12T00:00:02.000Z",
+      };
+      const sync = {
+        async syncRoom() {
+          calls += 1;
+          const first = calls === 1;
+          return { type: "room.sync.result",
+            requestId: wrongPage === (first ? "first" : "middle")
+              ? "wrong-subscribe-request" : `subscribe-v2-wrong-${wrongPage}`,
+            mode: "delta", events: first ? [firstEvent] : [secondEvent],
+            nextCursor: first
+              ? { version: 1, roomId, afterSeq: 1, watermark: 2 }
+              : { version: 1, roomId, afterSeq: 2 },
+            watermark: 2, hasMore: first } as const;
+        },
+        async beginRoomRepair() { throw new Error("unused"); },
+        async readRoomRepairPage() { throw new Error("unused"); },
+        async beginWorkspaceBootstrap() { throw new Error("unused"); },
+        async readWorkspaceBootstrapPage() { throw new Error("unused"); },
+        async completeSnapshot() { throw new Error("unused"); },
+        async releaseSnapshot() {},
+      } satisfies SyncService;
+      const registry = createSubscriptionRegistry();
+      const outboxStore: OutboxDispatchStore = {
+        async listPendingOutbox() { return []; },
+        async authorizeOutboxCandidate() { return true; },
+        async markOutboxDispatched() {}, async markOutboxFailed() {},
+      };
+      const server = await startMessageWebSocketServer({ auth, service, sync,
+        outboxStore, subscriptionRegistry: registry });
+      const client = await LoopbackClient.connect(server.url);
+      try {
+        await client.login(humans[0]);
+        client.send({ type: "room.subscribe.v2",
+          requestId: `subscribe-v2-wrong-${wrongPage}`, roomId,
+          cursor: { version: 1, roomId, afterSeq: 0 } });
+        await client.waitForError("storage_unavailable", `subscribe-v2-wrong-${wrongPage}`);
+        expect(client.frameCount((frame) => hasType(frame, "room.sync.result") &&
+          frame.requestId === "wrong-subscribe-request")).toBe(0);
+        expect(client.frameCount((frame) => hasType(frame, "room.subscribed.v2"))).toBe(0);
+        expect(registry.candidates({ targetKind: "room", targetId: roomId })).toEqual([]);
+      } finally {
+        await client.close();
+        await server.close();
+      }
+    },
+  );
+
+  it("orders out-of-order active deliveries without advancing across a sequence gap", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "v2-active-order");
+    const sessionContext = {
+      sessionId: "session-v2-active-order",
+      sessionFamilyId: "family-v2-active-order",
+      principal,
+    };
+    const auth: AuthenticationService = {
+      async login() { return session; },
+      async authenticate() { return principal; },
+      async authenticateSession() { return sessionContext; },
+      async refresh() { return session; },
+      async revoke() {},
+    };
+    const service: MessageService = {
+      async send(_context, message) {
+        return {
+          type: "message.accepted",
+          requestId: message.id,
+          messageId: message.id,
+          persistedAt: "2026-08-12T00:00:00.000Z",
+        };
+      },
+      subscribe() { throw new Error("v2 must not use legacy listeners"); },
+      async history() { throw new Error("v2 must not use legacy history"); },
+    };
+    const sync = {
+      async syncRoom() {
+        return {
+          type: "room.sync.result",
+          requestId: "subscribe-v2-active-order",
+          mode: "delta",
+          events: [],
+          nextCursor: { version: 1, roomId, afterSeq: 0 },
+          watermark: 0,
+          hasMore: false,
+        } as const;
+      },
+      async beginRoomRepair() { throw new Error("unused"); },
+      async readRoomRepairPage() { throw new Error("unused"); },
+      async beginWorkspaceBootstrap() { throw new Error("unused"); },
+      async readWorkspaceBootstrapPage() { throw new Error("unused"); },
+      async completeSnapshot() { throw new Error("unused"); },
+      async releaseSnapshot() {},
+    } satisfies SyncService;
+    const pending = new Map<string, OutboxDelivery>();
+    const dispatched: string[] = [];
+    const store: OutboxDispatchStore = {
+      async listPendingOutbox(limit) { return [...pending.values()].slice(0, limit); },
+      async authorizeOutboxCandidate() { return true; },
+      async markOutboxDispatched(deliveryId) {
+        dispatched.push(deliveryId);
+        pending.delete(deliveryId);
+      },
+      async markOutboxFailed() { throw new Error("active ordering send must not fail"); },
+    };
+    const eventFor = (sequence: number): PersistedRoomEvent => ({
+      eventId: `event-v2-active-order-${sequence}`,
+      streamKind: "room",
+      streamId: roomId,
+      streamSeq: sequence,
+      roomId,
+      actorId: humans[0].id,
+      occurredAt: `2026-08-12T00:00:0${sequence}.000Z`,
+      type: "room.message.accepted",
+      payload: messageFor(humans[0], `v2-active-order-${sequence}`),
+    });
+    const queue = (sequence: number) => {
+      const event = eventFor(sequence);
+      pending.set(`delivery-v2-active-order-${sequence}`, {
+        deliveryId: `delivery-v2-active-order-${sequence}`,
+        eventId: event.eventId,
+        targetKind: "room",
+        targetId: roomId,
+        streamSeq: event.streamSeq,
+        attempts: 0,
+        event,
+      });
+    };
+    const server = await startMessageWebSocketServer({
+      auth,
+      service,
+      sync,
+      outboxStore: store,
+      outboxPollIntervalMs: 10,
+    });
+    const client = await LoopbackClient.connect(server.url);
+
+    try {
+      await client.login(humans[0]);
+      client.send({
+        type: "room.subscribe.v2",
+        requestId: "subscribe-v2-active-order",
+        roomId,
+        cursor: { version: 1, roomId, afterSeq: 0 },
+      });
+      await client.waitForFrame(
+        (frame) => hasType(frame, "room.subscribed.v2") &&
+          frame.requestId === "subscribe-v2-active-order",
+        "active ordered subscription",
+      );
+      queue(2);
+      await vi.waitFor(() => expect(dispatched).toEqual(["delivery-v2-active-order-2"]));
+      expect(client.frameCount((frame) => hasType(frame, "room.event"))).toBe(0);
+      queue(1);
+      await vi.waitFor(() => expect(dispatched).toEqual([
+        "delivery-v2-active-order-2",
+        "delivery-v2-active-order-1",
+      ]));
+      await client.waitForFrame(
+        (frame) => hasType(frame, "room.event") && isRecord(frame.event) &&
+          frame.event.eventId === "event-v2-active-order-2",
+        "drained active event 2",
+      );
+      const received = [1, 2].map((sequence) => client.frameIndex(
+        (frame) => hasType(frame, "room.event") && isRecord(frame.event) &&
+          frame.event.eventId === `event-v2-active-order-${sequence}`,
+      ));
+      expect(received[0]).toBeLessThan(received[1]!);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("retries from the last contiguous cursor when an active gap buffer overflows", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "v2-active-overflow");
+    const sessionContext = {
+      sessionId: "session-v2-active-overflow",
+      sessionFamilyId: "family-v2-active-overflow",
+      principal,
+    };
+    const auth: AuthenticationService = {
+      async login() { return session; },
+      async authenticate() { return principal; },
+      async authenticateSession() { return sessionContext; },
+      async refresh() { return session; },
+      async revoke() {},
+    };
+    const service: MessageService = {
+      async send(_context, message) {
+        return {
+          type: "message.accepted",
+          requestId: message.id,
+          messageId: message.id,
+          persistedAt: "2026-08-12T00:00:00.000Z",
+        };
+      },
+      subscribe() { throw new Error("v2 must not use legacy listeners"); },
+      async history() { throw new Error("v2 must not use legacy history"); },
+    };
+    const sync = {
+      async syncRoom() {
+        return {
+          type: "room.sync.result",
+          requestId: "subscribe-v2-active-overflow",
+          mode: "delta",
+          events: [],
+          nextCursor: { version: 1, roomId, afterSeq: 0 },
+          watermark: 0,
+          hasMore: false,
+        } as const;
+      },
+      async beginRoomRepair() { throw new Error("unused"); },
+      async readRoomRepairPage() { throw new Error("unused"); },
+      async beginWorkspaceBootstrap() { throw new Error("unused"); },
+      async readWorkspaceBootstrapPage() { throw new Error("unused"); },
+      async completeSnapshot() { throw new Error("unused"); },
+      async releaseSnapshot() {},
+    } satisfies SyncService;
+    const pending = new Map<string, OutboxDelivery>();
+    const dispatched: string[] = [];
+    const store: OutboxDispatchStore = {
+      async listPendingOutbox(limit) { return [...pending.values()].slice(0, limit); },
+      async authorizeOutboxCandidate() { return true; },
+      async markOutboxDispatched(deliveryId) {
+        dispatched.push(deliveryId);
+        pending.delete(deliveryId);
+      },
+      async markOutboxFailed() { throw new Error("active overflow capture must be accepted"); },
+    };
+    const eventFor = (sequence: number): PersistedRoomEvent => ({
+        eventId: `event-v2-active-overflow-${sequence}`,
+        streamKind: "room",
+        streamId: roomId,
+        streamSeq: sequence,
+        roomId,
+        actorId: humans[0].id,
+        occurredAt: `2026-08-12T00:00:0${sequence}.000Z`,
+        type: "room.message.accepted",
+        payload: messageFor(humans[0], `v2-active-overflow-${sequence}`),
+    });
+    const queue = (sequence: number) => {
+      const event = eventFor(sequence);
+      pending.set(`delivery-v2-active-overflow-${sequence}`, {
+        deliveryId: `delivery-v2-active-overflow-${sequence}`,
+        eventId: event.eventId,
+        targetKind: "room",
+        targetId: roomId,
+        streamSeq: event.streamSeq,
+        attempts: 0,
+        event,
+      });
+    };
+    const registry = createSubscriptionRegistry();
+    const server = await startMessageWebSocketServer({
+      auth,
+      service,
+      sync,
+      outboxStore: store,
+      outboxPollIntervalMs: 10,
+      subscriptionRegistry: registry,
+      v2GateMaxEvents: 2,
+      v2GateMaxBytes: Buffer.byteLength(JSON.stringify(eventFor(3)), "utf8"),
+    });
+    const client = await LoopbackClient.connect(server.url);
+
+    try {
+      await client.login(humans[0]);
+      client.send({
+        type: "room.subscribe.v2",
+        requestId: "subscribe-v2-active-overflow",
+        roomId,
+        cursor: { version: 1, roomId, afterSeq: 0 },
+      });
+      const subscribed = await client.waitForFrame(
+        (frame) => hasType(frame, "room.subscribed.v2") &&
+          frame.requestId === "subscribe-v2-active-overflow",
+        "active overflow subscription",
+      );
+      expect(subscribed.frame).toMatchObject({
+        cursor: { version: 1, roomId, afterSeq: 0 },
+        watermark: 0,
+      });
+      expect(isRecord(subscribed.frame) && isRecord(subscribed.frame.cursor)
+        ? Object.hasOwn(subscribed.frame.cursor, "watermark")
+        : true).toBe(false);
+      queue(1);
+      await vi.waitFor(() => expect(dispatched).toEqual([
+        "delivery-v2-active-overflow-1",
+      ]));
+      await client.waitForFrame(
+        (frame) => hasType(frame, "room.event") && isRecord(frame.event) &&
+          frame.event.eventId === "event-v2-active-overflow-1",
+        "active contiguous event 1",
+      );
+      queue(3);
+      await vi.waitFor(() => expect(dispatched).toEqual([
+        "delivery-v2-active-overflow-1",
+        "delivery-v2-active-overflow-3",
+      ]));
+      expect(client.frameCount((frame) => hasType(frame, "room.event"))).toBe(1);
+      queue(4);
+      await vi.waitFor(() => expect(dispatched).toEqual([
+        "delivery-v2-active-overflow-1",
+        "delivery-v2-active-overflow-3",
+        "delivery-v2-active-overflow-4",
+      ]));
+      const retry = await client.waitForFrame(
+        (frame) => hasType(frame, "room.subscribe.v2.retry") &&
+          frame.requestId === "subscribe-v2-active-overflow",
+        "active overflow retry",
+      );
+      expect(retry.frame).toEqual({
+        type: "room.subscribe.v2.retry",
+        requestId: "subscribe-v2-active-overflow",
+        roomId,
+        reason: "gate_overflow",
+        restartFrom: { version: 1, roomId, afterSeq: 1 },
+      });
+      expect(registry.candidates({ targetKind: "room", targetId: roomId })).toEqual([]);
+      expect(client.frameCount((frame) => hasType(frame, "room.subscribed.v2"))).toBe(1);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("does not advance or drain higher active events when the next send fails", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "v2-active-send-failure");
+    const sessionContext = {
+      sessionId: "session-v2-active-send-failure",
+      sessionFamilyId: "family-v2-active-send-failure",
+      principal,
+    };
+    const auth: AuthenticationService = {
+      async login() { return session; },
+      async authenticate() { return principal; },
+      async authenticateSession() { return sessionContext; },
+      async refresh() { return session; },
+      async revoke() {},
+    };
+    const service: MessageService = {
+      async send(_context, message) {
+        return {
+          type: "message.accepted",
+          requestId: message.id,
+          messageId: message.id,
+          persistedAt: "2026-08-12T00:00:00.000Z",
+        };
+      },
+      subscribe() { throw new Error("v2 must not use legacy listeners"); },
+      async history() { throw new Error("v2 must not use legacy history"); },
+    };
+    const sync = {
+      async syncRoom() {
+        return {
+          type: "room.sync.result",
+          requestId: "subscribe-v2-active-send-failure",
+          mode: "delta",
+          events: [],
+          nextCursor: { version: 1, roomId, afterSeq: 0 },
+          watermark: 0,
+          hasMore: false,
+        } as const;
+      },
+      async beginRoomRepair() { throw new Error("unused"); },
+      async readRoomRepairPage() { throw new Error("unused"); },
+      async beginWorkspaceBootstrap() { throw new Error("unused"); },
+      async readWorkspaceBootstrapPage() { throw new Error("unused"); },
+      async completeSnapshot() { throw new Error("unused"); },
+      async releaseSnapshot() {},
+    } satisfies SyncService;
+    const pending = new Map<string, OutboxDelivery>();
+    const dispatched: string[] = [];
+    const failed: Array<{ readonly deliveryId: string; readonly reason: string }> = [];
+    const store: OutboxDispatchStore = {
+      async listPendingOutbox(limit) { return [...pending.values()].slice(0, limit); },
+      async authorizeOutboxCandidate() { return true; },
+      async markOutboxDispatched(deliveryId) {
+        dispatched.push(deliveryId);
+        pending.delete(deliveryId);
+      },
+      async markOutboxFailed(deliveryId, reason) {
+        failed.push({ deliveryId, reason });
+        pending.delete(deliveryId);
+      },
+    };
+    const queue = (sequence: number, body: string) => {
+      const event: PersistedRoomEvent = {
+        eventId: `event-v2-active-send-failure-${sequence}`,
+        streamKind: "room",
+        streamId: roomId,
+        streamSeq: sequence,
+        roomId,
+        actorId: humans[0].id,
+        occurredAt: `2026-08-12T00:00:0${sequence}.000Z`,
+        type: "room.message.accepted",
+        payload: { ...messageFor(humans[0], `v2-active-send-failure-${sequence}`), body },
+      };
+      pending.set(`delivery-v2-active-send-failure-${sequence}`, {
+        deliveryId: `delivery-v2-active-send-failure-${sequence}`,
+        eventId: event.eventId,
+        targetKind: "room",
+        targetId: roomId,
+        streamSeq: event.streamSeq,
+        attempts: 0,
+        event,
+      });
+    };
+    const server = await startMessageWebSocketServer({
+      auth,
+      service,
+      sync,
+      outboxStore: store,
+      outboxPollIntervalMs: 10,
+      maxBufferedAmountBytes: 512,
+    });
+    const client = await LoopbackClient.connect(server.url);
+
+    try {
+      await client.login(humans[0]);
+      client.send({
+        type: "room.subscribe.v2",
+        requestId: "subscribe-v2-active-send-failure",
+        roomId,
+        cursor: { version: 1, roomId, afterSeq: 0 },
+      });
+      await client.waitForFrame(
+        (frame) => hasType(frame, "room.subscribed.v2") &&
+          frame.requestId === "subscribe-v2-active-send-failure",
+        "active send failure subscription",
+      );
+      queue(2, "buffered higher event");
+      await vi.waitFor(() => expect(dispatched).toEqual([
+        "delivery-v2-active-send-failure-2",
+      ]));
+      queue(1, "界".repeat(512));
+      await expect(client.waitForClose()).resolves.toBeUndefined();
+      await vi.waitFor(() => expect(failed).toEqual([{
+        deliveryId: "delivery-v2-active-send-failure-1",
+        reason: "backpressure",
+      }]));
+      expect(client.frameCount((frame) => hasType(frame, "room.event"))).toBe(0);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("returns retry and removes the inactive v2 subscription when its event gate overflows", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "v2-overflow");
+    const sessionContext = {
+      sessionId: "session-v2-overflow",
+      sessionFamilyId: "family-v2-overflow",
+      principal,
+    };
+    const auth: AuthenticationService = {
+      async login() { return session; },
+      async authenticate() { return principal; },
+      async authenticateSession() { return sessionContext; },
+      async refresh() { return session; },
+      async revoke() {},
+    };
+    const service: MessageService = {
+      async send(_context, message) {
+        return {
+          type: "message.accepted",
+          requestId: message.id,
+          messageId: message.id,
+          persistedAt: "2026-08-12T00:00:00.000Z",
+        };
+      },
+      subscribe() { throw new Error("v2 must not use legacy listeners"); },
+      async history() { throw new Error("v2 must not use legacy history"); },
+    };
+    const pending = new Map<string, OutboxDelivery>();
+    const dispatched: string[] = [];
+    const store: OutboxDispatchStore = {
+      async listPendingOutbox(limit) { return [...pending.values()].slice(0, limit); },
+      async authorizeOutboxCandidate() { return true; },
+      async markOutboxDispatched(deliveryId) {
+        dispatched.push(deliveryId);
+        pending.delete(deliveryId);
+      },
+      async markOutboxFailed() { throw new Error("overflow capture must be accepted"); },
+    };
+    const syncStarted = deferred<void>();
+    const syncResult = deferred<{
+      readonly type: "room.sync.result";
+      readonly requestId: string;
+      readonly mode: "delta";
+      readonly events: readonly [];
+      readonly nextCursor: {
+        readonly version: 1;
+        readonly roomId: string;
+        readonly afterSeq: number;
+        readonly watermark: number;
+      };
+      readonly watermark: number;
+      readonly hasMore: false;
+    }>();
+    const sync = {
+      async syncRoom() {
+        syncStarted.resolve();
+        return syncResult.promise;
+      },
+      async beginRoomRepair() { throw new Error("unused"); },
+      async readRoomRepairPage() { throw new Error("unused"); },
+      async beginWorkspaceBootstrap() { throw new Error("unused"); },
+      async readWorkspaceBootstrapPage() { throw new Error("unused"); },
+      async completeSnapshot() { throw new Error("unused"); },
+      async releaseSnapshot() {},
+    } satisfies SyncService;
+    const eventFor = (sequence: number): PersistedRoomEvent => ({
+      eventId: `event-v2-overflow-${sequence}`,
+      streamKind: "room",
+      streamId: roomId,
+      streamSeq: sequence,
+      roomId,
+      actorId: humans[0].id,
+      occurredAt: `2026-08-12T00:00:0${sequence}.000Z`,
+      type: "room.message.accepted",
+      payload: messageFor(humans[0], `v2-overflow-${sequence}`),
+    });
+    const queue = (sequence: number) => {
+      const event = eventFor(sequence);
+      pending.set(`delivery-v2-overflow-${sequence}`, {
+        deliveryId: `delivery-v2-overflow-${sequence}`,
+        eventId: event.eventId,
+        targetKind: "room",
+        targetId: roomId,
+        streamSeq: event.streamSeq,
+        attempts: 0,
+        event,
+      });
+    };
+    const registry = createSubscriptionRegistry();
+    const server = await startMessageWebSocketServer({
+      auth,
+      service,
+      sync,
+      outboxStore: store,
+      outboxPollIntervalMs: 10,
+      v2GateMaxEvents: 1,
+      subscriptionRegistry: registry,
+    });
+    const client = await LoopbackClient.connect(server.url);
+
+    try {
+      await client.login(humans[0]);
+      client.send({
+        type: "room.subscribe.v2",
+        requestId: "subscribe-v2-overflow",
+        roomId,
+        cursor: { version: 1, roomId, afterSeq: 0 },
+      });
+      await settlesWithin(syncStarted.promise, 100);
+      queue(1);
+      queue(2);
+      await vi.waitFor(() => expect(dispatched).toEqual([
+        "delivery-v2-overflow-1",
+        "delivery-v2-overflow-2",
+      ]));
+      expect(() => registry.candidates({ targetKind: "room", targetId: roomId }))
+        .not.toThrow();
+      expect(registry.candidates({ targetKind: "room", targetId: roomId })).toEqual([]);
+      queue(3);
+      await vi.waitFor(() => expect(dispatched).toContain("delivery-v2-overflow-3"));
+      syncResult.resolve({
+        type: "room.sync.result",
+        requestId: "subscribe-v2-overflow",
+        mode: "delta",
+        events: [],
+        nextCursor: { version: 1, roomId, afterSeq: 0 },
+        watermark: 0,
+        hasMore: false,
+      });
+      await expect(client.waitForFrame(
+        (frame) => hasType(frame, "room.subscribe.v2.retry") &&
+          frame.requestId === "subscribe-v2-overflow",
+        "v2 overflow retry",
+      )).resolves.toMatchObject({
+        frame: {
+          type: "room.subscribe.v2.retry",
+          reason: "gate_overflow",
+          restartFrom: { version: 1, roomId, afterSeq: 0 },
+        },
+      });
+      expect(client.frameCount((frame) => hasType(frame, "room.subscribed.v2"))).toBe(0);
+      expect(client.frameCount((frame) => hasType(frame, "room.event"))).toBe(0);
+      await expect(client.waitForFrame(
+        (frame) => hasType(frame, "room.event") && isRecord(frame.event) &&
+          frame.event.eventId === "event-v2-overflow-3",
+        "post-overflow room event",
+        100,
+      )).rejects.toThrow("Timed out");
+    } finally {
+      syncResult.resolve({
+        type: "room.sync.result",
+        requestId: "subscribe-v2-overflow",
+        mode: "delta",
+        events: [],
+        nextCursor: { version: 1, roomId, afterSeq: 0 },
+        watermark: 0,
+        hasMore: false,
+      });
+      await client.close();
+      await server.close();
+    }
+  });
+
   it("dispatches the owner-approved closed outbox wire without legacy listeners", async () => {
     const principal = { accountId: "account-human-1", actorId: humans[0].id };
     const session = issuedSession(principal, "outbox-wire");

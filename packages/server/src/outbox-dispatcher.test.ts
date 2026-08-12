@@ -198,12 +198,16 @@ describe("OutboxDispatcher", () => {
     ];
     const store = new MemoryOutboxStore(deliveries, (item, candidate) =>
       item.targetKind !== "room" || candidate.connectionId === member.connectionId);
-    const sent: Array<{ readonly connectionId: string; readonly frame: unknown }> = [];
+    const sent: Array<{
+      readonly connectionId: string;
+      readonly frame: unknown;
+      readonly item: OutboxDelivery;
+    }> = [];
     const dispatcher = createOutboxDispatcher({
       store,
       registry,
-      send: async (candidate, frame) => {
-        sent.push({ connectionId: candidate.connectionId, frame });
+      send: async (candidate, frame, item) => {
+        sent.push({ connectionId: candidate.connectionId, frame, item });
         return { accepted: true };
       },
     });
@@ -213,10 +217,12 @@ describe("OutboxDispatcher", () => {
     expect(sent).toContainEqual({
       connectionId: member.connectionId,
       frame: { type: "message.created", message: roomEvent.payload },
+      item: deliveries[0],
     });
     expect(sent).toContainEqual({
       connectionId: member.connectionId,
       frame: { type: "room.event", event: roomReadEvent },
+      item: deliveries[1],
     });
     expect(sent).not.toContainEqual(expect.objectContaining({
       connectionId: removedRoomMember.connectionId,
@@ -224,10 +230,12 @@ describe("OutboxDispatcher", () => {
     expect(sent).toContainEqual({
       connectionId: removedPrincipal.connectionId,
       frame: principalEvent,
+      item: deliveries[2],
     });
     expect(sent).toContainEqual({
       connectionId: revokedFamily.connectionId,
       frame: { type: "auth.session-revoked", eventId: revokedEvent.eventId },
+      item: deliveries[3],
     });
     expect(revokedFamily.revoke).toHaveBeenCalledTimes(1);
     expect(store.authorizationCalls).toHaveLength(6);

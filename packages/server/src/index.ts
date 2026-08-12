@@ -113,15 +113,26 @@ export type {
   RoomHistoryFrame,
   RoomHistoryRequestFrame,
   RoomEventFrame,
+  RoomRepairBeginRequestFrame,
+  RoomRepairPageRequestFrame,
   RoomSubscribeFrame,
+  RoomSubscribeV2Frame,
+  RoomSubscribeV2RetryFrame,
   RoomSubscribedFrame,
+  RoomSubscribedV2Frame,
+  RoomSyncRequestFrame,
   ServerFrame,
+  SnapshotCompleteRequestFrame,
+  WorkspaceBootstrapPageRequestFrame,
+  WorkspaceBootstrapRequestFrame,
 } from "./protocol.js";
 export {
   MESSAGE_WEBSOCKET_MAX_BUFFERED_AMOUNT_BYTES,
   MESSAGE_WEBSOCKET_MAX_PAYLOAD_BYTES,
   MESSAGE_WEBSOCKET_MAX_QUEUED_FRAME_BYTES,
   MESSAGE_WEBSOCKET_MAX_QUEUED_FRAME_COUNT,
+  MESSAGE_WEBSOCKET_V2_GATE_MAX_BYTES,
+  MESSAGE_WEBSOCKET_V2_GATE_MAX_EVENTS,
   startMessageWebSocketServer,
 } from "./websocket.js";
 export type { MessageWebSocketServer, StartMessageWebSocketServerOptions } from "./websocket.js";
