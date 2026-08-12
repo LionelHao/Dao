@@ -53,6 +53,7 @@ interface AuthorityWorkerData {
   readonly databasePath: string;
   readonly recovery?: LegacyImportRecovery;
   readonly rollbackFailureForTest?: true;
+  readonly transactionFaultPoint?: "after-domain-write" | "before-commit";
 }
 
 function isAuthorityWorkerData(value: unknown): value is AuthorityWorkerData {
@@ -63,8 +64,12 @@ function isAuthorityWorkerData(value: unknown): value is AuthorityWorkerData {
   const keys = Object.keys(record).sort();
   if (typeof record.databasePath !== "string" || record.databasePath.length === 0 ||
       keys.some((key) =>
-        key !== "databasePath" && key !== "recovery" && key !== "rollbackFailureForTest") ||
-      (record.rollbackFailureForTest !== undefined && record.rollbackFailureForTest !== true)) {
+        key !== "databasePath" && key !== "recovery" && key !== "rollbackFailureForTest" &&
+        key !== "transactionFaultPoint") ||
+      (record.rollbackFailureForTest !== undefined && record.rollbackFailureForTest !== true) ||
+      (record.transactionFaultPoint !== undefined &&
+        record.transactionFaultPoint !== "after-domain-write" &&
+        record.transactionFaultPoint !== "before-commit")) {
     return false;
   }
   if (record.recovery === undefined) {
@@ -1146,6 +1151,14 @@ function executeHuman(request: AuthorityWorkerRequest): void {
       beforeApply(actorId) {
         gate = humanRepairGate(openedDatabase, request, actorId);
       },
+      ...(isAuthorityWorkerData(workerData) &&
+        workerData.transactionFaultPoint === "after-domain-write"
+        ? { afterDomainWrite: () => process.exit(81) }
+        : {}),
+      ...(isAuthorityWorkerData(workerData) &&
+        workerData.transactionFaultPoint === "before-commit"
+        ? { beforeCommit: () => process.exit(82) }
+        : {}),
     });
     respond({
       type: "authority.command-acknowledged",

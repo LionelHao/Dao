@@ -27,6 +27,7 @@ import {
 } from "./worker-database-client.js";
 import {
   AuthorityRollbackFatalError,
+  executeHumanDatabaseCommand,
   runAuthorityImmediateTransaction,
 } from "./authority-database-handler.js";
 import {
@@ -1235,6 +1236,69 @@ describe("public worker transport errors", () => {
 });
 
 describe("WorkerDatabaseClient", () => {
+  it("fires after-domain-write after the message fact but before event, outbox, and idempotency", () => {
+    const path = databasePath();
+    const context = {
+      kind: "human" as const,
+      sessionId: "domain-probe-access",
+      sessionFamilyId: "domain-probe-family",
+      principal: { accountId: "domain-probe-account", actorId: "domain-probe-human" },
+      requestId: "domain-probe-request",
+      idempotencyKey: "domain-probe-message",
+    };
+    const database = new DatabaseSync(path);
+    migrateAuthorityDatabase(database);
+    database.prepare(
+      `INSERT INTO actors (id, kind, display_name, reachability, readiness,
+         tool_permissions_json, catalog_revision)
+       VALUES (?, 'human', 'Probe', 'online', NULL, '[]', 0)`,
+    ).run(context.principal.actorId);
+    database.prepare(
+      "INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq) VALUES ('identity', ?, 0, 1)",
+    ).run(context.principal.actorId);
+    database.prepare(
+      `INSERT INTO sessions (family_id, account_id, actor_id, access_token_hash,
+         refresh_token_hash, access_expires_at, refresh_expires_at, revoked_at)
+       VALUES (?, ?, ?, ?, 'refresh', 10000, 20000, NULL)`,
+    ).run(context.sessionFamilyId, context.principal.accountId,
+      context.principal.actorId, context.sessionId);
+    database.prepare(
+      "INSERT INTO rooms (id, name, status, created_at) VALUES ('domain-probe-room', 'Probe', 'active', 't')",
+    ).run();
+    database.prepare(
+      `INSERT INTO room_memberships (room_id, actor_id, kind, role, participation,
+         tool_permissions_json, joined_at, configured_at, access_revision)
+       VALUES ('domain-probe-room', ?, 'human', 'owner', NULL, '[]', 't', NULL, 0)`,
+    ).run(context.principal.actorId);
+    database.prepare(
+      "INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq) VALUES ('room', 'domain-probe-room', 0, 1)",
+    ).run();
+    const probe = new Error("after-domain-write-probe");
+    expect(() => executeHumanDatabaseCommand(database, {
+      context,
+      command: {
+        type: "message.send",
+        roomId: "domain-probe-room",
+        payload: {
+          id: "domain-probe-message",
+          roomId: "domain-probe-room",
+          body: "probe",
+          sentAt: "2026-08-12T00:00:00.000Z",
+        },
+      },
+      now: 1_000,
+      afterDomainWrite() {
+        expect(database.prepare("SELECT COUNT(*) AS count FROM messages").get()).toEqual({ count: 1 });
+        expect(database.prepare("SELECT COUNT(*) AS count FROM events").get()).toEqual({ count: 0 });
+        expect(database.prepare("SELECT COUNT(*) AS count FROM outbox_deliveries").get()).toEqual({ count: 0 });
+        expect(database.prepare("SELECT COUNT(*) AS count FROM idempotency_records").get()).toEqual({ count: 0 });
+        throw probe;
+      },
+    })).toThrow(probe);
+    expect(database.prepare("SELECT COUNT(*) AS count FROM messages").get()).toEqual({ count: 0 });
+    database.close();
+  });
+
   it("serializes live snapshot revalidation with current session and revision state", async () => {
     const path = databasePath();
     const context = {

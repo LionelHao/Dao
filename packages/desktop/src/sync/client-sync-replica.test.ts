@@ -12,7 +12,7 @@ import type {
   SnapshotVersion,
   WorkspaceBootstrapPage,
 } from "@native-im/core";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   ClientSyncReplicaError,
@@ -149,12 +149,21 @@ class MemoryCache implements ClientAuthorityCache {
     if (this.#catalogStage === undefined) throw new Error("catalog staging absent");
     this.#catalogStage.rooms.push(...page.rooms);
   }
+  async finalizeCatalog(snapshotId: string, expectedChecksum: string): Promise<boolean> {
+    return this.#catalogStage?.id === snapshotId &&
+      checksum("catalog", this.#catalogStage.rooms) === expectedChecksum &&
+      new Set(this.#catalogStage.rooms.map((room) => room.roomId)).size ===
+        this.#catalogStage.rooms.length;
+  }
   commitCatalog(version: number, value: string): void {
     void version;
     void value;
     if (this.#catalogStage === undefined) throw new Error("catalog staging absent");
     this.#catalog = structuredClone(this.#catalogStage.rooms);
     this.#catalogStage = undefined;
+  }
+  *catalogRoomIds(): Iterable<string> {
+    for (const room of this.#catalog) yield room.roomId;
   }
   beginRoom(roomId: string, snapshotId: string): void {
     this.#roomStage.set(roomId, { id: snapshotId, records: [] });
@@ -163,6 +172,10 @@ class MemoryCache implements ClientAuthorityCache {
     const stage = this.#roomStage.get(page.roomId);
     if (stage === undefined) throw new Error("room staging absent");
     stage.records.push(...page.records);
+  }
+  async finalizeRoom(snapshotId: string, expectedChecksum: string): Promise<boolean> {
+    const stage = [...this.#roomStage.values()].find((candidate) => candidate.id === snapshotId);
+    return stage !== undefined && checksum("room", stage.records) === expectedChecksum;
   }
   commitRoom(roomId: string, watermark: number, value: string): void {
     void value;
@@ -279,6 +292,37 @@ function statusError(status: number): Error & { status: number } {
 }
 
 describe("ClientSyncReplica", () => {
+  it("keeps replica buffering O(page) and delegates staged canonical verification to the cache", async () => {
+    const transport = new FakeTransport();
+    const cache = new MemoryCache();
+    const records = Array.from({ length: 200 }, (_, index): RoomRepairRecord => ({
+      kind: "message",
+      value: {
+        id: `bounded-${index}`,
+        roomId: "room-1",
+        authorId: "human-1",
+        authorKind: "human",
+        body: `bounded-${index}`,
+        sentAt: "2026-08-12T00:00:00.000Z",
+      },
+    }));
+    const expectedChecksum = checksum("room", records);
+    transport.repairs.set("room-1", records.map((record, page) => repairPage({
+      page,
+      records: [record],
+      hasMore: page < records.length - 1,
+      snapshotChecksum: expectedChecksum,
+    })));
+    const digest = vi.spyOn(globalThis.crypto.subtle, "digest");
+    const replica = createClientSyncReplica({ transport, cache });
+
+    await replica.repairRoom("room-1");
+
+    expect(digest).not.toHaveBeenCalled();
+    expect(cache.liveRoom("room-1")?.records).toHaveLength(records.length);
+    digest.mockRestore();
+  });
+
   it("restores a materialized catalog and every discovered room", async () => {
     const transport = new FakeTransport();
     const cache = new MemoryCache();

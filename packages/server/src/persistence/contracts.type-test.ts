@@ -7,6 +7,7 @@ import type {
 } from "./contracts.js";
 import { mintInternalAgentCommandContext } from "./contracts.js";
 import type { CanonicalIdentityEventInput } from "./authority-database-handler.js";
+import type { StartAuthoritativeServerOptions } from "../index.js";
 
 // @ts-expect-error Internal Agent capabilities must not be exported from the package root.
 import type { InternalAgentCommandContext as PublicInternalAgentCommandContext } from "../index.js";
@@ -24,6 +25,9 @@ export type PackageRootSyncQueryStoreMustStayUnavailable = PublicSyncQueryStore;
 export type PackageRootSqliteFactoryMustStayUnavailable = typeof publicCreateSqliteAuthoritativeStore;
 export type PackageRootAuthoritativeLifecycleFactoryMustStayUnavailable =
   typeof publicCreateAuthoritativeRoomLifecycleService;
+type PublicStartOptionsWithFault = StartAuthoritativeServerOptions & {
+  readonly faultPoint: "before-commit";
+};
 
 type Assert<T extends true> = T;
 type DeliveryFor<Kind extends OutboxDelivery["targetKind"], Delivery = OutboxDelivery> =
@@ -144,4 +148,9 @@ export type HumanMessageCannotInjectAuthorKind = Assert<
 >;
 export type HumanContextHasServerPrincipal = Assert<
   AuthenticatedCommandContext["principal"] extends { readonly actorId: string } ? true : false
+>;
+export type PublicStartOptionsHaveNoFaultPoint = Assert<
+  PublicStartOptionsWithFault extends StartAuthoritativeServerOptions
+    ? "faultPoint" extends keyof StartAuthoritativeServerOptions ? false : true
+    : false
 >;

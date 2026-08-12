@@ -5,6 +5,12 @@ import {
   type WorkerDatabaseClient as InternalWorkerDatabaseClient,
 } from "./persistence/worker-database-client.js";
 
+export { startAuthoritativeServer } from "./authoritative-server.js";
+export type {
+  AuthoritativeServer,
+  StartAuthoritativeServerOptions,
+} from "./authoritative-server.js";
+
 export {
   AuthenticationError,
   createAuthenticationService,

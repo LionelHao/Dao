@@ -47,9 +47,12 @@ export interface ClientAuthorityCache {
   roomCursor(roomId: string): RoomCursor | undefined;
   beginCatalog(snapshotId: string): void;
   stageCatalogPage(page: WorkspaceBootstrapPage): void;
+  finalizeCatalog(snapshotId: string, expectedChecksum: string): Promise<boolean>;
   commitCatalog(version: number, checksum: string): void;
+  catalogRoomIds(): Iterable<string>;
   beginRoom(roomId: string, snapshotId: string): void;
   stageRoomPage(page: RoomRepairPage): void;
+  finalizeRoom(snapshotId: string, expectedChecksum: string): Promise<boolean>;
   commitRoom(roomId: string, watermark: number, checksum: string): void;
   applyRoomEvents(
     roomId: string,
@@ -89,29 +92,6 @@ interface SnapshotEnvelope {
   readonly snapshotId: string;
   readonly mode: "materialized" | "streaming";
   readonly checksum: string;
-}
-
-function canonicalJson(value: unknown): string {
-  if (value === null || typeof value === "boolean" || typeof value === "number" ||
-      typeof value === "string") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  if (typeof value === "object") {
-    const record = value as Record<string, unknown>;
-    return `{${Object.keys(record).sort().map((key) =>
-      `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
-  }
-  throw invalid("Snapshot contained a non-canonical value");
-}
-
-async function snapshotChecksum(
-  kind: "catalog" | "room",
-  values: readonly unknown[],
-): Promise<string> {
-  const digest = await globalThis.crypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(canonicalJson({ kind, values, version: 1 })),
-  );
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function invalid(message: string): ClientSyncReplicaError {
@@ -460,7 +440,6 @@ export function createClientSyncReplica(options: {
       checksum: first.snapshotChecksum,
       watermark: first.watermark,
     } as const;
-    const records = [...first.records];
     try {
       cache.beginRoom(roomId, first.snapshotId);
       cache.stageRoomPage(first);
@@ -472,10 +451,9 @@ export function createClientSyncReplica(options: {
         validateRoomPage(next, roomId, page.page + 1, envelope);
         if (next.requestId !== pageRequestId) throw invalid("Room repair response did not match its request");
         cache.stageRoomPage(next);
-        records.push(...next.records);
         page = next;
       }
-      if (await snapshotChecksum("room", records) !== first.snapshotChecksum) {
+      if (!await cache.finalizeRoom(first.snapshotId, first.snapshotChecksum)) {
         throw invalid("Room repair checksum did not match its records");
       }
       if (first.mode === "streaming") {
@@ -532,12 +510,9 @@ export function createClientSyncReplica(options: {
       mode: first.mode,
       checksum: first.snapshotChecksum,
     } as const;
-    const roomIds: string[] = [];
-    const rooms = [...first.rooms];
     try {
       cache.beginCatalog(first.snapshotId);
       cache.stageCatalogPage(first);
-      roomIds.push(...first.rooms.map((room) => room.roomId));
       let page = first;
       while (page.hasMore) {
         const pageRequestId = requestId("workspace-bootstrap-page");
@@ -549,15 +524,10 @@ export function createClientSyncReplica(options: {
           throw invalid("Catalog revision changed between pages");
         }
         cache.stageCatalogPage(next);
-        rooms.push(...next.rooms);
-        roomIds.push(...next.rooms.map((room) => room.roomId));
         page = next;
       }
-      if (await snapshotChecksum("catalog", rooms) !== first.snapshotChecksum) {
+      if (!await cache.finalizeCatalog(first.snapshotId, first.snapshotChecksum)) {
         throw invalid("Workspace bootstrap checksum did not match its rooms");
-      }
-      if (new Set(roomIds).size !== roomIds.length) {
-        throw invalid("Workspace bootstrap contained a duplicate room");
       }
       if (first.mode === "streaming") {
         await completeStreaming(first.snapshotId, {
@@ -572,7 +542,7 @@ export function createClientSyncReplica(options: {
       cache.discardSnapshot(first.snapshotId);
       throw cause;
     }
-    for (const roomId of roomIds) await repairRoom(roomId);
+    for (const roomId of cache.catalogRoomIds()) await repairRoom(roomId);
   };
 
   const restoreWorkspace = (): Promise<void> => {

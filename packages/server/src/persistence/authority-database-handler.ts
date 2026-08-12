@@ -60,6 +60,8 @@ export interface ExecuteHumanDatabaseCommandInput {
   };
   readonly now: number;
   readonly beforeApply?: (actorId: string) => void;
+  readonly afterDomainWrite?: () => void;
+  readonly beforeCommit?: () => void;
 }
 
 export interface ExecuteAgentDatabaseCommandInput {
@@ -95,10 +97,12 @@ export class AuthorityRollbackFatalError extends AggregateError {
 export function runAuthorityImmediateTransaction<Result>(
   database: DatabaseSync,
   operation: () => Result,
+  beforeCommit?: () => void,
 ): Result {
   database.exec("BEGIN IMMEDIATE");
   try {
     const result = operation();
+    beforeCommit?.();
     database.exec("COMMIT");
     return result;
   } catch (error: unknown) {
@@ -2191,6 +2195,7 @@ function executeMessageSend(
   eventId: string,
   scope: string,
   key: string,
+  afterDomainWrite?: () => void,
 ): CommandAcknowledgement {
   requireRoomMembership(database, actorId, command.roomId);
   const actor = database.prepare("SELECT kind FROM actors WHERE id = ?").get(actorId);
@@ -2215,6 +2220,7 @@ function executeMessageSend(
       message.body,
       message.sentAt,
     );
+  afterDomainWrite?.();
   const streamSeq = appendRoomEvent(database, {
     eventId,
     roomId: message.roomId,
@@ -2867,6 +2873,7 @@ export function executeHumanDatabaseCommand(
               eventId,
               scope,
               key,
+              input.afterDomainWrite,
             )
           : input.command.type === "human.read.record"
             ? executeHumanRead(database, actorId, input.command, acceptedAt, scope, key)
@@ -2901,5 +2908,5 @@ export function executeHumanDatabaseCommand(
                           : unreachableCommand(input.command);
       },
     });
-  });
+  }, input.beforeCommit);
 }

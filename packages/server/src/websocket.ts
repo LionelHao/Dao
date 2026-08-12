@@ -298,6 +298,14 @@ function closeWebSocketServer(server: WebSocketServer): Promise<void> {
   });
 }
 
+function throwCleanupFailures(message: string, results: readonly PromiseSettledResult<void>[]): void {
+  const failures = results.flatMap((result) =>
+    result.status === "rejected" ? [result.reason] : []);
+  if (failures.length > 0) {
+    throw new AggregateError(failures, message);
+  }
+}
+
 function safelyUnsubscribe(unsubscribe: (() => void) | undefined): void {
   try {
     unsubscribe?.();
@@ -1853,12 +1861,17 @@ export async function startMessageWebSocketServer(
     url: `ws://${host}:${address.port}`,
     close(): Promise<void> {
       closePromise ??= (async () => {
-        await outboxDispatcher?.close();
+        // Calling close first synchronously fences future dispatcher scheduling.
+        const dispatcherClose = outboxDispatcher?.close() ?? Promise.resolve();
         for (const socket of activeSockets) {
           abortAndTerminate(socket);
         }
-        await closeWebSocketServer(webSocketServer);
-        await closeHttpServer(httpServer);
+        const results = await Promise.allSettled([
+          dispatcherClose,
+          closeWebSocketServer(webSocketServer),
+          closeHttpServer(httpServer),
+        ]);
+        throwCleanupFailures("Message WebSocket server cleanup failed", results);
       })();
       return closePromise;
     },

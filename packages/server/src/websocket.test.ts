@@ -1,6 +1,8 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
+import { createServer as createTcpServer, type Socket } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
 import { SnapshotWorkerClientError } from "./persistence/snapshot-worker-client.js";
@@ -180,11 +182,24 @@ class LoopbackClient {
     });
   }
 
-  static async connect(url: string): Promise<LoopbackClient> {
+  static async connect(url: string, timeoutMs = 1_000): Promise<LoopbackClient> {
     const socket = new WebSocket(url);
     await new Promise<void>((resolve, reject) => {
-      socket.once("open", resolve);
-      socket.once("error", reject);
+      const cleanup = (): void => {
+        clearTimeout(deadline);
+        socket.off("open", onOpen);
+        socket.off("error", onError);
+      };
+      const onOpen = (): void => { cleanup(); resolve(); };
+      const onError = (error: Error): void => { cleanup(); reject(error); };
+      const deadline = setTimeout(() => {
+        cleanup();
+        socket.once("error", () => undefined);
+        socket.terminate();
+        reject(new Error(`Loopback WebSocket did not connect within ${timeoutMs}ms`));
+      }, timeoutMs);
+      socket.once("open", onOpen);
+      socket.once("error", onError);
     });
     return new LoopbackClient(socket);
   }
@@ -293,12 +308,25 @@ class LoopbackClient {
     return this.waitFor(predicate, description, timeoutMs);
   }
 
-  async close(): Promise<void> {
+  async close(timeoutMs = 1_000): Promise<void> {
     if (this.socket.readyState === WebSocket.CLOSED) {
       return;
     }
-    await new Promise<void>((resolve) => {
-      this.socket.once("close", resolve);
+    await new Promise<void>((resolve, reject) => {
+      const onClose = (): void => {
+        cleanup();
+        resolve();
+      };
+      const deadline = setTimeout(() => {
+        cleanup();
+        this.socket.terminate();
+        reject(new Error(`Loopback WebSocket did not close within ${timeoutMs}ms`));
+      }, timeoutMs);
+      const cleanup = (): void => {
+        clearTimeout(deadline);
+        this.socket.off("close", onClose);
+      };
+      this.socket.once("close", onClose);
       this.socket.close();
     });
   }
@@ -308,12 +336,24 @@ class LoopbackClient {
       return;
     }
     await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error("Timed out waiting for socket close")), timeoutMs);
-      this.socket.once("close", () => {
-        clearTimeout(timeout);
+      const onClose = (): void => {
+        cleanup();
         resolve();
-      });
+      };
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error("Timed out waiting for socket close"));
+      }, timeoutMs);
+      const cleanup = (): void => {
+        clearTimeout(timeout);
+        this.socket.off("close", onClose);
+      };
+      this.socket.once("close", onClose);
     });
+  }
+
+  closeListenerCountForTest(): number {
+    return this.socket.listenerCount("close");
   }
 
   frameIndex(predicate: (frame: unknown) => boolean): number {
@@ -378,6 +418,45 @@ class LoopbackClient {
       }
     }
   }
+}
+
+async function createStalledWebSocketPeer(handshake: boolean): Promise<{
+  readonly url: string;
+  readonly close: () => Promise<void>;
+}> {
+  const sockets = new Set<Socket>();
+  const server = createTcpServer((socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+    if (!handshake) return;
+    let request = "";
+    socket.on("data", (chunk: Buffer) => {
+      request += chunk.toString("utf8");
+      if (!request.includes("\r\n\r\n")) return;
+      const key = /sec-websocket-key:\s*(.+)\r\n/i.exec(request)?.[1]?.trim();
+      if (key === undefined) return;
+      const accept = createHash("sha1")
+        .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+        .digest("base64");
+      socket.write(
+        `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
+      );
+      socket.removeAllListeners("data");
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new TypeError("missing TCP port");
+  return {
+    url: `ws://127.0.0.1:${address.port}`,
+    async close() {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
 }
 
 function draftFor(id: string, room = roomId): MessageDraft {
@@ -587,6 +666,100 @@ afterEach(async () => {
 });
 
 describe("authenticated message WebSocket service", () => {
+  it("bounds stalled loopback connect, close, and close-wait listeners", async () => {
+    const stalledConnect = await createStalledWebSocketPeer(false);
+    try {
+      const outcome = await Promise.race([
+        LoopbackClient.connect(stalledConnect.url, 20)
+          .then(() => "connected", (error: unknown) => String(error)),
+        new Promise<string>((resolve) => setTimeout(() => resolve("outer-timeout"), 100)),
+      ]);
+      expect(outcome).toContain("within 20ms");
+    } finally {
+      await stalledConnect.close();
+    }
+
+    const stalledClose = await createStalledWebSocketPeer(true);
+    const client = await LoopbackClient.connect(stalledClose.url);
+    try {
+      const listenersBefore = client.closeListenerCountForTest();
+      await expect(client.waitForClose(20)).rejects.toThrow("Timed out");
+      expect(client.closeListenerCountForTest()).toBe(listenersBefore);
+      const outcome = await Promise.race([
+        client.close(20).then(() => "closed", (error: unknown) => String(error)),
+        new Promise<string>((resolve) => setTimeout(() => resolve("outer-timeout"), 100)),
+      ]);
+      expect(outcome).toContain("within 20ms");
+    } finally {
+      await stalledClose.close();
+    }
+  });
+  it("closes listeners and sockets even when an active outbox flush rejects", async () => {
+    const principal = { accountId: "account-close", actorId: humans[0].id };
+    const session = issuedSession(principal, "close-cleanup");
+    const activeFlush = deferred<readonly OutboxDelivery[]>();
+    const auth: AuthenticationService = {
+      async login() { return session; },
+      async authenticate() { return principal; },
+      async authenticateSession() {
+        return {
+          sessionId: session.accessToken,
+          sessionFamilyId: "family-close",
+          principal,
+        };
+      },
+      async refresh() { return session; },
+      async revoke() {},
+    };
+    const service: MessageService = {
+      async send(_actorId, message) {
+        return {
+          type: "message.accepted",
+          requestId: message.id,
+          messageId: message.id,
+          persistedAt: "2026-08-12T00:00:00.000Z",
+        };
+      },
+      subscribe() { return () => undefined; },
+      async history() { return []; },
+    };
+    const outboxStore: OutboxDispatchStore = {
+      listPendingOutbox: () => activeFlush.promise,
+      async authorizeOutboxCandidate() { return true; },
+      async markOutboxDispatched() {},
+      async markOutboxFailed() {},
+    };
+    const server = await startMessageWebSocketServer({ auth, service, outboxStore });
+    const client = await LoopbackClient.connect(server.url);
+    let unexpectedClient: LoopbackClient | undefined;
+
+    try {
+      const firstClose = server.close();
+      const secondClose = server.close();
+      const firstResultPromise = firstClose.then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      expect(secondClose).toBe(firstClose);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      try {
+        unexpectedClient = await LoopbackClient.connect(server.url);
+      } catch {
+        // Listener rejection is the expected state while the failed flush is settling.
+      }
+      expect(unexpectedClient).toBeUndefined();
+      await client.waitForClose();
+      activeFlush.reject(new Error("active outbox close failed"));
+      const firstResult = await firstResultPromise;
+      expect(firstResult).toBeInstanceOf(AggregateError);
+      await expect(secondClose).rejects.toBe(firstResult);
+    } finally {
+      activeFlush.reject(new Error("active outbox close failed"));
+      await unexpectedClient?.close();
+      await server.close().catch(() => undefined);
+    }
+  });
+
   it("routes closed recovery frames through SyncService with current request IDs", async () => {
     const principal = { accountId: "account-human-1", actorId: humans[0].id };
     const session = issuedSession(principal, "v2-recovery");
@@ -1027,10 +1200,7 @@ describe("authenticated message WebSocket service", () => {
     const auth: AuthenticationService = {
       async login() { return session; },
       async authenticate() { return principal; },
-      async authenticateSession() {
-        if (expired) throw new AuthenticationError(401, "token_expired");
-        return sessionContext;
-      },
+      async authenticateSession() { return sessionContext; },
       async refresh() { return session; },
       async revoke() {},
     };
@@ -1054,8 +1224,12 @@ describe("authenticated message WebSocket service", () => {
       readonly retainedFromSeq: number;
       readonly watermark: number;
     }>();
+    const syncRoomEntered = deferred<void>();
     const sync = {
-      async syncRoom() { return result.promise; },
+      async syncRoom() {
+        syncRoomEntered.resolve();
+        return result.promise;
+      },
       async beginRoomRepair() { throw new Error("unused"); },
       async readRoomRepairPage() { throw new Error("unused"); },
       async beginWorkspaceBootstrap() { throw new Error("unused"); },
@@ -1069,7 +1243,7 @@ describe("authenticated message WebSocket service", () => {
     try {
       await client.login(humans[0]);
       client.send({ type: "room.sync", requestId: "deferred-sync", roomId });
-      await vi.waitFor(() => expect(result.promise).toBeInstanceOf(Promise));
+      await syncRoomEntered.promise;
       await client.close();
       result.resolve({
         type: "room.sync.result",

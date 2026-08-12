@@ -620,12 +620,14 @@ function createAuthorityWorker(
   options: CreateWorkerDatabaseClientOptions,
   recovery: LegacyImportRecovery | undefined,
   rollbackFailureForTest = false,
+  transactionFaultPoint?: "after-domain-write" | "before-commit",
 ): AuthorityWorkerTransport {
   return new Worker(authorityWorkerUrl(), {
     workerData: {
       databasePath: options.databasePath,
       ...(recovery === undefined ? {} : { recovery }),
       ...(rollbackFailureForTest ? { rollbackFailureForTest: true } : {}),
+      ...(transactionFaultPoint === undefined ? {} : { transactionFaultPoint }),
     },
   });
 }
@@ -1529,5 +1531,15 @@ export function createWorkerDatabaseClientWithRollbackFailureForTest(
 ): Promise<WorkerDatabaseClient> {
   return createClient(options, (databasePath, recovery) =>
     createAuthorityWorker({ databasePath }, recovery, true),
+  );
+}
+
+// Deep-only real-worker crash seam; intentionally absent from the package root.
+export function createWorkerDatabaseClientWithTransactionFaultForTest(
+  options: CreateWorkerDatabaseClientOptions,
+  faultPoint: "after-domain-write" | "before-commit",
+): Promise<WorkerDatabaseClient> {
+  return createClient(options, (databasePath, recovery) =>
+    createAuthorityWorker({ databasePath }, recovery, false, faultPoint),
   );
 }
