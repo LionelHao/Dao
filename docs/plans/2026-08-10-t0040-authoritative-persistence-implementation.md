@@ -1278,7 +1278,7 @@ Propose `feat(desktop): restore authoritative client replica`. Risks: staging cl
 
 - Modify: `docs/plans/2026-08-10-t0040-authoritative-persistence-implementation.md`（机械记录 Task 13 实际扩围与理由）
 - Modify: `package.json`（把独立 Vitest ProjectConfig strict `tsc` 合同纳入常规 `typecheck`，防止 unsupported project option 回归）
-- Modify: `vitest.config.ts`（Node 22.13.1 下将 authority E2E 与 snapshot worker client 放入后置 heavy project，并用 Vitest 3.2.7 project-supported `poolOptions.forks.singleFork` 只在该 project 内单 worker 串行，其他 23 个测试文件仍并行；不改 timeout）
+- Modify: `vitest.config.ts`（将 authority E2E、snapshot worker client 与 1,001-event sync-service 压力测试放入后置 heavy project，用 Vitest 3.2.7 project-supported `poolOptions.forks.singleFork` 只在该 project 内单 worker 串行，并设置 project-local 15 秒预算；其他 22 个测试文件仍并行且保持默认 5 秒）
 - Create: `packages/server/src/authoritative-server.ts`
 - Create: `packages/server/src/authority.e2e.test.ts`
 - Create: `packages/server/src/fixtures/authority-child.ts`
@@ -1298,7 +1298,7 @@ Propose `feat(desktop): restore authoritative client replica`. Risks: staging cl
 - Modify: `packages/desktop/src/sync/client-sync-replica.test.ts`
 - Modify: `docs/plans/2026-08-10-t0040-authoritative-persistence-design.md`（机械同步 authority 当前 schema v5 事实）
 
-Task 13 实现时，真实事务内的 `after-domain-write` / `before-commit` 故障点无法由原七个文件到达，因此经范围批准增加以上三个 persistence 生产文件，并机械修改相邻 worker test 与 package-root type-test 锁住 hook 时点和 public seam 不泄漏；renderer 原接口又只生成固定 preview、无法消费恢复记录，因此另批准 `app.ts` 增加闭合 typed verified-fixture 输入。Node 22.13.1 standard full 并行时，既有 10k snapshot 与本任务 10k E2E 竞争导致原生 5 秒 timeout，因此另批准把 `authority.e2e.test.ts` 与 `snapshot-worker-client.test.ts` 放入后置 heavy project，并以 `pool: "forks"` + project-supported `poolOptions.forks.singleFork: true` 让该 project 共用一个 fork；其余 23 个 files 保持并行且不改 timeout。独立 strict `tsc` 配置合同锁住 `defineProject` 合法，runtime reporter 证明两 heavy modules 的最大同时活跃数为 1。接缝仅由 workerData/deep-only test factory 传递，未修改 public wire、schema 或 `worker-protocol.ts`，renderer 无参数行为保持兼容。
+Task 13 实现时，真实事务内的 `after-domain-write` / `before-commit` 故障点无法由原七个文件到达，因此经范围批准增加以上三个 persistence 生产文件，并机械修改相邻 worker test 与 package-root type-test 锁住 hook 时点和 public seam 不泄漏；renderer 原接口又只生成固定 preview、无法消费恢复记录，因此另批准 `app.ts` 增加闭合 typed verified-fixture 输入。Node 22.13.1 standard full 并行时，既有 10k snapshot 与本任务 10k E2E 竞争导致原生 5 秒 timeout，因此把 `authority.e2e.test.ts`、`snapshot-worker-client.test.ts` 和同样使用真实 SQLite/Worker 的 1,001-event `sync-service.test.ts` 放入后置 heavy project，并以 `pool: "forks"` + project-supported `poolOptions.forks.singleFork: true` 让该 project 共用一个 fork。GitHub `ubuntu-latest` 上这些压力验收在默认 5 秒边界超时，因此只为 heavy project 设置 15 秒 test budget；其余 22 个 files 保持并行和默认 5 秒，不减少压力数据或放宽任何业务 deadline。独立 strict `tsc` 配置合同锁住 `defineProject` 合法，runtime reporter 证明 heavy modules 的最大同时活跃数为 1。接缝仅由 workerData/deep-only test factory 传递，未修改 public wire、schema 或 `worker-protocol.ts`，renderer 无参数行为保持兼容。
 
 最终质量审查又批准最小扩围 WebSocket close 与 `ClientSyncReplica`：transport close 先封 dispatcher 并穷尽 socket/ws/http cleanup，composition 即使上游失败也依序关闭 snapshot/worker；replica 不再额外累计全量 records/rooms，而把 staging canonical checksum、catalog room IDs 与最终 commit 交给 cache port，保持 replica 自身 O(page)。相邻测试机械更新；E2E memory cache 则作为测试 adapter 刻意保存完整 10k values 并独立重算 checksum。renderer typed 输入在改 DOM 前经 core closed guards、顶层 exact envelope、unique message target 与 preview 关联校验，恢复的 read/judgement 按 `messageId` 挂载而不按作者 kind 猜测。E2E/loopback helper 对 JSON、child exit、TERM→KILL、WebSocket connect/close/wait 都使用有界 deadline 并清理 listener，fixture 故障不能无限挂住门禁。
 
