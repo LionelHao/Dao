@@ -7,7 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   migrateAuthorityDatabase,
-  migrateAuthorityDatabaseToPreviousVersionForTest,
+  migrateAuthorityDatabaseToVersion3ForTest,
   migrateSnapshotCacheDatabase,
 } from "./schema.js";
 import {
@@ -24,12 +24,15 @@ import {
   createSnapshotWorkerClient,
   createSnapshotWorkerClientForTest,
   createSnapshotWorkerClientWithPauseForTest,
+  type StreamingRepairAuthority,
   type SnapshotWorkerTransport,
 } from "./snapshot-worker-client.js";
 import type {
   AuthenticatedSessionContext,
   SnapshotWorkerRequest,
+  StreamingRepairLease,
 } from "./contracts.js";
+import { mintInternalAgentCommandContext } from "./contracts.js";
 import { createWorkerDatabaseClient } from "./worker-database-client.js";
 
 const temporaryDirectories: string[] = [];
@@ -111,6 +114,66 @@ function seedRoom(
   }
 }
 
+function seedClosedMixedStressRecords(
+  database: DatabaseSync,
+  context: AuthenticatedSessionContext,
+  roomId: string,
+): void {
+  database.prepare(
+    `INSERT INTO actors (
+       id, kind, display_name, reachability, readiness, tool_permissions_json
+     ) VALUES ('stress-agent', 'agent', 'Stress Agent', NULL, 'ready', '["review.read"]')`,
+  ).run();
+  database.prepare(
+    `INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+     VALUES ('identity', 'stress-agent', 0, 1)`,
+  ).run();
+  database.prepare(
+    `UPDATE messages
+     SET author_id = 'stress-agent', author_kind = 'agent'
+     WHERE id = 'message-9999' AND room_id = ?`,
+  ).run(roomId);
+  database.prepare(
+    `INSERT INTO room_memberships (
+       room_id, actor_id, kind, role, participation, tool_permissions_json,
+       joined_at, configured_at, access_revision
+     ) VALUES (?, 'stress-agent', 'agent', NULL, 'active', '["review.read"]',
+       NULL, '2026-08-11T00:00:00.000Z', 1)`,
+  ).run(roomId);
+  database.prepare(
+    `INSERT INTO human_read_receipts (room_id, actor_id, message_id, read_at)
+     VALUES (?, ?, 'message-0000', '2026-08-11T01:00:00.000Z')`,
+  ).run(roomId, context.principal.actorId);
+  const judgment = { id: "stress-judgment", messageId: "message-0000",
+    agentId: "stress-agent", outcome: "will_respond", reason: "stress",
+    decidedAt: "2026-08-11T01:00:01.000Z" };
+  database.prepare(
+    `INSERT INTO agent_judgments (
+       id, room_id, agent_id, message_id, judgment_json, created_at
+     ) VALUES ('stress-judgment', ?, 'stress-agent', 'message-0000', ?, ?)`,
+  ).run(roomId, JSON.stringify(judgment), judgment.decidedAt);
+  database.prepare(
+    `INSERT INTO open_items (
+       id, room_id, source_message_id, assigned_actor_id, status, body,
+       created_at, resolved_at, requester_actor_id, transfer_chain_json, responded_at
+     ) VALUES ('stress-open', ?, 'message-0000', 'stress-agent', 'pending_response',
+       'stress item', '2026-08-11T01:00:02.000Z', NULL, ?, '[]', NULL)`,
+  ).run(roomId, context.principal.actorId);
+  database.prepare(
+    `INSERT INTO agent_executions (
+       id, room_id, agent_id, trigger_message_id, status, started_at,
+       completed_at, result_json, requester_actor_id, tool_name
+     ) VALUES ('stress-execution', ?, 'stress-agent', 'message-0000', 'completed',
+       '2026-08-11T01:00:03.000Z', '2026-08-11T01:00:04.000Z', '"ok"', ?, 'review')`,
+  ).run(roomId, context.principal.actorId);
+  database.prepare(
+    `INSERT INTO calibration_signals (
+       id, room_id, agent_id, judgment_id, signal, created_at, source_message_id, actor_id
+     ) VALUES ('stress-calibration', ?, 'stress-agent', NULL, '👍',
+       '2026-08-11T01:00:05.000Z', 'message-9999', ?)`,
+  ).run(roomId, context.principal.actorId);
+}
+
 async function createDatabaseFixture(options: {
   readonly rooms?: readonly { readonly roomId: string; readonly messageCount?: number;
     readonly body?: (index: number) => string }[];
@@ -124,10 +187,17 @@ async function createDatabaseFixture(options: {
   const database = new DatabaseSync(authorityPath);
   migrateAuthorityDatabase(database);
   const contexts = options.contexts ?? [contextFor("a")];
-  for (const context of contexts) seedHuman(database, context, options.catalogRevision ?? 0);
-  for (const room of options.rooms ?? []) {
-    seedRoom(database, contexts[0]!, room.roomId, room.messageCount,
-      room.body ?? ((index) => `message-${index}`));
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    for (const context of contexts) seedHuman(database, context, options.catalogRevision ?? 0);
+    for (const room of options.rooms ?? []) {
+      seedRoom(database, contexts[0]!, room.roomId, room.messageCount,
+        room.body ?? ((index) => `message-${index}`));
+    }
+    database.exec("COMMIT");
+  } catch (cause: unknown) {
+    database.exec("ROLLBACK");
+    throw cause;
   }
   database.close();
   return { directory, authorityPath, cachePath, contexts };
@@ -399,7 +469,7 @@ describe("durable materialized snapshot worker", () => {
     const cachePath = join(directory, "snapshot-cache.sqlite");
     const context = contextFor("legacy-calibration");
     const database = new DatabaseSync(authorityPath);
-    migrateAuthorityDatabaseToPreviousVersionForTest(database);
+    migrateAuthorityDatabaseToVersion3ForTest(database);
     database.exec(`
       INSERT INTO actors (
         id, kind, display_name, reachability, readiness, tool_permissions_json,
@@ -682,7 +752,7 @@ describe("durable materialized snapshot worker", () => {
     };
     const fixture = await createDatabaseFixture({ contexts: [owner, target] });
     const seed = new DatabaseSync(fixture.authorityPath);
-    seedRoom(seed, owner, "race-room", 9_998);
+    seedRoom(seed, owner, "race-room", 8);
     seed.prepare(
       "UPDATE streams SET head_seq = 0 WHERE stream_kind = 'room' AND stream_id = 'race-room'",
     ).run();
@@ -884,6 +954,1902 @@ describe("durable materialized snapshot worker", () => {
     wal.hooks.continueBuild();
     await expect(walBuild).resolves.toEqual({ kind: "fallback", reason: "wal-growth" });
     await wal.client.close();
+  });
+
+  it("automatically streams after quota fallback and fences only the repaired room", async () => {
+    const original = contextFor("stream-original", "stream-family");
+    const refreshed = contextFor("stream-refreshed", "stream-family");
+    const otherFamily = contextFor("stream-other", "stream-other-family");
+    const fixture = await createDatabaseFixture({
+      contexts: [original, refreshed, otherFamily],
+      rooms: [
+        { roomId: "stream-room", messageCount: 10_000 },
+        { roomId: "unrelated-room", messageCount: 0 },
+      ],
+    });
+    const normalized = new DatabaseSync(fixture.authorityPath);
+    normalized.prepare(
+      "UPDATE streams SET head_seq = 0 WHERE stream_kind = 'room'",
+    ).run();
+    seedClosedMixedStressRecords(normalized, original, "stream-room");
+    normalized.close();
+    const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+    const client = await createSnapshotWorkerClient({
+      authorityPath: fixture.authorityPath,
+      cachePath: fixture.cachePath,
+      revalidate: (validation) => authority.revalidateSnapshot(validation, 2_000),
+      streamingAuthority: authority,
+      clock: () => 2_000,
+      limits: { cacheQuotaBytes: 1, maxRecordsPerPage: 500 },
+    });
+
+    const page0 = await client.beginRoomRepair(original, "stream-page-0", "stream-room");
+    expect(page0).toMatchObject({
+      type: "room.repair.page",
+      requestId: "stream-page-0",
+      page: 0,
+      mode: "streaming",
+      watermark: 0,
+      hasMore: true,
+    });
+    if ("kind" in page0 || page0.mode !== "streaming") {
+      throw new Error("expected automatic streaming fallback");
+    }
+
+    const humanCommand = {
+      ...original,
+      kind: "human" as const,
+      requestId: "barrier-message",
+      idempotencyKey: "barrier-message",
+    };
+    await expect(authority.executeHuman(humanCommand, {
+      type: "message.send",
+      roomId: "stream-room",
+      payload: {
+        id: "barrier-message",
+        roomId: "stream-room",
+        body: "must not persist",
+        sentAt: "2026-08-11T00:00:00.000Z",
+      },
+    }, 2_001)).rejects.toMatchObject({
+      status: 503,
+      code: "repair_barrier_active",
+      retryAfterMs: 250,
+    });
+    await expect(authority.executeAgent(mintInternalAgentCommandContext({
+      agentId: "stress-agent",
+      requestId: "barrier-agent-message",
+      idempotencyKey: "barrier-agent-message",
+    }), {
+      type: "message.send",
+      roomId: "stream-room",
+      payload: {
+        id: "barrier-agent-message",
+        roomId: "stream-room",
+        body: "agent must not persist",
+        sentAt: "2026-08-11T00:00:00.500Z",
+      },
+    }, 2_001)).rejects.toMatchObject({
+      status: 503,
+      code: "repair_barrier_active",
+      retryAfterMs: 250,
+    });
+    await expect(authority.executeHuman({
+      ...humanCommand,
+      requestId: "unrelated-message",
+      idempotencyKey: "unrelated-message",
+    }, {
+      type: "message.send",
+      roomId: "unrelated-room",
+      payload: {
+        id: "unrelated-message",
+        roomId: "unrelated-room",
+        body: "allowed",
+        sentAt: "2026-08-11T00:00:01.000Z",
+      },
+    }, 2_001)).resolves.toMatchObject({ aggregateId: "unrelated-message" });
+
+    await expect(client.readRoomRepairPage(
+      otherFamily, "other-family", page0.snapshotId, 0,
+    )).rejects.toMatchObject({ status: 403, code: "snapshot_forbidden" });
+    await expect(client.completeSnapshot(
+      refreshed,
+      "stream-complete-too-early",
+      page0.snapshotId,
+      { kind: "room", roomId: "stream-room", watermark: 0 },
+      page0.snapshotChecksum,
+    )).rejects.toMatchObject({ status: 409, code: "snapshot_stale" });
+    const records = [...page0.records];
+    let page = page0;
+    while (page.hasMore) {
+      page = await client.readRoomRepairPage(
+        refreshed,
+        `stream-page-${page.page + 1}`,
+        page.snapshotId,
+        page.page,
+      );
+      expect(page.mode).toBe("streaming");
+      records.push(...page.records);
+    }
+    expect(records).toHaveLength(10_008);
+    expect(new Set(records.map((record) => record.kind))).toEqual(new Set([
+      "room", "membership", "message", "human-read", "agent-judgement",
+      "open-item", "agent-execution", "calibration",
+    ]));
+    expect(page0.snapshotChecksum).toBe(createHash("sha256")
+      .update(canonicalJsonForTest({ kind: "room", values: records, version: 1 }), "utf8")
+      .digest("hex"));
+
+    await expect(client.completeSnapshot(
+      refreshed,
+      "stream-complete",
+      page0.snapshotId,
+      { kind: "room", roomId: "stream-room", watermark: 0 },
+      page0.snapshotChecksum,
+    )).resolves.toEqual({
+      type: "snapshot.completed",
+      requestId: "stream-complete",
+      snapshotId: page0.snapshotId,
+      version: { kind: "room", roomId: "stream-room", watermark: 0 },
+    });
+    await expect(client.completeSnapshot(
+      refreshed,
+      "stream-complete-replay",
+      page0.snapshotId,
+      { kind: "room", roomId: "stream-room", watermark: 0 },
+      page0.snapshotChecksum,
+    )).resolves.toMatchObject({ requestId: "stream-complete-replay" });
+
+    await expect(authority.executeHuman({
+      ...humanCommand,
+      requestId: "after-complete",
+      idempotencyKey: "after-complete",
+    }, {
+      type: "message.send",
+      roomId: "stream-room",
+      payload: {
+        id: "after-complete",
+        roomId: "stream-room",
+        body: "accepted after complete",
+        sentAt: "2026-08-11T00:00:02.000Z",
+      },
+    }, 2_002)).resolves.toMatchObject({ aggregateId: "after-complete" });
+
+    await authority.revokeSession(original.sessionId, 2_003);
+    await expect(client.completeSnapshot(
+      original,
+      "stream-complete-after-revoke",
+      page0.snapshotId,
+      { kind: "room", roomId: "stream-room", watermark: 0 },
+      page0.snapshotChecksum,
+    )).rejects.toMatchObject({ status: 403, code: "snapshot_family_revoked" });
+
+    const inspection = new DatabaseSync(fixture.authorityPath, { readOnly: true });
+    expect(inspection.prepare(
+      "SELECT COUNT(*) AS count FROM messages WHERE id = 'barrier-message'",
+    ).get()?.count).toBe(0);
+    expect(inspection.prepare(
+      "SELECT COUNT(*) AS count FROM events WHERE event_id LIKE '%barrier-message%'",
+    ).get()?.count).toBe(0);
+    expect(inspection.prepare(
+      "SELECT COUNT(*) AS count FROM outbox_deliveries WHERE event_id LIKE '%barrier-message%'",
+    ).get()?.count).toBe(0);
+    expect(inspection.prepare(
+      "SELECT COUNT(*) AS count FROM messages WHERE id = 'barrier-agent-message'",
+    ).get()?.count).toBe(0);
+    expect(inspection.prepare(
+      "SELECT COUNT(*) AS count FROM events WHERE event_id LIKE '%barrier-agent-message%'",
+    ).get()?.count).toBe(0);
+    expect(inspection.prepare(
+      "SELECT COUNT(*) AS count FROM outbox_deliveries WHERE event_id LIKE '%barrier-agent-message%'",
+    ).get()?.count).toBe(0);
+    inspection.close();
+    await client.close();
+    await authority.close();
+  });
+
+  it("replays exact idempotency before the barrier and reports conflicts as 409", async () => {
+    const fixture = await createDatabaseFixture({
+      rooms: [{ roomId: "idempotency-barrier-room", messageCount: 2 }],
+    });
+    const context = fixture.contexts[0]!;
+    const normalized = new DatabaseSync(fixture.authorityPath);
+    normalized.prepare(
+      "UPDATE streams SET head_seq = 0 WHERE stream_kind = 'room' AND stream_id = ?",
+    ).run("idempotency-barrier-room");
+    normalized.close();
+    const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+    const commandContext = {
+      ...context,
+      kind: "human" as const,
+      requestId: "idempotency-before-barrier-first",
+      idempotencyKey: "idempotency-before-barrier-message",
+    };
+    const command = {
+      type: "message.send" as const,
+      roomId: "idempotency-barrier-room",
+      payload: {
+        id: "idempotency-before-barrier-message",
+        roomId: "idempotency-barrier-room",
+        body: "stable replay",
+        sentAt: "2026-08-11T00:00:00.000Z",
+      },
+    };
+    const first = await authority.executeHuman(commandContext, command, 2_000);
+    const client = await createSnapshotWorkerClient({
+      authorityPath: fixture.authorityPath,
+      cachePath: fixture.cachePath,
+      revalidate: (validation) => authority.revalidateSnapshot(validation, 2_001),
+      streamingAuthority: authority,
+      clock: () => 2_001,
+      limits: { cacheQuotaBytes: 1, maxRecordsPerPage: 2 },
+    });
+    const page0 = await client.beginRoomRepair(
+      context, "idempotency-before-barrier-zero", "idempotency-barrier-room",
+    );
+    if ("kind" in page0) throw new Error("expected streaming page zero");
+
+    await expect(authority.executeHuman({
+      ...commandContext,
+      requestId: "idempotency-before-barrier-replay",
+    }, command, 2_002)).resolves.toEqual(first);
+    await expect(authority.executeHuman({
+      ...commandContext,
+      requestId: "idempotency-before-barrier-conflict",
+    }, {
+      ...command,
+      payload: { ...command.payload, body: "changed payload" },
+    }, 2_002)).rejects.toMatchObject({ status: 409, code: "idempotency_conflict" });
+    await client.close();
+    await authority.close();
+  });
+
+  it.each(["deadline", "wal-growth"] as const)(
+    "automatically streams after %s materialization fallback",
+    async (reason) => {
+      const fixture = await createDatabaseFixture({
+        rooms: [{ roomId: `automatic-${reason}`, messageCount: 10_000 }],
+      });
+      const context = fixture.contexts[0]!;
+      const normalized = new DatabaseSync(fixture.authorityPath);
+      normalized.prepare(
+        "UPDATE streams SET head_seq = 0 WHERE stream_kind = 'room'",
+      ).run();
+      seedClosedMixedStressRecords(normalized, context, `automatic-${reason}`);
+      normalized.close();
+      const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+      const paused = await createSnapshotWorkerClientWithPauseForTest({
+        authorityPath: fixture.authorityPath,
+        cachePath: fixture.cachePath,
+        revalidate: (validation) => authority.revalidateSnapshot(validation, 2_000),
+        streamingAuthority: authority,
+        clock: () => 2_000,
+        limits: reason === "deadline"
+          ? { buildDeadlineMs: 1, maxRecordsPerPage: 500 }
+          : { maxWalGrowthBytes: 1, maxRecordsPerPage: 500 },
+      });
+      const beginning = paused.client.beginRoomRepair(
+        context, `automatic-${reason}-zero`, `automatic-${reason}`,
+      );
+      await paused.hooks.waitForFixedView();
+      if (reason === "deadline") {
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      } else {
+        const writer = new DatabaseSync(fixture.authorityPath);
+        writer.prepare("UPDATE actors SET display_name = 'WAL fallback' WHERE id = ?")
+          .run(context.principal.actorId);
+        writer.close();
+      }
+      paused.hooks.continueBuild();
+
+      const page0 = await beginning;
+      expect(page0).toMatchObject({
+        type: "room.repair.page",
+        requestId: `automatic-${reason}-zero`,
+        mode: "streaming",
+        page: 0,
+        watermark: 0,
+      });
+      if ("kind" in page0 || page0.mode !== "streaming") {
+        throw new Error(`expected ${reason} to use automatic streaming fallback`);
+      }
+      const records = [...page0.records];
+      let page = page0;
+      while (page.hasMore) {
+        page = await paused.client.readRoomRepairPage(
+          context,
+          `automatic-${reason}-${page.page + 1}`,
+          page.snapshotId,
+          page.page,
+        );
+        expect(page).toMatchObject({
+          mode: "streaming",
+          watermark: 0,
+        });
+        records.push(...page.records);
+      }
+      expect(records).toHaveLength(10_008);
+      expect(new Set(records.map((record) => record.kind))).toEqual(new Set([
+        "room", "membership", "message", "human-read", "agent-judgement",
+        "open-item", "agent-execution", "calibration",
+      ]));
+      expect(page0.snapshotChecksum).toBe(createHash("sha256")
+        .update(canonicalJsonForTest({ kind: "room", values: records, version: 1 }), "utf8")
+        .digest("hex"));
+      await expect(paused.client.completeSnapshot(
+        context,
+        `automatic-${reason}-complete`,
+        page0.snapshotId,
+        { kind: "room", roomId: `automatic-${reason}`, watermark: 0 },
+        page0.snapshotChecksum,
+      )).resolves.toMatchObject({
+        type: "snapshot.completed",
+        version: { kind: "room", roomId: `automatic-${reason}`, watermark: 0 },
+      });
+      await paused.client.close();
+      await authority.close();
+    },
+  );
+
+  it("rejects streaming page jumps before scanning and replays only the same continuation", async () => {
+    const fixture = await createDatabaseFixture({
+      rooms: [{ roomId: "keyset-room", messageCount: 8 }],
+    });
+    const context = fixture.contexts[0]!;
+    const baseLease = {
+      snapshotId: "keyset-snapshot",
+      principalId: context.principal.actorId,
+      accountId: context.principal.accountId,
+      sessionFamilyId: context.sessionFamilyId,
+      scope: { kind: "room" as const, roomId: "keyset-room" },
+      version: { kind: "room" as const, roomId: "keyset-room", watermark: 8 },
+      authorizationRevision: 7,
+      idleExpiresAt: "2026-08-11T00:00:30.000Z",
+    };
+    let attachedLease = baseLease;
+    const client = await createSnapshotWorkerClient({
+      authorityPath: fixture.authorityPath,
+      cachePath: fixture.cachePath,
+      revalidate: async () => undefined,
+      limits: { cacheQuotaBytes: 1, maxRecordsPerPage: 2 },
+      streamingAuthority: {
+        async acquireStreamingRepair() { return baseLease; },
+        async registerStreamingRepair(snapshotId, checksum, pageCount) {
+          attachedLease = {
+            ...baseLease,
+            snapshotId,
+            checksum,
+            pageCount,
+            lastPage: pageCount - 1,
+            highestAuthorizedPage: 0,
+          };
+          return attachedLease;
+        },
+        async authorizeStreamingRepairPage() { return attachedLease; },
+        async completeStreamingRepair(_context, snapshotId, version) {
+          return { type: "snapshot.completed" as const, requestId: "internal",
+            snapshotId, version };
+        },
+        async releaseStreamingRepair() {},
+      },
+      clock: () => 2_000,
+    });
+    const page0 = await client.beginRoomRepair(context, "keyset-zero", "keyset-room");
+    if ("kind" in page0 || page0.mode !== "streaming") throw new Error("expected streaming");
+
+    await expect(client.readRoomRepairPage(
+      context, "keyset-skip", page0.snapshotId, 1,
+    )).rejects.toMatchObject({ status: 400, code: "invalid_request" });
+    const page1 = await client.readRoomRepairPage(
+      context, "keyset-one", page0.snapshotId, 0,
+    );
+    const replay = await client.readRoomRepairPage(
+      context, "keyset-one-replay", page0.snapshotId, 0,
+    );
+    expect(replay).toEqual({ ...page1, requestId: "keyset-one-replay" });
+    await client.close();
+  });
+
+  it("keyset-scans only one new page for a later streaming continuation", async () => {
+    const fixture = await createDatabaseFixture({
+      rooms: [{ roomId: "keyset-scan-room", messageCount: 400 }],
+    });
+    const context = fixture.contexts[0]!;
+    const normalized = new DatabaseSync(fixture.authorityPath);
+    normalized.prepare(
+      "UPDATE streams SET head_seq = 0 WHERE stream_kind = 'room'",
+    ).run();
+    normalized.close();
+    const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+    const paused = await createSnapshotWorkerClientWithPauseForTest({
+      authorityPath: fixture.authorityPath,
+      cachePath: fixture.cachePath,
+      revalidate: (validation) => authority.revalidateSnapshot(validation, 2_000),
+      streamingAuthority: authority,
+      clock: () => 2_000,
+      limits: { cacheQuotaBytes: 1, maxRecordsPerPage: 100 },
+    });
+    const beginning = paused.client.beginRoomRepair(
+      context, "keyset-scan-zero", "keyset-scan-room",
+    );
+    await paused.hooks.waitForFixedView();
+    paused.hooks.continueBuild();
+    const page0 = await beginning;
+    if ("kind" in page0 || page0.mode !== "streaming") throw new Error("expected streaming");
+    expect(paused.hooks.streamingPageScanCount()).toBe(100);
+
+    await paused.client.readRoomRepairPage(
+      context, "keyset-scan-one", page0.snapshotId, 0,
+    );
+    expect(paused.hooks.streamingPageScanCount()).toBe(200);
+    await paused.client.close();
+    await authority.close();
+  });
+
+  it("fences only one principal catalog and completes by catalog revision", async () => {
+    const alice: AuthenticatedSessionContext = {
+      sessionId: tokenHash("catalog-alice-access"),
+      sessionFamilyId: tokenHash("catalog-alice-family"),
+      principal: { accountId: "catalog-alice-account", actorId: "catalog-alice" },
+    };
+    const bob: AuthenticatedSessionContext = {
+      sessionId: tokenHash("catalog-bob-access"),
+      sessionFamilyId: tokenHash("catalog-bob-family"),
+      principal: { accountId: "catalog-bob-account", actorId: "catalog-bob" },
+    };
+    const fixture = await createDatabaseFixture({
+      contexts: [alice, bob],
+      rooms: [{ roomId: "catalog-room" }],
+      catalogRevision: 8,
+    });
+    const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+    const client = await createSnapshotWorkerClient({
+      authorityPath: fixture.authorityPath,
+      cachePath: fixture.cachePath,
+      revalidate: (validation) => authority.revalidateSnapshot(validation, 2_000),
+      streamingAuthority: authority,
+      clock: () => 2_000,
+      limits: { cacheQuotaBytes: 1 },
+    });
+    const page0 = await client.beginWorkspaceBootstrap(alice, "catalog-stream-0");
+    expect(page0).toMatchObject({
+      type: "workspace.bootstrap.page",
+      mode: "streaming",
+      catalogRevision: 8,
+      page: 0,
+      hasMore: false,
+    });
+    if ("kind" in page0 || page0.mode !== "streaming") {
+      throw new Error("expected catalog streaming fallback");
+    }
+    await expect(authority.executeHuman({
+      ...alice, kind: "human", requestId: "alice-create", idempotencyKey: "alice-create",
+    }, { type: "room.create", payload: { name: "Blocked Alice room" } }, 2_001))
+      .rejects.toMatchObject({ status: 503, code: "repair_barrier_active" });
+    await expect(authority.executeHuman({
+      ...bob, kind: "human", requestId: "bob-create", idempotencyKey: "bob-create",
+    }, { type: "room.create", payload: { name: "Allowed Bob room" } }, 2_001))
+      .resolves.toMatchObject({ acceptedAt: new Date(2_001).toISOString() });
+    await expect(client.completeSnapshot(
+      alice,
+      "wrong-catalog-complete",
+      page0.snapshotId,
+      { kind: "room", roomId: "catalog-room", watermark: 8 },
+      page0.snapshotChecksum,
+    )).rejects.toMatchObject({ status: 409, code: "snapshot_stale" });
+    await expect(client.completeSnapshot(
+      alice,
+      "catalog-complete",
+      page0.snapshotId,
+      { kind: "catalog", catalogRevision: 8 },
+      page0.snapshotChecksum,
+    )).resolves.toMatchObject({
+      type: "snapshot.completed",
+      requestId: "catalog-complete",
+      version: { kind: "catalog", catalogRevision: 8 },
+    });
+    await expect(authority.executeHuman({
+      ...alice, kind: "human", requestId: "alice-after", idempotencyKey: "alice-after",
+    }, { type: "room.create", payload: { name: "Allowed after complete" } }, 2_002))
+      .resolves.toBeDefined();
+    await expect(client.completeSnapshot(
+      alice,
+      "catalog-complete-after-revision",
+      page0.snapshotId,
+      { kind: "catalog", catalogRevision: 8 },
+      page0.snapshotChecksum,
+    )).rejects.toMatchObject({ status: 409, code: "snapshot_stale" });
+    await client.close();
+    await authority.close();
+  });
+
+  it.each([
+    { governance: "family revoke", terminalCode: "snapshot_family_revoked", status: 403 },
+    { governance: "member removal", terminalCode: "snapshot_stale", status: 409 },
+    { governance: "role downgrade", terminalCode: "snapshot_stale", status: 409 },
+    { governance: "room archive", terminalCode: "room_archived", status: 409 },
+  ] as const)(
+    "commits $governance before invalidating the affected catalog lease",
+    async ({ governance, terminalCode, status }) => {
+      const owner: AuthenticatedSessionContext = {
+        sessionId: tokenHash(`catalog-governance-owner-access-${governance}`),
+        sessionFamilyId: tokenHash(`catalog-governance-owner-family-${governance}`),
+        principal: {
+          accountId: `catalog-governance-owner-account-${governance}`,
+          actorId: `catalog-governance-owner-${governance}`,
+        },
+      };
+      const target: AuthenticatedSessionContext = {
+        sessionId: tokenHash(`catalog-governance-target-access-${governance}`),
+        sessionFamilyId: tokenHash(`catalog-governance-target-family-${governance}`),
+        principal: {
+          accountId: `catalog-governance-target-account-${governance}`,
+          actorId: `catalog-governance-target-${governance}`,
+        },
+      };
+      const roomId = `catalog-governance-room-${governance}`;
+      const secondRoomId = `${roomId}-z`;
+      const fixture = await createDatabaseFixture({ contexts: [owner, target] });
+      const seeded = new DatabaseSync(fixture.authorityPath);
+      seedRoom(seeded, owner, roomId);
+      seedRoom(seeded, owner, secondRoomId);
+      seeded.prepare(
+        `INSERT INTO room_memberships (
+           room_id, actor_id, kind, role, participation, tool_permissions_json,
+           joined_at, configured_at, access_revision
+         ) VALUES (?, ?, 'human', 'admin', NULL, '[]', ?, NULL, 4)`,
+      ).run(roomId, target.principal.actorId, "2026-08-11T00:00:00.000Z");
+      seeded.prepare(
+        `INSERT INTO room_memberships (
+           room_id, actor_id, kind, role, participation, tool_permissions_json,
+           joined_at, configured_at, access_revision
+         ) VALUES (?, ?, 'human', 'member', NULL, '[]', ?, NULL, 2)`,
+      ).run(secondRoomId, target.principal.actorId, "2026-08-11T00:00:01.000Z");
+      seeded.close();
+
+      const authority = await createWorkerDatabaseClient({
+        databasePath: fixture.authorityPath,
+      });
+      const client = await createSnapshotWorkerClient({
+        authorityPath: fixture.authorityPath,
+        cachePath: fixture.cachePath,
+        revalidate: (validation) => authority.revalidateSnapshot(validation, 2_000),
+        streamingAuthority: authority,
+        clock: () => 2_000,
+        limits: { cacheQuotaBytes: 1, maxRecordsPerPage: 1 },
+      });
+      const page0 = await client.beginWorkspaceBootstrap(
+        target,
+        `catalog-governance-zero-${governance}`,
+      );
+      if ("kind" in page0 || page0.mode !== "streaming") {
+        throw new Error("expected catalog streaming fallback");
+      }
+
+      if (governance === "family revoke") {
+        await authority.revokeSession(target.sessionId, 2_001);
+      } else {
+        const command = governance === "member removal"
+          ? {
+              type: "member.remove" as const,
+              roomId,
+              payload: { targetActorId: target.principal.actorId },
+            }
+          : governance === "role downgrade"
+            ? {
+                type: "human.role.change" as const,
+                roomId,
+                payload: {
+                  targetActorId: target.principal.actorId,
+                  role: "member" as const,
+                },
+              }
+            : { type: "room.archive" as const, roomId, payload: {} };
+        await expect(authority.executeHuman({
+          ...owner,
+          kind: "human",
+          requestId: `catalog-governance-${governance}`,
+          idempotencyKey: `catalog-governance-${governance}`,
+        }, command, 2_001)).resolves.toBeDefined();
+      }
+
+      await expect(client.readWorkspaceBootstrapPage(
+        target,
+        `catalog-governance-after-${governance}`,
+        page0.snapshotId,
+        0,
+      )).rejects.toMatchObject({ status, code: terminalCode });
+
+      const inspected = new DatabaseSync(fixture.authorityPath, { readOnly: true });
+      if (governance === "family revoke") {
+        expect(inspected.prepare(
+          "SELECT revoked_at AS revokedAt FROM sessions WHERE access_token_hash = ?",
+        ).get(target.sessionId)?.revokedAt).toBe(2_001);
+      } else if (governance === "member removal") {
+        expect(inspected.prepare(
+          "SELECT 1 FROM room_memberships WHERE room_id = ? AND actor_id = ?",
+        ).get(roomId, target.principal.actorId)).toBeUndefined();
+      } else if (governance === "role downgrade") {
+        expect(inspected.prepare(
+          "SELECT role FROM room_memberships WHERE room_id = ? AND actor_id = ?",
+        ).get(roomId, target.principal.actorId)?.role).toBe("member");
+      } else {
+        expect(inspected.prepare("SELECT status FROM rooms WHERE id = ?")
+          .get(roomId)?.status).toBe("archived");
+      }
+      inspected.close();
+      await client.close();
+      await authority.close();
+    },
+  );
+
+  it("releases an idle or disconnected streaming barrier", async () => {
+    const fixture = await createDatabaseFixture({
+      rooms: [{ roomId: "release-stream-room", messageCount: 2 }],
+    });
+    const normalized = new DatabaseSync(fixture.authorityPath);
+    normalized.prepare(
+      "UPDATE streams SET head_seq = 0 WHERE stream_kind = 'room'",
+    ).run();
+    normalized.close();
+    const context = fixture.contexts[0]!;
+    let now = 2_000;
+    const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+    const createClient = () => createSnapshotWorkerClient({
+      authorityPath: fixture.authorityPath,
+      cachePath: fixture.cachePath,
+      revalidate: (validation) => authority.revalidateSnapshot(validation, now),
+      streamingAuthority: authority,
+      clock: () => now,
+      limits: { cacheQuotaBytes: 1, maxRecordsPerPage: 2 },
+    });
+    const idleClient = await createClient();
+    const idlePage = await idleClient.beginRoomRepair(
+      context, "idle-release-zero", "release-stream-room",
+    );
+    if ("kind" in idlePage || idlePage.mode !== "streaming") {
+      throw new Error("expected streaming");
+    }
+    now = 32_000;
+    await expect(idleClient.readRoomRepairPage(
+      context, "idle-release-one", idlePage.snapshotId, 0,
+    )).rejects.toMatchObject({ status: 410, code: "snapshot_expired" });
+
+    const commandContext = {
+      ...context,
+      kind: "human" as const,
+      requestId: "after-idle-release",
+      idempotencyKey: "after-idle-release",
+    };
+    await expect(authority.executeHuman(commandContext, {
+      type: "message.send",
+      roomId: "release-stream-room",
+      payload: {
+        id: "after-idle-release",
+        roomId: "release-stream-room",
+        body: "idle lease released",
+        sentAt: "2026-08-11T00:00:03.000Z",
+      },
+    }, now)).resolves.toMatchObject({ aggregateId: "after-idle-release" });
+    await idleClient.close();
+
+    now = 33_000;
+    const disconnectedClient = await createClient();
+    const disconnectedPage = await disconnectedClient.beginRoomRepair(
+      context, "disconnect-release-zero", "release-stream-room",
+    );
+    if ("kind" in disconnectedPage || disconnectedPage.mode !== "streaming") {
+      throw new Error("expected streaming");
+    }
+    await disconnectedClient.close();
+    await expect(authority.executeHuman({
+      ...commandContext,
+      requestId: "after-disconnect-release",
+      idempotencyKey: "after-disconnect-release",
+    }, {
+      type: "message.send",
+      roomId: "release-stream-room",
+      payload: {
+        id: "after-disconnect-release",
+        roomId: "release-stream-room",
+        body: "disconnect lease released",
+        sentAt: "2026-08-11T00:00:04.000Z",
+      },
+    }, now)).resolves.toMatchObject({ aggregateId: "after-disconnect-release" });
+    await authority.close();
+  });
+
+  it("releases only an owner-matched snapshot and leaves another connection barrier active", async () => {
+    const owner = contextFor("release-owner", "release-owner-family");
+    const otherFamily = contextFor("release-other", "release-other-family");
+    const fixture = await createDatabaseFixture({
+      contexts: [owner, otherFamily],
+      rooms: [
+        { roomId: "release-scope-a", messageCount: 0 },
+        { roomId: "release-scope-b", messageCount: 0 },
+      ],
+    });
+    const normalized = new DatabaseSync(fixture.authorityPath);
+    normalized.prepare("UPDATE streams SET head_seq = 0 WHERE stream_kind = 'room'").run();
+    normalized.close();
+    const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+    const client = await createSnapshotWorkerClient({
+      authorityPath: fixture.authorityPath,
+      cachePath: fixture.cachePath,
+      revalidate: (validation) => authority.revalidateSnapshot(validation, 2_000),
+      streamingAuthority: authority,
+      clock: () => 2_000,
+      limits: { cacheQuotaBytes: 1, maxRecordsPerPage: 2 },
+    });
+    const pageA = await client.beginRoomRepair(owner, "release-a-zero", "release-scope-a");
+    const pageB = await client.beginRoomRepair(owner, "release-b-zero", "release-scope-b");
+    if ("kind" in pageA || "kind" in pageB ||
+        pageA.mode !== "streaming" || pageB.mode !== "streaming") {
+      throw new Error("expected two streaming leases");
+    }
+
+    await expect(client.releaseSnapshot(otherFamily, pageA.snapshotId))
+      .rejects.toMatchObject({ status: 403, code: "snapshot_forbidden" });
+    await expect(client.releaseSnapshot(owner, pageA.snapshotId)).resolves.toBeUndefined();
+    await expect(client.releaseSnapshot(owner, pageA.snapshotId)).resolves.toBeUndefined();
+    const commandContext = {
+      ...owner,
+      kind: "human" as const,
+      requestId: "release-scope-write-a",
+      idempotencyKey: "release-scope-write-a",
+    };
+    await expect(authority.executeHuman(commandContext, {
+      type: "message.send",
+      roomId: "release-scope-a",
+      payload: {
+        id: "release-scope-write-a",
+        roomId: "release-scope-a",
+        body: "released scope",
+        sentAt: "2026-08-11T00:00:01.000Z",
+      },
+    }, 2_001)).resolves.toMatchObject({ aggregateId: "release-scope-write-a" });
+    await expect(authority.executeHuman({
+      ...commandContext,
+      requestId: "release-scope-write-b",
+      idempotencyKey: "release-scope-write-b",
+    }, {
+      type: "message.send",
+      roomId: "release-scope-b",
+      payload: {
+        id: "release-scope-write-b",
+        roomId: "release-scope-b",
+        body: "still blocked",
+        sentAt: "2026-08-11T00:00:02.000Z",
+      },
+    }, 2_001)).rejects.toMatchObject({ status: 503, code: "repair_barrier_active" });
+    await client.close();
+    await authority.close();
+  });
+
+  it.each([
+    { name: "member removal", command: (roomId: string, targetId: string) => ({
+      type: "member.remove" as const, roomId, payload: { targetActorId: targetId },
+    }) },
+    { name: "role downgrade", command: (roomId: string, targetId: string) => ({
+      type: "human.role.change" as const, roomId,
+      payload: { targetActorId: targetId, role: "member" as const },
+    }) },
+    { name: "room archive", command: (roomId: string, targetId: string) => {
+      void targetId;
+      return { type: "room.archive" as const, roomId, payload: {} };
+    } },
+  ])("lets $name commit before preempting only the affected lease", async ({ command }) => {
+    const owner: AuthenticatedSessionContext = {
+      sessionId: tokenHash(`preempt-owner-access-${command.name}`),
+      sessionFamilyId: tokenHash(`preempt-owner-family-${command.name}`),
+      principal: { accountId: "preempt-owner-account", actorId: "preempt-owner" },
+    };
+    const target: AuthenticatedSessionContext = {
+      sessionId: tokenHash(`preempt-target-access-${command.name}`),
+      sessionFamilyId: tokenHash(`preempt-target-family-${command.name}`),
+      principal: { accountId: "preempt-target-account", actorId: "preempt-target" },
+    };
+    const fixture = await createDatabaseFixture({ contexts: [owner, target] });
+    const seeded = new DatabaseSync(fixture.authorityPath);
+    seedRoom(seeded, owner, "preempt-room", 2);
+    seeded.prepare(
+      "UPDATE streams SET head_seq = 0 WHERE stream_kind = 'room' AND stream_id = 'preempt-room'",
+    ).run();
+    seeded.prepare(
+      `INSERT INTO room_memberships (
+         room_id, actor_id, kind, role, participation, tool_permissions_json,
+         joined_at, configured_at, access_revision
+       ) VALUES ('preempt-room', ?, 'human', 'admin', NULL, '[]', 't', NULL, 4)`,
+    ).run(target.principal.actorId);
+    seeded.close();
+    const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+    const client = await createSnapshotWorkerClient({
+      authorityPath: fixture.authorityPath,
+      cachePath: fixture.cachePath,
+      revalidate: (validation) => authority.revalidateSnapshot(validation, 2_000),
+      streamingAuthority: authority,
+      clock: () => 2_000,
+      limits: { cacheQuotaBytes: 1, maxRecordsPerPage: 2 },
+    });
+    const page0 = await client.beginRoomRepair(target, "preempt-page-0", "preempt-room");
+    if ("kind" in page0 || page0.mode !== "streaming") throw new Error("expected streaming");
+
+    await expect(authority.executeHuman({
+      ...owner,
+      kind: "human",
+      requestId: `preempt-${command.name}`,
+      idempotencyKey: `preempt-${command.name}`,
+    }, command("preempt-room", target.principal.actorId), 2_001)).resolves.toBeDefined();
+    await expect(client.readRoomRepairPage(
+      target, "preempt-after", page0.snapshotId, 0,
+    )).rejects.toMatchObject({ status: expect.any(Number),
+      code: expect.stringMatching(/snapshot_stale|room_archived|room_forbidden/) });
+
+    const inspected = new DatabaseSync(fixture.authorityPath, { readOnly: true });
+    if (command("preempt-room", target.principal.actorId).type === "member.remove") {
+      expect(inspected.prepare(
+        "SELECT COUNT(*) AS count FROM room_memberships WHERE room_id = 'preempt-room' AND actor_id = ?",
+      ).get(target.principal.actorId)?.count).toBe(0);
+    } else if (command("preempt-room", target.principal.actorId).type === "room.archive") {
+      expect(inspected.prepare("SELECT status FROM rooms WHERE id = 'preempt-room'").get()?.status)
+        .toBe("archived");
+    } else {
+      expect(inspected.prepare(
+        "SELECT role FROM room_memberships WHERE room_id = 'preempt-room' AND actor_id = ?",
+      ).get(target.principal.actorId)?.role).toBe("member");
+    }
+    inspected.close();
+    await client.close();
+    await authority.close();
+  });
+
+  it.each(["member.remove", "room.archive"] as const)(
+    "does not preempt a newer lease when replaying an applied %s",
+    async (type) => {
+      const owner: AuthenticatedSessionContext = {
+        sessionId: tokenHash(`replay-owner-access-${type}`),
+        sessionFamilyId: tokenHash(`replay-owner-family-${type}`),
+        principal: { accountId: `replay-owner-account-${type}`, actorId: `replay-owner-${type}` },
+      };
+      const target: AuthenticatedSessionContext = {
+        sessionId: tokenHash(`replay-target-access-${type}`),
+        sessionFamilyId: tokenHash(`replay-target-family-${type}`),
+        principal: { accountId: `replay-target-account-${type}`, actorId: `replay-target-${type}` },
+      };
+      const fixture = await createDatabaseFixture({ contexts: [owner, target] });
+      const roomId = `replay-preempt-${type}`;
+      const seeded = new DatabaseSync(fixture.authorityPath);
+      seedRoom(seeded, owner, roomId, 2);
+      seeded.prepare(
+        "UPDATE streams SET head_seq = 0 WHERE stream_kind = 'room' AND stream_id = ?",
+      ).run(roomId);
+      seeded.prepare(
+        `INSERT INTO room_memberships (
+           room_id, actor_id, kind, role, participation, tool_permissions_json,
+           joined_at, configured_at, access_revision
+         ) VALUES (?, ?, 'human', 'admin', NULL, '[]', 't', NULL, 4)`,
+      ).run(roomId, target.principal.actorId);
+      seeded.close();
+      const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+      const command = type === "member.remove"
+        ? { type, roomId, payload: { targetActorId: target.principal.actorId } }
+        : { type, roomId, payload: {} };
+      const commandContext = {
+        ...owner,
+        kind: "human" as const,
+        requestId: `replay-preempt-first-${type}`,
+        idempotencyKey: `replay-preempt-${type}`,
+      };
+      const first = await authority.executeHuman(commandContext, command, 2_000);
+
+      const restored = new DatabaseSync(fixture.authorityPath);
+      if (type === "member.remove") {
+        restored.prepare(
+          `INSERT INTO room_memberships (
+             room_id, actor_id, kind, role, participation, tool_permissions_json,
+             joined_at, configured_at, access_revision
+           ) VALUES (?, ?, 'human', 'admin', NULL, '[]', 't2', NULL, 5)`,
+        ).run(roomId, target.principal.actorId);
+      } else {
+        restored.prepare("UPDATE rooms SET status = 'active' WHERE id = ?").run(roomId);
+      }
+      restored.close();
+      const client = await createSnapshotWorkerClient({
+        authorityPath: fixture.authorityPath,
+        cachePath: fixture.cachePath,
+        revalidate: (validation) => authority.revalidateSnapshot(validation, 2_001),
+        streamingAuthority: authority,
+        clock: () => 2_001,
+        limits: { cacheQuotaBytes: 1, maxRecordsPerPage: 2 },
+      });
+      const page0 = await client.beginRoomRepair(
+        target, `replay-preempt-zero-${type}`, roomId,
+      );
+      if ("kind" in page0) throw new Error("expected streaming page zero");
+      await expect(authority.executeHuman({
+        ...commandContext,
+        requestId: `replay-preempt-second-${type}`,
+      }, command, 2_002)).resolves.toEqual(first);
+      await expect(client.readRoomRepairPage(
+        target, `replay-preempt-one-${type}`, page0.snapshotId, 0,
+      )).resolves.toMatchObject({ mode: "streaming", page: 1 });
+      await client.close();
+      await authority.close();
+    },
+  );
+
+  it.each(["member", "admin"] as const)(
+    "keeps member-to-%s role changes behind the ordinary repair barrier",
+    async (role) => {
+      const owner: AuthenticatedSessionContext = {
+        sessionId: tokenHash(`role-gate-owner-access-${role}`),
+        sessionFamilyId: tokenHash(`role-gate-owner-family-${role}`),
+        principal: { accountId: "role-gate-owner-account", actorId: "role-gate-owner" },
+      };
+      const target: AuthenticatedSessionContext = {
+        sessionId: tokenHash(`role-gate-target-access-${role}`),
+        sessionFamilyId: tokenHash(`role-gate-target-family-${role}`),
+        principal: { accountId: "role-gate-target-account", actorId: "role-gate-target" },
+      };
+      const fixture = await createDatabaseFixture({ contexts: [owner, target] });
+      const seeded = new DatabaseSync(fixture.authorityPath);
+      seedRoom(seeded, owner, "role-gate-room", 2);
+      seeded.prepare(
+        "UPDATE streams SET head_seq = 0 WHERE stream_kind = 'room' AND stream_id = 'role-gate-room'",
+      ).run();
+      seeded.prepare(
+        `INSERT INTO room_memberships (
+           room_id, actor_id, kind, role, participation, tool_permissions_json,
+           joined_at, configured_at, access_revision
+         ) VALUES ('role-gate-room', ?, 'human', 'member', NULL, '[]', 't', NULL, 4)`,
+      ).run(target.principal.actorId);
+      seeded.close();
+      const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+      const client = await createSnapshotWorkerClient({
+        authorityPath: fixture.authorityPath,
+        cachePath: fixture.cachePath,
+        revalidate: (validation) => authority.revalidateSnapshot(validation, 2_000),
+        streamingAuthority: authority,
+        clock: () => 2_000,
+        limits: { cacheQuotaBytes: 1, maxRecordsPerPage: 2 },
+      });
+      const page0 = await client.beginRoomRepair(
+        target, `role-gate-${role}-zero`, "role-gate-room",
+      );
+      if ("kind" in page0 || page0.mode !== "streaming") throw new Error("expected streaming");
+
+      await expect(authority.executeHuman({
+        ...owner,
+        kind: "human",
+        requestId: `role-gate-${role}`,
+        idempotencyKey: `role-gate-${role}`,
+      }, {
+        type: "human.role.change",
+        roomId: "role-gate-room",
+        payload: { targetActorId: target.principal.actorId, role },
+      }, 2_001)).rejects.toMatchObject({
+        status: 503,
+        code: "repair_barrier_active",
+      });
+      const inspected = new DatabaseSync(fixture.authorityPath, { readOnly: true });
+      expect(inspected.prepare(
+        "SELECT role FROM room_memberships WHERE room_id = 'role-gate-room' AND actor_id = ?",
+      ).get(target.principal.actorId)?.role).toBe("member");
+      inspected.close();
+      await client.close();
+      await authority.close();
+    },
+  );
+
+  it("lets session-family revoke preempt a streaming lease", async () => {
+    const fixture = await createDatabaseFixture({ rooms: [{ roomId: "revoke-stream-room", messageCount: 2 }] });
+    const normalized = new DatabaseSync(fixture.authorityPath);
+    normalized.prepare(
+      "UPDATE streams SET head_seq = 0 WHERE stream_kind = 'room' AND stream_id = 'revoke-stream-room'",
+    ).run();
+    normalized.close();
+    const context = fixture.contexts[0]!;
+    const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+    const client = await createSnapshotWorkerClient({
+      authorityPath: fixture.authorityPath, cachePath: fixture.cachePath,
+      revalidate: (validation) => authority.revalidateSnapshot(validation, 2_000),
+      streamingAuthority: authority, clock: () => 2_000,
+      limits: { cacheQuotaBytes: 1, maxRecordsPerPage: 2 },
+    });
+    const page0 = await client.beginRoomRepair(context, "revoke-stream-0", "revoke-stream-room");
+    if ("kind" in page0 || page0.mode !== "streaming") throw new Error("expected streaming");
+    await authority.revokeSession(context.sessionId, 2_001);
+    await expect(client.readRoomRepairPage(
+      context, "revoke-stream-1", page0.snapshotId, 0,
+    )).rejects.toMatchObject({ status: 403, code: "snapshot_family_revoked" });
+    await client.close();
+    await authority.close();
+  });
+
+  it("lets refresh rotate through a barrier and continue on a new session in the same family", async () => {
+    const fixture = await createDatabaseFixture({ rooms: [{ roomId: "refresh-stream-room", messageCount: 2 }] });
+    const original = fixture.contexts[0]!;
+    const normalized = new DatabaseSync(fixture.authorityPath);
+    normalized.prepare(
+      "UPDATE streams SET head_seq = 0 WHERE stream_kind = 'room' AND stream_id = 'refresh-stream-room'",
+    ).run();
+    normalized.prepare(
+      "UPDATE sessions SET access_expires_at = 2001 WHERE access_token_hash = ?",
+    ).run(original.sessionId);
+    normalized.close();
+    let now = 2_000;
+    const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+    const client = await createSnapshotWorkerClient({
+      authorityPath: fixture.authorityPath, cachePath: fixture.cachePath,
+      revalidate: (validation) => authority.revalidateSnapshot(validation, now),
+      streamingAuthority: authority, clock: () => now,
+      limits: { cacheQuotaBytes: 1, maxRecordsPerPage: 2 },
+    });
+    const page0 = await client.beginRoomRepair(original, "refresh-stream-0", "refresh-stream-room");
+    if ("kind" in page0 || page0.mode !== "streaming") throw new Error("expected streaming");
+    now = 2_002;
+    const currentRefreshTokenHash = tokenHash(`refresh-${original.sessionId}`);
+    await authority.validateSessionRefresh(
+      currentRefreshTokenHash, original.principal, now,
+    );
+    const rotated = await authority.rotateSession({
+      currentRefreshTokenHash,
+      accessTokenHash: tokenHash("refresh-stream-next-access"),
+      refreshTokenHash: tokenHash("refresh-stream-next-refresh"),
+      accessExpiresAt: 1_000_000,
+      refreshExpiresAt: 2_000_000,
+      expectedPrincipal: original.principal,
+      now,
+    });
+    const refreshed: AuthenticatedSessionContext = {
+      sessionId: rotated.sessionId,
+      sessionFamilyId: rotated.familyId,
+      principal: original.principal,
+    };
+    let page = await client.readRoomRepairPage(
+      refreshed, "refresh-stream-1", page0.snapshotId, 0,
+    );
+    expect(page).toMatchObject({ mode: "streaming", page: 1 });
+    while (page.hasMore) {
+      page = await client.readRoomRepairPage(
+        refreshed, `refresh-stream-${page.page + 1}`, page.snapshotId, page.page,
+      );
+    }
+    await client.close();
+    await authority.close();
+  });
+
+  describe("paused streaming checksum lifecycle", () => {
+    class PausedChecksumTransport extends EventEmitter implements SnapshotWorkerTransport {
+      #streamingRequest:
+        | Extract<SnapshotWorkerRequest, { readonly type: "snapshot.begin-streaming" }>
+        | undefined;
+      #checksumReached: (() => void) | undefined;
+      readonly checksumReached = new Promise<void>((resolve) => {
+        this.#checksumReached = resolve;
+      });
+      checksumPasses = 0;
+      materializedAttempts = 0;
+      releaseRequests = 0;
+      terminateCount = 0;
+
+      get snapshotId(): string {
+        const request = this.#streamingRequest;
+        if (request === undefined) throw new Error("streaming checksum was not started");
+        return request.lease.snapshotId;
+      }
+
+      postMessage(request: SnapshotWorkerRequest): void {
+        if (request.type === "snapshot.initialize") {
+          queueMicrotask(() => this.emit("message", {
+            type: "snapshot.ready", requestId: request.requestId,
+          }));
+          return;
+        }
+        if (request.type === "snapshot.begin-room" || request.type === "snapshot.begin-catalog") {
+          this.materializedAttempts += 1;
+          queueMicrotask(() => this.emit("message", {
+            type: "snapshot.fallback", requestId: request.requestId, reason: "quota",
+          }));
+          return;
+        }
+        if (request.type === "snapshot.cache-count") {
+          queueMicrotask(() => this.emit("message", {
+            type: "snapshot.cache-count", requestId: request.requestId, count: 0,
+          }));
+          return;
+        }
+        if (request.type === "snapshot.begin-streaming") {
+          if (this.#streamingRequest !== undefined) {
+            if (request.lease.snapshotId !== this.#streamingRequest.lease.snapshotId ||
+                request.lease.checksum !== "paused-checksum" || request.lease.pageCount !== 2) {
+              throw new Error("streaming retry did not reuse the attached snapshot");
+            }
+            this.#emitPage0(request);
+            return;
+          }
+          this.checksumPasses += 1;
+          this.#streamingRequest = request;
+          this.#checksumReached?.();
+          return;
+        }
+        if (request.type === "snapshot.read-streaming-page") {
+          const lease = request.lease;
+          queueMicrotask(() => this.emit("message", {
+            type: "snapshot.streaming-page",
+            requestId: request.requestId,
+            manifest: {
+              snapshotId: lease.snapshotId,
+              principalId: lease.principalId,
+              sessionFamilyId: lease.sessionFamilyId,
+              checksum: "paused-checksum",
+              pageCount: 2,
+              kind: "room",
+              roomId: "paused-checksum-room",
+              accessRevision: lease.authorizationRevision,
+              watermark: 0,
+            },
+            page: {
+              type: "room.repair.page",
+              requestId: request.responseRequestId,
+              snapshotId: lease.snapshotId,
+              roomId: "paused-checksum-room",
+              page: 1,
+              records: [],
+              watermark: 0,
+              snapshotChecksum: "paused-checksum",
+              hasMore: false,
+              mode: "streaming",
+              idleExpiresAt: lease.idleExpiresAt,
+            },
+          }));
+          return;
+        }
+        if (request.type === "snapshot.release-streaming") {
+          this.releaseRequests += 1;
+          queueMicrotask(() => this.emit("message", {
+            type: "snapshot.streaming-released", requestId: request.requestId,
+          }));
+          return;
+        }
+        if (request.type === "snapshot.close") {
+          queueMicrotask(() => this.emit("message", {
+            type: "snapshot.closed", requestId: request.requestId,
+          }));
+        }
+      }
+
+      continueChecksum(): void {
+        const request = this.#streamingRequest;
+        if (request === undefined) {
+          throw new Error("streaming checksum was not paused");
+        }
+        this.#emitPage0(request);
+      }
+
+      #emitPage0(
+        request: Extract<SnapshotWorkerRequest, { readonly type: "snapshot.begin-streaming" }>,
+      ): void {
+        const lease = request.lease;
+        if (lease.scope.kind === "catalog" && lease.version.kind === "catalog") {
+          queueMicrotask(() => this.emit("message", {
+            type: "snapshot.streaming-page",
+            requestId: request.requestId,
+            manifest: {
+              snapshotId: lease.snapshotId,
+              principalId: lease.principalId,
+              sessionFamilyId: lease.sessionFamilyId,
+              checksum: "paused-checksum",
+              pageCount: 2,
+              kind: "catalog",
+              catalogRevision: lease.version.catalogRevision,
+            },
+            page: {
+              type: "workspace.bootstrap.page",
+              requestId: request.responseRequestId,
+              snapshotId: lease.snapshotId,
+              page: 0,
+              rooms: [],
+              catalogRevision: lease.version.catalogRevision,
+              snapshotChecksum: "paused-checksum",
+              hasMore: true,
+              mode: "streaming",
+              idleExpiresAt: lease.idleExpiresAt,
+            },
+          }));
+          return;
+        }
+        if (lease.scope.kind !== "room" || lease.version.kind !== "room") {
+          throw new Error("streaming scope and version do not match");
+        }
+        queueMicrotask(() => this.emit("message", {
+          type: "snapshot.streaming-page",
+          requestId: request.requestId,
+          manifest: {
+            snapshotId: lease.snapshotId,
+            principalId: lease.principalId,
+            sessionFamilyId: lease.sessionFamilyId,
+            checksum: "paused-checksum",
+            pageCount: 2,
+            kind: "room",
+            roomId: lease.scope.roomId,
+            accessRevision: lease.authorizationRevision,
+            watermark: lease.version.watermark,
+          },
+          page: {
+            type: "room.repair.page",
+            requestId: request.responseRequestId,
+            snapshotId: lease.snapshotId,
+            roomId: lease.scope.roomId,
+            page: 0,
+            records: [],
+            watermark: lease.version.watermark,
+            snapshotChecksum: "paused-checksum",
+            hasMore: true,
+            mode: "streaming",
+            idleExpiresAt: lease.idleExpiresAt,
+          },
+        }));
+      }
+
+      async terminate(): Promise<number> {
+        this.terminateCount += 1;
+        return 0;
+      }
+    }
+
+    it("does not reuse a pre-attach checksum operation from a refreshed session", async () => {
+      const fixture = await createDatabaseFixture({
+        rooms: [{ roomId: "checksum-preattach-room" }],
+      });
+      const original = fixture.contexts[0]!;
+      const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+      const transport = new PausedChecksumTransport();
+      const client = await createSnapshotWorkerClientForTest({
+        authorityPath: fixture.authorityPath,
+        cachePath: fixture.cachePath,
+        revalidate: (validation) => authority.revalidateSnapshot(validation, 2_000),
+        streamingAuthority: authority,
+        clock: () => 2_000,
+      }, () => transport);
+      const beginning = client.beginRoomRepair(
+        original, "checksum-preattach-zero", "checksum-preattach-room",
+      );
+      await transport.checksumReached;
+      const rotated = await authority.rotateSession({
+        currentRefreshTokenHash: tokenHash(`refresh-${original.sessionId}`),
+        accessTokenHash: tokenHash("checksum-preattach-next-access"),
+        refreshTokenHash: tokenHash("checksum-preattach-next-refresh"),
+        accessExpiresAt: 1_000_000,
+        refreshExpiresAt: 2_000_000,
+        expectedPrincipal: original.principal,
+        now: 2_000,
+      });
+      const refreshed: AuthenticatedSessionContext = {
+        sessionId: rotated.sessionId,
+        sessionFamilyId: rotated.familyId,
+        principal: original.principal,
+      };
+
+      await expect(client.beginRoomRepair(
+        refreshed, "checksum-preattach-refreshed", "checksum-preattach-room",
+      )).rejects.toMatchObject({ status: 429, code: "snapshot_busy" });
+      expect(transport.checksumPasses).toBe(1);
+      expect(transport.materializedAttempts).toBe(2);
+      await client.close();
+      transport.continueChecksum();
+      await expect(beginning).rejects.toMatchObject({ code: "snapshot_worker_closed" });
+      await authority.close();
+    });
+
+    it("retains an attached checksum when rotation revokes the old page-zero session", async () => {
+      const fixture = await createDatabaseFixture({
+        rooms: [{ roomId: "checksum-rotate-room" }],
+      });
+      const original = fixture.contexts[0]!;
+      const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+      const transport = new PausedChecksumTransport();
+      const client = await createSnapshotWorkerClientForTest({
+        authorityPath: fixture.authorityPath,
+        cachePath: fixture.cachePath,
+        revalidate: (validation) => authority.revalidateSnapshot(validation, 2_000),
+        streamingAuthority: authority,
+        clock: () => 2_000,
+      }, () => transport);
+      const beginning = client.beginRoomRepair(
+        original, "checksum-rotate-old", "checksum-rotate-room",
+      );
+      await transport.checksumReached;
+      const rotated = await authority.rotateSession({
+        currentRefreshTokenHash: tokenHash(`refresh-${original.sessionId}`),
+        accessTokenHash: tokenHash("checksum-rotate-next-access"),
+        refreshTokenHash: tokenHash("checksum-rotate-next-refresh"),
+        accessExpiresAt: 1_000_000,
+        refreshExpiresAt: 2_000_000,
+        expectedPrincipal: original.principal,
+        now: 2_000,
+      });
+      const refreshed: AuthenticatedSessionContext = {
+        sessionId: rotated.sessionId,
+        sessionFamilyId: rotated.familyId,
+        principal: original.principal,
+      };
+      transport.continueChecksum();
+      await expect(beginning).rejects.toMatchObject({ status: 403, code: "session_revoked" });
+
+      const page0 = await client.beginRoomRepair(
+        refreshed, "checksum-rotate-new", "checksum-rotate-room",
+      );
+      if ("kind" in page0) throw new Error("expected attached streaming page zero");
+      expect(page0).toMatchObject({
+        mode: "streaming",
+        page: 0,
+        snapshotId: transport.snapshotId,
+        snapshotChecksum: "paused-checksum",
+      });
+      expect(transport.materializedAttempts).toBe(1);
+      expect(transport.checksumPasses).toBe(1);
+      await client.close();
+      await authority.close();
+    });
+
+    it("does not publish a continuation whose authorization returns after explicit release", async () => {
+      const fixture = await createDatabaseFixture({
+        rooms: [{ roomId: "paused-checksum-room" }],
+      });
+      const context = fixture.contexts[0]!;
+      const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+      let pageOneReachedResolve: (() => void) | undefined;
+      const pageOneReached = new Promise<void>((resolve) => { pageOneReachedResolve = resolve; });
+      let continuePageOne: (() => void) | undefined;
+      const pageOneGate = new Promise<void>((resolve) => { continuePageOne = resolve; });
+      const delayedAuthority: StreamingRepairAuthority = {
+        acquireStreamingRepair: (session, scope, now) =>
+          authority.acquireStreamingRepair(session, scope, now),
+        registerStreamingRepair: (snapshotId, checksum, pageCount, now) =>
+          authority.registerStreamingRepair(snapshotId, checksum, pageCount, now),
+        async authorizeStreamingRepairPage(session, snapshotId, page, now) {
+          const authorized = await authority.authorizeStreamingRepairPage(
+            session, snapshotId, page, now,
+          );
+          if (page === 1) {
+            pageOneReachedResolve?.();
+            await pageOneGate;
+          }
+          return authorized;
+        },
+        completeStreamingRepair: (session, snapshotId, version, checksum, now) =>
+          authority.completeStreamingRepair(session, snapshotId, version, checksum, now),
+        releaseStreamingRepair: (session, snapshotId, now) =>
+          authority.releaseStreamingRepair(session, snapshotId, now),
+      };
+      const transport = new PausedChecksumTransport();
+      const client = await createSnapshotWorkerClientForTest({
+        authorityPath: fixture.authorityPath,
+        cachePath: fixture.cachePath,
+        revalidate: (validation) => authority.revalidateSnapshot(validation, 2_000),
+        streamingAuthority: delayedAuthority,
+        clock: () => 2_000,
+      }, () => transport);
+      const beginning = client.beginRoomRepair(
+        context, "delayed-authorize-zero", "paused-checksum-room",
+      );
+      await transport.checksumReached;
+      transport.continueChecksum();
+      const page0 = await beginning;
+      if ("kind" in page0) throw new Error("expected streaming page zero");
+      const reading = client.readRoomRepairPage(
+        context, "delayed-authorize-one", page0.snapshotId, 0,
+      );
+      await pageOneReached;
+      await client.releaseSnapshot(context, page0.snapshotId);
+      continuePageOne?.();
+      await expect(reading).rejects.toMatchObject({ code: "snapshot_not_found" });
+      expect(transport.releaseRequests).toBe(1);
+      await client.close();
+      await authority.close();
+    });
+
+    it("clears worker state when continuation authorization observes idle expiry", async () => {
+      const fixture = await createDatabaseFixture({
+        rooms: [{ roomId: "paused-checksum-room" }],
+      });
+      const context = fixture.contexts[0]!;
+      let now = 2_000;
+      const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+      const transport = new PausedChecksumTransport();
+      const client = await createSnapshotWorkerClientForTest({
+        authorityPath: fixture.authorityPath,
+        cachePath: fixture.cachePath,
+        revalidate: (validation) => authority.revalidateSnapshot(validation, now),
+        streamingAuthority: authority,
+        clock: () => now,
+      }, () => transport);
+      const beginning = client.beginRoomRepair(
+        context, "continuation-expiry-zero", "paused-checksum-room",
+      );
+      await transport.checksumReached;
+      transport.continueChecksum();
+      const page0 = await beginning;
+      if ("kind" in page0) throw new Error("expected streaming page zero");
+      now = 32_000;
+      await expect(client.readRoomRepairPage(
+        context, "continuation-expiry-one", page0.snapshotId, 0,
+      )).rejects.toMatchObject({ status: 410, code: "snapshot_expired" });
+      expect(transport.releaseRequests).toBe(1);
+      await expect(authority.executeHuman({
+        ...context,
+        kind: "human",
+        requestId: "continuation-expiry-write",
+        idempotencyKey: "continuation-expiry-write",
+      }, {
+        type: "message.send",
+        roomId: "paused-checksum-room",
+        payload: {
+          id: "continuation-expiry-write",
+          roomId: "paused-checksum-room",
+          body: "expired lease released",
+          sentAt: "2026-08-11T00:00:00.000Z",
+        },
+      }, now)).resolves.toBeDefined();
+      await client.close();
+      await authority.close();
+    });
+
+    it("clears worker state when continuation authorization observes family preemption", async () => {
+      const fixture = await createDatabaseFixture({
+        rooms: [{ roomId: "paused-checksum-room" }],
+      });
+      const context = fixture.contexts[0]!;
+      const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+      const transport = new PausedChecksumTransport();
+      const client = await createSnapshotWorkerClientForTest({
+        authorityPath: fixture.authorityPath,
+        cachePath: fixture.cachePath,
+        revalidate: (validation) => authority.revalidateSnapshot(validation, 2_000),
+        streamingAuthority: authority,
+        clock: () => 2_000,
+      }, () => transport);
+      const beginning = client.beginRoomRepair(
+        context, "continuation-preempt-zero", "paused-checksum-room",
+      );
+      await transport.checksumReached;
+      transport.continueChecksum();
+      const page0 = await beginning;
+      if ("kind" in page0) throw new Error("expected streaming page zero");
+      await authority.revokeSession(context.sessionId, 2_001);
+      await expect(client.readRoomRepairPage(
+        context, "continuation-preempt-one", page0.snapshotId, 0,
+      )).rejects.toMatchObject({ status: 403, code: "snapshot_family_revoked" });
+      expect(transport.releaseRequests).toBe(1);
+      await client.close();
+      await authority.close();
+    });
+
+    it("rejects a continuation when the worker fails before its queued response", async () => {
+      const fixture = await createDatabaseFixture({
+        rooms: [{ roomId: "paused-checksum-room" }],
+      });
+      const context = fixture.contexts[0]!;
+      const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+      const transport = new PausedChecksumTransport();
+      const client = await createSnapshotWorkerClientForTest({
+        authorityPath: fixture.authorityPath,
+        cachePath: fixture.cachePath,
+        revalidate: (validation) => authority.revalidateSnapshot(validation, 2_000),
+        streamingAuthority: authority,
+        clock: () => 2_000,
+      }, () => transport);
+      const beginning = client.beginRoomRepair(
+        context, "continuation-terminal-zero", "paused-checksum-room",
+      );
+      await transport.checksumReached;
+      transport.continueChecksum();
+      const page0 = await beginning;
+      if ("kind" in page0) throw new Error("expected streaming page zero");
+      const reading = client.readRoomRepairPage(
+        context, "continuation-terminal-one", page0.snapshotId, 0,
+      );
+      transport.emit("error", new Error("continuation worker failure"));
+      await expect(reading).rejects.toMatchObject({ code: "snapshot_worker_error" });
+      expect(transport.terminateCount).toBe(1);
+      await authority.close();
+    });
+
+    it("releases a room lease when closed during the checksum pass", async () => {
+      const fixture = await createDatabaseFixture({
+        rooms: [{ roomId: "checksum-close-room" }],
+      });
+      const context = fixture.contexts[0]!;
+      const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+      const transport = new PausedChecksumTransport();
+      const client = await createSnapshotWorkerClientForTest({
+        authorityPath: fixture.authorityPath,
+        cachePath: fixture.cachePath,
+        revalidate: (validation) => authority.revalidateSnapshot(validation, 2_000),
+        streamingAuthority: authority,
+        clock: () => 2_000,
+      }, () => transport);
+      const beginning = client.beginRoomRepair(
+        context, "checksum-close-room-zero", "checksum-close-room",
+      );
+      await transport.checksumReached;
+      const command = (requestId: string) => authority.executeHuman({
+        ...context, kind: "human" as const, requestId, idempotencyKey: requestId,
+      }, {
+        type: "message.send" as const,
+        roomId: "checksum-close-room",
+        payload: {
+          id: requestId,
+          roomId: "checksum-close-room",
+          body: "lease lifecycle",
+          sentAt: "2026-08-11T00:00:00.000Z",
+        },
+      }, 2_000);
+      await expect(command("checksum-close-room-blocked"))
+        .rejects.toMatchObject({ status: 503, code: "repair_barrier_active" });
+
+      await client.close();
+      expect(transport.releaseRequests).toBe(1);
+      await expect(command("checksum-close-room-released")).resolves.toBeDefined();
+      transport.continueChecksum();
+      await expect(beginning).rejects.toMatchObject({ code: "snapshot_worker_closed" });
+      await expect(command("checksum-close-room-still-released")).resolves.toBeDefined();
+      await authority.close();
+    });
+
+    it("releases a catalog lease when closed during the checksum pass", async () => {
+      const fixture = await createDatabaseFixture();
+      const context = fixture.contexts[0]!;
+      const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+      const transport = new PausedChecksumTransport();
+      const client = await createSnapshotWorkerClientForTest({
+        authorityPath: fixture.authorityPath,
+        cachePath: fixture.cachePath,
+        revalidate: (validation) => authority.revalidateSnapshot(validation, 2_000),
+        streamingAuthority: authority,
+        clock: () => 2_000,
+      }, () => transport);
+      const beginning = client.beginWorkspaceBootstrap(context, "checksum-close-catalog-zero");
+      await transport.checksumReached;
+      const createRoom = (requestId: string) => authority.executeHuman({
+        ...context, kind: "human" as const, requestId, idempotencyKey: requestId,
+      }, {
+        type: "room.create" as const,
+        payload: { name: requestId },
+      }, 2_000);
+      await expect(createRoom("checksum-close-catalog-blocked"))
+        .rejects.toMatchObject({ status: 503, code: "repair_barrier_active" });
+
+      await client.close();
+      expect(transport.releaseRequests).toBe(1);
+      await expect(createRoom("checksum-close-catalog-released")).resolves.toBeDefined();
+      transport.continueChecksum();
+      await expect(beginning).rejects.toMatchObject({ code: "snapshot_worker_closed" });
+      await expect(createRoom("checksum-close-catalog-still-released")).resolves.toBeDefined();
+      await authority.close();
+    });
+
+    it("releases an acquired lease when the worker fails during the checksum pass", async () => {
+      const fixture = await createDatabaseFixture({
+        rooms: [{ roomId: "checksum-terminal-room" }],
+      });
+      const context = fixture.contexts[0]!;
+      const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+      const transport = new PausedChecksumTransport();
+      const client = await createSnapshotWorkerClientForTest({
+        authorityPath: fixture.authorityPath,
+        cachePath: fixture.cachePath,
+        revalidate: (validation) => authority.revalidateSnapshot(validation, 2_000),
+        streamingAuthority: authority,
+        clock: () => 2_000,
+      }, () => transport);
+      const beginning = client.beginRoomRepair(
+        context, "checksum-terminal-zero", "checksum-terminal-room",
+      );
+      await transport.checksumReached;
+      transport.emit("error", new Error("worker failed during checksum"));
+      await expect(beginning).rejects.toMatchObject({ code: "snapshot_worker_error" });
+      expect(transport.terminateCount).toBe(1);
+
+      await expect(authority.executeHuman({
+        ...context,
+        kind: "human",
+        requestId: "checksum-terminal-released",
+        idempotencyKey: "checksum-terminal-released",
+      }, {
+        type: "message.send",
+        roomId: "checksum-terminal-room",
+        payload: {
+          id: "checksum-terminal-released",
+          roomId: "checksum-terminal-room",
+          body: "terminal release",
+          sentAt: "2026-08-11T00:00:00.000Z",
+        },
+      }, 2_000)).resolves.toBeDefined();
+      transport.continueChecksum();
+      await authority.close();
+    });
+
+    it("releases worker state when explicitly released during the checksum pass", async () => {
+      const fixture = await createDatabaseFixture({
+        rooms: [{ roomId: "checksum-explicit-room" }],
+      });
+      const context = fixture.contexts[0]!;
+      const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+      const transport = new PausedChecksumTransport();
+      const client = await createSnapshotWorkerClientForTest({
+        authorityPath: fixture.authorityPath,
+        cachePath: fixture.cachePath,
+        revalidate: (validation) => authority.revalidateSnapshot(validation, 2_000),
+        streamingAuthority: authority,
+        clock: () => 2_000,
+      }, () => transport);
+      const beginning = client.beginRoomRepair(
+        context, "checksum-explicit-zero", "checksum-explicit-room",
+      );
+      await transport.checksumReached;
+      await client.releaseSnapshot(context, transport.snapshotId);
+      expect(transport.releaseRequests).toBe(1);
+      transport.continueChecksum();
+      await expect(beginning).rejects.toMatchObject({ code: "snapshot_not_found" });
+      await expect(authority.executeHuman({
+        ...context,
+        kind: "human",
+        requestId: "checksum-explicit-released",
+        idempotencyKey: "checksum-explicit-released",
+      }, {
+        type: "message.send",
+        roomId: "checksum-explicit-room",
+        payload: {
+          id: "checksum-explicit-released",
+          roomId: "checksum-explicit-room",
+          body: "explicit release",
+          sentAt: "2026-08-11T00:00:00.000Z",
+        },
+      }, 2_000)).resolves.toBeDefined();
+      await client.close();
+      await authority.close();
+    });
+
+    it("releases only this client's unauthorized page-zero lease on close", async () => {
+      const owner = contextFor("close-owner", "close-owner-family");
+      const target: AuthenticatedSessionContext = {
+        sessionId: tokenHash("close-target-access"),
+        sessionFamilyId: tokenHash("close-target-family"),
+        principal: { accountId: "close-target-account", actorId: "close-target" },
+      };
+      const fixture = await createDatabaseFixture({
+        contexts: [owner, target],
+        rooms: [{ roomId: "close-room-a" }, { roomId: "close-room-b" }],
+      });
+      const seeded = new DatabaseSync(fixture.authorityPath);
+      const insertMembership = seeded.prepare(
+        `INSERT INTO room_memberships (
+           room_id, actor_id, kind, role, participation, tool_permissions_json,
+           joined_at, configured_at, access_revision
+         ) VALUES (?, ?, 'human', 'member', NULL, '[]', 't', NULL, 1)`,
+      );
+      insertMembership.run("close-room-a", target.principal.actorId);
+      insertMembership.run("close-room-b", target.principal.actorId);
+      seeded.prepare(
+        "UPDATE sessions SET access_expires_at = 2001 WHERE access_token_hash = ?",
+      ).run(target.sessionId);
+      seeded.close();
+      let now = 2_000;
+      const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+      const transportA = new PausedChecksumTransport();
+      const transportB = new PausedChecksumTransport();
+      const clientA = await createSnapshotWorkerClientForTest({
+        authorityPath: fixture.authorityPath,
+        cachePath: fixture.cachePath,
+        revalidate: (validation) => authority.revalidateSnapshot(validation, now),
+        streamingAuthority: authority,
+        clock: () => now,
+      }, () => transportA);
+      const clientB = await createSnapshotWorkerClientForTest({
+        authorityPath: fixture.authorityPath,
+        cachePath: join(fixture.directory, "snapshot-cache-b.sqlite"),
+        revalidate: (validation) => authority.revalidateSnapshot(validation, now),
+        streamingAuthority: authority,
+        clock: () => now,
+      }, () => transportB);
+      const beginningA = clientA.beginRoomRepair(target, "close-a-zero", "close-room-a");
+      const beginningB = clientB.beginRoomRepair(target, "close-b-zero", "close-room-b");
+      await Promise.all([transportA.checksumReached, transportB.checksumReached]);
+      now = 2_002;
+      transportA.continueChecksum();
+      transportB.continueChecksum();
+      await expect(beginningA).rejects.toMatchObject({ status: 401, code: "token_expired" });
+      await expect(beginningB).rejects.toMatchObject({ status: 401, code: "token_expired" });
+
+      await clientA.close();
+      const commandContext = {
+        ...owner,
+        kind: "human" as const,
+        requestId: "close-write-a",
+        idempotencyKey: "close-write-a",
+      };
+      await expect(authority.executeHuman(commandContext, {
+        type: "message.send",
+        roomId: "close-room-a",
+        payload: { id: "close-write-a", roomId: "close-room-a", body: "released",
+          sentAt: "2026-08-11T00:00:00.000Z" },
+      }, now)).resolves.toMatchObject({ aggregateId: "close-write-a" });
+      await expect(authority.executeHuman({
+        ...commandContext,
+        requestId: "close-write-b-blocked",
+        idempotencyKey: "close-write-b-blocked",
+      }, {
+        type: "message.send",
+        roomId: "close-room-b",
+        payload: { id: "close-write-b-blocked", roomId: "close-room-b", body: "blocked",
+          sentAt: "2026-08-11T00:00:01.000Z" },
+      }, now)).rejects.toMatchObject({ status: 503, code: "repair_barrier_active" });
+      await clientB.close();
+      await expect(authority.executeHuman({
+        ...commandContext,
+        requestId: "close-write-b",
+        idempotencyKey: "close-write-b",
+      }, {
+        type: "message.send",
+        roomId: "close-room-b",
+        payload: { id: "close-write-b", roomId: "close-room-b", body: "released",
+          sentAt: "2026-08-11T00:00:02.000Z" },
+      }, now)).resolves.toMatchObject({ aggregateId: "close-write-b" });
+      await authority.close();
+    });
+
+    it("retains a paused checksum after token expiry and reuses it after refresh", async () => {
+
+    const fixture = await createDatabaseFixture({
+      rooms: [{ roomId: "paused-checksum-room" }],
+    });
+    const original = fixture.contexts[0]!;
+    const seeded = new DatabaseSync(fixture.authorityPath);
+    seeded.prepare(
+      "UPDATE sessions SET access_expires_at = 2001 WHERE access_token_hash = ?",
+    ).run(original.sessionId);
+    seeded.close();
+    let now = 2_000;
+    const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+    const transport = new PausedChecksumTransport();
+    const client = await createSnapshotWorkerClientForTest({
+      authorityPath: fixture.authorityPath,
+      cachePath: fixture.cachePath,
+      revalidate: (validation) => authority.revalidateSnapshot(validation, now),
+      streamingAuthority: authority,
+      clock: () => now,
+    }, () => transport);
+    const beginning = client.beginRoomRepair(
+      original, "paused-checksum-zero", "paused-checksum-room",
+    );
+    await transport.checksumReached;
+    const concurrentBeginning = client.beginRoomRepair(
+      original, "paused-checksum-concurrent-zero", "paused-checksum-room",
+    ).then(
+      () => undefined,
+      (cause: unknown) => cause,
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    now = 2_002;
+    transport.continueChecksum();
+    await expect(beginning).rejects.toMatchObject({ status: 401, code: "token_expired" });
+    expect(await concurrentBeginning).toMatchObject({ status: 401, code: "token_expired" });
+    const currentRefreshTokenHash = tokenHash(`refresh-${original.sessionId}`);
+    const rotated = await authority.rotateSession({
+      currentRefreshTokenHash,
+      accessTokenHash: tokenHash("paused-checksum-next-access"),
+      refreshTokenHash: tokenHash("paused-checksum-next-refresh"),
+      accessExpiresAt: 1_000_000,
+      refreshExpiresAt: 2_000_000,
+      expectedPrincipal: original.principal,
+      now,
+    });
+    const refreshed: AuthenticatedSessionContext = {
+      sessionId: rotated.sessionId,
+      sessionFamilyId: rotated.familyId,
+      principal: original.principal,
+    };
+
+    const page0 = await client.beginRoomRepair(
+      refreshed, "paused-checksum-retry-zero", "paused-checksum-room",
+    );
+    expect(page0).toMatchObject({ mode: "streaming", page: 0, hasMore: true });
+    if ("kind" in page0) throw new Error("expected streaming page");
+    expect(page0.snapshotId).toBe(transport.snapshotId);
+    expect(transport.checksumPasses).toBe(1);
+    expect(transport.materializedAttempts).toBe(1);
+    await expect(client.readRoomRepairPage(
+      refreshed, "paused-checksum-one", page0.snapshotId, 0,
+    )).resolves.toMatchObject({ mode: "streaming", page: 1, hasMore: false });
+    await client.close();
+    await authority.close();
+    });
+  });
+
+  it("reuses an unauthorized deadline fallback before a second materialized scan", async () => {
+    const fixture = await createDatabaseFixture({
+      rooms: [{ roomId: "deadline-retry-room", messageCount: 400 }],
+    });
+    const original = fixture.contexts[0]!;
+    const normalized = new DatabaseSync(fixture.authorityPath);
+    normalized.prepare(
+      "UPDATE streams SET head_seq = 0 WHERE stream_kind = 'room' AND stream_id = ?",
+    ).run("deadline-retry-room");
+    normalized.close();
+    const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+    let failPage0 = true;
+    let registered: Awaited<ReturnType<StreamingRepairAuthority["registerStreamingRepair"]>> | undefined;
+    const streamingAuthority: StreamingRepairAuthority = {
+      acquireStreamingRepair: (context, scope, now) =>
+        authority.acquireStreamingRepair(context, scope, now),
+      async registerStreamingRepair(snapshotId, checksum, pageCount, now) {
+        registered = await authority.registerStreamingRepair(snapshotId, checksum, pageCount, now);
+        return registered;
+      },
+      async authorizeStreamingRepairPage(context, snapshotId, page, now) {
+        if (failPage0) {
+          failPage0 = false;
+          throw Object.assign(new Error("expired at page zero"), {
+            code: "token_expired", status: 401,
+          });
+        }
+        return authority.authorizeStreamingRepairPage(context, snapshotId, page, now);
+      },
+      completeStreamingRepair: (context, snapshotId, version, checksum, now) =>
+        authority.completeStreamingRepair(context, snapshotId, version, checksum, now),
+      releaseStreamingRepair: (context, snapshotId, now) =>
+        authority.releaseStreamingRepair(context, snapshotId, now),
+    };
+    let now = 2_000;
+    const paused = await createSnapshotWorkerClientWithPauseForTest({
+      authorityPath: fixture.authorityPath,
+      cachePath: fixture.cachePath,
+      revalidate: (validation) => authority.revalidateSnapshot(validation, now),
+      streamingAuthority,
+      clock: () => now,
+      limits: { buildDeadlineMs: 1, maxRecordsPerPage: 100 },
+    });
+    const beginning = paused.client.beginRoomRepair(
+      original, "deadline-retry-zero", "deadline-retry-room",
+    );
+    await paused.hooks.waitForFixedView();
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    paused.hooks.continueBuild();
+    await expect(beginning).rejects.toMatchObject({ status: 401, code: "token_expired" });
+    if (registered === undefined) throw new Error("streaming checksum was not attached");
+    now = 2_002;
+    const rotated = await authority.rotateSession({
+      currentRefreshTokenHash: tokenHash(`refresh-${original.sessionId}`),
+      accessTokenHash: tokenHash("deadline-retry-next-access"),
+      refreshTokenHash: tokenHash("deadline-retry-next-refresh"),
+      accessExpiresAt: 1_000_000,
+      refreshExpiresAt: 2_000_000,
+      expectedPrincipal: original.principal,
+      now,
+    });
+    const refreshed: AuthenticatedSessionContext = {
+      sessionId: rotated.sessionId,
+      sessionFamilyId: rotated.familyId,
+      principal: original.principal,
+    };
+    const page0 = await paused.client.beginRoomRepair(
+      refreshed, "deadline-retry-refreshed-zero", "deadline-retry-room",
+    );
+    if ("kind" in page0) throw new Error("expected streaming retry page");
+    expect(page0).toMatchObject({
+      mode: "streaming",
+      page: 0,
+      snapshotId: registered.snapshotId,
+      snapshotChecksum: registered.checksum,
+    });
+    const hooks = paused.hooks as typeof paused.hooks & {
+      materializedBuildCount(): number;
+    };
+    expect(hooks.materializedBuildCount()).toBe(1);
+    await paused.client.close();
+    await authority.close();
   });
 
   it("reclaims expired logical quota without deleting an active snapshot", async () => {
@@ -1089,6 +3055,138 @@ describe("durable materialized snapshot worker", () => {
       contextFor("mismatch"), "public-request", "room-mismatch",
     )).rejects.toMatchObject({ status: 503, code: "snapshot_worker_protocol_error" });
   });
+
+  it.each(["room", "catalog"] as const)(
+    "fails terminally when a streaming %s envelope is internally valid but lease-mismatched",
+    async (kind) => {
+      const context = contextFor(`stream-envelope-${kind}`);
+      const expectedRoomId = "stream-envelope-room";
+      const snapshotId = `stream-envelope-${kind}-snapshot`;
+      const baseLease = {
+        snapshotId,
+        principalId: context.principal.actorId,
+        accountId: context.principal.accountId,
+        sessionFamilyId: context.sessionFamilyId,
+        scope: kind === "room"
+          ? { kind, roomId: expectedRoomId }
+          : { kind, principalId: context.principal.actorId },
+        version: kind === "room"
+          ? { kind, roomId: expectedRoomId, watermark: 7 }
+          : { kind, catalogRevision: 11 },
+        authorizationRevision: kind === "room" ? 3 : 11,
+        idleExpiresAt: "2026-08-11T00:00:30.000Z",
+      } as StreamingRepairLease;
+      class LeaseMismatchedStreamingTransport extends EventEmitter
+        implements SnapshotWorkerTransport {
+        postMessage(request: SnapshotWorkerRequest): void {
+          queueMicrotask(() => {
+            if (request.type === "snapshot.initialize") {
+              this.emit("message", { type: "snapshot.ready", requestId: request.requestId });
+              return;
+            }
+            if (request.type === "snapshot.begin-room" ||
+                request.type === "snapshot.begin-catalog") {
+              this.emit("message", {
+                type: "snapshot.fallback", requestId: request.requestId, reason: "quota",
+              });
+              return;
+            }
+            if (request.type === "snapshot.cache-count") {
+              this.emit("message", {
+                type: "snapshot.cache-count", requestId: request.requestId, count: 0,
+              });
+              return;
+            }
+            if (request.type !== "snapshot.begin-streaming") return;
+            if (kind === "room") {
+              this.emit("message", {
+                type: "snapshot.streaming-page",
+                requestId: request.requestId,
+                manifest: {
+                  snapshotId,
+                  principalId: context.principal.actorId,
+                  sessionFamilyId: context.sessionFamilyId,
+                  checksum: "stream-envelope-checksum",
+                  pageCount: 1,
+                  kind: "room",
+                  roomId: "wrong-room",
+                  accessRevision: 99,
+                  watermark: 8,
+                },
+                page: {
+                  type: "room.repair.page",
+                  requestId: request.responseRequestId,
+                  snapshotId,
+                  roomId: "wrong-room",
+                  page: 0,
+                  records: [],
+                  watermark: 8,
+                  snapshotChecksum: "stream-envelope-checksum",
+                  hasMore: false,
+                  mode: "streaming",
+                  idleExpiresAt: request.lease.idleExpiresAt,
+                },
+              });
+              return;
+            }
+            this.emit("message", {
+              type: "snapshot.streaming-page",
+              requestId: request.requestId,
+              manifest: {
+                snapshotId,
+                principalId: context.principal.actorId,
+                sessionFamilyId: context.sessionFamilyId,
+                checksum: "stream-envelope-checksum",
+                pageCount: 1,
+                kind: "catalog",
+                catalogRevision: 12,
+              },
+              page: {
+                type: "workspace.bootstrap.page",
+                requestId: request.responseRequestId,
+                snapshotId,
+                page: 0,
+                rooms: [],
+                catalogRevision: 12,
+                snapshotChecksum: "stream-envelope-checksum",
+                hasMore: false,
+                mode: "streaming",
+                idleExpiresAt: request.lease.idleExpiresAt,
+              },
+            });
+          });
+        }
+        async terminate(): Promise<number> { return 0; }
+      }
+      const authority: StreamingRepairAuthority = {
+        async acquireStreamingRepair() { return baseLease; },
+        async registerStreamingRepair(_id, checksum, pageCount) {
+          return { ...baseLease, checksum, pageCount, lastPage: 0, highestAuthorizedPage: -1 };
+        },
+        async authorizeStreamingRepairPage() {
+          return { ...baseLease, checksum: "stream-envelope-checksum", pageCount: 1,
+            lastPage: 0, highestAuthorizedPage: 0 };
+        },
+        async completeStreamingRepair(_session, id, version) {
+          return { type: "snapshot.completed", requestId: "internal", snapshotId: id, version };
+        },
+        async releaseStreamingRepair() {},
+      };
+      const client = await createSnapshotWorkerClientForTest({
+        authorityPath: "/not-opened/stream-envelope-authority.sqlite",
+        cachePath: "/not-opened/stream-envelope-cache.sqlite",
+        revalidate: async () => undefined,
+        streamingAuthority: authority,
+      }, () => new LeaseMismatchedStreamingTransport());
+      const result = kind === "room"
+        ? client.beginRoomRepair(context, "stream-envelope-room", expectedRoomId)
+        : client.beginWorkspaceBootstrap(context, "stream-envelope-catalog");
+      await expect(result).rejects.toMatchObject({
+        status: 503,
+        code: "snapshot_worker_protocol_error",
+      });
+    },
+  );
 
   it("keeps raw snapshot worker, cache path, and fault hooks off the package root", async () => {
     const publicApi: Record<string, unknown> = await import("../index.js");

@@ -35,6 +35,11 @@ import {
   type SnapshotRevalidationRequest,
 } from "./contracts.js";
 import type { AuthorityWorkerErrorCode } from "./worker-protocol.js";
+import type {
+  RepairMutationImpact,
+  RepairScope,
+} from "../fallback-repair-coordinator.js";
+import type { SnapshotVersion } from "@native-im/core";
 
 export class AuthorityDatabaseError extends Error {
   constructor(
@@ -54,12 +59,19 @@ export interface ExecuteHumanDatabaseCommandInput {
     readonly sealedToken: string;
   };
   readonly now: number;
+  readonly beforeApply?: (actorId: string) => void;
 }
 
 export interface ExecuteAgentDatabaseCommandInput {
   readonly context: AgentWorkerCommandContext;
   readonly command: AgentCollaborationCommand;
   readonly now: number;
+  readonly beforeApply?: (actorId: string) => void;
+}
+
+export interface DatabaseCommandResult {
+  readonly acknowledgement: CommandAcknowledgement;
+  readonly disposition: "applied" | "replayed";
 }
 
 function fail(code: AuthorityWorkerErrorCode, message: string): never {
@@ -144,6 +156,7 @@ interface IdempotentCommandInput {
   readonly aggregateId: string;
   readonly idempotencyKey: string;
   readonly now: number;
+  readonly beforeApply?: () => void;
   readonly execute: (
     acceptedAt: string,
     scope: string,
@@ -154,7 +167,7 @@ interface IdempotentCommandInput {
 function executeIdempotently(
   database: DatabaseSync,
   input: IdempotentCommandInput,
-): CommandAcknowledgement {
+): DatabaseCommandResult {
   const scope = [
     input.actorId,
     input.command.type,
@@ -175,8 +188,12 @@ function executeIdempotently(
     if (typeof existing.responseJson !== "string") {
       return fail("storage_unavailable", "Stored idempotency acknowledgement is corrupt");
     }
-    return parseStoredAcknowledgement(existing.responseJson);
+    return {
+      acknowledgement: parseStoredAcknowledgement(existing.responseJson),
+      disposition: "replayed",
+    };
   }
+  input.beforeApply?.();
   const acceptedAt = new Date(input.now).toISOString();
   const acknowledgement = input.execute(
     acceptedAt,
@@ -198,7 +215,7 @@ function executeIdempotently(
       acceptedAt,
       new Date(input.now + 30 * 24 * 60 * 60 * 1_000).toISOString(),
     );
-  return acknowledgement;
+  return { acknowledgement, disposition: "applied" };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -328,6 +345,99 @@ export function revalidateSnapshotDatabaseQuery(
       return fail("snapshot_stale", "Snapshot room access revision changed");
     }
   });
+}
+
+export function inspectStreamingRepairScopeDatabaseQuery(
+  database: DatabaseSync,
+  context: AuthenticatedSessionContext,
+  scope: RepairScope,
+  now: number,
+): { readonly version: SnapshotVersion; readonly authorizationRevision: number } {
+  return runAuthorityImmediateTransaction(database, () => {
+    const actorId = requireHumanSession(database, context, now);
+    if (scope.kind === "catalog") {
+      if (scope.principalId !== actorId) {
+        return fail("snapshot_forbidden", "Streaming catalog principal was rejected");
+      }
+      const actor = database.prepare(
+        "SELECT catalog_revision AS catalogRevision FROM actors WHERE id = ?",
+      ).get(actorId);
+      if (typeof actor?.catalogRevision !== "number") {
+        return fail("snapshot_forbidden", "Streaming catalog principal was rejected");
+      }
+      return {
+        version: { kind: "catalog", catalogRevision: actor.catalogRevision },
+        authorizationRevision: actor.catalogRevision,
+      };
+    }
+    const row = database.prepare(
+      `SELECT room.status AS roomStatus,
+              membership.access_revision AS accessRevision,
+              stream.head_seq AS watermark
+       FROM rooms AS room
+       JOIN room_memberships AS membership ON membership.room_id = room.id
+       JOIN streams AS stream ON stream.stream_kind = 'room' AND stream.stream_id = room.id
+       WHERE room.id = ? AND membership.actor_id = ? AND membership.kind = 'human'`,
+    ).get(scope.roomId, actorId);
+    if (row === undefined) {
+      const room = database.prepare("SELECT status FROM rooms WHERE id = ?")
+        .get(scope.roomId);
+      if (room === undefined) return fail("room_not_found", "Streaming room was not found");
+      return fail("room_forbidden", "Streaming room membership was rejected");
+    }
+    if (row.roomStatus !== "active") {
+      return fail("room_archived", "Streaming room is archived");
+    }
+    if (typeof row.accessRevision !== "number" || typeof row.watermark !== "number") {
+      return fail("storage_unavailable", "Streaming room version is corrupt");
+    }
+    return {
+      version: { kind: "room", roomId: scope.roomId, watermark: row.watermark },
+      authorizationRevision: row.accessRevision,
+    };
+  });
+}
+
+export function validateHumanSessionDatabaseQuery(
+  database: DatabaseSync,
+  context: AuthenticatedSessionContext,
+  now: number,
+): string {
+  return runAuthorityImmediateTransaction(database, () =>
+    requireHumanSession(database, context, now));
+}
+
+export function repairMutationImpactDatabaseQuery(
+  database: DatabaseSync,
+  actorId: string,
+  command: HumanCollaborationCommand | RoomGovernanceCommand | AgentCollaborationCommand,
+): RepairMutationImpact {
+  if (command.type === "room.create") {
+    return { roomIds: [], catalogPrincipalIds: [actorId] };
+  }
+  let roomId: string;
+  if (command.type === "human.invitation.decide") {
+    const invitation = invitationByToken(database, command.payload.token);
+    if (typeof invitation.roomId !== "string") {
+      return fail("storage_unavailable", "Authority invitation is corrupt");
+    }
+    roomId = invitation.roomId;
+  } else {
+    roomId = command.roomId;
+  }
+  let catalogPrincipalIds: readonly string[] = [];
+  if (command.type === "room.rename" || command.type === "room.archive") {
+    catalogPrincipalIds = database.prepare(
+      `SELECT actor_id AS actorId FROM room_memberships
+       WHERE room_id = ? AND kind = 'human' ORDER BY actor_id`,
+    ).all(roomId).map((row) => String(row.actorId));
+  } else if (command.type === "human.invitation.decide" &&
+      command.payload.decision === "accept") {
+    catalogPrincipalIds = [actorId];
+  } else if (command.type === "human.role.change" || command.type === "member.remove") {
+    catalogPrincipalIds = [command.payload.targetActorId];
+  }
+  return { roomIds: [roomId], catalogPrincipalIds };
 }
 
 export function readHistoryDatabaseQuery(
@@ -2653,7 +2763,7 @@ function executeAgentExecutionTransition(
 export function executeAgentDatabaseCommand(
   database: DatabaseSync,
   input: ExecuteAgentDatabaseCommandInput,
-): CommandAcknowledgement {
+): DatabaseCommandResult {
   return runAuthorityImmediateTransaction(database, () => {
     const parsed = parsePersistentCommand(input.command);
     if (!parsed.ok) {
@@ -2670,6 +2780,9 @@ export function executeAgentDatabaseCommand(
         ? input.command.payload.id
         : input.context.idempotencyKey,
       now: input.now,
+      beforeApply() {
+        input.beforeApply?.(agentId);
+      },
       execute(acceptedAt, scope, key) {
         return input.command.type === "message.send"
           ? executeMessageSend(
@@ -2712,14 +2825,13 @@ export function executeAgentDatabaseCommand(
 export function executeHumanDatabaseCommand(
   database: DatabaseSync,
   input: ExecuteHumanDatabaseCommandInput,
-): CommandAcknowledgement {
+): DatabaseCommandResult {
   return runAuthorityImmediateTransaction(database, () => {
     const parsed = parsePersistentCommand(input.command);
     if (!parsed.ok) {
       return fail("invalid_request", "Authority command payload was rejected");
     }
     const actorId = requireHumanSession(database, input.context, input.now);
-    recheckHumanCommandAuthority(database, actorId, input.command);
     const aggregateKind = input.command.type === "room.create" ? "identity" : "room";
     const aggregateId = input.command.type === "room.create"
       ? actorId
@@ -2731,6 +2843,7 @@ export function executeHumanDatabaseCommand(
               : fail("storage_unavailable", "Authority invitation is corrupt");
           })()
         : input.command.roomId;
+    recheckHumanCommandAuthority(database, actorId, input.command);
     return executeIdempotently(database, {
       actorId,
       command: input.command,
@@ -2740,6 +2853,9 @@ export function executeHumanDatabaseCommand(
         ? input.command.payload.id
         : input.context.idempotencyKey,
       now: input.now,
+      beforeApply() {
+        input.beforeApply?.(actorId);
+      },
       execute(acceptedAt, scope, key) {
         const eventId = stableId("event", scope, key, "0");
         return input.command.type === "message.send"

@@ -9,6 +9,8 @@ import type {
   Message,
   RoomSyncRequest,
   RoomSyncResult,
+  SnapshotCompleted,
+  SnapshotVersion,
 } from "@native-im/core";
 import type { RoomAuditRecord } from "../room-lifecycle.js";
 import {
@@ -38,6 +40,8 @@ import type {
   OutboxDeliveryFailureReason,
   OutboxDispatchCandidate,
   RoomGovernanceCommand,
+  RepairScope,
+  StreamingRepairLease,
   SnapshotRevalidationRequest,
 } from "./contracts.js";
 import {
@@ -50,7 +54,7 @@ export interface CreateWorkerDatabaseClientOptions {
 }
 
 export interface AuthoritySchemaInspection {
-  readonly version: 4;
+  readonly version: 5;
 }
 
 export interface WorkerDatabaseClient {
@@ -102,6 +106,35 @@ export interface WorkerDatabaseClient {
     validation: SnapshotRevalidationRequest,
     now: number,
   ): Promise<void>;
+  acquireStreamingRepair(
+    context: AuthenticatedSessionContext,
+    scope: RepairScope,
+    now: number,
+  ): Promise<StreamingRepairLease>;
+  registerStreamingRepair(
+    snapshotId: string,
+    checksum: string,
+    pageCount: number,
+    now: number,
+  ): Promise<StreamingRepairLease>;
+  authorizeStreamingRepairPage(
+    context: AuthenticatedSessionContext,
+    snapshotId: string,
+    page: number,
+    now: number,
+  ): Promise<StreamingRepairLease>;
+  completeStreamingRepair(
+    context: AuthenticatedSessionContext,
+    snapshotId: string,
+    version: SnapshotVersion,
+    checksum: string,
+    now: number,
+  ): Promise<SnapshotCompleted>;
+  releaseStreamingRepair(
+    context: AuthenticatedSessionContext,
+    snapshotId: string,
+    now: number,
+  ): Promise<void>;
   readActor(actorId: string): Promise<Actor | undefined>;
   readRoom(roomId: string): Promise<ManagedRoom | undefined>;
   canAccessRoom(
@@ -139,11 +172,13 @@ export interface AuthorityWorkerTransport {
 
 export class AuthorityWorkerClientError extends Error {
   readonly status: number;
+  readonly retryAfterMs: number | undefined;
 
   constructor(readonly code: AuthorityWorkerClientErrorCode, message: string) {
     super(message);
     this.name = "AuthorityWorkerClientError";
     this.status = authorityWorkerClientErrorStatus(code);
+    this.retryAfterMs = code === "repair_barrier_active" ? 250 : undefined;
   }
 }
 
@@ -162,7 +197,7 @@ export type AuthorityWorkerClientErrorCode =
 
 function authorityWorkerClientErrorStatus(
   code: AuthorityWorkerClientErrorCode,
-): 400 | 401 | 403 | 404 | 409 | 503 {
+): 400 | 401 | 403 | 404 | 409 | 410 | 429 | 503 {
   switch (code) {
     case "agent_permissions_invalid":
     case "agent_required":
@@ -186,6 +221,7 @@ function authorityWorkerClientErrorStatus(
     case "open_item_not_found":
     case "room_member_not_found":
     case "room_not_found":
+    case "snapshot_not_found":
       return 404;
     case "actor_conflict":
     case "authority_already_initialized":
@@ -203,6 +239,10 @@ function authorityWorkerClientErrorStatus(
       return 409;
     case "snapshot_forbidden":
       return 403;
+    case "snapshot_expired":
+      return 410;
+    case "snapshot_busy":
+      return 429;
     case "authority_not_initialized":
     case "authority_worker_closed":
     case "authority_worker_error":
@@ -215,6 +255,7 @@ function authorityWorkerClientErrorStatus(
     case "legacy_import_failed":
     case "legacy_import_unavailable":
     case "storage_unavailable":
+    case "repair_barrier_active":
       return 503;
     default: {
       const unreachable: never = code;
@@ -921,6 +962,87 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
       });
   }
 
+  acquireStreamingRepair(
+    context: AuthenticatedSessionContext,
+    scope: RepairScope,
+    now: number,
+  ): Promise<StreamingRepairLease> {
+    return this.#send({ type: "authority.repair-acquire", context, scope, now })
+      .then((response) => {
+        if (response.type !== "authority.repair-lease") {
+          this.#failProtocol("Authority worker returned the wrong repair-acquire response");
+          throw this.#terminalError;
+        }
+        return response.lease;
+      });
+  }
+
+  registerStreamingRepair(
+    snapshotId: string,
+    checksum: string,
+    pageCount: number,
+    now: number,
+  ): Promise<StreamingRepairLease> {
+    return this.#send({
+      type: "authority.repair-register", snapshotId, checksum, pageCount, now,
+    }).then((response) => {
+      if (response.type !== "authority.repair-lease") {
+        this.#failProtocol("Authority worker returned the wrong repair-register response");
+        throw this.#terminalError;
+      }
+      return response.lease;
+    });
+  }
+
+  authorizeStreamingRepairPage(
+    context: AuthenticatedSessionContext,
+    snapshotId: string,
+    page: number,
+    now: number,
+  ): Promise<StreamingRepairLease> {
+    return this.#send({
+      type: "authority.repair-authorize-page", context, snapshotId, page, now,
+    }).then((response) => {
+      if (response.type !== "authority.repair-lease") {
+        this.#failProtocol("Authority worker returned the wrong repair-page response");
+        throw this.#terminalError;
+      }
+      return response.lease;
+    });
+  }
+
+  completeStreamingRepair(
+    context: AuthenticatedSessionContext,
+    snapshotId: string,
+    version: SnapshotVersion,
+    checksum: string,
+    now: number,
+  ): Promise<SnapshotCompleted> {
+    return this.#send({
+      type: "authority.repair-complete", context, snapshotId, version, checksum, now,
+    }).then((response) => {
+      if (response.type !== "authority.snapshot-completed") {
+        this.#failProtocol("Authority worker returned the wrong repair-complete response");
+        throw this.#terminalError;
+      }
+      return response.completed;
+    });
+  }
+
+  releaseStreamingRepair(
+    context: AuthenticatedSessionContext,
+    snapshotId: string,
+    now: number,
+  ): Promise<void> {
+    return this.#send({ type: "authority.repair-release", context, snapshotId, now })
+      .then((response) => {
+        if (response.type !== "authority.repair-released") {
+          this.#failProtocol("Authority worker returned the wrong repair-release response");
+          throw this.#terminalError;
+        }
+      });
+  }
+
   syncRoom(
     context: AuthenticatedSessionContext,
     request: RoomSyncRequest,
@@ -1275,6 +1397,16 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
         responseType === "authority.room-synced") ||
       (requestType === "authority.snapshot-revalidate" &&
         responseType === "authority.snapshot-revalidated") ||
+      (requestType === "authority.repair-acquire" &&
+        responseType === "authority.repair-lease") ||
+      (requestType === "authority.repair-register" &&
+        responseType === "authority.repair-lease") ||
+      (requestType === "authority.repair-authorize-page" &&
+        responseType === "authority.repair-lease") ||
+      (requestType === "authority.repair-complete" &&
+        responseType === "authority.snapshot-completed") ||
+      (requestType === "authority.repair-release" &&
+        responseType === "authority.repair-released") ||
       (requestType === "authority.compact-room-stream" &&
         responseType === "authority.room-stream-compacted") ||
       (requestType === "authority.close" && responseType === "authority.closed")

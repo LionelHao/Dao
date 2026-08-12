@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
-export const AUTHORITY_SCHEMA_VERSION = 4 as const;
+export const AUTHORITY_SCHEMA_VERSION = 5 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -23,11 +23,14 @@ const V3_MIGRATION_CHECKSUM =
   "0f4ba33b182ae9b5c84874961265a4739a23cc80db4d8c6675af47646ceb81ee";
 const V4_MIGRATION_CHECKSUM =
   "28a42b0ccfdc0d5c2eb111bc783cdd30c2678eb162cf9d77dcc2b6b3823f169c";
+const V5_MIGRATION_CHECKSUM =
+  "3f90cdeb9b7c9e04f432aac809f340033f6d9a2ea1a6a5bd8d9ab50fab8d891d";
 const SCHEMA_FINGERPRINTS = {
   1: "03f2bbba4aa7082ec01819824726ce1bd9b4bd14cebea71afc93c6821dbf405c",
   2: "01c37d92ec2f303613a7bb8b592ca846fbea7c829b3c81fe4521699db949dfcc",
   3: "8653114fb3c00fcbddc386c16693d98ce6f226695f1941ac73dc341aa5fc7a61",
   4: "b2d08fa3332bf0dc7fd4f0594210550089ed867a51b5da63be0e89830743d3ac",
+  5: "b804592978b0afde52b64574534f355eaaf12db2d3401f0ebdf3d09373ca40a0",
 } as const;
 
 const V1_STATEMENTS = [
@@ -209,6 +212,17 @@ const V4_STATEMENTS = [
    BEGIN
      SELECT RAISE(ABORT, 'canonical calibration signal is invalid');
    END`,
+] as const;
+
+const V5_STATEMENTS = [
+  `CREATE INDEX messages_room_id_id ON messages(room_id, id)`,
+  `CREATE INDEX agent_judgments_room_id_id ON agent_judgments(room_id, id)`,
+  `CREATE INDEX open_items_room_id_id ON open_items(room_id, id)`,
+  `CREATE INDEX agent_executions_room_id_id ON agent_executions(room_id, id)`,
+  `CREATE INDEX calibration_signals_room_id_id
+   ON calibration_signals(room_id, id)`,
+  `CREATE INDEX room_memberships_catalog_actor_kind_room
+   ON room_memberships(actor_id, kind, room_id)`,
 ] as const;
 
 const V2_STATEMENTS = [
@@ -586,6 +600,12 @@ const MIGRATIONS = [
     V4_STATEMENTS,
     V4_MIGRATION_CHECKSUM,
   ),
+  defineMigration(
+    5,
+    "streaming-keyset-indexes",
+    V5_STATEMENTS,
+    V5_MIGRATION_CHECKSUM,
+  ),
 ] as const satisfies readonly Migration[];
 
 const V1_SCHEMA_CONTRACT = {
@@ -762,6 +782,7 @@ const SCHEMA_CONTRACTS = {
   2: V2_SCHEMA_CONTRACT,
   3: V3_SCHEMA_CONTRACT,
   4: V4_SCHEMA_CONTRACT,
+  5: V4_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -1272,6 +1293,12 @@ export function migrateAuthorityDatabaseToPreviousVersionForTest(
   database: DatabaseSync,
 ): void {
   migrateAuthorityDatabaseToVersion(database, AUTHORITY_SCHEMA_VERSION - 1);
+}
+
+export function migrateAuthorityDatabaseToVersion3ForTest(
+  database: DatabaseSync,
+): void {
+  migrateAuthorityDatabaseToVersion(database, 3);
 }
 
 export function migrateAuthorityDatabaseToVersion2ForTest(

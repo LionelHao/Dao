@@ -36,10 +36,18 @@ import {
   readHistoryDatabaseQuery,
   readRoomAuditDatabaseQuery,
   readRoomDatabaseQuery,
+  repairMutationImpactDatabaseQuery,
   revalidateSnapshotDatabaseQuery,
   runAuthorityImmediateTransaction,
   syncRoomDatabaseQuery,
+  inspectStreamingRepairScopeDatabaseQuery,
 } from "./authority-database-handler.js";
+import {
+  FallbackRepairCoordinator,
+  FallbackRepairError,
+  type RepairPreemptionCode,
+  type StreamingRepairLease,
+} from "../fallback-repair-coordinator.js";
 
 interface AuthorityWorkerData {
   readonly databasePath: string;
@@ -109,6 +117,7 @@ let workerInitialized = false;
 let workerClosed = false;
 let rollbackFailureForTestAvailable =
   isAuthorityWorkerData(workerData) && workerData.rollbackFailureForTest === true;
+const repairs = new FallbackRepairCoordinator();
 
 function respond(response: AuthorityWorkerResponse): void {
   authorityPort.postMessage(response);
@@ -880,6 +889,9 @@ function revokeSession(request: AuthorityWorkerRequest): void {
   }
   try {
     const openedDatabase = requireAuthorityTransactionDatabase();
+    const family = openedDatabase.prepare(
+      "SELECT family_id AS familyId FROM sessions WHERE access_token_hash = ?",
+    ).get(request.accessTokenHash);
     const result = runAuthorityImmediateTransaction(openedDatabase, () => {
       const row = openedDatabase
         .prepare(
@@ -919,6 +931,12 @@ function revokeSession(request: AuthorityWorkerRequest): void {
       return;
     }
     respond({ type: "authority.session-revoked", requestId: request.requestId });
+    if (typeof family?.familyId === "string") {
+      repairs.preemptAfterCommit({
+        roomIds: [], catalogPrincipalIds: [], familyIds: [family.familyId],
+        code: "snapshot_family_revoked", now: request.now,
+      });
+    }
   } catch (error: unknown) {
     if (handleRollbackFatal(request.requestId, error)) return;
     respondWithError(
@@ -929,28 +947,226 @@ function revokeSession(request: AuthorityWorkerRequest): void {
   }
 }
 
+function respondRepairFailure(requestId: string, cause: unknown, fallbackMessage: string): void {
+  if (cause instanceof FallbackRepairError) {
+    respondWithError(requestId, cause.code, cause.message);
+    return;
+  }
+  if (cause instanceof AuthorityDatabaseError) {
+    respondWithError(requestId, cause.code, cause.message);
+    return;
+  }
+  respondWithError(requestId, "storage_unavailable", fallbackMessage);
+}
+
+function revalidateRepairLease(
+  lease: StreamingRepairLease,
+  context: Extract<AuthorityWorkerRequest, { readonly type: "authority.repair-authorize-page" }>["context"],
+  now: number,
+): void {
+  revalidateSnapshotDatabaseQuery(
+    requireAuthorityTransactionDatabase(),
+    lease.scope.kind === "room"
+      ? {
+          kind: "room",
+          context,
+          roomId: lease.scope.roomId,
+          accessRevision: lease.authorizationRevision,
+        }
+      : {
+          kind: "catalog",
+          context,
+          catalogRevision: lease.authorizationRevision,
+        },
+    now,
+  );
+}
+
+function acquireRepair(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.repair-acquire") throw new TypeError("wrong repair acquire");
+  try {
+    const inspected = inspectStreamingRepairScopeDatabaseQuery(
+      requireAuthorityTransactionDatabase(), request.context, request.scope, request.now,
+    );
+    const lease = repairs.acquire({
+      context: request.context,
+      scope: request.scope,
+      version: inspected.version,
+      authorizationRevision: inspected.authorizationRevision,
+      now: request.now,
+    });
+    respond({ type: "authority.repair-lease", requestId: request.requestId, lease });
+  } catch (cause: unknown) {
+    respondRepairFailure(request.requestId, cause, "Streaming repair acquire failed");
+  }
+}
+
+function registerRepair(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.repair-register") throw new TypeError("wrong repair register");
+  try {
+    const lease = repairs.registerChecksum(
+      request.snapshotId, request.checksum, request.pageCount, request.now,
+    );
+    respond({ type: "authority.repair-lease", requestId: request.requestId, lease });
+  } catch (cause: unknown) {
+    respondRepairFailure(request.requestId, cause, "Streaming repair registration failed");
+  }
+}
+
+function authorizeRepairPage(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.repair-authorize-page") throw new TypeError("wrong repair page authorization");
+  try {
+    const current = repairs.describe({
+      context: request.context, snapshotId: request.snapshotId, now: request.now,
+    });
+    revalidateRepairLease(current, request.context, request.now);
+    const lease = repairs.authorizePage({
+      context: request.context, snapshotId: request.snapshotId,
+      page: request.page, now: request.now,
+    });
+    respond({ type: "authority.repair-lease", requestId: request.requestId, lease });
+  } catch (cause: unknown) {
+    respondRepairFailure(request.requestId, cause, "Streaming repair page authorization failed");
+  }
+}
+
+function completeRepair(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.repair-complete") throw new TypeError("wrong repair completion");
+  try {
+    const current = repairs.describe({
+      context: request.context, snapshotId: request.snapshotId, now: request.now,
+    });
+    revalidateRepairLease(current, request.context, request.now);
+    const completed = repairs.complete({
+      context: request.context,
+      snapshotId: request.snapshotId,
+      version: request.version,
+      checksum: request.checksum,
+      now: request.now,
+    });
+    respond({
+      type: "authority.snapshot-completed",
+      requestId: request.requestId,
+      completed: {
+        type: "snapshot.completed",
+        requestId: request.requestId,
+        snapshotId: completed.snapshotId,
+        version: completed.version,
+      },
+    });
+  } catch (cause: unknown) {
+    respondRepairFailure(request.requestId, cause, "Streaming repair completion failed");
+  }
+}
+
+function releaseRepair(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.repair-release") throw new TypeError("wrong repair release");
+  try {
+    repairs.releaseOwned({
+      context: request.context, snapshotId: request.snapshotId, now: request.now,
+    });
+    respond({ type: "authority.repair-released", requestId: request.requestId });
+  } catch (cause: unknown) {
+    respondRepairFailure(request.requestId, cause, "Streaming repair release failed");
+  }
+}
+
+function isAccessReducingForLease(
+  command: Extract<AuthorityWorkerRequest, { readonly type: "authority.execute-human" }>["command"],
+  lease: StreamingRepairLease,
+  roleDowngradeTargetId: string | undefined,
+): boolean {
+  if (command.type === "room.archive") return true;
+  if (command.type === "member.remove") {
+    return command.payload.targetActorId === lease.principalId;
+  }
+  return command.type === "human.role.change" &&
+    roleDowngradeTargetId === lease.principalId;
+}
+
+function humanRepairGate(
+  opened: DatabaseSync,
+  request: Extract<AuthorityWorkerRequest, { readonly type: "authority.execute-human" }>,
+  actorId: string,
+): {
+  readonly impact: ReturnType<typeof repairMutationImpactDatabaseQuery>;
+  readonly preemption?: {
+    readonly code: RepairPreemptionCode;
+    readonly roomPrincipalIds?: readonly string[];
+  };
+} {
+  const impact = repairMutationImpactDatabaseQuery(opened, actorId, request.command);
+  let roleDowngradeTargetId: string | undefined;
+  if (request.command.type === "human.role.change" && request.command.payload.role === "member") {
+    const current = opened.prepare(
+      `SELECT role FROM room_memberships
+       WHERE room_id = ? AND actor_id = ? AND kind = 'human'`,
+    ).get(request.command.roomId, request.command.payload.targetActorId);
+    if (current?.role === "admin") {
+      roleDowngradeTargetId = request.command.payload.targetActorId;
+    }
+  }
+  const blockers = repairs.blockingLeases(impact, request.now);
+  if (blockers.some((lease) =>
+    !isAccessReducingForLease(request.command, lease, roleDowngradeTargetId))) {
+    throw new FallbackRepairError("repair_barrier_active");
+  }
+  if (request.command.type === "room.archive") {
+    return { impact, preemption: { code: "room_archived" } };
+  }
+  if (request.command.type === "member.remove") {
+    return { impact, preemption: {
+      code: "snapshot_stale",
+      roomPrincipalIds: [request.command.payload.targetActorId],
+    } };
+  }
+  if (request.command.type === "human.role.change" && roleDowngradeTargetId !== undefined) {
+    return { impact, preemption: {
+      code: "snapshot_stale",
+      roomPrincipalIds: [request.command.payload.targetActorId],
+    } };
+  }
+  return { impact };
+}
+
 function executeHuman(request: AuthorityWorkerRequest): void {
   if (request.type !== "authority.execute-human") {
     throw new TypeError("executeHuman received the wrong request type");
   }
   try {
     const openedDatabase = requireAuthorityTransactionDatabase();
-    const acknowledgement = executeHumanDatabaseCommand(openedDatabase, {
+    let gate: ReturnType<typeof humanRepairGate> | undefined;
+    const result = executeHumanDatabaseCommand(openedDatabase, {
       context: request.context,
       command: request.command,
       ...(request.invitationSecret === undefined
         ? {}
         : { invitationSecret: request.invitationSecret }),
       now: request.now,
+      beforeApply(actorId) {
+        gate = humanRepairGate(openedDatabase, request, actorId);
+      },
     });
     respond({
       type: "authority.command-acknowledged",
       requestId: request.requestId,
-      acknowledgement,
+      acknowledgement: result.acknowledgement,
     });
+    if (result.disposition === "applied" && gate?.preemption !== undefined) {
+      repairs.preemptAfterCommit({
+        ...gate.impact,
+        familyIds: [],
+        ...gate.preemption,
+        now: request.now,
+      });
+    }
   } catch (error: unknown) {
     if (handleRollbackFatal(request.requestId, error)) return;
     if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    if (error instanceof FallbackRepairError) {
       respondWithError(request.requestId, error.code, error.message);
       return;
     }
@@ -967,19 +1183,29 @@ function executeAgent(request: AuthorityWorkerRequest): void {
     throw new TypeError("executeAgent received the wrong request type");
   }
   try {
-    const acknowledgement = executeAgentDatabaseCommand(requireAuthorityTransactionDatabase(), {
+    const impact = { roomIds: [request.command.roomId], catalogPrincipalIds: [] };
+    const result = executeAgentDatabaseCommand(requireAuthorityTransactionDatabase(), {
       context: request.context,
       command: request.command,
       now: request.now,
+      beforeApply() {
+        if (repairs.blockingLease(impact, request.now) !== undefined) {
+          throw new FallbackRepairError("repair_barrier_active");
+        }
+      },
     });
     respond({
       type: "authority.command-acknowledged",
       requestId: request.requestId,
-      acknowledgement,
+      acknowledgement: result.acknowledgement,
     });
   } catch (error: unknown) {
     if (handleRollbackFatal(request.requestId, error)) return;
     if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    if (error instanceof FallbackRepairError) {
       respondWithError(request.requestId, error.code, error.message);
       return;
     }
@@ -1266,6 +1492,7 @@ function closeAuthority(request: AuthorityWorkerRequest): void {
   }
 
   try {
+    repairs.releaseAll();
     if (database !== undefined) {
       database.close();
       database = undefined;
@@ -1361,6 +1588,21 @@ async function dispatch(value: unknown): Promise<void> {
       return;
     case "authority.snapshot-revalidate":
       revalidateSnapshot(value);
+      return;
+    case "authority.repair-acquire":
+      acquireRepair(value);
+      return;
+    case "authority.repair-register":
+      registerRepair(value);
+      return;
+    case "authority.repair-authorize-page":
+      authorizeRepairPage(value);
+      return;
+    case "authority.repair-complete":
+      completeRepair(value);
+      return;
+    case "authority.repair-release":
+      releaseRepair(value);
       return;
     case "authority.compact-room-stream":
       compactRoomStream(value);

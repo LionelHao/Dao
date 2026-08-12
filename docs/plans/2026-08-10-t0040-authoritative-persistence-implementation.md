@@ -1052,11 +1052,18 @@ Propose `feat(server): materialize repair snapshots`. Risks: experimental read-o
 
 - Create: `packages/server/src/fallback-repair-coordinator.ts`
 - Create: `packages/server/src/fallback-repair-coordinator.test.ts`
+- Modify: `packages/server/src/index.ts` (keep Task 10 server-internal APIs off the package root)
+- Modify: `packages/server/src/persistence/contracts.ts` (closed internal repair scope/lease contract)
 - Modify: `packages/server/src/persistence/worker-protocol.ts`
+- Modify: `packages/server/src/persistence/worker-database-client.ts`
+- Modify: `packages/server/src/persistence/worker-database-client.test.ts`
+- Modify: `packages/server/src/persistence/authority-database-handler.ts`
 - Modify: `packages/server/src/persistence/authority-worker.ts`
-- Modify: `packages/server/src/persistence/sqlite-authoritative-store.ts`
+- Modify: `packages/server/src/persistence/schema.ts` (immutable v5 scoped keyset indexes only)
+- Modify: `packages/server/src/persistence/schema.test.ts`
 - Modify: `packages/server/src/persistence/snapshot-worker.ts`
 - Modify: `packages/server/src/persistence/snapshot-worker-client.ts`
+- Modify: `packages/server/src/persistence/snapshot-worker-client.test.ts`
 - Modify: `packages/server/src/sync-service.ts`
 - Modify: `packages/server/src/sync-service.test.ts`
 
@@ -1101,6 +1108,24 @@ AuthorityWorker serializes acquire/normal-command/preempt/complete. A normal mut
 - [ ] **Step 4: Implement O(page) streaming and completion tombstones.**
 
 SnapshotWorker does one stable checksum pass and then reads pages in primary-key order while the scope is frozen. It keeps only one page in memory and has no total record/byte/time limit; only 30 seconds between page/complete requests. The client keeps staging until `snapshot.completed`. A 30-second tombstone replays completed only after current same-family/permission/version validation; revoke or revision change rejects the old completion.
+
+Authority schema v5 adds only the composite indexes required by those closed
+keyset scans: `(room_id, id)` on the five streamed fact tables and
+`(actor_id, kind, room_id)` for catalog membership. V1-v4 statements,
+checksums, and fingerprints stay immutable. `EXPLAIN QUERY PLAN` plus sparse,
+interleaved room/catalog fixtures prove that later pages seek within the target
+scope instead of skipping unrelated rows from the beginning.
+
+Immediately after acquire, the client tracks the lease with a process-local operation epoch, before the checksum pass starts. Checksum registration and page authorization use that epoch as an ownership CAS, so close, terminal failure, or explicit release cannot be followed by a late barrier resurrection. Once the checksum is attached, an expired access token leaves that lease available for a same-family refreshed session to authorize and replay page zero without another materialized or checksum scan.
+
+Buzz translation is explicit at this boundary: Buzz's stored-event query becomes
+primary-key/keyset-ordered room and catalog segments; its per-event visibility
+recheck becomes AuthorityWorker lease authorization before every page; and its
+EOSE completion boundary becomes `snapshot.completed` only after the final page
+is continuously authorized. We deliberately deviate from Buzz's Nostr
+filter/subscription model: repair uses closed room/catalog scopes, a frozen
+authority version, and client staging followed by one atomic replacement because
+human/Agent IM repair must never expose a partially rebuilt cache.
 
 Run: `pnpm typecheck && pnpm exec vitest run packages/server/src/fallback-repair-coordinator.test.ts packages/server/src/persistence/snapshot-worker-client.test.ts packages/server/src/sync-service.test.ts && pnpm lint`
 

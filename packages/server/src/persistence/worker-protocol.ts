@@ -1,10 +1,18 @@
-import { isActor, isMessage, isRoomSyncResult } from "@native-im/core";
+import {
+  isActor,
+  isMessage,
+  isRoomSyncResult,
+  isSnapshotCompleted,
+  isSnapshotVersion,
+} from "@native-im/core";
 import type {
   Actor,
   ManagedRoom,
   Message,
   RoomSyncRequest,
   RoomSyncResult,
+  SnapshotCompleted,
+  SnapshotVersion,
 } from "@native-im/core";
 import {
   isManagedRoomShape,
@@ -31,6 +39,8 @@ import type {
   OutboxDispatchCandidate,
   RoomGovernanceCommand,
   SnapshotRevalidationRequest,
+  RepairScope,
+  StreamingRepairLease,
 } from "./contracts.js";
 
 export type AuthorityWorkerErrorCode =
@@ -66,9 +76,13 @@ export type AuthorityWorkerErrorCode =
   | "room_member_not_found"
   | "room_not_found"
   | "room_owner_required"
+  | "repair_barrier_active"
   | "session_revoked"
+  | "snapshot_busy"
+  | "snapshot_expired"
   | "snapshot_family_revoked"
   | "snapshot_forbidden"
+  | "snapshot_not_found"
   | "snapshot_stale"
   | "storage_unavailable"
   | "token_expired";
@@ -109,9 +123,13 @@ export function isAuthorityWorkerErrorCode(
     case "room_member_not_found":
     case "room_not_found":
     case "room_owner_required":
+    case "repair_barrier_active":
     case "session_revoked":
+    case "snapshot_busy":
+    case "snapshot_expired":
     case "snapshot_family_revoked":
     case "snapshot_forbidden":
+    case "snapshot_not_found":
     case "snapshot_stale":
     case "storage_unavailable":
     case "token_expired":
@@ -249,6 +267,45 @@ export type AuthorityWorkerRequest =
       readonly now: number;
     }
   | {
+      readonly type: "authority.repair-acquire";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly scope: RepairScope;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.repair-register";
+      readonly requestId: string;
+      readonly snapshotId: string;
+      readonly checksum: string;
+      readonly pageCount: number;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.repair-authorize-page";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly snapshotId: string;
+      readonly page: number;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.repair-complete";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly snapshotId: string;
+      readonly version: SnapshotVersion;
+      readonly checksum: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.repair-release";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly snapshotId: string;
+      readonly now: number;
+    }
+  | {
       readonly type: "authority.compact-room-stream";
       readonly requestId: string;
       readonly roomId: string;
@@ -260,12 +317,12 @@ export type AuthorityWorkerResponse =
   | {
       readonly type: "authority.ready";
       readonly requestId: string;
-      readonly schemaVersion: 4;
+      readonly schemaVersion: 5;
     }
   | {
       readonly type: "authority.schema";
       readonly requestId: string;
-      readonly schemaVersion: 4;
+      readonly schemaVersion: 5;
     }
   | {
       readonly type: "authority.legacy-imported";
@@ -348,6 +405,17 @@ export type AuthorityWorkerResponse =
       readonly result: RoomSyncResult;
     }
   | { readonly type: "authority.snapshot-revalidated"; readonly requestId: string }
+  | {
+      readonly type: "authority.repair-lease";
+      readonly requestId: string;
+      readonly lease: StreamingRepairLease;
+    }
+  | {
+      readonly type: "authority.snapshot-completed";
+      readonly requestId: string;
+      readonly completed: SnapshotCompleted;
+    }
+  | { readonly type: "authority.repair-released"; readonly requestId: string }
   | {
       readonly type: "authority.room-stream-compacted";
       readonly requestId: string;
@@ -513,6 +581,39 @@ function isSnapshotRevalidationRequest(
   return value.kind === "catalog" &&
     hasExactKeys(value, ["kind", "context", "catalogRevision"]) &&
     isNonNegativeSafeInteger(value.catalogRevision);
+}
+
+function isRepairScope(value: unknown): value is RepairScope {
+  return isRecord(value) && (
+    (value.kind === "room" && hasExactKeys(value, ["kind", "roomId"]) &&
+      isText(value.roomId)) ||
+    (value.kind === "catalog" && hasExactKeys(value, ["kind", "principalId"]) &&
+      isText(value.principalId))
+  );
+}
+
+function isStreamingRepairLease(value: unknown): value is StreamingRepairLease {
+  if (!isRecord(value) || !hasExactKeys(value, [
+    "snapshotId", "principalId", "accountId", "sessionFamilyId", "scope",
+    "version", "authorizationRevision", "idleExpiresAt",
+    ...(Object.hasOwn(value, "checksum") ? ["checksum"] : []),
+    ...(Object.hasOwn(value, "pageCount") ? ["pageCount"] : []),
+    ...(Object.hasOwn(value, "lastPage") ? ["lastPage"] : []),
+    ...(Object.hasOwn(value, "highestAuthorizedPage") ? ["highestAuthorizedPage"] : []),
+  ])) return false;
+  const attached = Object.hasOwn(value, "checksum") || Object.hasOwn(value, "pageCount") ||
+    Object.hasOwn(value, "lastPage") || Object.hasOwn(value, "highestAuthorizedPage");
+  return isText(value.snapshotId) && isText(value.principalId) &&
+    isText(value.accountId) && isTokenHash(value.sessionFamilyId) &&
+    isRepairScope(value.scope) && isSnapshotVersion(value.version) &&
+    isNonNegativeSafeInteger(value.authorizationRevision) &&
+    isText(value.idleExpiresAt) &&
+    (!attached || (isText(value.checksum) && isNonNegativeSafeInteger(value.pageCount) &&
+      value.pageCount > 0 && isNonNegativeSafeInteger(value.lastPage) &&
+      value.lastPage === value.pageCount - 1 &&
+      typeof value.highestAuthorizedPage === "number" &&
+      Number.isSafeInteger(value.highestAuthorizedPage) && value.highestAuthorizedPage >= -1 &&
+      value.highestAuthorizedPage <= value.lastPage));
 }
 
 function isAuthenticatedCommandContext(
@@ -805,6 +906,29 @@ export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWork
       return hasExactKeys(value, ["type", "requestId", "validation", "now"]) &&
         isSnapshotRevalidationRequest(value.validation) &&
         isNonNegativeSafeInteger(value.now);
+    case "authority.repair-acquire":
+      return hasExactKeys(value, ["type", "requestId", "context", "scope", "now"]) &&
+        isAuthenticatedSessionContext(value.context) && isRepairScope(value.scope) &&
+        isNonNegativeSafeInteger(value.now);
+    case "authority.repair-register":
+      return hasExactKeys(value, ["type", "requestId", "snapshotId", "checksum", "pageCount", "now"]) &&
+        isText(value.snapshotId) &&
+        isText(value.checksum) && isNonNegativeSafeInteger(value.pageCount) &&
+        value.pageCount > 0 &&
+        isNonNegativeSafeInteger(value.now);
+    case "authority.repair-authorize-page":
+      return hasExactKeys(value, ["type", "requestId", "context", "snapshotId", "page", "now"]) &&
+        isAuthenticatedSessionContext(value.context) && isText(value.snapshotId) &&
+        isNonNegativeSafeInteger(value.page) && isNonNegativeSafeInteger(value.now);
+    case "authority.repair-complete":
+      return hasExactKeys(value, ["type", "requestId", "context", "snapshotId", "version", "checksum", "now"]) &&
+        isAuthenticatedSessionContext(value.context) && isText(value.snapshotId) &&
+        isSnapshotVersion(value.version) && isText(value.checksum) &&
+        isNonNegativeSafeInteger(value.now);
+    case "authority.repair-release":
+      return hasExactKeys(value, ["type", "requestId", "context", "snapshotId", "now"]) &&
+        isAuthenticatedSessionContext(value.context) && isText(value.snapshotId) &&
+        isNonNegativeSafeInteger(value.now);
     case "authority.compact-room-stream":
       return hasExactKeys(value, ["type", "requestId", "roomId", "retainedFromSeq"]) &&
         isText(value.roomId) && isNonNegativeSafeInteger(value.retainedFromSeq) &&
@@ -826,7 +950,7 @@ export function isAuthorityWorkerResponse(
     case "authority.schema":
       return (
         hasExactKeys(value, ["type", "requestId", "schemaVersion"]) &&
-        value.schemaVersion === 4
+        value.schemaVersion === 5
       );
     case "authority.closed":
       return hasExactKeys(value, ["type", "requestId"]);
@@ -890,6 +1014,14 @@ export function isAuthorityWorkerResponse(
       return hasExactKeys(value, ["type", "requestId", "result"]) &&
         isRoomSyncResult(value.result);
     case "authority.snapshot-revalidated":
+      return hasExactKeys(value, ["type", "requestId"]);
+    case "authority.repair-lease":
+      return hasExactKeys(value, ["type", "requestId", "lease"]) &&
+        isStreamingRepairLease(value.lease);
+    case "authority.snapshot-completed":
+      return hasExactKeys(value, ["type", "requestId", "completed"]) &&
+        isSnapshotCompleted(value.completed);
+    case "authority.repair-released":
       return hasExactKeys(value, ["type", "requestId"]);
     case "authority.room-stream-compacted":
       return hasExactKeys(

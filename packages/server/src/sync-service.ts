@@ -1,8 +1,11 @@
 import type {
   RoomRepairPage,
   RoomSyncResult,
+  SnapshotCompleted,
+  SnapshotVersion,
   WorkspaceBootstrapPage,
 } from "@native-im/core";
+import { isSnapshotVersion } from "@native-im/core";
 import {
   parseRoomSyncRequest,
   ROOM_SYNC_DEFAULT_LIMIT,
@@ -54,6 +57,17 @@ export interface SyncService {
     snapshotId: string,
     afterPage: number,
   ): Promise<WorkspaceBootstrapPage>;
+  completeSnapshot(
+    context: AuthenticatedSessionContext,
+    requestId: string,
+    snapshotId: string,
+    version: SnapshotVersion,
+    checksum: string,
+  ): Promise<SnapshotCompleted>;
+  releaseSnapshot(
+    context: AuthenticatedSessionContext,
+    snapshotId: string,
+  ): Promise<void>;
 }
 
 export interface MaterializedSnapshotStore {
@@ -64,6 +78,9 @@ export interface MaterializedSnapshotStore {
     requestId: string): Promise<WorkspaceBootstrapPage>;
   readWorkspaceBootstrapPage(context: AuthenticatedSessionContext, requestId: string,
     snapshotId: string, afterPage: number): Promise<WorkspaceBootstrapPage>;
+  completeSnapshot(context: AuthenticatedSessionContext, requestId: string,
+    snapshotId: string, version: SnapshotVersion, checksum: string): Promise<SnapshotCompleted>;
+  releaseSnapshot(context: AuthenticatedSessionContext, snapshotId: string): Promise<void>;
 }
 
 export interface SyncServiceOptions {
@@ -130,6 +147,21 @@ export function createSyncService(options: SyncServiceOptions): SyncService {
         : options.snapshots.readWorkspaceBootstrapPage(
             context, requestId, snapshotId, afterPage,
           );
+    },
+    completeSnapshot(context, requestId, snapshotId, version, checksum): Promise<SnapshotCompleted> {
+      if (!validText(requestId) || !validText(snapshotId) || !validText(checksum) ||
+          !isSnapshotVersion(version)) {
+        return Promise.reject(new SyncServiceError());
+      }
+      return options.snapshots === undefined
+        ? Promise.reject(snapshotsUnavailable())
+        : options.snapshots.completeSnapshot(context, requestId, snapshotId, version, checksum);
+    },
+    releaseSnapshot(context, snapshotId): Promise<void> {
+      if (!validText(snapshotId)) return Promise.reject(new SyncServiceError());
+      return options.snapshots === undefined
+        ? Promise.reject(snapshotsUnavailable())
+        : options.snapshots.releaseSnapshot(context, snapshotId);
     },
   };
 }

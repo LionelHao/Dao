@@ -167,6 +167,11 @@ export type WorkerDatabaseClient = Omit<
   | "syncRoom"
   | "compactRoomStream"
   | "revalidateSnapshot"
+  | "acquireStreamingRepair"
+  | "registerStreamingRepair"
+  | "authorizeStreamingRepairPage"
+  | "completeStreamingRepair"
+  | "releaseStreamingRepair"
 >;
 export async function createWorkerDatabaseClient(
   options: CreateWorkerDatabaseClientOptions,

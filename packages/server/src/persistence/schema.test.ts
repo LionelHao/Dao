@@ -9,6 +9,7 @@ import {
   listAuthorityTables,
   migrateAuthorityDatabase,
   migrateAuthorityDatabaseToPreviousVersionForTest,
+  migrateAuthorityDatabaseToVersion3ForTest,
   migrateAuthorityDatabaseToVersion2ForTest,
   readSchemaVersion,
   listSnapshotCacheTables,
@@ -45,6 +46,17 @@ const V3_MIGRATION_CHECKSUM =
   "0f4ba33b182ae9b5c84874961265a4739a23cc80db4d8c6675af47646ceb81ee";
 const V4_MIGRATION_CHECKSUM =
   "28a42b0ccfdc0d5c2eb111bc783cdd30c2678eb162cf9d77dcc2b6b3823f169c";
+const V5_MIGRATION_CHECKSUM =
+  "3f90cdeb9b7c9e04f432aac809f340033f6d9a2ea1a6a5bd8d9ab50fab8d891d";
+
+const STREAMING_KEYSET_INDEXES = [
+  "agent_executions_room_id_id",
+  "agent_judgments_room_id_id",
+  "calibration_signals_room_id_id",
+  "messages_room_id_id",
+  "open_items_room_id_id",
+  "room_memberships_catalog_actor_kind_room",
+] as const;
 
 interface LogicalSnapshot {
   readonly schemaVersion: number;
@@ -72,6 +84,17 @@ function tableColumns(database: DatabaseSync, tableName: string): readonly strin
     .prepare(`PRAGMA table_info('${tableName}')`)
     .all()
     .map((row) => String(row.name));
+}
+
+function queryPlanDetails(
+  database: DatabaseSync,
+  sql: string,
+  ...parameters: readonly (string | number)[]
+): readonly string[] {
+  return database
+    .prepare(`EXPLAIN QUERY PLAN ${sql}`)
+    .all(...parameters)
+    .map((row) => String(row.detail));
 }
 
 function databaseWithoutTransactionState(database: DatabaseSync): DatabaseSync {
@@ -342,12 +365,12 @@ describe("authority SQLite schema", () => {
     });
   });
 
-  it("migrates a fresh database through v1, v2, v3, and v4 to the complete schema", () => {
+  it("migrates a fresh database through immutable v1-v5 to the complete schema", () => {
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
 
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(4);
-      expect(readSchemaVersion(database)).toBe(4);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(5);
+      expect(readSchemaVersion(database)).toBe(5);
       expect(listAuthorityTables(database)).toEqual(AUTHORITY_TABLES);
       expect(
         database
@@ -378,6 +401,12 @@ describe("authority SQLite schema", () => {
           version: 4,
           name: "canonical-collaboration-facts",
           checksum: V4_MIGRATION_CHECKSUM,
+          applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+        },
+        {
+          version: 5,
+          name: "streaming-keyset-indexes",
+          checksum: V5_MIGRATION_CHECKSUM,
           applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
         },
       ]);
@@ -427,14 +456,109 @@ describe("authority SQLite schema", () => {
     });
   });
 
-  it("adds complete canonical collaboration columns in immutable v4", () => {
+  it("adds immutable v5 scoped keyset indexes and uses them for sparse interleaved scans", () => {
     withDatabase((database) => {
       migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      expect(readSchemaVersion(database)).toBe(4);
+      migrateAuthorityDatabase(database);
+
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(5);
+      expect(readSchemaVersion(database)).toBe(5);
+      expect(
+        database
+          .prepare(
+            `SELECT name FROM sqlite_schema
+             WHERE type = 'index' AND name IN (${STREAMING_KEYSET_INDEXES.map(() => "?").join(", ")})
+             ORDER BY name`,
+          )
+          .all(...STREAMING_KEYSET_INDEXES)
+          .map((row) => String(row.name)),
+      ).toEqual([...STREAMING_KEYSET_INDEXES].sort());
+
+      database.exec(`
+        INSERT INTO actors (id, kind, display_name)
+        VALUES ('actor-a', 'human', 'Actor A'), ('actor-b', 'human', 'Actor B');
+        INSERT INTO rooms (id, name, status, created_at)
+        VALUES
+          ('room-a-1', 'A1', 'active', '2026-08-11T00:00:00.000Z'),
+          ('room-a-2', 'A2', 'active', '2026-08-11T00:00:01.000Z'),
+          ('room-b-1', 'B1', 'active', '2026-08-11T00:00:02.000Z');
+        INSERT INTO room_memberships (
+          room_id, actor_id, kind, role, participation, joined_at
+        ) VALUES
+          ('room-a-1', 'actor-a', 'human', 'member', NULL,
+           '2026-08-11T00:01:00.000Z'),
+          ('room-b-1', 'actor-b', 'human', 'member', NULL,
+           '2026-08-11T00:01:01.000Z'),
+          ('room-a-2', 'actor-a', 'human', 'member', NULL,
+           '2026-08-11T00:01:02.000Z');
+        INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+        VALUES
+          ('001', 'room-a-1', 'actor-a', 'human', 'a-1',
+           '2026-08-11T00:02:00.000Z'),
+          ('002', 'room-b-1', 'actor-b', 'human', 'b-1',
+           '2026-08-11T00:02:01.000Z'),
+          ('003', 'room-a-1', 'actor-a', 'human', 'a-2',
+           '2026-08-11T00:02:02.000Z');
+      `);
+
+      expect(
+        database
+          .prepare(
+            `SELECT id FROM messages
+             WHERE room_id = ? AND id > ? ORDER BY id LIMIT 1`,
+          )
+          .all("room-a-1", "001"),
+      ).toEqual([{ id: "003" }]);
+      expect(
+        database
+          .prepare(
+            `SELECT room_id AS roomId FROM room_memberships
+             WHERE actor_id = ? AND kind = 'human' AND room_id > ?
+             ORDER BY room_id LIMIT 1`,
+          )
+          .all("actor-a", "room-a-1"),
+      ).toEqual([{ roomId: "room-a-2" }]);
+
+      const roomScans = [
+        ["messages", "messages_room_id_id"],
+        ["agent_judgments", "agent_judgments_room_id_id"],
+        ["open_items", "open_items_room_id_id"],
+        ["agent_executions", "agent_executions_room_id_id"],
+        ["calibration_signals", "calibration_signals_room_id_id"],
+      ] as const;
+      for (const [table, index] of roomScans) {
+        expect(
+          queryPlanDetails(
+            database,
+            `SELECT id FROM ${table}
+             WHERE room_id = ? AND id > ? ORDER BY id LIMIT 50`,
+            "room-a-1",
+            "001",
+          ).join("\n"),
+        ).toContain(index);
+      }
+      expect(
+        queryPlanDetails(
+          database,
+          `SELECT room_id FROM room_memberships
+           WHERE actor_id = ? AND kind = 'human' AND room_id > ?
+           ORDER BY room_id LIMIT 50`,
+          "actor-a",
+          "room-a-1",
+        ).join("\n"),
+      ).toContain("room_memberships_catalog_actor_kind_room");
+    });
+  });
+
+  it("adds complete canonical collaboration columns in immutable v4", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabaseToVersion3ForTest(database);
       expect(readSchemaVersion(database)).toBe(3);
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(4);
+      expect(readSchemaVersion(database)).toBe(5);
       expect(tableColumns(database, "open_items")).toEqual(
         expect.arrayContaining([
           "requester_actor_id",
@@ -455,7 +579,7 @@ describe("authority SQLite schema", () => {
     withDatabase((database) => {
       createV1Fixture(database);
       seedV1History(database);
-      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      migrateAuthorityDatabaseToVersion3ForTest(database);
       database.exec(`
         INSERT INTO agent_judgments (
           id, room_id, agent_id, message_id, judgment_json, created_at
@@ -474,7 +598,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(4);
+      expect(readSchemaVersion(database)).toBe(5);
       expect(database.prepare(
         `SELECT source_message_id AS sourceMessageId, actor_id AS actorId
          FROM calibration_signals WHERE id = 'signal-v3'`,
@@ -527,7 +651,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(4);
+      expect(readSchemaVersion(database)).toBe(5);
       expect(
         database.prepare("SELECT id, catalog_revision FROM actors ORDER BY id").all(),
       ).toEqual([
@@ -606,7 +730,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(4);
+      expect(readSchemaVersion(database)).toBe(5);
       expect(
         database
           .prepare(
@@ -1183,9 +1307,9 @@ describe("authority SQLite schema", () => {
     });
 
     withDatabase((database) => {
-      database.exec("PRAGMA user_version = 5");
+      database.exec("PRAGMA user_version = 6");
       expect(() => migrateAuthorityDatabase(database)).toThrow(/future schema/i);
-      expect(readSchemaVersion(database)).toBe(5);
+      expect(readSchemaVersion(database)).toBe(6);
     });
   });
 
@@ -1241,7 +1365,7 @@ describe("authority SQLite schema", () => {
 });
 
 describe("derived snapshot cache schema", () => {
-  it("creates independent v1 WAL/FULL tables without changing authority v4", () => {
+  it("creates independent v1 WAL/FULL tables without changing authority v5", () => {
     withDatabase((database) => {
       migrateSnapshotCacheDatabase(database);
       expect(SNAPSHOT_CACHE_SCHEMA_VERSION).toBe(1);
@@ -1257,7 +1381,7 @@ describe("derived snapshot cache schema", () => {
         .toBe(SNAPSHOT_CACHE_BUSY_TIMEOUT_MS);
       expect(() => validateSnapshotCacheSchema(database)).not.toThrow();
     });
-    expect(AUTHORITY_SCHEMA_VERSION).toBe(4);
+    expect(AUTHORITY_SCHEMA_VERSION).toBe(5);
   });
 
   it("fails closed on version-one corruption and refuses future versions", () => {

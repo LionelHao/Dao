@@ -4,6 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import { parentPort, workerData } from "node:worker_threads";
 import {
   isRoomRepairPage,
+  isSnapshotVersion,
   isWorkspaceBootstrapPage,
 } from "@native-im/core";
 import type {
@@ -18,6 +19,8 @@ import type {
   SnapshotWorkerErrorCode,
   SnapshotWorkerRequest,
   SnapshotWorkerResponse,
+  StreamingRepairLease,
+  StreamingSnapshotManifest,
 } from "./contracts.js";
 import { SNAPSHOT_REQUEST_ID_MAX_BYTES } from "./contracts.js";
 import {
@@ -87,6 +90,35 @@ function validContext(value: unknown): value is AuthenticatedSessionContext {
     text(value.principal.accountId) && text(value.principal.actorId);
 }
 
+function validRepairScope(value: unknown): boolean {
+  return isRecord(value) && (
+    (value.kind === "room" && exact(value, ["kind", "roomId"]) && text(value.roomId)) ||
+    (value.kind === "catalog" && exact(value, ["kind", "principalId"]) && text(value.principalId))
+  );
+}
+
+function validStreamingLease(value: unknown): value is StreamingRepairLease {
+  if (!isRecord(value) || !exact(value, [
+    "snapshotId", "principalId", "accountId", "sessionFamilyId", "scope",
+    "version", "authorizationRevision", "idleExpiresAt",
+    ...(Object.hasOwn(value, "checksum") ? ["checksum"] : []),
+    ...(Object.hasOwn(value, "pageCount") ? ["pageCount"] : []),
+    ...(Object.hasOwn(value, "lastPage") ? ["lastPage"] : []),
+    ...(Object.hasOwn(value, "highestAuthorizedPage") ? ["highestAuthorizedPage"] : []),
+  ])) return false;
+  const attached = Object.hasOwn(value, "checksum") || Object.hasOwn(value, "pageCount") ||
+    Object.hasOwn(value, "lastPage") || Object.hasOwn(value, "highestAuthorizedPage");
+  return text(value.snapshotId) && text(value.principalId) && text(value.accountId) &&
+    text(value.sessionFamilyId) && validRepairScope(value.scope) &&
+    isSnapshotVersion(value.version) && count(value.authorizationRevision) &&
+    text(value.idleExpiresAt) &&
+    (!attached || (text(value.checksum) && count(value.pageCount) &&
+      value.pageCount > 0 && count(value.lastPage) && value.lastPage === value.pageCount - 1 &&
+      typeof value.highestAuthorizedPage === "number" &&
+      Number.isSafeInteger(value.highestAuthorizedPage) && value.highestAuthorizedPage >= -1 &&
+      value.highestAuthorizedPage <= value.lastPage));
+}
+
 function isRequest(value: unknown): value is SnapshotWorkerRequest {
   if (!isRecord(value) || !text(value.type) || !text(value.requestId)) return false;
   switch (value.type) {
@@ -105,6 +137,15 @@ function isRequest(value: unknown): value is SnapshotWorkerRequest {
       return exact(value, ["type", "requestId", "context", "responseRequestId", "snapshotId", "afterPage", "now"]) &&
         validContext(value.context) && responseRequestId(value.responseRequestId) && text(value.snapshotId) &&
         count(value.afterPage) && count(value.now);
+    case "snapshot.begin-streaming":
+      return exact(value, ["type", "requestId", "lease", "responseRequestId"]) &&
+        validStreamingLease(value.lease) && responseRequestId(value.responseRequestId);
+    case "snapshot.read-streaming-page":
+      return exact(value, ["type", "requestId", "lease", "responseRequestId", "afterPage"]) &&
+        validStreamingLease(value.lease) && responseRequestId(value.responseRequestId) &&
+        text(value.lease.checksum) && count(value.afterPage);
+    case "snapshot.release-streaming":
+      return exact(value, ["type", "requestId", "snapshotId"]) && text(value.snapshotId);
     case "snapshot.invalidate":
       return exact(value, ["type", "requestId", "snapshotId"]) && text(value.snapshotId);
     default:
@@ -140,6 +181,7 @@ const requests: unknown[] = [];
 let processing = false;
 let fixedViewPauseAvailable = data.pauseState !== undefined;
 let fullValidationCount = 0;
+const streamingSnapshots = new Map<string, StreamingSnapshotState>();
 
 function respond(response: SnapshotWorkerResponse): void {
   port.postMessage(response);
@@ -289,24 +331,34 @@ function parseJson(value: unknown): unknown {
 
 function* scanRows(
   authority: DatabaseSync,
-  orderedSql: string,
+  baseSql: string,
   parameter: string,
+  keyColumn: string,
+  keyField: string,
 ): Generator<Record<string, unknown>> {
-  const statement = authority.prepare(`${orderedSql} LIMIT ? OFFSET ?`);
-  let offset = 0;
+  let lastKey: string | undefined;
   while (true) {
-    const rows = statement.all(parameter, data.limits.scanBatchSize, offset);
+    const statement = authority.prepare(
+      `${baseSql}${lastKey === undefined ? "" : ` AND ${keyColumn} > ?`}
+       ORDER BY ${keyColumn} LIMIT ?`,
+    );
+    const rows = statement.all(parameter,
+      ...(lastKey === undefined ? [] : [lastKey]), data.limits.scanBatchSize);
     for (const row of rows) yield row;
     if (rows.length < data.limits.scanBatchSize) return;
-    offset += rows.length;
+    const nextKey = rows.at(-1)?.[keyField];
+    if (typeof nextKey !== "string") {
+      throw new SnapshotBuildError("storage_unavailable", "Snapshot scan key is corrupt");
+    }
+    lastKey = nextKey;
   }
 }
 
-function roomRecords(
+function* roomRecords(
   authority: DatabaseSync,
   roomId: string,
   recordScanned: () => void,
-): readonly RoomRepairRecord[] {
+): Generator<RoomRepairRecord> {
   const room = authority.prepare(
     "SELECT id, name, status, created_at AS createdAt FROM rooms WHERE id = ?",
   ).get(roomId);
@@ -314,21 +366,21 @@ function roomRecords(
       (room.status !== "active" && room.status !== "archived") || typeof room.createdAt !== "string") {
     throw new SnapshotBuildError("storage_unavailable", "Snapshot room metadata is corrupt");
   }
-  const records: RoomRepairRecord[] = [{ kind: "room", value: {
+  yield { kind: "room", value: {
     id: room.id, name: room.name, status: room.status, createdAt: room.createdAt,
-  }}];
+  }};
   recordScanned();
   for (const row of scanRows(authority,
     `SELECT actor_id AS actorId, kind, role, participation,
             tool_permissions_json AS toolPermissionsJson, joined_at AS joinedAt,
             configured_at AS configuredAt
-     FROM room_memberships WHERE room_id = ? ORDER BY actor_id`,
-    roomId)) {
+     FROM room_memberships WHERE room_id = ?`,
+    roomId, "actor_id", "actorId")) {
     if (row.kind === "human" && typeof row.actorId === "string" &&
         (row.role === "owner" || row.role === "admin" || row.role === "member") &&
         typeof row.joinedAt === "string") {
-      records.push({ kind: "membership", value: { kind: "human", actorId: row.actorId,
-        role: row.role, joinedAt: row.joinedAt }});
+      yield { kind: "membership", value: { kind: "human", actorId: row.actorId,
+        role: row.role, joinedAt: row.joinedAt }};
     } else if (row.kind === "agent" && typeof row.actorId === "string" &&
         (row.participation === "active" || row.participation === "on-mention" || row.participation === "silent") &&
         typeof row.configuredAt === "string") {
@@ -336,37 +388,37 @@ function roomRecords(
       if (!Array.isArray(permissions) || permissions.length === 0 || !permissions.every(text)) {
         throw new SnapshotBuildError("storage_unavailable", "Snapshot membership is corrupt");
       }
-      records.push({ kind: "membership", value: { kind: "agent", actorId: row.actorId,
+      yield { kind: "membership", value: { kind: "agent", actorId: row.actorId,
         participation: row.participation, toolPermissions: permissions,
-        configuredAt: row.configuredAt }});
+        configuredAt: row.configuredAt }};
     } else throw new SnapshotBuildError("storage_unavailable", "Snapshot membership is corrupt");
     recordScanned();
   }
   for (const row of scanRows(authority,
     `SELECT id, room_id AS roomId, author_id AS authorId, author_kind AS authorKind,
-            body, sent_at AS sentAt FROM messages WHERE room_id = ? ORDER BY id`,
-    roomId)) {
+            body, sent_at AS sentAt FROM messages WHERE room_id = ?`,
+    roomId, "id", "id")) {
     if (typeof row.id !== "string" || typeof row.roomId !== "string" || typeof row.authorId !== "string" ||
         (row.authorKind !== "human" && row.authorKind !== "agent") || typeof row.body !== "string" ||
         typeof row.sentAt !== "string") throw new SnapshotBuildError("storage_unavailable", "Snapshot message is corrupt");
-    records.push({ kind: "message", value: { id: row.id, roomId: row.roomId,
-      authorId: row.authorId, authorKind: row.authorKind, body: row.body, sentAt: row.sentAt }});
+    yield { kind: "message", value: { id: row.id, roomId: row.roomId,
+      authorId: row.authorId, authorKind: row.authorKind, body: row.body, sentAt: row.sentAt }};
     recordScanned();
   }
   for (const row of scanRows(authority,
     `SELECT actor_id AS actorId, message_id AS messageId, read_at AS readAt
-     FROM human_read_receipts WHERE room_id = ? ORDER BY actor_id`,
-    roomId)) {
+     FROM human_read_receipts WHERE room_id = ?`,
+    roomId, "actor_id", "actorId")) {
     if (typeof row.actorId !== "string" || typeof row.messageId !== "string" || typeof row.readAt !== "string")
       throw new SnapshotBuildError("storage_unavailable", "Snapshot receipt is corrupt");
-    records.push({ kind: "human-read", value: { id: `human-read:${roomId}:${row.actorId}`,
-      messageId: row.messageId, readerId: row.actorId, readAt: row.readAt }});
+    yield { kind: "human-read", value: { id: `human-read:${roomId}:${row.actorId}`,
+      messageId: row.messageId, readerId: row.actorId, readAt: row.readAt }};
     recordScanned();
   }
   for (const row of scanRows(authority,
-    "SELECT judgment_json AS json FROM agent_judgments WHERE room_id = ? ORDER BY id",
-    roomId)) {
-    records.push({ kind: "agent-judgement", value: parseJson(row.json) as RoomRepairRecord & never });
+    "SELECT id, judgment_json AS json FROM agent_judgments WHERE room_id = ?",
+    roomId, "id", "id")) {
+    yield { kind: "agent-judgement", value: parseJson(row.json) as RoomRepairRecord & never };
     recordScanned();
   }
   for (const row of scanRows(authority,
@@ -374,16 +426,16 @@ function roomRecords(
             requester_actor_id AS requesterId, assigned_actor_id AS ownerId,
             body AS content, status, created_at AS createdAt,
             responded_at AS respondedAt, transfer_chain_json AS transferChainJson
-     FROM open_items WHERE room_id = ? ORDER BY id`,
-    roomId)) {
+     FROM open_items WHERE room_id = ?`,
+    roomId, "id", "id")) {
     const transferChain = parseJson(row.transferChainJson);
-    records.push({ kind: "open-item", value: {
+    yield { kind: "open-item", value: {
       id: String(row.id), roomId: String(row.roomId), sourceMessageId: String(row.sourceMessageId),
       requesterId: String(row.requesterId), ownerId: String(row.ownerId), content: String(row.content),
       status: row.status as "pending_response", createdAt: String(row.createdAt),
       ...(typeof row.respondedAt === "string" ? { respondedAt: row.respondedAt } : {}),
       transferChain: transferChain as [],
-    }});
+    }};
     recordScanned();
   }
   for (const row of scanRows(authority,
@@ -391,60 +443,482 @@ function roomRecords(
             requester_actor_id AS requesterId, agent_id AS agentId, tool_name AS toolName,
             status, started_at AS startedAt, completed_at AS completedAt,
             result_json AS resultJson
-     FROM agent_executions WHERE room_id = ? ORDER BY id`,
-    roomId)) {
-    records.push({ kind: "agent-execution", value: {
+     FROM agent_executions WHERE room_id = ?`,
+    roomId, "id", "id")) {
+    yield { kind: "agent-execution", value: {
       id: String(row.id), roomId: String(row.roomId), sourceMessageId: String(row.sourceMessageId),
       requesterId: String(row.requesterId), agentId: String(row.agentId), toolName: String(row.toolName),
       status: row.status as "running", startedAt: String(row.startedAt),
       ...(typeof row.completedAt === "string" ? { completedAt: row.completedAt } : {}),
       ...(typeof row.resultJson === "string" ? { result: String(parseJson(row.resultJson)) } : {}),
-    }});
+    }};
     recordScanned();
   }
   for (const row of scanRows(authority,
     `SELECT id, source_message_id AS sourceMessageId, actor_id AS actorId,
             agent_id AS agentId, signal AS emoji, created_at AS createdAt
-     FROM calibration_signals WHERE room_id = ? ORDER BY id`,
-    roomId)) {
+     FROM calibration_signals WHERE room_id = ?`,
+    roomId, "id", "id")) {
     const common = { id: String(row.id), agentId: String(row.agentId),
       emoji: row.emoji as "👍" | "👎", createdAt: String(row.createdAt) };
     if (row.sourceMessageId === null && row.actorId === null) {
-      records.push({ kind: "legacy-unknown-calibration", value: {
+      yield { kind: "legacy-unknown-calibration", value: {
         ...common, sourceMessageId: null, actorId: null,
-      }});
+      }};
     } else if (typeof row.sourceMessageId === "string" && typeof row.actorId === "string") {
-      records.push({ kind: "calibration", value: {
+      yield { kind: "calibration", value: {
         ...common, sourceMessageId: row.sourceMessageId, actorId: row.actorId,
-      }});
+      }};
     } else {
       throw new SnapshotBuildError("storage_unavailable", "Snapshot calibration is corrupt");
     }
     recordScanned();
   }
-  return records;
 }
 
-function catalogRooms(
+function* catalogRooms(
   authority: DatabaseSync,
   principalId: string,
   recordScanned: () => void,
-): readonly RoomSummary[] {
-  const rooms: RoomSummary[] = [];
+): Generator<RoomSummary> {
   for (const row of scanRows(authority,
     `SELECT room.id AS roomId, room.name, room.status, membership.role
      FROM room_memberships AS membership
      JOIN rooms AS room ON room.id = membership.room_id
-     WHERE membership.actor_id = ? AND membership.kind = 'human' AND room.status = 'active'
-     ORDER BY room.id`,
-    principalId)) {
-    rooms.push({
+     WHERE membership.actor_id = ? AND membership.kind = 'human' AND room.status = 'active'`,
+    principalId, "room.id", "roomId")) {
+    yield {
       roomId: String(row.roomId), name: String(row.name), status: row.status as "active",
       role: row.role as "owner" | "admin" | "member",
-    });
+    };
     recordScanned();
   }
-  return rooms;
+}
+
+function streamingValues(
+  authority: DatabaseSync,
+  lease: StreamingRepairLease,
+): Iterable<RoomRepairRecord | RoomSummary> {
+  return lease.scope.kind === "room"
+    ? roomRecords(authority, lease.scope.roomId, () => undefined)
+    : catalogRooms(authority, lease.scope.principalId, () => undefined);
+}
+
+interface StreamingCursor {
+  readonly segment: number;
+  readonly key?: string;
+}
+
+interface StreamingSnapshotState {
+  readonly manifest: StreamingSnapshotManifest;
+  cursor: StreamingCursor | undefined;
+  lastServedPage: number;
+  replayPage?: {
+    readonly page: number;
+    readonly values: readonly (RoomRepairRecord | RoomSummary)[];
+  };
+}
+
+function keysetRows(
+  authority: DatabaseSync,
+  baseSql: string,
+  parameters: readonly string[],
+  keyColumn: string,
+  lastKey: string | undefined,
+  limit: number,
+): readonly Record<string, unknown>[] {
+  const statement = authority.prepare(
+    `${baseSql}${lastKey === undefined ? "" : ` AND ${keyColumn} > ?`}
+     ORDER BY ${keyColumn} LIMIT ?`,
+  );
+  const rows = statement.all(...parameters, ...(lastKey === undefined ? [] : [lastKey]), limit);
+  if (data.pauseState !== undefined) {
+    Atomics.add(new Int32Array(data.pauseState), 1, rows.length);
+  }
+  return rows;
+}
+
+function membershipRecord(row: Record<string, unknown>): RoomRepairRecord {
+  if (row.kind === "human" && typeof row.actorId === "string" &&
+      (row.role === "owner" || row.role === "admin" || row.role === "member") &&
+      typeof row.joinedAt === "string") {
+    return { kind: "membership", value: { kind: "human", actorId: row.actorId,
+      role: row.role, joinedAt: row.joinedAt }};
+  }
+  if (row.kind === "agent" && typeof row.actorId === "string" &&
+      (row.participation === "active" || row.participation === "on-mention" ||
+        row.participation === "silent") && typeof row.configuredAt === "string") {
+    const permissions = parseJson(row.toolPermissionsJson);
+    if (Array.isArray(permissions) && permissions.length > 0 && permissions.every(text)) {
+      return { kind: "membership", value: { kind: "agent", actorId: row.actorId,
+        participation: row.participation, toolPermissions: permissions,
+        configuredAt: row.configuredAt }};
+    }
+  }
+  throw new SnapshotBuildError("storage_unavailable", "Snapshot membership is corrupt");
+}
+
+function messageRecord(row: Record<string, unknown>): RoomRepairRecord {
+  if (typeof row.id !== "string" || typeof row.roomId !== "string" ||
+      typeof row.authorId !== "string" ||
+      (row.authorKind !== "human" && row.authorKind !== "agent") ||
+      typeof row.body !== "string" || typeof row.sentAt !== "string") {
+    throw new SnapshotBuildError("storage_unavailable", "Snapshot message is corrupt");
+  }
+  return { kind: "message", value: { id: row.id, roomId: row.roomId,
+    authorId: row.authorId, authorKind: row.authorKind, body: row.body, sentAt: row.sentAt }};
+}
+
+function keysetRoomPage(
+  authority: DatabaseSync,
+  roomId: string,
+  initial: StreamingCursor | undefined,
+  limit: number,
+): { readonly values: readonly RoomRepairRecord[]; readonly cursor: StreamingCursor } {
+  const values: RoomRepairRecord[] = [];
+  let segment = initial?.segment ?? 0;
+  let key = initial?.key;
+  const append = (
+    rows: readonly Record<string, unknown>[],
+    keyOf: (row: Record<string, unknown>) => string,
+    recordOf: (row: Record<string, unknown>) => RoomRepairRecord,
+  ): void => {
+    const requested = limit - values.length;
+    for (const row of rows) {
+      values.push(recordOf(row));
+      key = keyOf(row);
+    }
+    if (rows.length < requested) {
+      segment += 1;
+      key = undefined;
+    }
+  };
+
+  while (values.length < limit && segment < 8) {
+    if (segment === 0) {
+      const room = authority.prepare(
+        "SELECT id, name, status, created_at AS createdAt FROM rooms WHERE id = ?",
+      ).get(roomId);
+      if (room === undefined || typeof room.id !== "string" || typeof room.name !== "string" ||
+          (room.status !== "active" && room.status !== "archived") ||
+          typeof room.createdAt !== "string") {
+        throw new SnapshotBuildError("storage_unavailable", "Snapshot room metadata is corrupt");
+      }
+      if (key === undefined) {
+        values.push({ kind: "room", value: { id: room.id, name: room.name,
+          status: room.status, createdAt: room.createdAt }});
+        if (data.pauseState !== undefined) {
+          Atomics.add(new Int32Array(data.pauseState), 1, 1);
+        }
+      }
+      segment = 1;
+      key = undefined;
+      continue;
+    }
+    const remaining = limit - values.length;
+    if (segment === 1) {
+      append(keysetRows(authority,
+        `SELECT actor_id AS actorId, kind, role, participation,
+                tool_permissions_json AS toolPermissionsJson, joined_at AS joinedAt,
+                configured_at AS configuredAt
+         FROM room_memberships WHERE room_id = ?`, [roomId], "actor_id", key, remaining),
+      (row) => String(row.actorId), membershipRecord);
+    } else if (segment === 2) {
+      append(keysetRows(authority,
+        `SELECT id, room_id AS roomId, author_id AS authorId, author_kind AS authorKind,
+                body, sent_at AS sentAt FROM messages WHERE room_id = ?`,
+        [roomId], "id", key, remaining), (row) => String(row.id), messageRecord);
+    } else if (segment === 3) {
+      append(keysetRows(authority,
+        `SELECT actor_id AS actorId, message_id AS messageId, read_at AS readAt
+         FROM human_read_receipts WHERE room_id = ?`,
+        [roomId], "actor_id", key, remaining), (row) => String(row.actorId), (row) => {
+          if (typeof row.actorId !== "string" || typeof row.messageId !== "string" ||
+              typeof row.readAt !== "string") {
+            throw new SnapshotBuildError("storage_unavailable", "Snapshot receipt is corrupt");
+          }
+          return { kind: "human-read", value: { id: `human-read:${roomId}:${row.actorId}`,
+            messageId: row.messageId, readerId: row.actorId, readAt: row.readAt }};
+        });
+    } else if (segment === 4) {
+      append(keysetRows(authority,
+        "SELECT id, judgment_json AS json FROM agent_judgments WHERE room_id = ?",
+        [roomId], "id", key, remaining), (row) => String(row.id), (row) =>
+          ({ kind: "agent-judgement", value: parseJson(row.json) as RoomRepairRecord & never }));
+    } else if (segment === 5) {
+      append(keysetRows(authority,
+        `SELECT id, room_id AS roomId, source_message_id AS sourceMessageId,
+                requester_actor_id AS requesterId, assigned_actor_id AS ownerId,
+                body AS content, status, created_at AS createdAt,
+                responded_at AS respondedAt, transfer_chain_json AS transferChainJson
+         FROM open_items WHERE room_id = ?`, [roomId], "id", key, remaining),
+      (row) => String(row.id), (row) => ({ kind: "open-item", value: {
+        id: String(row.id), roomId: String(row.roomId), sourceMessageId: String(row.sourceMessageId),
+        requesterId: String(row.requesterId), ownerId: String(row.ownerId),
+        content: String(row.content), status: row.status as "pending_response",
+        createdAt: String(row.createdAt),
+        ...(typeof row.respondedAt === "string" ? { respondedAt: row.respondedAt } : {}),
+        transferChain: parseJson(row.transferChainJson) as [],
+      }}));
+    } else if (segment === 6) {
+      append(keysetRows(authority,
+        `SELECT id, room_id AS roomId, trigger_message_id AS sourceMessageId,
+                requester_actor_id AS requesterId, agent_id AS agentId, tool_name AS toolName,
+                status, started_at AS startedAt, completed_at AS completedAt,
+                result_json AS resultJson
+         FROM agent_executions WHERE room_id = ?`, [roomId], "id", key, remaining),
+      (row) => String(row.id), (row) => ({ kind: "agent-execution", value: {
+        id: String(row.id), roomId: String(row.roomId), sourceMessageId: String(row.sourceMessageId),
+        requesterId: String(row.requesterId), agentId: String(row.agentId),
+        toolName: String(row.toolName), status: row.status as "running",
+        startedAt: String(row.startedAt),
+        ...(typeof row.completedAt === "string" ? { completedAt: row.completedAt } : {}),
+        ...(typeof row.resultJson === "string"
+          ? { result: String(parseJson(row.resultJson)) } : {}),
+      }}));
+    } else {
+      append(keysetRows(authority,
+        `SELECT id, source_message_id AS sourceMessageId, actor_id AS actorId,
+                agent_id AS agentId, signal AS emoji, created_at AS createdAt
+         FROM calibration_signals WHERE room_id = ?`, [roomId], "id", key, remaining),
+      (row) => String(row.id), (row) => {
+        const common = { id: String(row.id), agentId: String(row.agentId),
+          emoji: row.emoji as "👍" | "👎", createdAt: String(row.createdAt) };
+        if (row.sourceMessageId === null && row.actorId === null) {
+          return { kind: "legacy-unknown-calibration", value: {
+            ...common, sourceMessageId: null, actorId: null,
+          }};
+        }
+        if (typeof row.sourceMessageId === "string" && typeof row.actorId === "string") {
+          return { kind: "calibration", value: {
+            ...common, sourceMessageId: row.sourceMessageId, actorId: row.actorId,
+          }};
+        }
+        throw new SnapshotBuildError("storage_unavailable", "Snapshot calibration is corrupt");
+      });
+    }
+  }
+  return { values, cursor: { segment, ...(key === undefined ? {} : { key }) } };
+}
+
+function keysetCatalogPage(
+  authority: DatabaseSync,
+  principalId: string,
+  initial: StreamingCursor | undefined,
+  limit: number,
+): { readonly values: readonly RoomSummary[]; readonly cursor: StreamingCursor } {
+  const rows = keysetRows(authority,
+    `SELECT room.id AS roomId, room.name, room.status, membership.role
+     FROM room_memberships AS membership
+     JOIN rooms AS room ON room.id = membership.room_id
+     WHERE membership.actor_id = ? AND membership.kind = 'human' AND room.status = 'active'`,
+    [principalId], "room.id", initial?.key, limit);
+  return {
+    values: rows.map((row) => ({
+      roomId: String(row.roomId), name: String(row.name), status: row.status as "active",
+      role: row.role as "owner" | "admin" | "member",
+    })),
+    cursor: {
+      segment: 0,
+      ...(rows.length === 0 ? (initial?.key === undefined ? {} : { key: initial.key })
+        : { key: String(rows.at(-1)?.roomId) }),
+    },
+  };
+}
+
+function streamingChecksumAndCount(
+  lease: StreamingRepairLease,
+): { readonly checksum: string; readonly count: number } {
+  const authority = openAuthorityPreflight();
+  try {
+    const kind = lease.scope.kind;
+    const digest = createHash("sha256");
+    digest.update(`{"kind":${JSON.stringify(kind)},"values":[`, "utf8");
+    let countValue = 0;
+    for (const value of streamingValues(authority, lease)) {
+      if (countValue > 0) digest.update(",", "utf8");
+      digest.update(canonicalJson(value), "utf8");
+      countValue += 1;
+    }
+    digest.update(`],"version":1}`, "utf8");
+    return { checksum: digest.digest("hex"), count: countValue };
+  } finally {
+    authority.close();
+  }
+}
+
+function streamingPageEnvelope(
+  manifest: StreamingSnapshotManifest,
+  requestId: string,
+  page: number,
+  values: readonly (RoomRepairRecord | RoomSummary)[],
+  idleExpiresAt: string,
+): SnapshotMaterializedPage {
+  const hasMore = page + 1 < manifest.pageCount;
+  if (manifest.kind === "room") {
+    const result = {
+      type: "room.repair.page" as const,
+      requestId,
+      snapshotId: manifest.snapshotId,
+      roomId: manifest.roomId,
+      page,
+      records: values as readonly RoomRepairRecord[],
+      watermark: manifest.watermark,
+      snapshotChecksum: manifest.checksum,
+      hasMore,
+      mode: "streaming" as const,
+      idleExpiresAt,
+    };
+    if (!isRoomRepairPage(result)) {
+      throw new SnapshotBuildError("storage_unavailable", "Streaming room record is corrupt");
+    }
+    return result;
+  }
+  const result = {
+    type: "workspace.bootstrap.page" as const,
+    requestId,
+    snapshotId: manifest.snapshotId,
+    page,
+    rooms: values as readonly RoomSummary[],
+    catalogRevision: manifest.catalogRevision,
+    snapshotChecksum: manifest.checksum,
+    hasMore,
+    mode: "streaming" as const,
+    idleExpiresAt,
+  };
+  if (!isWorkspaceBootstrapPage(result)) {
+    throw new SnapshotBuildError("storage_unavailable", "Streaming catalog record is corrupt");
+  }
+  return result;
+}
+
+function readStreamingPage(
+  state: StreamingSnapshotState,
+  lease: StreamingRepairLease,
+  requestId: string,
+  page: number,
+): SnapshotMaterializedPage {
+  const manifest = state.manifest;
+  if (page < 0 || page >= manifest.pageCount || lease.snapshotId !== manifest.snapshotId ||
+      lease.sessionFamilyId !== manifest.sessionFamilyId ||
+      lease.principalId !== manifest.principalId ||
+      (lease.checksum !== undefined && lease.checksum !== manifest.checksum) ||
+      (lease.pageCount !== undefined && lease.pageCount !== manifest.pageCount)) {
+    throw new SnapshotBuildError("invalid_request", "Streaming page request is invalid");
+  }
+  if (state.replayPage?.page === page) {
+    return streamingPageEnvelope(
+      manifest, requestId, page, state.replayPage.values, lease.idleExpiresAt,
+    );
+  }
+  if (page !== state.lastServedPage + 1) {
+    throw new SnapshotBuildError("invalid_request", "Streaming pages must be read continuously");
+  }
+  const authority = openAuthorityPreflight();
+  try {
+    const selected = lease.scope.kind === "room"
+      ? keysetRoomPage(
+          authority, lease.scope.roomId, state.cursor, data.limits.maxRecordsPerPage,
+        )
+      : keysetCatalogPage(
+          authority, lease.scope.principalId, state.cursor, data.limits.maxRecordsPerPage,
+        );
+    const expectedCount = page === manifest.pageCount - 1
+      ? undefined : data.limits.maxRecordsPerPage;
+    if ((expectedCount !== undefined && selected.values.length !== expectedCount) ||
+        (page === manifest.pageCount - 1 && selected.values.length === 0 &&
+          manifest.pageCount > 1)) {
+      throw new SnapshotBuildError("storage_unavailable", "Streaming cursor lost its frozen version");
+    }
+    state.cursor = selected.cursor;
+    state.lastServedPage = page;
+    state.replayPage = { page, values: selected.values };
+    return streamingPageEnvelope(manifest, requestId, page, selected.values, lease.idleExpiresAt);
+  } finally {
+    authority.close();
+  }
+}
+
+function beginStreaming(
+  request: Extract<SnapshotWorkerRequest, { readonly type: "snapshot.begin-streaming" }>,
+): void {
+  try {
+    if (request.lease.checksum !== undefined) {
+      const state = streamingSnapshots.get(request.lease.snapshotId);
+      if (state === undefined) {
+        throw new SnapshotBuildError("snapshot_not_found", "Streaming snapshot was not found");
+      }
+      const page = readStreamingPage(state, request.lease, request.responseRequestId, 0);
+      respond({
+        type: "snapshot.streaming-page", requestId: request.requestId,
+        page, manifest: state.manifest,
+      });
+      return;
+    }
+    const measured = streamingChecksumAndCount(request.lease);
+    const pageCount = Math.max(1, Math.ceil(measured.count / data.limits.maxRecordsPerPage));
+    const manifest: StreamingSnapshotManifest = request.lease.scope.kind === "room" &&
+        request.lease.version.kind === "room"
+      ? {
+          snapshotId: request.lease.snapshotId,
+          principalId: request.lease.principalId,
+          sessionFamilyId: request.lease.sessionFamilyId,
+          checksum: measured.checksum,
+          pageCount,
+          kind: "room",
+          roomId: request.lease.scope.roomId,
+          accessRevision: request.lease.authorizationRevision,
+          watermark: request.lease.version.watermark,
+        }
+      : request.lease.scope.kind === "catalog" && request.lease.version.kind === "catalog"
+        ? {
+            snapshotId: request.lease.snapshotId,
+            principalId: request.lease.principalId,
+            sessionFamilyId: request.lease.sessionFamilyId,
+            checksum: measured.checksum,
+            pageCount,
+            kind: "catalog",
+            catalogRevision: request.lease.version.catalogRevision,
+          }
+        : (() => { throw new SnapshotBuildError("invalid_request", "Streaming version mismatch"); })();
+    const state: StreamingSnapshotState = {
+      manifest,
+      cursor: undefined,
+      lastServedPage: -1,
+    };
+    streamingSnapshots.set(manifest.snapshotId, state);
+    const page = readStreamingPage(
+      state,
+      { ...request.lease, checksum: manifest.checksum, pageCount: manifest.pageCount,
+        lastPage: manifest.pageCount - 1, highestAuthorizedPage: -1 },
+      request.responseRequestId,
+      0,
+    );
+    respond({ type: "snapshot.streaming-page", requestId: request.requestId, page, manifest });
+  } catch (cause: unknown) {
+    if (cause instanceof SnapshotBuildError) error(request.requestId, cause.code, cause.message);
+    else error(request.requestId, "storage_unavailable", "Streaming snapshot initialization failed");
+  }
+}
+
+function handleStreamingRead(
+  request: Extract<SnapshotWorkerRequest, { readonly type: "snapshot.read-streaming-page" }>,
+): void {
+  try {
+    const state = streamingSnapshots.get(request.lease.snapshotId);
+    if (state === undefined) {
+      throw new SnapshotBuildError("snapshot_not_found", "Streaming snapshot was not found");
+    }
+    const pageNumber = request.afterPage + 1;
+    const page = readStreamingPage(
+      state, request.lease, request.responseRequestId, pageNumber,
+    );
+    respond({ type: "snapshot.streaming-page", requestId: request.requestId,
+      page, manifest: state.manifest });
+  } catch (cause: unknown) {
+    if (cause instanceof SnapshotBuildError) error(request.requestId, cause.code, cause.message);
+    else error(request.requestId, "storage_unavailable", "Streaming snapshot page failed");
+  }
 }
 
 function pageEnvelope(
@@ -680,6 +1154,9 @@ function build(
   cleanupExpired(request.now);
   const reusable = findReusableForRequest(request);
   if (reusable !== undefined) return reusable;
+  if (data.pauseState !== undefined) {
+    Atomics.add(new Int32Array(data.pauseState), 2, 1);
+  }
   const startedAt = performance.now();
   const initialWalBytes = authorityWalSize();
   const authority = openAuthorityReadView();
@@ -720,7 +1197,7 @@ function build(
         authority.exec("COMMIT"); readTransactionOpen = false;
         return pageFromCache(reusable, request.responseRequestId, 0);
       }
-      values = roomRecords(authority, request.roomId, recordScanned);
+      values = [...roomRecords(authority, request.roomId, recordScanned)];
       version = { roomId: request.roomId, watermark };
       const checksum = canonicalChecksum("room", values);
       const snapshotId = randomUUID();
@@ -746,7 +1223,7 @@ function build(
       authority.exec("COMMIT"); readTransactionOpen = false;
       return pageFromCache(reusable, request.responseRequestId, 0);
     }
-    values = catalogRooms(authority, request.context.principal.actorId, recordScanned);
+    values = [...catalogRooms(authority, request.context.principal.actorId, recordScanned)];
     version = { catalogRevision };
     const checksum = canonicalChecksum("catalog", values);
     const snapshotId = randomUUID();
@@ -831,7 +1308,21 @@ function dispatch(value: unknown): void {
   if (!initialized || closed) { error(value.requestId, "storage_unavailable", "Snapshot worker is unavailable"); return; }
   if (value.type === "snapshot.close") {
     closed = true;
+    streamingSnapshots.clear();
     respond({ type: "snapshot.closed", requestId: value.requestId }); port.close();
+    return;
+  }
+  if (value.type === "snapshot.begin-streaming") {
+    beginStreaming(value);
+    return;
+  }
+  if (value.type === "snapshot.read-streaming-page") {
+    handleStreamingRead(value);
+    return;
+  }
+  if (value.type === "snapshot.release-streaming") {
+    streamingSnapshots.delete(value.snapshotId);
+    respond({ type: "snapshot.streaming-released", requestId: value.requestId });
     return;
   }
   try {

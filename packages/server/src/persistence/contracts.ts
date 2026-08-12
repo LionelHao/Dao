@@ -24,6 +24,7 @@ import type {
   RoomSyncRequest,
   RoomSyncResult,
   WorkspaceBootstrapPage,
+  SnapshotVersion,
 } from "@native-im/core";
 
 export const SNAPSHOT_REQUEST_ID_MAX_BYTES = 128;
@@ -34,6 +35,25 @@ export interface AuthenticatedSessionContext {
   readonly sessionId: string;
   readonly sessionFamilyId: string;
   readonly principal: AuthenticatedPrincipal;
+}
+
+export type RepairScope =
+  | { readonly kind: "room"; readonly roomId: string }
+  | { readonly kind: "catalog"; readonly principalId: string };
+
+export interface StreamingRepairLease {
+  readonly snapshotId: string;
+  readonly principalId: string;
+  readonly accountId: string;
+  readonly sessionFamilyId: string;
+  readonly scope: RepairScope;
+  readonly version: SnapshotVersion;
+  readonly authorizationRevision: number;
+  readonly checksum?: string;
+  readonly pageCount?: number;
+  readonly lastPage?: number;
+  readonly highestAuthorizedPage?: number;
+  readonly idleExpiresAt: string;
 }
 
 export type MaterializedSnapshotManifest = {
@@ -67,6 +87,21 @@ export type SnapshotRevalidationRequest =
     };
 
 export type SnapshotMaterializedPage = RoomRepairPage | WorkspaceBootstrapPage;
+export type StreamingSnapshotManifest = {
+  readonly snapshotId: string;
+  readonly principalId: string;
+  readonly sessionFamilyId: string;
+  readonly checksum: string;
+  readonly pageCount: number;
+} & (
+  | {
+      readonly kind: "room";
+      readonly roomId: string;
+      readonly accessRevision: number;
+      readonly watermark: number;
+    }
+  | { readonly kind: "catalog"; readonly catalogRevision: number }
+);
 export type SnapshotFallbackReason = "quota" | "deadline" | "wal-growth";
 
 export type SnapshotWorkerRequest =
@@ -94,6 +129,24 @@ export type SnapshotWorkerRequest =
       readonly snapshotId: string;
       readonly afterPage: number;
       readonly now: number;
+    }
+  | {
+      readonly type: "snapshot.begin-streaming";
+      readonly requestId: string;
+      readonly lease: StreamingRepairLease;
+      readonly responseRequestId: string;
+    }
+  | {
+      readonly type: "snapshot.read-streaming-page";
+      readonly requestId: string;
+      readonly lease: StreamingRepairLease;
+      readonly responseRequestId: string;
+      readonly afterPage: number;
+    }
+  | {
+      readonly type: "snapshot.release-streaming";
+      readonly requestId: string;
+      readonly snapshotId: string;
     }
   | {
       readonly type: "snapshot.invalidate";
@@ -133,6 +186,12 @@ export type SnapshotWorkerResponse =
       readonly reason: SnapshotFallbackReason;
     }
   | {
+      readonly type: "snapshot.streaming-page";
+      readonly requestId: string;
+      readonly page: SnapshotMaterializedPage;
+      readonly manifest: StreamingSnapshotManifest;
+    }
+  | {
       readonly type: "snapshot.cache-count";
       readonly requestId: string;
       readonly count: number;
@@ -143,6 +202,7 @@ export type SnapshotWorkerResponse =
       readonly count: number;
     }
   | { readonly type: "snapshot.invalidated"; readonly requestId: string }
+  | { readonly type: "snapshot.streaming-released"; readonly requestId: string }
   | { readonly type: "snapshot.closed"; readonly requestId: string }
   | {
       readonly type: "snapshot.error";

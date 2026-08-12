@@ -258,6 +258,18 @@ describe("permission-aware retained room sync", () => {
           snapshotChecksum: "checksum", hasMore: false, mode: "materialized" as const,
           expiresAt: "2026-08-11T00:05:00.000Z" };
       },
+      async completeSnapshot(
+        _context: AuthenticatedSessionContext,
+        requestId: string,
+        completedSnapshotId: string,
+        version: { readonly kind: "catalog"; readonly catalogRevision: number },
+        checksum: string,
+      ) {
+        void checksum;
+        return { type: "snapshot.completed" as const, requestId,
+          snapshotId: completedSnapshotId, version };
+      },
+      async releaseSnapshot() {},
     };
     const sync = createSyncService({ store: fixture.store, snapshots });
 
@@ -269,11 +281,21 @@ describe("permission-aware retained room sync", () => {
       .resolves.toMatchObject({ type: "workspace.bootstrap.page", requestId: "catalog-begin", page: 0 });
     await expect(sync.readWorkspaceBootstrapPage(context, "catalog-next", snapshotId, 0))
       .resolves.toMatchObject({ requestId: "catalog-next", page: 1 });
+    await expect(sync.completeSnapshot(context, "complete", snapshotId,
+      { kind: "catalog", catalogRevision: 0 }, "checksum"))
+      .resolves.toEqual({ type: "snapshot.completed", requestId: "complete",
+        snapshotId, version: { kind: "catalog", catalogRevision: 0 } });
+    await expect(sync.releaseSnapshot(context, snapshotId)).resolves.toBeUndefined();
     for (const invalid of ["", " "]) {
       await expect(sync.beginWorkspaceBootstrap(context, invalid))
         .rejects.toMatchObject({ status: 400, code: "invalid_request" });
     }
     await expect(sync.readRoomRepairPage(context, "bad-page", snapshotId, -1))
+      .rejects.toMatchObject({ status: 400, code: "invalid_request" });
+    await expect(sync.completeSnapshot(context, "bad-complete", snapshotId,
+      { kind: "room", roomId: "", watermark: 0 }, "checksum"))
+      .rejects.toMatchObject({ status: 400, code: "invalid_request" });
+    await expect(sync.releaseSnapshot(context, " "))
       .rejects.toMatchObject({ status: 400, code: "invalid_request" });
     await fixture.client.close();
   });
@@ -762,7 +784,7 @@ describe("permission-aware retained room sync", () => {
       ).get(),
     }).toEqual(before);
     database.close();
-    await expect(fixture.client.inspectSchema()).resolves.toEqual({ version: 4 });
+    await expect(fixture.client.inspectSchema()).resolves.toEqual({ version: 5 });
     const context = fixture.contexts[0];
     if (context === undefined) throw new Error("missing fixture context");
     await expect(fixture.sync.syncRoom(
