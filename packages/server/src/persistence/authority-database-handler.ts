@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type {
   Actor,
+  AgentExecution,
   ManagedRoom,
   Message,
   PersistedIdentityEvent,
@@ -21,7 +22,32 @@ import {
   ROOM_SYNC_DEFAULT_LIMIT,
   ROOM_SYNC_MAX_PAGE_BYTES,
   type AgentCollaborationCommand,
+  type AgentInvocationInput,
+  type AgentRuntimeRecovery,
+  type AgentRuntimeRecoveryPage,
+  type AgentRuntimeRecoveryPageInput,
+  type AgentRuntimeProviderContext,
+  type AgentRuntimeToolPlanEntry,
+  type CommitExecutionStepInput,
+  type CompleteExecutionInput,
+  type CompleteCompensationInput,
+  type FailExecutionInput,
+  type ScheduleRetryInput,
+  type InterruptExecutionInput,
+  type PrepareToolInput,
+  type ToolGrant,
+  type ToolConfirmationInput,
+  type ToolConfirmation,
+  type ResumeConfirmedToolInput,
+  type ResumedToolDispatch,
+  type DispatchToolInput,
+  type SettleToolInput,
+  type ToolDispatch,
+  type AgentRuntimeCompensationWork,
+  type ResumeAgentRuntimeCompensationInput,
+  type CancelForHumanFenceInput,
   type AgentWorkerCommandContext,
+  type AgentRuntimeWorkerContext,
   type AuthenticatedCommandContext,
   type AuthenticatedSessionContext,
   type CommandAcknowledgement,
@@ -74,6 +100,13 @@ export interface ExecuteAgentDatabaseCommandInput {
 export interface DatabaseCommandResult {
   readonly acknowledgement: CommandAcknowledgement;
   readonly disposition: "applied" | "replayed";
+}
+
+export interface InvokeAgentRuntimeDatabaseCommandInput {
+  readonly context: AuthenticatedCommandContext | AgentWorkerCommandContext;
+  readonly input: AgentInvocationInput;
+  readonly now: number;
+  readonly maxQueuedPerRoom?: number;
 }
 
 function fail(code: AuthorityWorkerErrorCode, message: string): never {
@@ -2676,9 +2709,8 @@ function executeAgentExecutionTransition(
   requireAgentToolPermission(database, command.roomId, agentId, command.payload.toolName);
   const current = database.prepare(
     `SELECT id, room_id AS roomId, agent_id AS agentId,
-            trigger_message_id AS sourceMessageId, requester_actor_id AS requesterId,
-            tool_name AS toolName, status, started_at AS startedAt,
-            completed_at AS completedAt, result_json AS resultJson
+            source_message_id AS sourceMessageId, requester_actor_id AS requesterId,
+            current_tool_id AS toolName, state AS status, started_at AS startedAt
      FROM agent_executions WHERE id = ?`,
   ).get(command.payload.executionId);
   let execution: Record<string, JsonValue>;
@@ -2697,24 +2729,46 @@ function executeAgentExecutionTransition(
       sourceMessageId: command.payload.sourceMessageId,
       requesterId,
       agentId,
-      toolName: command.payload.toolName,
       status: "running",
+      actionCategory: "tool_call",
+      toolDispatchPhase: "dispatched",
+      currentToolId: command.payload.toolName,
+      currentAttemptSeq: 1,
+      retryCycle: 1,
+      retryOrdinal: 1,
+      providerId: "legacy-authority",
+      modelId: "no-model",
+      recoveryCursor: 0,
+      queuedAt: acceptedAt,
       startedAt: acceptedAt,
+      updatedAt: acceptedAt,
     };
     database.prepare(
       `INSERT INTO agent_executions (
-         id, room_id, agent_id, trigger_message_id, status, started_at,
-         completed_at, result_json, requester_actor_id, tool_name
-       ) VALUES (?, ?, ?, ?, 'running', ?, NULL, NULL, ?, ?)`,
+         id, room_id, agent_id, source_message_id, requester_actor_id, state,
+         action_category, tool_dispatch_phase, current_tool_id,
+         current_attempt_seq, retry_cycle, retry_ordinal, provider_id, model_id,
+         recovery_cursor, queued_at, started_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, 'running', 'tool_call', 'dispatched', ?,
+                 1, 1, 1, 'legacy-authority', 'no-model', 0, ?, ?, ?)`,
     ).run(
       command.payload.executionId,
       command.roomId,
       agentId,
       command.payload.sourceMessageId,
-      acceptedAt,
       requesterId,
       command.payload.toolName,
+      acceptedAt,
+      acceptedAt,
+      acceptedAt,
     );
+    database.prepare(
+      `INSERT INTO agent_execution_attempts (
+         execution_id, room_id, attempt_seq, retry_cycle, retry_ordinal, state,
+         action_category, tool_dispatch_phase, started_at, finished_at,
+         error_code, next_retry_at, recovery_cursor
+       ) VALUES (?, ?, 1, 1, 1, 'running', 'tool_call', 'dispatched', ?, NULL, NULL, NULL, 0)`,
+    ).run(command.payload.executionId, command.roomId, acceptedAt);
   } else {
     if (current.roomId !== command.roomId || current.agentId !== agentId ||
         current.sourceMessageId !== command.payload.sourceMessageId ||
@@ -2725,28 +2779,50 @@ function executeAgentExecutionTransition(
     if (current.status !== "running" || command.payload.status === "running") {
       return fail("execution_not_running", "Authority Agent execution is not running");
     }
+    const status = command.payload.status === "interrupted" ? "cancelled" : command.payload.status;
     execution = {
       id: command.payload.executionId,
       roomId: command.roomId,
       sourceMessageId: command.payload.sourceMessageId,
       requesterId: current.requesterId,
       agentId,
-      toolName: command.payload.toolName,
-      status: command.payload.status,
+      status,
+      actionCategory: "tool_call",
+      toolDispatchPhase: "finished",
+      currentToolId: command.payload.toolName,
+      currentAttemptSeq: 1,
+      retryCycle: 1,
+      retryOrdinal: 1,
+      providerId: "legacy-authority",
+      modelId: "no-model",
+      recoveryCursor: 0,
+      queuedAt: current.startedAt,
       startedAt: current.startedAt,
-      completedAt: acceptedAt,
-      ...(command.payload.result === undefined ? {} : { result: command.payload.result }),
+      updatedAt: acceptedAt,
+      finishedAt: acceptedAt,
+      ...(status === "cancelled" ? { cancellationReason: "legacy_interrupted" } : {}),
+      ...(status === "failed" ? { terminalErrorCode: "legacy_closed" } : {}),
     };
     database.prepare(
       `UPDATE agent_executions
-       SET status = ?, completed_at = ?, result_json = ?
+       SET state = ?, tool_dispatch_phase = 'finished', completed_at = ?,
+           updated_at = ?, cancellation_reason = ?, terminal_error_code = ?,
+           legacy_result_json = ?
        WHERE id = ?`,
     ).run(
-      command.payload.status,
+      status,
       acceptedAt,
+      acceptedAt,
+      status === "cancelled" ? "legacy_interrupted" : null,
+      status === "failed" ? "legacy_closed" : null,
       command.payload.result === undefined ? null : canonicalJson(command.payload.result),
       command.payload.executionId,
     );
+    database.prepare(
+      `UPDATE agent_execution_attempts
+       SET state = ?, tool_dispatch_phase = 'finished', finished_at = ?, error_code = ?
+       WHERE execution_id = ? AND attempt_seq = 1`,
+    ).run(status, acceptedAt, status === "failed" ? "legacy_closed" : null, command.payload.executionId);
   }
   const eventId = stableId("event", scope, key, "0");
   const streamSeq = appendRoomEvent(database, {
@@ -2764,6 +2840,2549 @@ function executeAgentExecutionTransition(
     acceptedAt,
     result: { execution },
   };
+}
+
+function agentExecutionFromRuntimeRow(row: Record<string, unknown>): AgentExecution {
+  const supersedes = typeof row.supersedesExecutionIdsJson === "string"
+    ? JSON.parse(row.supersedesExecutionIdsJson) as unknown
+    : undefined;
+  return {
+    id: String(row.id),
+    roomId: String(row.roomId),
+    sourceMessageId: String(row.sourceMessageId),
+    requesterId: String(row.requesterId),
+    agentId: String(row.agentId),
+    status: row.status as AgentExecution["status"],
+    actionCategory: row.actionCategory as AgentExecution["actionCategory"],
+    ...(typeof row.toolDispatchPhase === "string"
+      ? { toolDispatchPhase: row.toolDispatchPhase as NonNullable<AgentExecution["toolDispatchPhase"]> }
+      : {}),
+    ...(typeof row.currentToolId === "string" ? { currentToolId: row.currentToolId } : {}),
+    currentAttemptSeq: Number(row.currentAttemptSeq),
+    retryCycle: Number(row.retryCycle),
+    retryOrdinal: Number(row.retryOrdinal) as 1 | 2 | 3,
+    providerId: String(row.providerId),
+    modelId: String(row.modelId),
+    recoveryCursor: Number(row.recoveryCursor),
+    queuedAt: String(row.queuedAt),
+    ...(typeof row.startedAt === "string" ? { startedAt: row.startedAt } : {}),
+    updatedAt: String(row.updatedAt),
+    ...(typeof row.finishedAt === "string" ? { finishedAt: row.finishedAt } : {}),
+    ...(typeof row.cancellationReason === "string" ? { cancellationReason: row.cancellationReason } : {}),
+    ...(typeof row.terminalErrorCode === "string" ? { terminalErrorCode: row.terminalErrorCode } : {}),
+    ...(typeof row.deadLetteredAt === "string" ? { deadLetteredAt: row.deadLetteredAt } : {}),
+    ...(typeof row.resultMessageId === "string" ? { resultMessageId: row.resultMessageId } : {}),
+    ...(typeof row.manualRetryOfExecutionId === "string"
+      ? { manualRetryOfExecutionId: row.manualRetryOfExecutionId }
+      : {}),
+    ...(typeof row.compensatesExecutionId === "string"
+      ? { compensatesExecutionId: row.compensatesExecutionId }
+      : {}),
+    ...(Array.isArray(supersedes) && supersedes.length > 0
+      ? { supersedesExecutionIds: supersedes as readonly string[] }
+      : {}),
+  };
+}
+
+const AGENT_RUNTIME_EXECUTION_COLUMNS = `
+  id, room_id AS roomId, source_message_id AS sourceMessageId,
+  requester_actor_id AS requesterId, agent_id AS agentId,
+  state AS status, action_category AS actionCategory,
+  tool_dispatch_phase AS toolDispatchPhase, current_tool_id AS currentToolId,
+  current_attempt_seq AS currentAttemptSeq, retry_cycle AS retryCycle,
+  retry_ordinal AS retryOrdinal, provider_id AS providerId, model_id AS modelId,
+  recovery_cursor AS recoveryCursor, queued_at AS queuedAt,
+  started_at AS startedAt, updated_at AS updatedAt, completed_at AS finishedAt,
+  cancellation_reason AS cancellationReason, terminal_error_code AS terminalErrorCode,
+  dead_lettered_at AS deadLetteredAt, result_message_id AS resultMessageId,
+  manual_retry_of_execution_id AS manualRetryOfExecutionId,
+  compensates_execution_id AS compensatesExecutionId,
+  supersedes_execution_ids_json AS supersedesExecutionIdsJson`;
+
+function readAgentRuntimeExecutionRow(
+  database: DatabaseSync,
+  executionId: string,
+): Record<string, unknown> | undefined {
+  return database.prepare(
+    `SELECT ${AGENT_RUNTIME_EXECUTION_COLUMNS} FROM agent_executions WHERE id = ?`,
+  ).get(executionId) as Record<string, unknown> | undefined;
+}
+
+function requireHumanExecutionAuthority(
+  database: DatabaseSync,
+  context: AuthenticatedCommandContext,
+  now: number,
+  row: Record<string, unknown>,
+): string {
+  const actorId = requireHumanSession(database, context, now);
+  const membership = database.prepare(
+    `SELECT role FROM room_memberships
+     WHERE room_id = ? AND actor_id = ? AND kind = 'human'`,
+  ).get(String(row.roomId), actorId) as { readonly role?: unknown } | undefined;
+  if (membership === undefined ||
+      (row.requesterId !== actorId && membership.role !== "owner" && membership.role !== "admin")) {
+    return fail("room_forbidden", "Agent runtime execution authority was rejected");
+  }
+  return actorId;
+}
+
+export interface InterruptAgentRuntimeDatabaseCommandInput {
+  readonly context: AuthenticatedCommandContext;
+  readonly input: InterruptExecutionInput;
+  readonly now: number;
+}
+
+export function interruptAgentRuntimeDatabaseCommand(
+  database: DatabaseSync,
+  command: InterruptAgentRuntimeDatabaseCommandInput,
+): AgentExecution {
+  return runAuthorityImmediateTransaction(database, () => {
+    const row = readAgentRuntimeExecutionRow(database, command.input.executionId);
+    if (row === undefined) return fail("execution_conflict", "Agent runtime execution was not found");
+    requireHumanExecutionAuthority(database, command.context, command.now, row);
+    if (row.status === "completed" || row.status === "failed" || row.status === "cancelled") {
+      return agentExecutionFromRuntimeRow(row);
+    }
+    const finishedAt = new Date(command.now).toISOString();
+    const executionUpdate = database.prepare(
+      `UPDATE agent_executions
+       SET state = 'cancelled', completed_at = ?, updated_at = ?, cancellation_reason = ?
+       WHERE id = ? AND current_attempt_seq = ? AND state IN ('queued', 'running')`,
+    ).run(finishedAt, finishedAt, command.input.reason, command.input.executionId,
+      Number(row.currentAttemptSeq));
+    if (executionUpdate.changes !== 1) {
+      return fail("execution_conflict", "Agent runtime interrupt lost execution CAS");
+    }
+    const attemptUpdate = database.prepare(
+      `UPDATE agent_execution_attempts
+       SET state = 'cancelled', finished_at = ?, next_retry_at = NULL
+       WHERE execution_id = ? AND attempt_seq = ? AND state IN ('queued', 'running')`,
+    ).run(finishedAt, command.input.executionId, Number(row.currentAttemptSeq));
+    if (attemptUpdate.changes !== 1) {
+      return fail("execution_conflict", "Agent runtime interrupt lost attempt CAS");
+    }
+    const execution = agentExecutionFromRuntimeRow({
+      ...row,
+      status: "cancelled",
+      updatedAt: finishedAt,
+      finishedAt,
+      cancellationReason: command.input.reason,
+    });
+    const eventId = stableId("event", "agent-runtime-interrupt", command.input.executionId,
+      String(row.currentAttemptSeq));
+    const streamSeq = appendRoomEvent(database, {
+      eventId,
+      roomId: String(row.roomId),
+      actorId: String(row.agentId),
+      eventType: "room.agent_execution.changed",
+      occurredAt: finishedAt,
+      payload: execution as unknown as JsonValue,
+    });
+    appendRoomOutbox(database, eventId, String(row.roomId), streamSeq, finishedAt,
+      "agent-runtime-interrupt", command.input.executionId);
+    return execution;
+  });
+}
+
+export interface ManualRetryAgentRuntimeDatabaseCommandInput {
+  readonly context: AuthenticatedCommandContext;
+  readonly executionId: string;
+  readonly now: number;
+  readonly maxQueuedPerRoom?: number;
+}
+
+export function manualRetryAgentRuntimeDatabaseCommand(
+  database: DatabaseSync,
+  command: ManualRetryAgentRuntimeDatabaseCommandInput,
+): AgentExecution {
+  return runAuthorityImmediateTransaction(database, () => {
+    const old = readAgentRuntimeExecutionRow(database, command.executionId);
+    if (old === undefined) return fail("execution_conflict", "Agent runtime execution was not found");
+    const requesterId = requireHumanExecutionAuthority(database, command.context, command.now, old);
+    if (old.status !== "failed" || typeof old.deadLetteredAt !== "string") {
+      return fail("execution_conflict", "Agent runtime manual retry requires a dead-lettered execution");
+    }
+    const existing = database.prepare(
+      `SELECT ${AGENT_RUNTIME_EXECUTION_COLUMNS}
+       FROM agent_executions WHERE manual_retry_of_execution_id = ?`,
+    ).get(command.executionId) as Record<string, unknown> | undefined;
+    if (existing !== undefined) return agentExecutionFromRuntimeRow(existing);
+    if (command.maxQueuedPerRoom !== undefined) {
+      const outstanding = database.prepare(
+        `SELECT COUNT(*) AS count FROM agent_executions
+         WHERE room_id = ? AND state IN ('queued', 'running')`,
+      ).get(String(old.roomId)) as { readonly count: number };
+      if (outstanding.count >= command.maxQueuedPerRoom + 1) {
+        return fail("target_busy", "Agent runtime room queue is full");
+      }
+    }
+    const queuedAt = new Date(command.now).toISOString();
+    const executionId = stableId("agent-runtime-manual-retry", command.executionId);
+    database.prepare(
+      `INSERT INTO agent_executions (
+         id, room_id, agent_id, source_message_id, requester_actor_id, state,
+         action_category, current_attempt_seq, retry_cycle, retry_ordinal,
+         provider_id, model_id, recovery_cursor, queued_at, updated_at,
+         manual_retry_of_execution_id
+       ) VALUES (?, ?, ?, ?, ?, 'queued', 'model_generation', 1, ?, 1, ?, ?, 0, ?, ?, ?)`,
+    ).run(executionId, String(old.roomId), String(old.agentId), String(old.sourceMessageId),
+      requesterId, Number(old.retryCycle) + 1, String(old.providerId), String(old.modelId),
+      queuedAt, queuedAt, command.executionId);
+    const execution = agentExecutionFromRuntimeRow({
+      id: executionId,
+      roomId: old.roomId,
+      sourceMessageId: old.sourceMessageId,
+      requesterId,
+      agentId: old.agentId,
+      status: "queued",
+      actionCategory: "model_generation",
+      currentAttemptSeq: 1,
+      retryCycle: Number(old.retryCycle) + 1,
+      retryOrdinal: 1,
+      providerId: old.providerId,
+      modelId: old.modelId,
+      recoveryCursor: 0,
+      queuedAt,
+      updatedAt: queuedAt,
+      manualRetryOfExecutionId: command.executionId,
+    });
+    const eventId = stableId("event", "agent-runtime-manual-retry", command.executionId);
+    const streamSeq = appendRoomEvent(database, {
+      eventId,
+      roomId: String(old.roomId),
+      actorId: String(old.agentId),
+      eventType: "room.agent_execution.changed",
+      occurredAt: queuedAt,
+      payload: execution as unknown as JsonValue,
+    });
+    database.prepare(
+      `INSERT INTO agent_execution_attempts (
+         execution_id, room_id, attempt_seq, retry_cycle, retry_ordinal, state,
+         action_category, recovery_cursor, enqueue_stream_seq
+       ) VALUES (?, ?, 1, ?, 1, 'queued', 'model_generation', 0, ?)`,
+    ).run(executionId, String(old.roomId), Number(old.retryCycle) + 1, streamSeq);
+    appendRoomOutbox(database, eventId, String(old.roomId), streamSeq, queuedAt,
+      "agent-runtime-manual-retry", executionId);
+    return execution;
+  });
+}
+
+export interface CompensateAgentRuntimeDatabaseCommandInput {
+  readonly context: AuthenticatedCommandContext;
+  readonly executionId: string;
+  readonly dispatchId: string;
+  readonly now: number;
+  readonly maxQueuedPerRoom?: number;
+}
+
+export function compensateAgentRuntimeDatabaseCommand(
+  database: DatabaseSync,
+  command: CompensateAgentRuntimeDatabaseCommandInput,
+): AgentExecution {
+  return runAuthorityImmediateTransaction(database, () => {
+    const original = readAgentRuntimeExecutionRow(database, command.executionId);
+    if (original === undefined || original.status === "queued" || original.status === "running") {
+      return fail("execution_conflict", "Agent runtime compensation requires a terminal execution");
+    }
+    const actorId = requireHumanSession(database, command.context, command.now);
+    const membership = database.prepare(
+      `SELECT role FROM room_memberships
+       WHERE room_id = ? AND actor_id = ? AND kind = 'human'`,
+    ).get(String(original.roomId), actorId) as { readonly role?: unknown } | undefined;
+    if (membership === undefined) {
+      return fail("room_forbidden", "Agent runtime compensation membership was rejected");
+    }
+    const sideEffect = database.prepare(
+      `SELECT confirmation.human_principal_id AS humanPrincipalId,
+              dispatch.id AS dispatchId, dispatch.tool_id AS toolId,
+              dispatch.parameter_hash AS parameterHash,
+              dispatch.sealed_compensation AS sealedCompensation,
+              confirmation.target AS target, confirmation.impact AS impact
+       FROM agent_tool_dispatches AS dispatch
+       JOIN agent_tool_grants AS grant ON grant.id = dispatch.grant_id
+       JOIN agent_tool_confirmations AS confirmation ON confirmation.grant_id = grant.id
+       WHERE dispatch.execution_id = ? AND dispatch.id = ?
+         AND dispatch.state = 'succeeded'
+         AND dispatch.sealed_compensation IS NOT NULL
+         AND length(trim(dispatch.sealed_compensation)) > 0
+         AND confirmation.reversibility = 'compensatable'
+       ORDER BY grant.tool_call_step_seq DESC
+       LIMIT 1`,
+    ).get(command.executionId, command.dispatchId) as {
+      readonly humanPrincipalId?: unknown;
+      readonly dispatchId?: unknown;
+      readonly toolId?: unknown;
+      readonly parameterHash?: unknown;
+      readonly sealedCompensation?: unknown;
+      readonly target?: unknown;
+      readonly impact?: unknown;
+    } | undefined;
+    if (sideEffect === undefined) {
+      return fail("execution_conflict", "Agent runtime execution has no compensatable side effect");
+    }
+    if (sideEffect.humanPrincipalId !== actorId &&
+        membership.role !== "owner" && membership.role !== "admin") {
+      return fail("room_forbidden", "Agent runtime compensation authority was rejected");
+    }
+    const existingRequest = database.prepare(
+      `SELECT execution_id AS executionId
+       FROM agent_compensation_requests
+       WHERE original_dispatch_id = ?`,
+    ).get(command.dispatchId) as { readonly executionId?: unknown } | undefined;
+    if (typeof existingRequest?.executionId === "string") {
+      const existing = readAgentRuntimeExecutionRow(database, existingRequest.executionId);
+      if (existing === undefined) {
+        return fail("storage_unavailable", "Agent runtime compensation replay was corrupt");
+      }
+      return agentExecutionFromRuntimeRow(existing);
+    }
+    if (typeof sideEffect.toolId !== "string" ||
+        typeof sideEffect.sealedCompensation !== "string" ||
+        typeof sideEffect.target !== "string" || typeof sideEffect.impact !== "string") {
+      return fail("storage_unavailable", "Agent runtime compensation binding was corrupt");
+    }
+    requireAgentCommandAuthority(database, String(original.agentId), String(original.roomId));
+    if (command.maxQueuedPerRoom !== undefined) {
+      const outstanding = database.prepare(
+        `SELECT COUNT(*) AS count FROM agent_executions
+         WHERE room_id = ? AND state IN ('queued', 'running')`,
+      ).get(String(original.roomId)) as { readonly count: number };
+      if (outstanding.count >= command.maxQueuedPerRoom + 1) {
+        return fail("target_busy", "Agent runtime room queue is full");
+      }
+    }
+    const queuedAt = new Date(command.now).toISOString();
+    const executionId = stableId("agent-runtime-compensation", command.executionId, command.dispatchId);
+    database.prepare(
+      `INSERT INTO agent_executions (
+         id, room_id, agent_id, source_message_id, requester_actor_id, state,
+         action_category, current_attempt_seq, retry_cycle, retry_ordinal,
+         provider_id, model_id, recovery_cursor, queued_at, updated_at,
+         compensates_execution_id
+       ) VALUES (?, ?, ?, ?, ?, 'queued', 'model_generation', 1, 1, 1, ?, ?, 0, ?, ?, ?)`,
+    ).run(executionId, String(original.roomId), String(original.agentId),
+      String(original.sourceMessageId), actorId, String(original.providerId),
+      String(original.modelId), queuedAt, queuedAt, command.executionId);
+    const execution = agentExecutionFromRuntimeRow({
+      id: executionId,
+      roomId: original.roomId,
+      sourceMessageId: original.sourceMessageId,
+      requesterId: actorId,
+      agentId: original.agentId,
+      status: "queued",
+      actionCategory: "model_generation",
+      currentAttemptSeq: 1,
+      retryCycle: 1,
+      retryOrdinal: 1,
+      providerId: original.providerId,
+      modelId: original.modelId,
+      recoveryCursor: 0,
+      queuedAt,
+      updatedAt: queuedAt,
+      compensatesExecutionId: command.executionId,
+    });
+    const eventId = stableId(
+      "event", "agent-runtime-compensation", command.executionId, command.dispatchId,
+    );
+    const streamSeq = appendRoomEvent(database, {
+      eventId,
+      roomId: String(original.roomId),
+      actorId: String(original.agentId),
+      eventType: "room.agent_execution.changed",
+      occurredAt: queuedAt,
+      payload: execution as unknown as JsonValue,
+    });
+    database.prepare(
+      `INSERT INTO agent_execution_attempts (
+         execution_id, room_id, attempt_seq, retry_cycle, retry_ordinal, state,
+         action_category, recovery_cursor, enqueue_stream_seq
+       ) VALUES (?, ?, 1, 1, 1, 'queued', 'model_generation', 0, ?)`,
+    ).run(executionId, String(original.roomId), streamSeq);
+    database.prepare(
+      `INSERT INTO agent_compensation_requests (
+         execution_id, original_execution_id, original_dispatch_id,
+         requester_actor_id, session_family_id, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(executionId, command.executionId, String(sideEffect.dispatchId), actorId,
+      command.context.sessionFamilyId, queuedAt);
+    appendRoomOutbox(database, eventId, String(original.roomId), streamSeq, queuedAt,
+      "agent-runtime-compensation", executionId);
+    return execution;
+  });
+}
+
+export function resumeAgentRuntimeCompensationDatabaseCommand(
+  database: DatabaseSync,
+  input: ResumeAgentRuntimeCompensationInput,
+  agentId: string,
+): AgentRuntimeCompensationWork {
+  return runAuthorityImmediateTransaction(database, () => {
+    const now = new Date(input.now).toISOString();
+    const executionBinding = readAgentRuntimeExecutionRow(database, input.executionId);
+    const compensationBinding = database.prepare(
+      `SELECT request.original_execution_id AS originalExecutionId,
+              request.original_dispatch_id AS originalDispatchId,
+              request.requester_actor_id AS compensationRequesterId,
+              request.session_family_id AS compensationSessionFamilyId,
+              original.state AS originalState,
+              dispatch.tool_id AS compensationToolId,
+              dispatch.sealed_compensation AS sealedCompensation,
+              confirmation.target AS compensationTarget,
+              confirmation.impact AS compensationImpact,
+              confirmation.reversibility AS compensationReversibility
+       FROM agent_executions AS execution
+       JOIN agent_compensation_requests AS request ON request.execution_id = execution.id
+       JOIN agent_executions AS original ON original.id = request.original_execution_id
+       JOIN agent_tool_dispatches AS dispatch ON dispatch.id = request.original_dispatch_id
+       JOIN agent_tool_grants AS grant ON grant.id = dispatch.grant_id
+       JOIN agent_tool_confirmations AS confirmation ON confirmation.grant_id = grant.id
+       WHERE execution.id = ?`,
+    ).get(input.executionId) as Record<string, unknown> | undefined;
+    const binding = executionBinding === undefined || compensationBinding === undefined
+      ? undefined
+      : { ...executionBinding, ...compensationBinding };
+    if (binding !== undefined && binding.agentId !== agentId) {
+      return fail("agent_capability_forbidden", "Agent runtime compensation capability was rejected");
+    }
+    if (binding === undefined || Number(binding.currentAttemptSeq) !== input.attemptSeq || binding.status !== "running" ||
+        binding.actionCategory !== "model_generation" || Number(binding.recoveryCursor) !== 0 ||
+        binding.compensatesExecutionId !== binding.originalExecutionId ||
+        binding.originalState === "queued" || binding.originalState === "running" ||
+        binding.compensationReversibility !== "compensatable" ||
+        typeof binding.compensationToolId !== "string" ||
+        typeof binding.sealedCompensation !== "string" || binding.sealedCompensation.length === 0 ||
+        typeof binding.compensationRequesterId !== "string" ||
+        typeof binding.compensationSessionFamilyId !== "string" ||
+        typeof binding.compensationTarget !== "string" || typeof binding.compensationImpact !== "string") {
+      return fail("execution_conflict", "Agent runtime compensation binding was rejected");
+    }
+    requireAgentCommandAuthority(database, agentId, String(binding.roomId));
+    requireAgentToolPermission(database, String(binding.roomId), agentId, binding.compensationToolId);
+    const activeFamily = database.prepare(
+      `SELECT 1 AS present FROM sessions
+       WHERE family_id = ? AND actor_id = ? AND revoked_at IS NULL
+         AND access_expires_at > ? LIMIT 1`,
+    ).get(binding.compensationSessionFamilyId, binding.compensationRequesterId, input.now);
+    if (activeFamily === undefined) {
+      return fail("session_revoked", "Agent runtime compensation session is no longer active");
+    }
+    if (database.prepare(
+      `SELECT 1 AS present FROM agent_tool_dispatches
+       WHERE execution_id = ? AND attempt_seq = ? LIMIT 1`,
+    ).get(input.executionId, input.attemptSeq) !== undefined) {
+      return fail("execution_conflict", "Agent runtime compensation was already dispatched");
+    }
+    const canonicalToolCall = {
+      toolId: binding.compensationToolId,
+      parameters: { compensationOfDispatchId: String(binding.originalDispatchId) },
+      remainingCalls: [],
+    } satisfies JsonValue;
+    const parameterHash = createHash("sha256").update(binding.sealedCompensation).digest("hex");
+    const toolPlanHash = createHash("sha256").update(canonicalJson(canonicalToolCall)).digest("hex");
+    const grantId = stableId("agent-runtime-compensation-grant", input.executionId);
+    const confirmationId = stableId("agent-runtime-compensation-confirmation", input.executionId);
+    const dispatchId = stableId("agent-runtime-tool-dispatch", grantId);
+    const expiresAt = new Date(input.now + 1).toISOString();
+    const executionUpdate = database.prepare(
+      `UPDATE agent_executions SET action_category = 'tool_call', recovery_cursor = 1,
+         tool_dispatch_phase = 'dispatched', current_tool_id = ?, updated_at = ?
+       WHERE id = ? AND state = 'running' AND current_attempt_seq = ?
+         AND action_category = 'model_generation' AND recovery_cursor = 0
+         AND tool_dispatch_phase IS NULL AND current_tool_id IS NULL`,
+    ).run(binding.compensationToolId, now, input.executionId, input.attemptSeq);
+    const attemptUpdate = database.prepare(
+      `UPDATE agent_execution_attempts SET action_category = 'tool_call', recovery_cursor = 1,
+         tool_dispatch_phase = 'dispatched'
+       WHERE execution_id = ? AND attempt_seq = ? AND state = 'running'
+         AND action_category = 'model_generation' AND recovery_cursor = 0
+         AND tool_dispatch_phase IS NULL`,
+    ).run(input.executionId, input.attemptSeq);
+    if (executionUpdate.changes !== 1 || attemptUpdate.changes !== 1) {
+      return fail("execution_conflict", "Agent runtime compensation claim was stale");
+    }
+    database.prepare(
+      `INSERT INTO agent_execution_steps (
+         execution_id, attempt_seq, step_seq, step_kind, canonical_tool_call_json,
+         input_sha256, output_sha256, completed_at
+       ) VALUES (?, ?, 1, 'tool_call', ?, ?, ?, ?)`,
+    ).run(input.executionId, input.attemptSeq, canonicalJson(canonicalToolCall),
+      parameterHash, parameterHash, now);
+    database.prepare(
+      `INSERT INTO agent_tool_grants (
+         id, execution_id, attempt_seq, tool_call_step_seq, agent_id, room_id, tool_id,
+         parameter_hash, tool_plan_hash, confirmation_requirement, issued_at, expires_at, consumed_at
+       ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 'side_effect', ?, ?, ?)`,
+    ).run(grantId, input.executionId, input.attemptSeq, agentId, String(binding.roomId),
+      binding.compensationToolId, parameterHash, toolPlanHash, now, expiresAt, now);
+    database.prepare(
+      `INSERT INTO agent_tool_confirmations (
+         id, execution_id, attempt_seq, grant_id, tool_id, parameter_hash, room_id,
+         human_principal_id, session_family_id, target, impact, reversibility,
+         expires_at, consumed_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'compensatable', ?, ?)`,
+    ).run(confirmationId, input.executionId, input.attemptSeq, grantId,
+      binding.compensationToolId, parameterHash, String(binding.roomId),
+      binding.compensationRequesterId, binding.compensationSessionFamilyId,
+      `compensate:${binding.compensationTarget}`, `compensate:${binding.compensationImpact}`,
+      expiresAt, now);
+    database.prepare(
+      `INSERT INTO agent_tool_dispatches (
+         id, execution_id, attempt_seq, grant_id, tool_id, parameter_hash, state, dispatched_at
+       ) VALUES (?, ?, ?, ?, ?, ?, 'dispatched', ?)`,
+    ).run(dispatchId, input.executionId, input.attemptSeq, grantId,
+      binding.compensationToolId, parameterHash, now);
+    const executionRow = readAgentRuntimeExecutionRow(database, input.executionId);
+    if (executionRow === undefined) return fail("storage_unavailable", "Agent runtime compensation disappeared");
+    const execution = agentExecutionFromRuntimeRow(executionRow);
+    const eventId = stableId("event", "agent-runtime-compensation-dispatched", input.executionId);
+    const streamSeq = appendRoomEvent(database, {
+      eventId, roomId: String(execution.roomId), actorId: agentId,
+      eventType: "room.agent_execution.changed", occurredAt: now,
+      payload: execution as unknown as JsonValue,
+    });
+    appendRoomOutbox(database, eventId, String(execution.roomId), streamSeq, now,
+      "agent-runtime-compensation-dispatched", input.executionId);
+    return {
+      execution,
+      dispatch: {
+        id: dispatchId, executionId: input.executionId, attemptSeq: input.attemptSeq,
+        grantId, toolId: binding.compensationToolId, parameterHash,
+        state: "dispatched", dispatchedAt: now,
+      },
+      sealedCompensation: binding.sealedCompensation,
+    };
+  });
+}
+
+function recoverAgentRuntimeExecutionDatabaseCommand(
+  database: DatabaseSync,
+  now: number,
+  agentId: string,
+  onlyExecutionId: string,
+): readonly AgentRuntimeRecovery[] {
+  const recovered: AgentExecution[] = [];
+  const recoveryAt = new Date(now).toISOString();
+  const expiredConfirmations = database.prepare(
+    `SELECT execution.id AS executionId, execution.current_attempt_seq AS attemptSeq
+     FROM agent_executions AS execution
+     JOIN agent_execution_attempts AS attempt
+       ON attempt.execution_id = execution.id
+      AND attempt.attempt_seq = execution.current_attempt_seq
+     JOIN agent_tool_grants AS grant INDEXED BY agent_tool_grants_execution_step
+       ON grant.execution_id = execution.id
+      AND grant.attempt_seq = execution.current_attempt_seq
+      AND grant.tool_call_step_seq = execution.recovery_cursor
+      AND grant.confirmation_requirement = 'side_effect'
+      AND grant.consumed_at IS NULL
+     LEFT JOIN agent_tool_confirmations AS confirmation
+       ON confirmation.grant_id = grant.id AND confirmation.consumed_at IS NULL
+     WHERE execution.state = 'running' AND attempt.state = 'running'
+       AND execution.action_category = 'waiting_upstream'
+       AND execution.tool_dispatch_phase IS NULL
+       AND attempt.action_category = 'waiting_upstream'
+       AND attempt.tool_dispatch_phase IS NULL
+       AND execution.agent_id = ?
+       AND execution.id = ?
+       AND (grant.expires_at <= ? OR confirmation.expires_at <= ?)
+     LIMIT 2`,
+  ).all(agentId, onlyExecutionId, recoveryAt, recoveryAt) as unknown as readonly {
+    readonly executionId: string;
+    readonly attemptSeq: number;
+  }[];
+  if (expiredConfirmations.length > 1) {
+    return fail("storage_unavailable", "Agent runtime confirmation recovery binding was ambiguous");
+  }
+  for (const candidate of expiredConfirmations) {
+    recovered.push(runAuthorityImmediateTransaction(database, () => {
+      const execution = readAgentRuntimeExecutionRow(database, candidate.executionId);
+      if (execution === undefined || execution.status !== "running" ||
+          Number(execution.currentAttemptSeq) !== candidate.attemptSeq ||
+          execution.actionCategory !== "waiting_upstream" || execution.toolDispatchPhase !== null) {
+        return fail("execution_conflict", "Agent runtime confirmation recovery lost execution CAS");
+      }
+      const attemptUpdate = database.prepare(
+        `UPDATE agent_execution_attempts
+         SET state = 'failed', finished_at = ?, error_code = 'confirmation_expired'
+         WHERE execution_id = ? AND attempt_seq = ? AND state = 'running'
+           AND action_category = 'waiting_upstream' AND tool_dispatch_phase IS NULL`,
+      ).run(recoveryAt, candidate.executionId, candidate.attemptSeq);
+      const executionUpdate = database.prepare(
+        `UPDATE agent_executions
+         SET state = 'failed', completed_at = ?, updated_at = ?,
+             terminal_error_code = 'confirmation_expired'
+         WHERE id = ? AND current_attempt_seq = ? AND state = 'running'
+           AND action_category = 'waiting_upstream' AND tool_dispatch_phase IS NULL`,
+      ).run(recoveryAt, recoveryAt, candidate.executionId, candidate.attemptSeq);
+      if (attemptUpdate.changes !== 1 || executionUpdate.changes !== 1) {
+        return fail("execution_conflict", "Agent runtime confirmation recovery lost atomic CAS");
+      }
+      const failed = agentExecutionFromRuntimeRow({
+        ...execution, status: "failed", finishedAt: recoveryAt,
+        updatedAt: recoveryAt, terminalErrorCode: "confirmation_expired",
+      });
+      const eventId = stableId("event", "agent-runtime-confirmation-expired",
+        candidate.executionId, String(candidate.attemptSeq));
+      const streamSeq = appendRoomEvent(database, {
+        eventId, roomId: String(execution.roomId), actorId: String(execution.agentId),
+        eventType: "room.agent_execution.changed", occurredAt: recoveryAt,
+        payload: failed as unknown as JsonValue,
+      });
+      appendRoomOutbox(database, eventId, String(execution.roomId), streamSeq, recoveryAt,
+        "agent-runtime-confirmation-expired", candidate.executionId);
+      return failed;
+    }));
+  }
+  const ambiguousSideEffects = database.prepare(
+    `SELECT execution.id AS executionId, execution.current_attempt_seq AS attemptSeq,
+            dispatch.id AS dispatchId
+     FROM agent_executions AS execution
+     JOIN agent_execution_attempts AS attempt
+       ON attempt.execution_id = execution.id AND attempt.attempt_seq = execution.current_attempt_seq
+     JOIN agent_tool_grants AS grant INDEXED BY agent_tool_grants_execution_step
+       ON grant.execution_id = execution.id
+      AND grant.attempt_seq = execution.current_attempt_seq
+      AND grant.tool_call_step_seq = execution.recovery_cursor
+      AND grant.confirmation_requirement = 'side_effect'
+     JOIN agent_tool_dispatches AS dispatch
+       ON dispatch.grant_id = grant.id
+      AND dispatch.execution_id = execution.id
+      AND dispatch.attempt_seq = execution.current_attempt_seq
+     WHERE execution.state = 'running' AND attempt.state = 'running'
+       AND execution.action_category = 'tool_call'
+       AND execution.tool_dispatch_phase = 'dispatched'
+       AND attempt.tool_dispatch_phase = 'dispatched'
+       AND dispatch.state = 'dispatched'
+       AND execution.agent_id = ?
+       AND execution.id = ?
+     LIMIT 2`,
+  ).all(agentId, onlyExecutionId) as unknown as readonly {
+    readonly executionId: string;
+    readonly attemptSeq: number;
+    readonly dispatchId: string;
+  }[];
+  if (ambiguousSideEffects.length > 1) {
+    return fail("storage_unavailable", "Agent runtime unsettled side-effect binding was ambiguous");
+  }
+  for (const candidate of ambiguousSideEffects) {
+    recovered.push(runAuthorityImmediateTransaction(database, () => {
+      const execution = readAgentRuntimeExecutionRow(database, candidate.executionId);
+      if (execution === undefined || execution.status !== "running" ||
+          Number(execution.currentAttemptSeq) !== candidate.attemptSeq ||
+          execution.actionCategory !== "tool_call" || execution.toolDispatchPhase !== "dispatched") {
+        return fail("execution_conflict", "Agent runtime side-effect recovery lost execution CAS");
+      }
+      const finishedAt = new Date(now).toISOString();
+      const dispatchUpdate = database.prepare(
+        `UPDATE agent_tool_dispatches
+         SET state = 'outcome_unknown', settled_at = ?, closed_summary = 'runtime_restarted'
+         WHERE id = ? AND execution_id = ? AND attempt_seq = ? AND state = 'dispatched'`,
+      ).run(finishedAt, candidate.dispatchId, candidate.executionId, candidate.attemptSeq);
+      const attemptUpdate = database.prepare(
+        `UPDATE agent_execution_attempts
+         SET state = 'failed', tool_dispatch_phase = 'finished', finished_at = ?,
+             error_code = 'side_effect_outcome_unknown'
+         WHERE execution_id = ? AND attempt_seq = ? AND state = 'running'
+           AND action_category = 'tool_call' AND tool_dispatch_phase = 'dispatched'`,
+      ).run(finishedAt, candidate.executionId, candidate.attemptSeq);
+      const executionUpdate = database.prepare(
+        `UPDATE agent_executions
+         SET state = 'failed', tool_dispatch_phase = 'finished', completed_at = ?,
+             updated_at = ?, terminal_error_code = 'side_effect_outcome_unknown'
+         WHERE id = ? AND current_attempt_seq = ? AND state = 'running'
+           AND action_category = 'tool_call' AND tool_dispatch_phase = 'dispatched'`,
+      ).run(finishedAt, finishedAt, candidate.executionId, candidate.attemptSeq);
+      if (dispatchUpdate.changes !== 1 || attemptUpdate.changes !== 1 || executionUpdate.changes !== 1) {
+        return fail("execution_conflict", "Agent runtime side-effect recovery lost atomic CAS");
+      }
+      const failed = agentExecutionFromRuntimeRow({
+        ...execution, status: "failed", toolDispatchPhase: "finished",
+        finishedAt, updatedAt: finishedAt,
+        terminalErrorCode: "side_effect_outcome_unknown",
+      });
+      const eventId = stableId("event", "agent-runtime-side-effect-unknown",
+        candidate.executionId, String(candidate.attemptSeq));
+      const streamSeq = appendRoomEvent(database, {
+        eventId, roomId: String(execution.roomId), actorId: String(execution.agentId),
+        eventType: "room.agent_execution.changed", occurredAt: finishedAt,
+        payload: failed as unknown as JsonValue,
+      });
+      appendRoomOutbox(database, eventId, String(execution.roomId), streamSeq, finishedAt,
+        "agent-runtime-side-effect-unknown", candidate.dispatchId);
+      return failed;
+    }));
+  }
+  const settledSideEffects = database.prepare(
+    `SELECT DISTINCT execution.id AS executionId,
+            execution.current_attempt_seq AS attemptSeq,
+            dispatch.id AS dispatchId, dispatch.state AS dispatchState
+     FROM agent_executions AS execution
+     JOIN agent_execution_attempts AS attempt
+       ON attempt.execution_id = execution.id AND attempt.attempt_seq = execution.current_attempt_seq
+     JOIN agent_tool_grants AS grant INDEXED BY agent_tool_grants_execution_step
+       ON grant.execution_id = execution.id
+      AND grant.attempt_seq = execution.current_attempt_seq
+      AND grant.tool_call_step_seq = execution.recovery_cursor
+      AND grant.confirmation_requirement = 'side_effect'
+     JOIN agent_tool_dispatches AS dispatch
+       ON dispatch.grant_id = grant.id
+      AND dispatch.execution_id = execution.id
+      AND dispatch.attempt_seq = execution.current_attempt_seq
+     WHERE execution.state = 'running' AND attempt.state = 'running'
+       AND execution.action_category = 'tool_call'
+       AND execution.tool_dispatch_phase = 'finished'
+       AND attempt.action_category = 'tool_call'
+       AND attempt.tool_dispatch_phase = 'finished'
+       AND dispatch.state IN ('succeeded', 'failed')
+       AND execution.agent_id = ?
+       AND execution.id = ?
+     LIMIT 2`,
+  ).all(agentId, onlyExecutionId) as unknown as readonly {
+    readonly executionId: string;
+    readonly attemptSeq: number;
+    readonly dispatchId: string;
+    readonly dispatchState: "succeeded" | "failed";
+  }[];
+  if (settledSideEffects.length > 1) {
+    return fail("storage_unavailable", "Agent runtime settled side-effect binding was ambiguous");
+  }
+  for (const candidate of settledSideEffects) {
+    recovered.push(runAuthorityImmediateTransaction(database, () => {
+      const execution = readAgentRuntimeExecutionRow(database, candidate.executionId);
+      if (execution === undefined || execution.status !== "running" ||
+          Number(execution.currentAttemptSeq) !== candidate.attemptSeq ||
+          execution.actionCategory !== "tool_call" || execution.toolDispatchPhase !== "finished") {
+        return fail("execution_conflict", "Agent runtime settled side-effect recovery lost execution CAS");
+      }
+      const terminalErrorCode = candidate.dispatchState === "failed"
+        ? "tool_failure"
+        : "side_effect_reconciliation_required";
+      const attemptChanged = database.prepare(
+        `UPDATE agent_execution_attempts
+         SET state = 'failed', finished_at = ?, error_code = ?
+         WHERE execution_id = ? AND attempt_seq = ? AND state = 'running'
+           AND action_category = 'tool_call' AND tool_dispatch_phase = 'finished'`,
+      ).run(recoveryAt, terminalErrorCode, candidate.executionId, candidate.attemptSeq);
+      const executionChanged = database.prepare(
+        `UPDATE agent_executions
+         SET state = 'failed', completed_at = ?, updated_at = ?, terminal_error_code = ?
+         WHERE id = ? AND current_attempt_seq = ? AND state = 'running'
+           AND action_category = 'tool_call' AND tool_dispatch_phase = 'finished'`,
+      ).run(recoveryAt, recoveryAt, terminalErrorCode,
+        candidate.executionId, candidate.attemptSeq);
+      if (attemptChanged.changes !== 1 || executionChanged.changes !== 1) {
+        return fail("execution_conflict", "Agent runtime settled side-effect recovery lost atomic CAS");
+      }
+      const failed = agentExecutionFromRuntimeRow({
+        ...execution, status: "failed", finishedAt: recoveryAt,
+        updatedAt: recoveryAt, terminalErrorCode,
+      });
+      const eventId = stableId("event", "agent-runtime-side-effect-reconciliation",
+        candidate.executionId, String(candidate.attemptSeq));
+      const streamSeq = appendRoomEvent(database, {
+        eventId, roomId: String(execution.roomId), actorId: String(execution.agentId),
+        eventType: "room.agent_execution.changed", occurredAt: recoveryAt,
+        payload: failed as unknown as JsonValue,
+      });
+      appendRoomOutbox(database, eventId, String(execution.roomId), streamSeq, recoveryAt,
+        "agent-runtime-side-effect-reconciliation", candidate.dispatchId);
+      return failed;
+    }));
+  }
+  const running = database.prepare(
+    `SELECT execution.id AS executionId, execution.current_attempt_seq AS attemptSeq
+     FROM agent_executions AS execution
+     JOIN agent_execution_attempts AS attempt
+       ON attempt.execution_id = execution.id AND attempt.attempt_seq = execution.current_attempt_seq
+     WHERE execution.state = 'running' AND attempt.state = 'running'
+       AND (execution.action_category = 'model_generation'
+         OR (execution.action_category = 'tool_call' AND (
+           (execution.tool_dispatch_phase = 'not_started' AND NOT EXISTS (
+             SELECT 1 FROM agent_tool_grants AS waiting_grant
+             WHERE waiting_grant.execution_id = execution.id
+               AND waiting_grant.attempt_seq = execution.current_attempt_seq
+               AND waiting_grant.confirmation_requirement = 'side_effect'
+               AND waiting_grant.consumed_at IS NULL
+           ))
+           OR (execution.tool_dispatch_phase IN ('dispatched', 'finished') AND EXISTS (
+             SELECT 1 FROM agent_tool_grants AS grant
+             WHERE grant.execution_id = execution.id
+               AND grant.attempt_seq = execution.current_attempt_seq
+               AND grant.confirmation_requirement = 'read_only'
+           ))
+       )))
+       AND execution.agent_id = ?
+       AND execution.id = ?
+     ORDER BY execution.room_id, execution.queued_at, execution.id`,
+  ).all(agentId, onlyExecutionId) as unknown as readonly { readonly executionId: string; readonly attemptSeq: number }[];
+  for (const candidate of running) {
+    recovered.push(scheduleAgentRuntimeRetryDatabaseCommand(database, {
+      runtime: { kind: "runtime", runtimeId: "recovery", agentId },
+      input: {
+        executionId: candidate.executionId,
+        attemptSeq: candidate.attemptSeq,
+        errorCode: "runtime_restarted",
+        now,
+      },
+      allowSettledSideEffectRecovery: true,
+    }));
+  }
+  const queued = database.prepare(
+    `SELECT ${AGENT_RUNTIME_EXECUTION_COLUMNS}
+     FROM agent_executions AS execution
+     WHERE execution.state = 'queued'
+       AND execution.agent_id = ?
+       AND execution.id = ?
+       AND EXISTS (
+         SELECT 1 FROM agent_execution_attempts AS attempt
+         WHERE attempt.execution_id = execution.id
+           AND attempt.attempt_seq = execution.current_attempt_seq
+           AND attempt.state = 'queued'
+       )
+     ORDER BY (
+       SELECT attempt.enqueue_stream_seq FROM agent_execution_attempts AS attempt
+       WHERE attempt.execution_id = execution.id
+         AND attempt.attempt_seq = execution.current_attempt_seq
+     )`,
+  ).all(agentId, onlyExecutionId) as readonly Record<string, unknown>[];
+  const seen = new Set(recovered.map((execution) => execution.id));
+  for (const row of queued) {
+    if (!seen.has(String(row.id))) recovered.push(agentExecutionFromRuntimeRow(row));
+  }
+  const retrySchedule = database.prepare(
+    `SELECT next_retry_at AS nextRetryAt
+     FROM agent_execution_attempts
+     WHERE execution_id = ? AND attempt_seq = ?`,
+  );
+  return recovered.map((execution) => {
+    if (execution.status !== "queued") return { execution };
+    const schedule = retrySchedule.get(
+      execution.id,
+      execution.currentAttemptSeq,
+    ) as { readonly nextRetryAt?: number | null } | undefined;
+    return schedule?.nextRetryAt === null || schedule?.nextRetryAt === undefined
+      ? { execution }
+      : { execution, nextRetryAt: schedule.nextRetryAt };
+  });
+}
+
+type RecoveryBranch = 0 | 1;
+
+interface RecoveryCursorPayload {
+  readonly version: 1;
+  readonly branch: RecoveryBranch;
+  readonly afterExecutionId: string;
+}
+
+function encodeRecoveryCursor(payload: RecoveryCursorPayload): string {
+  return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+}
+
+function decodeRecoveryCursor(cursor: string | undefined): RecoveryCursorPayload {
+  if (cursor === undefined) return { version: 1, branch: 0, afterExecutionId: "" };
+  try {
+    const value: unknown = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+    if (typeof value !== "object" || value === null || Array.isArray(value) ||
+        Object.keys(value).sort().join("\0") !== "afterExecutionId\0branch\0version") {
+      return fail("execution_conflict", "Agent runtime recovery cursor was invalid");
+    }
+    const record = value as Record<string, unknown>;
+    if (record.version !== 1 || !Number.isInteger(record.branch) ||
+        Number(record.branch) < 0 || Number(record.branch) > 1 ||
+        typeof record.afterExecutionId !== "string") {
+      return fail("execution_conflict", "Agent runtime recovery cursor was invalid");
+    }
+    return value as RecoveryCursorPayload;
+  } catch (error: unknown) {
+    if (error instanceof AuthorityDatabaseError) throw error;
+    return fail("execution_conflict", "Agent runtime recovery cursor was invalid");
+  }
+}
+
+function recoveryCandidateIds(
+  database: DatabaseSync,
+  agentId: string,
+  now: number,
+  cursor: RecoveryCursorPayload,
+  limit: number,
+): readonly string[] {
+  const sql = cursor.branch === 0
+    ? `SELECT execution.id
+       FROM agent_executions AS execution INDEXED BY agent_executions_agent_state_id
+       WHERE execution.agent_id = ? AND execution.state = 'queued'
+         AND execution.id > ?
+       ORDER BY execution.id LIMIT ?`
+    : `SELECT execution.id
+       FROM agent_executions AS execution INDEXED BY agent_executions_agent_state_id
+       WHERE execution.agent_id = ? AND execution.state = 'running'
+         AND execution.id > ?
+       ORDER BY execution.id LIMIT ?`;
+  return database.prepare(sql).all(agentId, cursor.afterExecutionId, limit)
+    .map((row) => String(row.id));
+}
+
+export function recoverAgentRuntimePageDatabaseCommand(
+  database: DatabaseSync,
+  input: AgentRuntimeRecoveryPageInput,
+  agentId: string,
+): AgentRuntimeRecoveryPage {
+  if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 256) {
+    return fail("execution_conflict", "Agent runtime recovery page limit was invalid");
+  }
+  const cursor = decodeRecoveryCursor(input.cursor);
+  const candidateIds = recoveryCandidateIds(database, agentId, input.now, cursor, input.limit);
+  const recoveries = candidateIds.flatMap((executionId) =>
+    recoverAgentRuntimeExecutionDatabaseCommand(database, input.now, agentId, executionId));
+  if (candidateIds.length === input.limit) {
+    return {
+      recoveries,
+      nextCursor: encodeRecoveryCursor({
+        version: 1,
+        branch: cursor.branch,
+        afterExecutionId: candidateIds[candidateIds.length - 1] ?? cursor.afterExecutionId,
+      }),
+    };
+  }
+  if (cursor.branch < 1) {
+    return {
+      recoveries,
+      nextCursor: encodeRecoveryCursor({
+        version: 1,
+        branch: (cursor.branch + 1) as RecoveryBranch,
+        afterExecutionId: "",
+      }),
+    };
+  }
+  return { recoveries };
+}
+
+function toolGrantFromRow(row: Record<string, unknown>): ToolGrant {
+  return {
+    id: String(row.id), executionId: String(row.executionId), attemptSeq: Number(row.attemptSeq),
+    toolCallStepSeq: Number(row.toolCallStepSeq),
+    agentId: String(row.agentId), roomId: String(row.roomId), toolId: String(row.toolId),
+    parameterHash: String(row.parameterHash), toolPlanHash: String(row.toolPlanHash),
+    confirmationRequirement: row.confirmationRequirement as ToolGrant["confirmationRequirement"],
+    issuedAt: String(row.issuedAt), expiresAt: String(row.expiresAt),
+    ...(typeof row.consumedAt === "string" ? { consumedAt: row.consumedAt } : {}),
+  };
+}
+
+function toolConfirmationFromRow(row: Record<string, unknown>): ToolConfirmation {
+  return {
+    id: String(row.id), executionId: String(row.executionId), attemptSeq: Number(row.attemptSeq),
+    grantId: String(row.grantId),
+    toolId: String(row.toolId), parameterHash: String(row.parameterHash),
+    toolPlanHash: String(row.toolPlanHash), roomId: String(row.roomId),
+    humanPrincipalId: String(row.humanPrincipalId), sessionFamilyId: String(row.sessionFamilyId),
+    target: String(row.target), impact: String(row.impact),
+    reversibility: row.reversibility as ToolConfirmation["reversibility"],
+    expiresAt: String(row.expiresAt),
+    ...(typeof row.consumedAt === "string" ? { consumedAt: row.consumedAt } : {}),
+  };
+}
+
+function toolDispatchFromRow(row: Record<string, unknown>): ToolDispatch {
+  return {
+    id: String(row.id), executionId: String(row.executionId), attemptSeq: Number(row.attemptSeq),
+    grantId: String(row.grantId), toolId: String(row.toolId), parameterHash: String(row.parameterHash),
+    state: row.state as ToolDispatch["state"], dispatchedAt: String(row.dispatchedAt),
+    ...(typeof row.settledAt === "string" ? { settledAt: row.settledAt } : {}),
+    ...(typeof row.closedSummary === "string" ? { closedSummary: row.closedSummary } : {}),
+    ...(typeof row.sealedCompensation === "string" ? { sealedCompensation: row.sealedCompensation } : {}),
+  };
+}
+
+export function prepareAgentRuntimeToolDatabaseCommand(
+  database: DatabaseSync,
+  input: PrepareToolInput,
+  agentId: string,
+): ToolGrant {
+  return runAuthorityImmediateTransaction(database, () => {
+    const execution = readAgentRuntimeExecutionRow(database, input.executionId);
+    if (execution !== undefined && execution.agentId !== agentId) {
+      return fail("agent_capability_forbidden", "Agent runtime tool preparation agent was rejected");
+    }
+    if (execution === undefined || execution.status !== "running" ||
+        Number(execution.currentAttemptSeq) !== input.attemptSeq || execution.agentId !== agentId) {
+      return fail("execution_conflict", "Agent runtime tool preparation lost execution CAS");
+    }
+    if (Number(execution.recoveryCursor) !== input.toolCallStepSeq) {
+      return fail("execution_conflict", "Agent runtime tool preparation lost tool-call cursor");
+    }
+    const toolCallStep = database.prepare(
+      `SELECT canonical_tool_call_json AS canonicalToolCall,
+              output_sha256 AS parameterHash
+       FROM agent_execution_steps
+       WHERE execution_id = ? AND attempt_seq = ? AND step_seq = ?
+         AND step_kind = 'tool_call'`,
+    ).get(input.executionId, input.attemptSeq, input.toolCallStepSeq) as
+      | { readonly canonicalToolCall: string; readonly parameterHash: string }
+      | undefined;
+    if (toolCallStep === undefined || toolCallStep.parameterHash !== input.parameterHash) {
+      return fail("execution_conflict", "Agent runtime tool grant did not bind the tool-call step");
+    }
+    let canonicalToolCall: unknown;
+    try {
+      canonicalToolCall = JSON.parse(toolCallStep.canonicalToolCall);
+    } catch {
+      return fail("execution_conflict", "Agent runtime tool-call checkpoint was corrupt");
+    }
+    if (createHash("sha256").update(canonicalJson(canonicalToolCall)).digest("hex") !==
+        input.toolPlanHash) {
+      return fail("execution_conflict", "Agent runtime tool plan did not bind the tool-call step");
+    }
+    requireAgentCommandAuthority(database, String(execution.agentId), String(execution.roomId));
+    requireAgentToolPermission(database, String(execution.roomId), String(execution.agentId), input.toolId);
+    const unsettledDispatch = database.prepare(
+      `SELECT 1 AS present FROM agent_tool_dispatches
+       WHERE execution_id = ? AND attempt_seq = ? AND state = 'dispatched' LIMIT 1`,
+    ).get(input.executionId, input.attemptSeq);
+    if (unsettledDispatch !== undefined) {
+      return fail("execution_conflict", "Agent runtime attempt already has an unsettled tool dispatch");
+    }
+    const grantId = stableId("agent-runtime-tool-grant", input.executionId, String(input.attemptSeq),
+      String(input.toolCallStepSeq),
+      input.toolId, input.parameterHash);
+    const existing = database.prepare(
+      `SELECT id, execution_id AS executionId, attempt_seq AS attemptSeq,
+              tool_call_step_seq AS toolCallStepSeq, agent_id AS agentId,
+              room_id AS roomId, tool_id AS toolId, parameter_hash AS parameterHash,
+              tool_plan_hash AS toolPlanHash,
+              confirmation_requirement AS confirmationRequirement,
+              issued_at AS issuedAt, expires_at AS expiresAt, consumed_at AS consumedAt
+       FROM agent_tool_grants WHERE id = ?`,
+    ).get(grantId) as Record<string, unknown> | undefined;
+    if (existing !== undefined) {
+      const grant = toolGrantFromRow(existing);
+      if (grant.confirmationRequirement !== input.confirmationRequirement ||
+          grant.toolPlanHash !== input.toolPlanHash ||
+          grant.expiresAt !== new Date(input.expiresAt).toISOString()) {
+        return fail("idempotency_conflict", "Agent runtime tool grant payload changed");
+      }
+      const replayStateMatches = input.confirmationRequirement === "side_effect"
+        ? execution.actionCategory === "waiting_upstream" && execution.toolDispatchPhase === null &&
+          execution.currentToolId === null
+        : execution.actionCategory === "tool_call" && execution.toolDispatchPhase === "not_started" &&
+          execution.currentToolId === input.toolId;
+      if (!replayStateMatches) {
+        return fail("execution_conflict", "Agent runtime tool grant replay lost execution phase");
+      }
+      return grant;
+    }
+    if (execution.actionCategory !== "tool_call" ||
+        execution.toolDispatchPhase !== "not_started" || execution.currentToolId !== input.toolId) {
+      return fail("execution_conflict", "Agent runtime tool preparation requires an unstarted tool call");
+    }
+    const issuedAt = new Date(input.now).toISOString();
+    const expiresAt = new Date(input.expiresAt).toISOString();
+    database.prepare(
+      `INSERT INTO agent_tool_grants (
+         id, execution_id, attempt_seq, tool_call_step_seq, agent_id, room_id, tool_id,
+         parameter_hash, tool_plan_hash, confirmation_requirement, issued_at, expires_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(grantId, input.executionId, input.attemptSeq, input.toolCallStepSeq,
+      String(execution.agentId),
+      String(execution.roomId), input.toolId, input.parameterHash, input.toolPlanHash,
+      input.confirmationRequirement, issuedAt, expiresAt);
+    if (input.confirmationRequirement === "side_effect") {
+      const attemptChanged = database.prepare(
+        `UPDATE agent_execution_attempts
+         SET action_category = 'waiting_upstream', tool_dispatch_phase = NULL
+         WHERE execution_id = ? AND attempt_seq = ? AND state = 'running'
+           AND action_category = 'tool_call' AND tool_dispatch_phase = 'not_started'`,
+      ).run(input.executionId, input.attemptSeq);
+      const executionChanged = database.prepare(
+        `UPDATE agent_executions
+         SET action_category = 'waiting_upstream', tool_dispatch_phase = NULL,
+             current_tool_id = NULL, updated_at = ?
+         WHERE id = ? AND current_attempt_seq = ? AND state = 'running'
+           AND action_category = 'tool_call' AND tool_dispatch_phase = 'not_started'
+           AND current_tool_id = ?`,
+      ).run(issuedAt, input.executionId, input.attemptSeq, input.toolId);
+      if (attemptChanged.changes !== 1 || executionChanged.changes !== 1) {
+        return fail("execution_conflict", "Agent runtime confirmation wait lost atomic CAS");
+      }
+      const confirmationRequired = {
+        roomId: String(execution.roomId), agentId: String(execution.agentId),
+        executionId: input.executionId, attemptSeq: input.attemptSeq, grantId,
+        toolId: input.toolId, parameterHash: input.parameterHash, expiresAt,
+      };
+      const eventId = stableId("event", "agent-runtime-tool-confirmation-required", grantId);
+      const streamSeq = appendRoomEvent(database, {
+        eventId, roomId: String(execution.roomId), actorId: String(execution.agentId),
+        eventType: "room.agent_tool_confirmation.required", occurredAt: issuedAt,
+        payload: confirmationRequired,
+      });
+      appendRoomOutbox(database, eventId, String(execution.roomId), streamSeq, issuedAt,
+        "agent-runtime-tool-confirmation-required", grantId);
+    }
+    return {
+      id: grantId, executionId: input.executionId, attemptSeq: input.attemptSeq,
+      toolCallStepSeq: input.toolCallStepSeq,
+      agentId: String(execution.agentId), roomId: String(execution.roomId), toolId: input.toolId,
+      parameterHash: input.parameterHash,
+      toolPlanHash: input.toolPlanHash,
+      confirmationRequirement: input.confirmationRequirement,
+      issuedAt, expiresAt,
+    };
+  });
+}
+
+export interface ConfirmAgentRuntimeToolDatabaseCommandInput {
+  readonly context: AuthenticatedCommandContext;
+  readonly input: ToolConfirmationInput;
+  readonly now: number;
+}
+
+export function confirmAgentRuntimeToolDatabaseCommand(
+  database: DatabaseSync,
+  command: ConfirmAgentRuntimeToolDatabaseCommandInput,
+): ToolConfirmation {
+  return runAuthorityImmediateTransaction(database, () => {
+    const execution = readAgentRuntimeExecutionRow(database, command.input.executionId);
+    if (execution === undefined) return fail("execution_conflict", "Agent runtime execution was not found");
+    const humanPrincipalId = requireHumanExecutionAuthority(database, command.context, command.now, execution);
+    if (execution.status !== "running" || Number(execution.currentAttemptSeq) !== command.input.attemptSeq ||
+        execution.actionCategory !== "waiting_upstream" || execution.toolDispatchPhase !== null ||
+        execution.currentToolId !== null ||
+        command.input.expiresAt <= command.now) {
+      return fail("execution_conflict", "Agent runtime tool confirmation lost execution CAS");
+    }
+    const expiredGrant = database.prepare(
+      `SELECT 1 AS present FROM agent_tool_grants
+       WHERE execution_id = ? AND attempt_seq = ? AND tool_id = ? AND parameter_hash = ?
+         AND confirmation_requirement = 'side_effect' AND consumed_at IS NULL AND expires_at <= ?`,
+    ).get(command.input.executionId, command.input.attemptSeq, command.input.toolId,
+      command.input.parameterHash, new Date(command.now).toISOString());
+    if (expiredGrant !== undefined) {
+      return fail("confirmation_expired", "Agent runtime tool confirmation grant expired");
+    }
+    const grant = database.prepare(
+      `SELECT id, tool_plan_hash AS toolPlanHash FROM agent_tool_grants
+       WHERE execution_id = ? AND attempt_seq = ? AND tool_id = ? AND parameter_hash = ?
+         AND confirmation_requirement = 'side_effect'
+         AND consumed_at IS NULL AND expires_at > ?`,
+    ).get(command.input.executionId, command.input.attemptSeq, command.input.toolId,
+      command.input.parameterHash, new Date(command.now).toISOString());
+    if (grant === undefined) return fail("execution_conflict", "Agent runtime tool grant was unavailable");
+    const grantId = String((grant as { readonly id: unknown }).id);
+    const toolPlanHash = String((grant as { readonly toolPlanHash: unknown }).toolPlanHash);
+    const confirmationId = stableId("agent-runtime-tool-confirmation", grantId,
+      humanPrincipalId, command.context.sessionFamilyId);
+    const existing = database.prepare(
+      `SELECT confirmation.id, confirmation.execution_id AS executionId,
+              confirmation.attempt_seq AS attemptSeq, confirmation.grant_id AS grantId,
+              confirmation.tool_id AS toolId,
+              confirmation.parameter_hash AS parameterHash, confirmation.room_id AS roomId,
+              confirmation.human_principal_id AS humanPrincipalId,
+              confirmation.session_family_id AS sessionFamilyId,
+              confirmation.target, confirmation.impact, confirmation.reversibility,
+              confirmation.expires_at AS expiresAt,
+              confirmation.consumed_at AS consumedAt, grant.tool_plan_hash AS toolPlanHash
+       FROM agent_tool_confirmations AS confirmation
+       JOIN agent_tool_grants AS grant ON grant.id = confirmation.grant_id
+       WHERE confirmation.id = ?`,
+    ).get(confirmationId) as Record<string, unknown> | undefined;
+    if (existing !== undefined) {
+      const confirmation = toolConfirmationFromRow(existing);
+      if (confirmation.target !== command.input.target || confirmation.impact !== command.input.impact ||
+          confirmation.reversibility !== command.input.reversibility ||
+          confirmation.expiresAt !== new Date(command.input.expiresAt).toISOString()) {
+        return fail("idempotency_conflict", "Agent runtime tool confirmation payload changed");
+      }
+      return confirmation;
+    }
+    const expiresAt = new Date(command.input.expiresAt).toISOString();
+    database.prepare(
+      `INSERT INTO agent_tool_confirmations (
+         id, execution_id, attempt_seq, grant_id, tool_id, parameter_hash, room_id,
+         human_principal_id, session_family_id, target, impact, reversibility, expires_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(confirmationId, command.input.executionId, command.input.attemptSeq, grantId,
+      command.input.toolId,
+      command.input.parameterHash, String(execution.roomId), humanPrincipalId,
+      command.context.sessionFamilyId, command.input.target, command.input.impact,
+      command.input.reversibility, expiresAt);
+    return {
+      id: confirmationId, executionId: command.input.executionId,
+      grantId,
+      attemptSeq: command.input.attemptSeq, toolId: command.input.toolId,
+      parameterHash: command.input.parameterHash, roomId: String(execution.roomId),
+      toolPlanHash,
+      humanPrincipalId, sessionFamilyId: command.context.sessionFamilyId,
+      target: command.input.target, impact: command.input.impact,
+      reversibility: command.input.reversibility, expiresAt,
+    };
+  });
+}
+
+export function resumeConfirmedAgentRuntimeToolDatabaseCommand(
+  database: DatabaseSync,
+  input: ResumeConfirmedToolInput,
+  agentId: string,
+): ResumedToolDispatch {
+  const binding = database.prepare(
+    `SELECT confirmation.execution_id AS executionId,
+            confirmation.attempt_seq AS attemptSeq,
+            confirmation.tool_id AS toolId,
+            confirmation.parameter_hash AS parameterHash,
+            confirmation.room_id AS roomId,
+            grant.id AS grantId,
+            grant.tool_plan_hash AS toolPlanHash,
+            step.canonical_tool_call_json AS canonicalToolCall
+     FROM agent_tool_confirmations AS confirmation
+     JOIN agent_tool_grants AS grant
+       ON grant.id = confirmation.grant_id
+      AND grant.execution_id = confirmation.execution_id
+      AND grant.attempt_seq = confirmation.attempt_seq
+     JOIN agent_executions AS execution ON execution.id = confirmation.execution_id
+     JOIN agent_execution_steps AS step
+      ON step.execution_id = confirmation.execution_id
+      AND step.attempt_seq = confirmation.attempt_seq
+      AND step.step_seq = grant.tool_call_step_seq
+      AND step.step_kind = 'tool_call'
+      AND json_extract(step.canonical_tool_call_json, '$.toolId') = confirmation.tool_id
+      AND step.output_sha256 = confirmation.parameter_hash
+     WHERE confirmation.id = ? AND execution.agent_id = ?
+     ORDER BY step.step_seq DESC LIMIT 1`,
+  ).get(input.confirmationId, agentId) as Record<string, unknown> | undefined;
+  if (binding === undefined) {
+    return fail("execution_conflict", "Agent runtime confirmed tool binding was unavailable");
+  }
+  if (
+    binding.executionId !== input.executionId ||
+    binding.attemptSeq !== input.attemptSeq ||
+    binding.toolId !== input.toolId ||
+    binding.parameterHash !== input.parameterHash ||
+    binding.toolPlanHash !== input.toolPlanHash ||
+    binding.roomId !== input.roomId
+  ) {
+    return fail("execution_conflict", "Agent runtime confirmed tool input binding was rejected");
+  }
+  let canonicalToolCall: unknown;
+  try {
+    canonicalToolCall = JSON.parse(String(binding.canonicalToolCall));
+  } catch {
+    return fail("storage_unavailable", "Agent runtime confirmed tool parameters were corrupt");
+  }
+  if (typeof canonicalToolCall !== "object" || canonicalToolCall === null ||
+      !Object.hasOwn(canonicalToolCall, "parameters")) {
+    return fail("execution_conflict", "Agent runtime confirmed tool parameters were unavailable");
+  }
+  const parameters = (canonicalToolCall as { readonly parameters: JsonValue }).parameters;
+  const remainingCallsValue = Object.hasOwn(canonicalToolCall, "remainingCalls")
+    ? (canonicalToolCall as { readonly remainingCalls?: unknown }).remainingCalls
+    : [];
+  if (!Array.isArray(remainingCallsValue) || remainingCallsValue.some((entry) =>
+    typeof entry !== "object" || entry === null || Array.isArray(entry) ||
+    Object.keys(entry).sort().join("\0") !== "callId\0parameters\0toolId" ||
+    typeof (entry as { readonly callId?: unknown }).callId !== "string" ||
+    (entry as { readonly callId: string }).callId.length === 0 ||
+    typeof (entry as { readonly toolId?: unknown }).toolId !== "string" ||
+    (entry as { readonly toolId: string }).toolId.length === 0
+  )) {
+    return fail("storage_unavailable", "Agent runtime confirmed tool plan was corrupt");
+  }
+  const remainingCalls = remainingCallsValue as readonly AgentRuntimeToolPlanEntry[];
+  if (createHash("sha256").update(canonicalJson(parameters)).digest("hex") !== binding.parameterHash) {
+    return fail("storage_unavailable", "Agent runtime confirmed tool parameters failed integrity validation");
+  }
+  if (createHash("sha256").update(canonicalJson(canonicalToolCall)).digest("hex") !== binding.toolPlanHash) {
+    return fail("storage_unavailable", "Agent runtime confirmed tool plan failed integrity validation");
+  }
+  const existingDispatch = database.prepare(
+    `SELECT 1 AS present FROM agent_tool_dispatches WHERE grant_id = ? LIMIT 1`,
+  ).get(String(binding.grantId));
+  if (existingDispatch !== undefined) {
+    return fail("execution_conflict", "Agent runtime confirmed tool was already dispatched");
+  }
+  const dispatch = dispatchAgentRuntimeToolDatabaseCommand(database, {
+    executionId: input.executionId,
+    attemptSeq: input.attemptSeq,
+    grantId: String(binding.grantId),
+    toolId: input.toolId,
+    parameterHash: input.parameterHash,
+    confirmationRequirement: "side_effect",
+    confirmationId: input.confirmationId,
+    now: input.now,
+  }, agentId);
+  const execution = readAgentRuntimeExecutionRow(database, String(binding.executionId));
+  if (execution === undefined) {
+    return fail("storage_unavailable", "Agent runtime confirmed tool execution disappeared");
+  }
+  return {
+    confirmationId: input.confirmationId,
+    execution: agentExecutionFromRuntimeRow(execution),
+    dispatch,
+    parameters,
+    remainingCalls,
+    toolPlanHash: String(binding.toolPlanHash),
+  };
+}
+
+export function dispatchAgentRuntimeToolDatabaseCommand(
+  database: DatabaseSync,
+  input: DispatchToolInput,
+  agentId: string,
+): ToolDispatch {
+  return runAuthorityImmediateTransaction(database, () => {
+    const execution = readAgentRuntimeExecutionRow(database, input.executionId);
+    if (execution !== undefined && execution.agentId !== agentId) {
+      return fail("agent_capability_forbidden", "Agent runtime tool dispatch agent was rejected");
+    }
+    if (execution === undefined || execution.status !== "running" ||
+        Number(execution.currentAttemptSeq) !== input.attemptSeq || execution.agentId !== agentId) {
+      return fail("execution_conflict", "Agent runtime tool dispatch lost execution CAS");
+    }
+    requireAgentCommandAuthority(database, String(execution.agentId), String(execution.roomId));
+    requireAgentToolPermission(database, String(execution.roomId), String(execution.agentId), input.toolId);
+    const now = new Date(input.now).toISOString();
+    const grant = database.prepare(
+      `SELECT id, execution_id AS executionId, attempt_seq AS attemptSeq, agent_id AS agentId,
+              room_id AS roomId, tool_id AS toolId, parameter_hash AS parameterHash,
+              confirmation_requirement AS confirmationRequirement,
+              issued_at AS issuedAt, expires_at AS expiresAt, consumed_at AS consumedAt
+       FROM agent_tool_grants WHERE id = ?`,
+    ).get(input.grantId) as Record<string, unknown> | undefined;
+    const grantIdentityMatches = grant !== undefined && grant.executionId === input.executionId &&
+      Number(grant.attemptSeq) === input.attemptSeq && grant.agentId === execution.agentId &&
+      grant.roomId === execution.roomId && grant.toolId === input.toolId &&
+      grant.parameterHash === input.parameterHash &&
+      grant.confirmationRequirement === input.confirmationRequirement;
+    if (grantIdentityMatches && typeof grant.expiresAt === "string" && grant.expiresAt <= now) {
+      return fail("confirmation_expired", "Agent runtime tool grant expired before dispatch");
+    }
+    if (grant === undefined || grant.executionId !== input.executionId ||
+        Number(grant.attemptSeq) !== input.attemptSeq || grant.agentId !== execution.agentId ||
+        grant.roomId !== execution.roomId || grant.toolId !== input.toolId ||
+        grant.parameterHash !== input.parameterHash || typeof grant.consumedAt === "string" ||
+        typeof grant.expiresAt !== "string" || grant.expiresAt <= now ||
+        grant.confirmationRequirement !== input.confirmationRequirement ||
+        (grant.confirmationRequirement === "read_only" &&
+          (execution.actionCategory !== "tool_call" || execution.toolDispatchPhase !== "not_started" ||
+            execution.currentToolId !== input.toolId)) ||
+        (grant.confirmationRequirement === "side_effect" &&
+          (execution.actionCategory !== "waiting_upstream" || execution.toolDispatchPhase !== null ||
+            execution.currentToolId !== null))) {
+      return fail("execution_conflict", "Agent runtime tool grant was rejected");
+    }
+    if (input.confirmationRequirement === "side_effect") {
+      const confirmation = database.prepare(
+        `SELECT id, human_principal_id AS humanPrincipalId,
+                session_family_id AS sessionFamilyId, expires_at AS expiresAt,
+                consumed_at AS consumedAt FROM agent_tool_confirmations
+         WHERE id = ? AND execution_id = ? AND attempt_seq = ? AND tool_id = ?
+           AND parameter_hash = ? AND room_id = ?`,
+      ).get(input.confirmationId, input.executionId, input.attemptSeq, input.toolId,
+        input.parameterHash, String(execution.roomId)) as Record<string, unknown> | undefined;
+      if (confirmation !== undefined && typeof confirmation.expiresAt === "string" &&
+          confirmation.expiresAt <= now) {
+        return fail("confirmation_expired", "Agent runtime tool confirmation expired before dispatch");
+      }
+      if (confirmation === undefined || typeof confirmation.consumedAt === "string") {
+        return fail("execution_conflict", "Agent runtime tool confirmation was rejected");
+      }
+      const activeFamily = database.prepare(
+        `SELECT 1 AS present FROM sessions
+         WHERE family_id = ? AND actor_id = ? AND revoked_at IS NULL
+           AND access_expires_at > ? LIMIT 1`,
+      ).get(String(confirmation.sessionFamilyId), String(confirmation.humanPrincipalId), input.now);
+      if (activeFamily === undefined) {
+        return fail("session_revoked", "Agent runtime tool confirmation session is no longer active");
+      }
+      const consumedConfirmation = database.prepare(
+        `UPDATE agent_tool_confirmations SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL`,
+      ).run(now, input.confirmationId);
+      if (consumedConfirmation.changes !== 1) return fail("execution_conflict", "Agent runtime tool confirmation replayed");
+    }
+    const consumedGrant = database.prepare(
+      `UPDATE agent_tool_grants SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL`,
+    ).run(now, input.grantId);
+    const executionUpdate = database.prepare(
+      `UPDATE agent_executions SET action_category = 'tool_call',
+         tool_dispatch_phase = 'dispatched', current_tool_id = ?, updated_at = ?
+       WHERE id = ? AND state = 'running' AND current_attempt_seq = ?
+         AND action_category = ? AND tool_dispatch_phase IS ?`,
+    ).run(input.toolId, now, input.executionId, input.attemptSeq,
+      input.confirmationRequirement === "side_effect" ? "waiting_upstream" : "tool_call",
+      input.confirmationRequirement === "side_effect" ? null : "not_started");
+    const attemptUpdate = database.prepare(
+      `UPDATE agent_execution_attempts SET action_category = 'tool_call',
+         tool_dispatch_phase = 'dispatched'
+       WHERE execution_id = ? AND attempt_seq = ? AND state = 'running'
+         AND action_category = ? AND tool_dispatch_phase IS ?`,
+    ).run(input.executionId, input.attemptSeq,
+      input.confirmationRequirement === "side_effect" ? "waiting_upstream" : "tool_call",
+      input.confirmationRequirement === "side_effect" ? null : "not_started");
+    if (consumedGrant.changes !== 1 || executionUpdate.changes !== 1 || attemptUpdate.changes !== 1) {
+      return fail("execution_conflict", "Agent runtime tool dispatch lost atomic CAS");
+    }
+    const dispatchId = stableId("agent-runtime-tool-dispatch", input.grantId);
+    database.prepare(
+      `INSERT INTO agent_tool_dispatches (
+         id, execution_id, attempt_seq, grant_id, tool_id, parameter_hash, state, dispatched_at
+       ) VALUES (?, ?, ?, ?, ?, ?, 'dispatched', ?)`,
+    ).run(dispatchId, input.executionId, input.attemptSeq, input.grantId, input.toolId,
+      input.parameterHash, now);
+    const changedExecution = agentExecutionFromRuntimeRow({
+      ...execution, actionCategory: "tool_call", toolDispatchPhase: "dispatched",
+      currentToolId: input.toolId, updatedAt: now,
+    });
+    const eventId = stableId("event", "agent-runtime-tool-dispatch", dispatchId);
+    const streamSeq = appendRoomEvent(database, {
+      eventId, roomId: String(execution.roomId), actorId: String(execution.agentId),
+      eventType: "room.agent_execution.changed", occurredAt: now,
+      payload: changedExecution as unknown as JsonValue,
+    });
+    appendRoomOutbox(database, eventId, String(execution.roomId), streamSeq, now,
+      "agent-runtime-tool-dispatch", dispatchId);
+    return {
+      id: dispatchId, executionId: input.executionId, attemptSeq: input.attemptSeq,
+      grantId: input.grantId, toolId: input.toolId, parameterHash: input.parameterHash,
+      state: "dispatched", dispatchedAt: now,
+    };
+  });
+}
+
+export function settleAgentRuntimeToolDatabaseCommand(
+  database: DatabaseSync,
+  input: SettleToolInput,
+  agentId: string,
+): ToolDispatch {
+  return runAuthorityImmediateTransaction(database, () => {
+    const existing = database.prepare(
+      `SELECT dispatch.id, dispatch.execution_id AS executionId, dispatch.attempt_seq AS attemptSeq,
+              dispatch.grant_id AS grantId, dispatch.tool_id AS toolId,
+              dispatch.parameter_hash AS parameterHash, dispatch.state,
+              dispatch.dispatched_at AS dispatchedAt, dispatch.settled_at AS settledAt,
+              dispatch.closed_summary AS closedSummary, dispatch.sealed_compensation AS sealedCompensation,
+              grant.agent_id AS agentId
+       FROM agent_tool_dispatches AS dispatch
+       JOIN agent_tool_grants AS grant ON grant.id = dispatch.grant_id
+       WHERE dispatch.id = ?`,
+    ).get(input.dispatchId) as Record<string, unknown> | undefined;
+    if (existing === undefined || existing.executionId !== input.executionId ||
+        Number(existing.attemptSeq) !== input.attemptSeq || existing.grantId !== input.grantId ||
+        existing.agentId !== agentId) {
+      if (existing?.agentId !== undefined && existing.agentId !== agentId) {
+        return fail("agent_capability_forbidden", "Agent runtime tool settlement agent was rejected");
+      }
+      return fail("execution_conflict", "Agent runtime tool settlement identity was rejected");
+    }
+    if (existing.state !== "dispatched") {
+      const settled = toolDispatchFromRow(existing);
+      if (settled.state !== input.outcome || settled.closedSummary !== input.closedSummary ||
+          settled.sealedCompensation !== input.sealedCompensation) {
+        return fail("idempotency_conflict", "Agent runtime tool settlement payload changed");
+      }
+      return settled;
+    }
+    const settledAt = new Date(input.now).toISOString();
+    const grant = database.prepare(
+      `SELECT confirmation_requirement AS confirmationRequirement,
+              agent_id AS agentId, room_id AS roomId
+       FROM agent_tool_grants WHERE id = ?`,
+    ).get(input.grantId) as Record<string, unknown> | undefined;
+    if (grant === undefined) return fail("storage_unavailable", "Agent runtime tool grant is inconsistent");
+    if (grant.agentId !== agentId) {
+      return fail("agent_capability_forbidden", "Agent runtime tool settlement agent was rejected");
+    }
+    const updated = database.prepare(
+      `UPDATE agent_tool_dispatches
+       SET state = ?, settled_at = ?, closed_summary = ?, sealed_compensation = ?
+       WHERE id = ? AND state = 'dispatched'`,
+    ).run(input.outcome, settledAt, input.closedSummary ?? null,
+      input.sealedCompensation ?? null, input.dispatchId);
+    if (updated.changes !== 1) return fail("execution_conflict", "Agent runtime tool settlement lost CAS");
+    database.prepare(
+      `UPDATE agent_executions SET tool_dispatch_phase = 'finished', updated_at = ?
+       WHERE id = ? AND state = 'running' AND current_attempt_seq = ?
+         AND action_category = 'tool_call' AND tool_dispatch_phase = 'dispatched'`,
+    ).run(settledAt, input.executionId, input.attemptSeq);
+    database.prepare(
+      `UPDATE agent_execution_attempts SET tool_dispatch_phase = 'finished'
+       WHERE execution_id = ? AND attempt_seq = ? AND state = 'running'
+         AND action_category = 'tool_call' AND tool_dispatch_phase = 'dispatched'`,
+    ).run(input.executionId, input.attemptSeq);
+    if (grant?.confirmationRequirement === "side_effect" &&
+        (input.outcome === "failed" || input.outcome === "outcome_unknown")) {
+      const terminalErrorCode = input.outcome === "failed"
+        ? "tool_failure"
+        : "side_effect_outcome_unknown";
+      const execution = readAgentRuntimeExecutionRow(database, input.executionId);
+      if (execution?.status === "running" && Number(execution.currentAttemptSeq) === input.attemptSeq) {
+        const attemptChanged = database.prepare(
+          `UPDATE agent_execution_attempts
+           SET state = 'failed', tool_dispatch_phase = 'finished', finished_at = ?,
+               error_code = ?
+           WHERE execution_id = ? AND attempt_seq = ? AND state = 'running'`,
+        ).run(settledAt, terminalErrorCode, input.executionId, input.attemptSeq);
+        const executionChanged = database.prepare(
+          `UPDATE agent_executions
+           SET state = 'failed', tool_dispatch_phase = 'finished', completed_at = ?, updated_at = ?,
+               terminal_error_code = ?
+           WHERE id = ? AND current_attempt_seq = ? AND state = 'running'`,
+        ).run(settledAt, settledAt, terminalErrorCode, input.executionId, input.attemptSeq);
+        if (attemptChanged.changes !== 1 || executionChanged.changes !== 1) {
+          return fail("execution_conflict", "Agent runtime unknown side-effect settlement lost CAS");
+        }
+        const failed = agentExecutionFromRuntimeRow({
+          ...execution, status: "failed", toolDispatchPhase: "finished",
+          finishedAt: settledAt, updatedAt: settledAt,
+          terminalErrorCode,
+        });
+        const eventId = stableId("event", "agent-runtime-side-effect-unknown",
+          input.executionId, String(input.attemptSeq));
+        const streamSeq = appendRoomEvent(database, {
+          eventId, roomId: String(execution.roomId), actorId: String(execution.agentId),
+          eventType: "room.agent_execution.changed", occurredAt: settledAt,
+          payload: failed as unknown as JsonValue,
+        });
+        appendRoomOutbox(database, eventId, String(execution.roomId), streamSeq, settledAt,
+          "agent-runtime-side-effect-unknown", input.dispatchId);
+      }
+    }
+    const settledDispatch: ToolDispatch = {
+      ...toolDispatchFromRow(existing), state: input.outcome, settledAt,
+      ...(input.closedSummary === undefined ? {} : { closedSummary: input.closedSummary }),
+      ...(input.sealedCompensation === undefined ? {} : { sealedCompensation: input.sealedCompensation }),
+    };
+    const observableDispatch = {
+      id: settledDispatch.id,
+      executionId: settledDispatch.executionId,
+      roomId: String(grant.roomId),
+      agentId: String(grant.agentId),
+      attemptSeq: settledDispatch.attemptSeq,
+      grantId: settledDispatch.grantId,
+      toolId: settledDispatch.toolId,
+      parameterHash: settledDispatch.parameterHash,
+      state: settledDispatch.state,
+      dispatchedAt: settledDispatch.dispatchedAt,
+      settledAt,
+      ...(settledDispatch.closedSummary === undefined
+        ? {}
+        : { closedSummary: settledDispatch.closedSummary }),
+    };
+    const settlementEventId = stableId("event", "agent-runtime-tool-settlement", input.dispatchId);
+    const settlementStreamSeq = appendRoomEvent(database, {
+      eventId: settlementEventId, roomId: String(grant.roomId), actorId: String(grant.agentId),
+      eventType: "room.agent_tool_dispatch.changed", occurredAt: settledAt,
+      payload: observableDispatch as unknown as JsonValue,
+    });
+    appendRoomOutbox(database, settlementEventId, String(grant.roomId), settlementStreamSeq, settledAt,
+      "agent-runtime-tool-settlement", input.dispatchId);
+    return settledDispatch;
+  });
+}
+
+export function readAgentRuntimeExecutionDatabaseQuery(
+  database: DatabaseSync,
+  context: AuthenticatedSessionContext,
+  executionId: string,
+  now: number,
+): AgentExecution {
+  const actorId = requireHumanSession(database, context, now);
+  const execution = readAgentRuntimeExecutionRow(database, executionId);
+  if (execution === undefined) return fail("execution_conflict", "Agent runtime execution was not found");
+  requireRoomMembership(database, actorId, String(execution.roomId));
+  return agentExecutionFromRuntimeRow(execution);
+}
+
+export function loadAgentRuntimeProviderContextDatabaseQuery(
+  database: DatabaseSync,
+  executionId: string,
+  agentId: string,
+): AgentRuntimeProviderContext {
+  const execution = readAgentRuntimeExecutionRow(database, executionId);
+  if (execution === undefined || execution.agentId !== agentId) {
+    return fail("agent_capability_forbidden", "Agent runtime provider context was rejected");
+  }
+  const intent = database.prepare(
+    `SELECT intent.source_message_id AS sourceMessageId,
+            execution.requester_actor_id AS requesterActorId,
+            intent.target_agent_id AS targetAgentId,
+            intent.intent_kind AS intentKind,
+            message.author_id AS actorId, message.body AS body
+     FROM agent_invocation_intents AS intent
+     JOIN agent_executions AS execution ON execution.id = intent.execution_id
+     JOIN messages AS message ON message.id = intent.source_message_id
+     WHERE intent.execution_id = ?`,
+  ).get(executionId) as Record<string, unknown> | undefined;
+  if (intent === undefined || typeof intent.sourceMessageId !== "string" ||
+      typeof intent.requesterActorId !== "string" || intent.targetAgentId !== agentId ||
+      !["direct_mention", "structured_help", "routed_candidate"].includes(
+        String(intent.intentKind),
+      ) || typeof intent.actorId !== "string" || typeof intent.body !== "string") {
+    return fail("storage_unavailable", "Agent runtime invocation context is corrupt");
+  }
+  const rows = database.prepare(
+    `SELECT step_seq AS stepSeq, step_kind AS kind,
+            canonical_tool_call_json AS canonicalToolCall,
+            bounded_tool_result_json AS boundedToolResult,
+            input_sha256 AS inputSha256, output_sha256 AS outputSha256
+     FROM agent_execution_steps
+     WHERE execution_id = ? AND attempt_seq = ? AND step_seq <= ?
+     ORDER BY step_seq`,
+  ).all(executionId, Number(execution.currentAttemptSeq), Number(execution.recoveryCursor));
+  const committedSteps = rows.map((row) => {
+    const stepSeq = Number(row.stepSeq);
+    if (!Number.isSafeInteger(stepSeq) || stepSeq <= 0 ||
+        !["model_generation", "tool_call", "tool_result"].includes(String(row.kind))) {
+      return fail("storage_unavailable", "Agent runtime checkpoint context is corrupt");
+    }
+    let modelInput: JsonValue;
+    try {
+      modelInput = row.kind === "tool_call"
+        ? JSON.parse(String(row.canonicalToolCall)) as JsonValue
+        : row.kind === "tool_result"
+          ? JSON.parse(String(row.boundedToolResult)) as JsonValue
+          : { inputSha256: String(row.inputSha256), outputSha256: String(row.outputSha256) };
+    } catch {
+      return fail("storage_unavailable", "Agent runtime checkpoint JSON is corrupt");
+    }
+    return { stepSeq, kind: row.kind as "model_generation" | "tool_call" | "tool_result", modelInput };
+  });
+  return {
+    invocation: {
+      sourceMessageId: intent.sourceMessageId,
+      requesterActorId: intent.requesterActorId,
+      targetAgentId: agentId,
+      intentKind: intent.intentKind as "direct_mention" | "structured_help" | "routed_candidate",
+    },
+    visibleConversation: [{
+      messageId: intent.sourceMessageId, actorId: intent.actorId, body: intent.body,
+    }],
+    committedSteps,
+  };
+}
+
+export function cancelAgentRuntimeForHumanFenceDatabaseCommand(
+  database: DatabaseSync,
+  input: CancelForHumanFenceInput,
+  agentId: string,
+): AgentExecution {
+  return runAuthorityImmediateTransaction(database, () => {
+    const execution = readAgentRuntimeExecutionRow(database, input.executionId);
+    if (execution === undefined || execution.agentId !== agentId) {
+      return fail("agent_capability_forbidden", "Agent runtime fence agent was rejected");
+    }
+    const fenceMessage = database.prepare(
+      `SELECT room_id AS roomId, author_id AS authorId, author_kind AS authorKind
+       FROM messages WHERE id = ?`,
+    ).get(input.fenceMessageId) as Record<string, unknown> | undefined;
+    if (fenceMessage === undefined) {
+      return fail("message_not_found", "Agent runtime fence message was not an accepted human message");
+    }
+    if (fenceMessage.roomId !== execution.roomId || fenceMessage.authorKind !== "human") {
+      return fail("message_not_found", "Agent runtime fence message was not an accepted human message");
+    }
+    const fenceAuthorId = String(fenceMessage.authorId);
+    const toolDispatchPhase = typeof execution.toolDispatchPhase === "string"
+      ? execution.toolDispatchPhase
+      : null;
+    const existing = database.prepare(
+      `SELECT 1 AS present FROM agent_fence_replacements
+       WHERE fence_message_id = ? AND old_execution_id = ? AND old_attempt_seq = ?`,
+    ).get(input.fenceMessageId, input.executionId, Number(execution.currentAttemptSeq));
+    if (existing !== undefined) return agentExecutionFromRuntimeRow(execution);
+    const eligible = execution.status === "queued" ||
+      (execution.status === "running" && execution.actionCategory === "waiting_upstream") ||
+      (execution.status === "running" && execution.actionCategory === "tool_call" &&
+        execution.toolDispatchPhase === "not_started");
+    if (!eligible) return fail("execution_conflict", "Agent runtime execution is not human-fence eligible");
+    const finishedAt = new Date(input.now).toISOString();
+    const executionUpdate = database.prepare(
+      `UPDATE agent_executions SET state = 'cancelled', completed_at = ?, updated_at = ?,
+         cancellation_reason = 'human_fence'
+       WHERE id = ? AND current_attempt_seq = ? AND state = ? AND action_category = ?
+         AND tool_dispatch_phase IS ?`,
+    ).run(finishedAt, finishedAt, input.executionId, Number(execution.currentAttemptSeq),
+      String(execution.status), String(execution.actionCategory), toolDispatchPhase);
+    const attemptUpdate = database.prepare(
+      `UPDATE agent_execution_attempts SET state = 'cancelled', finished_at = ?, next_retry_at = NULL
+       WHERE execution_id = ? AND attempt_seq = ? AND state = ? AND action_category = ?
+         AND tool_dispatch_phase IS ?`,
+    ).run(finishedAt, input.executionId, Number(execution.currentAttemptSeq),
+      String(execution.status), String(execution.actionCategory), toolDispatchPhase);
+    if (executionUpdate.changes !== 1 || attemptUpdate.changes !== 1) {
+      return fail("execution_conflict", "Agent runtime human fence lost CAS");
+    }
+    const fenceId = stableId("agent-runtime-human-fence", input.fenceMessageId,
+      input.executionId, String(execution.currentAttemptSeq));
+    database.prepare(
+      `INSERT INTO agent_fence_replacements (
+         id, fence_message_id, old_execution_id, old_attempt_seq, created_at
+       ) VALUES (?, ?, ?, ?, ?)`,
+    ).run(fenceId, input.fenceMessageId, input.executionId,
+      Number(execution.currentAttemptSeq), finishedAt);
+    const cancelled = agentExecutionFromRuntimeRow({
+      ...execution, status: "cancelled", finishedAt, updatedAt: finishedAt,
+      cancellationReason: "human_fence",
+    });
+    const eventId = stableId("event", "agent-runtime-human-fence", fenceId);
+    const streamSeq = appendRoomEvent(database, {
+      eventId, roomId: String(execution.roomId), actorId: fenceAuthorId,
+      eventType: "room.agent_execution.changed", occurredAt: finishedAt,
+      payload: cancelled as unknown as JsonValue,
+    });
+    appendRoomOutbox(database, eventId, String(execution.roomId), streamSeq, finishedAt,
+      "agent-runtime-human-fence", fenceId);
+    return cancelled;
+  });
+}
+
+export interface ClaimNextAgentRuntimeDatabaseCommandInput {
+  readonly runtime: AgentRuntimeWorkerContext;
+  readonly roomId: string;
+  readonly now: number;
+}
+
+export interface CommitAgentRuntimeStepDatabaseCommandInput {
+  readonly runtime: AgentRuntimeWorkerContext;
+  readonly input: CommitExecutionStepInput;
+}
+export interface ScheduleAgentRuntimeRetryDatabaseCommandInput {
+  readonly runtime: AgentRuntimeWorkerContext;
+  readonly input: ScheduleRetryInput;
+  /** Server-private restart path for a side effect whose durable outcome is already settled. */
+  readonly allowSettledSideEffectRecovery?: true;
+}
+
+export function scheduleAgentRuntimeRetryDatabaseCommand(
+  database: DatabaseSync,
+  command: ScheduleAgentRuntimeRetryDatabaseCommandInput,
+): AgentExecution {
+  return runAuthorityImmediateTransaction(database, () => {
+    const { input } = command;
+    const current = database.prepare(
+      `SELECT id, room_id AS roomId, source_message_id AS sourceMessageId,
+              requester_actor_id AS requesterId, agent_id AS agentId,
+              state AS status, action_category AS actionCategory,
+              tool_dispatch_phase AS toolDispatchPhase, current_tool_id AS currentToolId,
+              current_attempt_seq AS currentAttemptSeq, retry_cycle AS retryCycle,
+              retry_ordinal AS retryOrdinal, provider_id AS providerId, model_id AS modelId,
+              recovery_cursor AS recoveryCursor, queued_at AS queuedAt,
+              started_at AS startedAt, updated_at AS updatedAt
+       FROM agent_executions
+       WHERE id = ? AND state = 'running' AND current_attempt_seq = ?`,
+    ).get(input.executionId, input.attemptSeq) as Record<string, unknown> | undefined;
+    if (current === undefined) {
+      return fail("execution_conflict", "Agent runtime retry lost execution CAS");
+    }
+    if (current.agentId !== command.runtime.agentId) {
+      return fail("agent_capability_forbidden", "Agent runtime retry agent was rejected");
+    }
+    const sideEffect = database.prepare(
+      `SELECT 1 AS present FROM agent_tool_grants
+       WHERE execution_id = ? AND attempt_seq = ?
+         AND confirmation_requirement = 'side_effect'
+       LIMIT 1`,
+    ).get(input.executionId, input.attemptSeq);
+    const settledSideEffect = database.prepare(
+      `SELECT 1 AS present
+       FROM agent_tool_dispatches AS dispatch
+       JOIN agent_tool_grants AS grant ON grant.id = dispatch.grant_id
+       WHERE dispatch.execution_id = ? AND dispatch.attempt_seq = ?
+         AND grant.confirmation_requirement = 'side_effect'
+         AND dispatch.state IN ('succeeded', 'failed')
+       LIMIT 1`,
+    ).get(input.executionId, input.attemptSeq);
+    const hasDurableToolResult = database.prepare(
+      `SELECT 1 AS present FROM agent_execution_steps
+       WHERE execution_id = ? AND attempt_seq = ? AND step_kind = 'tool_result'
+       LIMIT 1`,
+    ).get(input.executionId, input.attemptSeq) !== undefined;
+    const canRecoverSettledSideEffect = command.allowSettledSideEffectRecovery === true &&
+      settledSideEffect !== undefined &&
+      ((current.actionCategory === "tool_call" && current.toolDispatchPhase === "finished") ||
+       (current.actionCategory === "model_generation" && hasDurableToolResult));
+    if (sideEffect !== undefined && !canRecoverSettledSideEffect) {
+      return fail("execution_conflict", "Side-effecting Agent runtime attempts cannot auto retry");
+    }
+    const retryOrdinal = Number(current.retryOrdinal);
+    const finishedAt = new Date(input.now).toISOString();
+    database.prepare(
+      `UPDATE agent_tool_dispatches
+       SET state = 'outcome_unknown', settled_at = ?, closed_summary = 'runtime_restarted'
+       WHERE execution_id = ? AND attempt_seq = ? AND state = 'dispatched'
+         AND EXISTS (
+           SELECT 1 FROM agent_tool_grants AS grant
+           WHERE grant.id = agent_tool_dispatches.grant_id
+             AND grant.confirmation_requirement = 'read_only'
+         )`,
+    ).run(finishedAt, input.executionId, input.attemptSeq);
+    const closedAttempt = database.prepare(
+      `UPDATE agent_execution_attempts
+       SET state = 'failed', finished_at = ?, error_code = ?
+       WHERE execution_id = ? AND attempt_seq = ? AND state = 'running'`,
+    ).run(finishedAt, input.errorCode, input.executionId, input.attemptSeq);
+    if (closedAttempt.changes !== 1) {
+      return fail("execution_conflict", "Agent runtime retry lost attempt CAS");
+    }
+
+    if (retryOrdinal === 3) {
+      const terminal = database.prepare(
+        `UPDATE agent_executions
+         SET state = 'failed', completed_at = ?, updated_at = ?,
+             terminal_error_code = ?, dead_lettered_at = ?
+         WHERE id = ? AND state = 'running' AND current_attempt_seq = ?`,
+      ).run(finishedAt, finishedAt, input.errorCode, finishedAt, input.executionId, input.attemptSeq);
+      if (terminal.changes !== 1) {
+        return fail("execution_conflict", "Agent runtime dead-letter lost execution CAS");
+      }
+      const execution = agentExecutionFromRuntimeRow({
+        ...current,
+        status: "failed",
+        updatedAt: finishedAt,
+        finishedAt,
+        terminalErrorCode: input.errorCode,
+        deadLetteredAt: finishedAt,
+      });
+      const eventId = stableId("event", "agent-runtime-dead-letter", input.executionId, String(input.attemptSeq));
+      const streamSeq = appendRoomEvent(database, {
+        eventId,
+        roomId: String(current.roomId),
+        actorId: String(current.agentId),
+        eventType: "room.agent_execution.changed",
+        occurredAt: finishedAt,
+        payload: execution as unknown as JsonValue,
+      });
+      appendRoomOutbox(database, eventId, String(current.roomId), streamSeq, finishedAt,
+        "agent-runtime-dead-letter", input.executionId);
+      return execution;
+    }
+
+    const nextAttemptSeq = input.attemptSeq + 1;
+    const nextRetryOrdinal = (retryOrdinal + 1) as 2 | 3;
+    const nextRetryAt = input.now + (retryOrdinal === 1 ? 1_000 : 4_000);
+    const queued = database.prepare(
+      `UPDATE agent_executions
+       SET state = 'queued', action_category = 'model_generation',
+           tool_dispatch_phase = NULL, current_tool_id = NULL,
+           current_attempt_seq = ?, retry_ordinal = ?, recovery_cursor = 0,
+           started_at = NULL, completed_at = NULL, cancellation_reason = NULL,
+           terminal_error_code = NULL, dead_lettered_at = NULL, result_message_id = NULL,
+           updated_at = ?
+       WHERE id = ? AND state = 'running' AND current_attempt_seq = ?`,
+    ).run(nextAttemptSeq, nextRetryOrdinal, finishedAt, input.executionId, input.attemptSeq);
+    if (queued.changes !== 1) {
+      return fail("execution_conflict", "Agent runtime retry lost execution CAS");
+    }
+    const execution = agentExecutionFromRuntimeRow({
+      ...current,
+      status: "queued",
+      actionCategory: "model_generation",
+      toolDispatchPhase: null,
+      currentToolId: null,
+      currentAttemptSeq: nextAttemptSeq,
+      retryOrdinal: nextRetryOrdinal,
+      recoveryCursor: 0,
+      startedAt: null,
+      updatedAt: finishedAt,
+    });
+    const eventId = stableId("event", "agent-runtime-retry", input.executionId, String(nextAttemptSeq));
+    const streamSeq = appendRoomEvent(database, {
+      eventId,
+      roomId: String(current.roomId),
+      actorId: String(current.agentId),
+      eventType: "room.agent_execution.changed",
+      occurredAt: finishedAt,
+      payload: execution as unknown as JsonValue,
+    });
+    database.prepare(
+      `INSERT INTO agent_execution_attempts (
+         execution_id, room_id, attempt_seq, retry_cycle, retry_ordinal, state,
+         action_category, tool_dispatch_phase, started_at, finished_at,
+         error_code, next_retry_at, recovery_cursor, enqueue_stream_seq
+       ) VALUES (?, ?, ?, ?, ?, 'queued', 'model_generation', NULL, NULL, NULL, NULL, ?, 0, ?)`,
+    ).run(input.executionId, String(current.roomId), nextAttemptSeq, Number(current.retryCycle), nextRetryOrdinal,
+      nextRetryAt, streamSeq);
+    appendRoomOutbox(database, eventId, String(current.roomId), streamSeq, finishedAt,
+      "agent-runtime-retry", input.executionId);
+    return execution;
+  });
+}
+
+export interface FailAgentRuntimeExecutionDatabaseCommandInput {
+  readonly runtime: AgentRuntimeWorkerContext;
+  readonly input: FailExecutionInput;
+}
+
+export function failAgentRuntimeExecutionDatabaseCommand(
+  database: DatabaseSync,
+  command: FailAgentRuntimeExecutionDatabaseCommandInput,
+): AgentExecution {
+  return runAuthorityImmediateTransaction(database, () => {
+    const { input } = command;
+    const current = database.prepare(
+      `SELECT id, room_id AS roomId, source_message_id AS sourceMessageId,
+              requester_actor_id AS requesterId, agent_id AS agentId,
+              state AS status, action_category AS actionCategory,
+              tool_dispatch_phase AS toolDispatchPhase, current_tool_id AS currentToolId,
+              current_attempt_seq AS currentAttemptSeq, retry_cycle AS retryCycle,
+              retry_ordinal AS retryOrdinal, provider_id AS providerId, model_id AS modelId,
+              recovery_cursor AS recoveryCursor, queued_at AS queuedAt,
+              started_at AS startedAt, updated_at AS updatedAt,
+              completed_at AS finishedAt, cancellation_reason AS cancellationReason,
+              terminal_error_code AS terminalErrorCode, dead_lettered_at AS deadLetteredAt,
+              result_message_id AS resultMessageId,
+              manual_retry_of_execution_id AS manualRetryOfExecutionId,
+              compensates_execution_id AS compensatesExecutionId,
+              supersedes_execution_ids_json AS supersedesExecutionIdsJson
+       FROM agent_executions WHERE id = ?`,
+    ).get(input.executionId) as Record<string, unknown> | undefined;
+    if (current === undefined || Number(current.currentAttemptSeq) !== input.attemptSeq) {
+      return fail("execution_conflict", "Agent runtime terminal failure lost execution CAS");
+    }
+    if (current.agentId !== command.runtime.agentId) {
+      return fail("agent_capability_forbidden", "Agent runtime terminal failure agent was rejected");
+    }
+    if (current.status === "failed") {
+      if (current.terminalErrorCode !== input.errorCode) {
+        return fail("idempotency_conflict", "Agent runtime terminal failure payload changed");
+      }
+      return agentExecutionFromRuntimeRow(current);
+    }
+    if (current.status !== "running") {
+      return fail("execution_conflict", "Agent runtime terminal failure requires a running execution");
+    }
+    const finishedAt = new Date(input.now).toISOString();
+    const closedAttempt = database.prepare(
+      `UPDATE agent_execution_attempts
+       SET state = 'failed', finished_at = ?, error_code = ?
+       WHERE execution_id = ? AND attempt_seq = ? AND state = 'running'`,
+    ).run(finishedAt, input.errorCode, input.executionId, input.attemptSeq);
+    if (closedAttempt.changes !== 1) {
+      return fail("execution_conflict", "Agent runtime terminal failure lost attempt CAS");
+    }
+    const terminal = database.prepare(
+      `UPDATE agent_executions
+       SET state = 'failed', completed_at = ?, updated_at = ?, terminal_error_code = ?
+       WHERE id = ? AND state = 'running' AND current_attempt_seq = ?`,
+    ).run(finishedAt, finishedAt, input.errorCode, input.executionId, input.attemptSeq);
+    if (terminal.changes !== 1) {
+      return fail("execution_conflict", "Agent runtime terminal failure lost execution CAS");
+    }
+    const execution = agentExecutionFromRuntimeRow({
+      ...current,
+      status: "failed",
+      finishedAt,
+      updatedAt: finishedAt,
+      terminalErrorCode: input.errorCode,
+    });
+    const eventId = stableId(
+      "event",
+      "agent-runtime-terminal-failure",
+      input.executionId,
+      String(input.attemptSeq),
+    );
+    const streamSeq = appendRoomEvent(database, {
+      eventId,
+      roomId: String(current.roomId),
+      actorId: String(current.agentId),
+      eventType: "room.agent_execution.changed",
+      occurredAt: finishedAt,
+      payload: execution as unknown as JsonValue,
+    });
+    appendRoomOutbox(
+      database,
+      eventId,
+      String(current.roomId),
+      streamSeq,
+      finishedAt,
+      "agent-runtime-terminal-failure",
+      input.executionId,
+    );
+    return execution;
+  });
+}
+
+export function commitAgentRuntimeStepDatabaseCommand(
+  database: DatabaseSync,
+  command: CommitAgentRuntimeStepDatabaseCommandInput,
+): AgentExecution {
+  return runAuthorityImmediateTransaction(database, () => {
+    const { input } = command;
+    const current = database.prepare(`SELECT id, room_id AS roomId, source_message_id AS sourceMessageId,
+      requester_actor_id AS requesterId, agent_id AS agentId, provider_id AS providerId, model_id AS modelId,
+      current_attempt_seq AS currentAttemptSeq, retry_cycle AS retryCycle, retry_ordinal AS retryOrdinal,
+      action_category AS actionCategory, tool_dispatch_phase AS toolDispatchPhase,
+      current_tool_id AS currentToolId, recovery_cursor AS recoveryCursor,
+      queued_at AS queuedAt, started_at AS startedAt, updated_at AS updatedAt
+      FROM agent_executions WHERE id = ? AND state = 'running' AND current_attempt_seq = ?`).get(input.executionId, input.attemptSeq) as Record<string, unknown> | undefined;
+    if (current === undefined) return fail("execution_conflict", "Agent runtime checkpoint lost execution CAS");
+    if (current.agentId !== command.runtime.agentId) {
+      return fail("agent_capability_forbidden", "Agent runtime checkpoint agent was rejected");
+    }
+    if (input.stepKind === "model_generation" && current.actionCategory !== "model_generation") {
+      return fail("execution_conflict", "Agent runtime model checkpoint requires model generation");
+    }
+    if (input.stepKind === "tool_call" && current.actionCategory !== "model_generation") {
+      return fail("execution_conflict", "Agent runtime tool-call checkpoint requires model generation");
+    }
+    if (input.stepKind === "tool_result") {
+      const currentToolId = typeof current.currentToolId === "string" ? current.currentToolId : null;
+      const settledTool = database.prepare(
+        `SELECT dispatch.state AS dispatchState, dispatch.tool_id AS toolId
+         FROM agent_tool_dispatches AS dispatch
+         JOIN agent_tool_grants AS grant ON grant.id = dispatch.grant_id
+         JOIN agent_execution_steps AS tool_call
+           ON tool_call.execution_id = dispatch.execution_id
+          AND tool_call.attempt_seq = dispatch.attempt_seq
+          AND tool_call.step_seq = ?
+          AND tool_call.step_kind = 'tool_call'
+         WHERE dispatch.id = ? AND dispatch.execution_id = ? AND dispatch.attempt_seq = ?
+           AND dispatch.tool_id = ?
+           AND grant.execution_id = dispatch.execution_id
+           AND grant.attempt_seq = dispatch.attempt_seq
+           AND grant.tool_id = dispatch.tool_id
+           AND dispatch.state = 'succeeded'
+           AND json_extract(tool_call.canonical_tool_call_json, '$.toolId') = dispatch.tool_id
+           AND dispatch.dispatched_at >= tool_call.completed_at`,
+      ).get(input.stepSeq - 1, input.dispatchId, input.executionId, input.attemptSeq,
+        currentToolId);
+      if (current.actionCategory !== "tool_call" || current.toolDispatchPhase !== "finished" ||
+          currentToolId === null || settledTool === undefined) {
+        return fail("execution_conflict", "Agent runtime tool result requires a safely settled dispatch");
+      }
+    }
+    const changed = input.stepKind === "tool_result"
+      ? database.prepare(`UPDATE agent_execution_attempts
+          SET recovery_cursor = ?, action_category = 'model_generation', tool_dispatch_phase = NULL
+          WHERE execution_id = ? AND attempt_seq = ? AND state = 'running'
+            AND recovery_cursor = ? AND action_category = 'tool_call'
+            AND tool_dispatch_phase = 'finished'`).run(
+          input.stepSeq, input.executionId, input.attemptSeq, input.stepSeq - 1,
+        )
+      : input.stepKind === "tool_call"
+        ? database.prepare(`UPDATE agent_execution_attempts
+            SET recovery_cursor = ?, action_category = 'tool_call', tool_dispatch_phase = 'not_started'
+            WHERE execution_id = ? AND attempt_seq = ? AND state = 'running'
+              AND recovery_cursor = ? AND action_category = 'model_generation'
+              AND tool_dispatch_phase IS NULL`).run(
+            input.stepSeq, input.executionId, input.attemptSeq, input.stepSeq - 1,
+          )
+        : database.prepare(`UPDATE agent_execution_attempts SET recovery_cursor = ?
+          WHERE execution_id = ? AND attempt_seq = ? AND state = 'running' AND recovery_cursor = ?`).run(
+          input.stepSeq, input.executionId, input.attemptSeq, input.stepSeq - 1,
+        );
+    if (changed.changes !== 1) return fail("execution_conflict", "Agent runtime checkpoint lost attempt CAS");
+    database.prepare(`INSERT INTO agent_execution_steps (execution_id, attempt_seq, step_seq, step_kind, canonical_tool_call_json, bounded_tool_result_json, dispatch_id, input_sha256, output_sha256, completed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)` ).run(input.executionId, input.attemptSeq, input.stepSeq, input.stepKind,
+      input.stepKind === "tool_call" ? canonicalJson(input.canonicalToolCall) : null,
+      input.stepKind === "tool_result" ? canonicalJson(input.boundedToolResult) : null,
+      input.stepKind === "tool_result" ? input.dispatchId : null,
+      input.inputSha256, input.outputSha256, new Date(input.now).toISOString());
+    const completedAt = new Date(input.now).toISOString();
+    const executionChanged = input.stepKind === "tool_result"
+      ? database.prepare(`UPDATE agent_executions
+          SET recovery_cursor = ?, action_category = 'model_generation',
+              tool_dispatch_phase = NULL, current_tool_id = NULL, updated_at = ?
+          WHERE id = ? AND current_attempt_seq = ? AND state = 'running'
+            AND action_category = 'tool_call' AND tool_dispatch_phase = 'finished'`).run(
+          input.stepSeq, completedAt, input.executionId, input.attemptSeq,
+        )
+      : input.stepKind === "tool_call"
+        ? database.prepare(`UPDATE agent_executions
+            SET recovery_cursor = ?, action_category = 'tool_call',
+                tool_dispatch_phase = 'not_started', current_tool_id = ?, updated_at = ?
+            WHERE id = ? AND current_attempt_seq = ? AND state = 'running'
+              AND action_category = 'model_generation' AND tool_dispatch_phase IS NULL
+              AND current_tool_id IS NULL`).run(
+            input.stepSeq, input.canonicalToolCall.toolId, completedAt,
+            input.executionId, input.attemptSeq,
+          )
+        : database.prepare(`UPDATE agent_executions SET recovery_cursor = ?, updated_at = ?
+          WHERE id = ? AND current_attempt_seq = ? AND state = 'running'`).run(
+          input.stepSeq, completedAt, input.executionId, input.attemptSeq,
+        );
+    if (executionChanged.changes !== 1) {
+      return fail("execution_conflict", "Agent runtime checkpoint lost execution transition CAS");
+    }
+    const execution = agentExecutionFromRuntimeRow({
+      ...current, status: "running",
+      ...(input.stepKind === "tool_result"
+        ? { actionCategory: "model_generation", toolDispatchPhase: null, currentToolId: null }
+        : input.stepKind === "tool_call"
+          ? { actionCategory: "tool_call", toolDispatchPhase: "not_started",
+              currentToolId: input.canonicalToolCall.toolId }
+        : {}),
+      recoveryCursor: input.stepSeq, updatedAt: completedAt,
+    });
+    const eventId = stableId("event", "agent-runtime-checkpoint", input.executionId,
+      String(input.attemptSeq), String(input.stepSeq));
+    const streamSeq = appendRoomEvent(database, {
+      eventId, roomId: String(current.roomId), actorId: String(current.agentId),
+      eventType: "room.agent_execution.changed", occurredAt: completedAt,
+      payload: execution as unknown as JsonValue,
+    });
+    appendRoomOutbox(database, eventId, String(current.roomId), streamSeq, completedAt,
+      "agent-runtime-checkpoint", input.executionId);
+    return execution;
+  });
+}
+
+export function completeAgentRuntimeExecutionDatabaseCommand(
+  database: DatabaseSync,
+  input: CompleteExecutionInput,
+  agentId: string,
+): AgentExecution {
+  return runAuthorityImmediateTransaction(database, () => {
+    const requestHash = createHash("sha256").update(canonicalJson({
+      messageId: input.messageId, body: input.body, sentAt: input.sentAt,
+    })).digest("hex");
+    const completion = database.prepare(
+      `SELECT request_hash AS requestHash, message_id AS messageId
+       FROM agent_execution_completions
+       WHERE execution_id = ? AND attempt_seq = ?`,
+    ).get(input.executionId, input.attemptSeq) as Record<string, unknown> | undefined;
+    if (completion !== undefined) {
+      if (completion.requestHash !== requestHash || completion.messageId !== input.messageId) {
+        return fail("idempotency_conflict", "Agent runtime completion payload changed");
+      }
+      const replay = readAgentRuntimeExecutionRow(database, input.executionId);
+      if (replay === undefined || replay.status !== "completed" || replay.agentId !== agentId ||
+          replay.resultMessageId !== input.messageId) {
+        return fail("storage_unavailable", "Agent runtime completion record is inconsistent");
+      }
+      return agentExecutionFromRuntimeRow(replay);
+    }
+    const current = readAgentRuntimeExecutionRow(database, input.executionId);
+    if (current !== undefined && current.agentId !== agentId) {
+      return fail("agent_capability_forbidden", "Agent runtime completion agent was rejected");
+    }
+    if (current === undefined || current.status !== "running" || current.agentId !== agentId ||
+        Number(current.currentAttemptSeq) !== input.attemptSeq ||
+        current.actionCategory !== "model_generation") {
+      return fail("execution_conflict", "Agent runtime completion lost execution CAS");
+    }
+    requireAgentCommandAuthority(database, String(current.agentId), String(current.roomId));
+    const completedAt = new Date(input.now).toISOString();
+    database.prepare(
+      `INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+       VALUES (?, ?, ?, 'agent', ?, ?)`,
+    ).run(input.messageId, String(current.roomId), String(current.agentId), input.body, input.sentAt);
+    database.prepare(
+      `INSERT INTO agent_execution_completions (
+         execution_id, attempt_seq, message_id, request_hash, completed_at
+       ) VALUES (?, ?, ?, ?, ?)`,
+    ).run(input.executionId, input.attemptSeq, input.messageId, requestHash, completedAt);
+    const attemptChanged = database.prepare(
+      `UPDATE agent_execution_attempts
+       SET state = 'completed', finished_at = ?
+       WHERE execution_id = ? AND attempt_seq = ? AND state = 'running'
+         AND action_category = 'model_generation'`,
+    ).run(completedAt, input.executionId, input.attemptSeq);
+    const executionChanged = database.prepare(
+      `UPDATE agent_executions
+       SET state = 'completed', completed_at = ?, updated_at = ?, result_message_id = ?
+       WHERE id = ? AND current_attempt_seq = ? AND state = 'running'
+         AND action_category = 'model_generation'`,
+    ).run(completedAt, completedAt, input.messageId, input.executionId, input.attemptSeq);
+    if (attemptChanged.changes !== 1 || executionChanged.changes !== 1) {
+      return fail("execution_conflict", "Agent runtime completion lost atomic CAS");
+    }
+    const message: Message = {
+      id: input.messageId, roomId: String(current.roomId), authorId: String(current.agentId),
+      authorKind: "agent", body: input.body, sentAt: input.sentAt,
+    };
+    const messageEventId = stableId("event", "agent-runtime-complete-message", input.messageId);
+    const messageStreamSeq = appendRoomEvent(database, {
+      eventId: messageEventId, roomId: String(current.roomId), actorId: String(current.agentId),
+      eventType: "room.message.accepted", occurredAt: completedAt,
+      payload: message as unknown as JsonValue,
+    });
+    appendRoomOutbox(database, messageEventId, String(current.roomId), messageStreamSeq, completedAt,
+      "agent-runtime-complete-message", input.messageId);
+    const execution = agentExecutionFromRuntimeRow({
+      ...current, status: "completed", finishedAt: completedAt, updatedAt: completedAt,
+      resultMessageId: input.messageId,
+    });
+    const executionEventId = stableId("event", "agent-runtime-complete", input.executionId,
+      String(input.attemptSeq));
+    const executionStreamSeq = appendRoomEvent(database, {
+      eventId: executionEventId, roomId: String(current.roomId), actorId: String(current.agentId),
+      eventType: "room.agent_execution.changed", occurredAt: completedAt,
+      payload: execution as unknown as JsonValue,
+    });
+    appendRoomOutbox(database, executionEventId, String(current.roomId), executionStreamSeq, completedAt,
+      "agent-runtime-complete", input.executionId);
+    return execution;
+  });
+}
+
+export function completeAgentRuntimeCompensationDatabaseCommand(
+  database: DatabaseSync,
+  input: CompleteCompensationInput,
+  agentId: string,
+): AgentExecution {
+  return runAuthorityImmediateTransaction(database, () => {
+    const requestHash = createHash("sha256").update(canonicalJson({
+      dispatchId: input.dispatchId,
+      grantId: input.grantId,
+      boundedToolResult: input.boundedToolResult,
+      inputSha256: input.inputSha256,
+      outputSha256: input.outputSha256,
+      closedSummary: input.closedSummary,
+      messageId: input.messageId,
+      body: input.body,
+      sentAt: input.sentAt,
+    })).digest("hex");
+    const completion = database.prepare(
+      `SELECT request_hash AS requestHash, message_id AS messageId
+       FROM agent_execution_completions
+       WHERE execution_id = ? AND attempt_seq = ?`,
+    ).get(input.executionId, input.attemptSeq) as Record<string, unknown> | undefined;
+    if (completion !== undefined) {
+      if (completion.requestHash !== requestHash || completion.messageId !== input.messageId) {
+        return fail("idempotency_conflict", "Agent runtime compensation completion payload changed");
+      }
+      const replay = readAgentRuntimeExecutionRow(database, input.executionId);
+      if (replay === undefined || replay.status !== "completed" || replay.agentId !== agentId ||
+          replay.resultMessageId !== input.messageId || replay.compensatesExecutionId === undefined) {
+        return fail("storage_unavailable", "Agent runtime compensation completion record is inconsistent");
+      }
+      return agentExecutionFromRuntimeRow(replay);
+    }
+    const current = readAgentRuntimeExecutionRow(database, input.executionId);
+    if (current !== undefined && current.agentId !== agentId) {
+      return fail("agent_capability_forbidden", "Agent runtime compensation completion agent was rejected");
+    }
+    const outputHash = createHash("sha256")
+      .update(canonicalJson(input.boundedToolResult))
+      .digest("hex");
+    const binding = database.prepare(
+      `SELECT dispatch.state AS dispatchState, dispatch.parameter_hash AS parameterHash,
+              dispatch.tool_id AS toolId, dispatch.dispatched_at AS dispatchedAt,
+              grant.confirmation_requirement AS confirmationRequirement,
+              grant.room_id AS roomId, grant.agent_id AS agentId,
+              step.step_kind AS stepKind
+       FROM agent_tool_dispatches AS dispatch
+       JOIN agent_tool_grants AS grant ON grant.id = dispatch.grant_id
+       JOIN agent_execution_steps AS step
+         ON step.execution_id = dispatch.execution_id
+        AND step.attempt_seq = dispatch.attempt_seq
+        AND step.step_seq = grant.tool_call_step_seq
+       JOIN agent_compensation_requests AS compensation
+         ON compensation.execution_id = dispatch.execution_id
+       WHERE dispatch.id = ? AND dispatch.execution_id = ? AND dispatch.attempt_seq = ?
+         AND dispatch.grant_id = ?`,
+    ).get(input.dispatchId, input.executionId, input.attemptSeq, input.grantId) as
+      Record<string, unknown> | undefined;
+    if (current === undefined || current.status !== "running" || current.agentId !== agentId ||
+        current.compensatesExecutionId === undefined ||
+        Number(current.currentAttemptSeq) !== input.attemptSeq ||
+        current.actionCategory !== "tool_call" || current.toolDispatchPhase !== "dispatched" ||
+        Number(current.recoveryCursor) !== 1 || binding === undefined ||
+        binding.dispatchState !== "dispatched" || binding.confirmationRequirement !== "side_effect" ||
+        binding.agentId !== agentId || binding.roomId !== current.roomId ||
+        binding.toolId !== current.currentToolId || binding.stepKind !== "tool_call" ||
+        binding.parameterHash !== input.inputSha256 || outputHash !== input.outputSha256) {
+      return fail("execution_conflict", "Agent runtime compensation completion binding was rejected");
+    }
+    requireAgentCommandAuthority(database, agentId, String(current.roomId));
+    const completedAt = new Date(input.now).toISOString();
+    const settled = database.prepare(
+      `UPDATE agent_tool_dispatches
+       SET state = 'succeeded', settled_at = ?, closed_summary = ?
+       WHERE id = ? AND state = 'dispatched'`,
+    ).run(completedAt, input.closedSummary, input.dispatchId);
+    if (settled.changes !== 1) {
+      return fail("execution_conflict", "Agent runtime compensation settlement lost CAS");
+    }
+    database.prepare(
+      `INSERT INTO agent_execution_steps (
+         execution_id, attempt_seq, step_seq, step_kind, bounded_tool_result_json,
+         dispatch_id, input_sha256, output_sha256, completed_at
+       ) VALUES (?, ?, 2, 'tool_result', ?, ?, ?, ?, ?)`,
+    ).run(input.executionId, input.attemptSeq, canonicalJson(input.boundedToolResult),
+      input.dispatchId, input.inputSha256, input.outputSha256, completedAt);
+    database.prepare(
+      `INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+       VALUES (?, ?, ?, 'agent', ?, ?)`,
+    ).run(input.messageId, String(current.roomId), agentId, input.body, input.sentAt);
+    database.prepare(
+      `INSERT INTO agent_execution_completions (
+         execution_id, attempt_seq, message_id, request_hash, completed_at
+       ) VALUES (?, ?, ?, ?, ?)`,
+    ).run(input.executionId, input.attemptSeq, input.messageId, requestHash, completedAt);
+    const attemptChanged = database.prepare(
+      `UPDATE agent_execution_attempts
+       SET state = 'completed', action_category = 'model_generation',
+           tool_dispatch_phase = NULL, recovery_cursor = 2, finished_at = ?
+       WHERE execution_id = ? AND attempt_seq = ? AND state = 'running'
+         AND action_category = 'tool_call' AND tool_dispatch_phase = 'dispatched'
+         AND recovery_cursor = 1`,
+    ).run(completedAt, input.executionId, input.attemptSeq);
+    const executionChanged = database.prepare(
+      `UPDATE agent_executions
+       SET state = 'completed', action_category = 'model_generation',
+           tool_dispatch_phase = NULL, current_tool_id = NULL, recovery_cursor = 2,
+           completed_at = ?, updated_at = ?, result_message_id = ?
+       WHERE id = ? AND current_attempt_seq = ? AND state = 'running'
+         AND action_category = 'tool_call' AND tool_dispatch_phase = 'dispatched'
+         AND recovery_cursor = 1`,
+    ).run(completedAt, completedAt, input.messageId, input.executionId, input.attemptSeq);
+    if (attemptChanged.changes !== 1 || executionChanged.changes !== 1) {
+      return fail("execution_conflict", "Agent runtime compensation completion lost atomic CAS");
+    }
+    const continued = agentExecutionFromRuntimeRow({
+      ...current,
+      status: "running",
+      actionCategory: "model_generation",
+      toolDispatchPhase: null,
+      currentToolId: null,
+      recoveryCursor: 2,
+      updatedAt: completedAt,
+    });
+    const dispatchEventId = stableId("event", "agent-runtime-tool-settlement", input.dispatchId);
+    const dispatchStreamSeq = appendRoomEvent(database, {
+      eventId: dispatchEventId,
+      roomId: String(current.roomId),
+      actorId: agentId,
+      eventType: "room.agent_tool_dispatch.changed",
+      occurredAt: completedAt,
+      payload: {
+        id: input.dispatchId,
+        executionId: input.executionId,
+        roomId: String(current.roomId),
+        agentId,
+        attemptSeq: input.attemptSeq,
+        grantId: input.grantId,
+        toolId: String(binding.toolId),
+        parameterHash: String(binding.parameterHash),
+        state: "succeeded",
+        dispatchedAt: String(binding.dispatchedAt),
+        settledAt: completedAt,
+        closedSummary: input.closedSummary,
+      },
+    });
+    appendRoomOutbox(database, dispatchEventId, String(current.roomId), dispatchStreamSeq,
+      completedAt, "agent-runtime-tool-settlement", input.dispatchId);
+    const checkpointEventId = stableId("event", "agent-runtime-checkpoint", input.executionId,
+      String(input.attemptSeq), "2");
+    const checkpointStreamSeq = appendRoomEvent(database, {
+      eventId: checkpointEventId,
+      roomId: String(current.roomId),
+      actorId: agentId,
+      eventType: "room.agent_execution.changed",
+      occurredAt: completedAt,
+      payload: continued as unknown as JsonValue,
+    });
+    appendRoomOutbox(database, checkpointEventId, String(current.roomId), checkpointStreamSeq,
+      completedAt, "agent-runtime-checkpoint", input.executionId);
+    const message: Message = {
+      id: input.messageId,
+      roomId: String(current.roomId),
+      authorId: agentId,
+      authorKind: "agent",
+      body: input.body,
+      sentAt: input.sentAt,
+    };
+    const messageEventId = stableId("event", "agent-runtime-complete-message", input.messageId);
+    const messageStreamSeq = appendRoomEvent(database, {
+      eventId: messageEventId,
+      roomId: String(current.roomId),
+      actorId: agentId,
+      eventType: "room.message.accepted",
+      occurredAt: completedAt,
+      payload: message as unknown as JsonValue,
+    });
+    appendRoomOutbox(database, messageEventId, String(current.roomId), messageStreamSeq,
+      completedAt, "agent-runtime-complete-message", input.messageId);
+    const execution = agentExecutionFromRuntimeRow({
+      ...continued,
+      status: "completed",
+      finishedAt: completedAt,
+      updatedAt: completedAt,
+      resultMessageId: input.messageId,
+    });
+    const executionEventId = stableId("event", "agent-runtime-complete", input.executionId,
+      String(input.attemptSeq));
+    const executionStreamSeq = appendRoomEvent(database, {
+      eventId: executionEventId,
+      roomId: String(current.roomId),
+      actorId: agentId,
+      eventType: "room.agent_execution.changed",
+      occurredAt: completedAt,
+      payload: execution as unknown as JsonValue,
+    });
+    appendRoomOutbox(database, executionEventId, String(current.roomId), executionStreamSeq,
+      completedAt, "agent-runtime-complete", input.executionId);
+    return execution;
+  });
+}
+
+export function claimNextAgentRuntimeDatabaseCommand(
+  database: DatabaseSync,
+  input: ClaimNextAgentRuntimeDatabaseCommandInput,
+): AgentExecution | undefined {
+  return runAuthorityImmediateTransaction(database, () => {
+    const active = database.prepare(
+      `SELECT 1 AS present FROM agent_executions
+       WHERE room_id = ? AND state = 'running' LIMIT 1`,
+    ).get(input.roomId);
+    if (active !== undefined) return undefined;
+    const current = database.prepare(
+      `SELECT execution.id, execution.room_id AS roomId,
+              execution.source_message_id AS sourceMessageId,
+              execution.requester_actor_id AS requesterId, execution.agent_id AS agentId,
+              execution.provider_id AS providerId, execution.model_id AS modelId,
+              execution.current_attempt_seq AS currentAttemptSeq, execution.retry_cycle AS retryCycle,
+              execution.retry_ordinal AS retryOrdinal, execution.recovery_cursor AS recoveryCursor,
+              execution.queued_at AS queuedAt
+       FROM agent_execution_attempts AS attempt
+       JOIN agent_executions AS execution
+         ON execution.id = attempt.execution_id AND execution.current_attempt_seq = attempt.attempt_seq
+       WHERE attempt.room_id = ? AND attempt.state = 'queued' AND execution.state = 'queued'
+         AND (attempt.next_retry_at IS NULL OR attempt.next_retry_at <= ?)
+       ORDER BY attempt.enqueue_stream_seq ASC LIMIT 1`,
+    ).get(input.roomId, input.now) as Record<string, unknown> | undefined;
+    if (current === undefined) return undefined;
+    if (current.agentId !== input.runtime.agentId) return undefined;
+    const startedAt = new Date(input.now).toISOString();
+    const updateExecution = database.prepare(
+      `UPDATE agent_executions
+       SET state = 'running', started_at = ?, updated_at = ?
+       WHERE id = ? AND state = 'queued' AND current_attempt_seq = ?`,
+    ).run(startedAt, startedAt, String(current.id), Number(current.currentAttemptSeq));
+    if (updateExecution.changes !== 1) return undefined;
+    const updateAttempt = database.prepare(
+      `UPDATE agent_execution_attempts
+       SET state = 'running', started_at = ?
+       WHERE execution_id = ? AND attempt_seq = ? AND state = 'queued'`,
+    ).run(startedAt, String(current.id), Number(current.currentAttemptSeq));
+    if (updateAttempt.changes !== 1) {
+      throw new Error("Agent runtime claim lost attempt CAS");
+    }
+    const execution = agentExecutionFromRuntimeRow({
+      ...current, status: "running", actionCategory: "model_generation", startedAt, updatedAt: startedAt,
+    });
+    const eventId = stableId("event", "agent-runtime-claim", String(current.id), String(current.currentAttemptSeq));
+    const streamSeq = appendRoomEvent(database, {
+      eventId, roomId: input.roomId, actorId: String(current.agentId),
+      eventType: "room.agent_execution.changed", occurredAt: startedAt,
+      payload: execution as unknown as JsonValue,
+    });
+    appendRoomOutbox(database, eventId, input.roomId, streamSeq, startedAt,
+      "agent-runtime-claim", String(current.id));
+    return execution;
+  });
+}
+
+export function invokeAgentRuntimeDatabaseCommand(
+  database: DatabaseSync,
+  input: InvokeAgentRuntimeDatabaseCommandInput,
+): AgentExecution {
+  return runAuthorityImmediateTransaction(database, () => {
+    const requesterId = input.context.kind === "human"
+      ? requireHumanSession(database, input.context, input.now)
+      : input.context.agent.actorId;
+    if (input.context.kind === "human") {
+      requireRoomMembership(database, requesterId, input.input.roomId);
+    } else {
+      requireAgentCommandAuthority(database, requesterId, input.input.roomId);
+    }
+    const source = database.prepare(
+      `SELECT room_id AS roomId, author_id AS authorId FROM messages WHERE id = ?`,
+    ).get(input.input.sourceMessageId) as Record<string, unknown> | undefined;
+    if (source?.roomId !== input.input.roomId || source.authorId !== requesterId) {
+      return fail("message_not_found", "Agent runtime source message was not authorized");
+    }
+    const target = database.prepare(
+      `SELECT actor.readiness, membership.participation, membership.configured_at AS configuredAt
+       FROM actors AS actor
+       JOIN room_memberships AS membership ON membership.actor_id = actor.id
+       WHERE actor.id = ? AND actor.kind = 'agent' AND membership.room_id = ?
+         AND membership.kind = 'agent'`,
+    ).get(input.input.targetAgentId, input.input.roomId) as Record<string, unknown> | undefined;
+    const directMandatory = input.input.intentKind === "direct_mention";
+    if (target === undefined || target.configuredAt === null ||
+        target.readiness === "paused" || target.readiness === "noauth" ||
+        (!directMandatory && target.participation !== "active")) {
+      return fail("room_member_not_found", "Agent runtime target Agent is not executable");
+    }
+    const existing = database.prepare(
+      `SELECT execution.id, execution.room_id AS roomId,
+              execution.source_message_id AS sourceMessageId,
+              execution.requester_actor_id AS requesterId, execution.agent_id AS agentId,
+              execution.state AS status, execution.action_category AS actionCategory,
+              execution.current_attempt_seq AS currentAttemptSeq, execution.retry_cycle AS retryCycle,
+              execution.retry_ordinal AS retryOrdinal, execution.provider_id AS providerId,
+              execution.model_id AS modelId, execution.recovery_cursor AS recoveryCursor,
+              execution.queued_at AS queuedAt, execution.updated_at AS updatedAt,
+              intent.intent_kind AS intentKind
+       FROM agent_invocation_intents AS intent
+       JOIN agent_executions AS execution ON execution.id = intent.execution_id
+       WHERE intent.source_message_id = ? AND intent.target_agent_id = ?`,
+    ).get(input.input.sourceMessageId, input.input.targetAgentId) as Record<string, unknown> | undefined;
+    if (existing !== undefined) {
+      if (existing.roomId !== input.input.roomId || existing.requesterId !== requesterId ||
+          existing.providerId !== input.input.providerId || existing.modelId !== input.input.modelId) {
+        return fail("idempotency_conflict", "Agent runtime invocation payload conflicts with its intent");
+      }
+      const priority = { routed_candidate: 1, structured_help: 2, direct_mention: 3 } as const;
+      const oldKind = existing.intentKind as keyof typeof priority;
+      if (priority[input.input.intentKind] > priority[oldKind]) {
+        database.prepare(
+          `UPDATE agent_invocation_intents SET intent_kind = ?
+           WHERE source_message_id = ? AND target_agent_id = ? AND intent_kind = ?`,
+        ).run(input.input.intentKind, input.input.sourceMessageId, input.input.targetAgentId, oldKind);
+      }
+      return agentExecutionFromRuntimeRow(existing);
+    }
+    if (input.maxQueuedPerRoom !== undefined) {
+      const outstanding = database.prepare(
+        `SELECT COUNT(*) AS count FROM agent_executions
+         WHERE room_id = ? AND state IN ('queued', 'running')`,
+      ).get(input.input.roomId) as { readonly count: number };
+      if (outstanding.count >= input.maxQueuedPerRoom + 1) {
+        return fail("target_busy", "Agent runtime room queue is full");
+      }
+    }
+    const acceptedAt = new Date(input.now).toISOString();
+    const executionId = stableId(
+      "agent-runtime-execution", input.input.sourceMessageId, input.input.targetAgentId,
+    );
+    database.prepare(
+      `INSERT INTO agent_executions (
+        id, room_id, agent_id, source_message_id, requester_actor_id, state,
+        action_category, tool_dispatch_phase, current_tool_id, current_attempt_seq,
+        retry_cycle, retry_ordinal, provider_id, model_id, recovery_cursor,
+        queued_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, 'queued', 'model_generation', NULL, NULL, 1, 1, 1, ?, ?, 0, ?, ?)`,
+    ).run(executionId, input.input.roomId, input.input.targetAgentId,
+      input.input.sourceMessageId, requesterId, input.input.providerId, input.input.modelId,
+      acceptedAt, acceptedAt);
+    const execution = agentExecutionFromRuntimeRow({
+      id: executionId, roomId: input.input.roomId, sourceMessageId: input.input.sourceMessageId,
+      requesterId, agentId: input.input.targetAgentId, status: "queued", actionCategory: "model_generation",
+      currentAttemptSeq: 1, retryCycle: 1, retryOrdinal: 1, providerId: input.input.providerId,
+      modelId: input.input.modelId, recoveryCursor: 0, queuedAt: acceptedAt, updatedAt: acceptedAt,
+    });
+    const eventId = stableId("event", "agent-runtime-invoke", executionId);
+    const streamSeq = appendRoomEvent(database, {
+      eventId, roomId: input.input.roomId, actorId: input.input.targetAgentId,
+      eventType: "room.agent_execution.changed", occurredAt: acceptedAt,
+      payload: execution as unknown as JsonValue,
+    });
+    database.prepare(
+      `INSERT INTO agent_execution_attempts (
+        execution_id, room_id, attempt_seq, retry_cycle, retry_ordinal, state, action_category,
+        tool_dispatch_phase, started_at, finished_at, error_code, next_retry_at, recovery_cursor,
+        enqueue_stream_seq
+      ) VALUES (?, ?, 1, 1, 1, 'queued', 'model_generation', NULL, NULL, NULL, NULL, NULL, 0, ?)`,
+    ).run(executionId, input.input.roomId, streamSeq);
+    database.prepare(
+      `INSERT INTO agent_invocation_intents (
+        id, source_message_id, target_agent_id, intent_kind, execution_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(stableId("agent-runtime-intent", input.input.sourceMessageId, input.input.targetAgentId),
+      input.input.sourceMessageId, input.input.targetAgentId, input.input.intentKind, executionId, acceptedAt);
+    appendRoomOutbox(database, eventId, input.input.roomId, streamSeq, acceptedAt,
+      "agent-runtime-invoke", executionId);
+    return execution;
+  });
 }
 
 export function executeAgentDatabaseCommand(

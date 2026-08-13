@@ -166,8 +166,12 @@ describe("T-0012 read receipts and agent judgements", () => {
     };
     const execution = {
       id: "execution-1", roomId: room.id, sourceMessageId: humanMessage.id,
-      requesterId: "human-lionel", agentId: "agent-data", toolName: "warehouse.query",
-      status: "running" as const, startedAt: "2026-08-07T09:02:00.000Z",
+      requesterId: "human-lionel", agentId: "agent-data", status: "running" as const,
+      actionCategory: "tool_call" as const, toolDispatchPhase: "dispatched" as const,
+      currentToolId: "warehouse.query", currentAttemptSeq: 1, retryCycle: 1, retryOrdinal: 1 as const,
+      providerId: "legacy-direct-tool", modelId: "no-model", recoveryCursor: 0,
+      queuedAt: "2026-08-07T09:02:00.000Z", startedAt: "2026-08-07T09:02:00.000Z",
+      updatedAt: "2026-08-07T09:02:00.000Z",
     };
     const signal = {
       id: "calibration-1", sourceMessageId: agentMessage.id, actorId: "human-lionel",
@@ -356,15 +360,65 @@ describe("T-0013 request and invocation addressing", () => {
       input: "检索历史",
     });
     expect(primitives.openItemsFor(room.id)).toHaveLength(1);
-    expect(execution.status).toBe("running");
+    expect(execution).toMatchObject({
+      status: "running", actionCategory: "tool_call", currentToolId: "long.running",
+      toolDispatchPhase: "dispatched", currentAttemptSeq: 1, retryCycle: 1, retryOrdinal: 1,
+      providerId: "legacy-direct-tool", modelId: "no-model", recoveryCursor: 0,
+    });
     expect(toolCalls).toContain("agent-research:long.running");
 
     primitives.interruptAgentExecution(execution.id);
-    await expect(primitives.waitForAgentExecution(execution.id)).resolves.toMatchObject({ status: "interrupted" });
+    await expect(primitives.waitForAgentExecution(execution.id)).resolves.toMatchObject({
+      status: "cancelled", toolDispatchPhase: "finished", cancellationReason: "human_interrupt",
+    });
     expect(primitives.agentReadiness("agent-research")).toBe("ready");
     expect(() => primitives.rejectAgentExecution(execution.id)).toThrowError(
       new CollaborationPrimitiveError("agent_cannot_reject_invocation"),
     );
+  });
+
+  it("cancels synchronously when an interrupted tool resolves after ignoring abort", async () => {
+    let resolveTool: ((value: string) => void) | undefined;
+    const primitives = createCollaborationPrimitives({
+      actors: [...humans, ...agents], rooms: [room], messages: [humanMessage, agentMessage],
+      now: () => "2026-08-07T09:02:00.000Z",
+      toolInvokers: {
+        "search.web": async () => await new Promise<string>((resolve) => { resolveTool = resolve; }),
+      },
+    });
+    const execution = primitives.addressAgent({
+      messageId: humanMessage.id, requesterId: "human-lionel", targetId: "agent-research",
+      toolName: "search.web", input: "ignore abort",
+    });
+    const interrupted = primitives.interruptAgentExecution(execution.id);
+    expect(interrupted).toMatchObject({
+      status: "cancelled", toolDispatchPhase: "finished", cancellationReason: "human_interrupt",
+    });
+    expect(primitives.agentReadiness("agent-research")).toBe("ready");
+    resolveTool?.("late result");
+    await expect(primitives.waitForAgentExecution(execution.id)).resolves.toMatchObject({
+      status: "cancelled", toolDispatchPhase: "finished", cancellationReason: "human_interrupt",
+    });
+    expect(primitives.agentReadiness("agent-research")).toBe("ready");
+  });
+
+  it("returns a persisted terminal execution without waiting for an abort-ignorant tool", async () => {
+    const primitives = createCollaborationPrimitives({
+      actors: [...humans, ...agents], rooms: [room], messages: [humanMessage, agentMessage],
+      now: () => "2026-08-07T09:02:00.000Z",
+      toolInvokers: {
+        "search.web": async () => await new Promise<string>(() => undefined),
+      },
+    });
+    const execution = primitives.addressAgent({
+      messageId: humanMessage.id, requesterId: "human-lionel", targetId: "agent-research",
+      toolName: "search.web", input: "never settles",
+    });
+    primitives.interruptAgentExecution(execution.id);
+    await expect(primitives.waitForAgentExecution(execution.id)).resolves.toMatchObject({
+      status: "cancelled", toolDispatchPhase: "finished", cancellationReason: "human_interrupt",
+    });
+    expect(primitives.agentReadiness("agent-research")).toBe("ready");
   });
 
   it("addresses only agents with @all and only online humans with owner-limited, rate-limited @here", () => {

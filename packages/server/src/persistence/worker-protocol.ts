@@ -1,11 +1,13 @@
 import {
   isActor,
+  isAgentExecution,
   isMessage,
   isRoomSyncResult,
   isSnapshotCompleted,
   isSnapshotVersion,
 } from "@native-im/core";
 import type {
+  AgentExecution,
   Actor,
   ManagedRoom,
   Message,
@@ -27,6 +29,31 @@ import {
 } from "./contracts.js";
 import type {
   AgentCollaborationCommand,
+  AgentInvocationInput,
+  AgentRuntimeRecovery,
+  AgentRuntimeRecoveryPage,
+  AgentRuntimeRecoveryPageInput,
+  AgentRuntimeProviderContext,
+  AgentRuntimeToolPlanEntry,
+  CommitExecutionStepInput,
+  CompleteExecutionInput,
+  CompleteCompensationInput,
+  FailExecutionInput,
+  ScheduleRetryInput,
+  InterruptExecutionInput,
+  PrepareToolInput,
+  ToolGrant,
+  ToolConfirmationInput,
+  ToolConfirmation,
+  ResumeConfirmedToolInput,
+  ResumedToolDispatch,
+  DispatchToolInput,
+  SettleToolInput,
+  ToolDispatch,
+  AgentRuntimeCompensationWork,
+  ResumeAgentRuntimeCompensationInput,
+  CancelForHumanFenceInput,
+  AgentRuntimeWorkerContext,
   AgentWorkerCommandContext,
   AuthenticatedSessionContext,
   AuthenticatedCommandContext,
@@ -45,6 +72,7 @@ import type {
 
 export type AuthorityWorkerErrorCode =
   | "actor_conflict"
+  | "agent_capability_forbidden"
   | "agent_missing_permission"
   | "agent_permissions_invalid"
   | "agent_required"
@@ -52,6 +80,7 @@ export type AuthorityWorkerErrorCode =
   | "authority_not_initialized"
   | "authority_worker_closed"
   | "calibration_source_invalid"
+  | "confirmation_expired"
   | "execution_conflict"
   | "execution_not_running"
   | "idempotency_conflict"
@@ -85,6 +114,7 @@ export type AuthorityWorkerErrorCode =
   | "snapshot_not_found"
   | "snapshot_stale"
   | "storage_unavailable"
+  | "target_busy"
   | "token_expired";
 
 export function isAuthorityWorkerErrorCode(
@@ -92,6 +122,7 @@ export function isAuthorityWorkerErrorCode(
 ): value is AuthorityWorkerErrorCode {
   switch (value) {
     case "actor_conflict":
+    case "agent_capability_forbidden":
     case "agent_missing_permission":
     case "agent_permissions_invalid":
     case "agent_required":
@@ -99,6 +130,7 @@ export function isAuthorityWorkerErrorCode(
     case "authority_not_initialized":
     case "authority_worker_closed":
     case "calibration_source_invalid":
+    case "confirmation_expired":
     case "execution_conflict":
     case "execution_not_running":
     case "idempotency_conflict":
@@ -132,6 +164,7 @@ export function isAuthorityWorkerErrorCode(
     case "snapshot_not_found":
     case "snapshot_stale":
     case "storage_unavailable":
+    case "target_busy":
     case "token_expired":
       return true;
     default:
@@ -204,6 +237,137 @@ export type AuthorityWorkerRequest =
       readonly context: AgentWorkerCommandContext;
       readonly command: AgentCollaborationCommand;
       readonly now: number;
+    }
+  | {
+      readonly type: "authority.agent-runtime.invoke";
+      readonly requestId: string;
+      readonly context: AuthenticatedCommandContext | AgentWorkerCommandContext;
+      readonly input: AgentInvocationInput;
+      readonly now: number;
+      readonly maxQueuedPerRoom?: number;
+    }
+  | {
+      readonly type: "authority.agent-runtime.claim-next";
+      readonly requestId: string;
+      readonly runtime: AgentRuntimeWorkerContext;
+      readonly roomId: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.agent-runtime.commit-step";
+      readonly requestId: string;
+      readonly runtime: AgentRuntimeWorkerContext;
+      readonly input: CommitExecutionStepInput;
+    }
+  | {
+      readonly type: "authority.agent-runtime.complete-execution";
+      readonly requestId: string;
+      readonly runtime: AgentRuntimeWorkerContext;
+      readonly input: CompleteExecutionInput;
+    }
+  | {
+      readonly type: "authority.agent-runtime.complete-compensation";
+      readonly requestId: string;
+      readonly runtime: AgentRuntimeWorkerContext;
+      readonly input: CompleteCompensationInput;
+    }
+  | {
+      readonly type: "authority.agent-runtime.schedule-retry";
+      readonly requestId: string;
+      readonly runtime: AgentRuntimeWorkerContext;
+      readonly input: ScheduleRetryInput;
+    }
+  | {
+      readonly type: "authority.agent-runtime.fail-execution";
+      readonly requestId: string;
+      readonly runtime: AgentRuntimeWorkerContext;
+      readonly input: FailExecutionInput;
+    }
+  | {
+      readonly type: "authority.agent-runtime.interrupt";
+      readonly requestId: string;
+      readonly context: AuthenticatedCommandContext;
+      readonly input: InterruptExecutionInput;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.agent-runtime.manual-retry";
+      readonly requestId: string;
+      readonly context: AuthenticatedCommandContext;
+      readonly executionId: string;
+      readonly now: number;
+      readonly maxQueuedPerRoom?: number;
+    }
+  | {
+      readonly type: "authority.agent-runtime.compensate";
+      readonly requestId: string;
+      readonly context: AuthenticatedCommandContext;
+      readonly executionId: string;
+      readonly dispatchId: string;
+      readonly now: number;
+      readonly maxQueuedPerRoom?: number;
+    }
+  | {
+      readonly type: "authority.agent-runtime.resume-compensation";
+      readonly requestId: string;
+      readonly runtime: AgentRuntimeWorkerContext;
+      readonly input: ResumeAgentRuntimeCompensationInput;
+    }
+  | {
+      readonly type: "authority.agent-runtime.recover";
+      readonly requestId: string;
+      readonly runtime: AgentRuntimeWorkerContext;
+      readonly input: AgentRuntimeRecoveryPageInput;
+    }
+  | {
+      readonly type: "authority.agent-runtime.prepare-tool";
+      readonly requestId: string;
+      readonly runtime: AgentRuntimeWorkerContext;
+      readonly input: PrepareToolInput;
+    }
+  | {
+      readonly type: "authority.agent-runtime.confirm-tool";
+      readonly requestId: string;
+      readonly context: AuthenticatedCommandContext;
+      readonly input: ToolConfirmationInput;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.agent-runtime.resume-confirmed-tool";
+      readonly requestId: string;
+      readonly runtime: AgentRuntimeWorkerContext;
+      readonly input: ResumeConfirmedToolInput;
+    }
+  | {
+      readonly type: "authority.agent-runtime.dispatch-tool";
+      readonly requestId: string;
+      readonly runtime: AgentRuntimeWorkerContext;
+      readonly input: DispatchToolInput;
+    }
+  | {
+      readonly type: "authority.agent-runtime.settle-tool";
+      readonly requestId: string;
+      readonly runtime: AgentRuntimeWorkerContext;
+      readonly input: SettleToolInput;
+    }
+  | {
+      readonly type: "authority.agent-runtime.read-execution";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly executionId: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.agent-runtime.load-provider-context";
+      readonly requestId: string;
+      readonly runtime: AgentRuntimeWorkerContext;
+      readonly executionId: string;
+    }
+  | {
+      readonly type: "authority.agent-runtime.cancel-human-fence";
+      readonly requestId: string;
+      readonly runtime: AgentRuntimeWorkerContext;
+      readonly input: CancelForHumanFenceInput;
     }
   | {
       readonly type: "authority.read-history";
@@ -317,12 +481,12 @@ export type AuthorityWorkerResponse =
   | {
       readonly type: "authority.ready";
       readonly requestId: string;
-      readonly schemaVersion: 5;
+      readonly schemaVersion: 6;
     }
   | {
       readonly type: "authority.schema";
       readonly requestId: string;
-      readonly schemaVersion: 5;
+      readonly schemaVersion: 6;
     }
   | {
       readonly type: "authority.legacy-imported";
@@ -374,6 +538,102 @@ export type AuthorityWorkerResponse =
       readonly type: "authority.command-acknowledged";
       readonly requestId: string;
       readonly acknowledgement: CommandAcknowledgement;
+    }
+  | {
+      readonly type: "authority.agent-runtime.invoked";
+      readonly requestId: string;
+      readonly execution: AgentExecution;
+    }
+  | {
+      readonly type: "authority.agent-runtime.claimed";
+      readonly requestId: string;
+      readonly execution?: AgentExecution;
+    }
+  | {
+      readonly type: "authority.agent-runtime.step-committed";
+      readonly requestId: string;
+      readonly execution: AgentExecution;
+    }
+  | {
+      readonly type: "authority.agent-runtime.execution-completed";
+      readonly requestId: string;
+      readonly execution: AgentExecution;
+    }
+  | {
+      readonly type: "authority.agent-runtime.compensation-completed";
+      readonly requestId: string;
+      readonly execution: AgentExecution;
+    }
+  | {
+      readonly type: "authority.agent-runtime.retry-scheduled";
+      readonly requestId: string;
+      readonly execution: AgentExecution;
+    }
+  | {
+      readonly type: "authority.agent-runtime.execution-failed";
+      readonly requestId: string;
+      readonly execution: AgentExecution;
+    }
+  | {
+      readonly type: "authority.agent-runtime.interrupted";
+      readonly requestId: string;
+      readonly execution: AgentExecution;
+    }
+  | {
+      readonly type: "authority.agent-runtime.manual-retried";
+      readonly requestId: string;
+      readonly execution: AgentExecution;
+    }
+  | {
+      readonly type: "authority.agent-runtime.compensation-accepted";
+      readonly requestId: string;
+      readonly execution: AgentExecution;
+    }
+  | {
+      readonly type: "authority.agent-runtime.compensation-resumed";
+      readonly requestId: string;
+      readonly work: AgentRuntimeCompensationWork;
+    }
+  | {
+      readonly type: "authority.agent-runtime.recovered";
+      readonly requestId: string;
+      readonly page: AgentRuntimeRecoveryPage;
+    }
+  | {
+      readonly type: "authority.agent-runtime.tool-prepared";
+      readonly requestId: string;
+      readonly grant: ToolGrant;
+    }
+  | {
+      readonly type: "authority.agent-runtime.tool-confirmed";
+      readonly requestId: string;
+      readonly confirmation: ToolConfirmation;
+    }
+  | {
+      readonly type: "authority.agent-runtime.confirmed-tool-resumed";
+      readonly requestId: string;
+      readonly resumed: ResumedToolDispatch;
+    }
+  | {
+      readonly type: "authority.agent-runtime.tool-dispatched" | "authority.agent-runtime.tool-settled";
+      readonly requestId: string;
+      readonly dispatch: ToolDispatch;
+    }
+  | {
+      readonly type: "authority.agent-runtime.execution";
+      readonly requestId: string;
+      readonly execution: AgentExecution;
+    }
+  | {
+      readonly type: "authority.agent-runtime.provider-context";
+      readonly requestId: string;
+      readonly executionId: string;
+      readonly context: AgentRuntimeProviderContext;
+    }
+  | {
+      readonly type: "authority.agent-runtime.human-fence-cancelled";
+      readonly requestId: string;
+      readonly execution: AgentExecution;
     }
   | {
       readonly type: "authority.history";
@@ -652,6 +912,233 @@ function isAgentWorkerCommandContext(value: unknown): value is AgentWorkerComman
   );
 }
 
+function isAgentInvocationInput(value: unknown): value is AgentInvocationInput {
+  return isRecord(value) &&
+    hasExactKeys(value, [
+      "roomId", "sourceMessageId", "targetAgentId", "intentKind", "providerId", "modelId",
+    ]) &&
+    isText(value.roomId) && isText(value.sourceMessageId) && isText(value.targetAgentId) &&
+    (value.intentKind === "direct_mention" ||
+      value.intentKind === "structured_help" ||
+      value.intentKind === "routed_candidate") &&
+    isText(value.providerId) && isText(value.modelId);
+}
+
+function isAgentRuntimeWorkerContext(value: unknown): value is AgentRuntimeWorkerContext {
+  return isRecord(value) && hasExactKeys(value, ["kind", "runtimeId", "agentId"]) &&
+    value.kind === "runtime" && isText(value.runtimeId) && isText(value.agentId);
+}
+
+function isSha256(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+
+function isAgentRuntimeToolPlanEntry(value: unknown): value is AgentRuntimeToolPlanEntry {
+  return isRecord(value) && hasExactKeys(value, ["callId", "toolId", "parameters"]) &&
+    isText(value.callId) && isText(value.toolId) && isJsonValue(value.parameters);
+}
+
+function isCommitExecutionStepInput(value: unknown): value is CommitExecutionStepInput {
+  if (!isRecord(value)) return false;
+  const common = isText(value.executionId) &&
+    isNonNegativeSafeInteger(value.attemptSeq) && value.attemptSeq > 0 &&
+    isNonNegativeSafeInteger(value.stepSeq) && value.stepSeq > 0 &&
+    isSha256(value.inputSha256) && isSha256(value.outputSha256) &&
+    isNonNegativeSafeInteger(value.now);
+  if (!common) return false;
+  if (value.stepKind === "model_generation") {
+    return hasExactKeys(value, [
+      "executionId", "attemptSeq", "stepSeq", "stepKind", "inputSha256", "outputSha256", "now",
+    ]);
+  }
+  if (value.stepKind === "tool_call") {
+    return hasExactKeys(value, [
+      "executionId", "attemptSeq", "stepSeq", "stepKind", "canonicalToolCall",
+      "inputSha256", "outputSha256", "now",
+    ]) && isRecord(value.canonicalToolCall) &&
+      [["toolId"], ["toolId", "parameters"], ["toolId", "parameters", "remainingCalls"]]
+        .some((keys) => hasExactKeys(value.canonicalToolCall as Record<string, unknown>, keys)) &&
+      isText(value.canonicalToolCall.toolId) &&
+      (!Object.hasOwn(value.canonicalToolCall, "parameters") ||
+       isJsonValue(value.canonicalToolCall.parameters)) &&
+      (!Object.hasOwn(value.canonicalToolCall, "remainingCalls") ||
+       (Array.isArray(value.canonicalToolCall.remainingCalls) &&
+        value.canonicalToolCall.remainingCalls.every(isAgentRuntimeToolPlanEntry)));
+  }
+  return value.stepKind === "tool_result" && hasExactKeys(value, [
+    "executionId", "attemptSeq", "stepSeq", "stepKind", "dispatchId", "boundedToolResult",
+    "inputSha256", "outputSha256", "now",
+  ]) && isText(value.dispatchId) && value.boundedToolResult !== null && isJsonValue(value.boundedToolResult);
+}
+
+function isScheduleRetryInput(value: unknown): value is ScheduleRetryInput {
+  return isRecord(value) && hasExactKeys(value, [
+    "executionId", "attemptSeq", "errorCode", "now",
+  ]) && isText(value.executionId) && isNonNegativeSafeInteger(value.attemptSeq) && value.attemptSeq > 0 &&
+    (value.errorCode === "rate_limited" || value.errorCode === "upstream_timeout" ||
+      value.errorCode === "upstream_unavailable" || value.errorCode === "target_busy" ||
+      value.errorCode === "runtime_restarted") &&
+    isNonNegativeSafeInteger(value.now);
+}
+
+function isAgentRuntimeRecovery(value: unknown): value is AgentRuntimeRecovery {
+  return isRecord(value) &&
+    (hasExactKeys(value, ["execution"]) || hasExactKeys(value, ["execution", "nextRetryAt"])) &&
+    isAgentExecution(value.execution) &&
+    (!Object.hasOwn(value, "nextRetryAt") || isNonNegativeSafeInteger(value.nextRetryAt));
+}
+
+function isAgentRuntimeRecoveryPageInput(value: unknown): value is AgentRuntimeRecoveryPageInput {
+  if (!isRecord(value)) return false;
+  const keys = ["now", "limit", ...(Object.hasOwn(value, "cursor") ? ["cursor"] : [])];
+  return hasExactKeys(value, keys) && isNonNegativeSafeInteger(value.now) &&
+    isNonNegativeSafeInteger(value.limit) && value.limit > 0 && value.limit <= 256 &&
+    (!Object.hasOwn(value, "cursor") || isText(value.cursor));
+}
+
+function isAgentRuntimeRecoveryPage(value: unknown): value is AgentRuntimeRecoveryPage {
+  if (!isRecord(value)) return false;
+  const keys = ["recoveries", ...(Object.hasOwn(value, "nextCursor") ? ["nextCursor"] : [])];
+  return hasExactKeys(value, keys) && Array.isArray(value.recoveries) &&
+    value.recoveries.length <= 256 && value.recoveries.every(isAgentRuntimeRecovery) &&
+    (!Object.hasOwn(value, "nextCursor") || isText(value.nextCursor));
+}
+
+function isFailExecutionInput(value: unknown): value is FailExecutionInput {
+  return isRecord(value) && hasExactKeys(value, [
+    "executionId", "attemptSeq", "errorCode", "now",
+  ]) && isText(value.executionId) && isNonNegativeSafeInteger(value.attemptSeq) && value.attemptSeq > 0 &&
+    (value.errorCode === "provider_cancelled" ||
+      value.errorCode === "provider_input_too_large" ||
+      value.errorCode === "provider_invalid_request" ||
+      value.errorCode === "provider_invalid_response" ||
+      value.errorCode === "provider_not_configured" ||
+      value.errorCode === "provider_failure" ||
+      value.errorCode === "provider_response_too_large" ||
+      value.errorCode === "provider_unauthorized" ||
+      value.errorCode === "tool_failure") &&
+    isNonNegativeSafeInteger(value.now);
+}
+
+function isCompleteExecutionInput(value: unknown): value is CompleteExecutionInput {
+  return isRecord(value) && hasExactKeys(value, [
+    "executionId", "attemptSeq", "messageId", "body", "sentAt", "now",
+  ]) && isText(value.executionId) && isNonNegativeSafeInteger(value.attemptSeq) && value.attemptSeq > 0 &&
+    isText(value.messageId) && isText(value.body) && typeof value.sentAt === "string" &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value.sentAt) &&
+    isNonNegativeSafeInteger(value.now);
+}
+
+function isCompleteCompensationInput(value: unknown): value is CompleteCompensationInput {
+  return isRecord(value) && hasExactKeys(value, [
+    "executionId", "attemptSeq", "dispatchId", "grantId", "boundedToolResult",
+    "inputSha256", "outputSha256", "closedSummary", "messageId", "body", "sentAt", "now",
+  ]) && isText(value.executionId) && isNonNegativeSafeInteger(value.attemptSeq) &&
+    value.attemptSeq > 0 && isText(value.dispatchId) && isText(value.grantId) &&
+    value.boundedToolResult !== null && isJsonValue(value.boundedToolResult) &&
+    isSha256(value.inputSha256) && isSha256(value.outputSha256) &&
+    isText(value.closedSummary) && Buffer.byteLength(value.closedSummary, "utf8") <= 65_536 &&
+    isText(value.messageId) && isText(value.body) &&
+    typeof value.sentAt === "string" &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value.sentAt) &&
+    isNonNegativeSafeInteger(value.now);
+}
+
+function isInterruptExecutionInput(value: unknown): value is InterruptExecutionInput {
+  return isRecord(value) && hasExactKeys(value, ["executionId", "reason"]) &&
+    isText(value.executionId) &&
+    (value.reason === "requested_by_requester" || value.reason === "requested_by_room_manager");
+}
+
+function isPrepareToolInput(value: unknown): value is PrepareToolInput {
+  return isRecord(value) && hasExactKeys(value, [
+    "executionId", "attemptSeq", "toolCallStepSeq", "toolId", "parameterHash", "toolPlanHash", "confirmationRequirement", "now", "expiresAt",
+  ]) && isText(value.executionId) && isNonNegativeSafeInteger(value.attemptSeq) && value.attemptSeq > 0 &&
+    isNonNegativeSafeInteger(value.toolCallStepSeq) && value.toolCallStepSeq > 0 &&
+    isText(value.toolId) && isSha256(value.parameterHash) && isSha256(value.toolPlanHash) &&
+    (value.confirmationRequirement === "read_only" || value.confirmationRequirement === "side_effect") &&
+    isNonNegativeSafeInteger(value.now) && isNonNegativeSafeInteger(value.expiresAt) && value.expiresAt > value.now;
+}
+
+function isToolConfirmationInput(value: unknown): value is ToolConfirmationInput {
+  return isRecord(value) && hasExactKeys(value, [
+    "executionId", "attemptSeq", "toolId", "parameterHash", "target", "impact", "reversibility", "expiresAt",
+  ]) && isText(value.executionId) && isNonNegativeSafeInteger(value.attemptSeq) && value.attemptSeq > 0 &&
+    isText(value.toolId) && isSha256(value.parameterHash) && isText(value.target) && isText(value.impact) &&
+    (value.reversibility === "compensatable" || value.reversibility === "irreversible") &&
+    isNonNegativeSafeInteger(value.expiresAt);
+}
+
+function isDispatchToolInput(value: unknown): value is DispatchToolInput {
+  if (!isRecord(value)) return false;
+  const keys = ["executionId", "attemptSeq", "grantId", "toolId", "parameterHash", "confirmationRequirement", "now",
+    ...(Object.hasOwn(value, "confirmationId") ? ["confirmationId"] : [])];
+  return hasExactKeys(value, keys) && isText(value.executionId) &&
+    isNonNegativeSafeInteger(value.attemptSeq) && value.attemptSeq > 0 && isText(value.grantId) &&
+    isText(value.toolId) && isSha256(value.parameterHash) && isNonNegativeSafeInteger(value.now) &&
+    ((value.confirmationRequirement === "read_only" && !Object.hasOwn(value, "confirmationId")) ||
+      (value.confirmationRequirement === "side_effect" && isText(value.confirmationId)));
+}
+
+function isSettleToolInput(value: unknown): value is SettleToolInput {
+  if (!isRecord(value)) return false;
+  const keys = ["dispatchId", "executionId", "attemptSeq", "grantId", "outcome", "now",
+    ...(Object.hasOwn(value, "closedSummary") ? ["closedSummary"] : []),
+    ...(Object.hasOwn(value, "sealedCompensation") ? ["sealedCompensation"] : [])];
+  return hasExactKeys(value, keys) && isText(value.dispatchId) && isText(value.executionId) &&
+    isNonNegativeSafeInteger(value.attemptSeq) && value.attemptSeq > 0 && isText(value.grantId) &&
+    (value.outcome === "succeeded" || value.outcome === "failed" || value.outcome === "outcome_unknown") &&
+    (!Object.hasOwn(value, "closedSummary") ||
+      (isText(value.closedSummary) && Buffer.byteLength(value.closedSummary, "utf8") <= 65_536)) &&
+    (!Object.hasOwn(value, "sealedCompensation") ||
+      (isText(value.sealedCompensation) && Buffer.byteLength(value.sealedCompensation, "utf8") <= 65_536)) &&
+    isNonNegativeSafeInteger(value.now);
+}
+
+function isToolGrant(value: unknown): value is ToolGrant {
+  if (!isRecord(value)) return false;
+  const keys = ["id", "executionId", "attemptSeq", "toolCallStepSeq", "agentId", "roomId", "toolId", "parameterHash", "toolPlanHash", "confirmationRequirement", "issuedAt", "expiresAt",
+    ...(Object.hasOwn(value, "consumedAt") ? ["consumedAt"] : [])];
+  return hasExactKeys(value, keys) && isText(value.id) && isText(value.executionId) &&
+    isNonNegativeSafeInteger(value.attemptSeq) && value.attemptSeq > 0 &&
+    isNonNegativeSafeInteger(value.toolCallStepSeq) && value.toolCallStepSeq > 0 && isText(value.agentId) &&
+    isText(value.roomId) && isText(value.toolId) && isSha256(value.parameterHash) && isSha256(value.toolPlanHash) &&
+    (value.confirmationRequirement === "read_only" || value.confirmationRequirement === "side_effect") &&
+    isText(value.issuedAt) && isText(value.expiresAt) &&
+    (!Object.hasOwn(value, "consumedAt") || isText(value.consumedAt));
+}
+
+function isToolConfirmation(value: unknown): value is ToolConfirmation {
+  if (!isRecord(value)) return false;
+  const keys = ["id", "executionId", "attemptSeq", "grantId", "toolId", "parameterHash", "toolPlanHash", "roomId", "humanPrincipalId",
+    "sessionFamilyId", "target", "impact", "reversibility", "expiresAt",
+    ...(Object.hasOwn(value, "consumedAt") ? ["consumedAt"] : [])];
+  return hasExactKeys(value, keys) && isText(value.id) && isText(value.executionId) &&
+    isNonNegativeSafeInteger(value.attemptSeq) && value.attemptSeq > 0 && isText(value.grantId) && isText(value.toolId) &&
+    isSha256(value.parameterHash) && isSha256(value.toolPlanHash) &&
+    isText(value.roomId) && isText(value.humanPrincipalId) &&
+    isText(value.sessionFamilyId) && isText(value.target) && isText(value.impact) &&
+    (value.reversibility === "compensatable" || value.reversibility === "irreversible") &&
+    isText(value.expiresAt) && (!Object.hasOwn(value, "consumedAt") || isText(value.consumedAt));
+}
+
+function isToolDispatch(value: unknown): value is ToolDispatch {
+  if (!isRecord(value)) return false;
+  const keys = ["id", "executionId", "attemptSeq", "grantId", "toolId", "parameterHash", "state", "dispatchedAt",
+    ...(Object.hasOwn(value, "settledAt") ? ["settledAt"] : []),
+    ...(Object.hasOwn(value, "closedSummary") ? ["closedSummary"] : []),
+    ...(Object.hasOwn(value, "sealedCompensation") ? ["sealedCompensation"] : [])];
+  return hasExactKeys(value, keys) && isText(value.id) && isText(value.executionId) &&
+    isNonNegativeSafeInteger(value.attemptSeq) && value.attemptSeq > 0 && isText(value.grantId) &&
+    isText(value.toolId) && isSha256(value.parameterHash) &&
+    (value.state === "dispatched" || value.state === "succeeded" || value.state === "failed" || value.state === "outcome_unknown") &&
+    isText(value.dispatchedAt) && (!Object.hasOwn(value, "settledAt") || isText(value.settledAt)) &&
+    (!Object.hasOwn(value, "closedSummary") ||
+      (isText(value.closedSummary) && Buffer.byteLength(value.closedSummary, "utf8") <= 65_536)) &&
+    (!Object.hasOwn(value, "sealedCompensation") ||
+      (isText(value.sealedCompensation) && Buffer.byteLength(value.sealedCompensation, "utf8") <= 65_536));
+}
+
 function isHumanCommand(value: unknown): value is HumanCollaborationCommand | RoomGovernanceCommand {
   const parsed = parsePersistentCommand(value);
   if (!parsed.ok) {
@@ -688,6 +1175,33 @@ function isJsonValue(value: unknown): boolean {
     return value.every(isJsonValue);
   }
   return isRecord(value) && Object.values(value).every(isJsonValue);
+}
+
+function isAgentRuntimeProviderContext(value: unknown): value is AgentRuntimeProviderContext {
+  if (!isRecord(value) ||
+      !hasExactKeys(value, ["invocation", "visibleConversation", "committedSteps"]) ||
+      !isRecord(value.invocation) ||
+      !hasExactKeys(value.invocation, [
+        "sourceMessageId", "requesterActorId", "targetAgentId", "intentKind",
+      ]) ||
+      !isText(value.invocation.sourceMessageId) ||
+      !isText(value.invocation.requesterActorId) ||
+      !isText(value.invocation.targetAgentId) ||
+      !["direct_mention", "structured_help", "routed_candidate"].includes(
+        String(value.invocation.intentKind),
+      ) ||
+      !Array.isArray(value.visibleConversation) ||
+      !Array.isArray(value.committedSteps)) return false;
+  if (!value.visibleConversation.every((entry) => isRecord(entry) &&
+      hasExactKeys(entry, ["messageId", "actorId", "body"]) &&
+      isText(entry.messageId) && isText(entry.actorId) && typeof entry.body === "string")) {
+    return false;
+  }
+  return value.committedSteps.every((step) => isRecord(step) &&
+    hasExactKeys(step, ["stepSeq", "kind", "modelInput"]) &&
+    isNonNegativeSafeInteger(step.stepSeq) && step.stepSeq > 0 &&
+    ["model_generation", "tool_call", "tool_result"].includes(String(step.kind)) &&
+    isJsonValue(step.modelInput));
 }
 
 function isCommandAcknowledgement(value: unknown): value is CommandAcknowledgement {
@@ -864,6 +1378,98 @@ export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWork
         isAgentCommand(value.command) &&
         isNonNegativeSafeInteger(value.now)
       );
+    case "authority.agent-runtime.invoke":
+      return (
+        hasExactKeys(value, ["type", "requestId", "context", "input", "now"]) ||
+        hasExactKeys(value, ["type", "requestId", "context", "input", "now", "maxQueuedPerRoom"])
+      ) &&
+        (isAuthenticatedCommandContext(value.context) || isAgentWorkerCommandContext(value.context)) &&
+        isAgentInvocationInput(value.input) && isNonNegativeSafeInteger(value.now) &&
+        (!Object.hasOwn(value, "maxQueuedPerRoom") ||
+          (isNonNegativeSafeInteger(value.maxQueuedPerRoom) && value.maxQueuedPerRoom > 0));
+    case "authority.agent-runtime.claim-next":
+      return hasExactKeys(value, ["type", "requestId", "runtime", "roomId", "now"]) &&
+        isAgentRuntimeWorkerContext(value.runtime) && isText(value.roomId) &&
+        isNonNegativeSafeInteger(value.now);
+    case "authority.agent-runtime.commit-step":
+      return hasExactKeys(value, ["type", "requestId", "runtime", "input"]) &&
+        isAgentRuntimeWorkerContext(value.runtime) && isCommitExecutionStepInput(value.input);
+    case "authority.agent-runtime.complete-execution":
+      return hasExactKeys(value, ["type", "requestId", "runtime", "input"]) &&
+        isAgentRuntimeWorkerContext(value.runtime) && isCompleteExecutionInput(value.input);
+    case "authority.agent-runtime.complete-compensation":
+      return hasExactKeys(value, ["type", "requestId", "runtime", "input"]) &&
+        isAgentRuntimeWorkerContext(value.runtime) && isCompleteCompensationInput(value.input);
+    case "authority.agent-runtime.schedule-retry":
+      return hasExactKeys(value, ["type", "requestId", "runtime", "input"]) &&
+        isAgentRuntimeWorkerContext(value.runtime) && isScheduleRetryInput(value.input);
+    case "authority.agent-runtime.fail-execution":
+      return hasExactKeys(value, ["type", "requestId", "runtime", "input"]) &&
+        isAgentRuntimeWorkerContext(value.runtime) && isFailExecutionInput(value.input);
+    case "authority.agent-runtime.interrupt":
+      return hasExactKeys(value, ["type", "requestId", "context", "input", "now"]) &&
+        isAuthenticatedCommandContext(value.context) && isInterruptExecutionInput(value.input) &&
+        isNonNegativeSafeInteger(value.now);
+    case "authority.agent-runtime.manual-retry":
+      return (hasExactKeys(value, ["type", "requestId", "context", "executionId", "now"]) ||
+        hasExactKeys(value, ["type", "requestId", "context", "executionId", "now", "maxQueuedPerRoom"])) &&
+        isAuthenticatedCommandContext(value.context) && isText(value.executionId) &&
+        isNonNegativeSafeInteger(value.now) &&
+        (!Object.hasOwn(value, "maxQueuedPerRoom") ||
+         (isNonNegativeSafeInteger(value.maxQueuedPerRoom) && value.maxQueuedPerRoom > 0));
+    case "authority.agent-runtime.compensate":
+      return (hasExactKeys(value, ["type", "requestId", "context", "executionId", "dispatchId", "now"]) ||
+        hasExactKeys(value, ["type", "requestId", "context", "executionId", "dispatchId", "now", "maxQueuedPerRoom"])) &&
+        isAuthenticatedCommandContext(value.context) && isText(value.executionId) && isText(value.dispatchId) &&
+        isNonNegativeSafeInteger(value.now) &&
+        (!Object.hasOwn(value, "maxQueuedPerRoom") ||
+         (isNonNegativeSafeInteger(value.maxQueuedPerRoom) && value.maxQueuedPerRoom > 0));
+    case "authority.agent-runtime.resume-compensation":
+      return hasExactKeys(value, ["type", "requestId", "runtime", "input"]) &&
+        isAgentRuntimeWorkerContext(value.runtime) && isRecord(value.input) &&
+        hasExactKeys(value.input, ["executionId", "attemptSeq", "now"]) &&
+        isText(value.input.executionId) && isNonNegativeSafeInteger(value.input.attemptSeq) &&
+        value.input.attemptSeq > 0 &&
+        isNonNegativeSafeInteger(value.input.now);
+    case "authority.agent-runtime.recover":
+      return hasExactKeys(value, ["type", "requestId", "runtime", "input"]) &&
+        isAgentRuntimeWorkerContext(value.runtime) && isAgentRuntimeRecoveryPageInput(value.input);
+    case "authority.agent-runtime.prepare-tool":
+      return hasExactKeys(value, ["type", "requestId", "runtime", "input"]) &&
+        isAgentRuntimeWorkerContext(value.runtime) && isPrepareToolInput(value.input);
+    case "authority.agent-runtime.confirm-tool":
+      return hasExactKeys(value, ["type", "requestId", "context", "input", "now"]) &&
+        isAuthenticatedCommandContext(value.context) && isToolConfirmationInput(value.input) &&
+        isNonNegativeSafeInteger(value.now) && value.input.expiresAt > value.now;
+    case "authority.agent-runtime.resume-confirmed-tool":
+      return hasExactKeys(value, ["type", "requestId", "runtime", "input"]) &&
+        isAgentRuntimeWorkerContext(value.runtime) && isRecord(value.input) &&
+        hasExactKeys(value.input, [
+          "confirmationId", "executionId", "attemptSeq", "roomId", "toolId", "parameterHash", "toolPlanHash", "now",
+        ]) && isText(value.input.confirmationId) && isText(value.input.executionId) &&
+        isNonNegativeSafeInteger(value.input.attemptSeq) && value.input.attemptSeq > 0 &&
+        isText(value.input.roomId) && isText(value.input.toolId) &&
+        isSha256(value.input.parameterHash) && isSha256(value.input.toolPlanHash) &&
+        isNonNegativeSafeInteger(value.input.now);
+    case "authority.agent-runtime.dispatch-tool":
+      return hasExactKeys(value, ["type", "requestId", "runtime", "input"]) &&
+        isAgentRuntimeWorkerContext(value.runtime) && isDispatchToolInput(value.input);
+    case "authority.agent-runtime.settle-tool":
+      return hasExactKeys(value, ["type", "requestId", "runtime", "input"]) &&
+        isAgentRuntimeWorkerContext(value.runtime) && isSettleToolInput(value.input);
+    case "authority.agent-runtime.read-execution":
+      return hasExactKeys(value, ["type", "requestId", "context", "executionId", "now"]) &&
+        isAuthenticatedSessionContext(value.context) && isText(value.executionId) &&
+        isNonNegativeSafeInteger(value.now);
+    case "authority.agent-runtime.load-provider-context":
+      return hasExactKeys(value, ["type", "requestId", "runtime", "executionId"]) &&
+        isAgentRuntimeWorkerContext(value.runtime) && isText(value.executionId);
+    case "authority.agent-runtime.cancel-human-fence":
+      return hasExactKeys(value, ["type", "requestId", "runtime", "input"]) &&
+        isAgentRuntimeWorkerContext(value.runtime) && isRecord(value.input) &&
+        hasExactKeys(value.input, ["executionId", "fenceMessageId", "now"]) &&
+        isText(value.input.executionId) && isText(value.input.fenceMessageId) &&
+        isNonNegativeSafeInteger(value.input.now);
     case "authority.read-history":
       return hasExactKeys(value, ["type", "requestId", "context", "roomId", "now"]) &&
         isAuthenticatedSessionContext(value.context) && isText(value.roomId) &&
@@ -950,7 +1556,7 @@ export function isAuthorityWorkerResponse(
     case "authority.schema":
       return (
         hasExactKeys(value, ["type", "requestId", "schemaVersion"]) &&
-        value.schemaVersion === 5
+        value.schemaVersion === 6
       );
     case "authority.closed":
       return hasExactKeys(value, ["type", "requestId"]);
@@ -983,6 +1589,59 @@ export function isAuthorityWorkerResponse(
         hasExactKeys(value, ["type", "requestId", "acknowledgement"]) &&
         isCommandAcknowledgement(value.acknowledgement)
       );
+    case "authority.agent-runtime.invoked":
+      return hasExactKeys(value, ["type", "requestId", "execution"]) &&
+        isAgentExecution(value.execution);
+    case "authority.agent-runtime.claimed":
+      return hasExactKeys(value, ["type", "requestId", ...(Object.hasOwn(value, "execution") ? ["execution"] : [])]) &&
+        (!Object.hasOwn(value, "execution") || isAgentExecution(value.execution));
+    case "authority.agent-runtime.step-committed":
+      return hasExactKeys(value, ["type", "requestId", "execution"]) && isAgentExecution(value.execution);
+    case "authority.agent-runtime.execution-completed":
+    case "authority.agent-runtime.compensation-completed":
+      return hasExactKeys(value, ["type", "requestId", "execution"]) && isAgentExecution(value.execution);
+    case "authority.agent-runtime.retry-scheduled":
+      return hasExactKeys(value, ["type", "requestId", "execution"]) && isAgentExecution(value.execution);
+    case "authority.agent-runtime.execution-failed":
+      return hasExactKeys(value, ["type", "requestId", "execution"]) && isAgentExecution(value.execution);
+    case "authority.agent-runtime.interrupted":
+    case "authority.agent-runtime.manual-retried":
+      return hasExactKeys(value, ["type", "requestId", "execution"]) && isAgentExecution(value.execution);
+    case "authority.agent-runtime.compensation-accepted":
+      return hasExactKeys(value, ["type", "requestId", "execution"]) &&
+        isAgentExecution(value.execution);
+    case "authority.agent-runtime.compensation-resumed":
+      return hasExactKeys(value, ["type", "requestId", "work"]) && isRecord(value.work) &&
+        hasExactKeys(value.work, ["execution", "dispatch", "sealedCompensation"]) &&
+        isAgentExecution(value.work.execution) && isToolDispatch(value.work.dispatch) &&
+        isText(value.work.sealedCompensation) &&
+        Buffer.byteLength(value.work.sealedCompensation, "utf8") <= 65_536;
+    case "authority.agent-runtime.recovered":
+      return hasExactKeys(value, ["type", "requestId", "page"]) &&
+        isAgentRuntimeRecoveryPage(value.page);
+    case "authority.agent-runtime.tool-prepared":
+      return hasExactKeys(value, ["type", "requestId", "grant"]) && isToolGrant(value.grant);
+    case "authority.agent-runtime.tool-confirmed":
+      return hasExactKeys(value, ["type", "requestId", "confirmation"]) && isToolConfirmation(value.confirmation);
+    case "authority.agent-runtime.confirmed-tool-resumed":
+      return hasExactKeys(value, ["type", "requestId", "resumed"]) && isRecord(value.resumed) &&
+        hasExactKeys(value.resumed, ["confirmationId", "execution", "dispatch", "parameters", "remainingCalls", "toolPlanHash"]) &&
+        isText(value.resumed.confirmationId) &&
+        isAgentExecution(value.resumed.execution) && isToolDispatch(value.resumed.dispatch) &&
+        isJsonValue(value.resumed.parameters) && isSha256(value.resumed.toolPlanHash) &&
+        Array.isArray(value.resumed.remainingCalls) &&
+        value.resumed.remainingCalls.every(isAgentRuntimeToolPlanEntry);
+    case "authority.agent-runtime.tool-dispatched":
+    case "authority.agent-runtime.tool-settled":
+      return hasExactKeys(value, ["type", "requestId", "dispatch"]) && isToolDispatch(value.dispatch);
+    case "authority.agent-runtime.execution":
+      return hasExactKeys(value, ["type", "requestId", "execution"]) && isAgentExecution(value.execution);
+    case "authority.agent-runtime.provider-context":
+      return hasExactKeys(value, ["type", "requestId", "executionId", "context"]) &&
+        isText(value.executionId) && isAgentRuntimeProviderContext(value.context) &&
+        value.context.invocation.targetAgentId.length > 0;
+    case "authority.agent-runtime.human-fence-cancelled":
+      return hasExactKeys(value, ["type", "requestId", "execution"]) && isAgentExecution(value.execution);
     case "authority.history":
       return hasExactKeys(value, ["type", "requestId", "messages"]) &&
         Array.isArray(value.messages) && value.messages.every(isMessage);

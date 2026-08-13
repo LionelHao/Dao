@@ -3,6 +3,7 @@ import { rmSync, statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { parentPort, workerData } from "node:worker_threads";
 import {
+  isAgentExecution,
   isRoomRepairPage,
   isSnapshotVersion,
   isWorkspaceBootstrapPage,
@@ -439,19 +440,21 @@ function* roomRecords(
     recordScanned();
   }
   for (const row of scanRows(authority,
-    `SELECT id, room_id AS roomId, trigger_message_id AS sourceMessageId,
-            requester_actor_id AS requesterId, agent_id AS agentId, tool_name AS toolName,
-            status, started_at AS startedAt, completed_at AS completedAt,
-            result_json AS resultJson
+    `SELECT id, room_id AS roomId, source_message_id AS sourceMessageId,
+            requester_actor_id AS requesterId, agent_id AS agentId, state AS status,
+            action_category AS actionCategory, tool_dispatch_phase AS toolDispatchPhase,
+            current_tool_id AS currentToolId, current_attempt_seq AS currentAttemptSeq,
+            retry_cycle AS retryCycle, retry_ordinal AS retryOrdinal,
+            provider_id AS providerId, model_id AS modelId, recovery_cursor AS recoveryCursor,
+            queued_at AS queuedAt, started_at AS startedAt, updated_at AS updatedAt,
+            completed_at AS finishedAt, cancellation_reason AS cancellationReason,
+            terminal_error_code AS terminalErrorCode, dead_lettered_at AS deadLetteredAt,
+            result_message_id AS resultMessageId, manual_retry_of_execution_id AS manualRetryOfExecutionId,
+            compensates_execution_id AS compensatesExecutionId,
+            supersedes_execution_ids_json AS supersedesExecutionIdsJson
      FROM agent_executions WHERE room_id = ?`,
     roomId, "id", "id")) {
-    yield { kind: "agent-execution", value: {
-      id: String(row.id), roomId: String(row.roomId), sourceMessageId: String(row.sourceMessageId),
-      requesterId: String(row.requesterId), agentId: String(row.agentId), toolName: String(row.toolName),
-      status: row.status as "running", startedAt: String(row.startedAt),
-      ...(typeof row.completedAt === "string" ? { completedAt: row.completedAt } : {}),
-      ...(typeof row.resultJson === "string" ? { result: String(parseJson(row.resultJson)) } : {}),
-    }};
+    yield agentExecutionRecord(row);
     recordScanned();
   }
   for (const row of scanRows(authority,
@@ -558,6 +561,57 @@ function membershipRecord(row: Record<string, unknown>): RoomRepairRecord {
   throw new SnapshotBuildError("storage_unavailable", "Snapshot membership is corrupt");
 }
 
+function agentExecutionRecord(row: Record<string, unknown>): RoomRepairRecord {
+  let supersedesExecutionIds: readonly string[] | undefined;
+  if (typeof row.supersedesExecutionIdsJson !== "string") {
+    throw new SnapshotBuildError("storage_unavailable", "Snapshot execution is corrupt");
+  }
+  try {
+    const parsed: unknown = JSON.parse(row.supersedesExecutionIdsJson);
+    if (!Array.isArray(parsed) || !parsed.every((id) => typeof id === "string" && id.trim().length > 0) ||
+        new Set(parsed).size !== parsed.length) {
+      throw new TypeError("invalid execution lineage");
+    }
+    supersedesExecutionIds = parsed.length === 0 ? undefined : parsed;
+  } catch {
+    throw new SnapshotBuildError("storage_unavailable", "Snapshot execution is corrupt");
+  }
+  const value = {
+    id: row.id,
+    roomId: row.roomId,
+    sourceMessageId: row.sourceMessageId,
+    requesterId: row.requesterId,
+    agentId: row.agentId,
+    status: row.status,
+    actionCategory: row.actionCategory,
+    currentAttemptSeq: row.currentAttemptSeq,
+    retryCycle: row.retryCycle,
+    retryOrdinal: row.retryOrdinal,
+    providerId: row.providerId,
+    modelId: row.modelId,
+    recoveryCursor: row.recoveryCursor,
+    queuedAt: row.queuedAt,
+    updatedAt: row.updatedAt,
+    ...(typeof row.toolDispatchPhase === "string" ? { toolDispatchPhase: row.toolDispatchPhase } : {}),
+    ...(typeof row.currentToolId === "string" ? { currentToolId: row.currentToolId } : {}),
+    ...(typeof row.startedAt === "string" ? { startedAt: row.startedAt } : {}),
+    ...(typeof row.finishedAt === "string" ? { finishedAt: row.finishedAt } : {}),
+    ...(typeof row.cancellationReason === "string" ? { cancellationReason: row.cancellationReason } : {}),
+    ...(typeof row.terminalErrorCode === "string" ? { terminalErrorCode: row.terminalErrorCode } : {}),
+    ...(typeof row.deadLetteredAt === "string" ? { deadLetteredAt: row.deadLetteredAt } : {}),
+    ...(typeof row.resultMessageId === "string" ? { resultMessageId: row.resultMessageId } : {}),
+    ...(typeof row.manualRetryOfExecutionId === "string"
+      ? { manualRetryOfExecutionId: row.manualRetryOfExecutionId } : {}),
+    ...(typeof row.compensatesExecutionId === "string"
+      ? { compensatesExecutionId: row.compensatesExecutionId } : {}),
+    ...(supersedesExecutionIds === undefined ? {} : { supersedesExecutionIds }),
+  };
+  if (!isAgentExecution(value)) {
+    throw new SnapshotBuildError("storage_unavailable", "Snapshot execution is corrupt");
+  }
+  return { kind: "agent-execution", value };
+}
+
 function messageRecord(row: Record<string, unknown>): RoomRepairRecord {
   if (typeof row.id !== "string" || typeof row.roomId !== "string" ||
       typeof row.authorId !== "string" ||
@@ -662,20 +716,20 @@ function keysetRoomPage(
       }}));
     } else if (segment === 6) {
       append(keysetRows(authority,
-        `SELECT id, room_id AS roomId, trigger_message_id AS sourceMessageId,
-                requester_actor_id AS requesterId, agent_id AS agentId, tool_name AS toolName,
-                status, started_at AS startedAt, completed_at AS completedAt,
-                result_json AS resultJson
+        `SELECT id, room_id AS roomId, source_message_id AS sourceMessageId,
+                requester_actor_id AS requesterId, agent_id AS agentId, state AS status,
+                action_category AS actionCategory, tool_dispatch_phase AS toolDispatchPhase,
+                current_tool_id AS currentToolId, current_attempt_seq AS currentAttemptSeq,
+                retry_cycle AS retryCycle, retry_ordinal AS retryOrdinal,
+                provider_id AS providerId, model_id AS modelId, recovery_cursor AS recoveryCursor,
+                queued_at AS queuedAt, started_at AS startedAt, updated_at AS updatedAt,
+                completed_at AS finishedAt, cancellation_reason AS cancellationReason,
+                terminal_error_code AS terminalErrorCode, dead_lettered_at AS deadLetteredAt,
+                result_message_id AS resultMessageId, manual_retry_of_execution_id AS manualRetryOfExecutionId,
+                compensates_execution_id AS compensatesExecutionId,
+                supersedes_execution_ids_json AS supersedesExecutionIdsJson
          FROM agent_executions WHERE room_id = ?`, [roomId], "id", key, remaining),
-      (row) => String(row.id), (row) => ({ kind: "agent-execution", value: {
-        id: String(row.id), roomId: String(row.roomId), sourceMessageId: String(row.sourceMessageId),
-        requesterId: String(row.requesterId), agentId: String(row.agentId),
-        toolName: String(row.toolName), status: row.status as "running",
-        startedAt: String(row.startedAt),
-        ...(typeof row.completedAt === "string" ? { completedAt: row.completedAt } : {}),
-        ...(typeof row.resultJson === "string"
-          ? { result: String(parseJson(row.resultJson)) } : {}),
-      }}));
+      (row) => String(row.id), agentExecutionRecord);
     } else {
       append(keysetRows(authority,
         `SELECT id, source_message_id AS sourceMessageId, actor_id AS actorId,

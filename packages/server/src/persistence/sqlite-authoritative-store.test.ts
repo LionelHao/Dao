@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
-import type { Actor } from "@native-im/core";
+import { isAgentExecution, type Actor, type AgentExecution } from "@native-im/core";
 import {
   createAuthenticationService,
   AuthenticationError,
@@ -15,11 +15,15 @@ import { createAesGcmInvitationSecretProtector } from "../invitation-secret-prot
 import { createSqliteAuthoritativeStore } from "./sqlite-authoritative-store.js";
 import {
   mintInternalAgentCommandContext,
+  mintInternalAgentRuntimeContext,
+  parsePersistedRoomEvent,
   type AgentCollaborationCommand,
+  type AgentRuntimeAuthorityStore,
   type AuthenticatedCommandContext,
   type CommandAcknowledgement,
   type CommandStore,
   type HumanCollaborationCommand,
+  type InternalAgentRuntimeContext,
   type RoomGovernanceCommand,
 } from "./contracts.js";
 import { migrateAuthorityDatabase } from "./schema.js";
@@ -34,6 +38,28 @@ function tokenSequence(...tokens: readonly string[]): () => string {
 function tokenHash(token: string): string {
   return createHash("sha256").update(token).digest("base64url");
 }
+
+async function recoverAllAgentRuntimeExecutions(
+  authority: Pick<AgentRuntimeAuthorityStore, "recoverPage">,
+  runtime: InternalAgentRuntimeContext,
+  now: number,
+): Promise<readonly AgentExecution[]> {
+  const executions: AgentExecution[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await authority.recoverPage(runtime, {
+      now, limit: 256, ...(cursor === undefined ? {} : { cursor }),
+    });
+    executions.push(...page.recoveries.map(({ execution }) => execution));
+    cursor = page.nextCursor;
+  } while (cursor !== undefined);
+  return executions;
+}
+
+const DEFAULT_TOOL_CALL_BINDING = {
+  toolCallStepSeq: 1,
+  toolPlanHash: createHash("sha256").update('{"toolId":"review.read"}').digest("hex"),
+} as const;
 
 function deferred(): {
   readonly promise: Promise<void>;
@@ -233,6 +259,8 @@ async function createAgentFactFixture(databasePath: string) {
     VALUES
       ('message-human-source', 'room-facts', 'human-li', 'human', 'please review',
        '2026-08-10T13:01:00.000Z'),
+      ('message-human-source-next', 'room-facts', 'human-li', 'human', 'please review next',
+       '2026-08-10T13:01:30.000Z'),
       ('message-agent-source', 'room-facts', 'agent-review', 'agent', 'review complete',
        '2026-08-10T13:02:00.000Z');
   `);
@@ -250,6 +278,21 @@ async function createAgentFactFixture(databasePath: string) {
       idempotencyKey: "facts-human-key",
     },
   };
+}
+
+async function checkpointToolCall(
+  fixture: Awaited<ReturnType<typeof createAgentFactFixture>>,
+  runtime: ReturnType<typeof mintInternalAgentRuntimeContext>,
+  executionId: string,
+  attemptSeq: number,
+  now: number,
+  parameterHash: string,
+): Promise<void> {
+  await fixture.authority.commitStep(runtime, {
+    executionId, attemptSeq, stepSeq: 1, stepKind: "tool_call",
+    canonicalToolCall: { toolId: "review.read" },
+    inputSha256: "1".repeat(64), outputSha256: parameterHash, now,
+  });
 }
 
 function readMessageCommandCounts(databasePath: string): {
@@ -689,6 +732,14 @@ describe("SQLite authoritative sessions", () => {
         sentAt: "2026-08-10T13:01:00.000Z",
       },
       {
+        id: "message-human-source-next",
+        roomId: "room-facts",
+        authorId: "human-li",
+        authorKind: "human",
+        body: "please review next",
+        sentAt: "2026-08-10T13:01:30.000Z",
+      },
+      {
         id: "message-agent-source",
         roomId: "room-facts",
         authorId: "agent-review",
@@ -929,7 +980,7 @@ describe("SQLite authoritative sessions", () => {
       )).rejects.toMatchObject({ status: 409, code: "idempotency_conflict" });
       await fixture.client.close();
 
-      const database = new DatabaseSync(databasePath, { readOnly: true });
+      const database = new DatabaseSync(databasePath);
       expect(database.prepare(
         "SELECT author_id AS authorId, author_kind AS authorKind FROM messages WHERE id = ?",
       ).get(command.payload.id)).toEqual({ authorId: "agent-review", authorKind: "agent" });
@@ -1158,6 +1209,2345 @@ describe("SQLite authoritative sessions", () => {
   });
 
   describe("Agent execution authoritative facts", () => {
+    it("Agent runtime authority requires the human requester to remain a current room member", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-human-membership-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      await fixture.client.close();
+      const database = new DatabaseSync(databasePath);
+      database.prepare(
+        "DELETE FROM room_memberships WHERE room_id = ? AND actor_id = ?",
+      ).run("room-facts", "human-li");
+      const before = database.prepare(
+        `SELECT
+           (SELECT COUNT(*) FROM agent_executions) AS executions,
+           (SELECT COUNT(*) FROM agent_execution_attempts) AS attempts,
+           (SELECT COUNT(*) FROM agent_invocation_intents) AS intents,
+           (SELECT COUNT(*) FROM events) AS events,
+           (SELECT COUNT(*) FROM outbox_deliveries) AS outbox`,
+      ).get();
+      database.close();
+      const reopenedClient = await createWorkerDatabaseClient({ databasePath });
+      const reopened = createSqliteAuthoritativeStore(reopenedClient, { clock: () => 3_000 });
+
+      await expect(reopened.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source",
+        targetAgentId: "agent-review", intentKind: "direct_mention",
+        providerId: "provider-test", modelId: "model-test",
+      })).rejects.toMatchObject({ status: 403, code: "room_forbidden" });
+      await reopenedClient.close();
+      const afterDatabase = new DatabaseSync(databasePath, { readOnly: true });
+      expect(afterDatabase.prepare(
+        `SELECT
+           (SELECT COUNT(*) FROM agent_executions) AS executions,
+           (SELECT COUNT(*) FROM agent_execution_attempts) AS attempts,
+           (SELECT COUNT(*) FROM agent_invocation_intents) AS intents,
+           (SELECT COUNT(*) FROM events) AS events,
+           (SELECT COUNT(*) FROM outbox_deliveries) AS outbox`,
+      ).get()).toEqual(before);
+      afterDatabase.close();
+    });
+
+    it("Agent runtime authority requires an internal Agent requester to remain a current room member", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-agent-membership-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      await fixture.client.close();
+      const database = new DatabaseSync(databasePath);
+      database.prepare(
+        "DELETE FROM room_memberships WHERE room_id = ? AND actor_id = ?",
+      ).run("room-facts", "agent-review");
+      database.close();
+      const reopenedClient = await createWorkerDatabaseClient({ databasePath });
+      const reopened = createSqliteAuthoritativeStore(reopenedClient, { clock: () => 3_000 });
+
+      await expect(reopened.invoke(mintInternalAgentCommandContext({
+        agentId: "agent-review", requestId: "agent-invoke", idempotencyKey: "agent-invoke",
+      }), {
+        roomId: "room-facts", sourceMessageId: "message-agent-source",
+        targetAgentId: "agent-review", intentKind: "direct_mention",
+        providerId: "provider-test", modelId: "model-test",
+      })).rejects.toMatchObject({ status: 403, code: "room_forbidden" });
+      await reopenedClient.close();
+    });
+
+    it("Agent runtime authority invokes once per source and target with a queued attempt", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-invoke-"));
+      temporaryDirectories.push(directory);
+      const fixture = await createAgentFactFixture(join(directory, "authority.sqlite"));
+      const input = {
+        roomId: "room-facts",
+        sourceMessageId: "message-human-source",
+        targetAgentId: "agent-review",
+        intentKind: "direct_mention" as const,
+        providerId: "provider-test",
+        modelId: "model-test",
+      };
+      const first = await fixture.authority.invoke(fixture.humanContext, input);
+      const replay = await fixture.authority.invoke(fixture.humanContext, input);
+
+      expect(replay).toEqual(first);
+      expect(first).toMatchObject({
+        roomId: input.roomId,
+        sourceMessageId: input.sourceMessageId,
+        requesterId: "human-li",
+        agentId: input.targetAgentId,
+        status: "queued",
+        actionCategory: "model_generation",
+        currentAttemptSeq: 1,
+        retryCycle: 1,
+        retryOrdinal: 1,
+        recoveryCursor: 0,
+      });
+      await fixture.client.close();
+    });
+
+    it("Agent runtime authority admits exact replay before enforcing the durable room cap", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-invoke-cap-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const common = {
+        roomId: "room-facts",
+        targetAgentId: "agent-review",
+        intentKind: "direct_mention" as const,
+        providerId: "provider-test",
+        modelId: "model-test",
+      };
+      const first = await fixture.authority.invoke(
+        fixture.humanContext,
+        { ...common, sourceMessageId: "message-human-source" },
+        1,
+      );
+      await fixture.authority.claimNext(
+        mintInternalAgentRuntimeContext({ runtimeId: "runtime-cap", agentId: "agent-review" }),
+        "room-facts",
+        4_000,
+      );
+      const second = await fixture.authority.invoke(
+        fixture.humanContext,
+        { ...common, sourceMessageId: "message-human-source-next" },
+        1,
+      );
+      await expect(
+        fixture.authority.invoke(
+          fixture.humanContext,
+          { ...common, sourceMessageId: "message-human-source-next" },
+          1,
+        ),
+      ).resolves.toEqual(second);
+      const writer = new DatabaseSync(databasePath);
+      writer.prepare(
+        `INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+         VALUES (?, 'room-facts', 'human-li', 'human', 'overflow', ?)`,
+      ).run("message-human-overflow", "2026-08-10T13:01:45.000Z");
+      writer.close();
+      await expect(
+        fixture.authority.invoke(
+          fixture.humanContext,
+          { ...common, sourceMessageId: "message-human-overflow" },
+          1,
+        ),
+      ).rejects.toMatchObject({ code: "target_busy", status: 429 });
+
+      await fixture.client.close();
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM agent_executions").get())
+        .toEqual({ count: 2 });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM agent_invocation_intents").get())
+        .toEqual({ count: 2 });
+      expect(first.id).not.toBe(second.id);
+      database.close();
+    });
+
+    it.each(["paused", "noauth", "unconfigured", "silent_routed"] as const)(
+      "Agent runtime authority rejects a %s target with zero writes across restart",
+      async (condition) => {
+        const directory = await mkdtemp(join(tmpdir(), `native-im-runtime-target-${condition}-`));
+        temporaryDirectories.push(directory);
+        const databasePath = join(directory, "authority.sqlite");
+        const fixture = await createAgentFactFixture(databasePath);
+        await fixture.client.close();
+        const database = new DatabaseSync(databasePath);
+        if (condition === "paused" || condition === "noauth") {
+          database.prepare("UPDATE actors SET readiness = ? WHERE id = 'agent-review'").run(condition);
+        } else if (condition === "unconfigured") {
+          database.prepare("DELETE FROM room_memberships WHERE room_id = 'room-facts' AND actor_id = 'agent-review'").run();
+        } else {
+          database.prepare("UPDATE room_memberships SET participation = 'silent' WHERE room_id = 'room-facts' AND actor_id = 'agent-review'").run();
+        }
+        const before = authoritativeCountSnapshot(databasePath);
+        database.close();
+        const reopenedClient = await createWorkerDatabaseClient({ databasePath });
+        const reopened = createSqliteAuthoritativeStore(reopenedClient, { clock: () => 3_000 });
+        await expect(reopened.invoke(fixture.humanContext, {
+          roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+          intentKind: condition === "silent_routed" ? "routed_candidate" : "direct_mention",
+          providerId: "provider-test", modelId: "model-test",
+        })).rejects.toMatchObject({ code: "room_member_not_found" });
+        expect(authoritativeCountSnapshot(databasePath)).toEqual(before);
+        await reopenedClient.close();
+      },
+    );
+
+    it("Agent runtime direct mandatory invocation accepts a silent ready target", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-target-silent-direct-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      await fixture.client.close();
+      const database = new DatabaseSync(databasePath);
+      database.prepare("UPDATE room_memberships SET participation = 'silent' WHERE room_id = 'room-facts' AND actor_id = 'agent-review'").run();
+      database.close();
+      const reopenedClient = await createWorkerDatabaseClient({ databasePath });
+      const reopened = createSqliteAuthoritativeStore(reopenedClient, { clock: () => 3_000 });
+      await expect(reopened.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      })).resolves.toMatchObject({ status: "queued", agentId: "agent-review" });
+      await reopenedClient.close();
+    });
+
+    it("Agent runtime authority deterministically upgrades invocation intent priority", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-intent-priority-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const base = {
+        roomId: "room-facts", sourceMessageId: "message-human-source",
+        targetAgentId: "agent-review", providerId: "provider-test", modelId: "model-test",
+      } as const;
+      const routed = await fixture.authority.invoke(fixture.humanContext, {
+        ...base, intentKind: "routed_candidate",
+      });
+      await expect(fixture.authority.invoke(fixture.humanContext, {
+        ...base, intentKind: "direct_mention",
+      })).resolves.toEqual(routed);
+      await expect(fixture.authority.invoke(fixture.humanContext, {
+        ...base, intentKind: "structured_help",
+      })).resolves.toEqual(routed);
+      await expect(fixture.authority.invoke(fixture.humanContext, {
+        ...base, intentKind: "direct_mention", modelId: "changed-model",
+      })).rejects.toMatchObject({ status: 409, code: "idempotency_conflict" });
+      await fixture.client.close();
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      expect(database.prepare(
+        "SELECT intent_kind AS intentKind FROM agent_invocation_intents WHERE execution_id = ?",
+      ).get(routed.id)).toEqual({ intentKind: "direct_mention" });
+      database.close();
+    });
+
+    it("Agent runtime authority claims room executions in FIFO order exactly once", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-claim-"));
+      temporaryDirectories.push(directory);
+      const fixture = await createAgentFactFixture(join(directory, "authority.sqlite"));
+      const common = {
+        roomId: "room-facts",
+        targetAgentId: "agent-review",
+        intentKind: "direct_mention" as const,
+        providerId: "provider-test",
+        modelId: "model-test",
+      };
+      const first = await fixture.authority.invoke(fixture.humanContext, {
+        ...common, sourceMessageId: "message-human-source",
+      });
+      const second = await fixture.authority.invoke(fixture.humanContext, {
+        ...common, sourceMessageId: "message-human-source-next",
+      });
+      const runtime = mintInternalAgentRuntimeContext({ runtimeId: "runtime-fifo", agentId: "agent-review" });
+      await fixture.client.close();
+      const vacuum = new DatabaseSync(join(directory, "authority.sqlite"));
+      vacuum.exec("VACUUM");
+      const claimPlan = vacuum.prepare(
+        `EXPLAIN QUERY PLAN
+         SELECT execution.id
+         FROM agent_execution_attempts AS attempt
+         JOIN agent_executions AS execution
+           ON execution.id = attempt.execution_id
+          AND execution.current_attempt_seq = attempt.attempt_seq
+         WHERE attempt.room_id = ? AND attempt.state = 'queued'
+           AND execution.state = 'queued'
+           AND (attempt.next_retry_at IS NULL OR attempt.next_retry_at <= ?)
+         ORDER BY attempt.enqueue_stream_seq ASC LIMIT 1`,
+      ).all("room-facts", 4_000) as readonly { readonly detail: string }[];
+      expect(claimPlan.map((row) => row.detail)).not.toContain(
+        "USE TEMP B-TREE FOR ORDER BY",
+      );
+      vacuum.close();
+      const reopenedClient = await createWorkerDatabaseClient({ databasePath: join(directory, "authority.sqlite") });
+      const reopened = createSqliteAuthoritativeStore(reopenedClient);
+
+      await expect(reopened.claimNext(runtime, "room-facts", 4_000))
+        .resolves.toMatchObject({ id: first.id, status: "running", startedAt: "1970-01-01T00:00:04.000Z" });
+      await expect(reopened.claimNext(runtime, "room-facts", 5_000)).resolves.toBeUndefined();
+      const interruptAuthority = createSqliteAuthoritativeStore(reopenedClient, { clock: () => 5_500 });
+      await interruptAuthority.interrupt(fixture.humanContext, {
+        executionId: first.id, reason: "requested_by_requester",
+      });
+      await expect(reopened.claimNext(runtime, "room-facts", 6_000))
+        .resolves.toMatchObject({ id: second.id, status: "running", startedAt: "1970-01-01T00:00:06.000Z" });
+      await expect(reopened.claimNext(runtime, "room-facts", 7_000)).resolves.toBeUndefined();
+      await reopenedClient.close();
+    });
+
+    it("Agent runtime authority commits each checkpoint once with an attempt CAS", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-checkpoint-"));
+      temporaryDirectories.push(directory);
+      const fixture = await createAgentFactFixture(join(directory, "authority.sqlite"));
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({ runtimeId: "runtime-checkpoint", agentId: "agent-review" });
+      await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+      const input = {
+        executionId: execution.id, attemptSeq: 1, stepSeq: 1, stepKind: "model_generation" as const,
+        inputSha256: "a".repeat(64), outputSha256: "b".repeat(64), now: 5_000,
+      };
+
+      await expect(fixture.authority.commitStep(runtime, input))
+        .resolves.toMatchObject({ id: execution.id, recoveryCursor: 1, status: "running" });
+      await expect(fixture.authority.commitStep(runtime, input)).rejects.toMatchObject({ code: "execution_conflict" });
+      await fixture.client.close();
+    });
+
+    it("Agent runtime provider context reloads the durable invocation and committed checkpoints", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-provider-context-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source",
+        targetAgentId: "agent-review", intentKind: "structured_help",
+        providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({
+        runtimeId: "runtime-provider-context", agentId: "agent-review",
+      });
+      await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+      await fixture.authority.commitStep(runtime, {
+        executionId: execution.id, attemptSeq: 1, stepSeq: 1,
+        stepKind: "model_generation", inputSha256: "a".repeat(64),
+        outputSha256: "b".repeat(64), now: 5_000,
+      });
+      await fixture.client.close();
+
+      const reopenedClient = await createWorkerDatabaseClient({ databasePath });
+      const reopened = createSqliteAuthoritativeStore(reopenedClient);
+      await expect(reopened.loadProviderContext(runtime, execution.id)).resolves.toEqual({
+        invocation: {
+          sourceMessageId: "message-human-source", requesterActorId: "human-li",
+          targetAgentId: "agent-review", intentKind: "structured_help",
+        },
+        visibleConversation: [{
+          messageId: "message-human-source", actorId: "human-li", body: "please review",
+        }],
+        committedSteps: [{
+          stepSeq: 1, kind: "model_generation",
+          modelInput: { inputSha256: "a".repeat(64), outputSha256: "b".repeat(64) },
+        }],
+      });
+      const wrongRuntime = mintInternalAgentRuntimeContext({
+        runtimeId: "runtime-provider-context-wrong", agentId: "agent-other",
+      });
+      await expect(reopened.loadProviderContext(wrongRuntime, execution.id))
+        .rejects.toMatchObject({ status: 403, code: "agent_capability_forbidden" });
+      await reopenedClient.close();
+    });
+
+    it("Agent runtime capabilities can claim and mutate only their bound Agent executions", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-agent-bound-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const right = mintInternalAgentRuntimeContext({ runtimeId: "runtime-right", agentId: "agent-review" });
+      const wrong = mintInternalAgentRuntimeContext({ runtimeId: "runtime-wrong", agentId: "agent-other" });
+      const beforeClaim = authoritativeCountSnapshot(databasePath);
+      await expect(fixture.authority.claimNext(wrong, "room-facts", 4_000)).resolves.toBeUndefined();
+      expect(authoritativeCountSnapshot(databasePath)).toEqual(beforeClaim);
+      await fixture.authority.claimNext(right, "room-facts", 4_000);
+      const beforeWrong = authoritativeCountSnapshot(databasePath);
+      await expect(fixture.authority.commitStep(wrong, {
+        executionId: execution.id, attemptSeq: 1, stepSeq: 1, stepKind: "model_generation",
+        inputSha256: "a".repeat(64), outputSha256: "b".repeat(64), now: 4_500,
+      })).rejects.toMatchObject({ status: 403, code: "agent_capability_forbidden" });
+      await expect(fixture.authority.scheduleRetry(wrong, {
+        executionId: execution.id, attemptSeq: 1, errorCode: "upstream_timeout", now: 4_500,
+      })).rejects.toMatchObject({ status: 403, code: "agent_capability_forbidden" });
+      await expect(fixture.authority.completeExecution(wrong, {
+        executionId: execution.id, attemptSeq: 1, messageId: "message-wrong-runtime",
+        body: "forged", sentAt: "1970-01-01T00:00:04.500Z", now: 4_500,
+      })).rejects.toMatchObject({ status: 403, code: "agent_capability_forbidden" });
+      await expect(fixture.authority.cancelForHumanFence(wrong, {
+        executionId: execution.id, fenceMessageId: "message-human-source", now: 4_500,
+      })).rejects.toMatchObject({ status: 403, code: "agent_capability_forbidden" });
+      expect(authoritativeCountSnapshot(databasePath)).toEqual(beforeWrong);
+      await checkpointToolCall(fixture, right, execution.id, 1, 5_000, "a".repeat(64));
+      await expect(fixture.authority.prepareTool(wrong, {
+        executionId: execution.id, attemptSeq: 1, ...DEFAULT_TOOL_CALL_BINDING, toolId: "review.read",
+        parameterHash: "a".repeat(64), confirmationRequirement: "read_only",
+        now: 5_250, expiresAt: 10_000,
+      })).rejects.toMatchObject({ status: 403, code: "agent_capability_forbidden" });
+      const grant = await fixture.authority.prepareTool(right, {
+        executionId: execution.id, attemptSeq: 1, ...DEFAULT_TOOL_CALL_BINDING, toolId: "review.read",
+        parameterHash: "a".repeat(64), confirmationRequirement: "read_only",
+        now: 5_250, expiresAt: 10_000,
+      });
+      await expect(fixture.authority.dispatchTool(wrong, {
+        executionId: execution.id, attemptSeq: 1, grantId: grant.id, toolId: "review.read",
+        parameterHash: "a".repeat(64), confirmationRequirement: "read_only", now: 5_500,
+      })).rejects.toMatchObject({ status: 403, code: "agent_capability_forbidden" });
+      const dispatch = await fixture.authority.dispatchTool(right, {
+        executionId: execution.id, attemptSeq: 1, grantId: grant.id, toolId: "review.read",
+        parameterHash: "a".repeat(64), confirmationRequirement: "read_only", now: 5_500,
+      });
+      await expect(fixture.authority.settleTool(wrong, {
+        dispatchId: dispatch.id, executionId: execution.id, attemptSeq: 1, grantId: grant.id,
+        outcome: "succeeded", now: 6_000,
+      })).rejects.toMatchObject({ status: 403, code: "agent_capability_forbidden" });
+      await expect(recoverAllAgentRuntimeExecutions(fixture.authority, wrong, 6_000)).resolves.toEqual([]);
+      await fixture.client.close();
+    });
+
+    it("Agent runtime authority closes checkpoint phases before tool preparation", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-step-phases-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({ runtimeId: "runtime-step-phases", agentId: "agent-review" });
+      await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+      const before = authoritativeCountSnapshot(databasePath);
+      await expect(fixture.authority.prepareTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, ...DEFAULT_TOOL_CALL_BINDING, toolId: "review.read",
+        parameterHash: "a".repeat(64), confirmationRequirement: "read_only",
+        now: 4_500, expiresAt: 10_000,
+      })).rejects.toMatchObject({ status: 409, code: "execution_conflict" });
+      expect(authoritativeCountSnapshot(databasePath)).toEqual(before);
+      await expect(fixture.authority.commitStep(runtime, {
+        executionId: execution.id, attemptSeq: 1, stepSeq: 1, stepKind: "tool_result",
+        dispatchId: "dispatch-missing", boundedToolResult: { invalid: true }, inputSha256: "a".repeat(64),
+        outputSha256: "b".repeat(64), now: 4_750,
+      })).rejects.toMatchObject({ status: 409, code: "execution_conflict" });
+      expect(authoritativeCountSnapshot(databasePath)).toEqual(before);
+      await expect(fixture.authority.commitStep(runtime, {
+        executionId: execution.id, attemptSeq: 1, stepSeq: 1, stepKind: "tool_call",
+        canonicalToolCall: { toolId: "review.read" }, inputSha256: "a".repeat(64),
+        outputSha256: "a".repeat(64), now: 5_000,
+      })).resolves.toMatchObject({
+        actionCategory: "tool_call", toolDispatchPhase: "not_started", currentToolId: "review.read",
+      });
+      await expect(fixture.authority.prepareTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, ...DEFAULT_TOOL_CALL_BINDING, toolId: "review.read",
+        parameterHash: "a".repeat(64), confirmationRequirement: "read_only",
+        now: 5_500, expiresAt: 10_000,
+      })).resolves.toMatchObject({ toolId: "review.read" });
+      const toolPhaseCounts = authoritativeCountSnapshot(databasePath);
+      await expect(fixture.authority.commitStep(runtime, {
+        executionId: execution.id, attemptSeq: 1, stepSeq: 2, stepKind: "model_generation",
+        inputSha256: "a".repeat(64), outputSha256: "b".repeat(64), now: 6_000,
+      })).rejects.toMatchObject({ status: 409, code: "execution_conflict" });
+      expect(authoritativeCountSnapshot(databasePath)).toEqual(toolPhaseCounts);
+      await fixture.client.close();
+    });
+
+    it("Agent runtime authority atomically completes with one Agent message and closed execution event", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-complete-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({ runtimeId: "runtime-complete", agentId: "agent-review" });
+      await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+      const complete = (fixture.authority as unknown as {
+        completeExecution(runtimeContext: typeof runtime, input: {
+          readonly executionId: string; readonly attemptSeq: number; readonly messageId: string;
+          readonly body: string; readonly sentAt: string; readonly now: number;
+        }): Promise<import("@native-im/core").AgentExecution>;
+      }).completeExecution.bind(fixture.authority);
+
+      const exactCompletion = {
+        executionId: execution.id, attemptSeq: 1, messageId: "message-agent-result",
+        body: "Final answer body", sentAt: "1970-01-01T00:00:05.000Z", now: 5_000,
+      } as const;
+      const [firstComplete, concurrentReplay] = await Promise.all([
+        complete(runtime, exactCompletion), complete(runtime, exactCompletion),
+      ]);
+      expect(firstComplete).toMatchObject({
+        id: execution.id, status: "completed", resultMessageId: "message-agent-result",
+      });
+      expect(concurrentReplay).toEqual(firstComplete);
+      await fixture.client.close();
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      expect(database.prepare("SELECT author_id AS authorId, body FROM messages WHERE id = ?")
+        .get("message-agent-result")).toEqual({ authorId: "agent-review", body: "Final answer body" });
+      const executionEvent = database.prepare(
+        `SELECT payload_json AS payload FROM events
+         WHERE event_type = 'room.agent_execution.changed'
+         ORDER BY stream_seq DESC LIMIT 1`,
+      ).get() as { readonly payload: string };
+      expect(executionEvent.payload).not.toContain("Final answer body");
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.message.accepted' AND json_extract(payload_json, '$.id') = ?",
+      ).get("message-agent-result")).toEqual({ count: 1 });
+      database.close();
+      const reopenedClient = await createWorkerDatabaseClient({ databasePath });
+      const reopened = createSqliteAuthoritativeStore(reopenedClient);
+      await expect(reopened.completeExecution(runtime, exactCompletion)).resolves.toEqual(firstComplete);
+      await expect(reopened.completeExecution(runtime, {
+        ...exactCompletion, body: "changed body",
+      })).rejects.toMatchObject({ status: 409, code: "idempotency_conflict" });
+      await expect(reopened.completeExecution(runtime, {
+        ...exactCompletion, messageId: "message-agent-result-changed",
+      })).rejects.toMatchObject({ status: 409, code: "idempotency_conflict" });
+      await reopenedClient.close();
+    });
+
+    it("Agent runtime authority schedules retry atomically with a new queued attempt", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-retry-"));
+      temporaryDirectories.push(directory);
+      const fixture = await createAgentFactFixture(join(directory, "authority.sqlite"));
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({ runtimeId: "runtime-retry", agentId: "agent-review" });
+      await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+      await expect(fixture.authority.scheduleRetry(runtime, {
+        executionId: execution.id, attemptSeq: 1, errorCode: "upstream_timeout", now: 5_000,
+      })).resolves.toMatchObject({ currentAttemptSeq: 2, retryOrdinal: 2, status: "queued" });
+      await expect(fixture.authority.claimNext(runtime, "room-facts", 5_999)).resolves.toBeUndefined();
+      await expect(fixture.authority.claimNext(runtime, "room-facts", 6_000))
+        .resolves.toMatchObject({ currentAttemptSeq: 2, retryOrdinal: 2, status: "running" });
+      await expect(fixture.authority.scheduleRetry(runtime, {
+        executionId: execution.id, attemptSeq: 1, errorCode: "upstream_timeout", now: 6_500,
+      })).rejects.toMatchObject({ code: "execution_conflict" });
+      await expect(fixture.authority.scheduleRetry(runtime, {
+        executionId: execution.id, attemptSeq: 2, errorCode: "upstream_unavailable", now: 7_000,
+      })).resolves.toMatchObject({ currentAttemptSeq: 3, retryOrdinal: 3, status: "queued" });
+      await expect(fixture.authority.claimNext(runtime, "room-facts", 10_999)).resolves.toBeUndefined();
+      await expect(fixture.authority.claimNext(runtime, "room-facts", 11_000))
+        .resolves.toMatchObject({ currentAttemptSeq: 3, retryOrdinal: 3, status: "running" });
+      await expect(fixture.authority.scheduleRetry(runtime, {
+        executionId: execution.id, attemptSeq: 3, errorCode: "rate_limited", now: 12_000,
+      })).resolves.toMatchObject({
+        currentAttemptSeq: 3,
+        retryOrdinal: 3,
+        status: "failed",
+        terminalErrorCode: "rate_limited",
+        deadLetteredAt: "1970-01-01T00:00:12.000Z",
+      });
+      await expect(fixture.authority.claimNext(runtime, "room-facts", 20_000)).resolves.toBeUndefined();
+      await fixture.client.close();
+    });
+
+    it("Agent runtime authority terminalizes a non-retryable provider failure atomically", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-terminal-failure-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({
+        runtimeId: "runtime-terminal-failure",
+        agentId: "agent-review",
+      });
+      await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+      const input = {
+        executionId: execution.id,
+        attemptSeq: 1,
+        errorCode: "provider_invalid_response" as const,
+        now: 5_000,
+      };
+      const failed = await fixture.authority.failExecution(runtime, input);
+      expect(failed).toMatchObject({
+        status: "failed",
+        terminalErrorCode: "provider_invalid_response",
+        currentAttemptSeq: 1,
+      });
+      await expect(fixture.authority.failExecution(runtime, input)).resolves.toEqual(failed);
+      await fixture.client.close();
+
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      expect(database.prepare(
+        "SELECT state, error_code AS errorCode FROM agent_execution_attempts WHERE execution_id = ? AND attempt_seq = 1",
+      ).get(execution.id)).toEqual({ state: "failed", errorCode: "provider_invalid_response" });
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.agent_execution.changed' AND json_extract(payload_json, '$.id') = ?",
+      ).get(execution.id)).toEqual({ count: 3 });
+      expect(database.prepare(
+        "SELECT result_message_id AS resultMessageId FROM agent_executions WHERE id = ?",
+      ).get(execution.id)).toEqual({ resultMessageId: null });
+      database.close();
+
+      const reopenedClient = await createWorkerDatabaseClient({ databasePath });
+      const reopened = createSqliteAuthoritativeStore(reopenedClient);
+      await expect(reopened.failExecution(runtime, input)).resolves.toEqual(failed);
+      await expect(reopened.failExecution(runtime, {
+        ...input,
+        errorCode: "provider_failure",
+      })).rejects.toMatchObject({ status: 409, code: "idempotency_conflict" });
+      await reopenedClient.close();
+    });
+
+    it.each(["dispatched", "settled"] as const)(
+      "Agent runtime authority refuses automatic retry for a %s side effect with zero writes",
+      async (phase) => {
+        const directory = await mkdtemp(join(tmpdir(), `native-im-runtime-side-effect-${phase}-`));
+        temporaryDirectories.push(directory);
+        const databasePath = join(directory, "authority.sqlite");
+        const fixture = await createAgentFactFixture(databasePath);
+        const execution = await fixture.authority.invoke(fixture.humanContext, {
+          roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+          intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+        });
+        const runtime = mintInternalAgentRuntimeContext({ runtimeId: `runtime-side-effect-${phase}`, agentId: "agent-review" });
+        await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+        await checkpointToolCall(fixture, runtime, execution.id, 1, 4_500, "9".repeat(64));
+        const parameterHash = "9".repeat(64);
+        const grant = await fixture.authority.prepareTool(runtime, {
+          executionId: execution.id, attemptSeq: 1, ...DEFAULT_TOOL_CALL_BINDING, toolId: "review.read", parameterHash,
+          confirmationRequirement: "side_effect", now: 5_000, expiresAt: 10_000,
+        });
+        const confirmationAuthority = createSqliteAuthoritativeStore(fixture.client, { clock: () => 5_500 });
+        const confirmation = await confirmationAuthority.confirmTool(fixture.humanContext, {
+          executionId: execution.id, attemptSeq: 1, toolId: "review.read", parameterHash,
+          target: "review target", impact: "updates remote review", reversibility: "irreversible",
+          expiresAt: 9_000,
+        });
+        const dispatch = await fixture.authority.dispatchTool(runtime, {
+          executionId: execution.id, attemptSeq: 1, grantId: grant.id, toolId: "review.read",
+          parameterHash, confirmationRequirement: "side_effect", confirmationId: confirmation.id,
+          now: 6_000,
+        });
+        if (phase === "settled") {
+          await fixture.authority.settleTool(runtime, {
+            dispatchId: dispatch.id, executionId: execution.id, attemptSeq: 1, grantId: grant.id,
+            outcome: "succeeded", closedSummary: "updated", now: 6_500,
+          });
+        }
+        await fixture.client.close();
+        const beforeDatabase = new DatabaseSync(databasePath, { readOnly: true });
+        const before = beforeDatabase.prepare(
+          `SELECT
+             (SELECT json_object('state', state, 'attempt', current_attempt_seq,
+                    'action', action_category, 'phase', tool_dispatch_phase)
+                FROM agent_executions WHERE id = ?) AS execution,
+             (SELECT json_group_array(json_object('attempt', attempt_seq, 'state', state,
+                    'action', action_category, 'phase', tool_dispatch_phase, 'error', error_code))
+                FROM agent_execution_attempts WHERE execution_id = ?) AS attempts,
+             (SELECT json_group_array(json_object('id', id, 'state', state, 'settled', settled_at))
+                FROM agent_tool_dispatches WHERE execution_id = ?) AS dispatches,
+             (SELECT COUNT(*) FROM events) AS events,
+             (SELECT COUNT(*) FROM outbox_deliveries) AS outbox`,
+        ).get(execution.id, execution.id, execution.id);
+        beforeDatabase.close();
+        const reopenedClient = await createWorkerDatabaseClient({ databasePath });
+        const reopened = createSqliteAuthoritativeStore(reopenedClient);
+
+        await expect(reopened.scheduleRetry(runtime, {
+          executionId: execution.id, attemptSeq: 1, errorCode: "runtime_restarted", now: 7_000,
+        })).rejects.toMatchObject({ status: 409, code: "execution_conflict" });
+        await reopenedClient.close();
+        const afterDatabase = new DatabaseSync(databasePath, { readOnly: true });
+        expect(afterDatabase.prepare(
+          `SELECT
+             (SELECT json_object('state', state, 'attempt', current_attempt_seq,
+                    'action', action_category, 'phase', tool_dispatch_phase)
+                FROM agent_executions WHERE id = ?) AS execution,
+             (SELECT json_group_array(json_object('attempt', attempt_seq, 'state', state,
+                    'action', action_category, 'phase', tool_dispatch_phase, 'error', error_code))
+                FROM agent_execution_attempts WHERE execution_id = ?) AS attempts,
+             (SELECT json_group_array(json_object('id', id, 'state', state, 'settled', settled_at))
+                FROM agent_tool_dispatches WHERE execution_id = ?) AS dispatches,
+             (SELECT COUNT(*) FROM events) AS events,
+             (SELECT COUNT(*) FROM outbox_deliveries) AS outbox`,
+        ).get(execution.id, execution.id, execution.id)).toEqual(before);
+        afterDatabase.close();
+      },
+    );
+
+    it("Agent runtime authority commits a bounded read-only tool result and restart resumes model generation", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-read-tool-result-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({ runtimeId: "runtime-read-tool-result", agentId: "agent-review" });
+      await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+      await checkpointToolCall(fixture, runtime, execution.id, 1, 4_500, "8".repeat(64));
+      const parameterHash = "8".repeat(64);
+      const grant = await fixture.authority.prepareTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, ...DEFAULT_TOOL_CALL_BINDING, toolId: "review.read", parameterHash,
+        confirmationRequirement: "read_only", now: 5_000, expiresAt: 10_000,
+      });
+      const dispatch = await fixture.authority.dispatchTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, grantId: grant.id, toolId: "review.read",
+        parameterHash, confirmationRequirement: "read_only", now: 5_500,
+      });
+      await fixture.authority.settleTool(runtime, {
+        dispatchId: dispatch.id, executionId: execution.id, attemptSeq: 1, grantId: grant.id,
+        outcome: "succeeded", closedSummary: "read complete", now: 6_000,
+      });
+      await expect(fixture.authority.commitStep(runtime, {
+        executionId: execution.id, attemptSeq: 1, stepSeq: 2, stepKind: "tool_result",
+        dispatchId: dispatch.id, boundedToolResult: { ok: true, count: 1 },
+        inputSha256: "a".repeat(64), outputSha256: "b".repeat(64), now: 6_500,
+      })).resolves.toMatchObject({
+        id: execution.id, status: "running", actionCategory: "model_generation",
+        recoveryCursor: 2,
+      });
+      await fixture.client.close();
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      expect(database.prepare(
+        `SELECT execution.action_category AS executionAction,
+                execution.tool_dispatch_phase AS executionPhase,
+                execution.current_tool_id AS executionTool,
+                attempt.action_category AS attemptAction,
+                attempt.tool_dispatch_phase AS attemptPhase,
+                step.step_kind AS stepKind,
+                step.bounded_tool_result_json AS boundedToolResult
+         FROM agent_executions AS execution
+         JOIN agent_execution_attempts AS attempt
+           ON attempt.execution_id = execution.id AND attempt.attempt_seq = 1
+         JOIN agent_execution_steps AS step
+           ON step.execution_id = execution.id AND step.attempt_seq = 1 AND step.step_seq = 2
+         WHERE execution.id = ?`,
+      ).get(execution.id)).toEqual({
+        executionAction: "model_generation", executionPhase: null, executionTool: null,
+        attemptAction: "model_generation", attemptPhase: null, stepKind: "tool_result",
+        boundedToolResult: '{"count":1,"ok":true}',
+      });
+      expect(() => migrateAuthorityDatabase(database)).not.toThrow();
+      database.close();
+      const reopenedClient = await createWorkerDatabaseClient({ databasePath });
+      const reopened = createSqliteAuthoritativeStore(reopenedClient);
+      await expect(recoverAllAgentRuntimeExecutions(reopened, runtime, 7_000)).resolves.toEqual([
+        expect.objectContaining({ id: execution.id, status: "queued", currentAttemptSeq: 2 }),
+      ]);
+      await reopenedClient.close();
+    });
+
+    it("Agent runtime tool-result checkpoint follows the latest dispatch in its attempt", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-latest-tool-result-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({ runtimeId: "runtime-latest-tool-result", agentId: "agent-review" });
+      await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+      await checkpointToolCall(fixture, runtime, execution.id, 1, 4_500, "a".repeat(64));
+      const firstGrant = await fixture.authority.prepareTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, ...DEFAULT_TOOL_CALL_BINDING, toolId: "review.read",
+        parameterHash: "a".repeat(64), confirmationRequirement: "read_only",
+        now: 5_000, expiresAt: 20_000,
+      });
+      const firstDispatch = await fixture.authority.dispatchTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, grantId: firstGrant.id, toolId: "review.read",
+        parameterHash: "a".repeat(64), confirmationRequirement: "read_only", now: 5_500,
+      });
+      await fixture.authority.settleTool(runtime, {
+        dispatchId: firstDispatch.id, executionId: execution.id, attemptSeq: 1, grantId: firstGrant.id,
+        outcome: "succeeded", now: 6_000,
+      });
+      await fixture.authority.commitStep(runtime, {
+        executionId: execution.id, attemptSeq: 1, stepSeq: 2, stepKind: "tool_result",
+        dispatchId: firstDispatch.id, boundedToolResult: { ok: true }, inputSha256: "a".repeat(64),
+        outputSha256: "b".repeat(64), now: 6_500,
+      });
+      await fixture.authority.commitStep(runtime, {
+        executionId: execution.id, attemptSeq: 1, stepSeq: 3, stepKind: "tool_call",
+        canonicalToolCall: { toolId: "review.read" }, inputSha256: "c".repeat(64),
+        outputSha256: "e".repeat(64), now: 7_000,
+      });
+      const secondGrant = await fixture.authority.prepareTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, ...DEFAULT_TOOL_CALL_BINDING, toolCallStepSeq: 3,
+        toolId: "review.read",
+        parameterHash: "e".repeat(64), confirmationRequirement: "read_only",
+        now: 7_500, expiresAt: 20_000,
+      });
+      const secondDispatch = await fixture.authority.dispatchTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, grantId: secondGrant.id, toolId: "review.read",
+        parameterHash: "e".repeat(64), confirmationRequirement: "read_only", now: 8_000,
+      });
+      await fixture.authority.settleTool(runtime, {
+        dispatchId: secondDispatch.id, executionId: execution.id, attemptSeq: 1, grantId: secondGrant.id,
+        outcome: "failed", now: 8_500,
+      });
+      const before = authoritativeCountSnapshot(databasePath);
+      for (const dispatchId of [secondDispatch.id, firstDispatch.id, "dispatch-changed"]) {
+        await expect(fixture.authority.commitStep(runtime, {
+          executionId: execution.id, attemptSeq: 1, stepSeq: 4, stepKind: "tool_result",
+          dispatchId, boundedToolResult: { ok: false }, inputSha256: "e".repeat(64),
+          outputSha256: "f".repeat(64), now: 9_000,
+        })).rejects.toMatchObject({ status: 409, code: "execution_conflict" });
+        expect(authoritativeCountSnapshot(databasePath)).toEqual(before);
+      }
+      await fixture.client.close();
+    });
+
+    it.each(["succeeded", "failed"] as const)(
+      "Agent runtime authority closes a %s side-effect result safely",
+      async (outcome) => {
+        const directory = await mkdtemp(join(tmpdir(), `native-im-runtime-side-result-${outcome}-`));
+        temporaryDirectories.push(directory);
+        const databasePath = join(directory, "authority.sqlite");
+        const fixture = await createAgentFactFixture(databasePath);
+        const execution = await fixture.authority.invoke(fixture.humanContext, {
+          roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+          intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+        });
+        const runtime = mintInternalAgentRuntimeContext({ runtimeId: `runtime-side-result-${outcome}`, agentId: "agent-review" });
+        await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+        await checkpointToolCall(fixture, runtime, execution.id, 1, 4_500, "4".repeat(64));
+        const parameterHash = "4".repeat(64);
+        const grant = await fixture.authority.prepareTool(runtime, {
+          executionId: execution.id, attemptSeq: 1, ...DEFAULT_TOOL_CALL_BINDING, toolId: "review.read", parameterHash,
+          confirmationRequirement: "side_effect", now: 5_000, expiresAt: 10_000,
+        });
+        const confirmationAuthority = createSqliteAuthoritativeStore(fixture.client, { clock: () => 5_500 });
+        const confirmation = await confirmationAuthority.confirmTool(fixture.humanContext, {
+          executionId: execution.id, attemptSeq: 1, toolId: "review.read", parameterHash,
+          target: "review target", impact: "updates remote review", reversibility: "irreversible",
+          expiresAt: 9_000,
+        });
+        const dispatch = await fixture.authority.dispatchTool(runtime, {
+          executionId: execution.id, attemptSeq: 1, grantId: grant.id, toolId: "review.read",
+          parameterHash, confirmationRequirement: "side_effect", confirmationId: confirmation.id,
+          now: 6_000,
+        });
+        await fixture.authority.settleTool(runtime, {
+          dispatchId: dispatch.id, executionId: execution.id, attemptSeq: 1, grantId: grant.id,
+          outcome, closedSummary: outcome, now: 6_500,
+        });
+        const commitment = fixture.authority.commitStep(runtime, {
+          executionId: execution.id, attemptSeq: 1, stepSeq: 2, stepKind: "tool_result",
+          dispatchId: dispatch.id, boundedToolResult: { outcome }, inputSha256: "a".repeat(64),
+          outputSha256: "b".repeat(64), now: 7_000,
+        });
+        if (outcome === "succeeded") {
+          await expect(commitment).resolves.toMatchObject({ actionCategory: "model_generation", status: "running" });
+        } else {
+          await expect(commitment).rejects.toMatchObject({ status: 409, code: "execution_conflict" });
+        }
+        await fixture.client.close();
+        if (outcome === "succeeded") {
+          const restartedClient = await createWorkerDatabaseClient({ databasePath });
+          const restarted = createSqliteAuthoritativeStore(restartedClient);
+          await expect(recoverAllAgentRuntimeExecutions(restarted, runtime, 8_000)).resolves.toEqual([
+            expect.objectContaining({ id: execution.id, status: "queued", currentAttemptSeq: 2,
+              actionCategory: "model_generation" }),
+          ]);
+          await restartedClient.close();
+        }
+        const database = new DatabaseSync(databasePath, { readOnly: true });
+        expect(() => migrateAuthorityDatabase(database)).not.toThrow();
+        database.close();
+      },
+    );
+
+    it("Agent runtime authority terminalizes an outcome-unknown side effect and forbids continuation", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-side-unknown-"));
+      temporaryDirectories.push(directory);
+      const fixture = await createAgentFactFixture(join(directory, "authority.sqlite"));
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({ runtimeId: "runtime-side-unknown", agentId: "agent-review" });
+      await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+      await checkpointToolCall(fixture, runtime, execution.id, 1, 4_500, "5".repeat(64));
+      const parameterHash = "5".repeat(64);
+      const grant = await fixture.authority.prepareTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, ...DEFAULT_TOOL_CALL_BINDING, toolId: "review.read", parameterHash,
+        confirmationRequirement: "side_effect", now: 5_000, expiresAt: 10_000,
+      });
+      const confirmationAuthority = createSqliteAuthoritativeStore(fixture.client, { clock: () => 5_500 });
+      const confirmation = await confirmationAuthority.confirmTool(fixture.humanContext, {
+        executionId: execution.id, attemptSeq: 1, toolId: "review.read", parameterHash,
+        target: "review target", impact: "updates remote review", reversibility: "irreversible",
+        expiresAt: 9_000,
+      });
+      const dispatch = await fixture.authority.dispatchTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, grantId: grant.id, toolId: "review.read",
+        parameterHash, confirmationRequirement: "side_effect", confirmationId: confirmation.id,
+        now: 6_000,
+      });
+      await fixture.authority.settleTool(runtime, {
+        dispatchId: dispatch.id, executionId: execution.id, attemptSeq: 1, grantId: grant.id,
+        outcome: "outcome_unknown", closedSummary: "ambiguous", now: 6_500,
+      });
+      await expect(fixture.authority.readExecution({
+        sessionId: fixture.humanContext.sessionId,
+        sessionFamilyId: fixture.humanContext.sessionFamilyId,
+        principal: fixture.humanContext.principal,
+      }, execution.id)).resolves.toMatchObject({
+        status: "failed", terminalErrorCode: "side_effect_outcome_unknown",
+      });
+      await expect(fixture.authority.commitStep(runtime, {
+        executionId: execution.id, attemptSeq: 1, stepSeq: 1, stepKind: "tool_result",
+        dispatchId: dispatch.id, boundedToolResult: { outcome: "unknown" }, inputSha256: "a".repeat(64),
+        outputSha256: "b".repeat(64), now: 7_000,
+      })).rejects.toMatchObject({ code: "execution_conflict" });
+      await fixture.client.close();
+    });
+
+    it.each(["succeeded", "failed", "outcome_unknown"] as const)(
+      "Agent runtime authority publishes one bounded observable %s settlement without sealed compensation",
+      async (outcome) => {
+        const directory = await mkdtemp(join(tmpdir(), `native-im-runtime-settle-event-${outcome}-`));
+        temporaryDirectories.push(directory);
+        const databasePath = join(directory, "authority.sqlite");
+        const fixture = await createAgentFactFixture(databasePath);
+        const execution = await fixture.authority.invoke(fixture.humanContext, {
+          roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+          intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+        });
+        const runtime = mintInternalAgentRuntimeContext({ runtimeId: `runtime-settle-event-${outcome}`, agentId: "agent-review" });
+        await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+        await checkpointToolCall(fixture, runtime, execution.id, 1, 4_500, "3".repeat(64));
+        const grant = await fixture.authority.prepareTool(runtime, {
+          executionId: execution.id, attemptSeq: 1, ...DEFAULT_TOOL_CALL_BINDING, toolId: "review.read",
+          parameterHash: "3".repeat(64), confirmationRequirement: "read_only",
+          now: 5_000, expiresAt: 10_000,
+        });
+        const dispatch = await fixture.authority.dispatchTool(runtime, {
+          executionId: execution.id, attemptSeq: 1, grantId: grant.id, toolId: "review.read",
+          parameterHash: "3".repeat(64), confirmationRequirement: "read_only", now: 5_500,
+        });
+        const input = {
+          dispatchId: dispatch.id, executionId: execution.id, attemptSeq: 1, grantId: grant.id,
+          outcome, closedSummary: "bounded", sealedCompensation: "sealed-private-token", now: 6_000,
+        } as const;
+        const first = await fixture.authority.settleTool(runtime, input);
+        await expect(fixture.authority.settleTool(runtime, input)).resolves.toEqual(first);
+        const eventDatabase = new DatabaseSync(databasePath, { readOnly: true });
+        const settlementSequence = Number(eventDatabase.prepare(
+          `SELECT stream_seq AS streamSeq FROM events
+           WHERE event_type = 'room.agent_tool_dispatch.changed'`,
+        ).get()?.streamSeq);
+        const storedRoomEvents = eventDatabase.prepare(
+          `SELECT event_id AS eventId, stream_kind AS streamKind, stream_id AS streamId,
+                  stream_seq AS streamSeq, room_id AS roomId, actor_id AS actorId,
+                  occurred_at AS occurredAt, event_type AS type, payload_json AS payloadJson
+           FROM events WHERE stream_kind = 'room' ORDER BY stream_seq`,
+        ).all() as readonly Record<string, unknown>[];
+        for (const stored of storedRoomEvents) {
+          const { payloadJson, ...envelope } = stored;
+          expect(parsePersistedRoomEvent({ ...envelope, payload: JSON.parse(String(payloadJson)) }),
+            `stored event ${JSON.stringify(envelope)} ${String(payloadJson)}`)
+            .toMatchObject({ ok: true });
+        }
+        eventDatabase.close();
+        const synchronized = await fixture.authority.syncRoom({
+          sessionId: fixture.humanContext.sessionId,
+          sessionFamilyId: fixture.humanContext.sessionFamilyId,
+          principal: fixture.humanContext.principal,
+        }, {
+          type: "room.sync", requestId: `settlement-sync-${outcome}`, roomId: "room-facts",
+          cursor: { version: 1, roomId: "room-facts", afterSeq: settlementSequence - 1 }, limit: 100,
+        });
+        expect(synchronized).toMatchObject({ mode: "delta" });
+        expect(JSON.stringify(synchronized)).toContain("room.agent_tool_dispatch.changed");
+        expect(JSON.stringify(synchronized)).not.toContain("sealed-private-token");
+        const pending = await createSqliteAuthoritativeStore(fixture.client, { clock: () => 7_000 })
+          .listPendingOutbox(100);
+        expect(JSON.stringify(pending)).toContain("room.agent_tool_dispatch.changed");
+        expect(JSON.stringify(pending)).not.toContain("sealed-private-token");
+        await fixture.client.close();
+        const database = new DatabaseSync(databasePath, { readOnly: true });
+        const events = database.prepare(
+          `SELECT payload_json AS payload FROM events
+           WHERE event_type = 'room.agent_tool_dispatch.changed'`,
+        ).all() as readonly { readonly payload: string }[];
+        expect(events).toHaveLength(1);
+        expect(JSON.parse(events[0]!.payload)).toMatchObject({ id: dispatch.id, state: outcome });
+        expect(events[0]!.payload).not.toContain("sealed-private-token");
+        expect(database.prepare(
+          `SELECT COUNT(*) AS count FROM outbox_deliveries AS delivery
+           JOIN events AS event ON event.event_id = delivery.event_id
+           WHERE event.event_type = 'room.agent_tool_dispatch.changed'`,
+        ).get()).toEqual({ count: 1 });
+        database.close();
+      },
+    );
+
+    it("Agent runtime authority interrupts idempotently and manual retry creates a new execution", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-interrupt-"));
+      temporaryDirectories.push(directory);
+      const fixture = await createAgentFactFixture(join(directory, "authority.sqlite"));
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({ runtimeId: "runtime-interrupt", agentId: "agent-review" });
+      await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+      const interruptAuthority = createSqliteAuthoritativeStore(fixture.client, { clock: () => 5_000 });
+      const interrupted = await interruptAuthority.interrupt(fixture.humanContext, {
+        executionId: execution.id, reason: "requested_by_requester",
+      });
+      expect(interrupted).toMatchObject({ status: "cancelled", cancellationReason: "requested_by_requester" });
+      await expect(interruptAuthority.interrupt(fixture.humanContext, {
+        executionId: execution.id, reason: "requested_by_requester",
+      })).resolves.toEqual(interrupted);
+      await expect(fixture.authority.commitStep(runtime, {
+        executionId: execution.id, attemptSeq: 1, stepSeq: 1, stepKind: "model_generation",
+        inputSha256: "a".repeat(64), outputSha256: "b".repeat(64), now: 6_000,
+      })).rejects.toMatchObject({ code: "execution_conflict" });
+
+      const failed = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source-next", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      await fixture.authority.claimNext(runtime, "room-facts", 7_000);
+      await fixture.authority.scheduleRetry(runtime, {
+        executionId: failed.id, attemptSeq: 1, errorCode: "upstream_timeout", now: 8_000,
+      });
+      await fixture.authority.claimNext(runtime, "room-facts", 9_000);
+      await fixture.authority.scheduleRetry(runtime, {
+        executionId: failed.id, attemptSeq: 2, errorCode: "upstream_timeout", now: 10_000,
+      });
+      await fixture.authority.claimNext(runtime, "room-facts", 14_000);
+      await fixture.authority.scheduleRetry(runtime, {
+        executionId: failed.id, attemptSeq: 3, errorCode: "upstream_timeout", now: 15_000,
+      });
+      const retryAuthority = createSqliteAuthoritativeStore(fixture.client, { clock: () => 16_000 });
+      const retried = await retryAuthority.manualRetry(fixture.humanContext, failed.id);
+      expect(retried).toMatchObject({
+        status: "queued", currentAttemptSeq: 1, retryOrdinal: 1,
+        manualRetryOfExecutionId: failed.id,
+      });
+      await expect(retryAuthority.manualRetry(fixture.humanContext, failed.id)).resolves.toEqual(retried);
+      await fixture.client.close();
+    });
+
+    it("Agent runtime authority recovers a running model attempt without reviving the old attempt", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-recover-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({ runtimeId: "runtime-recover", agentId: "agent-review" });
+      await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+      await fixture.client.close();
+
+      const reopenedClient = await createWorkerDatabaseClient({ databasePath });
+      const reopened = createSqliteAuthoritativeStore(reopenedClient);
+      await expect(recoverAllAgentRuntimeExecutions(reopened, runtime, 5_000)).resolves.toEqual([
+        expect.objectContaining({ id: execution.id, status: "queued", currentAttemptSeq: 2, retryOrdinal: 2 }),
+      ]);
+      await expect(reopened.claimNext(runtime, "room-facts", 5_999)).resolves.toBeUndefined();
+      await expect(reopened.claimNext(runtime, "room-facts", 6_000))
+        .resolves.toMatchObject({ id: execution.id, currentAttemptSeq: 2, status: "running" });
+      await reopenedClient.close();
+    });
+
+    it("Agent runtime authority pages recovery with a stable keyset across restart and unrelated agents", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-recovery-pages-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      await fixture.client.close();
+
+      const database = new DatabaseSync(databasePath);
+      database.exec(`
+        INSERT INTO actors (id, kind, display_name)
+        VALUES ('agent-unrelated-recovery', 'agent', 'Unrelated recovery Agent');
+        INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+        VALUES ('identity', 'agent-unrelated-recovery', 0, 1);
+        WITH RECURSIVE seq(value) AS (
+          VALUES (1) UNION ALL SELECT value + 1 FROM seq WHERE value < 10000
+        )
+        INSERT INTO agent_executions (
+          id, room_id, agent_id, source_message_id, requester_actor_id, state,
+          action_category, tool_dispatch_phase, current_tool_id,
+          current_attempt_seq, retry_cycle, retry_ordinal, provider_id, model_id,
+          recovery_cursor, queued_at, started_at, updated_at, completed_at,
+          cancellation_reason, terminal_error_code, dead_lettered_at, result_message_id,
+          manual_retry_of_execution_id, compensates_execution_id,
+          supersedes_execution_ids_json, legacy_result_json
+        )
+        SELECT printf('unrelated-recovery-%05d', value), 'room-facts',
+               'agent-unrelated-recovery', 'message-human-source', 'human-li',
+               'queued', 'model_generation', NULL, NULL, 1, 1, 2,
+               'provider-test', 'model-test', 0,
+               '1970-01-01T00:00:03.000Z', NULL, '1970-01-01T00:00:03.000Z',
+               NULL, NULL, NULL, NULL, NULL, NULL, NULL, '[]', NULL
+        FROM seq;
+        WITH RECURSIVE seq(value) AS (
+          VALUES (1) UNION ALL SELECT value + 1 FROM seq WHERE value < 5
+        )
+        INSERT INTO agent_executions (
+          id, room_id, agent_id, source_message_id, requester_actor_id, state,
+          action_category, tool_dispatch_phase, current_tool_id,
+          current_attempt_seq, retry_cycle, retry_ordinal, provider_id, model_id,
+          recovery_cursor, queued_at, started_at, updated_at, completed_at,
+          cancellation_reason, terminal_error_code, dead_lettered_at, result_message_id,
+          manual_retry_of_execution_id, compensates_execution_id,
+          supersedes_execution_ids_json, legacy_result_json
+        )
+        SELECT printf('target-recovery-%02d', value), 'room-facts',
+               'agent-review', 'message-human-source', 'human-li',
+               'queued', 'model_generation', NULL, NULL, 1, 1, 2,
+               'provider-test', 'model-test', 0,
+               '1970-01-01T00:00:03.000Z', NULL, '1970-01-01T00:00:03.000Z',
+               NULL, NULL, NULL, NULL, NULL, NULL, NULL, '[]', NULL
+        FROM seq;
+        INSERT INTO agent_execution_attempts (
+          execution_id, room_id, attempt_seq, retry_cycle, retry_ordinal, state,
+          action_category, tool_dispatch_phase, started_at, finished_at,
+          error_code, next_retry_at, recovery_cursor, enqueue_stream_seq
+        )
+        SELECT id, room_id, 1, 1, 2, 'queued', 'model_generation', NULL,
+               NULL, NULL, NULL, 0, 0, 1
+        FROM agent_executions
+        WHERE id LIKE 'unrelated-recovery-%' OR id LIKE 'target-recovery-%';
+      `);
+      expect(() => migrateAuthorityDatabase(database)).not.toThrow();
+      for (const state of ["queued", "running"] as const) {
+        const explain = database.prepare(
+          `EXPLAIN QUERY PLAN
+           SELECT execution.id
+           FROM agent_executions AS execution INDEXED BY agent_executions_agent_state_id
+           WHERE execution.agent_id = ? AND execution.state = ?
+             AND execution.id > ?
+           ORDER BY execution.id LIMIT ?`,
+        ).all("agent-review", state, "", 2).map((row) => String(row.detail));
+        expect(explain.some((detail) =>
+          detail.includes("agent_executions_agent_state_id") && detail.includes("SEARCH execution"),
+        )).toBe(true);
+        expect(explain.join("\n")).not.toMatch(/SCAN execution|AUTOMATIC|TEMP B-TREE/);
+      }
+      database.close();
+
+      const runtime = mintInternalAgentRuntimeContext({
+        runtimeId: "runtime-recovery-pages",
+        agentId: "agent-review",
+      });
+      let client = await createWorkerDatabaseClient({ databasePath });
+      let authority = createSqliteAuthoritativeStore(client);
+      let cursor: string | undefined;
+      let restarted = false;
+      const recoveredIds: string[] = [];
+      do {
+        const page = await authority.recoverPage(runtime, {
+          now: 10_000, limit: 2, ...(cursor === undefined ? {} : { cursor }),
+        });
+        expect(page.recoveries.length).toBeLessThanOrEqual(2);
+        recoveredIds.push(...page.recoveries.map(({ execution }) => execution.id));
+        cursor = page.nextCursor;
+        if (!restarted && recoveredIds.length === 2) {
+          await client.close();
+          client = await createWorkerDatabaseClient({ databasePath });
+          authority = createSqliteAuthoritativeStore(client);
+          restarted = true;
+        }
+      } while (cursor !== undefined);
+      await client.close();
+      expect(restarted).toBe(true);
+      expect(recoveredIds).toEqual([
+        "target-recovery-01", "target-recovery-02", "target-recovery-03",
+        "target-recovery-04", "target-recovery-05",
+      ]);
+      expect(new Set(recoveredIds).size).toBe(recoveredIds.length);
+    });
+
+    it("Agent runtime recovery returns a future retry deadline after a worker restart", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-recovery-future-retry-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({
+        runtimeId: "runtime-recovery-future-retry",
+        agentId: "agent-review",
+      });
+      await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+      const retried = await fixture.authority.scheduleRetry(runtime, {
+        executionId: execution.id, attemptSeq: 1, errorCode: "upstream_timeout", now: 5_000,
+      });
+      await fixture.client.close();
+
+      const reopenedClient = await createWorkerDatabaseClient({ databasePath });
+      const reopened = createSqliteAuthoritativeStore(reopenedClient);
+      await expect(reopened.recoverPage(runtime, { now: 5_500, limit: 1 })).resolves.toEqual({
+        recoveries: [{ execution: retried, nextRetryAt: 6_000 }],
+        nextCursor: expect.any(String),
+      });
+      await reopenedClient.close();
+    });
+
+    it("Agent runtime pages exact expired confirmations without holes or duplicates", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-expired-pages-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      await fixture.client.close();
+
+      const database = new DatabaseSync(databasePath);
+      database.exec(`
+        WITH RECURSIVE seq(value) AS (
+          VALUES (1) UNION ALL SELECT value + 1 FROM seq WHERE value < 257
+        )
+        INSERT INTO agent_executions (
+          id, room_id, agent_id, source_message_id, requester_actor_id, state,
+          action_category, current_attempt_seq, retry_cycle, retry_ordinal,
+          provider_id, model_id, recovery_cursor, queued_at, started_at, updated_at
+        )
+        SELECT printf('expired-page-%03d', value), 'room-facts', 'agent-review',
+               'message-human-source', 'human-li', 'running', 'waiting_upstream',
+               1, 1, 1, 'provider-test', 'model-test', 1,
+               '1970-01-01T00:00:03.000Z', '1970-01-01T00:00:04.000Z',
+               '1970-01-01T00:00:04.000Z'
+        FROM seq;
+        INSERT INTO agent_execution_attempts (
+          execution_id, room_id, attempt_seq, retry_cycle, retry_ordinal, state,
+          action_category, started_at, recovery_cursor
+        )
+        SELECT id, room_id, 1, 1, 1, 'running', 'waiting_upstream',
+               '1970-01-01T00:00:04.000Z', 1
+        FROM agent_executions WHERE id LIKE 'expired-page-%';
+        INSERT INTO agent_execution_steps (
+          execution_id, attempt_seq, step_seq, step_kind, canonical_tool_call_json,
+          input_sha256, output_sha256, completed_at
+        )
+        SELECT id, 1, 1, 'tool_call', '{"toolId":"review.read"}',
+               '${"a".repeat(64)}', '${"a".repeat(64)}',
+               '1970-01-01T00:00:04.000Z'
+        FROM agent_executions WHERE id LIKE 'expired-page-%';
+        INSERT INTO agent_tool_grants (
+          id, execution_id, attempt_seq, tool_call_step_seq, agent_id, room_id,
+          tool_id, parameter_hash, tool_plan_hash, confirmation_requirement,
+          issued_at, expires_at
+        )
+        SELECT 'grant-' || id, id, 1, 1, 'agent-review', 'room-facts', 'review.read',
+               '${"a".repeat(64)}', '${"a".repeat(64)}', 'side_effect',
+               '1970-01-01T00:00:04.000Z', '1970-01-01T00:00:05.000Z'
+        FROM agent_executions WHERE id LIKE 'expired-page-%';
+      `);
+      expect(() => migrateAuthorityDatabase(database)).not.toThrow();
+      database.close();
+
+      const client = await createWorkerDatabaseClient({ databasePath });
+      const authority = createSqliteAuthoritativeStore(client);
+      const runtime = mintInternalAgentRuntimeContext({
+        runtimeId: "runtime-expired-pages",
+        agentId: "agent-review",
+      });
+      const recoveredIds: string[] = [];
+      let cursor: string | undefined;
+      do {
+        const page = await authority.recoverPage(runtime, {
+          now: 6_000, limit: 64, ...(cursor === undefined ? {} : { cursor }),
+        });
+        expect(page.recoveries.length).toBeLessThanOrEqual(64);
+        recoveredIds.push(...page.recoveries.map(({ execution }) => execution.id));
+        cursor = page.nextCursor;
+      } while (cursor !== undefined);
+      await client.close();
+
+      expect(recoveredIds).toHaveLength(257);
+      expect(new Set(recoveredIds).size).toBe(257);
+      expect(recoveredIds).toEqual(
+        Array.from({ length: 257 }, (_, index) => `expired-page-${String(index + 1).padStart(3, "0")}`),
+      );
+    });
+
+    it("Agent runtime authority atomically confirms, dispatches, and late-settles a cancelled side effect", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-tool-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({ runtimeId: "runtime-tool", agentId: "agent-review" });
+      await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+      await checkpointToolCall(fixture, runtime, execution.id, 1, 4_500, "c".repeat(64));
+      const parameterHash = "c".repeat(64);
+      const grant = await fixture.authority.prepareTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, ...DEFAULT_TOOL_CALL_BINDING, toolId: "review.read", parameterHash,
+        confirmationRequirement: "side_effect", now: 5_000, expiresAt: 10_000,
+      });
+      await expect(fixture.authority.readExecution({
+        sessionId: fixture.humanContext.sessionId,
+        sessionFamilyId: fixture.humanContext.sessionFamilyId,
+        principal: fixture.humanContext.principal,
+      }, execution.id)).resolves.toMatchObject({
+        actionCategory: "waiting_upstream",
+        status: "running",
+      });
+      const confirmationRequiredSync = await fixture.authority.syncRoom({
+        sessionId: fixture.humanContext.sessionId,
+        sessionFamilyId: fixture.humanContext.sessionFamilyId,
+        principal: fixture.humanContext.principal,
+      }, {
+        type: "room.sync", requestId: "confirmation-required-sync", roomId: "room-facts",
+        cursor: { version: 1, roomId: "room-facts", afterSeq: 0 }, limit: 100,
+      });
+      expect(JSON.stringify(confirmationRequiredSync)).toContain("room.agent_tool_confirmation.required");
+      expect(JSON.stringify(await createSqliteAuthoritativeStore(fixture.client, { clock: () => 5_250 })
+        .listPendingOutbox(100))).toContain("room.agent_tool_confirmation.required");
+      const confirmationAuthority = createSqliteAuthoritativeStore(fixture.client, { clock: () => 5_500 });
+      const confirmation = await confirmationAuthority.confirmTool(fixture.humanContext, {
+        executionId: execution.id, attemptSeq: 1, toolId: "review.read", parameterHash,
+        target: "review target", impact: "updates remote review", reversibility: "compensatable",
+        expiresAt: 9_000,
+      });
+      await expect(fixture.authority.dispatchTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, grantId: grant.id,
+        toolId: "review.read", parameterHash, confirmationRequirement: "read_only", now: 5_750,
+      })).rejects.toMatchObject({ code: "execution_conflict" });
+      const dispatch = await fixture.authority.dispatchTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, grantId: grant.id,
+        toolId: "review.read", parameterHash, confirmationRequirement: "side_effect",
+        confirmationId: confirmation.id, now: 6_000,
+      });
+      expect(grant).toMatchObject({ confirmationRequirement: "side_effect" });
+      expect(dispatch).toMatchObject({ state: "dispatched", grantId: grant.id });
+      await expect(fixture.authority.dispatchTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, grantId: grant.id,
+        toolId: "review.read", parameterHash, confirmationRequirement: "side_effect",
+        confirmationId: confirmation.id, now: 6_500,
+      })).rejects.toMatchObject({ code: "execution_conflict" });
+
+      const interruptAuthority = createSqliteAuthoritativeStore(fixture.client, { clock: () => 7_000 });
+      await interruptAuthority.interrupt(fixture.humanContext, {
+        executionId: execution.id, reason: "requested_by_requester",
+      });
+      await expect(fixture.authority.settleTool(runtime, {
+        dispatchId: dispatch.id, executionId: execution.id, attemptSeq: 1, grantId: grant.id,
+        outcome: "succeeded", closedSummary: "updated", sealedCompensation: "sealed-token", now: 8_000,
+      })).resolves.toMatchObject({ state: "succeeded", closedSummary: "updated" });
+      const sessionContext = {
+        sessionId: fixture.humanContext.sessionId,
+        sessionFamilyId: fixture.humanContext.sessionFamilyId,
+        principal: fixture.humanContext.principal,
+      };
+      await expect(fixture.authority.readExecution(sessionContext, execution.id))
+        .resolves.toMatchObject({ status: "cancelled", cancellationReason: "requested_by_requester" });
+      await fixture.client.close();
+    });
+
+    it("Agent runtime compensation creates one new linked execution after a compensatable side effect", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-compensation-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const original = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({
+        runtimeId: "runtime-compensation",
+        agentId: "agent-review",
+      });
+      await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+      const parameters = { path: "note.txt", content: "after", expectedCurrentSha256: null } as const;
+      const parameterHash = createHash("sha256")
+        .update(JSON.stringify({ content: "after", expectedCurrentSha256: null, path: "note.txt" }))
+        .digest("hex");
+      const toolPlanHash = createHash("sha256")
+        .update(`{"parameters":{"content":"after","expectedCurrentSha256":null,"path":"note.txt"},"remainingCalls":[],"toolId":"review.read"}`)
+        .digest("hex");
+      await fixture.authority.commitStep(runtime, {
+        executionId: original.id, attemptSeq: 1, stepSeq: 1, stepKind: "tool_call",
+        canonicalToolCall: { toolId: "review.read", parameters, remainingCalls: [] },
+        inputSha256: "a".repeat(64), outputSha256: parameterHash, now: 4_500,
+      });
+      await fixture.authority.prepareTool(runtime, {
+        executionId: original.id, attemptSeq: 1, toolCallStepSeq: 1,
+        toolId: "review.read", parameterHash, toolPlanHash,
+        confirmationRequirement: "side_effect", now: 4_750, expiresAt: 10_000,
+      });
+      const confirmation = await fixture.authority.confirmTool(fixture.humanContext, {
+        executionId: original.id, attemptSeq: 1, toolId: "review.read", parameterHash,
+        target: "note.txt", impact: "replace sandbox file", reversibility: "compensatable",
+        expiresAt: 9_000,
+      });
+      const resumed = await fixture.authority.resumeConfirmedTool(runtime, {
+        confirmationId: confirmation.id, executionId: original.id, attemptSeq: 1,
+        roomId: "room-facts", toolId: "review.read", parameterHash,
+        toolPlanHash: confirmation.toolPlanHash, now: 5_000,
+      });
+      await createSqliteAuthoritativeStore(fixture.client, { clock: () => 5_125 })
+        .interrupt(fixture.humanContext, {
+          executionId: original.id,
+          reason: "requested_by_requester",
+        });
+      await fixture.authority.settleTool(runtime, {
+        dispatchId: resumed.dispatch.id, executionId: original.id, attemptSeq: 1,
+        grantId: resumed.dispatch.grantId, outcome: "succeeded",
+        closedSummary: "sandbox_write:replace", sealedCompensation: "sealed-private-token", now: 5_250,
+      });
+      await expect(fixture.authority.readExecution({
+        sessionId: fixture.humanContext.sessionId,
+        sessionFamilyId: fixture.humanContext.sessionFamilyId,
+        principal: fixture.humanContext.principal,
+      }, original.id)).resolves.toMatchObject({ status: "cancelled" });
+
+      const authority = fixture.authority;
+      const compensation = await authority.compensate(
+        fixture.humanContext, original.id, resumed.dispatch.id, 32,
+      );
+      expect(compensation).toMatchObject({
+        status: "queued", actionCategory: "model_generation",
+        compensatesExecutionId: original.id, roomId: original.roomId, agentId: original.agentId,
+      });
+      await expect(authority.compensate(
+        fixture.humanContext, original.id, resumed.dispatch.id, 32,
+      ))
+        .resolves.toEqual(compensation);
+      await fixture.client.close();
+      const restartedClient = await createWorkerDatabaseClient({ databasePath });
+      const restartedAuthority = createSqliteAuthoritativeStore(restartedClient, { clock: () => 5_500 });
+      const claimedCompensation = await restartedAuthority.claimNext(runtime, "room-facts", 5_500);
+      expect(claimedCompensation).toMatchObject({ id: compensation.id, status: "running" });
+      const wrongRuntime = mintInternalAgentRuntimeContext({
+        runtimeId: "runtime-compensation-wrong-agent", agentId: "agent-other",
+      });
+      await expect(restartedAuthority.resumeCompensation(wrongRuntime, {
+        executionId: compensation.id, attemptSeq: 1, now: 5_625,
+      })).rejects.toMatchObject({ code: "agent_capability_forbidden", status: 403 });
+      const denialDatabase = new DatabaseSync(databasePath, { readOnly: true });
+      expect(denialDatabase.prepare(
+        "SELECT COUNT(*) AS count FROM agent_tool_dispatches WHERE execution_id = ?",
+      ).get(compensation.id)).toEqual({ count: 0 });
+      denialDatabase.close();
+      const work = await restartedAuthority.resumeCompensation(runtime, {
+        executionId: compensation.id, attemptSeq: 1, now: 5_750,
+      });
+      expect(work).toMatchObject({
+        execution: {
+          id: compensation.id, status: "running", actionCategory: "tool_call",
+          toolDispatchPhase: "dispatched", compensatesExecutionId: original.id,
+        },
+        sealedCompensation: "sealed-private-token",
+        dispatch: { state: "dispatched", executionId: compensation.id },
+      });
+      await expect(restartedAuthority.resumeCompensation(runtime, {
+        executionId: compensation.id, attemptSeq: 1, now: 6_000,
+      })).rejects.toMatchObject({ code: "execution_conflict" });
+      const result = { path: "note.txt", restored: true } as const;
+      const completed = await restartedAuthority.completeCompensation(runtime, {
+        executionId: compensation.id,
+        attemptSeq: 1,
+        dispatchId: work.dispatch.id,
+        grantId: work.dispatch.grantId,
+        boundedToolResult: result,
+        inputSha256: work.dispatch.parameterHash,
+        outputSha256: createHash("sha256")
+          .update(JSON.stringify({ path: "note.txt", restored: true }))
+          .digest("hex"),
+        closedSummary: "sandbox_compensation:restored:note.txt",
+        messageId: "message-compensation-result",
+        body: "Compensation completed.",
+        sentAt: new Date(6_250).toISOString(),
+        now: 6_250,
+      });
+      expect(completed).toMatchObject({
+        id: compensation.id,
+        status: "completed",
+        actionCategory: "model_generation",
+        recoveryCursor: 2,
+        resultMessageId: "message-compensation-result",
+      });
+      await expect(restartedAuthority.completeCompensation(runtime, {
+        executionId: compensation.id,
+        attemptSeq: 1,
+        dispatchId: work.dispatch.id,
+        grantId: work.dispatch.grantId,
+        boundedToolResult: result,
+        inputSha256: work.dispatch.parameterHash,
+        outputSha256: createHash("sha256")
+          .update(JSON.stringify({ path: "note.txt", restored: true }))
+          .digest("hex"),
+        closedSummary: "sandbox_compensation:restored:note.txt",
+        messageId: "message-compensation-result",
+        body: "Compensation completed.",
+        sentAt: new Date(6_250).toISOString(),
+        now: 6_250,
+      })).resolves.toEqual(completed);
+      await expect(restartedAuthority.completeCompensation(runtime, {
+        executionId: compensation.id,
+        attemptSeq: 1,
+        dispatchId: work.dispatch.id,
+        grantId: work.dispatch.grantId,
+        boundedToolResult: result,
+        inputSha256: work.dispatch.parameterHash,
+        outputSha256: createHash("sha256")
+          .update(JSON.stringify({ path: "note.txt", restored: true }))
+          .digest("hex"),
+        closedSummary: "sandbox_compensation:restored:note.txt",
+        messageId: "message-compensation-result",
+        body: "changed body",
+        sentAt: new Date(6_250).toISOString(),
+        now: 6_250,
+      })).rejects.toMatchObject({ code: "idempotency_conflict", status: 409 });
+      const completedDatabase = new DatabaseSync(databasePath, { readOnly: true });
+      expect(completedDatabase.prepare(
+        `SELECT dispatch.state, step.step_kind AS stepKind, execution.state AS executionState,
+                execution.result_message_id AS resultMessageId
+         FROM agent_tool_dispatches AS dispatch
+         JOIN agent_execution_steps AS step ON step.dispatch_id = dispatch.id
+         JOIN agent_executions AS execution ON execution.id = dispatch.execution_id
+         WHERE dispatch.id = ?`,
+      ).get(work.dispatch.id)).toEqual({
+        state: "succeeded",
+        stepKind: "tool_result",
+        executionState: "completed",
+        resultMessageId: "message-compensation-result",
+      });
+      expect(completedDatabase.prepare(
+        "SELECT COUNT(*) AS count FROM messages WHERE id = ?",
+      ).get("message-compensation-result")).toEqual({ count: 1 });
+      completedDatabase.close();
+      const privateDatabase = new DatabaseSync(databasePath, { readOnly: true });
+      expect(JSON.stringify(privateDatabase.prepare(
+        "SELECT payload_json AS payload FROM events WHERE stream_kind = 'room' ORDER BY stream_seq",
+      ).all())).not.toContain("sealed-private-token");
+      privateDatabase.close();
+      await restartedClient.close();
+    });
+
+    it("Agent runtime authority resumes a confirmed side effect from bounded durable parameters after restart", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-side-resume-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({ runtimeId: "runtime-side-resume", agentId: "agent-review" });
+      await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+      await fixture.authority.commitStep(runtime, {
+        executionId: execution.id, attemptSeq: 1, stepSeq: 1, stepKind: "model_generation",
+        inputSha256: "a".repeat(64), outputSha256: "b".repeat(64), now: 4_250,
+      });
+      const parameters = { path: "note.txt", content: "hello" } as const;
+      const parameterHash = createHash("sha256")
+        .update(JSON.stringify({ content: "hello", path: "note.txt" }))
+        .digest("hex");
+      await fixture.authority.commitStep(runtime, {
+        executionId: execution.id, attemptSeq: 1, stepSeq: 2, stepKind: "tool_call",
+        canonicalToolCall: {
+          toolId: "review.read",
+          parameters,
+          remainingCalls: [{ callId: "call-next", toolId: "review.next", parameters: { page: 2 } }],
+        },
+        inputSha256: "c".repeat(64), outputSha256: parameterHash, now: 4_500,
+      });
+      await fixture.authority.prepareTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, toolCallStepSeq: 2,
+        toolId: "review.read", parameterHash,
+        toolPlanHash: createHash("sha256").update(
+          '{"parameters":{"content":"hello","path":"note.txt"},"remainingCalls":[{"callId":"call-next","parameters":{"page":2},"toolId":"review.next"}],"toolId":"review.read"}',
+        ).digest("hex"),
+        confirmationRequirement: "side_effect", now: 4_750, expiresAt: 10_000,
+      });
+      const confirmation = await fixture.authority.confirmTool(fixture.humanContext, {
+        executionId: execution.id, attemptSeq: 1, toolId: "review.read", parameterHash,
+        target: "note.txt", impact: "create file", reversibility: "compensatable",
+        expiresAt: 9_000,
+      });
+      await fixture.client.close();
+
+      const reopenedClient = await createWorkerDatabaseClient({ databasePath });
+      const reopened = createSqliteAuthoritativeStore(reopenedClient);
+      await expect(reopened.resumeConfirmedTool(runtime, {
+        confirmationId: confirmation.id,
+        executionId: execution.id,
+        attemptSeq: 1,
+        roomId: "room-wrong",
+        toolId: "review.read",
+        parameterHash,
+        toolPlanHash: confirmation.toolPlanHash,
+        now: 4_900,
+      })).rejects.toMatchObject({ code: "execution_conflict", status: 409 });
+      const beforeResume = new DatabaseSync(databasePath, { readOnly: true });
+      expect(beforeResume.prepare(
+        "SELECT COUNT(*) AS count FROM agent_tool_dispatches WHERE execution_id = ?",
+      ).get(execution.id)).toEqual({ count: 0 });
+      expect(beforeResume.prepare(
+        "SELECT consumed_at AS consumedAt FROM agent_tool_confirmations WHERE id = ?",
+      ).get(confirmation.id)).toEqual({ consumedAt: null });
+      beforeResume.close();
+      const resumed = await reopened.resumeConfirmedTool(runtime, {
+        confirmationId: confirmation.id,
+        executionId: execution.id,
+        attemptSeq: 1,
+        roomId: "room-facts",
+        toolId: "review.read",
+        parameterHash,
+        toolPlanHash: confirmation.toolPlanHash,
+        now: 5_000,
+      });
+      expect(resumed).toMatchObject({
+        confirmationId: confirmation.id,
+        parameters,
+        remainingCalls: [{ callId: "call-next", toolId: "review.next", parameters: { page: 2 } }],
+        execution: {
+          id: execution.id,
+          status: "running",
+          actionCategory: "tool_call",
+          toolDispatchPhase: "dispatched",
+          currentToolId: "review.read",
+        },
+        dispatch: {
+          executionId: execution.id,
+          state: "dispatched",
+          toolId: "review.read",
+          parameterHash,
+        },
+      });
+      await expect(reopened.resumeConfirmedTool(runtime, {
+        confirmationId: confirmation.id,
+        executionId: execution.id,
+        attemptSeq: 1,
+        roomId: "room-facts",
+        toolId: "review.read",
+        parameterHash,
+        toolPlanHash: confirmation.toolPlanHash,
+        now: 5_100,
+      })).rejects.toMatchObject({ code: "execution_conflict", status: 409 });
+      const readOnly = new DatabaseSync(databasePath, { readOnly: true });
+      expect(readOnly.prepare(
+        "SELECT COUNT(*) AS count FROM agent_tool_dispatches WHERE grant_id = ?",
+      ).get(resumed.dispatch.grantId)).toEqual({ count: 1 });
+      readOnly.close();
+      await reopened.settleTool(runtime, {
+        dispatchId: resumed.dispatch.id, executionId: execution.id, attemptSeq: 1,
+        grantId: resumed.dispatch.grantId, outcome: "succeeded", now: 5_250,
+      });
+      await expect(reopened.commitStep(runtime, {
+        executionId: execution.id, attemptSeq: 1, stepSeq: 3, stepKind: "tool_result",
+        dispatchId: resumed.dispatch.id, boundedToolResult: { written: true },
+        inputSha256: parameterHash, outputSha256: "d".repeat(64), now: 5_500,
+      })).resolves.toMatchObject({ actionCategory: "model_generation", recoveryCursor: 3 });
+      await reopenedClient.close();
+    });
+
+    it("Agent runtime authority distinguishes identical side-effect calls by durable tool-call step across restart", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-repeat-side-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({ runtimeId: "runtime-repeat-side", agentId: "agent-review" });
+      await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+      const parameters = {} as const;
+      const parameterHash = createHash("sha256").update("{}").digest("hex");
+      const canonicalToolCall = { toolId: "review.read", parameters, remainingCalls: [] } as const;
+      const toolPlanHash = createHash("sha256")
+        .update('{"parameters":{},"remainingCalls":[],"toolId":"review.read"}')
+        .digest("hex");
+      const confirm = async (stepSeq: number, now: number) => {
+        await fixture.authority.commitStep(runtime, {
+          executionId: execution.id, attemptSeq: 1, stepSeq, stepKind: "tool_call",
+          canonicalToolCall, inputSha256: "a".repeat(64), outputSha256: parameterHash, now,
+        });
+        const grant = await fixture.authority.prepareTool(runtime, {
+          executionId: execution.id, attemptSeq: 1, toolCallStepSeq: stepSeq,
+          toolId: "review.read", parameterHash, toolPlanHash,
+          confirmationRequirement: "side_effect", now: now + 100, expiresAt: now + 5_000,
+        });
+        const confirmationInput = {
+          executionId: execution.id, attemptSeq: 1, toolId: "review.read", parameterHash,
+          target: "same", impact: "same", reversibility: "compensatable", expiresAt: now + 4_000,
+        } as const;
+        const [confirmation, replay] = await Promise.all([
+          fixture.authority.confirmTool(fixture.humanContext, confirmationInput),
+          fixture.authority.confirmTool(fixture.humanContext, confirmationInput),
+        ]);
+        expect(replay).toEqual(confirmation);
+        return { grant, confirmation };
+      };
+      const first = await confirm(1, 4_500);
+      const firstDispatch = await fixture.authority.resumeConfirmedTool(runtime, {
+        confirmationId: first.confirmation.id, executionId: execution.id, attemptSeq: 1,
+        roomId: "room-facts", toolId: "review.read", parameterHash, toolPlanHash, now: 5_000,
+      });
+      await fixture.authority.settleTool(runtime, {
+        dispatchId: firstDispatch.dispatch.id, executionId: execution.id, attemptSeq: 1,
+        grantId: first.grant.id, outcome: "succeeded",
+        sealedCompensation: "sealed-first", now: 5_100,
+      });
+      await fixture.authority.commitStep(runtime, {
+        executionId: execution.id, attemptSeq: 1, stepSeq: 2, stepKind: "tool_result",
+        dispatchId: firstDispatch.dispatch.id, boundedToolResult: { ok: true },
+        inputSha256: parameterHash, outputSha256: "b".repeat(64), now: 5_200,
+      });
+      const second = await confirm(3, 5_300);
+      expect(second.grant.id).not.toBe(first.grant.id);
+      expect(second.confirmation.id).not.toBe(first.confirmation.id);
+      await fixture.client.close();
+      const reopenedClient = await createWorkerDatabaseClient({ databasePath });
+      const reopened = createSqliteAuthoritativeStore(reopenedClient);
+      const secondDispatch = await reopened.resumeConfirmedTool(runtime, {
+        confirmationId: second.confirmation.id, executionId: execution.id, attemptSeq: 1,
+        roomId: "room-facts", toolId: "review.read", parameterHash, toolPlanHash, now: 5_500,
+      });
+      expect(secondDispatch.dispatch.id).not.toBe(firstDispatch.dispatch.id);
+      expect(secondDispatch.toolPlanHash).toBe(toolPlanHash);
+      await reopened.settleTool(runtime, {
+        dispatchId: secondDispatch.dispatch.id, executionId: execution.id, attemptSeq: 1,
+        grantId: second.grant.id, outcome: "succeeded",
+        sealedCompensation: "sealed-second", now: 5_600,
+      });
+      await reopenedClient.close();
+
+      const explainDatabase = new DatabaseSync(databasePath, { readOnly: true });
+      const explain = explainDatabase.prepare(
+        `EXPLAIN QUERY PLAN
+         SELECT execution.id
+         FROM agent_executions AS execution
+         JOIN agent_execution_attempts AS attempt
+           ON attempt.execution_id = execution.id
+          AND attempt.attempt_seq = execution.current_attempt_seq
+         JOIN agent_tool_grants AS grant INDEXED BY agent_tool_grants_execution_step
+           ON grant.execution_id = execution.id
+          AND grant.attempt_seq = execution.current_attempt_seq
+          AND grant.tool_call_step_seq = execution.recovery_cursor
+          AND grant.confirmation_requirement = 'side_effect'
+         JOIN agent_tool_dispatches AS dispatch
+           ON dispatch.grant_id = grant.id
+          AND dispatch.execution_id = execution.id
+          AND dispatch.attempt_seq = execution.current_attempt_seq
+         WHERE execution.id = ? AND dispatch.state IN ('succeeded', 'failed')
+         LIMIT 2`,
+      ).all(execution.id).map((row) => String(row.detail));
+      expect(explain.some((detail) =>
+        detail.includes("SEARCH grant USING COVERING INDEX agent_tool_grants_execution_step"),
+      )).toBe(true);
+      expect(explain.join("\n")).not.toMatch(/SCAN grant|AUTOMATIC|TEMP B-TREE/);
+      explainDatabase.close();
+
+      const recoveredClient = await createWorkerDatabaseClient({ databasePath });
+      const recovered = createSqliteAuthoritativeStore(recoveredClient, { clock: () => 6_000 });
+      await expect(recoverAllAgentRuntimeExecutions(recovered, runtime, 6_000)).resolves.toEqual([
+        expect.objectContaining({
+          id: execution.id,
+          status: "failed",
+          terminalErrorCode: "side_effect_reconciliation_required",
+        }),
+      ]);
+      const firstCompensation = await recovered.compensate(
+        fixture.humanContext, execution.id, firstDispatch.dispatch.id, 32,
+      );
+      const secondCompensation = await recovered.compensate(
+        fixture.humanContext, execution.id, secondDispatch.dispatch.id, 32,
+      );
+      expect(firstCompensation.id).not.toBe(secondCompensation.id);
+      expect(firstCompensation).toMatchObject({ compensatesExecutionId: execution.id });
+      expect(secondCompensation).toMatchObject({ compensatesExecutionId: execution.id });
+      await recoveredClient.close();
+
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM agent_tool_dispatches WHERE execution_id = ?",
+      ).get(execution.id)).toEqual({ count: 2 });
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM agent_compensation_requests WHERE original_execution_id = ?",
+      ).get(execution.id)).toEqual({ count: 2 });
+      expect(database.prepare(
+        `SELECT state, settled_at AS settledAt FROM agent_tool_dispatches
+         WHERE execution_id = ? ORDER BY dispatched_at`,
+      ).all(execution.id)).toEqual([
+        { state: "succeeded", settledAt: "1970-01-01T00:00:05.100Z" },
+        { state: "succeeded", settledAt: "1970-01-01T00:00:05.600Z" },
+      ]);
+      database.close();
+    });
+
+    it("Agent runtime authority distinguishes identical read-only calls by durable tool-call step across restart", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-repeat-read-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({ runtimeId: "runtime-repeat-read", agentId: "agent-review" });
+      await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+      const parameters = {} as const;
+      const parameterHash = createHash("sha256").update("{}").digest("hex");
+      const canonicalToolCall = { toolId: "review.read", parameters, remainingCalls: [] } as const;
+      const toolPlanHash = createHash("sha256")
+        .update('{"parameters":{},"remainingCalls":[],"toolId":"review.read"}')
+        .digest("hex");
+      await fixture.authority.commitStep(runtime, {
+        executionId: execution.id, attemptSeq: 1, stepSeq: 1, stepKind: "tool_call",
+        canonicalToolCall, inputSha256: "a".repeat(64), outputSha256: parameterHash, now: 4_500,
+      });
+      const firstGrant = await fixture.authority.prepareTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, toolCallStepSeq: 1,
+        toolId: "review.read", parameterHash, toolPlanHash,
+        confirmationRequirement: "read_only", now: 4_600, expiresAt: 9_000,
+      });
+      const firstDispatch = await fixture.authority.dispatchTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, grantId: firstGrant.id,
+        toolId: "review.read", parameterHash, confirmationRequirement: "read_only", now: 4_700,
+      });
+      await fixture.authority.settleTool(runtime, {
+        dispatchId: firstDispatch.id, executionId: execution.id, attemptSeq: 1,
+        grantId: firstGrant.id, outcome: "succeeded", now: 4_800,
+      });
+      await fixture.authority.commitStep(runtime, {
+        executionId: execution.id, attemptSeq: 1, stepSeq: 2, stepKind: "tool_result",
+        dispatchId: firstDispatch.id, boundedToolResult: { ok: true },
+        inputSha256: parameterHash, outputSha256: "b".repeat(64), now: 4_900,
+      });
+      await fixture.client.close();
+
+      const reopenedClient = await createWorkerDatabaseClient({ databasePath });
+      const reopened = createSqliteAuthoritativeStore(reopenedClient);
+      await reopened.commitStep(runtime, {
+        executionId: execution.id, attemptSeq: 1, stepSeq: 3, stepKind: "tool_call",
+        canonicalToolCall, inputSha256: "c".repeat(64), outputSha256: parameterHash, now: 5_000,
+      });
+      const secondGrant = await reopened.prepareTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, toolCallStepSeq: 3,
+        toolId: "review.read", parameterHash, toolPlanHash,
+        confirmationRequirement: "read_only", now: 5_100, expiresAt: 9_500,
+      });
+      const secondDispatch = await reopened.dispatchTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, grantId: secondGrant.id,
+        toolId: "review.read", parameterHash, confirmationRequirement: "read_only", now: 5_200,
+      });
+      expect(secondGrant.id).not.toBe(firstGrant.id);
+      expect(secondDispatch.id).not.toBe(firstDispatch.id);
+      await reopenedClient.close();
+    });
+
+    it("Agent runtime authority denies mismatched tool dispatch without consuming or inserting facts", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-tool-deny-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({ runtimeId: "runtime-tool-deny", agentId: "agent-review" });
+      await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+      await checkpointToolCall(fixture, runtime, execution.id, 1, 4_500, "d".repeat(64));
+      const grant = await fixture.authority.prepareTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, ...DEFAULT_TOOL_CALL_BINDING, toolId: "review.read",
+        parameterHash: "d".repeat(64), confirmationRequirement: "read_only",
+        now: 5_000, expiresAt: 10_000,
+      });
+      const preparedDatabase = new DatabaseSync(databasePath, { readOnly: true });
+      expect(preparedDatabase.prepare(
+        `SELECT COUNT(*) AS count FROM events
+         WHERE event_type = 'room.agent_tool_confirmation.required'`,
+      ).get()).toEqual({ count: 0 });
+      preparedDatabase.close();
+      await expect(fixture.authority.dispatchTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, grantId: grant.id,
+        toolId: "review.read", parameterHash: "e".repeat(64),
+        confirmationRequirement: "read_only", now: 6_000,
+      })).rejects.toMatchObject({ code: "execution_conflict" });
+      await fixture.client.close();
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      expect(database.prepare("SELECT consumed_at AS consumedAt FROM agent_tool_grants WHERE id = ?")
+        .get(grant.id)).toEqual({ consumedAt: null });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM agent_tool_dispatches").get())
+        .toEqual({ count: 0 });
+      database.close();
+    });
+
+    it("Agent runtime authority rejects preparing another tool while a dispatch is unsettled with zero writes", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-tool-single-dispatch-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({ runtimeId: "runtime-one-dispatch", agentId: "agent-review" });
+      await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+      await checkpointToolCall(fixture, runtime, execution.id, 1, 4_500, "2".repeat(64));
+      const grant = await fixture.authority.prepareTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, ...DEFAULT_TOOL_CALL_BINDING, toolId: "review.read",
+        parameterHash: "2".repeat(64), confirmationRequirement: "read_only",
+        now: 5_000, expiresAt: 10_000,
+      });
+      await fixture.authority.dispatchTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, grantId: grant.id, toolId: "review.read",
+        parameterHash: "2".repeat(64), confirmationRequirement: "read_only", now: 5_500,
+      });
+      await fixture.client.close();
+      const beforeDb = new DatabaseSync(databasePath, { readOnly: true });
+      const before = beforeDb.prepare(
+        `SELECT (SELECT COUNT(*) FROM agent_tool_grants) AS grants,
+                (SELECT COUNT(*) FROM agent_tool_dispatches) AS dispatches,
+                (SELECT COUNT(*) FROM events) AS events,
+                (SELECT COUNT(*) FROM outbox_deliveries) AS outbox`,
+      ).get();
+      beforeDb.close();
+      const reopenedClient = await createWorkerDatabaseClient({ databasePath });
+      const reopened = createSqliteAuthoritativeStore(reopenedClient);
+      await expect(reopened.prepareTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, ...DEFAULT_TOOL_CALL_BINDING, toolId: "review.read",
+        parameterHash: "3".repeat(64), confirmationRequirement: "read_only",
+        now: 6_000, expiresAt: 11_000,
+      })).rejects.toMatchObject({ status: 409, code: "execution_conflict" });
+      await reopenedClient.close();
+      const afterDb = new DatabaseSync(databasePath, { readOnly: true });
+      expect(afterDb.prepare(
+        `SELECT (SELECT COUNT(*) FROM agent_tool_grants) AS grants,
+                (SELECT COUNT(*) FROM agent_tool_dispatches) AS dispatches,
+                (SELECT COUNT(*) FROM events) AS events,
+                (SELECT COUNT(*) FROM outbox_deliveries) AS outbox`,
+      ).get()).toEqual(before);
+      afterDb.close();
+    });
+
+    it("Agent runtime authority cancels only fence-eligible attempts without creating a replacement", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-fence-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({ runtimeId: "runtime-fence", agentId: "agent-review" });
+      await expect(fixture.authority.cancelForHumanFence(runtime, {
+        executionId: execution.id, fenceMessageId: "message-human-source-next", now: 5_000,
+      })).resolves.toMatchObject({ status: "cancelled", cancellationReason: "human_fence" });
+      await expect(fixture.authority.cancelForHumanFence(runtime, {
+        executionId: execution.id, fenceMessageId: "message-human-source-next", now: 6_000,
+      })).resolves.toMatchObject({ status: "cancelled", cancellationReason: "human_fence" });
+      await fixture.client.close();
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM agent_fence_replacements").get())
+        .toEqual({ count: 1 });
+      expect(database.prepare(
+        "SELECT replacement_execution_id AS replacementExecutionId FROM agent_fence_replacements",
+      ).get()).toEqual({ replacementExecutionId: null });
+      database.close();
+    });
+
+    it("Agent runtime recovery marks an unsettled side effect outcome unknown and terminal", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-side-effect-recover-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({ runtimeId: "runtime-side-effect-recover", agentId: "agent-review" });
+      await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+      await checkpointToolCall(fixture, runtime, execution.id, 1, 4_500, "f".repeat(64));
+      const parameterHash = "f".repeat(64);
+      const grant = await fixture.authority.prepareTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, ...DEFAULT_TOOL_CALL_BINDING, toolId: "review.read", parameterHash,
+        confirmationRequirement: "side_effect", now: 5_000, expiresAt: 10_000,
+      });
+      const humanAuthority = createSqliteAuthoritativeStore(fixture.client, { clock: () => 5_500 });
+      const confirmation = await humanAuthority.confirmTool(fixture.humanContext, {
+        executionId: execution.id, attemptSeq: 1, toolId: "review.read", parameterHash,
+        target: "review target", impact: "updates remote review", reversibility: "irreversible",
+        expiresAt: 9_000,
+      });
+      const dispatch = await fixture.authority.dispatchTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, grantId: grant.id,
+        toolId: "review.read", parameterHash, confirmationRequirement: "side_effect",
+        confirmationId: confirmation.id, now: 6_000,
+      });
+      await fixture.client.close();
+
+      const reopenedClient = await createWorkerDatabaseClient({ databasePath });
+      const reopened = createSqliteAuthoritativeStore(reopenedClient);
+      await expect(recoverAllAgentRuntimeExecutions(reopened, runtime, 7_000)).resolves.toEqual([
+        expect.objectContaining({
+          id: execution.id, status: "failed", terminalErrorCode: "side_effect_outcome_unknown",
+        }),
+      ]);
+      await reopenedClient.close();
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      expect(database.prepare("SELECT state, settled_at AS settledAt FROM agent_tool_dispatches WHERE id = ?")
+        .get(dispatch.id)).toEqual({ state: "outcome_unknown", settledAt: "1970-01-01T00:00:07.000Z" });
+      database.close();
+    });
+
+    it.each([
+      ["succeeded", "side_effect_reconciliation_required"],
+      ["failed", "tool_failure"],
+    ] as const)(
+      "Agent runtime terminalizes a %s side effect without creating another effect-capable attempt",
+      async (outcome, terminalErrorCode) => {
+        const directory = await mkdtemp(join(tmpdir(), `native-im-runtime-side-settled-${outcome}-`));
+        temporaryDirectories.push(directory);
+        const databasePath = join(directory, "authority.sqlite");
+        const fixture = await createAgentFactFixture(databasePath);
+        const execution = await fixture.authority.invoke(fixture.humanContext, {
+          roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+          intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+        });
+        const runtime = mintInternalAgentRuntimeContext({ runtimeId: `runtime-side-settled-${outcome}`, agentId: "agent-review" });
+        await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+        await checkpointToolCall(fixture, runtime, execution.id, 1, 4_500, "c".repeat(64));
+        const parameterHash = "c".repeat(64);
+        const grant = await fixture.authority.prepareTool(runtime, {
+          executionId: execution.id, attemptSeq: 1, ...DEFAULT_TOOL_CALL_BINDING, toolId: "review.read", parameterHash,
+          confirmationRequirement: "side_effect", now: 5_000, expiresAt: 10_000,
+        });
+        const humanAuthority = createSqliteAuthoritativeStore(fixture.client, { clock: () => 5_500 });
+        const confirmation = await humanAuthority.confirmTool(fixture.humanContext, {
+          executionId: execution.id, attemptSeq: 1, toolId: "review.read", parameterHash,
+          target: "review target", impact: "updates remote review", reversibility: "irreversible",
+          expiresAt: 9_000,
+        });
+        const dispatch = await fixture.authority.dispatchTool(runtime, {
+          executionId: execution.id, attemptSeq: 1, grantId: grant.id,
+          toolId: "review.read", parameterHash, confirmationRequirement: "side_effect",
+          confirmationId: confirmation.id, now: 6_000,
+        });
+        await fixture.authority.settleTool(runtime, {
+          dispatchId: dispatch.id, executionId: execution.id, attemptSeq: 1, grantId: grant.id,
+          outcome, closedSummary: outcome, now: 6_500,
+        });
+        if (outcome === "failed") {
+          await expect(fixture.authority.readExecution({
+            sessionId: fixture.humanContext.sessionId,
+            sessionFamilyId: fixture.humanContext.sessionFamilyId,
+            principal: fixture.humanContext.principal,
+          }, execution.id)).resolves.toMatchObject({ status: "failed", terminalErrorCode });
+        }
+        await fixture.client.close();
+
+        const reopenedClient = await createWorkerDatabaseClient({ databasePath });
+        const reopened = createSqliteAuthoritativeStore(reopenedClient);
+        await expect(recoverAllAgentRuntimeExecutions(reopened, runtime, 7_000)).resolves.toEqual(
+          outcome === "succeeded"
+            ? [expect.objectContaining({ id: execution.id, status: "failed", terminalErrorCode })]
+            : [],
+        );
+        await reopenedClient.close();
+
+        const database = new DatabaseSync(databasePath, { readOnly: true });
+        expect(database.prepare(
+          "SELECT COUNT(*) AS count FROM agent_tool_dispatches WHERE execution_id = ?",
+        ).get(execution.id)).toEqual({ count: 1 });
+        expect(database.prepare(
+          "SELECT COUNT(*) AS count FROM agent_tool_grants WHERE execution_id = ?",
+        ).get(execution.id)).toEqual({ count: 1 });
+        expect(database.prepare(
+          "SELECT state, settled_at AS settledAt FROM agent_tool_dispatches WHERE id = ?",
+        ).get(dispatch.id)).toEqual({ state: outcome, settledAt: "1970-01-01T00:00:06.500Z" });
+        expect(database.prepare(
+          `SELECT attempt_seq AS attemptSeq, state, action_category AS actionCategory,
+                  error_code AS errorCode
+           FROM agent_execution_attempts WHERE execution_id = ? ORDER BY attempt_seq`,
+        ).all(execution.id)).toEqual([
+          { attemptSeq: 1, state: "failed", actionCategory: "tool_call", errorCode: terminalErrorCode },
+        ]);
+        expect(() => migrateAuthorityDatabase(database)).not.toThrow();
+        database.close();
+      },
+    );
+
+    it("Agent runtime recovery never retries a settled side effect when its retry budget is exhausted", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-side-settled-dead-letter-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({ runtimeId: "runtime-side-settled-dead-letter", agentId: "agent-review" });
+      await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+      await fixture.authority.scheduleRetry(runtime, {
+        executionId: execution.id, attemptSeq: 1, errorCode: "upstream_timeout", now: 4_500,
+      });
+      await fixture.authority.claimNext(runtime, "room-facts", 5_500);
+      await fixture.authority.scheduleRetry(runtime, {
+        executionId: execution.id, attemptSeq: 2, errorCode: "upstream_timeout", now: 6_000,
+      });
+      await fixture.authority.claimNext(runtime, "room-facts", 10_000);
+      await checkpointToolCall(fixture, runtime, execution.id, 3, 10_250, "d".repeat(64));
+      const parameterHash = "d".repeat(64);
+      const grant = await fixture.authority.prepareTool(runtime, {
+        executionId: execution.id, attemptSeq: 3, ...DEFAULT_TOOL_CALL_BINDING, toolId: "review.read", parameterHash,
+        confirmationRequirement: "side_effect", now: 10_500, expiresAt: 20_000,
+      });
+      const humanAuthority = createSqliteAuthoritativeStore(fixture.client, { clock: () => 11_000 });
+      const confirmation = await humanAuthority.confirmTool(fixture.humanContext, {
+        executionId: execution.id, attemptSeq: 3, toolId: "review.read", parameterHash,
+        target: "review target", impact: "updates remote review", reversibility: "irreversible",
+        expiresAt: 19_000,
+      });
+      const dispatch = await fixture.authority.dispatchTool(runtime, {
+        executionId: execution.id, attemptSeq: 3, grantId: grant.id,
+        toolId: "review.read", parameterHash, confirmationRequirement: "side_effect",
+        confirmationId: confirmation.id, now: 11_500,
+      });
+      await fixture.authority.settleTool(runtime, {
+        dispatchId: dispatch.id, executionId: execution.id, attemptSeq: 3, grantId: grant.id,
+        outcome: "succeeded", closedSummary: "succeeded", now: 12_000,
+      });
+      await fixture.client.close();
+
+      const reopenedClient = await createWorkerDatabaseClient({ databasePath });
+      const reopened = createSqliteAuthoritativeStore(reopenedClient);
+      await expect(recoverAllAgentRuntimeExecutions(reopened, runtime, 13_000)).resolves.toEqual([
+        expect.objectContaining({
+          id: execution.id, status: "failed", currentAttemptSeq: 3,
+          terminalErrorCode: "side_effect_reconciliation_required",
+        }),
+      ]);
+      await reopenedClient.close();
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM agent_tool_dispatches WHERE execution_id = ?",
+      ).get(execution.id)).toEqual({ count: 1 });
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM agent_execution_attempts WHERE execution_id = ?",
+      ).get(execution.id)).toEqual({ count: 3 });
+      expect(database.prepare("SELECT state FROM agent_tool_dispatches WHERE id = ?")
+        .get(dispatch.id)).toEqual({ state: "succeeded" });
+      database.close();
+    });
+
+    it("Agent runtime recovery fails an expired waiting confirmation without dispatch", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-confirmation-expire-"));
+      temporaryDirectories.push(directory);
+      const fixture = await createAgentFactFixture(join(directory, "authority.sqlite"));
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({ runtimeId: "runtime-confirmation-expire", agentId: "agent-review" });
+      await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+      await checkpointToolCall(fixture, runtime, execution.id, 1, 4_500, "1".repeat(64));
+      await fixture.authority.prepareTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, ...DEFAULT_TOOL_CALL_BINDING, toolId: "review.read",
+        parameterHash: "1".repeat(64), confirmationRequirement: "side_effect",
+        now: 5_000, expiresAt: 6_000,
+      });
+      await expect(recoverAllAgentRuntimeExecutions(fixture.authority, runtime, 6_000)).resolves.toEqual([
+        expect.objectContaining({
+          id: execution.id, status: "failed", terminalErrorCode: "confirmation_expired",
+        }),
+      ]);
+      await fixture.client.close();
+    });
+
+    it("Agent runtime tool confirmation returns gone after its grant expires", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-confirmation-gone-"));
+      temporaryDirectories.push(directory);
+      const fixture = await createAgentFactFixture(join(directory, "authority.sqlite"));
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({ runtimeId: "runtime-confirmation-gone", agentId: "agent-review" });
+      await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+      await checkpointToolCall(fixture, runtime, execution.id, 1, 4_500, "7".repeat(64));
+      const parameterHash = "7".repeat(64);
+      await fixture.authority.prepareTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, ...DEFAULT_TOOL_CALL_BINDING, toolId: "review.read", parameterHash,
+        confirmationRequirement: "side_effect", now: 5_000, expiresAt: 6_000,
+      });
+      const expiredAuthority = createSqliteAuthoritativeStore(fixture.client, { clock: () => 6_000 });
+      await expect(expiredAuthority.confirmTool(fixture.humanContext, {
+        executionId: execution.id, attemptSeq: 1, toolId: "review.read", parameterHash,
+        target: "review target", impact: "updates remote review", reversibility: "irreversible",
+        expiresAt: 7_000,
+      })).rejects.toMatchObject({ status: 410, code: "confirmation_expired" });
+      await fixture.client.close();
+    });
+
+    it.each(["grant", "confirmation"] as const)(
+      "Agent runtime tool dispatch returns gone when its %s expires without consuming authority",
+      async (expiredAuthority) => {
+        const directory = await mkdtemp(join(tmpdir(), `native-im-runtime-dispatch-${expiredAuthority}-gone-`));
+        temporaryDirectories.push(directory);
+        const databasePath = join(directory, "authority.sqlite");
+        const fixture = await createAgentFactFixture(databasePath);
+        const execution = await fixture.authority.invoke(fixture.humanContext, {
+          roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+          intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+        });
+        const runtime = mintInternalAgentRuntimeContext({ runtimeId: `runtime-dispatch-${expiredAuthority}-gone`, agentId: "agent-review" });
+        await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+        await checkpointToolCall(fixture, runtime, execution.id, 1, 4_500, "e".repeat(64));
+        const parameterHash = "e".repeat(64);
+        const grant = await fixture.authority.prepareTool(runtime, {
+          executionId: execution.id, attemptSeq: 1, ...DEFAULT_TOOL_CALL_BINDING, toolId: "review.read", parameterHash,
+          confirmationRequirement: "side_effect", now: 5_000,
+          expiresAt: expiredAuthority === "grant" ? 6_000 : 10_000,
+        });
+        const confirmationAuthority = createSqliteAuthoritativeStore(fixture.client, { clock: () => 5_500 });
+        const confirmation = await confirmationAuthority.confirmTool(fixture.humanContext, {
+          executionId: execution.id, attemptSeq: 1, toolId: "review.read", parameterHash,
+          target: "review target", impact: "updates remote review", reversibility: "irreversible",
+          expiresAt: expiredAuthority === "confirmation" ? 6_000 : 9_000,
+        });
+        await expect(fixture.authority.dispatchTool(runtime, {
+          executionId: execution.id, attemptSeq: 1, grantId: grant.id, toolId: "review.read",
+          parameterHash, confirmationRequirement: "side_effect", confirmationId: confirmation.id,
+          now: 6_000,
+        })).rejects.toMatchObject({ status: 410, code: "confirmation_expired" });
+        await fixture.client.close();
+        const database = new DatabaseSync(databasePath, { readOnly: true });
+        expect(database.prepare(
+          `SELECT (SELECT consumed_at FROM agent_tool_grants WHERE id = ?) AS grantConsumed,
+                  (SELECT consumed_at FROM agent_tool_confirmations WHERE id = ?) AS confirmationConsumed,
+                  (SELECT COUNT(*) FROM agent_tool_dispatches) AS dispatches`,
+        ).get(grant.id, confirmation.id)).toEqual({
+          grantConsumed: null, confirmationConsumed: null, dispatches: 0,
+        });
+        database.close();
+      },
+    );
+
+    it("Agent runtime tool dispatch rechecks that the confirmation session family is active", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-confirmation-revoked-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({ runtimeId: "runtime-confirmation-revoked", agentId: "agent-review" });
+      await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+      await checkpointToolCall(fixture, runtime, execution.id, 1, 4_500, "6".repeat(64));
+      const parameterHash = "6".repeat(64);
+      const grant = await fixture.authority.prepareTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, ...DEFAULT_TOOL_CALL_BINDING, toolId: "review.read", parameterHash,
+        confirmationRequirement: "side_effect", now: 5_000, expiresAt: 10_000,
+      });
+      const confirmationAuthority = createSqliteAuthoritativeStore(fixture.client, { clock: () => 5_500 });
+      const confirmation = await confirmationAuthority.confirmTool(fixture.humanContext, {
+        executionId: execution.id, attemptSeq: 1, toolId: "review.read", parameterHash,
+        target: "review target", impact: "updates remote review", reversibility: "irreversible",
+        expiresAt: 9_000,
+      });
+      await fixture.client.close();
+      const database = new DatabaseSync(databasePath);
+      database.prepare("UPDATE sessions SET revoked_at = ? WHERE family_id = ?")
+        .run(5_750, fixture.humanContext.sessionFamilyId);
+      const before = database.prepare(
+        `SELECT (SELECT consumed_at FROM agent_tool_grants WHERE id = ?) AS grantConsumed,
+                (SELECT consumed_at FROM agent_tool_confirmations WHERE id = ?) AS confirmationConsumed,
+                (SELECT COUNT(*) FROM agent_tool_dispatches) AS dispatches`,
+      ).get(grant.id, confirmation.id);
+      database.close();
+      const reopenedClient = await createWorkerDatabaseClient({ databasePath });
+      const reopened = createSqliteAuthoritativeStore(reopenedClient);
+      await expect(reopened.dispatchTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, grantId: grant.id, toolId: "review.read",
+        parameterHash, confirmationRequirement: "side_effect", confirmationId: confirmation.id,
+        now: 6_000,
+      })).rejects.toMatchObject({ status: 403, code: "session_revoked" });
+      await reopenedClient.close();
+      const after = new DatabaseSync(databasePath, { readOnly: true });
+      expect(after.prepare(
+        `SELECT (SELECT consumed_at FROM agent_tool_grants WHERE id = ?) AS grantConsumed,
+                (SELECT consumed_at FROM agent_tool_confirmations WHERE id = ?) AS confirmationConsumed,
+                (SELECT COUNT(*) FROM agent_tool_dispatches) AS dispatches`,
+      ).get(grant.id, confirmation.id)).toEqual(before);
+      after.close();
+    });
+
+    it("Agent runtime recovery expires waiting side effects at the earlier confirmation deadline", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-confirmation-min-expiry-"));
+      temporaryDirectories.push(directory);
+      const fixture = await createAgentFactFixture(join(directory, "authority.sqlite"));
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({ runtimeId: "runtime-min-expiry", agentId: "agent-review" });
+      await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+      await checkpointToolCall(fixture, runtime, execution.id, 1, 4_500, "7".repeat(64));
+      const parameterHash = "7".repeat(64);
+      await fixture.authority.prepareTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, ...DEFAULT_TOOL_CALL_BINDING, toolId: "review.read", parameterHash,
+        confirmationRequirement: "side_effect", now: 5_000, expiresAt: 10_000,
+      });
+      const confirmationAuthority = createSqliteAuthoritativeStore(fixture.client, { clock: () => 5_500 });
+      await confirmationAuthority.confirmTool(fixture.humanContext, {
+        executionId: execution.id, attemptSeq: 1, toolId: "review.read", parameterHash,
+        target: "review target", impact: "updates remote review", reversibility: "irreversible",
+        expiresAt: 6_000,
+      });
+      await expect(recoverAllAgentRuntimeExecutions(fixture.authority, runtime, 6_000)).resolves.toEqual([
+        expect.objectContaining({ status: "failed", terminalErrorCode: "confirmation_expired" }),
+      ]);
+      await fixture.client.close();
+    });
+
+    it("Agent runtime recovery preserves an unexpired side-effect confirmation wait", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-confirmation-wait-recover-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const execution = await fixture.authority.invoke(fixture.humanContext, {
+        roomId: "room-facts", sourceMessageId: "message-human-source", targetAgentId: "agent-review",
+        intentKind: "direct_mention", providerId: "provider-test", modelId: "model-test",
+      });
+      const runtime = mintInternalAgentRuntimeContext({ runtimeId: "runtime-wait-recover", agentId: "agent-review" });
+      await fixture.authority.claimNext(runtime, "room-facts", 4_000);
+      await checkpointToolCall(fixture, runtime, execution.id, 1, 4_500, "f".repeat(64));
+      await fixture.authority.prepareTool(runtime, {
+        executionId: execution.id, attemptSeq: 1, ...DEFAULT_TOOL_CALL_BINDING, toolId: "review.read",
+        parameterHash: "f".repeat(64), confirmationRequirement: "side_effect",
+        now: 5_000, expiresAt: 10_000,
+      });
+      await fixture.client.close();
+      const reopenedClient = await createWorkerDatabaseClient({ databasePath });
+      const reopened = createSqliteAuthoritativeStore(reopenedClient, { clock: () => 6_000 });
+      await expect(recoverAllAgentRuntimeExecutions(reopened, runtime, 6_000)).resolves.toEqual([]);
+      await expect(reopened.readExecution({
+        sessionId: fixture.humanContext.sessionId,
+        sessionFamilyId: fixture.humanContext.sessionFamilyId,
+        principal: fixture.humanContext.principal,
+      }, execution.id)).resolves.toMatchObject({
+        status: "running", actionCategory: "waiting_upstream",
+      });
+      await reopenedClient.close();
+    });
+
     it("persists running and terminal transitions without duplicating the execution", async () => {
       const directory = await mkdtemp(join(tmpdir(), "native-im-agent-execution-"));
       temporaryDirectories.push(directory);
@@ -1200,9 +3590,10 @@ describe("SQLite authoritative sessions", () => {
         ),
       ).rejects.toMatchObject({ status: 409, code: "idempotency_conflict" });
 
+      const legacySecret = "legacy-result-private-sentinel";
       const completed = {
         ...running,
-        payload: { ...running.payload, status: "completed", result: "approved" },
+        payload: { ...running.payload, status: "completed", result: legacySecret },
       } as const;
       const completedContext = mintInternalAgentCommandContext({
         agentId: "agent-review",
@@ -1230,19 +3621,26 @@ describe("SQLite authoritative sessions", () => {
 
       const database = new DatabaseSync(databasePath, { readOnly: true });
       expect(database.prepare(
-        `SELECT status, requester_actor_id AS requesterId, agent_id AS agentId,
-                tool_name AS toolName, result_json AS result
+        `SELECT state AS status, requester_actor_id AS requesterId, agent_id AS agentId,
+                current_tool_id AS toolName, legacy_result_json AS result
          FROM agent_executions`,
       ).get()).toEqual({
         status: "completed",
         requesterId: "human-li",
         agentId: "agent-review",
         toolName: "review.read",
-        result: "\"approved\"",
+        result: JSON.stringify(legacySecret),
       });
       expect(database.prepare(
         "SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.agent_execution.changed'",
       ).get()).toEqual({ count: 2 });
+      const eventPayloads = database.prepare(
+        "SELECT payload_json AS payloadJson FROM events WHERE event_type = 'room.agent_execution.changed' ORDER BY stream_seq",
+      ).all() as readonly { readonly payloadJson: string }[];
+      expect(eventPayloads).toHaveLength(2);
+      expect(eventPayloads.map(({ payloadJson }) => JSON.parse(payloadJson)).every(isAgentExecution)).toBe(true);
+      expect(eventPayloads.some(({ payloadJson }) => payloadJson.includes(legacySecret))).toBe(false);
+      expect(JSON.stringify(finished)).not.toContain(legacySecret);
       expect(database.prepare("SELECT COUNT(*) AS count FROM agent_executions").get())
         .toEqual({ count: 1 });
       database.close();
@@ -1484,7 +3882,7 @@ describe("SQLite authoritative sessions", () => {
       agentMatrixCase(
         "agent.execution.transition",
         "room.agent_execution.changed",
-        "SELECT COUNT(*) AS count FROM agent_executions WHERE id = 'matrix-execution' AND status = 'running'",
+        "SELECT COUNT(*) AS count FROM agent_executions WHERE id = 'matrix-execution' AND state = 'running'",
         ({ roomId }) => ({
           type: "agent.execution.transition", roomId,
           payload: {

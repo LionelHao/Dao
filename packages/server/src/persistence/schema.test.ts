@@ -3,12 +3,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
+import { isAgentExecution } from "@native-im/core";
 import {
   AUTHORITY_SCHEMA_VERSION,
+  AUTHORITY_SCHEMA_V6_STATEMENT_COUNT_FOR_TEST,
   configureAuthorityConnection,
   listAuthorityTables,
   migrateAuthorityDatabase,
   migrateAuthorityDatabaseToPreviousVersionForTest,
+  migrateAuthorityDatabaseToVersion4ForTest,
   migrateAuthorityDatabaseToVersion3ForTest,
   migrateAuthorityDatabaseToVersion2ForTest,
   readSchemaVersion,
@@ -21,8 +24,17 @@ import {
 
 const AUTHORITY_TABLES = [
   "actors",
+  "agent_compensation_requests",
+  "agent_execution_attempts",
+  "agent_execution_completions",
+  "agent_execution_steps",
   "agent_executions",
+  "agent_fence_replacements",
+  "agent_invocation_intents",
   "agent_judgments",
+  "agent_tool_confirmations",
+  "agent_tool_dispatches",
+  "agent_tool_grants",
   "calibration_signals",
   "events",
   "human_read_receipts",
@@ -48,6 +60,27 @@ const V4_MIGRATION_CHECKSUM =
   "28a42b0ccfdc0d5c2eb111bc783cdd30c2678eb162cf9d77dcc2b6b3823f169c";
 const V5_MIGRATION_CHECKSUM =
   "3f90cdeb9b7c9e04f432aac809f340033f6d9a2ea1a6a5bd8d9ab50fab8d891d";
+const V6_MIGRATION_CHECKSUM =
+  "f068c43f2e3e479a4fbf5c36903a3481d2cf6d9f62b3957815359f4084280468";
+
+const V6_INDEXES = [
+  "agent_execution_attempts_recovery",
+  "agent_execution_attempts_room_enqueue",
+  "agent_execution_steps_execution_attempt",
+  "agent_executions_recovery",
+  "agent_executions_agent_recovery",
+  "agent_executions_room_queue",
+  "agent_fence_replacements_replacement_old",
+  "agent_fence_replacements_replay",
+  "agent_tool_confirmations_expiry",
+  "agent_tool_dispatches_state",
+  "agent_tool_dispatches_one_unsettled",
+  "agent_tool_grants_expiry",
+  "agent_tool_grants_execution_step",
+  "agent_tool_grants_recovery_binding",
+  "agent_tool_grants_recovery_expiry",
+  "agent_tool_confirmations_recovery_expiry",
+] as const;
 
 const STREAMING_KEYSET_INDEXES = [
   "agent_executions_room_id_id",
@@ -343,6 +376,63 @@ function snapshot(database: DatabaseSync): LogicalSnapshot {
   return { schemaVersion: readSchemaVersion(database), tables };
 }
 
+function seedV6ToolExecution(database: DatabaseSync): void {
+  const hash = "a".repeat(64);
+  database.exec(`
+    INSERT INTO actors (id, kind, display_name) VALUES
+      ('v6-human', 'human', 'V6 Human'), ('v6-agent', 'agent', 'V6 Agent'),
+      ('v6-agent-2', 'agent', 'V6 Agent 2');
+    INSERT INTO rooms (id, name, status, created_at)
+    VALUES ('v6-room', 'V6', 'active', '2026-08-13T00:00:00.000Z');
+    INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+    VALUES ('identity', 'v6-human', 0, 1), ('identity', 'v6-agent', 0, 1),
+           ('identity', 'v6-agent-2', 0, 1), ('room', 'v6-room', 0, 1);
+    INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+    VALUES ('v6-message', 'v6-room', 'v6-human', 'human', 'invoke',
+            '2026-08-13T00:00:00.000Z');
+    INSERT INTO agent_executions (
+      id, room_id, agent_id, source_message_id, requester_actor_id, state,
+      action_category, tool_dispatch_phase, current_tool_id,
+      current_attempt_seq, retry_cycle, retry_ordinal, provider_id, model_id,
+      recovery_cursor, queued_at, started_at, updated_at
+    ) VALUES (
+      'v6-execution', 'v6-room', 'v6-agent', 'v6-message', 'v6-human',
+      'running', 'tool_call', 'dispatched', 'summarize', 1, 1, 1,
+      'test-provider', 'test-model', 1, '2026-08-13T00:00:00.000Z',
+      '2026-08-13T00:00:01.000Z', '2026-08-13T00:00:01.000Z'
+    );
+    INSERT INTO agent_execution_attempts (
+      execution_id, room_id, attempt_seq, retry_cycle, retry_ordinal, state,
+      action_category, tool_dispatch_phase, started_at, finished_at,
+      error_code, next_retry_at, recovery_cursor
+    ) VALUES (
+      'v6-execution', 'v6-room', 1, 1, 1, 'running', 'tool_call', 'dispatched',
+      '2026-08-13T00:00:01.000Z', NULL, NULL, NULL, 1
+    );
+    INSERT INTO agent_execution_steps (
+      execution_id, attempt_seq, step_seq, step_kind, canonical_tool_call_json,
+      input_sha256, output_sha256, completed_at
+    ) VALUES (
+      'v6-execution', 1, 1, 'tool_call', '{"toolId":"summarize"}',
+      '${hash}', '${hash}', '2026-08-13T00:00:01.000Z'
+    );
+    INSERT INTO agent_tool_grants (
+      id, execution_id, attempt_seq, tool_call_step_seq, agent_id, room_id, tool_id,
+      parameter_hash, tool_plan_hash, confirmation_requirement, issued_at, expires_at, consumed_at
+    ) VALUES (
+      'v6-grant', 'v6-execution', 1, 1, 'v6-agent', 'v6-room', 'summarize',
+      '${hash}', '${hash}', 'read_only', '2026-08-13T00:00:01.000Z', '2026-08-13T00:01:01.000Z', NULL
+    );
+    INSERT INTO agent_tool_dispatches (
+      id, execution_id, attempt_seq, grant_id, tool_id, parameter_hash,
+      state, dispatched_at, settled_at, closed_summary, sealed_compensation
+    ) VALUES (
+      'v6-dispatch', 'v6-execution', 1, 'v6-grant', 'summarize', '${hash}',
+      'dispatched', '2026-08-13T00:00:02.000Z', NULL, NULL, NULL
+    );
+  `);
+}
+
 describe("authority SQLite schema", () => {
   it("configures and verifies the durability and concurrency pragmas", () => {
     withDatabase((database) => {
@@ -365,12 +455,12 @@ describe("authority SQLite schema", () => {
     });
   });
 
-  it("migrates a fresh database through immutable v1-v5 to the complete schema", () => {
+  it("migrates a fresh database through immutable v1-v6 to the complete schema", () => {
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
 
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(5);
-      expect(readSchemaVersion(database)).toBe(5);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(6);
+      expect(readSchemaVersion(database)).toBe(6);
       expect(listAuthorityTables(database)).toEqual(AUTHORITY_TABLES);
       expect(
         database
@@ -407,6 +497,12 @@ describe("authority SQLite schema", () => {
           version: 5,
           name: "streaming-keyset-indexes",
           checksum: V5_MIGRATION_CHECKSUM,
+          applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+        },
+        {
+          version: 6,
+          name: "agent-runtime-authority",
+          checksum: V6_MIGRATION_CHECKSUM,
           applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
         },
       ]);
@@ -456,13 +552,924 @@ describe("authority SQLite schema", () => {
     });
   });
 
-  it("adds immutable v5 scoped keyset indexes and uses them for sparse interleaved scans", () => {
+  it("migrates fresh and every immutable historical version through v6", () => {
+    const createHistoricalDatabase = (
+      database: DatabaseSync,
+      version: 1 | 2 | 3 | 4 | 5,
+    ): void => {
+      createV1Fixture(database);
+      seedV1History(database);
+      if (version >= 2) migrateAuthorityDatabaseToVersion2ForTest(database);
+      if (version >= 3) migrateAuthorityDatabaseToVersion3ForTest(database);
+      if (version >= 4) migrateAuthorityDatabaseToVersion4ForTest(database);
+      if (version >= 5) migrateAuthorityDatabaseToPreviousVersionForTest(database);
+    };
+
+    for (const version of [1, 2, 3, 4, 5] as const) {
+      withDatabase((database) => {
+        createHistoricalDatabase(database, version);
+        expect(readSchemaVersion(database)).toBe(version);
+
+        migrateAuthorityDatabase(database);
+
+        expect(AUTHORITY_SCHEMA_VERSION).toBe(6);
+        expect(readSchemaVersion(database)).toBe(6);
+        expect(listAuthorityTables(database)).toEqual(AUTHORITY_TABLES);
+        expect(database.prepare(
+          "SELECT id, kind, display_name FROM actors WHERE id IN ('human-1', 'agent-1') ORDER BY id",
+        ).all()).toEqual([
+          { id: "agent-1", kind: "agent", display_name: "Sage" },
+          { id: "human-1", kind: "human", display_name: "Ada" },
+        ]);
+        expect(database.prepare(
+          "SELECT room_id, author_id, body FROM messages WHERE id = 'message-1'",
+        ).get()).toEqual({ room_id: "room-1", author_id: "human-1", body: "legacy history" });
+        expect(
+          database
+            .prepare(
+              "SELECT name FROM sqlite_schema WHERE type = 'index' AND name IN (" +
+                V6_INDEXES.map(() => "?").join(", ") +
+                ") ORDER BY name",
+            )
+            .all(...V6_INDEXES)
+            .map((row) => String(row.name)),
+        ).toEqual([...V6_INDEXES].sort());
+        expect(
+          database
+            .prepare("SELECT checksum FROM schema_migrations WHERE version = 5")
+            .get(),
+        ).toEqual({ checksum: V5_MIGRATION_CHECKSUM });
+      });
+    }
+  });
+
+  it("rebuilds legitimate v5 executions into closed v6 attempts", () => {
     withDatabase((database) => {
       migrateAuthorityDatabaseToPreviousVersionForTest(database);
-      expect(readSchemaVersion(database)).toBe(4);
+      database.exec(`
+        INSERT INTO actors (id, kind, display_name)
+        VALUES ('legacy-human', 'human', 'Legacy Human'),
+               ('legacy-agent', 'agent', 'Legacy Agent');
+        INSERT INTO rooms (id, name, status, created_at)
+        VALUES ('legacy-room', 'Legacy', 'active', '2026-08-13T00:00:00.000Z');
+        INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+        VALUES ('identity', 'legacy-human', 0, 1),
+               ('identity', 'legacy-agent', 0, 1),
+               ('room', 'legacy-room', 0, 1);
+        INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+        VALUES ('legacy-message', 'legacy-room', 'legacy-human', 'human',
+                'legacy invocation', '2026-08-13T00:00:01.000Z');
+        INSERT INTO agent_executions (
+          id, room_id, agent_id, trigger_message_id, status, started_at,
+          completed_at, result_json, requester_actor_id, tool_name
+        ) VALUES
+          ('legacy-completed', 'legacy-room', 'legacy-agent', 'legacy-message',
+           'completed', '2026-08-13T00:00:02.000Z',
+           '2026-08-13T00:00:03.000Z', '{"ok":true}', 'legacy-human', 'summarize'),
+          ('legacy-failed', 'legacy-room', 'legacy-agent', 'legacy-message',
+           'failed', '2026-08-13T00:00:04.000Z',
+           '2026-08-13T00:00:05.000Z', '{"error":"legacy"}', 'legacy-human', 'summarize'),
+          ('legacy-interrupted', 'legacy-room', 'legacy-agent', 'legacy-message',
+           'interrupted', '2026-08-13T00:00:06.000Z', NULL, NULL,
+           'legacy-human', 'summarize'),
+          ('legacy-running', 'legacy-room', 'legacy-agent', 'legacy-message',
+           'running', '2026-08-13T00:00:07.000Z', NULL, NULL,
+           'legacy-human', 'summarize');
+      `);
+
       migrateAuthorityDatabase(database);
 
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(5);
+      expect(
+        database
+          .prepare(
+            `SELECT state AS status, current_attempt_seq AS currentAttemptSeq,
+                    retry_cycle AS retryCycle, retry_ordinal AS retryOrdinal,
+                    action_category AS actionCategory,
+                    tool_dispatch_phase AS toolDispatchPhase,
+                    terminal_error_code AS terminalErrorCode
+             FROM agent_executions WHERE id = 'legacy-running'`,
+          )
+          .get(),
+      ).toMatchObject({
+        status: "failed",
+        currentAttemptSeq: 1,
+        retryCycle: 1,
+        retryOrdinal: 1,
+        actionCategory: "tool_call",
+        toolDispatchPhase: "finished",
+        terminalErrorCode: "side_effect_outcome_unknown",
+      });
+      expect(
+        database
+          .prepare(
+            `SELECT state, action_category, tool_dispatch_phase, error_code
+             FROM agent_execution_attempts
+             WHERE execution_id = 'legacy-running' AND attempt_seq = 1`,
+          )
+          .get(),
+      ).toEqual({
+        state: "failed",
+        action_category: "tool_call",
+        tool_dispatch_phase: "finished",
+        error_code: "side_effect_outcome_unknown",
+      });
+      expect(
+        database
+          .prepare(
+            `SELECT state, cancellation_reason, legacy_result_json AS resultJson,
+                    current_tool_id AS toolId
+             FROM agent_executions WHERE id = 'legacy-interrupted'`,
+          )
+          .get(),
+      ).toEqual({
+        state: "cancelled",
+        cancellation_reason: "legacy_interrupted",
+        resultJson: null,
+        toolId: "summarize",
+      });
+      expect(
+        database
+          .prepare(
+            "SELECT legacy_result_json AS resultJson FROM agent_executions WHERE id = 'legacy-completed'",
+          )
+          .get(),
+      ).toEqual({ resultJson: '{"ok":true}' });
+    });
+  });
+
+  it("fails closed for legacy completed or failed rows without completion and preserves interrupted/running completion timestamps", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      database.exec(`
+        INSERT INTO actors (id, kind, display_name)
+        VALUES ('legacy-human-null', 'human', 'Legacy Human'),
+               ('legacy-agent-null', 'agent', 'Legacy Agent');
+        INSERT INTO rooms (id, name, status, created_at)
+        VALUES ('legacy-null-room', 'Legacy', 'active', '2026-08-13T00:00:00.000Z');
+        INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+        VALUES ('identity', 'legacy-human-null', 0, 1),
+               ('identity', 'legacy-agent-null', 0, 1),
+               ('room', 'legacy-null-room', 0, 1);
+        INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+        VALUES ('legacy-null-message', 'legacy-null-room', 'legacy-human-null',
+                'human', 'legacy', '2026-08-13T00:00:00.000Z');
+        INSERT INTO agent_executions (
+          id, room_id, agent_id, trigger_message_id, status, started_at,
+          completed_at, result_json, requester_actor_id, tool_name
+        ) VALUES
+          ('legacy-completed-null', 'legacy-null-room', 'legacy-agent-null',
+           'legacy-null-message', 'completed', '2026-08-13T00:00:01.000Z',
+           NULL, NULL, 'legacy-human-null', 'tool'),
+          ('legacy-failed-null', 'legacy-null-room', 'legacy-agent-null',
+           'legacy-null-message', 'failed', '2026-08-13T00:00:02.000Z',
+           NULL, NULL, 'legacy-human-null', 'tool');
+      `);
+      const before = snapshot(database);
+      expect(() => migrateAuthorityDatabase(database)).toThrow();
+      expect(snapshot(database)).toEqual(before);
+    });
+
+    withDatabase((database) => {
+      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      database.exec(`
+        INSERT INTO actors (id, kind, display_name)
+        VALUES ('legacy-human-preserve', 'human', 'Legacy Human'),
+               ('legacy-agent-preserve', 'agent', 'Legacy Agent');
+        INSERT INTO rooms (id, name, status, created_at)
+        VALUES ('legacy-preserve-room', 'Legacy', 'active', '2026-08-13T00:00:00.000Z');
+        INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+        VALUES ('identity', 'legacy-human-preserve', 0, 1),
+               ('identity', 'legacy-agent-preserve', 0, 1),
+               ('room', 'legacy-preserve-room', 0, 1);
+        INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+        VALUES ('legacy-preserve-message', 'legacy-preserve-room',
+                'legacy-human-preserve', 'human', 'legacy',
+                '2026-08-13T00:00:00.000Z');
+        INSERT INTO agent_executions (
+          id, room_id, agent_id, trigger_message_id, status, started_at,
+          completed_at, result_json, requester_actor_id, tool_name
+        ) VALUES
+          ('legacy-interrupted-preserve', 'legacy-preserve-room',
+           'legacy-agent-preserve', 'legacy-preserve-message', 'interrupted',
+           '2026-08-13T00:00:01.000Z', '2026-08-13T00:00:02.000Z',
+           '{"legacy":"interrupted"}', 'legacy-human-preserve', 'tool-interrupted'),
+          ('legacy-running-preserve', 'legacy-preserve-room',
+           'legacy-agent-preserve', 'legacy-preserve-message', 'running',
+           '2026-08-13T00:00:03.000Z', '2026-08-13T00:00:04.000Z',
+           '{"legacy":"running"}', 'legacy-human-preserve', 'tool-running');
+      `);
+      migrateAuthorityDatabase(database);
+      expect(
+        database.prepare(
+          `SELECT id, source_message_id, requester_actor_id, started_at,
+                  completed_at, updated_at, current_tool_id, legacy_result_json
+           FROM agent_executions
+           WHERE id IN ('legacy-interrupted-preserve', 'legacy-running-preserve')
+           ORDER BY id`,
+        ).all(),
+      ).toEqual([
+        {
+          id: "legacy-interrupted-preserve",
+          source_message_id: "legacy-preserve-message",
+          requester_actor_id: "legacy-human-preserve",
+          started_at: "2026-08-13T00:00:01.000Z",
+          completed_at: "2026-08-13T00:00:02.000Z",
+          updated_at: "2026-08-13T00:00:02.000Z",
+          current_tool_id: "tool-interrupted",
+          legacy_result_json: '{"legacy":"interrupted"}',
+        },
+        {
+          id: "legacy-running-preserve",
+          source_message_id: "legacy-preserve-message",
+          requester_actor_id: "legacy-human-preserve",
+          started_at: "2026-08-13T00:00:03.000Z",
+          completed_at: "2026-08-13T00:00:04.000Z",
+          updated_at: "2026-08-13T00:00:04.000Z",
+          current_tool_id: "tool-running",
+          legacy_result_json: '{"legacy":"running"}',
+        },
+      ]);
+    });
+  });
+
+  it("rolls every v6 statement back to v5 without changing data", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      const before = snapshot(database);
+      const statementCount = AUTHORITY_SCHEMA_V6_STATEMENT_COUNT_FOR_TEST;
+
+      for (let failAfterStatement = 1; failAfterStatement <= statementCount; failAfterStatement += 1) {
+        expect(() =>
+          migrateAuthorityDatabase(database, { failAfterStatement }),
+        ).toThrow(/injected migration failure/i);
+        expect(snapshot(database)).toEqual(before);
+      }
+    });
+  });
+
+  it("refuses missing v6 indexes and corrupted v6 execution facts on startup", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabase(database);
+      database.exec("DROP INDEX agent_tool_dispatches_state");
+      expect(() => migrateAuthorityDatabase(database)).toThrow(/physical contract/i);
+    });
+
+    const corruptions: readonly ((database: DatabaseSync) => void)[] = [
+      (database) => {
+        database.exec("PRAGMA ignore_check_constraints = ON");
+        database.exec("UPDATE agent_executions SET state = 'invalid' WHERE id = 'v6-execution'");
+        database.exec("PRAGMA ignore_check_constraints = OFF");
+      },
+      (database) => {
+        database.exec("PRAGMA ignore_check_constraints = ON");
+        database.exec(
+          "UPDATE agent_execution_attempts SET retry_ordinal = 4 WHERE execution_id = 'v6-execution' AND attempt_seq = 1",
+        );
+        database.exec("PRAGMA ignore_check_constraints = OFF");
+      },
+      (database) => {
+        database.exec("PRAGMA ignore_check_constraints = ON");
+        database.exec(
+          "UPDATE agent_execution_attempts SET state = 'queued', started_at = NULL, tool_dispatch_phase = 'not_started', enqueue_stream_seq = 0 WHERE execution_id = 'v6-execution' AND attempt_seq = 1",
+        );
+        database.exec("PRAGMA ignore_check_constraints = OFF");
+      },
+      (database) => {
+        database.exec("PRAGMA foreign_keys = OFF");
+        database.exec(
+          "UPDATE agent_tool_dispatches SET grant_id = 'missing-grant' WHERE id = 'v6-dispatch'",
+        );
+        database.exec("PRAGMA foreign_keys = ON");
+      },
+    ];
+    for (const corrupt of corruptions) {
+      withDatabase((database) => {
+        migrateAuthorityDatabase(database);
+        database.exec(`
+          INSERT INTO actors (id, kind, display_name) VALUES
+            ('v6-human', 'human', 'V6 Human'), ('v6-agent', 'agent', 'V6 Agent');
+          INSERT INTO rooms (id, name, status, created_at)
+          VALUES ('v6-room', 'V6', 'active', '2026-08-13T00:00:00.000Z');
+          INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+          VALUES ('identity', 'v6-human', 0, 1), ('identity', 'v6-agent', 0, 1),
+                 ('room', 'v6-room', 0, 1);
+          INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+          VALUES ('v6-message', 'v6-room', 'v6-human', 'human', 'invoke',
+                  '2026-08-13T00:00:00.000Z');
+          INSERT INTO agent_executions (
+            id, room_id, agent_id, source_message_id, requester_actor_id, state,
+            action_category, tool_dispatch_phase, current_tool_id,
+            current_attempt_seq, retry_cycle, retry_ordinal, provider_id, model_id,
+            recovery_cursor, queued_at, started_at, updated_at
+          ) VALUES (
+            'v6-execution', 'v6-room', 'v6-agent', 'v6-message', 'v6-human',
+            'running', 'tool_call', 'dispatched', 'summarize', 1, 1, 1,
+            'test-provider', 'test-model', 1, '2026-08-13T00:00:00.000Z',
+            '2026-08-13T00:00:01.000Z', '2026-08-13T00:00:01.000Z'
+          );
+          INSERT INTO agent_execution_attempts (
+            execution_id, room_id, attempt_seq, retry_cycle, retry_ordinal, state,
+            action_category, tool_dispatch_phase, started_at, finished_at,
+            error_code, next_retry_at, recovery_cursor
+          ) VALUES (
+            'v6-execution', 'v6-room', 1, 1, 1, 'running', 'tool_call', 'dispatched',
+            '2026-08-13T00:00:01.000Z', NULL, NULL, NULL, 1
+          );
+          INSERT INTO agent_execution_steps (
+            execution_id, attempt_seq, step_seq, step_kind, canonical_tool_call_json,
+            input_sha256, output_sha256, completed_at
+          ) VALUES (
+            'v6-execution', 1, 1, 'tool_call', '{"toolId":"summarize"}',
+            '${"a".repeat(64)}', '${"a".repeat(64)}', '2026-08-13T00:00:01.000Z'
+          );
+          INSERT INTO agent_tool_grants (
+            id, execution_id, attempt_seq, tool_call_step_seq, agent_id, room_id, tool_id,
+            parameter_hash, tool_plan_hash, confirmation_requirement, issued_at, expires_at, consumed_at
+          ) VALUES (
+            'v6-grant', 'v6-execution', 1, 1, 'v6-agent', 'v6-room', 'summarize',
+            '${"a".repeat(64)}', '${"a".repeat(64)}', 'read_only', '2026-08-13T00:00:01.000Z',
+            '2026-08-13T00:01:01.000Z', NULL
+          );
+          INSERT INTO agent_tool_dispatches (
+            id, execution_id, attempt_seq, grant_id, tool_id, parameter_hash,
+            state, dispatched_at, settled_at, closed_summary, sealed_compensation
+          ) VALUES (
+            'v6-dispatch', 'v6-execution', 1, 'v6-grant', 'summarize',
+            '${"a".repeat(64)}', 'dispatched', '2026-08-13T00:00:02.000Z', NULL,
+            NULL, NULL
+          );
+        `);
+        corrupt(database);
+        expect(() => migrateAuthorityDatabase(database)).toThrow(/integrity|invariant/i);
+      });
+    }
+  });
+
+  it("refuses C1 attempt, intent, grant, dispatch, lineage, and fence corruption", () => {
+    const corruptions: readonly {
+      readonly name: string;
+      readonly corrupt: (database: DatabaseSync) => void;
+    }[] = [
+      {
+        name: "attempt sequence beyond execution current",
+        corrupt(database) {
+          database.exec(`
+            INSERT INTO agent_execution_attempts (
+              execution_id, room_id, attempt_seq, retry_cycle, retry_ordinal, state,
+              action_category, tool_dispatch_phase, started_at, finished_at,
+              error_code, next_retry_at, recovery_cursor
+            ) VALUES (
+              'v6-execution', 'v6-room', 2, 1, 2, 'completed', 'tool_call', 'finished',
+              '2026-08-13T00:00:02.000Z', '2026-08-13T00:00:03.000Z',
+              NULL, NULL, 0
+            )
+          `);
+        },
+      },
+      {
+        name: "nonterminal attempt below current",
+        corrupt(database) {
+          database.exec(
+            "UPDATE agent_executions SET current_attempt_seq = 2, retry_ordinal = 2 WHERE id = 'v6-execution'",
+          );
+          database.exec(`
+            INSERT INTO agent_execution_attempts (
+              execution_id, room_id, attempt_seq, retry_cycle, retry_ordinal, state,
+              action_category, tool_dispatch_phase, started_at, finished_at,
+              error_code, next_retry_at, recovery_cursor
+            ) VALUES (
+              'v6-execution', 'v6-room', 2, 1, 2, 'running', 'tool_call', 'dispatched',
+              '2026-08-13T00:00:02.000Z', NULL, NULL, NULL, 0
+            )
+          `);
+        },
+      },
+      {
+        name: "intent target does not bind execution agent",
+        corrupt(database) {
+          database.exec(`
+            INSERT INTO agent_invocation_intents (
+              id, source_message_id, target_agent_id, intent_kind, execution_id, created_at
+            ) VALUES (
+              'v6-intent', 'v6-message', 'v6-agent-2', 'direct_mention',
+              'v6-execution', '2026-08-13T00:00:00.000Z'
+            )
+          `);
+        },
+      },
+      {
+        name: "grant actor does not bind execution agent",
+        corrupt(database) {
+          database.exec("UPDATE agent_tool_grants SET agent_id = 'v6-agent-2' WHERE id = 'v6-grant'");
+        },
+      },
+      {
+        name: "dispatch exists on a model attempt",
+        corrupt(database) {
+          database.exec("PRAGMA ignore_check_constraints = ON");
+          database.exec(`
+            UPDATE agent_execution_attempts
+            SET action_category = 'model_generation', tool_dispatch_phase = NULL
+            WHERE execution_id = 'v6-execution' AND attempt_seq = 1
+          `);
+          database.exec("PRAGMA ignore_check_constraints = OFF");
+        },
+      },
+      {
+        name: "self manual retry lineage",
+        corrupt(database) {
+          database.exec("UPDATE agent_executions SET manual_retry_of_execution_id = id WHERE id = 'v6-execution'");
+        },
+      },
+      {
+        name: "malformed supersedes lineage JSON",
+        corrupt(database) {
+          database.exec("PRAGMA ignore_check_constraints = ON");
+          database.exec("UPDATE agent_executions SET supersedes_execution_ids_json = '{' WHERE id = 'v6-execution'");
+          database.exec("PRAGMA ignore_check_constraints = OFF");
+        },
+      },
+      {
+        name: "fence replacement references a running old attempt",
+        corrupt(database) {
+          database.exec(`
+            INSERT INTO agent_fence_replacements (
+              id, fence_message_id, old_execution_id, old_attempt_seq,
+              route_job_id, selected_agent_id, expected_judgment_id,
+              replacement_execution_id, created_at
+            ) VALUES (
+              'v6-fence', 'v6-message', 'v6-execution', 1,
+              NULL, NULL, NULL, NULL,
+              '2026-08-13T00:00:03.000Z'
+            )
+          `);
+        },
+      },
+    ];
+
+    for (const { name, corrupt } of corruptions) {
+      withDatabase((database) => {
+        migrateAuthorityDatabase(database);
+        seedV6ToolExecution(database);
+        corrupt(database);
+        expect(() => migrateAuthorityDatabase(database), name).toThrow(/integrity|invariant/i);
+      });
+    }
+  });
+
+  it("seeks one exact confirmation recovery binding with 10000 expired waits", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabase(database);
+      seedV6ToolExecution(database);
+      database.exec(`
+        WITH RECURSIVE seq(value) AS (
+          VALUES (1) UNION ALL SELECT value + 1 FROM seq WHERE value < 10000
+        )
+        INSERT INTO agent_executions (
+          id, room_id, agent_id, source_message_id, requester_actor_id, state,
+          action_category, current_attempt_seq, retry_cycle, retry_ordinal,
+          provider_id, model_id, recovery_cursor, queued_at, started_at, updated_at
+        )
+        SELECT printf('expired-wait-%05d', value), 'v6-room', 'v6-agent',
+               'v6-message', 'v6-human', 'running', 'waiting_upstream',
+               1, 1, 1, 'test-provider', 'test-model', 1,
+               '2026-08-13T00:00:00.000Z', '2026-08-13T00:00:01.000Z',
+               '2026-08-13T00:00:01.000Z'
+        FROM seq;
+        INSERT INTO agent_execution_attempts (
+          execution_id, room_id, attempt_seq, retry_cycle, retry_ordinal, state,
+          action_category, started_at, recovery_cursor
+        )
+        SELECT id, room_id, 1, 1, 1, 'running', 'waiting_upstream',
+               '2026-08-13T00:00:01.000Z', 1
+        FROM agent_executions WHERE id LIKE 'expired-wait-%';
+        INSERT INTO agent_execution_steps (
+          execution_id, attempt_seq, step_seq, step_kind, canonical_tool_call_json,
+          input_sha256, output_sha256, completed_at
+        )
+        SELECT id, 1, 1, 'tool_call', '{"toolId":"summarize"}',
+               '${"a".repeat(64)}', '${"a".repeat(64)}',
+               '2026-08-13T00:00:01.000Z'
+        FROM agent_executions WHERE id LIKE 'expired-wait-%';
+        INSERT INTO agent_tool_grants (
+          id, execution_id, attempt_seq, tool_call_step_seq, agent_id, room_id,
+          tool_id, parameter_hash, tool_plan_hash, confirmation_requirement,
+          issued_at, expires_at
+        )
+        SELECT 'grant-' || id, id, 1, 1, 'v6-agent', 'v6-room', 'summarize',
+               '${"a".repeat(64)}', '${"a".repeat(64)}', 'side_effect',
+               '2026-08-13T00:00:01.000Z', '2026-08-13T00:00:02.000Z'
+        FROM agent_executions WHERE id LIKE 'expired-wait-%';
+      `);
+      const plan = queryPlanDetails(database, `
+        SELECT execution.id
+        FROM agent_executions AS execution
+        JOIN agent_execution_attempts AS attempt
+          ON attempt.execution_id = execution.id
+         AND attempt.attempt_seq = execution.current_attempt_seq
+        JOIN agent_tool_grants AS grant INDEXED BY agent_tool_grants_execution_step
+          ON grant.execution_id = execution.id
+         AND grant.attempt_seq = execution.current_attempt_seq
+         AND grant.tool_call_step_seq = execution.recovery_cursor
+         AND grant.confirmation_requirement = 'side_effect'
+         AND grant.consumed_at IS NULL
+        LEFT JOIN agent_tool_confirmations AS confirmation
+          ON confirmation.grant_id = grant.id AND confirmation.consumed_at IS NULL
+        WHERE execution.state = 'running' AND attempt.state = 'running'
+          AND execution.action_category = 'waiting_upstream'
+          AND execution.tool_dispatch_phase IS NULL
+          AND attempt.action_category = 'waiting_upstream'
+          AND attempt.tool_dispatch_phase IS NULL
+          AND execution.agent_id = ?
+          AND execution.id = ?
+          AND (grant.expires_at <= ? OR confirmation.expires_at <= ?)
+        LIMIT 2
+      `, "v6-agent", "expired-wait-10000", "2026-08-13T00:00:03.000Z",
+      "2026-08-13T00:00:03.000Z");
+      expect(plan.some((detail) =>
+        detail.includes("agent_tool_grants_execution_step") &&
+        /execution_id=\? AND attempt_seq=\? AND tool_call_step_seq=\?/i.test(detail),
+      )).toBe(true);
+      expect(plan.some((detail) =>
+        detail.includes("sqlite_autoindex_agent_tool_confirmations") &&
+        detail.includes("grant_id=?"),
+      )).toBe(true);
+      expect(plan.join("\n")).not.toMatch(/SCAN grant|SCAN confirmation|AUTOMATIC|TEMP B-TREE/);
+    });
+  });
+
+  it("allows a durable fence before routing and requires the routing tuple to be all-or-none", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabase(database);
+      seedV6ToolExecution(database);
+
+      expect(() => database.exec(`
+        INSERT INTO agent_fence_replacements (
+          id, fence_message_id, old_execution_id, old_attempt_seq,
+          route_job_id, selected_agent_id, expected_judgment_id,
+          replacement_execution_id, created_at
+        ) VALUES (
+          'v6-staged-fence', 'v6-message', 'v6-execution', 1,
+          NULL, NULL, NULL, NULL, '2026-08-13T00:00:03.000Z'
+        )
+      `)).not.toThrow();
+      expect(() => database.exec(`
+        INSERT INTO agent_fence_replacements (
+          id, fence_message_id, old_execution_id, old_attempt_seq,
+          route_job_id, selected_agent_id, expected_judgment_id,
+          replacement_execution_id, created_at
+        ) VALUES (
+          'v6-partial-fence', 'v6-message', 'v6-execution', 1,
+          'route-1', NULL, NULL, NULL, '2026-08-13T00:00:04.000Z'
+        )
+      `)).toThrow();
+    });
+  });
+
+  it("physically refuses an execution without its required source message", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabase(database);
+      seedV6ToolExecution(database);
+      expect(() => database.exec(
+        "UPDATE agent_executions SET source_message_id = NULL WHERE id = 'v6-execution'",
+      )).toThrow(/NOT NULL/i);
+    });
+  });
+
+  it("physically rejects the core-visible empty, noncanonical, and unsafe v6 boundaries", () => {
+    const updates = [
+      "UPDATE agent_executions SET current_tool_id = ' ' WHERE id = 'v6-execution'",
+      "UPDATE agent_executions SET updated_at = '2026-08-13T00:00:01Z' WHERE id = 'v6-execution'",
+      "UPDATE agent_executions SET current_attempt_seq = 9007199254740992 WHERE id = 'v6-execution'",
+      `UPDATE agent_executions
+       SET state = 'cancelled', completed_at = '2026-08-13T00:00:02.000Z',
+           updated_at = '2026-08-13T00:00:02.000Z', cancellation_reason = ''
+       WHERE id = 'v6-execution'`,
+    ] as const;
+    for (const update of updates) {
+      withDatabase((database) => {
+        migrateAuthorityDatabase(database);
+        seedV6ToolExecution(database);
+        expect(() => database.exec(update)).toThrow(/CHECK/i);
+      });
+    }
+    expect(isAgentExecution({
+      id: "execution", roomId: "room", sourceMessageId: "source", requesterId: "human", agentId: "agent",
+      status: "queued", actionCategory: "tool_call", toolDispatchPhase: "not_started", currentToolId: " ",
+      currentAttemptSeq: 1, retryCycle: 1, retryOrdinal: 1, providerId: "provider", modelId: "model",
+      recoveryCursor: 0, queuedAt: "2026-08-13T00:00:00.000Z", updatedAt: "2026-08-13T00:00:00.000Z",
+    })).toBe(false);
+  });
+
+  it("rejects every NULL-producing 24-byte timestamp both physically and on restart", () => {
+    const invalid = "2026-99-99T99:99:99.999Z";
+    withDatabase((database) => {
+      migrateAuthorityDatabase(database);
+      seedV6ToolExecution(database);
+      expect(() => database.prepare(
+        "UPDATE agent_executions SET updated_at = ? WHERE id = 'v6-execution'",
+      ).run(invalid)).toThrow(/CHECK/i);
+      database.exec("PRAGMA ignore_check_constraints = ON");
+      database.prepare(
+        "UPDATE agent_executions SET updated_at = ? WHERE id = 'v6-execution'",
+      ).run(invalid);
+      database.exec("PRAGMA ignore_check_constraints = OFF");
+      expect(() => migrateAuthorityDatabase(database)).toThrow(/integrity|invariant/i);
+    });
+  });
+
+  it.each(["closed_summary", "sealed_compensation"] as const)(
+    "bounds dispatch %s to 65536 UTF-8 bytes physically and on restart",
+    (column) => {
+      withDatabase((database) => {
+        migrateAuthorityDatabase(database);
+        seedV6ToolExecution(database);
+        expect(() => database.prepare(
+          `UPDATE agent_tool_dispatches SET ${column} = ? WHERE id = 'v6-dispatch'`,
+        ).run("好".repeat(21_846))).toThrow(/CHECK/i);
+        database.exec("PRAGMA ignore_check_constraints = ON");
+        database.prepare(
+          `UPDATE agent_tool_dispatches SET ${column} = ? WHERE id = 'v6-dispatch'`,
+        ).run("好".repeat(21_846));
+        database.exec("PRAGMA ignore_check_constraints = OFF");
+        expect(() => migrateAuthorityDatabase(database)).toThrow(/integrity|invariant/i);
+      });
+    },
+  );
+
+  it("requires a routed fence for every superseded execution and closes intent timestamps", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabase(database);
+      seedV6ToolExecution(database);
+      database.exec(`
+        DELETE FROM agent_tool_dispatches WHERE id = 'v6-dispatch';
+        DELETE FROM agent_tool_grants WHERE id = 'v6-grant';
+        UPDATE agent_execution_attempts
+        SET state = 'cancelled', tool_dispatch_phase = 'not_started',
+            finished_at = '2026-08-13T00:00:02.000Z'
+        WHERE execution_id = 'v6-execution' AND attempt_seq = 1;
+        UPDATE agent_executions
+        SET state = 'cancelled', tool_dispatch_phase = 'not_started',
+            completed_at = '2026-08-13T00:00:02.000Z', updated_at = '2026-08-13T00:00:02.000Z',
+            cancellation_reason = 'fenced'
+        WHERE id = 'v6-execution';
+        INSERT INTO agent_executions (
+          id, room_id, agent_id, source_message_id, requester_actor_id, state,
+          action_category, tool_dispatch_phase, current_tool_id,
+          current_attempt_seq, retry_cycle, retry_ordinal, provider_id, model_id,
+          recovery_cursor, queued_at, started_at, updated_at, supersedes_execution_ids_json
+        ) VALUES ('v6-unfenced-replacement', 'v6-room', 'v6-agent', 'v6-message', 'v6-human',
+          'queued', 'model_generation', NULL, NULL, 1, 1, 1, 'provider', 'model', 0,
+          '2026-08-13T00:00:03.000Z', NULL, '2026-08-13T00:00:03.000Z', '["v6-execution"]');
+        INSERT INTO agent_execution_attempts (
+          execution_id, room_id, attempt_seq, retry_cycle, retry_ordinal, state,
+          action_category, tool_dispatch_phase, started_at, finished_at,
+          error_code, next_retry_at, recovery_cursor, enqueue_stream_seq
+        ) VALUES ('v6-unfenced-replacement', 'v6-room', 1, 1, 1, 'queued', 'model_generation', NULL,
+                  NULL, NULL, NULL, NULL, 0, 1);
+      `);
+      expect(() => migrateAuthorityDatabase(database)).toThrow(/integrity|invariant/i);
+    });
+    withDatabase((database) => {
+      const invalid = "2026-99-99T99:99:99.999Z";
+      migrateAuthorityDatabase(database);
+      seedV6ToolExecution(database);
+      expect(() => database.prepare(`INSERT INTO agent_invocation_intents (
+        id, source_message_id, target_agent_id, intent_kind, execution_id, created_at
+      ) VALUES ('intent-time', 'v6-message', 'v6-agent', 'direct_mention', 'v6-execution', ?)`).run(invalid))
+        .toThrow(/CHECK/i);
+      database.prepare(`INSERT INTO agent_invocation_intents (
+        id, source_message_id, target_agent_id, intent_kind, execution_id, created_at
+      ) VALUES ('intent-time', 'v6-message', 'v6-agent', 'direct_mention', 'v6-execution',
+                '2026-08-13T00:00:03.000Z')`).run();
+      database.exec("PRAGMA ignore_check_constraints = ON");
+      database.prepare("UPDATE agent_invocation_intents SET created_at = ? WHERE id = 'intent-time'")
+        .run(invalid);
+      database.exec("PRAGMA ignore_check_constraints = OFF");
+      expect(() => migrateAuthorityDatabase(database)).toThrow(/integrity|invariant/i);
+    });
+  });
+
+  it("accepts string supersedes lineage and a matching routed fence replacement", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabase(database);
+      seedV6ToolExecution(database);
+      database.exec(`
+        DELETE FROM agent_tool_dispatches WHERE id = 'v6-dispatch';
+        DELETE FROM agent_tool_grants WHERE id = 'v6-grant';
+        UPDATE agent_execution_attempts
+        SET state = 'cancelled', tool_dispatch_phase = 'not_started',
+            finished_at = '2026-08-13T00:00:02.000Z'
+        WHERE execution_id = 'v6-execution' AND attempt_seq = 1;
+        UPDATE agent_executions
+        SET state = 'cancelled', cancellation_reason = 'legacy_interrupted', tool_dispatch_phase = 'not_started',
+            completed_at = '2026-08-13T00:00:02.000Z',
+            updated_at = '2026-08-13T00:00:02.000Z'
+        WHERE id = 'v6-execution';
+        INSERT INTO agent_judgments (
+          id, room_id, agent_id, message_id, judgment_json, created_at
+        ) VALUES (
+          'v6-judgment', 'v6-room', 'v6-agent', 'v6-message',
+          '{"outcome":"will_respond"}',
+          '2026-08-13T00:00:03.000Z'
+        );
+        INSERT INTO agent_executions (
+          id, room_id, agent_id, source_message_id, requester_actor_id, state,
+          action_category, tool_dispatch_phase, current_tool_id,
+          current_attempt_seq, retry_cycle, retry_ordinal, provider_id, model_id,
+          recovery_cursor, queued_at, started_at, updated_at,
+          supersedes_execution_ids_json
+        ) VALUES (
+          'v6-replacement', 'v6-room', 'v6-agent', 'v6-message', 'v6-human',
+          'queued', 'tool_call', 'not_started', 'summarize', 1, 1, 1,
+          'test-provider', 'test-model', 0, '2026-08-13T00:00:03.000Z', NULL,
+          '2026-08-13T00:00:03.000Z', '["v6-execution"]'
+        );
+        INSERT INTO agent_execution_attempts (
+          execution_id, room_id, attempt_seq, retry_cycle, retry_ordinal, state,
+          action_category, tool_dispatch_phase, started_at, finished_at,
+          error_code, next_retry_at, recovery_cursor, enqueue_stream_seq
+        ) VALUES (
+          'v6-replacement', 'v6-room', 1, 1, 1, 'queued', 'tool_call', 'not_started',
+          NULL, NULL, NULL, NULL, 0, 1
+        );
+        INSERT INTO agent_fence_replacements (
+          id, fence_message_id, old_execution_id, old_attempt_seq,
+          route_job_id, selected_agent_id, expected_judgment_id,
+          replacement_execution_id, created_at
+        ) VALUES (
+          'v6-routed-fence', 'v6-message', 'v6-execution', 1,
+          'route-1', 'v6-agent', 'v6-judgment', 'v6-replacement',
+          '2026-08-13T00:00:03.000Z'
+        );
+      `);
+      expect(() => migrateAuthorityDatabase(database)).not.toThrow();
+    });
+  });
+
+  it("refuses non-string supersedes lineage elements", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabase(database);
+      seedV6ToolExecution(database);
+      database.exec("PRAGMA ignore_check_constraints = ON");
+      database.exec("UPDATE agent_executions SET supersedes_execution_ids_json = '[1]' WHERE id = 'v6-execution'");
+      database.exec("PRAGMA ignore_check_constraints = OFF");
+      expect(() => migrateAuthorityDatabase(database)).toThrow(/integrity|invariant/i);
+    });
+  });
+
+  it("refuses a fence whose cancelled old attempt, judgment, or replacement violates the frozen fence contract", () => {
+    const corruptions: readonly {
+      readonly name: string;
+      readonly corrupt: (database: DatabaseSync) => void;
+    }[] = [
+      {
+        name: "model generation had started before cancellation",
+        corrupt(database) {
+          database.exec(`
+            UPDATE agent_execution_attempts
+            SET action_category = 'model_generation', tool_dispatch_phase = NULL,
+                started_at = '2026-08-13T00:00:01.000Z'
+            WHERE execution_id = 'v6-execution' AND attempt_seq = 1;
+            UPDATE agent_executions
+            SET action_category = 'model_generation', tool_dispatch_phase = NULL,
+                current_tool_id = NULL
+            WHERE id = 'v6-execution';
+          `);
+        },
+      },
+      {
+        name: "tool dispatch had started before cancellation",
+        corrupt(database) {
+          database.exec(`
+            UPDATE agent_execution_attempts SET tool_dispatch_phase = 'dispatched'
+            WHERE execution_id = 'v6-execution' AND attempt_seq = 1;
+            UPDATE agent_executions SET tool_dispatch_phase = 'dispatched'
+            WHERE id = 'v6-execution';
+          `);
+        },
+      },
+      {
+        name: "judgment does not belong to the fence message",
+        corrupt(database) {
+          database.exec(`
+            INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+            VALUES ('v6-other-message', 'v6-room', 'v6-human', 'human', 'other',
+                    '2026-08-13T00:00:04.000Z');
+            UPDATE agent_judgments SET message_id = 'v6-other-message'
+            WHERE id = 'v6-judgment';
+          `);
+        },
+      },
+      {
+        name: "judgment outcome is not will respond",
+        corrupt(database) {
+          database.exec("UPDATE agent_judgments SET judgment_json = '{\"outcome\":\"decline\"}' WHERE id = 'v6-judgment'");
+        },
+      },
+      {
+        name: "judgment JSON has no outcome",
+        corrupt(database) {
+          database.exec("UPDATE agent_judgments SET judgment_json = '{}' WHERE id = 'v6-judgment'");
+        },
+      },
+      {
+        name: "judgment outcome is null",
+        corrupt(database) {
+          database.exec("UPDATE agent_judgments SET judgment_json = '{\"outcome\":null}' WHERE id = 'v6-judgment'");
+        },
+      },
+      {
+        name: "replacement is no longer queued",
+        corrupt(database) {
+          database.exec(`
+            UPDATE agent_execution_attempts
+            SET state = 'running', started_at = '2026-08-13T00:00:04.000Z'
+            WHERE execution_id = 'v6-replacement' AND attempt_seq = 1;
+            UPDATE agent_executions
+            SET state = 'running', started_at = '2026-08-13T00:00:04.000Z',
+                updated_at = '2026-08-13T00:00:04.000Z'
+            WHERE id = 'v6-replacement';
+          `);
+        },
+      },
+      {
+        name: "replacement consumes retry ordinal two",
+        corrupt(database) {
+          database.exec(`
+            UPDATE agent_execution_attempts SET retry_ordinal = 2
+            WHERE execution_id = 'v6-replacement' AND attempt_seq = 1;
+            UPDATE agent_executions SET retry_ordinal = 2
+            WHERE id = 'v6-replacement';
+          `);
+        },
+      },
+    ];
+
+    for (const { name, corrupt } of corruptions) {
+      withDatabase((database) => {
+        migrateAuthorityDatabase(database);
+        seedV6ToolExecution(database);
+        database.exec(`
+          DELETE FROM agent_tool_dispatches WHERE id = 'v6-dispatch';
+          DELETE FROM agent_tool_grants WHERE id = 'v6-grant';
+          UPDATE agent_execution_attempts
+          SET state = 'cancelled', tool_dispatch_phase = 'not_started',
+              finished_at = '2026-08-13T00:00:02.000Z'
+          WHERE execution_id = 'v6-execution' AND attempt_seq = 1;
+          UPDATE agent_executions
+          SET state = 'cancelled', cancellation_reason = 'legacy_interrupted', tool_dispatch_phase = 'not_started',
+              completed_at = '2026-08-13T00:00:02.000Z',
+              updated_at = '2026-08-13T00:00:02.000Z'
+          WHERE id = 'v6-execution';
+          INSERT INTO agent_judgments (
+            id, room_id, agent_id, message_id, judgment_json, created_at
+          ) VALUES (
+            'v6-judgment', 'v6-room', 'v6-agent', 'v6-message',
+            '{"outcome":"will_respond"}', '2026-08-13T00:00:03.000Z'
+          );
+          INSERT INTO agent_executions (
+            id, room_id, agent_id, source_message_id, requester_actor_id, state,
+            action_category, tool_dispatch_phase, current_tool_id,
+            current_attempt_seq, retry_cycle, retry_ordinal, provider_id, model_id,
+            recovery_cursor, queued_at, started_at, updated_at,
+            supersedes_execution_ids_json
+          ) VALUES (
+            'v6-replacement', 'v6-room', 'v6-agent', 'v6-message', 'v6-human',
+            'queued', 'tool_call', 'not_started', 'summarize', 1, 1, 1,
+            'test-provider', 'test-model', 0, '2026-08-13T00:00:03.000Z', NULL,
+            '2026-08-13T00:00:03.000Z', '["v6-execution"]'
+          );
+          INSERT INTO agent_execution_attempts (
+            execution_id, room_id, attempt_seq, retry_cycle, retry_ordinal, state,
+            action_category, tool_dispatch_phase, started_at, finished_at,
+            error_code, next_retry_at, recovery_cursor, enqueue_stream_seq
+          ) VALUES (
+            'v6-replacement', 'v6-room', 1, 1, 1, 'queued', 'tool_call', 'not_started',
+            NULL, NULL, NULL, NULL, 0, 1
+          );
+          INSERT INTO agent_fence_replacements (
+            id, fence_message_id, old_execution_id, old_attempt_seq,
+            route_job_id, selected_agent_id, expected_judgment_id,
+            replacement_execution_id, created_at
+          ) VALUES (
+            'v6-routed-fence', 'v6-message', 'v6-execution', 1,
+            'route-1', 'v6-agent', 'v6-judgment', 'v6-replacement',
+            '2026-08-13T00:00:03.000Z'
+          );
+        `);
+        corrupt(database);
+        expect(() => migrateAuthorityDatabase(database), name).toThrow(/integrity|invariant/i);
+      });
+    }
+  });
+
+  it("adds immutable v5 scoped keyset indexes and uses them for sparse interleaved scans", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabaseToVersion4ForTest(database);
+      expect(readSchemaVersion(database)).toBe(4);
+      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+
       expect(readSchemaVersion(database)).toBe(5);
       expect(
         database
@@ -551,14 +1558,26 @@ describe("authority SQLite schema", () => {
     });
   });
 
+  it("indexes reverse routed-fence lineage lookups", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabase(database);
+      expect(queryPlanDetails(
+        database,
+        `SELECT 1 FROM agent_fence_replacements
+         WHERE replacement_execution_id = ? AND old_execution_id = ?`,
+        "replacement", "old",
+      ).some((detail) => /SEARCH agent_fence_replacements USING .*agent_fence_replacements_replacement_old/i.test(detail))).toBe(true);
+    });
+  });
+
   it("adds complete canonical collaboration columns in immutable v4", () => {
     withDatabase((database) => {
       migrateAuthorityDatabaseToVersion3ForTest(database);
       expect(readSchemaVersion(database)).toBe(3);
 
-      migrateAuthorityDatabase(database);
+      migrateAuthorityDatabaseToVersion4ForTest(database);
 
-      expect(readSchemaVersion(database)).toBe(5);
+      expect(readSchemaVersion(database)).toBe(4);
       expect(tableColumns(database, "open_items")).toEqual(
         expect.arrayContaining([
           "requester_actor_id",
@@ -598,7 +1617,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(5);
+      expect(readSchemaVersion(database)).toBe(6);
       expect(database.prepare(
         `SELECT source_message_id AS sourceMessageId, actor_id AS actorId
          FROM calibration_signals WHERE id = 'signal-v3'`,
@@ -651,7 +1670,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(5);
+      expect(readSchemaVersion(database)).toBe(6);
       expect(
         database.prepare("SELECT id, catalog_revision FROM actors ORDER BY id").all(),
       ).toEqual([
@@ -730,7 +1749,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(5);
+      expect(readSchemaVersion(database)).toBe(6);
       expect(
         database
           .prepare(
@@ -1024,7 +2043,7 @@ describe("authority SQLite schema", () => {
 
     for (const [tableName, search, replacement] of probes) {
       withDatabase((database) => {
-        migrateAuthorityDatabase(database);
+        migrateAuthorityDatabaseToPreviousVersionForTest(database);
         tamperSchemaSql(database, tableName, search, replacement);
 
         expect(() => migrateAuthorityDatabase(database)).toThrow(/unknown schema/i);
@@ -1036,7 +2055,7 @@ describe("authority SQLite schema", () => {
     withDatabase((database) => {
       createV1Fixture(database);
       seedV1History(database);
-      migrateAuthorityDatabase(database);
+      migrateAuthorityDatabaseToPreviousVersionForTest(database);
       database.exec(`
         INSERT INTO actors (
           id, kind, display_name, reachability, readiness, tool_permissions_json
@@ -1307,9 +2326,9 @@ describe("authority SQLite schema", () => {
     });
 
     withDatabase((database) => {
-      database.exec("PRAGMA user_version = 6");
+      database.exec("PRAGMA user_version = 7");
       expect(() => migrateAuthorityDatabase(database)).toThrow(/future schema/i);
-      expect(readSchemaVersion(database)).toBe(6);
+      expect(readSchemaVersion(database)).toBe(7);
     });
   });
 
@@ -1381,7 +2400,7 @@ describe("derived snapshot cache schema", () => {
         .toBe(SNAPSHOT_CACHE_BUSY_TIMEOUT_MS);
       expect(() => validateSnapshotCacheSchema(database)).not.toThrow();
     });
-    expect(AUTHORITY_SCHEMA_VERSION).toBe(5);
+    expect(AUTHORITY_SCHEMA_VERSION).toBe(6);
   });
 
   it("fails closed on version-one corruption and refuses future versions", () => {

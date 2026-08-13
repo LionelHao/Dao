@@ -25,9 +25,29 @@ import {
   AuthorityRollbackFatalError,
   appendCanonicalIdentityEvent,
   executeAgentDatabaseCommand,
+  invokeAgentRuntimeDatabaseCommand,
   executeHumanDatabaseCommand,
   authorizeOutboxCandidateDatabaseQuery,
   canAccessRoomDatabaseQuery,
+  commitAgentRuntimeStepDatabaseCommand,
+  completeAgentRuntimeExecutionDatabaseCommand,
+  completeAgentRuntimeCompensationDatabaseCommand,
+  failAgentRuntimeExecutionDatabaseCommand,
+  claimNextAgentRuntimeDatabaseCommand,
+  scheduleAgentRuntimeRetryDatabaseCommand,
+  interruptAgentRuntimeDatabaseCommand,
+  manualRetryAgentRuntimeDatabaseCommand,
+  compensateAgentRuntimeDatabaseCommand,
+  resumeAgentRuntimeCompensationDatabaseCommand,
+  recoverAgentRuntimePageDatabaseCommand,
+  prepareAgentRuntimeToolDatabaseCommand,
+  confirmAgentRuntimeToolDatabaseCommand,
+  resumeConfirmedAgentRuntimeToolDatabaseCommand,
+  dispatchAgentRuntimeToolDatabaseCommand,
+  settleAgentRuntimeToolDatabaseCommand,
+  readAgentRuntimeExecutionDatabaseQuery,
+  loadAgentRuntimeProviderContextDatabaseQuery,
+  cancelAgentRuntimeForHumanFenceDatabaseCommand,
   compactRoomStreamDatabaseCommand,
   listPendingOutboxDatabaseQuery,
   markOutboxDispatchedDatabaseCommand,
@@ -1230,6 +1250,361 @@ function executeAgent(request: AuthorityWorkerRequest): void {
   }
 }
 
+function invokeAgentRuntime(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.agent-runtime.invoke") {
+    throw new TypeError("invokeAgentRuntime received the wrong request type");
+  }
+  try {
+    const execution = invokeAgentRuntimeDatabaseCommand(
+      requireAuthorityTransactionDatabase(), request,
+    );
+    respond({ type: "authority.agent-runtime.invoked", requestId: request.requestId, execution });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithError(request.requestId, "storage_unavailable", "Agent runtime invocation failed");
+  }
+}
+
+function claimNextAgentRuntime(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.agent-runtime.claim-next") {
+    throw new TypeError("claimNextAgentRuntime received the wrong request type");
+  }
+  try {
+    const execution = claimNextAgentRuntimeDatabaseCommand(
+      requireAuthorityTransactionDatabase(), request,
+    );
+    respond({
+      type: "authority.agent-runtime.claimed", requestId: request.requestId,
+      ...(execution === undefined ? {} : { execution }),
+    });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithError(request.requestId, "storage_unavailable", "Agent runtime claim failed");
+  }
+}
+
+function commitAgentRuntimeStep(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.agent-runtime.commit-step") throw new TypeError("commitAgentRuntimeStep received wrong request");
+  try {
+    const execution = commitAgentRuntimeStepDatabaseCommand(
+      requireAuthorityTransactionDatabase(), { runtime: request.runtime, input: request.input },
+    );
+    respond({ type: "authority.agent-runtime.step-committed", requestId: request.requestId, execution });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) return respondWithError(request.requestId, error.code, error.message);
+    respondWithError(request.requestId, "storage_unavailable", "Agent runtime checkpoint failed");
+  }
+}
+
+function completeAgentRuntimeExecution(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.agent-runtime.complete-execution") {
+    throw new TypeError("completeAgentRuntimeExecution received wrong request");
+  }
+  try {
+    const execution = completeAgentRuntimeExecutionDatabaseCommand(
+      requireAuthorityTransactionDatabase(), request.input, request.runtime.agentId,
+    );
+    respond({
+      type: "authority.agent-runtime.execution-completed",
+      requestId: request.requestId,
+      execution,
+    });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithError(request.requestId, "storage_unavailable", "Agent runtime completion failed");
+  }
+}
+
+function completeAgentRuntimeCompensation(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.agent-runtime.complete-compensation") {
+    throw new TypeError("completeAgentRuntimeCompensation received wrong request");
+  }
+  try {
+    const execution = completeAgentRuntimeCompensationDatabaseCommand(
+      requireAuthorityTransactionDatabase(), request.input, request.runtime.agentId,
+    );
+    respond({
+      type: "authority.agent-runtime.compensation-completed",
+      requestId: request.requestId,
+      execution,
+    });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) {
+      return respondWithError(request.requestId, error.code, error.message);
+    }
+    respondWithError(request.requestId, "storage_unavailable",
+      "Agent runtime compensation completion failed");
+  }
+}
+
+function scheduleAgentRuntimeRetry(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.agent-runtime.schedule-retry") {
+    throw new TypeError("scheduleAgentRuntimeRetry received wrong request");
+  }
+  try {
+    const execution = scheduleAgentRuntimeRetryDatabaseCommand(
+      requireAuthorityTransactionDatabase(),
+      { runtime: request.runtime, input: request.input },
+    );
+    respond({
+      type: "authority.agent-runtime.retry-scheduled",
+      requestId: request.requestId,
+      execution,
+    });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithError(request.requestId, "storage_unavailable", "Agent runtime retry failed");
+  }
+}
+
+function failAgentRuntimeExecution(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.agent-runtime.fail-execution") {
+    throw new TypeError("failAgentRuntimeExecution received wrong request");
+  }
+  try {
+    const execution = failAgentRuntimeExecutionDatabaseCommand(
+      requireAuthorityTransactionDatabase(),
+      { runtime: request.runtime, input: request.input },
+    );
+    respond({
+      type: "authority.agent-runtime.execution-failed",
+      requestId: request.requestId,
+      execution,
+    });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithError(request.requestId, "storage_unavailable", "Agent runtime terminal failure failed");
+  }
+}
+
+function interruptAgentRuntime(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.agent-runtime.interrupt") throw new TypeError("interruptAgentRuntime received wrong request");
+  try {
+    const execution = interruptAgentRuntimeDatabaseCommand(requireAuthorityTransactionDatabase(), request);
+    respond({ type: "authority.agent-runtime.interrupted", requestId: request.requestId, execution });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) return respondWithError(request.requestId, error.code, error.message);
+    respondWithError(request.requestId, "storage_unavailable", "Agent runtime interrupt failed");
+  }
+}
+
+function manualRetryAgentRuntime(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.agent-runtime.manual-retry") throw new TypeError("manualRetryAgentRuntime received wrong request");
+  try {
+    const execution = manualRetryAgentRuntimeDatabaseCommand(requireAuthorityTransactionDatabase(), request);
+    respond({ type: "authority.agent-runtime.manual-retried", requestId: request.requestId, execution });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) return respondWithError(request.requestId, error.code, error.message);
+    respondWithError(request.requestId, "storage_unavailable", "Agent runtime manual retry failed");
+  }
+}
+
+function compensateAgentRuntime(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.agent-runtime.compensate") {
+    throw new TypeError("compensateAgentRuntime received wrong request");
+  }
+  try {
+    const execution = compensateAgentRuntimeDatabaseCommand(
+      requireAuthorityTransactionDatabase(), request,
+    );
+    respond({
+      type: "authority.agent-runtime.compensation-accepted",
+      requestId: request.requestId,
+      execution,
+    });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) {
+      return respondWithError(request.requestId, error.code, error.message);
+    }
+    respondWithError(request.requestId, "storage_unavailable", "Agent runtime compensation failed");
+  }
+}
+
+function resumeAgentRuntimeCompensation(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.agent-runtime.resume-compensation") {
+    throw new TypeError("resumeAgentRuntimeCompensation received wrong request");
+  }
+  try {
+    const work = resumeAgentRuntimeCompensationDatabaseCommand(
+      requireAuthorityTransactionDatabase(), request.input, request.runtime.agentId,
+    );
+    respond({
+      type: "authority.agent-runtime.compensation-resumed",
+      requestId: request.requestId,
+      work,
+    });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) {
+      return respondWithError(request.requestId, error.code, error.message);
+    }
+    respondWithError(request.requestId, "storage_unavailable", "Agent runtime compensation resume failed");
+  }
+}
+
+function recoverAgentRuntime(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.agent-runtime.recover") throw new TypeError("recoverAgentRuntime received wrong request");
+  try {
+    const page = recoverAgentRuntimePageDatabaseCommand(
+      requireAuthorityTransactionDatabase(), request.input, request.runtime.agentId,
+    );
+    respond({ type: "authority.agent-runtime.recovered", requestId: request.requestId, page });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) return respondWithError(request.requestId, error.code, error.message);
+    respondWithError(request.requestId, "storage_unavailable", "Agent runtime recovery failed");
+  }
+}
+
+function prepareAgentRuntimeTool(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.agent-runtime.prepare-tool") throw new TypeError("prepareAgentRuntimeTool received wrong request");
+  try {
+    const grant = prepareAgentRuntimeToolDatabaseCommand(
+      requireAuthorityTransactionDatabase(), request.input, request.runtime.agentId,
+    );
+    respond({ type: "authority.agent-runtime.tool-prepared", requestId: request.requestId, grant });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) return respondWithError(request.requestId, error.code, error.message);
+    respondWithError(request.requestId, "storage_unavailable", "Agent runtime tool preparation failed");
+  }
+}
+
+function confirmAgentRuntimeTool(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.agent-runtime.confirm-tool") throw new TypeError("confirmAgentRuntimeTool received wrong request");
+  try {
+    const confirmation = confirmAgentRuntimeToolDatabaseCommand(requireAuthorityTransactionDatabase(), request);
+    respond({ type: "authority.agent-runtime.tool-confirmed", requestId: request.requestId, confirmation });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) return respondWithError(request.requestId, error.code, error.message);
+    respondWithError(request.requestId, "storage_unavailable", "Agent runtime tool confirmation failed");
+  }
+}
+
+function resumeConfirmedAgentRuntimeTool(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.agent-runtime.resume-confirmed-tool") {
+    throw new TypeError("resumeConfirmedAgentRuntimeTool received wrong request");
+  }
+  try {
+    const resumed = resumeConfirmedAgentRuntimeToolDatabaseCommand(
+      requireAuthorityTransactionDatabase(), request.input, request.runtime.agentId,
+    );
+    respond({
+      type: "authority.agent-runtime.confirmed-tool-resumed",
+      requestId: request.requestId,
+      resumed,
+    });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) {
+      return respondWithError(request.requestId, error.code, error.message);
+    }
+    respondWithError(request.requestId, "storage_unavailable", "Agent runtime confirmed tool resume failed");
+  }
+}
+
+function dispatchAgentRuntimeTool(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.agent-runtime.dispatch-tool") throw new TypeError("dispatchAgentRuntimeTool received wrong request");
+  try {
+    const dispatch = dispatchAgentRuntimeToolDatabaseCommand(
+      requireAuthorityTransactionDatabase(), request.input, request.runtime.agentId,
+    );
+    respond({ type: "authority.agent-runtime.tool-dispatched", requestId: request.requestId, dispatch });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) return respondWithError(request.requestId, error.code, error.message);
+    respondWithError(request.requestId, "storage_unavailable", "Agent runtime tool dispatch failed");
+  }
+}
+
+function settleAgentRuntimeTool(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.agent-runtime.settle-tool") throw new TypeError("settleAgentRuntimeTool received wrong request");
+  try {
+    const dispatch = settleAgentRuntimeToolDatabaseCommand(
+      requireAuthorityTransactionDatabase(), request.input, request.runtime.agentId,
+    );
+    respond({ type: "authority.agent-runtime.tool-settled", requestId: request.requestId, dispatch });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) return respondWithError(request.requestId, error.code, error.message);
+    respondWithError(request.requestId, "storage_unavailable", "Agent runtime tool settlement failed");
+  }
+}
+
+function readAgentRuntimeExecution(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.agent-runtime.read-execution") throw new TypeError("readAgentRuntimeExecution received wrong request");
+  try {
+    const execution = readAgentRuntimeExecutionDatabaseQuery(requireAuthorityDatabase(), request.context,
+      request.executionId, request.now);
+    respond({ type: "authority.agent-runtime.execution", requestId: request.requestId, execution });
+  } catch (error: unknown) {
+    if (error instanceof AuthorityDatabaseError) return respondWithError(request.requestId, error.code, error.message);
+    respondWithError(request.requestId, "storage_unavailable", "Agent runtime execution read failed");
+  }
+}
+
+function loadAgentRuntimeProviderContext(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.agent-runtime.load-provider-context") {
+    throw new TypeError("loadAgentRuntimeProviderContext received wrong request");
+  }
+  try {
+    const context = loadAgentRuntimeProviderContextDatabaseQuery(
+      requireAuthorityDatabase(), request.executionId, request.runtime.agentId,
+    );
+    respond({
+      type: "authority.agent-runtime.provider-context",
+      requestId: request.requestId,
+      executionId: request.executionId,
+      context,
+    });
+  } catch (error: unknown) {
+    if (error instanceof AuthorityDatabaseError) {
+      return respondWithError(request.requestId, error.code, error.message);
+    }
+    respondWithError(request.requestId, "storage_unavailable", "Agent runtime provider context failed");
+  }
+}
+
+function cancelAgentRuntimeForHumanFence(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.agent-runtime.cancel-human-fence") throw new TypeError("cancelAgentRuntimeForHumanFence received wrong request");
+  try {
+    const execution = cancelAgentRuntimeForHumanFenceDatabaseCommand(
+      requireAuthorityTransactionDatabase(), request.input, request.runtime.agentId,
+    );
+    respond({ type: "authority.agent-runtime.human-fence-cancelled", requestId: request.requestId, execution });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) return respondWithError(request.requestId, error.code, error.message);
+    respondWithError(request.requestId, "storage_unavailable", "Agent runtime human fence failed");
+  }
+}
+
 function readHistory(request: AuthorityWorkerRequest): void {
   if (request.type !== "authority.read-history") {
     throw new TypeError("readHistory received the wrong request type");
@@ -1568,6 +1943,66 @@ async function dispatch(value: unknown): Promise<void> {
       return;
     case "authority.execute-agent":
       executeAgent(value);
+      return;
+    case "authority.agent-runtime.invoke":
+      invokeAgentRuntime(value);
+      return;
+    case "authority.agent-runtime.claim-next":
+      claimNextAgentRuntime(value);
+      return;
+    case "authority.agent-runtime.commit-step":
+      commitAgentRuntimeStep(value);
+      return;
+    case "authority.agent-runtime.complete-execution":
+      completeAgentRuntimeExecution(value);
+      return;
+    case "authority.agent-runtime.complete-compensation":
+      completeAgentRuntimeCompensation(value);
+      return;
+    case "authority.agent-runtime.schedule-retry":
+      scheduleAgentRuntimeRetry(value);
+      return;
+    case "authority.agent-runtime.fail-execution":
+      failAgentRuntimeExecution(value);
+      return;
+    case "authority.agent-runtime.interrupt":
+      interruptAgentRuntime(value);
+      return;
+    case "authority.agent-runtime.manual-retry":
+      manualRetryAgentRuntime(value);
+      return;
+    case "authority.agent-runtime.compensate":
+      compensateAgentRuntime(value);
+      return;
+    case "authority.agent-runtime.resume-compensation":
+      resumeAgentRuntimeCompensation(value);
+      return;
+    case "authority.agent-runtime.recover":
+      recoverAgentRuntime(value);
+      return;
+    case "authority.agent-runtime.prepare-tool":
+      prepareAgentRuntimeTool(value);
+      return;
+    case "authority.agent-runtime.confirm-tool":
+      confirmAgentRuntimeTool(value);
+      return;
+    case "authority.agent-runtime.resume-confirmed-tool":
+      resumeConfirmedAgentRuntimeTool(value);
+      return;
+    case "authority.agent-runtime.dispatch-tool":
+      dispatchAgentRuntimeTool(value);
+      return;
+    case "authority.agent-runtime.settle-tool":
+      settleAgentRuntimeTool(value);
+      return;
+    case "authority.agent-runtime.read-execution":
+      readAgentRuntimeExecution(value);
+      return;
+    case "authority.agent-runtime.load-provider-context":
+      loadAgentRuntimeProviderContext(value);
+      return;
+    case "authority.agent-runtime.cancel-human-fence":
+      cancelAgentRuntimeForHumanFence(value);
       return;
     case "authority.read-history":
       readHistory(value);

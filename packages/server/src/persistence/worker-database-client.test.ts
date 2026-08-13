@@ -37,6 +37,7 @@ import {
   type AuthorityWorkerResponse,
 } from "./worker-protocol.js";
 import { migrateAuthorityDatabase } from "./schema.js";
+import { mintInternalAgentRuntimeContext } from "./contracts.js";
 
 const temporaryDirectories = new Set<string>();
 const clients = new Set<WorkerDatabaseClient>();
@@ -99,7 +100,7 @@ async function expectDatabasePathReusable(path: string): Promise<void> {
   const replacement = trackClient(
     await createWorkerDatabaseClient({ databasePath: path }),
   );
-  await expect(replacement.inspectSchema()).resolves.toEqual({ version: 5 });
+  await expect(replacement.inspectSchema()).resolves.toEqual({ version: 6 });
 }
 
 async function expectDatabasePathEventuallyReusable(path: string): Promise<void> {
@@ -137,7 +138,7 @@ function workerThatRuns(scriptBody: string): Worker {
         parentPort.postMessage({
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 5,
+          schemaVersion: 6,
         });
         return;
       }
@@ -203,7 +204,7 @@ class MessageErrorTransport extends EventEmitter implements AuthorityWorkerTrans
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 5,
+          schemaVersion: 6,
         } satisfies AuthorityWorkerResponse);
       });
       return;
@@ -225,7 +226,7 @@ class CapabilityProbeTransport extends EventEmitter implements AuthorityWorkerTr
       queueMicrotask(() => this.emit("message", {
         type: "authority.ready",
         requestId: request.requestId,
-        schemaVersion: 5,
+        schemaVersion: 6,
       } satisfies AuthorityWorkerResponse));
       return;
     }
@@ -260,7 +261,7 @@ class SyncResultProbeTransport extends EventEmitter implements AuthorityWorkerTr
       queueMicrotask(() => this.emit("message", {
         type: "authority.ready",
         requestId: request.requestId,
-        schemaVersion: 5,
+        schemaVersion: 6,
       } satisfies AuthorityWorkerResponse));
       return;
     }
@@ -273,6 +274,52 @@ class SyncResultProbeTransport extends EventEmitter implements AuthorityWorkerTr
   async terminate(): Promise<number> {
     return 0;
   }
+}
+
+class ResumedToolProbeTransport extends EventEmitter implements AuthorityWorkerTransport {
+  constructor(
+    private readonly responseFor: (
+      request: Extract<AuthorityWorkerRequest, { readonly type: "authority.agent-runtime.resume-confirmed-tool" }>,
+    ) => AuthorityWorkerResponse,
+  ) { super(); }
+
+  postMessage(request: AuthorityWorkerRequest): void {
+    if (request.type === "authority.initialize") {
+      queueMicrotask(() => this.emit("message", {
+        type: "authority.ready", requestId: request.requestId, schemaVersion: 6,
+      } satisfies AuthorityWorkerResponse));
+      return;
+    }
+    if (request.type !== "authority.agent-runtime.resume-confirmed-tool") {
+      throw new Error("unexpected resumed tool probe request");
+    }
+    queueMicrotask(() => this.emit("message", this.responseFor(request)));
+  }
+
+  async terminate(): Promise<number> { return 0; }
+}
+
+class RecoveryPageProbeTransport extends EventEmitter implements AuthorityWorkerTransport {
+  constructor(
+    private readonly responseFor: (
+      request: Extract<AuthorityWorkerRequest, { readonly type: "authority.agent-runtime.recover" }>,
+    ) => AuthorityWorkerResponse,
+  ) { super(); }
+
+  postMessage(request: AuthorityWorkerRequest): void {
+    if (request.type === "authority.initialize") {
+      queueMicrotask(() => this.emit("message", {
+        type: "authority.ready", requestId: request.requestId, schemaVersion: 6,
+      } satisfies AuthorityWorkerResponse));
+      return;
+    }
+    if (request.type !== "authority.agent-runtime.recover") {
+      throw new Error("unexpected recovery page probe request");
+    }
+    queueMicrotask(() => this.emit("message", this.responseFor(request)));
+  }
+
+  async terminate(): Promise<number> { return 0; }
 }
 
 class CompactionResultProbeTransport extends EventEmitter implements AuthorityWorkerTransport {
@@ -291,7 +338,7 @@ class CompactionResultProbeTransport extends EventEmitter implements AuthorityWo
       queueMicrotask(() => this.emit("message", {
         type: "authority.ready",
         requestId: request.requestId,
-        schemaVersion: 5,
+        schemaVersion: 6,
       } satisfies AuthorityWorkerResponse));
       return;
     }
@@ -323,7 +370,7 @@ class ThrowingPostTransport extends EventEmitter implements AuthorityWorkerTrans
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 5,
+          schemaVersion: 6,
         } satisfies AuthorityWorkerResponse);
       });
     }
@@ -346,7 +393,7 @@ class DeferredTerminationTransport
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 5,
+          schemaVersion: 6,
         } satisfies AuthorityWorkerResponse);
       });
       return;
@@ -375,7 +422,7 @@ class RejectingTerminationTransport
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 5,
+          schemaVersion: 6,
         } satisfies AuthorityWorkerResponse);
       });
       return;
@@ -403,7 +450,7 @@ class CloseRaceTransport extends EventEmitter implements AuthorityWorkerTranspor
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 5,
+          schemaVersion: 6,
         } satisfies AuthorityWorkerResponse);
       });
       return;
@@ -432,7 +479,7 @@ class CloseRaceTransport extends EventEmitter implements AuthorityWorkerTranspor
     this.emit("message", {
       type: "authority.schema",
       requestId: this.#inspectRequest.requestId,
-      schemaVersion: 5,
+      schemaVersion: 6,
     } satisfies AuthorityWorkerResponse);
   }
 
@@ -579,6 +626,270 @@ describe("AuthorityWorker closed protocol", () => {
         now: 1_000,
       }),
     ).toBe(true);
+    const runtimeInvoke = {
+      type: "authority.agent-runtime.invoke",
+      requestId: "runtime-invoke",
+      context: {
+        sessionId: createHash("sha256").update("runtime-session").digest("base64url"),
+        sessionFamilyId: createHash("sha256").update("runtime-family").digest("base64url"),
+        principal: { accountId: "account-li", actorId: "human-li" },
+        kind: "human",
+        requestId: "runtime-command-request",
+        idempotencyKey: "runtime-invoke-key",
+      },
+      input: {
+        roomId: "room-runtime",
+        sourceMessageId: "message-runtime",
+        targetAgentId: "agent-runtime",
+        intentKind: "direct_mention",
+        providerId: "provider-runtime",
+        modelId: "model-runtime",
+      },
+      now: 1_000,
+    } as const;
+    expect(isAuthorityWorkerRequest(runtimeInvoke)).toBe(true);
+    expect(isAuthorityWorkerRequest({ ...runtimeInvoke, maxQueuedPerRoom: 32 })).toBe(true);
+    expect(isAuthorityWorkerRequest({ ...runtimeInvoke, maxQueuedPerRoom: 0 })).toBe(false);
+    expect(isAuthorityWorkerRequest({ ...runtimeInvoke, maxQueuedPerRoom: 33, extra: true })).toBe(false);
+    expect(isAuthorityWorkerRequest({ ...runtimeInvoke, extra: true })).toBe(false);
+    expect(isAuthorityWorkerRequest({
+      ...runtimeInvoke,
+      input: { ...runtimeInvoke.input, arbitraryPayload: true },
+    })).toBe(false);
+    const compensation = {
+      type: "authority.agent-runtime.compensate",
+      requestId: "runtime-compensate",
+      context: runtimeInvoke.context,
+      executionId: "execution-original",
+      dispatchId: "dispatch-original",
+      now: 1_000,
+      maxQueuedPerRoom: 32,
+    } as const;
+    expect(isAuthorityWorkerRequest(compensation)).toBe(true);
+    expect(isAuthorityWorkerRequest({ ...compensation, sealedCompensation: "forged" })).toBe(false);
+    expect(isAuthorityWorkerRequest({ ...compensation, executionId: "" })).toBe(false);
+    expect(isAuthorityWorkerRequest({ ...compensation, dispatchId: "" })).toBe(false);
+    expect(isAuthorityWorkerRequest({ ...compensation, maxQueuedPerRoom: 0 })).toBe(false);
+    const completeCompensation = {
+      type: "authority.agent-runtime.complete-compensation",
+      requestId: "runtime-complete-compensation",
+      runtime: { kind: "runtime", runtimeId: "runtime-closed", agentId: "agent-runtime" },
+      input: {
+        executionId: "execution-compensation", attemptSeq: 1,
+        dispatchId: "dispatch-compensation", grantId: "grant-compensation",
+        boundedToolResult: { restored: true }, inputSha256: "a".repeat(64),
+        outputSha256: "b".repeat(64), closedSummary: "restored",
+        messageId: "message-compensation", body: "Compensation completed.",
+        sentAt: "2026-08-13T00:00:00.000Z", now: 1_000,
+      },
+    } as const;
+    expect(isAuthorityWorkerRequest(completeCompensation)).toBe(true);
+    expect(isAuthorityWorkerRequest({
+      ...completeCompensation,
+      input: { ...completeCompensation.input, sealedCompensation: "forged" },
+    })).toBe(false);
+    expect(isAuthorityWorkerRequest({
+      ...completeCompensation,
+      input: { ...completeCompensation.input, boundedToolResult: null },
+    })).toBe(false);
+    const runtimeContext = { kind: "runtime", runtimeId: "runtime-closed", agentId: "agent-runtime" } as const;
+    const recoverPage = {
+      type: "authority.agent-runtime.recover",
+      requestId: "runtime-recover-page",
+      runtime: runtimeContext,
+      input: { now: 1_000, limit: 256, cursor: "opaque-cursor" },
+    } as const;
+    expect(isAuthorityWorkerRequest(recoverPage)).toBe(true);
+    expect(isAuthorityWorkerRequest({
+      ...recoverPage, input: { ...recoverPage.input, limit: 257 },
+    })).toBe(false);
+    expect(isAuthorityWorkerRequest({
+      ...recoverPage, input: { ...recoverPage.input, offset: 1 },
+    })).toBe(false);
+    expect(isAuthorityWorkerRequest({
+      ...recoverPage, input: { now: 1_000, limit: 64 }, extra: true,
+    })).toBe(false);
+    const commitToolResult = {
+      type: "authority.agent-runtime.commit-step",
+      requestId: "runtime-tool-result",
+      runtime: runtimeContext,
+      input: {
+        executionId: "execution-1", attemptSeq: 1, stepSeq: 2,
+        stepKind: "tool_result", dispatchId: "dispatch-1", boundedToolResult: { ok: true },
+        inputSha256: "a".repeat(64), outputSha256: "b".repeat(64), now: 1_000,
+      },
+    } as const;
+    expect(isAuthorityWorkerRequest(commitToolResult)).toBe(true);
+    expect(isAuthorityWorkerRequest({
+      ...commitToolResult,
+      runtime: { kind: "runtime", runtimeId: "runtime-closed" },
+    })).toBe(false);
+    expect(isAuthorityWorkerRequest({
+      ...commitToolResult,
+      input: { ...commitToolResult.input, boundedToolResult: null },
+    })).toBe(false);
+    const toolResultWithoutDispatch: Record<string, unknown> = { ...commitToolResult.input };
+    delete toolResultWithoutDispatch.dispatchId;
+    expect(isAuthorityWorkerRequest({ ...commitToolResult, input: toolResultWithoutDispatch })).toBe(false);
+    expect(isAuthorityWorkerRequest({
+      ...commitToolResult,
+      input: { ...commitToolResult.input, canonicalToolCall: { tool: "review.read" } },
+    })).toBe(false);
+    const commitToolCall = {
+      type: "authority.agent-runtime.commit-step",
+      requestId: "runtime-tool-call",
+      runtime: runtimeContext,
+      input: {
+        executionId: "execution-1", attemptSeq: 1, stepSeq: 1,
+        stepKind: "tool_call", canonicalToolCall: { toolId: "review.read" },
+        inputSha256: "a".repeat(64), outputSha256: "b".repeat(64), now: 1_000,
+      },
+    } as const;
+    expect(isAuthorityWorkerRequest(commitToolCall)).toBe(true);
+    expect(isAuthorityWorkerRequest({
+      ...commitToolCall,
+      input: {
+        ...commitToolCall.input,
+        canonicalToolCall: { toolId: "review.read", parameters: { path: "." } },
+      },
+    })).toBe(true);
+    expect(isAuthorityWorkerRequest({
+      ...commitToolCall,
+      input: {
+        ...commitToolCall.input,
+        canonicalToolCall: {
+          toolId: "review.read",
+          parameters: { path: "." },
+          remainingCalls: [{ callId: "call-2", toolId: "review.next", parameters: {} }],
+        },
+      },
+    })).toBe(true);
+    expect(isAuthorityWorkerRequest({
+      ...commitToolCall,
+      input: {
+        ...commitToolCall.input,
+        canonicalToolCall: {
+          toolId: "review.read",
+          parameters: { path: "." },
+          remainingCalls: [{ callId: "call-2", toolId: "review.next", parameters: {}, raw: true }],
+        },
+      },
+    })).toBe(false);
+    expect(isAuthorityWorkerRequest({
+      ...commitToolCall, input: { ...commitToolCall.input, canonicalToolCall: {} },
+    })).toBe(false);
+    expect(isAuthorityWorkerRequest({
+      ...commitToolCall,
+      input: { ...commitToolCall.input, canonicalToolCall: { toolId: "review.read", raw: "secret" } },
+    })).toBe(false);
+    expect(isAuthorityWorkerRequest({
+      type: "authority.agent-runtime.complete-execution", requestId: "runtime-complete",
+      runtime: runtimeContext,
+      input: {
+        executionId: "execution-1", attemptSeq: 1, messageId: "message-result",
+        body: "bounded answer", sentAt: "1970-01-01T00:00:01.000Z", now: 1_000,
+      },
+    })).toBe(true);
+    expect(isAuthorityWorkerRequest({
+      type: "authority.agent-runtime.complete-execution", requestId: "runtime-complete-extra",
+      runtime: runtimeContext,
+      input: {
+        executionId: "execution-1", attemptSeq: 1, messageId: "message-result",
+        body: "bounded answer", sentAt: "1970-01-01T00:00:01.000Z", now: 1_000,
+        providerBody: "raw secret",
+      },
+    })).toBe(false);
+    const failExecution = {
+      type: "authority.agent-runtime.fail-execution",
+      requestId: "runtime-fail-execution",
+      runtime: runtimeContext,
+      input: {
+        executionId: "execution-1",
+        attemptSeq: 1,
+        errorCode: "provider_invalid_response",
+        now: 1_000,
+      },
+    } as const;
+    expect(isAuthorityWorkerRequest(failExecution)).toBe(true);
+    expect(isAuthorityWorkerRequest({
+      ...failExecution,
+      input: { ...failExecution.input, providerBody: "raw secret" },
+    })).toBe(false);
+    expect(isAuthorityWorkerRequest({
+      ...failExecution,
+      input: { ...failExecution.input, errorCode: "arbitrary_failure" },
+    })).toBe(false);
+    const prepareTool = {
+      type: "authority.agent-runtime.prepare-tool",
+      requestId: "runtime-prepare-tool",
+      runtime: runtimeContext,
+      input: {
+        executionId: "execution-1", attemptSeq: 1, toolCallStepSeq: 1, toolId: "review.read",
+        parameterHash: "a".repeat(64), toolPlanHash: "b".repeat(64),
+        confirmationRequirement: "side_effect",
+        now: 1_000, expiresAt: 2_000,
+      },
+    } as const;
+    expect(isAuthorityWorkerRequest(prepareTool)).toBe(true);
+    expect(isAuthorityWorkerRequest({ ...prepareTool, input: { ...prepareTool.input, actorId: "human-1" } })).toBe(false);
+    const resumeConfirmedTool = {
+      type: "authority.agent-runtime.resume-confirmed-tool",
+      requestId: "runtime-resume-tool",
+      runtime: runtimeContext,
+      input: {
+        confirmationId: "confirmation-1", executionId: "execution-1", attemptSeq: 1,
+        roomId: "room-1", toolId: "review.read", parameterHash: "a".repeat(64),
+        toolPlanHash: "b".repeat(64), now: 1_500,
+      },
+    } as const;
+    expect(isAuthorityWorkerRequest(resumeConfirmedTool)).toBe(true);
+    expect(isAuthorityWorkerRequest({
+      ...resumeConfirmedTool,
+      input: { ...resumeConfirmedTool.input, parameters: { secret: true } },
+    })).toBe(false);
+    const dispatchTool = {
+      type: "authority.agent-runtime.dispatch-tool",
+      requestId: "runtime-dispatch-tool",
+      runtime: runtimeContext,
+      input: {
+        executionId: "execution-1", attemptSeq: 1, grantId: "grant-1", toolId: "review.read",
+        parameterHash: "a".repeat(64), confirmationRequirement: "side_effect",
+        confirmationId: "confirmation-1", now: 1_500,
+      },
+    } as const;
+    expect(isAuthorityWorkerRequest(dispatchTool)).toBe(true);
+    expect(isAuthorityWorkerRequest({
+      ...dispatchTool,
+      input: { ...dispatchTool.input, confirmationRequirement: "read_only" },
+    })).toBe(false);
+    expect(isAuthorityWorkerRequest({
+      type: "authority.agent-runtime.settle-tool", requestId: "runtime-settle-tool",
+      runtime: runtimeContext,
+      input: {
+        dispatchId: "dispatch-1", executionId: "execution-1", attemptSeq: 1,
+        grantId: "grant-1", outcome: "succeeded", now: 2_000,
+      },
+    })).toBe(true);
+    expect(isAuthorityWorkerRequest({
+      type: "authority.agent-runtime.settle-tool", requestId: "runtime-settle-tool-boundary",
+      runtime: runtimeContext,
+      input: {
+        dispatchId: "dispatch-1", executionId: "execution-1", attemptSeq: 1,
+        grantId: "grant-1", outcome: "succeeded", closedSummary: "好".repeat(21_845), now: 2_000,
+      },
+    })).toBe(true);
+    expect(isAuthorityWorkerRequest({
+      type: "authority.agent-runtime.settle-tool", requestId: "runtime-settle-tool-oversize",
+      runtime: runtimeContext,
+      input: {
+        dispatchId: "dispatch-1", executionId: "execution-1", attemptSeq: 1,
+        grantId: "grant-1", outcome: "succeeded", sealedCompensation: "好".repeat(21_846), now: 2_000,
+      },
+    })).toBe(false);
+    expect(isAuthorityWorkerRequest({
+      type: "authority.agent-runtime.recover", requestId: "runtime-recover",
+      runtime: runtimeContext, now: 2_000, extra: true,
+    })).toBe(false);
 
     expect(
       isAuthorityWorkerRequest({
@@ -620,11 +931,21 @@ describe("AuthorityWorker closed protocol", () => {
   });
 
   it("accepts only exact response variants", () => {
+    expect(isAuthorityWorkerResponse({
+      type: "authority.ready",
+      requestId: "schema-v5",
+      schemaVersion: 5,
+    })).toBe(false);
+    expect(isAuthorityWorkerResponse({
+      type: "authority.ready",
+      requestId: "schema-v6",
+      schemaVersion: 6,
+    })).toBe(true);
     expect(
       isAuthorityWorkerResponse({
         type: "authority.ready",
         requestId: "1",
-        schemaVersion: 5,
+        schemaVersion: 6,
       }),
     ).toBe(true);
     expect(isAuthorityWorkerResponse({
@@ -705,7 +1026,7 @@ describe("AuthorityWorker closed protocol", () => {
       isAuthorityWorkerResponse({
         type: "authority.schema",
         requestId: "2",
-        schemaVersion: 5,
+        schemaVersion: 6,
       }),
     ).toBe(true);
     expect(
@@ -722,12 +1043,41 @@ describe("AuthorityWorker closed protocol", () => {
         message: "Invalid authority worker request",
       }),
     ).toBe(true);
+    const failedExecutionResponse = {
+      type: "authority.agent-runtime.execution-failed",
+      requestId: "runtime-execution-failed",
+      execution: {
+        id: "execution-1",
+        roomId: "room-1",
+        sourceMessageId: "message-1",
+        requesterId: "human-1",
+        agentId: "agent-1",
+        status: "failed",
+        actionCategory: "model_generation",
+        currentAttemptSeq: 1,
+        retryCycle: 1,
+        retryOrdinal: 1,
+        providerId: "provider-1",
+        modelId: "model-1",
+        recoveryCursor: 0,
+        queuedAt: "2026-08-13T00:00:00.000Z",
+        startedAt: "2026-08-13T00:00:01.000Z",
+        finishedAt: "2026-08-13T00:00:02.000Z",
+        updatedAt: "2026-08-13T00:00:02.000Z",
+        terminalErrorCode: "provider_invalid_response",
+      },
+    } as const;
+    expect(isAuthorityWorkerResponse(failedExecutionResponse)).toBe(true);
+    expect(isAuthorityWorkerResponse({
+      ...failedExecutionResponse,
+      execution: { ...failedExecutionResponse.execution, providerBody: "raw secret" },
+    })).toBe(false);
 
     expect(
       isAuthorityWorkerResponse({
         type: "authority.schema",
         requestId: "5",
-        schemaVersion: 5,
+        schemaVersion: 6,
         rows: [],
       }),
     ).toBe(false);
@@ -803,7 +1153,7 @@ describe("AuthorityWorker closed protocol", () => {
     let response = once(worker, "message");
     worker.postMessage({ type: "authority.initialize", requestId: "1" });
     await expect(response).resolves.toEqual([
-      { type: "authority.ready", requestId: "1", schemaVersion: 5 },
+      { type: "authority.ready", requestId: "1", schemaVersion: 6 },
     ]);
 
     response = once(worker, "message");
@@ -820,7 +1170,7 @@ describe("AuthorityWorker closed protocol", () => {
     response = once(worker, "message");
     worker.postMessage({ type: "authority.inspect-schema", requestId: "2" });
     await expect(response).resolves.toEqual([
-      { type: "authority.schema", requestId: "2", schemaVersion: 5 },
+      { type: "authority.schema", requestId: "2", schemaVersion: 6 },
     ]);
   });
 });
@@ -887,7 +1237,7 @@ describe("authority database coordinator registry", () => {
     const initialized = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
-    await expect(initialized.inspectSchema()).resolves.toEqual({ version: 5 });
+    await expect(initialized.inspectSchema()).resolves.toEqual({ version: 6 });
     await initialized.close();
     linkSync(path, aliasPath);
 
@@ -918,7 +1268,7 @@ describe("authority database coordinator registry", () => {
     const replacement = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
-    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 5 });
+    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 6 });
   });
 
   it("rejects a hardlink added while the original database is live", async () => {
@@ -927,7 +1277,7 @@ describe("authority database coordinator registry", () => {
     const original = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
-    await expect(original.inspectSchema()).resolves.toEqual({ version: 5 });
+    await expect(original.inspectSchema()).resolves.toEqual({ version: 6 });
     linkSync(path, aliasPath);
 
     let spawnCount = 0;
@@ -946,7 +1296,7 @@ describe("authority database coordinator registry", () => {
     expect((aliasError as { cause?: unknown }).cause).toBeUndefined();
     expect(publicErrorSurface(aliasError)).not.toContain(path);
     expect(publicErrorSurface(aliasError)).not.toContain(aliasPath);
-    await expect(original.inspectSchema()).resolves.toEqual({ version: 5 });
+    await expect(original.inspectSchema()).resolves.toEqual({ version: 6 });
   });
 
   it("atomically reserves a dangling relative symlink chain with its future target", async () => {
@@ -988,7 +1338,7 @@ describe("authority database coordinator registry", () => {
     const replacement = trackClient(
       await createWorkerDatabaseClient({ databasePath: otherPath }),
     );
-    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 5 });
+    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 6 });
   });
 
   it("rejects a symlink cycle with a stable path-free error", async () => {
@@ -1021,7 +1371,7 @@ describe("authority database coordinator registry", () => {
     const replacement = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
-    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 5 });
+    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 6 });
   });
 
   it("releases the path after initialization failure so a retry can succeed", async () => {
@@ -1061,7 +1411,7 @@ describe("authority database coordinator registry", () => {
     const replacement = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
-    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 5 });
+    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 6 });
   });
 
   it("keeps the path reserved until terminal transport teardown completes", async () => {
@@ -1157,7 +1507,7 @@ describe("authority database coordinator registry", () => {
 
     await expect(
       Promise.all([first.inspectSchema(), second.inspectSchema()]),
-    ).resolves.toEqual([{ version: 5 }, { version: 5 }]);
+    ).resolves.toEqual([{ version: 6 }, { version: 6 }]);
   });
 });
 
@@ -1448,6 +1798,111 @@ describe("WorkerDatabaseClient", () => {
     ]);
   });
 
+  it("rejects a resumed side effect with a wrong confirmation or altered parameters", async () => {
+    const runtime = mintInternalAgentRuntimeContext({ runtimeId: "runtime-probe", agentId: "agent-probe" });
+    const response = (
+      request: Extract<AuthorityWorkerRequest, { readonly type: "authority.agent-runtime.resume-confirmed-tool" }>,
+      confirmationId: string,
+      parameters: Record<string, string>,
+    ): AuthorityWorkerResponse => ({
+      type: "authority.agent-runtime.confirmed-tool-resumed",
+      requestId: request.requestId,
+      resumed: {
+        confirmationId,
+        parameters,
+        remainingCalls: [],
+        toolPlanHash: createHash("sha256").update(
+          JSON.stringify({ parameters, remainingCalls: [], toolId: "write.file" }),
+        ).digest("hex"),
+        execution: {
+          id: "execution-probe", roomId: "room-probe", sourceMessageId: "message-probe",
+          requesterId: "human-probe", agentId: "agent-probe", status: "running",
+          actionCategory: "tool_call", toolDispatchPhase: "dispatched", currentToolId: "write.file",
+          currentAttemptSeq: 1, retryCycle: 1, retryOrdinal: 1,
+          providerId: "provider-probe", modelId: "model-probe", recoveryCursor: 2,
+          queuedAt: "2026-08-13T00:00:00.000Z", startedAt: "2026-08-13T00:00:00.001Z",
+          updatedAt: "2026-08-13T00:00:00.002Z",
+        },
+        dispatch: {
+          id: "dispatch-probe", executionId: "execution-probe", attemptSeq: 1,
+          grantId: "grant-probe", toolId: "write.file",
+          parameterHash: createHash("sha256").update('{"safe":"value"}').digest("hex"),
+          state: "dispatched", dispatchedAt: "2026-08-13T00:00:00.002Z",
+        },
+      },
+    });
+    for (const kind of ["confirmation", "parameters", "remaining-calls"] as const) {
+      const transport = new ResumedToolProbeTransport((request) => {
+        const base = response(
+          request,
+          kind === "confirmation" ? "confirmation-other" : "confirmation-probe",
+          kind === "parameters" ? { safe: "altered" } : { safe: "value" },
+        );
+        return kind === "remaining-calls" && base.type === "authority.agent-runtime.confirmed-tool-resumed"
+          ? {
+              ...base,
+              resumed: {
+                ...base.resumed,
+                remainingCalls: [{ callId: "forged", toolId: "write.file", parameters: {} }],
+              },
+            }
+          : base;
+      });
+      const client = trackClient(await createWorkerDatabaseClientForTest(
+        { databasePath: databasePath() },
+        () => transport,
+      ));
+      await expect(client.resumeConfirmedAgentRuntimeTool(runtime, {
+        confirmationId: "confirmation-probe", executionId: "execution-probe", attemptSeq: 1,
+        roomId: "room-probe", toolId: "write.file",
+        parameterHash: createHash("sha256").update('{"safe":"value"}').digest("hex"),
+        toolPlanHash: createHash("sha256").update(
+          '{"parameters":{"safe":"value"},"remainingCalls":[],"toolId":"write.file"}',
+        ).digest("hex"), now: 1_000,
+      })).rejects.toMatchObject({ code: "authority_worker_protocol_error", status: 503 });
+    }
+  });
+
+  it("rejects a recovery response that exceeds the requested hard page limit", async () => {
+    const runtime = mintInternalAgentRuntimeContext({
+      runtimeId: "runtime-recovery-limit",
+      agentId: "agent-recovery-limit",
+    });
+    const execution = (id: string) => ({
+      id,
+      roomId: `room-${id}`,
+      sourceMessageId: `message-${id}`,
+      requesterId: "human-recovery-limit",
+      agentId: "agent-recovery-limit",
+      status: "queued" as const,
+      actionCategory: "model_generation" as const,
+      currentAttemptSeq: 1,
+      retryCycle: 1,
+      retryOrdinal: 2,
+      providerId: "provider-recovery-limit",
+      modelId: "model-recovery-limit",
+      recoveryCursor: 0,
+      queuedAt: "2026-08-13T00:00:00.000Z",
+      updatedAt: "2026-08-13T00:00:00.000Z",
+    });
+    const transport = new RecoveryPageProbeTransport((request) => ({
+      type: "authority.agent-runtime.recovered",
+      requestId: request.requestId,
+      page: {
+        recoveries: [
+          { execution: execution("execution-recovery-a") },
+          { execution: execution("execution-recovery-b") },
+        ],
+      },
+    }));
+    const client = trackClient(await createWorkerDatabaseClientForTest(
+      { databasePath: databasePath() },
+      () => transport,
+    ));
+    await expect(client.recoverAgentRuntimePage(runtime, { now: 1_000, limit: 1 }))
+      .rejects.toMatchObject({ code: "authority_worker_protocol_error", status: 503 });
+  });
+
   it("migrates in a real worker while the main event loop remains responsive", async () => {
     const path = databasePath();
     const opening = createWorkerDatabaseClient({ databasePath: path });
@@ -1455,7 +1910,7 @@ describe("WorkerDatabaseClient", () => {
 
     await expect(heartbeat).resolves.toBeUndefined();
     const client = trackClient(await opening);
-    await expect(client.inspectSchema()).resolves.toEqual({ version: 5 });
+    await expect(client.inspectSchema()).resolves.toEqual({ version: 6 });
   });
 
   it("correlates concurrent responses to monotonically increasing request IDs", async () => {
@@ -1482,7 +1937,7 @@ describe("WorkerDatabaseClient", () => {
         setImmediate(() => parentPort.postMessage({
           type: "authority.schema",
           requestId: first.requestId,
-          schemaVersion: 5,
+          schemaVersion: 6,
         }));
       }
     `);
@@ -1496,7 +1951,7 @@ describe("WorkerDatabaseClient", () => {
     const first = client.inspectSchema();
     const secondRejection = rejectionOf(client.inspectSchema());
 
-    await expect(first).resolves.toEqual({ version: 5 });
+    await expect(first).resolves.toEqual({ version: 6 });
     await expect(secondRejection).resolves.toMatchObject({
       code: "invalid_request",
       status: 400,
@@ -1564,7 +2019,7 @@ describe("WorkerDatabaseClient", () => {
       parentPort.postMessage({
         type: "authority.schema",
         requestId: request.requestId,
-        schemaVersion: 5,
+        schemaVersion: 6,
         extra: true,
       });
     `);

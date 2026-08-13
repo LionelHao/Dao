@@ -30,9 +30,19 @@ import {
 } from "./service.js";
 import { MessageIdConflictError } from "./store.js";
 import type { SyncService } from "./sync-service.js";
+import type { AgentExecution } from "@native-im/core";
+import type {
+  AgentExecutionPreview,
+} from "./agent-runtime/contracts.js";
+import type {
+  AgentInvocationInput,
+  AuthenticatedCommandContext,
+  ToolConfirmationInput,
+} from "./persistence/contracts.js";
 import {
   parseClientFrame,
   type AuthenticatedFrame,
+  type AgentExecutionPreviewFrame,
   type ClientFrame,
   type ProtocolErrorFrame,
   type ServerFrame,
@@ -45,6 +55,7 @@ import {
 
 export interface MessageWebSocketServer {
   readonly url: string;
+  publishAgentExecutionPreview(roomId: string, preview: AgentExecutionPreview): Promise<boolean>;
   close(): Promise<void>;
 }
 
@@ -63,11 +74,43 @@ export interface StartMessageWebSocketServerOptions {
   readonly sync?: SyncService;
   readonly v2GateMaxEvents?: number;
   readonly v2GateMaxBytes?: number;
+  readonly agentRuntime?: AgentRuntimeTransport;
+  readonly authorizeAgentExecutionPreview?: (
+    context: AuthenticatedSessionContext,
+    roomId: string,
+  ) => Promise<boolean>;
+}
+
+export interface AgentRuntimeTransport {
+  invoke(
+    context: AuthenticatedCommandContext,
+    input: Omit<AgentInvocationInput, "providerId" | "modelId">,
+  ): Promise<AgentExecution>;
+  interrupt(
+    context: AuthenticatedCommandContext,
+    executionId: string,
+    reason: "requested_by_requester" | "requested_by_room_manager",
+  ): Promise<AgentExecution>;
+  retry(context: AuthenticatedCommandContext, executionId: string): Promise<AgentExecution>;
+  confirmTool(context: AuthenticatedCommandContext, input: ToolConfirmationInput): Promise<AgentExecution>;
+  compensate(
+    context: AuthenticatedCommandContext, executionId: string, dispatchId: string,
+  ): Promise<AgentExecution>;
 }
 
 type RuntimeMessageWebSocketServerOptions = StartMessageWebSocketServerOptions & {
   readonly streamingOwners: Map<string, StreamingSnapshotOwners>;
 };
+
+type RecoveryClientFrame = Extract<ClientFrame, {
+  readonly type:
+    | "workspace.bootstrap.begin"
+    | "workspace.bootstrap.page"
+    | "room.sync"
+    | "room.repair.begin"
+    | "room.repair.page"
+    | "snapshot.complete";
+}>;
 
 export const MESSAGE_WEBSOCKET_MAX_PAYLOAD_BYTES = 64 * 1_024;
 export const MESSAGE_WEBSOCKET_MAX_BUFFERED_AMOUNT_BYTES = 1 * 1_024 * 1_024;
@@ -169,7 +212,65 @@ const MAPPED_SERVICE_ERROR_STATUSES = new Map<ProtocolErrorFrame["code"], Protoc
   ["snapshot_busy", 429],
   ["repair_barrier_active", 503],
   ["storage_unavailable", 503],
+  ["agent_missing_permission", 403],
+  ["execution_conflict", 409],
+  ["execution_not_running", 409],
+  ["idempotency_conflict", 409],
+  ["confirmation_expired", 410],
+  ["target_busy", 429],
+  ["runtime_closed", 503],
+  ["provider_not_configured", 409],
 ]);
+
+async function handleAgentRuntimeFrame(
+  socket: WebSocket,
+  frame: Extract<ClientFrame, { type: `agent.${string}` }>,
+  options: StartMessageWebSocketServerOptions,
+  context: ConnectionContext,
+): Promise<void> {
+  const session = await requireSession(socket, frame.requestId, options, context);
+  if (session === undefined) return;
+  const runtime = options.agentRuntime;
+  if (runtime === undefined) {
+    sendFrame(socket, errorFrame(503, "storage_unavailable", "storage_unavailable", frame.requestId));
+    return;
+  }
+  const commandContext = {
+    ...session,
+    kind: "human" as const,
+    requestId: frame.requestId,
+    idempotencyKey: frame.requestId,
+  };
+  try {
+    const execution = await (() => {
+      switch (frame.type) {
+        case "agent.invoke":
+          return runtime.invoke(commandContext, {
+            roomId: frame.roomId, sourceMessageId: frame.sourceMessageId,
+            targetAgentId: frame.targetAgentId, intentKind: frame.intentKind,
+          });
+        case "agent.interrupt":
+          return runtime.interrupt(commandContext, frame.executionId, frame.reason);
+        case "agent.retry":
+          return runtime.retry(commandContext, frame.executionId);
+        case "agent.tool.confirm":
+          return runtime.confirmTool(commandContext, {
+            executionId: frame.executionId, attemptSeq: frame.attemptSeq,
+            toolId: frame.toolId, parameterHash: frame.parameterHash,
+            target: frame.target, impact: frame.impact,
+            reversibility: frame.reversibility, expiresAt: frame.expiresAt,
+          });
+        case "agent.compensate":
+          return runtime.compensate(commandContext, frame.executionId, frame.dispatchId);
+      }
+    })();
+    if (!context.closed) sendFrame(socket, {
+      type: "agent.execution", requestId: frame.requestId, execution,
+    });
+  } catch (error: unknown) {
+    if (!context.closed) sendFrame(socket, mappedError(error, frame.requestId));
+  }
+}
 
 const STORAGE_UNAVAILABLE_ERROR_CODES = new Set([
   "authority_not_initialized",
@@ -745,17 +846,7 @@ function forgetSharedStreamingSnapshot(
 }
 
 function isCorrelatedRecoveryResponse(
-  frame: Exclude<ClientFrame, {
-    readonly type:
-      | "auth.login"
-      | "auth.resume"
-      | "auth.refresh"
-      | "auth.revoke"
-      | "message.send"
-      | "room.history"
-      | "room.subscribe"
-      | "room.subscribe.v2";
-  }>,
+  frame: RecoveryClientFrame,
   response: unknown,
 ): response is ServerFrame {
   if (frame.type === "workspace.bootstrap.begin") {
@@ -819,17 +910,7 @@ function detachStreamingSnapshot(
 
 async function handleRecoveryFrame(
   socket: WebSocket,
-  frame: Exclude<ClientFrame, {
-    readonly type:
-      | "auth.login"
-      | "auth.resume"
-      | "auth.refresh"
-      | "auth.revoke"
-      | "message.send"
-      | "room.history"
-      | "room.subscribe"
-      | "room.subscribe.v2";
-  }>,
+  frame: RecoveryClientFrame,
   options: StartMessageWebSocketServerOptions,
   context: ConnectionContext,
   streamingOwners: Map<string, StreamingSnapshotOwners>,
@@ -1534,6 +1615,13 @@ async function handleFrame(
     case "room.subscribe.v2":
       await handleSubscribeV2(socket, frame, options, context);
       return;
+    case "agent.invoke":
+    case "agent.interrupt":
+    case "agent.retry":
+    case "agent.tool.confirm":
+    case "agent.compensate":
+      await handleAgentRuntimeFrame(socket, frame, options, context);
+      return;
     case "workspace.bootstrap.begin":
     case "workspace.bootstrap.page":
     case "room.sync":
@@ -1859,6 +1947,65 @@ export async function startMessageWebSocketServer(
 
   return {
     url: `ws://${host}:${address.port}`,
+    async publishAgentExecutionPreview(roomId, preview): Promise<boolean> {
+      if (Buffer.byteLength(preview.text, "utf8") > 64 * 1_024 ||
+          !Number.isSafeInteger(preview.attemptSeq) || preview.attemptSeq <= 0 ||
+          !Number.isSafeInteger(preview.streamSeq) || preview.streamSeq <= 0) {
+        return false;
+      }
+      const removePreviewSubscription = (context: ConnectionContext): void => {
+        safelyUnsubscribe(context.unsubscribersByRoom.get(roomId));
+        context.unsubscribersByRoom.delete(roomId);
+        context.subscriptionGenerationsByRoom.delete(roomId);
+        const gate = context.v2GatesByRoom.get(roomId);
+        if (gate !== undefined) cleanupV2Gate(context, gate);
+      };
+      const frame: AgentExecutionPreviewFrame = {
+        type: "agent.execution.preview",
+        executionId: preview.executionId,
+        attemptSeq: preview.attemptSeq,
+        streamSeq: preview.streamSeq,
+        text: preview.text,
+      };
+      const serialized = JSON.stringify(frame);
+      const deliveries = [...liveConnections.values()]
+        .filter(({ context }) => !context.closed && context.principal !== undefined &&
+          context.subscriptionGenerationsByRoom.has(roomId))
+        .map(async ({ socket, context }): Promise<OutboxSendResult> => {
+          if (options.authorizeAgentExecutionPreview !== undefined) {
+            const session = context.session;
+            if (session === undefined ||
+                !await options.authorizeAgentExecutionPreview(session, roomId)) {
+              removePreviewSubscription(context);
+              return { accepted: false, reason: "closed" };
+            }
+          }
+          return new Promise<OutboxSendResult>((resolve) => {
+          const maxBufferedAmount = maxBufferedAmountBySocket.get(socket) ??
+            MESSAGE_WEBSOCKET_MAX_BUFFERED_AMOUNT_BYTES;
+          if (socket.readyState !== WebSocket.OPEN ||
+              Buffer.byteLength(serialized, "utf8") > maxBufferedAmount - socket.bufferedAmount) {
+            removePreviewSubscription(context);
+            resolve({ accepted: false, reason: "backpressure" });
+            return;
+          }
+          try {
+            socket.send(serialized, (error) => {
+              if (error != null) {
+                removePreviewSubscription(context);
+                resolve({ accepted: false, reason: "send_rejected" });
+              } else resolve({ accepted: true });
+            });
+          } catch {
+            removePreviewSubscription(context);
+            resolve({ accepted: false, reason: "send_rejected" });
+          }
+          });
+        });
+      if (deliveries.length === 0) return false;
+      const results = await Promise.all(deliveries);
+      return results.some((result) => result.accepted);
+    },
     close(): Promise<void> {
       closePromise ??= (async () => {
         // Calling close first synchronously fences future dispatcher scheduling.

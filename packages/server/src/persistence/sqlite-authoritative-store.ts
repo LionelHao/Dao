@@ -10,6 +10,24 @@ import type { RoomAuditRecord } from "../room-lifecycle.js";
 import type { InvitationSecretProtector } from "../invitation-secret-protector.js";
 import type {
   AgentCollaborationCommand,
+  AgentInvocationInput,
+  AgentRuntimeAuthorityStore,
+  CommitExecutionStepInput,
+  CompleteExecutionInput,
+  CompleteCompensationInput,
+  FailExecutionInput,
+  ScheduleRetryInput,
+  InterruptExecutionInput,
+  PrepareToolInput,
+  ToolGrant,
+  ToolConfirmationInput,
+  ToolConfirmation,
+  ResumeConfirmedToolInput,
+  ResumedToolDispatch,
+  DispatchToolInput,
+  SettleToolInput,
+  ToolDispatch,
+  CancelForHumanFenceInput,
   AuthenticatedSessionContext,
   AuthenticatedCommandContext,
   CommandStore,
@@ -18,6 +36,7 @@ import type {
   HashedSessionRotation,
   HumanCollaborationCommand,
   InternalAgentCommandContext,
+  InternalAgentRuntimeContext,
   IssuedSessionRecord,
   OutboxDelivery,
   OutboxDeliveryFailureReason,
@@ -56,6 +75,70 @@ export interface SqliteAuthoritativeStore extends
     context: InternalAgentCommandContext,
     command: AgentCollaborationCommand,
   ): Promise<CommandAcknowledgement>;
+  invoke(
+    context: AuthenticatedCommandContext | InternalAgentCommandContext,
+    input: AgentInvocationInput,
+    maxQueuedPerRoom?: number,
+  ): Promise<import("@native-im/core").AgentExecution>;
+  claimNext(
+    runtime: InternalAgentRuntimeContext,
+    roomId: string,
+    now: number,
+  ): Promise<import("@native-im/core").AgentExecution | undefined>;
+  commitStep(
+    runtime: InternalAgentRuntimeContext,
+    input: CommitExecutionStepInput,
+  ): Promise<import("@native-im/core").AgentExecution>;
+  completeExecution(
+    runtime: InternalAgentRuntimeContext,
+    input: CompleteExecutionInput,
+  ): Promise<import("@native-im/core").AgentExecution>;
+  completeCompensation(
+    runtime: InternalAgentRuntimeContext,
+    input: CompleteCompensationInput,
+  ): Promise<import("@native-im/core").AgentExecution>;
+  scheduleRetry(
+    runtime: InternalAgentRuntimeContext,
+    input: ScheduleRetryInput,
+  ): Promise<import("@native-im/core").AgentExecution>;
+  failExecution(
+    runtime: InternalAgentRuntimeContext,
+    input: FailExecutionInput,
+  ): Promise<import("@native-im/core").AgentExecution>;
+  interrupt(
+    context: AuthenticatedCommandContext,
+    input: InterruptExecutionInput,
+  ): Promise<import("@native-im/core").AgentExecution>;
+  manualRetry(
+    context: AuthenticatedCommandContext,
+    executionId: string,
+    maxQueuedPerRoom?: number,
+  ): Promise<import("@native-im/core").AgentExecution>;
+  compensate(
+    context: AuthenticatedCommandContext,
+    executionId: string,
+    dispatchId: string,
+    maxQueuedPerRoom?: number,
+  ): Promise<import("@native-im/core").AgentExecution>;
+  resumeCompensation(
+    runtime: InternalAgentRuntimeContext,
+    input: Parameters<AgentRuntimeAuthorityStore["resumeCompensation"]>[1],
+  ): ReturnType<AgentRuntimeAuthorityStore["resumeCompensation"]>;
+  recoverPage(
+    runtime: InternalAgentRuntimeContext,
+    input: Parameters<AgentRuntimeAuthorityStore["recoverPage"]>[1],
+  ): ReturnType<AgentRuntimeAuthorityStore["recoverPage"]>;
+  prepareTool(runtime: InternalAgentRuntimeContext, input: PrepareToolInput): Promise<ToolGrant>;
+  confirmTool(context: AuthenticatedCommandContext, input: ToolConfirmationInput): Promise<ToolConfirmation>;
+  resumeConfirmedTool(runtime: InternalAgentRuntimeContext, input: ResumeConfirmedToolInput): Promise<ResumedToolDispatch>;
+  dispatchTool(runtime: InternalAgentRuntimeContext, input: DispatchToolInput): Promise<ToolDispatch>;
+  settleTool(runtime: InternalAgentRuntimeContext, input: SettleToolInput): Promise<ToolDispatch>;
+  readExecution(context: AuthenticatedSessionContext, executionId: string): Promise<import("@native-im/core").AgentExecution>;
+  loadProviderContext(
+    runtime: InternalAgentRuntimeContext,
+    executionId: string,
+  ): ReturnType<AgentRuntimeAuthorityStore["loadProviderContext"]>;
+  cancelForHumanFence(runtime: InternalAgentRuntimeContext, input: CancelForHumanFenceInput): Promise<import("@native-im/core").AgentExecution>;
   readHistory(
     context: AuthenticatedSessionContext,
     roomId: string,
@@ -231,6 +314,87 @@ export function createSqliteAuthoritativeStore(
       command: AgentCollaborationCommand,
     ): Promise<CommandAcknowledgement> {
       return client.executeAgent(context, command, clock());
+    },
+
+    invoke(
+      context: AuthenticatedCommandContext | InternalAgentCommandContext,
+      input: AgentInvocationInput,
+      maxQueuedPerRoom?: number,
+    ): Promise<import("@native-im/core").AgentExecution> {
+      return client.invokeAgentRuntime(context, input, clock(), maxQueuedPerRoom);
+    },
+
+    claimNext(runtime, roomId, now) {
+      return client.claimNextAgentRuntime(runtime, roomId, now);
+    },
+
+    commitStep(runtime, input) {
+      return client.commitAgentRuntimeStep(runtime, input);
+    },
+    completeExecution(runtime, input) {
+      return client.completeAgentRuntimeExecution(runtime, input);
+    },
+    completeCompensation(runtime, input: CompleteCompensationInput) {
+      return client.completeAgentRuntimeCompensation(runtime, input);
+    },
+
+    scheduleRetry(runtime, input) {
+      return client.scheduleAgentRuntimeRetry(runtime, input);
+    },
+
+    failExecution(runtime, input) {
+      return client.failAgentRuntimeExecution(runtime, input);
+    },
+
+    interrupt(context, input) {
+      return client.interruptAgentRuntime(context, input, clock());
+    },
+
+    manualRetry(context, executionId, maxQueuedPerRoom) {
+      return client.manualRetryAgentRuntime(context, executionId, clock(), maxQueuedPerRoom);
+    },
+
+    compensate(context, executionId, dispatchId, maxQueuedPerRoom) {
+      return client.compensateAgentRuntime(context, executionId, dispatchId, clock(), maxQueuedPerRoom);
+    },
+    resumeCompensation(runtime, input) {
+      return client.resumeAgentRuntimeCompensation(runtime, input);
+    },
+
+    recoverPage(runtime, input) {
+      return client.recoverAgentRuntimePage(runtime, input);
+    },
+
+    prepareTool(runtime, input) {
+      return client.prepareAgentRuntimeTool(runtime, input);
+    },
+
+    confirmTool(context, input) {
+      return client.confirmAgentRuntimeTool(context, input, clock());
+    },
+
+    resumeConfirmedTool(runtime, input) {
+      return client.resumeConfirmedAgentRuntimeTool(runtime, input);
+    },
+
+    dispatchTool(runtime, input) {
+      return client.dispatchAgentRuntimeTool(runtime, input);
+    },
+
+    settleTool(runtime, input) {
+      return client.settleAgentRuntimeTool(runtime, input);
+    },
+
+    readExecution(context, executionId) {
+      return client.readAgentRuntimeExecution(context, executionId, clock());
+    },
+
+    loadProviderContext(runtime, executionId) {
+      return client.loadAgentRuntimeProviderContext(runtime, executionId);
+    },
+
+    cancelForHumanFence(runtime, input) {
+      return client.cancelAgentRuntimeForHumanFence(runtime, input);
     },
 
     readHistory(

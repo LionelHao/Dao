@@ -180,6 +180,71 @@ describe("client protocol resource bounds", () => {
   });
 });
 
+describe("closed Agent runtime protocol", () => {
+  const invocation = {
+    type: "agent.invoke",
+    requestId: "invoke-1",
+    roomId: "room-1",
+    sourceMessageId: "message-1",
+    targetAgentId: "agent-1",
+    intentKind: "direct_mention",
+  } as const;
+  const confirmation = {
+    type: "agent.tool.confirm",
+    requestId: "confirm-1",
+    executionId: "execution-1",
+    attemptSeq: 1,
+    toolId: "sandbox-file.write",
+    parameterHash: "a".repeat(64),
+    target: "note.txt",
+    impact: "replace one bounded sandbox file",
+    reversibility: "compensatable",
+    expiresAt: 1_786_000_000_000,
+  } as const;
+
+  it.each([
+    invocation,
+    {
+      type: "agent.interrupt", requestId: "interrupt-1", executionId: "execution-1",
+      reason: "requested_by_requester",
+    },
+    { type: "agent.retry", requestId: "retry-1", executionId: "execution-1" },
+    confirmation,
+    {
+      type: "agent.compensate", requestId: "compensate-1",
+      executionId: "execution-1", dispatchId: "dispatch-1",
+    },
+  ])("accepts $type as an exact client frame", (frame) => {
+    expect(parse(frame)).toEqual({ ok: true, frame });
+  });
+
+  it.each([
+    { ...invocation, requesterActorId: "forged-human" },
+    { ...invocation, agentCapability: "forged-runtime" },
+    { ...invocation, providerId: "client-selected-provider" },
+    { ...invocation, modelId: "client-selected-model" },
+    { ...invocation, intentKind: "unknown" },
+    { ...confirmation, attemptSeq: 0 },
+    { ...confirmation, parameterHash: "A".repeat(64) },
+    { ...confirmation, reversibility: "reversible" },
+    { ...confirmation, expiresAt: Number.MAX_SAFE_INTEGER + 1 },
+    {
+      type: "agent.interrupt", requestId: "interrupt-1", executionId: "execution-1",
+      reason: "provider_cancelled",
+    },
+    { type: "agent.retry", requestId: "retry-1", executionId: "" },
+    {
+      type: "agent.compensate", requestId: "compensate-1",
+      executionId: "execution-1", dispatchId: "",
+    },
+  ])("rejects malformed or identity-bearing Agent runtime frames", (frame) => {
+    expect(parse(frame)).toMatchObject({
+      ok: false,
+      error: { type: "error", status: 400, code: "invalid_request" },
+    });
+  });
+});
+
 describe("closed v2 recovery protocol", () => {
   const cursor = { version: 1, roomId: "room-1", afterSeq: 7 } as const;
 

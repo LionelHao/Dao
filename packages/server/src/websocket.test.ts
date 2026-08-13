@@ -39,6 +39,7 @@ import {
   type RoomLifecycleService,
   type SyncService,
   createSubscriptionRegistry,
+  type StartMessageWebSocketServerOptions,
 } from "./index.js";
 
 const humans = [
@@ -551,6 +552,7 @@ async function populateRoom(rooms: RoomLifecycleService): Promise<void> {
 
 async function createFixture(options: {
   readonly maxBufferedAmountBytes?: number;
+  readonly agentRuntime?: StartMessageWebSocketServerOptions["agentRuntime"];
 } = {}): Promise<{
   readonly connect: () => Promise<LoopbackClient>;
   readonly clients: readonly LoopbackClient[];
@@ -562,6 +564,10 @@ async function createFixture(options: {
   readonly messages: () => Promise<readonly Message[]>;
   readonly rooms: () => RoomLifecycleService;
   readonly service: () => MessageService;
+  readonly publishPreview: (
+    roomId: string,
+    preview: { readonly executionId: string; readonly attemptSeq: number; readonly streamSeq: number; readonly text: string },
+  ) => Promise<boolean>;
 }> {
   const directory = await mkdtemp(join(tmpdir(), "native-im-websocket-"));
   const sessionsPath = join(directory, "sessions.json");
@@ -602,6 +608,7 @@ async function createFixture(options: {
       auth,
       service,
       maxBufferedAmountBytes: options.maxBufferedAmountBytes,
+      agentRuntime: options.agentRuntime,
       afterSubscribeRegistered: async () => {
         const hook = afterSubscribeRegistered;
         afterSubscribeRegistered = undefined;
@@ -656,6 +663,10 @@ async function createFixture(options: {
       }
       return activeService;
     },
+    publishPreview: (targetRoomId, preview) => {
+      if (activeServer === undefined) throw new Error("server is not running");
+      return activeServer.publishAgentExecutionPreview(targetRoomId, preview);
+    },
   };
 }
 
@@ -666,6 +677,93 @@ afterEach(async () => {
 });
 
 describe("authenticated message WebSocket service", () => {
+  it("derives the human session for closed Agent runtime commands and correlates results", async () => {
+    const calls: Array<{ readonly method: string; readonly context: unknown; readonly input: unknown }> = [];
+    const execution = {
+      id: "execution-1", roomId, sourceMessageId: "message-1", requesterId: humans[0].id,
+      agentId: agents[0]!.id, status: "queued", actionCategory: "model_generation",
+      providerId: "openai.responses", modelId: "gpt-5", currentAttemptSeq: 1,
+      retryCycle: 1, retryOrdinal: 1,
+      queuedAt: "2026-08-09T08:00:00.000Z", recoveryCursor: 0,
+      updatedAt: "2026-08-09T08:00:00.000Z",
+    } as const;
+    const runtime = {
+      invoke: async (context: unknown, input: unknown) => { calls.push({ method: "invoke", context, input }); return execution; },
+      interrupt: async (context: unknown, id: string, reason: unknown) => { calls.push({ method: "interrupt", context, input: { id, reason } }); return execution; },
+      retry: async (context: unknown, id: string) => { calls.push({ method: "retry", context, input: id }); return execution; },
+      confirmTool: async (context: unknown, input: unknown) => { calls.push({ method: "confirm", context, input }); return execution; },
+      compensate: async (context: unknown, id: string, dispatchId: string) => { calls.push({ method: "compensate", context, input: { id, dispatchId } }); return execution; },
+    };
+    const runtimeFixture = await createFixture({ agentRuntime: runtime });
+    fixtures.push(runtimeFixture);
+    const client = await runtimeFixture.connect();
+    try {
+      await client.login(humans[0]);
+      for (const frame of [
+        {
+          type: "agent.invoke", requestId: "invoke", roomId, sourceMessageId: "message-1",
+          targetAgentId: agents[0]!.id, intentKind: "direct_mention",
+        },
+        { type: "agent.interrupt", requestId: "interrupt", executionId: execution.id, reason: "requested_by_requester" },
+        { type: "agent.retry", requestId: "retry", executionId: execution.id },
+        {
+          type: "agent.tool.confirm", requestId: "confirm", executionId: execution.id,
+          attemptSeq: 1, toolId: "sandbox-file.write", parameterHash: "a".repeat(64),
+          target: "note.txt", impact: "replace", reversibility: "compensatable", expiresAt: 1_786_000_000_000,
+        },
+        { type: "agent.compensate", requestId: "compensate", executionId: execution.id, dispatchId: "dispatch-1" },
+      ] as const) {
+        client.send(frame);
+        await expect(client.waitForFrame(
+          (candidate) => hasType(candidate, "agent.execution") && candidate.requestId === frame.requestId,
+          `agent result ${frame.requestId}`,
+        )).resolves.toMatchObject({ frame: { execution } });
+      }
+      expect(calls).toHaveLength(5);
+      expect(calls.every(({ context }) =>
+        typeof context === "object" && context !== null &&
+        (context as { kind?: unknown }).kind === "human" &&
+        !Object.hasOwn(context, "agentCapability"))).toBe(true);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("delivers bounded execution previews only to live room subscribers", async () => {
+    const fixture = await createFixture();
+    fixtures.push(fixture);
+    const member = await fixture.connect();
+    const outsiderClient = await fixture.connect();
+    await Promise.all([member.login(humans[0]), outsiderClient.login(outsider)]);
+    await member.subscribe(roomId);
+    const preview = {
+      executionId: "execution-preview", attemptSeq: 1, streamSeq: 1, text: "partial",
+    } as const;
+
+    await expect(fixture.publishPreview(roomId, preview)).resolves.toBe(true);
+    await expect(member.waitForFrame(
+      (frame) => hasType(frame, "agent.execution.preview") &&
+        frame.executionId === preview.executionId,
+      "execution preview",
+    )).resolves.toMatchObject({ frame: { type: "agent.execution.preview", ...preview } });
+    expect(outsiderClient.frameCount((frame) => hasType(frame, "agent.execution.preview"))).toBe(0);
+    await expect(fixture.publishPreview(roomId, {
+      ...preview, streamSeq: 2, text: "x".repeat(64 * 1_024 + 1),
+    })).resolves.toBe(false);
+    expect(member.frameCount((frame) =>
+      hasType(frame, "agent.execution.preview") && frame.streamSeq === 2)).toBe(0);
+
+    const bounded = await createFixture({ maxBufferedAmountBytes: 512 });
+    fixtures.push(bounded);
+    const boundedMember = await bounded.connect();
+    await boundedMember.login(humans[0], "preview-bounded-login");
+    await boundedMember.subscribe(roomId, "preview-bounded-subscribe");
+    await expect(bounded.publishPreview(roomId, {
+      ...preview, executionId: "preview-backpressure", text: "x".repeat(500),
+    })).resolves.toBe(false);
+    await expect(boundedMember.history(roomId, "preview-after-backpressure"))
+      .resolves.toMatchObject({ frame: { type: "room.history" } });
+  });
   it("bounds stalled loopback connect, close, and close-wait listeners", async () => {
     const stalledConnect = await createStalledWebSocketPeer(false);
     try {

@@ -9,8 +9,9 @@
 - 身份：`auth.login`、`auth.resume`、`auth.refresh`、`auth.revoke`；
 - 写入与旧兼容读：`message.send`、`room.history`、`room.subscribe`；
 - v2 恢复：`workspace.bootstrap.begin`、`workspace.bootstrap.page`、`room.sync`、`room.repair.begin`、`room.repair.page`、`snapshot.complete`、`room.subscribe.v2`。
+- Agent runtime：`agent.invoke`、`agent.interrupt`、`agent.retry`、`agent.tool.confirm`、`agent.compensate`。客户端只传业务 ID 与 closed confirmation 字段；provider/model、secret、Agent capability、grant 和任意 command 均不得来自 JSON。
 
-成功帧同样以 closed `type` 区分：`auth.authenticated`、`auth.revoked`、`message.accepted`、`message.created`、`room.event`、`identity.room-access.changed`、`auth.session-revoked`、`room.history`、`room.subscribed`、`workspace.bootstrap.page`、`room.sync.result`、`room.repair.page`、`snapshot.completed`、`room.subscribed.v2`、`room.subscribe.v2.retry`。请求/响应帧回显当前 `requestId`；异步 `room.event` 使用持久 `eventId` 与 `streamSeq`。
+成功帧同样以 closed `type` 区分：`auth.authenticated`、`auth.revoked`、`message.accepted`、`message.created`、`room.event`、`identity.room-access.changed`、`auth.session-revoked`、`room.history`、`room.subscribed`、`workspace.bootstrap.page`、`room.sync.result`、`room.repair.page`、`snapshot.completed`、`room.subscribed.v2`、`room.subscribe.v2.retry`、`agent.execution`。请求/响应帧回显当前 `requestId`；异步 `room.event` 使用持久 `eventId` 与 `streamSeq`。`agent.execution.preview` 是 64 KiB 内的临时帧，只含 executionId/attemptSeq/streamSeq/text；它不是 message/event，不能进入 history 或恢复。
 
 错误统一为：
 
@@ -24,7 +25,7 @@
 }
 ```
 
-同步相关稳定 code 为 `invalid_request`、`unauthenticated`、`room_forbidden`、`room_not_found`、`room_archived`、`snapshot_forbidden`、`snapshot_family_revoked`、`snapshot_stale`、`snapshot_not_found`、`snapshot_expired`、`snapshot_busy`、`repair_barrier_active`、`storage_unavailable`。认证另有 `invalid_token`、`token_expired`、`session_revoked`。客户端必须按 code 决策，不能解析错误文案，也不能把内部 worker code、数据库路径或堆栈当作 wire 合同。
+同步相关稳定 code 为 `invalid_request`、`unauthenticated`、`room_forbidden`、`room_not_found`、`room_archived`、`snapshot_forbidden`、`snapshot_family_revoked`、`snapshot_stale`、`snapshot_not_found`、`snapshot_expired`、`snapshot_busy`、`repair_barrier_active`、`storage_unavailable`。认证另有 `invalid_token`、`token_expired`、`session_revoked`。Agent runtime 另有 `agent_missing_permission`、`execution_conflict`、`execution_not_running`、`idempotency_conflict`、`confirmation_expired`、`target_busy`、`runtime_closed`、`provider_not_configured`。客户端必须按 code 决策，不能解析错误文案，也不能把内部 worker code、数据库路径或堆栈当作 wire 合同。
 
 权威定义见 [`protocol.ts`](../../packages/server/src/protocol.ts) 与 [`sync.ts`](../../packages/core/src/sync.ts)。
 
@@ -75,7 +76,17 @@ Authority schema 和可丢弃的 snapshot-cache schema 分别版本化。fresh�
 
 Legacy import 在正式激活新 authority 前解析并验证 closed 数据，使用 migration/事务写入临时目标；损坏输入、重复启动、启用前终止都不得留下半激活 authority。证据见 [`schema.test.ts`](../../packages/server/src/persistence/schema.test.ts) 和 [`legacy-importer.test.ts`](../../packages/server/src/persistence/legacy-importer.test.ts)。Snapshot cache 可随时删除重建，不能反向覆盖 authority。
 
-## 7. Buzz reference / translation / deviation
+## 7. Agent runtime authority、预览与恢复
+
+`startAuthoritativeServer` 只接收 closed production config，并在 composition root 构造 OpenAI Responses Provider、HTTP JSON/Git status/sandbox-file 三个真实工具以及 environment SecretProvider。WebSocket `agent.invoke` 不含 provider/model；composition 根据目标 Agent 注入固定配置，mint 的 runtime capability 只在进程内 WeakSet 与 worker closed projection 中存在。缺失 secret 时 fresh authority 将配置目标 Agent 投影为 `noauth`，invoke 在持久化前返回 `409 provider_not_configured`。
+
+Provider 输入从 AuthorityWorker 私有查询重建：invocation intent、已授权源消息与当前 attempt 的 committed checkpoints 都由 SQLite 读取并绑定 runtime Agent；客户端或错误 Agent 不能提供或读取这些字段。运行状态、attempt、工具阶段、confirmation-required 与 settlement 都先作为 durable event/outbox 提交；renderer 只按权威 execution 渲染 `排队中 / 正在生成 / 正在调用 <tool> / 等待上游 / 已完成 / 已失败 / 已取消`，不使用 `.typing`、typing dots 或 human read/request 语义。
+
+Preview 是独立的临时背压通道。每次 production 投递前重验当前 session/room 权限；超过 byte/buffer 上限或 send 失败只撤销该连接对应 room 的 preview subscription，不写 execution、不终止 Provider，也不把 partial text 转成 Message。durable completion 仍由 Agent message + execution event/outbox 事务决定。
+
+Runtime shutdown 固定为 transport 停止新请求 → 所有 Agent runtime bounded close → snapshot client → AuthorityWorker；每阶段 all-settled，前一阶段失败不能跳过后续关闭。真实 restart 的 provider context、tool dispatch/settlement、retry/dead-letter、compensation 与 journal 崩溃边界由 Agent runtime、SQLite store、compiled composition E2E 测试共同覆盖。OpenAI live smoke 只有在显式 `NATIVE_IM_OPENAI_LIVE_SMOKE=1` 且存在 `OPENAI_API_KEY` 时才算真实模型证据；skip 不能写成通过。
+
+## 8. Buzz reference / translation / deviation
 
 | Buzz 参照 | 本项目 TypeScript 翻译 | 明确偏离及原因 |
 | --- | --- | --- |

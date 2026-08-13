@@ -114,6 +114,52 @@ function seedRoom(
   }
 }
 
+function insertV6ToolExecution(
+  database: DatabaseSync,
+  input: {
+    readonly id: string;
+    readonly roomId: string;
+    readonly agentId: string;
+    readonly sourceMessageId: string;
+    readonly requesterId: string;
+    readonly status: "running" | "completed" | "failed" | "cancelled";
+    readonly startedAt: string;
+    readonly finishedAt?: string;
+    readonly toolId: string;
+    readonly legacyResultJson?: string;
+  },
+): void {
+  const terminal = input.status !== "running";
+  const phase = input.status === "running" ? "dispatched" : "finished";
+  const finishedAt = terminal ? input.finishedAt : undefined;
+  const cancellationReason = input.status === "cancelled" ? "legacy_interrupted" : undefined;
+  const errorCode = input.status === "failed" ? "legacy_closed" : undefined;
+  database.prepare(
+    `INSERT INTO agent_executions (
+       id, room_id, agent_id, source_message_id, requester_actor_id, state,
+       action_category, tool_dispatch_phase, current_tool_id,
+       current_attempt_seq, retry_cycle, retry_ordinal, provider_id, model_id,
+       recovery_cursor, queued_at, started_at, updated_at, completed_at,
+       cancellation_reason, terminal_error_code, legacy_result_json
+     ) VALUES (?, ?, ?, ?, ?, ?, 'tool_call', ?, ?, 1, 1, 1,
+       'legacy-v5', 'no-model', 0, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    input.id, input.roomId, input.agentId, input.sourceMessageId, input.requesterId,
+    input.status, phase, input.toolId, input.startedAt, input.startedAt,
+    finishedAt ?? input.startedAt, finishedAt ?? null, cancellationReason ?? null,
+    errorCode ?? null, input.legacyResultJson ?? null,
+  );
+  database.prepare(
+    `INSERT INTO agent_execution_attempts (
+       execution_id, room_id, attempt_seq, retry_cycle, retry_ordinal, state,
+       action_category, tool_dispatch_phase, started_at, finished_at,
+       error_code, next_retry_at, recovery_cursor
+     ) VALUES (?, ?, 1, 1, 1, ?, 'tool_call', ?, ?, ?, ?, NULL, 0)`,
+  ).run(
+    input.id, input.roomId, input.status, phase, input.startedAt, finishedAt ?? null, errorCode ?? null,
+  );
+}
+
 function seedClosedMixedStressRecords(
   database: DatabaseSync,
   context: AuthenticatedSessionContext,
@@ -159,13 +205,12 @@ function seedClosedMixedStressRecords(
      ) VALUES ('stress-open', ?, 'message-0000', 'stress-agent', 'pending_response',
        'stress item', '2026-08-11T01:00:02.000Z', NULL, ?, '[]', NULL)`,
   ).run(roomId, context.principal.actorId);
-  database.prepare(
-    `INSERT INTO agent_executions (
-       id, room_id, agent_id, trigger_message_id, status, started_at,
-       completed_at, result_json, requester_actor_id, tool_name
-     ) VALUES ('stress-execution', ?, 'stress-agent', 'message-0000', 'completed',
-       '2026-08-11T01:00:03.000Z', '2026-08-11T01:00:04.000Z', '"ok"', ?, 'review')`,
-  ).run(roomId, context.principal.actorId);
+  insertV6ToolExecution(database, {
+    id: "stress-execution", roomId, agentId: "stress-agent", sourceMessageId: "message-0000",
+    requesterId: context.principal.actorId, status: "completed",
+    startedAt: "2026-08-11T01:00:03.000Z", finishedAt: "2026-08-11T01:00:04.000Z",
+    toolId: "review", legacyResultJson: '"ok"',
+  });
   database.prepare(
     `INSERT INTO calibration_signals (
        id, room_id, agent_id, judgment_id, signal, created_at, source_message_id, actor_id
@@ -434,13 +479,23 @@ describe("durable materialized snapshot worker", () => {
        ) VALUES ('open-a', 'room-mixed', 'message-human', 'agent-a',
          'pending_response', 'respond', '2026-08-11T00:00:06.000Z', NULL, ?, '[]', NULL)`,
     ).run(context.principal.actorId);
+    for (const execution of [
+      { id: "execution-a", status: "completed" as const,
+        legacyResultJson: '"legacy-result-private-sentinel"' },
+      { id: "execution-running", status: "running" as const },
+      { id: "execution-interrupted", status: "cancelled" as const },
+      { id: "execution-failed", status: "failed" as const },
+    ]) {
+      insertV6ToolExecution(database, {
+        ...execution, roomId: "room-mixed", agentId: "agent-a", sourceMessageId: "message-human",
+        requesterId: context.principal.actorId, startedAt: "2026-08-11T00:00:07.000Z",
+        ...(execution.status === "running" ? {} : { finishedAt: "2026-08-11T00:00:08.000Z" }),
+        toolId: "tool",
+      });
+    }
     database.prepare(
-      `INSERT INTO agent_executions (
-         id, room_id, agent_id, trigger_message_id, status, started_at,
-         completed_at, result_json, requester_actor_id, tool_name
-       ) VALUES ('execution-a', 'room-mixed', 'agent-a', 'message-human', 'completed',
-         '2026-08-11T00:00:07.000Z', '2026-08-11T00:00:08.000Z', '"ok"', ?, 'tool')`,
-    ).run(context.principal.actorId);
+      "UPDATE agent_executions SET supersedes_execution_ids_json = '[\"execution-interrupted\"]' WHERE id = 'execution-a'",
+    ).run();
     database.prepare(
       `INSERT INTO calibration_signals (
          id, room_id, agent_id, judgment_id, signal, created_at, source_message_id, actor_id
@@ -457,8 +512,22 @@ describe("durable materialized snapshot worker", () => {
     expect(page.hasMore).toBe(false);
     expect(page.records.map((record) => record.kind)).toEqual([
       "room", "membership", "membership", "message", "message", "human-read",
-      "agent-judgement", "open-item", "agent-execution", "calibration",
+      "agent-judgement", "open-item", "agent-execution", "agent-execution", "agent-execution",
+      "agent-execution", "calibration",
     ]);
+    const executions = page.records.filter((record) => record.kind === "agent-execution");
+    expect(executions.map((record) => record.value)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "execution-a", status: "completed", currentToolId: "tool", toolDispatchPhase: "finished",
+        providerId: "legacy-v5", modelId: "no-model", finishedAt: "2026-08-11T00:00:08.000Z",
+        supersedesExecutionIds: ["execution-interrupted"],
+      }),
+      expect.objectContaining({ id: "execution-running", status: "running", toolDispatchPhase: "dispatched" }),
+      expect.objectContaining({ id: "execution-interrupted", status: "cancelled", cancellationReason: "legacy_interrupted" }),
+      expect.objectContaining({ id: "execution-failed", status: "failed", terminalErrorCode: "legacy_closed" }),
+    ]));
+    expect(executions.every((record) => !Object.hasOwn(record.value, "resultMessageId"))).toBe(true);
+    expect(JSON.stringify(page.records)).not.toContain("legacy-result-private-sentinel");
     await client.close();
   });
 
@@ -1383,6 +1452,102 @@ describe("durable materialized snapshot worker", () => {
     );
     expect(paused.hooks.streamingPageScanCount()).toBe(200);
     await paused.client.close();
+    await authority.close();
+  });
+
+  it("keyset-streams a v6 execution lineage without projecting legacy result bytes", async () => {
+    const fixture = await createDatabaseFixture({ rooms: [{ roomId: "stream-lineage-room" }] });
+    const context = fixture.contexts[0]!;
+    const database = new DatabaseSync(fixture.authorityPath);
+    database.exec(`
+      INSERT INTO actors (id, kind, display_name, readiness, tool_permissions_json)
+      VALUES ('stream-lineage-agent', 'agent', 'Lineage', 'ready', '["tool"]');
+      INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+      VALUES ('identity', 'stream-lineage-agent', 0, 1);
+      INSERT INTO room_memberships (
+        room_id, actor_id, kind, role, participation, tool_permissions_json,
+        joined_at, configured_at, access_revision
+      ) VALUES ('stream-lineage-room', 'stream-lineage-agent', 'agent', NULL, 'active', '["tool"]',
+                NULL, '2026-08-13T00:00:00.000Z', 0);
+      INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+      VALUES ('stream-lineage-message', 'stream-lineage-room', 'human-a', 'human', 'lineage',
+              '2026-08-13T00:00:00.000Z');
+    `);
+    insertV6ToolExecution(database, {
+      id: "stream-lineage-old", roomId: "stream-lineage-room", agentId: "stream-lineage-agent",
+      sourceMessageId: "stream-lineage-message", requesterId: context.principal.actorId,
+      status: "cancelled", startedAt: "2026-08-13T00:00:01.000Z",
+      finishedAt: "2026-08-13T00:00:02.000Z", toolId: "tool-old",
+      legacyResultJson: '"legacy-result-private-sentinel"',
+    });
+    database.exec(`
+      UPDATE agent_execution_attempts
+      SET tool_dispatch_phase = 'not_started'
+      WHERE execution_id = 'stream-lineage-old' AND attempt_seq = 1;
+      UPDATE agent_executions
+      SET tool_dispatch_phase = 'not_started'
+      WHERE id = 'stream-lineage-old';
+      INSERT INTO agent_judgments (
+        id, room_id, agent_id, message_id, judgment_json, created_at
+      ) VALUES (
+        'stream-lineage-judgment', 'stream-lineage-room', 'stream-lineage-agent',
+        'stream-lineage-message',
+        '{"id":"stream-lineage-judgment","messageId":"stream-lineage-message","agentId":"stream-lineage-agent","outcome":"will_respond","reason":"routed","decidedAt":"2026-08-13T00:00:03.000Z"}',
+        '2026-08-13T00:00:03.000Z'
+      );
+      INSERT INTO agent_executions (
+        id, room_id, agent_id, source_message_id, requester_actor_id, state,
+        action_category, tool_dispatch_phase, current_tool_id,
+        current_attempt_seq, retry_cycle, retry_ordinal, provider_id, model_id,
+        recovery_cursor, queued_at, started_at, updated_at, supersedes_execution_ids_json
+      ) VALUES (
+        'stream-lineage-new', 'stream-lineage-room', 'stream-lineage-agent',
+        'stream-lineage-message', '${context.principal.actorId}', 'queued',
+        'model_generation', NULL, NULL, 1, 1, 1, 'provider', 'model', 0,
+        '2026-08-13T00:00:03.000Z', NULL, '2026-08-13T00:00:03.000Z',
+        '["stream-lineage-old"]'
+      );
+      INSERT INTO agent_execution_attempts (
+        execution_id, room_id, attempt_seq, retry_cycle, retry_ordinal, state,
+        action_category, tool_dispatch_phase, started_at, finished_at,
+        error_code, next_retry_at, recovery_cursor, enqueue_stream_seq
+      ) VALUES ('stream-lineage-new', 'stream-lineage-room', 1, 1, 1, 'queued', 'model_generation', NULL,
+                NULL, NULL, NULL, NULL, 0, 1);
+      INSERT INTO agent_fence_replacements (
+        id, fence_message_id, old_execution_id, old_attempt_seq,
+        route_job_id, selected_agent_id, expected_judgment_id,
+        replacement_execution_id, created_at
+      ) VALUES (
+        'stream-lineage-fence', 'stream-lineage-message', 'stream-lineage-old', 1,
+        'stream-lineage-route', 'stream-lineage-agent', 'stream-lineage-judgment',
+        'stream-lineage-new', '2026-08-13T00:00:03.000Z'
+      );
+    `);
+    migrateAuthorityDatabase(database);
+    database.close();
+    const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
+    const client = await createSnapshotWorkerClient({
+      authorityPath: fixture.authorityPath, cachePath: fixture.cachePath,
+      revalidate: (validation) => authority.revalidateSnapshot(validation, 2_000),
+      streamingAuthority: authority, clock: () => 2_000,
+      limits: { cacheQuotaBytes: 1, maxRecordsPerPage: 2 },
+    });
+    let page = await client.beginRoomRepair(context, "stream-lineage-begin", "stream-lineage-room");
+    if ("kind" in page || page.mode !== "streaming") throw new Error("expected streaming lineage page");
+    const records = [...page.records];
+    while (page.hasMore) {
+      page = await client.readRoomRepairPage(context, `stream-lineage-${page.page + 1}`,
+        page.snapshotId, page.page);
+      expect(page.mode).toBe("streaming");
+      records.push(...page.records);
+    }
+    const lineage = records.find((record) => record.kind === "agent-execution" &&
+      record.value.id === "stream-lineage-new");
+    expect(lineage).toEqual({ kind: "agent-execution", value: expect.objectContaining({
+      id: "stream-lineage-new", supersedesExecutionIds: ["stream-lineage-old"],
+    }) });
+    expect(JSON.stringify(records)).not.toContain("legacy-result-private-sentinel");
+    await client.close();
     await authority.close();
   });
 

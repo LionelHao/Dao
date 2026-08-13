@@ -5,12 +5,35 @@ import type {
   InternalAgentCommandContext,
   OutboxDelivery,
 } from "./contracts.js";
+
+const legacyInterruptedTransition: AgentCollaborationCommand = {
+  type: "agent.execution.transition", roomId: "room-1",
+  payload: { executionId: "execution-1", sourceMessageId: "message-1", toolName: "search.web", status: "interrupted" },
+};
+const invalidLegacyQueuedTransition = {
+  type: "agent.execution.transition" as const, roomId: "room-1",
+  payload: { executionId: "execution-1", sourceMessageId: "message-1", toolName: "search.web", status: "queued" as const },
+};
+// @ts-expect-error Legacy transition commands cannot use canonical queued status.
+const invalidLegacyQueuedCommand: AgentCollaborationCommand = invalidLegacyQueuedTransition;
+const invalidLegacyCancelledTransition = {
+  type: "agent.execution.transition" as const, roomId: "room-1",
+  payload: { executionId: "execution-1", sourceMessageId: "message-1", toolName: "search.web", status: "cancelled" as const },
+};
+// @ts-expect-error Legacy transition commands cannot use canonical cancelled status.
+const invalidLegacyCancelledCommand: AgentCollaborationCommand = invalidLegacyCancelledTransition;
+
+void legacyInterruptedTransition;
+void invalidLegacyQueuedCommand;
+void invalidLegacyCancelledCommand;
 import { mintInternalAgentCommandContext } from "./contracts.js";
 import type { CanonicalIdentityEventInput } from "./authority-database-handler.js";
 import type { StartAuthoritativeServerOptions } from "../index.js";
 
 // @ts-expect-error Internal Agent capabilities must not be exported from the package root.
 import type { InternalAgentCommandContext as PublicInternalAgentCommandContext } from "../index.js";
+// @ts-expect-error Internal Agent runtime capabilities must not be exported from the package root.
+import type { InternalAgentRuntimeContext as PublicInternalAgentRuntimeContext } from "../index.js";
 import type { WorkerDatabaseClient as PublicWorkerDatabaseClient } from "../index.js";
 // @ts-expect-error Raw point-query stores are server-internal and absent from the package root.
 import type { SyncQueryStore as PublicSyncQueryStore } from "../index.js";
@@ -21,6 +44,8 @@ import { createAuthoritativeRoomLifecycleService as publicCreateAuthoritativeRoo
 
 export type PackageRootInternalAgentContextMustStayUnavailable =
   PublicInternalAgentCommandContext;
+export type PackageRootInternalAgentRuntimeContextMustStayUnavailable =
+  PublicInternalAgentRuntimeContext;
 export type PackageRootSyncQueryStoreMustStayUnavailable = PublicSyncQueryStore;
 export type PackageRootSqliteFactoryMustStayUnavailable = typeof publicCreateSqliteAuthoritativeStore;
 export type PackageRootAuthoritativeLifecycleFactoryMustStayUnavailable =
@@ -104,6 +129,17 @@ export type PublicClientHasNoExecuteHuman = Assert<
 >;
 export type PublicClientHasNoExecuteAgent = Assert<
   "executeAgent" extends keyof PublicWorkerDatabaseClient ? false : true
+>;
+export type PublicClientHasNoRawAgentRuntimeAuthority = Assert<
+  Extract<keyof PublicWorkerDatabaseClient,
+    | "invokeAgentRuntime" | "claimNextAgentRuntime" | "commitAgentRuntimeStep"
+    | "completeAgentRuntimeExecution" | "completeAgentRuntimeCompensation"
+    | "scheduleAgentRuntimeRetry" | "failAgentRuntimeExecution" | "interruptAgentRuntime" | "manualRetryAgentRuntime"
+    | "compensateAgentRuntime" | "resumeAgentRuntimeCompensation"
+    | "recoverAgentRuntimePage"
+    | "prepareAgentRuntimeTool" | "confirmAgentRuntimeTool" | "resumeConfirmedAgentRuntimeTool"
+    | "dispatchAgentRuntimeTool" | "settleAgentRuntimeTool" | "readAgentRuntimeExecution"
+  > extends never ? true : false
 >;
 export type PublicClientCannotReadActor = Assert<
   "readActor" extends keyof PublicWorkerDatabaseClient ? false : true

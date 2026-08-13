@@ -5,13 +5,15 @@ import {
   isAgentRoomMembership,
   isCalibrationSignal,
   isHumanReadReceipt,
+  isPublicAgentToolDispatch,
+  isPublicToolConfirmationRequired,
   isRoomCursor,
   isHumanRoomMembership,
   isMessage,
   isOpenItem,
 } from "@native-im/core";
 import type {
-  AgentExecutionStatus,
+  AgentExecution,
   AgentJudgementOutcome,
   AgentParticipation,
   Actor,
@@ -26,6 +28,8 @@ import type {
   WorkspaceBootstrapPage,
   SnapshotVersion,
 } from "@native-im/core";
+
+type LegacyAgentExecutionTransitionStatus = "running" | "completed" | "interrupted" | "failed";
 
 export const SNAPSHOT_REQUEST_ID_MAX_BYTES = 128;
 import type { AuthenticatedPrincipal } from "../auth.js";
@@ -271,6 +275,8 @@ export interface AgentPrincipal {
 
 const internalCommandAuthority: unique symbol = Symbol("internal-agent-command-authority");
 const internalAgentCommandContexts = new WeakSet<object>();
+const internalRuntimeAuthority: unique symbol = Symbol("internal-agent-runtime-authority");
+const internalAgentRuntimeContexts = new WeakSet<object>();
 
 export interface InternalAgentCommandContext {
   readonly kind: "agent";
@@ -285,6 +291,344 @@ export interface AgentWorkerCommandContext {
   readonly agent: AgentPrincipal;
   readonly requestId: string;
   readonly idempotencyKey: string;
+}
+
+export interface InternalAgentRuntimeContext {
+  readonly kind: "runtime";
+  readonly [internalRuntimeAuthority]: true;
+  readonly runtimeId: string;
+  readonly agentId: string;
+}
+
+export interface AgentRuntimeWorkerContext {
+  readonly kind: "runtime";
+  readonly runtimeId: string;
+  readonly agentId: string;
+}
+
+export interface InternalAgentRuntimeContextInput {
+  readonly runtimeId: string;
+  readonly agentId: string;
+}
+
+export type AgentInvocationIntentKind =
+  | "direct_mention"
+  | "structured_help"
+  | "routed_candidate";
+
+export interface AgentInvocationInput {
+  readonly roomId: string;
+  readonly sourceMessageId: string;
+  readonly targetAgentId: string;
+  readonly intentKind: AgentInvocationIntentKind;
+  readonly providerId: string;
+  readonly modelId: string;
+}
+
+interface CommitExecutionStepInputBase {
+  readonly executionId: string;
+  readonly attemptSeq: number;
+  readonly stepSeq: number;
+  readonly inputSha256: string;
+  readonly outputSha256: string;
+  readonly now: number;
+}
+
+export interface AgentRuntimeToolPlanEntry {
+  readonly callId: string;
+  readonly toolId: string;
+  readonly parameters: JsonValue;
+}
+
+export type CommitExecutionStepInput = CommitExecutionStepInputBase & (
+  | {
+      readonly stepKind: "model_generation";
+      readonly canonicalToolCall?: never;
+      readonly boundedToolResult?: never;
+    }
+  | {
+      readonly stepKind: "tool_call";
+      readonly canonicalToolCall: {
+        readonly toolId: string;
+        readonly parameters?: JsonValue;
+        readonly remainingCalls?: readonly AgentRuntimeToolPlanEntry[];
+      };
+      readonly boundedToolResult?: never;
+    }
+  | {
+      readonly stepKind: "tool_result";
+      readonly canonicalToolCall?: never;
+      readonly dispatchId: string;
+      readonly boundedToolResult: Exclude<JsonValue, null>;
+    }
+);
+
+export interface ScheduleRetryInput {
+  readonly executionId: string;
+  readonly attemptSeq: number;
+  readonly errorCode: "rate_limited" | "upstream_timeout" | "upstream_unavailable" | "target_busy" | "runtime_restarted";
+  readonly now: number;
+}
+
+export type AgentRuntimeTerminalErrorCode =
+  | "provider_cancelled"
+  | "provider_input_too_large"
+  | "provider_invalid_request"
+  | "provider_invalid_response"
+  | "provider_not_configured"
+  | "provider_failure"
+  | "provider_response_too_large"
+  | "provider_unauthorized"
+  | "tool_failure";
+
+export interface FailExecutionInput {
+  readonly executionId: string;
+  readonly attemptSeq: number;
+  readonly errorCode: AgentRuntimeTerminalErrorCode;
+  readonly now: number;
+}
+
+export interface CompleteExecutionInput {
+  readonly executionId: string;
+  readonly attemptSeq: number;
+  readonly messageId: string;
+  readonly body: string;
+  readonly sentAt: string;
+  readonly now: number;
+}
+
+export interface CompleteCompensationInput extends CompleteExecutionInput {
+  readonly dispatchId: string;
+  readonly grantId: string;
+  readonly boundedToolResult: Exclude<JsonValue, null>;
+  readonly inputSha256: string;
+  readonly outputSha256: string;
+  readonly closedSummary: string;
+}
+
+export interface InterruptExecutionInput {
+  readonly executionId: string;
+  readonly reason: "requested_by_requester" | "requested_by_room_manager";
+}
+
+export type ToolConfirmationRequirement = "read_only" | "side_effect";
+
+export interface PrepareToolInput {
+  readonly executionId: string;
+  readonly attemptSeq: number;
+  readonly toolCallStepSeq: number;
+  readonly toolId: string;
+  readonly parameterHash: string;
+  readonly toolPlanHash: string;
+  readonly confirmationRequirement: ToolConfirmationRequirement;
+  readonly now: number;
+  readonly expiresAt: number;
+}
+
+export interface ToolGrant {
+  readonly id: string;
+  readonly executionId: string;
+  readonly attemptSeq: number;
+  readonly toolCallStepSeq: number;
+  readonly agentId: string;
+  readonly roomId: string;
+  readonly toolId: string;
+  readonly parameterHash: string;
+  readonly toolPlanHash: string;
+  readonly confirmationRequirement: ToolConfirmationRequirement;
+  readonly issuedAt: string;
+  readonly expiresAt: string;
+  readonly consumedAt?: string;
+}
+
+export interface ToolConfirmationInput {
+  readonly executionId: string;
+  readonly attemptSeq: number;
+  readonly toolId: string;
+  readonly parameterHash: string;
+  readonly target: string;
+  readonly impact: string;
+  readonly reversibility: "compensatable" | "irreversible";
+  readonly expiresAt: number;
+}
+
+export interface ToolConfirmation {
+  readonly id: string;
+  readonly executionId: string;
+  readonly attemptSeq: number;
+  readonly grantId: string;
+  readonly toolId: string;
+  readonly parameterHash: string;
+  readonly toolPlanHash: string;
+  readonly roomId: string;
+  readonly humanPrincipalId: string;
+  readonly sessionFamilyId: string;
+  readonly target: string;
+  readonly impact: string;
+  readonly reversibility: "compensatable" | "irreversible";
+  readonly expiresAt: string;
+  readonly consumedAt?: string;
+}
+
+export interface ResumeConfirmedToolInput {
+  readonly confirmationId: string;
+  readonly executionId: string;
+  readonly attemptSeq: number;
+  readonly roomId: string;
+  readonly toolId: string;
+  readonly parameterHash: string;
+  readonly toolPlanHash: string;
+  readonly now: number;
+}
+
+export interface ResumedToolDispatch {
+  readonly confirmationId: string;
+  readonly execution: AgentExecution;
+  readonly dispatch: ToolDispatch;
+  readonly parameters: JsonValue;
+  readonly remainingCalls: readonly AgentRuntimeToolPlanEntry[];
+  readonly toolPlanHash: string;
+}
+
+export interface AgentRuntimeRecovery {
+  readonly execution: AgentExecution;
+  readonly nextRetryAt?: number;
+}
+
+export interface AgentRuntimeRecoveryPageInput {
+  readonly now: number;
+  readonly limit: number;
+  readonly cursor?: string;
+}
+
+export interface AgentRuntimeRecoveryPage {
+  readonly recoveries: readonly AgentRuntimeRecovery[];
+  readonly nextCursor?: string;
+}
+
+export type DispatchToolInput = {
+  readonly executionId: string;
+  readonly attemptSeq: number;
+  readonly grantId: string;
+  readonly toolId: string;
+  readonly parameterHash: string;
+  readonly now: number;
+} & (
+  | { readonly confirmationRequirement: "read_only"; readonly confirmationId?: never }
+  | { readonly confirmationRequirement: "side_effect"; readonly confirmationId: string }
+);
+
+export interface SettleToolInput {
+  readonly dispatchId: string;
+  readonly executionId: string;
+  readonly attemptSeq: number;
+  readonly grantId: string;
+  readonly outcome: "succeeded" | "failed" | "outcome_unknown";
+  readonly closedSummary?: string;
+  readonly sealedCompensation?: string;
+  readonly now: number;
+}
+
+export interface CancelForHumanFenceInput {
+  readonly executionId: string;
+  readonly fenceMessageId: string;
+  readonly now: number;
+}
+
+export interface ToolDispatch {
+  readonly id: string;
+  readonly executionId: string;
+  readonly attemptSeq: number;
+  readonly grantId: string;
+  readonly toolId: string;
+  readonly parameterHash: string;
+  readonly state: "dispatched" | "succeeded" | "failed" | "outcome_unknown";
+  readonly dispatchedAt: string;
+  readonly settledAt?: string;
+  readonly closedSummary?: string;
+  readonly sealedCompensation?: string;
+}
+
+export interface ResumeAgentRuntimeCompensationInput {
+  readonly executionId: string;
+  readonly attemptSeq: number;
+  readonly now: number;
+}
+
+export interface AgentRuntimeCompensationWork {
+  readonly execution: AgentExecution;
+  readonly dispatch: ToolDispatch;
+  readonly sealedCompensation: string;
+}
+
+export interface AgentRuntimeAuthorityStore {
+  invoke(
+    context: AuthenticatedCommandContext | InternalAgentCommandContext,
+    input: AgentInvocationInput,
+    maxQueuedPerRoom?: number,
+  ): Promise<AgentExecution>;
+  claimNext(runtime: InternalAgentRuntimeContext, roomId: string, now: number): Promise<AgentExecution | undefined>;
+  commitStep(runtime: InternalAgentRuntimeContext, input: CommitExecutionStepInput): Promise<AgentExecution>;
+  completeExecution(runtime: InternalAgentRuntimeContext, input: CompleteExecutionInput): Promise<AgentExecution>;
+  completeCompensation(
+    runtime: InternalAgentRuntimeContext,
+    input: CompleteCompensationInput,
+  ): Promise<AgentExecution>;
+  scheduleRetry(runtime: InternalAgentRuntimeContext, input: ScheduleRetryInput): Promise<AgentExecution>;
+  failExecution(runtime: InternalAgentRuntimeContext, input: FailExecutionInput): Promise<AgentExecution>;
+  interrupt(context: AuthenticatedCommandContext, input: InterruptExecutionInput): Promise<AgentExecution>;
+  manualRetry(
+    context: AuthenticatedCommandContext,
+    executionId: string,
+    maxQueuedPerRoom?: number,
+  ): Promise<AgentExecution>;
+  compensate(
+    context: AuthenticatedCommandContext,
+    executionId: string,
+    dispatchId: string,
+    maxQueuedPerRoom?: number,
+  ): Promise<AgentExecution>;
+  resumeCompensation(
+    runtime: InternalAgentRuntimeContext,
+    input: ResumeAgentRuntimeCompensationInput,
+  ): Promise<AgentRuntimeCompensationWork>;
+  prepareTool(runtime: InternalAgentRuntimeContext, input: PrepareToolInput): Promise<ToolGrant>;
+  confirmTool(context: AuthenticatedCommandContext, input: ToolConfirmationInput): Promise<ToolConfirmation>;
+  resumeConfirmedTool(
+    runtime: InternalAgentRuntimeContext,
+    input: ResumeConfirmedToolInput,
+  ): Promise<ResumedToolDispatch>;
+  dispatchTool(runtime: InternalAgentRuntimeContext, input: DispatchToolInput): Promise<ToolDispatch>;
+  settleTool(runtime: InternalAgentRuntimeContext, input: SettleToolInput): Promise<ToolDispatch>;
+  cancelForHumanFence(runtime: InternalAgentRuntimeContext, input: CancelForHumanFenceInput): Promise<AgentExecution>;
+  recoverPage(
+    runtime: InternalAgentRuntimeContext,
+    input: AgentRuntimeRecoveryPageInput,
+  ): Promise<AgentRuntimeRecoveryPage>;
+  readExecution(context: AuthenticatedSessionContext, executionId: string): Promise<AgentExecution>;
+  loadProviderContext(
+    runtime: InternalAgentRuntimeContext,
+    executionId: string,
+  ): Promise<AgentRuntimeProviderContext>;
+}
+
+export interface AgentRuntimeProviderContext {
+  readonly invocation: {
+    readonly sourceMessageId: string;
+    readonly requesterActorId: string;
+    readonly targetAgentId: string;
+    readonly intentKind: "direct_mention" | "structured_help" | "routed_candidate";
+  };
+  readonly visibleConversation: readonly {
+    readonly messageId: string;
+    readonly actorId: string;
+    readonly body: string;
+  }[];
+  readonly committedSteps: readonly {
+    readonly stepSeq: number;
+    readonly kind: "model_generation" | "tool_call" | "tool_result";
+    readonly modelInput: JsonValue;
+  }[];
 }
 
 export interface InternalAgentCommandContextInput {
@@ -331,6 +675,38 @@ export function isInternalAgentCommandContext(
   value: unknown,
 ): value is InternalAgentCommandContext {
   return typeof value === "object" && value !== null && internalAgentCommandContexts.has(value);
+}
+
+export function mintInternalAgentRuntimeContext(
+  input: InternalAgentRuntimeContextInput,
+): InternalAgentRuntimeContext {
+  if (typeof input.runtimeId !== "string" || input.runtimeId.trim().length === 0 ||
+      typeof input.agentId !== "string" || input.agentId.trim().length === 0) {
+    throw new TypeError("Internal Agent runtime context runtimeId and agentId must be non-empty");
+  }
+  const context: InternalAgentRuntimeContext = Object.freeze({
+    kind: "runtime",
+    [internalRuntimeAuthority]: true as const,
+    runtimeId: input.runtimeId,
+    agentId: input.agentId,
+  });
+  internalAgentRuntimeContexts.add(context);
+  return context;
+}
+
+export function isInternalAgentRuntimeContext(
+  value: unknown,
+): value is InternalAgentRuntimeContext {
+  return typeof value === "object" && value !== null && internalAgentRuntimeContexts.has(value);
+}
+
+export function toAgentRuntimeWorkerContext(
+  context: InternalAgentRuntimeContext,
+): AgentRuntimeWorkerContext {
+  if (!isInternalAgentRuntimeContext(context)) {
+    throw new AgentCapabilityForbiddenError();
+  }
+  return Object.freeze({ kind: "runtime", runtimeId: context.runtimeId, agentId: context.agentId });
 }
 
 export function toAgentWorkerCommandContext(
@@ -396,7 +772,7 @@ export type CollaborationCommand =
         readonly executionId: string;
         readonly sourceMessageId: string;
         readonly toolName: string;
-        readonly status: AgentExecutionStatus;
+        readonly status: LegacyAgentExecutionTransitionStatus;
         readonly result?: string;
       } & CommandActorFreePayload;
     }
@@ -761,6 +1137,12 @@ function validRoomEventPayload(
   }
   if (type === "room.agent_execution.changed") {
     return isAgentExecution(payload) && payload.roomId === roomId && payload.agentId === eventActorId;
+  }
+  if (type === "room.agent_tool_dispatch.changed") {
+    return isPublicAgentToolDispatch(payload) && payload.roomId === roomId && payload.agentId === eventActorId;
+  }
+  if (type === "room.agent_tool_confirmation.required") {
+    return isPublicToolConfirmationRequired(payload) && payload.roomId === roomId && payload.agentId === eventActorId;
   }
   return type === "room.calibration.recorded" && isCalibrationSignal(payload) && payload.actorId === eventActorId;
 }

@@ -200,6 +200,110 @@ describe("pure synchronization contracts", () => {
     })).toBe(true);
   });
 
+  it("requires agent execution event payload identity to match its envelope", () => {
+    const execution = {
+      id: "execution-1",
+      roomId: "room-1",
+      sourceMessageId: "message-1",
+      requesterId: "human-1",
+      agentId: "agent-1",
+      status: "queued",
+      actionCategory: "model_generation",
+      currentAttemptSeq: 1,
+      retryCycle: 1,
+      retryOrdinal: 1,
+      providerId: "provider-1",
+      modelId: "model-1",
+      recoveryCursor: 0,
+      queuedAt: "2026-08-10T00:00:00.000Z",
+      updatedAt: "2026-08-10T00:00:00.000Z",
+    };
+    const event = {
+      eventId: "event-1",
+      streamKind: "room",
+      streamId: "room-1",
+      streamSeq: 1,
+      roomId: "room-1",
+      actorId: "agent-1",
+      occurredAt: "2026-08-10T00:00:00.000Z",
+      type: "room.agent_execution.changed",
+      payload: execution,
+    };
+    const result = {
+      type: "room.sync.result",
+      requestId: "request-1",
+      mode: "delta",
+      events: [event],
+      nextCursor: { version: 1, roomId: "room-1", afterSeq: 1 },
+      watermark: 1,
+      hasMore: false,
+    };
+    expect(isRoomSyncResult(result)).toBe(true);
+    expect(isRoomSyncResult({
+      ...result,
+      events: [{ ...event, payload: { ...execution, roomId: "room-2" } }],
+    })).toBe(false);
+    expect(isRoomSyncResult({
+      ...result,
+      events: [{ ...event, payload: { ...execution, agentId: "agent-2" } }],
+    })).toBe(false);
+  });
+
+  it("accepts only a bounded public Agent tool-dispatch projection", () => {
+    const payload = {
+      id: "dispatch-1", executionId: "execution-1", roomId: "room-1", agentId: "agent-1",
+      attemptSeq: 1, grantId: "grant-1", toolId: "search.web", parameterHash: "a".repeat(64),
+      state: "succeeded", dispatchedAt: "2026-08-10T00:00:30.000Z",
+      settledAt: "2026-08-10T00:01:00.000Z", closedSummary: "done",
+    } as const;
+    const event = {
+      eventId: "event-1", streamKind: "room", streamId: "room-1", streamSeq: 1,
+      roomId: "room-1", actorId: "agent-1", occurredAt: "2026-08-10T00:01:00.000Z",
+      type: "room.agent_tool_dispatch.changed", payload,
+    } as const;
+    const result = {
+      type: "room.sync.result", requestId: "request-1", mode: "delta", events: [event],
+      nextCursor: { version: 1, roomId: "room-1", afterSeq: 1 }, watermark: 1, hasMore: false,
+    } as const;
+    expect(isRoomSyncResult(result)).toBe(true);
+    expect(isRoomSyncResult({
+      ...result, events: [{ ...event, payload: { ...payload, sealedCompensation: "secret" } }],
+    })).toBe(false);
+    expect(isRoomSyncResult({
+      ...result, events: [{ ...event, payload: { ...payload, closedSummary: "好".repeat(21_846) } }],
+    })).toBe(false);
+    expect(isRoomSyncResult({
+      ...result, events: [{ ...event, payload: { ...payload, roomId: "room-2" } }],
+    })).toBe(false);
+  });
+
+  it("accepts only a closed public confirmation-required projection", () => {
+    const payload = {
+      roomId: "room-1", agentId: "agent-1", executionId: "execution-1", attemptSeq: 1,
+      grantId: "grant-1", toolId: "search.web", parameterHash: "a".repeat(64),
+      expiresAt: "2026-08-10T00:05:00.000Z",
+    } as const;
+    const event = {
+      eventId: "event-1", streamKind: "room", streamId: "room-1", streamSeq: 1,
+      roomId: "room-1", actorId: "agent-1", occurredAt: "2026-08-10T00:01:00.000Z",
+      type: "room.agent_tool_confirmation.required", payload,
+    } as const;
+    const result = {
+      type: "room.sync.result", requestId: "request-1", mode: "delta", events: [event],
+      nextCursor: { version: 1, roomId: "room-1", afterSeq: 1 }, watermark: 1, hasMore: false,
+    } as const;
+    expect(isRoomSyncResult(result)).toBe(true);
+    expect(isRoomSyncResult({
+      ...result, events: [{ ...event, payload: { ...payload, sealedCompensation: "secret" } }],
+    })).toBe(false);
+    expect(isRoomSyncResult({
+      ...result, events: [{ ...event, payload: { ...payload, agentId: "agent-2" } }],
+    })).toBe(false);
+    expect(isRoomSyncResult({
+      ...result, events: [{ ...event, payload: { ...payload, expiresAt: "tomorrow" } }],
+    })).toBe(false);
+  });
+
   it("does not interchange room and catalog snapshot versions", () => {
     expect(isSnapshotVersion({ kind: "room", roomId: "room-1", watermark: 4 })).toBe(true);
     expect(isSnapshotVersion({ kind: "catalog", catalogRevision: 3 })).toBe(true);

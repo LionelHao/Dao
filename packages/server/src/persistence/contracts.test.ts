@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
   isInternalAgentCommandContext,
+  isInternalAgentRuntimeContext,
   mintInternalAgentCommandContext,
+  mintInternalAgentRuntimeContext,
   parsePersistedIdentityEvent,
   parsePersistedRoomEvent,
   parsePersistentCommand,
   toAgentWorkerCommandContext,
+  toAgentRuntimeWorkerContext,
 } from "./contracts.js";
 
 const acceptedCommands: readonly unknown[] = [
@@ -56,6 +59,19 @@ const acceptedCommands: readonly unknown[] = [
   { type: "member.remove", roomId: "room-1", payload: { targetActorId: "human-2" } },
 ];
 
+describe("legacy execution transition command status", () => {
+  const base = { type: "agent.execution.transition", roomId: "room-1", payload: {
+    executionId: "execution-1", sourceMessageId: "message-1", toolName: "search.web",
+  } };
+  it("accepts interrupted and rejects canonical-only statuses", () => {
+    expect(parsePersistentCommand({
+      ...base, payload: { ...base.payload, status: "interrupted" },
+    })).toMatchObject({ ok: true });
+    expect(parsePersistentCommand({ ...base, payload: { ...base.payload, status: "queued" } })).toEqual({ ok: false, code: "invalid_command" });
+    expect(parsePersistentCommand({ ...base, payload: { ...base.payload, status: "cancelled" } })).toEqual({ ok: false, code: "invalid_command" });
+  });
+});
+
 describe("server-private Agent command capability", () => {
   it("rejects JSON and structurally similar objects but emits a closed cloneable worker context after minting", () => {
     const forged = {
@@ -79,6 +95,20 @@ describe("server-private Agent command capability", () => {
     expect(wire).toEqual(forged);
     expect(structuredClone(wire)).toEqual(wire);
     expect(isInternalAgentCommandContext(structuredClone(capability))).toBe(false);
+  });
+});
+
+describe("Agent runtime authority closed port", () => {
+  it("mints an opaque runtime capability and sends only its closed worker projection", () => {
+    const forged = { kind: "runtime", runtimeId: "runtime-1", agentId: "agent-1" };
+    expect(isInternalAgentRuntimeContext(forged)).toBe(false);
+
+    const runtime = mintInternalAgentRuntimeContext({ runtimeId: "runtime-1", agentId: "agent-1" });
+    expect(isInternalAgentRuntimeContext(runtime)).toBe(true);
+    expect(toAgentRuntimeWorkerContext(runtime)).toEqual(forged);
+    expect(isInternalAgentRuntimeContext(structuredClone(runtime))).toBe(false);
+    expect(() => mintInternalAgentRuntimeContext({ runtimeId: "runtime-1", agentId: "" }))
+      .toThrow(TypeError);
   });
 });
 
@@ -201,11 +231,49 @@ const acceptedRoomEvents: readonly unknown[] = [
       sourceMessageId: "message-1",
       requesterId: "human-1",
       agentId: "agent-1",
-      toolName: "search.web",
       status: "completed",
+      actionCategory: "tool_call",
+      toolDispatchPhase: "finished",
+      currentToolId: "search.web",
+      currentAttemptSeq: 1,
+      retryCycle: 1,
+      retryOrdinal: 1,
+      providerId: "legacy-authority",
+      modelId: "no-model",
+      recoveryCursor: 0,
+      queuedAt: "2026-08-10T00:00:00.000Z",
       startedAt: "2026-08-10T00:00:00.000Z",
-      completedAt: "2026-08-10T00:01:00.000Z",
-      result: "done",
+      updatedAt: "2026-08-10T00:01:00.000Z",
+      finishedAt: "2026-08-10T00:01:00.000Z",
+    },
+  },
+  {
+    ...roomEventBase,
+    actorId: "agent-1",
+    type: "room.agent_tool_confirmation.required",
+    payload: {
+      roomId: "room-1", agentId: "agent-1", executionId: "execution-1", attemptSeq: 1,
+      grantId: "grant-1", toolId: "search.web", parameterHash: "a".repeat(64),
+      expiresAt: "2026-08-10T00:05:00.000Z",
+    },
+  },
+  {
+    ...roomEventBase,
+    actorId: "agent-1",
+    type: "room.agent_tool_dispatch.changed",
+    payload: {
+      id: "dispatch-1",
+      executionId: "execution-1",
+      roomId: "room-1",
+      agentId: "agent-1",
+      attemptSeq: 1,
+      grantId: "grant-1",
+      toolId: "search.web",
+      parameterHash: "a".repeat(64),
+      state: "succeeded",
+      dispatchedAt: "2026-08-10T00:00:30.000Z",
+      settledAt: "2026-08-10T00:01:00.000Z",
+      closedSummary: "search completed",
     },
   },
   {
@@ -386,6 +454,38 @@ describe("closed authority contracts", () => {
         authorKind: "human",
         body: "hello",
         sentAt: "2026-08-10T00:00:00.000Z",
+      },
+    })).toEqual({ ok: false, code: "invalid_event" });
+    expect(parsePersistedRoomEvent({
+      ...base,
+      actorId: "agent-1",
+      type: "room.agent_tool_confirmation.required",
+      payload: {
+        roomId: "room-1", agentId: "agent-1", executionId: "execution-1", attemptSeq: 1,
+        grantId: "grant-1", toolId: "search.web", parameterHash: "a".repeat(64),
+        expiresAt: "2026-08-10T00:05:00.000Z", sealedCompensation: "secret",
+      },
+    })).toEqual({ ok: false, code: "invalid_event" });
+    expect(parsePersistedRoomEvent({
+      ...base,
+      actorId: "agent-1",
+      type: "room.agent_tool_dispatch.changed",
+      payload: {
+        id: "dispatch-1", executionId: "execution-1", roomId: "room-1", agentId: "agent-1",
+        attemptSeq: 1, grantId: "grant-1", toolId: "search.web", parameterHash: "a".repeat(64),
+        state: "succeeded", dispatchedAt: "2026-08-10T00:00:30.000Z",
+        settledAt: "2026-08-10T00:01:00.000Z", sealedCompensation: "secret",
+      },
+    })).toEqual({ ok: false, code: "invalid_event" });
+    expect(parsePersistedRoomEvent({
+      ...base,
+      actorId: "agent-1",
+      type: "room.agent_tool_dispatch.changed",
+      payload: {
+        id: "dispatch-1", executionId: "execution-1", roomId: "room-1", agentId: "agent-1",
+        attemptSeq: 1, grantId: "grant-1", toolId: "search.web", parameterHash: "a".repeat(64),
+        state: "succeeded", dispatchedAt: "2026-08-10T00:00:30.000Z",
+        settledAt: "2026-08-10T00:01:00.000Z", closedSummary: "好".repeat(21_846),
       },
     })).toEqual({ ok: false, code: "invalid_event" });
     expect(parsePersistedRoomEvent({

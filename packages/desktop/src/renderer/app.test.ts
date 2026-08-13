@@ -44,6 +44,21 @@ type RendererUnderTest = {
       readonly onConfigureAgent: (request: AgentConfigurationRequest) => void;
     },
   ) => void;
+  renderAgentExecutionLifecycle?: (
+    root: HTMLElement,
+    options: {
+      readonly execution: AgentExecution;
+      readonly agentLabel: string;
+      readonly confirmation?: {
+        readonly toolId: string;
+        readonly target: string;
+        readonly impact: string;
+      };
+      readonly onInterrupt?: (executionId: string) => void;
+      readonly onRetry?: (executionId: string) => void;
+      readonly onConfirm?: (executionId: string) => void;
+    },
+  ) => void;
 };
 
 const app = importedApp as unknown as RendererUnderTest;
@@ -62,6 +77,71 @@ describe("empty group chat renderer", () => {
 });
 
 describe("verified collaboration primitive renderer", () => {
+  it("renders authoritative execution labels and actions without human typing semantics", () => {
+    const root = document.createElement("main");
+    const calls: string[] = [];
+    const base: AgentExecution = {
+      id: "execution-live", roomId: "preview-room", sourceMessageId: "preview-human-mention",
+      requesterId: "human-li", agentId: "agent-data", status: "running",
+      actionCategory: "model_generation", providerId: "openai.responses", modelId: "gpt-5",
+      currentAttemptSeq: 2, retryCycle: 1, retryOrdinal: 1,
+      queuedAt: "2026-08-12T00:00:00.000Z",
+      startedAt: "2026-08-12T00:00:01.000Z", recoveryCursor: 3,
+      updatedAt: "2026-08-12T00:00:02.000Z",
+    };
+    const render = (execution: AgentExecution, confirmation?: {
+      readonly toolId: string; readonly target: string; readonly impact: string;
+    }) => app.renderAgentExecutionLifecycle?.(root, {
+      execution, agentLabel: "数据 Agent", confirmation,
+      onInterrupt: () => calls.push("interrupt"),
+      onRetry: () => calls.push("retry"),
+      onConfirm: () => calls.push("confirm"),
+    });
+
+    expect(app.renderAgentExecutionLifecycle).toBeTypeOf("function");
+    const queued = structuredClone(base) as { status: AgentExecution["status"]; startedAt?: string };
+    queued.status = "queued";
+    Reflect.deleteProperty(queued, "startedAt");
+    render(queued as AgentExecution);
+    expect(root.textContent).toContain("排队中");
+    render(base);
+    expect(root.textContent).toContain("正在生成");
+    expect(root.textContent).toContain("第 2 次尝试");
+    root.querySelector<HTMLButtonElement>("[data-action='interrupt']")?.click();
+
+    render({ ...base, actionCategory: "tool_call", toolDispatchPhase: "dispatched", currentToolId: "search.web" });
+    expect(root.textContent).toContain("正在调用 search.web");
+
+    render({ ...base, actionCategory: "waiting_upstream" }, {
+      toolId: "sandbox-file.write", target: "note.txt", impact: "替换文件",
+    });
+    expect(root.textContent).toContain("等待上游");
+    expect(root.textContent).toContain("note.txt");
+    root.querySelector<HTMLButtonElement>("[data-action='confirm']")?.click();
+
+    render({
+      ...base, status: "failed", actionCategory: "model_generation",
+      finishedAt: "2026-08-12T00:00:02.000Z", terminalErrorCode: "provider_failure",
+    });
+    expect(root.textContent).toContain("已失败");
+    expect(root.textContent).toContain("provider_failure");
+    root.querySelector<HTMLButtonElement>("[data-action='retry']")?.click();
+    render({
+      ...base, status: "completed", actionCategory: "model_generation",
+      finishedAt: "2026-08-12T00:00:02.000Z", resultMessageId: "message-result",
+    });
+    expect(root.textContent).toContain("已完成");
+    render({
+      ...base, status: "cancelled", actionCategory: "model_generation",
+      finishedAt: "2026-08-12T00:00:02.000Z", cancellationReason: "requested_by_requester",
+    });
+    expect(root.textContent).toContain("已取消");
+    expect(calls).toEqual(["interrupt", "confirm", "retry"]);
+    expect(root.querySelector(".typing")).toBeNull();
+    expect(root.querySelector("[data-typing-dots]")).toBeNull();
+    expect(root.querySelector("[data-action='read']")).toBeNull();
+    expect(root.querySelector("[data-action='request']")).toBeNull();
+  });
   it("rejects malformed or unrelated restored records before mutating the DOM", () => {
     const empty = (): RestoredPrimitivePreviewRecords => ({
       humanReads: [], agentJudgements: [], openItems: [], agentExecutions: [],
@@ -139,9 +219,19 @@ describe("verified collaboration primitive renderer", () => {
         sourceMessageId: "preview-human-mention",
         requesterId: "恢复请求者",
         agentId: "恢复 Agent",
-        toolName: "restore.inspect",
         status: "running",
+        actionCategory: "tool_call",
+        toolDispatchPhase: "dispatched",
+        currentToolId: "restore.inspect",
+        currentAttemptSeq: 1,
+        retryCycle: 1,
+        retryOrdinal: 1,
+        providerId: "restore-direct-tool",
+        modelId: "no-model",
+        recoveryCursor: 0,
+        queuedAt: "2026-08-12T13:00:03.000Z",
         startedAt: "2026-08-12T13:00:03.000Z",
+        updatedAt: "2026-08-12T13:00:03.000Z",
       }],
       socialReactions: [{
         id: "social-restored",
@@ -231,7 +321,7 @@ describe("verified collaboration primitive renderer", () => {
 
     interrupt?.click();
 
-    expect(root.querySelector("[data-agent-invocation]")?.getAttribute("data-execution-status")).toBe("interrupted");
+    expect(root.querySelector("[data-agent-invocation]")?.getAttribute("data-execution-status")).toBe("cancelled");
     expect(root.querySelector("[data-member-id='agent-data']")?.textContent).toBe("可用");
   });
 

@@ -308,7 +308,9 @@ export {
 } from "./collaboration.js";
 export type {
   AgentExecution,
+  AgentExecutionActionCategory,
   AgentExecutionStatus,
+  AgentToolDispatchPhase,
   AgentJudgement,
   AgentJudgementOutcome,
   CalibrationSignal,
@@ -320,6 +322,8 @@ export type {
 } from "./collaboration.js";
 export {
   isRoomCursor,
+  isPublicAgentToolDispatch,
+  isPublicToolConfirmationRequired,
   isRoomRepairPage,
   isRoomSyncResult,
   isSnapshotCompleted,
@@ -329,6 +333,8 @@ export {
 export type {
   PersistedIdentityEvent,
   PersistedRoomEvent,
+  PublicAgentToolDispatch,
+  PublicToolConfirmationRequired,
   LegacyUnknownCalibrationSignal,
   RoomCursor,
   RoomRepairPage,

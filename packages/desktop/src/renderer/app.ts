@@ -36,6 +36,81 @@ export interface RoomJoinControlOptions {
   readonly onConfigureAgent: (request: AgentConfigurationRequest) => void;
 }
 
+export interface AgentExecutionLifecycleOptions {
+  readonly execution: AgentExecution;
+  readonly agentLabel: string;
+  readonly confirmation?: {
+    readonly toolId: string;
+    readonly target: string;
+    readonly impact: string;
+  };
+  readonly onInterrupt?: (executionId: string) => void;
+  readonly onRetry?: (executionId: string) => void;
+  readonly onConfirm?: (executionId: string) => void;
+}
+
+function executionLifecycleLabel(execution: AgentExecution): string {
+  if (execution.status === "queued") return "排队中";
+  if (execution.status === "completed") return "已完成";
+  if (execution.status === "failed") return "已失败";
+  if (execution.status === "cancelled") return "已取消";
+  if (execution.actionCategory === "model_generation") return "正在生成";
+  if (execution.actionCategory === "waiting_upstream") return "等待上游";
+  return `正在调用 ${execution.currentToolId ?? "未知工具"}`;
+}
+
+export function renderAgentExecutionLifecycle(
+  root: HTMLElement,
+  options: AgentExecutionLifecycleOptions,
+): void {
+  if (!isAgentExecution(options.execution) || options.agentLabel.trim().length === 0) {
+    throw new TypeError("Agent execution lifecycle input is invalid");
+  }
+  const { execution } = options;
+  const section = primitiveElement("section", "agent-execution-lifecycle");
+  section.dataset.executionId = execution.id;
+  section.dataset.executionStatus = execution.status;
+  section.dataset.actionCategory = execution.actionCategory;
+  const title = primitiveElement(
+    "h2", "agent-execution-lifecycle__title",
+    `${options.agentLabel} · ${executionLifecycleLabel(execution)}`,
+  );
+  const attempt = primitiveElement(
+    "p", "agent-execution-lifecycle__attempt", `第 ${execution.currentAttemptSeq} 次尝试`,
+  );
+  section.append(title, attempt);
+  const closedReason = execution.status === "failed"
+    ? execution.terminalErrorCode
+    : execution.status === "cancelled" ? execution.cancellationReason : undefined;
+  if (closedReason !== undefined) {
+    const reason = primitiveElement("p", "agent-execution-lifecycle__reason", closedReason);
+    reason.dataset.closedReason = closedReason;
+    section.append(reason);
+  }
+  if (execution.status === "running" || execution.status === "queued") {
+    if (options.onInterrupt !== undefined) {
+      const interrupt = appendPrimitiveButton(section, "中断", "interrupt");
+      interrupt.addEventListener("click", () => options.onInterrupt?.(execution.id));
+    }
+  }
+  if (execution.status === "failed" && options.onRetry !== undefined) {
+    const retry = appendPrimitiveButton(section, "重试", "retry");
+    retry.addEventListener("click", () => options.onRetry?.(execution.id));
+  }
+  if (execution.status === "running" && execution.actionCategory === "waiting_upstream" &&
+      options.confirmation !== undefined && options.onConfirm !== undefined) {
+    const confirmation = primitiveElement(
+      "p", "agent-execution-lifecycle__confirmation",
+      `${options.confirmation.toolId} · ${options.confirmation.target} · ${options.confirmation.impact}`,
+    );
+    const confirm = appendPrimitiveButton(section, "确认执行", "confirm");
+    confirm.addEventListener("click", () => options.onConfirm?.(execution.id));
+    section.append(confirmation, confirm);
+  }
+  root.setAttribute("aria-label", "Agent 执行状态");
+  root.replaceChildren(section);
+}
+
 export function renderEmptyGroupChat(root: HTMLElement): void {
   const section = document.createElement("section");
   const title = document.createElement("h1");
@@ -1003,17 +1078,18 @@ function appendAddressingPreview(
     section.append(openItem);
   }
   const executionStatusLabels: Readonly<Record<AgentExecution["status"], string>> = {
+    queued: "等待执行",
     running: "正在调用",
     completed: "已完成调用",
-    interrupted: "已中断",
     failed: "调用失败",
+    cancelled: "已取消",
   };
   for (const record of records.agentExecutions) {
     const agentLabel = record.agentId === "agent-data" ? "数据 Agent" : record.agentId;
     const invocation = primitiveElement(
       "div",
       "agent-invocation",
-      `Agent 执行 · ${agentLabel} ${executionStatusLabels[record.status]} ${record.toolName}`,
+      `Agent 执行 · ${agentLabel} ${executionStatusLabels[record.status]} ${record.currentToolId ?? "未调度工具"}`,
     );
     invocation.dataset.agentInvocation = record.agentId;
     invocation.dataset.executionStatus = record.status;
@@ -1027,8 +1103,8 @@ function appendAddressingPreview(
       const interrupt = appendPrimitiveButton(invocation, "中断", "interrupt");
       interrupt.dataset.testid = "interrupt-agent-execution";
       interrupt.addEventListener("click", () => {
-        invocation.dataset.executionStatus = "interrupted";
-        invocation.firstChild!.textContent = `Agent 执行 · ${agentLabel} 已中断`;
+        invocation.dataset.executionStatus = "cancelled";
+        invocation.firstChild!.textContent = `Agent 执行 · ${agentLabel} 已取消`;
         status.textContent = "可用";
         interrupt.remove();
       });
@@ -1127,9 +1203,19 @@ const defaultRestoredPrimitiveRecords: RestoredPrimitivePreviewRecords = {
     sourceMessageId: "preview-human-mention",
     requesterId: "human-li",
     agentId: "agent-data",
-    toolName: "warehouse.query",
     status: "running",
+    actionCategory: "tool_call",
+    toolDispatchPhase: "dispatched",
+    currentToolId: "warehouse.query",
+    currentAttemptSeq: 1,
+    retryCycle: 1,
+    retryOrdinal: 1,
+    providerId: "preview-direct-tool",
+    modelId: "no-model",
+    recoveryCursor: 0,
+    queuedAt: "2026-08-08T10:04:00.000Z",
     startedAt: "2026-08-08T10:04:00.000Z",
+    updatedAt: "2026-08-08T10:04:00.000Z",
   }],
   socialReactions: [{
     id: "preview-social-reaction",

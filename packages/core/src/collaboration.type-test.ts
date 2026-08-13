@@ -1,10 +1,32 @@
 import type {
+  AgentExecution,
   AgentConfigurationRequest,
   AgentRoomMembership,
   HumanInvitationRequest,
   HumanRoomMembership,
   MessageDraft,
+  PublicAgentToolDispatch,
+  PublicToolConfirmationRequired,
 } from "./index.js";
+
+type Assert<T extends true> = T;
+export type PublicDispatchProjectionOmitsSealedCompensation = Assert<
+  "sealedCompensation" extends keyof PublicAgentToolDispatch ? false : true
+>;
+export type PublicConfirmationProjectionOmitsSecret = Assert<
+  Extract<keyof PublicToolConfirmationRequired, "sealedCompensation" | "target" | "impact"> extends never
+    ? true
+    : false
+>;
+
+const humanRequest = {
+  kind: "human-invitation" as const,
+  roomId: "room-1",
+  inviteeActorId: "human-2",
+};
+
+// @ts-expect-error A human request cannot be persisted as an agent execution.
+const invalidHumanRequestExecution: AgentExecution = humanRequest;
 
 const invalidHumanMembership: HumanRoomMembership = {
   kind: "human",
@@ -105,6 +127,7 @@ const invalidAgentConfigurationInviteeActorId: AgentConfigurationRequest =
   agentConfigurationWithInviteeActorId;
 
 void invalidHumanMembership;
+void invalidHumanRequestExecution;
 void invalidHumanConfiguredAt;
 void invalidAgentMembership;
 void invalidDraftAuthorId;

@@ -8,6 +8,7 @@ import {
 export { startAuthoritativeServer } from "./authoritative-server.js";
 export type {
   AuthoritativeServer,
+  AgentRuntimeServerConfig,
   StartAuthoritativeServerOptions,
 } from "./authoritative-server.js";
 
@@ -103,6 +104,13 @@ export type {
 export { parseClientFrame, PROTOCOL_FIELD_LIMITS } from "./protocol.js";
 export type {
   AuthenticatedFrame,
+  AgentCompensateFrame,
+  AgentExecutionPreviewFrame,
+  AgentExecutionResultFrame,
+  AgentInterruptFrame,
+  AgentInvokeFrame,
+  AgentRetryFrame,
+  AgentToolConfirmFrame,
   AuthLoginFrame,
   AuthRefreshFrame,
   AuthResumeFrame,
@@ -141,7 +149,11 @@ export {
   MESSAGE_WEBSOCKET_V2_GATE_MAX_EVENTS,
   startMessageWebSocketServer,
 } from "./websocket.js";
-export type { MessageWebSocketServer, StartMessageWebSocketServerOptions } from "./websocket.js";
+export type {
+  AgentRuntimeTransport,
+  MessageWebSocketServer,
+  StartMessageWebSocketServerOptions,
+} from "./websocket.js";
 export {
   CollaborationPrimitiveError,
   createAuthoritativeCollaborationPrimitives,
@@ -175,6 +187,26 @@ export type WorkerDatabaseClient = Omit<
   InternalWorkerDatabaseClient,
   | "executeHuman"
   | "executeAgent"
+  | "invokeAgentRuntime"
+  | "claimNextAgentRuntime"
+  | "commitAgentRuntimeStep"
+  | "completeAgentRuntimeExecution"
+  | "completeAgentRuntimeCompensation"
+  | "scheduleAgentRuntimeRetry"
+  | "failAgentRuntimeExecution"
+  | "interruptAgentRuntime"
+  | "manualRetryAgentRuntime"
+  | "compensateAgentRuntime"
+  | "resumeAgentRuntimeCompensation"
+  | "recoverAgentRuntimePage"
+  | "prepareAgentRuntimeTool"
+  | "confirmAgentRuntimeTool"
+  | "resumeConfirmedAgentRuntimeTool"
+  | "dispatchAgentRuntimeTool"
+  | "settleAgentRuntimeTool"
+  | "readAgentRuntimeExecution"
+  | "loadAgentRuntimeProviderContext"
+  | "cancelAgentRuntimeForHumanFence"
   | "readActor"
   | "readRoom"
   | "listPendingOutbox"

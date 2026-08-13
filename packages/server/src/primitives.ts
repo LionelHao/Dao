@@ -9,7 +9,6 @@ import type {
   Actor,
   AgentActor,
   AgentExecution,
-  AgentExecutionStatus,
   AgentJudgement,
   AgentJudgementOutcome,
   AgentReadiness,
@@ -409,7 +408,10 @@ export function createCollaborationPrimitives(
 
   function updateExecution(
     value: AgentExecution,
-    update: Partial<Pick<AgentExecution, "status" | "completedAt" | "result">>,
+    update: Partial<Pick<AgentExecution,
+      "status" | "toolDispatchPhase" | "updatedAt" | "finishedAt" |
+      "cancellationReason" | "terminalErrorCode"
+    >>,
   ): AgentExecution {
     const next: AgentExecution = { ...value, ...update };
     executionsById.set(next.id, next);
@@ -432,15 +434,26 @@ export function createCollaborationPrimitives(
     }
 
     const controller = new AbortController();
+    const startedAt = now();
     const initial: AgentExecution = {
       id: nextId("execution"),
       roomId: input.message.roomId,
       sourceMessageId: input.message.id,
       requesterId: input.requesterId,
       agentId: input.target.id,
-      toolName: input.toolName,
       status: "running",
-      startedAt: now(),
+      actionCategory: "tool_call",
+      toolDispatchPhase: "dispatched",
+      currentToolId: input.toolName,
+      currentAttemptSeq: 1,
+      retryCycle: 1,
+      retryOrdinal: 1,
+      providerId: "legacy-direct-tool",
+      modelId: "no-model",
+      recoveryCursor: 0,
+      queuedAt: startedAt,
+      startedAt,
+      updatedAt: startedAt,
     };
     executionsById.set(initial.id, initial);
     executionControllersById.set(initial.id, controller);
@@ -448,7 +461,7 @@ export function createCollaborationPrimitives(
 
     const running = (async (): Promise<AgentExecution> => {
       try {
-        const result = await toolInvoker({
+        await toolInvoker({
           agentId: input.target.id,
           roomId: input.message.roomId,
           messageId: input.message.id,
@@ -459,14 +472,25 @@ export function createCollaborationPrimitives(
         if (current.status !== "running") {
           return cloneExecution(current);
         }
-        const completed = updateExecution(current, { status: "completed", completedAt: now(), result });
+        const finishedAt = now();
+        const completed = updateExecution(current, {
+          status: "completed", toolDispatchPhase: "finished", finishedAt, updatedAt: finishedAt,
+        });
         agentReadinessOverridesById.set(input.target.id, "ready");
         return cloneExecution(completed);
       } catch {
         const current = execution(initial.id);
         if (current.status === "running") {
-          const status: AgentExecutionStatus = controller.signal.aborted ? "interrupted" : "failed";
-          const finished = updateExecution(current, { status, completedAt: now() });
+          const finishedAt = now();
+          const finished = controller.signal.aborted
+            ? updateExecution(current, {
+              status: "cancelled", toolDispatchPhase: "finished", finishedAt, updatedAt: finishedAt,
+              cancellationReason: "human_interrupt",
+            })
+            : updateExecution(current, {
+              status: "failed", toolDispatchPhase: "finished", finishedAt, updatedAt: finishedAt,
+              terminalErrorCode: "tool_failure",
+            });
           agentReadinessOverridesById.set(input.target.id, "ready");
           return cloneExecution(finished);
         }
@@ -619,14 +643,23 @@ export function createCollaborationPrimitives(
       if (current.status !== "running") {
         return cloneExecution(current);
       }
+      const finishedAt = now();
+      const cancelled = updateExecution(current, {
+        status: "cancelled", toolDispatchPhase: "finished", finishedAt, updatedAt: finishedAt,
+        cancellationReason: "human_interrupt",
+      });
+      agentReadinessOverridesById.set(current.agentId, "ready");
       executionControllersById.get(executionId)?.abort();
-      return cloneExecution(current);
+      return cloneExecution(cancelled);
     },
 
     waitForAgentExecution(executionId: string): Promise<AgentExecution> {
+      const current = executionsById.get(executionId);
+      if (current !== undefined && current.status !== "running") {
+        return Promise.resolve(cloneExecution(current));
+      }
       const running = executionPromisesById.get(executionId);
       if (running === undefined) {
-        const current = executionsById.get(executionId);
         if (current === undefined) {
           return Promise.reject(new CollaborationPrimitiveError("unknown_execution"));
         }

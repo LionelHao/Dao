@@ -101,6 +101,32 @@ export interface RoomSyncRequest {
   readonly limit?: number;
 }
 
+export interface PublicAgentToolDispatch {
+  readonly id: string;
+  readonly executionId: string;
+  readonly roomId: string;
+  readonly agentId: string;
+  readonly attemptSeq: number;
+  readonly grantId: string;
+  readonly toolId: string;
+  readonly parameterHash: string;
+  readonly state: "succeeded" | "failed" | "outcome_unknown";
+  readonly dispatchedAt: string;
+  readonly settledAt: string;
+  readonly closedSummary?: string;
+}
+
+export interface PublicToolConfirmationRequired {
+  readonly roomId: string;
+  readonly agentId: string;
+  readonly executionId: string;
+  readonly attemptSeq: number;
+  readonly grantId: string;
+  readonly toolId: string;
+  readonly parameterHash: string;
+  readonly expiresAt: string;
+}
+
 interface PersistedEventBase {
   readonly eventId: string;
   readonly streamSeq: number;
@@ -129,6 +155,8 @@ export type PersistedRoomEvent =
   | RoomEvent<"room.agent_judgment.recorded", AgentJudgement>
   | RoomEvent<"room.open_item.changed", OpenItem>
   | RoomEvent<"room.agent_execution.changed", AgentExecution>
+  | RoomEvent<"room.agent_tool_confirmation.required", PublicToolConfirmationRequired>
+  | RoomEvent<"room.agent_tool_dispatch.changed", PublicAgentToolDispatch>
   | RoomEvent<"room.calibration.recorded", CalibrationSignal>;
 
 type IdentityEvent<TType extends string, TPayload> = PersistedEventBase & {
@@ -184,8 +212,37 @@ function text(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+function canonicalIsoTimestamp(value: unknown): value is string {
+  if (!text(value)) return false;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === value;
+}
+
 function count(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+export function isPublicAgentToolDispatch(value: unknown): value is PublicAgentToolDispatch {
+  if (!isRecord(value) || !exact(value, [
+    "id", "executionId", "roomId", "agentId", "attemptSeq", "grantId", "toolId",
+    "parameterHash", "state", "dispatchedAt", "settledAt",
+  ], ["closedSummary"])) return false;
+  return text(value.id) && text(value.executionId) && text(value.roomId) && text(value.agentId) &&
+    count(value.attemptSeq) && value.attemptSeq > 0 && text(value.grantId) && text(value.toolId) &&
+    typeof value.parameterHash === "string" && /^[0-9a-f]{64}$/.test(value.parameterHash) &&
+    (value.state === "succeeded" || value.state === "failed" || value.state === "outcome_unknown") &&
+    text(value.dispatchedAt) && text(value.settledAt) &&
+    (!Object.hasOwn(value, "closedSummary") ||
+      (text(value.closedSummary) && new TextEncoder().encode(value.closedSummary).byteLength <= 65_536));
+}
+
+export function isPublicToolConfirmationRequired(value: unknown): value is PublicToolConfirmationRequired {
+  return isRecord(value) && exact(value, [
+    "roomId", "agentId", "executionId", "attemptSeq", "grantId", "toolId", "parameterHash", "expiresAt",
+  ]) && text(value.roomId) && text(value.agentId) && text(value.executionId) &&
+    count(value.attemptSeq) && value.attemptSeq > 0 && text(value.grantId) && text(value.toolId) &&
+    typeof value.parameterHash === "string" && /^[0-9a-f]{64}$/.test(value.parameterHash) &&
+    canonicalIsoTimestamp(value.expiresAt);
 }
 
 function isRoomSummary(value: unknown): value is RoomSummary {
@@ -326,6 +383,13 @@ function isPersistedRoomEventValue(value: unknown): value is PersistedRoomEvent 
   }
   if (value.type === "room.agent_execution.changed") {
     return isAgentExecution(payload) && payload.roomId === value.roomId && payload.agentId === value.actorId;
+  }
+  if (value.type === "room.agent_tool_dispatch.changed") {
+    return isPublicAgentToolDispatch(payload) && payload.roomId === value.roomId && payload.agentId === value.actorId;
+  }
+  if (value.type === "room.agent_tool_confirmation.required") {
+    return isPublicToolConfirmationRequired(payload) &&
+      payload.roomId === value.roomId && payload.agentId === value.actorId;
   }
   return value.type === "room.calibration.recorded" && isCalibrationSignal(payload) && payload.actorId === value.actorId;
 }

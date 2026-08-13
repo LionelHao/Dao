@@ -38,7 +38,11 @@ export interface OpenItem {
   readonly transferChain: readonly OpenItemTransfer[];
 }
 
-export type AgentExecutionStatus = "running" | "completed" | "interrupted" | "failed";
+export type AgentExecutionStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+
+export type AgentExecutionActionCategory = "model_generation" | "tool_call" | "waiting_upstream";
+
+export type AgentToolDispatchPhase = "not_started" | "dispatched" | "finished";
 
 export interface AgentExecution {
   readonly id: string;
@@ -46,11 +50,27 @@ export interface AgentExecution {
   readonly sourceMessageId: string;
   readonly requesterId: string;
   readonly agentId: string;
-  readonly toolName: string;
   readonly status: AgentExecutionStatus;
-  readonly startedAt: string;
-  readonly completedAt?: string;
-  readonly result?: string;
+  readonly actionCategory: AgentExecutionActionCategory;
+  readonly toolDispatchPhase?: AgentToolDispatchPhase;
+  readonly currentToolId?: string;
+  readonly currentAttemptSeq: number;
+  readonly retryCycle: number;
+  readonly retryOrdinal: 1 | 2 | 3;
+  readonly providerId: string;
+  readonly modelId: string;
+  readonly recoveryCursor: number;
+  readonly queuedAt: string;
+  readonly startedAt?: string;
+  readonly updatedAt: string;
+  readonly finishedAt?: string;
+  readonly cancellationReason?: string;
+  readonly terminalErrorCode?: string;
+  readonly deadLetteredAt?: string;
+  readonly resultMessageId?: string;
+  readonly manualRetryOfExecutionId?: string;
+  readonly compensatesExecutionId?: string;
+  readonly supersedesExecutionIds?: readonly string[];
 }
 
 export interface SocialReaction {
@@ -84,6 +104,20 @@ function hasExactKeys(value: UnknownRecord, required: readonly string[], optiona
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+function isCanonicalIsoTimestamp(value: unknown): value is string {
+  if (!isNonEmptyString(value)) return false;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === value;
+}
+
+function isPositiveSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 export function isHumanReadReceipt(value: unknown): value is HumanReadReceipt {
@@ -136,22 +170,91 @@ export function isOpenItem(value: unknown): value is OpenItem {
 }
 
 export function isAgentExecution(value: unknown): value is AgentExecution {
-  return isRecord(value) &&
-    hasExactKeys(
-      value,
-      ["id", "roomId", "sourceMessageId", "requesterId", "agentId", "toolName", "status", "startedAt"],
-      ["completedAt", "result"],
-    ) &&
-    isNonEmptyString(value.id) &&
+  if (!isRecord(value) || !hasExactKeys(
+    value,
+    [
+      "id", "roomId", "sourceMessageId", "requesterId", "agentId", "status", "actionCategory",
+      "currentAttemptSeq", "retryCycle", "retryOrdinal", "providerId", "modelId", "recoveryCursor",
+      "queuedAt", "updatedAt",
+    ],
+    [
+      "toolDispatchPhase", "currentToolId", "startedAt", "finishedAt", "cancellationReason",
+      "terminalErrorCode", "deadLetteredAt", "resultMessageId", "manualRetryOfExecutionId",
+      "compensatesExecutionId", "supersedesExecutionIds",
+    ],
+  )) {
+    return false;
+  }
+
+  const isTerminal = value.status === "completed" || value.status === "failed" || value.status === "cancelled";
+  const hasOptionalString = (key: string): boolean =>
+    !Object.hasOwn(value, key) || isNonEmptyString(value[key]);
+  const hasExecutionIdList = !Object.hasOwn(value, "supersedesExecutionIds") ||
+    (Array.isArray(value.supersedesExecutionIds) &&
+      value.supersedesExecutionIds.length > 0 &&
+      value.supersedesExecutionIds.every(isNonEmptyString) &&
+      new Set(value.supersedesExecutionIds).size === value.supersedesExecutionIds.length);
+  const hasToolDispatch = Object.hasOwn(value, "toolDispatchPhase");
+  const hasCurrentTool = Object.hasOwn(value, "currentToolId");
+
+  return isNonEmptyString(value.id) &&
     isNonEmptyString(value.roomId) &&
     isNonEmptyString(value.sourceMessageId) &&
     isNonEmptyString(value.requesterId) &&
     isNonEmptyString(value.agentId) &&
-    isNonEmptyString(value.toolName) &&
-    (value.status === "running" || value.status === "completed" || value.status === "interrupted" || value.status === "failed") &&
-    isNonEmptyString(value.startedAt) &&
-    (!Object.hasOwn(value, "completedAt") || isNonEmptyString(value.completedAt)) &&
-    (!Object.hasOwn(value, "result") || isNonEmptyString(value.result));
+    (value.status === "queued" || value.status === "running" || value.status === "completed" || value.status === "failed" || value.status === "cancelled") &&
+    (value.actionCategory === "model_generation" || value.actionCategory === "tool_call" || value.actionCategory === "waiting_upstream") &&
+    isPositiveSafeInteger(value.currentAttemptSeq) &&
+    isPositiveSafeInteger(value.retryCycle) &&
+    (value.retryOrdinal === 1 || value.retryOrdinal === 2 || value.retryOrdinal === 3) &&
+    isNonEmptyString(value.providerId) &&
+    isNonEmptyString(value.modelId) &&
+    isNonNegativeSafeInteger(value.recoveryCursor) &&
+    isCanonicalIsoTimestamp(value.queuedAt) &&
+    isCanonicalIsoTimestamp(value.updatedAt) &&
+    (!Object.hasOwn(value, "startedAt") || isCanonicalIsoTimestamp(value.startedAt)) &&
+    (!Object.hasOwn(value, "finishedAt") || isCanonicalIsoTimestamp(value.finishedAt)) &&
+    hasOptionalString("cancellationReason") &&
+    hasOptionalString("terminalErrorCode") &&
+    (!Object.hasOwn(value, "deadLetteredAt") || isCanonicalIsoTimestamp(value.deadLetteredAt)) &&
+    hasOptionalString("resultMessageId") &&
+    hasOptionalString("manualRetryOfExecutionId") &&
+    hasOptionalString("compensatesExecutionId") &&
+    hasExecutionIdList &&
+    (value.actionCategory === "tool_call"
+      ? hasToolDispatch === hasCurrentTool &&
+        (!hasToolDispatch ||
+          ((value.toolDispatchPhase === "not_started" || value.toolDispatchPhase === "dispatched" || value.toolDispatchPhase === "finished") &&
+            isNonEmptyString(value.currentToolId)))
+      : !hasToolDispatch && !hasCurrentTool) &&
+    (isTerminal ? Object.hasOwn(value, "finishedAt") : !Object.hasOwn(value, "finishedAt")) &&
+    (value.status === "queued" ? !Object.hasOwn(value, "startedAt") : true) &&
+    (value.status === "running" || value.status === "completed" || value.status === "failed" ? Object.hasOwn(value, "startedAt") : true) &&
+    (value.status === "completed" ? !Object.hasOwn(value, "cancellationReason") &&
+      !Object.hasOwn(value, "terminalErrorCode") && !Object.hasOwn(value, "deadLetteredAt") : true) &&
+    (value.status === "cancelled" ? Object.hasOwn(value, "cancellationReason") &&
+      !Object.hasOwn(value, "resultMessageId") && !Object.hasOwn(value, "terminalErrorCode") &&
+      !Object.hasOwn(value, "deadLetteredAt") : true) &&
+    (value.status === "failed" ? Object.hasOwn(value, "terminalErrorCode") &&
+      !Object.hasOwn(value, "resultMessageId") && !Object.hasOwn(value, "cancellationReason") : true) &&
+    (value.status === "queued" || value.status === "running" ?
+      !Object.hasOwn(value, "resultMessageId") && !Object.hasOwn(value, "cancellationReason") &&
+      !Object.hasOwn(value, "terminalErrorCode") && !Object.hasOwn(value, "deadLetteredAt") : true) &&
+    Date.parse(value.queuedAt as string) <= Date.parse(value.updatedAt as string) &&
+    (!Object.hasOwn(value, "startedAt") || Date.parse(value.queuedAt as string) <= Date.parse(value.startedAt as string) &&
+      Date.parse(value.startedAt as string) <= Date.parse(value.updatedAt as string)) &&
+    (!Object.hasOwn(value, "finishedAt") ||
+      Date.parse(value.queuedAt as string) <= Date.parse(value.finishedAt as string) &&
+      (!Object.hasOwn(value, "startedAt") || Date.parse(value.startedAt as string) <= Date.parse(value.finishedAt as string)) &&
+      Date.parse(value.finishedAt as string) <= Date.parse(value.updatedAt as string)) &&
+    (!Object.hasOwn(value, "deadLetteredAt") ||
+      Date.parse(value.finishedAt as string) <= Date.parse(value.deadLetteredAt as string) &&
+      Date.parse(value.deadLetteredAt as string) <= Date.parse(value.updatedAt as string)) &&
+    !(value.actionCategory === "tool_call" && value.status === "queued" &&
+      hasToolDispatch && value.toolDispatchPhase !== "not_started") &&
+    ["manualRetryOfExecutionId", "compensatesExecutionId", "supersedesExecutionIds"].filter((key) => Object.hasOwn(value, key)).length <= 1 &&
+    value.manualRetryOfExecutionId !== value.id && value.compensatesExecutionId !== value.id &&
+    (!Object.hasOwn(value, "supersedesExecutionIds") || !(value.supersedesExecutionIds as readonly string[]).includes(value.id));
 }
 
 export function isSocialReaction(value: unknown): value is SocialReaction {

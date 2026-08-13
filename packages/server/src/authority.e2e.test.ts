@@ -5,9 +5,12 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer as createTcpServer, type Socket } from "node:net";
+import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
 import type { ServerFrame } from "./protocol.js";
+import { startAuthoritativeServerForTest } from "./authoritative-server.js";
+import type { AgentRuntimeProviderInput, ProviderAdapter } from "./agent-runtime/contracts.js";
 import {
   createClientSyncReplica,
   type ClientAuthorityCache,
@@ -877,6 +880,167 @@ describe("authoritative server real-process harness", () => {
       .resolves.not.toContain("startAuthoritativeServerForTest");
     await expect(readFile(join(process.cwd(), "packages/server/dist/index.d.ts"), "utf8"))
       .resolves.not.toContain("createWorkerDatabaseClientWithTransactionFaultForTest");
+  });
+
+  it("wires closed Agent runtime input from durable authority without client provider configuration", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-agent-composition-"));
+    let resolveInput!: (input: AgentRuntimeProviderInput) => void;
+    const providerInput = new Promise<AgentRuntimeProviderInput>((resolve) => {
+      resolveInput = resolve;
+    });
+    const provider: ProviderAdapter = {
+      id: "provider-composition",
+      async *stream(input) {
+        resolveInput(input);
+        yield { type: "response_started" };
+        yield { type: "text_delta", delta: "completed" };
+        yield { type: "completed", finishReason: "stop" };
+      },
+    };
+    let runtimeRoomId = "";
+    const identities = {
+      async verify(credentials: { readonly accountId: string; readonly secret: string }) {
+        return credentials.accountId === "account-a" && credentials.secret === "test-secret"
+          ? { accountId: "account-a", actorId: "human-a" }
+          : undefined;
+      },
+    };
+    const server = await startAuthoritativeServerForTest({
+      databasePath: join(directory, "authority.sqlite"),
+      snapshotCachePath: join(directory, "snapshot.sqlite"),
+      actors,
+      identities,
+      invitationSecretKey: Buffer.alloc(32, 19),
+      agentRuntime: {
+        agentIds: ["agent-a"],
+        provider: {
+          endpoint: "https://example.invalid/v1/responses", model: "model-composition",
+          secretEnvironmentKey: "UNUSED_DEEP_TEST_SECRET",
+        },
+        httpJsonTool: { origin: "https://example.invalid", pathTemplate: "/{path}" },
+        gitStatusTool: { gitBinaryPath: "/usr/bin/git", repositoryRoot: directory },
+        sandboxFileTool: { root: directory, compensationKey: Buffer.alloc(32, 23) },
+        contextLimits: { maxInputBytes: 65_536, maxOutputBytes: 65_536, maxToolCalls: 4 },
+      },
+    }, {
+      agentRuntimeAdapters: { provider, tools: [] },
+      async initialize(facades) {
+        const issued = await facades.auth.login({ accountId: "account-a", secret: "test-secret" });
+        const session = await facades.auth.authenticateSession(issued.accessToken);
+        const context = { ...session, kind: "human" as const,
+          requestId: "composition-seed", idempotencyKey: "composition-seed" };
+        const room = await facades.lifecycle.createRoom(context, { name: "Runtime" });
+        runtimeRoomId = room.id;
+        await facades.lifecycle.configureAgent(
+          { ...context, requestId: "composition-config", idempotencyKey: "composition-config" },
+          { kind: "agent-configuration", roomId: room.id, agentId: "agent-a",
+            participation: "active", toolPermissions: ["authority.inspect"] },
+        );
+        await facades.messages.send(
+          { ...context, requestId: "composition-message", idempotencyKey: "composition-message" },
+          { id: "composition-source", roomId: room.id, body: "durable composition input",
+            sentAt: "2026-08-13T10:00:00.000Z" },
+        );
+      },
+    });
+    const client = await JsonWebSocketClient.connect(server.url);
+    try {
+      await client.login("composition-login");
+      const response = await client.request({
+        type: "agent.invoke", requestId: "composition-invoke", roomId: runtimeRoomId,
+        sourceMessageId: "composition-source", targetAgentId: "agent-a",
+        intentKind: "direct_mention",
+      }, "agent.execution");
+      expect(response.type).toBe("agent.execution");
+      await expect(providerInput).resolves.toMatchObject({
+        purpose: "agent_runtime",
+        invocation: {
+          sourceMessageId: "composition-source", requesterActorId: "human-a",
+          targetAgentId: "agent-a", intentKind: "direct_mention",
+        },
+        visibleConversation: [{
+          messageId: "composition-source", actorId: "human-a", body: "durable composition input",
+        }],
+        committedSteps: [],
+      });
+    } finally {
+      client.close();
+      await server.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("projects a missing production provider secret as noauth", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-agent-noauth-"));
+    const databasePath = join(directory, "authority.sqlite");
+    let noauthRoomId = "";
+    const server = await startAuthoritativeServerForTest({
+      databasePath,
+      snapshotCachePath: join(directory, "snapshot.sqlite"),
+      actors,
+      identities: {
+        async verify(credentials) {
+          return credentials.accountId === "account-a" && credentials.secret === "test-secret"
+            ? { accountId: "account-a", actorId: "human-a" }
+            : undefined;
+        },
+      },
+      invitationSecretKey: Buffer.alloc(32, 29),
+      agentRuntime: {
+        agentIds: ["agent-a"],
+        provider: {
+          endpoint: "https://example.invalid/v1/responses", model: "model-noauth",
+          secretEnvironmentKey: "NATIVE_IM_TEST_INTENTIONALLY_MISSING_SECRET",
+        },
+        httpJsonTool: { origin: "https://example.invalid", pathTemplate: "/{path}" },
+        gitStatusTool: { gitBinaryPath: "/usr/bin/git", repositoryRoot: directory },
+        sandboxFileTool: { root: directory, compensationKey: Buffer.alloc(32, 31) },
+        contextLimits: { maxInputBytes: 65_536, maxOutputBytes: 65_536, maxToolCalls: 4 },
+      },
+    }, {
+      async initialize(facades) {
+        const issued = await facades.auth.login({ accountId: "account-a", secret: "test-secret" });
+        const session = await facades.auth.authenticateSession(issued.accessToken);
+        const context = { ...session, kind: "human" as const,
+          requestId: "noauth-seed", idempotencyKey: "noauth-seed" };
+        const room = await facades.lifecycle.createRoom(context, { name: "Noauth" });
+        noauthRoomId = room.id;
+        await facades.lifecycle.configureAgent(
+          { ...context, requestId: "noauth-config", idempotencyKey: "noauth-config" },
+          { kind: "agent-configuration", roomId: room.id, agentId: "agent-a",
+            participation: "active", toolPermissions: ["authority.inspect"] },
+        );
+        await facades.messages.send(
+          { ...context, requestId: "noauth-message", idempotencyKey: "noauth-message" },
+          { id: "noauth-source", roomId: room.id, body: "must fail before persistence",
+            sentAt: "2026-08-13T10:01:00.000Z" },
+        );
+      },
+    });
+    const client = await JsonWebSocketClient.connect(server.url);
+    try {
+      await client.login("noauth-login");
+      await expect(client.request({
+        type: "agent.invoke", requestId: "noauth-invoke", roomId: noauthRoomId,
+        sourceMessageId: "noauth-source", targetAgentId: "agent-a",
+        intentKind: "direct_mention",
+      }, "agent.execution")).rejects.toMatchObject({
+        status: 409, code: "provider_not_configured",
+      });
+    } finally {
+      client.close();
+    }
+    await server.close();
+    const database = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      expect(database.prepare("SELECT readiness FROM actors WHERE id = 'agent-a'").get())
+        .toEqual({ readiness: "noauth" });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM agent_executions").get())
+        .toEqual({ count: 0 });
+    } finally {
+      database.close();
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it("builds the closed JSON-line child fixture used by restart tests", async () => {

@@ -225,9 +225,20 @@ function seedMixedRoomRecords(databasePath: string, roomId: string): Record<stri
        VALUES (?, ?, ?, 'human-a', 'pending_response', ?, ?, NULL, 'human-a', '[]', NULL)`,
     );
     const insertExecution = database.prepare(
-      `INSERT INTO agent_executions (id, room_id, agent_id, trigger_message_id, status,
-         started_at, completed_at, result_json, requester_actor_id, tool_name)
-       VALUES (?, ?, 'agent-a', ?, 'running', ?, NULL, NULL, 'human-a', 'x')`,
+      `INSERT INTO agent_executions (
+         id, room_id, agent_id, source_message_id, requester_actor_id, state,
+         action_category, tool_dispatch_phase, current_tool_id,
+         current_attempt_seq, retry_cycle, retry_ordinal, provider_id, model_id,
+         recovery_cursor, queued_at, started_at, updated_at
+       ) VALUES (?, ?, 'agent-a', ?, 'human-a', 'running',
+         'tool_call', 'dispatched', 'x', 1, 1, 1, 'fixture', 'no-model', 0, ?, ?, ?)`,
+    );
+    const insertAttempt = database.prepare(
+      `INSERT INTO agent_execution_attempts (
+         execution_id, room_id, attempt_seq, retry_cycle, retry_ordinal, state,
+         action_category, tool_dispatch_phase, started_at, finished_at,
+         error_code, next_retry_at, recovery_cursor
+       ) VALUES (?, ?, 1, 1, 1, 'running', 'tool_call', 'dispatched', ?, NULL, NULL, NULL, 0)`,
     );
     const insertCalibration = database.prepare(
       `INSERT INTO calibration_signals (id, room_id, agent_id, judgment_id, signal,
@@ -285,8 +296,13 @@ function seedMixedRoomRecords(databasePath: string, roomId: string): Record<stri
           transferChain: [] };
         const execution = { id: `e${suffix}`, roomId,
           sourceMessageId: messageId, requesterId: "human-a", agentId: "agent-a",
-          toolName: "x", status: "running" as const,
-          startedAt: "t" };
+          status: "running" as const, actionCategory: "tool_call" as const,
+          toolDispatchPhase: "dispatched" as const, currentToolId: "x",
+          currentAttemptSeq: 1, retryCycle: 1, retryOrdinal: 1,
+          providerId: "fixture", modelId: "no-model", recoveryCursor: 0,
+          queuedAt: "2026-08-13T00:00:00.000Z",
+          startedAt: "2026-08-13T00:00:00.000Z",
+          updatedAt: "2026-08-13T00:00:00.000Z" };
         if (!isAgentJudgement(judgment) || !isOpenItem(item) ||
             !isAgentExecution(execution)) {
           throw new TypeError("Mixed collaboration fixture is not closed");
@@ -294,7 +310,9 @@ function seedMixedRoomRecords(databasePath: string, roomId: string): Record<stri
         insertJudgement.run(judgment.id, roomId, messageId,
           JSON.stringify(judgment), judgment.decidedAt);
         insertOpenItem.run(item.id, roomId, messageId, item.content, item.createdAt);
-        insertExecution.run(execution.id, roomId, messageId, execution.startedAt);
+        insertExecution.run(execution.id, roomId, messageId, execution.queuedAt,
+          execution.startedAt, execution.updatedAt);
+        insertAttempt.run(execution.id, execution.roomId, execution.startedAt);
       }
       for (let index = 0; index < 999; index += 1) {
         const suffix = index.toString(36);

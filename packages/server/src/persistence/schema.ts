@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
-export const AUTHORITY_SCHEMA_VERSION = 5 as const;
+export const AUTHORITY_SCHEMA_VERSION = 6 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -25,12 +25,15 @@ const V4_MIGRATION_CHECKSUM =
   "28a42b0ccfdc0d5c2eb111bc783cdd30c2678eb162cf9d77dcc2b6b3823f169c";
 const V5_MIGRATION_CHECKSUM =
   "3f90cdeb9b7c9e04f432aac809f340033f6d9a2ea1a6a5bd8d9ab50fab8d891d";
+const V6_MIGRATION_CHECKSUM =
+  "f068c43f2e3e479a4fbf5c36903a3481d2cf6d9f62b3957815359f4084280468";
 const SCHEMA_FINGERPRINTS = {
   1: "03f2bbba4aa7082ec01819824726ce1bd9b4bd14cebea71afc93c6821dbf405c",
   2: "01c37d92ec2f303613a7bb8b592ca846fbea7c829b3c81fe4521699db949dfcc",
   3: "8653114fb3c00fcbddc386c16693d98ce6f226695f1941ac73dc341aa5fc7a61",
   4: "b2d08fa3332bf0dc7fd4f0594210550089ed867a51b5da63be0e89830743d3ac",
   5: "b804592978b0afde52b64574534f355eaaf12db2d3401f0ebdf3d09373ca40a0",
+  6: "4257f86aea6183e12471aaee30a32590a88ecf52c17596a8b46c9ef9b607280a",
 } as const;
 
 const V1_STATEMENTS = [
@@ -224,6 +227,407 @@ const V5_STATEMENTS = [
   `CREATE INDEX room_memberships_catalog_actor_kind_room
    ON room_memberships(actor_id, kind, room_id)`,
 ] as const;
+
+const V6_STATEMENTS = [
+  `CREATE TABLE agent_executions_v6 (
+    id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    agent_id TEXT NOT NULL REFERENCES actors(id),
+    source_message_id TEXT NOT NULL REFERENCES messages(id),
+    requester_actor_id TEXT NOT NULL REFERENCES actors(id),
+    state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'completed', 'failed', 'cancelled')),
+    action_category TEXT NOT NULL CHECK (action_category IN ('model_generation', 'tool_call', 'waiting_upstream')),
+    tool_dispatch_phase TEXT CHECK (tool_dispatch_phase IN ('not_started', 'dispatched', 'finished')),
+    current_tool_id TEXT CHECK (current_tool_id IS NULL OR length(trim(current_tool_id)) > 0),
+    current_attempt_seq INTEGER NOT NULL CHECK (current_attempt_seq BETWEEN 1 AND 9007199254740991),
+    retry_cycle INTEGER NOT NULL CHECK (retry_cycle BETWEEN 1 AND 9007199254740991),
+    retry_ordinal INTEGER NOT NULL CHECK (retry_ordinal BETWEEN 1 AND 3),
+    provider_id TEXT NOT NULL CHECK (length(trim(provider_id)) > 0),
+    model_id TEXT NOT NULL CHECK (length(trim(model_id)) > 0),
+    recovery_cursor INTEGER NOT NULL CHECK (recovery_cursor BETWEEN 0 AND 9007199254740991),
+    queued_at TEXT NOT NULL,
+    started_at TEXT,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    cancellation_reason TEXT,
+    terminal_error_code TEXT,
+    dead_lettered_at TEXT,
+    result_message_id TEXT REFERENCES messages(id),
+    manual_retry_of_execution_id TEXT REFERENCES agent_executions_v6(id),
+    compensates_execution_id TEXT REFERENCES agent_executions_v6(id),
+    legacy_result_json TEXT,
+    supersedes_execution_ids_json TEXT NOT NULL DEFAULT '[]'
+      CHECK (json_valid(supersedes_execution_ids_json) AND json_type(supersedes_execution_ids_json) = 'array'),
+    CHECK (length(CAST(supersedes_execution_ids_json AS BLOB)) <= 65536),
+    CHECK (json_array_length(supersedes_execution_ids_json) <= 256),
+    CHECK (
+      (action_category = 'tool_call' AND (
+        (tool_dispatch_phase IS NULL AND current_tool_id IS NULL)
+        OR (tool_dispatch_phase IS NOT NULL AND current_tool_id IS NOT NULL)
+      ))
+      OR (action_category <> 'tool_call' AND tool_dispatch_phase IS NULL AND current_tool_id IS NULL)
+    ),
+    CHECK (
+      (state = 'queued' AND started_at IS NULL AND completed_at IS NULL
+       AND cancellation_reason IS NULL AND terminal_error_code IS NULL
+       AND dead_lettered_at IS NULL AND result_message_id IS NULL)
+      OR (state = 'running' AND started_at IS NOT NULL AND completed_at IS NULL
+          AND cancellation_reason IS NULL AND terminal_error_code IS NULL
+          AND dead_lettered_at IS NULL AND result_message_id IS NULL)
+      OR (state = 'completed' AND started_at IS NOT NULL AND completed_at IS NOT NULL
+          AND cancellation_reason IS NULL AND terminal_error_code IS NULL
+          AND dead_lettered_at IS NULL)
+      OR (state = 'failed' AND started_at IS NOT NULL AND completed_at IS NOT NULL
+          AND cancellation_reason IS NULL AND terminal_error_code IS NOT NULL
+          AND result_message_id IS NULL)
+      OR (state = 'cancelled' AND completed_at IS NOT NULL
+          AND cancellation_reason IS NOT NULL AND terminal_error_code IS NULL
+          AND dead_lettered_at IS NULL AND result_message_id IS NULL)
+    ),
+    CHECK (state <> 'queued' OR tool_dispatch_phase IS NULL OR tool_dispatch_phase = 'not_started')
+    ,CHECK (length(queued_at) = 24 AND COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', queued_at) = queued_at, 0))
+    ,CHECK (length(updated_at) = 24 AND COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', updated_at) = updated_at, 0))
+    ,CHECK (started_at IS NULL OR (length(started_at) = 24 AND COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', started_at) = started_at, 0)))
+    ,CHECK (completed_at IS NULL OR (length(completed_at) = 24 AND COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', completed_at) = completed_at, 0)))
+    ,CHECK (dead_lettered_at IS NULL OR (length(dead_lettered_at) = 24 AND COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', dead_lettered_at) = dead_lettered_at, 0)))
+    ,CHECK (cancellation_reason IS NULL OR length(trim(cancellation_reason)) > 0)
+    ,CHECK (terminal_error_code IS NULL OR length(trim(terminal_error_code)) > 0)
+    ,CHECK (queued_at <= updated_at
+       AND (started_at IS NULL OR queued_at <= started_at AND started_at <= updated_at)
+       AND (completed_at IS NULL OR queued_at <= completed_at
+            AND (started_at IS NULL OR started_at <= completed_at) AND completed_at <= updated_at)
+       AND (dead_lettered_at IS NULL OR completed_at <= dead_lettered_at AND dead_lettered_at <= updated_at))
+  ) STRICT`,
+  `INSERT INTO agent_executions_v6 (
+    id, room_id, agent_id, source_message_id, requester_actor_id, state,
+    action_category, tool_dispatch_phase, current_tool_id,
+    current_attempt_seq, retry_cycle, retry_ordinal, provider_id, model_id,
+    recovery_cursor, queued_at, started_at, updated_at, completed_at,
+    cancellation_reason, terminal_error_code, dead_lettered_at, result_message_id,
+    manual_retry_of_execution_id, compensates_execution_id,
+    supersedes_execution_ids_json, legacy_result_json
+  )
+  SELECT
+    id, room_id, agent_id, trigger_message_id, requester_actor_id,
+    CASE status
+      WHEN 'completed' THEN 'completed'
+      WHEN 'failed' THEN 'failed'
+      WHEN 'interrupted' THEN 'cancelled'
+      WHEN 'running' THEN 'failed'
+      ELSE NULL
+    END,
+    'tool_call', 'finished', tool_name,
+    1, 1, 1, 'legacy-v5', 'no-model', 0,
+    started_at, started_at,
+    CASE
+      WHEN status IN ('completed', 'failed') THEN completed_at
+      ELSE COALESCE(completed_at, started_at)
+    END,
+    CASE
+      WHEN status IN ('completed', 'failed') THEN completed_at
+      ELSE COALESCE(completed_at, started_at)
+    END,
+    CASE WHEN status = 'interrupted' THEN 'legacy_interrupted' ELSE NULL END,
+    CASE
+      WHEN status = 'running' THEN 'side_effect_outcome_unknown'
+      WHEN status = 'failed' THEN 'legacy_failed'
+      ELSE NULL
+    END,
+    CASE WHEN status = 'running' THEN COALESCE(completed_at, started_at) ELSE NULL END,
+    NULL, NULL, NULL, '[]', result_json
+  FROM agent_executions`,
+  `DROP TRIGGER messages_validate_update`,
+  `DROP TABLE agent_executions`,
+  `ALTER TABLE agent_executions_v6 RENAME TO agent_executions`,
+  `CREATE TRIGGER messages_validate_update
+   BEFORE UPDATE OF room_id, author_id, author_kind ON messages
+   WHEN COALESCE((SELECT kind FROM actors WHERE id = NEW.author_id), '')
+          <> NEW.author_kind
+      OR EXISTS (
+        SELECT 1 FROM human_read_receipts
+        WHERE message_id = OLD.id AND room_id <> NEW.room_id
+      )
+      OR EXISTS (
+        SELECT 1 FROM agent_judgments
+        WHERE message_id = OLD.id AND room_id <> NEW.room_id
+      )
+      OR EXISTS (
+        SELECT 1 FROM open_items
+        WHERE source_message_id = OLD.id AND room_id <> NEW.room_id
+      )
+      OR EXISTS (
+        SELECT 1 FROM agent_executions
+        WHERE source_message_id = OLD.id AND room_id <> NEW.room_id
+      )
+   BEGIN
+     SELECT RAISE(ABORT, 'message update would break authority references');
+   END`,
+  `CREATE TRIGGER agent_executions_validate_insert
+   BEFORE INSERT ON agent_executions
+   WHEN COALESCE((SELECT kind FROM actors WHERE id = NEW.agent_id), '') <> 'agent'
+      OR (NEW.source_message_id IS NOT NULL
+          AND COALESCE((SELECT room_id FROM messages WHERE id = NEW.source_message_id), '') <> NEW.room_id)
+      OR (NEW.requester_actor_id IS NOT NULL
+          AND COALESCE((SELECT kind FROM actors WHERE id = NEW.requester_actor_id), '') NOT IN ('human', 'agent'))
+      OR (NEW.result_message_id IS NOT NULL
+          AND (COALESCE((SELECT room_id FROM messages WHERE id = NEW.result_message_id), '') <> NEW.room_id
+               OR COALESCE((SELECT author_id FROM messages WHERE id = NEW.result_message_id), '') <> NEW.agent_id
+               OR COALESCE((SELECT author_kind FROM messages WHERE id = NEW.result_message_id), '') <> 'agent'))
+   BEGIN
+     SELECT RAISE(ABORT, 'agent execution must reference closed actors and room messages');
+   END`,
+  `CREATE TRIGGER agent_executions_validate_update
+   BEFORE UPDATE OF room_id, agent_id, source_message_id, requester_actor_id, result_message_id
+   ON agent_executions
+   WHEN COALESCE((SELECT kind FROM actors WHERE id = NEW.agent_id), '') <> 'agent'
+      OR (NEW.source_message_id IS NOT NULL
+          AND COALESCE((SELECT room_id FROM messages WHERE id = NEW.source_message_id), '') <> NEW.room_id)
+      OR (NEW.requester_actor_id IS NOT NULL
+          AND COALESCE((SELECT kind FROM actors WHERE id = NEW.requester_actor_id), '') NOT IN ('human', 'agent'))
+      OR (NEW.result_message_id IS NOT NULL
+          AND (COALESCE((SELECT room_id FROM messages WHERE id = NEW.result_message_id), '') <> NEW.room_id
+               OR COALESCE((SELECT author_id FROM messages WHERE id = NEW.result_message_id), '') <> NEW.agent_id
+               OR COALESCE((SELECT author_kind FROM messages WHERE id = NEW.result_message_id), '') <> 'agent'))
+   BEGIN
+     SELECT RAISE(ABORT, 'agent execution must reference closed actors and room messages');
+   END`,
+  `CREATE TABLE agent_invocation_intents (
+    id TEXT PRIMARY KEY,
+    source_message_id TEXT NOT NULL REFERENCES messages(id),
+    target_agent_id TEXT NOT NULL REFERENCES actors(id),
+    intent_kind TEXT NOT NULL CHECK (intent_kind IN ('direct_mention', 'structured_help', 'routed_candidate')),
+    execution_id TEXT NOT NULL UNIQUE REFERENCES agent_executions(id),
+    created_at TEXT NOT NULL,
+    UNIQUE (source_message_id, target_agent_id),
+    CHECK (length(created_at) = 24 AND COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', created_at) = created_at, 0))
+  ) STRICT`,
+  `CREATE TABLE agent_execution_attempts (
+    execution_id TEXT NOT NULL REFERENCES agent_executions(id),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    attempt_seq INTEGER NOT NULL CHECK (attempt_seq BETWEEN 1 AND 9007199254740991),
+    retry_cycle INTEGER NOT NULL CHECK (retry_cycle BETWEEN 1 AND 9007199254740991),
+    retry_ordinal INTEGER NOT NULL CHECK (retry_ordinal BETWEEN 1 AND 3),
+    state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'completed', 'failed', 'cancelled')),
+    action_category TEXT NOT NULL CHECK (action_category IN ('model_generation', 'tool_call', 'waiting_upstream')),
+    tool_dispatch_phase TEXT CHECK (tool_dispatch_phase IN ('not_started', 'dispatched', 'finished')),
+    started_at TEXT,
+    finished_at TEXT,
+    error_code TEXT,
+    next_retry_at INTEGER,
+    recovery_cursor INTEGER NOT NULL CHECK (recovery_cursor BETWEEN 0 AND 9007199254740991),
+    enqueue_stream_seq INTEGER NOT NULL DEFAULT 0
+      CHECK (enqueue_stream_seq BETWEEN 0 AND 9007199254740991),
+    PRIMARY KEY (execution_id, attempt_seq),
+    CHECK (
+      (action_category = 'tool_call')
+      OR (action_category <> 'tool_call' AND tool_dispatch_phase IS NULL)
+    ),
+    CHECK (
+      (state = 'queued' AND started_at IS NULL AND finished_at IS NULL AND error_code IS NULL)
+      OR (state = 'running' AND started_at IS NOT NULL AND finished_at IS NULL AND error_code IS NULL)
+      OR (state = 'completed' AND started_at IS NOT NULL AND finished_at IS NOT NULL AND error_code IS NULL)
+      OR (state = 'failed' AND started_at IS NOT NULL AND finished_at IS NOT NULL AND error_code IS NOT NULL)
+      OR (state = 'cancelled' AND finished_at IS NOT NULL AND error_code IS NULL)
+    )
+    ,CHECK (state <> 'queued' OR enqueue_stream_seq > 0)
+    ,CHECK (next_retry_at IS NULL OR next_retry_at BETWEEN 0 AND 9007199254740991)
+    ,CHECK (started_at IS NULL OR (length(started_at) = 24 AND COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', started_at) = started_at, 0)))
+    ,CHECK (finished_at IS NULL OR (length(finished_at) = 24 AND COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', finished_at) = finished_at, 0)))
+    ,CHECK (error_code IS NULL OR length(trim(error_code)) > 0)
+  ) STRICT`,
+  `INSERT INTO agent_execution_attempts (
+    execution_id, room_id, attempt_seq, retry_cycle, retry_ordinal, state,
+    action_category, tool_dispatch_phase, started_at, finished_at,
+    error_code, next_retry_at, recovery_cursor
+  )
+  SELECT id, room_id, 1, 1, 1, state, action_category, tool_dispatch_phase,
+         started_at, completed_at, terminal_error_code, NULL, recovery_cursor
+  FROM agent_executions`,
+  `CREATE TABLE agent_execution_steps (
+    execution_id TEXT NOT NULL,
+    attempt_seq INTEGER NOT NULL,
+    step_seq INTEGER NOT NULL CHECK (step_seq BETWEEN 1 AND 9007199254740991),
+    step_kind TEXT NOT NULL CHECK (step_kind IN ('model_generation', 'tool_call', 'tool_result')),
+    canonical_tool_call_json TEXT,
+    bounded_tool_result_json TEXT,
+    dispatch_id TEXT UNIQUE REFERENCES agent_tool_dispatches(id),
+    input_sha256 TEXT NOT NULL CHECK (length(input_sha256) = 64 AND input_sha256 NOT GLOB '*[^0-9a-f]*'),
+    output_sha256 TEXT NOT NULL CHECK (length(output_sha256) = 64 AND output_sha256 NOT GLOB '*[^0-9a-f]*'),
+    completed_at TEXT NOT NULL,
+    PRIMARY KEY (execution_id, attempt_seq, step_seq),
+    FOREIGN KEY (execution_id, attempt_seq)
+      REFERENCES agent_execution_attempts(execution_id, attempt_seq),
+    CHECK (canonical_tool_call_json IS NULL OR json_valid(canonical_tool_call_json)),
+    CHECK (bounded_tool_result_json IS NULL OR json_valid(bounded_tool_result_json)),
+    CHECK (
+      (step_kind = 'model_generation'
+       AND canonical_tool_call_json IS NULL AND bounded_tool_result_json IS NULL AND dispatch_id IS NULL)
+      OR (step_kind = 'tool_call'
+          AND canonical_tool_call_json IS NOT NULL AND bounded_tool_result_json IS NULL AND dispatch_id IS NULL)
+      OR (step_kind = 'tool_result'
+          AND canonical_tool_call_json IS NULL AND bounded_tool_result_json IS NOT NULL AND dispatch_id IS NOT NULL)
+    ),
+    CHECK (length(CAST(COALESCE(canonical_tool_call_json, '') AS BLOB)) <= 65536),
+    CHECK (length(CAST(COALESCE(bounded_tool_result_json, '') AS BLOB)) <= 65536),
+    CHECK (length(completed_at) = 24 AND COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', completed_at) = completed_at, 0))
+  ) STRICT`,
+  `CREATE TABLE agent_execution_completions (
+    execution_id TEXT NOT NULL,
+    attempt_seq INTEGER NOT NULL,
+    message_id TEXT NOT NULL UNIQUE REFERENCES messages(id),
+    request_hash TEXT NOT NULL CHECK (length(request_hash) = 64 AND request_hash NOT GLOB '*[^0-9a-f]*'),
+    completed_at TEXT NOT NULL,
+    PRIMARY KEY (execution_id, attempt_seq),
+    FOREIGN KEY (execution_id, attempt_seq)
+      REFERENCES agent_execution_attempts(execution_id, attempt_seq),
+    CHECK (length(completed_at) = 24 AND COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', completed_at) = completed_at, 0))
+  ) STRICT`,
+  `CREATE TABLE agent_tool_grants (
+    id TEXT PRIMARY KEY,
+    execution_id TEXT NOT NULL,
+    attempt_seq INTEGER NOT NULL,
+    tool_call_step_seq INTEGER NOT NULL CHECK (tool_call_step_seq BETWEEN 1 AND 9007199254740991),
+    agent_id TEXT NOT NULL REFERENCES actors(id),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    tool_id TEXT NOT NULL CHECK (length(trim(tool_id)) > 0),
+    parameter_hash TEXT NOT NULL CHECK (length(parameter_hash) = 64 AND parameter_hash NOT GLOB '*[^0-9a-f]*'),
+    tool_plan_hash TEXT NOT NULL CHECK (length(tool_plan_hash) = 64 AND tool_plan_hash NOT GLOB '*[^0-9a-f]*'),
+    confirmation_requirement TEXT NOT NULL
+      CHECK (confirmation_requirement IN ('read_only', 'side_effect')),
+    issued_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    consumed_at TEXT,
+    FOREIGN KEY (execution_id, attempt_seq)
+      REFERENCES agent_execution_attempts(execution_id, attempt_seq),
+    FOREIGN KEY (execution_id, attempt_seq, tool_call_step_seq)
+      REFERENCES agent_execution_steps(execution_id, attempt_seq, step_seq),
+    CHECK (length(issued_at) = 24 AND COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', issued_at) = issued_at, 0)),
+    CHECK (length(expires_at) = 24 AND COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', expires_at) = expires_at, 0)),
+    CHECK (consumed_at IS NULL OR (length(consumed_at) = 24 AND COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', consumed_at) = consumed_at, 0)))
+  ) STRICT`,
+  `CREATE TABLE agent_tool_confirmations (
+    id TEXT PRIMARY KEY,
+    execution_id TEXT NOT NULL,
+    attempt_seq INTEGER NOT NULL,
+    grant_id TEXT NOT NULL UNIQUE REFERENCES agent_tool_grants(id),
+    tool_id TEXT NOT NULL CHECK (length(trim(tool_id)) > 0),
+    parameter_hash TEXT NOT NULL CHECK (length(parameter_hash) = 64 AND parameter_hash NOT GLOB '*[^0-9a-f]*'),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    human_principal_id TEXT NOT NULL REFERENCES actors(id),
+    session_family_id TEXT NOT NULL CHECK (length(trim(session_family_id)) > 0),
+    target TEXT NOT NULL CHECK (length(trim(target)) > 0),
+    impact TEXT NOT NULL CHECK (length(trim(impact)) > 0),
+    reversibility TEXT NOT NULL CHECK (reversibility IN ('compensatable', 'irreversible')),
+    expires_at TEXT NOT NULL,
+    consumed_at TEXT,
+    FOREIGN KEY (execution_id, attempt_seq)
+      REFERENCES agent_execution_attempts(execution_id, attempt_seq),
+    CHECK (length(expires_at) = 24 AND COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', expires_at) = expires_at, 0)),
+    CHECK (consumed_at IS NULL OR (length(consumed_at) = 24 AND COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', consumed_at) = consumed_at, 0)))
+  ) STRICT`,
+  `CREATE TABLE agent_tool_dispatches (
+    id TEXT PRIMARY KEY,
+    execution_id TEXT NOT NULL,
+    attempt_seq INTEGER NOT NULL,
+    grant_id TEXT NOT NULL UNIQUE REFERENCES agent_tool_grants(id),
+    tool_id TEXT NOT NULL CHECK (length(trim(tool_id)) > 0),
+    parameter_hash TEXT NOT NULL CHECK (length(parameter_hash) = 64 AND parameter_hash NOT GLOB '*[^0-9a-f]*'),
+    state TEXT NOT NULL CHECK (state IN ('dispatched', 'succeeded', 'failed', 'outcome_unknown')),
+    dispatched_at TEXT NOT NULL,
+    settled_at TEXT,
+    closed_summary TEXT,
+    sealed_compensation TEXT,
+    FOREIGN KEY (execution_id, attempt_seq)
+      REFERENCES agent_execution_attempts(execution_id, attempt_seq),
+    CHECK (
+      (state = 'dispatched' AND settled_at IS NULL)
+      OR (state <> 'dispatched' AND settled_at IS NOT NULL)
+    ),
+    CHECK (length(dispatched_at) = 24 AND COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', dispatched_at) = dispatched_at, 0)),
+    CHECK (settled_at IS NULL OR (length(settled_at) = 24 AND COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', settled_at) = settled_at, 0))),
+    CHECK (length(CAST(COALESCE(closed_summary, '') AS BLOB)) <= 65536),
+    CHECK (length(CAST(COALESCE(sealed_compensation, '') AS BLOB)) <= 65536)
+  ) STRICT`,
+  `CREATE TABLE agent_compensation_requests (
+    execution_id TEXT PRIMARY KEY REFERENCES agent_executions(id),
+    original_execution_id TEXT NOT NULL REFERENCES agent_executions(id),
+    original_dispatch_id TEXT NOT NULL UNIQUE REFERENCES agent_tool_dispatches(id),
+    requester_actor_id TEXT NOT NULL REFERENCES actors(id),
+    session_family_id TEXT NOT NULL CHECK (length(trim(session_family_id)) > 0),
+    created_at TEXT NOT NULL,
+    CHECK (execution_id <> original_execution_id),
+    CHECK (length(created_at) = 24 AND COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', created_at) = created_at, 0))
+  ) STRICT`,
+  `CREATE TABLE agent_fence_replacements (
+    id TEXT PRIMARY KEY,
+    fence_message_id TEXT NOT NULL REFERENCES messages(id),
+    old_execution_id TEXT NOT NULL,
+    old_attempt_seq INTEGER NOT NULL CHECK (old_attempt_seq BETWEEN 1 AND 9007199254740991),
+    route_job_id TEXT,
+    selected_agent_id TEXT REFERENCES actors(id),
+    expected_judgment_id TEXT,
+    replacement_execution_id TEXT REFERENCES agent_executions(id),
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (old_execution_id, old_attempt_seq)
+      REFERENCES agent_execution_attempts(execution_id, attempt_seq),
+    CHECK (
+      (route_job_id IS NULL
+       AND selected_agent_id IS NULL
+       AND expected_judgment_id IS NULL
+       AND replacement_execution_id IS NULL)
+      OR (route_job_id IS NOT NULL
+          AND length(trim(route_job_id)) > 0
+          AND selected_agent_id IS NOT NULL
+          AND expected_judgment_id IS NOT NULL
+          AND length(trim(expected_judgment_id)) > 0
+          AND replacement_execution_id IS NOT NULL)
+    ),
+    UNIQUE (fence_message_id, old_execution_id, old_attempt_seq),
+    UNIQUE (fence_message_id, old_execution_id),
+    UNIQUE (fence_message_id, route_job_id, selected_agent_id),
+    CHECK (length(created_at) = 24 AND COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', created_at) = created_at, 0))
+  ) STRICT`,
+  `CREATE INDEX agent_executions_room_queue
+   ON agent_executions(room_id, state, queued_at, current_attempt_seq)`,
+  `CREATE INDEX agent_executions_room_id_id ON agent_executions(room_id, id)`,
+  `CREATE INDEX agent_executions_recovery
+   ON agent_executions(state, action_category, updated_at)`,
+  `CREATE INDEX agent_executions_agent_recovery
+   ON agent_executions(agent_id, state, action_category, room_id, queued_at, id)`,
+  `CREATE INDEX agent_executions_agent_state_id
+   ON agent_executions(agent_id, state, id, current_attempt_seq)`,
+  `CREATE INDEX agent_execution_attempts_recovery
+   ON agent_execution_attempts(state, next_retry_at, execution_id, attempt_seq)`,
+  `CREATE INDEX agent_execution_attempts_room_enqueue
+   ON agent_execution_attempts(room_id, state, enqueue_stream_seq, execution_id, attempt_seq)`,
+  `CREATE INDEX agent_execution_steps_execution_attempt
+   ON agent_execution_steps(execution_id, attempt_seq, step_seq)`,
+  `CREATE INDEX agent_tool_grants_expiry
+   ON agent_tool_grants(expires_at, consumed_at)`,
+  `CREATE INDEX agent_tool_confirmations_expiry
+   ON agent_tool_confirmations(expires_at, consumed_at)`,
+  `CREATE INDEX agent_tool_grants_recovery_expiry
+   ON agent_tool_grants(agent_id, confirmation_requirement, consumed_at, expires_at, execution_id, attempt_seq)`,
+  `CREATE INDEX agent_tool_grants_recovery_binding
+   ON agent_tool_grants(execution_id, attempt_seq, tool_id, parameter_hash,
+                        confirmation_requirement, consumed_at)`,
+  `CREATE INDEX agent_tool_grants_execution_step
+   ON agent_tool_grants(execution_id, attempt_seq, tool_call_step_seq,
+                        confirmation_requirement, id)`,
+  `CREATE INDEX agent_tool_confirmations_recovery_expiry
+   ON agent_tool_confirmations(consumed_at, expires_at, execution_id, attempt_seq,
+                               tool_id, parameter_hash)`,
+  `CREATE INDEX agent_tool_dispatches_state
+   ON agent_tool_dispatches(state, dispatched_at)`,
+  `CREATE UNIQUE INDEX agent_tool_dispatches_one_unsettled
+   ON agent_tool_dispatches(execution_id, attempt_seq) WHERE state = 'dispatched'`,
+  `CREATE INDEX agent_fence_replacements_replay
+   ON agent_fence_replacements(fence_message_id, route_job_id, selected_agent_id)`,
+  `CREATE INDEX agent_fence_replacements_replacement_old
+   ON agent_fence_replacements(replacement_execution_id, old_execution_id)`,
+] as const;
+
+export const AUTHORITY_SCHEMA_V6_STATEMENT_COUNT_FOR_TEST = V6_STATEMENTS.length;
 
 const V2_STATEMENTS = [
   `ALTER TABLE actors
@@ -570,7 +974,9 @@ function defineMigration(
 ): Migration {
   const checksum = migrationChecksum(version, name, statements);
   if (historicalChecksum !== undefined && checksum !== historicalChecksum) {
-    throw new Error(`Historical migration ${version} no longer matches its checksum`);
+    throw new Error(
+      `Historical migration ${version} no longer matches its checksum (${checksum})`,
+    );
   }
   return {
     version,
@@ -605,6 +1011,12 @@ const MIGRATIONS = [
     "streaming-keyset-indexes",
     V5_STATEMENTS,
     V5_MIGRATION_CHECKSUM,
+  ),
+  defineMigration(
+    6,
+    "agent-runtime-authority",
+    V6_STATEMENTS,
+    V6_MIGRATION_CHECKSUM,
   ),
 ] as const satisfies readonly Migration[];
 
@@ -777,12 +1189,152 @@ const V4_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V6_SCHEMA_CONTRACT = {
+  ...V4_SCHEMA_CONTRACT,
+  agent_executions: [
+    "id",
+    "room_id",
+    "agent_id",
+    "source_message_id",
+    "requester_actor_id",
+    "state",
+    "action_category",
+    "tool_dispatch_phase",
+    "current_tool_id",
+    "current_attempt_seq",
+    "retry_cycle",
+    "retry_ordinal",
+    "provider_id",
+    "model_id",
+    "recovery_cursor",
+    "queued_at",
+    "started_at",
+    "updated_at",
+    "completed_at",
+    "cancellation_reason",
+    "terminal_error_code",
+    "dead_lettered_at",
+    "result_message_id",
+    "manual_retry_of_execution_id",
+    "compensates_execution_id",
+    "legacy_result_json",
+    "supersedes_execution_ids_json",
+  ],
+  agent_execution_attempts: [
+    "execution_id",
+    "room_id",
+    "attempt_seq",
+    "retry_cycle",
+    "retry_ordinal",
+    "state",
+    "action_category",
+    "tool_dispatch_phase",
+    "started_at",
+    "finished_at",
+    "error_code",
+    "next_retry_at",
+    "recovery_cursor",
+    "enqueue_stream_seq",
+  ],
+  agent_execution_steps: [
+    "execution_id",
+    "attempt_seq",
+    "step_seq",
+    "step_kind",
+    "canonical_tool_call_json",
+    "bounded_tool_result_json",
+    "dispatch_id",
+    "input_sha256",
+    "output_sha256",
+    "completed_at",
+  ],
+  agent_execution_completions: [
+    "execution_id",
+    "attempt_seq",
+    "message_id",
+    "request_hash",
+    "completed_at",
+  ],
+  agent_compensation_requests: [
+    "execution_id",
+    "original_execution_id",
+    "original_dispatch_id",
+    "requester_actor_id",
+    "session_family_id",
+    "created_at",
+  ],
+  agent_fence_replacements: [
+    "id",
+    "fence_message_id",
+    "old_execution_id",
+    "old_attempt_seq",
+    "route_job_id",
+    "selected_agent_id",
+    "expected_judgment_id",
+    "replacement_execution_id",
+    "created_at",
+  ],
+  agent_invocation_intents: [
+    "id",
+    "source_message_id",
+    "target_agent_id",
+    "intent_kind",
+    "execution_id",
+    "created_at",
+  ],
+  agent_tool_confirmations: [
+    "id",
+    "execution_id",
+    "attempt_seq",
+    "grant_id",
+    "tool_id",
+    "parameter_hash",
+    "room_id",
+    "human_principal_id",
+    "session_family_id",
+    "target",
+    "impact",
+    "reversibility",
+    "expires_at",
+    "consumed_at",
+  ],
+  agent_tool_dispatches: [
+    "id",
+    "execution_id",
+    "attempt_seq",
+    "grant_id",
+    "tool_id",
+    "parameter_hash",
+    "state",
+    "dispatched_at",
+    "settled_at",
+    "closed_summary",
+    "sealed_compensation",
+  ],
+  agent_tool_grants: [
+    "id",
+    "execution_id",
+    "attempt_seq",
+    "tool_call_step_seq",
+    "agent_id",
+    "room_id",
+    "tool_id",
+    "parameter_hash",
+    "tool_plan_hash",
+    "confirmation_requirement",
+    "issued_at",
+    "expires_at",
+    "consumed_at",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
   3: V3_SCHEMA_CONTRACT,
   4: V4_SCHEMA_CONTRACT,
   5: V4_SCHEMA_CONTRACT,
+  6: V6_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -1090,17 +1642,19 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
      LIMIT 1`,
     "open item sources must belong to their rooms",
   );
-  requireNoRows(
-    database,
-    `SELECT 1
-     FROM agent_executions AS execution
-     JOIN actors AS actor ON actor.id = execution.agent_id
-     LEFT JOIN messages AS message ON message.id = execution.trigger_message_id
-     WHERE actor.kind <> 'agent'
-        OR (message.id IS NOT NULL AND message.room_id <> execution.room_id)
-     LIMIT 1`,
-    "agent executions must reference agents and room messages",
-  );
+  if (schemaVersion < 6) {
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_executions AS execution
+       JOIN actors AS actor ON actor.id = execution.agent_id
+       LEFT JOIN messages AS message ON message.id = execution.trigger_message_id
+       WHERE actor.kind <> 'agent'
+          OR (message.id IS NOT NULL AND message.room_id <> execution.room_id)
+       LIMIT 1`,
+      "agent executions must reference agents and room messages",
+    );
+  }
   requireNoRows(
     database,
     `SELECT 1
@@ -1133,6 +1687,523 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
                    OR signal.signal NOT IN ('👍', '👎')))
        LIMIT 1`,
       "canonical calibration signals must reference a human actor and same-room Agent message",
+    );
+  }
+  if (schemaVersion >= 6) {
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_executions AS execution
+       JOIN actors AS agent ON agent.id = execution.agent_id
+       LEFT JOIN actors AS requester ON requester.id = execution.requester_actor_id
+       LEFT JOIN messages AS source ON source.id = execution.source_message_id
+       LEFT JOIN messages AS result ON result.id = execution.result_message_id
+       WHERE agent.kind <> 'agent'
+          OR execution.requester_actor_id IS NULL
+          OR requester.id IS NULL OR requester.kind NOT IN ('human', 'agent')
+          OR execution.source_message_id IS NULL
+          OR source.id IS NULL OR source.room_id <> execution.room_id
+          OR (execution.result_message_id IS NOT NULL
+              AND (result.id IS NULL OR result.room_id <> execution.room_id
+                   OR result.author_id <> execution.agent_id OR result.author_kind <> 'agent'))
+          OR execution.state NOT IN ('queued', 'running', 'completed', 'failed', 'cancelled')
+          OR execution.action_category NOT IN ('model_generation', 'tool_call', 'waiting_upstream')
+          OR execution.current_attempt_seq < 1 OR execution.retry_cycle < 1
+          OR execution.current_attempt_seq > 9007199254740991 OR execution.retry_cycle > 9007199254740991
+          OR execution.retry_ordinal NOT BETWEEN 1 AND 3
+          OR execution.recovery_cursor NOT BETWEEN 0 AND 9007199254740991
+          OR execution.current_tool_id IS NOT NULL AND length(trim(execution.current_tool_id)) = 0
+          OR length(execution.queued_at) <> 24 OR strftime('%Y-%m-%dT%H:%M:%fZ', execution.queued_at) IS NOT execution.queued_at
+          OR length(execution.updated_at) <> 24 OR strftime('%Y-%m-%dT%H:%M:%fZ', execution.updated_at) IS NOT execution.updated_at
+          OR (execution.started_at IS NOT NULL AND (length(execution.started_at) <> 24 OR strftime('%Y-%m-%dT%H:%M:%fZ', execution.started_at) IS NOT execution.started_at))
+          OR (execution.completed_at IS NOT NULL AND (length(execution.completed_at) <> 24 OR strftime('%Y-%m-%dT%H:%M:%fZ', execution.completed_at) IS NOT execution.completed_at))
+          OR (execution.dead_lettered_at IS NOT NULL AND (length(execution.dead_lettered_at) <> 24 OR strftime('%Y-%m-%dT%H:%M:%fZ', execution.dead_lettered_at) IS NOT execution.dead_lettered_at))
+          OR (execution.cancellation_reason IS NOT NULL AND length(trim(execution.cancellation_reason)) = 0)
+          OR (execution.terminal_error_code IS NOT NULL AND length(trim(execution.terminal_error_code)) = 0)
+          OR execution.queued_at > execution.updated_at
+          OR (execution.started_at IS NOT NULL AND (execution.queued_at > execution.started_at OR execution.started_at > execution.updated_at))
+          OR (execution.completed_at IS NOT NULL AND (execution.queued_at > execution.completed_at
+              OR (execution.started_at IS NOT NULL AND execution.started_at > execution.completed_at)
+              OR execution.completed_at > execution.updated_at))
+          OR (execution.dead_lettered_at IS NOT NULL AND (execution.completed_at IS NULL
+              OR execution.completed_at > execution.dead_lettered_at OR execution.dead_lettered_at > execution.updated_at))
+          OR (execution.action_category = 'tool_call'
+              AND NOT ((execution.tool_dispatch_phase IS NULL AND execution.current_tool_id IS NULL)
+                       OR (execution.tool_dispatch_phase IS NOT NULL AND execution.current_tool_id IS NOT NULL)))
+          OR (execution.action_category <> 'tool_call'
+              AND (execution.tool_dispatch_phase IS NOT NULL OR execution.current_tool_id IS NOT NULL))
+          OR (execution.state = 'queued' AND (execution.started_at IS NOT NULL
+              OR execution.completed_at IS NOT NULL OR execution.cancellation_reason IS NOT NULL
+              OR execution.terminal_error_code IS NOT NULL OR execution.dead_lettered_at IS NOT NULL
+              OR execution.result_message_id IS NOT NULL
+              OR (execution.tool_dispatch_phase IS NOT NULL AND execution.tool_dispatch_phase <> 'not_started')))
+          OR (execution.state = 'running' AND (execution.started_at IS NULL
+              OR execution.completed_at IS NOT NULL OR execution.cancellation_reason IS NOT NULL
+              OR execution.terminal_error_code IS NOT NULL OR execution.dead_lettered_at IS NOT NULL
+              OR execution.result_message_id IS NOT NULL))
+          OR (execution.state = 'completed' AND (execution.started_at IS NULL
+              OR execution.completed_at IS NULL OR execution.cancellation_reason IS NOT NULL
+              OR execution.terminal_error_code IS NOT NULL OR execution.dead_lettered_at IS NOT NULL))
+          OR (execution.state = 'failed' AND (execution.started_at IS NULL
+              OR execution.completed_at IS NULL OR execution.cancellation_reason IS NOT NULL
+              OR execution.terminal_error_code IS NULL OR execution.result_message_id IS NOT NULL))
+          OR (execution.state = 'cancelled' AND (execution.completed_at IS NULL
+              OR execution.cancellation_reason IS NULL OR execution.terminal_error_code IS NOT NULL
+              OR execution.dead_lettered_at IS NOT NULL OR execution.result_message_id IS NOT NULL))
+       LIMIT 1`,
+      "v6 executions must be closed canonical records",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_execution_attempts AS attempt
+       LEFT JOIN agent_executions AS execution ON execution.id = attempt.execution_id
+       WHERE execution.id IS NULL
+          OR attempt.room_id <> execution.room_id
+          OR attempt.attempt_seq NOT BETWEEN 1 AND 9007199254740991
+          OR attempt.retry_cycle NOT BETWEEN 1 AND 9007199254740991
+          OR attempt.retry_ordinal NOT BETWEEN 1 AND 3
+          OR attempt.state NOT IN ('queued', 'running', 'completed', 'failed', 'cancelled')
+          OR attempt.action_category NOT IN ('model_generation', 'tool_call', 'waiting_upstream')
+          OR (attempt.action_category = 'tool_call' AND attempt.tool_dispatch_phase IS NOT NULL
+              AND attempt.tool_dispatch_phase NOT IN ('not_started', 'dispatched', 'finished'))
+          OR (attempt.action_category <> 'tool_call' AND attempt.tool_dispatch_phase IS NOT NULL)
+          OR (attempt.state = 'queued' AND (attempt.started_at IS NOT NULL
+              OR attempt.finished_at IS NOT NULL OR attempt.error_code IS NOT NULL))
+          OR (attempt.state = 'running' AND (attempt.started_at IS NULL
+              OR attempt.finished_at IS NOT NULL OR attempt.error_code IS NOT NULL))
+          OR (attempt.state = 'completed' AND (attempt.started_at IS NULL
+              OR attempt.finished_at IS NULL OR attempt.error_code IS NOT NULL))
+          OR (attempt.state = 'failed' AND (attempt.started_at IS NULL
+              OR attempt.finished_at IS NULL OR attempt.error_code IS NULL))
+          OR (attempt.state = 'cancelled' AND (attempt.finished_at IS NULL OR attempt.error_code IS NOT NULL))
+          OR attempt.recovery_cursor NOT BETWEEN 0 AND 9007199254740991
+          OR attempt.enqueue_stream_seq NOT BETWEEN 0 AND 9007199254740991
+          OR (attempt.state = 'queued' AND attempt.enqueue_stream_seq = 0)
+          OR (attempt.next_retry_at IS NOT NULL AND attempt.next_retry_at NOT BETWEEN 0 AND 9007199254740991)
+          OR (attempt.started_at IS NOT NULL AND (length(attempt.started_at) <> 24 OR strftime('%Y-%m-%dT%H:%M:%fZ', attempt.started_at) IS NOT attempt.started_at))
+          OR (attempt.finished_at IS NOT NULL AND (length(attempt.finished_at) <> 24 OR strftime('%Y-%m-%dT%H:%M:%fZ', attempt.finished_at) IS NOT attempt.finished_at))
+          OR (attempt.error_code IS NOT NULL AND length(trim(attempt.error_code)) = 0)
+          OR (attempt.attempt_seq = execution.current_attempt_seq
+              AND (attempt.retry_cycle <> execution.retry_cycle
+                   OR attempt.retry_ordinal <> execution.retry_ordinal
+                   OR attempt.state <> execution.state
+                   OR attempt.action_category <> execution.action_category
+                   OR attempt.tool_dispatch_phase IS NOT execution.tool_dispatch_phase
+                   OR attempt.recovery_cursor <> execution.recovery_cursor))
+       LIMIT 1`,
+      "v6 attempts must close and match their current execution",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_execution_attempts AS attempt
+       JOIN agent_executions AS execution ON execution.id = attempt.execution_id
+       WHERE attempt.attempt_seq > execution.current_attempt_seq
+          OR (attempt.attempt_seq < execution.current_attempt_seq
+              AND attempt.state NOT IN ('completed', 'failed', 'cancelled'))
+       LIMIT 1`,
+      "v6 attempt sequence must be closed below the current attempt",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_executions AS execution
+       LEFT JOIN agent_execution_attempts AS attempt
+         ON attempt.execution_id = execution.id
+        AND attempt.attempt_seq = execution.current_attempt_seq
+       WHERE attempt.execution_id IS NULL
+       LIMIT 1`,
+      "every v6 execution must have its current attempt",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_execution_steps AS step
+       JOIN agent_execution_attempts AS attempt
+         ON attempt.execution_id = step.execution_id
+        AND attempt.attempt_seq = step.attempt_seq
+       WHERE step.step_kind NOT IN ('model_generation', 'tool_call', 'tool_result')
+          OR (step.step_kind = 'model_generation'
+              AND (step.canonical_tool_call_json IS NOT NULL
+                   OR step.bounded_tool_result_json IS NOT NULL))
+          OR (step.step_kind = 'tool_call'
+              AND (step.canonical_tool_call_json IS NULL
+                   OR step.bounded_tool_result_json IS NOT NULL))
+          OR (step.step_kind = 'tool_result'
+              AND (step.canonical_tool_call_json IS NOT NULL
+                   OR step.bounded_tool_result_json IS NULL))
+          OR step.step_seq NOT BETWEEN 1 AND 9007199254740991
+          OR length(step.input_sha256) <> 64 OR step.input_sha256 GLOB '*[^0-9a-f]*'
+          OR length(step.output_sha256) <> 64 OR step.output_sha256 GLOB '*[^0-9a-f]*'
+          OR step.step_seq > attempt.recovery_cursor
+          OR length(step.completed_at) <> 24 OR strftime('%Y-%m-%dT%H:%M:%fZ', step.completed_at) IS NOT step.completed_at
+       LIMIT 1`,
+      "v6 checkpoints must be bounded by their attempt cursor",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM agent_tool_grants
+       WHERE length(issued_at) <> 24 OR strftime('%Y-%m-%dT%H:%M:%fZ', issued_at) IS NOT issued_at
+          OR length(expires_at) <> 24 OR strftime('%Y-%m-%dT%H:%M:%fZ', expires_at) IS NOT expires_at
+          OR (consumed_at IS NOT NULL AND (length(consumed_at) <> 24 OR strftime('%Y-%m-%dT%H:%M:%fZ', consumed_at) IS NOT consumed_at))
+       LIMIT 1`,
+      "v6 grants must use canonical timestamps",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM agent_tool_confirmations
+       WHERE length(expires_at) <> 24 OR strftime('%Y-%m-%dT%H:%M:%fZ', expires_at) IS NOT expires_at
+          OR (consumed_at IS NOT NULL AND (length(consumed_at) <> 24 OR strftime('%Y-%m-%dT%H:%M:%fZ', consumed_at) IS NOT consumed_at))
+       LIMIT 1`,
+      "v6 confirmations must use canonical timestamps",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM agent_tool_dispatches
+       WHERE length(dispatched_at) <> 24 OR strftime('%Y-%m-%dT%H:%M:%fZ', dispatched_at) IS NOT dispatched_at
+          OR (settled_at IS NOT NULL AND (length(settled_at) <> 24 OR strftime('%Y-%m-%dT%H:%M:%fZ', settled_at) IS NOT settled_at))
+          OR length(CAST(COALESCE(closed_summary, '') AS BLOB)) > 65536
+          OR length(CAST(COALESCE(sealed_compensation, '') AS BLOB)) > 65536
+       LIMIT 1`,
+      "v6 dispatches must use canonical timestamps and bounded settlement fields",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM agent_tool_dispatches
+       WHERE state = 'dispatched'
+       GROUP BY execution_id, attempt_seq
+       HAVING COUNT(*) > 1
+       LIMIT 1`,
+      "v6 attempts may have only one unsettled dispatch",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM agent_fence_replacements
+       WHERE length(created_at) <> 24 OR strftime('%Y-%m-%dT%H:%M:%fZ', created_at) IS NOT created_at
+       LIMIT 1`,
+      "v6 fences must use canonical timestamps",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_execution_attempts AS attempt
+       LEFT JOIN agent_execution_steps AS step
+         ON step.execution_id = attempt.execution_id AND step.attempt_seq = attempt.attempt_seq
+       GROUP BY attempt.execution_id, attempt.attempt_seq, attempt.recovery_cursor
+       HAVING (attempt.recovery_cursor = 0 AND COUNT(step.step_seq) <> 0)
+          OR (attempt.recovery_cursor > 0
+              AND (COUNT(step.step_seq) <> attempt.recovery_cursor
+                   OR MIN(step.step_seq) <> 1 OR MAX(step.step_seq) <> attempt.recovery_cursor))
+       LIMIT 1`,
+      "v6 attempt recovery cursors must exactly cover their own contiguous steps",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_execution_completions AS completion
+       JOIN agent_execution_attempts AS attempt
+         ON attempt.execution_id = completion.execution_id
+        AND attempt.attempt_seq = completion.attempt_seq
+       JOIN agent_executions AS execution ON execution.id = completion.execution_id
+       JOIN messages AS message ON message.id = completion.message_id
+       WHERE length(completion.request_hash) <> 64
+          OR completion.request_hash GLOB '*[^0-9a-f]*'
+          OR execution.state <> 'completed'
+          OR attempt.state <> 'completed'
+          OR execution.result_message_id <> completion.message_id
+          OR message.room_id <> execution.room_id
+          OR message.author_id <> execution.agent_id
+          OR message.author_kind <> 'agent'
+          OR length(completion.completed_at) <> 24
+          OR strftime('%Y-%m-%dT%H:%M:%fZ', completion.completed_at) IS NOT completion.completed_at
+       LIMIT 1`,
+      "v6 completion records must bind one completed Agent message and attempt",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_tool_grants AS grant
+       JOIN agent_execution_attempts AS attempt
+         ON attempt.execution_id = grant.execution_id
+        AND attempt.attempt_seq = grant.attempt_seq
+       JOIN agent_executions AS execution ON execution.id = grant.execution_id
+       JOIN actors AS agent ON agent.id = grant.agent_id
+       JOIN agent_execution_steps AS step
+         ON step.execution_id = grant.execution_id
+        AND step.attempt_seq = grant.attempt_seq
+        AND step.step_seq = grant.tool_call_step_seq
+       WHERE agent.kind <> 'agent' OR grant.agent_id <> execution.agent_id
+          OR grant.room_id <> execution.room_id OR length(grant.parameter_hash) <> 64
+          OR grant.parameter_hash GLOB '*[^0-9a-f]*'
+          OR length(grant.tool_plan_hash) <> 64 OR grant.tool_plan_hash GLOB '*[^0-9a-f]*'
+          OR step.step_kind <> 'tool_call'
+          OR json_extract(step.canonical_tool_call_json, '$.toolId') IS NOT grant.tool_id
+          OR step.output_sha256 IS NOT grant.parameter_hash
+          OR grant.confirmation_requirement NOT IN ('read_only', 'side_effect')
+       LIMIT 1`,
+      "v6 grants must bind the current execution identity",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_tool_confirmations AS confirmation
+       JOIN agent_execution_attempts AS attempt
+         ON attempt.execution_id = confirmation.execution_id
+        AND attempt.attempt_seq = confirmation.attempt_seq
+       JOIN agent_executions AS execution ON execution.id = confirmation.execution_id
+       JOIN actors AS principal ON principal.id = confirmation.human_principal_id
+       JOIN agent_tool_grants AS grant ON grant.id = confirmation.grant_id
+       WHERE principal.kind <> 'human' OR confirmation.room_id <> execution.room_id
+          OR confirmation.execution_id <> grant.execution_id
+          OR confirmation.attempt_seq <> grant.attempt_seq
+          OR confirmation.tool_id <> grant.tool_id
+          OR confirmation.parameter_hash <> grant.parameter_hash
+          OR length(confirmation.parameter_hash) <> 64
+          OR confirmation.parameter_hash GLOB '*[^0-9a-f]*'
+          OR confirmation.reversibility NOT IN ('compensatable', 'irreversible')
+       LIMIT 1`,
+      "v6 confirmations must bind human principal and execution room",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_tool_dispatches AS dispatch
+       JOIN agent_tool_grants AS grant ON grant.id = dispatch.grant_id
+       JOIN agent_execution_attempts AS attempt
+         ON attempt.execution_id = dispatch.execution_id
+        AND attempt.attempt_seq = dispatch.attempt_seq
+       WHERE dispatch.execution_id <> grant.execution_id
+          OR dispatch.attempt_seq <> grant.attempt_seq
+          OR dispatch.tool_id <> grant.tool_id
+          OR dispatch.parameter_hash <> grant.parameter_hash
+          OR length(dispatch.parameter_hash) <> 64 OR dispatch.parameter_hash GLOB '*[^0-9a-f]*'
+          OR dispatch.state NOT IN ('dispatched', 'succeeded', 'failed', 'outcome_unknown')
+          OR ((dispatch.state = 'dispatched') <> (dispatch.settled_at IS NULL))
+          OR (grant.confirmation_requirement = 'side_effect' AND NOT EXISTS (
+            SELECT 1 FROM agent_tool_confirmations AS confirmation
+            WHERE confirmation.grant_id = grant.id
+              AND confirmation.execution_id = dispatch.execution_id
+              AND confirmation.attempt_seq = dispatch.attempt_seq
+              AND confirmation.tool_id = dispatch.tool_id
+              AND confirmation.parameter_hash = dispatch.parameter_hash
+              AND confirmation.consumed_at IS NOT NULL
+          ))
+       LIMIT 1`,
+      "v6 dispatches must remain append-only grant facts",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_invocation_intents AS intent
+       JOIN agent_executions AS execution ON execution.id = intent.execution_id
+       JOIN actors AS target ON target.id = intent.target_agent_id
+       LEFT JOIN messages AS source ON source.id = intent.source_message_id
+       WHERE intent.intent_kind NOT IN ('direct_mention', 'structured_help', 'routed_candidate')
+          OR target.kind <> 'agent'
+          OR execution.source_message_id IS NULL
+          OR intent.target_agent_id <> execution.agent_id
+          OR intent.source_message_id <> execution.source_message_id
+          OR source.id IS NULL OR source.room_id <> execution.room_id
+          OR length(intent.created_at) <> 24
+          OR strftime('%Y-%m-%dT%H:%M:%fZ', intent.created_at) IS NOT intent.created_at
+       LIMIT 1`,
+      "v6 invocation intents must bind the execution target and source message",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_tool_grants AS grant
+       JOIN agent_execution_attempts AS attempt
+         ON attempt.execution_id = grant.execution_id
+        AND attempt.attempt_seq = grant.attempt_seq
+       JOIN agent_executions AS execution ON execution.id = grant.execution_id
+       WHERE (attempt.action_category NOT IN ('tool_call', 'waiting_upstream')
+              AND NOT (attempt.action_category = 'model_generation'
+                       AND EXISTS (
+                         SELECT 1 FROM agent_execution_steps AS step
+                         WHERE step.execution_id = grant.execution_id
+                           AND step.attempt_seq = grant.attempt_seq
+                           AND step.step_kind = 'tool_result'
+                       )
+                       AND EXISTS (
+                         SELECT 1 FROM agent_tool_dispatches AS result_dispatch
+                         WHERE result_dispatch.grant_id = grant.id
+                           AND ((grant.confirmation_requirement = 'read_only'
+                                 AND result_dispatch.state <> 'dispatched')
+                                OR (grant.confirmation_requirement = 'side_effect'
+                                    AND result_dispatch.state IN ('succeeded', 'failed')))
+                       )))
+          OR grant.agent_id <> execution.agent_id OR grant.room_id <> execution.room_id
+          OR (grant.confirmation_requirement = 'read_only'
+              AND attempt.action_category <> 'tool_call'
+              AND NOT (attempt.action_category = 'model_generation'
+                       AND EXISTS (
+                         SELECT 1 FROM agent_execution_steps AS step
+                         WHERE step.execution_id = grant.execution_id
+                           AND step.attempt_seq = grant.attempt_seq
+                           AND step.step_kind = 'tool_result'
+                       )))
+          OR (grant.confirmation_requirement = 'side_effect'
+              AND attempt.action_category NOT IN ('waiting_upstream', 'tool_call')
+              AND NOT (attempt.action_category = 'model_generation'
+                       AND EXISTS (
+                         SELECT 1 FROM agent_execution_steps AS step
+                         WHERE step.execution_id = grant.execution_id
+                           AND step.attempt_seq = grant.attempt_seq
+                           AND step.step_kind = 'tool_result'
+                       )
+                       AND EXISTS (
+                         SELECT 1 FROM agent_tool_dispatches AS result_dispatch
+                         WHERE result_dispatch.grant_id = grant.id
+                           AND result_dispatch.state IN ('succeeded', 'failed')
+                       )))
+       LIMIT 1`,
+      "v6 grants require a matching tool-call attempt",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_tool_dispatches AS dispatch
+       JOIN agent_tool_grants AS grant ON grant.id = dispatch.grant_id
+       JOIN agent_execution_attempts AS attempt
+         ON attempt.execution_id = dispatch.execution_id
+        AND attempt.attempt_seq = dispatch.attempt_seq
+       WHERE NOT (
+         (attempt.action_category = 'tool_call'
+          AND attempt.tool_dispatch_phase IN ('dispatched', 'finished'))
+         OR (dispatch.state IN ('succeeded', 'failed')
+             AND EXISTS (
+               SELECT 1 FROM agent_execution_steps AS step
+               WHERE step.execution_id = dispatch.execution_id
+                 AND step.attempt_seq = dispatch.attempt_seq
+                 AND step.step_kind = 'tool_result'
+                 AND step.dispatch_id = dispatch.id
+             ))
+         OR (dispatch.state = 'outcome_unknown'
+             AND attempt.state = 'failed'
+             AND attempt.error_code = 'side_effect_outcome_unknown')
+       )
+       LIMIT 1`,
+      "v6 dispatches require a dispatched or finished tool attempt",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_executions AS execution
+       LEFT JOIN agent_executions AS manual ON manual.id = execution.manual_retry_of_execution_id
+       LEFT JOIN agent_executions AS compensation ON compensation.id = execution.compensates_execution_id
+       WHERE ((execution.manual_retry_of_execution_id IS NOT NULL)
+              + (execution.compensates_execution_id IS NOT NULL)
+              + (json_array_length(execution.supersedes_execution_ids_json) > 0)) > 1
+          OR execution.manual_retry_of_execution_id = execution.id
+          OR execution.compensates_execution_id = execution.id
+          OR (execution.manual_retry_of_execution_id IS NOT NULL
+              AND (manual.id IS NULL OR manual.state <> 'failed'
+                   OR manual.dead_lettered_at IS NULL))
+          OR (execution.compensates_execution_id IS NOT NULL
+              AND (compensation.id IS NULL
+                   OR compensation.state NOT IN ('completed', 'failed', 'cancelled')))
+          OR NOT json_valid(execution.supersedes_execution_ids_json)
+          OR json_type(execution.supersedes_execution_ids_json) <> 'array'
+          OR length(CAST(execution.supersedes_execution_ids_json AS BLOB)) > 65536
+          OR CASE WHEN json_valid(execution.supersedes_execution_ids_json)
+                  THEN json_array_length(execution.supersedes_execution_ids_json) > 256 ELSE 1 END
+          OR EXISTS (
+            SELECT 1
+            FROM json_each(execution.supersedes_execution_ids_json) AS supersedes
+            LEFT JOIN agent_executions AS old ON old.id = supersedes.value
+            WHERE supersedes.type <> 'text'
+               OR length(supersedes.value) = 0
+               OR supersedes.value = execution.id
+               OR old.id IS NULL OR old.state <> 'cancelled'
+          )
+          OR EXISTS (
+            SELECT 1 FROM json_each(execution.supersedes_execution_ids_json)
+            GROUP BY value HAVING COUNT(*) > 1
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM json_each(execution.supersedes_execution_ids_json) AS supersedes
+            WHERE NOT EXISTS (
+              SELECT 1 FROM agent_fence_replacements AS fence
+              WHERE fence.replacement_execution_id = execution.id
+                AND fence.old_execution_id = supersedes.value
+            )
+          )
+       LIMIT 1`,
+      "v6 execution lineage must be unique, non-self, and terminally closed",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_compensation_requests AS request
+       JOIN agent_executions AS execution ON execution.id = request.execution_id
+       JOIN agent_executions AS original ON original.id = request.original_execution_id
+       JOIN agent_tool_dispatches AS dispatch ON dispatch.id = request.original_dispatch_id
+       JOIN agent_tool_grants AS grant ON grant.id = dispatch.grant_id
+       JOIN agent_tool_confirmations AS confirmation ON confirmation.grant_id = grant.id
+       WHERE execution.compensates_execution_id <> request.original_execution_id
+          OR execution.requester_actor_id <> request.requester_actor_id
+          OR original.state NOT IN ('completed', 'failed', 'cancelled')
+          OR dispatch.execution_id <> request.original_execution_id
+          OR dispatch.state <> 'succeeded'
+          OR dispatch.sealed_compensation IS NULL
+          OR length(trim(dispatch.sealed_compensation)) = 0
+          OR confirmation.reversibility <> 'compensatable'
+          OR NOT EXISTS (
+            SELECT 1 FROM sessions AS session
+            WHERE session.family_id = request.session_family_id
+              AND session.actor_id = request.requester_actor_id
+          )
+       LIMIT 1`,
+      "v6 compensation requests must bind one terminal compensatable side effect",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_fence_replacements AS fence
+       JOIN agent_execution_attempts AS old_attempt
+         ON old_attempt.execution_id = fence.old_execution_id
+        AND old_attempt.attempt_seq = fence.old_attempt_seq
+       JOIN agent_executions AS old_execution ON old_execution.id = fence.old_execution_id
+       JOIN messages AS message ON message.id = fence.fence_message_id
+       LEFT JOIN actors AS selected ON selected.id = fence.selected_agent_id
+       LEFT JOIN agent_judgments AS judgment ON judgment.id = fence.expected_judgment_id
+       LEFT JOIN agent_executions AS replacement ON replacement.id = fence.replacement_execution_id
+       LEFT JOIN agent_execution_attempts AS replacement_attempt
+         ON replacement_attempt.execution_id = replacement.id
+        AND replacement_attempt.attempt_seq = replacement.current_attempt_seq
+       WHERE old_execution.state <> 'cancelled' OR old_attempt.state <> 'cancelled'
+          OR NOT (
+            old_attempt.started_at IS NULL
+            OR old_attempt.action_category = 'waiting_upstream'
+            OR (old_attempt.action_category = 'tool_call'
+                AND old_attempt.tool_dispatch_phase = 'not_started')
+          )
+          OR message.author_kind <> 'human' OR message.room_id <> old_execution.room_id
+          OR (fence.selected_agent_id IS NOT NULL
+              AND (selected.id IS NULL OR selected.kind <> 'agent'))
+          OR (fence.expected_judgment_id IS NOT NULL
+              AND (judgment.id IS NULL OR judgment.room_id <> old_execution.room_id
+                   OR judgment.agent_id <> fence.selected_agent_id
+                   OR judgment.message_id <> fence.fence_message_id
+                   OR NOT json_valid(judgment.judgment_json)
+                   OR json_extract(judgment.judgment_json, '$.outcome') IS NOT 'will_respond'))
+          OR (fence.replacement_execution_id IS NOT NULL
+              AND (replacement.id IS NULL OR replacement.room_id <> old_execution.room_id
+                   OR replacement.agent_id <> fence.selected_agent_id
+                   OR replacement.state <> 'queued'
+                   OR replacement.current_attempt_seq <> 1
+                   OR replacement.retry_ordinal <> 1
+                   OR replacement_attempt.execution_id IS NULL
+                   OR replacement_attempt.state <> 'queued'
+                   OR NOT EXISTS (
+                     SELECT 1 FROM json_each(replacement.supersedes_execution_ids_json)
+                     WHERE value = fence.old_execution_id
+                   )))
+       LIMIT 1`,
+      "v6 fences must close the old attempt before a same-room replacement",
     );
   }
 }
@@ -1168,9 +2239,10 @@ function validateExistingSchema(database: DatabaseSync, currentVersion: number):
   }
   const expectedFingerprint =
     SCHEMA_FINGERPRINTS[currentVersion as keyof typeof SCHEMA_FINGERPRINTS];
-  if (readSchemaFingerprint(database) !== expectedFingerprint) {
+  const actualFingerprint = readSchemaFingerprint(database);
+  if (actualFingerprint !== expectedFingerprint) {
     throw new Error(
-      `Refusing unknown schema physical contract at version ${currentVersion}`,
+      `Refusing unknown schema physical contract at version ${currentVersion} (${actualFingerprint})`,
     );
   }
 
@@ -1293,6 +2365,12 @@ export function migrateAuthorityDatabaseToPreviousVersionForTest(
   database: DatabaseSync,
 ): void {
   migrateAuthorityDatabaseToVersion(database, AUTHORITY_SCHEMA_VERSION - 1);
+}
+
+export function migrateAuthorityDatabaseToVersion4ForTest(
+  database: DatabaseSync,
+): void {
+  migrateAuthorityDatabaseToVersion(database, 4);
 }
 
 export function migrateAuthorityDatabaseToVersion3ForTest(

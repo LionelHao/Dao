@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { BigIntStats } from "node:fs";
 import { lstat, readdir, readFile, readlink, realpath, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
@@ -28,6 +29,29 @@ import type {
 } from "./legacy-importer.js";
 import type {
   AgentCollaborationCommand,
+  AgentInvocationInput,
+  AgentRuntimeRecoveryPage,
+  AgentRuntimeRecoveryPageInput,
+  AgentRuntimeProviderContext,
+  CommitExecutionStepInput,
+  CompleteExecutionInput,
+  CompleteCompensationInput,
+  FailExecutionInput,
+  ScheduleRetryInput,
+  InterruptExecutionInput,
+  PrepareToolInput,
+  ToolGrant,
+  ToolConfirmationInput,
+  ToolConfirmation,
+  ResumeConfirmedToolInput,
+  ResumedToolDispatch,
+  DispatchToolInput,
+  SettleToolInput,
+  ToolDispatch,
+  AgentRuntimeCompensationWork,
+  ResumeAgentRuntimeCompensationInput,
+  CancelForHumanFenceInput,
+  AgentWorkerCommandContext,
   AuthenticatedSessionContext,
   AuthenticatedCommandContext,
   CommandAcknowledgement,
@@ -35,6 +59,8 @@ import type {
   HashedSessionRotation,
   HumanCollaborationCommand,
   InternalAgentCommandContext,
+  InternalAgentRuntimeContext,
+  JsonValue,
   IssuedSessionRecord,
   OutboxDelivery,
   OutboxDeliveryFailureReason,
@@ -47,6 +73,7 @@ import type {
 import {
   ROOM_SYNC_DEFAULT_LIMIT,
   toAgentWorkerCommandContext,
+  toAgentRuntimeWorkerContext,
 } from "./contracts.js";
 
 export interface CreateWorkerDatabaseClientOptions {
@@ -54,7 +81,7 @@ export interface CreateWorkerDatabaseClientOptions {
 }
 
 export interface AuthoritySchemaInspection {
-  readonly version: 5;
+  readonly version: 6;
 }
 
 export interface WorkerDatabaseClient {
@@ -88,6 +115,41 @@ export interface WorkerDatabaseClient {
     command: AgentCollaborationCommand,
     now: number,
   ): Promise<CommandAcknowledgement>;
+  invokeAgentRuntime(
+    context: AuthenticatedCommandContext | InternalAgentCommandContext,
+    input: AgentInvocationInput,
+    now: number,
+    maxQueuedPerRoom?: number,
+  ): Promise<import("@native-im/core").AgentExecution>;
+  claimNextAgentRuntime(
+    runtime: InternalAgentRuntimeContext,
+    roomId: string,
+    now: number,
+  ): Promise<import("@native-im/core").AgentExecution | undefined>;
+  commitAgentRuntimeStep(runtime: InternalAgentRuntimeContext, input: CommitExecutionStepInput): Promise<import("@native-im/core").AgentExecution>;
+  completeAgentRuntimeExecution(runtime: InternalAgentRuntimeContext, input: CompleteExecutionInput): Promise<import("@native-im/core").AgentExecution>;
+  completeAgentRuntimeCompensation(runtime: InternalAgentRuntimeContext, input: CompleteCompensationInput): Promise<import("@native-im/core").AgentExecution>;
+  scheduleAgentRuntimeRetry(runtime: InternalAgentRuntimeContext, input: ScheduleRetryInput): Promise<import("@native-im/core").AgentExecution>;
+  failAgentRuntimeExecution(runtime: InternalAgentRuntimeContext, input: FailExecutionInput): Promise<import("@native-im/core").AgentExecution>;
+  interruptAgentRuntime(context: AuthenticatedCommandContext, input: InterruptExecutionInput, now: number): Promise<import("@native-im/core").AgentExecution>;
+  manualRetryAgentRuntime(context: AuthenticatedCommandContext, executionId: string, now: number, maxQueuedPerRoom?: number): Promise<import("@native-im/core").AgentExecution>;
+  compensateAgentRuntime(context: AuthenticatedCommandContext, executionId: string, dispatchId: string, now: number, maxQueuedPerRoom?: number): Promise<import("@native-im/core").AgentExecution>;
+  resumeAgentRuntimeCompensation(runtime: InternalAgentRuntimeContext, input: ResumeAgentRuntimeCompensationInput): Promise<AgentRuntimeCompensationWork>;
+  recoverAgentRuntimePage(
+    runtime: InternalAgentRuntimeContext,
+    input: AgentRuntimeRecoveryPageInput,
+  ): Promise<AgentRuntimeRecoveryPage>;
+  prepareAgentRuntimeTool(runtime: InternalAgentRuntimeContext, input: PrepareToolInput): Promise<ToolGrant>;
+  confirmAgentRuntimeTool(context: AuthenticatedCommandContext, input: ToolConfirmationInput, now: number): Promise<ToolConfirmation>;
+  resumeConfirmedAgentRuntimeTool(runtime: InternalAgentRuntimeContext, input: ResumeConfirmedToolInput): Promise<ResumedToolDispatch>;
+  dispatchAgentRuntimeTool(runtime: InternalAgentRuntimeContext, input: DispatchToolInput): Promise<ToolDispatch>;
+  settleAgentRuntimeTool(runtime: InternalAgentRuntimeContext, input: SettleToolInput): Promise<ToolDispatch>;
+  readAgentRuntimeExecution(context: AuthenticatedSessionContext, executionId: string, now: number): Promise<import("@native-im/core").AgentExecution>;
+  loadAgentRuntimeProviderContext(
+    runtime: InternalAgentRuntimeContext,
+    executionId: string,
+  ): Promise<AgentRuntimeProviderContext>;
+  cancelAgentRuntimeForHumanFence(runtime: InternalAgentRuntimeContext, input: CancelForHumanFenceInput): Promise<import("@native-im/core").AgentExecution>;
   readHistory(
     context: AuthenticatedSessionContext,
     roomId: string,
@@ -209,6 +271,7 @@ function authorityWorkerClientErrorStatus(
     case "token_expired":
       return 401;
     case "agent_missing_permission":
+    case "agent_capability_forbidden":
     case "identity_forbidden":
     case "invitation_forbidden":
     case "room_forbidden":
@@ -240,8 +303,10 @@ function authorityWorkerClientErrorStatus(
     case "snapshot_forbidden":
       return 403;
     case "snapshot_expired":
+    case "confirmation_expired":
       return 410;
     case "snapshot_busy":
+    case "target_busy":
       return 429;
     case "authority_not_initialized":
     case "authority_worker_closed":
@@ -313,6 +378,18 @@ function hasExactKeys(
     actualKeys.length === sortedExpectedKeys.length &&
     actualKeys.every((key, index) => key === sortedExpectedKeys[index])
   );
+}
+
+function canonicalRuntimeJson(value: JsonValue): string {
+  if (value === null || typeof value === "boolean" || typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalRuntimeJson).join(",")}]`;
+  const record = value as { readonly [key: string]: JsonValue };
+  return `{${Object.keys(record).sort().map((key) =>
+    `${JSON.stringify(key)}:${canonicalRuntimeJson(record[key] as JsonValue)}`
+  ).join(",")}}`;
 }
 
 function roomSyncResultMatchesRequest(
@@ -942,6 +1019,489 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
     });
   }
 
+  invokeAgentRuntime(
+    context: AuthenticatedCommandContext | InternalAgentCommandContext,
+    input: AgentInvocationInput,
+    now: number,
+    maxQueuedPerRoom?: number,
+  ): Promise<import("@native-im/core").AgentExecution> {
+    let wireContext: AuthenticatedCommandContext | AgentWorkerCommandContext;
+    try {
+      wireContext = context.kind === "human"
+        ? context
+        : toAgentWorkerCommandContext(context);
+    } catch (error: unknown) {
+      return Promise.reject(error);
+    }
+    return this.#send({
+      type: "authority.agent-runtime.invoke",
+      context: wireContext,
+      input,
+      now,
+      ...(maxQueuedPerRoom === undefined ? {} : { maxQueuedPerRoom }),
+    })
+      .then((response) => {
+        if (response.type !== "authority.agent-runtime.invoked") {
+          this.#failProtocol("Authority worker returned the wrong Agent runtime invoke response");
+          throw this.#terminalError;
+        }
+        if (
+          response.execution.roomId !== input.roomId ||
+          response.execution.sourceMessageId !== input.sourceMessageId ||
+          response.execution.agentId !== input.targetAgentId ||
+          response.execution.providerId !== input.providerId ||
+          response.execution.modelId !== input.modelId
+        ) {
+          this.#failProtocol("Authority worker returned a mismatched Agent runtime invocation");
+          throw this.#terminalError;
+        }
+        return response.execution;
+      });
+  }
+
+  commitAgentRuntimeStep(
+    runtime: InternalAgentRuntimeContext,
+    input: CommitExecutionStepInput,
+  ): Promise<import("@native-im/core").AgentExecution> {
+    let wireRuntime: ReturnType<typeof toAgentRuntimeWorkerContext>;
+    try { wireRuntime = toAgentRuntimeWorkerContext(runtime); } catch (error: unknown) { return Promise.reject(error); }
+    return this.#send({ type: "authority.agent-runtime.commit-step", runtime: wireRuntime, input }).then((response) => {
+      if (response.type !== "authority.agent-runtime.step-committed") {
+        this.#failProtocol("Authority worker returned the wrong Agent runtime checkpoint response");
+        throw this.#terminalError;
+      }
+      if (response.execution.id !== input.executionId ||
+          response.execution.currentAttemptSeq !== input.attemptSeq ||
+          response.execution.agentId !== runtime.agentId) {
+        this.#failProtocol("Authority worker returned a mismatched Agent runtime checkpoint");
+        throw this.#terminalError;
+      }
+      return response.execution;
+    });
+  }
+
+  completeAgentRuntimeExecution(
+    runtime: InternalAgentRuntimeContext,
+    input: CompleteExecutionInput,
+  ): Promise<import("@native-im/core").AgentExecution> {
+    let wireRuntime: ReturnType<typeof toAgentRuntimeWorkerContext>;
+    try { wireRuntime = toAgentRuntimeWorkerContext(runtime); } catch (error: unknown) { return Promise.reject(error); }
+    return this.#send({ type: "authority.agent-runtime.complete-execution", runtime: wireRuntime, input })
+      .then((response) => {
+        if (response.type !== "authority.agent-runtime.execution-completed") {
+          this.#failProtocol("Authority worker returned the wrong Agent runtime completion response");
+          throw this.#terminalError;
+        }
+        if (response.execution.id !== input.executionId ||
+            response.execution.currentAttemptSeq !== input.attemptSeq ||
+            response.execution.agentId !== runtime.agentId) {
+          this.#failProtocol("Authority worker returned a mismatched Agent runtime completion");
+          throw this.#terminalError;
+        }
+        return response.execution;
+      });
+  }
+
+  completeAgentRuntimeCompensation(
+    runtime: InternalAgentRuntimeContext,
+    input: CompleteCompensationInput,
+  ): Promise<import("@native-im/core").AgentExecution> {
+    let wireRuntime: ReturnType<typeof toAgentRuntimeWorkerContext>;
+    try { wireRuntime = toAgentRuntimeWorkerContext(runtime); } catch (error: unknown) { return Promise.reject(error); }
+    return this.#send({ type: "authority.agent-runtime.complete-compensation", runtime: wireRuntime, input })
+      .then((response) => {
+        if (response.type !== "authority.agent-runtime.compensation-completed") {
+          this.#failProtocol("Authority worker returned the wrong Agent runtime compensation completion response");
+          throw this.#terminalError;
+        }
+        if (response.execution.id !== input.executionId ||
+            response.execution.currentAttemptSeq !== input.attemptSeq ||
+            response.execution.agentId !== runtime.agentId ||
+            response.execution.status !== "completed" ||
+            response.execution.resultMessageId !== input.messageId) {
+          this.#failProtocol("Authority worker returned a mismatched Agent runtime compensation completion");
+          throw this.#terminalError;
+        }
+        return response.execution;
+      });
+  }
+
+  scheduleAgentRuntimeRetry(
+    runtime: InternalAgentRuntimeContext,
+    input: ScheduleRetryInput,
+  ): Promise<import("@native-im/core").AgentExecution> {
+    let wireRuntime: ReturnType<typeof toAgentRuntimeWorkerContext>;
+    try { wireRuntime = toAgentRuntimeWorkerContext(runtime); } catch (error: unknown) { return Promise.reject(error); }
+    return this.#send({ type: "authority.agent-runtime.schedule-retry", runtime: wireRuntime, input }).then((response) => {
+      if (response.type !== "authority.agent-runtime.retry-scheduled") {
+        this.#failProtocol("Authority worker returned the wrong Agent runtime retry response");
+        throw this.#terminalError;
+      }
+      if (response.execution.id !== input.executionId || response.execution.agentId !== runtime.agentId) {
+        this.#failProtocol("Authority worker returned a mismatched Agent runtime retry");
+        throw this.#terminalError;
+      }
+      return response.execution;
+    });
+  }
+
+  failAgentRuntimeExecution(
+    runtime: InternalAgentRuntimeContext,
+    input: FailExecutionInput,
+  ): Promise<import("@native-im/core").AgentExecution> {
+    let wireRuntime: ReturnType<typeof toAgentRuntimeWorkerContext>;
+    try { wireRuntime = toAgentRuntimeWorkerContext(runtime); } catch (error: unknown) { return Promise.reject(error); }
+    return this.#send({ type: "authority.agent-runtime.fail-execution", runtime: wireRuntime, input }).then((response) => {
+      if (response.type !== "authority.agent-runtime.execution-failed") {
+        this.#failProtocol("Authority worker returned the wrong Agent runtime terminal response");
+        throw this.#terminalError;
+      }
+      if (response.execution.id !== input.executionId ||
+          response.execution.currentAttemptSeq !== input.attemptSeq ||
+          response.execution.agentId !== runtime.agentId) {
+        this.#failProtocol("Authority worker returned a mismatched Agent runtime terminal result");
+        throw this.#terminalError;
+      }
+      return response.execution;
+    });
+  }
+
+  interruptAgentRuntime(
+    context: AuthenticatedCommandContext,
+    input: InterruptExecutionInput,
+    now: number,
+  ): Promise<import("@native-im/core").AgentExecution> {
+    return this.#send({ type: "authority.agent-runtime.interrupt", context, input, now }).then((response) => {
+      if (response.type !== "authority.agent-runtime.interrupted") {
+        this.#failProtocol("Authority worker returned the wrong Agent runtime interrupt response");
+        throw this.#terminalError;
+      }
+      if (response.execution.id !== input.executionId) {
+        this.#failProtocol("Authority worker returned a mismatched Agent runtime interruption");
+        throw this.#terminalError;
+      }
+      return response.execution;
+    });
+  }
+
+  manualRetryAgentRuntime(
+    context: AuthenticatedCommandContext,
+    executionId: string,
+    now: number,
+    maxQueuedPerRoom?: number,
+  ): Promise<import("@native-im/core").AgentExecution> {
+    return this.#send({
+      type: "authority.agent-runtime.manual-retry", context, executionId, now,
+      ...(maxQueuedPerRoom === undefined ? {} : { maxQueuedPerRoom }),
+    }).then((response) => {
+      if (response.type !== "authority.agent-runtime.manual-retried") {
+        this.#failProtocol("Authority worker returned the wrong Agent runtime manual retry response");
+        throw this.#terminalError;
+      }
+      if (response.execution.id === executionId || response.execution.manualRetryOfExecutionId !== executionId) {
+        this.#failProtocol("Authority worker returned a mismatched Agent runtime manual retry");
+        throw this.#terminalError;
+      }
+      return response.execution;
+    });
+  }
+
+  compensateAgentRuntime(
+    context: AuthenticatedCommandContext,
+    executionId: string,
+    dispatchId: string,
+    now: number,
+    maxQueuedPerRoom?: number,
+  ): Promise<import("@native-im/core").AgentExecution> {
+    return this.#send({
+      type: "authority.agent-runtime.compensate", context, executionId, dispatchId, now,
+      ...(maxQueuedPerRoom === undefined ? {} : { maxQueuedPerRoom }),
+    }).then((response) => {
+      if (response.type !== "authority.agent-runtime.compensation-accepted") {
+        this.#failProtocol("Authority worker returned the wrong Agent runtime compensation response");
+        throw this.#terminalError;
+      }
+      if (response.execution.id === executionId ||
+          response.execution.compensatesExecutionId !== executionId) {
+        this.#failProtocol("Authority worker returned a mismatched Agent runtime compensation");
+        throw this.#terminalError;
+      }
+      return response.execution;
+    });
+  }
+
+  resumeAgentRuntimeCompensation(
+    runtime: InternalAgentRuntimeContext,
+    input: ResumeAgentRuntimeCompensationInput,
+  ): Promise<AgentRuntimeCompensationWork> {
+    let wireRuntime: ReturnType<typeof toAgentRuntimeWorkerContext>;
+    try { wireRuntime = toAgentRuntimeWorkerContext(runtime); } catch (error: unknown) { return Promise.reject(error); }
+    return this.#send({ type: "authority.agent-runtime.resume-compensation", runtime: wireRuntime, input })
+      .then((response) => {
+        if (response.type !== "authority.agent-runtime.compensation-resumed") {
+          this.#failProtocol("Authority worker returned the wrong Agent runtime compensation work");
+          throw this.#terminalError;
+        }
+        const { work } = response;
+        if (work.execution.id !== input.executionId ||
+            work.execution.currentAttemptSeq !== input.attemptSeq ||
+            work.execution.agentId !== runtime.agentId ||
+            work.execution.status !== "running" ||
+            work.execution.actionCategory !== "tool_call" ||
+            work.execution.toolDispatchPhase !== "dispatched" ||
+            work.dispatch.executionId !== input.executionId ||
+            work.dispatch.attemptSeq !== input.attemptSeq ||
+            work.dispatch.state !== "dispatched" ||
+            work.dispatch.toolId !== work.execution.currentToolId ||
+            createHash("sha256").update(work.sealedCompensation).digest("hex") !==
+              work.dispatch.parameterHash) {
+          this.#failProtocol("Authority worker returned mismatched Agent runtime compensation work");
+          throw this.#terminalError;
+        }
+        return work;
+      });
+  }
+
+  recoverAgentRuntimePage(
+    runtime: InternalAgentRuntimeContext,
+    input: AgentRuntimeRecoveryPageInput,
+  ): Promise<AgentRuntimeRecoveryPage> {
+    let wireRuntime: ReturnType<typeof toAgentRuntimeWorkerContext>;
+    try { wireRuntime = toAgentRuntimeWorkerContext(runtime); } catch (error: unknown) { return Promise.reject(error); }
+    return this.#send({ type: "authority.agent-runtime.recover", runtime: wireRuntime, input }).then((response) => {
+      if (response.type !== "authority.agent-runtime.recovered") {
+        this.#failProtocol("Authority worker returned the wrong Agent runtime recovery response");
+        throw this.#terminalError;
+      }
+      if (response.page.recoveries.length > input.limit) {
+        this.#failProtocol("Authority worker exceeded the requested Agent runtime recovery page limit");
+        throw this.#terminalError;
+      }
+      if (response.page.recoveries.some(({ execution }) => execution.agentId !== runtime.agentId)) {
+        this.#failProtocol("Authority worker returned another Agent's recovery result");
+        throw this.#terminalError;
+      }
+      return response.page;
+    });
+  }
+
+  prepareAgentRuntimeTool(runtime: InternalAgentRuntimeContext, input: PrepareToolInput): Promise<ToolGrant> {
+    let wireRuntime: ReturnType<typeof toAgentRuntimeWorkerContext>;
+    try { wireRuntime = toAgentRuntimeWorkerContext(runtime); } catch (error: unknown) { return Promise.reject(error); }
+    return this.#send({ type: "authority.agent-runtime.prepare-tool", runtime: wireRuntime, input }).then((response) => {
+      if (response.type !== "authority.agent-runtime.tool-prepared") {
+        this.#failProtocol("Authority worker returned the wrong Agent runtime tool preparation response");
+        throw this.#terminalError;
+      }
+      if (response.grant.executionId !== input.executionId ||
+          response.grant.attemptSeq !== input.attemptSeq ||
+          response.grant.agentId !== runtime.agentId ||
+          response.grant.toolCallStepSeq !== input.toolCallStepSeq ||
+          response.grant.toolId !== input.toolId ||
+          response.grant.parameterHash !== input.parameterHash ||
+          response.grant.toolPlanHash !== input.toolPlanHash ||
+          response.grant.confirmationRequirement !== input.confirmationRequirement) {
+        this.#failProtocol("Authority worker returned a mismatched Agent runtime tool grant");
+        throw this.#terminalError;
+      }
+      return response.grant;
+    });
+  }
+
+  confirmAgentRuntimeTool(
+    context: AuthenticatedCommandContext,
+    input: ToolConfirmationInput,
+    now: number,
+  ): Promise<ToolConfirmation> {
+    return this.#send({ type: "authority.agent-runtime.confirm-tool", context, input, now }).then((response) => {
+      if (response.type !== "authority.agent-runtime.tool-confirmed") {
+        this.#failProtocol("Authority worker returned the wrong Agent runtime tool confirmation response");
+        throw this.#terminalError;
+      }
+      if (response.confirmation.executionId !== input.executionId ||
+          response.confirmation.attemptSeq !== input.attemptSeq ||
+          response.confirmation.toolId !== input.toolId ||
+          response.confirmation.parameterHash !== input.parameterHash ||
+          !/^[0-9a-f]{64}$/.test(response.confirmation.toolPlanHash)) {
+        this.#failProtocol("Authority worker returned a mismatched Agent runtime confirmation");
+        throw this.#terminalError;
+      }
+      return response.confirmation;
+    });
+  }
+
+  resumeConfirmedAgentRuntimeTool(
+    runtime: InternalAgentRuntimeContext,
+    input: ResumeConfirmedToolInput,
+  ): Promise<ResumedToolDispatch> {
+    let wireRuntime: ReturnType<typeof toAgentRuntimeWorkerContext>;
+    try { wireRuntime = toAgentRuntimeWorkerContext(runtime); } catch (error: unknown) { return Promise.reject(error); }
+    return this.#send({
+      type: "authority.agent-runtime.resume-confirmed-tool",
+      runtime: wireRuntime,
+      input,
+    }).then((response) => {
+      if (response.type !== "authority.agent-runtime.confirmed-tool-resumed") {
+        this.#failProtocol("Authority worker returned the wrong confirmed tool resume response");
+        throw this.#terminalError;
+      }
+      if (response.resumed.execution.id !== response.resumed.dispatch.executionId ||
+          response.resumed.confirmationId !== input.confirmationId ||
+          response.resumed.execution.id !== input.executionId ||
+          response.resumed.execution.roomId !== input.roomId ||
+          response.resumed.execution.agentId !== runtime.agentId ||
+          response.resumed.execution.currentAttemptSeq !== input.attemptSeq ||
+          response.resumed.execution.currentAttemptSeq !== response.resumed.dispatch.attemptSeq ||
+          response.resumed.execution.status !== "running" ||
+          response.resumed.execution.actionCategory !== "tool_call" ||
+          response.resumed.execution.toolDispatchPhase !== "dispatched" ||
+          response.resumed.execution.currentToolId !== input.toolId ||
+          response.resumed.dispatch.state !== "dispatched" ||
+          response.resumed.dispatch.toolId !== input.toolId ||
+          response.resumed.dispatch.parameterHash !== input.parameterHash ||
+          response.resumed.toolPlanHash !== input.toolPlanHash ||
+          createHash("sha256").update(canonicalRuntimeJson(response.resumed.parameters), "utf8").digest("hex") !==
+            response.resumed.dispatch.parameterHash ||
+          createHash("sha256").update(canonicalRuntimeJson({
+            toolId: input.toolId,
+            parameters: response.resumed.parameters,
+            remainingCalls: response.resumed.remainingCalls,
+          } as unknown as JsonValue), "utf8").digest("hex") !== response.resumed.toolPlanHash) {
+        this.#failProtocol("Authority worker returned a mismatched confirmed tool resume response");
+        throw this.#terminalError;
+      }
+      return response.resumed;
+    });
+  }
+
+  dispatchAgentRuntimeTool(runtime: InternalAgentRuntimeContext, input: DispatchToolInput): Promise<ToolDispatch> {
+    let wireRuntime: ReturnType<typeof toAgentRuntimeWorkerContext>;
+    try { wireRuntime = toAgentRuntimeWorkerContext(runtime); } catch (error: unknown) { return Promise.reject(error); }
+    return this.#send({ type: "authority.agent-runtime.dispatch-tool", runtime: wireRuntime, input }).then((response) => {
+      if (response.type !== "authority.agent-runtime.tool-dispatched") {
+        this.#failProtocol("Authority worker returned the wrong Agent runtime tool dispatch response");
+        throw this.#terminalError;
+      }
+      if (response.dispatch.executionId !== input.executionId ||
+          response.dispatch.attemptSeq !== input.attemptSeq ||
+          response.dispatch.grantId !== input.grantId ||
+          response.dispatch.toolId !== input.toolId ||
+          response.dispatch.parameterHash !== input.parameterHash) {
+        this.#failProtocol("Authority worker returned a mismatched Agent runtime tool dispatch");
+        throw this.#terminalError;
+      }
+      return response.dispatch;
+    });
+  }
+
+  settleAgentRuntimeTool(runtime: InternalAgentRuntimeContext, input: SettleToolInput): Promise<ToolDispatch> {
+    let wireRuntime: ReturnType<typeof toAgentRuntimeWorkerContext>;
+    try { wireRuntime = toAgentRuntimeWorkerContext(runtime); } catch (error: unknown) { return Promise.reject(error); }
+    return this.#send({ type: "authority.agent-runtime.settle-tool", runtime: wireRuntime, input }).then((response) => {
+      if (response.type !== "authority.agent-runtime.tool-settled") {
+        this.#failProtocol("Authority worker returned the wrong Agent runtime tool settlement response");
+        throw this.#terminalError;
+      }
+      if (response.dispatch.id !== input.dispatchId ||
+          response.dispatch.executionId !== input.executionId ||
+          response.dispatch.attemptSeq !== input.attemptSeq ||
+          response.dispatch.grantId !== input.grantId) {
+        this.#failProtocol("Authority worker returned a mismatched Agent runtime tool settlement");
+        throw this.#terminalError;
+      }
+      return response.dispatch;
+    });
+  }
+
+  readAgentRuntimeExecution(
+    context: AuthenticatedSessionContext,
+    executionId: string,
+    now: number,
+  ): Promise<import("@native-im/core").AgentExecution> {
+    return this.#send({ type: "authority.agent-runtime.read-execution", context, executionId, now }).then((response) => {
+      if (response.type !== "authority.agent-runtime.execution") {
+        this.#failProtocol("Authority worker returned the wrong Agent runtime execution response");
+        throw this.#terminalError;
+      }
+      if (response.execution.id !== executionId) {
+        this.#failProtocol("Authority worker returned a mismatched Agent runtime execution");
+        throw this.#terminalError;
+      }
+      return response.execution;
+    });
+  }
+
+  loadAgentRuntimeProviderContext(
+    runtime: InternalAgentRuntimeContext,
+    executionId: string,
+  ): Promise<AgentRuntimeProviderContext> {
+    let wireRuntime: ReturnType<typeof toAgentRuntimeWorkerContext>;
+    try { wireRuntime = toAgentRuntimeWorkerContext(runtime); } catch (error: unknown) { return Promise.reject(error); }
+    return this.#send({
+      type: "authority.agent-runtime.load-provider-context",
+      runtime: wireRuntime,
+      executionId,
+    }).then((response) => {
+      if (response.type !== "authority.agent-runtime.provider-context") {
+        this.#failProtocol("Authority worker returned the wrong Agent runtime provider context");
+        throw this.#terminalError;
+      }
+      if (response.executionId !== executionId ||
+          response.context.invocation.targetAgentId !== wireRuntime.agentId) {
+        this.#failProtocol("Authority worker returned a mismatched Agent runtime provider context");
+        throw this.#terminalError;
+      }
+      return response.context;
+    });
+  }
+
+  cancelAgentRuntimeForHumanFence(
+    runtime: InternalAgentRuntimeContext,
+    input: CancelForHumanFenceInput,
+  ): Promise<import("@native-im/core").AgentExecution> {
+    let wireRuntime: ReturnType<typeof toAgentRuntimeWorkerContext>;
+    try { wireRuntime = toAgentRuntimeWorkerContext(runtime); } catch (error: unknown) { return Promise.reject(error); }
+    return this.#send({ type: "authority.agent-runtime.cancel-human-fence", runtime: wireRuntime, input }).then((response) => {
+      if (response.type !== "authority.agent-runtime.human-fence-cancelled") {
+        this.#failProtocol("Authority worker returned the wrong Agent runtime human fence response");
+        throw this.#terminalError;
+      }
+      if (response.execution.id !== input.executionId || response.execution.agentId !== runtime.agentId) {
+        this.#failProtocol("Authority worker returned a mismatched Agent runtime fence cancellation");
+        throw this.#terminalError;
+      }
+      return response.execution;
+    });
+  }
+
+  claimNextAgentRuntime(
+    runtime: InternalAgentRuntimeContext,
+    roomId: string,
+    now: number,
+  ): Promise<import("@native-im/core").AgentExecution | undefined> {
+    let wireRuntime: ReturnType<typeof toAgentRuntimeWorkerContext>;
+    try {
+      wireRuntime = toAgentRuntimeWorkerContext(runtime);
+    } catch (error: unknown) {
+      return Promise.reject(error);
+    }
+    return this.#send({ type: "authority.agent-runtime.claim-next", runtime: wireRuntime, roomId, now })
+      .then((response) => {
+        if (response.type !== "authority.agent-runtime.claimed") {
+          this.#failProtocol("Authority worker returned the wrong Agent runtime claim response");
+          throw this.#terminalError;
+        }
+        if (response.execution !== undefined &&
+            (response.execution.roomId !== roomId ||
+             response.execution.agentId !== runtime.agentId ||
+             response.execution.status !== "running")) {
+          this.#failProtocol("Authority worker returned a mismatched Agent runtime claim");
+          throw this.#terminalError;
+        }
+        return response.execution;
+      });
+  }
+
   readHistory(
     context: AuthenticatedSessionContext,
     roomId: string,
@@ -1382,6 +1942,46 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
         responseType === "authority.command-acknowledged") ||
       (requestType === "authority.execute-agent" &&
         responseType === "authority.command-acknowledged") ||
+      (requestType === "authority.agent-runtime.invoke" &&
+        responseType === "authority.agent-runtime.invoked") ||
+      (requestType === "authority.agent-runtime.claim-next" &&
+        responseType === "authority.agent-runtime.claimed") ||
+      (requestType === "authority.agent-runtime.commit-step" &&
+        responseType === "authority.agent-runtime.step-committed") ||
+      (requestType === "authority.agent-runtime.complete-execution" &&
+        responseType === "authority.agent-runtime.execution-completed") ||
+      (requestType === "authority.agent-runtime.complete-compensation" &&
+        responseType === "authority.agent-runtime.compensation-completed") ||
+      (requestType === "authority.agent-runtime.schedule-retry" &&
+        responseType === "authority.agent-runtime.retry-scheduled") ||
+      (requestType === "authority.agent-runtime.fail-execution" &&
+        responseType === "authority.agent-runtime.execution-failed") ||
+      (requestType === "authority.agent-runtime.interrupt" &&
+        responseType === "authority.agent-runtime.interrupted") ||
+      (requestType === "authority.agent-runtime.manual-retry" &&
+        responseType === "authority.agent-runtime.manual-retried") ||
+      (requestType === "authority.agent-runtime.compensate" &&
+        responseType === "authority.agent-runtime.compensation-accepted") ||
+      (requestType === "authority.agent-runtime.resume-compensation" &&
+        responseType === "authority.agent-runtime.compensation-resumed") ||
+      (requestType === "authority.agent-runtime.recover" &&
+        responseType === "authority.agent-runtime.recovered") ||
+      (requestType === "authority.agent-runtime.prepare-tool" &&
+        responseType === "authority.agent-runtime.tool-prepared") ||
+      (requestType === "authority.agent-runtime.confirm-tool" &&
+        responseType === "authority.agent-runtime.tool-confirmed") ||
+      (requestType === "authority.agent-runtime.resume-confirmed-tool" &&
+        responseType === "authority.agent-runtime.confirmed-tool-resumed") ||
+      (requestType === "authority.agent-runtime.dispatch-tool" &&
+        responseType === "authority.agent-runtime.tool-dispatched") ||
+      (requestType === "authority.agent-runtime.settle-tool" &&
+        responseType === "authority.agent-runtime.tool-settled") ||
+      (requestType === "authority.agent-runtime.read-execution" &&
+        responseType === "authority.agent-runtime.execution") ||
+      (requestType === "authority.agent-runtime.load-provider-context" &&
+        responseType === "authority.agent-runtime.provider-context") ||
+      (requestType === "authority.agent-runtime.cancel-human-fence" &&
+        responseType === "authority.agent-runtime.human-fence-cancelled") ||
       (requestType === "authority.read-history" &&
         responseType === "authority.history") ||
       (requestType === "authority.read-actor" && responseType === "authority.actor") ||
