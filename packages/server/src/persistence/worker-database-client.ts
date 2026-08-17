@@ -56,7 +56,7 @@ export interface CreateWorkerDatabaseClientOptions {
 }
 
 export interface AuthoritySchemaInspection {
-  readonly version: 8;
+  readonly version: 9;
 }
 
 export interface WorkerDatabaseClient {
@@ -226,6 +226,7 @@ function authorityWorkerClientErrorStatus(
     case "invitation_not_found":
     case "member_not_found":
     case "message_not_found":
+    case "light_task_not_found":
     case "open_item_not_found":
     case "execution_not_found":
     case "route_job_not_found":

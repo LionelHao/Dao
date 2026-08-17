@@ -3,6 +3,7 @@ import type {
   AgentRoomMembership,
   HumanInvitationRequest,
   HumanRoomMembership,
+  LightTask,
   MessageDraft,
 } from "./index.js";
 import type {
@@ -108,6 +109,14 @@ const agentConfigurationWithInviteeActorId = {
 const invalidAgentConfigurationInviteeActorId: AgentConfigurationRequest =
   agentConfigurationWithInviteeActorId;
 
+const invalidLightTaskPlanningField: LightTask = {
+  id: "task-1", roomId: "room-1", sourceMessageId: "message-1", title: "完成评审",
+  claimant: null, claimantRoleAtClaim: null, verifierRole: "owner", verifierActorId: null,
+  criteria: [], status: "todo", createdAt: "2026-08-17T00:00:00.000Z",
+  // @ts-expect-error LightTask cannot carry Blueprint dependency planning.
+  deps: ["T-0001"],
+};
+
 declare const runtimeProviderInput: AgentRuntimeProviderInput;
 declare const routerProviderInput: RouterProviderInput;
 
@@ -125,5 +134,6 @@ void invalidHumanInvitationAgentId;
 void invalidHumanInvitationParticipation;
 void invalidHumanInvitationToolPermissions;
 void invalidAgentConfigurationInviteeActorId;
+void invalidLightTaskPlanningField;
 void invalidRouterInput;
 void invalidRuntimeInput;

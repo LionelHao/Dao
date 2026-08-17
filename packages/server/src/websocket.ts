@@ -73,7 +73,14 @@ export interface StartMessageWebSocketServerOptions {
   readonly v2GateMaxEvents?: number;
   readonly v2GateMaxBytes?: number;
   readonly agentRuntime?: AgentRuntime;
-  readonly collaboration?: Pick<AuthoritativeCollaborationPrimitives, "createOpenItem" | "transitionOpenItem">;
+  readonly collaboration?: Pick<
+    AuthoritativeCollaborationPrimitives,
+    | "createOpenItem"
+    | "transitionOpenItem"
+    | "createLightTask"
+    | "transitionLightTask"
+    | "setLightTaskCriterion"
+  >;
 }
 
 type RuntimeMessageWebSocketServerOptions = StartMessageWebSocketServerOptions & {
@@ -185,6 +192,7 @@ const MAPPED_SERVICE_ERROR_STATUSES = new Map<ProtocolErrorFrame["code"], Protoc
   ["agent_runtime_closed", 503],
   ["execution_conflict", 409],
   ["execution_not_found", 404],
+  ["light_task_not_found", 404],
   ["open_item_not_found", 404],
   ["invalid_parameters", 400],
   ["permission_denied", 403],
@@ -789,7 +797,10 @@ function isCorrelatedRecoveryResponse(
       | "agent.tool.confirm"
       | "agent.compensate"
       | "open-item.create"
-      | "open-item.transition";
+      | "open-item.transition"
+      | "light-task.create"
+      | "light-task.transition"
+      | "light-task.criterion.set";
   }>,
   response: unknown,
 ): response is ServerFrame {
@@ -870,7 +881,10 @@ async function handleRecoveryFrame(
       | "agent.tool.confirm"
       | "agent.compensate"
       | "open-item.create"
-      | "open-item.transition";
+      | "open-item.transition"
+      | "light-task.create"
+      | "light-task.transition"
+      | "light-task.criterion.set";
   }>,
   options: StartMessageWebSocketServerOptions,
   context: ConnectionContext,
@@ -1570,6 +1584,48 @@ async function handleFrame(
                   ? { itemId: frame.itemId, action: "transfer", targetActorId: frame.targetActorId, reason: frame.reason }
                   : { itemId: frame.itemId, action: frame.action, reason: frame.reason });
         sendFrame(socket, { type: "open-item.ack", requestId: frame.requestId, item });
+      } catch (error: unknown) {
+        sendFrame(socket, mappedError(error, frame.requestId));
+      }
+      return;
+    }
+    case "light-task.create":
+    case "light-task.transition":
+    case "light-task.criterion.set": {
+      const session = await requireSession(socket, frame.requestId, options, context);
+      if (session === undefined) return;
+      if (options.collaboration === undefined) {
+        sendFrame(socket, errorFrame(503, "storage_unavailable", "storage_unavailable", frame.requestId));
+        return;
+      }
+      const commandContext = {
+        ...session,
+        kind: "human" as const,
+        requestId: frame.requestId,
+        idempotencyKey: `${frame.type}:${frame.requestId}`,
+      };
+      try {
+        const task = frame.type === "light-task.create"
+          ? await options.collaboration.createLightTask(commandContext, frame.roomId, {
+              sourceMessageId: frame.sourceMessageId,
+              title: frame.title,
+              verifierRole: frame.verifierRole,
+              criteria: frame.criteria,
+            })
+          : frame.type === "light-task.transition"
+            ? await options.collaboration.transitionLightTask(commandContext, frame.roomId, {
+                taskId: frame.taskId,
+                action: frame.action,
+                ...(frame.action === "verify" && frame.emptyCriteriaConfirmed === true
+                  ? { emptyCriteriaConfirmed: true as const }
+                  : {}),
+              })
+            : await options.collaboration.setLightTaskCriterion(commandContext, frame.roomId, {
+                taskId: frame.taskId,
+                criterionId: frame.criterionId,
+                met: frame.met,
+              });
+        sendFrame(socket, { type: "light-task.ack", requestId: frame.requestId, task });
       } catch (error: unknown) {
         sendFrame(socket, mappedError(error, frame.requestId));
       }

@@ -3,6 +3,7 @@ import type { DatabaseSync } from "node:sqlite";
 import type {
   AgentExecution,
   Actor,
+  LightTask,
   ManagedRoom,
   Message,
   OpenItem,
@@ -15,6 +16,7 @@ import type {
   RoomSyncRequest,
   RoomSyncResult,
 } from "@native-im/core";
+import { isLightTask } from "@native-im/core";
 import type {
   RuntimeAuthorityOperation,
   RuntimeAuthorityOperationResult,
@@ -2515,6 +2517,280 @@ function executeOpenItemCreate(
   };
 }
 
+function readLightTask(database: DatabaseSync, roomId: string, taskId: string): LightTask {
+  const row = database.prepare(
+    `SELECT id, room_id AS roomId, source_message_id AS sourceMessageId, title,
+            claimant_actor_id AS claimant, claimant_role_at_claim AS claimantRoleAtClaim,
+            verifier_role AS verifierRole, verifier_actor_id AS verifierActorId,
+            criteria_json AS criteriaJson, status, created_at AS createdAt,
+            claimed_at AS claimedAt, delivered_at AS deliveredAt, verified_at AS verifiedAt
+     FROM light_tasks WHERE id = ?`,
+  ).get(taskId);
+  if (row?.roomId !== roomId || typeof row.criteriaJson !== "string") {
+    return fail("light_task_not_found", "Authority light task was not found");
+  }
+  let criteria: unknown;
+  try {
+    criteria = JSON.parse(row.criteriaJson);
+  } catch {
+    return fail("storage_unavailable", "Authority light task criteria are corrupt");
+  }
+  const task = {
+    id: row.id,
+    roomId: row.roomId,
+    sourceMessageId: row.sourceMessageId,
+    title: row.title,
+    claimant: row.claimant,
+    claimantRoleAtClaim: row.claimantRoleAtClaim,
+    verifierRole: row.verifierRole,
+    verifierActorId: row.verifierActorId,
+    criteria,
+    status: row.status,
+    createdAt: row.createdAt,
+    ...(typeof row.claimedAt === "string" ? { claimedAt: row.claimedAt } : {}),
+    ...(typeof row.deliveredAt === "string" ? { deliveredAt: row.deliveredAt } : {}),
+    ...(typeof row.verifiedAt === "string" ? { verifiedAt: row.verifiedAt } : {}),
+  };
+  if (!isLightTask(task)) {
+    return fail("storage_unavailable", "Authority light task is corrupt");
+  }
+  return task;
+}
+
+function currentHumanRoomRole(
+  database: DatabaseSync,
+  roomId: string,
+  actorId: string,
+): LightTask["verifierRole"] | undefined {
+  const membership = database.prepare(
+    `SELECT membership.role, room.status AS roomStatus
+     FROM room_memberships AS membership
+     JOIN rooms AS room ON room.id = membership.room_id
+     WHERE membership.room_id = ? AND membership.actor_id = ? AND membership.kind = 'human'`,
+  ).get(roomId, actorId);
+  if (membership?.roomStatus !== "active" ||
+      (membership.role !== "owner" && membership.role !== "admin" &&
+       membership.role !== "member")) {
+    return undefined;
+  }
+  return membership.role;
+}
+
+function appendLightTaskChanged(
+  database: DatabaseSync,
+  actorId: string,
+  task: LightTask,
+  acceptedAt: string,
+  scope: string,
+  key: string,
+): CommandAcknowledgement {
+  const eventId = stableId("event", scope, key, "0");
+  const streamSeq = appendRoomEvent(database, {
+    eventId,
+    roomId: task.roomId,
+    actorId,
+    eventType: "room.light_task.changed",
+    occurredAt: acceptedAt,
+    payload: task as unknown as JsonValue,
+  });
+  appendRoomOutbox(database, eventId, task.roomId, streamSeq, acceptedAt, scope, key);
+  return {
+    aggregateId: task.id,
+    eventIds: [eventId],
+    acceptedAt,
+    result: { task: task as unknown as JsonValue },
+  };
+}
+
+function executeLightTaskCreate(
+  database: DatabaseSync,
+  actorId: string,
+  command: Extract<HumanCollaborationCommand, { readonly type: "light-task.create" }>,
+  acceptedAt: string,
+  scope: string,
+  key: string,
+): CommandAcknowledgement {
+  roomMessageAuthor(database, command.roomId, command.payload.sourceMessageId);
+  const task: LightTask = {
+    id: stableId("light-task", scope, key),
+    roomId: command.roomId,
+    sourceMessageId: command.payload.sourceMessageId,
+    title: command.payload.title,
+    claimant: null,
+    claimantRoleAtClaim: null,
+    verifierRole: command.payload.verifierRole,
+    verifierActorId: null,
+    criteria: command.payload.criteria.map((criterion) => ({ ...criterion, met: false })),
+    status: "todo",
+    createdAt: acceptedAt,
+  };
+  database.prepare(
+    `INSERT INTO light_tasks (
+       id, room_id, source_message_id, title, claimant_actor_id,
+       claimant_role_at_claim, verifier_role, verifier_actor_id, criteria_json,
+       status, created_at, claimed_at, delivered_at, verified_at
+     ) VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL, ?, 'todo', ?, NULL, NULL, NULL)`,
+  ).run(
+    task.id,
+    task.roomId,
+    task.sourceMessageId,
+    task.title,
+    task.verifierRole,
+    canonicalJson(task.criteria),
+    task.createdAt,
+  );
+  return appendLightTaskChanged(database, actorId, task, acceptedAt, scope, key);
+}
+
+function requireCurrentLightTaskClaimant(
+  database: DatabaseSync,
+  actorId: string,
+  task: LightTask,
+): void {
+  if (task.claimant !== actorId || currentHumanRoomRole(database, task.roomId, actorId) === undefined) {
+    return fail("permission_denied", "Authority light task claimant permission was rejected");
+  }
+}
+
+function executeLightTaskTransition(
+  database: DatabaseSync,
+  actorId: string,
+  command: Extract<HumanCollaborationCommand, { readonly type: "light-task.transition" }>,
+  acceptedAt: string,
+  scope: string,
+  key: string,
+): CommandAcknowledgement {
+  const current = readLightTask(database, command.roomId, command.payload.taskId);
+  let task: LightTask;
+  let updated: { readonly changes: number | bigint };
+  if (command.payload.action === "claim") {
+    if (current.status !== "todo") {
+      return fail("execution_conflict", "Authority light task claim was stale");
+    }
+    const claimantRoleAtClaim = currentHumanRoomRole(database, command.roomId, actorId);
+    if (claimantRoleAtClaim === undefined) {
+      return fail("permission_denied", "Authority light task claimant is not a current member");
+    }
+    task = {
+      ...current,
+      claimant: actorId,
+      claimantRoleAtClaim,
+      status: "claimed",
+      claimedAt: acceptedAt,
+    };
+    updated = database.prepare(
+      `UPDATE light_tasks
+       SET claimant_actor_id = ?, claimant_role_at_claim = ?, status = 'claimed', claimed_at = ?
+       WHERE id = ? AND room_id = ? AND status = 'todo'`,
+    ).run(actorId, claimantRoleAtClaim, acceptedAt, current.id, command.roomId);
+  } else if (command.payload.action === "deliver") {
+    if (current.status !== "claimed") {
+      return fail("execution_conflict", "Authority light task delivery was stale");
+    }
+    requireCurrentLightTaskClaimant(database, actorId, current);
+    if (current.verifierRole === current.claimantRoleAtClaim) {
+      return fail("execution_conflict", "Authority light task verifier role conflicts with claimant role");
+    }
+    const candidates = database.prepare(
+      `SELECT membership.actor_id AS actorId
+       FROM room_memberships AS membership
+       JOIN actors AS actor ON actor.id = membership.actor_id
+       JOIN rooms AS room ON room.id = membership.room_id
+       WHERE membership.room_id = ? AND membership.kind = 'human'
+         AND membership.role = ? AND actor.kind = 'human' AND room.status = 'active'
+       ORDER BY membership.actor_id`,
+    ).all(command.roomId, current.verifierRole);
+    if (candidates.length !== 1 || typeof candidates[0]?.actorId !== "string" ||
+        candidates[0].actorId === current.claimant) {
+      return fail("execution_conflict", "Authority light task verifier is not uniquely resolvable");
+    }
+    task = {
+      ...current,
+      verifierActorId: candidates[0].actorId,
+      status: "delivered",
+      deliveredAt: acceptedAt,
+    };
+    updated = database.prepare(
+      `UPDATE light_tasks
+       SET verifier_actor_id = ?, status = 'delivered', delivered_at = ?
+       WHERE id = ? AND room_id = ? AND status = 'claimed'
+         AND claimant_actor_id = ? AND verifier_actor_id IS NULL`,
+    ).run(task.verifierActorId, acceptedAt, current.id, command.roomId, current.claimant);
+  } else {
+    if (current.status !== "delivered") {
+      return fail("execution_conflict", "Authority light task verification was stale");
+    }
+    if (current.claimant === null ||
+        currentHumanRoomRole(database, command.roomId, current.claimant) === undefined) {
+      return fail("permission_denied", "Authority light task claimant is no longer a current member");
+    }
+    if (current.verifierActorId !== actorId ||
+        currentHumanRoomRole(database, command.roomId, actorId) === undefined) {
+      return fail("permission_denied", "Authority light task verifier permission was rejected");
+    }
+    if (current.criteria.length === 0) {
+      if (command.payload.emptyCriteriaConfirmed !== true) {
+        return fail("execution_conflict", "Authority light task empty criteria require confirmation");
+      }
+    } else if (current.criteria.some((criterion) => !criterion.met)) {
+      return fail("execution_conflict", "Authority light task criteria are incomplete");
+    }
+    task = { ...current, status: "verified", verifiedAt: acceptedAt };
+    updated = database.prepare(
+      `UPDATE light_tasks SET status = 'verified', verified_at = ?
+       WHERE id = ? AND room_id = ? AND status = 'delivered'
+         AND verifier_actor_id = ? AND criteria_json = ?`,
+    ).run(acceptedAt, current.id, command.roomId, actorId, canonicalJson(current.criteria));
+  }
+  if (updated.changes !== 1) {
+    return fail("execution_conflict", "Authority light task transition was stale");
+  }
+  return appendLightTaskChanged(database, actorId, task, acceptedAt, scope, key);
+}
+
+function executeLightTaskCriterionSet(
+  database: DatabaseSync,
+  actorId: string,
+  command: Extract<HumanCollaborationCommand, { readonly type: "light-task.criterion.set" }>,
+  acceptedAt: string,
+  scope: string,
+  key: string,
+): CommandAcknowledgement {
+  const current = readLightTask(database, command.roomId, command.payload.taskId);
+  if (current.status !== "delivered") {
+    return fail("execution_conflict", "Authority light task criteria are not editable");
+  }
+  if (current.claimant === null ||
+      currentHumanRoomRole(database, command.roomId, current.claimant) === undefined) {
+    return fail("permission_denied", "Authority light task claimant is no longer a current member");
+  }
+  if (current.verifierActorId !== actorId ||
+      currentHumanRoomRole(database, command.roomId, actorId) === undefined) {
+    return fail("permission_denied", "Authority light task verifier permission was rejected");
+  }
+  const criterionIndex = current.criteria.findIndex(
+    (criterion) => criterion.id === command.payload.criterionId,
+  );
+  if (criterionIndex === -1) {
+    return fail("invalid_request", "Authority light task criterion was not found");
+  }
+  const criteria = current.criteria.map((criterion, index) => index === criterionIndex
+    ? { ...criterion, met: command.payload.met }
+    : criterion);
+  const task: LightTask = { ...current, criteria };
+  const updated = database.prepare(
+    `UPDATE light_tasks SET criteria_json = ?
+     WHERE id = ? AND room_id = ? AND status = 'delivered'
+       AND verifier_actor_id = ? AND criteria_json = ?`,
+  ).run(
+    canonicalJson(criteria), current.id, command.roomId, actorId, canonicalJson(current.criteria),
+  );
+  if (updated.changes !== 1) {
+    return fail("execution_conflict", "Authority light task criterion update was stale");
+  }
+  return appendLightTaskChanged(database, actorId, task, acceptedAt, scope, key);
+}
+
 function executeOpenItemProposal(
   database: DatabaseSync,
   actorId: string,
@@ -4919,6 +5195,12 @@ export function executeHumanDatabaseCommand(
               ? executeOpenItemCreate(database, actorId, input.command, acceptedAt, scope, key)
             : input.command.type === "open-item.transition"
               ? executeOpenItemTransition(database, actorId, input.command, acceptedAt, scope, key)
+              : input.command.type === "light-task.create"
+                ? executeLightTaskCreate(database, actorId, input.command, acceptedAt, scope, key)
+                : input.command.type === "light-task.transition"
+                  ? executeLightTaskTransition(database, actorId, input.command, acceptedAt, scope, key)
+                  : input.command.type === "light-task.criterion.set"
+                    ? executeLightTaskCriterionSet(database, actorId, input.command, acceptedAt, scope, key)
               : input.command.type === "calibration.record"
                 ? executeCalibrationRecord(database, actorId, input.command, acceptedAt, scope, key)
             : input.command.type === "room.create"

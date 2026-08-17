@@ -58,6 +58,43 @@ export interface OpenItemAgentFailure {
   readonly failedAt: string;
 }
 
+export type LightTaskStatus = "todo" | "claimed" | "delivered" | "verified";
+export type LightTaskVerifierRole = "owner" | "admin" | "member";
+
+export interface LightTaskCriterion {
+  readonly id: string;
+  readonly text: string;
+  readonly met: boolean;
+}
+
+export interface LightTask {
+  readonly id: string;
+  readonly roomId: string;
+  readonly sourceMessageId: string;
+  readonly title: string;
+  readonly claimant: string | null;
+  readonly claimantRoleAtClaim: LightTaskVerifierRole | null;
+  readonly verifierRole: LightTaskVerifierRole;
+  readonly verifierActorId: string | null;
+  readonly criteria: readonly LightTaskCriterion[];
+  readonly status: LightTaskStatus;
+  readonly createdAt: string;
+  readonly claimedAt?: string;
+  readonly deliveredAt?: string;
+  readonly verifiedAt?: string;
+}
+
+export type LightTaskProjection = Pick<
+  LightTask,
+  | "id"
+  | "roomId"
+  | "sourceMessageId"
+  | "title"
+  | "claimant"
+  | "status"
+  | "criteria"
+>;
+
 export type AgentExecutionStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 export type AgentExecutionActionCategory = "model_generation" | "tool_call" | "waiting_upstream";
 export type AgentToolDispatchPhase = "not_started" | "dispatched" | "finished";
@@ -508,6 +545,67 @@ export function isOpenItemAgentFailure(value: unknown): value is OpenItemAgentFa
     isNonEmptyString(value.executionId) && Number.isSafeInteger(value.attemptSeq) &&
     (value.attemptSeq as number) >= 1 && isNonEmptyString(value.reasonCode) &&
     isNonEmptyString(value.failedAt);
+}
+
+function isLightTaskRole(value: unknown): value is LightTaskVerifierRole {
+  return value === "owner" || value === "admin" || value === "member";
+}
+
+function isLightTaskCriterion(value: unknown): value is LightTaskCriterion {
+  return isRecord(value) && hasExactKeys(value, ["id", "text", "met"]) &&
+    isNonEmptyString(value.id) && value.id.trim().length > 0 &&
+    isNonEmptyString(value.text) && value.text.trim().length > 0 && typeof value.met === "boolean";
+}
+
+export function isLightTask(value: unknown): value is LightTask {
+  if (!isRecord(value) || !hasExactKeys(value, [
+    "id", "roomId", "sourceMessageId", "title", "claimant", "claimantRoleAtClaim",
+    "verifierRole", "verifierActorId", "criteria", "status", "createdAt",
+  ], ["claimedAt", "deliveredAt", "verifiedAt"]) ||
+      !isNonEmptyString(value.id) || !isNonEmptyString(value.roomId) ||
+      !isNonEmptyString(value.sourceMessageId) || !isNonEmptyString(value.title) ||
+      value.title.trim().length === 0 ||
+      !(value.claimant === null || isNonEmptyString(value.claimant)) ||
+      !(value.claimantRoleAtClaim === null || isLightTaskRole(value.claimantRoleAtClaim)) ||
+      !isLightTaskRole(value.verifierRole) ||
+      !(value.verifierActorId === null || isNonEmptyString(value.verifierActorId)) ||
+      !Array.isArray(value.criteria) || !value.criteria.every(isLightTaskCriterion) ||
+      new Set(value.criteria.map((criterion) => criterion.id)).size !== value.criteria.length ||
+      !(value.status === "todo" || value.status === "claimed" ||
+        value.status === "delivered" || value.status === "verified") ||
+      !isNonEmptyString(value.createdAt)) {
+    return false;
+  }
+  const hasClaim = value.claimant !== null && value.claimantRoleAtClaim !== null &&
+    isNonEmptyString(value.claimedAt);
+  if (value.status === "todo") {
+    return value.claimant === null && value.claimantRoleAtClaim === null &&
+      value.verifierActorId === null && !Object.hasOwn(value, "claimedAt") &&
+      !Object.hasOwn(value, "deliveredAt") && !Object.hasOwn(value, "verifiedAt");
+  }
+  if (!hasClaim) return false;
+  if (value.status === "claimed") {
+    return value.verifierActorId === null && !Object.hasOwn(value, "deliveredAt") &&
+      !Object.hasOwn(value, "verifiedAt");
+  }
+  if (!isNonEmptyString(value.verifierActorId) || value.verifierActorId === value.claimant ||
+      value.verifierRole === value.claimantRoleAtClaim || !isNonEmptyString(value.deliveredAt)) {
+    return false;
+  }
+  if (value.status === "delivered") return !Object.hasOwn(value, "verifiedAt");
+  return isNonEmptyString(value.verifiedAt) && value.criteria.every((criterion) => criterion.met);
+}
+
+export function projectLightTask(value: LightTask): LightTaskProjection {
+  return {
+    id: value.id,
+    roomId: value.roomId,
+    sourceMessageId: value.sourceMessageId,
+    title: value.title,
+    claimant: value.claimant,
+    status: value.status,
+    criteria: value.criteria,
+  };
 }
 
 export function isAgentExecution(value: unknown): value is AgentExecution {

@@ -8,6 +8,7 @@ import type {
   CalibrationSignal,
   HumanReadReceipt,
   HumanInvitationRequest,
+  LightTask,
   OpenItem,
   RouteJudgment,
   SocialReaction,
@@ -19,6 +20,7 @@ interface RestoredPrimitivePreviewRecords {
   readonly agentJudgements: readonly AgentJudgement[];
   readonly routeJudgments: readonly RouteJudgment[];
   readonly openItems: readonly OpenItem[];
+  readonly lightTasks: readonly LightTask[];
   readonly agentExecutions: readonly AgentExecution[];
   readonly socialReactions: readonly SocialReaction[];
   readonly calibrations: readonly CalibrationSignal[];
@@ -147,7 +149,7 @@ describe("side-effect confirmation renderer", () => {
 describe("verified collaboration primitive renderer", () => {
   it("rejects malformed or unrelated restored records before mutating the DOM", () => {
     const empty = (): RestoredPrimitivePreviewRecords => ({
-      humanReads: [], agentJudgements: [], routeJudgments: [], openItems: [], agentExecutions: [],
+      humanReads: [], agentJudgements: [], routeJudgments: [], openItems: [], lightTasks: [], agentExecutions: [],
       socialReactions: [], calibrations: [],
     });
     const read: HumanReadReceipt = {
@@ -229,6 +231,7 @@ describe("verified collaboration primitive renderer", () => {
         createdAt: "2026-08-12T13:00:02.000Z",
         transferChain: [],
       }],
+      lightTasks: [],
       agentExecutions: [{
         id: "execution-restored",
         roomId: "preview-room",
@@ -362,7 +365,7 @@ describe("verified collaboration primitive renderer", () => {
     };
     app.renderM2PrimitivesPreview?.(root, {
       humanReads: [], agentJudgements: [], routeJudgments: [], agentExecutions: [],
-      socialReactions: [], calibrations: [],
+      lightTasks: [], socialReactions: [], calibrations: [],
       openItems: [
         { ...common, id: "item-awaiting", currentOwnerId: "human-owner", status: "awaiting", transferChain: [] },
         { ...common, id: "item-transferred", currentOwnerId: "human-next", status: "transferred",
@@ -390,6 +393,45 @@ describe("verified collaboration primitive renderer", () => {
       .toHaveLength(0);
     expect(root.querySelectorAll("[data-open-item-status='deferred'] .human-request-action"))
       .toHaveLength(0);
+  });
+
+  it("renders LightTask four states, audit actors, verifier role, and criteria without GBP controls", () => {
+    const root = document.createElement("main");
+    const common = {
+      roomId: "preview-room", sourceMessageId: "preview-human-mention", title: "完成评审",
+      verifierRole: "owner" as const,
+      criteria: [{ id: "criterion-1", text: "评审通过", met: false }],
+      createdAt: "2026-08-17T00:00:00.000Z",
+    };
+    app.renderM2PrimitivesPreview?.(root, {
+      humanReads: [], agentJudgements: [], routeJudgments: [], openItems: [], agentExecutions: [],
+      socialReactions: [], calibrations: [],
+      lightTasks: [
+        { ...common, id: "task-todo", claimant: null, claimantRoleAtClaim: null,
+          verifierActorId: null, status: "todo" },
+        { ...common, id: "task-claimed", claimant: "human-claimant", claimantRoleAtClaim: "member",
+          verifierActorId: null, status: "claimed", claimedAt: "2026-08-17T00:01:00.000Z" },
+        { ...common, id: "task-delivered", claimant: "human-claimant", claimantRoleAtClaim: "member",
+          verifierActorId: "human-owner", status: "delivered",
+          claimedAt: "2026-08-17T00:01:00.000Z", deliveredAt: "2026-08-17T00:02:00.000Z" },
+        { ...common, id: "task-verified", claimant: "human-claimant", claimantRoleAtClaim: "member",
+          verifierActorId: "human-owner", status: "verified",
+          criteria: [{ id: "criterion-1", text: "评审通过", met: true }],
+          claimedAt: "2026-08-17T00:01:00.000Z", deliveredAt: "2026-08-17T00:02:00.000Z",
+          verifiedAt: "2026-08-17T00:03:00.000Z" },
+      ],
+    });
+    expect(root.querySelectorAll(".light-task")).toHaveLength(4);
+    expect(root.querySelector("[data-light-task-status='todo']")?.textContent)
+      .toContain("未认领");
+    expect(root.querySelector("[data-light-task-status='claimed']")?.textContent)
+      .toContain("认领人：human-claimant");
+    expect(root.querySelector("[data-light-task-status='delivered']")?.textContent)
+      .toContain("验收角色：owner · 验收人：human-owner");
+    expect(root.querySelector("[data-light-task-status='verified'] [data-criterion-met='true']")
+      ?.textContent).toContain("✓ 评审通过");
+    expect(root.querySelector(".light-task")?.textContent).not.toMatch(/deps|maturity|milestone|依赖|里程碑/);
+    expect(root.querySelector(".light-task [data-action='dependency']")).toBeNull();
   });
 
   it("T-0014 exposes human mutation controls, append-only correction, and separate calibration", () => {

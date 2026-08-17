@@ -175,6 +175,13 @@ describe("T-0012 read receipts and agent judgements", () => {
       startedAt: "2026-08-07T09:02:00.000Z",
       updatedAt: "2026-08-07T09:02:00.000Z",
     };
+    const task = {
+      id: "light-task-1", roomId: room.id, sourceMessageId: humanMessage.id,
+      title: "完成评审", claimant: null, claimantRoleAtClaim: null,
+      verifierRole: "owner" as const, verifierActorId: null,
+      criteria: [{ id: "criterion-1", text: "评审通过", met: false }],
+      status: "todo" as const, createdAt: "2026-08-07T09:02:00.000Z",
+    };
     const signal = {
       id: "calibration-1", sourceMessageId: agentMessage.id, actorId: "human-lionel",
       agentId: "agent-data", emoji: "👍" as const, createdAt: "2026-08-07T09:02:00.000Z",
@@ -187,6 +194,8 @@ describe("T-0012 read receipts and agent judgements", () => {
         commands.push(`human:${command.type}`);
         if (command.type === "human.read.record") return acknowledgement({ receipt });
         if (command.type === "open-item.create" || command.type === "open-item.transition") return acknowledgement({ item });
+        if (command.type === "light-task.create" || command.type === "light-task.transition" ||
+            command.type === "light-task.criterion.set") return acknowledgement({ task });
         if (command.type === "calibration.record") return acknowledgement({ signal });
         throw new Error("unexpected human command");
       },
@@ -214,6 +223,16 @@ describe("T-0012 read receipts and agent judgements", () => {
     await primitives.transitionOpenItem(agentContext, room.id, {
       itemId: item.id, action: "answer",
     });
+    await primitives.createLightTask(humanContext, room.id, {
+      sourceMessageId: humanMessage.id, title: "完成评审", verifierRole: "owner",
+      criteria: [{ id: "criterion-1", text: "评审通过" }],
+    });
+    await primitives.transitionLightTask(humanContext, room.id, {
+      taskId: task.id, action: "claim",
+    });
+    await primitives.setLightTaskCriterion(humanContext, room.id, {
+      taskId: task.id, criterionId: "criterion-1", met: true,
+    });
     await primitives.transitionAgentExecution(agentContext, room.id, {
       executionId: execution.id, sourceMessageId: humanMessage.id,
       toolName: "warehouse.query", status: "running",
@@ -227,11 +246,15 @@ describe("T-0012 read receipts and agent judgements", () => {
       "agent:agent.judgment.record",
       "human:open-item.create",
       "agent:open-item.transition",
+      "human:light-task.create",
+      "human:light-task.transition",
+      "human:light-task.criterion.set",
       "agent:agent.execution.transition",
       "human:calibration.record",
     ]);
     expect(accepted.map((fact) => fact.kind)).toEqual([
-      "human-read", "agent-judgment", "open-item", "open-item", "agent-execution", "calibration",
+      "human-read", "agent-judgment", "open-item", "open-item", "light-task", "light-task",
+      "light-task", "agent-execution", "calibration",
     ]);
   });
 

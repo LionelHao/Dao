@@ -50,6 +50,24 @@ const acceptedCommands: readonly unknown[] = [
     },
   },
   {
+    type: "light-task.create",
+    roomId: "room-1",
+    payload: {
+      sourceMessageId: "message-1", title: "完成评审", verifierRole: "owner",
+      criteria: [{ id: "criterion-1", text: "评审通过" }],
+    },
+  },
+  {
+    type: "light-task.transition",
+    roomId: "room-1",
+    payload: { taskId: "task-1", action: "verify", emptyCriteriaConfirmed: true },
+  },
+  {
+    type: "light-task.criterion.set",
+    roomId: "room-1",
+    payload: { taskId: "task-1", criterionId: "criterion-1", met: true },
+  },
+  {
     type: "agent.execution.transition",
     roomId: "room-1",
     payload: {
@@ -194,6 +212,16 @@ const acceptedRoomEvents: readonly unknown[] = [
       outcome: "will_respond",
       reason: "命中领域",
       decidedAt: "2026-08-10T00:00:00.000Z",
+    },
+  },
+  {
+    ...roomEventBase,
+    type: "room.light_task.changed",
+    payload: {
+      id: "task-1", roomId: "room-1", sourceMessageId: "message-1", title: "完成评审",
+      claimant: null, claimantRoleAtClaim: null, verifierRole: "owner", verifierActorId: null,
+      criteria: [{ id: "criterion-1", text: "评审通过", met: false }], status: "todo",
+      createdAt: "2026-08-10T00:00:00.000Z",
     },
   },
   {
@@ -408,6 +436,23 @@ describe("closed authority contracts", () => {
         body: "hello",
         sentAt: "2026-08-10T00:00:00.000Z",
         authorId: "human-1",
+      },
+    })).toEqual({ ok: false, code: "invalid_command" });
+    for (const forbidden of ["deps", "maturity", "milestone", "blueprintTaskId", "status"]) {
+      expect(parsePersistentCommand({
+        type: "light-task.create",
+        roomId: "room-1",
+        payload: {
+          sourceMessageId: "message-1", title: "完成评审", verifierRole: "owner",
+          criteria: [], [forbidden]: forbidden === "deps" ? [] : "forged",
+        },
+      })).toEqual({ ok: false, code: "invalid_command" });
+    }
+    expect(parsePersistentCommand({
+      type: "light-task.create", roomId: "room-1",
+      payload: {
+        sourceMessageId: "message-1", title: "完成评审", verifierRole: "owner",
+        criteria: [{ id: "duplicate", text: "one" }, { id: "duplicate", text: "two" }],
       },
     })).toEqual({ ok: false, code: "invalid_command" });
   });

@@ -16,6 +16,7 @@ import {
   type WorkspaceBootstrapPage,
   type AgentExecution,
   type AgentInvocationIntent,
+  type LightTask,
   type OpenItem,
 } from "@native-im/core";
 import type { AuthenticationErrorCode } from "./auth.js";
@@ -53,6 +54,17 @@ const OPEN_ITEM_CREATE_FIELDS = new Set([
 ]);
 const OPEN_ITEM_TRANSITION_REQUIRED_FIELDS = new Set(["type", "requestId", "roomId", "itemId", "action"]);
 const OPEN_ITEM_TRANSITION_OPTIONAL_FIELDS = new Set(["targetActorId", "reason"]);
+const LIGHT_TASK_CREATE_FIELDS = new Set([
+  "type", "requestId", "roomId", "sourceMessageId", "title", "verifierRole", "criteria",
+]);
+const LIGHT_TASK_CRITERION_FIELDS = new Set(["id", "text"]);
+const LIGHT_TASK_TRANSITION_REQUIRED_FIELDS = new Set([
+  "type", "requestId", "roomId", "taskId", "action",
+]);
+const LIGHT_TASK_TRANSITION_OPTIONAL_FIELDS = new Set(["emptyCriteriaConfirmed"]);
+const LIGHT_TASK_CRITERION_SET_FIELDS = new Set([
+  "type", "requestId", "roomId", "taskId", "criterionId", "met",
+]);
 
 export const PROTOCOL_FIELD_LIMITS = Object.freeze({
   requestId: 128,
@@ -203,6 +215,35 @@ export type OpenItemTransitionFrame = {
   | { readonly action: "transfer"; readonly targetActorId: string; readonly reason: string }
 );
 
+export interface LightTaskCreateFrame {
+  readonly type: "light-task.create";
+  readonly requestId: string;
+  readonly roomId: string;
+  readonly sourceMessageId: string;
+  readonly title: string;
+  readonly verifierRole: "owner" | "admin" | "member";
+  readonly criteria: readonly { readonly id: string; readonly text: string }[];
+}
+
+export type LightTaskTransitionFrame = {
+  readonly type: "light-task.transition";
+  readonly requestId: string;
+  readonly roomId: string;
+  readonly taskId: string;
+} & (
+  | { readonly action: "claim" | "deliver" }
+  | { readonly action: "verify"; readonly emptyCriteriaConfirmed?: true }
+);
+
+export interface LightTaskCriterionSetFrame {
+  readonly type: "light-task.criterion.set";
+  readonly requestId: string;
+  readonly roomId: string;
+  readonly taskId: string;
+  readonly criterionId: string;
+  readonly met: boolean;
+}
+
 export type ClientFrame =
   | AuthLoginFrame
   | AuthResumeFrame
@@ -224,7 +265,10 @@ export type ClientFrame =
   | AgentToolConfirmFrame
   | AgentCompensateFrame
   | OpenItemCreateFrame
-  | OpenItemTransitionFrame;
+  | OpenItemTransitionFrame
+  | LightTaskCreateFrame
+  | LightTaskTransitionFrame
+  | LightTaskCriterionSetFrame;
 
 export interface AuthenticatedFrame {
   readonly type: "auth.authenticated";
@@ -314,6 +358,12 @@ export interface OpenItemAckFrame {
   readonly item: OpenItem;
 }
 
+export interface LightTaskAckFrame {
+  readonly type: "light-task.ack";
+  readonly requestId: string;
+  readonly task: LightTask;
+}
+
 export type ProtocolErrorCode =
   | AuthenticationErrorCode
   | MessageErrorCode
@@ -341,6 +391,7 @@ export type ProtocolErrorCode =
   | "agent_runtime_closed"
   | "execution_conflict"
   | "execution_not_found"
+  | "light_task_not_found"
   | "open_item_not_found"
   | "invalid_parameters"
   | "permission_denied"
@@ -382,6 +433,7 @@ export type ServerFrame =
   | AgentExecutionAckFrame
   | AgentExecutionPreviewFrame
   | OpenItemAckFrame
+  | LightTaskAckFrame
   | ProtocolErrorFrame;
 
 export type ClientFrameParseResult =
@@ -834,6 +886,65 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
       }
       return { ok: false, error: protocolError("open-item.transition requires a closed transition", requestId) };
     }
+    case "light-task.create": {
+      const criteria = value.criteria;
+      if (!hasOnlyFields(value, LIGHT_TASK_CREATE_FIELDS) || requestId === undefined ||
+          !isBoundedString(value.roomId, PROTOCOL_FIELD_LIMITS.roomId) ||
+          !isBoundedString(value.sourceMessageId, PROTOCOL_FIELD_LIMITS.messageId) ||
+          !isBoundedString(value.title, PROTOCOL_FIELD_LIMITS.body) || value.title.trim().length === 0 ||
+          (value.verifierRole !== "owner" && value.verifierRole !== "admin" &&
+           value.verifierRole !== "member") || !Array.isArray(criteria) || criteria.length > 64 ||
+          !criteria.every((criterion) => isRecord(criterion) &&
+            hasOnlyFields(criterion, LIGHT_TASK_CRITERION_FIELDS) &&
+            isBoundedString(criterion.id, PROTOCOL_FIELD_LIMITS.messageId) &&
+            criterion.id.trim().length > 0 &&
+            isBoundedString(criterion.text, PROTOCOL_FIELD_LIMITS.body) &&
+            criterion.text.trim().length > 0) ||
+          new Set(criteria.map((criterion) => (criterion as UnknownRecord).id)).size !== criteria.length) {
+        return { ok: false, error: protocolError("light-task.create requires a closed confirmation", requestId) };
+      }
+      return { ok: true, frame: {
+        type: "light-task.create", requestId, roomId: value.roomId,
+        sourceMessageId: value.sourceMessageId, title: value.title,
+        verifierRole: value.verifierRole, criteria: criteria as LightTaskCreateFrame["criteria"],
+      } };
+    }
+    case "light-task.transition": {
+      if (!hasRequiredAndOptionalFields(
+        value, LIGHT_TASK_TRANSITION_REQUIRED_FIELDS, LIGHT_TASK_TRANSITION_OPTIONAL_FIELDS,
+      ) || requestId === undefined ||
+          !isBoundedString(value.roomId, PROTOCOL_FIELD_LIMITS.roomId) ||
+          !isBoundedString(value.taskId, PROTOCOL_FIELD_LIMITS.messageId)) {
+        return { ok: false, error: protocolError("light-task.transition requires a closed transition", requestId) };
+      }
+      const base = {
+        type: "light-task.transition" as const, requestId, roomId: value.roomId, taskId: value.taskId,
+      };
+      if ((value.action === "claim" || value.action === "deliver") &&
+          value.emptyCriteriaConfirmed === undefined) {
+        return { ok: true, frame: { ...base, action: value.action } };
+      }
+      if (value.action === "verify" &&
+          (value.emptyCriteriaConfirmed === undefined || value.emptyCriteriaConfirmed === true)) {
+        return { ok: true, frame: {
+          ...base, action: "verify",
+          ...(value.emptyCriteriaConfirmed === true ? { emptyCriteriaConfirmed: true as const } : {}),
+        } };
+      }
+      return { ok: false, error: protocolError("light-task.transition requires a closed transition", requestId) };
+    }
+    case "light-task.criterion.set":
+      if (!hasOnlyFields(value, LIGHT_TASK_CRITERION_SET_FIELDS) || requestId === undefined ||
+          !isBoundedString(value.roomId, PROTOCOL_FIELD_LIMITS.roomId) ||
+          !isBoundedString(value.taskId, PROTOCOL_FIELD_LIMITS.messageId) ||
+          !isBoundedString(value.criterionId, PROTOCOL_FIELD_LIMITS.messageId) ||
+          typeof value.met !== "boolean") {
+        return { ok: false, error: protocolError("light-task.criterion.set requires a closed criterion", requestId) };
+      }
+      return { ok: true, frame: {
+        type: "light-task.criterion.set", requestId, roomId: value.roomId,
+        taskId: value.taskId, criterionId: value.criterionId, met: value.met,
+      } };
     default:
       return { ok: false, error: protocolError("Unknown request type", requestId) };
   }

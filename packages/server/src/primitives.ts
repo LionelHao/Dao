@@ -3,6 +3,7 @@ import {
   isAgentJudgement,
   isCalibrationSignal,
   isHumanReadReceipt,
+  isLightTask,
   isOpenItem,
   isOpenItemAgentFailure,
 } from "@native-im/core";
@@ -17,6 +18,7 @@ import type {
   CalibrationSignal,
   HumanActor,
   HumanReadReceipt,
+  LightTask,
   Message,
   OpenItem,
   OpenItemAgentFailure,
@@ -40,6 +42,7 @@ export type {
   AgentJudgementOutcome,
   CalibrationSignal,
   HumanReadReceipt,
+  LightTask,
   OpenItem,
   OpenItemAgentFailure,
   OpenItemOrigin,
@@ -75,6 +78,7 @@ export interface MessageState {
 
 export type AcceptedCollaborationFact =
   | { readonly kind: "human-read"; readonly value: HumanReadReceipt }
+  | { readonly kind: "light-task"; readonly value: LightTask }
   | { readonly kind: "agent-judgment"; readonly value: AgentJudgement }
   | { readonly kind: "open-item"; readonly value: OpenItem }
   | { readonly kind: "open-item-agent-failure"; readonly value: OpenItemAgentFailure }
@@ -124,6 +128,9 @@ type OpenItemCreateCommand = Extract<HumanCollaborationCommand, { readonly type:
 type OpenItemProposalCommand = Extract<AgentCollaborationCommand, { readonly type: "open-item.propose" }>;
 type OpenItemTransitionCommand = Extract<HumanCollaborationCommand, { readonly type: "open-item.transition" }>;
 type OpenItemAgentFailureCommand = Extract<AgentCollaborationCommand, { readonly type: "open-item.agent-failure.record" }>;
+type LightTaskCreateCommand = Extract<HumanCollaborationCommand, { readonly type: "light-task.create" }>;
+type LightTaskTransitionCommand = Extract<HumanCollaborationCommand, { readonly type: "light-task.transition" }>;
+type LightTaskCriterionCommand = Extract<HumanCollaborationCommand, { readonly type: "light-task.criterion.set" }>;
 type AgentExecutionCommand = Extract<AgentCollaborationCommand, { readonly type: "agent.execution.transition" }>;
 type CalibrationCommand = Extract<HumanCollaborationCommand, { readonly type: "calibration.record" }>;
 
@@ -163,6 +170,21 @@ export interface AuthoritativeCollaborationPrimitives {
     roomId: string,
     payload: OpenItemAgentFailureCommand["payload"],
   ): Promise<OpenItemAgentFailure>;
+  createLightTask(
+    context: AuthenticatedCommandContext,
+    roomId: string,
+    payload: LightTaskCreateCommand["payload"],
+  ): Promise<LightTask>;
+  transitionLightTask(
+    context: AuthenticatedCommandContext,
+    roomId: string,
+    payload: LightTaskTransitionCommand["payload"],
+  ): Promise<LightTask>;
+  setLightTaskCriterion(
+    context: AuthenticatedCommandContext,
+    roomId: string,
+    payload: LightTaskCriterionCommand["payload"],
+  ): Promise<LightTask>;
   transitionAgentExecution(
     context: InternalAgentCommandContext,
     roomId: string,
@@ -261,6 +283,32 @@ export function createAuthoritativeCollaborationPrimitives(
         "failure",
         isOpenItemAgentFailure,
         (value) => ({ kind: "open-item-agent-failure", value }),
+      );
+    },
+    createLightTask(context, roomId, payload) {
+      return publish(
+        options.commandStore.executeHuman(context, { type: "light-task.create", roomId, payload }),
+        "task",
+        isLightTask,
+        (value) => ({ kind: "light-task", value }),
+      );
+    },
+    transitionLightTask(context, roomId, payload) {
+      return publish(
+        options.commandStore.executeHuman(context, { type: "light-task.transition", roomId, payload }),
+        "task",
+        isLightTask,
+        (value) => ({ kind: "light-task", value }),
+      );
+    },
+    setLightTaskCriterion(context, roomId, payload) {
+      return publish(
+        options.commandStore.executeHuman(context, {
+          type: "light-task.criterion.set", roomId, payload,
+        }),
+        "task",
+        isLightTask,
+        (value) => ({ kind: "light-task", value }),
       );
     },
     transitionAgentExecution(context, roomId, payload) {

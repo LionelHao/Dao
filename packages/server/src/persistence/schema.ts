@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
-export const AUTHORITY_SCHEMA_VERSION = 8 as const;
+export const AUTHORITY_SCHEMA_VERSION = 9 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -31,6 +31,8 @@ const V7_MIGRATION_CHECKSUM =
   "4ad86ad359400228cf5428d7bb59c5fc371009904fe50cfedd4641e79e6d4977";
 const V8_MIGRATION_CHECKSUM =
   "b0eb63981b5ee92cfd51133972e78c4054c3fdf155cee58ce4c029564ed6d1d1";
+const V9_MIGRATION_CHECKSUM =
+  "802bd498bf342a575fa21fb46e18b7a375259bd40a571844bb375d756c0616b2";
 const SCHEMA_FINGERPRINTS = {
   1: "03f2bbba4aa7082ec01819824726ce1bd9b4bd14cebea71afc93c6821dbf405c",
   2: "01c37d92ec2f303613a7bb8b592ca846fbea7c829b3c81fe4521699db949dfcc",
@@ -40,6 +42,7 @@ const SCHEMA_FINGERPRINTS = {
   6: "0e5c764a0fae33f00eae7bfd2e21dbbc4d54781d43ef5aa967c6dfeef8c58035",
   7: "9827d65dd5eac378112a51859251ac842d4393c518f21f8862956aa6ebd0edae",
   8: "7dcef5f3d765e7d19015f19aca2d033aee0f0b3c07f53c4934e3c1d2b6053f20",
+  9: "0374dbc27aa894ec239c89bcc6682fc53b219c8a2e150dfea3389beb7bf8e4e7",
 } as const;
 
 const V1_STATEMENTS = [
@@ -694,6 +697,131 @@ const V8_STATEMENTS = [
    END`,
 ] as const;
 
+const V9_STATEMENTS = [
+  `CREATE TABLE light_tasks (
+    id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    source_message_id TEXT NOT NULL REFERENCES messages(id),
+    title TEXT NOT NULL CHECK (length(trim(title)) > 0),
+    claimant_actor_id TEXT REFERENCES actors(id),
+    claimant_role_at_claim TEXT CHECK (
+      claimant_role_at_claim IS NULL OR claimant_role_at_claim IN ('owner', 'admin', 'member')
+    ),
+    verifier_role TEXT NOT NULL CHECK (verifier_role IN ('owner', 'admin', 'member')),
+    verifier_actor_id TEXT REFERENCES actors(id),
+    criteria_json TEXT NOT NULL CHECK (
+      json_valid(criteria_json) AND json_type(criteria_json) = 'array'
+    ),
+    status TEXT NOT NULL CHECK (status IN ('todo', 'claimed', 'delivered', 'verified')),
+    created_at TEXT NOT NULL,
+    claimed_at TEXT,
+    delivered_at TEXT,
+    verified_at TEXT,
+    CHECK (
+      (status = 'todo' AND claimant_actor_id IS NULL AND claimant_role_at_claim IS NULL
+       AND verifier_actor_id IS NULL AND claimed_at IS NULL AND delivered_at IS NULL
+       AND verified_at IS NULL)
+      OR
+      (status = 'claimed' AND claimant_actor_id IS NOT NULL AND claimant_role_at_claim IS NOT NULL
+       AND verifier_actor_id IS NULL AND claimed_at IS NOT NULL AND delivered_at IS NULL
+       AND verified_at IS NULL)
+      OR
+      (status = 'delivered' AND claimant_actor_id IS NOT NULL AND claimant_role_at_claim IS NOT NULL
+       AND verifier_actor_id IS NOT NULL AND claimed_at IS NOT NULL AND delivered_at IS NOT NULL
+       AND verified_at IS NULL AND claimant_actor_id <> verifier_actor_id
+       AND claimant_role_at_claim <> verifier_role)
+      OR
+      (status = 'verified' AND claimant_actor_id IS NOT NULL AND claimant_role_at_claim IS NOT NULL
+       AND verifier_actor_id IS NOT NULL AND claimed_at IS NOT NULL AND delivered_at IS NOT NULL
+       AND verified_at IS NOT NULL AND claimant_actor_id <> verifier_actor_id
+       AND claimant_role_at_claim <> verifier_role)
+    )
+  ) STRICT`,
+  `CREATE INDEX light_tasks_room_id_id_v9 ON light_tasks(room_id, id)`,
+  `CREATE INDEX light_tasks_active_actor_v9
+   ON light_tasks(room_id, status, claimant_actor_id, verifier_actor_id, id)`,
+  `CREATE TRIGGER light_tasks_validate_insert_v9
+   BEFORE INSERT ON light_tasks
+   WHEN COALESCE((SELECT room_id FROM messages WHERE id = NEW.source_message_id), '') <> NEW.room_id
+      OR (NEW.claimant_actor_id IS NOT NULL AND
+          COALESCE((SELECT kind FROM actors WHERE id = NEW.claimant_actor_id), '') <> 'human')
+      OR (NEW.verifier_actor_id IS NOT NULL AND
+          COALESCE((SELECT kind FROM actors WHERE id = NEW.verifier_actor_id), '') <> 'human')
+      OR (NEW.status = 'verified' AND EXISTS (
+        SELECT 1 FROM json_each(NEW.criteria_json) AS criterion
+        WHERE json_extract(criterion.value, '$.met') <> 1
+      ))
+      OR EXISTS (
+        SELECT 1 FROM json_each(NEW.criteria_json) AS criterion
+        WHERE json_type(criterion.value) <> 'object'
+           OR (SELECT COUNT(*) FROM json_each(criterion.value)) <> 3
+           OR json_type(criterion.value, '$.id') <> 'text'
+           OR json_type(criterion.value, '$.text') <> 'text'
+           OR json_type(criterion.value, '$.met') NOT IN ('true', 'false')
+           OR length(trim(COALESCE(json_extract(criterion.value, '$.id'), ''))) = 0
+           OR length(trim(COALESCE(json_extract(criterion.value, '$.text'), ''))) = 0
+      )
+      OR EXISTS (
+        SELECT 1 FROM json_each(NEW.criteria_json) AS criterion
+        GROUP BY json_extract(criterion.value, '$.id') HAVING COUNT(*) > 1
+      )
+   BEGIN
+     SELECT RAISE(ABORT, 'canonical light task is invalid');
+   END`,
+  `CREATE TRIGGER light_tasks_validate_update_v9
+   BEFORE UPDATE ON light_tasks
+   WHEN NEW.id <> OLD.id OR NEW.room_id <> OLD.room_id
+      OR NEW.source_message_id <> OLD.source_message_id OR NEW.title <> OLD.title
+      OR NEW.verifier_role <> OLD.verifier_role OR NEW.created_at <> OLD.created_at
+      OR OLD.status = 'verified'
+      OR (OLD.status = 'todo' AND NEW.status NOT IN ('todo', 'claimed'))
+      OR (OLD.status = 'claimed' AND NEW.status NOT IN ('claimed', 'delivered'))
+      OR (OLD.status = 'delivered' AND NEW.status NOT IN ('delivered', 'verified'))
+      OR (OLD.claimant_actor_id IS NOT NULL AND NEW.claimant_actor_id IS NOT OLD.claimant_actor_id)
+      OR (OLD.claimant_role_at_claim IS NOT NULL
+          AND NEW.claimant_role_at_claim IS NOT OLD.claimant_role_at_claim)
+      OR (OLD.verifier_actor_id IS NOT NULL AND NEW.verifier_actor_id IS NOT OLD.verifier_actor_id)
+      OR (OLD.claimant_actor_id IS NULL AND NEW.claimant_actor_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM room_memberships AS membership
+        WHERE membership.room_id = NEW.room_id
+          AND membership.actor_id = NEW.claimant_actor_id
+          AND membership.kind = 'human'
+          AND membership.role = NEW.claimant_role_at_claim
+      ))
+      OR (OLD.verifier_actor_id IS NULL AND NEW.verifier_actor_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM room_memberships AS membership
+        WHERE membership.room_id = NEW.room_id
+          AND membership.actor_id = NEW.verifier_actor_id
+          AND membership.kind = 'human'
+          AND membership.role = NEW.verifier_role
+      ))
+      OR (NEW.status = 'verified' AND EXISTS (
+        SELECT 1 FROM json_each(NEW.criteria_json) AS criterion
+        WHERE json_extract(criterion.value, '$.met') <> 1
+      ))
+      OR (NEW.criteria_json <> OLD.criteria_json AND OLD.status <> 'delivered')
+      OR json_array_length(NEW.criteria_json) <> json_array_length(OLD.criteria_json)
+      OR EXISTS (
+        SELECT 1 FROM json_each(OLD.criteria_json) AS criterion
+        WHERE json_extract(NEW.criteria_json, '$[' || criterion.key || '].id')
+                IS NOT json_extract(criterion.value, '$.id')
+           OR json_extract(NEW.criteria_json, '$[' || criterion.key || '].text')
+                IS NOT json_extract(criterion.value, '$.text')
+      )
+   BEGIN
+     SELECT RAISE(ABORT, 'canonical light task update is invalid');
+   END`,
+  `CREATE TRIGGER messages_validate_light_tasks_update_v9
+   BEFORE UPDATE OF room_id ON messages
+   WHEN EXISTS (
+     SELECT 1 FROM light_tasks
+     WHERE source_message_id = OLD.id AND room_id <> NEW.room_id
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'message update would break light task references');
+   END`,
+] as const;
+
 const V2_STATEMENTS = [
   `ALTER TABLE actors
    ADD COLUMN catalog_revision INTEGER NOT NULL DEFAULT 0
@@ -1078,6 +1206,7 @@ const MIGRATIONS = [
   defineMigration(6, "agent-runtime-authority", V6_STATEMENTS, V6_MIGRATION_CHECKSUM),
   defineMigration(7, "single-route-authority", V7_STATEMENTS, V7_MIGRATION_CHECKSUM),
   defineMigration(8, "closed-open-item-authority", V8_STATEMENTS, V8_MIGRATION_CHECKSUM),
+  defineMigration(9, "closed-light-task-authority", V9_STATEMENTS, V9_MIGRATION_CHECKSUM),
 ] as const satisfies readonly Migration[];
 
 const V1_SCHEMA_CONTRACT = {
@@ -1354,6 +1483,15 @@ const V8_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V9_SCHEMA_CONTRACT = {
+  ...V8_SCHEMA_CONTRACT,
+  light_tasks: [
+    "id", "room_id", "source_message_id", "title", "claimant_actor_id",
+    "claimant_role_at_claim", "verifier_role", "verifier_actor_id", "criteria_json",
+    "status", "created_at", "claimed_at", "delivered_at", "verified_at",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
@@ -1363,6 +1501,7 @@ const SCHEMA_CONTRACTS = {
   6: V6_SCHEMA_CONTRACT,
   7: V7_SCHEMA_CONTRACT,
   8: V8_SCHEMA_CONTRACT,
+  9: V9_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -1774,6 +1913,44 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
       "OpenItem Agent failures must reference the active Agent owner and failed attempt",
     );
   }
+  if (schemaVersion >= 9) {
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM light_tasks AS task
+       JOIN messages AS source ON source.id = task.source_message_id
+       LEFT JOIN actors AS claimant ON claimant.id = task.claimant_actor_id
+       LEFT JOIN actors AS verifier ON verifier.id = task.verifier_actor_id
+       WHERE source.room_id <> task.room_id
+          OR (task.claimant_actor_id IS NOT NULL AND claimant.kind <> 'human')
+          OR (task.verifier_actor_id IS NOT NULL AND verifier.kind <> 'human')
+          OR (task.status = 'verified' AND EXISTS (
+            SELECT 1 FROM json_each(task.criteria_json) AS criterion
+            WHERE json_extract(criterion.value, '$.met') <> 1
+          ))
+       LIMIT 1`,
+      "closed LightTasks must keep same-room source, human audit actors, and met verification criteria",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM light_tasks AS task, json_each(task.criteria_json) AS criterion
+       WHERE json_type(criterion.value) <> 'object'
+          OR (SELECT COUNT(*) FROM json_each(criterion.value)) <> 3
+          OR json_type(criterion.value, '$.id') <> 'text'
+          OR json_type(criterion.value, '$.text') <> 'text'
+          OR json_type(criterion.value, '$.met') NOT IN ('true', 'false')
+          OR length(trim(COALESCE(json_extract(criterion.value, '$.id'), ''))) = 0
+          OR length(trim(COALESCE(json_extract(criterion.value, '$.text'), ''))) = 0
+          OR EXISTS (
+            SELECT 1 FROM json_each(task.criteria_json) AS duplicate
+            WHERE duplicate.key <> criterion.key
+              AND json_extract(duplicate.value, '$.id') = json_extract(criterion.value, '$.id')
+          )
+       LIMIT 1`,
+      "LightTask criteria must be closed and uniquely identified",
+    );
+  }
 }
 
 function validateExistingSchema(database: DatabaseSync, currentVersion: number): void {
@@ -1933,6 +2110,12 @@ export function migrateAuthorityDatabaseToPreviousVersionForTest(
   database: DatabaseSync,
 ): void {
   migrateAuthorityDatabaseToVersion(database, AUTHORITY_SCHEMA_VERSION - 1);
+}
+
+export function migrateAuthorityDatabaseToVersion7ForTest(
+  database: DatabaseSync,
+): void {
+  migrateAuthorityDatabaseToVersion(database, 7);
 }
 
 export function migrateAuthorityDatabaseToVersion6ForTest(

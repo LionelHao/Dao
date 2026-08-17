@@ -5,6 +5,7 @@ import {
   isAgentRoomMembership,
   isCalibrationSignal,
   isHumanReadReceipt,
+  isLightTask,
   isRoomCursor,
   isHumanRoomMembership,
   isMessage,
@@ -357,6 +358,17 @@ type CommandActorFreePayload = {
   readonly authorKind?: never;
 };
 
+type LightTaskPlanningFreePayload = {
+  readonly deps?: never;
+  readonly maturity?: never;
+  readonly milestone?: never;
+  readonly blueprintTaskId?: never;
+  readonly status?: never;
+  readonly blocked?: never;
+  readonly dropped?: never;
+  readonly superseded?: never;
+};
+
 export type CollaborationCommand =
   | { readonly type: "message.send"; readonly roomId: string; readonly payload: MessageDraft & CommandActorFreePayload }
   | {
@@ -427,6 +439,34 @@ export type CollaborationCommand =
       } & CommandActorFreePayload;
     }
   | {
+      readonly type: "light-task.create";
+      readonly roomId: string;
+      readonly payload: {
+        readonly sourceMessageId: string;
+        readonly title: string;
+        readonly verifierRole: "owner" | "admin" | "member";
+        readonly criteria: readonly { readonly id: string; readonly text: string }[];
+      } & CommandActorFreePayload & LightTaskPlanningFreePayload;
+    }
+  | {
+      readonly type: "light-task.transition";
+      readonly roomId: string;
+      readonly payload: {
+        readonly taskId: string;
+        readonly action: "claim" | "deliver" | "verify";
+        readonly emptyCriteriaConfirmed?: true;
+      } & CommandActorFreePayload;
+    }
+  | {
+      readonly type: "light-task.criterion.set";
+      readonly roomId: string;
+      readonly payload: {
+        readonly taskId: string;
+        readonly criterionId: string;
+        readonly met: boolean;
+      } & CommandActorFreePayload;
+    }
+  | {
       readonly type: "calibration.record";
       readonly roomId: string;
       readonly payload: ({
@@ -440,7 +480,7 @@ export type CollaborationCommand =
 
 export type HumanCollaborationCommand = Extract<
   CollaborationCommand,
-  { readonly type: "message.send" | "human.read.record" | "open-item.create" | "open-item.transition" | "calibration.record" }
+  { readonly type: "message.send" | "human.read.record" | "open-item.create" | "open-item.transition" | "light-task.create" | "light-task.transition" | "light-task.criterion.set" | "calibration.record" }
 >;
 
 export type AgentCollaborationCommand = Extract<
@@ -683,6 +723,31 @@ function isCollaborationCommand(value: UnknownRecord): boolean {
       text(payload.itemId) && text(payload.executionId) && count(payload.attemptSeq, 1) &&
       text(payload.reasonCode);
   }
+  if (value.type === "light-task.create") {
+    return exact(payload, ["sourceMessageId", "title", "verifierRole", "criteria"]) &&
+      text(payload.sourceMessageId) && text(payload.title) && payload.title.trim().length > 0 &&
+      (payload.verifierRole === "owner" || payload.verifierRole === "admin" ||
+        payload.verifierRole === "member") && Array.isArray(payload.criteria) &&
+      payload.criteria.length <= 64 && payload.criteria.every((criterion) =>
+        isRecord(criterion) && exact(criterion, ["id", "text"]) &&
+        text(criterion.id) && criterion.id.trim().length > 0 &&
+        text(criterion.text) && criterion.text.trim().length > 0) &&
+      new Set(payload.criteria.map((criterion) => (criterion as UnknownRecord).id)).size ===
+        payload.criteria.length;
+  }
+  if (value.type === "light-task.transition") {
+    return text(payload.taskId) && (
+      ((payload.action === "claim" || payload.action === "deliver") &&
+        exact(payload, ["taskId", "action"])) ||
+      (payload.action === "verify" && exact(payload, ["taskId", "action"],
+        payload.emptyCriteriaConfirmed === true ? ["emptyCriteriaConfirmed"] : []) &&
+        (payload.emptyCriteriaConfirmed === undefined || payload.emptyCriteriaConfirmed === true))
+    );
+  }
+  if (value.type === "light-task.criterion.set") {
+    return exact(payload, ["taskId", "criterionId", "met"]) && text(payload.taskId) &&
+      text(payload.criterionId) && typeof payload.met === "boolean";
+  }
   if (value.type === "agent.execution.transition") {
     return exact(payload, ["executionId", "sourceMessageId", "toolName", "status"], ["result"]) &&
       text(payload.executionId) && text(payload.sourceMessageId) && text(payload.toolName) &&
@@ -816,6 +881,9 @@ function validRoomEventPayload(
   }
   if (type === "room.open_item.agent_attempt_failed") {
     return isOpenItemAgentFailure(payload);
+  }
+  if (type === "room.light_task.changed") {
+    return isLightTask(payload) && payload.roomId === roomId;
   }
   if (type === "room.agent_execution.changed") {
     return isAgentExecution(payload) && payload.roomId === roomId && payload.agentId === eventActorId;

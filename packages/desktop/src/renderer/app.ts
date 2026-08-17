@@ -3,6 +3,7 @@ import {
   isAgentJudgement,
   isCalibrationSignal,
   isHumanReadReceipt,
+  isLightTask,
   isOpenItem,
   isRouteJudgment,
   isSocialReaction,
@@ -16,6 +17,7 @@ import {
   type HumanActor,
   type HumanInvitationRequest,
   type HumanReadReceipt,
+  type LightTask,
   type Message,
   type OpenItem,
   type RouteJudgment,
@@ -29,6 +31,7 @@ export interface RestoredPrimitivePreviewRecords {
   readonly agentJudgements: readonly AgentJudgement[];
   readonly routeJudgments: readonly RouteJudgment[];
   readonly openItems: readonly OpenItem[];
+  readonly lightTasks: readonly LightTask[];
   readonly agentExecutions: readonly AgentExecution[];
   readonly socialReactions: readonly SocialReaction[];
   readonly calibrations: readonly CalibrationSignal[];
@@ -1119,6 +1122,44 @@ function appendAddressingPreview(
     }
     section.append(openItem);
   }
+  const lightTaskStatusLabels: Readonly<Record<LightTask["status"], string>> = {
+    todo: "待认领",
+    claimed: "已认领",
+    delivered: "待验收",
+    verified: "已验收",
+  };
+  for (const record of records.lightTasks) {
+    const lightTask = primitiveElement(
+      "article",
+      "light-task",
+      `轻任务 · ${record.title} · ${lightTaskStatusLabels[record.status]}`,
+    );
+    lightTask.dataset.lightTaskStatus = record.status;
+    lightTask.dataset.sourceMessageId = record.sourceMessageId;
+    lightTask.append(
+      primitiveElement("span", "light-task__claimant", `认领人：${record.claimant ?? "未认领"}`),
+      primitiveElement(
+        "span",
+        "light-task__verifier",
+        `验收角色：${record.verifierRole} · 验收人：${record.verifierActorId ?? "交付时解析"}`,
+      ),
+      primitiveElement("span", "light-task__source", `来源消息：${record.sourceMessageId}`),
+    );
+    const criteria = primitiveElement("ul", "light-task__criteria");
+    if (record.criteria.length === 0) {
+      criteria.append(primitiveElement("li", "light-task__criterion", "无预设 criteria · 验收需显式确认"));
+    } else {
+      for (const criterion of record.criteria) {
+        const item = primitiveElement(
+          "li", "light-task__criterion", `${criterion.met ? "✓" : "○"} ${criterion.text}`,
+        );
+        item.dataset.criterionMet = String(criterion.met);
+        criteria.append(item);
+      }
+    }
+    lightTask.append(criteria);
+    section.append(lightTask);
+  }
   const executionStatusLabels: Readonly<Record<AgentExecution["status"], string>> = {
     queued: "已排队",
     running: "正在调用",
@@ -1259,6 +1300,21 @@ const defaultRestoredPrimitiveRecords: RestoredPrimitivePreviewRecords = {
       transferredAt: "2026-08-08T10:03:01.000Z",
     }],
   }],
+  lightTasks: [{
+    id: "preview-light-task",
+    roomId: "preview-room",
+    sourceMessageId: "preview-human-mention",
+    title: "完成权限边界复核",
+    claimant: "陈研发",
+    claimantRoleAtClaim: "member",
+    verifierRole: "owner",
+    verifierActorId: "周安全",
+    criteria: [{ id: "preview-criterion", text: "权限矩阵已复核", met: false }],
+    status: "delivered",
+    createdAt: "2026-08-08T10:03:10.000Z",
+    claimedAt: "2026-08-08T10:03:20.000Z",
+    deliveredAt: "2026-08-08T10:03:30.000Z",
+  }],
   agentExecutions: [{
     id: "preview-agent-execution",
     roomId: "preview-room",
@@ -1298,17 +1354,19 @@ function validateRestoredPrimitiveRecords(records: RestoredPrimitivePreviewRecor
   if (typeof records !== "object" || records === null ||
       Object.keys(records).sort().join(",") !== [
         "agentExecutions", "agentJudgements", "calibrations", "humanReads",
-        "openItems", "routeJudgments", "socialReactions",
+        "lightTasks", "openItems", "routeJudgments", "socialReactions",
       ].join(",") ||
       !Array.isArray(records.humanReads) || !Array.isArray(records.agentJudgements) ||
       !Array.isArray(records.routeJudgments) ||
-      !Array.isArray(records.openItems) || !Array.isArray(records.agentExecutions) ||
+      !Array.isArray(records.openItems) || !Array.isArray(records.lightTasks) ||
+      !Array.isArray(records.agentExecutions) ||
       !Array.isArray(records.socialReactions) || !Array.isArray(records.calibrations)) {
     throw new TypeError("Restored collaboration record envelope is not closed");
   }
   const messageIds = new Set(["preview-human-mention", "preview-agent-data"]);
   const primitiveIds = [
-    ...records.humanReads, ...records.agentJudgements, ...records.routeJudgments, ...records.openItems,
+    ...records.humanReads, ...records.agentJudgements, ...records.routeJudgments,
+    ...records.openItems, ...records.lightTasks,
     ...records.agentExecutions, ...records.socialReactions, ...records.calibrations,
   ].map((record) => record.id);
   if (new Set(primitiveIds).size !== primitiveIds.length) {
@@ -1322,6 +1380,9 @@ function validateRestoredPrimitiveRecords(records: RestoredPrimitivePreviewRecor
         isRouteJudgment(record) && messageIds.has(record.sourceMessageId)) ||
       !records.openItems.every((record) =>
         isOpenItem(record) && record.roomId === "preview-room" &&
+        messageIds.has(record.sourceMessageId)) ||
+      !records.lightTasks.every((record) =>
+        isLightTask(record) && record.roomId === "preview-room" &&
         messageIds.has(record.sourceMessageId)) ||
       !records.agentExecutions.every((record) =>
         isAgentExecution(record) && record.roomId === "preview-room" &&

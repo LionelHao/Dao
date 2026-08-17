@@ -544,7 +544,7 @@ describe("LegacyStateImporter", () => {
     const creator = track(
       await createWorkerDatabaseClient({ databasePath: stagingPath }),
     );
-    await expect(creator.inspectSchema()).resolves.toEqual({ version: 8 });
+    await expect(creator.inspectSchema()).resolves.toEqual({ version: 9 });
     await creator.close();
     writeFileSync(
       recoveryPath,
@@ -644,7 +644,7 @@ describe("LegacyStateImporter", () => {
     expect(lstatSync(databasePath, { bigint: true }).nlink).toBe(1n);
 
     const restarted = track(await createWorkerDatabaseClient({ databasePath }));
-    await expect(restarted.inspectSchema()).resolves.toEqual({ version: 8 });
+    await expect(restarted.inspectSchema()).resolves.toEqual({ version: 9 });
     await expect(restarted.inspectLegacyImport()).resolves.toMatchObject({
       markerVersion: 1,
       actors: 3,
@@ -726,7 +726,7 @@ describe("LegacyStateImporter", () => {
     rmSync(unrelatedHardlinkPath);
 
     const restarted = track(await createWorkerDatabaseClient({ databasePath }));
-    await expect(restarted.inspectSchema()).resolves.toEqual({ version: 8 });
+    await expect(restarted.inspectSchema()).resolves.toEqual({ version: 9 });
     await expect(restarted.inspectLegacyImport()).resolves.toMatchObject({
       markerVersion: 1,
       actors: 3,
@@ -742,7 +742,7 @@ describe("LegacyStateImporter", () => {
     const directory = fixtureDirectory();
     const databasePath = join(directory, "authority.sqlite");
     const creator = track(await createWorkerDatabaseClient({ databasePath }));
-    await expect(creator.inspectSchema()).resolves.toEqual({ version: 8 });
+    await expect(creator.inspectSchema()).resolves.toEqual({ version: 9 });
     await creator.close();
     const before = readFileSync(databasePath);
     const nonce = "00000000-0000-4000-8000-000000000040";
@@ -776,7 +776,7 @@ describe("LegacyStateImporter", () => {
     const databasePath = join(directory, "authority.sqlite");
     const fixture = writeLegacyFixture(directory);
     const creator = track(await createWorkerDatabaseClient({ databasePath }));
-    await expect(creator.inspectSchema()).resolves.toEqual({ version: 8 });
+    await expect(creator.inspectSchema()).resolves.toEqual({ version: 9 });
     await creator.close();
     const before = readFileSync(databasePath);
 
