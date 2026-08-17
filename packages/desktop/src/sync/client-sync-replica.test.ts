@@ -800,6 +800,30 @@ describe("ClientSyncReplica", () => {
     });
   });
 
+  it("ignores an unseen stale subscription batch already covered by the repair cursor", async () => {
+    const transport = new FakeTransport();
+    const cache = new MemoryCache();
+    transport.subscribeRoom = async (roomId, cursor, observer) => {
+      expect(roomId).toBe("room-1");
+      expect(cursor).toEqual({ version: 1, roomId: "room-1", afterSeq: 9 });
+      await observer.events([event(9, "snapshot-covered-event")], {
+        version: 1, roomId: "room-1", afterSeq: 9,
+      });
+      await observer.events([event(10)], {
+        version: 1, roomId: "room-1", afterSeq: 10,
+      });
+      return new FakeSubscription({ ...cursor, afterSeq: 10 });
+    };
+    const replica = createClientSyncReplica({ transport, cache });
+
+    await replica.repairRoom("room-1");
+
+    expect(cache.liveRoom("room-1")?.events.map((item) => item.streamSeq)).toEqual([10]);
+    expect(cache.roomCursor("room-1")).toEqual({
+      version: 1, roomId: "room-1", afterSeq: 10,
+    });
+  });
+
   it("does not let a stale retry replace a newer room subscription", async () => {
     const transport = new FakeTransport();
     const cache = new MemoryCache();

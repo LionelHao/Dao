@@ -3,6 +3,7 @@ import {
   isAgentJudgement,
   isCalibrationSignal,
   isHumanReadReceipt,
+  isHumanPreemptionNotice,
   isLightTask,
   isNeedsActionProjection,
   isOpenItem,
@@ -18,6 +19,7 @@ import {
   type HumanActor,
   type HumanInvitationRequest,
   type HumanReadReceipt,
+  type HumanPreemptionNotice,
   type LightTask,
   type NeedsActionProjection,
   type Message,
@@ -117,6 +119,25 @@ export function renderAgentExecutionPreview(
   element.dataset.attemptSeq = String(preview.attemptSeq);
   element.dataset.streamSeq = String(preview.streamSeq);
   element.textContent = `${element.textContent ?? ""}${preview.delta}`;
+  root.replaceChildren(element);
+}
+
+export function renderHumanPreemptionNotice(
+  root: HTMLElement,
+  notice: HumanPreemptionNotice,
+): void {
+  if (!isHumanPreemptionNotice(notice)) {
+    throw new TypeError("Human preemption notice is not closed");
+  }
+  const element = document.createElement("aside");
+  element.className = "human-preemption-notice";
+  element.dataset.sourceHumanMessageId = notice.sourceHumanMessageId;
+  element.dataset.cancelledExecutionCount = String(notice.cancelledExecutionIds.length);
+  element.dataset.rerouteStatus = notice.rerouteStatus;
+  element.setAttribute("aria-live", "polite");
+  element.textContent = notice.cancelledExecutionIds.length === 0
+    ? "检测到人类发言，Agent 发言判定已刷新"
+    : `检测到人类发言，${notice.cancelledExecutionIds.length} 个旧 Agent 执行已取消并重新判定`;
   root.replaceChildren(element);
 }
 
@@ -1210,13 +1231,29 @@ function appendAddressingPreview(
   };
   for (const record of records.agentExecutions) {
     const agentLabel = record.agentId === "agent-data" ? "数据 Agent" : record.agentId;
+    const humanPreempted = record.status === "cancelled" &&
+      record.cancellationReason?.startsWith("human_preempted:") === true;
+    const requeued = record.status === "queued" && record.supersedesExecutionIds !== undefined;
+    const executionState = humanPreempted
+      ? "因人类发言已取消"
+      : requeued
+        ? "已重新排队"
+        : executionStatusLabels[record.status];
     const invocation = primitiveElement(
       "div",
       "agent-invocation",
-      `Agent 执行 · ${agentLabel} ${executionStatusLabels[record.status]} · ${executionActionLabels[record.actionCategory]} · attempt ${record.currentAttemptSeq} · ${record.toolName}`,
+      `Agent 执行 · ${agentLabel} ${executionState} · ${executionActionLabels[record.actionCategory]} · attempt ${record.currentAttemptSeq} · ${record.toolName}`,
     );
     invocation.dataset.agentInvocation = record.agentId;
     invocation.dataset.executionStatus = record.status;
+    if (humanPreempted) {
+      invocation.classList.add("agent-invocation--human-preempted");
+      invocation.dataset.preemptedByMessageId = record.cancellationReason!.slice("human_preempted:".length);
+    }
+    if (requeued) {
+      invocation.classList.add("agent-invocation--requeued");
+      invocation.dataset.supersedesExecutionIds = record.supersedesExecutionIds!.join(",");
+    }
     const status = primitiveElement(
       "span",
       "member-status-label",

@@ -130,13 +130,41 @@ function appendEvents(
   body?: (seq: number) => string,
   eventFactory: (roomId: string, seq: number) => PersistedRoomEvent = roomEvent,
 ): void {
-  for (let streamSeq = 1; streamSeq <= count; streamSeq += 1) {
-    appendEvent(
-      databasePath,
-      body === undefined
-        ? eventFactory(roomId, streamSeq)
-        : roomEvent(roomId, streamSeq, body(streamSeq)),
+  const database = new DatabaseSync(databasePath);
+  try {
+    database.exec("BEGIN IMMEDIATE");
+    const advance = database.prepare(
+      `UPDATE streams SET head_seq = ?
+       WHERE stream_kind = 'room' AND stream_id = ? AND head_seq = ?`,
     );
+    const insert = database.prepare(
+      `INSERT INTO events (
+         event_id, stream_kind, stream_id, stream_seq, room_id,
+         actor_id, event_type, occurred_at, payload_json
+       ) VALUES (?, 'room', ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    for (let streamSeq = 1; streamSeq <= count; streamSeq += 1) {
+      const event = body === undefined
+        ? eventFactory(roomId, streamSeq)
+        : roomEvent(roomId, streamSeq, body(streamSeq));
+      advance.run(event.streamSeq, event.roomId, event.streamSeq - 1);
+      insert.run(
+        event.eventId,
+        event.streamId,
+        event.streamSeq,
+        event.roomId,
+        event.actorId,
+        event.type,
+        event.occurredAt,
+        JSON.stringify(event.payload),
+      );
+    }
+    database.exec("COMMIT");
+  } catch (error: unknown) {
+    database.exec("ROLLBACK");
+    throw error;
+  } finally {
+    database.close();
   }
 }
 
@@ -784,7 +812,7 @@ describe("permission-aware retained room sync", () => {
       ).get(),
     }).toEqual(before);
     database.close();
-    await expect(fixture.client.inspectSchema()).resolves.toEqual({ version: 10 });
+    await expect(fixture.client.inspectSchema()).resolves.toEqual({ version: 11 });
     const context = fixture.contexts[0];
     if (context === undefined) throw new Error("missing fixture context");
     await expect(fixture.sync.syncRoom(

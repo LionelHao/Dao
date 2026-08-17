@@ -192,6 +192,15 @@ export interface AgentExecution {
   readonly nextRetryAt?: string;
   readonly manualRetryOfExecutionId?: string;
   readonly compensatesExecutionId?: string;
+  readonly supersedesExecutionIds?: readonly string[];
+}
+
+export interface HumanPreemptionNotice {
+  readonly roomId: string;
+  readonly sourceHumanMessageId: string;
+  readonly cancelledExecutionIds: readonly string[];
+  readonly rerouteStatus: "queued";
+  readonly occurredAt: string;
 }
 
 export interface AgentExecutionAttempt {
@@ -808,6 +817,7 @@ export function isAgentExecution(value: unknown): value is AgentExecution {
       "toolDispatchPhase", "providerId", "modelId", "startedAt", "completedAt",
       "cancellationReason", "terminalErrorCode", "deadLetteredAt", "resultMessageId",
       "nextRetryAt", "manualRetryOfExecutionId", "compensatesExecutionId",
+      "supersedesExecutionIds",
     ],
   )) {
     return false;
@@ -842,8 +852,25 @@ export function isAgentExecution(value: unknown): value is AgentExecution {
     (!Object.hasOwn(value, "resultMessageId") || (status === "completed" && isNonEmptyString(value.resultMessageId))) &&
     (!Object.hasOwn(value, "nextRetryAt") || (status === "queued" && isNonEmptyString(value.nextRetryAt))) &&
     (!Object.hasOwn(value, "manualRetryOfExecutionId") || isNonEmptyString(value.manualRetryOfExecutionId)) &&
-    (!Object.hasOwn(value, "compensatesExecutionId") || isNonEmptyString(value.compensatesExecutionId))
+    (!Object.hasOwn(value, "compensatesExecutionId") || isNonEmptyString(value.compensatesExecutionId)) &&
+    (!Object.hasOwn(value, "supersedesExecutionIds") || (
+      Array.isArray(value.supersedesExecutionIds) && value.supersedesExecutionIds.length > 0 &&
+      value.supersedesExecutionIds.length <= 32 &&
+      value.supersedesExecutionIds.every(isNonEmptyString) &&
+      new Set(value.supersedesExecutionIds).size === value.supersedesExecutionIds.length &&
+      !value.supersedesExecutionIds.includes(value.id as string)
+    ))
   );
+}
+
+export function isHumanPreemptionNotice(value: unknown): value is HumanPreemptionNotice {
+  return isRecord(value) && hasExactKeys(value, [
+    "roomId", "sourceHumanMessageId", "cancelledExecutionIds", "rerouteStatus", "occurredAt",
+  ]) && isNonEmptyString(value.roomId) && isNonEmptyString(value.sourceHumanMessageId) &&
+    Array.isArray(value.cancelledExecutionIds) && value.cancelledExecutionIds.length <= 33 &&
+    value.cancelledExecutionIds.every(isNonEmptyString) &&
+    new Set(value.cancelledExecutionIds).size === value.cancelledExecutionIds.length &&
+    value.rerouteStatus === "queued" && isNonEmptyString(value.occurredAt);
 }
 
 export function isSocialReaction(value: unknown): value is SocialReaction {

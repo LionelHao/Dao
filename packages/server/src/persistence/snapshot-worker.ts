@@ -350,6 +350,18 @@ function canonicalLegacyExecution(row: Record<string, unknown>): AgentExecution 
   const toolDispatchPhase = row.toolDispatchPhase === "not_started" ||
     row.toolDispatchPhase === "dispatched" || row.toolDispatchPhase === "finished"
     ? row.toolDispatchPhase : status === "running" ? "dispatched" : "finished";
+  const supersedesExecutionIds = row.supersedesExecutionIdsJson === null ||
+    row.supersedesExecutionIdsJson === undefined
+    ? undefined
+    : parseJson(row.supersedesExecutionIdsJson);
+  if (supersedesExecutionIds !== undefined &&
+      (!Array.isArray(supersedesExecutionIds) || supersedesExecutionIds.length < 1 ||
+       supersedesExecutionIds.length > 32 ||
+       !supersedesExecutionIds.every((value) => typeof value === "string" && value.trim().length > 0) ||
+       new Set(supersedesExecutionIds).size !== supersedesExecutionIds.length ||
+       supersedesExecutionIds.includes(String(row.id)))) {
+    throw new SnapshotBuildError("storage_unavailable", "Snapshot execution supersession lineage is corrupt");
+  }
   return {
     id: String(row.id),
     roomId: String(row.roomId),
@@ -377,6 +389,7 @@ function canonicalLegacyExecution(row: Record<string, unknown>): AgentExecution 
     ...(status === "queued" && typeof row.nextRetryAt === "string" ? { nextRetryAt: row.nextRetryAt } : {}),
     ...(typeof row.manualRetryOfExecutionId === "string" ? { manualRetryOfExecutionId: row.manualRetryOfExecutionId } : {}),
     ...(typeof row.compensatesExecutionId === "string" ? { compensatesExecutionId: row.compensatesExecutionId } : {}),
+    ...(supersedesExecutionIds === undefined ? {} : { supersedesExecutionIds }),
   };
 }
 
@@ -535,7 +548,8 @@ function* roomRecords(
             cancellation_reason AS cancellationReason, terminal_error_code AS terminalErrorCode,
             dead_lettered_at AS deadLetteredAt, result_message_id AS resultMessageId,
             next_retry_at AS nextRetryAt, manual_retry_of_execution_id AS manualRetryOfExecutionId,
-            compensates_execution_id AS compensatesExecutionId
+            compensates_execution_id AS compensatesExecutionId,
+            supersedes_execution_ids_json AS supersedesExecutionIdsJson
      FROM agent_executions WHERE room_id = ?`,
     roomId, "id", "id")) {
     yield { kind: "agent-execution", value: canonicalLegacyExecution(row) };
@@ -895,7 +909,8 @@ function keysetRoomPage(
                 cancellation_reason AS cancellationReason, terminal_error_code AS terminalErrorCode,
                 dead_lettered_at AS deadLetteredAt, result_message_id AS resultMessageId,
                 next_retry_at AS nextRetryAt, manual_retry_of_execution_id AS manualRetryOfExecutionId,
-                compensates_execution_id AS compensatesExecutionId
+                compensates_execution_id AS compensatesExecutionId,
+                supersedes_execution_ids_json AS supersedesExecutionIdsJson
          FROM agent_executions WHERE room_id = ?`, [roomId], "id", key, remaining),
       (row) => String(row.id), (row) => ({
         kind: "agent-execution",

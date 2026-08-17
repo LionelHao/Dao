@@ -57,6 +57,17 @@ function invocationResult(value: unknown): InvocationAccepted {
   return { execution: value.execution, replayed: value.replayed };
 }
 
+function fenceReplacementResult(
+  value: unknown,
+): Awaited<ReturnType<RuntimeAuthority["enqueueFenceReplacements"]>> {
+  if (!record(value) || value.kind !== "human-fence-replacements" ||
+      !Array.isArray(value.executions) || !value.executions.every(isAgentExecution) ||
+      typeof value.replayed !== "boolean") {
+    throw new AgentRuntimeError("provider_failure", "Authority fence replacement result was malformed");
+  }
+  return { executions: value.executions, replayed: value.replayed };
+}
+
 function preparedToolResult(value: unknown): ReturnType<RuntimeAuthority["prepareTool"]> extends Promise<infer Result> ? Result : never {
   if (!record(value) || value.kind !== "prepared-tool" || !isAgentExecution(value.execution) ||
       typeof value.grantId !== "string" ||
@@ -128,6 +139,16 @@ export function createWorkerRuntimeAuthority(worker: WorkerDatabaseClient): Runt
         intent,
         executionId: `execution-${randomUUID()}`,
         intentId: `intent-${randomUUID()}`,
+        providerId,
+        modelId,
+        now: Date.now(),
+      }));
+    },
+    async enqueueFenceReplacements(routeJobId, targetAgentId, providerId, modelId) {
+      return fenceReplacementResult(await execute({
+        type: "runtime.enqueue-fence-replacements",
+        routeJobId,
+        targetAgentId,
         providerId,
         modelId,
         now: Date.now(),

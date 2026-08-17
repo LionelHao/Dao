@@ -53,6 +53,16 @@ type RendererUnderTest = {
       readonly authoritative: false;
     } | undefined,
   ) => void;
+  renderHumanPreemptionNotice?: (
+    root: HTMLElement,
+    notice: {
+      readonly roomId: string;
+      readonly sourceHumanMessageId: string;
+      readonly cancelledExecutionIds: readonly string[];
+      readonly rerouteStatus: "queued";
+      readonly occurredAt: string;
+    },
+  ) => void;
   renderRoomAttentionSummary?: (
     root: HTMLElement,
     input: { readonly unreadCount: number; readonly needsAction: readonly NeedsActionProjection[] },
@@ -140,6 +150,56 @@ describe("ephemeral Agent execution preview", () => {
     expect(preview?.classList.contains("typing")).toBe(false);
     render(root, undefined);
     expect(root.childElementCount).toBe(0);
+  });
+});
+
+describe("human preemption presentation", () => {
+  it("renders a separate notice and cancelled/requeued execution states without withdrawal or failure", () => {
+    const noticeRoot = document.createElement("div");
+    app.renderHumanPreemptionNotice?.(noticeRoot, {
+      roomId: "preview-room",
+      sourceHumanMessageId: "preview-human-mention",
+      cancelledExecutionIds: ["execution-old"],
+      rerouteStatus: "queued",
+      occurredAt: "2026-08-17T00:00:02.000Z",
+    });
+    expect(noticeRoot.querySelector(".human-preemption-notice")?.textContent)
+      .toContain("1 个旧 Agent 执行已取消并重新判定");
+
+    const root = document.createElement("main");
+    app.renderM2PrimitivesPreview?.(root, {
+      humanReads: [], agentJudgements: [], routeJudgments: [], openItems: [], lightTasks: [],
+      socialReactions: [], calibrations: [],
+      agentExecutions: [
+        {
+          id: "execution-old", roomId: "preview-room", sourceMessageId: "preview-agent-data",
+          requesterId: "human-li", agentId: "agent-data", toolName: "model.generate",
+          status: "cancelled", actionCategory: "waiting_upstream", currentAttemptSeq: 1,
+          retryCycle: 1, retryOrdinal: 1, recoveryCursor: 1,
+          queuedAt: "2026-08-17T00:00:00.000Z", startedAt: "2026-08-17T00:00:01.000Z",
+          updatedAt: "2026-08-17T00:00:02.000Z", completedAt: "2026-08-17T00:00:02.000Z",
+          cancellationReason: "human_preempted:preview-human-mention",
+        },
+        {
+          id: "execution-new", roomId: "preview-room", sourceMessageId: "preview-human-mention",
+          requesterId: "human-li", agentId: "agent-data", toolName: "model.generate",
+          status: "queued", actionCategory: "model_generation", currentAttemptSeq: 1,
+          retryCycle: 1, retryOrdinal: 1, recoveryCursor: 0,
+          queuedAt: "2026-08-17T00:00:03.000Z", updatedAt: "2026-08-17T00:00:03.000Z",
+          supersedesExecutionIds: ["execution-old"],
+        },
+      ],
+    });
+
+    expect(root.querySelector(".agent-invocation--human-preempted")?.textContent)
+      .toContain("因人类发言已取消");
+    expect(root.querySelector(".agent-invocation--requeued")?.textContent).toContain("已重新排队");
+    expect(root.querySelector(".agent-invocation--requeued")?.getAttribute("data-supersedes-execution-ids"))
+      .toBe("execution-old");
+    const executionText = [...root.querySelectorAll(".agent-invocation")]
+      .map((element) => element.textContent).join(" ");
+    expect(executionText).not.toContain("撤回");
+    expect(executionText).not.toContain("调用失败");
   });
 });
 

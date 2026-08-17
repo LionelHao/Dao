@@ -622,7 +622,7 @@ describe("SQLite authoritative sessions", () => {
   });
 
   describe("message.send shared idempotency", () => {
-    it("commits one route job with the closed Agent membership snapshot before acknowledging", async () => {
+    it("commits the human message before its fence and then snapshots closed Agent membership once", async () => {
       const directory = await mkdtemp(join(tmpdir(), "native-im-route-job-message-"));
       temporaryDirectories.push(directory);
       const databasePath = join(directory, "authority.sqlite");
@@ -695,6 +695,16 @@ describe("SQLite authoritative sessions", () => {
         { ...context, requestId: "route-message-replay" },
         command,
       )).resolves.toEqual(first);
+      await expect(client.executeRuntime({
+        type: "runtime.cancel-for-human-fence",
+        sourceHumanMessageId: command.payload.id,
+        now: 2_000,
+      })).resolves.toMatchObject({ kind: "human-fence-cancelled" });
+      await expect(client.executeRuntime({
+        type: "runtime.create-route-after-human-fence",
+        sourceHumanMessageId: command.payload.id,
+        now: 2_001,
+      })).resolves.toMatchObject({ kind: "human-fence-route", replayed: false });
 
       const inspection = new DatabaseSync(databasePath, { readOnly: true });
       expect(inspection.prepare(
@@ -879,6 +889,16 @@ describe("SQLite authoritative sessions", () => {
         { ...context, requestId: "route-retry-message", idempotencyKey: "route-retry-message" },
         retryCommand,
       );
+      await client.executeRuntime({
+        type: "runtime.cancel-for-human-fence",
+        sourceHumanMessageId: retryCommand.payload.id,
+        now: 2_900,
+      });
+      await client.executeRuntime({
+        type: "runtime.create-route-after-human-fence",
+        sourceHumanMessageId: retryCommand.payload.id,
+        now: 2_901,
+      });
       const retryClaim1 = await client.executeRoute({
         type: "route.claim",
         sourceMessageId: retryCommand.payload.id,
@@ -966,6 +986,16 @@ describe("SQLite authoritative sessions", () => {
         { ...context, requestId: "route-restart-message", idempotencyKey: "route-restart-message" },
         restartCommand,
       );
+      await client.executeRuntime({
+        type: "runtime.cancel-for-human-fence",
+        sourceHumanMessageId: restartCommand.payload.id,
+        now: 4_900,
+      });
+      await client.executeRuntime({
+        type: "runtime.create-route-after-human-fence",
+        sourceHumanMessageId: restartCommand.payload.id,
+        now: 4_901,
+      });
       const restartClaim = await client.executeRoute({
         type: "route.claim",
         sourceMessageId: restartCommand.payload.id,
@@ -2132,6 +2162,16 @@ describe("SQLite authoritative sessions", () => {
           },
         },
       );
+      await fixture.client.executeRuntime({
+        type: "runtime.cancel-for-human-fence",
+        sourceHumanMessageId: "message-after-calibration",
+        now: 8_100,
+      });
+      await fixture.client.executeRuntime({
+        type: "runtime.create-route-after-human-fence",
+        sourceHumanMessageId: "message-after-calibration",
+        now: 8_101,
+      });
       await expect(
         fixture.authority.executeHuman(
           { ...context, requestId: "calibration-conflict" },

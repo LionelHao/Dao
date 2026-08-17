@@ -83,6 +83,10 @@ schema v10 只追加 `ball_boundary_claims`。BallInCourt 本身不是第二份�
 
 默认时钟边界为：OpenItem/LightTask 使用 server-private 配置，Blueprint claimed/awaiting 为七天，明确单一 blocked mention 立即到期。阈值前不 claim；边界时刻首次 claim；SQLite 重启、snapshot cache 删除与重复扫描都不再产生同一事件。生产 Blueprint adapter 当前为空的只读端口，实际 GBP 读取/写入仍属于 M5；v10 不建设跨 room inbox 或通知送达通道。
 
+schema v11 追加不可配置的 human preemption fence。human `room.message.accepted` 必须先独立 durable commit；随后 AuthorityWorker 先把同 room 的旧 queued，以及 running/waiting_upstream、running/tool_call+not_started execution/attempt 原子改为 cancelled，写 `human_preemption_fences`、`agent_human_fences` 与稳定 `room.human_preemption.applied` event/outbox，再以提交后的最新 room 状态创建唯一 RouteJob。running/model_generation 和已 dispatched tool 不被强杀。Agent message、系统 event、历史 replay 不进入该入口。
+
+replacement 不复活旧 execution：route terminal 后只为实际 selected Agent 创建新 queued execution，并用 `supersedesExecutionIds` 与 `agent_fence_replacements` 记录旧 attempt lineage。旧 attempt 的 late completion 继续由现有 CAS 拒绝；同一 human message retry 重放同一 fence/route/replacement receipt。启动时有界扫描 durable human message 中尚无 RouteJob 的记录；内存 orchestration 最多 256 个 pending、每批最多 256、最多 32 批，真正执行仍复用 T-0041 的 room FIFO、每 room 32 queued、全进程 8 active scheduler。repair 中的 `agent-execution` 可恢复 cancellationReason 与 supersedes lineage；delta/subscribe 用独立的 preemption event 恢复提示，不把它表现为 human 撤回或 Agent failure。
+
 Legacy import 在正式激活新 authority 前解析并验证 closed 数据，使用 migration/事务写入临时目标；损坏输入、重复启动、启用前终止都不得留下半激活 authority。证据见 [`schema.test.ts`](../../packages/server/src/persistence/schema.test.ts) 和 [`legacy-importer.test.ts`](../../packages/server/src/persistence/legacy-importer.test.ts)。Snapshot cache 可随时删除重建，不能反向覆盖 authority。
 
 ## 7. Buzz reference / translation / deviation

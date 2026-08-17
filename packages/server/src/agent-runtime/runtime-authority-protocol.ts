@@ -1,6 +1,7 @@
 import {
   type AgentExecution,
   type AgentInvocationIntent,
+  type HumanPreemptionNotice,
   type ToolConfirmationInput,
   type ToolDescriptor,
 } from "@native-im/core";
@@ -127,6 +128,25 @@ export type RuntimeAuthorityOperation =
       readonly outputSha256: string;
       readonly now: number;
     }
+  | {
+      readonly type: "runtime.cancel-for-human-fence";
+      readonly sourceHumanMessageId: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.create-route-after-human-fence";
+      readonly sourceHumanMessageId: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.enqueue-fence-replacements";
+      readonly routeJobId: string;
+      readonly targetAgentId: string;
+      readonly providerId: string;
+      readonly modelId: string;
+      readonly now: number;
+    }
+  | { readonly type: "runtime.list-pending-human-fences"; readonly now: number }
   | { readonly type: "runtime.recover"; readonly now: number };
 
 export type RuntimeAuthorityOperationResult =
@@ -164,6 +184,27 @@ export type RuntimeAuthorityOperationResult =
     }
   | { readonly kind: "settled-tool" }
   | { readonly kind: "checkpoint" }
+  | {
+      readonly kind: "human-fence-cancelled";
+      readonly notice: HumanPreemptionNotice;
+      readonly cancelledExecutions: readonly AgentExecution[];
+    }
+  | {
+      readonly kind: "human-fence-route";
+      readonly roomId: string;
+      readonly sourceHumanMessageId: string;
+      readonly routeJobId: string;
+      readonly replayed: boolean;
+    }
+  | {
+      readonly kind: "human-fence-replacements";
+      readonly executions: readonly AgentExecution[];
+      readonly replayed: boolean;
+    }
+  | {
+      readonly kind: "pending-human-fences";
+      readonly sourceHumanMessageIds: readonly string[];
+    }
   | {
       readonly kind: "compensation";
       readonly execution: AgentExecution;
@@ -327,6 +368,19 @@ export function isRuntimeAuthorityOperation(value: unknown): value is RuntimeAut
     return exact(value, ["type", "executionId", "attemptSeq", "stepSeq", "kind", "inputSha256", "outputSha256", "now"]) &&
       text(value.executionId) && count(value.attemptSeq, 1) && count(value.stepSeq, 1) &&
       (value.kind === "model" || value.kind === "tool") && sha256(value.inputSha256) && sha256(value.outputSha256) && count(value.now);
+  }
+  if (value.type === "runtime.cancel-for-human-fence" ||
+      value.type === "runtime.create-route-after-human-fence") {
+    return exact(value, ["type", "sourceHumanMessageId", "now"]) &&
+      text(value.sourceHumanMessageId) && count(value.now);
+  }
+  if (value.type === "runtime.enqueue-fence-replacements") {
+    return exact(value, ["type", "routeJobId", "targetAgentId", "providerId", "modelId", "now"]) &&
+      text(value.routeJobId) && text(value.targetAgentId) && text(value.providerId) &&
+      text(value.modelId) && count(value.now);
+  }
+  if (value.type === "runtime.list-pending-human-fences") {
+    return exact(value, ["type", "now"]) && count(value.now);
   }
   return value.type === "runtime.recover" && exact(value, ["type", "now"]) && count(value.now);
 }

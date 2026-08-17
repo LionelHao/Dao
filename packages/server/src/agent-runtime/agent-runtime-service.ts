@@ -77,6 +77,11 @@ interface RuntimeJob {
 
 export interface AgentRuntimeService extends AgentRuntime {
   invokeRouted(routeJobId: string, intent: AgentInvocationIntent): Promise<InvocationAccepted>;
+  invokeFenceReplacements(
+    routeJobId: string,
+    intent: AgentInvocationIntent,
+  ): Promise<readonly AgentExecution[]>;
+  applyCommittedHumanFence(cancelledExecutions: readonly AgentExecution[]): void;
   whenIdle(): Promise<void>;
   recover(): Promise<void>;
 }
@@ -354,6 +359,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
       const runtimeError = error instanceof AgentRuntimeError
         ? error
         : new AgentRuntimeError("provider_failure", "Provider execution failed");
+      if (runtimeError.code === "execution_conflict") return;
       if (!transient(runtimeError.code)) {
         await options.authority.scheduleRetry(claimed.id, claimed.currentAttemptSeq, runtimeError.code, undefined);
         return;
@@ -397,6 +403,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         const runtimeError = error instanceof AgentRuntimeError
           ? error
           : new AgentRuntimeError("provider_failure", "Agent runtime failed");
+        if (runtimeError.code === "execution_conflict") return;
         await options.authority.scheduleRetry(
           job.execution.id,
           job.execution.currentAttemptSeq,
@@ -475,6 +482,44 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         pump();
       }
       return accepted;
+    },
+    async invokeFenceReplacements(routeJobId, intent) {
+      if (closed) throw new AgentRuntimeError("agent_runtime_closed", "Agent runtime is closed");
+      if (options.readiness?.() === "noauth") {
+        throw new AgentRuntimeError("agent_configuration_missing", "Agent model authentication is not configured");
+      }
+      const queue = queues.get(intent.roomId);
+      if (queue !== undefined && queue.length >= limits.maxQueuedPerRoom) {
+        throw new AgentRuntimeError("agent_queue_full", "Agent room queue is full", 1_000);
+      }
+      const accepted = await options.authority.enqueueFenceReplacements(
+        routeJobId,
+        intent.targetAgentId,
+        options.provider.id,
+        options.modelId,
+      );
+      for (const execution of accepted.executions) {
+        if (execution.status !== "queued" || jobsByExecution.has(execution.id)) continue;
+        enqueue({ execution, intent, context: undefined, toolContinuations: [], sideEffectDispatched: false });
+      }
+      pump();
+      return accepted.executions;
+    },
+    applyCommittedHumanFence(cancelledExecutions) {
+      for (const cancelled of cancelledExecutions) {
+        if (cancelled.status !== "cancelled") continue;
+        controllers.get(cancelled.id)?.abort("human_preempted");
+        const job = jobsByExecution.get(cancelled.id);
+        if (job !== undefined) job.execution = cancelled;
+        for (const queue of queues.values()) {
+          const index = queue.findIndex((candidate) => candidate.execution.id === cancelled.id);
+          if (index >= 0) queue.splice(index, 1);
+        }
+        for (const [confirmationId, pending] of pendingConfirmations) {
+          if (pending.job.execution.id === cancelled.id) pendingConfirmations.delete(confirmationId);
+        }
+      }
+      signalIdle();
     },
     async interrupt(context, executionId, reason) {
       const cancelled = await options.authority.interrupt(context, executionId, reason);

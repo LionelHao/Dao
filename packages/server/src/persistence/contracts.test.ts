@@ -193,6 +193,17 @@ const acceptedRoomEvents: readonly unknown[] = [
   },
   {
     ...roomEventBase,
+    type: "room.human_preemption.applied",
+    payload: {
+      roomId: "room-1",
+      sourceHumanMessageId: "message-1",
+      cancelledExecutionIds: ["execution-1"],
+      rerouteStatus: "queued",
+      occurredAt: "2026-08-10T00:00:00.000Z",
+    },
+  },
+  {
+    ...roomEventBase,
     type: "room.human_read.recorded",
     payload: {
       id: "read-1",
