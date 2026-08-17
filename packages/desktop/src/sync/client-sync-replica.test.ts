@@ -392,6 +392,32 @@ describe("ClientSyncReplica", () => {
     expect(cache.hasStaging()).toBe(false);
   });
 
+  it("restarts a stale streaming repair with bounded 250ms and 1s backoff", async () => {
+    vi.useFakeTimers();
+    const transport = new FakeTransport();
+    const cache = new MemoryCache();
+    transport.repairs.set("room-1", [streamingRepairPage()]);
+    const stale = () => Object.assign(new Error("snapshot stale"), {
+      status: 409,
+      code: "snapshot_stale",
+    });
+    transport.completeFailures.push(stale(), stale());
+    const replica = createClientSyncReplica({ transport, cache });
+
+    const repairing = replica.repairRoom("room-1");
+    await vi.advanceTimersByTimeAsync(249);
+    expect(transport.repairBeginCalls).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(transport.repairBeginCalls).toBe(2);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await expect(repairing).resolves.toBeUndefined();
+
+    expect(transport.repairBeginCalls).toBe(3);
+    expect(transport.completeCalls).toHaveLength(3);
+    expect(cache.liveRoom("room-1")?.cursor.afterSeq).toBe(9);
+    vi.useRealTimers();
+  });
+
   it("single-flights concurrent repair for the same room", async () => {
     const transport = new FakeTransport();
     const cache = new MemoryCache();
@@ -746,6 +772,32 @@ describe("ClientSyncReplica", () => {
     expect(cache.liveRoom("room-1")?.records).toEqual([replacement]);
     expect(cache.liveRoom("room-1")?.events).toEqual([]);
     expect(cache.hasStaging()).toBe(false);
+  });
+
+  it("ignores a wholly duplicate stale subscription batch after newer live events", async () => {
+    const transport = new FakeTransport();
+    const cache = new MemoryCache();
+    transport.subscribeRoom = async (roomId, cursor, observer) => {
+      expect(roomId).toBe("room-1");
+      await observer.events([event(10)], {
+        version: 1, roomId: "room-1", afterSeq: 10,
+      });
+      await observer.events([event(11)], {
+        version: 1, roomId: "room-1", afterSeq: 11,
+      });
+      await observer.events([event(10)], {
+        version: 1, roomId: "room-1", afterSeq: 10,
+      });
+      return new FakeSubscription({ ...cursor, afterSeq: 11 });
+    };
+    const replica = createClientSyncReplica({ transport, cache });
+
+    await replica.repairRoom("room-1");
+
+    expect(cache.liveRoom("room-1")?.events.map((item) => item.streamSeq)).toEqual([10, 11]);
+    expect(cache.roomCursor("room-1")).toEqual({
+      version: 1, roomId: "room-1", afterSeq: 11,
+    });
   });
 
   it("does not let a stale retry replace a newer room subscription", async () => {

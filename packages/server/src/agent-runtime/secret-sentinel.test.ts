@@ -4,8 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
-import type { AgentRuntimeProviderInput } from "@native-im/core";
+import type { AgentRuntimeProviderInput, RouterProviderInput } from "@native-im/core";
 import { migrateAuthorityDatabase } from "../persistence/schema.js";
+import { createOpenAIRouterProvider } from "../route-runtime/openai-router-provider.js";
 import { createOpenAIResponsesProvider } from "./openai-responses-provider.js";
 
 describe("Agent runtime secret sentinel", () => {
@@ -48,16 +49,42 @@ describe("Agent runtime secret sentinel", () => {
       };
       const wireEvents = [];
       for await (const event of provider.stream(input, new AbortController().signal)) wireEvents.push(event);
+      const routerFetch = vi.fn(async () => new Response(JSON.stringify({
+        output: [{ content: [{ type: "output_text", text: JSON.stringify({ candidates: [] }) }] }],
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+      const router = createOpenAIRouterProvider({
+        endpoint: "https://api.openai.com/v1/responses",
+        model: "configured-router-model",
+        secretProvider: { getSecret: () => sentinel },
+        fetch: routerFetch,
+      });
+      const routerInput: RouterProviderInput = {
+        purpose: "route_decision",
+        roomId: "room-sentinel",
+        sourceMessageId: "message-sentinel",
+        message: { authorId: "human-sentinel", authorKind: "human", summary: "safe" },
+        roomPhase: "discussion",
+        agents: [],
+        topic: {
+          topicKey: "topic-v1:sentinel",
+          embeddingModelVersion: "dao-topic-embedding-v1",
+          windowSize: 8,
+          cosineThreshold: 0.82,
+        },
+        limits: { timeoutMs: 1_000, maxCandidates: 0, maxOutputBytes: 64 * 1_024 },
+      };
+      const routePlan = await router.decide(routerInput, new AbortController().signal);
       database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
       database.close();
 
       const durableBytes = readdirSync(directory)
         .map((name) => readFileSync(join(directory, name)))
         .reduce((total, bytes) => `${total}${bytes.toString("latin1")}`, "");
-      const diagnostic = JSON.stringify({ wireEvents, error: null, stdout: "", stderr: "" });
+      const diagnostic = JSON.stringify({ wireEvents, routePlan, error: null, stdout: "", stderr: "" });
       expect(durableBytes).not.toContain(sentinel);
       expect(diagnostic).not.toContain(sentinel);
       expect(JSON.stringify(fetch.mock.calls[0]?.[1]?.body)).not.toContain(sentinel);
+      expect(JSON.stringify(routerFetch.mock.calls[0]?.[1]?.body)).not.toContain(sentinel);
       expect(JSON.stringify(wireEvents)).not.toContain(sentinel);
     } finally {
       rmSync(directory, { recursive: true, force: true });

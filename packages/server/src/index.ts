@@ -183,6 +183,7 @@ export type WorkerDatabaseClient = Omit<
   | "executeHuman"
   | "executeAgent"
   | "executeRuntime"
+  | "executeRoute"
   | "readActor"
   | "readRoom"
   | "listPendingOutbox"

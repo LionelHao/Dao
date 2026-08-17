@@ -362,6 +362,11 @@ export function createClientSyncReplica(options: {
       for (const item of buffered) {
         for (const event of item.events) validateEventShape(roomId, event);
         const fresh = deduplicateEvents(item.events, bufferedSeen);
+        const whollyDuplicateStaleBatch = item.events.length > 0 && fresh.length === 0 &&
+          isRoomCursor(item.cursor) && sameCursorRoom(item.cursor, roomId) &&
+          item.cursor.afterSeq <= bufferedCursor.afterSeq &&
+          item.events.every((event) => event.streamSeq <= bufferedCursor.afterSeq);
+        if (whollyDuplicateStaleBatch) continue;
         validateEventAdvance(roomId, bufferedCursor, fresh, item.cursor);
         prepared.push({ events: fresh, cursor: item.cursor });
         bufferedCursor = item.cursor;
@@ -486,7 +491,22 @@ export function createClientSyncReplica(options: {
     const operationEpoch = lifecycleEpoch;
     const roomOperation = (roomOperationGenerations.get(roomId) ?? 0) + 1;
     roomOperationGenerations.set(roomId, roomOperation);
-    const repairing = repairRoomOnce(roomId, operationEpoch, roomOperation).finally(() => {
+    const repairing = (async () => {
+      const retryDelays = [250, 1_000] as const;
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          await repairRoomOnce(roomId, operationEpoch, roomOperation);
+          return;
+        } catch (cause: unknown) {
+          const stale = typeof cause === "object" && cause !== null &&
+            "status" in cause && cause.status === 409 &&
+            "code" in cause && cause.code === "snapshot_stale";
+          const delay = retryDelays[attempt];
+          if (!stale || delay === undefined) throw cause;
+          await new Promise<void>((resolve) => setTimeout(resolve, delay));
+        }
+      }
+    })().finally(() => {
       if (roomRepairs.get(roomId) === repairing) roomRepairs.delete(roomId);
     });
     roomRepairs.set(roomId, repairing);

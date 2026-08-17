@@ -3,7 +3,10 @@ import { rmSync, statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { parentPort, workerData } from "node:worker_threads";
 import {
+  isCalibrationSignal,
   isRoomRepairPage,
+  isRouteJob,
+  isRouteJudgment,
   isSnapshotVersion,
   isWorkspaceBootstrapPage,
 } from "@native-im/core";
@@ -502,23 +505,36 @@ function* roomRecords(
     recordScanned();
   }
   for (const row of scanRows(authority,
+    `SELECT id, room_id AS roomId, source_message_id AS sourceMessageId, status,
+            current_attempt AS currentAttempt, topic_key AS topicKey,
+            embedding_model_version AS embeddingModelVersion, window_size AS windowSize,
+            cosine_threshold AS cosineThreshold, room_phase AS roomPhase,
+            created_at AS createdAt, updated_at AS updatedAt, completed_at AS completedAt,
+            terminal_error_code AS terminalErrorCode, next_retry_at AS nextRetryAt
+     FROM route_jobs WHERE room_id = ?`,
+    roomId, "id", "id")) {
+    yield routeJobRecord(row);
+    recordScanned();
+  }
+  for (const row of scanRows(authority,
+    `SELECT judgment.id, judgment.route_job_id AS routeJobId,
+            judgment.source_message_id AS sourceMessageId,
+            judgment.agent_id AS agentId, judgment.outcome,
+            judgment.reason_code AS reasonCode, judgment.reason_text AS reasonText,
+            judgment.route_attempt AS routeAttempt, judgment.decided_at AS decidedAt
+     FROM route_judgments AS judgment
+     JOIN route_jobs AS route ON route.id = judgment.route_job_id
+     WHERE route.room_id = ?`,
+    roomId, "judgment.id", "id")) {
+    yield routeJudgmentRecord(row);
+    recordScanned();
+  }
+  for (const row of scanRows(authority,
     `SELECT id, source_message_id AS sourceMessageId, actor_id AS actorId,
-            agent_id AS agentId, signal AS emoji, created_at AS createdAt
+            agent_id AS agentId, signal, created_at AS createdAt
      FROM calibration_signals WHERE room_id = ?`,
     roomId, "id", "id")) {
-    const common = { id: String(row.id), agentId: String(row.agentId),
-      emoji: row.emoji as "👍" | "👎", createdAt: String(row.createdAt) };
-    if (row.sourceMessageId === null && row.actorId === null) {
-      yield { kind: "legacy-unknown-calibration", value: {
-        ...common, sourceMessageId: null, actorId: null,
-      }};
-    } else if (typeof row.sourceMessageId === "string" && typeof row.actorId === "string") {
-      yield { kind: "calibration", value: {
-        ...common, sourceMessageId: row.sourceMessageId, actorId: row.actorId,
-      }};
-    } else {
-      throw new SnapshotBuildError("storage_unavailable", "Snapshot calibration is corrupt");
-    }
+    yield calibrationRecord(row);
     recordScanned();
   }
 }
@@ -616,6 +632,75 @@ function messageRecord(row: Record<string, unknown>): RoomRepairRecord {
     authorId: row.authorId, authorKind: row.authorKind, body: row.body, sentAt: row.sentAt }};
 }
 
+function routeJobRecord(row: Record<string, unknown>): RoomRepairRecord {
+  const value = {
+    id: row.id,
+    roomId: row.roomId,
+    sourceMessageId: row.sourceMessageId,
+    status: row.status,
+    currentAttempt: row.currentAttempt,
+    topicKey: row.topicKey,
+    embeddingModelVersion: row.embeddingModelVersion,
+    windowSize: row.windowSize,
+    cosineThreshold: row.cosineThreshold,
+    roomPhase: row.roomPhase,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    ...(typeof row.completedAt === "string" ? { completedAt: row.completedAt } : {}),
+    ...(typeof row.terminalErrorCode === "string" ? { terminalErrorCode: row.terminalErrorCode } : {}),
+    ...(typeof row.nextRetryAt === "string" ? { nextRetryAt: row.nextRetryAt } : {}),
+  };
+  if (!isRouteJob(value)) throw new SnapshotBuildError("storage_unavailable", "Snapshot route job is corrupt");
+  return { kind: "route-job", value };
+}
+
+function routeJudgmentRecord(row: Record<string, unknown>): RoomRepairRecord {
+  const value = {
+    id: row.id,
+    routeJobId: row.routeJobId,
+    sourceMessageId: row.sourceMessageId,
+    agentId: row.agentId,
+    outcome: row.outcome,
+    reasonCode: row.reasonCode,
+    reasonText: row.reasonText,
+    routeAttempt: row.routeAttempt,
+    decidedAt: row.decidedAt,
+  };
+  if (!isRouteJudgment(value)) throw new SnapshotBuildError("storage_unavailable", "Snapshot route judgment is corrupt");
+  return { kind: "route-judgment", value };
+}
+
+function calibrationRecord(row: Record<string, unknown>): RoomRepairRecord {
+  const common = {
+    id: String(row.id),
+    agentId: String(row.agentId),
+    createdAt: String(row.createdAt),
+  };
+  if (row.sourceMessageId === null && row.actorId === null) {
+    if (row.signal !== "👍" && row.signal !== "👎") {
+      throw new SnapshotBuildError("storage_unavailable", "Legacy calibration signal is corrupt");
+    }
+    return { kind: "legacy-unknown-calibration", value: {
+      ...common, sourceMessageId: null, actorId: null, emoji: row.signal,
+    }};
+  }
+  if (typeof row.sourceMessageId !== "string" || typeof row.actorId !== "string") {
+    throw new SnapshotBuildError("storage_unavailable", "Snapshot calibration is corrupt");
+  }
+  const value = {
+    ...common,
+    sourceMessageId: row.sourceMessageId,
+    actorId: row.actorId,
+    ...(row.signal === "👍" || row.signal === "👎"
+      ? { emoji: row.signal }
+      : { feedback: row.signal }),
+  };
+  if (!isCalibrationSignal(value)) {
+    throw new SnapshotBuildError("storage_unavailable", "Snapshot calibration signal is corrupt");
+  }
+  return { kind: "calibration", value };
+}
+
 function keysetRoomPage(
   authority: DatabaseSync,
   roomId: string,
@@ -641,7 +726,7 @@ function keysetRoomPage(
     }
   };
 
-  while (values.length < limit && segment < 8) {
+  while (values.length < limit && segment < 10) {
     if (segment === 0) {
       const room = authority.prepare(
         "SELECT id, name, status, created_at AS createdAt FROM rooms WHERE id = ?",
@@ -726,26 +811,33 @@ function keysetRoomPage(
         kind: "agent-execution",
         value: canonicalLegacyExecution(row),
       }));
+    } else if (segment === 7) {
+      append(keysetRows(authority,
+        `SELECT id, room_id AS roomId, source_message_id AS sourceMessageId, status,
+                current_attempt AS currentAttempt, topic_key AS topicKey,
+                embedding_model_version AS embeddingModelVersion, window_size AS windowSize,
+                cosine_threshold AS cosineThreshold, room_phase AS roomPhase,
+                created_at AS createdAt, updated_at AS updatedAt, completed_at AS completedAt,
+                terminal_error_code AS terminalErrorCode, next_retry_at AS nextRetryAt
+         FROM route_jobs WHERE room_id = ?`, [roomId], "id", key, remaining),
+      (row) => String(row.id), routeJobRecord);
+    } else if (segment === 8) {
+      append(keysetRows(authority,
+        `SELECT judgment.id, judgment.route_job_id AS routeJobId,
+                judgment.source_message_id AS sourceMessageId,
+                judgment.agent_id AS agentId, judgment.outcome,
+                judgment.reason_code AS reasonCode, judgment.reason_text AS reasonText,
+                judgment.route_attempt AS routeAttempt, judgment.decided_at AS decidedAt
+         FROM route_judgments AS judgment
+         JOIN route_jobs AS route ON route.id = judgment.route_job_id
+         WHERE route.room_id = ?`, [roomId], "judgment.id", key, remaining),
+      (row) => String(row.id), routeJudgmentRecord);
     } else {
       append(keysetRows(authority,
         `SELECT id, source_message_id AS sourceMessageId, actor_id AS actorId,
-                agent_id AS agentId, signal AS emoji, created_at AS createdAt
+                agent_id AS agentId, signal, created_at AS createdAt
          FROM calibration_signals WHERE room_id = ?`, [roomId], "id", key, remaining),
-      (row) => String(row.id), (row) => {
-        const common = { id: String(row.id), agentId: String(row.agentId),
-          emoji: row.emoji as "👍" | "👎", createdAt: String(row.createdAt) };
-        if (row.sourceMessageId === null && row.actorId === null) {
-          return { kind: "legacy-unknown-calibration", value: {
-            ...common, sourceMessageId: null, actorId: null,
-          }};
-        }
-        if (typeof row.sourceMessageId === "string" && typeof row.actorId === "string") {
-          return { kind: "calibration", value: {
-            ...common, sourceMessageId: row.sourceMessageId, actorId: row.actorId,
-          }};
-        }
-        throw new SnapshotBuildError("storage_unavailable", "Snapshot calibration is corrupt");
-      });
+      (row) => String(row.id), calibrationRecord);
     }
   }
   return { values, cursor: { segment, ...(key === undefined ? {} : { key }) } };

@@ -27,6 +27,7 @@ import {
   executeAgentDatabaseCommand,
   executeHumanDatabaseCommand,
   executeRuntimeAuthorityOperation,
+  executeRouteAuthorityOperation,
   authorizeOutboxCandidateDatabaseQuery,
   canAccessRoomDatabaseQuery,
   compactRoomStreamDatabaseCommand,
@@ -44,6 +45,7 @@ import {
   inspectStreamingRepairScopeDatabaseQuery,
 } from "./authority-database-handler.js";
 import { runtimeResultAsJson } from "../agent-runtime/runtime-authority-protocol.js";
+import { routeResultAsJson } from "../route-runtime/route-authority-protocol.js";
 import {
   FallbackRepairCoordinator,
   FallbackRepairError,
@@ -1256,6 +1258,54 @@ function executeRuntime(request: AuthorityWorkerRequest): void {
   }
 }
 
+function executeRoute(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.route") {
+    throw new TypeError("executeRoute received the wrong request type");
+  }
+  try {
+    const openedDatabase = requireAuthorityTransactionDatabase();
+    const roomRows = request.operation.type === "route.claim"
+      ? openedDatabase.prepare(
+          `SELECT room_id AS roomId FROM messages WHERE id = ?`,
+        ).all(request.operation.sourceMessageId)
+      : request.operation.type === "route.recover"
+        ? openedDatabase.prepare(
+            `SELECT DISTINCT room_id AS roomId FROM route_jobs WHERE status = 'running'`,
+          ).all()
+        : openedDatabase.prepare(
+            `SELECT room_id AS roomId FROM route_jobs WHERE id = ?`,
+          ).all(request.operation.routeJobId);
+    const roomIds = roomRows.map((row) => row.roomId).filter(
+      (roomId): roomId is string => typeof roomId === "string",
+    );
+    const result = executeRouteAuthorityOperation(
+      openedDatabase,
+      request.operation,
+    );
+    respond({
+      type: "authority.route-result",
+      requestId: request.requestId,
+      result: routeResultAsJson(result),
+    });
+    if (roomIds.length > 0) {
+      repairs.preemptAfterCommit({
+        roomIds,
+        catalogPrincipalIds: [],
+        familyIds: [],
+        code: "snapshot_stale",
+        now: request.operation.now,
+      });
+    }
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithError(request.requestId, "storage_unavailable", "Authority route operation failed");
+  }
+}
+
 function readHistory(request: AuthorityWorkerRequest): void {
   if (request.type !== "authority.read-history") {
     throw new TypeError("readHistory received the wrong request type");
@@ -1597,6 +1647,9 @@ async function dispatch(value: unknown): Promise<void> {
       return;
     case "authority.runtime":
       executeRuntime(value);
+      return;
+    case "authority.route":
+      executeRoute(value);
       return;
     case "authority.read-history":
       readHistory(value);

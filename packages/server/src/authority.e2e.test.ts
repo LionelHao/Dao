@@ -5,6 +5,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer as createTcpServer, type Socket } from "node:net";
+import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
 import type { ServerFrame } from "./protocol.js";
@@ -156,6 +157,52 @@ async function stopChild(
     child.kill("SIGKILL");
   }
   await childExit(child, killTimeoutMs);
+}
+
+async function waitForRouteJudgmentCount(
+  directory: string,
+  roomId: string,
+  expected: number,
+  timeoutMs = 10_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let actual = -1;
+  while (Date.now() <= deadline) {
+    const database = new DatabaseSync(join(directory, "authority.sqlite"), { readOnly: true });
+    try {
+      const count = database.prepare(
+        `SELECT COUNT(*) AS count
+         FROM route_judgments AS judgment
+         INNER JOIN route_jobs AS job ON job.id = judgment.route_job_id
+         WHERE job.room_id = ?`,
+      );
+      const row = count.get(roomId) as { readonly count: number };
+      actual = row.count;
+      if (row.count === expected) return;
+    } finally {
+      database.close();
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(
+    `Route judgments did not settle at ${expected} within ${timeoutMs}ms (actual=${actual})`,
+  );
+}
+
+function readRoomHeadSeq(directory: string, roomId: string): number {
+  const database = new DatabaseSync(join(directory, "authority.sqlite"), { readOnly: true });
+  try {
+    const row = database.prepare(
+      `SELECT head_seq AS headSeq FROM streams
+       WHERE stream_kind = 'room' AND stream_id = ?`,
+    ).get(roomId) as { readonly headSeq: number } | undefined;
+    if (row === undefined || !Number.isSafeInteger(row.headSeq)) {
+      throw new Error("Authoritative room stream head was missing");
+    }
+    return row.headSeq;
+  } finally {
+    database.close();
+  }
 }
 
 async function spawnAuthorityChild(options: ChildStartOptions): Promise<{
@@ -1315,12 +1362,13 @@ describe("authoritative server real-process harness", () => {
       const expectedMissedIds = (await Promise.all(missedIds.map((messageId) =>
         commandRowCounts(directory, messageId))))
         .map((counts) => counts.eventIds[0]!);
-      expect(recoveredMissed.map((event) => event.eventId)).toEqual(expectedMissedIds);
-      expect(recoveredMissed.map((event) => event.streamSeq)).toEqual([
-        retainedCursor.afterSeq + 1,
-        retainedCursor.afterSeq + 2,
-      ]);
-      expect(new Set(recoveredMissed.map((event) => event.eventId)).size).toBe(2);
+      const recoveredMessages = recoveredMissed.filter((event) =>
+        event.type === "room.message.accepted" && missedIds.includes(event.payload.id));
+      expect(recoveredMessages.map((event) => event.eventId)).toEqual(expectedMissedIds);
+      expect(recoveredMessages.every((event) => event.streamSeq > retainedCursor.afterSeq)).toBe(true);
+      expect(recoveredMissed.some((event) => event.type.startsWith("route."))).toBe(true);
+      expect(new Set(recoveredMissed.map((event) => event.eventId)).size)
+        .toBe(recoveredMissed.length);
 
       await replicaC.clearAndRestore();
       const livePromise = clientA.waitFor((frame) => frame.type === "room.event" &&
@@ -1361,6 +1409,11 @@ describe("authoritative server real-process harness", () => {
       const stressA = await JsonWebSocketClient.connect(stress.url);
       clients.push(stressA);
       const stressAccessToken = await stressA.login("stress-a-login");
+      await waitForRouteJudgmentCount(
+        directory,
+        roomId,
+        mixed.mixedCounts["route-judgment"] ?? 0,
+      );
       transportA.replaceClient(stressA);
       transportA.beforeStreamingSnapshotComplete = () => {
         expect(cacheA.roomSignature(roomId)).toBe(beforeStress);
@@ -1417,12 +1470,13 @@ describe("authoritative server real-process harness", () => {
       transportC.beforeMaterializedLastPageReturn = undefined;
       expect(materializedLastPageObserved).toBe(true);
       expect(transportA.roomRepairModes.at(-1)).toBe("streaming");
-      expect(stressPagesA).toBe(Math.ceil(10_000 / stressPageSize));
+      const completeStressPages = Math.ceil(mixed.total / stressPageSize);
+      expect(stressPagesA).toBe(completeStressPages);
       expect([transportB.roomRepairModes.at(-1), transportC.roomRepairModes.at(-1)])
         .toEqual(["materialized", "materialized"]);
-      expect([stressPagesB, stressPagesC]).toEqual([100, 100]);
+      expect([stressPagesB, stressPagesC]).toEqual([101, 101]);
 
-      expect(mixed.total).toBe(10_000);
+      expect(mixed.total).toBe(10_010);
       expect(mixed.distinctMembershipActors).toBe(2_000);
       expect(mixed.mixedCounts).toEqual({
         room: 1,
@@ -1433,18 +1487,17 @@ describe("authoritative server real-process harness", () => {
         "open-item": 500,
         "agent-execution": 500,
         calibration: 1_000,
+        "route-job": 5,
+        "route-judgment": 5,
       });
+      const authoritativeHeadSeq = readRoomHeadSeq(directory, roomId);
       const authorityChecksum = cacheA.roomChecksum(roomId);
       expect(authorityChecksum).toBeTypeOf("string");
       for (const cache of [cacheA, cacheB, cacheC]) {
         expect(cache.factCount(roomId)).toBe(mixed.total);
         expect(cache.roomChecksum(roomId)).toBe(authorityChecksum);
         expect(cache.independentRoomChecksum(roomId)).toBe(authorityChecksum);
-        // T-0041 recovery emits one canonical execution transition and one closed
-        // recovery lifecycle event for every legacy running execution.
-        expect(cache.roomCursor(roomId)?.afterSeq).toBe(
-          mixed.watermark + Math.max(0, (mixed.mixedCounts["agent-execution"] ?? 0) - 1) * 2,
-        );
+        expect(cache.roomCursor(roomId)?.afterSeq).toBe(authoritativeHeadSeq);
       }
       expect(cacheB.roomValues(roomId)).toEqual(cacheA.roomValues(roomId));
       expect(cacheC.roomValues(roomId)).toEqual(cacheA.roomValues(roomId));

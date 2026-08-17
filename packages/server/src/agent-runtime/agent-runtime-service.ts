@@ -50,6 +50,7 @@ interface AgentRuntimeServiceOptions {
     readonly streamSeq: number;
     readonly delta: string;
   }) => void;
+  readonly onMessageCommitted?: (execution: AgentExecution) => void;
 }
 
 interface RuntimeJob {
@@ -66,6 +67,7 @@ interface RuntimeJob {
 }
 
 export interface AgentRuntimeService extends AgentRuntime {
+  invokeRouted(routeJobId: string, intent: AgentInvocationIntent): Promise<InvocationAccepted>;
   whenIdle(): Promise<void>;
   recover(): Promise<void>;
 }
@@ -286,7 +288,12 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         await runAttempt(job, controller);
         return;
       }
-      await options.authority.complete(claimed.id, claimed.currentAttemptSeq, partial);
+      const completed = await options.authority.complete(claimed.id, claimed.currentAttemptSeq, partial);
+      try {
+        options.onMessageCommitted?.(completed);
+      } catch {
+        // Post-commit routing notification cannot alter the completed execution.
+      }
       return;
     } catch (error: unknown) {
       if (controller.signal.aborted) return;
@@ -384,6 +391,33 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
       const accepted = await options.authority.invoke(context, intent, options.provider.id, options.modelId);
       if (!accepted.replayed && accepted.execution.status === "queued") {
         enqueue({ execution: accepted.execution, intent, context, toolContinuations: [], sideEffectDispatched: false });
+        pump();
+      }
+      return accepted;
+    },
+    async invokeRouted(routeJobId, intent): Promise<InvocationAccepted> {
+      if (closed) throw new AgentRuntimeError("agent_runtime_closed", "Agent runtime is closed");
+      if (options.readiness?.() === "noauth") {
+        throw new AgentRuntimeError("agent_configuration_missing", "Agent model authentication is not configured");
+      }
+      const queue = queues.get(intent.roomId);
+      if (queue !== undefined && queue.length >= limits.maxQueuedPerRoom) {
+        throw new AgentRuntimeError("agent_queue_full", "Agent room queue is full", 1_000);
+      }
+      const accepted = await options.authority.invokeRouted(
+        routeJobId,
+        intent,
+        options.provider.id,
+        options.modelId,
+      );
+      if (!accepted.replayed && accepted.execution.status === "queued") {
+        enqueue({
+          execution: accepted.execution,
+          intent,
+          context: undefined,
+          toolContinuations: [],
+          sideEffectDispatched: false,
+        });
         pump();
       }
       return accepted;
@@ -532,6 +566,11 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
           begun.execution.currentAttemptSeq,
           "Compensation completed",
         );
+        try {
+          options.onMessageCommitted?.(completed);
+        } catch {
+          // Post-commit routing notification cannot alter compensation completion.
+        }
         return { execution: completed, replayed: false };
       } catch (error: unknown) {
         await options.authority.settleTool(

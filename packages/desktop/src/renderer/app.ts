@@ -4,6 +4,7 @@ import {
   isCalibrationSignal,
   isHumanReadReceipt,
   isOpenItem,
+  isRouteJudgment,
   isSocialReaction,
   type Actor,
   type AgentActor,
@@ -17,6 +18,7 @@ import {
   type HumanReadReceipt,
   type Message,
   type OpenItem,
+  type RouteJudgment,
   type SocialReaction,
   type ToolConfirmationInput,
   type ToolConfirmationRequiredPayload,
@@ -25,6 +27,7 @@ import {
 export interface RestoredPrimitivePreviewRecords {
   readonly humanReads: readonly HumanReadReceipt[];
   readonly agentJudgements: readonly AgentJudgement[];
+  readonly routeJudgments: readonly RouteJudgment[];
   readonly openItems: readonly OpenItem[];
   readonly agentExecutions: readonly AgentExecution[];
   readonly socialReactions: readonly SocialReaction[];
@@ -1045,6 +1048,27 @@ function appendReceiptRecords(
     if (content === null) throw new Error("Message judgement target has no content column");
     content.append(judgement);
   }
+
+  const routeOutcomeLabels: Readonly<Record<RouteJudgment["outcome"], string>> = {
+    no_response_needed: "无需回应",
+    will_respond: "将回应",
+    suppressed: "被抑制",
+  };
+  for (const record of records.routeJudgments) {
+    const judgment = primitiveElement(
+      "div",
+      "route-judgment",
+      `路由判定 · ${routeOutcomeLabels[record.outcome]} · ${record.reasonText}`,
+    );
+    judgment.dataset.routeOutcome = record.outcome;
+    judgment.dataset.routeReasonCode = record.reasonCode;
+    judgment.dataset.routeAttempt = String(record.routeAttempt);
+    judgment.dataset.routeJobId = record.routeJobId;
+    const content = messagesById.get(record.sourceMessageId)!
+      .querySelector<HTMLElement>(".message-content");
+    if (content === null) throw new Error("Route judgment target has no content column");
+    content.append(judgment);
+  }
 }
 
 function appendAddressingPreview(
@@ -1141,10 +1165,13 @@ function appendReactionAndCorrectionPreview(
     container.append(social);
   }
   for (const record of records.calibrations) {
+    const marker = "emoji" in record
+      ? record.emoji
+      : record.feedback === "useful" ? "有用" : "这条不必";
     const calibration = primitiveElement(
       "span",
       "reaction reaction--calibration",
-      `${record.emoji} 校准：影响后续发言判定`,
+      `${marker} 校准：影响后续发言判定`,
     );
     calibration.dataset.reactionKind = "calibration";
     calibration.dataset.sourceMessageId = record.sourceMessageId;
@@ -1185,6 +1212,17 @@ const defaultRestoredPrimitiveRecords: RestoredPrimitivePreviewRecords = {
       decidedAt: "2026-08-08T10:02:03.000Z",
     },
   ],
+  routeJudgments: [{
+    id: "preview-route-judgment",
+    routeJobId: "preview-route-job",
+    sourceMessageId: "preview-human-mention",
+    agentId: "agent-data",
+    outcome: "will_respond",
+    reasonCode: "direct_mention",
+    reasonText: "显式点名，路由到数据 Agent",
+    routeAttempt: 1,
+    decidedAt: "2026-08-08T10:02:04.000Z",
+  }],
   openItems: [{
     id: "preview-open-item",
     roomId: "preview-room",
@@ -1240,16 +1278,17 @@ function validateRestoredPrimitiveRecords(records: RestoredPrimitivePreviewRecor
   if (typeof records !== "object" || records === null ||
       Object.keys(records).sort().join(",") !== [
         "agentExecutions", "agentJudgements", "calibrations", "humanReads",
-        "openItems", "socialReactions",
+        "openItems", "routeJudgments", "socialReactions",
       ].join(",") ||
       !Array.isArray(records.humanReads) || !Array.isArray(records.agentJudgements) ||
+      !Array.isArray(records.routeJudgments) ||
       !Array.isArray(records.openItems) || !Array.isArray(records.agentExecutions) ||
       !Array.isArray(records.socialReactions) || !Array.isArray(records.calibrations)) {
     throw new TypeError("Restored collaboration record envelope is not closed");
   }
   const messageIds = new Set(["preview-human-mention", "preview-agent-data"]);
   const primitiveIds = [
-    ...records.humanReads, ...records.agentJudgements, ...records.openItems,
+    ...records.humanReads, ...records.agentJudgements, ...records.routeJudgments, ...records.openItems,
     ...records.agentExecutions, ...records.socialReactions, ...records.calibrations,
   ].map((record) => record.id);
   if (new Set(primitiveIds).size !== primitiveIds.length) {
@@ -1259,6 +1298,8 @@ function validateRestoredPrimitiveRecords(records: RestoredPrimitivePreviewRecor
     isHumanReadReceipt(record) && messageIds.has(record.messageId)) ||
       !records.agentJudgements.every((record) =>
         isAgentJudgement(record) && messageIds.has(record.messageId)) ||
+      !records.routeJudgments.every((record) =>
+        isRouteJudgment(record) && messageIds.has(record.sourceMessageId)) ||
       !records.openItems.every((record) =>
         isOpenItem(record) && record.roomId === "preview-room" &&
         messageIds.has(record.sourceMessageId)) ||

@@ -552,6 +552,398 @@ describe("SQLite authoritative sessions", () => {
   });
 
   describe("message.send shared idempotency", () => {
+    it("commits one route job with the closed Agent membership snapshot before acknowledging", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-route-job-message-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const routeActors = [
+        actors[0],
+        actors[1],
+        {
+          id: "agent-route-second",
+          kind: "agent",
+          displayName: "Second Router Target",
+          readiness: "ready",
+          toolPermissions: ["route.read"],
+        },
+      ] as const satisfies readonly Actor[];
+      const bootstrapClient = await createWorkerDatabaseClient({ databasePath });
+      const bootstrapAuthority = createSqliteAuthoritativeStore(bootstrapClient);
+      await bootstrapAuthority.registerActors(routeActors);
+      const auth = createAuthenticationService({
+        actors: { getActor: (actorId) => routeActors.find((actor) => actor.id === actorId) },
+        identities,
+        authority: bootstrapAuthority,
+        clock: () => 1_000,
+        tokenFactory: tokenSequence("route-access", "route-refresh"),
+      });
+      const issued = await auth.login({ accountId: "account-li", secret: "correct" });
+      const session = await auth.authenticateSession(issued.accessToken);
+      await bootstrapClient.close();
+
+      const setup = new DatabaseSync(databasePath);
+      migrateAuthorityDatabase(setup);
+      setup.exec(`
+        INSERT INTO rooms (id, name, status, created_at)
+        VALUES ('room-route', 'Route Room', 'active', '2026-08-17T10:00:00.000Z');
+        INSERT INTO room_memberships (
+          room_id, actor_id, kind, role, participation, tool_permissions_json,
+          joined_at, configured_at, access_revision
+        ) VALUES
+          ('room-route', 'human-li', 'human', 'owner', NULL, '[]',
+           '2026-08-17T10:00:00.000Z', NULL, 0),
+          ('room-route', 'agent-review', 'agent', NULL, 'active', '["review.read"]',
+           NULL, '2026-08-17T10:00:00.000Z', 1),
+          ('room-route', 'agent-route-second', 'agent', NULL, 'on-mention', '["route.read"]',
+           NULL, '2026-08-17T10:00:00.000Z', 1);
+        INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+        VALUES ('room', 'room-route', 0, 1);
+      `);
+      setup.close();
+
+      const client = await createWorkerDatabaseClient({ databasePath });
+      const authority = createSqliteAuthoritativeStore(client, { clock: () => 2_000 });
+      const context = {
+        ...session,
+        kind: "human" as const,
+        requestId: "route-message-first",
+        idempotencyKey: "route-message-idempotency",
+      };
+      const command = {
+        type: "message.send",
+        roomId: "room-route",
+        payload: {
+          id: "message-route-source",
+          roomId: "room-route",
+          body: "@agent-review @agent-route-second Please assess the database migration risk",
+          sentAt: "2026-08-17T10:01:00.000Z",
+        },
+      } as const;
+
+      const first = await authority.executeHuman(context, command);
+      await expect(authority.executeHuman(
+        { ...context, requestId: "route-message-replay" },
+        command,
+      )).resolves.toEqual(first);
+
+      const inspection = new DatabaseSync(databasePath, { readOnly: true });
+      expect(inspection.prepare(
+        `SELECT source_message_id AS sourceMessageId, status, current_attempt AS currentAttempt,
+                embedding_model_version AS embeddingModelVersion, window_size AS windowSize,
+                cosine_threshold AS cosineThreshold, room_phase AS roomPhase
+         FROM route_jobs`,
+      ).all()).toEqual([{
+        sourceMessageId: "message-route-source",
+        status: "queued",
+        currentAttempt: 1,
+        embeddingModelVersion: "dao-topic-embedding-v1",
+        windowSize: 8,
+        cosineThreshold: 0.82,
+        roomPhase: "discussion",
+      }]);
+      expect(inspection.prepare(
+        `SELECT agent_id AS agentId, participation, role, capabilities_json AS capabilitiesJson,
+                calibration_score AS calibrationScore, has_ball AS hasBall
+         FROM route_job_agents ORDER BY agent_id`,
+      ).all()).toEqual([
+        {
+          agentId: "agent-review",
+          participation: "active",
+          role: "Reviewer",
+          capabilitiesJson: '["review.read"]',
+          calibrationScore: 0,
+          hasBall: 0,
+        },
+        {
+          agentId: "agent-route-second",
+          participation: "on-mention",
+          role: "Second Router Target",
+          capabilitiesJson: '["route.read"]',
+          calibrationScore: 0,
+          hasBall: 0,
+        },
+      ]);
+      expect(inspection.prepare("SELECT COUNT(*) AS count FROM route_attempts").get()).toEqual({ count: 1 });
+      expect(inspection.prepare("SELECT COUNT(*) AS count FROM message_topics").get()).toEqual({ count: 1 });
+      inspection.close();
+
+      const claimed = await client.executeRoute({
+        type: "route.claim",
+        sourceMessageId: command.payload.id,
+        now: 2_100,
+      });
+      expect(claimed).toMatchObject({
+        kind: "route-claimed",
+        job: { status: "running", currentAttempt: 1 },
+        providerInput: {
+          purpose: "route_decision",
+          sourceMessageId: command.payload.id,
+          message: {
+            authorId: "human-li",
+            authorKind: "human",
+            summary: command.payload.body,
+          },
+          agents: [
+            { agentId: "agent-review", participation: "active", capabilities: ["review.read"] },
+            { agentId: "agent-route-second", participation: "on-mention", capabilities: ["route.read"] },
+          ],
+          limits: { timeoutMs: 1_000, maxCandidates: 2, maxOutputBytes: 65_536 },
+        },
+        decisionContext: {
+          directMentionAgentIds: ["agent-review", "agent-route-second"],
+          structuredHelpAgentIds: [],
+        },
+      });
+      await expect(client.executeRoute({
+        type: "route.claim",
+        sourceMessageId: command.payload.id,
+        now: 2_101,
+      })).rejects.toMatchObject({ status: 409, code: "route_conflict" });
+
+      await authority.executeHuman(
+        { ...context, requestId: "remove-route-agent", idempotencyKey: "remove-route-agent" },
+        { type: "member.remove", roomId: "room-route", payload: { targetActorId: "agent-route-second" } },
+      );
+      const routeJobId = (claimed as { readonly job: { readonly id: string } }).job.id;
+      const decidedAt = "1970-01-01T00:00:02.200Z";
+      const judgments = ["agent-review", "agent-route-second"].map((agentId) => ({
+        id: `judgment-${agentId}`,
+        routeJobId,
+        sourceMessageId: command.payload.id,
+        agentId,
+        outcome: "will_respond" as const,
+        reasonCode: "direct_mention" as const,
+        reasonText: "direct mandatory address",
+        routeAttempt: 1 as const,
+        decidedAt,
+      }));
+      const intents = ["agent-review", "agent-route-second"].map((targetAgentId) => ({
+        kind: "direct_mention" as const,
+        roomId: "room-route",
+        sourceMessageId: command.payload.id,
+        targetAgentId,
+        reasonCode: "direct_mention" as const,
+        reasonText: "direct mandatory address",
+        priority: 1 as const,
+      }));
+      await expect(client.executeRoute({
+        type: "route.complete",
+        routeJobId,
+        attempt: 1,
+        judgments,
+        intents,
+        now: 2_200,
+      })).resolves.toMatchObject({
+        kind: "route-completed",
+        job: { status: "completed" },
+        intents: [{ targetAgentId: "agent-review" }],
+      });
+
+      const completedInspection = new DatabaseSync(databasePath, { readOnly: true });
+      expect(completedInspection.prepare(
+        `SELECT agent_id AS agentId, outcome, reason_code AS reasonCode
+         FROM route_judgments ORDER BY agent_id`,
+      ).all()).toEqual([
+        { agentId: "agent-review", outcome: "will_respond", reasonCode: "direct_mention" },
+        { agentId: "agent-route-second", outcome: "suppressed", reasonCode: "permission_denied" },
+      ]);
+      expect(completedInspection.prepare(
+        `SELECT target_agent_id AS targetAgentId FROM route_invocation_intents`,
+      ).all()).toEqual([{ targetAgentId: "agent-review" }]);
+      completedInspection.close();
+
+      const routedInvocation = {
+        type: "runtime.invoke-routed",
+        routeJobId,
+        intent: {
+          kind: "direct_mention",
+          roomId: "room-route",
+          sourceMessageId: command.payload.id,
+          targetAgentId: "agent-review",
+        },
+        executionId: "execution-routed-authoritative",
+        intentId: "intent-routed-authoritative",
+        providerId: "openai-responses",
+        modelId: "runtime-model",
+        now: 2_300,
+      } as const;
+      await expect(client.executeRuntime(routedInvocation)).resolves.toMatchObject({
+        kind: "invocation",
+        replayed: false,
+        execution: {
+          id: "execution-routed-authoritative",
+          requesterId: "human-li",
+          agentId: "agent-review",
+          status: "queued",
+        },
+      });
+      await expect(client.executeRuntime({
+        ...routedInvocation,
+        executionId: "execution-routed-replay-unused",
+        intentId: "intent-routed-replay-unused",
+        now: 2_301,
+      })).resolves.toMatchObject({
+        kind: "invocation",
+        replayed: true,
+        execution: { id: "execution-routed-authoritative" },
+      });
+      await expect(client.executeRuntime({
+        ...routedInvocation,
+        intent: { ...routedInvocation.intent, targetAgentId: "agent-route-second" },
+        executionId: "execution-routed-forbidden",
+        intentId: "intent-routed-forbidden",
+        now: 2_302,
+      })).rejects.toMatchObject({ status: 403, code: "permission_denied" });
+
+      const retryCommand = {
+        type: "message.send",
+        roomId: "room-route",
+        payload: {
+          id: "message-route-retry",
+          roomId: "room-route",
+          body: "Assess another migration risk",
+          sentAt: "2026-08-17T10:02:00.000Z",
+        },
+      } as const;
+      await authority.executeHuman(
+        { ...context, requestId: "route-retry-message", idempotencyKey: "route-retry-message" },
+        retryCommand,
+      );
+      const retryClaim1 = await client.executeRoute({
+        type: "route.claim",
+        sourceMessageId: retryCommand.payload.id,
+        now: 3_000,
+      }) as { readonly job: { readonly id: string } };
+      const retryJobId = retryClaim1.job.id;
+      await expect(client.executeRoute({
+        type: "route.fail",
+        routeJobId: retryJobId,
+        attempt: 1,
+        errorCode: "provider_timeout",
+        now: 3_100,
+      })).resolves.toMatchObject({
+        kind: "route-failed",
+        retryAfterMs: 250,
+        job: { status: "queued", currentAttempt: 2, nextRetryAt: "1970-01-01T00:00:03.350Z" },
+      });
+      await expect(client.executeRoute({
+        type: "route.claim",
+        sourceMessageId: retryCommand.payload.id,
+        now: 3_349,
+      })).rejects.toMatchObject({ status: 409, code: "route_conflict" });
+      await client.executeRoute({
+        type: "route.claim",
+        sourceMessageId: retryCommand.payload.id,
+        now: 3_350,
+      });
+      await expect(client.executeRoute({
+        type: "route.fail",
+        routeJobId: retryJobId,
+        attempt: 2,
+        errorCode: "provider_malformed",
+        now: 3_400,
+      })).resolves.toMatchObject({
+        kind: "route-failed",
+        retryAfterMs: 1_000,
+        job: { status: "queued", currentAttempt: 3, nextRetryAt: "1970-01-01T00:00:04.400Z" },
+      });
+      await client.executeRoute({
+        type: "route.claim",
+        sourceMessageId: retryCommand.payload.id,
+        now: 4_400,
+      });
+      await expect(client.executeRoute({
+        type: "route.fail",
+        routeJobId: retryJobId,
+        attempt: 3,
+        errorCode: "provider_failure",
+        now: 4_500,
+      })).resolves.toMatchObject({
+        kind: "route-failed",
+        job: { status: "failed", currentAttempt: 3, terminalErrorCode: "provider_failure" },
+      });
+      const exhaustedInspection = new DatabaseSync(databasePath, { readOnly: true });
+      expect(exhaustedInspection.prepare(
+        `SELECT attempt_seq AS attemptSeq, status, error_code AS errorCode
+         FROM route_attempts WHERE route_job_id = ? ORDER BY attempt_seq`,
+      ).all(retryJobId)).toEqual([
+        { attemptSeq: 1, status: "failed", errorCode: "provider_timeout" },
+        { attemptSeq: 2, status: "failed", errorCode: "provider_malformed" },
+        { attemptSeq: 3, status: "failed", errorCode: "provider_failure" },
+      ]);
+      expect(exhaustedInspection.prepare(
+        `SELECT agent_id AS agentId, reason_code AS reasonCode, route_attempt AS routeAttempt
+         FROM route_judgments WHERE route_job_id = ?`,
+      ).all(retryJobId)).toEqual([
+        { agentId: "agent-review", reasonCode: "provider_failed", routeAttempt: 3 },
+      ]);
+      expect(exhaustedInspection.prepare(
+        `SELECT metric_name AS metricName, value FROM route_metrics WHERE route_job_id = ?`,
+      ).all(retryJobId)).toEqual([{ metricName: "attempts_exhausted", value: 1 }]);
+      exhaustedInspection.close();
+
+      const restartCommand = {
+        type: "message.send",
+        roomId: "room-route",
+        payload: {
+          id: "message-route-worker-restart",
+          roomId: "room-route",
+          body: "Assess the restart boundary",
+          sentAt: "2026-08-17T10:03:00.000Z",
+        },
+      } as const;
+      await authority.executeHuman(
+        { ...context, requestId: "route-restart-message", idempotencyKey: "route-restart-message" },
+        restartCommand,
+      );
+      const restartClaim = await client.executeRoute({
+        type: "route.claim",
+        sourceMessageId: restartCommand.payload.id,
+        now: 5_000,
+      }) as { readonly job: { readonly id: string } };
+      await client.close();
+
+      const restartedClient = await createWorkerDatabaseClient({ databasePath });
+      await expect(restartedClient.executeRoute({
+        type: "route.recover",
+        now: 5_100,
+      })).resolves.toMatchObject({
+        kind: "route-recovery",
+        jobs: [{
+          id: restartClaim.job.id,
+          status: "queued",
+          currentAttempt: 2,
+          nextRetryAt: "1970-01-01T00:00:05.350Z",
+        }],
+      });
+      await expect(restartedClient.executeRoute({
+        type: "route.recover",
+        now: 5_350,
+      })).resolves.toMatchObject({
+        kind: "route-recovery",
+        jobs: [{
+          id: restartClaim.job.id,
+          status: "queued",
+          currentAttempt: 2,
+          nextRetryAt: "1970-01-01T00:00:05.350Z",
+        }],
+      });
+      await restartedClient.close();
+      const recoveredInspection = new DatabaseSync(databasePath, { readOnly: true });
+      expect(recoveredInspection.prepare(
+        `SELECT attempt_seq AS attemptSeq, status, error_code AS errorCode
+         FROM route_attempts WHERE route_job_id = ? ORDER BY attempt_seq`,
+      ).all(restartClaim.job.id)).toEqual([
+        { attemptSeq: 1, status: "failed", errorCode: "runtime_restarted" },
+        { attemptSeq: 2, status: "queued", errorCode: null },
+      ]);
+      expect(recoveredInspection.prepare(
+        `SELECT COUNT(*) AS count FROM events
+         WHERE event_type = 'route.retry-scheduled' AND payload_json LIKE ?`,
+      ).get(`%${restartClaim.job.id}%`)).toEqual({ count: 1 });
+      recoveredInspection.close();
+    });
+
     it("returns one stable acknowledgement for sequential exact replay", async () => {
       const directory = await mkdtemp(join(tmpdir(), "native-im-message-sequential-"));
       temporaryDirectories.push(directory);
@@ -1272,6 +1664,44 @@ describe("SQLite authoritative sessions", () => {
           command,
         ),
       ).resolves.toEqual(first);
+      const useful = {
+        type: "calibration.record",
+        roomId: "room-facts",
+        payload: { sourceMessageId: "message-agent-source", feedback: "useful" },
+      } as const;
+      const usefulFirst = await fixture.authority.executeHuman(
+        { ...context, requestId: "calibration-useful-1", idempotencyKey: "calibration-useful-1" },
+        useful,
+      );
+      await expect(fixture.authority.executeHuman(
+        { ...context, requestId: "calibration-useful-replay", idempotencyKey: "calibration-useful-1" },
+        useful,
+      )).resolves.toEqual(usefulFirst);
+      await fixture.authority.executeHuman(
+        { ...context, requestId: "calibration-useful-2", idempotencyKey: "calibration-useful-2" },
+        useful,
+      );
+      await fixture.authority.executeHuman(
+        { ...context, requestId: "calibration-useful-3", idempotencyKey: "calibration-useful-3" },
+        useful,
+      );
+      await fixture.authority.executeHuman(
+        { ...context, requestId: "calibration-not-needed", idempotencyKey: "calibration-not-needed" },
+        { ...useful, payload: { ...useful.payload, feedback: "not_needed" } },
+      );
+      await fixture.authority.executeHuman(
+        { ...context, requestId: "calibration-followup", idempotencyKey: "calibration-followup" },
+        {
+          type: "message.send",
+          roomId: "room-facts",
+          payload: {
+            id: "message-after-calibration",
+            roomId: "room-facts",
+            body: "review complete",
+            sentAt: "2026-08-10T13:03:00.000Z",
+          },
+        },
+      );
       await expect(
         fixture.authority.executeHuman(
           { ...context, requestId: "calibration-conflict" },
@@ -1284,6 +1714,12 @@ describe("SQLite authoritative sessions", () => {
           { ...command, payload: { ...command.payload, emoji: "❤️" } } as never,
         ),
       ).rejects.toMatchObject({ status: 400, code: "invalid_request" });
+      await expect(
+        fixture.authority.executeHuman(
+          { ...context, requestId: "calibration-human", idempotencyKey: "calibration-human" },
+          { ...command, payload: { sourceMessageId: "message-human-source", emoji: "👍" } },
+        ),
+      ).rejects.toMatchObject({ status: 400, code: "calibration_source_invalid" });
       await fixture.client.close();
 
       const restartedClient = await createWorkerDatabaseClient({ databasePath });
@@ -1311,9 +1747,27 @@ describe("SQLite authoritative sessions", () => {
       });
       expect(database.prepare(
         "SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.calibration.recorded'",
-      ).get()).toEqual({ count: 1 });
+      ).get()).toEqual({ count: 5 });
       expect(database.prepare("SELECT COUNT(*) AS count FROM calibration_signals").get())
         .toEqual({ count: 1 });
+      expect(database.prepare(
+        `SELECT kind, weight FROM route_calibration_facts ORDER BY rowid`,
+      ).all()).toEqual([
+        { kind: "thumbs_down", weight: -1 },
+        { kind: "useful", weight: 2 },
+        { kind: "useful", weight: 2 },
+        { kind: "useful", weight: 2 },
+        { kind: "not_needed", weight: -2 },
+      ]);
+      expect(database.prepare(
+        `SELECT score FROM route_calibration_scores WHERE agent_id = 'agent-review'`,
+      ).get()).toEqual({ score: 2 });
+      expect(database.prepare(
+        `SELECT snapshot.calibration_score AS calibrationScore
+         FROM route_job_agents AS snapshot
+         JOIN route_jobs AS job ON job.id = snapshot.route_job_id
+         WHERE job.source_message_id = 'message-after-calibration'`,
+      ).get()).toEqual({ calibrationScore: 2 });
       database.close();
     });
   });
