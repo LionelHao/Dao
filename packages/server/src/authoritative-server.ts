@@ -33,6 +33,10 @@ import { createWorkerRouteAuthority } from "./route-runtime/worker-route-authori
 import { mintInternalAgentCommandContext } from "./persistence/contracts.js";
 import { createEmptyBlueprintBallProjectionPort, type BlueprintBallProjectionPort } from "./ball-runtime/contracts.js";
 import { createBallRuntimeService, type BallRuntimeService } from "./ball-runtime/ball-runtime-service.js";
+import {
+  createHumanPreemptionRuntime,
+  type HumanPreemptionRuntime,
+} from "./human-preemption/human-preemption-runtime.js";
 
 export interface AuthoritativeServer {
   readonly url: string;
@@ -117,6 +121,7 @@ async function start(
   let runtime: AgentRuntimeService | undefined;
   let routeRuntime: RouteRuntimeService | undefined;
   let ballRuntime: BallRuntimeService | undefined;
+  let humanPreemptionRuntime: HumanPreemptionRuntime | undefined;
   try {
     worker = transactionFault === undefined
       ? await createWorkerDatabaseClient({ databasePath: options.databasePath })
@@ -199,7 +204,7 @@ async function start(
           try {
             const acknowledgement = await authority.executeHuman(context, command);
             if (command.type === "message.send") {
-              routeRuntime?.notify(command.roomId, acknowledgement.aggregateId);
+              await humanPreemptionRuntime?.handle(acknowledgement.aggregateId);
             }
             if (command.type === "open-item.create" || command.type === "open-item.transition" ||
                 command.type === "light-task.create" || command.type === "light-task.transition" ||
@@ -328,15 +333,25 @@ async function start(
       authority: routeAuthority,
       provider: routerProvider,
       async invoke(routeJobId, intent) {
-        await runtime!.invokeRouted(routeJobId, {
+        const runtimeIntent = {
           kind: intent.kind,
           roomId: intent.roomId,
           sourceMessageId: intent.sourceMessageId,
           targetAgentId: intent.targetAgentId,
-        });
+        } as const;
+        const replacements = await runtime!.invokeFenceReplacements(routeJobId, runtimeIntent);
+        if (replacements.length === 0) await runtime!.invokeRouted(routeJobId, runtimeIntent);
       },
     });
     await routeRuntime.recover();
+    humanPreemptionRuntime = createHumanPreemptionRuntime({
+      worker,
+      runtime,
+      notifyRoute(roomId, sourceMessageId) {
+        return routeRuntime!.notify(roomId, sourceMessageId);
+      },
+    });
+    await humanPreemptionRuntime.recover();
     const ballConfiguration = options.ballRuntime ?? {};
     ballRuntime = createBallRuntimeService({
       worker,

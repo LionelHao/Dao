@@ -60,6 +60,24 @@
   white-space: pre-wrap;
 }
 
+.human-preemption-notice {
+  border-left: 3px solid #64748b;
+  border-radius: 0.25rem;
+  background: #f8fafc;
+  color: #334155;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.8125rem;
+}
+
+.agent-invocation--human-preempted {
+  border-color: #94a3b8;
+  color: #475569;
+}
+
+.agent-invocation--requeued {
+  border-color: #2563eb;
+}
+
 .agent-tool-confirmation {
   padding: 0.75rem;
   border: 1px solid var(--semantic-warning);

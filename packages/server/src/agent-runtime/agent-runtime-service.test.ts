@@ -61,6 +61,8 @@ function authority(): RuntimeAuthority & { executions: Map<string, AgentExecutio
       executions.set(value.id, value);
       return { execution: value, replayed: false };
     },
+    invokeRouted: vi.fn(),
+    enqueueFenceReplacements: vi.fn(),
     async claim(id, attemptSeq) {
       const value = executions.get(id)!;
       if (value.currentAttemptSeq !== attemptSeq || value.status !== "queued") throw new AgentRuntimeError("execution_conflict", "stale");
@@ -256,6 +258,57 @@ describe("bounded Agent runtime scheduler", () => {
     await expect(runtime.interrupt(context, accepted.execution.id, "replayed"))
       .resolves.toMatchObject({ id: accepted.execution.id, status: "cancelled" });
     expect(ordering).toEqual(["cancel-committed", "abort-propagated", "cancel-committed"]);
+  });
+
+  it("aborts a provider fake and removes queued work only after a committed human fence is applied", async () => {
+    const runtimeAuthority = authority();
+    const ordering: string[] = [];
+    let started!: () => void;
+    const sawStart = new Promise<void>((resolve) => { started = resolve; });
+    const complete = vi.spyOn(runtimeAuthority, "complete");
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      provider: provider(async function* (_input, signal) {
+        started();
+        await new Promise<void>((resolve) => signal.addEventListener("abort", () => {
+          ordering.push("abort-propagated");
+          resolve();
+        }, { once: true }));
+        yield { type: "response_started", sequence: 1 };
+      }),
+      modelId: "fake-model",
+      buildProviderInput: providerInput,
+      limits: { maxActive: 1, maxQueuedPerRoom: 2, maxPartialBytes: 1_024 },
+    });
+    const active = await runtime.invoke(context, intent("room-a", "human-fence-active"));
+    const queued = await runtime.invoke(
+      { ...context, requestId: "human-fence-r2", idempotencyKey: "human-fence-k2" },
+      intent("room-a", "human-fence-queued"),
+    );
+    await sawStart;
+    const cancelledAt = "2026-08-17T00:00:02.000Z";
+    const cancelled = [active.execution.id, queued.execution.id].map((id) => {
+      const current = runtimeAuthority.executions.get(id)!;
+      const value: AgentExecution = {
+        ...current,
+        status: "cancelled",
+        actionCategory: id === active.execution.id ? "waiting_upstream" : current.actionCategory,
+        updatedAt: cancelledAt,
+        completedAt: cancelledAt,
+        cancellationReason: "human_preempted:human-message",
+      };
+      runtimeAuthority.executions.set(id, value);
+      return value;
+    });
+
+    ordering.push("cancel-committed");
+    runtime.applyCommittedHumanFence(cancelled);
+    await runtime.whenIdle();
+
+    expect(ordering).toEqual(["cancel-committed", "abort-propagated"]);
+    expect(complete).not.toHaveBeenCalled();
+    expect([...runtimeAuthority.executions.values()].map((value) => value.status))
+      .toEqual(["cancelled", "cancelled"]);
   });
 
   it("executes a closed provider tool plan and continues with only bounded tool output", async () => {

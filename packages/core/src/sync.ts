@@ -12,6 +12,7 @@ import {
   isAgentJudgement,
   isCalibrationSignal,
   isHumanReadReceipt,
+  isHumanPreemptionNotice,
   isLightTask,
   isBallOverdueTrigger,
   isOpenItem,
@@ -22,6 +23,7 @@ import {
   type AgentJudgement,
   type CalibrationSignal,
   type HumanReadReceipt,
+  type HumanPreemptionNotice,
   type LightTask,
   type BallOverdueTrigger,
   type OpenItem,
@@ -167,6 +169,7 @@ export type PersistedRoomEvent =
   | RoomEvent<"room.open_item.agent_attempt_failed", OpenItemAgentFailure>
   | RoomEvent<"room.light_task.changed", LightTask>
   | RoomEvent<"room.ball.overdue", BallOverdueTrigger>
+  | RoomEvent<"room.human_preemption.applied", HumanPreemptionNotice>
   | RoomEvent<"room.agent_execution.changed", AgentExecution>
   | RoomEvent<"room.route_judgment.recorded", RouteJudgment>
   | RoomEvent<
@@ -398,6 +401,10 @@ function isPersistedRoomEventValue(value: unknown): value is PersistedRoomEvent 
   if (value.type === "room.ball.overdue") {
     return isBallOverdueTrigger(payload) && payload.roomId === value.roomId &&
       payload.agentId === value.actorId;
+  }
+  if (value.type === "room.human_preemption.applied") {
+    return isHumanPreemptionNotice(payload) && payload.roomId === value.roomId &&
+      payload.occurredAt === value.occurredAt;
   }
   if (value.type === "room.agent_execution.changed") {
     return isAgentExecution(payload) && payload.roomId === value.roomId && payload.agentId === value.actorId;

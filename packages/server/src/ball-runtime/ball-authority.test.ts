@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   executeBallAuthorityOperation,
   executeHumanDatabaseCommand,
+  executeRuntimeAuthorityOperation,
 } from "../persistence/authority-database-handler.js";
 import { migrateAuthorityDatabase } from "../persistence/schema.js";
 
@@ -131,6 +132,16 @@ describe("real SQLite BallInCourt authority", () => {
           id, roomId: "room-1", body: "route probe", sentAt: new Date(t0 + offset).toISOString(),
         } },
         now: t0 + offset,
+      });
+      executeRuntimeAuthorityOperation(database, {
+        type: "runtime.cancel-for-human-fence",
+        sourceHumanMessageId: id,
+        now: t0 + offset + 1,
+      });
+      executeRuntimeAuthorityOperation(database, {
+        type: "runtime.create-route-after-human-fence",
+        sourceHumanMessageId: id,
+        now: t0 + offset + 2,
       });
     }
     expect(database.prepare(

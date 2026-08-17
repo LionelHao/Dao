@@ -2,6 +2,7 @@ import type {
   AgentConfigurationRequest,
   AgentRoomMembership,
   HumanInvitationRequest,
+  HumanPreemptionNotice,
   HumanRoomMembership,
   LightTask,
   BallInCourt,
@@ -125,6 +126,14 @@ const invalidBallHolderSet: BallInCourt = {
   // @ts-expect-error BallInCourt has exactly one holder and cannot carry a holder set.
   holderIds: ["human-1", "human-2"],
 };
+
+const invalidConfigurablePreemption: HumanPreemptionNotice = {
+  roomId: "room-1", sourceHumanMessageId: "message-human-1",
+  cancelledExecutionIds: [], rerouteStatus: "queued", occurredAt: "2026-08-17T00:00:00.000Z",
+  // @ts-expect-error Human preemption is a hard rule and cannot carry an opt-out.
+  enabled: false,
+};
+void invalidConfigurablePreemption;
 
 declare const runtimeProviderInput: AgentRuntimeProviderInput;
 declare const routerProviderInput: RouterProviderInput;

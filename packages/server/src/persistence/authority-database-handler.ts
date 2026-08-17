@@ -24,6 +24,7 @@ import {
   type BallOverdueTrigger,
   type BallSummary,
   type BlueprintBallFact,
+  type HumanPreemptionNotice,
   type NeedsActionProjection,
   type ReminderCandidate,
 } from "@native-im/core";
@@ -2464,7 +2465,7 @@ function executeMessageSend(
     scope,
     key,
   );
-  enqueueRouteJobForMessage(database, message, acceptedAt);
+  if (message.authorKind === "agent") enqueueRouteJobForMessage(database, message, acceptedAt);
   return {
     aggregateId: message.id,
     eventIds: [eventId],
@@ -3704,7 +3705,8 @@ function runtimeExecutionById(database: DatabaseSync, executionId: string): Agen
             result_message_id AS resultMessageId,
             next_retry_at AS nextRetryAt,
             manual_retry_of_execution_id AS manualRetryOfExecutionId,
-            compensates_execution_id AS compensatesExecutionId
+            compensates_execution_id AS compensatesExecutionId,
+            supersedes_execution_ids_json AS supersedesExecutionIdsJson
      FROM agent_executions WHERE id = ?`,
   ).get(executionId);
   if (row === undefined) return fail("execution_not_found", "Agent execution was not found");
@@ -3720,6 +3722,20 @@ function runtimeExecutionById(database: DatabaseSync, executionId: string): Agen
     typeof row.updatedAt !== "string"
   ) return fail("storage_unavailable", "Agent execution was corrupt");
   const status = row.status;
+  let supersedesExecutionIds: string[] | undefined;
+  if (typeof row.supersedesExecutionIdsJson === "string") {
+    try {
+      const parsed = JSON.parse(row.supersedesExecutionIdsJson) as unknown;
+      if (!Array.isArray(parsed) || parsed.length === 0 || parsed.length > 32 ||
+          !parsed.every((entry) => typeof entry === "string" && entry.trim().length > 0) ||
+          new Set(parsed).size !== parsed.length || parsed.includes(row.id)) {
+        return fail("storage_unavailable", "Agent execution supersedes lineage was corrupt");
+      }
+      supersedesExecutionIds = parsed;
+    } catch {
+      return fail("storage_unavailable", "Agent execution supersedes lineage was corrupt");
+    }
+  }
   const execution: AgentExecution = {
     id: row.id,
     roomId: row.roomId,
@@ -3750,6 +3766,7 @@ function runtimeExecutionById(database: DatabaseSync, executionId: string): Agen
     ...(typeof row.nextRetryAt === "string" ? { nextRetryAt: row.nextRetryAt } : {}),
     ...(typeof row.manualRetryOfExecutionId === "string" ? { manualRetryOfExecutionId: row.manualRetryOfExecutionId } : {}),
     ...(typeof row.compensatesExecutionId === "string" ? { compensatesExecutionId: row.compensatesExecutionId } : {}),
+    ...(supersedesExecutionIds === undefined ? {} : { supersedesExecutionIds }),
   };
   return execution;
 }
@@ -3889,6 +3906,39 @@ function routeSourceAuthor(database: DatabaseSync, job: RouteJob): string {
     return fail("storage_unavailable", "Route source author was corrupt");
   }
   return source.authorId;
+}
+
+function hasPendingHumanPreemptionAfterSource(
+  database: DatabaseSync,
+  execution: AgentExecution,
+): boolean {
+  const pending = database.prepare(
+    `SELECT 1 AS present
+     FROM events AS source_event
+     JOIN events AS human_event
+       ON human_event.stream_kind = 'room'
+      AND human_event.stream_id = source_event.stream_id
+      AND human_event.room_id = source_event.room_id
+      AND human_event.stream_seq > source_event.stream_seq
+      AND human_event.event_type = 'room.message.accepted'
+     JOIN messages AS human_message
+       ON human_message.id = json_extract(human_event.payload_json, '$.id')
+      AND human_message.room_id = human_event.room_id
+      AND human_message.author_kind = 'human'
+     LEFT JOIN route_jobs AS human_route
+       ON human_route.source_message_id = human_message.id
+     LEFT JOIN human_preemption_fences AS fence
+       ON fence.source_human_message_id = human_message.id
+     WHERE source_event.stream_kind = 'room'
+       AND source_event.stream_id = ?
+       AND source_event.room_id = ?
+       AND source_event.event_type = 'room.message.accepted'
+       AND json_extract(source_event.payload_json, '$.id') = ?
+       AND human_route.id IS NULL
+       AND fence.source_human_message_id IS NULL
+     ORDER BY human_event.stream_seq LIMIT 1`,
+  ).get(execution.roomId, execution.roomId, execution.sourceMessageId);
+  return pending?.present === 1;
 }
 
 function appendRouteLifecycleEvent(
@@ -4338,6 +4388,298 @@ export function executeRuntimeAuthorityOperation(
 ): RuntimeAuthorityOperationResult {
   return runAuthorityImmediateTransaction(database, () => {
     const occurredAt = new Date(operation.now).toISOString();
+    if (operation.type === "runtime.list-pending-human-fences") {
+      const rows = database.prepare(
+        `SELECT message.id
+         FROM messages AS message
+         JOIN events AS accepted
+           ON accepted.stream_kind = 'room' AND accepted.stream_id = message.room_id
+          AND accepted.event_type = 'room.message.accepted'
+          AND json_extract(accepted.payload_json, '$.id') = message.id
+         LEFT JOIN route_jobs AS route ON route.source_message_id = message.id
+         WHERE message.author_kind = 'human' AND route.id IS NULL
+         ORDER BY accepted.occurred_at, accepted.stream_seq, message.id LIMIT 256`,
+      ).all();
+      if (!rows.every((row) => typeof row.id === "string")) {
+        return fail("storage_unavailable", "Pending human fence rows were corrupt");
+      }
+      return {
+        kind: "pending-human-fences",
+        sourceHumanMessageIds: rows.map((row) => row.id as string),
+      };
+    }
+    if (operation.type === "runtime.cancel-for-human-fence") {
+      const source = database.prepare(
+        `SELECT message.id, message.room_id AS roomId, message.author_id AS humanActorId,
+                event.occurred_at AS acceptedAt
+         FROM messages AS message
+         JOIN events AS event
+           ON event.stream_kind = 'room' AND event.stream_id = message.room_id
+          AND event.room_id = message.room_id AND event.actor_id = message.author_id
+          AND event.event_type = 'room.message.accepted'
+          AND json_extract(event.payload_json, '$.id') = message.id
+         WHERE message.id = ? AND message.author_kind = 'human'
+         ORDER BY event.stream_seq LIMIT 1`,
+      ).get(operation.sourceHumanMessageId);
+      if (typeof source?.id !== "string" || typeof source.roomId !== "string" ||
+          typeof source.humanActorId !== "string" || typeof source.acceptedAt !== "string") {
+        return fail("message_not_found", "Durable human fence message was not found");
+      }
+      const existing = database.prepare(
+        `SELECT cancel_committed_at AS cancelCommittedAt
+         FROM human_preemption_fences WHERE source_human_message_id = ?`,
+      ).get(source.id);
+      if (typeof existing?.cancelCommittedAt === "string") {
+        const ids = database.prepare(
+          `SELECT execution_id AS executionId FROM agent_human_fences
+           WHERE fence_message_id = ? ORDER BY execution_id`,
+        ).all(source.id);
+        if (!ids.every((row) => typeof row.executionId === "string")) {
+          return fail("storage_unavailable", "Human fence replay rows were corrupt");
+        }
+        const cancelledExecutions = ids.map((row) => runtimeExecutionById(database, row.executionId as string));
+        const notice: HumanPreemptionNotice = {
+          roomId: source.roomId,
+          sourceHumanMessageId: source.id,
+          cancelledExecutionIds: cancelledExecutions.map((execution) => execution.id),
+          rerouteStatus: "queued",
+          occurredAt: existing.cancelCommittedAt,
+        };
+        return { kind: "human-fence-cancelled", notice, cancelledExecutions };
+      }
+      const candidates = database.prepare(
+        `SELECT id
+         FROM agent_executions
+         WHERE room_id = ? AND queued_at <= ? AND (
+           status = 'queued'
+           OR (status = 'running' AND action_category = 'waiting_upstream')
+           OR (status = 'running' AND action_category = 'tool_call'
+               AND tool_dispatch_phase = 'not_started')
+         )
+         ORDER BY queued_at, id LIMIT 34`,
+      ).all(source.roomId, source.acceptedAt);
+      if (candidates.length > 33 || !candidates.every((row) => typeof row.id === "string")) {
+        return fail("storage_unavailable", "Human fence candidate set exceeded its bound");
+      }
+      const cancelledExecutions: AgentExecution[] = [];
+      for (const candidate of candidates) {
+        const current = runtimeExecutionById(database, candidate.id as string);
+        const cancellationReason = `human_preempted:${source.id}`;
+        const updated = database.prepare(
+          `UPDATE agent_executions
+           SET status = 'cancelled', cancellation_reason = ?, completed_at = ?,
+               updated_at = ?, next_retry_at = NULL
+           WHERE id = ? AND current_attempt_seq = ? AND (
+             status = 'queued'
+             OR (status = 'running' AND action_category = 'waiting_upstream')
+             OR (status = 'running' AND action_category = 'tool_call'
+                 AND tool_dispatch_phase = 'not_started')
+           )`,
+        ).run(cancellationReason, occurredAt, occurredAt, current.id, current.currentAttemptSeq);
+        if (updated.changes !== 1) return fail("execution_conflict", "Human fence cancellation was stale");
+        database.prepare(
+          `UPDATE agent_execution_attempts
+           SET status = 'cancelled', finished_at = ?, error_code = 'human_preempted', next_retry_at = NULL
+           WHERE execution_id = ? AND attempt_seq = ? AND status IN ('queued', 'running')`,
+        ).run(occurredAt, current.id, current.currentAttemptSeq);
+        database.prepare(
+          `INSERT INTO agent_human_fences (
+             fence_message_id, execution_id, old_attempt_seq, cancelled_at
+           ) VALUES (?, ?, ?, ?)`,
+        ).run(source.id, current.id, current.currentAttemptSeq, occurredAt);
+        const cancelled = runtimeExecutionById(database, current.id);
+        appendRuntimeExecutionEvent(database, cancelled, occurredAt, "cancelled", "human_preempted");
+        cancelledExecutions.push(cancelled);
+      }
+      database.prepare(
+        `INSERT INTO human_preemption_fences (
+           source_human_message_id, room_id, human_actor_id, accepted_at,
+           cancelled_count, cancel_committed_at
+         ) VALUES (?, ?, ?, ?, ?, ?)`,
+      ).run(source.id, source.roomId, source.humanActorId, source.acceptedAt,
+        cancelledExecutions.length, occurredAt);
+      const notice: HumanPreemptionNotice = {
+        roomId: source.roomId,
+        sourceHumanMessageId: source.id,
+        cancelledExecutionIds: cancelledExecutions.map((execution) => execution.id),
+        rerouteStatus: "queued",
+        occurredAt,
+      };
+      const eventId = stableId("human-preemption", source.id);
+      const streamSeq = appendRoomEvent(database, {
+        eventId,
+        roomId: source.roomId,
+        actorId: source.humanActorId,
+        eventType: "room.human_preemption.applied",
+        occurredAt,
+        payload: notice as unknown as JsonValue,
+      });
+      appendRoomOutbox(database, eventId, source.roomId, streamSeq, occurredAt,
+        "human-preemption", source.id);
+      return { kind: "human-fence-cancelled", notice, cancelledExecutions };
+    }
+    if (operation.type === "runtime.create-route-after-human-fence") {
+      const fence = database.prepare(
+        `SELECT fence.room_id AS roomId, fence.human_actor_id AS humanActorId,
+                fence.accepted_at AS acceptedAt, fence.route_job_id AS routeJobId,
+                message.body, message.sent_at AS sentAt
+         FROM human_preemption_fences AS fence
+         JOIN messages AS message ON message.id = fence.source_human_message_id
+         WHERE fence.source_human_message_id = ?`,
+      ).get(operation.sourceHumanMessageId);
+      if (typeof fence?.roomId !== "string" || typeof fence.humanActorId !== "string" ||
+          typeof fence.acceptedAt !== "string" || typeof fence.body !== "string" ||
+          typeof fence.sentAt !== "string") {
+        return fail("execution_conflict", "Human cancellation must commit before route creation");
+      }
+      if (typeof fence.routeJobId === "string") {
+        return {
+          kind: "human-fence-route", roomId: fence.roomId,
+          sourceHumanMessageId: operation.sourceHumanMessageId,
+          routeJobId: fence.routeJobId, replayed: true,
+        };
+      }
+      const message: Message = {
+        id: operation.sourceHumanMessageId,
+        roomId: fence.roomId,
+        authorId: fence.humanActorId,
+        authorKind: "human",
+        body: fence.body,
+        sentAt: fence.sentAt,
+      };
+      enqueueRouteJobForMessage(database, message, occurredAt);
+      const routeJobId = stableId("route-job", message.id);
+      const linked = database.prepare(
+        `UPDATE human_preemption_fences
+         SET route_job_id = ?, route_created_at = ?
+         WHERE source_human_message_id = ? AND route_job_id IS NULL`,
+      ).run(routeJobId, occurredAt, message.id);
+      if (linked.changes !== 1) return fail("execution_conflict", "Human fence route link was stale");
+      return {
+        kind: "human-fence-route", roomId: message.roomId,
+        sourceHumanMessageId: message.id, routeJobId, replayed: false,
+      };
+    }
+    if (operation.type === "runtime.enqueue-fence-replacements") {
+      const fenceRoute = database.prepare(
+        `SELECT 1 AS present
+         FROM route_jobs AS route
+         JOIN human_preemption_fences AS fence
+           ON fence.source_human_message_id = route.source_message_id
+          AND fence.route_job_id = route.id
+         WHERE route.id = ?`,
+      ).get(operation.routeJobId);
+      if (fenceRoute?.present !== 1) {
+        return { kind: "human-fence-replacements", executions: [], replayed: false };
+      }
+      const route = database.prepare(
+        `SELECT route.room_id AS roomId, route.source_message_id AS sourceMessageId,
+                route.status, source.author_id AS requesterId, intent.intent_kind AS intentKind
+         FROM route_jobs AS route
+         JOIN messages AS source ON source.id = route.source_message_id
+         JOIN route_invocation_intents AS intent
+           ON intent.route_job_id = route.id AND intent.target_agent_id = ?
+         JOIN route_judgments AS judgment
+           ON judgment.route_job_id = route.id AND judgment.agent_id = intent.target_agent_id
+          AND judgment.outcome = 'will_respond'
+         JOIN human_preemption_fences AS fence
+           ON fence.source_human_message_id = route.source_message_id
+          AND fence.route_job_id = route.id
+         JOIN room_memberships AS membership
+           ON membership.room_id = route.room_id AND membership.actor_id = intent.target_agent_id
+          AND membership.kind = 'agent'
+         JOIN actors AS actor ON actor.id = intent.target_agent_id AND actor.kind = 'agent'
+         JOIN rooms AS room ON room.id = route.room_id AND room.status = 'active'
+         WHERE route.id = ?`,
+      ).get(operation.targetAgentId, operation.routeJobId);
+      if (typeof route?.roomId !== "string" || typeof route.sourceMessageId !== "string" ||
+          typeof route.requesterId !== "string" ||
+          (route.status !== "completed" && route.status !== "failed") ||
+          (route.intentKind !== "direct_mention" && route.intentKind !== "structured_help" &&
+            route.intentKind !== "routed_candidate")) {
+        return fail("execution_conflict", "Fence replacement requires a terminal selected route judgment");
+      }
+      const existing = database.prepare(
+        `SELECT execution_id AS executionId FROM agent_invocation_intents
+         WHERE source_message_id = ? AND target_agent_id = ?`,
+      ).get(route.sourceMessageId, operation.targetAgentId);
+      if (typeof existing?.executionId === "string") {
+        const execution = runtimeExecutionById(database, existing.executionId);
+        const replacement = database.prepare(
+          `SELECT 1 AS present FROM agent_fence_replacements
+           WHERE fence_message_id = ? AND replacement_execution_id = ? LIMIT 1`,
+        ).get(route.sourceMessageId, execution.id);
+        return {
+          kind: "human-fence-replacements",
+          executions: replacement?.present === 1 ? [execution] : [],
+          replayed: replacement?.present === 1,
+        };
+      }
+      const oldRows = database.prepare(
+        `SELECT fence.execution_id AS executionId, fence.old_attempt_seq AS oldAttemptSeq
+         FROM agent_human_fences AS fence
+         JOIN agent_executions AS old ON old.id = fence.execution_id
+         LEFT JOIN agent_fence_replacements AS replacement
+           ON replacement.fence_message_id = fence.fence_message_id
+          AND replacement.old_execution_id = fence.execution_id
+         WHERE fence.fence_message_id = ? AND old.agent_id = ?
+           AND replacement.old_execution_id IS NULL
+         ORDER BY fence.execution_id LIMIT 33`,
+      ).all(route.sourceMessageId, operation.targetAgentId);
+      if (!oldRows.every((row) => typeof row.executionId === "string" &&
+          typeof row.oldAttemptSeq === "number")) {
+        return fail("storage_unavailable", "Fence replacement lineage was corrupt");
+      }
+      if (oldRows.length === 0) {
+        return { kind: "human-fence-replacements", executions: [], replayed: false };
+      }
+      const queued = database.prepare(
+        `SELECT COUNT(*) AS count FROM agent_executions WHERE room_id = ? AND status = 'queued'`,
+      ).get(route.roomId);
+      if (typeof queued?.count !== "number" || queued.count >= 32) {
+        return fail("agent_queue_full", "Agent room queue was full");
+      }
+      const supersedesExecutionIds = oldRows.map((row) => row.executionId as string);
+      const executionId = stableId("fence-replacement", route.sourceMessageId, operation.targetAgentId);
+      const intentId = stableId("fence-replacement-intent", route.sourceMessageId, operation.targetAgentId);
+      database.prepare(
+        `INSERT INTO agent_executions (
+           id, room_id, agent_id, trigger_message_id, status, started_at,
+           completed_at, result_json, requester_actor_id, tool_name,
+           action_category, tool_dispatch_phase, current_attempt_seq,
+           retry_cycle, retry_ordinal, provider_id, model_id, recovery_cursor,
+           queued_at, updated_at, supersedes_execution_ids_json
+         ) VALUES (?, ?, ?, ?, 'queued', ?, NULL, NULL, ?, 'model.generate',
+                   'model_generation', NULL, 1, 1, 1, ?, ?, 0, ?, ?, ?)`,
+      ).run(executionId, route.roomId, operation.targetAgentId, route.sourceMessageId,
+        occurredAt, route.requesterId, operation.providerId, operation.modelId,
+        occurredAt, occurredAt, JSON.stringify(supersedesExecutionIds));
+      database.prepare(
+        `INSERT INTO agent_execution_attempts (
+           execution_id, attempt_seq, retry_cycle, retry_ordinal, status,
+           action_category, recovery_cursor
+         ) VALUES (?, 1, 1, 1, 'queued', 'model_generation', 0)`,
+      ).run(executionId);
+      database.prepare(
+        `INSERT INTO agent_invocation_intents (
+           id, room_id, source_message_id, target_agent_id, requester_actor_id,
+           intent_kind, execution_id, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(intentId, route.roomId, route.sourceMessageId, operation.targetAgentId,
+        route.requesterId, route.intentKind, executionId, occurredAt);
+      for (const old of oldRows) {
+        database.prepare(
+          `INSERT INTO agent_fence_replacements (
+             fence_message_id, old_execution_id, old_attempt_seq, route_job_id,
+             selected_agent_id, replacement_execution_id, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        ).run(route.sourceMessageId, old.executionId as string, old.oldAttemptSeq as number,
+          operation.routeJobId, operation.targetAgentId, executionId, occurredAt);
+      }
+      const execution = runtimeExecutionById(database, executionId);
+      appendRuntimeExecutionEvent(database, execution, occurredAt, "queued");
+      return { kind: "human-fence-replacements", executions: [execution], replayed: false };
+    }
     if (operation.type === "runtime.read-context") {
       const execution = runtimeExecutionById(database, operation.executionId);
       requireAgentCommandAuthority(database, execution.agentId, execution.roomId);
@@ -4574,6 +4916,13 @@ export function executeRuntimeAuthorityOperation(
     }
 
     if (operation.type === "runtime.claim") {
+      const current = runtimeExecutionById(database, operation.executionId);
+      if (current.status !== "queued" || current.currentAttemptSeq !== operation.attemptSeq) {
+        return fail("execution_conflict", "Agent attempt claim was stale");
+      }
+      if (hasPendingHumanPreemptionAfterSource(database, current)) {
+        return fail("execution_conflict", "Agent attempt is behind a durable human fence");
+      }
       const updated = database.prepare(
         `UPDATE agent_executions
          SET status = 'running', started_at = ?, updated_at = ?, next_retry_at = NULL
@@ -4595,6 +4944,11 @@ export function executeRuntimeAuthorityOperation(
       requireAgentCommandAuthority(database, current.agentId, current.roomId);
       if (current.status !== "running" || current.currentAttemptSeq !== operation.attemptSeq) {
         return fail("execution_conflict", "Agent completion was stale");
+      }
+      if ((current.actionCategory === "waiting_upstream" ||
+          (current.actionCategory === "tool_call" && current.toolDispatchPhase === "not_started")) &&
+          hasPendingHumanPreemptionAfterSource(database, current)) {
+        return fail("execution_conflict", "Agent completion is behind a durable human fence");
       }
       database.prepare(
         `INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)

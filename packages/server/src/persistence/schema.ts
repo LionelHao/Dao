@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
-export const AUTHORITY_SCHEMA_VERSION = 10 as const;
+export const AUTHORITY_SCHEMA_VERSION = 11 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -35,6 +35,8 @@ const V9_MIGRATION_CHECKSUM =
   "802bd498bf342a575fa21fb46e18b7a375259bd40a571844bb375d756c0616b2";
 const V10_MIGRATION_CHECKSUM =
   "a7a668d54ddd3636f2e2bafcb7e55be8c9771d56c19a6ca5e3c79027a6647105";
+const V11_MIGRATION_CHECKSUM =
+  "3ef3ca9216e684ec3d9e4097fe8a2e7148c75d5bb4b23ed7bf5a0eb5edc970a1";
 const SCHEMA_FINGERPRINTS = {
   1: "03f2bbba4aa7082ec01819824726ce1bd9b4bd14cebea71afc93c6821dbf405c",
   2: "01c37d92ec2f303613a7bb8b592ca846fbea7c829b3c81fe4521699db949dfcc",
@@ -46,6 +48,7 @@ const SCHEMA_FINGERPRINTS = {
   8: "7dcef5f3d765e7d19015f19aca2d033aee0f0b3c07f53c4934e3c1d2b6053f20",
   9: "0374dbc27aa894ec239c89bcc6682fc53b219c8a2e150dfea3389beb7bf8e4e7",
   10: "7fd3399cc25e505de80d69adae24f7fc5a027de57cfb3e0b56df294e454c91fb",
+  11: "83e48fc5a4b1b1c19863efd785ea098308d100c1899d638d2b5f95c5b0c119a6",
 } as const;
 
 const V1_STATEMENTS = [
@@ -850,6 +853,123 @@ const V10_STATEMENTS = [
    ON ball_boundary_claims(room_id, holder_actor_id, claimed_at, id)`,
 ] as const;
 
+const V11_STATEMENTS = [
+  `ALTER TABLE agent_executions
+   ADD COLUMN supersedes_execution_ids_json TEXT
+   CHECK (
+     supersedes_execution_ids_json IS NULL OR (
+       json_valid(supersedes_execution_ids_json)
+       AND json_type(supersedes_execution_ids_json) = 'array'
+       AND json_array_length(supersedes_execution_ids_json) BETWEEN 1 AND 32
+     )
+   )`,
+  `ALTER TABLE agent_fence_replacements RENAME TO agent_fence_replacements_v10`,
+  `CREATE TABLE agent_fence_replacements (
+    fence_message_id TEXT NOT NULL,
+    old_execution_id TEXT NOT NULL,
+    old_attempt_seq INTEGER NOT NULL CHECK (old_attempt_seq >= 1),
+    route_job_id TEXT NOT NULL,
+    selected_agent_id TEXT NOT NULL REFERENCES actors(id),
+    replacement_execution_id TEXT NOT NULL REFERENCES agent_executions(id),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (fence_message_id, old_execution_id),
+    FOREIGN KEY (fence_message_id, old_execution_id, old_attempt_seq)
+      REFERENCES agent_human_fences(fence_message_id, execution_id, old_attempt_seq)
+  ) STRICT`,
+  `INSERT INTO agent_fence_replacements (
+     fence_message_id, old_execution_id, old_attempt_seq, route_job_id,
+     selected_agent_id, replacement_execution_id, created_at
+   )
+   SELECT fence_message_id, old_execution_id, old_attempt_seq, route_job_id,
+          selected_agent_id, replacement_execution_id, created_at
+   FROM agent_fence_replacements_v10`,
+  `DROP TABLE agent_fence_replacements_v10`,
+  `CREATE INDEX agent_fence_replacements_replacement_v11
+   ON agent_fence_replacements(replacement_execution_id, old_execution_id)`,
+  `CREATE TABLE human_preemption_fences (
+    source_human_message_id TEXT PRIMARY KEY REFERENCES messages(id),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    human_actor_id TEXT NOT NULL REFERENCES actors(id),
+    accepted_at TEXT NOT NULL,
+    cancelled_count INTEGER NOT NULL CHECK (cancelled_count BETWEEN 0 AND 33),
+    cancel_committed_at TEXT NOT NULL,
+    route_job_id TEXT UNIQUE REFERENCES route_jobs(id),
+    route_created_at TEXT,
+    CHECK (
+      (route_job_id IS NULL AND route_created_at IS NULL)
+      OR (route_job_id IS NOT NULL AND route_created_at IS NOT NULL)
+    )
+  ) STRICT`,
+  `CREATE INDEX human_preemption_fences_pending_route_v11
+   ON human_preemption_fences(route_job_id, cancel_committed_at, source_human_message_id)`,
+  `CREATE TRIGGER agent_executions_v11_validate_supersedes_insert
+   BEFORE INSERT ON agent_executions
+   WHEN NEW.supersedes_execution_ids_json IS NOT NULL AND (
+     EXISTS (
+       SELECT 1 FROM json_each(NEW.supersedes_execution_ids_json)
+       WHERE type <> 'text' OR length(trim(CAST(value AS TEXT))) = 0 OR value = NEW.id
+     )
+     OR (SELECT COUNT(*) FROM json_each(NEW.supersedes_execution_ids_json)) <>
+        (SELECT COUNT(DISTINCT value) FROM json_each(NEW.supersedes_execution_ids_json))
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'execution supersedes lineage is invalid');
+   END`,
+  `CREATE TRIGGER agent_executions_v11_validate_supersedes_update
+   BEFORE UPDATE OF supersedes_execution_ids_json ON agent_executions
+   WHEN NEW.supersedes_execution_ids_json IS NOT NULL AND (
+     EXISTS (
+       SELECT 1 FROM json_each(NEW.supersedes_execution_ids_json)
+       WHERE type <> 'text' OR length(trim(CAST(value AS TEXT))) = 0 OR value = NEW.id
+     )
+     OR (SELECT COUNT(*) FROM json_each(NEW.supersedes_execution_ids_json)) <>
+        (SELECT COUNT(DISTINCT value) FROM json_each(NEW.supersedes_execution_ids_json))
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'execution supersedes lineage is invalid');
+   END`,
+  `CREATE TRIGGER human_preemption_fences_validate_insert_v11
+   BEFORE INSERT ON human_preemption_fences
+   WHEN NOT EXISTS (
+     SELECT 1
+     FROM messages AS message
+     JOIN actors AS actor ON actor.id = message.author_id AND actor.kind = 'human'
+     JOIN events AS event
+       ON event.stream_kind = 'room' AND event.stream_id = message.room_id
+      AND event.room_id = message.room_id AND event.actor_id = message.author_id
+      AND event.event_type = 'room.message.accepted'
+      AND json_extract(event.payload_json, '$.id') = message.id
+      AND event.occurred_at = NEW.accepted_at
+     WHERE message.id = NEW.source_human_message_id
+       AND message.room_id = NEW.room_id
+       AND message.author_id = NEW.human_actor_id
+       AND message.author_kind = 'human'
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'human preemption requires a durable human message');
+   END`,
+  `CREATE TRIGGER human_preemption_fences_validate_update_v11
+   BEFORE UPDATE ON human_preemption_fences
+   WHEN NEW.source_human_message_id <> OLD.source_human_message_id
+      OR NEW.room_id <> OLD.room_id
+      OR NEW.human_actor_id <> OLD.human_actor_id
+      OR NEW.accepted_at <> OLD.accepted_at
+      OR NEW.cancelled_count <> OLD.cancelled_count
+      OR NEW.cancel_committed_at <> OLD.cancel_committed_at
+      OR (OLD.route_job_id IS NOT NULL AND (
+        NEW.route_job_id IS NOT OLD.route_job_id OR NEW.route_created_at IS NOT OLD.route_created_at
+      ))
+      OR (NEW.route_job_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM route_jobs AS route
+        WHERE route.id = NEW.route_job_id
+          AND route.room_id = NEW.room_id
+          AND route.source_message_id = NEW.source_human_message_id
+      ))
+   BEGIN
+     SELECT RAISE(ABORT, 'human preemption fence update is invalid');
+   END`,
+] as const;
+
 const V2_STATEMENTS = [
   `ALTER TABLE actors
    ADD COLUMN catalog_revision INTEGER NOT NULL DEFAULT 0
@@ -1236,6 +1356,7 @@ const MIGRATIONS = [
   defineMigration(8, "closed-open-item-authority", V8_STATEMENTS, V8_MIGRATION_CHECKSUM),
   defineMigration(9, "closed-light-task-authority", V9_STATEMENTS, V9_MIGRATION_CHECKSUM),
   defineMigration(10, "ball-in-court-boundaries", V10_STATEMENTS, V10_MIGRATION_CHECKSUM),
+  defineMigration(11, "hard-human-preemption", V11_STATEMENTS, V11_MIGRATION_CHECKSUM),
 ] as const satisfies readonly Migration[];
 
 const V1_SCHEMA_CONTRACT = {
@@ -1529,6 +1650,18 @@ const V10_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V11_SCHEMA_CONTRACT = {
+  ...V10_SCHEMA_CONTRACT,
+  agent_executions: [
+    ...V10_SCHEMA_CONTRACT.agent_executions,
+    "supersedes_execution_ids_json",
+  ],
+  human_preemption_fences: [
+    "source_human_message_id", "room_id", "human_actor_id", "accepted_at",
+    "cancelled_count", "cancel_committed_at", "route_job_id", "route_created_at",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
@@ -1540,6 +1673,7 @@ const SCHEMA_CONTRACTS = {
   8: V8_SCHEMA_CONTRACT,
   9: V9_SCHEMA_CONTRACT,
   10: V10_SCHEMA_CONTRACT,
+  11: V11_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {

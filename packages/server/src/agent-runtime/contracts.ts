@@ -142,6 +142,11 @@ export interface RuntimeRecoveryRecord {
   readonly outcome: "enqueue" | "failed" | "fail_outcome_unknown" | "wait_confirmation";
 }
 
+export interface FenceReplacementAccepted {
+  readonly executions: readonly AgentExecution[];
+  readonly replayed: boolean;
+}
+
 export interface RuntimeAuthority {
   readContext(executionId: string): Promise<{
     readonly visibleConversation: readonly { readonly messageId: string; readonly authorId: string; readonly body: string }[];
@@ -160,6 +165,12 @@ export interface RuntimeAuthority {
     providerId: string,
     modelId: string,
   ): Promise<InvocationAccepted>;
+  enqueueFenceReplacements(
+    routeJobId: string,
+    targetAgentId: string,
+    providerId: string,
+    modelId: string,
+  ): Promise<FenceReplacementAccepted>;
   claim(executionId: string, attemptSeq: number): Promise<AgentExecution>;
   complete(executionId: string, attemptSeq: number, body: string): Promise<AgentExecution>;
   scheduleRetry(

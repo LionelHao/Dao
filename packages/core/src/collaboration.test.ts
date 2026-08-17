@@ -6,6 +6,7 @@ import {
   isAgentJudgement,
   isCalibrationSignal,
   isHumanReadReceipt,
+  isHumanPreemptionNotice,
   isLightTask,
   isOpenItem,
   isOpenItemAgentFailure,
@@ -18,6 +19,37 @@ import {
 } from "./collaboration.js";
 
 describe("canonical collaboration records", () => {
+  it("keeps human preemption and replacement lineage closed and separate from failure", () => {
+    expect(isHumanPreemptionNotice({
+      roomId: "room-1", sourceHumanMessageId: "message-human-1",
+      cancelledExecutionIds: ["execution-old-1", "execution-old-2"],
+      rerouteStatus: "queued", occurredAt: "2026-08-17T00:00:01.000Z",
+    })).toBe(true);
+    expect(isHumanPreemptionNotice({
+      roomId: "room-1", sourceHumanMessageId: "message-human-1",
+      cancelledExecutionIds: ["execution-old-1", "execution-old-1"],
+      rerouteStatus: "queued", occurredAt: "2026-08-17T00:00:01.000Z",
+    })).toBe(false);
+    expect(isHumanPreemptionNotice({
+      roomId: "room-1", sourceHumanMessageId: "message-human-1",
+      cancelledExecutionIds: [], rerouteStatus: "queued",
+      occurredAt: "2026-08-17T00:00:01.000Z", humanWithdrawn: true,
+    })).toBe(false);
+    const replacement = {
+      id: "execution-new-1", roomId: "room-1", sourceMessageId: "message-human-1",
+      requesterId: "human-1", agentId: "agent-1", toolName: "model.generate",
+      status: "queued", actionCategory: "model_generation", currentAttemptSeq: 1,
+      retryCycle: 1, retryOrdinal: 1, recoveryCursor: 0,
+      queuedAt: "2026-08-17T00:00:02.000Z", updatedAt: "2026-08-17T00:00:02.000Z",
+      supersedesExecutionIds: ["execution-old-1"],
+    } as const;
+    expect(isAgentExecution(replacement)).toBe(true);
+    expect(isAgentExecution({ ...replacement, supersedesExecutionIds: [] })).toBe(false);
+    expect(isAgentExecution({
+      ...replacement, supersedesExecutionIds: ["execution-old-1", "execution-old-1"],
+    })).toBe(false);
+  });
+
   it("projects one closed holder from each authoritative commitment state without text or role inference", () => {
     const openItem = {
       id: "item-1", roomId: "room-1", sourceMessageId: "message-1",

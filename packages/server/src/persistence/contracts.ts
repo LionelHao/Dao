@@ -5,6 +5,7 @@ import {
   isAgentRoomMembership,
   isCalibrationSignal,
   isHumanReadReceipt,
+  isHumanPreemptionNotice,
   isLightTask,
   isRoomCursor,
   isHumanRoomMembership,
@@ -836,6 +837,7 @@ function validRoomEventPayload(
   payload: UnknownRecord,
   roomId: string,
   eventActorId: string,
+  occurredAt: string,
 ): boolean {
   if (type === "room.created" || type === "room.renamed" || type === "room.archived") {
     return exact(payload, ["room"]) && strictManagedRoom(payload.room) &&
@@ -885,6 +887,10 @@ function validRoomEventPayload(
   if (type === "room.light_task.changed") {
     return isLightTask(payload) && payload.roomId === roomId;
   }
+  if (type === "room.human_preemption.applied") {
+    return isHumanPreemptionNotice(payload) && payload.roomId === roomId &&
+      payload.occurredAt === occurredAt;
+  }
   if (type === "room.agent_execution.changed") {
     return isAgentExecution(payload) && payload.roomId === roomId && payload.agentId === eventActorId;
   }
@@ -915,6 +921,7 @@ export function parsePersistedRoomEvent(
     value.payload as UnknownRecord,
     value.roomId as string,
     value.actorId as string,
+    value.occurredAt as string,
   )
     ? { ok: true, value: value as unknown as PersistedRoomEvent }
     : { ok: false, code: "invalid_event" };

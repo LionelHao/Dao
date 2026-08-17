@@ -9,6 +9,30 @@ import {
 } from "./sync.js";
 
 describe("pure synchronization contracts", () => {
+  it("accepts only the dedicated human-preemption room event", () => {
+    const event = {
+      eventId: "human-preemption-1", streamKind: "room", streamId: "room-1", streamSeq: 1,
+      roomId: "room-1", actorId: "human-1", occurredAt: "2026-08-17T00:00:01.000Z",
+      type: "room.human_preemption.applied",
+      payload: {
+        roomId: "room-1", sourceHumanMessageId: "message-human-1",
+        cancelledExecutionIds: ["execution-old-1"], rerouteStatus: "queued",
+        occurredAt: "2026-08-17T00:00:01.000Z",
+      },
+    };
+    const result = {
+      type: "room.sync.result", requestId: "request-preemption", mode: "delta", events: [event],
+      nextCursor: { version: 1, roomId: "room-1", afterSeq: 1 }, watermark: 1, hasMore: false,
+    };
+    expect(isRoomSyncResult(result)).toBe(true);
+    expect(isRoomSyncResult({
+      ...result, events: [{ ...event, payload: { ...event.payload, failed: true } }],
+    })).toBe(false);
+    expect(isRoomSyncResult({
+      ...result, events: [{ ...event, payload: { ...event.payload, roomId: "room-2" } }],
+    })).toBe(false);
+  });
+
   it("accepts only versioned, non-negative room cursors", () => {
     expect(isRoomCursor({ version: 1, roomId: "room-1", afterSeq: 0 })).toBe(true);
     expect(isRoomCursor({
