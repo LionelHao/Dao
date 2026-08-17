@@ -32,6 +32,7 @@ import { MessageIdConflictError } from "./store.js";
 import type { SyncService } from "./sync-service.js";
 import type { AgentRuntime } from "./agent-runtime/contracts.js";
 import type { AuthoritativeCollaborationPrimitives } from "./primitives.js";
+import type { BallRuntimeService } from "./ball-runtime/ball-runtime-service.js";
 import {
   parseClientFrame,
   type AuthenticatedFrame,
@@ -81,6 +82,7 @@ export interface StartMessageWebSocketServerOptions {
     | "transitionLightTask"
     | "setLightTaskCriterion"
   >;
+  readonly ballRuntime?: Pick<BallRuntimeService, "query">;
 }
 
 type RuntimeMessageWebSocketServerOptions = StartMessageWebSocketServerOptions & {
@@ -800,7 +802,8 @@ function isCorrelatedRecoveryResponse(
       | "open-item.transition"
       | "light-task.create"
       | "light-task.transition"
-      | "light-task.criterion.set";
+      | "light-task.criterion.set"
+      | "ball.query";
   }>,
   response: unknown,
 ): response is ServerFrame {
@@ -884,7 +887,8 @@ async function handleRecoveryFrame(
       | "open-item.transition"
       | "light-task.create"
       | "light-task.transition"
-      | "light-task.criterion.set";
+      | "light-task.criterion.set"
+      | "ball.query";
   }>,
   options: StartMessageWebSocketServerOptions,
   context: ConnectionContext,
@@ -1626,6 +1630,24 @@ async function handleFrame(
                 met: frame.met,
               });
         sendFrame(socket, { type: "light-task.ack", requestId: frame.requestId, task });
+      } catch (error: unknown) {
+        sendFrame(socket, mappedError(error, frame.requestId));
+      }
+      return;
+    }
+    case "ball.query": {
+      const session = await requireSession(socket, frame.requestId, options, context);
+      if (session === undefined) return;
+      if (options.ballRuntime === undefined) {
+        sendFrame(socket, errorFrame(503, "storage_unavailable", "storage_unavailable", frame.requestId));
+        return;
+      }
+      try {
+        const result = await options.ballRuntime.query(session, frame.roomId);
+        sendFrame(socket, {
+          type: "ball.query.result", requestId: frame.requestId, roomId: frame.roomId,
+          balls: result.balls, needsAction: result.needsAction, reminders: result.reminders,
+        });
       } catch (error: unknown) {
         sendFrame(socket, mappedError(error, frame.requestId));
       }

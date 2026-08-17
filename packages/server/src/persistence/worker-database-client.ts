@@ -46,6 +46,7 @@ import type {
 } from "./contracts.js";
 import type { RuntimeAuthorityOperation } from "../agent-runtime/runtime-authority-protocol.js";
 import type { RouteAuthorityOperation } from "../route-runtime/route-authority-protocol.js";
+import type { BallAuthorityOperation } from "../ball-runtime/ball-authority-protocol.js";
 import {
   ROOM_SYNC_DEFAULT_LIMIT,
   toAgentWorkerCommandContext,
@@ -56,7 +57,7 @@ export interface CreateWorkerDatabaseClientOptions {
 }
 
 export interface AuthoritySchemaInspection {
-  readonly version: 9;
+  readonly version: 10;
 }
 
 export interface WorkerDatabaseClient {
@@ -162,6 +163,7 @@ export interface WorkerDatabaseClient {
   ): Promise<void>;
   executeRuntime(operation: RuntimeAuthorityOperation): Promise<unknown>;
   executeRoute(operation: RouteAuthorityOperation): Promise<unknown>;
+  executeBall(operation: BallAuthorityOperation): Promise<unknown>;
   close(): Promise<void>;
 }
 
@@ -983,6 +985,19 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
     });
   }
 
+  executeBall(operation: BallAuthorityOperation): Promise<unknown> {
+    if (this.#terminalError !== undefined) return this.#rejectTerminal();
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) return Promise.reject(unavailable);
+    return this.#send({ type: "authority.ball", operation }).then((response) => {
+      if (response.type !== "authority.ball-result") {
+        this.#failProtocol("Authority worker returned the wrong ball response");
+        throw this.#terminalError;
+      }
+      return response.result;
+    });
+  }
+
   readHistory(
     context: AuthenticatedSessionContext,
     roomId: string,
@@ -1427,6 +1442,8 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
         responseType === "authority.runtime-result") ||
       (requestType === "authority.route" &&
         responseType === "authority.route-result") ||
+      (requestType === "authority.ball" &&
+        responseType === "authority.ball-result") ||
       (requestType === "authority.read-history" &&
         responseType === "authority.history") ||
       (requestType === "authority.read-actor" && responseType === "authority.actor") ||

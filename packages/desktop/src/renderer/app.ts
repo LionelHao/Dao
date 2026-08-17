@@ -4,6 +4,7 @@ import {
   isCalibrationSignal,
   isHumanReadReceipt,
   isLightTask,
+  isNeedsActionProjection,
   isOpenItem,
   isRouteJudgment,
   isSocialReaction,
@@ -18,6 +19,7 @@ import {
   type HumanInvitationRequest,
   type HumanReadReceipt,
   type LightTask,
+  type NeedsActionProjection,
   type Message,
   type OpenItem,
   type RouteJudgment,
@@ -25,6 +27,40 @@ import {
   type ToolConfirmationInput,
   type ToolConfirmationRequiredPayload,
 } from "@native-im/core";
+
+export function renderRoomAttentionSummary(
+  root: HTMLElement,
+  input: { readonly unreadCount: number; readonly needsAction: readonly NeedsActionProjection[] },
+): void {
+  if (!Number.isSafeInteger(input.unreadCount) || input.unreadCount < 0 ||
+      input.needsAction.length > 256 || !input.needsAction.every(isNeedsActionProjection)) {
+    throw new TypeError("Room attention summary is not closed");
+  }
+  const panel = document.createElement("section");
+  panel.className = "room-attention-summary";
+  panel.setAttribute("aria-label", "房间关注摘要");
+  const unread = document.createElement("p");
+  unread.className = "room-attention-summary__unread";
+  unread.dataset.unreadCount = String(input.unreadCount);
+  unread.textContent = `纯未读 · ${input.unreadCount}`;
+  const actions = document.createElement("section");
+  actions.className = "room-attention-summary__needs-action";
+  actions.dataset.needsActionCount = String(input.needsAction.length);
+  const heading = document.createElement("h2");
+  heading.textContent = `需要我动 · ${input.needsAction.length}`;
+  actions.append(heading);
+  for (const entry of input.needsAction) {
+    const item = document.createElement("article");
+    item.className = "needs-action-item";
+    item.dataset.sourceKind = entry.ball.sourceKind;
+    item.dataset.sourceId = entry.ball.sourceId;
+    item.dataset.overdue = String(entry.overdue);
+    item.textContent = `${entry.ball.reason} · ${entry.overdue ? "已逾期" : "待处理"}`;
+    actions.append(item);
+  }
+  panel.append(unread, actions);
+  root.replaceChildren(panel);
+}
 
 export interface RestoredPrimitivePreviewRecords {
   readonly humanReads: readonly HumanReadReceipt[];

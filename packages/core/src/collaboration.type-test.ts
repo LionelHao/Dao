@@ -4,6 +4,7 @@ import type {
   HumanInvitationRequest,
   HumanRoomMembership,
   LightTask,
+  BallInCourt,
   MessageDraft,
 } from "./index.js";
 import type {
@@ -117,6 +118,14 @@ const invalidLightTaskPlanningField: LightTask = {
   deps: ["T-0001"],
 };
 
+const invalidBallHolderSet: BallInCourt = {
+  holderId: "human-1", roomId: "room-1", sourceKind: "open-item", sourceId: "item-1",
+  reason: "awaiting", since: "2026-08-17T00:00:00.000Z",
+  deadline: "2026-08-18T00:00:00.000Z",
+  // @ts-expect-error BallInCourt has exactly one holder and cannot carry a holder set.
+  holderIds: ["human-1", "human-2"],
+};
+
 declare const runtimeProviderInput: AgentRuntimeProviderInput;
 declare const routerProviderInput: RouterProviderInput;
 
@@ -135,5 +144,6 @@ void invalidHumanInvitationParticipation;
 void invalidHumanInvitationToolPermissions;
 void invalidAgentConfigurationInviteeActorId;
 void invalidLightTaskPlanningField;
+void invalidBallHolderSet;
 void invalidRouterInput;
 void invalidRuntimeInput;

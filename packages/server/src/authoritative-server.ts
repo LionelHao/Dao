@@ -31,6 +31,8 @@ import { createOpenAIRouterProvider } from "./route-runtime/openai-router-provid
 import { createRouteRuntimeService, type RouteRuntimeService } from "./route-runtime/route-runtime-service.js";
 import { createWorkerRouteAuthority } from "./route-runtime/worker-route-authority.js";
 import { mintInternalAgentCommandContext } from "./persistence/contracts.js";
+import { createEmptyBlueprintBallProjectionPort, type BlueprintBallProjectionPort } from "./ball-runtime/contracts.js";
+import { createBallRuntimeService, type BallRuntimeService } from "./ball-runtime/ball-runtime-service.js";
 
 export interface AuthoritativeServer {
   readonly url: string;
@@ -52,6 +54,11 @@ export interface StartAuthoritativeServerOptions {
     readonly sandboxRoot?: string;
     readonly gitBinaryPath?: string;
   };
+  readonly ballRuntime?: {
+    readonly openItemDeadlineMs?: number;
+    readonly lightTaskDeadlineMs?: number;
+    readonly scanIntervalMs?: number;
+  };
 }
 
 interface AuthoritativeServerTestOptions {
@@ -64,7 +71,8 @@ interface AuthoritativeServerTestOptions {
   readonly snapshotMaxRecordsPerPage?: number;
   readonly initialize?: (facades: AuthoritativeServerTestFacades) => Promise<void>;
   readonly registerMissingActors?: false;
-  readonly afterCloseForTest?: Partial<Record<"transport" | "route" | "runtime" | "snapshots" | "worker", () => void>>;
+  readonly afterCloseForTest?: Partial<Record<"transport" | "route" | "runtime" | "ball" | "snapshots" | "worker", () => void>>;
+  readonly blueprintBallProjectionPort?: BlueprintBallProjectionPort;
 }
 
 export interface AuthoritativeServerTestFacades {
@@ -108,6 +116,7 @@ async function start(
   let transport: Awaited<ReturnType<typeof startMessageWebSocketServer>> | undefined;
   let runtime: AgentRuntimeService | undefined;
   let routeRuntime: RouteRuntimeService | undefined;
+  let ballRuntime: BallRuntimeService | undefined;
   try {
     worker = transactionFault === undefined
       ? await createWorkerDatabaseClient({ databasePath: options.databasePath })
@@ -192,6 +201,12 @@ async function start(
             if (command.type === "message.send") {
               routeRuntime?.notify(command.roomId, acknowledgement.aggregateId);
             }
+            if (command.type === "open-item.create" || command.type === "open-item.transition" ||
+                command.type === "light-task.create" || command.type === "light-task.transition" ||
+                command.type === "light-task.criterion.set") {
+              ballRuntime?.track(command.roomId);
+              void ballRuntime?.scan(command.roomId).catch(() => undefined);
+            }
             return acknowledgement;
           } catch (error: unknown) {
             if (transactionFault !== undefined) {
@@ -204,6 +219,10 @@ async function start(
           const acknowledgement = await authority.executeAgent(context, command);
           if (command.type === "message.send") {
             routeRuntime?.notify(command.roomId, acknowledgement.aggregateId);
+          }
+          if (command.type.startsWith("open-item.")) {
+            ballRuntime?.track(command.roomId);
+            void ballRuntime?.scan(command.roomId).catch(() => undefined);
           }
           return acknowledgement;
         },
@@ -318,6 +337,18 @@ async function start(
       },
     });
     await routeRuntime.recover();
+    const ballConfiguration = options.ballRuntime ?? {};
+    ballRuntime = createBallRuntimeService({
+      worker,
+      blueprint: testOptions.blueprintBallProjectionPort ?? createEmptyBlueprintBallProjectionPort(),
+      policy: {
+        openItemDeadlineMs: ballConfiguration.openItemDeadlineMs ?? 24 * 60 * 60 * 1_000,
+        lightTaskDeadlineMs: ballConfiguration.lightTaskDeadlineMs ?? 24 * 60 * 60 * 1_000,
+      },
+      ...(ballConfiguration.scanIntervalMs === undefined
+        ? {} : { scanIntervalMs: ballConfiguration.scanIntervalMs }),
+    });
+    await ballRuntime.recover();
     const sendBeforeMarkFaultDeliveries = new Set<string>();
     const outboxStore = testOptions.faultPoint === "after-send-before-dispatch-mark"
       ? {
@@ -346,10 +377,12 @@ async function start(
       outboxPollIntervalMs: 10,
       agentRuntime: runtime,
       collaboration: primitives,
+      ballRuntime,
     });
   } catch (error: unknown) {
     await transport?.close().catch(() => undefined);
     await routeRuntime?.close().catch(() => undefined);
+    await ballRuntime?.close().catch(() => undefined);
     await runtime?.close().catch(() => undefined);
     await snapshots?.close().catch(() => undefined);
     await worker?.close().catch(() => undefined);
@@ -366,6 +399,7 @@ async function start(
           ["transport", () => transport.close()],
           ["route", () => routeRuntime!.close()],
           ["runtime", () => runtime!.close()],
+          ["ball", () => ballRuntime!.close()],
           ["snapshots", () => snapshots.close()],
           ["worker", () => worker.close()],
         ] as const) {

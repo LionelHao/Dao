@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  isBallInCourt,
+  isBlueprintBallFact,
   isAgentExecution,
   isAgentJudgement,
   isCalibrationSignal,
@@ -12,9 +14,128 @@ import {
   isRouterProviderInput,
   isRouterPlan,
   isSocialReaction,
+  projectBallsInCourt,
 } from "./collaboration.js";
 
 describe("canonical collaboration records", () => {
+  it("projects one closed holder from each authoritative commitment state without text or role inference", () => {
+    const openItem = {
+      id: "item-1", roomId: "room-1", sourceMessageId: "message-1",
+      requesterId: "human-1", currentOwnerId: "agent-1", content: "我来只是正文，不参与推断",
+      status: "transferred", origin: { kind: "human_mention" },
+      createdAt: "2026-08-17T00:00:00.000Z",
+      transferChain: [{
+        fromId: "human-2", toId: "agent-1", reason: "明确转交",
+        transferredAt: "2026-08-17T00:10:00.000Z",
+      }],
+    } as const;
+    const claimed = {
+      id: "task-1", roomId: "room-1", sourceMessageId: "message-2", title: "Ship",
+      claimant: "human-2", claimantRoleAtClaim: "member", verifierRole: "owner",
+      verifierActorId: null, criteria: [], status: "claimed",
+      createdAt: "2026-08-17T00:00:00.000Z", claimedAt: "2026-08-17T00:20:00.000Z",
+    } as const;
+    const delivered = {
+      ...claimed, id: "task-2", status: "delivered", verifierActorId: "human-3",
+      deliveredAt: "2026-08-17T00:30:00.000Z",
+    } as const;
+    const todo = {
+      ...claimed, id: "task-todo", claimant: null, claimantRoleAtClaim: null,
+      status: "todo", claimedAt: undefined,
+    };
+    const blueprint = {
+      sourceKind: "blueprint-awaiting", sourceId: "T-0100", roomId: "room-1",
+      assigneeId: "agent-2", reason: "awaiting authoritative assignee",
+      since: "2026-08-10T00:00:00.000Z",
+    } as const;
+    expect(isBlueprintBallFact(blueprint)).toBe(true);
+
+    const balls = projectBallsInCourt({
+      openItems: [openItem], lightTasks: [claimed, delivered, todo], blueprintFacts: [blueprint, blueprint],
+      openItemDeadlineMs: 60_000, lightTaskDeadlineMs: 60_000,
+    });
+    expect(balls).toEqual([
+      {
+        holderId: "agent-1", roomId: "room-1", sourceKind: "open-item", sourceId: "item-1",
+        reason: "open item transferred to current owner", since: "2026-08-17T00:10:00.000Z",
+        deadline: "2026-08-17T00:11:00.000Z",
+      },
+      {
+        holderId: "human-2", roomId: "room-1", sourceKind: "light-task", sourceId: "task-1",
+        reason: "claimed light task awaits delivery", since: "2026-08-17T00:20:00.000Z",
+        deadline: "2026-08-17T00:21:00.000Z",
+      },
+      {
+        holderId: "human-3", roomId: "room-1", sourceKind: "light-task", sourceId: "task-2",
+        reason: "delivered light task awaits persisted verifier", since: "2026-08-17T00:30:00.000Z",
+        deadline: "2026-08-17T00:31:00.000Z",
+      },
+      {
+        holderId: "agent-2", roomId: "room-1", sourceKind: "blueprint-awaiting", sourceId: "T-0100",
+        reason: "awaiting authoritative assignee", since: "2026-08-10T00:00:00.000Z",
+        deadline: "2026-08-17T00:00:00.000Z",
+      },
+    ]);
+    expect(balls.every(isBallInCourt)).toBe(true);
+    expect(balls.some((ball) => ball.sourceId === "task-todo")).toBe(false);
+  });
+
+  it("rejects ambiguous or open-shaped Blueprint facts and closed ball extras", () => {
+    expect(isBlueprintBallFact({
+      sourceKind: "blueprint-blocked-mention", sourceId: "T-1", roomId: "room-1",
+      mentionedActorId: "human-1", reason: "explicit blocked fact", since: "2026-08-17T00:00:00.000Z",
+    })).toBe(true);
+    expect(isBlueprintBallFact({
+      sourceKind: "blueprint-blocked-mention", sourceId: "T-1", roomId: "room-1",
+      mentionedActorIds: ["human-1", "human-2"], reason: "ambiguous", since: "2026-08-17T00:00:00.000Z",
+    })).toBe(false);
+    expect(isBallInCourt({
+      holderId: "human-1", roomId: "room-1", sourceKind: "open-item", sourceId: "item-1",
+      reason: "awaiting current owner", since: "2026-08-17T00:00:00.000Z",
+      deadline: "2026-08-18T00:00:00.000Z", messageText: "我来",
+    })).toBe(false);
+  });
+
+  it("uses seven days for Blueprint claimed/awaiting and immediate blocked mentions", () => {
+    const since = "2026-08-10T00:00:00.000Z";
+    const balls = projectBallsInCourt({
+      openItems: [], lightTasks: [], openItemDeadlineMs: 1, lightTaskDeadlineMs: 1,
+      blueprintFacts: [
+        { sourceKind: "blueprint-task", sourceId: "T-1", roomId: "room-1",
+          assigneeId: "agent-1", reason: "claimed", since },
+        { sourceKind: "blueprint-awaiting", sourceId: "T-2", roomId: "room-1",
+          assigneeId: "human-1", reason: "awaiting", since },
+        { sourceKind: "blueprint-blocked-mention", sourceId: "T-3", roomId: "room-1",
+          mentionedActorId: "human-2", reason: "explicit blocked mention", since },
+      ],
+    });
+    expect(balls.map((ball) => [ball.sourceKind, ball.holderId, ball.deadline])).toEqual([
+      ["blueprint-task", "agent-1", "2026-08-17T00:00:00.000Z"],
+      ["blueprint-awaiting", "human-1", "2026-08-17T00:00:00.000Z"],
+      ["blueprint-blocked-mention", "human-2", since],
+    ]);
+  });
+
+  it("atomically projects the newest authoritative Blueprint assignee and ignores an older replay", () => {
+    const older = {
+      sourceKind: "blueprint-awaiting", sourceId: "T-4", roomId: "room-1",
+      assigneeId: "human-1", reason: "older authoritative assignee",
+      since: "2026-08-10T00:00:00.000Z",
+    } as const;
+    const newer = {
+      ...older, assigneeId: "agent-1", reason: "new authoritative assignee",
+      since: "2026-08-11T00:00:00.000Z",
+    } as const;
+    expect(projectBallsInCourt({
+      openItems: [], lightTasks: [], blueprintFacts: [older, newer, older],
+      openItemDeadlineMs: 1, lightTaskDeadlineMs: 1,
+    })).toEqual([{
+      holderId: "agent-1", roomId: "room-1", sourceKind: "blueprint-awaiting", sourceId: "T-4",
+      reason: "new authoritative assignee", since: "2026-08-11T00:00:00.000Z",
+      deadline: "2026-08-18T00:00:00.000Z",
+    }]);
+  });
+
   it("keeps LightTask as a closed four-state fact without GBP planning fields", () => {
     const todo = {
       id: "task-1", roomId: "room-1", sourceMessageId: "message-1",

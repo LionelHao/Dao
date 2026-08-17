@@ -28,6 +28,7 @@ import {
   executeHumanDatabaseCommand,
   executeRuntimeAuthorityOperation,
   executeRouteAuthorityOperation,
+  executeBallAuthorityOperation,
   authorizeOutboxCandidateDatabaseQuery,
   canAccessRoomDatabaseQuery,
   compactRoomStreamDatabaseCommand,
@@ -44,6 +45,7 @@ import {
   syncRoomDatabaseQuery,
   inspectStreamingRepairScopeDatabaseQuery,
 } from "./authority-database-handler.js";
+import { ballResultAsJson } from "../ball-runtime/ball-authority-protocol.js";
 import { runtimeResultAsJson } from "../agent-runtime/runtime-authority-protocol.js";
 import { routeResultAsJson } from "../route-runtime/route-authority-protocol.js";
 import {
@@ -1306,6 +1308,30 @@ function executeRoute(request: AuthorityWorkerRequest): void {
   }
 }
 
+function executeBall(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.ball") throw new TypeError("executeBall received the wrong request type");
+  try {
+    const result = executeBallAuthorityOperation(requireAuthorityTransactionDatabase(), request.operation);
+    respond({
+      type: "authority.ball-result", requestId: request.requestId, result: ballResultAsJson(result),
+    });
+    if (request.operation.type === "ball.scan-overdue" && result.kind === "ball-overdue-scan" &&
+        (result.agentTriggers.length > 0 || result.reminders.length > 0)) {
+      repairs.preemptAfterCommit({
+        roomIds: [request.operation.roomId], catalogPrincipalIds: [], familyIds: [],
+        code: "snapshot_stale", now: request.operation.now,
+      });
+    }
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithError(request.requestId, "storage_unavailable", "Authority ball operation failed");
+  }
+}
+
 function readHistory(request: AuthorityWorkerRequest): void {
   if (request.type !== "authority.read-history") {
     throw new TypeError("readHistory received the wrong request type");
@@ -1650,6 +1676,9 @@ async function dispatch(value: unknown): Promise<void> {
       return;
     case "authority.route":
       executeRoute(value);
+      return;
+    case "authority.ball":
+      executeBall(value);
       return;
     case "authority.read-history":
       readHistory(value);

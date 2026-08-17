@@ -228,7 +228,7 @@ async function spawnAuthorityChild(options: ChildStartOptions): Promise<{
     frame = await ready;
   } catch (error: unknown) {
     await stopChild(child).catch(() => undefined);
-    throw error;
+    throw new Error(`${String(error)} stderr=${unexpectedChildStderr(child)}`);
   }
   if (typeof frame !== "object" || frame === null ||
       (frame as Record<string, unknown>).type !== "ready" ||
@@ -1174,15 +1174,39 @@ describe("authoritative server real-process harness", () => {
         type: "light-task.ack",
         task: { id: taskAck.task.id, status: "todo", claimant: null },
       });
+      const claimedTask = await client.request({
+        type: "light-task.transition", requestId: "light-task-claim-ball", roomId,
+        taskId: taskAck.task.id, action: "claim",
+      }, "light-task.ack");
+      expect(claimedTask).toMatchObject({
+        type: "light-task.ack", task: { id: taskAck.task.id, status: "claimed", claimant: "human-a" },
+      });
+      const firstBalls = await client.request({
+        type: "ball.query", requestId: "ball-query-first", roomId,
+      }, "ball.query.result");
+      expect(firstBalls).toMatchObject({
+        type: "ball.query.result",
+        balls: expect.arrayContaining([expect.objectContaining({
+          sourceKind: "light-task", sourceId: taskAck.task.id, holderId: "human-a",
+        })]),
+        needsAction: expect.arrayContaining([expect.objectContaining({ actorId: "human-a", overdue: false })]),
+      });
       peer = await JsonWebSocketClient.connect(seeded.url);
       await peer.login("light-task-peer-login");
       const peerRepair = await repairRecords(peer, roomId);
       expect(peerRepair.records.filter((record) =>
         record.kind === "light-task" && record.value.id === taskAck.task.id)).toEqual([
         expect.objectContaining({ kind: "light-task", value: expect.objectContaining({
-          status: "todo", criteria: [{ id: "criterion-review", text: "Review is complete", met: false }],
+          status: "claimed", claimant: "human-a",
+          criteria: [{ id: "criterion-review", text: "Review is complete", met: false }],
         }) }),
       ]);
+      const peerBalls = await peer.request({
+        type: "ball.query", requestId: "ball-query-peer", roomId,
+      }, "ball.query.result");
+      expect(peerBalls).toMatchObject({
+        balls: expect.arrayContaining([expect.objectContaining({ sourceId: taskAck.task.id, holderId: "human-a" })]),
+      });
       peer.close();
       peer = undefined;
       const current = await repairRecords(client, roomId);
@@ -1204,6 +1228,13 @@ describe("authoritative server real-process harness", () => {
         record.kind === "open-item" && record.value.id === firstAck.item.id)).toHaveLength(1);
       expect(repaired.records.filter((record) =>
         record.kind === "light-task" && record.value.id === taskAck.task.id)).toHaveLength(1);
+      const restartedBalls = await client.request({
+        type: "ball.query", requestId: "ball-query-restarted", roomId,
+      }, "ball.query.result");
+      expect(restartedBalls).toMatchObject({
+        balls: expect.arrayContaining([expect.objectContaining({ sourceId: taskAck.task.id, holderId: "human-a" })]),
+        needsAction: expect.arrayContaining([expect.objectContaining({ actorId: "human-a" })]),
+      });
       const database = new DatabaseSync(join(directory, "authority.sqlite"), { readOnly: true });
       expect(database.prepare(
         "SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.open_item.changed' AND payload_json LIKE ?",
@@ -1214,7 +1245,7 @@ describe("authoritative server real-process harness", () => {
         .get(taskAck.task.id)).toEqual({ count: 1 });
       expect(database.prepare(
         "SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.light_task.changed' AND payload_json LIKE ?",
-      ).get(`%${taskAck.task.id}%`)).toEqual({ count: 1 });
+      ).get(`%${taskAck.task.id}%`)).toEqual({ count: 2 });
       database.close();
     } finally {
       client?.close();

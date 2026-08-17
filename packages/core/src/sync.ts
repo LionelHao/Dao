@@ -13,6 +13,7 @@ import {
   isCalibrationSignal,
   isHumanReadReceipt,
   isLightTask,
+  isBallOverdueTrigger,
   isOpenItem,
   isOpenItemAgentFailure,
   isRouteJob,
@@ -22,6 +23,7 @@ import {
   type CalibrationSignal,
   type HumanReadReceipt,
   type LightTask,
+  type BallOverdueTrigger,
   type OpenItem,
   type OpenItemAgentFailure,
   type RouteJob,
@@ -164,6 +166,7 @@ export type PersistedRoomEvent =
   | RoomEvent<"room.open_item.changed", OpenItem>
   | RoomEvent<"room.open_item.agent_attempt_failed", OpenItemAgentFailure>
   | RoomEvent<"room.light_task.changed", LightTask>
+  | RoomEvent<"room.ball.overdue", BallOverdueTrigger>
   | RoomEvent<"room.agent_execution.changed", AgentExecution>
   | RoomEvent<"room.route_judgment.recorded", RouteJudgment>
   | RoomEvent<
@@ -391,6 +394,10 @@ function isPersistedRoomEventValue(value: unknown): value is PersistedRoomEvent 
   }
   if (value.type === "room.light_task.changed") {
     return isLightTask(payload) && payload.roomId === value.roomId;
+  }
+  if (value.type === "room.ball.overdue") {
+    return isBallOverdueTrigger(payload) && payload.roomId === value.roomId &&
+      payload.agentId === value.actorId;
   }
   if (value.type === "room.agent_execution.changed") {
     return isAgentExecution(payload) && payload.roomId === value.roomId && payload.agentId === value.actorId;

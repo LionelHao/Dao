@@ -33,6 +33,10 @@ import {
   isRouteAuthorityOperation,
   type RouteAuthorityOperation,
 } from "../route-runtime/route-authority-protocol.js";
+import {
+  isBallAuthorityOperation,
+  type BallAuthorityOperation,
+} from "../ball-runtime/ball-authority-protocol.js";
 import type {
   AgentCollaborationCommand,
   AgentWorkerCommandContext,
@@ -350,18 +354,23 @@ export type AuthorityWorkerRequest =
       readonly requestId: string;
       readonly operation: RouteAuthorityOperation;
     }
+  | {
+      readonly type: "authority.ball";
+      readonly requestId: string;
+      readonly operation: BallAuthorityOperation;
+    }
   | { readonly type: "authority.close"; readonly requestId: string };
 
 export type AuthorityWorkerResponse =
   | {
       readonly type: "authority.ready";
       readonly requestId: string;
-      readonly schemaVersion: 9;
+      readonly schemaVersion: 10;
     }
   | {
       readonly type: "authority.schema";
       readonly requestId: string;
-      readonly schemaVersion: 9;
+      readonly schemaVersion: 10;
     }
   | {
       readonly type: "authority.legacy-imported";
@@ -469,6 +478,11 @@ export type AuthorityWorkerResponse =
     }
   | {
       readonly type: "authority.route-result";
+      readonly requestId: string;
+      readonly result: JsonValue;
+    }
+  | {
+      readonly type: "authority.ball-result";
       readonly requestId: string;
       readonly result: JsonValue;
     }
@@ -991,6 +1005,9 @@ export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWork
     case "authority.route":
       return hasExactKeys(value, ["type", "requestId", "operation"]) &&
         isRouteAuthorityOperation(value.operation);
+    case "authority.ball":
+      return hasExactKeys(value, ["type", "requestId", "operation"]) &&
+        isBallAuthorityOperation(value.operation);
     default:
       return false;
   }
@@ -1008,7 +1025,7 @@ export function isAuthorityWorkerResponse(
     case "authority.schema":
       return (
         hasExactKeys(value, ["type", "requestId", "schemaVersion"]) &&
-        value.schemaVersion === 9
+        value.schemaVersion === 10
       );
     case "authority.closed":
       return hasExactKeys(value, ["type", "requestId"]);
@@ -1093,6 +1110,9 @@ export function isAuthorityWorkerResponse(
       return hasExactKeys(value, ["type", "requestId", "result"]) &&
         isJsonValue(value.result);
     case "authority.route-result":
+      return hasExactKeys(value, ["type", "requestId", "result"]) &&
+        isJsonValue(value.result);
+    case "authority.ball-result":
       return hasExactKeys(value, ["type", "requestId", "result"]) &&
         isJsonValue(value.result);
     case "authority.legacy-imported":

@@ -716,11 +716,21 @@ describe("authenticated message WebSocket service", () => {
       status: "claimed" as const, claimedAt: "2026-08-12T00:01:00.000Z",
     }));
     const setLightTaskCriterion = vi.fn(async () => todoTask);
+    const queryBalls = vi.fn(async () => ({
+      balls: [{
+        holderId: humans[0].id, roomId, sourceKind: "light-task" as const,
+        sourceId: "task-api", reason: "claimed light task awaits delivery",
+        since: "2026-08-12T00:01:00.000Z", deadline: "2026-08-13T00:01:00.000Z",
+      }],
+      needsAction: [],
+      reminders: [],
+    }));
     const server = await startMessageWebSocketServer({
       auth, service, collaboration: {
         createOpenItem, transitionOpenItem, createLightTask, transitionLightTask,
         setLightTaskCriterion,
       },
+      ballRuntime: { query: queryBalls },
     });
     const client = await LoopbackClient.connect(server.url);
     try {
@@ -786,6 +796,14 @@ describe("authenticated message WebSocket service", () => {
         (frame) => hasType(frame, "light-task.ack") && frame.requestId === "task-check",
         "light task criterion acknowledgement",
       )).resolves.toMatchObject({ frame: { task: { id: "task-api" } } });
+      client.send({ type: "ball.query", requestId: "ball-query", roomId });
+      await expect(client.waitForFrame(
+        (frame) => hasType(frame, "ball.query.result") && frame.requestId === "ball-query",
+        "ball query result",
+      )).resolves.toMatchObject({
+        frame: { roomId, balls: [{ sourceKind: "light-task", sourceId: "task-api" }] },
+      });
+      expect(queryBalls).toHaveBeenCalledWith(sessionContext, roomId);
     } finally {
       await client.close();
       await server.close();
