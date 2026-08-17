@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type {
+  AgentExecution,
   Actor,
   ManagedRoom,
   Message,
@@ -9,6 +10,10 @@ import type {
   RoomSyncRequest,
   RoomSyncResult,
 } from "@native-im/core";
+import type {
+  RuntimeAuthorityOperation,
+  RuntimeAuthorityOperationResult,
+} from "../agent-runtime/runtime-authority-protocol.js";
 import {
   isManagedRoomShape,
   isRoomAuditRecord,
@@ -2699,13 +2704,23 @@ function executeAgentExecutionTransition(
       agentId,
       toolName: command.payload.toolName,
       status: "running",
+      actionCategory: "tool_call",
+      toolDispatchPhase: "not_started",
+      currentAttemptSeq: 1,
+      retryCycle: 1,
+      retryOrdinal: 1,
+      recoveryCursor: 0,
+      queuedAt: acceptedAt,
       startedAt: acceptedAt,
+      updatedAt: acceptedAt,
     };
     database.prepare(
       `INSERT INTO agent_executions (
          id, room_id, agent_id, trigger_message_id, status, started_at,
-         completed_at, result_json, requester_actor_id, tool_name
-       ) VALUES (?, ?, ?, ?, 'running', ?, NULL, NULL, ?, ?)`,
+         completed_at, result_json, requester_actor_id, tool_name,
+         action_category, tool_dispatch_phase, queued_at, updated_at
+       ) VALUES (?, ?, ?, ?, 'running', ?, NULL, NULL, ?, ?,
+                 'tool_call', 'not_started', ?, ?)`,
     ).run(
       command.payload.executionId,
       command.roomId,
@@ -2714,7 +2729,15 @@ function executeAgentExecutionTransition(
       acceptedAt,
       requesterId,
       command.payload.toolName,
+      acceptedAt,
+      acceptedAt,
     );
+    database.prepare(
+      `INSERT INTO agent_execution_attempts (
+         execution_id, attempt_seq, retry_cycle, retry_ordinal, status,
+         action_category, started_at, recovery_cursor
+       ) VALUES (?, 1, 1, 1, 'running', 'tool_call', ?, 0)`,
+    ).run(command.payload.executionId, acceptedAt);
   } else {
     if (current.roomId !== command.roomId || current.agentId !== agentId ||
         current.sourceMessageId !== command.payload.sourceMessageId ||
@@ -2733,18 +2756,42 @@ function executeAgentExecutionTransition(
       agentId,
       toolName: command.payload.toolName,
       status: command.payload.status,
+      actionCategory: "tool_call",
+      toolDispatchPhase: "finished",
+      currentAttemptSeq: 1,
+      retryCycle: 1,
+      retryOrdinal: 1,
+      recoveryCursor: 0,
+      queuedAt: current.startedAt,
       startedAt: current.startedAt,
+      updatedAt: acceptedAt,
       completedAt: acceptedAt,
-      ...(command.payload.result === undefined ? {} : { result: command.payload.result }),
+      ...(command.payload.status === "cancelled" ? { cancellationReason: "legacy_interrupt" } : {}),
+      ...(command.payload.status === "failed" ? { terminalErrorCode: "legacy_failure" } : {}),
     };
     database.prepare(
       `UPDATE agent_executions
-       SET status = ?, completed_at = ?, result_json = ?
+       SET status = ?, completed_at = ?, result_json = ?, updated_at = ?,
+           tool_dispatch_phase = 'finished', cancellation_reason = ?, terminal_error_code = ?
        WHERE id = ?`,
     ).run(
       command.payload.status,
       acceptedAt,
       command.payload.result === undefined ? null : canonicalJson(command.payload.result),
+      acceptedAt,
+      command.payload.status === "cancelled" ? "legacy_interrupt" : null,
+      command.payload.status === "failed" ? "legacy_failure" : null,
+      command.payload.executionId,
+    );
+    database.prepare(
+      `UPDATE agent_execution_attempts
+       SET status = ?, finished_at = ?, error_code = ?
+       WHERE execution_id = ? AND attempt_seq = 1 AND status = 'running'`,
+    ).run(
+      command.payload.status,
+      acceptedAt,
+      command.payload.status === "cancelled" ? "legacy_interrupt" :
+        command.payload.status === "failed" ? "legacy_failure" : null,
       command.payload.executionId,
     );
   }
@@ -2764,6 +2811,1010 @@ function executeAgentExecutionTransition(
     acceptedAt,
     result: { execution },
   };
+}
+
+function runtimeExecutionById(database: DatabaseSync, executionId: string): AgentExecution {
+  const row = database.prepare(
+    `SELECT id, room_id AS roomId, trigger_message_id AS sourceMessageId,
+            requester_actor_id AS requesterId, agent_id AS agentId,
+            tool_name AS toolName, status, action_category AS actionCategory,
+            tool_dispatch_phase AS toolDispatchPhase,
+            current_attempt_seq AS currentAttemptSeq, retry_cycle AS retryCycle,
+            retry_ordinal AS retryOrdinal, provider_id AS providerId,
+            model_id AS modelId, recovery_cursor AS recoveryCursor,
+            queued_at AS queuedAt, started_at AS startedAt,
+            updated_at AS updatedAt, completed_at AS completedAt,
+            cancellation_reason AS cancellationReason,
+            terminal_error_code AS terminalErrorCode,
+            dead_lettered_at AS deadLetteredAt,
+            result_message_id AS resultMessageId,
+            next_retry_at AS nextRetryAt,
+            manual_retry_of_execution_id AS manualRetryOfExecutionId,
+            compensates_execution_id AS compensatesExecutionId
+     FROM agent_executions WHERE id = ?`,
+  ).get(executionId);
+  if (row === undefined) return fail("execution_not_found", "Agent execution was not found");
+  if (
+    typeof row.id !== "string" || typeof row.roomId !== "string" ||
+    typeof row.sourceMessageId !== "string" || typeof row.requesterId !== "string" ||
+    typeof row.agentId !== "string" || typeof row.toolName !== "string" ||
+    (row.status !== "queued" && row.status !== "running" && row.status !== "completed" && row.status !== "failed" && row.status !== "cancelled") ||
+    (row.actionCategory !== "model_generation" && row.actionCategory !== "tool_call" && row.actionCategory !== "waiting_upstream") ||
+    typeof row.currentAttemptSeq !== "number" || typeof row.retryCycle !== "number" ||
+    (row.retryOrdinal !== 1 && row.retryOrdinal !== 2 && row.retryOrdinal !== 3) ||
+    typeof row.recoveryCursor !== "number" || typeof row.queuedAt !== "string" ||
+    typeof row.updatedAt !== "string"
+  ) return fail("storage_unavailable", "Agent execution was corrupt");
+  const status = row.status;
+  const execution: AgentExecution = {
+    id: row.id,
+    roomId: row.roomId,
+    sourceMessageId: row.sourceMessageId,
+    requesterId: row.requesterId,
+    agentId: row.agentId,
+    toolName: row.toolName,
+    status,
+    actionCategory: row.actionCategory,
+    ...(row.actionCategory === "tool_call" &&
+      (row.toolDispatchPhase === "not_started" || row.toolDispatchPhase === "dispatched" || row.toolDispatchPhase === "finished")
+      ? { toolDispatchPhase: row.toolDispatchPhase }
+      : {}),
+    currentAttemptSeq: row.currentAttemptSeq,
+    retryCycle: row.retryCycle,
+    retryOrdinal: row.retryOrdinal,
+    ...(typeof row.providerId === "string" ? { providerId: row.providerId } : {}),
+    ...(typeof row.modelId === "string" ? { modelId: row.modelId } : {}),
+    recoveryCursor: row.recoveryCursor,
+    queuedAt: row.queuedAt,
+    ...(status !== "queued" && typeof row.startedAt === "string" ? { startedAt: row.startedAt } : {}),
+    updatedAt: row.updatedAt,
+    ...(typeof row.completedAt === "string" ? { completedAt: row.completedAt } : {}),
+    ...(typeof row.cancellationReason === "string" ? { cancellationReason: row.cancellationReason } : {}),
+    ...(typeof row.terminalErrorCode === "string" ? { terminalErrorCode: row.terminalErrorCode } : {}),
+    ...(typeof row.deadLetteredAt === "string" ? { deadLetteredAt: row.deadLetteredAt } : {}),
+    ...(typeof row.resultMessageId === "string" ? { resultMessageId: row.resultMessageId } : {}),
+    ...(typeof row.nextRetryAt === "string" ? { nextRetryAt: row.nextRetryAt } : {}),
+    ...(typeof row.manualRetryOfExecutionId === "string" ? { manualRetryOfExecutionId: row.manualRetryOfExecutionId } : {}),
+    ...(typeof row.compensatesExecutionId === "string" ? { compensatesExecutionId: row.compensatesExecutionId } : {}),
+  };
+  return execution;
+}
+
+function appendRuntimeExecutionEvent(
+  database: DatabaseSync,
+  execution: AgentExecution,
+  occurredAt: string,
+  transition: string,
+  errorCode?: string,
+): void {
+  const eventId = stableId("runtime", execution.id, String(execution.currentAttemptSeq), transition);
+  const streamSeq = appendRoomEvent(database, {
+    eventId,
+    roomId: execution.roomId,
+    actorId: execution.agentId,
+    eventType: "room.agent_execution.changed",
+    occurredAt,
+    payload: execution as unknown as JsonValue,
+  });
+  appendRoomOutbox(database, eventId, execution.roomId, streamSeq, occurredAt, "runtime", transition);
+  const lifecycleType = transition === "queued" || transition === "manual-retry-queued"
+    ? "agent.execution.queued"
+    : transition === "started"
+      ? "agent.execution.started"
+      : transition === "retry-scheduled"
+        ? "agent.execution.retry-scheduled"
+        : transition === "completed"
+          ? "agent.execution.completed"
+          : transition === "cancelled"
+            ? "agent.execution.cancelled"
+            : transition === "dead-lettered"
+              ? "agent.execution.dead-lettered"
+              : transition === "recovered"
+                ? "agent.execution.recovered"
+                : undefined;
+  if (lifecycleType === undefined) return;
+  const lifecycleEventId = stableId("runtime-lifecycle", execution.id, String(execution.currentAttemptSeq), transition);
+  const lifecycleSeq = appendRoomEvent(database, {
+    eventId: lifecycleEventId,
+    roomId: execution.roomId,
+    actorId: execution.agentId,
+    eventType: lifecycleType,
+    occurredAt,
+    payload: {
+      executionId: execution.id,
+      attemptSeq: execution.currentAttemptSeq,
+      retryCycle: execution.retryCycle,
+      retryOrdinal: execution.retryOrdinal,
+      actionCategory: execution.actionCategory,
+      status: execution.status,
+      ...(errorCode === undefined ? {} : { errorCode }),
+      ...(execution.nextRetryAt === undefined ? {} : { nextRetryAt: execution.nextRetryAt }),
+    },
+  });
+  appendRoomOutbox(
+    database,
+    lifecycleEventId,
+    execution.roomId,
+    lifecycleSeq,
+    occurredAt,
+    "runtime-lifecycle",
+    transition,
+  );
+}
+
+function requireRuntimeHumanAuthority(
+  database: DatabaseSync,
+  context: AuthenticatedCommandContext,
+  execution: AgentExecution,
+  now: number,
+): void {
+  const actorId = requireHumanSession(database, context, now);
+  const membership = database.prepare(
+    `SELECT membership.role, room.status AS roomStatus
+     FROM room_memberships AS membership
+     JOIN rooms AS room ON room.id = membership.room_id
+     WHERE membership.room_id = ? AND membership.actor_id = ? AND membership.kind = 'human'`,
+  ).get(execution.roomId, actorId);
+  if (membership?.roomStatus !== "active" ||
+      (actorId !== execution.requesterId && membership.role !== "owner" && membership.role !== "admin")) {
+    return fail("permission_denied", "Agent execution control was forbidden");
+  }
+}
+
+export function executeRuntimeAuthorityOperation(
+  database: DatabaseSync,
+  operation: RuntimeAuthorityOperation,
+): RuntimeAuthorityOperationResult {
+  return runAuthorityImmediateTransaction(database, () => {
+    const occurredAt = new Date(operation.now).toISOString();
+    if (operation.type === "runtime.read-context") {
+      const execution = runtimeExecutionById(database, operation.executionId);
+      requireAgentCommandAuthority(database, execution.agentId, execution.roomId);
+      const permissionRow = database.prepare(
+        `SELECT actor.tool_permissions_json AS capabilityJson,
+                membership.tool_permissions_json AS membershipJson,
+                membership.participation AS participation, room.status AS roomStatus
+         FROM actors AS actor
+         JOIN room_memberships AS membership ON membership.actor_id = actor.id
+         JOIN rooms AS room ON room.id = membership.room_id
+         WHERE actor.id = ? AND membership.room_id = ? AND actor.kind = 'agent' AND membership.kind = 'agent'`,
+      ).get(execution.agentId, execution.roomId);
+      const capabilities = typeof permissionRow?.capabilityJson === "string"
+        ? JSON.parse(permissionRow.capabilityJson) as unknown : [];
+      const membershipPermissions = typeof permissionRow?.membershipJson === "string"
+        ? JSON.parse(permissionRow.membershipJson) as unknown : [];
+      const allowedIds = new Set(["http-json.read", "repository.git-status", "sandbox-file.write"]);
+      const toolIds = permissionRow?.roomStatus === "active" && permissionRow.participation === "active" &&
+        Array.isArray(capabilities) && Array.isArray(membershipPermissions)
+        ? capabilities.filter((entry): entry is "http-json.read" | "repository.git-status" | "sandbox-file.write" =>
+            typeof entry === "string" && allowedIds.has(entry) && membershipPermissions.includes(entry))
+        : [];
+      const messages = database.prepare(
+        `SELECT id AS messageId, author_id AS authorId, body
+         FROM (
+           SELECT id, author_id, body, sent_at
+           FROM messages WHERE room_id = ?
+           ORDER BY sent_at DESC, id DESC LIMIT 64
+         ) ORDER BY sent_at, messageId`,
+      ).all(execution.roomId);
+      if (!messages.every((message) => typeof message.messageId === "string" &&
+          typeof message.authorId === "string" && typeof message.body === "string")) {
+        return fail("storage_unavailable", "Agent runtime context was corrupt");
+      }
+      return {
+        kind: "context",
+        visibleConversation: messages as { messageId: string; authorId: string; body: string }[],
+        toolIds,
+      };
+    }
+    if (operation.type === "runtime.invoke") {
+      const requesterId = operation.context.kind === "human"
+        ? requireHumanSession(database, operation.context, operation.now)
+        : (() => {
+            requireAgentCommandAuthority(database, operation.context.agent.actorId, operation.intent.roomId);
+            return operation.context.agent.actorId;
+          })();
+      const source = database.prepare(
+        `SELECT room_id AS roomId, author_id AS authorId FROM messages WHERE id = ?`,
+      ).get(operation.intent.sourceMessageId);
+      if (source?.roomId !== operation.intent.roomId || source.authorId !== requesterId) {
+        return fail("message_not_found", "Agent invocation source message was not found");
+      }
+      const target = database.prepare(
+        `SELECT actor.kind AS actorKind, membership.kind AS membershipKind, room.status AS roomStatus
+         FROM room_memberships AS membership
+         JOIN actors AS actor ON actor.id = membership.actor_id
+         JOIN rooms AS room ON room.id = membership.room_id
+         WHERE membership.room_id = ? AND membership.actor_id = ?`,
+      ).get(operation.intent.roomId, operation.intent.targetAgentId);
+      if (target?.actorKind !== "agent" || target.membershipKind !== "agent" || target.roomStatus !== "active") {
+        return fail("permission_denied", "Target Agent membership was forbidden");
+      }
+      const existing = database.prepare(
+        `SELECT execution_id AS executionId, intent_kind AS intentKind
+         FROM agent_invocation_intents WHERE source_message_id = ? AND target_agent_id = ?`,
+      ).get(operation.intent.sourceMessageId, operation.intent.targetAgentId);
+      if (typeof existing?.executionId === "string") {
+        if (operation.intent.kind === "direct_mention" && existing.intentKind !== "direct_mention") {
+          database.prepare(
+            `UPDATE agent_invocation_intents SET intent_kind = 'direct_mention'
+             WHERE source_message_id = ? AND target_agent_id = ?`,
+          ).run(operation.intent.sourceMessageId, operation.intent.targetAgentId);
+        }
+        return { kind: "invocation", execution: runtimeExecutionById(database, existing.executionId), replayed: true };
+      }
+      const queued = database.prepare(
+        `SELECT COUNT(*) AS count FROM agent_executions WHERE room_id = ? AND status = 'queued'`,
+      ).get(operation.intent.roomId);
+      if (typeof queued?.count !== "number" || queued.count >= 32) {
+        return fail("agent_queue_full", "Agent room queue was full");
+      }
+      database.prepare(
+        `INSERT INTO agent_executions (
+           id, room_id, agent_id, trigger_message_id, status, started_at,
+           completed_at, result_json, requester_actor_id, tool_name,
+           action_category, tool_dispatch_phase, current_attempt_seq,
+           retry_cycle, retry_ordinal, provider_id, model_id, recovery_cursor,
+           queued_at, updated_at
+         ) VALUES (?, ?, ?, ?, 'queued', ?, NULL, NULL, ?, 'model.generate',
+                   'model_generation', NULL, 1, 1, 1, ?, ?, 0, ?, ?)`,
+      ).run(
+        operation.executionId,
+        operation.intent.roomId,
+        operation.intent.targetAgentId,
+        operation.intent.sourceMessageId,
+        occurredAt,
+        requesterId,
+        operation.providerId,
+        operation.modelId,
+        occurredAt,
+        occurredAt,
+      );
+      database.prepare(
+        `INSERT INTO agent_execution_attempts (
+           execution_id, attempt_seq, retry_cycle, retry_ordinal, status,
+           action_category, started_at, finished_at, error_code, next_retry_at,
+           recovery_cursor
+         ) VALUES (?, 1, 1, 1, 'queued', 'model_generation', NULL, NULL, NULL, NULL, 0)`,
+      ).run(operation.executionId);
+      database.prepare(
+        `INSERT INTO agent_invocation_intents (
+           id, room_id, source_message_id, target_agent_id, requester_actor_id,
+           intent_kind, execution_id, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        operation.intentId,
+        operation.intent.roomId,
+        operation.intent.sourceMessageId,
+        operation.intent.targetAgentId,
+        requesterId,
+        operation.intent.kind,
+        operation.executionId,
+        occurredAt,
+      );
+      const execution = runtimeExecutionById(database, operation.executionId);
+      appendRuntimeExecutionEvent(database, execution, occurredAt, "queued");
+      return { kind: "invocation", execution, replayed: false };
+    }
+
+    if (operation.type === "runtime.claim") {
+      const updated = database.prepare(
+        `UPDATE agent_executions
+         SET status = 'running', started_at = ?, updated_at = ?, next_retry_at = NULL
+         WHERE id = ? AND current_attempt_seq = ? AND status = 'queued'`,
+      ).run(occurredAt, occurredAt, operation.executionId, operation.attemptSeq);
+      if (updated.changes !== 1) return fail("execution_conflict", "Agent attempt claim was stale");
+      database.prepare(
+        `UPDATE agent_execution_attempts SET status = 'running', started_at = ?, next_retry_at = NULL
+         WHERE execution_id = ? AND attempt_seq = ? AND status = 'queued'`,
+      ).run(occurredAt, operation.executionId, operation.attemptSeq);
+      const execution = runtimeExecutionById(database, operation.executionId);
+      requireAgentCommandAuthority(database, execution.agentId, execution.roomId);
+      appendRuntimeExecutionEvent(database, execution, occurredAt, "started");
+      return { kind: "execution", execution };
+    }
+
+    if (operation.type === "runtime.complete") {
+      const current = runtimeExecutionById(database, operation.executionId);
+      requireAgentCommandAuthority(database, current.agentId, current.roomId);
+      if (current.status !== "running" || current.currentAttemptSeq !== operation.attemptSeq) {
+        return fail("execution_conflict", "Agent completion was stale");
+      }
+      database.prepare(
+        `INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+         VALUES (?, ?, ?, 'agent', ?, ?)`,
+      ).run(operation.messageId, current.roomId, current.agentId, operation.body, occurredAt);
+      const messageEventId = stableId("runtime-message", current.id, String(operation.attemptSeq));
+      const message = {
+        id: operation.messageId,
+        roomId: current.roomId,
+        authorId: current.agentId,
+        authorKind: "agent" as const,
+        body: operation.body,
+        sentAt: occurredAt,
+      };
+      const messageSeq = appendRoomEvent(database, {
+        eventId: messageEventId,
+        roomId: current.roomId,
+        actorId: current.agentId,
+        eventType: "room.message.accepted",
+        occurredAt,
+        payload: message,
+      });
+      appendRoomOutbox(database, messageEventId, current.roomId, messageSeq, occurredAt, "runtime", "message");
+      database.prepare(
+        `UPDATE agent_executions
+         SET status = 'completed', completed_at = ?, updated_at = ?, result_message_id = ?
+         WHERE id = ? AND current_attempt_seq = ? AND status = 'running'`,
+      ).run(occurredAt, occurredAt, operation.messageId, operation.executionId, operation.attemptSeq);
+      database.prepare(
+        `UPDATE agent_execution_attempts SET status = 'completed', finished_at = ?
+         WHERE execution_id = ? AND attempt_seq = ? AND status = 'running'`,
+      ).run(occurredAt, operation.executionId, operation.attemptSeq);
+      const execution = runtimeExecutionById(database, operation.executionId);
+      appendRuntimeExecutionEvent(database, execution, occurredAt, "completed");
+      return { kind: "execution", execution };
+    }
+
+    if (operation.type === "runtime.schedule-retry") {
+      const current = runtimeExecutionById(database, operation.executionId);
+      if (current.status !== "running" || current.currentAttemptSeq !== operation.attemptSeq) {
+        return fail("execution_conflict", "Agent retry result was stale");
+      }
+      const shouldRetry = operation.nextRetryAt !== undefined && current.retryOrdinal < 3;
+      database.prepare(
+        `UPDATE agent_execution_attempts
+         SET status = 'failed', finished_at = ?, error_code = ?, next_retry_at = ?
+         WHERE execution_id = ? AND attempt_seq = ? AND status = 'running'`,
+      ).run(occurredAt, operation.errorCode, operation.nextRetryAt ?? null, current.id, current.currentAttemptSeq);
+      if (shouldRetry) {
+        const nextAttempt = current.currentAttemptSeq + 1;
+        const nextOrdinal = current.retryOrdinal + 1;
+        database.prepare(
+          `UPDATE agent_executions
+           SET status = 'queued', current_attempt_seq = ?, retry_ordinal = ?,
+               updated_at = ?, next_retry_at = ?, terminal_error_code = NULL
+           WHERE id = ? AND current_attempt_seq = ? AND status = 'running'`,
+        ).run(nextAttempt, nextOrdinal, occurredAt, operation.nextRetryAt, current.id, current.currentAttemptSeq);
+        database.prepare(
+          `INSERT INTO agent_execution_attempts (
+             execution_id, attempt_seq, retry_cycle, retry_ordinal, status,
+             action_category, started_at, finished_at, error_code, next_retry_at,
+             recovery_cursor
+           ) VALUES (?, ?, ?, ?, 'queued', ?, NULL, NULL, NULL, ?, ?)`,
+        ).run(current.id, nextAttempt, current.retryCycle, nextOrdinal, current.actionCategory, operation.nextRetryAt, current.recoveryCursor);
+        const execution = runtimeExecutionById(database, current.id);
+        appendRuntimeExecutionEvent(database, execution, occurredAt, "retry-scheduled", operation.errorCode);
+        return { kind: "execution", execution };
+      }
+      database.prepare(
+        `UPDATE agent_executions
+         SET status = 'failed', completed_at = ?, updated_at = ?,
+             terminal_error_code = ?, dead_lettered_at = ?, next_retry_at = NULL
+         WHERE id = ? AND current_attempt_seq = ? AND status = 'running'`,
+      ).run(occurredAt, occurredAt, operation.errorCode, occurredAt, current.id, current.currentAttemptSeq);
+      const execution = runtimeExecutionById(database, current.id);
+      appendRuntimeExecutionEvent(database, execution, occurredAt, "dead-lettered", operation.errorCode);
+      return { kind: "execution", execution };
+    }
+
+    if (operation.type === "runtime.interrupt") {
+      const current = runtimeExecutionById(database, operation.executionId);
+      requireRuntimeHumanAuthority(database, operation.context, current, operation.now);
+      if (current.status === "completed" || current.status === "failed" || current.status === "cancelled") {
+        return { kind: "execution", execution: current };
+      }
+      database.prepare(
+        `UPDATE agent_executions
+         SET status = 'cancelled', cancellation_reason = ?, completed_at = ?, updated_at = ?, next_retry_at = NULL
+         WHERE id = ? AND current_attempt_seq = ? AND status IN ('queued', 'running')`,
+      ).run(operation.reason, occurredAt, occurredAt, current.id, current.currentAttemptSeq);
+      database.prepare(
+        `UPDATE agent_execution_attempts
+         SET status = 'cancelled', finished_at = ?, error_code = ?
+         WHERE execution_id = ? AND attempt_seq = ? AND status IN ('queued', 'running')`,
+      ).run(occurredAt, operation.reason, current.id, current.currentAttemptSeq);
+      const execution = runtimeExecutionById(database, current.id);
+      appendRuntimeExecutionEvent(database, execution, occurredAt, "cancelled");
+      return { kind: "execution", execution };
+    }
+
+    if (operation.type === "runtime.manual-retry") {
+      const old = runtimeExecutionById(database, operation.executionId);
+      requireRuntimeHumanAuthority(database, operation.context, old, operation.now);
+      if (old.status !== "failed" && old.status !== "cancelled") {
+        return fail("execution_conflict", "Only terminal Agent executions can be retried");
+      }
+      const existing = database.prepare(
+        `SELECT id FROM agent_executions WHERE manual_retry_of_execution_id = ? ORDER BY queued_at LIMIT 1`,
+      ).get(old.id);
+      if (typeof existing?.id === "string") {
+        return { kind: "invocation", execution: runtimeExecutionById(database, existing.id), replayed: true };
+      }
+      database.prepare(
+        `INSERT INTO agent_executions (
+           id, room_id, agent_id, trigger_message_id, status, started_at,
+           completed_at, result_json, requester_actor_id, tool_name,
+           action_category, tool_dispatch_phase, current_attempt_seq,
+           retry_cycle, retry_ordinal, provider_id, model_id, recovery_cursor,
+           queued_at, updated_at, manual_retry_of_execution_id
+         ) VALUES (?, ?, ?, ?, 'queued', ?, NULL, NULL, ?, 'model.generate',
+                   'model_generation', NULL, 1, 1, 1, ?, ?, 0, ?, ?, ?)`,
+      ).run(operation.newExecutionId, old.roomId, old.agentId, old.sourceMessageId, occurredAt,
+        operation.context.principal.actorId, old.providerId ?? "openai-responses", old.modelId ?? "configured", occurredAt, occurredAt, old.id);
+      database.prepare(
+        `INSERT INTO agent_execution_attempts (
+           execution_id, attempt_seq, retry_cycle, retry_ordinal, status, action_category, recovery_cursor
+         ) VALUES (?, 1, 1, 1, 'queued', 'model_generation', 0)`,
+      ).run(operation.newExecutionId);
+      const execution = runtimeExecutionById(database, operation.newExecutionId);
+      appendRuntimeExecutionEvent(database, execution, occurredAt, "manual-retry-queued");
+      return { kind: "invocation", execution, replayed: false };
+    }
+
+    if (operation.type === "runtime.begin-compensation") {
+      const old = runtimeExecutionById(database, operation.executionId);
+      const humanId = requireHumanSession(database, operation.context, operation.now);
+      if (old.status !== "completed") {
+        return fail("execution_conflict", "Only completed side effects can be compensated");
+      }
+      const authority = database.prepare(
+        `SELECT membership.role, room.status AS roomStatus,
+                confirmation.human_principal_id AS confirmationPrincipalId,
+                dispatch.dispatch_id AS oldDispatchId, dispatch.tool_id AS toolId,
+                dispatch.parameter_sha256 AS parameterSha256,
+                dispatch.sealed_compensation AS sealedCompensation,
+                actor.tool_permissions_json AS capabilityJson,
+                agent_membership.tool_permissions_json AS membershipJson,
+                agent_membership.participation AS participation
+         FROM room_memberships AS membership
+         JOIN rooms AS room ON room.id = membership.room_id
+         JOIN tool_dispatches AS dispatch
+           ON dispatch.execution_id = ? AND dispatch.state = 'succeeded'
+         JOIN tool_confirmations AS confirmation
+           ON confirmation.execution_id = dispatch.execution_id
+          AND confirmation.attempt_seq = dispatch.attempt_seq
+         JOIN actors AS actor ON actor.id = ? AND actor.kind = 'agent'
+         JOIN room_memberships AS agent_membership
+           ON agent_membership.room_id = room.id AND agent_membership.actor_id = actor.id
+         WHERE membership.room_id = ? AND membership.actor_id = ? AND membership.kind = 'human'
+         ORDER BY dispatch.dispatched_at DESC LIMIT 1`,
+      ).get(old.id, old.agentId, old.roomId, humanId);
+      const capabilities = typeof authority?.capabilityJson === "string"
+        ? JSON.parse(authority.capabilityJson) as unknown : [];
+      const membershipPermissions = typeof authority?.membershipJson === "string"
+        ? JSON.parse(authority.membershipJson) as unknown : [];
+      if (authority?.roomStatus !== "active" ||
+          (authority.confirmationPrincipalId !== humanId && authority.role !== "owner" && authority.role !== "admin") ||
+          authority.toolId !== "sandbox-file.write" || typeof authority.parameterSha256 !== "string" ||
+          typeof authority.sealedCompensation !== "string" || authority.participation !== "active" ||
+          !Array.isArray(capabilities) || !capabilities.includes(authority.toolId) ||
+          !Array.isArray(membershipPermissions) || !membershipPermissions.includes(authority.toolId)) {
+        return fail("permission_denied", "Compensation authority was forbidden");
+      }
+      const existing = database.prepare(
+        `SELECT id FROM agent_executions WHERE compensates_execution_id = ? ORDER BY queued_at LIMIT 1`,
+      ).get(old.id);
+      if (typeof existing?.id === "string") {
+        const execution = runtimeExecutionById(database, existing.id);
+        const dispatch = database.prepare(
+          `SELECT dispatch_id AS dispatchId FROM tool_dispatches WHERE execution_id = ?`,
+        ).get(execution.id);
+        if (typeof dispatch?.dispatchId !== "string") {
+          return fail("storage_unavailable", "Compensation dispatch was corrupt");
+        }
+        return {
+          kind: "compensation",
+          execution,
+          dispatchId: dispatch.dispatchId,
+          toolId: "sandbox-file.write",
+          sealedCompensation: authority.sealedCompensation,
+          replayed: true,
+        };
+      }
+      database.prepare(
+        `INSERT INTO agent_executions (
+           id, room_id, agent_id, trigger_message_id, status, started_at,
+           requester_actor_id, tool_name, action_category, tool_dispatch_phase,
+           current_attempt_seq, retry_cycle, retry_ordinal, recovery_cursor,
+           queued_at, updated_at, compensates_execution_id
+         ) VALUES (?, ?, ?, ?, 'running', ?, ?, 'sandbox-file.write', 'tool_call',
+                   'dispatched', 1, 1, 1, 0, ?, ?, ?)`,
+      ).run(operation.newExecutionId, old.roomId, old.agentId, old.sourceMessageId,
+        occurredAt, humanId, occurredAt, occurredAt, old.id);
+      database.prepare(
+        `INSERT INTO agent_execution_attempts (
+           execution_id, attempt_seq, retry_cycle, retry_ordinal, status,
+           action_category, started_at, recovery_cursor
+         ) VALUES (?, 1, 1, 1, 'running', 'tool_call', ?, 0)`,
+      ).run(operation.newExecutionId, occurredAt);
+      database.prepare(
+        `INSERT INTO agent_execution_grants (
+           grant_id, execution_id, attempt_seq, agent_id, room_id, tool_id,
+           parameter_sha256, issued_at, expires_at, consumed_at
+         ) VALUES (?, ?, 1, ?, ?, 'sandbox-file.write', ?, ?, ?, ?)`,
+      ).run(operation.grantId, operation.newExecutionId, old.agentId, old.roomId,
+        authority.parameterSha256, occurredAt, occurredAt, occurredAt);
+      database.prepare(
+        `INSERT INTO tool_dispatches (
+           dispatch_id, execution_id, attempt_seq, grant_id, tool_id,
+           parameter_sha256, state, dispatched_at
+         ) VALUES (?, ?, 1, ?, 'sandbox-file.write', ?, 'dispatched', ?)`,
+      ).run(operation.dispatchId, operation.newExecutionId, operation.grantId,
+        authority.parameterSha256, occurredAt);
+      const execution = runtimeExecutionById(database, operation.newExecutionId);
+      appendRuntimeExecutionEvent(database, execution, occurredAt, "started");
+      return {
+        kind: "compensation",
+        execution,
+        dispatchId: operation.dispatchId,
+        toolId: "sandbox-file.write",
+        sealedCompensation: authority.sealedCompensation,
+        replayed: false,
+      };
+    }
+
+    if (operation.type === "runtime.read-pending-confirmation") {
+      const current = runtimeExecutionById(database, operation.executionId);
+      if (current.status !== "running" || current.actionCategory !== "waiting_upstream") {
+        return fail("execution_conflict", "Confirmation targeted a stale Agent execution");
+      }
+      const pending = database.prepare(
+        `SELECT confirmation.expires_at AS expiresAt,
+                confirmation.consumed_at AS consumedAt,
+                grant.grant_id AS grantId,
+                grant.tool_id AS toolId,
+                step.tool_call_json AS toolCallJson
+         FROM tool_confirmations AS confirmation
+         JOIN agent_execution_grants AS grant
+           ON grant.execution_id = confirmation.execution_id
+          AND grant.attempt_seq = confirmation.attempt_seq
+          AND grant.tool_id = confirmation.tool_id
+          AND grant.parameter_sha256 = confirmation.parameter_sha256
+         JOIN agent_execution_steps AS step
+           ON step.execution_id = confirmation.execution_id
+          AND step.attempt_seq = confirmation.attempt_seq
+          AND step.step_kind = 'tool'
+         WHERE confirmation.confirmation_id = ?
+           AND confirmation.execution_id = ?
+         ORDER BY step.step_seq DESC LIMIT 1`,
+      ).get(operation.confirmationId, current.id);
+      if (pending === undefined || pending.consumedAt !== null ||
+          typeof pending.expiresAt !== "string" || Date.parse(pending.expiresAt) <= operation.now ||
+          typeof pending.grantId !== "string" || typeof pending.toolId !== "string" ||
+          typeof pending.toolCallJson !== "string") {
+        return fail("confirmation_expired", "Pending tool confirmation was unavailable");
+      }
+      let toolCall: unknown;
+      try {
+        toolCall = JSON.parse(pending.toolCallJson) as unknown;
+      } catch {
+        return fail("storage_unavailable", "Pending tool confirmation was corrupt");
+      }
+      if (!isRecord(toolCall) || typeof toolCall.callId !== "string" ||
+          typeof toolCall.argumentsJson !== "string" || !isRecord(toolCall.parameters)) {
+        return fail("storage_unavailable", "Pending tool confirmation was corrupt");
+      }
+      return {
+        kind: "pending-confirmation",
+        execution: current,
+        grantId: pending.grantId,
+        toolId: pending.toolId as "http-json.read" | "repository.git-status" | "sandbox-file.write",
+        parameters: toolCall.parameters,
+        callId: toolCall.callId,
+        argumentsJson: toolCall.argumentsJson,
+      };
+    }
+
+    if (operation.type === "runtime.prepare-tool") {
+      const current = runtimeExecutionById(database, operation.executionId);
+      if (current.status !== "running" || current.currentAttemptSeq !== operation.attemptSeq) {
+        return fail("execution_conflict", "Tool preparation targeted a stale Agent attempt");
+      }
+      const permissions = database.prepare(
+        `SELECT actor.kind AS actorKind, actor.readiness AS readiness,
+                actor.tool_permissions_json AS capabilityJson,
+                membership.kind AS membershipKind,
+                membership.participation AS participation,
+                membership.tool_permissions_json AS membershipPermissionsJson,
+                room.status AS roomStatus
+         FROM actors AS actor
+         JOIN room_memberships AS membership ON membership.actor_id = actor.id
+         JOIN rooms AS room ON room.id = membership.room_id
+         WHERE actor.id = ? AND membership.room_id = ?`,
+      ).get(current.agentId, current.roomId);
+      const capability = typeof permissions?.capabilityJson === "string"
+        ? JSON.parse(permissions.capabilityJson) as unknown : undefined;
+      const membershipPermissions = typeof permissions?.membershipPermissionsJson === "string"
+        ? JSON.parse(permissions.membershipPermissionsJson) as unknown : undefined;
+      if (permissions?.actorKind !== "agent" || permissions.readiness !== "ready" ||
+          permissions.membershipKind !== "agent" || permissions.participation !== "active" ||
+          permissions.roomStatus !== "active" || !Array.isArray(capability) ||
+          !capability.includes(operation.tool.id) || !Array.isArray(membershipPermissions) ||
+          !membershipPermissions.includes(operation.tool.id)) {
+        return fail("permission_denied", "Agent tool authority was forbidden");
+      }
+      const parameterSha256 = createHash("sha256").update(canonicalJson(operation.parameters)).digest("hex");
+      if (operation.tool.effect === "side-effecting" &&
+          (operation.confirmationId === undefined || operation.confirmationContext === undefined)) {
+        return fail("confirmation_forbidden", "Side-effecting tool confirmation was required");
+      }
+      database.prepare(
+        `INSERT INTO agent_execution_grants (
+           grant_id, execution_id, attempt_seq, agent_id, room_id, tool_id,
+           parameter_sha256, issued_at, expires_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(operation.grantId, current.id, current.currentAttemptSeq, current.agentId,
+        current.roomId, operation.tool.id, parameterSha256, occurredAt, operation.expiresAt);
+      if (operation.tool.effect === "side-effecting") {
+        const confirmationContext = operation.confirmationContext;
+        const confirmationId = operation.confirmationId;
+        if (confirmationContext === undefined || confirmationId === undefined) {
+          return fail("confirmation_forbidden", "Side-effecting tool confirmation was required");
+        }
+        const humanId = requireHumanSession(database, confirmationContext, operation.now);
+        const humanMembership = database.prepare(
+          `SELECT 1 AS present FROM room_memberships
+           WHERE room_id = ? AND actor_id = ? AND kind = 'human'`,
+        ).get(current.roomId, humanId);
+        if (humanMembership?.present !== 1) {
+          return fail("confirmation_forbidden", "Tool confirmation principal was forbidden");
+        }
+        database.prepare(
+          `INSERT INTO tool_confirmations (
+             confirmation_id, execution_id, attempt_seq, tool_id, parameter_sha256,
+             room_id, human_principal_id, session_family_id, expires_at,
+             target, impact, reversibility
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(confirmationId, current.id, current.currentAttemptSeq, operation.tool.id,
+          parameterSha256, current.roomId, humanId, confirmationContext.sessionFamilyId,
+          operation.expiresAt, operation.tool.id, "bounded-side-effect", operation.tool.reversibility);
+        if (operation.providerCall !== undefined) {
+          database.prepare(
+            `INSERT INTO agent_execution_steps (
+               execution_id, attempt_seq, step_seq, step_kind, tool_call_json,
+               input_sha256, output_sha256, completed_at
+             ) VALUES (?, ?, ?, 'tool', ?, ?, ?, ?)`,
+          ).run(
+            current.id,
+            current.currentAttemptSeq,
+            current.recoveryCursor + 1,
+            canonicalJson({
+              callId: operation.providerCall.callId,
+              argumentsJson: operation.providerCall.argumentsJson,
+              parameters: operation.parameters,
+            }),
+            parameterSha256,
+            parameterSha256,
+            occurredAt,
+          );
+        }
+      }
+      database.prepare(
+        `UPDATE agent_executions
+         SET action_category = ?, tool_name = ?, tool_dispatch_phase = ?, updated_at = ?
+         WHERE id = ? AND current_attempt_seq = ? AND status = 'running'`,
+      ).run(
+        operation.tool.effect === "side-effecting" ? "waiting_upstream" : "tool_call",
+        operation.tool.id,
+        operation.tool.effect === "side-effecting" ? null : "not_started",
+        occurredAt,
+        current.id,
+        current.currentAttemptSeq,
+      );
+      database.prepare(
+        `UPDATE agent_execution_attempts SET action_category = ?
+         WHERE execution_id = ? AND attempt_seq = ? AND status = 'running'`,
+      ).run(operation.tool.effect === "side-effecting" ? "waiting_upstream" : "tool_call",
+        current.id, current.currentAttemptSeq);
+      const execution = runtimeExecutionById(database, current.id);
+      appendRuntimeExecutionEvent(database, execution, occurredAt, "tool-prepared");
+      if (operation.confirmationId !== undefined) {
+        const confirmationEventId = stableId(
+          "runtime-confirmation",
+          execution.id,
+          String(execution.currentAttemptSeq),
+          operation.confirmationId,
+        );
+        const confirmationSeq = appendRoomEvent(database, {
+          eventId: confirmationEventId,
+          roomId: execution.roomId,
+          actorId: execution.agentId,
+          eventType: "agent.tool.confirmation-required",
+          occurredAt,
+          payload: {
+            confirmationId: operation.confirmationId,
+            executionId: execution.id,
+            attemptSeq: execution.currentAttemptSeq,
+            toolId: operation.tool.id,
+            target: operation.tool.id,
+            impact: "bounded-side-effect",
+            reversibility: operation.tool.reversibility,
+            expiresAt: operation.expiresAt,
+          },
+        });
+        appendRoomOutbox(
+          database,
+          confirmationEventId,
+          execution.roomId,
+          confirmationSeq,
+          occurredAt,
+          "runtime-confirmation",
+          operation.confirmationId,
+        );
+      }
+      return {
+        kind: "prepared-tool",
+        execution,
+        grantId: operation.grantId,
+        ...(operation.confirmationId === undefined ? {} : {
+          confirmationId: operation.confirmationId,
+          target: operation.tool.id,
+          impact: "bounded-side-effect",
+          reversibility: operation.tool.reversibility,
+        }),
+      };
+    }
+
+    if (operation.type === "runtime.claim-tool") {
+      const current = runtimeExecutionById(database, operation.executionId);
+      if (current.status !== "running" || current.currentAttemptSeq !== operation.attemptSeq ||
+          !((current.actionCategory === "tool_call" && current.toolDispatchPhase === "not_started") ||
+            current.actionCategory === "waiting_upstream")) {
+        return fail("execution_conflict", "Tool claim targeted a stale Agent attempt");
+      }
+      const grant = database.prepare(
+        `SELECT grant.agent_id AS agentId, grant.room_id AS roomId, grant.tool_id AS toolId,
+                grant.parameter_sha256 AS parameterSha256, grant.expires_at AS expiresAt,
+                grant.consumed_at AS consumedAt,
+                actor.kind AS actorKind, actor.readiness AS readiness,
+                actor.tool_permissions_json AS capabilityJson,
+                membership.kind AS membershipKind,
+                membership.participation AS participation,
+                membership.tool_permissions_json AS membershipPermissionsJson,
+                room.status AS roomStatus
+         FROM agent_execution_grants AS grant
+         JOIN actors AS actor ON actor.id = grant.agent_id
+         JOIN room_memberships AS membership
+           ON membership.room_id = grant.room_id AND membership.actor_id = grant.agent_id
+         JOIN rooms AS room ON room.id = grant.room_id
+         WHERE grant.grant_id = ? AND grant.execution_id = ? AND grant.attempt_seq = ?`,
+      ).get(operation.grantId, current.id, current.currentAttemptSeq);
+      const parameterSha256 = createHash("sha256").update(canonicalJson(operation.parameters)).digest("hex");
+      const capability = typeof grant?.capabilityJson === "string"
+        ? JSON.parse(grant.capabilityJson) as unknown : undefined;
+      const membershipPermissions = typeof grant?.membershipPermissionsJson === "string"
+        ? JSON.parse(grant.membershipPermissionsJson) as unknown : undefined;
+      if (grant?.agentId !== current.agentId || grant.roomId !== current.roomId ||
+          typeof grant.toolId !== "string" || grant.parameterSha256 !== parameterSha256 ||
+          typeof grant.expiresAt !== "string" || Date.parse(grant.expiresAt) <= operation.now ||
+          grant.consumedAt !== null || grant.actorKind !== "agent" || grant.readiness !== "ready" ||
+          grant.membershipKind !== "agent" || grant.participation !== "active" || grant.roomStatus !== "active" ||
+          !Array.isArray(capability) || !capability.includes(grant.toolId) ||
+          !Array.isArray(membershipPermissions) || !membershipPermissions.includes(grant.toolId)) {
+        return fail("permission_denied", "Tool dispatch authority was forbidden");
+      }
+      if (grant.toolId === "sandbox-file.write") {
+        if (current.actionCategory !== "waiting_upstream") {
+          return fail("confirmation_forbidden", "Side-effecting tool was not waiting for confirmation");
+        }
+        if (operation.confirmation === undefined || operation.confirmation.input.executionId !== current.id) {
+          return fail("confirmation_forbidden", "Tool confirmation was missing or mismatched");
+        }
+        const principalId = requireHumanSession(database, operation.confirmation.context, operation.now);
+        const confirmation = database.prepare(
+          `SELECT execution_id AS executionId, attempt_seq AS attemptSeq, tool_id AS toolId,
+                  parameter_sha256 AS parameterSha256, room_id AS roomId,
+                  human_principal_id AS principalId, session_family_id AS sessionFamilyId,
+                  expires_at AS expiresAt, consumed_at AS consumedAt
+           FROM tool_confirmations WHERE confirmation_id = ?`,
+        ).get(operation.confirmation.input.confirmationId);
+        if (confirmation === undefined) return fail("confirmation_forbidden", "Tool confirmation was not found");
+        if (confirmation.consumedAt !== null) return fail("confirmation_replayed", "Tool confirmation was already consumed");
+        if (typeof confirmation.expiresAt !== "string" || Date.parse(confirmation.expiresAt) <= operation.now) {
+          return fail("confirmation_expired", "Tool confirmation expired");
+        }
+        if (confirmation.executionId !== current.id || confirmation.attemptSeq !== current.currentAttemptSeq ||
+            confirmation.toolId !== grant.toolId || confirmation.parameterSha256 !== parameterSha256 ||
+            confirmation.roomId !== current.roomId || confirmation.principalId !== principalId ||
+            confirmation.sessionFamilyId !== operation.confirmation.context.sessionFamilyId) {
+          return fail("confirmation_forbidden", "Tool confirmation binding was forbidden");
+        }
+        const consumed = database.prepare(
+          `UPDATE tool_confirmations SET consumed_at = ?
+           WHERE confirmation_id = ? AND consumed_at IS NULL`,
+        ).run(occurredAt, operation.confirmation.input.confirmationId);
+        if (consumed.changes !== 1) return fail("confirmation_replayed", "Tool confirmation was already consumed");
+      } else if (operation.confirmation !== undefined) {
+        return fail("confirmation_forbidden", "Read-only tool did not accept confirmation");
+      }
+      const consumedGrant = database.prepare(
+        `UPDATE agent_execution_grants SET consumed_at = ?
+         WHERE grant_id = ? AND consumed_at IS NULL`,
+      ).run(occurredAt, operation.grantId);
+      if (consumedGrant.changes !== 1) return fail("execution_conflict", "Tool grant was already consumed");
+      database.prepare(
+        `INSERT INTO tool_dispatches (
+           dispatch_id, execution_id, attempt_seq, grant_id, tool_id,
+           parameter_sha256, state, dispatched_at
+         ) VALUES (?, ?, ?, ?, ?, ?, 'dispatched', ?)`,
+      ).run(operation.dispatchId, current.id, current.currentAttemptSeq, operation.grantId,
+        grant.toolId, parameterSha256, occurredAt);
+      database.prepare(
+        `UPDATE agent_executions
+         SET action_category = 'tool_call', tool_dispatch_phase = 'dispatched', updated_at = ?
+         WHERE id = ? AND current_attempt_seq = ? AND status = 'running'`,
+      ).run(occurredAt, current.id, current.currentAttemptSeq);
+      return {
+        kind: "claimed-tool",
+        dispatchId: operation.dispatchId,
+        toolId: grant.toolId as "http-json.read" | "repository.git-status" | "sandbox-file.write",
+        parameters: operation.parameters,
+      };
+    }
+
+    if (operation.type === "runtime.settle-tool") {
+      const dispatch = database.prepare(
+        `SELECT execution_id AS executionId, attempt_seq AS attemptSeq, state
+         FROM tool_dispatches WHERE dispatch_id = ?`,
+      ).get(operation.dispatchId);
+      if (dispatch?.state !== "dispatched" || typeof dispatch.executionId !== "string" ||
+          typeof dispatch.attemptSeq !== "number") {
+        return fail("execution_conflict", "Tool dispatch settlement was stale");
+      }
+      database.prepare(
+        `UPDATE tool_dispatches
+         SET state = ?, settled_at = ?, closed_summary_json = ?, sealed_compensation = ?
+         WHERE dispatch_id = ? AND state = 'dispatched'`,
+      ).run(operation.state, occurredAt, canonicalJson(operation.summary),
+        operation.sealedCompensation ?? null, operation.dispatchId);
+      database.prepare(
+        `UPDATE agent_executions SET tool_dispatch_phase = 'finished', updated_at = ?
+         WHERE id = ? AND current_attempt_seq = ? AND status = 'running'`,
+      ).run(occurredAt, dispatch.executionId, dispatch.attemptSeq);
+      return { kind: "settled-tool" };
+    }
+
+    if (operation.type === "runtime.checkpoint") {
+      const current = runtimeExecutionById(database, operation.executionId);
+      if (current.status !== "running" || current.currentAttemptSeq !== operation.attemptSeq) {
+        return fail("execution_conflict", "Checkpoint targeted a stale Agent attempt");
+      }
+      database.prepare(
+        `INSERT INTO agent_execution_steps (
+           execution_id, attempt_seq, step_seq, step_kind, input_sha256,
+           output_sha256, completed_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(execution_id, attempt_seq, step_seq) DO UPDATE SET
+           step_kind = excluded.step_kind,
+           input_sha256 = excluded.input_sha256,
+           output_sha256 = excluded.output_sha256,
+           completed_at = excluded.completed_at`,
+      ).run(current.id, current.currentAttemptSeq, operation.stepSeq, operation.kind,
+        operation.inputSha256, operation.outputSha256, occurredAt);
+      database.prepare(
+        `UPDATE agent_execution_attempts SET recovery_cursor = ?
+         WHERE execution_id = ? AND attempt_seq = ? AND recovery_cursor < ?`,
+      ).run(operation.stepSeq, current.id, current.currentAttemptSeq, operation.stepSeq);
+      database.prepare(
+        `UPDATE agent_executions SET recovery_cursor = ?, updated_at = ?
+         WHERE id = ? AND current_attempt_seq = ? AND recovery_cursor < ?`,
+      ).run(operation.stepSeq, occurredAt, current.id, current.currentAttemptSeq, operation.stepSeq);
+      return { kind: "checkpoint" };
+    }
+
+    const recoverable = database.prepare(
+      `SELECT id FROM agent_executions WHERE status IN ('queued', 'running') ORDER BY queued_at, id`,
+    ).all();
+    const records: { execution: AgentExecution; outcome: "enqueue" | "failed" | "fail_outcome_unknown" | "wait_confirmation" }[] = [];
+    for (const row of recoverable) {
+      if (typeof row.id !== "string") return fail("storage_unavailable", "Recovery execution was corrupt");
+      let current = runtimeExecutionById(database, row.id);
+      if (current.status === "running") {
+        if (current.providerId === undefined) {
+          database.prepare(
+            `UPDATE agent_execution_attempts
+             SET status = 'failed', finished_at = ?, error_code = 'side_effect_outcome_unknown'
+             WHERE execution_id = ? AND attempt_seq = ? AND status = 'running'`,
+          ).run(occurredAt, current.id, current.currentAttemptSeq);
+          database.prepare(
+            `UPDATE agent_executions
+             SET status = 'failed', completed_at = ?, updated_at = ?,
+                 terminal_error_code = 'side_effect_outcome_unknown', dead_lettered_at = ?
+             WHERE id = ? AND current_attempt_seq = ? AND status = 'running'`,
+          ).run(occurredAt, occurredAt, occurredAt, current.id, current.currentAttemptSeq);
+          current = runtimeExecutionById(database, current.id);
+          appendRuntimeExecutionEvent(database, current, occurredAt, "recovered", "side_effect_outcome_unknown");
+          records.push({ execution: current, outcome: "fail_outcome_unknown" });
+          continue;
+        }
+        if (current.actionCategory === "waiting_upstream") {
+          const confirmation = database.prepare(
+            `SELECT expires_at AS expiresAt FROM tool_confirmations
+             WHERE execution_id = ? AND attempt_seq = ? AND consumed_at IS NULL
+             ORDER BY expires_at DESC LIMIT 1`,
+          ).get(current.id, current.currentAttemptSeq);
+          if (typeof confirmation?.expiresAt === "string" && Date.parse(confirmation.expiresAt) > operation.now) {
+            records.push({ execution: current, outcome: "wait_confirmation" });
+            continue;
+          }
+          database.prepare(
+            `UPDATE agent_execution_attempts
+             SET status = 'failed', finished_at = ?, error_code = 'confirmation_expired'
+             WHERE execution_id = ? AND attempt_seq = ? AND status = 'running'`,
+          ).run(occurredAt, current.id, current.currentAttemptSeq);
+          database.prepare(
+            `UPDATE agent_executions
+             SET status = 'failed', completed_at = ?, updated_at = ?,
+                 terminal_error_code = 'confirmation_expired', dead_lettered_at = ?
+             WHERE id = ? AND current_attempt_seq = ? AND status = 'running'`,
+          ).run(occurredAt, occurredAt, occurredAt, current.id, current.currentAttemptSeq);
+          current = runtimeExecutionById(database, current.id);
+          appendRuntimeExecutionEvent(database, current, occurredAt, "recovered", "confirmation_expired");
+          records.push({ execution: current, outcome: "failed" });
+          continue;
+        }
+        const latestDispatch = database.prepare(
+          `SELECT tool_id AS toolId, state
+           FROM tool_dispatches
+           WHERE execution_id = ? AND attempt_seq = ?
+           ORDER BY rowid DESC LIMIT 1`,
+        ).get(current.id, current.currentAttemptSeq);
+        const sideEffectMayHaveOccurred = latestDispatch?.toolId === "sandbox-file.write" &&
+          (latestDispatch.state === "dispatched" ||
+           latestDispatch.state === "succeeded" ||
+           latestDispatch.state === "outcome_unknown");
+        if (current.actionCategory === "tool_call" &&
+            (current.toolDispatchPhase === "dispatched" || sideEffectMayHaveOccurred)) {
+          database.prepare(
+            `UPDATE tool_dispatches SET state = 'outcome_unknown', settled_at = ?
+             WHERE execution_id = ? AND attempt_seq = ? AND state IN ('dispatched', 'succeeded')`,
+          ).run(occurredAt, current.id, current.currentAttemptSeq);
+          database.prepare(
+            `UPDATE agent_execution_attempts SET status = 'failed', finished_at = ?, error_code = 'side_effect_outcome_unknown'
+             WHERE execution_id = ? AND attempt_seq = ?`,
+          ).run(occurredAt, current.id, current.currentAttemptSeq);
+          database.prepare(
+            `UPDATE agent_executions SET status = 'failed', completed_at = ?, updated_at = ?,
+                    terminal_error_code = 'side_effect_outcome_unknown', dead_lettered_at = ?
+             WHERE id = ?`,
+          ).run(occurredAt, occurredAt, occurredAt, current.id);
+          current = runtimeExecutionById(database, current.id);
+          appendRuntimeExecutionEvent(database, current, occurredAt, "recovered", "side_effect_outcome_unknown");
+          records.push({ execution: current, outcome: "fail_outcome_unknown" });
+          continue;
+        }
+        const nextAttempt = current.currentAttemptSeq + 1;
+        if (current.retryOrdinal >= 3) {
+          database.prepare(
+            `UPDATE agent_executions SET status = 'failed', completed_at = ?, updated_at = ?,
+                    terminal_error_code = 'runtime_restarted', dead_lettered_at = ? WHERE id = ?`,
+          ).run(occurredAt, occurredAt, occurredAt, current.id);
+          current = runtimeExecutionById(database, current.id);
+          appendRuntimeExecutionEvent(database, current, occurredAt, "recovered", "runtime_restarted");
+          records.push({ execution: current, outcome: "fail_outcome_unknown" });
+          continue;
+        }
+        database.prepare(
+          `UPDATE agent_execution_attempts SET status = 'failed', finished_at = ?, error_code = 'runtime_restarted'
+           WHERE execution_id = ? AND attempt_seq = ?`,
+        ).run(occurredAt, current.id, current.currentAttemptSeq);
+        database.prepare(
+          `UPDATE agent_executions SET status = 'queued', current_attempt_seq = ?, retry_ordinal = retry_ordinal + 1,
+                  updated_at = ?, next_retry_at = ? WHERE id = ?`,
+        ).run(nextAttempt, occurredAt, occurredAt, current.id);
+        database.prepare(
+          `INSERT INTO agent_execution_attempts (
+             execution_id, attempt_seq, retry_cycle, retry_ordinal, status, action_category, next_retry_at, recovery_cursor
+           ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)`,
+        ).run(current.id, nextAttempt, current.retryCycle, current.retryOrdinal + 1, current.actionCategory, occurredAt, current.recoveryCursor);
+        current = runtimeExecutionById(database, current.id);
+        appendRuntimeExecutionEvent(database, current, occurredAt, "recovered", "runtime_restarted");
+      }
+      records.push({ execution: current, outcome: current.actionCategory === "waiting_upstream" ? "wait_confirmation" : "enqueue" });
+    }
+    return { kind: "recovery", records };
+  });
 }
 
 export function executeAgentDatabaseCommand(

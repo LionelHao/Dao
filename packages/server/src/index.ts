@@ -109,6 +109,13 @@ export type {
   AuthRevokeFrame,
   AuthRevokedFrame,
   AuthSessionRevokedFrame,
+  AgentCompensateFrame,
+  AgentExecutionAckFrame,
+  AgentExecutionPreviewFrame,
+  AgentInterruptFrame,
+  AgentInvokeFrame,
+  AgentRetryFrame,
+  AgentToolConfirmFrame,
   ClientFrame,
   ClientFrameParseResult,
   MessageCreatedFrame,
@@ -175,6 +182,7 @@ export type WorkerDatabaseClient = Omit<
   InternalWorkerDatabaseClient,
   | "executeHuman"
   | "executeAgent"
+  | "executeRuntime"
   | "readActor"
   | "readRoom"
   | "listPendingOutbox"

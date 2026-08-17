@@ -30,6 +30,7 @@ import {
 } from "./service.js";
 import { MessageIdConflictError } from "./store.js";
 import type { SyncService } from "./sync-service.js";
+import type { AgentRuntime } from "./agent-runtime/contracts.js";
 import {
   parseClientFrame,
   type AuthenticatedFrame,
@@ -45,6 +46,13 @@ import {
 
 export interface MessageWebSocketServer {
   readonly url: string;
+  publishAgentPreview(preview: {
+    readonly roomId: string;
+    readonly executionId: string;
+    readonly attemptSeq: number;
+    readonly streamSeq: number;
+    readonly delta: string;
+  }): void;
   close(): Promise<void>;
 }
 
@@ -63,6 +71,7 @@ export interface StartMessageWebSocketServerOptions {
   readonly sync?: SyncService;
   readonly v2GateMaxEvents?: number;
   readonly v2GateMaxBytes?: number;
+  readonly agentRuntime?: AgentRuntime;
 }
 
 type RuntimeMessageWebSocketServerOptions = StartMessageWebSocketServerOptions & {
@@ -169,6 +178,22 @@ const MAPPED_SERVICE_ERROR_STATUSES = new Map<ProtocolErrorFrame["code"], Protoc
   ["snapshot_busy", 429],
   ["repair_barrier_active", 503],
   ["storage_unavailable", 503],
+  ["agent_configuration_missing", 503],
+  ["agent_queue_full", 429],
+  ["agent_runtime_closed", 503],
+  ["execution_conflict", 409],
+  ["execution_not_found", 404],
+  ["invalid_parameters", 400],
+  ["permission_denied", 403],
+  ["provider_authentication", 503],
+  ["provider_failure", 503],
+  ["provider_malformed", 503],
+  ["provider_rate_limited", 503],
+  ["provider_timeout", 503],
+  ["provider_unavailable", 503],
+  ["side_effect_outcome_unknown", 409],
+  ["tool_failure", 503],
+  ["tool_target_busy", 503],
 ]);
 
 const STORAGE_UNAVAILABLE_ERROR_CODES = new Set([
@@ -754,7 +779,12 @@ function isCorrelatedRecoveryResponse(
       | "message.send"
       | "room.history"
       | "room.subscribe"
-      | "room.subscribe.v2";
+      | "room.subscribe.v2"
+      | "agent.invoke"
+      | "agent.interrupt"
+      | "agent.retry"
+      | "agent.tool.confirm"
+      | "agent.compensate";
   }>,
   response: unknown,
 ): response is ServerFrame {
@@ -828,7 +858,12 @@ async function handleRecoveryFrame(
       | "message.send"
       | "room.history"
       | "room.subscribe"
-      | "room.subscribe.v2";
+      | "room.subscribe.v2"
+      | "agent.invoke"
+      | "agent.interrupt"
+      | "agent.retry"
+      | "agent.tool.confirm"
+      | "agent.compensate";
   }>,
   options: StartMessageWebSocketServerOptions,
   context: ConnectionContext,
@@ -1497,6 +1532,78 @@ async function handleFrame(
       }
       return;
     }
+    case "agent.invoke":
+    case "agent.interrupt":
+    case "agent.retry":
+    case "agent.tool.confirm":
+    case "agent.compensate": {
+      const session = await requireSession(socket, frame.requestId, options, context);
+      if (session === undefined) return;
+      if (options.agentRuntime === undefined) {
+        sendFrame(socket, errorFrame(503, "agent_runtime_closed", "agent_runtime_closed", frame.requestId));
+        return;
+      }
+      const commandContext = {
+        ...session,
+        kind: "human" as const,
+        requestId: frame.requestId,
+        idempotencyKey: frame.type === "agent.invoke"
+          ? `${frame.intent.sourceMessageId}:${frame.intent.targetAgentId}`
+          : frame.type === "agent.tool.confirm"
+            ? `${frame.type}:${frame.confirmation.confirmationId}`
+            : `${frame.type}:${frame.executionId}`,
+      };
+      try {
+        if (frame.type === "agent.invoke") {
+          const accepted = await options.agentRuntime.invoke(commandContext, frame.intent);
+          sendFrame(socket, {
+            type: "agent.execution.ack",
+            requestId: frame.requestId,
+            execution: accepted.execution,
+            replayed: accepted.replayed,
+          });
+        } else if (frame.type === "agent.interrupt") {
+          const execution = await options.agentRuntime.interrupt(
+            commandContext,
+            frame.executionId,
+            frame.reason,
+          );
+          sendFrame(socket, {
+            type: "agent.execution.ack",
+            requestId: frame.requestId,
+            execution,
+            replayed: false,
+          });
+        } else if (frame.type === "agent.retry") {
+          const accepted = await options.agentRuntime.retry(commandContext, frame.executionId);
+          sendFrame(socket, {
+            type: "agent.execution.ack",
+            requestId: frame.requestId,
+            execution: accepted.execution,
+            replayed: accepted.replayed,
+          });
+        } else if (frame.type === "agent.tool.confirm") {
+          const execution = await options.agentRuntime.confirmTool(commandContext, frame.confirmation);
+          sendFrame(socket, {
+            type: "agent.execution.ack",
+            requestId: frame.requestId,
+            execution,
+            replayed: false,
+          });
+        } else {
+          const accepted = await options.agentRuntime.compensate(commandContext, frame.executionId);
+          sendFrame(socket, {
+            type: "agent.execution.ack",
+            requestId: frame.requestId,
+            execution: accepted.execution,
+            replayed: accepted.replayed,
+          });
+        }
+      } catch (error: unknown) {
+        sendFrame(socket, mappedError(error, frame.requestId));
+      }
+      return;
+    }
     case "room.history": {
       const principal = await requirePrincipal(socket, frame.requestId, options, context);
       if (principal === undefined) {
@@ -1859,6 +1966,23 @@ export async function startMessageWebSocketServer(
 
   return {
     url: `ws://${host}:${address.port}`,
+    publishAgentPreview(preview): void {
+      for (const { socket, context } of liveConnections.values()) {
+        if (
+          context.closed ||
+          context.session === undefined ||
+          (!context.unsubscribersByRoom.has(preview.roomId) &&
+            !context.v2GatesByRoom.has(preview.roomId))
+        ) {
+          continue;
+        }
+        sendFrame(socket, {
+          type: "agent.execution.preview",
+          ...preview,
+          authoritative: false,
+        });
+      }
+    },
     close(): Promise<void> {
       closePromise ??= (async () => {
         // Calling close first synchronously fences future dispatcher scheduling.

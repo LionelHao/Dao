@@ -5,6 +5,10 @@ import type {
   HumanRoomMembership,
   MessageDraft,
 } from "./index.js";
+import type {
+  AgentRuntimeProviderInput,
+  RouterProviderInput,
+} from "./collaboration.js";
 
 const invalidHumanMembership: HumanRoomMembership = {
   kind: "human",
@@ -104,6 +108,14 @@ const agentConfigurationWithInviteeActorId = {
 const invalidAgentConfigurationInviteeActorId: AgentConfigurationRequest =
   agentConfigurationWithInviteeActorId;
 
+declare const runtimeProviderInput: AgentRuntimeProviderInput;
+declare const routerProviderInput: RouterProviderInput;
+
+// @ts-expect-error Router input cannot receive the full runtime conversation/tool context.
+const invalidRouterInput: RouterProviderInput = runtimeProviderInput;
+// @ts-expect-error Runtime input cannot receive the closed routing-summary contract.
+const invalidRuntimeInput: AgentRuntimeProviderInput = routerProviderInput;
+
 void invalidHumanMembership;
 void invalidHumanConfiguredAt;
 void invalidAgentMembership;
@@ -113,3 +125,5 @@ void invalidHumanInvitationAgentId;
 void invalidHumanInvitationParticipation;
 void invalidHumanInvitationToolPermissions;
 void invalidAgentConfigurationInviteeActorId;
+void invalidRouterInput;
+void invalidRuntimeInput;

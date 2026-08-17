@@ -30,6 +30,21 @@
   font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
 }
 
+.agent-execution-preview {
+  border: 1px dashed #64748b;
+  border-radius: 0.5rem;
+  color: #475569;
+  padding: 0.625rem 0.75rem;
+  white-space: pre-wrap;
+}
+
+.agent-tool-confirmation {
+  padding: 0.75rem;
+  border: 1px solid var(--semantic-warning);
+  border-radius: 0.5rem;
+  background: var(--panel);
+}
+
 .m2-primitives-preview {
   display: grid;
   width: min(56rem, calc(100vw - 2rem));

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
-export const AUTHORITY_SCHEMA_VERSION = 5 as const;
+export const AUTHORITY_SCHEMA_VERSION = 6 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -25,12 +25,15 @@ const V4_MIGRATION_CHECKSUM =
   "28a42b0ccfdc0d5c2eb111bc783cdd30c2678eb162cf9d77dcc2b6b3823f169c";
 const V5_MIGRATION_CHECKSUM =
   "3f90cdeb9b7c9e04f432aac809f340033f6d9a2ea1a6a5bd8d9ab50fab8d891d";
+const V6_MIGRATION_CHECKSUM =
+  "87b3d62db40e9e7f8fa3e643315a62c26f01968d4065fb743fa502a7251d9257";
 const SCHEMA_FINGERPRINTS = {
   1: "03f2bbba4aa7082ec01819824726ce1bd9b4bd14cebea71afc93c6821dbf405c",
   2: "01c37d92ec2f303613a7bb8b592ca846fbea7c829b3c81fe4521699db949dfcc",
   3: "8653114fb3c00fcbddc386c16693d98ce6f226695f1941ac73dc341aa5fc7a61",
   4: "b2d08fa3332bf0dc7fd4f0594210550089ed867a51b5da63be0e89830743d3ac",
   5: "b804592978b0afde52b64574534f355eaaf12db2d3401f0ebdf3d09373ca40a0",
+  6: "0e5c764a0fae33f00eae7bfd2e21dbbc4d54781d43ef5aa967c6dfeef8c58035",
 } as const;
 
 const V1_STATEMENTS = [
@@ -223,6 +226,184 @@ const V5_STATEMENTS = [
    ON calibration_signals(room_id, id)`,
   `CREATE INDEX room_memberships_catalog_actor_kind_room
    ON room_memberships(actor_id, kind, room_id)`,
+] as const;
+
+const V6_STATEMENTS = [
+  `ALTER TABLE agent_executions
+   ADD COLUMN action_category TEXT NOT NULL DEFAULT 'tool_call'
+   CHECK (action_category IN ('model_generation', 'tool_call', 'waiting_upstream'))`,
+  `ALTER TABLE agent_executions
+   ADD COLUMN tool_dispatch_phase TEXT
+   CHECK (tool_dispatch_phase IS NULL OR tool_dispatch_phase IN ('not_started', 'dispatched', 'finished'))`,
+  `ALTER TABLE agent_executions
+   ADD COLUMN current_attempt_seq INTEGER NOT NULL DEFAULT 1
+   CHECK (current_attempt_seq >= 1)`,
+  `ALTER TABLE agent_executions
+   ADD COLUMN retry_cycle INTEGER NOT NULL DEFAULT 1
+   CHECK (retry_cycle >= 1)`,
+  `ALTER TABLE agent_executions
+   ADD COLUMN retry_ordinal INTEGER NOT NULL DEFAULT 1
+   CHECK (retry_ordinal BETWEEN 1 AND 3)`,
+  `ALTER TABLE agent_executions ADD COLUMN provider_id TEXT`,
+  `ALTER TABLE agent_executions ADD COLUMN model_id TEXT`,
+  `ALTER TABLE agent_executions
+   ADD COLUMN recovery_cursor INTEGER NOT NULL DEFAULT 0
+   CHECK (recovery_cursor >= 0)`,
+  `ALTER TABLE agent_executions ADD COLUMN queued_at TEXT`,
+  `ALTER TABLE agent_executions ADD COLUMN updated_at TEXT`,
+  `ALTER TABLE agent_executions ADD COLUMN cancellation_reason TEXT`,
+  `ALTER TABLE agent_executions ADD COLUMN terminal_error_code TEXT`,
+  `ALTER TABLE agent_executions ADD COLUMN dead_lettered_at TEXT`,
+  `ALTER TABLE agent_executions ADD COLUMN result_message_id TEXT REFERENCES messages(id)`,
+  `ALTER TABLE agent_executions ADD COLUMN next_retry_at TEXT`,
+  `ALTER TABLE agent_executions ADD COLUMN manual_retry_of_execution_id TEXT REFERENCES agent_executions(id)`,
+  `ALTER TABLE agent_executions ADD COLUMN compensates_execution_id TEXT REFERENCES agent_executions(id)`,
+  `UPDATE agent_executions
+   SET status = CASE status WHEN 'interrupted' THEN 'cancelled' ELSE status END,
+       tool_dispatch_phase = CASE WHEN status = 'running' THEN 'dispatched' ELSE 'finished' END,
+       queued_at = started_at,
+       updated_at = COALESCE(completed_at, started_at),
+       cancellation_reason = CASE WHEN status = 'interrupted' THEN 'legacy_interrupted' ELSE NULL END,
+       terminal_error_code = CASE WHEN status = 'failed' THEN 'legacy_failure' ELSE NULL END`,
+  `CREATE TABLE agent_invocation_intents (
+    id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    source_message_id TEXT NOT NULL REFERENCES messages(id),
+    target_agent_id TEXT NOT NULL REFERENCES actors(id),
+    requester_actor_id TEXT NOT NULL REFERENCES actors(id),
+    intent_kind TEXT NOT NULL CHECK (intent_kind IN ('direct_mention', 'structured_help', 'routed_candidate')),
+    execution_id TEXT NOT NULL UNIQUE REFERENCES agent_executions(id),
+    created_at TEXT NOT NULL,
+    UNIQUE (source_message_id, target_agent_id)
+  ) STRICT`,
+  `CREATE TABLE agent_execution_attempts (
+    execution_id TEXT NOT NULL REFERENCES agent_executions(id),
+    attempt_seq INTEGER NOT NULL CHECK (attempt_seq >= 1),
+    retry_cycle INTEGER NOT NULL CHECK (retry_cycle >= 1),
+    retry_ordinal INTEGER NOT NULL CHECK (retry_ordinal BETWEEN 1 AND 3),
+    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed', 'cancelled')),
+    action_category TEXT NOT NULL CHECK (action_category IN ('model_generation', 'tool_call', 'waiting_upstream')),
+    started_at TEXT,
+    finished_at TEXT,
+    error_code TEXT,
+    next_retry_at TEXT,
+    recovery_cursor INTEGER NOT NULL DEFAULT 0 CHECK (recovery_cursor >= 0),
+    PRIMARY KEY (execution_id, attempt_seq)
+  ) STRICT`,
+  `INSERT INTO agent_execution_attempts (
+     execution_id, attempt_seq, retry_cycle, retry_ordinal, status,
+     action_category, started_at, finished_at, error_code, next_retry_at,
+     recovery_cursor
+   )
+   SELECT id, 1, 1, 1, status, 'tool_call', started_at, completed_at,
+          CASE WHEN status = 'failed' THEN 'legacy_failure' ELSE NULL END,
+          NULL, 0
+   FROM agent_executions`,
+  `CREATE TABLE agent_execution_steps (
+    execution_id TEXT NOT NULL,
+    attempt_seq INTEGER NOT NULL,
+    step_seq INTEGER NOT NULL CHECK (step_seq >= 1),
+    step_kind TEXT NOT NULL CHECK (step_kind IN ('model', 'tool')),
+    tool_call_json TEXT CHECK (tool_call_json IS NULL OR json_valid(tool_call_json)),
+    bounded_tool_result_json TEXT CHECK (bounded_tool_result_json IS NULL OR json_valid(bounded_tool_result_json)),
+    input_sha256 TEXT NOT NULL CHECK (length(input_sha256) = 64),
+    output_sha256 TEXT NOT NULL CHECK (length(output_sha256) = 64),
+    completed_at TEXT NOT NULL,
+    PRIMARY KEY (execution_id, attempt_seq, step_seq),
+    FOREIGN KEY (execution_id, attempt_seq)
+      REFERENCES agent_execution_attempts(execution_id, attempt_seq)
+  ) STRICT`,
+  `CREATE TABLE agent_execution_grants (
+    grant_id TEXT PRIMARY KEY,
+    execution_id TEXT NOT NULL,
+    attempt_seq INTEGER NOT NULL,
+    agent_id TEXT NOT NULL REFERENCES actors(id),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    tool_id TEXT NOT NULL CHECK (tool_id IN ('http-json.read', 'repository.git-status', 'sandbox-file.write')),
+    parameter_sha256 TEXT NOT NULL CHECK (length(parameter_sha256) = 64),
+    issued_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    consumed_at TEXT,
+    FOREIGN KEY (execution_id, attempt_seq)
+      REFERENCES agent_execution_attempts(execution_id, attempt_seq)
+  ) STRICT`,
+  `CREATE TABLE tool_confirmations (
+    confirmation_id TEXT PRIMARY KEY,
+    execution_id TEXT NOT NULL,
+    attempt_seq INTEGER NOT NULL,
+    tool_id TEXT NOT NULL CHECK (tool_id IN ('sandbox-file.write')),
+    parameter_sha256 TEXT NOT NULL CHECK (length(parameter_sha256) = 64),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    human_principal_id TEXT NOT NULL REFERENCES actors(id),
+    session_family_id TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    target TEXT NOT NULL,
+    impact TEXT NOT NULL,
+    reversibility TEXT NOT NULL CHECK (reversibility IN ('compensatable', 'irreversible')),
+    consumed_at TEXT,
+    FOREIGN KEY (execution_id, attempt_seq)
+      REFERENCES agent_execution_attempts(execution_id, attempt_seq)
+  ) STRICT`,
+  `CREATE TABLE tool_dispatches (
+    dispatch_id TEXT PRIMARY KEY,
+    execution_id TEXT NOT NULL,
+    attempt_seq INTEGER NOT NULL,
+    grant_id TEXT NOT NULL UNIQUE REFERENCES agent_execution_grants(grant_id),
+    tool_id TEXT NOT NULL CHECK (tool_id IN ('http-json.read', 'repository.git-status', 'sandbox-file.write')),
+    parameter_sha256 TEXT NOT NULL CHECK (length(parameter_sha256) = 64),
+    state TEXT NOT NULL CHECK (state IN ('dispatched', 'succeeded', 'failed', 'outcome_unknown')),
+    dispatched_at TEXT NOT NULL,
+    settled_at TEXT,
+    closed_summary_json TEXT CHECK (closed_summary_json IS NULL OR json_valid(closed_summary_json)),
+    sealed_compensation TEXT,
+    FOREIGN KEY (execution_id, attempt_seq)
+      REFERENCES agent_execution_attempts(execution_id, attempt_seq)
+  ) STRICT`,
+  `CREATE TABLE agent_human_fences (
+    fence_message_id TEXT NOT NULL REFERENCES messages(id),
+    execution_id TEXT NOT NULL REFERENCES agent_executions(id),
+    old_attempt_seq INTEGER NOT NULL CHECK (old_attempt_seq >= 1),
+    cancelled_at TEXT NOT NULL,
+    PRIMARY KEY (fence_message_id, execution_id, old_attempt_seq)
+  ) STRICT`,
+  `CREATE TABLE agent_fence_replacements (
+    fence_message_id TEXT NOT NULL,
+    old_execution_id TEXT NOT NULL,
+    old_attempt_seq INTEGER NOT NULL CHECK (old_attempt_seq >= 1),
+    route_job_id TEXT NOT NULL,
+    selected_agent_id TEXT NOT NULL REFERENCES actors(id),
+    replacement_execution_id TEXT NOT NULL UNIQUE REFERENCES agent_executions(id),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (fence_message_id, old_execution_id),
+    FOREIGN KEY (fence_message_id, old_execution_id, old_attempt_seq)
+      REFERENCES agent_human_fences(fence_message_id, execution_id, old_attempt_seq)
+  ) STRICT`,
+  `CREATE INDEX agent_executions_room_queue_v6
+   ON agent_executions(room_id, status, queued_at, id)`,
+  `CREATE INDEX agent_execution_attempts_retry_v6
+   ON agent_execution_attempts(status, next_retry_at, execution_id, attempt_seq)`,
+  `CREATE TRIGGER agent_executions_v6_validate_insert
+   BEFORE INSERT ON agent_executions
+   WHEN NEW.status NOT IN ('queued', 'running', 'completed', 'failed', 'cancelled')
+      OR NEW.queued_at IS NULL OR NEW.updated_at IS NULL
+      OR (NEW.action_category = 'tool_call' AND NEW.tool_dispatch_phase IS NULL)
+      OR (NEW.action_category <> 'tool_call' AND NEW.tool_dispatch_phase IS NOT NULL)
+      OR (NEW.status = 'cancelled' AND NEW.cancellation_reason IS NULL)
+      OR (NEW.status = 'failed' AND NEW.terminal_error_code IS NULL)
+   BEGIN
+     SELECT RAISE(ABORT, 'canonical Agent execution is invalid');
+   END`,
+  `CREATE TRIGGER agent_executions_v6_validate_update
+   BEFORE UPDATE ON agent_executions
+   WHEN NEW.status NOT IN ('queued', 'running', 'completed', 'failed', 'cancelled')
+      OR NEW.queued_at IS NULL OR NEW.updated_at IS NULL
+      OR (NEW.action_category = 'tool_call' AND NEW.tool_dispatch_phase IS NULL)
+      OR (NEW.action_category <> 'tool_call' AND NEW.tool_dispatch_phase IS NOT NULL)
+      OR (NEW.status = 'cancelled' AND NEW.cancellation_reason IS NULL)
+      OR (NEW.status = 'failed' AND NEW.terminal_error_code IS NULL)
+   BEGIN
+     SELECT RAISE(ABORT, 'canonical Agent execution is invalid');
+   END`,
 ] as const;
 
 const V2_STATEMENTS = [
@@ -606,6 +787,7 @@ const MIGRATIONS = [
     V5_STATEMENTS,
     V5_MIGRATION_CHECKSUM,
   ),
+  defineMigration(6, "agent-runtime-authority", V6_STATEMENTS, V6_MIGRATION_CHECKSUM),
 ] as const satisfies readonly Migration[];
 
 const V1_SCHEMA_CONTRACT = {
@@ -777,12 +959,71 @@ const V4_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V6_SCHEMA_CONTRACT = {
+  ...V4_SCHEMA_CONTRACT,
+  agent_executions: [
+    ...V4_SCHEMA_CONTRACT.agent_executions,
+    "action_category",
+    "tool_dispatch_phase",
+    "current_attempt_seq",
+    "retry_cycle",
+    "retry_ordinal",
+    "provider_id",
+    "model_id",
+    "recovery_cursor",
+    "queued_at",
+    "updated_at",
+    "cancellation_reason",
+    "terminal_error_code",
+    "dead_lettered_at",
+    "result_message_id",
+    "next_retry_at",
+    "manual_retry_of_execution_id",
+    "compensates_execution_id",
+  ],
+  agent_execution_attempts: [
+    "execution_id", "attempt_seq", "retry_cycle", "retry_ordinal", "status",
+    "action_category", "started_at", "finished_at", "error_code", "next_retry_at",
+    "recovery_cursor",
+  ],
+  agent_execution_grants: [
+    "grant_id", "execution_id", "attempt_seq", "agent_id", "room_id", "tool_id",
+    "parameter_sha256", "issued_at", "expires_at", "consumed_at",
+  ],
+  agent_execution_steps: [
+    "execution_id", "attempt_seq", "step_seq", "step_kind", "tool_call_json",
+    "bounded_tool_result_json", "input_sha256", "output_sha256", "completed_at",
+  ],
+  agent_fence_replacements: [
+    "fence_message_id", "old_execution_id", "old_attempt_seq", "route_job_id", "selected_agent_id",
+    "replacement_execution_id", "created_at",
+  ],
+  agent_human_fences: [
+    "fence_message_id", "execution_id", "old_attempt_seq", "cancelled_at",
+  ],
+  agent_invocation_intents: [
+    "id", "room_id", "source_message_id", "target_agent_id", "requester_actor_id",
+    "intent_kind", "execution_id", "created_at",
+  ],
+  tool_confirmations: [
+    "confirmation_id", "execution_id", "attempt_seq", "tool_id", "parameter_sha256",
+    "room_id", "human_principal_id", "session_family_id", "expires_at", "target",
+    "impact", "reversibility", "consumed_at",
+  ],
+  tool_dispatches: [
+    "dispatch_id", "execution_id", "attempt_seq", "grant_id", "tool_id",
+    "parameter_sha256", "state", "dispatched_at", "settled_at", "closed_summary_json",
+    "sealed_compensation",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
   3: V3_SCHEMA_CONTRACT,
   4: V4_SCHEMA_CONTRACT,
   5: V4_SCHEMA_CONTRACT,
+  6: V6_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -1293,6 +1534,12 @@ export function migrateAuthorityDatabaseToPreviousVersionForTest(
   database: DatabaseSync,
 ): void {
   migrateAuthorityDatabaseToVersion(database, AUTHORITY_SCHEMA_VERSION - 1);
+}
+
+export function migrateAuthorityDatabaseToVersion4ForTest(
+  database: DatabaseSync,
+): void {
+  migrateAuthorityDatabaseToVersion(database, 4);
 }
 
 export function migrateAuthorityDatabaseToVersion3ForTest(

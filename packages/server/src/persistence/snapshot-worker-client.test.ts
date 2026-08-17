@@ -162,9 +162,11 @@ function seedClosedMixedStressRecords(
   database.prepare(
     `INSERT INTO agent_executions (
        id, room_id, agent_id, trigger_message_id, status, started_at,
-       completed_at, result_json, requester_actor_id, tool_name
+       completed_at, result_json, requester_actor_id, tool_name,
+       action_category, tool_dispatch_phase, queued_at, updated_at
      ) VALUES ('stress-execution', ?, 'stress-agent', 'message-0000', 'completed',
-       '2026-08-11T01:00:03.000Z', '2026-08-11T01:00:04.000Z', '"ok"', ?, 'review')`,
+       '2026-08-11T01:00:03.000Z', '2026-08-11T01:00:04.000Z', '"ok"', ?, 'review',
+       'tool_call', 'finished', '2026-08-11T01:00:03.000Z', '2026-08-11T01:00:04.000Z')`,
   ).run(roomId, context.principal.actorId);
   database.prepare(
     `INSERT INTO calibration_signals (
@@ -437,9 +439,11 @@ describe("durable materialized snapshot worker", () => {
     database.prepare(
       `INSERT INTO agent_executions (
          id, room_id, agent_id, trigger_message_id, status, started_at,
-         completed_at, result_json, requester_actor_id, tool_name
+         completed_at, result_json, requester_actor_id, tool_name,
+         action_category, tool_dispatch_phase, queued_at, updated_at
        ) VALUES ('execution-a', 'room-mixed', 'agent-a', 'message-human', 'completed',
-         '2026-08-11T00:00:07.000Z', '2026-08-11T00:00:08.000Z', '"ok"', ?, 'tool')`,
+         '2026-08-11T00:00:07.000Z', '2026-08-11T00:00:08.000Z', '"ok"', ?, 'tool',
+         'tool_call', 'finished', '2026-08-11T00:00:07.000Z', '2026-08-11T00:00:08.000Z')`,
     ).run(context.principal.actorId);
     database.prepare(
       `INSERT INTO calibration_signals (

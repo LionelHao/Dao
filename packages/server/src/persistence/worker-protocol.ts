@@ -25,6 +25,10 @@ import {
   parsePersistentCommand,
   parseRoomSyncRequest,
 } from "./contracts.js";
+import {
+  isRuntimeAuthorityOperation,
+  type RuntimeAuthorityOperation,
+} from "../agent-runtime/runtime-authority-protocol.js";
 import type {
   AgentCollaborationCommand,
   AgentWorkerCommandContext,
@@ -35,6 +39,7 @@ import type {
   HashedSessionRotation,
   HumanCollaborationCommand,
   IssuedSessionRecord,
+  JsonValue,
   OutboxDelivery,
   OutboxDispatchCandidate,
   RoomGovernanceCommand,
@@ -46,17 +51,23 @@ import type {
 export type AuthorityWorkerErrorCode =
   | "actor_conflict"
   | "agent_missing_permission"
+  | "agent_queue_full"
   | "agent_permissions_invalid"
   | "agent_required"
   | "authority_already_initialized"
   | "authority_not_initialized"
   | "authority_worker_closed"
   | "calibration_source_invalid"
+  | "confirmation_expired"
+  | "confirmation_forbidden"
+  | "confirmation_replayed"
   | "execution_conflict"
+  | "execution_not_found"
   | "execution_not_running"
   | "idempotency_conflict"
   | "identity_forbidden"
   | "invalid_request"
+  | "invalid_parameters"
   | "invalid_token"
   | "invitation_consumed"
   | "invitation_forbidden"
@@ -69,6 +80,7 @@ export type AuthorityWorkerErrorCode =
   | "member_not_found"
   | "message_not_found"
   | "open_item_not_found"
+  | "permission_denied"
   | "room_archived"
   | "room_compaction_blocked"
   | "room_forbidden"
@@ -93,17 +105,23 @@ export function isAuthorityWorkerErrorCode(
   switch (value) {
     case "actor_conflict":
     case "agent_missing_permission":
+    case "agent_queue_full":
     case "agent_permissions_invalid":
     case "agent_required":
     case "authority_already_initialized":
     case "authority_not_initialized":
     case "authority_worker_closed":
     case "calibration_source_invalid":
+    case "confirmation_expired":
+    case "confirmation_forbidden":
+    case "confirmation_replayed":
     case "execution_conflict":
+    case "execution_not_found":
     case "execution_not_running":
     case "idempotency_conflict":
     case "identity_forbidden":
     case "invalid_request":
+    case "invalid_parameters":
     case "invalid_token":
     case "invitation_consumed":
     case "invitation_forbidden":
@@ -116,6 +134,7 @@ export function isAuthorityWorkerErrorCode(
     case "member_not_found":
     case "message_not_found":
     case "open_item_not_found":
+    case "permission_denied":
     case "room_archived":
     case "room_compaction_blocked":
     case "room_forbidden":
@@ -311,18 +330,23 @@ export type AuthorityWorkerRequest =
       readonly roomId: string;
       readonly retainedFromSeq: number;
     }
+  | {
+      readonly type: "authority.runtime";
+      readonly requestId: string;
+      readonly operation: RuntimeAuthorityOperation;
+    }
   | { readonly type: "authority.close"; readonly requestId: string };
 
 export type AuthorityWorkerResponse =
   | {
       readonly type: "authority.ready";
       readonly requestId: string;
-      readonly schemaVersion: 5;
+      readonly schemaVersion: 6;
     }
   | {
       readonly type: "authority.schema";
       readonly requestId: string;
-      readonly schemaVersion: 5;
+      readonly schemaVersion: 6;
     }
   | {
       readonly type: "authority.legacy-imported";
@@ -422,6 +446,11 @@ export type AuthorityWorkerResponse =
       readonly roomId: string;
       readonly retainedFromSeq: number;
       readonly headSeq: number;
+    }
+  | {
+      readonly type: "authority.runtime-result";
+      readonly requestId: string;
+      readonly result: JsonValue;
     }
   | { readonly type: "authority.closed"; readonly requestId: string }
   | {
@@ -933,6 +962,9 @@ export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWork
       return hasExactKeys(value, ["type", "requestId", "roomId", "retainedFromSeq"]) &&
         isText(value.roomId) && isNonNegativeSafeInteger(value.retainedFromSeq) &&
         value.retainedFromSeq >= 1;
+    case "authority.runtime":
+      return hasExactKeys(value, ["type", "requestId", "operation"]) &&
+        isRuntimeAuthorityOperation(value.operation);
     default:
       return false;
   }
@@ -950,7 +982,7 @@ export function isAuthorityWorkerResponse(
     case "authority.schema":
       return (
         hasExactKeys(value, ["type", "requestId", "schemaVersion"]) &&
-        value.schemaVersion === 5
+        value.schemaVersion === 6
       );
     case "authority.closed":
       return hasExactKeys(value, ["type", "requestId"]);
@@ -1031,6 +1063,9 @@ export function isAuthorityWorkerResponse(
         isNonNegativeSafeInteger(value.retainedFromSeq) && value.retainedFromSeq >= 1 &&
         isNonNegativeSafeInteger(value.headSeq) &&
         value.retainedFromSeq <= value.headSeq + 1;
+    case "authority.runtime-result":
+      return hasExactKeys(value, ["type", "requestId", "result"]) &&
+        isJsonValue(value.result);
     case "authority.legacy-imported":
       return (
         hasExactKeys(value, [

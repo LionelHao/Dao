@@ -350,4 +350,39 @@ describe("closed v2 recovery protocol", () => {
         frame: { type: "room.subscribe", requestId: "subscribe", roomId: "room-1" },
       });
   });
+
+  it("accepts only closed T-0041 Agent runtime control frames", () => {
+    expect(parse({
+      type: "agent.invoke",
+      requestId: "invoke-1",
+      intent: {
+        kind: "direct_mention",
+        roomId: "room-1",
+        sourceMessageId: "message-1",
+        targetAgentId: "agent-1",
+      },
+    })).toMatchObject({ ok: true, frame: { type: "agent.invoke" } });
+    expect(parse({
+      type: "agent.interrupt",
+      requestId: "interrupt-1",
+      executionId: "execution-1",
+      reason: "human_cancelled",
+    })).toMatchObject({ ok: true, frame: { type: "agent.interrupt" } });
+    expect(parse({
+      type: "agent.tool.confirm",
+      requestId: "confirm-1",
+      confirmation: { confirmationId: "confirmation-1", executionId: "execution-1" },
+    })).toMatchObject({ ok: true, frame: { type: "agent.tool.confirm" } });
+    expect(parse({
+      type: "agent.invoke",
+      requestId: "invoke-forged",
+      intent: {
+        kind: "direct_mention",
+        roomId: "room-1",
+        sourceMessageId: "message-1",
+        targetAgentId: "agent-1",
+        requesterId: "forged-human",
+      },
+    })).toMatchObject({ ok: false, error: { code: "invalid_request" } });
+  });
 });

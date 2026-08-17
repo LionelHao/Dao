@@ -26,6 +26,7 @@ import {
   appendCanonicalIdentityEvent,
   executeAgentDatabaseCommand,
   executeHumanDatabaseCommand,
+  executeRuntimeAuthorityOperation,
   authorizeOutboxCandidateDatabaseQuery,
   canAccessRoomDatabaseQuery,
   compactRoomStreamDatabaseCommand,
@@ -42,6 +43,7 @@ import {
   syncRoomDatabaseQuery,
   inspectStreamingRepairScopeDatabaseQuery,
 } from "./authority-database-handler.js";
+import { runtimeResultAsJson } from "../agent-runtime/runtime-authority-protocol.js";
 import {
   FallbackRepairCoordinator,
   FallbackRepairError,
@@ -1230,6 +1232,30 @@ function executeAgent(request: AuthorityWorkerRequest): void {
   }
 }
 
+function executeRuntime(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.runtime") {
+    throw new TypeError("executeRuntime received the wrong request type");
+  }
+  try {
+    const result = executeRuntimeAuthorityOperation(
+      requireAuthorityTransactionDatabase(),
+      request.operation,
+    );
+    respond({
+      type: "authority.runtime-result",
+      requestId: request.requestId,
+      result: runtimeResultAsJson(result),
+    });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithError(request.requestId, "storage_unavailable", "Authority runtime operation failed");
+  }
+}
+
 function readHistory(request: AuthorityWorkerRequest): void {
   if (request.type !== "authority.read-history") {
     throw new TypeError("readHistory received the wrong request type");
@@ -1568,6 +1594,9 @@ async function dispatch(value: unknown): Promise<void> {
       return;
     case "authority.execute-agent":
       executeAgent(value);
+      return;
+    case "authority.runtime":
+      executeRuntime(value);
       return;
     case "authority.read-history":
       readHistory(value);

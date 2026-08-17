@@ -908,7 +908,7 @@ describe("authoritative server real-process harness", () => {
         type: "close-cleanup-probed",
         samePromise: true,
         aggregate: true,
-        closeCounts: { transport: 1, snapshots: 1, worker: 1 },
+        closeCounts: { transport: 1, runtime: 1, snapshots: 1, worker: 1 },
       });
     } finally {
       await rm(directory, { recursive: true, force: true });
@@ -1440,7 +1440,11 @@ describe("authoritative server real-process harness", () => {
         expect(cache.factCount(roomId)).toBe(mixed.total);
         expect(cache.roomChecksum(roomId)).toBe(authorityChecksum);
         expect(cache.independentRoomChecksum(roomId)).toBe(authorityChecksum);
-        expect(cache.roomCursor(roomId)?.afterSeq).toBe(mixed.watermark);
+        // T-0041 recovery emits one canonical execution transition and one closed
+        // recovery lifecycle event for every legacy running execution.
+        expect(cache.roomCursor(roomId)?.afterSeq).toBe(
+          mixed.watermark + Math.max(0, (mixed.mixedCounts["agent-execution"] ?? 0) - 1) * 2,
+        );
       }
       expect(cacheB.roomValues(roomId)).toEqual(cacheA.roomValues(roomId));
       expect(cacheC.roomValues(roomId)).toEqual(cacheA.roomValues(roomId));

@@ -641,7 +641,7 @@ function isCollaborationCommand(value: UnknownRecord): boolean {
   if (value.type === "agent.execution.transition") {
     return exact(payload, ["executionId", "sourceMessageId", "toolName", "status"], ["result"]) &&
       text(payload.executionId) && text(payload.sourceMessageId) && text(payload.toolName) &&
-      (payload.status === "running" || payload.status === "completed" || payload.status === "interrupted" || payload.status === "failed") &&
+      (payload.status === "running" || payload.status === "completed" || payload.status === "cancelled" || payload.status === "failed") &&
       (payload.result === undefined || text(payload.result));
   }
   return value.type === "calibration.record" &&
@@ -761,6 +761,22 @@ function validRoomEventPayload(
   }
   if (type === "room.agent_execution.changed") {
     return isAgentExecution(payload) && payload.roomId === roomId && payload.agentId === eventActorId;
+  }
+  if (
+    type === "agent.execution.queued" || type === "agent.execution.started" ||
+    type === "agent.execution.retry-scheduled" || type === "agent.execution.completed" ||
+    type === "agent.execution.failed" || type === "agent.execution.cancelled" ||
+    type === "agent.execution.dead-lettered" || type === "agent.execution.recovered"
+  ) {
+    return exact(payload, [
+      "executionId", "attemptSeq", "retryCycle", "retryOrdinal", "actionCategory", "status",
+    ], ["errorCode", "nextRetryAt"]) && text(payload.executionId) && count(payload.attemptSeq) &&
+      payload.attemptSeq >= 1 && count(payload.retryCycle) && payload.retryCycle >= 1 &&
+      (payload.retryOrdinal === 1 || payload.retryOrdinal === 2 || payload.retryOrdinal === 3) &&
+      (payload.actionCategory === "model_generation" || payload.actionCategory === "tool_call" || payload.actionCategory === "waiting_upstream") &&
+      (payload.status === "queued" || payload.status === "running" || payload.status === "completed" || payload.status === "failed" || payload.status === "cancelled") &&
+      (!Object.hasOwn(payload, "errorCode") || text(payload.errorCode)) &&
+      (!Object.hasOwn(payload, "nextRetryAt") || text(payload.nextRetryAt));
   }
   return type === "room.calibration.recorded" && isCalibrationSignal(payload) && payload.actorId === eventActorId;
 }

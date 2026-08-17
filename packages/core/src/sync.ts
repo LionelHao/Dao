@@ -116,6 +116,28 @@ type RoomEvent<TType extends string, TPayload> = PersistedEventBase & {
   readonly payload: TPayload;
 };
 
+export interface AgentExecutionLifecyclePayload {
+  readonly executionId: string;
+  readonly attemptSeq: number;
+  readonly retryCycle: number;
+  readonly retryOrdinal: 1 | 2 | 3;
+  readonly actionCategory: AgentExecution["actionCategory"];
+  readonly status: AgentExecution["status"];
+  readonly errorCode?: string;
+  readonly nextRetryAt?: string;
+}
+
+export interface ToolConfirmationRequiredPayload {
+  readonly confirmationId: string;
+  readonly executionId: string;
+  readonly attemptSeq: number;
+  readonly toolId: string;
+  readonly target: string;
+  readonly impact: string;
+  readonly reversibility: "compensatable" | "irreversible";
+  readonly expiresAt: string;
+}
+
 export type PersistedRoomEvent =
   | RoomEvent<"room.created" | "room.renamed" | "room.archived", { readonly room: ManagedRoom }>
   | RoomEvent<"human.invitation.issued", { readonly invitationId: string; readonly inviteeActorId: string }>
@@ -129,6 +151,18 @@ export type PersistedRoomEvent =
   | RoomEvent<"room.agent_judgment.recorded", AgentJudgement>
   | RoomEvent<"room.open_item.changed", OpenItem>
   | RoomEvent<"room.agent_execution.changed", AgentExecution>
+  | RoomEvent<
+      | "agent.execution.queued"
+      | "agent.execution.started"
+      | "agent.execution.retry-scheduled"
+      | "agent.execution.completed"
+      | "agent.execution.failed"
+      | "agent.execution.cancelled"
+      | "agent.execution.dead-lettered"
+      | "agent.execution.recovered",
+      AgentExecutionLifecyclePayload
+    >
+  | RoomEvent<"agent.tool.confirmation-required", ToolConfirmationRequiredPayload>
   | RoomEvent<"room.calibration.recorded", CalibrationSignal>;
 
 type IdentityEvent<TType extends string, TPayload> = PersistedEventBase & {
@@ -326,6 +360,32 @@ function isPersistedRoomEventValue(value: unknown): value is PersistedRoomEvent 
   }
   if (value.type === "room.agent_execution.changed") {
     return isAgentExecution(payload) && payload.roomId === value.roomId && payload.agentId === value.actorId;
+  }
+  if (
+    value.type === "agent.execution.queued" || value.type === "agent.execution.started" ||
+    value.type === "agent.execution.retry-scheduled" || value.type === "agent.execution.completed" ||
+    value.type === "agent.execution.failed" || value.type === "agent.execution.cancelled" ||
+    value.type === "agent.execution.dead-lettered" || value.type === "agent.execution.recovered"
+  ) {
+    return exact(payload, [
+      "executionId", "attemptSeq", "retryCycle", "retryOrdinal", "actionCategory", "status",
+    ], ["errorCode", "nextRetryAt"]) && text(payload.executionId) && count(payload.attemptSeq) &&
+      payload.attemptSeq >= 1 && count(payload.retryCycle) && payload.retryCycle >= 1 &&
+      (payload.retryOrdinal === 1 || payload.retryOrdinal === 2 || payload.retryOrdinal === 3) &&
+      (payload.actionCategory === "model_generation" || payload.actionCategory === "tool_call" || payload.actionCategory === "waiting_upstream") &&
+      (payload.status === "queued" || payload.status === "running" || payload.status === "completed" || payload.status === "failed" || payload.status === "cancelled") &&
+      (!Object.hasOwn(payload, "errorCode") || text(payload.errorCode)) &&
+      (!Object.hasOwn(payload, "nextRetryAt") || text(payload.nextRetryAt));
+  }
+  if (value.type === "agent.tool.confirmation-required") {
+    return exact(payload, [
+      "confirmationId", "executionId", "attemptSeq", "toolId", "target", "impact",
+      "reversibility", "expiresAt",
+    ]) && text(payload.confirmationId) && text(payload.executionId) &&
+      count(payload.attemptSeq) && payload.attemptSeq >= 1 && text(payload.toolId) &&
+      text(payload.target) && text(payload.impact) &&
+      (payload.reversibility === "compensatable" || payload.reversibility === "irreversible") &&
+      text(payload.expiresAt) && Number.isFinite(Date.parse(payload.expiresAt));
   }
   return value.type === "room.calibration.recorded" && isCalibrationSignal(payload) && payload.actorId === value.actorId;
 }

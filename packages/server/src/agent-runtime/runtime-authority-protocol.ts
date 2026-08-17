@@ -1,0 +1,320 @@
+import {
+  type AgentExecution,
+  type AgentInvocationIntent,
+  type ToolConfirmationInput,
+  type ToolDescriptor,
+} from "@native-im/core";
+import type {
+  AgentRuntimeErrorCode,
+  RuntimeRecoveryRecord,
+} from "./contracts.js";
+import type {
+  AgentWorkerCommandContext,
+  AuthenticatedCommandContext,
+  JsonValue,
+} from "../persistence/contracts.js";
+
+export type RuntimeAuthorityOperation =
+  | { readonly type: "runtime.read-context"; readonly executionId: string; readonly now: number }
+  | {
+      readonly type: "runtime.invoke";
+      readonly context: AuthenticatedCommandContext | AgentWorkerCommandContext;
+      readonly intent: AgentInvocationIntent;
+      readonly executionId: string;
+      readonly intentId: string;
+      readonly providerId: string;
+      readonly modelId: string;
+      readonly now: number;
+    }
+  | { readonly type: "runtime.claim"; readonly executionId: string; readonly attemptSeq: number; readonly now: number }
+  | {
+      readonly type: "runtime.complete";
+      readonly executionId: string;
+      readonly attemptSeq: number;
+      readonly messageId: string;
+      readonly body: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.schedule-retry";
+      readonly executionId: string;
+      readonly attemptSeq: number;
+      readonly errorCode: AgentRuntimeErrorCode;
+      readonly nextRetryAt?: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.interrupt";
+      readonly context: AuthenticatedCommandContext;
+      readonly executionId: string;
+      readonly reason: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.manual-retry";
+      readonly context: AuthenticatedCommandContext;
+      readonly executionId: string;
+      readonly newExecutionId: string;
+      readonly newIntentId: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.begin-compensation";
+      readonly context: AuthenticatedCommandContext;
+      readonly executionId: string;
+      readonly newExecutionId: string;
+      readonly grantId: string;
+      readonly dispatchId: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.prepare-tool";
+      readonly executionId: string;
+      readonly attemptSeq: number;
+      readonly tool: ToolDescriptor;
+      readonly parameters: Readonly<Record<string, unknown>>;
+      readonly grantId: string;
+      readonly confirmationId?: string;
+      readonly confirmationContext?: AuthenticatedCommandContext;
+      readonly providerCall?: { readonly callId: string; readonly argumentsJson: string };
+      readonly expiresAt: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.read-pending-confirmation";
+      readonly confirmationId: string;
+      readonly executionId: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.claim-tool";
+      readonly executionId: string;
+      readonly attemptSeq: number;
+      readonly grantId: string;
+      readonly dispatchId: string;
+      readonly parameters: Readonly<Record<string, unknown>>;
+      readonly confirmation?: {
+        readonly context: AuthenticatedCommandContext;
+        readonly input: ToolConfirmationInput;
+      };
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.settle-tool";
+      readonly dispatchId: string;
+      readonly state: "succeeded" | "failed" | "outcome_unknown";
+      readonly summary: Readonly<Record<string, string | number | boolean>>;
+      readonly sealedCompensation?: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.checkpoint";
+      readonly executionId: string;
+      readonly attemptSeq: number;
+      readonly stepSeq: number;
+      readonly kind: "model" | "tool";
+      readonly inputSha256: string;
+      readonly outputSha256: string;
+      readonly now: number;
+    }
+  | { readonly type: "runtime.recover"; readonly now: number };
+
+export type RuntimeAuthorityOperationResult =
+  | {
+      readonly kind: "context";
+      readonly visibleConversation: readonly { readonly messageId: string; readonly authorId: string; readonly body: string }[];
+      readonly toolIds: readonly ToolDescriptor["id"][];
+    }
+  | { readonly kind: "invocation"; readonly execution: AgentExecution; readonly replayed: boolean }
+  | { readonly kind: "execution"; readonly execution: AgentExecution }
+  | {
+      readonly kind: "prepared-tool";
+      readonly execution: AgentExecution;
+      readonly grantId: string;
+      readonly confirmationId?: string;
+      readonly target?: string;
+      readonly impact?: string;
+      readonly reversibility?: "compensatable" | "irreversible";
+    }
+  | {
+      readonly kind: "claimed-tool";
+      readonly dispatchId: string;
+      readonly toolId: ToolDescriptor["id"];
+      readonly parameters: Readonly<Record<string, unknown>>;
+    }
+  | {
+      readonly kind: "pending-confirmation";
+      readonly execution: AgentExecution;
+      readonly grantId: string;
+      readonly toolId: ToolDescriptor["id"];
+      readonly parameters: Readonly<Record<string, unknown>>;
+      readonly callId: string;
+      readonly argumentsJson: string;
+    }
+  | { readonly kind: "settled-tool" }
+  | { readonly kind: "checkpoint" }
+  | {
+      readonly kind: "compensation";
+      readonly execution: AgentExecution;
+      readonly dispatchId: string;
+      readonly toolId: ToolDescriptor["id"];
+      readonly sealedCompensation: string;
+      readonly replayed: boolean;
+    }
+  | { readonly kind: "recovery"; readonly records: readonly RuntimeRecoveryRecord[] };
+
+type UnknownRecord = Record<string, unknown>;
+
+function record(value: unknown): value is UnknownRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function exact(value: UnknownRecord, required: readonly string[], optional: readonly string[] = []): boolean {
+  const allowed = new Set([...required, ...optional]);
+  return required.every((key) => Object.hasOwn(value, key)) && Object.keys(value).every((key) => allowed.has(key));
+}
+
+function text(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function count(value: unknown, minimum = 0): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= minimum;
+}
+
+function humanContext(value: unknown): value is AuthenticatedCommandContext {
+  if (!record(value) || !exact(value, ["kind", "sessionId", "sessionFamilyId", "principal", "requestId", "idempotencyKey"]) ||
+      value.kind !== "human" || !text(value.sessionId) || !text(value.sessionFamilyId) || !text(value.requestId) || !text(value.idempotencyKey) ||
+      !record(value.principal) || !exact(value.principal, ["accountId", "actorId"]) || !text(value.principal.accountId) || !text(value.principal.actorId)) return false;
+  return true;
+}
+
+function agentContext(value: unknown): value is AgentWorkerCommandContext {
+  return record(value) && exact(value, ["kind", "agent", "requestId", "idempotencyKey"]) && value.kind === "agent" &&
+    text(value.requestId) && text(value.idempotencyKey) && record(value.agent) &&
+    exact(value.agent, ["actorId", "kind"]) && value.agent.kind === "agent" && text(value.agent.actorId);
+}
+
+function invocationIntent(value: unknown): value is AgentInvocationIntent {
+  return record(value) && exact(value, ["kind", "roomId", "sourceMessageId", "targetAgentId"]) &&
+    (value.kind === "direct_mention" || value.kind === "structured_help" || value.kind === "routed_candidate") &&
+    text(value.roomId) && text(value.sourceMessageId) && text(value.targetAgentId);
+}
+
+const toolIds = new Set<ToolDescriptor["id"]>([
+  "http-json.read", "repository.git-status", "sandbox-file.write",
+]);
+
+function jsonObject(value: unknown): value is Readonly<Record<string, unknown>> {
+  if (!record(value)) return false;
+  try {
+    return Buffer.byteLength(JSON.stringify(value), "utf8") <= 64 * 1_024;
+  } catch {
+    return false;
+  }
+}
+
+function toolDescriptor(value: unknown): value is ToolDescriptor {
+  return record(value) && exact(value, ["id", "displayName", "effect", "reversibility"]) &&
+    toolIds.has(value.id as ToolDescriptor["id"]) && text(value.displayName) &&
+    (value.effect === "read-only" || value.effect === "side-effecting") &&
+    (value.reversibility === "compensatable" || value.reversibility === "irreversible");
+}
+
+function sha256(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/u.test(value);
+}
+
+const errorCodes = new Set<AgentRuntimeErrorCode>([
+  "agent_configuration_missing", "agent_queue_full", "agent_runtime_closed", "confirmation_expired",
+  "confirmation_forbidden", "confirmation_replayed", "execution_conflict", "execution_not_found",
+  "invalid_parameters", "permission_denied", "provider_authentication", "provider_failure",
+  "provider_malformed", "provider_rate_limited", "provider_timeout", "provider_unavailable",
+  "side_effect_outcome_unknown", "tool_failure", "tool_target_busy",
+]);
+
+export function isRuntimeAuthorityOperation(value: unknown): value is RuntimeAuthorityOperation {
+  if (!record(value) || !text(value.type)) return false;
+  if (value.type === "runtime.read-context") {
+    return exact(value, ["type", "executionId", "now"]) && text(value.executionId) && count(value.now);
+  }
+  if (value.type === "runtime.invoke") {
+    return exact(value, ["type", "context", "intent", "executionId", "intentId", "providerId", "modelId", "now"]) &&
+      (humanContext(value.context) || agentContext(value.context)) && invocationIntent(value.intent) &&
+      text(value.executionId) && text(value.intentId) && text(value.providerId) && text(value.modelId) && count(value.now);
+  }
+  if (value.type === "runtime.claim") {
+    return exact(value, ["type", "executionId", "attemptSeq", "now"]) && text(value.executionId) && count(value.attemptSeq, 1) && count(value.now);
+  }
+  if (value.type === "runtime.complete") {
+    return exact(value, ["type", "executionId", "attemptSeq", "messageId", "body", "now"]) &&
+      text(value.executionId) && count(value.attemptSeq, 1) && text(value.messageId) && text(value.body) &&
+      Buffer.byteLength(value.body, "utf8") <= 256 * 1_024 && count(value.now);
+  }
+  if (value.type === "runtime.schedule-retry") {
+    return exact(value, ["type", "executionId", "attemptSeq", "errorCode", "now"], Object.hasOwn(value, "nextRetryAt") ? ["nextRetryAt"] : []) &&
+      text(value.executionId) && count(value.attemptSeq, 1) && errorCodes.has(value.errorCode as AgentRuntimeErrorCode) &&
+      (!Object.hasOwn(value, "nextRetryAt") || text(value.nextRetryAt)) && count(value.now);
+  }
+  if (value.type === "runtime.interrupt") {
+    return exact(value, ["type", "context", "executionId", "reason", "now"]) && humanContext(value.context) &&
+      text(value.executionId) && text(value.reason) && count(value.now);
+  }
+  if (value.type === "runtime.manual-retry") {
+    return exact(value, ["type", "context", "executionId", "newExecutionId", "newIntentId", "now"]) &&
+      humanContext(value.context) && text(value.executionId) && text(value.newExecutionId) && text(value.newIntentId) && count(value.now);
+  }
+  if (value.type === "runtime.begin-compensation") {
+    return exact(value, ["type", "context", "executionId", "newExecutionId", "grantId", "dispatchId", "now"]) &&
+      humanContext(value.context) && text(value.executionId) && text(value.newExecutionId) &&
+      text(value.grantId) && text(value.dispatchId) && count(value.now);
+  }
+  if (value.type === "runtime.prepare-tool") {
+    const optional = [
+      ...(Object.hasOwn(value, "confirmationId") ? ["confirmationId"] : []),
+      ...(Object.hasOwn(value, "confirmationContext") ? ["confirmationContext"] : []),
+      ...(Object.hasOwn(value, "providerCall") ? ["providerCall"] : []),
+    ];
+    return exact(value, ["type", "executionId", "attemptSeq", "tool", "parameters", "grantId", "expiresAt", "now"], optional) &&
+      text(value.executionId) && count(value.attemptSeq, 1) && toolDescriptor(value.tool) &&
+      jsonObject(value.parameters) && text(value.grantId) && text(value.expiresAt) && count(value.now) &&
+      (!Object.hasOwn(value, "confirmationId") || text(value.confirmationId)) &&
+      (!Object.hasOwn(value, "confirmationContext") || humanContext(value.confirmationContext)) &&
+      (!Object.hasOwn(value, "providerCall") || (record(value.providerCall) &&
+        exact(value.providerCall, ["callId", "argumentsJson"]) && text(value.providerCall.callId) &&
+        typeof value.providerCall.argumentsJson === "string" &&
+        Buffer.byteLength(value.providerCall.argumentsJson, "utf8") <= 64 * 1_024));
+  }
+  if (value.type === "runtime.read-pending-confirmation") {
+    return exact(value, ["type", "confirmationId", "executionId", "now"]) &&
+      text(value.confirmationId) && text(value.executionId) && count(value.now);
+  }
+  if (value.type === "runtime.claim-tool") {
+    const optional = Object.hasOwn(value, "confirmation") ? ["confirmation"] : [];
+    return exact(value, ["type", "executionId", "attemptSeq", "grantId", "dispatchId", "parameters", "now"], optional) &&
+      text(value.executionId) && count(value.attemptSeq, 1) && text(value.grantId) && text(value.dispatchId) &&
+      jsonObject(value.parameters) && count(value.now) &&
+      (!Object.hasOwn(value, "confirmation") || (record(value.confirmation) &&
+        exact(value.confirmation, ["context", "input"]) && humanContext(value.confirmation.context) &&
+        record(value.confirmation.input) && exact(value.confirmation.input, ["confirmationId", "executionId"]) &&
+        text(value.confirmation.input.confirmationId) && text(value.confirmation.input.executionId)));
+  }
+  if (value.type === "runtime.settle-tool") {
+    const optional = Object.hasOwn(value, "sealedCompensation") ? ["sealedCompensation"] : [];
+    return exact(value, ["type", "dispatchId", "state", "summary", "now"], optional) &&
+      text(value.dispatchId) && (value.state === "succeeded" || value.state === "failed" || value.state === "outcome_unknown") &&
+      jsonObject(value.summary) && Object.values(value.summary).every((entry) =>
+        typeof entry === "string" || typeof entry === "number" || typeof entry === "boolean") &&
+      (!Object.hasOwn(value, "sealedCompensation") || text(value.sealedCompensation)) && count(value.now);
+  }
+  if (value.type === "runtime.checkpoint") {
+    return exact(value, ["type", "executionId", "attemptSeq", "stepSeq", "kind", "inputSha256", "outputSha256", "now"]) &&
+      text(value.executionId) && count(value.attemptSeq, 1) && count(value.stepSeq, 1) &&
+      (value.kind === "model" || value.kind === "tool") && sha256(value.inputSha256) && sha256(value.outputSha256) && count(value.now);
+  }
+  return value.type === "runtime.recover" && exact(value, ["type", "now"]) && count(value.now);
+}
+
+export function runtimeResultAsJson(result: RuntimeAuthorityOperationResult): JsonValue {
+  return result as unknown as JsonValue;
+}

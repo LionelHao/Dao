@@ -23,6 +23,31 @@ interface RestoredPrimitivePreviewRecords {
 }
 
 type RendererUnderTest = {
+  renderToolConfirmation?: (
+    root: HTMLElement,
+    confirmation: {
+      readonly confirmationId: string;
+      readonly executionId: string;
+      readonly attemptSeq: number;
+      readonly toolId: string;
+      readonly target: string;
+      readonly impact: string;
+      readonly reversibility: "compensatable" | "irreversible";
+      readonly expiresAt: string;
+    },
+    onConfirm: (input: { readonly confirmationId: string; readonly executionId: string }) => void,
+  ) => void;
+  renderAgentExecutionPreview?: (
+    root: HTMLElement,
+    preview: {
+      readonly roomId: string;
+      readonly executionId: string;
+      readonly attemptSeq: number;
+      readonly streamSeq: number;
+      readonly delta: string;
+      readonly authoritative: false;
+    } | undefined,
+  ) => void;
   renderEmptyGroupChat?: (root: HTMLElement) => void;
   renderMessageTimeline?: (
     root: HTMLElement,
@@ -58,6 +83,62 @@ describe("empty group chat renderer", () => {
     expect(root.querySelector("[data-testid='empty-group-chat']")).not.toBeNull();
     expect(root.textContent).toContain("还没有消息");
     expect(root.textContent).toContain("邀请真人或编制 agent 后开始协作");
+  });
+});
+
+describe("ephemeral Agent execution preview", () => {
+  it("keeps ordered partial text non-authoritative and clears it without a typing animation", () => {
+    const renderer = importedApp as RendererUnderTest;
+    const root = document.createElement("div");
+    const render = renderer.renderAgentExecutionPreview!;
+    render(root, {
+      roomId: "room-1",
+      executionId: "execution-1",
+      attemptSeq: 1,
+      streamSeq: 2,
+      delta: "partial",
+      authoritative: false,
+    });
+    render(root, {
+      roomId: "room-1",
+      executionId: "execution-1",
+      attemptSeq: 1,
+      streamSeq: 1,
+      delta: "stale",
+      authoritative: false,
+    });
+    const preview = root.querySelector<HTMLElement>("[data-agent-execution-preview]");
+    expect(preview?.textContent).toBe("partial");
+    expect(preview?.dataset.authoritative).toBe("false");
+    expect(preview?.classList.contains("typing")).toBe(false);
+    render(root, undefined);
+    expect(root.childElementCount).toBe(0);
+  });
+});
+
+describe("side-effect confirmation renderer", () => {
+  it("shows target, impact, reversibility, and expiry and emits one closed confirmation", () => {
+    const root = document.createElement("div");
+    const confirmations: Array<{ readonly confirmationId: string; readonly executionId: string }> = [];
+    app.renderToolConfirmation?.(root, {
+      confirmationId: "confirmation-1",
+      executionId: "execution-1",
+      attemptSeq: 2,
+      toolId: "sandbox-file.write",
+      target: "sandbox-file.write",
+      impact: "bounded-side-effect",
+      reversibility: "compensatable",
+      expiresAt: "2026-08-17T00:05:00.000Z",
+    }, (input) => confirmations.push(input));
+    expect(root.textContent).toContain("目标：sandbox-file.write");
+    expect(root.textContent).toContain("影响：bounded-side-effect");
+    expect(root.textContent).toContain("可逆性：compensatable");
+    expect(root.textContent).toContain("过期：2026-08-17T00:05:00.000Z");
+    const button = root.querySelector<HTMLButtonElement>("button");
+    button?.click();
+    button?.click();
+    expect(confirmations).toEqual([{ confirmationId: "confirmation-1", executionId: "execution-1" }]);
+    expect(button?.disabled).toBe(true);
   });
 });
 
@@ -141,7 +222,14 @@ describe("verified collaboration primitive renderer", () => {
         agentId: "恢复 Agent",
         toolName: "restore.inspect",
         status: "running",
+        actionCategory: "model_generation",
+        currentAttemptSeq: 1,
+        retryCycle: 1,
+        retryOrdinal: 1,
+        recoveryCursor: 0,
+        queuedAt: "2026-08-12T13:00:02.900Z",
         startedAt: "2026-08-12T13:00:03.000Z",
+        updatedAt: "2026-08-12T13:00:03.000Z",
       }],
       socialReactions: [{
         id: "social-restored",
@@ -175,7 +263,8 @@ describe("verified collaboration primitive renderer", () => {
     expect(agentJudgement?.textContent).toContain("已判定");
     expect(openItem?.textContent).toContain("恢复后的待答问题");
     expect(openItem?.textContent).toContain("待答项");
-    expect(agentExecution?.textContent).toContain("恢复 Agent 正在调用 restore.inspect");
+    expect(agentExecution?.textContent).toContain("恢复 Agent 正在调用");
+    expect(agentExecution?.textContent).toContain("restore.inspect");
     expect(agentExecution?.textContent).toContain("Agent 执行");
     expect(social?.textContent).toContain("🎉 纯社交");
     expect(calibration?.textContent).toContain("👍 校准：影响后续发言判定");
@@ -231,7 +320,7 @@ describe("verified collaboration primitive renderer", () => {
 
     interrupt?.click();
 
-    expect(root.querySelector("[data-agent-invocation]")?.getAttribute("data-execution-status")).toBe("interrupted");
+    expect(root.querySelector("[data-agent-invocation]")?.getAttribute("data-execution-status")).toBe("cancelled");
     expect(root.querySelector("[data-member-id='agent-data']")?.textContent).toBe("可用");
   });
 

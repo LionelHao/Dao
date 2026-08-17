@@ -14,6 +14,8 @@ import {
   type SnapshotCompleted,
   type SnapshotVersion,
   type WorkspaceBootstrapPage,
+  type AgentExecution,
+  type AgentInvocationIntent,
 } from "@native-im/core";
 import type { AuthenticationErrorCode } from "./auth.js";
 import { ROOM_SYNC_MAX_LIMIT } from "./persistence/contracts.js";
@@ -39,6 +41,12 @@ const SNAPSHOT_COMPLETE_FIELDS = new Set([
 ]);
 const ROOM_SUBSCRIBE_V2_FIELDS = new Set(["type", "requestId", "roomId", "cursor"]);
 const MESSAGE_DRAFT_FIELDS = new Set(["id", "roomId", "body", "sentAt"]);
+const AGENT_INVOKE_FIELDS = new Set(["type", "requestId", "intent"]);
+const AGENT_INTENT_FIELDS = new Set(["kind", "roomId", "sourceMessageId", "targetAgentId"]);
+const AGENT_CONTROL_FIELDS = new Set(["type", "requestId", "executionId"]);
+const AGENT_INTERRUPT_FIELDS = new Set(["type", "requestId", "executionId", "reason"]);
+const AGENT_CONFIRM_FIELDS = new Set(["type", "requestId", "confirmation"]);
+const AGENT_CONFIRMATION_FIELDS = new Set(["confirmationId", "executionId"]);
 
 export const PROTOCOL_FIELD_LIMITS = Object.freeze({
   requestId: 128,
@@ -137,6 +145,37 @@ export interface RoomSubscribeV2Frame {
   readonly cursor: RoomCursor;
 }
 
+export interface AgentInvokeFrame {
+  readonly type: "agent.invoke";
+  readonly requestId: string;
+  readonly intent: AgentInvocationIntent;
+}
+
+export interface AgentInterruptFrame {
+  readonly type: "agent.interrupt";
+  readonly requestId: string;
+  readonly executionId: string;
+  readonly reason: string;
+}
+
+export interface AgentRetryFrame {
+  readonly type: "agent.retry";
+  readonly requestId: string;
+  readonly executionId: string;
+}
+
+export interface AgentToolConfirmFrame {
+  readonly type: "agent.tool.confirm";
+  readonly requestId: string;
+  readonly confirmation: { readonly confirmationId: string; readonly executionId: string };
+}
+
+export interface AgentCompensateFrame {
+  readonly type: "agent.compensate";
+  readonly requestId: string;
+  readonly executionId: string;
+}
+
 export type ClientFrame =
   | AuthLoginFrame
   | AuthResumeFrame
@@ -151,7 +190,12 @@ export type ClientFrame =
   | RoomRepairBeginRequestFrame
   | RoomRepairPageRequestFrame
   | SnapshotCompleteRequestFrame
-  | RoomSubscribeV2Frame;
+  | RoomSubscribeV2Frame
+  | AgentInvokeFrame
+  | AgentInterruptFrame
+  | AgentRetryFrame
+  | AgentToolConfirmFrame
+  | AgentCompensateFrame;
 
 export interface AuthenticatedFrame {
   readonly type: "auth.authenticated";
@@ -218,6 +262,23 @@ export interface RoomSubscribeV2RetryFrame {
   readonly restartFrom: RoomCursor;
 }
 
+export interface AgentExecutionAckFrame {
+  readonly type: "agent.execution.ack";
+  readonly requestId: string;
+  readonly execution: AgentExecution;
+  readonly replayed: boolean;
+}
+
+export interface AgentExecutionPreviewFrame {
+  readonly type: "agent.execution.preview";
+  readonly roomId: string;
+  readonly executionId: string;
+  readonly attemptSeq: number;
+  readonly streamSeq: number;
+  readonly delta: string;
+  readonly authoritative: false;
+}
+
 export type ProtocolErrorCode =
   | AuthenticationErrorCode
   | MessageErrorCode
@@ -240,6 +301,22 @@ export type ProtocolErrorCode =
   | "storage_unavailable"
   | "room_not_found"
   | "room_archived"
+  | "agent_configuration_missing"
+  | "agent_queue_full"
+  | "agent_runtime_closed"
+  | "execution_conflict"
+  | "execution_not_found"
+  | "invalid_parameters"
+  | "permission_denied"
+  | "provider_authentication"
+  | "provider_failure"
+  | "provider_malformed"
+  | "provider_rate_limited"
+  | "provider_timeout"
+  | "provider_unavailable"
+  | "side_effect_outcome_unknown"
+  | "tool_failure"
+  | "tool_target_busy"
   | "internal_error";
 
 export interface ProtocolErrorFrame {
@@ -266,6 +343,8 @@ export type ServerFrame =
   | SnapshotCompleted
   | RoomSubscribedV2Frame
   | RoomSubscribeV2RetryFrame
+  | AgentExecutionAckFrame
+  | AgentExecutionPreviewFrame
   | ProtocolErrorFrame;
 
 export type ClientFrameParseResult =
@@ -637,6 +716,51 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
           cursor: value.cursor,
         },
       };
+    case "agent.invoke":
+      if (!hasOnlyFields(value, AGENT_INVOKE_FIELDS) || requestId === undefined ||
+          !isRecord(value.intent) || !hasOnlyFields(value.intent, AGENT_INTENT_FIELDS) ||
+          (value.intent.kind !== "direct_mention" && value.intent.kind !== "structured_help" && value.intent.kind !== "routed_candidate") ||
+          !isBoundedString(value.intent.roomId, PROTOCOL_FIELD_LIMITS.roomId) ||
+          !isBoundedString(value.intent.sourceMessageId, PROTOCOL_FIELD_LIMITS.messageId) ||
+          !isBoundedString(value.intent.targetAgentId, PROTOCOL_FIELD_LIMITS.accountId)) {
+        return { ok: false, error: protocolError("agent.invoke requires a closed invocation intent", requestId) };
+      }
+      return { ok: true, frame: { type: "agent.invoke", requestId, intent: {
+        kind: value.intent.kind,
+        roomId: value.intent.roomId,
+        sourceMessageId: value.intent.sourceMessageId,
+        targetAgentId: value.intent.targetAgentId,
+      } } };
+    case "agent.interrupt":
+      if (!hasOnlyFields(value, AGENT_INTERRUPT_FIELDS) || requestId === undefined ||
+          !isBoundedString(value.executionId, PROTOCOL_FIELD_LIMITS.messageId) ||
+          !isBoundedString(value.reason, 256)) {
+        return { ok: false, error: protocolError("agent.interrupt requires executionId and bounded reason", requestId) };
+      }
+      return { ok: true, frame: { type: "agent.interrupt", requestId, executionId: value.executionId, reason: value.reason } };
+    case "agent.retry":
+      if (!hasOnlyFields(value, AGENT_CONTROL_FIELDS) || requestId === undefined ||
+          !isBoundedString(value.executionId, PROTOCOL_FIELD_LIMITS.messageId)) {
+        return { ok: false, error: protocolError("agent.retry requires executionId", requestId) };
+      }
+      return { ok: true, frame: { type: "agent.retry", requestId, executionId: value.executionId } };
+    case "agent.compensate":
+      if (!hasOnlyFields(value, AGENT_CONTROL_FIELDS) || requestId === undefined ||
+          !isBoundedString(value.executionId, PROTOCOL_FIELD_LIMITS.messageId)) {
+        return { ok: false, error: protocolError("agent.compensate requires executionId", requestId) };
+      }
+      return { ok: true, frame: { type: "agent.compensate", requestId, executionId: value.executionId } };
+    case "agent.tool.confirm":
+      if (!hasOnlyFields(value, AGENT_CONFIRM_FIELDS) || requestId === undefined ||
+          !isRecord(value.confirmation) || !hasOnlyFields(value.confirmation, AGENT_CONFIRMATION_FIELDS) ||
+          !isBoundedString(value.confirmation.confirmationId, PROTOCOL_FIELD_LIMITS.messageId) ||
+          !isBoundedString(value.confirmation.executionId, PROTOCOL_FIELD_LIMITS.messageId)) {
+        return { ok: false, error: protocolError("agent.tool.confirm requires a closed confirmation", requestId) };
+      }
+      return { ok: true, frame: { type: "agent.tool.confirm", requestId, confirmation: {
+        confirmationId: value.confirmation.confirmationId,
+        executionId: value.confirmation.executionId,
+      } } };
     default:
       return { ok: false, error: protocolError("Unknown request type", requestId) };
   }

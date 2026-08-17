@@ -226,8 +226,10 @@ function seedMixedRoomRecords(databasePath: string, roomId: string): Record<stri
     );
     const insertExecution = database.prepare(
       `INSERT INTO agent_executions (id, room_id, agent_id, trigger_message_id, status,
-         started_at, completed_at, result_json, requester_actor_id, tool_name)
-       VALUES (?, ?, 'agent-a', ?, 'running', ?, NULL, NULL, 'human-a', 'x')`,
+         started_at, completed_at, result_json, requester_actor_id, tool_name,
+         action_category, tool_dispatch_phase, queued_at, updated_at)
+       VALUES (?, ?, 'agent-a', ?, 'running', ?, NULL, NULL, 'human-a', 'x',
+         'tool_call', 'not_started', ?, ?)`,
     );
     const insertCalibration = database.prepare(
       `INSERT INTO calibration_signals (id, room_id, agent_id, judgment_id, signal,
@@ -286,7 +288,10 @@ function seedMixedRoomRecords(databasePath: string, roomId: string): Record<stri
         const execution = { id: `e${suffix}`, roomId,
           sourceMessageId: messageId, requesterId: "human-a", agentId: "agent-a",
           toolName: "x", status: "running" as const,
-          startedAt: "t" };
+          actionCategory: "tool_call" as const,
+          toolDispatchPhase: "not_started" as const,
+          currentAttemptSeq: 1, retryCycle: 1, retryOrdinal: 1 as const,
+          recoveryCursor: 0, queuedAt: "t", startedAt: "t", updatedAt: "t" };
         if (!isAgentJudgement(judgment) || !isOpenItem(item) ||
             !isAgentExecution(execution)) {
           throw new TypeError("Mixed collaboration fixture is not closed");
@@ -294,7 +299,14 @@ function seedMixedRoomRecords(databasePath: string, roomId: string): Record<stri
         insertJudgement.run(judgment.id, roomId, messageId,
           JSON.stringify(judgment), judgment.decidedAt);
         insertOpenItem.run(item.id, roomId, messageId, item.content, item.createdAt);
-        insertExecution.run(execution.id, roomId, messageId, execution.startedAt);
+        insertExecution.run(
+          execution.id,
+          roomId,
+          messageId,
+          execution.startedAt,
+          execution.startedAt,
+          execution.startedAt,
+        );
       }
       for (let index = 0; index < 999; index += 1) {
         const suffix = index.toString(36);
@@ -481,7 +493,7 @@ const serverOptions: StartAuthoritativeServerOptions = {
   identities,
   invitationSecretKey: Buffer.from(command.invitationSecretKey, "base64url"),
 };
-const closeCounts = { transport: 0, snapshots: 0, worker: 0 };
+const closeCounts = { transport: 0, runtime: 0, snapshots: 0, worker: 0 };
 const testOptions = {
   ...(command.faultPoint === undefined ? {} : { faultPoint: command.faultPoint }),
   ...(command.forceSnapshotFallback === true ? { snapshotCacheQuotaBytes: 1 } : {}),
@@ -496,6 +508,7 @@ const testOptions = {
         closeCounts.transport += 1;
         throw new Error("transport close probe");
       },
+      runtime() { closeCounts.runtime += 1; },
       snapshots() { closeCounts.snapshots += 1; },
       worker() { closeCounts.worker += 1; },
     },

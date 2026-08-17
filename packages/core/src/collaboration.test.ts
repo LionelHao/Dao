@@ -70,10 +70,19 @@ describe("canonical collaboration records", () => {
       sourceMessageId: "message-1",
       requesterId: "human-1",
       agentId: "agent-1",
-      toolName: "search.web",
-      status: "interrupted",
-      startedAt: "2026-08-10T00:00:00.000Z",
+      toolName: "http-json.read",
+      status: "cancelled",
+      actionCategory: "tool_call",
+      toolDispatchPhase: "not_started",
+      currentAttemptSeq: 2,
+      retryCycle: 1,
+      retryOrdinal: 2,
+      recoveryCursor: 1,
+      queuedAt: "2026-08-10T00:00:00.000Z",
+      startedAt: "2026-08-10T00:00:01.000Z",
+      updatedAt: "2026-08-10T00:01:00.000Z",
       completedAt: "2026-08-10T00:01:00.000Z",
+      cancellationReason: "requested_by_human",
     })).toBe(true);
     expect(isAgentExecution({
       id: "execution-1",
@@ -83,8 +92,25 @@ describe("canonical collaboration records", () => {
       agentId: "agent-1",
       toolName: "search.web",
       status: "running",
+      actionCategory: "model_generation",
+      currentAttemptSeq: 1,
+      retryCycle: 1,
+      retryOrdinal: 1,
+      recoveryCursor: 0,
+      queuedAt: "2026-08-10T00:00:00.000Z",
       startedAt: "2026-08-10T00:00:00.000Z",
+      updatedAt: "2026-08-10T00:00:00.000Z",
       result: undefined,
+    })).toBe(false);
+    expect(isAgentExecution({
+      id: "execution-legacy-interrupted",
+      roomId: "room-1",
+      sourceMessageId: "message-1",
+      requesterId: "human-1",
+      agentId: "agent-1",
+      toolName: "search.web",
+      status: "interrupted",
+      startedAt: "2026-08-10T00:00:00.000Z",
     })).toBe(false);
   });
 

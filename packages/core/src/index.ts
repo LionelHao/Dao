@@ -308,7 +308,13 @@ export {
 } from "./collaboration.js";
 export type {
   AgentExecution,
+  AgentExecutionActionCategory,
+  AgentExecutionAttempt,
   AgentExecutionStatus,
+  AgentInvocationIntent,
+  AgentInvocationIntentKind,
+  AgentRuntimeProviderInput,
+  AgentToolDispatchPhase,
   AgentJudgement,
   AgentJudgementOutcome,
   CalibrationSignal,
@@ -316,7 +322,14 @@ export type {
   OpenItem,
   OpenItemStatus,
   OpenItemTransfer,
+  ProviderEvent,
+  ProviderNeutralCheckpoint,
+  RouterProviderInput,
   SocialReaction,
+  ToolConfirmationInput,
+  ToolDescriptor,
+  ToolEffect,
+  ToolReversibility,
 } from "./collaboration.js";
 export {
   isRoomCursor,
@@ -327,6 +340,7 @@ export {
   isWorkspaceBootstrapPage,
 } from "./sync.js";
 export type {
+  AgentExecutionLifecyclePayload,
   PersistedIdentityEvent,
   PersistedRoomEvent,
   LegacyUnknownCalibrationSignal,
@@ -339,5 +353,6 @@ export type {
   SnapshotCompleted,
   SnapshotDeliveryMode,
   SnapshotVersion,
+  ToolConfirmationRequiredPayload,
   WorkspaceBootstrapPage,
 } from "./sync.js";

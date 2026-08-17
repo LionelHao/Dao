@@ -1,5 +1,7 @@
 import type { Actor } from "@native-im/core";
 import { isDeepStrictEqual } from "node:util";
+import { mkdir } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import {
   createAuthenticationService,
   type IdentityAdapter,
@@ -17,6 +19,14 @@ import {
   createWorkerDatabaseClientWithTransactionFaultForTest,
   type WorkerDatabaseClient,
 } from "./persistence/worker-database-client.js";
+import { createAgentRuntimeService, type AgentRuntimeService } from "./agent-runtime/agent-runtime-service.js";
+import { createEnvironmentSecretProvider } from "./agent-runtime/environment-secret-provider.js";
+import { createOpenAIResponsesProvider } from "./agent-runtime/openai-responses-provider.js";
+import { createWorkerRuntimeAuthority } from "./agent-runtime/worker-runtime-authority.js";
+import { createHttpJsonReadAdapter } from "./agent-runtime/tools/http-json-read.js";
+import { createRepositoryGitStatusAdapter } from "./agent-runtime/tools/repository-git-status.js";
+import { createSandboxFileWriteAdapter } from "./agent-runtime/tools/sandbox-file-write.js";
+import { createToolGateway } from "./agent-runtime/tool-gateway.js";
 
 export interface AuthoritativeServer {
   readonly url: string;
@@ -29,6 +39,15 @@ export interface StartAuthoritativeServerOptions {
   readonly actors: readonly Actor[];
   readonly identities: IdentityAdapter;
   readonly invitationSecretKey: Uint8Array;
+  readonly agentRuntime?: {
+    readonly model?: string;
+    readonly endpoint?: string;
+    readonly httpJsonOrigin?: string;
+    readonly httpJsonPathPrefix?: string;
+    readonly repositoryRoot?: string;
+    readonly sandboxRoot?: string;
+    readonly gitBinaryPath?: string;
+  };
 }
 
 interface AuthoritativeServerTestOptions {
@@ -41,7 +60,7 @@ interface AuthoritativeServerTestOptions {
   readonly snapshotMaxRecordsPerPage?: number;
   readonly initialize?: (facades: AuthoritativeServerTestFacades) => Promise<void>;
   readonly registerMissingActors?: false;
-  readonly afterCloseForTest?: Partial<Record<"transport" | "snapshots" | "worker", () => void>>;
+  readonly afterCloseForTest?: Partial<Record<"transport" | "runtime" | "snapshots" | "worker", () => void>>;
 }
 
 export interface AuthoritativeServerTestFacades {
@@ -83,6 +102,7 @@ async function start(
   let worker: WorkerDatabaseClient | undefined;
   let snapshots: Awaited<ReturnType<typeof createSnapshotWorkerClient>> | undefined;
   let transport: Awaited<ReturnType<typeof startMessageWebSocketServer>> | undefined;
+  let runtime: AgentRuntimeService | undefined;
   try {
     worker = transactionFault === undefined
       ? await createWorkerDatabaseClient({ databasePath: options.databasePath })
@@ -183,6 +203,62 @@ async function start(
     });
     const primitives = createAuthoritativeCollaborationPrimitives({ commandStore });
     await testOptions.initialize?.({ auth, lifecycle, messages: service, primitives });
+    const runtimeConfiguration = options.agentRuntime ?? {};
+    const secretProvider = createEnvironmentSecretProvider();
+    const provider = createOpenAIResponsesProvider({
+      endpoint: runtimeConfiguration.endpoint ?? "https://api.openai.com/v1/responses",
+      model: runtimeConfiguration.model ?? "gpt-5-mini",
+      secretProvider,
+    });
+    const sandboxRoot = resolve(
+      runtimeConfiguration.sandboxRoot ?? resolve(dirname(options.databasePath), "agent-sandbox"),
+    );
+    await mkdir(sandboxRoot, { recursive: true, mode: 0o700 });
+    const tools = [
+      createHttpJsonReadAdapter({
+        origin: runtimeConfiguration.httpJsonOrigin ?? "https://api.github.com",
+        pathPrefix: runtimeConfiguration.httpJsonPathPrefix ?? "/users/",
+        maxResponseBytes: 256 * 1_024,
+      }),
+      createRepositoryGitStatusAdapter({
+        binaryPath: runtimeConfiguration.gitBinaryPath ?? "/usr/bin/git",
+        repositoryRoot: resolve(runtimeConfiguration.repositoryRoot ?? process.cwd()),
+        maxOutputBytes: 256 * 1_024,
+        timeoutMs: 5_000,
+      }),
+      createSandboxFileWriteAdapter({
+        root: sandboxRoot,
+        compensationKey: new Uint8Array(options.invitationSecretKey),
+        maxContentBytes: 256 * 1_024,
+      }),
+    ] as const;
+    const runtimeAuthority = createWorkerRuntimeAuthority(worker);
+    const toolGateway = createToolGateway({ authority: runtimeAuthority, adapters: tools });
+    runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      provider,
+      modelId: runtimeConfiguration.model ?? "gpt-5-mini",
+      readiness: () => secretProvider.getSecret("OPENAI_API_KEY") === undefined ? "noauth" : "ready",
+      tools: tools.map((tool) => tool.descriptor),
+      toolGateway,
+      toolAdapters: tools,
+      async buildProviderInput(execution, intent) {
+        const runtimeContext = await runtimeAuthority.readContext(execution.id);
+        const allowed = new Set(runtimeContext.toolIds);
+        return {
+          purpose: "agent_runtime",
+          invocation: intent,
+          visibleConversation: runtimeContext.visibleConversation,
+          availableTools: tools.map((tool) => tool.descriptor).filter((tool) => allowed.has(tool.id)),
+          committedSteps: [],
+          limits: { maxInputBytes: 256 * 1_024, maxOutputBytes: 256 * 1_024, timeoutMs: 30_000 },
+        };
+      },
+      emitPreview(preview) {
+        transport?.publishAgentPreview(preview);
+      },
+    });
+    await runtime.recover();
     const outboxStore = testOptions.faultPoint === "after-send-before-dispatch-mark"
       ? {
           listPendingOutbox: (limit: number) => authority.listPendingOutbox(limit),
@@ -199,9 +275,11 @@ async function start(
       sync,
       outboxStore,
       outboxPollIntervalMs: 10,
+      agentRuntime: runtime,
     });
   } catch (error: unknown) {
     await transport?.close().catch(() => undefined);
+    await runtime?.close().catch(() => undefined);
     await snapshots?.close().catch(() => undefined);
     await worker?.close().catch(() => undefined);
     throw error;
@@ -215,6 +293,7 @@ async function start(
         const failures: unknown[] = [];
         for (const [stage, close] of [
           ["transport", () => transport.close()],
+          ["runtime", () => runtime!.close()],
           ["snapshots", () => snapshots.close()],
           ["worker", () => worker.close()],
         ] as const) {
