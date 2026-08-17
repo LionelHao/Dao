@@ -100,7 +100,10 @@ export function createWorkerRuntimeAuthority(worker: WorkerDatabaseClient): Runt
           !result.visibleConversation.every((message) => record(message) &&
             typeof message.messageId === "string" && typeof message.authorId === "string" && typeof message.body === "string") ||
           !Array.isArray(result.toolIds) || !result.toolIds.every((toolId) =>
-            toolId === "http-json.read" || toolId === "repository.git-status" || toolId === "sandbox-file.write")) {
+            toolId === "http-json.read" || toolId === "repository.git-status" || toolId === "sandbox-file.write") ||
+          !Array.isArray(result.openItemTargets) || !result.openItemTargets.every((target) =>
+            record(target) && typeof target.actorId === "string" &&
+            (target.kind === "human" || target.kind === "agent"))) {
         throw new AgentRuntimeError("provider_failure", "Authority runtime context was malformed");
       }
       return result as unknown as Awaited<ReturnType<RuntimeAuthority["readContext"]>>;

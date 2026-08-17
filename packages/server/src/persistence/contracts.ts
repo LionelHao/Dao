@@ -9,6 +9,7 @@ import {
   isHumanRoomMembership,
   isMessage,
   isOpenItem,
+  isOpenItemAgentFailure,
   isRouteJob,
   isRouteJudgment,
 } from "@native-im/core";
@@ -376,8 +377,21 @@ export type CollaborationCommand =
       readonly type: "open-item.create";
       readonly roomId: string;
       readonly payload: {
+        readonly creationKind: "human_mention" | "manual_unfinished";
         readonly sourceMessageId: string;
-        readonly ownerId: string;
+        readonly targetActorId: string;
+        readonly content: string;
+      } & CommandActorFreePayload;
+    }
+  | {
+      readonly type: "open-item.propose";
+      readonly roomId: string;
+      readonly payload: {
+        readonly proposalKind: "risk" | "challenge";
+        readonly targetActorId: string;
+        readonly sourceExecutionId: string;
+        readonly sourceMessageId: string;
+        readonly reason: string;
         readonly content: string;
       } & CommandActorFreePayload;
     }
@@ -386,9 +400,19 @@ export type CollaborationCommand =
       readonly roomId: string;
       readonly payload: {
         readonly itemId: string;
-        readonly action: "respond" | "defer" | "transfer";
-        readonly targetId?: string;
+        readonly action: "answer" | "defer" | "cannot_answer" | "transfer";
+        readonly targetActorId?: string;
         readonly reason?: string;
+      } & CommandActorFreePayload;
+    }
+  | {
+      readonly type: "open-item.agent-failure.record";
+      readonly roomId: string;
+      readonly payload: {
+        readonly itemId: string;
+        readonly executionId: string;
+        readonly attemptSeq: number;
+        readonly reasonCode: string;
       } & CommandActorFreePayload;
     }
   | {
@@ -421,7 +445,7 @@ export type HumanCollaborationCommand = Extract<
 
 export type AgentCollaborationCommand = Extract<
   CollaborationCommand,
-  { readonly type: "message.send" | "agent.judgment.record" | "open-item.create" | "open-item.transition" | "agent.execution.transition" }
+  { readonly type: "message.send" | "agent.judgment.record" | "open-item.propose" | "open-item.transition" | "open-item.agent-failure.record" | "agent.execution.transition" }
 >;
 
 export type RoomGovernanceCommand =
@@ -632,16 +656,32 @@ function isCollaborationCommand(value: UnknownRecord): boolean {
       text(payload.reason);
   }
   if (value.type === "open-item.create") {
-    return exact(payload, ["sourceMessageId", "ownerId", "content"]) &&
-      text(payload.sourceMessageId) && text(payload.ownerId) && text(payload.content);
+    return exact(payload, ["creationKind", "sourceMessageId", "targetActorId", "content"]) &&
+      (payload.creationKind === "human_mention" || payload.creationKind === "manual_unfinished") &&
+      text(payload.sourceMessageId) && text(payload.targetActorId) && text(payload.content);
+  }
+  if (value.type === "open-item.propose") {
+    return exact(payload, [
+      "proposalKind", "targetActorId", "sourceExecutionId", "sourceMessageId", "reason", "content",
+    ]) && (payload.proposalKind === "risk" || payload.proposalKind === "challenge") &&
+      text(payload.targetActorId) && text(payload.sourceExecutionId) &&
+      text(payload.sourceMessageId) && text(payload.reason) && text(payload.content);
   }
   if (value.type === "open-item.transition") {
     if (payload.action === "transfer") {
-      return exact(payload, ["itemId", "action", "targetId", "reason"]) &&
-        text(payload.itemId) && text(payload.targetId) && text(payload.reason);
+      return exact(payload, ["itemId", "action", "targetActorId", "reason"]) &&
+        text(payload.itemId) && text(payload.targetActorId) && text(payload.reason);
     }
-    return (payload.action === "respond" || payload.action === "defer") &&
-      exact(payload, ["itemId", "action"]) && text(payload.itemId);
+    if (payload.action === "answer") {
+      return exact(payload, ["itemId", "action"]) && text(payload.itemId);
+    }
+    return (payload.action === "defer" || payload.action === "cannot_answer") &&
+      exact(payload, ["itemId", "action", "reason"]) && text(payload.itemId) && text(payload.reason);
+  }
+  if (value.type === "open-item.agent-failure.record") {
+    return exact(payload, ["itemId", "executionId", "attemptSeq", "reasonCode"]) &&
+      text(payload.itemId) && text(payload.executionId) && count(payload.attemptSeq, 1) &&
+      text(payload.reasonCode);
   }
   if (value.type === "agent.execution.transition") {
     return exact(payload, ["executionId", "sourceMessageId", "toolName", "status"], ["result"]) &&
@@ -773,6 +813,9 @@ function validRoomEventPayload(
   }
   if (type === "room.open_item.changed") {
     return isOpenItem(payload) && payload.roomId === roomId;
+  }
+  if (type === "room.open_item.agent_attempt_failed") {
+    return isOpenItemAgentFailure(payload);
   }
   if (type === "room.agent_execution.changed") {
     return isAgentExecution(payload) && payload.roomId === roomId && payload.agentId === eventActorId;

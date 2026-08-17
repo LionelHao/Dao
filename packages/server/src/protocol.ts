@@ -16,6 +16,7 @@ import {
   type WorkspaceBootstrapPage,
   type AgentExecution,
   type AgentInvocationIntent,
+  type OpenItem,
 } from "@native-im/core";
 import type { AuthenticationErrorCode } from "./auth.js";
 import { ROOM_SYNC_MAX_LIMIT } from "./persistence/contracts.js";
@@ -47,6 +48,11 @@ const AGENT_CONTROL_FIELDS = new Set(["type", "requestId", "executionId"]);
 const AGENT_INTERRUPT_FIELDS = new Set(["type", "requestId", "executionId", "reason"]);
 const AGENT_CONFIRM_FIELDS = new Set(["type", "requestId", "confirmation"]);
 const AGENT_CONFIRMATION_FIELDS = new Set(["confirmationId", "executionId"]);
+const OPEN_ITEM_CREATE_FIELDS = new Set([
+  "type", "requestId", "roomId", "creationKind", "sourceMessageId", "targetActorId", "content",
+]);
+const OPEN_ITEM_TRANSITION_REQUIRED_FIELDS = new Set(["type", "requestId", "roomId", "itemId", "action"]);
+const OPEN_ITEM_TRANSITION_OPTIONAL_FIELDS = new Set(["targetActorId", "reason"]);
 
 export const PROTOCOL_FIELD_LIMITS = Object.freeze({
   requestId: 128,
@@ -176,6 +182,27 @@ export interface AgentCompensateFrame {
   readonly executionId: string;
 }
 
+export interface OpenItemCreateFrame {
+  readonly type: "open-item.create";
+  readonly requestId: string;
+  readonly roomId: string;
+  readonly creationKind: "human_mention" | "manual_unfinished";
+  readonly sourceMessageId: string;
+  readonly targetActorId: string;
+  readonly content: string;
+}
+
+export type OpenItemTransitionFrame = {
+  readonly type: "open-item.transition";
+  readonly requestId: string;
+  readonly roomId: string;
+  readonly itemId: string;
+} & (
+  | { readonly action: "answer" }
+  | { readonly action: "defer" | "cannot_answer"; readonly reason: string }
+  | { readonly action: "transfer"; readonly targetActorId: string; readonly reason: string }
+);
+
 export type ClientFrame =
   | AuthLoginFrame
   | AuthResumeFrame
@@ -195,7 +222,9 @@ export type ClientFrame =
   | AgentInterruptFrame
   | AgentRetryFrame
   | AgentToolConfirmFrame
-  | AgentCompensateFrame;
+  | AgentCompensateFrame
+  | OpenItemCreateFrame
+  | OpenItemTransitionFrame;
 
 export interface AuthenticatedFrame {
   readonly type: "auth.authenticated";
@@ -279,6 +308,12 @@ export interface AgentExecutionPreviewFrame {
   readonly authoritative: false;
 }
 
+export interface OpenItemAckFrame {
+  readonly type: "open-item.ack";
+  readonly requestId: string;
+  readonly item: OpenItem;
+}
+
 export type ProtocolErrorCode =
   | AuthenticationErrorCode
   | MessageErrorCode
@@ -306,6 +341,7 @@ export type ProtocolErrorCode =
   | "agent_runtime_closed"
   | "execution_conflict"
   | "execution_not_found"
+  | "open_item_not_found"
   | "invalid_parameters"
   | "permission_denied"
   | "provider_authentication"
@@ -345,6 +381,7 @@ export type ServerFrame =
   | RoomSubscribeV2RetryFrame
   | AgentExecutionAckFrame
   | AgentExecutionPreviewFrame
+  | OpenItemAckFrame
   | ProtocolErrorFrame;
 
 export type ClientFrameParseResult =
@@ -761,6 +798,42 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
         confirmationId: value.confirmation.confirmationId,
         executionId: value.confirmation.executionId,
       } } };
+    case "open-item.create":
+      if (!hasOnlyFields(value, OPEN_ITEM_CREATE_FIELDS) || requestId === undefined ||
+          !isBoundedString(value.roomId, PROTOCOL_FIELD_LIMITS.roomId) ||
+          (value.creationKind !== "human_mention" && value.creationKind !== "manual_unfinished") ||
+          !isBoundedString(value.sourceMessageId, PROTOCOL_FIELD_LIMITS.messageId) ||
+          !isBoundedString(value.targetActorId, PROTOCOL_FIELD_LIMITS.accountId) ||
+          !isBoundedString(value.content, PROTOCOL_FIELD_LIMITS.body)) {
+        return { ok: false, error: protocolError("open-item.create requires a closed human request", requestId) };
+      }
+      return { ok: true, frame: {
+        type: "open-item.create", requestId, roomId: value.roomId,
+        creationKind: value.creationKind, sourceMessageId: value.sourceMessageId,
+        targetActorId: value.targetActorId, content: value.content,
+      } };
+    case "open-item.transition": {
+      if (!hasRequiredAndOptionalFields(
+        value, OPEN_ITEM_TRANSITION_REQUIRED_FIELDS, OPEN_ITEM_TRANSITION_OPTIONAL_FIELDS,
+      ) || requestId === undefined ||
+          !isBoundedString(value.roomId, PROTOCOL_FIELD_LIMITS.roomId) ||
+          !isBoundedString(value.itemId, PROTOCOL_FIELD_LIMITS.messageId)) {
+        return { ok: false, error: protocolError("open-item.transition requires a closed transition", requestId) };
+      }
+      const base = { type: "open-item.transition" as const, requestId, roomId: value.roomId, itemId: value.itemId };
+      if (value.action === "answer" && value.reason === undefined && value.targetActorId === undefined) {
+        return { ok: true, frame: { ...base, action: "answer" } };
+      }
+      if ((value.action === "defer" || value.action === "cannot_answer") &&
+          isBoundedString(value.reason, 1_024) && value.targetActorId === undefined) {
+        return { ok: true, frame: { ...base, action: value.action, reason: value.reason } };
+      }
+      if (value.action === "transfer" && isBoundedString(value.reason, 1_024) &&
+          isBoundedString(value.targetActorId, PROTOCOL_FIELD_LIMITS.accountId)) {
+        return { ok: true, frame: { ...base, action: "transfer", targetActorId: value.targetActorId, reason: value.reason } };
+      }
+      return { ok: false, error: protocolError("open-item.transition requires a closed transition", requestId) };
+    }
     default:
       return { ok: false, error: protocolError("Unknown request type", requestId) };
   }

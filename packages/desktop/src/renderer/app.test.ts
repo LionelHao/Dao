@@ -173,8 +173,9 @@ describe("verified collaboration primitive renderer", () => {
       { ...empty(), humanReads: [{ ...read, messageId: "other-message" }] },
       { ...empty(), openItems: [{
         id: "wrong-room", roomId: "other-room", sourceMessageId: "preview-agent-data",
-        requesterId: "human-a", ownerId: "human-a", content: "closed",
-        status: "pending_response", createdAt: "2026-08-12T00:00:00.000Z",
+        requesterId: "human-a", currentOwnerId: "human-a", content: "closed",
+        status: "awaiting", origin: { kind: "human_mention" },
+        createdAt: "2026-08-12T00:00:00.000Z",
         transferChain: [],
       }] },
       { ...empty(), humanReads: [read], agentJudgements: [{ ...judgement, id: read.id }] },
@@ -221,9 +222,10 @@ describe("verified collaboration primitive renderer", () => {
         roomId: "preview-room",
         sourceMessageId: "preview-agent-data",
         requesterId: "恢复请求者",
-        ownerId: "恢复负责人",
+        currentOwnerId: "恢复负责人",
         content: "恢复后的待答问题",
-        status: "pending_response",
+        status: "awaiting",
+        origin: { kind: "manual_unfinished" },
         createdAt: "2026-08-12T13:00:02.000Z",
         transferChain: [],
       }],
@@ -282,6 +284,9 @@ describe("verified collaboration primitive renderer", () => {
     expect(routeJudgment?.classList.contains("typing")).toBe(false);
     expect(openItem?.textContent).toContain("恢复后的待答问题");
     expect(openItem?.textContent).toContain("待答项");
+    expect(openItem?.textContent).toContain("来源：手动标记未完");
+    expect(openItem?.getAttribute("data-source-message-id")).toBe("preview-agent-data");
+    expect(openItem?.querySelectorAll(".human-request-action")).toHaveLength(3);
     expect(agentExecution?.textContent).toContain("恢复 Agent 正在调用");
     expect(agentExecution?.textContent).toContain("restore.inspect");
     expect(agentExecution?.textContent).toContain("Agent 执行");
@@ -289,7 +294,7 @@ describe("verified collaboration primitive renderer", () => {
     expect(calibration?.textContent).toContain("👍 校准：影响后续发言判定");
     expect(humanRead?.getAttribute("data-receipt-kind")).toBe("human-read");
     expect(agentJudgement?.getAttribute("data-receipt-kind")).toBe("agent-judgement");
-    expect(openItem?.getAttribute("data-open-item-status")).toBe("pending_response");
+    expect(openItem?.getAttribute("data-open-item-status")).toBe("awaiting");
     expect(agentExecution?.getAttribute("data-agent-invocation")).toBe("恢复 Agent");
     expect(agentExecution?.getAttribute("data-execution-status")).toBe("running");
     expect(social?.getAttribute("data-reaction-kind")).toBe("social");
@@ -336,11 +341,55 @@ describe("verified collaboration primitive renderer", () => {
     expect(root.textContent).toContain("@all 只调用 Agent");
     expect(root.textContent).toContain("@here 仅群主可用");
     expect(root.querySelector("[data-agent-invocation] [data-action='reject']")).toBeNull();
+    expect(root.querySelectorAll("[data-open-item-status='transferred'] .human-request-action"))
+      .toHaveLength(3);
+    expect(root.querySelector("[data-open-item-status='transferred']")?.textContent)
+      .toContain("来源：手动标记未完");
+    expect(root.querySelectorAll("[data-agent-invocation] .human-request-action")).toHaveLength(0);
 
     interrupt?.click();
 
     expect(root.querySelector("[data-agent-invocation]")?.getAttribute("data-execution-status")).toBe("cancelled");
     expect(root.querySelector("[data-member-id='agent-data']")?.textContent).toBe("可用");
+  });
+
+  it("renders D-01 content, unique owner, source, four states, and active human actions", () => {
+    const root = document.createElement("main");
+    const common = {
+      roomId: "preview-room", sourceMessageId: "preview-agent-data",
+      requesterId: "human-requester", content: "D-01 commitment",
+      origin: { kind: "manual_unfinished" as const }, createdAt: "2026-08-12T00:00:00.000Z",
+    };
+    app.renderM2PrimitivesPreview?.(root, {
+      humanReads: [], agentJudgements: [], routeJudgments: [], agentExecutions: [],
+      socialReactions: [], calibrations: [],
+      openItems: [
+        { ...common, id: "item-awaiting", currentOwnerId: "human-owner", status: "awaiting", transferChain: [] },
+        { ...common, id: "item-transferred", currentOwnerId: "human-next", status: "transferred",
+          transferChain: [{ fromId: "human-owner", toId: "human-next", reason: "handoff",
+            transferredAt: "2026-08-12T00:01:00.000Z" }] },
+        { ...common, id: "item-answered", currentOwnerId: null, status: "answered", transferChain: [],
+          respondedAt: "2026-08-12T00:02:00.000Z" },
+        { ...common, id: "item-deferred", currentOwnerId: null, status: "deferred", transferChain: [],
+          respondedAt: "2026-08-12T00:03:00.000Z" },
+      ],
+    });
+    expect(root.querySelector("[data-open-item-status='awaiting']")?.textContent)
+      .toContain("human-owner · 待回应");
+    expect(root.querySelector("[data-open-item-status='transferred']")?.textContent)
+      .toContain("human-next · 已转交");
+    expect(root.querySelector("[data-open-item-status='answered']")?.textContent)
+      .toContain("已闭合 · 已回应");
+    expect(root.querySelector("[data-open-item-status='deferred']")?.textContent)
+      .toContain("已闭合 · 已搁置");
+    expect(root.querySelectorAll("[data-open-item-status='awaiting'] .human-request-action"))
+      .toHaveLength(3);
+    expect(root.querySelectorAll("[data-open-item-status='transferred'] .human-request-action"))
+      .toHaveLength(3);
+    expect(root.querySelectorAll("[data-open-item-status='answered'] .human-request-action"))
+      .toHaveLength(0);
+    expect(root.querySelectorAll("[data-open-item-status='deferred'] .human-request-action"))
+      .toHaveLength(0);
   });
 
   it("T-0014 exposes human mutation controls, append-only correction, and separate calibration", () => {

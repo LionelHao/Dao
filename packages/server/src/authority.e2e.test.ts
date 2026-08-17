@@ -1112,6 +1112,83 @@ describe("authoritative server real-process harness", () => {
     }
   });
 
+  it("persists one human OpenItem through WebSocket replay, repair, terminal CAS, and restart", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-open-item-restart-"));
+    let first: ChildProcessWithoutNullStreams | undefined;
+    let second: ChildProcessWithoutNullStreams | undefined;
+    let client: JsonWebSocketClient | undefined;
+    try {
+      const seeded = await spawnAuthorityChild({ directory, seedAllFacts: true });
+      first = seeded.child;
+      client = await JsonWebSocketClient.connect(seeded.url);
+      await client.login("open-item-login");
+      const roomId = await discoverRoom(client);
+      const before = await repairRecords(client, roomId);
+      const source = before.records.find((record) =>
+        record.kind === "message" && record.value.authorKind === "human");
+      if (source?.kind !== "message") throw new Error("missing human source message");
+      const create = {
+        type: "open-item.create" as const,
+        requestId: "open-item-create",
+        roomId,
+        creationKind: "human_mention" as const,
+        sourceMessageId: source.value.id,
+        targetActorId: "human-a",
+        content: "Please close this authoritative request",
+      };
+      const firstAck = await client.request(create, "open-item.ack");
+      if (firstAck.type !== "open-item.ack") throw new Error("wrong OpenItem acknowledgement");
+      const replayAck = await client.request(
+        { ...create, requestId: "open-item-create-replay" },
+        "open-item.ack",
+      );
+      expect(replayAck).toMatchObject({
+        type: "open-item.ack",
+        item: { id: firstAck.item.id, status: "awaiting", currentOwnerId: "human-a" },
+      });
+      const answered = await client.request({
+        type: "open-item.transition", requestId: "open-item-answer", roomId,
+        itemId: firstAck.item.id, action: "answer",
+      }, "open-item.ack");
+      expect(answered).toMatchObject({
+        type: "open-item.ack", item: { id: firstAck.item.id, status: "answered", currentOwnerId: null },
+      });
+      await expect(client.request({
+        type: "open-item.transition", requestId: "open-item-terminal-conflict", roomId,
+        itemId: firstAck.item.id, action: "defer", reason: "too late",
+      }, "open-item.ack")).rejects.toMatchObject({ status: 409, code: "execution_conflict" });
+      const current = await repairRecords(client, roomId);
+      expect(current.records.filter((record) =>
+        record.kind === "open-item" && record.value.id === firstAck.item.id)).toEqual([
+        expect.objectContaining({ kind: "open-item", value: expect.objectContaining({ status: "answered" }) }),
+      ]);
+      client.close();
+      await stopChild(first);
+      first = undefined;
+      await unlink(join(directory, "snapshot-cache.sqlite")).catch(() => undefined);
+
+      const restarted = await spawnAuthorityChild({ directory, readbackOnly: true });
+      second = restarted.child;
+      client = await JsonWebSocketClient.connect(restarted.url);
+      await client.login("open-item-restart-login");
+      const repaired = await repairRecords(client, roomId);
+      expect(repaired.records.filter((record) =>
+        record.kind === "open-item" && record.value.id === firstAck.item.id)).toHaveLength(1);
+      const database = new DatabaseSync(join(directory, "authority.sqlite"), { readOnly: true });
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.open_item.changed' AND payload_json LIKE ?",
+      ).get(`%${firstAck.item.id}%`)).toEqual({ count: 2 });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM open_items WHERE id = ?")
+        .get(firstAck.item.id)).toEqual({ count: 1 });
+      database.close();
+    } finally {
+      client?.close();
+      if (first !== undefined) await stopChild(first);
+      if (second !== undefined) await stopChild(second);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   for (const [faultPoint, expectedExit] of [
     ["after-domain-write", 81],
     ["before-commit", 82],

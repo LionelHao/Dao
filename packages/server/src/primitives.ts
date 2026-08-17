@@ -4,6 +4,7 @@ import {
   isCalibrationSignal,
   isHumanReadReceipt,
   isOpenItem,
+  isOpenItemAgentFailure,
 } from "@native-im/core";
 import type {
   Actor,
@@ -18,6 +19,7 @@ import type {
   HumanReadReceipt,
   Message,
   OpenItem,
+  OpenItemAgentFailure,
   OpenItemTransfer,
   Room,
   SocialReaction,
@@ -39,6 +41,8 @@ export type {
   CalibrationSignal,
   HumanReadReceipt,
   OpenItem,
+  OpenItemAgentFailure,
+  OpenItemOrigin,
   OpenItemStatus,
   OpenItemTransfer,
   SocialReaction,
@@ -73,6 +77,7 @@ export type AcceptedCollaborationFact =
   | { readonly kind: "human-read"; readonly value: HumanReadReceipt }
   | { readonly kind: "agent-judgment"; readonly value: AgentJudgement }
   | { readonly kind: "open-item"; readonly value: OpenItem }
+  | { readonly kind: "open-item-agent-failure"; readonly value: OpenItemAgentFailure }
   | { readonly kind: "agent-execution"; readonly value: AgentExecution }
   | { readonly kind: "calibration"; readonly value: CalibrationSignal };
 
@@ -116,7 +121,9 @@ export interface CollaborationPrimitivesOptions {
 type HumanReadCommand = Extract<HumanCollaborationCommand, { readonly type: "human.read.record" }>;
 type AgentJudgementCommand = Extract<AgentCollaborationCommand, { readonly type: "agent.judgment.record" }>;
 type OpenItemCreateCommand = Extract<HumanCollaborationCommand, { readonly type: "open-item.create" }>;
+type OpenItemProposalCommand = Extract<AgentCollaborationCommand, { readonly type: "open-item.propose" }>;
 type OpenItemTransitionCommand = Extract<HumanCollaborationCommand, { readonly type: "open-item.transition" }>;
+type OpenItemAgentFailureCommand = Extract<AgentCollaborationCommand, { readonly type: "open-item.agent-failure.record" }>;
 type AgentExecutionCommand = Extract<AgentCollaborationCommand, { readonly type: "agent.execution.transition" }>;
 type CalibrationCommand = Extract<HumanCollaborationCommand, { readonly type: "calibration.record" }>;
 
@@ -137,15 +144,25 @@ export interface AuthoritativeCollaborationPrimitives {
     payload: AgentJudgementCommand["payload"],
   ): Promise<AgentJudgement>;
   createOpenItem(
-    context: AuthenticatedCommandContext | InternalAgentCommandContext,
+    context: AuthenticatedCommandContext,
     roomId: string,
     payload: OpenItemCreateCommand["payload"],
+  ): Promise<OpenItem>;
+  proposeOpenItem(
+    context: InternalAgentCommandContext,
+    roomId: string,
+    payload: OpenItemProposalCommand["payload"],
   ): Promise<OpenItem>;
   transitionOpenItem(
     context: AuthenticatedCommandContext | InternalAgentCommandContext,
     roomId: string,
     payload: OpenItemTransitionCommand["payload"],
   ): Promise<OpenItem>;
+  recordOpenItemAgentFailure(
+    context: InternalAgentCommandContext,
+    roomId: string,
+    payload: OpenItemAgentFailureCommand["payload"],
+  ): Promise<OpenItemAgentFailure>;
   transitionAgentExecution(
     context: InternalAgentCommandContext,
     roomId: string,
@@ -193,15 +210,6 @@ export function createAuthoritativeCollaborationPrimitives(
     return value;
   }
 
-  function executeOpenItem(
-    context: AuthenticatedCommandContext | InternalAgentCommandContext,
-    command: OpenItemCreateCommand | OpenItemTransitionCommand,
-  ): Promise<CommandAcknowledgement> {
-    return context.kind === "human"
-      ? options.commandStore.executeHuman(context, command)
-      : options.commandStore.executeAgent(context, command);
-  }
-
   return {
     recordHumanRead(context, roomId, payload) {
       return publish(
@@ -221,7 +229,15 @@ export function createAuthoritativeCollaborationPrimitives(
     },
     createOpenItem(context, roomId, payload) {
       return publish(
-        executeOpenItem(context, { type: "open-item.create", roomId, payload }),
+        options.commandStore.executeHuman(context, { type: "open-item.create", roomId, payload }),
+        "item",
+        isOpenItem,
+        (value) => ({ kind: "open-item", value }),
+      );
+    },
+    proposeOpenItem(context, roomId, payload) {
+      return publish(
+        options.commandStore.executeAgent(context, { type: "open-item.propose", roomId, payload }),
         "item",
         isOpenItem,
         (value) => ({ kind: "open-item", value }),
@@ -229,10 +245,22 @@ export function createAuthoritativeCollaborationPrimitives(
     },
     transitionOpenItem(context, roomId, payload) {
       return publish(
-        executeOpenItem(context, { type: "open-item.transition", roomId, payload }),
+        context.kind === "human"
+          ? options.commandStore.executeHuman(context, { type: "open-item.transition", roomId, payload })
+          : options.commandStore.executeAgent(context, { type: "open-item.transition", roomId, payload }),
         "item",
         isOpenItem,
         (value) => ({ kind: "open-item", value }),
+      );
+    },
+    recordOpenItemAgentFailure(context, roomId, payload) {
+      return publish(
+        options.commandStore.executeAgent(context, {
+          type: "open-item.agent-failure.record", roomId, payload,
+        }),
+        "failure",
+        isOpenItemAgentFailure,
+        (value) => ({ kind: "open-item-agent-failure", value }),
       );
     },
     transitionAgentExecution(context, roomId, payload) {
@@ -272,7 +300,7 @@ export interface CollaborationPrimitives {
     readonly content: string;
   }): OpenItem;
   openItemsFor(roomId: string): readonly OpenItem[];
-  respondToOpenItem(itemId: string, status: "responded" | "deferred"): OpenItem;
+  respondToOpenItem(itemId: string, status: "answered" | "deferred"): OpenItem;
   transferOpenItem(itemId: string, targetId: string, reason: string): OpenItem;
   addressAgent(input: {
     readonly messageId: string;
@@ -561,9 +589,10 @@ export function createCollaborationPrimitives(
         roomId: sourceMessage.roomId,
         sourceMessageId: sourceMessage.id,
         requesterId: input.requesterId,
-        ownerId: input.targetId,
+        currentOwnerId: input.targetId,
         content: input.content,
-        status: "pending_response",
+        status: "awaiting",
+        origin: { kind: "human_mention" },
         createdAt: now(),
         transferChain: [],
       };
@@ -576,7 +605,7 @@ export function createCollaborationPrimitives(
       return [...openItemsById.values()].filter((item) => item.roomId === roomId).map(cloneOpenItem);
     },
 
-    respondToOpenItem(itemId: string, status: "responded" | "deferred"): OpenItem {
+    respondToOpenItem(itemId: string, status: "answered" | "deferred"): OpenItem {
       const item = openItemsById.get(itemId);
       if (item === undefined) {
         throw new CollaborationPrimitiveError("unknown_open_item");
@@ -584,7 +613,8 @@ export function createCollaborationPrimitives(
       const next: OpenItem = {
         ...item,
         status,
-        ...(status === "responded" ? { respondedAt: now() } : {}),
+        currentOwnerId: null,
+        respondedAt: now(),
       };
       openItemsById.set(itemId, next);
       return cloneOpenItem(next);
@@ -599,14 +629,16 @@ export function createCollaborationPrimitives(
       assertRoomMembership(targetId, item.roomId);
       requireNonEmpty(reason);
       const transfer: OpenItemTransfer = {
-        fromId: item.ownerId,
+        fromId: item.currentOwnerId ?? (() => {
+          throw new CollaborationPrimitiveError("unknown_open_item");
+        })(),
         toId: targetId,
         reason,
         transferredAt: now(),
       };
       const next: OpenItem = {
         ...item,
-        ownerId: targetId,
+        currentOwnerId: targetId,
         status: "transferred",
         transferChain: [...item.transferChain, transfer],
       };

@@ -31,6 +31,7 @@ import {
 import { MessageIdConflictError } from "./store.js";
 import type { SyncService } from "./sync-service.js";
 import type { AgentRuntime } from "./agent-runtime/contracts.js";
+import type { AuthoritativeCollaborationPrimitives } from "./primitives.js";
 import {
   parseClientFrame,
   type AuthenticatedFrame,
@@ -72,6 +73,7 @@ export interface StartMessageWebSocketServerOptions {
   readonly v2GateMaxEvents?: number;
   readonly v2GateMaxBytes?: number;
   readonly agentRuntime?: AgentRuntime;
+  readonly collaboration?: Pick<AuthoritativeCollaborationPrimitives, "createOpenItem" | "transitionOpenItem">;
 }
 
 type RuntimeMessageWebSocketServerOptions = StartMessageWebSocketServerOptions & {
@@ -183,6 +185,7 @@ const MAPPED_SERVICE_ERROR_STATUSES = new Map<ProtocolErrorFrame["code"], Protoc
   ["agent_runtime_closed", 503],
   ["execution_conflict", 409],
   ["execution_not_found", 404],
+  ["open_item_not_found", 404],
   ["invalid_parameters", 400],
   ["permission_denied", 403],
   ["provider_authentication", 503],
@@ -784,7 +787,9 @@ function isCorrelatedRecoveryResponse(
       | "agent.interrupt"
       | "agent.retry"
       | "agent.tool.confirm"
-      | "agent.compensate";
+      | "agent.compensate"
+      | "open-item.create"
+      | "open-item.transition";
   }>,
   response: unknown,
 ): response is ServerFrame {
@@ -863,7 +868,9 @@ async function handleRecoveryFrame(
       | "agent.interrupt"
       | "agent.retry"
       | "agent.tool.confirm"
-      | "agent.compensate";
+      | "agent.compensate"
+      | "open-item.create"
+      | "open-item.transition";
   }>,
   options: StartMessageWebSocketServerOptions,
   context: ConnectionContext,
@@ -1529,6 +1536,42 @@ async function handleFrame(
         if (!context.closed) {
           sendFrame(socket, mappedError(error, frame.requestId));
         }
+      }
+      return;
+    }
+    case "open-item.create":
+    case "open-item.transition": {
+      const session = await requireSession(socket, frame.requestId, options, context);
+      if (session === undefined) return;
+      if (options.collaboration === undefined) {
+        sendFrame(socket, errorFrame(503, "storage_unavailable", "storage_unavailable", frame.requestId));
+        return;
+      }
+      const commandContext = {
+        ...session,
+        kind: "human" as const,
+        requestId: frame.requestId,
+        idempotencyKey: frame.type === "open-item.create"
+          ? `${frame.creationKind}:${frame.sourceMessageId}:${frame.targetActorId}`
+          : `${frame.type}:${frame.requestId}`,
+      };
+      try {
+        const item = frame.type === "open-item.create"
+          ? await options.collaboration.createOpenItem(commandContext, frame.roomId, {
+              creationKind: frame.creationKind,
+              sourceMessageId: frame.sourceMessageId,
+              targetActorId: frame.targetActorId,
+              content: frame.content,
+            })
+          : await options.collaboration.transitionOpenItem(commandContext, frame.roomId,
+              frame.action === "answer"
+                ? { itemId: frame.itemId, action: "answer" }
+                : frame.action === "transfer"
+                  ? { itemId: frame.itemId, action: "transfer", targetActorId: frame.targetActorId, reason: frame.reason }
+                  : { itemId: frame.itemId, action: frame.action, reason: frame.reason });
+        sendFrame(socket, { type: "open-item.ack", requestId: frame.requestId, item });
+      } catch (error: unknown) {
+        sendFrame(socket, mappedError(error, frame.requestId));
       }
       return;
     }

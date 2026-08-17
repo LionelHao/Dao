@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
-export const AUTHORITY_SCHEMA_VERSION = 7 as const;
+export const AUTHORITY_SCHEMA_VERSION = 8 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -29,6 +29,8 @@ const V6_MIGRATION_CHECKSUM =
   "87b3d62db40e9e7f8fa3e643315a62c26f01968d4065fb743fa502a7251d9257";
 const V7_MIGRATION_CHECKSUM =
   "4ad86ad359400228cf5428d7bb59c5fc371009904fe50cfedd4641e79e6d4977";
+const V8_MIGRATION_CHECKSUM =
+  "b0eb63981b5ee92cfd51133972e78c4054c3fdf155cee58ce4c029564ed6d1d1";
 const SCHEMA_FINGERPRINTS = {
   1: "03f2bbba4aa7082ec01819824726ce1bd9b4bd14cebea71afc93c6821dbf405c",
   2: "01c37d92ec2f303613a7bb8b592ca846fbea7c829b3c81fe4521699db949dfcc",
@@ -37,6 +39,7 @@ const SCHEMA_FINGERPRINTS = {
   5: "b804592978b0afde52b64574534f355eaaf12db2d3401f0ebdf3d09373ca40a0",
   6: "0e5c764a0fae33f00eae7bfd2e21dbbc4d54781d43ef5aa967c6dfeef8c58035",
   7: "9827d65dd5eac378112a51859251ac842d4393c518f21f8862956aa6ebd0edae",
+  8: "7dcef5f3d765e7d19015f19aca2d033aee0f0b3c07f53c4934e3c1d2b6053f20",
 } as const;
 
 const V1_STATEMENTS = [
@@ -515,6 +518,182 @@ const V7_STATEMENTS = [
   `CREATE INDEX route_calibration_facts_agent_topic_v7 ON route_calibration_facts(agent_id, topic_key, created_at)`,
 ] as const;
 
+const V8_STATEMENTS = [
+  `DROP TRIGGER open_items_validate_insert`,
+  `DROP TRIGGER open_items_validate_update`,
+  `DROP TRIGGER messages_validate_update`,
+  `ALTER TABLE open_items RENAME TO open_items_v7`,
+  `CREATE TABLE open_items (
+    id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    source_message_id TEXT NOT NULL REFERENCES messages(id),
+    current_owner_actor_id TEXT REFERENCES actors(id),
+    status TEXT NOT NULL CHECK (status IN ('awaiting', 'answered', 'deferred', 'transferred')),
+    body TEXT NOT NULL CHECK (length(trim(body)) > 0),
+    created_at TEXT NOT NULL,
+    responded_at TEXT,
+    requester_actor_id TEXT NOT NULL REFERENCES actors(id),
+    transfer_chain_json TEXT NOT NULL
+      CHECK (json_valid(transfer_chain_json) AND json_type(transfer_chain_json) = 'array'),
+    origin_kind TEXT NOT NULL CHECK (origin_kind IN ('human_mention', 'manual_unfinished', 'agent_proposal')),
+    proposal_kind TEXT CHECK (proposal_kind IS NULL OR proposal_kind IN ('risk', 'challenge')),
+    source_execution_id TEXT REFERENCES agent_executions(id),
+    proposal_reason TEXT,
+    CHECK (
+      (status IN ('awaiting', 'transferred')
+       AND current_owner_actor_id IS NOT NULL AND responded_at IS NULL)
+      OR
+      (status IN ('answered', 'deferred')
+       AND current_owner_actor_id IS NULL AND responded_at IS NOT NULL)
+    ),
+    CHECK (
+      (origin_kind = 'agent_proposal'
+       AND proposal_kind IS NOT NULL
+       AND source_execution_id IS NOT NULL
+       AND proposal_reason IS NOT NULL
+       AND length(trim(proposal_reason)) > 0)
+      OR
+      (origin_kind IN ('human_mention', 'manual_unfinished')
+       AND proposal_kind IS NULL
+       AND source_execution_id IS NULL
+       AND proposal_reason IS NULL)
+    ),
+    CHECK (status <> 'awaiting' OR json_array_length(transfer_chain_json) = 0),
+    CHECK (status <> 'transferred' OR json_array_length(transfer_chain_json) > 0)
+  ) STRICT`,
+  `INSERT INTO open_items (
+     id, room_id, source_message_id, current_owner_actor_id, status, body,
+     created_at, responded_at, requester_actor_id, transfer_chain_json,
+     origin_kind, proposal_kind, source_execution_id, proposal_reason
+   )
+   SELECT id, room_id, source_message_id,
+          CASE WHEN status IN ('responded', 'deferred') THEN NULL ELSE assigned_actor_id END,
+          CASE status
+            WHEN 'pending_response' THEN 'awaiting'
+            WHEN 'responded' THEN 'answered'
+            WHEN 'deferred' THEN 'deferred'
+            WHEN 'transferred' THEN 'transferred'
+          END,
+          body, created_at,
+          CASE WHEN status IN ('responded', 'deferred')
+            THEN COALESCE(responded_at, resolved_at, created_at)
+            ELSE NULL
+          END,
+          requester_actor_id, transfer_chain_json,
+          'manual_unfinished', NULL, NULL, NULL
+   FROM open_items_v7`,
+  `DROP TABLE open_items_v7`,
+  `CREATE INDEX open_items_room_id_id ON open_items(room_id, id)`,
+  `CREATE INDEX open_items_active_owner_v8
+   ON open_items(room_id, current_owner_actor_id, status, id)`,
+  `CREATE TABLE open_item_agent_failures (
+    id TEXT PRIMARY KEY,
+    open_item_id TEXT NOT NULL REFERENCES open_items(id),
+    execution_id TEXT NOT NULL REFERENCES agent_executions(id),
+    attempt_seq INTEGER NOT NULL CHECK (attempt_seq >= 1),
+    reason_code TEXT NOT NULL CHECK (length(trim(reason_code)) > 0),
+    failed_at TEXT NOT NULL,
+    UNIQUE (open_item_id, execution_id, attempt_seq)
+  ) STRICT`,
+  `CREATE INDEX open_item_agent_failures_item_v8
+   ON open_item_agent_failures(open_item_id, failed_at, id)`,
+  `CREATE TRIGGER open_items_validate_insert_v8
+   BEFORE INSERT ON open_items
+   WHEN COALESCE((SELECT room_id FROM messages WHERE id = NEW.source_message_id), '') <> NEW.room_id
+      OR NOT EXISTS (
+        SELECT 1 FROM room_memberships
+        WHERE room_id = NEW.room_id AND actor_id = NEW.requester_actor_id
+      )
+      OR (NEW.current_owner_actor_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM room_memberships
+        WHERE room_id = NEW.room_id AND actor_id = NEW.current_owner_actor_id
+      ))
+      OR (NEW.status = 'transferred' AND
+          COALESCE(json_extract(NEW.transfer_chain_json, '$[#-1].toId'), '')
+            <> NEW.current_owner_actor_id)
+      OR (NEW.origin_kind = 'agent_proposal' AND NOT EXISTS (
+        SELECT 1 FROM agent_executions AS execution
+        WHERE execution.id = NEW.source_execution_id
+          AND execution.room_id = NEW.room_id
+          AND execution.trigger_message_id = NEW.source_message_id
+          AND execution.agent_id = NEW.requester_actor_id
+      ))
+   BEGIN
+     SELECT RAISE(ABORT, 'canonical open item is invalid');
+   END`,
+  `CREATE TRIGGER open_items_validate_update_v8
+   BEFORE UPDATE ON open_items
+   WHEN NEW.id <> OLD.id
+      OR NEW.room_id <> OLD.room_id
+      OR NEW.source_message_id <> OLD.source_message_id
+      OR NEW.requester_actor_id <> OLD.requester_actor_id
+      OR NEW.body <> OLD.body
+      OR NEW.created_at <> OLD.created_at
+      OR NEW.origin_kind <> OLD.origin_kind
+      OR NEW.proposal_kind IS NOT OLD.proposal_kind
+      OR NEW.source_execution_id IS NOT OLD.source_execution_id
+      OR NEW.proposal_reason IS NOT OLD.proposal_reason
+      OR OLD.status IN ('answered', 'deferred')
+      OR json_array_length(NEW.transfer_chain_json) < json_array_length(OLD.transfer_chain_json)
+      OR EXISTS (
+        SELECT 1 FROM json_each(OLD.transfer_chain_json) AS old_transfer
+        WHERE json_extract(NEW.transfer_chain_json, '$[' || old_transfer.key || ']')
+          IS NOT old_transfer.value
+      )
+      OR (NEW.current_owner_actor_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM room_memberships
+        WHERE room_id = NEW.room_id AND actor_id = NEW.current_owner_actor_id
+      ))
+      OR (NEW.status = 'transferred' AND
+          COALESCE(json_extract(NEW.transfer_chain_json, '$[#-1].toId'), '')
+            <> NEW.current_owner_actor_id)
+   BEGIN
+     SELECT RAISE(ABORT, 'canonical open item update is invalid');
+   END`,
+  `CREATE TRIGGER open_item_agent_failures_validate_insert_v8
+   BEFORE INSERT ON open_item_agent_failures
+   WHEN NOT EXISTS (
+     SELECT 1
+     FROM open_items AS item
+     JOIN actors AS owner ON owner.id = item.current_owner_actor_id
+     JOIN agent_executions AS execution ON execution.id = NEW.execution_id
+     WHERE item.id = NEW.open_item_id
+       AND item.status IN ('awaiting', 'transferred')
+       AND owner.kind = 'agent'
+       AND execution.room_id = item.room_id
+       AND execution.trigger_message_id = item.source_message_id
+       AND execution.agent_id = item.current_owner_actor_id
+       AND execution.status = 'failed'
+       AND execution.current_attempt_seq = NEW.attempt_seq
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'open item Agent failure is invalid');
+   END`,
+  `CREATE TRIGGER messages_validate_update_v8
+   BEFORE UPDATE OF room_id, author_id, author_kind ON messages
+   WHEN COALESCE((SELECT kind FROM actors WHERE id = NEW.author_id), '')
+          <> NEW.author_kind
+      OR EXISTS (
+        SELECT 1 FROM human_read_receipts
+        WHERE message_id = OLD.id AND room_id <> NEW.room_id
+      )
+      OR EXISTS (
+        SELECT 1 FROM agent_judgments
+        WHERE message_id = OLD.id AND room_id <> NEW.room_id
+      )
+      OR EXISTS (
+        SELECT 1 FROM open_items
+        WHERE source_message_id = OLD.id AND room_id <> NEW.room_id
+      )
+      OR EXISTS (
+        SELECT 1 FROM agent_executions
+        WHERE trigger_message_id = OLD.id AND room_id <> NEW.room_id
+      )
+   BEGIN
+     SELECT RAISE(ABORT, 'message update would break authority references');
+   END`,
+] as const;
+
 const V2_STATEMENTS = [
   `ALTER TABLE actors
    ADD COLUMN catalog_revision INTEGER NOT NULL DEFAULT 0
@@ -860,7 +1039,7 @@ function defineMigration(
 ): Migration {
   const checksum = migrationChecksum(version, name, statements);
   if (historicalChecksum !== undefined && checksum !== historicalChecksum) {
-    throw new Error(`Historical migration ${version} no longer matches its checksum`);
+    throw new Error(`Historical migration ${version} no longer matches its checksum: ${checksum}`);
   }
   return {
     version,
@@ -898,6 +1077,7 @@ const MIGRATIONS = [
   ),
   defineMigration(6, "agent-runtime-authority", V6_STATEMENTS, V6_MIGRATION_CHECKSUM),
   defineMigration(7, "single-route-authority", V7_STATEMENTS, V7_MIGRATION_CHECKSUM),
+  defineMigration(8, "closed-open-item-authority", V8_STATEMENTS, V8_MIGRATION_CHECKSUM),
 ] as const satisfies readonly Migration[];
 
 const V1_SCHEMA_CONTRACT = {
@@ -1162,6 +1342,18 @@ const V7_SCHEMA_CONTRACT = {
   route_metrics: ["route_job_id", "metric_name", "value", "recorded_at"],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V8_SCHEMA_CONTRACT = {
+  ...V7_SCHEMA_CONTRACT,
+  open_items: [
+    "id", "room_id", "source_message_id", "current_owner_actor_id", "status", "body",
+    "created_at", "responded_at", "requester_actor_id", "transfer_chain_json",
+    "origin_kind", "proposal_kind", "source_execution_id", "proposal_reason",
+  ],
+  open_item_agent_failures: [
+    "id", "open_item_id", "execution_id", "attempt_seq", "reason_code", "failed_at",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
@@ -1170,6 +1362,7 @@ const SCHEMA_CONTRACTS = {
   5: V4_SCHEMA_CONTRACT,
   6: V6_SCHEMA_CONTRACT,
   7: V7_SCHEMA_CONTRACT,
+  8: V8_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -1522,6 +1715,65 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
       "canonical calibration signals must reference a human actor and same-room Agent message",
     );
   }
+  if (schemaVersion >= 8) {
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM open_items AS item
+       JOIN messages AS source ON source.id = item.source_message_id
+       JOIN actors AS requester ON requester.id = item.requester_actor_id
+       LEFT JOIN agent_executions AS execution ON execution.id = item.source_execution_id
+       WHERE source.room_id <> item.room_id
+          OR (item.status IN ('awaiting', 'transferred') AND item.current_owner_actor_id IS NULL)
+          OR (item.status IN ('answered', 'deferred') AND item.current_owner_actor_id IS NOT NULL)
+          OR (item.status = 'transferred' AND
+              COALESCE(json_extract(item.transfer_chain_json, '$[#-1].toId'), '')
+                <> item.current_owner_actor_id)
+          OR (item.origin_kind = 'agent_proposal' AND (
+              execution.id IS NULL
+              OR execution.room_id <> item.room_id
+              OR execution.trigger_message_id <> item.source_message_id
+              OR execution.agent_id <> item.requester_actor_id))
+       LIMIT 1`,
+      "closed OpenItems must keep one active owner, valid provenance, and same-room source",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM open_items AS item, json_each(item.transfer_chain_json) AS transfer
+       WHERE json_type(transfer.value) <> 'object'
+          OR length(trim(COALESCE(json_extract(transfer.value, '$.fromId'), ''))) = 0
+          OR length(trim(COALESCE(json_extract(transfer.value, '$.toId'), ''))) = 0
+          OR length(trim(COALESCE(json_extract(transfer.value, '$.reason'), ''))) = 0
+          OR length(trim(COALESCE(json_extract(transfer.value, '$.transferredAt'), ''))) = 0
+          OR EXISTS (
+            SELECT 1
+            FROM json_each(item.transfer_chain_json) AS next
+            WHERE CAST(next.key AS INTEGER) = CAST(transfer.key AS INTEGER) + 1
+              AND json_extract(transfer.value, '$.toId')
+                <> json_extract(next.value, '$.fromId')
+          )
+       LIMIT 1`,
+      "OpenItem transfer chains must be closed, ordered, and append-only shaped",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM open_item_agent_failures AS failure
+       JOIN open_items AS item ON item.id = failure.open_item_id
+       JOIN agent_executions AS execution ON execution.id = failure.execution_id
+       LEFT JOIN actors AS owner ON owner.id = item.current_owner_actor_id
+       WHERE item.status NOT IN ('awaiting', 'transferred')
+          OR owner.kind <> 'agent'
+          OR execution.room_id <> item.room_id
+          OR execution.trigger_message_id <> item.source_message_id
+          OR execution.agent_id <> item.current_owner_actor_id
+          OR execution.status <> 'failed'
+          OR execution.current_attempt_seq <> failure.attempt_seq
+       LIMIT 1`,
+      "OpenItem Agent failures must reference the active Agent owner and failed attempt",
+    );
+  }
 }
 
 function validateExistingSchema(database: DatabaseSync, currentVersion: number): void {
@@ -1555,9 +1807,10 @@ function validateExistingSchema(database: DatabaseSync, currentVersion: number):
   }
   const expectedFingerprint =
     SCHEMA_FINGERPRINTS[currentVersion as keyof typeof SCHEMA_FINGERPRINTS];
-  if (readSchemaFingerprint(database) !== expectedFingerprint) {
+  const actualFingerprint = readSchemaFingerprint(database);
+  if (actualFingerprint !== expectedFingerprint) {
     throw new Error(
-      `Refusing unknown schema physical contract at version ${currentVersion}`,
+      `Refusing unknown schema physical contract at version ${currentVersion} (${actualFingerprint})`,
     );
   }
 
@@ -1680,6 +1933,12 @@ export function migrateAuthorityDatabaseToPreviousVersionForTest(
   database: DatabaseSync,
 ): void {
   migrateAuthorityDatabaseToVersion(database, AUTHORITY_SCHEMA_VERSION - 1);
+}
+
+export function migrateAuthorityDatabaseToVersion6ForTest(
+  database: DatabaseSync,
+): void {
+  migrateAuthorityDatabaseToVersion(database, 6);
 }
 
 export function migrateAuthorityDatabaseToVersion5ForTest(

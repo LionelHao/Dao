@@ -220,9 +220,11 @@ function seedMixedRoomRecords(databasePath: string, roomId: string): Record<stri
        VALUES (?, ?, 'agent-a', ?, ?, ?)`,
     );
     const insertOpenItem = database.prepare(
-      `INSERT INTO open_items (id, room_id, source_message_id, assigned_actor_id, status,
-         body, created_at, resolved_at, requester_actor_id, transfer_chain_json, responded_at)
-       VALUES (?, ?, ?, 'human-a', 'pending_response', ?, ?, NULL, 'human-a', '[]', NULL)`,
+      `INSERT INTO open_items (id, room_id, source_message_id, current_owner_actor_id, status,
+         body, created_at, responded_at, requester_actor_id, transfer_chain_json,
+         origin_kind, proposal_kind, source_execution_id, proposal_reason)
+       VALUES (?, ?, ?, 'human-a', 'awaiting', ?, ?, NULL, 'human-a', '[]',
+         'manual_unfinished', NULL, NULL, NULL)`,
     );
     const insertExecution = database.prepare(
       `INSERT INTO agent_executions (id, room_id, agent_id, trigger_message_id, status,
@@ -282,8 +284,8 @@ function seedMixedRoomRecords(databasePath: string, roomId: string): Record<stri
           outcome: "will_respond" as const, reason: `j${suffix}`,
           decidedAt: "t" };
         const item = { id: `o${suffix}`, roomId, sourceMessageId: messageId,
-          requesterId: "human-a", ownerId: "human-a", content: `o${suffix}`,
-          status: "pending_response" as const, createdAt: "t",
+          requesterId: "human-a", currentOwnerId: "human-a", content: `o${suffix}`,
+          status: "awaiting" as const, origin: { kind: "manual_unfinished" as const }, createdAt: "t",
           transferChain: [] };
         const execution = { id: `e${suffix}`, roomId,
           sourceMessageId: messageId, requesterId: "human-a", agentId: "agent-a",
@@ -477,8 +479,9 @@ async function seedThroughFacades(
       },
     );
     await facades.primitives.createOpenItem(human("seed-open-item"), roomId, {
+      creationKind: "manual_unfinished",
       sourceMessageId: "message-agent-authority",
-      ownerId: command.identity.actorId,
+      targetActorId: command.identity.actorId,
       content: "Human decision remains open",
     });
     await facades.primitives.transitionAgentExecution(

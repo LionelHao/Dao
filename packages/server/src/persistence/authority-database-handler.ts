@@ -5,6 +5,8 @@ import type {
   Actor,
   ManagedRoom,
   Message,
+  OpenItem,
+  OpenItemAgentFailure,
   PersistedIdentityEvent,
   PersistedRoomEvent,
   RouteInvocationIntent,
@@ -2439,56 +2441,61 @@ function requireAssignedRoomMember(
   database: DatabaseSync,
   roomId: string,
   actorId: string,
-): void {
+): "human" | "agent" {
   const member = database
-    .prepare("SELECT 1 AS present FROM room_memberships WHERE room_id = ? AND actor_id = ?")
+    .prepare("SELECT kind FROM room_memberships WHERE room_id = ? AND actor_id = ?")
     .get(roomId, actorId);
-  if (member?.present !== 1) {
+  if (member?.kind !== "human" && member?.kind !== "agent") {
     return fail("member_not_found", "Authority open-item owner is not a room member");
   }
+  return member.kind;
 }
 
 function executeOpenItemCreate(
   database: DatabaseSync,
   actorId: string,
-  command: Extract<HumanCollaborationCommand | AgentCollaborationCommand, { readonly type: "open-item.create" }>,
+  command: Extract<HumanCollaborationCommand, { readonly type: "open-item.create" }>,
   acceptedAt: string,
   scope: string,
   key: string,
 ): CommandAcknowledgement {
-  const requesterId = roomMessageAuthor(
-    database,
-    command.roomId,
-    command.payload.sourceMessageId,
+  roomMessageAuthor(database, command.roomId, command.payload.sourceMessageId);
+  const targetKind = requireAssignedRoomMember(
+    database, command.roomId, command.payload.targetActorId,
   );
-  requireAssignedRoomMember(database, command.roomId, command.payload.ownerId);
-  const item = {
+  if (command.payload.creationKind === "human_mention" && targetKind !== "human") {
+    return fail("invalid_request", "Human mention OpenItems require a human target");
+  }
+  const item: OpenItem = {
     id: stableId("open-item", scope, key),
     roomId: command.roomId,
     sourceMessageId: command.payload.sourceMessageId,
-    requesterId,
-    ownerId: command.payload.ownerId,
+    requesterId: actorId,
+    currentOwnerId: command.payload.targetActorId,
     content: command.payload.content,
-    status: "pending_response" as const,
+    status: "awaiting",
+    origin: { kind: command.payload.creationKind },
     createdAt: acceptedAt,
-    transferChain: [] as readonly JsonValue[],
+    transferChain: [],
   };
   database
     .prepare(
       `INSERT INTO open_items (
-         id, room_id, source_message_id, assigned_actor_id, status, body,
-         created_at, resolved_at, requester_actor_id, transfer_chain_json, responded_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, '[]', NULL)`,
+         id, room_id, source_message_id, current_owner_actor_id, status, body,
+         created_at, responded_at, requester_actor_id, transfer_chain_json,
+         origin_kind, proposal_kind, source_execution_id, proposal_reason
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, '[]', ?, NULL, NULL, NULL)`,
     )
     .run(
       item.id,
       item.roomId,
       item.sourceMessageId,
-      item.ownerId,
+      item.currentOwnerId,
       item.status,
       item.content,
       item.createdAt,
       item.requesterId,
+      item.origin.kind,
     );
   const eventId = stableId("event", scope, key, "0");
   const streamSeq = appendRoomEvent(database, {
@@ -2497,14 +2504,78 @@ function executeOpenItemCreate(
     actorId,
     eventType: "room.open_item.changed",
     occurredAt: acceptedAt,
-    payload: item,
+    payload: item as unknown as JsonValue,
   });
   appendRoomOutbox(database, eventId, command.roomId, streamSeq, acceptedAt, scope, key);
   return {
     aggregateId: item.id,
     eventIds: [eventId],
     acceptedAt,
-    result: { item },
+    result: { item: item as unknown as JsonValue },
+  };
+}
+
+function executeOpenItemProposal(
+  database: DatabaseSync,
+  actorId: string,
+  command: Extract<AgentCollaborationCommand, { readonly type: "open-item.propose" }>,
+  acceptedAt: string,
+  scope: string,
+  key: string,
+): CommandAcknowledgement {
+  roomMessageAuthor(database, command.roomId, command.payload.sourceMessageId);
+  requireAssignedRoomMember(database, command.roomId, command.payload.targetActorId);
+  const execution = database.prepare(
+    `SELECT room_id AS roomId, trigger_message_id AS sourceMessageId,
+            agent_id AS agentId, status
+     FROM agent_executions WHERE id = ?`,
+  ).get(command.payload.sourceExecutionId);
+  if (execution?.roomId !== command.roomId ||
+      execution.sourceMessageId !== command.payload.sourceMessageId ||
+      execution.agentId !== actorId ||
+      (execution.status !== "running" && execution.status !== "completed")) {
+    return fail("permission_denied", "Agent OpenItem proposal provenance was rejected");
+  }
+  const proposalOrigin = {
+    kind: "agent_proposal" as const,
+    proposalKind: command.payload.proposalKind,
+    sourceExecutionId: command.payload.sourceExecutionId,
+    reason: command.payload.reason,
+  };
+  const item: OpenItem = {
+    id: stableId("open-item", scope, key),
+    roomId: command.roomId,
+    sourceMessageId: command.payload.sourceMessageId,
+    requesterId: actorId,
+    currentOwnerId: command.payload.targetActorId,
+    content: command.payload.content,
+    status: "awaiting",
+    origin: proposalOrigin,
+    createdAt: acceptedAt,
+    transferChain: [],
+  };
+  database.prepare(
+    `INSERT INTO open_items (
+       id, room_id, source_message_id, current_owner_actor_id, status, body,
+       created_at, responded_at, requester_actor_id, transfer_chain_json,
+       origin_kind, proposal_kind, source_execution_id, proposal_reason
+     ) VALUES (?, ?, ?, ?, 'awaiting', ?, ?, NULL, ?, '[]',
+       'agent_proposal', ?, ?, ?)`,
+  ).run(
+    item.id, item.roomId, item.sourceMessageId, item.currentOwnerId, item.content,
+    item.createdAt, item.requesterId, proposalOrigin.proposalKind,
+    proposalOrigin.sourceExecutionId, proposalOrigin.reason,
+  );
+  const eventId = stableId("event", scope, key, "0");
+  const streamSeq = appendRoomEvent(database, {
+    eventId, roomId: command.roomId, actorId,
+    eventType: "room.open_item.changed", occurredAt: acceptedAt,
+    payload: item as unknown as JsonValue,
+  });
+  appendRoomOutbox(database, eventId, command.roomId, streamSeq, acceptedAt, scope, key);
+  return {
+    aggregateId: item.id, eventIds: [eventId], acceptedAt,
+    result: { item: item as unknown as JsonValue },
   };
 }
 
@@ -2519,15 +2590,18 @@ function executeOpenItemTransition(
   const row = database
     .prepare(
       `SELECT id, room_id AS roomId, source_message_id AS sourceMessageId,
-              requester_actor_id AS requesterId, assigned_actor_id AS ownerId,
+              requester_actor_id AS requesterId, current_owner_actor_id AS currentOwnerId,
               body AS content, status, created_at AS createdAt,
-              responded_at AS respondedAt, transfer_chain_json AS transferChainJson
+              responded_at AS respondedAt, transfer_chain_json AS transferChainJson,
+              origin_kind AS originKind, proposal_kind AS proposalKind,
+              source_execution_id AS sourceExecutionId, proposal_reason AS proposalReason
        FROM open_items WHERE id = ?`,
     )
     .get(command.payload.itemId);
   if (row?.roomId !== command.roomId || typeof row.id !== "string" ||
       typeof row.sourceMessageId !== "string" || typeof row.requesterId !== "string" ||
-      typeof row.ownerId !== "string" || typeof row.content !== "string" ||
+      (typeof row.currentOwnerId !== "string" && row.currentOwnerId !== null) ||
+      typeof row.content !== "string" ||
       typeof row.createdAt !== "string" || typeof row.transferChainJson !== "string") {
     return fail("open_item_not_found", "Authority open item was not found");
   }
@@ -2535,12 +2609,34 @@ function executeOpenItemTransition(
   if (!Array.isArray(parsedTransfers)) {
     return fail("storage_unavailable", "Authority open item transfer chain is corrupt");
   }
-  let ownerId = row.ownerId;
-  let status: "responded" | "deferred" | "transferred";
-  let respondedAt = typeof row.respondedAt === "string" ? row.respondedAt : undefined;
-  let transferChain = parsedTransfers as JsonValue[];
+  if (row.status === "answered" || row.status === "deferred") {
+    return fail("execution_conflict", "Authority OpenItem is already terminal");
+  }
+  if (row.status !== "awaiting" && row.status !== "transferred" ||
+      typeof row.currentOwnerId !== "string") {
+    return fail("storage_unavailable", "Authority OpenItem active owner is corrupt");
+  }
+  const ownerKind = database.prepare("SELECT kind FROM actors WHERE id = ?")
+    .get(row.currentOwnerId)?.kind;
+  const actorKind = database.prepare("SELECT kind FROM actors WHERE id = ?").get(actorId)?.kind;
+  const isRequester = actorKind === "human" && actorId === row.requesterId;
+  const isOwner = actorId === row.currentOwnerId;
+  if (!isOwner && !isRequester) {
+    return fail("permission_denied", "Authority OpenItem transition was forbidden");
+  }
+  if (actorKind === "agent" && (!isOwner || ownerKind !== "agent" || command.payload.action !== "answer")) {
+    return fail("permission_denied", "Agent OpenItem owners can only answer");
+  }
+  if (isRequester && !isOwner && command.payload.action !== "transfer" &&
+      command.payload.action !== "defer") {
+    return fail("permission_denied", "OpenItem requester transition was forbidden");
+  }
+  let currentOwnerId: string | null = row.currentOwnerId;
+  let status: "answered" | "deferred" | "transferred";
+  let respondedAt: string | undefined;
+  let transferChain = parsedTransfers as OpenItem["transferChain"];
   if (command.payload.action === "transfer") {
-    const targetId = command.payload.targetId;
+    const targetId = command.payload.targetActorId;
     const reason = command.payload.reason;
     if (targetId === undefined || reason === undefined) {
       return fail("invalid_request", "Authority open item transfer was rejected");
@@ -2550,46 +2646,57 @@ function executeOpenItemTransition(
     transferChain = [
       ...transferChain,
       {
-        fromId: ownerId,
+        fromId: row.currentOwnerId,
         toId: targetId,
         reason,
         transferredAt: acceptedAt,
       },
     ];
-    ownerId = targetId;
+    currentOwnerId = targetId;
   } else {
-    status = command.payload.action === "respond" ? "responded" : "deferred";
-    if (status === "responded") {
-      respondedAt = acceptedAt;
-    }
+    status = command.payload.action === "answer" ? "answered" : "deferred";
+    currentOwnerId = null;
+    respondedAt = acceptedAt;
   }
-  const item = {
+  const origin: OpenItem["origin"] = row.originKind === "agent_proposal" ? {
+    kind: "agent_proposal",
+    proposalKind: row.proposalKind as "risk" | "challenge",
+    sourceExecutionId: String(row.sourceExecutionId),
+    reason: String(row.proposalReason),
+  } : { kind: row.originKind as "human_mention" | "manual_unfinished" };
+  const item: OpenItem = {
     id: row.id,
     roomId: command.roomId,
     sourceMessageId: row.sourceMessageId,
     requesterId: row.requesterId,
-    ownerId,
+    currentOwnerId,
     content: row.content,
     status,
+    origin,
     createdAt: row.createdAt,
     ...(respondedAt === undefined ? {} : { respondedAt }),
     transferChain,
   };
-  database
+  const updated = database
     .prepare(
       `UPDATE open_items
-       SET assigned_actor_id = ?, status = ?, resolved_at = ?,
-           transfer_chain_json = ?, responded_at = ?
-       WHERE id = ?`,
+       SET current_owner_actor_id = ?, status = ?, transfer_chain_json = ?, responded_at = ?
+       WHERE id = ? AND status = ? AND current_owner_actor_id = ?
+         AND transfer_chain_json = ?`,
     )
     .run(
-      ownerId,
+      currentOwnerId,
       status,
-      status === "responded" ? acceptedAt : null,
       canonicalJson(transferChain),
       respondedAt ?? null,
       row.id,
+      row.status,
+      row.currentOwnerId,
+      row.transferChainJson,
     );
+  if (updated.changes !== 1) {
+    return fail("execution_conflict", "Authority OpenItem transition was stale");
+  }
   const eventId = stableId("event", scope, key, "0");
   const streamSeq = appendRoomEvent(database, {
     eventId,
@@ -2597,14 +2704,58 @@ function executeOpenItemTransition(
     actorId,
     eventType: "room.open_item.changed",
     occurredAt: acceptedAt,
-    payload: item,
+    payload: item as unknown as JsonValue,
   });
   appendRoomOutbox(database, eventId, command.roomId, streamSeq, acceptedAt, scope, key);
   return {
     aggregateId: row.id,
     eventIds: [eventId],
     acceptedAt,
-    result: { item },
+    result: { item: item as unknown as JsonValue },
+  };
+}
+
+function executeOpenItemAgentFailure(
+  database: DatabaseSync,
+  actorId: string,
+  command: Extract<AgentCollaborationCommand, { readonly type: "open-item.agent-failure.record" }>,
+  acceptedAt: string,
+  scope: string,
+  key: string,
+): CommandAcknowledgement {
+  const failure: OpenItemAgentFailure = {
+    id: stableId("open-item-agent-failure", scope, key),
+    openItemId: command.payload.itemId,
+    executionId: command.payload.executionId,
+    attemptSeq: command.payload.attemptSeq,
+    reasonCode: command.payload.reasonCode,
+    failedAt: acceptedAt,
+  };
+  const item = database.prepare(
+    `SELECT current_owner_actor_id AS currentOwnerId
+     FROM open_items WHERE id = ? AND room_id = ?`,
+  ).get(failure.openItemId, command.roomId);
+  if (item?.currentOwnerId !== actorId) {
+    return fail("permission_denied", "OpenItem Agent failure owner was rejected");
+  }
+  database.prepare(
+    `INSERT INTO open_item_agent_failures (
+       id, open_item_id, execution_id, attempt_seq, reason_code, failed_at
+     ) VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(
+    failure.id, failure.openItemId, failure.executionId, failure.attemptSeq,
+    failure.reasonCode, failure.failedAt,
+  );
+  const eventId = stableId("event", scope, key, "0");
+  const streamSeq = appendRoomEvent(database, {
+    eventId, roomId: command.roomId, actorId,
+    eventType: "room.open_item.agent_attempt_failed",
+    occurredAt: acceptedAt, payload: failure as unknown as JsonValue,
+  });
+  appendRoomOutbox(database, eventId, command.roomId, streamSeq, acceptedAt, scope, key);
+  return {
+    aggregateId: failure.id, eventIds: [eventId], acceptedAt,
+    result: { failure: failure as unknown as JsonValue },
   };
 }
 
@@ -3699,10 +3850,22 @@ export function executeRuntimeAuthorityOperation(
           typeof message.authorId === "string" && typeof message.body === "string")) {
         return fail("storage_unavailable", "Agent runtime context was corrupt");
       }
+      const openItemTargets = database.prepare(
+        `SELECT membership.actor_id AS actorId, membership.kind
+         FROM room_memberships AS membership
+         JOIN rooms AS room ON room.id = membership.room_id
+         WHERE membership.room_id = ? AND room.status = 'active'
+         ORDER BY membership.actor_id`,
+      ).all(execution.roomId);
+      if (!openItemTargets.every((target) => typeof target.actorId === "string" &&
+          (target.kind === "human" || target.kind === "agent"))) {
+        return fail("storage_unavailable", "Agent OpenItem targets were corrupt");
+      }
       return {
         kind: "context",
         visibleConversation: messages as { messageId: string; authorId: string; body: string }[],
         toolIds,
+        openItemTargets: openItemTargets as { actorId: string; kind: "human" | "agent" }[],
       };
     }
     if (operation.type === "runtime.invoke") {
@@ -3987,6 +4150,36 @@ export function executeRuntimeAuthorityOperation(
       ).run(occurredAt, occurredAt, operation.errorCode, occurredAt, current.id, current.currentAttemptSeq);
       const execution = runtimeExecutionById(database, current.id);
       appendRuntimeExecutionEvent(database, execution, occurredAt, "dead-lettered", operation.errorCode);
+      const ownedItems = database.prepare(
+        `SELECT id
+         FROM open_items
+         WHERE room_id = ? AND current_owner_actor_id = ?
+           AND status IN ('awaiting', 'transferred')
+           AND (source_execution_id = ? OR source_message_id = ?)
+         ORDER BY id`,
+      ).all(execution.roomId, execution.agentId, execution.id, execution.sourceMessageId);
+      for (const ownedItem of ownedItems) {
+        if (typeof ownedItem.id !== "string") {
+          return fail("storage_unavailable", "Agent-owned OpenItem linkage was corrupt");
+        }
+        executeOpenItemAgentFailure(
+          database,
+          execution.agentId,
+          {
+            type: "open-item.agent-failure.record",
+            roomId: execution.roomId,
+            payload: {
+              itemId: ownedItem.id,
+              executionId: execution.id,
+              attemptSeq: operation.attemptSeq,
+              reasonCode: operation.errorCode,
+            },
+          },
+          occurredAt,
+          "runtime-open-item-failure",
+          `${execution.id}:${operation.attemptSeq}:${ownedItem.id}`,
+        );
+      }
       return { kind: "execution", execution };
     }
 
@@ -4652,10 +4845,12 @@ export function executeAgentDatabaseCommand(
               scope,
               key,
             )
-          : input.command.type === "open-item.create"
-            ? executeOpenItemCreate(database, agentId, input.command, acceptedAt, scope, key)
+          : input.command.type === "open-item.propose"
+            ? executeOpenItemProposal(database, agentId, input.command, acceptedAt, scope, key)
             : input.command.type === "open-item.transition"
               ? executeOpenItemTransition(database, agentId, input.command, acceptedAt, scope, key)
+              : input.command.type === "open-item.agent-failure.record"
+                ? executeOpenItemAgentFailure(database, agentId, input.command, acceptedAt, scope, key)
               : input.command.type === "agent.execution.transition"
                 ? executeAgentExecutionTransition(
                     database,
