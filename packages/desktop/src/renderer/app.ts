@@ -18,6 +18,8 @@ import {
   type Message,
   type OpenItem,
   type SocialReaction,
+  type ToolConfirmationInput,
+  type ToolConfirmationRequiredPayload,
 } from "@native-im/core";
 
 export interface RestoredPrimitivePreviewRecords {
@@ -27,6 +29,78 @@ export interface RestoredPrimitivePreviewRecords {
   readonly agentExecutions: readonly AgentExecution[];
   readonly socialReactions: readonly SocialReaction[];
   readonly calibrations: readonly CalibrationSignal[];
+}
+
+export interface AgentExecutionPreview {
+  readonly roomId: string;
+  readonly executionId: string;
+  readonly attemptSeq: number;
+  readonly streamSeq: number;
+  readonly delta: string;
+  readonly authoritative: false;
+}
+
+export function renderAgentExecutionPreview(
+  root: HTMLElement,
+  preview: AgentExecutionPreview | undefined,
+): void {
+  if (preview === undefined) {
+    root.replaceChildren();
+    return;
+  }
+  const current = root.querySelector<HTMLElement>("[data-agent-execution-preview]");
+  const currentAttempt = Number(current?.dataset.attemptSeq ?? 0);
+  const currentSequence = Number(current?.dataset.streamSeq ?? 0);
+  if (
+    current !== null &&
+    current.dataset.executionId === preview.executionId &&
+    (preview.attemptSeq < currentAttempt ||
+      (preview.attemptSeq === currentAttempt && preview.streamSeq <= currentSequence))
+  ) {
+    return;
+  }
+  const element = current?.dataset.executionId === preview.executionId
+    ? current
+    : document.createElement("aside");
+  if (element !== current) {
+    element.className = "agent-execution-preview";
+    element.dataset.agentExecutionPreview = "true";
+    element.dataset.authoritative = "false";
+    element.setAttribute("aria-live", "polite");
+    element.setAttribute("aria-label", "Agent 非权威临时预览");
+    element.textContent = "";
+  }
+  if (preview.attemptSeq > currentAttempt) element.textContent = "";
+  element.dataset.executionId = preview.executionId;
+  element.dataset.attemptSeq = String(preview.attemptSeq);
+  element.dataset.streamSeq = String(preview.streamSeq);
+  element.textContent = `${element.textContent ?? ""}${preview.delta}`;
+  root.replaceChildren(element);
+}
+
+export function renderToolConfirmation(
+  root: HTMLElement,
+  confirmation: ToolConfirmationRequiredPayload,
+  onConfirm: (input: ToolConfirmationInput) => void,
+): void {
+  const card = document.createElement("section");
+  card.className = "agent-tool-confirmation";
+  card.dataset.toolConfirmation = confirmation.confirmationId;
+  card.setAttribute("aria-label", "Agent 工具副作用确认");
+  const details = document.createElement("p");
+  details.textContent = `目标：${confirmation.target} · 影响：${confirmation.impact} · 可逆性：${confirmation.reversibility} · 过期：${confirmation.expiresAt}`;
+  const confirm = document.createElement("button");
+  confirm.type = "button";
+  confirm.textContent = "确认执行一次";
+  confirm.addEventListener("click", () => {
+    confirm.disabled = true;
+    onConfirm({
+      confirmationId: confirmation.confirmationId,
+      executionId: confirmation.executionId,
+    });
+  }, { once: true });
+  card.append(details, confirm);
+  root.replaceChildren(card);
 }
 
 export interface RoomJoinControlOptions {
@@ -1003,17 +1077,23 @@ function appendAddressingPreview(
     section.append(openItem);
   }
   const executionStatusLabels: Readonly<Record<AgentExecution["status"], string>> = {
+    queued: "已排队",
     running: "正在调用",
     completed: "已完成调用",
-    interrupted: "已中断",
     failed: "调用失败",
+    cancelled: "已取消",
+  };
+  const executionActionLabels: Readonly<Record<AgentExecution["actionCategory"], string>> = {
+    model_generation: "正在生成",
+    tool_call: "正在调用工具",
+    waiting_upstream: "等待上游",
   };
   for (const record of records.agentExecutions) {
     const agentLabel = record.agentId === "agent-data" ? "数据 Agent" : record.agentId;
     const invocation = primitiveElement(
       "div",
       "agent-invocation",
-      `Agent 执行 · ${agentLabel} ${executionStatusLabels[record.status]} ${record.toolName}`,
+      `Agent 执行 · ${agentLabel} ${executionStatusLabels[record.status]} · ${executionActionLabels[record.actionCategory]} · attempt ${record.currentAttemptSeq} · ${record.toolName}`,
     );
     invocation.dataset.agentInvocation = record.agentId;
     invocation.dataset.executionStatus = record.status;
@@ -1027,8 +1107,8 @@ function appendAddressingPreview(
       const interrupt = appendPrimitiveButton(invocation, "中断", "interrupt");
       interrupt.dataset.testid = "interrupt-agent-execution";
       interrupt.addEventListener("click", () => {
-        invocation.dataset.executionStatus = "interrupted";
-        invocation.firstChild!.textContent = `Agent 执行 · ${agentLabel} 已中断`;
+        invocation.dataset.executionStatus = "cancelled";
+        invocation.firstChild!.textContent = `Agent 执行 · ${agentLabel} 已取消`;
         status.textContent = "可用";
         interrupt.remove();
       });
@@ -1129,7 +1209,15 @@ const defaultRestoredPrimitiveRecords: RestoredPrimitivePreviewRecords = {
     agentId: "agent-data",
     toolName: "warehouse.query",
     status: "running",
+    actionCategory: "tool_call",
+    toolDispatchPhase: "dispatched",
+    currentAttemptSeq: 1,
+    retryCycle: 1,
+    retryOrdinal: 1,
+    recoveryCursor: 0,
+    queuedAt: "2026-08-08T10:03:59.000Z",
     startedAt: "2026-08-08T10:04:00.000Z",
+    updatedAt: "2026-08-08T10:04:00.000Z",
   }],
   socialReactions: [{
     id: "preview-social-reaction",

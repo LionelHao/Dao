@@ -409,9 +409,9 @@ export function createCollaborationPrimitives(
 
   function updateExecution(
     value: AgentExecution,
-    update: Partial<Pick<AgentExecution, "status" | "completedAt" | "result">>,
+    update: Partial<AgentExecution>,
   ): AgentExecution {
-    const next: AgentExecution = { ...value, ...update };
+    const next: AgentExecution = { ...value, ...update, updatedAt: now() };
     executionsById.set(next.id, next);
     return next;
   }
@@ -432,6 +432,7 @@ export function createCollaborationPrimitives(
     }
 
     const controller = new AbortController();
+    const startedAt = now();
     const initial: AgentExecution = {
       id: nextId("execution"),
       roomId: input.message.roomId,
@@ -440,7 +441,15 @@ export function createCollaborationPrimitives(
       agentId: input.target.id,
       toolName: input.toolName,
       status: "running",
-      startedAt: now(),
+      actionCategory: "tool_call",
+      toolDispatchPhase: "dispatched",
+      currentAttemptSeq: 1,
+      retryCycle: 1,
+      retryOrdinal: 1,
+      recoveryCursor: 0,
+      queuedAt: startedAt,
+      startedAt,
+      updatedAt: startedAt,
     };
     executionsById.set(initial.id, initial);
     executionControllersById.set(initial.id, controller);
@@ -459,14 +468,26 @@ export function createCollaborationPrimitives(
         if (current.status !== "running") {
           return cloneExecution(current);
         }
-        const completed = updateExecution(current, { status: "completed", completedAt: now(), result });
+        void result;
+        const completed = updateExecution(current, {
+          status: "completed",
+          completedAt: now(),
+          toolDispatchPhase: "finished",
+        });
         agentReadinessOverridesById.set(input.target.id, "ready");
         return cloneExecution(completed);
       } catch {
         const current = execution(initial.id);
         if (current.status === "running") {
-          const status: AgentExecutionStatus = controller.signal.aborted ? "interrupted" : "failed";
-          const finished = updateExecution(current, { status, completedAt: now() });
+          const status: AgentExecutionStatus = controller.signal.aborted ? "cancelled" : "failed";
+          const finished = updateExecution(current, {
+            status,
+            completedAt: now(),
+            toolDispatchPhase: "finished",
+            ...(status === "cancelled"
+              ? { cancellationReason: "requested_by_human" }
+              : { terminalErrorCode: "tool_failure" }),
+          });
           agentReadinessOverridesById.set(input.target.id, "ready");
           return cloneExecution(finished);
         }

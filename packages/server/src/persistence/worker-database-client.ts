@@ -44,6 +44,7 @@ import type {
   StreamingRepairLease,
   SnapshotRevalidationRequest,
 } from "./contracts.js";
+import type { RuntimeAuthorityOperation } from "../agent-runtime/runtime-authority-protocol.js";
 import {
   ROOM_SYNC_DEFAULT_LIMIT,
   toAgentWorkerCommandContext,
@@ -54,7 +55,7 @@ export interface CreateWorkerDatabaseClientOptions {
 }
 
 export interface AuthoritySchemaInspection {
-  readonly version: 5;
+  readonly version: 6;
 }
 
 export interface WorkerDatabaseClient {
@@ -158,6 +159,7 @@ export interface WorkerDatabaseClient {
     deliveryId: string,
     reason: OutboxDeliveryFailureReason,
   ): Promise<void>;
+  executeRuntime(operation: RuntimeAuthorityOperation): Promise<unknown>;
   close(): Promise<void>;
 }
 
@@ -180,6 +182,7 @@ export class AuthorityWorkerClientError extends Error {
     this.status = authorityWorkerClientErrorStatus(code);
     this.retryAfterMs = code === "repair_barrier_active" ? 250 : undefined;
   }
+
 }
 
 type AuthorityWorkerClientLocalErrorCode =
@@ -202,6 +205,7 @@ function authorityWorkerClientErrorStatus(
     case "agent_permissions_invalid":
     case "agent_required":
     case "calibration_source_invalid":
+    case "invalid_parameters":
     case "invalid_request":
     case "invitee_required":
       return 400;
@@ -209,6 +213,8 @@ function authorityWorkerClientErrorStatus(
     case "token_expired":
       return 401;
     case "agent_missing_permission":
+    case "confirmation_forbidden":
+    case "permission_denied":
     case "identity_forbidden":
     case "invitation_forbidden":
     case "room_forbidden":
@@ -219,6 +225,7 @@ function authorityWorkerClientErrorStatus(
     case "member_not_found":
     case "message_not_found":
     case "open_item_not_found":
+    case "execution_not_found":
     case "room_member_not_found":
     case "room_not_found":
     case "snapshot_not_found":
@@ -236,12 +243,15 @@ function authorityWorkerClientErrorStatus(
     case "room_member_exists":
     case "room_owner_required":
     case "snapshot_stale":
+    case "confirmation_replayed":
       return 409;
     case "snapshot_forbidden":
       return 403;
     case "snapshot_expired":
+    case "confirmation_expired":
       return 410;
     case "snapshot_busy":
+    case "agent_queue_full":
       return 429;
     case "authority_not_initialized":
     case "authority_worker_closed":
@@ -942,6 +952,19 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
     });
   }
 
+  executeRuntime(operation: RuntimeAuthorityOperation): Promise<unknown> {
+    if (this.#terminalError !== undefined) return this.#rejectTerminal();
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) return Promise.reject(unavailable);
+    return this.#send({ type: "authority.runtime", operation }).then((response) => {
+      if (response.type !== "authority.runtime-result") {
+        this.#failProtocol("Authority worker returned the wrong runtime response");
+        throw this.#terminalError;
+      }
+      return response.result;
+    });
+  }
+
   readHistory(
     context: AuthenticatedSessionContext,
     roomId: string,
@@ -1382,6 +1405,8 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
         responseType === "authority.command-acknowledged") ||
       (requestType === "authority.execute-agent" &&
         responseType === "authority.command-acknowledged") ||
+      (requestType === "authority.runtime" &&
+        responseType === "authority.runtime-result") ||
       (requestType === "authority.read-history" &&
         responseType === "authority.history") ||
       (requestType === "authority.read-actor" && responseType === "authority.actor") ||

@@ -9,6 +9,7 @@ import {
   listAuthorityTables,
   migrateAuthorityDatabase,
   migrateAuthorityDatabaseToPreviousVersionForTest,
+  migrateAuthorityDatabaseToVersion4ForTest,
   migrateAuthorityDatabaseToVersion3ForTest,
   migrateAuthorityDatabaseToVersion2ForTest,
   readSchemaVersion,
@@ -21,7 +22,13 @@ import {
 
 const AUTHORITY_TABLES = [
   "actors",
+  "agent_execution_attempts",
+  "agent_execution_grants",
+  "agent_execution_steps",
   "agent_executions",
+  "agent_fence_replacements",
+  "agent_human_fences",
+  "agent_invocation_intents",
   "agent_judgments",
   "calibration_signals",
   "events",
@@ -37,6 +44,8 @@ const AUTHORITY_TABLES = [
   "schema_migrations",
   "sessions",
   "streams",
+  "tool_confirmations",
+  "tool_dispatches",
 ] as const;
 const V1_MIGRATION_CHECKSUM =
   "34117e7de4fb7c8eb36b5363bc178e45a82b08c668ca712a7b7e5e82343a6358";
@@ -365,12 +374,12 @@ describe("authority SQLite schema", () => {
     });
   });
 
-  it("migrates a fresh database through immutable v1-v5 to the complete schema", () => {
+  it("migrates a fresh database through immutable v1-v6 to the complete schema", () => {
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
 
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(5);
-      expect(readSchemaVersion(database)).toBe(5);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(6);
+      expect(readSchemaVersion(database)).toBe(6);
       expect(listAuthorityTables(database)).toEqual(AUTHORITY_TABLES);
       expect(
         database
@@ -407,6 +416,12 @@ describe("authority SQLite schema", () => {
           version: 5,
           name: "streaming-keyset-indexes",
           checksum: V5_MIGRATION_CHECKSUM,
+          applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+        },
+        {
+          version: 6,
+          name: "agent-runtime-authority",
+          checksum: expect.stringMatching(/^[a-f0-9]{64}$/),
           applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
         },
       ]);
@@ -458,12 +473,12 @@ describe("authority SQLite schema", () => {
 
   it("adds immutable v5 scoped keyset indexes and uses them for sparse interleaved scans", () => {
     withDatabase((database) => {
-      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      migrateAuthorityDatabaseToVersion4ForTest(database);
       expect(readSchemaVersion(database)).toBe(4);
       migrateAuthorityDatabase(database);
 
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(5);
-      expect(readSchemaVersion(database)).toBe(5);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(6);
+      expect(readSchemaVersion(database)).toBe(6);
       expect(
         database
           .prepare(
@@ -551,6 +566,101 @@ describe("authority SQLite schema", () => {
     });
   });
 
+  it("upgrades historical v5 executions into canonical v6 attempts without losing legacy fields", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      expect(readSchemaVersion(database)).toBe(5);
+      database.exec(`
+        INSERT INTO actors (id, kind, display_name, reachability, readiness, tool_permissions_json)
+        VALUES
+          ('human-v5', 'human', 'Human V5', 'online', NULL, '[]'),
+          ('agent-v5', 'agent', 'Agent V5', NULL, 'ready', '["repository.git-status"]');
+        INSERT INTO rooms (id, name, status, created_at)
+        VALUES ('room-v5', 'Room V5', 'active', '2026-08-12T00:00:00.000Z');
+        INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+        VALUES
+          ('identity', 'human-v5', 0, 1),
+          ('identity', 'agent-v5', 0, 1),
+          ('room', 'room-v5', 0, 1);
+        INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+        VALUES ('message-v5', 'room-v5', 'human-v5', 'human', 'legacy', '2026-08-12T00:00:01.000Z');
+        INSERT INTO agent_executions (
+          id, room_id, agent_id, trigger_message_id, status, started_at,
+          completed_at, result_json, requester_actor_id, tool_name
+        ) VALUES
+          ('execution-v5-running', 'room-v5', 'agent-v5', 'message-v5', 'running',
+           '2026-08-12T00:00:02.000Z', NULL, '{"legacy":true}', 'human-v5', 'repository.git-status'),
+          ('execution-v5-interrupted', 'room-v5', 'agent-v5', 'message-v5', 'interrupted',
+           '2026-08-12T00:00:03.000Z', '2026-08-12T00:00:04.000Z', '"kept"',
+           'human-v5', 'repository.git-status');
+      `);
+
+      migrateAuthorityDatabase(database);
+
+      expect(readSchemaVersion(database)).toBe(6);
+      expect(database.prepare(
+        `SELECT id, status, action_category AS actionCategory,
+                tool_dispatch_phase AS toolDispatchPhase,
+                current_attempt_seq AS attemptSeq, retry_cycle AS retryCycle,
+                retry_ordinal AS retryOrdinal, recovery_cursor AS recoveryCursor,
+                queued_at AS queuedAt, updated_at AS updatedAt,
+                cancellation_reason AS cancellationReason, result_json AS resultJson
+         FROM agent_executions ORDER BY id`,
+      ).all()).toEqual([
+        {
+          id: "execution-v5-interrupted",
+          status: "cancelled",
+          actionCategory: "tool_call",
+          toolDispatchPhase: "finished",
+          attemptSeq: 1,
+          retryCycle: 1,
+          retryOrdinal: 1,
+          recoveryCursor: 0,
+          queuedAt: "2026-08-12T00:00:03.000Z",
+          updatedAt: "2026-08-12T00:00:04.000Z",
+          cancellationReason: "legacy_interrupted",
+          resultJson: '"kept"',
+        },
+        {
+          id: "execution-v5-running",
+          status: "running",
+          actionCategory: "tool_call",
+          toolDispatchPhase: "dispatched",
+          attemptSeq: 1,
+          retryCycle: 1,
+          retryOrdinal: 1,
+          recoveryCursor: 0,
+          queuedAt: "2026-08-12T00:00:02.000Z",
+          updatedAt: "2026-08-12T00:00:02.000Z",
+          cancellationReason: null,
+          resultJson: '{"legacy":true}',
+        },
+      ]);
+      expect(database.prepare(
+        `SELECT execution_id AS executionId, attempt_seq AS attemptSeq, status,
+                action_category AS actionCategory, recovery_cursor AS recoveryCursor
+         FROM agent_execution_attempts ORDER BY execution_id`,
+      ).all()).toEqual([
+        { executionId: "execution-v5-interrupted", attemptSeq: 1, status: "cancelled", actionCategory: "tool_call", recoveryCursor: 0 },
+        { executionId: "execution-v5-running", attemptSeq: 1, status: "running", actionCategory: "tool_call", recoveryCursor: 0 },
+      ]);
+    });
+  });
+
+  it("rolls back an injected v6 migration failure as one transaction", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      const before = snapshot(database);
+
+      expect(() => migrateAuthorityDatabase(database, { failAfterStatement: 5 }))
+        .toThrow(/injected migration failure/i);
+
+      expect(readSchemaVersion(database)).toBe(5);
+      expect(snapshot(database)).toEqual(before);
+      expect(listAuthorityTables(database)).not.toContain("agent_execution_attempts");
+    });
+  });
+
   it("adds complete canonical collaboration columns in immutable v4", () => {
     withDatabase((database) => {
       migrateAuthorityDatabaseToVersion3ForTest(database);
@@ -558,7 +668,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(5);
+      expect(readSchemaVersion(database)).toBe(6);
       expect(tableColumns(database, "open_items")).toEqual(
         expect.arrayContaining([
           "requester_actor_id",
@@ -598,7 +708,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(5);
+      expect(readSchemaVersion(database)).toBe(6);
       expect(database.prepare(
         `SELECT source_message_id AS sourceMessageId, actor_id AS actorId
          FROM calibration_signals WHERE id = 'signal-v3'`,
@@ -651,7 +761,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(5);
+      expect(readSchemaVersion(database)).toBe(6);
       expect(
         database.prepare("SELECT id, catalog_revision FROM actors ORDER BY id").all(),
       ).toEqual([
@@ -730,7 +840,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(5);
+      expect(readSchemaVersion(database)).toBe(6);
       expect(
         database
           .prepare(
@@ -1149,10 +1259,17 @@ describe("authority SQLite schema", () => {
                   '2026-08-09T01:13:00.000Z');
         INSERT INTO agent_executions (
           id, room_id, agent_id, trigger_message_id, status, started_at,
-          completed_at, result_json, requester_actor_id, tool_name
+          completed_at, result_json, requester_actor_id, tool_name,
+          action_category, tool_dispatch_phase, queued_at, updated_at
         ) VALUES ('execution-valid', 'room-1', 'agent-1', 'message-1', 'running',
                   '2026-08-09T01:14:00.000Z', NULL, NULL, 'human-1',
-                  'summarize');
+                  'summarize', 'tool_call', 'dispatched',
+                  '2026-08-09T01:14:00.000Z', '2026-08-09T01:14:00.000Z');
+        INSERT INTO agent_execution_attempts (
+          execution_id, attempt_seq, retry_cycle, retry_ordinal, status,
+          action_category, started_at, recovery_cursor
+        ) VALUES ('execution-valid', 1, 1, 1, 'running', 'tool_call',
+                  '2026-08-09T01:14:00.000Z', 0);
         INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
         VALUES ('message-agent', 'room-1', 'agent-1', 'agent', 'agent answer',
                 '2026-08-09T01:14:30.000Z');
@@ -1307,9 +1424,9 @@ describe("authority SQLite schema", () => {
     });
 
     withDatabase((database) => {
-      database.exec("PRAGMA user_version = 6");
+      database.exec("PRAGMA user_version = 7");
       expect(() => migrateAuthorityDatabase(database)).toThrow(/future schema/i);
-      expect(readSchemaVersion(database)).toBe(6);
+      expect(readSchemaVersion(database)).toBe(7);
     });
   });
 
@@ -1365,7 +1482,7 @@ describe("authority SQLite schema", () => {
 });
 
 describe("derived snapshot cache schema", () => {
-  it("creates independent v1 WAL/FULL tables without changing authority v5", () => {
+  it("creates independent v1 WAL/FULL tables without changing authority v6", () => {
     withDatabase((database) => {
       migrateSnapshotCacheDatabase(database);
       expect(SNAPSHOT_CACHE_SCHEMA_VERSION).toBe(1);
@@ -1381,7 +1498,7 @@ describe("derived snapshot cache schema", () => {
         .toBe(SNAPSHOT_CACHE_BUSY_TIMEOUT_MS);
       expect(() => validateSnapshotCacheSchema(database)).not.toThrow();
     });
-    expect(AUTHORITY_SCHEMA_VERSION).toBe(5);
+    expect(AUTHORITY_SCHEMA_VERSION).toBe(6);
   });
 
   it("fails closed on version-one corruption and refuses future versions", () => {

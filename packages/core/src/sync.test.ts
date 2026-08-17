@@ -200,6 +200,47 @@ describe("pure synchronization contracts", () => {
     })).toBe(true);
   });
 
+  it("accepts only closed side-effect confirmation display facts", () => {
+    const event = {
+      eventId: "confirmation-event-1",
+      streamKind: "room",
+      streamId: "room-1",
+      streamSeq: 1,
+      roomId: "room-1",
+      actorId: "agent-1",
+      occurredAt: "2026-08-17T00:00:00.000Z",
+      type: "agent.tool.confirmation-required",
+      payload: {
+        confirmationId: "confirmation-1",
+        executionId: "execution-1",
+        attemptSeq: 1,
+        toolId: "sandbox-file.write",
+        target: "sandbox-file.write",
+        impact: "bounded-side-effect",
+        reversibility: "compensatable",
+        expiresAt: "2026-08-17T00:05:00.000Z",
+      },
+    };
+    const result = {
+      type: "room.sync.result",
+      requestId: "request-1",
+      mode: "delta",
+      events: [event],
+      nextCursor: { version: 1, roomId: "room-1", afterSeq: 1 },
+      watermark: 1,
+      hasMore: false,
+    };
+    expect(isRoomSyncResult(result)).toBe(true);
+    expect(isRoomSyncResult({
+      ...result,
+      events: [{ ...event, payload: { ...event.payload, expiresAt: "not-a-date" } }],
+    })).toBe(false);
+    expect(isRoomSyncResult({
+      ...result,
+      events: [{ ...event, payload: { ...event.payload, parameterSha256: "secret-binding" } }],
+    })).toBe(false);
+  });
+
   it("does not interchange room and catalog snapshot versions", () => {
     expect(isSnapshotVersion({ kind: "room", roomId: "room-1", watermark: 4 })).toBe(true);
     expect(isSnapshotVersion({ kind: "catalog", catalogRevision: 3 })).toBe(true);

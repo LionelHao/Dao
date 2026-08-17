@@ -167,7 +167,12 @@ describe("T-0012 read receipts and agent judgements", () => {
     const execution = {
       id: "execution-1", roomId: room.id, sourceMessageId: humanMessage.id,
       requesterId: "human-lionel", agentId: "agent-data", toolName: "warehouse.query",
-      status: "running" as const, startedAt: "2026-08-07T09:02:00.000Z",
+      status: "running" as const, actionCategory: "tool_call" as const,
+      toolDispatchPhase: "not_started" as const, currentAttemptSeq: 1,
+      retryCycle: 1, retryOrdinal: 1 as const, recoveryCursor: 0,
+      queuedAt: "2026-08-07T09:02:00.000Z",
+      startedAt: "2026-08-07T09:02:00.000Z",
+      updatedAt: "2026-08-07T09:02:00.000Z",
     };
     const signal = {
       id: "calibration-1", sourceMessageId: agentMessage.id, actorId: "human-lionel",
@@ -360,7 +365,7 @@ describe("T-0013 request and invocation addressing", () => {
     expect(toolCalls).toContain("agent-research:long.running");
 
     primitives.interruptAgentExecution(execution.id);
-    await expect(primitives.waitForAgentExecution(execution.id)).resolves.toMatchObject({ status: "interrupted" });
+    await expect(primitives.waitForAgentExecution(execution.id)).resolves.toMatchObject({ status: "cancelled" });
     expect(primitives.agentReadiness("agent-research")).toBe("ready");
     expect(() => primitives.rejectAgentExecution(execution.id)).toThrowError(
       new CollaborationPrimitiveError("agent_cannot_reject_invocation"),
