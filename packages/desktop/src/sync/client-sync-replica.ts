@@ -361,12 +361,12 @@ export function createClientSyncReplica(options: {
     try {
       for (const item of buffered) {
         for (const event of item.events) validateEventShape(roomId, event);
-        const fresh = deduplicateEvents(item.events, bufferedSeen);
-        const whollyDuplicateStaleBatch = item.events.length > 0 && fresh.length === 0 &&
+        const whollyStaleBatch = item.events.length > 0 &&
           isRoomCursor(item.cursor) && sameCursorRoom(item.cursor, roomId) &&
           item.cursor.afterSeq <= bufferedCursor.afterSeq &&
           item.events.every((event) => event.streamSeq <= bufferedCursor.afterSeq);
-        if (whollyDuplicateStaleBatch) continue;
+        if (whollyStaleBatch) continue;
+        const fresh = deduplicateEvents(item.events, bufferedSeen);
         validateEventAdvance(roomId, bufferedCursor, fresh, item.cursor);
         prepared.push({ events: fresh, cursor: item.cursor });
         bufferedCursor = item.cursor;
