@@ -27,6 +27,9 @@ import { createHttpJsonReadAdapter } from "./agent-runtime/tools/http-json-read.
 import { createRepositoryGitStatusAdapter } from "./agent-runtime/tools/repository-git-status.js";
 import { createSandboxFileWriteAdapter } from "./agent-runtime/tools/sandbox-file-write.js";
 import { createToolGateway } from "./agent-runtime/tool-gateway.js";
+import { createOpenAIRouterProvider } from "./route-runtime/openai-router-provider.js";
+import { createRouteRuntimeService, type RouteRuntimeService } from "./route-runtime/route-runtime-service.js";
+import { createWorkerRouteAuthority } from "./route-runtime/worker-route-authority.js";
 
 export interface AuthoritativeServer {
   readonly url: string;
@@ -60,7 +63,7 @@ interface AuthoritativeServerTestOptions {
   readonly snapshotMaxRecordsPerPage?: number;
   readonly initialize?: (facades: AuthoritativeServerTestFacades) => Promise<void>;
   readonly registerMissingActors?: false;
-  readonly afterCloseForTest?: Partial<Record<"transport" | "runtime" | "snapshots" | "worker", () => void>>;
+  readonly afterCloseForTest?: Partial<Record<"transport" | "route" | "runtime" | "snapshots" | "worker", () => void>>;
 }
 
 export interface AuthoritativeServerTestFacades {
@@ -103,6 +106,7 @@ async function start(
   let snapshots: Awaited<ReturnType<typeof createSnapshotWorkerClient>> | undefined;
   let transport: Awaited<ReturnType<typeof startMessageWebSocketServer>> | undefined;
   let runtime: AgentRuntimeService | undefined;
+  let routeRuntime: RouteRuntimeService | undefined;
   try {
     worker = transactionFault === undefined
       ? await createWorkerDatabaseClient({ databasePath: options.databasePath })
@@ -183,7 +187,11 @@ async function start(
     const commandStore = {
         async executeHuman(context, command) {
           try {
-            return await authority.executeHuman(context, command);
+            const acknowledgement = await authority.executeHuman(context, command);
+            if (command.type === "message.send") {
+              routeRuntime?.notify(command.roomId, acknowledgement.aggregateId);
+            }
+            return acknowledgement;
           } catch (error: unknown) {
             if (transactionFault !== undefined) {
               process.exit(transactionFault === "after-domain-write" ? 81 : 82);
@@ -191,7 +199,13 @@ async function start(
             throw error;
           }
         },
-        executeAgent: (context, command) => authority.executeAgent(context, command),
+        async executeAgent(context, command) {
+          const acknowledgement = await authority.executeAgent(context, command);
+          if (command.type === "message.send") {
+            routeRuntime?.notify(command.roomId, acknowledgement.aggregateId);
+          }
+          return acknowledgement;
+        },
       } satisfies Parameters<typeof createMessageService>[0]["commandStore"];
     const service = createMessageService({
       commandStore,
@@ -257,15 +271,49 @@ async function start(
       emitPreview(preview) {
         transport?.publishAgentPreview(preview);
       },
+      onMessageCommitted(execution) {
+        if (execution.resultMessageId !== undefined) {
+          routeRuntime?.notify(execution.roomId, execution.resultMessageId);
+        }
+      },
     });
     await runtime.recover();
+    const routeAuthority = createWorkerRouteAuthority(worker);
+    const routerProvider = createOpenAIRouterProvider({
+      endpoint: runtimeConfiguration.endpoint ?? "https://api.openai.com/v1/responses",
+      model: runtimeConfiguration.model ?? "gpt-5-mini",
+      secretProvider,
+    });
+    routeRuntime = createRouteRuntimeService({
+      authority: routeAuthority,
+      provider: routerProvider,
+      async invoke(routeJobId, intent) {
+        await runtime!.invokeRouted(routeJobId, {
+          kind: intent.kind,
+          roomId: intent.roomId,
+          sourceMessageId: intent.sourceMessageId,
+          targetAgentId: intent.targetAgentId,
+        });
+      },
+    });
+    await routeRuntime.recover();
+    const sendBeforeMarkFaultDeliveries = new Set<string>();
     const outboxStore = testOptions.faultPoint === "after-send-before-dispatch-mark"
       ? {
-          listPendingOutbox: (limit: number) => authority.listPendingOutbox(limit),
+          async listPendingOutbox(limit: number) {
+            const deliveries = await authority.listPendingOutbox(limit);
+            for (const delivery of deliveries) {
+              if (delivery.targetKind === "room" && delivery.event.type === "room.message.accepted") {
+                sendBeforeMarkFaultDeliveries.add(delivery.deliveryId);
+              }
+            }
+            return deliveries;
+          },
           authorizeOutboxCandidate: authority.authorizeOutboxCandidate,
           markOutboxFailed: authority.markOutboxFailed,
-          markOutboxDispatched(): Promise<void> {
-            process.exit(84);
+          markOutboxDispatched(deliveryId: string): Promise<void> {
+            if (sendBeforeMarkFaultDeliveries.has(deliveryId)) process.exit(84);
+            return authority.markOutboxDispatched(deliveryId);
           },
         }
       : authority;
@@ -279,6 +327,7 @@ async function start(
     });
   } catch (error: unknown) {
     await transport?.close().catch(() => undefined);
+    await routeRuntime?.close().catch(() => undefined);
     await runtime?.close().catch(() => undefined);
     await snapshots?.close().catch(() => undefined);
     await worker?.close().catch(() => undefined);
@@ -293,6 +342,7 @@ async function start(
         const failures: unknown[] = [];
         for (const [stage, close] of [
           ["transport", () => transport.close()],
+          ["route", () => routeRuntime!.close()],
           ["runtime", () => runtime!.close()],
           ["snapshots", () => snapshots.close()],
           ["worker", () => worker.close()],

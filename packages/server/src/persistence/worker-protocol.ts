@@ -29,6 +29,10 @@ import {
   isRuntimeAuthorityOperation,
   type RuntimeAuthorityOperation,
 } from "../agent-runtime/runtime-authority-protocol.js";
+import {
+  isRouteAuthorityOperation,
+  type RouteAuthorityOperation,
+} from "../route-runtime/route-authority-protocol.js";
 import type {
   AgentCollaborationCommand,
   AgentWorkerCommandContext,
@@ -89,6 +93,8 @@ export type AuthorityWorkerErrorCode =
   | "room_not_found"
   | "room_owner_required"
   | "repair_barrier_active"
+  | "route_conflict"
+  | "route_job_not_found"
   | "session_revoked"
   | "snapshot_busy"
   | "snapshot_expired"
@@ -143,6 +149,8 @@ export function isAuthorityWorkerErrorCode(
     case "room_not_found":
     case "room_owner_required":
     case "repair_barrier_active":
+    case "route_conflict":
+    case "route_job_not_found":
     case "session_revoked":
     case "snapshot_busy":
     case "snapshot_expired":
@@ -335,18 +343,23 @@ export type AuthorityWorkerRequest =
       readonly requestId: string;
       readonly operation: RuntimeAuthorityOperation;
     }
+  | {
+      readonly type: "authority.route";
+      readonly requestId: string;
+      readonly operation: RouteAuthorityOperation;
+    }
   | { readonly type: "authority.close"; readonly requestId: string };
 
 export type AuthorityWorkerResponse =
   | {
       readonly type: "authority.ready";
       readonly requestId: string;
-      readonly schemaVersion: 6;
+      readonly schemaVersion: 7;
     }
   | {
       readonly type: "authority.schema";
       readonly requestId: string;
-      readonly schemaVersion: 6;
+      readonly schemaVersion: 7;
     }
   | {
       readonly type: "authority.legacy-imported";
@@ -449,6 +462,11 @@ export type AuthorityWorkerResponse =
     }
   | {
       readonly type: "authority.runtime-result";
+      readonly requestId: string;
+      readonly result: JsonValue;
+    }
+  | {
+      readonly type: "authority.route-result";
       readonly requestId: string;
       readonly result: JsonValue;
     }
@@ -965,6 +983,9 @@ export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWork
     case "authority.runtime":
       return hasExactKeys(value, ["type", "requestId", "operation"]) &&
         isRuntimeAuthorityOperation(value.operation);
+    case "authority.route":
+      return hasExactKeys(value, ["type", "requestId", "operation"]) &&
+        isRouteAuthorityOperation(value.operation);
     default:
       return false;
   }
@@ -982,7 +1003,7 @@ export function isAuthorityWorkerResponse(
     case "authority.schema":
       return (
         hasExactKeys(value, ["type", "requestId", "schemaVersion"]) &&
-        value.schemaVersion === 6
+        value.schemaVersion === 7
       );
     case "authority.closed":
       return hasExactKeys(value, ["type", "requestId"]);
@@ -1064,6 +1085,9 @@ export function isAuthorityWorkerResponse(
         isNonNegativeSafeInteger(value.headSeq) &&
         value.retainedFromSeq <= value.headSeq + 1;
     case "authority.runtime-result":
+      return hasExactKeys(value, ["type", "requestId", "result"]) &&
+        isJsonValue(value.result);
+    case "authority.route-result":
       return hasExactKeys(value, ["type", "requestId", "result"]) &&
         isJsonValue(value.result);
     case "authority.legacy-imported":

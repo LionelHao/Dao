@@ -9,6 +9,8 @@ import {
   isHumanRoomMembership,
   isMessage,
   isOpenItem,
+  isRouteJob,
+  isRouteJudgment,
 } from "@native-im/core";
 import type {
   AgentExecutionStatus,
@@ -403,10 +405,13 @@ export type CollaborationCommand =
   | {
       readonly type: "calibration.record";
       readonly roomId: string;
-      readonly payload: {
+      readonly payload: ({
         readonly sourceMessageId: string;
         readonly emoji: "👍" | "👎";
-      } & CommandActorFreePayload;
+      } | {
+        readonly sourceMessageId: string;
+        readonly feedback: "useful" | "not_needed";
+      }) & CommandActorFreePayload;
     };
 
 export type HumanCollaborationCommand = Extract<
@@ -644,9 +649,11 @@ function isCollaborationCommand(value: UnknownRecord): boolean {
       (payload.status === "running" || payload.status === "completed" || payload.status === "cancelled" || payload.status === "failed") &&
       (payload.result === undefined || text(payload.result));
   }
-  return value.type === "calibration.record" &&
-    exact(payload, ["sourceMessageId", "emoji"]) && text(payload.sourceMessageId) &&
-    (payload.emoji === "👍" || payload.emoji === "👎");
+  if (value.type !== "calibration.record" || !text(payload.sourceMessageId)) return false;
+  return (exact(payload, ["sourceMessageId", "emoji"]) &&
+      (payload.emoji === "👍" || payload.emoji === "👎")) ||
+    (exact(payload, ["sourceMessageId", "feedback"]) &&
+      (payload.feedback === "useful" || payload.feedback === "not_needed"));
 }
 
 function isGovernanceCommand(value: UnknownRecord): boolean {
@@ -755,6 +762,14 @@ function validRoomEventPayload(
   }
   if (type === "room.agent_judgment.recorded") {
     return isAgentJudgement(payload) && payload.agentId === eventActorId;
+  }
+  if (type === "room.route_judgment.recorded") {
+    return isRouteJudgment(payload);
+  }
+  if (type === "route.queued" || type === "route.started" ||
+      type === "route.retry-scheduled" || type === "route.completed" ||
+      type === "route.failed" || type === "route.recovered") {
+    return isRouteJob(payload) && payload.roomId === roomId;
   }
   if (type === "room.open_item.changed") {
     return isOpenItem(payload) && payload.roomId === roomId;

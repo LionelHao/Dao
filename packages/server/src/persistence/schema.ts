@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
-export const AUTHORITY_SCHEMA_VERSION = 6 as const;
+export const AUTHORITY_SCHEMA_VERSION = 7 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -27,6 +27,8 @@ const V5_MIGRATION_CHECKSUM =
   "3f90cdeb9b7c9e04f432aac809f340033f6d9a2ea1a6a5bd8d9ab50fab8d891d";
 const V6_MIGRATION_CHECKSUM =
   "87b3d62db40e9e7f8fa3e643315a62c26f01968d4065fb743fa502a7251d9257";
+const V7_MIGRATION_CHECKSUM =
+  "4ad86ad359400228cf5428d7bb59c5fc371009904fe50cfedd4641e79e6d4977";
 const SCHEMA_FINGERPRINTS = {
   1: "03f2bbba4aa7082ec01819824726ce1bd9b4bd14cebea71afc93c6821dbf405c",
   2: "01c37d92ec2f303613a7bb8b592ca846fbea7c829b3c81fe4521699db949dfcc",
@@ -34,6 +36,7 @@ const SCHEMA_FINGERPRINTS = {
   4: "b2d08fa3332bf0dc7fd4f0594210550089ed867a51b5da63be0e89830743d3ac",
   5: "b804592978b0afde52b64574534f355eaaf12db2d3401f0ebdf3d09373ca40a0",
   6: "0e5c764a0fae33f00eae7bfd2e21dbbc4d54781d43ef5aa967c6dfeef8c58035",
+  7: "9827d65dd5eac378112a51859251ac842d4393c518f21f8862956aa6ebd0edae",
 } as const;
 
 const V1_STATEMENTS = [
@@ -404,6 +407,112 @@ const V6_STATEMENTS = [
    BEGIN
      SELECT RAISE(ABORT, 'canonical Agent execution is invalid');
    END`,
+] as const;
+
+const V7_STATEMENTS = [
+  `CREATE TABLE route_jobs (
+    id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    source_message_id TEXT NOT NULL UNIQUE REFERENCES messages(id),
+    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed', 'cancelled')),
+    current_attempt INTEGER NOT NULL DEFAULT 1 CHECK (current_attempt BETWEEN 1 AND 3),
+    topic_key TEXT NOT NULL,
+    embedding_model_version TEXT NOT NULL CHECK (embedding_model_version = 'dao-topic-embedding-v1'),
+    window_size INTEGER NOT NULL CHECK (window_size = 8),
+    cosine_threshold REAL NOT NULL CHECK (cosine_threshold = 0.82),
+    room_phase TEXT NOT NULL CHECK (room_phase IN ('discussion', 'execution')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    terminal_error_code TEXT,
+    next_retry_at TEXT
+  ) STRICT`,
+  `CREATE TABLE route_job_agents (
+    route_job_id TEXT NOT NULL REFERENCES route_jobs(id),
+    agent_id TEXT NOT NULL REFERENCES actors(id),
+    participation TEXT NOT NULL CHECK (participation IN ('active', 'on-mention', 'silent')),
+    role TEXT NOT NULL,
+    capabilities_json TEXT NOT NULL CHECK (json_valid(capabilities_json) AND json_type(capabilities_json) = 'array'),
+    calibration_score INTEGER NOT NULL CHECK (calibration_score BETWEEN -4 AND 4),
+    has_ball INTEGER NOT NULL CHECK (has_ball IN (0, 1)),
+    PRIMARY KEY (route_job_id, agent_id)
+  ) STRICT`,
+  `CREATE TABLE route_attempts (
+    route_job_id TEXT NOT NULL REFERENCES route_jobs(id),
+    attempt_seq INTEGER NOT NULL CHECK (attempt_seq BETWEEN 1 AND 3),
+    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed', 'cancelled')),
+    started_at TEXT,
+    finished_at TEXT,
+    error_code TEXT,
+    next_retry_at TEXT,
+    PRIMARY KEY (route_job_id, attempt_seq)
+  ) STRICT`,
+  `CREATE TABLE route_judgments (
+    id TEXT PRIMARY KEY,
+    route_job_id TEXT NOT NULL REFERENCES route_jobs(id),
+    source_message_id TEXT NOT NULL REFERENCES messages(id),
+    agent_id TEXT NOT NULL REFERENCES actors(id),
+    outcome TEXT NOT NULL CHECK (outcome IN ('will_respond', 'no_response_needed', 'suppressed')),
+    reason_code TEXT NOT NULL CHECK (reason_code IN (
+      'direct_mention', 'structured_help', 'domain_match', 'risk_detected', 'ball_due',
+      'participation_silent', 'participation_on_mention', 'cooldown', 'agent_round_limit',
+      'human_burst_soft_suppression', 'execution_phase', 'calibration_suppressed',
+      'provider_omitted', 'provider_failed', 'permission_denied', 'not_selected'
+    )),
+    reason_text TEXT NOT NULL CHECK (length(trim(reason_text)) > 0),
+    route_attempt INTEGER NOT NULL CHECK (route_attempt BETWEEN 1 AND 3),
+    decided_at TEXT NOT NULL,
+    UNIQUE (route_job_id, agent_id)
+  ) STRICT`,
+  `CREATE TABLE route_invocation_intents (
+    route_job_id TEXT NOT NULL REFERENCES route_jobs(id),
+    source_message_id TEXT NOT NULL REFERENCES messages(id),
+    target_agent_id TEXT NOT NULL REFERENCES actors(id),
+    intent_kind TEXT NOT NULL CHECK (intent_kind IN ('direct_mention', 'structured_help', 'routed_candidate')),
+    reason_code TEXT NOT NULL CHECK (reason_code IN ('direct_mention', 'structured_help', 'domain_match', 'risk_detected', 'ball_due')),
+    reason_text TEXT NOT NULL CHECK (length(trim(reason_text)) > 0),
+    priority INTEGER NOT NULL CHECK (priority BETWEEN 1 AND 3),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (source_message_id, target_agent_id)
+  ) STRICT`,
+  `CREATE TABLE message_topics (
+    message_id TEXT PRIMARY KEY REFERENCES messages(id),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    topic_key TEXT NOT NULL,
+    embedding_model_version TEXT NOT NULL CHECK (embedding_model_version = 'dao-topic-embedding-v1'),
+    window_size INTEGER NOT NULL CHECK (window_size = 8),
+    cosine_threshold REAL NOT NULL CHECK (cosine_threshold = 0.82),
+    created_at TEXT NOT NULL
+  ) STRICT`,
+  `CREATE TABLE route_calibration_facts (
+    fact_id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    source_message_id TEXT NOT NULL REFERENCES messages(id),
+    human_actor_id TEXT NOT NULL REFERENCES actors(id),
+    agent_id TEXT NOT NULL REFERENCES actors(id),
+    topic_key TEXT NOT NULL,
+    weight INTEGER NOT NULL CHECK (weight IN (-2, -1, 1, 2)),
+    kind TEXT NOT NULL CHECK (kind IN ('useful', 'not_needed', 'thumbs_up', 'thumbs_down')),
+    created_at TEXT NOT NULL
+  ) STRICT`,
+  `CREATE TABLE route_calibration_scores (
+    agent_id TEXT NOT NULL REFERENCES actors(id),
+    topic_key TEXT NOT NULL,
+    score INTEGER NOT NULL CHECK (score BETWEEN -4 AND 4),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (agent_id, topic_key)
+  ) STRICT`,
+  `CREATE TABLE route_metrics (
+    route_job_id TEXT NOT NULL REFERENCES route_jobs(id),
+    metric_name TEXT NOT NULL CHECK (metric_name IN ('attempts_exhausted')),
+    value INTEGER NOT NULL CHECK (value >= 0),
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (route_job_id, metric_name)
+  ) STRICT`,
+  `CREATE INDEX route_jobs_room_queue_v7 ON route_jobs(room_id, status, created_at, id)`,
+  `CREATE INDEX route_attempts_retry_v7 ON route_attempts(status, next_retry_at, route_job_id, attempt_seq)`,
+  `CREATE INDEX route_judgments_message_v7 ON route_judgments(source_message_id, agent_id)`,
+  `CREATE INDEX route_calibration_facts_agent_topic_v7 ON route_calibration_facts(agent_id, topic_key, created_at)`,
 ] as const;
 
 const V2_STATEMENTS = [
@@ -788,6 +897,7 @@ const MIGRATIONS = [
     V5_MIGRATION_CHECKSUM,
   ),
   defineMigration(6, "agent-runtime-authority", V6_STATEMENTS, V6_MIGRATION_CHECKSUM),
+  defineMigration(7, "single-route-authority", V7_STATEMENTS, V7_MIGRATION_CHECKSUM),
 ] as const satisfies readonly Migration[];
 
 const V1_SCHEMA_CONTRACT = {
@@ -1017,6 +1127,41 @@ const V6_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V7_SCHEMA_CONTRACT = {
+  ...V6_SCHEMA_CONTRACT,
+  message_topics: [
+    "message_id", "room_id", "topic_key", "embedding_model_version", "window_size",
+    "cosine_threshold", "created_at",
+  ],
+  route_attempts: [
+    "route_job_id", "attempt_seq", "status", "started_at", "finished_at", "error_code",
+    "next_retry_at",
+  ],
+  route_calibration_facts: [
+    "fact_id", "room_id", "source_message_id", "human_actor_id", "agent_id", "topic_key",
+    "weight", "kind", "created_at",
+  ],
+  route_calibration_scores: ["agent_id", "topic_key", "score", "updated_at"],
+  route_invocation_intents: [
+    "route_job_id", "source_message_id", "target_agent_id", "intent_kind", "reason_code",
+    "reason_text", "priority", "created_at",
+  ],
+  route_job_agents: [
+    "route_job_id", "agent_id", "participation", "role", "capabilities_json",
+    "calibration_score", "has_ball",
+  ],
+  route_jobs: [
+    "id", "room_id", "source_message_id", "status", "current_attempt", "topic_key",
+    "embedding_model_version", "window_size", "cosine_threshold", "room_phase", "created_at",
+    "updated_at", "completed_at", "terminal_error_code", "next_retry_at",
+  ],
+  route_judgments: [
+    "id", "route_job_id", "source_message_id", "agent_id", "outcome", "reason_code",
+    "reason_text", "route_attempt", "decided_at",
+  ],
+  route_metrics: ["route_job_id", "metric_name", "value", "recorded_at"],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
@@ -1024,6 +1169,7 @@ const SCHEMA_CONTRACTS = {
   4: V4_SCHEMA_CONTRACT,
   5: V4_SCHEMA_CONTRACT,
   6: V6_SCHEMA_CONTRACT,
+  7: V7_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -1534,6 +1680,12 @@ export function migrateAuthorityDatabaseToPreviousVersionForTest(
   database: DatabaseSync,
 ): void {
   migrateAuthorityDatabaseToVersion(database, AUTHORITY_SCHEMA_VERSION - 1);
+}
+
+export function migrateAuthorityDatabaseToVersion5ForTest(
+  database: DatabaseSync,
+): void {
+  migrateAuthorityDatabaseToVersion(database, 5);
 }
 
 export function migrateAuthorityDatabaseToVersion4ForTest(

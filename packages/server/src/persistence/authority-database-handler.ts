@@ -7,6 +7,9 @@ import type {
   Message,
   PersistedIdentityEvent,
   PersistedRoomEvent,
+  RouteInvocationIntent,
+  RouteJob,
+  RouteJudgment,
   RoomSyncRequest,
   RoomSyncResult,
 } from "@native-im/core";
@@ -14,6 +17,11 @@ import type {
   RuntimeAuthorityOperation,
   RuntimeAuthorityOperationResult,
 } from "../agent-runtime/runtime-authority-protocol.js";
+import type {
+  RouteAuthorityOperation,
+  RouteAuthorityOperationResult,
+  RouteProviderFailureCode,
+} from "../route-runtime/route-authority-protocol.js";
 import {
   isManagedRoomShape,
   isRoomAuditRecord,
@@ -45,6 +53,7 @@ import type {
   RepairScope,
 } from "../fallback-repair-coordinator.js";
 import type { SnapshotVersion } from "@native-im/core";
+import { assignTopicKey } from "../route-runtime/route-decision.js";
 
 export class AuthorityDatabaseError extends Error {
   constructor(
@@ -2243,12 +2252,128 @@ function executeMessageSend(
     scope,
     key,
   );
+  enqueueRouteJobForMessage(database, message, acceptedAt);
   return {
     aggregateId: message.id,
     eventIds: [eventId],
     acceptedAt,
     result: { message: message as unknown as JsonValue },
   };
+}
+
+function enqueueRouteJobForMessage(
+  database: DatabaseSync,
+  message: Message,
+  acceptedAt: string,
+): void {
+  const recentTopics = database.prepare(
+    `SELECT topic_key AS topicKey, body AS summary
+     FROM (
+       SELECT topic.topic_key, prior.body, prior.sent_at, prior.id
+       FROM message_topics AS topic
+       JOIN messages AS prior ON prior.id = topic.message_id
+       WHERE topic.room_id = ? AND prior.id <> ?
+       ORDER BY prior.sent_at DESC, prior.id DESC
+       LIMIT 8
+     )
+     ORDER BY sent_at, id`,
+  ).all(message.roomId, message.id);
+  if (!recentTopics.every((entry) =>
+    typeof entry.topicKey === "string" && typeof entry.summary === "string")) {
+    return fail("storage_unavailable", "Route topic history was corrupt");
+  }
+  const topic = assignTopicKey(
+    message.body,
+    recentTopics as { readonly topicKey: string; readonly summary: string }[],
+  );
+  database.prepare(
+    `INSERT INTO message_topics (
+       message_id, room_id, topic_key, embedding_model_version,
+       window_size, cosine_threshold, created_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    message.id,
+    message.roomId,
+    topic.topicKey,
+    topic.embeddingModelVersion,
+    topic.windowSize,
+    topic.cosineThreshold,
+    acceptedAt,
+  );
+
+  const routeJobId = stableId("route-job", message.id);
+  database.prepare(
+    `INSERT INTO route_jobs (
+       id, room_id, source_message_id, status, current_attempt, topic_key,
+       embedding_model_version, window_size, cosine_threshold, room_phase,
+       created_at, updated_at
+     ) VALUES (?, ?, ?, 'queued', 1, ?, ?, ?, ?, 'discussion', ?, ?)`,
+  ).run(
+    routeJobId,
+    message.roomId,
+    message.id,
+    topic.topicKey,
+    topic.embeddingModelVersion,
+    topic.windowSize,
+    topic.cosineThreshold,
+    acceptedAt,
+    acceptedAt,
+  );
+  database.prepare(
+    `INSERT INTO route_attempts (route_job_id, attempt_seq, status)
+     VALUES (?, 1, 'queued')`,
+  ).run(routeJobId);
+
+  const members = database.prepare(
+    `SELECT membership.actor_id AS agentId,
+            membership.participation,
+            actor.display_name AS role,
+            actor.tool_permissions_json AS capabilitiesJson,
+            COALESCE(score.score, 0) AS calibrationScore
+     FROM room_memberships AS membership
+     JOIN actors AS actor ON actor.id = membership.actor_id
+     LEFT JOIN route_calibration_scores AS score
+       ON score.agent_id = membership.actor_id AND score.topic_key = ?
+     WHERE membership.room_id = ?
+       AND membership.kind = 'agent'
+       AND actor.kind = 'agent'
+       AND membership.participation IN ('active', 'on-mention', 'silent')
+     ORDER BY membership.actor_id`,
+  ).all(topic.topicKey, message.roomId);
+  for (const member of members) {
+    if (typeof member.agentId !== "string" ||
+        (member.participation !== "active" && member.participation !== "on-mention" && member.participation !== "silent") ||
+        typeof member.role !== "string" || member.role.trim().length === 0 ||
+        typeof member.capabilitiesJson !== "string" ||
+        typeof member.calibrationScore !== "number") {
+      return fail("storage_unavailable", "Route Agent membership snapshot was corrupt");
+    }
+    database.prepare(
+      `INSERT INTO route_job_agents (
+         route_job_id, agent_id, participation, role, capabilities_json,
+         calibration_score, has_ball
+       ) VALUES (?, ?, ?, ?, ?, ?, 0)`,
+    ).run(
+      routeJobId,
+      member.agentId,
+      member.participation,
+      member.role,
+      member.capabilitiesJson,
+      member.calibrationScore,
+    );
+  }
+  if (members.length === 0) {
+    database.prepare(
+      `UPDATE route_attempts SET status = 'completed', finished_at = ?
+       WHERE route_job_id = ? AND attempt_seq = 1`,
+    ).run(acceptedAt, routeJobId);
+    database.prepare(
+      `UPDATE route_jobs SET status = 'completed', updated_at = ?, completed_at = ?
+       WHERE id = ?`,
+    ).run(acceptedAt, acceptedAt, routeJobId);
+  } else {
+    appendRouteLifecycleEvent(database, routeJobById(database, routeJobId), acceptedAt, "queued");
+  }
 }
 
 function executeHumanRead(
@@ -2492,38 +2617,114 @@ function executeCalibrationRecord(
   key: string,
 ): CommandAcknowledgement {
   const source = database.prepare(
-    `SELECT room_id AS roomId, author_id AS authorId, author_kind AS authorKind
-     FROM messages WHERE id = ?`,
+    `SELECT message.room_id AS roomId, message.author_id AS authorId,
+            message.author_kind AS authorKind, message.body,
+            topic.topic_key AS topicKey
+     FROM messages AS message
+     LEFT JOIN message_topics AS topic ON topic.message_id = message.id
+     WHERE message.id = ?`,
   ).get(command.payload.sourceMessageId);
   if (source?.roomId !== command.roomId || source.authorKind !== "agent" ||
-      typeof source.authorId !== "string") {
+      typeof source.authorId !== "string" || typeof source.body !== "string") {
     return fail(
       "calibration_source_invalid",
       "Authority calibration must reference an Agent message",
     );
   }
+  let topicKey = typeof source.topicKey === "string" ? source.topicKey : undefined;
+  if (topicKey === undefined) {
+    const recentTopics = database.prepare(
+      `SELECT topic.topic_key AS topicKey, prior.body AS summary
+       FROM message_topics AS topic
+       JOIN messages AS prior ON prior.id = topic.message_id
+       WHERE topic.room_id = ? AND prior.id <> ?
+       ORDER BY prior.sent_at DESC, prior.id DESC
+       LIMIT 8`,
+    ).all(command.roomId, command.payload.sourceMessageId);
+    if (!recentTopics.every((entry) =>
+      typeof entry.topicKey === "string" && typeof entry.summary === "string")) {
+      return fail("storage_unavailable", "Calibration topic history was corrupt");
+    }
+    const assigned = assignTopicKey(
+      source.body,
+      recentTopics as { readonly topicKey: string; readonly summary: string }[],
+    );
+    topicKey = assigned.topicKey;
+    database.prepare(
+      `INSERT INTO message_topics (
+         message_id, room_id, topic_key, embedding_model_version,
+         window_size, cosine_threshold, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      command.payload.sourceMessageId,
+      command.roomId,
+      assigned.topicKey,
+      assigned.embeddingModelVersion,
+      assigned.windowSize,
+      assigned.cosineThreshold,
+      acceptedAt,
+    );
+  }
+  const calibration = "emoji" in command.payload
+    ? {
+        signal: command.payload.emoji,
+        kind: command.payload.emoji === "👍" ? "thumbs_up" as const : "thumbs_down" as const,
+        weight: command.payload.emoji === "👍" ? 1 : -1,
+      }
+    : {
+        signal: command.payload.feedback,
+        kind: command.payload.feedback,
+        weight: command.payload.feedback === "useful" ? 2 : -2,
+      };
   const signal = {
     id: stableId("calibration", scope, key),
     sourceMessageId: command.payload.sourceMessageId,
     actorId,
     agentId: source.authorId,
-    emoji: command.payload.emoji,
+    ...(calibration.kind === "thumbs_up" || calibration.kind === "thumbs_down"
+      ? { emoji: calibration.signal as "👍" | "👎" }
+      : { feedback: calibration.signal as "useful" | "not_needed" }),
     createdAt: acceptedAt,
   };
+  if (calibration.kind === "thumbs_up" || calibration.kind === "thumbs_down") {
+    database.prepare(
+      `INSERT INTO calibration_signals (
+         id, room_id, agent_id, judgment_id, signal, created_at,
+         source_message_id, actor_id
+       ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?)`,
+    ).run(
+      signal.id,
+      command.roomId,
+      signal.agentId,
+      calibration.signal,
+      signal.createdAt,
+      signal.sourceMessageId,
+      signal.actorId,
+    );
+  }
   database.prepare(
-    `INSERT INTO calibration_signals (
-       id, room_id, agent_id, judgment_id, signal, created_at,
-       source_message_id, actor_id
-     ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?)`,
+    `INSERT INTO route_calibration_facts (
+       fact_id, room_id, source_message_id, human_actor_id,
+       agent_id, topic_key, weight, kind, created_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     signal.id,
     command.roomId,
-    signal.agentId,
-    signal.emoji,
-    signal.createdAt,
     signal.sourceMessageId,
     signal.actorId,
+    signal.agentId,
+    topicKey,
+    calibration.weight,
+    calibration.kind,
+    acceptedAt,
   );
+  database.prepare(
+    `INSERT INTO route_calibration_scores (agent_id, topic_key, score, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT (agent_id, topic_key) DO UPDATE SET
+       score = MAX(-4, MIN(4, route_calibration_scores.score + excluded.score)),
+       updated_at = excluded.updated_at`,
+  ).run(signal.agentId, topicKey, calibration.weight, acceptedAt);
   const eventId = stableId("event", scope, key, "0");
   const streamSeq = appendRoomEvent(database, {
     eventId,
@@ -2961,6 +3162,503 @@ function requireRuntimeHumanAuthority(
   }
 }
 
+function routeJobFromRow(row: Record<string, unknown> | undefined): RouteJob {
+  if (row === undefined || typeof row.id !== "string" || typeof row.roomId !== "string" ||
+      typeof row.sourceMessageId !== "string" ||
+      (row.status !== "queued" && row.status !== "running" && row.status !== "completed" &&
+        row.status !== "failed" && row.status !== "cancelled") ||
+      (row.currentAttempt !== 1 && row.currentAttempt !== 2 && row.currentAttempt !== 3) ||
+      typeof row.topicKey !== "string" || row.embeddingModelVersion !== "dao-topic-embedding-v1" ||
+      row.windowSize !== 8 || row.cosineThreshold !== 0.82 ||
+      (row.roomPhase !== "discussion" && row.roomPhase !== "execution") ||
+      typeof row.createdAt !== "string" || typeof row.updatedAt !== "string") {
+    return fail("storage_unavailable", "Route job was corrupt");
+  }
+  return {
+    id: row.id,
+    roomId: row.roomId,
+    sourceMessageId: row.sourceMessageId,
+    status: row.status,
+    currentAttempt: row.currentAttempt,
+    topicKey: row.topicKey,
+    embeddingModelVersion: row.embeddingModelVersion,
+    windowSize: row.windowSize,
+    cosineThreshold: row.cosineThreshold,
+    roomPhase: row.roomPhase,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    ...(typeof row.completedAt === "string" ? { completedAt: row.completedAt } : {}),
+    ...(typeof row.terminalErrorCode === "string" ? { terminalErrorCode: row.terminalErrorCode } : {}),
+    ...(typeof row.nextRetryAt === "string" ? { nextRetryAt: row.nextRetryAt } : {}),
+  };
+}
+
+const routeJobSelect = `SELECT
+  id, room_id AS roomId, source_message_id AS sourceMessageId, status,
+  current_attempt AS currentAttempt, topic_key AS topicKey,
+  embedding_model_version AS embeddingModelVersion, window_size AS windowSize,
+  cosine_threshold AS cosineThreshold, room_phase AS roomPhase,
+  created_at AS createdAt, updated_at AS updatedAt, completed_at AS completedAt,
+  terminal_error_code AS terminalErrorCode, next_retry_at AS nextRetryAt
+FROM route_jobs`;
+
+function routeJobById(database: DatabaseSync, routeJobId: string): RouteJob {
+  const row = database.prepare(`${routeJobSelect} WHERE id = ?`).get(routeJobId);
+  if (row === undefined) return fail("route_job_not_found", "Route job was not found");
+  return routeJobFromRow(row);
+}
+
+function routeSourceAuthor(database: DatabaseSync, job: RouteJob): string {
+  const source = database.prepare(
+    "SELECT author_id AS authorId FROM messages WHERE id = ? AND room_id = ?",
+  ).get(job.sourceMessageId, job.roomId);
+  if (typeof source?.authorId !== "string") {
+    return fail("storage_unavailable", "Route source author was corrupt");
+  }
+  return source.authorId;
+}
+
+function appendRouteLifecycleEvent(
+  database: DatabaseSync,
+  job: RouteJob,
+  occurredAt: string,
+  transition: "queued" | "started" | "retry-scheduled" | "completed" | "failed" | "recovered",
+): void {
+  const eventId = stableId("route-lifecycle", job.id, String(job.currentAttempt), transition);
+  const streamSeq = appendRoomEvent(database, {
+    eventId,
+    roomId: job.roomId,
+    actorId: routeSourceAuthor(database, job),
+    eventType: `route.${transition}`,
+    occurredAt,
+    payload: job as unknown as JsonValue,
+  });
+  appendRoomOutbox(database, eventId, job.roomId, streamSeq, occurredAt, "route", transition);
+}
+
+function appendRouteJudgmentEvent(
+  database: DatabaseSync,
+  job: RouteJob,
+  judgment: RouteJudgment,
+  occurredAt: string,
+): void {
+  const eventId = stableId("route-judgment-event", judgment.id);
+  const streamSeq = appendRoomEvent(database, {
+    eventId,
+    roomId: job.roomId,
+    actorId: judgment.agentId,
+    eventType: "room.route_judgment.recorded",
+    occurredAt,
+    payload: judgment as unknown as JsonValue,
+  });
+  appendRoomOutbox(database, eventId, job.roomId, streamSeq, occurredAt, "route-judgment", judgment.id);
+}
+
+function directMentionAgentIds(body: string, agentIds: readonly string[]): readonly string[] {
+  const mentioned = new Set<string>();
+  for (const match of body.matchAll(/@([\p{L}\p{N}_.:-]+)/gu)) {
+    if (match[1] !== undefined) mentioned.add(match[1]);
+  }
+  return agentIds.filter((agentId) => mentioned.has(agentId));
+}
+
+function closeRouteAfterExhaustion(
+  database: DatabaseSync,
+  job: RouteJob,
+  errorCode: RouteProviderFailureCode,
+  occurredAt: string,
+): RouteJob {
+  const agents = database.prepare(
+    `SELECT agent_id AS agentId FROM route_job_agents
+     WHERE route_job_id = ? ORDER BY agent_id`,
+  ).all(job.id);
+  for (const agent of agents) {
+    if (typeof agent.agentId !== "string") {
+      return fail("storage_unavailable", "Route Agent snapshot was corrupt");
+    }
+    const judgment: RouteJudgment = {
+      id: stableId("route-judgment", job.id, agent.agentId),
+      routeJobId: job.id,
+      sourceMessageId: job.sourceMessageId,
+      agentId: agent.agentId,
+      outcome: "no_response_needed",
+      reasonCode: "provider_failed",
+      reasonText: `closed provider failure: ${errorCode}`,
+      routeAttempt: job.currentAttempt,
+      decidedAt: occurredAt,
+    };
+    database.prepare(
+      `INSERT INTO route_judgments (
+         id, route_job_id, source_message_id, agent_id, outcome,
+         reason_code, reason_text, route_attempt, decided_at
+       ) VALUES (?, ?, ?, ?, 'no_response_needed', 'provider_failed', ?, ?, ?)`,
+    ).run(
+      judgment.id,
+      judgment.routeJobId,
+      judgment.sourceMessageId,
+      judgment.agentId,
+      judgment.reasonText,
+      judgment.routeAttempt,
+      judgment.decidedAt,
+    );
+    appendRouteJudgmentEvent(database, job, judgment, occurredAt);
+  }
+  database.prepare(
+    `UPDATE route_jobs
+     SET status = 'failed', updated_at = ?, completed_at = ?,
+         terminal_error_code = ?, next_retry_at = NULL
+     WHERE id = ? AND status = 'running' AND current_attempt = ?`,
+  ).run(occurredAt, occurredAt, errorCode, job.id, job.currentAttempt);
+  database.prepare(
+    `INSERT INTO route_metrics (route_job_id, metric_name, value, recorded_at)
+     VALUES (?, 'attempts_exhausted', 1, ?)`,
+  ).run(job.id, occurredAt);
+  const failed = routeJobById(database, job.id);
+  appendRouteLifecycleEvent(database, failed, occurredAt, "failed");
+  return failed;
+}
+
+function failRouteAttempt(
+  database: DatabaseSync,
+  job: RouteJob,
+  errorCode: RouteProviderFailureCode,
+  now: number,
+): { readonly job: RouteJob; readonly retryAfterMs?: number } {
+  if (job.status !== "running") return fail("route_conflict", "Route attempt was not running");
+  const occurredAt = new Date(now).toISOString();
+  database.prepare(
+    `UPDATE route_attempts
+     SET status = 'failed', finished_at = ?, error_code = ?, next_retry_at = NULL
+     WHERE route_job_id = ? AND attempt_seq = ? AND status = 'running'`,
+  ).run(occurredAt, errorCode, job.id, job.currentAttempt);
+  if (job.currentAttempt === 3) {
+    return { job: closeRouteAfterExhaustion(database, job, errorCode, occurredAt) };
+  }
+  const retryAfterMs = job.currentAttempt === 1 ? 250 : 1_000;
+  const nextAttempt = (job.currentAttempt + 1) as 2 | 3;
+  const nextRetryAt = new Date(now + retryAfterMs).toISOString();
+  database.prepare(
+    `UPDATE route_jobs
+     SET status = 'queued', current_attempt = ?, updated_at = ?, next_retry_at = ?
+     WHERE id = ? AND status = 'running' AND current_attempt = ?`,
+  ).run(nextAttempt, occurredAt, nextRetryAt, job.id, job.currentAttempt);
+  database.prepare(
+    `INSERT INTO route_attempts (
+       route_job_id, attempt_seq, status, next_retry_at
+     ) VALUES (?, ?, 'queued', ?)`,
+  ).run(job.id, nextAttempt, nextRetryAt);
+  const retry = routeJobById(database, job.id);
+  appendRouteLifecycleEvent(database, retry, occurredAt, "retry-scheduled");
+  return { job: retry, retryAfterMs };
+}
+
+export function executeRouteAuthorityOperation(
+  database: DatabaseSync,
+  operation: RouteAuthorityOperation,
+): RouteAuthorityOperationResult {
+  return runAuthorityImmediateTransaction(database, () => {
+    const occurredAt = new Date(operation.now).toISOString();
+    if (operation.type === "route.claim") {
+      const row = database.prepare(
+        `${routeJobSelect} WHERE source_message_id = ?`,
+      ).get(operation.sourceMessageId);
+      if (row === undefined) return fail("route_job_not_found", "Route job was not found");
+      const queued = routeJobFromRow(row);
+      if (queued.status !== "queued" ||
+          (queued.nextRetryAt !== undefined && Date.parse(queued.nextRetryAt) > operation.now)) {
+        return fail("route_conflict", "Route job was not claimable");
+      }
+      const claimed = database.prepare(
+        `UPDATE route_jobs SET status = 'running', updated_at = ?, next_retry_at = NULL
+         WHERE id = ? AND status = 'queued' AND current_attempt = ?`,
+      ).run(occurredAt, queued.id, queued.currentAttempt);
+      if (claimed.changes !== 1) return fail("route_conflict", "Route claim was stale");
+      database.prepare(
+        `UPDATE route_attempts SET status = 'running', started_at = ?, next_retry_at = NULL
+         WHERE route_job_id = ? AND attempt_seq = ? AND status = 'queued'`,
+      ).run(occurredAt, queued.id, queued.currentAttempt);
+      appendRouteLifecycleEvent(database, routeJobById(database, queued.id), occurredAt, "started");
+
+      const message = database.prepare(
+        `SELECT author_id AS authorId, author_kind AS authorKind, body, sent_at AS sentAt
+         FROM messages WHERE id = ? AND room_id = ?`,
+      ).get(queued.sourceMessageId, queued.roomId);
+      if (typeof message?.authorId !== "string" ||
+          (message.authorKind !== "human" && message.authorKind !== "agent") ||
+          typeof message.body !== "string" || typeof message.sentAt !== "string") {
+        return fail("storage_unavailable", "Route source message was corrupt");
+      }
+      const memberRows = database.prepare(
+        `SELECT snapshot.agent_id AS agentId, snapshot.participation, snapshot.role,
+                snapshot.capabilities_json AS capabilitiesJson,
+                snapshot.calibration_score AS calibrationScore,
+                snapshot.has_ball AS hasBall
+         FROM route_job_agents AS snapshot
+         WHERE snapshot.route_job_id = ? ORDER BY snapshot.agent_id`,
+      ).all(queued.id);
+      const agents = memberRows.map((member) => {
+        let capabilities: unknown;
+        try {
+          capabilities = typeof member.capabilitiesJson === "string"
+            ? JSON.parse(member.capabilitiesJson) : undefined;
+        } catch {
+          return fail("storage_unavailable", "Route capability snapshot was corrupt");
+        }
+        if (typeof member.agentId !== "string" ||
+            (member.participation !== "active" && member.participation !== "on-mention" && member.participation !== "silent") ||
+            typeof member.role !== "string" || !Array.isArray(capabilities) ||
+            !capabilities.every((entry) => typeof entry === "string") ||
+            typeof member.calibrationScore !== "number" ||
+            (member.hasBall !== 0 && member.hasBall !== 1)) {
+          return fail("storage_unavailable", "Route Agent snapshot was corrupt");
+        }
+        return {
+          agentId: member.agentId,
+          participation: member.participation,
+          role: member.role,
+          capabilities,
+          calibrationScore: member.calibrationScore,
+          hasBall: member.hasBall === 1,
+        } as const;
+      });
+      const recentHumans = database.prepare(
+        `SELECT sent_at AS sentAt FROM messages
+         WHERE room_id = ? AND author_kind = 'human' AND sent_at >= ? AND sent_at <= ?
+         ORDER BY sent_at`,
+      ).all(queued.roomId, new Date(operation.now - 60_000).toISOString(), occurredAt);
+      const recentHumanMessageTimes = recentHumans.map((entry) => {
+        const parsed = typeof entry.sentAt === "string" ? Date.parse(entry.sentAt) : Number.NaN;
+        if (!Number.isFinite(parsed)) return fail("storage_unavailable", "Route human-message clock was corrupt");
+        return parsed;
+      });
+      const recentKinds = database.prepare(
+        `SELECT author_kind AS authorKind FROM messages
+         WHERE room_id = ? AND (sent_at < ? OR (sent_at = ? AND id <= ?))
+         ORDER BY sent_at DESC, id DESC LIMIT 4`,
+      ).all(queued.roomId, message.sentAt, message.sentAt, queued.sourceMessageId);
+      let consecutiveAgentRounds = 0;
+      for (const entry of recentKinds) {
+        if (entry.authorKind === "human") break;
+        if (entry.authorKind !== "agent") return fail("storage_unavailable", "Route message author was corrupt");
+        consecutiveAgentRounds += 1;
+      }
+      const cooldownRows = database.prepare(
+        `SELECT judgment.agent_id AS agentId, MAX(judgment.decided_at) AS decidedAt
+         FROM route_judgments AS judgment
+         JOIN route_jobs AS prior ON prior.id = judgment.route_job_id
+         WHERE prior.room_id = ? AND prior.topic_key = ?
+           AND prior.id <> ? AND judgment.outcome = 'will_respond'
+         GROUP BY judgment.agent_id ORDER BY judgment.agent_id`,
+      ).all(queued.roomId, queued.topicKey, queued.id);
+      const cooldownByAgentId = cooldownRows.map((entry) => {
+        const lastRespondedAt = typeof entry.decidedAt === "string" ? Date.parse(entry.decidedAt) : Number.NaN;
+        if (typeof entry.agentId !== "string" || !Number.isFinite(lastRespondedAt)) {
+          return fail("storage_unavailable", "Route cooldown fact was corrupt");
+        }
+        return { agentId: entry.agentId, lastRespondedAt };
+      });
+      const running = routeJobById(database, queued.id);
+      return {
+        kind: "route-claimed",
+        job: running,
+        providerInput: {
+          purpose: "route_decision",
+          roomId: running.roomId,
+          sourceMessageId: running.sourceMessageId,
+          message: {
+            authorId: message.authorId,
+            authorKind: message.authorKind,
+            summary: message.body.slice(0, 4_096),
+          },
+          roomPhase: running.roomPhase,
+          agents,
+          topic: {
+            topicKey: running.topicKey,
+            embeddingModelVersion: running.embeddingModelVersion,
+            windowSize: running.windowSize,
+            cosineThreshold: running.cosineThreshold,
+          },
+          limits: {
+            timeoutMs: 1_000,
+            maxCandidates: Math.min(agents.length, 256),
+            maxOutputBytes: 64 * 1_024,
+          },
+        },
+        decisionContext: {
+          directMentionAgentIds: directMentionAgentIds(
+            message.body,
+            agents.map((agent) => agent.agentId),
+          ),
+          structuredHelpAgentIds: [],
+          recentHumanMessageTimes,
+          consecutiveAgentRounds,
+          cooldownByAgentId,
+        },
+      };
+    }
+
+    if (operation.type === "route.complete") {
+      const job = routeJobById(database, operation.routeJobId);
+      if (job.status !== "running" || job.currentAttempt !== operation.attempt) {
+        return fail("route_conflict", "Route completion was stale");
+      }
+      const snapshotAgents = database.prepare(
+        `SELECT agent_id AS agentId FROM route_job_agents
+         WHERE route_job_id = ? ORDER BY agent_id`,
+      ).all(job.id).map((entry) => {
+        if (typeof entry.agentId !== "string") return fail("storage_unavailable", "Route Agent snapshot was corrupt");
+        return entry.agentId;
+      });
+      const expectedAgents = new Set(snapshotAgents);
+      const judgmentByAgent = new Map<string, RouteJudgment>();
+      for (const judgment of operation.judgments) {
+        if (judgment.routeJobId !== job.id || judgment.sourceMessageId !== job.sourceMessageId ||
+            judgment.routeAttempt !== job.currentAttempt || !expectedAgents.has(judgment.agentId) ||
+            judgmentByAgent.has(judgment.agentId)) {
+          return fail("route_conflict", "Route judgment set was not closed");
+        }
+        judgmentByAgent.set(judgment.agentId, judgment);
+      }
+      if (judgmentByAgent.size !== expectedAgents.size) {
+        return fail("route_conflict", "Route judgment set omitted an Agent");
+      }
+      const currentRoom = database.prepare("SELECT status FROM rooms WHERE id = ?").get(job.roomId);
+      const acceptedIntents: RouteInvocationIntent[] = [];
+      const intentAgents = new Set<string>();
+      for (const intent of operation.intents) {
+        if (intent.roomId !== job.roomId || intent.sourceMessageId !== job.sourceMessageId ||
+            !expectedAgents.has(intent.targetAgentId) || intentAgents.has(intent.targetAgentId)) {
+          return fail("route_conflict", "Route invocation intent was invalid");
+        }
+        intentAgents.add(intent.targetAgentId);
+        const membership = database.prepare(
+          `SELECT membership.kind, actor.kind AS actorKind
+           FROM room_memberships AS membership
+           JOIN actors AS actor ON actor.id = membership.actor_id
+           WHERE membership.room_id = ? AND membership.actor_id = ?`,
+        ).get(job.roomId, intent.targetAgentId);
+        if (currentRoom?.status !== "active" || membership?.kind !== "agent" || membership.actorKind !== "agent") {
+          const previous = judgmentByAgent.get(intent.targetAgentId)!;
+          judgmentByAgent.set(intent.targetAgentId, {
+            ...previous,
+            outcome: "suppressed",
+            reasonCode: "permission_denied",
+            reasonText: "current Agent membership permission denied",
+          });
+          continue;
+        }
+        acceptedIntents.push(intent);
+      }
+      for (const agentId of snapshotAgents) {
+        const judgment = judgmentByAgent.get(agentId)!;
+        if ((acceptedIntents.some((intent) => intent.targetAgentId === agentId)) !==
+            (judgment.outcome === "will_respond")) {
+          return fail("route_conflict", "Route judgment and invocation intent disagreed");
+        }
+        database.prepare(
+          `INSERT INTO route_judgments (
+             id, route_job_id, source_message_id, agent_id, outcome,
+             reason_code, reason_text, route_attempt, decided_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          judgment.id,
+          judgment.routeJobId,
+          judgment.sourceMessageId,
+          judgment.agentId,
+          judgment.outcome,
+          judgment.reasonCode,
+          judgment.reasonText,
+          judgment.routeAttempt,
+          judgment.decidedAt,
+        );
+        appendRouteJudgmentEvent(database, job, judgment, occurredAt);
+      }
+      for (const intent of acceptedIntents) {
+        database.prepare(
+          `INSERT INTO route_invocation_intents (
+             route_job_id, source_message_id, target_agent_id, intent_kind,
+             reason_code, reason_text, priority, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          job.id,
+          job.sourceMessageId,
+          intent.targetAgentId,
+          intent.kind,
+          intent.reasonCode,
+          intent.reasonText,
+          intent.priority,
+          occurredAt,
+        );
+      }
+      if (operation.terminalErrorCode === undefined) {
+        database.prepare(
+          `UPDATE route_attempts SET status = 'completed', finished_at = ?
+           WHERE route_job_id = ? AND attempt_seq = ? AND status = 'running'`,
+        ).run(occurredAt, job.id, job.currentAttempt);
+        database.prepare(
+          `UPDATE route_jobs
+           SET status = 'completed', updated_at = ?, completed_at = ?, next_retry_at = NULL
+           WHERE id = ? AND status = 'running' AND current_attempt = ?`,
+        ).run(occurredAt, occurredAt, job.id, job.currentAttempt);
+      } else {
+        database.prepare(
+          `UPDATE route_attempts
+           SET status = 'failed', finished_at = ?, error_code = ?
+           WHERE route_job_id = ? AND attempt_seq = ? AND status = 'running'`,
+        ).run(occurredAt, operation.terminalErrorCode, job.id, job.currentAttempt);
+        database.prepare(
+          `UPDATE route_jobs
+           SET status = 'failed', updated_at = ?, completed_at = ?,
+               terminal_error_code = ?, next_retry_at = NULL
+           WHERE id = ? AND status = 'running' AND current_attempt = ?`,
+        ).run(
+          occurredAt,
+          occurredAt,
+          operation.terminalErrorCode,
+          job.id,
+          job.currentAttempt,
+        );
+        database.prepare(
+          `INSERT INTO route_metrics (route_job_id, metric_name, value, recorded_at)
+           VALUES (?, 'attempts_exhausted', 1, ?)`,
+        ).run(job.id, occurredAt);
+      }
+      const terminalJob = routeJobById(database, job.id);
+      appendRouteLifecycleEvent(
+        database,
+        terminalJob,
+        occurredAt,
+        operation.terminalErrorCode === undefined ? "completed" : "failed",
+      );
+      return {
+        kind: "route-completed",
+        job: terminalJob,
+        intents: acceptedIntents,
+      };
+    }
+
+    if (operation.type === "route.fail") {
+      const job = routeJobById(database, operation.routeJobId);
+      if (job.currentAttempt !== operation.attempt) return fail("route_conflict", "Route failure was stale");
+      const failed = failRouteAttempt(database, job, operation.errorCode, operation.now);
+      return { kind: "route-failed", ...failed };
+    }
+
+    const runningRows = database.prepare(
+      `${routeJobSelect} WHERE status = 'running' ORDER BY created_at, id LIMIT 256`,
+    ).all();
+    for (const row of runningRows) {
+      failRouteAttempt(database, routeJobFromRow(row), "runtime_restarted", operation.now);
+    }
+    const readyRows = database.prepare(
+      `${routeJobSelect}
+       WHERE status = 'queued'
+       ORDER BY room_id, created_at, id LIMIT 256`,
+    ).all();
+    return { kind: "route-recovery", jobs: readyRows.map(routeJobFromRow) };
+  });
+}
+
 export function executeRuntimeAuthorityOperation(
   database: DatabaseSync,
   operation: RuntimeAuthorityOperation,
@@ -3097,6 +3795,99 @@ export function executeRuntimeAuthorityOperation(
       return { kind: "invocation", execution, replayed: false };
     }
 
+    if (operation.type === "runtime.invoke-routed") {
+      const routeIntent = database.prepare(
+        `SELECT route.room_id AS roomId, route.source_message_id AS sourceMessageId,
+                route.status AS routeStatus, intent.intent_kind AS intentKind,
+                source.author_id AS requesterId
+         FROM route_jobs AS route
+         JOIN route_invocation_intents AS intent ON intent.route_job_id = route.id
+         JOIN messages AS source ON source.id = route.source_message_id
+         WHERE route.id = ? AND intent.target_agent_id = ?`,
+      ).get(operation.routeJobId, operation.intent.targetAgentId);
+      if (routeIntent?.roomId !== operation.intent.roomId ||
+          routeIntent.sourceMessageId !== operation.intent.sourceMessageId ||
+          (routeIntent.routeStatus !== "completed" && routeIntent.routeStatus !== "failed") ||
+          routeIntent.intentKind !== operation.intent.kind || typeof routeIntent.requesterId !== "string") {
+        return fail("permission_denied", "Routed Agent invocation was not authorized");
+      }
+      const target = database.prepare(
+        `SELECT actor.kind AS actorKind, membership.kind AS membershipKind, room.status AS roomStatus
+         FROM room_memberships AS membership
+         JOIN actors AS actor ON actor.id = membership.actor_id
+         JOIN rooms AS room ON room.id = membership.room_id
+         WHERE membership.room_id = ? AND membership.actor_id = ?`,
+      ).get(operation.intent.roomId, operation.intent.targetAgentId);
+      if (target?.actorKind !== "agent" || target.membershipKind !== "agent" || target.roomStatus !== "active") {
+        return fail("permission_denied", "Routed target Agent membership was forbidden");
+      }
+      const existing = database.prepare(
+        `SELECT execution_id AS executionId, intent_kind AS intentKind
+         FROM agent_invocation_intents WHERE source_message_id = ? AND target_agent_id = ?`,
+      ).get(operation.intent.sourceMessageId, operation.intent.targetAgentId);
+      if (typeof existing?.executionId === "string") {
+        if (operation.intent.kind === "direct_mention" && existing.intentKind !== "direct_mention") {
+          database.prepare(
+            `UPDATE agent_invocation_intents SET intent_kind = 'direct_mention'
+             WHERE source_message_id = ? AND target_agent_id = ?`,
+          ).run(operation.intent.sourceMessageId, operation.intent.targetAgentId);
+        }
+        return { kind: "invocation", execution: runtimeExecutionById(database, existing.executionId), replayed: true };
+      }
+      const queued = database.prepare(
+        `SELECT COUNT(*) AS count FROM agent_executions WHERE room_id = ? AND status = 'queued'`,
+      ).get(operation.intent.roomId);
+      if (typeof queued?.count !== "number" || queued.count >= 32) {
+        return fail("agent_queue_full", "Agent room queue was full");
+      }
+      database.prepare(
+        `INSERT INTO agent_executions (
+           id, room_id, agent_id, trigger_message_id, status, started_at,
+           completed_at, result_json, requester_actor_id, tool_name,
+           action_category, tool_dispatch_phase, current_attempt_seq,
+           retry_cycle, retry_ordinal, provider_id, model_id, recovery_cursor,
+           queued_at, updated_at
+         ) VALUES (?, ?, ?, ?, 'queued', ?, NULL, NULL, ?, 'model.generate',
+                   'model_generation', NULL, 1, 1, 1, ?, ?, 0, ?, ?)`,
+      ).run(
+        operation.executionId,
+        operation.intent.roomId,
+        operation.intent.targetAgentId,
+        operation.intent.sourceMessageId,
+        occurredAt,
+        routeIntent.requesterId,
+        operation.providerId,
+        operation.modelId,
+        occurredAt,
+        occurredAt,
+      );
+      database.prepare(
+        `INSERT INTO agent_execution_attempts (
+           execution_id, attempt_seq, retry_cycle, retry_ordinal, status,
+           action_category, started_at, finished_at, error_code, next_retry_at,
+           recovery_cursor
+         ) VALUES (?, 1, 1, 1, 'queued', 'model_generation', NULL, NULL, NULL, NULL, 0)`,
+      ).run(operation.executionId);
+      database.prepare(
+        `INSERT INTO agent_invocation_intents (
+           id, room_id, source_message_id, target_agent_id, requester_actor_id,
+           intent_kind, execution_id, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        operation.intentId,
+        operation.intent.roomId,
+        operation.intent.sourceMessageId,
+        operation.intent.targetAgentId,
+        routeIntent.requesterId,
+        operation.intent.kind,
+        operation.executionId,
+        occurredAt,
+      );
+      const execution = runtimeExecutionById(database, operation.executionId);
+      appendRuntimeExecutionEvent(database, execution, occurredAt, "queued");
+      return { kind: "invocation", execution, replayed: false };
+    }
+
     if (operation.type === "runtime.claim") {
       const updated = database.prepare(
         `UPDATE agent_executions
@@ -3142,6 +3933,7 @@ export function executeRuntimeAuthorityOperation(
         payload: message,
       });
       appendRoomOutbox(database, messageEventId, current.roomId, messageSeq, occurredAt, "runtime", "message");
+      enqueueRouteJobForMessage(database, message, occurredAt);
       database.prepare(
         `UPDATE agent_executions
          SET status = 'completed', completed_at = ?, updated_at = ?, result_message_id = ?

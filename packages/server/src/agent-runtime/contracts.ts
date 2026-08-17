@@ -153,6 +153,12 @@ export interface RuntimeAuthority {
     providerId: string,
     modelId: string,
   ): Promise<InvocationAccepted>;
+  invokeRouted(
+    routeJobId: string,
+    intent: AgentInvocationIntent,
+    providerId: string,
+    modelId: string,
+  ): Promise<InvocationAccepted>;
   claim(executionId: string, attemptSeq: number): Promise<AgentExecution>;
   complete(executionId: string, attemptSeq: number, body: string): Promise<AgentExecution>;
   scheduleRetry(

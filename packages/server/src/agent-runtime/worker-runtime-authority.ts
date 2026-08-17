@@ -118,6 +118,18 @@ export function createWorkerRuntimeAuthority(worker: WorkerDatabaseClient): Runt
         now: Date.now(),
       }));
     },
+    async invokeRouted(routeJobId, intent, providerId, modelId) {
+      return invocationResult(await execute({
+        type: "runtime.invoke-routed",
+        routeJobId,
+        intent,
+        executionId: `execution-${randomUUID()}`,
+        intentId: `intent-${randomUUID()}`,
+        providerId,
+        modelId,
+        now: Date.now(),
+      }));
+    },
     async claim(executionId, attemptSeq) {
       return executionResult(await execute({ type: "runtime.claim", executionId, attemptSeq, now: Date.now() }));
     },

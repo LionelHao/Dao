@@ -5,6 +5,10 @@ import {
   isCalibrationSignal,
   isHumanReadReceipt,
   isOpenItem,
+  isRouteJob,
+  isRouteJudgment,
+  isRouterProviderInput,
+  isRouterPlan,
   isSocialReaction,
 } from "./collaboration.js";
 
@@ -137,6 +141,76 @@ describe("canonical collaboration records", () => {
       agentId: "agent-1",
       emoji: "🎉",
       createdAt: "2026-08-10T00:00:00.000Z",
+    })).toBe(false);
+  });
+
+  it("accepts only closed route jobs, plans, and per-agent final judgments", () => {
+    expect(isRouteJob({
+      id: "route-1", roomId: "room-1", sourceMessageId: "message-1",
+      status: "running", currentAttempt: 2, topicKey: "topic-v1:abc",
+      embeddingModelVersion: "dao-topic-embedding-v1", windowSize: 8,
+      cosineThreshold: 0.82, roomPhase: "discussion",
+      createdAt: "2026-08-17T00:00:00.000Z", updatedAt: "2026-08-17T00:00:01.000Z",
+    })).toBe(true);
+    expect(isRouteJob({
+      id: "route-1", roomId: "room-1", sourceMessageId: "message-1",
+      status: "running", currentAttempt: 2, topicKey: "topic-v1:abc",
+      embeddingModelVersion: "changed-silently", windowSize: 9,
+      cosineThreshold: 0.7, roomPhase: "discussion",
+      createdAt: "2026-08-17T00:00:00.000Z", updatedAt: "2026-08-17T00:00:01.000Z",
+    })).toBe(false);
+    expect(isRouterPlan({ candidates: [{
+      agentId: "agent-1", trigger: "risk", order: 1,
+      reasonCode: "risk_detected", reasonText: "发现权限风险",
+    }] })).toBe(true);
+    expect(isRouterPlan({ candidates: [
+      { agentId: "agent-1", trigger: "risk", order: 1, reasonCode: "risk_detected", reasonText: "one" },
+      { agentId: "agent-1", trigger: "domain", order: 2, reasonCode: "domain_match", reasonText: "two" },
+    ] })).toBe(false);
+    expect(isRouteJudgment({
+      id: "route-judgment-1", routeJobId: "route-1", sourceMessageId: "message-1",
+      agentId: "agent-1", outcome: "will_respond", reasonCode: "direct_mention",
+      reasonText: "direct mandatory address", routeAttempt: 2,
+      decidedAt: "2026-08-17T00:00:01.000Z",
+    })).toBe(true);
+    expect(isRouteJudgment({
+      id: "route-judgment-1", routeJobId: "route-1", sourceMessageId: "message-1",
+      agentId: "agent-1", outcome: "will_respond", reasonCode: "direct_mention",
+      reasonText: "", routeAttempt: 0, decidedAt: "2026-08-17T00:00:01.000Z",
+    })).toBe(false);
+    const routerInput = {
+      purpose: "route_decision",
+      roomId: "room-1",
+      sourceMessageId: "message-1",
+      message: { authorId: "human-1", authorKind: "human", summary: "review migration" },
+      roomPhase: "discussion",
+      agents: [{
+        agentId: "agent-1", participation: "active", role: "agent",
+        capabilities: ["review.read"], calibrationScore: 0, hasBall: false,
+      }],
+      topic: {
+        topicKey: "topic-v1:abc", embeddingModelVersion: "dao-topic-embedding-v1",
+        windowSize: 8, cosineThreshold: 0.82,
+      },
+      limits: { timeoutMs: 1_000, maxCandidates: 1, maxOutputBytes: 65_536 },
+    } as const;
+    expect(isRouterProviderInput(routerInput)).toBe(true);
+    expect(isRouterProviderInput({ ...routerInput, visibleConversation: [] })).toBe(false);
+    expect(isRouterProviderInput({
+      ...routerInput,
+      limits: { ...routerInput.limits, timeoutMs: 1_001 },
+    })).toBe(false);
+  });
+
+  it("keeps weighted route calibration feedback closed and distinct from emoji", () => {
+    expect(isCalibrationSignal({
+      id: "calibration-useful", sourceMessageId: "message-agent", actorId: "human-1",
+      agentId: "agent-1", feedback: "useful", createdAt: "2026-08-17T00:00:00.000Z",
+    })).toBe(true);
+    expect(isCalibrationSignal({
+      id: "calibration-invalid", sourceMessageId: "message-agent", actorId: "human-1",
+      agentId: "agent-1", emoji: "👍", feedback: "useful",
+      createdAt: "2026-08-17T00:00:00.000Z",
     })).toBe(false);
   });
 });

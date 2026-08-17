@@ -9,6 +9,7 @@ import type {
   HumanReadReceipt,
   HumanInvitationRequest,
   OpenItem,
+  RouteJudgment,
   SocialReaction,
 } from "@native-im/core";
 import * as importedApp from "./app.js";
@@ -16,6 +17,7 @@ import * as importedApp from "./app.js";
 interface RestoredPrimitivePreviewRecords {
   readonly humanReads: readonly HumanReadReceipt[];
   readonly agentJudgements: readonly AgentJudgement[];
+  readonly routeJudgments: readonly RouteJudgment[];
   readonly openItems: readonly OpenItem[];
   readonly agentExecutions: readonly AgentExecution[];
   readonly socialReactions: readonly SocialReaction[];
@@ -145,7 +147,7 @@ describe("side-effect confirmation renderer", () => {
 describe("verified collaboration primitive renderer", () => {
   it("rejects malformed or unrelated restored records before mutating the DOM", () => {
     const empty = (): RestoredPrimitivePreviewRecords => ({
-      humanReads: [], agentJudgements: [], openItems: [], agentExecutions: [],
+      humanReads: [], agentJudgements: [], routeJudgments: [], openItems: [], agentExecutions: [],
       socialReactions: [], calibrations: [],
     });
     const read: HumanReadReceipt = {
@@ -203,6 +205,17 @@ describe("verified collaboration primitive renderer", () => {
         reason: "恢复后仍会回应",
         decidedAt: "2026-08-12T13:00:01.000Z",
       }],
+      routeJudgments: [{
+        id: "route-judgment-restored",
+        routeJobId: "route-job-restored",
+        sourceMessageId: "preview-human-mention",
+        agentId: "agent-data",
+        outcome: "suppressed",
+        reasonCode: "cooldown",
+        reasonText: "同话题冷却期尚未结束",
+        routeAttempt: 2,
+        decidedAt: "2026-08-12T13:00:01.500Z",
+      }],
       openItems: [{
         id: "open-restored",
         roomId: "preview-room",
@@ -252,6 +265,7 @@ describe("verified collaboration primitive renderer", () => {
 
     const humanRead = root.querySelector(".human-read-receipt");
     const agentJudgement = root.querySelector(".agent-judgement");
+    const routeJudgment = root.querySelector(".route-judgment");
     const openItem = root.querySelector(".open-item");
     const agentExecution = root.querySelector(".agent-invocation");
     const social = root.querySelector(".reaction--social");
@@ -261,6 +275,11 @@ describe("verified collaboration primitive renderer", () => {
     expect(humanRead?.textContent).toContain("已读");
     expect(agentJudgement?.textContent).toContain("恢复后仍会回应");
     expect(agentJudgement?.textContent).toContain("已判定");
+    expect(routeJudgment?.textContent).toContain("被抑制");
+    expect(routeJudgment?.textContent).toContain("同话题冷却期尚未结束");
+    expect(routeJudgment?.getAttribute("data-route-outcome")).toBe("suppressed");
+    expect(routeJudgment?.getAttribute("data-route-attempt")).toBe("2");
+    expect(routeJudgment?.classList.contains("typing")).toBe(false);
     expect(openItem?.textContent).toContain("恢复后的待答问题");
     expect(openItem?.textContent).toContain("待答项");
     expect(agentExecution?.textContent).toContain("恢复 Agent 正在调用");

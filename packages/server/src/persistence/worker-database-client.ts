@@ -45,6 +45,7 @@ import type {
   SnapshotRevalidationRequest,
 } from "./contracts.js";
 import type { RuntimeAuthorityOperation } from "../agent-runtime/runtime-authority-protocol.js";
+import type { RouteAuthorityOperation } from "../route-runtime/route-authority-protocol.js";
 import {
   ROOM_SYNC_DEFAULT_LIMIT,
   toAgentWorkerCommandContext,
@@ -55,7 +56,7 @@ export interface CreateWorkerDatabaseClientOptions {
 }
 
 export interface AuthoritySchemaInspection {
-  readonly version: 6;
+  readonly version: 7;
 }
 
 export interface WorkerDatabaseClient {
@@ -160,6 +161,7 @@ export interface WorkerDatabaseClient {
     reason: OutboxDeliveryFailureReason,
   ): Promise<void>;
   executeRuntime(operation: RuntimeAuthorityOperation): Promise<unknown>;
+  executeRoute(operation: RouteAuthorityOperation): Promise<unknown>;
   close(): Promise<void>;
 }
 
@@ -226,6 +228,7 @@ function authorityWorkerClientErrorStatus(
     case "message_not_found":
     case "open_item_not_found":
     case "execution_not_found":
+    case "route_job_not_found":
     case "room_member_not_found":
     case "room_not_found":
     case "snapshot_not_found":
@@ -234,6 +237,7 @@ function authorityWorkerClientErrorStatus(
     case "authority_already_initialized":
     case "authority_coordinator_exists":
     case "execution_conflict":
+    case "route_conflict":
     case "execution_not_running":
     case "idempotency_conflict":
     case "invitation_consumed":
@@ -965,6 +969,19 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
     });
   }
 
+  executeRoute(operation: RouteAuthorityOperation): Promise<unknown> {
+    if (this.#terminalError !== undefined) return this.#rejectTerminal();
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) return Promise.reject(unavailable);
+    return this.#send({ type: "authority.route", operation }).then((response) => {
+      if (response.type !== "authority.route-result") {
+        this.#failProtocol("Authority worker returned the wrong route response");
+        throw this.#terminalError;
+      }
+      return response.result;
+    });
+  }
+
   readHistory(
     context: AuthenticatedSessionContext,
     roomId: string,
@@ -1407,6 +1424,8 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
         responseType === "authority.command-acknowledged") ||
       (requestType === "authority.runtime" &&
         responseType === "authority.runtime-result") ||
+      (requestType === "authority.route" &&
+        responseType === "authority.route-result") ||
       (requestType === "authority.read-history" &&
         responseType === "authority.history") ||
       (requestType === "authority.read-actor" && responseType === "authority.actor") ||

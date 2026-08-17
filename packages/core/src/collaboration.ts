@@ -144,8 +144,109 @@ export interface RouterProviderInput {
   readonly purpose: "route_decision";
   readonly roomId: string;
   readonly sourceMessageId: string;
-  readonly messageSummary: string;
-  readonly candidateAgentIds: readonly string[];
+  readonly message: {
+    readonly authorId: string;
+    readonly authorKind: "human" | "agent";
+    readonly summary: string;
+  };
+  readonly roomPhase: RouteRoomPhase;
+  readonly agents: readonly {
+    readonly agentId: string;
+    readonly participation: "active" | "on-mention" | "silent";
+    readonly role: string;
+    readonly capabilities: readonly string[];
+    readonly calibrationScore: number;
+    readonly hasBall: boolean;
+  }[];
+  readonly topic: {
+    readonly topicKey: string;
+    readonly embeddingModelVersion: "dao-topic-embedding-v1";
+    readonly windowSize: 8;
+    readonly cosineThreshold: 0.82;
+  };
+  readonly limits: {
+    readonly timeoutMs: 1_000;
+    readonly maxCandidates: number;
+    readonly maxOutputBytes: number;
+  };
+}
+
+export type RouteRoomPhase = "discussion" | "execution";
+export type RouteJobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+export type RouteTriggerCategory = "domain" | "risk" | "structured_mention" | "ball";
+export type RouteReasonCode =
+  | "direct_mention"
+  | "structured_help"
+  | "domain_match"
+  | "risk_detected"
+  | "ball_due"
+  | "participation_silent"
+  | "participation_on_mention"
+  | "cooldown"
+  | "agent_round_limit"
+  | "human_burst_soft_suppression"
+  | "execution_phase"
+  | "calibration_suppressed"
+  | "provider_omitted"
+  | "provider_failed"
+  | "permission_denied"
+  | "not_selected";
+
+export interface RouteJob {
+  readonly id: string;
+  readonly roomId: string;
+  readonly sourceMessageId: string;
+  readonly status: RouteJobStatus;
+  readonly currentAttempt: 1 | 2 | 3;
+  readonly topicKey: string;
+  readonly embeddingModelVersion: "dao-topic-embedding-v1";
+  readonly windowSize: 8;
+  readonly cosineThreshold: 0.82;
+  readonly roomPhase: RouteRoomPhase;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly completedAt?: string;
+  readonly terminalErrorCode?: string;
+  readonly nextRetryAt?: string;
+}
+
+export interface RouterCandidate {
+  readonly agentId: string;
+  readonly trigger: RouteTriggerCategory;
+  readonly order: number;
+  readonly reasonCode: "domain_match" | "risk_detected" | "structured_help" | "ball_due";
+  readonly reasonText: string;
+}
+
+export interface RouterPlan {
+  readonly candidates: readonly RouterCandidate[];
+}
+
+export interface RouteJudgment {
+  readonly id: string;
+  readonly routeJobId: string;
+  readonly sourceMessageId: string;
+  readonly agentId: string;
+  readonly outcome: AgentJudgementOutcome;
+  readonly reasonCode: RouteReasonCode;
+  readonly reasonText: string;
+  readonly routeAttempt: 1 | 2 | 3;
+  readonly decidedAt: string;
+}
+
+export interface RouteInvocationIntent extends AgentInvocationIntent {
+  readonly reasonCode: "direct_mention" | "structured_help" | "domain_match" | "risk_detected" | "ball_due";
+  readonly reasonText: string;
+  readonly priority: 1 | 2 | 3;
+}
+
+export interface BallSummary {
+  readonly agentId: string;
+  readonly sourceKind: "open-item" | "light-task" | "blueprint-task";
+  readonly sourceId: string;
+  readonly reason: string;
+  readonly since: string;
+  readonly deadline: string;
 }
 
 export type ProviderEvent =
@@ -164,14 +265,18 @@ export interface SocialReaction {
   readonly createdAt: string;
 }
 
-export interface CalibrationSignal {
+interface CalibrationSignalBase {
   readonly id: string;
   readonly sourceMessageId: string;
   readonly actorId: string;
   readonly agentId: string;
-  readonly emoji: "👍" | "👎";
   readonly createdAt: string;
 }
+
+export type CalibrationSignal = CalibrationSignalBase & (
+  | { readonly emoji: "👍" | "👎" }
+  | { readonly feedback: "useful" | "not_needed" }
+);
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -206,6 +311,114 @@ export function isAgentJudgement(value: unknown): value is AgentJudgement {
     isNonEmptyString(value.agentId) &&
     (value.outcome === "will_respond" || value.outcome === "no_response_needed" || value.outcome === "suppressed") &&
     isNonEmptyString(value.reason) &&
+    isNonEmptyString(value.decidedAt);
+}
+
+const routeReasonCodes = new Set<RouteReasonCode>([
+  "direct_mention", "structured_help", "domain_match", "risk_detected", "ball_due",
+  "participation_silent", "participation_on_mention", "cooldown", "agent_round_limit",
+  "human_burst_soft_suppression", "execution_phase", "calibration_suppressed",
+  "provider_omitted", "provider_failed", "permission_denied", "not_selected",
+]);
+
+export function isRouteJob(value: unknown): value is RouteJob {
+  if (!isRecord(value) || !hasExactKeys(value, [
+    "id", "roomId", "sourceMessageId", "status", "currentAttempt", "topicKey",
+    "embeddingModelVersion", "windowSize", "cosineThreshold", "roomPhase",
+    "createdAt", "updatedAt",
+  ], ["completedAt", "terminalErrorCode", "nextRetryAt"])) return false;
+  const terminal = value.status === "completed" || value.status === "failed" || value.status === "cancelled";
+  return isNonEmptyString(value.id) && isNonEmptyString(value.roomId) &&
+    isNonEmptyString(value.sourceMessageId) &&
+    (value.status === "queued" || value.status === "running" || terminal) &&
+    (value.currentAttempt === 1 || value.currentAttempt === 2 || value.currentAttempt === 3) &&
+    isNonEmptyString(value.topicKey) && value.embeddingModelVersion === "dao-topic-embedding-v1" &&
+    value.windowSize === 8 && value.cosineThreshold === 0.82 &&
+    (value.roomPhase === "discussion" || value.roomPhase === "execution") &&
+    isNonEmptyString(value.createdAt) && isNonEmptyString(value.updatedAt) &&
+    (!Object.hasOwn(value, "completedAt") || isNonEmptyString(value.completedAt)) &&
+    (!Object.hasOwn(value, "terminalErrorCode") || isNonEmptyString(value.terminalErrorCode)) &&
+    (!Object.hasOwn(value, "nextRetryAt") || isNonEmptyString(value.nextRetryAt)) &&
+    (!terminal || isNonEmptyString(value.completedAt));
+}
+
+function isRouterCandidate(value: unknown): value is RouterCandidate {
+  return isRecord(value) && hasExactKeys(value, [
+    "agentId", "trigger", "order", "reasonCode", "reasonText",
+  ]) && isNonEmptyString(value.agentId) &&
+    (value.trigger === "domain" || value.trigger === "risk" ||
+     value.trigger === "structured_mention" || value.trigger === "ball") &&
+    typeof value.order === "number" && Number.isSafeInteger(value.order) && value.order >= 1 &&
+    (value.reasonCode === "domain_match" || value.reasonCode === "risk_detected" ||
+     value.reasonCode === "structured_help" || value.reasonCode === "ball_due") &&
+    isNonEmptyString(value.reasonText);
+}
+
+export function isRouterPlan(value: unknown): value is RouterPlan {
+  if (!isRecord(value) || !hasExactKeys(value, ["candidates"]) || !Array.isArray(value.candidates) ||
+      !value.candidates.every(isRouterCandidate)) return false;
+  const ids = new Set<string>();
+  const orders = new Set<number>();
+  for (const candidate of value.candidates) {
+    if (ids.has(candidate.agentId) || orders.has(candidate.order)) return false;
+    ids.add(candidate.agentId);
+    orders.add(candidate.order);
+  }
+  return value.candidates.every((candidate, index) => candidate.order === index + 1);
+}
+
+export function isRouterProviderInput(value: unknown): value is RouterProviderInput {
+  if (!isRecord(value) || !hasExactKeys(value, [
+    "purpose", "roomId", "sourceMessageId", "message", "roomPhase",
+    "agents", "topic", "limits",
+  ]) || value.purpose !== "route_decision" || !isNonEmptyString(value.roomId) ||
+      !isNonEmptyString(value.sourceMessageId) ||
+      (value.roomPhase !== "discussion" && value.roomPhase !== "execution") ||
+      !isRecord(value.message) || !hasExactKeys(value.message, ["authorId", "authorKind", "summary"]) ||
+      !isNonEmptyString(value.message.authorId) ||
+      (value.message.authorKind !== "human" && value.message.authorKind !== "agent") ||
+      !isNonEmptyString(value.message.summary) ||
+      !Array.isArray(value.agents) || value.agents.length > 256 ||
+      !isRecord(value.topic) || !hasExactKeys(value.topic, [
+        "topicKey", "embeddingModelVersion", "windowSize", "cosineThreshold",
+      ]) || !isNonEmptyString(value.topic.topicKey) ||
+      value.topic.embeddingModelVersion !== "dao-topic-embedding-v1" ||
+      value.topic.windowSize !== 8 || value.topic.cosineThreshold !== 0.82 ||
+      !isRecord(value.limits) || !hasExactKeys(value.limits, [
+        "timeoutMs", "maxCandidates", "maxOutputBytes",
+      ]) || value.limits.timeoutMs !== 1_000 ||
+      typeof value.limits.maxCandidates !== "number" ||
+      !Number.isSafeInteger(value.limits.maxCandidates) || value.limits.maxCandidates < 0 ||
+      value.limits.maxCandidates > 256 || value.limits.maxOutputBytes !== 64 * 1_024) {
+    return false;
+  }
+  const agentIds = new Set<string>();
+  for (const agent of value.agents) {
+    if (!isRecord(agent) || !hasExactKeys(agent, [
+      "agentId", "participation", "role", "capabilities", "calibrationScore", "hasBall",
+    ]) || !isNonEmptyString(agent.agentId) || agentIds.has(agent.agentId) ||
+        (agent.participation !== "active" && agent.participation !== "on-mention" && agent.participation !== "silent") ||
+        !isNonEmptyString(agent.role) || !Array.isArray(agent.capabilities) ||
+        !agent.capabilities.every(isNonEmptyString) ||
+        new Set(agent.capabilities).size !== agent.capabilities.length ||
+        typeof agent.calibrationScore !== "number" || !Number.isSafeInteger(agent.calibrationScore) ||
+        agent.calibrationScore < -4 || agent.calibrationScore > 4 || typeof agent.hasBall !== "boolean") {
+      return false;
+    }
+    agentIds.add(agent.agentId);
+  }
+  return value.limits.maxCandidates === value.agents.length;
+}
+
+export function isRouteJudgment(value: unknown): value is RouteJudgment {
+  return isRecord(value) && hasExactKeys(value, [
+    "id", "routeJobId", "sourceMessageId", "agentId", "outcome", "reasonCode",
+    "reasonText", "routeAttempt", "decidedAt",
+  ]) && isNonEmptyString(value.id) && isNonEmptyString(value.routeJobId) &&
+    isNonEmptyString(value.sourceMessageId) && isNonEmptyString(value.agentId) &&
+    (value.outcome === "will_respond" || value.outcome === "no_response_needed" || value.outcome === "suppressed") &&
+    routeReasonCodes.has(value.reasonCode as RouteReasonCode) && isNonEmptyString(value.reasonText) &&
+    (value.routeAttempt === 1 || value.routeAttempt === 2 || value.routeAttempt === 3) &&
     isNonEmptyString(value.decidedAt);
 }
 
@@ -299,12 +512,15 @@ export function isSocialReaction(value: unknown): value is SocialReaction {
 }
 
 export function isCalibrationSignal(value: unknown): value is CalibrationSignal {
-  return isRecord(value) &&
-    hasExactKeys(value, ["id", "sourceMessageId", "actorId", "agentId", "emoji", "createdAt"]) &&
+  if (!isRecord(value)) return false;
+  const emoji = hasExactKeys(value, ["id", "sourceMessageId", "actorId", "agentId", "emoji", "createdAt"]) &&
+    (value.emoji === "👍" || value.emoji === "👎");
+  const feedback = hasExactKeys(value, ["id", "sourceMessageId", "actorId", "agentId", "feedback", "createdAt"]) &&
+    (value.feedback === "useful" || value.feedback === "not_needed");
+  return (emoji || feedback) &&
     isNonEmptyString(value.id) &&
     isNonEmptyString(value.sourceMessageId) &&
     isNonEmptyString(value.actorId) &&
     isNonEmptyString(value.agentId) &&
-    (value.emoji === "👍" || value.emoji === "👎") &&
     isNonEmptyString(value.createdAt);
 }

@@ -26,6 +26,16 @@ export type RuntimeAuthorityOperation =
       readonly modelId: string;
       readonly now: number;
     }
+  | {
+      readonly type: "runtime.invoke-routed";
+      readonly routeJobId: string;
+      readonly intent: AgentInvocationIntent;
+      readonly executionId: string;
+      readonly intentId: string;
+      readonly providerId: string;
+      readonly modelId: string;
+      readonly now: number;
+    }
   | { readonly type: "runtime.claim"; readonly executionId: string; readonly attemptSeq: number; readonly now: number }
   | {
       readonly type: "runtime.complete";
@@ -242,6 +252,11 @@ export function isRuntimeAuthorityOperation(value: unknown): value is RuntimeAut
     return exact(value, ["type", "context", "intent", "executionId", "intentId", "providerId", "modelId", "now"]) &&
       (humanContext(value.context) || agentContext(value.context)) && invocationIntent(value.intent) &&
       text(value.executionId) && text(value.intentId) && text(value.providerId) && text(value.modelId) && count(value.now);
+  }
+  if (value.type === "runtime.invoke-routed") {
+    return exact(value, ["type", "routeJobId", "intent", "executionId", "intentId", "providerId", "modelId", "now"]) &&
+      text(value.routeJobId) && invocationIntent(value.intent) && text(value.executionId) &&
+      text(value.intentId) && text(value.providerId) && text(value.modelId) && count(value.now);
   }
   if (value.type === "runtime.claim") {
     return exact(value, ["type", "executionId", "attemptSeq", "now"]) && text(value.executionId) && count(value.attemptSeq, 1) && count(value.now);

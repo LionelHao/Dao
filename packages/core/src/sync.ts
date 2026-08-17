@@ -13,11 +13,15 @@ import {
   isCalibrationSignal,
   isHumanReadReceipt,
   isOpenItem,
+  isRouteJob,
+  isRouteJudgment,
   type AgentExecution,
   type AgentJudgement,
   type CalibrationSignal,
   type HumanReadReceipt,
   type OpenItem,
+  type RouteJob,
+  type RouteJudgment,
 } from "./collaboration.js";
 
 export interface RoomSummary {
@@ -48,6 +52,8 @@ export type RoomRepairRecord =
   | { readonly kind: "agent-judgement"; readonly value: AgentJudgement }
   | { readonly kind: "open-item"; readonly value: OpenItem }
   | { readonly kind: "agent-execution"; readonly value: AgentExecution }
+  | { readonly kind: "route-job"; readonly value: RouteJob }
+  | { readonly kind: "route-judgment"; readonly value: RouteJudgment }
   | { readonly kind: "calibration"; readonly value: CalibrationSignal }
   | { readonly kind: "legacy-unknown-calibration";
       readonly value: LegacyUnknownCalibrationSignal };
@@ -151,6 +157,16 @@ export type PersistedRoomEvent =
   | RoomEvent<"room.agent_judgment.recorded", AgentJudgement>
   | RoomEvent<"room.open_item.changed", OpenItem>
   | RoomEvent<"room.agent_execution.changed", AgentExecution>
+  | RoomEvent<"room.route_judgment.recorded", RouteJudgment>
+  | RoomEvent<
+      | "route.queued"
+      | "route.started"
+      | "route.retry-scheduled"
+      | "route.completed"
+      | "route.failed"
+      | "route.recovered",
+      RouteJob
+    >
   | RoomEvent<
       | "agent.execution.queued"
       | "agent.execution.started"
@@ -302,6 +318,8 @@ function isRepairRecord(value: unknown): value is RoomRepairRecord {
   if (value.kind === "agent-judgement") return isAgentJudgement(value.value);
   if (value.kind === "open-item") return isOpenItem(value.value);
   if (value.kind === "agent-execution") return isAgentExecution(value.value);
+  if (value.kind === "route-job") return isRouteJob(value.value);
+  if (value.kind === "route-judgment") return isRouteJudgment(value.value);
   if (value.kind === "calibration") return isCalibrationSignal(value.value);
   if (value.kind === "legacy-unknown-calibration") {
     const legacy = value.value;
@@ -360,6 +378,14 @@ function isPersistedRoomEventValue(value: unknown): value is PersistedRoomEvent 
   }
   if (value.type === "room.agent_execution.changed") {
     return isAgentExecution(payload) && payload.roomId === value.roomId && payload.agentId === value.actorId;
+  }
+  if (value.type === "room.route_judgment.recorded") {
+    return isRouteJudgment(payload) && payload.agentId === value.actorId;
+  }
+  if (value.type === "route.queued" || value.type === "route.started" ||
+      value.type === "route.retry-scheduled" || value.type === "route.completed" ||
+      value.type === "route.failed" || value.type === "route.recovered") {
+    return isRouteJob(payload) && payload.roomId === value.roomId;
   }
   if (
     value.type === "agent.execution.queued" || value.type === "agent.execution.started" ||

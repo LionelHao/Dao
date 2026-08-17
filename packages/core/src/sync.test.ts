@@ -241,6 +241,54 @@ describe("pure synchronization contracts", () => {
     })).toBe(false);
   });
 
+  it("repairs and streams only closed route jobs and per-agent judgments", () => {
+    const job = {
+      id: "route-job-1", roomId: "room-1", sourceMessageId: "message-1",
+      status: "completed", currentAttempt: 2, topicKey: "topic-1",
+      embeddingModelVersion: "dao-topic-embedding-v1", windowSize: 8,
+      cosineThreshold: 0.82, roomPhase: "discussion",
+      createdAt: "2026-08-17T00:00:00.000Z", updatedAt: "2026-08-17T00:00:02.000Z",
+      completedAt: "2026-08-17T00:00:02.000Z",
+    };
+    const judgment = {
+      id: "route-judgment-1", routeJobId: job.id, sourceMessageId: "message-1",
+      agentId: "agent-1", outcome: "suppressed", reasonCode: "cooldown",
+      reasonText: "same topic is cooling down", routeAttempt: 2,
+      decidedAt: "2026-08-17T00:00:02.000Z",
+    };
+    const repairPage = {
+      type: "room.repair.page", requestId: "request-1", snapshotId: "snapshot-1",
+      roomId: "room-1", page: 0,
+      records: [
+        { kind: "route-job", value: job },
+        { kind: "route-judgment", value: judgment },
+      ],
+      watermark: 2, snapshotChecksum: "sha256:route", hasMore: false,
+      mode: "streaming", idleExpiresAt: "2026-08-17T00:00:30.000Z",
+    };
+    expect(isRoomRepairPage(repairPage)).toBe(true);
+    expect(isRoomRepairPage({
+      ...repairPage,
+      records: [{ kind: "route-judgment", value: { ...judgment, outcome: "unknown" } }],
+    })).toBe(false);
+
+    const event = {
+      eventId: "route-event-1", streamKind: "room", streamId: "room-1", streamSeq: 1,
+      roomId: "room-1", actorId: "human-1", occurredAt: "2026-08-17T00:00:02.000Z",
+      type: "route.completed", payload: job,
+    };
+    const result = {
+      type: "room.sync.result", requestId: "request-2", mode: "delta", events: [event],
+      nextCursor: { version: 1, roomId: "room-1", afterSeq: 1 },
+      watermark: 1, hasMore: false,
+    };
+    expect(isRoomSyncResult(result)).toBe(true);
+    expect(isRoomSyncResult({
+      ...result,
+      events: [{ ...event, payload: { ...job, providerBody: "must-not-cross-sync" } }],
+    })).toBe(false);
+  });
+
   it("does not interchange room and catalog snapshot versions", () => {
     expect(isSnapshotVersion({ kind: "room", roomId: "room-1", watermark: 4 })).toBe(true);
     expect(isSnapshotVersion({ kind: "catalog", catalogRevision: 3 })).toBe(true);

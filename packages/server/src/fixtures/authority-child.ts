@@ -330,6 +330,12 @@ function seedMixedRoomRecords(databasePath: string, roomId: string): Record<stri
       ).get(roomId) as { readonly count: number };
       return row.count;
     };
+    const routeJudgmentCount = database.prepare(
+      `SELECT COUNT(*) AS count
+       FROM route_job_agents AS candidate
+       INNER JOIN route_jobs AS job ON job.id = candidate.route_job_id
+       WHERE job.room_id = ?`,
+    ).get(roomId) as { readonly count: number };
     const mixedCounts = {
       room: 1,
       membership: count("room_memberships"),
@@ -339,6 +345,11 @@ function seedMixedRoomRecords(databasePath: string, roomId: string): Record<stri
       "open-item": count("open_items"),
       "agent-execution": count("agent_executions"),
       calibration: count("calibration_signals"),
+      "route-job": count("route_jobs"),
+      // A restarted production runtime closes one judgment for every snapshotted
+      // candidate. Count that stable post-recovery set so the stress assertion
+      // remains deterministic while the child finishes pending route work.
+      "route-judgment": routeJudgmentCount.count,
     };
     const distinctMembershipActors = database.prepare(
       "SELECT COUNT(DISTINCT actor_id) AS count FROM room_memberships WHERE room_id = ?",
