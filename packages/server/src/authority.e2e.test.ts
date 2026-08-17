@@ -1056,6 +1056,7 @@ describe("authoritative server real-process harness", () => {
       client = await JsonWebSocketClient.connect(seeded.url);
       await client.login("seed-readback-login");
       const seededRoomId = await discoverRoom(client);
+      await waitForRouteJudgmentCount(directory, seededRoomId, 2);
       const seededSnapshot = await repairRecords(client, seededRoomId);
       client.close();
       await stopChild(first);
