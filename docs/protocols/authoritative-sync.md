@@ -12,6 +12,8 @@
 
 成功帧同样以 closed `type` 区分：`auth.authenticated`、`auth.revoked`、`message.accepted`、`message.created`、`room.event`、`identity.room-access.changed`、`auth.session-revoked`、`room.history`、`room.subscribed`、`workspace.bootstrap.page`、`room.sync.result`、`room.repair.page`、`snapshot.completed`、`room.subscribed.v2`、`room.subscribe.v2.retry`、`open-item.ack`、`light-task.ack`。请求/响应帧回显当前 `requestId`；异步 `room.event` 使用持久 `eventId` 与 `streamSeq`。
 
+T-0019 另增加 closed `ball.query { requestId, roomId }` 与 `ball.query.result { requestId, roomId, balls, needsAction, reminders }`。请求不接受 `actorId`、跨 room scope 或任意筛选条件；服务端从已认证 session 得到 principal，并在 AuthorityWorker 查询时复核当前 room membership。
+
 错误统一为：
 
 ```ts
@@ -74,6 +76,12 @@ OutboxDispatcher 在提交后读取 pending delivery，按当前权限授权、�
 Authority schema 和可丢弃的 snapshot-cache schema 分别版本化。fresh、上一版到当前版、未知目标版本、注入中途失败都必须测试；失败时 schema version 与原数据保持不变。升级要补齐 actor/membership revision，以及 room/identity stream 的 `head_seq` / `retained_from_seq`，保证旧历史可 repair、新事件序号连续。
 
 schema v9 新增 closed `light_tasks` 权威事实。human 只有发送 `light-task.create` 显式确认后才创建任务；普通消息（包括“我来做”）不会推导任务。`light-task.transition` 只允许 todo→claimed→delivered→verified，`light-task.criterion.set` 只允许持久化验收者在 delivered 阶段更新稳定 criterion 的 `met`。每次成功写入都和 `room.light_task.changed`、room outbox、idempotency acknowledgement 同属一个 AuthorityWorker transaction；repair record 使用 `kind: "light-task"`，不会携带 deps、maturity、milestone 或 Blueprint task ID。
+
+schema v10 只追加 `ball_boundary_claims`。BallInCourt 本身不是第二份可写事实：它由当前 OpenItem、LightTask 与有界只读 Blueprint adapter 投影。OpenItem awaiting/transferred 的 current owner、LightTask claimed 的 claimant、delivered 的已持久 verifierActorId，以及 Blueprint 权威单一 assignee/blocked mention 才能成为 holder；todo/verified、消息文本、角色名或多人集合不能推导 holder。相同 source 只保留最新权威状态。
+
+逾期扫描在同一个 AuthorityWorker transaction 内用 room/source/holder/since/deadline/boundary kind 唯一 claim 边界。human claim 只返回 room-scoped `NeedsActionProjection`/`ReminderCandidate`，不写 agent event；agent claim 持久化 `room.ball.overdue` event/outbox 和 closed `BallSummary`。route authority 只可消费仍与当前 source 状态匹配的 agent claim，并原子写入 `route_consumed_at`，所以同一边界最多让一个后续 RouteJob 得到 `hasBall=true`；该结构信号绕过 soft suppression，但不伪造 human 消息。成员移除后新查询、事件投递与 route consumption 都拒绝，原 OpenItem/LightTask 历史事实不删除。
+
+默认时钟边界为：OpenItem/LightTask 使用 server-private 配置，Blueprint claimed/awaiting 为七天，明确单一 blocked mention 立即到期。阈值前不 claim；边界时刻首次 claim；SQLite 重启、snapshot cache 删除与重复扫描都不再产生同一事件。生产 Blueprint adapter 当前为空的只读端口，实际 GBP 读取/写入仍属于 M5；v10 不建设跨 room inbox 或通知送达通道。
 
 Legacy import 在正式激活新 authority 前解析并验证 closed 数据，使用 migration/事务写入临时目标；损坏输入、重复启动、启用前终止都不得留下半激活 authority。证据见 [`schema.test.ts`](../../packages/server/src/persistence/schema.test.ts) 和 [`legacy-importer.test.ts`](../../packages/server/src/persistence/legacy-importer.test.ts)。Snapshot cache 可随时删除重建，不能反向覆盖 authority。
 

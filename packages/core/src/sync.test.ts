@@ -176,6 +176,33 @@ describe("pure synchronization contracts", () => {
     })).toBe(false);
   });
 
+  it("accepts only agent-bound authoritative ball overdue events", () => {
+    const ball = {
+      holderId: "agent-1", roomId: "room-1", sourceKind: "open-item",
+      sourceId: "item-1", reason: "open item awaits current owner",
+      since: "2026-08-17T00:00:00.000Z", deadline: "2026-08-17T00:01:00.000Z",
+    } as const;
+    const event = {
+      eventId: "event-ball", streamKind: "room", streamId: "room-1", streamSeq: 1,
+      roomId: "room-1", actorId: "agent-1", occurredAt: "2026-08-17T00:01:00.000Z",
+      type: "room.ball.overdue",
+      payload: {
+        id: "trigger-1", roomId: "room-1", agentId: "agent-1", ball,
+        triggeredAt: "2026-08-17T00:01:00.000Z",
+      },
+    } as const;
+    const result = {
+      type: "room.sync.result", requestId: "request-ball", mode: "delta", events: [event],
+      nextCursor: { version: 1, roomId: "room-1", afterSeq: 1 },
+      watermark: 1, hasMore: false,
+    } as const;
+    expect(isRoomSyncResult(result)).toBe(true);
+    expect(isRoomSyncResult({ ...result, events: [{ ...event, actorId: "agent-2" }] })).toBe(false);
+    expect(isRoomSyncResult({
+      ...result, events: [{ ...event, payload: { ...event.payload, messageText: "我来" } }],
+    })).toBe(false);
+  });
+
   it("rejects impossible delta envelopes", () => {
     const event = (streamSeq: number, roomId = "room-1") => ({
       eventId: `event-${streamSeq}`,

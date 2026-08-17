@@ -95,6 +95,72 @@ export type LightTaskProjection = Pick<
   | "criteria"
 >;
 
+export type BallSourceKind =
+  | "open-item"
+  | "light-task"
+  | "blueprint-task"
+  | "blueprint-awaiting"
+  | "blueprint-blocked-mention";
+
+export interface BallInCourt {
+  readonly holderId: string;
+  readonly roomId: string;
+  readonly sourceKind: BallSourceKind;
+  readonly sourceId: string;
+  readonly reason: string;
+  readonly since: string;
+  readonly deadline: string;
+}
+
+export type BlueprintBallFact =
+  | {
+      readonly sourceKind: "blueprint-task" | "blueprint-awaiting";
+      readonly sourceId: string;
+      readonly roomId: string;
+      readonly assigneeId: string;
+      readonly reason: string;
+      readonly since: string;
+    }
+  | {
+      readonly sourceKind: "blueprint-blocked-mention";
+      readonly sourceId: string;
+      readonly roomId: string;
+      readonly mentionedActorId: string;
+      readonly reason: string;
+      readonly since: string;
+    };
+
+export interface NeedsActionProjection {
+  readonly roomId: string;
+  readonly actorId: string;
+  readonly ball: BallInCourt;
+  readonly overdue: boolean;
+}
+
+export interface ReminderCandidate {
+  readonly roomId: string;
+  readonly recipientId: string;
+  readonly sourceKind: BallSourceKind;
+  readonly sourceId: string;
+  readonly dueAt: string;
+}
+
+export interface BallOverdueTrigger {
+  readonly id: string;
+  readonly roomId: string;
+  readonly agentId: string;
+  readonly ball: BallInCourt;
+  readonly triggeredAt: string;
+}
+
+export interface BallProjectionInput {
+  readonly openItems: readonly OpenItem[];
+  readonly lightTasks: readonly LightTask[];
+  readonly blueprintFacts: readonly BlueprintBallFact[];
+  readonly openItemDeadlineMs: number;
+  readonly lightTaskDeadlineMs: number;
+}
+
 export type AgentExecutionStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 export type AgentExecutionActionCategory = "model_generation" | "tool_call" | "waiting_upstream";
 export type AgentToolDispatchPhase = "not_started" | "dispatched" | "finished";
@@ -303,7 +369,7 @@ export interface RouteInvocationIntent extends AgentInvocationIntent {
 
 export interface BallSummary {
   readonly agentId: string;
-  readonly sourceKind: "open-item" | "light-task" | "blueprint-task";
+  readonly sourceKind: BallSourceKind;
   readonly sourceId: string;
   readonly reason: string;
   readonly since: string;
@@ -555,6 +621,128 @@ function isLightTaskCriterion(value: unknown): value is LightTaskCriterion {
   return isRecord(value) && hasExactKeys(value, ["id", "text", "met"]) &&
     isNonEmptyString(value.id) && value.id.trim().length > 0 &&
     isNonEmptyString(value.text) && value.text.trim().length > 0 && typeof value.met === "boolean";
+}
+
+const ballSourceKinds = new Set<BallSourceKind>([
+  "open-item", "light-task", "blueprint-task", "blueprint-awaiting",
+  "blueprint-blocked-mention",
+]);
+
+function validTimestamp(value: unknown): value is string {
+  return isNonEmptyString(value) && Number.isFinite(Date.parse(value));
+}
+
+export function isBallInCourt(value: unknown): value is BallInCourt {
+  return isRecord(value) && hasExactKeys(value, [
+    "holderId", "roomId", "sourceKind", "sourceId", "reason", "since", "deadline",
+  ]) && isNonEmptyString(value.holderId) && isNonEmptyString(value.roomId) &&
+    ballSourceKinds.has(value.sourceKind as BallSourceKind) && isNonEmptyString(value.sourceId) &&
+    isNonEmptyString(value.reason) && validTimestamp(value.since) && validTimestamp(value.deadline) &&
+    Date.parse(value.deadline) >= Date.parse(value.since);
+}
+
+export function isNeedsActionProjection(value: unknown): value is NeedsActionProjection {
+  return isRecord(value) && hasExactKeys(value, ["roomId", "actorId", "ball", "overdue"]) &&
+    isNonEmptyString(value.roomId) && isNonEmptyString(value.actorId) &&
+    isBallInCourt(value.ball) && value.ball.roomId === value.roomId &&
+    value.ball.holderId === value.actorId && typeof value.overdue === "boolean";
+}
+
+export function isReminderCandidate(value: unknown): value is ReminderCandidate {
+  return isRecord(value) && hasExactKeys(value, [
+    "roomId", "recipientId", "sourceKind", "sourceId", "dueAt",
+  ]) && isNonEmptyString(value.roomId) && isNonEmptyString(value.recipientId) &&
+    ballSourceKinds.has(value.sourceKind as BallSourceKind) && isNonEmptyString(value.sourceId) &&
+    validTimestamp(value.dueAt);
+}
+
+export function isBallOverdueTrigger(value: unknown): value is BallOverdueTrigger {
+  return isRecord(value) && hasExactKeys(value, [
+    "id", "roomId", "agentId", "ball", "triggeredAt",
+  ]) && isNonEmptyString(value.id) && isNonEmptyString(value.roomId) &&
+    isNonEmptyString(value.agentId) && isBallInCourt(value.ball) &&
+    value.ball.roomId === value.roomId && value.ball.holderId === value.agentId &&
+    validTimestamp(value.triggeredAt) && Date.parse(value.triggeredAt) >= Date.parse(value.ball.deadline);
+}
+
+export function isBlueprintBallFact(value: unknown): value is BlueprintBallFact {
+  if (!isRecord(value) || !isNonEmptyString(value.sourceKind)) return false;
+  if (value.sourceKind === "blueprint-task" || value.sourceKind === "blueprint-awaiting") {
+    return hasExactKeys(value, [
+      "sourceKind", "sourceId", "roomId", "assigneeId", "reason", "since",
+    ]) && isNonEmptyString(value.sourceId) && isNonEmptyString(value.roomId) &&
+      isNonEmptyString(value.assigneeId) && isNonEmptyString(value.reason) && validTimestamp(value.since);
+  }
+  return value.sourceKind === "blueprint-blocked-mention" && hasExactKeys(value, [
+    "sourceKind", "sourceId", "roomId", "mentionedActorId", "reason", "since",
+  ]) && isNonEmptyString(value.sourceId) && isNonEmptyString(value.roomId) &&
+    isNonEmptyString(value.mentionedActorId) && isNonEmptyString(value.reason) && validTimestamp(value.since);
+}
+
+const BLUEPRINT_DEADLINE_MS = 7 * 24 * 60 * 60 * 1_000;
+
+function deadline(since: string, delayMs: number): string {
+  if (!Number.isSafeInteger(delayMs) || delayMs < 0) {
+    throw new TypeError("Ball deadline must be a non-negative safe integer");
+  }
+  return new Date(Date.parse(since) + delayMs).toISOString();
+}
+
+export function projectBallsInCourt(input: BallProjectionInput): readonly BallInCourt[] {
+  const balls = new Map<string, BallInCourt>();
+  const put = (ball: BallInCourt): void => {
+    const key = `${ball.sourceKind}:${ball.sourceId}`;
+    const current = balls.get(key);
+    if (current === undefined || Date.parse(ball.since) > Date.parse(current.since)) balls.set(key, ball);
+  };
+  for (const item of input.openItems) {
+    if ((item.status !== "awaiting" && item.status !== "transferred") || item.currentOwnerId === null) continue;
+    const since = item.status === "transferred"
+      ? item.transferChain.at(-1)?.transferredAt ?? item.createdAt
+      : item.createdAt;
+    put({
+      holderId: item.currentOwnerId, roomId: item.roomId, sourceKind: "open-item", sourceId: item.id,
+      reason: item.status === "transferred"
+        ? "open item transferred to current owner" : "open item awaits current owner",
+      since, deadline: deadline(since, input.openItemDeadlineMs),
+    });
+  }
+  for (const task of input.lightTasks) {
+    if (task.status === "claimed" && task.claimant !== null && task.claimedAt !== undefined) {
+      put({
+        holderId: task.claimant, roomId: task.roomId, sourceKind: "light-task", sourceId: task.id,
+        reason: "claimed light task awaits delivery", since: task.claimedAt,
+        deadline: deadline(task.claimedAt, input.lightTaskDeadlineMs),
+      });
+    } else if (task.status === "delivered" && task.verifierActorId !== null && task.deliveredAt !== undefined) {
+      put({
+        holderId: task.verifierActorId, roomId: task.roomId, sourceKind: "light-task", sourceId: task.id,
+        reason: "delivered light task awaits persisted verifier", since: task.deliveredAt,
+        deadline: deadline(task.deliveredAt, input.lightTaskDeadlineMs),
+      });
+    }
+  }
+  for (const fact of input.blueprintFacts) {
+    const blocked = fact.sourceKind === "blueprint-blocked-mention";
+    put({
+      holderId: blocked ? fact.mentionedActorId : fact.assigneeId,
+      roomId: fact.roomId,
+      sourceKind: fact.sourceKind,
+      sourceId: fact.sourceId,
+      reason: fact.reason,
+      since: fact.since,
+      deadline: deadline(fact.since, blocked ? 0 : BLUEPRINT_DEADLINE_MS),
+    });
+  }
+  const order: Readonly<Record<BallSourceKind, number>> = {
+    "open-item": 0,
+    "light-task": 1,
+    "blueprint-task": 2,
+    "blueprint-awaiting": 3,
+    "blueprint-blocked-mention": 4,
+  };
+  return [...balls.values()].sort((left, right) =>
+    order[left.sourceKind] - order[right.sourceKind] || left.sourceId.localeCompare(right.sourceId));
 }
 
 export function isLightTask(value: unknown): value is LightTask {

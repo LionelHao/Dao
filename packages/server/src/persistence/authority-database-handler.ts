@@ -16,7 +16,17 @@ import type {
   RoomSyncRequest,
   RoomSyncResult,
 } from "@native-im/core";
-import { isLightTask } from "@native-im/core";
+import {
+  isLightTask,
+  isOpenItem,
+  projectBallsInCourt,
+  type BallInCourt,
+  type BallOverdueTrigger,
+  type BallSummary,
+  type BlueprintBallFact,
+  type NeedsActionProjection,
+  type ReminderCandidate,
+} from "@native-im/core";
 import type {
   RuntimeAuthorityOperation,
   RuntimeAuthorityOperationResult,
@@ -26,6 +36,10 @@ import type {
   RouteAuthorityOperationResult,
   RouteProviderFailureCode,
 } from "../route-runtime/route-authority-protocol.js";
+import type {
+  BallAuthorityOperation,
+  BallAuthorityOperationResult,
+} from "../ball-runtime/ball-authority-protocol.js";
 import {
   isManagedRoomShape,
   isRoomAuditRecord,
@@ -96,6 +110,200 @@ export interface DatabaseCommandResult {
 
 function fail(code: AuthorityWorkerErrorCode, message: string): never {
   throw new AuthorityDatabaseError(code, message);
+}
+
+function ballFactsForRoom(
+  database: DatabaseSync,
+  roomId: string,
+  blueprintFacts: readonly BlueprintBallFact[],
+  openItemDeadlineMs: number,
+  lightTaskDeadlineMs: number,
+): readonly BallInCourt[] {
+  if (blueprintFacts.some((fact) => fact.roomId !== roomId)) {
+    return fail("invalid_request", "Blueprint ball facts crossed the requested room");
+  }
+  const openItems = database.prepare(
+    `SELECT id, room_id AS roomId, source_message_id AS sourceMessageId,
+            requester_actor_id AS requesterId, current_owner_actor_id AS currentOwnerId,
+            body AS content, status, created_at AS createdAt, responded_at AS respondedAt,
+            transfer_chain_json AS transferChainJson, origin_kind AS originKind,
+            proposal_kind AS proposalKind, source_execution_id AS sourceExecutionId,
+            proposal_reason AS proposalReason
+     FROM open_items WHERE room_id = ? ORDER BY id`,
+  ).all(roomId).map((row) => {
+    let transferChain: unknown;
+    try {
+      transferChain = typeof row.transferChainJson === "string"
+        ? JSON.parse(row.transferChainJson) : undefined;
+    } catch {
+      return fail("storage_unavailable", "Authority OpenItem transfer chain was corrupt");
+    }
+    const item = {
+      id: row.id, roomId: row.roomId, sourceMessageId: row.sourceMessageId,
+      requesterId: row.requesterId, currentOwnerId: row.currentOwnerId, content: row.content,
+      status: row.status,
+      origin: row.originKind === "agent_proposal" ? {
+        kind: "agent_proposal", proposalKind: row.proposalKind,
+        sourceExecutionId: row.sourceExecutionId, reason: row.proposalReason,
+      } : { kind: row.originKind },
+      createdAt: row.createdAt,
+      ...(typeof row.respondedAt === "string" ? { respondedAt: row.respondedAt } : {}),
+      transferChain,
+    };
+    if (!isOpenItem(item)) return fail("storage_unavailable", "Authority OpenItem ball fact was corrupt");
+    return item;
+  });
+  const lightTasks = database.prepare(
+    `SELECT id, room_id AS roomId, source_message_id AS sourceMessageId, title,
+            claimant_actor_id AS claimant, claimant_role_at_claim AS claimantRoleAtClaim,
+            verifier_role AS verifierRole, verifier_actor_id AS verifierActorId,
+            criteria_json AS criteriaJson, status, created_at AS createdAt,
+            claimed_at AS claimedAt, delivered_at AS deliveredAt, verified_at AS verifiedAt
+     FROM light_tasks WHERE room_id = ? ORDER BY id`,
+  ).all(roomId).map((row) => {
+    let criteria: unknown;
+    try {
+      criteria = typeof row.criteriaJson === "string" ? JSON.parse(row.criteriaJson) : undefined;
+    } catch {
+      return fail("storage_unavailable", "Authority LightTask criteria were corrupt");
+    }
+    const task = {
+      id: row.id, roomId: row.roomId, sourceMessageId: row.sourceMessageId, title: row.title,
+      claimant: row.claimant, claimantRoleAtClaim: row.claimantRoleAtClaim,
+      verifierRole: row.verifierRole, verifierActorId: row.verifierActorId,
+      criteria, status: row.status, createdAt: row.createdAt,
+      ...(typeof row.claimedAt === "string" ? { claimedAt: row.claimedAt } : {}),
+      ...(typeof row.deliveredAt === "string" ? { deliveredAt: row.deliveredAt } : {}),
+      ...(typeof row.verifiedAt === "string" ? { verifiedAt: row.verifiedAt } : {}),
+    };
+    if (!isLightTask(task)) return fail("storage_unavailable", "Authority LightTask ball fact was corrupt");
+    return task;
+  });
+  return projectBallsInCourt({
+    openItems: openItems.filter((item) => {
+      const since = item.status === "transferred"
+        ? item.transferChain.at(-1)?.transferredAt
+        : item.createdAt;
+      return since !== undefined && Number.isFinite(Date.parse(since));
+    }),
+    lightTasks: lightTasks.filter((task) => {
+      const since = task.status === "claimed" ? task.claimedAt
+        : task.status === "delivered" ? task.deliveredAt : task.createdAt;
+      return since !== undefined && Number.isFinite(Date.parse(since));
+    }),
+    blueprintFacts, openItemDeadlineMs, lightTaskDeadlineMs,
+  });
+}
+
+export function executeBallAuthorityOperation(
+  database: DatabaseSync,
+  operation: BallAuthorityOperation,
+): BallAuthorityOperationResult {
+  return runAuthorityImmediateTransaction(database, () => {
+    if (operation.type === "ball.list-rooms") {
+      const rows = database.prepare(
+        `SELECT DISTINCT room_id AS roomId FROM (
+           SELECT room_id FROM open_items WHERE status IN ('awaiting', 'transferred')
+           UNION ALL
+           SELECT room_id FROM light_tasks WHERE status IN ('claimed', 'delivered')
+         ) ORDER BY roomId LIMIT 257`,
+      ).all();
+      if (rows.length > 256 || !rows.every((row) => typeof row.roomId === "string")) {
+        return fail("storage_unavailable", "Ball room recovery exceeded its closed bound");
+      }
+      return { kind: "ball-rooms", roomIds: rows.map((row) => row.roomId as string) };
+    }
+    const room = database.prepare("SELECT status FROM rooms WHERE id = ?").get(operation.roomId);
+    if (room === undefined) return fail("room_not_found", "Ball room was not found");
+    if (room.status !== "active") return fail("room_archived", "Ball room is archived");
+    const balls = ballFactsForRoom(
+      database,
+      operation.roomId,
+      operation.blueprintFacts,
+      operation.policy.openItemDeadlineMs,
+      operation.policy.lightTaskDeadlineMs,
+    );
+    if (operation.type === "ball.query") {
+      const actorId = requireHumanSession(database, operation.context, operation.now);
+      requireRoomMembership(database, actorId, operation.roomId);
+      const needsAction: NeedsActionProjection[] = balls
+        .filter((ball) => ball.holderId === actorId)
+        .map((ball) => ({
+          roomId: ball.roomId, actorId, ball, overdue: operation.now >= Date.parse(ball.deadline),
+        }));
+      const reminders: ReminderCandidate[] = needsAction
+        .filter((entry) => entry.overdue)
+        .map(({ ball }) => ({
+          roomId: ball.roomId, recipientId: actorId, sourceKind: ball.sourceKind,
+          sourceId: ball.sourceId, dueAt: ball.deadline,
+        }));
+      return { kind: "ball-query", balls, needsAction, reminders };
+    }
+
+    const holderRows = database.prepare(
+      `SELECT membership.actor_id AS actorId, actor.kind
+       FROM room_memberships AS membership
+       JOIN actors AS actor ON actor.id = membership.actor_id
+       WHERE membership.room_id = ? ORDER BY membership.actor_id`,
+    ).all(operation.roomId);
+    const holderKinds = new Map(holderRows.flatMap((row) =>
+      typeof row.actorId === "string" && (row.kind === "human" || row.kind === "agent")
+        ? [[row.actorId, row.kind] as const] : []));
+    const occurredAt = new Date(operation.now).toISOString();
+    const agentTriggers: BallOverdueTrigger[] = [];
+    const reminders: ReminderCandidate[] = [];
+    const ballSummaries: BallSummary[] = [];
+    for (const ball of balls) {
+      if (operation.now < Date.parse(ball.deadline)) continue;
+      const holderKind = holderKinds.get(ball.holderId);
+      if (holderKind === undefined) continue;
+      const boundaryKind = holderKind === "agent" ? "agent_trigger" : "human_reminder";
+      const claimId = stableId(
+        "ball-boundary", ball.roomId, ball.sourceKind, ball.sourceId, ball.holderId,
+        ball.since, boundaryKind,
+      );
+      const inserted = database.prepare(
+        `INSERT OR IGNORE INTO ball_boundary_claims (
+           id, room_id, source_kind, source_id, holder_actor_id, holder_kind,
+           reason, since_at, deadline_at, boundary_kind, claimed_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        claimId, ball.roomId, ball.sourceKind, ball.sourceId, ball.holderId, holderKind,
+        ball.reason.slice(0, 1_024), ball.since, ball.deadline, boundaryKind, occurredAt,
+      );
+      if (inserted.changes !== 1) continue;
+      if (holderKind === "human") {
+        reminders.push({
+          roomId: ball.roomId, recipientId: ball.holderId, sourceKind: ball.sourceKind,
+          sourceId: ball.sourceId, dueAt: ball.deadline,
+        });
+        continue;
+      }
+      const trigger: BallOverdueTrigger = {
+        id: stableId("ball-overdue-trigger", claimId), roomId: ball.roomId,
+        agentId: ball.holderId, ball, triggeredAt: occurredAt,
+      };
+      const eventId = stableId("ball-overdue-event", trigger.id);
+      const streamSeq = appendRoomEvent(database, {
+        eventId, roomId: ball.roomId, actorId: ball.holderId,
+        eventType: "room.ball.overdue", occurredAt,
+        payload: trigger as unknown as JsonValue,
+      });
+      appendRoomOutbox(database, eventId, ball.roomId, streamSeq, occurredAt, "ball-overdue", trigger.id);
+      database.prepare(
+        `UPDATE route_job_agents SET has_ball = 1
+         WHERE agent_id = ? AND route_job_id IN (
+           SELECT id FROM route_jobs WHERE room_id = ? AND status = 'queued'
+         )`,
+      ).run(ball.holderId, ball.roomId);
+      agentTriggers.push(trigger);
+      ballSummaries.push({
+        agentId: ball.holderId, sourceKind: ball.sourceKind, sourceId: ball.sourceId,
+        reason: ball.reason, since: ball.since, deadline: ball.deadline,
+      });
+    }
+    return { kind: "ball-overdue-scan", agentTriggers, reminders, ballSummaries };
+  });
 }
 
 function unreachableCommand(command: never): never {
@@ -2352,11 +2560,42 @@ function enqueueRouteJobForMessage(
         typeof member.calibrationScore !== "number") {
       return fail("storage_unavailable", "Route Agent membership snapshot was corrupt");
     }
+    const activeBall = database.prepare(
+      `SELECT claim.id
+       FROM ball_boundary_claims AS claim
+       WHERE claim.room_id = ? AND claim.holder_actor_id = ?
+         AND claim.boundary_kind = 'agent_trigger' AND claim.route_consumed_at IS NULL
+         AND (
+           (claim.source_kind = 'open-item' AND EXISTS (
+             SELECT 1 FROM open_items AS item
+             WHERE item.id = claim.source_id AND item.room_id = claim.room_id
+               AND item.current_owner_actor_id = claim.holder_actor_id
+               AND item.status IN ('awaiting', 'transferred')
+               AND CASE WHEN item.status = 'transferred'
+                 THEN json_extract(item.transfer_chain_json, '$[#-1].transferredAt')
+                 ELSE item.created_at END = claim.since_at
+           ))
+           OR (claim.source_kind = 'light-task' AND EXISTS (
+             SELECT 1 FROM light_tasks AS task
+             WHERE task.id = claim.source_id AND task.room_id = claim.room_id
+               AND ((task.status = 'claimed' AND task.claimant_actor_id = claim.holder_actor_id
+                     AND task.claimed_at = claim.since_at)
+                 OR (task.status = 'delivered' AND task.verifier_actor_id = claim.holder_actor_id
+                     AND task.delivered_at = claim.since_at))
+           ))
+           OR claim.source_kind IN (
+             'blueprint-task', 'blueprint-awaiting', 'blueprint-blocked-mention'
+           )
+         )
+       ORDER BY claim.claimed_at, claim.id LIMIT 1`,
+    ).get(message.roomId, member.agentId);
+    const activeBallId = typeof activeBall?.id === "string" ? activeBall.id : undefined;
+    const hasBall = activeBallId !== undefined;
     database.prepare(
       `INSERT INTO route_job_agents (
          route_job_id, agent_id, participation, role, capabilities_json,
          calibration_score, has_ball
-       ) VALUES (?, ?, ?, ?, ?, ?, 0)`,
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       routeJobId,
       member.agentId,
@@ -2364,7 +2603,14 @@ function enqueueRouteJobForMessage(
       member.role,
       member.capabilitiesJson,
       member.calibrationScore,
+      hasBall ? 1 : 0,
     );
+    if (hasBall) {
+      database.prepare(
+        `UPDATE ball_boundary_claims SET route_consumed_at = ?
+         WHERE id = ? AND route_consumed_at IS NULL`,
+      ).run(acceptedAt, activeBallId);
+    }
   }
   if (members.length === 0) {
     database.prepare(

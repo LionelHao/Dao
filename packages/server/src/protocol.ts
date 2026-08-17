@@ -17,6 +17,9 @@ import {
   type AgentExecution,
   type AgentInvocationIntent,
   type LightTask,
+  type BallInCourt,
+  type NeedsActionProjection,
+  type ReminderCandidate,
   type OpenItem,
 } from "@native-im/core";
 import type { AuthenticationErrorCode } from "./auth.js";
@@ -111,6 +114,12 @@ export interface MessageSendFrame {
 
 export interface RoomHistoryRequestFrame {
   readonly type: "room.history";
+  readonly requestId: string;
+  readonly roomId: string;
+}
+
+export interface BallQueryFrame {
+  readonly type: "ball.query";
   readonly requestId: string;
   readonly roomId: string;
 }
@@ -251,6 +260,7 @@ export type ClientFrame =
   | AuthRevokeFrame
   | MessageSendFrame
   | RoomHistoryRequestFrame
+  | BallQueryFrame
   | RoomSubscribeFrame
   | WorkspaceBootstrapRequestFrame
   | WorkspaceBootstrapPageRequestFrame
@@ -364,6 +374,15 @@ export interface LightTaskAckFrame {
   readonly task: LightTask;
 }
 
+export interface BallQueryResultFrame {
+  readonly type: "ball.query.result";
+  readonly requestId: string;
+  readonly roomId: string;
+  readonly balls: readonly BallInCourt[];
+  readonly needsAction: readonly NeedsActionProjection[];
+  readonly reminders: readonly ReminderCandidate[];
+}
+
 export type ProtocolErrorCode =
   | AuthenticationErrorCode
   | MessageErrorCode
@@ -434,6 +453,7 @@ export type ServerFrame =
   | AgentExecutionPreviewFrame
   | OpenItemAckFrame
   | LightTaskAckFrame
+  | BallQueryResultFrame
   | ProtocolErrorFrame;
 
 export type ClientFrameParseResult =
@@ -657,6 +677,7 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
     }
     case "room.history":
     case "room.subscribe":
+    case "ball.query":
       if (
         !hasOnlyFields(value, ROOM_FIELDS) ||
         requestId === undefined ||

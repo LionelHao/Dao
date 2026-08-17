@@ -17,6 +17,16 @@ const validDraft = {
 };
 
 describe("client protocol resource bounds", () => {
+  it("accepts only the room-scoped closed ball query frame", () => {
+    expect(parse({ type: "ball.query", requestId: "ball-1", roomId: "room-1" }))
+      .toEqual({
+        ok: true, frame: { type: "ball.query", requestId: "ball-1", roomId: "room-1" },
+      });
+    expect(parse({
+      type: "ball.query", requestId: "ball-1", roomId: "room-1", actorId: "human-2",
+    }).ok).toBe(false);
+  });
+
   it.each([
     ["requestId", { type: "auth.revoke", requestId: "" }],
     ["accountId", { type: "auth.login", requestId: "r", accountId: "", secret: "s" }],

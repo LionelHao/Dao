@@ -189,6 +189,7 @@ export type WorkerDatabaseClient = Omit<
   | "executeAgent"
   | "executeRuntime"
   | "executeRoute"
+  | "executeBall"
   | "readActor"
   | "readRoom"
   | "listPendingOutbox"

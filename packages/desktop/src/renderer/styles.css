@@ -30,6 +30,28 @@
   font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
 }
 
+.room-attention-summary {
+  display: grid;
+  gap: 12px;
+}
+
+.room-attention-summary__unread,
+.room-attention-summary__needs-action {
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--line, #d9dde5);
+  border-radius: 10px;
+}
+
+.room-attention-summary__needs-action {
+  border-color: #d59b32;
+  background: #fffaf0;
+}
+
+.needs-action-item[data-overdue="true"] {
+  color: #9b2c2c;
+}
+
 .agent-execution-preview {
   border: 1px dashed #64748b;
   border-radius: 0.5rem;

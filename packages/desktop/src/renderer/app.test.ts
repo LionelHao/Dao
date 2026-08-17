@@ -9,6 +9,7 @@ import type {
   HumanReadReceipt,
   HumanInvitationRequest,
   LightTask,
+  NeedsActionProjection,
   OpenItem,
   RouteJudgment,
   SocialReaction,
@@ -52,6 +53,10 @@ type RendererUnderTest = {
       readonly authoritative: false;
     } | undefined,
   ) => void;
+  renderRoomAttentionSummary?: (
+    root: HTMLElement,
+    input: { readonly unreadCount: number; readonly needsAction: readonly NeedsActionProjection[] },
+  ) => void;
   renderEmptyGroupChat?: (root: HTMLElement) => void;
   renderMessageTimeline?: (
     root: HTMLElement,
@@ -78,6 +83,24 @@ type RendererUnderTest = {
 const app = importedApp as unknown as RendererUnderTest;
 
 describe("empty group chat renderer", () => {
+  it("renders unread and room-scoped needs-action independently", () => {
+    const root = document.createElement("main");
+    app.renderRoomAttentionSummary?.(root, {
+      unreadCount: 0,
+      needsAction: [{
+        roomId: "room-1", actorId: "human-1", overdue: false,
+        ball: {
+          holderId: "human-1", roomId: "room-1", sourceKind: "open-item",
+          sourceId: "item-1", reason: "open item awaits current owner",
+          since: "2026-08-17T00:00:00.000Z", deadline: "2026-08-18T00:00:00.000Z",
+        },
+      }],
+    });
+    expect(root.querySelector("[data-unread-count='0']")?.textContent).toContain("纯未读 · 0");
+    expect(root.querySelector("[data-needs-action-count='1']")?.textContent).toContain("需要我动 · 1");
+    expect(root.querySelector("[data-source-id='item-1']")).not.toBeNull();
+  });
+
   it("renders a visible empty collaboration room without pretending an agent is a human", () => {
     const root = document.createElement("main");
 

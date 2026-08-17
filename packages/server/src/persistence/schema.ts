@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
-export const AUTHORITY_SCHEMA_VERSION = 9 as const;
+export const AUTHORITY_SCHEMA_VERSION = 10 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -33,6 +33,8 @@ const V8_MIGRATION_CHECKSUM =
   "b0eb63981b5ee92cfd51133972e78c4054c3fdf155cee58ce4c029564ed6d1d1";
 const V9_MIGRATION_CHECKSUM =
   "802bd498bf342a575fa21fb46e18b7a375259bd40a571844bb375d756c0616b2";
+const V10_MIGRATION_CHECKSUM =
+  "a7a668d54ddd3636f2e2bafcb7e55be8c9771d56c19a6ca5e3c79027a6647105";
 const SCHEMA_FINGERPRINTS = {
   1: "03f2bbba4aa7082ec01819824726ce1bd9b4bd14cebea71afc93c6821dbf405c",
   2: "01c37d92ec2f303613a7bb8b592ca846fbea7c829b3c81fe4521699db949dfcc",
@@ -43,6 +45,7 @@ const SCHEMA_FINGERPRINTS = {
   7: "9827d65dd5eac378112a51859251ac842d4393c518f21f8862956aa6ebd0edae",
   8: "7dcef5f3d765e7d19015f19aca2d033aee0f0b3c07f53c4934e3c1d2b6053f20",
   9: "0374dbc27aa894ec239c89bcc6682fc53b219c8a2e150dfea3389beb7bf8e4e7",
+  10: "7fd3399cc25e505de80d69adae24f7fc5a027de57cfb3e0b56df294e454c91fb",
 } as const;
 
 const V1_STATEMENTS = [
@@ -822,6 +825,31 @@ const V9_STATEMENTS = [
    END`,
 ] as const;
 
+const V10_STATEMENTS = [
+  `CREATE TABLE ball_boundary_claims (
+    id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    source_kind TEXT NOT NULL CHECK (source_kind IN (
+      'open-item', 'light-task', 'blueprint-task', 'blueprint-awaiting',
+      'blueprint-blocked-mention'
+    )),
+    source_id TEXT NOT NULL CHECK (length(trim(source_id)) > 0),
+    holder_actor_id TEXT NOT NULL REFERENCES actors(id),
+    holder_kind TEXT NOT NULL CHECK (holder_kind IN ('human', 'agent')),
+    reason TEXT NOT NULL CHECK (length(trim(reason)) > 0 AND length(reason) <= 1024),
+    since_at TEXT NOT NULL,
+    deadline_at TEXT NOT NULL,
+    boundary_kind TEXT NOT NULL CHECK (boundary_kind IN ('agent_trigger', 'human_reminder')),
+    claimed_at TEXT NOT NULL,
+    route_consumed_at TEXT,
+    UNIQUE (
+      room_id, source_kind, source_id, holder_actor_id, since_at, boundary_kind
+    )
+  ) STRICT`,
+  `CREATE INDEX ball_boundary_claims_room_holder_v10
+   ON ball_boundary_claims(room_id, holder_actor_id, claimed_at, id)`,
+] as const;
+
 const V2_STATEMENTS = [
   `ALTER TABLE actors
    ADD COLUMN catalog_revision INTEGER NOT NULL DEFAULT 0
@@ -1207,6 +1235,7 @@ const MIGRATIONS = [
   defineMigration(7, "single-route-authority", V7_STATEMENTS, V7_MIGRATION_CHECKSUM),
   defineMigration(8, "closed-open-item-authority", V8_STATEMENTS, V8_MIGRATION_CHECKSUM),
   defineMigration(9, "closed-light-task-authority", V9_STATEMENTS, V9_MIGRATION_CHECKSUM),
+  defineMigration(10, "ball-in-court-boundaries", V10_STATEMENTS, V10_MIGRATION_CHECKSUM),
 ] as const satisfies readonly Migration[];
 
 const V1_SCHEMA_CONTRACT = {
@@ -1492,6 +1521,14 @@ const V9_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V10_SCHEMA_CONTRACT = {
+  ...V9_SCHEMA_CONTRACT,
+  ball_boundary_claims: [
+    "id", "room_id", "source_kind", "source_id", "holder_actor_id", "holder_kind",
+    "reason", "since_at", "deadline_at", "boundary_kind", "claimed_at", "route_consumed_at",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
@@ -1502,6 +1539,7 @@ const SCHEMA_CONTRACTS = {
   7: V7_SCHEMA_CONTRACT,
   8: V8_SCHEMA_CONTRACT,
   9: V9_SCHEMA_CONTRACT,
+  10: V10_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -1951,6 +1989,24 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
       "LightTask criteria must be closed and uniquely identified",
     );
   }
+  if (schemaVersion >= 10) {
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM ball_boundary_claims AS claim
+       JOIN actors AS holder ON holder.id = claim.holder_actor_id
+       LEFT JOIN room_memberships AS membership
+         ON membership.room_id = claim.room_id AND membership.actor_id = claim.holder_actor_id
+       WHERE holder.kind <> claim.holder_kind
+          OR claim.deadline_at < claim.since_at
+          OR claim.claimed_at < claim.deadline_at
+          OR (claim.route_consumed_at IS NOT NULL AND claim.route_consumed_at < claim.claimed_at)
+          OR (claim.boundary_kind = 'agent_trigger' AND claim.holder_kind <> 'agent')
+          OR (claim.boundary_kind = 'human_reminder' AND claim.holder_kind <> 'human')
+       LIMIT 1`,
+      "ball boundary claims must remain closed and holder-kind matched",
+    );
+  }
 }
 
 function validateExistingSchema(database: DatabaseSync, currentVersion: number): void {
@@ -2110,6 +2166,18 @@ export function migrateAuthorityDatabaseToPreviousVersionForTest(
   database: DatabaseSync,
 ): void {
   migrateAuthorityDatabaseToVersion(database, AUTHORITY_SCHEMA_VERSION - 1);
+}
+
+export function migrateAuthorityDatabaseToVersion9ForTest(
+  database: DatabaseSync,
+): void {
+  migrateAuthorityDatabaseToVersion(database, 9);
+}
+
+export function migrateAuthorityDatabaseToVersion8ForTest(
+  database: DatabaseSync,
+): void {
+  migrateAuthorityDatabaseToVersion(database, 8);
 }
 
 export function migrateAuthorityDatabaseToVersion7ForTest(
