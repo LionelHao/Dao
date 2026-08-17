@@ -13,6 +13,7 @@ import {
   isCalibrationSignal,
   isHumanReadReceipt,
   isOpenItem,
+  isOpenItemAgentFailure,
   isRouteJob,
   isRouteJudgment,
   type AgentExecution,
@@ -20,6 +21,7 @@ import {
   type CalibrationSignal,
   type HumanReadReceipt,
   type OpenItem,
+  type OpenItemAgentFailure,
   type RouteJob,
   type RouteJudgment,
 } from "./collaboration.js";
@@ -51,6 +53,7 @@ export type RoomRepairRecord =
   | { readonly kind: "human-read"; readonly value: HumanReadReceipt }
   | { readonly kind: "agent-judgement"; readonly value: AgentJudgement }
   | { readonly kind: "open-item"; readonly value: OpenItem }
+  | { readonly kind: "open-item-agent-failure"; readonly value: OpenItemAgentFailure }
   | { readonly kind: "agent-execution"; readonly value: AgentExecution }
   | { readonly kind: "route-job"; readonly value: RouteJob }
   | { readonly kind: "route-judgment"; readonly value: RouteJudgment }
@@ -156,6 +159,7 @@ export type PersistedRoomEvent =
   | RoomEvent<"room.human_read.recorded", HumanReadReceipt>
   | RoomEvent<"room.agent_judgment.recorded", AgentJudgement>
   | RoomEvent<"room.open_item.changed", OpenItem>
+  | RoomEvent<"room.open_item.agent_attempt_failed", OpenItemAgentFailure>
   | RoomEvent<"room.agent_execution.changed", AgentExecution>
   | RoomEvent<"room.route_judgment.recorded", RouteJudgment>
   | RoomEvent<
@@ -317,6 +321,7 @@ function isRepairRecord(value: unknown): value is RoomRepairRecord {
   if (value.kind === "human-read") return isHumanReadReceipt(value.value);
   if (value.kind === "agent-judgement") return isAgentJudgement(value.value);
   if (value.kind === "open-item") return isOpenItem(value.value);
+  if (value.kind === "open-item-agent-failure") return isOpenItemAgentFailure(value.value);
   if (value.kind === "agent-execution") return isAgentExecution(value.value);
   if (value.kind === "route-job") return isRouteJob(value.value);
   if (value.kind === "route-judgment") return isRouteJudgment(value.value);
@@ -375,6 +380,9 @@ function isPersistedRoomEventValue(value: unknown): value is PersistedRoomEvent 
   }
   if (value.type === "room.open_item.changed") {
     return isOpenItem(payload) && payload.roomId === value.roomId;
+  }
+  if (value.type === "room.open_item.agent_attempt_failed") {
+    return isOpenItemAgentFailure(payload);
   }
   if (value.type === "room.agent_execution.changed") {
     return isAgentExecution(payload) && payload.roomId === value.roomId && payload.agentId === value.actorId;

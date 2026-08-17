@@ -12,6 +12,8 @@ import {
 } from "@native-im/core";
 import type {
   AgentExecution,
+  OpenItem,
+  OpenItemAgentFailure,
   RoomRepairRecord,
   RoomSummary,
 } from "@native-im/core";
@@ -471,19 +473,42 @@ function* roomRecords(
   }
   for (const row of scanRows(authority,
     `SELECT id, room_id AS roomId, source_message_id AS sourceMessageId,
-            requester_actor_id AS requesterId, assigned_actor_id AS ownerId,
+            requester_actor_id AS requesterId, current_owner_actor_id AS currentOwnerId,
             body AS content, status, created_at AS createdAt,
-            responded_at AS respondedAt, transfer_chain_json AS transferChainJson
+            responded_at AS respondedAt, transfer_chain_json AS transferChainJson,
+            origin_kind AS originKind, proposal_kind AS proposalKind,
+            source_execution_id AS sourceExecutionId, proposal_reason AS proposalReason
      FROM open_items WHERE room_id = ?`,
     roomId, "id", "id")) {
     const transferChain = parseJson(row.transferChainJson);
     yield { kind: "open-item", value: {
       id: String(row.id), roomId: String(row.roomId), sourceMessageId: String(row.sourceMessageId),
-      requesterId: String(row.requesterId), ownerId: String(row.ownerId), content: String(row.content),
-      status: row.status as "pending_response", createdAt: String(row.createdAt),
+      requesterId: String(row.requesterId),
+      currentOwnerId: row.currentOwnerId === null ? null : String(row.currentOwnerId),
+      content: String(row.content), status: row.status as OpenItem["status"],
+      origin: row.originKind === "agent_proposal" ? {
+        kind: "agent_proposal", proposalKind: String(row.proposalKind) as "risk" | "challenge",
+        sourceExecutionId: String(row.sourceExecutionId), reason: String(row.proposalReason),
+      } : { kind: String(row.originKind) as "human_mention" | "manual_unfinished" },
+      createdAt: String(row.createdAt),
       ...(typeof row.respondedAt === "string" ? { respondedAt: row.respondedAt } : {}),
       transferChain: transferChain as [],
     }};
+    recordScanned();
+  }
+  for (const row of scanRows(authority,
+    `SELECT failure.id, failure.open_item_id AS openItemId,
+            failure.execution_id AS executionId, failure.attempt_seq AS attemptSeq,
+            failure.reason_code AS reasonCode, failure.failed_at AS failedAt
+     FROM open_item_agent_failures AS failure
+     JOIN open_items AS item ON item.id = failure.open_item_id
+     WHERE item.room_id = ?`,
+    roomId, "failure.id", "id")) {
+    yield { kind: "open-item-agent-failure", value: {
+      id: String(row.id), openItemId: String(row.openItemId),
+      executionId: String(row.executionId), attemptSeq: Number(row.attemptSeq),
+      reasonCode: String(row.reasonCode), failedAt: String(row.failedAt),
+    } satisfies OpenItemAgentFailure };
     recordScanned();
   }
   for (const row of scanRows(authority,
@@ -726,7 +751,7 @@ function keysetRoomPage(
     }
   };
 
-  while (values.length < limit && segment < 10) {
+  while (values.length < limit && segment < 11) {
     if (segment === 0) {
       const room = authority.prepare(
         "SELECT id, name, status, created_at AS createdAt FROM rooms WHERE id = ?",
@@ -780,19 +805,39 @@ function keysetRoomPage(
     } else if (segment === 5) {
       append(keysetRows(authority,
         `SELECT id, room_id AS roomId, source_message_id AS sourceMessageId,
-                requester_actor_id AS requesterId, assigned_actor_id AS ownerId,
+                requester_actor_id AS requesterId, current_owner_actor_id AS currentOwnerId,
                 body AS content, status, created_at AS createdAt,
-                responded_at AS respondedAt, transfer_chain_json AS transferChainJson
+                responded_at AS respondedAt, transfer_chain_json AS transferChainJson,
+                origin_kind AS originKind, proposal_kind AS proposalKind,
+                source_execution_id AS sourceExecutionId, proposal_reason AS proposalReason
          FROM open_items WHERE room_id = ?`, [roomId], "id", key, remaining),
       (row) => String(row.id), (row) => ({ kind: "open-item", value: {
         id: String(row.id), roomId: String(row.roomId), sourceMessageId: String(row.sourceMessageId),
-        requesterId: String(row.requesterId), ownerId: String(row.ownerId),
-        content: String(row.content), status: row.status as "pending_response",
+        requesterId: String(row.requesterId),
+        currentOwnerId: row.currentOwnerId === null ? null : String(row.currentOwnerId),
+        content: String(row.content), status: row.status as OpenItem["status"],
+        origin: row.originKind === "agent_proposal" ? {
+          kind: "agent_proposal", proposalKind: String(row.proposalKind) as "risk" | "challenge",
+          sourceExecutionId: String(row.sourceExecutionId), reason: String(row.proposalReason),
+        } : { kind: String(row.originKind) as "human_mention" | "manual_unfinished" },
         createdAt: String(row.createdAt),
         ...(typeof row.respondedAt === "string" ? { respondedAt: row.respondedAt } : {}),
         transferChain: parseJson(row.transferChainJson) as [],
       }}));
     } else if (segment === 6) {
+      append(keysetRows(authority,
+        `SELECT failure.id, failure.open_item_id AS openItemId,
+                failure.execution_id AS executionId, failure.attempt_seq AS attemptSeq,
+                failure.reason_code AS reasonCode, failure.failed_at AS failedAt
+         FROM open_item_agent_failures AS failure
+         JOIN open_items AS item ON item.id = failure.open_item_id
+         WHERE item.room_id = ?`, [roomId], "failure.id", key, remaining),
+      (row) => String(row.id), (row) => ({ kind: "open-item-agent-failure", value: {
+        id: String(row.id), openItemId: String(row.openItemId),
+        executionId: String(row.executionId), attemptSeq: Number(row.attemptSeq),
+        reasonCode: String(row.reasonCode), failedAt: String(row.failedAt),
+      }}));
+    } else if (segment === 7) {
       append(keysetRows(authority,
         `SELECT id, room_id AS roomId, trigger_message_id AS sourceMessageId,
                 requester_actor_id AS requesterId, agent_id AS agentId, tool_name AS toolName,
@@ -811,7 +856,7 @@ function keysetRoomPage(
         kind: "agent-execution",
         value: canonicalLegacyExecution(row),
       }));
-    } else if (segment === 7) {
+    } else if (segment === 8) {
       append(keysetRows(authority,
         `SELECT id, room_id AS roomId, source_message_id AS sourceMessageId, status,
                 current_attempt AS currentAttempt, topic_key AS topicKey,
@@ -821,7 +866,7 @@ function keysetRoomPage(
                 terminal_error_code AS terminalErrorCode, next_retry_at AS nextRetryAt
          FROM route_jobs WHERE room_id = ?`, [roomId], "id", key, remaining),
       (row) => String(row.id), routeJobRecord);
-    } else if (segment === 8) {
+    } else if (segment === 9) {
       append(keysetRows(authority,
         `SELECT judgment.id, judgment.route_job_id AS routeJobId,
                 judgment.source_message_id AS sourceMessageId,

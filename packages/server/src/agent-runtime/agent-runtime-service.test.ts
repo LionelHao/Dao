@@ -51,12 +51,13 @@ function authority(): RuntimeAuthority & { executions: Map<string, AgentExecutio
   let next = 0;
   return {
     executions,
-    async readContext() { return { visibleConversation: [], toolIds: [] }; },
+    async readContext() { return { visibleConversation: [], toolIds: [], openItemTargets: [] }; },
     beginCompensation: vi.fn(),
     readPendingConfirmation: vi.fn(),
     async invoke(_context, invocation) {
       next += 1;
-      const value = execution(`execution-${next}`, invocation.roomId);
+      const value = { ...execution(`execution-${next}`, invocation.roomId),
+        sourceMessageId: invocation.sourceMessageId };
       executions.set(value.id, value);
       return { execution: value, replayed: false };
     },
@@ -314,6 +315,57 @@ describe("bounded Agent runtime scheduler", () => {
     expect(rounds).toBe(2);
     expect(execute).toHaveBeenCalledTimes(1);
     expect(runtimeAuthority.checkpoint).toHaveBeenCalledTimes(1);
+    expect(runtimeAuthority.executions.get(accepted.execution.id)?.status).toBe("completed");
+  });
+
+  it("turns only a closed provider risk/challenge function into an authoritative OpenItem proposal", async () => {
+    const runtimeAuthority = authority();
+    runtimeAuthority.checkpoint = vi.fn(async () => undefined);
+    const proposeOpenItem = vi.fn(async () => ({ id: "open-item-proposed" }));
+    let rounds = 0;
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      provider: provider(async function* (input) {
+        rounds += 1;
+        yield { type: "response_started", sequence: 1 };
+        if (input.toolContinuations === undefined) {
+          yield { type: "tool_call_started", sequence: 2, callId: "proposal-call", toolName: "dao_propose_open_item" };
+          yield { type: "tool_call_delta", sequence: 3, callId: "proposal-call", delta: JSON.stringify({
+            proposalKind: "risk", targetActorId: "human-reviewer",
+            sourceMessageId: "proposal-source", reason: "权限边界风险", content: "请确认权限边界",
+          }) };
+          yield { type: "completed", sequence: 4 };
+        } else {
+          expect(input.toolContinuations).toEqual([{
+            callId: "proposal-call", toolId: "open-item.propose",
+            argumentsJson: JSON.stringify({
+              proposalKind: "risk", targetActorId: "human-reviewer",
+              sourceMessageId: "proposal-source", reason: "权限边界风险", content: "请确认权限边界",
+            }),
+            modelInput: "OpenItem open-item-proposed was authoritatively created.",
+          }]);
+          yield { type: "text_delta", sequence: 2, delta: "已创建待答项" };
+          yield { type: "completed", sequence: 3 };
+        }
+      }),
+      modelId: "fake-model",
+      buildProviderInput: async (value, invocation) => ({
+        ...(await providerInput(value, invocation)),
+        openItemTargets: [{ actorId: "human-reviewer", kind: "human" }],
+      }),
+      tools: [],
+      toolGateway: { execute: vi.fn() },
+      proposeOpenItem,
+    });
+    const accepted = await runtime.invoke(context, intent("room-a", "proposal-source"));
+    await runtime.whenIdle();
+    expect(proposeOpenItem).toHaveBeenCalledWith(expect.objectContaining({
+      execution: expect.objectContaining({ id: accepted.execution.id, agentId: "agent-room-a" }),
+      callId: "proposal-call", proposalKind: "risk", targetActorId: "human-reviewer",
+      sourceMessageId: "proposal-source", reason: "权限边界风险", content: "请确认权限边界",
+    }));
+    expect(runtimeAuthority.checkpoint).toHaveBeenCalledTimes(1);
+    expect(rounds).toBe(2);
     expect(runtimeAuthority.executions.get(accepted.execution.id)?.status).toBe("completed");
   });
 

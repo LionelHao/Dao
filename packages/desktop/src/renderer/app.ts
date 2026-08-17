@@ -1086,18 +1086,37 @@ function appendAddressingPreview(
   agentLine.append(agentMention, document.createTextNode(" 拉取失败记录（调用，必响应、可中断）"));
   section.append(humanLine, agentLine);
   const openStatusLabels: Readonly<Record<OpenItem["status"], string>> = {
-    pending_response: "待回应",
-    responded: "已回应",
+    awaiting: "待回应",
+    answered: "已回应",
     deferred: "已搁置",
     transferred: "已转交",
   };
   for (const record of records.openItems) {
+    const originLabel = record.origin.kind === "human_mention"
+      ? "@human 请求"
+      : record.origin.kind === "manual_unfinished"
+        ? "手动标记未完"
+        : `Agent ${record.origin.proposalKind} proposal · ${record.origin.sourceExecutionId}`;
     const openItem = primitiveElement(
       "div",
       "open-item",
-      `待答项 · ${record.content} · ${record.requesterId} → ${record.ownerId} · ${openStatusLabels[record.status]}`,
+      `待答项 · ${record.content} · ${record.requesterId} → ${record.currentOwnerId ?? "已闭合"} · ${openStatusLabels[record.status]}`,
     );
     openItem.dataset.openItemStatus = record.status;
+    openItem.dataset.openItemOrigin = record.origin.kind;
+    openItem.dataset.sourceMessageId = record.sourceMessageId;
+    openItem.append(primitiveElement(
+      "span", "open-item__source", `来源：${originLabel} · 消息 ${record.sourceMessageId}`,
+    ));
+    if (record.status === "awaiting" || record.status === "transferred") {
+      const actions = primitiveElement("span", "open-item__actions");
+      for (const [label, action] of [
+        ["回应", "answer"], ["搁置", "defer"], ["转交", "transfer"],
+      ] as const) {
+        appendPrimitiveButton(actions, label, action).classList.add("human-request-action");
+      }
+      openItem.append(actions);
+    }
     section.append(openItem);
   }
   const executionStatusLabels: Readonly<Record<AgentExecution["status"], string>> = {
@@ -1228,9 +1247,10 @@ const defaultRestoredPrimitiveRecords: RestoredPrimitivePreviewRecords = {
     roomId: "preview-room",
     sourceMessageId: "preview-agent-data",
     requesterId: "周安全",
-    ownerId: "陈研发",
+    currentOwnerId: "陈研发",
     content: "权限边界",
     status: "transferred",
+    origin: { kind: "manual_unfinished" },
     createdAt: "2026-08-08T10:03:00.000Z",
     transferChain: [{
       fromId: "周安全",

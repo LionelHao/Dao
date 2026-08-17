@@ -385,4 +385,45 @@ describe("closed v2 recovery protocol", () => {
       },
     })).toMatchObject({ ok: false, error: { code: "invalid_request" } });
   });
+
+  it("accepts only closed T-0017 human OpenItem frames", () => {
+    expect(parse({
+      type: "open-item.create",
+      requestId: "open-create",
+      roomId: "room-1",
+      creationKind: "human_mention",
+      sourceMessageId: "message-1",
+      targetActorId: "human-2",
+      content: "请确认权限边界",
+    })).toMatchObject({ ok: true, frame: { type: "open-item.create", creationKind: "human_mention" } });
+    expect(parse({
+      type: "open-item.transition", requestId: "open-transfer", roomId: "room-1",
+      itemId: "item-1", action: "transfer", targetActorId: "human-3", reason: "领域转交",
+    })).toMatchObject({ ok: true, frame: { type: "open-item.transition", action: "transfer" } });
+    expect(parse({
+      type: "open-item.transition", requestId: "open-answer", roomId: "room-1",
+      itemId: "item-1", action: "answer",
+    })).toMatchObject({ ok: true, frame: { type: "open-item.transition", action: "answer" } });
+    for (const frame of [
+      {
+        type: "open-item.create", requestId: "natural-language", roomId: "room-1",
+        creationKind: "risk", sourceMessageId: "message-1", targetActorId: "human-2", content: "risk",
+      },
+      {
+        type: "open-item.create", requestId: "forged", roomId: "room-1",
+        creationKind: "human_mention", sourceMessageId: "message-1", targetActorId: "human-2",
+        content: "risk", requesterId: "human-forged",
+      },
+      {
+        type: "open-item.transition", requestId: "open-defer-no-reason", roomId: "room-1",
+        itemId: "item-1", action: "defer",
+      },
+      {
+        type: "open-item.transition", requestId: "open-answer-extra", roomId: "room-1",
+        itemId: "item-1", action: "answer", reason: "not closed",
+      },
+    ]) {
+      expect(parse(frame)).toMatchObject({ ok: false, error: { code: "invalid_request" } });
+    }
+  });
 });

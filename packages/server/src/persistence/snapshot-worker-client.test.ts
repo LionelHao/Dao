@@ -154,10 +154,12 @@ function seedClosedMixedStressRecords(
   ).run(roomId, JSON.stringify(judgment), judgment.decidedAt);
   database.prepare(
     `INSERT INTO open_items (
-       id, room_id, source_message_id, assigned_actor_id, status, body,
-       created_at, resolved_at, requester_actor_id, transfer_chain_json, responded_at
-     ) VALUES ('stress-open', ?, 'message-0000', 'stress-agent', 'pending_response',
-       'stress item', '2026-08-11T01:00:02.000Z', NULL, ?, '[]', NULL)`,
+       id, room_id, source_message_id, current_owner_actor_id, status, body,
+       created_at, responded_at, requester_actor_id, transfer_chain_json,
+       origin_kind, proposal_kind, source_execution_id, proposal_reason
+     ) VALUES ('stress-open', ?, 'message-0000', 'stress-agent', 'awaiting',
+       'stress item', '2026-08-11T01:00:02.000Z', NULL, ?, '[]',
+       'manual_unfinished', NULL, NULL, NULL)`,
   ).run(roomId, context.principal.actorId);
   database.prepare(
     `INSERT INTO agent_executions (
@@ -431,20 +433,35 @@ describe("durable materialized snapshot worker", () => {
     ).run(JSON.stringify(judgment), judgment.decidedAt);
     database.prepare(
       `INSERT INTO open_items (
-         id, room_id, source_message_id, assigned_actor_id, status, body,
-         created_at, resolved_at, requester_actor_id, transfer_chain_json, responded_at
+         id, room_id, source_message_id, current_owner_actor_id, status, body,
+         created_at, responded_at, requester_actor_id, transfer_chain_json,
+         origin_kind, proposal_kind, source_execution_id, proposal_reason
        ) VALUES ('open-a', 'room-mixed', 'message-human', 'agent-a',
-         'pending_response', 'respond', '2026-08-11T00:00:06.000Z', NULL, ?, '[]', NULL)`,
+         'awaiting', 'respond', '2026-08-11T00:00:06.000Z', NULL, ?, '[]',
+         'manual_unfinished', NULL, NULL, NULL)`,
     ).run(context.principal.actorId);
     database.prepare(
       `INSERT INTO agent_executions (
          id, room_id, agent_id, trigger_message_id, status, started_at,
          completed_at, result_json, requester_actor_id, tool_name,
-         action_category, tool_dispatch_phase, queued_at, updated_at
-       ) VALUES ('execution-a', 'room-mixed', 'agent-a', 'message-human', 'completed',
-         '2026-08-11T00:00:07.000Z', '2026-08-11T00:00:08.000Z', '"ok"', ?, 'tool',
-         'tool_call', 'finished', '2026-08-11T00:00:07.000Z', '2026-08-11T00:00:08.000Z')`,
+         action_category, tool_dispatch_phase, queued_at, updated_at,
+         terminal_error_code, dead_lettered_at
+       ) VALUES ('execution-a', 'room-mixed', 'agent-a', 'message-human', 'failed',
+         '2026-08-11T00:00:07.000Z', '2026-08-11T00:00:08.000Z', NULL, ?, 'tool',
+         'tool_call', 'finished', '2026-08-11T00:00:07.000Z', '2026-08-11T00:00:08.000Z',
+         'provider_failure', '2026-08-11T00:00:08.000Z')`,
     ).run(context.principal.actorId);
+    database.exec(`
+      INSERT INTO agent_execution_attempts (
+        execution_id, attempt_seq, retry_cycle, retry_ordinal, status,
+        action_category, started_at, finished_at, error_code, recovery_cursor
+      ) VALUES ('execution-a', 1, 1, 1, 'failed', 'tool_call',
+        '2026-08-11T00:00:07.000Z', '2026-08-11T00:00:08.000Z', 'provider_failure', 0);
+      INSERT INTO open_item_agent_failures (
+        id, open_item_id, execution_id, attempt_seq, reason_code, failed_at
+      ) VALUES ('open-failure-a', 'open-a', 'execution-a', 1,
+        'provider_failure', '2026-08-11T00:00:08.000Z');
+    `);
     database.prepare(
       `INSERT INTO calibration_signals (
          id, room_id, agent_id, judgment_id, signal, created_at, source_message_id, actor_id
@@ -461,8 +478,13 @@ describe("durable materialized snapshot worker", () => {
     expect(page.hasMore).toBe(false);
     expect(page.records.map((record) => record.kind)).toEqual([
       "room", "membership", "membership", "message", "message", "human-read",
-      "agent-judgement", "open-item", "agent-execution", "calibration",
+      "agent-judgement", "open-item", "open-item-agent-failure", "agent-execution", "calibration",
     ]);
+    expect(page.records.find((record) => record.kind === "open-item-agent-failure"))
+      .toEqual({ kind: "open-item-agent-failure", value: {
+        id: "open-failure-a", openItemId: "open-a", executionId: "execution-a",
+        attemptSeq: 1, reasonCode: "provider_failure", failedAt: "2026-08-11T00:00:08.000Z",
+      } });
     await client.close();
   });
 

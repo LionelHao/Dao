@@ -5,6 +5,7 @@ import {
   isCalibrationSignal,
   isHumanReadReceipt,
   isOpenItem,
+  isOpenItemAgentFailure,
   isRouteJob,
   isRouteJudgment,
   isRouterProviderInput,
@@ -52,14 +53,15 @@ describe("canonical collaboration records", () => {
   });
 
   it("validates open-item and execution status records without merging them", () => {
-    expect(isOpenItem({
+    const transferred = {
       id: "item-1",
       roomId: "room-1",
       sourceMessageId: "message-1",
       requesterId: "human-1",
-      ownerId: "human-2",
+      currentOwnerId: "human-3",
       content: "请确认",
       status: "transferred",
+      origin: { kind: "human_mention" },
       createdAt: "2026-08-10T00:00:00.000Z",
       transferChain: [{
         fromId: "human-2",
@@ -67,7 +69,60 @@ describe("canonical collaboration records", () => {
         reason: "转交",
         transferredAt: "2026-08-10T00:01:00.000Z",
       }],
+    } as const;
+    expect(isOpenItem(transferred)).toBe(true);
+    expect(isOpenItem({ ...transferred, currentOwnerId: "human-2" })).toBe(false);
+    expect(isOpenItem({ ...transferred, currentOwnerId: null })).toBe(false);
+    expect(isOpenItem({ ...transferred, transferChain: [] })).toBe(false);
+    expect(isOpenItem({
+      ...transferred,
+      status: "awaiting",
+      currentOwnerId: "human-2",
+      transferChain: [],
     })).toBe(true);
+    expect(isOpenItem({
+      ...transferred,
+      status: "answered",
+      currentOwnerId: null,
+      respondedAt: "2026-08-10T00:02:00.000Z",
+    })).toBe(true);
+    expect(isOpenItem({
+      ...transferred,
+      status: "deferred",
+      currentOwnerId: null,
+      respondedAt: "2026-08-10T00:02:00.000Z",
+    })).toBe(true);
+    expect(isOpenItem({ ...transferred, status: "answered", currentOwnerId: "human-3" })).toBe(false);
+    expect(isOpenItem({ ...transferred, status: "pending_response" })).toBe(false);
+    expect(isOpenItem({
+      ...transferred,
+      origin: {
+        kind: "agent_proposal",
+        proposalKind: "risk",
+        sourceExecutionId: "execution-1",
+        reason: "部署可能丢数据",
+      },
+    })).toBe(true);
+    expect(isOpenItem({
+      ...transferred,
+      origin: { kind: "agent_proposal", proposalKind: "risk", reason: "缺少 execution" },
+    })).toBe(false);
+    expect(isOpenItemAgentFailure({
+      id: "open-item-failure-1",
+      openItemId: "item-1",
+      executionId: "execution-1",
+      attemptSeq: 3,
+      reasonCode: "provider_timeout",
+      failedAt: "2026-08-10T00:03:00.000Z",
+    })).toBe(true);
+    expect(isOpenItemAgentFailure({
+      id: "open-item-failure-1",
+      openItemId: "item-1",
+      executionId: "execution-1",
+      attemptSeq: 0,
+      reasonCode: "provider_timeout",
+      failedAt: "2026-08-10T00:03:00.000Z",
+    })).toBe(false);
     expect(isAgentExecution({
       id: "execution-1",
       roomId: "room-1",

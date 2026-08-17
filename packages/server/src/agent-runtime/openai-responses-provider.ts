@@ -17,8 +17,13 @@ function configuredText(value: string, field: string): string {
   return value;
 }
 
-function functionName(tool: ToolDescriptor): string {
-  return tool.id.replaceAll(".", "_").replaceAll("-", "_");
+const OPEN_ITEM_PROPOSAL_FUNCTION = "dao_propose_open_item";
+
+function functionName(tool: ToolDescriptor | ToolDescriptor["id"] | "open-item.propose"): string {
+  const id = typeof tool === "string" ? tool : tool.id;
+  return id === "open-item.propose"
+    ? OPEN_ITEM_PROPOSAL_FUNCTION
+    : id.replaceAll(".", "_").replaceAll("-", "_");
 }
 
 function functionParameters(tool: ToolDescriptor): Readonly<Record<string, unknown>> {
@@ -109,7 +114,7 @@ export function createOpenAIResponsesProvider(
         conversationInput.push({
           type: "function_call",
           call_id: continuation.callId,
-          name: functionName({ id: continuation.toolId } as ToolDescriptor),
+          name: functionName(continuation.toolId),
           arguments: continuation.argumentsJson,
         });
         conversationInput.push({
@@ -123,13 +128,33 @@ export function createOpenAIResponsesProvider(
         stream: true,
         store: false,
         input: conversationInput,
-        tools: input.availableTools.map((tool) => ({
-          type: "function",
-          name: functionName(tool),
-          description: tool.displayName,
-          strict: true,
-          parameters: functionParameters(tool),
-        })),
+        tools: [
+          ...input.availableTools.map((tool) => ({
+            type: "function",
+            name: functionName(tool),
+            description: tool.displayName,
+            strict: true,
+            parameters: functionParameters(tool),
+          })),
+          ...((input.openItemTargets?.length ?? 0) === 0 ? [] : [{
+            type: "function",
+            name: OPEN_ITEM_PROPOSAL_FUNCTION,
+            description: "Create a structured risk or challenge OpenItem for a current room member; never infer targets from prose.",
+            strict: true,
+            parameters: {
+              type: "object",
+              properties: {
+                proposalKind: { type: "string", enum: ["risk", "challenge"] },
+                targetActorId: { type: "string", enum: input.openItemTargets!.map((target) => target.actorId) },
+                sourceMessageId: { type: "string", enum: [input.invocation.sourceMessageId] },
+                reason: { type: "string", minLength: 1, maxLength: 2_048 },
+                content: { type: "string", minLength: 1, maxLength: 32_768 },
+              },
+              required: ["proposalKind", "targetActorId", "sourceMessageId", "reason", "content"],
+              additionalProperties: false,
+            },
+          }]),
+        ],
       });
       if (Buffer.byteLength(requestBody, "utf8") > input.limits.maxInputBytes) {
         throw new AgentRuntimeError("invalid_parameters", "Provider input exceeded its byte limit");

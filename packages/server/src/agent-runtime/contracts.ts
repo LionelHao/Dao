@@ -146,6 +146,7 @@ export interface RuntimeAuthority {
   readContext(executionId: string): Promise<{
     readonly visibleConversation: readonly { readonly messageId: string; readonly authorId: string; readonly body: string }[];
     readonly toolIds: readonly ToolDescriptor["id"][];
+    readonly openItemTargets: readonly { readonly actorId: string; readonly kind: "human" | "agent" }[];
   }>;
   invoke(
     context: AuthenticatedCommandContext | InternalAgentCommandContext,

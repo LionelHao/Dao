@@ -354,12 +354,12 @@ export type AuthorityWorkerResponse =
   | {
       readonly type: "authority.ready";
       readonly requestId: string;
-      readonly schemaVersion: 7;
+      readonly schemaVersion: 8;
     }
   | {
       readonly type: "authority.schema";
       readonly requestId: string;
-      readonly schemaVersion: 7;
+      readonly schemaVersion: 8;
     }
   | {
       readonly type: "authority.legacy-imported";
@@ -705,7 +705,9 @@ function isHumanCommand(value: unknown): value is HumanCollaborationCommand | Ro
     return false;
   }
   return parsed.value.type !== "agent.judgment.record" &&
-    parsed.value.type !== "agent.execution.transition";
+    parsed.value.type !== "agent.execution.transition" &&
+    parsed.value.type !== "open-item.propose" &&
+    parsed.value.type !== "open-item.agent-failure.record";
 }
 
 function isAgentCommand(value: unknown): value is AgentCollaborationCommand {
@@ -715,8 +717,9 @@ function isAgentCommand(value: unknown): value is AgentCollaborationCommand {
   }
   return parsed.value.type === "message.send" ||
     parsed.value.type === "agent.judgment.record" ||
-    parsed.value.type === "open-item.create" ||
+    parsed.value.type === "open-item.propose" ||
     parsed.value.type === "open-item.transition" ||
+    parsed.value.type === "open-item.agent-failure.record" ||
     parsed.value.type === "agent.execution.transition";
 }
 
@@ -1003,7 +1006,7 @@ export function isAuthorityWorkerResponse(
     case "authority.schema":
       return (
         hasExactKeys(value, ["type", "requestId", "schemaVersion"]) &&
-        value.schemaVersion === 7
+        value.schemaVersion === 8
       );
     case "authority.closed":
       return hasExactKeys(value, ["type", "requestId"]);

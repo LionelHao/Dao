@@ -454,12 +454,13 @@ async function createCommandMatrixFixture(databasePath: string): Promise<{
       '2026-08-10T14:03:00.000Z', NULL, NULL
     );
     INSERT INTO open_items (
-      id, room_id, source_message_id, assigned_actor_id, status, body,
-      created_at, resolved_at, requester_actor_id, transfer_chain_json, responded_at
+      id, room_id, source_message_id, current_owner_actor_id, status, body,
+      created_at, responded_at, requester_actor_id, transfer_chain_json,
+      origin_kind, proposal_kind, source_execution_id, proposal_reason
     ) VALUES (
       'matrix-open-existing', 'room-matrix', 'matrix-human-source', 'agent-review',
-      'pending_response', 'respond to this', '2026-08-10T14:04:00.000Z', NULL,
-      'human-li', '[]', NULL
+      'awaiting', 'respond to this', '2026-08-10T14:04:00.000Z', NULL,
+      'human-li', '[]', 'manual_unfinished', NULL, NULL, NULL
     );
   `);
   database.close();
@@ -1466,8 +1467,9 @@ describe("SQLite authoritative sessions", () => {
         type: "open-item.create",
         roomId: "room-facts",
         payload: {
+          creationKind: "manual_unfinished",
           sourceMessageId: "message-human-source",
-          ownerId: "agent-review",
+          targetActorId: "agent-review",
           content: "Review the authoritative result",
         },
       } as const;
@@ -1494,7 +1496,7 @@ describe("SQLite authoritative sessions", () => {
       const transitionCommand = {
         type: "open-item.transition",
         roomId: "room-facts",
-        payload: { itemId: created.aggregateId, action: "respond" },
+        payload: { itemId: created.aggregateId, action: "answer" },
       } as const;
       const agentContext = mintInternalAgentCommandContext({
         agentId: "agent-review",
@@ -1529,14 +1531,14 @@ describe("SQLite authoritative sessions", () => {
       const database = new DatabaseSync(databasePath, { readOnly: true });
       const item = database.prepare(
         `SELECT status, requester_actor_id AS requesterId,
-                assigned_actor_id AS ownerId, transfer_chain_json AS transferChain,
+                current_owner_actor_id AS currentOwnerId, transfer_chain_json AS transferChain,
                 responded_at AS respondedAt
          FROM open_items`,
       ).get();
       expect(item).toEqual({
-        status: "responded",
+        status: "answered",
         requesterId: "human-li",
-        ownerId: "agent-review",
+        currentOwnerId: null,
         transferChain: "[]",
         respondedAt: "1970-01-01T00:00:03.000Z",
       });
@@ -1545,6 +1547,180 @@ describe("SQLite authoritative sessions", () => {
       ).get()).toEqual({ count: 2 });
       expect(database.prepare("SELECT COUNT(*) AS count FROM open_items").get())
         .toEqual({ count: 1 });
+      database.close();
+    });
+
+    it("keeps human requests, Agent proposals, permissions, failures, and terminal CAS closed", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-open-item-closed-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createAgentFactFixture(databasePath);
+      const humanMention = await fixture.authority.executeHuman(
+        { ...fixture.humanContext, requestId: "human-mention", idempotencyKey: "human-mention" },
+        { type: "open-item.create", roomId: "room-facts", payload: {
+          creationKind: "human_mention", sourceMessageId: "message-human-source",
+          targetActorId: "human-li", content: "Human-only request",
+        } },
+      );
+      await expect(fixture.authority.executeHuman(
+        { ...fixture.humanContext, requestId: "human-mention-agent", idempotencyKey: "human-mention-agent" },
+        { type: "open-item.create", roomId: "room-facts", payload: {
+          creationKind: "human_mention", sourceMessageId: "message-human-source",
+          targetActorId: "agent-review", content: "Must not turn an Agent invocation into a request",
+        } },
+      )).rejects.toMatchObject({ status: 400, code: "invalid_request" });
+      const afterHumanMention = new DatabaseSync(databasePath, { readOnly: true });
+      expect(afterHumanMention.prepare("SELECT COUNT(*) AS count FROM open_items").get())
+        .toEqual({ count: 1 });
+      expect(afterHumanMention.prepare("SELECT COUNT(*) AS count FROM agent_executions").get())
+        .toEqual({ count: 0 });
+      expect(afterHumanMention.prepare(
+        "SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.open_item.changed'",
+      ).get()).toEqual({ count: 1 });
+      expect(afterHumanMention.prepare(
+        "SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.agent_execution.changed'",
+      ).get()).toEqual({ count: 0 });
+      afterHumanMention.close();
+
+      const agentContext = (requestId: string) => mintInternalAgentCommandContext({
+        agentId: "agent-review", requestId, idempotencyKey: requestId,
+      });
+      const runningCommand = { type: "agent.execution.transition", roomId: "room-facts", payload: {
+        executionId: "execution-open-item", sourceMessageId: "message-human-source",
+        toolName: "review.read", status: "running",
+      } } as const;
+      await fixture.authority.executeAgent(agentContext("execution-open-item-running"), runningCommand);
+      const afterAgentInvocation = new DatabaseSync(databasePath, { readOnly: true });
+      expect(afterAgentInvocation.prepare("SELECT COUNT(*) AS count FROM open_items").get())
+        .toEqual({ count: 1 });
+      expect(afterAgentInvocation.prepare("SELECT COUNT(*) AS count FROM agent_executions").get())
+        .toEqual({ count: 1 });
+      expect(afterAgentInvocation.prepare(
+        "SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.open_item.changed'",
+      ).get()).toEqual({ count: 1 });
+      expect(afterAgentInvocation.prepare(
+        "SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.agent_execution.changed'",
+      ).get()).toEqual({ count: 1 });
+      afterAgentInvocation.close();
+      const proposalCommand = { type: "open-item.propose", roomId: "room-facts", payload: {
+        proposalKind: "risk", targetActorId: "agent-review",
+        sourceExecutionId: "execution-open-item", sourceMessageId: "message-human-source",
+        reason: "Authoritative review found a risk", content: "Resolve the identified risk",
+      } } as const;
+      const proposed = await fixture.authority.executeAgent(agentContext("proposal-open-item"), proposalCommand);
+      await expect(fixture.authority.executeAgent(
+        mintInternalAgentCommandContext({
+          agentId: "agent-review", requestId: "proposal-replay", idempotencyKey: "proposal-open-item",
+        }),
+        proposalCommand,
+      )).resolves.toEqual(proposed);
+      await expect(fixture.authority.executeAgent(agentContext("proposal-forged-provenance"), {
+        ...proposalCommand,
+        payload: { ...proposalCommand.payload, sourceExecutionId: "execution-missing" },
+      })).rejects.toMatchObject({ status: 403, code: "permission_denied" });
+      await fixture.authority.executeAgent(agentContext("execution-open-item-failed"), {
+        ...runningCommand, payload: { ...runningCommand.payload, status: "failed" },
+      });
+      const failureCommand = { type: "open-item.agent-failure.record", roomId: "room-facts", payload: {
+        itemId: proposed.aggregateId, executionId: "execution-open-item",
+        attemptSeq: 1, reasonCode: "legacy_failure",
+      } } as const;
+      const failure = await fixture.authority.executeAgent(agentContext("proposal-failure"), failureCommand);
+      await expect(fixture.authority.executeAgent(
+        mintInternalAgentCommandContext({
+          agentId: "agent-review", requestId: "proposal-failure-replay", idempotencyKey: "proposal-failure",
+        }),
+        failureCommand,
+      )).resolves.toEqual(failure);
+      await expect(fixture.authority.executeAgent(agentContext("agent-cannot-defer"), {
+        type: "open-item.transition", roomId: "room-facts",
+        payload: { itemId: proposed.aggregateId, action: "defer", reason: "forbidden" },
+      })).rejects.toMatchObject({ status: 403, code: "permission_denied" });
+
+      const manual = await fixture.authority.executeHuman(
+        { ...fixture.humanContext, requestId: "manual-item", idempotencyKey: "manual-item" },
+        { type: "open-item.create", roomId: "room-facts", payload: {
+          creationKind: "manual_unfinished", sourceMessageId: "message-human-source",
+          targetActorId: "agent-review", content: "This is unfinished",
+        } },
+      );
+      await expect(fixture.authority.executeAgent(agentContext("manual-agent-cannot-transfer"), {
+        type: "open-item.transition", roomId: "room-facts", payload: {
+          itemId: manual.aggregateId, action: "transfer", targetActorId: "human-li", reason: "forbidden",
+        },
+      })).rejects.toMatchObject({ status: 403, code: "permission_denied" });
+      await expect(fixture.authority.executeHuman(
+        {
+          ...fixture.humanContext,
+          requestId: "manual-requester-cannot-answer-for-owner",
+          idempotencyKey: "manual-requester-cannot-answer-for-owner",
+        },
+        { type: "open-item.transition", roomId: "room-facts", payload: {
+          itemId: manual.aggregateId, action: "cannot_answer", reason: "Requester is not the owner",
+        } },
+      )).rejects.toMatchObject({ status: 403, code: "permission_denied" });
+      const transferred = await fixture.authority.executeHuman(
+        { ...fixture.humanContext, requestId: "manual-transfer", idempotencyKey: "manual-transfer" },
+        { type: "open-item.transition", roomId: "room-facts", payload: {
+          itemId: manual.aggregateId, action: "transfer", targetActorId: "human-li", reason: "Requester takes it back",
+        } },
+      );
+      expect(transferred.result).toMatchObject({ item: {
+        status: "transferred", currentOwnerId: "human-li",
+        transferChain: [{ fromId: "agent-review", toId: "human-li" }],
+      } });
+      await fixture.authority.executeHuman(
+        { ...fixture.humanContext, requestId: "manual-answer", idempotencyKey: "manual-answer" },
+        { type: "open-item.transition", roomId: "room-facts", payload: {
+          itemId: manual.aggregateId, action: "answer",
+        } },
+      );
+      await expect(fixture.authority.executeHuman(
+        { ...fixture.humanContext, requestId: "manual-answer-again", idempotencyKey: "manual-answer-again" },
+        { type: "open-item.transition", roomId: "room-facts", payload: {
+          itemId: manual.aggregateId, action: "answer",
+        } },
+      )).rejects.toMatchObject({ status: 409, code: "execution_conflict" });
+      await fixture.client.close();
+
+      const removal = new DatabaseSync(databasePath);
+      removal.prepare(
+        "DELETE FROM room_memberships WHERE room_id = 'room-facts' AND actor_id = 'human-li'",
+      ).run();
+      removal.close();
+      const removedClient = await createWorkerDatabaseClient({ databasePath });
+      const removedAuthority = createSqliteAuthoritativeStore(removedClient, { clock: () => 4_000 });
+      await expect(removedAuthority.executeHuman(
+        { ...fixture.humanContext, requestId: "removed-owner-answer", idempotencyKey: "removed-owner-answer" },
+        { type: "open-item.transition", roomId: "room-facts", payload: {
+          itemId: humanMention.aggregateId, action: "answer",
+        } },
+      )).rejects.toMatchObject({ status: 403, code: "room_forbidden" });
+      await removedClient.close();
+
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM open_items").get()).toEqual({ count: 3 });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM agent_executions").get()).toEqual({ count: 1 });
+      expect(database.prepare(
+        "SELECT status, current_owner_actor_id AS currentOwnerId FROM open_items WHERE id = ?",
+      ).get(proposed.aggregateId)).toEqual({ status: "awaiting", currentOwnerId: "agent-review" });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM open_item_agent_failures").get())
+        .toEqual({ count: 1 });
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.open_item.agent_attempt_failed'",
+      ).get()).toEqual({ count: 1 });
+      expect(database.prepare(
+        "SELECT status, current_owner_actor_id AS currentOwnerId FROM open_items WHERE id = ?",
+      ).get(manual.aggregateId)).toEqual({ status: "answered", currentOwnerId: null });
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.open_item.changed'",
+      ).get()).toEqual({ count: 5 });
+      expect(humanMention.aggregateId).not.toBe(proposed.aggregateId);
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM messages WHERE id = 'message-human-source'",
+      ).get()).toEqual({ count: 1 });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM open_items WHERE id = ?")
+        .get(humanMention.aggregateId)).toEqual({ count: 1 });
       database.close();
     });
   });
@@ -1915,24 +2091,24 @@ describe("SQLite authoritative sessions", () => {
         "SELECT COUNT(*) AS count FROM open_items WHERE body = 'matrix open item'",
         ({ roomId }) => ({
           type: "open-item.create", roomId,
-          payload: { sourceMessageId: "matrix-human-source", ownerId: "human-chen", content: "matrix open item" },
+          payload: { creationKind: "manual_unfinished", sourceMessageId: "matrix-human-source", targetActorId: "human-chen", content: "matrix open item" },
         }),
         ({ roomId }) => ({
           type: "open-item.create", roomId,
-          payload: { sourceMessageId: "matrix-human-source", ownerId: "human-chen", content: "matrix changed item" },
+          payload: { creationKind: "manual_unfinished", sourceMessageId: "matrix-human-source", targetActorId: "human-chen", content: "matrix changed item" },
         }),
       ),
       agentMatrixCase(
         "open-item.transition",
         "room.open_item.changed",
-        "SELECT COUNT(*) AS count FROM open_items WHERE id = 'matrix-open-existing' AND status = 'responded'",
+        "SELECT COUNT(*) AS count FROM open_items WHERE id = 'matrix-open-existing' AND status = 'answered'",
         ({ roomId }) => ({
           type: "open-item.transition", roomId,
-          payload: { itemId: "matrix-open-existing", action: "respond" },
+          payload: { itemId: "matrix-open-existing", action: "answer" },
         }),
         ({ roomId }) => ({
           type: "open-item.transition", roomId,
-          payload: { itemId: "matrix-open-existing", action: "defer" },
+          payload: { itemId: "matrix-open-existing", action: "defer", reason: "matrix changed reason" },
         }),
       ),
       agentMatrixCase(

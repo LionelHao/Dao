@@ -75,6 +75,36 @@ describe("OpenAI Responses production adapter", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it("declares the reserved closed OpenItem proposal function only with authoritative targets", async () => {
+    const fetch = vi.fn(async () => streamResponse("done"));
+    const provider = createOpenAIResponsesProvider({
+      endpoint: "https://api.openai.com/v1/responses", model: "configured-model",
+      secretProvider: { getSecret: () => "server-secret" }, fetch,
+    });
+    for await (const _event of provider.stream({
+      ...input,
+      openItemTargets: [
+        { actorId: "human-reviewer", kind: "human" },
+        { actorId: "agent-security", kind: "agent" },
+      ],
+    }, new AbortController().signal)) void _event;
+    const body = JSON.parse(String(fetch.mock.calls[0]![1].body)) as {
+      readonly tools: readonly { readonly name: string; readonly parameters: Record<string, unknown> }[];
+    };
+    const proposal = body.tools.find((tool) => tool.name === "dao_propose_open_item");
+    expect(proposal).toMatchObject({
+      parameters: {
+        required: ["proposalKind", "targetActorId", "sourceMessageId", "reason", "content"],
+        additionalProperties: false,
+        properties: {
+          proposalKind: { enum: ["risk", "challenge"] },
+          targetActorId: { enum: ["human-reviewer", "agent-security"] },
+          sourceMessageId: { enum: ["message-1"] },
+        },
+      },
+    });
+  });
+
   it("maps HTTP errors to closed codes without response bodies, headers, or secrets", async () => {
     const sentinel = "sk-sentinel-closed-error-51b";
     const provider = createOpenAIResponsesProvider({

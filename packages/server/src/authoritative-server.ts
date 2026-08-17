@@ -30,6 +30,7 @@ import { createToolGateway } from "./agent-runtime/tool-gateway.js";
 import { createOpenAIRouterProvider } from "./route-runtime/openai-router-provider.js";
 import { createRouteRuntimeService, type RouteRuntimeService } from "./route-runtime/route-runtime-service.js";
 import { createWorkerRouteAuthority } from "./route-runtime/worker-route-authority.js";
+import { mintInternalAgentCommandContext } from "./persistence/contracts.js";
 
 export interface AuthoritativeServer {
   readonly url: string;
@@ -264,6 +265,7 @@ async function start(
           invocation: intent,
           visibleConversation: runtimeContext.visibleConversation,
           availableTools: tools.map((tool) => tool.descriptor).filter((tool) => allowed.has(tool.id)),
+          openItemTargets: runtimeContext.openItemTargets,
           committedSteps: [],
           limits: { maxInputBytes: 256 * 1_024, maxOutputBytes: 256 * 1_024, timeoutMs: 30_000 },
         };
@@ -275,6 +277,25 @@ async function start(
         if (execution.resultMessageId !== undefined) {
           routeRuntime?.notify(execution.roomId, execution.resultMessageId);
         }
+      },
+      async proposeOpenItem(input) {
+        const item = await primitives.proposeOpenItem(
+          mintInternalAgentCommandContext({
+            agentId: input.execution.agentId,
+            requestId: `runtime-open-item:${input.execution.id}:${input.callId}`,
+            idempotencyKey: `runtime-open-item:${input.execution.id}:${input.callId}`,
+          }),
+          input.execution.roomId,
+          {
+            proposalKind: input.proposalKind,
+            targetActorId: input.targetActorId,
+            sourceExecutionId: input.execution.id,
+            sourceMessageId: input.sourceMessageId,
+            reason: input.reason,
+            content: input.content,
+          },
+        );
+        return { id: item.id };
       },
     });
     await runtime.recover();
@@ -324,6 +345,7 @@ async function start(
       outboxStore,
       outboxPollIntervalMs: 10,
       agentRuntime: runtime,
+      collaboration: primitives,
     });
   } catch (error: unknown) {
     await transport?.close().catch(() => undefined);

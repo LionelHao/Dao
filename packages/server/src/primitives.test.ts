@@ -160,8 +160,9 @@ describe("T-0012 read receipts and agent judgements", () => {
     };
     const item = {
       id: "open-item-1", roomId: room.id, sourceMessageId: humanMessage.id,
-      requesterId: "human-lionel", ownerId: "human-zhou", content: "确认权限边界",
-      status: "pending_response" as const, createdAt: "2026-08-07T09:02:00.000Z",
+      requesterId: "human-lionel", currentOwnerId: "human-zhou", content: "确认权限边界",
+      status: "awaiting" as const, origin: { kind: "human_mention" as const },
+      createdAt: "2026-08-07T09:02:00.000Z",
       transferChain: [],
     };
     const execution = {
@@ -192,7 +193,7 @@ describe("T-0012 read receipts and agent judgements", () => {
       async executeAgent(_context, command: AgentCollaborationCommand) {
         commands.push(`agent:${command.type}`);
         if (command.type === "agent.judgment.record") return acknowledgement({ judgment });
-        if (command.type === "open-item.create" || command.type === "open-item.transition") return acknowledgement({ item });
+        if (command.type === "open-item.propose" || command.type === "open-item.transition") return acknowledgement({ item });
         if (command.type === "agent.execution.transition") return acknowledgement({ execution });
         throw new Error("unexpected Agent command");
       },
@@ -207,10 +208,11 @@ describe("T-0012 read receipts and agent judgements", () => {
       messageId: humanMessage.id, outcome: "will_respond", reason: "命中领域",
     });
     await primitives.createOpenItem(humanContext, room.id, {
-      sourceMessageId: humanMessage.id, ownerId: "human-zhou", content: "确认权限边界",
+      creationKind: "human_mention", sourceMessageId: humanMessage.id,
+      targetActorId: "human-zhou", content: "确认权限边界",
     });
     await primitives.transitionOpenItem(agentContext, room.id, {
-      itemId: item.id, action: "respond",
+      itemId: item.id, action: "answer",
     });
     await primitives.transitionAgentExecution(agentContext, room.id, {
       executionId: execution.id, sourceMessageId: humanMessage.id,
@@ -349,7 +351,7 @@ describe("T-0013 request and invocation addressing", () => {
     const transferred = primitives.transferOpenItem(openItem.id, "human-chen", "周安全本周不在岗");
     expect(transferred).toMatchObject({
       status: "transferred",
-      ownerId: "human-chen",
+      currentOwnerId: "human-chen",
       transferChain: [expect.objectContaining({ fromId: "human-zhou", toId: "human-chen" })],
     });
 

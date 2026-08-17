@@ -16,7 +16,17 @@ export interface AgentJudgement {
   readonly decidedAt: string;
 }
 
-export type OpenItemStatus = "pending_response" | "responded" | "deferred" | "transferred";
+export type OpenItemStatus = "awaiting" | "answered" | "deferred" | "transferred";
+
+export type OpenItemOrigin =
+  | { readonly kind: "human_mention" }
+  | { readonly kind: "manual_unfinished" }
+  | {
+      readonly kind: "agent_proposal";
+      readonly proposalKind: "risk" | "challenge";
+      readonly sourceExecutionId: string;
+      readonly reason: string;
+    };
 
 export interface OpenItemTransfer {
   readonly fromId: string;
@@ -30,12 +40,22 @@ export interface OpenItem {
   readonly roomId: string;
   readonly sourceMessageId: string;
   readonly requesterId: string;
-  readonly ownerId: string;
+  readonly currentOwnerId: string | null;
   readonly content: string;
   readonly status: OpenItemStatus;
+  readonly origin: OpenItemOrigin;
   readonly createdAt: string;
   readonly respondedAt?: string;
   readonly transferChain: readonly OpenItemTransfer[];
+}
+
+export interface OpenItemAgentFailure {
+  readonly id: string;
+  readonly openItemId: string;
+  readonly executionId: string;
+  readonly attemptSeq: number;
+  readonly reasonCode: string;
+  readonly failedAt: string;
 }
 
 export type AgentExecutionStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
@@ -126,10 +146,14 @@ export interface AgentRuntimeProviderInput {
     readonly body: string;
   }[];
   readonly availableTools: readonly ToolDescriptor[];
+  readonly openItemTargets?: readonly {
+    readonly actorId: string;
+    readonly kind: "human" | "agent";
+  }[];
   readonly committedSteps: readonly ProviderNeutralCheckpoint[];
   readonly toolContinuations?: readonly {
     readonly callId: string;
-    readonly toolId: ToolDescriptor["id"];
+    readonly toolId: ToolDescriptor["id"] | "open-item.propose";
     readonly argumentsJson: string;
     readonly modelInput: string;
   }[];
@@ -431,24 +455,59 @@ function isOpenItemTransfer(value: unknown): value is OpenItemTransfer {
     isNonEmptyString(value.transferredAt);
 }
 
+function isOpenItemOrigin(value: unknown): value is OpenItemOrigin {
+  if (!isRecord(value) || !isNonEmptyString(value.kind)) return false;
+  if (value.kind === "human_mention" || value.kind === "manual_unfinished") {
+    return hasExactKeys(value, ["kind"]);
+  }
+  return value.kind === "agent_proposal" &&
+    hasExactKeys(value, ["kind", "proposalKind", "sourceExecutionId", "reason"]) &&
+    (value.proposalKind === "risk" || value.proposalKind === "challenge") &&
+    isNonEmptyString(value.sourceExecutionId) && isNonEmptyString(value.reason);
+}
+
 export function isOpenItem(value: unknown): value is OpenItem {
-  return isRecord(value) &&
+  if (!isRecord(value) ||
     hasExactKeys(
       value,
-      ["id", "roomId", "sourceMessageId", "requesterId", "ownerId", "content", "status", "createdAt", "transferChain"],
+      ["id", "roomId", "sourceMessageId", "requesterId", "currentOwnerId", "content", "status", "origin", "createdAt", "transferChain"],
       ["respondedAt"],
-    ) &&
-    isNonEmptyString(value.id) &&
-    isNonEmptyString(value.roomId) &&
-    isNonEmptyString(value.sourceMessageId) &&
-    isNonEmptyString(value.requesterId) &&
-    isNonEmptyString(value.ownerId) &&
-    isNonEmptyString(value.content) &&
-    (value.status === "pending_response" || value.status === "responded" || value.status === "deferred" || value.status === "transferred") &&
-    isNonEmptyString(value.createdAt) &&
-    (!Object.hasOwn(value, "respondedAt") || isNonEmptyString(value.respondedAt)) &&
-    Array.isArray(value.transferChain) &&
-    value.transferChain.every(isOpenItemTransfer);
+    ) === false ||
+    !isNonEmptyString(value.id) ||
+    !isNonEmptyString(value.roomId) ||
+    !isNonEmptyString(value.sourceMessageId) ||
+    !isNonEmptyString(value.requesterId) ||
+    !(value.currentOwnerId === null || isNonEmptyString(value.currentOwnerId)) ||
+    !isNonEmptyString(value.content) ||
+    !(value.status === "awaiting" || value.status === "answered" || value.status === "deferred" || value.status === "transferred") ||
+    !isOpenItemOrigin(value.origin) ||
+    !isNonEmptyString(value.createdAt) ||
+    !Array.isArray(value.transferChain) ||
+    !value.transferChain.every(isOpenItemTransfer)) {
+    return false;
+  }
+  const terminal = value.status === "answered" || value.status === "deferred";
+  if (terminal !== (value.currentOwnerId === null)) return false;
+  if (terminal !== Object.hasOwn(value, "respondedAt") ||
+      (terminal && !isNonEmptyString(value.respondedAt))) return false;
+  if (value.status === "awaiting" && value.transferChain.length !== 0) return false;
+  if (value.status === "transferred") {
+    const last = value.transferChain.at(-1);
+    if (last === undefined || last.toId !== value.currentOwnerId) return false;
+  }
+  for (let index = 1; index < value.transferChain.length; index += 1) {
+    if (value.transferChain[index - 1]!.toId !== value.transferChain[index]!.fromId) return false;
+  }
+  return true;
+}
+
+export function isOpenItemAgentFailure(value: unknown): value is OpenItemAgentFailure {
+  return isRecord(value) && hasExactKeys(value, [
+    "id", "openItemId", "executionId", "attemptSeq", "reasonCode", "failedAt",
+  ]) && isNonEmptyString(value.id) && isNonEmptyString(value.openItemId) &&
+    isNonEmptyString(value.executionId) && Number.isSafeInteger(value.attemptSeq) &&
+    (value.attemptSeq as number) >= 1 && isNonEmptyString(value.reasonCode) &&
+    isNonEmptyString(value.failedAt);
 }
 
 export function isAgentExecution(value: unknown): value is AgentExecution {

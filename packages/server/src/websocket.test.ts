@@ -666,6 +666,85 @@ afterEach(async () => {
 });
 
 describe("authenticated message WebSocket service", () => {
+  it("routes closed T-0017 human OpenItem frames and preserves 403/409 API errors", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "open-item-api");
+    const sessionContext = {
+      sessionId: "session-open-item-api", sessionFamilyId: "family-open-item-api", principal,
+    };
+    const auth: AuthenticationService = {
+      async login() { return session; },
+      async authenticate() { return principal; },
+      async authenticateSession() { return sessionContext; },
+      async refresh() { return session; },
+      async revoke() {},
+    };
+    const service: MessageService = {
+      async send(_context, message) {
+        return { type: "message.accepted", requestId: message.id, messageId: message.id,
+          persistedAt: "2026-08-12T00:00:00.000Z" };
+      },
+      subscribe() { return () => undefined; },
+      async history() { return []; },
+    };
+    const awaitingItem = {
+      id: "item-api", roomId, sourceMessageId: "message-source", requesterId: humans[0].id,
+      currentOwnerId: humans[1].id, content: "请确认", status: "awaiting" as const,
+      origin: { kind: "human_mention" as const }, createdAt: "2026-08-12T00:00:00.000Z",
+      transferChain: [],
+    };
+    const createOpenItem = vi.fn(async () => awaitingItem);
+    const transitionOpenItem = vi.fn(async (_context, _room: string, payload: { readonly itemId: string }) => {
+      if (payload.itemId === "forbidden") {
+        throw Object.assign(new Error("closed"), { status: 403, code: "permission_denied" });
+      }
+      if (payload.itemId === "terminal") {
+        throw Object.assign(new Error("closed"), { status: 409, code: "execution_conflict" });
+      }
+      return { ...awaitingItem, currentOwnerId: null, status: "answered" as const,
+        respondedAt: "2026-08-12T00:01:00.000Z" };
+    });
+    const server = await startMessageWebSocketServer({
+      auth, service, collaboration: { createOpenItem, transitionOpenItem },
+    });
+    const client = await LoopbackClient.connect(server.url);
+    try {
+      await client.login(humans[0]);
+      client.send({
+        type: "open-item.create", requestId: "open-create", roomId,
+        creationKind: "human_mention", sourceMessageId: "message-source",
+        targetActorId: humans[1].id, content: "请确认",
+      });
+      await expect(client.waitForFrame(
+        (frame) => hasType(frame, "open-item.ack") && frame.requestId === "open-create",
+        "open item acknowledgement",
+      )).resolves.toMatchObject({ frame: { item: { id: "item-api", status: "awaiting" } } });
+      expect(createOpenItem).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "human", principal, requestId: "open-create" }),
+        roomId,
+        { creationKind: "human_mention", sourceMessageId: "message-source",
+          targetActorId: humans[1].id, content: "请确认" },
+      );
+
+      client.send({ type: "open-item.transition", requestId: "open-forbidden", roomId,
+        itemId: "forbidden", action: "answer" });
+      await expect(client.waitForError("permission_denied", "open-forbidden"))
+        .resolves.toMatchObject({ frame: { status: 403 } });
+      client.send({ type: "open-item.transition", requestId: "open-terminal", roomId,
+        itemId: "terminal", action: "answer" });
+      await expect(client.waitForError("execution_conflict", "open-terminal"))
+        .resolves.toMatchObject({ frame: { status: 409 } });
+      expect(transitionOpenItem.mock.calls.map(([context]) => context.idempotencyKey))
+        .toEqual([
+          "open-item.transition:open-forbidden",
+          "open-item.transition:open-terminal",
+        ]);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
   it("bounds stalled loopback connect, close, and close-wait listeners", async () => {
     const stalledConnect = await createStalledWebSocketPeer(false);
     try {

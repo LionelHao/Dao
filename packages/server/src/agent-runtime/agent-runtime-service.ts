@@ -51,6 +51,15 @@ interface AgentRuntimeServiceOptions {
     readonly delta: string;
   }) => void;
   readonly onMessageCommitted?: (execution: AgentExecution) => void;
+  readonly proposeOpenItem?: (input: {
+    readonly execution: AgentExecution;
+    readonly callId: string;
+    readonly proposalKind: "risk" | "challenge";
+    readonly targetActorId: string;
+    readonly sourceMessageId: string;
+    readonly reason: string;
+    readonly content: string;
+  }) => Promise<{ readonly id: string }>;
 }
 
 interface RuntimeJob {
@@ -59,7 +68,7 @@ interface RuntimeJob {
   readonly context: AuthenticatedCommandContext | InternalAgentCommandContext | undefined;
   readonly toolContinuations: {
     callId: string;
-    toolId: ToolDescriptor["id"];
+    toolId: ToolDescriptor["id"] | "open-item.propose";
     argumentsJson: string;
     modelInput: string;
   }[];
@@ -88,6 +97,30 @@ const productionClock: RuntimeClock = {
     });
   },
 };
+
+const OPEN_ITEM_PROPOSAL_FUNCTION = "dao_propose_open_item";
+
+function closedOpenItemProposal(value: unknown): value is {
+  readonly proposalKind: "risk" | "challenge";
+  readonly targetActorId: string;
+  readonly sourceMessageId: string;
+  readonly reason: string;
+  readonly content: string;
+} {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  return keys.length === 5 && keys.join("\0") === [
+    "content", "proposalKind", "reason", "sourceMessageId", "targetActorId",
+  ].join("\0") &&
+    (record.proposalKind === "risk" || record.proposalKind === "challenge") &&
+    typeof record.targetActorId === "string" && record.targetActorId.length > 0 &&
+    typeof record.sourceMessageId === "string" && record.sourceMessageId.length > 0 &&
+    typeof record.reason === "string" && record.reason.trim().length > 0 &&
+    Buffer.byteLength(record.reason, "utf8") <= 2_048 &&
+    typeof record.content === "string" && record.content.trim().length > 0 &&
+    Buffer.byteLength(record.content, "utf8") <= 32_768;
+}
 
 function validateLimits(limits: RuntimeLimits): void {
   if (!Number.isSafeInteger(limits.maxActive) || limits.maxActive < 1 || limits.maxActive > AGENT_RUNTIME_MAX_ACTIVE ||
@@ -223,13 +256,34 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
           tool.id.replaceAll(".", "_").replaceAll("-", "_"), tool,
         ]));
         for (const [callId, call] of toolCalls) {
-          const tool = toolsByName.get(call.toolName);
           let parameters: unknown;
           try {
             parameters = JSON.parse(call.argumentsJson);
           } catch {
             throw new AgentRuntimeError("provider_malformed", "Provider tool arguments were malformed");
           }
+          if (call.toolName === OPEN_ITEM_PROPOSAL_FUNCTION) {
+            if (options.proposeOpenItem === undefined || !closedOpenItemProposal(parameters) ||
+                parameters.sourceMessageId !== claimed.sourceMessageId ||
+                !input.openItemTargets?.some((target) => target.actorId === parameters.targetActorId)) {
+              throw new AgentRuntimeError("provider_malformed", "Provider OpenItem proposal was rejected");
+            }
+            const item = await options.proposeOpenItem({
+              execution: claimed, callId, ...parameters,
+            });
+            const modelInput = `OpenItem ${item.id} was authoritatively created.`;
+            const stepSeq = job.toolContinuations.length + 1;
+            await options.authority.checkpoint(
+              claimed.id, claimed.currentAttemptSeq, stepSeq, "tool",
+              createHash("sha256").update(call.argumentsJson).digest("hex"),
+              createHash("sha256").update(modelInput).digest("hex"),
+            );
+            job.toolContinuations.push({
+              callId, toolId: "open-item.propose", argumentsJson: call.argumentsJson, modelInput,
+            });
+            continue;
+          }
+          const tool = toolsByName.get(call.toolName);
           if (tool === undefined || typeof parameters !== "object" || parameters === null || Array.isArray(parameters)) {
             throw new AgentRuntimeError("provider_malformed", "Provider tool plan was rejected");
           }

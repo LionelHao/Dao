@@ -87,6 +87,13 @@ describe("real AuthorityWorker runtime authority", () => {
         sourceMessageId: "message-runtime-1",
         targetAgentId: "agent-runtime",
       }, "openai-responses", "configured-model");
+      await expect(authority.readContext(first.execution.id)).resolves.toMatchObject({
+        openItemTargets: [
+          { actorId: "agent-git", kind: "agent" },
+          { actorId: "agent-runtime", kind: "agent" },
+          { actorId: "human-runtime", kind: "human" },
+        ],
+      });
       const runningFirst = await authority.claim(first.execution.id, 1);
       const completed = await authority.complete(runningFirst.id, 1, "durable answer");
       expect(completed).toMatchObject({ status: "completed", currentAttemptSeq: 1 });
@@ -288,6 +295,13 @@ describe("real AuthorityWorker runtime authority", () => {
       });
       expect(gitOutcome.summary).toMatchObject({ exitCategory: "success" });
 
+      const openItem = await createSqliteAuthoritativeStore(client).executeHuman(
+        { ...context, requestId: "request-open-item-failure", idempotencyKey: "key-open-item-failure" },
+        { type: "open-item.create", roomId: "room-runtime", payload: {
+          creationKind: "manual_unfinished", sourceMessageId: "message-runtime-5",
+          targetActorId: "agent-runtime", content: "Agent must retain this commitment on failure",
+        } },
+      );
       const fifth = await authority.invoke(
         { ...context, requestId: "request-runtime-5", idempotencyKey: "key-runtime-5" },
         { kind: "direct_mention", roomId: "room-runtime", sourceMessageId: "message-runtime-5", targetAgentId: "agent-runtime" },
@@ -321,6 +335,23 @@ describe("real AuthorityWorker runtime authority", () => {
         retryOrdinal: 3,
         terminalErrorCode: "provider_unavailable",
       });
+      const failedItem = new DatabaseSync(databasePath, { readOnly: true });
+      expect(failedItem.prepare(
+        `SELECT status, current_owner_actor_id AS currentOwnerId
+         FROM open_items WHERE id = ?`,
+      ).get(openItem.aggregateId)).toEqual({ status: "awaiting", currentOwnerId: "agent-runtime" });
+      expect(failedItem.prepare(
+        `SELECT failure.execution_id AS executionId, failure.attempt_seq AS attemptSeq,
+                failure.reason_code AS reasonCode
+         FROM open_item_agent_failures AS failure WHERE failure.open_item_id = ?`,
+      ).get(openItem.aggregateId)).toEqual({
+        executionId: fifth.execution.id, attemptSeq: 3, reasonCode: "provider_unavailable",
+      });
+      expect(failedItem.prepare(
+        `SELECT COUNT(*) AS count FROM events
+         WHERE event_type = 'room.open_item.agent_attempt_failed'`,
+      ).get()).toEqual({ count: 1 });
+      failedItem.close();
       const manualRetry = await authority.retry(
         { ...context, requestId: "request-manual-retry", idempotencyKey: "key-manual-retry" },
         deadLettered.id,

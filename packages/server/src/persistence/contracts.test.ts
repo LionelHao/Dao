@@ -23,12 +23,31 @@ const acceptedCommands: readonly unknown[] = [
   {
     type: "open-item.create",
     roomId: "room-1",
-    payload: { sourceMessageId: "message-1", ownerId: "human-2", content: "请确认" },
+    payload: {
+      creationKind: "human_mention", sourceMessageId: "message-1",
+      targetActorId: "human-2", content: "请确认",
+    },
+  },
+  {
+    type: "open-item.propose",
+    roomId: "room-1",
+    payload: {
+      proposalKind: "risk", targetActorId: "human-2", sourceExecutionId: "execution-1",
+      sourceMessageId: "message-1", reason: "存在数据风险", content: "请确认风险",
+    },
   },
   {
     type: "open-item.transition",
     roomId: "room-1",
-    payload: { itemId: "item-1", action: "transfer", targetId: "human-3", reason: "转交" },
+    payload: { itemId: "item-1", action: "transfer", targetActorId: "human-3", reason: "转交" },
+  },
+  {
+    type: "open-item.agent-failure.record",
+    roomId: "room-1",
+    payload: {
+      itemId: "item-1", executionId: "execution-1", attemptSeq: 2,
+      reasonCode: "provider_timeout",
+    },
   },
   {
     type: "agent.execution.transition",
@@ -220,11 +239,25 @@ const acceptedRoomEvents: readonly unknown[] = [
       roomId: "room-1",
       sourceMessageId: "message-1",
       requesterId: "human-1",
-      ownerId: "human-2",
+      currentOwnerId: "human-2",
       content: "请确认",
-      status: "pending_response",
+      status: "awaiting",
+      origin: { kind: "human_mention" },
       createdAt: "2026-08-10T00:00:00.000Z",
       transferChain: [],
+    },
+  },
+  {
+    ...roomEventBase,
+    actorId: "agent-1",
+    type: "room.open_item.agent_attempt_failed",
+    payload: {
+      id: "open-item-failure-1",
+      openItemId: "item-1",
+      executionId: "execution-1",
+      attemptSeq: 3,
+      reasonCode: "provider_unavailable",
+      failedAt: "2026-08-10T00:01:00.000Z",
     },
   },
   {
