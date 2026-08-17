@@ -162,6 +162,13 @@ function seedClosedMixedStressRecords(
        'manual_unfinished', NULL, NULL, NULL)`,
   ).run(roomId, context.principal.actorId);
   database.prepare(
+    `INSERT INTO light_tasks (
+       id, room_id, source_message_id, title, verifier_role, criteria_json,
+       status, created_at
+     ) VALUES ('stress-light-task', ?, 'message-0000', 'stress task', 'owner', ?,
+       'todo', '2026-08-11T01:00:02.500Z')`,
+  ).run(roomId, JSON.stringify([{ id: "stress-criterion", text: "checked", met: false }]));
+  database.prepare(
     `INSERT INTO agent_executions (
        id, room_id, agent_id, trigger_message_id, status, started_at,
        completed_at, result_json, requester_actor_id, tool_name,
@@ -441,6 +448,13 @@ describe("durable materialized snapshot worker", () => {
          'manual_unfinished', NULL, NULL, NULL)`,
     ).run(context.principal.actorId);
     database.prepare(
+      `INSERT INTO light_tasks (
+         id, room_id, source_message_id, title, verifier_role, criteria_json,
+         status, created_at
+       ) VALUES ('light-task-a', 'room-mixed', 'message-human', '完成评审', 'owner', ?,
+         'todo', '2026-08-11T00:00:06.500Z')`,
+    ).run(JSON.stringify([{ id: "criterion-a", text: "评审通过", met: false }]));
+    database.prepare(
       `INSERT INTO agent_executions (
          id, room_id, agent_id, trigger_message_id, status, started_at,
          completed_at, result_json, requester_actor_id, tool_name,
@@ -478,8 +492,14 @@ describe("durable materialized snapshot worker", () => {
     expect(page.hasMore).toBe(false);
     expect(page.records.map((record) => record.kind)).toEqual([
       "room", "membership", "membership", "message", "message", "human-read",
-      "agent-judgement", "open-item", "open-item-agent-failure", "agent-execution", "calibration",
+      "agent-judgement", "open-item", "open-item-agent-failure", "light-task",
+      "agent-execution", "calibration",
     ]);
+    expect(page.records.find((record) => record.kind === "light-task"))
+      .toMatchObject({ kind: "light-task", value: {
+        id: "light-task-a", status: "todo", claimant: null, verifierRole: "owner",
+        criteria: [{ id: "criterion-a", text: "评审通过", met: false }],
+      } });
     expect(page.records.find((record) => record.kind === "open-item-agent-failure"))
       .toEqual({ kind: "open-item-agent-failure", value: {
         id: "open-failure-a", openItemId: "open-a", executionId: "execution-a",
@@ -1097,10 +1117,10 @@ describe("durable materialized snapshot worker", () => {
       expect(page.mode).toBe("streaming");
       records.push(...page.records);
     }
-    expect(records).toHaveLength(10_008);
+    expect(records).toHaveLength(10_009);
     expect(new Set(records.map((record) => record.kind))).toEqual(new Set([
       "room", "membership", "message", "human-read", "agent-judgement",
-      "open-item", "agent-execution", "calibration",
+      "open-item", "light-task", "agent-execution", "calibration",
     ]));
     expect(page0.snapshotChecksum).toBe(createHash("sha256")
       .update(canonicalJsonForTest({ kind: "room", values: records, version: 1 }), "utf8")
@@ -1294,10 +1314,10 @@ describe("durable materialized snapshot worker", () => {
         });
         records.push(...page.records);
       }
-      expect(records).toHaveLength(10_008);
+      expect(records).toHaveLength(10_009);
       expect(new Set(records.map((record) => record.kind))).toEqual(new Set([
         "room", "membership", "message", "human-read", "agent-judgement",
-        "open-item", "agent-execution", "calibration",
+        "open-item", "light-task", "agent-execution", "calibration",
       ]));
       expect(page0.snapshotChecksum).toBe(createHash("sha256")
         .update(canonicalJsonForTest({ kind: "room", values: records, version: 1 }), "utf8")

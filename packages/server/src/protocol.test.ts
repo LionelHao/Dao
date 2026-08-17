@@ -426,4 +426,35 @@ describe("closed v2 recovery protocol", () => {
       expect(parse(frame)).toMatchObject({ ok: false, error: { code: "invalid_request" } });
     }
   });
+
+  it("accepts only explicit closed T-0018 LightTask frames", () => {
+    expect(parse({
+      type: "light-task.intent", requestId: "task-intent", roomId: "room-1",
+      sourceMessageId: "message-1", text: "我来做",
+    })).toMatchObject({ ok: false, error: { code: "invalid_request" } });
+    expect(parse({
+      type: "light-task.create", requestId: "task-create", roomId: "room-1",
+      sourceMessageId: "message-1", title: "完成评审", verifierRole: "owner",
+      criteria: [{ id: "criterion-1", text: "评审通过" }],
+    })).toMatchObject({ ok: true, frame: { type: "light-task.create", verifierRole: "owner" } });
+    expect(parse({
+      type: "light-task.transition", requestId: "task-verify", roomId: "room-1",
+      taskId: "task-1", action: "verify", emptyCriteriaConfirmed: true,
+    })).toMatchObject({ ok: true, frame: { type: "light-task.transition", action: "verify" } });
+    expect(parse({
+      type: "light-task.criterion.set", requestId: "task-check", roomId: "room-1",
+      taskId: "task-1", criterionId: "criterion-1", met: true,
+    })).toMatchObject({ ok: true, frame: { type: "light-task.criterion.set", met: true } });
+    for (const injected of ["deps", "maturity", "milestone", "blueprintTaskId", "status"]) {
+      expect(parse({
+        type: "light-task.create", requestId: `task-${injected}`, roomId: "room-1",
+        sourceMessageId: "message-1", title: "完成评审", verifierRole: "owner", criteria: [],
+        [injected]: injected === "deps" ? [] : "forged",
+      })).toMatchObject({ ok: false, error: { code: "invalid_request" } });
+    }
+    expect(parse({
+      type: "light-task.transition", requestId: "task-deliver-forged", roomId: "room-1",
+      taskId: "task-1", action: "deliver", emptyCriteriaConfirmed: true,
+    })).toMatchObject({ ok: false, error: { code: "invalid_request" } });
+  });
 });

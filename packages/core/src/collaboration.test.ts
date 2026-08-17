@@ -4,6 +4,7 @@ import {
   isAgentJudgement,
   isCalibrationSignal,
   isHumanReadReceipt,
+  isLightTask,
   isOpenItem,
   isOpenItemAgentFailure,
   isRouteJob,
@@ -14,6 +15,39 @@ import {
 } from "./collaboration.js";
 
 describe("canonical collaboration records", () => {
+  it("keeps LightTask as a closed four-state fact without GBP planning fields", () => {
+    const todo = {
+      id: "task-1", roomId: "room-1", sourceMessageId: "message-1",
+      title: "Close the release checklist", claimant: null, claimantRoleAtClaim: null,
+      verifierRole: "admin", verifierActorId: null,
+      criteria: [{ id: "criterion-1", text: "All checks pass", met: false }],
+      status: "todo", createdAt: "2026-08-17T00:00:00.000Z",
+    } as const;
+    expect(isLightTask(todo)).toBe(true);
+    expect(isLightTask({ ...todo, deps: ["T-0001"] })).toBe(false);
+    expect(isLightTask({ ...todo, status: "blocked" })).toBe(false);
+    expect(isLightTask({ ...todo, claimant: "human-1" })).toBe(false);
+    const claimed = {
+      ...todo, status: "claimed", claimant: "human-1", claimantRoleAtClaim: "member",
+      claimedAt: "2026-08-17T00:01:00.000Z",
+    } as const;
+    expect(isLightTask(claimed)).toBe(true);
+    const delivered = {
+      ...claimed, status: "delivered", verifierActorId: "human-2",
+      deliveredAt: "2026-08-17T00:02:00.000Z",
+    } as const;
+    expect(isLightTask(delivered)).toBe(true);
+    expect(isLightTask({ ...delivered, verifierActorId: "human-1" })).toBe(false);
+    expect(isLightTask({ ...delivered, verifierRole: "member" })).toBe(false);
+    expect(isLightTask({ ...delivered, criteria: [{ ...delivered.criteria[0], met: true }] })).toBe(true);
+    expect(isLightTask({
+      ...delivered, status: "verified", verifiedAt: "2026-08-17T00:03:00.000Z",
+      criteria: [{ ...delivered.criteria[0], met: true }],
+    })).toBe(true);
+    expect(isLightTask({ ...delivered, status: "verified", verifiedAt: "2026-08-17T00:03:00.000Z" }))
+      .toBe(false);
+  });
+
   it("keeps human reads and agent judgements as closed, distinct records", () => {
     expect(isHumanReadReceipt({
       id: "read-1",

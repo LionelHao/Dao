@@ -12,6 +12,7 @@ import {
   isAgentJudgement,
   isCalibrationSignal,
   isHumanReadReceipt,
+  isLightTask,
   isOpenItem,
   isOpenItemAgentFailure,
   isRouteJob,
@@ -20,6 +21,7 @@ import {
   type AgentJudgement,
   type CalibrationSignal,
   type HumanReadReceipt,
+  type LightTask,
   type OpenItem,
   type OpenItemAgentFailure,
   type RouteJob,
@@ -54,6 +56,7 @@ export type RoomRepairRecord =
   | { readonly kind: "agent-judgement"; readonly value: AgentJudgement }
   | { readonly kind: "open-item"; readonly value: OpenItem }
   | { readonly kind: "open-item-agent-failure"; readonly value: OpenItemAgentFailure }
+  | { readonly kind: "light-task"; readonly value: LightTask }
   | { readonly kind: "agent-execution"; readonly value: AgentExecution }
   | { readonly kind: "route-job"; readonly value: RouteJob }
   | { readonly kind: "route-judgment"; readonly value: RouteJudgment }
@@ -160,6 +163,7 @@ export type PersistedRoomEvent =
   | RoomEvent<"room.agent_judgment.recorded", AgentJudgement>
   | RoomEvent<"room.open_item.changed", OpenItem>
   | RoomEvent<"room.open_item.agent_attempt_failed", OpenItemAgentFailure>
+  | RoomEvent<"room.light_task.changed", LightTask>
   | RoomEvent<"room.agent_execution.changed", AgentExecution>
   | RoomEvent<"room.route_judgment.recorded", RouteJudgment>
   | RoomEvent<
@@ -322,6 +326,7 @@ function isRepairRecord(value: unknown): value is RoomRepairRecord {
   if (value.kind === "agent-judgement") return isAgentJudgement(value.value);
   if (value.kind === "open-item") return isOpenItem(value.value);
   if (value.kind === "open-item-agent-failure") return isOpenItemAgentFailure(value.value);
+  if (value.kind === "light-task") return isLightTask(value.value);
   if (value.kind === "agent-execution") return isAgentExecution(value.value);
   if (value.kind === "route-job") return isRouteJob(value.value);
   if (value.kind === "route-judgment") return isRouteJudgment(value.value);
@@ -383,6 +388,9 @@ function isPersistedRoomEventValue(value: unknown): value is PersistedRoomEvent 
   }
   if (value.type === "room.open_item.agent_attempt_failed") {
     return isOpenItemAgentFailure(payload);
+  }
+  if (value.type === "room.light_task.changed") {
+    return isLightTask(payload) && payload.roomId === value.roomId;
   }
   if (value.type === "room.agent_execution.changed") {
     return isAgentExecution(payload) && payload.roomId === value.roomId && payload.agentId === value.actorId;

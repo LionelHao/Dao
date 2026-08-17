@@ -252,6 +252,75 @@ async function createAgentFactFixture(databasePath: string) {
   };
 }
 
+const lightTaskActors = [
+  { id: "human-task-owner", kind: "human", displayName: "Owner", reachability: "online" },
+  { id: "human-task-claimant", kind: "human", displayName: "Claimant", reachability: "online" },
+  { id: "human-task-admin-a", kind: "human", displayName: "Admin A", reachability: "online" },
+  { id: "human-task-admin-b", kind: "human", displayName: "Admin B", reachability: "online" },
+] as const satisfies readonly Actor[];
+
+async function createLightTaskFixture(databasePath: string) {
+  const bootstrapClient = await createWorkerDatabaseClient({ databasePath });
+  const authority = createSqliteAuthoritativeStore(bootstrapClient);
+  await authority.registerActors(lightTaskActors);
+  const identitiesByAccount = new Map(lightTaskActors.map((actor) => [
+    `account-${actor.id}`, actor.id,
+  ]));
+  const auth = createAuthenticationService({
+    actors: { getActor: (actorId) => lightTaskActors.find((actor) => actor.id === actorId) },
+    identities: {
+      async verify(credentials) {
+        const actorId = identitiesByAccount.get(credentials.accountId);
+        return credentials.secret === "correct" && actorId !== undefined
+          ? { accountId: credentials.accountId, actorId }
+          : undefined;
+      },
+    },
+    authority,
+    clock: () => 1_000,
+    tokenFactory: tokenSequence(
+      "task-owner-access", "task-owner-refresh",
+      "task-claimant-access", "task-claimant-refresh",
+      "task-admin-a-access", "task-admin-a-refresh",
+      "task-admin-b-access", "task-admin-b-refresh",
+    ),
+  });
+  const sessions = new Map<string, Awaited<ReturnType<typeof auth.authenticateSession>>>();
+  for (const actor of lightTaskActors) {
+    const issued = await auth.login({ accountId: `account-${actor.id}`, secret: "correct" });
+    sessions.set(actor.id, await auth.authenticateSession(issued.accessToken));
+  }
+  await bootstrapClient.close();
+
+  const database = new DatabaseSync(databasePath);
+  migrateAuthorityDatabase(database);
+  database.exec(`
+    INSERT INTO rooms (id, name, status, created_at)
+    VALUES ('room-light-task', 'Light Tasks', 'active', '2026-08-17T00:00:00.000Z');
+    INSERT INTO room_memberships (
+      room_id, actor_id, kind, role, participation, tool_permissions_json,
+      joined_at, configured_at, access_revision
+    ) VALUES
+      ('room-light-task', 'human-task-owner', 'human', 'owner', NULL, '[]', '2026-08-17T00:00:00.000Z', NULL, 0),
+      ('room-light-task', 'human-task-claimant', 'human', 'member', NULL, '[]', '2026-08-17T00:00:00.000Z', NULL, 0),
+      ('room-light-task', 'human-task-admin-a', 'human', 'admin', NULL, '[]', '2026-08-17T00:00:00.000Z', NULL, 0),
+      ('room-light-task', 'human-task-admin-b', 'human', 'member', NULL, '[]', '2026-08-17T00:00:00.000Z', NULL, 0);
+    INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+    VALUES ('room', 'room-light-task', 0, 1);
+    INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+    VALUES ('message-light-task', 'room-light-task', 'human-task-owner', 'human',
+            '需要一个明确承诺', '2026-08-17T00:00:01.000Z');
+  `);
+  database.close();
+
+  const client = await createWorkerDatabaseClient({ databasePath });
+  const store = createSqliteAuthoritativeStore(client, { clock: () => 3_000 });
+  const context = (actorId: string, requestId: string): AuthenticatedCommandContext => ({
+    ...sessions.get(actorId)!, kind: "human", requestId, idempotencyKey: requestId,
+  });
+  return { client, store, context };
+}
+
 function readMessageCommandCounts(databasePath: string): {
   readonly messages: number;
   readonly events: number;
@@ -1722,6 +1791,191 @@ describe("SQLite authoritative sessions", () => {
       expect(database.prepare("SELECT COUNT(*) AS count FROM open_items WHERE id = ?")
         .get(humanMention.aggregateId)).toEqual({ count: 1 });
       database.close();
+    });
+  });
+
+  describe("LightTask authoritative facts", () => {
+    it("persists explicit confirmation, stable replay, forward transitions, criteria, and empty confirmation", async () => {
+      const directory = await mkdtemp(join(tmpdir(), "native-im-light-task-"));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createLightTaskFixture(databasePath);
+      await fixture.store.executeHuman(
+        fixture.context("human-task-owner", "task-intent-only-message"),
+        { type: "message.send", roomId: "room-light-task", payload: {
+          id: "message-light-task-intent", roomId: "room-light-task", body: "我来做",
+          sentAt: "2026-08-17T00:00:01.500Z",
+        } },
+      );
+      const intentInspection = new DatabaseSync(databasePath, { readOnly: true });
+      expect(intentInspection.prepare("SELECT COUNT(*) AS count FROM light_tasks").get())
+        .toEqual({ count: 0 });
+      intentInspection.close();
+      const create = {
+        type: "light-task.create", roomId: "room-light-task", payload: {
+          sourceMessageId: "message-light-task", title: "完成权威评审", verifierRole: "owner",
+          criteria: [{ id: "criterion-review", text: "评审通过" }],
+        },
+      } as const;
+      const createContext = fixture.context("human-task-owner", "task-create-stable");
+      const created = await fixture.store.executeHuman(createContext, create);
+      await expect(fixture.store.executeHuman(
+        { ...createContext, requestId: "task-create-ack-retry" }, create,
+      )).resolves.toEqual(created);
+      await expect(fixture.store.executeHuman(
+        { ...createContext, requestId: "task-create-conflict" },
+        { ...create, payload: { ...create.payload, title: "changed" } },
+      )).rejects.toMatchObject({ status: 409, code: "idempotency_conflict" });
+      expect(created.result).toMatchObject({ task: {
+        status: "todo", claimant: null, claimantRoleAtClaim: null, verifierActorId: null,
+      } });
+
+      const claimed = await fixture.store.executeHuman(
+        fixture.context("human-task-claimant", "task-claim"),
+        { type: "light-task.transition", roomId: "room-light-task", payload: {
+          taskId: created.aggregateId, action: "claim",
+        } },
+      );
+      expect(claimed.result).toMatchObject({ task: {
+        status: "claimed", claimant: "human-task-claimant", claimantRoleAtClaim: "member",
+      } });
+      const delivered = await fixture.store.executeHuman(
+        fixture.context("human-task-claimant", "task-deliver"),
+        { type: "light-task.transition", roomId: "room-light-task", payload: {
+          taskId: created.aggregateId, action: "deliver",
+        } },
+      );
+      expect(delivered.result).toMatchObject({ task: {
+        status: "delivered", verifierRole: "owner", verifierActorId: "human-task-owner",
+      } });
+      await expect(fixture.store.executeHuman(
+        fixture.context("human-task-claimant", "task-criterion-forbidden"),
+        { type: "light-task.criterion.set", roomId: "room-light-task", payload: {
+          taskId: created.aggregateId, criterionId: "criterion-review", met: true,
+        } },
+      )).rejects.toMatchObject({ status: 403, code: "permission_denied" });
+      await expect(fixture.store.executeHuman(
+        fixture.context("human-task-owner", "task-verify-incomplete"),
+        { type: "light-task.transition", roomId: "room-light-task", payload: {
+          taskId: created.aggregateId, action: "verify",
+        } },
+      )).rejects.toMatchObject({ status: 409, code: "execution_conflict" });
+      await fixture.store.executeHuman(
+        fixture.context("human-task-owner", "task-criterion-met"),
+        { type: "light-task.criterion.set", roomId: "room-light-task", payload: {
+          taskId: created.aggregateId, criterionId: "criterion-review", met: true,
+        } },
+      );
+      const verified = await fixture.store.executeHuman(
+        fixture.context("human-task-owner", "task-verify"),
+        { type: "light-task.transition", roomId: "room-light-task", payload: {
+          taskId: created.aggregateId, action: "verify",
+        } },
+      );
+      expect(verified.result).toMatchObject({ task: {
+        status: "verified", claimant: "human-task-claimant", claimantRoleAtClaim: "member",
+        verifierActorId: "human-task-owner", criteria: [{ met: true }],
+      } });
+
+      const emptyCreated = await fixture.store.executeHuman(
+        fixture.context("human-task-owner", "empty-create"),
+        { ...create, payload: { ...create.payload, title: "无清单验收", criteria: [] } },
+      );
+      await fixture.store.executeHuman(
+        fixture.context("human-task-claimant", "empty-claim"),
+        { type: "light-task.transition", roomId: "room-light-task", payload: {
+          taskId: emptyCreated.aggregateId, action: "claim",
+        } },
+      );
+      await fixture.store.executeHuman(
+        fixture.context("human-task-claimant", "empty-deliver"),
+        { type: "light-task.transition", roomId: "room-light-task", payload: {
+          taskId: emptyCreated.aggregateId, action: "deliver",
+        } },
+      );
+      await expect(fixture.store.executeHuman(
+        fixture.context("human-task-owner", "empty-verify-no-confirm"),
+        { type: "light-task.transition", roomId: "room-light-task", payload: {
+          taskId: emptyCreated.aggregateId, action: "verify",
+        } },
+      )).rejects.toMatchObject({ status: 409, code: "execution_conflict" });
+      await fixture.store.executeHuman(
+        fixture.context("human-task-owner", "empty-verify-confirmed"),
+        { type: "light-task.transition", roomId: "room-light-task", payload: {
+          taskId: emptyCreated.aggregateId, action: "verify", emptyCriteriaConfirmed: true,
+        } },
+      );
+      await fixture.client.close();
+
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM light_tasks").get()).toEqual({ count: 2 });
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.light_task.changed'",
+      ).get()).toEqual({ count: 9 });
+      expect(database.prepare(
+        `SELECT COUNT(*) AS count FROM outbox_deliveries AS delivery
+         JOIN events AS event ON event.event_id = delivery.event_id
+         WHERE event.event_type = 'room.light_task.changed'`,
+      ).get()).toEqual({ count: 9 });
+      database.close();
+    });
+
+    it("rejects same-role, ambiguous verifier, same actor, and removed claimant transitions", async () => {
+      const scenarios = ["same-role", "ambiguous", "same-actor", "removed"] as const;
+      for (const scenario of scenarios) {
+        const directory = await mkdtemp(join(tmpdir(), `native-im-light-task-${scenario}-`));
+        temporaryDirectories.push(directory);
+        const databasePath = join(directory, "authority.sqlite");
+        const fixture = await createLightTaskFixture(databasePath);
+        const claimantId = scenario === "same-actor" ? "human-task-owner" : "human-task-claimant";
+        const verifierRole = scenario === "same-role" ? "member"
+          : scenario === "ambiguous" ? "admin"
+          : scenario === "same-actor" ? "member" : "owner";
+        const created = await fixture.store.executeHuman(
+          fixture.context("human-task-owner", `${scenario}-create`),
+          { type: "light-task.create", roomId: "room-light-task", payload: {
+            sourceMessageId: "message-light-task", title: scenario, verifierRole, criteria: [],
+          } },
+        );
+        await fixture.store.executeHuman(
+          fixture.context(claimantId, `${scenario}-claim`),
+          { type: "light-task.transition", roomId: "room-light-task", payload: {
+            taskId: created.aggregateId, action: "claim",
+          } },
+        );
+        await fixture.client.close();
+        const database = new DatabaseSync(databasePath);
+        if (scenario === "ambiguous") {
+          database.exec(`UPDATE room_memberships SET role = 'admin'
+                         WHERE room_id = 'room-light-task' AND actor_id = 'human-task-admin-b'`);
+        } else if (scenario === "same-actor") {
+          database.exec(`
+            DELETE FROM room_memberships
+            WHERE room_id = 'room-light-task' AND actor_id = 'human-task-claimant';
+            UPDATE room_memberships SET role = 'member'
+            WHERE room_id = 'room-light-task' AND actor_id = 'human-task-owner';
+          `);
+        } else if (scenario === "removed") {
+          database.exec(`DELETE FROM room_memberships
+                         WHERE room_id = 'room-light-task' AND actor_id = 'human-task-claimant'`);
+        }
+        database.close();
+        const restartedClient = await createWorkerDatabaseClient({ databasePath });
+        const restartedStore = createSqliteAuthoritativeStore(restartedClient, { clock: () => 4_000 });
+        await expect(restartedStore.executeHuman(
+          fixture.context(claimantId, `${scenario}-deliver`),
+          { type: "light-task.transition", roomId: "room-light-task", payload: {
+            taskId: created.aggregateId, action: "deliver",
+          } },
+        )).rejects.toMatchObject(scenario === "removed"
+          ? { status: 403, code: "room_forbidden" }
+          : { status: 409, code: "execution_conflict" });
+        await restartedClient.close();
+        const inspection = new DatabaseSync(databasePath, { readOnly: true });
+        expect(inspection.prepare("SELECT status FROM light_tasks WHERE id = ?")
+          .get(created.aggregateId)).toEqual({ status: "claimed" });
+        inspection.close();
+      }
     });
   });
 

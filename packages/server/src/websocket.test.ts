@@ -666,7 +666,7 @@ afterEach(async () => {
 });
 
 describe("authenticated message WebSocket service", () => {
-  it("routes closed T-0017 human OpenItem frames and preserves 403/409 API errors", async () => {
+  it("routes closed T-0017/T-0018 human collaboration frames and preserves API errors", async () => {
     const principal = { accountId: "account-human-1", actorId: humans[0].id };
     const session = issuedSession(principal, "open-item-api");
     const sessionContext = {
@@ -704,8 +704,23 @@ describe("authenticated message WebSocket service", () => {
       return { ...awaitingItem, currentOwnerId: null, status: "answered" as const,
         respondedAt: "2026-08-12T00:01:00.000Z" };
     });
+    const todoTask = {
+      id: "task-api", roomId, sourceMessageId: "message-source", title: "完成评审",
+      claimant: null, claimantRoleAtClaim: null, verifierRole: "owner" as const,
+      verifierActorId: null, criteria: [{ id: "criterion-1", text: "评审通过", met: false }],
+      status: "todo" as const, createdAt: "2026-08-12T00:00:00.000Z",
+    };
+    const createLightTask = vi.fn(async () => todoTask);
+    const transitionLightTask = vi.fn(async () => ({
+      ...todoTask, claimant: humans[1].id, claimantRoleAtClaim: "member" as const,
+      status: "claimed" as const, claimedAt: "2026-08-12T00:01:00.000Z",
+    }));
+    const setLightTaskCriterion = vi.fn(async () => todoTask);
     const server = await startMessageWebSocketServer({
-      auth, service, collaboration: { createOpenItem, transitionOpenItem },
+      auth, service, collaboration: {
+        createOpenItem, transitionOpenItem, createLightTask, transitionLightTask,
+        setLightTaskCriterion,
+      },
     });
     const client = await LoopbackClient.connect(server.url);
     try {
@@ -739,6 +754,38 @@ describe("authenticated message WebSocket service", () => {
           "open-item.transition:open-forbidden",
           "open-item.transition:open-terminal",
         ]);
+
+      client.send({
+        type: "light-task.create", requestId: "task-create", roomId,
+        sourceMessageId: "message-source", title: "完成评审", verifierRole: "owner",
+        criteria: [{ id: "criterion-1", text: "评审通过" }],
+      });
+      await expect(client.waitForFrame(
+        (frame) => hasType(frame, "light-task.ack") && frame.requestId === "task-create",
+        "light task acknowledgement",
+      )).resolves.toMatchObject({ frame: { task: { id: "task-api", status: "todo" } } });
+      expect(createLightTask).toHaveBeenCalledWith(
+        expect.objectContaining({ idempotencyKey: "light-task.create:task-create" }),
+        roomId,
+        { sourceMessageId: "message-source", title: "完成评审", verifierRole: "owner",
+          criteria: [{ id: "criterion-1", text: "评审通过" }] },
+      );
+      client.send({
+        type: "light-task.transition", requestId: "task-claim", roomId,
+        taskId: "task-api", action: "claim",
+      });
+      await expect(client.waitForFrame(
+        (frame) => hasType(frame, "light-task.ack") && frame.requestId === "task-claim",
+        "light task claim acknowledgement",
+      )).resolves.toMatchObject({ frame: { task: { status: "claimed" } } });
+      client.send({
+        type: "light-task.criterion.set", requestId: "task-check", roomId,
+        taskId: "task-api", criterionId: "criterion-1", met: true,
+      });
+      await expect(client.waitForFrame(
+        (frame) => hasType(frame, "light-task.ack") && frame.requestId === "task-check",
+        "light task criterion acknowledgement",
+      )).resolves.toMatchObject({ frame: { task: { id: "task-api" } } });
     } finally {
       await client.close();
       await server.close();

@@ -10,7 +10,7 @@
 - 写入与旧兼容读：`message.send`、`room.history`、`room.subscribe`；
 - v2 恢复：`workspace.bootstrap.begin`、`workspace.bootstrap.page`、`room.sync`、`room.repair.begin`、`room.repair.page`、`snapshot.complete`、`room.subscribe.v2`。
 
-成功帧同样以 closed `type` 区分：`auth.authenticated`、`auth.revoked`、`message.accepted`、`message.created`、`room.event`、`identity.room-access.changed`、`auth.session-revoked`、`room.history`、`room.subscribed`、`workspace.bootstrap.page`、`room.sync.result`、`room.repair.page`、`snapshot.completed`、`room.subscribed.v2`、`room.subscribe.v2.retry`。请求/响应帧回显当前 `requestId`；异步 `room.event` 使用持久 `eventId` 与 `streamSeq`。
+成功帧同样以 closed `type` 区分：`auth.authenticated`、`auth.revoked`、`message.accepted`、`message.created`、`room.event`、`identity.room-access.changed`、`auth.session-revoked`、`room.history`、`room.subscribed`、`workspace.bootstrap.page`、`room.sync.result`、`room.repair.page`、`snapshot.completed`、`room.subscribed.v2`、`room.subscribe.v2.retry`、`open-item.ack`、`light-task.ack`。请求/响应帧回显当前 `requestId`；异步 `room.event` 使用持久 `eventId` 与 `streamSeq`。
 
 错误统一为：
 
@@ -72,6 +72,8 @@ OutboxDispatcher 在提交后读取 pending delivery，按当前权限授权、�
 ## 6. Migration 与 legacy import
 
 Authority schema 和可丢弃的 snapshot-cache schema 分别版本化。fresh、上一版到当前版、未知目标版本、注入中途失败都必须测试；失败时 schema version 与原数据保持不变。升级要补齐 actor/membership revision，以及 room/identity stream 的 `head_seq` / `retained_from_seq`，保证旧历史可 repair、新事件序号连续。
+
+schema v9 新增 closed `light_tasks` 权威事实。human 只有发送 `light-task.create` 显式确认后才创建任务；普通消息（包括“我来做”）不会推导任务。`light-task.transition` 只允许 todo→claimed→delivered→verified，`light-task.criterion.set` 只允许持久化验收者在 delivered 阶段更新稳定 criterion 的 `met`。每次成功写入都和 `room.light_task.changed`、room outbox、idempotency acknowledgement 同属一个 AuthorityWorker transaction；repair record 使用 `kind: "light-task"`，不会携带 deps、maturity、milestone 或 Blueprint task ID。
 
 Legacy import 在正式激活新 authority 前解析并验证 closed 数据，使用 migration/事务写入临时目标；损坏输入、重复启动、启用前终止都不得留下半激活 authority。证据见 [`schema.test.ts`](../../packages/server/src/persistence/schema.test.ts) 和 [`legacy-importer.test.ts`](../../packages/server/src/persistence/legacy-importer.test.ts)。Snapshot cache 可随时删除重建，不能反向覆盖 authority。
 

@@ -91,6 +91,18 @@ type HumanMessageWithInjectedAuthor = {
   };
 };
 
+type LightTaskCreateWithInjectedBlueprintField = {
+  readonly type: "light-task.create";
+  readonly roomId: "room-1";
+  readonly payload: {
+    readonly sourceMessageId: "message-1";
+    readonly title: "完成评审";
+    readonly verifierRole: "owner";
+    readonly criteria: readonly [];
+    readonly milestone: "M3";
+  };
+};
+
 export type PublicJsonCannotConstructInternalContext = Assert<
   PublicJsonAgentContext extends InternalAgentCommandContext ? false : true
 >;
@@ -145,6 +157,9 @@ export type AgentJudgementCannotInjectAgent = Assert<
 >;
 export type HumanMessageCannotInjectAuthorKind = Assert<
   HumanMessageWithInjectedAuthor extends HumanCollaborationCommand ? false : true
+>;
+export type LightTaskCreateCannotInjectBlueprintFields = Assert<
+  LightTaskCreateWithInjectedBlueprintField extends HumanCollaborationCommand ? false : true
 >;
 export type HumanContextHasServerPrincipal = Assert<
   AuthenticatedCommandContext["principal"] extends { readonly actorId: string } ? true : false

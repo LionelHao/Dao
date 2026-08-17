@@ -1112,11 +1112,12 @@ describe("authoritative server real-process harness", () => {
     }
   });
 
-  it("persists one human OpenItem through WebSocket replay, repair, terminal CAS, and restart", async () => {
+  it("persists OpenItem and explicit LightTask through WebSocket replay, multi-client repair, and restart", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-open-item-restart-"));
     let first: ChildProcessWithoutNullStreams | undefined;
     let second: ChildProcessWithoutNullStreams | undefined;
     let client: JsonWebSocketClient | undefined;
+    let peer: JsonWebSocketClient | undefined;
     try {
       const seeded = await spawnAuthorityChild({ directory, seedAllFacts: true });
       first = seeded.child;
@@ -1157,6 +1158,33 @@ describe("authoritative server real-process harness", () => {
         type: "open-item.transition", requestId: "open-item-terminal-conflict", roomId,
         itemId: firstAck.item.id, action: "defer", reason: "too late",
       }, "open-item.ack")).rejects.toMatchObject({ status: 409, code: "execution_conflict" });
+      const taskCreate = {
+        type: "light-task.create" as const,
+        requestId: "light-task-create-stable",
+        roomId,
+        sourceMessageId: source.value.id,
+        title: "Persist explicit commitment",
+        verifierRole: "owner" as const,
+        criteria: [{ id: "criterion-review", text: "Review is complete" }],
+      };
+      const taskAck = await client.request(taskCreate, "light-task.ack");
+      if (taskAck.type !== "light-task.ack") throw new Error("wrong LightTask acknowledgement");
+      const taskReplay = await client.request(taskCreate, "light-task.ack");
+      expect(taskReplay).toMatchObject({
+        type: "light-task.ack",
+        task: { id: taskAck.task.id, status: "todo", claimant: null },
+      });
+      peer = await JsonWebSocketClient.connect(seeded.url);
+      await peer.login("light-task-peer-login");
+      const peerRepair = await repairRecords(peer, roomId);
+      expect(peerRepair.records.filter((record) =>
+        record.kind === "light-task" && record.value.id === taskAck.task.id)).toEqual([
+        expect.objectContaining({ kind: "light-task", value: expect.objectContaining({
+          status: "todo", criteria: [{ id: "criterion-review", text: "Review is complete", met: false }],
+        }) }),
+      ]);
+      peer.close();
+      peer = undefined;
       const current = await repairRecords(client, roomId);
       expect(current.records.filter((record) =>
         record.kind === "open-item" && record.value.id === firstAck.item.id)).toEqual([
@@ -1174,15 +1202,23 @@ describe("authoritative server real-process harness", () => {
       const repaired = await repairRecords(client, roomId);
       expect(repaired.records.filter((record) =>
         record.kind === "open-item" && record.value.id === firstAck.item.id)).toHaveLength(1);
+      expect(repaired.records.filter((record) =>
+        record.kind === "light-task" && record.value.id === taskAck.task.id)).toHaveLength(1);
       const database = new DatabaseSync(join(directory, "authority.sqlite"), { readOnly: true });
       expect(database.prepare(
         "SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.open_item.changed' AND payload_json LIKE ?",
       ).get(`%${firstAck.item.id}%`)).toEqual({ count: 2 });
       expect(database.prepare("SELECT COUNT(*) AS count FROM open_items WHERE id = ?")
         .get(firstAck.item.id)).toEqual({ count: 1 });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM light_tasks WHERE id = ?")
+        .get(taskAck.task.id)).toEqual({ count: 1 });
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.light_task.changed' AND payload_json LIKE ?",
+      ).get(`%${taskAck.task.id}%`)).toEqual({ count: 1 });
       database.close();
     } finally {
       client?.close();
+      peer?.close();
       if (first !== undefined) await stopChild(first);
       if (second !== undefined) await stopChild(second);
       await rm(directory, { recursive: true, force: true });

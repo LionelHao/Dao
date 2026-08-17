@@ -139,6 +139,43 @@ describe("pure synchronization contracts", () => {
     })).toBe(false);
   });
 
+  it("keeps LightTask repair records and events closed and room-bound", () => {
+    const task = {
+      id: "task-1", roomId: "room-1", sourceMessageId: "message-1", title: "Ship review",
+      claimant: "human-1", claimantRoleAtClaim: "member", verifierRole: "owner",
+      verifierActorId: "human-2", criteria: [{ id: "criterion-1", text: "Reviewed", met: true }],
+      status: "delivered", createdAt: "2026-08-17T00:00:00.000Z",
+      claimedAt: "2026-08-17T00:01:00.000Z", deliveredAt: "2026-08-17T00:02:00.000Z",
+    };
+    const page = {
+      type: "room.repair.page", requestId: "request-1", snapshotId: "snapshot-1",
+      roomId: "room-1", page: 0, records: [{ kind: "light-task", value: task }],
+      watermark: 1, snapshotChecksum: "sha256:light-task", hasMore: false,
+      mode: "streaming", idleExpiresAt: "2026-08-17T00:00:30.000Z",
+    };
+    expect(isRoomRepairPage(page)).toBe(true);
+    expect(isRoomRepairPage({
+      ...page,
+      records: [{ kind: "light-task", value: { ...task, maturity: "stable" } }],
+    })).toBe(false);
+
+    const event = {
+      eventId: "event-1", streamKind: "room", streamId: "room-1", streamSeq: 1,
+      roomId: "room-1", actorId: "human-1", occurredAt: "2026-08-17T00:02:00.000Z",
+      type: "room.light_task.changed", payload: task,
+    };
+    const result = {
+      type: "room.sync.result", requestId: "request-2", mode: "delta", events: [event],
+      nextCursor: { version: 1, roomId: "room-1", afterSeq: 1 },
+      watermark: 1, hasMore: false,
+    };
+    expect(isRoomSyncResult(result)).toBe(true);
+    expect(isRoomSyncResult({
+      ...result,
+      events: [{ ...event, payload: { ...task, roomId: "room-2" } }],
+    })).toBe(false);
+  });
+
   it("rejects impossible delta envelopes", () => {
     const event = (streamSeq: number, roomId = "room-1") => ({
       eventId: `event-${streamSeq}`,

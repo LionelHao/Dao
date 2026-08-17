@@ -4,6 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import { parentPort, workerData } from "node:worker_threads";
 import {
   isCalibrationSignal,
+  isLightTask,
   isRoomRepairPage,
   isRouteJob,
   isRouteJudgment,
@@ -512,6 +513,17 @@ function* roomRecords(
     recordScanned();
   }
   for (const row of scanRows(authority,
+    `SELECT id, room_id AS roomId, source_message_id AS sourceMessageId, title,
+            claimant_actor_id AS claimant, claimant_role_at_claim AS claimantRoleAtClaim,
+            verifier_role AS verifierRole, verifier_actor_id AS verifierActorId,
+            criteria_json AS criteriaJson, status, created_at AS createdAt,
+            claimed_at AS claimedAt, delivered_at AS deliveredAt, verified_at AS verifiedAt
+     FROM light_tasks WHERE room_id = ?`,
+    roomId, "id", "id")) {
+    yield lightTaskRecord(row);
+    recordScanned();
+  }
+  for (const row of scanRows(authority,
     `SELECT id, room_id AS roomId, trigger_message_id AS sourceMessageId,
             requester_actor_id AS requesterId, agent_id AS agentId, tool_name AS toolName,
             status, started_at AS startedAt, completed_at AS completedAt,
@@ -726,6 +738,30 @@ function calibrationRecord(row: Record<string, unknown>): RoomRepairRecord {
   return { kind: "calibration", value };
 }
 
+function lightTaskRecord(row: Record<string, unknown>): RoomRepairRecord {
+  const criteria = parseJson(row.criteriaJson);
+  const task = {
+    id: row.id,
+    roomId: row.roomId,
+    sourceMessageId: row.sourceMessageId,
+    title: row.title,
+    claimant: row.claimant,
+    claimantRoleAtClaim: row.claimantRoleAtClaim,
+    verifierRole: row.verifierRole,
+    verifierActorId: row.verifierActorId,
+    criteria,
+    status: row.status,
+    createdAt: row.createdAt,
+    ...(typeof row.claimedAt === "string" ? { claimedAt: row.claimedAt } : {}),
+    ...(typeof row.deliveredAt === "string" ? { deliveredAt: row.deliveredAt } : {}),
+    ...(typeof row.verifiedAt === "string" ? { verifiedAt: row.verifiedAt } : {}),
+  };
+  if (!isLightTask(task)) {
+    throw new SnapshotBuildError("storage_unavailable", "Snapshot light task is corrupt");
+  }
+  return { kind: "light-task", value: task };
+}
+
 function keysetRoomPage(
   authority: DatabaseSync,
   roomId: string,
@@ -751,7 +787,7 @@ function keysetRoomPage(
     }
   };
 
-  while (values.length < limit && segment < 11) {
+  while (values.length < limit && segment < 12) {
     if (segment === 0) {
       const room = authority.prepare(
         "SELECT id, name, status, created_at AS createdAt FROM rooms WHERE id = ?",
@@ -839,6 +875,15 @@ function keysetRoomPage(
       }}));
     } else if (segment === 7) {
       append(keysetRows(authority,
+        `SELECT id, room_id AS roomId, source_message_id AS sourceMessageId, title,
+                claimant_actor_id AS claimant, claimant_role_at_claim AS claimantRoleAtClaim,
+                verifier_role AS verifierRole, verifier_actor_id AS verifierActorId,
+                criteria_json AS criteriaJson, status, created_at AS createdAt,
+                claimed_at AS claimedAt, delivered_at AS deliveredAt, verified_at AS verifiedAt
+         FROM light_tasks WHERE room_id = ?`, [roomId], "id", key, remaining),
+      (row) => String(row.id), lightTaskRecord);
+    } else if (segment === 8) {
+      append(keysetRows(authority,
         `SELECT id, room_id AS roomId, trigger_message_id AS sourceMessageId,
                 requester_actor_id AS requesterId, agent_id AS agentId, tool_name AS toolName,
                 status, started_at AS startedAt, completed_at AS completedAt,
@@ -856,7 +901,7 @@ function keysetRoomPage(
         kind: "agent-execution",
         value: canonicalLegacyExecution(row),
       }));
-    } else if (segment === 8) {
+    } else if (segment === 9) {
       append(keysetRows(authority,
         `SELECT id, room_id AS roomId, source_message_id AS sourceMessageId, status,
                 current_attempt AS currentAttempt, topic_key AS topicKey,
@@ -866,7 +911,7 @@ function keysetRoomPage(
                 terminal_error_code AS terminalErrorCode, next_retry_at AS nextRetryAt
          FROM route_jobs WHERE room_id = ?`, [roomId], "id", key, remaining),
       (row) => String(row.id), routeJobRecord);
-    } else if (segment === 9) {
+    } else if (segment === 10) {
       append(keysetRows(authority,
         `SELECT judgment.id, judgment.route_job_id AS routeJobId,
                 judgment.source_message_id AS sourceMessageId,

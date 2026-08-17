@@ -81,6 +81,7 @@ export type AuthorityWorkerErrorCode =
   | "invitee_required"
   | "legacy_import_failed"
   | "legacy_import_unavailable"
+  | "light_task_not_found"
   | "member_not_found"
   | "message_not_found"
   | "open_item_not_found"
@@ -137,6 +138,7 @@ export function isAuthorityWorkerErrorCode(
     case "invitee_required":
     case "legacy_import_failed":
     case "legacy_import_unavailable":
+    case "light_task_not_found":
     case "member_not_found":
     case "message_not_found":
     case "open_item_not_found":
@@ -354,12 +356,12 @@ export type AuthorityWorkerResponse =
   | {
       readonly type: "authority.ready";
       readonly requestId: string;
-      readonly schemaVersion: 8;
+      readonly schemaVersion: 9;
     }
   | {
       readonly type: "authority.schema";
       readonly requestId: string;
-      readonly schemaVersion: 8;
+      readonly schemaVersion: 9;
     }
   | {
       readonly type: "authority.legacy-imported";
@@ -1006,7 +1008,7 @@ export function isAuthorityWorkerResponse(
     case "authority.schema":
       return (
         hasExactKeys(value, ["type", "requestId", "schemaVersion"]) &&
-        value.schemaVersion === 8
+        value.schemaVersion === 9
       );
     case "authority.closed":
       return hasExactKeys(value, ["type", "requestId"]);
