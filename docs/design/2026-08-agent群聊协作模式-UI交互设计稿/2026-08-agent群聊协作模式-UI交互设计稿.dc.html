@@ -1,0 +1,1732 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>原生人机协作 IM · macOS Desktop UI 交互设计稿</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+  body { margin:0; background:#eceff2; }
+  *,*::before,*::after { box-sizing:border-box; }
+  a { color:#175cd3; text-decoration:none; border-bottom:1px solid #b9d0f5; }
+  a:hover { color:#0f3f95; border-bottom-color:#175cd3; }
+  button:focus-visible, [tabindex]:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline:3px solid #2563eb; outline-offset:2px; }
+  @media (prefers-reduced-motion: reduce) { *,*::before,*::after { transition-duration:.01ms !important; animation-duration:.01ms !important; } }
+</style>
+</helmet>
+
+<template id="__bundler_thumbnail"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200"><rect width="200" height="200" fill="#1f2937"></rect><rect x="60" y="66" width="6" height="68" rx="3" fill="#5b21b6"></rect><circle cx="94" cy="82" r="14" fill="#eef4ff"></circle><rect x="80" y="106" width="28" height="28" rx="8" fill="#84adff"></rect><rect x="118" y="72" width="22" height="20" rx="4" fill="#f8fafc"></rect><rect x="118" y="112" width="22" height="16" rx="4" fill="#94a3b8"></rect></svg></template>
+
+<div style="min-height:100vh;font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Helvetica Neue',sans-serif;color:#1f2937;-webkit-font-smoothing:antialiased">
+
+  <header style="position:sticky;top:0;z-index:40;display:flex;align-items:center;gap:24px;padding:14px 32px;background:#ffffff;border-bottom:1px solid #cbd5e1">
+    <div style="display:grid;gap:2px">
+      <div style="font-size:14px;font-weight:700;letter-spacing:-0.01em">原生人机协作 IM · macOS Desktop UI 交互设计稿</div>
+      <div style="font:500 11px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;color:#64748b;letter-spacing:.04em">PRD 证据重建版 v0.1 已批准基线 · FT-16 Design Contract · 2026-08</div>
+    </div>
+    <nav aria-label="设计稿分区" style="display:flex;gap:6px;margin-left:auto">
+      <button type="button" onClick="{{ goProto }}" style="padding:7px 12px;border:1px solid #1f2937;border-radius:6px;background:#1f2937;color:#fff;font:600 12px/1 inherit;cursor:pointer">交互原型</button>
+      <button type="button" onClick="{{ goStates }}" style="padding:7px 12px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#1f2937;font:600 12px/1 inherit;cursor:pointer">状态分支</button>
+      <button type="button" onClick="{{ goTokens }}" style="padding:7px 12px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#1f2937;font:600 12px/1 inherit;cursor:pointer">设计令牌</button>
+      <button type="button" onClick="{{ goComponents }}" style="padding:7px 12px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#1f2937;font:600 12px/1 inherit;cursor:pointer">组件状态</button>
+      <button type="button" onClick="{{ goCoverage }}" style="padding:7px 12px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#1f2937;font:600 12px/1 inherit;cursor:pointer">覆盖矩阵</button>
+      <button type="button" onClick="{{ goHandoff }}" style="padding:7px 12px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#1f2937;font:600 12px/1 inherit;cursor:pointer">工程交接</button>
+    </nav>
+  </header>
+
+  <sc-if value="{{ vProto }}" hint-placeholder-val="{{ true }}">
+  <section data-screen-label="交互原型" style="padding:28px 32px 72px">
+
+    <div style="display:flex;gap:20px;align-items:flex-start;max-width:1504px;margin:0 auto 20px;padding:16px 18px;background:#fff;border:1px solid #cbd5e1;border-radius:10px">
+      <div style="display:grid;gap:10px;min-width:0;flex:1">
+        <div style="font:600 10px/1 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.12em;color:#64748b">核心原型路径</div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px">
+          <button type="button" onClick="{{ pick1 }}" style="padding:6px 10px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;font:600 12px/1.3 inherit;color:#1f2937;cursor:pointer;text-align:left">J-01 登录 / 入群 → 进入 Room</button>
+          <button type="button" onClick="{{ pick2 }}" style="padding:6px 10px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;font:600 12px/1.3 inherit;color:#1f2937;cursor:pointer;text-align:left">J-02 发消息 → ACK / 失败重试</button>
+          <button type="button" onClick="{{ pick3 }}" style="padding:6px 10px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;font:600 12px/1.3 inherit;color:#1f2937;cursor:pointer;text-align:left">J-03 @Agent → execution → final</button>
+          <button type="button" onClick="{{ pick4 }}" style="padding:6px 10px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;font:600 12px/1.3 inherit;color:#1f2937;cursor:pointer;text-align:left">J-04 @Human → Request → 接受 / 转交</button>
+          <button type="button" onClick="{{ pick5 }}" style="padding:6px 10px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;font:600 12px/1.3 inherit;color:#1f2937;cursor:pointer;text-align:left">J-05 副作用 → 精确确认 → 结果</button>
+          <button type="button" onClick="{{ pick6 }}" style="padding:6px 10px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;font:600 12px/1.3 inherit;color:#1f2937;cursor:pointer;text-align:left">J-06 proposal → 确认 → 项目事实</button>
+          <button type="button" onClick="{{ pick7 }}" style="padding:6px 10px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;font:600 12px/1.3 inherit;color:#1f2937;cursor:pointer;text-align:left">J-07 通知深链 / 离线 → repair</button>
+        </div>
+      </div>
+      <div style="width:1px;align-self:stretch;background:#e2e8f0"></div>
+      <div style="width:400px;display:grid;gap:8px">
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="font:600 12px/1 inherit;color:#0f172a">{{ jLabel }}</span>
+          <span style="font:600 10px/1 ui-monospace,SFMono-Regular,Menlo,monospace;color:#64748b">{{ stepLabel }}</span>
+        </div>
+        <p style="margin:0;font-size:12px;line-height:1.6;color:#334155;min-height:38px;text-wrap:pretty">{{ stepNote }}</p>
+        <div style="display:flex;gap:6px">
+          <button type="button" onClick="{{ prev }}" style="padding:7px 12px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;font:600 12px/1 inherit;color:#1f2937;cursor:pointer">上一步</button>
+          <button type="button" onClick="{{ next }}" style="padding:7px 14px;border:1px solid #1d4ed8;border-radius:5px;background:#1d4ed8;color:#fff;font:600 12px/1 inherit;cursor:pointer">下一步 →</button>
+          <span style="font:500 10px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;color:#64748b;align-self:center">{{ jReq }}</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ 默认窗口 1440 × 900 ============ -->
+    <div style="max-width:1504px;margin:0 auto">
+      <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:8px">
+        <h2 style="margin:0;font-size:13px;font-weight:700">默认窗口 1440 × 900</h2>
+        <span style="font:500 11px/1 ui-monospace,SFMono-Regular,Menlo,monospace;color:#64748b">REQ-UX-002 · 三栏原子指向同一 roomId</span>
+      </div>
+
+      <div style="width:1440px;height:900px;background:#f8fafc;border:1px solid #94a3b8;border-radius:12px;overflow:hidden;box-shadow:0 24px 60px rgb(15 23 42 / 14%);display:grid;grid-template-rows:38px minmax(0,1fr)">
+
+        <div style="display:flex;align-items:center;gap:8px;padding:0 12px;background:#eef1f5;border-bottom:1px solid #d7dee7">
+          <span style="width:11px;height:11px;border-radius:50%;background:#e5695f"></span>
+          <span style="width:11px;height:11px;border-radius:50%;background:#e0b34a"></span>
+          <span style="width:11px;height:11px;border-radius:50%;background:#61bd5c"></span>
+          <span style="margin-left:10px;font-size:12px;font-weight:600;color:#475569">原生人机协作 IM</span>
+          <span style="margin-left:auto;font:500 10px/1 ui-monospace,SFMono-Regular,Menlo,monospace;color:#64748b">单租户私有部署 · SQLite 权威</span>
+        </div>
+
+        <!-- 启动与身份 -->
+        <sc-if value="{{ vAuth }}" hint-placeholder-val="{{ false }}">
+        <div data-screen-label="启动与身份" style="display:grid;place-items:center;padding:40px;min-height:0">
+          <div style="width:560px;display:grid;gap:16px">
+
+            <sc-if value="{{ aRestore }}" hint-placeholder-val="{{ false }}">
+            <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:28px;display:grid;gap:14px">
+              <div style="display:flex;align-items:center;gap:10px">
+                <span style="width:26px;height:26px;border-radius:7px;background:#1f2937;display:grid;place-items:center;color:#fff;font:700 11px/1 ui-monospace,Menlo,monospace">IM</span>
+                <span style="font-size:15px;font-weight:700">正在恢复会话</span>
+              </div>
+              <div style="height:4px;border-radius:2px;background:#e2e8f0;overflow:hidden"><span style="display:block;width:38%;height:100%;background:#1d4ed8"></span></div>
+              <p style="margin:0;font-size:13px;line-height:1.7;color:#475569;text-wrap:pretty">校验 session 与离线授权租约。<strong style="font-weight:700">在校验通过前不显示任何 Room 内容</strong>，避免闪现未授权缓存。</p>
+              <div style="display:flex;gap:6px;flex-wrap:wrap">
+                <span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.08em;padding:4px 6px;border-radius:3px;border:1px dotted #64748b;color:#475569">LOCAL 暂态</span>
+                <span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.08em;padding:4px 6px;border-radius:3px;border:1px solid #cbd5e1;color:#475569">REQ-UX-006</span>
+              </div>
+            </div>
+            </sc-if>
+
+            <sc-if value="{{ aLogin }}" hint-placeholder-val="{{ false }}">
+            <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:28px;display:grid;gap:16px">
+              <div style="display:grid;gap:6px">
+                <span style="font-size:16px;font-weight:700">登录</span>
+                <span style="font-size:12px;color:#64748b">邀请绑定的密码账户 · 每台设备独立可撤销 session family</span>
+              </div>
+              <div style="display:flex;gap:10px;padding:10px 12px;border-left:3px solid #b54708;background:#fffaf0;border-radius:0 6px 6px 0">
+                <span style="font:700 10px/1.6 ui-monospace,Menlo,monospace;color:#b54708">401</span>
+                <span style="font-size:12px;line-height:1.6;color:#7c4a08">此设备的 session 已被撤销。本地加密 cache 已锁定，重新认证且仍有权限后可恢复。</span>
+              </div>
+              <label style="display:grid;gap:6px"><span style="font-size:12px;font-weight:700">账户</span><input type="text" value="chen.mo@studio.internal" readonly="readonly" style="min-height:38px;padding:8px 10px;border:1px solid #64748b;border-radius:6px;font:inherit;font-size:13px;background:#fff" /></label>
+              <label style="display:grid;gap:6px"><span style="font-size:12px;font-weight:700">密码</span><input type="password" value="0123456789" readonly="readonly" style="min-height:38px;padding:8px 10px;border:1px solid #64748b;border-radius:6px;font:inherit;font-size:13px;background:#fff" /></label>
+              <button type="button" onClick="{{ next }}" style="min-height:38px;border:1px solid #1d4ed8;border-radius:6px;background:#1d4ed8;color:#fff;font:700 13px/1 inherit;cursor:pointer">登录</button>
+              <p style="margin:0;font-size:11px;line-height:1.6;color:#64748b">Agent 没有登录入口；作者身份由服务端认证 principal 注入。<span style="font:600 10px/1 ui-monospace,Menlo,monospace">REQ-ID-001 / REQ-ID-002</span></p>
+            </div>
+            </sc-if>
+
+            <sc-if value="{{ aInvite }}" hint-placeholder-val="{{ false }}">
+            <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:28px;display:grid;gap:16px">
+              <div style="display:grid;gap:6px">
+                <span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;color:#64748b">定向邀请 · 仅受邀账户可接受</span>
+                <span style="font-size:16px;font-weight:700">林澈 邀请你加入 Room「归档迁移 2026Q3」</span>
+              </div>
+              <div style="border:1px dashed #84adff;background:#f5f8ff;border-radius:8px;padding:14px;display:grid;gap:8px">
+                <span style="font-size:12px;font-weight:700;color:#175cd3">接受后你将获得的可见性</span>
+                <ul style="margin:0;padding-left:18px;font-size:12px;line-height:1.8;color:#334155">
+                  <li>Room 的<strong style="font-weight:700">全部历史消息与附件</strong>，包含你加入之前的内容。</li>
+                  <li>Room 当前有效内容默认对 Room 内 Agent 可见，包含 Agent 配置之前的历史。</li>
+                  <li>Provider 与模型：<span style="font:600 11px/1 ui-monospace,Menlo,monospace">server-side 单 Provider / 单模型</span>，已禁用 Provider 侧留存。</li>
+                  <li>已撤回内容仅保留于 Human 审计与 owner 导出，不进入 Agent 检索。</li>
+                </ul>
+              </div>
+              <div style="display:flex;gap:8px">
+                <button type="button" onClick="{{ next }}" style="min-height:38px;padding:0 16px;border:1px solid #1d4ed8;border-radius:6px;background:#1d4ed8;color:#fff;font:700 13px/1 inherit;cursor:pointer">我已了解，接受邀请</button>
+                <button type="button" style="min-height:38px;padding:0 16px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#1f2937;font:600 13px/1 inherit;cursor:pointer">拒绝</button>
+              </div>
+              <p style="margin:0;font-size:11px;line-height:1.6;color:#64748b">拒绝也是被记录的结果；接受前不产生半 membership。<span style="font:600 10px/1 ui-monospace,Menlo,monospace">REQ-ID-003 / REQ-MSG-010</span></p>
+            </div>
+            </sc-if>
+
+            <sc-if value="{{ aCatalog }}" hint-placeholder-val="{{ false }}">
+            <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:28px;display:grid;gap:14px">
+              <span style="font-size:15px;font-weight:700">加载 Room catalog</span>
+              <div style="display:grid;gap:8px">
+                <div style="height:44px;border-radius:8px;background:#f1f5f9;border:1px solid #e2e8f0"></div>
+                <div style="height:44px;border-radius:8px;background:#f1f5f9;border:1px solid #e2e8f0"></div>
+                <div style="height:44px;border-radius:8px;background:#f8fafc;border:1px solid #e2e8f0"></div>
+              </div>
+              <p style="margin:0;font-size:12px;line-height:1.7;color:#475569;text-wrap:pretty">catalog、上次 Room 的 timeline 与 project panel <strong style="font-weight:700">原子恢复</strong>；repair 完成前不显示"半个 Room"。</p>
+              <span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.08em;padding:4px 6px;border-radius:3px;border:1px solid #1f2937;color:#1f2937;width:max-content">EVT stable event</span>
+            </div>
+            </sc-if>
+
+            <sc-if value="{{ aNoRoom }}" hint-placeholder-val="{{ false }}">
+            <div role="status" style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:28px;display:grid;gap:14px;text-align:left">
+              <span style="font:700 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.1em;color:#64748b">EMPTY · SERVER PROJECTION</span>
+              <span style="font-size:17px;font-weight:700">还没有可进入的 Room</span>
+              <p style="margin:0;font-size:12.5px;line-height:1.7;color:#475569">catalog 已完整加载，此账户当前没有 active 或 archived Room。这里不是加载中，也不会展示演示 Room。</p>
+              <div style="display:flex;gap:8px;flex-wrap:wrap"><button type="button" style="min-height:36px;padding:0 14px;border:1px solid #1d4ed8;border-radius:6px;background:#1d4ed8;color:#fff;font:700 12px/1 inherit">使用邀请链接加入</button><button type="button" style="min-height:36px;padding:0 14px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#334155;font:600 12px/1 inherit">刷新 catalog</button></div>
+              <span style="font:500 10px/1.6 ui-monospace,Menlo,monospace;color:#64748b">恢复动作只发起明确 command/query；不会本地伪造 membership。</span>
+            </div>
+            </sc-if>
+
+            <sc-if value="{{ aDegraded }}" hint-placeholder-val="{{ false }}">
+            <div role="status" style="background:#fffaf0;border:1px solid #f0c48a;border-radius:12px;padding:28px;display:grid;gap:14px">
+              <span style="font:700 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.1em;color:#b54708">DEGRADED · CATALOG AVAILABLE</span>
+              <span style="font-size:17px;font-weight:700;color:#5c3a05">Room 列表可用，最近 Room 暂不可恢复</span>
+              <p style="margin:0;font-size:12.5px;line-height:1.7;color:#7c4a08">session 有效且 catalog 已校验，但上次 Room 的 projection 不完整。保留完整旧 cache，不展示半个 Room，也不接受写入。</p>
+              <div style="display:flex;gap:8px;flex-wrap:wrap"><button type="button" style="min-height:36px;padding:0 14px;border:1px solid #b54708;border-radius:6px;background:#b54708;color:#fff;font:700 12px/1 inherit">重试 repair</button><button type="button" style="min-height:36px;padding:0 14px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#334155;font:600 12px/1 inherit">选择其他 Room</button></div>
+            </div>
+            </sc-if>
+
+            <sc-if value="{{ aFatal }}" hint-placeholder-val="{{ false }}">
+            <div role="alert" style="background:#fff5f4;border:1px solid #f0a9a3;border-radius:12px;padding:28px;display:grid;gap:14px">
+              <span style="font:700 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.1em;color:#b42318">FATAL · FAIL CLOSED</span>
+              <span style="font-size:17px;font-weight:700;color:#8a2118">无法安全启动工作区</span>
+              <p style="margin:0;font-size:12.5px;line-height:1.7;color:#8a2118">本地加密 cache 校验失败且服务端无法完成权威重建。未解密、未展示任何 Room 内容；没有永久 spinner。</p>
+              <div style="display:flex;gap:8px;flex-wrap:wrap"><button type="button" style="min-height:36px;padding:0 14px;border:1px solid #b42318;border-radius:6px;background:#b42318;color:#fff;font:700 12px/1 inherit">重新认证并重建 cache</button><button type="button" style="min-height:36px;padding:0 14px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#334155;font:600 12px/1 inherit">导出无正文诊断</button></div>
+              <span style="font:500 10px/1.6 ui-monospace,Menlo,monospace;color:#8a2118">诊断只含稳定 ID、状态、大小与错误分类，不含消息/附件正文、token、secret 或隐藏推理。</span>
+            </div>
+            </sc-if>
+
+          </div>
+        </div>
+        </sc-if>
+
+        <!-- Room 主界面 -->
+        <sc-if value="{{ vShell }}" hint-placeholder-val="{{ true }}">
+        <div data-screen-label="Room 主界面" style="display:grid;grid-template-columns:248px minmax(0,1fr) 340px;min-height:0;position:relative">
+
+          <!-- 左栏 -->
+          <aside aria-label="Room 列表" style="border-right:1px solid #e2e8f0;background:#fff;display:grid;grid-template-rows:auto minmax(0,1fr) auto;min-height:0">
+            <div style="padding:14px 14px 10px;display:grid;gap:10px;border-bottom:1px solid #eef1f5">
+              <div style="display:flex;align-items:center;gap:8px">
+                <span style="width:26px;height:26px;border-radius:50%;background:#1d4ed8;display:grid;place-items:center;color:#fff;font:700 11px/1 inherit">陈</span>
+                <div style="display:grid;gap:1px;min-width:0">
+                  <span style="font-size:12px;font-weight:700">陈默</span>
+                  <span style="font:500 10px/1 ui-monospace,Menlo,monospace;color:#64748b">owner · 本设备 session</span>
+                </div>
+                <button type="button" onClick="{{ toggleNotif }}" aria-label="通知中心，3 条未读" style="margin-left:auto;position:relative;width:30px;height:30px;border:1px solid #cbd5e1;border-radius:7px;background:#fff;cursor:pointer;display:grid;place-items:center">
+                  <span style="width:12px;height:2px;background:#334155;box-shadow:0 4px 0 #334155,0 -4px 0 #334155"></span>
+                  <span style="position:absolute;top:-5px;right:-5px;min-width:16px;height:16px;padding:0 4px;border-radius:8px;background:#b42318;color:#fff;font:700 10px/16px ui-monospace,Menlo,monospace;text-align:center">3</span>
+                </button>
+              </div>
+            </div>
+
+            <div style="overflow:auto;padding:8px">
+              <div style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;color:#64748b;padding:6px 8px">ACTIVE ROOMS</div>
+
+              <div aria-current="true" style="display:grid;grid-template-columns:3px minmax(0,1fr) auto;gap:8px;padding:8px;border-radius:8px;background:#eef4ff;border:1px solid #d9e6ff;align-items:center">
+                <span style="width:3px;height:100%;border-radius:2px;background:#1d4ed8"></span>
+                <div style="display:grid;gap:3px;min-width:0">
+                  <span style="font-size:12.5px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">归档迁移 2026Q3</span>
+                  <span style="font-size:11px;color:#475569;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">3 Human · 2 Agent · Goal 已确认</span>
+                </div>
+                <div style="display:grid;gap:3px;justify-items:end">
+                  <span style="min-width:17px;height:17px;padding:0 5px;border-radius:9px;background:#b42318;color:#fff;font:700 10px/17px ui-monospace,Menlo,monospace">2</span>
+                  <span style="font:700 9px/1 ui-monospace,Menlo,monospace;letter-spacing:.06em;color:#b54708;border:1px solid #f0c48a;background:#fffaf0;border-radius:3px;padding:2px 3px">持球</span>
+                </div>
+              </div>
+
+              <div style="display:grid;grid-template-columns:3px minmax(0,1fr) auto;gap:8px;padding:8px;border-radius:8px;align-items:center">
+                <span style="width:3px;height:100%;border-radius:2px;background:transparent"></span>
+                <div style="display:grid;gap:3px;min-width:0">
+                  <span style="font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">供应商合规审阅</span>
+                  <span style="font-size:11px;color:#64748b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">2 Human · 1 Agent</span>
+                </div>
+                <span style="min-width:17px;height:17px;padding:0 5px;border-radius:9px;background:#e2e8f0;color:#334155;font:700 10px/17px ui-monospace,Menlo,monospace">5</span>
+              </div>
+
+              <div style="display:grid;grid-template-columns:3px minmax(0,1fr) auto;gap:8px;padding:8px;border-radius:8px;align-items:center">
+                <span style="width:3px;height:100%;border-radius:2px;background:transparent"></span>
+                <div style="display:grid;gap:3px;min-width:0">
+                  <span style="font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">内部工具试点</span>
+                  <span style="font-size:11px;color:#64748b">1 Human · 1 Agent</span>
+                </div>
+                <span></span>
+              </div>
+
+              <div style="height:1px;background:#eef1f5;margin:10px 8px"></div>
+              <button type="button" style="width:100%;display:flex;align-items:center;gap:8px;padding:8px;border:0;border-radius:8px;background:transparent;font:600 12px/1 inherit;color:#475569;cursor:pointer;text-align:left">
+                <span style="width:14px;height:11px;border:1px solid #94a3b8;border-radius:2px;display:block"></span>
+                已归档 Room（4）
+              </button>
+              <p style="margin:6px 8px 0;font-size:10.5px;line-height:1.6;color:#94a3b8">不设跨 Room 五分区工作台与全局搜索（DEF-001 / DEF-004）。</p>
+            </div>
+
+            <div style="padding:10px 12px;border-top:1px solid #eef1f5;display:grid;gap:6px">
+              <sc-if value="{{ netOffline }}" hint-placeholder-val="{{ false }}">
+              <div style="display:flex;gap:8px;align-items:center;padding:7px 8px;border:1px solid #cbd5e1;border-left:3px solid #b54708;border-radius:0 6px 6px 0;background:#fffaf0">
+                <span style="font:700 10px/1 ui-monospace,Menlo,monospace;color:#b54708">离线</span>
+                <span style="font-size:11px;line-height:1.5;color:#7c4a08">只读缓存 · 租约剩 6h 12m</span>
+              </div>
+              </sc-if>
+              <sc-if value="{{ netRepair }}" hint-placeholder-val="{{ false }}">
+              <div style="display:flex;gap:8px;align-items:center;padding:7px 8px;border:1px solid #cbd5e1;border-left:3px solid #1d4ed8;border-radius:0 6px 6px 0;background:#eef4ff">
+                <span style="font:700 10px/1 ui-monospace,Menlo,monospace;color:#175cd3">REPAIR</span>
+                <span style="font-size:11px;line-height:1.5;color:#1e3a8a">cursor 缺口 · 固定 watermark 重建</span>
+              </div>
+              </sc-if>
+              <sc-if value="{{ netRepairFailed }}" hint-placeholder-val="{{ false }}">
+              <div role="alert" style="display:grid;gap:5px;padding:8px;border:1px solid #f0a9a3;border-left:3px solid #b42318;border-radius:0 6px 6px 0;background:#fff5f4">
+                <span style="font:700 10px/1 ui-monospace,Menlo,monospace;color:#b42318">REPAIR FAILED</span>
+                <span style="font-size:11px;line-height:1.5;color:#8a2118">新快照未提交；继续使用完整旧 cache，只读且不显示半个 Room。</span>
+                <button type="button" onClick="{{ next }}" style="width:max-content;height:26px;padding:0 9px;border:1px solid #b42318;border-radius:5px;background:#fff;color:#b42318;font:700 10.5px/1 inherit">重试完整 repair</button>
+              </div>
+              </sc-if>
+              <sc-if value="{{ netOnline }}" hint-placeholder-val="{{ true }}">
+              <div style="display:flex;gap:8px;align-items:center;font-size:11px;color:#64748b">
+                <span style="width:7px;height:7px;border-radius:50%;background:#027a48"></span>
+                已连接 · cursor 连续
+              </div>
+              </sc-if>
+            </div>
+          </aside>
+
+          <!-- 中栏 -->
+          <main aria-label="消息时间线" style="display:grid;grid-template-rows:auto minmax(0,1fr) auto;min-height:0;background:#fff">
+            <div style="display:flex;align-items:center;gap:12px;padding:12px 20px;border-bottom:1px solid #e2e8f0">
+              <div style="display:grid;gap:3px;min-width:0">
+                <div style="display:flex;align-items:center;gap:8px">
+                  <span style="font-size:14px;font-weight:700">归档迁移 2026Q3</span>
+                  <span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.06em;padding:3px 5px;border-radius:3px;border:1px solid #cbd5e1;color:#475569">ROOM = PROJECT</span>
+                </div>
+                <span style="font-size:11px;color:#64748b">陈默 · 林澈 · 周予 ｜ 检索员 Agent（on-mention）· 记忆管家（steward）</span>
+              </div>
+              <div style="margin-left:auto;display:flex;gap:6px">
+                <button type="button" style="height:30px;padding:0 10px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;font:600 11.5px/1 inherit;color:#334155;cursor:pointer">成员与 Agent</button>
+                <button type="button" onClick="{{ toggleDrawer }}" style="height:30px;padding:0 10px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;font:600 11.5px/1 inherit;color:#334155;cursor:pointer">Room 设置</button>
+              </div>
+            </div>
+
+            <div style="overflow:auto;padding:18px 20px;display:grid;gap:14px;align-content:start" aria-live="polite" aria-relevant="additions">
+
+              <div style="display:flex;align-items:center;gap:10px;color:#94a3b8;font:500 10.5px/1 ui-monospace,Menlo,monospace">
+                <span style="flex:1;height:1px;background:#eef1f5"></span>8 月 18 日<span style="flex:1;height:1px;background:#eef1f5"></span>
+              </div>
+
+              <!-- Human 消息 + 附件 -->
+              <article style="display:grid;grid-template-columns:30px minmax(0,1fr);gap:10px;align-items:start">
+                <span aria-hidden="true" style="width:30px;height:30px;border-radius:50%;background:#0e7490;display:grid;place-items:center;color:#fff;font:700 12px/1 inherit">林</span>
+                <div style="min-width:0">
+                  <div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap">
+                    <span style="font-size:13px;font-weight:700">林澈</span>
+                    <span style="font:600 9.5px/1 ui-monospace,Menlo,monospace;letter-spacing:.08em;padding:2px 4px;border-radius:3px;border:1px solid #cbd5e1;color:#475569">HUMAN · admin</span>
+                    <span style="font-size:10.5px;color:#94a3b8">09:41</span>
+                  </div>
+                  <div style="display:inline-block;max-width:min(560px,100%);margin-top:5px;padding:9px 12px;border:1px solid #d9e6ff;border-radius:0 12px 12px;background:#eef4ff;font-size:13px;line-height:1.6;color:#1f2937">旧系统的导出清单我放上来了，第 3 节的字段映射还有两处对不上。</div>
+                  <div style="margin-top:8px;display:flex;gap:10px;align-items:center;max-width:420px;padding:9px 11px;border:1px solid #e2e8f0;border-radius:8px;background:#f8fafc">
+                    <span aria-hidden="true" style="width:26px;height:32px;border:1px solid #94a3b8;border-radius:3px;background:#fff;display:block;flex:none"></span>
+                    <div style="display:grid;gap:2px;min-width:0">
+                      <span style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">export-mapping-v7.xlsx</span>
+                      <span style="font:500 10px/1.4 ui-monospace,Menlo,monospace;color:#64748b">248 KB · sha256 4f9c… · 已提取文本</span>
+                    </div>
+                    <div style="margin-left:auto;display:flex;gap:5px">
+                      <button type="button" style="height:26px;padding:0 8px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;font:600 11px/1 inherit;cursor:pointer">预览</button>
+                      <button type="button" style="height:26px;padding:0 8px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;font:600 11px/1 inherit;cursor:pointer">下载</button>
+                    </div>
+                  </div>
+                  <div style="margin-top:6px;font-size:10.5px;color:#64748b">周予 已读 · 陈默 已读<span style="margin-left:8px;font:600 10px/1 ui-monospace,Menlo,monospace;color:#94a3b8">read receipt ≠ Agent judgement</span></div>
+                </div>
+              </article>
+
+              <!-- 撤回 tombstone -->
+              <article style="display:grid;grid-template-columns:30px minmax(0,1fr);gap:10px;align-items:start">
+                <span aria-hidden="true" style="width:30px;height:30px;border-radius:50%;background:#cbd5e1;display:grid;place-items:center;color:#475569;font:700 12px/1 inherit">周</span>
+                <div style="min-width:0">
+                  <div style="display:flex;align-items:baseline;gap:8px"><span style="font-size:13px;font-weight:700;color:#475569">周予</span><span style="font-size:10.5px;color:#94a3b8">09:44</span></div>
+                  <div style="display:inline-flex;gap:8px;align-items:center;margin-top:5px;padding:8px 11px;border:1px dashed #94a3b8;border-radius:6px;background:#f8fafc;font-size:12px;color:#475569">
+                    <span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;letter-spacing:.08em;color:#475569">TOMBSTONE</span>
+                    发送者已撤回此消息 · 09:45 撤回 · 关联 pending 调用已原子取消
+                  </div>
+                  <div style="margin-top:5px;font-size:10.5px;color:#64748b">原文仅保留于 Human 审计与 owner 导出，不进入 Agent 检索。</div>
+                </div>
+              </article>
+
+              <!-- Agent final + 更正 -->
+              <article style="display:grid;grid-template-columns:3px 30px minmax(0,1fr);gap:10px;align-items:start;padding:8px;margin:0 -8px;border-radius:8px;background:#f8fafc">
+                <span aria-hidden="true" style="width:3px;align-self:stretch;min-height:36px;border-radius:2px;background:#5b21b6"></span>
+                <span aria-hidden="true" style="width:30px;height:30px;border-radius:8px;background:#5b21b6;display:grid;place-items:center;color:#fff;font:700 12px/1 inherit">检</span>
+                <div style="min-width:0">
+                  <div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap">
+                    <span style="font-size:13px;font-weight:700">检索员</span>
+                    <span style="font:600 9.5px/1 ui-monospace,Menlo,monospace;letter-spacing:.08em;padding:2px 4px;border-radius:3px;color:#5b21b6;background:#f4f0ff;border:1px solid #ddd0f8">AGENT · 资料检索</span>
+                    <span style="font-size:10.5px;color:#94a3b8">09:47 · final</span>
+                    <span style="font:600 9.5px/1 ui-monospace,Menlo,monospace;padding:2px 4px;border-radius:3px;border:1px solid #1f2937;color:#1f2937">EVT</span>
+                  </div>
+                  <p style="margin:5px 0 0;font-size:13px;line-height:1.65;color:#1f2937;text-wrap:pretty">字段映射的两处冲突来自 2026-07-30 的旧口径：<span style="font:600 12px/1 ui-monospace,Menlo,monospace">owner_id</span> 在旧系统是部门编号，不是人。建议按新口径重写第 3 节。</p>
+                  <div style="margin-top:7px;display:flex;gap:6px;flex-wrap:wrap">
+                    <button type="button" style="display:inline-flex;gap:5px;align-items:center;height:24px;padding:0 7px;border:1px solid #cbd5e1;border-radius:4px;background:#fff;font:600 10.5px/1 inherit;color:#334155;cursor:pointer">来源 · 消息 #1187</button>
+                    <button type="button" style="display:inline-flex;gap:5px;align-items:center;height:24px;padding:0 7px;border:1px solid #cbd5e1;border-radius:4px;background:#fff;font:600 10.5px/1 inherit;color:#334155;cursor:pointer">来源 · export-mapping-v7.xlsx p.3</button>
+                    <span style="height:24px;display:inline-flex;align-items:center;padding:0 7px;border:1px solid #e2e8f0;border-radius:4px;font:500 10.5px/1 ui-monospace,Menlo,monospace;color:#64748b">context manifest</span>
+                  </div>
+                  <div style="margin-top:8px;padding:9px 11px;border:1px solid #f6c66d;border-radius:6px;background:#fff8e8">
+                    <div style="display:flex;gap:8px;align-items:baseline"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;letter-spacing:.08em;color:#81520a">CORRECTION</span><span style="font-size:10.5px;color:#81520a">09:52 · 更正 09:47 的 final</span></div>
+                    <p style="margin:5px 0 0;font-size:12.5px;line-height:1.6;color:#5c3a05">第二处冲突实际在第 4 节。原 final 保留不可修改，此条为追加关联更正。</p>
+                  </div>
+                </div>
+              </article>
+
+              <!-- J-06 Decision proposal 来源深链高亮锚点 -->
+              <article style="display:grid;grid-template-columns:30px minmax(0,1fr);gap:10px;align-items:start">
+                <span aria-hidden="true" style="width:30px;height:30px;border-radius:50%;background:#0e7490;display:grid;place-items:center;color:#fff;font:700 12px/1 inherit">林</span>
+                <div style="min-width:0">
+                  <div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap">
+                    <span style="font-size:13px;font-weight:700">林澈</span>
+                    <span style="font-size:10.5px;color:#94a3b8">09:55</span>
+                    <span style="font-size:10.5px;color:#64748b">已编辑 · v2</span>
+                  </div>
+                  <div style="display:inline-block;max-width:min(560px,100%);margin-top:5px;padding:9px 12px;border:1px solid #d9e6ff;border-radius:0 12px 12px;font-size:13px;line-height:1.6;background:{{ hlBg }};border-color:{{ hlBorder }};box-shadow:{{ hlRing }}">
+                    <span style="display:block;margin-bottom:6px;padding-left:8px;border-left:2px solid #94a3b8;font-size:11.5px;line-height:1.5;color:#475569">回复 检索员 09:47：owner_id 在旧系统是部门编号…</span>
+                    那就统一按新口径：迁移只保留人级 owner，部门维度放到标签里。
+                  </div>
+                  <sc-if value="{{ hlOn }}" hint-placeholder-val="{{ false }}">
+                  <div style="margin-top:6px;display:inline-flex;gap:6px;align-items:center;font:600 10.5px/1 ui-monospace,Menlo,monospace;color:#175cd3">来源定位命中 · 消息 #1203 v2</div>
+                  </sc-if>
+                </div>
+              </article>
+
+              <!-- 结构化寻址消息（J-03 / J-04 锚点） -->
+              <article style="display:grid;grid-template-columns:30px minmax(0,1fr);gap:10px;align-items:start">
+                <span aria-hidden="true" style="width:30px;height:30px;border-radius:50%;background:#1d4ed8;display:grid;place-items:center;color:#fff;font:700 12px/1 inherit">陈</span>
+                <div style="min-width:0">
+                  <div style="display:flex;align-items:baseline;gap:8px"><span style="font-size:13px;font-weight:700">陈默</span><span style="font:600 9.5px/1 ui-monospace,Menlo,monospace;letter-spacing:.08em;padding:2px 4px;border-radius:3px;border:1px solid #cbd5e1;color:#475569">HUMAN · owner</span><span style="font-size:10.5px;color:#94a3b8">10:02</span></div>
+                  <div style="display:inline-block;max-width:min(560px,100%);margin-top:5px;padding:9px 12px;border:1px solid #d9e6ff;border-radius:0 12px 12px;background:#eef4ff;font-size:13px;line-height:1.85;color:#1f2937">
+                    <span style="display:inline-flex;align-items:center;gap:4px;padding:1px 5px;border-radius:4px;background:#5b21b6;color:#fff;font-weight:700;font-size:12px"><span aria-hidden="true" style="width:7px;height:7px;border-radius:2px;background:#fff;display:inline-block"></span>@检索员</span>
+                    <span> 和 </span>
+                    <span style="display:inline-flex;align-items:center;gap:4px;padding:1px 5px;border-radius:4px;background:#0e7490;color:#fff;font-weight:700;font-size:12px"><span aria-hidden="true" style="width:7px;height:7px;border-radius:2px;background:#fff;display:inline-block"></span>@核对员</span>
+                    <span> 分别核对第 3、4 节，</span>
+                    <span style="font-weight:700;color:#1d4ed8;border-bottom:2px dashed currentcolor;padding:0 1px">@周予</span>
+                    <span> 请确认迁移窗口能不能压到 4 小时。</span>
+                  </div>
+                  <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">
+                    <span style="display:inline-flex;gap:5px;align-items:center;padding:3px 6px;border-radius:4px;background:#f4f0ff;border:1px solid #ddd0f8;font:600 10px/1.3 ui-monospace,Menlo,monospace;color:#5b21b6">2 × AGENT INVOCATION</span>
+                    <span style="display:inline-flex;gap:5px;align-items:center;padding:3px 6px;border-radius:4px;background:#eef4ff;border:1px dashed #84adff;font:600 10px/1.3 ui-monospace,Menlo,monospace;color:#175cd3">1 × HUMAN REQUEST（待接受）</span>
+                  </div>
+                </div>
+              </article>
+
+              <!-- @Human Request 卡 -->
+              <sc-if value="{{ reqAny }}" hint-placeholder-val="{{ false }}">
+              <div role="group" aria-label="Human Request" style="margin-left:40px;display:grid;gap:10px;padding:12px 14px;border:1px dashed #84adff;border-radius:8px;background:#f5f8ff">
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                  <span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;letter-spacing:.1em;color:#175cd3">HUMAN REQUEST</span>
+                  <span style="font-size:12px;font-weight:700;color:#0f172a">{{ reqTitle }}</span>
+                  <span style="margin-left:auto;font:600 10px/1 ui-monospace,Menlo,monospace;padding:3px 5px;border-radius:3px;border:1px solid #84adff;color:#175cd3;background:#fff">{{ reqState }}</span>
+                </div>
+                <p style="margin:0;font-size:12px;line-height:1.65;color:#334155;text-wrap:pretty">{{ reqBody }}</p>
+                <div style="display:flex;gap:6px;flex-wrap:wrap">
+                  <sc-if value="{{ reqPending }}" hint-placeholder-val="{{ false }}">
+                  <button type="button" onClick="{{ next }}" style="height:30px;padding:0 12px;border:1px solid #1d4ed8;border-radius:6px;background:#1d4ed8;color:#fff;font:700 12px/1 inherit;cursor:pointer">接受（我承担）</button>
+                  </sc-if>
+                  <sc-if value="{{ reqPending }}" hint-placeholder-val="{{ false }}">
+                  <button type="button" style="height:30px;padding:0 12px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;font:600 12px/1 inherit;color:#334155;cursor:pointer">拒绝</button>
+                  </sc-if>
+                  <sc-if value="{{ reqPending }}" hint-placeholder-val="{{ false }}">
+                  <button type="button" style="height:30px;padding:0 12px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;font:600 12px/1 inherit;color:#334155;cursor:pointer">转交…</button>
+                  </sc-if>
+                  <span style="font:500 10px/1.6 ui-monospace,Menlo,monospace;color:#64748b;align-self:center">{{ reqHint }}</span>
+                </div>
+              </div>
+              </sc-if>
+
+              <!-- Agent execution A -->
+              <sc-if value="{{ execAny }}" hint-placeholder-val="{{ false }}">
+              <div style="display:grid;grid-template-columns:3px 30px minmax(0,1fr);gap:10px;align-items:start;padding:8px;margin:0 -8px;border-radius:8px;background:#f8fafc">
+                <span aria-hidden="true" style="width:3px;align-self:stretch;border-radius:2px;background:#5b21b6"></span>
+                <span aria-hidden="true" style="width:30px;height:30px;border-radius:8px;background:#5b21b6;display:grid;place-items:center;color:#fff;font:700 12px/1 inherit">检</span>
+                <div style="min-width:0;display:grid;gap:8px">
+                  <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                    <span style="font-size:13px;font-weight:700">检索员</span>
+                    <span style="display:inline-flex;align-items:center;gap:5px;padding:3px 7px;border-radius:4px;border:1px solid {{ e1Line }};background:{{ e1Bg }};color:{{ e1Fg }};font:700 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.06em">{{ e1Icon }} {{ e1State }}</span>
+                    <span style="font-size:10.5px;color:#64748b">{{ e1Sub }}</span>
+                    <span style="margin-left:auto;font:500 10px/1 ui-monospace,Menlo,monospace;color:#94a3b8">exec 8f21 · attempt {{ e1Attempt }}</span>
+                  </div>
+                  <p style="margin:0;font-size:12px;line-height:1.6;color:#475569;text-wrap:pretty">{{ e1Note }}</p>
+
+                  <sc-if value="{{ e1Preview }}" hint-placeholder-val="{{ false }}">
+                  <div aria-live="off" style="padding:9px 11px;border:1px dotted #64748b;border-radius:6px;background:repeating-linear-gradient(135deg,#fff 0 6px,#f4f6f9 6px 12px);color:#475569;font-size:12.5px;line-height:1.6">
+                    <div style="display:flex;gap:8px;align-items:center;margin-bottom:5px"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;letter-spacing:.1em;color:#475569">PREVIEW · 非权威 · 可丢弃</span><span style="font-size:10px;color:#64748b">不进入历史 / 记忆 / 项目提取</span></div>
+                    第 3 节共 12 处映射，其中 owner_id、dept_code 两处与新口径冲突，正在核对第 4 节…
+                  </div>
+                  </sc-if>
+
+                  <sc-if value="{{ e1Final }}" hint-placeholder-val="{{ false }}">
+                  <div style="padding:0">
+                    <p style="margin:0;font-size:13px;line-height:1.65;color:#1f2937;text-wrap:pretty">第 3 节 12 处映射中有 2 处需改：owner_id 改为人级引用，dept_code 降为标签。已附来源。</p>
+                    <div style="margin-top:7px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+                      <span style="font:600 9.5px/1 ui-monospace,Menlo,monospace;padding:3px 5px;border-radius:3px;border:1px solid #1f2937;color:#1f2937">FINAL COMMITTED</span>
+                      <button type="button" style="height:24px;padding:0 7px;border:1px solid #cbd5e1;border-radius:4px;background:#fff;font:600 10.5px/1 inherit;color:#334155;cursor:pointer">来源 · 附件 p.3</button>
+                    </div>
+                  </div>
+                  </sc-if>
+
+                  <sc-if value="{{ e1Actions }}" hint-placeholder-val="{{ false }}">
+                  <div style="display:flex;gap:6px;flex-wrap:wrap">
+                    <button type="button" style="height:28px;padding:0 10px;border:1px solid #b42318;border-radius:5px;background:#fff;color:#b42318;font:600 11.5px/1 inherit;cursor:pointer">取消本次执行</button>
+                    <span style="align-self:center;font:500 10px/1.5 ui-monospace,Menlo,monospace;color:#64748b">仅 invoking Human 或 owner/admin 可取消</span>
+                  </div>
+                  </sc-if>
+                </div>
+              </div>
+              </sc-if>
+
+              <!-- Agent execution B -->
+              <sc-if value="{{ exec2Any }}" hint-placeholder-val="{{ false }}">
+              <div style="display:grid;grid-template-columns:3px 30px minmax(0,1fr);gap:10px;align-items:start;padding:8px;margin:0 -8px;border-radius:8px;background:#f8fafc">
+                <span aria-hidden="true" style="width:3px;align-self:stretch;border-radius:2px;background:#0e7490"></span>
+                <span aria-hidden="true" style="width:30px;height:30px;border-radius:8px;background:#0e7490;display:grid;place-items:center;color:#fff;font:700 12px/1 inherit">核</span>
+                <div style="min-width:0;display:grid;gap:8px">
+                  <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                    <span style="font-size:13px;font-weight:700">核对员</span>
+                    <span style="display:inline-flex;align-items:center;gap:5px;padding:3px 7px;border-radius:4px;border:1px solid {{ e2Line }};background:{{ e2Bg }};color:{{ e2Fg }};font:700 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.06em">{{ e2Icon }} {{ e2State }}</span>
+                    <span style="font-size:10.5px;color:#64748b">{{ e2Sub }}</span>
+                    <span style="margin-left:auto;font:500 10px/1 ui-monospace,Menlo,monospace;color:#94a3b8">{{ e2Id }}</span>
+                  </div>
+                  <p style="margin:0;font-size:12px;line-height:1.6;color:#475569;text-wrap:pretty">{{ e2Note }}</p>
+                  <sc-if value="{{ e2Recover }}" hint-placeholder-val="{{ false }}">
+                  <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+                    <button type="button" onClick="{{ next }}" style="height:28px;padding:0 10px;border:1px solid #1d4ed8;border-radius:5px;background:#1d4ed8;color:#fff;font:700 11.5px/1 inherit;cursor:pointer">重试（新 execution）</button>
+                    <button type="button" style="height:28px;padding:0 10px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;font:600 11.5px/1 inherit;color:#334155;cursor:pointer">查看诊断</button>
+                    <span style="font:500 10px/1.5 ui-monospace,Menlo,monospace;color:#64748b">同 Agent / 同模型 · retryOfExecutionId 谱系</span>
+                  </div>
+                  </sc-if>
+                  <sc-if value="{{ e2Final }}" hint-placeholder-val="{{ false }}">
+                  <p style="margin:0;font-size:13px;line-height:1.65;color:#1f2937;text-wrap:pretty">第 4 节仅 1 处需改：迁移窗口字段单位为分钟，文档写成小时。</p>
+                  </sc-if>
+                </div>
+              </div>
+              </sc-if>
+
+              <!-- 副作用确认 -->
+              <sc-if value="{{ confAny }}" hint-placeholder-val="{{ false }}">
+              <div role="group" aria-label="外部副作用确认" style="margin-left:40px;display:grid;gap:10px;padding:13px 15px;border:1px solid {{ confLine }};border-radius:8px;background:{{ confBg }}">
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                  <span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;letter-spacing:.1em;color:{{ confFg }}">SIDE-EFFECT · 逐次精确确认</span>
+                  <span style="margin-left:auto;font:700 10px/1 ui-monospace,Menlo,monospace;padding:3px 5px;border-radius:3px;border:1px solid {{ confLine }};background:#fff;color:{{ confFg }}">{{ confState }}</span>
+                </div>
+                <div style="font-size:12.5px;font-weight:700;color:#0f172a">检索员 请求执行 sandbox write</div>
+                <dl style="margin:0;display:grid;grid-template-columns:78px minmax(0,1fr);gap:5px 10px;font-size:11.5px;line-height:1.55">
+                  <dt style="color:#64748b;font-weight:600">目标</dt><dd style="margin:0;font-family:ui-monospace,Menlo,monospace">sandbox://room-2041/mapping/section-3.md</dd>
+                  <dt style="color:#64748b;font-weight:600">参数摘要</dt><dd style="margin:0;font-family:ui-monospace,Menlo,monospace">mode=overwrite · 4.2 KB · hash 91ab…</dd>
+                  <dt style="color:#64748b;font-weight:600">影响</dt><dd style="margin:0">覆盖 sandbox 内 1 个文件，不触达外部系统</dd>
+                  <dt style="color:#64748b;font-weight:600">可逆性</dt><dd style="margin:0">可逆 · 保留前一版本快照</dd>
+                  <dt style="color:#64748b;font-weight:600">有效期</dt><dd style="margin:0">服务端 09:58 过期（归档不暂停安全过期）</dd>
+                  <dt style="color:#64748b;font-weight:600">执行次数</dt><dd style="margin:0"><strong style="font-weight:700">一次性执行</strong> · grant 单次消费</dd>
+                </dl>
+                <p style="margin:0;font-size:11.5px;line-height:1.6;color:{{ confFg }};text-wrap:pretty">{{ confNote }}</p>
+                <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+                  <sc-if value="{{ confPending }}" hint-placeholder-val="{{ false }}">
+                  <button type="button" onClick="{{ next }}" style="height:30px;padding:0 12px;border:1px solid #b54708;border-radius:6px;background:#b54708;color:#fff;font:700 12px/1 inherit;cursor:pointer">确认执行这一次</button>
+                  </sc-if>
+                  <sc-if value="{{ confPending }}" hint-placeholder-val="{{ false }}">
+                  <button type="button" style="height:30px;padding:0 12px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;font:600 12px/1 inherit;color:#334155;cursor:pointer">拒绝</button>
+                  </sc-if>
+                  <sc-if value="{{ confPending }}" hint-placeholder-val="{{ false }}">
+                  <button type="button" style="height:30px;padding:0 12px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;font:600 12px/1 inherit;color:#334155;cursor:pointer">转交确认权…</button>
+                  </sc-if>
+                  <sc-if value="{{ confUnknown }}" hint-placeholder-val="{{ false }}">
+                  <button type="button" onClick="{{ next }}" style="height:30px;padding:0 12px;border:1px solid #8a5a00;border-radius:6px;background:#8a5a00;color:#fff;font:700 12px/1 inherit;cursor:pointer">开始 review 并闭合</button>
+                  </sc-if>
+                  <sc-if value="{{ confUnknown }}" hint-placeholder-val="{{ false }}">
+                  <span style="font:600 10px/1.5 ui-monospace,Menlo,monospace;color:#8a5a00;align-self:center">无「重试」入口：原 toolCall 永不二次执行</span>
+                  </sc-if>
+                  <sc-if value="{{ confRecover }}" hint-placeholder-val="{{ false }}">
+                  <button type="button" onClick="{{ next }}" style="height:30px;padding:0 12px;border:1px solid {{ confLine }};border-radius:6px;background:#fff;color:{{ confFg }};font:700 11.5px/1 inherit">{{ confRecoverLabel }}</button>
+                  </sc-if>
+                  <sc-if value="{{ confRecover }}" hint-placeholder-val="{{ false }}">
+                  <span style="font:600 10px/1.5 ui-monospace,Menlo,monospace;color:{{ confFg }};align-self:center">{{ confRecoverHint }}</span>
+                  </sc-if>
+                </div>
+              </div>
+              </sc-if>
+
+              <!-- 归档只读提示 -->
+              <sc-if value="{{ netOffline }}" hint-placeholder-val="{{ false }}">
+              <div style="padding:10px 12px;border:1px solid #cbd5e1;border-left:3px solid #b54708;border-radius:0 6px 6px 0;background:#fffaf0;font-size:12px;line-height:1.6;color:#7c4a08">离线只读：可浏览最后一次完整校验的加密 cache。<strong style="font-weight:700">不接受离线消息 / 项目 / 工具写入</strong>；重连后先 sync/repair，再由你显式重试。</div>
+              </sc-if>
+
+            </div>
+
+            <!-- composer -->
+            <div style="border-top:1px solid #e2e8f0;padding:12px 20px 14px;display:grid;gap:9px;background:#fff">
+              <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+                <span style="display:inline-flex;gap:5px;align-items:center;padding:3px 7px;border-radius:4px;background:#f1f5f9;border:1px solid #e2e8f0;font-size:11px;color:#334155">回复 检索员 09:47<button type="button" aria-label="移除引用" style="border:0;background:transparent;color:#64748b;font-size:12px;cursor:pointer;padding:0 2px">×</button></span>
+                <span style="font:500 10px/1 ui-monospace,Menlo,monospace;color:#94a3b8">reply-to 绑定 messageId · 不创建 Thread</span>
+              </div>
+              <sc-if value="{{ attAny }}" hint-placeholder-val="{{ false }}">
+              <div role="status" aria-label="附件状态" style="display:grid;grid-template-columns:38px minmax(0,1fr) auto;gap:10px;align-items:center;padding:10px 11px;border:1px solid {{ attLine }};border-radius:7px;background:{{ attBg }}">
+                <span aria-hidden="true" style="width:38px;height:38px;border:1px solid {{ attLine }};border-radius:6px;background:#fff;display:grid;place-items:center;font:700 10px/1 ui-monospace,Menlo,monospace;color:{{ attFg }}">{{ attIcon }}</span>
+                <span style="display:grid;gap:4px;min-width:0"><span style="display:flex;gap:7px;align-items:center;flex-wrap:wrap"><strong style="font-size:12px">迁移字段映射.pdf</strong><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;color:{{ attFg }}">{{ attState }}</span></span><span style="font-size:11px;line-height:1.5;color:{{ attFg }}">{{ attNote }}</span><span style="font:500 9.5px/1.5 ui-monospace,Menlo,monospace;color:#64748b">{{ attAuthority }}</span></span>
+                <span style="display:flex;gap:6px;align-items:center">
+                  <sc-if value="{{ attCanCancel }}" hint-placeholder-val="{{ false }}"><button type="button" onClick="{{ next }}" style="height:27px;padding:0 9px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;color:#334155;font:600 10.5px/1 inherit">取消</button></sc-if>
+                  <sc-if value="{{ attCanRetry }}" hint-placeholder-val="{{ false }}"><button type="button" onClick="{{ next }}" style="height:27px;padding:0 9px;border:1px solid {{ attLine }};border-radius:5px;background:#fff;color:{{ attFg }};font:700 10.5px/1 inherit">重试上传</button></sc-if>
+                  <sc-if value="{{ attCanRemove }}" hint-placeholder-val="{{ false }}"><button type="button" onClick="{{ next }}" style="height:27px;padding:0 9px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;color:#334155;font:600 10.5px/1 inherit">移除</button></sc-if>
+                </span>
+              </div>
+              </sc-if>
+              <div style="border:1px solid {{ cmpLine }};border-radius:9px;background:#fff;display:grid">
+                <div contenteditable="false" role="textbox" aria-label="消息输入" tabindex="0" style="min-height:64px;padding:11px 12px;font-size:13px;line-height:1.7;color:#1f2937">{{ cmpText }}</div>
+                <div style="display:flex;align-items:center;gap:8px;padding:8px 10px;border-top:1px solid #eef1f5">
+                  <button type="button" style="height:28px;padding:0 9px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;font:600 11.5px/1 inherit;color:#334155;cursor:pointer">@ 寻址…</button>
+                  <button type="button" style="height:28px;padding:0 9px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;font:600 11.5px/1 inherit;color:#334155;cursor:pointer">附件</button>
+                  <span style="font:500 10px/1.5 ui-monospace,Menlo,monospace;color:#94a3b8">⌘↩ 发送 · ⌥↑ 定位上一条待我处理</span>
+                  <span style="margin-left:auto;display:inline-flex;align-items:center;gap:7px">
+                    <span style="font-size:11px;color:{{ cmpFg }};font-weight:600">{{ cmpStatus }}</span>
+                    <button type="button" onClick="{{ next }}" disabled="{{ cmpDisabled }}" style="height:30px;padding:0 14px;border:1px solid {{ cmpBtnLine }};border-radius:6px;background:{{ cmpBtnBg }};color:{{ cmpBtnFg }};font:700 12px/1 inherit;cursor:pointer">{{ cmpBtn }}</button>
+                  </span>
+                </div>
+              </div>
+              <sc-if value="{{ cmpFailed }}" hint-placeholder-val="{{ false }}">
+              <div style="display:flex;gap:9px;align-items:center;padding:9px 11px;border:1px solid #f0a9a3;border-left:3px solid #b42318;border-radius:0 6px 6px 0;background:#fff5f4">
+                <span style="font:700 10px/1 ui-monospace,Menlo,monospace;color:#b42318">503 可重试</span>
+                <span style="font-size:12px;line-height:1.6;color:#8a2118">服务端暂不可用，消息未提交。<strong style="font-weight:700">输入已保留</strong>，重试使用同一 idempotency key，不会产生第二条。</span>
+                <button type="button" onClick="{{ next }}" style="margin-left:auto;height:28px;padding:0 11px;border:1px solid #b42318;border-radius:5px;background:#fff;color:#b42318;font:700 11.5px/1 inherit;cursor:pointer">重试发送</button>
+              </div>
+              </sc-if>
+              <sc-if value="{{ netOffline }}" hint-placeholder-val="{{ false }}">
+              <div style="font:600 11px/1.5 inherit;color:#7c4a08">离线状态下发送被禁用；不会显示「已发送」。</div>
+              </sc-if>
+            </div>
+          </main>
+
+          <!-- 右栏 -->
+          <aside aria-label="项目与记忆面板" style="border-left:1px solid #e2e8f0;background:#fff;display:grid;grid-template-rows:auto minmax(0,1fr);min-height:0">
+            <div style="display:flex;gap:2px;padding:10px 12px 0;border-bottom:1px solid #e2e8f0">
+              <button type="button" aria-current="true" style="padding:8px 10px;border:0;border-bottom:2px solid #1f2937;background:transparent;font:700 12px/1 inherit;color:#0f172a;cursor:pointer">项目</button>
+              <button type="button" style="padding:8px 10px;border:0;border-bottom:2px solid transparent;background:transparent;font:600 12px/1 inherit;color:#64748b;cursor:pointer">记忆</button>
+              <button type="button" style="padding:8px 10px;border:0;border-bottom:2px solid transparent;background:transparent;font:600 12px/1 inherit;color:#64748b;cursor:pointer">Agent</button>
+              <span style="margin-left:auto;align-self:center;font:500 10px/1 ui-monospace,Menlo,monospace;color:#94a3b8">room-2041</span>
+            </div>
+            <div style="overflow:auto;padding:12px;display:grid;gap:12px;align-content:start">
+
+              <section style="border:1px solid #e2e8f0;border-left:3px solid #027a48;border-radius:0 8px 8px 0;padding:11px 12px;display:grid;gap:7px">
+                <div style="display:flex;align-items:center;gap:7px"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;letter-spacing:.1em;color:#027a48">GOAL · CONFIRMED</span><span style="margin-left:auto;font:500 9.5px/1 ui-monospace,Menlo,monospace;color:#94a3b8">v3</span></div>
+                <p style="margin:0;font-size:12.5px;font-weight:600;line-height:1.55;color:#0f172a;text-wrap:pretty">9 月 12 日前完成旧归档系统到新平台的数据迁移，停机窗口不超过 4 小时。</p>
+                <div style="font-size:10.5px;color:#64748b">陈默 确认 · 08-14 · <a href="#src">来源消息 #0981</a> · 同时最多一个 active</div>
+              </section>
+
+              <section style="display:grid;gap:7px">
+                <div style="display:flex;align-items:center;gap:7px"><h3 style="margin:0;font-size:11px;font-weight:700;letter-spacing:.06em;color:#475569">DECISIONS</h3><span style="margin-left:auto;font-size:10.5px;color:#94a3b8">3</span></div>
+
+                <sc-if value="{{ decProposed }}" hint-placeholder-val="{{ true }}">
+                <article style="border:1px dashed #94a3b8;border-radius:8px;padding:10px 11px;display:grid;gap:7px;background:#fbfcfd">
+                  <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+                    <span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;letter-spacing:.08em;color:#475569">PROPOSAL · 未生效</span>
+                    <span style="font-size:10px;color:#64748b">由 检索员 提出</span>
+                  </div>
+                  <p style="margin:0;font-size:12px;line-height:1.55;color:#1f2937;text-wrap:pretty">迁移只保留人级 owner，部门维度改为标签。</p>
+                  <div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center">
+                    <button type="button" onClick="{{ jumpSource }}" style="height:26px;padding:0 8px;border:1px solid #cbd5e1;border-radius:4px;background:#fff;font:600 10.5px/1 inherit;color:#334155;cursor:pointer">查看来源 #1203</button>
+                    <button type="button" onClick="{{ confirmDec }}" style="height:26px;padding:0 8px;border:1px solid #027a48;border-radius:4px;background:#fff;color:#027a48;font:700 10.5px/1 inherit;cursor:pointer">确认</button>
+                    <button type="button" style="height:26px;padding:0 8px;border:1px solid #cbd5e1;border-radius:4px;background:#fff;font:600 10.5px/1 inherit;color:#334155;cursor:pointer">驳回</button>
+                  </div>
+                  <p style="margin:0;font:500 10px/1.5 ui-monospace,Menlo,monospace;color:#64748b">Agent 提出的项目事实不会自行成为 confirmed。</p>
+                </article>
+                </sc-if>
+
+                <sc-if value="{{ decConfirmed }}" hint-placeholder-val="{{ false }}">
+                <article style="border:1px solid #e2e8f0;border-left:3px solid #027a48;border-radius:0 8px 8px 0;padding:10px 11px;display:grid;gap:6px">
+                  <div style="display:flex;align-items:center;gap:6px"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;letter-spacing:.08em;color:#027a48">CONFIRMED</span><span style="margin-left:auto;font:500 9.5px/1 ui-monospace,Menlo,monospace;color:#94a3b8">v1</span></div>
+                  <p style="margin:0;font-size:12px;line-height:1.55;color:#0f172a;font-weight:600;text-wrap:pretty">迁移只保留人级 owner，部门维度改为标签。</p>
+                  <div style="font-size:10.5px;color:#64748b">陈默 确认 · 10:11 · <a href="#src">来源 #1203</a></div>
+                </article>
+                </sc-if>
+
+                <sc-if value="{{ decSuperseded }}" hint-placeholder-val="{{ false }}">
+                <article style="border:1px solid #e2e8f0;border-radius:8px;padding:10px 11px;display:grid;gap:6px;background:#f8fafc;color:#64748b">
+                  <div style="display:flex;align-items:center;gap:6px"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;letter-spacing:.08em;color:#64748b">SUPERSEDED</span></div>
+                  <p style="margin:0;font-size:12px;line-height:1.55;text-decoration:line-through">按部门维度保留 owner_id 原字段。</p>
+                  <div style="font-size:10.5px">被 v2 取代 · 双向链保留 · <a href="#src">查看新结论</a></div>
+                </article>
+                </sc-if>
+
+                <article style="border:1px solid #e2e8f0;border-left:3px solid #027a48;border-radius:0 8px 8px 0;padding:10px 11px;display:grid;gap:6px">
+                  <div style="display:flex;align-items:center;gap:6px"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;letter-spacing:.08em;color:#027a48">CONFIRMED</span><span style="margin-left:auto;font:500 9.5px/1 ui-monospace,Menlo,monospace;color:#94a3b8">v1</span></div>
+                  <p style="margin:0;font-size:12px;line-height:1.55;color:#0f172a;font-weight:600">停机窗口按 4 小时上限对外承诺。</p>
+                  <div style="font-size:10.5px;color:#64748b">林澈 确认 · 08-15 · <a href="#src">来源 #1042</a></div>
+                </article>
+              </section>
+
+              <section style="display:grid;gap:7px">
+                <div style="display:flex;align-items:center;gap:7px"><h3 style="margin:0;font-size:11px;font-weight:700;letter-spacing:.06em;color:#475569">NEXTACTIONS</h3><span style="margin-left:auto;font-size:10.5px;color:#94a3b8">4</span></div>
+
+                <article style="border:1px solid #e2e8f0;border-radius:8px;padding:10px 11px;display:grid;gap:6px">
+                  <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+                    <span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;color:#475569">IN_PROGRESS</span>
+                    <span style="margin-left:auto;font:600 9.5px/1 ui-monospace,Menlo,monospace;color:#b54708;border:1px solid #f0c48a;background:#fffaf0;border-radius:3px;padding:2px 4px">持球 · 周予</span>
+                  </div>
+                  <p style="margin:0;font-size:12px;line-height:1.55;color:#0f172a;font-weight:600">核算 4 小时窗口下的分批切换方案</p>
+                  <div style="font-size:10.5px;color:#64748b">owner 周予（Human）· 期限 08-20 · 验收人 陈默</div>
+                </article>
+
+                <sc-if value="{{ reqAccepted }}" hint-placeholder-val="{{ false }}">
+                <article style="border:1px solid #e2e8f0;border-left:3px solid #1d4ed8;border-radius:0 8px 8px 0;padding:10px 11px;display:grid;gap:6px">
+                  <div style="display:flex;align-items:center;gap:6px"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;color:#175cd3">ACCEPTED · 新建</span><span style="margin-left:auto;font:500 9.5px/1 ui-monospace,Menlo,monospace;color:#94a3b8">由 Request 原子创建</span></div>
+                  <p style="margin:0;font-size:12px;line-height:1.55;color:#0f172a;font-weight:600">确认迁移窗口能否压到 4 小时</p>
+                  <div style="font-size:10.5px;color:#64748b">owner 周予 · 来源 Request #R-77 · Ball 已迁移至此</div>
+                </article>
+                </sc-if>
+
+                <article style="border:1px dashed #94a3b8;border-radius:8px;padding:10px 11px;display:grid;gap:6px;background:#fbfcfd">
+                  <div style="display:flex;align-items:center;gap:6px"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;color:#475569">PROPOSED · 待 Human 确认</span></div>
+                  <p style="margin:0;font-size:12px;line-height:1.55;color:#1f2937">由 检索员 生成第 4 节字段映射修订稿</p>
+                  <div style="font-size:10.5px;color:#64748b">拟 owner 检索员（Agent）· 需具名 Human 确认，且验收人不得为该 Agent</div>
+                </article>
+
+                <article style="border:1px solid #e2e8f0;border-radius:8px;padding:10px 11px;display:grid;gap:6px;opacity:.72">
+                  <div style="display:flex;align-items:center;gap:6px"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;color:#027a48">DELIVERED → 待验收</span></div>
+                  <p style="margin:0;font-size:12px;line-height:1.55;color:#0f172a">导出旧系统字段清单</p>
+                  <div style="font-size:10.5px;color:#64748b">owner 检索员（Agent）· 交付物 2 项 · 验收人 林澈（持球）</div>
+                </article>
+              </section>
+
+              <section style="display:grid;gap:7px">
+                <h3 style="margin:0;font-size:11px;font-weight:700;letter-spacing:.06em;color:#475569">BLOCKERS / OPENQUESTIONS</h3>
+                <article style="border:1px solid #f0a9a3;border-left:3px solid #b42318;border-radius:0 8px 8px 0;padding:10px 11px;display:grid;gap:6px;background:#fff8f7">
+                  <div style="display:flex;align-items:center;gap:6px"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;color:#b42318">OPEN · 已升级一次</span></div>
+                  <p style="margin:0;font-size:12px;line-height:1.55;color:#0f172a;font-weight:600">旧系统只读账号权限未开通，无法验证抽样</p>
+                  <div style="font-size:10.5px;color:#8a2118">owner 林澈 · cannot_answer 升级 08-17 · 转交提案待目标接受</div>
+                </article>
+                <article style="border:1px solid #e2e8f0;border-radius:8px;padding:10px 11px;display:grid;gap:6px">
+                  <div style="display:flex;align-items:center;gap:6px"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;color:#475569">DEFERRED · reviewAt 08-19</span></div>
+                  <p style="margin:0;font-size:12px;line-height:1.55;color:#1f2937">是否需要保留 2023 年前的历史附件</p>
+                  <div style="font-size:10.5px;color:#64748b">理由：等法务口径 · reviewAt 到达自动回到 open</div>
+                </article>
+              </section>
+
+              <section style="display:grid;gap:7px">
+                <h3 style="margin:0;font-size:11px;font-weight:700;letter-spacing:.06em;color:#475569">重要记忆 · 5 类</h3>
+                <div style="display:grid;gap:6px;font-size:11.5px;line-height:1.5">
+                  <div style="display:flex;gap:8px;padding:8px 9px;border:1px solid #e2e8f0;border-radius:6px"><span style="font:700 9.5px/1.4 ui-monospace,Menlo,monospace;color:#027a48;flex:none">CONTEXT</span><span style="color:#334155">停机窗口受客户合同约束，不可协商。</span></div>
+                  <div style="display:flex;gap:8px;padding:8px 9px;border:1px solid #cbd5e1;border-radius:6px;background:repeating-linear-gradient(135deg,#fff 0 6px,#f6f7f9 6px 12px)"><span style="font:700 9.5px/1.4 ui-monospace,Menlo,monospace;color:#b54708;flex:none">DISPUTED</span><span style="color:#475569">旧系统夜间无写入流量 — 周予 已提出争议，暂停注入 Agent context。</span></div>
+                  <div style="display:flex;gap:8px;padding:8px 9px;border:1px solid #e2e8f0;border-radius:6px"><span style="font:700 9.5px/1.4 ui-monospace,Menlo,monospace;color:#475569;flex:none">STEWARD</span><span style="color:#334155">记忆管家：watermark 至 #1203，落后 0 条。</span></div>
+                </div>
+                <button type="button" style="height:28px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;font:600 11.5px/1 inherit;color:#334155;cursor:pointer">在当前 Room 内检索…</button>
+                <p style="margin:0;font-size:10px;line-height:1.5;color:#94a3b8">仅当前 Room 检索与按需取回原文；不建设跨 Room 全局搜索。</p>
+              </section>
+            </div>
+          </aside>
+
+          <!-- 通知中心 -->
+          <sc-if value="{{ notifOpen }}" hint-placeholder-val="{{ false }}">
+          <div role="dialog" aria-label="通知中心" style="position:absolute;top:8px;left:256px;width:396px;background:#fff;border:1px solid #94a3b8;border-radius:10px;box-shadow:0 18px 40px rgb(15 23 42 / 18%);z-index:20;display:grid;grid-template-rows:auto minmax(0,1fr) auto;max-height:520px">
+            <div style="display:flex;align-items:center;gap:8px;padding:11px 13px;border-bottom:1px solid #e2e8f0">
+              <span style="font-size:13px;font-weight:700">通知</span>
+              <span style="font:500 10px/1 ui-monospace,Menlo,monospace;color:#64748b">flat · durable · recipient-scoped</span>
+              <button type="button" onClick="{{ toggleNotif }}" aria-label="关闭通知中心" style="margin-left:auto;width:24px;height:24px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;cursor:pointer;color:#475569">×</button>
+            </div>
+            <div style="overflow:auto;padding:8px;display:grid;gap:6px">
+              <button type="button" onClick="{{ jumpSource }}" style="text-align:left;display:grid;gap:5px;padding:10px 11px;border:1px solid #d9e6ff;border-left:3px solid #1d4ed8;border-radius:0 7px 7px 0;background:#f7faff;cursor:pointer;font:inherit">
+                <div style="display:flex;gap:7px;align-items:center"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;color:#175cd3">TOOL CONFIRMATION</span><span style="margin-left:auto;font:600 9.5px/1 ui-monospace,Menlo,monospace;color:#b54708">未处理</span></div>
+                <span style="font-size:12px;line-height:1.5;color:#0f172a;font-weight:600">检索员 请求 sandbox write 确认</span>
+                <span style="font-size:10.5px;color:#64748b">09:56 · 你是当前唯一 confirmation principal · 点击定位来源</span>
+              </button>
+              <button type="button" onClick="{{ jumpSource }}" style="text-align:left;display:grid;gap:5px;padding:10px 11px;border:1px solid #e2e8f0;border-radius:7px;background:#fff;cursor:pointer;font:inherit">
+                <div style="display:flex;gap:7px;align-items:center"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;color:#475569">HUMAN REQUEST</span><span style="margin-left:auto;font:600 9.5px/1 ui-monospace,Menlo,monospace;color:#b54708">未处理</span></div>
+                <span style="font-size:12px;line-height:1.5;color:#0f172a;font-weight:600">陈默 请你确认迁移窗口</span>
+                <span style="font-size:10.5px;color:#64748b">10:02 · 已读不等于已处理</span>
+              </button>
+              <button type="button" style="text-align:left;display:grid;gap:5px;padding:10px 11px;border:1px solid #e2e8f0;border-radius:7px;background:#fff;cursor:pointer;font:inherit">
+                <div style="display:flex;gap:7px;align-items:center"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;color:#475569">AGENT FAILED</span><span style="margin-left:auto;font:600 9.5px/1 ui-monospace,Menlo,monospace;color:#b54708">未处理</span></div>
+                <span style="font-size:12px;line-height:1.5;color:#0f172a;font-weight:600">核对员 执行失败：provider timeout</span>
+                <span style="font-size:10.5px;color:#64748b">10:04 · 恢复动作：重试 / 查看诊断 · <strong style="font-weight:700">acknowledge 后才 handled</strong></span>
+              </button>
+              <div style="display:grid;gap:5px;padding:10px 11px;border:1px solid #e2e8f0;border-radius:7px;background:#f8fafc;opacity:.8">
+                <div style="display:flex;gap:7px;align-items:center"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;color:#475569">DUE REMINDER</span><span style="margin-left:auto;font:600 9.5px/1 ui-monospace,Menlo,monospace;color:#027a48">已处理</span></div>
+                <span style="font-size:12px;line-height:1.5;color:#334155">NextAction「导出旧系统字段清单」已交付</span>
+                <span style="font-size:10.5px;color:#64748b">到期后每 24h 提醒一次，跨重启去重</span>
+              </div>
+              <div style="display:grid;gap:5px;padding:10px 11px;border:1px dashed #94a3b8;border-radius:7px;background:#f8fafc">
+                <span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;color:#475569">来源不可访问</span>
+                <span style="font-size:12px;line-height:1.5;color:#334155">你已不再是该 Room 成员，通知来源无法打开。</span>
+                <span style="font-size:10.5px;color:#64748b">安全失败：不泄露标题与正文，本地项已清除</span>
+              </div>
+              <sc-if value="{{ notifSyncAny }}" hint-placeholder-val="{{ false }}">
+              <div role="status" style="display:grid;gap:7px;padding:10px 11px;border:1px solid #84adff;border-radius:7px;background:#eef4ff">
+                <div style="display:flex;gap:7px;align-items:center"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;color:#175cd3">MULTI-SESSION CONVERGENCE</span><span style="margin-left:auto;font:700 9.5px/1 ui-monospace,Menlo,monospace;color:{{ notifSyncFg }}">{{ notifSyncState }}</span></div>
+                <span style="font-size:11.5px;line-height:1.55;color:#1e3a8a">{{ notifSyncNote }}</span>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font:600 9.5px/1.5 ui-monospace,Menlo,monospace;color:#475569"><span style="padding:5px 7px;border:1px solid #b9d0f5;border-radius:4px;background:#fff">MacBook · {{ notifMac }}</span><span style="padding:5px 7px;border:1px solid #b9d0f5;border-radius:4px;background:#fff">iMac · {{ notifImac }}</span></div>
+                <span style="font:500 9.5px/1.5 ui-monospace,Menlo,monospace;color:#64748b">read 由 notification.read stable event 收敛；handled 只由 source 对象终态投影，任一 session 均不能本地伪造。</span>
+              </div>
+              </sc-if>
+            </div>
+            <div style="padding:9px 12px;border-top:1px solid #e2e8f0;display:flex;gap:8px;align-items:center">
+              <button type="button" style="height:27px;padding:0 9px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;font:600 11px/1 inherit;color:#334155;cursor:pointer">全部标为已读</button>
+              <span style="font:500 10px/1.4 ui-monospace,Menlo,monospace;color:#94a3b8">read 不清除责任 · 无 OS push</span>
+            </div>
+          </div>
+          </sc-if>
+
+          <!-- Room settings drawer -->
+          <sc-if value="{{ drawerOpen }}" hint-placeholder-val="{{ false }}">
+          <div role="dialog" aria-modal="true" aria-label="Room 设置" style="position:absolute;inset:0;background:rgb(15 23 42 / 32%);z-index:30;display:grid;grid-template-columns:minmax(0,1fr) 560px">
+            <button type="button" onClick="{{ toggleDrawer }}" aria-label="关闭设置" style="border:0;background:transparent;cursor:pointer"></button>
+            <div style="background:#fff;border-left:1px solid #94a3b8;display:grid;grid-template-rows:auto minmax(0,1fr);min-height:0;box-shadow:-18px 0 40px rgb(15 23 42 / 18%)">
+              <div style="padding:14px 18px;border-bottom:1px solid #e2e8f0;display:flex;align-items:center;gap:10px">
+                <div style="display:grid;gap:3px"><span style="font-size:14px;font-weight:700">Room 设置 · 归档迁移 2026Q3</span><span style="font-size:11px;color:#64748b">你的角色：owner · 全部治理动作可用</span></div>
+                <button type="button" onClick="{{ toggleDrawer }}" style="margin-left:auto;width:28px;height:28px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;cursor:pointer;color:#475569">×</button>
+              </div>
+              <div style="overflow:auto;padding:16px 18px 24px;display:grid;gap:16px;align-content:start">
+
+                <section style="border:1px dashed #84adff;border-radius:9px;background:#f5f8ff;padding:14px;display:grid;gap:11px">
+                  <div style="display:grid;gap:3px">
+                    <span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;letter-spacing:.1em;color:#175cd3">流程 A · HUMAN INVITATION</span>
+                    <span style="font-size:13px;font-weight:700">邀请 Human（需对方显式接受）</span>
+                  </div>
+                  <div style="display:grid;grid-template-columns:minmax(0,1fr) 132px;gap:8px">
+                    <input type="text" value="zhou.yu@studio.internal" readonly="readonly" style="min-height:36px;padding:8px 10px;border:1px solid #64748b;border-radius:6px;font:inherit;font-size:13px;background:#fff" />
+                    <select style="min-height:36px;padding:8px 10px;border:1px solid #64748b;border-radius:6px;font:inherit;font-size:13px;background:#fff"><option>member</option><option>admin</option></select>
+                  </div>
+                  <div style="display:flex;gap:8px;align-items:center">
+                    <button type="button" style="height:34px;padding:0 14px;border:1px solid #175cd3;border-radius:6px;background:#fff;color:#175cd3;font:700 12.5px/1 inherit;cursor:pointer">发送邀请</button>
+                    <span style="display:inline-flex;gap:6px;align-items:center;font-size:11.5px;color:#175cd3"><span style="width:12px;height:12px;border:2px solid #84adff;border-top-color:#175cd3;border-radius:50%;display:block"></span>submitting… 等待 server ACK</span>
+                  </div>
+                  <p style="margin:0;font-size:11px;line-height:1.6;color:#334155">邀请只在收到 durable ACK 后显示为「已发送」。<strong style="font-weight:700">接受前不产生 membership</strong>，Agent 不走这条路径。</p>
+                </section>
+
+                <section style="border:1px solid #cbd5e1;border-left:6px solid #344054;border-radius:0 9px 9px 0;background:#f8fafc;padding:14px;display:grid;gap:11px">
+                  <div style="display:grid;gap:3px">
+                    <span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;letter-spacing:.1em;color:#344054">流程 B · AGENT ASSIGNMENT</span>
+                    <span style="font-size:13px;font-weight:700">配置 Agent（无接受步骤，立即生效）</span>
+                  </div>
+                  <div style="display:grid;gap:9px">
+                    <div style="border:1px solid #e2e8f0;border-radius:8px;background:#fff;padding:11px;display:grid;gap:9px">
+                      <div style="display:flex;align-items:center;gap:9px">
+                        <span aria-hidden="true" style="width:28px;height:28px;border-radius:8px;background:#5b21b6;display:grid;place-items:center;color:#fff;font:700 11px/1 inherit">检</span>
+                        <div style="display:grid;gap:2px"><span style="font-size:12.5px;font-weight:700">检索员</span><span style="font:500 10px/1 ui-monospace,Menlo,monospace;color:#64748b">Global Profile · agent_7f21 · 改名不改 actorId</span></div>
+                        <span style="margin-left:auto;display:inline-flex;align-items:center;gap:5px;padding:3px 6px;border-radius:4px;border:1px solid #a7d8c0;background:#f0fdf6;font:700 10px/1 ui-monospace,Menlo,monospace;color:#027a48">● ready</span>
+                      </div>
+                      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+                        <label style="display:grid;gap:5px"><span style="font-size:11.5px;font-weight:700">房间职责</span><input type="text" value="资料检索与字段核对" readonly="readonly" style="min-height:34px;padding:7px 9px;border:1px solid #64748b;border-radius:6px;font:inherit;font-size:12.5px" /></label>
+                        <label style="display:grid;gap:5px"><span style="font-size:11.5px;font-weight:700">participation</span><select style="min-height:34px;padding:7px 9px;border:1px solid #64748b;border-radius:6px;font:inherit;font-size:12.5px"><option>on-mention</option><option>active</option></select></label>
+                      </div>
+                      <fieldset style="margin:0;border:1px solid #cbd5e1;border-radius:7px;padding:9px">
+                        <legend style="font-size:11.5px;font-weight:700;padding:0 4px">工具 grant（全局能力的子集）</legend>
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:11.5px">
+                          <span style="display:flex;gap:6px;align-items:center;padding:5px 7px;border:1px solid #e2e8f0;border-radius:5px"><span aria-hidden="true" style="width:13px;height:13px;border:1px solid #334155;border-radius:3px;background:#334155;display:grid;place-items:center;color:#fff;font-size:9px">✓</span>room-memory lookup<span style="margin-left:auto;font:600 9px/1 ui-monospace,Menlo,monospace;color:#027a48">读</span></span>
+                          <span style="display:flex;gap:6px;align-items:center;padding:5px 7px;border:1px solid #e2e8f0;border-radius:5px"><span aria-hidden="true" style="width:13px;height:13px;border:1px solid #334155;border-radius:3px;background:#334155;display:grid;place-items:center;color:#fff;font-size:9px">✓</span>附件读取<span style="margin-left:auto;font:600 9px/1 ui-monospace,Menlo,monospace;color:#027a48">读</span></span>
+                          <span style="display:flex;gap:6px;align-items:center;padding:5px 7px;border:1px solid #e2e8f0;border-radius:5px"><span aria-hidden="true" style="width:13px;height:13px;border:1px solid #94a3b8;border-radius:3px;display:block"></span>受限 HTTPS read<span style="margin-left:auto;font:600 9px/1 ui-monospace,Menlo,monospace;color:#027a48">读</span></span>
+                          <span style="display:flex;gap:6px;align-items:center;padding:5px 7px;border:1px solid #f0c48a;border-radius:5px;background:#fffaf0"><span aria-hidden="true" style="width:13px;height:13px;border:1px solid #b54708;border-radius:3px;background:#b54708;display:grid;place-items:center;color:#fff;font-size:9px">✓</span>sandbox write<span style="margin-left:auto;font:600 9px/1 ui-monospace,Menlo,monospace;color:#b54708">逐次确认</span></span>
+                        </div>
+                      </fieldset>
+                      <div style="display:flex;gap:7px;flex-wrap:wrap;align-items:center">
+                        <button type="button" style="height:32px;padding:0 12px;border:1px solid #344054;border-radius:6px;background:#344054;color:#fff;font:700 12px/1 inherit;cursor:pointer">保存 assignment</button>
+                        <button type="button" style="height:32px;padding:0 12px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;font:600 12px/1 inherit;color:#334155;cursor:pointer">暂停（paused）</button>
+                        <span style="display:inline-flex;gap:7px;align-items:center;padding:5px 8px;border:1px solid #f0a9a3;border-left:3px solid #b42318;border-radius:0 5px 5px 0;background:#fff5f4;font-size:11px;color:#8a2118"><span style="font:700 10px/1 ui-monospace,Menlo,monospace">409</span>assignment 版本冲突：另一位 admin 已修改，已载入最新值，请复核后重试</span>
+                      </div>
+                    </div>
+
+                    <div style="border:1px solid #e2e8f0;border-radius:8px;background:#fff;padding:11px;display:flex;align-items:center;gap:9px">
+                      <span aria-hidden="true" style="width:28px;height:28px;border-radius:8px;background:#344054;display:grid;place-items:center;color:#fff;font:700 11px/1 inherit">记</span>
+                      <div style="display:grid;gap:2px"><span style="font-size:12.5px;font-weight:700">记忆管家 · steward</span><span style="font-size:10.5px;color:#64748b">内置 · 不作为普通 participant 抢占发言</span></div>
+                      <span style="margin-left:auto;display:inline-flex;align-items:center;gap:5px;padding:3px 6px;border-radius:4px;border:1px solid #f0c48a;background:#fffaf0;font:700 10px/1 ui-monospace,Menlo,monospace;color:#b54708">◐ degraded</span>
+                    </div>
+                  </div>
+                </section>
+
+                <section style="display:grid;gap:9px">
+                  <span style="font-size:13px;font-weight:700">治理</span>
+                  <div style="display:grid;gap:7px">
+                    <div style="display:flex;gap:9px;align-items:center;padding:10px 11px;border:1px solid #e2e8f0;border-radius:8px"><div style="display:grid;gap:2px"><span style="font-size:12px;font-weight:700">转移 ownership</span><span style="font-size:10.5px;color:#64748b">目标须为当前 Human member；owner 离开前必须完成</span></div><button type="button" style="margin-left:auto;height:30px;padding:0 11px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;font:600 11.5px/1 inherit;color:#334155;cursor:pointer">选择目标…</button></div>
+                    <div style="display:flex;gap:9px;align-items:center;padding:10px 11px;border:1px solid #e2e8f0;border-radius:8px"><div style="display:grid;gap:2px"><span style="font-size:12px;font-weight:700">归档 Room</span><span style="font-size:10.5px;color:#64748b">业务只读并冻结业务 timer；安全有效期不延长；可审计重开</span></div><button type="button" style="margin-left:auto;height:30px;padding:0 11px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;font:600 11.5px/1 inherit;color:#334155;cursor:pointer">归档…</button></div>
+                    <div style="padding:11px;border:1px solid #f0a9a3;border-radius:8px;background:#fff8f7;display:grid;gap:8px">
+                      <span style="font-size:12px;font-weight:700;color:#8a2118">周予 离开前的未完成责任冲突清单（3）</span>
+                      <ul style="margin:0;padding-left:18px;font-size:11.5px;line-height:1.75;color:#8a2118">
+                        <li>NextAction「核算分批切换方案」— 需转交或取消</li>
+                        <li>Request #R-77 pending_acceptance — 需取消或转交新目标</li>
+                        <li>Blocker「只读账号权限」持球 — 需转交或显式升级</li>
+                      </ul>
+                      <div style="display:flex;gap:7px"><button type="button" disabled="disabled" style="height:30px;padding:0 11px;border:1px solid #cbd5e1;border-radius:6px;background:#f1f5f9;color:#94a3b8;font:700 11.5px/1 inherit;cursor:not-allowed">移除成员（被阻止）</button><button type="button" style="height:30px;padding:0 11px;border:1px solid #b42318;border-radius:6px;background:#fff;color:#b42318;font:700 11.5px/1 inherit;cursor:pointer">逐项转交…</button></div>
+                    </div>
+                  </div>
+                </section>
+
+                <p style="margin:0;font:500 10.5px/1.7 ui-monospace,Menlo,monospace;color:#64748b;padding:10px 11px;border:1px solid #e2e8f0;border-radius:7px;background:#f8fafc">焦点契约：drawer 打开后焦点移到标题，Tab 循环限制在 drawer 内，Esc 关闭并把焦点归还「Room 设置」按钮。</p>
+              </div>
+            </div>
+          </div>
+          </sc-if>
+
+        </div>
+        </sc-if>
+      </div>
+
+      <sc-if value="{{ showAnn }}" hint-placeholder-val="{{ true }}">
+      <div style="margin-top:12px;padding:14px 16px;border:1px solid #cbd5e1;border-radius:10px;background:#fff;display:grid;gap:8px">
+        <div style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;color:#64748b">当前步骤的工程交接标注</div>
+        <div style="display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;font-size:11.5px;line-height:1.6">
+          <div style="display:grid;gap:4px"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;color:#64748b">用户动作</span><span style="color:#1f2937">{{ annAction }}</span></div>
+          <div style="display:grid;gap:4px"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;color:#64748b">本地暂态</span><span style="color:#1f2937">{{ annLocal }}</span></div>
+          <div style="display:grid;gap:4px"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;color:#64748b">server ACK</span><span style="color:#1f2937">{{ annAck }}</span></div>
+          <div style="display:grid;gap:4px"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;color:#64748b">stable event / projection</span><span style="color:#1f2937">{{ annEvent }}</span></div>
+          <div style="display:grid;gap:4px"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;color:#64748b">错误恢复动作</span><span style="color:#1f2937">{{ annRecover }}</span></div>
+        </div>
+      </div>
+      </sc-if>
+    </div>
+
+    <!-- ============ 最小支持窗口 ============ -->
+    <sc-if value="{{ showMinWindow }}" hint-placeholder-val="{{ true }}">
+    <div style="max-width:1504px;margin:40px auto 0">
+      <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:8px">
+        <h2 style="margin:0;font-size:13px;font-weight:700">最小支持窗口 840 × 560</h2>
+        <span style="font:500 11px/1 ui-monospace,Menlo,monospace;color:#64748b">与 Electron 最小窗口约束（min-width 840 / min-height 560）一致 · 非移动端设计</span>
+      </div>
+      <div data-screen-label="最小窗口" style="width:840px;height:560px;background:#f8fafc;border:1px solid #94a3b8;border-radius:10px;overflow:hidden;box-shadow:0 14px 34px rgb(15 23 42 / 12%);display:grid;grid-template-rows:32px minmax(0,1fr)">
+        <div style="display:flex;align-items:center;gap:7px;padding:0 10px;background:#eef1f5;border-bottom:1px solid #d7dee7">
+          <span style="width:9px;height:9px;border-radius:50%;background:#e5695f"></span><span style="width:9px;height:9px;border-radius:50%;background:#e0b34a"></span><span style="width:9px;height:9px;border-radius:50%;background:#61bd5c"></span>
+          <span style="margin-left:8px;font-size:11px;font-weight:600;color:#475569">归档迁移 2026Q3</span>
+        </div>
+        <div style="display:grid;grid-template-columns:56px minmax(0,1fr);min-height:0">
+          <div style="border-right:1px solid #e2e8f0;background:#fff;display:grid;grid-template-rows:auto minmax(0,1fr);padding:8px 0;gap:8px;justify-items:center">
+            <button type="button" aria-label="通知中心，3 条未读" style="position:relative;width:34px;height:34px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;cursor:pointer"><span style="position:absolute;top:-4px;right:-4px;min-width:15px;height:15px;padding:0 4px;border-radius:8px;background:#b42318;color:#fff;font:700 9px/15px ui-monospace,Menlo,monospace">3</span></button>
+            <div style="display:grid;gap:7px;align-content:start">
+              <span aria-current="true" style="width:34px;height:34px;border-radius:8px;background:#eef4ff;border:1px solid #1d4ed8;display:grid;place-items:center;font:700 11px/1 inherit;color:#1d4ed8;position:relative">归<span style="position:absolute;top:-4px;right:-4px;min-width:15px;height:15px;padding:0 4px;border-radius:8px;background:#b42318;color:#fff;font:700 9px/15px ui-monospace,Menlo,monospace">2</span></span>
+              <span style="width:34px;height:34px;border-radius:8px;background:#f1f5f9;display:grid;place-items:center;font:700 11px/1 inherit;color:#475569">供</span>
+              <span style="width:34px;height:34px;border-radius:8px;background:#f1f5f9;display:grid;place-items:center;font:700 11px/1 inherit;color:#475569">内</span>
+            </div>
+          </div>
+          <div style="display:grid;grid-template-rows:auto minmax(0,1fr) auto;min-height:0;background:#fff">
+            <div style="display:flex;align-items:center;gap:8px;padding:9px 14px;border-bottom:1px solid #e2e8f0">
+              <span style="font-size:12.5px;font-weight:700">归档迁移 2026Q3</span>
+              <div style="margin-left:auto;display:flex;gap:4px;padding:2px;border:1px solid #cbd5e1;border-radius:7px;background:#f8fafc">
+                <span aria-current="true" style="padding:4px 9px;border-radius:5px;background:#fff;border:1px solid #cbd5e1;font:700 11px/1 inherit;color:#0f172a">时间线</span>
+                <span style="padding:4px 9px;border-radius:5px;font:600 11px/1 inherit;color:#475569;display:inline-flex;gap:5px;align-items:center">项目<span style="min-width:14px;height:14px;padding:0 4px;border-radius:7px;background:#b54708;color:#fff;font:700 9px/14px ui-monospace,Menlo,monospace">2</span></span>
+              </div>
+            </div>
+            <div style="overflow:hidden;padding:12px 14px;display:grid;gap:11px;align-content:start">
+              <div style="display:grid;grid-template-columns:26px minmax(0,1fr);gap:9px"><span style="width:26px;height:26px;border-radius:50%;background:#0e7490;display:grid;place-items:center;color:#fff;font:700 11px/1 inherit">林</span><div><div style="font-size:12px;font-weight:700">林澈</div><div style="display:inline-block;margin-top:4px;padding:7px 10px;border:1px solid #d9e6ff;border-radius:0 10px 10px;background:#eef4ff;font-size:12px;line-height:1.55">第 3 节字段映射还有两处对不上。</div></div></div>
+              <div style="display:grid;grid-template-columns:3px 26px minmax(0,1fr);gap:9px;padding:7px;margin:0 -7px;border-radius:7px;background:#f8fafc"><span style="width:3px;align-self:stretch;border-radius:2px;background:#5b21b6"></span><span style="width:26px;height:26px;border-radius:7px;background:#5b21b6;display:grid;place-items:center;color:#fff;font:700 11px/1 inherit">检</span><div><div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap"><span style="font-size:12px;font-weight:700">检索员</span><span style="display:inline-flex;gap:4px;align-items:center;padding:2px 5px;border-radius:3px;border:1px solid #cbd5e1;background:#fff;font:700 9px/1 ui-monospace,Menlo,monospace;color:#475569">▶ RUNNING</span></div><p style="margin:4px 0 0;font-size:12px;line-height:1.55;color:#475569">正在核对第 3 节字段映射…</p></div></div>
+              <div style="padding:9px 11px;border:1px solid #f0c48a;border-radius:7px;background:#fffaf0;display:grid;gap:5px"><span style="font:700 9px/1 ui-monospace,Menlo,monospace;letter-spacing:.08em;color:#b54708">SIDE-EFFECT · 待你确认</span><span style="font-size:11.5px;line-height:1.5;color:#7c4a08">sandbox write · section-3.md · 一次性执行 · 09:58 过期</span><div style="display:flex;gap:5px"><button type="button" style="height:26px;padding:0 9px;border:1px solid #b54708;border-radius:5px;background:#b54708;color:#fff;font:700 11px/1 inherit;cursor:pointer">确认</button><button type="button" style="height:26px;padding:0 9px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;font:600 11px/1 inherit;color:#334155;cursor:pointer">拒绝</button></div></div>
+            </div>
+            <div style="border-top:1px solid #e2e8f0;padding:9px 14px;display:flex;gap:8px;align-items:center"><span style="flex:1;min-height:34px;border:1px solid #cbd5e1;border-radius:7px;padding:8px 10px;font-size:12px;color:#94a3b8">写点什么…</span><button type="button" style="height:34px;padding:0 12px;border:1px solid #1d4ed8;border-radius:6px;background:#1d4ed8;color:#fff;font:700 12px/1 inherit;cursor:pointer">发送</button></div>
+          </div>
+        </div>
+      </div>
+      <p style="margin:10px 0 0;max-width:840px;font-size:12px;line-height:1.7;color:#475569;text-wrap:pretty">最小窗口的适配规则：左栏坍缩为 <strong style="font-weight:700">56px 图标轨</strong>（保留 badge 与归档入口于溢出菜单）；右栏改为中栏顶部的<strong style="font-weight:700">「时间线 / 项目」分段控件</strong>，切换不改变 roomId；确认卡、Request 卡与 execution 状态在两种窗口下都完整可读，核心动作不进入溢出菜单。</p>
+    </div>
+    </sc-if>
+  </section>
+  </sc-if>
+
+  <sc-if value="{{ vStates }}" hint-placeholder-val="{{ false }}">
+  <section data-screen-label="状态分支" style="padding:28px 32px 72px;max-width:1504px;margin:0 auto;display:grid;gap:26px">
+
+    <div style="display:grid;gap:5px">
+      <h2 style="margin:0;font-size:16px;font-weight:700">关键状态与失败分支</h2>
+      <p style="margin:0;max-width:820px;font-size:12.5px;line-height:1.7;color:#475569;text-wrap:pretty">每张卡都是产品态，不是 happy-path 装饰。凡是没有服务端事件或状态机支撑的点击效果，一律标注为 <span style="font:600 11px/1 ui-monospace,Menlo,monospace">prototype-only</span>，不显示「已生效」。</p>
+    </div>
+
+    <div style="display:grid;gap:10px">
+      <h3 style="margin:0;font:700 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;color:#475569">A · 启动与身份</h3>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(348px,1fr));gap:12px">
+
+        <article style="border:1px solid #e2e8f0;border-radius:10px;background:#fff;padding:14px;display:grid;gap:9px">
+          <div style="display:flex;gap:7px;align-items:center"><span style="font-size:12.5px;font-weight:700">首次登录 · 无任何 Room</span><span style="margin-left:auto;font:600 9.5px/1 ui-monospace,Menlo,monospace;color:#64748b;border:1px solid #cbd5e1;border-radius:3px;padding:3px 4px">EMPTY</span></div>
+          <div style="border:1px dashed #cbd5e1;border-radius:8px;background:#f8fafc;padding:18px;display:grid;gap:7px;place-items:center;text-align:center">
+            <span style="font-size:13px;font-weight:700;color:#334155">你还不在任何 Room 中</span>
+            <span style="font-size:11.5px;line-height:1.6;color:#64748b;max-width:260px">Room 由 owner 或 admin 邀请你加入。收到定向邀请后会出现在这里。</span>
+          </div>
+          <p style="margin:0;font-size:11px;line-height:1.6;color:#64748b">不提供自助建群入口；不显示营销式空状态插画。</p>
+        </article>
+
+        <article style="border:1px solid #e2e8f0;border-radius:10px;background:#fff;padding:14px;display:grid;gap:9px">
+          <div style="display:flex;gap:7px;align-items:center"><span style="font-size:12.5px;font-weight:700">Room 撤权 · 本地缓存锁定</span><span style="margin-left:auto;font:600 9.5px/1 ui-monospace,Menlo,monospace;color:#b42318;border:1px solid #f0a9a3;border-radius:3px;padding:3px 4px">403</span></div>
+          <div style="border:1px solid #f0a9a3;border-left:3px solid #b42318;border-radius:0 8px 8px 0;background:#fff5f4;padding:12px;display:grid;gap:6px">
+            <span style="font-size:12px;font-weight:700;color:#8a2118">你已不再是「供应商合规审阅」的成员</span>
+            <span style="font-size:11.5px;line-height:1.6;color:#8a2118">该 Room 的本地缓存已从磁盘与内存删除，订阅与同步 cursor 已失效。历史消息的作者归属仍保留在服务端审计中。</span>
+          </div>
+          <p style="margin:0;font-size:11px;line-height:1.6;color:#64748b">纯离线设备最晚在服务端签发的 <span style="font:600 10.5px/1 ui-monospace,Menlo,monospace">maxOfflineReadLease</span> 到期时锁定；客户端不能上调或选择「永不过期」。</p>
+        </article>
+
+        <article style="border:1px solid #e2e8f0;border-radius:10px;background:#fff;padding:14px;display:grid;gap:9px">
+          <div style="display:flex;gap:7px;align-items:center"><span style="font-size:12.5px;font-weight:700">不可恢复错误</span><span style="margin-left:auto;font:600 9.5px/1 ui-monospace,Menlo,monospace;color:#b42318;border:1px solid #f0a9a3;border-radius:3px;padding:3px 4px">FATAL</span></div>
+          <div style="border:1px solid #e2e8f0;border-radius:8px;background:#f8fafc;padding:12px;display:grid;gap:7px">
+            <span style="font-size:12px;font-weight:700;color:#0f172a">本地缓存校验失败，且无法连接服务端</span>
+            <span style="font:500 10.5px/1.6 ui-monospace,Menlo,monospace;color:#64748b">cache_integrity_failed · room-1902 · 2026-08-18T10:11Z</span>
+            <div style="display:flex;gap:6px"><button type="button" style="height:29px;padding:0 10px;border:1px solid #1d4ed8;border-radius:6px;background:#1d4ed8;color:#fff;font:700 11.5px/1 inherit;cursor:pointer">清除缓存并重新同步</button><button type="button" style="height:29px;padding:0 10px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;font:600 11.5px/1 inherit;color:#334155;cursor:pointer">导出诊断包</button></div>
+          </div>
+          <p style="margin:0;font-size:11px;line-height:1.6;color:#64748b">诊断包不含消息正文、附件、token 与隐藏推理。</p>
+        </article>
+
+        <article style="border:1px solid #e2e8f0;border-radius:10px;background:#fff;padding:14px;display:grid;gap:9px">
+          <div style="display:flex;gap:7px;align-items:center"><span style="font-size:12.5px;font-weight:700">归档 Room · 业务只读</span><span style="margin-left:auto;font:600 9.5px/1 ui-monospace,Menlo,monospace;color:#475569;border:1px solid #cbd5e1;border-radius:3px;padding:3px 4px">ARCHIVED</span></div>
+          <div style="border:1px solid #cbd5e1;border-radius:8px;background:repeating-linear-gradient(135deg,#fff 0 7px,#f4f6f9 7px 14px);padding:12px;display:grid;gap:6px">
+            <span style="font-size:12px;font-weight:700;color:#334155">此 Room 已于 08-02 归档</span>
+            <ul style="margin:0;padding-left:17px;font-size:11.5px;line-height:1.75;color:#475569"><li>Agent、memory steward、业务通知升级与 deadline/reviewAt 计时已冻结（保留剩余时长）</li><li>未 dispatch 的 confirmation 已记为 rejected(room_archived)，grant 已撤销</li><li>认证、租约与工具 grant 的安全有效期不因归档延长</li></ul>
+            <div style="display:flex;gap:6px"><button type="button" style="height:29px;padding:0 10px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;font:600 11.5px/1 inherit;color:#334155;cursor:pointer">浏览 / 导出</button><button type="button" style="height:29px;padding:0 10px;border:1px solid #344054;border-radius:6px;background:#344054;color:#fff;font:700 11.5px/1 inherit;cursor:pointer">审计重开</button></div>
+          </div>
+          <p style="margin:0;font-size:11px;line-height:1.6;color:#64748b">归档不阻止 session 撤销、成员移除与权限降低等安全治理命令。</p>
+        </article>
+      </div>
+    </div>
+
+    <div style="display:grid;gap:10px">
+      <h3 style="margin:0;font:700 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;color:#475569">B · 消息与内容</h3>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(348px,1fr));gap:12px">
+
+        <article style="border:1px solid #e2e8f0;border-radius:10px;background:#fff;padding:14px;display:grid;gap:9px">
+          <span style="font-size:12.5px;font-weight:700">附件生命周期摘要（完整路径见 J-02）</span>
+          <div style="display:grid;gap:7px">
+            <div style="display:flex;gap:9px;align-items:center;padding:9px 10px;border:1px solid #e2e8f0;border-radius:7px;background:#f8fafc"><span style="width:22px;height:28px;border:1px solid #94a3b8;border-radius:3px;background:#fff;flex:none"></span><div style="display:grid;gap:4px;min-width:0;flex:1"><span style="font-size:11.5px;font-weight:600">legacy-schema.pdf</span><span style="height:3px;border-radius:2px;background:#e2e8f0;display:block"><span style="display:block;width:62%;height:100%;border-radius:2px;background:#1d4ed8"></span></span></div><span style="font:600 10px/1 ui-monospace,Menlo,monospace;color:#175cd3">62% 上传中</span></div>
+            <div style="display:flex;gap:9px;align-items:center;padding:9px 10px;border:1px solid #e2e8f0;border-radius:7px"><span style="width:22px;height:28px;border:1px solid #94a3b8;border-radius:3px;flex:none"></span><div style="display:grid;gap:2px;min-width:0;flex:1"><span style="font-size:11.5px;font-weight:600">扫描件-合同.png</span><span style="font:500 10px/1 ui-monospace,Menlo,monospace;color:#64748b">已提交 · OCR 提取中</span></div><span style="font:600 10px/1 ui-monospace,Menlo,monospace;color:#b54708">处理中</span></div>
+            <div style="display:flex;gap:9px;align-items:center;padding:9px 10px;border:1px solid #f0a9a3;border-radius:7px;background:#fff5f4"><span style="width:22px;height:28px;border:1px solid #b42318;border-radius:3px;flex:none"></span><div style="display:grid;gap:2px;min-width:0;flex:1"><span style="font-size:11.5px;font-weight:600;color:#8a2118">archive.7z</span><span style="font-size:10.5px;color:#8a2118">类型不在闭集 · 正文未上传</span></div><button type="button" style="height:25px;padding:0 8px;border:1px solid #b42318;border-radius:5px;background:#fff;color:#b42318;font:700 10.5px/1 inherit;cursor:pointer">移除</button></div>
+          </div>
+          <p style="margin:0;font-size:11px;line-height:1.6;color:#64748b">J-02 可逐步检查：本地已选、上传中、处理/OCR、ready、可重试失败、不可重试失败、取消、大小/类型拒绝、恶意文件拒绝、权限撤销。不可解析时不伪造内容；Agent 引用必须带附件来源。</p>
+        </article>
+
+        <article style="border:1px solid #e2e8f0;border-radius:10px;background:#fff;padding:14px;display:grid;gap:9px">
+          <span style="font-size:12.5px;font-weight:700">版本编辑链 / 引用已撤回原文</span>
+          <div style="display:grid;gap:7px">
+            <div style="padding:9px 11px;border:1px solid #d9e6ff;border-radius:0 10px 10px;background:#eef4ff;font-size:12px;line-height:1.6">窗口按 4 小时上限对外承诺。<span style="display:block;margin-top:5px;font:500 10px/1 ui-monospace,Menlo,monospace;color:#175cd3">已编辑 v3 · 查看版本链（v1 / v2 / v3）</span></div>
+            <p style="margin:0;font-size:11px;line-height:1.6;color:#64748b">正文编辑不得静默增删已提交的 mention / reply / 附件关联；改变寻址必须发新消息。</p>
+            <div style="padding:9px 11px;border:1px dashed #94a3b8;border-radius:7px;background:#f8fafc;font-size:11.5px;line-height:1.6;color:#475569"><span style="display:block;font:700 9.5px/1.6 ui-monospace,Menlo,monospace">REPLY TARGET TOMBSTONE</span>你回复的消息已被作者撤回。引用关系保留，正文不再显示。</div>
+          </div>
+        </article>
+
+        <article style="border:1px solid #e2e8f0;border-radius:10px;background:#fff;padding:14px;display:grid;gap:9px">
+          <span style="font-size:12.5px;font-weight:700">长消息与代码块折叠</span>
+          <div style="padding:10px 11px;border:1px solid #e2e8f0;border-radius:8px;background:#f8fafc;display:grid;gap:7px">
+            <span style="font:500 11px/1.7 ui-monospace,Menlo,monospace;color:#334155;white-space:pre-wrap">ALTER TABLE archive_owner
+  ADD COLUMN owner_actor_id TEXT;
+UPDATE archive_owner SET …</span>
+            <div style="display:flex;gap:6px;align-items:center"><button type="button" style="height:26px;padding:0 9px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;font:600 10.5px/1 inherit;color:#334155;cursor:pointer">展开全部 132 行</button><span style="font:500 10px/1 ui-monospace,Menlo,monospace;color:#64748b">超长内容默认折叠，不影响 aria 结构</span></div>
+          </div>
+        </article>
+      </div>
+    </div>
+
+    <div style="display:grid;gap:10px">
+      <h3 style="margin:0;font:700 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;color:#475569">C · Agent 协作</h3>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(348px,1fr));gap:12px">
+
+        <article style="border:1px solid #e2e8f0;border-radius:10px;background:#fff;padding:14px;display:grid;gap:9px">
+          <span style="font-size:12.5px;font-weight:700">Agent profile 与 availability 四态</span>
+          <div style="display:grid;gap:7px">
+            <div style="display:flex;gap:9px;align-items:center;padding:9px 10px;border:1px solid #e2e8f0;border-radius:7px"><span style="width:26px;height:26px;border-radius:7px;background:#5b21b6;display:grid;place-items:center;color:#fff;font:700 11px/1 inherit;flex:none">检</span><div style="display:grid;gap:2px;min-width:0;flex:1"><span style="font-size:11.5px;font-weight:700">检索员 · 资料检索与字段核对</span><span style="font:500 10px/1 ui-monospace,Menlo,monospace;color:#64748b">participation: on-mention</span></div><span style="display:inline-flex;gap:5px;align-items:center;padding:3px 6px;border-radius:4px;border:1px solid #a7d8c0;background:#f0fdf6;font:700 10px/1 ui-monospace,Menlo,monospace;color:#027a48">● ready</span></div>
+            <div style="display:flex;gap:9px;align-items:center;padding:9px 10px;border:1px solid #e2e8f0;border-radius:7px"><span style="width:26px;height:26px;border-radius:7px;background:#0e7490;display:grid;place-items:center;color:#fff;font:700 11px/1 inherit;flex:none">核</span><div style="display:grid;gap:2px;min-width:0;flex:1"><span style="font-size:11.5px;font-weight:700">核对员 · 交叉校验</span><span style="font:500 10px/1 ui-monospace,Menlo,monospace;color:#64748b">participation: active</span></div><span style="display:inline-flex;gap:5px;align-items:center;padding:3px 6px;border-radius:4px;border:1px solid #94a3b8;background:#f8fafc;font:700 10px/1 ui-monospace,Menlo,monospace;color:#334155">▶ busy 1</span></div>
+            <div style="display:flex;gap:9px;align-items:center;padding:9px 10px;border:1px solid #e2e8f0;border-radius:7px;background:#f8fafc"><span style="width:26px;height:26px;border-radius:7px;background:#94a3b8;display:grid;place-items:center;color:#fff;font:700 11px/1 inherit;flex:none">草</span><div style="display:grid;gap:2px;min-width:0;flex:1"><span style="font-size:11.5px;font-weight:700">草案员</span><span style="font:500 10px/1 ui-monospace,Menlo,monospace;color:#64748b">owner/admin 显式暂停 · durable override</span></div><span style="display:inline-flex;gap:5px;align-items:center;padding:3px 6px;border-radius:4px;border:1px solid #cbd5e1;background:#fff;font:700 10px/1 ui-monospace,Menlo,monospace;color:#475569">⏸ paused</span></div>
+            <div style="display:flex;gap:9px;align-items:center;padding:9px 10px;border:1px solid #f0c48a;border-radius:7px;background:#fffaf0"><span style="width:26px;height:26px;border-radius:7px;background:#b54708;display:grid;place-items:center;color:#fff;font:700 11px/1 inherit;flex:none">译</span><div style="display:grid;gap:2px;min-width:0;flex:1"><span style="font-size:11.5px;font-weight:700;color:#7c4a08">译员</span><span style="font-size:10.5px;color:#7c4a08">Provider credential 未就绪 — 部署级配置问题</span></div><span style="display:inline-flex;gap:5px;align-items:center;padding:3px 6px;border-radius:4px;border:1px solid #f0c48a;background:#fff;font:700 10px/1 ui-monospace,Menlo,monospace;color:#b54708">⚠ noauth</span></div>
+          </div>
+          <p style="margin:0;font-size:11px;line-height:1.6;color:#64748b">availability ≠ participation。paused / noauth 不进入新执行，也不显示「会回复」。无 silent 档位。</p>
+        </article>
+
+        <article style="border:1px solid #e2e8f0;border-radius:10px;background:#fff;padding:14px;display:grid;gap:9px">
+          <span style="font-size:12.5px;font-weight:700">scoped preemption 与旧状态不覆盖</span>
+          <div style="display:grid;gap:7px">
+            <div style="padding:9px 11px;border-left:3px solid #64748b;border-radius:0 6px 6px 0;background:#f8fafc;font-size:11.5px;line-height:1.6;color:#334155">陈默 对该执行发出关联纠正 → 本次执行 <strong style="font-weight:700">cancelled(superseded)</strong>；Room 内其他 Agent 工作不受影响。</div>
+            <div style="padding:9px 11px;border:1px solid #cbd5e1;border-radius:7px;font-size:11.5px;line-height:1.6;color:#475569"><span style="display:block;font:700 9.5px/1.6 ui-monospace,Menlo,monospace">STALE EVENT 已丢弃</span>晚到的 exec c93d 事件序号低于当前 projection，已按 eventId 去重丢弃，不覆盖新状态。</div>
+            <div style="padding:9px 11px;border:1px solid #cbd5e1;border-radius:7px;font-size:11.5px;line-height:1.6;color:#475569"><span style="display:block;font:700 9.5px/1.6 ui-monospace,Menlo,monospace">SOURCE REVISED</span>触发消息已被作者修订：运行中的 execution 标记 source revised，但冻结输入不漂移。</div>
+          </div>
+        </article>
+
+        <article style="border:1px solid #e2e8f0;border-radius:10px;background:#fff;padding:14px;display:grid;gap:9px">
+          <span style="font-size:12.5px;font-weight:700">memory steward 降级</span>
+          <div style="padding:11px;border:1px solid #f0c48a;border-radius:8px;background:#fffaf0;display:grid;gap:6px">
+            <span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;letter-spacing:.08em;color:#b54708">MEMORY DEGRADED</span>
+            <span style="font-size:11.5px;line-height:1.65;color:#7c4a08">聊天与显式调用继续，使用已确认记忆 + raw delta 降级。依赖语义记忆的风险 / 领域主动插话已暂停；由权威 NextAction/Blocker/Ball 计算的确定性 due 仍继续并注入具体 project source。</span>
+          </div>
+          <p style="margin:0;font-size:11px;line-height:1.6;color:#64748b">若 project authority 也不可读，due execution 同样暂停并通知 Human。</p>
+        </article>
+      </div>
+    </div>
+
+    <div style="display:grid;gap:10px">
+      <h3 style="margin:0;font:700 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;color:#475569">D · 工具安全</h3>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(348px,1fr));gap:12px">
+
+        <article style="border:1px solid #e2e8f0;border-radius:10px;background:#fff;padding:14px;display:grid;gap:9px">
+          <span style="font-size:12.5px;font-weight:700">read-only 自动执行</span>
+          <div style="padding:9px 11px;border:1px solid #e2e8f0;border-radius:7px;background:#f8fafc;display:grid;gap:5px">
+            <span style="font:600 10px/1 ui-monospace,Menlo,monospace;color:#027a48">TOOL · READ · 已自动执行</span>
+            <span style="font-size:11.5px;line-height:1.6;color:#334155">room-memory lookup（3 条来源）· 附件读取 p.3-4 · 用时 1.2s</span>
+            <span style="font-size:10.5px;color:#64748b">范围：global capability ∩ room assignment ∩ current membership；结果带来源与大小/超时边界。</span>
+          </div>
+        </article>
+
+        <article style="border:1px solid #e2e8f0;border-radius:10px;background:#fff;padding:14px;display:grid;gap:9px">
+          <span style="font-size:12.5px;font-weight:700">确认拒绝 / 失效 / 撤权矩阵（完整路径见 J-05）</span>
+          <div style="display:grid;gap:7px;font-size:11.5px;line-height:1.6">
+            <div style="padding:9px 11px;border:1px solid #cbd5e1;border-radius:7px;background:#f8fafc;color:#475569"><span style="display:block;font:700 9.5px/1.6 ui-monospace,Menlo,monospace">PARAMS CHANGED</span>参数已变化，原确认作废。需针对新参数重新确认，旧 grant 不可复用。</div>
+            <div style="padding:9px 11px;border:1px solid #cbd5e1;border-radius:7px;background:#f8fafc;color:#475569"><span style="display:block;font:700 9.5px/1.6 ui-monospace,Menlo,monospace">EXPIRED</span>确认已于 09:58 过期，未执行。可重新发起调用。</div>
+            <div style="padding:9px 11px;border:1px solid #f0a9a3;border-radius:7px;background:#fff5f4;color:#8a2118"><span style="display:block;font:700 9.5px/1.6 ui-monospace,Menlo,monospace">PERMISSION DENIED · NOAUTH</span>该 Agent 的 sandbox write grant 已被撤销，调用在执行点失败。</div>
+            <div style="padding:9px 11px;border:1px solid #cbd5e1;border-radius:7px;background:#f8fafc;color:#475569"><span style="display:block;font:700 9.5px/1.6 ui-monospace,Menlo,monospace">HUMAN REJECTED / DUPLICATE</span>拒绝使 parent cancelled；重复确认返回既有结果，adapter 调用次数不增加。</div>
+            <div style="padding:9px 11px;border:1px solid #cbd5e1;border-radius:7px;background:#f8fafc;color:#475569"><span style="display:block;font:700 9.5px/1.6 ui-monospace,Menlo,monospace">PRINCIPAL / SESSION / GRANT REVOKED</span>旧 binding 或 claim 前撤权失败闭合；confirmed 事实可保留，但结果明确为「未执行」。</div>
+          </div>
+        </article>
+
+        <article style="border:1px solid #c99a3d;border-radius:10px;background:#fff;padding:14px;display:grid;gap:9px">
+          <span style="font-size:12.5px;font-weight:700">outcome_unknown review 面板</span>
+          <div style="padding:11px;border:1px solid #c99a3d;border-radius:8px;background:repeating-linear-gradient(135deg,#fffdf6 0 7px,#fdf3dd 7px 14px);display:grid;gap:8px">
+            <div style="display:flex;gap:7px;align-items:center"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;letter-spacing:.08em;color:#8a5a00">OUTCOME_UNKNOWN · 需 Human 闭合</span><span style="margin-left:auto;font:500 10px/1 ui-monospace,Menlo,monospace;color:#8a5a00">toolCall 4c11</span></div>
+            <span style="font-size:11.5px;line-height:1.65;color:#7a4f00">已 durable dispatch 后连接中断，无法判定是否写入。<strong style="font-weight:700">这不是普通失败</strong>：不提供重试，原 toolCall 永不二次执行。</span>
+            <div style="display:grid;gap:5px;font:500 10.5px/1.6 ui-monospace,Menlo,monospace;color:#7a4f00">证据：dispatch claim 10:04:12 · adapter socket reset 10:04:19 · sandbox 版本快照 v7 存在</div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap"><button type="button" style="height:28px;padding:0 10px;border:1px solid #8a5a00;border-radius:5px;background:#8a5a00;color:#fff;font:700 11px/1 inherit;cursor:pointer">闭合为 known succeeded</button><button type="button" style="height:28px;padding:0 10px;border:1px solid #8a5a00;border-radius:5px;background:#fff;color:#8a5a00;font:700 11px/1 inherit;cursor:pointer">known failed</button><button type="button" style="height:28px;padding:0 10px;border:1px solid #8a5a00;border-radius:5px;background:#fff;color:#8a5a00;font:700 11px/1 inherit;cursor:pointer">已补偿 / 接受风险</button></div>
+          </div>
+        </article>
+
+        <article style="border:1px solid #e2e8f0;border-radius:10px;background:#fff;padding:14px;display:grid;gap:9px">
+          <span style="font-size:12.5px;font-weight:700">confirmed 后、claim 前被撤销</span>
+          <div style="padding:11px;border:1px solid #cbd5e1;border-radius:8px;background:#f8fafc;display:grid;gap:6px">
+            <span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;color:#475569">GRANT REVOKED · 结果：未执行</span>
+            <span style="font-size:11.5px;line-height:1.65;color:#475569">你的确认事实保持 <strong style="font-weight:700">confirmed</strong>（不可改写），但 Room 已归档，独立 grant 已原子 revoked，父 execution cancelled，晚到的 claim 被拒。</span>
+            <span style="font-size:10.5px;color:#64748b">措辞契约：显示「未执行」，不显示「已回滚」。</span>
+          </div>
+        </article>
+      </div>
+    </div>
+
+    <div style="display:grid;gap:10px">
+      <h3 style="margin:0;font:700 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;color:#475569">E · 通知 / 治理 / 异步错误</h3>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(348px,1fr));gap:12px">
+
+        <article style="border:1px solid #e2e8f0;border-radius:10px;background:#fff;padding:14px;display:grid;gap:9px">
+          <span style="font-size:12.5px;font-weight:700">read 与 handled 分离</span>
+          <div style="display:grid;gap:7px;font-size:11.5px;line-height:1.6">
+            <div style="display:flex;gap:8px;padding:9px 10px;border:1px solid #d9e6ff;border-left:3px solid #1d4ed8;border-radius:0 7px 7px 0;background:#f7faff"><span style="color:#0f172a;font-weight:600;flex:1">未读 · 未处理</span><span style="font:700 9.5px/1.4 ui-monospace,Menlo,monospace;color:#175cd3">unread</span></div>
+            <div style="display:flex;gap:8px;padding:9px 10px;border:1px solid #e2e8f0;border-radius:7px"><span style="color:#334155;flex:1">已读 · 仍未处理（责任未清）</span><span style="font:700 9.5px/1.4 ui-monospace,Menlo,monospace;color:#b54708">needs action</span></div>
+            <div style="display:flex;gap:8px;padding:9px 10px;border:1px solid #e2e8f0;border-radius:7px;background:#f8fafc;opacity:.8"><span style="color:#475569;flex:1">已处理（source 对象已终结）</span><span style="font:700 9.5px/1.4 ui-monospace,Menlo,monospace;color:#027a48">handled</span></div>
+          </div>
+          <p style="margin:0;font-size:11px;line-height:1.6;color:#64748b">handled 由 source 对象状态投影，不能靠读通知清除；按 (recipient, source boundary, type) 幂等。</p>
+        </article>
+
+        <article style="border:1px solid #e2e8f0;border-radius:10px;background:#fff;padding:14px;display:grid;gap:9px">
+          <span style="font-size:12.5px;font-weight:700">异步动作的五态（统一契约）</span>
+          <div style="display:grid;gap:6px">
+            <div style="display:flex;gap:8px;align-items:center;padding:8px 10px;border:1px solid #e2e8f0;border-radius:7px;font-size:11.5px"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;color:#64748b;width:104px;flex:none">IDLE</span><span style="color:#334155">动作可用，无暂态</span></div>
+            <div style="display:flex;gap:8px;align-items:center;padding:8px 10px;border:1px solid #84adff;border-radius:7px;background:#f7faff;font-size:11.5px"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;color:#175cd3;width:104px;flex:none">SUBMITTING</span><span style="color:#1e3a8a">禁用重复提交，保留输入</span></div>
+            <div style="display:flex;gap:8px;align-items:center;padding:8px 10px;border:1px solid #a7d8c0;border-radius:7px;background:#f0fdf6;font-size:11.5px"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;color:#027a48;width:104px;flex:none">ACCEPTED</span><span style="color:#065f46">仅在 requestId 匹配的权威 ACK / stable event 后</span></div>
+            <div style="display:flex;gap:8px;align-items:center;padding:8px 10px;border:1px solid #f0c48a;border-radius:7px;background:#fffaf0;font-size:11.5px"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;color:#b54708;width:104px;flex:none">RETRYABLE</span><span style="color:#7c4a08">429 / 503 / 超时 — 保留输入 + 显式重试</span></div>
+            <div style="display:flex;gap:8px;align-items:center;padding:8px 10px;border:1px solid #f0a9a3;border-radius:7px;background:#fff5f4;font-size:11.5px"><span style="font:700 9.5px/1 ui-monospace,Menlo,monospace;color:#b42318;width:104px;flex:none">NON-RETRYABLE</span><span style="color:#8a2118">401 / 403 / 409 / 410 — 提供修复路径而非重试</span></div>
+          </div>
+        </article>
+
+        <article style="border:1px solid #e2e8f0;border-radius:10px;background:#fff;padding:14px;display:grid;gap:9px">
+          <span style="font-size:12.5px;font-weight:700">Room settings 的权限与错误</span>
+          <div style="display:grid;gap:6px;font-size:11.5px;line-height:1.6">
+            <div style="padding:8px 10px;border:1px solid #e2e8f0;border-radius:7px;background:#f8fafc;color:#475569"><strong style="font-weight:700;color:#0f172a">member 视图</strong>：治理区只读，邀请与 assignment 控件禁用并说明原因，不隐藏到无从解释。</div>
+            <div style="padding:8px 10px;border:1px solid #e2e8f0;border-radius:7px;color:#475569"><strong style="font-weight:700;color:#0f172a">admin 视图</strong>：可管理 member 与普通 Agent；对同级 admin 的操作被拒（403）。</div>
+            <div style="padding:8px 10px;border:1px solid #f0c48a;border-radius:7px;background:#fffaf0;color:#7c4a08"><span style="font:700 9.5px/1.4 ui-monospace,Menlo,monospace">429</span> 操作过于频繁，将在 12s 后可重试；输入保留。</div>
+            <div style="padding:8px 10px;border:1px solid #f0a9a3;border-radius:7px;background:#fff5f4;color:#8a2118"><span style="font:700 9.5px/1.4 ui-monospace,Menlo,monospace">403</span> 你不能移除同级 admin。请先由 owner 降级。</div>
+            <div style="padding:8px 10px;border:1px solid #f0c48a;border-radius:7px;background:#fffaf0;color:#7c4a08"><span style="font:700 9.5px/1.4 ui-monospace,Menlo,monospace">503</span> 服务端暂不可用，配置未提交。已载入你的输入以便重试。</div>
+          </div>
+        </article>
+      </div>
+    </div>
+  </section>
+  </sc-if>
+
+  <sc-if value="{{ vTokens }}" hint-placeholder-val="{{ false }}">
+  <section data-screen-label="设计令牌" style="padding:28px 32px 72px;max-width:1504px;margin:0 auto;display:grid;gap:26px">
+
+    <div style="display:grid;gap:6px">
+      <h2 style="margin:0;font-size:16px;font-weight:700">设计令牌与 signature element</h2>
+      <p style="margin:0;max-width:860px;font-size:12.5px;line-height:1.7;color:#475569;text-wrap:pretty">signature element 是<strong style="font-weight:700">「权威轨 + 权威印记」</strong>：每条消息、每张项目卡左侧 3px 竖轨的<strong style="font-weight:700">线型</strong>表达权威等级，配合等宽小印记给出事实来源。去掉颜色后，线型与印记文字仍能区分身份与权威。其余界面保持克制：无渐变、无玻璃拟态、无拟人化装饰。</p>
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:14px">
+
+      <div style="border:1px solid #cbd5e1;border-radius:10px;background:#fff;padding:16px;display:grid;gap:12px">
+        <span style="font:700 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;color:#475569">SIGNATURE · 权威轨线型</span>
+        <div style="display:grid;gap:9px">
+          <div style="display:grid;grid-template-columns:56px minmax(0,1fr);gap:11px;align-items:center"><span style="height:26px;border-left:3px solid #1f2937;display:block"></span><span style="font-size:12px;line-height:1.5"><strong style="font-weight:700">实线</strong> — authoritative / confirmed fact（server ACK 或 stable event）</span></div>
+          <div style="display:grid;grid-template-columns:56px minmax(0,1fr);gap:11px;align-items:center"><span style="height:26px;border-left:3px dashed #94a3b8;display:block"></span><span style="font-size:12px;line-height:1.5"><strong style="font-weight:700">虚线</strong> — proposal / pending acceptance（尚未成为事实）</span></div>
+          <div style="display:grid;grid-template-columns:56px minmax(0,1fr);gap:11px;align-items:center"><span style="height:26px;border-left:3px dotted #64748b;display:block"></span><span style="font-size:12px;line-height:1.5"><strong style="font-weight:700">点线</strong> — local transient / preview（可丢弃，不入历史）</span></div>
+          <div style="display:grid;grid-template-columns:56px minmax(0,1fr);gap:11px;align-items:center"><span style="height:26px;border-left:3px double #475569;display:block"></span><span style="font-size:12px;line-height:1.5"><strong style="font-weight:700">双线</strong> — projection（由权威对象推导，如 Ball）</span></div>
+          <div style="display:grid;grid-template-columns:56px minmax(0,1fr);gap:11px;align-items:center"><span style="height:26px;background:repeating-linear-gradient(135deg,#fff 0 5px,#e6d3a8 5px 10px);border-left:3px solid #c99a3d;display:block"></span><span style="font-size:12px;line-height:1.5"><strong style="font-weight:700">斜纹填充</strong> — disputed / outcome_unknown（需人工闭合）</span></div>
+        </div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;padding-top:4px;border-top:1px solid #eef1f5">
+          <span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.08em;padding:4px 6px;border-radius:3px;border:1px dotted #64748b;color:#475569">LOCAL</span>
+          <span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.08em;padding:4px 6px;border-radius:3px;border:1px solid #cbd5e1;color:#475569">ACK</span>
+          <span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.08em;padding:4px 6px;border-radius:3px;border:1px solid #1f2937;color:#1f2937">EVT</span>
+          <span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.08em;padding:4px 6px;border-radius:3px;border:1px double #475569;color:#475569">PROJ</span>
+          <span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.08em;padding:4px 6px;border-radius:3px;border:1px dotted #64748b;color:#475569">PREVIEW</span>
+        </div>
+      </div>
+
+      <div style="border:1px solid #cbd5e1;border-radius:10px;background:#fff;padding:16px;display:grid;gap:12px">
+        <span style="font:700 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;color:#475569">身份 · 非颜色可辨</span>
+        <div style="display:grid;gap:10px">
+          <div style="display:flex;gap:11px;align-items:center"><span style="width:34px;height:34px;border-radius:50%;background:#1d4ed8;display:grid;place-items:center;color:#fff;font:700 13px/1 inherit;flex:none">陈</span><span style="font-size:12px;line-height:1.55"><strong style="font-weight:700">Human</strong>：圆形头像 + 气泡（左上直角）+ <span style="font:600 10.5px/1 ui-monospace,Menlo,monospace">HUMAN · role</span> 标签</span></div>
+          <div style="display:flex;gap:11px;align-items:center"><span style="display:flex;gap:5px;flex:none;align-items:center"><span style="width:3px;height:34px;border-radius:2px;background:#5b21b6"></span><span style="width:34px;height:34px;border-radius:9px;background:#5b21b6;display:grid;place-items:center;color:#fff;font:700 13px/1 inherit">检</span></span><span style="font-size:12px;line-height:1.55"><strong style="font-weight:700">Agent</strong>：圆角方形标识 + 职责色轨 + 无气泡正文 + <span style="font:600 10.5px/1 ui-monospace,Menlo,monospace">AGENT · 职责</span> 标签</span></div>
+          <div style="display:flex;gap:11px;align-items:center"><span style="width:34px;height:34px;border-radius:9px;background:#5b21b6;background-image:repeating-linear-gradient(135deg,rgb(255 255 255 / 24%) 0 3px,transparent 3px 6px);box-shadow:inset 0 0 0 1px rgb(15 23 42 / 28%);display:grid;place-items:center;color:#fff;font:700 13px/1 inherit;flex:none">译</span><span style="font-size:12px;line-height:1.55">第 6 个及以后的 Agent 复用色槽时叠加<strong style="font-weight:700">斜纹身份图案</strong>，不靠颜色区分。</span></div>
+        </div>
+        <p style="margin:0;font-size:11px;line-height:1.6;color:#64748b">寻址：<span style="color:#1d4ed8;font-weight:700;border-bottom:2px dashed currentcolor">@Human</span> 为虚下划线的请求（待接受）；<span style="padding:1px 5px;border-radius:4px;background:#5b21b6;color:#fff;font-weight:700">@Agent</span> 为实心 chip 的一次真实调用。两者选择器、反馈与结果均不同。</p>
+      </div>
+
+      <div style="border:1px solid #cbd5e1;border-radius:10px;background:#fff;padding:16px;display:grid;gap:12px">
+        <span style="font:700 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;color:#475569">颜色（沿用已验证的对比度资产）</span>
+        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(128px,1fr));gap:8px;font:500 10px/1.5 ui-monospace,Menlo,monospace">
+          <div><span style="display:block;height:34px;border-radius:6px;background:#f8fafc;border:1px solid #e2e8f0"></span><span style="color:#475569">app-bg #f8fafc</span></div>
+          <div><span style="display:block;height:34px;border-radius:6px;background:#ffffff;border:1px solid #e2e8f0"></span><span style="color:#475569">panel #ffffff</span></div>
+          <div><span style="display:block;height:34px;border-radius:6px;background:#e2e8f0"></span><span style="color:#475569">line #e2e8f0</span></div>
+          <div><span style="display:block;height:34px;border-radius:6px;background:#1f2937"></span><span style="color:#475569">ink #1f2937</span></div>
+          <div><span style="display:block;height:34px;border-radius:6px;background:#64748b"></span><span style="color:#475569">muted #64748b</span></div>
+          <div><span style="display:block;height:34px;border-radius:6px;background:#1d4ed8"></span><span style="color:#475569">human #1d4ed8</span></div>
+          <div><span style="display:block;height:34px;border-radius:6px;background:#eef4ff;border:1px solid #d9e6ff"></span><span style="color:#475569">bubble #eef4ff</span></div>
+          <div><span style="display:block;height:34px;border-radius:6px;background:#027a48"></span><span style="color:#475569">success #027a48</span></div>
+          <div><span style="display:block;height:34px;border-radius:6px;background:#b54708"></span><span style="color:#475569">warning #b54708</span></div>
+          <div><span style="display:block;height:34px;border-radius:6px;background:#b42318"></span><span style="color:#475569">danger #b42318</span></div>
+          <div><span style="display:block;height:34px;border-radius:6px;background:#8a5a00"></span><span style="color:#475569">unknown #8a5a00</span></div>
+          <div><span style="display:block;height:34px;border-radius:6px;background:#2563eb"></span><span style="color:#475569">focus #2563eb</span></div>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:6px;font:500 10px/1.4 ui-monospace,Menlo,monospace;color:#475569">
+          <div><span style="display:block;height:26px;border-radius:6px;background:#175cd3"></span>role 1</div>
+          <div><span style="display:block;height:26px;border-radius:6px;background:#5b21b6"></span>role 2</div>
+          <div><span style="display:block;height:26px;border-radius:6px;background:#a21caf"></span>role 3</div>
+          <div><span style="display:block;height:26px;border-radius:6px;background:#0e7490"></span>role 4</div>
+          <div><span style="display:block;height:26px;border-radius:6px;background:#344054"></span>role 5</div>
+        </div>
+        <p style="margin:0;font-size:11px;line-height:1.6;color:#64748b">职责色槽与语义色互斥（不复用 success/warning/danger），避免「紫色 = 失败」之类的误读。</p>
+      </div>
+
+      <div style="border:1px solid #cbd5e1;border-radius:10px;background:#fff;padding:16px;display:grid;gap:12px">
+        <span style="font:700 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;color:#475569">字体与字号</span>
+        <div style="display:grid;gap:7px">
+          <div style="display:flex;gap:10px;align-items:baseline"><span style="font:500 10px/1 ui-monospace,Menlo,monospace;color:#94a3b8;width:74px;flex:none">16 / 700</span><span style="font-size:16px;font-weight:700">分区标题</span></div>
+          <div style="display:flex;gap:10px;align-items:baseline"><span style="font:500 10px/1 ui-monospace,Menlo,monospace;color:#94a3b8;width:74px;flex:none">14 / 700</span><span style="font-size:14px;font-weight:700">Room 名称 · 面板标题</span></div>
+          <div style="display:flex;gap:10px;align-items:baseline"><span style="font:500 10px/1 ui-monospace,Menlo,monospace;color:#94a3b8;width:74px;flex:none">13 / 400</span><span style="font-size:13px">消息正文（行高 1.65）</span></div>
+          <div style="display:flex;gap:10px;align-items:baseline"><span style="font:500 10px/1 ui-monospace,Menlo,monospace;color:#94a3b8;width:74px;flex:none">12 / 500</span><span style="font-size:12px">项目卡与元信息</span></div>
+          <div style="display:flex;gap:10px;align-items:baseline"><span style="font:500 10px/1 ui-monospace,Menlo,monospace;color:#94a3b8;width:74px;flex:none">10.5 mono</span><span style="font:600 10.5px/1 ui-monospace,Menlo,monospace;letter-spacing:.08em">STATE / 印记 / ID</span></div>
+        </div>
+        <p style="margin:0;font-size:11px;line-height:1.6;color:#64748b">正文使用 macOS 系统字体（-apple-system / PingFang SC）；一切状态、ID 与印记使用等宽体，使「机器事实」与「人写内容」在排版上就可区分。最小可读字号 10.5px 仅用于等宽印记。</p>
+      </div>
+
+      <div style="border:1px solid #cbd5e1;border-radius:10px;background:#fff;padding:16px;display:grid;gap:12px">
+        <span style="font:700 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;color:#475569">间距 · 圆角 · 边框 · 层级</span>
+        <div style="display:grid;gap:7px;font-size:11.5px;line-height:1.6;color:#334155">
+          <div>间距梯度 <span style="font:600 10.5px/1 ui-monospace,Menlo,monospace">4 · 6 · 8 · 10 · 12 · 14 · 18 · 24</span>（栏内 padding 12–20，时间线行距 14）</div>
+          <div>圆角 <span style="font:600 10.5px/1 ui-monospace,Menlo,monospace">3</span> 印记 · <span style="font:600 10.5px/1 ui-monospace,Menlo,monospace">5–6</span> 控件 · <span style="font:600 10.5px/1 ui-monospace,Menlo,monospace">8–10</span> 卡片 · <span style="font:600 10.5px/1 ui-monospace,Menlo,monospace">0 12 12</span> Human 气泡 · <span style="font:600 10.5px/1 ui-monospace,Menlo,monospace">8</span> Agent 方形标识</div>
+          <div>边框 1px 为主；语义强调用 3px 左轨，Agent assignment 用 6px 左轨</div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">层级：<span style="padding:5px 8px;border:1px solid #e2e8f0;border-radius:6px;background:#fff">0 面板</span><span style="padding:5px 8px;border:1px solid #94a3b8;border-radius:6px;background:#fff;box-shadow:0 8px 20px rgb(15 23 42 / 12%)">20 popover</span><span style="padding:5px 8px;border:1px solid #94a3b8;border-radius:6px;background:#fff;box-shadow:-10px 0 24px rgb(15 23 42 / 16%)">30 drawer</span></div>
+          <div>焦点环：<span style="display:inline-block;padding:4px 8px;border-radius:5px;border:1px solid #cbd5e1;outline:3px solid #2563eb;outline-offset:2px">3px #2563eb / offset 2</span></div>
+        </div>
+      </div>
+
+      <div style="border:1px solid #cbd5e1;border-radius:10px;background:#fff;padding:16px;display:grid;gap:10px">
+        <span style="font:700 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;color:#475569">状态语义（唯一词表）</span>
+        <div style="display:grid;gap:5px;font-size:11.5px;line-height:1.55">
+          <div style="display:grid;grid-template-columns:132px minmax(0,1fr);gap:9px"><span style="font:700 10px/1.5 ui-monospace,Menlo,monospace;color:#475569">ACCEPTED</span><span style="color:#334155">已接受，尚未开始生成（含 queued）</span></div>
+          <div style="display:grid;grid-template-columns:132px minmax(0,1fr);gap:9px"><span style="font:700 10px/1.5 ui-monospace,Menlo,monospace;color:#334155">RUNNING</span><span style="color:#334155">正在处理（含 waiting_confirmation，必须给出行动入口）</span></div>
+          <div style="display:grid;grid-template-columns:132px minmax(0,1fr);gap:9px"><span style="font:700 10px/1.5 ui-monospace,Menlo,monospace;color:#027a48">COMPLETED</span><span style="color:#334155">权威 final 已提交（≠ 项目建议已被确认）</span></div>
+          <div style="display:grid;grid-template-columns:132px minmax(0,1fr);gap:9px"><span style="font:700 10px/1.5 ui-monospace,Menlo,monospace;color:#b42318">FAILED</span><span style="color:#334155">错误终态，附原因 / 影响 / 恢复动作</span></div>
+          <div style="display:grid;grid-template-columns:132px minmax(0,1fr);gap:9px"><span style="font:700 10px/1.5 ui-monospace,Menlo,monospace;color:#475569">CANCELLED</span><span style="color:#334155">Human 取消或被 supersede，独立终态，不计失败</span></div>
+          <div style="display:grid;grid-template-columns:132px minmax(0,1fr);gap:9px"><span style="font:700 10px/1.5 ui-monospace,Menlo,monospace;color:#8a5a00">OUTCOME_UNKNOWN</span><span style="color:#334155">已 dispatch 结果不明，禁止自动重试，需 review 闭合</span></div>
+          <div style="display:grid;grid-template-columns:132px minmax(0,1fr);gap:9px"><span style="font:700 10px/1.5 ui-monospace,Menlo,monospace;color:#475569">PROPOSAL</span><span style="color:#334155">提议，未生效</span></div>
+          <div style="display:grid;grid-template-columns:132px minmax(0,1fr);gap:9px"><span style="font:700 10px/1.5 ui-monospace,Menlo,monospace;color:#027a48">CONFIRMED</span><span style="color:#334155">具名 Human 确认的项目事实（含 confirmer / 来源 / 版本）</span></div>
+          <div style="display:grid;grid-template-columns:132px minmax(0,1fr);gap:9px"><span style="font:700 10px/1.5 ui-monospace,Menlo,monospace;color:#b54708">DISPUTED</span><span style="color:#334155">已被 Human 争议，暂停注入 Agent context</span></div>
+          <div style="display:grid;grid-template-columns:132px minmax(0,1fr);gap:9px"><span style="font:700 10px/1.5 ui-monospace,Menlo,monospace;color:#64748b">SUPERSEDED</span><span style="color:#334155">被新结论取代，保留双向链</span></div>
+        </div>
+        <p style="margin:0;font-size:11px;line-height:1.6;color:#64748b">禁用词：「已读」不得表达 Agent judgement；「正在输入」不得用于 Agent；「已回滚」不得用于已 dispatch 的副作用。</p>
+      </div>
+
+      <div style="border:1px solid #cbd5e1;border-radius:10px;background:#fff;padding:16px;display:grid;gap:10px">
+        <span style="font:700 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;color:#475569">动效与可访问性令牌</span>
+        <div style="display:grid;gap:6px;font-size:11.5px;line-height:1.65;color:#334155">
+          <div>过渡仅用于 popover / drawer 的 120ms 位移与 80ms 淡入；状态变化不使用循环动画。</div>
+          <div>运行态使用<strong style="font-weight:700">静态图标 + 文字</strong>（▶ RUNNING），不使用打字点、脉冲或旋转球。</div>
+          <div><span style="font:600 10.5px/1 ui-monospace,Menlo,monospace">prefers-reduced-motion</span>：全部过渡降至 0.01ms，进度条改为静态百分比文字。</div>
+          <div>aria-live 策略：时间线容器 <span style="font:600 10.5px/1 ui-monospace,Menlo,monospace">polite / additions</span>；preview 容器 <span style="font:600 10.5px/1 ui-monospace,Menlo,monospace">aria-live=off</span>，仅在产品态迁移（accepted→running→终态）时播报一次简短摘要，不逐 token 轰炸读屏。</div>
+          <div>键盘：<span style="font:600 10.5px/1 ui-monospace,Menlo,monospace">⌘1/2/3</span> 三栏跳转 · <span style="font:600 10.5px/1 ui-monospace,Menlo,monospace">⌘K</span> Room 切换 · <span style="font:600 10.5px/1 ui-monospace,Menlo,monospace">⌥↑/↓</span> 遍历待我处理 · <span style="font:600 10.5px/1 ui-monospace,Menlo,monospace">Esc</span> 关闭并归还焦点。</div>
+          <div>最小点击目标 28×28（drawer 表单控件 34–38），文本对比度 ≥ 4.5:1。</div>
+        </div>
+      </div>
+    </div>
+  </section>
+  </sc-if>
+
+  <sc-if value="{{ vComponents }}" hint-placeholder-val="{{ false }}">
+  <section data-screen-label="组件状态" style="padding:28px 32px 72px;max-width:1504px;margin:0 auto;display:grid;gap:22px">
+    <div style="display:grid;gap:5px">
+      <h2 style="margin:0;font-size:16px;font-weight:700">核心组件 × 状态</h2>
+      <p style="margin:0;max-width:820px;font-size:12.5px;line-height:1.7;color:#475569">default / hover / focus / disabled / loading / error 六态。loading 一律为有界暂态；error 一律带分类与恢复动作。</p>
+    </div>
+
+    <div style="border:1px solid #cbd5e1;border-radius:10px;background:#fff;overflow:hidden">
+      <div style="display:grid;grid-template-columns:168px repeat(6,minmax(0,1fr));gap:0;background:#f8fafc;border-bottom:1px solid #cbd5e1;font:700 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.08em;color:#475569">
+        <span style="padding:11px 12px">组件</span><span style="padding:11px 12px">default</span><span style="padding:11px 12px">hover</span><span style="padding:11px 12px">focus</span><span style="padding:11px 12px">disabled</span><span style="padding:11px 12px">loading</span><span style="padding:11px 12px">error</span>
+      </div>
+
+      <div style="display:grid;grid-template-columns:168px repeat(6,minmax(0,1fr));align-items:center;border-bottom:1px solid #eef1f5">
+        <span style="padding:12px;font-size:11.5px;font-weight:700">主按钮</span>
+        <span style="padding:12px"><button type="button" style="height:32px;padding:0 12px;border:1px solid #1d4ed8;border-radius:6px;background:#1d4ed8;color:#fff;font:700 12px/1 inherit;cursor:pointer" style-hover="background:#1740b0;border-color:#1740b0">发送</button></span>
+        <span style="padding:12px"><button type="button" style="height:32px;padding:0 12px;border:1px solid #1740b0;border-radius:6px;background:#1740b0;color:#fff;font:700 12px/1 inherit;cursor:pointer">发送</button></span>
+        <span style="padding:12px"><button type="button" style="height:32px;padding:0 12px;border:1px solid #1d4ed8;border-radius:6px;background:#1d4ed8;color:#fff;font:700 12px/1 inherit;cursor:pointer;outline:3px solid #2563eb;outline-offset:2px">发送</button></span>
+        <span style="padding:12px"><button type="button" disabled="disabled" style="height:32px;padding:0 12px;border:1px solid #cbd5e1;border-radius:6px;background:#f1f5f9;color:#94a3b8;font:700 12px/1 inherit;cursor:not-allowed">发送</button></span>
+        <span style="padding:12px"><button type="button" disabled="disabled" style="height:32px;padding:0 12px;border:1px solid #84adff;border-radius:6px;background:#eef4ff;color:#175cd3;font:700 12px/1 inherit;cursor:progress">发送中…</button></span>
+        <span style="padding:12px;display:grid;gap:4px"><button type="button" style="height:32px;padding:0 12px;border:1px solid #b42318;border-radius:6px;background:#fff;color:#b42318;font:700 12px/1 inherit;cursor:pointer">重试发送</button><span style="font:600 9.5px/1.4 ui-monospace,Menlo,monospace;color:#b42318">503 可重试</span></span>
+      </div>
+
+      <div style="display:grid;grid-template-columns:168px repeat(6,minmax(0,1fr));align-items:center;border-bottom:1px solid #eef1f5">
+        <span style="padding:12px;font-size:11.5px;font-weight:700">次按钮 / 危险动作</span>
+        <span style="padding:12px"><button type="button" style="height:32px;padding:0 12px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#1f2937;font:600 12px/1 inherit;cursor:pointer">转交…</button></span>
+        <span style="padding:12px"><button type="button" style="height:32px;padding:0 12px;border:1px solid #94a3b8;border-radius:6px;background:#f8fafc;color:#0f172a;font:600 12px/1 inherit;cursor:pointer">转交…</button></span>
+        <span style="padding:12px"><button type="button" style="height:32px;padding:0 12px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#1f2937;font:600 12px/1 inherit;cursor:pointer;outline:3px solid #2563eb;outline-offset:2px">转交…</button></span>
+        <span style="padding:12px;display:grid;gap:4px"><button type="button" disabled="disabled" style="height:32px;padding:0 12px;border:1px solid #e2e8f0;border-radius:6px;background:#f8fafc;color:#94a3b8;font:600 12px/1 inherit;cursor:not-allowed">移除成员</button><span style="font:500 9.5px/1.4 ui-monospace,Menlo,monospace;color:#64748b">原因：3 项未完成责任</span></span>
+        <span style="padding:12px"><button type="button" disabled="disabled" style="height:32px;padding:0 12px;border:1px solid #cbd5e1;border-radius:6px;background:#f8fafc;color:#64748b;font:600 12px/1 inherit;cursor:progress">提交中…</button></span>
+        <span style="padding:12px"><button type="button" style="height:32px;padding:0 12px;border:1px solid #b42318;border-radius:6px;background:#fff;color:#b42318;font:700 12px/1 inherit;cursor:pointer">403 查看权限</button></span>
+      </div>
+
+      <div style="display:grid;grid-template-columns:168px repeat(6,minmax(0,1fr));align-items:center;border-bottom:1px solid #eef1f5">
+        <span style="padding:12px;font-size:11.5px;font-weight:700">输入框</span>
+        <span style="padding:12px"><input type="text" value="zhou.yu@…" readonly="readonly" style="width:100%;min-height:32px;padding:7px 9px;border:1px solid #64748b;border-radius:6px;font:inherit;font-size:12px" /></span>
+        <span style="padding:12px"><input type="text" value="zhou.yu@…" readonly="readonly" style="width:100%;min-height:32px;padding:7px 9px;border:1px solid #334155;border-radius:6px;font:inherit;font-size:12px" /></span>
+        <span style="padding:12px"><input type="text" value="zhou.yu@…" readonly="readonly" style="width:100%;min-height:32px;padding:7px 9px;border:1px solid #64748b;border-radius:6px;font:inherit;font-size:12px;outline:3px solid #2563eb;outline-offset:2px" /></span>
+        <span style="padding:12px"><input type="text" value="归档后只读" readonly="readonly" disabled="disabled" style="width:100%;min-height:32px;padding:7px 9px;border:1px solid #e2e8f0;border-radius:6px;font:inherit;font-size:12px;background:#f1f5f9;color:#94a3b8" /></span>
+        <span style="padding:12px"><span style="display:flex;gap:6px;align-items:center;width:100%;min-height:32px;padding:7px 9px;border:1px solid #84adff;border-radius:6px;font-size:12px;color:#175cd3;background:#f7faff">校验中…</span></span>
+        <span style="padding:12px;display:grid;gap:4px"><input type="text" value="zhou.yu" readonly="readonly" aria-invalid="true" style="width:100%;min-height:32px;padding:7px 9px;border:1px solid #b42318;border-radius:6px;font:inherit;font-size:12px;background:#fff5f4" /><span style="font-size:10px;color:#b42318">需完整账户地址</span></span>
+      </div>
+
+      <div style="display:grid;grid-template-columns:168px repeat(6,minmax(0,1fr));align-items:center;border-bottom:1px solid #eef1f5">
+        <span style="padding:12px;font-size:11.5px;font-weight:700">Room 列表项</span>
+        <span style="padding:12px"><span style="display:flex;gap:7px;align-items:center;padding:7px 8px;border-radius:7px;font-size:11.5px"><span style="width:3px;height:22px;border-radius:2px;background:transparent"></span>归档迁移<span style="margin-left:auto;min-width:16px;height:16px;padding:0 4px;border-radius:8px;background:#e2e8f0;color:#334155;font:700 9.5px/16px ui-monospace,Menlo,monospace">5</span></span></span>
+        <span style="padding:12px"><span style="display:flex;gap:7px;align-items:center;padding:7px 8px;border-radius:7px;background:#f4f6f9;font-size:11.5px"><span style="width:3px;height:22px;border-radius:2px;background:#cbd5e1"></span>归档迁移<span style="margin-left:auto;min-width:16px;height:16px;padding:0 4px;border-radius:8px;background:#e2e8f0;color:#334155;font:700 9.5px/16px ui-monospace,Menlo,monospace">5</span></span></span>
+        <span style="padding:12px"><span style="display:flex;gap:7px;align-items:center;padding:7px 8px;border-radius:7px;background:#eef4ff;border:1px solid #d9e6ff;font-size:11.5px;outline:3px solid #2563eb;outline-offset:2px"><span style="width:3px;height:22px;border-radius:2px;background:#1d4ed8"></span>归档迁移</span></span>
+        <span style="padding:12px"><span style="display:flex;gap:7px;align-items:center;padding:7px 8px;border-radius:7px;font-size:11.5px;color:#94a3b8;background:repeating-linear-gradient(135deg,#fff 0 6px,#f4f6f9 6px 12px)"><span style="width:3px;height:22px;border-radius:2px;background:#e2e8f0"></span>已归档 Room</span></span>
+        <span style="padding:12px"><span style="display:block;height:36px;border-radius:7px;background:#f1f5f9"></span></span>
+        <span style="padding:12px"><span style="display:flex;gap:6px;align-items:center;padding:7px 8px;border-radius:7px;border:1px solid #f0a9a3;background:#fff5f4;font-size:11px;color:#8a2118">已失去访问权 · 缓存已清除</span></span>
+      </div>
+
+      <div style="display:grid;grid-template-columns:168px repeat(6,minmax(0,1fr));align-items:center;border-bottom:1px solid #eef1f5">
+        <span style="padding:12px;font-size:11.5px;font-weight:700">execution 状态条</span>
+        <span style="padding:12px"><span style="display:inline-flex;gap:5px;align-items:center;padding:3px 7px;border-radius:4px;border:1px solid #cbd5e1;background:#fff;font:700 10px/1 ui-monospace,Menlo,monospace;color:#475569">● ACCEPTED</span></span>
+        <span style="padding:12px"><span style="display:inline-flex;gap:5px;align-items:center;padding:3px 7px;border-radius:4px;border:1px solid #94a3b8;background:#fff;font:700 10px/1 ui-monospace,Menlo,monospace;color:#334155">▶ RUNNING</span></span>
+        <span style="padding:12px"><span style="display:inline-flex;gap:5px;align-items:center;padding:3px 7px;border-radius:4px;border:1px solid #f0c48a;background:#fffaf0;font:700 10px/1 ui-monospace,Menlo,monospace;color:#b54708">◆ WAITING CONFIRM</span></span>
+        <span style="padding:12px"><span style="display:inline-flex;gap:5px;align-items:center;padding:3px 7px;border-radius:4px;border:1px solid #cbd5e1;background:#f8fafc;font:700 10px/1 ui-monospace,Menlo,monospace;color:#475569">⊘ CANCELLED</span></span>
+        <span style="padding:12px"><span style="display:inline-flex;gap:5px;align-items:center;padding:3px 7px;border-radius:4px;border:1px solid #a7d8c0;background:#f0fdf6;font:700 10px/1 ui-monospace,Menlo,monospace;color:#027a48">■ COMPLETED</span></span>
+        <span style="padding:12px;display:grid;gap:4px"><span style="display:inline-flex;gap:5px;align-items:center;padding:3px 7px;border-radius:4px;border:1px solid #f0a9a3;background:#fff5f4;font:700 10px/1 ui-monospace,Menlo,monospace;color:#b42318;width:max-content">✕ FAILED</span><span style="display:inline-flex;gap:5px;align-items:center;padding:3px 7px;border-radius:4px;border:1px solid #c99a3d;background:repeating-linear-gradient(135deg,#fffdf6 0 6px,#fdf3dd 6px 12px);font:700 10px/1 ui-monospace,Menlo,monospace;color:#8a5a00;width:max-content">? OUTCOME_UNKNOWN</span></span>
+      </div>
+
+      <div style="display:grid;grid-template-columns:168px repeat(6,minmax(0,1fr));align-items:center;border-bottom:1px solid #eef1f5">
+        <span style="padding:12px;font-size:11.5px;font-weight:700">项目卡（权威分层）</span>
+        <span style="padding:12px"><span style="display:block;padding:8px 9px;border:1px solid #e2e8f0;border-left:3px solid #027a48;border-radius:0 6px 6px 0;font-size:11px;line-height:1.5"><span style="font:700 9px/1.6 ui-monospace,Menlo,monospace;color:#027a48">CONFIRMED</span>停机 4 小时上限</span></span>
+        <span style="padding:12px"><span style="display:block;padding:8px 9px;border:1px solid #cbd5e1;border-left:3px solid #027a48;border-radius:0 6px 6px 0;background:#f8fafc;font-size:11px;line-height:1.5"><span style="font:700 9px/1.6 ui-monospace,Menlo,monospace;color:#027a48">CONFIRMED</span>停机 4 小时上限</span></span>
+        <span style="padding:12px"><span style="display:block;padding:8px 9px;border:1px dashed #94a3b8;border-radius:6px;font-size:11px;line-height:1.5;outline:3px solid #2563eb;outline-offset:2px"><span style="font:700 9px/1.6 ui-monospace,Menlo,monospace;color:#475569">PROPOSAL</span>改为人级 owner</span></span>
+        <span style="padding:12px"><span style="display:block;padding:8px 9px;border:1px solid #e2e8f0;border-radius:6px;background:#f8fafc;font-size:11px;line-height:1.5;color:#94a3b8"><span style="font:700 9px/1.6 ui-monospace,Menlo,monospace">SUPERSEDED</span><span style="text-decoration:line-through">保留部门维度</span></span></span>
+        <span style="padding:12px"><span style="display:block;height:44px;border-radius:6px;background:#f1f5f9"></span></span>
+        <span style="padding:12px"><span style="display:block;padding:8px 9px;border:1px solid #cbd5e1;border-radius:6px;background:repeating-linear-gradient(135deg,#fff 0 6px,#f6f7f9 6px 12px);font-size:11px;line-height:1.5;color:#475569"><span style="font:700 9px/1.6 ui-monospace,Menlo,monospace;color:#b54708">DISPUTED</span>暂停注入 context</span></span>
+      </div>
+
+      <div style="display:grid;grid-template-columns:168px repeat(6,minmax(0,1fr));align-items:center">
+        <span style="padding:12px;font-size:11.5px;font-weight:700">通知项</span>
+        <span style="padding:12px"><span style="display:block;padding:8px 9px;border:1px solid #d9e6ff;border-left:3px solid #1d4ed8;border-radius:0 6px 6px 0;background:#f7faff;font-size:11px;line-height:1.5">未读 · 未处理</span></span>
+        <span style="padding:12px"><span style="display:block;padding:8px 9px;border:1px solid #84adff;border-left:3px solid #1d4ed8;border-radius:0 6px 6px 0;background:#eef4ff;font-size:11px;line-height:1.5">未读 · 未处理</span></span>
+        <span style="padding:12px"><span style="display:block;padding:8px 9px;border:1px solid #d9e6ff;border-radius:6px;background:#f7faff;font-size:11px;line-height:1.5;outline:3px solid #2563eb;outline-offset:2px">未读 · 未处理</span></span>
+        <span style="padding:12px"><span style="display:block;padding:8px 9px;border:1px dashed #94a3b8;border-radius:6px;background:#f8fafc;font-size:11px;line-height:1.5;color:#64748b">来源不可访问</span></span>
+        <span style="padding:12px"><span style="display:block;height:38px;border-radius:6px;background:#f1f5f9"></span></span>
+        <span style="padding:12px"><span style="display:block;padding:8px 9px;border:1px solid #f0a9a3;border-radius:6px;background:#fff5f4;font-size:11px;line-height:1.5;color:#8a2118">深链失败 · 安全失败</span></span>
+      </div>
+    </div>
+  </section>
+  </sc-if>
+
+  <sc-if value="{{ vCoverage }}" hint-placeholder-val="{{ false }}">
+  <section data-screen-label="覆盖矩阵" style="padding:28px 32px 72px;max-width:1504px;margin:0 auto;display:grid;gap:20px">
+    <div style="display:grid;gap:5px">
+      <h2 style="margin:0;font-size:16px;font-weight:700">页面与状态覆盖矩阵</h2>
+      <p style="margin:0;max-width:860px;font-size:12.5px;line-height:1.7;color:#475569">对应 PRD 第 19 节「后续设计稿与交互原型的输入合同」9 项，全部以 Requirement ID 标注。</p>
+    </div>
+    <div style="border:1px solid #cbd5e1;border-radius:10px;background:#fff;overflow:hidden">
+      <div style="display:grid;grid-template-columns:150px minmax(0,1.55fr) minmax(0,1fr) 176px;background:#f8fafc;border-bottom:1px solid #cbd5e1;font:700 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.08em;color:#475569"><span style="padding:11px 12px">画面 / 分区</span><span style="padding:11px 12px">已覆盖状态</span><span style="padding:11px 12px">失败与恢复分支</span><span style="padding:11px 12px">Requirement</span></div>
+
+      <div style="display:grid;grid-template-columns:150px minmax(0,1.55fr) minmax(0,1fr) 176px;border-bottom:1px solid #eef1f5;font-size:11.5px;line-height:1.6"><span style="padding:11px 12px;font-weight:700">启动与身份</span><span style="padding:11px 12px;color:#334155">恢复 session、密码登录、邀请与 AI 披露、catalog 加载、首次无 Room、离线只读、归档只读</span><span style="padding:11px 12px;color:#475569">401 撤销、403 撤权清 cache、邀请过期、cache 校验失败、repair 中、fatal</span><span style="padding:11px 12px;font:500 10.5px/1.6 ui-monospace,Menlo,monospace;color:#64748b">REQ-UX-006 · REQ-ID-002/003/005 · REQ-NFR-007/008</span></div>
+
+      <div style="display:grid;grid-template-columns:150px minmax(0,1.55fr) minmax(0,1fr) 176px;border-bottom:1px solid #eef1f5;font-size:11.5px;line-height:1.6"><span style="padding:11px 12px;font-weight:700">Room 三栏外壳</span><span style="padding:11px 12px;color:#334155">1440×900 默认窗口、840×560 最小窗口、Room list + badge + 归档入口、栏切换原子同 roomId</span><span style="padding:11px 12px;color:#475569">离线横幅、repair 横幅、Room 撤权后消失、最小窗口右栏改分段控件</span><span style="padding:11px 12px;font:500 10.5px/1.6 ui-monospace,Menlo,monospace;color:#64748b">REQ-UX-002/003 · REQ-PRIM-003</span></div>
+
+      <div style="display:grid;grid-template-columns:150px minmax(0,1.55fr) minmax(0,1fr) 176px;border-bottom:1px solid #eef1f5;font-size:11.5px;line-height:1.6"><span style="padding:11px 12px;font-weight:700">消息与内容</span><span style="padding:11px 12px;color:#334155">Human/Agent 同屏、reply 引用与定位、结构化 @Human/@Agent、附件预览/下载/OCR、编辑版本链、撤回 tombstone、Agent correction、长消息折叠</span><span style="padding:11px 12px;color:#475569">上传失败、不可解析、reply 目标已撤回、编辑不得改寻址、503 重试同 key</span><span style="padding:11px 12px;font:500 10.5px/1.6 ui-monospace,Menlo,monospace;color:#64748b">REQ-MSG-001～010 · REQ-UX-007</span></div>
+
+      <div style="display:grid;grid-template-columns:150px minmax(0,1.55fr) minmax(0,1fr) 176px;border-bottom:1px solid #eef1f5;font-size:11.5px;line-height:1.6"><span style="padding:11px 12px;font-weight:700">Agent 协作</span><span style="padding:11px 12px;color:#334155">profile / 职责 / participation active·on-mention、availability ready·busy·paused·noauth、单消息多 Agent 并发、accepted·running·preview·completed·failed·cancelled</span><span style="padding:11px 12px;color:#475569">provider timeout 有界 attempt、手动 retry 谱系、scoped preemption、stale event 丢弃、source revised、memory degraded</span><span style="padding:11px 12px;font:500 10.5px/1.6 ui-monospace,Menlo,monospace;color:#64748b">REQ-AGT-001～010 · REQ-MEM-010 · REQ-MSG-008</span></div>
+
+      <div style="display:grid;grid-template-columns:150px minmax(0,1.55fr) minmax(0,1fr) 176px;border-bottom:1px solid #eef1f5;font-size:11.5px;line-height:1.6"><span style="padding:11px 12px;font-weight:700">项目推进</span><span style="padding:11px 12px;color:#334155">唯一 active Goal、Decision proposed/confirmed/superseded、Request pending/accepted/transfer、NextAction 全生命周期与验收、Blocker open/deferred/cannot_answer、Ball 多 source</span><span style="padding:11px 12px;color:#475569">并发确认 409、Agent 不得自确认/自验收、离群责任冲突清单、reviewAt 回到 open</span><span style="padding:11px 12px;font:500 10.5px/1.6 ui-monospace,Menlo,monospace;color:#64748b">REQ-PRJ-001～013 · REQ-ROOM-003 · REQ-UX-004</span></div>
+
+      <div style="display:grid;grid-template-columns:150px minmax(0,1.55fr) minmax(0,1fr) 176px;border-bottom:1px solid #eef1f5;font-size:11.5px;line-height:1.6"><span style="padding:11px 12px;font-weight:700">Memory</span><span style="padding:11px 12px;color:#334155">五类记忆、steward watermark、proposal/confirmed/disputed、来源消息与附件引用、点击来源回时间线、Room 内检索</span><span style="padding:11px 12px;color:#475569">disputed 暂停注入、steward 降级、来源已撤回显示 tombstone、不做跨 Room 搜索</span><span style="padding:11px 12px;font:500 10.5px/1.6 ui-monospace,Menlo,monospace;color:#64748b">REQ-MEM-001～007 · REQ-UX-004</span></div>
+
+      <div style="display:grid;grid-template-columns:150px minmax(0,1.55fr) minmax(0,1fr) 176px;border-bottom:1px solid #eef1f5;font-size:11.5px;line-height:1.6"><span style="padding:11px 12px;font-weight:700">工具安全</span><span style="padding:11px 12px;color:#334155">read-only 自动执行、side-effect 逐次确认（目标/参数/影响/可逆/有效期/一次性）、confirmed→grant→claim→dispatched</span><span style="padding:11px 12px;color:#475569">参数变更失效、expired、permission denied/noauth、claim 前 revoke 显示「未执行」、outcome_unknown review 三种闭合</span><span style="padding:11px 12px;font:500 10.5px/1.6 ui-monospace,Menlo,monospace;color:#64748b">REQ-AGT-011/012/013 · REQ-PRIM-018</span></div>
+
+      <div style="display:grid;grid-template-columns:150px minmax(0,1.55fr) minmax(0,1fr) 176px;border-bottom:1px solid #eef1f5;font-size:11.5px;line-height:1.6"><span style="padding:11px 12px;font-weight:700">通知</span><span style="padding:11px 12px;color:#334155">flat durable recipient-scoped center、Room badge、mention/Request/confirmation/due/tool result/Agent 完成失败、read 与 handled 分离、深链</span><span style="padding:11px 12px;color:#475569">来源不可访问安全失败、撤权停止投递并清本地项、无 OS push、无五分区 inbox</span><span style="padding:11px 12px;font:500 10.5px/1.6 ui-monospace,Menlo,monospace;color:#64748b">REQ-UX-008 · REQ-PRJ-012</span></div>
+
+      <div style="display:grid;grid-template-columns:150px minmax(0,1.55fr) minmax(0,1fr) 176px;border-bottom:1px solid #eef1f5;font-size:11.5px;line-height:1.6"><span style="padding:11px 12px;font-weight:700">Settings drawer</span><span style="padding:11px 12px;color:#334155">Human invitation 与 Agent assignment 两条独立流程、owner/admin/member 权限态、职责/participation/availability/tool grants、归档·重开·ownership transfer</span><span style="padding:11px 12px;color:#475569">loading、ACK、401/403/409/429/503、离群未完成责任冲突清单、焦点归还</span><span style="padding:11px 12px;font:500 10.5px/1.6 ui-monospace,Menlo,monospace;color:#64748b">REQ-UX-005 · REQ-ROOM-002/003/004 · REQ-ID-004</span></div>
+
+      <div style="display:grid;grid-template-columns:150px minmax(0,1.55fr) minmax(0,1fr) 176px;font-size:11.5px;line-height:1.6"><span style="padding:11px 12px;font-weight:700">可访问性</span><span style="padding:11px 12px;color:#334155">完整键盘路径、可预测焦点顺序、drawer/dialog 焦点归还、控件名称与状态、非颜色区分、reduced motion</span><span style="padding:11px 12px;color:#475569">preview 使用 aria-live=off + 产品态摘要播报；最小窗口核心动作不进溢出菜单</span><span style="padding:11px 12px;font:500 10.5px/1.6 ui-monospace,Menlo,monospace;color:#64748b">REQ-UX-009 · FCV1-A11Y</span></div>
+    </div>
+
+    <div style="border:1px solid #cbd5e1;border-radius:10px;background:#fff;overflow:hidden">
+      <div style="padding:13px 14px;background:#f8fafc;border-bottom:1px solid #cbd5e1;display:flex;gap:10px;align-items:center"><strong style="font-size:12.5px">FT-16 可访问性验证矩阵</strong><span style="font:500 10px/1 ui-monospace,Menlo,monospace;color:#64748b">REQ-UX-009 · 通过条件必须逐项留证</span></div>
+      <div style="display:grid;grid-template-columns:150px minmax(0,1.1fr) minmax(0,1.45fr) minmax(0,1fr);font-size:11px;line-height:1.6">
+        <strong style="padding:10px 12px;border-bottom:1px solid #eef1f5">键盘 / 焦点</strong><span style="padding:10px 12px;border-bottom:1px solid #eef1f5;color:#334155">macOS 全键盘访问开启；不用指针完成 J-01～J-07</span><span style="padding:10px 12px;border-bottom:1px solid #eef1f5;color:#475569">Tab 顺序与视觉顺序一致；dialog/drawer 圈定焦点；关闭后回到触发器；Esc 不绕过确认</span><span style="padding:10px 12px;border-bottom:1px solid #eef1f5;color:#027a48">0 个焦点陷阱；核心动作均有可见 focus ring</span>
+        <strong style="padding:10px 12px;border-bottom:1px solid #eef1f5">缩放 / 重排</strong><span style="padding:10px 12px;border-bottom:1px solid #eef1f5;color:#334155">1440×900：100% / 125% / 150% / 200%；840×560：100% / 125% / 150%</span><span style="padding:10px 12px;border-bottom:1px solid #eef1f5;color:#475569">消息、Request、execution、confirmation、错误与恢复动作不裁切；允许区域滚动，禁止双轴页面滚动</span><span style="padding:10px 12px;border-bottom:1px solid #eef1f5;color:#027a48">文本不重叠；核心动作不进不可发现溢出菜单</span>
+        <strong style="padding:10px 12px;border-bottom:1px solid #eef1f5">对比度 / 非颜色</strong><span style="padding:10px 12px;border-bottom:1px solid #eef1f5;color:#334155">默认、hover、focus、disabled、error、degraded、selected 全状态</span><span style="padding:10px 12px;border-bottom:1px solid #eef1f5;color:#475569">正文/小字 ≥ 4.5:1；大字 ≥ 3:1；控件边界与焦点 ≥ 3:1；状态同时使用图标、文本或线型</span><span style="padding:10px 12px;border-bottom:1px solid #eef1f5;color:#027a48">Human/Agent、success/error 不依赖颜色单独识别</span>
+        <strong style="padding:10px 12px">动效 / 通告</strong><span style="padding:10px 12px;color:#334155">系统 Reduce Motion 开 / 关；VoiceOver 验证状态变化</span><span style="padding:10px 12px;color:#475569">reduced motion 下无位移动画；preview `aria-live=off`；仅 accepted/failed/completed/cancelled 等低频产品态用克制通告</span><span style="padding:10px 12px;color:#027a48">无模拟 typing；无高频 chunk 播报；通告含对象与恢复动作</span>
+      </div>
+    </div>
+
+    <div style="border:1px solid #84adff;border-radius:10px;background:#eef4ff;padding:14px 16px;display:flex;gap:14px;align-items:center">
+      <div style="display:grid;gap:4px"><strong style="font-size:12.5px;color:#1e3a8a">103 条 PRD Requirement 已逐项索引</strong><span style="font-size:11px;line-height:1.6;color:#334155">本页保留场景级矩阵；逐 ID 分类为设计页面/交互、非视觉协议约束、批准边界或冲突处理，且不使用范围缩写。</span></div>
+      <a href="../design-requirement-coverage.md" style="margin-left:auto;padding:7px 10px;border:1px solid #1d4ed8;border-radius:5px;background:#fff;font:700 11px/1 inherit;white-space:nowrap">打开逐项 Requirement 覆盖矩阵 →</a>
+    </div>
+
+    <div style="border:1px solid #cbd5e1;border-radius:10px;background:#fff;padding:16px;display:grid;gap:9px">
+      <span style="font:700 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;color:#475569">明确未设计（本次范围之外）</span>
+      <div style="display:flex;gap:7px;flex-wrap:wrap;font-size:11.5px">
+        <span style="padding:5px 9px;border:1px dashed #94a3b8;border-radius:5px;color:#475569">Web / 原生移动端</span>
+        <span style="padding:5px 9px;border:1px dashed #94a3b8;border-radius:5px;color:#475569">OS push</span>
+        <span style="padding:5px 9px;border:1px dashed #94a3b8;border-radius:5px;color:#475569">跨 Room 五分区工作台</span>
+        <span style="padding:5px 9px;border:1px dashed #94a3b8;border-radius:5px;color:#475569">全局搜索</span>
+        <span style="padding:5px 9px;border:1px dashed #94a3b8;border-radius:5px;color:#475569">完整 Blueprint UI</span>
+        <span style="padding:5px 9px;border:1px dashed #94a3b8;border-radius:5px;color:#475569">多 Provider / BYOK</span>
+        <span style="padding:5px 9px;border:1px dashed #94a3b8;border-radius:5px;color:#475569">独立 Thread</span>
+        <span style="padding:5px 9px;border:1px dashed #94a3b8;border-radius:5px;color:#475569">音视频 / 网盘 / 组织架构 / 审批流</span>
+        <span style="padding:5px 9px;border:1px dashed #94a3b8;border-radius:5px;color:#475569">社交 reaction / 详细 read receipt / @all</span>
+        <span style="padding:5px 9px;border:1px dashed #94a3b8;border-radius:5px;color:#475569">永久删除 UI</span>
+      </div>
+      <p style="margin:0;font-size:11px;line-height:1.6;color:#64748b">375px 窄窗不作为移动端或响应式验收证据（GAP-023）。最小支持窗口为 840×560 桌面窗口。</p>
+    </div>
+  </section>
+  </sc-if>
+
+  <sc-if value="{{ vHandoff }}" hint-placeholder-val="{{ false }}">
+  <section data-screen-label="工程交接" style="padding:28px 32px 72px;max-width:1504px;margin:0 auto;display:grid;gap:20px">
+    <div style="display:grid;gap:5px">
+      <h2 style="margin:0;font-size:16px;font-weight:700">工程交接注释</h2>
+      <p style="margin:0;max-width:900px;font-size:12.5px;line-height:1.7;color:#475569">每个交互标明权威来源。凡是没有服务端事件或状态机支撑的点击效果，都必须标为 <span style="font:600 11px/1 ui-monospace,Menlo,monospace">prototype-only</span>，界面不得显示「已生效」。</p>
+    </div>
+
+    <div style="border:1px solid #cbd5e1;border-radius:10px;background:#fff;overflow:hidden">
+      <div style="display:grid;grid-template-columns:150px minmax(0,1fr) minmax(0,1fr) minmax(0,1.1fr) minmax(0,1.1fr);background:#f8fafc;border-bottom:1px solid #cbd5e1;font:700 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.08em;color:#475569"><span style="padding:11px 12px">用户动作</span><span style="padding:11px 12px">本地暂态</span><span style="padding:11px 12px">server ACK</span><span style="padding:11px 12px">stable event / projection</span><span style="padding:11px 12px">错误恢复动作</span></div>
+
+      <div style="display:grid;grid-template-columns:150px minmax(0,1fr) minmax(0,1fr) minmax(0,1.1fr) minmax(0,1.1fr);border-bottom:1px solid #eef1f5;font-size:11.5px;line-height:1.6"><span style="padding:11px 12px;font-weight:700">发送消息</span><span style="padding:11px 12px;color:#475569">submitting；保留正文/附件/引用；禁用重复提交</span><span style="padding:11px 12px;color:#334155">message.accepted（requestId 匹配）</span><span style="padding:11px 12px;color:#334155">message.created + 逐 target intent outcome；按 messageId/eventId 去重</span><span style="padding:11px 12px;color:#475569">429/503/超时 → 保留输入，重试用同一 idempotency key（30 天窗口内重放原结果）</span></div>
+
+      <div style="display:grid;grid-template-columns:150px minmax(0,1fr) minmax(0,1fr) minmax(0,1.1fr) minmax(0,1.1fr);border-bottom:1px solid #eef1f5;font-size:11.5px;line-height:1.6"><span style="padding:11px 12px;font-weight:700">@Agent 调用</span><span style="padding:11px 12px;color:#475569">无独立暂态；随消息提交。preview chunk 为可丢弃本地显示</span><span style="padding:11px 12px;color:#334155">逐 target accepted / rejected</span><span style="padding:11px 12px;color:#334155">invocation.accepted → execution.running → completed/failed/cancelled（各自独立）</span><span style="padding:11px 12px;color:#475569">failed → 手动 retry 创建 retryOfExecutionId 新 execution；来源已撤回/Context 已争议 → 拒绝旧 snapshot</span></div>
+
+      <div style="display:grid;grid-template-columns:150px minmax(0,1fr) minmax(0,1fr) minmax(0,1.1fr) minmax(0,1.1fr);border-bottom:1px solid #eef1f5;font-size:11.5px;line-height:1.6"><span style="padding:11px 12px;font-weight:700">@Human Request 接受</span><span style="padding:11px 12px;color:#475569">按钮 submitting；卡片保持 pending 外观</span><span style="padding:11px 12px;color:#334155">request.accepted（仅 target 本人 session）</span><span style="padding:11px 12px;color:#334155">nextaction/openquestion 原子创建；Ball projection 迁移到新 source</span><span style="padding:11px 12px;color:#475569">409 已取消/已转交 → 载入最新状态并说明；不静默成功</span></div>
+
+      <div style="display:grid;grid-template-columns:150px minmax(0,1fr) minmax(0,1fr) minmax(0,1.1fr) minmax(0,1.1fr);border-bottom:1px solid #eef1f5;font-size:11.5px;line-height:1.6"><span style="padding:11px 12px;font-weight:700">副作用确认</span><span style="padding:11px 12px;color:#475569">按钮 submitting；参数区冻结显示，任何变化即作废</span><span style="padding:11px 12px;color:#334155">confirmation.confirmed（绑定 execution/attempt/toolCall/参数/principal/session，一次消费）</span><span style="padding:11px 12px;color:#334155">grant active → claimed / revoked / expired；toolcall.dispatched</span><span style="padding:11px 12px;color:#475569">expired/参数变更/403 → 重新发起调用；claim 前 revoke → 显示「未执行」；claim 后异常 → outcome_unknown review</span></div>
+
+      <div style="display:grid;grid-template-columns:150px minmax(0,1fr) minmax(0,1fr) minmax(0,1.1fr) minmax(0,1.1fr);border-bottom:1px solid #eef1f5;font-size:11.5px;line-height:1.6"><span style="padding:11px 12px;font-weight:700">确认 Decision</span><span style="padding:11px 12px;color:#475569">按钮 submitting；proposal 仍为虚线轨</span><span style="padding:11px 12px;color:#334155">decision.confirmed（具名 confirmer）</span><span style="padding:11px 12px;color:#334155">confirmed fact + memory 更新 + 受影响对象提示</span><span style="padding:11px 12px;color:#475569">并发确认只成功一个，另一端 409 并显示当前权威结论</span></div>
+
+      <div style="display:grid;grid-template-columns:150px minmax(0,1fr) minmax(0,1fr) minmax(0,1.1fr) minmax(0,1.1fr);border-bottom:1px solid #eef1f5;font-size:11.5px;line-height:1.6"><span style="padding:11px 12px;font-weight:700">点击通知深链</span><span style="padding:11px 12px;color:#475569">高亮与滚动位置为纯本地视图状态</span><span style="padding:11px 12px;color:#334155">notification.read（不改变 handled）</span><span style="padding:11px 12px;color:#334155">handled 由 source 对象状态投影</span><span style="padding:11px 12px;color:#475569">来源不可访问 → 安全失败，不泄露标题与正文，本地项清除</span></div>
+
+      <div style="display:grid;grid-template-columns:150px minmax(0,1fr) minmax(0,1fr) minmax(0,1.1fr) minmax(0,1.1fr);border-bottom:1px solid #eef1f5;font-size:11.5px;line-height:1.6"><span style="padding:11px 12px;font-weight:700">邀请 Human / 配置 Agent</span><span style="padding:11px 12px;color:#475569">按钮 submitting；表单保留</span><span style="padding:11px 12px;color:#334155">invitation.created / assignment.updated（含版本）</span><span style="padding:11px 12px;color:#334155">membership 仅在接受后创建；assignment 立即生效并写审计</span><span style="padding:11px 12px;color:#475569">401 重新登录 · 403 权限说明 · 409 载入最新版本 · 429 冷却 · 503 保留输入重试</span></div>
+
+      <div style="display:grid;grid-template-columns:150px minmax(0,1fr) minmax(0,1fr) minmax(0,1.1fr) minmax(0,1.1fr);font-size:11.5px;line-height:1.6"><span style="padding:11px 12px;font-weight:700">离线 → 重连</span><span style="padding:11px 12px;color:#475569">离线只读横幅；所有写入禁用，不进入队列</span><span style="padding:11px 12px;color:#334155">重连后 sync（连续 cursor）或 repair</span><span style="padding:11px 12px;color:#334155">固定 watermark 重建 revision/项目/Ball/invocation/confirmation/notification</span><span style="padding:11px 12px;color:#475569">repair 失败 → 保留完整旧 cache；未接受的操作由用户显式重试，旧 confirmation 不自动执行</span></div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:14px">
+      <div style="border:1px solid #cbd5e1;border-radius:10px;background:#fff;padding:16px;display:grid;gap:8px">
+        <span style="font:700 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;color:#475569">prototype-only 清单</span>
+        <ul style="margin:0;padding-left:18px;font-size:11.5px;line-height:1.8;color:#334155">
+          <li>本设计稿的所有步进按钮（上一步 / 下一步 / 路径选择）仅用于演示状态迁移。</li>
+          <li>卡片内的「确认 / 接受 / 重试」在原型中直接推进视图，实现时必须等待匹配 requestId 的权威 ACK。</li>
+          <li>示例中的 ID（exec 8f21、toolCall 4c11、room-2041）为占位，不代表真实数据。</li>
+        </ul>
+      </div>
+      <div style="border:1px solid #cbd5e1;border-radius:10px;background:#fff;padding:16px;display:grid;gap:8px">
+        <span style="font:700 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;color:#475569">实现时必须验证的三条硬边界</span>
+        <ul style="margin:0;padding-left:18px;font-size:11.5px;line-height:1.8;color:#334155">
+          <li>Agent 的任何项目结论只能落为 proposal；confirmed 必须带具名 Human confirmer。</li>
+          <li>side-effect 的成功只能来自 dispatch 证据；不确定即 <span style="font:600 10.5px/1 ui-monospace,Menlo,monospace">outcome_unknown</span>，且不提供 generic retry。</li>
+          <li>三栏渲染必须取自同一 roomId 的 projection；切换 Room 时原子替换，不允许任一栏保留上一个 Room 的数据。</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+  </sc-if>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;showAnnotations&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;设计稿&quot;},&quot;showMinWindow&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;设计稿&quot;}}">
+const D = {
+  view: 'shell', auth: '', net: 'online', cmp: 'idle', req: '', e1: '', e2: '',
+  conf: '', attach: '', notifSync: '', dec: 'proposed', notif: false, hl: false,
+  ann: ['—', '—', '—', '—', '—']
+};
+
+const J = {
+  1: { label: 'J-01 登录 / 入群', req: 'REQ-ID-002 / 003 · REQ-UX-006', steps: [
+    { view:'auth', auth:'restore', note:'客户端启动：先校验 session 与离线租约，再决定是否解密 cache。不得先闪现未授权内容。',
+      ann:['启动应用','恢复中骨架，无 Room 内容','session.verify 结果','—','校验失败 → 登录 / 锁定'] },
+    { view:'auth', auth:'login', note:'session 已在另一设备被撤销 → 401。本地 cache 锁定，需重新认证。',
+      ann:['提交密码','submitting，保留输入','login ACK 建立本设备 session family','session.created','401 凭据错误 / 429 限流 → 保留输入重试'] },
+    { view:'auth', auth:'invite', note:'定向邀请与 AI 可见性披露必须在接受之前呈现；接受是显式动作。',
+      ann:['点击接受邀请','按钮 submitting','invitation.accepted','membership.created','邀请过期 / 非目标账户 → 明确失败，不产生半 membership'] },
+    { view:'auth', auth:'catalog', note:'加载 Room catalog 并原子恢复上次 Room；repair 完成前不显示半个 Room。',
+      ann:['—','catalog 骨架','sync cursor 建立','room.catalog / snapshot 投影','cursor 缺口 → repair；坏 cache → 重建'] },
+    { view:'auth', auth:'no_room', note:'首次使用空态：catalog 权威返回 0 个 Room。明确说明可用邀请加入；不是加载中，也不注入示例数据。',
+      ann:['打开应用','—','catalog ACK（0 items）','room.catalog projection','刷新 / 使用定向邀请；不本地创建 membership'] },
+    { view:'auth', auth:'degraded', note:'部分可用：catalog 已校验但上次 Room projection 不完整。保留完整旧 cache，只读并提供 repair/切换 Room。',
+      ann:['选择上次 Room','degraded，只读','repair rejected / unavailable','旧完整 projection','重试 repair / 选择其他 Room'] },
+    { view:'auth', auth:'fatal', note:'不可恢复错误必须失败闭合：不解密 Room 内容、没有永久 spinner，提供重新认证重建与安全诊断。',
+      ann:['启动','fatal','cache/rebuild error','—','重新认证并重建 cache / 导出无正文诊断'] },
+    { view:'shell', note:'进入 Room：左栏、时间线、项目面板同时指向同一 roomId。',
+      ann:['选择 Room','—','—','三栏由同一 roomId 的 projection 渲染','切换失败 → 保留旧 Room 并提示'] }
+  ]},
+  2: { label: 'J-02 发消息与 ACK', req: 'REQ-MSG-001 / 002 · REQ-UX-007', steps: [
+    { view:'shell', cmp:'idle', note:'composer idle：结构化寻址与附件在正文之外，绑定稳定 actorId。',
+      ann:['输入正文','草稿本地保存','—','—','—'] },
+    { view:'shell', cmp:'idle', attach:'selected', note:'本地已选：只显示本机选择与预校验结果，尚无 fileId，不得声称已上传。',
+      ann:['选择附件','LOCAL selected','—','—','移除 / 开始上传'] },
+    { view:'shell', cmp:'idle', attach:'uploading', note:'上传中：显示真实字节进度和取消。取消会终止本次上传，不创建 source attachment。',
+      ann:['开始上传','uploading 42%','—','—','取消 → cancelled'] },
+    { view:'shell', cmp:'idle', attach:'processing', note:'上传 ACK 已获得 fileId；服务端正在安全扫描、提取文本与 OCR。此时不能发送依赖 ready 内容的消息。',
+      ann:['上传完成','processing','attachment.accepted','attachment.processing','处理失败 → 分类为可重试 / 不可重试'] },
+    { view:'shell', cmp:'idle', attach:'ready', note:'ready：hash、MIME、字节数、提取/OCR 与 AI-visible 披露均已由 stable event 确认，可随消息提交。',
+      ann:['—','—','—','attachment.ready','预览/下载仍在每次访问时重验权限'] },
+    { view:'shell', cmp:'idle', attach:'retryable', note:'可重试失败：网络中断，未产生 ready attachment。保留本地文件引用并提供显式重试。',
+      ann:['—','retryable_failure','无 ready ACK','attachment.upload_failed(retryable)','重试使用同 upload key / 移除'] },
+    { view:'shell', cmp:'idle', attach:'nonretryable', note:'不可重试失败：提取器不支持加密 PDF。原文件未进入可用附件集合；必须换文件。',
+      ann:['—','nonretryable_failure','rejected','attachment.rejected(unsupported_encryption)','移除 / 选择其他文件'] },
+    { view:'shell', cmp:'idle', attach:'cancelled', note:'用户取消：上传终止且状态闭合，不显示成功；可移除或重新选择后创建新的 upload。',
+      ann:['取消上传','cancelled','cancel ACK','attachment.cancelled','移除 / 重新选择'] },
+    { view:'shell', cmp:'idle', attach:'size_type', note:'大小/类型在读取正文前失败闭合：超过部署上限或 MIME 不在闭集，拒绝原因与允许范围可见。',
+      ann:['选择文件','local validation failed','—','—','选择符合大小与类型限制的文件'] },
+    { view:'shell', cmp:'idle', attach:'malware', note:'安全扫描拒绝：附件隔离且不可预览、下载、发送或进入 Agent context；错误不回显扫描原始正文。',
+      ann:['—','blocked','attachment rejected','attachment.malware_rejected','移除；联系管理员只查看安全分类'] },
+    { view:'shell', cmp:'idle', attach:'permission_revoked', note:'权限撤销：ready fileId 仍是审计事实，但当前 session 不再可读，立即隐藏预览并从待发送关联移除。',
+      ann:['membership/session revoke','locked','403','membership.revoked','清 Room cache / 重新认证；不泄露文件名以外正文'] },
+    { view:'shell', cmp:'submitting', note:'submitting 是本地暂态。输入不清空，不显示任何成功文案。',
+      ann:['⌘↩ 发送','submitting + 禁用重复提交','等待 message.accepted','—','超时 → 可重试失败'] },
+    { view:'shell', cmp:'sent', note:'message.accepted 只表示身份/成员/内容校验通过且已耐久提交，不表示他人已收到或 Agent 已回答。',
+      ann:['—','清除暂态','message.accepted（requestId 匹配）','message.created 事件 + 逐 target outcome','—'] },
+    { view:'shell', cmp:'failed', note:'503 可重试失败：输入保留，提供显式重试；不因回调未抛异常就显示成功。',
+      ann:['—','failed 暂态，保留正文与附件','无 ACK','—','重试（同 idempotency key）/ 放弃'] },
+    { view:'shell', cmp:'sent', note:'重试成功：同一 key 重放返回同一 messageId，时间线无可见重复。',
+      ann:['点击重试','submitting → 清除','重放 ACK 返回原 IDs','按 eventId 去重收敛','—'] }
+  ]},
+  3: { label: 'J-03 @Agent 调用', req: 'REQ-AGT-001 / 008 / 009 · REQ-MSG-008', steps: [
+    { view:'shell', cmp:'sent', e1:'accepted', e2:'accepted', note:'一条消息点名两个 Agent：逐 target 原子持久化独立 invocation intent，并返回逐目标结果。',
+      ann:['发送含 2 个 @Agent 的消息','—','message.accepted + 2 × intent accepted','invocation.accepted ×2','单 target 撤权 → 该 target rejected，消息仍 accepted'] },
+    { view:'shell', cmp:'sent', e1:'running', e2:'running', note:'running 展示真实产品态，不使用模拟真人的 typing。preview 是非权威、可丢弃的本地显示。',
+      ann:['—','preview chunk（本地、可丢弃）','—','execution.running','断线 → preview 丢弃，状态由 repair 恢复'] },
+    { view:'shell', cmp:'sent', e1:'completed', e2:'failed', note:'两个 execution 互不连带：A 提交 final；B provider timeout，有界 attempt 后显式 failed。',
+      ann:['—','—','—','execution.completed / execution.failed','B：手动重试（新 execution）或查看诊断'] },
+    { view:'shell', cmp:'sent', e1:'completed', e2:'retrying', note:'Human 手动重试创建带 retryOfExecutionId 的新 execution，复用同一冻结 snapshot；不换 Agent、不换模型。',
+      ann:['点击重试','按钮 submitting','retry ACK（新 executionId）','execution.accepted','来源已撤回 / Context 已争议 → 拒绝旧 snapshot，要求新 invocation'] },
+    { view:'shell', cmp:'sent', e1:'completed', e2:'completed', note:'每次执行恰有一个终态；两者独立完成。',
+      ann:['—','—','—','execution.completed','—'] },
+    { view:'shell', cmp:'sent', e1:'completed', e2:'cancelled', note:'Human 发出关联纠正 → scoped supersede。cancelled 是独立终态，不等于系统失败，也不伪装成「已回滚」。',
+      ann:['发送关联纠正 / 显式取消','—','cancel ACK','execution.cancelled（superseded）','无关新消息不取消 Room 内其他 Agent 工作'] }
+  ]},
+  4: { label: 'J-04 @Human Request', req: 'REQ-PRJ-004 · REQ-PRIM-010', steps: [
+    { view:'shell', cmp:'sent', req:'pending', note:'@Human 与 accepted 消息同事务创建 pending Request。接受之前，责任与 Ball 都不归目标。',
+      ann:['发送含 @Human 的消息','—','message.accepted + request pending','request.created','目标已撤权 → 该 target rejected'] },
+    { view:'shell', cmp:'sent', req:'accepted', note:'目标本人接受 → Request 握手终结，并原子创建/链接 NextAction，Ball 迁移到该 source。',
+      ann:['目标点击接受','按钮 submitting','request.accepted','nextaction.created + ball 投影迁移','冲突 / 已取消 → 409 并载入最新状态'] },
+    { view:'shell', cmp:'sent', req:'transfer', note:'或转交：新目标重新进入 pending_acceptance，接受前责任不转移；requester 可在接受前取消。',
+      ann:['选择转交目标','—','request.transferred','request.pending_acceptance（新 target）','新目标拒绝 → 保留原 owner 并重新分派'] }
+  ]},
+  5: { label: 'J-05 副作用确认', req: 'REQ-AGT-012 / 013 · REQ-PRIM-018', steps: [
+    { view:'shell', cmp:'sent', e1:'running', conf:'pending', note:'running / waiting_confirmation：读工具已自动执行，外部写必须逐次精确确认。',
+      ann:['—','—','—','toolcall.waiting_confirmation','参数变化 → 旧确认失效；到期 → expired'] },
+    { view:'shell', cmp:'sent', e1:'cancelled', conf:'rejected', note:'Human 明确拒绝：confirmation 终态为 rejected，未生成 grant，parent execution 收敛为 cancelled；界面只显示「未执行」。',
+      ann:['点击拒绝','submitting','confirmation.rejected','execution.cancelled(human_rejected)','重新行动必须创建新 invocation'] },
+    { view:'shell', cmp:'sent', e1:'running', conf:'duplicate', note:'重复确认：同一 confirmation 已由另一 session 消费；本次 command 返回稳定冲突并加载最新状态，绝不重复 dispatch。',
+      ann:['另一设备再次确认','submitting','409 already_consumed','existing confirmation/grant projection','载入最新状态；adapter 调用次数不增加'] },
+    { view:'shell', cmp:'sent', e1:'cancelled', conf:'params_changed', note:'参数发生任何变化都会使旧 confirmation 失效；旧 hash/binding 不可复用，只能基于新参数创建新 toolCall。',
+      ann:['修改参数','—','confirmation.rejected(params_changed)','grant absent / revoked','重新发起新 invocation/toolCall'] },
+    { view:'shell', cmp:'sent', e1:'cancelled', conf:'principal_revoked', note:'principal 或 session family 已撤销：旧绑定确认失败闭合，未 dispatch；重新登录也不能复活旧确认。',
+      ann:['旧 session 点击确认','submitting','403 binding_revoked','confirmation.rejected / grant absent','重新认证后创建新 invocation'] },
+    { view:'shell', cmp:'sent', e1:'running', conf:'confirmed', note:'confirmed 是不可改写的 Human 决定，恢复同一 execution，并产生独立、单次消费的 dispatch grant。',
+      ann:['点击确认执行这一次','按钮 submitting','confirmation.confirmed','grant active（单次消费）','换 session / 转交后旧 principal 确认 → 失败'] },
+    { view:'shell', cmp:'sent', e1:'cancelled', conf:'grant_revoked', note:'确认后、claim 前撤销权限或 grant：confirmation 事实保持 confirmed，独立 grant 原子 revoked，parent cancelled，adapter 调用次数为 0。',
+      ann:['撤销 assignment/grant','—','revoke ACK','grant.revoked + execution.cancelled','晚到 claim → 拒绝；显示「已确认但未执行」'] },
+    { view:'shell', cmp:'sent', e1:'running', conf:'dispatched', note:'grant 被 claim → dispatched。此后取消只能停止后续步骤，不得声称副作用已撤销。',
+      ann:['—','—','claim 提交','toolcall.dispatched','claim 前撤销 → grant revoked，结果为「未执行」'] },
+    { view:'shell', cmp:'sent', e1:'running', conf:'unknown', note:'adapter 在 durable claim 后异常 → outcome_unknown。禁止自动与 generic 重试，必须由 Human review 闭合。',
+      ann:['—','—','—','toolcall.outcome_unknown','review：闭合为 known succeeded / known failed / 已补偿'] },
+    { view:'shell', cmp:'sent', e1:'completed', conf:'reviewed', note:'review 闭合为 known succeeded；如需再次行动只能创建新的 invocation / toolCall。',
+      ann:['选择闭合结论','submitting','review ACK','toolcall.reviewed + execution.completed','闭合为 known failed → 创建新 invocation'] }
+  ]},
+  6: { label: 'J-06 proposal → 事实', req: 'REQ-MEM-005 · REQ-PRJ-002 / 003', steps: [
+    { view:'shell', cmp:'sent', dec:'proposed', note:'Agent 提出 Decision proposal。虚线轨 + PROPOSAL 印记：它不是事实，也不进入权威链。',
+      ann:['—','—','—','decision.proposed','—'] },
+    { view:'shell', cmp:'sent', dec:'proposed', hl:true, note:'点击来源 → 深链回时间线并高亮该消息版本，确认前可核对原文。',
+      ann:['点击「查看来源」','高亮为本地视图状态','—','消息 projection（含版本）','来源已撤回 → 显示 tombstone，不泄露正文'] },
+    { view:'shell', cmp:'sent', dec:'confirmed', hl:false, note:'具名 Human 确认 → confirmed fact，记录 confirmer、来源、时间与版本。',
+      ann:['点击确认','按钮 submitting','decision.confirmed','confirmed fact + memory 更新','并发确认冲突 → 只产生一个，另一端 409'] },
+    { view:'shell', cmp:'sent', dec:'superseded', note:'新结论 supersede 旧 Decision，保留双向链；confirmed 不可原位改写。',
+      ann:['提交新结论','—','decision.superseded','双向链 + 受影响对象提示','来源被修订 → 不静默改写已确认事实'] }
+  ]},
+  7: { label: 'J-07 通知 / 离线', req: 'REQ-UX-008 · REQ-NFR-007 / 004', steps: [
+    { view:'shell', cmp:'sent', notif:true, note:'flat、durable、recipient-scoped 通知中心；read 与 handled 分离，无 OS push。',
+      ann:['打开通知中心','popover 打开','—','notification projection（服务端权威未读/已处理）','来源不可访问 → 安全失败并清除本地项'] },
+    { view:'shell', cmp:'sent', notif:false, hl:true, note:'点击通知深链到来源并高亮；仅阅读只改变 read，不改变 handled。',
+      ann:['点击通知','滚动 + 高亮为本地视图状态','read 状态提交','notification.read','无权访问 → 安全失败，不泄露标题正文'] },
+    { view:'shell', cmp:'sent', notif:true, notifSync:'read_a', note:'MacBook 标为已读只提交 recipient-scoped read 事实；iMac 在事件到达前仍可短暂显示未读。',
+      ann:['MacBook 标为已读','read submitting','notification.read ACK','notification.read stable event','断线 session 由 cursor sync 补齐'] },
+    { view:'shell', cmp:'sent', notif:true, notifSync:'read_converged', note:'两台设备按同一 stable event 收敛为已读；handled 仍为 false，因为来源 Request 尚未闭合。',
+      ann:['—','—','—','read=true / handled=false','重复 eventId 去重'] },
+    { view:'shell', cmp:'sent', notif:true, notifSync:'handled_source', note:'任一设备完成来源 Request 后，handled 由 source 对象终态投影，不由「标为已读」按钮推断。',
+      ann:['iMac 接受 Request','submitting','request.accepted','source terminal → notification handled projection','409 冲突时载入 source 最新状态'] },
+    { view:'shell', cmp:'sent', notif:true, notifSync:'handled_converged', note:'所有 active session 最终收敛为 read=true、handled=true；离线设备在 repair 后得到相同结果。',
+      ann:['—','—','—','notification projection converged','撤权设备停止同步并清本地项'] },
+    { view:'shell', cmp:'idle', net:'offline', note:'离线只读最后一次完整校验的加密 cache；写操作禁用，不接受离线消息 / 项目 / 工具写入。',
+      ann:['断网','离线只读横幅，发送禁用','—','—','重连后由用户显式重试未接受的操作'] },
+    { view:'shell', cmp:'idle', net:'repair', note:'重连：cursor 缺口 → repair 在固定 watermark 下重建全部可见状态，含 pending confirmation 与通知。',
+      ann:['重新连接','repair 进行中横幅','sync/repair ACK','snapshot 重建 projection','repair 失败 → 保留完整旧 cache，不显示半个快照'] },
+    { view:'shell', cmp:'idle', net:'repair_failed', note:'repair 失败是闭合错误态：新快照不提交，旧完整 cache 保持只读；提供明确重试而不是永久 spinner。',
+      ann:['—','repair_failed','repair error','旧完整 projection 保持','重试完整 repair / 重新认证重建'] },
+    { view:'shell', cmp:'idle', net:'online', note:'收敛完成：无可见重复、无顺序回退；旧 confirmation 不自动执行。',
+      ann:['—','—','—','按 eventId 去重收敛','—'] }
+  ]}
+};
+
+const E1 = {
+  accepted:  { s:'ACCEPTED', i:'●', line:'#cbd5e1', bg:'#fff',    fg:'#475569', sub:'子态 queued · 尚未开始生成', note:'服务端已接受本次调用并持久化 intent；尚未开始生成。', attempt:'1' },
+  running:   { s:'RUNNING',  i:'▶', line:'#94a3b8', bg:'#fff',    fg:'#334155', sub:'子态 model_generation', note:'正在处理。不使用模拟真人的 typing 动画；状态来自 durable execution。', attempt:'1' },
+  completed: { s:'COMPLETED',i:'■', line:'#a7d8c0', bg:'#f0fdf6', fg:'#027a48', sub:'final 已提交', note:'权威 final 已提交。completed 不等于其中的项目建议已获 Human 确认。', attempt:'1' },
+  failed:    { s:'FAILED',   i:'✕', line:'#f0a9a3', bg:'#fff5f4', fg:'#b42318', sub:'provider timeout · attempt 3/3', note:'有界 attempt 后显式失败，不自动换 Agent 或换模型。', attempt:'3' },
+  cancelled: { s:'CANCELLED',i:'⊘', line:'#cbd5e1', bg:'#f8fafc', fg:'#475569', sub:'superseded by 关联纠正', note:'被 Human 取消或被关联的新上下文取代，是独立终态，不计入失败指标。', attempt:'1' },
+  retrying:  { s:'ACCEPTED', i:'●', line:'#cbd5e1', bg:'#fff',    fg:'#475569', sub:'retryOf exec c93d · 新 execution', note:'手动重试创建的新 execution，复用同一冻结 context snapshot。', attempt:'1' }
+};
+
+const ATTACH = {
+  selected: { s:'LOCAL SELECTED', icon:'PDF', line:'#94a3b8', bg:'#f8fafc', fg:'#475569', note:'4.2 MB · application/pdf · 仅本地选择，尚无 fileId。', authority:'LOCAL 暂态 · 可移除或开始上传', remove:true },
+  uploading: { s:'UPLOADING 42%', icon:'42%', line:'#84adff', bg:'#eef4ff', fg:'#175cd3', note:'1.8 / 4.2 MB · 分块上传有界；取消立即终止本次 upload。', authority:'LOCAL progress + upload session · 未产生 ready 事实', cancel:true },
+  processing: { s:'PROCESSING / OCR', icon:'OCR', line:'#84adff', bg:'#eef4ff', fg:'#175cd3', note:'fileId att-2041 · 安全扫描、文本提取与 OCR 中；暂不可随消息发送。', authority:'attachment.accepted ACK + processing stable event', cancel:true },
+  ready: { s:'READY', icon:'✓', line:'#a7d8c0', bg:'#f0fdf6', fg:'#027a48', note:'hash 91ab… · 12 页 · OCR 完成 · 当前 Room Agent 可按权限读取。', authority:'attachment.ready stable event · 每次预览/下载仍重验权限', remove:true },
+  retryable: { s:'RETRYABLE FAILURE', icon:'↻', line:'#f0c48a', bg:'#fffaf0', fg:'#b54708', note:'网络中断，未创建 ready attachment；本地文件引用保留。', authority:'upload_failed(retryable) · 同 upload key 可安全重试', retry:true, remove:true },
+  nonretryable: { s:'NONRETRYABLE FAILURE', icon:'!', line:'#f0a9a3', bg:'#fff5f4', fg:'#b42318', note:'加密 PDF 无法安全提取；文件未进入可用附件集合。', authority:'attachment.rejected(unsupported_encryption) · 请选择其他文件', remove:true },
+  cancelled: { s:'CANCELLED', icon:'×', line:'#cbd5e1', bg:'#f8fafc', fg:'#475569', note:'上传已取消，未提交 source attachment，也不显示成功。', authority:'attachment.cancelled terminal · 新上传使用新 upload', remove:true },
+  size_type: { s:'SIZE / TYPE REJECTED', icon:'!', line:'#f0a9a3', bg:'#fff5f4', fg:'#b42318', note:'文件 62 MB，超过 50 MB 上限；允许 PDF、PNG、JPEG、DOCX、XLSX、TXT、CSV。', authority:'LOCAL preflight · 正文未上传', remove:true },
+  malware: { s:'MALWARE REJECTED', icon:'⊘', line:'#f0a9a3', bg:'#fff5f4', fg:'#b42318', note:'安全扫描拒绝并隔离；不可预览、下载、发送或进入 Agent context。', authority:'attachment.malware_rejected stable event · 原始扫描正文不回显', remove:true },
+  permission_revoked: { s:'PERMISSION REVOKED', icon:'🔒', line:'#cbd5e1', bg:'#f8fafc', fg:'#475569', note:'当前 membership/session 已撤销；预览隐藏并从待发送关联移除。', authority:'403 + membership.revoked · 清对应 Room cache', remove:true }
+};
+
+const NOTIF_SYNC = {
+  read_a: { s:'PROPAGATING READ', fg:'#b54708', note:'MacBook 的 read ACK 已提交；iMac 仍离线，不能提前显示已收敛。', mac:'read=true · handled=false', imac:'read=false · handled=false' },
+  read_converged: { s:'READ CONVERGED', fg:'#027a48', note:'同一 recipient 的 read stable event 已由两个 session 消费并按 eventId 去重。', mac:'read=true · handled=false', imac:'read=true · handled=false' },
+  handled_source: { s:'SOURCE TERMINAL', fg:'#175cd3', note:'iMac 已接受来源 Request；handled 正在由 source terminal projection 传播。', mac:'read=true · handled=false', imac:'read=true · handled=true' },
+  handled_converged: { s:'HANDLED CONVERGED', fg:'#027a48', note:'两台设备均从同一 source projection 得到 handled=true；不是本地清除。', mac:'read=true · handled=true', imac:'read=true · handled=true' }
+};
+
+const CONF = {
+  pending:    { s:'PENDING',        line:'#f0c48a', bg:'#fffaf0', fg:'#b54708', note:'参数一旦变化，此确认立即失效并需重新确认；服务端过期不因归档暂停。' },
+  rejected:   { s:'REJECTED · HUMAN', line:'#cbd5e1', bg:'#f8fafc', fg:'#475569', note:'Human 已明确拒绝。未生成 grant，adapter 未调用，parent execution 已 cancelled。', recover:'创建新 invocation', recoverHint:'旧 confirmation 为终态，不可复活' },
+  duplicate:  { s:'DUPLICATE REFUSED · 409', line:'#f0c48a', bg:'#fffaf0', fg:'#b54708', note:'另一 session 已消费同一 confirmation；本次重复确认返回既有结果，绝不再次 dispatch。', recover:'载入最新状态', recoverHint:'按 existing confirmation/grant projection 收敛' },
+  params_changed: { s:'INVALID · PARAMS CHANGED', line:'#f0a9a3', bg:'#fff5f4', fg:'#b42318', note:'规范化参数 SHA-256 已变化，旧 confirmation/binding 作废，adapter 未调用。', recover:'基于新参数重新发起', recoverHint:'创建新 toolCall；旧 grant 不可复用' },
+  principal_revoked: { s:'REJECTED · BINDING REVOKED', line:'#f0a9a3', bg:'#fff5f4', fg:'#b42318', note:'principal 或 session family 已撤销；旧绑定不能在重新登录后复活，adapter 未调用。', recover:'重新认证并新建调用', recoverHint:'新 execution / attempt / binding' },
+  confirmed:  { s:'CONFIRMED',      line:'#a7d8c0', bg:'#f0fdf6', fg:'#027a48', note:'已确认，尚未 dispatch。此刻仍可因归档 / 取消 / 撤权而 revoke grant，结果为「未执行」。' },
+  grant_revoked: { s:'CONFIRMED · GRANT REVOKED', line:'#cbd5e1', bg:'#f8fafc', fg:'#475569', note:'Human 确认事实保持 confirmed；claim 前 grant 已原子 revoked，parent cancelled，adapter 调用次数为 0。', recover:'查看撤销原因', recoverHint:'晚到 claim 被拒；只能创建新 invocation' },
+  dispatched: { s:'DISPATCHED',     line:'#94a3b8', bg:'#f8fafc', fg:'#334155', note:'grant 已被 claim 并派发。后续取消只停止后续步骤，不得声称副作用已撤销。' },
+  unknown:    { s:'OUTCOME_UNKNOWN',line:'#c99a3d', bg:'repeating-linear-gradient(135deg,#fffdf6 0 7px,#fdf3dd 7px 14px)', fg:'#8a5a00', note:'已 dispatch 但结果不确定。已停用自动与 generic 重试；必须由 Human review 闭合，原 toolCall 永不二次执行。' },
+  reviewed:   { s:'REVIEWED · KNOWN SUCCEEDED', line:'#a7d8c0', bg:'#f0fdf6', fg:'#027a48', note:'review 已闭合为 known succeeded，证据已归档。如需再次行动，创建新的 invocation / toolCall。' },
+  expired:    { s:'EXPIRED',        line:'#cbd5e1', bg:'#f8fafc', fg:'#475569', note:'确认已过期，未执行。' }
+};
+
+const REQS = {
+  pending:  { state:'PENDING_ACCEPTANCE', title:'请周予确认迁移窗口能否压到 4 小时', body:'目标：周予。接受前不产生其责任，Ball 仍在 requester。同名成员由稳定 actorId 区分，不依赖 displayName。', hint:'仅目标 Human 本人可接受 / 拒绝 / 转交' },
+  accepted: { state:'ACCEPTED', title:'周予 已接受该 Request', body:'握手终结，已原子创建 NextAction「确认迁移窗口能否压到 4 小时」，Ball 迁移到该 NextAction；纯信息请求则链接 OpenQuestion 闭环。', hint:'Request 本身不再持有 Ball' },
+  transfer: { state:'TRANSFERRED → PENDING_ACCEPTANCE', title:'已转交给 林澈，等待其接受', body:'转交是审计迁移：新目标重新进入 pending_acceptance，在其本人接受前责任不转移。转交链不可删除。', hint:'requester 可在接受前 cancel' }
+};
+
+class Component extends DCLogic {
+  state = { view: 'proto', j: 3, s: 0, notif: false, drawer: false, hl: false, dec: null };
+
+  cur() {
+    const j = J[this.state.j];
+    const st = j.steps[Math.min(this.state.s, j.steps.length - 1)] || {};
+    return Object.assign({}, D, st);
+  }
+
+  go = (v) => () => this.setState({ view: v });
+  pick = (n) => () => this.setState({ j: n, s: 0, notif: false, drawer: false, hl: false, dec: null });
+  next = () => {
+    const j = J[this.state.j];
+    this.setState({ s: Math.min(this.state.s + 1, j.steps.length - 1), notif: false, hl: false, dec: null });
+  };
+  prev = () => this.setState({ s: Math.max(this.state.s - 1, 0), notif: false, hl: false, dec: null });
+
+  renderVals() {
+    const f = this.cur();
+    const j = J[this.state.j];
+    const e1 = E1[f.e1] || E1.accepted;
+    const e2 = E1[f.e2] || E1.accepted;
+    const cf = CONF[f.conf] || CONF.pending;
+    const at = ATTACH[f.attach] || ATTACH.selected;
+    const ns = NOTIF_SYNC[f.notifSync] || NOTIF_SYNC.read_a;
+    const rq = REQS[f.req] || REQS.pending;
+    const notif = this.state.notif || f.notif;
+    const hl = this.state.hl || f.hl;
+    const dec = this.state.dec || f.dec;
+    const cmpMap = {
+      idle:       { text:'@检索员 帮我核对第 3 节的字段映射', status:'', fg:'#64748b', btn:'发送', line:'#cbd5e1', bl:'#1d4ed8', bb:'#1d4ed8', bf:'#fff', dis:false },
+      submitting: { text:'@检索员 帮我核对第 3 节的字段映射', status:'submitting…', fg:'#175cd3', btn:'发送中', line:'#84adff', bl:'#84adff', bb:'#eef4ff', bf:'#175cd3', dis:true },
+      sent:       { text:'', status:'已提交 · message.accepted', fg:'#027a48', btn:'发送', line:'#cbd5e1', bl:'#1d4ed8', bb:'#1d4ed8', bf:'#fff', dis:false },
+      failed:     { text:'@检索员 帮我核对第 3 节的字段映射', status:'未提交', fg:'#b42318', btn:'发送', line:'#f0a9a3', bl:'#1d4ed8', bb:'#1d4ed8', bf:'#fff', dis:false }
+    };
+    const c = cmpMap[f.cmp] || cmpMap.idle;
+    const off = f.net === 'offline';
+    const ann = f.ann || D.ann;
+
+    return {
+      goProto: this.go('proto'), goStates: this.go('states'), goTokens: this.go('tokens'),
+      goComponents: this.go('components'), goCoverage: this.go('coverage'), goHandoff: this.go('handoff'),
+      vProto: this.state.view === 'proto', vStates: this.state.view === 'states',
+      vTokens: this.state.view === 'tokens', vComponents: this.state.view === 'components',
+      vCoverage: this.state.view === 'coverage', vHandoff: this.state.view === 'handoff',
+
+      pick1: this.pick(1), pick2: this.pick(2), pick3: this.pick(3), pick4: this.pick(4),
+      pick5: this.pick(5), pick6: this.pick(6), pick7: this.pick(7),
+      next: this.next, prev: this.prev,
+      toggleNotif: () => this.setState({ notif: !notif }),
+      toggleDrawer: () => this.setState({ drawer: !this.state.drawer }),
+      jumpSource: () => this.setState({ hl: true, notif: false }),
+      confirmDec: () => this.setState({ dec: 'confirmed' }),
+
+      jLabel: j.label, jReq: j.req,
+      stepLabel: '步骤 ' + (this.state.s + 1) + ' / ' + j.steps.length,
+      stepNote: f.note || '',
+
+      vAuth: f.view === 'auth', vShell: f.view === 'shell',
+      aRestore: f.auth === 'restore', aLogin: f.auth === 'login',
+      aInvite: f.auth === 'invite', aCatalog: f.auth === 'catalog',
+      aNoRoom: f.auth === 'no_room', aDegraded: f.auth === 'degraded', aFatal: f.auth === 'fatal',
+
+      netOffline: off, netRepair: f.net === 'repair', netRepairFailed: f.net === 'repair_failed', netOnline: f.net === 'online',
+      notifOpen: notif, drawerOpen: this.state.drawer,
+      hlOn: hl,
+      hlBg: hl ? '#fff8e8' : '#eef4ff',
+      hlBorder: hl ? '#e0b34a' : '#d9e6ff',
+      hlRing: hl ? '0 0 0 3px rgba(224,179,74,.35)' : 'none',
+
+      cmpText: off ? '离线状态下不可编辑发送内容' : (c.text || '写点什么…'),
+      cmpStatus: off ? '离线 · 发送已禁用' : c.status,
+      cmpFg: off ? '#7c4a08' : c.fg,
+      cmpBtn: c.btn, cmpLine: c.line, cmpBtnLine: off ? '#cbd5e1' : c.bl,
+      cmpBtnBg: off ? '#f1f5f9' : c.bb, cmpBtnFg: off ? '#94a3b8' : c.bf,
+      cmpDisabled: off || c.dis, cmpFailed: f.cmp === 'failed' && !off,
+
+      attAny: !!f.attach, attState: at.s, attIcon: at.icon, attLine: at.line, attBg: at.bg,
+      attFg: at.fg, attNote: at.note, attAuthority: at.authority,
+      attCanCancel: !!at.cancel, attCanRetry: !!at.retry, attCanRemove: !!at.remove,
+
+      reqAny: !!f.req, reqPending: f.req === 'pending', reqAccepted: f.req === 'accepted',
+      reqState: rq.state, reqTitle: rq.title, reqBody: rq.body, reqHint: rq.hint,
+
+      execAny: !!f.e1, e1State: e1.s, e1Icon: e1.i, e1Line: e1.line, e1Bg: e1.bg, e1Fg: e1.fg,
+      e1Sub: e1.sub, e1Note: e1.note, e1Attempt: e1.attempt,
+      e1Preview: f.e1 === 'running' && !f.conf, e1Final: f.e1 === 'completed',
+      e1Actions: f.e1 === 'running' || f.e1 === 'accepted',
+
+      exec2Any: !!f.e2, e2State: e2.s, e2Icon: e2.i, e2Line: e2.line, e2Bg: e2.bg, e2Fg: e2.fg,
+      e2Sub: e2.sub, e2Note: e2.note, e2Final: f.e2 === 'completed',
+      e2Recover: f.e2 === 'failed',
+      e2Id: f.e2 === 'retrying' ? 'exec d4a0 · retryOf c93d' : 'exec c93d',
+
+      confAny: !!f.conf, confState: cf.s, confLine: cf.line, confBg: cf.bg, confFg: cf.fg,
+      confNote: cf.note, confPending: f.conf === 'pending', confUnknown: f.conf === 'unknown',
+      confRecover: !!cf.recover, confRecoverLabel: cf.recover || '', confRecoverHint: cf.recoverHint || '',
+
+      notifSyncAny: !!f.notifSync, notifSyncState: ns.s, notifSyncFg: ns.fg, notifSyncNote: ns.note,
+      notifMac: ns.mac, notifImac: ns.imac,
+
+      decProposed: dec === 'proposed', decConfirmed: dec === 'confirmed', decSuperseded: dec === 'superseded',
+
+      showAnn: this.props.showAnnotations !== false,
+      showMinWindow: this.props.showMinWindow !== false,
+      annAction: ann[0], annLocal: ann[1], annAck: ann[2], annEvent: ann[3], annRecover: ann[4]
+    };
+  }
+}
+</script>
+</body>
+</html>
