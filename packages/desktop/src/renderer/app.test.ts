@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import type {
   AgentActor,
@@ -915,7 +916,13 @@ function contrastRatio(foreground: string, background: string): number {
 
 describe("join control visual accessibility tokens", () => {
   it("uses AA dark status colours and a three-to-one control boundary", () => {
-    const styles = readFileSync("packages/desktop/src/renderer/styles.css", "utf8");
+    const localStyles = resolve(process.cwd(), "src/renderer/styles.css");
+    const styles = readFileSync(
+      existsSync(localStyles)
+        ? localStyles
+        : resolve(process.cwd(), "packages/desktop/src/renderer/styles.css"),
+      "utf8",
+    );
     const darkStatusBackground = "#202c40";
     const controlBorder = "#64748b";
 

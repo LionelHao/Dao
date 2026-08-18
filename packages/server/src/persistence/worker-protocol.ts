@@ -25,6 +25,7 @@ import {
   parsePersistentCommand,
   parseRoomSyncRequest,
 } from "./contracts.js";
+import { MAX_ACTIVE_SESSION_FAMILIES } from "./contracts.js";
 import {
   isRuntimeAuthorityOperation,
   type RuntimeAuthorityOperation,
@@ -53,6 +54,8 @@ import type {
   RoomGovernanceCommand,
   SnapshotRevalidationRequest,
   RepairScope,
+  PublicSession,
+  SessionDevice,
   StreamingRepairLease,
 } from "./contracts.js";
 
@@ -101,6 +104,9 @@ export type AuthorityWorkerErrorCode =
   | "route_conflict"
   | "route_job_not_found"
   | "session_revoked"
+  | "session_not_found"
+  | "session_id_conflict"
+  | "session_limit_reached"
   | "snapshot_busy"
   | "snapshot_expired"
   | "snapshot_family_revoked"
@@ -158,6 +164,9 @@ export function isAuthorityWorkerErrorCode(
     case "route_conflict":
     case "route_job_not_found":
     case "session_revoked":
+    case "session_not_found":
+    case "session_id_conflict":
+    case "session_limit_reached":
     case "snapshot_busy":
     case "snapshot_expired":
     case "snapshot_family_revoked":
@@ -218,6 +227,19 @@ export type AuthorityWorkerRequest =
       readonly type: "authority.session-revoke";
       readonly requestId: string;
       readonly accessTokenHash: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.sessions-list";
+      readonly requestId: string;
+      readonly accessTokenHash: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.session-revoke-target";
+      readonly requestId: string;
+      readonly accessTokenHash: string;
+      readonly publicSessionId: string;
       readonly now: number;
     }
   | {
@@ -365,12 +387,12 @@ export type AuthorityWorkerResponse =
   | {
       readonly type: "authority.ready";
       readonly requestId: string;
-      readonly schemaVersion: 11;
+      readonly schemaVersion: 12;
     }
   | {
       readonly type: "authority.schema";
       readonly requestId: string;
-      readonly schemaVersion: 11;
+      readonly schemaVersion: 12;
     }
   | {
       readonly type: "authority.legacy-imported";
@@ -417,6 +439,16 @@ export type AuthorityWorkerResponse =
   | {
       readonly type: "authority.session-revoked";
       readonly requestId: string;
+    }
+  | {
+      readonly type: "authority.sessions";
+      readonly requestId: string;
+      readonly sessions: readonly PublicSession[];
+    }
+  | {
+      readonly type: "authority.session-target-revoked";
+      readonly requestId: string;
+      readonly publicSessionId: string;
     }
   | {
       readonly type: "authority.command-acknowledged";
@@ -522,6 +554,38 @@ function isText(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+function isBoundedSessionText(value: unknown): value is string {
+  return isText(value) && Buffer.byteLength(value, "utf8") <= 128;
+}
+
+function isSessionDevice(value: unknown): value is SessionDevice {
+  return isRecord(value) &&
+    hasExactKeys(value, ["id", "label", "platform"]) &&
+    isBoundedSessionText(value.id) &&
+    isBoundedSessionText(value.label) &&
+    (value.platform === "macos" ||
+      value.platform === "windows" ||
+      value.platform === "linux" ||
+      value.platform === "unknown");
+}
+
+function isPublicSession(value: unknown): value is PublicSession {
+  return isRecord(value) &&
+    hasExactKeys(value, [
+      "id", "deviceLabel", "platform", "refreshExpiresAt", "current",
+      ...(Object.hasOwn(value, "createdAt") ? ["createdAt"] : []),
+    ]) &&
+    isBoundedSessionText(value.id) &&
+    isBoundedSessionText(value.deviceLabel) &&
+    (value.platform === "macos" ||
+      value.platform === "windows" ||
+      value.platform === "linux" ||
+      value.platform === "unknown") &&
+    (!Object.hasOwn(value, "createdAt") || isText(value.createdAt)) &&
+    isText(value.refreshExpiresAt) &&
+    typeof value.current === "boolean";
+}
+
 function isTokenHash(value: unknown): value is string {
   if (typeof value !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(value)) {
     return false;
@@ -547,19 +611,25 @@ function isHashedSessionIssue(value: unknown): value is HashedSessionIssue {
     hasExactKeys(value, [
       "accountId",
       "actorId",
+      "publicSessionId",
+      "device",
       "accessTokenHash",
       "refreshTokenHash",
       "accessExpiresAt",
       "refreshExpiresAt",
+      "now",
     ]) &&
     isText(value.accountId) &&
     isText(value.actorId) &&
+    isBoundedSessionText(value.publicSessionId) &&
+    isSessionDevice(value.device) &&
     isTokenHash(value.accessTokenHash) &&
     isTokenHash(value.refreshTokenHash) &&
     value.accessTokenHash !== value.refreshTokenHash &&
     isNonNegativeSafeInteger(value.accessExpiresAt) &&
     isNonNegativeSafeInteger(value.refreshExpiresAt) &&
-    value.refreshExpiresAt > value.accessExpiresAt
+    value.refreshExpiresAt > value.accessExpiresAt &&
+    isNonNegativeSafeInteger(value.now)
   );
 }
 
@@ -569,6 +639,7 @@ function isIssuedSessionRecord(value: unknown): value is IssuedSessionRecord {
     hasExactKeys(value, [
       "sessionId",
       "familyId",
+      "publicSessionId",
       "accountId",
       "actorId",
       "accessExpiresAt",
@@ -576,6 +647,7 @@ function isIssuedSessionRecord(value: unknown): value is IssuedSessionRecord {
     ]) &&
     isTokenHash(value.sessionId) &&
     isTokenHash(value.familyId) &&
+    isBoundedSessionText(value.publicSessionId) &&
     isText(value.accountId) &&
     isText(value.actorId) &&
     isNonNegativeSafeInteger(value.accessExpiresAt) &&
@@ -902,6 +974,21 @@ export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWork
         isTokenHash(value.accessTokenHash) &&
         isNonNegativeSafeInteger(value.now)
       );
+    case "authority.sessions-list":
+      return (
+        hasExactKeys(value, ["type", "requestId", "accessTokenHash", "now"]) &&
+        isTokenHash(value.accessTokenHash) &&
+        isNonNegativeSafeInteger(value.now)
+      );
+    case "authority.session-revoke-target":
+      return (
+        hasExactKeys(value, [
+          "type", "requestId", "accessTokenHash", "publicSessionId", "now",
+        ]) &&
+        isTokenHash(value.accessTokenHash) &&
+        isBoundedSessionText(value.publicSessionId) &&
+        isNonNegativeSafeInteger(value.now)
+      );
     case "authority.execute-human":
       return (
         hasExactKeys(value, [
@@ -1025,7 +1112,7 @@ export function isAuthorityWorkerResponse(
     case "authority.schema":
       return (
         hasExactKeys(value, ["type", "requestId", "schemaVersion"]) &&
-        value.schemaVersion === 11
+        value.schemaVersion === 12
       );
     case "authority.closed":
       return hasExactKeys(value, ["type", "requestId"]);
@@ -1053,6 +1140,14 @@ export function isAuthorityWorkerResponse(
       return hasExactKeys(value, ["type", "requestId"]);
     case "authority.session-revoked":
       return hasExactKeys(value, ["type", "requestId"]);
+    case "authority.sessions":
+      return hasExactKeys(value, ["type", "requestId", "sessions"]) &&
+        Array.isArray(value.sessions) &&
+        value.sessions.length <= MAX_ACTIVE_SESSION_FAMILIES &&
+        value.sessions.every(isPublicSession);
+    case "authority.session-target-revoked":
+      return hasExactKeys(value, ["type", "requestId", "publicSessionId"]) &&
+        isBoundedSessionText(value.publicSessionId);
     case "authority.command-acknowledged":
       return (
         hasExactKeys(value, ["type", "requestId", "acknowledgement"]) &&

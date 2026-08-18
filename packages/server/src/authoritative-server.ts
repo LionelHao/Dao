@@ -38,6 +38,9 @@ import {
   type HumanPreemptionRuntime,
 } from "./human-preemption/human-preemption-runtime.js";
 
+export const AUTHORITATIVE_SERVER_DEFAULT_HOST = "127.0.0.1";
+export const AUTHORITATIVE_SERVER_DEFAULT_PORT = 8_787;
+
 export interface AuthoritativeServer {
   readonly url: string;
   close(): Promise<void>;
@@ -46,6 +49,15 @@ export interface AuthoritativeServer {
 export interface StartAuthoritativeServerOptions {
   readonly databasePath: string;
   readonly snapshotCachePath: string;
+  /**
+   * Deployment-owned listener configuration. The public composition defaults
+   * to the Desktop loopback endpoint, 127.0.0.1:8787. Tests and embedded
+   * callers that need an ephemeral listener must explicitly pass port 0.
+   */
+  readonly listen?: {
+    readonly host?: string;
+    readonly port?: number;
+  };
   readonly actors: readonly Actor[];
   readonly identities: IdentityAdapter;
   readonly invitationSecretKey: Uint8Array;
@@ -388,6 +400,8 @@ async function start(
       auth,
       service,
       sync,
+      host: options.listen?.host ?? AUTHORITATIVE_SERVER_DEFAULT_HOST,
+      port: options.listen?.port ?? AUTHORITATIVE_SERVER_DEFAULT_PORT,
       outboxStore,
       outboxPollIntervalMs: 10,
       agentRuntime: runtime,

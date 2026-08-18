@@ -4,8 +4,15 @@ import type { StateStore } from "./state-store.js";
 import type {
   AuthenticatedSessionContext,
   HashedSessionIssue,
+  PublicSession,
+  SessionDevice,
+  SessionPlatform,
   SessionAuthority,
 } from "./persistence/contracts.js";
+import { MAX_ACTIVE_SESSION_FAMILIES } from "./persistence/contracts.js";
+
+export { MAX_ACTIVE_SESSION_FAMILIES } from "./persistence/contracts.js";
+export type { PublicSession, SessionDevice, SessionPlatform } from "./persistence/contracts.js";
 
 const DEFAULT_ACCESS_TTL_MS = 15 * 60 * 1_000;
 const DEFAULT_REFRESH_TTL_MS = 30 * 24 * 60 * 60 * 1_000;
@@ -13,6 +20,19 @@ const SCRYPT_HASH_BYTES = 64;
 const MIN_SCRYPT_SALT_BYTES = 16;
 const DUMMY_SCRYPT_SALT = Buffer.from("native-im-auth-dummy-salt-v1", "utf8");
 const DUMMY_SCRYPT_HASH = Buffer.alloc(SCRYPT_HASH_BYTES);
+export const SESSION_DEVICE_ID_MAX_BYTES = 128;
+export const SESSION_DEVICE_LABEL_MAX_BYTES = 128;
+const DEFAULT_SESSION_DEVICE: SessionDevice = Object.freeze({
+  id: "unknown",
+  label: "Unknown device",
+  platform: "unknown",
+});
+const LEGACY_SESSION_DEVICE: SessionDevice = Object.freeze({
+  id: "legacy",
+  label: "Legacy device",
+  platform: "unknown",
+});
+const LEGACY_PUBLIC_SESSION_ID_DOMAIN = "native-im:legacy-public-session-id:v1\0";
 const SESSION_STATE_FIELDS = new Set(["version", "sessions"]);
 const SESSION_RECORD_FIELDS = new Set([
   "familyId",
@@ -23,6 +43,11 @@ const SESSION_RECORD_FIELDS = new Set([
   "accessExpiresAt",
   "refreshExpiresAt",
   "revokedAt",
+  "publicSessionId",
+  "deviceId",
+  "deviceLabel",
+  "platform",
+  "createdAt",
 ]);
 
 export interface LoginCredentials {
@@ -44,6 +69,7 @@ export interface IdentityAdapter {
 }
 
 export interface IssuedSession {
+  readonly sessionId: string;
   readonly accountId: string;
   readonly actorId: string;
   readonly accessToken: string;
@@ -62,13 +88,15 @@ export type AuthenticationErrorCode =
   | "invalid_token"
   | "token_expired"
   | "session_revoked"
+  | "session_not_found"
+  | "session_limit_reached"
   | "identity_forbidden";
 
 export class AuthenticationError extends Error {
-  readonly status: 401 | 403;
+  readonly status: 401 | 403 | 404 | 409;
   readonly code: AuthenticationErrorCode;
 
-  constructor(status: 401 | 403, code: AuthenticationErrorCode) {
+  constructor(status: 401 | 403 | 404 | 409, code: AuthenticationErrorCode) {
     super(code);
     this.name = "AuthenticationError";
     this.status = status;
@@ -77,7 +105,7 @@ export class AuthenticationError extends Error {
 }
 
 export interface AuthenticationService {
-  login(credentials: LoginCredentials): Promise<IssuedSession>;
+  login(credentials: LoginCredentials, device?: SessionDevice): Promise<IssuedSession>;
   authenticate(accessToken: string): Promise<AuthenticatedPrincipal>;
   authenticateSession(accessToken: string): Promise<AuthenticatedSessionContext>;
   refresh(
@@ -85,6 +113,8 @@ export interface AuthenticationService {
     expectedPrincipal?: AuthenticatedPrincipal,
   ): Promise<IssuedSession>;
   revoke(accessToken: string): Promise<void>;
+  listSessions(accessToken: string): Promise<readonly PublicSession[]>;
+  revokeSession(accessToken: string, sessionId: string): Promise<void>;
 }
 
 export interface AuthenticationActorDirectory {
@@ -100,6 +130,11 @@ interface SessionRecord {
   readonly accessExpiresAt: number;
   readonly refreshExpiresAt: number;
   readonly revokedAt?: number;
+  readonly publicSessionId?: string;
+  readonly deviceId?: string;
+  readonly deviceLabel?: string;
+  readonly platform?: SessionPlatform;
+  readonly createdAt?: number;
 }
 
 export interface SessionState {
@@ -114,6 +149,7 @@ export interface AuthenticationServiceOptions {
   readonly authority?: SessionAuthority;
   readonly clock?: () => number;
   readonly tokenFactory?: () => string;
+  readonly sessionIdFactory?: () => string;
   readonly accessTtlMs?: number;
   readonly refreshTtlMs?: number;
 }
@@ -139,6 +175,31 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+function isBoundedText(value: unknown, maxBytes: number): value is string {
+  return isNonEmptyString(value) && Buffer.byteLength(value, "utf8") <= maxBytes;
+}
+
+function isSessionPlatform(value: unknown): value is SessionPlatform {
+  return value === "macos" || value === "windows" || value === "linux" || value === "unknown";
+}
+
+function validateSessionDevice(device: SessionDevice): SessionDevice {
+  if (!isBoundedText(device.id, SESSION_DEVICE_ID_MAX_BYTES)) {
+    throw new TypeError(
+      `session device id must be 1-${SESSION_DEVICE_ID_MAX_BYTES} UTF-8 bytes`,
+    );
+  }
+  if (!isBoundedText(device.label, SESSION_DEVICE_LABEL_MAX_BYTES)) {
+    throw new TypeError(
+      `session device label must be 1-${SESSION_DEVICE_LABEL_MAX_BYTES} UTF-8 bytes`,
+    );
+  }
+  if (!isSessionPlatform(device.platform)) {
+    throw new TypeError("session device platform is invalid");
+  }
+  return Object.freeze({ id: device.id, label: device.label, platform: device.platform });
+}
+
 function decodeCanonicalBase64Url(value: unknown): Buffer | undefined {
   if (typeof value !== "string") {
     return undefined;
@@ -153,8 +214,17 @@ function isTokenHash(value: unknown): value is string {
 }
 
 function isSessionRecord(value: unknown): value is SessionRecord {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const deviceFields = [
+    "publicSessionId",
+    "deviceId",
+    "deviceLabel",
+    "platform",
+  ] as const;
+  const presentDeviceFields = deviceFields.filter((field) => Object.hasOwn(value, field));
   return (
-    isRecord(value) &&
     hasOnlyFields(value, SESSION_RECORD_FIELDS) &&
     isTokenHash(value.familyId) &&
     isNonEmptyString(value.accountId) &&
@@ -163,8 +233,22 @@ function isSessionRecord(value: unknown): value is SessionRecord {
     isTokenHash(value.refreshTokenHash) &&
     isFiniteTimestamp(value.accessExpiresAt) &&
     isFiniteTimestamp(value.refreshExpiresAt) &&
-    (value.revokedAt === undefined || isFiniteTimestamp(value.revokedAt))
+    (value.revokedAt === undefined || isFiniteTimestamp(value.revokedAt)) &&
+    ((presentDeviceFields.length === 0 && value.createdAt === undefined) ||
+      (presentDeviceFields.length === deviceFields.length &&
+        isBoundedText(value.publicSessionId, SESSION_DEVICE_ID_MAX_BYTES) &&
+        isBoundedText(value.deviceId, SESSION_DEVICE_ID_MAX_BYTES) &&
+        isBoundedText(value.deviceLabel, SESSION_DEVICE_LABEL_MAX_BYTES) &&
+        isSessionPlatform(value.platform) &&
+        (value.createdAt === undefined || isFiniteTimestamp(value.createdAt))))
   );
+}
+
+export function deriveLegacyPublicSessionId(familyId: string): string {
+  return createHash("sha256")
+    .update(LEGACY_PUBLIC_SESSION_ID_DOMAIN, "utf8")
+    .update(familyId, "utf8")
+    .digest("base64url");
 }
 
 export function isSessionState(value: unknown): value is SessionState {
@@ -181,8 +265,17 @@ export function isSessionState(value: unknown): value is SessionState {
   const tokenHashes = new Set<string>();
   const familyPrincipals = new Map<
     string,
-    { readonly accountId: string; readonly actorId: string }
+    {
+      readonly accountId: string;
+      readonly actorId: string;
+      readonly publicSessionId?: string;
+      readonly deviceId?: string;
+      readonly deviceLabel?: string;
+      readonly platform?: SessionPlatform;
+      readonly createdAt?: number;
+    }
   >();
+  const publicSessionIds = new Map<string, string>();
   for (const session of value.sessions) {
     if (
       session.accessTokenHash === session.refreshTokenHash ||
@@ -197,14 +290,38 @@ export function isSessionState(value: unknown): value is SessionState {
     const principal = familyPrincipals.get(session.familyId);
     if (
       principal !== undefined &&
-      (principal.accountId !== session.accountId || principal.actorId !== session.actorId)
+      (principal.accountId !== session.accountId ||
+        principal.actorId !== session.actorId ||
+        principal.publicSessionId !== session.publicSessionId ||
+        principal.deviceId !== session.deviceId ||
+        principal.deviceLabel !== session.deviceLabel ||
+        principal.platform !== session.platform ||
+        principal.createdAt !== session.createdAt)
     ) {
       return false;
     }
-    familyPrincipals.set(session.familyId, {
-      accountId: session.accountId,
-      actorId: session.actorId,
-    });
+    if (principal === undefined) {
+      const publicSessionId =
+        session.publicSessionId ?? deriveLegacyPublicSessionId(session.familyId);
+      const existingFamily = publicSessionIds.get(publicSessionId);
+      if (existingFamily !== undefined && existingFamily !== session.familyId) {
+        return false;
+      }
+      publicSessionIds.set(publicSessionId, session.familyId);
+      familyPrincipals.set(session.familyId, {
+        accountId: session.accountId,
+        actorId: session.actorId,
+        ...(session.publicSessionId === undefined
+          ? {}
+          : {
+              publicSessionId: session.publicSessionId,
+              deviceId: session.deviceId,
+              deviceLabel: session.deviceLabel,
+              platform: session.platform,
+              createdAt: session.createdAt,
+            }),
+      });
+    }
   }
 
   return true;
@@ -313,6 +430,8 @@ export function createAuthenticationService(
   const clock = options.clock ?? Date.now;
   const tokenFactory =
     options.tokenFactory ?? (() => randomBytes(32).toString("base64url"));
+  const sessionIdFactory =
+    options.sessionIdFactory ?? (() => randomBytes(32).toString("base64url"));
   const accessTtlMs = options.accessTtlMs ?? DEFAULT_ACCESS_TTL_MS;
   const refreshTtlMs = options.refreshTtlMs ?? DEFAULT_REFRESH_TTL_MS;
 
@@ -369,6 +488,7 @@ export function createAuthenticationService(
   function createAuthorityIssue(
     accountId: string,
     actorId: string,
+    device: SessionDevice,
     now: number,
   ): {
     readonly issued: IssuedSession;
@@ -376,6 +496,7 @@ export function createAuthenticationService(
   } {
     const accessToken = tokenFactory();
     const refreshToken = tokenFactory();
+    const publicSessionId = sessionIdFactory();
     if (accessToken.length === 0 || refreshToken.length === 0) {
       throw new Error("tokenFactory must return non-empty tokens");
     }
@@ -384,18 +505,25 @@ export function createAuthenticationService(
     if (accessTokenHash === refreshTokenHash) {
       throw new Error("tokenFactory produced a duplicate token");
     }
+    if (!isBoundedText(publicSessionId, SESSION_DEVICE_ID_MAX_BYTES)) {
+      throw new Error("sessionIdFactory must return a bounded non-empty identifier");
+    }
     const accessExpiresAt = now + accessTtlMs;
     const refreshExpiresAt = now + refreshTtlMs;
     return {
       input: {
         accountId,
         actorId,
+        publicSessionId,
+        device,
         accessTokenHash,
         refreshTokenHash,
         accessExpiresAt,
         refreshExpiresAt,
+        now,
       },
       issued: {
+        sessionId: publicSessionId,
         accountId,
         actorId,
         accessToken,
@@ -420,6 +548,12 @@ export function createAuthenticationService(
     if (code === "session_revoked") {
       throw revokedSession();
     }
+    if (code === "session_not_found") {
+      throw new AuthenticationError(404, "session_not_found");
+    }
+    if (code === "session_limit_reached") {
+      throw new AuthenticationError(409, "session_limit_reached");
+    }
     if (code === "identity_forbidden") {
       throw new AuthenticationError(403, "identity_forbidden");
     }
@@ -431,10 +565,14 @@ export function createAuthenticationService(
     accountId: string,
     actorId: string,
     familyId: string | undefined,
+    publicSessionId: string | undefined,
+    device: SessionDevice | undefined,
+    createdAt: number | null | undefined,
     now: number,
   ): { issued: IssuedSession; record: SessionRecord } {
     const accessToken = tokenFactory();
     const refreshToken = tokenFactory();
+    const nextPublicSessionId = publicSessionId ?? sessionIdFactory();
     if (accessToken.length === 0 || refreshToken.length === 0) {
       throw new Error("tokenFactory must return non-empty tokens");
     }
@@ -451,6 +589,18 @@ export function createAuthenticationService(
     if (accessTokenHash === refreshTokenHash || hasCollision) {
       throw new Error("tokenFactory produced a duplicate token");
     }
+    if (!isBoundedText(nextPublicSessionId, SESSION_DEVICE_ID_MAX_BYTES)) {
+      throw new Error("sessionIdFactory must return a bounded non-empty identifier");
+    }
+    const publicIdCollision = current.sessions.some(
+      (session) =>
+        session.familyId !== familyId &&
+        (session.publicSessionId ?? deriveLegacyPublicSessionId(session.familyId)) ===
+          nextPublicSessionId,
+    );
+    if (publicIdCollision) {
+      throw new Error("sessionIdFactory produced a duplicate session identifier");
+    }
 
     const accessExpiresAt = now + accessTtlMs;
     const refreshExpiresAt = now + refreshTtlMs;
@@ -462,11 +612,17 @@ export function createAuthenticationService(
       refreshTokenHash,
       accessExpiresAt,
       refreshExpiresAt,
+      publicSessionId: nextPublicSessionId,
+      deviceId: device?.id ?? DEFAULT_SESSION_DEVICE.id,
+      deviceLabel: device?.label ?? DEFAULT_SESSION_DEVICE.label,
+      platform: device?.platform ?? DEFAULT_SESSION_DEVICE.platform,
+      ...(createdAt === null ? {} : { createdAt: createdAt ?? now }),
     };
 
     return {
       record,
       issued: {
+        sessionId: nextPublicSessionId,
         accountId,
         actorId,
         accessToken,
@@ -503,8 +659,40 @@ export function createAuthenticationService(
     }
   }
 
+  function publicSessionId(session: SessionRecord): string {
+    return session.publicSessionId ?? deriveLegacyPublicSessionId(session.familyId);
+  }
+
+  function requireJsonAccessSession(
+    current: SessionState,
+    accessToken: string,
+    now: number,
+  ): SessionRecord {
+    if (accessToken.length === 0) {
+      throw invalidToken();
+    }
+    const session = current.sessions.find(
+      (candidate) => candidate.accessTokenHash === hashToken(accessToken),
+    );
+    if (session === undefined) {
+      throw invalidToken();
+    }
+    requireHumanActor(session.actorId);
+    if (session.revokedAt !== undefined) {
+      throw revokedSession();
+    }
+    if (now >= session.accessExpiresAt) {
+      throw new AuthenticationError(401, "token_expired");
+    }
+    return session;
+  }
+
   return {
-    async login(credentials: LoginCredentials): Promise<IssuedSession> {
+    async login(
+      credentials: LoginCredentials,
+      device: SessionDevice = DEFAULT_SESSION_DEVICE,
+    ): Promise<IssuedSession> {
+      const validatedDevice = validateSessionDevice(device);
       const identity = await options.identities.verify(credentials);
       if (identity === undefined) {
         throw new AuthenticationError(401, "invalid_credentials");
@@ -516,6 +704,7 @@ export function createAuthenticationService(
         const authorityIssue = createAuthorityIssue(
           identity.accountId,
           identity.actorId,
+          validatedDevice,
           now,
         );
         try {
@@ -527,14 +716,60 @@ export function createAuthenticationService(
       }
 
       return runExclusive(async (current) => {
+        const familyCapacity = new Map<string, {
+          active: boolean;
+          refreshExpiresAt: number;
+          createdAt: number;
+          publicSessionId: string;
+        }>();
+        for (const session of current.sessions) {
+          if (
+            session.accountId !== identity.accountId ||
+            session.actorId !== identity.actorId
+          ) {
+            continue;
+          }
+          const family = familyCapacity.get(session.familyId);
+          familyCapacity.set(session.familyId, {
+            active: (family?.active ?? false) || session.revokedAt === undefined,
+            refreshExpiresAt: Math.max(
+              family?.refreshExpiresAt ?? -1,
+              session.refreshExpiresAt,
+            ),
+            createdAt: family?.createdAt ?? session.createdAt ?? -1,
+            publicSessionId:
+              family?.publicSessionId ?? publicSessionId(session),
+          });
+        }
+        const activeFamilies = [...familyCapacity.entries()]
+          .filter(([, family]) => family.active && family.refreshExpiresAt > now)
+          .sort((left, right) =>
+            left[1].createdAt - right[1].createdAt ||
+            left[1].publicSessionId.localeCompare(right[1].publicSessionId));
+        if (activeFamilies.length > MAX_ACTIVE_SESSION_FAMILIES) {
+          throw new AuthenticationError(409, "session_limit_reached");
+        }
+        const evictedFamilyId = activeFamilies.length === MAX_ACTIVE_SESSION_FAMILIES
+          ? activeFamilies[0]?.[0]
+          : undefined;
+        const sessionsBeforeIssue = evictedFamilyId === undefined
+          ? current.sessions
+          : current.sessions.map((session) =>
+              session.familyId === evictedFamilyId && session.revokedAt === undefined
+                ? { ...session, revokedAt: now }
+                : session);
+        const stateBeforeIssue = { version: 1, sessions: sessionsBeforeIssue } as const;
         const { issued, record } = createIssuedRecord(
-          current,
+          stateBeforeIssue,
           identity.accountId,
           identity.actorId,
           undefined,
+          undefined,
+          validatedDevice,
+          undefined,
           now,
         );
-        await persist({ version: 1, sessions: [...current.sessions, record] });
+        await persist({ version: 1, sessions: [...sessionsBeforeIssue, record] });
         return issued;
       });
     },
@@ -642,6 +877,7 @@ export function createAuthenticationService(
             }).then((record) => ({ record, accessToken, nextRefreshToken }));
           })
           .then(({ record, accessToken, nextRefreshToken }) => ({
+            sessionId: record.publicSessionId,
             accountId: record.accountId,
             actorId: record.actorId,
             accessToken,
@@ -681,16 +917,38 @@ export function createAuthenticationService(
           throw new AuthenticationError(401, "token_expired");
         }
 
+        const normalizedDevice = session.publicSessionId === undefined
+          ? LEGACY_SESSION_DEVICE
+          : {
+              id: session.deviceId ?? DEFAULT_SESSION_DEVICE.id,
+              label: session.deviceLabel ?? DEFAULT_SESSION_DEVICE.label,
+              platform: session.platform ?? DEFAULT_SESSION_DEVICE.platform,
+            };
+        const normalizedFamily = {
+          publicSessionId: publicSessionId(session),
+          deviceId: normalizedDevice.id,
+          deviceLabel: normalizedDevice.label,
+          platform: normalizedDevice.platform,
+          ...(session.createdAt === undefined ? {} : { createdAt: session.createdAt }),
+        } as const;
         const { issued, record } = createIssuedRecord(
           current,
           session.accountId,
           session.actorId,
           session.familyId,
+          normalizedFamily.publicSessionId,
+          normalizedDevice,
+          session.createdAt ?? null,
           now,
         );
-        const sessions = current.sessions.map((candidate) =>
-          candidate === session ? { ...candidate, revokedAt: now } : candidate,
-        );
+        const sessions = current.sessions.map((candidate) => {
+          if (candidate.familyId !== session.familyId) return candidate;
+          return {
+            ...candidate,
+            ...normalizedFamily,
+            ...(candidate === session ? { revokedAt: now } : {}),
+          };
+        });
         await persist({ version: 1, sessions: [...sessions, record] });
         return issued;
       });
@@ -720,6 +978,97 @@ export function createAuthenticationService(
         requireHumanActor(session.actorId);
 
         await revokeFamily(current, session.familyId, clock());
+      });
+    },
+
+    listSessions(accessToken: string): Promise<readonly PublicSession[]> {
+      const now = clock();
+      if (options.authority !== undefined) {
+        if (accessToken.length === 0) {
+          return Promise.reject(invalidToken());
+        }
+        return options.authority
+          .listSessions(hashToken(accessToken), now)
+          .catch((error: unknown) => translateAuthorityError(error));
+      }
+      return runExclusive((current) => {
+        const caller = requireJsonAccessSession(current, accessToken, now);
+        const families = new Map<string, SessionRecord[]>();
+        for (const session of current.sessions) {
+          if (session.accountId !== caller.accountId || session.actorId !== caller.actorId) {
+            continue;
+          }
+          const family = families.get(session.familyId) ?? [];
+          family.push(session);
+          families.set(session.familyId, family);
+        }
+        const projected = [...families.entries()]
+          .flatMap(([familyId, generations]) => {
+            const active = generations.filter((generation) => generation.revokedAt === undefined);
+            const refreshExpiresAt = Math.max(
+              ...generations.map((generation) => generation.refreshExpiresAt),
+            );
+            if (active.length === 0 || now >= refreshExpiresAt) {
+              return [];
+            }
+            const canonical = generations[0];
+            if (canonical === undefined) {
+              return [];
+            }
+            return [{
+              id: publicSessionId(canonical),
+              deviceLabel: canonical.deviceLabel ?? "Legacy device",
+              platform: canonical.platform ?? "unknown",
+              ...(canonical.createdAt === undefined
+                ? {}
+                : { createdAt: new Date(canonical.createdAt).toISOString() }),
+              refreshExpiresAt: new Date(refreshExpiresAt).toISOString(),
+              current: familyId === caller.familyId,
+              sortCreatedAt: canonical.createdAt ?? -1,
+            }];
+          })
+          .sort((left, right) =>
+            right.sortCreatedAt - left.sortCreatedAt || left.id.localeCompare(right.id))
+          .map((session) => ({
+            id: session.id,
+            deviceLabel: session.deviceLabel,
+            platform: session.platform,
+            ...(session.createdAt === undefined ? {} : { createdAt: session.createdAt }),
+            refreshExpiresAt: session.refreshExpiresAt,
+            current: session.current,
+          }));
+        if (projected.length > MAX_ACTIVE_SESSION_FAMILIES) {
+          throw new AuthenticationError(409, "session_limit_reached");
+        }
+        return projected;
+      });
+    },
+
+    revokeSession(accessToken: string, sessionId: string): Promise<void> {
+      const now = clock();
+      if (!isBoundedText(sessionId, SESSION_DEVICE_ID_MAX_BYTES)) {
+        return Promise.reject(new AuthenticationError(404, "session_not_found"));
+      }
+      if (options.authority !== undefined) {
+        if (accessToken.length === 0) {
+          return Promise.reject(invalidToken());
+        }
+        return options.authority
+          .revokeSession(hashToken(accessToken), sessionId, now)
+          .catch((error: unknown) => translateAuthorityError(error));
+      }
+      return runExclusive(async (current) => {
+        const caller = requireJsonAccessSession(current, accessToken, now);
+        const target = current.sessions.find(
+          (candidate) =>
+            candidate.accountId === caller.accountId &&
+            candidate.actorId === caller.actorId &&
+            publicSessionId(candidate) === sessionId,
+        );
+        if (target === undefined) {
+          throw new AuthenticationError(404, "session_not_found");
+        }
+        await revokeFamily(current, target.familyId, now);
       });
     },
   };

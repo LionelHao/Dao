@@ -4,7 +4,14 @@ import tseslint from "typescript-eslint";
 
 export default tseslint.config(
   {
-    ignores: ["buzz/**", "**/dist/**", "**/node_modules/**", "coverage/**"],
+    ignores: [
+      "buzz/**",
+      // Reconstructed design prototypes are generated browser artifacts, not workspace source.
+      "docs/design/**/support.js",
+      "**/dist/**",
+      "**/node_modules/**",
+      "coverage/**",
+    ],
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,
@@ -17,4 +24,3 @@ export default tseslint.config(
     },
   },
 );
-

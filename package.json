@@ -10,7 +10,8 @@
     "typecheck": "tsc -b && tsc --noEmit -p packages/core/tsconfig.type-test.json && tsc --noEmit -p packages/server/tsconfig.type-test.json && tsc --noEmit --strict --module NodeNext --moduleResolution NodeNext --target ES2022 --types node vitest.config.ts",
     "lint": "eslint . --max-warnings=0",
     "verify:core-boundary": "node scripts/verify-core-boundary.mjs",
-    "test": "pnpm verify:core-boundary && vitest run",
+    "verify:desktop-boundary": "node scripts/verify-desktop-boundary.mjs",
+    "test": "pnpm verify:core-boundary && pnpm verify:desktop-boundary && vitest run",
     "build": "pnpm -r --if-present run build"
   },
   "devDependencies": {

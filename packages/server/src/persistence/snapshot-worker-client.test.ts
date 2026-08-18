@@ -70,6 +70,17 @@ function seedHuman(
      VALUES ('identity', ?, 0, 1)`,
   ).run(context.principal.actorId);
   database.prepare(
+    `INSERT OR IGNORE INTO session_families (
+       family_id, public_id, account_id, actor_id, device_id, device_label,
+       platform, created_at, refresh_expires_at, revoked_at
+     ) VALUES (?, ?, ?, ?, 'test', 'Test', 'unknown', 0, 2000000, NULL)`,
+  ).run(
+    context.sessionFamilyId,
+    `test_${context.sessionFamilyId}`,
+    context.principal.accountId,
+    context.principal.actorId,
+  );
+  database.prepare(
     `INSERT INTO sessions (
        family_id, account_id, actor_id, access_token_hash, refresh_token_hash,
        access_expires_at, refresh_expires_at, revoked_at
@@ -270,6 +281,17 @@ describe("durable materialized snapshot worker", () => {
       `INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
        VALUES ('identity', ?, 0, 1)`,
     ).run(context.principal.actorId);
+    database.prepare(
+      `INSERT INTO session_families (
+         family_id, public_id, account_id, actor_id, device_id, device_label,
+         platform, created_at, refresh_expires_at, revoked_at
+       ) VALUES (?, ?, ?, ?, 'test', 'Test', 'unknown', 0, 2000000, NULL)`,
+    ).run(
+      context.sessionFamilyId,
+      `test_${context.sessionFamilyId}`,
+      context.principal.accountId,
+      context.principal.actorId,
+    );
     database.prepare(
       `INSERT INTO sessions (
          family_id, account_id, actor_id, access_token_hash, refresh_token_hash,

@@ -9,6 +9,7 @@ import {
   listAuthorityTables,
   migrateAuthorityDatabase,
   migrateAuthorityDatabaseToPreviousVersionForTest,
+  migrateAuthorityDatabaseToVersion10ForTest,
   migrateAuthorityDatabaseToVersion9ForTest,
   migrateAuthorityDatabaseToVersion8ForTest,
   migrateAuthorityDatabaseToVersion7ForTest,
@@ -60,6 +61,7 @@ const AUTHORITY_TABLES = [
   "route_judgments",
   "route_metrics",
   "schema_migrations",
+  "session_families",
   "sessions",
   "streams",
   "tool_confirmations",
@@ -83,6 +85,8 @@ const V10_MIGRATION_CHECKSUM =
   "a7a668d54ddd3636f2e2bafcb7e55be8c9771d56c19a6ca5e3c79027a6647105";
 const V11_MIGRATION_CHECKSUM =
   "3ef3ca9216e684ec3d9e4097fe8a2e7148c75d5bb4b23ed7bf5a0eb5edc970a1";
+const V12_MIGRATION_CHECKSUM =
+  "66276cc21f02f19f5e60758039acd43030ba8a9666b37c0fef65ad30852929fa";
 
 const STREAMING_KEYSET_INDEXES = [
   "agent_executions_room_id_id",
@@ -378,7 +382,185 @@ function snapshot(database: DatabaseSync): LogicalSnapshot {
   return { schemaVersion: readSchemaVersion(database), tables };
 }
 
+function seedV11SessionCapacity(
+  database: DatabaseSync,
+  familyCount: number,
+  expiredFamilyIndex?: number,
+): void {
+  database.exec(`
+    INSERT INTO actors (id, kind, display_name)
+    VALUES ('capacity-migration-human', 'human', 'Capacity Human');
+    INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+    VALUES ('identity', 'capacity-migration-human', 0, 1);
+  `);
+  const insert = database.prepare(
+    `INSERT INTO sessions (
+       family_id, account_id, actor_id, access_token_hash, refresh_token_hash,
+       access_expires_at, refresh_expires_at, revoked_at
+     ) VALUES (?, 'capacity-account', 'capacity-migration-human', ?, ?, ?, ?, NULL)`,
+  );
+  const now = Date.now();
+  for (let index = 0; index < familyCount; index += 1) {
+    const refreshExpiresAt = index === expiredFamilyIndex
+      ? now - 24 * 60 * 60 * 1_000
+      : now + 24 * 60 * 60 * 1_000;
+    insert.run(
+      `capacity-family-${index}`,
+      `capacity-access-${index}`,
+      `capacity-refresh-${index}`,
+      refreshExpiresAt - 1_000,
+      refreshExpiresAt,
+    );
+  }
+}
+
 describe("authority SQLite schema", () => {
+  it("upgrades v11 session generations into one closed v12 device-family projection", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      expect(readSchemaVersion(database)).toBe(11);
+      database.exec(`
+        INSERT INTO actors (id, kind, display_name)
+        VALUES ('human-session-v11', 'human', 'Legacy Human');
+        INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+        VALUES ('identity', 'human-session-v11', 0, 1);
+        INSERT INTO sessions (
+          family_id, account_id, actor_id, access_token_hash, refresh_token_hash,
+          access_expires_at, refresh_expires_at, revoked_at
+        ) VALUES
+          ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+           'legacy-account', 'human-session-v11', 'legacy-access-1',
+           'legacy-refresh-1', 2000, 9000, 1500),
+          ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+           'legacy-account', 'human-session-v11', 'legacy-access-2',
+           'legacy-refresh-2', 4000, 12000, NULL);
+      `);
+
+      migrateAuthorityDatabase(database);
+
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(12);
+      expect(readSchemaVersion(database)).toBe(12);
+      expect(tableColumns(database, "session_families")).toEqual([
+        "family_id", "public_id", "account_id", "actor_id", "device_id",
+        "device_label", "platform", "created_at", "refresh_expires_at", "revoked_at",
+      ]);
+      const migratedFamilies = database.prepare(
+        `SELECT family_id AS familyId, public_id AS publicId, account_id AS accountId,
+                actor_id AS actorId, device_id AS deviceId, device_label AS deviceLabel,
+                platform, created_at AS createdAt,
+                refresh_expires_at AS refreshExpiresAt, revoked_at AS revokedAt
+         FROM session_families`,
+      ).all();
+      expect(migratedFamilies).toEqual([{
+        familyId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        publicId: expect.stringMatching(/^[0-9a-f]{64}$/),
+        accountId: "legacy-account",
+        actorId: "human-session-v11",
+        deviceId: "legacy",
+        deviceLabel: "Legacy device",
+        platform: "unknown",
+        createdAt: null,
+        refreshExpiresAt: 12_000,
+        revokedAt: null,
+      }]);
+      expect(String(migratedFamilies[0]?.publicId)).not.toContain(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      );
+      expect(database.prepare("SELECT COUNT(*) AS count FROM sessions").get()).toEqual({
+        count: 2,
+      });
+    });
+  });
+
+  it("rolls back the v12 family table, version, and migration record atomically", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      const before = snapshot(database);
+
+      expect(() => migrateAuthorityDatabase(database, { failAfterStatement: 1 }))
+        .toThrow(/injected migration failure/i);
+
+      expect(readSchemaVersion(database)).toBe(11);
+      expect(snapshot(database)).toEqual(before);
+      expect(listAuthorityTables(database)).not.toContain("session_families");
+    });
+  });
+
+  it("atomically rejects an over-cap v11 principal while ignoring expired families", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      seedV11SessionCapacity(database, 97);
+      const before = snapshot(database);
+
+      expect(() => migrateAuthorityDatabase(database)).toThrow(
+        /active session family capacity exceeds 96/i,
+      );
+      expect(readSchemaVersion(database)).toBe(11);
+      expect(listAuthorityTables(database)).not.toContain("session_families");
+      expect(snapshot(database)).toEqual(before);
+    });
+
+    withDatabase((database) => {
+      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      seedV11SessionCapacity(database, 97, 0);
+
+      expect(() => migrateAuthorityDatabase(database)).not.toThrow();
+      expect(readSchemaVersion(database)).toBe(12);
+      expect(database.prepare("SELECT COUNT(*) AS count FROM session_families").get())
+        .toEqual({ count: 97 });
+    });
+  });
+
+  it("rejects cross-principal v11 families and missing v12 family projections", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      database.exec(`
+        INSERT INTO actors (id, kind, display_name)
+        VALUES ('family-human-a', 'human', 'A'), ('family-human-b', 'human', 'B');
+        INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+        VALUES ('identity', 'family-human-a', 0, 1), ('identity', 'family-human-b', 0, 1);
+        INSERT INTO sessions (
+          family_id, account_id, actor_id, access_token_hash, refresh_token_hash,
+          access_expires_at, refresh_expires_at, revoked_at
+        ) VALUES
+          ('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+           'account-a', 'family-human-a', 'access-a', 'refresh-a', 1000, 2000, NULL),
+          ('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+           'account-b', 'family-human-b', 'access-b', 'refresh-b', 1000, 2000, NULL);
+      `);
+
+      expect(() => migrateAuthorityDatabase(database)).toThrow(
+        /session generation must match exactly one family principal/i,
+      );
+      expect(readSchemaVersion(database)).toBe(11);
+      expect(listAuthorityTables(database)).not.toContain("session_families");
+    });
+
+    withDatabase((database) => {
+      migrateAuthorityDatabase(database);
+      database.exec(`
+        INSERT INTO actors (id, kind, display_name)
+        VALUES ('missing-family-human', 'human', 'Human');
+        INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+        VALUES ('identity', 'missing-family-human', 0, 1);
+        INSERT INTO session_families (
+          family_id, public_id, account_id, actor_id, device_id, device_label,
+          platform, created_at, refresh_expires_at, revoked_at
+        ) VALUES ('missing-family', 'missing-public', 'missing-account',
+                  'missing-family-human', 'device', 'Device', 'unknown', 0, 2000, NULL);
+        INSERT INTO sessions (
+          family_id, account_id, actor_id, access_token_hash, refresh_token_hash,
+          access_expires_at, refresh_expires_at, revoked_at
+        ) VALUES ('missing-family', 'missing-account', 'missing-family-human',
+                  'missing-access', 'missing-refresh', 1000, 2000, NULL);
+        DELETE FROM session_families WHERE family_id = 'missing-family';
+      `);
+
+      expect(() => migrateAuthorityDatabase(database)).toThrow(
+        /session generation must match exactly one family principal/i,
+      );
+    });
+  });
   it("configures and verifies the durability and concurrency pragmas", () => {
     withDatabase((database) => {
       database.exec("PRAGMA foreign_keys = OFF");
@@ -400,12 +582,12 @@ describe("authority SQLite schema", () => {
     });
   });
 
-  it("migrates a fresh database through immutable v1-v11 to the complete schema", () => {
+  it("migrates a fresh database through immutable v1-v12 to the complete schema", () => {
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
 
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(11);
-      expect(readSchemaVersion(database)).toBe(11);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(12);
+      expect(readSchemaVersion(database)).toBe(12);
       expect(listAuthorityTables(database)).toEqual(AUTHORITY_TABLES);
       expect(
         database
@@ -480,6 +662,12 @@ describe("authority SQLite schema", () => {
           checksum: V11_MIGRATION_CHECKSUM,
           applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
         },
+        {
+          version: 12,
+          name: "authoritative-session-families",
+          checksum: V12_MIGRATION_CHECKSUM,
+          applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+        },
       ]);
       expect(tableColumns(database, "actors")).toContain("catalog_revision");
       expect(tableColumns(database, "room_memberships")).toContain(
@@ -533,8 +721,8 @@ describe("authority SQLite schema", () => {
       expect(readSchemaVersion(database)).toBe(4);
       migrateAuthorityDatabase(database);
 
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(11);
-      expect(readSchemaVersion(database)).toBe(11);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(12);
+      expect(readSchemaVersion(database)).toBe(12);
       expect(
         database
           .prepare(
@@ -653,7 +841,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(11);
+      expect(readSchemaVersion(database)).toBe(12);
       expect(database.prepare(
         `SELECT id, status, action_category AS actionCategory,
                 tool_dispatch_phase AS toolDispatchPhase,
@@ -730,7 +918,7 @@ describe("authority SQLite schema", () => {
       expect(snapshot(database)).toEqual(before);
 
       migrateAuthorityDatabase(database);
-      expect(readSchemaVersion(database)).toBe(11);
+      expect(readSchemaVersion(database)).toBe(12);
       expect(tableColumns(database, "route_jobs")).toEqual([
         "id", "room_id", "source_message_id", "status", "current_attempt", "topic_key",
         "embedding_model_version", "window_size", "cosine_threshold", "room_phase",
@@ -787,7 +975,7 @@ describe("authority SQLite schema", () => {
       expect(snapshot(database)).toEqual(before);
 
       migrateAuthorityDatabase(database);
-      expect(readSchemaVersion(database)).toBe(11);
+      expect(readSchemaVersion(database)).toBe(12);
       expect(database.prepare(
         `SELECT id, current_owner_actor_id AS currentOwnerId, status,
                 requester_actor_id AS requesterId, origin_kind AS originKind,
@@ -926,7 +1114,7 @@ describe("authority SQLite schema", () => {
       expect(listAuthorityTables(database)).not.toContain("ball_boundary_claims");
 
       migrateAuthorityDatabase(database);
-      expect(readSchemaVersion(database)).toBe(11);
+      expect(readSchemaVersion(database)).toBe(12);
       expect(tableColumns(database, "ball_boundary_claims")).toEqual([
         "id", "room_id", "source_kind", "source_id", "holder_actor_id", "holder_kind",
         "reason", "since_at", "deadline_at", "boundary_kind", "claimed_at", "route_consumed_at",
@@ -939,7 +1127,7 @@ describe("authority SQLite schema", () => {
 
   it("upgrades immutable v10 to v11 human preemption and rolls back atomically", () => {
     withDatabase((database) => {
-      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      migrateAuthorityDatabaseToVersion10ForTest(database);
       expect(readSchemaVersion(database)).toBe(10);
       database.exec(`
         INSERT INTO actors (id, kind, display_name, tool_permissions_json)
@@ -986,7 +1174,7 @@ describe("authority SQLite schema", () => {
       expect(tableColumns(database, "agent_executions")).not.toContain("supersedes_execution_ids_json");
 
       migrateAuthorityDatabase(database);
-      expect(readSchemaVersion(database)).toBe(11);
+      expect(readSchemaVersion(database)).toBe(12);
       expect(tableColumns(database, "human_preemption_fences")).toEqual([
         "source_human_message_id", "room_id", "human_actor_id", "accepted_at",
         "cancelled_count", "cancel_committed_at", "route_job_id", "route_created_at",
@@ -1013,7 +1201,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(11);
+      expect(readSchemaVersion(database)).toBe(12);
       expect(tableColumns(database, "open_items")).toEqual(
         expect.arrayContaining([
           "requester_actor_id",
@@ -1053,7 +1241,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(11);
+      expect(readSchemaVersion(database)).toBe(12);
       expect(database.prepare(
         `SELECT source_message_id AS sourceMessageId, actor_id AS actorId
          FROM calibration_signals WHERE id = 'signal-v3'`,
@@ -1106,7 +1294,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(11);
+      expect(readSchemaVersion(database)).toBe(12);
       expect(
         database.prepare("SELECT id, catalog_revision FROM actors ORDER BY id").all(),
       ).toEqual([
@@ -1185,7 +1373,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(11);
+      expect(readSchemaVersion(database)).toBe(12);
       expect(
         database
           .prepare(
@@ -1585,6 +1773,13 @@ describe("authority SQLite schema", () => {
       );
 
       database.exec(`
+        INSERT INTO session_families (
+          family_id, public_id, account_id, actor_id, device_id, device_label,
+          platform, created_at, refresh_expires_at, revoked_at
+        ) VALUES (
+          'family-human', 'public-human', 'human', 'human-1', 'test-device',
+          'Test device', 'unknown', 0, 2, NULL
+        );
         INSERT INTO sessions (
           family_id, account_id, actor_id, access_token_hash, refresh_token_hash,
           access_expires_at, refresh_expires_at, revoked_at
@@ -1769,9 +1964,9 @@ describe("authority SQLite schema", () => {
     });
 
     withDatabase((database) => {
-      database.exec("PRAGMA user_version = 12");
+      database.exec("PRAGMA user_version = 13");
       expect(() => migrateAuthorityDatabase(database)).toThrow(/future schema/i);
-      expect(readSchemaVersion(database)).toBe(12);
+      expect(readSchemaVersion(database)).toBe(13);
     });
   });
 
@@ -1827,7 +2022,7 @@ describe("authority SQLite schema", () => {
 });
 
 describe("derived snapshot cache schema", () => {
-  it("creates independent v1 WAL/FULL tables without changing authority v10", () => {
+  it("creates independent v1 WAL/FULL tables without changing authority v12", () => {
     withDatabase((database) => {
       migrateSnapshotCacheDatabase(database);
       expect(SNAPSHOT_CACHE_SCHEMA_VERSION).toBe(1);
@@ -1843,7 +2038,7 @@ describe("derived snapshot cache schema", () => {
         .toBe(SNAPSHOT_CACHE_BUSY_TIMEOUT_MS);
       expect(() => validateSnapshotCacheSchema(database)).not.toThrow();
     });
-    expect(AUTHORITY_SCHEMA_VERSION).toBe(11);
+    expect(AUTHORITY_SCHEMA_VERSION).toBe(12);
   });
 
   it("fails closed on version-one corruption and refuses future versions", () => {

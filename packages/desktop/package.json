@@ -4,13 +4,16 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "tsc -p tsconfig.json && node scripts/copy-renderer.mjs",
+    "build": "tsc -p tsconfig.json && node scripts/build-preload.mjs && node scripts/copy-renderer.mjs",
+    "smoke": "node scripts/smoke-electron.mjs",
+    "test": "vitest run --config vitest.config.ts",
     "start": "electron dist/main.js"
   },
   "dependencies": {
     "@native-im/core": "workspace:*"
   },
   "devDependencies": {
-    "electron": "^37.2.6"
+    "electron": "^37.2.6",
+    "esbuild": "0.28.1"
   }
 }

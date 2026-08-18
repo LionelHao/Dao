@@ -33,6 +33,7 @@ import type {
 } from "@native-im/core";
 
 export const SNAPSHOT_REQUEST_ID_MAX_BYTES = 128;
+export const MAX_ACTIVE_SESSION_FAMILIES = 96;
 import type { AuthenticatedPrincipal } from "../auth.js";
 import type { RoomAuditRecord } from "../room-lifecycle.js";
 
@@ -220,13 +221,33 @@ export interface SnapshotRevalidationStore {
   revalidateSnapshot(validation: SnapshotRevalidationRequest): Promise<void>;
 }
 
+export type SessionPlatform = "macos" | "windows" | "linux" | "unknown";
+
+export interface SessionDevice {
+  readonly id: string;
+  readonly label: string;
+  readonly platform: SessionPlatform;
+}
+
+export interface PublicSession {
+  readonly id: string;
+  readonly deviceLabel: string;
+  readonly platform: SessionPlatform;
+  readonly createdAt?: string;
+  readonly refreshExpiresAt: string;
+  readonly current: boolean;
+}
+
 export interface HashedSessionIssue {
   readonly accountId: string;
   readonly actorId: string;
+  readonly publicSessionId: string;
+  readonly device: SessionDevice;
   readonly accessTokenHash: string;
   readonly refreshTokenHash: string;
   readonly accessExpiresAt: number;
   readonly refreshExpiresAt: number;
+  readonly now: number;
 }
 
 export interface HashedSessionRotation {
@@ -242,6 +263,7 @@ export interface HashedSessionRotation {
 export interface IssuedSessionRecord {
   readonly sessionId: string;
   readonly familyId: string;
+  readonly publicSessionId: string;
   readonly accountId: string;
   readonly actorId: string;
   readonly accessExpiresAt: number;
@@ -261,6 +283,12 @@ export interface SessionAuthority {
   ): Promise<void>;
   rotate(input: HashedSessionRotation): Promise<IssuedSessionRecord>;
   revoke(accessTokenHash: string, now: number): Promise<void>;
+  listSessions(accessTokenHash: string, now: number): Promise<readonly PublicSession[]>;
+  revokeSession(
+    accessTokenHash: string,
+    publicSessionId: string,
+    now: number,
+  ): Promise<void>;
 }
 
 export interface AuthenticatedCommandContext extends AuthenticatedSessionContext {

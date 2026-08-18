@@ -8,6 +8,7 @@ import type { Actor } from "@native-im/core";
 import {
   createAuthenticationService,
   AuthenticationError,
+  MAX_ACTIVE_SESSION_FAMILIES,
   type IdentityAdapter,
   type LoginCredentials,
 } from "../auth.js";
@@ -22,8 +23,14 @@ import {
   type HumanCollaborationCommand,
   type RoomGovernanceCommand,
 } from "./contracts.js";
-import { migrateAuthorityDatabase } from "./schema.js";
-import { createWorkerDatabaseClient } from "./worker-database-client.js";
+import {
+  migrateAuthorityDatabase,
+  migrateAuthorityDatabaseToPreviousVersionForTest,
+} from "./schema.js";
+import {
+  createWorkerDatabaseClient,
+  createWorkerDatabaseClientWithTransactionFaultForTest,
+} from "./worker-database-client.js";
 import { isAuthorityWorkerRequest } from "./worker-protocol.js";
 
 function tokenSequence(...tokens: readonly string[]): () => string {
@@ -33,6 +40,41 @@ function tokenSequence(...tokens: readonly string[]): () => string {
 
 function tokenHash(token: string): string {
   return createHash("sha256").update(token).digest("base64url");
+}
+
+function identitySessionMutationSnapshot(databasePath: string): unknown {
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    return {
+      families: database.prepare(
+        `SELECT family_id AS familyId, public_id AS publicId, revoked_at AS revokedAt
+         FROM session_families ORDER BY family_id`,
+      ).all(),
+      generations: database.prepare(
+        `SELECT family_id AS familyId, access_token_hash AS accessTokenHash,
+                revoked_at AS revokedAt
+         FROM sessions ORDER BY family_id, access_token_hash`,
+      ).all(),
+      identityStreams: database.prepare(
+        `SELECT stream_id AS streamId, head_seq AS headSeq
+         FROM streams WHERE stream_kind = 'identity' ORDER BY stream_id`,
+      ).all(),
+      revokeEvents: database.prepare(
+        `SELECT event_id AS eventId, stream_id AS streamId, stream_seq AS streamSeq,
+                payload_json AS payloadJson
+         FROM events WHERE event_type = 'identity.session.revoked'
+         ORDER BY event_id`,
+      ).all(),
+      sessionFamilyOutbox: database.prepare(
+        `SELECT id, event_id AS eventId, target_id AS targetId, stream_seq AS streamSeq,
+                status, attempts
+         FROM outbox_deliveries WHERE target_kind = 'session-family'
+         ORDER BY id`,
+      ).all(),
+    };
+  } finally {
+    database.close();
+  }
 }
 
 function deferred(): {
@@ -587,6 +629,410 @@ describe("SQLite authoritative sessions", () => {
         rm(directory, { recursive: true, force: true }),
       ),
     );
+  });
+
+  it("persists two public device families and atomically revokes only the targeted family", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-device-sessions-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const client = await createWorkerDatabaseClient({ databasePath });
+    const authority = createSqliteAuthoritativeStore(client);
+    const foreignActor = {
+      id: "human-foreign-session",
+      kind: "human" as const,
+      displayName: "Foreign Human",
+      reachability: "online",
+    };
+    await authority.registerActors([...actors, foreignActor]);
+    let now = 1_000;
+    const publicIds = ["sqlite-device-a", "sqlite-device-b"];
+    const auth = createAuthenticationService({
+      actors: actorDirectory,
+      identities,
+      authority,
+      clock: () => now,
+      tokenFactory: tokenSequence(
+        "sqlite-a-access", "sqlite-a-refresh", "sqlite-b-access", "sqlite-b-refresh",
+        "sqlite-b-next-access", "sqlite-b-next-refresh",
+      ),
+      sessionIdFactory: () => publicIds.shift() ?? "unexpected-public-id",
+    });
+    const a = await auth.login(
+      { accountId: "account-li", secret: "correct" },
+      { id: "install-a", label: "Mac A", platform: "macos" },
+    );
+    now = 2_000;
+    const b = await auth.login(
+      { accountId: "account-li", secret: "correct" },
+      { id: "install-b", label: "Linux B", platform: "linux" },
+    );
+
+    await expect(auth.listSessions(a.accessToken)).resolves.toEqual([
+      expect.objectContaining({ id: b.sessionId, deviceLabel: "Linux B", current: false }),
+      expect.objectContaining({ id: a.sessionId, deviceLabel: "Mac A", current: true }),
+    ]);
+    const foreignAuth = createAuthenticationService({
+      actors: { getActor: (actorId) => actorId === foreignActor.id ? foreignActor : undefined },
+      identities: {
+        async verify(credentials) {
+          return credentials.accountId === "foreign-account" && credentials.secret === "correct"
+            ? { accountId: "foreign-account", actorId: foreignActor.id }
+            : undefined;
+        },
+      },
+      authority,
+      clock: () => now,
+      tokenFactory: tokenSequence("foreign-access", "foreign-refresh"),
+      sessionIdFactory: () => "foreign-public-session",
+    });
+    const foreign = await foreignAuth.login(
+      { accountId: "foreign-account", secret: "correct" },
+      { id: "foreign-install", label: "Foreign device", platform: "windows" },
+    );
+    await expect(foreignAuth.listSessions(foreign.accessToken)).resolves.toEqual([
+      expect.objectContaining({ id: foreign.sessionId, current: true }),
+    ]);
+    await expect(
+      foreignAuth.revokeSession(foreign.accessToken, b.sessionId),
+    ).rejects.toMatchObject({ status: 404, code: "session_not_found" });
+    now = 3_000;
+    const [refreshRace, revokeRace] = await Promise.allSettled([
+      auth.refresh(b.refreshToken),
+      auth.revokeSession(a.accessToken, b.sessionId),
+    ]);
+    expect(revokeRace.status).toBe("fulfilled");
+    if (refreshRace.status === "fulfilled") {
+      await expect(auth.authenticate(refreshRace.value.accessToken)).rejects.toMatchObject({
+        code: "session_revoked",
+      });
+    } else {
+      expect(refreshRace.reason).toMatchObject({ code: "session_revoked" });
+    }
+    await auth.revokeSession(a.accessToken, b.sessionId);
+    await expect(auth.authenticate(a.accessToken)).resolves.toMatchObject({ actorId: "human-li" });
+    await expect(auth.authenticate(b.accessToken)).rejects.toMatchObject({ code: "session_revoked" });
+    await expect(auth.refresh(b.refreshToken)).rejects.toMatchObject({ code: "session_revoked" });
+
+    await client.close();
+    const inspection = new DatabaseSync(databasePath, { readOnly: true });
+    expect(inspection.prepare(
+      "SELECT COUNT(*) AS count FROM events WHERE event_type = 'identity.session.revoked'",
+    ).get()).toEqual({ count: 1 });
+    expect(inspection.prepare(
+      "SELECT COUNT(*) AS count FROM outbox_deliveries WHERE target_kind = 'session-family'",
+    ).get()).toEqual({ count: 1 });
+    inspection.close();
+
+    const restartedClient = await createWorkerDatabaseClient({ databasePath });
+    const restartedAuth = createAuthenticationService({
+      actors: actorDirectory,
+      identities,
+      authority: createSqliteAuthoritativeStore(restartedClient),
+      clock: () => now,
+      tokenFactory: tokenSequence("restart-access", "restart-refresh"),
+    });
+    await expect(restartedAuth.listSessions(a.accessToken)).resolves.toEqual([
+      expect.objectContaining({ id: a.sessionId, current: true }),
+    ]);
+    await expect(restartedAuth.authenticate(b.accessToken)).rejects.toMatchObject({
+      code: "session_revoked",
+    });
+    await restartedClient.close();
+  });
+
+  it("atomically evicts the oldest family on the 97th login and fails closed above capacity", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-session-capacity-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const client = await createWorkerDatabaseClient({ databasePath });
+    const authority = createSqliteAuthoritativeStore(client);
+    await authority.registerActors(actors);
+    let tokenSequenceNumber = 0;
+    let publicIdSequence = 0;
+    let now = 1_000;
+    const auth = createAuthenticationService({
+      actors: actorDirectory,
+      identities,
+      authority,
+      clock: () => now,
+      tokenFactory: () => `capacity-token-${++tokenSequenceNumber}`,
+      sessionIdFactory: () => `capacity-public-${++publicIdSequence}`,
+    });
+    const issued = [];
+    for (let index = 0; index < MAX_ACTIVE_SESSION_FAMILIES; index += 1) {
+      issued.push(await auth.login(
+        { accountId: "account-li", secret: "correct" },
+        { id: `capacity-device-${index}`, label: `Capacity ${index}`, platform: "macos" },
+      ));
+    }
+    await expect(auth.listSessions(issued[0]!.accessToken)).resolves.toHaveLength(
+      MAX_ACTIVE_SESSION_FAMILIES,
+    );
+    const evictedContext = await authority.authenticate(
+      tokenHash(issued[0]!.accessToken),
+      now,
+    );
+    const evictedLease = await client.acquireStreamingRepair(
+      evictedContext,
+      { kind: "catalog", principalId: "human-li" },
+      now,
+    );
+    await client.registerStreamingRepair(
+      evictedLease.snapshotId,
+      "capacity-evicted-checksum",
+      1,
+      now,
+    );
+    const replacement = await auth.login(
+      { accountId: "account-li", secret: "correct" },
+      { id: "capacity-overflow", label: "Overflow", platform: "linux" },
+    );
+    await expect(client.authorizeStreamingRepairPage(
+      evictedContext,
+      evictedLease.snapshotId,
+      0,
+      now,
+    )).rejects.toMatchObject({
+      status: 403,
+      code: "snapshot_family_revoked",
+    });
+    const replacementContext = await authority.authenticate(
+      tokenHash(replacement.accessToken),
+      now,
+    );
+    const replacementLease = await client.acquireStreamingRepair(
+      replacementContext,
+      { kind: "catalog", principalId: "human-li" },
+      now,
+    );
+    expect(replacementLease.sessionFamilyId).toBe(replacementContext.sessionFamilyId);
+    await expect(auth.authenticate(issued[0]!.accessToken)).rejects.toMatchObject({
+      status: 403,
+      code: "session_revoked",
+    });
+    await expect(auth.refresh(issued[0]!.refreshToken)).rejects.toMatchObject({
+      status: 403,
+      code: "session_revoked",
+    });
+    const afterReplacement = await auth.listSessions(issued[1]!.accessToken);
+    expect(afterReplacement).toHaveLength(MAX_ACTIVE_SESSION_FAMILIES);
+    expect(afterReplacement).toContainEqual(
+      expect.objectContaining({ id: replacement.sessionId }),
+    );
+    const capacityInspection = new DatabaseSync(databasePath, { readOnly: true });
+    expect(capacityInspection.prepare(
+      "SELECT COUNT(*) AS count FROM events WHERE event_type = 'identity.session.revoked'",
+    ).get()).toEqual({ count: 1 });
+    expect(capacityInspection.prepare(
+      "SELECT COUNT(*) AS count FROM outbox_deliveries WHERE target_kind = 'session-family'",
+    ).get()).toEqual({ count: 1 });
+    capacityInspection.close();
+
+    const bypassFamilyId = tokenHash("capacity-bypass-family");
+    const bypassDatabase = new DatabaseSync(databasePath);
+    bypassDatabase.prepare(
+      `INSERT INTO session_families (
+         family_id, public_id, account_id, actor_id, device_id, device_label,
+         platform, created_at, refresh_expires_at, revoked_at
+       ) VALUES (?, 'capacity-bypass-public', 'account-li', 'human-li',
+                 'bypass-device', 'Bypass', 'unknown', 2000, 9999999999999, NULL)`,
+    ).run(bypassFamilyId);
+    bypassDatabase.prepare(
+      `INSERT INTO sessions (
+         family_id, account_id, actor_id, access_token_hash, refresh_token_hash,
+         access_expires_at, refresh_expires_at, revoked_at
+       ) VALUES (?, 'account-li', 'human-li', ?, ?, 9999999999998, 9999999999999, NULL)`,
+    ).run(
+      bypassFamilyId,
+      tokenHash("capacity-bypass-access"),
+      tokenHash("capacity-bypass-refresh"),
+    );
+    bypassDatabase.close();
+    await expect(auth.listSessions(issued[1]!.accessToken)).rejects.toMatchObject({
+      status: 409,
+      code: "session_limit_reached",
+    });
+
+    const cleanupDatabase = new DatabaseSync(databasePath);
+    cleanupDatabase.prepare("DELETE FROM sessions WHERE family_id = ?").run(bypassFamilyId);
+    cleanupDatabase.prepare("DELETE FROM session_families WHERE family_id = ?")
+      .run(bypassFamilyId);
+    cleanupDatabase.close();
+
+    now = 31 * 24 * 60 * 60 * 1_000;
+    const afterExpiry = await auth.login(
+      { accountId: "account-li", secret: "correct" },
+      { id: "capacity-after-expiry", label: "After expiry", platform: "linux" },
+    );
+    await expect(auth.listSessions(afterExpiry.accessToken)).resolves.toHaveLength(1);
+    await client.close();
+  });
+
+  it("rolls back every targeted-revoke write when the authority worker fails before commit", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-target-revoke-rollback-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const bootstrapClient = await createWorkerDatabaseClient({ databasePath });
+    const bootstrapAuthority = createSqliteAuthoritativeStore(bootstrapClient);
+    await bootstrapAuthority.registerActors(actors);
+    const bootstrapAuth = createAuthenticationService({
+      actors: actorDirectory,
+      identities,
+      authority: bootstrapAuthority,
+      clock: () => 1_000,
+      tokenFactory: tokenSequence(
+        "rollback-caller-access",
+        "rollback-caller-refresh",
+        "rollback-target-access",
+        "rollback-target-refresh",
+      ),
+      sessionIdFactory: tokenSequence("rollback-caller-public", "rollback-target-public"),
+    });
+    const caller = await bootstrapAuth.login(
+      { accountId: "account-li", secret: "correct" },
+      { id: "rollback-caller", label: "Rollback caller", platform: "macos" },
+    );
+    const target = await bootstrapAuth.login(
+      { accountId: "account-li", secret: "correct" },
+      { id: "rollback-target", label: "Rollback target", platform: "linux" },
+    );
+    await bootstrapClient.close();
+    const before = identitySessionMutationSnapshot(databasePath);
+
+    const faultClient = await createWorkerDatabaseClientWithTransactionFaultForTest(
+      { databasePath },
+      "before-commit",
+    );
+    const faultAuth = createAuthenticationService({
+      actors: actorDirectory,
+      identities,
+      authority: createSqliteAuthoritativeStore(faultClient),
+      clock: () => 2_000,
+    });
+
+    await expect(faultAuth.revokeSession(caller.accessToken, target.sessionId))
+      .rejects.toMatchObject({ code: "authority_worker_exited", status: 503 });
+    expect(identitySessionMutationSnapshot(databasePath)).toEqual(before);
+
+    const inspection = new DatabaseSync(databasePath, { readOnly: true });
+    expect(inspection.prepare(
+      `SELECT revoked_at AS revokedAt FROM session_families WHERE public_id = ?`,
+    ).get(target.sessionId)).toEqual({ revokedAt: null });
+    expect(inspection.prepare(
+      `SELECT COUNT(*) AS count FROM sessions AS session
+       JOIN session_families AS family ON family.family_id = session.family_id
+       WHERE family.public_id = ? AND session.revoked_at IS NOT NULL`,
+    ).get(target.sessionId)).toEqual({ count: 0 });
+    inspection.close();
+  });
+
+  it.each([
+    { callerState: "revoked", status: 403, code: "session_revoked" },
+    { callerState: "expired", status: 401, code: "token_expired" },
+  ] as const)(
+    "rejects list and targeted revoke from a $callerState caller without any authority mutation",
+    async ({ callerState, status, code }) => {
+      const directory = await mkdtemp(join(tmpdir(), `native-im-${callerState}-caller-`));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const client = await createWorkerDatabaseClient({ databasePath });
+      const authority = createSqliteAuthoritativeStore(client);
+      await authority.registerActors(actors);
+      let now = 1_000;
+      const auth = createAuthenticationService({
+        actors: actorDirectory,
+        identities,
+        authority,
+        accessTtlMs: 100,
+        refreshTtlMs: 1_000,
+        clock: () => now,
+        tokenFactory: tokenSequence(
+          `${callerState}-caller-access`,
+          `${callerState}-caller-refresh`,
+          `${callerState}-target-access`,
+          `${callerState}-target-refresh`,
+        ),
+        sessionIdFactory: tokenSequence(
+          `${callerState}-caller-public`,
+          `${callerState}-target-public`,
+        ),
+      });
+      const caller = await auth.login(
+        { accountId: "account-li", secret: "correct" },
+        { id: `${callerState}-caller`, label: "Caller", platform: "macos" },
+      );
+      const target = await auth.login(
+        { accountId: "account-li", secret: "correct" },
+        { id: `${callerState}-target`, label: "Target", platform: "linux" },
+      );
+      if (callerState === "revoked") {
+        await auth.revoke(caller.accessToken);
+      } else {
+        now = 1_100;
+      }
+      const before = identitySessionMutationSnapshot(databasePath);
+
+      await expect(auth.listSessions(caller.accessToken)).rejects.toMatchObject({ status, code });
+      await expect(auth.revokeSession(caller.accessToken, target.sessionId))
+        .rejects.toMatchObject({ status, code });
+
+      expect(identitySessionMutationSnapshot(databasePath)).toEqual(before);
+      const inspection = new DatabaseSync(databasePath, { readOnly: true });
+      expect(inspection.prepare(
+        `SELECT revoked_at AS revokedAt FROM session_families WHERE public_id = ?`,
+      ).get(target.sessionId)).toEqual({ revokedAt: null });
+      inspection.close();
+      await client.close();
+    },
+  );
+
+  it("authenticates and refreshes v11 tokens after the v12 family migration", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-v11-session-token-migration-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const oldAccessToken = "v11-access-token";
+    const oldRefreshToken = "v11-refresh-token";
+    const familyId = tokenHash(oldAccessToken);
+    const database = new DatabaseSync(databasePath);
+    migrateAuthorityDatabaseToPreviousVersionForTest(database);
+    database.prepare(
+      `INSERT INTO actors (id, kind, display_name)
+       VALUES ('human-li', 'human', 'Lionel')`,
+    ).run();
+    database.prepare(
+      `INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+       VALUES ('identity', 'human-li', 0, 1)`,
+    ).run();
+    database.prepare(
+      `INSERT INTO sessions (
+         family_id, account_id, actor_id, access_token_hash, refresh_token_hash,
+         access_expires_at, refresh_expires_at, revoked_at
+       ) VALUES (?, 'account-li', 'human-li', ?, ?, 5000, 20000, NULL)`,
+    ).run(familyId, tokenHash(oldAccessToken), tokenHash(oldRefreshToken));
+    database.close();
+
+    const client = await createWorkerDatabaseClient({ databasePath });
+    const auth = createAuthenticationService({
+      actors: actorDirectory,
+      identities,
+      authority: createSqliteAuthoritativeStore(client),
+      clock: () => 1_000,
+      tokenFactory: tokenSequence("v12-access-token", "v12-refresh-token"),
+    });
+
+    await expect(auth.authenticate(oldAccessToken)).resolves.toEqual({
+      accountId: "account-li",
+      actorId: "human-li",
+    });
+    const rotated = await auth.refresh(oldRefreshToken);
+    expect(rotated.sessionId).toMatch(/^[0-9a-f]{64}$/);
+    expect(rotated.sessionId).not.toContain(familyId);
+    await expect(auth.authenticate(rotated.accessToken)).resolves.toEqual({
+      accountId: "account-li",
+      actorId: "human-li",
+    });
+    await expect(client.inspectSchema()).resolves.toEqual({ version: 12 });
+    await client.close();
   });
 
   it("persists a room.create command through the authoritative worker", async () => {
@@ -3418,10 +3864,15 @@ describe("SQLite authoritative sessions", () => {
         "refresh-one",
         "access-two",
         "refresh-two",
+        "access-independent",
+        "refresh-independent",
       ),
     });
 
-    const issued = await auth.login({ accountId: "account-li", secret: "correct" });
+    const issued = await auth.login(
+      { accountId: "account-li", secret: "correct" },
+      { id: "rotate-install", label: "Rotation device", platform: "macos" },
+    );
     const firstContext = await auth.authenticateSession(issued.accessToken);
     await expect(
       auth.refresh(issued.refreshToken, {
@@ -3433,14 +3884,68 @@ describe("SQLite authoritative sessions", () => {
     now = 2_000;
     const rotated = await auth.refresh(issued.refreshToken, firstContext.principal);
     const rotatedContext = await auth.authenticateSession(rotated.accessToken);
+    expect(rotated.sessionId).toBe(issued.sessionId);
     expect(rotatedContext.sessionFamilyId).toBe(firstContext.sessionFamilyId);
     expect(rotatedContext.sessionId).not.toBe(firstContext.sessionId);
+    await expect(auth.listSessions(rotated.accessToken)).resolves.toEqual([{
+      id: issued.sessionId,
+      deviceLabel: "Rotation device",
+      platform: "macos",
+      createdAt: new Date(1_000).toISOString(),
+      refreshExpiresAt: rotated.refreshExpiresAt,
+      current: true,
+    }]);
+
+    const independent = await auth.login(
+      { accountId: "account-li", secret: "correct" },
+      { id: "independent-install", label: "Independent device", platform: "linux" },
+    );
+    const independentContext = await auth.authenticateSession(independent.accessToken);
+    const replayLease = await client.acquireStreamingRepair(
+      rotatedContext,
+      { kind: "catalog", principalId: "human-li" },
+      now,
+    );
+    await client.registerStreamingRepair(
+      replayLease.snapshotId,
+      "refresh-replay-checksum",
+      1,
+      now,
+    );
 
     now = 3_000;
+    await expect(auth.refresh(rotated.refreshToken, {
+      accountId: "foreign-account",
+      actorId: "foreign-human",
+    })).rejects.toMatchObject({
+      status: 403,
+      code: "identity_forbidden",
+    });
+    await expect(client.authorizeStreamingRepairPage(
+      rotatedContext,
+      replayLease.snapshotId,
+      0,
+      now,
+    )).resolves.toMatchObject({ snapshotId: replayLease.snapshotId });
     await expect(auth.refresh(issued.refreshToken)).rejects.toMatchObject({
       status: 403,
       code: "session_revoked",
     });
+    await expect(client.authorizeStreamingRepairPage(
+      rotatedContext,
+      replayLease.snapshotId,
+      0,
+      now,
+    )).rejects.toMatchObject({
+      status: 403,
+      code: "snapshot_family_revoked",
+    });
+    const independentLease = await client.acquireStreamingRepair(
+      independentContext,
+      { kind: "catalog", principalId: "human-li" },
+      now,
+    );
+    expect(independentLease.sessionFamilyId).toBe(independentContext.sessionFamilyId);
     await expect(auth.authenticateSession(rotated.accessToken)).rejects.toMatchObject({
       status: 403,
       code: "session_revoked",
@@ -3459,7 +3964,7 @@ describe("SQLite authoritative sessions", () => {
         )
         .all(),
     ).toEqual([
-      { eventType: "identity.session.issued", count: 1 },
+      { eventType: "identity.session.issued", count: 2 },
       { eventType: "identity.session.revoked", count: 1 },
       { eventType: "identity.session.rotated", count: 1 },
     ]);
@@ -3479,12 +3984,192 @@ describe("SQLite authoritative sessions", () => {
       {
         targetKind: "session-family",
         targetId: firstContext.sessionFamilyId,
-        streamSeq: 4,
+        streamSeq: 5,
         status: "pending",
         attempts: 0,
       },
     ]);
     database.close();
+  });
+
+  it.each(["validate", "rotate"] as const)(
+    "rolls back refresh-replay %s before post-commit repair preemption",
+    async (replayPath) => {
+      const directory = await mkdtemp(join(tmpdir(), `native-im-${replayPath}-rollback-`));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const bootstrapClient = await createWorkerDatabaseClient({ databasePath });
+      const bootstrapAuthority = createSqliteAuthoritativeStore(bootstrapClient);
+      await bootstrapAuthority.registerActors(actors);
+      let now = 1_000;
+      const bootstrapAuth = createAuthenticationService({
+        actors: actorDirectory,
+        identities,
+        authority: bootstrapAuthority,
+        clock: () => now,
+        tokenFactory: tokenSequence(
+          `${replayPath}-rollback-access-one`,
+          `${replayPath}-rollback-refresh-one`,
+          `${replayPath}-rollback-access-two`,
+          `${replayPath}-rollback-refresh-two`,
+        ),
+      });
+      const issued = await bootstrapAuth.login(
+        { accountId: "account-li", secret: "correct" },
+      );
+      now = 2_000;
+      const rotated = await bootstrapAuth.refresh(issued.refreshToken);
+      const rotatedContext = await bootstrapAuth.authenticateSession(rotated.accessToken);
+      await bootstrapClient.close();
+      const before = identitySessionMutationSnapshot(databasePath);
+
+      const faultClient = await createWorkerDatabaseClientWithTransactionFaultForTest(
+        { databasePath },
+        "before-commit",
+      );
+      const faultAuthority = createSqliteAuthoritativeStore(faultClient);
+      const lease = await faultClient.acquireStreamingRepair(
+        rotatedContext,
+        { kind: "catalog", principalId: "human-li" },
+        now,
+      );
+      await faultClient.registerStreamingRepair(
+        lease.snapshotId,
+        `${replayPath}-rollback-checksum`,
+        1,
+        now,
+      );
+      const replay = replayPath === "validate"
+        ? faultAuthority.validateRefresh(
+            tokenHash(issued.refreshToken),
+            rotatedContext.principal,
+            3_000,
+          )
+        : faultAuthority.rotate({
+            currentRefreshTokenHash: tokenHash(issued.refreshToken),
+            accessTokenHash: tokenHash("rollback-loser-access"),
+            refreshTokenHash: tokenHash("rollback-loser-refresh"),
+            accessExpiresAt: 4_000,
+            refreshExpiresAt: 30_000,
+            expectedPrincipal: rotatedContext.principal,
+            now: 3_000,
+          });
+      await expect(replay).rejects.toMatchObject({
+        status: 503,
+        code: "authority_worker_exited",
+      });
+      expect(identitySessionMutationSnapshot(databasePath)).toEqual(before);
+    },
+  );
+
+  it("preempts a revoked family after a concurrent rotation loser commits", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-rotate-race-preempt-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const client = await createWorkerDatabaseClient({ databasePath });
+    const authority = createSqliteAuthoritativeStore(client);
+    await authority.registerActors(actors);
+    let now = 1_000;
+    const auth = createAuthenticationService({
+      actors: actorDirectory,
+      identities,
+      authority,
+      clock: () => now,
+      tokenFactory: tokenSequence(
+        "race-access",
+        "race-refresh",
+        "race-independent-access",
+        "race-independent-refresh",
+      ),
+    });
+    const issued = await auth.login(
+      { accountId: "account-li", secret: "correct" },
+      { id: "race-install", label: "Race device", platform: "macos" },
+    );
+    const independent = await auth.login(
+      { accountId: "account-li", secret: "correct" },
+      { id: "race-independent", label: "Independent", platform: "linux" },
+    );
+    const initialContext = await auth.authenticateSession(issued.accessToken);
+    const independentContext = await auth.authenticateSession(independent.accessToken);
+    const raceLease = await client.acquireStreamingRepair(
+      initialContext,
+      { kind: "catalog", principalId: "human-li" },
+      now,
+    );
+    await client.registerStreamingRepair(
+      raceLease.snapshotId,
+      "rotation-race-checksum",
+      1,
+      now,
+    );
+
+    now = 2_000;
+    const rotations = await Promise.allSettled([
+      authority.rotate({
+        currentRefreshTokenHash: tokenHash(issued.refreshToken),
+        accessTokenHash: tokenHash("race-winner-a-access"),
+        refreshTokenHash: tokenHash("race-winner-a-refresh"),
+        accessExpiresAt: 3_000,
+        refreshExpiresAt: 30_000,
+        expectedPrincipal: initialContext.principal,
+        now,
+      }),
+      authority.rotate({
+        currentRefreshTokenHash: tokenHash(issued.refreshToken),
+        accessTokenHash: tokenHash("race-winner-b-access"),
+        refreshTokenHash: tokenHash("race-winner-b-refresh"),
+        accessExpiresAt: 3_000,
+        refreshExpiresAt: 30_000,
+        expectedPrincipal: initialContext.principal,
+        now,
+      }),
+    ]);
+    expect(rotations.map((result) => result.status).sort()).toEqual([
+      "fulfilled",
+      "rejected",
+    ]);
+    const winningRotation = rotations.find((result) => result.status === "fulfilled");
+    const losingRotation = rotations.find((result) => result.status === "rejected");
+    if (
+      winningRotation?.status !== "fulfilled" ||
+      losingRotation?.status !== "rejected"
+    ) {
+      throw new Error("Expected one winning and one losing rotation");
+    }
+    expect(losingRotation.reason).toMatchObject({
+      status: 403,
+      code: "session_revoked",
+    });
+    await expect(client.authorizeStreamingRepairPage(
+      {
+        sessionId: winningRotation.value.sessionId,
+        sessionFamilyId: winningRotation.value.familyId,
+        principal: initialContext.principal,
+      },
+      raceLease.snapshotId,
+      0,
+      now,
+    )).rejects.toMatchObject({
+      status: 403,
+      code: "snapshot_family_revoked",
+    });
+    const independentLease = await client.acquireStreamingRepair(
+      independentContext,
+      { kind: "catalog", principalId: "human-li" },
+      now,
+    );
+    expect(independentLease.sessionFamilyId).toBe(independentContext.sessionFamilyId);
+    await client.close();
+
+    const inspection = new DatabaseSync(databasePath, { readOnly: true });
+    expect(inspection.prepare(
+      "SELECT COUNT(*) AS count FROM events WHERE event_type = 'identity.session.revoked'",
+    ).get()).toEqual({ count: 1 });
+    expect(inspection.prepare(
+      "SELECT COUNT(*) AS count FROM outbox_deliveries WHERE target_kind = 'session-family'",
+    ).get()).toEqual({ count: 1 });
+    inspection.close();
   });
 
   it("explicitly revokes a family and persists one terminal outbox delivery", async () => {
