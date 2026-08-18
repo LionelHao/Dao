@@ -133,4 +133,4 @@ authoritative composition 默认绑定 `127.0.0.1:8787`，与 Desktop 默认 Ide
 - `auth.session.revoke.ack` 与 unsolicited terminal frame 语义不能合并。
 - safeStorage backend、Windows ACL/Unix mode 分支与 preload sandbox bundle 是发行平台必须保留的边界。
 - active device-session 上限、Desktop parser session 数和最大 server frame 必须保持闭合；修改任何一侧时同步更新协议测试。
-- 本轮不 commit、不 push、不创建 PR，也不修改 Blueprint 权威状态。
+- 本轮实现已通过 PR #21 合入 `main`；仍未由实施者自行标记 `verified`，也未修改 Blueprint 权威状态。
