@@ -62,5 +62,11 @@ FT-09 responsibility objects/cleanup、FT-10 settlement/timer、FT-13 encrypted 
 - `node scripts/verify-desktop-boundary.mjs`：通过（5 个 production renderer sources）。
 - `git diff --check`：通过。
 
-工作分支为 `codex/ft-02a-room-governance`，独立 worktree 为
-`/Users/leo/code/Dao-ft02a-room-governance`，基线 main commit 为 `097a41e`。未执行 commit、push、PR 创建或合并；未修改 Blueprint 或任务状态。
+## Git / PR 交付溯源
+
+- 工作分支：`codex/ft-02a-room-governance`；独立 worktree：`/Users/leo/code/Dao-ft02a-room-governance`。
+- 原始创建基线：main commit `097a41e`；发布前该分支变基到当时的 `origin/main` `ca159f6`。
+- feature commit：`003b36c9f3bb9db30a64ff13e8702fae2fd38148`。
+- GitHub PR：`#26`；仓库按 squash merge 策略合入 main。
+- main squash-merge commit：`fb37f7aca58665b5aad0aeda80fa3a685d45e74b`；截至本次溯源核对，它也是本地 main 与 `origin/main` 的当前提交。
+- 本次交付未修改 Blueprint 或任务状态；交付范围仍仅为 FT-02A 基础切片，不代表完整 FT-02、M2 或任务 verified。
