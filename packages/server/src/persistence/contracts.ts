@@ -8,6 +8,7 @@ import {
   isHumanPreemptionNotice,
   isLightTask,
   isRoomCursor,
+  isRoomGovernanceView,
   isHumanRoomMembership,
   isMessage,
   isOpenItem,
@@ -28,6 +29,7 @@ import type {
   RoomRepairPage,
   RoomSyncRequest,
   RoomSyncResult,
+  RoomGovernanceView,
   WorkspaceBootstrapPage,
   SnapshotVersion,
 } from "@native-im/core";
@@ -521,6 +523,26 @@ export type RoomGovernanceCommand =
   | { readonly type: "room.create"; readonly payload: { readonly name: string } }
   | { readonly type: "room.rename"; readonly roomId: string; readonly payload: { readonly name: string } }
   | { readonly type: "room.archive"; readonly roomId: string; readonly payload: Record<string, never> }
+  | { readonly type: "room.reopen"; readonly roomId: string; readonly payload: { readonly expectedGovernanceRevision: number } }
+  | {
+      readonly type: "room.ownership.transfer";
+      readonly roomId: string;
+      readonly payload: { readonly targetActorId: string; readonly expectedGovernanceRevision: number };
+    }
+  | {
+      readonly type: "room.member.role.set";
+      readonly roomId: string;
+      readonly payload: {
+        readonly targetActorId: string;
+        readonly role: "admin" | "member";
+        readonly expectedGovernanceRevision: number;
+      };
+    }
+  | {
+      readonly type: "room.member.leave";
+      readonly roomId: string;
+      readonly payload: { readonly expectedGovernanceRevision: number };
+    }
   | {
       readonly type: "human.invitation.issue";
       readonly roomId: string;
@@ -626,6 +648,10 @@ export interface SyncQueryStore {
   readHistory(context: AuthenticatedSessionContext, roomId: string): Promise<readonly Message[]>;
   readActor(actorId: string): Promise<Actor | undefined>;
   readRoom(roomId: string): Promise<ManagedRoom | undefined>;
+  readRoomGovernance(
+    context: AuthenticatedSessionContext,
+    roomId: string,
+  ): Promise<RoomGovernanceView>;
   canAccessRoom(context: AuthenticatedSessionContext, roomId: string): Promise<boolean>;
   readRoomAudit(
     context: AuthenticatedSessionContext,
@@ -802,6 +828,17 @@ function isGovernanceCommand(value: UnknownRecord): boolean {
   if (value.type === "room.archive") {
     return exact(payload, []);
   }
+  if (value.type === "room.reopen" || value.type === "room.member.leave") {
+    return exact(payload, ["expectedGovernanceRevision"]) && count(payload.expectedGovernanceRevision);
+  }
+  if (value.type === "room.ownership.transfer") {
+    return exact(payload, ["targetActorId", "expectedGovernanceRevision"]) && text(payload.targetActorId) &&
+      count(payload.expectedGovernanceRevision);
+  }
+  if (value.type === "room.member.role.set") {
+    return exact(payload, ["targetActorId", "role", "expectedGovernanceRevision"]) && text(payload.targetActorId) &&
+      (payload.role === "admin" || payload.role === "member") && count(payload.expectedGovernanceRevision);
+  }
   if (value.type === "human.invitation.issue") {
     return exact(payload, ["inviteeActorId"]) && text(payload.inviteeActorId);
   }
@@ -870,6 +907,10 @@ function validRoomEventPayload(
   if (type === "room.created" || type === "room.renamed" || type === "room.archived") {
     return exact(payload, ["room"]) && strictManagedRoom(payload.room) &&
       (payload.room as { readonly id: string }).id === roomId;
+  }
+  if (type === "room.governance.changed") {
+    return exact(payload, ["governance"]) && isRoomGovernanceView(payload.governance) &&
+      payload.governance.roomId === roomId;
   }
   if (type === "human.invitation.issued") {
     return exact(payload, ["invitationId", "inviteeActorId"]) && text(payload.invitationId) && text(payload.inviteeActorId);

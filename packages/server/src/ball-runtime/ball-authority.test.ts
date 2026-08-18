@@ -43,9 +43,10 @@ function openDatabase(): { readonly path: string; readonly database: DatabaseSyn
     INSERT INTO room_memberships (
       room_id, actor_id, kind, role, participation, joined_at, configured_at
     ) VALUES
-      ('room-1', 'human-1', 'human', 'owner', NULL, '2026-08-17T00:00:00.000Z', NULL),
+      ('room-1', 'human-1', 'human', 'member', NULL, '2026-08-17T00:00:00.000Z', NULL),
       ('room-1', 'human-2', 'human', 'member', NULL, '2026-08-17T00:00:00.000Z', NULL),
       ('room-1', 'agent-1', 'agent', NULL, 'active', NULL, '2026-08-17T00:00:00.000Z');
+    UPDATE rooms SET owner_actor_id = 'human-1', governance_revision = 1 WHERE id = 'room-1';
     INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
     VALUES
       ('message-open', 'room-1', 'human-1', 'human', 'Explicit request', '2026-08-17T00:00:00.000Z'),
@@ -201,6 +202,9 @@ describe("real SQLite BallInCourt authority", () => {
       .toEqual([expect.objectContaining({ holderId: "human-2" })]);
     expect(transferred.balls.filter((ball) => ball.sourceId === "task-1"))
       .toEqual([expect.objectContaining({ holderId: "human-2", reason: expect.stringContaining("verifier") })]);
+    database.prepare(
+      "UPDATE rooms SET owner_actor_id = 'human-2', governance_revision = 2 WHERE id = 'room-1'",
+    ).run();
     database.prepare("DELETE FROM room_memberships WHERE room_id = 'room-1' AND actor_id = 'human-1'").run();
     expect(() => executeBallAuthorityOperation(database, {
       type: "ball.query", context, roomId: "room-1", policy, now: t0 + 30_000,

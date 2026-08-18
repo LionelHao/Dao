@@ -388,12 +388,19 @@ function importRows(
     );
     for (const room of state.lifecycle.rooms) {
       insertRoom.run(room.id, room.name, room.status, room.createdAt);
+      const owners = room.members.filter((membership) =>
+        membership.kind === "human" && membership.role === "owner");
+      if (owners.length !== 1) {
+        throw new Error("Legacy room must have exactly one Human owner");
+      }
       for (const membership of room.members) {
         insertMembership.run(
           room.id,
           membership.actorId,
           membership.kind,
-          membership.kind === "human" ? membership.role : null,
+          membership.kind === "human"
+            ? (membership.role === "owner" ? "member" : membership.role)
+            : null,
           membership.kind === "agent" ? membership.participation : null,
           JSON.stringify(
             membership.kind === "agent" ? membership.toolPermissions : [],
@@ -402,6 +409,11 @@ function importRows(
           membership.kind === "agent" ? membership.configuredAt : null,
         );
       }
+      database.prepare(
+        `UPDATE rooms
+         SET owner_actor_id = ?, governance_revision = 1
+         WHERE id = ?`,
+      ).run(owners[0]!.actorId, room.id);
     }
     const insertInvitation = database.prepare(
       `INSERT INTO room_invitations (

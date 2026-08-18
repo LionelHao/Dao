@@ -424,7 +424,10 @@ function* roomRecords(
   recordScanned: () => void,
 ): Generator<RoomRepairRecord> {
   const room = authority.prepare(
-    "SELECT id, name, status, created_at AS createdAt FROM rooms WHERE id = ?",
+    `SELECT id, name, status, created_at AS createdAt, owner_actor_id AS ownerActorId,
+            governance_revision AS governanceRevision,
+            archive_generation AS archiveGeneration, archived_at AS archivedAt
+     FROM rooms WHERE id = ?`,
   ).get(roomId);
   if (room === undefined || typeof room.id !== "string" || typeof room.name !== "string" ||
       (room.status !== "active" && room.status !== "archived") || typeof room.createdAt !== "string") {
@@ -434,11 +437,31 @@ function* roomRecords(
     id: room.id, name: room.name, status: room.status, createdAt: room.createdAt,
   }};
   recordScanned();
+  if (typeof room.ownerActorId !== "string" || typeof room.governanceRevision !== "number" ||
+      typeof room.archiveGeneration !== "number") {
+    throw new SnapshotBuildError("storage_unavailable", "Snapshot governance is corrupt");
+  }
+  yield { kind: "governance", value: {
+    roomId: room.id,
+    projectId: room.id,
+    lifecycle: room.status,
+    governanceRevision: room.governanceRevision,
+    ownerActorId: room.ownerActorId,
+    archiveGeneration: room.archiveGeneration,
+    ...(room.status === "archived" && typeof room.archivedAt === "string"
+      ? { archivedAt: room.archivedAt }
+      : {}),
+  }};
+  recordScanned();
   for (const row of scanRows(authority,
-    `SELECT actor_id AS actorId, kind, role, participation,
-            tool_permissions_json AS toolPermissionsJson, joined_at AS joinedAt,
-            configured_at AS configuredAt
-     FROM room_memberships WHERE room_id = ?`,
+    `SELECT membership.actor_id AS actorId, membership.kind,
+            CASE WHEN membership.actor_id = room.owner_actor_id
+              THEN 'owner' ELSE membership.role END AS role, membership.participation,
+            membership.tool_permissions_json AS toolPermissionsJson,
+            membership.joined_at AS joinedAt, membership.configured_at AS configuredAt
+     FROM room_memberships AS membership
+     JOIN rooms AS room ON room.id = membership.room_id
+     WHERE membership.room_id = ?`,
     roomId, "actor_id", "actorId")) {
     if (row.kind === "human" && typeof row.actorId === "string" &&
         (row.role === "owner" || row.role === "admin" || row.role === "member") &&
@@ -596,7 +619,9 @@ function* catalogRooms(
   recordScanned: () => void,
 ): Generator<RoomSummary> {
   for (const row of scanRows(authority,
-    `SELECT room.id AS roomId, room.name, room.status, membership.role
+    `SELECT room.id AS roomId, room.name, room.status,
+            CASE WHEN membership.actor_id = room.owner_actor_id
+              THEN 'owner' ELSE membership.role END AS role
      FROM room_memberships AS membership
      JOIN rooms AS room ON room.id = membership.room_id
      WHERE membership.actor_id = ? AND membership.kind = 'human' AND room.status = 'active'`,
@@ -804,7 +829,10 @@ function keysetRoomPage(
   while (values.length < limit && segment < 12) {
     if (segment === 0) {
       const room = authority.prepare(
-        "SELECT id, name, status, created_at AS createdAt FROM rooms WHERE id = ?",
+        `SELECT id, name, status, created_at AS createdAt, owner_actor_id AS ownerActorId,
+                governance_revision AS governanceRevision,
+                archive_generation AS archiveGeneration, archived_at AS archivedAt
+         FROM rooms WHERE id = ?`,
       ).get(roomId);
       if (room === undefined || typeof room.id !== "string" || typeof room.name !== "string" ||
           (room.status !== "active" && room.status !== "archived") ||
@@ -814,6 +842,23 @@ function keysetRoomPage(
       if (key === undefined) {
         values.push({ kind: "room", value: { id: room.id, name: room.name,
           status: room.status, createdAt: room.createdAt }});
+        if (values.length >= limit) {
+          return { values, cursor: { segment: 0, key: "governance" } };
+        }
+      }
+      if (key === undefined || key === "governance") {
+        if (typeof room.ownerActorId !== "string" || typeof room.governanceRevision !== "number" ||
+            typeof room.archiveGeneration !== "number") {
+          throw new SnapshotBuildError("storage_unavailable", "Snapshot governance is corrupt");
+        }
+        values.push({ kind: "governance", value: {
+          roomId: room.id, projectId: room.id, lifecycle: room.status,
+          governanceRevision: room.governanceRevision, ownerActorId: room.ownerActorId,
+          archiveGeneration: room.archiveGeneration,
+          ...(room.status === "archived" && typeof room.archivedAt === "string"
+            ? { archivedAt: room.archivedAt }
+            : {}),
+        }});
         if (data.pauseState !== undefined) {
           Atomics.add(new Int32Array(data.pauseState), 1, 1);
         }
@@ -825,10 +870,14 @@ function keysetRoomPage(
     const remaining = limit - values.length;
     if (segment === 1) {
       append(keysetRows(authority,
-        `SELECT actor_id AS actorId, kind, role, participation,
-                tool_permissions_json AS toolPermissionsJson, joined_at AS joinedAt,
-                configured_at AS configuredAt
-         FROM room_memberships WHERE room_id = ?`, [roomId], "actor_id", key, remaining),
+        `SELECT membership.actor_id AS actorId, membership.kind,
+                CASE WHEN membership.actor_id = room.owner_actor_id
+                  THEN 'owner' ELSE membership.role END AS role, membership.participation,
+                membership.tool_permissions_json AS toolPermissionsJson,
+                membership.joined_at AS joinedAt, membership.configured_at AS configuredAt
+         FROM room_memberships AS membership
+         JOIN rooms AS room ON room.id = membership.room_id
+         WHERE membership.room_id = ?`, [roomId], "membership.actor_id", key, remaining),
       (row) => String(row.actorId), membershipRecord);
     } else if (segment === 2) {
       append(keysetRows(authority,
@@ -955,7 +1004,9 @@ function keysetCatalogPage(
   limit: number,
 ): { readonly values: readonly RoomSummary[]; readonly cursor: StreamingCursor } {
   const rows = keysetRows(authority,
-    `SELECT room.id AS roomId, room.name, room.status, membership.role
+    `SELECT room.id AS roomId, room.name, room.status,
+            CASE WHEN membership.actor_id = room.owner_actor_id
+              THEN 'owner' ELSE membership.role END AS role
      FROM room_memberships AS membership
      JOIN rooms AS room ON room.id = membership.room_id
      WHERE membership.actor_id = ? AND membership.kind = 'human' AND room.status = 'active'`,

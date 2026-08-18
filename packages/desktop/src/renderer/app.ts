@@ -9,6 +9,9 @@ import {
   isOpenItem,
   isRouteJudgment,
   isSocialReaction,
+  isRoomGovernanceView,
+  isHumanRoomMembership,
+  isAgentRoomMembership,
   type Actor,
   type AgentActor,
   type AgentConfigurationRequest,
@@ -28,7 +31,62 @@ import {
   type SocialReaction,
   type ToolConfirmationInput,
   type ToolConfirmationRequiredPayload,
+  type RoomGovernanceView,
+  type ManagedRoom,
 } from "@native-im/core";
+
+export function renderRoomGovernanceProjection(
+  root: HTMLElement,
+  input: {
+    readonly governance: RoomGovernanceView;
+    readonly memberships: ManagedRoom["members"];
+    readonly viewerActorId: string;
+  },
+): void {
+  if (!isRoomGovernanceView(input.governance) ||
+      !input.memberships.every((membership) =>
+        isHumanRoomMembership(membership) || isAgentRoomMembership(membership))) {
+    throw new TypeError("Room governance projection is not closed");
+  }
+  const humans = input.memberships.filter(isHumanRoomMembership);
+  if (humans.filter((member) => member.actorId === input.governance.ownerActorId).length !== 1) {
+    throw new TypeError("Room governance owner projection is inconsistent");
+  }
+  const viewer = humans.find((member) => member.actorId === input.viewerActorId);
+  const viewerRole = input.viewerActorId === input.governance.ownerActorId
+    ? "owner"
+    : viewer?.role;
+  const panel = document.createElement("section");
+  panel.className = "room-governance";
+  panel.dataset.roomId = input.governance.roomId;
+  panel.dataset.projectId = input.governance.projectId;
+  panel.dataset.governanceRevision = String(input.governance.governanceRevision);
+  panel.dataset.viewerRole = viewerRole ?? "none";
+  panel.setAttribute("aria-label", "房间治理权限");
+  const heading = document.createElement("h2");
+  heading.textContent = "成员与权限";
+  const status = document.createElement("p");
+  status.setAttribute("aria-live", "polite");
+  status.textContent = `当前角色：${viewerRole ?? "无权限"} · 治理版本 ${input.governance.governanceRevision}`;
+  const list = document.createElement("ul");
+  for (const membership of input.memberships) {
+    const item = document.createElement("li");
+    item.dataset.actorId = membership.actorId;
+    const projectedRole = membership.kind === "agent"
+      ? "agent"
+      : membership.actorId === input.governance.ownerActorId ? "owner" : membership.role;
+    item.dataset.role = projectedRole;
+    const manageable = viewerRole === "owner"
+      ? projectedRole !== "owner"
+      : viewerRole === "admin" &&
+        (projectedRole === "member" || projectedRole === "agent");
+    item.dataset.manageable = String(manageable);
+    item.textContent = `${membership.actorId} · ${projectedRole} · ${manageable ? "可管理" : "不可管理"}`;
+    list.append(item);
+  }
+  panel.append(heading, status, list);
+  root.replaceChildren(panel);
+}
 
 export function renderRoomAttentionSummary(
   root: HTMLElement,

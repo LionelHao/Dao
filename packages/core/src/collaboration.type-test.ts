@@ -7,6 +7,7 @@ import type {
   LightTask,
   BallInCourt,
   MessageDraft,
+  DepartureConflict,
 } from "./index.js";
 import type {
   AgentRuntimeProviderInput,
@@ -42,6 +43,16 @@ const invalidAgentMembership: AgentRoomMembership = {
   // @ts-expect-error Agent membership cannot carry a human social role.
   role: "member",
 };
+
+const conflictWithGrant = {
+  conflictId: "conflict-1", roomId: "room-1", subjectId: "human-2",
+  kind: "confirmation" as const, title: "Pending confirmation", state: "pending",
+  allowedResolutions: ["reject_or_revoke"] as const, sourceId: "confirmation-1",
+  revision: 1, grant: "secret",
+};
+// @ts-expect-error Departure conflicts cannot carry raw grant material.
+const invalidConflictGrant: DepartureConflict = conflictWithGrant;
+void invalidConflictGrant;
 
 const draftWithAuthorId = {
   id: "message-1",

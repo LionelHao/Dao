@@ -5,8 +5,10 @@ import type {
   HumanRoomRole,
   ManagedRoom,
   Message,
+  RoomGovernanceView,
   RoomStatus,
 } from "./index.js";
+import { isRoomGovernanceView } from "./index.js";
 import {
   isAgentExecution,
   isAgentJudgement,
@@ -54,6 +56,7 @@ export interface LegacyUnknownCalibrationSignal {
 
 export type RoomRepairRecord =
   | { readonly kind: "room"; readonly value: Omit<ManagedRoom, "members"> }
+  | { readonly kind: "governance"; readonly value: RoomGovernanceView }
   | { readonly kind: "membership"; readonly value: HumanRoomMembership | AgentRoomMembership }
   | { readonly kind: "message"; readonly value: Message }
   | { readonly kind: "human-read"; readonly value: HumanReadReceipt }
@@ -156,6 +159,7 @@ export interface ToolConfirmationRequiredPayload {
 
 export type PersistedRoomEvent =
   | RoomEvent<"room.created" | "room.renamed" | "room.archived", { readonly room: ManagedRoom }>
+  | RoomEvent<"room.governance.changed", { readonly governance: RoomGovernanceView }>
   | RoomEvent<"human.invitation.issued", { readonly invitationId: string; readonly inviteeActorId: string }>
   | RoomEvent<"human.invitation.accepted", { readonly invitationId: string; readonly membership: HumanRoomMembership }>
   | RoomEvent<"human.invitation.rejected", { readonly invitationId: string; readonly targetActorId: string }>
@@ -346,6 +350,7 @@ function isRepairRecord(value: unknown): value is RoomRepairRecord {
       text(legacy.createdAt);
   }
   if (value.kind === "room") return isRoomMetadata(value.value);
+  if (value.kind === "governance") return isRoomGovernanceView(value.value);
   if (value.kind === "membership") return isHumanMembershipValue(value.value) || isAgentMembershipValue(value.value);
   return value.kind === "message" && isMessageValue(value.value);
 }
@@ -373,6 +378,10 @@ function isPersistedRoomEventValue(value: unknown): value is PersistedRoomEvent 
   }
   if (value.type === "human.role.changed") {
     return exact(payload, ["membership"]) && isHumanMembershipValue(payload.membership);
+  }
+  if (value.type === "room.governance.changed") {
+    return exact(payload, ["governance"]) && isRoomGovernanceView(payload.governance) &&
+      payload.governance.roomId === value.roomId;
   }
   if (value.type === "member.removed") {
     return exact(payload, ["targetActorId"]) && text(payload.targetActorId);

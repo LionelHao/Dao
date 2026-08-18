@@ -2058,11 +2058,12 @@ describe("authoritative server real-process harness", () => {
         observeMaterializedLastPage = resolve;
       });
       let materializedLastPageObserved = false;
+      const expectedRepairTotal = mixed.total + 1;
       transportC.beforeMaterializedLastPageReturn = async (page, receivedRecordCount) => {
         materializedLastPageObserved = true;
         observeMaterializedLastPage();
         expect(page.hasMore).toBe(false);
-        expect(receivedRecordCount).toBe(mixed.total);
+        expect(receivedRecordCount).toBe(expectedRepairTotal);
         expect(cacheC.factCount(roomId)).toBe(0);
         await materializedLastPageRelease;
       };
@@ -2080,7 +2081,7 @@ describe("authoritative server real-process harness", () => {
       transportC.beforeMaterializedLastPageReturn = undefined;
       expect(materializedLastPageObserved).toBe(true);
       expect(transportA.roomRepairModes.at(-1)).toBe("streaming");
-      const completeStressPages = Math.ceil(mixed.total / stressPageSize);
+      const completeStressPages = Math.ceil(expectedRepairTotal / stressPageSize);
       expect(stressPagesA).toBe(completeStressPages);
       expect([transportB.roomRepairModes.at(-1), transportC.roomRepairModes.at(-1)])
         .toEqual(["materialized", "materialized"]);
@@ -2104,7 +2105,7 @@ describe("authoritative server real-process harness", () => {
       const authorityChecksum = cacheA.roomChecksum(roomId);
       expect(authorityChecksum).toBeTypeOf("string");
       for (const cache of [cacheA, cacheB, cacheC]) {
-        expect(cache.factCount(roomId)).toBe(mixed.total);
+        expect(cache.factCount(roomId)).toBe(expectedRepairTotal);
         expect(cache.roomChecksum(roomId)).toBe(authorityChecksum);
         expect(cache.independentRoomChecksum(roomId)).toBe(authorityChecksum);
         expect(cache.roomCursor(roomId)?.afterSeq).toBe(authoritativeHeadSeq);

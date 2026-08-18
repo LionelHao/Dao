@@ -9,6 +9,7 @@ import type {
   Message,
   RoomSyncRequest,
   RoomSyncResult,
+  RoomGovernanceView,
   SnapshotCompleted,
   SnapshotVersion,
 } from "@native-im/core";
@@ -58,7 +59,7 @@ export interface CreateWorkerDatabaseClientOptions {
 }
 
 export interface AuthoritySchemaInspection {
-  readonly version: 12;
+  readonly version: 13;
 }
 
 export interface WorkerDatabaseClient {
@@ -147,6 +148,11 @@ export interface WorkerDatabaseClient {
   ): Promise<void>;
   readActor(actorId: string): Promise<Actor | undefined>;
   readRoom(roomId: string): Promise<ManagedRoom | undefined>;
+  readRoomGovernance(
+    context: AuthenticatedSessionContext,
+    roomId: string,
+    now: number,
+  ): Promise<RoomGovernanceView>;
   canAccessRoom(
     context: AuthenticatedSessionContext,
     roomId: string,
@@ -259,10 +265,13 @@ function authorityWorkerClientErrorStatus(
     case "room_compaction_blocked":
     case "room_member_exists":
     case "room_owner_required":
+    case "ownership_transfer_required":
+    case "room_revision_conflict":
     case "snapshot_stale":
     case "confirmation_replayed":
       return 409;
     case "snapshot_forbidden":
+    case "role_forbidden":
       return 403;
     case "snapshot_expired":
     case "confirmation_expired":
@@ -283,6 +292,7 @@ function authorityWorkerClientErrorStatus(
     case "legacy_import_unavailable":
     case "storage_unavailable":
     case "repair_barrier_active":
+    case "dependency_unavailable":
       return 503;
     default: {
       const unreachable: never = code;
@@ -1242,6 +1252,21 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
     });
   }
 
+  readRoomGovernance(
+    context: AuthenticatedSessionContext,
+    roomId: string,
+    now: number,
+  ): Promise<RoomGovernanceView> {
+    return this.#send({ type: "authority.read-room-governance", context, roomId, now })
+      .then((response) => {
+        if (response.type !== "authority.room-governance") {
+          this.#failProtocol("Authority worker returned the wrong governance response");
+          throw this.#terminalError;
+        }
+        return response.governance;
+      });
+  }
+
   canAccessRoom(
     context: AuthenticatedSessionContext,
     roomId: string,
@@ -1514,6 +1539,7 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
         responseType === "authority.history") ||
       (requestType === "authority.read-actor" && responseType === "authority.actor") ||
       (requestType === "authority.read-room" && responseType === "authority.room") ||
+      (requestType === "authority.read-room-governance" && responseType === "authority.room-governance") ||
       (requestType === "authority.can-access-room" && responseType === "authority.room-access") ||
       (requestType === "authority.read-room-audit" && responseType === "authority.room-audit") ||
       (requestType === "authority.outbox-list" && responseType === "authority.outbox") ||

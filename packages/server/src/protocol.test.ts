@@ -676,4 +676,38 @@ describe("closed v2 recovery protocol", () => {
       taskId: "task-1", action: "deliver", emptyCriteriaConfirmed: true,
     })).toMatchObject({ ok: false, error: { code: "invalid_request" } });
   });
+
+  it("accepts only closed FT-02A governance CAS frames", () => {
+    expect(parse({
+      type: "room.governance.get", requestId: "governance-get", roomId: "room-1",
+    })).toMatchObject({ ok: true, frame: { type: "room.governance.get" } });
+    expect(parse({
+      type: "room.ownership.transfer", requestId: "transfer", roomId: "room-1",
+      targetActorId: "human-2", expectedGovernanceRevision: 3, idempotencyKey: "transfer-key",
+    })).toMatchObject({ ok: true, frame: {
+      type: "room.ownership.transfer", expectedGovernanceRevision: 3,
+    } });
+    expect(parse({
+      type: "room.member.role.set", requestId: "role", roomId: "room-1",
+      targetActorId: "human-2", role: "admin", expectedGovernanceRevision: 3,
+      idempotencyKey: "role-key",
+    })).toMatchObject({ ok: true, frame: { type: "room.member.role.set", role: "admin" } });
+    for (const frame of [
+      {
+        type: "room.member.role.set", requestId: "owner-forged", roomId: "room-1",
+        targetActorId: "human-2", role: "owner", expectedGovernanceRevision: 3,
+        idempotencyKey: "owner-forged",
+      },
+      {
+        type: "room.ownership.transfer", requestId: "missing-cas", roomId: "room-1",
+        targetActorId: "human-2", idempotencyKey: "missing-cas",
+      },
+      {
+        type: "room.member.leave", requestId: "extra", roomId: "room-1",
+        expectedGovernanceRevision: 3, idempotencyKey: "extra", responsibilityPlan: [],
+      },
+    ]) {
+      expect(parse(frame)).toMatchObject({ ok: false, error: { code: "invalid_request" } });
+    }
+  });
 });

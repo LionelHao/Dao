@@ -108,8 +108,11 @@ function seedRoom(
     `INSERT INTO room_memberships (
        room_id, actor_id, kind, role, participation, tool_permissions_json,
        joined_at, configured_at, access_revision
-     ) VALUES (?, ?, 'human', 'owner', NULL, '[]', ?, NULL, 7)`,
+     ) VALUES (?, ?, 'human', 'member', NULL, '[]', ?, NULL, 7)`,
   ).run(roomId, context.principal.actorId, "2026-08-11T00:00:00.000Z");
+  database.prepare(
+    "UPDATE rooms SET owner_actor_id = ?, governance_revision = 1 WHERE id = ?",
+  ).run(context.principal.actorId, roomId);
   database.prepare(
     `INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
      VALUES ('room', ?, ?, 1)`,
@@ -410,7 +413,10 @@ describe("durable materialized snapshot worker", () => {
       type: "room.repair.page", requestId: "begin-room", roomId: "room-page",
       page: 0, watermark: 4, mode: "materialized", hasMore: true,
     });
-    expect(page0.records.map((record) => record.kind)).toEqual(["room", "membership"]);
+    expect(page0.records.map((record) => record.kind)).toEqual(["room", "governance"]);
+    expect(page0.records[1]).toMatchObject({ kind: "governance", value: {
+      roomId: "room-page", projectId: "room-page", ownerActorId: context.principal.actorId,
+    } });
 
     const page1 = await client.readRoomRepairPage(
       context, "read-page-one", page0.snapshotId, 0,
@@ -420,8 +426,12 @@ describe("durable materialized snapshot worker", () => {
     const page2 = await client.readRoomRepairPage(
       context, "read-page-two", page0.snapshotId, 1,
     );
-    expect(page2).toMatchObject({ requestId: "read-page-two", page: 2, hasMore: false });
-    await expect(client.readRoomRepairPage(context, "past-end", page0.snapshotId, 2))
+    expect(page2).toMatchObject({ requestId: "read-page-two", page: 2, hasMore: true });
+    const page3 = await client.readRoomRepairPage(
+      context, "read-page-three", page0.snapshotId, 2,
+    );
+    expect(page3).toMatchObject({ requestId: "read-page-three", page: 3, hasMore: false });
+    await expect(client.readRoomRepairPage(context, "past-end", page0.snapshotId, 3))
       .rejects.toMatchObject({ status: 400, code: "invalid_request" });
     await expect(client.readRoomRepairPage(context, "negative", page0.snapshotId, -1))
       .rejects.toMatchObject({ status: 400, code: "invalid_request" });
@@ -513,7 +523,7 @@ describe("durable materialized snapshot worker", () => {
     if ("kind" in page && page.kind === "fallback") throw new Error("unexpected fallback");
     expect(page.hasMore).toBe(false);
     expect(page.records.map((record) => record.kind)).toEqual([
-      "room", "membership", "membership", "message", "message", "human-read",
+      "room", "governance", "membership", "membership", "message", "message", "human-read",
       "agent-judgement", "open-item", "open-item-agent-failure", "light-task",
       "agent-execution", "calibration",
     ]);
@@ -645,7 +655,7 @@ describe("durable materialized snapshot worker", () => {
     expect(pages.every((entry) => entry.records.length <= 2)).toBe(true);
     expect(pages.every((entry) =>
       Buffer.byteLength(canonicalJsonForTest(entry), "utf8") <= maxPageBytes)).toBe(true);
-    expect(pages.flatMap((entry) => entry.records)).toHaveLength(5);
+    expect(pages.flatMap((entry) => entry.records)).toHaveLength(6);
     await client.close();
   });
 
@@ -807,7 +817,7 @@ describe("durable materialized snapshot worker", () => {
     await client.close();
   });
 
-  it("keeps main/AuthorityWorker responsive and deletes a snapshot when final authorization loses", async () => {
+  it("keeps main/AuthorityWorker responsive and preserves a snapshot when unsafe removal fails closed", async () => {
     const owner: AuthenticatedSessionContext = {
       sessionId: tokenHash("race-owner-access"),
       sessionFamilyId: tokenHash("race-owner-family"),
@@ -847,20 +857,21 @@ describe("durable materialized snapshot worker", () => {
       idempotencyKey: "unrelated-create",
     }, { type: "room.create", payload: { name: "Unrelated" } }, 2_000);
     await expect(Promise.all([heartbeat, unrelatedCommit])).resolves.toBeDefined();
-    await authority.executeHuman({
+    await expect(authority.executeHuman({
       ...owner, kind: "human", requestId: "remove-target",
       idempotencyKey: "remove-target",
     }, { type: "member.remove", roomId: "race-room",
-      payload: { targetActorId: target.principal.actorId } }, 2_001);
+      payload: { targetActorId: target.principal.actorId } }, 2_001))
+      .rejects.toMatchObject({ status: 503, code: "dependency_unavailable" });
     paused.hooks.continueBuild();
 
-    await expect(beginning).rejects.toMatchObject({ status: 403, code: "room_forbidden" });
-    await expect(paused.client.cacheCountForTest()).resolves.toBe(0);
+    await expect(beginning).resolves.toMatchObject({ mode: "materialized", page: 0 });
+    await expect(paused.client.cacheCountForTest()).resolves.toBe(1);
     await paused.client.close();
     await authority.close();
   });
 
-  it("revalidates every later page and invalidates cache after membership removal", async () => {
+  it("revalidates every later page and preserves cache after unsafe removal fails closed", async () => {
     const owner: AuthenticatedSessionContext = {
       sessionId: tokenHash("page-owner-access"), sessionFamilyId: tokenHash("page-owner-family"),
       principal: { accountId: "page-owner-account", actorId: "page-owner" },
@@ -891,13 +902,14 @@ describe("durable materialized snapshot worker", () => {
     paused.hooks.continueBuild();
     const page0 = await beginning;
     if ("kind" in page0 && page0.kind === "fallback") throw new Error("unexpected fallback");
-    await authority.executeHuman({ ...owner, kind: "human", requestId: "page-remove",
+    await expect(authority.executeHuman({ ...owner, kind: "human", requestId: "page-remove",
       idempotencyKey: "page-remove" }, { type: "member.remove", roomId: "page-auth-room",
-      payload: { targetActorId: target.principal.actorId } }, 2_001);
+      payload: { targetActorId: target.principal.actorId } }, 2_001))
+      .rejects.toMatchObject({ status: 503, code: "dependency_unavailable" });
     await expect(paused.client.readRoomRepairPage(
       target, "page-auth-one", page0.snapshotId, 0,
-    )).rejects.toMatchObject({ status: 403, code: "room_forbidden" });
-    await expect(paused.client.cacheCountForTest()).resolves.toBe(0);
+    )).resolves.toMatchObject({ page: 1 });
+    await expect(paused.client.cacheCountForTest()).resolves.toBe(1);
     await paused.client.close();
     await authority.close();
   });
@@ -1139,9 +1151,9 @@ describe("durable materialized snapshot worker", () => {
       expect(page.mode).toBe("streaming");
       records.push(...page.records);
     }
-    expect(records).toHaveLength(10_009);
+    expect(records).toHaveLength(10_010);
     expect(new Set(records.map((record) => record.kind))).toEqual(new Set([
-      "room", "membership", "message", "human-read", "agent-judgement",
+      "room", "governance", "membership", "message", "human-read", "agent-judgement",
       "open-item", "light-task", "agent-execution", "calibration",
     ]));
     expect(page0.snapshotChecksum).toBe(createHash("sha256")
@@ -1336,9 +1348,9 @@ describe("durable materialized snapshot worker", () => {
         });
         records.push(...page.records);
       }
-      expect(records).toHaveLength(10_009);
+      expect(records).toHaveLength(10_010);
       expect(new Set(records.map((record) => record.kind))).toEqual(new Set([
-        "room", "membership", "message", "human-read", "agent-judgement",
+        "room", "governance", "membership", "message", "human-read", "agent-judgement",
         "open-item", "light-task", "agent-execution", "calibration",
       ]));
       expect(page0.snapshotChecksum).toBe(createHash("sha256")
@@ -1444,12 +1456,12 @@ describe("durable materialized snapshot worker", () => {
     paused.hooks.continueBuild();
     const page0 = await beginning;
     if ("kind" in page0 || page0.mode !== "streaming") throw new Error("expected streaming");
-    expect(paused.hooks.streamingPageScanCount()).toBe(100);
+    expect(paused.hooks.streamingPageScanCount()).toBe(99);
 
     await paused.client.readRoomRepairPage(
       context, "keyset-scan-one", page0.snapshotId, 0,
     );
-    expect(paused.hooks.streamingPageScanCount()).toBe(200);
+    expect(paused.hooks.streamingPageScanCount()).toBe(199);
     await paused.client.close();
     await authority.close();
   });
@@ -1537,7 +1549,7 @@ describe("durable materialized snapshot worker", () => {
     { governance: "role downgrade", terminalCode: "snapshot_stale", status: 409 },
     { governance: "room archive", terminalCode: "room_archived", status: 409 },
   ] as const)(
-    "commits $governance before invalidating the affected catalog lease",
+    "applies or fails closed for $governance before touching the affected catalog lease",
     async ({ governance, terminalCode, status }) => {
       const owner: AuthenticatedSessionContext = {
         sessionId: tokenHash(`catalog-governance-owner-access-${governance}`),
@@ -1605,20 +1617,38 @@ describe("durable materialized snapshot worker", () => {
             }
           : governance === "role downgrade"
             ? {
-                type: "human.role.change" as const,
+                type: "room.member.role.set" as const,
                 roomId,
                 payload: {
                   targetActorId: target.principal.actorId,
                   role: "member" as const,
+                  expectedGovernanceRevision: 1,
                 },
               }
             : { type: "room.archive" as const, roomId, payload: {} };
-        await expect(authority.executeHuman({
+        const execution = expect(authority.executeHuman({
           ...owner,
           kind: "human",
           requestId: `catalog-governance-${governance}`,
           idempotencyKey: `catalog-governance-${governance}`,
-        }, command, 2_001)).resolves.toBeDefined();
+        }, command, 2_001));
+        if (governance === "member removal" || governance === "room archive") {
+          await execution.rejects.toMatchObject({ status: 503, code: "dependency_unavailable" });
+          await expect(client.readWorkspaceBootstrapPage(
+            target, `catalog-governance-after-${governance}`, page0.snapshotId, 0,
+          )).resolves.toMatchObject({ mode: "streaming", page: 1 });
+          const inspected = new DatabaseSync(fixture.authorityPath, { readOnly: true });
+          expect(inspected.prepare(
+            "SELECT role FROM room_memberships WHERE room_id = ? AND actor_id = ?",
+          ).get(roomId, target.principal.actorId)?.role).toBe("admin");
+          expect(inspected.prepare("SELECT status FROM rooms WHERE id = ?").get(roomId)?.status)
+            .toBe("active");
+          inspected.close();
+          await client.close();
+          await authority.close();
+          return;
+        }
+        await execution.resolves.toBeDefined();
       }
 
       await expect(client.readWorkspaceBootstrapPage(
@@ -1799,14 +1829,14 @@ describe("durable materialized snapshot worker", () => {
       type: "member.remove" as const, roomId, payload: { targetActorId: targetId },
     }) },
     { name: "role downgrade", command: (roomId: string, targetId: string) => ({
-      type: "human.role.change" as const, roomId,
-      payload: { targetActorId: targetId, role: "member" as const },
+      type: "room.member.role.set" as const, roomId,
+      payload: { targetActorId: targetId, role: "member" as const, expectedGovernanceRevision: 1 },
     }) },
     { name: "room archive", command: (roomId: string, targetId: string) => {
       void targetId;
       return { type: "room.archive" as const, roomId, payload: {} };
     } },
-  ])("lets $name commit before preempting only the affected lease", async ({ command }) => {
+  ])("applies or fails $name closed before touching the affected lease", async ({ command }) => {
     const owner: AuthenticatedSessionContext = {
       sessionId: tokenHash(`preempt-owner-access-${command.name}`),
       sessionFamilyId: tokenHash(`preempt-owner-family-${command.name}`),
@@ -1842,12 +1872,36 @@ describe("durable materialized snapshot worker", () => {
     const page0 = await client.beginRoomRepair(target, "preempt-page-0", "preempt-room");
     if ("kind" in page0 || page0.mode !== "streaming") throw new Error("expected streaming");
 
-    await expect(authority.executeHuman({
+    const governanceCommand = command("preempt-room", target.principal.actorId);
+    const execution = expect(authority.executeHuman({
       ...owner,
       kind: "human",
       requestId: `preempt-${command.name}`,
       idempotencyKey: `preempt-${command.name}`,
-    }, command("preempt-room", target.principal.actorId), 2_001)).resolves.toBeDefined();
+    }, governanceCommand, 2_001));
+    if (governanceCommand.type === "member.remove" || governanceCommand.type === "room.archive"
+      || governanceCommand.type === "room.member.role.set") {
+      await execution.rejects.toMatchObject({
+        status: 503,
+        code: governanceCommand.type === "room.member.role.set"
+          ? "repair_barrier_active"
+          : "dependency_unavailable",
+      });
+      await expect(client.readRoomRepairPage(
+        target, "preempt-after", page0.snapshotId, 0,
+      )).resolves.toMatchObject({ mode: "streaming", page: 1 });
+      const inspected = new DatabaseSync(fixture.authorityPath, { readOnly: true });
+      expect(inspected.prepare(
+        "SELECT role FROM room_memberships WHERE room_id = 'preempt-room' AND actor_id = ?",
+      ).get(target.principal.actorId)?.role).toBe("admin");
+      expect(inspected.prepare("SELECT status FROM rooms WHERE id = 'preempt-room'").get()?.status)
+        .toBe("active");
+      inspected.close();
+      await client.close();
+      await authority.close();
+      return;
+    }
+    await execution.resolves.toBeDefined();
     await expect(client.readRoomRepairPage(
       target, "preempt-after", page0.snapshotId, 0,
     )).rejects.toMatchObject({ status: expect.any(Number),
@@ -1872,7 +1926,7 @@ describe("durable materialized snapshot worker", () => {
   });
 
   it.each(["member.remove", "room.archive"] as const)(
-    "does not preempt a newer lease when replaying an applied %s",
+    "does not preempt a lease when rejected %s is retried",
     async (type) => {
       const owner: AuthenticatedSessionContext = {
         sessionId: tokenHash(`replay-owner-access-${type}`),
@@ -1908,20 +1962,8 @@ describe("durable materialized snapshot worker", () => {
         requestId: `replay-preempt-first-${type}`,
         idempotencyKey: `replay-preempt-${type}`,
       };
-      const first = await authority.executeHuman(commandContext, command, 2_000);
-
-      const restored = new DatabaseSync(fixture.authorityPath);
-      if (type === "member.remove") {
-        restored.prepare(
-          `INSERT INTO room_memberships (
-             room_id, actor_id, kind, role, participation, tool_permissions_json,
-             joined_at, configured_at, access_revision
-           ) VALUES (?, ?, 'human', 'admin', NULL, '[]', 't2', NULL, 5)`,
-        ).run(roomId, target.principal.actorId);
-      } else {
-        restored.prepare("UPDATE rooms SET status = 'active' WHERE id = ?").run(roomId);
-      }
-      restored.close();
+      await expect(authority.executeHuman(commandContext, command, 2_000))
+        .rejects.toMatchObject({ status: 503, code: "dependency_unavailable" });
       const client = await createSnapshotWorkerClient({
         authorityPath: fixture.authorityPath,
         cachePath: fixture.cachePath,
@@ -1937,7 +1979,9 @@ describe("durable materialized snapshot worker", () => {
       await expect(authority.executeHuman({
         ...commandContext,
         requestId: `replay-preempt-second-${type}`,
-      }, command, 2_002)).resolves.toEqual(first);
+      }, command, 2_002)).rejects.toMatchObject({
+        status: 503, code: "dependency_unavailable",
+      });
       await expect(client.readRoomRepairPage(
         target, `replay-preempt-one-${type}`, page0.snapshotId, 0,
       )).resolves.toMatchObject({ mode: "streaming", page: 1 });
@@ -1992,9 +2036,13 @@ describe("durable materialized snapshot worker", () => {
         requestId: `role-gate-${role}`,
         idempotencyKey: `role-gate-${role}`,
       }, {
-        type: "human.role.change",
+        type: "room.member.role.set",
         roomId: "role-gate-room",
-        payload: { targetActorId: target.principal.actorId, role },
+        payload: {
+          targetActorId: target.principal.actorId,
+          role,
+          expectedGovernanceRevision: 1,
+        },
       }, 2_001)).rejects.toMatchObject({
         status: 503,
         code: "repair_barrier_active",

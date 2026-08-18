@@ -226,6 +226,9 @@ async function createFixture(options: {
     ).run(roomId, context.principal.actorId, "2026-08-11T00:00:00.000Z");
   }
   database.prepare(
+    "UPDATE rooms SET owner_actor_id = ?, governance_revision = 1 WHERE id = ?",
+  ).run(contexts[0]!.principal.actorId, roomId);
+  database.prepare(
     "INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq) VALUES ('room', ?, 0, 1)",
   ).run(roomId);
   database.close();
@@ -823,7 +826,7 @@ describe("permission-aware retained room sync", () => {
       ).get(),
     }).toEqual(before);
     database.close();
-    await expect(fixture.client.inspectSchema()).resolves.toEqual({ version: 12 });
+    await expect(fixture.client.inspectSchema()).resolves.toEqual({ version: 13 });
     const context = fixture.contexts[0];
     if (context === undefined) throw new Error("missing fixture context");
     await expect(fixture.sync.syncRoom(

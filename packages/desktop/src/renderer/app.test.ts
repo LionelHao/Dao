@@ -124,6 +124,45 @@ describe("empty group chat renderer", () => {
   });
 });
 
+describe("room governance projection", () => {
+  it("shows the authoritative owner and the owner/admin management matrix without colour-only cues", () => {
+    const root = document.createElement("main");
+    importedApp.renderRoomGovernanceProjection(root, {
+      governance: {
+        roomId: "room-1", projectId: "room-1", lifecycle: "active",
+        governanceRevision: 4, ownerActorId: "human-owner", archiveGeneration: 0,
+      },
+      memberships: [
+        { kind: "human", actorId: "human-owner", role: "member", joinedAt: "2026-08-18T00:00:00.000Z" },
+        { kind: "human", actorId: "human-admin", role: "admin", joinedAt: "2026-08-18T00:00:00.000Z" },
+        { kind: "human", actorId: "human-member", role: "member", joinedAt: "2026-08-18T00:00:00.000Z" },
+        { kind: "agent", actorId: "agent-1", participation: "active", toolPermissions: ["search"], configuredAt: "2026-08-18T00:00:00.000Z" },
+      ],
+      viewerActorId: "human-admin",
+    });
+
+    expect(root.querySelector("section")?.getAttribute("aria-label")).toBe("房间治理权限");
+    expect(root.querySelector("[aria-live='polite']")?.textContent).toContain("治理版本 4");
+    expect(root.querySelector("[data-actor-id='human-owner']")?.getAttribute("data-role")).toBe("owner");
+    expect(root.querySelector("[data-actor-id='human-owner']")?.getAttribute("data-manageable")).toBe("false");
+    expect(root.querySelector("[data-actor-id='human-admin']")?.getAttribute("data-manageable")).toBe("false");
+    expect(root.querySelector("[data-actor-id='human-member']")?.textContent).toContain("可管理");
+    expect(root.querySelector("[data-actor-id='agent-1']")?.textContent).toContain("可管理");
+  });
+
+  it("rejects a projection whose canonical owner is not a current Human member", () => {
+    const root = document.createElement("main");
+    expect(() => importedApp.renderRoomGovernanceProjection(root, {
+      governance: {
+        roomId: "room-1", projectId: "room-1", lifecycle: "active",
+        governanceRevision: 1, ownerActorId: "missing", archiveGeneration: 0,
+      },
+      memberships: [],
+      viewerActorId: "human-admin",
+    })).toThrow("owner projection is inconsistent");
+  });
+});
+
 describe("ephemeral Agent execution preview", () => {
   it("keeps ordered partial text non-authoritative and clears it without a typing animation", () => {
     const renderer = importedApp as RendererUnderTest;

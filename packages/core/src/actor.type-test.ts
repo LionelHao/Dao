@@ -1,4 +1,4 @@
-import type { AgentActor, HumanActor } from "./index.js";
+import type { AgentActor, HumanActor, RoomGovernanceView } from "./index.js";
 
 const human: HumanActor = {
   id: "human-lionel",
@@ -28,3 +28,16 @@ const invalidAgent: AgentActor = {
 };
 
 void invalidAgent;
+
+const governance: RoomGovernanceView<"room-1"> = {
+  roomId: "room-1", projectId: "room-1", lifecycle: "active",
+  governanceRevision: 1, ownerActorId: "human-1", archiveGeneration: 0,
+};
+void governance;
+
+const invalidProject: RoomGovernanceView<"room-1"> = {
+  ...governance,
+  // @ts-expect-error projectId is the same literal identity as roomId.
+  projectId: "project-2",
+};
+void invalidProject;

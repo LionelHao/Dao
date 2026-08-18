@@ -9,6 +9,33 @@ import {
 } from "./sync.js";
 
 describe("pure synchronization contracts", () => {
+  it("keeps governance delta and repair projections closed and room-bound", () => {
+    const governance = {
+      roomId: "room-1", projectId: "room-1", lifecycle: "active",
+      governanceRevision: 3, ownerActorId: "human-1", archiveGeneration: 0,
+    };
+    const page = {
+      type: "room.repair.page", requestId: "request-governance", snapshotId: "snapshot-1",
+      roomId: "room-1", page: 0, records: [{ kind: "governance", value: governance }],
+      watermark: 1, snapshotChecksum: "sha256:governance", hasMore: false,
+      mode: "streaming", idleExpiresAt: "2026-08-18T00:00:30.000Z",
+    };
+    expect(isRoomRepairPage(page)).toBe(true);
+    expect(isRoomRepairPage({ ...page, records: [{ kind: "governance", value: { ...governance, projectId: "project-2" } }] })).toBe(false);
+    const event = {
+      eventId: "event-governance", streamKind: "room", streamId: "room-1", streamSeq: 1,
+      roomId: "room-1", actorId: "human-1", occurredAt: "2026-08-18T00:00:00.000Z",
+      type: "room.governance.changed", payload: { governance },
+    };
+    const result = {
+      type: "room.sync.result", requestId: "request-governance", mode: "delta", events: [event],
+      nextCursor: { version: 1, roomId: "room-1", afterSeq: 1 }, watermark: 1, hasMore: false,
+    };
+    expect(isRoomSyncResult(result)).toBe(true);
+    expect(isRoomSyncResult({
+      ...result, events: [{ ...event, payload: { governance: { ...governance, roomId: "room-2", projectId: "room-2" } } }],
+    })).toBe(false);
+  });
   it("accepts only the dedicated human-preemption room event", () => {
     const event = {
       eventId: "human-preemption-1", streamKind: "room", streamId: "room-1", streamSeq: 1,

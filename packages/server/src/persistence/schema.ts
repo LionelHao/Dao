@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { MAX_ACTIVE_SESSION_FAMILIES } from "./contracts.js";
 
-export const AUTHORITY_SCHEMA_VERSION = 12 as const;
+export const AUTHORITY_SCHEMA_VERSION = 13 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -40,6 +40,8 @@ const V11_MIGRATION_CHECKSUM =
   "3ef3ca9216e684ec3d9e4097fe8a2e7148c75d5bb4b23ed7bf5a0eb5edc970a1";
 const V12_MIGRATION_CHECKSUM =
   "66276cc21f02f19f5e60758039acd43030ba8a9666b37c0fef65ad30852929fa";
+const V13_MIGRATION_CHECKSUM =
+  "0d008e577b5514d5fd51fa65c9c31ef51e32e55e09483c8a2e3a707d6ca42e3e";
 const SCHEMA_FINGERPRINTS = {
   1: "03f2bbba4aa7082ec01819824726ce1bd9b4bd14cebea71afc93c6821dbf405c",
   2: "01c37d92ec2f303613a7bb8b592ca846fbea7c829b3c81fe4521699db949dfcc",
@@ -53,6 +55,7 @@ const SCHEMA_FINGERPRINTS = {
   10: "7fd3399cc25e505de80d69adae24f7fc5a027de57cfb3e0b56df294e454c91fb",
   11: "83e48fc5a4b1b1c19863efd785ea098308d100c1899d638d2b5f95c5b0c119a6",
   12: "7232d27114e9acf32dcfbc2d59f3c3128eed10955de3cc2703ddeedf92892741",
+  13: "037df6a2818f2a90b7394240a4cf71d77949faf31df6534c5546c9ed6b7e7191",
 } as const;
 
 const V1_STATEMENTS = [
@@ -1055,6 +1058,109 @@ const V12_STATEMENTS = [
    END`,
 ] as const;
 
+const V13_STATEMENTS = [
+  `ALTER TABLE rooms ADD COLUMN owner_actor_id TEXT`,
+  `ALTER TABLE rooms ADD COLUMN governance_revision INTEGER NOT NULL DEFAULT 0
+   CHECK (governance_revision >= 0)`,
+  `ALTER TABLE rooms ADD COLUMN archive_generation INTEGER NOT NULL DEFAULT 0
+   CHECK (archive_generation >= 0)`,
+  `ALTER TABLE rooms ADD COLUMN archived_at TEXT`,
+  `UPDATE rooms
+   SET owner_actor_id = (
+     SELECT membership.actor_id
+     FROM room_memberships AS membership
+     WHERE membership.room_id = rooms.id
+       AND membership.kind = 'human'
+       AND membership.role = 'owner'
+   ),
+   archived_at = CASE WHEN status = 'archived' THEN created_at ELSE NULL END,
+   archive_generation = CASE WHEN status = 'archived' THEN 1 ELSE 0 END`,
+  `UPDATE room_memberships SET role = 'member'
+   WHERE kind = 'human' AND role = 'owner'`,
+  `UPDATE room_memberships
+   SET role = 'owner'
+   WHERE kind = 'human'
+     AND actor_id = (SELECT owner_actor_id FROM rooms WHERE id = room_memberships.room_id)`,
+  `CREATE UNIQUE INDEX room_memberships_v13_one_human_owner
+   ON room_memberships(room_id) WHERE kind = 'human' AND role = 'owner'`,
+  `CREATE TRIGGER room_memberships_v13_owner_role_insert
+   BEFORE INSERT ON room_memberships
+   WHEN NEW.role = 'owner' AND NEW.actor_id IS NOT (
+     SELECT owner_actor_id FROM rooms WHERE id = NEW.room_id
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'owner role is controlled by canonical room ownership');
+   END`,
+  `CREATE TRIGGER room_memberships_v13_owner_role_update
+   BEFORE UPDATE OF role ON room_memberships
+   WHEN (NEW.role = 'owner' AND NEW.actor_id IS NOT (
+          SELECT owner_actor_id FROM rooms WHERE id = NEW.room_id
+        ))
+      OR (OLD.actor_id = (SELECT owner_actor_id FROM rooms WHERE id = OLD.room_id)
+          AND NEW.role <> 'owner')
+   BEGIN
+     SELECT RAISE(ABORT, 'owner role is controlled by canonical room ownership');
+   END`,
+  `CREATE TRIGGER rooms_v13_owner_validate_update
+   BEFORE UPDATE OF owner_actor_id ON rooms
+   WHEN NEW.owner_actor_id IS NULL OR NOT EXISTS (
+     SELECT 1 FROM room_memberships AS membership
+     JOIN actors AS actor ON actor.id = membership.actor_id
+     WHERE membership.room_id = NEW.id
+       AND membership.actor_id = NEW.owner_actor_id
+       AND membership.kind = 'human'
+       AND actor.kind = 'human'
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'room owner must be a same-room Human member');
+   END`,
+  `CREATE TRIGGER rooms_v13_owner_role_sync
+   AFTER UPDATE OF owner_actor_id ON rooms
+   BEGIN
+     UPDATE room_memberships
+     SET role = CASE WHEN actor_id = NEW.owner_actor_id THEN 'owner' ELSE 'member' END
+     WHERE room_id = NEW.id AND kind = 'human'
+       AND (actor_id = NEW.owner_actor_id OR role = 'owner');
+   END`,
+  `CREATE TRIGGER room_memberships_v13_protect_owner_delete
+   BEFORE DELETE ON room_memberships
+   WHEN OLD.actor_id = (SELECT owner_actor_id FROM rooms WHERE id = OLD.room_id)
+   BEGIN
+     SELECT RAISE(ABORT, 'current room owner cannot be removed');
+   END`,
+  `CREATE TRIGGER room_memberships_v13_protect_owner_update
+   BEFORE UPDATE OF room_id, actor_id, kind ON room_memberships
+   WHEN OLD.actor_id = (SELECT owner_actor_id FROM rooms WHERE id = OLD.room_id)
+   BEGIN
+     SELECT RAISE(ABORT, 'current room owner membership cannot change identity');
+   END`,
+  `CREATE TABLE room_audit_v13 (
+    id TEXT PRIMARY KEY,
+    type TEXT NOT NULL CHECK (type IN (
+      'room.created', 'room.renamed', 'room.archived', 'room.human.invited',
+      'room.invitation.accepted', 'room.invitation.rejected',
+      'room.agent.configured', 'room.member.removed', 'room.member.role.changed',
+      'room.ownership.transferred'
+    )),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    actor_id TEXT NOT NULL REFERENCES actors(id),
+    result TEXT NOT NULL CHECK (result IN (
+      'created', 'renamed', 'archived', 'pending', 'accepted', 'rejected',
+      'configured', 'removed', 'role-changed', 'ownership-transferred'
+    )),
+    timestamp TEXT NOT NULL,
+    details_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(details_json))
+  ) STRICT`,
+  `INSERT INTO room_audit_v13
+   SELECT id, type, room_id, actor_id, result, timestamp, details_json FROM room_audit`,
+  `DROP TABLE room_audit`,
+  `ALTER TABLE room_audit_v13 RENAME TO room_audit`,
+  `CREATE TRIGGER room_audit_v13_immutable_update
+   BEFORE UPDATE ON room_audit BEGIN SELECT RAISE(ABORT, 'room audit is immutable'); END`,
+  `CREATE TRIGGER room_audit_v13_immutable_delete
+   BEFORE DELETE ON room_audit BEGIN SELECT RAISE(ABORT, 'room audit is immutable'); END`,
+] as const;
+
 const V2_STATEMENTS = [
   `ALTER TABLE actors
    ADD COLUMN catalog_revision INTEGER NOT NULL DEFAULT 0
@@ -1448,6 +1554,12 @@ const MIGRATIONS = [
     V12_STATEMENTS,
     V12_MIGRATION_CHECKSUM,
   ),
+  defineMigration(
+    13,
+    "room-governance-foundation",
+    V13_STATEMENTS,
+    V13_MIGRATION_CHECKSUM,
+  ),
 ] as const satisfies readonly Migration[];
 
 const V1_SCHEMA_CONTRACT = {
@@ -1761,6 +1873,14 @@ const V12_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V13_SCHEMA_CONTRACT = {
+  ...V12_SCHEMA_CONTRACT,
+  rooms: [
+    ...V12_SCHEMA_CONTRACT.rooms,
+    "owner_actor_id", "governance_revision", "archive_generation", "archived_at",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
@@ -1774,6 +1894,7 @@ const SCHEMA_CONTRACTS = {
   10: V10_SCHEMA_CONTRACT,
   11: V11_SCHEMA_CONTRACT,
   12: V12_SCHEMA_CONTRACT,
+  13: V13_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -2274,6 +2395,38 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
       "session families must remain human-owned, generation-backed, and terminally closed",
     );
   }
+  if (schemaVersion >= 13) {
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM rooms AS room
+       LEFT JOIN room_memberships AS membership
+         ON membership.room_id = room.id AND membership.actor_id = room.owner_actor_id
+       LEFT JOIN actors AS actor ON actor.id = membership.actor_id
+       WHERE room.owner_actor_id IS NULL
+          OR membership.actor_id IS NULL
+          OR membership.kind <> 'human'
+          OR actor.kind <> 'human'
+          OR membership.role <> 'owner'
+          OR room.governance_revision < 0
+          OR room.archive_generation < 0
+          OR (room.status = 'active' AND room.archived_at IS NOT NULL)
+          OR (room.status = 'archived' AND room.archived_at IS NULL)
+       LIMIT 1`,
+      "every room must have exactly one canonical same-room Human owner",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM room_memberships AS membership
+       WHERE (kind = 'human' AND role NOT IN ('owner', 'admin', 'member'))
+          OR (kind = 'agent' AND role IS NOT NULL)
+          OR (kind = 'human' AND role = 'owner' AND actor_id IS NOT (
+            SELECT owner_actor_id FROM rooms WHERE id = membership.room_id
+          ))
+       LIMIT 1`,
+      "v13 membership roles must keep Human governance separate from Agent participation",
+    );
+  }
 }
 
 function validateExistingSchema(database: DatabaseSync, currentVersion: number): void {
@@ -2369,6 +2522,29 @@ function assertV12SessionCapacity(database: DatabaseSync, now: number): void {
   }
 }
 
+function assertV13LegacyOwnership(database: DatabaseSync): void {
+  requireNoRows(
+    database,
+    `SELECT 1
+     FROM rooms AS room
+     WHERE (SELECT COUNT(*) FROM room_memberships AS membership
+            JOIN actors AS actor ON actor.id = membership.actor_id
+            WHERE membership.room_id = room.id
+              AND membership.kind = 'human'
+              AND actor.kind = 'human'
+              AND membership.role = 'owner') <> 1
+        OR EXISTS (
+          SELECT 1 FROM room_memberships AS membership
+          LEFT JOIN actors AS actor ON actor.id = membership.actor_id
+          WHERE membership.room_id = room.id
+            AND membership.role = 'owner'
+            AND (membership.kind <> 'human' OR actor.kind <> 'human')
+        )
+     LIMIT 1`,
+    "v13 migration requires exactly one same-room Human owner per room",
+  );
+}
+
 function migrateAuthorityDatabaseToVersion(
   database: DatabaseSync,
   targetVersion: number,
@@ -2407,6 +2583,9 @@ function migrateAuthorityDatabaseToVersion(
       }
       if (migration.version === 12) {
         assertV12SessionCapacity(database, Date.now());
+      }
+      if (migration.version === 13) {
+        assertV13LegacyOwnership(database);
       }
 
       for (const statement of migration.statements) {
@@ -2459,6 +2638,12 @@ export function migrateAuthorityDatabaseToPreviousVersionForTest(
   database: DatabaseSync,
 ): void {
   migrateAuthorityDatabaseToVersion(database, AUTHORITY_SCHEMA_VERSION - 1);
+}
+
+export function migrateAuthorityDatabaseToVersion11ForTest(
+  database: DatabaseSync,
+): void {
+  migrateAuthorityDatabaseToVersion(database, 11);
 }
 
 export function migrateAuthorityDatabaseToVersion10ForTest(

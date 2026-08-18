@@ -5,6 +5,7 @@ import type {
   Message,
   RoomSyncRequest,
   RoomSyncResult,
+  RoomGovernanceView,
 } from "@native-im/core";
 import type { RoomAuditRecord } from "../room-lifecycle.js";
 import type { InvitationSecretProtector } from "../invitation-secret-protector.js";
@@ -40,6 +41,7 @@ export interface SqliteAuthoritativeStore extends
     | "readHistory"
     | "readActor"
     | "readRoom"
+    | "readRoomGovernance"
     | "canAccessRoom"
     | "readRoomAudit"
     | "listPendingOutbox"
@@ -67,6 +69,10 @@ export interface SqliteAuthoritativeStore extends
   compactRoomStream(roomId: string, retainedFromSeq: number): Promise<void>;
   readActor(actorId: string): Promise<Actor | undefined>;
   readRoom(roomId: string): Promise<ManagedRoom | undefined>;
+  readRoomGovernance(
+    context: AuthenticatedSessionContext,
+    roomId: string,
+  ): Promise<RoomGovernanceView>;
   canAccessRoom(
     context: AuthenticatedSessionContext,
     roomId: string,
@@ -269,6 +275,13 @@ export function createSqliteAuthoritativeStore(
 
     readRoom(roomId: string): Promise<ManagedRoom | undefined> {
       return client.readRoom(roomId);
+    },
+
+    readRoomGovernance(
+      context: AuthenticatedSessionContext,
+      roomId: string,
+    ): Promise<RoomGovernanceView> {
+      return client.readRoomGovernance(context, roomId, clock());
     },
 
     canAccessRoom(
