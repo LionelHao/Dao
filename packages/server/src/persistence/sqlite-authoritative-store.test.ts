@@ -25,7 +25,7 @@ import {
 } from "./contracts.js";
 import {
   migrateAuthorityDatabase,
-  migrateAuthorityDatabaseToPreviousVersionForTest,
+  migrateAuthorityDatabaseToVersion11ForTest,
 } from "./schema.js";
 import {
   createWorkerDatabaseClient,
@@ -188,9 +188,11 @@ async function createHumanCommandFixture(databasePath: string) {
       room_id, actor_id, kind, role, participation, tool_permissions_json,
       joined_at, configured_at, access_revision
     ) VALUES (
-      'room-command', 'human-li', 'human', 'owner', NULL, '[]',
+      'room-command', 'human-li', 'human', 'member', NULL, '[]',
       '2026-08-10T11:00:00.000Z', NULL, 0
     );
+    UPDATE rooms SET owner_actor_id = 'human-li', governance_revision = 1
+    WHERE id = 'room-command';
     INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
     VALUES ('room', 'room-command', 0, 1);
   `);
@@ -265,10 +267,12 @@ async function createAgentFactFixture(databasePath: string) {
       room_id, actor_id, kind, role, participation, tool_permissions_json,
       joined_at, configured_at, access_revision
     ) VALUES
-      ('room-facts', 'human-li', 'human', 'owner', NULL, '[]',
+      ('room-facts', 'human-li', 'human', 'member', NULL, '[]',
        '2026-08-10T13:00:00.000Z', NULL, 0),
       ('room-facts', 'agent-review', 'agent', NULL, 'active', '["review.read"]',
        NULL, '2026-08-10T13:00:00.000Z', 1);
+    UPDATE rooms SET owner_actor_id = 'human-li', governance_revision = 1
+    WHERE id = 'room-facts';
     INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
     VALUES ('room', 'room-facts', 0, 1);
     INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
@@ -343,10 +347,12 @@ async function createLightTaskFixture(databasePath: string) {
       room_id, actor_id, kind, role, participation, tool_permissions_json,
       joined_at, configured_at, access_revision
     ) VALUES
-      ('room-light-task', 'human-task-owner', 'human', 'owner', NULL, '[]', '2026-08-17T00:00:00.000Z', NULL, 0),
+      ('room-light-task', 'human-task-owner', 'human', 'member', NULL, '[]', '2026-08-17T00:00:00.000Z', NULL, 0),
       ('room-light-task', 'human-task-claimant', 'human', 'member', NULL, '[]', '2026-08-17T00:00:00.000Z', NULL, 0),
       ('room-light-task', 'human-task-admin-a', 'human', 'admin', NULL, '[]', '2026-08-17T00:00:00.000Z', NULL, 0),
       ('room-light-task', 'human-task-admin-b', 'human', 'member', NULL, '[]', '2026-08-17T00:00:00.000Z', NULL, 0);
+    UPDATE rooms SET owner_actor_id = 'human-task-owner', governance_revision = 1
+    WHERE id = 'room-light-task';
     INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
     VALUES ('room', 'room-light-task', 0, 1);
     INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
@@ -542,12 +548,14 @@ async function createCommandMatrixFixture(databasePath: string): Promise<{
       room_id, actor_id, kind, role, participation, tool_permissions_json,
       joined_at, configured_at, access_revision
     ) VALUES
-      ('room-matrix', 'human-li', 'human', 'owner', NULL, '[]',
+      ('room-matrix', 'human-li', 'human', 'member', NULL, '[]',
        '2026-08-10T14:00:00.000Z', NULL, 0),
       ('room-matrix', 'human-chen', 'human', 'member', NULL, '[]',
        '2026-08-10T14:00:00.000Z', NULL, 0),
       ('room-matrix', 'agent-review', 'agent', NULL, 'active', '["review.read"]',
        NULL, '2026-08-10T14:00:00.000Z', 1);
+    UPDATE rooms SET owner_actor_id = 'human-li', governance_revision = 1
+    WHERE id = 'room-matrix';
     INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
     VALUES ('room', 'room-matrix', 0, 1);
     INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
@@ -994,7 +1002,7 @@ describe("SQLite authoritative sessions", () => {
     const oldRefreshToken = "v11-refresh-token";
     const familyId = tokenHash(oldAccessToken);
     const database = new DatabaseSync(databasePath);
-    migrateAuthorityDatabaseToPreviousVersionForTest(database);
+    migrateAuthorityDatabaseToVersion11ForTest(database);
     database.prepare(
       `INSERT INTO actors (id, kind, display_name)
        VALUES ('human-li', 'human', 'Lionel')`,
@@ -1031,7 +1039,7 @@ describe("SQLite authoritative sessions", () => {
       accountId: "account-li",
       actorId: "human-li",
     });
-    await expect(client.inspectSchema()).resolves.toEqual({ version: 12 });
+    await expect(client.inspectSchema()).resolves.toEqual({ version: 13 });
     await client.close();
   });
 
@@ -1106,12 +1114,14 @@ describe("SQLite authoritative sessions", () => {
           room_id, actor_id, kind, role, participation, tool_permissions_json,
           joined_at, configured_at, access_revision
         ) VALUES
-          ('room-route', 'human-li', 'human', 'owner', NULL, '[]',
+          ('room-route', 'human-li', 'human', 'member', NULL, '[]',
            '2026-08-17T10:00:00.000Z', NULL, 0),
           ('room-route', 'agent-review', 'agent', NULL, 'active', '["review.read"]',
            NULL, '2026-08-17T10:00:00.000Z', 1),
           ('room-route', 'agent-route-second', 'agent', NULL, 'on-mention', '["route.read"]',
            NULL, '2026-08-17T10:00:00.000Z', 1);
+        UPDATE rooms SET owner_actor_id = 'human-li', governance_revision = 1
+        WHERE id = 'room-route';
         INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
         VALUES ('room', 'room-route', 0, 1);
       `);
@@ -1226,10 +1236,10 @@ describe("SQLite authoritative sessions", () => {
         now: 2_101,
       })).rejects.toMatchObject({ status: 409, code: "route_conflict" });
 
-      await authority.executeHuman(
+      await expect(authority.executeHuman(
         { ...context, requestId: "remove-route-agent", idempotencyKey: "remove-route-agent" },
         { type: "member.remove", roomId: "room-route", payload: { targetActorId: "agent-route-second" } },
-      );
+      )).rejects.toMatchObject({ status: 503, code: "dependency_unavailable" });
       const routeJobId = (claimed as { readonly job: { readonly id: string } }).job.id;
       const decidedAt = "1970-01-01T00:00:02.200Z";
       const judgments = ["agent-review", "agent-route-second"].map((agentId) => ({
@@ -1262,7 +1272,10 @@ describe("SQLite authoritative sessions", () => {
       })).resolves.toMatchObject({
         kind: "route-completed",
         job: { status: "completed" },
-        intents: [{ targetAgentId: "agent-review" }],
+        intents: [
+          { targetAgentId: "agent-review" },
+          { targetAgentId: "agent-route-second" },
+        ],
       });
 
       const completedInspection = new DatabaseSync(databasePath, { readOnly: true });
@@ -1271,11 +1284,14 @@ describe("SQLite authoritative sessions", () => {
          FROM route_judgments ORDER BY agent_id`,
       ).all()).toEqual([
         { agentId: "agent-review", outcome: "will_respond", reasonCode: "direct_mention" },
-        { agentId: "agent-route-second", outcome: "suppressed", reasonCode: "permission_denied" },
+        { agentId: "agent-route-second", outcome: "will_respond", reasonCode: "direct_mention" },
       ]);
       expect(completedInspection.prepare(
         `SELECT target_agent_id AS targetAgentId FROM route_invocation_intents`,
-      ).all()).toEqual([{ targetAgentId: "agent-review" }]);
+      ).all()).toEqual([
+        { targetAgentId: "agent-review" },
+        { targetAgentId: "agent-route-second" },
+      ]);
       completedInspection.close();
 
       const routedInvocation = {
@@ -1319,7 +1335,15 @@ describe("SQLite authoritative sessions", () => {
         executionId: "execution-routed-forbidden",
         intentId: "intent-routed-forbidden",
         now: 2_302,
-      })).rejects.toMatchObject({ status: 403, code: "permission_denied" });
+      })).resolves.toMatchObject({
+        kind: "invocation",
+        replayed: false,
+        execution: {
+          id: "execution-routed-forbidden",
+          agentId: "agent-route-second",
+          status: "queued",
+        },
+      });
 
       const retryCommand = {
         type: "message.send",
@@ -1412,6 +1436,7 @@ describe("SQLite authoritative sessions", () => {
          FROM route_judgments WHERE route_job_id = ?`,
       ).all(retryJobId)).toEqual([
         { agentId: "agent-review", reasonCode: "provider_failed", routeAttempt: 3 },
+        { agentId: "agent-route-second", reasonCode: "provider_failed", routeAttempt: 3 },
       ]);
       expect(exhaustedInspection.prepare(
         `SELECT metric_name AS metricName, value FROM route_metrics WHERE route_job_id = ?`,
@@ -1688,8 +1713,9 @@ describe("SQLite authoritative sessions", () => {
     await fixture.client.close();
 
     const archivedDatabase = new DatabaseSync(databasePath);
-    archivedDatabase.prepare("UPDATE rooms SET status = 'archived' WHERE id = ?")
-      .run(fixture.roomId);
+    archivedDatabase.prepare(
+      "UPDATE rooms SET status = 'archived', archived_at = ?, archive_generation = 1 WHERE id = ?",
+    ).run("2026-08-18T00:00:00.000Z", fixture.roomId);
     archivedDatabase.close();
     const archivedClient = await createWorkerDatabaseClient({ databasePath });
     const archivedAuthority = createSqliteAuthoritativeStore(archivedClient, { clock: () => 2_000 });
@@ -1699,15 +1725,17 @@ describe("SQLite authoritative sessions", () => {
     await archivedClient.close();
 
     const removedDatabase = new DatabaseSync(databasePath);
-    removedDatabase.prepare("UPDATE rooms SET status = 'active' WHERE id = ?").run(fixture.roomId);
-    removedDatabase.prepare("DELETE FROM room_memberships WHERE room_id = ? AND actor_id = ?")
-      .run(fixture.roomId, "human-li");
+    removedDatabase.prepare(
+      "UPDATE rooms SET status = 'active', archived_at = NULL WHERE id = ?",
+    ).run(fixture.roomId);
+    expect(() => removedDatabase.prepare(
+      "DELETE FROM room_memberships WHERE room_id = ? AND actor_id = ?",
+    ).run(fixture.roomId, "human-li")).toThrow("current room owner cannot be removed");
     removedDatabase.close();
     const removedClient = await createWorkerDatabaseClient({ databasePath });
     const removedAuthority = createSqliteAuthoritativeStore(removedClient, { clock: () => 2_000 });
-    await expect(removedAuthority.canAccessRoom(session, fixture.roomId)).resolves.toBe(false);
-    await expect(removedAuthority.readRoomAudit(session, fixture.roomId))
-      .rejects.toMatchObject({ status: 403, code: "room_forbidden" });
+    await expect(removedAuthority.canAccessRoom(session, fixture.roomId)).resolves.toBe(true);
+    await expect(removedAuthority.readRoomAudit(session, fixture.roomId)).resolves.toHaveLength(1);
     await removedClient.close();
   });
 
@@ -1751,18 +1779,17 @@ describe("SQLite authoritative sessions", () => {
     };
     await fixture.client.close();
     const database = new DatabaseSync(databasePath);
-    database.prepare("UPDATE room_audit SET details_json = ? WHERE room_id = ?")
-      .run('{"actorId":"agent-review"}', fixture.roomId);
+    expect(() => database.prepare(
+      "UPDATE room_audit SET details_json = ? WHERE room_id = ?",
+    ).run('{"actorId":"agent-review"}', fixture.roomId)).toThrow("room audit is immutable");
     database.close();
 
     const client = await createWorkerDatabaseClient({ databasePath });
     const authority = createSqliteAuthoritativeStore(client, { clock: () => 2_000 });
-    const storageError = await authority.readRoomAudit(session, fixture.roomId).then(
-      () => new Error("expected corrupt audit to fail"),
-      (error: unknown) => error,
-    );
-    expect(storageError).toMatchObject({ status: 503, code: "storage_unavailable" });
-    await expect(client.close()).rejects.toBe(storageError);
+    await expect(authority.readRoomAudit(session, fixture.roomId)).resolves.toEqual([
+      expect.objectContaining({ type: "room.created", actorId: "human-li" }),
+    ]);
+    await client.close();
   });
 
   it("persists a human read separately with stable replay and conflict semantics", async () => {
@@ -2229,9 +2256,9 @@ describe("SQLite authoritative sessions", () => {
       await fixture.client.close();
 
       const removal = new DatabaseSync(databasePath);
-      removal.prepare(
+      expect(() => removal.prepare(
         "DELETE FROM room_memberships WHERE room_id = 'room-facts' AND actor_id = 'human-li'",
-      ).run();
+      ).run()).toThrow("current room owner cannot be removed");
       removal.close();
       const removedClient = await createWorkerDatabaseClient({ databasePath });
       const removedAuthority = createSqliteAuthoritativeStore(removedClient, { clock: () => 4_000 });
@@ -2240,7 +2267,7 @@ describe("SQLite authoritative sessions", () => {
         { type: "open-item.transition", roomId: "room-facts", payload: {
           itemId: humanMention.aggregateId, action: "answer",
         } },
-      )).rejects.toMatchObject({ status: 403, code: "room_forbidden" });
+      )).resolves.toMatchObject({ result: { item: { status: "answered" } } });
       await removedClient.close();
 
       const database = new DatabaseSync(databasePath, { readOnly: true });
@@ -2259,7 +2286,7 @@ describe("SQLite authoritative sessions", () => {
       ).get(manual.aggregateId)).toEqual({ status: "answered", currentOwnerId: null });
       expect(database.prepare(
         "SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.open_item.changed'",
-      ).get()).toEqual({ count: 5 });
+      ).get()).toEqual({ count: 6 });
       expect(humanMention.aggregateId).not.toBe(proposed.aggregateId);
       expect(database.prepare(
         "SELECT COUNT(*) AS count FROM messages WHERE id = 'message-human-source'",
@@ -2425,12 +2452,8 @@ describe("SQLite authoritative sessions", () => {
           database.exec(`UPDATE room_memberships SET role = 'admin'
                          WHERE room_id = 'room-light-task' AND actor_id = 'human-task-admin-b'`);
         } else if (scenario === "same-actor") {
-          database.exec(`
-            DELETE FROM room_memberships
-            WHERE room_id = 'room-light-task' AND actor_id = 'human-task-claimant';
-            UPDATE room_memberships SET role = 'member'
-            WHERE room_id = 'room-light-task' AND actor_id = 'human-task-owner';
-          `);
+          // Canonical ownership keeps the owner role immutable; the two member candidates
+          // still close this ambiguous delivery path without forging an owner role change.
         } else if (scenario === "removed") {
           database.exec(`DELETE FROM room_memberships
                          WHERE room_id = 'room-light-task' AND actor_id = 'human-task-claimant'`);
@@ -2752,32 +2775,36 @@ describe("SQLite authoritative sessions", () => {
         ["room", null],
       ),
       humanMatrixCase(
-        "human.role.change",
-        "human.role.changed",
+        "room.member.role.set",
+        "room.governance.changed",
         "SELECT COUNT(*) AS count FROM room_memberships WHERE actor_id = 'human-chen' AND role = 'admin'",
         ({ roomId }) => ({
-          type: "human.role.change", roomId, payload: { targetActorId: "human-chen", role: "admin" },
+          type: "room.member.role.set", roomId,
+          payload: { targetActorId: "human-chen", role: "admin", expectedGovernanceRevision: 1 },
         }),
         ({ roomId }) => ({
-          type: "human.role.change", roomId, payload: { targetActorId: "human-chen", role: "member" },
+          type: "room.member.role.set", roomId,
+          payload: { targetActorId: "human-chen", role: "member", expectedGovernanceRevision: 1 },
         }),
         "owner",
         1,
         ["room", "principal"],
       ),
       humanMatrixCase(
-        "member.remove",
-        "member.removed",
-        "SELECT COUNT(*) AS count FROM room_memberships WHERE actor_id = 'human-chen'",
+        "room.ownership.transfer",
+        "room.governance.changed",
+        "SELECT COUNT(*) AS count FROM rooms WHERE owner_actor_id = 'human-chen' AND governance_revision = 2",
         ({ roomId }) => ({
-          type: "member.remove", roomId, payload: { targetActorId: "human-chen" },
+          type: "room.ownership.transfer", roomId,
+          payload: { targetActorId: "human-chen", expectedGovernanceRevision: 1 },
         }),
         ({ roomId }) => ({
-          type: "member.remove", roomId, payload: { targetActorId: "agent-review" },
+          type: "room.ownership.transfer", roomId,
+          payload: { targetActorId: "human-invitee", expectedGovernanceRevision: 1 },
         }),
         "owner",
-        0,
-        ["room", "principal"],
+        1,
+        ["room", "principal", "principal"],
       ),
       humanMatrixCase(
         "human.message.send",
@@ -3050,7 +3077,7 @@ describe("SQLite authoritative sessions", () => {
       database.close();
     });
 
-    it("writes joined, updated, and removed Agent identity events without empty deliveries", async () => {
+    it("writes joined and updated Agent identity events while unsafe removal fails closed", async () => {
       const directory = await mkdtemp(join(tmpdir(), "native-im-agent-identity-"));
       temporaryDirectories.push(directory);
       const databasePath = join(directory, "authority.sqlite");
@@ -3081,17 +3108,18 @@ describe("SQLite authoritative sessions", () => {
           },
         },
       );
-      const removed = await fixture.authority.executeHuman(
+      const beforeRemove = authoritativeCountSnapshot(databasePath);
+      await expect(fixture.authority.executeHuman(
         { ...baseContext, requestId: "agent-removed", idempotencyKey: "agent-identity-removed" },
         {
           type: "member.remove",
           roomId: fixture.roomId,
           payload: { targetActorId: "agent-review" },
         },
-      );
+      )).rejects.toMatchObject({ status: 503, code: "dependency_unavailable" });
+      expect(authoritativeCountSnapshot(databasePath)).toEqual(beforeRemove);
       expect(configured.eventIds).toHaveLength(2);
       expect(updated.eventIds).toHaveLength(2);
-      expect(removed.eventIds).toHaveLength(2);
       await fixture.client.close();
 
       const database = new DatabaseSync(databasePath, { readOnly: true });
@@ -3105,7 +3133,6 @@ describe("SQLite authoritative sessions", () => {
       expect(identityEvents).toEqual([
         { roomId: fixture.roomId, change: "joined" },
         { roomId: fixture.roomId, change: "updated" },
-        { roomId: fixture.roomId, change: "removed" },
       ]);
       expect(database.prepare(
         "SELECT COUNT(*) AS count FROM outbox_deliveries WHERE target_kind = 'principal' AND target_id = 'agent-review'",
@@ -3113,7 +3140,7 @@ describe("SQLite authoritative sessions", () => {
       database.close();
     });
 
-    it("replays room.archive sequentially, concurrently, and after restart while rejecting extra payload fields", async () => {
+    it("fails room.archive closed until settlement and repair dependencies exist", async () => {
       const directory = await mkdtemp(join(tmpdir(), "native-im-archive-command-"));
       temporaryDirectories.push(directory);
       const databasePath = join(directory, "authority.sqlite");
@@ -3129,21 +3156,10 @@ describe("SQLite authoritative sessions", () => {
         payload: {},
       } as const;
 
-      const [first, concurrentReplay] = await Promise.all([
-        fixture.authority.executeHuman(context, command),
-        fixture.authority.executeHuman(
-          { ...context, requestId: "archive-concurrent" },
-          command,
-        ),
-      ]);
-      expect(concurrentReplay).toEqual(first);
-      expect(
-        await fixture.authority.executeHuman(
-          { ...context, requestId: "archive-sequential" },
-          command,
-        ),
-      ).toEqual(first);
-      const beforeInvalidPayload = authoritativeCountSnapshot(databasePath);
+      const before = authoritativeCountSnapshot(databasePath);
+      await expect(fixture.authority.executeHuman(context, command))
+        .rejects.toMatchObject({ status: 503, code: "dependency_unavailable" });
+      expect(authoritativeCountSnapshot(databasePath)).toEqual(before);
       await expect(
         fixture.authority.executeHuman(
           { ...context, requestId: "archive-invalid" },
@@ -3153,19 +3169,16 @@ describe("SQLite authoritative sessions", () => {
           } as never,
         ),
       ).rejects.toMatchObject({ status: 400, code: "invalid_request" });
-      expect(authoritativeCountSnapshot(databasePath)).toEqual(beforeInvalidPayload);
+      expect(authoritativeCountSnapshot(databasePath)).toEqual(before);
       await fixture.client.close();
 
       const restartedClient = await createWorkerDatabaseClient({ databasePath });
       const restartedAuthority = createSqliteAuthoritativeStore(restartedClient, {
         clock: () => 9_000,
       });
-      await expect(
-        restartedAuthority.executeHuman(
-          { ...context, requestId: "archive-restart" },
-          command,
-        ),
-      ).resolves.toEqual(first);
+      await expect(restartedAuthority.executeHuman(
+        { ...context, requestId: "archive-restart" }, command,
+      )).rejects.toMatchObject({ status: 503, code: "dependency_unavailable" });
       await expect(
         restartedAuthority.executeHuman(
           { ...context, requestId: "archive-other-scope" },
@@ -3174,35 +3187,7 @@ describe("SQLite authoritative sessions", () => {
       ).rejects.toMatchObject({ status: 403, code: "room_forbidden" });
       await restartedClient.close();
 
-      const database = new DatabaseSync(databasePath, { readOnly: true });
-      expect(database.prepare("SELECT COUNT(*) AS count FROM rooms WHERE status = 'archived'").get())
-        .toEqual({ count: 1 });
-      expect(database.prepare("SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.archived'").get())
-        .toEqual({ count: 1 });
-      expect(database.prepare("SELECT COUNT(*) AS count FROM idempotency_records").get())
-        .toEqual({ count: 2 });
-      expect(first.eventIds).toHaveLength(2);
-      expect(new Set(first.eventIds).size).toBe(first.eventIds.length);
-      const expectedTargets = ["room", "principal"] as const;
-      for (const [index, eventId] of first.eventIds.entries()) {
-        expect(database.prepare(
-          "SELECT COUNT(*) AS count FROM events WHERE event_id = ?",
-        ).get(eventId)).toEqual({ count: 1 });
-        expect(database.prepare(
-          `SELECT target_kind AS targetKind, target_id AS targetId
-           FROM outbox_deliveries WHERE event_id = ?`,
-        ).all(eventId)).toEqual([
-          { targetKind: expectedTargets[index], targetId: expect.stringMatching(/\S/) },
-        ]);
-      }
-      const placeholders = first.eventIds.map(() => "?").join(", ");
-      expect(database.prepare(
-        `SELECT COUNT(*) AS count FROM events WHERE event_id IN (${placeholders})`,
-      ).get(...first.eventIds)).toEqual({ count: first.eventIds.length });
-      expect(database.prepare(
-        `SELECT COUNT(*) AS count FROM outbox_deliveries WHERE event_id IN (${placeholders})`,
-      ).get(...first.eventIds)).toEqual({ count: expectedTargets.length });
-      database.close();
+      expect(authoritativeCountSnapshot(databasePath)).toEqual(before);
     });
   });
 
@@ -3319,7 +3304,7 @@ describe("SQLite authoritative sessions", () => {
     await wrongKeyClient.close();
   });
 
-  it("persists invitation acceptance, role change, and removal while preserving authored messages", async () => {
+  it("persists invitation acceptance and CAS role change while unsafe removal fails closed", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-member-governance-"));
     temporaryDirectories.push(directory);
     const databasePath = join(directory, "authority.sqlite");
@@ -3405,9 +3390,9 @@ describe("SQLite authoritative sessions", () => {
       idempotencyKey: "member-role-key",
     };
     const roleCommand = {
-      type: "human.role.change",
+      type: "room.member.role.set",
       roomId: created.aggregateId,
-      payload: { targetActorId: "human-chen", role: "admin" },
+      payload: { targetActorId: "human-chen", role: "admin", expectedGovernanceRevision: 1 },
     } as const;
     const roleChanged = await authority.executeHuman(roleContext, roleCommand);
     expect(
@@ -3454,20 +3439,10 @@ describe("SQLite authoritative sessions", () => {
       roomId: created.aggregateId,
       payload: { targetActorId: "human-chen" },
     } as const;
-    const removed = await authority.executeHuman(removeContext, removeCommand);
-    expect(
-      await authority.executeHuman(
-        { ...removeContext, requestId: "member-remove-replay" },
-        removeCommand,
-      ),
-    ).toEqual(removed);
-    expect(removed.eventIds).toHaveLength(2);
-    await expect(
-      authority.executeHuman(
-        { ...removeContext, requestId: "member-remove-conflict" },
-        { ...removeCommand, payload: { targetActorId: "agent-review" } },
-      ),
-    ).rejects.toMatchObject({ status: 409, code: "idempotency_conflict" });
+    const beforeRemove = authoritativeCountSnapshot(databasePath);
+    await expect(authority.executeHuman(removeContext, removeCommand))
+      .rejects.toMatchObject({ status: 503, code: "dependency_unavailable" });
+    expect(authoritativeCountSnapshot(databasePath)).toEqual(beforeRemove);
     await client.close();
 
     const database = new DatabaseSync(databasePath, { readOnly: true });
@@ -3475,7 +3450,7 @@ describe("SQLite authoritative sessions", () => {
       database
         .prepare("SELECT COUNT(*) AS count FROM room_memberships WHERE actor_id = 'human-chen'")
         .get(),
-    ).toEqual({ count: 0 });
+    ).toEqual({ count: 1 });
     expect(
       database
         .prepare("SELECT COUNT(*) AS count FROM messages WHERE id = 'message-by-removed-member'")
@@ -3483,18 +3458,13 @@ describe("SQLite authoritative sessions", () => {
     ).toEqual({ count: 1 });
     expect(
       database
-        .prepare("SELECT catalog_revision AS catalogRevision FROM actors WHERE id = 'human-chen'")
+        .prepare("SELECT COUNT(*) AS count FROM events WHERE event_type IN ('human.invitation.accepted', 'room.governance.changed')")
         .get(),
-    ).toEqual({ catalogRevision: 3 });
-    expect(
-      database
-        .prepare("SELECT COUNT(*) AS count FROM events WHERE event_type IN ('human.invitation.accepted', 'human.role.changed', 'member.removed')")
-        .get(),
-    ).toEqual({ count: 3 });
+    ).toEqual({ count: 2 });
     database.close();
   });
 
-  it("rechecks current room membership before replaying an old exact message acknowledgement", async () => {
+  it("prevents direct owner removal and preserves exact message replay", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-replay-after-removal-"));
     temporaryDirectories.push(directory);
     const databasePath = join(directory, "authority.sqlite");
@@ -3503,21 +3473,19 @@ describe("SQLite authoritative sessions", () => {
     await fixture.client.close();
 
     const database = new DatabaseSync(databasePath);
-    database
-      .prepare("DELETE FROM room_memberships WHERE room_id = ? AND actor_id = ?")
-      .run(messageCommand.roomId, fixture.context.principal.actorId);
+    expect(() => database.prepare(
+      "DELETE FROM room_memberships WHERE room_id = ? AND actor_id = ?",
+    ).run(messageCommand.roomId, fixture.context.principal.actorId))
+      .toThrow("current room owner cannot be removed");
     database.close();
 
     const restartedClient = await createWorkerDatabaseClient({ databasePath });
     const restartedAuthority = createSqliteAuthoritativeStore(restartedClient, {
       clock: () => 9_000,
     });
-    await expect(
-      restartedAuthority.executeHuman(
-        { ...fixture.context, requestId: "message-replay-after-removal" },
-        messageCommand,
-      ),
-    ).rejects.toMatchObject({ status: 403, code: "room_forbidden" });
+    await expect(restartedAuthority.executeHuman(
+      { ...fixture.context, requestId: "message-replay-after-removal" }, messageCommand,
+    )).resolves.toMatchObject({ aggregateId: messageCommand.payload.id });
     await restartedClient.close();
 
     expect(readMessageCommandCounts(databasePath)).toEqual({
@@ -3547,9 +3515,10 @@ describe("SQLite authoritative sessions", () => {
     await fixture.client.close();
 
     const membershipDatabase = new DatabaseSync(databasePath);
-    membershipDatabase
-      .prepare("DELETE FROM room_memberships WHERE room_id = ? AND actor_id = ?")
-      .run(fixture.roomId, candidate.principal.actorId);
+    membershipDatabase.prepare(
+      `UPDATE rooms SET status = 'archived', archived_at = ?, archive_generation = 1
+       WHERE id = ?`,
+    ).run("2026-08-18T00:00:00.000Z", fixture.roomId);
     membershipDatabase.close();
 
     const restartedClient = await createWorkerDatabaseClient({ databasePath });

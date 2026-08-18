@@ -39,6 +39,7 @@ import {
   readHistoryDatabaseQuery,
   readRoomAuditDatabaseQuery,
   readRoomDatabaseQuery,
+  readRoomGovernanceDatabaseQuery,
   repairMutationImpactDatabaseQuery,
   revalidateSnapshotDatabaseQuery,
   runAuthorityImmediateTransaction,
@@ -1773,6 +1774,24 @@ function readRoom(request: AuthorityWorkerRequest): void {
   }
 }
 
+function readRoomGovernance(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.read-room-governance") {
+    throw new TypeError("readRoomGovernance received the wrong request type");
+  }
+  try {
+    const governance = readRoomGovernanceDatabaseQuery(
+      requireAuthorityDatabase(), request.context, request.roomId, request.now,
+    );
+    respond({ type: "authority.room-governance", requestId: request.requestId, governance });
+  } catch (error: unknown) {
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithError(request.requestId, "storage_unavailable", "Authority governance query failed");
+  }
+}
+
 function canAccessRoom(request: AuthorityWorkerRequest): void {
   if (request.type !== "authority.can-access-room") {
     throw new TypeError("canAccessRoom received the wrong request type");
@@ -2078,6 +2097,9 @@ async function dispatch(value: unknown): Promise<void> {
       return;
     case "authority.read-room":
       readRoom(value);
+      return;
+    case "authority.read-room-governance":
+      readRoomGovernance(value);
       return;
     case "authority.can-access-room":
       canAccessRoom(value);

@@ -321,6 +321,32 @@ export class AuthorityRollbackFatalError extends AggregateError {
   }
 }
 
+function assertCommittedRoomOwnership(database: DatabaseSync): void {
+  const hasCanonicalOwner = database
+    .prepare("SELECT 1 AS present FROM pragma_table_info('rooms') WHERE name = 'owner_actor_id'")
+    .get()?.present === 1;
+  if (!hasCanonicalOwner) return;
+  const invalid = database.prepare(
+    `SELECT room.id
+     FROM rooms AS room
+     LEFT JOIN room_memberships AS owner
+       ON owner.room_id = room.id
+      AND owner.actor_id = room.owner_actor_id
+      AND owner.kind = 'human'
+      AND owner.role = 'owner'
+     WHERE room.owner_actor_id IS NULL
+        OR owner.actor_id IS NULL
+        OR (SELECT COUNT(*) FROM room_memberships AS legacy_owner
+            WHERE legacy_owner.room_id = room.id
+              AND legacy_owner.kind = 'human'
+              AND legacy_owner.role = 'owner') <> 1
+     LIMIT 1`,
+  ).get();
+  if (invalid !== undefined) {
+    return fail("storage_unavailable", "Authority room ownership invariant was violated");
+  }
+}
+
 export function runAuthorityImmediateTransaction<Result>(
   database: DatabaseSync,
   operation: () => Result,
@@ -329,6 +355,7 @@ export function runAuthorityImmediateTransaction<Result>(
   database.exec("BEGIN IMMEDIATE");
   try {
     const result = operation();
+    assertCommittedRoomOwnership(database);
     beforeCommit?.();
     database.exec("COMMIT");
     return result;
@@ -1022,6 +1049,17 @@ export function readRoomDatabaseQuery(
     : fail("storage_unavailable", "Authority room is corrupt");
 }
 
+export function readRoomGovernanceDatabaseQuery(
+  database: DatabaseSync,
+  context: AuthenticatedSessionContext,
+  roomId: string,
+  now: number,
+): import("@native-im/core").RoomGovernanceView {
+  const actorId = requireHumanSession(database, context, now);
+  requireRoomMembership(database, actorId, roomId);
+  return readGovernanceView(database, roomId);
+}
+
 export function canAccessRoomDatabaseQuery(
   database: DatabaseSync,
   context: AuthenticatedSessionContext,
@@ -1356,7 +1394,8 @@ function requireRoomManager(
 ): { readonly roomStatus: string; readonly role: string } {
   const membership = database
     .prepare(
-      `SELECT room.status AS roomStatus, membership.role
+      `SELECT room.status AS roomStatus, membership.role,
+              room.owner_actor_id = membership.actor_id AS isOwner
        FROM room_memberships AS membership
        JOIN rooms AS room ON room.id = membership.room_id
        WHERE membership.room_id = ?
@@ -1366,11 +1405,11 @@ function requireRoomManager(
     .get(roomId, actorId);
   if (
     typeof membership?.roomStatus !== "string" ||
-    (membership.role !== "owner" && membership.role !== "admin")
+    (membership.isOwner !== 1 && membership.role !== "admin")
   ) {
     return fail("room_forbidden", "Authority room governance was rejected");
   }
-  return { roomStatus: membership.roomStatus, role: membership.role };
+  return { roomStatus: membership.roomStatus, role: membership.isOwner === 1 ? "owner" : "admin" };
 }
 
 function requireRoomOwner(
@@ -1408,7 +1447,7 @@ function invitationByToken(
 function readManagedRoom(database: DatabaseSync, roomId: string): JsonValue {
   const row = database
     .prepare(
-      `SELECT id, name, status, created_at AS createdAt
+      `SELECT id, name, status, created_at AS createdAt, owner_actor_id AS ownerActorId
        FROM rooms WHERE id = ?`,
     )
     .get(roomId);
@@ -1439,7 +1478,7 @@ function readManagedRoom(database: DatabaseSync, roomId: string): JsonValue {
         return {
           kind: "human",
           actorId: member.actorId,
-          role: member.role,
+          role: member.actorId === row.ownerActorId ? "owner" : member.role,
           joinedAt: member.joinedAt,
         };
       }
@@ -1475,6 +1514,29 @@ function readManagedRoom(database: DatabaseSync, roomId: string): JsonValue {
     status: row.status,
     members,
     createdAt: row.createdAt,
+  };
+}
+
+function readGovernanceView(database: DatabaseSync, roomId: string): import("@native-im/core").RoomGovernanceView {
+  const row = database.prepare(
+    `SELECT id, status, owner_actor_id AS ownerActorId,
+            governance_revision AS governanceRevision,
+            archive_generation AS archiveGeneration, archived_at AS archivedAt
+     FROM rooms WHERE id = ?`,
+  ).get(roomId);
+  if (typeof row?.id !== "string" || (row.status !== "active" && row.status !== "archived") ||
+    typeof row.ownerActorId !== "string" || typeof row.governanceRevision !== "number" ||
+    typeof row.archiveGeneration !== "number") {
+    return fail("room_not_found", "Authority room governance was not found");
+  }
+  return {
+    roomId: row.id,
+    projectId: row.id,
+    lifecycle: row.status,
+    governanceRevision: row.governanceRevision,
+    ownerActorId: row.ownerActorId,
+    archiveGeneration: row.archiveGeneration,
+    ...(row.status === "archived" && typeof row.archivedAt === "string" ? { archivedAt: row.archivedAt } : {}),
   };
 }
 
@@ -1667,9 +1729,12 @@ function executeRoomCreate(
       `INSERT INTO room_memberships (
          room_id, actor_id, kind, role, participation, tool_permissions_json,
          joined_at, configured_at, access_revision
-       ) VALUES (?, ?, 'human', 'owner', NULL, '[]', ?, NULL, 0)`,
+       ) VALUES (?, ?, 'human', 'member', NULL, '[]', ?, NULL, 0)`,
     )
     .run(roomId, actorId, acceptedAt);
+  database.prepare(
+    `UPDATE rooms SET owner_actor_id = ?, governance_revision = 1 WHERE id = ?`,
+  ).run(actorId, roomId);
   database
     .prepare(
       `INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
@@ -1792,9 +1857,7 @@ function executeRenameOrArchive(
       command.roomId,
     );
   } else {
-    database.prepare("UPDATE rooms SET status = 'archived' WHERE id = ?").run(
-      command.roomId,
-    );
+    return fail("dependency_unavailable", "Archive settlement and repair dependencies are unavailable");
   }
   const eventType = command.type === "room.rename" ? "room.renamed" : "room.archived";
   const auditType = eventType;
@@ -2234,18 +2297,107 @@ function executeInvitationDecision(
   };
 }
 
-function executeHumanRoleChange(
+function requireGovernanceRevision(
+  database: DatabaseSync,
+  roomId: string,
+  expectedGovernanceRevision: number,
+): void {
+  const row = database.prepare(
+    "SELECT governance_revision AS governanceRevision FROM rooms WHERE id = ?",
+  ).get(roomId);
+  if (typeof row?.governanceRevision !== "number") {
+    return fail("room_not_found", "Authority room was not found");
+  }
+  if (row.governanceRevision !== expectedGovernanceRevision) {
+    return fail("room_revision_conflict", "Room governance revision is stale");
+  }
+}
+
+function executeOwnershipTransfer(
   database: DatabaseSync,
   actorId: string,
-  command: Extract<RoomGovernanceCommand, { readonly type: "human.role.change" }>,
+  command: Extract<RoomGovernanceCommand, { readonly type: "room.ownership.transfer" }>,
   acceptedAt: string,
   scope: string,
   key: string,
 ): CommandAcknowledgement {
   const owner = requireRoomOwner(database, actorId, command.roomId);
+  if (owner.roomStatus !== "active") return fail("dependency_unavailable", "Archived ownership transfer is not available in FT-02A");
+  requireGovernanceRevision(database, command.roomId, command.payload.expectedGovernanceRevision);
+  if (command.payload.targetActorId === actorId) {
+    return fail("role_forbidden", "Ownership target must be another current Human member");
+  }
+  const target = database.prepare(
+    `SELECT joined_at AS joinedAt FROM room_memberships
+     WHERE room_id = ? AND actor_id = ? AND kind = 'human'`,
+  ).get(command.roomId, command.payload.targetActorId);
+  if (typeof target?.joinedAt !== "string") return fail("member_not_found", "Ownership target was not found");
+  database.prepare(
+    `UPDATE room_memberships SET role = 'member', access_revision = access_revision + 1
+     WHERE room_id = ? AND actor_id = ?`,
+  ).run(command.roomId, command.payload.targetActorId);
+  database.prepare(
+    `UPDATE room_memberships SET access_revision = access_revision + 1
+     WHERE room_id = ? AND actor_id = ?`,
+  ).run(command.roomId, actorId);
+  database.prepare(
+    `UPDATE rooms SET owner_actor_id = ?, governance_revision = governance_revision + 1
+     WHERE id = ? AND governance_revision = ?`,
+  ).run(command.payload.targetActorId, command.roomId, command.payload.expectedGovernanceRevision);
+  const governance = readGovernanceView(database, command.roomId);
+  database.prepare(
+    `INSERT INTO room_audit (id, type, room_id, actor_id, result, timestamp, details_json)
+     VALUES (?, 'room.ownership.transferred', ?, ?, 'ownership-transferred', ?, ?)`,
+  ).run(stableId("audit", scope, key), command.roomId, actorId, acceptedAt, canonicalJson({
+    previousOwnerActorId: actorId,
+    targetActorId: command.payload.targetActorId,
+    previousGovernanceRevision: command.payload.expectedGovernanceRevision,
+    governanceRevision: governance.governanceRevision,
+  }));
+  const eventId = stableId("event", scope, key, "0");
+  const streamSeq = appendRoomEvent(database, {
+    eventId, roomId: command.roomId, actorId, eventType: "room.governance.changed",
+    occurredAt: acceptedAt, payload: { governance: governance as unknown as JsonValue },
+  });
+  appendRoomOutbox(database, eventId, command.roomId, streamSeq, acceptedAt, scope, key);
+  const eventIds = [eventId];
+  for (const [index, principalId] of [actorId, command.payload.targetActorId].entries()) {
+    database.prepare("UPDATE actors SET catalog_revision = catalog_revision + 1 WHERE id = ?").run(principalId);
+    const identityEventId = stableId("event", scope, key, String(index + 1));
+    const identitySeq = appendCanonicalIdentityEvent(database, {
+      eventId: identityEventId, principalId, eventType: "identity.room-access.changed",
+      occurredAt: acceptedAt, payload: { roomId: command.roomId, change: "updated" },
+    });
+    appendPrincipalOutbox(database, identityEventId, principalId, identitySeq, acceptedAt, scope, key);
+    eventIds.push(identityEventId);
+  }
+  return {
+    aggregateId: command.roomId, eventIds, acceptedAt,
+    result: {
+      governance: governance as unknown as JsonValue,
+      previousOwnerActorId: actorId,
+      room: readManagedRoom(database, command.roomId),
+    },
+  };
+}
+
+function executeHumanRoleChange(
+  database: DatabaseSync,
+  actorId: string,
+  command: Extract<RoomGovernanceCommand, { readonly type: "room.member.role.set" }>,
+  acceptedAt: string,
+  scope: string,
+  key: string,
+): CommandAcknowledgement {
+  const manager = requireRoomManager(database, actorId, command.roomId);
+  if (manager.role !== "owner") {
+    return fail("role_forbidden", "Admin cannot change a peer governance role");
+  }
+  const owner = { roomStatus: manager.roomStatus };
   if (owner.roomStatus !== "active") {
     return fail("room_archived", "Authority room is archived");
   }
+  requireGovernanceRevision(database, command.roomId, command.payload.expectedGovernanceRevision);
   const target = database
     .prepare(
       `SELECT kind, role, joined_at AS joinedAt
@@ -2255,8 +2407,9 @@ function executeHumanRoleChange(
   if (target?.kind !== "human" || typeof target.joinedAt !== "string") {
     return fail("room_member_not_found", "Authority human member was not found");
   }
-  if (target.role === "owner") {
-    return fail("room_owner_required", "Authority room owner cannot be reassigned");
+  const governance = readGovernanceView(database, command.roomId);
+  if (command.payload.targetActorId === governance.ownerActorId) {
+    return fail("role_forbidden", "Authority room owner cannot be changed by role-set");
   }
   database
     .prepare(
@@ -2265,6 +2418,10 @@ function executeHumanRoleChange(
        WHERE room_id = ? AND actor_id = ?`,
     )
     .run(command.payload.role, command.roomId, command.payload.targetActorId);
+  database.prepare(
+    `UPDATE rooms SET governance_revision = governance_revision + 1
+     WHERE id = ? AND governance_revision = ?`,
+  ).run(command.roomId, command.payload.expectedGovernanceRevision);
   database
     .prepare("UPDATE actors SET catalog_revision = catalog_revision + 1 WHERE id = ?")
     .run(command.payload.targetActorId);
@@ -2295,9 +2452,11 @@ function executeHumanRoleChange(
     eventId: roomEventId,
     roomId: command.roomId,
     actorId,
-    eventType: "human.role.changed",
+    eventType: "room.governance.changed",
     occurredAt: acceptedAt,
-    payload: { membership },
+    payload: {
+      governance: readGovernanceView(database, command.roomId) as unknown as JsonValue,
+    },
   });
   appendRoomOutbox(database, roomEventId, command.roomId, roomSeq, acceptedAt, scope, key);
   const identityEventId = stableId("event", scope, key, "1");
@@ -2321,7 +2480,11 @@ function executeHumanRoleChange(
     aggregateId: command.roomId,
     eventIds: [roomEventId, identityEventId],
     acceptedAt,
-    result: { room: readManagedRoom(database, command.roomId) },
+    result: {
+      room: readManagedRoom(database, command.roomId),
+      governance: readGovernanceView(database, command.roomId) as unknown as JsonValue,
+      membership,
+    },
   };
 }
 
@@ -2329,9 +2492,6 @@ function executeMemberRemove(
   database: DatabaseSync,
   actorId: string,
   command: Extract<RoomGovernanceCommand, { readonly type: "member.remove" }>,
-  acceptedAt: string,
-  scope: string,
-  key: string,
 ): CommandAcknowledgement {
   const manager = requireRoomManager(database, actorId, command.roomId);
   if (manager.roomStatus !== "active") {
@@ -2347,68 +2507,31 @@ function executeMemberRemove(
     return fail("room_member_not_found", "Authority room member was not found");
   }
   if (target.kind === "human" && target.role === "owner") {
-    return fail("room_owner_required", "Authority room owner cannot be removed");
+    return fail("ownership_transfer_required", "Room owner must transfer ownership before removal");
   }
-  database
-    .prepare("DELETE FROM room_memberships WHERE room_id = ? AND actor_id = ?")
-    .run(command.roomId, command.payload.targetActorId);
-  if (target.kind === "human") {
-    database
-      .prepare("UPDATE actors SET catalog_revision = catalog_revision + 1 WHERE id = ?")
-      .run(command.payload.targetActorId);
+  const governance = readGovernanceView(database, command.roomId);
+  if (target.kind === "human" && command.payload.targetActorId === governance.ownerActorId) {
+    return fail("ownership_transfer_required", "Room owner must transfer ownership before removal");
   }
-  database
-    .prepare(
-      `INSERT INTO room_audit (
-         id, type, room_id, actor_id, result, timestamp, details_json
-       ) VALUES (?, 'room.member.removed', ?, ?, 'removed', ?, ?)`,
-    )
-    .run(
-      stableId("audit", scope, key),
-      command.roomId,
-      actorId,
-      acceptedAt,
-      canonicalJson({ targetActorId: command.payload.targetActorId }),
+  if (manager.role === "admin" && target.kind === "human" && target.role === "admin") {
+    return fail("role_forbidden", "Admin cannot remove a peer admin");
+  }
+  return fail("dependency_unavailable", "Departure responsibility cleanup is unavailable");
+}
+
+function executeMemberLeave(
+  database: DatabaseSync,
+  actorId: string,
+  command: Extract<RoomGovernanceCommand, { readonly type: "room.member.leave" }>,
+): CommandAcknowledgement {
+  const governance = readGovernanceView(database, command.roomId);
+  if (governance.ownerActorId === actorId) {
+    return fail(
+      "ownership_transfer_required",
+      "Room owner must transfer ownership before leaving",
     );
-  const roomEventId = stableId("event", scope, key, "0");
-  const roomSeq = appendRoomEvent(database, {
-    eventId: roomEventId,
-    roomId: command.roomId,
-    actorId,
-    eventType: "member.removed",
-    occurredAt: acceptedAt,
-    payload: { targetActorId: command.payload.targetActorId },
-  });
-  appendRoomOutbox(database, roomEventId, command.roomId, roomSeq, acceptedAt, scope, key);
-  const eventIds = [roomEventId];
-  {
-    const identityEventId = stableId("event", scope, key, "1");
-    const identitySeq = appendCanonicalIdentityEvent(database, {
-      eventId: identityEventId,
-      principalId: command.payload.targetActorId,
-      eventType: "identity.room-access.changed",
-      occurredAt: acceptedAt,
-      payload: { roomId: command.roomId, change: "removed" },
-    });
-    if (target.kind === "human") {
-      appendPrincipalOutbox(
-        database,
-        identityEventId,
-        command.payload.targetActorId,
-        identitySeq,
-        acceptedAt,
-        scope,
-        key,
-      );
-    }
-    eventIds.push(identityEventId);
   }
-  return {
-    aggregateId: command.roomId,
-    eventIds,
-    acceptedAt,
-    result: { room: readManagedRoom(database, command.roomId) },
-  };
+  return fail("dependency_unavailable", "Departure responsibility cleanup is unavailable");
 }
 
 function executeMessageSend(
@@ -2810,7 +2933,8 @@ function currentHumanRoomRole(
   actorId: string,
 ): LightTask["verifierRole"] | undefined {
   const membership = database.prepare(
-    `SELECT membership.role, room.status AS roomStatus
+    `SELECT membership.role, room.status AS roomStatus,
+            room.owner_actor_id = membership.actor_id AS isOwner
      FROM room_memberships AS membership
      JOIN rooms AS room ON room.id = membership.room_id
      WHERE membership.room_id = ? AND membership.actor_id = ? AND membership.kind = 'human'`,
@@ -2820,7 +2944,7 @@ function currentHumanRoomRole(
        membership.role !== "member")) {
     return undefined;
   }
-  return membership.role;
+  return membership.isOwner === 1 ? "owner" : membership.role;
 }
 
 function appendLightTaskChanged(
@@ -2944,9 +3068,11 @@ function executeLightTaskTransition(
        JOIN actors AS actor ON actor.id = membership.actor_id
        JOIN rooms AS room ON room.id = membership.room_id
        WHERE membership.room_id = ? AND membership.kind = 'human'
-         AND membership.role = ? AND actor.kind = 'human' AND room.status = 'active'
+         AND ((? = 'owner' AND membership.actor_id = room.owner_actor_id)
+           OR (? <> 'owner' AND membership.role = ?))
+         AND actor.kind = 'human' AND room.status = 'active'
        ORDER BY membership.actor_id`,
-    ).all(command.roomId, current.verifierRole);
+    ).all(command.roomId, current.verifierRole, current.verifierRole, current.verifierRole);
     if (candidates.length !== 1 || typeof candidates[0]?.actorId !== "string" ||
         candidates[0].actorId === current.claimant) {
       return fail("execution_conflict", "Authority light task verifier is not uniquely resolvable");
@@ -3432,13 +3558,22 @@ function recheckHumanCommandAuthority(
     }
     return;
   }
+  if (command.type === "room.member.role.set" || command.type === "room.ownership.transfer") {
+    requireRoomMembership(database, actorId, command.roomId);
+    return;
+  }
   if (command.type === "human.role.change") {
     requireRoomOwner(database, actorId, command.roomId);
+    return;
+  }
+  if (command.type === "room.member.leave") {
+    requireRoomMembership(database, actorId, command.roomId);
     return;
   }
   if (
     command.type === "room.rename" ||
     command.type === "room.archive" ||
+    command.type === "room.reopen" ||
     command.type === "human.invitation.issue" ||
     command.type === "agent.configure" ||
     command.type === "member.remove"
@@ -3841,13 +3976,14 @@ function requireRuntimeHumanAuthority(
 ): void {
   const actorId = requireHumanSession(database, context, now);
   const membership = database.prepare(
-    `SELECT membership.role, room.status AS roomStatus
+    `SELECT membership.role, room.status AS roomStatus,
+            room.owner_actor_id = membership.actor_id AS isOwner
      FROM room_memberships AS membership
      JOIN rooms AS room ON room.id = membership.room_id
      WHERE membership.room_id = ? AND membership.actor_id = ? AND membership.kind = 'human'`,
   ).get(execution.roomId, actorId);
   if (membership?.roomStatus !== "active" ||
-      (actorId !== execution.requesterId && membership.role !== "owner" && membership.role !== "admin")) {
+      (actorId !== execution.requesterId && membership.isOwner !== 1 && membership.role !== "admin")) {
     return fail("permission_denied", "Agent execution control was forbidden");
   }
 }
@@ -5121,6 +5257,7 @@ export function executeRuntimeAuthorityOperation(
       }
       const authority = database.prepare(
         `SELECT membership.role, room.status AS roomStatus,
+                room.owner_actor_id = membership.actor_id AS isOwner,
                 confirmation.human_principal_id AS confirmationPrincipalId,
                 dispatch.dispatch_id AS oldDispatchId, dispatch.tool_id AS toolId,
                 dispatch.parameter_sha256 AS parameterSha256,
@@ -5146,7 +5283,7 @@ export function executeRuntimeAuthorityOperation(
       const membershipPermissions = typeof authority?.membershipJson === "string"
         ? JSON.parse(authority.membershipJson) as unknown : [];
       if (authority?.roomStatus !== "active" ||
-          (authority.confirmationPrincipalId !== humanId && authority.role !== "owner" && authority.role !== "admin") ||
+          (authority.confirmationPrincipalId !== humanId && authority.isOwner !== 1 && authority.role !== "admin") ||
           authority.toolId !== "sandbox-file.write" || typeof authority.parameterSha256 !== "string" ||
           typeof authority.sealedCompensation !== "string" || authority.participation !== "active" ||
           !Array.isArray(capabilities) || !capabilities.includes(authority.toolId) ||
@@ -5807,6 +5944,8 @@ export function executeHumanDatabaseCommand(
               ? executeRoomCreate(database, actorId, input.command, acceptedAt, scope, key)
               : input.command.type === "room.rename" || input.command.type === "room.archive"
                 ? executeRenameOrArchive(database, actorId, input.command, acceptedAt, scope, key)
+                : input.command.type === "room.ownership.transfer"
+                  ? executeOwnershipTransfer(database, actorId, input.command, acceptedAt, scope, key)
                 : input.command.type === "agent.configure"
                   ? executeAgentConfigure(database, actorId, input.command, acceptedAt, scope, key)
                   : input.command.type === "human.invitation.issue"
@@ -5821,10 +5960,14 @@ export function executeHumanDatabaseCommand(
                       )
                     : input.command.type === "human.invitation.decide"
                       ? executeInvitationDecision(database, actorId, input.command, acceptedAt, scope, key)
-                      : input.command.type === "human.role.change"
+                      : input.command.type === "room.member.role.set"
                         ? executeHumanRoleChange(database, actorId, input.command, acceptedAt, scope, key)
+                        : input.command.type === "room.member.leave"
+                          ? executeMemberLeave(database, actorId, input.command)
+                        : input.command.type === "human.role.change" || input.command.type === "room.reopen"
+                          ? fail("dependency_unavailable", "Legacy or dependency-bound governance path is unavailable")
                         : input.command.type === "member.remove"
-                          ? executeMemberRemove(database, actorId, input.command, acceptedAt, scope, key)
+                          ? executeMemberRemove(database, actorId, input.command)
                           : unreachableCommand(input.command);
       },
     });

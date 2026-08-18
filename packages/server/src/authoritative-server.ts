@@ -407,6 +407,7 @@ async function start(
       agentRuntime: runtime,
       collaboration: primitives,
       ballRuntime,
+      governance: authority,
     });
   } catch (error: unknown) {
     await transport?.close().catch(() => undefined);

@@ -11,6 +11,7 @@ import {
   type RoomRepairPage,
   type RoomSyncRequest,
   type RoomSyncResult,
+  type RoomGovernanceView,
   type SnapshotCompleted,
   type SnapshotVersion,
   type WorkspaceBootstrapPage,
@@ -47,6 +48,13 @@ const AUTH_SESSIONS_LIST_FIELDS = new Set(["type", "requestId"]);
 const AUTH_SESSION_REVOKE_FIELDS = new Set(["type", "requestId", "sessionId"]);
 const MESSAGE_SEND_FIELDS = new Set(["type", "requestId", "message"]);
 const ROOM_FIELDS = new Set(["type", "requestId", "roomId"]);
+const ROOM_GOVERNANCE_MUTATION_FIELDS = new Set([
+  "type", "requestId", "roomId", "expectedGovernanceRevision", "idempotencyKey",
+]);
+const ROOM_GOVERNANCE_TARGET_FIELDS = new Set([
+  ...ROOM_GOVERNANCE_MUTATION_FIELDS, "targetActorId",
+]);
+const ROOM_ROLE_SET_FIELDS = new Set([...ROOM_GOVERNANCE_TARGET_FIELDS, "role"]);
 const WORKSPACE_BOOTSTRAP_BEGIN_FIELDS = new Set(["type", "requestId"]);
 const SNAPSHOT_PAGE_FIELDS = new Set(["type", "requestId", "snapshotId", "afterPage"]);
 const ROOM_SYNC_REQUIRED_FIELDS = new Set(["type", "requestId", "roomId"]);
@@ -159,6 +167,46 @@ export interface RoomSubscribeFrame {
   readonly requestId: string;
   readonly roomId: string;
 }
+
+export interface RoomGovernanceGetFrame {
+  readonly type: "room.governance.get";
+  readonly requestId: string;
+  readonly roomId: string;
+}
+
+export type RoomGovernanceMutationFrame =
+  | {
+      readonly type: "room.ownership.transfer";
+      readonly requestId: string;
+      readonly roomId: string;
+      readonly targetActorId: string;
+      readonly expectedGovernanceRevision: number;
+      readonly idempotencyKey: string;
+    }
+  | {
+      readonly type: "room.member.role.set";
+      readonly requestId: string;
+      readonly roomId: string;
+      readonly targetActorId: string;
+      readonly role: "admin" | "member";
+      readonly expectedGovernanceRevision: number;
+      readonly idempotencyKey: string;
+    }
+  | {
+      readonly type: "room.member.leave" | "room.archive" | "room.reopen";
+      readonly requestId: string;
+      readonly roomId: string;
+      readonly expectedGovernanceRevision: number;
+      readonly idempotencyKey: string;
+    }
+  | {
+      readonly type: "room.member.remove";
+      readonly requestId: string;
+      readonly roomId: string;
+      readonly targetActorId: string;
+      readonly expectedGovernanceRevision: number;
+      readonly idempotencyKey: string;
+    };
 
 export interface WorkspaceBootstrapRequestFrame {
   readonly type: "workspace.bootstrap.begin";
@@ -294,6 +342,8 @@ export type ClientFrame =
   | RoomHistoryRequestFrame
   | BallQueryFrame
   | RoomSubscribeFrame
+  | RoomGovernanceGetFrame
+  | RoomGovernanceMutationFrame
   | WorkspaceBootstrapRequestFrame
   | WorkspaceBootstrapPageRequestFrame
   | RoomSyncRequestFrame
@@ -375,6 +425,20 @@ export interface RoomSubscribedFrame {
   readonly roomId: string;
 }
 
+export interface RoomGovernanceFrame {
+  readonly type: "room.governance";
+  readonly requestId: string;
+  readonly governance: RoomGovernanceView;
+}
+
+export interface RoomGovernanceAckFrame {
+  readonly type: "room.governance.ack";
+  readonly requestId: string;
+  readonly operation: RoomGovernanceMutationFrame["type"];
+  readonly governance?: RoomGovernanceView;
+  readonly eventIds: readonly string[];
+}
+
 export interface RoomSubscribedV2Frame {
   readonly type: "room.subscribed.v2";
   readonly requestId: string;
@@ -451,6 +515,10 @@ export type ProtocolErrorCode =
   | "storage_unavailable"
   | "room_not_found"
   | "room_archived"
+  | "role_forbidden"
+  | "room_revision_conflict"
+  | "ownership_transfer_required"
+  | "dependency_unavailable"
   | "agent_configuration_missing"
   | "agent_queue_full"
   | "agent_runtime_closed"
@@ -491,6 +559,8 @@ export type ServerFrame =
   | IdentityRoomAccessChangedFrame
   | RoomHistoryFrame
   | RoomSubscribedFrame
+  | RoomGovernanceFrame
+  | RoomGovernanceAckFrame
   | WorkspaceBootstrapPage
   | RoomSyncResult
   | RoomRepairPage
@@ -777,6 +847,7 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
     }
     case "room.history":
     case "room.subscribe":
+    case "room.governance.get":
     case "ball.query":
       if (
         !hasOnlyFields(value, ROOM_FIELDS) ||
@@ -799,6 +870,53 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
           roomId: value.roomId,
         },
       };
+    case "room.ownership.transfer":
+    case "room.member.remove": {
+      if (!hasOnlyFields(value, ROOM_GOVERNANCE_TARGET_FIELDS) || requestId === undefined ||
+          !isBoundedString(value.roomId, PROTOCOL_FIELD_LIMITS.roomId) ||
+          !isBoundedString(value.targetActorId, PROTOCOL_FIELD_LIMITS.accountId) ||
+          !isBoundedString(value.idempotencyKey, PROTOCOL_FIELD_LIMITS.requestId) ||
+          !isPageIndex(value.expectedGovernanceRevision)) {
+        return { ok: false, error: protocolError(`${value.type} requires a closed CAS command`, requestId) };
+      }
+      return { ok: true, frame: {
+        type: value.type, requestId, roomId: value.roomId,
+        targetActorId: value.targetActorId,
+        expectedGovernanceRevision: value.expectedGovernanceRevision,
+        idempotencyKey: value.idempotencyKey,
+      } };
+    }
+    case "room.member.role.set": {
+      if (!hasOnlyFields(value, ROOM_ROLE_SET_FIELDS) || requestId === undefined ||
+          !isBoundedString(value.roomId, PROTOCOL_FIELD_LIMITS.roomId) ||
+          !isBoundedString(value.targetActorId, PROTOCOL_FIELD_LIMITS.accountId) ||
+          (value.role !== "admin" && value.role !== "member") ||
+          !isBoundedString(value.idempotencyKey, PROTOCOL_FIELD_LIMITS.requestId) ||
+          !isPageIndex(value.expectedGovernanceRevision)) {
+        return { ok: false, error: protocolError("room.member.role.set requires a closed CAS role command", requestId) };
+      }
+      return { ok: true, frame: {
+        type: "room.member.role.set", requestId, roomId: value.roomId,
+        targetActorId: value.targetActorId, role: value.role,
+        expectedGovernanceRevision: value.expectedGovernanceRevision,
+        idempotencyKey: value.idempotencyKey,
+      } };
+    }
+    case "room.member.leave":
+    case "room.archive":
+    case "room.reopen": {
+      if (!hasOnlyFields(value, ROOM_GOVERNANCE_MUTATION_FIELDS) || requestId === undefined ||
+          !isBoundedString(value.roomId, PROTOCOL_FIELD_LIMITS.roomId) ||
+          !isBoundedString(value.idempotencyKey, PROTOCOL_FIELD_LIMITS.requestId) ||
+          !isPageIndex(value.expectedGovernanceRevision)) {
+        return { ok: false, error: protocolError(`${value.type} requires a closed CAS command`, requestId) };
+      }
+      return { ok: true, frame: {
+        type: value.type, requestId, roomId: value.roomId,
+        expectedGovernanceRevision: value.expectedGovernanceRevision,
+        idempotencyKey: value.idempotencyKey,
+      } };
+    }
     case "workspace.bootstrap.begin":
       if (!hasOnlyFields(value, WORKSPACE_BOOTSTRAP_BEGIN_FIELDS) || requestId === undefined) {
         return {

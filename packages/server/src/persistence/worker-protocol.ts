@@ -1,6 +1,7 @@
 import {
   isActor,
   isMessage,
+  isRoomGovernanceView,
   isRoomSyncResult,
   isSnapshotCompleted,
   isSnapshotVersion,
@@ -11,6 +12,7 @@ import type {
   Message,
   RoomSyncRequest,
   RoomSyncResult,
+  RoomGovernanceView,
   SnapshotCompleted,
   SnapshotVersion,
 } from "@native-im/core";
@@ -93,6 +95,10 @@ export type AuthorityWorkerErrorCode =
   | "message_not_found"
   | "open_item_not_found"
   | "permission_denied"
+  | "role_forbidden"
+  | "room_revision_conflict"
+  | "ownership_transfer_required"
+  | "dependency_unavailable"
   | "room_archived"
   | "room_compaction_blocked"
   | "room_forbidden"
@@ -153,6 +159,10 @@ export function isAuthorityWorkerErrorCode(
     case "message_not_found":
     case "open_item_not_found":
     case "permission_denied":
+    case "role_forbidden":
+    case "room_revision_conflict":
+    case "ownership_transfer_required":
+    case "dependency_unavailable":
     case "room_archived":
     case "room_compaction_blocked":
     case "room_forbidden":
@@ -269,6 +279,13 @@ export type AuthorityWorkerRequest =
     }
   | { readonly type: "authority.read-actor"; readonly requestId: string; readonly actorId: string }
   | { readonly type: "authority.read-room"; readonly requestId: string; readonly roomId: string }
+  | {
+      readonly type: "authority.read-room-governance";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly roomId: string;
+      readonly now: number;
+    }
   | {
       readonly type: "authority.can-access-room";
       readonly requestId: string;
@@ -387,12 +404,12 @@ export type AuthorityWorkerResponse =
   | {
       readonly type: "authority.ready";
       readonly requestId: string;
-      readonly schemaVersion: 12;
+      readonly schemaVersion: 13;
     }
   | {
       readonly type: "authority.schema";
       readonly requestId: string;
-      readonly schemaVersion: 12;
+      readonly schemaVersion: 13;
     }
   | {
       readonly type: "authority.legacy-imported";
@@ -462,6 +479,11 @@ export type AuthorityWorkerResponse =
     }
   | { readonly type: "authority.actor"; readonly requestId: string; readonly actor?: Actor }
   | { readonly type: "authority.room"; readonly requestId: string; readonly room?: ManagedRoom }
+  | {
+      readonly type: "authority.room-governance";
+      readonly requestId: string;
+      readonly governance: RoomGovernanceView;
+    }
   | { readonly type: "authority.room-access"; readonly requestId: string; readonly allowed: boolean }
   | {
       readonly type: "authority.room-audit";
@@ -1025,6 +1047,10 @@ export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWork
       return hasExactKeys(value, ["type", "requestId", "actorId"]) && isText(value.actorId);
     case "authority.read-room":
       return hasExactKeys(value, ["type", "requestId", "roomId"]) && isText(value.roomId);
+    case "authority.read-room-governance":
+      return hasExactKeys(value, ["type", "requestId", "context", "roomId", "now"]) &&
+        isAuthenticatedSessionContext(value.context) && isText(value.roomId) &&
+        isNonNegativeSafeInteger(value.now);
     case "authority.can-access-room":
     case "authority.read-room-audit":
       return hasExactKeys(value, ["type", "requestId", "context", "roomId", "now"]) &&
@@ -1112,7 +1138,7 @@ export function isAuthorityWorkerResponse(
     case "authority.schema":
       return (
         hasExactKeys(value, ["type", "requestId", "schemaVersion"]) &&
-        value.schemaVersion === 12
+        value.schemaVersion === 13
       );
     case "authority.closed":
       return hasExactKeys(value, ["type", "requestId"]);
@@ -1166,6 +1192,9 @@ export function isAuthorityWorkerResponse(
         value,
         ["type", "requestId", ...(Object.hasOwn(value, "room") ? ["room"] : [])],
       ) && (!Object.hasOwn(value, "room") || isManagedRoomShape(value.room));
+    case "authority.room-governance":
+      return hasExactKeys(value, ["type", "requestId", "governance"]) &&
+        isRoomGovernanceView(value.governance);
     case "authority.room-access":
       return hasExactKeys(value, ["type", "requestId", "allowed"]) &&
         typeof value.allowed === "boolean";

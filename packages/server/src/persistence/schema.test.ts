@@ -9,6 +9,7 @@ import {
   listAuthorityTables,
   migrateAuthorityDatabase,
   migrateAuthorityDatabaseToPreviousVersionForTest,
+  migrateAuthorityDatabaseToVersion11ForTest,
   migrateAuthorityDatabaseToVersion10ForTest,
   migrateAuthorityDatabaseToVersion9ForTest,
   migrateAuthorityDatabaseToVersion8ForTest,
@@ -87,6 +88,8 @@ const V11_MIGRATION_CHECKSUM =
   "3ef3ca9216e684ec3d9e4097fe8a2e7148c75d5bb4b23ed7bf5a0eb5edc970a1";
 const V12_MIGRATION_CHECKSUM =
   "66276cc21f02f19f5e60758039acd43030ba8a9666b37c0fef65ad30852929fa";
+const V13_MIGRATION_CHECKSUM =
+  "0d008e577b5514d5fd51fa65c9c31ef51e32e55e09483c8a2e3a707d6ca42e3e";
 
 const STREAMING_KEYSET_INDEXES = [
   "agent_executions_room_id_id",
@@ -357,7 +360,9 @@ function seedV1History(database: DatabaseSync): void {
       ('room-1', 'human-1', 'human', 'owner', NULL, '[]',
        '2026-08-09T00:00:00.000Z', NULL),
       ('room-1', 'agent-1', 'agent', NULL, 'active', '["summarize"]',
-       NULL, '2026-08-09T00:01:00.000Z');
+       NULL, '2026-08-09T00:01:00.000Z'),
+      ('room-2', 'human-1', 'human', 'owner', NULL, '[]',
+       '2026-08-09T01:00:00.000Z', NULL);
 
     INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
     VALUES (
@@ -415,9 +420,133 @@ function seedV11SessionCapacity(
 }
 
 describe("authority SQLite schema", () => {
-  it("upgrades v11 session generations into one closed v12 device-family projection", () => {
+  it("upgrades v12 ownership into one canonical Human owner without a second Project aggregate", () => {
     withDatabase((database) => {
       migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      expect(readSchemaVersion(database)).toBe(12);
+      database.exec(`
+        INSERT INTO actors (id, kind, display_name) VALUES
+          ('owner-v12', 'human', 'Owner'), ('member-v12', 'human', 'Member');
+        INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq) VALUES
+          ('identity', 'owner-v12', 0, 1), ('identity', 'member-v12', 0, 1),
+          ('room', 'room-v12', 0, 1);
+        INSERT INTO rooms (id, name, status, created_at)
+        VALUES ('room-v12', 'Room', 'active', '2026-08-18T00:00:00.000Z');
+        INSERT INTO room_memberships (
+          room_id, actor_id, kind, role, participation, tool_permissions_json,
+          joined_at, configured_at, access_revision
+        ) VALUES
+          ('room-v12', 'owner-v12', 'human', 'owner', NULL, '[]',
+           '2026-08-18T00:00:00.000Z', NULL, 0),
+          ('room-v12', 'member-v12', 'human', 'member', NULL, '[]',
+           '2026-08-18T00:00:00.000Z', NULL, 0);
+      `);
+
+      migrateAuthorityDatabase(database);
+
+      expect(readSchemaVersion(database)).toBe(13);
+      expect(database.prepare(
+        `SELECT id, owner_actor_id AS ownerActorId, governance_revision AS governanceRevision,
+                archive_generation AS archiveGeneration, archived_at AS archivedAt
+         FROM rooms WHERE id = 'room-v12'`,
+      ).get()).toEqual({
+        id: "room-v12", ownerActorId: "owner-v12", governanceRevision: 0,
+        archiveGeneration: 0, archivedAt: null,
+      });
+      expect(database.prepare(
+        "SELECT actor_id AS actorId, role FROM room_memberships WHERE room_id = 'room-v12' ORDER BY actor_id",
+      ).all()).toEqual([
+        { actorId: "member-v12", role: "member" },
+        { actorId: "owner-v12", role: "owner" },
+      ]);
+      expect(listAuthorityTables(database)).not.toContain("projects");
+    });
+  });
+
+  it.each([
+    { name: "zero owner", owners: [] as readonly [string, string, string][] },
+    { name: "two owners", owners: [["human-a", "human", "owner"], ["human-b", "human", "owner"]] as const },
+    { name: "Agent owner", owners: [["agent-a", "agent", "owner"]] as const },
+  ])("refuses v12 $name with an atomic zero-write v13 migration", ({ owners }) => {
+    withDatabase((database) => {
+      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      database.exec(`
+        INSERT INTO actors (id, kind, display_name) VALUES
+          ('human-a', 'human', 'A'), ('human-b', 'human', 'B'), ('agent-a', 'agent', 'Agent');
+        INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq) VALUES
+          ('identity', 'human-a', 0, 1), ('identity', 'human-b', 0, 1),
+          ('identity', 'agent-a', 0, 1), ('room', 'invalid-owner-room', 0, 1);
+        INSERT INTO rooms (id, name, status, created_at)
+        VALUES ('invalid-owner-room', 'Invalid', 'active', '2026-08-18T00:00:00.000Z');
+      `);
+      const insert = database.prepare(`INSERT INTO room_memberships (
+        room_id, actor_id, kind, role, participation, tool_permissions_json,
+        joined_at, configured_at, access_revision
+      ) VALUES ('invalid-owner-room', ?, ?, ?, NULL, '[]', '2026-08-18T00:00:00.000Z', NULL, 0)`);
+      for (const owner of owners) insert.run(...owner);
+      const before = snapshot(database);
+
+      expect(() => migrateAuthorityDatabase(database)).toThrow(/exactly one same-room Human owner/i);
+      expect(readSchemaVersion(database)).toBe(12);
+      expect(snapshot(database)).toEqual(before);
+    });
+  });
+
+  it("refuses cross-room and non-Human canonical owner updates", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabase(database);
+      database.exec(`
+        INSERT INTO actors (id, kind, display_name) VALUES
+          ('human-owner-a', 'human', 'A'), ('human-owner-b', 'human', 'B'),
+          ('agent-owner', 'agent', 'Agent');
+        INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq) VALUES
+          ('identity', 'human-owner-a', 0, 1), ('identity', 'human-owner-b', 0, 1),
+          ('identity', 'agent-owner', 0, 1), ('room', 'room-a', 0, 1), ('room', 'room-b', 0, 1);
+        INSERT INTO rooms (id, name, status, created_at) VALUES
+          ('room-a', 'A', 'active', '2026-08-18T00:00:00.000Z'),
+          ('room-b', 'B', 'active', '2026-08-18T00:00:00.000Z');
+        INSERT INTO room_memberships (
+          room_id, actor_id, kind, role, participation, tool_permissions_json,
+          joined_at, configured_at, access_revision
+        ) VALUES
+          ('room-a', 'human-owner-a', 'human', 'member', NULL, '[]', 't', NULL, 0),
+          ('room-a', 'agent-owner', 'agent', NULL, 'active', '["read"]', NULL, 't', 0),
+          ('room-b', 'human-owner-b', 'human', 'member', NULL, '[]', 't', NULL, 0);
+        UPDATE rooms SET owner_actor_id = 'human-owner-a' WHERE id = 'room-a';
+        UPDATE rooms SET owner_actor_id = 'human-owner-b' WHERE id = 'room-b';
+      `);
+      expectSqlRejected(database, "UPDATE rooms SET owner_actor_id = 'human-owner-b' WHERE id = 'room-a'");
+      expectSqlRejected(database, "UPDATE rooms SET owner_actor_id = 'agent-owner' WHERE id = 'room-a'");
+      expectSqlRejected(database, "UPDATE rooms SET owner_actor_id = NULL WHERE id = 'room-a'");
+    });
+  });
+
+  it("rolls every v13 migration statement back with schema, data, version, and history intact", () => {
+    for (let failAfterStatement = 1; failAfterStatement <= 20; failAfterStatement += 1) {
+      withDatabase((database) => {
+        migrateAuthorityDatabaseToPreviousVersionForTest(database);
+        database.exec(`
+          INSERT INTO actors (id, kind, display_name) VALUES ('rollback-owner', 'human', 'Owner');
+          INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq) VALUES
+            ('identity', 'rollback-owner', 0, 1), ('room', 'rollback-room', 0, 1);
+          INSERT INTO rooms (id, name, status, created_at)
+          VALUES ('rollback-room', 'Rollback', 'active', '2026-08-18T00:00:00.000Z');
+          INSERT INTO room_memberships (
+            room_id, actor_id, kind, role, participation, tool_permissions_json,
+            joined_at, configured_at, access_revision
+          ) VALUES ('rollback-room', 'rollback-owner', 'human', 'owner', NULL, '[]',
+                    '2026-08-18T00:00:00.000Z', NULL, 0);
+        `);
+        const before = snapshot(database);
+        expect(() => migrateAuthorityDatabase(database, { failAfterStatement })).toThrow(/injected migration failure/i);
+        expect(readSchemaVersion(database)).toBe(12);
+        expect(snapshot(database)).toEqual(before);
+      });
+    }
+  });
+  it("upgrades v11 session generations into one closed v12 device-family projection", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabaseToVersion11ForTest(database);
       expect(readSchemaVersion(database)).toBe(11);
       database.exec(`
         INSERT INTO actors (id, kind, display_name)
@@ -438,8 +567,8 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(12);
-      expect(readSchemaVersion(database)).toBe(12);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(13);
+      expect(readSchemaVersion(database)).toBe(13);
       expect(tableColumns(database, "session_families")).toEqual([
         "family_id", "public_id", "account_id", "actor_id", "device_id",
         "device_label", "platform", "created_at", "refresh_expires_at", "revoked_at",
@@ -474,7 +603,7 @@ describe("authority SQLite schema", () => {
 
   it("rolls back the v12 family table, version, and migration record atomically", () => {
     withDatabase((database) => {
-      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      migrateAuthorityDatabaseToVersion11ForTest(database);
       const before = snapshot(database);
 
       expect(() => migrateAuthorityDatabase(database, { failAfterStatement: 1 }))
@@ -488,7 +617,7 @@ describe("authority SQLite schema", () => {
 
   it("atomically rejects an over-cap v11 principal while ignoring expired families", () => {
     withDatabase((database) => {
-      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      migrateAuthorityDatabaseToVersion11ForTest(database);
       seedV11SessionCapacity(database, 97);
       const before = snapshot(database);
 
@@ -501,11 +630,11 @@ describe("authority SQLite schema", () => {
     });
 
     withDatabase((database) => {
-      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      migrateAuthorityDatabaseToVersion11ForTest(database);
       seedV11SessionCapacity(database, 97, 0);
 
       expect(() => migrateAuthorityDatabase(database)).not.toThrow();
-      expect(readSchemaVersion(database)).toBe(12);
+      expect(readSchemaVersion(database)).toBe(13);
       expect(database.prepare("SELECT COUNT(*) AS count FROM session_families").get())
         .toEqual({ count: 97 });
     });
@@ -513,7 +642,7 @@ describe("authority SQLite schema", () => {
 
   it("rejects cross-principal v11 families and missing v12 family projections", () => {
     withDatabase((database) => {
-      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      migrateAuthorityDatabaseToVersion11ForTest(database);
       database.exec(`
         INSERT INTO actors (id, kind, display_name)
         VALUES ('family-human-a', 'human', 'A'), ('family-human-b', 'human', 'B');
@@ -582,12 +711,12 @@ describe("authority SQLite schema", () => {
     });
   });
 
-  it("migrates a fresh database through immutable v1-v12 to the complete schema", () => {
+  it("migrates a fresh database through immutable v1-v13 to the complete schema", () => {
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
 
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(12);
-      expect(readSchemaVersion(database)).toBe(12);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(13);
+      expect(readSchemaVersion(database)).toBe(13);
       expect(listAuthorityTables(database)).toEqual(AUTHORITY_TABLES);
       expect(
         database
@@ -668,6 +797,12 @@ describe("authority SQLite schema", () => {
           checksum: V12_MIGRATION_CHECKSUM,
           applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
         },
+        {
+          version: 13,
+          name: "room-governance-foundation",
+          checksum: V13_MIGRATION_CHECKSUM,
+          applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+        },
       ]);
       expect(tableColumns(database, "actors")).toContain("catalog_revision");
       expect(tableColumns(database, "room_memberships")).toContain(
@@ -721,8 +856,8 @@ describe("authority SQLite schema", () => {
       expect(readSchemaVersion(database)).toBe(4);
       migrateAuthorityDatabase(database);
 
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(12);
-      expect(readSchemaVersion(database)).toBe(12);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(13);
+      expect(readSchemaVersion(database)).toBe(13);
       expect(
         database
           .prepare(
@@ -826,6 +961,11 @@ describe("authority SQLite schema", () => {
           ('identity', 'human-v5', 0, 1),
           ('identity', 'agent-v5', 0, 1),
           ('room', 'room-v5', 0, 1);
+        INSERT INTO room_memberships (
+          room_id, actor_id, kind, role, participation, tool_permissions_json,
+          joined_at, configured_at, access_revision
+        ) VALUES ('room-v5', 'human-v5', 'human', 'owner', NULL, '[]',
+                  '2026-08-12T00:00:00.000Z', NULL, 0);
         INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
         VALUES ('message-v5', 'room-v5', 'human-v5', 'human', 'legacy', '2026-08-12T00:00:01.000Z');
         INSERT INTO agent_executions (
@@ -841,7 +981,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(12);
+      expect(readSchemaVersion(database)).toBe(13);
       expect(database.prepare(
         `SELECT id, status, action_category AS actionCategory,
                 tool_dispatch_phase AS toolDispatchPhase,
@@ -918,7 +1058,7 @@ describe("authority SQLite schema", () => {
       expect(snapshot(database)).toEqual(before);
 
       migrateAuthorityDatabase(database);
-      expect(readSchemaVersion(database)).toBe(12);
+      expect(readSchemaVersion(database)).toBe(13);
       expect(tableColumns(database, "route_jobs")).toEqual([
         "id", "room_id", "source_message_id", "status", "current_attempt", "topic_key",
         "embedding_model_version", "window_size", "cosine_threshold", "room_phase",
@@ -954,7 +1094,7 @@ describe("authority SQLite schema", () => {
         INSERT INTO room_memberships (
           room_id, actor_id, kind, role, participation, joined_at
         ) VALUES
-          ('room-v7', 'human-v7-a', 'human', 'member', NULL, '2026-08-17T00:00:00.000Z'),
+          ('room-v7', 'human-v7-a', 'human', 'owner', NULL, '2026-08-17T00:00:00.000Z'),
           ('room-v7', 'human-v7-b', 'human', 'member', NULL, '2026-08-17T00:00:00.000Z');
         INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
         VALUES ('message-v7', 'room-v7', 'human-v7-a', 'human', 'source', '2026-08-17T00:00:01.000Z');
@@ -975,7 +1115,7 @@ describe("authority SQLite schema", () => {
       expect(snapshot(database)).toEqual(before);
 
       migrateAuthorityDatabase(database);
-      expect(readSchemaVersion(database)).toBe(12);
+      expect(readSchemaVersion(database)).toBe(13);
       expect(database.prepare(
         `SELECT id, current_owner_actor_id AS currentOwnerId, status,
                 requester_actor_id AS requesterId, origin_kind AS originKind,
@@ -1114,7 +1254,7 @@ describe("authority SQLite schema", () => {
       expect(listAuthorityTables(database)).not.toContain("ball_boundary_claims");
 
       migrateAuthorityDatabase(database);
-      expect(readSchemaVersion(database)).toBe(12);
+      expect(readSchemaVersion(database)).toBe(13);
       expect(tableColumns(database, "ball_boundary_claims")).toEqual([
         "id", "room_id", "source_kind", "source_id", "holder_actor_id", "holder_kind",
         "reason", "since_at", "deadline_at", "boundary_kind", "claimed_at", "route_consumed_at",
@@ -1139,6 +1279,11 @@ describe("authority SQLite schema", () => {
           ('identity', 'human-v10', 0, 1),
           ('identity', 'agent-v10', 0, 1),
           ('room', 'room-v10', 0, 1);
+        INSERT INTO room_memberships (
+          room_id, actor_id, kind, role, participation, tool_permissions_json,
+          joined_at, configured_at, access_revision
+        ) VALUES ('room-v10', 'human-v10', 'human', 'owner', NULL, '[]',
+                  '2026-08-17T00:00:00.000Z', NULL, 0);
         INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
         VALUES ('message-fence-v10', 'room-v10', 'human-v10', 'human', 'fence', '2026-08-17T00:00:00.000Z');
         INSERT INTO agent_executions (
@@ -1174,7 +1319,7 @@ describe("authority SQLite schema", () => {
       expect(tableColumns(database, "agent_executions")).not.toContain("supersedes_execution_ids_json");
 
       migrateAuthorityDatabase(database);
-      expect(readSchemaVersion(database)).toBe(12);
+      expect(readSchemaVersion(database)).toBe(13);
       expect(tableColumns(database, "human_preemption_fences")).toEqual([
         "source_human_message_id", "room_id", "human_actor_id", "accepted_at",
         "cancelled_count", "cancel_committed_at", "route_job_id", "route_created_at",
@@ -1201,7 +1346,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(12);
+      expect(readSchemaVersion(database)).toBe(13);
       expect(tableColumns(database, "open_items")).toEqual(
         expect.arrayContaining([
           "requester_actor_id",
@@ -1241,7 +1386,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(12);
+      expect(readSchemaVersion(database)).toBe(13);
       expect(database.prepare(
         `SELECT source_message_id AS sourceMessageId, actor_id AS actorId
          FROM calibration_signals WHERE id = 'signal-v3'`,
@@ -1294,7 +1439,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(12);
+      expect(readSchemaVersion(database)).toBe(13);
       expect(
         database.prepare("SELECT id, catalog_revision FROM actors ORDER BY id").all(),
       ).toEqual([
@@ -1311,6 +1456,7 @@ describe("authority SQLite schema", () => {
       ).toEqual([
         { room_id: "room-1", actor_id: "agent-1", access_revision: 0 },
         { room_id: "room-1", actor_id: "human-1", access_revision: 0 },
+        { room_id: "room-2", actor_id: "human-1", access_revision: 0 },
       ]);
       expect(
         database
@@ -1373,7 +1519,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(12);
+      expect(readSchemaVersion(database)).toBe(13);
       expect(
         database
           .prepare(
@@ -1964,9 +2110,9 @@ describe("authority SQLite schema", () => {
     });
 
     withDatabase((database) => {
-      database.exec("PRAGMA user_version = 13");
+      database.exec("PRAGMA user_version = 14");
       expect(() => migrateAuthorityDatabase(database)).toThrow(/future schema/i);
-      expect(readSchemaVersion(database)).toBe(13);
+      expect(readSchemaVersion(database)).toBe(14);
     });
   });
 
@@ -2022,7 +2168,7 @@ describe("authority SQLite schema", () => {
 });
 
 describe("derived snapshot cache schema", () => {
-  it("creates independent v1 WAL/FULL tables without changing authority v12", () => {
+  it("creates independent v1 WAL/FULL tables without changing authority v13", () => {
     withDatabase((database) => {
       migrateSnapshotCacheDatabase(database);
       expect(SNAPSHOT_CACHE_SCHEMA_VERSION).toBe(1);
@@ -2038,7 +2184,7 @@ describe("derived snapshot cache schema", () => {
         .toBe(SNAPSHOT_CACHE_BUSY_TIMEOUT_MS);
       expect(() => validateSnapshotCacheSchema(database)).not.toThrow();
     });
-    expect(AUTHORITY_SCHEMA_VERSION).toBe(12);
+    expect(AUTHORITY_SCHEMA_VERSION).toBe(13);
   });
 
   it("fails closed on version-one corruption and refuses future versions", () => {

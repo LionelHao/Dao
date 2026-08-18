@@ -55,6 +55,42 @@ export interface Room {
 export type HumanRoomRole = "owner" | "admin" | "member";
 export type AgentParticipation = "active" | "on-mention" | "silent";
 export type RoomStatus = "active" | "archived";
+export type RoomLifecycleState = "active" | "archived";
+
+export interface RoomGovernanceView<TRoomId extends string = string> {
+  readonly roomId: TRoomId;
+  readonly projectId: TRoomId;
+  readonly lifecycle: RoomLifecycleState;
+  readonly governanceRevision: number;
+  readonly ownerActorId: string;
+  readonly archivedAt?: string;
+  readonly archiveGeneration: number;
+}
+
+export type DepartureResponsibilityKind =
+  | "request" | "next_action" | "blocker_or_open_question" | "confirmation" | "acceptance";
+export type DepartureResolution = "complete" | "transfer" | "escalate" | "reject_or_revoke";
+
+export interface DepartureConflict {
+  readonly conflictId: string;
+  readonly roomId: string;
+  readonly subjectId: string;
+  readonly kind: DepartureResponsibilityKind;
+  readonly title: string;
+  readonly state: string;
+  readonly allowedResolutions: readonly DepartureResolution[];
+  readonly sourceId: string;
+  readonly revision: number;
+  readonly grant?: never;
+  readonly confirmationParameters?: never;
+}
+
+export interface DepartureConflictList {
+  readonly roomId: string;
+  readonly targetActorId: string;
+  readonly governanceRevision: number;
+  readonly conflicts: readonly DepartureConflict[];
+}
 
 export interface HumanRoomMembership {
   readonly kind: "human";
@@ -158,6 +194,62 @@ function isAgentParticipation(value: unknown): value is AgentParticipation {
   return (
     typeof value === "string" && agentParticipations.has(value as AgentParticipation)
   );
+}
+
+function hasOnlyKeys(value: UnknownRecord, required: readonly string[], optional: readonly string[] = []): boolean {
+  const allowed = new Set([...required, ...optional]);
+  return required.every((key) => Object.hasOwn(value, key)) &&
+    Object.keys(value).every((key) => allowed.has(key));
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isSafeRevision(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+export function isRoomGovernanceView(value: unknown): value is RoomGovernanceView {
+  if (!isRecord(value) || !hasOnlyKeys(value, [
+    "roomId", "projectId", "lifecycle", "governanceRevision", "ownerActorId", "archiveGeneration",
+  ], ["archivedAt"])) return false;
+  return isNonEmptyString(value.roomId) && value.projectId === value.roomId &&
+    (value.lifecycle === "active" || value.lifecycle === "archived") &&
+    isSafeRevision(value.governanceRevision) && isNonEmptyString(value.ownerActorId) &&
+    isSafeRevision(value.archiveGeneration) &&
+    (value.lifecycle === "archived" ? isNonEmptyString(value.archivedAt) : value.archivedAt === undefined);
+}
+
+const departureKinds = new Set<DepartureResponsibilityKind>([
+  "request", "next_action", "blocker_or_open_question", "confirmation", "acceptance",
+]);
+const departureResolutions = new Set<DepartureResolution>([
+  "complete", "transfer", "escalate", "reject_or_revoke",
+]);
+
+export function isDepartureConflict(value: unknown): value is DepartureConflict {
+  return isRecord(value) && hasOnlyKeys(value, [
+    "conflictId", "roomId", "subjectId", "kind", "title", "state", "allowedResolutions", "sourceId", "revision",
+  ]) && isNonEmptyString(value.conflictId) && isNonEmptyString(value.roomId) &&
+    isNonEmptyString(value.subjectId) && departureKinds.has(value.kind as DepartureResponsibilityKind) &&
+    isNonEmptyString(value.title) && isNonEmptyString(value.state) &&
+    Array.isArray(value.allowedResolutions) && value.allowedResolutions.length > 0 &&
+    value.allowedResolutions.every((resolution) => departureResolutions.has(resolution as DepartureResolution)) &&
+    new Set(value.allowedResolutions).size === value.allowedResolutions.length &&
+    isNonEmptyString(value.sourceId) && isSafeRevision(value.revision);
+}
+
+export function isDepartureConflictList(value: unknown): value is DepartureConflictList {
+  if (!isRecord(value) || !hasOnlyKeys(value, ["roomId", "targetActorId", "governanceRevision", "conflicts"]) ||
+    !isNonEmptyString(value.roomId) || !isNonEmptyString(value.targetActorId) ||
+    !isSafeRevision(value.governanceRevision) || !Array.isArray(value.conflicts)) return false;
+  const ids = new Set<string>();
+  return value.conflicts.every((conflict) => {
+    if (!isDepartureConflict(conflict) || conflict.roomId !== value.roomId || ids.has(conflict.conflictId)) return false;
+    ids.add(conflict.conflictId);
+    return true;
+  });
 }
 
 export function isHumanActor(value: unknown): value is HumanActor {

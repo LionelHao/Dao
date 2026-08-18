@@ -14,9 +14,41 @@ type DomainUnderTest = {
   isMessageDraft?: (value: unknown) => boolean;
   isMessage?: (value: unknown) => boolean;
   isRoom?: (value: unknown) => boolean;
+  isRoomGovernanceView?: (value: unknown) => boolean;
+  isDepartureConflictList?: (value: unknown) => boolean;
 };
 
 const domain = importedDomain as unknown as DomainUnderTest;
+
+describe("room governance guards", () => {
+  const governance = {
+    roomId: "room-1", projectId: "room-1", lifecycle: "active",
+    governanceRevision: 2, ownerActorId: "human-1", archiveGeneration: 0,
+  };
+
+  it("enforces Room=Project and a closed governance projection", () => {
+    expect(domain.isRoomGovernanceView?.(governance)).toBe(true);
+    expect(domain.isRoomGovernanceView?.({ ...governance, projectId: "project-2" })).toBe(false);
+    expect(domain.isRoomGovernanceView?.({ ...governance, ownerRole: "owner" })).toBe(false);
+    expect(domain.isRoomGovernanceView?.({ ...governance, lifecycle: "archived" })).toBe(false);
+    expect(domain.isRoomGovernanceView?.({
+      ...governance, lifecycle: "archived", archivedAt: "2026-08-18T00:00:00.000Z",
+    })).toBe(true);
+  });
+
+  it("rejects cross-room, duplicate and secret-bearing departure conflicts", () => {
+    const conflict = {
+      conflictId: "conflict-1", roomId: "room-1", subjectId: "human-2",
+      kind: "confirmation", title: "Pending confirmation", state: "pending",
+      allowedResolutions: ["reject_or_revoke"], sourceId: "confirmation-1", revision: 1,
+    };
+    const list = { roomId: "room-1", targetActorId: "human-2", governanceRevision: 2, conflicts: [conflict] };
+    expect(domain.isDepartureConflictList?.(list)).toBe(true);
+    expect(domain.isDepartureConflictList?.({ ...list, conflicts: [{ ...conflict, roomId: "room-2" }] })).toBe(false);
+    expect(domain.isDepartureConflictList?.({ ...list, conflicts: [{ ...conflict, grant: "secret" }] })).toBe(false);
+    expect(domain.isDepartureConflictList?.({ ...list, conflicts: [conflict, conflict] })).toBe(false);
+  });
+});
 
 describe("domain kernel guards", () => {
   it("distinguishes human reachability from agent readiness and guards all core records", () => {

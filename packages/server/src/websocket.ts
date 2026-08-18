@@ -23,7 +23,11 @@ import {
   type OutboxDispatchStore,
   type OutboxSendResult,
 } from "./outbox-dispatcher.js";
-import type { AuthenticatedSessionContext } from "./persistence/contracts.js";
+import type {
+  AuthenticatedSessionContext,
+  CommandStore,
+  SyncQueryStore,
+} from "./persistence/contracts.js";
 import type { OutboxDelivery } from "./persistence/contracts.js";
 import {
   MessageValidationError,
@@ -85,6 +89,8 @@ export interface StartMessageWebSocketServerOptions {
     | "setLightTaskCriterion"
   >;
   readonly ballRuntime?: Pick<BallRuntimeService, "query">;
+  readonly governance?: Pick<CommandStore, "executeHuman"> &
+    Pick<SyncQueryStore, "readRoomGovernance">;
 }
 
 type RuntimeMessageWebSocketServerOptions = StartMessageWebSocketServerOptions & {
@@ -215,6 +221,10 @@ const MAPPED_SERVICE_ERROR_STATUSES = new Map<ProtocolErrorFrame["code"], Protoc
   ["snapshot_not_found", 404],
   ["room_not_found", 404],
   ["room_archived", 409],
+  ["role_forbidden", 403],
+  ["room_revision_conflict", 409],
+  ["ownership_transfer_required", 409],
+  ["dependency_unavailable", 503],
   ["snapshot_stale", 409],
   ["snapshot_expired", 410],
   ["snapshot_busy", 429],
@@ -831,6 +841,13 @@ function isCorrelatedRecoveryResponse(
       | "room.history"
       | "room.subscribe"
       | "room.subscribe.v2"
+      | "room.governance.get"
+      | "room.ownership.transfer"
+      | "room.member.role.set"
+      | "room.member.leave"
+      | "room.member.remove"
+      | "room.archive"
+      | "room.reopen"
       | "agent.invoke"
       | "agent.interrupt"
       | "agent.retry"
@@ -918,6 +935,13 @@ async function handleRecoveryFrame(
       | "room.history"
       | "room.subscribe"
       | "room.subscribe.v2"
+      | "room.governance.get"
+      | "room.ownership.transfer"
+      | "room.member.role.set"
+      | "room.member.leave"
+      | "room.member.remove"
+      | "room.archive"
+      | "room.reopen"
       | "agent.invoke"
       | "agent.interrupt"
       | "agent.retry"
@@ -1725,6 +1749,70 @@ async function handleFrame(
         if (!context.closed) {
           sendFrame(socket, mappedError(error, frame.requestId));
         }
+      }
+      return;
+    }
+    case "room.governance.get": {
+      const session = await requireSession(socket, frame.requestId, options, context);
+      if (session === undefined) return;
+      if (options.governance === undefined) {
+        sendFrame(socket, errorFrame(503, "dependency_unavailable", "dependency_unavailable", frame.requestId));
+        return;
+      }
+      try {
+        const governance = await options.governance.readRoomGovernance(session, frame.roomId);
+        sendFrame(socket, { type: "room.governance", requestId: frame.requestId, governance });
+      } catch (error: unknown) {
+        sendFrame(socket, mappedError(error, frame.requestId));
+      }
+      return;
+    }
+    case "room.ownership.transfer":
+    case "room.member.role.set":
+    case "room.member.leave":
+    case "room.member.remove":
+    case "room.archive":
+    case "room.reopen": {
+      const session = await requireSession(socket, frame.requestId, options, context);
+      if (session === undefined) return;
+      if (options.governance === undefined) {
+        sendFrame(socket, errorFrame(503, "dependency_unavailable", "dependency_unavailable", frame.requestId));
+        return;
+      }
+      const command = frame.type === "room.ownership.transfer"
+        ? { type: frame.type, roomId: frame.roomId, payload: {
+            targetActorId: frame.targetActorId,
+            expectedGovernanceRevision: frame.expectedGovernanceRevision,
+          } } as const
+        : frame.type === "room.member.role.set"
+          ? { type: frame.type, roomId: frame.roomId, payload: {
+              targetActorId: frame.targetActorId, role: frame.role,
+              expectedGovernanceRevision: frame.expectedGovernanceRevision,
+            } } as const
+          : frame.type === "room.member.leave"
+            ? { type: frame.type, roomId: frame.roomId, payload: {
+                expectedGovernanceRevision: frame.expectedGovernanceRevision,
+              } } as const
+            : frame.type === "room.member.remove"
+              ? { type: "member.remove" as const, roomId: frame.roomId,
+                  payload: { targetActorId: frame.targetActorId } }
+              : frame.type === "room.reopen"
+                ? { type: frame.type, roomId: frame.roomId, payload: {
+                    expectedGovernanceRevision: frame.expectedGovernanceRevision,
+                  } } as const
+                : { type: "room.archive" as const, roomId: frame.roomId, payload: {} };
+      try {
+        const acknowledgement = await options.governance.executeHuman({
+          ...session, kind: "human", requestId: frame.requestId,
+          idempotencyKey: frame.idempotencyKey,
+        }, command);
+        const governance = await options.governance.readRoomGovernance(session, frame.roomId);
+        sendFrame(socket, {
+          type: "room.governance.ack", requestId: frame.requestId,
+          operation: frame.type, governance, eventIds: acknowledgement.eventIds,
+        });
+      } catch (error: unknown) {
+        sendFrame(socket, mappedError(error, frame.requestId));
       }
       return;
     }

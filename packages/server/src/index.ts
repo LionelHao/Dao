@@ -205,6 +205,7 @@ export type WorkerDatabaseClient = Omit<
   | "executeBall"
   | "readActor"
   | "readRoom"
+  | "readRoomGovernance"
   | "listPendingOutbox"
   | "authorizeOutboxCandidate"
   | "markOutboxDispatched"

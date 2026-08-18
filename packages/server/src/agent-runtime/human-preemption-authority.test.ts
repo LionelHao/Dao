@@ -44,9 +44,10 @@ function fixture(): DatabaseSync {
     INSERT INTO room_memberships (
       room_id, actor_id, kind, role, participation, joined_at, configured_at
     ) VALUES
-      ('room-1', 'human-1', 'human', 'owner', NULL, '2026-08-17T00:00:00.000Z', NULL),
+      ('room-1', 'human-1', 'human', 'member', NULL, '2026-08-17T00:00:00.000Z', NULL),
       ('room-1', 'agent-1', 'agent', NULL, 'active', NULL, '2026-08-17T00:00:00.000Z'),
       ('room-1', 'agent-2', 'agent', NULL, 'active', NULL, '2026-08-17T00:00:00.000Z');
+    UPDATE rooms SET owner_actor_id = 'human-1', governance_revision = 1 WHERE id = 'room-1';
   `);
   database.prepare(
     `INSERT INTO session_families (
