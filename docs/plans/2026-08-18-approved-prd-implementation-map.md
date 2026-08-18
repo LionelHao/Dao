@@ -47,7 +47,7 @@ FT-16 的设计覆盖矩阵还对 **全部 103 条** Requirement 给出了一个
 | FT / 里程碑 | 可复用的历史代码、测试与合同 | 新 PRD Gap 与预计修改区域 | 依赖与并行策略 | 建议自动化验收层级 |
 | --- | --- | --- | --- | --- |
 | **FT-01** M2；M5 的租约/安全收口 | T-0039 的 Human-only auth、session refresh/revoke、邀请与 Agent 配置分轨；T-0040 的 SQLite/identity outbox；当前 FT-01 implementation plan 已定义 device-family 切片。`packages/server/src/auth.ts`、`persistence/authority-worker.ts`、`websocket.test.ts` 是基础。 | 当前没有邀请绑定的 account provisioning/披露完成链、Tenant Administrator、Global Profile 管理、Room cache 清除或 offline lease；device family slice 正由另一会话处理，不能并行占用其共享文件。区域：`packages/server/src/auth.ts`、`protocol.ts`、`websocket.ts`、`persistence/{schema.ts,authority-database-handler.ts,contracts.ts,worker-protocol.ts}`；`packages/desktop/src/{main.ts,preload.ts,window.ts,renderer/}`。 | 硬：FT-02、03、07、11、13、14 都依赖它的认证 principal/撤权。软：FT-16 可先定义 J-01。当前 slice 完成前，其他任务不得改 schema v12/session 族或 preload/auth 线路。 | 单元+schema migration+AuthorityWorker transaction；真实 WebSocket 两设备 E2E；Electron main/preload/renderer 集成；撤权与缓存失效安全回归。 |
-| **FT-02** M2 | T-0039 的 RoomLifecycle、invite/configuration 分离和审计；T-0040 的 server authority。 | 现行唯一 owner、admin peer 约束、ownership transfer、自离群责任清理、archive 后成员只读/reopen、冻结业务 timer/confirmation grant 语义都不满足新合同。区域：`packages/core/src/index.ts`、`packages/server/src/room-lifecycle.ts`、`persistence/{schema.ts,authority-database-handler.ts,snapshot-worker.ts}`、`protocol.ts`、`websocket.ts`、`renderer/app.ts`。 | 硬：FT-01 认证；FT-03 房间范围消息；FT-09 的责任清理；FT-10/13 的 archive 安全收敛。可与 FT-03 的纯消息合同并行；同一 migration、AuthorityWorker、protocol 批次必须串行。 | Core state-machine/type tests；SQLite migration/transaction/invariant；权限矩阵 API/WS；reopen/restart/repair E2E；FT-16 drawer/错误态 DOM。 |
+| **FT-02A / FT-02B / FT-02C** M2 governance slices | FT-02A 已在 `fb37f7a` 合入唯一 owner、角色矩阵、ownership transfer、CAS 与基础治理 projection；T-0039 的 RoomLifecycle 与 T-0040 authority机制继续复用。 | FT-02B 尚需 Human leave/remove、责任冲突与同事务 final recheck；FT-02C 尚需 archive/reopen coordinator、timer/confirmation/runtime/cache/lease settlement、repair与Desktop。区域：`packages/server/src/room-governance/`、AuthorityWorker command family、closed protocol/repair与 renderer governance分区。 | **不再等待完整上游 FT。** FT-02B 只直接依赖 shared contract spine + FT-09A 聚合 `DepartureResponsibilityPort`；该 port 必须装配所有已启用 contributor，FT-10 pending-confirmation contributor 已启用但缺失时仍为503/零写。FT-02C 只消费 `ArchivedMessageGate`、`BusinessTimerSuspensionParticipant`、FT-10 `ArchiveToolSafetyParticipant`、`RuntimeArchiveFenceParticipant`、`AssignmentSecurityReductionParticipant`、FT-02C lifecycle descriptor（实现 FT-13 `RoomRepairSegmentDescriptor`）、`RoomCacheInvalidationPort`、`OfflineLeaseInvalidationPort`；每个依赖可独立合入，enabled-but-missing 必须503。共享 migration/AuthorityWorker/protocol窗口仍串行。 | FT-02B：conflict/final-recheck/CAS/restart/crash/WS/access-reduction。FT-02C：participant rollback、archive/reopen/timer连续性、message/runtime/tool/cache/lease race、repair/三客户端、FT-16 drawer/read-only/error DOM。 |
 | **FT-03** M2 | T-0040 durable `message.accepted`、event/outbox/idempotency、history/realtime；T-0013/0014 只可复用人/Agent 分治机制；T-0041 final/preview 分离。 | Message 仍是纯文本；生产协议没有 structured mention/reply/revision/tombstone/correction，也没有同事务逐 target Request/invocation intent。regex/raw agent ID、兼容 primitives 与静态 UI均不能证明能力。区域：`packages/core/src/{index.ts,sync.ts}`、`packages/server/src/{protocol.ts,websocket.ts,service.ts,primitives.ts}`、`persistence/{schema.ts,authority-database-handler.ts,snapshot-worker.ts}`、`packages/desktop/src/{sync/client-sync-replica.ts,renderer/}`。 | 硬：FT-01 principal、FT-02 active/archived access、FT-13 atomic event/repair。软：FT-04 attachment link、FT-05 tombstone exclusion、FT-08 invocation handoff、FT-09 Request。可先锁闭合 message model/protocol，随后串行接入 attachment、runtime和项目派生。 | Core guards/type test；wire negative/ACK-idempotency；worker transaction crash tests；multi-client repair E2E；renderer only after ACK/event tests。 |
 | **FT-04** M2 | T-0040 durable source/event/repair机制；T-0041 的受限 adapter、安全最小披露和 secret sentinel测试。 | 无 upload/object metadata/hash、preview/download authorization、text extraction/OCR 或 attachment source retrieval；不能把本地 blob/fixture 当作实现。区域：`packages/server/src/persistence/`、`packages/server/src/{protocol.ts,websocket.ts,authoritative-server.ts}`、`packages/core/src/{index.ts,sync.ts}`、`packages/desktop/src/{preload.ts,renderer/,sync/}`。 | 硬：FT-03 message/source transaction、FT-13 durable storage/repair、FT-01 membership download recheck。软：FT-05 corpus和 FT-06 retrieval。上传写入先于 extraction，可让 extractor 并行但必须以 durable attachment ID 收敛。 | hash/MIME/size guard；storage+schema transaction；authorization/download test；extract/OCR fixture with failure transparency；restart/cross-device E2E；safe preview Electron test。 |
 | **FT-05** M3 | T-0040 corpus persistence/repair；T-0041 runtime recovery；T-0017～0019 的来源/责任投影可作为迁移经验。 | 无 steward、五类 memory、watermark、source index、Context dispute/resolution 或 recall operational exclusion；当前最近 64 条窗口不符合 corpus 合同。区域：`packages/core/src/{collaboration.ts,sync.ts}`、`packages/server/src/persistence/{schema.ts,authority-database-handler.ts,snapshot-worker.ts}`、`packages/server/src/{authoritative-server.ts,agent-runtime/}`。 | 硬：FT-03 revision/tombstone、FT-04 attachment source、FT-13 durable rebuild；FT-02 Room boundary。软：FT-09 confirmed project facts。可先在 authority 建立 versioned memory/source model，与 FT-06 编译器并行；watermark contract 必须共同评审且串行合入。 | closed record/state-transition tests；steward async/idempotency/restart tests；dispute exclusion tests；repair equivalence；memory-failure degraded E2E。 |
@@ -69,7 +69,12 @@ FT-16 的设计覆盖矩阵还对 **全部 103 条** Requirement 给出了一个
 flowchart LR
   M1["M1: approved evidence / PRD / FT-16 input"]
   F01["FT-01 Identity & Session"]
-  F02["FT-02 Room Governance"]
+  F02A["FT-02A: owner / roles / transfer / CAS"]
+  Spine["Shared private contract spine"]
+  F09A["FT-09A departure contributor"]
+  F02B["FT-02B: Human departure governance"]
+  PSet["Eight server-private lifecycle participants"]
+  F02C["FT-02C: archive / reopen / Desktop"]
   F03["FT-03 Message Authority"]
   F04["FT-04 Attachment Pipeline"]
   F13["FT-13 Sync & Reliability"]
@@ -87,15 +92,23 @@ flowchart LR
   F16["FT-16 Design Contract"]
 
   M1 --> F01
-  M1 --> F02
+  M1 --> F02A
   M1 --> F03
   M1 --> F04
   M1 --> F13
   M1 -. "all UI states" .-> F16
-  F01 --> F02
+  F01 --> F02A
   F01 --> F11a
   F01 --> F13
-  F02 --> F03
+  F02A --> Spine
+  Spine --> F09A
+  Spine --> F02B
+  F09A --> F02B
+  Spine --> PSet
+  PSet --> F02C
+  F02A --> F02B
+  F02A --> F02C
+  F02A --> F03
   F03 --> F04
   F03 --> F05
   F03 --> F08
@@ -107,12 +120,16 @@ flowchart LR
   F06 --> F07
   F07 --> F08
   F08 --> F10
-  F02 --> F09
+  F02B --> F09
   F03 --> F09
   F05 --> F09
   F09 --> F12
   F13 --> F12
-  F02 --> F10
+  F02A --> F10
+  F10 -. "ArchiveToolSafetyParticipant" .-> PSet
+  F03 -. "ArchivedMessageGate" .-> PSet
+  F08 -. "RuntimeArchiveFenceParticipant" .-> PSet
+  F13 -. "repair / cache / lease ports" .-> PSet
   F09 --> F10
   F10 --> F14
   F13 --> F14
@@ -124,7 +141,7 @@ flowchart LR
   F09 --> F15
   F16 -. "UI acceptance gate" .-> F11a
   F16 -. "UI acceptance gate" .-> F11b
-  F16 -. "settings / execution / project / notification" .-> F02
+  F16 -. "settings / archived / departure" .-> F02C
   F16 -. "settings / execution / project / notification" .-> F07
   F16 -. "settings / execution / project / notification" .-> F08
   F16 -. "settings / execution / project / notification" .-> F09

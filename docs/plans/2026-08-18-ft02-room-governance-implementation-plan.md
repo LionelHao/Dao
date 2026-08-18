@@ -4,6 +4,8 @@
 > 状态：**TDD 实施计划；仅在 FT-01 合入后的独立实现会话执行**
 > 工程设计：[2026-08-18-ft02-room-governance-design.md](./2026-08-18-ft02-room-governance-design.md)
 
+> **2026-08-18 owner 分片决定：** 后续实施已拆为 FT-02B（departure governance）与 FT-02C（archive/reopen settlement + Desktop）。执行入口、依赖、文件所有权、race 与退出条件以 [FT-02B / FT-02C 分片实施说明](./2026-08-18-ft02b-ft02c-sliced-implementation-note.md) 为准。本文件下列原始 slice 保留为验收证据池，但不再解释为“等待完整 FT-07/09/10/13 后一次性启动”的串行路径。
+
 ## 1. 交付目标和执行约束
 
 实现 Room 即 Project、唯一 owner、owner/admin/member 治理、离群责任清理、archive/reopen 及其 authority/sync/Desktop 闭环。实现必须满足 `REQ-ROOM-001`～`REQ-ROOM-004`、`REQ-PRIM-003`～`REQ-PRIM-005`、`REQ-ID-003`/`REQ-ID-005`、`REQ-NFR-002`～`REQ-NFR-004`、`REQ-NFR-007`～`REQ-NFR-008`、`REQ-NFR-011`～`REQ-NFR-014`，并为 `REQ-PRJ-004`～`REQ-PRJ-012` 与 `REQ-AGT-012` 留出已测试 seam。
@@ -17,19 +19,25 @@
 
 ## 2. 进入条件与集成决策点
 
+进入条件按分片判定，不再使用一个全 FT 阻塞门：
+
+- FT-02B 只直接等待 shared contract spine 与 FT-09A 聚合 `DepartureResponsibilityPort` 的实际合入 commit；不等待完整 FT-07、FT-10 或 FT-13，但聚合 port 必须装配所有已启用 contributor，FT-10 pending-confirmation contributor 已启用却缺失时仍必须 503 且整笔零写。
+- FT-02C 只消费分片说明列出的八个 server-private lifecycle dependency；不等待其所属完整 FT，但本次 command 所需 transaction participant、repair descriptor 或 cache/lease port 缺失、版本错误、enabled-but-unregistered 或执行失败时必须 503 且整笔零写。
+- participant 合入前，archive/reopen继续保持503；禁止 empty/no-op stub、旧 archive旁路和 post-commit settlement。
+- FT-02 不复制 FT-07/09/10/13 的 SQL、状态机、runtime或cache authority。
+
 在写第一行生产代码前，实施者须在同一工作树做以下只读核对；任一条件未满足时停在 seam 对齐，不能猜测。
 
 | 检查 | 通过条件 | 否则行动 |
 | --- | --- | --- |
 | FT-01 集成 | `AuthenticatedSessionContext`、session revoke、身份 event/outbox、cache invalidation seam 的实际形状可用且有测试。 | 与 FT-01 所有者约定 adapter；FT-02 不直接修改其未合入 schema。 |
 | migration 顺序 | `AUTHORITY_SCHEMA_VERSION`、上一个 checksum/fingerprint/schema contract 来自实际 merged HEAD。 | 在合并队列指定新的连续版本；绝不占用“v12”或重写历史 migration。 |
-| FT-09 departure port | `DepartureResponsibilityPort` 能在 AuthorityWorker transaction 内列出 Request、NextAction、Blocker/OpenQuestion 和 acceptance 的活动引用，并能通过 own-command 完成/转交/升级。 | 只实现不依赖它的治理命令，所有 leave/remove fail closed `dependency_unavailable`；不把 OpenItem/LightTask 改名冒充 FT-09。 |
-| FT-10 archive safety port | 同一 transaction 可标记未 dispatch confirmation `rejected(room_archived)`、撤销 grant、fence waiting execution，且 dispatch 先 recheck room lifecycle。 | archive command 不进入 production；不能只设置 `rooms.status`。 |
-| FT-13/14 runtime/cache ports | lifecycle delta/repair、cache purge、offline lease/attachment read 的责任边界确定。 | 不宣称 archived read、撤权 cache 或租约行为已实现。 |
+| FT-09A aggregate departure port（仅 FT-02B） | shared spine 与聚合 `DepartureResponsibilityPort` 已合入，并能在同一 AuthorityWorker transaction汇总所有已启用 contributor；FT-09A port 与条件性 FT-10 `PendingConfirmationDepartureContributor` 的实际 merged SHA/registration均已记录。 | Human leave/remove保持503；不等待完整 FT-09/FT-10，也不直接调用 FT-10 persistence；任一 enabled contributor缺失不能解释为空冲突。 |
+| FT-02C lifecycle participants | 分片说明 §4 的八个 participant 分别有真实 registration/version/merged SHA；本 command所需集合均 ready。 | archive/reopen不进入production并保持503；不能只设置 `rooms.status`，也不能以空/no-op替代。 |
 
 ## 3. 目标落点与修改边界
 
-本计划只列仓库中当前已存在的文件路径；新增类型、测试和 UI 都应先落到这些既有模块，避免把 feature 拆成未经审阅的新平行框架。
+本计划原始落点只列仓库中当时已存在的路径；owner批准的 FT-02B/FT-02C coordinator、shared spine 与 participant integration unit 例外，精确新增路径以分片说明 §2.1、§3、§4.1 为准，不得另建未登记的平行框架。
 
 | 层 | 计划修改的现有文件 | 目的 |
 | --- | --- | --- |
@@ -41,6 +49,8 @@
 | Desktop | `packages/desktop/src/sync/client-sync-replica.ts`, `packages/desktop/src/sync/client-sync-replica.test.ts`, `packages/desktop/src/renderer/app.ts`, `packages/desktop/src/renderer/app.test.ts`, `packages/desktop/src/renderer/styles.css`, `packages/desktop/src/renderer/main.ts`, `packages/desktop/src/window.test.ts` | Room settings, conflict sheet, archived read-only/reopen states and accessible authority-driven UI。 |
 
 ## 4. TDD slices in dependency order
+
+下列 Slice 1～9 映射为：Slice 1～3 的已交付部分属于 FT-02A；Slice 4 属于 FT-02B；Slice 5～9 的 archive/reopen、repair与Desktop部分属于 FT-02C。精确执行顺序使用分片说明 §5；相邻 FT 的完整完成不再作为单一前置。
 
 Each slice is: add the stated RED test → make the smallest contract/implementation pass → run the focused regression set → refactor only after evidence is green. A failing test must not be skipped, weakened, converted to a snapshot-only assertion, or papered over by UI hiding.
 
@@ -92,7 +102,7 @@ Each slice is: add the stated RED test → make the smallest contract/implementa
 
 **RED:** with a transaction-local fake/real owning-port fixture, assert one conflict each for active Request, NextAction, Blocker/OpenQuestion, pending confirmation and pending acceptance; an empty list permits removal. Assert conflict IDs are stable, Room-scoped, actionable and omit secrets. Assert a responsibility created after preflight but before final remove makes final remove return 409 with the new closed list.
 
-**GREEN:** make `room.member.leave` and `room.member.remove` call the FT-09/FT-10 participants from the same AuthorityWorker transaction. The final command never changes a responsibility itself; it only observes its legal terminal/transfer/escalation/rejection state. Map unavailable dependency to 503 and test it.
+**GREEN:** make `room.member.leave` and `room.member.remove` call the single registered FT-09A aggregate `DepartureResponsibilityPort` from the same AuthorityWorker transaction, including the final collect immediately before membership mutation. FT-02B does not call FT-10 persistence directly; the aggregate port includes FT-09 domain contributors and, when enabled, the FT-10 `PendingConfirmationDepartureContributor`. The final command never changes a responsibility itself; it only observes its legal terminal/transfer/escalation/rejection state. Map missing enabled contributor, unavailable/malformed dependency or cross-Room output to 503 and test zero writes.
 
 **Required policy tests:**
 
