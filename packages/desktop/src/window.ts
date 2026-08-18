@@ -7,8 +7,29 @@ export interface BlankGroupChatWindowOptions {
     readonly contextIsolation: true;
     readonly nodeIntegration: false;
     readonly preload: string;
+    readonly sandbox: true;
+    readonly webSecurity: true;
   };
   readonly width: number;
+}
+
+export interface SecurityPolicyWindow {
+  readonly webContents: {
+    setWindowOpenHandler(handler: () => { readonly action: "deny" }): void;
+    on(
+      event: "will-navigate",
+      listener: (event: { preventDefault(): void }) => void,
+    ): void;
+    readonly session: {
+      setPermissionRequestHandler(
+        handler: (
+          webContents: unknown,
+          permission: string,
+          callback: (allowed: boolean) => void,
+        ) => void,
+      ): void;
+    };
+  };
 }
 
 export function blankGroupChatWindowOptions(
@@ -24,6 +45,20 @@ export function blankGroupChatWindowOptions(
       preload: preloadPath,
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
     },
   };
+}
+
+export function installWindowSecurityPolicy(window: SecurityPolicyWindow): void {
+  window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  window.webContents.on("will-navigate", (event) => {
+    event.preventDefault();
+  });
+  window.webContents.session.setPermissionRequestHandler(
+    (_webContents, _permission, callback) => {
+      callback(false);
+    },
+  );
 }

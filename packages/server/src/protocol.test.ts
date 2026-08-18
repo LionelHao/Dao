@@ -16,7 +16,209 @@ const validDraft = {
   sentAt: "2026-08-10T00:00:00.000Z",
 };
 
+const validDevice = {
+  id: "desktop-installation-1",
+  label: "Test desktop",
+  platform: "macos",
+} as const;
+
 describe("client protocol resource bounds", () => {
+  it("keeps a maximum escaped session list below the Desktop 64 KiB frame bound", () => {
+    const escaped = "\"".repeat(PROTOCOL_FIELD_LIMITS.sessionId);
+    const frame = {
+      type: "auth.sessions",
+      requestId: "\0".repeat(PROTOCOL_FIELD_LIMITS.requestId),
+      sessions: Array.from({ length: PROTOCOL_FIELD_LIMITS.sessions }, (_, index) => ({
+        id: escaped,
+        deviceLabel: escaped,
+        platform: "windows",
+        createdAt: "2026-08-18T00:00:00.000Z",
+        refreshExpiresAt: "2026-09-18T00:00:00.000Z",
+        current: index === 0,
+      })),
+    };
+
+    expect(PROTOCOL_FIELD_LIMITS.sessions).toBe(96);
+    expect(Buffer.byteLength(JSON.stringify(frame), "utf8")).toBeLessThan(64 * 1_024);
+  });
+
+  it("requires a closed device descriptor on auth.login", () => {
+    expect(parse({
+      type: "auth.login",
+      requestId: "login-device",
+      accountId: "account-human-1",
+      secret: "credential-canary",
+      device: { ...validDevice, label: "Lionel's MacBook" },
+    })).toEqual({
+      ok: true,
+      frame: {
+        type: "auth.login",
+        requestId: "login-device",
+        accountId: "account-human-1",
+        secret: "credential-canary",
+        device: { ...validDevice, label: "Lionel's MacBook" },
+      },
+    });
+
+    expect(parse({
+      type: "auth.login",
+      requestId: "missing-device",
+      accountId: "account-human-1",
+      secret: "credential-canary",
+    })).toMatchObject({
+      ok: false,
+      error: { status: 400, code: "invalid_request", requestId: "missing-device" },
+    });
+  });
+
+  it.each([
+    {
+      name: "missing device id",
+      device: { label: "MacBook", platform: "macos" },
+    },
+    {
+      name: "empty device id",
+      device: { id: "", label: "MacBook", platform: "macos" },
+    },
+    {
+      name: "blank device id",
+      device: { id: "   ", label: "MacBook", platform: "macos" },
+    },
+    {
+      name: "empty device label",
+      device: { id: "desktop-1", label: "", platform: "macos" },
+    },
+    {
+      name: "blank device label",
+      device: { id: "desktop-1", label: "   ", platform: "macos" },
+    },
+    {
+      name: "unknown platform",
+      device: { id: "desktop-1", label: "MacBook", platform: "ios" },
+    },
+    {
+      name: "extra device field",
+      device: { id: "desktop-1", label: "MacBook", platform: "macos", actorId: "forged" },
+    },
+    {
+      name: "oversized UTF-8 device id",
+      device: {
+        id: "界".repeat(Math.floor(PROTOCOL_FIELD_LIMITS.deviceId / 3) + 1),
+        label: "MacBook",
+        platform: "macos",
+      },
+    },
+    {
+      name: "oversized UTF-8 device label",
+      device: {
+        id: "desktop-1",
+        label: "界".repeat(Math.floor(PROTOCOL_FIELD_LIMITS.deviceLabel / 3) + 1),
+        platform: "macos",
+      },
+    },
+  ])("rejects $name without reflecting the login secret", ({ device }) => {
+    const parsed = parse({
+      type: "auth.login",
+      requestId: "invalid-device",
+      accountId: "account-human-1",
+      secret: "device-secret-canary",
+      device,
+    });
+
+    expect(parsed).toMatchObject({
+      ok: false,
+      error: {
+        type: "error",
+        status: 400,
+        code: "invalid_request",
+        requestId: "invalid-device",
+      },
+    });
+    expect(JSON.stringify(parsed)).not.toContain("device-secret-canary");
+  });
+
+  it("accepts exact device limits measured in UTF-8 bytes", () => {
+    expect(parse({
+      type: "auth.login",
+      requestId: "device-limits",
+      accountId: "account-human-1",
+      secret: "secret",
+      device: {
+        id: "i".repeat(PROTOCOL_FIELD_LIMITS.deviceId),
+        label: "l".repeat(PROTOCOL_FIELD_LIMITS.deviceLabel),
+        platform: "linux",
+      },
+    })).toMatchObject({ ok: true });
+  });
+
+  it.each([
+    {
+      frame: { type: "auth.sessions.list", requestId: "sessions-list" },
+      expected: { type: "auth.sessions.list", requestId: "sessions-list" },
+    },
+    {
+      frame: {
+        type: "auth.session.revoke",
+        requestId: "session-revoke",
+        sessionId: "public-session-2",
+      },
+      expected: {
+        type: "auth.session.revoke",
+        requestId: "session-revoke",
+        sessionId: "public-session-2",
+      },
+    },
+  ])("accepts closed $frame.type requests", ({ frame, expected }) => {
+    expect(parse(frame)).toEqual({ ok: true, frame: expected });
+  });
+
+  it.each([
+    {
+      name: "list extra field",
+      frame: { type: "auth.sessions.list", requestId: "sessions-list", accountId: "forged" },
+    },
+    {
+      name: "list missing requestId",
+      frame: { type: "auth.sessions.list" },
+    },
+    {
+      name: "target revoke missing sessionId",
+      frame: { type: "auth.session.revoke", requestId: "session-revoke" },
+    },
+    {
+      name: "target revoke empty sessionId",
+      frame: { type: "auth.session.revoke", requestId: "session-revoke", sessionId: "" },
+    },
+    {
+      name: "target revoke blank sessionId",
+      frame: { type: "auth.session.revoke", requestId: "session-revoke", sessionId: "   " },
+    },
+    {
+      name: "target revoke oversized sessionId",
+      frame: {
+        type: "auth.session.revoke",
+        requestId: "session-revoke",
+        sessionId: "s".repeat(PROTOCOL_FIELD_LIMITS.sessionId + 1),
+      },
+    },
+    {
+      name: "target revoke extra field",
+      frame: {
+        type: "auth.session.revoke",
+        requestId: "session-revoke",
+        sessionId: "public-session-2",
+        accessToken: "credential-canary",
+      },
+    },
+  ])("rejects $name as an invalid request", ({ frame }) => {
+    const parsed = parse(frame);
+    expect(parsed).toMatchObject({
+      ok: false,
+      error: { type: "error", status: 400, code: "invalid_request" },
+    });
+    expect(JSON.stringify(parsed)).not.toContain("credential-canary");
+  });
+
   it("accepts only the room-scoped closed ball query frame", () => {
     expect(parse({ type: "ball.query", requestId: "ball-1", roomId: "room-1" }))
       .toEqual({
@@ -29,8 +231,12 @@ describe("client protocol resource bounds", () => {
 
   it.each([
     ["requestId", { type: "auth.revoke", requestId: "" }],
-    ["accountId", { type: "auth.login", requestId: "r", accountId: "", secret: "s" }],
-    ["secret", { type: "auth.login", requestId: "r", accountId: "a", secret: "" }],
+    ["accountId", {
+      type: "auth.login", requestId: "r", accountId: "", secret: "s", device: validDevice,
+    }],
+    ["secret", {
+      type: "auth.login", requestId: "r", accountId: "a", secret: "", device: validDevice,
+    }],
     ["accessToken", { type: "auth.resume", requestId: "r", accessToken: "" }],
     ["refreshToken", { type: "auth.refresh", requestId: "r", refreshToken: "" }],
     ["roomId", { type: "room.history", requestId: "r", roomId: "" }],
@@ -60,6 +266,7 @@ describe("client protocol resource bounds", () => {
         requestId: "r",
         accountId: "a".repeat(PROTOCOL_FIELD_LIMITS.accountId + 1),
         secret: "s",
+        device: validDevice,
       },
     ],
     [
@@ -69,6 +276,7 @@ describe("client protocol resource bounds", () => {
         requestId: "r",
         accountId: "a",
         secret: "s".repeat(PROTOCOL_FIELD_LIMITS.secret + 1),
+        device: validDevice,
       },
     ],
     [
@@ -151,6 +359,7 @@ describe("client protocol resource bounds", () => {
         requestId: "r",
         accountId: "a".repeat(PROTOCOL_FIELD_LIMITS.accountId),
         secret: "s".repeat(PROTOCOL_FIELD_LIMITS.secret),
+        device: validDevice,
       },
     },
     {

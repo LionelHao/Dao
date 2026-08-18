@@ -36,6 +36,7 @@ import type {
   HumanCollaborationCommand,
   InternalAgentCommandContext,
   IssuedSessionRecord,
+  PublicSession,
   OutboxDelivery,
   OutboxDeliveryFailureReason,
   OutboxDispatchCandidate,
@@ -57,7 +58,7 @@ export interface CreateWorkerDatabaseClientOptions {
 }
 
 export interface AuthoritySchemaInspection {
-  readonly version: 11;
+  readonly version: 12;
 }
 
 export interface WorkerDatabaseClient {
@@ -77,6 +78,12 @@ export interface WorkerDatabaseClient {
   ): Promise<void>;
   rotateSession(input: HashedSessionRotation): Promise<IssuedSessionRecord>;
   revokeSession(accessTokenHash: string, now: number): Promise<void>;
+  listSessions(accessTokenHash: string, now: number): Promise<readonly PublicSession[]>;
+  revokeTargetSession(
+    accessTokenHash: string,
+    publicSessionId: string,
+    now: number,
+  ): Promise<void>;
   executeHuman(
     context: AuthenticatedCommandContext,
     command: HumanCollaborationCommand | RoomGovernanceCommand,
@@ -235,12 +242,15 @@ function authorityWorkerClientErrorStatus(
     case "room_member_not_found":
     case "room_not_found":
     case "snapshot_not_found":
+    case "session_not_found":
       return 404;
     case "actor_conflict":
     case "authority_already_initialized":
     case "authority_coordinator_exists":
     case "execution_conflict":
     case "route_conflict":
+    case "session_id_conflict":
+    case "session_limit_reached":
     case "execution_not_running":
     case "idempotency_conflict":
     case "invitation_consumed":
@@ -896,6 +906,58 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
     });
   }
 
+  listSessions(
+    accessTokenHash: string,
+    now: number,
+  ): Promise<readonly PublicSession[]> {
+    if (this.#terminalError !== undefined) {
+      return this.#rejectTerminal();
+    }
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) {
+      return Promise.reject(unavailable);
+    }
+    return this.#send({
+      type: "authority.sessions-list",
+      accessTokenHash,
+      now,
+    }).then((response) => {
+      if (response.type !== "authority.sessions") {
+        this.#failProtocol("Authority worker returned the wrong session list response");
+        throw this.#terminalError;
+      }
+      return response.sessions;
+    });
+  }
+
+  revokeTargetSession(
+    accessTokenHash: string,
+    publicSessionId: string,
+    now: number,
+  ): Promise<void> {
+    if (this.#terminalError !== undefined) {
+      return this.#rejectTerminal();
+    }
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) {
+      return Promise.reject(unavailable);
+    }
+    return this.#send({
+      type: "authority.session-revoke-target",
+      accessTokenHash,
+      publicSessionId,
+      now,
+    }).then((response) => {
+      if (
+        response.type !== "authority.session-target-revoked" ||
+        response.publicSessionId !== publicSessionId
+      ) {
+        this.#failProtocol("Authority worker returned the wrong targeted revoke response");
+        throw this.#terminalError;
+      }
+    });
+  }
+
   executeHuman(
     context: AuthenticatedCommandContext,
     command: HumanCollaborationCommand | RoomGovernanceCommand,
@@ -1434,6 +1496,10 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
         responseType === "authority.session-refresh-valid") ||
       (requestType === "authority.session-revoke" &&
         responseType === "authority.session-revoked") ||
+      (requestType === "authority.sessions-list" &&
+        responseType === "authority.sessions") ||
+      (requestType === "authority.session-revoke-target" &&
+        responseType === "authority.session-target-revoked") ||
       (requestType === "authority.execute-human" &&
         responseType === "authority.command-acknowledged") ||
       (requestType === "authority.execute-agent" &&

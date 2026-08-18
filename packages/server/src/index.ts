@@ -5,7 +5,11 @@ import {
   type WorkerDatabaseClient as InternalWorkerDatabaseClient,
 } from "./persistence/worker-database-client.js";
 
-export { startAuthoritativeServer } from "./authoritative-server.js";
+export {
+  AUTHORITATIVE_SERVER_DEFAULT_HOST,
+  AUTHORITATIVE_SERVER_DEFAULT_PORT,
+  startAuthoritativeServer,
+} from "./authoritative-server.js";
 export type {
   AuthoritativeServer,
   StartAuthoritativeServerOptions,
@@ -16,6 +20,9 @@ export {
   createAuthenticationService,
   createScryptIdentityAdapter,
   isSessionState,
+  MAX_ACTIVE_SESSION_FAMILIES,
+  SESSION_DEVICE_ID_MAX_BYTES,
+  SESSION_DEVICE_LABEL_MAX_BYTES,
 } from "./auth.js";
 export type {
   AuthenticatedPrincipal,
@@ -27,6 +34,8 @@ export type {
   IssuedSession,
   LoginCredentials,
   PasswordIdentityRecord,
+  SessionDevice,
+  SessionPlatform,
   SessionState,
 } from "./auth.js";
 export { createJsonStateStore, StateStoreCorruptionError } from "./state-store.js";
@@ -108,7 +117,11 @@ export type {
   AuthResumeFrame,
   AuthRevokeFrame,
   AuthRevokedFrame,
+  AuthSessionRevokeAckFrame,
+  AuthSessionRevokeFrame,
   AuthSessionRevokedFrame,
+  AuthSessionsFrame,
+  AuthSessionsListFrame,
   AgentCompensateFrame,
   AgentExecutionAckFrame,
   AgentExecutionPreviewFrame,
@@ -221,6 +234,9 @@ export async function createWorkerDatabaseClient(
       internal.validateSessionRefresh(currentRefreshTokenHash, expectedPrincipal, now),
     rotateSession: (input) => internal.rotateSession(input),
     revokeSession: (accessTokenHash, now) => internal.revokeSession(accessTokenHash, now),
+    listSessions: (accessTokenHash, now) => internal.listSessions(accessTokenHash, now),
+    revokeTargetSession: (accessTokenHash, publicSessionId, now) =>
+      internal.revokeTargetSession(accessTokenHash, publicSessionId, now),
     readHistory: (context, roomId, now) => internal.readHistory(context, roomId, now),
     canAccessRoom: (context, roomId, now) => internal.canAccessRoom(context, roomId, now),
     readRoomAudit: (context, roomId, now) => internal.readRoomAudit(context, roomId, now),
@@ -245,6 +261,7 @@ export type {
   HashedSessionIssue,
   HashedSessionRotation,
   IssuedSessionRecord,
+  PublicSession,
   JsonValue,
   OutboxDelivery,
   OutboxDeliveryFailureReason,

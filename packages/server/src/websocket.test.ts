@@ -40,6 +40,10 @@ import {
   type SyncService,
   createSubscriptionRegistry,
 } from "./index.js";
+import {
+  formatMessageWebSocketUrl,
+  validateMessageWebSocketListener,
+} from "./websocket.js";
 
 const humans = [
   {
@@ -93,6 +97,12 @@ const agents = [
   },
 ] as const satisfies readonly Actor[];
 
+const testLoginDevice = Object.freeze({
+  id: "websocket-test-installation",
+  label: "WebSocket test device",
+  platform: "unknown" as const,
+});
+
 const outsider = {
   id: "human-outsider",
   kind: "human",
@@ -129,6 +139,7 @@ interface SessionFrame extends Record<string, unknown> {
   readonly requestId: string;
   readonly accountId: string;
   readonly actorId: string;
+  readonly sessionId?: string;
   readonly accessToken?: string;
   readonly refreshToken?: string;
 }
@@ -204,13 +215,22 @@ class LoopbackClient {
     return new LoopbackClient(socket);
   }
 
-  async login(actor: Actor, requestId = `login-${actor.id}`): Promise<SessionFrame> {
+  async login(
+    actor: Actor,
+    requestId = `login-${actor.id}`,
+    device = {
+      id: `installation-${actor.id}`,
+      label: `Test device for ${actor.displayName}`,
+      platform: "unknown" as const,
+    },
+  ): Promise<SessionFrame> {
     const accountId = `account-${actor.id}`;
     this.send({
       type: "auth.login",
       requestId,
       accountId,
       secret: `secret-${actor.id}`,
+      device,
     });
     const received = await this.waitForAuthentication(requestId);
     return received.frame as SessionFrame;
@@ -231,6 +251,28 @@ class LoopbackClient {
     return this.waitFor(
       (frame) => hasType(frame, "auth.revoked") && frame.requestId === requestId,
       `revocation ${requestId}`,
+    );
+  }
+
+  async listSessions(requestId = "sessions-list"): Promise<ReceivedFrame> {
+    this.send({ type: "auth.sessions.list", requestId });
+    return this.waitFor(
+      (frame) => hasType(frame, "auth.sessions") && frame.requestId === requestId,
+      `session list ${requestId}`,
+    );
+  }
+
+  async revokeSession(
+    sessionId: string,
+    requestId = "session-revoke",
+  ): Promise<ReceivedFrame> {
+    this.send({ type: "auth.session.revoke", requestId, sessionId });
+    return this.waitFor(
+      (frame) =>
+        hasType(frame, "auth.session.revoke.ack") &&
+        frame.requestId === requestId &&
+        frame.sessionId === sessionId,
+      `targeted session revocation ${requestId}`,
     );
   }
 
@@ -513,10 +555,35 @@ function issuedSession(
 ): IssuedSession {
   return {
     ...principal,
+    sessionId: `${tokenPrefix}-session`,
     accessToken: `${tokenPrefix}-access`,
     refreshToken: `${tokenPrefix}-refresh`,
     expiresAt: "2026-08-10T01:00:00.000Z",
     refreshExpiresAt: "2026-08-11T00:00:00.000Z",
+  };
+}
+
+function idleMessageService(): MessageService {
+  return {
+    async send(_actorId, message) {
+      return {
+        type: "message.accepted",
+        requestId: message.id,
+        messageId: message.id,
+        persistedAt: "2026-08-18T00:00:00.000Z",
+      };
+    },
+    subscribe() { return () => undefined; },
+    async history() { return []; },
+  };
+}
+
+function idleOutboxStore(): OutboxDispatchStore {
+  return {
+    async listPendingOutbox() { return []; },
+    async authorizeOutboxCandidate() { return false; },
+    async markOutboxDispatched() {},
+    async markOutboxFailed() {},
   };
 }
 
@@ -666,6 +733,460 @@ afterEach(async () => {
 });
 
 describe("authenticated message WebSocket service", () => {
+  it.each([false, true])(
+    "revokes an unacknowledged login after post-commit validation fails (cleanup fails: %s)",
+    async (cleanupFails) => {
+      const principal = { accountId: "account-human-1", actorId: humans[0].id };
+      const session = issuedSession(principal, `login-compensation-${cleanupFails}`);
+      const revokeCalls: string[] = [];
+      const auth: AuthenticationService = {
+        async login() { return session; },
+        async authenticate() { return principal; },
+        async authenticateSession() {
+          throw new AuthorityWorkerClientError(
+            "storage_unavailable",
+            "authenticate-session-secret",
+          );
+        },
+        async refresh() { return session; },
+        async revoke(accessToken) {
+          revokeCalls.push(accessToken);
+          if (cleanupFails) throw new Error("cleanup-secret");
+        },
+        async listSessions() { return []; },
+        async revokeSession() {},
+      };
+      const server = await startMessageWebSocketServer({
+        auth,
+        service: idleMessageService(),
+        outboxStore: idleOutboxStore(),
+      });
+      const client = await LoopbackClient.connect(server.url);
+
+      try {
+        client.send({
+          type: "auth.login",
+          requestId: `login-compensation-${cleanupFails}`,
+          accountId: principal.accountId,
+          secret: "credential-secret",
+          device: testLoginDevice,
+        });
+        const received = await client.waitForError(
+          "storage_unavailable",
+          `login-compensation-${cleanupFails}`,
+        );
+        expect(received.frame).toMatchObject({ status: 503 });
+        expect(JSON.stringify(received.frame)).not.toContain("authenticate-session-secret");
+        expect(JSON.stringify(received.frame)).not.toContain("cleanup-secret");
+        expect(revokeCalls).toEqual([session.accessToken]);
+        expect(client.frameCount((frame) => hasType(frame, "auth.authenticated"))).toBe(0);
+      } finally {
+        await client.close();
+        await server.close();
+      }
+    },
+  );
+
+  it("keeps successful login unrevoked and compensates a failed post-rotation validation", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const loginSession = issuedSession(principal, "refresh-compensation-login");
+    const rotatedSession = issuedSession(principal, "refresh-compensation-rotated");
+    const revokeCalls: string[] = [];
+    let authenticateSessionCalls = 0;
+    const context = {
+      sessionId: "refresh-compensation-generation",
+      sessionFamilyId: "refresh-compensation-family",
+      principal,
+    };
+    const auth: AuthenticationService = {
+      async login() { return loginSession; },
+      async authenticate() { return principal; },
+      async authenticateSession() {
+        authenticateSessionCalls += 1;
+        if (authenticateSessionCalls === 1) return context;
+        throw new AuthorityWorkerClientError(
+          "storage_unavailable",
+          "rotation-validation-secret",
+        );
+      },
+      async refresh() { return rotatedSession; },
+      async revoke(accessToken) { revokeCalls.push(accessToken); },
+      async listSessions() { return []; },
+      async revokeSession() {},
+    };
+    const server = await startMessageWebSocketServer({
+      auth,
+      service: idleMessageService(),
+      outboxStore: idleOutboxStore(),
+    });
+    const client = await LoopbackClient.connect(server.url);
+
+    try {
+      await client.login(humans[0], "refresh-compensation-login");
+      expect(revokeCalls).toEqual([]);
+      client.send({
+        type: "auth.refresh",
+        requestId: "refresh-compensation-failure",
+        refreshToken: loginSession.refreshToken,
+      });
+      const received = await client.waitForError(
+        "storage_unavailable",
+        "refresh-compensation-failure",
+      );
+      expect(received.frame).toMatchObject({ status: 503 });
+      expect(JSON.stringify(received.frame)).not.toContain("rotation-validation-secret");
+      expect(revokeCalls).toEqual([rotatedSession.accessToken]);
+      expect(client.frameCount(
+        (frame) => hasType(frame, "auth.authenticated") &&
+          frame.requestId === "refresh-compensation-failure",
+      )).toBe(0);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("revokes a login committed after its socket closes while issuance is pending", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "closed-login-compensation");
+    const pending = deferred<IssuedSession>();
+    const entered = deferred<void>();
+    const revokeCalls: string[] = [];
+    const auth: AuthenticationService = {
+      async login() { entered.resolve(); return pending.promise; },
+      async authenticate() { return principal; },
+      async refresh() { return session; },
+      async revoke(accessToken) { revokeCalls.push(accessToken); },
+      async listSessions() { return []; },
+      async revokeSession() {},
+    };
+    const server = await startMessageWebSocketServer({
+      auth,
+      service: idleMessageService(),
+    });
+    const client = await LoopbackClient.connect(server.url);
+
+    client.send({
+      type: "auth.login",
+      requestId: "closed-login-compensation",
+      accountId: principal.accountId,
+      secret: "secret",
+      device: testLoginDevice,
+    });
+    await entered.promise;
+    await client.close();
+    pending.resolve(session);
+    await vi.waitFor(() => expect(revokeCalls).toEqual([session.accessToken]));
+    await server.close();
+  });
+
+  it("revokes a rotation committed after its authenticated socket closes", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const loginSession = issuedSession(principal, "closed-refresh-login");
+    const rotatedSession = issuedSession(principal, "closed-refresh-rotation");
+    const pending = deferred<IssuedSession>();
+    const entered = deferred<void>();
+    const revokeCalls: string[] = [];
+    const auth: AuthenticationService = {
+      async login() { return loginSession; },
+      async authenticate() { return principal; },
+      async refresh() { entered.resolve(); return pending.promise; },
+      async revoke(accessToken) { revokeCalls.push(accessToken); },
+      async listSessions() { return []; },
+      async revokeSession() {},
+    };
+    const server = await startMessageWebSocketServer({
+      auth,
+      service: idleMessageService(),
+    });
+    const client = await LoopbackClient.connect(server.url);
+
+    await client.login(humans[0], "closed-refresh-login");
+    expect(revokeCalls).toEqual([]);
+    client.send({
+      type: "auth.refresh",
+      requestId: "closed-refresh-compensation",
+      refreshToken: loginSession.refreshToken,
+    });
+    await entered.promise;
+    await client.close();
+    pending.resolve(rotatedSession);
+    await vi.waitFor(() => expect(revokeCalls).toEqual([rotatedSession.accessToken]));
+    await server.close();
+  });
+
+  it("lists same-account devices and revokes every live target-family connection without touching the caller", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const sessionA = issuedSession(principal, "device-a");
+    const sessionB = issuedSession(principal, "device-b");
+    const contextA = {
+      sessionId: "authority-generation-a",
+      sessionFamilyId: "authority-family-a",
+      principal,
+    };
+    const contextB = {
+      sessionId: "authority-generation-b",
+      sessionFamilyId: "authority-family-b",
+      principal,
+    };
+    const contextByAccessToken = new Map([
+      [sessionA.accessToken, contextA],
+      [sessionB.accessToken, contextB],
+    ]);
+    const publicIdByFamily = new Map([
+      [contextA.sessionFamilyId, sessionA.sessionId],
+      [contextB.sessionFamilyId, sessionB.sessionId],
+    ]);
+    const activeFamilies = new Set([
+      contextA.sessionFamilyId,
+      contextB.sessionFamilyId,
+    ]);
+    const publicSessions = [
+      {
+        id: sessionB.sessionId,
+        deviceLabel: "iMac",
+        platform: "macos" as const,
+        createdAt: "2026-08-12T00:01:00.000Z",
+        refreshExpiresAt: sessionB.refreshExpiresAt,
+      },
+      {
+        id: sessionA.sessionId,
+        deviceLabel: "MacBook",
+        platform: "macos" as const,
+        createdAt: "2026-08-12T00:00:00.000Z",
+        refreshExpiresAt: sessionA.refreshExpiresAt,
+      },
+    ];
+    const revokeCalls: string[] = [];
+    const revocationEvent: PersistedIdentityEvent & {
+      readonly type: "identity.session.revoked";
+    } = {
+      eventId: "targeted-revoke-event",
+      streamKind: "identity",
+      streamId: principal.actorId,
+      streamSeq: 1,
+      actorId: principal.actorId,
+      occurredAt: "2026-08-12T00:02:00.000Z",
+      type: "identity.session.revoked",
+      payload: {
+        sessionId: contextB.sessionId,
+        familyId: contextB.sessionFamilyId,
+        accountId: principal.accountId,
+      },
+    };
+    const revocationDelivery: OutboxDelivery = {
+      deliveryId: "targeted-revoke-delivery",
+      eventId: revocationEvent.eventId,
+      targetKind: "session-family",
+      targetId: contextB.sessionFamilyId,
+      streamSeq: revocationEvent.streamSeq,
+      attempts: 0,
+      event: revocationEvent,
+    };
+    let queuedRevocation: OutboxDelivery | undefined;
+    let dispatchReleased = false;
+    const dispatched: string[] = [];
+
+    function authenticateContext(accessToken: string) {
+      const context = contextByAccessToken.get(accessToken);
+      if (context === undefined) {
+        throw new AuthenticationError(401, "invalid_token");
+      }
+      if (!activeFamilies.has(context.sessionFamilyId)) {
+        throw new AuthenticationError(403, "session_revoked");
+      }
+      return context;
+    }
+
+    const auth: AuthenticationService = {
+      async login(_credentials, device) {
+        if (device?.id === "installation-a") return sessionA;
+        if (device?.id === "installation-b") return sessionB;
+        throw new AuthenticationError(401, "invalid_credentials");
+      },
+      async authenticate(accessToken) {
+        return authenticateContext(accessToken).principal;
+      },
+      async authenticateSession(accessToken) {
+        return authenticateContext(accessToken);
+      },
+      async refresh() {
+        return sessionA;
+      },
+      async revoke() {},
+      async listSessions(accessToken) {
+        const current = authenticateContext(accessToken);
+        const currentPublicId = publicIdByFamily.get(current.sessionFamilyId);
+        return publicSessions
+          .filter((session) => [...publicIdByFamily.entries()].some(
+            ([familyId, publicId]) =>
+              publicId === session.id && activeFamilies.has(familyId),
+          ))
+          .map((session) => ({
+            ...session,
+            current: session.id === currentPublicId,
+          }));
+      },
+      async revokeSession(accessToken, sessionId) {
+        authenticateContext(accessToken);
+        const targetFamily = [...publicIdByFamily.entries()].find(
+          ([, publicId]) => publicId === sessionId,
+        )?.[0];
+        if (targetFamily === undefined) {
+          throw new AuthenticationError(404, "session_not_found");
+        }
+        revokeCalls.push(sessionId);
+        if (!activeFamilies.delete(targetFamily)) return;
+        if (targetFamily === contextB.sessionFamilyId) {
+          queuedRevocation = revocationDelivery;
+        }
+      },
+    };
+    const history = vi.fn(async () => [] as readonly Message[]);
+    const service: MessageService = {
+      async send(_context, message) {
+        return {
+          type: "message.accepted",
+          requestId: message.id,
+          messageId: message.id,
+          persistedAt: "2026-08-12T00:00:00.000Z",
+        };
+      },
+      subscribe() { return () => undefined; },
+      history,
+    };
+    const outboxStore: OutboxDispatchStore = {
+      async listPendingOutbox() {
+        return dispatchReleased && queuedRevocation !== undefined
+          ? [queuedRevocation]
+          : [];
+      },
+      async authorizeOutboxCandidate(delivery, candidate) {
+        return delivery.targetKind === "session-family" &&
+          delivery.targetId === candidate.sessionFamilyId;
+      },
+      async markOutboxDispatched(deliveryId) {
+        dispatched.push(deliveryId);
+        queuedRevocation = undefined;
+      },
+      async markOutboxFailed() {
+        throw new Error("targeted terminal delivery must not fail");
+      },
+    };
+    const server = await startMessageWebSocketServer({
+      auth,
+      service,
+      outboxStore,
+      outboxPollIntervalMs: 10,
+    });
+    const deviceA = await LoopbackClient.connect(server.url);
+    const deviceB = await LoopbackClient.connect(server.url);
+    const deviceBPeer = await LoopbackClient.connect(server.url);
+
+    try {
+      const loginA = await deviceA.login(humans[0], "login-device-a", {
+        id: "installation-a",
+        label: "MacBook",
+        platform: "macos",
+      });
+      const loginB = await deviceB.login(humans[0], "login-device-b", {
+        id: "installation-b",
+        label: "iMac",
+        platform: "macos",
+      });
+      expect(loginA).toMatchObject({ sessionId: sessionA.sessionId });
+      expect(loginB).toMatchObject({ sessionId: sessionB.sessionId });
+      await expect(deviceBPeer.resume(sessionB.accessToken, "resume-device-b-peer"))
+        .resolves.toMatchObject({ frame: { sessionId: sessionB.sessionId } });
+
+      const initialList = await deviceA.listSessions("list-before-revoke");
+      expect(initialList.frame).toEqual({
+        type: "auth.sessions",
+        requestId: "list-before-revoke",
+        sessions: [
+          { ...publicSessions[0], current: false },
+          { ...publicSessions[1], current: true },
+        ],
+      });
+      expect(JSON.stringify(initialList.frame)).not.toContain("device-a-access");
+      expect(JSON.stringify(initialList.frame)).not.toContain("device-b-refresh");
+      expect(JSON.stringify(initialList.frame)).not.toContain("authority-family");
+
+      deviceA.send({
+        type: "auth.session.revoke",
+        requestId: "foreign-revoke",
+        sessionId: "foreign-or-random-session",
+      });
+      await expect(deviceA.waitForError("session_not_found", "foreign-revoke"))
+        .resolves.toMatchObject({ frame: { status: 404 } });
+      expect(activeFamilies).toEqual(new Set([
+        contextA.sessionFamilyId,
+        contextB.sessionFamilyId,
+      ]));
+
+      await expect(deviceA.revokeSession(sessionB.sessionId, "revoke-device-b"))
+        .resolves.toMatchObject({
+          frame: {
+            type: "auth.session.revoke.ack",
+            requestId: "revoke-device-b",
+            sessionId: sessionB.sessionId,
+            revoked: true,
+          },
+        });
+      expect(revokeCalls).toEqual([sessionB.sessionId]);
+
+      deviceB.send({ type: "room.history", requestId: "device-b-after-revoke", roomId });
+      deviceBPeer.send({
+        type: "room.history",
+        requestId: "device-b-peer-after-revoke",
+        roomId,
+      });
+      await expect(deviceB.waitForError("session_revoked", "device-b-after-revoke"))
+        .resolves.toMatchObject({ frame: { status: 403 } });
+      await expect(deviceBPeer.waitForError(
+        "session_revoked",
+        "device-b-peer-after-revoke",
+      )).resolves.toMatchObject({ frame: { status: 403 } });
+
+      dispatchReleased = true;
+      await Promise.all([
+        deviceB.waitForFrame(
+          (frame) => hasType(frame, "auth.session-revoked") &&
+            frame.eventId === revocationEvent.eventId,
+          "device B terminal revoke",
+        ),
+        deviceBPeer.waitForFrame(
+          (frame) => hasType(frame, "auth.session-revoked") &&
+            frame.eventId === revocationEvent.eventId,
+          "device B peer terminal revoke",
+        ),
+      ]);
+      await Promise.all([deviceB.waitForClose(), deviceBPeer.waitForClose()]);
+      expect(deviceB.frameCount((frame) => hasType(frame, "auth.session-revoked"))).toBe(1);
+      expect(deviceBPeer.frameCount((frame) => hasType(frame, "auth.session-revoked"))).toBe(1);
+      await vi.waitFor(() => expect(dispatched).toEqual([revocationDelivery.deliveryId]));
+
+      const converged = await deviceA.listSessions("list-after-revoke");
+      expect(converged.frame).toEqual({
+        type: "auth.sessions",
+        requestId: "list-after-revoke",
+        sessions: [{ ...publicSessions[1], current: true }],
+      });
+      await expect(deviceA.history(roomId, "caller-remains-authenticated"))
+        .resolves.toMatchObject({
+          frame: { type: "room.history", requestId: "caller-remains-authenticated" },
+        });
+      expect(history).toHaveBeenCalledTimes(1);
+    } finally {
+      await Promise.all([
+        deviceA.close(),
+        deviceB.close(),
+        deviceBPeer.close(),
+      ]);
+      await server.close();
+    }
+  });
+
   it("routes closed T-0017/T-0018 human collaboration frames and preserves API errors", async () => {
     const principal = { accountId: "account-human-1", actorId: humans[0].id };
     const session = issuedSession(principal, "open-item-api");
@@ -1266,6 +1787,7 @@ describe("authenticated message WebSocket service", () => {
     [new SnapshotWorkerClientError("snapshot_worker_error", "worker details"), 503, "storage_unavailable"],
     [new SnapshotWorkerClientError("snapshot_worker_protocol_error", "bad envelope"), 503, "storage_unavailable"],
     [new AuthorityWorkerClientError("repair_barrier_active", "authority internals"), 503, "repair_barrier_active"],
+    [new AuthorityWorkerClientError("session_limit_reached", "authority capacity"), 409, "session_limit_reached"],
     [new AuthorityWorkerClientError("authority_worker_closed", "worker details"), 503, "storage_unavailable"],
     [new AuthorityWorkerClientError("authority_worker_error", "worker details"), 503, "storage_unavailable"],
     [new AuthorityWorkerClientError("authority_worker_protocol_error", "bad envelope"), 503, "storage_unavailable"],
@@ -2971,6 +3493,21 @@ describe("authenticated message WebSocket service", () => {
     expect(serverModule.MESSAGE_WEBSOCKET_MAX_QUEUED_FRAME_BYTES).toBe(256 * 1_024);
   });
 
+  it("keeps the plaintext authority listener loopback-only and formats IPv6 URLs", () => {
+    expect(() => validateMessageWebSocketListener("127.0.0.1", 8_787)).not.toThrow();
+    expect(() => validateMessageWebSocketListener("127.12.34.56", 0)).not.toThrow();
+    expect(() => validateMessageWebSocketListener("localhost", 65_535)).not.toThrow();
+    expect(() => validateMessageWebSocketListener("::1", 0)).not.toThrow();
+    expect(formatMessageWebSocketUrl("::1", 8_787)).toBe("ws://[::1]:8787");
+
+    for (const host of ["", " ", "127.0.0.1 ", "0.0.0.0", "::", "192.168.1.2", "example.com"]) {
+      expect(() => validateMessageWebSocketListener(host, 8_787)).toThrow(TypeError);
+    }
+    for (const port of [-1, 1.5, 65_536, Number.POSITIVE_INFINITY]) {
+      expect(() => validateMessageWebSocketListener("127.0.0.1", port)).toThrow(RangeError);
+    }
+  });
+
   it.each([
     { option: "maxQueuedFrameCount", value: 0 },
     { option: "maxQueuedFrameCount", value: 1.5 },
@@ -3031,11 +3568,29 @@ describe("authenticated message WebSocket service", () => {
       frame: { type: "error", status: 400, code: "invalid_request" },
     });
 
+    client.send({ type: "auth.sessions.list", requestId: "unauthenticated-list" });
+    await expect(client.waitForError("unauthenticated", "unauthenticated-list"))
+      .resolves.toMatchObject({ frame: { status: 401 } });
+    client.send({
+      type: "auth.session.revoke",
+      requestId: "unauthenticated-target-revoke",
+      sessionId: "public-session-canary",
+    });
+    const unauthenticatedRevoke = await client.waitForError(
+      "unauthenticated",
+      "unauthenticated-target-revoke",
+    );
+    expect(unauthenticatedRevoke.frame).toMatchObject({ status: 401 });
+    expect(JSON.stringify(unauthenticatedRevoke.frame)).not.toContain(
+      "public-session-canary",
+    );
+
     client.send({
       type: "auth.login",
       requestId: "bad-login",
       accountId: "account-human-1",
       secret: "wrong-secret",
+      device: testLoginDevice,
     });
     const invalidCredentials = await client.waitForError("invalid_credentials", "bad-login");
     expect(invalidCredentials.frame).toMatchObject({ status: 401 });
@@ -3132,6 +3687,7 @@ describe("authenticated message WebSocket service", () => {
         requestId: "count-bound-login",
         accountId: principal.accountId,
         secret: "correct-secret",
+        device: testLoginDevice,
       });
       await loginStarted.promise;
       client.send({
@@ -3204,6 +3760,7 @@ describe("authenticated message WebSocket service", () => {
       requestId: "byte-bound-login",
       accountId: principal.accountId,
       secret: "correct-secret",
+      device: testLoginDevice,
     });
     const largeFrame = JSON.stringify({
       type: "message.send",
@@ -3342,6 +3899,7 @@ describe("authenticated message WebSocket service", () => {
       requestId: "exact-outbound-login",
       accountId: principal.accountId,
       actorId: principal.actorId,
+      sessionId: session.sessionId,
       accessToken: session.accessToken,
       refreshToken: session.refreshToken,
       expiresAt: session.expiresAt,
@@ -3388,6 +3946,7 @@ describe("authenticated message WebSocket service", () => {
         requestId: authenticated.requestId,
         accountId: principal.accountId,
         secret: "correct-secret",
+        device: testLoginDevice,
       });
 
       await expect(client.waitForAuthentication(authenticated.requestId)).resolves.toMatchObject({
@@ -3464,6 +4023,7 @@ describe("authenticated message WebSocket service", () => {
         requestId: "terminate-login",
         accountId: principal.accountId,
         secret: "correct-secret",
+        device: testLoginDevice,
       });
       client.send({
         type: "message.send",
@@ -3543,6 +4103,7 @@ describe("authenticated message WebSocket service", () => {
         requestId: "throwing-login",
         accountId: principal.accountId,
         secret: "correct-secret",
+        device: testLoginDevice,
       });
       client.send({
         type: "message.send",
@@ -3755,6 +4316,7 @@ describe("authenticated message WebSocket service", () => {
       requestId: "agent-login",
       accountId: `account-${agents[0].id}`,
       secret: `secret-${agents[0].id}`,
+      device: testLoginDevice,
     });
     await expect(agentClient.waitForError("identity_forbidden", "agent-login")).resolves.toMatchObject({
       frame: { status: 403 },
@@ -3796,6 +4358,7 @@ describe("authenticated message WebSocket service", () => {
         type: "auth.authenticated",
         requestId: "restart-resume",
         actorId: humans[0].id,
+        sessionId: session.sessionId,
       },
     });
     await resumed.revoke("restart-revoke");
@@ -4328,6 +4891,7 @@ describe("authenticated message WebSocket service", () => {
       requestId: "second-login",
       accountId: `account-${humans[1].id}`,
       secret: `secret-${humans[1].id}`,
+      device: testLoginDevice,
     });
     await expect(client.waitForError("already_authenticated", "second-login")).resolves.toMatchObject({
       frame: { status: 409 },

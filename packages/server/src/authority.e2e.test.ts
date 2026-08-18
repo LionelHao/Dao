@@ -1,13 +1,35 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { createHash } from "node:crypto";
-import { access, readFile, unlink } from "node:fs/promises";
+import { createHash, scryptSync } from "node:crypto";
+import { access, readFile, readdir, unlink } from "node:fs/promises";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer as createTcpServer, type Socket } from "node:net";
 import { DatabaseSync } from "node:sqlite";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { WebSocket } from "ws";
+import {
+  createIdentitySessionController,
+  type AuthorizedStateInvalidator,
+  type IdentitySessionController,
+} from "../../desktop/src/identity/controller.js";
+import {
+  IDENTITY_CONTRACT_LIMITS,
+  type IdentityPublicState,
+  type IdentityStoredCredentials,
+} from "../../desktop/src/identity/contracts.js";
+import type { IdentityCredentialVault } from "../../desktop/src/identity/credential-vault.js";
+import type { DeviceIdentityStore } from "../../desktop/src/identity/device-identity.js";
+import {
+  createIdentityWebSocketClient,
+  type IdentityWebSocketClient,
+  type IdentityWebSocketLike,
+} from "../../desktop/src/identity/websocket-client.js";
+import { createScryptIdentityAdapter, MAX_ACTIVE_SESSION_FAMILIES } from "./auth.js";
+import {
+  startAuthoritativeServer,
+  type AuthoritativeServer,
+} from "./authoritative-server.js";
 import type { ServerFrame } from "./protocol.js";
 import {
   createClientSyncReplica,
@@ -46,6 +68,131 @@ const actors = [
 ] as const;
 const childStderr = new WeakMap<ChildProcessWithoutNullStreams, string>();
 const stressPageSize = 50;
+
+class NodeIdentityWebSocketAdapter implements IdentityWebSocketLike {
+  readonly #socket: WebSocket;
+  readonly #wrappers = new Map<
+    "open" | "message" | "close" | "error",
+    Map<(event: unknown) => void, (...args: unknown[]) => void>
+  >();
+
+  constructor(endpoint: string) {
+    this.#socket = new WebSocket(endpoint);
+  }
+
+  get readyState(): number {
+    return this.#socket.readyState;
+  }
+
+  addEventListener(
+    type: "open" | "message" | "close" | "error",
+    listener: (event: unknown) => void,
+  ): void {
+    const byListener = this.#wrappers.get(type) ?? new Map();
+    const wrapped = (...args: unknown[]): void => {
+      if (type === "message") {
+        const [data, isBinary] = args;
+        listener({
+          data: isBinary === true
+            ? data
+            : Buffer.from(data as Uint8Array).toString("utf8"),
+        });
+        return;
+      }
+      listener(args[0] ?? {});
+    };
+    byListener.set(listener, wrapped);
+    this.#wrappers.set(type, byListener);
+    this.#socket.on(type, wrapped);
+  }
+
+  removeEventListener(
+    type: "open" | "message" | "close" | "error",
+    listener: (event: unknown) => void,
+  ): void {
+    const byListener = this.#wrappers.get(type);
+    const wrapped = byListener?.get(listener);
+    if (wrapped === undefined) return;
+    this.#socket.off(type, wrapped);
+    byListener.delete(listener);
+    if (byListener.size === 0) this.#wrappers.delete(type);
+  }
+
+  send(data: string): void {
+    this.#socket.send(data);
+  }
+
+  close(code?: number, reason?: string): void {
+    this.#socket.close(code, reason);
+  }
+}
+
+function createMemoryCredentialVault(initial?: IdentityStoredCredentials): {
+  readonly vault: IdentityCredentialVault;
+  readonly read: () => IdentityStoredCredentials | undefined;
+  readonly clear: ReturnType<typeof vi.fn>;
+} {
+  let stored = initial === undefined ? undefined : structuredClone(initial);
+  const clear = vi.fn(async () => {
+    stored = undefined;
+  });
+  return {
+    vault: {
+      async load() {
+        return stored === undefined ? undefined : structuredClone(stored);
+      },
+      async save(credentials) {
+        stored = structuredClone(credentials);
+      },
+      clear,
+    },
+    read: () => stored === undefined ? undefined : structuredClone(stored),
+    clear,
+  };
+}
+
+function createMemoryDevice(
+  id: string,
+  label: string,
+): DeviceIdentityStore {
+  return {
+    async loadOrCreate() {
+      return { id, label, platform: "macos" };
+    },
+  };
+}
+
+function createTrackedInvalidator(): AuthorizedStateInvalidator & {
+  readonly invalidate: ReturnType<typeof vi.fn>;
+} {
+  return { invalidate: vi.fn(async () => undefined) };
+}
+
+function createDesktopClientFactory(
+  endpoint: string,
+  profile: string,
+): () => IdentityWebSocketClient {
+  let sequence = 0;
+  return () => createIdentityWebSocketClient({
+    endpoint,
+    webSocketFactory: (url) => new NodeIdentityWebSocketAdapter(url),
+    requestIdFactory: () => `${profile}-${++sequence}`,
+    timeoutMs: 5_000,
+  });
+}
+
+async function readAllRegularFiles(directory: string): Promise<readonly Buffer[]> {
+  const contents: Buffer[] = [];
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) {
+      contents.push(...await readAllRegularFiles(path));
+    } else if (entry.isFile()) {
+      contents.push(await readFile(path));
+    }
+  }
+  return contents;
+}
 
 interface ChildStartOptions {
   readonly directory: string;
@@ -489,6 +636,11 @@ class JsonWebSocketClient {
       requestId,
       accountId: "account-a",
       secret: "test-secret",
+      device: {
+        id: "authority-e2e-installation",
+        label: "Authority E2E device",
+        platform: "unknown",
+      },
     }, "auth.authenticated");
     if (frame.type !== "auth.authenticated") throw new TypeError("wrong login frame");
     return frame.accessToken;
@@ -916,6 +1068,10 @@ describe("authoritative server real-process harness", () => {
     const packageRoot = await import("./index.js");
 
     expect(module.startAuthoritativeServer).toBeTypeOf("function");
+    expect(packageRoot.AUTHORITATIVE_SERVER_DEFAULT_HOST).toBe("127.0.0.1");
+    expect(packageRoot.AUTHORITATIVE_SERVER_DEFAULT_PORT).toBe(8_787);
+    // Prevent server issuance/list bounds from exceeding the Desktop frame parser.
+    expect(IDENTITY_CONTRACT_LIMITS.sessions).toBe(MAX_ACTIVE_SESSION_FAMILIES);
     expect(packageRoot).not.toHaveProperty("startAuthoritativeServerForTest");
     expect(packageRoot).not.toHaveProperty(
       "createWorkerDatabaseClientWithTransactionFaultForTest",
@@ -924,6 +1080,315 @@ describe("authoritative server real-process harness", () => {
       .resolves.not.toContain("startAuthoritativeServerForTest");
     await expect(readFile(join(process.cwd(), "packages/server/dist/index.d.ts"), "utf8"))
       .resolves.not.toContain("createWorkerDatabaseClientWithTransactionFaultForTest");
+  });
+
+  it("drives three isolated Desktop Identity controllers through real password login and targeted device revocation", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-ft01-desktop-authority-"));
+    const databasePath = join(directory, "authority.sqlite");
+    const snapshotCachePath = join(directory, "snapshot-cache.sqlite");
+    const accountId = "account-a";
+    const passwordCanary = "ft01-password-canary-never-persist-2026";
+    const salt = Buffer.from("ft01-scrypt-salt-v1", "utf8");
+    const identities = createScryptIdentityAdapter([{
+      accountId,
+      actorId: "human-a",
+      salt: salt.toString("base64url"),
+      hash: scryptSync(passwordCanary, salt, 64).toString("base64url"),
+    }]);
+    const serverOptions = {
+      databasePath,
+      snapshotCachePath,
+      listen: { host: "127.0.0.1", port: 0 },
+      actors,
+      identities,
+      invitationSecretKey: new Uint8Array(32).fill(19),
+    } as const;
+    const profileA = createMemoryCredentialVault();
+    const profileB = createMemoryCredentialVault();
+    const profileC = createMemoryCredentialVault();
+    const invalidatorA = createTrackedInvalidator();
+    const invalidatorB = createTrackedInvalidator();
+    const invalidatorC = createTrackedInvalidator();
+    const observedA: IdentityPublicState[] = [];
+    const observedB: IdentityPublicState[] = [];
+    const observedC: IdentityPublicState[] = [];
+    const observedRestoredA: IdentityPublicState[] = [];
+    const observedReloginA: IdentityPublicState[] = [];
+    const applicationLogs: unknown[][] = [];
+    const logSpies = (["debug", "info", "warn", "error"] as const).map((method) =>
+      vi.spyOn(console, method).mockImplementation((...values: unknown[]) => {
+        applicationLogs.push(values);
+      }));
+    const controllers: IdentitySessionController[] = [];
+    let server: AuthoritativeServer | undefined;
+
+    try {
+      server = await startAuthoritativeServer(serverOptions);
+      const controllerA = createIdentitySessionController({
+        vault: profileA.vault,
+        deviceIdentity: createMemoryDevice("installation-a", "FT01 Device A"),
+        clientFactory: createDesktopClientFactory(server.url, "desktop-a"),
+        authorizedState: invalidatorA,
+      });
+      const controllerB = createIdentitySessionController({
+        vault: profileB.vault,
+        deviceIdentity: createMemoryDevice("installation-b", "FT01 Device B"),
+        clientFactory: createDesktopClientFactory(server.url, "desktop-b"),
+        authorizedState: invalidatorB,
+      });
+      const controllerC = createIdentitySessionController({
+        vault: profileC.vault,
+        deviceIdentity: createMemoryDevice("installation-c", "FT01 Device C"),
+        clientFactory: createDesktopClientFactory(server.url, "desktop-c"),
+        authorizedState: invalidatorC,
+      });
+      controllers.push(controllerA, controllerB, controllerC);
+      controllerA.subscribe((state) => observedA.push(state));
+      controllerB.subscribe((state) => observedB.push(state));
+      controllerC.subscribe((state) => observedC.push(state));
+
+      await expect(controllerA.initialize()).resolves.toEqual({ status: "signed-out" });
+      await expect(controllerB.initialize()).resolves.toEqual({ status: "signed-out" });
+      await expect(controllerC.initialize()).resolves.toEqual({ status: "signed-out" });
+      await expect(controllerA.login({ accountId, secret: passwordCanary }))
+        .resolves.toMatchObject({
+          status: "authenticated",
+          accountId,
+          actorId: "human-a",
+          sessions: [{ deviceLabel: "FT01 Device A", current: true }],
+        });
+      await expect(controllerB.login({ accountId, secret: passwordCanary }))
+        .resolves.toMatchObject({ status: "authenticated", accountId, actorId: "human-a" });
+      await expect(controllerC.login({ accountId, secret: passwordCanary }))
+        .resolves.toMatchObject({ status: "authenticated", accountId, actorId: "human-a" });
+
+      const credentialsA = profileA.read();
+      const credentialsB = profileB.read();
+      const credentialsC = profileC.read();
+      if (credentialsA === undefined || credentialsB === undefined || credentialsC === undefined) {
+        throw new TypeError("Desktop profiles did not persist issued credentials");
+      }
+      expect(credentialsA.sessionId).not.toBe(credentialsB.sessionId);
+      expect(new Set([
+        credentialsA.sessionId,
+        credentialsB.sessionId,
+        credentialsC.sessionId,
+      ])).toHaveProperty("size", 3);
+
+      const listedA = await controllerA.refreshSessions();
+      expect(listedA).toMatchObject({ status: "authenticated", accountId });
+      if (listedA.status !== "authenticated") {
+        throw new TypeError("Desktop A did not publish authenticated sessions");
+      }
+      expect(listedA.sessions).toHaveLength(3);
+      expect(listedA.sessions.map((session) => session.deviceLabel).sort())
+        .toEqual(["FT01 Device A", "FT01 Device B", "FT01 Device C"]);
+      expect(listedA.sessions.filter((session) => session.current))
+        .toEqual([expect.objectContaining({
+          id: credentialsA.sessionId,
+          deviceLabel: "FT01 Device A",
+        })]);
+      const targetB = listedA.sessions.find(
+        (session) => session.deviceLabel === "FT01 Device B",
+      );
+      if (targetB === undefined) throw new TypeError("Desktop B public session was missing");
+
+      const afterRevoke = await controllerA.revokeSession({ sessionId: targetB.id });
+      expect(afterRevoke).toMatchObject({ status: "authenticated", accountId });
+      if (afterRevoke.status !== "authenticated") {
+        throw new TypeError("Desktop A lost authentication after revoking B");
+      }
+      expect(afterRevoke.sessions).toHaveLength(2);
+      expect(afterRevoke.sessions).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          id: credentialsA.sessionId,
+          deviceLabel: "FT01 Device A",
+          current: true,
+        }),
+        expect.objectContaining({
+          id: credentialsC.sessionId,
+          deviceLabel: "FT01 Device C",
+          current: false,
+        }),
+      ]));
+      await vi.waitFor(() => {
+        expect(controllerB.getState()).toEqual({ status: "revoked", accountId });
+        expect(profileB.read()).toBeUndefined();
+      }, { timeout: 5_000, interval: 20 });
+      expect(profileB.clear).toHaveBeenCalledOnce();
+      expect(invalidatorB.invalidate).toHaveBeenCalledOnce();
+      expect(invalidatorA.invalidate).not.toHaveBeenCalled();
+      expect(invalidatorC.invalidate).not.toHaveBeenCalled();
+      await expect(controllerA.refreshSessions()).resolves.toMatchObject({
+        status: "authenticated",
+        sessions: expect.arrayContaining([
+          expect.objectContaining({ id: credentialsA.sessionId, current: true }),
+          expect.objectContaining({ id: credentialsC.sessionId, current: false }),
+        ]),
+      });
+      await expect(controllerC.refreshSessions()).resolves.toMatchObject({
+        status: "authenticated",
+        sessions: expect.arrayContaining([
+          expect.objectContaining({ id: credentialsC.sessionId, current: true }),
+          expect.objectContaining({ id: credentialsA.sessionId, current: false }),
+        ]),
+      });
+
+      const sensitiveValues: string[] = [
+        passwordCanary,
+        credentialsA.accessToken,
+        credentialsA.refreshToken,
+        credentialsB.accessToken,
+        credentialsB.refreshToken,
+        credentialsC.accessToken,
+        credentialsC.refreshToken,
+      ];
+      const firstPublicEvidence = JSON.stringify([
+        ...observedA,
+        ...observedB,
+        ...observedC,
+        controllerA.getState(),
+        controllerB.getState(),
+        controllerC.getState(),
+      ]);
+      for (const sensitive of sensitiveValues) {
+        expect(firstPublicEvidence).not.toContain(sensitive);
+      }
+
+      controllerA.close();
+      controllerB.close();
+      controllerC.close();
+      await server.close();
+      server = undefined;
+
+      const database = new DatabaseSync(databasePath);
+      try {
+        const familyRows = database.prepare(
+          `SELECT device_label AS deviceLabel, revoked_at AS revokedAt
+           FROM session_families ORDER BY device_label`,
+        ).all() as Array<{ readonly deviceLabel: string; readonly revokedAt: number | null }>;
+        expect(familyRows).toEqual([
+          { deviceLabel: "FT01 Device A", revokedAt: null },
+          { deviceLabel: "FT01 Device B", revokedAt: expect.any(Number) },
+          { deviceLabel: "FT01 Device C", revokedAt: null },
+        ]);
+        const persistedSessions = JSON.stringify(database.prepare(
+          "SELECT * FROM sessions ORDER BY family_id, access_token_hash",
+        ).all());
+        for (const sensitive of sensitiveValues) {
+          expect(persistedSessions).not.toContain(sensitive);
+        }
+        const expired = database.prepare(
+          "UPDATE sessions SET access_expires_at = 0 WHERE access_token_hash = ?",
+        ).run(createHash("sha256").update(credentialsA.accessToken, "utf8").digest("base64url"));
+        expect(expired.changes).toBe(1);
+      } finally {
+        database.close();
+      }
+
+      server = await startAuthoritativeServer(serverOptions);
+      const restoredA = createIdentitySessionController({
+        vault: profileA.vault,
+        deviceIdentity: createMemoryDevice("installation-a", "FT01 Device A"),
+        clientFactory: createDesktopClientFactory(server.url, "desktop-a-restored"),
+        authorizedState: invalidatorA,
+      });
+      controllers.push(restoredA);
+      restoredA.subscribe((state) => observedRestoredA.push(state));
+      const restoredState = await restoredA.initialize();
+      expect(restoredState).toMatchObject({
+        status: "authenticated",
+        accountId,
+        actorId: "human-a",
+      });
+      if (restoredState.status !== "authenticated") {
+        throw new TypeError("Desktop A did not restore authenticated state");
+      }
+      expect(restoredState.sessions).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          id: credentialsA.sessionId,
+          deviceLabel: "FT01 Device A",
+          current: true,
+        }),
+        expect.objectContaining({
+          id: credentialsC.sessionId,
+          deviceLabel: "FT01 Device C",
+          current: false,
+        }),
+      ]));
+      const rotatedCredentialsA = profileA.read();
+      expect(rotatedCredentialsA).toMatchObject({
+        accountId: credentialsA.accountId,
+        actorId: credentialsA.actorId,
+        sessionId: credentialsA.sessionId,
+      });
+      expect(rotatedCredentialsA?.accessToken).not.toBe(credentialsA.accessToken);
+      expect(rotatedCredentialsA?.refreshToken).not.toBe(credentialsA.refreshToken);
+      if (rotatedCredentialsA === undefined) {
+        throw new TypeError("Desktop A did not persist refreshed credentials");
+      }
+      sensitiveValues.push(rotatedCredentialsA.accessToken, rotatedCredentialsA.refreshToken);
+      expect(invalidatorA.invalidate).not.toHaveBeenCalled();
+
+      await expect(restoredA.logout()).resolves.toEqual({
+        status: "signed-out",
+        accountId,
+      });
+      expect(profileA.read()).toBeUndefined();
+      expect(invalidatorA.invalidate).toHaveBeenCalledOnce();
+      restoredA.close();
+
+      const reloginA = createIdentitySessionController({
+        vault: profileA.vault,
+        deviceIdentity: createMemoryDevice("installation-a", "FT01 Device A"),
+        clientFactory: createDesktopClientFactory(server.url, "desktop-a-relogin"),
+        authorizedState: invalidatorA,
+      });
+      controllers.push(reloginA);
+      reloginA.subscribe((state) => observedReloginA.push(state));
+      await expect(reloginA.initialize()).resolves.toEqual({ status: "signed-out" });
+      await expect(reloginA.login({ accountId, secret: passwordCanary }))
+        .resolves.toMatchObject({ status: "authenticated", accountId, actorId: "human-a" });
+      const reloginCredentialsA = profileA.read();
+      if (reloginCredentialsA === undefined) {
+        throw new TypeError("Desktop A did not persist relogin credentials");
+      }
+      expect(reloginCredentialsA.sessionId).not.toBe(credentialsA.sessionId);
+      sensitiveValues.push(reloginCredentialsA.accessToken, reloginCredentialsA.refreshToken);
+
+      const finalPublicEvidence = JSON.stringify([
+        ...observedA,
+        ...observedB,
+        ...observedC,
+        ...observedRestoredA,
+        ...observedReloginA,
+        restoredA.getState(),
+        reloginA.getState(),
+      ]);
+      const deliveryArtifacts = (await Promise.all([
+        "docs/plans/2026-08-18-ft01-identity-session-implementation-plan.md",
+        "docs/plans/2026-08-18-ft01-identity-session-acceptance-matrix.md",
+        "docs/deliveries/FT-01-Identity-Session-交付说明.md",
+      ].map((path) => readFile(join(process.cwd(), path), "utf8")))).join("\n");
+      for (const sensitive of sensitiveValues) {
+        expect(finalPublicEvidence).not.toContain(sensitive);
+        expect(JSON.stringify(applicationLogs)).not.toContain(sensitive);
+        expect(deliveryArtifacts).not.toContain(sensitive);
+      }
+
+      reloginA.close();
+      await server.close();
+      server = undefined;
+      const diskBytes = Buffer.concat(await readAllRegularFiles(directory));
+      for (const sensitive of sensitiveValues) {
+        expect(diskBytes.includes(Buffer.from(sensitive, "utf8"))).toBe(false);
+      }
+    } finally {
+      for (const controller of controllers) controller.close();
+      await server?.close().catch(() => undefined);
+      for (const spy of logSpies) spy.mockRestore();
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it("builds the closed JSON-line child fixture used by restart tests", async () => {

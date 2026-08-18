@@ -1,4 +1,5 @@
 import { createServer, type Server as HttpServer } from "node:http";
+import { isIP } from "node:net";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import {
   isRoomRepairPage,
@@ -11,6 +12,7 @@ import {
 } from "@native-im/core";
 import {
   AuthenticationError,
+  MAX_ACTIVE_SESSION_FAMILIES,
   type AuthenticatedPrincipal,
   type AuthenticationService,
   type IssuedSession,
@@ -96,6 +98,23 @@ export const MESSAGE_WEBSOCKET_MAX_QUEUED_FRAME_BYTES = 256 * 1_024;
 export const MESSAGE_WEBSOCKET_V2_GATE_MAX_EVENTS = 256;
 export const MESSAGE_WEBSOCKET_V2_GATE_MAX_BYTES = 256 * 1_024;
 
+export function validateMessageWebSocketListener(host: string, port: number): void {
+  const loopback = host === "localhost" || host === "::1" ||
+    (isIP(host) === 4 && host.startsWith("127."));
+  if (host.trim() !== host || !loopback) {
+    throw new TypeError("Message WebSocket listener must use an explicit loopback host");
+  }
+  if (!Number.isSafeInteger(port) || port < 0 || port > 65_535) {
+    throw new RangeError("Message WebSocket listener port must be an integer from 0 to 65535");
+  }
+}
+
+export function formatMessageWebSocketUrl(host: string, port: number): string {
+  validateMessageWebSocketListener(host, port);
+  const urlHost = host.includes(":") ? `[${host}]` : host;
+  return `ws://${urlHost}:${port}`;
+}
+
 const maxBufferedAmountBySocket = new WeakMap<WebSocket, number>();
 const abortConnectionBySocket = new WeakMap<WebSocket, () => void>();
 
@@ -172,10 +191,22 @@ function mappedError(error: unknown, requestId: string): ProtocolErrorFrame {
   return errorFrame(500, "internal_error", "Unable to process request", requestId);
 }
 
+async function revokeUnacknowledgedSession(
+  auth: AuthenticationService,
+  accessToken: string,
+): Promise<void> {
+  try {
+    await auth.revoke(accessToken);
+  } catch {
+    // Preserve the original post-commit failure; compensation is best effort.
+  }
+}
+
 const MAPPED_SERVICE_ERROR_STATUSES = new Map<ProtocolErrorFrame["code"], ProtocolErrorFrame["status"]>([
   ["invalid_token", 401],
   ["token_expired", 401],
   ["session_revoked", 403],
+  ["session_limit_reached", 409],
   ["snapshot_family_revoked", 403],
   ["invalid_request", 400],
   ["unauthenticated", 401],
@@ -477,6 +508,7 @@ function authenticatedFrame(
   requestId: string,
   principal: AuthenticatedPrincipal,
   session?: IssuedSession,
+  resumedSessionId?: string,
 ): AuthenticatedFrame {
   return session === undefined
     ? {
@@ -484,12 +516,16 @@ function authenticatedFrame(
         requestId,
         accountId: principal.accountId,
         actorId: principal.actorId,
+        ...(resumedSessionId === undefined ? {} : { sessionId: resumedSessionId }),
       }
     : {
         type: "auth.authenticated",
         requestId,
         accountId: principal.accountId,
         actorId: principal.actorId,
+        ...(typeof session.sessionId === "string"
+          ? { sessionId: session.sessionId }
+          : {}),
         accessToken: session.accessToken,
         refreshToken: session.refreshToken,
         expiresAt: session.expiresAt,
@@ -789,6 +825,8 @@ function isCorrelatedRecoveryResponse(
       | "auth.resume"
       | "auth.refresh"
       | "auth.revoke"
+      | "auth.sessions.list"
+      | "auth.session.revoke"
       | "message.send"
       | "room.history"
       | "room.subscribe"
@@ -874,6 +912,8 @@ async function handleRecoveryFrame(
       | "auth.resume"
       | "auth.refresh"
       | "auth.revoke"
+      | "auth.sessions.list"
+      | "auth.session.revoke"
       | "message.send"
       | "room.history"
       | "room.subscribe"
@@ -1015,12 +1055,16 @@ async function handleLoginOrResume(
   }
 
   context.authOperationPending = true;
+  const initialGeneration = context.credentialGeneration;
+  let issuedSession: IssuedSession | undefined;
+  let installedGeneration: number | undefined;
   try {
     if (frame.type === "auth.login") {
       const session = await options.auth.login({
         accountId: frame.accountId,
         secret: frame.secret,
-      });
+      }, frame.device);
+      issuedSession = session;
       const principal = { accountId: session.accountId, actorId: session.actorId };
       const authenticatedSession = options.outboxStore === undefined
         ? undefined
@@ -1037,10 +1081,23 @@ async function handleLoginOrResume(
         session.accessToken,
         authenticatedSession,
       )) {
+        await revokeUnacknowledgedSession(options.auth, session.accessToken);
+        issuedSession = undefined;
         return;
       }
+      installedGeneration = context.credentialGeneration;
       registerIdentitySubscriptions(context, options.subscriptionRegistry);
-      sendFrame(socket, authenticatedFrame(frame.requestId, principal, session));
+      const sent = await sendFrameWithResult(
+        socket,
+        authenticatedFrame(frame.requestId, principal, session),
+      );
+      if (!sent.accepted) {
+        clearAuthentication(context, installedGeneration);
+        await revokeUnacknowledgedSession(options.auth, session.accessToken);
+        issuedSession = undefined;
+        return;
+      }
+      issuedSession = undefined;
       return;
     }
 
@@ -1049,12 +1106,30 @@ async function handleLoginOrResume(
       : await options.auth.authenticateSession(frame.accessToken);
     const principal = authenticatedSession?.principal ??
       await options.auth.authenticate(frame.accessToken);
+    const currentSessions = (await options.auth.listSessions(frame.accessToken)).filter(
+      (session) => session.current,
+    );
+    if (currentSessions.length !== 1) {
+      throw new Error("Authenticated session list must have exactly one current session");
+    }
+    const [currentSession] = currentSessions;
     if (!installAuthentication(context, principal, frame.accessToken, authenticatedSession)) {
       return;
     }
     registerIdentitySubscriptions(context, options.subscriptionRegistry);
-    sendFrame(socket, authenticatedFrame(frame.requestId, principal));
+    sendFrame(
+      socket,
+      authenticatedFrame(frame.requestId, principal, undefined, currentSession!.id),
+    );
   } catch (error: unknown) {
+    if (issuedSession !== undefined) {
+      clearAuthentication(
+        context,
+        installedGeneration ?? initialGeneration,
+      );
+      await revokeUnacknowledgedSession(options.auth, issuedSession.accessToken);
+      issuedSession = undefined;
+    }
     if (!context.closed) {
       sendFrame(socket, mappedError(error, frame.requestId));
     }
@@ -1084,9 +1159,15 @@ async function handleRefresh(
 
   const expectedPrincipal = context.principal;
   context.authOperationPending = true;
+  const initialGeneration = context.credentialGeneration;
+  let issuedSession: IssuedSession | undefined;
+  let installedGeneration: number | undefined;
   try {
     const session = await options.auth.refresh(frame.refreshToken, expectedPrincipal);
+    issuedSession = session;
     if (context.closed) {
+      await revokeUnacknowledgedSession(options.auth, session.accessToken);
+      issuedSession = undefined;
       return;
     }
     const refreshedPrincipal = {
@@ -1097,16 +1178,7 @@ async function handleRefresh(
       expectedPrincipal !== undefined &&
       !samePrincipal(expectedPrincipal, refreshedPrincipal)
     ) {
-      sendFrame(
-        socket,
-        errorFrame(
-          403,
-          "identity_forbidden",
-          "Refresh identity does not match the socket session",
-          frame.requestId,
-        ),
-      );
-      return;
+      throw new AuthenticationError(403, "identity_forbidden");
     }
 
     const authenticatedSession = options.outboxStore === undefined
@@ -1124,14 +1196,32 @@ async function handleRefresh(
       session.accessToken,
       authenticatedSession,
     )) {
+      await revokeUnacknowledgedSession(options.auth, session.accessToken);
+      issuedSession = undefined;
       return;
     }
+    installedGeneration = context.credentialGeneration;
     registerIdentitySubscriptions(context, options.subscriptionRegistry);
-    sendFrame(
+    const sent = await sendFrameWithResult(
       socket,
       authenticatedFrame(frame.requestId, refreshedPrincipal, session),
     );
+    if (!sent.accepted) {
+      clearAuthentication(context, installedGeneration);
+      await revokeUnacknowledgedSession(options.auth, session.accessToken);
+      issuedSession = undefined;
+      return;
+    }
+    issuedSession = undefined;
   } catch (error: unknown) {
+    if (issuedSession !== undefined) {
+      clearAuthentication(
+        context,
+        installedGeneration ?? initialGeneration,
+      );
+      await revokeUnacknowledgedSession(options.auth, issuedSession.accessToken);
+      issuedSession = undefined;
+    }
     if (!context.closed) {
       sendFrame(socket, mappedError(error, frame.requestId));
     }
@@ -1173,6 +1263,81 @@ async function handleRevoke(
     }
   } finally {
     context.authOperationPending = false;
+  }
+}
+
+async function handleListSessions(
+  socket: WebSocket,
+  frame: Extract<ClientFrame, { type: "auth.sessions.list" }>,
+  options: StartMessageWebSocketServerOptions,
+  context: ConnectionContext,
+): Promise<void> {
+  const principal = await requirePrincipal(socket, frame.requestId, options, context);
+  const accessToken = context.accessToken;
+  if (principal === undefined || accessToken === undefined) {
+    return;
+  }
+  const generation = context.credentialGeneration;
+
+  try {
+    const sessions = await options.auth.listSessions(accessToken);
+    const response = { type: "auth.sessions" as const, requestId: frame.requestId, sessions };
+    if (
+      sessions.length > MAX_ACTIVE_SESSION_FAMILIES ||
+      Buffer.byteLength(JSON.stringify(response), "utf8") >
+        MESSAGE_WEBSOCKET_MAX_PAYLOAD_BYTES
+    ) {
+      throw new Error("Authentication session list exceeds the protocol bound");
+    }
+    sendCurrentGeneration(
+      socket,
+      response,
+      generation,
+      context,
+    );
+  } catch (error: unknown) {
+    sendCurrentGeneration(
+      socket,
+      mappedError(error, frame.requestId),
+      generation,
+      context,
+    );
+  }
+}
+
+async function handleTargetedRevoke(
+  socket: WebSocket,
+  frame: Extract<ClientFrame, { type: "auth.session.revoke" }>,
+  options: StartMessageWebSocketServerOptions,
+  context: ConnectionContext,
+): Promise<void> {
+  const principal = await requirePrincipal(socket, frame.requestId, options, context);
+  const accessToken = context.accessToken;
+  if (principal === undefined || accessToken === undefined) {
+    return;
+  }
+  const generation = context.credentialGeneration;
+
+  try {
+    await options.auth.revokeSession(accessToken, frame.sessionId);
+    sendCurrentGeneration(
+      socket,
+      {
+        type: "auth.session.revoke.ack",
+        requestId: frame.requestId,
+        sessionId: frame.sessionId,
+        revoked: true,
+      },
+      generation,
+      context,
+    );
+  } catch (error: unknown) {
+    sendCurrentGeneration(
+      socket,
+      mappedError(error, frame.requestId),
+      generation,
+      context,
+    );
   }
 }
 
@@ -1531,6 +1696,12 @@ async function handleFrame(
     case "auth.revoke":
       await handleRevoke(socket, frame, options, context);
       return;
+    case "auth.sessions.list":
+      await handleListSessions(socket, frame, options, context);
+      return;
+    case "auth.session.revoke":
+      await handleTargetedRevoke(socket, frame, options, context);
+      return;
     case "message.send": {
       const principal = await requirePrincipal(socket, frame.requestId, options, context);
       if (principal === undefined) {
@@ -1792,6 +1963,7 @@ export async function startMessageWebSocketServer(
 ): Promise<MessageWebSocketServer> {
   const host = options.host ?? "127.0.0.1";
   const port = options.port ?? 0;
+  validateMessageWebSocketListener(host, port);
   const maxBufferedAmountBytes =
     options.maxBufferedAmountBytes ?? MESSAGE_WEBSOCKET_MAX_BUFFERED_AMOUNT_BYTES;
   if (!Number.isFinite(maxBufferedAmountBytes) || maxBufferedAmountBytes < 0) {
@@ -2084,9 +2256,8 @@ export async function startMessageWebSocketServer(
     throw new Error("Message WebSocket server did not expose a TCP address");
   }
   outboxDispatcher?.start();
-
   return {
-    url: `ws://${host}:${address.port}`,
+    url: formatMessageWebSocketUrl(host, address.port),
     publishAgentPreview(preview): void {
       for (const { socket, context } of liveConnections.values()) {
         if (

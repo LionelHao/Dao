@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
+import { MAX_ACTIVE_SESSION_FAMILIES } from "./contracts.js";
 
-export const AUTHORITY_SCHEMA_VERSION = 11 as const;
+export const AUTHORITY_SCHEMA_VERSION = 12 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -37,6 +38,8 @@ const V10_MIGRATION_CHECKSUM =
   "a7a668d54ddd3636f2e2bafcb7e55be8c9771d56c19a6ca5e3c79027a6647105";
 const V11_MIGRATION_CHECKSUM =
   "3ef3ca9216e684ec3d9e4097fe8a2e7148c75d5bb4b23ed7bf5a0eb5edc970a1";
+const V12_MIGRATION_CHECKSUM =
+  "66276cc21f02f19f5e60758039acd43030ba8a9666b37c0fef65ad30852929fa";
 const SCHEMA_FINGERPRINTS = {
   1: "03f2bbba4aa7082ec01819824726ce1bd9b4bd14cebea71afc93c6821dbf405c",
   2: "01c37d92ec2f303613a7bb8b592ca846fbea7c829b3c81fe4521699db949dfcc",
@@ -49,6 +52,7 @@ const SCHEMA_FINGERPRINTS = {
   9: "0374dbc27aa894ec239c89bcc6682fc53b219c8a2e150dfea3389beb7bf8e4e7",
   10: "7fd3399cc25e505de80d69adae24f7fc5a027de57cfb3e0b56df294e454c91fb",
   11: "83e48fc5a4b1b1c19863efd785ea098308d100c1899d638d2b5f95c5b0c119a6",
+  12: "7232d27114e9acf32dcfbc2d59f3c3128eed10955de3cc2703ddeedf92892741",
 } as const;
 
 const V1_STATEMENTS = [
@@ -970,6 +974,87 @@ const V11_STATEMENTS = [
    END`,
 ] as const;
 
+const V12_STATEMENTS = [
+  `CREATE TABLE session_families (
+    family_id TEXT PRIMARY KEY,
+    public_id TEXT NOT NULL UNIQUE CHECK (length(public_id) BETWEEN 1 AND 128),
+    account_id TEXT NOT NULL CHECK (length(trim(account_id)) > 0),
+    actor_id TEXT NOT NULL REFERENCES actors(id),
+    device_id TEXT NOT NULL CHECK (length(device_id) BETWEEN 1 AND 128),
+    device_label TEXT NOT NULL CHECK (length(device_label) BETWEEN 1 AND 128),
+    platform TEXT NOT NULL CHECK (platform IN ('macos', 'windows', 'linux', 'unknown')),
+    created_at INTEGER CHECK (created_at IS NULL OR created_at >= 0),
+    refresh_expires_at INTEGER NOT NULL CHECK (refresh_expires_at >= 0),
+    revoked_at INTEGER CHECK (revoked_at IS NULL OR revoked_at >= 0),
+    UNIQUE (family_id, account_id, actor_id)
+  ) STRICT`,
+  `INSERT INTO session_families (
+     family_id, public_id, account_id, actor_id, device_id, device_label,
+     platform, created_at, refresh_expires_at, revoked_at
+   )
+   SELECT
+     family_id,
+     lower(hex(randomblob(32))),
+     MIN(account_id),
+     MIN(actor_id),
+     'legacy',
+     'Legacy device',
+     'unknown',
+     NULL,
+     MAX(refresh_expires_at),
+     CASE
+       WHEN SUM(CASE WHEN revoked_at IS NULL THEN 1 ELSE 0 END) > 0 THEN NULL
+       ELSE COALESCE(MAX(revoked_at), 0)
+     END
+   FROM sessions
+   GROUP BY family_id`,
+  `CREATE INDEX session_families_principal_active_v12
+   ON session_families(account_id, actor_id, revoked_at, created_at DESC, public_id)`,
+  `CREATE TRIGGER session_families_validate_insert_v12
+   BEFORE INSERT ON session_families
+   WHEN COALESCE((SELECT kind FROM actors WHERE id = NEW.actor_id), '') <> 'human'
+   BEGIN
+     SELECT RAISE(ABORT, 'session family actor must be human');
+   END`,
+  `CREATE TRIGGER session_families_validate_update_v12
+   BEFORE UPDATE ON session_families
+   WHEN NEW.family_id <> OLD.family_id
+      OR NEW.public_id <> OLD.public_id
+      OR NEW.account_id <> OLD.account_id
+      OR NEW.actor_id <> OLD.actor_id
+      OR NEW.device_id <> OLD.device_id
+      OR NEW.device_label <> OLD.device_label
+      OR NEW.platform <> OLD.platform
+      OR NEW.created_at IS NOT OLD.created_at
+      OR NEW.refresh_expires_at < OLD.refresh_expires_at
+      OR (OLD.revoked_at IS NOT NULL AND NEW.revoked_at IS NOT OLD.revoked_at)
+   BEGIN
+     SELECT RAISE(ABORT, 'session family immutable fields cannot change');
+   END`,
+  `CREATE TRIGGER sessions_validate_family_insert_v12
+   BEFORE INSERT ON sessions
+   WHEN NOT EXISTS (
+     SELECT 1 FROM session_families AS family
+     WHERE family.family_id = NEW.family_id
+       AND family.account_id = NEW.account_id
+       AND family.actor_id = NEW.actor_id
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'session generation must match its family principal');
+   END`,
+  `CREATE TRIGGER sessions_validate_family_update_v12
+   BEFORE UPDATE OF family_id, account_id, actor_id ON sessions
+   WHEN NOT EXISTS (
+     SELECT 1 FROM session_families AS family
+     WHERE family.family_id = NEW.family_id
+       AND family.account_id = NEW.account_id
+       AND family.actor_id = NEW.actor_id
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'session generation must match its family principal');
+   END`,
+] as const;
+
 const V2_STATEMENTS = [
   `ALTER TABLE actors
    ADD COLUMN catalog_revision INTEGER NOT NULL DEFAULT 0
@@ -1357,6 +1442,12 @@ const MIGRATIONS = [
   defineMigration(9, "closed-light-task-authority", V9_STATEMENTS, V9_MIGRATION_CHECKSUM),
   defineMigration(10, "ball-in-court-boundaries", V10_STATEMENTS, V10_MIGRATION_CHECKSUM),
   defineMigration(11, "hard-human-preemption", V11_STATEMENTS, V11_MIGRATION_CHECKSUM),
+  defineMigration(
+    12,
+    "authoritative-session-families",
+    V12_STATEMENTS,
+    V12_MIGRATION_CHECKSUM,
+  ),
 ] as const satisfies readonly Migration[];
 
 const V1_SCHEMA_CONTRACT = {
@@ -1662,6 +1753,14 @@ const V11_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V12_SCHEMA_CONTRACT = {
+  ...V11_SCHEMA_CONTRACT,
+  session_families: [
+    "family_id", "public_id", "account_id", "actor_id", "device_id", "device_label",
+    "platform", "created_at", "refresh_expires_at", "revoked_at",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
@@ -1674,6 +1773,7 @@ const SCHEMA_CONTRACTS = {
   9: V9_SCHEMA_CONTRACT,
   10: V10_SCHEMA_CONTRACT,
   11: V11_SCHEMA_CONTRACT,
+  12: V12_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -2141,6 +2241,39 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
       "ball boundary claims must remain closed and holder-kind matched",
     );
   }
+  if (schemaVersion >= 12) {
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM sessions AS session
+       LEFT JOIN session_families AS family ON family.family_id = session.family_id
+       WHERE family.family_id IS NULL
+          OR family.account_id <> session.account_id
+          OR family.actor_id <> session.actor_id
+       LIMIT 1`,
+      "every session generation must match exactly one family principal",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM session_families AS family
+       LEFT JOIN actors AS actor ON actor.id = family.actor_id
+       WHERE actor.kind <> 'human'
+          OR NOT EXISTS (
+            SELECT 1 FROM sessions AS session WHERE session.family_id = family.family_id
+          )
+          OR family.refresh_expires_at <> (
+            SELECT MAX(session.refresh_expires_at)
+            FROM sessions AS session WHERE session.family_id = family.family_id
+          )
+          OR (family.revoked_at IS NOT NULL AND EXISTS (
+            SELECT 1 FROM sessions AS session
+            WHERE session.family_id = family.family_id AND session.revoked_at IS NULL
+          ))
+       LIMIT 1`,
+      "session families must remain human-owned, generation-backed, and terminally closed",
+    );
+  }
 }
 
 function validateExistingSchema(database: DatabaseSync, currentVersion: number): void {
@@ -2213,6 +2346,29 @@ function appliedAt(): string {
   return new Date().toISOString();
 }
 
+function assertV12SessionCapacity(database: DatabaseSync, now: number): void {
+  const overCapacity = database.prepare(
+    `WITH active_families AS (
+       SELECT family_id, account_id, actor_id
+       FROM sessions
+       GROUP BY family_id, account_id, actor_id
+       HAVING SUM(CASE WHEN revoked_at IS NULL THEN 1 ELSE 0 END) > 0
+          AND MAX(refresh_expires_at) > ?
+     )
+     SELECT account_id AS accountId, actor_id AS actorId, COUNT(*) AS count
+     FROM active_families
+     GROUP BY account_id, actor_id
+     HAVING COUNT(*) > ?
+     LIMIT 1`,
+  ).get(now, MAX_ACTIVE_SESSION_FAMILIES);
+  if (overCapacity !== undefined) {
+    throw new Error(
+      `Refusing v12 migration: active session family capacity exceeds ` +
+        MAX_ACTIVE_SESSION_FAMILIES,
+    );
+  }
+}
+
 function migrateAuthorityDatabaseToVersion(
   database: DatabaseSync,
   targetVersion: number,
@@ -2248,6 +2404,9 @@ function migrateAuthorityDatabaseToVersion(
     for (const migration of MIGRATIONS) {
       if (migration.version <= currentVersion || migration.version > targetVersion) {
         continue;
+      }
+      if (migration.version === 12) {
+        assertV12SessionCapacity(database, Date.now());
       }
 
       for (const statement of migration.statements) {
@@ -2300,6 +2459,12 @@ export function migrateAuthorityDatabaseToPreviousVersionForTest(
   database: DatabaseSync,
 ): void {
   migrateAuthorityDatabaseToVersion(database, AUTHORITY_SCHEMA_VERSION - 1);
+}
+
+export function migrateAuthorityDatabaseToVersion10ForTest(
+  database: DatabaseSync,
+): void {
+  migrateAuthorityDatabaseToVersion(database, 10);
 }
 
 export function migrateAuthorityDatabaseToVersion9ForTest(

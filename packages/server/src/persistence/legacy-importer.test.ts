@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
+import { deriveLegacyPublicSessionId } from "../auth.js";
 import {
   createWorkerDatabaseClient,
   type WorkerDatabaseClient,
@@ -39,7 +40,10 @@ function fixtureDirectory(): string {
   return directory;
 }
 
-function writeLegacyFixture(directory: string): {
+function writeLegacyFixture(
+  directory: string,
+  sessionMetadata: Readonly<Record<string, unknown>> = {},
+): {
   readonly sessionFilePath: string;
   readonly roomFilePath: string;
   readonly messageFilePath: string;
@@ -63,6 +67,7 @@ function writeLegacyFixture(directory: string): {
           refreshTokenHash: hash("refresh-owner"),
           accessExpiresAt: 1_800_000_000_000,
           refreshExpiresAt: 1_900_000_000_000,
+          ...sessionMetadata,
         },
       ],
     }),
@@ -285,6 +290,22 @@ describe("LegacyStateImporter", () => {
         .toEqual({ count: 1 });
       expect(database.prepare("SELECT COUNT(*) AS count FROM room_audit").get())
         .toEqual({ count: 3 });
+      const importedFamilies = database.prepare(
+        `SELECT public_id AS publicId, device_id AS deviceId,
+                device_label AS deviceLabel, platform, created_at AS createdAt,
+                refresh_expires_at AS refreshExpiresAt, revoked_at AS revokedAt
+         FROM session_families`,
+      ).all();
+      expect(importedFamilies).toEqual([{
+        publicId: deriveLegacyPublicSessionId(hash("family-owner")),
+        deviceId: "legacy",
+        deviceLabel: "Legacy device",
+        platform: "unknown",
+        createdAt: null,
+        refreshExpiresAt: 1_900_000_000_000,
+        revokedAt: null,
+      }]);
+      expect(String(importedFamilies[0]?.publicId)).not.toContain(hash("family-owner"));
       expect(database.prepare("SELECT DISTINCT catalog_revision FROM actors").all())
         .toEqual([{ catalog_revision: 0 }]);
       expect(
@@ -340,6 +361,72 @@ describe("LegacyStateImporter", () => {
         messageFilePath: join(directory, "missing-c"),
       }),
     ).resolves.toEqual({ imported: false, actors: 3, rooms: 1, messages: 2 });
+  });
+
+  it("preserves complete current-format session family metadata during import", async () => {
+    const directory = fixtureDirectory();
+    const databasePath = join(directory, "authority.sqlite");
+    const fixture = writeLegacyFixture(directory, {
+      publicSessionId: "public-desktop-session",
+      deviceId: "desktop-installation-01",
+      deviceLabel: "Leo's MacBook",
+      platform: "macos",
+      createdAt: 1_700_000_000_123,
+    });
+    const client = track(await createWorkerDatabaseClient({ databasePath }));
+
+    await expect(client.importLegacyState(importPaths(fixture))).resolves.toMatchObject({
+      imported: true,
+    });
+    await client.close();
+
+    const database = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      expect(database.prepare(
+        `SELECT public_id AS publicId, device_id AS deviceId,
+                device_label AS deviceLabel, platform, created_at AS createdAt
+         FROM session_families`,
+      ).all()).toEqual([{
+        publicId: "public-desktop-session",
+        deviceId: "desktop-installation-01",
+        deviceLabel: "Leo's MacBook",
+        platform: "macos",
+        createdAt: 1_700_000_000_123,
+      }]);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("rejects an over-cap active legacy principal before staging activation", async () => {
+    const directory = fixtureDirectory();
+    const databasePath = join(directory, "authority.sqlite");
+    const fixture = writeLegacyFixture(directory);
+    const sessionState = JSON.parse(
+      readFileSync(fixture.sessionFilePath, "utf8"),
+    ) as { sessions: Array<Record<string, unknown>> };
+    const template = sessionState.sessions[0];
+    if (template === undefined) throw new Error("legacy session fixture is missing");
+    const futureExpiry = Date.now() + 24 * 60 * 60 * 1_000;
+    sessionState.sessions = Array.from({ length: 97 }, (_, index) => ({
+      ...template,
+      familyId: hash(`capacity-family-${index}`),
+      accessTokenHash: hash(`capacity-access-${index}`),
+      refreshTokenHash: hash(`capacity-refresh-${index}`),
+      accessExpiresAt: futureExpiry - 1_000,
+      refreshExpiresAt: futureExpiry,
+    }));
+    writeFileSync(fixture.sessionFilePath, JSON.stringify({
+      version: 1,
+      sessions: sessionState.sessions,
+    }), "utf8");
+
+    await expect(importLegacyStateForTest(
+      { databasePath, ...importPaths(fixture) },
+      {},
+    )).rejects.toThrow(/legacy active session family capacity exceeds 96/i);
+    expect(existsSync(databasePath)).toBe(false);
+    expectNoStagingFiles(directory);
   });
 
   it("replays the original marker result after valid authority state evolves", async () => {
@@ -544,7 +631,7 @@ describe("LegacyStateImporter", () => {
     const creator = track(
       await createWorkerDatabaseClient({ databasePath: stagingPath }),
     );
-    await expect(creator.inspectSchema()).resolves.toEqual({ version: 11 });
+    await expect(creator.inspectSchema()).resolves.toEqual({ version: 12 });
     await creator.close();
     writeFileSync(
       recoveryPath,
@@ -644,7 +731,7 @@ describe("LegacyStateImporter", () => {
     expect(lstatSync(databasePath, { bigint: true }).nlink).toBe(1n);
 
     const restarted = track(await createWorkerDatabaseClient({ databasePath }));
-    await expect(restarted.inspectSchema()).resolves.toEqual({ version: 11 });
+    await expect(restarted.inspectSchema()).resolves.toEqual({ version: 12 });
     await expect(restarted.inspectLegacyImport()).resolves.toMatchObject({
       markerVersion: 1,
       actors: 3,
@@ -726,7 +813,7 @@ describe("LegacyStateImporter", () => {
     rmSync(unrelatedHardlinkPath);
 
     const restarted = track(await createWorkerDatabaseClient({ databasePath }));
-    await expect(restarted.inspectSchema()).resolves.toEqual({ version: 11 });
+    await expect(restarted.inspectSchema()).resolves.toEqual({ version: 12 });
     await expect(restarted.inspectLegacyImport()).resolves.toMatchObject({
       markerVersion: 1,
       actors: 3,
@@ -742,7 +829,7 @@ describe("LegacyStateImporter", () => {
     const directory = fixtureDirectory();
     const databasePath = join(directory, "authority.sqlite");
     const creator = track(await createWorkerDatabaseClient({ databasePath }));
-    await expect(creator.inspectSchema()).resolves.toEqual({ version: 11 });
+    await expect(creator.inspectSchema()).resolves.toEqual({ version: 12 });
     await creator.close();
     const before = readFileSync(databasePath);
     const nonce = "00000000-0000-4000-8000-000000000040";
@@ -776,7 +863,7 @@ describe("LegacyStateImporter", () => {
     const databasePath = join(directory, "authority.sqlite");
     const fixture = writeLegacyFixture(directory);
     const creator = track(await createWorkerDatabaseClient({ databasePath }));
-    await expect(creator.inspectSchema()).resolves.toEqual({ version: 11 });
+    await expect(creator.inspectSchema()).resolves.toEqual({ version: 12 });
     await creator.close();
     const before = readFileSync(databasePath);
 

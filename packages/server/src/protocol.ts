@@ -22,15 +22,29 @@ import {
   type ReminderCandidate,
   type OpenItem,
 } from "@native-im/core";
-import type { AuthenticationErrorCode } from "./auth.js";
-import { ROOM_SYNC_MAX_LIMIT } from "./persistence/contracts.js";
+import type {
+  AuthenticationErrorCode,
+  PublicSession,
+  SessionDevice,
+} from "./auth.js";
+import {
+  SESSION_DEVICE_ID_MAX_BYTES,
+  SESSION_DEVICE_LABEL_MAX_BYTES,
+} from "./auth.js";
+import {
+  MAX_ACTIVE_SESSION_FAMILIES,
+  ROOM_SYNC_MAX_LIMIT,
+} from "./persistence/contracts.js";
 import type { MessageErrorCode } from "./service.js";
 import type { MessageStoreErrorCode } from "./store.js";
 
-const AUTH_LOGIN_FIELDS = new Set(["type", "requestId", "accountId", "secret"]);
+const AUTH_LOGIN_FIELDS = new Set(["type", "requestId", "accountId", "secret", "device"]);
+const AUTH_LOGIN_DEVICE_FIELDS = new Set(["id", "label", "platform"]);
 const AUTH_RESUME_FIELDS = new Set(["type", "requestId", "accessToken"]);
 const AUTH_REFRESH_FIELDS = new Set(["type", "requestId", "refreshToken"]);
 const AUTH_REVOKE_FIELDS = new Set(["type", "requestId"]);
+const AUTH_SESSIONS_LIST_FIELDS = new Set(["type", "requestId"]);
+const AUTH_SESSION_REVOKE_FIELDS = new Set(["type", "requestId", "sessionId"]);
 const MESSAGE_SEND_FIELDS = new Set(["type", "requestId", "message"]);
 const ROOM_FIELDS = new Set(["type", "requestId", "roomId"]);
 const WORKSPACE_BOOTSTRAP_BEGIN_FIELDS = new Set(["type", "requestId"]);
@@ -74,6 +88,10 @@ export const PROTOCOL_FIELD_LIMITS = Object.freeze({
   accountId: 256,
   secret: 4_096,
   token: 4_096,
+  deviceId: SESSION_DEVICE_ID_MAX_BYTES,
+  deviceLabel: SESSION_DEVICE_LABEL_MAX_BYTES,
+  sessionId: SESSION_DEVICE_ID_MAX_BYTES,
+  sessions: MAX_ACTIVE_SESSION_FAMILIES,
   roomId: 256,
   messageId: 256,
   body: 32 * 1_024,
@@ -87,6 +105,7 @@ export interface AuthLoginFrame {
   readonly requestId: string;
   readonly accountId: string;
   readonly secret: string;
+  readonly device: SessionDevice;
 }
 
 export interface AuthResumeFrame {
@@ -104,6 +123,17 @@ export interface AuthRefreshFrame {
 export interface AuthRevokeFrame {
   readonly type: "auth.revoke";
   readonly requestId: string;
+}
+
+export interface AuthSessionsListFrame {
+  readonly type: "auth.sessions.list";
+  readonly requestId: string;
+}
+
+export interface AuthSessionRevokeFrame {
+  readonly type: "auth.session.revoke";
+  readonly requestId: string;
+  readonly sessionId: string;
 }
 
 export interface MessageSendFrame {
@@ -258,6 +288,8 @@ export type ClientFrame =
   | AuthResumeFrame
   | AuthRefreshFrame
   | AuthRevokeFrame
+  | AuthSessionsListFrame
+  | AuthSessionRevokeFrame
   | MessageSendFrame
   | RoomHistoryRequestFrame
   | BallQueryFrame
@@ -285,6 +317,7 @@ export interface AuthenticatedFrame {
   readonly requestId: string;
   readonly accountId: string;
   readonly actorId: string;
+  readonly sessionId?: string;
   readonly accessToken?: string;
   readonly refreshToken?: string;
   readonly expiresAt?: string;
@@ -294,6 +327,19 @@ export interface AuthenticatedFrame {
 export interface AuthRevokedFrame {
   readonly type: "auth.revoked";
   readonly requestId: string;
+}
+
+export interface AuthSessionsFrame {
+  readonly type: "auth.sessions";
+  readonly requestId: string;
+  readonly sessions: readonly PublicSession[];
+}
+
+export interface AuthSessionRevokeAckFrame {
+  readonly type: "auth.session.revoke.ack";
+  readonly requestId: string;
+  readonly sessionId: string;
+  readonly revoked: true;
 }
 
 export interface MessageCreatedFrame {
@@ -436,6 +482,8 @@ export interface ProtocolErrorFrame {
 export type ServerFrame =
   | AuthenticatedFrame
   | AuthRevokedFrame
+  | AuthSessionsFrame
+  | AuthSessionRevokeAckFrame
   | AuthSessionRevokedFrame
   | MessageAcceptedAck
   | MessageCreatedFrame
@@ -521,6 +569,19 @@ function isStrictMessageDraft(value: unknown): value is MessageDraft {
   );
 }
 
+function isSessionPlatform(value: unknown): value is SessionDevice["platform"] {
+  return value === "macos" || value === "windows" || value === "linux" ||
+    value === "unknown";
+}
+
+function isStrictSessionDevice(value: unknown): value is SessionDevice {
+  return isRecord(value) &&
+    hasOnlyFields(value, AUTH_LOGIN_DEVICE_FIELDS) &&
+    isBoundedText(value.id, PROTOCOL_FIELD_LIMITS.deviceId) &&
+    isBoundedText(value.label, PROTOCOL_FIELD_LIMITS.deviceLabel) &&
+    isSessionPlatform(value.platform);
+}
+
 function protocolError(
   message: string,
   requestId?: string,
@@ -539,6 +600,10 @@ function isBoundedString(value: unknown, maximumBytes: number): value is string 
     value.length > 0 &&
     Buffer.byteLength(value, "utf8") <= maximumBytes
   );
+}
+
+function isBoundedText(value: unknown, maximumBytes: number): value is string {
+  return isBoundedString(value, maximumBytes) && value.trim().length > 0;
 }
 
 export function parseClientFrame(raw: string): ClientFrameParseResult {
@@ -566,12 +631,13 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
         !hasOnlyFields(value, AUTH_LOGIN_FIELDS) ||
         requestId === undefined ||
         !isBoundedString(value.accountId, PROTOCOL_FIELD_LIMITS.accountId) ||
-        !isBoundedString(value.secret, PROTOCOL_FIELD_LIMITS.secret)
+        !isBoundedString(value.secret, PROTOCOL_FIELD_LIMITS.secret) ||
+        !isStrictSessionDevice(value.device)
       ) {
         return {
           ok: false,
           error: protocolError(
-            "auth.login requires string requestId, accountId, and secret",
+            "auth.login requires requestId, accountId, secret, and a device descriptor",
             requestId,
           ),
         };
@@ -583,6 +649,7 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
           requestId,
           accountId: value.accountId,
           secret: value.secret,
+          device: value.device,
         },
       };
     case "auth.resume":
@@ -637,6 +704,39 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
         };
       }
       return { ok: true, frame: { type: "auth.revoke", requestId } };
+    case "auth.sessions.list":
+      if (!hasOnlyFields(value, AUTH_SESSIONS_LIST_FIELDS) || requestId === undefined) {
+        return {
+          ok: false,
+          error: protocolError(
+            "auth.sessions.list requires a string requestId",
+            requestId,
+          ),
+        };
+      }
+      return { ok: true, frame: { type: "auth.sessions.list", requestId } };
+    case "auth.session.revoke":
+      if (
+        !hasOnlyFields(value, AUTH_SESSION_REVOKE_FIELDS) ||
+        requestId === undefined ||
+        !isBoundedText(value.sessionId, PROTOCOL_FIELD_LIMITS.sessionId)
+      ) {
+        return {
+          ok: false,
+          error: protocolError(
+            "auth.session.revoke requires string requestId and sessionId",
+            requestId,
+          ),
+        };
+      }
+      return {
+        ok: true,
+        frame: {
+          type: "auth.session.revoke",
+          requestId,
+          sessionId: value.sessionId,
+        },
+      };
     case "message.send": {
       if (!hasOnlyFields(value, MESSAGE_SEND_FIELDS) || requestId === undefined) {
         return {

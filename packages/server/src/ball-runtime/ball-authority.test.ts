@@ -67,6 +67,12 @@ function openDatabase(): { readonly path: string; readonly database: DatabaseSyn
     );
   `);
   database.prepare(
+    `INSERT INTO session_families (
+       family_id, public_id, account_id, actor_id, device_id, device_label,
+       platform, created_at, refresh_expires_at, revoked_at
+     ) VALUES (?, ?, 'account-1', 'human-1', 'test', 'Test', 'unknown', ?, ?, NULL)`,
+  ).run(familyToken, `test_${familyToken}`, t0, t0 + 7_200_000);
+  database.prepare(
     `INSERT INTO sessions (
        family_id, account_id, actor_id, access_token_hash, refresh_token_hash,
        access_expires_at, refresh_expires_at

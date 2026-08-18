@@ -31,13 +31,17 @@ describe("real AuthorityWorker runtime authority", () => {
     try {
       const store = createSqliteAuthoritativeStore(client);
       await store.registerActors(actors);
+      const now = Date.now();
       const session = await client.issueSession({
         accountId: "account-runtime",
         actorId: "human-runtime",
+        publicSessionId: "runtime-public-session",
+        device: { id: "runtime-test", label: "Runtime test", platform: "unknown" },
         accessTokenHash: hash("access-runtime"),
         refreshTokenHash: hash("refresh-runtime"),
-        accessExpiresAt: Date.now() + 60_000,
-        refreshExpiresAt: Date.now() + 120_000,
+        accessExpiresAt: now + 60_000,
+        refreshExpiresAt: now + 120_000,
+        now,
       });
       await client.close();
 

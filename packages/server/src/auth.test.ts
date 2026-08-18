@@ -18,6 +18,10 @@ import {
   type SessionState,
   type StateStore,
 } from "./index.js";
+import {
+  deriveLegacyPublicSessionId,
+  MAX_ACTIVE_SESSION_FAMILIES,
+} from "./auth.js";
 
 const accounts = new Map([
   ["account-li", { actorId: "human-li", secret: "correct-li" }],
@@ -169,6 +173,22 @@ describe("session state authority guard", () => {
     expect(
       isSessionState({ version: 1, sessions: [], secret: "must-not-be-state" }),
     ).toBe(false);
+  });
+
+  it("accepts complete device metadata while preserving an unknown legacy creation time", () => {
+    expect(isSessionState({
+      version: 1,
+      sessions: [sessionRecord({
+        publicSessionId: "opaque-legacy-session",
+        deviceId: "legacy",
+        deviceLabel: "Legacy device",
+        platform: "unknown",
+      })],
+    })).toBe(true);
+    expect(isSessionState({
+      version: 1,
+      sessions: [sessionRecord({ createdAt: 0 })],
+    })).toBe(false);
   });
 
   it.each([
@@ -331,6 +351,243 @@ describe("session state authority guard", () => {
 });
 
 describe("authentication service", () => {
+  it("normalizes every generation when refreshing a legacy JSON session family", async () => {
+    const legacyRecord = sessionRecord();
+    const initial = {
+      version: 1,
+      sessions: [legacyRecord as unknown as SessionState["sessions"][number]],
+    } as const;
+    expect(isSessionState(initial)).toBe(true);
+    let persisted: SessionState = initial;
+    const sessions: StateStore<SessionState> = {
+      async load() {
+        return persisted;
+      },
+      async save(value) {
+        if (!isSessionState(value)) throw new Error("session guard rejected normalized family");
+        persisted = value;
+      },
+    };
+    const service = createAuthenticationService({
+      identities: testIdentityAdapter,
+      sessions,
+      clock: () => 100,
+      tokenFactory: createTokenFactory("legacy-rotation-token"),
+    });
+
+    const refreshed = await service.refresh("refresh-token");
+
+    expect(refreshed.sessionId).toBe(
+      deriveLegacyPublicSessionId(tokenHash("family-access-token")),
+    );
+    expect(refreshed.sessionId).not.toContain(tokenHash("family-access-token"));
+    await expect(service.authenticate(refreshed.accessToken)).resolves.toEqual({
+      accountId: "account-li",
+      actorId: "human-li",
+    });
+    expect(persisted.sessions).toHaveLength(2);
+    expect(persisted.sessions).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        publicSessionId: refreshed.sessionId,
+        deviceId: "legacy",
+        deviceLabel: "Legacy device",
+        platform: "unknown",
+      }),
+    ]));
+    expect(persisted.sessions.every((session) => !("createdAt" in session))).toBe(true);
+    await expect(service.listSessions(refreshed.accessToken)).resolves.toEqual([{
+      id: refreshed.sessionId,
+      deviceLabel: "Legacy device",
+      platform: "unknown",
+      refreshExpiresAt: new Date(30 * 24 * 60 * 60 * 1_000 + 100).toISOString(),
+      current: true,
+    }]);
+    expect(isSessionState(persisted)).toBe(true);
+  });
+
+  it("lists independent public device sessions and revokes exactly one owned family", async () => {
+    const sessions = new FailingSessionStore();
+    let now = 1_000;
+    const publicIds = ["public-device-a", "public-device-b"];
+    const service = createAuthenticationService({
+      identities: testIdentityAdapter,
+      sessions,
+      clock: () => now,
+      tokenFactory: createTokenFactory("multi-device-token"),
+      sessionIdFactory: () => publicIds.shift() ?? "unexpected-public-id",
+    });
+    const deviceA = await service.login(
+      { accountId: "account-li", secret: "correct-li" },
+      { id: "desktop-a", label: "Li's MacBook", platform: "macos" },
+    );
+    now = 2_000;
+    const deviceB = await service.login(
+      { accountId: "account-li", secret: "correct-li" },
+      { id: "desktop-b", label: "Li's Linux box", platform: "linux" },
+    );
+
+    expect(deviceA.sessionId).toBe("public-device-a");
+    expect(deviceB.sessionId).toBe("public-device-b");
+    expect(await service.listSessions(deviceA.accessToken)).toEqual([
+      {
+        id: "public-device-b",
+        deviceLabel: "Li's Linux box",
+        platform: "linux",
+        createdAt: new Date(2_000).toISOString(),
+        refreshExpiresAt: deviceB.refreshExpiresAt,
+        current: false,
+      },
+      {
+        id: "public-device-a",
+        deviceLabel: "Li's MacBook",
+        platform: "macos",
+        createdAt: new Date(1_000).toISOString(),
+        refreshExpiresAt: deviceA.refreshExpiresAt,
+        current: true,
+      },
+    ]);
+
+    now = 3_000;
+    await service.revokeSession(deviceA.accessToken, deviceB.sessionId);
+    await expect(service.authenticate(deviceB.accessToken)).rejects.toMatchObject({
+      status: 403,
+      code: "session_revoked",
+    });
+    await expect(service.refresh(deviceB.refreshToken)).rejects.toMatchObject({
+      status: 403,
+      code: "session_revoked",
+    });
+    await expect(service.authenticate(deviceA.accessToken)).resolves.toEqual({
+      accountId: "account-li",
+      actorId: "human-li",
+    });
+    await expect(service.listSessions(deviceA.accessToken)).resolves.toEqual([
+      expect.objectContaining({ id: "public-device-a", current: true }),
+    ]);
+    await expect(
+      service.revokeSession(deviceA.accessToken, "foreign-or-unknown"),
+    ).rejects.toMatchObject({ status: 404, code: "session_not_found" });
+  });
+
+  it("caps active device families per Human principal without blocking another principal", async () => {
+    const sessions = new FailingSessionStore();
+    let now = 1_000;
+    const service = createAuthenticationService({
+      identities: testIdentityAdapter,
+      sessions,
+      clock: () => now,
+      tokenFactory: createTokenFactory("capacity-token"),
+      sessionIdFactory: createTokenFactory("capacity-session"),
+    });
+    const issued = [];
+    for (let index = 0; index < MAX_ACTIVE_SESSION_FAMILIES; index += 1) {
+      issued.push(await service.login(
+        { accountId: "account-li", secret: "correct-li" },
+        { id: `device-${index}`, label: `Device ${index}`, platform: "macos" },
+      ));
+    }
+
+    expect(await service.listSessions(issued[0]!.accessToken)).toHaveLength(
+      MAX_ACTIVE_SESSION_FAMILIES,
+    );
+    const savesAtLimit = sessions.saveAttempts;
+    const replacement = await service.login(
+      { accountId: "account-li", secret: "correct-li" },
+      { id: "device-over-limit", label: "Over limit", platform: "linux" },
+    );
+    expect(sessions.saveAttempts).toBe(savesAtLimit + 1);
+    await expect(service.authenticate(issued[0]!.accessToken)).rejects.toMatchObject({
+      status: 403,
+      code: "session_revoked",
+    });
+    await expect(service.refresh(issued[0]!.refreshToken)).rejects.toMatchObject({
+      status: 403,
+      code: "session_revoked",
+    });
+    const afterReplacement = await service.listSessions(issued[1]!.accessToken);
+    expect(afterReplacement).toHaveLength(MAX_ACTIVE_SESSION_FAMILIES);
+    expect(afterReplacement).toContainEqual(
+      expect.objectContaining({ id: replacement.sessionId }),
+    );
+    expect(afterReplacement).not.toContainEqual(
+      expect.objectContaining({ id: issued[0]!.sessionId }),
+    );
+
+    await expect(service.login(
+      { accountId: "account-ada", secret: "correct-ada" },
+      { id: "ada-device", label: "Ada device", platform: "windows" },
+    )).resolves.toMatchObject({ accountId: "account-ada" });
+
+    now = 31 * 24 * 60 * 60 * 1_000;
+    const afterExpiry = await service.login(
+      { accountId: "account-li", secret: "correct-li" },
+      { id: "after-expiry", label: "After expiry", platform: "linux" },
+    );
+    await expect(service.listSessions(afterExpiry.accessToken)).resolves.toHaveLength(1);
+  });
+
+  it("fails closed instead of hiding legacy over-cap active session families", async () => {
+    const records = Array.from(
+      { length: MAX_ACTIVE_SESSION_FAMILIES + 1 },
+      (_, index) => sessionRecord({
+        familyId: tokenHash(`over-cap-family-${index}`),
+        accessTokenHash: tokenHash(`over-cap-access-${index}`),
+        refreshTokenHash: tokenHash(`over-cap-refresh-${index}`),
+        publicSessionId: `over-cap-public-${index}`,
+        deviceId: `over-cap-device-${index}`,
+        deviceLabel: `Over cap ${index}`,
+        platform: "unknown",
+        createdAt: index,
+      }) as unknown as SessionState["sessions"][number],
+    );
+    const state = { version: 1, sessions: records } as const;
+    expect(isSessionState(state)).toBe(true);
+    const sessions = new FailingSessionStore(state);
+    const service = createAuthenticationService({
+      identities: testIdentityAdapter,
+      sessions,
+      clock: () => 100,
+      tokenFactory: createTokenFactory("unused-over-cap"),
+    });
+
+    await expect(service.listSessions("over-cap-access-0")).rejects.toMatchObject({
+      status: 409,
+      code: "session_limit_reached",
+    });
+    expect(sessions.saveAttempts).toBe(0);
+  });
+
+  it("rejects unbounded or open device descriptors before issuing credentials", async () => {
+    const sessions = new FailingSessionStore();
+    const service = createAuthenticationService({
+      identities: testIdentityAdapter,
+      sessions,
+      tokenFactory: createTokenFactory("invalid-device-token"),
+    });
+
+    await expect(service.login(
+      { accountId: "account-li", secret: "correct-li" },
+      { id: "device", label: "x".repeat(129), platform: "macos" },
+    )).rejects.toThrow(/device label/i);
+    expect(sessions.saveAttempts).toBe(0);
+  });
+
+  it("checks independently generated public session identifiers for collisions", async () => {
+    const sessions = new FailingSessionStore();
+    const service = createAuthenticationService({
+      identities: testIdentityAdapter,
+      sessions,
+      tokenFactory: createTokenFactory("public-collision-token"),
+      sessionIdFactory: () => "same-public-session",
+    });
+    await service.login({ accountId: "account-li", secret: "correct-li" });
+
+    await expect(
+      service.login({ accountId: "account-ada", secret: "correct-ada" }),
+    ).rejects.toThrow(/duplicate session identifier/i);
+    expect((await sessions.load())?.sessions).toHaveLength(1);
+  });
+
   it("rejects an account mapped to an agent without issuing or persisting a session", async () => {
     const sessions = new FailingSessionStore();
     const service = createAuthenticationService({
@@ -352,6 +609,24 @@ describe("authentication service", () => {
       status: 401,
       code: "invalid_token",
     });
+  });
+
+  it.each([
+    { accountId: "missing-account", secret: "any-secret" },
+    { accountId: "account-li", secret: "wrong-secret" },
+  ])("rejects unknown or wrong-password credentials without a session write", async (credentials) => {
+    const sessions = new FailingSessionStore();
+    const service = createAuthenticationService({
+      identities: testIdentityAdapter,
+      sessions,
+      tokenFactory: createTokenFactory("invalid-login-token"),
+    });
+
+    await expect(service.login(credentials)).rejects.toMatchObject({
+      status: 401,
+      code: "invalid_credentials",
+    });
+    expect(sessions.saveAttempts).toBe(0);
   });
 
   it.each([

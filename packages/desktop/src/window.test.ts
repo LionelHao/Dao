@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import * as importedWindow from "./window.js";
 
 type WindowModuleUnderTest = {
@@ -7,9 +7,30 @@ type WindowModuleUnderTest = {
     minHeight: number;
     minWidth: number;
     title: string;
-    webPreferences: { contextIsolation: boolean; nodeIntegration: boolean; preload: string };
+    webPreferences: {
+      contextIsolation: boolean;
+      nodeIntegration: boolean;
+      preload: string;
+      sandbox: boolean;
+      webSecurity: boolean;
+    };
     width: number;
   };
+  installWindowSecurityPolicy?: (window: {
+    readonly webContents: {
+      setWindowOpenHandler(handler: () => { readonly action: "deny" }): void;
+      on(event: "will-navigate", listener: (event: { preventDefault(): void }) => void): void;
+      session: {
+        setPermissionRequestHandler(
+          handler: (
+            webContents: unknown,
+            permission: string,
+            callback: (allowed: boolean) => void,
+          ) => void,
+        ): void;
+      };
+    };
+  }) => void;
 };
 
 const windowModule = importedWindow as unknown as WindowModuleUnderTest;
@@ -30,8 +51,41 @@ describe("blank group chat window", () => {
         preload: "/tmp/preload.js",
         contextIsolation: true,
         nodeIntegration: false,
+        sandbox: true,
+        webSecurity: true,
       },
     });
   });
-});
 
+  it("denies renderer navigation, new windows, and permissions by default", () => {
+    let openHandler: (() => { readonly action: "deny" }) | undefined;
+    let navigationHandler: ((event: { preventDefault(): void }) => void) | undefined;
+    let permissionHandler:
+      | ((webContents: unknown, permission: string, callback: (allowed: boolean) => void) => void)
+      | undefined;
+    windowModule.installWindowSecurityPolicy?.({
+      webContents: {
+        setWindowOpenHandler(handler) {
+          openHandler = handler;
+        },
+        on(_event, listener) {
+          navigationHandler = listener;
+        },
+        session: {
+          setPermissionRequestHandler(handler) {
+            permissionHandler = handler;
+          },
+        },
+      },
+    });
+
+    expect(windowModule.installWindowSecurityPolicy).toBeTypeOf("function");
+    expect(openHandler?.()).toEqual({ action: "deny" });
+    const navigation = { preventDefault: vi.fn() };
+    navigationHandler?.(navigation);
+    expect(navigation.preventDefault).toHaveBeenCalledOnce();
+    const permission = vi.fn();
+    permissionHandler?.({}, "clipboard-read", permission);
+    expect(permission).toHaveBeenCalledWith(false);
+  });
+});

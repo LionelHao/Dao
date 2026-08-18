@@ -15,7 +15,11 @@ import {
 import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { Actor, Message } from "@native-im/core";
-import { isSessionState, type SessionState } from "../auth.js";
+import {
+  deriveLegacyPublicSessionId,
+  isSessionState,
+  type SessionState,
+} from "../auth.js";
 import {
   isRoomLifecycleState,
   type RoomAuditRecord,
@@ -27,6 +31,7 @@ import {
   migrateAuthorityDatabase,
   readSchemaVersion,
 } from "./schema.js";
+import { MAX_ACTIVE_SESSION_FAMILIES } from "./contracts.js";
 
 const IMPORT_MARKER_SCOPE = "__authority_legacy_import__";
 const IMPORT_MARKER_KEY = "t0039-v1";
@@ -212,6 +217,39 @@ function validateCrossFileReferences(
   }
 }
 
+function validateLegacySessionCapacity(sessions: SessionState, now: number): void {
+  const families = new Map<string, {
+    readonly accountId: string;
+    readonly actorId: string;
+    active: boolean;
+    refreshExpiresAt: number;
+  }>();
+  for (const session of sessions.sessions) {
+    const family = families.get(session.familyId);
+    families.set(session.familyId, {
+      accountId: family?.accountId ?? session.accountId,
+      actorId: family?.actorId ?? session.actorId,
+      active: (family?.active ?? false) || session.revokedAt === undefined,
+      refreshExpiresAt: Math.max(
+        family?.refreshExpiresAt ?? -1,
+        session.refreshExpiresAt,
+      ),
+    });
+  }
+  const capacityByPrincipal = new Map<string, number>();
+  for (const family of families.values()) {
+    if (!family.active || family.refreshExpiresAt <= now) continue;
+    const principal = JSON.stringify([family.accountId, family.actorId]);
+    const capacity = (capacityByPrincipal.get(principal) ?? 0) + 1;
+    if (capacity > MAX_ACTIVE_SESSION_FAMILIES) {
+      throw new Error(
+        `Legacy active session family capacity exceeds ${MAX_ACTIVE_SESSION_FAMILIES}`,
+      );
+    }
+    capacityByPrincipal.set(principal, capacity);
+  }
+}
+
 async function readValidatedLegacyState(
   paths: LegacyImportPaths,
 ): Promise<ValidatedLegacyState> {
@@ -232,6 +270,7 @@ async function readValidatedLegacyState(
   await createJsonlMessageStore(paths.messageFilePath).list("");
   const messages = parseStrictMessages(messageBytes.toString("utf8"));
   validateCrossFileReferences(sessionValue, roomValue, messages);
+  validateLegacySessionCapacity(sessionValue, Date.now());
 
   const sourceHash = createHash("sha256")
     .update(sessionBytes)
@@ -285,6 +324,40 @@ function importRows(
   try {
     for (const actor of state.lifecycle.actors) {
       insertActor(database, actor);
+    }
+    const families = new Map<string, typeof state.sessions.sessions>();
+    for (const session of state.sessions.sessions) {
+      families.set(session.familyId, [
+        ...(families.get(session.familyId) ?? []),
+        session,
+      ]);
+    }
+    const insertFamily = database.prepare(
+      `INSERT INTO session_families (
+         family_id, public_id, account_id, actor_id, device_id, device_label,
+         platform, created_at, refresh_expires_at, revoked_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    for (const [familyId, generations] of families) {
+      const canonical = generations[0];
+      if (canonical === undefined) {
+        throw new Error("Legacy session family is empty");
+      }
+      const revoked = generations.every((generation) => generation.revokedAt !== undefined);
+      insertFamily.run(
+        familyId,
+        canonical.publicSessionId ?? deriveLegacyPublicSessionId(familyId),
+        canonical.accountId,
+        canonical.actorId,
+        canonical.deviceId ?? "legacy",
+        canonical.deviceLabel ?? "Legacy device",
+        canonical.platform ?? "unknown",
+        canonical.createdAt ?? null,
+        Math.max(...generations.map((generation) => generation.refreshExpiresAt)),
+        revoked
+          ? Math.max(...generations.map((generation) => generation.revokedAt ?? 0))
+          : null,
+      );
     }
     const insertSession = database.prepare(
       `INSERT INTO sessions (

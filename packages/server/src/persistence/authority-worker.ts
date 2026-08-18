@@ -54,6 +54,7 @@ import {
   type RepairPreemptionCode,
   type StreamingRepairLease,
 } from "../fallback-repair-coordinator.js";
+import { MAX_ACTIVE_SESSION_FAMILIES } from "./contracts.js";
 
 interface AuthorityWorkerData {
   readonly databasePath: string;
@@ -492,15 +493,68 @@ function issueSession(request: AuthorityWorkerRequest): void {
   }
   try {
     const openedDatabase = requireAuthorityTransactionDatabase();
-    const session = runAuthorityImmediateTransaction(openedDatabase, () => {
+    const result = runAuthorityImmediateTransaction(openedDatabase, () => {
       const actor = openedDatabase
         .prepare("SELECT kind FROM actors WHERE id = ?")
         .get(request.input.actorId);
       if (actor?.kind !== "human") {
         throw new Error("identity_forbidden");
       }
+      const activeFamilyCount = openedDatabase.prepare(
+        `SELECT COUNT(*) AS count
+         FROM session_families
+         WHERE account_id = ? AND actor_id = ?
+           AND revoked_at IS NULL AND refresh_expires_at > ?`,
+      ).get(
+        request.input.accountId,
+        request.input.actorId,
+        request.input.now,
+      )?.count;
+      if (typeof activeFamilyCount !== "number") {
+        throw new Error("session_family_corrupt");
+      }
+      if (activeFamilyCount > MAX_ACTIVE_SESSION_FAMILIES) {
+        throw new Error("session_limit_reached");
+      }
+      let evictedFamilyId: string | undefined;
+      if (activeFamilyCount === MAX_ACTIVE_SESSION_FAMILIES) {
+        const oldest = readOldestActiveSessionFamily(
+          openedDatabase,
+          request.input.accountId,
+          request.input.actorId,
+          request.input.now,
+        );
+        if (oldest === undefined) {
+          throw new Error("session_family_corrupt");
+        }
+        revokeSessionFamily(openedDatabase, oldest, request.input.now);
+        evictedFamilyId = oldest.familyId;
+      }
       const familyId = request.input.accessTokenHash;
       const sessionId = request.input.accessTokenHash;
+      if (openedDatabase.prepare(
+        "SELECT 1 FROM session_families WHERE public_id = ?",
+      ).get(request.input.publicSessionId) !== undefined) {
+        throw new Error("session_id_conflict");
+      }
+      openedDatabase
+        .prepare(
+          `INSERT INTO session_families (
+             family_id, public_id, account_id, actor_id, device_id, device_label,
+             platform, created_at, refresh_expires_at, revoked_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+        )
+        .run(
+          familyId,
+          request.input.publicSessionId,
+          request.input.accountId,
+          request.input.actorId,
+          request.input.device.id,
+          request.input.device.label,
+          request.input.device.platform,
+          request.input.now,
+          request.input.refreshExpiresAt,
+        );
       openedDatabase
         .prepare(
           `INSERT INTO sessions (
@@ -521,7 +575,7 @@ function issueSession(request: AuthorityWorkerRequest): void {
         principalId: request.input.actorId,
         eventId: stableId("identity.session.issued", sessionId),
         eventType: "identity.session.issued",
-        occurredAt: new Date().toISOString(),
+        occurredAt: new Date(request.input.now).toISOString(),
         payload: {
           sessionId,
           familyId,
@@ -529,30 +583,45 @@ function issueSession(request: AuthorityWorkerRequest): void {
         },
       });
       return {
-        sessionId,
-        familyId,
-        accountId: request.input.accountId,
-        actorId: request.input.actorId,
-        accessExpiresAt: request.input.accessExpiresAt,
-        refreshExpiresAt: request.input.refreshExpiresAt,
+        session: {
+          sessionId,
+          familyId,
+          publicSessionId: request.input.publicSessionId,
+          accountId: request.input.accountId,
+          actorId: request.input.actorId,
+          accessExpiresAt: request.input.accessExpiresAt,
+          refreshExpiresAt: request.input.refreshExpiresAt,
+        },
+        evictedFamilyId,
       };
     });
+    if (result.evictedFamilyId !== undefined) {
+      preemptRevokedFamilyAfterCommit(result.evictedFamilyId, request.input.now);
+    }
     respond({
       type: "authority.session-issued",
       requestId: request.requestId,
-      session,
+      session: result.session,
     });
   } catch (error: unknown) {
     if (handleRollbackFatal(request.requestId, error)) return;
     const code = error instanceof Error && error.message === "identity_forbidden"
       ? "identity_forbidden"
-      : "storage_unavailable";
+      : error instanceof Error && error.message === "session_id_conflict"
+        ? "session_id_conflict"
+        : error instanceof Error && error.message === "session_limit_reached"
+          ? "session_limit_reached"
+        : "storage_unavailable";
     respondWithError(
       request.requestId,
       code,
       code === "identity_forbidden"
         ? "Session actor is forbidden"
-        : "Authority session issuance failed",
+        : code === "session_id_conflict"
+          ? "Session identifier conflicts with existing state"
+          : code === "session_limit_reached"
+            ? "Active session family limit reached"
+          : "Authority session issuance failed",
     );
   }
 }
@@ -572,8 +641,13 @@ function authenticateSession(request: AuthorityWorkerRequest): void {
            session.actor_id AS actorId,
            session.access_expires_at AS accessExpiresAt,
            session.revoked_at AS revokedAt,
+           family.revoked_at AS familyRevokedAt,
            actor.kind AS actorKind
          FROM sessions AS session
+         JOIN session_families AS family
+           ON family.family_id = session.family_id
+          AND family.account_id = session.account_id
+          AND family.actor_id = session.actor_id
          JOIN actors AS actor ON actor.id = session.actor_id
          WHERE session.access_token_hash = ?`,
       )
@@ -590,7 +664,10 @@ function authenticateSession(request: AuthorityWorkerRequest): void {
       );
       return;
     }
-    if (typeof session.revokedAt === "number") {
+    if (
+      typeof session.revokedAt === "number" ||
+      typeof session.familyRevokedAt === "number"
+    ) {
       respondWithError(
         request.requestId,
         "session_revoked",
@@ -638,11 +715,54 @@ function authenticateSession(request: AuthorityWorkerRequest): void {
 interface SessionAuthorityRow {
   readonly sessionId: string;
   readonly familyId: string;
+  readonly publicSessionId: string;
   readonly accountId: string;
   readonly actorId: string;
   readonly accessExpiresAt: number;
   readonly refreshExpiresAt: number;
   readonly revokedAt: number | null;
+  readonly familyRevokedAt: number | null;
+}
+
+function readOldestActiveSessionFamily(
+  openedDatabase: DatabaseSync,
+  accountId: string,
+  actorId: string,
+  now: number,
+): SessionAuthorityRow | undefined {
+  const row = openedDatabase.prepare(
+    `SELECT
+       session.access_token_hash AS sessionId,
+       family.family_id AS familyId,
+       family.public_id AS publicSessionId,
+       family.account_id AS accountId,
+       family.actor_id AS actorId,
+       session.access_expires_at AS accessExpiresAt,
+       family.refresh_expires_at AS refreshExpiresAt,
+       session.revoked_at AS revokedAt,
+       family.revoked_at AS familyRevokedAt
+     FROM session_families AS family
+     JOIN sessions AS session ON session.family_id = family.family_id
+     WHERE family.account_id = ? AND family.actor_id = ?
+       AND family.revoked_at IS NULL AND family.refresh_expires_at > ?
+     ORDER BY family.created_at ASC, family.public_id ASC, session.rowid ASC
+     LIMIT 1`,
+  ).get(accountId, actorId, now);
+  if (row === undefined) return undefined;
+  if (
+    typeof row.sessionId !== "string" ||
+    typeof row.familyId !== "string" ||
+    typeof row.publicSessionId !== "string" ||
+    typeof row.accountId !== "string" ||
+    typeof row.actorId !== "string" ||
+    typeof row.accessExpiresAt !== "number" ||
+    typeof row.refreshExpiresAt !== "number" ||
+    (row.revokedAt !== null && typeof row.revokedAt !== "number") ||
+    (row.familyRevokedAt !== null && typeof row.familyRevokedAt !== "number")
+  ) {
+    throw new Error("session_family_corrupt");
+  }
+  return row as unknown as SessionAuthorityRow;
 }
 
 function readSessionByRefreshHash(
@@ -653,14 +773,20 @@ function readSessionByRefreshHash(
     .prepare(
       `SELECT
          access_token_hash AS sessionId,
-         family_id AS familyId,
-         account_id AS accountId,
-         actor_id AS actorId,
-         access_expires_at AS accessExpiresAt,
-         refresh_expires_at AS refreshExpiresAt,
-         revoked_at AS revokedAt
-       FROM sessions
-       WHERE refresh_token_hash = ?`,
+         session.family_id AS familyId,
+         family.public_id AS publicSessionId,
+         session.account_id AS accountId,
+         session.actor_id AS actorId,
+         session.access_expires_at AS accessExpiresAt,
+         session.refresh_expires_at AS refreshExpiresAt,
+         session.revoked_at AS revokedAt,
+         family.revoked_at AS familyRevokedAt
+       FROM sessions AS session
+       JOIN session_families AS family
+         ON family.family_id = session.family_id
+        AND family.account_id = session.account_id
+        AND family.actor_id = session.actor_id
+       WHERE session.refresh_token_hash = ?`,
     )
     .get(refreshTokenHash);
   if (row === undefined) {
@@ -669,15 +795,78 @@ function readSessionByRefreshHash(
   if (
     typeof row.sessionId !== "string" ||
     typeof row.familyId !== "string" ||
+    typeof row.publicSessionId !== "string" ||
     typeof row.accountId !== "string" ||
     typeof row.actorId !== "string" ||
     typeof row.accessExpiresAt !== "number" ||
     typeof row.refreshExpiresAt !== "number" ||
-    (row.revokedAt !== null && typeof row.revokedAt !== "number")
+    (row.revokedAt !== null && typeof row.revokedAt !== "number") ||
+    (row.familyRevokedAt !== null && typeof row.familyRevokedAt !== "number")
   ) {
     throw new Error("session_corrupt");
   }
   return row as unknown as SessionAuthorityRow;
+}
+
+interface AccessAuthorityRow extends SessionAuthorityRow {
+  readonly actorKind: string;
+}
+
+function readSessionByAccessHash(
+  openedDatabase: DatabaseSync,
+  accessTokenHash: string,
+): AccessAuthorityRow | undefined {
+  const row = openedDatabase.prepare(
+    `SELECT
+       session.access_token_hash AS sessionId,
+       session.family_id AS familyId,
+       family.public_id AS publicSessionId,
+       session.account_id AS accountId,
+       session.actor_id AS actorId,
+       session.access_expires_at AS accessExpiresAt,
+       family.refresh_expires_at AS refreshExpiresAt,
+       session.revoked_at AS revokedAt,
+       family.revoked_at AS familyRevokedAt,
+       actor.kind AS actorKind
+     FROM sessions AS session
+     JOIN session_families AS family
+       ON family.family_id = session.family_id
+      AND family.account_id = session.account_id
+      AND family.actor_id = session.actor_id
+     JOIN actors AS actor ON actor.id = session.actor_id
+     WHERE session.access_token_hash = ?`,
+  ).get(accessTokenHash);
+  if (row === undefined) {
+    return undefined;
+  }
+  if (
+    typeof row.sessionId !== "string" ||
+    typeof row.familyId !== "string" ||
+    typeof row.publicSessionId !== "string" ||
+    typeof row.accountId !== "string" ||
+    typeof row.actorId !== "string" ||
+    typeof row.accessExpiresAt !== "number" ||
+    typeof row.refreshExpiresAt !== "number" ||
+    (row.revokedAt !== null && typeof row.revokedAt !== "number") ||
+    (row.familyRevokedAt !== null && typeof row.familyRevokedAt !== "number") ||
+    typeof row.actorKind !== "string"
+  ) {
+    throw new Error("session_corrupt");
+  }
+  return row as unknown as AccessAuthorityRow;
+}
+
+function validateAccessAuthorityRow(
+  session: AccessAuthorityRow | undefined,
+  now: number,
+): "invalid_token" | "identity_forbidden" | "session_revoked" | "token_expired" | undefined {
+  if (session === undefined) return "invalid_token";
+  if (session.actorKind !== "human") return "identity_forbidden";
+  if (session.revokedAt !== null || session.familyRevokedAt !== null) {
+    return "session_revoked";
+  }
+  if (now >= session.accessExpiresAt) return "token_expired";
+  return undefined;
 }
 
 function revokeSessionFamily(
@@ -685,6 +874,13 @@ function revokeSessionFamily(
   session: SessionAuthorityRow,
   now: number,
 ): void {
+  openedDatabase
+    .prepare(
+      `UPDATE session_families
+       SET revoked_at = COALESCE(revoked_at, ?)
+       WHERE family_id = ?`,
+    )
+    .run(now, session.familyId);
   openedDatabase
     .prepare(
       `UPDATE sessions
@@ -745,6 +941,16 @@ function revokeSessionFamily(
   }
 }
 
+function preemptRevokedFamilyAfterCommit(familyId: string, now: number): void {
+  repairs.preemptAfterCommit({
+    roomIds: [],
+    catalogPrincipalIds: [],
+    familyIds: [familyId],
+    code: "snapshot_family_revoked",
+    now,
+  });
+}
+
 function validateSessionRefresh(request: AuthorityWorkerRequest): void {
   if (request.type !== "authority.session-validate-refresh") {
     throw new TypeError("validateSessionRefresh received the wrong request type");
@@ -766,16 +972,25 @@ function validateSessionRefresh(request: AuthorityWorkerRequest): void {
       ) {
         return { ok: false as const, code: "identity_forbidden" as const };
       }
-      if (current.revokedAt !== null) {
+      if (current.revokedAt !== null || current.familyRevokedAt !== null) {
         revokeSessionFamily(openedDatabase, current, request.now);
-        return { ok: false as const, code: "session_revoked" as const };
+        return {
+          ok: false as const,
+          code: "session_revoked" as const,
+          revokedFamilyId: current.familyId,
+        };
       }
       if (request.now >= current.refreshExpiresAt) {
         return { ok: false as const, code: "token_expired" as const };
       }
       return { ok: true as const };
-    });
+    }, isAuthorityWorkerData(workerData) && workerData.transactionFaultPoint === "before-commit"
+      ? () => process.exit(82)
+      : undefined);
     if (!result.ok) {
+      if ("revokedFamilyId" in result) {
+        preemptRevokedFamilyAfterCommit(result.revokedFamilyId, request.now);
+      }
       respondWithError(
         request.requestId,
         result.code,
@@ -818,9 +1033,13 @@ function rotateSession(request: AuthorityWorkerRequest): void {
       ) {
         return { kind: "error" as const, code: "identity_forbidden" as const };
       }
-      if (current.revokedAt !== null) {
+      if (current.revokedAt !== null || current.familyRevokedAt !== null) {
         revokeSessionFamily(openedDatabase, current, request.input.now);
-        return { kind: "error" as const, code: "session_revoked" as const };
+        return {
+          kind: "error" as const,
+          code: "session_revoked" as const,
+          revokedFamilyId: current.familyId,
+        };
       }
       if (request.input.now >= current.refreshExpiresAt) {
         return { kind: "error" as const, code: "token_expired" as const };
@@ -848,6 +1067,13 @@ function rotateSession(request: AuthorityWorkerRequest): void {
           request.input.accessExpiresAt,
           request.input.refreshExpiresAt,
         );
+      openedDatabase
+        .prepare(
+          `UPDATE session_families
+           SET refresh_expires_at = MAX(refresh_expires_at, ?)
+           WHERE family_id = ?`,
+        )
+        .run(request.input.refreshExpiresAt, current.familyId);
       appendCanonicalIdentityEvent(openedDatabase, {
         principalId: current.actorId,
         eventId: stableId("identity.session.rotated", request.input.accessTokenHash),
@@ -864,14 +1090,20 @@ function rotateSession(request: AuthorityWorkerRequest): void {
         session: {
           sessionId: request.input.accessTokenHash,
           familyId: current.familyId,
+          publicSessionId: current.publicSessionId,
           accountId: current.accountId,
           actorId: current.actorId,
           accessExpiresAt: request.input.accessExpiresAt,
           refreshExpiresAt: request.input.refreshExpiresAt,
         },
       };
-    });
+    }, isAuthorityWorkerData(workerData) && workerData.transactionFaultPoint === "before-commit"
+      ? () => process.exit(82)
+      : undefined);
     if (result.kind === "error") {
+      if ("revokedFamilyId" in result) {
+        preemptRevokedFamilyAfterCommit(result.revokedFamilyId, request.input.now);
+      }
       respondWithError(
         request.requestId,
         result.code,
@@ -941,19 +1173,171 @@ function revokeSession(request: AuthorityWorkerRequest): void {
       );
       return;
     }
-    respond({ type: "authority.session-revoked", requestId: request.requestId });
     if (typeof family?.familyId === "string") {
-      repairs.preemptAfterCommit({
-        roomIds: [], catalogPrincipalIds: [], familyIds: [family.familyId],
-        code: "snapshot_family_revoked", now: request.now,
-      });
+      preemptRevokedFamilyAfterCommit(family.familyId, request.now);
     }
+    respond({ type: "authority.session-revoked", requestId: request.requestId });
   } catch (error: unknown) {
     if (handleRollbackFatal(request.requestId, error)) return;
     respondWithError(
       request.requestId,
       "storage_unavailable",
       "Authority session revoke failed",
+    );
+  }
+}
+
+function listSessions(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.sessions-list") {
+    throw new TypeError("listSessions received the wrong request type");
+  }
+  try {
+    const openedDatabase = requireAuthorityTransactionDatabase();
+    const result = runAuthorityImmediateTransaction(openedDatabase, () => {
+      const caller = readSessionByAccessHash(openedDatabase, request.accessTokenHash);
+      const error = validateAccessAuthorityRow(caller, request.now);
+      if (error !== undefined || caller === undefined) {
+        return { kind: "error" as const, code: error ?? "invalid_token" as const };
+      }
+      const rows = openedDatabase.prepare(
+        `SELECT
+           public_id AS id,
+           device_label AS deviceLabel,
+           platform,
+           created_at AS createdAt,
+           refresh_expires_at AS refreshExpiresAt,
+           family_id AS familyId
+         FROM session_families
+         WHERE account_id = ? AND actor_id = ?
+           AND revoked_at IS NULL AND refresh_expires_at > ?
+         ORDER BY created_at DESC, public_id ASC
+         LIMIT ?`,
+      ).all(
+        caller.accountId,
+        caller.actorId,
+        request.now,
+        MAX_ACTIVE_SESSION_FAMILIES + 1,
+      );
+      if (rows.length > MAX_ACTIVE_SESSION_FAMILIES) {
+        return { kind: "error" as const, code: "session_limit_reached" as const };
+      }
+      const sessions = rows.map((row) => {
+        if (
+          typeof row.id !== "string" ||
+          typeof row.deviceLabel !== "string" ||
+          (row.platform !== "macos" && row.platform !== "windows" &&
+            row.platform !== "linux" && row.platform !== "unknown") ||
+          (row.createdAt !== null && typeof row.createdAt !== "number") ||
+          typeof row.refreshExpiresAt !== "number" ||
+          typeof row.familyId !== "string"
+        ) {
+          throw new Error("session_family_corrupt");
+        }
+        const platform = row.platform as "macos" | "windows" | "linux" | "unknown";
+        return {
+          id: row.id,
+          deviceLabel: row.deviceLabel,
+          platform,
+          ...(row.createdAt === null
+            ? {}
+            : { createdAt: new Date(row.createdAt).toISOString() }),
+          refreshExpiresAt: new Date(row.refreshExpiresAt).toISOString(),
+          current: row.familyId === caller.familyId,
+        };
+      });
+      return { kind: "sessions" as const, sessions };
+    });
+    if (result.kind === "error") {
+      respondWithError(request.requestId, result.code, "Authority session list was rejected");
+      return;
+    }
+    respond({
+      type: "authority.sessions",
+      requestId: request.requestId,
+      sessions: result.sessions,
+    });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    respondWithError(
+      request.requestId,
+      "storage_unavailable",
+      "Authority session list failed",
+    );
+  }
+}
+
+function revokeTargetSession(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.session-revoke-target") {
+    throw new TypeError("revokeTargetSession received the wrong request type");
+  }
+  try {
+    const openedDatabase = requireAuthorityTransactionDatabase();
+    const result = runAuthorityImmediateTransaction(openedDatabase, () => {
+      const caller = readSessionByAccessHash(openedDatabase, request.accessTokenHash);
+      const error = validateAccessAuthorityRow(caller, request.now);
+      if (error !== undefined || caller === undefined) {
+        return { kind: "error" as const, code: error ?? "invalid_token" as const };
+      }
+      const target = openedDatabase.prepare(
+        `SELECT
+           session.access_token_hash AS sessionId,
+           family.family_id AS familyId,
+           family.public_id AS publicSessionId,
+           family.account_id AS accountId,
+           family.actor_id AS actorId,
+           session.access_expires_at AS accessExpiresAt,
+           family.refresh_expires_at AS refreshExpiresAt,
+           session.revoked_at AS revokedAt,
+           family.revoked_at AS familyRevokedAt
+         FROM session_families AS family
+         JOIN sessions AS session ON session.family_id = family.family_id
+         WHERE family.public_id = ?
+           AND family.account_id = ? AND family.actor_id = ?
+         ORDER BY session.rowid
+         LIMIT 1`,
+      ).get(request.publicSessionId, caller.accountId, caller.actorId);
+      if (target === undefined) {
+        return { kind: "error" as const, code: "session_not_found" as const };
+      }
+      if (
+        typeof target.sessionId !== "string" ||
+        typeof target.familyId !== "string" ||
+        typeof target.publicSessionId !== "string" ||
+        typeof target.accountId !== "string" ||
+        typeof target.actorId !== "string" ||
+        typeof target.accessExpiresAt !== "number" ||
+        typeof target.refreshExpiresAt !== "number" ||
+        (target.revokedAt !== null && typeof target.revokedAt !== "number") ||
+        (target.familyRevokedAt !== null && typeof target.familyRevokedAt !== "number")
+      ) {
+        throw new Error("session_family_corrupt");
+      }
+      const session = target as unknown as SessionAuthorityRow;
+      revokeSessionFamily(openedDatabase, session, request.now);
+      return { kind: "revoked" as const, familyId: session.familyId };
+    }, isAuthorityWorkerData(workerData) && workerData.transactionFaultPoint === "before-commit"
+      ? () => process.exit(82)
+      : undefined);
+    if (result.kind === "error") {
+      respondWithError(
+        request.requestId,
+        result.code,
+        "Authority targeted session revoke was rejected",
+      );
+      return;
+    }
+    preemptRevokedFamilyAfterCommit(result.familyId, request.now);
+    respond({
+      type: "authority.session-target-revoked",
+      requestId: request.requestId,
+      publicSessionId: request.publicSessionId,
+    });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    respondWithError(
+      request.requestId,
+      "storage_unavailable",
+      "Authority targeted session revoke failed",
     );
   }
 }
@@ -1664,6 +2048,12 @@ async function dispatch(value: unknown): Promise<void> {
       return;
     case "authority.session-revoke":
       revokeSession(value);
+      return;
+    case "authority.sessions-list":
+      listSessions(value);
+      return;
+    case "authority.session-revoke-target":
+      revokeTargetSession(value);
       return;
     case "authority.execute-human":
       executeHuman(value);

@@ -182,6 +182,14 @@ export function createSqliteAuthoritativeStore(
       return client.revokeSession(accessTokenHash, now);
     },
 
+    listSessions(accessTokenHash, now) {
+      return client.listSessions(accessTokenHash, now);
+    },
+
+    revokeSession(accessTokenHash, publicSessionId, now) {
+      return client.revokeTargetSession(accessTokenHash, publicSessionId, now);
+    },
+
     async executeHuman(
       context: AuthenticatedCommandContext,
       command: HumanCollaborationCommand | RoomGovernanceCommand,
