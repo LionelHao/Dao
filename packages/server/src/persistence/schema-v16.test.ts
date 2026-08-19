@@ -7,7 +7,7 @@ import {
   AUTHORITY_SCHEMA_VERSION,
   AUTHORITY_V16_STATEMENT_COUNT_FOR_TEST,
   listAuthorityTables,
-  migrateAuthorityDatabase,
+  migrateAuthorityDatabaseToVersion16ForTest,
   migrateAuthorityDatabaseToHistoricalVersionForTest,
   migrateAuthorityDatabaseToVersion15ForTest,
   readSchemaVersion,
@@ -237,7 +237,7 @@ describe("authority SQLite v16 Message Authority", () => {
       withDatabase((database) => {
         migrateAuthorityDatabaseToHistoricalVersionForTest(database, version);
         expect(readSchemaVersion(database)).toBe(version);
-        migrateAuthorityDatabase(database);
+        migrateAuthorityDatabaseToVersion16ForTest(database);
         expect(readSchemaVersion(database)).toBe(16);
         expect(database.prepare(
           "SELECT COUNT(*) AS count FROM schema_migrations",
@@ -248,9 +248,9 @@ describe("authority SQLite v16 Message Authority", () => {
 
   it("creates the closed v16 tables and indexes without changing the v15 checksum", () => {
     withDatabase((database) => {
-      migrateAuthorityDatabase(database);
+      migrateAuthorityDatabaseToVersion16ForTest(database);
 
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(16);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(17);
       expect(AUTHORITY_V16_STATEMENT_COUNT_FOR_TEST).toBe(82);
       expect(readSchemaVersion(database)).toBe(16);
       for (const [table, columns] of Object.entries(V16_TABLE_COLUMNS)) {
@@ -300,7 +300,7 @@ describe("authority SQLite v16 Message Authority", () => {
         "SELECT COUNT(*) AS count FROM outbox_deliveries",
       ).get();
 
-      migrateAuthorityDatabase(database);
+      migrateAuthorityDatabaseToVersion16ForTest(database);
 
       expect(database.prepare(
         `SELECT message_id AS messageId, room_id AS roomId, message_kind AS messageKind,
@@ -354,7 +354,7 @@ describe("authority SQLite v16 Message Authority", () => {
       expect(database.prepare("SELECT COUNT(*) AS count FROM outbox_deliveries").get())
         .toEqual(beforeOutbox);
 
-      migrateAuthorityDatabase(database);
+      migrateAuthorityDatabaseToVersion16ForTest(database);
       expect(database.prepare("SELECT COUNT(*) AS count FROM message_envelopes").get())
         .toEqual({ count: 3 });
       expect(database.prepare("SELECT COUNT(*) AS count FROM message_revisions").get())
@@ -398,7 +398,7 @@ describe("authority SQLite v16 Message Authority", () => {
         "SELECT COUNT(*) AS count FROM outbox_deliveries",
       ).get();
 
-      migrateAuthorityDatabase(database);
+      migrateAuthorityDatabaseToVersion16ForTest(database);
 
       expect(database.prepare(
         `SELECT id, execution_id AS executionId, source_revision AS sourceRevision,
@@ -458,7 +458,7 @@ describe("authority SQLite v16 Message Authority", () => {
           '2026-08-19T00:03:00.000Z'
         );
       `);
-      migrateAuthorityDatabase(database);
+      migrateAuthorityDatabaseToVersion16ForTest(database);
       expect(database.prepare(
         `SELECT requester_actor_id AS requesterActorId, origin_kind AS originKind
          FROM agent_invocation_intents WHERE id = 'backfilled-agent-intent'`,
@@ -515,7 +515,7 @@ describe("authority SQLite v16 Message Authority", () => {
            'message_target', 'pending'
          )`,
       ).run()).toThrow(/binding/i);
-      expect(() => migrateAuthorityDatabase(database)).not.toThrow();
+      expect(() => migrateAuthorityDatabaseToVersion16ForTest(database)).not.toThrow();
     });
   });
 
@@ -564,7 +564,7 @@ describe("authority SQLite v16 Message Authority", () => {
         receipt: database.prepare("SELECT * FROM idempotency_records").get(),
       };
 
-      migrateAuthorityDatabase(database);
+      migrateAuthorityDatabaseToVersion16ForTest(database);
 
       expect({
         profile: database.prepare("SELECT * FROM agent_profiles").get(),
@@ -581,7 +581,7 @@ describe("authority SQLite v16 Message Authority", () => {
     withDatabase((database) => {
       migrateAuthorityDatabaseToVersion15ForTest(database);
       seedRoomAndLegacyMessages(database);
-      migrateAuthorityDatabase(database);
+      migrateAuthorityDatabaseToVersion16ForTest(database);
 
       expect(() => database.prepare(
         `INSERT INTO message_reply_links (message_id, room_id, reply_to_message_id)
@@ -624,7 +624,7 @@ describe("authority SQLite v16 Message Authority", () => {
     withDatabase((database) => {
       migrateAuthorityDatabaseToVersion15ForTest(database);
       seedRoomAndLegacyMessages(database);
-      migrateAuthorityDatabase(database);
+      migrateAuthorityDatabaseToVersion16ForTest(database);
 
       for (const mutation of [
         "UPDATE messages SET room_id = 'v16-room-2' WHERE id = 'legacy-human'",
@@ -640,7 +640,7 @@ describe("authority SQLite v16 Message Authority", () => {
     withDatabase((database) => {
       migrateAuthorityDatabaseToVersion15ForTest(database);
       seedRoomAndLegacyMessages(database);
-      migrateAuthorityDatabase(database);
+      migrateAuthorityDatabaseToVersion16ForTest(database);
 
       expect(() => database.prepare(
         `INSERT INTO message_mentions (
@@ -720,7 +720,7 @@ describe("authority SQLite v16 Message Authority", () => {
     withDatabase((database) => {
       migrateAuthorityDatabaseToVersion15ForTest(database);
       seedRoomAndLegacyMessages(database);
-      migrateAuthorityDatabase(database);
+      migrateAuthorityDatabaseToVersion16ForTest(database);
 
       expect(() => begin(database, () => {
         database.prepare(
@@ -800,7 +800,7 @@ describe("authority SQLite v16 Message Authority", () => {
     withDatabase((database) => {
       migrateAuthorityDatabaseToVersion15ForTest(database);
       seedRoomAndLegacyMessages(database);
-      migrateAuthorityDatabase(database);
+      migrateAuthorityDatabaseToVersion16ForTest(database);
 
       begin(database, () => {
         database.prepare(
@@ -858,7 +858,7 @@ describe("authority SQLite v16 Message Authority", () => {
     withDatabase((database) => {
       migrateAuthorityDatabaseToVersion15ForTest(database);
       seedRoomAndLegacyMessages(database);
-      migrateAuthorityDatabase(database);
+      migrateAuthorityDatabaseToVersion16ForTest(database);
 
       database.prepare(
         `INSERT INTO message_revisions (
@@ -902,7 +902,7 @@ describe("authority SQLite v16 Message Authority", () => {
     withDatabase((database) => {
       migrateAuthorityDatabaseToVersion15ForTest(database);
       seedRoomAndLegacyMessages(database);
-      migrateAuthorityDatabase(database);
+      migrateAuthorityDatabaseToVersion16ForTest(database);
       seedClaimedAgentExecution(database);
 
       expect(() => begin(database, () => {
@@ -951,7 +951,7 @@ describe("authority SQLite v16 Message Authority", () => {
           "SELECT version, name, checksum FROM schema_migrations ORDER BY version",
         ).all();
 
-        expect(() => migrateAuthorityDatabase(database, { failAfterStatement }))
+        expect(() => migrateAuthorityDatabaseToVersion16ForTest(database, { failAfterStatement }))
           .toThrow(/injected migration failure/i);
 
         expect(readSchemaVersion(database)).toBe(15);
