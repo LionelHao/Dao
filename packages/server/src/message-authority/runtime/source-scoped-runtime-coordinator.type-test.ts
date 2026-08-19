@@ -2,12 +2,14 @@ import type {
   AgentMessageCommitCommand,
   CommittedSourceExecutionCancellation,
   SourceScopedAgentRuntimePort,
+  SourceScopedRuntimeBoundary,
   SourceScopedRuntimePersistencePort,
 } from "./source-scoped-runtime-coordinator.js";
 
 declare const persistence: SourceScopedRuntimePersistencePort;
 declare const runtime: SourceScopedAgentRuntimePort;
 declare const committedCancellation: CommittedSourceExecutionCancellation;
+declare const boundary: SourceScopedRuntimeBoundary;
 
 // @ts-expect-error Provider preview has no authority persistence operation.
 persistence.publishPreview({ executionId: "execution-1", delta: "partial" });
@@ -19,6 +21,12 @@ runtime.applyRoomWideHumanPreemption("room-1");
 runtime.undoDispatchedSideEffect("execution-1");
 
 runtime.abortAfterCommittedCancellation(committedCancellation);
+
+// @ts-expect-error The production preview/recall boundary has no authority write port.
+boundary.persistence.submit({ body: "preview" });
+
+// @ts-expect-error Provider partials cannot use the final-message CAS operation.
+boundary.commitAgentMessage({ body: "preview" });
 
 const invalidFinal: AgentMessageCommitCommand = {
   kind: "final",

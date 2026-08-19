@@ -21,6 +21,7 @@ import {
   type WorkerDatabaseClient,
 } from "./persistence/worker-database-client.js";
 import { createAgentRuntimeService, type AgentRuntimeService } from "./agent-runtime/agent-runtime-service.js";
+import type { ProviderAdapter } from "./agent-runtime/contracts.js";
 import { createEnvironmentSecretProvider } from "./agent-runtime/environment-secret-provider.js";
 import { createOpenAIResponsesProvider } from "./agent-runtime/openai-responses-provider.js";
 import { createWorkerRuntimeAuthority } from "./agent-runtime/worker-runtime-authority.js";
@@ -40,6 +41,10 @@ import {
 } from "./human-preemption/human-preemption-runtime.js";
 import { RoomCacheInvalidationPostCommitDispatcher } from "./access/room-cache-invalidation-port.js";
 import { createProductionSharedAuthorityParticipantComposition } from "./room-governance/production-participant-composition.js";
+import {
+  createSourceScopedRuntimeBoundary,
+  type SourceScopedRuntimeBoundary,
+} from "./message-authority/runtime/source-scoped-runtime-coordinator.js";
 
 export { createProductionSharedAuthorityParticipantComposition } from "./room-governance/production-participant-composition.js";
 
@@ -97,6 +102,7 @@ interface AuthoritativeServerTestOptions {
   readonly registerMissingActors?: false;
   readonly afterCloseForTest?: Partial<Record<"transport" | "route" | "runtime" | "ball" | "snapshots" | "worker", () => void>>;
   readonly blueprintBallProjectionPort?: BlueprintBallProjectionPort;
+  readonly agentRuntimeProviderForTest?: ProviderAdapter;
 }
 
 export interface AuthoritativeServerTestFacades {
@@ -148,6 +154,7 @@ async function start(
   let snapshots: Awaited<ReturnType<typeof createSnapshotWorkerClient>> | undefined;
   let transport: Awaited<ReturnType<typeof startMessageWebSocketServer>> | undefined;
   let runtime: AgentRuntimeService | undefined;
+  let sourceScopedRuntimeBoundary: SourceScopedRuntimeBoundary | undefined;
   let routeRuntime: RouteRuntimeService | undefined;
   let ballRuntime: BallRuntimeService | undefined;
   let humanPreemptionRuntime: HumanPreemptionRuntime | undefined;
@@ -341,7 +348,7 @@ async function start(
     await testOptions.initialize?.({ auth, lifecycle, messages: service, primitives });
     const runtimeConfiguration = options.agentRuntime ?? {};
     const secretProvider = createEnvironmentSecretProvider();
-    const provider = createOpenAIResponsesProvider({
+    const provider = testOptions.agentRuntimeProviderForTest ?? createOpenAIResponsesProvider({
       endpoint: runtimeConfiguration.endpoint ?? "https://api.openai.com/v1/responses",
       model: runtimeConfiguration.model ?? "gpt-5-mini",
       secretProvider,
@@ -374,7 +381,10 @@ async function start(
       authority: runtimeAuthority,
       provider,
       modelId: runtimeConfiguration.model ?? "gpt-5-mini",
-      readiness: () => secretProvider.getSecret("OPENAI_API_KEY") === undefined ? "noauth" : "ready",
+      readiness: () => testOptions.agentRuntimeProviderForTest !== undefined ||
+          secretProvider.getSecret("OPENAI_API_KEY") !== undefined
+        ? "ready"
+        : "noauth",
       tools: tools.map((tool) => tool.descriptor),
       toolGateway,
       toolAdapters: tools,
@@ -392,7 +402,7 @@ async function start(
         };
       },
       emitPreview(preview) {
-        transport?.publishAgentPreview(preview);
+        sourceScopedRuntimeBoundary?.publishPreview(preview);
       },
       onMessageCommitted(execution) {
         if (execution.resultMessageId !== undefined) {
@@ -417,6 +427,24 @@ async function start(
           },
         );
         return { id: item.id };
+      },
+    });
+    sourceScopedRuntimeBoundary = createSourceScopedRuntimeBoundary({
+      runtime: {
+        applyCommittedMessageRecall(input) {
+          runtime?.applyCommittedMessageRecall(input);
+        },
+      },
+      preview: {
+        publish(preview) {
+          transport?.publishAgentPreview({
+            roomId: preview.roomId,
+            executionId: preview.executionId,
+            attemptSeq: preview.attemptSeq,
+            streamSeq: preview.streamSeq,
+            delta: preview.delta,
+          });
+        },
       },
     });
     await runtime.recover();
@@ -495,16 +523,13 @@ async function start(
         };
       },
       async recallHumanMessage(...args: Parameters<typeof authority.recallHumanMessage>) {
-        const receipt = await authority.recallHumanMessage(...args);
-        try {
-          runtime?.applyCommittedMessageRecall({
-            sourceMessageId: receipt.messageId,
-            cancellations: receipt.abortTargets,
-          });
-        } catch {
-          // The recall/fence/cancellation transaction is already durable. Restart recovery
-          // observes cancelled executions, so an in-process abort failure cannot change the ACK.
-        }
+        const receipt = await sourceScopedRuntimeBoundary!.coordinateRecallCommit(
+          () => authority.recallHumanMessage(...args),
+          (committed) => ({
+            sourceMessageId: committed.messageId,
+            cancellations: committed.abortTargets,
+          }),
+        );
         return {
           messageId: receipt.messageId,
           revision: receipt.revision,

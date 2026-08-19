@@ -3,6 +3,7 @@ import {
   mintInternalAgentMessageCommitContext,
 } from "../internal-message-capability.js";
 import {
+  createSourceScopedRuntimeBoundary,
   createSourceScopedRuntimeCoordinator,
   type AgentMessageCommitCommand,
   type AgentMessageCommitReceipt,
@@ -79,6 +80,63 @@ function persistencePort(
 }
 
 describe("source-scoped message runtime coordination", () => {
+  it("bridges the production recall receipt to an exact-source abort only after commit", async () => {
+    const order: string[] = [];
+    let releaseCommit!: () => void;
+    const commitBarrier = new Promise<void>((resolve) => { releaseCommit = resolve; });
+    const applyCommittedMessageRecall = vi.fn((input: { sourceMessageId: string }) => {
+      order.push(`abort:${input.sourceMessageId}`);
+    });
+    const boundary = createSourceScopedRuntimeBoundary({
+      runtime: { applyCommittedMessageRecall },
+    });
+    const pending = boundary.coordinateRecallCommit(
+      async () => {
+        order.push("authority:start");
+        await commitBarrier;
+        order.push("authority:committed");
+        return { messageId: source.sourceMessageId, revision: 1, abortTargets: [
+          cancelledExecution("execution-1"),
+        ] };
+      },
+      (receipt) => ({
+        sourceMessageId: receipt.messageId,
+        cancellations: receipt.abortTargets,
+      }),
+    );
+    await Promise.resolve();
+    expect(applyCommittedMessageRecall).not.toHaveBeenCalled();
+    releaseCommit();
+    await expect(pending).resolves.toMatchObject({ messageId: source.sourceMessageId });
+    expect(order).toEqual([
+      "authority:start",
+      "authority:committed",
+      `abort:${source.sourceMessageId}`,
+    ]);
+  });
+
+  it("never publishes preview through a durable port and keeps its source identity", () => {
+    const publish = vi.fn();
+    const boundary = createSourceScopedRuntimeBoundary({ preview: { publish } });
+    boundary.publishPreview({
+      roomId: source.roomId,
+      sourceMessageId: source.sourceMessageId,
+      executionId: "execution-preview",
+      attemptSeq: 1,
+      streamSeq: 2,
+      delta: "temporary-only",
+    });
+    expect(publish).toHaveBeenCalledWith({
+      roomId: source.roomId,
+      sourceMessageId: source.sourceMessageId,
+      executionId: "execution-preview",
+      attemptSeq: 1,
+      streamSeq: 2,
+      delta: "temporary-only",
+    });
+    expect(boundary).not.toHaveProperty("persistence");
+  });
+
   it("propagates exact-source AbortSignal effects only after durable recall commit", async () => {
     const order: string[] = [];
     let releaseCommit!: () => void;

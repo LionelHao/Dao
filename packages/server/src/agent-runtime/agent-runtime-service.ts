@@ -45,6 +45,7 @@ interface AgentRuntimeServiceOptions {
   readonly limits?: RuntimeLimits;
   readonly emitPreview?: (preview: {
     readonly roomId: string;
+    readonly sourceMessageId: string;
     readonly executionId: string;
     readonly attemptSeq: number;
     readonly streamSeq: number;
@@ -247,6 +248,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
           }
           options.emitPreview?.({
             roomId: claimed.roomId,
+            sourceMessageId: claimed.sourceMessageId,
             executionId: claimed.id,
             attemptSeq: claimed.currentAttemptSeq,
             streamSeq: event.sequence,

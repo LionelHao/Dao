@@ -8,6 +8,8 @@ import {
   isMessage,
   isOpenItem,
   type Actor,
+  type AgentRuntimeProviderInput,
+  type ProviderEvent,
 } from "@native-im/core";
 import { DatabaseSync } from "node:sqlite";
 import type { IdentityAdapter, LoginCredentials } from "../auth.js";
@@ -20,6 +22,7 @@ import {
   startAuthoritativeServerForTest,
   type StartAuthoritativeServerOptions,
 } from "../authoritative-server.js";
+import type { ProviderAdapter } from "../agent-runtime/contracts.js";
 
 interface AuthorityChildStartCommand {
   readonly type: "start";
@@ -51,6 +54,8 @@ interface AuthorityChildStartCommand {
   readonly seedMixedRoomId?: string;
   readonly emitUnrelatedWarningForTest?: true;
   readonly closeCleanupProbe?: true;
+  readonly seedRuntimeRoomForTest?: true;
+  readonly previewSentinelForTest?: string;
   readonly suppressJsonForTest?: true;
   readonly ignoreSigtermForTest?: true;
   readonly compactRoom?: {
@@ -90,6 +95,8 @@ function isStartCommand(value: unknown): value is AuthorityChildStartCommand {
     ...(value.seedMixedRoomId === undefined ? [] : ["seedMixedRoomId"]),
     ...(value.emitUnrelatedWarningForTest === undefined ? [] : ["emitUnrelatedWarningForTest"]),
     ...(value.closeCleanupProbe === undefined ? [] : ["closeCleanupProbe"]),
+    ...(value.seedRuntimeRoomForTest === undefined ? [] : ["seedRuntimeRoomForTest"]),
+    ...(value.previewSentinelForTest === undefined ? [] : ["previewSentinelForTest"]),
     ...(value.suppressJsonForTest === undefined ? [] : ["suppressJsonForTest"]),
     ...(value.ignoreSigtermForTest === undefined ? [] : ["ignoreSigtermForTest"]),
     ...(value.compactRoom === undefined ? [] : ["compactRoom"]),
@@ -125,6 +132,11 @@ function isStartCommand(value: unknown): value is AuthorityChildStartCommand {
       (value.emitUnrelatedWarningForTest !== undefined &&
         value.emitUnrelatedWarningForTest !== true) ||
       (value.closeCleanupProbe !== undefined && value.closeCleanupProbe !== true) ||
+      (value.seedRuntimeRoomForTest !== undefined && value.seedRuntimeRoomForTest !== true) ||
+      (value.previewSentinelForTest !== undefined &&
+        (typeof value.previewSentinelForTest !== "string" ||
+          value.previewSentinelForTest.length === 0 ||
+          Buffer.byteLength(value.previewSentinelForTest, "utf8") > 1_024)) ||
       (value.suppressJsonForTest !== undefined && value.suppressJsonForTest !== true) ||
       (value.ignoreSigtermForTest !== undefined && value.ignoreSigtermForTest !== true) ||
       (value.compactRoom !== undefined &&
@@ -135,6 +147,10 @@ function isStartCommand(value: unknown): value is AuthorityChildStartCommand {
           Number(value.compactRoom.retainedFromSeq) < 1)) ||
       [value.inspectMessageIds, value.seedMixedRoomId, value.compactRoom]
         .filter((utility) => utility !== undefined).length > 1) {
+    return false;
+  }
+  if ([value.seedAllFacts, value.seedGovernanceRoom, value.seedRuntimeRoomForTest]
+      .filter((seed) => seed === true).length > 1) {
     return false;
   }
   return value.faultPoint === undefined ||
@@ -561,6 +577,97 @@ async function seedGovernanceRoomThroughFacades(
   }, { name: "Governance process room" });
 }
 
+async function seedRuntimeRoomThroughFacades(
+  facades: Parameters<NonNullable<Parameters<typeof startAuthoritativeServerForTest>[1]["initialize"]>>[0],
+): Promise<void> {
+  const issued = await facades.auth.login({
+    accountId: command.identity.accountId,
+    secret: command.identity.secret,
+  });
+  const session = await facades.auth.authenticateSession(issued.accessToken);
+  const context = {
+    ...session,
+    kind: "human" as const,
+    requestId: "seed-runtime-room",
+    idempotencyKey: "seed-runtime-room",
+  };
+  const room = await facades.lifecycle.createRoom(context, { name: "Runtime preview sentinel" });
+  await facades.lifecycle.configureAgent({
+    ...context,
+    requestId: "seed-runtime-agent",
+    idempotencyKey: "seed-runtime-agent",
+  }, {
+    kind: "agent-configuration",
+    roomId: room.id,
+    agentId: "agent-a",
+    participation: "active",
+    toolPermissions: ["repository.git-status"],
+  });
+}
+
+function createPreviewSentinelProvider(
+  sentinel: string,
+  databasePath: string,
+): ProviderAdapter {
+  const verifyCommittedRecall = (input: AgentRuntimeProviderInput): void => {
+    const database = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      const execution = database.prepare(
+        `SELECT status FROM agent_executions
+         WHERE trigger_message_id = ? ORDER BY rowid DESC LIMIT 1`,
+      ).get(input.invocation.sourceMessageId) as { readonly status: string } | undefined;
+      const fence = database.prepare(
+        `SELECT COUNT(*) AS count FROM message_recall_fences
+         WHERE source_message_id = ? AND scope_kind = 'execution'`,
+      ).get(input.invocation.sourceMessageId) as { readonly count: number };
+      if (execution?.status !== "cancelled" || fence.count < 1) process.exit(86);
+    } finally {
+      database.close();
+    }
+  };
+  return Object.freeze({
+    id: "preview-sentinel-test-provider",
+    async *stream(
+      input: AgentRuntimeProviderInput,
+      signal: AbortSignal,
+    ): AsyncIterable<ProviderEvent> {
+      if (input.invocation.sourceMessageId.includes("completed")) {
+        yield { type: "response_started", sequence: 1 };
+        yield { type: "text_delta", sequence: 2, delta: "durable completed final" };
+        yield { type: "completed", sequence: 3 };
+        return;
+      }
+      if (input.toolContinuations === undefined) {
+        yield { type: "response_started", sequence: 1 };
+        yield {
+          type: "tool_call_started",
+          sequence: 2,
+          callId: "preview-sentinel-read",
+          toolName: "repository_git_status",
+        };
+        yield {
+          type: "tool_call_delta",
+          sequence: 3,
+          callId: "preview-sentinel-read",
+          delta: "{}",
+        };
+        yield { type: "completed", sequence: 4 };
+        return;
+      }
+      yield { type: "response_started", sequence: 1 };
+      yield { type: "text_delta", sequence: 2, delta: sentinel };
+      await new Promise<void>((resolve) => {
+        const aborted = (): void => {
+          if (signal.reason === "message_recalled") verifyCommittedRecall(input);
+          resolve();
+        };
+        if (signal.aborted) aborted();
+        else signal.addEventListener("abort", aborted, { once: true });
+      });
+    },
+  });
+}
+
 const serverOptions: StartAuthoritativeServerOptions = {
   databasePath: command.databasePath,
   snapshotCachePath: command.snapshotCachePath,
@@ -581,7 +688,18 @@ const testOptions = {
   ...(command.seedGovernanceRoom === true
     ? { initialize: seedGovernanceRoomThroughFacades }
     : {}),
+  ...(command.seedRuntimeRoomForTest === true
+    ? { initialize: seedRuntimeRoomThroughFacades }
+    : {}),
   ...(command.readbackOnly === true ? { registerMissingActors: false as const } : {}),
+  ...(command.previewSentinelForTest === undefined
+    ? {}
+    : {
+        agentRuntimeProviderForTest: createPreviewSentinelProvider(
+          command.previewSentinelForTest,
+          command.databasePath,
+        ),
+      }),
   ...(command.closeCleanupProbe === true ? {
     afterCloseForTest: {
       transport() {

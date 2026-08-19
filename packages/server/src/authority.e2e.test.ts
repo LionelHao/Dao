@@ -30,6 +30,8 @@ import {
   startAuthoritativeServer,
   type AuthoritativeServer,
 } from "./authoritative-server.js";
+import { createWorkerDatabaseClient } from "./persistence/worker-database-client.js";
+import { createWorkerRuntimeAuthority } from "./agent-runtime/worker-runtime-authority.js";
 import type { ServerFrame } from "./protocol.js";
 import {
   createClientSyncReplica,
@@ -80,6 +82,13 @@ const actors = [
     toolPermissions: ["authority.inspect"],
   },
 ] as const;
+const previewActors = [
+  actors[0],
+  {
+    ...actors[1],
+    toolPermissions: ["repository.git-status"],
+  },
+] as const satisfies readonly Actor[];
 const childStderr = new WeakMap<ChildProcessWithoutNullStreams, string>();
 const stressPageSize = 50;
 
@@ -225,6 +234,8 @@ interface ChildStartOptions {
   readonly seedMixedRoomId?: string;
   readonly emitUnrelatedWarningForTest?: true;
   readonly closeCleanupProbe?: true;
+  readonly seedRuntimeRoomForTest?: true;
+  readonly previewSentinelForTest?: string;
   readonly compactRoom?: {
     readonly roomId: string;
     readonly retainedFromSeq: number;
@@ -269,6 +280,12 @@ function startCommand(options: ChildStartOptions): Record<string, unknown> {
     ...(options.emitUnrelatedWarningForTest === undefined
       ? {} : { emitUnrelatedWarningForTest: true }),
     ...(options.closeCleanupProbe === undefined ? {} : { closeCleanupProbe: true }),
+    ...(options.seedRuntimeRoomForTest === undefined
+      ? {}
+      : { seedRuntimeRoomForTest: true }),
+    ...(options.previewSentinelForTest === undefined
+      ? {}
+      : { previewSentinelForTest: options.previewSentinelForTest }),
   };
 }
 
@@ -1048,6 +1065,34 @@ async function repairRecords(client: JsonWebSocketClient, roomId: string) {
   return { records, watermark: first.watermark, checksum: first.snapshotChecksum };
 }
 
+function authoritySentinelHits(databasePath: string, sentinel: string): readonly string[] {
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    const hits: string[] = [];
+    const tables = database.prepare(
+      `SELECT name FROM sqlite_schema
+       WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+       ORDER BY name`,
+    ).all() as Array<{ readonly name: string }>;
+    for (const { name } of tables) {
+      const quotedTable = `"${name.replaceAll('"', '""')}"`;
+      const columns = database.prepare(`PRAGMA table_info(${quotedTable})`).all() as
+        Array<{ readonly name: string }>;
+      for (const column of columns) {
+        const quotedColumn = `"${column.name.replaceAll('"', '""')}"`;
+        const row = database.prepare(
+          `SELECT COUNT(*) AS count FROM ${quotedTable}
+           WHERE instr(CAST(${quotedColumn} AS TEXT), ?) > 0`,
+        ).get(sentinel) as { readonly count: number };
+        if (row.count > 0) hits.push(`${name}.${column.name}:${row.count}`);
+      }
+    }
+    return hits;
+  } finally {
+    database.close();
+  }
+}
+
 async function seedDirectory(directory: string): Promise<string> {
   const started = await spawnAuthorityChild({ directory, seedAllFacts: true });
   const client = await JsonWebSocketClient.connect(started.url);
@@ -1505,6 +1550,265 @@ describe("authoritative server real-process harness", () => {
     } finally {
       for (const client of clients) client.close();
       if (started !== undefined) await stopChild(started.child);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("keeps provider preview transient across source recall while preserving completed and dispatched facts", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-preview-recall-sentinel-"));
+    const databasePath = join(directory, "authority.sqlite");
+    const sentinel = "PREVIEW-MUST-STAY-TRANSIENT-7D04FBD1";
+    let started: Awaited<ReturnType<typeof spawnAuthorityChild>> | undefined;
+    let client: JsonWebSocketClient | undefined;
+    let runtimeClient: Awaited<ReturnType<typeof createWorkerDatabaseClient>> | undefined;
+    try {
+      started = await spawnAuthorityChild({
+        directory,
+        actors: previewActors,
+        seedRuntimeRoomForTest: true,
+        previewSentinelForTest: sentinel,
+      });
+      client = await JsonWebSocketClient.connect(started.url);
+      await client.login("preview-recall-login");
+      const roomId = await discoverRoom(client);
+      await client.request({
+        type: "room.subscribe.v2",
+        requestId: "preview-recall-subscribe",
+        roomId,
+        cursor: { version: 1, roomId, afterSeq: readRoomHeadSeq(directory, roomId) },
+      }, "room.subscribed.v2");
+
+      const submit = async (messageId: string, body: string): Promise<void> => {
+        await expect(client!.request({
+          type: "message.send.v2",
+          requestId: `submit-${messageId}`,
+          message: { messageId, roomId, body, mentionedTargets: [], attachments: [] },
+        }, "message.accepted")).resolves.toMatchObject({ messageId, targetOutcomes: [] });
+      };
+      const invoke = async (messageId: string) => {
+        const frame = await client!.request({
+          type: "agent.invoke",
+          requestId: `invoke-${messageId}`,
+          intent: {
+            kind: "direct_mention",
+            roomId,
+            sourceMessageId: messageId,
+            targetAgentId: "agent-a",
+          },
+        }, "agent.execution.ack");
+        if (frame.type !== "agent.execution.ack") throw new TypeError("wrong execution ACK");
+        return frame.execution;
+      };
+
+      const completedSourceId = "message-preview-completed";
+      await submit(completedSourceId, "complete before source recall");
+      const completedExecution = await invoke(completedSourceId);
+      await vi.waitFor(() => {
+        const database = new DatabaseSync(databasePath, { readOnly: true });
+        try {
+          expect(database.prepare(
+            "SELECT status FROM agent_executions WHERE id = ?",
+          ).get(completedExecution.id)).toEqual({ status: "completed" });
+        } finally {
+          database.close();
+        }
+      });
+      await expect(client.request({
+        type: "message.recall",
+        requestId: "recall-completed-preview-source",
+        roomId,
+        messageId: completedSourceId,
+        expectedRevision: 1,
+      }, "message.recall.accepted")).resolves.toMatchObject({
+        messageId: completedSourceId,
+        revision: 1,
+      });
+
+      const previewSourceId = "message-preview-running";
+      await submit(previewSourceId, "run a read tool then wait on preview");
+      const runningExecution = await invoke(previewSourceId);
+      await expect(client.waitFor((frame) =>
+        frame.type === "agent.execution.preview" &&
+        frame.executionId === runningExecution.id && frame.delta === sentinel,
+      )).resolves.toMatchObject({
+        type: "agent.execution.preview",
+        executionId: runningExecution.id,
+        delta: sentinel,
+        authoritative: false,
+      });
+
+      const beforeRecall = new DatabaseSync(databasePath, { readOnly: true });
+      let retainedDispatch: unknown;
+      try {
+        retainedDispatch = beforeRecall.prepare(
+          `SELECT dispatch_id AS dispatchId, state
+           FROM tool_dispatches WHERE execution_id = ?`,
+        ).get(runningExecution.id);
+        expect(retainedDispatch).toEqual(expect.objectContaining({ state: "succeeded" }));
+        expect(authoritySentinelHits(databasePath, sentinel)).toEqual([]);
+      } finally {
+        beforeRecall.close();
+      }
+
+      await expect(client.request({
+        type: "message.recall",
+        requestId: "recall-running-preview-source",
+        roomId,
+        messageId: previewSourceId,
+        expectedRevision: 1,
+      }, "message.recall.accepted")).resolves.toMatchObject({
+        messageId: previewSourceId,
+        revision: 1,
+      });
+
+      const history = await client.request({
+        type: "room.history.v2",
+        requestId: "preview-sentinel-history",
+        roomId,
+      }, "room.history.v2");
+      const revisions = await client.request({
+        type: "message.revisions.query",
+        requestId: "preview-sentinel-revisions",
+        roomId,
+        messageId: previewSourceId,
+      }, "message.revisions");
+      const repair = await repairRecords(client, roomId);
+      expect(JSON.stringify({ history, revisions, repair })).not.toContain(sentinel);
+      expect(revisions).toMatchObject({ revisions: [] });
+
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      try {
+        expect(database.prepare(
+          "SELECT status FROM agent_executions WHERE id = ?",
+        ).get(runningExecution.id)).toEqual({ status: "cancelled" });
+        expect(database.prepare(
+          "SELECT status FROM agent_executions WHERE id = ?",
+        ).get(completedExecution.id)).toEqual({ status: "completed" });
+        expect(database.prepare(
+          `SELECT dispatch_id AS dispatchId, state
+           FROM tool_dispatches WHERE execution_id = ?`,
+        ).get(runningExecution.id)).toEqual(retainedDispatch);
+        expect(database.prepare(
+          `SELECT COUNT(*) AS count FROM messages
+           WHERE author_kind = 'agent' AND body = ?`,
+        ).get(sentinel)).toEqual({ count: 0 });
+        expect(database.prepare(
+          `SELECT COUNT(*) AS count FROM messages
+           WHERE author_kind = 'agent'`,
+        ).get()).toEqual({ count: 1 });
+        expect(authoritySentinelHits(databasePath, sentinel)).toEqual([]);
+      } finally {
+        database.close();
+      }
+
+      client.close();
+      client = undefined;
+      await stopChild(started.child);
+      started = undefined;
+      runtimeClient = await createWorkerDatabaseClient({ databasePath });
+      const runtimeContext = await createWorkerRuntimeAuthority(runtimeClient)
+        .readContext(runningExecution.id);
+      expect(JSON.stringify(runtimeContext)).not.toContain(sentinel);
+      await runtimeClient.close();
+      runtimeClient = undefined;
+      const durableBytes = Buffer.concat(await readAllRegularFiles(directory));
+      expect(durableBytes.includes(Buffer.from(sentinel, "utf8"))).toBe(false);
+    } finally {
+      await runtimeClient?.close().catch(() => undefined);
+      client?.close();
+      if (started !== undefined) await stopChild(started.child).catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("does not turn a provider preview into authority data after crash and reconnect repair", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-preview-crash-sentinel-"));
+    const databasePath = join(directory, "authority.sqlite");
+    const sentinel = "PREVIEW-CRASH-RECONNECT-ZERO-WRITE-58C3";
+    let first: Awaited<ReturnType<typeof spawnAuthorityChild>> | undefined;
+    let second: Awaited<ReturnType<typeof spawnAuthorityChild>> | undefined;
+    let client: JsonWebSocketClient | undefined;
+    try {
+      first = await spawnAuthorityChild({
+        directory,
+        actors: previewActors,
+        seedRuntimeRoomForTest: true,
+        previewSentinelForTest: sentinel,
+      });
+      client = await JsonWebSocketClient.connect(first.url);
+      await client.login("preview-crash-login");
+      const roomId = await discoverRoom(client);
+      await client.request({
+        type: "room.subscribe.v2",
+        requestId: "preview-crash-subscribe",
+        roomId,
+        cursor: { version: 1, roomId, afterSeq: readRoomHeadSeq(directory, roomId) },
+      }, "room.subscribed.v2");
+      const sourceMessageId = "message-preview-crash-running";
+      await client.request({
+        type: "message.send.v2",
+        requestId: "preview-crash-submit",
+        message: {
+          messageId: sourceMessageId,
+          roomId,
+          body: "crash after provider preview",
+          mentionedTargets: [],
+          attachments: [],
+        },
+      }, "message.accepted");
+      const invoked = await client.request({
+        type: "agent.invoke",
+        requestId: "preview-crash-invoke",
+        intent: {
+          kind: "direct_mention",
+          roomId,
+          sourceMessageId,
+          targetAgentId: "agent-a",
+        },
+      }, "agent.execution.ack");
+      if (invoked.type !== "agent.execution.ack") throw new TypeError("wrong execution ACK");
+      await client.waitFor((frame) => frame.type === "agent.execution.preview" &&
+        frame.executionId === invoked.execution.id && frame.delta === sentinel);
+
+      client.terminate();
+      client = undefined;
+      first.child.kill("SIGKILL");
+      await childExit(first.child);
+      first = undefined;
+      expect(authoritySentinelHits(databasePath, sentinel)).toEqual([]);
+
+      second = await spawnAuthorityChild({
+        directory,
+        actors: previewActors,
+        readbackOnly: true,
+        previewSentinelForTest: sentinel,
+      });
+      client = await JsonWebSocketClient.connect(second.url);
+      await client.login("preview-reconnect-login");
+      const repairedRoomId = await discoverRoom(client);
+      const repair = await repairRecords(client, repairedRoomId);
+      const history = await client.request({
+        type: "room.history.v2",
+        requestId: "preview-reconnect-history",
+        roomId: repairedRoomId,
+      }, "room.history.v2");
+      expect(JSON.stringify({ repair, history })).not.toContain(sentinel);
+      expect(authoritySentinelHits(databasePath, sentinel)).toEqual([]);
+      const durableBytes = Buffer.concat(await readAllRegularFiles(directory));
+      expect(durableBytes.includes(Buffer.from(sentinel, "utf8"))).toBe(false);
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      try {
+        expect(database.prepare(
+          `SELECT COUNT(*) AS count FROM messages
+           WHERE author_kind = 'agent' AND body = ?`,
+        ).get(sentinel)).toEqual({ count: 0 });
+      } finally {
+        database.close();
+      }
+    } finally {
+      client?.close();
+      if (first !== undefined) await stopChild(first.child).catch(() => undefined);
+      if (second !== undefined) await stopChild(second.child).catch(() => undefined);
       await rm(directory, { recursive: true, force: true });
     }
   }, 30_000);
