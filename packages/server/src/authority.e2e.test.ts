@@ -526,6 +526,51 @@ function readRoomHeadSeq(directory: string, roomId: string): number {
   }
 }
 
+async function waitForRoomAuthorityQuiescence(
+  directory: string,
+  roomId: string,
+  timeoutMs = 5_000,
+): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  let previousHead = -1;
+  let stableSamples = 0;
+  let pendingDeliveries = -1;
+  while (Date.now() <= deadline) {
+    const database = new DatabaseSync(join(directory, "authority.sqlite"), { readOnly: true });
+    let headSeq: number;
+    try {
+      const stream = database.prepare(
+        `SELECT head_seq AS headSeq FROM streams
+         WHERE stream_kind = 'room' AND stream_id = ?`,
+      ).get(roomId) as { readonly headSeq: number } | undefined;
+      if (stream === undefined || !Number.isSafeInteger(stream.headSeq)) {
+        throw new TypeError("Authority quiescence observed an invalid Room stream");
+      }
+      headSeq = stream.headSeq;
+      const pending = database.prepare(
+        `SELECT COUNT(*) AS count
+         FROM outbox_deliveries AS delivery
+         INNER JOIN events AS event ON event.event_id = delivery.event_id
+         WHERE event.stream_kind = 'room' AND event.stream_id = ?
+           AND delivery.status <> 'dispatched'`,
+      ).get(roomId) as { readonly count: number };
+      pendingDeliveries = pending.count;
+    } finally {
+      database.close();
+    }
+    stableSamples = pendingDeliveries === 0 && headSeq === previousHead
+      ? stableSamples + 1
+      : 0;
+    if (stableSamples >= 2) return headSeq;
+    previousHead = headSeq;
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(
+    `Room authority did not quiesce within ${timeoutMs}ms ` +
+      `(head=${previousHead}, pendingDeliveries=${pendingDeliveries})`,
+  );
+}
+
 async function spawnAuthorityChild(options: ChildStartOptions): Promise<{
   readonly child: ChildProcessWithoutNullStreams;
   readonly url: string;
@@ -1276,7 +1321,9 @@ async function seedDirectory(directory: string): Promise<string> {
   const client = await JsonWebSocketClient.connect(started.url);
   try {
     await client.login("seed-login");
-    return await discoverRoom(client);
+    const roomId = await discoverRoom(client);
+    await waitForRoomAuthorityQuiescence(directory, roomId);
+    return roomId;
   } finally {
     client.close();
     await stopChild(started.child);
@@ -1789,6 +1836,7 @@ describe("authoritative server real-process harness", () => {
           }),
         ]));
       }
+      await waitForRoomAuthorityQuiescence(directory, roomId);
       const repairs = await Promise.all(restarted.map((client) => repairRecords(client, roomId)));
       expect(repairs.map((repair) => repair.mode)).toEqual([
         "materialized",
