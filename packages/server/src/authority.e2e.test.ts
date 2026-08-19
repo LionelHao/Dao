@@ -727,6 +727,30 @@ class JsonWebSocketClient {
   }
 }
 
+async function loginAuthorityDevice(
+  client: JsonWebSocketClient,
+  input: {
+    readonly requestId: string;
+    readonly accountId: string;
+    readonly secret: string;
+    readonly deviceId: string;
+  },
+): Promise<string> {
+  const frame = await client.request({
+    type: "auth.login",
+    requestId: input.requestId,
+    accountId: input.accountId,
+    secret: input.secret,
+    device: {
+      id: input.deviceId,
+      label: `Authority E2E ${input.deviceId}`,
+      platform: "unknown",
+    },
+  }, "auth.authenticated");
+  if (frame.type !== "auth.authenticated") throw new TypeError("wrong device login frame");
+  return frame.accessToken;
+}
+
 function recordKey(record: RoomRepairRecord): string {
   const value = record.value as unknown as Record<string, unknown>;
   return `${record.kind}:${String(value.id ?? value.actorId ?? "room")}`;
@@ -1214,6 +1238,276 @@ describe("authoritative server real-process harness", () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+
+  it("replays one structured v2 aggregate after an unconsumed ACK, changed requests, and restart", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-ft03-message-replay-"));
+    const messageActors = [
+      ...actors,
+      { id: "human-b", kind: "human", displayName: "Human B", reachability: "online" },
+    ] satisfies readonly Actor[];
+    const identities = [
+      { accountId: "account-a", actorId: "human-a", secret: "test-secret" },
+      { accountId: "account-b", actorId: "human-b", secret: "test-secret-b" },
+    ] as const;
+    const clients: JsonWebSocketClient[] = [];
+    let started: Awaited<ReturnType<typeof spawnAuthorityChild>> | undefined;
+    try {
+      const seeded = await spawnAuthorityChild({
+        directory,
+        actors: messageActors,
+        identities,
+        seedAllFacts: true,
+      });
+      const seedClient = await JsonWebSocketClient.connect(seeded.url);
+      clients.push(seedClient);
+      await loginAuthorityDevice(seedClient, {
+        requestId: "message-v2-replay-seed-login",
+        accountId: "account-a",
+        secret: "test-secret",
+        deviceId: "message-v2-seed-device",
+      });
+      const roomId = await discoverRoom(seedClient);
+      seedClient.close();
+      await stopChild(seeded.child);
+
+      const setup = new DatabaseSync(join(directory, "authority.sqlite"));
+      setup.prepare(
+        `INSERT INTO room_memberships (
+           room_id, actor_id, kind, role, participation, tool_permissions_json,
+           joined_at, configured_at, access_revision
+         ) VALUES (?, 'human-b', 'human', 'member', NULL, '[]', ?, NULL, 0)`,
+      ).run(roomId, "2026-08-19T00:00:00.000Z");
+      setup.close();
+
+      started = await spawnAuthorityChild({ directory, actors: messageActors, identities });
+      const [observerA, sender, observerB] = await Promise.all([
+        JsonWebSocketClient.connect(started.url),
+        JsonWebSocketClient.connect(started.url),
+        JsonWebSocketClient.connect(started.url),
+      ]);
+      clients.push(observerA, sender, observerB);
+      await Promise.all([
+        loginAuthorityDevice(observerA, {
+          requestId: "message-v2-device-a-login",
+          accountId: "account-a",
+          secret: "test-secret",
+          deviceId: "message-v2-device-a",
+        }),
+        loginAuthorityDevice(sender, {
+          requestId: "message-v2-device-b-login",
+          accountId: "account-a",
+          secret: "test-secret",
+          deviceId: "message-v2-device-b",
+        }),
+        loginAuthorityDevice(observerB, {
+          requestId: "message-v2-human-b-login",
+          accountId: "account-b",
+          secret: "test-secret-b",
+          deviceId: "message-v2-human-b-device",
+        }),
+      ]);
+      const head = readRoomHeadSeq(directory, roomId);
+      await Promise.all([observerA, observerB].map((client, index) => client.request({
+        type: "room.subscribe.v2",
+        requestId: `message-v2-replay-subscribe-${index}`,
+        roomId,
+        cursor: { version: 1, roomId, afterSeq: head },
+      }, "room.subscribed.v2")));
+
+      const message = {
+        messageId: "message-v2-ack-loss-replay",
+        roomId,
+        body: "@Human B @Agent A production request",
+        mentionedTargets: [
+          {
+            id: "target-human-b",
+            kind: "human-request",
+            targetActorId: "human-b",
+            range: { startUtf16: 0, endUtf16: 8 },
+          },
+          {
+            id: "target-agent-a",
+            kind: "agent-invocation",
+            targetActorId: "agent-a",
+            range: { startUtf16: 9, endUtf16: 17 },
+          },
+        ],
+        replyToMessageId: "message-human-authority",
+        attachments: [],
+      } as const;
+      const observerAEvent = observerA.waitFor((frame) => frame.type === "room.event" &&
+        frame.event.roomId === roomId && frame.event.type === "room.message.accepted" &&
+        frame.event.payload.id === message.messageId);
+      const observerBEvent = observerB.waitFor((frame) => frame.type === "room.event" &&
+        frame.event.roomId === roomId && frame.event.type === "room.message.accepted" &&
+        frame.event.payload.id === message.messageId);
+      sender.send({
+        type: "message.send.v2",
+        requestId: "message-v2-unconsumed-ack",
+        message,
+      });
+      let stableEventA: ServerFrame;
+      let stableEventB: ServerFrame;
+      try {
+        [stableEventA, stableEventB] = await Promise.all([observerAEvent, observerBEvent]);
+      } catch (error: unknown) {
+        throw new Error(`Structured v2 event did not converge: ${JSON.stringify({
+          observerA: observerA.frames(),
+          sender: sender.frames(),
+          observerB: observerB.frames(),
+        })}`, { cause: error });
+      }
+      expect(stableEventA).toEqual(stableEventB);
+      if (stableEventA.type !== "room.event") throw new TypeError("wrong stable message event");
+      sender.terminate();
+
+      const replayClient = await JsonWebSocketClient.connect(started.url);
+      clients.push(replayClient);
+      await loginAuthorityDevice(replayClient, {
+        requestId: "message-v2-replay-login",
+        accountId: "account-a",
+        secret: "test-secret",
+        deviceId: "message-v2-replay-device",
+      });
+      const replay = await replayClient.request({
+        type: "message.send.v2",
+        requestId: "message-v2-replay-new-request",
+        message,
+      }, "message.accepted");
+      expect(replay).toMatchObject({
+        type: "message.accepted",
+        requestId: "message-v2-replay-new-request",
+        messageId: message.messageId,
+        targetOutcomes: [
+          {
+            targetId: "target-human-b",
+            targetActorId: "human-b",
+            kind: "human-request",
+            status: "request-created",
+            requestIntentId: expect.any(String),
+          },
+          {
+            targetId: "target-agent-a",
+            targetActorId: "agent-a",
+            kind: "agent-invocation",
+            status: "invocation-intent-created",
+            invocationIntentId: expect.any(String),
+          },
+        ],
+      });
+      if (replay.type !== "message.accepted") throw new TypeError("wrong replay ACK");
+
+      const changedMessages = [
+        { ...message, body: `${message.body}!` },
+        {
+          ...message,
+          mentionedTargets: [
+            { ...message.mentionedTargets[0], targetActorId: "human-a" },
+            message.mentionedTargets[1],
+          ],
+        },
+        {
+          ...message,
+          mentionedTargets: [
+            { ...message.mentionedTargets[0], range: { startUtf16: 0, endUtf16: 7 } },
+            message.mentionedTargets[1],
+          ],
+        },
+        {
+          messageId: message.messageId,
+          roomId: message.roomId,
+          body: message.body,
+          mentionedTargets: message.mentionedTargets,
+          attachments: message.attachments,
+        },
+      ] as const;
+      for (const [index, changed] of changedMessages.entries()) {
+        await expect(replayClient.request({
+          type: "message.send.v2",
+          requestId: `message-v2-changed-${index}`,
+          message: changed,
+        }, "message.accepted")).rejects.toMatchObject({
+          status: 409,
+          code: "idempotency_conflict",
+        });
+      }
+
+      for (const client of [observerA, observerB, replayClient]) client.close();
+      await stopChild(started.child);
+      started = await spawnAuthorityChild({ directory, actors: messageActors, identities });
+      const restartedClient = await JsonWebSocketClient.connect(started.url);
+      clients.push(restartedClient);
+      await loginAuthorityDevice(restartedClient, {
+        requestId: "message-v2-restart-login",
+        accountId: "account-a",
+        secret: "test-secret",
+        deviceId: "message-v2-restart-device",
+      });
+      await expect(restartedClient.request({
+        type: "message.send.v2",
+        requestId: "message-v2-restart-replay",
+        message,
+      }, "message.accepted")).resolves.toEqual({
+        ...replay,
+        requestId: "message-v2-restart-replay",
+      });
+      restartedClient.close();
+      await stopChild(started.child);
+      started = undefined;
+
+      const database = new DatabaseSync(join(directory, "authority.sqlite"), { readOnly: true });
+      try {
+        expect(database.prepare(
+          `SELECT
+             (SELECT COUNT(*) FROM messages WHERE id = ?) AS messages,
+             (SELECT COUNT(*) FROM message_revisions WHERE message_id = ?) AS revisions,
+             (SELECT COUNT(*) FROM message_envelopes WHERE message_id = ?) AS envelopes,
+             (SELECT COUNT(*) FROM message_mentions WHERE message_id = ?) AS mentions,
+             (SELECT COUNT(*) FROM message_target_outcomes WHERE message_id = ?) AS outcomes,
+             (SELECT COUNT(*) FROM human_request_intents WHERE source_message_id = ?) AS humanIntents,
+             (SELECT COUNT(*) FROM agent_invocation_intents
+                WHERE source_message_id = ? AND origin_kind = 'message_target') AS agentIntents,
+             (SELECT COUNT(*) FROM message_reply_links WHERE message_id = ?) AS replyLinks,
+             (SELECT COUNT(*) FROM message_attachment_links WHERE message_id = ?) AS attachments,
+             (SELECT COUNT(*) FROM events WHERE event_id = ?) AS events,
+             (SELECT COUNT(*) FROM outbox_deliveries WHERE event_id = ?) AS outbox,
+             (SELECT COUNT(*) FROM idempotency_records WHERE key = ?) AS receipts`,
+        ).get(
+          message.messageId,
+          message.messageId,
+          message.messageId,
+          message.messageId,
+          message.messageId,
+          message.messageId,
+          message.messageId,
+          message.messageId,
+          message.messageId,
+          stableEventA.event.eventId,
+          stableEventA.event.eventId,
+          message.messageId,
+        )).toEqual({
+          messages: 1,
+          revisions: 1,
+          envelopes: 1,
+          mentions: 2,
+          outcomes: 2,
+          humanIntents: 1,
+          agentIntents: 1,
+          replyLinks: 1,
+          attachments: 0,
+          events: 1,
+          outbox: 1,
+          receipts: 1,
+        });
+      } finally {
+        database.close();
+      }
+    } finally {
+      for (const client of clients) client.close();
+      if (started !== undefined) await stopChild(started.child);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it("drives three isolated Desktop Identity controllers through real password login and targeted device revocation", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-ft01-desktop-authority-"));

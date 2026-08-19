@@ -1112,6 +1112,9 @@ function messageEventMatchesCurrentProjection(
      WHERE envelope.message_id = ? AND envelope.room_id = ?`,
   ).get(messageId, roomId);
   if (authority === undefined) return !isStoredMessageEventPointer(row);
+  if (row.eventType === "room.message.accepted" && !isStoredMessageEventPointer(row)) {
+    return authority.lifecycle === "active" && authority.currentRevision === 1;
+  }
   if (typeof row.occurredAt !== "string" || authority.latestMessageEventSeq !== row.streamSeq) {
     return false;
   }
@@ -1706,7 +1709,8 @@ export function authorizeOutboxCandidateDatabaseQuery(
   const delivery = database
     .prepare(
       `SELECT delivery.target_kind AS targetKind, delivery.target_id AS targetId,
-              event.event_type AS eventType, event.occurred_at AS occurredAt,
+              event.stream_seq AS streamSeq, event.event_type AS eventType,
+              event.occurred_at AS occurredAt,
               event.payload_json AS payloadJson
        FROM outbox_deliveries AS delivery
        JOIN events AS event ON event.event_id = delivery.event_id
