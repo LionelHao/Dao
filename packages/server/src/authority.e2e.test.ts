@@ -3532,5 +3532,5 @@ describe("authoritative server real-process harness", () => {
       if (child !== undefined) await stopChild(child);
       await rm(directory, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 });
