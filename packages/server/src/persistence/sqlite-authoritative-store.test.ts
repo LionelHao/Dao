@@ -1039,7 +1039,7 @@ describe("SQLite authoritative sessions", () => {
       accountId: "account-li",
       actorId: "human-li",
     });
-    await expect(client.inspectSchema()).resolves.toEqual({ version: 15 });
+    await expect(client.inspectSchema()).resolves.toEqual({ version: 16 });
     await client.close();
   });
 
