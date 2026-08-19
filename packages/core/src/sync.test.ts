@@ -270,6 +270,14 @@ describe("pure synchronization contracts", () => {
       type: "room.sync.result",
       requestId: "request-1",
       mode: "repair_required",
+      reason: "operational_projection_changed",
+      retainedFromSeq: 5,
+      watermark: 8,
+    })).toBe(true);
+    expect(isRoomSyncResult({
+      type: "room.sync.result",
+      requestId: "request-1",
+      mode: "repair_required",
       reason: "unknown",
       retainedFromSeq: 5,
       watermark: 8,

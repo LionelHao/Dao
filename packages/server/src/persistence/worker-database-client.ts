@@ -464,8 +464,9 @@ function roomSyncResultMatchesRequest(
     if (request.cursor === undefined) {
       return result.reason === "cursor_absent";
     }
-    return result.reason === "cursor_expired" &&
-      request.cursor.afterSeq < result.retainedFromSeq - 1 &&
+    return ((result.reason === "cursor_expired" &&
+      request.cursor.afterSeq < result.retainedFromSeq - 1) ||
+      result.reason === "operational_projection_changed") &&
       result.watermark >= request.cursor.afterSeq;
   }
   if (

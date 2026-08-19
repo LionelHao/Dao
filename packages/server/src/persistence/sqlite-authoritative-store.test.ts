@@ -4448,10 +4448,17 @@ describe("SQLite authoritative sessions", () => {
       sessionFamilyId: fixture.contexts.owner.sessionFamilyId,
       principal: fixture.contexts.owner.principal,
     };
+    const recallRawSentinel = "RECALLED-RAW-MESSAGE-V2-SENTINEL-7A4D";
+    const beforeMessageDatabase = new DatabaseSync(databasePath, { readOnly: true });
+    const beforeMessageHead = beforeMessageDatabase.prepare(
+      `SELECT head_seq AS headSeq FROM streams
+       WHERE stream_kind = 'room' AND stream_id = ?`,
+    ).get(fixture.contexts.roomId) as { readonly headSeq: number };
+    beforeMessageDatabase.close();
     const message = {
       messageId: "message-v2-structured",
       roomId: fixture.contexts.roomId,
-      body: "@Chen @Reviewer @Alternate hello",
+      body: `@Chen @Reviewer @Alternate hello ${recallRawSentinel}`,
       mentionedTargets: [
         {
           id: "target-human",
@@ -4580,6 +4587,34 @@ describe("SQLite authoritative sessions", () => {
       { messageId: message.messageId, revision: 1, body: message.body },
       { messageId: message.messageId, revision: 2, body: "@Chen @Reviewer @Alternate revised" },
     ] });
+    await expect(fixture.store.syncRoom(ownerSession, {
+      type: "room.sync",
+      requestId: "revised-message-stale-accepted",
+      roomId: message.roomId,
+      cursor: { version: 1, roomId: message.roomId, afterSeq: beforeMessageHead.headSeq },
+    })).resolves.toMatchObject({
+      mode: "repair_required",
+      reason: "operational_projection_changed",
+    });
+    const revisedDelta = await fixture.store.syncRoom(ownerSession, {
+      type: "room.sync",
+      requestId: "revised-message-current-event",
+      roomId: message.roomId,
+      cursor: {
+        version: 1,
+        roomId: message.roomId,
+        afterSeq: beforeMessageHead.headSeq + 1,
+      },
+    });
+    expect(revisedDelta).toMatchObject({
+      mode: "delta",
+      events: [{
+        type: "room.message.revised",
+        payload: { id: message.messageId, currentRevision: { revision: 2 } },
+      }],
+    });
+    expect(JSON.stringify(await fixture.store.listPendingOutbox(10)))
+      .not.toContain(recallRawSentinel);
 
     const recalled = await fixture.store.recallHumanMessage(
       { ...fixture.contexts.owner, requestId: "recall-first", idempotencyKey: "recall-v2-2" },
@@ -4619,9 +4654,52 @@ describe("SQLite authoritative sessions", () => {
       recalledAt: recalled.recalledAt,
       revisionCount: 2,
     });
+    expect(JSON.stringify(history)).not.toContain(recallRawSentinel);
+    await expect(fixture.store.syncRoom(ownerSession, {
+      type: "room.sync",
+      requestId: "recalled-message-stale-cursor",
+      roomId: message.roomId,
+      cursor: { version: 1, roomId: message.roomId, afterSeq: beforeMessageHead.headSeq },
+    })).resolves.toMatchObject({
+      type: "room.sync.result",
+      requestId: "recalled-message-stale-cursor",
+      mode: "repair_required",
+      reason: "operational_projection_changed",
+    });
 
     await fixture.client.close();
     const database = new DatabaseSync(databasePath, { readOnly: true });
+    expect(database.prepare(
+      `SELECT body FROM message_revisions
+       WHERE message_id = ? AND instr(body, ?) > 0`,
+    ).all(message.messageId, recallRawSentinel)).toHaveLength(1);
+    const messageEventPayloads = database.prepare(
+      `SELECT event_type AS eventType, payload_json AS payloadJson
+       FROM events
+       WHERE stream_id = ?
+         AND event_type IN ('room.message.accepted', 'room.message.revised', 'room.message.recalled')
+         AND json_extract(payload_json, '$.id') = ?
+       ORDER BY stream_seq`,
+    ).all(message.roomId, message.messageId);
+    expect(messageEventPayloads).toEqual([
+      { eventType: "room.message.accepted", payloadJson: JSON.stringify({ id: message.messageId }) },
+      { eventType: "room.message.revised", payloadJson: JSON.stringify({ id: message.messageId }) },
+      { eventType: "room.message.recalled", payloadJson: JSON.stringify({ id: message.messageId }) },
+    ]);
+    expect(JSON.stringify(messageEventPayloads)).not.toContain(recallRawSentinel);
+    expect(database.prepare(
+      `SELECT event.event_type AS eventType, delivery.status
+       FROM outbox_deliveries AS delivery
+       JOIN events AS event ON event.event_id = delivery.event_id
+       WHERE event.stream_id = ?
+         AND event.event_type IN ('room.message.accepted', 'room.message.revised', 'room.message.recalled')
+         AND json_extract(event.payload_json, '$.id') = ?
+       ORDER BY event.stream_seq`,
+    ).all(message.roomId, message.messageId)).toEqual([
+      { eventType: "room.message.accepted", status: "dispatched" },
+      { eventType: "room.message.revised", status: "dispatched" },
+      { eventType: "room.message.recalled", status: "pending" },
+    ]);
     expect(database.prepare(
       "SELECT COUNT(*) AS count FROM message_target_outcomes WHERE message_id = ?",
     ).get(message.messageId)).toEqual({ count: 3 });
