@@ -260,6 +260,13 @@ type ClosedMessageRecallResult = Readonly<{
 type ClosedMessageHistoryResult = Readonly<{
   messages: readonly TimelineMessage[];
   hasMore: boolean;
+  lifecycle: "active" | "archived";
+  actors: readonly Readonly<{
+    actorId: string;
+    kind: "human" | "agent";
+    displayName: string;
+    secondaryLabel: string;
+  }>[];
 }>;
 
 type ClosedMessageRevisionsResult = Readonly<{
@@ -343,10 +350,34 @@ function closeMessageHistoryResult(
   roomId: string,
   limit: number,
 ): ClosedMessageHistoryResult | undefined {
-  if (!isObjectRecord(value) || !hasOnlyOwnFields(value, ["messages", "hasMore"]) ||
+  if (!isObjectRecord(value) || !hasOnlyOwnFields(value, [
+    "messages", "hasMore", "lifecycle", "actors",
+  ]) ||
       typeof value.hasMore !== "boolean" || !Array.isArray(value.messages) ||
-      value.messages.length > limit) {
+      value.messages.length > limit ||
+      (value.lifecycle !== "active" && value.lifecycle !== "archived") ||
+      !Array.isArray(value.actors) || value.actors.length > 512) {
     return undefined;
+  }
+  const actors: Array<ClosedMessageHistoryResult["actors"][number]> = [];
+  const actorIds = new Set<string>();
+  for (const actor of value.actors) {
+    if (!isObjectRecord(actor) || !hasOnlyOwnFields(actor, [
+      "actorId", "kind", "displayName", "secondaryLabel",
+    ]) || typeof actor.actorId !== "string" || !isBoundedWireText(actor.actorId, 256) ||
+        (actor.kind !== "human" && actor.kind !== "agent") ||
+        typeof actor.displayName !== "string" || !isBoundedWireText(actor.displayName, 512) ||
+        typeof actor.secondaryLabel !== "string" ||
+        !isBoundedWireText(actor.secondaryLabel, 512) || actorIds.has(actor.actorId)) {
+      return undefined;
+    }
+    actorIds.add(actor.actorId);
+    actors.push({
+      actorId: actor.actorId,
+      kind: actor.kind,
+      displayName: actor.displayName,
+      secondaryLabel: actor.secondaryLabel,
+    });
   }
   const messageIds = new Set<string>();
   const closedMessages: TimelineMessage[] = [];
@@ -360,7 +391,12 @@ function closeMessageHistoryResult(
     closedMessages.push(message);
     previousCreatedAt = message.createdAt;
   }
-  return { messages: closedMessages, hasMore: value.hasMore };
+  return {
+    messages: closedMessages,
+    hasMore: value.hasMore,
+    lifecycle: value.lifecycle,
+    actors,
+  };
 }
 
 function closeMessageRevisionsResult(

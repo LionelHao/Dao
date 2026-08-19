@@ -1154,9 +1154,18 @@ function isAgentMessageReceipt(value: unknown): value is AgentMessageCommitRecei
 }
 
 function isMessageHistoryPage(value: unknown): value is MessageHistoryPage {
-  return isRecord(value) && hasExactKeys(value, ["messages", "hasMore"]) &&
+  return isRecord(value) && hasExactKeys(value, [
+    "messages", "hasMore", "lifecycle", "actors",
+  ]) &&
     Array.isArray(value.messages) && value.messages.every(isTimelineMessage) &&
-    typeof value.hasMore === "boolean";
+    typeof value.hasMore === "boolean" &&
+    (value.lifecycle === "active" || value.lifecycle === "archived") &&
+    Array.isArray(value.actors) && value.actors.length <= 512 &&
+    value.actors.every((actor) => isRecord(actor) && hasExactKeys(actor, [
+      "actorId", "kind", "displayName", "secondaryLabel",
+    ]) && isText(actor.actorId) && (actor.kind === "human" || actor.kind === "agent") &&
+      isText(actor.displayName) && isText(actor.secondaryLabel)) &&
+    new Set(value.actors.map((actor) => actor.actorId)).size === value.actors.length;
 }
 
 function isMessageRevisionPage(value: unknown): value is MessageRevisionPage {

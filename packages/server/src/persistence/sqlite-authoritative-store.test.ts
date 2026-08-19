@@ -4599,6 +4599,16 @@ describe("SQLite authoritative sessions", () => {
     const history = await fixture.store.readMessageHistory(ownerSession, {
       roomId: message.roomId,
     });
+    expect(history).toMatchObject({
+      lifecycle: "active",
+      actors: expect.arrayContaining([
+        { actorId: "human-li", kind: "human", displayName: "Lionel", secondaryLabel: "Owner" },
+        { actorId: "human-chen", kind: "human", displayName: "Chen", secondaryLabel: "Member" },
+        { actorId: "agent-review", kind: "agent", displayName: "Reviewer",
+          secondaryLabel: "Active Agent" },
+      ]),
+    });
+    expect(history.actors.some(({ actorId }) => actorId === "human-alternate")).toBe(false);
     expect(history.messages.find((entry) => entry.id === message.messageId)).toEqual({
       id: message.messageId,
       roomId: message.roomId,

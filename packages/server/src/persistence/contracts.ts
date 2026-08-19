@@ -388,6 +388,15 @@ export interface MessageRevisionQuery {
 export interface MessageHistoryPage {
   readonly messages: readonly TimelineMessage[];
   readonly hasMore: boolean;
+  readonly lifecycle: "active" | "archived";
+  readonly actors: readonly MessageHistoryActor[];
+}
+
+export interface MessageHistoryActor {
+  readonly actorId: string;
+  readonly kind: "human" | "agent";
+  readonly displayName: string;
+  readonly secondaryLabel: string;
 }
 
 export interface MessageRevisionPage {

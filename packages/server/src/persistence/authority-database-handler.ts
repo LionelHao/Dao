@@ -7745,6 +7745,55 @@ export function readMessageHistoryDatabaseQuery(
     }
     const actorId = requireHumanSession(database, context, now);
     requireSyncHumanRoomMembership(database, actorId, query.roomId);
+    const room = database.prepare(
+      `SELECT status, owner_actor_id AS ownerActorId FROM rooms WHERE id = ?`,
+    ).get(query.roomId);
+    if ((room?.status !== "active" && room?.status !== "archived") ||
+        typeof room.ownerActorId !== "string") {
+      return fail("storage_unavailable", "Message history Room authority is corrupt");
+    }
+    const actors = database.prepare(
+      `SELECT actor.id AS actorId, actor.kind, actor.display_name AS displayName,
+              membership.role, membership.participation
+       FROM room_memberships AS membership
+       JOIN actors AS actor ON actor.id = membership.actor_id
+       WHERE membership.room_id = ?
+       ORDER BY actor.id`,
+    ).all(query.roomId).map((row) => {
+      if (typeof row.actorId !== "string" || row.actorId.length === 0 ||
+          typeof row.displayName !== "string" || row.displayName.length === 0 ||
+          (row.kind !== "human" && row.kind !== "agent")) {
+        return fail("storage_unavailable", "Message history actor projection is corrupt");
+      }
+      if (row.kind === "human") {
+        if (row.role !== "owner" && row.role !== "member" && row.role !== "admin") {
+          return fail("storage_unavailable", "Message history Human role is corrupt");
+        }
+        if ((row.role === "owner") !== (row.actorId === room.ownerActorId)) {
+          return fail("storage_unavailable", "Message history Room ownership is corrupt");
+        }
+        return {
+          actorId: row.actorId,
+          kind: "human" as const,
+          displayName: row.displayName,
+          secondaryLabel: row.role === "owner"
+            ? "Owner"
+            : row.role === "admin" ? "Admin" : "Member",
+        };
+      }
+      if (row.participation !== "active" && row.participation !== "on-mention" &&
+          row.participation !== "silent") {
+        return fail("storage_unavailable", "Message history Agent assignment is corrupt");
+      }
+      return {
+        actorId: row.actorId,
+        kind: "agent" as const,
+        displayName: row.displayName,
+        secondaryLabel: row.participation === "active"
+          ? "Active Agent"
+          : row.participation === "on-mention" ? "On-mention Agent" : "Silent Agent",
+      };
+    });
     const limit = messageAuthorityPageLimit(query.limit);
     let afterCreatedAt: string | undefined;
     if (query.afterMessageId !== undefined) {
@@ -7773,6 +7822,8 @@ export function readMessageHistoryDatabaseQuery(
         ? readOperationalTimelineMessage(database, row.messageId)
         : fail("storage_unavailable", "Message history row is corrupt")),
       hasMore,
+      lifecycle: room.status,
+      actors,
     };
   });
 }

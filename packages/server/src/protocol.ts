@@ -521,6 +521,15 @@ export interface RoomHistoryV2Frame {
   readonly roomId: string;
   readonly messages: readonly TimelineMessage[];
   readonly hasMore: boolean;
+  readonly lifecycle: "active" | "archived";
+  readonly actors: readonly MessageHistoryActorFrame[];
+}
+
+export interface MessageHistoryActorFrame {
+  readonly actorId: string;
+  readonly kind: "human" | "agent";
+  readonly displayName: string;
+  readonly secondaryLabel: string;
 }
 
 export interface MessageRevisionsFrame {

@@ -1200,6 +1200,11 @@ describe("authoritative server real-process harness", () => {
       }, "room.history.v2");
       if (history.type !== "room.history.v2") throw new TypeError("wrong message history frame");
       expect(history.roomId).toBe(roomId);
+      expect(history.lifecycle).toBe("active");
+      expect(history.actors).toEqual(expect.arrayContaining([
+        expect.objectContaining({ actorId: "human-a", kind: "human", displayName: "Human A" }),
+        expect.objectContaining({ actorId: "agent-a", kind: "agent", displayName: "Agent A" }),
+      ]));
       expect(history.messages).toEqual(expect.arrayContaining([
         expect.objectContaining({ id: messageId, authorId: "human-a" }),
       ]));
