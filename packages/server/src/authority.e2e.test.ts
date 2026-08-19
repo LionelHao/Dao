@@ -98,6 +98,7 @@ const previewActors = [
 ] as const satisfies readonly Actor[];
 const childStderr = new WeakMap<ChildProcessWithoutNullStreams, string>();
 const stressPageSize = 50;
+const materializedPageSize = 100;
 
 class NodeIdentityWebSocketAdapter implements IdentityWebSocketLike {
   readonly #socket: WebSocket;
@@ -785,8 +786,27 @@ async function loginAuthorityDevice(
 }
 
 function recordKey(record: RoomRepairRecord): string {
-  const value = record.value as unknown as Record<string, unknown>;
-  return `${record.kind}:${String(value.id ?? value.actorId ?? "room")}`;
+  switch (record.kind) {
+    case "room": return "room";
+    case "governance": return "governance";
+    case "membership": return `membership\0${record.value.actorId}`;
+    case "message": return `message\0${record.value.id}`;
+    case "timeline-message": return `timeline-message\0${record.value.id}`;
+    case "message-revision": {
+      return `message-revision\0${record.value.messageId}\0${record.value.revision}`;
+    }
+    case "attachment": return `attachment\0${record.value.attachment.attachmentId}`;
+    case "human-read": return `human-read\0${record.value.id}`;
+    case "agent-judgement": return `agent-judgement\0${record.value.id}`;
+    case "open-item": return `open-item\0${record.value.id}`;
+    case "open-item-agent-failure": return `open-item-agent-failure\0${record.value.id}`;
+    case "light-task": return `light-task\0${record.value.id}`;
+    case "agent-execution": return `agent-execution\0${record.value.id}`;
+    case "route-job": return `route-job\0${record.value.id}`;
+    case "route-judgment": return `route-judgment\0${record.value.id}`;
+    case "calibration": return `calibration\0${record.value.id}`;
+    case "legacy-unknown-calibration": return `legacy-calibration\0${record.value.id}`;
+  }
 }
 
 function canonicalJsonForAuthorityTest(value: unknown): string {
@@ -3471,14 +3491,17 @@ describe("authoritative server real-process harness", () => {
       expect(stressPagesA).toBe(completeStressPages);
       expect([transportB.roomRepairModes.at(-1), transportC.roomRepairModes.at(-1)])
         .toEqual(["materialized", "materialized"]);
-      expect([stressPagesB, stressPagesC]).toEqual([101, 101]);
+      const completeMaterializedPages = Math.ceil(expectedRepairTotal / materializedPageSize);
+      expect([stressPagesB, stressPagesC])
+        .toEqual([completeMaterializedPages, completeMaterializedPages]);
 
-      expect(mixed.total).toBe(10_010);
+      expect(mixed.total).toBe(13_509);
       expect(mixed.distinctMembershipActors).toBe(2_000);
       expect(mixed.mixedCounts).toEqual({
         room: 1,
         membership: 2_000,
         "timeline-message": 3_500,
+        "message-revision": 3_499,
         "human-read": 1_999,
         "agent-judgement": 500,
         "open-item": 500,
@@ -3509,5 +3532,5 @@ describe("authoritative server real-process harness", () => {
       if (child !== undefined) await stopChild(child);
       await rm(directory, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 });

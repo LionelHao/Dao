@@ -31,7 +31,12 @@ import {
   type NeedsActionProjection,
   type ReminderCandidate,
   type OpenItem,
+  type AttachmentPrivateEvent,
 } from "@native-im/core";
+import {
+  parseAttachmentClientFrame,
+  type AttachmentClientFrame,
+} from "./attachment-authority/protocol.js";
 import type {
   AuthenticationErrorCode,
   PublicSession,
@@ -449,7 +454,8 @@ export type ClientFrame =
   | OpenItemTransitionFrame
   | LightTaskCreateFrame
   | LightTaskTransitionFrame
-  | LightTaskCriterionSetFrame;
+  | LightTaskCriterionSetFrame
+  | AttachmentClientFrame;
 
 export interface AuthenticatedFrame {
   readonly type: "auth.authenticated";
@@ -652,6 +658,68 @@ export interface BallQueryResultFrame {
   readonly reminders: readonly ReminderCandidate[];
 }
 
+export type AttachmentAuthorityServerFrame =
+  | AttachmentPrivateEvent
+  | Readonly<{
+      type: "attachment.upload.begun";
+      requestId: string;
+      uploadId: string;
+      acknowledgedBytes: number;
+    }>
+  | Readonly<{
+      type: "attachment.upload.chunk.ack";
+      requestId: string;
+      uploadId: string;
+      acknowledgedBytes: number;
+    }>
+  | Readonly<{
+      type: "attachment.upload.accepted";
+      requestId: string;
+      attachmentId: string;
+      processingStatus: "accepted-quarantined";
+    }>
+  | Readonly<{
+      type: "attachment.upload.cancelled";
+      requestId: string;
+      status: "cancelled";
+    }>
+  | Readonly<{
+      type: "attachment.status";
+      requestId: string;
+      attachmentId: string;
+      processingStatus:
+        | "accepted-quarantined"
+        | "processing"
+        | "ready"
+        | "retryable-failed"
+        | "nonretryable-failed"
+        | "malware-rejected"
+        | "cancelled";
+      generation: number;
+    }>
+  | Readonly<{
+      type: "attachment.preview.opened";
+      requestId: string;
+      streamId: string;
+      byteSize: number;
+    }>
+  | Readonly<{
+      type: "attachment.download.opened";
+      requestId: string;
+      streamId: string;
+      byteSize: number;
+      originalFilename: string;
+    }>
+  | Readonly<{
+      type: "attachment.stream.chunk";
+      requestId: string;
+      streamId: string;
+      offset: number;
+      byteLength: number;
+      base64: string;
+      eof: boolean;
+    }>;
+
 export type ProtocolErrorCode =
   | AuthenticationErrorCode
   | MessageErrorCode
@@ -665,6 +733,26 @@ export type ProtocolErrorCode =
   | "mention_entity_invalid"
   | "author_fields_forbidden"
   | "attachment_feature_unavailable"
+  | "invalid_chunk"
+  | "attachment_forbidden"
+  | "attachment_already_bound"
+  | "generation_conflict"
+  | "attachment_not_ready"
+  | "upload_offset_conflict"
+  | "upload_expired"
+  | "attachment_gone"
+  | "attachment_too_large"
+  | "chunk_too_large"
+  | "attachment_type_unsupported"
+  | "type_mismatch"
+  | "attachment_malformed"
+  | "encrypted_pdf"
+  | "archive_bomb"
+  | "image_bomb"
+  | "attachment_capacity_limited"
+  | "scanner_unavailable"
+  | "extractor_unavailable"
+  | "ocr_unavailable"
   | "snapshot_forbidden"
   | "snapshot_family_revoked"
   | "snapshot_stale"
@@ -715,10 +803,11 @@ export type ProtocolErrorCode =
 export type ProtocolErrorFrame =
   | {
       readonly type: "error";
-      readonly status: 400 | 401 | 403 | 404 | 409 | 410 | 429 | 500 | 503;
+      readonly status: 400 | 401 | 403 | 404 | 409 | 410 | 413 | 415 | 422 | 429 | 500 | 503;
       readonly code: Exclude<ProtocolErrorCode, "departure_blocked">;
       readonly message: string;
       readonly requestId?: string;
+      readonly retryAfterSeconds?: number;
       readonly details?: never;
     }
   | {
@@ -762,6 +851,7 @@ export type ServerFrame =
   | OpenItemAckFrame
   | LightTaskAckFrame
   | BallQueryResultFrame
+  | AttachmentAuthorityServerFrame
   | ProtocolErrorFrame;
 
 export type ClientFrameParseResult =
@@ -918,6 +1008,23 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
   )
     ? value.requestId
     : undefined;
+  if (typeof value.type === "string" && value.type.startsWith("attachment.")) {
+    const parsed = parseAttachmentClientFrame(value);
+    if (parsed.ok) return parsed;
+    return {
+      ok: false,
+      error: {
+        type: "error",
+        status: parsed.error.status,
+        code: parsed.error.code,
+        message: parsed.error.message,
+        ...(parsed.error.requestId === undefined ? {} : { requestId: parsed.error.requestId }),
+        ...("retryAfterSeconds" in parsed.error
+          ? { retryAfterSeconds: parsed.error.retryAfterSeconds }
+          : {}),
+      },
+    };
+  }
   switch (value.type) {
     case "auth.login":
       if (

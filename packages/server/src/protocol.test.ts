@@ -792,4 +792,44 @@ describe("closed v2 recovery protocol", () => {
       error: { type: "error", status: 400, code: "invalid_request" },
     });
   });
+
+  it("routes closed FT-04 attachment frames through the production parser", () => {
+    expect(parse({
+      type: "attachment.upload.begin",
+      requestId: "attachment-begin",
+      roomId: "room-1",
+      uploadKey: "upload-key-1",
+      originalFilename: "safe.txt",
+      declaredMime: null,
+      expectedBytes: 4,
+      expectedSha256: "a".repeat(64),
+    })).toMatchObject({
+      ok: true,
+      frame: { type: "attachment.upload.begin", expectedBytes: 4 },
+    });
+    expect(parse({
+      type: "attachment.status.query",
+      requestId: "attachment-status",
+      attachmentId: "attachment-1",
+    })).toMatchObject({ ok: true, frame: { type: "attachment.status.query" } });
+    expect(parse({
+      type: "attachment.upload.begin",
+      requestId: "attachment-too-large",
+      roomId: "room-1",
+      uploadKey: "upload-key-2",
+      originalFilename: "safe.txt",
+      declaredMime: "text/plain",
+      expectedBytes: 52_428_801,
+      expectedSha256: "a".repeat(64),
+    })).toEqual({
+      ok: false,
+      error: {
+        type: "error",
+        status: 413,
+        code: "attachment_too_large",
+        message: "Invalid attachment request",
+        requestId: "attachment-too-large",
+      },
+    });
+  });
 });

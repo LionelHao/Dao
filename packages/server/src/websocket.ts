@@ -612,8 +612,10 @@ const MAPPED_SERVICE_ERROR_STATUSES = new Map<GenericProtocolErrorCode, Protocol
   ["mention_entity_invalid", 400],
   ["author_fields_forbidden", 400],
   ["attachment_feature_unavailable", 400],
+  ["invalid_chunk", 400],
   ["unauthenticated", 401],
   ["room_forbidden", 403],
+  ["attachment_forbidden", 403],
   ["snapshot_forbidden", 403],
   ["snapshot_not_found", 404],
   ["room_not_found", 404],
@@ -624,18 +626,36 @@ const MAPPED_SERVICE_ERROR_STATUSES = new Map<GenericProtocolErrorCode, Protocol
   ["ownership_transfer_required", 409],
   ["member_not_found", 404],
   ["idempotency_conflict", 409],
+  ["attachment_already_bound", 409],
+  ["generation_conflict", 409],
+  ["attachment_not_ready", 409],
+  ["upload_offset_conflict", 409],
   ["message_version_conflict", 409],
   ["message_recalled", 409],
   ["agent_final_immutable", 409],
   ["protocol_upgrade_required", 410],
+  ["upload_expired", 410],
+  ["attachment_gone", 410],
+  ["attachment_too_large", 413],
+  ["chunk_too_large", 413],
+  ["attachment_type_unsupported", 415],
+  ["type_mismatch", 415],
+  ["attachment_malformed", 422],
+  ["encrypted_pdf", 422],
+  ["archive_bomb", 422],
+  ["image_bomb", 422],
   ["confirmation_rejected", 409],
   ["grant_revoked", 409],
   ["dependency_unavailable", 503],
   ["snapshot_stale", 409],
   ["snapshot_expired", 410],
   ["snapshot_busy", 429],
+  ["attachment_capacity_limited", 429],
   ["repair_barrier_active", 503],
   ["storage_unavailable", 503],
+  ["scanner_unavailable", 503],
+  ["extractor_unavailable", 503],
+  ["ocr_unavailable", 503],
   ["agent_configuration_missing", 503],
   ["agent_queue_full", 429],
   ["agent_runtime_closed", 503],
@@ -1249,6 +1269,15 @@ function isCorrelatedRecoveryResponse(
       | "message.recall"
       | "room.history.v2"
       | "message.revisions.query"
+      | "attachment.upload.begin"
+      | "attachment.upload.chunk"
+      | "attachment.upload.finalize"
+      | "attachment.upload.cancel"
+      | "attachment.processing.retry"
+      | "attachment.status.query"
+      | "attachment.preview.open"
+      | "attachment.download.open"
+      | "attachment.stream.read"
       | "room.history"
       | "room.subscribe"
       | "room.subscribe.v2"
@@ -1349,6 +1378,15 @@ async function handleRecoveryFrame(
       | "message.recall"
       | "room.history.v2"
       | "message.revisions.query"
+      | "attachment.upload.begin"
+      | "attachment.upload.chunk"
+      | "attachment.upload.finalize"
+      | "attachment.upload.cancel"
+      | "attachment.processing.retry"
+      | "attachment.status.query"
+      | "attachment.preview.open"
+      | "attachment.download.open"
+      | "attachment.stream.read"
       | "room.history"
       | "room.subscribe"
       | "room.subscribe.v2"

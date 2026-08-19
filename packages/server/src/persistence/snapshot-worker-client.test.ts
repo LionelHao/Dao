@@ -202,6 +202,110 @@ function seedClosedMixedStressRecords(
   ).run(roomId, context.principal.actorId);
 }
 
+const ATTACHMENT_SHA_A = "a".repeat(64);
+const ATTACHMENT_SHA_B = "b".repeat(64);
+
+function seedReadyBoundAttachment(
+  database: DatabaseSync,
+  context: AuthenticatedSessionContext,
+  roomId: string,
+  messageId: string,
+): void {
+  database.prepare(`
+    INSERT INTO attachment_uploads (
+      upload_id, upload_key, canonical_input_sha256, room_id, uploader_actor_id,
+      session_family_id, access_revision, lifecycle_generation, expected_bytes,
+      received_bytes, expected_sha256, original_filename, declared_mime, format_hint,
+      status, terminal_reason_code, created_at, updated_at, idle_expires_at,
+      absolute_expires_at
+    ) VALUES (
+      'snapshot-upload', 'snapshot-upload-key', ?, ?, ?, ?, 7, 0, 4, 0, ?,
+      'repair.txt', 'text/plain', 'txt', 'open', NULL,
+      '2026-08-11T00:00:02.100Z', '2026-08-11T00:00:02.100Z',
+      '2026-08-11T00:30:02.100Z', '2026-08-12T00:00:02.100Z'
+    )
+  `).run(
+    ATTACHMENT_SHA_B,
+    roomId,
+    context.principal.actorId,
+    context.sessionFamilyId,
+    ATTACHMENT_SHA_A,
+  );
+  database.prepare(`
+    INSERT INTO attachment_upload_chunks (
+      upload_id, ordinal, byte_offset, byte_length, chunk_sha256,
+      part_object_key, created_at
+    ) VALUES ('snapshot-upload', 0, 0, 4, ?, 'snapshotpart',
+      '2026-08-11T00:00:02.200Z')
+  `).run(ATTACHMENT_SHA_A);
+  database.exec(`
+    UPDATE attachment_uploads SET status = 'finalizing'
+    WHERE upload_id = 'snapshot-upload';
+    INSERT INTO attachments (
+      attachment_id, source_upload_id, room_id, uploader_actor_id, original_filename,
+      declared_mime, detected_mime, format, byte_size, sha256,
+      quarantine_object_key, object_key, processing_status, processing_generation,
+      failure_code, source_message_id, source_operational_state, source_bound_at,
+      lifecycle_generation, access_revision, created_at, updated_at, ready_at
+    ) VALUES (
+      'snapshot-attachment', 'snapshot-upload', '${roomId}',
+      '${context.principal.actorId}', 'repair.txt', 'text/plain', 'text/plain', 'txt', 4,
+      '${ATTACHMENT_SHA_A}', 'snapshotquarantine', NULL, 'quarantined', 1,
+      NULL, NULL, 'unbound', NULL, 0, 7, '2026-08-11T00:00:02.300Z',
+      '2026-08-11T00:00:02.300Z', NULL
+    );
+    UPDATE attachment_uploads SET status = 'accepted'
+    WHERE upload_id = 'snapshot-upload';
+    INSERT INTO attachment_processing_attempts (
+      attachment_id, processing_generation, attempt_number, adapter_kind,
+      adapter_name, adapter_version, status, failure_code, timeout_ms,
+      stdout_limit_bytes, stderr_limit_bytes, started_at, finished_at
+    ) VALUES (
+      'snapshot-attachment', 1, 1, 'scanner', 'clamav', '1.5.3', 'queued', NULL,
+      120000, 8388608, 65536, NULL, NULL
+    );
+    UPDATE attachments SET processing_status = 'scanning'
+    WHERE attachment_id = 'snapshot-attachment';
+    UPDATE attachment_processing_attempts
+    SET status = 'running', started_at = '2026-08-11T00:00:02.400Z'
+    WHERE attachment_id = 'snapshot-attachment' AND attempt_number = 1;
+    UPDATE attachment_processing_attempts
+    SET status = 'succeeded', finished_at = '2026-08-11T00:00:02.500Z'
+    WHERE attachment_id = 'snapshot-attachment' AND attempt_number = 1;
+    INSERT INTO attachment_processing_attempts (
+      attachment_id, processing_generation, attempt_number, adapter_kind,
+      adapter_name, adapter_version, status, failure_code, timeout_ms,
+      stdout_limit_bytes, stderr_limit_bytes, started_at, finished_at
+    ) VALUES (
+      'snapshot-attachment', 1, 2, 'extractor', 'builtin-text', '1', 'queued', NULL,
+      60000, 8388608, 65536, NULL, NULL
+    );
+    UPDATE attachments SET processing_status = 'extracting'
+    WHERE attachment_id = 'snapshot-attachment';
+    UPDATE attachment_processing_attempts
+    SET status = 'running', started_at = '2026-08-11T00:00:02.600Z'
+    WHERE attachment_id = 'snapshot-attachment' AND attempt_number = 2;
+    UPDATE attachment_processing_attempts
+    SET status = 'succeeded', finished_at = '2026-08-11T00:00:02.700Z'
+    WHERE attachment_id = 'snapshot-attachment' AND attempt_number = 2;
+    INSERT INTO attachment_extraction_artifacts (
+      artifact_id, attachment_id, processing_generation, method, tool_name,
+      tool_version, object_key, sha256, byte_size, page_start, page_end,
+      range_start, range_end, created_at
+    ) VALUES (
+      'snapshot-extraction', 'snapshot-attachment', 1, 'extracted-text',
+      'builtin-text', '1', 'snapshotextraction', '${ATTACHMENT_SHA_B}', 4,
+      NULL, NULL, 0, 4, '2026-08-11T00:00:02.700Z'
+    );
+    UPDATE attachments SET processing_status = 'ready', object_key = 'snapshotobject',
+      ready_at = '2026-08-11T00:00:02.800Z', updated_at = '2026-08-11T00:00:02.800Z'
+    WHERE attachment_id = 'snapshot-attachment';
+    INSERT INTO message_attachment_links (
+      message_id, room_id, attachment_id, operational_state
+    ) VALUES ('${messageId}', '${roomId}', 'snapshot-attachment', 'active');
+  `);
+}
+
 async function createDatabaseFixture(options: {
   readonly rooms?: readonly { readonly roomId: string; readonly messageCount?: number;
     readonly body?: (index: number) => string;
@@ -443,8 +547,16 @@ describe("durable materialized snapshot worker", () => {
     const page3 = await client.readRoomRepairPage(
       context, "read-page-three", page0.snapshotId, 2,
     );
-    expect(page3).toMatchObject({ requestId: "read-page-three", page: 3, hasMore: false });
-    await expect(client.readRoomRepairPage(context, "past-end", page0.snapshotId, 3))
+    expect(page3).toMatchObject({ requestId: "read-page-three", page: 3, hasMore: true });
+    const page4 = await client.readRoomRepairPage(
+      context, "read-page-four", page0.snapshotId, 3,
+    );
+    expect(page4).toMatchObject({ requestId: "read-page-four", page: 4, hasMore: true });
+    const page5 = await client.readRoomRepairPage(
+      context, "read-page-five", page0.snapshotId, 4,
+    );
+    expect(page5).toMatchObject({ requestId: "read-page-five", page: 5, hasMore: false });
+    await expect(client.readRoomRepairPage(context, "past-end", page0.snapshotId, 5))
       .rejects.toMatchObject({ status: 400, code: "invalid_request" });
     await expect(client.readRoomRepairPage(context, "negative", page0.snapshotId, -1))
       .rejects.toMatchObject({ status: 400, code: "invalid_request" });
@@ -555,6 +667,7 @@ describe("durable materialized snapshot worker", () => {
       id: "message-human", roomId: "room-mixed", authorId: context.principal.actorId,
       authorKind: "human", body: "question", sentAt: "2026-08-11T00:00:02.000Z",
     });
+    seedReadyBoundAttachment(database, context, "room-mixed", "message-human");
     insertLegacyMessageAuthorityRecord(database, {
       id: "message-recalled", roomId: "room-mixed", authorId: context.principal.actorId,
       authorKind: "human", body: "RECALLED-SNAPSHOT-RAW-SENTINEL",
@@ -640,7 +753,8 @@ describe("durable materialized snapshot worker", () => {
     expect(page.hasMore).toBe(false);
     expect(page.records.map((record) => record.kind)).toEqual([
       "room", "governance", "membership", "membership", "timeline-message",
-      "timeline-message", "timeline-message", "human-read", "agent-judgement", "open-item",
+      "timeline-message", "timeline-message", "message-revision", "attachment", "human-read",
+      "agent-judgement", "open-item",
       "open-item-agent-failure", "light-task", "agent-execution", "calibration",
     ]);
     const timelineMessages = page.records.filter((record) =>
@@ -657,6 +771,29 @@ describe("durable materialized snapshot worker", () => {
         recalledAt: "2026-08-11T00:00:03.500Z", revisionCount: 1,
       },
     ]));
+    expect(page.records.filter((record) => record.kind === "message-revision"))
+      .toEqual([expect.objectContaining({
+        kind: "message-revision",
+        roomId: "room-mixed",
+        value: expect.objectContaining({ messageId: "message-human", body: "question" }),
+      })]);
+    expect(page.records.find((record) => record.kind === "attachment"))
+      .toMatchObject({
+        kind: "attachment",
+        value: {
+          sourceEligibility: "bound-active",
+          attachment: {
+            attachmentId: "snapshot-attachment",
+            sourceMessageId: "message-human",
+            processingStatus: "ready",
+            provenance: {
+              scanner: { kind: "clamav", version: "1.5.3" },
+              extraction: { method: "plain-text", tool: "builtin" },
+              ocr: null,
+            },
+          },
+        },
+      });
     expect(JSON.stringify(page)).not.toContain("RECALLED-SNAPSHOT-RAW-SENTINEL");
     expect(page.records.find((record) => record.kind === "light-task"))
       .toMatchObject({ kind: "light-task", value: {
@@ -668,6 +805,15 @@ describe("durable materialized snapshot worker", () => {
         id: "open-failure-a", openItemId: "open-a", executionId: "execution-a",
         attemptSeq: 1, reasonCode: "provider_failure", failedAt: "2026-08-11T00:00:08.000Z",
       } });
+    const cache = new DatabaseSync(fixture.cachePath, { readOnly: true });
+    const cachedPayload = cache.prepare(
+      "SELECT payload_json AS payloadJson FROM repair_snapshot_pages ORDER BY page_number",
+    ).all().map(({ payloadJson }) => String(payloadJson)).join("\n");
+    cache.close();
+    expect(cachedPayload).toContain("message-revision-reference");
+    expect(cachedPayload).toContain("attachment-reference");
+    expect(cachedPayload).not.toContain("question");
+    expect(cachedPayload).not.toContain("repair.txt");
     await client.close();
   });
 
@@ -786,7 +932,9 @@ describe("durable materialized snapshot worker", () => {
     expect(pages.every((entry) => entry.records.length <= 2)).toBe(true);
     expect(pages.every((entry) =>
       Buffer.byteLength(canonicalJsonForTest(entry), "utf8") <= maxPageBytes)).toBe(true);
-    expect(pages.flatMap((entry) => entry.records)).toHaveLength(6);
+    const records = pages.flatMap((entry) => entry.records);
+    expect(records).toHaveLength(9);
+    expect(records.filter((record) => record.kind === "message-revision")).toHaveLength(3);
     await client.close();
   });
 
@@ -1428,9 +1576,10 @@ describe("durable materialized snapshot worker", () => {
       expect(page.mode).toBe("streaming");
       records.push(...page.records);
     }
-    expect(records).toHaveLength(10_010);
+    expect(records).toHaveLength(20_009);
     expect(new Set(records.map((record) => record.kind))).toEqual(new Set([
-      "room", "governance", "membership", "timeline-message", "human-read", "agent-judgement",
+      "room", "governance", "membership", "timeline-message", "message-revision",
+      "human-read", "agent-judgement",
       "open-item", "light-task", "agent-execution", "calibration",
     ]));
     expect(page0.snapshotChecksum).toBe(createHash("sha256")
@@ -1626,9 +1775,10 @@ describe("durable materialized snapshot worker", () => {
         });
         records.push(...page.records);
       }
-      expect(records).toHaveLength(10_010);
+      expect(records).toHaveLength(20_009);
       expect(new Set(records.map((record) => record.kind))).toEqual(new Set([
-        "room", "governance", "membership", "timeline-message", "human-read", "agent-judgement",
+        "room", "governance", "membership", "timeline-message", "message-revision",
+        "human-read", "agent-judgement",
         "open-item", "light-task", "agent-execution", "calibration",
       ]));
       expect(page0.snapshotChecksum).toBe(createHash("sha256")

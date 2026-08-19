@@ -9,7 +9,7 @@ import {
 } from "./sync.js";
 
 describe("pure synchronization contracts", () => {
-  it("accepts closed Message Authority events and only operational timeline repair records", () => {
+  it("accepts closed Message Authority and Attachment events plus active operational repair records", () => {
     const currentRevision = {
       messageId: "message-v2-1", revision: 1, body: "hello",
       revisedAt: "2026-08-19T00:00:00.000Z", revisedByActorId: "human-1",
@@ -59,6 +59,49 @@ describe("pure synchronization contracts", () => {
     }))).toBe(false);
     expect(isRoomRepairPage(repair({
       kind: "message-revision", roomId: "room-1", value: currentRevision,
+    }))).toBe(true);
+
+    const attachment = {
+      attachmentId: "attachment-1",
+      roomId: "room-1",
+      originalFilename: "requirements.txt",
+      format: "txt",
+      declaredMime: "text/plain",
+      detectedMime: "text/plain",
+      byteSize: 128,
+      sha256: "a".repeat(64),
+      uploaderActorId: "human-1",
+      createdAt: "2026-08-19T00:00:00.000Z",
+      readyAt: "2026-08-19T00:01:00.000Z",
+      processingStatus: "ready",
+      generation: 1,
+      sourceMessageId: "message-v2-1",
+      provenance: {
+        scanner: { kind: "clamav", version: "1.5.3" },
+        extraction: {
+          method: "plain-text", tool: "builtin", version: "1",
+          artifactSha256: "b".repeat(64), artifactByteSize: 42, pageCount: null,
+        },
+        ocr: null,
+      },
+    } as const;
+    const boundEvent = {
+      eventId: "event-attachment", streamKind: "room", streamId: "room-1", streamSeq: 1,
+      roomId: "room-1", actorId: "human-1", occurredAt: "2026-08-19T00:02:00.000Z",
+      type: "room.attachment.bound",
+      payload: { attachment, sourceEligibility: "bound-active" },
+    } as const;
+    expect(isRoomSyncResult(delta(boundEvent))).toBe(true);
+    expect(isRoomSyncResult(delta({
+      ...boundEvent,
+      payload: { ...boundEvent.payload, objectKey: "object-secret" },
+    }))).toBe(false);
+    expect(isRoomRepairPage(repair({
+      kind: "attachment", value: { attachment, sourceEligibility: "bound-active" },
+    }))).toBe(true);
+    expect(isRoomRepairPage(repair({
+      kind: "attachment",
+      value: { attachment: { ...attachment, sourceMessageId: null }, sourceEligibility: "bound-active" },
     }))).toBe(false);
   });
 
