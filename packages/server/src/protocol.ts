@@ -1,10 +1,18 @@
 import {
+  MESSAGE_AUTHORITY_LIMITS,
+  isAttachmentReference,
+  isHumanMessageSubmit,
   isRoomCursor,
   isMessageDraft,
   isSnapshotVersion,
   type Message,
   type MessageAcceptedAck,
   type MessageDraft,
+  type HumanMessageSubmit,
+  type MessageAuthorityEvent,
+  type MessageRevision,
+  type MessageTargetOutcome,
+  type TimelineMessage,
   type PersistedIdentityEvent,
   type PersistedRoomEvent,
   type RoomCursor,
@@ -48,6 +56,26 @@ const AUTH_REVOKE_FIELDS = new Set(["type", "requestId"]);
 const AUTH_SESSIONS_LIST_FIELDS = new Set(["type", "requestId"]);
 const AUTH_SESSION_REVOKE_FIELDS = new Set(["type", "requestId", "sessionId"]);
 const MESSAGE_SEND_FIELDS = new Set(["type", "requestId", "message"]);
+const MESSAGE_V2_REQUIRED_FIELDS = new Set([
+  "messageId", "roomId", "body", "mentionedTargets", "attachments",
+]);
+const MESSAGE_V2_OPTIONAL_FIELDS = new Set(["replyToMessageId"]);
+const MESSAGE_REVISE_FIELDS = new Set([
+  "type", "requestId", "roomId", "messageId", "expectedRevision", "body",
+]);
+const MESSAGE_RECALL_FIELDS = new Set([
+  "type", "requestId", "roomId", "messageId", "expectedRevision",
+]);
+const ROOM_HISTORY_V2_REQUIRED_FIELDS = new Set(["type", "requestId", "roomId"]);
+const ROOM_HISTORY_V2_OPTIONAL_FIELDS = new Set(["afterMessageId", "limit"]);
+const MESSAGE_REVISIONS_REQUIRED_FIELDS = new Set([
+  "type", "requestId", "roomId", "messageId",
+]);
+const MESSAGE_REVISIONS_OPTIONAL_FIELDS = new Set(["afterRevision", "limit"]);
+const MESSAGE_AUTHORITY_FORBIDDEN_FIELDS = new Set([
+  "authorId", "authorActorId", "authorKind", "actorId", "principal", "session",
+  "sessionFamilyId", "capability", "runtimeKind", "provider", "model",
+]);
 const ROOM_FIELDS = new Set(["type", "requestId", "roomId"]);
 const ROOM_DEPARTURE_CONFLICTS_FIELDS = new Set([
   "type", "requestId", "roomId", "targetActorId",
@@ -107,6 +135,10 @@ export const PROTOCOL_FIELD_LIMITS = Object.freeze({
   roomId: 256,
   messageId: 256,
   body: 32 * 1_024,
+  messageTargets: MESSAGE_AUTHORITY_LIMITS.targets,
+  messageAttachments: MESSAGE_AUTHORITY_LIMITS.attachments,
+  historyPage: 100,
+  revisionPage: 100,
   sentAt: 64,
   snapshotId: 256,
   snapshotChecksum: 256,
@@ -152,6 +184,46 @@ export interface MessageSendFrame {
   readonly type: "message.send";
   readonly requestId: string;
   readonly message: MessageDraft;
+}
+
+export interface MessageSendV2Frame {
+  readonly type: "message.send.v2";
+  readonly requestId: string;
+  readonly message: HumanMessageSubmit;
+}
+
+export interface MessageReviseFrame {
+  readonly type: "message.revise";
+  readonly requestId: string;
+  readonly roomId: string;
+  readonly messageId: string;
+  readonly expectedRevision: number;
+  readonly body: string;
+}
+
+export interface MessageRecallFrame {
+  readonly type: "message.recall";
+  readonly requestId: string;
+  readonly roomId: string;
+  readonly messageId: string;
+  readonly expectedRevision: number;
+}
+
+export interface RoomHistoryV2RequestFrame {
+  readonly type: "room.history.v2";
+  readonly requestId: string;
+  readonly roomId: string;
+  readonly afterMessageId?: string;
+  readonly limit?: number;
+}
+
+export interface MessageRevisionsQueryFrame {
+  readonly type: "message.revisions.query";
+  readonly requestId: string;
+  readonly roomId: string;
+  readonly messageId: string;
+  readonly afterRevision?: number;
+  readonly limit?: number;
 }
 
 export interface RoomHistoryRequestFrame {
@@ -350,6 +422,11 @@ export type ClientFrame =
   | AuthSessionsListFrame
   | AuthSessionRevokeFrame
   | MessageSendFrame
+  | MessageSendV2Frame
+  | MessageReviseFrame
+  | MessageRecallFrame
+  | RoomHistoryV2RequestFrame
+  | MessageRevisionsQueryFrame
   | RoomHistoryRequestFrame
   | BallQueryFrame
   | RoomSubscribeFrame
@@ -407,6 +484,52 @@ export interface AuthSessionRevokeAckFrame {
 export interface MessageCreatedFrame {
   readonly type: "message.created";
   readonly message: Message;
+}
+
+export interface MessageAcceptedV2Frame {
+  readonly type: "message.accepted";
+  readonly requestId: string;
+  readonly messageId: string;
+  readonly persistedAt: string;
+  readonly targetOutcomes: readonly MessageTargetOutcome[];
+}
+
+export interface MessageRevisionAcceptedFrame {
+  readonly type: "message.revision.accepted";
+  readonly requestId: string;
+  readonly messageId: string;
+  readonly revision: number;
+  readonly persistedAt: string;
+}
+
+export interface MessageRecallAcceptedFrame {
+  readonly type: "message.recall.accepted";
+  readonly requestId: string;
+  readonly messageId: string;
+  readonly revision: number;
+  readonly recalledAt: string;
+}
+
+export interface MessageAuthorityRoomEventFrame {
+  readonly type: "room.event";
+  readonly event: MessageAuthorityEvent;
+}
+
+export interface RoomHistoryV2Frame {
+  readonly type: "room.history.v2";
+  readonly requestId: string;
+  readonly roomId: string;
+  readonly messages: readonly TimelineMessage[];
+  readonly hasMore: boolean;
+}
+
+export interface MessageRevisionsFrame {
+  readonly type: "message.revisions";
+  readonly requestId: string;
+  readonly roomId: string;
+  readonly messageId: string;
+  readonly revisions: readonly MessageRevision[];
+  readonly hasMore: boolean;
 }
 
 export interface RoomEventFrame {
@@ -529,6 +652,10 @@ export type ProtocolErrorCode =
   | "identity_forbidden"
   | "already_authenticated"
   | "invalid_request"
+  | "invalid_message"
+  | "mention_entity_invalid"
+  | "author_fields_forbidden"
+  | "attachment_feature_unavailable"
   | "snapshot_forbidden"
   | "snapshot_family_revoked"
   | "snapshot_stale"
@@ -541,12 +668,17 @@ export type ProtocolErrorCode =
   | "session_revoked"
   | "storage_unavailable"
   | "room_not_found"
+  | "reply_target_not_found"
   | "room_archived"
   | "role_forbidden"
   | "room_revision_conflict"
   | "ownership_transfer_required"
   | "member_not_found"
   | "idempotency_conflict"
+  | "message_version_conflict"
+  | "message_recalled"
+  | "agent_final_immutable"
+  | "protocol_upgrade_required"
   | "departure_blocked"
   | "confirmation_rejected"
   | "grant_revoked"
@@ -596,10 +728,16 @@ export type ServerFrame =
   | AuthSessionRevokeAckFrame
   | AuthSessionRevokedFrame
   | MessageAcceptedAck
+  | MessageAcceptedV2Frame
+  | MessageRevisionAcceptedFrame
+  | MessageRecallAcceptedFrame
   | MessageCreatedFrame
   | RoomEventFrame
+  | MessageAuthorityRoomEventFrame
   | IdentityRoomAccessChangedFrame
   | RoomHistoryFrame
+  | RoomHistoryV2Frame
+  | MessageRevisionsFrame
   | RoomSubscribedFrame
   | RoomGovernanceFrame
   | RoomDepartureConflictsResultFrame
@@ -680,6 +818,39 @@ function isStrictMessageDraft(value: unknown): value is MessageDraft {
     isBoundedString(value.body, PROTOCOL_FIELD_LIMITS.body) &&
     isBoundedString(value.sentAt, PROTOCOL_FIELD_LIMITS.sentAt)
   );
+}
+
+function hasMessageAuthorityInjection(value: UnknownRecord): boolean {
+  return Reflect.ownKeys(value).some((key) =>
+    typeof key !== "string" || MESSAGE_AUTHORITY_FORBIDDEN_FIELDS.has(key));
+}
+
+function isPositiveSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function isBoundedLimit(value: unknown, maximum: number): value is number {
+  return isPositiveSafeInteger(value) && value <= maximum;
+}
+
+function hasValidV2MessageBasics(value: UnknownRecord): boolean {
+  if (!hasRequiredAndOptionalFields(
+    value,
+    MESSAGE_V2_REQUIRED_FIELDS,
+    MESSAGE_V2_OPTIONAL_FIELDS,
+  ) || !isBoundedText(value.messageId, PROTOCOL_FIELD_LIMITS.messageId) ||
+      !isBoundedText(value.roomId, PROTOCOL_FIELD_LIMITS.roomId) ||
+      !isBoundedText(value.body, PROTOCOL_FIELD_LIMITS.body) ||
+      value.body.length > MESSAGE_AUTHORITY_LIMITS.bodyUtf16 ||
+      (value.replyToMessageId !== undefined &&
+        !isBoundedText(value.replyToMessageId, PROTOCOL_FIELD_LIMITS.messageId)) ||
+      !Array.isArray(value.attachments) ||
+      value.attachments.length > PROTOCOL_FIELD_LIMITS.messageAttachments ||
+      !value.attachments.every(isAttachmentReference)) {
+    return false;
+  }
+  return Array.isArray(value.mentionedTargets) &&
+    value.mentionedTargets.length <= PROTOCOL_FIELD_LIMITS.messageTargets;
 }
 
 function isSessionPlatform(value: unknown): value is SessionDevice["platform"] {
@@ -888,6 +1059,179 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
         frame: { type: "message.send", requestId, message: value.message },
       };
     }
+    case "message.send.v2": {
+      if (!hasOnlyFields(value, MESSAGE_SEND_FIELDS) || requestId === undefined) {
+        return {
+          ok: false,
+          error: protocolError(
+            "message.send.v2 requires a string requestId and message",
+            requestId,
+          ),
+        };
+      }
+      if (!isRecord(value.message)) {
+        return {
+          ok: false,
+          error: protocolError(
+            "message.send.v2 requires a closed message",
+            requestId,
+            400,
+            "invalid_message",
+          ),
+        };
+      }
+      if (hasMessageAuthorityInjection(value.message)) {
+        return {
+          ok: false,
+          error: protocolError(
+            "Message author and authority fields are server-controlled",
+            requestId,
+            400,
+            "author_fields_forbidden",
+          ),
+        };
+      }
+      if (Array.isArray(value.message.attachments) && value.message.attachments.length > 0) {
+        return {
+          ok: false,
+          error: protocolError(
+            "Message attachments are unavailable until the FT-04 validator is active",
+            requestId,
+            400,
+            "attachment_feature_unavailable",
+          ),
+        };
+      }
+      if (!hasValidV2MessageBasics(value.message)) {
+        return {
+          ok: false,
+          error: protocolError(
+            "message.send.v2 message fields are invalid",
+            requestId,
+            400,
+            "invalid_message",
+          ),
+        };
+      }
+      if (!isHumanMessageSubmit(value.message)) {
+        return {
+          ok: false,
+          error: protocolError(
+            "message.send.v2 mention entities are invalid",
+            requestId,
+            400,
+            "mention_entity_invalid",
+          ),
+        };
+      }
+      return {
+        ok: true,
+        frame: { type: "message.send.v2", requestId, message: value.message },
+      };
+    }
+    case "message.revise":
+      if (!hasOnlyFields(value, MESSAGE_REVISE_FIELDS) || requestId === undefined ||
+          !isBoundedText(value.roomId, PROTOCOL_FIELD_LIMITS.roomId) ||
+          !isBoundedText(value.messageId, PROTOCOL_FIELD_LIMITS.messageId) ||
+          !isPositiveSafeInteger(value.expectedRevision) ||
+          !isBoundedText(value.body, PROTOCOL_FIELD_LIMITS.body) ||
+          value.body.length > MESSAGE_AUTHORITY_LIMITS.bodyUtf16) {
+        return {
+          ok: false,
+          error: protocolError("message.revise requires closed CAS fields", requestId),
+        };
+      }
+      return {
+        ok: true,
+        frame: {
+          type: "message.revise",
+          requestId,
+          roomId: value.roomId,
+          messageId: value.messageId,
+          expectedRevision: value.expectedRevision,
+          body: value.body,
+        },
+      };
+    case "message.recall":
+      if (!hasOnlyFields(value, MESSAGE_RECALL_FIELDS) || requestId === undefined ||
+          !isBoundedText(value.roomId, PROTOCOL_FIELD_LIMITS.roomId) ||
+          !isBoundedText(value.messageId, PROTOCOL_FIELD_LIMITS.messageId) ||
+          !isPositiveSafeInteger(value.expectedRevision)) {
+        return {
+          ok: false,
+          error: protocolError("message.recall requires closed CAS fields", requestId),
+        };
+      }
+      return {
+        ok: true,
+        frame: {
+          type: "message.recall",
+          requestId,
+          roomId: value.roomId,
+          messageId: value.messageId,
+          expectedRevision: value.expectedRevision,
+        },
+      };
+    case "room.history.v2":
+      if (!hasRequiredAndOptionalFields(
+        value,
+        ROOM_HISTORY_V2_REQUIRED_FIELDS,
+        ROOM_HISTORY_V2_OPTIONAL_FIELDS,
+      ) || requestId === undefined ||
+          !isBoundedText(value.roomId, PROTOCOL_FIELD_LIMITS.roomId) ||
+          (value.afterMessageId !== undefined &&
+            !isBoundedText(value.afterMessageId, PROTOCOL_FIELD_LIMITS.messageId)) ||
+          (value.limit !== undefined &&
+            !isBoundedLimit(value.limit, PROTOCOL_FIELD_LIMITS.historyPage))) {
+        return {
+          ok: false,
+          error: protocolError("room.history.v2 requires bounded query fields", requestId),
+        };
+      }
+      return {
+        ok: true,
+        frame: {
+          type: "room.history.v2",
+          requestId,
+          roomId: value.roomId,
+          ...(value.afterMessageId === undefined
+            ? {}
+            : { afterMessageId: value.afterMessageId }),
+          ...(value.limit === undefined ? {} : { limit: value.limit }),
+        },
+      };
+    case "message.revisions.query":
+      if (!hasRequiredAndOptionalFields(
+        value,
+        MESSAGE_REVISIONS_REQUIRED_FIELDS,
+        MESSAGE_REVISIONS_OPTIONAL_FIELDS,
+      ) || requestId === undefined ||
+          !isBoundedText(value.roomId, PROTOCOL_FIELD_LIMITS.roomId) ||
+          !isBoundedText(value.messageId, PROTOCOL_FIELD_LIMITS.messageId) ||
+          (value.afterRevision !== undefined && !isPageIndex(value.afterRevision)) ||
+          (value.limit !== undefined &&
+            !isBoundedLimit(value.limit, PROTOCOL_FIELD_LIMITS.revisionPage))) {
+        return {
+          ok: false,
+          error: protocolError(
+            "message.revisions.query requires bounded query fields",
+            requestId,
+          ),
+        };
+      }
+      return {
+        ok: true,
+        frame: {
+          type: "message.revisions.query",
+          requestId,
+          roomId: value.roomId,
+          messageId: value.messageId,
+          ...(value.afterRevision === undefined
+            ? {}
+            : { afterRevision: value.afterRevision }),
+          ...(value.limit === undefined ? {} : { limit: value.limit }),
+        },
+      };
     case "room.history":
     case "room.subscribe":
     case "room.governance.get":

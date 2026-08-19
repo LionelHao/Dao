@@ -3,15 +3,24 @@ import { isIP } from "node:net";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import {
   isDepartureConflictList,
+  isIsoUtcTimestamp,
+  isMessageRevision,
+  isMessageTargetOutcome,
   isRoomRepairPage,
   isRoomGovernanceView,
   isRoomSyncResult,
   isSnapshotCompleted,
+  isTimelineMessage,
   isWorkspaceBootstrapPage,
+  MESSAGE_AUTHORITY_LIMITS,
+  type HumanMessageSubmit,
+  type MessageRevision,
+  type MessageTargetOutcome,
   type PersistedRoomEvent,
   type DepartureConflictList,
   type RoomCursor,
   type SnapshotVersion,
+  type TimelineMessage,
 } from "@native-im/core";
 import {
   AuthenticationError,
@@ -28,6 +37,7 @@ import {
 } from "./outbox-dispatcher.js";
 import type {
   AuthenticatedSessionContext,
+  AuthenticatedCommandContext,
   ClosedRoomGovernanceAcknowledgement,
   ClosedRoomGovernanceTransportStore,
   CommandStore,
@@ -46,6 +56,7 @@ import type { AuthoritativeCollaborationPrimitives } from "./primitives.js";
 import type { BallRuntimeService } from "./ball-runtime/ball-runtime-service.js";
 import {
   parseClientFrame,
+  PROTOCOL_FIELD_LIMITS,
   type AuthenticatedFrame,
   type ClientFrame,
   type ProtocolErrorFrame,
@@ -67,6 +78,47 @@ export interface MessageWebSocketServer {
     readonly delta: string;
   }): void;
   close(): Promise<void>;
+}
+
+export interface MessageAuthorityTransport {
+  submitHumanMessage(
+    context: AuthenticatedCommandContext,
+    message: HumanMessageSubmit,
+  ): Promise<unknown>;
+  reviseHumanMessage(
+    context: AuthenticatedCommandContext,
+    input: Readonly<{
+      roomId: string;
+      messageId: string;
+      expectedRevision: number;
+      body: string;
+    }>,
+  ): Promise<unknown>;
+  recallHumanMessage(
+    context: AuthenticatedCommandContext,
+    input: Readonly<{
+      roomId: string;
+      messageId: string;
+      expectedRevision: number;
+    }>,
+  ): Promise<unknown>;
+  readMessageHistory(
+    context: AuthenticatedSessionContext,
+    input: Readonly<{
+      roomId: string;
+      afterMessageId?: string;
+      limit?: number;
+    }>,
+  ): Promise<unknown>;
+  readMessageRevisions(
+    context: AuthenticatedSessionContext,
+    input: Readonly<{
+      roomId: string;
+      messageId: string;
+      afterRevision?: number;
+      limit?: number;
+    }>,
+  ): Promise<unknown>;
 }
 
 export interface StartMessageWebSocketServerOptions {
@@ -94,6 +146,7 @@ export interface StartMessageWebSocketServerOptions {
     | "setLightTaskCriterion"
   >;
   readonly ballRuntime?: Pick<BallRuntimeService, "query">;
+  readonly messageAuthority?: MessageAuthorityTransport;
   readonly governance?: Pick<CommandStore, "executeHuman"> &
     Pick<SyncQueryStore, "readRoomGovernance"> &
     Partial<ClosedRoomGovernanceTransportStore>;
@@ -184,6 +237,154 @@ function hasOnlyOwnFields(value: Record<string, unknown>, fields: readonly strin
   const allowed = new Set(fields);
   return fields.every((field) => Object.hasOwn(value, field)) &&
     Reflect.ownKeys(value).every((key) => typeof key === "string" && allowed.has(key));
+}
+
+type ClosedMessageSubmitResult = Readonly<{
+  messageId: string;
+  persistedAt: string;
+  targetOutcomes: readonly MessageTargetOutcome[];
+}>;
+
+type ClosedMessageRevisionResult = Readonly<{
+  messageId: string;
+  revision: number;
+  persistedAt: string;
+}>;
+
+type ClosedMessageRecallResult = Readonly<{
+  messageId: string;
+  revision: number;
+  recalledAt: string;
+}>;
+
+type ClosedMessageHistoryResult = Readonly<{
+  messages: readonly TimelineMessage[];
+  hasMore: boolean;
+}>;
+
+type ClosedMessageRevisionsResult = Readonly<{
+  revisions: readonly MessageRevision[];
+  hasMore: boolean;
+}>;
+
+function closeMessageSubmitResult(
+  value: unknown,
+  message: HumanMessageSubmit,
+): ClosedMessageSubmitResult | undefined {
+  if (!isObjectRecord(value) ||
+      !hasOnlyOwnFields(value, ["messageId", "persistedAt", "targetOutcomes"]) ||
+      value.messageId !== message.messageId || !isIsoUtcTimestamp(value.persistedAt) ||
+      !Array.isArray(value.targetOutcomes) ||
+      value.targetOutcomes.length !== message.mentionedTargets.length ||
+      value.targetOutcomes.length > MESSAGE_AUTHORITY_LIMITS.targetOutcomes) {
+    return undefined;
+  }
+  const outcomesByTargetId = new Map<string, MessageTargetOutcome>();
+  const closedOutcomes: MessageTargetOutcome[] = [];
+  for (const outcome of value.targetOutcomes) {
+    if (!isMessageTargetOutcome(outcome) || outcomesByTargetId.has(outcome.targetId)) {
+      return undefined;
+    }
+    outcomesByTargetId.set(outcome.targetId, outcome);
+    closedOutcomes.push(outcome);
+  }
+  if (message.mentionedTargets.some((target) => {
+    const outcome = outcomesByTargetId.get(target.id);
+    return outcome === undefined || outcome.kind !== target.kind ||
+      outcome.targetActorId !== target.targetActorId;
+  })) {
+    return undefined;
+  }
+  return {
+    messageId: value.messageId,
+    persistedAt: value.persistedAt,
+    targetOutcomes: closedOutcomes,
+  };
+}
+
+function closeMessageRevisionResult(
+  value: unknown,
+  messageId: string,
+  expectedRevision: number,
+): ClosedMessageRevisionResult | undefined {
+  if (!isObjectRecord(value) ||
+      !hasOnlyOwnFields(value, ["messageId", "revision", "persistedAt"]) ||
+      value.messageId !== messageId || value.revision !== expectedRevision + 1 ||
+      !isIsoUtcTimestamp(value.persistedAt)) {
+    return undefined;
+  }
+  return {
+    messageId: value.messageId,
+    revision: value.revision,
+    persistedAt: value.persistedAt,
+  };
+}
+
+function closeMessageRecallResult(
+  value: unknown,
+  messageId: string,
+  expectedRevision: number,
+): ClosedMessageRecallResult | undefined {
+  if (!isObjectRecord(value) ||
+      !hasOnlyOwnFields(value, ["messageId", "revision", "recalledAt"]) ||
+      value.messageId !== messageId || value.revision !== expectedRevision ||
+      !isIsoUtcTimestamp(value.recalledAt)) {
+    return undefined;
+  }
+  return {
+    messageId: value.messageId,
+    revision: value.revision,
+    recalledAt: value.recalledAt,
+  };
+}
+
+function closeMessageHistoryResult(
+  value: unknown,
+  roomId: string,
+  limit: number,
+): ClosedMessageHistoryResult | undefined {
+  if (!isObjectRecord(value) || !hasOnlyOwnFields(value, ["messages", "hasMore"]) ||
+      typeof value.hasMore !== "boolean" || !Array.isArray(value.messages) ||
+      value.messages.length > limit) {
+    return undefined;
+  }
+  const messageIds = new Set<string>();
+  const closedMessages: TimelineMessage[] = [];
+  let previousCreatedAt: string | undefined;
+  for (const message of value.messages) {
+    if (!isTimelineMessage(message) || message.roomId !== roomId || messageIds.has(message.id) ||
+        (previousCreatedAt !== undefined && message.createdAt < previousCreatedAt)) {
+      return undefined;
+    }
+    messageIds.add(message.id);
+    closedMessages.push(message);
+    previousCreatedAt = message.createdAt;
+  }
+  return { messages: closedMessages, hasMore: value.hasMore };
+}
+
+function closeMessageRevisionsResult(
+  value: unknown,
+  messageId: string,
+  afterRevision: number,
+  limit: number,
+): ClosedMessageRevisionsResult | undefined {
+  if (!isObjectRecord(value) || !hasOnlyOwnFields(value, ["revisions", "hasMore"]) ||
+      typeof value.hasMore !== "boolean" || !Array.isArray(value.revisions) ||
+      value.revisions.length > limit) {
+    return undefined;
+  }
+  let previousRevision = afterRevision;
+  const closedRevisions: MessageRevision[] = [];
+  for (const revision of value.revisions) {
+    if (!isMessageRevision(revision) || revision.messageId !== messageId ||
+        revision.revision !== previousRevision + 1) {
+      return undefined;
+    }
+    previousRevision = revision.revision;
+    closedRevisions.push(revision);
+  }
+  return { revisions: closedRevisions, hasMore: value.hasMore };
 }
 
 function isServiceErrorCode<TCode extends string>(
@@ -371,17 +572,26 @@ const MAPPED_SERVICE_ERROR_STATUSES = new Map<GenericProtocolErrorCode, Protocol
   ["session_limit_reached", 409],
   ["snapshot_family_revoked", 403],
   ["invalid_request", 400],
+  ["invalid_message", 400],
+  ["mention_entity_invalid", 400],
+  ["author_fields_forbidden", 400],
+  ["attachment_feature_unavailable", 400],
   ["unauthenticated", 401],
   ["room_forbidden", 403],
   ["snapshot_forbidden", 403],
   ["snapshot_not_found", 404],
   ["room_not_found", 404],
+  ["reply_target_not_found", 404],
   ["room_archived", 409],
   ["role_forbidden", 403],
   ["room_revision_conflict", 409],
   ["ownership_transfer_required", 409],
   ["member_not_found", 404],
   ["idempotency_conflict", 409],
+  ["message_version_conflict", 409],
+  ["message_recalled", 409],
+  ["agent_final_immutable", 409],
+  ["protocol_upgrade_required", 410],
   ["confirmation_rejected", 409],
   ["grant_revoked", 409],
   ["dependency_unavailable", 503],
@@ -998,6 +1208,11 @@ function isCorrelatedRecoveryResponse(
       | "auth.sessions.list"
       | "auth.session.revoke"
       | "message.send"
+      | "message.send.v2"
+      | "message.revise"
+      | "message.recall"
+      | "room.history.v2"
+      | "message.revisions.query"
       | "room.history"
       | "room.subscribe"
       | "room.subscribe.v2"
@@ -1093,6 +1308,11 @@ async function handleRecoveryFrame(
       | "auth.sessions.list"
       | "auth.session.revoke"
       | "message.send"
+      | "message.send.v2"
+      | "message.revise"
+      | "message.recall"
+      | "room.history.v2"
+      | "message.revisions.query"
       | "room.history"
       | "room.subscribe"
       | "room.subscribe.v2"
@@ -1888,6 +2108,154 @@ async function handleFrame(
     case "auth.session.revoke":
       await handleTargetedRevoke(socket, frame, options, context);
       return;
+    case "message.send.v2":
+    case "message.revise":
+    case "message.recall":
+    case "room.history.v2":
+    case "message.revisions.query": {
+      const session = await requireSession(socket, frame.requestId, options, context);
+      if (session === undefined) {
+        return;
+      }
+      const authority = options.messageAuthority;
+      if (authority === undefined) {
+        sendFrame(socket, errorFrame(
+          503,
+          "dependency_unavailable",
+          "dependency_unavailable",
+          frame.requestId,
+        ));
+        return;
+      }
+      try {
+        if (frame.type === "message.send.v2") {
+          const accepted = closeMessageSubmitResult(
+            await authority.submitHumanMessage({
+              ...session,
+              kind: "human",
+              requestId: frame.requestId,
+              idempotencyKey: frame.message.messageId,
+            }, frame.message),
+            frame.message,
+          );
+          if (accepted !== undefined) {
+            sendFrame(socket, {
+              type: "message.accepted",
+              requestId: frame.requestId,
+              ...accepted,
+            });
+            return;
+          }
+        } else if (frame.type === "message.revise") {
+          const accepted = closeMessageRevisionResult(
+            await authority.reviseHumanMessage({
+              ...session,
+              kind: "human",
+              requestId: frame.requestId,
+              idempotencyKey:
+                `message.revise:${frame.messageId}:${frame.expectedRevision}`,
+            }, {
+              roomId: frame.roomId,
+              messageId: frame.messageId,
+              expectedRevision: frame.expectedRevision,
+              body: frame.body,
+            }),
+            frame.messageId,
+            frame.expectedRevision,
+          );
+          if (accepted !== undefined) {
+            sendFrame(socket, {
+              type: "message.revision.accepted",
+              requestId: frame.requestId,
+              ...accepted,
+            });
+            return;
+          }
+        } else if (frame.type === "message.recall") {
+          const accepted = closeMessageRecallResult(
+            await authority.recallHumanMessage({
+              ...session,
+              kind: "human",
+              requestId: frame.requestId,
+              idempotencyKey:
+                `message.recall:${frame.messageId}:${frame.expectedRevision}`,
+            }, {
+              roomId: frame.roomId,
+              messageId: frame.messageId,
+              expectedRevision: frame.expectedRevision,
+            }),
+            frame.messageId,
+            frame.expectedRevision,
+          );
+          if (accepted !== undefined) {
+            sendFrame(socket, {
+              type: "message.recall.accepted",
+              requestId: frame.requestId,
+              ...accepted,
+            });
+            return;
+          }
+        } else if (frame.type === "room.history.v2") {
+          const input = {
+            roomId: frame.roomId,
+            ...(frame.afterMessageId === undefined
+              ? {}
+              : { afterMessageId: frame.afterMessageId }),
+            ...(frame.limit === undefined ? {} : { limit: frame.limit }),
+          };
+          const history = closeMessageHistoryResult(
+            await authority.readMessageHistory(session, input),
+            frame.roomId,
+            frame.limit ?? PROTOCOL_FIELD_LIMITS.historyPage,
+          );
+          if (history !== undefined) {
+            sendFrame(socket, {
+              type: "room.history.v2",
+              requestId: frame.requestId,
+              roomId: frame.roomId,
+              ...history,
+            });
+            return;
+          }
+        } else {
+          const input = {
+            roomId: frame.roomId,
+            messageId: frame.messageId,
+            ...(frame.afterRevision === undefined
+              ? {}
+              : { afterRevision: frame.afterRevision }),
+            ...(frame.limit === undefined ? {} : { limit: frame.limit }),
+          };
+          const revisions = closeMessageRevisionsResult(
+            await authority.readMessageRevisions(session, input),
+            frame.messageId,
+            frame.afterRevision ?? 0,
+            frame.limit ?? PROTOCOL_FIELD_LIMITS.revisionPage,
+          );
+          if (revisions !== undefined) {
+            sendFrame(socket, {
+              type: "message.revisions",
+              requestId: frame.requestId,
+              roomId: frame.roomId,
+              messageId: frame.messageId,
+              ...revisions,
+            });
+            return;
+          }
+        }
+        sendFrame(socket, errorFrame(
+          503,
+          "dependency_unavailable",
+          "dependency_unavailable",
+          frame.requestId,
+        ));
+      } catch (error: unknown) {
+        if (!context.closed) {
+          sendFrame(socket, mappedError(error, frame.requestId));
+        }
+      }
+      return;
+    }
     case "message.send": {
       const principal = await requirePrincipal(socket, frame.requestId, options, context);
       if (principal === undefined) {

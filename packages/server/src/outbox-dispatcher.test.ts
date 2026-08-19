@@ -50,6 +50,36 @@ const roomReadEvent: PersistedRoomEvent = {
   },
 };
 
+const messageAuthorityEvent: PersistedRoomEvent = {
+  eventId: "event-message-v2-1",
+  streamKind: "room",
+  streamId: "room-1",
+  streamSeq: 3,
+  roomId: "room-1",
+  actorId: "human-author",
+  occurredAt: "2026-08-19T00:01:00.000Z",
+  type: "room.message.accepted",
+  payload: {
+    id: "message-v2-1",
+    roomId: "room-1",
+    authorId: "human-author",
+    authorKind: "human",
+    createdAt: "2026-08-19T00:00:00.000Z",
+    lifecycle: "active",
+    currentRevision: {
+      messageId: "message-v2-1",
+      revision: 1,
+      body: "durable v2",
+      revisedAt: "2026-08-19T00:00:00.000Z",
+      revisedByActorId: "human-author",
+    },
+    revisionCount: 1,
+    mentionedTargets: [],
+    attachments: [],
+    targetOutcomes: [],
+  },
+};
+
 const principalEvent: PersistedIdentityEvent = {
   eventId: "event-principal-1",
   streamKind: "identity",
@@ -171,6 +201,23 @@ class MemoryOutboxStore implements OutboxDispatchStore {
 }
 
 describe("OutboxDispatcher", () => {
+  it("dispatches Message Authority events without downgrading them to legacy message.created", async () => {
+    const registry = createSubscriptionRegistry();
+    const member = connection("message-v2-member", "human-member");
+    registry.addRoom({ roomId: "room-1", connection: member });
+    const item = delivery("delivery-message-v2", "room", "room-1", messageAuthorityEvent);
+    const store = new MemoryOutboxStore([item], () => true);
+    const send = vi.fn(async () => ({ accepted: true as const }));
+    const dispatcher = createOutboxDispatcher({ store, registry, send });
+
+    await expect(dispatcher.flushOnce()).resolves.toBe(1);
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({ connectionId: member.connectionId }),
+      { type: "room.event", event: messageAuthorityEvent },
+      item,
+    );
+  });
+
   it("rejects a batch size above the closed worker wire limit", () => {
     expect(() => createOutboxDispatcher({
       store: new MemoryOutboxStore([], () => true),

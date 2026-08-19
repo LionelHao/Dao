@@ -3618,6 +3618,385 @@ describe("authenticated message WebSocket service", () => {
     });
   });
 
+  it("fails closed when Message Authority vNext is not installed", async () => {
+    const fixture = await createFixture();
+    fixtures.push(fixture);
+    const client = await fixture.connect();
+    const frames = [
+      {
+        type: "message.send.v2",
+        requestId: "message-v2-unavailable",
+        message: {
+          messageId: "message-v2-1",
+          roomId,
+          body: "hello",
+          mentionedTargets: [],
+          attachments: [],
+        },
+      },
+      {
+        type: "message.revise",
+        requestId: "message-revise-unavailable",
+        roomId,
+        messageId: "message-v2-1",
+        expectedRevision: 1,
+        body: "revised",
+      },
+      {
+        type: "message.recall",
+        requestId: "message-recall-unavailable",
+        roomId,
+        messageId: "message-v2-1",
+        expectedRevision: 1,
+      },
+      {
+        type: "room.history.v2",
+        requestId: "message-history-unavailable",
+        roomId,
+        limit: 25,
+      },
+      {
+        type: "message.revisions.query",
+        requestId: "message-revisions-unavailable",
+        roomId,
+        messageId: "message-v2-1",
+        limit: 25,
+      },
+    ] as const;
+
+    client.send(frames[0]);
+    await expect(client.waitForError("unauthenticated", frames[0].requestId))
+      .resolves.toMatchObject({ frame: { status: 401 } });
+
+    await client.login(humans[0], "message-authority-login");
+    for (const frame of frames) {
+      client.send(frame);
+      await expect(client.waitForError("dependency_unavailable", frame.requestId))
+        .resolves.toMatchObject({
+          frame: {
+            type: "error",
+            status: 503,
+            code: "dependency_unavailable",
+            message: "dependency_unavailable",
+            requestId: frame.requestId,
+          },
+        });
+    }
+  });
+
+  it("routes closed Message Authority vNext frames with server-derived session authority", async () => {
+    const acceptedMessage = {
+      id: "message-v2-1",
+      roomId,
+      authorId: "human-1",
+      authorKind: "human" as const,
+      createdAt: "2026-08-19T00:00:00.000Z",
+      lifecycle: "active" as const,
+      currentRevision: {
+        messageId: "message-v2-1",
+        revision: 1,
+        body: "hello",
+        revisedAt: "2026-08-19T00:00:00.000Z",
+        revisedByActorId: "human-1",
+      },
+      revisionCount: 1,
+      mentionedTargets: [],
+      attachments: [],
+      targetOutcomes: [],
+    };
+    const submitHumanMessage = vi.fn(async () => ({
+      messageId: "message-v2-1",
+      persistedAt: "2026-08-19T00:00:00.000Z",
+      targetOutcomes: [],
+    }));
+    const reviseHumanMessage = vi.fn(async () => ({
+      messageId: "message-v2-1",
+      revision: 2,
+      persistedAt: "2026-08-19T00:01:00.000Z",
+    }));
+    const recallHumanMessage = vi.fn(async () => ({
+      messageId: "message-v2-1",
+      revision: 2,
+      recalledAt: "2026-08-19T00:02:00.000Z",
+    }));
+    const readMessageHistory = vi.fn(async () => ({
+      messages: [acceptedMessage],
+      hasMore: false,
+    }));
+    const readMessageRevisions = vi.fn(async () => ({
+      revisions: [acceptedMessage.currentRevision],
+      hasMore: false,
+    }));
+    const server = await startMessageWebSocketServer({
+      auth: governanceAuthenticationService(),
+      service: idleMessageService(),
+      messageAuthority: {
+        submitHumanMessage,
+        reviseHumanMessage,
+        recallHumanMessage,
+        readMessageHistory,
+        readMessageRevisions,
+      },
+    });
+    const client = await LoopbackClient.connect(server.url);
+
+    try {
+      await client.login(humans[0], "message-v2-login");
+      client.send({
+        type: "message.send.v2",
+        requestId: "message-v2-send",
+        message: {
+          messageId: "message-v2-1",
+          roomId,
+          body: "hello",
+          mentionedTargets: [],
+          attachments: [],
+        },
+      });
+      await expect(client.waitForFrame(
+        (frame) => hasType(frame, "message.accepted") &&
+          frame.requestId === "message-v2-send" && Array.isArray(frame.targetOutcomes),
+        "v2 message acceptance",
+      )).resolves.toMatchObject({ frame: {
+        type: "message.accepted",
+        requestId: "message-v2-send",
+        messageId: "message-v2-1",
+        persistedAt: "2026-08-19T00:00:00.000Z",
+        targetOutcomes: [],
+      } });
+
+      client.send({
+        type: "message.revise", requestId: "message-v2-revise", roomId,
+        messageId: "message-v2-1", expectedRevision: 1, body: "revised",
+      });
+      await expect(client.waitForFrame(
+        (frame) => hasType(frame, "message.revision.accepted") &&
+          frame.requestId === "message-v2-revise",
+        "message revision acceptance",
+      )).resolves.toMatchObject({ frame: {
+        messageId: "message-v2-1", revision: 2,
+        persistedAt: "2026-08-19T00:01:00.000Z",
+      } });
+
+      client.send({
+        type: "room.history.v2", requestId: "message-v2-history", roomId, limit: 25,
+      });
+      await expect(client.waitForFrame(
+        (frame) => hasType(frame, "room.history.v2") &&
+          frame.requestId === "message-v2-history",
+        "message v2 history",
+      )).resolves.toMatchObject({ frame: {
+        roomId, messages: [acceptedMessage], hasMore: false,
+      } });
+
+      client.send({
+        type: "message.revisions.query", requestId: "message-v2-revisions",
+        roomId, messageId: "message-v2-1", limit: 25,
+      });
+      await expect(client.waitForFrame(
+        (frame) => hasType(frame, "message.revisions") &&
+          frame.requestId === "message-v2-revisions",
+        "message revisions",
+      )).resolves.toMatchObject({ frame: {
+        roomId, messageId: "message-v2-1",
+        revisions: [acceptedMessage.currentRevision], hasMore: false,
+      } });
+
+      client.send({
+        type: "message.recall", requestId: "message-v2-recall", roomId,
+        messageId: "message-v2-1", expectedRevision: 2,
+      });
+      await expect(client.waitForFrame(
+        (frame) => hasType(frame, "message.recall.accepted") &&
+          frame.requestId === "message-v2-recall",
+        "message recall acceptance",
+      )).resolves.toMatchObject({ frame: {
+        messageId: "message-v2-1", revision: 2,
+        recalledAt: "2026-08-19T00:02:00.000Z",
+      } });
+
+      expect(submitHumanMessage).toHaveBeenCalledWith({
+        ...governanceSession,
+        kind: "human",
+        requestId: "message-v2-send",
+        idempotencyKey: "message-v2-1",
+      }, expect.objectContaining({ messageId: "message-v2-1", roomId }));
+      expect(reviseHumanMessage).toHaveBeenCalledTimes(1);
+      expect(recallHumanMessage).toHaveBeenCalledTimes(1);
+      expect(readMessageHistory).toHaveBeenCalledWith(
+        governanceSession,
+        { roomId, limit: 25 },
+      );
+      expect(readMessageRevisions).toHaveBeenCalledWith(
+        governanceSession,
+        { roomId, messageId: "message-v2-1", limit: 25 },
+      );
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("fails closed on malformed Message Authority dependency results", async () => {
+    const malformedHumanMessage = {
+      id: "message-v2-1",
+      roomId: "another-room",
+      authorId: "human-1",
+      authorKind: "human" as const,
+      createdAt: "2026-08-19T00:00:00.000Z",
+      lifecycle: "active" as const,
+      currentRevision: {
+        messageId: "message-v2-1",
+        revision: 1,
+        body: "hello",
+        revisedAt: "2026-08-19T00:00:00.000Z",
+        revisedByActorId: "human-1",
+      },
+      revisionCount: 1,
+      mentionedTargets: [],
+      attachments: [],
+      targetOutcomes: [],
+    };
+    const server = await startMessageWebSocketServer({
+      auth: governanceAuthenticationService(),
+      service: idleMessageService(),
+      messageAuthority: {
+        async submitHumanMessage() {
+          return {
+            messageId: "message-v2-1",
+            persistedAt: "2026-08-19T00:00:00.000Z",
+            targetOutcomes: [{
+              targetId: "wrong-target",
+              targetActorId: "agent-1",
+              kind: "agent-invocation",
+              status: "invocation-intent-created",
+              invocationIntentId: "intent-1",
+            }],
+          };
+        },
+        async reviseHumanMessage() {
+          return {
+            messageId: "message-v2-1",
+            revision: 3,
+            persistedAt: "2026-08-19T00:01:00.000Z",
+          };
+        },
+        async recallHumanMessage() {
+          return {
+            messageId: "message-v2-1",
+            revision: 2,
+            recalledAt: "2026-08-19T00:02:00.000Z",
+          };
+        },
+        async readMessageHistory() {
+          return { messages: [malformedHumanMessage], hasMore: false };
+        },
+        async readMessageRevisions() {
+          return {
+            revisions: [
+              { ...malformedHumanMessage.currentRevision, revision: 2 },
+              { ...malformedHumanMessage.currentRevision, revision: 2 },
+            ],
+            hasMore: false,
+          };
+        },
+      },
+    });
+    const client = await LoopbackClient.connect(server.url);
+
+    try {
+      await client.login(humans[0], "message-v2-malformed-login");
+      const frames = [
+        {
+          type: "message.send.v2", requestId: "message-v2-malformed-send",
+          message: {
+            messageId: "message-v2-1", roomId, body: "@Ada",
+            mentionedTargets: [{
+              id: "target-1", kind: "agent-invocation",
+              targetActorId: "agent-1", range: { startUtf16: 0, endUtf16: 4 },
+            }],
+            attachments: [],
+          },
+        },
+        {
+          type: "message.revise", requestId: "message-v2-malformed-revise", roomId,
+          messageId: "message-v2-1", expectedRevision: 1, body: "revised",
+        },
+        {
+          type: "message.recall", requestId: "message-v2-malformed-recall", roomId,
+          messageId: "message-v2-1", expectedRevision: 1,
+        },
+        {
+          type: "room.history.v2", requestId: "message-v2-malformed-history", roomId,
+          limit: 25,
+        },
+        {
+          type: "message.revisions.query",
+          requestId: "message-v2-malformed-revisions", roomId,
+          messageId: "message-v2-1", afterRevision: 1, limit: 25,
+        },
+      ] as const;
+      for (const frame of frames) {
+        client.send(frame);
+        await expect(client.waitForError("dependency_unavailable", frame.requestId))
+          .resolves.toMatchObject({ frame: { status: 503 } });
+      }
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("maps the approved Message Authority error family without leaking causes", async () => {
+    const errors = [
+      ["invalid_message", 400],
+      ["mention_entity_invalid", 400],
+      ["author_fields_forbidden", 400],
+      ["attachment_feature_unavailable", 400],
+      ["room_forbidden", 403],
+      ["reply_target_not_found", 404],
+      ["message_version_conflict", 409],
+      ["message_recalled", 409],
+      ["agent_final_immutable", 409],
+      ["protocol_upgrade_required", 410],
+      ["dependency_unavailable", 503],
+    ] as const;
+    const server = await startMessageWebSocketServer({
+      auth: governanceAuthenticationService(),
+      service: idleMessageService(),
+      messageAuthority: {
+        async submitHumanMessage() { return undefined; },
+        async reviseHumanMessage(_context, input) {
+          const [code, status] = errors[Number(input.body)];
+          throw Object.assign(new Error("message-authority-private-cause"), {
+            code, status, secret: "message-authority-private-secret",
+          });
+        },
+        async recallHumanMessage() { return undefined; },
+        async readMessageHistory() { return undefined; },
+        async readMessageRevisions() { return undefined; },
+      },
+    });
+    const client = await LoopbackClient.connect(server.url);
+
+    try {
+      await client.login(humans[0], "message-v2-errors-login");
+      for (const [index, [code, status]] of errors.entries()) {
+        const requestId = `message-v2-error-${index}`;
+        client.send({
+          type: "message.revise", requestId, roomId,
+          messageId: "message-v2-1", expectedRevision: 1, body: String(index),
+        });
+        const received = await client.waitForError(code, requestId);
+        expect(received.frame).toMatchObject({ status, code, message: code, requestId });
+        expect(JSON.stringify(received.frame)).not.toContain("message-authority-private");
+      }
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
   it("closes an inbound frame larger than 64 KiB", async () => {
     const fixture = await createFixture();
     fixtures.push(fixture);
