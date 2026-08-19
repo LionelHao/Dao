@@ -54,7 +54,13 @@ async function runtimeServer(): Promise<{
         cursor: { version: 1, roomId: "room-1", afterSeq: 0 }, watermark: 0 });
     } else if (frame.type === "room.history.v2") {
       send({ type: "room.history.v2", requestId, roomId: "room-1",
-        messages: [message], hasMore: false });
+        messages: [message], hasMore: false, lifecycle: "active",
+        actors: [
+          { actorId: "human-1", kind: "human", displayName: "Sam",
+            secondaryLabel: "Owner" },
+          { actorId: "agent-1", kind: "agent", displayName: "Sam",
+            secondaryLabel: "On-mention Agent" },
+        ] });
     } else if (frame.type === "message.send.v2") {
       const submitted = frame.message as { messageId: string; body: string };
       const accepted: ActiveHumanMessage = {
@@ -106,7 +112,12 @@ describe("production Desktop Message Authority runtime", () => {
       type: "room.history.v2", requestId: "history-1", roomId: "room-1",
     })).resolves.toMatchObject({
       type: "room.history.v2", status: "ready", viewerActorId: "human-1",
-      lifecycle: "active", actors: [], generation: 1, watermark: 0,
+      lifecycle: "active", generation: 1, watermark: 0,
+      actors: [
+        { actorId: "human-1", kind: "human", displayName: "Sam", secondaryLabel: "Owner" },
+        { actorId: "agent-1", kind: "agent", displayName: "Sam",
+          secondaryLabel: "On-mention Agent" },
+      ],
       messages: [message],
     });
     const pending = runtime.client.sendV2({

@@ -129,7 +129,13 @@ describe("Message Authority WebSocket transport", () => {
           return;
         case "room.history.v2":
           send({ type: "room.history.v2", requestId, roomId: "room-1",
-            messages: [message], hasMore: false });
+            messages: [message], hasMore: false, lifecycle: "active",
+            actors: [
+              { actorId: "human-1", kind: "human", displayName: "Sam",
+                secondaryLabel: "Owner" },
+              { actorId: "agent-1", kind: "agent", displayName: "Sam",
+                secondaryLabel: "On-mention Agent" },
+            ] });
           return;
         case "message.revisions.query":
           send({ type: "message.revisions", requestId, roomId: "room-1",
@@ -168,7 +174,14 @@ describe("Message Authority WebSocket transport", () => {
     );
     await expect(transport.historyV2({
       type: "room.history.v2", requestId: "history-1", roomId: "room-1",
-    })).resolves.toMatchObject({ messages: [message] });
+    })).resolves.toMatchObject({
+      messages: [message], lifecycle: "active",
+      actors: [
+        { actorId: "human-1", kind: "human", displayName: "Sam", secondaryLabel: "Owner" },
+        { actorId: "agent-1", kind: "agent", displayName: "Sam",
+          secondaryLabel: "On-mention Agent" },
+      ],
+    });
     await expect(transport.revisionsQuery({
       type: "message.revisions.query", requestId: "revisions-1",
       roomId: "room-1", messageId: "message-1",

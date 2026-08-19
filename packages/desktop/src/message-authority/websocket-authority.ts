@@ -31,6 +31,7 @@ import {
   type MessageSendV2Command,
 } from "./contracts.js";
 import type { MessageClosedError } from "../renderer/message-authority/view-model.js";
+import type { MessageActorOption } from "../renderer/message-authority/view-model.js";
 
 type SocketEvent = "open" | "message" | "close" | "error";
 
@@ -68,6 +69,8 @@ export type MessageHistoryV2WireResult = Readonly<{
   roomId: string;
   messages: readonly TimelineMessage[];
   hasMore: boolean;
+  lifecycle: "active" | "archived";
+  actors: readonly MessageActorOption[];
 }>;
 
 export interface MessageAuthorityWireTransport {
@@ -272,15 +275,26 @@ export function parseMessageAuthorityServerFrame(raw: string): ParsedFrame | und
     case "message.revision.accepted": return parseRevisionAccepted(value);
     case "message.recall.accepted": return parseRecallAccepted(value);
     case "room.history.v2":
-      return exact(value, ["type", "requestId", "roomId", "messages", "hasMore"]) &&
+      return exact(value, [
+        "type", "requestId", "roomId", "messages", "hasMore", "lifecycle", "actors",
+      ]) &&
         text(value.requestId, 128) && text(value.roomId, 256) &&
         Array.isArray(value.messages) && value.messages.length <= 1_000 &&
         value.messages.every(isTimelineMessage) &&
         value.messages.every((message) => message.roomId === value.roomId) &&
         new Set(value.messages.map((message) => message.id)).size === value.messages.length &&
-        typeof value.hasMore === "boolean"
+        typeof value.hasMore === "boolean" &&
+        (value.lifecycle === "active" || value.lifecycle === "archived") &&
+        Array.isArray(value.actors) && value.actors.length <= 512 &&
+        value.actors.every((actor) => record(actor) && exact(actor, [
+          "actorId", "kind", "displayName", "secondaryLabel",
+        ]) && text(actor.actorId, 256) && (actor.kind === "human" || actor.kind === "agent") &&
+          text(actor.displayName, 512) && text(actor.secondaryLabel, 512)) &&
+        new Set(value.actors.map((actor) => actor.actorId)).size === value.actors.length
         ? { type: value.type, requestId: value.requestId, roomId: value.roomId,
-          messages: structuredClone(value.messages as TimelineMessage[]), hasMore: value.hasMore }
+          messages: structuredClone(value.messages as TimelineMessage[]), hasMore: value.hasMore,
+          lifecycle: value.lifecycle,
+          actors: structuredClone(value.actors as MessageActorOption[]) }
         : undefined;
     case "message.revisions":
       return exact(value, [

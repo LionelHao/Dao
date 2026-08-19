@@ -19,6 +19,7 @@ import type { MessageClosedError } from "../renderer/message-authority/view-mode
 import {
   MessageAuthorityTransportError,
   createMessageAuthorityWebSocketTransport,
+  type MessageHistoryV2WireResult,
   type MessageAuthorityWebSocketLike,
   type MessageAuthorityWireTransport,
 } from "./websocket-authority.js";
@@ -243,10 +244,15 @@ export function createDesktopMessageAuthorityRuntime(options: {
   const readCompleteHistory = async (
     transportPort: MessageAuthorityWireTransport,
     command: MessageHistoryV2Command,
-  ): Promise<readonly TimelineMessage[]> => {
+  ): Promise<Readonly<{
+    messages: readonly TimelineMessage[];
+    lifecycle: "active" | "archived";
+    actors: MessageHistoryV2WireResult["actors"];
+  }>> => {
     const messages: TimelineMessage[] = [];
     const seen = new Set<string>();
     let afterMessageId = command.afterMessageId;
+    let authority: Pick<MessageHistoryV2WireResult, "lifecycle" | "actors"> | undefined;
     for (let page = 0; page < MAX_HISTORY_PAGES; page += 1) {
       const response = await transportPort.historyV2({
         type: "room.history.v2",
@@ -258,6 +264,12 @@ export function createDesktopMessageAuthorityRuntime(options: {
       if (response.roomId !== command.roomId) {
         throw new MessageAuthorityTransportError("protocol_error");
       }
+      if (authority === undefined) {
+        authority = { lifecycle: response.lifecycle, actors: response.actors };
+      } else if (authority.lifecycle !== response.lifecycle ||
+          JSON.stringify(authority.actors) !== JSON.stringify(response.actors)) {
+        throw new MessageAuthorityTransportError("protocol_error");
+      }
       for (const message of response.messages) {
         if (seen.has(message.id) || messages.length >= MAX_HISTORY_MESSAGES) {
           throw new MessageAuthorityTransportError("request_capacity_exceeded");
@@ -265,7 +277,11 @@ export function createDesktopMessageAuthorityRuntime(options: {
         seen.add(message.id);
         messages.push(structuredClone(message));
       }
-      if (!response.hasMore) return messages;
+      if (!response.hasMore) return {
+        messages,
+        lifecycle: authority.lifecycle,
+        actors: authority.actors,
+      };
       const last = response.messages.at(-1);
       if (last === undefined) throw new MessageAuthorityTransportError("protocol_error");
       afterMessageId = last.id;
@@ -297,7 +313,9 @@ export function createDesktopMessageAuthorityRuntime(options: {
         const state = await ensureRoom(command.roomId);
         state.collecting = true;
         state.initialEvents = [];
-        let messages = await readCompleteHistory(transport, command);
+        const history = await readCompleteHistory(transport, command);
+        let messages = history.messages;
+        state.lifecycle = history.lifecycle;
         for (const event of state.initialEvents) {
           updateLifecycle(state, event);
           if (isMessageAuthorityEvent(event)) messages = [...foldMessageEvent(messages, event)];
@@ -314,7 +332,7 @@ export function createDesktopMessageAuthorityRuntime(options: {
           viewerActorId: session.actorId,
           lifecycle: state.lifecycle,
           connection: { status: "online" },
-          actors: [],
+          actors: history.actors,
           messages,
           hasMore: false,
           generation: state.generation,
