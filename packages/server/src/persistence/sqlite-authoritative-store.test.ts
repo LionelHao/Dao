@@ -32,6 +32,7 @@ import {
   createWorkerDatabaseClientWithTransactionFaultForTest,
 } from "./worker-database-client.js";
 import { isAuthorityWorkerRequest } from "./worker-protocol.js";
+import { insertLegacyMessageAuthorityRecord } from "./message-authority-legacy-adapter.js";
 
 function tokenSequence(...tokens: readonly string[]): () => string {
   const remaining = [...tokens];
@@ -275,13 +276,15 @@ async function createAgentFactFixture(databasePath: string) {
     WHERE id = 'room-facts';
     INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
     VALUES ('room', 'room-facts', 0, 1);
-    INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
-    VALUES
-      ('message-human-source', 'room-facts', 'human-li', 'human', 'please review',
-       '2026-08-10T13:01:00.000Z'),
-      ('message-agent-source', 'room-facts', 'agent-review', 'agent', 'review complete',
-       '2026-08-10T13:02:00.000Z');
   `);
+  insertLegacyMessageAuthorityRecord(database, {
+    id: "message-human-source", roomId: "room-facts", authorId: "human-li",
+    authorKind: "human", body: "please review", sentAt: "2026-08-10T13:01:00.000Z",
+  });
+  insertLegacyMessageAuthorityRecord(database, {
+    id: "message-agent-source", roomId: "room-facts", authorId: "agent-review",
+    authorKind: "agent", body: "review complete", sentAt: "2026-08-10T13:02:00.000Z",
+  });
   database.close();
 
   const client = await createWorkerDatabaseClient({ databasePath });
@@ -355,10 +358,11 @@ async function createLightTaskFixture(databasePath: string) {
     WHERE id = 'room-light-task';
     INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
     VALUES ('room', 'room-light-task', 0, 1);
-    INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
-    VALUES ('message-light-task', 'room-light-task', 'human-task-owner', 'human',
-            '需要一个明确承诺', '2026-08-17T00:00:01.000Z');
   `);
+  insertLegacyMessageAuthorityRecord(database, {
+    id: "message-light-task", roomId: "room-light-task", authorId: "human-task-owner",
+    authorKind: "human", body: "需要一个明确承诺", sentAt: "2026-08-17T00:00:01.000Z",
+  });
   database.close();
 
   const client = await createWorkerDatabaseClient({ databasePath });
@@ -558,12 +562,16 @@ async function createCommandMatrixFixture(databasePath: string): Promise<{
     WHERE id = 'room-matrix';
     INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
     VALUES ('room', 'room-matrix', 0, 1);
-    INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
-    VALUES
-      ('matrix-human-source', 'room-matrix', 'human-li', 'human', 'please review',
-       '2026-08-10T14:01:00.000Z'),
-      ('matrix-agent-source', 'room-matrix', 'agent-review', 'agent', 'review complete',
-       '2026-08-10T14:02:00.000Z');
+  `);
+  insertLegacyMessageAuthorityRecord(database, {
+    id: "matrix-human-source", roomId: "room-matrix", authorId: "human-li",
+    authorKind: "human", body: "please review", sentAt: "2026-08-10T14:01:00.000Z",
+  });
+  insertLegacyMessageAuthorityRecord(database, {
+    id: "matrix-agent-source", roomId: "room-matrix", authorId: "agent-review",
+    authorKind: "agent", body: "review complete", sentAt: "2026-08-10T14:02:00.000Z",
+  });
+  database.exec(`
     INSERT INTO room_invitations (
       id, room_id, inviter_actor_id, invitee_actor_id, token_hash, status,
       created_at, decision_actor_id, decided_at

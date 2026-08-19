@@ -342,6 +342,46 @@ describe("LegacyStateImporter", () => {
       expect(database.prepare("SELECT COUNT(*) AS count FROM events").get()).toEqual({
         count: 0,
       });
+      expect(
+        database.prepare(
+          `SELECT envelope.message_id AS messageId,
+                  envelope.message_kind AS messageKind,
+                  envelope.lifecycle,
+                  envelope.current_revision AS currentRevision,
+                  envelope.revision_count AS revisionCount,
+                  revision.body,
+                  revision.revised_at AS revisedAt,
+                  revision.revised_by_actor_id AS revisedByActorId
+           FROM message_envelopes AS envelope
+           JOIN message_revisions AS revision
+             ON revision.message_id = envelope.message_id
+            AND revision.revision = 1
+           ORDER BY envelope.message_id`,
+        ).all(),
+      ).toEqual([
+        {
+          messageId: "message-agent",
+          messageKind: "agent-final",
+          lifecycle: "active",
+          currentRevision: 1,
+          revisionCount: 1,
+          body: "ready",
+          revisedAt: "2026-08-09T08:02:00.000Z",
+          revisedByActorId: "agent-helper",
+        },
+        {
+          messageId: "message-human",
+          messageKind: "human",
+          lifecycle: "active",
+          currentRevision: 1,
+          revisionCount: 1,
+          body: "hello",
+          revisedAt: "2026-08-09T08:01:00.000Z",
+          revisedByActorId: "human-owner",
+        },
+      ]);
+      expect(database.prepare("SELECT COUNT(*) AS count FROM message_target_outcomes").get())
+        .toEqual({ count: 0 });
     } finally {
       database.close();
     }

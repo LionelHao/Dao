@@ -100,6 +100,7 @@ import {
   type ReopenAfterCommitRescan,
 } from "../room-governance/archive-coordinator.js";
 import { AuthorityParticipantUnavailableError } from "../room-governance/private-participant-registry.js";
+import { insertLegacyMessageAuthorityRecord } from "./message-authority-legacy-adapter.js";
 import {
   coordinateMemberAccessRevocationInTransaction,
   MemberAccessRevocationError,
@@ -3204,19 +3205,7 @@ function executeMessageSend(
     "message",
     stableId("message-gate", scope, key),
   );
-  database
-    .prepare(
-      `INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    )
-    .run(
-      message.id,
-      message.roomId,
-      message.authorId,
-      message.authorKind,
-      message.body,
-      message.sentAt,
-    );
+  insertLegacyMessageAuthorityRecord(database, message);
   afterDomainWrite?.();
   const streamSeq = appendRoomEvent(database, {
     eventId,
@@ -5845,10 +5834,6 @@ export function executeRuntimeAuthorityOperation(
         "message",
         stableId("runtime-complete-message-gate", current.id, String(operation.attemptSeq)),
       );
-      database.prepare(
-        `INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
-         VALUES (?, ?, ?, 'agent', ?, ?)`,
-      ).run(operation.messageId, current.roomId, current.agentId, operation.body, occurredAt);
       const messageEventId = stableId("runtime-message", current.id, String(operation.attemptSeq));
       const message = {
         id: operation.messageId,
@@ -5858,6 +5843,7 @@ export function executeRuntimeAuthorityOperation(
         body: operation.body,
         sentAt: occurredAt,
       };
+      insertLegacyMessageAuthorityRecord(database, message);
       const messageSeq = appendRoomEvent(database, {
         eventId: messageEventId,
         roomId: current.roomId,
