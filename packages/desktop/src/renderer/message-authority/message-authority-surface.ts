@@ -17,6 +17,7 @@ export interface MessageAuthoritySurfaceActions {
   readonly onRevise: (messageId: string) => void;
   readonly onRecall: (messageId: string) => void;
   readonly onRetryRepair: () => void;
+  readonly onReconnect: () => void;
   readonly onReauthenticate: () => void;
   readonly onRefreshProjection: () => void;
   readonly onDismissReply: () => void;
@@ -73,6 +74,9 @@ function connectionBanner(
   if (connection.status === "offline") {
     banner.append(text("strong", "离线 · 只读完整缓存"));
     banner.append(text("span", `数据截至 ${connection.asOf}；所有消息写入已禁用，不进入队列。`));
+    const reconnect = button("重新连接并恢复", "reconnect-message-authority");
+    reconnect.addEventListener("click", actions.onReconnect);
+    banner.append(reconnect);
   } else if (connection.status === "repairing") {
     banner.append(text("strong", "REPAIR 进行中"));
     banner.append(text("span", `固定 watermark ${connection.watermark}；staging 不可见，继续显示旧完整 projection。`));
@@ -313,6 +317,36 @@ function renderSubmission(
   return panel;
 }
 
+function renderMutation(
+  state: MessageAuthorityState,
+  actions: MessageAuthoritySurfaceActions,
+): HTMLElement | undefined {
+  const mutation = state.mutation;
+  if (mutation.status === "idle") return undefined;
+  const panel = element("section", mutation.status === "failed"
+    ? "message-authority__error"
+    : "message-authority__submission");
+  panel.dataset.mutationStatus = mutation.status;
+  panel.dataset.mutationRequestId = mutation.requestId;
+  panel.tabIndex = -1;
+  const label = mutation.kind === "revise" ? "修订" : "撤回";
+  if (mutation.status === "pending") {
+    panel.append(text("strong", `LOCAL · ${label} intent 正在提交；尚无成功事实。`));
+  } else if (mutation.status === "acknowledged") {
+    panel.append(text("strong", `ACK · ${label}已持久化；等待 stable event`));
+    panel.append(text("p", "ACK 不会替换 projection；当前正文保持到 stable event。"));
+  } else {
+    panel.dataset.mutationError = mutation.error.code;
+    panel.setAttribute("role", "group");
+    panel.append(text("strong", `${mutation.error.status} · ${mutation.error.code} · ${label}未生效`));
+    panel.append(text("p", `${recovery(mutation.error)}；失败方正文与旧完整 projection 已保留。ACK 不会替换 projection。`));
+    const refresh = button("载入最新 projection", "refresh-projection");
+    refresh.addEventListener("click", actions.onRefreshProjection);
+    panel.append(refresh);
+  }
+  return panel;
+}
+
 function renderComposer(
   state: MessageAuthorityState,
   actions: MessageAuthoritySurfaceActions,
@@ -394,10 +428,14 @@ export function renderMessageAuthoritySurface(
   shell.append(renderExecutions(state));
   const submission = renderSubmission(state, actions);
   if (submission !== undefined) shell.append(submission);
+  const mutation = renderMutation(state, actions);
+  if (mutation !== undefined) shell.append(mutation);
   shell.append(renderComposer(state, actions));
   root.replaceChildren(shell);
 
   if (state.submission.status === "retryable-failure" || state.submission.status === "nonretryable-failure") {
     root.querySelector<HTMLElement>("[data-message-error]")?.focus();
+  } else if (state.mutation.status === "failed") {
+    root.querySelector<HTMLElement>("[data-mutation-error]")?.focus();
   }
 }

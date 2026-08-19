@@ -49,6 +49,7 @@ export type MessageAuthorityTransportErrorCode =
   | "access_revoked"
   | "connection_unavailable"
   | "request_timeout"
+  | "repair_required"
   | "protocol_error"
   | "client_closed"
   | "request_capacity_exceeded";
@@ -57,6 +58,11 @@ export class MessageAuthorityTransportError extends Error {
   constructor(
     readonly code: MessageAuthorityTransportErrorCode,
     readonly closedError?: MessageClosedError,
+    readonly repair?: Readonly<{
+      reason: "cursor_absent" | "cursor_expired" | "operational_projection_changed";
+      retainedFromSeq: number;
+      watermark: number;
+    }>,
   ) {
     super(`Message Authority transport failed: ${code}`);
     this.name = "MessageAuthorityTransportError";
@@ -512,8 +518,28 @@ export function createMessageAuthorityWebSocketTransport(options: {
       );
       if (live === undefined) {
         // No ordinary room.sync RPC exists on this message-specific transport.
-      } else if (live.closed || frame.mode !== "delta" ||
-          frame.nextCursor.roomId !== live.cursor.roomId) {
+      } else if (live.closed) {
+        protocolFailure();
+        return;
+      } else if (frame.mode === "repair_required") {
+        const item = pending.get(frame.requestId);
+        if (item === undefined) {
+          protocolFailure();
+          return;
+        }
+        pending.delete(frame.requestId);
+        clearTimeout(item.timer);
+        live.closed = true;
+        if (subscriptions.get(live.cursor.roomId) === live) {
+          subscriptions.delete(live.cursor.roomId);
+        }
+        item.reject(new MessageAuthorityTransportError("repair_required", undefined, {
+          reason: frame.reason,
+          retainedFromSeq: frame.retainedFromSeq,
+          watermark: frame.watermark,
+        }));
+        return;
+      } else if (frame.nextCursor.roomId !== live.cursor.roomId) {
         protocolFailure();
         return;
       } else {

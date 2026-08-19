@@ -52,6 +52,27 @@ function acceptedEvent(sequence: number, id: string, body: string): MessageAutho
   };
 }
 
+function revisedEvent(sequence: number, revision: number, body: string): MessageAuthorityEvent {
+  return {
+    eventId: `event-revised-${sequence}`, streamKind: "room", streamId: "room-1",
+    streamSeq: sequence, roomId: "room-1", type: "room.message.revised",
+    actorId: "human-1", occurredAt: createdAt,
+    payload: { ...human("message-existing", body), revisionCount: revision,
+      currentRevision: { ...human("message-existing", body).currentRevision, revision, body } },
+  };
+}
+
+function recalledEvent(sequence: number): MessageAuthorityEvent {
+  return {
+    eventId: `event-recalled-${sequence}`, streamKind: "room", streamId: "room-1",
+    streamSeq: sequence, roomId: "room-1", type: "room.message.recalled",
+    actorId: "human-1", occurredAt: createdAt,
+    payload: { id: "message-existing", roomId: "room-1", authorId: "human-1",
+      authorKind: "human", createdAt, lifecycle: "recalled", recalledAt: createdAt,
+      revisionCount: 2 },
+  };
+}
+
 interface DeferredSend {
   readonly requestId: string;
   resolve(): void;
@@ -335,12 +356,111 @@ describe("Message Authority bridge renderer adapter", () => {
       type: "message.revise", roomId: "room-1", messageId: "message-existing",
       expectedRevision: 1, body: "Actually revised body",
     })));
+    await vi.waitFor(() => expect(root.querySelector("[data-mutation-status='acknowledged']"))
+      .not.toBeNull());
+    expect(root.textContent).toContain("ACK 不会替换 projection");
+    expect(root.textContent).toContain("Existing authority message");
+    authority.publish({ type: "room.event", cursorBefore: 9, generation: 4,
+      event: revisedEvent(10, 2, "Actually revised body") });
+    await vi.waitFor(() => expect(root.textContent).toContain("Actually revised body"));
+    expect(root.querySelector("[data-mutation-status]")).toBeNull();
 
     root.querySelector<HTMLButtonElement>("[data-action='recall-message']")!.click();
     expect(authority.port.recall).toHaveBeenCalledWith(expect.objectContaining({
       type: "message.recall", roomId: "room-1", messageId: "message-existing",
-      expectedRevision: 1,
+      expectedRevision: 2,
     }));
+    await vi.waitFor(() => expect(root.querySelector("[data-mutation-status='acknowledged']"))
+      .not.toBeNull());
+    authority.publish({ type: "room.event", cursorBefore: 10, generation: 4,
+      event: recalledEvent(11) });
+    await vi.waitFor(() => expect(root.textContent).toContain("消息已撤回"));
+    expect(root.textContent).not.toContain("Actually revised body");
+    dispose();
+    authority.close();
+  });
+
+  it("keeps the old complete timeline visible while offline retry performs an atomic restore", async () => {
+    const authority = authorityHarness();
+    const root = document.createElement("main");
+    const dispose = mountMessageAuthorityBridgeSurface(root, authority.bridge, "room-1", {
+      createMessageId: () => "message-new",
+      createTargetId: () => "target-new",
+    });
+    await vi.waitFor(() => expect(root.textContent).toContain("Existing authority message"));
+    authority.publish({ type: "message.connection", roomId: "room-1",
+      connection: { status: "offline", asOf: createdAt } });
+
+    let restore: ((value: Awaited<ReturnType<MessageAuthorityClientPort["historyV2"]>>) => void) | undefined;
+    let restoreRequestId = "";
+    vi.mocked(authority.port.historyV2).mockImplementationOnce((request) => new Promise((resolve) => {
+      restoreRequestId = request.requestId;
+      restore = resolve;
+    }));
+    root.querySelector<HTMLButtonElement>("[data-action='reconnect-message-authority']")!.click();
+    await vi.waitFor(() => expect(authority.port.historyV2).toHaveBeenCalledTimes(2));
+    expect(root.textContent).toContain("Existing authority message");
+
+    expect(root.textContent).toContain("staging 不可见");
+
+    restore!({ type: "room.history.v2", requestId: restoreRequestId, roomId: "room-1",
+      status: "ready", viewerActorId: "human-1", lifecycle: "active",
+      connection: { status: "online" }, actors: [], messages: [human("message-restored", "Restored")],
+      hasMore: false, generation: 5, watermark: 12 });
+    await vi.waitFor(() => expect(root.textContent).toContain("Restored"));
+    expect(root.textContent).not.toContain("Existing authority message");
+    expect(root.querySelector("[data-projection-generation='5']")).not.toBeNull();
+
+    authority.publish({ type: "message.connection", roomId: "room-1",
+      connection: { status: "offline", asOf: createdAt } });
+    vi.mocked(authority.port.historyV2).mockRejectedValueOnce(
+      new MessageAuthorityClientFailure({ status: 503, code: "dependency_unavailable" }),
+    );
+    root.querySelector<HTMLButtonElement>("[data-action='reconnect-message-authority']")!.click();
+    await vi.waitFor(() => expect(root.textContent).toContain("REPAIR FAILED"));
+    expect(root.textContent).toContain("Restored");
+    expect(root.querySelector("[data-projection-generation='5']")).not.toBeNull();
+    dispose();
+    authority.close();
+  });
+
+  it("correlates revise conflicts by requestId, preserves the losing body, and offers refresh", async () => {
+    const authority = authorityHarness();
+    vi.mocked(authority.port.revise).mockRejectedValueOnce(
+      new MessageAuthorityClientFailure({ status: 409, code: "message_version_conflict" }),
+    );
+    const root = document.createElement("main");
+    const dispose = mountMessageAuthorityBridgeSurface(root, authority.bridge, "room-1", {
+      createMessageId: () => "message-new",
+      createTargetId: () => "target-new",
+    });
+    await vi.waitFor(() => expect(root.textContent).toContain("Existing authority message"));
+    root.querySelector<HTMLButtonElement>("[data-action='revise-message']")!.click();
+    await vi.waitFor(() => expect(send(root).textContent).toBe("保存修订"));
+    composer(root).value = "Losing concurrent revision";
+    composer(root).dispatchEvent(new Event("input", { bubbles: true }));
+    send(root).click();
+
+    await vi.waitFor(() => expect(root.querySelector("[data-mutation-error='message_version_conflict']"))
+      .not.toBeNull());
+    expect(root.querySelector("[data-mutation-request-id='revise-3']")).not.toBeNull();
+    expect(composer(root).value).toBe("Losing concurrent revision");
+    expect(root.textContent).toContain("ACK 不会替换 projection");
+    expect(root.querySelector("[data-action='refresh-projection']")).not.toBeNull();
+    expect(root.textContent).toContain("Existing authority message");
+
+    vi.mocked(authority.port.recall).mockRejectedValueOnce(
+      new MessageAuthorityClientFailure({ status: 503, code: "dependency_unavailable" }),
+    );
+    root.querySelector<HTMLButtonElement>("[data-action='recall-message']")!.click();
+    await vi.waitFor(() => expect(root.querySelector("[data-mutation-error='dependency_unavailable']"))
+      .not.toBeNull());
+    expect(root.querySelector("[data-mutation-request-id='recall-4']")).not.toBeNull();
+    expect(root.textContent).toContain("Existing authority message");
+    expect(root.querySelector("[data-action='refresh-projection']")).not.toBeNull();
+    root.querySelector<HTMLButtonElement>("[data-action='refresh-projection']")!.click();
+    await vi.waitFor(() => expect(authority.port.historyV2).toHaveBeenCalledTimes(2));
+    expect(composer(root).value).toBe("Losing concurrent revision");
     dispose();
     authority.close();
   });

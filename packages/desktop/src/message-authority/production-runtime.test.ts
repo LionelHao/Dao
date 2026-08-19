@@ -203,4 +203,85 @@ describe("production Desktop Message Authority runtime", () => {
     }));
     offlineRuntime.close();
   });
+
+  it("recovers a repair_required subscription through real history without exposing a partial generation", async () => {
+    let subscribeCount = 0;
+    let historyCount = 0;
+    const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.once("listening", resolve));
+    const address = server.address();
+    if (typeof address === "string") throw new TypeError("Expected loopback TCP server");
+    server.on("connection", (socket) => socket.on("message", (raw) => {
+      const frame = JSON.parse(raw.toString()) as Record<string, unknown>;
+      const requestId = frame.requestId as string;
+      const send = (value: unknown): void => socket.send(JSON.stringify(value));
+      if (frame.type === "auth.resume") {
+        send({ type: "auth.authenticated", requestId, accountId: "account-1",
+          actorId: "human-1", sessionId: "session-1" });
+      } else if (frame.type === "room.subscribe.v2") {
+        subscribeCount += 1;
+        const cursor = frame.cursor as { afterSeq: number };
+        if (subscribeCount === 1) {
+          send({ type: "room.sync.result", requestId, mode: "delta", events: [],
+            nextCursor: { version: 1, roomId: "room-1", afterSeq: 0 },
+            watermark: 0, hasMore: false });
+          send({ type: "room.subscribed.v2", requestId, roomId: "room-1",
+            cursor: { version: 1, roomId: "room-1", afterSeq: 0 }, watermark: 0 });
+        } else if (cursor.afterSeq === 0) {
+          send({ type: "room.sync.result", requestId, mode: "repair_required",
+            reason: "cursor_expired", retainedFromSeq: 5, watermark: 8 });
+        } else {
+          expect(cursor.afterSeq).toBe(8);
+          send({ type: "room.sync.result", requestId, mode: "delta", events: [],
+            nextCursor: { version: 1, roomId: "room-1", afterSeq: 8 },
+            watermark: 8, hasMore: false });
+          send({ type: "room.subscribed.v2", requestId, roomId: "room-1",
+            cursor: { version: 1, roomId: "room-1", afterSeq: 8 }, watermark: 8 });
+        }
+      } else if (frame.type === "room.history.v2") {
+        historyCount += 1;
+        send({ type: "room.history.v2", requestId, roomId: "room-1",
+          messages: [{ ...message, currentRevision: { ...message.currentRevision,
+            body: historyCount === 1 ? "Old complete" : "Restored complete" } }],
+          hasMore: false, lifecycle: "active", actors: [] });
+      }
+    }));
+    const runtime = createDesktopMessageAuthorityRuntime({
+      endpoint: `ws://127.0.0.1:${address.port}`, session,
+      webSocketFactory: (endpoint) =>
+        new WebSocket(endpoint) as unknown as MessageAuthorityWebSocketLike,
+      timeoutMs: 2_000, now: () => now,
+    });
+    const inputs: unknown[] = [];
+    runtime.client.subscribe((input) => inputs.push(input));
+    await expect(runtime.client.historyV2({
+      type: "room.history.v2", requestId: "history-old", roomId: "room-1",
+    })).resolves.toMatchObject({ messages: [{ currentRevision: { body: "Old complete" } }] });
+
+    for (const client of server.clients) client.terminate();
+    await vi.waitFor(() => expect(inputs).toContainEqual({
+      type: "message.connection", roomId: "room-1",
+      connection: { status: "offline", asOf: now },
+    }));
+    await expect(runtime.client.historyV2({
+      type: "room.history.v2", requestId: "history-restored", roomId: "room-1",
+    })).resolves.toMatchObject({
+      generation: 2, watermark: 8,
+      messages: [{ currentRevision: { body: "Restored complete" } }],
+    });
+    expect(inputs).toContainEqual({
+      type: "message.connection", roomId: "room-1",
+      connection: { status: "repairing", watermark: 8 },
+    });
+    expect(inputs).not.toContainEqual(expect.objectContaining({
+      connection: expect.objectContaining({ status: "repair-failed" }),
+    }));
+    runtime.clearAndRestore("room-1");
+    await expect(runtime.client.historyV2({
+      type: "room.history.v2", requestId: "history-clear-restore", roomId: "room-1",
+    })).resolves.toMatchObject({ generation: 3, watermark: 8 });
+    expect(subscribeCount).toBe(5);
+    runtime.close();
+  });
 });

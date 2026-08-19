@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   applyMessageAuthorityInput,
+  beginMessageMutation,
   beginMessageSubmission,
   buildMentionPickerOptions,
   commitRepairGeneration,
@@ -378,5 +379,49 @@ describe("edit/recall control authority", () => {
       createMessageAuthorityState({ ...state, lifecycle: "archived" }),
       state.timeline[0]!,
     )).toEqual({ canRevise: false, canRecall: false });
+  });
+
+  it("correlates mutation ACK/errors without treating ACK as a projection", () => {
+    const pending = beginMessageMutation(initial(), {
+      kind: "revise", requestId: "revise-1", messageId: "message-source",
+      expectedRevision: 1, body: "losing body",
+    });
+    const unrelated = applyMessageAuthorityInput(pending, {
+      type: "message.error", requestId: "other-request",
+      status: 409, code: "message_version_conflict",
+    });
+    expect(unrelated).toBe(pending);
+
+    const acknowledged = applyMessageAuthorityInput(pending, {
+      type: "message.revision.accepted", requestId: "revise-1",
+      messageId: "message-source", revision: 2,
+      persistedAt: "2026-08-19T09:01:00.000Z",
+    });
+    expect(acknowledged.mutation.status).toBe("acknowledged");
+    expect((acknowledged.timeline[0] as ActiveHumanTimelineMessage).body)
+      .toBe("权威消息正文");
+    expect(acknowledged.announcement).toContain("ACK 不会替换 projection");
+
+    const projected = applyMessageAuthorityInput(acknowledged, {
+      type: "room.message.revised", eventId: "event-revised-2",
+      messageId: "message-source", revision: 2, body: "winning body",
+      revisedAt: "2026-08-19T09:01:00.000Z",
+    });
+    expect(projected.mutation.status).toBe("idle");
+    expect((projected.timeline[0] as ActiveHumanTimelineMessage).body).toBe("winning body");
+
+    const recall = beginMessageMutation(initial(), {
+      kind: "recall", requestId: "recall-1", messageId: "message-source",
+      expectedRevision: 1,
+    });
+    const failed = applyMessageAuthorityInput(recall, {
+      type: "message.error", requestId: "recall-1",
+      status: 503, code: "dependency_unavailable",
+    });
+    expect(failed.mutation).toMatchObject({
+      status: "failed", requestId: "recall-1",
+      error: { status: 503, code: "dependency_unavailable" },
+    });
+    expect((failed.timeline[0] as ActiveHumanTimelineMessage).body).toBe("权威消息正文");
   });
 });

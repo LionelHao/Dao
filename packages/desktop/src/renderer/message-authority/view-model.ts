@@ -145,6 +145,17 @@ export type MessageSubmissionState =
   | { readonly status: "retryable-failure"; readonly requestId: string; readonly payload: MessageDraft; readonly error: MessageClosedError }
   | { readonly status: "nonretryable-failure"; readonly requestId: string; readonly payload: MessageDraft; readonly error: MessageClosedError };
 
+export type MessageMutationState =
+  | { readonly status: "idle" }
+  | { readonly status: "pending"; readonly kind: "revise" | "recall"; readonly requestId: string;
+      readonly messageId: string; readonly expectedRevision: number; readonly body?: string }
+  | { readonly status: "acknowledged"; readonly kind: "revise" | "recall";
+      readonly requestId: string; readonly messageId: string; readonly expectedRevision: number;
+      readonly body?: string }
+  | { readonly status: "failed"; readonly kind: "revise" | "recall"; readonly requestId: string;
+      readonly messageId: string; readonly expectedRevision: number; readonly body?: string;
+      readonly error: MessageClosedError };
+
 export interface MessageAuthorityState {
   readonly roomId: string;
   readonly viewerActorId: string;
@@ -153,6 +164,7 @@ export interface MessageAuthorityState {
   readonly actors: readonly MessageActorOption[];
   readonly draft: MessageDraft;
   readonly submission: MessageSubmissionState;
+  readonly mutation: MessageMutationState;
   readonly timeline: readonly TimelineMessage[];
   readonly executions: readonly AgentExecutionProjection[];
   readonly previews: readonly AgentPreview[];
@@ -163,8 +175,9 @@ export interface MessageAuthorityState {
   readonly announcement: string;
 }
 
-type MessageAuthorityStateInput = Omit<MessageAuthorityState, "composerEnabled" | "announcement" | "submission" | "reducedMotion"> & {
+type MessageAuthorityStateInput = Omit<MessageAuthorityState, "composerEnabled" | "announcement" | "submission" | "mutation" | "reducedMotion"> & {
   readonly submission?: MessageSubmissionState;
+  readonly mutation?: MessageMutationState;
   readonly reducedMotion?: boolean;
   readonly announcement?: string;
 };
@@ -177,6 +190,10 @@ export type MessageAuthorityInput =
       readonly persistedAt: string;
       readonly targetOutcomes: readonly MessageTargetOutcome[];
     }
+  | { readonly type: "message.revision.accepted"; readonly requestId: string;
+      readonly messageId: string; readonly revision: number; readonly persistedAt: string }
+  | { readonly type: "message.recall.accepted"; readonly requestId: string;
+      readonly messageId: string; readonly revision: number; readonly recalledAt: string }
   | ({ readonly type: "message.error"; readonly requestId: string } & MessageClosedError)
   | { readonly type: "room.message.accepted"; readonly eventId: string; readonly message: TimelineMessage }
   | { readonly type: "room.message.revised"; readonly eventId: string; readonly messageId: string; readonly revision: number; readonly body: string; readonly revisedAt: string }
@@ -278,6 +295,7 @@ export function createMessageAuthorityState(input: MessageAuthorityStateInput): 
     actors: input.actors,
     draft: input.draft,
     submission: input.submission ?? { status: "idle" },
+    mutation: input.mutation ?? { status: "idle" },
     timeline: input.timeline,
     executions: input.executions,
     previews: input.previews,
@@ -334,6 +352,22 @@ export function beginMessageSubmission(
   });
 }
 
+export function beginMessageMutation(
+  state: MessageAuthorityState,
+  operation: Readonly<{ kind: "revise" | "recall"; requestId: string; messageId: string;
+    expectedRevision: number; body?: string }>,
+): MessageAuthorityState {
+  nonEmpty(operation.requestId, "requestId");
+  nonEmpty(operation.messageId, "messageId");
+  if (state.mutation.status === "pending") return state;
+  return withState(state, {
+    mutation: { status: "pending", ...operation },
+    announcement: operation.kind === "revise"
+      ? "正在提交修订 intent；正文已保留"
+      : "正在提交撤回 intent；等待 ACK 或 stable event",
+  });
+}
+
 function pendingPayload(state: MessageAuthorityState): MessageDraft | undefined {
   return state.submission.status === "idle" ? undefined : state.submission.payload;
 }
@@ -387,10 +421,16 @@ function applyError(
   state: MessageAuthorityState,
   input: Extract<MessageAuthorityInput, { type: "message.error" }>,
 ): MessageAuthorityState {
-  if (state.submission.status !== "submitting" || state.submission.requestId !== input.requestId) return state;
   const error = { ...input } as MessageClosedError & { readonly type?: never; readonly requestId?: never };
   Reflect.deleteProperty(error, "type");
   Reflect.deleteProperty(error, "requestId");
+  if (state.mutation.status === "pending" && state.mutation.requestId === input.requestId) {
+    return withState(state, {
+      mutation: { ...state.mutation, status: "failed", error },
+      announcement: `${state.mutation.kind === "revise" ? "修订" : "撤回"}失败；${input.status} ${input.code}；原 projection 与输入已保留`,
+    });
+  }
+  if (state.submission.status !== "submitting" || state.submission.requestId !== input.requestId) return state;
   const retryable = input.status === 429 || input.status === 503;
   return withState(state, {
     submission: {
@@ -400,6 +440,20 @@ function applyError(
       error,
     },
     announcement: `消息未提交；${input.status} ${input.code}；输入已保留`,
+  });
+}
+
+function applyMutationAck(
+  state: MessageAuthorityState,
+  input: Extract<MessageAuthorityInput,
+    { type: "message.revision.accepted" | "message.recall.accepted" }>,
+): MessageAuthorityState {
+  const mutation = state.mutation;
+  if (mutation.status !== "pending" || mutation.requestId !== input.requestId ||
+      mutation.messageId !== input.messageId) return state;
+  return withState(state, {
+    mutation: { ...mutation, status: "acknowledged" },
+    announcement: `${mutation.kind === "revise" ? "修订" : "撤回"} ACK 已持久化；等待 stable event，ACK 不会替换 projection`,
   });
 }
 
@@ -442,6 +496,9 @@ function applyRevisionEvent(
     timeline,
     appliedEventIds: addEvent(state, input.eventId),
     announcement: `消息已修订至 v${input.revision}`,
+    ...(state.mutation.status !== "idle" && state.mutation.messageId === input.messageId
+      ? { mutation: { status: "idle" as const } }
+      : {}),
   });
 }
 
@@ -455,6 +512,9 @@ function applyRecallEvent(
     timeline: upsertTimeline(state.timeline, input.tombstone),
     appliedEventIds: addEvent(state, input.eventId),
     announcement: "消息已撤回；时间线已收敛为 tombstone",
+    ...(state.mutation.status !== "idle" && state.mutation.messageId === input.tombstone.messageId
+      ? { mutation: { status: "idle" as const } }
+      : {}),
   });
 }
 
@@ -483,6 +543,8 @@ export function applyMessageAuthorityInput(
 ): MessageAuthorityState {
   switch (input.type) {
     case "message.accepted": return applyAcceptedAck(state, input);
+    case "message.revision.accepted": return applyMutationAck(state, input);
+    case "message.recall.accepted": return applyMutationAck(state, input);
     case "message.error": return applyError(state, input);
     case "room.message.accepted": return applyMessageEvent(state, input);
     case "room.message.revised": return applyRevisionEvent(state, input);
@@ -563,7 +625,8 @@ export function messageControls(
   message: TimelineMessage,
 ): { readonly canRevise: boolean; readonly canRecall: boolean } {
   const allowed = state.composerEnabled && message.kind === "human" &&
-    message.authorId === state.viewerActorId;
+    message.authorId === state.viewerActorId &&
+    (state.mutation.status === "idle" || state.mutation.status === "failed");
   return { canRevise: allowed, canRecall: allowed };
 }
 

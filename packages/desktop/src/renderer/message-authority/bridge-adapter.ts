@@ -22,6 +22,7 @@ import {
 } from "../../sync/message-authority-replica.js";
 import {
   applyMessageAuthorityInput,
+  beginMessageMutation,
   beginMessageSubmission,
   commitRepairGeneration,
   createMessageAuthorityState,
@@ -47,6 +48,13 @@ export interface MessageAuthorityBridgeSurfaceOptions {
 type RevisionTarget = Readonly<{ messageId: string; expectedRevision: number }>;
 type AwaitingReceipt = {
   readonly payload: MessageDraft;
+  readonly queued: MessageAuthorityBridgeInput[];
+};
+type AwaitingMutationReceipt = {
+  readonly kind: "revise" | "recall";
+  readonly messageId: string;
+  readonly expectedRevision: number;
+  readonly body?: string;
   readonly queued: MessageAuthorityBridgeInput[];
 };
 
@@ -160,6 +168,7 @@ export function mountMessageAuthorityBridgeSurface(
   let replica: MessageAuthorityReplica | undefined;
   let revisionTarget: RevisionTarget | undefined;
   let awaitingReceipt: AwaitingReceipt | undefined;
+  let awaitingMutationReceipt: AwaitingMutationReceipt | undefined;
   const beforeHistory: MessageAuthorityBridgeInput[] = [];
 
   const render = (): void => {
@@ -340,6 +349,11 @@ export function mountMessageAuthorityBridgeSurface(
         awaitingReceipt.queued.push(input);
         return;
       }
+      if (awaitingMutationReceipt !== undefined &&
+          input.event.payload.id === awaitingMutationReceipt.messageId) {
+        awaitingMutationReceipt.queued.push(input);
+        return;
+      }
       applyStableEvent(input);
       return;
     }
@@ -359,37 +373,56 @@ export function mountMessageAuthorityBridgeSurface(
       awaitingReceipt.queued.push(input);
       return;
     }
-    if (input.type === "message.accepted" || input.type === "message.error") {
+    if (awaitingMutationReceipt !== undefined &&
+        (input.type === "message.error" || input.type === "message.revision.accepted" ||
+          input.type === "message.recall.accepted")) {
+      awaitingMutationReceipt.queued.push(input);
+      return;
+    }
+    if (input.type === "message.accepted" || input.type === "message.error" ||
+        input.type === "message.revision.accepted" || input.type === "message.recall.accepted") {
       state = applyMessageAuthorityInput(state, input);
       render();
       return;
     }
-    state = replaceState(state, {
-      announcement: input.type === "message.revision.accepted"
-        ? `修订 ACK · v${input.revision} 已持久化，等待 stable event`
-        : "撤回 ACK · 已持久化，等待 stable event",
-    });
-    render();
   };
 
   const newDraft = (): MessageDraft => emptyDraft(roomId, options.createMessageId());
 
   const sendDraft = async (payload: MessageDraft, retry: boolean): Promise<void> => {
-    if (state === undefined || !state.composerEnabled || awaitingReceipt !== undefined) return;
+    if (state === undefined || !state.composerEnabled || awaitingReceipt !== undefined ||
+        awaitingMutationReceipt !== undefined || state.mutation.status === "pending" ||
+        state.mutation.status === "acknowledged") return;
     if (revisionTarget !== undefined) {
       const target = revisionTarget;
       state = replaceState(state, { draft: payload, announcement: "正在提交消息修订" });
       render();
+      const pending: AwaitingMutationReceipt = {
+        kind: "revise", messageId: target.messageId,
+        expectedRevision: target.expectedRevision, body: payload.body, queued: [],
+      };
+      awaitingMutationReceipt = pending;
       try {
-        await bridge.revise({
+        const receipt = await bridge.revise({
           type: "message.revise",
           roomId,
           messageId: target.messageId,
           expectedRevision: target.expectedRevision,
           body: payload.body,
         });
+        state = beginMessageMutation(state, {
+          kind: pending.kind,
+          messageId: pending.messageId,
+          expectedRevision: pending.expectedRevision,
+          body: pending.body!,
+          requestId: receipt.requestId,
+        });
         revisionTarget = undefined;
+        awaitingMutationReceipt = undefined;
+        render();
+        for (const queued of pending.queued) applyInput(queued);
       } catch {
+        awaitingMutationReceipt = undefined;
         state = replaceState(state, { announcement: "修订命令未进入闭合 bridge；正文已保留" });
       }
       render();
@@ -446,7 +479,8 @@ export function mountMessageAuthorityBridgeSurface(
       render();
     },
     onRevise(messageId) {
-      if (state === undefined || !state.composerEnabled) return;
+      if (state === undefined || !state.composerEnabled || awaitingMutationReceipt !== undefined ||
+          state.mutation.status === "pending" || state.mutation.status === "acknowledged") return;
       const message = state.timeline.find((candidate) =>
         candidate.messageId === messageId && candidate.kind === "human");
       if (message?.kind !== "human") return;
@@ -478,17 +512,35 @@ export function mountMessageAuthorityBridgeSurface(
       });
     },
     onRecall(messageId) {
-      if (state === undefined || !state.composerEnabled) return;
+      if (state === undefined || !state.composerEnabled || awaitingMutationReceipt !== undefined ||
+          state.mutation.status === "pending" || state.mutation.status === "acknowledged") return;
       const message = state.timeline.find((candidate) => candidate.messageId === messageId);
       if (message?.kind !== "human") return;
-      void bridge.recall({
-        type: "message.recall",
-        roomId,
-        messageId,
-        expectedRevision: message.revision,
+      const pending: AwaitingMutationReceipt = {
+        kind: "recall", messageId, expectedRevision: message.revision, queued: [],
+      };
+      awaitingMutationReceipt = pending;
+      void bridge.recall({ type: "message.recall", roomId, messageId,
+        expectedRevision: message.revision }).then((receipt) => {
+        if (disposed || state === undefined || awaitingMutationReceipt !== pending) return;
+        state = beginMessageMutation(state, {
+          kind: pending.kind,
+          messageId: pending.messageId,
+          expectedRevision: pending.expectedRevision,
+          requestId: receipt.requestId,
+        });
+        awaitingMutationReceipt = undefined;
+        render();
+        for (const queued of pending.queued) applyInput(queued);
+      }).catch(() => {
+        if (state === undefined || awaitingMutationReceipt !== pending) return;
+        awaitingMutationReceipt = undefined;
+        state = replaceState(state, { announcement: "撤回命令未进入闭合 bridge；旧正文已保留" });
+        render();
       });
     },
     onRetryRepair: () => { void loadHistory(); },
+    onReconnect: () => { void loadHistory(); },
     onReauthenticate: () => { void loadHistory(); },
     onRefreshProjection: () => { void loadHistory(); },
     onDismissReply() {
@@ -506,6 +558,7 @@ export function mountMessageAuthorityBridgeSurface(
   };
 
   const acceptHistory = (history: MessageAuthorityReadyHistory): void => {
+    const previous = state;
     replica = createMessageAuthorityReplica(roomId, {
       generation: history.generation,
       checkpoint: history.watermark,
@@ -517,7 +570,11 @@ export function mountMessageAuthorityBridgeSurface(
       lifecycle: history.lifecycle,
       connection: history.connection,
       actors: history.actors,
-      draft: newDraft(),
+      draft: previous?.draft ?? newDraft(),
+      ...(previous === undefined ? {} : {
+        submission: previous.submission,
+        mutation: previous.mutation,
+      }),
       timeline: history.messages.map(mapTimelineMessage),
       executions: [],
       previews: [],
@@ -530,12 +587,30 @@ export function mountMessageAuthorityBridgeSurface(
 
   const loadHistory = async (): Promise<void> => {
     if (disposed) return;
-    renderLoading(root);
+    const priorState = state;
+    if (state === undefined) {
+      renderLoading(root);
+    } else {
+      const watermark = replica?.afterSeq ?? 0;
+      state = replaceState(state, {
+        connection: { status: "repairing", watermark },
+        announcement: `正在重新连接并恢复；旧完整 projection 保持可见，staging 不可见`,
+      });
+      render();
+    }
     try {
       const history = await bridge.historyV2({ type: "room.history.v2", roomId });
       if (disposed) return;
       if (history.status === "ready") {
         acceptHistory(history);
+      } else if (priorState !== undefined && history.connection.status !== "revoked") {
+        state = state === undefined ? priorState : state;
+        state = state.connection.status === "repairing"
+          ? failRepairGeneration(state, history.connection.errorCode)
+          : replaceState(state, {
+            connection: { status: "repair-failed", errorCode: history.connection.errorCode },
+            announcement: "恢复失败；继续使用旧完整 projection",
+          });
       } else {
         replica = createMessageAuthorityReplica(roomId);
         if (history.connection.status === "revoked") replica = revokeMessageAuthorityRoom(replica);
@@ -560,6 +635,16 @@ export function mountMessageAuthorityBridgeSurface(
       for (const input of queued) applyInput(input);
     } catch {
       if (disposed) return;
+      if (priorState !== undefined && state !== undefined) {
+        state = state.connection.status === "repairing"
+          ? failRepairGeneration(state, "history_unavailable")
+          : replaceState(state, {
+            connection: { status: "repair-failed", errorCode: "history_unavailable" },
+            announcement: "恢复失败；继续使用旧完整 projection",
+          });
+        render();
+        return;
+      }
       replica = revokeMessageAuthorityRoom(createMessageAuthorityReplica(roomId));
       state = createMessageAuthorityState({
         roomId,

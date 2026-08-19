@@ -38,11 +38,13 @@ interface RoomRuntimeState {
   initialized: boolean;
   collecting: boolean;
   desynchronized: boolean;
+  repairing: boolean;
   initialEvents: PersistedRoomEvent[];
 }
 
 export interface DesktopMessageAuthorityRuntime {
   readonly client: MessageAuthorityClientPort;
+  clearAndRestore(roomId: string): void;
   invalidateAuthorizedState(): void;
   close(): void;
 }
@@ -199,6 +201,7 @@ export function createDesktopMessageAuthorityRuntime(options: {
     initialized: false,
     collecting: false,
     desynchronized: false,
+    repairing: false,
     initialEvents: [],
     subscription: undefined,
     initialize: undefined,
@@ -214,17 +217,31 @@ export function createDesktopMessageAuthorityRuntime(options: {
     existing?.subscription?.close();
     const state = freshRoomState(roomId, existing);
     rooms.set(roomId, state);
+    state.collecting = true;
+    state.initialEvents = [];
+    const observer = {
+      events: async (events: readonly PersistedRoomEvent[]) => observeRoomEvents(state, events),
+      async retry() {
+        state.desynchronized = true;
+        connection(roomId, { status: "repair-failed", errorCode: "subscription_gate_overflow" });
+      },
+    };
     const initialize = transport.subscribeRoom(
       roomId,
       { version: 1, roomId, afterSeq: 0 },
-      {
-        events: async (events) => observeRoomEvents(state, events),
-        async retry() {
-          state.desynchronized = true;
-          connection(roomId, { status: "repair-failed", errorCode: "subscription_gate_overflow" });
-        },
-      },
-    ).then((subscription) => {
+      observer,
+    ).catch(async (error: unknown) => {
+      if (!(error instanceof MessageAuthorityTransportError) ||
+          error.code !== "repair_required" || error.repair === undefined) throw error;
+      state.repairing = true;
+      state.watermark = error.repair.watermark;
+      connection(roomId, { status: "repairing", watermark: error.repair.watermark });
+      return transport.subscribeRoom(
+        roomId,
+        { version: 1, roomId, afterSeq: error.repair.watermark },
+        observer,
+      );
+    }).then((subscription) => {
       if (rooms.get(roomId) !== state) {
         subscription.close();
         return;
@@ -232,7 +249,17 @@ export function createDesktopMessageAuthorityRuntime(options: {
       state.subscription = subscription;
       state.watermark = subscription.cursor.afterSeq;
     }).catch((error: unknown) => {
-      if (rooms.get(roomId) === state) rooms.delete(roomId);
+      if (rooms.get(roomId) === state) {
+        if (state.repairing) {
+          state.desynchronized = true;
+          connection(roomId, {
+            status: "repair-failed",
+            errorCode: "subscription_restore_failed",
+          });
+        } else {
+          rooms.delete(roomId);
+        }
+      }
       throw error;
     });
     state.initialize = initialize;
@@ -311,8 +338,6 @@ export function createDesktopMessageAuthorityRuntime(options: {
       }
       try {
         const state = await ensureRoom(command.roomId);
-        state.collecting = true;
-        state.initialEvents = [];
         const history = await readCompleteHistory(transport, command);
         let messages = history.messages;
         state.lifecycle = history.lifecycle;
@@ -339,6 +364,18 @@ export function createDesktopMessageAuthorityRuntime(options: {
           watermark: state.watermark,
         };
       } catch (error: unknown) {
+        const current = rooms.get(command.roomId);
+        if (current !== undefined) {
+          current.collecting = false;
+          current.initialEvents = [];
+          if (current.repairing) {
+            current.desynchronized = true;
+            connection(command.roomId, {
+              status: "repair-failed",
+              errorCode: "history_restore_failed",
+            });
+          }
+        }
         throw authorityFailure(error);
       }
     },
@@ -414,6 +451,16 @@ export function createDesktopMessageAuthorityRuntime(options: {
 
   return Object.freeze({
     client,
+    clearAndRestore(roomId: string) {
+      const state = rooms.get(roomId);
+      if (state === undefined) return;
+      state.subscription?.close();
+      state.subscription = undefined;
+      state.initialized = false;
+      state.desynchronized = true;
+      state.collecting = false;
+      state.initialEvents = [];
+    },
     invalidateAuthorizedState() {
       revokeAll("session");
       transport.resetSession();
