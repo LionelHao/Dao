@@ -11,6 +11,7 @@ import { WebSocket } from "ws";
 import {
   createIdentitySessionController,
   type AuthorizedStateInvalidator,
+  type IdentityAuthoritySession,
   type IdentitySessionController,
 } from "../../desktop/src/identity/controller.js";
 import {
@@ -40,6 +41,12 @@ import {
   type SyncTransport,
 } from "../../desktop/src/sync/client-sync-replica.js";
 import { createDesktopGovernanceRuntime } from "../../desktop/src/governance/production-runtime.js";
+import {
+  createDesktopMessageAuthorityRuntime,
+  type DesktopMessageAuthorityRuntime,
+} from "../../desktop/src/message-authority/production-runtime.js";
+import type { MessageAuthorityPortInput } from
+  "../../desktop/src/message-authority/contracts.js";
 import {
   type GovernanceWebSocketLike,
 } from "../../desktop/src/governance/websocket-authority.js";
@@ -147,6 +154,10 @@ class NodeIdentityWebSocketAdapter implements IdentityWebSocketLike {
 
   close(code?: number, reason?: string): void {
     this.#socket.close(code, reason);
+  }
+
+  terminate(): void {
+    this.#socket.terminate();
   }
 }
 
@@ -752,7 +763,7 @@ async function loginAuthorityDevice(
     readonly secret: string;
     readonly deviceId: string;
   },
-): Promise<string> {
+): Promise<IdentityAuthoritySession> {
   const frame = await client.request({
     type: "auth.login",
     requestId: input.requestId,
@@ -765,7 +776,12 @@ async function loginAuthorityDevice(
     },
   }, "auth.authenticated");
   if (frame.type !== "auth.authenticated") throw new TypeError("wrong device login frame");
-  return frame.accessToken;
+  return {
+    actorId: frame.actorId,
+    sessionId: frame.sessionId,
+    accessToken: frame.accessToken,
+    expiresAt: frame.expiresAt,
+  };
 }
 
 function recordKey(record: RoomRepairRecord): string {
@@ -1809,6 +1825,203 @@ describe("authoritative server real-process harness", () => {
       client?.close();
       if (first !== undefined) await stopChild(first.child).catch(() => undefined);
       if (second !== undefined) await stopChild(second.child).catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("restores three production Desktop message runtimes from an expired cursor through revise, recall, clear, and restart", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-ft03-desktop-repair-"));
+    const runtimes: DesktopMessageAuthorityRuntime[] = [];
+    const rawClients: JsonWebSocketClient[] = [];
+    let started: Awaited<ReturnType<typeof spawnAuthorityChild>> | undefined;
+    try {
+      const roomId = await seedDirectory(directory);
+      const seededHead = readRoomHeadSeq(directory, roomId);
+      expect(seededHead).toBeGreaterThan(1);
+      await compactRoomStream(directory, roomId, seededHead);
+
+      started = await spawnAuthorityChild({ directory });
+      const sessions: IdentityAuthoritySession[] = [];
+      for (const deviceId of ["desktop-message-a", "desktop-message-b", "desktop-message-c"]) {
+        const loginClient = await JsonWebSocketClient.connect(started.url);
+        rawClients.push(loginClient);
+        sessions.push(await loginAuthorityDevice(loginClient, {
+          requestId: `${deviceId}-login`,
+          accountId: "account-a",
+          secret: "test-secret",
+          deviceId,
+        }));
+        loginClient.close();
+      }
+
+      const socketGroups = sessions.map(() => [] as NodeIdentityWebSocketAdapter[]);
+      const inputs = sessions.map(() => [] as MessageAuthorityPortInput[]);
+      const active = sessions.map((session, index) => {
+        const runtime = createDesktopMessageAuthorityRuntime({
+          endpoint: started!.url,
+          session: () => session,
+          webSocketFactory(endpoint) {
+            const socket = new NodeIdentityWebSocketAdapter(endpoint);
+            socketGroups[index]!.push(socket);
+            return socket;
+          },
+          timeoutMs: 5_000,
+        });
+        runtimes.push(runtime);
+        runtime.client.subscribe((input) => inputs[index]!.push(structuredClone(input)));
+        return runtime;
+      });
+      const initial = await Promise.all(active.map((runtime, index) =>
+        runtime.client.historyV2({
+          type: "room.history.v2",
+          requestId: `desktop-message-initial-${index}`,
+          roomId,
+        })));
+      expect(initial.every((history) => history.status === "ready")).toBe(true);
+      const initialWatermarks = initial.map((history) =>
+        history.status === "ready" ? history.watermark : -1);
+      expect(new Set(initialWatermarks).size).toBe(1);
+      const initialWatermark = initialWatermarks[0]!;
+      expect(initialWatermark).toBeGreaterThanOrEqual(seededHead);
+      for (const received of inputs) {
+        expect(received).toContainEqual({
+          type: "message.connection",
+          roomId,
+          connection: { status: "repairing", watermark: initialWatermark },
+        });
+      }
+
+      const acceptedBody = "DESKTOP-V2-ACCEPTED-RAW-SENTINEL";
+      const revisedBody = "DESKTOP-V2-REVISED-RAW-SENTINEL";
+      const messageId = "message-v2-desktop-repair";
+      await expect(active[0]!.client.sendV2({
+        type: "message.send.v2",
+        requestId: "desktop-message-send",
+        message: {
+          messageId,
+          roomId,
+          body: acceptedBody,
+          mentionedTargets: [],
+          attachments: [],
+        },
+      })).resolves.toMatchObject({
+        type: "message.accepted",
+        requestId: "desktop-message-send",
+        messageId,
+      });
+      await vi.waitFor(() => {
+        expect(inputs.every((received) => received.some((input) =>
+          input.type === "room.event" && input.event.type === "room.message.accepted" &&
+          input.event.payload.id === messageId))).toBe(true);
+      }, { timeout: 5_000 });
+
+      socketGroups[2]!.at(-1)!.terminate();
+      await vi.waitFor(() => {
+        expect(inputs[2]).toContainEqual({
+          type: "message.connection",
+          roomId,
+          connection: expect.objectContaining({ status: "offline" }),
+        });
+      }, { timeout: 5_000 });
+      await expect(active[0]!.client.revise({
+        type: "message.revise",
+        requestId: "desktop-message-revise",
+        roomId,
+        messageId,
+        expectedRevision: 1,
+        body: revisedBody,
+      })).resolves.toMatchObject({
+        type: "message.revision.accepted",
+        requestId: "desktop-message-revise",
+        messageId,
+        revision: 2,
+      });
+      await vi.waitFor(() => {
+        expect(inputs.slice(0, 2).every((received) => received.some((input) =>
+          input.type === "room.event" && input.event.type === "room.message.revised" &&
+          input.event.payload.id === messageId))).toBe(true);
+      }, { timeout: 5_000 });
+
+      const reconnected = await active[2]!.client.historyV2({
+        type: "room.history.v2",
+        requestId: "desktop-message-reconnect-c",
+        roomId,
+      });
+      if (reconnected.status !== "ready") throw new TypeError("Desktop C did not reconnect");
+      expect(reconnected.messages).toContainEqual(expect.objectContaining({
+        id: messageId,
+        lifecycle: "active",
+        currentRevision: expect.objectContaining({ revision: 2, body: revisedBody }),
+      }));
+
+      active[1]!.clearAndRestore(roomId);
+      const cleared = await active[1]!.client.historyV2({
+        type: "room.history.v2",
+        requestId: "desktop-message-clear-b",
+        roomId,
+      });
+      if (cleared.status !== "ready") throw new TypeError("Desktop B did not clear and restore");
+      expect(cleared.generation).toBeGreaterThan(
+        initial[1]!.status === "ready" ? initial[1].generation : 0,
+      );
+      expect(cleared.messages).toContainEqual(expect.objectContaining({
+        id: messageId,
+        currentRevision: expect.objectContaining({ revision: 2, body: revisedBody }),
+      }));
+
+      for (const received of inputs) received.length = 0;
+      await expect(active[0]!.client.recall({
+        type: "message.recall",
+        requestId: "desktop-message-recall",
+        roomId,
+        messageId,
+        expectedRevision: 2,
+      })).resolves.toMatchObject({
+        type: "message.recall.accepted",
+        requestId: "desktop-message-recall",
+        messageId,
+        revision: 2,
+      });
+      await vi.waitFor(() => {
+        expect(inputs.every((received) => received.some((input) =>
+          input.type === "room.event" && input.event.type === "room.message.recalled" &&
+          input.event.payload.id === messageId))).toBe(true);
+      }, { timeout: 5_000 });
+      expect(JSON.stringify(inputs)).not.toContain(acceptedBody);
+      expect(JSON.stringify(inputs)).not.toContain(revisedBody);
+
+      for (const runtime of active) runtime.close();
+      await stopChild(started.child);
+      started = await spawnAuthorityChild({ directory });
+      const restarted = sessions.map((session) => {
+        const runtime = createDesktopMessageAuthorityRuntime({
+          endpoint: started!.url,
+          session: () => session,
+          webSocketFactory: (endpoint) => new NodeIdentityWebSocketAdapter(endpoint),
+          timeoutMs: 5_000,
+        });
+        runtimes.push(runtime);
+        return runtime;
+      });
+      const finalHistories = await Promise.all(restarted.map((runtime, index) =>
+        runtime.client.historyV2({
+          type: "room.history.v2",
+          requestId: `desktop-message-restart-${index}`,
+          roomId,
+        })));
+      for (const history of finalHistories) {
+        if (history.status !== "ready") throw new TypeError("Desktop restart was not ready");
+        expect(history.messages).toContainEqual(expect.objectContaining({
+          id: messageId,
+          lifecycle: "recalled",
+        }));
+      }
+      expect(JSON.stringify(finalHistories)).not.toContain(acceptedBody);
+      expect(JSON.stringify(finalHistories)).not.toContain(revisedBody);
+    } finally {
+      for (const runtime of runtimes) runtime.close();
+      for (const client of rawClients) client.close();
+      if (started !== undefined) await stopChild(started.child);
       await rm(directory, { recursive: true, force: true });
     }
   }, 30_000);
