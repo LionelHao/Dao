@@ -4,6 +4,7 @@ import {
   mintInternalAgentCommandContext,
   parsePersistedIdentityEvent,
   parsePersistedRoomEvent,
+  parseClosedRoomGovernanceMutationCommand,
   parsePersistentCommand,
   toAgentWorkerCommandContext,
 } from "./contracts.js";
@@ -578,5 +579,67 @@ describe("closed authority contracts", () => {
         actor: { id: "human-other", kind: "human", displayName: "Other", reachability: "online" },
       },
     })).toEqual({ ok: false, code: "invalid_event" });
+  });
+});
+
+describe("closed FT-02B/FT-02C governance transport contracts", () => {
+  const commands = [
+    {
+      type: "room.member.leave", roomId: "room-1",
+      payload: { expectedGovernanceRevision: 4 },
+    },
+    {
+      type: "room.member.remove", roomId: "room-1",
+      payload: { targetActorId: "human-2", expectedGovernanceRevision: 4 },
+    },
+    {
+      type: "room.archive", roomId: "room-1",
+      payload: { expectedGovernanceRevision: 4 },
+    },
+    {
+      type: "room.reopen", roomId: "room-1",
+      payload: { expectedGovernanceRevision: 5 },
+    },
+  ] as const;
+
+  it.each(commands)("accepts canonical $type CAS payloads", (command) => {
+    expect(parseClosedRoomGovernanceMutationCommand(command)).toEqual({
+      ok: true,
+      value: command,
+    });
+  });
+
+  it.each([
+    ["legacy remove", {
+      type: "member.remove", roomId: "room-1", payload: { targetActorId: "human-2" },
+    }],
+    ["empty archive payload", { type: "room.archive", roomId: "room-1", payload: {} }],
+    ["missing CAS", {
+      type: "room.member.leave", roomId: "room-1", payload: {},
+    }],
+    ["negative CAS", {
+      type: "room.reopen", roomId: "room-1", payload: { expectedGovernanceRevision: -1 },
+    }],
+    ["wrong target", {
+      type: "room.member.remove", roomId: "room-1",
+      payload: { targetActorId: 7, expectedGovernanceRevision: 4 },
+    }],
+    ["oversized room", {
+      type: "room.archive", roomId: "r".repeat(257),
+      payload: { expectedGovernanceRevision: 4 },
+    }],
+    ...["actorId", "role", "principal", "sessionFamilyId", "grant", "capability"].map(
+      (field) => [`${field} injection`, {
+        type: "room.member.remove", roomId: "room-1",
+        payload: {
+          targetActorId: "human-2", expectedGovernanceRevision: 4, [field]: "forged",
+        },
+      }] as const,
+    ),
+  ])("rejects %s", (_name, command) => {
+    expect(parseClosedRoomGovernanceMutationCommand(command)).toEqual({
+      ok: false,
+      code: "invalid_command",
+    });
   });
 });

@@ -710,4 +710,86 @@ describe("closed v2 recovery protocol", () => {
       expect(parse(frame)).toMatchObject({ ok: false, error: { code: "invalid_request" } });
     }
   });
+
+  it("accepts the closed FT-02B departure query and FT-02B/FT-02C CAS frames", () => {
+    expect(parse({
+      type: "room.departure.conflicts",
+      requestId: "departure-preflight",
+      roomId: "room-1",
+      targetActorId: "human-2",
+    })).toEqual({
+      ok: true,
+      frame: {
+        type: "room.departure.conflicts",
+        requestId: "departure-preflight",
+        roomId: "room-1",
+        targetActorId: "human-2",
+      },
+    });
+
+    for (const frame of [
+      {
+        type: "room.member.leave", requestId: "leave", roomId: "room-1",
+        expectedGovernanceRevision: 4, idempotencyKey: "leave-key",
+      },
+      {
+        type: "room.member.remove", requestId: "remove", roomId: "room-1",
+        targetActorId: "human-2", expectedGovernanceRevision: 4,
+        idempotencyKey: "remove-key",
+      },
+      {
+        type: "room.archive", requestId: "archive", roomId: "room-1",
+        expectedGovernanceRevision: 4, idempotencyKey: "archive-key",
+      },
+      {
+        type: "room.reopen", requestId: "reopen", roomId: "room-1",
+        expectedGovernanceRevision: 5, idempotencyKey: "reopen-key",
+      },
+    ]) {
+      expect(parse(frame)).toEqual({ ok: true, frame });
+    }
+  });
+
+  it.each([
+    ["missing target", {
+      type: "room.departure.conflicts", requestId: "missing-target", roomId: "room-1",
+    }],
+    ["wrong target", {
+      type: "room.departure.conflicts", requestId: "wrong-target", roomId: "room-1",
+      targetActorId: 42,
+    }],
+    ["oversized target", {
+      type: "room.departure.conflicts", requestId: "large-target", roomId: "room-1",
+      targetActorId: "t".repeat(PROTOCOL_FIELD_LIMITS.accountId + 1),
+    }],
+    ["missing CAS", {
+      type: "room.archive", requestId: "missing-cas", roomId: "room-1",
+      idempotencyKey: "archive-key",
+    }],
+    ["wrong CAS", {
+      type: "room.reopen", requestId: "wrong-cas", roomId: "room-1",
+      expectedGovernanceRevision: "4", idempotencyKey: "reopen-key",
+    }],
+    ["negative CAS", {
+      type: "room.member.leave", requestId: "negative-cas", roomId: "room-1",
+      expectedGovernanceRevision: -1, idempotencyKey: "leave-key",
+    }],
+    ["oversized key", {
+      type: "room.member.remove", requestId: "large-key", roomId: "room-1",
+      targetActorId: "human-2", expectedGovernanceRevision: 4,
+      idempotencyKey: "k".repeat(PROTOCOL_FIELD_LIMITS.requestId + 1),
+    }],
+    ...["actorId", "role", "principal", "sessionFamilyId", "grant", "capability"].map(
+      (field) => [`${field} injection`, {
+        type: "room.member.remove", requestId: `injected-${field}`, roomId: "room-1",
+        targetActorId: "human-2", expectedGovernanceRevision: 4,
+        idempotencyKey: `key-${field}`, [field]: "forged",
+      }] as const,
+    ),
+  ])("rejects FT-02 governance %s", (_name, frame) => {
+    expect(parse(frame)).toMatchObject({
+      ok: false,
+      error: { type: "error", status: 400, code: "invalid_request" },
+    });
+  });
 });

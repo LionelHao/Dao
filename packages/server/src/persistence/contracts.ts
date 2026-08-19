@@ -21,6 +21,7 @@ import type {
   AgentJudgementOutcome,
   AgentParticipation,
   Actor,
+  DepartureConflictList,
   ManagedRoom,
   Message,
   MessageDraft,
@@ -579,6 +580,21 @@ export type RoomGovernanceCommand =
       readonly payload: { readonly targetActorId: string };
     };
 
+export type ClosedRoomGovernanceMutationCommand =
+  | {
+      readonly type: "room.member.leave" | "room.archive" | "room.reopen";
+      readonly roomId: string;
+      readonly payload: { readonly expectedGovernanceRevision: number };
+    }
+  | {
+      readonly type: "room.member.remove";
+      readonly roomId: string;
+      readonly payload: {
+        readonly targetActorId: string;
+        readonly expectedGovernanceRevision: number;
+      };
+    };
+
 export type PersistentCommand = CollaborationCommand | RoomGovernanceCommand;
 
 export type JsonValue =
@@ -594,6 +610,23 @@ export interface CommandAcknowledgement {
   readonly eventIds: readonly string[];
   readonly acceptedAt: string;
   readonly result: JsonValue;
+}
+
+export interface ClosedRoomGovernanceAcknowledgement {
+  readonly governance: RoomGovernanceView;
+  readonly eventIds: readonly string[];
+  readonly replayed: boolean;
+}
+
+export interface ClosedRoomGovernanceTransportStore {
+  readDepartureConflicts(
+    context: AuthenticatedSessionContext,
+    input: { readonly roomId: string; readonly targetActorId: string },
+  ): Promise<DepartureConflictList>;
+  executeHumanGovernance(
+    context: AuthenticatedCommandContext,
+    command: ClosedRoomGovernanceMutationCommand,
+  ): Promise<ClosedRoomGovernanceAcknowledgement>;
 }
 
 interface OutboxDeliveryBase {
@@ -701,6 +734,10 @@ function text(value: unknown): value is string {
 
 function count(value: unknown, minimum = 0): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= minimum;
+}
+
+function boundedText(value: unknown, maximumBytes: number): value is string {
+  return text(value) && Buffer.byteLength(value, "utf8") <= maximumBytes;
 }
 
 function stringList(value: unknown): value is readonly string[] {
@@ -871,6 +908,41 @@ export function parsePersistentCommand(
   return isRecord(value) && (isCollaborationCommand(value) || isGovernanceCommand(value))
     ? { ok: true, value: value as PersistentCommand }
     : { ok: false, code: "invalid_command" };
+}
+
+const GOVERNANCE_IDENTIFIER_MAX_BYTES = 256;
+
+export function parseClosedRoomGovernanceMutationCommand(
+  value: unknown,
+): ContractParseResult<ClosedRoomGovernanceMutationCommand, "invalid_command"> {
+  if (
+    !isRecord(value) ||
+    !exact(value, ["type", "roomId", "payload"]) ||
+    !boundedText(value.roomId, GOVERNANCE_IDENTIFIER_MAX_BYTES) ||
+    !isRecord(value.payload)
+  ) {
+    return { ok: false, code: "invalid_command" };
+  }
+  const payload = value.payload;
+  const validCas = count(payload.expectedGovernanceRevision);
+  if (
+    (value.type === "room.member.leave" ||
+      value.type === "room.archive" ||
+      value.type === "room.reopen") &&
+    exact(payload, ["expectedGovernanceRevision"]) &&
+    validCas
+  ) {
+    return { ok: true, value: value as ClosedRoomGovernanceMutationCommand };
+  }
+  if (
+    value.type === "room.member.remove" &&
+    exact(payload, ["targetActorId", "expectedGovernanceRevision"]) &&
+    boundedText(payload.targetActorId, GOVERNANCE_IDENTIFIER_MAX_BYTES) &&
+    validCas
+  ) {
+    return { ok: true, value: value as ClosedRoomGovernanceMutationCommand };
+  }
+  return { ok: false, code: "invalid_command" };
 }
 
 function roomEventEnvelope(value: UnknownRecord): value is UnknownRecord {

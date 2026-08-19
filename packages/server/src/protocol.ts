@@ -19,6 +19,7 @@ import {
   type AgentInvocationIntent,
   type LightTask,
   type BallInCourt,
+  type DepartureConflictList,
   type NeedsActionProjection,
   type ReminderCandidate,
   type OpenItem,
@@ -48,6 +49,9 @@ const AUTH_SESSIONS_LIST_FIELDS = new Set(["type", "requestId"]);
 const AUTH_SESSION_REVOKE_FIELDS = new Set(["type", "requestId", "sessionId"]);
 const MESSAGE_SEND_FIELDS = new Set(["type", "requestId", "message"]);
 const ROOM_FIELDS = new Set(["type", "requestId", "roomId"]);
+const ROOM_DEPARTURE_CONFLICTS_FIELDS = new Set([
+  "type", "requestId", "roomId", "targetActorId",
+]);
 const ROOM_GOVERNANCE_MUTATION_FIELDS = new Set([
   "type", "requestId", "roomId", "expectedGovernanceRevision", "idempotencyKey",
 ]);
@@ -172,6 +176,13 @@ export interface RoomGovernanceGetFrame {
   readonly type: "room.governance.get";
   readonly requestId: string;
   readonly roomId: string;
+}
+
+export interface RoomDepartureConflictsFrame {
+  readonly type: "room.departure.conflicts";
+  readonly requestId: string;
+  readonly roomId: string;
+  readonly targetActorId: string;
 }
 
 export type RoomGovernanceMutationFrame =
@@ -343,6 +354,7 @@ export type ClientFrame =
   | BallQueryFrame
   | RoomSubscribeFrame
   | RoomGovernanceGetFrame
+  | RoomDepartureConflictsFrame
   | RoomGovernanceMutationFrame
   | WorkspaceBootstrapRequestFrame
   | WorkspaceBootstrapPageRequestFrame
@@ -431,13 +443,28 @@ export interface RoomGovernanceFrame {
   readonly governance: RoomGovernanceView;
 }
 
-export interface RoomGovernanceAckFrame {
-  readonly type: "room.governance.ack";
+export interface RoomDepartureConflictsResultFrame {
+  readonly type: "room.departure.conflicts.result";
   readonly requestId: string;
-  readonly operation: RoomGovernanceMutationFrame["type"];
-  readonly governance?: RoomGovernanceView;
-  readonly eventIds: readonly string[];
+  readonly conflicts: DepartureConflictList;
 }
+
+export type RoomGovernanceAckFrame =
+  | {
+      readonly type: "room.governance.ack";
+      readonly requestId: string;
+      readonly operation: "room.ownership.transfer" | "room.member.role.set";
+      readonly governance: RoomGovernanceView;
+      readonly eventIds: readonly string[];
+    }
+  | {
+      readonly type: "room.governance.ack";
+      readonly requestId: string;
+      readonly operation: "room.member.leave" | "room.member.remove" | "room.archive" | "room.reopen";
+      readonly governance: RoomGovernanceView;
+      readonly eventIds: readonly string[];
+      readonly replayed: boolean;
+    };
 
 export interface RoomSubscribedV2Frame {
   readonly type: "room.subscribed.v2";
@@ -518,6 +545,11 @@ export type ProtocolErrorCode =
   | "role_forbidden"
   | "room_revision_conflict"
   | "ownership_transfer_required"
+  | "member_not_found"
+  | "idempotency_conflict"
+  | "departure_blocked"
+  | "confirmation_rejected"
+  | "grant_revoked"
   | "dependency_unavailable"
   | "agent_configuration_missing"
   | "agent_queue_full"
@@ -539,13 +571,23 @@ export type ProtocolErrorCode =
   | "tool_target_busy"
   | "internal_error";
 
-export interface ProtocolErrorFrame {
-  readonly type: "error";
-  readonly status: 400 | 401 | 403 | 404 | 409 | 410 | 429 | 500 | 503;
-  readonly code: ProtocolErrorCode;
-  readonly message: string;
-  readonly requestId?: string;
-}
+export type ProtocolErrorFrame =
+  | {
+      readonly type: "error";
+      readonly status: 400 | 401 | 403 | 404 | 409 | 410 | 429 | 500 | 503;
+      readonly code: Exclude<ProtocolErrorCode, "departure_blocked">;
+      readonly message: string;
+      readonly requestId?: string;
+      readonly details?: never;
+    }
+  | {
+      readonly type: "error";
+      readonly status: 409;
+      readonly code: "departure_blocked";
+      readonly message: string;
+      readonly requestId: string;
+      readonly details: DepartureConflictList;
+    };
 
 export type ServerFrame =
   | AuthenticatedFrame
@@ -560,6 +602,7 @@ export type ServerFrame =
   | RoomHistoryFrame
   | RoomSubscribedFrame
   | RoomGovernanceFrame
+  | RoomDepartureConflictsResultFrame
   | RoomGovernanceAckFrame
   | WorkspaceBootstrapPage
   | RoomSyncResult
@@ -656,7 +699,7 @@ function protocolError(
   message: string,
   requestId?: string,
   status: ProtocolErrorFrame["status"] = 400,
-  code: ProtocolErrorFrame["code"] = "invalid_request",
+  code: Exclude<ProtocolErrorFrame["code"], "departure_blocked"> = "invalid_request",
 ): ProtocolErrorFrame {
   if (requestId === undefined) {
     return { type: "error", status, code, message };
@@ -868,6 +911,30 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
           type: value.type,
           requestId,
           roomId: value.roomId,
+        },
+      };
+    case "room.departure.conflicts":
+      if (
+        !hasOnlyFields(value, ROOM_DEPARTURE_CONFLICTS_FIELDS) ||
+        requestId === undefined ||
+        !isBoundedString(value.roomId, PROTOCOL_FIELD_LIMITS.roomId) ||
+        !isBoundedString(value.targetActorId, PROTOCOL_FIELD_LIMITS.accountId)
+      ) {
+        return {
+          ok: false,
+          error: protocolError(
+            "room.departure.conflicts requires string requestId, roomId, and targetActorId",
+            requestId,
+          ),
+        };
+      }
+      return {
+        ok: true,
+        frame: {
+          type: "room.departure.conflicts",
+          requestId,
+          roomId: value.roomId,
+          targetActorId: value.targetActorId,
         },
       };
     case "room.ownership.transfer":

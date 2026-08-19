@@ -10,10 +10,12 @@ import { AuthorityWorkerClientError } from "./persistence/worker-database-client
 import {
   isMessage,
   type Actor,
+  type DepartureConflictList,
   type Message,
   type MessageDraft,
   type PersistedIdentityEvent,
   type PersistedRoomEvent,
+  type RoomGovernanceView,
 } from "@native-im/core";
 import {
   createAuthenticationService,
@@ -5070,6 +5072,442 @@ describe("authenticated message WebSocket service", () => {
       await client.close();
       await server.close();
       await rm(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+const governancePrincipal = {
+  accountId: "account-human-1",
+  actorId: "human-1",
+} as const;
+
+const governanceSession = {
+  sessionId: "governance-session",
+  sessionFamilyId: "governance-family",
+  principal: governancePrincipal,
+} as const;
+
+const governanceView: RoomGovernanceView = {
+  roomId,
+  projectId: roomId,
+  lifecycle: "active",
+  governanceRevision: 5,
+  ownerActorId: "human-1",
+  archiveGeneration: 0,
+};
+
+const departureConflictList: DepartureConflictList = {
+  roomId,
+  targetActorId: "human-2",
+  governanceRevision: 4,
+  conflicts: [{
+    conflictId: "next-action:next-1:3",
+    roomId,
+    subjectId: "human-2",
+    kind: "next_action",
+    title: "待转交行动",
+    state: "open",
+    allowedResolutions: ["complete", "transfer", "escalate"],
+    sourceId: "next-1",
+    revision: 3,
+  }],
+};
+
+function governanceAuthenticationService(): AuthenticationService {
+  const issued = issuedSession(governancePrincipal, "governance");
+  return {
+    async login() { return issued; },
+    async authenticate() { return governancePrincipal; },
+    async authenticateSession() { return governanceSession; },
+    async refresh() { return issued; },
+    async revoke() {},
+    async listSessions() {
+      return [{
+        id: issued.sessionId,
+        deviceLabel: "Governance device",
+        platform: "unknown",
+        refreshExpiresAt: issued.refreshExpiresAt,
+        current: true,
+      }];
+    },
+    async revokeSession() {},
+  };
+}
+
+describe("closed FT-02B/FT-02C WebSocket governance", () => {
+  it("fails unauthenticated and missing dependency paths closed without calling a legacy mutation", async () => {
+    const executeHuman = vi.fn(async () => ({
+      aggregateId: roomId,
+      eventIds: ["legacy-event"],
+      acceptedAt: "2026-08-19T00:00:00.000Z",
+      result: {},
+    }));
+    const server = await startMessageWebSocketServer({
+      auth: governanceAuthenticationService(),
+      service: idleMessageService(),
+      governance: {
+        executeHuman,
+        async readRoomGovernance() { return governanceView; },
+      },
+    });
+    const client = await LoopbackClient.connect(server.url);
+
+    try {
+      client.send({
+        type: "room.departure.conflicts", requestId: "preflight-unauthenticated",
+        roomId, targetActorId: "human-2",
+      });
+      await expect(client.waitForError("unauthenticated", "preflight-unauthenticated"))
+        .resolves.toMatchObject({ frame: { status: 401 } });
+
+      await client.login(humans[0], "governance-login");
+      client.send({
+        type: "room.departure.conflicts", requestId: "preflight-unavailable",
+        roomId, targetActorId: "human-2",
+      });
+      await expect(client.waitForError("dependency_unavailable", "preflight-unavailable"))
+        .resolves.toMatchObject({ frame: { status: 503 } });
+
+      client.send({
+        type: "room.archive", requestId: "archive-unavailable", roomId,
+        expectedGovernanceRevision: 4, idempotencyKey: "archive-unavailable-key",
+      });
+      await expect(client.waitForError("dependency_unavailable", "archive-unavailable"))
+        .resolves.toMatchObject({ frame: { status: 503 } });
+      expect(executeHuman).not.toHaveBeenCalled();
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("derives the Human session, returns a closed preflight, and correlates every CAS ACK", async () => {
+    const queries: unknown[] = [];
+    const mutations: unknown[] = [];
+    const executeHuman = vi.fn(async () => {
+      throw new Error("legacy governance mutation must not run");
+    });
+    const server = await startMessageWebSocketServer({
+      auth: governanceAuthenticationService(),
+      service: idleMessageService(),
+      governance: {
+        executeHuman,
+        async readRoomGovernance() { return governanceView; },
+        async readDepartureConflicts(context, input) {
+          queries.push({ context, input });
+          return departureConflictList;
+        },
+        async executeHumanGovernance(context, command) {
+          mutations.push({ context, command });
+          return {
+            governance: command.type === "room.archive"
+              ? {
+                  ...governanceView,
+                  lifecycle: "archived" as const,
+                  archiveGeneration: 1,
+                  archivedAt: "2026-08-19T00:00:00.000Z",
+                }
+              : governanceView,
+            eventIds: [`event-${command.type}`],
+            replayed: false,
+          };
+        },
+      },
+    });
+    const client = await LoopbackClient.connect(server.url);
+
+    try {
+      await client.login(humans[0], "governance-success-login");
+      client.send({
+        type: "room.departure.conflicts", requestId: "preflight-success",
+        roomId, targetActorId: "human-2",
+      });
+      const preflight = await client.waitForFrame(
+        (frame) => hasType(frame, "room.departure.conflicts.result") &&
+          frame.requestId === "preflight-success",
+        "departure preflight",
+      );
+      expect(preflight.frame).toEqual({
+        type: "room.departure.conflicts.result",
+        requestId: "preflight-success",
+        conflicts: departureConflictList,
+      });
+      expect(queries).toEqual([{
+        context: governanceSession,
+        input: { roomId, targetActorId: "human-2" },
+      }]);
+
+      const frames = [
+        {
+          type: "room.member.leave", requestId: "leave-success", roomId,
+          expectedGovernanceRevision: 4, idempotencyKey: "leave-key",
+        },
+        {
+          type: "room.member.remove", requestId: "remove-success", roomId,
+          targetActorId: "human-2", expectedGovernanceRevision: 4,
+          idempotencyKey: "remove-key",
+        },
+        {
+          type: "room.archive", requestId: "archive-success", roomId,
+          expectedGovernanceRevision: 4, idempotencyKey: "archive-key",
+        },
+        {
+          type: "room.reopen", requestId: "reopen-success", roomId,
+          expectedGovernanceRevision: 5, idempotencyKey: "reopen-key",
+        },
+      ] as const;
+      for (const frame of frames) {
+        client.send(frame);
+        const acknowledgement = await client.waitForFrame(
+          (candidate) => hasType(candidate, "room.governance.ack") &&
+            candidate.requestId === frame.requestId,
+          `${frame.type} acknowledgement`,
+        );
+        expect(acknowledgement.frame).toEqual({
+          type: "room.governance.ack",
+          requestId: frame.requestId,
+          operation: frame.type,
+          governance: frame.type === "room.archive"
+            ? {
+                ...governanceView,
+                lifecycle: "archived",
+                archiveGeneration: 1,
+                archivedAt: "2026-08-19T00:00:00.000Z",
+              }
+            : governanceView,
+          eventIds: [`event-${frame.type}`],
+          replayed: false,
+        });
+      }
+
+      expect(mutations).toEqual(frames.map((frame) => ({
+        context: {
+          ...governanceSession,
+          kind: "human",
+          requestId: frame.requestId,
+          idempotencyKey: frame.idempotencyKey,
+        },
+        command: frame.type === "room.member.remove"
+          ? {
+              type: frame.type, roomId,
+              payload: {
+                targetActorId: frame.targetActorId,
+                expectedGovernanceRevision: frame.expectedGovernanceRevision,
+              },
+            }
+          : {
+              type: frame.type, roomId,
+              payload: { expectedGovernanceRevision: frame.expectedGovernanceRevision },
+            },
+      })));
+      expect(executeHuman).not.toHaveBeenCalled();
+
+      client.send({
+        type: "room.departure.conflicts", requestId: "preflight-injected", roomId,
+        targetActorId: "human-2", principal: governancePrincipal,
+      });
+      await expect(client.waitForError("invalid_request", "preflight-injected"))
+        .resolves.toMatchObject({ frame: { status: 400 } });
+      expect(queries).toHaveLength(1);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("maps the closed status family and exposes details only for a safe departure_blocked", async () => {
+    const failures = new Map<string, { readonly status: number; readonly code: string }>([
+      ["human-403", { status: 403, code: "role_forbidden" }],
+      ["human-404", { status: 404, code: "member_not_found" }],
+      ["human-409", { status: 409, code: "room_revision_conflict" }],
+      ["human-410", { status: 410, code: "snapshot_expired" }],
+      ["human-429", { status: 429, code: "snapshot_busy" }],
+      ["human-503", { status: 503, code: "dependency_unavailable" }],
+    ]);
+    const server = await startMessageWebSocketServer({
+      auth: governanceAuthenticationService(),
+      service: idleMessageService(),
+      governance: {
+        async executeHuman() {
+          throw new Error("legacy mutation must not run");
+        },
+        async readRoomGovernance() { return governanceView; },
+        async readDepartureConflicts(_context, input) {
+          const failure = failures.get(input.targetActorId);
+          if (failure !== undefined) {
+            throw Object.assign(new Error("provider-secret"), failure, {
+              details: { secret: "must-not-cross-wire" },
+            });
+          }
+          if (input.targetActorId === "human-cross-room") {
+            return { ...departureConflictList, roomId: "room-2" };
+          }
+          if (input.targetActorId === "human-oversized") {
+            return {
+              ...departureConflictList,
+              targetActorId: input.targetActorId,
+              conflicts: [{
+                ...departureConflictList.conflicts[0],
+                subjectId: input.targetActorId,
+                title: "x".repeat(1_025),
+              }],
+            };
+          }
+          return {
+            ...departureConflictList,
+            targetActorId: input.targetActorId,
+            conflicts: departureConflictList.conflicts.map((conflict) => ({
+              ...conflict,
+              subjectId: input.targetActorId,
+            })),
+          };
+        },
+        async executeHumanGovernance(_context, command) {
+          const malformed = command.type === "room.member.remove" &&
+            command.payload.targetActorId === "human-malformed";
+          const targetActorId = command.type === "room.member.leave"
+            ? "human-1"
+            : command.type === "room.member.remove"
+              ? command.payload.targetActorId
+              : "human-2";
+          throw Object.assign(new Error("provider-secret"), {
+            status: 409,
+            code: "departure_blocked",
+            details: malformed
+              ? {
+                  ...departureConflictList,
+                  targetActorId: "human-malformed",
+                  conflicts: [{ ...departureConflictList.conflicts[0], grant: "secret-grant" }],
+                }
+              : {
+                  ...departureConflictList,
+                  targetActorId,
+                  conflicts: departureConflictList.conflicts.map((conflict) => ({
+                    ...conflict,
+                    subjectId: targetActorId,
+                  })),
+                },
+          });
+        },
+      },
+    });
+    const client = await LoopbackClient.connect(server.url);
+
+    try {
+      await client.login(humans[0], "governance-errors-login");
+      for (const [targetActorId, expected] of failures) {
+        const requestId = `error-${expected.status}`;
+        client.send({
+          type: "room.departure.conflicts", requestId, roomId, targetActorId,
+        });
+        const failure = await client.waitForError(expected.code, requestId);
+        expect(failure.frame).toEqual({
+          type: "error",
+          status: expected.status,
+          code: expected.code,
+          message: expected.code,
+          requestId,
+        });
+        expect(JSON.stringify(failure.frame)).not.toContain("provider-secret");
+        expect(JSON.stringify(failure.frame)).not.toContain("must-not-cross-wire");
+      }
+
+      client.send({
+        type: "room.member.remove", requestId: "remove-blocked", roomId,
+        targetActorId: "human-2", expectedGovernanceRevision: 4,
+        idempotencyKey: "remove-blocked-key",
+      });
+      const blocked = await client.waitForError("departure_blocked", "remove-blocked");
+      expect(blocked.frame).toEqual({
+        type: "error",
+        status: 409,
+        code: "departure_blocked",
+        message: "departure_blocked",
+        requestId: "remove-blocked",
+        details: departureConflictList,
+      });
+
+      client.send({
+        type: "room.member.leave", requestId: "leave-blocked", roomId,
+        expectedGovernanceRevision: 4, idempotencyKey: "leave-blocked-key",
+      });
+      await expect(client.waitForError("departure_blocked", "leave-blocked"))
+        .resolves.toMatchObject({
+          frame: {
+            status: 409,
+            details: { roomId, targetActorId: "human-1" },
+          },
+        });
+
+      client.send({
+        type: "room.member.remove", requestId: "remove-malformed", roomId,
+        targetActorId: "human-malformed", expectedGovernanceRevision: 4,
+        idempotencyKey: "remove-malformed-key",
+      });
+      const malformed = await client.waitForError("dependency_unavailable", "remove-malformed");
+      expect(malformed.frame).toEqual({
+        type: "error", status: 503, code: "dependency_unavailable",
+        message: "dependency_unavailable", requestId: "remove-malformed",
+      });
+      expect(JSON.stringify(malformed.frame)).not.toContain("secret-grant");
+
+      client.send({
+        type: "room.departure.conflicts", requestId: "preflight-cross-room", roomId,
+        targetActorId: "human-cross-room",
+      });
+      await expect(client.waitForError("dependency_unavailable", "preflight-cross-room"))
+        .resolves.toMatchObject({ frame: { status: 503 } });
+
+      client.send({
+        type: "room.departure.conflicts", requestId: "preflight-oversized", roomId,
+        targetActorId: "human-oversized",
+      });
+      await expect(client.waitForError("dependency_unavailable", "preflight-oversized"))
+        .resolves.toMatchObject({ frame: { status: 503 } });
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("rejects malformed dependency acknowledgements instead of inventing mutation success", async () => {
+    const server = await startMessageWebSocketServer({
+      auth: governanceAuthenticationService(),
+      service: idleMessageService(),
+      governance: {
+        async executeHuman() {
+          throw new Error("legacy mutation must not run");
+        },
+        async readRoomGovernance() { return { ...governanceView, roomId: "room-2", projectId: "room-2" }; },
+        async readDepartureConflicts() { return departureConflictList; },
+        async executeHumanGovernance() {
+          return {
+            governance: { ...governanceView, roomId: "room-2", projectId: "room-2" },
+            eventIds: ["forged-event", "forged-event"],
+            replayed: false,
+          };
+        },
+      },
+    });
+    const client = await LoopbackClient.connect(server.url);
+
+    try {
+      await client.login(humans[0], "governance-malformed-login");
+      client.send({
+        type: "room.archive", requestId: "archive-malformed", roomId,
+        expectedGovernanceRevision: 4, idempotencyKey: "archive-malformed-key",
+      });
+      const failure = await client.waitForError("dependency_unavailable", "archive-malformed");
+      expect(failure.frame).toEqual({
+        type: "error", status: 503, code: "dependency_unavailable",
+        message: "dependency_unavailable", requestId: "archive-malformed",
+      });
+      expect(client.frameCount((frame) => hasType(frame, "room.governance.ack") &&
+        frame.requestId === "archive-malformed")).toBe(0);
+      expect(JSON.stringify(failure.frame)).not.toContain("must-not-cross-wire");
+    } finally {
+      await client.close();
+      await server.close();
     }
   });
 });
