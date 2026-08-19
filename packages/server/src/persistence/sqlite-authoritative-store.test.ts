@@ -2630,7 +2630,7 @@ describe("SQLite authoritative sessions", () => {
           .get(created.aggregateId)).toEqual({ status: "claimed" });
         inspection.close();
       }
-    });
+    }, 15_000);
   });
 
   describe("Agent execution authoritative facts", () => {

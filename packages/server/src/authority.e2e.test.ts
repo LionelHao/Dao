@@ -1059,26 +1059,33 @@ async function discoverRoom(client: JsonWebSocketClient): Promise<string> {
 }
 
 async function repairRecords(client: JsonWebSocketClient, roomId: string) {
-  const first = await client.request({
-    type: "room.repair.begin",
-    requestId: "repair-begin",
-    roomId,
-  }, "room.repair.page");
-  if (!isRoomRepairPage(first)) throw new TypeError("wrong repair frame");
-  const records = [...first.records];
-  let page = first;
-  while (page.hasMore) {
-    const next = await client.request({
-      type: "room.repair.page",
-      requestId: `repair-page-${page.page}`,
-      snapshotId: page.snapshotId,
-      afterPage: page.page,
-    }, "room.repair.page");
-    if (!isRoomRepairPage(next)) throw new TypeError("wrong repair page");
-    records.push(...next.records);
-    page = next;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const first = await client.request({
+        type: "room.repair.begin",
+        requestId: `repair-begin-${attempt}`,
+        roomId,
+      }, "room.repair.page");
+      if (!isRoomRepairPage(first)) throw new TypeError("wrong repair frame");
+      const records = [...first.records];
+      let page = first;
+      while (page.hasMore) {
+        const next = await client.request({
+          type: "room.repair.page",
+          requestId: `repair-page-${attempt}-${page.page}`,
+          snapshotId: page.snapshotId,
+          afterPage: page.page,
+        }, "room.repair.page");
+        if (!isRoomRepairPage(next)) throw new TypeError("wrong repair page");
+        records.push(...next.records);
+        page = next;
+      }
+      return { records, watermark: first.watermark, checksum: first.snapshotChecksum };
+    } catch (error: unknown) {
+      if (!isRecord(error) || error.code !== "snapshot_stale" || attempt === 2) throw error;
+    }
   }
-  return { records, watermark: first.watermark, checksum: first.snapshotChecksum };
+  throw new Error("Room repair retry bound was exhausted");
 }
 
 function authoritySentinelHits(databasePath: string, sentinel: string): readonly string[] {
