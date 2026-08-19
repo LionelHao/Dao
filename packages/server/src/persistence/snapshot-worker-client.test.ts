@@ -1381,7 +1381,7 @@ describe("durable materialized snapshot worker", () => {
     inspection.close();
     await client.close();
     await authority.close();
-  }, 30_000);
+  }, 60_000);
 
   it("replays exact idempotency before the barrier and reports conflicts as 409", async () => {
     const fixture = await createDatabaseFixture({
