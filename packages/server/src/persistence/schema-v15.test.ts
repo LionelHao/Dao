@@ -52,6 +52,19 @@ describe("authority SQLite v15 room lifecycle audit vocabulary", () => {
            '2026-08-19T00:01:00.000Z', '{}'),
           ('v15-reopened', 'room.reopened', 'v15-room', 'v15-owner', 'reopened',
            '2026-08-19T00:02:00.000Z', '{}');
+        INSERT INTO room_cache_invalidation_intents (
+          id, room_id, lifecycle_generation, access_revision, reason,
+          target_actor_id
+        ) VALUES (
+          'v15-cache-remove', 'v15-room', 0, 1, 'member_removed', 'v15-owner'
+        );
+        INSERT INTO offline_read_lease_invalidations (
+          id, room_id, lifecycle_generation, access_revision, lease_generation,
+          revoked_lease_count, reason, target_actor_id
+        ) VALUES (
+          'v15-lease-remove', 'v15-room', 0, 1, 1, 0,
+          'member_removed', 'v15-owner'
+        );
       `);
 
       expect(database.prepare(
@@ -60,6 +73,14 @@ describe("authority SQLite v15 room lifecycle audit vocabulary", () => {
         { type: "room.member.left", result: "left" },
         { type: "room.reopened", result: "reopened" },
       ]);
+      expect(database.prepare(
+        `SELECT reason, target_actor_id AS targetActorId
+         FROM room_cache_invalidation_intents`,
+      ).all()).toEqual([{ reason: "member_removed", targetActorId: "v15-owner" }]);
+      expect(database.prepare(
+        `SELECT reason, target_actor_id AS targetActorId
+         FROM offline_read_lease_invalidations`,
+      ).all()).toEqual([{ reason: "member_removed", targetActorId: "v15-owner" }]);
     });
   });
 
@@ -159,7 +180,7 @@ describe("authority SQLite v15 room lifecycle audit vocabulary", () => {
         "SELECT name, checksum FROM schema_migrations WHERE version = 15",
       ).get()).toEqual({
         name: "truthful-room-lifecycle-audit-vocabulary",
-        checksum: "5d8370e193813ac80ba3962bb34946e148f5ae96d0025bf57ae5b89cf1755e2d",
+        checksum: "65a371b2faf68d906c8241195f3dff0d4937e8acfde2d46bb7961c748d9a15a8",
       });
       expect(() => database.prepare(
         "UPDATE room_audit SET details_json = '{}' WHERE id = ?",

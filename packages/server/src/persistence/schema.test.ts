@@ -987,7 +987,7 @@ describe("authority SQLite schema", () => {
         {
           version: 15,
           name: "truthful-room-lifecycle-audit-vocabulary",
-          checksum: "5d8370e193813ac80ba3962bb34946e148f5ae96d0025bf57ae5b89cf1755e2d",
+          checksum: "65a371b2faf68d906c8241195f3dff0d4937e8acfde2d46bb7961c748d9a15a8",
           applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
         },
       ]);
