@@ -154,6 +154,12 @@ describe("IdentitySessionController startup", () => {
     expect(states.map((value) => (value as { status: string }).status))
       .toEqual(["restoring", "authenticated"]);
     expect(JSON.stringify(states)).not.toMatch(/access-canary|refresh-canary/);
+    expect(controller.getCurrentAuthoritySession()).toEqual({
+      actorId: stored.actorId,
+      sessionId: stored.sessionId,
+      accessToken: stored.accessToken,
+      expiresAt: stored.expiresAt,
+    });
   });
 
   it("refreshes expired access exactly once, saves rotation, then authenticates", async () => {
