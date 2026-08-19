@@ -421,12 +421,12 @@ export type AuthorityWorkerResponse =
   | {
       readonly type: "authority.ready";
       readonly requestId: string;
-      readonly schemaVersion: 14;
+      readonly schemaVersion: 15;
     }
   | {
       readonly type: "authority.schema";
       readonly requestId: string;
-      readonly schemaVersion: 14;
+      readonly schemaVersion: 15;
     }
   | {
       readonly type: "authority.legacy-imported";
@@ -1185,7 +1185,7 @@ export function isAuthorityWorkerResponse(
     case "authority.schema":
       return (
         hasExactKeys(value, ["type", "requestId", "schemaVersion"]) &&
-        value.schemaVersion === 14
+        value.schemaVersion === 15
       );
     case "authority.closed":
       return hasExactKeys(value, ["type", "requestId"]);

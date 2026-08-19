@@ -7,7 +7,7 @@ import {
 } from "../access/room-cache-invalidation-port.js";
 import { OFFLINE_READ_LEASE_SCHEMA_STATEMENTS } from "../access/offline-lease-invalidation-port.js";
 
-export const AUTHORITY_SCHEMA_VERSION = 14 as const;
+export const AUTHORITY_SCHEMA_VERSION = 15 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -47,6 +47,8 @@ const V12_MIGRATION_CHECKSUM =
   "66276cc21f02f19f5e60758039acd43030ba8a9666b37c0fef65ad30852929fa";
 const V13_MIGRATION_CHECKSUM =
   "0d008e577b5514d5fd51fa65c9c31ef51e32e55e09483c8a2e3a707d6ca42e3e";
+const V15_MIGRATION_CHECKSUM =
+  "5d8370e193813ac80ba3962bb34946e148f5ae96d0025bf57ae5b89cf1755e2d";
 const SCHEMA_FINGERPRINTS = {
   1: "03f2bbba4aa7082ec01819824726ce1bd9b4bd14cebea71afc93c6821dbf405c",
   2: "01c37d92ec2f303613a7bb8b592ca846fbea7c829b3c81fe4521699db949dfcc",
@@ -62,6 +64,7 @@ const SCHEMA_FINGERPRINTS = {
   12: "7232d27114e9acf32dcfbc2d59f3c3128eed10955de3cc2703ddeedf92892741",
   13: "037df6a2818f2a90b7394240a4cf71d77949faf31df6534c5546c9ed6b7e7191",
   14: "b4f1034ce034203fd14f5bc32391cb8855f7d6eed64c0b01f75d41e331a8b5c5",
+  15: "f5ecdb3a8b6a10215e1bf72be3b57e19c101234720fb8f60bccf8915e364bdaf",
 } as const;
 
 const V1_STATEMENTS = [
@@ -1646,7 +1649,37 @@ const V14_STATEMENTS = [
   ...OFFLINE_READ_LEASE_SCHEMA_STATEMENTS,
 ] as const;
 
+const V15_STATEMENTS = [
+  `CREATE TABLE room_audit_v15 (
+    id TEXT PRIMARY KEY,
+    type TEXT NOT NULL CHECK (type IN (
+      'room.created', 'room.renamed', 'room.archived', 'room.reopened',
+      'room.human.invited', 'room.invitation.accepted', 'room.invitation.rejected',
+      'room.agent.configured', 'room.member.left', 'room.member.removed',
+      'room.member.role.changed', 'room.ownership.transferred'
+    )),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    actor_id TEXT NOT NULL REFERENCES actors(id),
+    result TEXT NOT NULL CHECK (result IN (
+      'created', 'renamed', 'archived', 'reopened', 'pending', 'accepted',
+      'rejected', 'configured', 'left', 'removed', 'role-changed',
+      'ownership-transferred'
+    )),
+    timestamp TEXT NOT NULL,
+    details_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(details_json))
+  ) STRICT`,
+  `INSERT INTO room_audit_v15
+   SELECT id, type, room_id, actor_id, result, timestamp, details_json FROM room_audit`,
+  `DROP TABLE room_audit`,
+  `ALTER TABLE room_audit_v15 RENAME TO room_audit`,
+  `CREATE TRIGGER room_audit_v15_immutable_update
+   BEFORE UPDATE ON room_audit BEGIN SELECT RAISE(ABORT, 'room audit is immutable'); END`,
+  `CREATE TRIGGER room_audit_v15_immutable_delete
+   BEFORE DELETE ON room_audit BEGIN SELECT RAISE(ABORT, 'room audit is immutable'); END`,
+] as const;
+
 export const AUTHORITY_V14_STATEMENT_COUNT_FOR_TEST = V14_STATEMENTS.length;
+export const AUTHORITY_V15_STATEMENT_COUNT_FOR_TEST = V15_STATEMENTS.length;
 
 const V2_STATEMENTS = [
   `ALTER TABLE actors
@@ -2048,6 +2081,12 @@ const MIGRATIONS = [
     V13_MIGRATION_CHECKSUM,
   ),
   defineMigration(14, "shared-authority-production-providers", V14_STATEMENTS),
+  defineMigration(
+    15,
+    "truthful-room-lifecycle-audit-vocabulary",
+    V15_STATEMENTS,
+    V15_MIGRATION_CHECKSUM,
+  ),
 ] as const satisfies readonly Migration[];
 
 const V1_SCHEMA_CONTRACT = {
@@ -2461,6 +2500,8 @@ const V14_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V15_SCHEMA_CONTRACT = V14_SCHEMA_CONTRACT;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
@@ -2476,6 +2517,7 @@ const SCHEMA_CONTRACTS = {
   12: V12_SCHEMA_CONTRACT,
   13: V13_SCHEMA_CONTRACT,
   14: V14_SCHEMA_CONTRACT,
+  15: V15_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -3581,6 +3623,12 @@ export function migrateAuthorityDatabaseToPreviousVersionForTest(
   database: DatabaseSync,
 ): void {
   migrateAuthorityDatabaseToVersion(database, AUTHORITY_SCHEMA_VERSION - 1);
+}
+
+export function migrateAuthorityDatabaseToVersion13ForTest(
+  database: DatabaseSync,
+): void {
+  migrateAuthorityDatabaseToVersion(database, 13);
 }
 
 export function migrateAuthorityDatabaseToVersion12ForTest(
