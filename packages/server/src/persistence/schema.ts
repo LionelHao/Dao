@@ -7,7 +7,7 @@ import {
 } from "../access/room-cache-invalidation-port.js";
 import { OFFLINE_READ_LEASE_SCHEMA_STATEMENTS } from "../access/offline-lease-invalidation-port.js";
 
-export const AUTHORITY_SCHEMA_VERSION = 16 as const;
+export const AUTHORITY_SCHEMA_VERSION = 17 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -68,6 +68,7 @@ const SCHEMA_FINGERPRINTS = {
   14: "b4f1034ce034203fd14f5bc32391cb8855f7d6eed64c0b01f75d41e331a8b5c5",
   15: "e8010dc3c03c71d51f20ef4054a815d3580abdcbd0762791508226a68918b426",
   16: "86a3512dcb625bc3e0f3d79e5a5d6542819523bee8ac851990148bcad8e38737",
+  17: "8f2d032e4c62f54882fbfc51a950da5b8b1e8d7318736deccc6bd63cbb6359e8",
 } as const;
 
 const V1_STATEMENTS = [
@@ -2580,9 +2581,726 @@ const V16_STATEMENTS = [
    BEGIN SELECT RAISE(ABORT, 'Agent correction lineage is immutable'); END`,
 ] as const;
 
+const V17_STATEMENTS = [
+  `CREATE TABLE attachment_uploads (
+    upload_id TEXT PRIMARY KEY CHECK (length(trim(upload_id)) BETWEEN 1 AND 128),
+    upload_key TEXT NOT NULL CHECK (length(trim(upload_key)) BETWEEN 1 AND 128),
+    canonical_input_sha256 TEXT NOT NULL CHECK (
+      length(canonical_input_sha256) = 64
+      AND canonical_input_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    uploader_actor_id TEXT NOT NULL REFERENCES actors(id),
+    session_family_id TEXT NOT NULL REFERENCES session_families(family_id),
+    access_revision INTEGER NOT NULL CHECK (access_revision >= 0),
+    lifecycle_generation INTEGER NOT NULL CHECK (lifecycle_generation >= 0),
+    expected_bytes INTEGER NOT NULL CHECK (
+      expected_bytes > 0 AND expected_bytes <= 52428800
+    ),
+    received_bytes INTEGER NOT NULL DEFAULT 0 CHECK (
+      received_bytes >= 0 AND received_bytes <= expected_bytes
+    ),
+    expected_sha256 TEXT NOT NULL CHECK (
+      length(expected_sha256) = 64 AND expected_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    original_filename TEXT NOT NULL CHECK (
+      length(trim(original_filename)) BETWEEN 1 AND 255
+      AND instr(original_filename, '/') = 0
+      AND instr(original_filename, char(92)) = 0
+    ),
+    declared_mime TEXT CHECK (
+      declared_mime IS NULL OR length(trim(declared_mime)) BETWEEN 1 AND 255
+    ),
+    format_hint TEXT NOT NULL CHECK (
+      format_hint IN ('pdf', 'png', 'jpeg', 'docx', 'xlsx', 'txt', 'csv')
+    ),
+    status TEXT NOT NULL CHECK (
+      status IN ('open', 'finalizing', 'accepted', 'cancelled', 'expired', 'rejected')
+    ),
+    terminal_reason_code TEXT,
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+    updated_at TEXT NOT NULL CHECK (length(updated_at) > 0),
+    idle_expires_at TEXT NOT NULL CHECK (length(idle_expires_at) > 0),
+    absolute_expires_at TEXT NOT NULL CHECK (length(absolute_expires_at) > 0),
+    UNIQUE (uploader_actor_id, room_id, upload_key),
+    CHECK (
+      (status IN ('open', 'finalizing', 'accepted') AND terminal_reason_code IS NULL)
+      OR (status = 'cancelled' AND terminal_reason_code = 'upload_cancelled')
+      OR (status = 'expired' AND terminal_reason_code = 'upload_expired')
+      OR (status = 'rejected' AND terminal_reason_code IN (
+        'attachment_too_large', 'attachment_type_unsupported', 'type_mismatch',
+        'hash_mismatch', 'attachment_malformed'
+      ))
+    )
+  ) STRICT`,
+  `CREATE INDEX attachment_uploads_active_v17
+   ON attachment_uploads(
+     room_id, uploader_actor_id, status, absolute_expires_at, upload_id
+   )`,
+  `CREATE TRIGGER attachment_uploads_v17_validate_insert
+   BEFORE INSERT ON attachment_uploads
+   WHEN COALESCE((SELECT kind FROM actors WHERE id = NEW.uploader_actor_id), '') <> 'human'
+      OR NOT EXISTS (
+        SELECT 1 FROM session_families AS family
+        WHERE family.family_id = NEW.session_family_id
+          AND family.actor_id = NEW.uploader_actor_id
+          AND family.revoked_at IS NULL
+      )
+      OR NOT EXISTS (
+        SELECT 1
+        FROM rooms AS room
+        JOIN room_memberships AS membership
+          ON membership.room_id = room.id
+         AND membership.actor_id = NEW.uploader_actor_id
+         AND membership.kind = 'human'
+        LEFT JOIN room_access_authority AS access ON access.room_id = room.id
+        WHERE room.id = NEW.room_id
+          AND room.status = 'active'
+          AND room.archive_generation = NEW.lifecycle_generation
+          AND CASE
+                WHEN access.access_revision IS NULL
+                  OR membership.access_revision > access.access_revision
+                THEN membership.access_revision
+                ELSE access.access_revision
+              END = NEW.access_revision
+      )
+      OR NEW.received_bytes <> 0 OR NEW.status <> 'open'
+      OR NEW.terminal_reason_code IS NOT NULL
+   BEGIN
+     SELECT RAISE(ABORT, 'attachment upload authority is invalid');
+   END`,
+  `CREATE TRIGGER attachment_uploads_v17_validate_update
+   BEFORE UPDATE ON attachment_uploads
+   WHEN NEW.upload_id <> OLD.upload_id OR NEW.upload_key <> OLD.upload_key
+      OR NEW.canonical_input_sha256 <> OLD.canonical_input_sha256
+      OR NEW.room_id <> OLD.room_id OR NEW.uploader_actor_id <> OLD.uploader_actor_id
+      OR NEW.session_family_id <> OLD.session_family_id
+      OR NEW.access_revision <> OLD.access_revision
+      OR NEW.lifecycle_generation <> OLD.lifecycle_generation
+      OR NEW.expected_bytes <> OLD.expected_bytes
+      OR NEW.expected_sha256 <> OLD.expected_sha256
+      OR NEW.original_filename <> OLD.original_filename
+      OR NEW.declared_mime IS NOT OLD.declared_mime OR NEW.format_hint <> OLD.format_hint
+      OR NEW.created_at <> OLD.created_at OR NEW.idle_expires_at <> OLD.idle_expires_at
+      OR NEW.absolute_expires_at <> OLD.absolute_expires_at
+      OR NEW.received_bytes < OLD.received_bytes
+      OR (NEW.received_bytes <> OLD.received_bytes AND (
+        OLD.status <> 'open' OR NEW.status <> 'open'
+        OR NEW.received_bytes <> COALESCE((
+          SELECT MAX(byte_offset + byte_length)
+          FROM attachment_upload_chunks WHERE upload_id = OLD.upload_id
+        ), 0)
+      ))
+      OR (NEW.status = OLD.status
+        AND NEW.terminal_reason_code IS NOT OLD.terminal_reason_code)
+      OR NOT (
+        (NEW.status = OLD.status)
+        OR (OLD.status = 'open' AND NEW.status IN (
+          'finalizing', 'cancelled', 'expired', 'rejected'
+        ))
+        OR (OLD.status = 'finalizing' AND NEW.status IN (
+          'accepted', 'cancelled', 'rejected'
+        ))
+      )
+      OR (OLD.status = 'open' AND NEW.status = 'finalizing' AND NOT EXISTS (
+        SELECT 1
+        FROM session_families AS family
+        JOIN rooms AS room ON room.id = NEW.room_id
+        JOIN room_memberships AS membership
+          ON membership.room_id = room.id
+         AND membership.actor_id = NEW.uploader_actor_id
+         AND membership.kind = 'human'
+        LEFT JOIN room_access_authority AS access ON access.room_id = room.id
+        WHERE family.family_id = NEW.session_family_id
+          AND family.actor_id = NEW.uploader_actor_id
+          AND family.revoked_at IS NULL
+          AND room.status = 'active'
+          AND room.archive_generation = NEW.lifecycle_generation
+          AND CASE
+                WHEN access.access_revision IS NULL
+                  OR membership.access_revision > access.access_revision
+                THEN membership.access_revision
+                ELSE access.access_revision
+              END = NEW.access_revision
+      ))
+      OR (NEW.status = 'finalizing' AND NEW.received_bytes <> NEW.expected_bytes)
+      OR (NEW.status = 'accepted' AND NOT EXISTS (
+        SELECT 1 FROM attachments WHERE source_upload_id = NEW.upload_id
+      ))
+   BEGIN
+     SELECT RAISE(ABORT, 'attachment upload transition is invalid');
+   END`,
+  `CREATE TRIGGER attachment_uploads_v17_immutable_delete
+   BEFORE DELETE ON attachment_uploads
+   BEGIN SELECT RAISE(ABORT, 'attachment upload authority is immutable'); END`,
+  `CREATE TABLE attachment_upload_chunks (
+    upload_id TEXT NOT NULL REFERENCES attachment_uploads(upload_id),
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0 AND ordinal < 1600),
+    byte_offset INTEGER NOT NULL CHECK (byte_offset >= 0),
+    byte_length INTEGER NOT NULL CHECK (byte_length > 0 AND byte_length <= 32768),
+    chunk_sha256 TEXT NOT NULL CHECK (
+      length(chunk_sha256) = 64 AND chunk_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    part_object_key TEXT NOT NULL UNIQUE CHECK (
+      length(part_object_key) BETWEEN 1 AND 200
+      AND instr(part_object_key, '/') = 0
+      AND instr(part_object_key, char(92)) = 0
+      AND instr(part_object_key, '..') = 0
+    ),
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+    PRIMARY KEY (upload_id, ordinal),
+    UNIQUE (upload_id, byte_offset)
+  ) STRICT`,
+  `CREATE INDEX attachment_upload_chunks_offset_v17
+   ON attachment_upload_chunks(upload_id, byte_offset, ordinal)`,
+  `CREATE TRIGGER attachment_upload_chunks_v17_validate_insert
+   BEFORE INSERT ON attachment_upload_chunks
+   WHEN NOT EXISTS (
+     SELECT 1
+     FROM attachment_uploads AS upload
+     JOIN session_families AS family ON family.family_id = upload.session_family_id
+     JOIN rooms AS room ON room.id = upload.room_id
+     JOIN room_memberships AS membership
+       ON membership.room_id = room.id
+      AND membership.actor_id = upload.uploader_actor_id
+      AND membership.kind = 'human'
+     LEFT JOIN room_access_authority AS access ON access.room_id = room.id
+     WHERE upload.upload_id = NEW.upload_id
+       AND upload.status = 'open'
+       AND family.actor_id = upload.uploader_actor_id
+       AND family.revoked_at IS NULL
+       AND room.status = 'active'
+       AND room.archive_generation = upload.lifecycle_generation
+       AND CASE
+             WHEN access.access_revision IS NULL
+               OR membership.access_revision > access.access_revision
+             THEN membership.access_revision
+             ELSE access.access_revision
+           END = upload.access_revision
+       AND NEW.ordinal = COALESCE((
+         SELECT MAX(chunk.ordinal) + 1
+         FROM attachment_upload_chunks AS chunk
+         WHERE chunk.upload_id = NEW.upload_id
+       ), 0)
+       AND NEW.byte_offset = upload.received_bytes
+       AND NEW.byte_offset + NEW.byte_length <= upload.expected_bytes
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'attachment upload chunk sequence is invalid');
+   END`,
+  `CREATE TRIGGER attachment_upload_chunks_v17_checkpoint_insert
+   AFTER INSERT ON attachment_upload_chunks
+   BEGIN
+     UPDATE attachment_uploads
+     SET received_bytes = NEW.byte_offset + NEW.byte_length,
+         updated_at = NEW.created_at
+     WHERE upload_id = NEW.upload_id;
+   END`,
+  `CREATE TRIGGER attachment_upload_chunks_v17_immutable_update
+   BEFORE UPDATE ON attachment_upload_chunks
+   BEGIN SELECT RAISE(ABORT, 'attachment upload chunk is immutable'); END`,
+  `CREATE TRIGGER attachment_upload_chunks_v17_immutable_delete
+   BEFORE DELETE ON attachment_upload_chunks
+   BEGIN SELECT RAISE(ABORT, 'attachment upload chunk is immutable'); END`,
+  `CREATE TABLE attachments (
+    attachment_id TEXT PRIMARY KEY CHECK (length(trim(attachment_id)) BETWEEN 1 AND 128),
+    source_upload_id TEXT NOT NULL UNIQUE REFERENCES attachment_uploads(upload_id),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    uploader_actor_id TEXT NOT NULL REFERENCES actors(id),
+    original_filename TEXT NOT NULL CHECK (
+      length(trim(original_filename)) BETWEEN 1 AND 255
+      AND instr(original_filename, '/') = 0
+      AND instr(original_filename, char(92)) = 0
+    ),
+    declared_mime TEXT CHECK (
+      declared_mime IS NULL OR length(trim(declared_mime)) BETWEEN 1 AND 255
+    ),
+    detected_mime TEXT NOT NULL CHECK (length(trim(detected_mime)) BETWEEN 1 AND 255),
+    format TEXT NOT NULL CHECK (
+      format IN ('pdf', 'png', 'jpeg', 'docx', 'xlsx', 'txt', 'csv')
+    ),
+    byte_size INTEGER NOT NULL CHECK (byte_size > 0 AND byte_size <= 52428800),
+    sha256 TEXT NOT NULL CHECK (
+      length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    quarantine_object_key TEXT NOT NULL UNIQUE CHECK (
+      length(quarantine_object_key) BETWEEN 1 AND 200
+      AND instr(quarantine_object_key, '/') = 0
+      AND instr(quarantine_object_key, char(92)) = 0
+      AND instr(quarantine_object_key, '..') = 0
+    ),
+    object_key TEXT UNIQUE CHECK (
+      object_key IS NULL OR (
+        length(object_key) BETWEEN 1 AND 200
+        AND instr(object_key, '/') = 0
+        AND instr(object_key, char(92)) = 0
+        AND instr(object_key, '..') = 0
+      )
+    ),
+    processing_status TEXT NOT NULL CHECK (processing_status IN (
+      'quarantined', 'scanning', 'extracting', 'ocr', 'ready',
+      'retryable-failed', 'nonretryable-failed', 'malware-rejected', 'cancelled'
+    )),
+    processing_generation INTEGER NOT NULL CHECK (processing_generation >= 1),
+    failure_code TEXT,
+    source_message_id TEXT,
+    source_operational_state TEXT NOT NULL CHECK (
+      source_operational_state IN ('unbound', 'bound-active', 'excluded-recalled')
+    ),
+    source_bound_at TEXT,
+    lifecycle_generation INTEGER NOT NULL CHECK (lifecycle_generation >= 0),
+    access_revision INTEGER NOT NULL CHECK (access_revision >= 0),
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+    updated_at TEXT NOT NULL CHECK (length(updated_at) > 0),
+    ready_at TEXT,
+    UNIQUE (attachment_id, room_id),
+    FOREIGN KEY (source_message_id, room_id)
+      REFERENCES message_envelopes(message_id, room_id)
+      DEFERRABLE INITIALLY DEFERRED,
+    CHECK (
+      (format = 'pdf' AND detected_mime = 'application/pdf')
+      OR (format = 'png' AND detected_mime = 'image/png')
+      OR (format = 'jpeg' AND detected_mime = 'image/jpeg')
+      OR (format = 'docx' AND detected_mime =
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+      OR (format = 'xlsx' AND detected_mime =
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+      OR (format = 'txt' AND detected_mime = 'text/plain')
+      OR (format = 'csv' AND detected_mime = 'text/csv')
+    ),
+    CHECK (
+      (processing_status IN ('quarantined', 'scanning', 'extracting', 'ocr')
+        AND failure_code IS NULL AND object_key IS NULL AND ready_at IS NULL)
+      OR (processing_status = 'ready' AND failure_code IS NULL
+        AND object_key IS NOT NULL AND ready_at IS NOT NULL)
+      OR (processing_status IN (
+          'retryable-failed', 'nonretryable-failed', 'malware-rejected', 'cancelled'
+        ) AND length(trim(failure_code)) > 0 AND object_key IS NULL AND ready_at IS NULL)
+    ),
+    CHECK (processing_status <> 'malware-rejected' OR failure_code = 'malware_detected'),
+    CHECK (
+      (source_operational_state = 'unbound'
+        AND source_message_id IS NULL AND source_bound_at IS NULL)
+      OR (source_operational_state IN ('bound-active', 'excluded-recalled')
+        AND processing_status = 'ready'
+        AND source_message_id IS NOT NULL AND source_bound_at IS NOT NULL)
+    )
+  ) STRICT`,
+  `CREATE INDEX attachments_room_source_v17
+   ON attachments(room_id, source_operational_state, source_message_id, attachment_id)`,
+  `CREATE INDEX attachments_processing_v17
+   ON attachments(processing_status, processing_generation, updated_at, attachment_id)`,
+  `CREATE TRIGGER attachments_v17_validate_insert
+   BEFORE INSERT ON attachments
+   WHEN NEW.processing_status <> 'quarantined' OR NEW.processing_generation <> 1
+      OR NEW.source_operational_state <> 'unbound' OR NEW.source_message_id IS NOT NULL
+      OR NOT EXISTS (
+        SELECT 1
+        FROM attachment_uploads AS upload
+        JOIN rooms AS room ON room.id = upload.room_id
+        JOIN room_memberships AS membership
+          ON membership.room_id = upload.room_id
+         AND membership.actor_id = upload.uploader_actor_id
+         AND membership.kind = 'human'
+        LEFT JOIN room_access_authority AS access ON access.room_id = room.id
+        WHERE upload.upload_id = NEW.source_upload_id
+          AND upload.status = 'finalizing'
+          AND upload.room_id = NEW.room_id
+          AND upload.uploader_actor_id = NEW.uploader_actor_id
+          AND upload.original_filename = NEW.original_filename
+          AND upload.declared_mime IS NEW.declared_mime
+          AND upload.format_hint = NEW.format
+          AND upload.expected_bytes = NEW.byte_size
+          AND upload.received_bytes = upload.expected_bytes
+          AND upload.expected_sha256 = NEW.sha256
+          AND upload.lifecycle_generation = NEW.lifecycle_generation
+          AND upload.access_revision = NEW.access_revision
+          AND room.status = 'active'
+          AND room.archive_generation = NEW.lifecycle_generation
+          AND CASE
+                WHEN access.access_revision IS NULL
+                  OR membership.access_revision > access.access_revision
+                THEN membership.access_revision
+                ELSE access.access_revision
+              END = NEW.access_revision
+      )
+   BEGIN
+     SELECT RAISE(ABORT, 'attachment finalize authority is invalid');
+   END`,
+  `CREATE TRIGGER attachments_v17_validate_update
+   BEFORE UPDATE ON attachments
+   WHEN NEW.attachment_id <> OLD.attachment_id
+      OR NEW.source_upload_id <> OLD.source_upload_id
+      OR NEW.room_id <> OLD.room_id OR NEW.uploader_actor_id <> OLD.uploader_actor_id
+      OR NEW.original_filename <> OLD.original_filename
+      OR NEW.declared_mime IS NOT OLD.declared_mime
+      OR NEW.detected_mime <> OLD.detected_mime OR NEW.format <> OLD.format
+      OR NEW.byte_size <> OLD.byte_size OR NEW.sha256 <> OLD.sha256
+      OR NEW.quarantine_object_key <> OLD.quarantine_object_key
+      OR NEW.lifecycle_generation <> OLD.lifecycle_generation
+      OR NEW.access_revision <> OLD.access_revision OR NEW.created_at <> OLD.created_at
+      OR (OLD.object_key IS NOT NULL AND NEW.object_key IS NOT OLD.object_key)
+      OR NOT (
+        NEW.processing_status = OLD.processing_status
+        OR (OLD.processing_status = 'quarantined'
+          AND NEW.processing_status IN ('scanning', 'cancelled'))
+        OR (OLD.processing_status = 'scanning' AND NEW.processing_status IN (
+          'extracting', 'ocr', 'retryable-failed', 'nonretryable-failed',
+          'malware-rejected', 'cancelled'
+        ))
+        OR (OLD.processing_status = 'extracting' AND NEW.processing_status IN (
+          'ocr', 'ready', 'retryable-failed', 'nonretryable-failed', 'cancelled'
+        ))
+        OR (OLD.processing_status = 'ocr' AND NEW.processing_status IN (
+          'ready', 'retryable-failed', 'nonretryable-failed', 'cancelled'
+        ))
+        OR (OLD.processing_status = 'retryable-failed'
+          AND NEW.processing_status = 'quarantined')
+      )
+      OR (NEW.processing_status <> OLD.processing_status
+        AND NEW.processing_status <> 'cancelled' AND NOT EXISTS (
+          SELECT 1
+          FROM rooms AS room
+          JOIN room_memberships AS membership
+            ON membership.room_id = room.id
+           AND membership.actor_id = NEW.uploader_actor_id
+           AND membership.kind = 'human'
+          LEFT JOIN room_access_authority AS access ON access.room_id = room.id
+          WHERE room.id = NEW.room_id
+            AND room.status = 'active'
+            AND room.archive_generation = NEW.lifecycle_generation
+            AND CASE
+                  WHEN access.access_revision IS NULL
+                    OR membership.access_revision > access.access_revision
+                  THEN membership.access_revision
+                  ELSE access.access_revision
+                END = NEW.access_revision
+        ))
+      OR (
+        ((OLD.processing_status = 'retryable-failed'
+            AND NEW.processing_status = 'quarantined')
+          OR (OLD.processing_status <> 'cancelled'
+            AND NEW.processing_status = 'cancelled'))
+        AND NEW.processing_generation <> OLD.processing_generation + 1
+      )
+      OR (
+        NOT ((OLD.processing_status = 'retryable-failed'
+            AND NEW.processing_status = 'quarantined')
+          OR (OLD.processing_status <> 'cancelled'
+            AND NEW.processing_status = 'cancelled'))
+        AND NEW.processing_generation <> OLD.processing_generation
+      )
+      OR (NEW.processing_status = OLD.processing_status
+        AND NEW.failure_code IS NOT OLD.failure_code)
+      OR (NEW.processing_status <> OLD.processing_status
+        AND NEW.processing_status <> 'malware-rejected' AND EXISTS (
+          SELECT 1 FROM attachment_processing_attempts AS attempt
+          WHERE attempt.attachment_id = NEW.attachment_id
+            AND attempt.processing_generation = NEW.processing_generation
+            AND attempt.adapter_kind = 'scanner'
+            AND attempt.status = 'malware-rejected'
+        ))
+      OR (NEW.processing_status = 'ready' AND OLD.processing_status <> 'ready' AND (
+        NOT EXISTS (
+          SELECT 1 FROM attachment_processing_attempts AS attempt
+          WHERE attempt.attachment_id = NEW.attachment_id
+            AND attempt.processing_generation = NEW.processing_generation
+            AND attempt.adapter_kind = 'scanner' AND attempt.status = 'succeeded'
+        )
+        OR NOT EXISTS (
+          SELECT 1 FROM attachment_processing_attempts AS attempt
+          WHERE attempt.attachment_id = NEW.attachment_id
+            AND attempt.processing_generation = NEW.processing_generation
+            AND attempt.adapter_kind IN ('extractor', 'ocr')
+            AND attempt.status = 'succeeded'
+        )
+        OR NOT EXISTS (
+          SELECT 1 FROM attachment_extraction_artifacts AS artifact
+          WHERE artifact.attachment_id = NEW.attachment_id
+            AND artifact.processing_generation = NEW.processing_generation
+        )
+        OR EXISTS (
+          SELECT 1 FROM attachment_processing_attempts AS attempt
+          WHERE attempt.attachment_id = NEW.attachment_id
+            AND attempt.processing_generation = NEW.processing_generation
+            AND attempt.adapter_kind = 'scanner'
+            AND attempt.status = 'malware-rejected'
+        )
+      ))
+      OR (NEW.processing_status = 'malware-rejected'
+        AND OLD.processing_status <> 'malware-rejected' AND NOT EXISTS (
+          SELECT 1 FROM attachment_processing_attempts AS attempt
+          WHERE attempt.attachment_id = NEW.attachment_id
+            AND attempt.processing_generation = OLD.processing_generation
+            AND attempt.adapter_kind = 'scanner'
+            AND attempt.status = 'malware-rejected'
+        ))
+      OR NOT (
+        (NEW.source_message_id IS OLD.source_message_id
+          AND NEW.source_operational_state = OLD.source_operational_state
+          AND NEW.source_bound_at IS OLD.source_bound_at)
+        OR (OLD.source_operational_state = 'unbound'
+          AND NEW.source_operational_state = 'bound-active'
+          AND NEW.source_message_id IS NOT NULL AND NEW.source_bound_at IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM message_attachment_links AS link
+            WHERE link.message_id = NEW.source_message_id
+              AND link.room_id = NEW.room_id
+              AND link.attachment_id = NEW.attachment_id
+              AND link.operational_state = 'active'
+          ))
+        OR (OLD.source_operational_state = 'bound-active'
+          AND NEW.source_operational_state = 'excluded-recalled'
+          AND NEW.source_message_id = OLD.source_message_id
+          AND NEW.source_bound_at = OLD.source_bound_at
+          AND EXISTS (
+            SELECT 1
+            FROM message_attachment_links AS link
+            JOIN message_envelopes AS envelope ON envelope.message_id = link.message_id
+            WHERE link.message_id = NEW.source_message_id
+              AND link.attachment_id = NEW.attachment_id
+              AND link.operational_state = 'excluded_recalled'
+              AND envelope.lifecycle = 'recalled'
+          ))
+      )
+   BEGIN
+     SELECT RAISE(ABORT, 'attachment processing or source transition is invalid');
+   END`,
+  `CREATE TRIGGER attachments_v17_immutable_delete
+   BEFORE DELETE ON attachments
+   BEGIN SELECT RAISE(ABORT, 'attachment authority is immutable'); END`,
+  `CREATE TABLE attachment_processing_attempts (
+    attachment_id TEXT NOT NULL REFERENCES attachments(attachment_id),
+    processing_generation INTEGER NOT NULL CHECK (processing_generation >= 1),
+    attempt_number INTEGER NOT NULL CHECK (attempt_number >= 1),
+    adapter_kind TEXT NOT NULL CHECK (adapter_kind IN ('scanner', 'extractor', 'ocr')),
+    adapter_name TEXT NOT NULL CHECK (length(trim(adapter_name)) BETWEEN 1 AND 128),
+    adapter_version TEXT NOT NULL CHECK (length(trim(adapter_version)) BETWEEN 1 AND 128),
+    status TEXT NOT NULL CHECK (status IN (
+      'queued', 'running', 'succeeded', 'retryable-failed',
+      'nonretryable-failed', 'malware-rejected', 'cancelled'
+    )),
+    failure_code TEXT,
+    timeout_ms INTEGER NOT NULL CHECK (timeout_ms > 0 AND timeout_ms <= 300000),
+    stdout_limit_bytes INTEGER NOT NULL CHECK (
+      stdout_limit_bytes >= 0 AND stdout_limit_bytes <= 8388608
+    ),
+    stderr_limit_bytes INTEGER NOT NULL CHECK (
+      stderr_limit_bytes >= 0 AND stderr_limit_bytes <= 65536
+    ),
+    started_at TEXT,
+    finished_at TEXT,
+    PRIMARY KEY (attachment_id, processing_generation, attempt_number),
+    CHECK (status <> 'malware-rejected' OR adapter_kind = 'scanner'),
+    CHECK (
+      (status = 'queued' AND failure_code IS NULL
+        AND started_at IS NULL AND finished_at IS NULL)
+      OR (status = 'running' AND failure_code IS NULL
+        AND started_at IS NOT NULL AND finished_at IS NULL)
+      OR (status = 'succeeded' AND failure_code IS NULL
+        AND started_at IS NOT NULL AND finished_at IS NOT NULL)
+      OR (status IN (
+          'retryable-failed', 'nonretryable-failed', 'malware-rejected'
+        ) AND length(trim(failure_code)) > 0
+        AND started_at IS NOT NULL AND finished_at IS NOT NULL)
+      OR (status = 'cancelled' AND failure_code = 'cancelled'
+        AND finished_at IS NOT NULL)
+    )
+  ) STRICT`,
+  `CREATE INDEX attachment_processing_attempts_status_v17
+   ON attachment_processing_attempts(
+     status, adapter_kind, attachment_id, processing_generation, attempt_number
+   )`,
+  `CREATE TRIGGER attachment_processing_attempts_v17_validate_insert
+   BEFORE INSERT ON attachment_processing_attempts
+   WHEN NOT EXISTS (
+     SELECT 1 FROM attachments AS attachment
+     WHERE attachment.attachment_id = NEW.attachment_id
+       AND attachment.processing_generation = NEW.processing_generation
+       AND attachment.processing_status NOT IN (
+         'ready', 'nonretryable-failed', 'malware-rejected', 'cancelled'
+       )
+       AND NEW.attempt_number = COALESCE((
+         SELECT MAX(attempt.attempt_number) + 1
+         FROM attachment_processing_attempts AS attempt
+         WHERE attempt.attachment_id = NEW.attachment_id
+           AND attempt.processing_generation = NEW.processing_generation
+       ), 1)
+       AND (
+         (NEW.adapter_kind = 'scanner'
+           AND attachment.processing_status IN ('quarantined', 'scanning'))
+         OR (NEW.adapter_kind = 'extractor'
+           AND attachment.processing_status IN ('scanning', 'extracting'))
+         OR (NEW.adapter_kind = 'ocr'
+           AND attachment.processing_status IN ('scanning', 'extracting', 'ocr'))
+       )
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'attachment processing attempt authority is invalid');
+   END`,
+  `CREATE TRIGGER attachment_processing_attempts_v17_validate_update
+   BEFORE UPDATE ON attachment_processing_attempts
+   WHEN NEW.attachment_id <> OLD.attachment_id
+      OR NEW.processing_generation <> OLD.processing_generation
+      OR NEW.attempt_number <> OLD.attempt_number
+      OR NEW.adapter_kind <> OLD.adapter_kind OR NEW.adapter_name <> OLD.adapter_name
+      OR NEW.adapter_version <> OLD.adapter_version OR NEW.timeout_ms <> OLD.timeout_ms
+      OR NEW.stdout_limit_bytes <> OLD.stdout_limit_bytes
+      OR NEW.stderr_limit_bytes <> OLD.stderr_limit_bytes
+      OR NOT EXISTS (
+        SELECT 1 FROM attachments AS attachment
+        WHERE attachment.attachment_id = NEW.attachment_id
+          AND attachment.processing_generation = NEW.processing_generation
+          AND attachment.processing_status NOT IN (
+            'ready', 'nonretryable-failed', 'malware-rejected', 'cancelled'
+          )
+      )
+      OR NOT (
+        (OLD.status = 'queued' AND NEW.status IN ('running', 'cancelled'))
+        OR (OLD.status = 'running' AND NEW.status IN (
+          'succeeded', 'retryable-failed', 'nonretryable-failed',
+          'malware-rejected', 'cancelled'
+        ))
+      )
+   BEGIN
+     SELECT RAISE(ABORT, 'attachment processing attempt transition is invalid');
+   END`,
+  `CREATE TRIGGER attachment_processing_attempts_v17_immutable_delete
+   BEFORE DELETE ON attachment_processing_attempts
+   BEGIN SELECT RAISE(ABORT, 'attachment processing attempt is immutable'); END`,
+  `CREATE TABLE attachment_extraction_artifacts (
+    artifact_id TEXT PRIMARY KEY CHECK (length(trim(artifact_id)) BETWEEN 1 AND 128),
+    attachment_id TEXT NOT NULL REFERENCES attachments(attachment_id),
+    processing_generation INTEGER NOT NULL CHECK (processing_generation >= 1),
+    method TEXT NOT NULL CHECK (
+      method IN ('extracted-text', 'ocr-text', 'table-text')
+    ),
+    tool_name TEXT NOT NULL CHECK (length(trim(tool_name)) BETWEEN 1 AND 128),
+    tool_version TEXT NOT NULL CHECK (length(trim(tool_version)) BETWEEN 1 AND 128),
+    object_key TEXT NOT NULL UNIQUE CHECK (
+      length(object_key) BETWEEN 1 AND 200
+      AND instr(object_key, '/') = 0
+      AND instr(object_key, char(92)) = 0
+      AND instr(object_key, '..') = 0
+    ),
+    sha256 TEXT NOT NULL CHECK (
+      length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    byte_size INTEGER NOT NULL CHECK (byte_size >= 0 AND byte_size <= 8388608),
+    page_start INTEGER CHECK (page_start IS NULL OR page_start >= 1),
+    page_end INTEGER CHECK (page_end IS NULL OR page_end >= page_start),
+    range_start INTEGER CHECK (range_start IS NULL OR range_start >= 0),
+    range_end INTEGER CHECK (range_end IS NULL OR range_end >= range_start),
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+    UNIQUE (attachment_id, processing_generation, method, object_key),
+    CHECK ((page_start IS NULL) = (page_end IS NULL)),
+    CHECK ((range_start IS NULL) = (range_end IS NULL))
+  ) STRICT`,
+  `CREATE INDEX attachment_extraction_artifacts_source_v17
+   ON attachment_extraction_artifacts(
+     attachment_id, processing_generation, method, artifact_id
+   )`,
+  `CREATE TRIGGER attachment_extraction_artifacts_v17_validate_insert
+   BEFORE INSERT ON attachment_extraction_artifacts
+   WHEN NOT EXISTS (
+     SELECT 1 FROM attachments AS attachment
+     WHERE attachment.attachment_id = NEW.attachment_id
+       AND attachment.processing_generation = NEW.processing_generation
+       AND (
+         (NEW.method IN ('extracted-text', 'table-text')
+           AND attachment.processing_status = 'extracting'
+           AND EXISTS (
+             SELECT 1 FROM attachment_processing_attempts AS attempt
+             WHERE attempt.attachment_id = NEW.attachment_id
+               AND attempt.processing_generation = NEW.processing_generation
+               AND attempt.adapter_kind = 'extractor' AND attempt.status = 'succeeded'
+           ))
+         OR (NEW.method = 'ocr-text' AND attachment.processing_status = 'ocr'
+           AND EXISTS (
+             SELECT 1 FROM attachment_processing_attempts AS attempt
+             WHERE attempt.attachment_id = NEW.attachment_id
+               AND attempt.processing_generation = NEW.processing_generation
+               AND attempt.adapter_kind = 'ocr' AND attempt.status = 'succeeded'
+           ))
+       )
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'attachment extraction provenance is invalid');
+   END`,
+  `CREATE TRIGGER attachment_extraction_artifacts_v17_immutable_update
+   BEFORE UPDATE ON attachment_extraction_artifacts
+   BEGIN SELECT RAISE(ABORT, 'attachment extraction provenance is immutable'); END`,
+  `CREATE TRIGGER attachment_extraction_artifacts_v17_immutable_delete
+   BEFORE DELETE ON attachment_extraction_artifacts
+   BEGIN SELECT RAISE(ABORT, 'attachment extraction provenance is immutable'); END`,
+  `CREATE UNIQUE INDEX message_attachment_links_attachment_v17
+   ON message_attachment_links(attachment_id)`,
+  `CREATE TRIGGER message_attachment_links_v17_validate_insert
+   BEFORE INSERT ON message_attachment_links
+   WHEN NEW.operational_state <> 'active' OR NOT EXISTS (
+     SELECT 1
+     FROM attachments AS attachment
+     JOIN rooms AS room ON room.id = attachment.room_id
+     JOIN room_memberships AS membership
+       ON membership.room_id = attachment.room_id
+      AND membership.actor_id = attachment.uploader_actor_id
+      AND membership.kind = 'human'
+     LEFT JOIN room_access_authority AS access ON access.room_id = room.id
+     JOIN message_envelopes AS envelope
+       ON envelope.message_id = NEW.message_id AND envelope.room_id = NEW.room_id
+     JOIN messages AS message ON message.id = envelope.message_id
+     WHERE attachment.attachment_id = NEW.attachment_id
+       AND attachment.room_id = NEW.room_id
+       AND attachment.processing_status = 'ready'
+       AND attachment.source_operational_state = 'unbound'
+       AND attachment.source_message_id IS NULL
+       AND envelope.message_kind = 'human' AND envelope.lifecycle = 'active'
+       AND message.author_kind = 'human'
+       AND message.author_id = attachment.uploader_actor_id
+       AND room.status = 'active'
+       AND room.archive_generation = attachment.lifecycle_generation
+       AND CASE
+             WHEN access.access_revision IS NULL
+               OR membership.access_revision > access.access_revision
+             THEN membership.access_revision
+             ELSE access.access_revision
+           END = attachment.access_revision
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'message attachment source binding is invalid');
+   END`,
+  `CREATE TRIGGER message_attachment_links_v17_bind_source
+   AFTER INSERT ON message_attachment_links
+   BEGIN
+     UPDATE attachments
+     SET source_message_id = NEW.message_id,
+         source_operational_state = 'bound-active',
+         source_bound_at = (
+           SELECT created_at FROM message_envelopes WHERE message_id = NEW.message_id
+         ),
+         updated_at = (
+           SELECT created_at FROM message_envelopes WHERE message_id = NEW.message_id
+         )
+     WHERE attachment_id = NEW.attachment_id;
+   END`,
+  `CREATE TRIGGER message_attachment_links_v17_exclude_source
+   AFTER UPDATE OF operational_state ON message_attachment_links
+   WHEN OLD.operational_state = 'active' AND NEW.operational_state = 'excluded_recalled'
+   BEGIN
+     UPDATE attachments
+     SET source_operational_state = 'excluded-recalled',
+         updated_at = COALESCE((
+           SELECT recalled_at FROM message_envelopes WHERE message_id = NEW.message_id
+         ), updated_at)
+     WHERE attachment_id = NEW.attachment_id
+       AND source_message_id = NEW.message_id;
+   END`,
+] as const;
+
 export const AUTHORITY_V14_STATEMENT_COUNT_FOR_TEST = V14_STATEMENTS.length;
 export const AUTHORITY_V15_STATEMENT_COUNT_FOR_TEST = V15_STATEMENTS.length;
 export const AUTHORITY_V16_STATEMENT_COUNT_FOR_TEST = V16_STATEMENTS.length;
+export const AUTHORITY_V17_STATEMENT_COUNT_FOR_TEST = V17_STATEMENTS.length;
 
 const V2_STATEMENTS = [
   `ALTER TABLE actors
@@ -2995,6 +3713,11 @@ const MIGRATIONS = [
     "message-authority-vnext",
     V16_STATEMENTS,
     V16_MIGRATION_CHECKSUM,
+  ),
+  defineMigration(
+    17,
+    "attachment-authority-pipeline",
+    V17_STATEMENTS,
   ),
 ] as const satisfies readonly Migration[];
 
@@ -3478,6 +4201,40 @@ const V16_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V17_SCHEMA_CONTRACT = {
+  ...V16_SCHEMA_CONTRACT,
+  attachment_extraction_artifacts: [
+    "artifact_id", "attachment_id", "processing_generation", "method",
+    "tool_name", "tool_version", "object_key", "sha256", "byte_size",
+    "page_start", "page_end", "range_start", "range_end", "created_at",
+  ],
+  attachment_processing_attempts: [
+    "attachment_id", "processing_generation", "attempt_number", "adapter_kind",
+    "adapter_name", "adapter_version", "status", "failure_code", "timeout_ms",
+    "stdout_limit_bytes", "stderr_limit_bytes", "started_at", "finished_at",
+  ],
+  attachment_upload_chunks: [
+    "upload_id", "ordinal", "byte_offset", "byte_length", "chunk_sha256",
+    "part_object_key", "created_at",
+  ],
+  attachment_uploads: [
+    "upload_id", "upload_key", "canonical_input_sha256", "room_id",
+    "uploader_actor_id", "session_family_id", "access_revision",
+    "lifecycle_generation", "expected_bytes", "received_bytes", "expected_sha256",
+    "original_filename", "declared_mime", "format_hint", "status",
+    "terminal_reason_code", "created_at", "updated_at", "idle_expires_at",
+    "absolute_expires_at",
+  ],
+  attachments: [
+    "attachment_id", "source_upload_id", "room_id", "uploader_actor_id",
+    "original_filename", "declared_mime", "detected_mime", "format", "byte_size",
+    "sha256", "quarantine_object_key", "object_key", "processing_status",
+    "processing_generation", "failure_code", "source_message_id",
+    "source_operational_state", "source_bound_at", "lifecycle_generation",
+    "access_revision", "created_at", "updated_at", "ready_at",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
@@ -3495,6 +4252,7 @@ const SCHEMA_CONTRACTS = {
   14: V14_SCHEMA_CONTRACT,
   15: V15_SCHEMA_CONTRACT,
   16: V16_SCHEMA_CONTRACT,
+  17: V17_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -4621,6 +5379,134 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
       "Agent corrections must append for the same Agent final",
     );
   }
+  if (schemaVersion >= 17) {
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM attachment_uploads AS upload
+       LEFT JOIN actors AS uploader ON uploader.id = upload.uploader_actor_id
+       LEFT JOIN session_families AS family
+         ON family.family_id = upload.session_family_id
+       LEFT JOIN rooms AS room ON room.id = upload.room_id
+       WHERE uploader.kind IS NOT 'human'
+          OR family.actor_id IS NOT upload.uploader_actor_id
+          OR room.id IS NULL
+          OR (upload.status = 'accepted' AND NOT EXISTS (
+            SELECT 1 FROM attachments AS attachment
+            WHERE attachment.source_upload_id = upload.upload_id
+          ))
+       LIMIT 1`,
+      "attachment uploads must retain their Human, family, Room, and artifact identity",
+    );
+    requireNoRows(
+      database,
+      `WITH ordered AS (
+         SELECT upload_id, ordinal, byte_offset, byte_length,
+                ROW_NUMBER() OVER (
+                  PARTITION BY upload_id ORDER BY ordinal
+                ) - 1 AS expected_ordinal,
+                COALESCE(SUM(byte_length) OVER (
+                  PARTITION BY upload_id ORDER BY ordinal
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                ), 0) AS expected_offset
+         FROM attachment_upload_chunks
+       )
+       SELECT 1
+       FROM ordered
+       WHERE ordinal <> expected_ordinal OR byte_offset <> expected_offset
+       LIMIT 1`,
+      "attachment upload chunks must remain contiguous and append-only",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM attachment_uploads AS upload
+       WHERE upload.received_bytes <> COALESCE((
+         SELECT MAX(chunk.byte_offset + chunk.byte_length)
+         FROM attachment_upload_chunks AS chunk
+         WHERE chunk.upload_id = upload.upload_id
+       ), 0)
+       LIMIT 1`,
+      "attachment upload checkpoints must equal their durable chunk boundary",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM attachments AS attachment
+       LEFT JOIN attachment_uploads AS upload
+         ON upload.upload_id = attachment.source_upload_id
+       WHERE upload.upload_id IS NULL
+          OR upload.room_id <> attachment.room_id
+          OR upload.uploader_actor_id <> attachment.uploader_actor_id
+          OR upload.original_filename <> attachment.original_filename
+          OR upload.declared_mime IS NOT attachment.declared_mime
+          OR upload.format_hint <> attachment.format
+          OR upload.expected_bytes <> attachment.byte_size
+          OR upload.expected_sha256 <> attachment.sha256
+          OR (attachment.source_operational_state = 'unbound' AND EXISTS (
+            SELECT 1 FROM message_attachment_links AS link
+            WHERE link.attachment_id = attachment.attachment_id
+          ))
+          OR (attachment.source_operational_state <> 'unbound' AND NOT EXISTS (
+            SELECT 1 FROM message_attachment_links AS link
+            WHERE link.attachment_id = attachment.attachment_id
+              AND link.message_id = attachment.source_message_id
+              AND ((attachment.source_operational_state = 'bound-active'
+                    AND link.operational_state = 'active')
+                OR (attachment.source_operational_state = 'excluded-recalled'
+                    AND link.operational_state = 'excluded_recalled'))
+          ))
+       LIMIT 1`,
+      "attachment artifacts and message sources must retain one canonical authority binding",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM message_attachment_links AS link
+       LEFT JOIN attachments AS attachment
+         ON attachment.attachment_id = link.attachment_id
+       WHERE attachment.attachment_id IS NULL
+          OR attachment.room_id <> link.room_id
+          OR attachment.source_message_id IS NOT link.message_id
+          OR (link.operational_state = 'active'
+              AND attachment.source_operational_state <> 'bound-active')
+          OR (link.operational_state = 'excluded_recalled'
+              AND attachment.source_operational_state <> 'excluded-recalled')
+       LIMIT 1`,
+      "message attachment links must retain one matching Attachment Authority source",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM attachment_processing_attempts AS attempt
+       LEFT JOIN attachments AS attachment
+         ON attachment.attachment_id = attempt.attachment_id
+       WHERE attachment.attachment_id IS NULL
+          OR attempt.processing_generation > attachment.processing_generation
+       LIMIT 1`,
+      "attachment processing attempts cannot outrun the artifact generation",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM attachment_extraction_artifacts AS artifact
+       LEFT JOIN attachments AS attachment
+         ON attachment.attachment_id = artifact.attachment_id
+       WHERE attachment.attachment_id IS NULL
+          OR artifact.processing_generation > attachment.processing_generation
+          OR NOT EXISTS (
+            SELECT 1 FROM attachment_processing_attempts AS attempt
+            WHERE attempt.attachment_id = artifact.attachment_id
+              AND attempt.processing_generation = artifact.processing_generation
+              AND attempt.status = 'succeeded'
+              AND ((artifact.method = 'ocr-text' AND attempt.adapter_kind = 'ocr')
+                OR (artifact.method IN ('extracted-text', 'table-text')
+                    AND attempt.adapter_kind = 'extractor'))
+          )
+       LIMIT 1`,
+      "attachment extraction metadata must retain successful processing provenance",
+    );
+  }
 }
 
 function validateExistingSchema(database: DatabaseSync, currentVersion: number): void {
@@ -4848,6 +5734,13 @@ export function migrateAuthorityDatabaseToVersion13ForTest(
   database: DatabaseSync,
 ): void {
   migrateAuthorityDatabaseToVersion(database, 13);
+}
+
+export function migrateAuthorityDatabaseToVersion16ForTest(
+  database: DatabaseSync,
+  fault?: MigrationFaultOptions,
+): void {
+  migrateAuthorityDatabaseToVersion(database, 16, fault);
 }
 
 export function migrateAuthorityDatabaseToVersion15ForTest(
