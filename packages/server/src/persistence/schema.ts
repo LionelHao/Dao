@@ -7,7 +7,7 @@ import {
 } from "../access/room-cache-invalidation-port.js";
 import { OFFLINE_READ_LEASE_SCHEMA_STATEMENTS } from "../access/offline-lease-invalidation-port.js";
 
-export const AUTHORITY_SCHEMA_VERSION = 15 as const;
+export const AUTHORITY_SCHEMA_VERSION = 16 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -49,6 +49,8 @@ const V13_MIGRATION_CHECKSUM =
   "0d008e577b5514d5fd51fa65c9c31ef51e32e55e09483c8a2e3a707d6ca42e3e";
 const V15_MIGRATION_CHECKSUM =
   "41740e7d34f6807248bf7879f34f9026844802dfe5a43f0ee18bf498a24dc0c9";
+const V16_MIGRATION_CHECKSUM =
+  "ed0d726ecda2b30b4dbbc43945a4165bb4e3923fb11c7f56198a0f0cd6f3383f";
 const SCHEMA_FINGERPRINTS = {
   1: "03f2bbba4aa7082ec01819824726ce1bd9b4bd14cebea71afc93c6821dbf405c",
   2: "01c37d92ec2f303613a7bb8b592ca846fbea7c829b3c81fe4521699db949dfcc",
@@ -65,6 +67,7 @@ const SCHEMA_FINGERPRINTS = {
   13: "037df6a2818f2a90b7394240a4cf71d77949faf31df6534c5546c9ed6b7e7191",
   14: "b4f1034ce034203fd14f5bc32391cb8855f7d6eed64c0b01f75d41e331a8b5c5",
   15: "e8010dc3c03c71d51f20ef4054a815d3580abdcbd0762791508226a68918b426",
+  16: "fd270863197055aaf10f4d48fb7c446546281673a69407daedbb0774da09b35b",
 } as const;
 
 const V1_STATEMENTS = [
@@ -1760,8 +1763,693 @@ const V15_STATEMENTS = [
      AND target_actor_id IS NOT NULL`,
 ] as const;
 
+const V16_STATEMENTS = [
+  `CREATE UNIQUE INDEX messages_id_room_v16 ON messages(id, room_id)`,
+  `CREATE TRIGGER messages_v16_body_immutable
+   BEFORE UPDATE OF body, sent_at ON messages
+   BEGIN SELECT RAISE(ABORT, 'message source body is immutable'); END`,
+  `CREATE TRIGGER messages_v16_delete_immutable
+   BEFORE DELETE ON messages
+   BEGIN SELECT RAISE(ABORT, 'message source is immutable'); END`,
+  `CREATE TABLE message_revisions (
+    message_id TEXT NOT NULL REFERENCES messages(id),
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    body TEXT NOT NULL CHECK (length(body) > 0),
+    revised_at TEXT NOT NULL CHECK (length(revised_at) > 0),
+    revised_by_actor_id TEXT NOT NULL REFERENCES actors(id),
+    PRIMARY KEY (message_id, revision)
+  ) STRICT`,
+  `INSERT INTO message_revisions (
+     message_id, revision, body, revised_at, revised_by_actor_id
+   )
+   SELECT id, 1, body, sent_at, author_id FROM messages`,
+  `CREATE TABLE message_envelopes (
+    message_id TEXT PRIMARY KEY REFERENCES messages(id),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    message_kind TEXT NOT NULL CHECK (
+      message_kind IN ('human', 'agent-final', 'agent-correction')
+    ),
+    lifecycle TEXT NOT NULL CHECK (lifecycle IN ('active', 'recalled')),
+    current_revision INTEGER NOT NULL CHECK (current_revision >= 1),
+    revision_count INTEGER NOT NULL CHECK (revision_count >= 1),
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+    recalled_at TEXT,
+    recalled_by_actor_id TEXT REFERENCES actors(id),
+    FOREIGN KEY (message_id, current_revision)
+      REFERENCES message_revisions(message_id, revision)
+      DEFERRABLE INITIALLY DEFERRED,
+    CHECK (
+      (lifecycle = 'active' AND recalled_at IS NULL AND recalled_by_actor_id IS NULL)
+      OR
+      (lifecycle = 'recalled' AND message_kind = 'human'
+       AND recalled_at IS NOT NULL AND recalled_by_actor_id IS NOT NULL)
+    )
+  ) STRICT`,
+  `INSERT INTO message_envelopes (
+     message_id, room_id, message_kind, lifecycle, current_revision,
+     revision_count, created_at, recalled_at, recalled_by_actor_id
+   )
+   SELECT id, room_id,
+          CASE author_kind WHEN 'human' THEN 'human' ELSE 'agent-final' END,
+          'active', 1, 1, sent_at, NULL, NULL
+   FROM messages`,
+  `CREATE UNIQUE INDEX message_envelopes_id_room_v16
+   ON message_envelopes(message_id, room_id)`,
+  `CREATE INDEX message_envelopes_room_created_v16
+   ON message_envelopes(room_id, created_at, message_id)`,
+  `CREATE INDEX message_revisions_revised_at_v16
+   ON message_revisions(revised_at, message_id, revision)`,
+  `CREATE TRIGGER message_revisions_v16_validate_insert
+   BEFORE INSERT ON message_revisions
+   WHEN length(NEW.message_id) = 0
+      OR length(NEW.revised_by_actor_id) = 0
+      OR COALESCE((SELECT author_id FROM messages WHERE id = NEW.message_id), '')
+           <> NEW.revised_by_actor_id
+      OR NEW.revision <> COALESCE((
+           SELECT MAX(revision) + 1 FROM message_revisions
+           WHERE message_id = NEW.message_id
+         ), 1)
+      OR (NEW.revision > 1 AND NOT EXISTS (
+           SELECT 1 FROM message_envelopes AS envelope
+           WHERE envelope.message_id = NEW.message_id
+             AND envelope.message_kind = 'human'
+             AND envelope.lifecycle = 'active'
+             AND envelope.current_revision = NEW.revision - 1
+             AND envelope.revision_count = NEW.revision - 1
+         ))
+   BEGIN
+     SELECT RAISE(ABORT, 'message revision sequence or author is invalid');
+   END`,
+  `CREATE TRIGGER message_revisions_v16_immutable_update
+   BEFORE UPDATE ON message_revisions
+   BEGIN SELECT RAISE(ABORT, 'message revision is immutable'); END`,
+  `CREATE TRIGGER message_revisions_v16_immutable_delete
+   BEFORE DELETE ON message_revisions
+   BEGIN SELECT RAISE(ABORT, 'message revision is immutable'); END`,
+  `CREATE TRIGGER message_envelopes_v16_validate_insert
+   BEFORE INSERT ON message_envelopes
+   WHEN length(NEW.message_id) = 0 OR length(NEW.room_id) = 0
+      OR NOT EXISTS (
+        SELECT 1 FROM messages AS message
+        WHERE message.id = NEW.message_id AND message.room_id = NEW.room_id
+          AND ((message.author_kind = 'human' AND NEW.message_kind = 'human')
+            OR (message.author_kind = 'agent'
+                AND NEW.message_kind IN ('agent-final', 'agent-correction')))
+      )
+      OR NEW.current_revision <> NEW.revision_count
+      OR NEW.current_revision <> COALESCE((
+        SELECT MAX(revision) FROM message_revisions
+        WHERE message_id = NEW.message_id
+      ), 0)
+   BEGIN
+     SELECT RAISE(ABORT, 'message envelope binding is invalid');
+   END`,
+  `CREATE TRIGGER message_envelopes_v16_validate_update
+   BEFORE UPDATE ON message_envelopes
+   WHEN NEW.message_id <> OLD.message_id OR NEW.room_id <> OLD.room_id
+      OR NEW.message_kind <> OLD.message_kind OR NEW.created_at <> OLD.created_at
+      OR OLD.lifecycle = 'recalled'
+      OR NEW.current_revision < OLD.current_revision
+      OR NEW.revision_count < OLD.revision_count
+      OR NEW.current_revision <> NEW.revision_count
+      OR NEW.current_revision <> COALESCE((
+        SELECT MAX(revision) FROM message_revisions
+        WHERE message_id = NEW.message_id
+      ), 0)
+      OR (NEW.message_kind <> 'human'
+          AND (NEW.current_revision <> OLD.current_revision
+               OR NEW.lifecycle <> OLD.lifecycle))
+      OR (NEW.lifecycle = 'recalled' AND (
+        OLD.lifecycle <> 'active'
+        OR NEW.recalled_at IS NULL OR NEW.recalled_by_actor_id IS NULL
+        OR NEW.recalled_by_actor_id <> (
+          SELECT author_id FROM messages WHERE id = NEW.message_id
+        )
+      ))
+   BEGIN
+     SELECT RAISE(ABORT, 'message envelope revision or recall transition is invalid');
+   END`,
+  `CREATE TRIGGER message_envelopes_v16_immutable_delete
+   BEFORE DELETE ON message_envelopes
+   BEGIN SELECT RAISE(ABORT, 'message envelope is immutable'); END`,
+  `CREATE TABLE message_mentions (
+    message_id TEXT NOT NULL,
+    room_id TEXT NOT NULL,
+    target_id TEXT NOT NULL CHECK (length(target_id) > 0),
+    target_kind TEXT NOT NULL CHECK (
+      target_kind IN ('human-request', 'agent-invocation')
+    ),
+    target_actor_id TEXT NOT NULL REFERENCES actors(id),
+    range_start_utf16 INTEGER NOT NULL CHECK (range_start_utf16 >= 0),
+    range_end_utf16 INTEGER NOT NULL CHECK (range_end_utf16 > range_start_utf16),
+    target_order INTEGER NOT NULL CHECK (target_order >= 0),
+    PRIMARY KEY (message_id, target_id),
+    UNIQUE (message_id, target_order),
+    FOREIGN KEY (message_id, room_id)
+      REFERENCES message_envelopes(message_id, room_id),
+    FOREIGN KEY (message_id, target_id)
+      REFERENCES message_target_outcomes(message_id, target_id)
+      DEFERRABLE INITIALLY DEFERRED
+  ) STRICT`,
+  `CREATE UNIQUE INDEX message_mentions_semantic_target_v16
+   ON message_mentions(message_id, target_kind, target_actor_id)`,
+  `CREATE UNIQUE INDEX message_mentions_outcome_binding_v16
+   ON message_mentions(message_id, target_id, target_actor_id, target_kind)`,
+  `CREATE UNIQUE INDEX message_mentions_actor_binding_v16
+   ON message_mentions(message_id, target_id, target_actor_id)`,
+  `CREATE TRIGGER message_mentions_v16_validate_insert
+   BEFORE INSERT ON message_mentions
+   WHEN NEW.target_order <> (
+          SELECT COUNT(*) FROM message_mentions WHERE message_id = NEW.message_id
+        )
+      OR EXISTS (
+        SELECT 1 FROM message_mentions AS existing
+        WHERE existing.message_id = NEW.message_id
+          AND NEW.range_start_utf16 < existing.range_end_utf16
+          AND existing.range_start_utf16 < NEW.range_end_utf16
+      )
+      OR NOT EXISTS (
+        SELECT 1 FROM message_envelopes AS envelope
+        WHERE envelope.message_id = NEW.message_id
+          AND envelope.room_id = NEW.room_id
+          AND envelope.message_kind = 'human'
+          AND envelope.lifecycle = 'active'
+      )
+   BEGIN
+     SELECT RAISE(ABORT, 'message mention order or range overlap is invalid');
+   END`,
+  `CREATE TRIGGER message_mentions_v16_immutable_update
+   BEFORE UPDATE ON message_mentions
+   BEGIN SELECT RAISE(ABORT, 'message mention is immutable'); END`,
+  `CREATE TRIGGER message_mentions_v16_immutable_delete
+   BEFORE DELETE ON message_mentions
+   BEGIN SELECT RAISE(ABORT, 'message mention is immutable'); END`,
+  `ALTER TABLE agent_invocation_intents RENAME TO agent_invocation_intents_v6`,
+  `CREATE TABLE agent_invocation_intents (
+    id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    source_message_id TEXT NOT NULL REFERENCES messages(id),
+    target_agent_id TEXT NOT NULL REFERENCES actors(id),
+    requester_actor_id TEXT NOT NULL REFERENCES actors(id),
+    intent_kind TEXT NOT NULL CHECK (
+      intent_kind IN ('direct_mention', 'structured_help', 'routed_candidate')
+    ),
+    execution_id TEXT UNIQUE REFERENCES agent_executions(id),
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+    message_transaction_id TEXT,
+    target_id TEXT,
+    source_revision INTEGER NOT NULL DEFAULT 1 CHECK (source_revision >= 1),
+    lineage_id TEXT,
+    turn_id TEXT,
+    origin_kind TEXT NOT NULL DEFAULT 'legacy_runtime' CHECK (
+      origin_kind IN ('message_target', 'legacy_runtime')
+    ),
+    status TEXT NOT NULL DEFAULT 'claimed' CHECK (
+      status IN ('pending', 'claimed', 'cancelled')
+    ),
+    claimed_at TEXT,
+    cancelled_at TEXT,
+    cancellation_reason TEXT CHECK (
+      cancellation_reason IS NULL OR cancellation_reason = 'message_recalled'
+    ),
+    supersedes_intent_id TEXT REFERENCES agent_invocation_intents(id),
+    FOREIGN KEY (source_message_id, source_revision)
+      REFERENCES message_revisions(message_id, revision),
+    FOREIGN KEY (source_message_id, target_id, target_agent_id)
+      REFERENCES message_mentions(message_id, target_id, target_actor_id)
+      DEFERRABLE INITIALLY DEFERRED,
+    CHECK (
+      (status = 'pending' AND claimed_at IS NULL
+       AND cancelled_at IS NULL AND cancellation_reason IS NULL)
+      OR
+      (status = 'claimed' AND cancelled_at IS NULL AND cancellation_reason IS NULL)
+      OR
+      (status = 'cancelled' AND cancelled_at IS NOT NULL
+       AND cancellation_reason = 'message_recalled')
+    ),
+    CHECK (
+      (origin_kind = 'legacy_runtime' AND target_id IS NULL
+       AND message_transaction_id IS NULL)
+      OR
+      (origin_kind = 'message_target' AND target_id IS NOT NULL
+       AND message_transaction_id IS NOT NULL AND lineage_id IS NOT NULL
+       AND turn_id IS NOT NULL AND execution_id IS NULL)
+    )
+  ) STRICT`,
+  `INSERT INTO agent_invocation_intents (
+     id, room_id, source_message_id, target_agent_id, requester_actor_id,
+     intent_kind, execution_id, created_at, message_transaction_id, target_id,
+     source_revision, lineage_id, turn_id, origin_kind, status, claimed_at,
+     cancelled_at, cancellation_reason, supersedes_intent_id
+   )
+   SELECT id, room_id, source_message_id, target_agent_id, requester_actor_id,
+          intent_kind, execution_id, created_at, NULL, NULL, 1, id, 'legacy',
+          'legacy_runtime', 'claimed', created_at, NULL, NULL, NULL
+   FROM agent_invocation_intents_v6`,
+  `DROP TABLE agent_invocation_intents_v6`,
+  `CREATE UNIQUE INDEX agent_invocation_intents_message_target_v16
+   ON agent_invocation_intents(message_transaction_id, target_id)
+   WHERE origin_kind = 'message_target'`,
+  `CREATE UNIQUE INDEX agent_invocation_intents_lineage_turn_v16
+   ON agent_invocation_intents(lineage_id, turn_id, target_agent_id)
+   WHERE lineage_id IS NOT NULL AND turn_id IS NOT NULL`,
+  `CREATE UNIQUE INDEX agent_invocation_intents_outcome_binding_v16
+   ON agent_invocation_intents(id, source_message_id, target_id, target_agent_id)`,
+  `CREATE INDEX agent_invocation_intents_pending_v16
+   ON agent_invocation_intents(status, created_at, id)`,
+  `CREATE TRIGGER agent_invocation_intents_v16_validate_insert
+   BEFORE INSERT ON agent_invocation_intents
+   WHEN length(NEW.id) = 0 OR length(NEW.room_id) = 0
+      OR COALESCE((SELECT kind FROM actors WHERE id = NEW.target_agent_id), '') <> 'agent'
+      OR COALESCE((SELECT kind FROM actors WHERE id = NEW.requester_actor_id), '') <> 'human'
+      OR NOT EXISTS (
+        SELECT 1 FROM messages AS source
+        WHERE source.id = NEW.source_message_id
+          AND source.room_id = NEW.room_id
+          AND source.author_id = NEW.requester_actor_id
+          AND source.author_kind = 'human'
+      )
+      OR (NEW.origin_kind = 'message_target' AND (
+        NEW.status <> 'pending' OR NEW.execution_id IS NOT NULL
+        OR NEW.intent_kind <> 'direct_mention'
+        OR NEW.source_revision <> 1
+        OR NEW.message_transaction_id <> NEW.source_message_id
+        OR NOT EXISTS (
+          SELECT 1 FROM message_mentions AS mention
+          WHERE mention.message_id = NEW.source_message_id
+            AND mention.target_id = NEW.target_id
+            AND mention.target_kind = 'agent-invocation'
+            AND mention.target_actor_id = NEW.target_agent_id
+        )
+      ))
+   BEGIN
+     SELECT RAISE(ABORT, 'Agent invocation intent binding is invalid');
+   END`,
+  `CREATE TRIGGER agent_invocation_intents_v16_validate_update
+   BEFORE UPDATE ON agent_invocation_intents
+   WHEN NEW.id <> OLD.id OR NEW.room_id <> OLD.room_id
+      OR NEW.source_message_id <> OLD.source_message_id
+      OR NEW.target_agent_id <> OLD.target_agent_id
+      OR NEW.requester_actor_id <> OLD.requester_actor_id
+      OR NEW.created_at <> OLD.created_at
+      OR NEW.message_transaction_id IS NOT OLD.message_transaction_id
+      OR NEW.target_id IS NOT OLD.target_id
+      OR NEW.source_revision <> OLD.source_revision
+      OR NEW.lineage_id IS NOT OLD.lineage_id OR NEW.turn_id IS NOT OLD.turn_id
+      OR NEW.origin_kind <> OLD.origin_kind
+      OR NEW.execution_id IS NOT OLD.execution_id
+      OR NEW.supersedes_intent_id IS NOT OLD.supersedes_intent_id
+      OR OLD.status = 'cancelled'
+      OR (OLD.status = 'claimed' AND NEW.status <> 'claimed')
+   BEGIN
+     SELECT RAISE(ABORT, 'Agent invocation intent binding or terminal state is immutable');
+   END`,
+  `CREATE TRIGGER agent_invocation_intents_v16_immutable_delete
+   BEFORE DELETE ON agent_invocation_intents
+   BEGIN SELECT RAISE(ABORT, 'Agent invocation intent is immutable'); END`,
+  `CREATE TABLE human_request_intents (
+    id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    source_message_id TEXT NOT NULL REFERENCES messages(id),
+    target_id TEXT NOT NULL,
+    source_revision INTEGER NOT NULL CHECK (source_revision >= 1),
+    requester_human_actor_id TEXT NOT NULL REFERENCES actors(id),
+    target_human_actor_id TEXT NOT NULL REFERENCES actors(id),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'claimed', 'cancelled')),
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+    claimed_at TEXT,
+    cancelled_at TEXT,
+    cancellation_reason TEXT CHECK (
+      cancellation_reason IS NULL OR cancellation_reason = 'message_recalled'
+    ),
+    UNIQUE (source_message_id, target_id),
+    FOREIGN KEY (source_message_id, source_revision)
+      REFERENCES message_revisions(message_id, revision),
+    FOREIGN KEY (source_message_id, target_id, target_human_actor_id)
+      REFERENCES message_mentions(message_id, target_id, target_actor_id)
+      DEFERRABLE INITIALLY DEFERRED,
+    CHECK (
+      (status = 'pending' AND claimed_at IS NULL
+       AND cancelled_at IS NULL AND cancellation_reason IS NULL)
+      OR
+      (status = 'claimed' AND claimed_at IS NOT NULL
+       AND cancelled_at IS NULL AND cancellation_reason IS NULL)
+      OR
+      (status = 'cancelled' AND cancelled_at IS NOT NULL
+       AND cancellation_reason = 'message_recalled')
+    )
+  ) STRICT`,
+  `CREATE UNIQUE INDEX human_request_intents_outcome_binding_v16
+   ON human_request_intents(id, source_message_id, target_id, target_human_actor_id)`,
+  `CREATE INDEX human_request_intents_pending_v16
+   ON human_request_intents(status, created_at, id)`,
+  `CREATE TRIGGER human_request_intents_v16_validate_insert
+   BEFORE INSERT ON human_request_intents
+   WHEN length(NEW.id) = 0
+      OR COALESCE((SELECT kind FROM actors WHERE id = NEW.requester_human_actor_id), '') <> 'human'
+      OR COALESCE((SELECT kind FROM actors WHERE id = NEW.target_human_actor_id), '') <> 'human'
+      OR NOT EXISTS (
+        SELECT 1 FROM messages AS source
+        WHERE source.id = NEW.source_message_id
+          AND source.room_id = NEW.room_id
+          AND source.author_id = NEW.requester_human_actor_id
+          AND source.author_kind = 'human'
+      )
+      OR NOT EXISTS (
+        SELECT 1 FROM message_mentions AS mention
+        WHERE mention.message_id = NEW.source_message_id
+          AND mention.target_id = NEW.target_id
+          AND mention.target_kind = 'human-request'
+          AND mention.target_actor_id = NEW.target_human_actor_id
+      )
+   BEGIN
+     SELECT RAISE(ABORT, 'Human Request intent binding is invalid');
+   END`,
+  `CREATE TRIGGER human_request_intents_v16_validate_update
+   BEFORE UPDATE ON human_request_intents
+   WHEN NEW.id <> OLD.id OR NEW.room_id <> OLD.room_id
+      OR NEW.source_message_id <> OLD.source_message_id
+      OR NEW.target_id <> OLD.target_id OR NEW.source_revision <> OLD.source_revision
+      OR NEW.requester_human_actor_id <> OLD.requester_human_actor_id
+      OR NEW.target_human_actor_id <> OLD.target_human_actor_id
+      OR NEW.created_at <> OLD.created_at OR OLD.status = 'cancelled'
+      OR (OLD.status = 'claimed' AND NEW.status <> 'claimed')
+   BEGIN
+     SELECT RAISE(ABORT, 'Human Request intent binding or terminal state is immutable');
+   END`,
+  `CREATE TRIGGER human_request_intents_v16_immutable_delete
+   BEFORE DELETE ON human_request_intents
+   BEGIN SELECT RAISE(ABORT, 'Human Request intent is immutable'); END`,
+  `CREATE TABLE message_target_outcomes (
+    message_id TEXT NOT NULL,
+    room_id TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    target_actor_id TEXT NOT NULL REFERENCES actors(id),
+    target_kind TEXT NOT NULL CHECK (
+      target_kind IN ('human-request', 'agent-invocation')
+    ),
+    status TEXT NOT NULL CHECK (
+      status IN ('request-created', 'invocation-intent-created', 'rejected')
+    ),
+    request_intent_id TEXT,
+    invocation_intent_id TEXT,
+    rejection_code TEXT CHECK (
+      rejection_code IS NULL OR rejection_code IN (
+        'target_not_member', 'target_kind_mismatch',
+        'target_assignment_inactive', 'target_room_archived'
+      )
+    ),
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+    PRIMARY KEY (message_id, target_id),
+    FOREIGN KEY (message_id, target_id, target_actor_id, target_kind)
+      REFERENCES message_mentions(message_id, target_id, target_actor_id, target_kind),
+    FOREIGN KEY (request_intent_id, message_id, target_id, target_actor_id)
+      REFERENCES human_request_intents(
+        id, source_message_id, target_id, target_human_actor_id
+      ) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (invocation_intent_id, message_id, target_id, target_actor_id)
+      REFERENCES agent_invocation_intents(
+        id, source_message_id, target_id, target_agent_id
+      ) DEFERRABLE INITIALLY DEFERRED,
+    CHECK (
+      (status = 'request-created' AND target_kind = 'human-request'
+       AND request_intent_id IS NOT NULL AND invocation_intent_id IS NULL
+       AND rejection_code IS NULL)
+      OR
+      (status = 'invocation-intent-created' AND target_kind = 'agent-invocation'
+       AND request_intent_id IS NULL AND invocation_intent_id IS NOT NULL
+       AND rejection_code IS NULL)
+      OR
+      (status = 'rejected' AND request_intent_id IS NULL
+       AND invocation_intent_id IS NULL AND rejection_code IS NOT NULL)
+    )
+  ) STRICT`,
+  `CREATE INDEX message_target_outcomes_room_message_v16
+   ON message_target_outcomes(room_id, message_id, target_id)`,
+  `CREATE TRIGGER message_target_outcomes_v16_immutable_update
+   BEFORE UPDATE ON message_target_outcomes
+   BEGIN SELECT RAISE(ABORT, 'message target outcome is immutable'); END`,
+  `CREATE TRIGGER message_target_outcomes_v16_immutable_delete
+   BEFORE DELETE ON message_target_outcomes
+   BEGIN SELECT RAISE(ABORT, 'message target outcome is immutable'); END`,
+  `CREATE TABLE message_reply_links (
+    message_id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL,
+    reply_to_message_id TEXT NOT NULL CHECK (length(reply_to_message_id) > 0),
+    FOREIGN KEY (message_id, room_id)
+      REFERENCES message_envelopes(message_id, room_id),
+    FOREIGN KEY (reply_to_message_id, room_id)
+      REFERENCES message_envelopes(message_id, room_id)
+  ) STRICT`,
+  `CREATE INDEX message_reply_links_target_v16
+   ON message_reply_links(room_id, reply_to_message_id, message_id)`,
+  `CREATE TRIGGER message_reply_links_v16_immutable_update
+   BEFORE UPDATE ON message_reply_links
+   BEGIN SELECT RAISE(ABORT, 'message reply link is immutable'); END`,
+  `CREATE TRIGGER message_reply_links_v16_immutable_delete
+   BEFORE DELETE ON message_reply_links
+   BEGIN SELECT RAISE(ABORT, 'message reply link is immutable'); END`,
+  `CREATE TABLE message_attachment_links (
+    message_id TEXT NOT NULL,
+    room_id TEXT NOT NULL,
+    attachment_id TEXT NOT NULL CHECK (length(attachment_id) > 0),
+    operational_state TEXT NOT NULL DEFAULT 'active' CHECK (
+      operational_state IN ('active', 'excluded_recalled')
+    ),
+    PRIMARY KEY (message_id, attachment_id),
+    FOREIGN KEY (message_id, room_id)
+      REFERENCES message_envelopes(message_id, room_id)
+  ) STRICT`,
+  `CREATE TRIGGER message_attachment_links_v16_validate_update
+   BEFORE UPDATE ON message_attachment_links
+   WHEN NEW.message_id <> OLD.message_id OR NEW.room_id <> OLD.room_id
+      OR NEW.attachment_id <> OLD.attachment_id
+      OR OLD.operational_state = 'excluded_recalled'
+      OR NEW.operational_state <> 'excluded_recalled'
+      OR NOT EXISTS (
+        SELECT 1 FROM message_envelopes AS envelope
+        WHERE envelope.message_id = NEW.message_id
+          AND envelope.lifecycle = 'recalled'
+      )
+   BEGIN
+     SELECT RAISE(ABORT, 'message attachment binding is immutable');
+   END`,
+  `CREATE TRIGGER message_attachment_links_v16_immutable_delete
+   BEFORE DELETE ON message_attachment_links
+   BEGIN SELECT RAISE(ABORT, 'message attachment link is immutable'); END`,
+  `CREATE TABLE agent_execution_intent_links (
+    intent_id TEXT NOT NULL REFERENCES agent_invocation_intents(id),
+    execution_id TEXT NOT NULL UNIQUE REFERENCES agent_executions(id),
+    execution_ordinal INTEGER NOT NULL CHECK (execution_ordinal >= 1),
+    retry_of_execution_id TEXT REFERENCES agent_executions(id),
+    source_revision INTEGER NOT NULL CHECK (source_revision >= 1),
+    linked_at TEXT NOT NULL CHECK (length(linked_at) > 0),
+    PRIMARY KEY (intent_id, execution_ordinal)
+  ) STRICT`,
+  `INSERT INTO agent_execution_intent_links (
+     intent_id, execution_id, execution_ordinal, retry_of_execution_id,
+     source_revision, linked_at
+   )
+   SELECT id, execution_id, 1, NULL, source_revision, created_at
+   FROM agent_invocation_intents WHERE execution_id IS NOT NULL`,
+  `CREATE INDEX agent_execution_intent_links_intent_ordinal_v16
+   ON agent_execution_intent_links(intent_id, execution_ordinal, execution_id)`,
+  `CREATE TRIGGER agent_execution_intent_links_v16_validate_insert
+   BEFORE INSERT ON agent_execution_intent_links
+   WHEN NEW.execution_ordinal <> COALESCE((
+          SELECT MAX(execution_ordinal) + 1 FROM agent_execution_intent_links
+          WHERE intent_id = NEW.intent_id
+        ), 1)
+      OR NOT EXISTS (
+        SELECT 1 FROM agent_invocation_intents AS intent
+        JOIN agent_executions AS execution ON execution.id = NEW.execution_id
+        WHERE intent.id = NEW.intent_id
+          AND intent.room_id = execution.room_id
+          AND intent.target_agent_id = execution.agent_id
+          AND intent.source_message_id = execution.trigger_message_id
+          AND intent.source_revision = NEW.source_revision
+      )
+   BEGIN
+     SELECT RAISE(ABORT, 'Agent execution intent lineage is invalid');
+   END`,
+  `CREATE TRIGGER agent_execution_intent_links_v16_immutable_update
+   BEFORE UPDATE ON agent_execution_intent_links
+   BEGIN SELECT RAISE(ABORT, 'Agent execution intent lineage is immutable'); END`,
+  `CREATE TRIGGER agent_execution_intent_links_v16_immutable_delete
+   BEFORE DELETE ON agent_execution_intent_links
+   BEGIN SELECT RAISE(ABORT, 'Agent execution intent lineage is immutable'); END`,
+  `CREATE TABLE message_recall_fences (
+    fence_id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    source_message_id TEXT NOT NULL REFERENCES message_envelopes(message_id),
+    source_revision INTEGER NOT NULL CHECK (source_revision >= 1),
+    scope_kind TEXT NOT NULL CHECK (
+      scope_kind IN ('message', 'invocation-intent', 'execution')
+    ),
+    invocation_intent_id TEXT REFERENCES agent_invocation_intents(id),
+    execution_id TEXT REFERENCES agent_executions(id),
+    reason TEXT NOT NULL CHECK (reason = 'message_recalled'),
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+    FOREIGN KEY (source_message_id, source_revision)
+      REFERENCES message_revisions(message_id, revision),
+    CHECK (
+      (scope_kind = 'message' AND invocation_intent_id IS NULL AND execution_id IS NULL)
+      OR
+      (scope_kind = 'invocation-intent'
+       AND invocation_intent_id IS NOT NULL AND execution_id IS NULL)
+      OR
+      (scope_kind = 'execution'
+       AND invocation_intent_id IS NOT NULL AND execution_id IS NOT NULL)
+    )
+  ) STRICT`,
+  `CREATE UNIQUE INDEX message_recall_fences_message_scope_v16
+   ON message_recall_fences(source_message_id)
+   WHERE scope_kind = 'message'`,
+  `CREATE UNIQUE INDEX message_recall_fences_intent_scope_v16
+   ON message_recall_fences(source_message_id, invocation_intent_id)
+   WHERE scope_kind = 'invocation-intent'`,
+  `CREATE UNIQUE INDEX message_recall_fences_execution_scope_v16
+   ON message_recall_fences(source_message_id, invocation_intent_id, execution_id)
+   WHERE scope_kind = 'execution'`,
+  `CREATE TRIGGER message_recall_fences_v16_validate_insert
+   BEFORE INSERT ON message_recall_fences
+   WHEN length(NEW.fence_id) = 0
+      OR NOT EXISTS (
+        SELECT 1 FROM message_envelopes AS envelope
+        WHERE envelope.message_id = NEW.source_message_id
+          AND envelope.room_id = NEW.room_id
+          AND envelope.message_kind = 'human'
+      )
+      OR (NEW.invocation_intent_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM agent_invocation_intents AS intent
+        WHERE intent.id = NEW.invocation_intent_id
+          AND intent.room_id = NEW.room_id
+          AND intent.source_message_id = NEW.source_message_id
+      ))
+      OR (NEW.execution_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM agent_execution_intent_links AS link
+        WHERE link.intent_id = NEW.invocation_intent_id
+          AND link.execution_id = NEW.execution_id
+      ))
+   BEGIN
+     SELECT RAISE(ABORT, 'message recall fence scope is invalid');
+   END`,
+  `CREATE TRIGGER message_recall_fences_v16_immutable_update
+   BEFORE UPDATE ON message_recall_fences
+   BEGIN SELECT RAISE(ABORT, 'message recall fence is immutable'); END`,
+  `CREATE TRIGGER message_recall_fences_v16_immutable_delete
+   BEFORE DELETE ON message_recall_fences
+   BEGIN SELECT RAISE(ABORT, 'message recall fence is immutable'); END`,
+  `CREATE TRIGGER message_envelopes_v16_recall_fence_update
+   BEFORE UPDATE OF lifecycle ON message_envelopes
+   WHEN NEW.lifecycle = 'recalled' AND (
+     NOT EXISTS (
+       SELECT 1 FROM message_recall_fences AS fence
+       WHERE fence.source_message_id = NEW.message_id AND fence.scope_kind = 'message'
+     )
+     OR EXISTS (
+       SELECT 1 FROM human_request_intents AS intent
+       WHERE intent.source_message_id = NEW.message_id AND intent.status = 'pending'
+     )
+     OR EXISTS (
+       SELECT 1 FROM agent_invocation_intents AS intent
+       WHERE intent.source_message_id = NEW.message_id AND intent.status = 'pending'
+     )
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'message recall requires a durable fence and cancelled pending intents');
+   END`,
+  `CREATE TABLE agent_message_sources (
+    message_id TEXT PRIMARY KEY REFERENCES message_envelopes(message_id),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    invocation_intent_id TEXT NOT NULL REFERENCES agent_invocation_intents(id),
+    execution_id TEXT NOT NULL REFERENCES agent_executions(id),
+    attempt_seq INTEGER NOT NULL CHECK (attempt_seq >= 1),
+    execution_generation INTEGER NOT NULL CHECK (execution_generation >= 1),
+    source_message_id TEXT NOT NULL REFERENCES message_envelopes(message_id),
+    source_revision INTEGER NOT NULL CHECK (source_revision >= 1),
+    committed_at TEXT NOT NULL CHECK (length(committed_at) > 0),
+    UNIQUE (invocation_intent_id, execution_id, attempt_seq, execution_generation),
+    FOREIGN KEY (source_message_id, source_revision)
+      REFERENCES message_revisions(message_id, revision)
+  ) STRICT`,
+  `CREATE TRIGGER agent_message_sources_v16_validate_insert
+   BEFORE INSERT ON agent_message_sources
+   WHEN NOT EXISTS (
+     SELECT 1
+     FROM message_envelopes AS output
+     JOIN messages AS output_message ON output_message.id = output.message_id
+     JOIN agent_invocation_intents AS intent ON intent.id = NEW.invocation_intent_id
+     JOIN agent_execution_intent_links AS link
+       ON link.intent_id = intent.id AND link.execution_id = NEW.execution_id
+     JOIN agent_executions AS execution ON execution.id = link.execution_id
+     JOIN message_envelopes AS source ON source.message_id = NEW.source_message_id
+     WHERE output.message_id = NEW.message_id
+       AND output.room_id = NEW.room_id
+       AND output.message_kind IN ('agent-final', 'agent-correction')
+       AND output_message.author_kind = 'agent'
+       AND output_message.author_id = intent.target_agent_id
+       AND intent.room_id = NEW.room_id
+       AND intent.source_message_id = NEW.source_message_id
+       AND intent.source_revision = NEW.source_revision
+       AND execution.current_attempt_seq = NEW.attempt_seq
+       AND source.lifecycle = 'active'
+       AND NOT EXISTS (
+         SELECT 1 FROM message_recall_fences AS fence
+         WHERE fence.source_message_id = NEW.source_message_id
+       )
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'Agent message source lineage or recall fence is invalid');
+   END`,
+  `CREATE TRIGGER agent_message_sources_v16_immutable_update
+   BEFORE UPDATE ON agent_message_sources
+   BEGIN SELECT RAISE(ABORT, 'Agent message source is immutable'); END`,
+  `CREATE TRIGGER agent_message_sources_v16_immutable_delete
+   BEFORE DELETE ON agent_message_sources
+   BEGIN SELECT RAISE(ABORT, 'Agent message source is immutable'); END`,
+  `CREATE TABLE agent_message_corrections (
+    correction_message_id TEXT PRIMARY KEY REFERENCES message_envelopes(message_id),
+    corrects_message_id TEXT NOT NULL REFERENCES message_envelopes(message_id),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    agent_actor_id TEXT NOT NULL REFERENCES actors(id),
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+    CHECK (correction_message_id <> corrects_message_id)
+  ) STRICT`,
+  `CREATE INDEX agent_message_corrections_source_v16
+   ON agent_message_corrections(room_id, corrects_message_id, correction_message_id)`,
+  `CREATE TRIGGER agent_message_corrections_v16_validate_insert
+   BEFORE INSERT ON agent_message_corrections
+   WHEN NOT EXISTS (
+     SELECT 1
+     FROM message_envelopes AS correction
+     JOIN messages AS correction_message ON correction_message.id = correction.message_id
+     JOIN message_envelopes AS original ON original.message_id = NEW.corrects_message_id
+     JOIN messages AS original_message ON original_message.id = original.message_id
+     WHERE correction.message_id = NEW.correction_message_id
+       AND correction.room_id = NEW.room_id
+       AND correction.message_kind = 'agent-correction'
+       AND original.room_id = NEW.room_id
+       AND original.message_kind = 'agent-final'
+       AND correction_message.author_id = NEW.agent_actor_id
+       AND original_message.author_id = NEW.agent_actor_id
+       AND correction_message.author_kind = 'agent'
+       AND original_message.author_kind = 'agent'
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'Agent correction must append for the same Agent final');
+   END`,
+  `CREATE TRIGGER agent_message_corrections_v16_immutable_update
+   BEFORE UPDATE ON agent_message_corrections
+   BEGIN SELECT RAISE(ABORT, 'Agent correction lineage is immutable'); END`,
+  `CREATE TRIGGER agent_message_corrections_v16_immutable_delete
+   BEFORE DELETE ON agent_message_corrections
+   BEGIN SELECT RAISE(ABORT, 'Agent correction lineage is immutable'); END`,
+] as const;
+
 export const AUTHORITY_V14_STATEMENT_COUNT_FOR_TEST = V14_STATEMENTS.length;
 export const AUTHORITY_V15_STATEMENT_COUNT_FOR_TEST = V15_STATEMENTS.length;
+export const AUTHORITY_V16_STATEMENT_COUNT_FOR_TEST = V16_STATEMENTS.length;
 
 const V2_STATEMENTS = [
   `ALTER TABLE actors
@@ -2168,6 +2856,12 @@ const MIGRATIONS = [
     "truthful-room-lifecycle-audit-vocabulary",
     V15_STATEMENTS,
     V15_MIGRATION_CHECKSUM,
+  ),
+  defineMigration(
+    16,
+    "message-authority-vnext",
+    V16_STATEMENTS,
+    V16_MIGRATION_CHECKSUM,
   ),
 ] as const satisfies readonly Migration[];
 
@@ -2594,6 +3288,59 @@ const V15_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V16_SCHEMA_CONTRACT = {
+  ...V15_SCHEMA_CONTRACT,
+  agent_execution_intent_links: [
+    "intent_id", "execution_id", "execution_ordinal", "retry_of_execution_id",
+    "source_revision", "linked_at",
+  ],
+  agent_invocation_intents: [
+    "id", "room_id", "source_message_id", "target_agent_id",
+    "requester_actor_id", "intent_kind", "execution_id", "created_at",
+    "message_transaction_id", "target_id", "source_revision", "lineage_id",
+    "turn_id", "origin_kind", "status", "claimed_at", "cancelled_at",
+    "cancellation_reason", "supersedes_intent_id",
+  ],
+  agent_message_corrections: [
+    "correction_message_id", "corrects_message_id", "room_id",
+    "agent_actor_id", "created_at",
+  ],
+  agent_message_sources: [
+    "message_id", "room_id", "invocation_intent_id", "execution_id",
+    "attempt_seq", "execution_generation", "source_message_id",
+    "source_revision", "committed_at",
+  ],
+  human_request_intents: [
+    "id", "room_id", "source_message_id", "target_id", "source_revision",
+    "requester_human_actor_id", "target_human_actor_id", "status",
+    "created_at", "claimed_at", "cancelled_at", "cancellation_reason",
+  ],
+  message_attachment_links: [
+    "message_id", "room_id", "attachment_id", "operational_state",
+  ],
+  message_envelopes: [
+    "message_id", "room_id", "message_kind", "lifecycle", "current_revision",
+    "revision_count", "created_at", "recalled_at", "recalled_by_actor_id",
+  ],
+  message_mentions: [
+    "message_id", "room_id", "target_id", "target_kind", "target_actor_id",
+    "range_start_utf16", "range_end_utf16", "target_order",
+  ],
+  message_recall_fences: [
+    "fence_id", "room_id", "source_message_id", "source_revision",
+    "scope_kind", "invocation_intent_id", "execution_id", "reason", "created_at",
+  ],
+  message_reply_links: ["message_id", "room_id", "reply_to_message_id"],
+  message_revisions: [
+    "message_id", "revision", "body", "revised_at", "revised_by_actor_id",
+  ],
+  message_target_outcomes: [
+    "message_id", "room_id", "target_id", "target_actor_id", "target_kind",
+    "status", "request_intent_id", "invocation_intent_id", "rejection_code",
+    "created_at",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
@@ -2610,6 +3357,7 @@ const SCHEMA_CONTRACTS = {
   13: V13_SCHEMA_CONTRACT,
   14: V14_SCHEMA_CONTRACT,
   15: V15_SCHEMA_CONTRACT,
+  16: V16_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -3512,6 +4260,167 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
       "offline lease invalidations must be bounded by lifecycle and access authority",
     );
   }
+  if (schemaVersion >= 16) {
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM messages AS message
+       LEFT JOIN message_envelopes AS envelope ON envelope.message_id = message.id
+       LEFT JOIN message_revisions AS current_revision
+         ON current_revision.message_id = envelope.message_id
+        AND current_revision.revision = envelope.current_revision
+       WHERE envelope.message_id IS NULL
+          OR envelope.room_id <> message.room_id
+          OR ((message.author_kind = 'human') <> (envelope.message_kind = 'human'))
+          OR current_revision.message_id IS NULL
+          OR envelope.current_revision <> envelope.revision_count
+          OR envelope.revision_count <> (
+            SELECT COUNT(*) FROM message_revisions AS revision
+            WHERE revision.message_id = message.id
+          )
+          OR envelope.current_revision <> (
+            SELECT MAX(revision) FROM message_revisions AS revision
+            WHERE revision.message_id = message.id
+          )
+       LIMIT 1`,
+      "every message must have one kind-matched envelope and complete revision chain",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM message_revisions AS revision
+       JOIN messages AS message ON message.id = revision.message_id
+       LEFT JOIN message_envelopes AS envelope ON envelope.message_id = revision.message_id
+       WHERE envelope.message_id IS NULL
+          OR revision.revised_by_actor_id <> message.author_id
+          OR (message.author_kind = 'agent' AND revision.revision <> 1)
+          OR revision.revision > envelope.current_revision
+       LIMIT 1`,
+      "message revisions must remain append-only and author bound",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM message_mentions AS mention
+       LEFT JOIN message_target_outcomes AS outcome
+         ON outcome.message_id = mention.message_id AND outcome.target_id = mention.target_id
+       WHERE outcome.message_id IS NULL
+          OR outcome.room_id <> mention.room_id
+          OR outcome.target_actor_id <> mention.target_actor_id
+          OR outcome.target_kind <> mention.target_kind
+          OR EXISTS (
+            SELECT 1 FROM message_mentions AS other
+            WHERE other.message_id = mention.message_id
+              AND other.target_order < mention.target_order
+              AND other.range_end_utf16 > mention.range_start_utf16
+          )
+       LIMIT 1`,
+      "every structured mention must have exactly one matching outcome and ordered range",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM message_target_outcomes AS outcome
+       LEFT JOIN human_request_intents AS request
+         ON request.id = outcome.request_intent_id
+       LEFT JOIN agent_invocation_intents AS invocation
+         ON invocation.id = outcome.invocation_intent_id
+       WHERE (outcome.status = 'request-created' AND (
+                request.id IS NULL OR request.source_message_id <> outcome.message_id
+                OR request.target_id <> outcome.target_id
+                OR request.target_human_actor_id <> outcome.target_actor_id
+              ))
+          OR (outcome.status = 'invocation-intent-created' AND (
+                invocation.id IS NULL
+                OR invocation.source_message_id <> outcome.message_id
+                OR invocation.target_id <> outcome.target_id
+                OR invocation.target_agent_id <> outcome.target_actor_id
+              ))
+          OR (outcome.status = 'rejected' AND (
+                request.id IS NOT NULL OR invocation.id IS NOT NULL
+              ))
+       LIMIT 1`,
+      "message target outcomes must retain their closed intent discriminants",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM human_request_intents AS intent
+       JOIN actors AS requester ON requester.id = intent.requester_human_actor_id
+       JOIN actors AS target ON target.id = intent.target_human_actor_id
+       JOIN messages AS source ON source.id = intent.source_message_id
+       WHERE requester.kind <> 'human' OR target.kind <> 'human'
+          OR source.author_kind <> 'human'
+          OR source.author_id <> intent.requester_human_actor_id
+          OR source.room_id <> intent.room_id
+       LIMIT 1`,
+      "Human Request intents must remain Human-authored and same-Room",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_invocation_intents AS intent
+       JOIN actors AS requester ON requester.id = intent.requester_actor_id
+       JOIN actors AS target ON target.id = intent.target_agent_id
+       JOIN messages AS source ON source.id = intent.source_message_id
+       WHERE requester.kind <> 'human' OR target.kind <> 'agent'
+          OR source.author_kind <> 'human'
+          OR source.author_id <> intent.requester_actor_id
+          OR source.room_id <> intent.room_id
+          OR (intent.origin_kind = 'message_target' AND (
+                intent.target_id IS NULL OR intent.message_transaction_id IS NULL
+                OR intent.lineage_id IS NULL OR intent.turn_id IS NULL
+                OR intent.execution_id IS NOT NULL
+              ))
+       LIMIT 1`,
+      "Agent invocation intents must remain execution-independent and authority bound",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM message_envelopes AS envelope
+       WHERE envelope.lifecycle = 'recalled' AND (
+         NOT EXISTS (
+           SELECT 1 FROM message_recall_fences AS fence
+           WHERE fence.source_message_id = envelope.message_id
+             AND fence.scope_kind = 'message'
+         )
+         OR EXISTS (
+           SELECT 1 FROM human_request_intents AS intent
+           WHERE intent.source_message_id = envelope.message_id
+             AND intent.status = 'pending'
+         )
+         OR EXISTS (
+           SELECT 1 FROM agent_invocation_intents AS intent
+           WHERE intent.source_message_id = envelope.message_id
+             AND intent.status = 'pending'
+         )
+       )
+       LIMIT 1`,
+      "recalled messages must have a source fence and no pending target intents",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_message_corrections AS correction
+       JOIN message_envelopes AS correction_envelope
+         ON correction_envelope.message_id = correction.correction_message_id
+       JOIN message_envelopes AS original_envelope
+         ON original_envelope.message_id = correction.corrects_message_id
+       JOIN messages AS correction_message
+         ON correction_message.id = correction.correction_message_id
+       JOIN messages AS original_message
+         ON original_message.id = correction.corrects_message_id
+       WHERE correction_envelope.message_kind <> 'agent-correction'
+          OR original_envelope.message_kind <> 'agent-final'
+          OR correction_envelope.room_id <> correction.room_id
+          OR original_envelope.room_id <> correction.room_id
+          OR correction_message.author_id <> correction.agent_actor_id
+          OR original_message.author_id <> correction.agent_actor_id
+       LIMIT 1`,
+      "Agent corrections must append for the same Agent final",
+    );
+  }
 }
 
 function validateExistingSchema(database: DatabaseSync, currentVersion: number): void {
@@ -3739,6 +4648,19 @@ export function migrateAuthorityDatabaseToVersion13ForTest(
   database: DatabaseSync,
 ): void {
   migrateAuthorityDatabaseToVersion(database, 13);
+}
+
+export function migrateAuthorityDatabaseToVersion15ForTest(
+  database: DatabaseSync,
+  fault?: MigrationFaultOptions,
+): void {
+  migrateAuthorityDatabaseToVersion(database, 15, fault);
+}
+
+export function migrateAuthorityDatabaseToVersion14ForTest(
+  database: DatabaseSync,
+): void {
+  migrateAuthorityDatabaseToVersion(database, 14);
 }
 
 export function migrateAuthorityDatabaseToVersion12ForTest(
