@@ -187,7 +187,7 @@ function hasExactKeys(
 ): boolean {
   const allowed = new Set([...required, ...optional]);
   return required.every((key) => Object.hasOwn(value, key)) &&
-    Object.keys(value).every((key) => allowed.has(key));
+    Reflect.ownKeys(value).every((key) => typeof key === "string" && allowed.has(key));
 }
 
 function isIdentifier(value: unknown): value is string {

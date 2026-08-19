@@ -154,6 +154,23 @@ describe("Message Authority vNext closed guards", () => {
       .toBe(false);
   });
 
+  it("rejects symbol and non-enumerable extra own keys at every closed boundary", () => {
+    const hiddenCapability = Symbol("capability");
+    const symbolInjectedSubmit = { ...submit, [hiddenCapability]: "forged" };
+    expect(messageAuthority.isHumanMessageSubmit(symbolInjectedSubmit)).toBe(false);
+
+    const hiddenInjectedTarget = { ...humanTarget } as Record<PropertyKey, unknown>;
+    Object.defineProperty(hiddenInjectedTarget, "capability", {
+      configurable: true,
+      enumerable: false,
+      value: "forged",
+    });
+    expect(messageAuthority.isHumanMessageSubmit({
+      ...submit,
+      mentionedTargets: [hiddenInjectedTarget, agentTarget],
+    })).toBe(false);
+  });
+
   it("rejects out-of-bounds, split-surrogate, overlapping, unsorted and duplicate targets", () => {
     expect(messageAuthority.isHumanMessageSubmit({
       ...submit,
