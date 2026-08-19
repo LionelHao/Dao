@@ -137,6 +137,100 @@ function begin(database: DatabaseSync, operation: () => void): void {
   }
 }
 
+function seedClaimedAgentExecution(database: DatabaseSync): void {
+  begin(database, () => {
+    database.prepare(
+      `INSERT INTO message_mentions (
+         message_id, room_id, target_id, target_kind, target_actor_id,
+         range_start_utf16, range_end_utf16, target_order
+       ) VALUES ('legacy-human', 'v16-room', 'final-target', 'agent-invocation',
+                 'v16-agent', 5, 10, 0)`,
+    ).run();
+    database.prepare(
+      `INSERT INTO agent_invocation_intents (
+         id, room_id, source_message_id, target_agent_id, requester_actor_id,
+         intent_kind, execution_id, created_at, message_transaction_id,
+         target_id, source_revision, lineage_id, turn_id, origin_kind, status
+       ) VALUES ('final-intent', 'v16-room', 'legacy-human', 'v16-agent',
+                 'v16-human', 'direct_mention', NULL,
+                 '2026-08-19T00:10:00.000Z', 'legacy-human', 'final-target', 1,
+                 'final-lineage', 'final-turn', 'message_target', 'pending')`,
+    ).run();
+    database.prepare(
+      `INSERT INTO message_target_outcomes (
+         message_id, room_id, target_id, target_actor_id, target_kind, status,
+         request_intent_id, invocation_intent_id, rejection_code, created_at
+       ) VALUES ('legacy-human', 'v16-room', 'final-target', 'v16-agent',
+                 'agent-invocation', 'invocation-intent-created', NULL,
+                 'final-intent', NULL, '2026-08-19T00:10:00.000Z')`,
+    ).run();
+  });
+  database.prepare(
+    `UPDATE agent_invocation_intents
+     SET status = 'claimed', claimed_at = '2026-08-19T00:11:00.000Z'
+     WHERE id = 'final-intent'`,
+  ).run();
+  database.exec(`
+    INSERT INTO agent_executions (
+      id, room_id, room_archive_generation, agent_id, trigger_message_id,
+      status, started_at, completed_at, result_json, requester_actor_id,
+      tool_name, action_category, tool_dispatch_phase, current_attempt_seq,
+      retry_cycle, retry_ordinal, provider_id, model_id, recovery_cursor,
+      queued_at, updated_at
+    ) VALUES (
+      'final-execution', 'v16-room', 0, 'v16-agent', 'legacy-human',
+      'running', '2026-08-19T00:11:00.000Z', NULL, NULL, 'v16-human',
+      'model.generate', 'model_generation', NULL, 1, 1, 1, NULL, NULL, 0,
+      '2026-08-19T00:11:00.000Z', '2026-08-19T00:11:00.000Z'
+    );
+    INSERT INTO agent_execution_attempts (
+      execution_id, attempt_seq, retry_cycle, retry_ordinal, status,
+      action_category, started_at, recovery_cursor
+    ) VALUES (
+      'final-execution', 1, 1, 1, 'running', 'model_generation',
+      '2026-08-19T00:11:00.000Z', 0
+    );
+    INSERT INTO agent_execution_intent_links (
+      intent_id, execution_id, execution_ordinal, retry_of_execution_id,
+      source_revision, linked_at
+    ) VALUES (
+      'final-intent', 'final-execution', 1, NULL, 1,
+      '2026-08-19T00:11:00.000Z'
+    );
+  `);
+}
+
+function insertAgentMessageSource(
+  database: DatabaseSync,
+  messageId: string,
+  executionGeneration: number,
+): void {
+  database.prepare(
+    `INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+     VALUES (?, 'v16-room', 'v16-agent', 'agent', 'durable final',
+             '2026-08-19T00:12:00.000Z')`,
+  ).run(messageId);
+  database.prepare(
+    `INSERT INTO message_revisions (
+       message_id, revision, body, revised_at, revised_by_actor_id
+     ) VALUES (?, 1, 'durable final', '2026-08-19T00:12:00.000Z', 'v16-agent')`,
+  ).run(messageId);
+  database.prepare(
+    `INSERT INTO message_envelopes (
+       message_id, room_id, message_kind, lifecycle, current_revision,
+       revision_count, created_at, recalled_at, recalled_by_actor_id
+     ) VALUES (?, 'v16-room', 'agent-final', 'active', 1, 1,
+               '2026-08-19T00:12:00.000Z', NULL, NULL)`,
+  ).run(messageId);
+  database.prepare(
+    `INSERT INTO agent_message_sources (
+       message_id, room_id, invocation_intent_id, execution_id, attempt_seq,
+       execution_generation, source_message_id, source_revision, committed_at
+     ) VALUES (?, 'v16-room', 'final-intent', 'final-execution', 1, ?,
+               'legacy-human', 1, '2026-08-19T00:12:00.000Z')`,
+  ).run(messageId, executionGeneration);
+}
+
 describe("authority SQLite v16 Message Authority", () => {
   it("upgrades every immutable historical schema through the actual v16 contract", () => {
     for (let version = 1; version < 16; version += 1) {
@@ -157,12 +251,14 @@ describe("authority SQLite v16 Message Authority", () => {
       migrateAuthorityDatabase(database);
 
       expect(AUTHORITY_SCHEMA_VERSION).toBe(16);
-      expect(AUTHORITY_V16_STATEMENT_COUNT_FOR_TEST).toBe(74);
+      expect(AUTHORITY_V16_STATEMENT_COUNT_FOR_TEST).toBe(82);
       expect(readSchemaVersion(database)).toBe(16);
       for (const [table, columns] of Object.entries(V16_TABLE_COLUMNS)) {
         expect(listAuthorityTables(database)).toContain(table);
         expect(tableColumns(database, table)).toEqual(columns);
       }
+      expect(tableColumns(database, "agent_executions").at(-1))
+        .toBe("execution_generation");
       expect(database.prepare(
         "SELECT name, checksum FROM schema_migrations WHERE version = 15",
       ).get()).toEqual({
@@ -173,7 +269,7 @@ describe("authority SQLite v16 Message Authority", () => {
         "SELECT name, checksum FROM schema_migrations WHERE version = 16",
       ).get()).toEqual({
         name: "message-authority-vnext",
-        checksum: "ed0d726ecda2b30b4dbbc43945a4165bb4e3923fb11c7f56198a0f0cd6f3383f",
+        checksum: "fe5e0cd58db3351d7ccc34d9e1a61b47ffe8ed2cce92fe36961356087338fe72",
       });
       const indexes = database.prepare(
         `SELECT name FROM sqlite_schema
@@ -181,12 +277,15 @@ describe("authority SQLite v16 Message Authority", () => {
       ).all().map((row) => String(row.name));
       expect(indexes).toEqual(expect.arrayContaining([
         "agent_execution_intent_links_intent_ordinal_v16",
+        "agent_executions_result_message_binding_v16",
         "agent_invocation_intents_lineage_turn_v16",
         "agent_invocation_intents_message_target_v16",
         "message_envelopes_room_created_v16",
         "message_mentions_semantic_target_v16",
         "message_recall_fences_execution_scope_v16",
         "message_revisions_revised_at_v16",
+        "message_target_outcomes_invocation_binding_v16",
+        "message_target_outcomes_request_binding_v16",
         "message_target_outcomes_room_message_v16",
       ]));
     });
@@ -428,6 +527,22 @@ describe("authority SQLite v16 Message Authority", () => {
     });
   });
 
+  it("keeps the legacy message identity immutable beside its append-only body", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabaseToVersion15ForTest(database);
+      seedRoomAndLegacyMessages(database);
+      migrateAuthorityDatabase(database);
+
+      for (const mutation of [
+        "UPDATE messages SET room_id = 'v16-room-2' WHERE id = 'legacy-human'",
+        "UPDATE messages SET author_id = 'v16-human-2' WHERE id = 'legacy-human'",
+        "UPDATE messages SET author_kind = 'agent' WHERE id = 'legacy-human'",
+      ]) {
+        expect(() => database.prepare(mutation).run()).toThrow(/immutable/i);
+      }
+    });
+  });
+
   it("requires every structured target to commit with exactly one closed outcome", () => {
     withDatabase((database) => {
       migrateAuthorityDatabaseToVersion15ForTest(database);
@@ -508,6 +623,86 @@ describe("authority SQLite v16 Message Authority", () => {
     });
   });
 
+  it("rejects cross-Room outcomes and intents without their matching created outcome", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabaseToVersion15ForTest(database);
+      seedRoomAndLegacyMessages(database);
+      migrateAuthorityDatabase(database);
+
+      expect(() => begin(database, () => {
+        database.prepare(
+          `INSERT INTO message_mentions (
+             message_id, room_id, target_id, target_kind, target_actor_id,
+             range_start_utf16, range_end_utf16, target_order
+           ) VALUES ('legacy-human', 'v16-room', 'cross-room', 'human-request',
+                     'v16-human-2', 0, 4, 0)`,
+        ).run();
+        database.prepare(
+          `INSERT INTO message_target_outcomes (
+             message_id, room_id, target_id, target_actor_id, target_kind, status,
+             request_intent_id, invocation_intent_id, rejection_code, created_at
+           ) VALUES ('legacy-human', 'v16-room-2', 'cross-room', 'v16-human-2',
+                     'human-request', 'rejected', NULL, NULL, 'target_not_member',
+                     '2026-08-19T00:06:00.000Z')`,
+        ).run();
+      })).toThrow();
+
+      expect(() => begin(database, () => {
+        database.prepare(
+          `INSERT INTO message_mentions (
+             message_id, room_id, target_id, target_kind, target_actor_id,
+             range_start_utf16, range_end_utf16, target_order
+           ) VALUES ('legacy-human', 'v16-room', 'orphan-intent', 'human-request',
+                     'v16-human-2', 0, 4, 0)`,
+        ).run();
+        database.prepare(
+          `INSERT INTO human_request_intents (
+             id, room_id, source_message_id, target_id, source_revision,
+             requester_human_actor_id, target_human_actor_id, status, created_at
+           ) VALUES ('orphan-request', 'v16-room', 'legacy-human', 'orphan-intent', 1,
+                     'v16-human', 'v16-human-2', 'pending',
+                     '2026-08-19T00:06:00.000Z')`,
+        ).run();
+        database.prepare(
+          `INSERT INTO message_target_outcomes (
+             message_id, room_id, target_id, target_actor_id, target_kind, status,
+             request_intent_id, invocation_intent_id, rejection_code, created_at
+           ) VALUES ('legacy-human', 'v16-room', 'orphan-intent', 'v16-human-2',
+                     'human-request', 'rejected', NULL, NULL, 'target_not_member',
+                     '2026-08-19T00:06:00.000Z')`,
+        ).run();
+      })).toThrow();
+
+      begin(database, () => {
+        database.prepare(
+          `INSERT INTO message_mentions (
+             message_id, room_id, target_id, target_kind, target_actor_id,
+             range_start_utf16, range_end_utf16, target_order
+           ) VALUES ('legacy-human', 'v16-room', 'closed-agent', 'agent-invocation',
+                     'v16-agent', 0, 4, 0)`,
+        ).run();
+        database.prepare(
+          `INSERT INTO message_target_outcomes (
+             message_id, room_id, target_id, target_actor_id, target_kind, status,
+             request_intent_id, invocation_intent_id, rejection_code, created_at
+           ) VALUES ('legacy-human', 'v16-room', 'closed-agent', 'v16-agent',
+                     'agent-invocation', 'rejected', NULL, NULL,
+                     'target_assignment_inactive', '2026-08-19T00:06:00.000Z')`,
+        ).run();
+      });
+      expect(() => database.prepare(
+        `INSERT INTO agent_invocation_intents (
+           id, room_id, source_message_id, target_agent_id, requester_actor_id,
+           intent_kind, execution_id, created_at, message_transaction_id,
+           target_id, source_revision, lineage_id, turn_id, origin_kind, status
+         ) VALUES ('late-agent-intent', 'v16-room', 'legacy-human', 'v16-agent',
+                   'v16-human', 'direct_mention', NULL,
+                   '2026-08-19T00:07:00.000Z', 'legacy-human', 'closed-agent', 1,
+                   'closed-lineage', 'closed-turn', 'message_target', 'pending')`,
+      ).run()).toThrow(/outcome|closed/i);
+    });
+  });
+
   it("stores execution-independent invocation intents and source-scoped recall fences", () => {
     withDatabase((database) => {
       migrateAuthorityDatabaseToVersion15ForTest(database);
@@ -563,6 +758,86 @@ describe("authority SQLite v16 Message Authority", () => {
       expect(() => database.prepare(
         "DELETE FROM message_recall_fences WHERE fence_id = 'message-fence'",
       ).run()).toThrow(/immutable/i);
+    });
+  });
+
+  it("binds a recall fence to the current source revision", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabaseToVersion15ForTest(database);
+      seedRoomAndLegacyMessages(database);
+      migrateAuthorityDatabase(database);
+
+      database.prepare(
+        `INSERT INTO message_revisions (
+           message_id, revision, body, revised_at, revised_by_actor_id
+         ) VALUES ('legacy-human', 2, 'edited', '2026-08-19T00:04:00.000Z', 'v16-human')`,
+      ).run();
+      database.prepare(
+        `UPDATE message_envelopes SET current_revision = 2, revision_count = 2
+         WHERE message_id = 'legacy-human'`,
+      ).run();
+
+      expect(() => database.prepare(
+        `INSERT INTO message_recall_fences (
+           fence_id, room_id, source_message_id, source_revision, scope_kind,
+           invocation_intent_id, execution_id, reason, created_at
+         ) VALUES ('stale-fence', 'v16-room', 'legacy-human', 1, 'message',
+                   NULL, NULL, 'message_recalled', '2026-08-19T00:08:00.000Z')`,
+      ).run()).toThrow(/fence|revision/i);
+
+      database.prepare(
+        `INSERT INTO message_recall_fences (
+           fence_id, room_id, source_message_id, source_revision, scope_kind,
+           invocation_intent_id, execution_id, reason, created_at
+         ) VALUES ('current-fence', 'v16-room', 'legacy-human', 2, 'message',
+                   NULL, NULL, 'message_recalled', '2026-08-19T00:08:00.000Z')`,
+      ).run();
+      database.prepare(
+        `UPDATE message_envelopes
+         SET lifecycle = 'recalled', recalled_at = '2026-08-19T00:08:00.000Z',
+             recalled_by_actor_id = 'v16-human'
+         WHERE message_id = 'legacy-human'`,
+      ).run();
+      expect(database.prepare(
+        `SELECT lifecycle, current_revision AS currentRevision
+         FROM message_envelopes WHERE message_id = 'legacy-human'`,
+      ).get()).toEqual({ lifecycle: "recalled", currentRevision: 2 });
+    });
+  });
+
+  it("binds Agent final source rows to the current attempt/generation and one final CAS", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabaseToVersion15ForTest(database);
+      seedRoomAndLegacyMessages(database);
+      migrateAuthorityDatabase(database);
+      seedClaimedAgentExecution(database);
+
+      expect(() => begin(database, () => {
+        insertAgentMessageSource(database, "arbitrary-generation-final", 999);
+      })).toThrow(/generation|lineage|foreign key/i);
+
+      begin(database, () => {
+        insertAgentMessageSource(database, "committed-final", 1);
+        database.prepare(
+          `UPDATE agent_execution_attempts
+           SET status = 'completed', finished_at = '2026-08-19T00:12:00.000Z'
+           WHERE execution_id = 'final-execution' AND attempt_seq = 1`,
+        ).run();
+        database.prepare(
+          `UPDATE agent_executions
+           SET status = 'completed', completed_at = '2026-08-19T00:12:00.000Z',
+               result_message_id = 'committed-final', updated_at = '2026-08-19T00:12:00.000Z'
+           WHERE id = 'final-execution'`,
+        ).run();
+      });
+
+      expect(() => begin(database, () => {
+        insertAgentMessageSource(database, "duplicate-final", 2);
+      })).toThrow(/final|lineage|unique/i);
+      expect(database.prepare(
+        `SELECT message_id AS messageId, execution_generation AS executionGeneration
+         FROM agent_message_sources`,
+      ).all()).toEqual([{ messageId: "committed-final", executionGeneration: 1 }]);
     });
   });
 
