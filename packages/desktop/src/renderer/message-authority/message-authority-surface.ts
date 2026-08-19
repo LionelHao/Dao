@@ -8,6 +8,19 @@ import {
   type MessageDraft,
   type TimelineMessage,
 } from "./view-model.js";
+import type { AttachmentStatusResult } from "../../attachment-authority/contracts.js";
+import {
+  createAttachmentAuthorityViewModel,
+  mapAttachmentMetadataForView,
+  type AccessProjectionAxis,
+  type DurableAttachmentAxis,
+} from "../attachment-authority/view-model.js";
+import { renderAttachmentAuthoritySurface } from "../attachment-authority/surface.js";
+
+export type MessageAttachmentHydration =
+  | Readonly<{ status: "loading"; previous?: AttachmentStatusResult }>
+  | Readonly<{ status: "available"; value: AttachmentStatusResult }>
+  | Readonly<{ status: "unavailable"; reason: "forbidden" | "gone" | "offline" | "repairing" | "unavailable" }>;
 
 export interface MessageAuthoritySurfaceActions {
   readonly onDraftBodyChange: (body: string) => void;
@@ -21,6 +34,14 @@ export interface MessageAuthoritySurfaceActions {
   readonly onReauthenticate: () => void;
   readonly onRefreshProjection: () => void;
   readonly onDismissReply: () => void;
+  readonly onSelectAttachment?: () => void;
+  readonly onPreviewAttachment?: (attachmentId: string) => void;
+  readonly onDownloadAttachment?: (attachmentId: string) => void;
+  readonly attachmentSubmissionBlocked?: () => boolean;
+  readonly attachmentHydration?: (
+    attachmentId: string,
+    sourceMessageId: string,
+  ) => MessageAttachmentHydration;
 }
 
 function element<Tag extends keyof HTMLElementTagNameMap>(
@@ -141,6 +162,74 @@ function renderHumanMessage(
       list.append(item);
     }
     card.append(list);
+  }
+  if (message.attachments.length > 0) {
+    const attachments = element("ul", "message-authority__attachments");
+    attachments.setAttribute("aria-label", "消息附件");
+    for (const attachment of message.attachments) {
+      const item = element("li", "message-authority__attachment");
+      item.dataset.attachmentId = attachment.attachmentId;
+      const hydration = actions.attachmentHydration?.(
+        attachment.attachmentId,
+        message.messageId,
+      ) ?? {
+        status: "unavailable" as const,
+        reason: "unavailable" as const,
+      };
+      if (hydration.status === "available") {
+        const status = hydration.value;
+        const durable: DurableAttachmentAxis = status.attachment.processingStatus === "processing"
+          ? { status: "processing", phase: "scanning", authoritySource: "projection" }
+          : status.attachment.processingStatus === "accepted-quarantined"
+            ? { status: "accepted-quarantined", authoritySource: "projection" }
+            : status.attachment.processingStatus === "malware-rejected"
+              ? { status: "malware-rejected", authoritySource: "projection" }
+              : status.attachment.processingStatus === "ready"
+                ? { status: "ready", authoritySource: "projection" }
+                : status.attachment.processingStatus === "retryable-failed"
+                  ? { status: "retryable-failed", authoritySource: "projection" }
+                  : status.attachment.processingStatus === "nonretryable-failed"
+                    ? { status: "nonretryable-failed", authoritySource: "projection" }
+                    : { status: "cancelled", authoritySource: "projection" };
+        const accessProjection: AccessProjectionAxis = state.connection.status === "offline"
+          ? "offline"
+          : state.connection.status === "repairing" || state.connection.status === "repair-failed"
+            ? "repairing"
+            : state.lifecycle === "archived" ? "archived-read-only" : status.accessProjection;
+        renderAttachmentAuthoritySurface(item, createAttachmentAuthorityViewModel({
+          localTransport: { status: "none" },
+          durable,
+          sourceEligibility: status.sourceEligibility,
+          accessProjection,
+          metadata: mapAttachmentMetadataForView(status.attachment),
+          allowCancel: false,
+          reducedMotion: state.reducedMotion,
+        }), {
+          onUpload() {}, onCancel() {}, onRetry() {}, onBind() {},
+          onPreview() { actions.onPreviewAttachment?.(attachment.attachmentId); },
+          onDownload() { actions.onDownloadAttachment?.(attachment.attachmentId); },
+          onRemove() {}, onReauthenticate() {}, onRefreshProjection() {},
+          onRestartUpload() {}, onSelectReplacement() {}, onUpgradeClient() {},
+        }, {
+          announce: false,
+          actionNames: { preview: "preview-attachment", download: "download-attachment" },
+        });
+      } else {
+        item.dataset.attachmentHydration = hydration.status === "loading" ? "loading" : hydration.reason;
+        const label = hydration.status === "loading"
+          ? "正在重新授权并载入附件 metadata"
+          : hydration.reason === "forbidden" ? "附件权限已撤销"
+            : hydration.reason === "gone" ? "附件已撤回或不可用"
+              : hydration.reason === "offline" ? "离线 · 附件 metadata 尚未验证"
+                : hydration.reason === "repairing" ? "REPAIR · 附件 metadata 等待验证"
+                  : "附件 metadata 暂不可用";
+        const status = text("span", label, "message-authority__attachment-unavailable");
+        status.setAttribute("aria-live", "off");
+        item.append(status);
+      }
+      attachments.append(item);
+    }
+    card.append(attachments);
   }
   const controls = messageControls(state, message);
   if (controls.canRevise || controls.canRecall) {
@@ -385,8 +474,26 @@ function renderComposer(
   input.addEventListener("input", () => actions.onDraftBodyChange(input.value));
   label.append(input);
   composer.append(label);
-  const send = button(state.submission.status === "submitting" ? "发送中…" : "发送", "send-message");
-  send.disabled = !state.composerEnabled || state.submission.status === "submitting";
+  const attachmentControls = element("section", "message-authority__attachment-composer");
+  attachmentControls.setAttribute("aria-label", "附件编辑器");
+  attachmentControls.dataset.attachmentComposerHost = "true";
+  if (actions.onSelectAttachment !== undefined) {
+    const selectAttachment = button("添加附件", "select-attachment");
+    selectAttachment.disabled = !state.composerEnabled || state.submission.status === "submitting";
+    selectAttachment.addEventListener("click", actions.onSelectAttachment);
+    attachmentControls.append(selectAttachment);
+  }
+  const attachmentSurface = element("div", "message-authority__attachment-surface");
+  attachmentSurface.dataset.attachmentComposer = "true";
+  attachmentControls.append(attachmentSurface);
+  composer.append(attachmentControls);
+  const attachmentBlocked = actions.attachmentSubmissionBlocked?.() ?? false;
+  const send = button(
+    state.submission.status === "submitting" ? "发送中…" :
+      attachmentBlocked ? "等待附件就绪" : "发送",
+    "send-message",
+  );
+  send.disabled = !state.composerEnabled || state.submission.status === "submitting" || attachmentBlocked;
   send.addEventListener("click", () => actions.onSend({ ...state.draft, body: input.value }));
   input.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && !send.disabled) {

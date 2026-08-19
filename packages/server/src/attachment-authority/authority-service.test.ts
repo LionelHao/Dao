@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { AttachmentMetadata } from "@native-im/core";
 import type { AuthenticatedCommandContext } from "../persistence/contracts.js";
 import type {
   AttachmentDatabaseOperation,
@@ -19,6 +20,31 @@ const context: AuthenticatedCommandContext = Object.freeze({
   sessionId: "session-1",
   sessionFamilyId: "family-1",
   principal: Object.freeze({ accountId: "account-1", actorId: "actor-1" }),
+});
+
+const readyMetadata: AttachmentMetadata = Object.freeze({
+  attachmentId: "attachment-status-1",
+  roomId: "room-1",
+  originalFilename: "安全报告.pdf",
+  format: "pdf",
+  declaredMime: "application/pdf",
+  detectedMime: "application/pdf",
+  byteSize: 65_536,
+  sha256: "a".repeat(64),
+  uploaderActorId: "actor-1",
+  createdAt: "2026-08-19T08:00:00.000Z",
+  readyAt: "2026-08-19T08:01:00.000Z",
+  processingStatus: "ready",
+  generation: 2,
+  sourceMessageId: "message-1",
+  provenance: Object.freeze({
+    scanner: Object.freeze({ kind: "clamav", version: "1.4.3" }),
+    extraction: Object.freeze({
+      method: "pdf-text", tool: "pdftotext", version: "25.06.0",
+      artifactSha256: "b".repeat(64), artifactByteSize: 1_024, pageCount: 2,
+    }),
+    ocr: null,
+  }),
 });
 
 afterEach(async () => {
@@ -49,6 +75,59 @@ function worker(
 }
 
 describe("attachment authority service", () => {
+  it("preserves only guarded safe metadata and reauthorization projections in status DTOs", async () => {
+    const database = worker((operation) => {
+      if (operation.kind !== "status-read") throw new Error("unexpected operation");
+      return {
+        attachment: readyMetadata,
+        sourceEligibility: "bound-active",
+        accessProjection: "authorized",
+      };
+    });
+    const service = createAttachmentAuthorityService({
+      database,
+      objectStore: await store(),
+      processor: { enqueue: async () => undefined },
+      nowMs: () => 1_000,
+      nextGrantId: randomUUID,
+    });
+
+    const status = await service.execute(context, {
+      type: "attachment.status.query",
+      requestId: "status-1",
+      attachmentId: readyMetadata.attachmentId,
+    });
+
+    expect(status).toEqual({
+      type: "attachment.status",
+      requestId: "status-1",
+      attachment: readyMetadata,
+      sourceEligibility: "bound-active",
+      accessProjection: "authorized",
+    });
+    expect(JSON.stringify(status)).not.toMatch(/objectKey|path|token|raw|extractedText|base64/u);
+  });
+
+  it("fails closed when the database seam injects storage authority into status metadata", async () => {
+    const database = worker(() => ({
+      attachment: { ...readyMetadata, objectKey: "object_secret" },
+      sourceEligibility: "bound-active",
+      accessProjection: "authorized",
+    } as unknown as AttachmentDatabaseOperationResult));
+    const service = createAttachmentAuthorityService({
+      database,
+      objectStore: await store(),
+      processor: { enqueue: async () => undefined },
+      nowMs: () => 1_000,
+      nextGrantId: randomUUID,
+    });
+
+    await expect(service.execute(context, {
+      type: "attachment.status.query", requestId: "status-injected",
+      attachmentId: readyMetadata.attachmentId,
+    })).rejects.toMatchObject({ status: 503, code: "storage_unavailable" });
+  });
+
   it("closes begin/chunk/finalize across the single writer and quarantine store before enqueue", async () => {
     const bytes = Buffer.from("hello attachment");
     const wholeSha = createHash("sha256").update(bytes).digest("hex");

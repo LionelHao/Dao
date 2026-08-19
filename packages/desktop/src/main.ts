@@ -1,4 +1,13 @@
-import { app, BrowserWindow, ipcMain, safeStorage } from "electron";
+import {
+  app,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+  safeStorage,
+  type BrowserWindowConstructorOptions,
+  type OpenDialogOptions,
+  type SaveDialogOptions,
+} from "electron";
 import { hostname } from "node:os";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
@@ -20,6 +29,12 @@ import {
 } from "./message-authority/controller.js";
 import { registerMessageAuthorityIpc } from "./message-authority/ipc.js";
 import { createDesktopMessageAuthorityRuntime } from "./message-authority/production-runtime.js";
+import { createDesktopAttachmentAuthorityRuntime } from "./attachment-authority/production-runtime.js";
+import {
+  createElectronAttachmentPorts,
+  type ElectronAttachmentPreviewWindow,
+} from "./attachment-authority/electron-production-ports.js";
+import { createElectronAttachmentRuntimeHost } from "./attachment-authority/electron-runtime-host.js";
 import {
   blankGroupChatWindowOptions,
   installWindowSecurityPolicy,
@@ -39,6 +54,41 @@ async function createWindow(): Promise<void> {
   > | undefined;
   let messageAuthority: ReturnType<typeof createMessageAuthorityController> | undefined;
   let disposeMessageAuthorityIpc: (() => void) | undefined;
+  let disposeAttachmentGovernanceState: (() => void) | undefined;
+  const attachmentRuntimeHost = createElectronAttachmentRuntimeHost({
+    createRuntime: () => {
+      const ports = createElectronAttachmentPorts({
+        parentWindow: window,
+        dialog: {
+          showOpenDialog: (_parent, options) => dialog.showOpenDialog(
+            window,
+            options as unknown as OpenDialogOptions,
+          ),
+          showSaveDialog: (_parent, options) => dialog.showSaveDialog(
+            window,
+            options as unknown as SaveDialogOptions,
+          ),
+        },
+        createPreviewWindow: (options) => new BrowserWindow(
+          options as BrowserWindowConstructorOptions,
+        ) as unknown as ElectronAttachmentPreviewWindow,
+        randomId: randomUUID,
+      });
+      return createDesktopAttachmentAuthorityRuntime({
+        endpoint: process.env.NATIVE_IM_IDENTITY_WS_URL ?? "ws://127.0.0.1:8787",
+        session: () => identity?.getCurrentAuthoritySession(),
+        webSocketFactory: (endpoint) => new WebSocket(endpoint),
+        openFileDialog: ports.openFileDialog,
+        saveDialog: ports.saveDialog,
+        previewHost: ports.previewHost,
+        ipcMain,
+        webContents: window.webContents,
+      });
+    },
+    onReplacementError: () => {
+      console.error("Native IM desktop Attachment Authority replacement failed closed.");
+    },
+  });
 
   try {
     installWindowSecurityPolicy(window);
@@ -61,9 +111,11 @@ async function createWindow(): Promise<void> {
         invalidate: () => {
           governance?.invalidateAuthorizedState();
           messageAuthorityRuntime?.invalidateAuthorizedState();
+          attachmentRuntimeHost.invalidateIdentity();
         },
       },
     });
+    attachmentRuntimeHost.start();
     governance = createDesktopGovernanceRuntime({
       endpoint: process.env.NATIVE_IM_IDENTITY_WS_URL ?? "ws://127.0.0.1:8787",
       session: () => identity?.getCurrentAuthoritySession(),
@@ -77,6 +129,9 @@ async function createWindow(): Promise<void> {
       ipcMain,
       webContents: window.webContents,
       controller: governance.controller,
+    });
+    disposeAttachmentGovernanceState = governance.controller.subscribe((state) => {
+      attachmentRuntimeHost.observeGovernanceState(state);
     });
     messageAuthorityRuntime = createDesktopMessageAuthorityRuntime({
       endpoint: process.env.NATIVE_IM_IDENTITY_WS_URL ?? "ws://127.0.0.1:8787",
@@ -95,6 +150,8 @@ async function createWindow(): Promise<void> {
     window.once("closed", () => {
       disposeGovernanceIpc?.();
       disposeMessageAuthorityIpc?.();
+      disposeAttachmentGovernanceState?.();
+      attachmentRuntimeHost.close();
       identity?.close();
       governance?.close();
       messageAuthority?.close();
@@ -107,6 +164,7 @@ async function createWindow(): Promise<void> {
         identityMethods: Object.keys(globalThis.dao?.identity ?? {}).sort(),
         governanceMethods: Object.keys(globalThis.dao?.governance ?? {}).sort(),
         messageAuthorityMethods: Object.keys(globalThis.dao?.messageAuthority ?? {}).sort(),
+        attachmentAuthorityMethods: Object.keys(globalThis.dao?.attachmentAuthority ?? {}).sort(),
         namespaces: Object.keys(globalThis.dao ?? {}).sort(),
         bridgeMissing: document.querySelector("[data-identity-bridge-missing]") !== null,
         governanceRouteContract: document.querySelector("#app")?.dataset.governanceRouteContract ?? "",
@@ -136,6 +194,17 @@ async function createWindow(): Promise<void> {
       "revisionsQuery",
       "sendV2",
     ];
+    const expectedAttachmentAuthorityMethods = [
+      "cancel",
+      "download",
+      "onAuthorityInput",
+      "preview",
+      "removeSelection",
+      "retryProcessing",
+      "select",
+      "status",
+      "upload",
+    ];
     let startupProbe: unknown;
     try {
       startupProbe = typeof startupProbeJson === "string"
@@ -158,8 +227,14 @@ async function createWindow(): Promise<void> {
         startupProbe.messageAuthorityMethods.length !== expectedMessageAuthorityMethods.length ||
         !startupProbe.messageAuthorityMethods.every(
           (method, index) => method === expectedMessageAuthorityMethods[index],
+        ) || !("attachmentAuthorityMethods" in startupProbe) ||
+        !Array.isArray(startupProbe.attachmentAuthorityMethods) ||
+        startupProbe.attachmentAuthorityMethods.length !== expectedAttachmentAuthorityMethods.length ||
+        !startupProbe.attachmentAuthorityMethods.every(
+          (method, index) => method === expectedAttachmentAuthorityMethods[index],
         ) || !("namespaces" in startupProbe) || !Array.isArray(startupProbe.namespaces) ||
-        startupProbe.namespaces.join(",") !== "governance,identity,messageAuthority" ||
+        startupProbe.namespaces.join(",") !==
+          "attachmentAuthority,governance,identity,messageAuthority" ||
         !("governanceRouteContract" in startupProbe) ||
         startupProbe.governanceRouteContract !== "closed-v1" ||
         !("bridgeMissing" in startupProbe) || startupProbe.bridgeMissing !== false ||
@@ -181,6 +256,8 @@ async function createWindow(): Promise<void> {
   } catch (error: unknown) {
     disposeGovernanceIpc?.();
     disposeMessageAuthorityIpc?.();
+    disposeAttachmentGovernanceState?.();
+    attachmentRuntimeHost.close();
     identity?.close();
     governance?.close();
     messageAuthority?.close();

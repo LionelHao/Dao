@@ -9,6 +9,10 @@ import type {
   MessageAuthorityBridgeInput,
   MessageAuthorityReadyHistory,
 } from "../../message-authority/contracts.js";
+import type {
+  AttachmentAuthorityBridge,
+  AttachmentStatusResult,
+} from "../../attachment-authority/contracts.js";
 import {
   advanceMessageAuthorityCursor,
   applyMessageAuthorityEvent,
@@ -38,11 +42,16 @@ import {
   renderMessageAuthoritySurface,
   type MessageAuthoritySurfaceActions,
 } from "./message-authority-surface.js";
+import {
+  mountAttachmentComposerBridge,
+  type AttachmentComposerBridgeController,
+} from "../attachment-authority/composer-bridge.js";
 
 export interface MessageAuthorityBridgeSurfaceOptions {
   readonly createMessageId: () => string;
   readonly createTargetId: () => string;
   readonly reducedMotion?: boolean;
+  readonly attachmentBridge?: AttachmentAuthorityBridge;
 }
 
 type RevisionTarget = Readonly<{ messageId: string; expectedRevision: number }>;
@@ -163,21 +172,184 @@ export function mountMessageAuthorityBridgeSurface(
   roomId: string,
   options: MessageAuthorityBridgeSurfaceOptions,
 ): () => void {
+  const attachmentBridge = options.attachmentBridge;
   let disposed = false;
   let state: MessageAuthorityState | undefined;
   let replica: MessageAuthorityReplica | undefined;
   let revisionTarget: RevisionTarget | undefined;
   let awaitingReceipt: AwaitingReceipt | undefined;
   let awaitingMutationReceipt: AwaitingMutationReceipt | undefined;
+  let attachmentComposer: AttachmentComposerBridgeController | undefined;
+  let attachmentSubmissionBlocked = false;
+  const attachmentStatuses = new Map<string, AttachmentStatusResult>();
+  const attachmentFailures = new Map<string, "forbidden" | "gone" | "unavailable">();
+  const attachmentHydratedEpoch = new Map<string, number>();
+  const attachmentPending = new Map<string, number>();
+  let attachmentHydrationEpoch = 0;
   const beforeHistory: MessageAuthorityBridgeInput[] = [];
+
+  const attachmentTargets = (): ReadonlyMap<string, string> => {
+    const result = new Map<string, string>();
+    if (state === undefined) return result;
+    for (const message of state.timeline) {
+      if (message.kind !== "human") continue;
+      for (const attachment of message.attachments) {
+        result.set(attachment.attachmentId, message.messageId);
+      }
+    }
+    return result;
+  };
+
+  const hydrationFor = (attachmentId: string, sourceMessageId: string) => {
+    if (state?.connection.status === "offline") {
+      const previous = attachmentStatuses.get(attachmentId);
+      return previous === undefined || previous.attachment.sourceMessageId !== sourceMessageId
+        ? { status: "unavailable" as const, reason: "offline" as const }
+        : { status: "available" as const, value: previous };
+    }
+    if (state?.connection.status === "repairing" || state?.connection.status === "repair-failed") {
+      const previous = attachmentStatuses.get(attachmentId);
+      return previous === undefined || previous.attachment.sourceMessageId !== sourceMessageId
+        ? { status: "unavailable" as const, reason: "repairing" as const }
+        : { status: "available" as const, value: previous };
+    }
+    if (attachmentPending.get(attachmentId) === attachmentHydrationEpoch ||
+        attachmentHydratedEpoch.get(attachmentId) !== attachmentHydrationEpoch) {
+      const previous = attachmentStatuses.get(attachmentId);
+      return previous === undefined
+        ? { status: "loading" as const }
+        : { status: "loading" as const, previous };
+    }
+    const current = attachmentStatuses.get(attachmentId);
+    if (current !== undefined) {
+      return current.attachment.sourceMessageId === sourceMessageId
+        ? { status: "available" as const, value: current }
+        : { status: "unavailable" as const, reason: "unavailable" as const };
+    }
+    return {
+      status: "unavailable" as const,
+      reason: attachmentFailures.get(attachmentId) ?? "unavailable" as const,
+    };
+  };
+
+  function closedHydrationReason(error: unknown): "forbidden" | "gone" | "unavailable" {
+    if (typeof error !== "object" || error === null) return "unavailable";
+    const candidate = "attachmentError" in error ? error.attachmentError : error;
+    if (typeof candidate !== "object" || candidate === null || !("status" in candidate)) {
+      return "unavailable";
+    }
+    return candidate.status === 403 ? "forbidden" : candidate.status === 410 ? "gone" : "unavailable";
+  }
+
+  function hydrateVisibleAttachments(): void {
+    if (disposed || attachmentBridge === undefined || state === undefined ||
+        state.connection.status !== "online") return;
+    for (const [attachmentId, sourceMessageId] of attachmentTargets()) {
+      if (attachmentHydratedEpoch.get(attachmentId) === attachmentHydrationEpoch ||
+          attachmentPending.get(attachmentId) === attachmentHydrationEpoch) continue;
+      const epoch = attachmentHydrationEpoch;
+      attachmentPending.set(attachmentId, epoch);
+      attachmentFailures.delete(attachmentId);
+      void attachmentBridge.status({ type: "attachment.status.query", attachmentId })
+        .then((status) => {
+          if (disposed || epoch !== attachmentHydrationEpoch ||
+              attachmentPending.get(attachmentId) !== epoch) return;
+          attachmentPending.delete(attachmentId);
+          attachmentHydratedEpoch.set(attachmentId, epoch);
+          const attachment = status.attachment;
+          if (attachment.attachmentId !== attachmentId || attachment.roomId !== roomId ||
+              attachment.sourceMessageId !== sourceMessageId ||
+              status.sourceEligibility !== "bound-active" ||
+              attachment.processingStatus !== "ready") {
+            attachmentStatuses.delete(attachmentId);
+            attachmentFailures.set(attachmentId, "unavailable");
+          } else {
+            attachmentStatuses.set(attachmentId, status);
+          }
+          render();
+        })
+        .catch((error: unknown) => {
+          if (disposed || epoch !== attachmentHydrationEpoch ||
+              attachmentPending.get(attachmentId) !== epoch) return;
+          attachmentPending.delete(attachmentId);
+          attachmentHydratedEpoch.set(attachmentId, epoch);
+          attachmentStatuses.delete(attachmentId);
+          attachmentFailures.set(attachmentId, closedHydrationReason(error));
+          render();
+        });
+    }
+  }
 
   const render = (): void => {
     if (disposed || state === undefined) return;
+    const currentAttachmentIds = new Set(attachmentTargets().keys());
+    for (const attachmentId of attachmentStatuses.keys()) {
+      if (!currentAttachmentIds.has(attachmentId)) attachmentStatuses.delete(attachmentId);
+    }
+    for (const attachmentId of attachmentFailures.keys()) {
+      if (!currentAttachmentIds.has(attachmentId)) attachmentFailures.delete(attachmentId);
+    }
+    for (const attachmentId of attachmentHydratedEpoch.keys()) {
+      if (!currentAttachmentIds.has(attachmentId)) attachmentHydratedEpoch.delete(attachmentId);
+    }
+    for (const attachmentId of attachmentPending.keys()) {
+      if (!currentAttachmentIds.has(attachmentId)) attachmentPending.delete(attachmentId);
+    }
     renderMessageAuthoritySurface(root, state, actions);
+    const attachmentRoot = root.querySelector<HTMLElement>("[data-attachment-composer]");
+    if (attachmentRoot !== null && attachmentBridge !== undefined) {
+      if (attachmentComposer === undefined) {
+        attachmentComposer = mountAttachmentComposerBridge(
+          attachmentRoot,
+          attachmentBridge,
+          roomId,
+          {
+            accessProjection: () => {
+              if (state?.connection.status === "revoked" || state?.connection.status === "fatal") {
+                return "permission-revoked";
+              }
+              if (state?.lifecycle === "archived") return "archived-read-only";
+              if (state?.connection.status === "offline") return "offline";
+              if (state?.connection.status === "repairing" ||
+                  state?.connection.status === "repair-failed") return "repairing";
+              return "authorized";
+            },
+            onReadyAttachmentIdsChange(attachmentIds) {
+              if (state === undefined) return;
+              state = replaceState(state, {
+                draft: {
+                  ...state.draft,
+                  attachments: attachmentIds.map((attachmentId) => ({ attachmentId })),
+                },
+              });
+            },
+            onSubmissionBlockedChange(blocked) {
+              if (attachmentSubmissionBlocked === blocked) return;
+              attachmentSubmissionBlocked = blocked;
+              render();
+            },
+            onBindRequested() {
+              root.querySelector<HTMLButtonElement>("[data-action='send-message']")?.focus();
+            },
+            onAnnouncement(message) {
+              if (state === undefined) return;
+              state = replaceState(state, { announcement: message });
+              render();
+            },
+            ...(options.reducedMotion === undefined ? {} : {
+              reducedMotion: options.reducedMotion,
+            }),
+          },
+        );
+      } else {
+        attachmentComposer.remount(attachmentRoot);
+      }
+    }
     if (revisionTarget !== undefined) {
       const send = root.querySelector<HTMLButtonElement>("[data-action='send-message']");
       if (send !== null) send.textContent = "保存修订";
     }
+    hydrateVisibleAttachments();
   };
 
   const applyStableEvent = (input: Extract<MessageAuthorityBridgeInput, { type: "room.event" }>): void => {
@@ -199,6 +371,12 @@ export function mountMessageAuthorityBridgeSurface(
         timeline: replica.timeline.map(mapTimelineMessage),
         projectionGeneration: replica.generation,
       });
+      if (input.event.type === "room.message.accepted" &&
+          input.event.payload.authorKind === "human") {
+        attachmentComposer?.clearBound(
+          input.event.payload.attachments.map((attachment) => attachment.attachmentId),
+        );
+      }
     } catch {
       state = replaceState(state, {
         connection: { status: "repair-failed", errorCode: "event_projection_invalid" },
@@ -242,6 +420,10 @@ export function mountMessageAuthorityBridgeSurface(
     if (state === undefined || replica === undefined || input.roomId !== roomId) return;
     const connection = input.connection;
     if (connection.status === "revoked") {
+      attachmentStatuses.clear();
+      attachmentFailures.clear();
+      attachmentHydratedEpoch.clear();
+      attachmentPending.clear();
       replica = revokeMessageAuthorityRoom(replica);
       state = replaceState(state, {
         connection,
@@ -381,7 +563,11 @@ export function mountMessageAuthorityBridgeSurface(
     }
     if (input.type === "message.accepted" || input.type === "message.error" ||
         input.type === "message.revision.accepted" || input.type === "message.recall.accepted") {
+      const boundAttachmentIds = input.type === "message.accepted" && state.submission.status === "submitting"
+        ? state.submission.payload.attachments.map((attachment) => attachment.attachmentId)
+        : [];
       state = applyMessageAuthorityInput(state, input);
+      if (input.type === "message.accepted") attachmentComposer?.clearBound(boundAttachmentIds);
       render();
       return;
     }
@@ -391,6 +577,7 @@ export function mountMessageAuthorityBridgeSurface(
 
   const sendDraft = async (payload: MessageDraft, retry: boolean): Promise<void> => {
     if (state === undefined || !state.composerEnabled || awaitingReceipt !== undefined ||
+        attachmentSubmissionBlocked ||
         awaitingMutationReceipt !== undefined || state.mutation.status === "pending" ||
         state.mutation.status === "event-observed" ||
         state.mutation.status === "acknowledged") return;
@@ -483,6 +670,13 @@ export function mountMessageAuthorityBridgeSurface(
       if (state === undefined || !state.composerEnabled || awaitingMutationReceipt !== undefined ||
           state.mutation.status === "pending" || state.mutation.status === "event-observed" ||
           state.mutation.status === "acknowledged") return;
+      if (state.draft.attachments.length > 0) {
+        state = replaceState(state, {
+          announcement: "请先移除当前附件，再编辑历史消息正文",
+        });
+        render();
+        return;
+      }
       const message = state.timeline.find((candidate) =>
         candidate.messageId === messageId && candidate.kind === "human");
       if (message?.kind !== "human") return;
@@ -558,6 +752,27 @@ export function mountMessageAuthorityBridgeSurface(
       state = replaceState(state, { draft });
       render();
     },
+    ...(attachmentBridge === undefined ? {} : {
+      attachmentSubmissionBlocked: () => attachmentSubmissionBlocked,
+      onSelectAttachment() {
+        if (state === undefined || !state.composerEnabled || revisionTarget !== undefined) return;
+        void attachmentComposer?.select();
+      },
+      onPreviewAttachment(attachmentId: string) {
+        void attachmentBridge.preview({
+          type: "attachment.preview",
+          attachmentId,
+          representation: "safe-rendered",
+        }).catch(() => undefined);
+      },
+      onDownloadAttachment(attachmentId: string) {
+        void attachmentBridge.download({
+          type: "attachment.download",
+          attachmentId,
+        }).catch(() => undefined);
+      },
+      attachmentHydration: hydrationFor,
+    }),
   };
 
   const acceptHistory = (history: MessageAuthorityReadyHistory): void => {
@@ -590,6 +805,8 @@ export function mountMessageAuthorityBridgeSurface(
 
   const loadHistory = async (): Promise<void> => {
     if (disposed) return;
+    attachmentHydrationEpoch += 1;
+    attachmentPending.clear();
     const priorState = state;
     if (state === undefined) {
       renderLoading(root);
@@ -676,6 +893,11 @@ export function mountMessageAuthorityBridgeSurface(
     if (disposed) return;
     disposed = true;
     unsubscribe();
+    attachmentComposer?.dispose();
+    attachmentStatuses.clear();
+    attachmentFailures.clear();
+    attachmentHydratedEpoch.clear();
+    attachmentPending.clear();
     root.replaceChildren();
   };
 }

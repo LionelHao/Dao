@@ -2,11 +2,13 @@ import { describe, expect, it, vi } from "vitest";
 import type { IdentityBridge } from "../identity/contracts.js";
 import type { GovernanceBridge } from "../governance/contracts.js";
 import type { MessageAuthorityBridge } from "../message-authority/contracts.js";
+import type { AttachmentAuthorityBridge } from "../attachment-authority/contracts.js";
 import { mountDesktopRendererEntry } from "./entry.js";
 
 const bridge = {} as IdentityBridge;
 const governance = {} as GovernanceBridge;
 const messageAuthority = {} as MessageAuthorityBridge;
+const attachmentAuthority = {} as AttachmentAuthorityBridge;
 
 function ports() {
   return {
@@ -119,6 +121,23 @@ describe("Desktop renderer route entry", () => {
     expect(dispose).toBe(expectedDispose);
   });
 
+  it("passes the closed Attachment Authority bridge only to the Message route", () => {
+    const root = document.createElement("main");
+    const renderers = ports();
+    mountDesktopRendererEntry(
+      root,
+      "?message-room=room-1",
+      bridge,
+      governance,
+      messageAuthority,
+      renderers,
+      attachmentAuthority,
+    );
+    expect(renderers.mountMessageAuthoritySurface).toHaveBeenCalledWith(
+      root, messageAuthority, "room-1", attachmentAuthority,
+    );
+  });
+
   it.each([
     "?message-room=", "?message-room=%20room", "?message-room=room-1&extra=true",
     "?message-room=room-1&message-room=room-2",
@@ -145,6 +164,7 @@ describe("Desktop renderer route entry", () => {
     const source = readFileSync(resolve(import.meta.dirname, "main.ts"), "utf8");
     expect(source).toContain("window.dao?.governance");
     expect(source).toContain("window.dao?.messageAuthority");
+    expect(source).toContain("window.dao?.attachmentAuthority");
     expect(source).toContain("mountDesktopRendererEntry");
     expect(source).not.toMatch(/WebSocket|accessToken|ipcRenderer/u);
   });

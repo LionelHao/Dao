@@ -10,11 +10,63 @@ import {
   type MessageAuthorityClientPort,
 } from "../../message-authority/controller.js";
 import type { MessageAuthorityPortInput } from "../../message-authority/contracts.js";
+import type {
+  AttachmentAuthorityBridge,
+  AttachmentAuthorityBridgeInput,
+} from "../../attachment-authority/contracts.js";
 import { registerMessageAuthorityIpc } from "../../message-authority/ipc.js";
 import { createMessageAuthorityBridge } from "../../message-authority/preload-bridge.js";
 import { mountMessageAuthorityBridgeSurface } from "./bridge-adapter.js";
 
 const createdAt = "2026-08-19T08:00:00.000Z";
+
+const remoteReadyStatus = {
+  type: "attachment.status" as const,
+  attachment: {
+    attachmentId: "attachment-remote", roomId: "room-1", originalFilename: "跨设备报告.pdf",
+    format: "pdf" as const, declaredMime: "application/pdf" as const,
+    detectedMime: "application/pdf" as const, byteSize: 65_536, sha256: "a".repeat(64),
+    uploaderActorId: "human-1", createdAt, readyAt: "2026-08-19T08:01:00.000Z",
+    processingStatus: "ready" as const, generation: 2, sourceMessageId: null,
+    provenance: {
+      scanner: { kind: "clamav" as const, version: "1.4.3" },
+      extraction: { method: "pdf-text" as const, tool: "pdftotext" as const,
+        version: "25.06.0", artifactSha256: "b".repeat(64), artifactByteSize: 1_024, pageCount: 2 },
+      ocr: null,
+    },
+  },
+  sourceEligibility: "unbound" as const,
+  accessProjection: "authorized" as const,
+};
+
+function privateStatus(attachmentId: string) {
+  return {
+    ...remoteReadyStatus,
+    attachment: { ...remoteReadyStatus.attachment, attachmentId },
+  };
+}
+
+function attachmentHarness(): { readonly bridge: AttachmentAuthorityBridge } {
+  return { bridge: {
+    select: vi.fn(async () => ({ status: "cancelled" as const })),
+    upload: vi.fn(async () => ({ operationId: "upload-1" })),
+    cancel: vi.fn(async () => ({ operationId: "cancel-1" })),
+    retryProcessing: vi.fn(async () => ({ operationId: "retry-1" })),
+    status: vi.fn(async () => remoteReadyStatus),
+    preview: vi.fn(async ({ attachmentId, representation }) => ({
+      type: "attachment.preview.policy" as const, attachmentId, representation,
+      nodeIntegration: false as const, contextIsolation: true as const, sandbox: true as const,
+      webSecurity: true as const, allowNavigation: false as const, allowWindowOpen: false as const,
+      allowPermissions: false as const, allowExternalProtocols: false as const,
+      allowNetwork: false as const, ariaLive: "off" as const,
+    })),
+    download: vi.fn(async ({ attachmentId }) => ({
+      type: "attachment.download.saved" as const, attachmentId,
+    })),
+    removeSelection: vi.fn(async () => undefined),
+    onAuthorityInput: () => () => undefined,
+  } };
+}
 
 function human(id: string, body: string): ActiveHumanMessage {
   return {
@@ -62,12 +114,12 @@ function revisedEvent(sequence: number, revision: number, body: string): Message
   };
 }
 
-function recalledEvent(sequence: number): MessageAuthorityEvent {
+function recalledEvent(sequence: number, messageId = "message-existing"): MessageAuthorityEvent {
   return {
     eventId: `event-recalled-${sequence}`, streamKind: "room", streamId: "room-1",
     streamSeq: sequence, roomId: "room-1", type: "room.message.recalled",
     actorId: "human-1", occurredAt: createdAt,
-    payload: { id: "message-existing", roomId: "room-1", authorId: "human-1",
+    payload: { id: messageId, roomId: "room-1", authorId: "human-1",
       authorKind: "human", createdAt, lifecycle: "recalled", recalledAt: createdAt,
       revisionCount: 2 },
   };
@@ -475,6 +527,185 @@ describe("Message Authority bridge renderer adapter", () => {
     root.querySelector<HTMLButtonElement>("[data-action='refresh-projection']")!.click();
     await vi.waitFor(() => expect(authority.port.historyV2).toHaveBeenCalledTimes(2));
     expect(composer(root).value).toBe("Losing concurrent revision");
+    dispose();
+    authority.close();
+  });
+
+  it("submits only stable READY attachment IDs and exposes bound preview/download through the bridge", async () => {
+    const authority = authorityHarness();
+    let attachmentListener: ((input: AttachmentAuthorityBridgeInput) => void) | undefined;
+    const attachmentBridge: AttachmentAuthorityBridge = {
+      select: vi.fn(async () => ({ status: "selected", selection: {
+        selectionHandle: "selection-1", displayName: "brief.pdf", format: "pdf",
+        declaredMime: "application/pdf", byteSize: 32_768,
+        expiresAt: "2026-08-19T12:00:00.000Z",
+      } })),
+      upload: vi.fn(async () => ({ operationId: "attachment-operation-1" })),
+      cancel: vi.fn(async () => ({ operationId: "cancel-1" })),
+      retryProcessing: vi.fn(async () => ({ operationId: "retry-1" })),
+      status: vi.fn(async ({ attachmentId }) => ({
+        ...privateStatus(attachmentId),
+        attachment: { ...privateStatus(attachmentId).attachment,
+          sourceMessageId: "message-with-attachment" },
+        sourceEligibility: "bound-active" as const,
+      })),
+      preview: vi.fn(async ({ attachmentId, representation }) => ({
+        type: "attachment.preview.policy", attachmentId, representation,
+        nodeIntegration: false, contextIsolation: true, sandbox: true, webSecurity: true,
+        allowNavigation: false, allowWindowOpen: false, allowPermissions: false,
+        allowExternalProtocols: false, allowNetwork: false, ariaLive: "off",
+      })),
+      download: vi.fn(async ({ attachmentId }) => ({
+        type: "attachment.download.saved", attachmentId,
+      })),
+      removeSelection: vi.fn(async () => undefined),
+      onAuthorityInput(listener) {
+        attachmentListener = listener;
+        return () => { attachmentListener = undefined; };
+      },
+    };
+    const root = document.createElement("main");
+    const dispose = mountMessageAuthorityBridgeSurface(root, authority.bridge, "room-1", {
+      createMessageId: () => "message-with-attachment",
+      createTargetId: () => "target-new",
+      attachmentBridge,
+    });
+    await vi.waitFor(() => expect(root.textContent).toContain("Existing authority message"));
+
+    root.querySelector<HTMLButtonElement>("[data-action='select-attachment']")?.click();
+    await vi.waitFor(() => expect(root.textContent).toContain("brief.pdf"));
+    expect(send(root).disabled).toBe(true);
+    expect(send(root).textContent).toBe("等待附件就绪");
+    root.querySelector<HTMLButtonElement>("[data-action='upload']")?.click();
+    await vi.waitFor(() => expect(attachmentBridge.upload).toHaveBeenCalledOnce());
+    attachmentListener?.({
+      type: "attachment.upload.accepted", operationId: "attachment-operation-1",
+      attachmentId: "attachment-1", processingStatus: "accepted-quarantined",
+    });
+    expect(send(root).disabled).toBe(true);
+    attachmentListener?.(privateStatus("attachment-1"));
+    expect(send(root).disabled).toBe(false);
+
+    composer(root).value = "Message with ready attachment";
+    composer(root).dispatchEvent(new Event("input", { bubbles: true }));
+    send(root).click();
+    await vi.waitFor(() => expect(authority.port.sendV2).toHaveBeenCalledOnce());
+    expect(vi.mocked(authority.port.sendV2).mock.calls[0]?.[0].message.attachments)
+      .toEqual([{ attachmentId: "attachment-1" }]);
+
+    const submittedEvent = acceptedEvent(
+      10, "message-with-attachment", "Message with ready attachment",
+    );
+    authority.publish({ type: "room.event", cursorBefore: 9, generation: 4,
+      event: { ...submittedEvent, payload: {
+        ...submittedEvent.payload,
+        attachments: [{ attachmentId: "attachment-1" }],
+      } } });
+    authority.deferred[0]?.resolve();
+    await vi.waitFor(() => expect(root.querySelector("[data-attachment-composer]")?.textContent)
+      .not.toContain("brief.pdf"));
+
+    await vi.waitFor(() => expect(root.querySelector("[data-attachment-id='attachment-1']"))
+      .not.toBeNull());
+    root.querySelector<HTMLButtonElement>("[data-action='preview-attachment']")?.click();
+    root.querySelector<HTMLButtonElement>("[data-action='download-attachment']")?.click();
+    expect(attachmentBridge.preview).toHaveBeenCalledWith({
+      type: "attachment.preview", attachmentId: "attachment-1", representation: "safe-rendered",
+    });
+    expect(attachmentBridge.download).toHaveBeenCalledWith({
+      type: "attachment.download", attachmentId: "attachment-1",
+    });
+    dispose();
+    authority.close();
+  });
+
+  it("rehydrates historical attachment cards through status reauthorization and degrades closed", async () => {
+    const authority = authorityHarness();
+    const history = {
+      type: "room.history.v2", requestId: "history-1", roomId: "room-1", status: "ready",
+      viewerActorId: "human-1", lifecycle: "archived", connection: { status: "online" },
+      actors: [{ actorId: "human-1", kind: "human", displayName: "Sam", secondaryLabel: "Owner" }],
+      messages: [{ ...human("message-history", "Historical attachment"),
+        attachments: [{ attachmentId: "attachment-history" }] }],
+      hasMore: false, generation: 4, watermark: 9,
+    } as const;
+    vi.mocked(authority.port.historyV2).mockResolvedValueOnce(history).mockResolvedValueOnce(history);
+    const status = vi.fn(async () => ({
+      ...remoteReadyStatus,
+      attachment: { ...remoteReadyStatus.attachment,
+        attachmentId: "attachment-history", sourceMessageId: "message-history" },
+      sourceEligibility: "bound-active" as const,
+      accessProjection: "archived-read-only" as const,
+    }));
+    const attachmentBridge = { ...attachmentHarness().bridge, status };
+    const root = document.createElement("main");
+    const dispose = mountMessageAuthorityBridgeSurface(root, authority.bridge, "room-1", {
+      createMessageId: () => "message-new", createTargetId: () => "target-new", attachmentBridge,
+    });
+
+    await vi.waitFor(() => expect(status).toHaveBeenCalledWith({
+      type: "attachment.status.query", attachmentId: "attachment-history",
+    }));
+    await vi.waitFor(() => expect(root.textContent).toContain("跨设备报告.pdf"));
+    const card = root.querySelector("[data-attachment-id='attachment-history']");
+    expect(card?.textContent).not.toContain("attachment-history");
+    expect(card?.querySelector("[data-action='preview-attachment']")).not.toBeNull();
+    expect(card?.querySelector("[data-action='download-attachment']")).not.toBeNull();
+    expect(root.innerHTML).not.toMatch(/path|token|objectKey|extractedText/u);
+    expect(root.querySelectorAll("[aria-live='polite']")).toHaveLength(1);
+    expect(card?.querySelector("[data-attachment-preview-policy]")?.getAttribute("aria-live"))
+      .toBe("off");
+
+    dispose();
+    authority.close();
+  });
+
+  it("keeps hydrated metadata read-only offline/repairing, reauthenticates again, and purges recall", async () => {
+    const authority = authorityHarness();
+    const history = {
+      type: "room.history.v2", requestId: "history-1", roomId: "room-1", status: "ready",
+      viewerActorId: "human-1", lifecycle: "active", connection: { status: "online" },
+      actors: [{ actorId: "human-1", kind: "human", displayName: "Sam", secondaryLabel: "Owner" }],
+      messages: [{ ...human("message-history", "Historical attachment"),
+        attachments: [{ attachmentId: "attachment-history" }] }],
+      hasMore: false, generation: 4, watermark: 9,
+    } as const;
+    vi.mocked(authority.port.historyV2).mockImplementation(async (request) => ({
+      ...history, requestId: request.requestId,
+    }));
+    const status = vi.fn(async () => ({
+      ...remoteReadyStatus,
+      attachment: { ...remoteReadyStatus.attachment,
+        attachmentId: "attachment-history", sourceMessageId: "message-history" },
+      sourceEligibility: "bound-active" as const,
+      accessProjection: "authorized" as const,
+    }));
+    const attachmentBridge = { ...attachmentHarness().bridge, status };
+    const root = document.createElement("main");
+    const dispose = mountMessageAuthorityBridgeSurface(root, authority.bridge, "room-1", {
+      createMessageId: () => "message-new", createTargetId: () => "target-new", attachmentBridge,
+    });
+    await vi.waitFor(() => expect(root.textContent).toContain("跨设备报告.pdf"));
+
+    authority.publish({ type: "message.connection", roomId: "room-1",
+      connection: { status: "repairing", watermark: 9 } });
+    expect(root.textContent).toContain("跨设备报告.pdf");
+    expect(root.querySelector("[data-action='preview-attachment']")).toBeNull();
+    authority.publish({ type: "message.connection", roomId: "room-1", connection: {
+      status: "offline", asOf: "2026-08-19T08:02:00.000Z",
+    } });
+    expect(root.textContent).toContain("跨设备报告.pdf");
+    expect(root.querySelector("[data-action='download-attachment']")).toBeNull();
+    root.querySelector<HTMLButtonElement>("[data-action='reconnect-message-authority']")?.click();
+    await vi.waitFor(() => expect(status).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(root.querySelector("[data-action='preview-attachment']")).not.toBeNull());
+
+    const recall = recalledEvent(10, "message-history");
+    authority.publish({ type: "room.event", cursorBefore: 9, generation: 4,
+      event: { ...recall, payload: { ...recall.payload, revisionCount: 1 } } });
+    expect(root.textContent).toContain("消息已撤回");
+    expect(root.textContent).not.toContain("跨设备报告.pdf");
+    expect(root.querySelector("[data-attachment-id='attachment-history']")).toBeNull();
     dispose();
     authority.close();
   });

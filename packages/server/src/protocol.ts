@@ -32,6 +32,8 @@ import {
   type ReminderCandidate,
   type OpenItem,
   type AttachmentPrivateEvent,
+  type AttachmentMetadata,
+  type AttachmentSourceEligibility,
 } from "@native-im/core";
 import {
   parseAttachmentClientFrame,
@@ -686,16 +688,9 @@ export type AttachmentAuthorityServerFrame =
   | Readonly<{
       type: "attachment.status";
       requestId: string;
-      attachmentId: string;
-      processingStatus:
-        | "accepted-quarantined"
-        | "processing"
-        | "ready"
-        | "retryable-failed"
-        | "nonretryable-failed"
-        | "malware-rejected"
-        | "cancelled";
-      generation: number;
+      attachment: AttachmentMetadata;
+      sourceEligibility: AttachmentSourceEligibility;
+      accessProjection: "authorized" | "archived-read-only";
     }>
   | Readonly<{
       type: "attachment.preview.opened";

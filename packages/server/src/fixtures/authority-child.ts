@@ -12,7 +12,10 @@ import {
   type ProviderEvent,
 } from "@native-im/core";
 import { DatabaseSync } from "node:sqlite";
+import { createServer as createTcpServer } from "node:net";
+import { dirname, join, resolve } from "node:path";
 import type { IdentityAdapter, LoginCredentials } from "../auth.js";
+import { PRODUCTION_CLAMD_POLICY } from "../attachment-authority/production-capabilities.js";
 import { mintInternalAgentCommandContext } from "../persistence/contracts.js";
 import { createLegacyMessageAuthorityInserter } from
   "../persistence/message-authority-legacy-adapter.js";
@@ -55,6 +58,7 @@ interface AuthorityChildStartCommand {
   readonly emitUnrelatedWarningForTest?: true;
   readonly closeCleanupProbe?: true;
   readonly seedRuntimeRoomForTest?: true;
+  readonly enableAttachmentFixture?: true;
   readonly previewSentinelForTest?: string;
   readonly suppressJsonForTest?: true;
   readonly ignoreSigtermForTest?: true;
@@ -96,6 +100,7 @@ function isStartCommand(value: unknown): value is AuthorityChildStartCommand {
     ...(value.emitUnrelatedWarningForTest === undefined ? [] : ["emitUnrelatedWarningForTest"]),
     ...(value.closeCleanupProbe === undefined ? [] : ["closeCleanupProbe"]),
     ...(value.seedRuntimeRoomForTest === undefined ? [] : ["seedRuntimeRoomForTest"]),
+    ...(value.enableAttachmentFixture === undefined ? [] : ["enableAttachmentFixture"]),
     ...(value.previewSentinelForTest === undefined ? [] : ["previewSentinelForTest"]),
     ...(value.suppressJsonForTest === undefined ? [] : ["suppressJsonForTest"]),
     ...(value.ignoreSigtermForTest === undefined ? [] : ["ignoreSigtermForTest"]),
@@ -133,6 +138,7 @@ function isStartCommand(value: unknown): value is AuthorityChildStartCommand {
         value.emitUnrelatedWarningForTest !== true) ||
       (value.closeCleanupProbe !== undefined && value.closeCleanupProbe !== true) ||
       (value.seedRuntimeRoomForTest !== undefined && value.seedRuntimeRoomForTest !== true) ||
+      (value.enableAttachmentFixture !== undefined && value.enableAttachmentFixture !== true) ||
       (value.previewSentinelForTest !== undefined &&
         (typeof value.previewSentinelForTest !== "string" ||
           value.previewSentinelForTest.length === 0 ||
@@ -158,6 +164,79 @@ function isStartCommand(value: unknown): value is AuthorityChildStartCommand {
     value.faultPoint === "before-commit" ||
     value.faultPoint === "after-commit-before-outbox" ||
     value.faultPoint === "after-send-before-dispatch-mark";
+}
+
+async function startAttachmentClamdFixture(): Promise<Readonly<{
+  endpoint: Readonly<{ kind: "tcp"; host: "127.0.0.1"; port: number }>;
+  close(): Promise<void>;
+}>> {
+  const sockets = new Set<import("node:net").Socket>();
+  const server = createTcpServer((socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+    let buffer = Buffer.alloc(0);
+    let mode: "command" | "stream" = "command";
+    let scannedBytes = 0;
+    socket.on("data", (chunk: Buffer) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      if (mode === "command") {
+        const terminator = buffer.indexOf(0);
+        if (terminator === -1) {
+          if (buffer.byteLength > 32) socket.destroy();
+          return;
+        }
+        const command = buffer.subarray(0, terminator + 1).toString("latin1");
+        buffer = buffer.subarray(terminator + 1);
+        if (command === "zVERSION\0") {
+          socket.end("ClamAV 1.5.3/fixture-db/Thu Jan 01 00:00:00 2026\0");
+          return;
+        }
+        if (command !== "zINSTREAM\0") {
+          socket.destroy();
+          return;
+        }
+        mode = "stream";
+      }
+      while (mode === "stream" && buffer.byteLength >= 4) {
+        const length = buffer.readUInt32BE(0);
+        if (length > 1 * 1_024 * 1_024) {
+          socket.destroy();
+          return;
+        }
+        if (length === 0) {
+          buffer = buffer.subarray(4);
+          if (buffer.byteLength !== 0 || scannedBytes === 0) socket.destroy();
+          else socket.end(
+            "FT04_E2E_SCANNER_RAW_SIGNATURE /private/ft04-e2e/clamd.sock " +
+            "FT04_E2E_BEARER_TOKEN: OK\0",
+          );
+          return;
+        }
+        if (buffer.byteLength < 4 + length) return;
+        scannedBytes += length;
+        if (scannedBytes > 50 * 1_024 * 1_024) {
+          socket.destroy();
+          return;
+        }
+        buffer = buffer.subarray(4 + length);
+      }
+    });
+  });
+  await new Promise<void>((resolveListen, rejectListen) => {
+    server.once("error", rejectListen);
+    server.listen(0, "127.0.0.1", resolveListen);
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new TypeError("Attachment ClamD fixture did not bind loopback TCP");
+  }
+  return Object.freeze({
+    endpoint: Object.freeze({ kind: "tcp" as const, host: "127.0.0.1" as const, port: address.port }),
+    async close() {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    },
+  });
 }
 
 async function readClosedStartupCommand(): Promise<AuthorityChildStartCommand> {
@@ -677,6 +756,10 @@ function createPreviewSentinelProvider(
   });
 }
 
+const attachmentFixture = command.enableAttachmentFixture === true
+  ? await startAttachmentClamdFixture()
+  : undefined;
+const attachmentToolPath = resolve(import.meta.dirname, "attachment-tool-child.js");
 const serverOptions: StartAuthoritativeServerOptions = {
   databasePath: command.databasePath,
   snapshotCachePath: command.snapshotCachePath,
@@ -685,6 +768,24 @@ const serverOptions: StartAuthoritativeServerOptions = {
   actors: command.actors,
   identities,
   invitationSecretKey: Buffer.from(command.invitationSecretKey, "base64url"),
+  ...(attachmentFixture === undefined ? {} : {
+    attachmentRuntime: {
+      storageRoot: join(dirname(command.databasePath), "attachment-store"),
+      cwd: dirname(command.databasePath),
+      ocrLanguage: "eng",
+      capabilityProbeTimeoutMs: 5_000,
+      clamd: {
+        endpoint: attachmentFixture.endpoint,
+        databaseSha256: "a".repeat(64),
+        databaseUpdatedAt: new Date().toISOString(),
+        policy: PRODUCTION_CLAMD_POLICY,
+      },
+      pdfinfo: { executable: process.execPath, argvPrefix: [attachmentToolPath, "pdfinfo"] },
+      pdftotext: { executable: process.execPath, argvPrefix: [attachmentToolPath, "pdftotext"] },
+      pdftoppm: { executable: process.execPath, argvPrefix: [attachmentToolPath, "pdftoppm"] },
+      tesseract: { executable: process.execPath, argvPrefix: [attachmentToolPath, "tesseract"] },
+    },
+  }),
 };
 const closeCounts = { transport: 0, runtime: 0, snapshots: 0, worker: 0 };
 const testOptions = {
@@ -731,6 +832,7 @@ if (command.closeCleanupProbe === true) {
   const failure = await first.catch((error: unknown) => error);
   const reopened = await startAuthoritativeServer(serverOptions);
   await reopened.close();
+  await attachmentFixture?.close();
   process.stdout.write(`${JSON.stringify({
     type: "close-cleanup-probed",
     samePromise,
@@ -745,7 +847,11 @@ let closing = false;
 async function close(): Promise<void> {
   if (closing) return;
   closing = true;
-  await server.close();
+  try {
+    await server.close();
+  } finally {
+    await attachmentFixture?.close();
+  }
   process.exit(0);
 }
 process.once("SIGTERM", () => void close());
