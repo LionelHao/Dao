@@ -13,7 +13,8 @@
     "src/collaboration.ts",
     "src/sync.ts",
     "src/message-authority.ts",
-    "src/attachment-authority.ts"
+    "src/attachment-authority.ts",
+    "src/room-memory.ts"
   ],
   "exclude": ["src/**/*.test.ts", "src/**/*.type-test.ts"]
 }
