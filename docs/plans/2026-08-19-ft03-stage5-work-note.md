@@ -2,7 +2,7 @@
 
 日期：2026-08-19
 
-状态：实施中；不得标记为 verified
+状态：生产实现、集成、自动化与代码 PR 已完成；等待 owner 验收，不得标记为 verified
 
 前置交接：T0040、T0041、Shared Stage 3、Stage 4 delivery/work note
 
@@ -118,3 +118,47 @@
 - `corepack pnpm --filter @native-im/desktop smoke`：`Electron Identity smoke passed`。
 - fallback pnpm 造成的临时 node_modules 缺少 Electron binary 已通过执行锁定版本包自身的 install script 修复；
   `pnpm-workspace.yaml`、lockfile 与 dependency version 均无最终改动。
+
+## 9. 最终生产实现
+
+- Core：新增 Human submit、UTF-16 mention entity、逐 target outcome、revision、Agent final/correction、tombstone、timeline event/repair 的 exact closed contract；public payload 不能携带 author/principal/session/capability/runtime/provider/model。
+- schema：从 v15 追加唯一 immutable v16 `message-authority-vnext`；message envelope/revision/mention/outcome、Human/Agent intent、execution link、reply/attachment、recall fence、Agent source/correction 全部 closed；v1～v15 statement/checksum/fingerprint 未改。
+- Authority：`message.send.v2` 在一个 `BEGIN IMMEDIATE` 中重验 session/Room/member/target，写 message、revision 1、每 target 唯一 outcome、accepted intent、event、outbox、receipt 与 ACK；任一系统错误整笔 rollback。
+- revision/recall：author-only/current-revision CAS；revision append-only且冻结 targets/reply/attachments/outcome/intent lineage；recall 投影 body-free tombstone，先 durable cancel/fence，再向 exact source runtime 传播 abort。
+- Agent final/correction：仅 server-internal opaque capability；重验 Agent、intent、execution、attempt/generation、source revision/fence 与 terminal CAS；public WS 无对应命令。
+- operational projection：history、stable event、delta、outbox、materialized/streaming repair、Desktop replica/timeline 共用 message-specific canonical seam；recalled raw 不进入 operational surface。
+- Desktop：closed five-operation-plus-subscribe bridge；main-only session/token/socket；structured mention/reply/target outcome/revision/recall/final/correction、offline/repair/revoked/410 与 accessibility 状态全部按 DESIGN_CONTRACT 接入真实 ACK/event/projection。
+
+## 10. RED→GREEN 与竞态证据
+
+- 每个切片先以缺失模块、旧 schema、旧 parser、旧 renderer 状态或真实 SQLite 反例取得 RED；没有删除、skip 或弱化既有测试。
+- 真实 SQLite 覆盖 member removal/Agent assignment reduction vs send、target/domain/outcome fault、two-device revision、revise vs recall、recall vs claim/create/final、Agent/Human route source fence、exact replay/change conflict。
+- 真实 child-process 覆盖三客户端、同 author 两设备、ACK 未消费后新 requestId replay、outbox stable event、restart、cursor expiry、clear-and-restore、revise/recall 与 Desktop 收敛。
+- preview sentinel 经过 provider chunk、durable recall、SIGKILL、restart、reconnect；SQLite operational columns、DB/WAL/cache bytes、event/outbox/history/repair/runtime context/Desktop input 均零命中。completed final 与 succeeded dispatch 保留。
+- recalled raw 仅保留于受限 authority revision/audit；旧/full message event、pending outbox、sync、route/calibration、runtime context 与 pre-recall snapshot cache 均被 tombstone/fence/invalidation 收敛。
+
+## 11. 最终计数与门禁
+
+- 全仓：101 files passed、2 live suites skipped、0 failed（103）；1430 tests passed、2 skipped、0 failed（1432）。
+- real Authority/process：23/23；SQLite authoritative store：84/84；snapshot worker：70/70；schema v15/v16/general：69/69；Desktop：33 files / 308 tests。
+- focused safety matrix：6 files / 207 tests；archived repair watermark：1/1。
+- `corepack pnpm typecheck`、`lint`、`test`、`build`、`verify:core-boundary`、`verify:desktop-boundary` 与 `git diff --check` 全部通过；lint 0 warnings。
+- 两个 skipped 是既有 opt-in OpenAI live smoke，不是本阶段回避项。
+
+## 12. PR 与合入顺序
+
+| PR | Ready head | Squash merge | GitHub quality |
+| --- | --- | --- | --- |
+| [#42 · Core closed contracts](https://github.com/LionelHao/Dao/pull/42) | `c63e685300172c13328e47a4312e573bcd197429` | `f768accac1266fc891e3f09a4f46daa7464e4bd9` | [32224440190](https://github.com/LionelHao/Dao/actions/runs/32224440190)，Node 22.13.1 / 22.x success |
+| [#43 · schema v16](https://github.com/LionelHao/Dao/pull/43) | `28f990c7b6a410f90e057a1cffe333a426270c94` | `2b775156adcfaf06bbb6fe33bcc71fd58023154d` | [32231268177](https://github.com/LionelHao/Dao/actions/runs/32231268177)，Node 22.13.1 / 22.x success |
+| [#44 · closed protocol](https://github.com/LionelHao/Dao/pull/44) | `499f6bdc6eede7b7221a91e26126e2b5f1d013a9` | `d7b64d1d5dff84bb16340805e08305fb0f36b555` | [32235419770](https://github.com/LionelHao/Dao/actions/runs/32235419770)，Node 22.13.1 / 22.x success |
+| [#45 · Authority lifecycle](https://github.com/LionelHao/Dao/pull/45) | `f4ed9bc8f6340fc8586fb983474f10b92686adde` | `ec3bb653e803064cd62f2b6f6fae8ed47705140b` | [32237011304](https://github.com/LionelHao/Dao/actions/runs/32237011304)，Node 22.13.1 / 22.x success |
+| [#46 · Desktop loop](https://github.com/LionelHao/Dao/pull/46) | `069e1f72affeddc598d0c84f21c4bc6c57fec6d1` | `4ca050a22422814a42600813ead006a708d62721` | [32237833927](https://github.com/LionelHao/Dao/actions/runs/32237833927)，Node 22.13.1 / 22.x success |
+| [#47 · race/leakage/E2E](https://github.com/LionelHao/Dao/pull/47) | `299a3d795c80c98b647eef4917e1529a8a6a9193` | `326f72d082b4e008946989d13380deb923dc70a3` | [32239461206](https://github.com/LionelHao/Dao/actions/runs/32239461206)，Node 22.13.1 / 22.x success |
+
+## 13. 边界与后续 owner
+
+- attachment reference 只保留 closed seam；`attachments: []` 可用，非空值在 FT-04 validator 合入前 fail closed。
+- FT-05 memory lifecycle、FT-08 完整 scheduling、FT-09 完整 Request lifecycle、FT-11 完整产品壳、FT-14 audit/export/retention 仍由各自 FT owner 负责；本阶段没有把 seam 描述为完整产品。
+- 建议 persistence reviewer 复核 v16 immutable DDL、逐 statement rollback、source/execution/final CAS 与 snapshot physical deletion；runtime/tool reviewer 复核 dispatched/outcome_unknown truthfulness；sync/Desktop reviewer 复核 fixed-watermark retry、revoked purge 与 renderer authority boundary。
+- 未修改 Blueprint HTML/JSON，未自行更改任何 FT/Blueprint 状态；原工作区四份未跟踪 FT-09/FT-10 文档保持原样。
