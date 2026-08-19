@@ -5,6 +5,7 @@ import {
   mintDatabaseAuthorityTransactionView,
   releaseDatabaseAuthorityTransactionView,
   useAuthorityTransactionDatabase,
+  withDatabaseAuthorityTransactionView,
 } from "./authority-transaction-database.js";
 
 describe("Authority transaction database capability", () => {
@@ -41,5 +42,27 @@ describe("Authority transaction database capability", () => {
       JSON.parse(JSON.stringify(unbound)),
       () => undefined,
     )).toThrow("transaction capability is invalid");
+  });
+
+  it("revokes the scoped database binding when participant work throws", () => {
+    const database = new DatabaseSync(":memory:");
+    let captured: ReturnType<typeof mintDatabaseAuthorityTransactionView> | undefined;
+    try {
+      expect(() => withDatabaseAuthorityTransactionView(
+        database,
+        "room-1",
+        "transaction-throw",
+        (transaction) => {
+          captured = transaction;
+          throw new Error("participant failed");
+        },
+      )).toThrow("participant failed");
+      expect(captured).toBeDefined();
+      expect(() => useAuthorityTransactionDatabase(captured!, () => undefined)).toThrow(
+        "database capability is unavailable",
+      );
+    } finally {
+      database.close();
+    }
   });
 });

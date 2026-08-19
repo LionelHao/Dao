@@ -32,6 +32,24 @@ export function releaseDatabaseAuthorityTransactionView(
   }
 }
 
+export function withDatabaseAuthorityTransactionView<TResult>(
+  database: DatabaseSync,
+  roomId: string,
+  transactionId: string,
+  operation: (transaction: AuthorityTransactionView) => TResult,
+): TResult {
+  const transaction = mintDatabaseAuthorityTransactionView(
+    database,
+    roomId,
+    transactionId,
+  );
+  try {
+    return operation(transaction);
+  } finally {
+    releaseDatabaseAuthorityTransactionView(transaction);
+  }
+}
+
 export function useAuthorityTransactionDatabase<TResult>(
   transaction: AuthorityTransactionView,
   operation: (database: DatabaseSync) => TResult,

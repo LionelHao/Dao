@@ -7,6 +7,7 @@ const PRIVATE_MARKERS = [
   "mintDatabaseAuthorityTransactionView",
   "releaseDatabaseAuthorityTransactionView",
   "useAuthorityTransactionDatabase",
+  "withDatabaseAuthorityTransactionView",
   "ParticipantRegistration",
   "DepartureResponsibilityContributor",
   "PendingConfirmationDepartureContributor",
