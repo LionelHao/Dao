@@ -17,9 +17,9 @@ import {
 import { registerGovernanceIpc } from "./governance/ipc.js";
 import {
   createMessageAuthorityController,
-  createUnavailableMessageAuthorityClientPort,
 } from "./message-authority/controller.js";
 import { registerMessageAuthorityIpc } from "./message-authority/ipc.js";
+import { createDesktopMessageAuthorityRuntime } from "./message-authority/production-runtime.js";
 import {
   blankGroupChatWindowOptions,
   installWindowSecurityPolicy,
@@ -34,6 +34,9 @@ async function createWindow(): Promise<void> {
   let identity: ReturnType<typeof createDesktopIdentityRuntime> | undefined;
   let governance: ReturnType<typeof createDesktopGovernanceRuntime> | undefined;
   let disposeGovernanceIpc: (() => void) | undefined;
+  let messageAuthorityRuntime: ReturnType<
+    typeof createDesktopMessageAuthorityRuntime
+  > | undefined;
   let messageAuthority: ReturnType<typeof createMessageAuthorityController> | undefined;
   let disposeMessageAuthorityIpc: (() => void) | undefined;
 
@@ -55,7 +58,10 @@ async function createWindow(): Promise<void> {
       ipcMain,
       webContents: window.webContents,
       authorizedState: {
-        invalidate: () => governance?.invalidateAuthorizedState(),
+        invalidate: () => {
+          governance?.invalidateAuthorizedState();
+          messageAuthorityRuntime?.invalidateAuthorizedState();
+        },
       },
     });
     governance = createDesktopGovernanceRuntime({
@@ -72,8 +78,13 @@ async function createWindow(): Promise<void> {
       webContents: window.webContents,
       controller: governance.controller,
     });
+    messageAuthorityRuntime = createDesktopMessageAuthorityRuntime({
+      endpoint: process.env.NATIVE_IM_IDENTITY_WS_URL ?? "ws://127.0.0.1:8787",
+      session: () => identity?.getCurrentAuthoritySession(),
+      webSocketFactory: (endpoint) => new WebSocket(endpoint),
+    });
     messageAuthority = createMessageAuthorityController({
-      client: createUnavailableMessageAuthorityClientPort(),
+      client: messageAuthorityRuntime.client,
       createRequestId: (operation) => `message-${operation}-${randomUUID()}`,
     });
     disposeMessageAuthorityIpc = registerMessageAuthorityIpc({
@@ -87,6 +98,7 @@ async function createWindow(): Promise<void> {
       identity?.close();
       governance?.close();
       messageAuthority?.close();
+      messageAuthorityRuntime?.close();
     });
 
     await Promise.all([window.loadFile(rendererPath), identity.initialize()]);
@@ -172,6 +184,7 @@ async function createWindow(): Promise<void> {
     identity?.close();
     governance?.close();
     messageAuthority?.close();
+    messageAuthorityRuntime?.close();
     if (!window.isDestroyed()) window.destroy();
     throw error;
   }
