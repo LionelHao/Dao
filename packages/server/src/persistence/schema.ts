@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { MAX_ACTIVE_SESSION_FAMILIES } from "./contracts.js";
 
-export const AUTHORITY_SCHEMA_VERSION = 13 as const;
+export const AUTHORITY_SCHEMA_VERSION = 14 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -56,6 +56,7 @@ const SCHEMA_FINGERPRINTS = {
   11: "83e48fc5a4b1b1c19863efd785ea098308d100c1899d638d2b5f95c5b0c119a6",
   12: "7232d27114e9acf32dcfbc2d59f3c3128eed10955de3cc2703ddeedf92892741",
   13: "037df6a2818f2a90b7394240a4cf71d77949faf31df6534c5546c9ed6b7e7191",
+  14: "79bb22503b76bcbb1826f52cf827cea2cfa0db04abf2419ad7ed30ff81681cf6",
 } as const;
 
 const V1_STATEMENTS = [
@@ -1161,6 +1162,22 @@ const V13_STATEMENTS = [
    BEFORE DELETE ON room_audit BEGIN SELECT RAISE(ABORT, 'room audit is immutable'); END`,
 ] as const;
 
+const V14_STATEMENTS = [
+  `CREATE TABLE room_message_archive_gates (
+    room_id TEXT PRIMARY KEY REFERENCES rooms(id),
+    gate_generation INTEGER NOT NULL CHECK (gate_generation > 0),
+    blocked_at TEXT NOT NULL
+  ) STRICT`,
+  `INSERT INTO room_message_archive_gates (
+     room_id, gate_generation, blocked_at
+   )
+   SELECT id, archive_generation, archived_at
+   FROM rooms
+   WHERE status = 'archived'
+     AND archive_generation > 0
+     AND archived_at IS NOT NULL`,
+] as const;
+
 const V2_STATEMENTS = [
   `ALTER TABLE actors
    ADD COLUMN catalog_revision INTEGER NOT NULL DEFAULT 0
@@ -1560,6 +1577,7 @@ const MIGRATIONS = [
     V13_STATEMENTS,
     V13_MIGRATION_CHECKSUM,
   ),
+  defineMigration(14, "shared-authority-production-providers", V14_STATEMENTS),
 ] as const satisfies readonly Migration[];
 
 const V1_SCHEMA_CONTRACT = {
@@ -1881,6 +1899,13 @@ const V13_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V14_SCHEMA_CONTRACT = {
+  ...V13_SCHEMA_CONTRACT,
+  room_message_archive_gates: [
+    "room_id", "gate_generation", "blocked_at",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
@@ -1895,6 +1920,7 @@ const SCHEMA_CONTRACTS = {
   11: V11_SCHEMA_CONTRACT,
   12: V12_SCHEMA_CONTRACT,
   13: V13_SCHEMA_CONTRACT,
+  14: V14_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -2427,6 +2453,25 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
       "v13 membership roles must keep Human governance separate from Agent participation",
     );
   }
+  if (schemaVersion >= 14) {
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM rooms AS room
+       LEFT JOIN room_message_archive_gates AS gate ON gate.room_id = room.id
+       WHERE (room.status = 'archived' AND (
+                gate.room_id IS NULL
+                OR gate.gate_generation <> room.archive_generation
+                OR gate.blocked_at <> room.archived_at
+              ))
+          OR (gate.room_id IS NOT NULL AND (
+                gate.gate_generation <= 0
+                OR gate.gate_generation > room.archive_generation
+              ))
+       LIMIT 1`,
+      "message archive gates must match the current archived generation",
+    );
+  }
 }
 
 function validateExistingSchema(database: DatabaseSync, currentVersion: number): void {
@@ -2638,6 +2683,12 @@ export function migrateAuthorityDatabaseToPreviousVersionForTest(
   database: DatabaseSync,
 ): void {
   migrateAuthorityDatabaseToVersion(database, AUTHORITY_SCHEMA_VERSION - 1);
+}
+
+export function migrateAuthorityDatabaseToVersion12ForTest(
+  database: DatabaseSync,
+): void {
+  migrateAuthorityDatabaseToVersion(database, 12);
 }
 
 export function migrateAuthorityDatabaseToVersion11ForTest(

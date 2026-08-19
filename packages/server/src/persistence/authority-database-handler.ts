@@ -75,6 +75,10 @@ import type { SnapshotVersion } from "@native-im/core";
 import { assignTopicKey } from "../route-runtime/route-decision.js";
 import type { AuthorityTransactionView } from "../room-governance/private-participant-contracts.js";
 import { withDatabaseAuthorityTransactionView } from "./authority-transaction-database.js";
+import {
+  ArchivedMessageMutationBlockedError,
+  requireMessageMutationAllowedInTransaction,
+} from "../message-authority/archived-message-gate.js";
 
 export class AuthorityDatabaseError extends Error {
   constructor(
@@ -113,6 +117,39 @@ export interface DatabaseCommandResult {
 
 function fail(code: AuthorityWorkerErrorCode, message: string): never {
   throw new AuthorityDatabaseError(code, message);
+}
+
+function requireMessageMutationAllowed(
+  database: DatabaseSync,
+  roomId: string,
+  mutationKind: "message" | "message_intent",
+  transactionId: string,
+): void {
+  const room = database.prepare(
+    "SELECT archive_generation AS archiveGeneration FROM rooms WHERE id = ?",
+  ).get(roomId);
+  if (typeof room?.archiveGeneration !== "number" ||
+    !Number.isSafeInteger(room.archiveGeneration) || room.archiveGeneration < 0) {
+    return fail("storage_unavailable", "Authority Room lifecycle proof was unavailable");
+  }
+  try {
+    withDatabaseAuthorityTransactionView(
+      database,
+      roomId,
+      transactionId,
+      (transaction) => requireMessageMutationAllowedInTransaction(transaction, {
+        roomId,
+        mutationKind,
+        expectedArchiveGeneration: room.archiveGeneration as number,
+      }),
+    );
+  } catch (error: unknown) {
+    if (error instanceof ArchivedMessageMutationBlockedError &&
+      error.reason === "room_archived") {
+      return fail("room_archived", "Authority Room is archived");
+    }
+    return fail("dependency_unavailable", "Message mutation gate was unavailable");
+  }
 }
 
 function ballFactsForRoom(
@@ -2578,6 +2615,12 @@ function executeMessageSend(
     authorId: actorId,
     authorKind: actor.kind,
   };
+  requireMessageMutationAllowed(
+    database,
+    command.roomId,
+    "message",
+    stableId("message-gate", scope, key),
+  );
   database
     .prepare(
       `INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
@@ -4429,6 +4472,14 @@ export function executeRouteAuthorityOperation(
         }
         acceptedIntents.push(intent);
       }
+      if (acceptedIntents.length > 0) {
+        requireMessageMutationAllowed(
+          database,
+          job.roomId,
+          "message_intent",
+          stableId("route-intent-gate", job.id, String(job.currentAttempt)),
+        );
+      }
       for (const agentId of snapshotAgents) {
         const judgment = judgmentByAgent.get(agentId)!;
         if ((acceptedIntents.some((intent) => intent.targetAgentId === agentId)) !==
@@ -4799,6 +4850,12 @@ export function executeRuntimeAuthorityOperation(
       const supersedesExecutionIds = oldRows.map((row) => row.executionId as string);
       const executionId = stableId("fence-replacement", route.sourceMessageId, operation.targetAgentId);
       const intentId = stableId("fence-replacement-intent", route.sourceMessageId, operation.targetAgentId);
+      requireMessageMutationAllowed(
+        database,
+        route.roomId,
+        "message_intent",
+        stableId("fence-replacement-intent-gate", operation.routeJobId, operation.targetAgentId),
+      );
       database.prepare(
         `INSERT INTO agent_executions (
            id, room_id, agent_id, trigger_message_id, status, started_at,
@@ -4918,6 +4975,12 @@ export function executeRuntimeAuthorityOperation(
       ).get(operation.intent.sourceMessageId, operation.intent.targetAgentId);
       if (typeof existing?.executionId === "string") {
         if (operation.intent.kind === "direct_mention" && existing.intentKind !== "direct_mention") {
+          requireMessageMutationAllowed(
+            database,
+            operation.intent.roomId,
+            "message_intent",
+            stableId("runtime-intent-upgrade-gate", operation.intentId),
+          );
           database.prepare(
             `UPDATE agent_invocation_intents SET intent_kind = 'direct_mention'
              WHERE source_message_id = ? AND target_agent_id = ?`,
@@ -4931,6 +4994,12 @@ export function executeRuntimeAuthorityOperation(
       if (typeof queued?.count !== "number" || queued.count >= 32) {
         return fail("agent_queue_full", "Agent room queue was full");
       }
+      requireMessageMutationAllowed(
+        database,
+        operation.intent.roomId,
+        "message_intent",
+        stableId("runtime-intent-gate", operation.intentId),
+      );
       database.prepare(
         `INSERT INTO agent_executions (
            id, room_id, agent_id, trigger_message_id, status, started_at,
@@ -5011,6 +5080,12 @@ export function executeRuntimeAuthorityOperation(
       ).get(operation.intent.sourceMessageId, operation.intent.targetAgentId);
       if (typeof existing?.executionId === "string") {
         if (operation.intent.kind === "direct_mention" && existing.intentKind !== "direct_mention") {
+          requireMessageMutationAllowed(
+            database,
+            operation.intent.roomId,
+            "message_intent",
+            stableId("routed-intent-upgrade-gate", operation.intentId),
+          );
           database.prepare(
             `UPDATE agent_invocation_intents SET intent_kind = 'direct_mention'
              WHERE source_message_id = ? AND target_agent_id = ?`,
@@ -5024,6 +5099,12 @@ export function executeRuntimeAuthorityOperation(
       if (typeof queued?.count !== "number" || queued.count >= 32) {
         return fail("agent_queue_full", "Agent room queue was full");
       }
+      requireMessageMutationAllowed(
+        database,
+        operation.intent.roomId,
+        "message_intent",
+        stableId("routed-intent-gate", operation.intentId),
+      );
       database.prepare(
         `INSERT INTO agent_executions (
            id, room_id, agent_id, trigger_message_id, status, started_at,
