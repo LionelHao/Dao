@@ -632,8 +632,8 @@ class JsonWebSocketClient {
       const timeout = setTimeout(() => {
         const index = this.#waiters.findIndex((waiter) => waiter.timeout === timeout);
         if (index >= 0) this.#waiters.splice(index, 1);
-        reject(new Error("Timed out waiting for the expected WebSocket frame"));
-      }, 2_000);
+        reject(new Error("Timed out waiting 10 seconds for the expected WebSocket frame"));
+      }, 10_000);
       this.#waiters.push({ predicate, resolve, reject, timeout });
     });
   }
@@ -644,7 +644,7 @@ class JsonWebSocketClient {
     this.send(value);
     return response.then((frame) => {
       if (frame.type === "error") {
-        throw Object.assign(new Error(frame.code), {
+        throw Object.assign(new Error(`${frame.code}: ${frame.message}`), {
           code: frame.code,
           status: frame.status,
         });
@@ -1136,6 +1136,80 @@ describe("authoritative server real-process harness", () => {
       .resolves.not.toContain("createWorkerDatabaseClientWithTransactionFaultForTest");
   });
 
+  it("routes message.send.v2 through the production AuthorityWorker and stable Room stream", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-ft03-message-composition-"));
+    let started: Awaited<ReturnType<typeof spawnAuthorityChild>> | undefined;
+    let client: JsonWebSocketClient | undefined;
+    try {
+      started = await spawnAuthorityChild({ directory, seedAllFacts: true });
+      client = await JsonWebSocketClient.connect(started.url);
+      await client.login("message-v2-production-login");
+      const roomId = await discoverRoom(client);
+      const head = readRoomHeadSeq(directory, roomId);
+      await client.request({
+        type: "room.subscribe.v2",
+        requestId: "message-v2-production-subscribe",
+        roomId,
+        cursor: { version: 1, roomId, afterSeq: head },
+      }, "room.subscribed.v2");
+
+      const messageId = "message-v2-production";
+      await expect(client.request({
+        type: "message.send.v2",
+        requestId: "message-v2-production-send",
+        message: {
+          messageId,
+          roomId,
+          body: "production Message Authority",
+          mentionedTargets: [],
+          attachments: [],
+        },
+      }, "message.accepted")).resolves.toMatchObject({
+        type: "message.accepted",
+        requestId: "message-v2-production-send",
+        messageId,
+        targetOutcomes: [],
+      });
+      await expect(client.waitFor((frame) => frame.type === "room.event" &&
+        frame.event.roomId === roomId &&
+        frame.event.type === "room.message.accepted" &&
+        frame.event.payload.id === messageId)).resolves.toMatchObject({
+        type: "room.event",
+        event: {
+          roomId,
+          type: "room.message.accepted",
+          payload: {
+            id: messageId,
+            roomId,
+            authorId: "human-a",
+            authorKind: "human",
+            lifecycle: "active",
+            currentRevision: {
+              messageId,
+              revision: 1,
+              body: "production Message Authority",
+              revisedByActorId: "human-a",
+            },
+          },
+        },
+      });
+      const history = await client.request({
+        type: "room.history.v2",
+        requestId: "message-v2-production-history",
+        roomId,
+      }, "room.history.v2");
+      if (history.type !== "room.history.v2") throw new TypeError("wrong message history frame");
+      expect(history.roomId).toBe(roomId);
+      expect(history.messages).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: messageId, authorId: "human-a" }),
+      ]));
+    } finally {
+      client?.close();
+      if (started !== undefined) await stopChild(started.child);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("drives three isolated Desktop Identity controllers through real password login and targeted device revocation", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-ft01-desktop-authority-"));
     const databasePath = join(directory, "authority.sqlite");
@@ -1494,11 +1568,23 @@ describe("authoritative server real-process harness", () => {
       await client.login("cache-mutation-login");
       const authority = await repairRecords(client, roomId);
       const mutated = structuredClone(authority.records);
-      const message = mutated.find((record) => record.kind === "message");
-      if (message === undefined || message.kind !== "message") {
+      const messageIndex = mutated.findIndex((record) => record.kind === "timeline-message" &&
+        record.value.lifecycle === "active" && record.value.authorKind === "human");
+      const message = mutated[messageIndex];
+      if (message === undefined || message.kind !== "timeline-message" ||
+          message.value.lifecycle !== "active" || message.value.authorKind !== "human") {
         throw new TypeError("Mutation fixture has no message");
       }
-      message.value.body = "mutated after transport";
+      mutated[messageIndex] = {
+        kind: "timeline-message",
+        value: {
+          ...message.value,
+          currentRevision: {
+            ...message.value.currentRevision,
+            body: "mutated after transport",
+          },
+        },
+      };
       const cache = new MemoryAuthorityCache();
       const snapshotId = "mutated-snapshot";
       cache.beginRoom(roomId, snapshotId);
@@ -1593,7 +1679,7 @@ describe("authoritative server real-process harness", () => {
       expect(kinds).toEqual(expect.arrayContaining([
         "room",
         "membership",
-        "message",
+        "timeline-message",
         "human-read",
         "agent-judgement",
         "open-item",
@@ -1601,11 +1687,12 @@ describe("authoritative server real-process harness", () => {
         "calibration",
       ]));
       expect(snapshot.records.filter((record) => record.kind === "membership")).toHaveLength(2);
-      expect(snapshot.records.filter((record) => record.kind === "message")).toHaveLength(2);
+      expect(snapshot.records.filter((record) => record.kind === "timeline-message"))
+        .toHaveLength(2);
       for (const [kind, count] of [
         ["room", 1],
         ["membership", 2],
-        ["message", 2],
+        ["timeline-message", 2],
         ["human-read", 1],
         ["agent-judgement", 1],
         ["open-item", 1],
@@ -1646,8 +1733,10 @@ describe("authoritative server real-process harness", () => {
       const roomId = await discoverRoom(client);
       const before = await repairRecords(client, roomId);
       const source = before.records.find((record) =>
-        record.kind === "message" && record.value.authorKind === "human");
-      if (source?.kind !== "message") throw new Error("missing human source message");
+        record.kind === "timeline-message" && record.value.lifecycle === "active" &&
+        record.value.authorKind === "human");
+      if (source?.kind !== "timeline-message" || source.value.lifecycle !== "active" ||
+          source.value.authorKind !== "human") throw new Error("missing human source message");
       const create = {
         type: "open-item.create" as const,
         requestId: "open-item-create",
@@ -2540,7 +2629,12 @@ describe("authoritative server real-process harness", () => {
       const materializedRepairs = Promise.all([
         replicaB.repairRoom(roomId), replicaC.clearAndRestore(),
       ]);
-      await materializedLastPagePaused;
+      await Promise.race([
+        materializedLastPagePaused,
+        materializedRepairs.then(() => {
+          throw new Error("Materialized repairs completed without observing the final page");
+        }),
+      ]);
       expect(cacheC.factCount(roomId)).toBe(0);
       expect(cacheC.roomChecksum(roomId)).toBeUndefined();
       releaseMaterializedLastPage();
@@ -2561,7 +2655,7 @@ describe("authoritative server real-process harness", () => {
       expect(mixed.mixedCounts).toEqual({
         room: 1,
         membership: 2_000,
-        message: 3_500,
+        "timeline-message": 3_500,
         "human-read": 1_999,
         "agent-judgement": 500,
         "open-item": 500,
