@@ -17,14 +17,14 @@ import {
 } from "@native-im/core";
 
 export interface RoomSubscriptionObserver {
-  events(events: readonly PersistedRoomEvent[], cursor: RoomCursor): Promise<void>;
+  events(events: readonly DesktopRoomEvent[], cursor: RoomCursor): Promise<void>;
   retry(restartFrom: RoomCursor): Promise<void>;
 }
 
 export interface SyncTransport {
   bootstrapBegin(requestId: string): Promise<WorkspaceBootstrapPage>;
   bootstrapPage(requestId: string, snapshotId: string, afterPage: number): Promise<WorkspaceBootstrapPage>;
-  syncRoom(request: RoomSyncRequest): Promise<RoomSyncResult>;
+  syncRoom(request: RoomSyncRequest): Promise<DesktopRoomSyncResult>;
   repairRoomBegin(requestId: string, roomId: string): Promise<RoomRepairPage>;
   repairRoomPage(requestId: string, snapshotId: string, afterPage: number): Promise<RoomRepairPage>;
   completeSnapshot(
@@ -58,11 +58,90 @@ export interface ClientAuthorityCache {
   commitRoom(roomId: string, watermark: number, checksum: string): void;
   applyRoomEvents(
     roomId: string,
-    events: readonly PersistedRoomEvent[],
+    events: readonly DesktopRoomEvent[],
     cursor: RoomCursor,
   ): void;
   discardSnapshot(snapshotId: string): void;
   clear(): void;
+}
+
+/** Desktop compatibility contract for the approved FT-02C event while Core lands in the integration tree. */
+export interface DesktopRoomReopenedEvent {
+  readonly eventId: string;
+  readonly streamKind: "room";
+  readonly streamId: string;
+  readonly streamSeq: number;
+  readonly roomId: string;
+  readonly actorId: string;
+  readonly occurredAt: string;
+  readonly type: "room.reopened";
+  readonly payload: {
+    readonly archiveGeneration: number;
+    readonly resumedTimerCount: number;
+  };
+}
+
+export type DesktopRoomEvent = PersistedRoomEvent | DesktopRoomReopenedEvent;
+export type DesktopRoomSyncResult =
+  | Exclude<RoomSyncResult, { readonly mode: "delta" }>
+  | (Omit<Extract<RoomSyncResult, { readonly mode: "delta" }>, "events"> & {
+      readonly events: readonly DesktopRoomEvent[];
+    });
+
+type UnknownRecord = Record<string, unknown>;
+function record(value: unknown): value is UnknownRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function exact(value: UnknownRecord, required: readonly string[]): boolean {
+  const fields = new Set(required);
+  return Reflect.ownKeys(value).length === fields.size &&
+    required.every((key) => Object.hasOwn(value, key)) &&
+    Reflect.ownKeys(value).every((key) => typeof key === "string" && fields.has(key));
+}
+function text(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 512;
+}
+function count(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+export function isDesktopRoomEvent(value: unknown): value is DesktopRoomEvent {
+  if (record(value) && value.type === "room.reopened") {
+    return exact(value, [
+      "eventId", "streamKind", "streamId", "streamSeq", "roomId", "actorId", "occurredAt", "type", "payload",
+    ]) && text(value.eventId) && value.streamKind === "room" && text(value.streamId) &&
+      value.streamId === value.roomId && count(value.streamSeq) && value.streamSeq > 0 &&
+      text(value.roomId) && text(value.actorId) && text(value.occurredAt) && record(value.payload) &&
+      exact(value.payload, ["archiveGeneration", "resumedTimerCount"]) &&
+      count(value.payload.archiveGeneration) && value.payload.archiveGeneration > 0 &&
+      count(value.payload.resumedTimerCount);
+  }
+  if (!record(value) || !text(value.roomId) || !count(value.streamSeq)) return false;
+  return isRoomSyncResult({
+    type: "room.sync.result", requestId: "desktop-event-validation", mode: "delta", events: [value],
+    nextCursor: { version: 1, roomId: value.roomId, afterSeq: value.streamSeq },
+    watermark: value.streamSeq, hasMore: false,
+  });
+}
+
+export function isDesktopRoomSyncResult(value: unknown): value is DesktopRoomSyncResult {
+  if (isRoomSyncResult(value)) return true;
+  if (!record(value) || !exact(value, [
+    "type", "requestId", "mode", "events", "nextCursor", "watermark", "hasMore",
+  ]) || value.type !== "room.sync.result" || !text(value.requestId) || value.mode !== "delta" ||
+      !Array.isArray(value.events) || !value.events.every(isDesktopRoomEvent) ||
+      !isRoomCursor(value.nextCursor) || !count(value.watermark) || typeof value.hasMore !== "boolean") return false;
+  const events = value.events;
+  const nextCursor = value.nextCursor as RoomCursor;
+  if (new Set(events.map((event) => event.eventId)).size !== events.length ||
+      events.some((event) => event.roomId !== nextCursor.roomId) ||
+      nextCursor.afterSeq > value.watermark ||
+      value.hasMore !== (nextCursor.afterSeq < value.watermark) ||
+      (value.hasMore ? nextCursor.watermark !== value.watermark
+        : Object.hasOwn(nextCursor, "watermark"))) return false;
+  if (events.length === 0) return nextCursor.afterSeq === value.watermark;
+  return events.at(-1)?.streamSeq === nextCursor.afterSeq &&
+    events.every((event, index) => index === 0 || event.streamSeq === events[index - 1]!.streamSeq + 1);
 }
 
 export class ClientSyncReplicaError extends Error {
@@ -157,10 +236,10 @@ function validateRoomPage(
 }
 
 function deduplicateEvents(
-  events: readonly PersistedRoomEvent[],
+  events: readonly DesktopRoomEvent[],
   seen: Set<string>,
-): readonly PersistedRoomEvent[] {
-  const result: PersistedRoomEvent[] = [];
+): readonly DesktopRoomEvent[] {
+  const result: DesktopRoomEvent[] = [];
   for (const event of events) {
     if (!seen.has(event.eventId)) {
       seen.add(event.eventId);
@@ -170,13 +249,13 @@ function deduplicateEvents(
   return result;
 }
 
-function validateEventShape(roomId: string, event: PersistedRoomEvent): void {
+function validateEventShape(roomId: string, event: DesktopRoomEvent): void {
   const eventCursor: RoomCursor = {
     version: 1,
     roomId,
     afterSeq: event.streamSeq,
   };
-  if (!isRoomSyncResult({
+  if (!isDesktopRoomSyncResult({
     type: "room.sync.result",
     requestId: "observer-event-validation",
     mode: "delta",
@@ -192,7 +271,7 @@ function validateEventShape(roomId: string, event: PersistedRoomEvent): void {
 function validateEventAdvance(
   roomId: string,
   current: RoomCursor,
-  events: readonly PersistedRoomEvent[],
+  events: readonly DesktopRoomEvent[],
   next: RoomCursor,
 ): void {
   if (!isRoomCursor(current) || !isRoomCursor(next) ||
@@ -250,7 +329,7 @@ export function createClientSyncReplica(options: {
 
   const applyEvents = (
     roomId: string,
-    events: readonly PersistedRoomEvent[],
+    events: readonly DesktopRoomEvent[],
     cursor: RoomCursor,
   ): void => {
     const current = cache.roomCursor(roomId) ?? { version: 1, roomId, afterSeq: 0 };
@@ -283,13 +362,13 @@ export function createClientSyncReplica(options: {
   const syncFrom = async (
     roomId: string,
     initialCursor: RoomCursor,
-    apply: (events: readonly PersistedRoomEvent[], cursor: RoomCursor) => void =
+    apply: (events: readonly DesktopRoomEvent[], cursor: RoomCursor) => void =
       (events, cursor) => applyEvents(roomId, events, cursor),
     assertCurrent: () => void = requireOpen,
   ): Promise<RoomCursor> => {
     let cursor = initialCursor;
     let fixedWatermark: number | undefined;
-    const events: PersistedRoomEvent[] = [];
+    const events: DesktopRoomEvent[] = [];
     for (;;) {
       const request: RoomSyncRequest = {
         type: "room.sync",
@@ -299,7 +378,7 @@ export function createClientSyncReplica(options: {
       };
       const result = await transport.syncRoom(request);
       assertCurrent();
-      if (!isRoomSyncResult(result) || result.requestId !== request.requestId) {
+      if (!isDesktopRoomSyncResult(result) || result.requestId !== request.requestId) {
         throw invalid("Room sync result did not match its request");
       }
       if (result.mode === "repair_required") {
@@ -334,7 +413,7 @@ export function createClientSyncReplica(options: {
   ): Promise<void> => {
     const assertCurrent = options.assertCurrent ?? requireOpen;
     const generation = (subscriptionGenerations.get(roomId) ?? 0) + 1;
-    const buffered: { events: readonly PersistedRoomEvent[]; cursor: RoomCursor }[] = [];
+    const buffered: { events: readonly DesktopRoomEvent[]; cursor: RoomCursor }[] = [];
     let activated = false;
     const observer: RoomSubscriptionObserver = {
       events: async (events, nextCursor) => {
@@ -394,7 +473,7 @@ export function createClientSyncReplica(options: {
     }
     const bufferedSeen = new Set(seenByRoom.get(roomId) ?? []);
     let bufferedCursor = cursor;
-    const prepared: { events: readonly PersistedRoomEvent[]; cursor: RoomCursor }[] = [];
+    const prepared: { events: readonly DesktopRoomEvent[]; cursor: RoomCursor }[] = [];
     try {
       for (const item of buffered) {
         for (const event of item.events) validateEventShape(roomId, event);

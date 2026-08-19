@@ -116,12 +116,10 @@ export function createDesktopGovernanceRuntime(options: {
         return { status: "ready", projection, viewerActorId: session.actorId,
           connection: { status: "online" } };
       } catch (error: unknown) {
-        const projection = cache.governanceProjection(roomId);
         const authorityError = closedError(error);
-        if (projection !== undefined && authorityError.status === 503) {
-          return { status: "ready", projection, viewerActorId: session.actorId, connection: {
-            status: "offline", asOf: cache.updatedAt(roomId) ?? now(), leaseExpiresAt: session.expiresAt,
-          } };
+        if (authorityError.status === 503) {
+          cache.clear();
+          return { status: "locked", roomId, connection: { status: "offline", asOf: now() } };
         }
         if (authorityError.status === 401 || authorityError.status === 403) {
           cache.clear();
@@ -152,7 +150,7 @@ export function createDesktopGovernanceRuntime(options: {
         const ack = await transport.execute(command);
         return {
           type: "ack", requestId: ack.requestId, command: ack.command, result: ack.result,
-          eventIds: ack.eventIds,
+          eventIds: ack.eventIds, replayed: ack.replayed,
           projection: mergeAcknowledgedProjection(current, ack.governance, command, session.actorId),
         };
       } catch (error: unknown) {
@@ -170,10 +168,9 @@ export function createDesktopGovernanceRuntime(options: {
     for (const roomId of roomIds) feed.revoked({ roomId, scope: "session", purgeCompleted: true });
   });
   const unsubscribeFailure = transport.onConnectionFailure(() => {
-    const session = options.session();
-    for (const roomId of cache.roomIds()) feed.connection({ roomId, connection: {
-      status: "offline", asOf: cache.updatedAt(roomId) ?? now(), leaseExpiresAt: session?.expiresAt ?? now(),
-    } });
+    const roomIds = cache.roomIds();
+    cache.clear();
+    for (const roomId of roomIds) feed.offline({ roomId, asOf: now() });
   });
 
   return Object.freeze({

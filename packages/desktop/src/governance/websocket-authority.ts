@@ -2,25 +2,25 @@ import {
   isRoomCursor,
   isRoomGovernanceView,
   isRoomRepairPage,
-  isRoomSyncResult,
   isSnapshotCompleted,
   isWorkspaceBootstrapPage,
-  type PersistedRoomEvent,
   type RoomCursor,
   type RoomGovernanceView,
   type RoomRepairPage,
   type RoomSyncRequest,
-  type RoomSyncResult,
   type SnapshotCompleted,
   type SnapshotVersion,
   type WorkspaceBootstrapPage,
 } from "@native-im/core";
 import type { IdentityAuthoritySession } from "../identity/controller.js";
 import type {
+  DesktopRoomEvent,
+  DesktopRoomSyncResult,
   RoomSubscription,
   RoomSubscriptionObserver,
   SyncTransport,
 } from "../sync/client-sync-replica.js";
+import { isDesktopRoomEvent, isDesktopRoomSyncResult } from "../sync/client-sync-replica.js";
 import {
   isDepartureConflictList,
   type GovernanceAuthorityCommand,
@@ -62,6 +62,7 @@ export interface GovernanceWireAck {
   readonly result: "accepted" | "already_archived" | "already_active";
   readonly governance: RoomGovernanceView;
   readonly eventIds: readonly string[];
+  readonly replayed: boolean;
 }
 
 export interface GovernanceAuthorityTransport extends SyncTransport {
@@ -117,11 +118,11 @@ function count(value: unknown): value is number {
 type ParsedFrame =
   | { readonly type: "auth.authenticated"; readonly requestId: string; readonly actorId: string; readonly sessionId: string }
   | ({ readonly type: "room.governance.ack" } & GovernanceWireAck)
-  | { readonly type: "room.departure.conflicts"; readonly requestId: string; readonly conflicts: DepartureConflictList }
-  | WorkspaceBootstrapPage | RoomRepairPage | RoomSyncResult | SnapshotCompleted
+  | { readonly type: "room.departure.conflicts.result"; readonly requestId: string; readonly conflicts: DepartureConflictList }
+  | WorkspaceBootstrapPage | RoomRepairPage | DesktopRoomSyncResult | SnapshotCompleted
   | { readonly type: "room.subscribed.v2"; readonly requestId: string; readonly roomId: string; readonly cursor: RoomCursor; readonly watermark: number }
   | { readonly type: "room.subscribe.v2.retry"; readonly requestId: string; readonly roomId: string; readonly reason: "gate_overflow"; readonly restartFrom: RoomCursor }
-  | { readonly type: "room.event"; readonly event: PersistedRoomEvent }
+  | { readonly type: "room.event"; readonly event: DesktopRoomEvent }
   | { readonly type: "auth.session-revoked"; readonly eventId: string }
   | { readonly type: "error"; readonly requestId?: string; readonly error: GovernanceTransportError };
 
@@ -149,15 +150,6 @@ function mappedError(status: number, code: string, details: unknown): Governance
   return closed === undefined ? undefined : new GovernanceTransportError(closed, status);
 }
 
-function persistedEvent(value: unknown): value is PersistedRoomEvent {
-  if (!record(value) || !text(value.roomId, 256) || !count(value.streamSeq)) return false;
-  return isRoomSyncResult({
-    type: "room.sync.result", requestId: "closed-event", mode: "delta", events: [value],
-    nextCursor: { version: 1, roomId: value.roomId, afterSeq: value.streamSeq },
-    watermark: value.streamSeq, hasMore: false,
-  });
-}
-
 export function parseGovernanceServerFrame(raw: string): ParsedFrame | undefined {
   if (encoder.encode(raw).byteLength > MAX_FRAME_BYTES) return undefined;
   let value: unknown;
@@ -170,28 +162,27 @@ export function parseGovernanceServerFrame(raw: string): ParsedFrame | undefined
         ? { type: value.type, requestId: value.requestId, actorId: value.actorId, sessionId: value.sessionId }
         : undefined;
     case "room.governance.ack": {
-      if (!exact(value, ["type", "requestId", "operation", "governance", "eventIds"], ["result"]) ||
+      if (!exact(value, ["type", "requestId", "operation", "governance", "eventIds", "replayed"]) ||
           !text(value.requestId, 128) || typeof value.operation !== "string" ||
           !commands.has(value.operation as GovernanceCommand) || !isRoomGovernanceView(value.governance) ||
           !Array.isArray(value.eventIds) || value.eventIds.length > 64 ||
           !value.eventIds.every((id) => text(id, 512)) || new Set(value.eventIds).size !== value.eventIds.length ||
-          (value.result !== undefined && value.result !== "accepted" &&
-            value.result !== "already_archived" && value.result !== "already_active")) return undefined;
-      const inferred = value.eventIds.length > 0 ? "accepted"
+          typeof value.replayed !== "boolean") return undefined;
+      const inferred = value.eventIds.length > 0 || value.replayed ? "accepted"
         : value.operation === "room.archive" && value.governance.lifecycle === "archived" ? "already_archived"
           : value.operation === "room.reopen" && value.governance.lifecycle === "active" ? "already_active"
             : "accepted";
       return { type: value.type, requestId: value.requestId, command: value.operation as GovernanceCommand,
-        result: (value.result ?? inferred) as GovernanceWireAck["result"], governance: value.governance,
+        result: inferred, governance: value.governance, replayed: value.replayed,
         eventIds: Object.freeze([...value.eventIds] as string[]) };
     }
-    case "room.departure.conflicts":
+    case "room.departure.conflicts.result":
       return exact(value, ["type", "requestId", "conflicts"]) && text(value.requestId, 128) &&
         isDepartureConflictList(value.conflicts)
         ? { type: value.type, requestId: value.requestId, conflicts: value.conflicts } : undefined;
     case "workspace.bootstrap.page": return isWorkspaceBootstrapPage(value) ? value : undefined;
     case "room.repair.page": return isRoomRepairPage(value) ? value : undefined;
-    case "room.sync.result": return isRoomSyncResult(value) ? value : undefined;
+    case "room.sync.result": return isDesktopRoomSyncResult(value) ? value : undefined;
     case "snapshot.completed": return isSnapshotCompleted(value) ? value : undefined;
     case "room.subscribed.v2":
       return exact(value, ["type", "requestId", "roomId", "cursor", "watermark"]) &&
@@ -203,7 +194,7 @@ export function parseGovernanceServerFrame(raw: string): ParsedFrame | undefined
         text(value.requestId, 128) && text(value.roomId, 256) && value.reason === "gate_overflow" &&
         isRoomCursor(value.restartFrom) && value.restartFrom.roomId === value.roomId ? value as ParsedFrame : undefined;
     case "room.event":
-      return exact(value, ["type", "event"]) && persistedEvent(value.event)
+      return exact(value, ["type", "event"]) && isDesktopRoomEvent(value.event)
         ? { type: value.type, event: value.event } : undefined;
     case "auth.session-revoked":
       return exact(value, ["type", "eventId"]) && text(value.eventId, 512)
@@ -401,7 +392,7 @@ export function createGovernanceWebSocketAuthority(options: {
       { type: "workspace.bootstrap.begin", requestId }, "workspace.bootstrap.page"),
     bootstrapPage: (requestId, snapshotId, afterPage) => exactRequest<WorkspaceBootstrapPage>(
       { type: "workspace.bootstrap.page", requestId, snapshotId, afterPage }, "workspace.bootstrap.page"),
-    syncRoom: (request: RoomSyncRequest) => exactRequest<RoomSyncResult>({ ...request }, "room.sync.result"),
+    syncRoom: (request: RoomSyncRequest) => exactRequest<DesktopRoomSyncResult>({ ...request }, "room.sync.result"),
     repairRoomBegin: (requestId, roomId) => exactRequest<RoomRepairPage>(
       { type: "room.repair.begin", requestId, roomId }, "room.repair.page"),
     repairRoomPage: (requestId, snapshotId, afterPage) => exactRequest<RoomRepairPage>(
@@ -427,9 +418,9 @@ export function createGovernanceWebSocketAuthority(options: {
       }
     },
     async queryDepartureConflicts(input) {
-      const response = await exactRequest<Extract<ParsedFrame, { type: "room.departure.conflicts" }>>({
+      const response = await exactRequest<Extract<ParsedFrame, { type: "room.departure.conflicts.result" }>>({
         type: "room.departure.conflicts", ...input,
-      }, "room.departure.conflicts");
+      }, "room.departure.conflicts.result");
       if (response.conflicts.roomId !== input.roomId ||
           response.conflicts.targetActorId !== input.targetActorId) throw new GovernanceTransportError("protocol_error");
       return structuredClone(response.conflicts);

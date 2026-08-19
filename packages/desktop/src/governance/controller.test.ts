@@ -82,7 +82,7 @@ describe("closed Governance controller", () => {
     };
     authority.resolveAck({
       type: "ack", requestId: "request-1", command: "room.archive", result: "accepted",
-      eventIds: ["event-archive"], projection: archived,
+      eventIds: ["event-archive"], projection: archived, replayed: false,
     });
     await vi.waitFor(() => expect(states.at(-1)).toMatchObject({
       state: { operation: { status: "acknowledged" }, projection: { lifecycle: "active" } },
@@ -99,6 +99,40 @@ describe("closed Governance controller", () => {
     expect(states.at(-1)).toMatchObject({
       state: { operation: { status: "succeeded" }, projection: { lifecycle: "archived" } },
     });
+    controller.close();
+  });
+
+  it("repairs a replayed ACK and succeeds only from the matching authoritative projection", async () => {
+    const feed = new Feed();
+    let resolveAck!: (ack: GovernanceAuthorityAck) => void;
+    const archived = {
+      ...projection, lifecycle: "archived" as const, governanceRevision: 8, archiveGeneration: 1,
+      archivedAt: "2026-08-19T08:00:00.000Z",
+    };
+    const authority: GovernanceAuthorityAdapter = {
+      querySurface: vi.fn()
+        .mockResolvedValueOnce(snapshot)
+        .mockResolvedValue({ ...snapshot, projection: archived }),
+      queryDepartureConflicts: vi.fn(),
+      execute: vi.fn(() => new Promise<GovernanceAuthorityAck>((resolve) => { resolveAck = resolve; })),
+    };
+    const controller = createGovernanceController({
+      authority, replica: feed,
+      createRequestIdentity: () => ({ requestId: "request-replay", idempotencyKey: "key-replay" }),
+    });
+    await controller.getSurface({ roomId: "room-1" });
+    controller.submit({ roomId: "room-1", intent: {
+      command: "room.archive", expectedGovernanceRevision: 7,
+    } });
+    resolveAck({
+      type: "ack", requestId: "request-replay", command: "room.archive", result: "accepted",
+      eventIds: ["historical-room-event"], projection: archived, replayed: true,
+    });
+    await vi.waitFor(() => expect(controller.current("room-1")).toMatchObject({
+      projection: { lifecycle: "archived", governanceRevision: 8 },
+      operation: { status: "succeeded", requestId: "request-replay" },
+    }));
+    expect(authority.querySurface).toHaveBeenCalledTimes(2);
     controller.close();
   });
 

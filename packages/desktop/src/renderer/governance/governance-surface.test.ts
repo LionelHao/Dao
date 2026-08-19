@@ -169,15 +169,19 @@ describe("Desktop Governance permission and conflict DOM contract", () => {
 });
 
 describe("Desktop Governance archived/reopen and recovery DOM contract", () => {
-  it("keeps an archived banner persistent, read surfaces enabled, and business controls disabled with reasons", () => {
+  it("keeps an archived banner persistent, reports host-owned read states without dead buttons, and disables business controls", () => {
     const root = document.createElement("main");
     renderGovernanceSurface(root, state("human-admin-a", "archived"), actions());
 
     expect(root.querySelector("[data-archived-banner]")?.textContent).toContain("ARCHIVED");
     expect(root.querySelector("[data-archived-banner]")?.textContent).toContain("2026-08-19T08:00:00.000Z");
     for (const surface of ["history", "attachments", "project-facts", "audit"]) {
-      expect(root.querySelector<HTMLButtonElement>(`[data-read-surface='${surface}']`)?.disabled).toBe(false);
+      const status = root.querySelector<HTMLElement>(`[data-read-surface='${surface}']`);
+      expect(status?.dataset.readable).toBe("true");
+      expect(status?.textContent).toContain("由宿主内容区呈现");
+      expect(status?.tagName).toBe("LI");
     }
+    expect(root.querySelector(".governance-readable-surfaces button")).toBeNull();
     for (const control of ["composer", "project-mutation", "agent-business-controls"]) {
       const button = root.querySelector<HTMLButtonElement>(`[data-business-control='${control}']`);
       expect(button?.disabled).toBe(true);

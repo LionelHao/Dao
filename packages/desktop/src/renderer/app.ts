@@ -51,10 +51,12 @@ function renderLockedGovernance(root: HTMLElement, state: Extract<GovernanceRemo
   locked.dataset.governanceLocked = "true";
   locked.setAttribute("role", "alert");
   const heading = document.createElement("h1");
-  heading.textContent = state.connection.status === "revoked" ? "Room 访问已撤销" : "治理服务不可用";
+  heading.textContent = state.connection.status === "revoked" ? "Room 访问已撤销"
+    : state.connection.status === "offline" ? "Room 离线且无有效读取 lease" : "治理服务不可用";
   const explanation = document.createElement("p");
   explanation.textContent = state.connection.status === "revoked"
     ? state.connection.purgeCompleted ? "缓存已清除" : "正在清除缓存"
+    : state.connection.status === "offline" ? `缓存不能作为权威来源 · 离线于 ${state.connection.asOf}`
     : `无法安全显示 Room · ${state.connection.errorCode}`;
   locked.append(heading, explanation);
   root.replaceChildren(locked);

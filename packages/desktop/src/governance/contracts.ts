@@ -27,7 +27,9 @@ export interface GovernanceMutationRequest {
 }
 
 type ReadyConnection = Exclude<GovernanceConnectionState, { status: "revoked" | "fatal" }>;
-type LockedConnection = Extract<GovernanceConnectionState, { status: "revoked" | "fatal" }>;
+export type GovernanceLockedConnection =
+  | Extract<GovernanceConnectionState, { status: "revoked" | "fatal" }>
+  | { readonly status: "offline"; readonly asOf: string };
 
 export interface GovernanceReadyState {
   readonly status: "ready";
@@ -40,7 +42,7 @@ export interface GovernanceReadyState {
 export interface GovernanceLockedState {
   readonly status: "locked";
   readonly roomId: string;
-  readonly connection: LockedConnection;
+  readonly connection: GovernanceLockedConnection;
 }
 export type GovernanceRemoteState = GovernanceReadyState | GovernanceLockedState;
 
@@ -70,6 +72,7 @@ export interface GovernanceAuthorityAck {
   readonly command: GovernanceCommand;
   readonly result: GovernanceAckResult;
   readonly eventIds: readonly string[];
+  readonly replayed: boolean;
   readonly projection: GovernanceProjection;
 }
 
@@ -152,12 +155,13 @@ export function isDepartureConflictList(value: unknown): value is DepartureConfl
     new Set(value.conflicts.map((item) => (item as { conflictId: string }).conflictId)).size === value.conflicts.length;
 }
 
-function isConnection(value: unknown, locked: boolean): value is GovernanceConnectionState {
+function isConnection(value: unknown, locked: boolean): boolean {
   if (!record(value) || typeof value.status !== "string") return false;
   switch (value.status) {
     case "online": return !locked && keys(value, ["status"]);
-    case "offline": return !locked && keys(value, ["status", "asOf", "leaseExpiresAt"]) &&
-      text(value.asOf) && text(value.leaseExpiresAt);
+    case "offline": return locked
+      ? keys(value, ["status", "asOf"]) && text(value.asOf)
+      : keys(value, ["status", "asOf", "leaseExpiresAt"]) && text(value.asOf) && text(value.leaseExpiresAt);
     case "repairing": return !locked && keys(value, ["status", "watermark"]) && revision(value.watermark);
     case "repair_failed": return !locked && keys(value, ["status", "errorCode"]) && text(value.errorCode);
     case "revoked": return locked && keys(value, ["status", "scope", "purgeCompleted"]) &&
@@ -250,10 +254,11 @@ export function isGovernanceStateEnvelope(value: unknown): value is GovernanceSt
 }
 export function isGovernanceAuthorityAck(value: unknown): value is GovernanceAuthorityAck {
   return record(value) && keys(value, [
-    "type", "requestId", "command", "result", "eventIds", "projection",
+    "type", "requestId", "command", "result", "eventIds", "projection", "replayed",
   ]) && value.type === "ack" && text(value.requestId) && typeof value.command === "string" &&
     commands.has(value.command as GovernanceCommand) &&
     (value.result === "accepted" || value.result === "already_archived" || value.result === "already_active") &&
+    typeof value.replayed === "boolean" &&
     Array.isArray(value.eventIds) && value.eventIds.length <= 64 && value.eventIds.every(text) &&
     new Set(value.eventIds).size === value.eventIds.length && isGovernanceProjection(value.projection) &&
     (value.result === "accepted" ? value.eventIds.length > 0 : value.eventIds.length === 0);

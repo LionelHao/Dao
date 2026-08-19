@@ -78,6 +78,7 @@ async function createWindow(): Promise<void> {
         governanceMethods: Object.keys(globalThis.dao?.governance ?? {}).sort(),
         namespaces: Object.keys(globalThis.dao ?? {}).sort(),
         bridgeMissing: document.querySelector("[data-identity-bridge-missing]") !== null,
+        governanceRouteContract: document.querySelector("#app")?.dataset.governanceRouteContract ?? "",
         status: document.querySelector("#app")?.dataset.identityStatus ?? ""
       })`,
       true,
@@ -115,6 +116,8 @@ async function createWindow(): Promise<void> {
           (method, index) => method === expectedGovernanceMethods[index],
         ) || !("namespaces" in startupProbe) || !Array.isArray(startupProbe.namespaces) ||
         startupProbe.namespaces.join(",") !== "governance,identity" ||
+        !("governanceRouteContract" in startupProbe) ||
+        startupProbe.governanceRouteContract !== "closed-v1" ||
         !("bridgeMissing" in startupProbe) || startupProbe.bridgeMissing !== false ||
         !("status" in startupProbe) || typeof startupProbe.status !== "string" ||
         startupProbe.status.length === 0) {

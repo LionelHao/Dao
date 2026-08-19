@@ -1,12 +1,12 @@
 import type {
   ManagedRoom,
-  PersistedRoomEvent,
   RoomGovernanceView,
   RoomRepairRecord,
 } from "@native-im/core";
 import { WebSocket, WebSocketServer } from "ws";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mountGovernanceSurface } from "../renderer/app.js";
+import type { DesktopRoomEvent } from "../sync/client-sync-replica.js";
 import type { GovernanceBridge, GovernanceRemoteState } from "./contracts.js";
 import { authoritySnapshotChecksum } from "./authority-cache.js";
 import { createDesktopGovernanceRuntime } from "./production-runtime.js";
@@ -46,16 +46,18 @@ function room(status: "active" | "archived"): ManagedRoom {
 function event(
   eventId: string,
   streamSeq: number,
-  type: "room.archived" | "room.renamed" | "room.governance.changed",
+  type: "room.archived" | "room.reopened" | "room.governance.changed",
   lifecycle: "active" | "archived",
   revision: number,
-): PersistedRoomEvent {
+): DesktopRoomEvent {
   const base = {
     eventId, streamKind: "room" as const, streamId: "room-1", streamSeq,
     roomId: "room-1", actorId: "owner-1", occurredAt: "2026-08-19T08:00:00.000Z",
   };
   return type === "room.governance.changed"
     ? { ...base, type, payload: { governance: governance(lifecycle, revision) } }
+    : type === "room.reopened"
+      ? { ...base, type, payload: { archiveGeneration: 1, resumedTimerCount: 0 } }
     : { ...base, type, payload: { room: room(lifecycle) } };
 }
 
@@ -73,7 +75,7 @@ async function loopbackAuthority(): Promise<{
   let currentGovernance = governance("active", 7);
   let currentRoom = room("active");
   let watermark = 9;
-  const history: PersistedRoomEvent[] = [];
+  const history: DesktopRoomEvent[] = [];
   server.on("connection", (socket) => {
     socket.on("message", (bytes, binary) => {
       if (binary) return socket.close(1002, "text only");
@@ -116,6 +118,12 @@ async function loopbackAuthority(): Promise<{
         case "room.subscribe.v2":
           send({ type: "room.subscribed.v2", requestId, roomId: "room-1", cursor: frame.cursor, watermark });
           return;
+        case "room.departure.conflicts":
+          send({ type: "room.departure.conflicts.result", requestId, conflicts: {
+            roomId: "room-1", targetActorId: frame.targetActorId,
+            governanceRevision: frame.expectedGovernanceRevision, conflicts: [],
+          } });
+          return;
         case "room.archive": {
           currentGovernance = governance("archived", 8);
           currentRoom = room("archived");
@@ -124,7 +132,7 @@ async function loopbackAuthority(): Promise<{
             event("room-stream-governance-archive", 11, "room.governance.changed", "archived", 8),
           ];
           history.push(...events); watermark = 11;
-          send({ type: "room.governance.ack", requestId, operation: "room.archive", result: "accepted",
+          send({ type: "room.governance.ack", requestId, operation: "room.archive", replayed: false,
             governance: currentGovernance, eventIds: events.map((item) => item.eventId) });
           setTimeout(() => { for (const item of events) send({ type: "room.event", event: item }); }, 150);
           return;
@@ -133,13 +141,11 @@ async function loopbackAuthority(): Promise<{
           currentGovernance = governance("active", 9);
           currentRoom = room("active");
           const events = [
-            // The target integration introduces room.reopened. This branch's Core closed union
-            // still requires the existing room metadata event to prove the same lifecycle projection.
-            event("room-stream-reopen", 12, "room.renamed", "active", 9),
+            event("room-stream-reopen", 12, "room.reopened", "active", 9),
             event("room-stream-governance-reopen", 13, "room.governance.changed", "active", 9),
           ];
           history.push(...events); watermark = 13;
-          send({ type: "room.governance.ack", requestId, operation: "room.reopen", result: "accepted",
+          send({ type: "room.governance.ack", requestId, operation: "room.reopen", replayed: false,
             governance: currentGovernance, eventIds: events.map((item) => item.eventId) });
           setTimeout(() => { for (const item of events) send({ type: "room.event", event: item }); }, 150);
           return;
@@ -156,7 +162,7 @@ async function loopbackAuthority(): Promise<{
   };
 }
 
-describe("production Desktop Governance loopback authority", () => {
+describe("production Desktop Governance loopback wire contract fixture", () => {
   it("rejects non-loopback/credential endpoints and exact-parser extensions", () => {
     expect(() => validateGovernanceWebSocketEndpoint("wss://authority.example.test"))
       .toThrow("endpoint is not allowed");
@@ -165,6 +171,19 @@ describe("production Desktop Governance loopback authority", () => {
     expect(parseGovernanceServerFrame(JSON.stringify({
       type: "auth.authenticated", requestId: "r", accountId: "a", actorId: "owner-1",
       sessionId: "session-1", accessToken: "must-not-return",
+    }))).toBeUndefined();
+    expect(parseGovernanceServerFrame(JSON.stringify({
+      type: "room.governance.ack", requestId: "r", operation: "room.archive",
+      governance: governance("archived", 8), eventIds: [], replayed: false, result: "already_archived",
+    }))).toBeUndefined();
+    expect(parseGovernanceServerFrame(JSON.stringify({
+      type: "room.governance.ack", requestId: "r", operation: "room.archive",
+      governance: governance("archived", 8), eventIds: ["room-stream-1"], replayed: true,
+    }))).toMatchObject({ type: "room.governance.ack", result: "accepted", replayed: true });
+    expect(parseGovernanceServerFrame(JSON.stringify({
+      type: "room.departure.conflicts", requestId: "r", conflicts: {
+        roomId: "room-1", targetActorId: "member-1", governanceRevision: 7, conflicts: [],
+      },
     }))).toBeUndefined();
   });
 
@@ -194,6 +213,11 @@ describe("production Desktop Governance loopback authority", () => {
     });
 
     await vi.waitFor(() => expect(root.querySelector("[data-archive-room]")).not.toBeNull());
+    await expect(runtime.controller.getDepartureConflicts({
+      roomId: "room-1", targetActorId: "member-1", expectedGovernanceRevision: 7,
+    })).resolves.toEqual({
+      roomId: "room-1", targetActorId: "member-1", governanceRevision: 7, conflicts: [],
+    });
     root.querySelector<HTMLButtonElement>("[data-archive-room]")!.click();
     root.querySelector<HTMLButtonElement>("[data-action='confirm-archive']")!.click();
     await vi.waitFor(() => expect(observed.some((state) => state.status === "ready" &&
@@ -218,7 +242,7 @@ describe("production Desktop Governance loopback authority", () => {
     dispose(); runtime.close();
   });
 
-  it("fails mutations locally while offline, reconnects within the next repair, and purges on revoke", async () => {
+  it("locks and purges without a real offline lease, reconnects on repair, and purges on revoke", async () => {
     const authority = await loopbackAuthority();
     let request = 0;
     const runtime = createDesktopGovernanceRuntime({
@@ -234,14 +258,13 @@ describe("production Desktop Governance loopback authority", () => {
     });
     authority.disconnect();
     await vi.waitFor(() => expect(runtime.controller.current("room-1")).toMatchObject({
-      status: "ready", connection: { status: "offline" },
+      status: "locked", connection: { status: "offline" },
     }));
+    expect(runtime.cache.governanceProjection("room-1")).toBeUndefined();
     const countBeforeSubmit = authority.received.length;
-    expect(runtime.controller.submit({
+    expect(() => runtime.controller.submit({
       roomId: "room-1", intent: { command: "room.archive", expectedGovernanceRevision: 7 },
-    }).state).toMatchObject({
-      status: "ready", operation: { status: "failed", error: { status: 503, code: "repair_unavailable" } },
-    });
+    })).toThrow("not available for mutation");
     expect(authority.received).toHaveLength(countBeforeSubmit);
 
     await expect(runtime.controller.getSurface({ roomId: "room-1" })).resolves.toMatchObject({

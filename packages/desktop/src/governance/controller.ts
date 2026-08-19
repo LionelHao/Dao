@@ -2,7 +2,6 @@ import { isRoomGovernanceView, type RoomGovernanceView } from "@native-im/core";
 import type {
   DepartureConflictList,
   GovernanceClosedError,
-  GovernanceConnectionState,
   GovernanceOperationState,
 } from "../renderer/governance/view-model.js";
 import {
@@ -58,10 +57,10 @@ export type GovernanceReplicaApplication =
       readonly errorCode: string;
     }
   | {
-      readonly source: "connection";
+      readonly source: "offline";
       readonly roomId: string;
       readonly eventIds: readonly [];
-      readonly connection: Exclude<GovernanceConnectionState, { status: "revoked" | "fatal" }>;
+      readonly asOf: string;
     };
 
 export interface GovernanceReplicaFeed {
@@ -76,10 +75,7 @@ export interface GovernanceReplicaFeedPort extends GovernanceReplicaFeed {
     readonly purgeCompleted: boolean;
   }): void;
   fatal(input: { readonly roomId: string; readonly errorCode: string }): void;
-  connection(input: {
-    readonly roomId: string;
-    readonly connection: Exclude<GovernanceConnectionState, { status: "revoked" | "fatal" }>;
-  }): void;
+  offline(input: { readonly roomId: string; readonly asOf: string }): void;
 }
 
 export function createGovernanceReplicaFeed(): GovernanceReplicaFeedPort {
@@ -104,11 +100,8 @@ export function createGovernanceReplicaFeed(): GovernanceReplicaFeedPort {
     fatal(input: { readonly roomId: string; readonly errorCode: string }) {
       publish({ source: "fatal", eventIds: [], ...input });
     },
-    connection(input: {
-      readonly roomId: string;
-      readonly connection: Exclude<GovernanceConnectionState, { status: "revoked" | "fatal" }>;
-    }) {
-      publish({ source: "connection", eventIds: [], ...input });
+    offline(input: { readonly roomId: string; readonly asOf: string }) {
+      publish({ source: "offline", eventIds: [], ...input });
     },
     subscribe(listener: (application: GovernanceReplicaApplication) => void) {
       listeners.add(listener);
@@ -171,6 +164,16 @@ function governanceMatchesProjection(
     governance.governanceRevision === projection.governanceRevision &&
     governance.archiveGeneration === projection.archiveGeneration &&
     governance.ownerActorId === projection.ownerActorId && governance.archivedAt === projection.archivedAt;
+}
+
+function projectionGovernanceMatches(
+  left: Extract<GovernanceRemoteState, { status: "ready" }>["projection"],
+  right: Extract<GovernanceRemoteState, { status: "ready" }>["projection"],
+): boolean {
+  return left.roomId === right.roomId && left.projectId === right.projectId &&
+    left.lifecycle === right.lifecycle && left.governanceRevision === right.governanceRevision &&
+    left.archiveGeneration === right.archiveGeneration && left.ownerActorId === right.ownerActorId &&
+    left.archivedAt === right.archivedAt;
 }
 
 function mergeGovernance(
@@ -253,6 +256,42 @@ export function createGovernanceController(options: {
       const current = states.get(roomId);
       if (current?.status !== "ready" || current.operation.status !== "submitting" ||
           current.operation.requestId !== requestId) return;
+      if (ack.replayed) {
+        emit({ ...current, operation: { status: "acknowledged", requestId, command: ack.command } });
+        try {
+          const repaired = cloneGovernanceAuthoritySnapshot(
+            await options.authority.querySurface({ roomId }),
+          );
+          if (closed) return;
+          const waiting = states.get(roomId);
+          if (waiting?.status !== "ready" || waiting.operation.status !== "acknowledged" ||
+              waiting.operation.requestId !== requestId) return;
+          if (repaired.status === "locked") {
+            pending.delete(roomId);
+            emit(repaired);
+            return;
+          }
+          if (repaired.connection.status !== "online" ||
+              !projectionGovernanceMatches(repaired.projection, ack.projection)) {
+            emit({ ...waiting, operation: {
+              status: "failed", requestId, command: ack.command,
+              error: { status: 503, code: "repair_unavailable" },
+            } });
+            return;
+          }
+          emit({ ...readyState(repaired), operation: {
+            status: "succeeded", requestId, command: ack.command,
+          } });
+        } catch {
+          const waiting = states.get(roomId);
+          if (waiting?.status === "ready" && waiting.operation.status === "acknowledged" &&
+              waiting.operation.requestId === requestId) emit({ ...waiting, operation: {
+            status: "failed", requestId, command: ack.command,
+            error: { status: 503, code: "repair_unavailable" },
+          } });
+        }
+        return;
+      }
       if (ack.result !== "accepted") {
         const expectedLifecycle = ack.result === "already_archived" ? "archived" : "active";
         if (ack.projection.lifecycle !== expectedLifecycle) return;
@@ -308,9 +347,10 @@ export function createGovernanceController(options: {
       });
       return;
     }
-    if (application.source === "connection") {
-      const current = states.get(application.roomId);
-      if (current?.status === "ready") emit({ ...current, connection: application.connection });
+    if (application.source === "offline") {
+      pending.delete(application.roomId);
+      emit({ status: "locked", roomId: application.roomId,
+        connection: { status: "offline", asOf: application.asOf } });
       return;
     }
     if (application.governance !== undefined &&

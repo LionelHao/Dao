@@ -341,8 +341,9 @@ export function renderGovernanceSurface(
     shell.append(archived);
   }
 
-  const read = element("nav", "governance-readable-surfaces");
-  read.setAttribute("aria-label", "归档期间仍可浏览的内容");
+  const read = element("section", "governance-readable-surfaces");
+  read.setAttribute("aria-label", "authority repair 中保持可读的内容状态");
+  const readList = element("ul");
   const readSurfaces = [
     ["history", "历史", model.readableSurfaces.history],
     ["attachments", "附件", model.readableSurfaces.attachments],
@@ -350,11 +351,14 @@ export function renderGovernanceSurface(
     ["audit", "审计", model.readableSurfaces.audit],
   ] as const;
   for (const [key, label, enabled] of readSurfaces) {
-    const action = button(label);
-    action.dataset.readSurface = key;
-    action.disabled = !enabled;
-    read.append(action);
+    const item = text("li", enabled
+      ? `${label} · 当前 authority projection 保持可读，由宿主内容区呈现`
+      : `${label} · 当前无读取 authority`);
+    item.dataset.readSurface = key;
+    item.dataset.readable = String(enabled);
+    readList.append(item);
   }
+  read.append(readList);
   shell.append(read);
 
   const business = element("section", "governance-business-controls");

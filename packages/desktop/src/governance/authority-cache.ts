@@ -1,11 +1,10 @@
 import { createHash } from "node:crypto";
 import type {
-  PersistedRoomEvent,
   RoomCursor,
   RoomRepairRecord,
   RoomSummary,
 } from "@native-im/core";
-import type { ClientAuthorityCache } from "../sync/client-sync-replica.js";
+import type { ClientAuthorityCache, DesktopRoomEvent } from "../sync/client-sync-replica.js";
 import type { GovernanceProjection } from "../renderer/governance/view-model.js";
 
 interface CatalogStage { readonly snapshotId: string; readonly rooms: RoomSummary[] }
@@ -63,8 +62,17 @@ function replaceRecord(records: RoomRepairRecord[], next: RoomRepairRecord): voi
   else records[index] = structuredClone(next);
 }
 
-function applyProjectionEvent(records: RoomRepairRecord[], event: PersistedRoomEvent): void {
+function applyProjectionEvent(records: RoomRepairRecord[], event: DesktopRoomEvent): void {
   switch (event.type) {
+    case "room.reopened": {
+      const current = records.find(
+        (record): record is Extract<RoomRepairRecord, { kind: "room" }> => record.kind === "room",
+      );
+      if (current !== undefined) replaceRecord(records, {
+        kind: "room", value: { ...current.value, status: "active" },
+      });
+      return;
+    }
     case "room.created":
     case "room.renamed":
     case "room.archived": {
