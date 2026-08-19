@@ -105,6 +105,13 @@ import {
 } from "../attachment-authority/database-authority.js";
 import type { AttachmentAuthorityIdFactory } from "../attachment-authority/database-contracts.js";
 import {
+  MemoryCorpusDatabaseError,
+  readMemoryCorpusSource,
+  registerMemoryCorpusSource,
+  transitionMemoryCorpusSource,
+  type MemoryCorpusSourceIdentity,
+} from "../room-memory/corpus-database-authority.js";
+import {
   readOperationalMessageAuthorityEvent,
   readOperationalTimelineMessage,
 } from
@@ -7484,6 +7491,152 @@ function messageRecallLogicalNow(
   return Math.max(requestedNow, latestCommittedAt + 1);
 }
 
+function commitMemoryCorpusMutation<Result>(operation: () => Result): Result {
+  try {
+    return operation();
+  } catch (error: unknown) {
+    if (error instanceof MemoryCorpusDatabaseError) {
+      return fail("storage_unavailable", "Room memory corpus authority rejected a source mutation");
+    }
+    throw error;
+  }
+}
+
+type MemoryCorpusLocalIdentity = Omit<MemoryCorpusSourceIdentity, "roomId">;
+
+function messageMemorySourceIdentity(
+  messageId: string,
+  revision: number,
+): MemoryCorpusLocalIdentity {
+  return revision === 1
+    ? { sourceKind: "message", sourceId: `message:${messageId}`, sourceRevision: revision }
+    : {
+        sourceKind: "message_revision",
+        sourceId: `message-revision:${messageId}`,
+        sourceRevision: revision,
+      };
+}
+
+function registerMessageMemorySource(
+  database: DatabaseSync,
+  input: Readonly<{
+    roomId: string;
+    messageId: string;
+    revision: number;
+    actorId: string;
+    actorKind: "human" | "agent";
+    streamSeq: number;
+    occurredAt: string;
+  }>,
+): void {
+  const identity = messageMemorySourceIdentity(input.messageId, input.revision);
+  commitMemoryCorpusMutation(() => registerMemoryCorpusSource(database, {
+    roomId: input.roomId,
+    ...identity,
+    serverStreamSeq: input.streamSeq,
+    eligibility: "eligible",
+    availability: "readable",
+    sourceActorId: input.actorId,
+    safeMetadata: { authorKind: input.actorKind, messageId: input.messageId },
+    readReference: `message-authority:${input.messageId}:revision:${input.revision}`,
+    occurredAt: input.occurredAt,
+  }));
+}
+
+function transitionExistingMemorySource(
+  database: DatabaseSync,
+  roomId: string,
+  identity: MemoryCorpusLocalIdentity,
+  eligibility: "excluded_recalled" | "excluded_revised",
+  occurredAt: string,
+): void {
+  if (readMemoryCorpusSource(database, { roomId, ...identity }) === undefined) return;
+  commitMemoryCorpusMutation(() => transitionMemoryCorpusSource(database, {
+    roomId,
+    ...identity,
+    eligibility,
+    availability: "metadata_only",
+    occurredAt,
+  }));
+}
+
+function registerMessageTombstoneMemorySource(
+  database: DatabaseSync,
+  input: Readonly<{
+    roomId: string;
+    messageId: string;
+    revision: number;
+    actorId: string;
+    streamSeq: number;
+    occurredAt: string;
+  }>,
+): void {
+  commitMemoryCorpusMutation(() => registerMemoryCorpusSource(database, {
+    roomId: input.roomId,
+    sourceKind: "message_tombstone",
+    sourceId: `message-tombstone:${input.messageId}`,
+    sourceRevision: input.revision,
+    serverStreamSeq: input.streamSeq,
+    eligibility: "excluded_recalled",
+    availability: "tombstone",
+    sourceActorId: input.actorId,
+    safeMetadata: { messageId: input.messageId, lifecycle: "recalled" },
+    readReference: `message-authority:tombstone:${input.messageId}:revision:${input.revision}`,
+    occurredAt: input.occurredAt,
+  }));
+}
+
+function registerBoundAttachmentMemorySource(
+  database: DatabaseSync,
+  input: Readonly<{
+    roomId: string;
+    messageId: string;
+    attachmentId: string;
+    actorId: string;
+    roomEventId: string;
+  }>,
+): void {
+  const row = database.prepare(`
+    SELECT attachment.processing_generation AS generation,
+           event.stream_seq AS streamSeq, event.occurred_at AS occurredAt
+    FROM attachments AS attachment
+    JOIN message_attachment_links AS link
+      ON link.attachment_id = attachment.attachment_id
+     AND link.message_id = ? AND link.room_id = attachment.room_id
+    JOIN events AS event ON event.event_id = ?
+    WHERE attachment.attachment_id = ? AND attachment.room_id = ?
+      AND attachment.processing_status = 'ready'
+      AND attachment.source_operational_state = 'bound-active'
+      AND link.operational_state = 'active'
+  `).get(
+    input.messageId,
+    input.roomEventId,
+    input.attachmentId,
+    input.roomId,
+  );
+  if (typeof row?.generation !== "number" || typeof row.streamSeq !== "number" ||
+      typeof row.occurredAt !== "string") {
+    return fail("storage_unavailable", "Bound attachment memory provenance is corrupt");
+  }
+  commitMemoryCorpusMutation(() => registerMemoryCorpusSource(database, {
+    roomId: input.roomId,
+    sourceKind: "attachment_extraction",
+    sourceId: `attachment-extraction:${input.attachmentId}`,
+    sourceRevision: row.generation as number,
+    serverStreamSeq: row.streamSeq as number,
+    eligibility: "eligible",
+    availability: "readable",
+    sourceActorId: input.actorId,
+    safeMetadata: {
+      attachmentId: input.attachmentId,
+      messageId: input.messageId,
+      status: "ready-bound-active",
+    },
+    readReference: `attachment-authority:${input.attachmentId}:generation:${String(row.generation)}`,
+    occurredAt: row.occurredAt as string,
+  }));
+}
+
 export function submitHumanMessageDatabaseCommand(
   database: DatabaseSync,
   input: {
@@ -7696,6 +7849,15 @@ export function submitHumanMessageDatabaseCommand(
           occurredAt: persistedAt,
           payload: { id: timeline.id },
         });
+        registerMessageMemorySource(database, {
+          roomId: input.message.roomId,
+          messageId: input.message.messageId,
+          revision: 1,
+          actorId,
+          actorKind: "human",
+          streamSeq,
+          occurredAt: persistedAt,
+        });
         input.onFaultPointForTest?.("after-event");
         appendRoomOutbox(
           database,
@@ -7738,7 +7900,7 @@ export function submitHumanMessageDatabaseCommand(
         };
         for (const attachment of input.message.attachments) {
           try {
-            bindAttachmentToMessageInTransaction(database, {
+            const bound = bindAttachmentToMessageInTransaction(database, {
               context: {
                 kind: "human",
                 sessionId: input.context.sessionId,
@@ -7753,6 +7915,13 @@ export function submitHumanMessageDatabaseCommand(
               },
               clock: { nowMs: () => input.now },
               ids: attachmentIds,
+            });
+            registerBoundAttachmentMemorySource(database, {
+              roomId: input.message.roomId,
+              messageId: input.message.messageId,
+              attachmentId: attachment.attachmentId,
+              actorId,
+              roomEventId: bound.roomEventId,
             });
           } catch (error: unknown) {
             if (error instanceof AttachmentAuthorityDatabaseError) {
@@ -7867,6 +8036,22 @@ export function reviseHumanMessageDatabaseCommand(
           eventType: "room.message.revised",
           occurredAt: persistedAt,
           payload: { id: timeline.id },
+        });
+        transitionExistingMemorySource(
+          database,
+          input.command.roomId,
+          messageMemorySourceIdentity(input.command.messageId, input.command.expectedRevision),
+          "excluded_revised",
+          persistedAt,
+        );
+        registerMessageMemorySource(database, {
+          roomId: input.command.roomId,
+          messageId: input.command.messageId,
+          revision,
+          actorId,
+          actorKind: "human",
+          streamSeq,
+          occurredAt: persistedAt,
         });
         appendRoomOutbox(
           database, eventId, input.command.roomId, streamSeq, persistedAt,
@@ -8105,6 +8290,28 @@ export function recallHumanMessageDatabaseCommand(
           eventType: "room.message.recalled",
           occurredAt: recalledAt,
           payload: { id: timeline.id },
+        });
+        transitionExistingMemorySource(
+          database,
+          input.command.roomId,
+          messageMemorySourceIdentity(input.command.messageId, input.command.expectedRevision),
+          "excluded_recalled",
+          recalledAt,
+        );
+        for (const attachment of linkedAttachments) {
+          transitionExistingMemorySource(database, input.command.roomId, {
+            sourceKind: "attachment_extraction",
+            sourceId: `attachment-extraction:${String(attachment.attachmentId)}`,
+            sourceRevision: attachment.generation as number,
+          }, "excluded_recalled", recalledAt);
+        }
+        registerMessageTombstoneMemorySource(database, {
+          roomId: input.command.roomId,
+          messageId: input.command.messageId,
+          revision: input.command.expectedRevision,
+          actorId,
+          streamSeq,
+          occurredAt: recalledAt,
         });
         appendRoomOutbox(
           database, eventId, input.command.roomId, streamSeq, recalledAt,
@@ -8542,6 +8749,15 @@ export function commitAgentMessageDatabaseCommand(
           eventType: "room.message.accepted",
           occurredAt: persistedAt,
           payload: { id: message.id },
+        });
+        registerMessageMemorySource(database, {
+          roomId: input.command.roomId,
+          messageId: input.command.messageId,
+          revision: 1,
+          actorId: input.context.agent.actorId,
+          actorKind: "agent",
+          streamSeq,
+          occurredAt: persistedAt,
         });
         appendRoomOutbox(
           database, eventId, input.command.roomId, streamSeq, persistedAt,
