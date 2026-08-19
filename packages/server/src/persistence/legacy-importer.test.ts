@@ -785,7 +785,7 @@ describe("LegacyStateImporter", () => {
     for (const [path, bytes] of fixture.originalBytes) {
       expect(readFileSync(path)).toEqual(bytes);
     }
-  });
+  }, WORKER_INITIALIZATION_TEST_TIMEOUT_MS);
 
   it("never clobbers a database that wins the activation race", async () => {
     const directory = fixtureDirectory();
@@ -916,7 +916,7 @@ describe("LegacyStateImporter", () => {
     await importer.close();
 
     expect(readFileSync(databasePath)).toEqual(before);
-  });
+  }, WORKER_INITIALIZATION_TEST_TIMEOUT_MS);
 
   it("closes successfully without opening or creating the authority database", async () => {
     const directory = fixtureDirectory();
