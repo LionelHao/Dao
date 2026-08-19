@@ -566,6 +566,178 @@ describe("pure synchronization contracts", () => {
     })).toBe(false);
   });
 
+  it("integrates closed memory repair records and minimal ordered delta events", () => {
+    const occurredAt = "2026-08-19T01:02:03.004Z";
+    const sourceRef = {
+      sourceKind: "message" as const,
+      sourceId: "message:message-1",
+      sourceRevision: 1,
+      eligibility: "eligible" as const,
+      availability: "readable" as const,
+    };
+    const projection = {
+      projectionKind: "memory" as const,
+      roomId: "room-1",
+      memoryRecordId: "memory-record-1",
+      kind: "context" as const,
+      currentVersion: {
+        roomId: "room-1",
+        memoryRecordId: "memory-record-1",
+        memoryVersionId: "memory-version-1",
+        version: 1,
+        kind: "context" as const,
+        state: "active" as const,
+        derivedText: "The production service is single-tenant.",
+        sourceRefs: [sourceRef],
+        createdAt: occurredAt,
+        replacesMemoryVersionId: null,
+      },
+      disputes: [] as const,
+      resolutions: [] as const,
+    };
+    const status = {
+      roomId: "room-1",
+      health: {
+        state: "healthy" as const,
+        reason: "none" as const,
+        memoryWatermark: 1,
+        corpusHead: 1,
+        lag: 0,
+        lastAttemptAt: occurredAt,
+        retryable: false,
+        recoveryRequired: false,
+      },
+      recoveryGeneration: 0,
+      updatedAt: occurredAt,
+    };
+    const projectionRecord = {
+      kind: "memory" as const,
+      roomId: "room-1",
+      value: { recordType: "projection" as const, projection },
+    };
+    const statusRecord = {
+      kind: "memory" as const,
+      roomId: "room-1",
+      value: { recordType: "status" as const, status },
+    };
+    const repairPage = {
+      type: "room.repair.page",
+      requestId: "request-memory-repair",
+      snapshotId: "snapshot-memory",
+      roomId: "room-1",
+      page: 0,
+      records: [projectionRecord, statusRecord],
+      watermark: 2,
+      snapshotChecksum: "sha256:memory",
+      hasMore: false,
+      mode: "streaming",
+      idleExpiresAt: "2026-08-19T01:03:00.000Z",
+    };
+
+    expect(isRoomRepairPage(repairPage)).toBe(true);
+    expect(isRoomRepairPage({
+      ...repairPage,
+      records: [{ ...projectionRecord, roomId: "room-2" }],
+    })).toBe(false);
+    expect(isRoomRepairPage({
+      ...repairPage,
+      records: [{ ...projectionRecord, rawBody: "must-not-cross-repair" }],
+    })).toBe(false);
+    expect(isRoomRepairPage({
+      ...repairPage,
+      records: [{
+        ...projectionRecord,
+        value: {
+          ...projectionRecord.value,
+          projection: {
+            ...projection,
+            currentVersion: {
+              ...projection.currentVersion,
+              providerMetadata: "must-not-cross-repair",
+            },
+          },
+        },
+      }],
+    })).toBe(false);
+
+    const versionChanged = {
+      eventId: "event-memory-version",
+      streamKind: "room" as const,
+      streamId: "room-1",
+      streamSeq: 1,
+      roomId: "room-1",
+      actorId: "memory-steward",
+      occurredAt,
+      type: "room.memory.version.changed" as const,
+      payload: {
+        memoryRecordId: "memory-record-1",
+        memoryVersionId: "memory-version-1",
+        kind: "context" as const,
+        state: "active" as const,
+        sourceIds: ["message:message-1"],
+        memoryWatermark: 1,
+      },
+    };
+    const healthChanged = {
+      eventId: "event-memory-health",
+      streamKind: "room" as const,
+      streamId: "room-1",
+      streamSeq: 2,
+      roomId: "room-1",
+      actorId: "memory-steward",
+      occurredAt,
+      type: "room.memory.health.changed" as const,
+      payload: status,
+    };
+    const delta = {
+      type: "room.sync.result",
+      requestId: "request-memory-delta",
+      mode: "delta",
+      events: [versionChanged, healthChanged],
+      nextCursor: { version: 1, roomId: "room-1", afterSeq: 2 },
+      watermark: 2,
+      hasMore: false,
+    };
+
+    expect(isRoomSyncResult(delta)).toBe(true);
+    expect(isRoomSyncResult({
+      ...delta,
+      events: [versionChanged, { ...healthChanged, eventId: versionChanged.eventId }],
+    })).toBe(false);
+    expect(isRoomSyncResult({
+      ...delta,
+      events: [healthChanged, versionChanged],
+    })).toBe(false);
+    expect(isRoomSyncResult({
+      ...delta,
+      events: [{
+        ...versionChanged,
+        payload: { ...versionChanged.payload, derivedText: "must-not-cross-event" },
+      }, healthChanged],
+    })).toBe(false);
+    expect(isRoomSyncResult({
+      ...delta,
+      events: [{
+        ...versionChanged,
+        payload: { ...versionChanged.payload, rawBody: "must-not-cross-event" },
+      }, healthChanged],
+    })).toBe(false);
+    expect(isRoomSyncResult({
+      ...delta,
+      events: [{
+        ...versionChanged,
+        payload: { ...versionChanged.payload, providerOutput: "must-not-cross-event" },
+      }, healthChanged],
+    })).toBe(false);
+    expect(isRoomSyncResult({
+      ...delta,
+      events: [versionChanged, {
+        ...healthChanged,
+        payload: { ...status, roomId: "room-2" },
+      }],
+    })).toBe(false);
+  });
+
   it("does not interchange room and catalog snapshot versions", () => {
     expect(isSnapshotVersion({ kind: "room", roomId: "room-1", watermark: 4 })).toBe(true);
     expect(isSnapshotVersion({ kind: "catalog", catalogRevision: 3 })).toBe(true);
