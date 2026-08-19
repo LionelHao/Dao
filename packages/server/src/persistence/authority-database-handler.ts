@@ -2977,7 +2977,7 @@ function commitClosedDeparture(
       );
   const acknowledgement = {
     aggregateId: authorization.roomId,
-    eventIds: [roomEventId, identityEventId],
+    eventIds: [roomEventId],
     acceptedAt,
     result: { governance } as unknown as JsonValue,
   };
@@ -3141,7 +3141,7 @@ function executeClosedLifecycle(
         } else if ("afterCommitRescan" in result) {
           onAfterCommitRescan(result.afterCommitRescan);
         }
-        const catalogEventIds = appendCatalogEvents(database, {
+        appendCatalogEvents(database, {
           roomId: command.roomId,
           change: command.type === "room.archive" ? "archived" : "updated",
           acceptedAt,
@@ -3149,7 +3149,6 @@ function executeClosedLifecycle(
           key,
           startIndex: catalogStartIndex,
         });
-        eventIds.push(...catalogEventIds);
         afterDomainWrite?.();
         return {
           aggregateId: command.roomId,

@@ -201,7 +201,7 @@ describe("FT-02A room governance foundation", () => {
       governance: { roomId: value.roomId, governanceRevision: 2 },
       replayed: false,
     });
-    expect(first.eventIds).toHaveLength(2);
+    expect(first.eventIds).toHaveLength(1);
     const replay = await value.authority.executeHumanGovernance({
       ...context,
       requestId: "member-leave-replay",

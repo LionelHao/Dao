@@ -196,7 +196,14 @@ async function readAllRegularFiles(directory: string): Promise<readonly Buffer[]
 
 interface ChildStartOptions {
   readonly directory: string;
+  readonly actors?: readonly Actor[];
+  readonly identities?: readonly {
+    readonly accountId: string;
+    readonly actorId: string;
+    readonly secret: string;
+  }[];
   readonly seedAllFacts?: true;
+  readonly seedGovernanceRoom?: true;
   readonly forceSnapshotFallback?: true;
   readonly snapshotRecordsPerPage?: number;
   readonly readbackOnly?: true;
@@ -220,14 +227,16 @@ function startCommand(options: ChildStartOptions): Record<string, unknown> {
     type: "start",
     databasePath: join(options.directory, "authority.sqlite"),
     snapshotCachePath: join(options.directory, "snapshot-cache.sqlite"),
-    actors,
+    actors: options.actors ?? actors,
     identity: {
       accountId: "account-a",
       actorId: "human-a",
       secret: "test-secret",
     },
     invitationSecretKey: Buffer.alloc(32, 7).toString("base64url"),
+    ...(options.identities === undefined ? {} : { identities: options.identities }),
     ...(options.seedAllFacts === undefined ? {} : { seedAllFacts: true }),
+    ...(options.seedGovernanceRoom === undefined ? {} : { seedGovernanceRoom: true }),
     ...(options.forceSnapshotFallback === undefined
       ? {}
       : { forceSnapshotFallback: true }),
@@ -630,15 +639,21 @@ class JsonWebSocketClient {
     });
   }
 
-  async login(requestId = "login"): Promise<string> {
+  async login(
+    requestId = "login",
+    identity: Readonly<{ accountId: string; secret: string }> = {
+      accountId: "account-a",
+      secret: "test-secret",
+    },
+  ): Promise<string> {
     const frame = await this.request({
       type: "auth.login",
       requestId,
-      accountId: "account-a",
-      secret: "test-secret",
+      accountId: identity.accountId,
+      secret: identity.secret,
       device: {
-        id: "authority-e2e-installation",
-        label: "Authority E2E device",
+        id: `authority-e2e-${identity.accountId}`,
+        label: `Authority E2E ${identity.accountId}`,
         platform: "unknown",
       },
     }, "auth.authenticated");
@@ -1721,6 +1736,233 @@ describe("authoritative server real-process harness", () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+
+  it("runs governance across crash boundaries, restart, three clients, CAS races, and removal", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-governance-process-"));
+    const governanceActors = [
+      actors[0], actors[1],
+      { id: "human-b", kind: "human", displayName: "Human B", reachability: "online" },
+      { id: "human-c", kind: "human", displayName: "Human C", reachability: "online" },
+      { id: "human-d", kind: "human", displayName: "Human D", reachability: "online" },
+    ] satisfies readonly Actor[];
+    const identities = [
+      { accountId: "account-a", actorId: "human-a", secret: "test-secret" },
+      { accountId: "account-b", actorId: "human-b", secret: "test-secret-b" },
+      { accountId: "account-c", actorId: "human-c", secret: "test-secret-c" },
+    ] as const;
+    const children: ChildProcessWithoutNullStreams[] = [];
+    const clients: JsonWebSocketClient[] = [];
+    try {
+      const seeded = await spawnAuthorityChild({
+        directory, actors: governanceActors, identities, seedGovernanceRoom: true,
+      });
+      children.push(seeded.child);
+      const seedClient = await JsonWebSocketClient.connect(seeded.url);
+      clients.push(seedClient);
+      await seedClient.login("governance-seed-login");
+      const roomId = await discoverRoom(seedClient);
+      seedClient.close();
+      await stopChild(seeded.child);
+
+      const setup = new DatabaseSync(join(directory, "authority.sqlite"));
+      setup.exec("BEGIN IMMEDIATE");
+      try {
+        const insertMembership = setup.prepare(
+          `INSERT INTO room_memberships (
+             room_id, actor_id, kind, role, participation, tool_permissions_json,
+             joined_at, configured_at, access_revision
+           ) VALUES (?, ?, 'human', ?, NULL, '[]', ?, NULL, 0)`,
+        );
+        insertMembership.run(roomId, "human-b", "member", "2026-08-19T00:00:00.000Z");
+        insertMembership.run(roomId, "human-c", "admin", "2026-08-19T00:00:01.000Z");
+        insertMembership.run(roomId, "human-d", "member", "2026-08-19T00:00:02.000Z");
+        setup.prepare(
+          `INSERT INTO project_next_actions (
+             id, room_id, source_room_id, source_id, revision, owner_kind,
+             owner_actor_id, verifier_human_actor_id, status
+           ) VALUES (?, ?, ?, ?, 1, 'human', 'human-c', NULL, 'in_progress')`,
+        ).run("governance-conflict-action", roomId, roomId, "governance-source");
+        setup.exec("COMMIT");
+      } catch (error: unknown) {
+        setup.exec("ROLLBACK");
+        throw error;
+      } finally {
+        setup.close();
+      }
+
+      for (const [faultPoint, expectedExit, key] of [
+        ["after-domain-write", 81, "archive-before-commit"],
+        ["after-commit-before-outbox", 83, "archive-ack-lost"],
+      ] as const) {
+        const faulted = await spawnAuthorityChild({
+          directory, actors: governanceActors, identities, faultPoint,
+        });
+        children.push(faulted.child);
+        const faultClient = await JsonWebSocketClient.connect(faulted.url);
+        clients.push(faultClient);
+        await faultClient.login(`${key}-login`);
+        faultClient.send({
+          type: "room.archive", requestId: key, roomId,
+          expectedGovernanceRevision: 1, idempotencyKey: key,
+        });
+        let exitCode: number | null;
+        try {
+          exitCode = await childExit(faulted.child, 5_000);
+        } catch (error: unknown) {
+          throw new Error(
+            `Governance fault did not terminate: ${JSON.stringify(faultClient.frames())}`,
+            { cause: error },
+          );
+        }
+        expect(exitCode).toBe(expectedExit);
+        const inspected = new DatabaseSync(join(directory, "authority.sqlite"), { readOnly: true });
+        const room = inspected.prepare(
+          "SELECT status, governance_revision AS governanceRevision FROM rooms WHERE id = ?",
+        ).get(roomId);
+        if (faultPoint === "after-domain-write") {
+          expect(room).toEqual({ status: "active", governanceRevision: 1 });
+          expect(inspected.prepare(
+            "SELECT COUNT(*) AS count FROM idempotency_records WHERE key = ?",
+          ).get(key)).toEqual({ count: 0 });
+        } else {
+          expect(room).toEqual({ status: "archived", governanceRevision: 2 });
+          expect(inspected.prepare(
+            "SELECT COUNT(*) AS count FROM room_audit WHERE type = 'room.archived'",
+          ).get()).toEqual({ count: 1 });
+        }
+        inspected.close();
+      }
+
+      const committed = new DatabaseSync(join(directory, "authority.sqlite"), { readOnly: true });
+      const archivedEventIds = committed.prepare(
+        `SELECT event_id AS eventId FROM events
+         WHERE room_id = ? AND event_type IN ('room.archived', 'room.security.reduced')
+         ORDER BY stream_seq`,
+      ).all(roomId).map((row) => String(row.eventId));
+      committed.close();
+      expect(archivedEventIds).toHaveLength(2);
+
+      const restarted = await spawnAuthorityChild({
+        directory, actors: governanceActors, identities,
+      });
+      children.push(restarted.child);
+      const [owner, ownerPeer, member, admin] = await Promise.all([
+        JsonWebSocketClient.connect(restarted.url), JsonWebSocketClient.connect(restarted.url),
+        JsonWebSocketClient.connect(restarted.url), JsonWebSocketClient.connect(restarted.url),
+      ]);
+      clients.push(owner, ownerPeer, member, admin);
+      await Promise.all([
+        owner.login("owner-login", identities[0]),
+        ownerPeer.login("owner-peer-login", identities[0]),
+        member.login("member-login", identities[1]),
+        admin.login("admin-login", identities[2]),
+      ]);
+      await expect(owner.request({
+        type: "room.archive", requestId: "archive-replay", roomId,
+        expectedGovernanceRevision: 1, idempotencyKey: "archive-ack-lost",
+      }, "room.governance.ack")).resolves.toMatchObject({
+        type: "room.governance.ack", eventIds: archivedEventIds, replayed: true,
+        governance: { lifecycle: "archived", governanceRevision: 2, archiveGeneration: 1 },
+      });
+      const conflictResult = await admin.request({
+        type: "room.departure.conflicts", requestId: "conflicts", roomId,
+        targetActorId: "human-c",
+      }, "room.departure.conflicts.result");
+      expect(conflictResult).toMatchObject({
+        conflicts: {
+          roomId, targetActorId: "human-c",
+          conflicts: [expect.objectContaining({ kind: "next_action", revision: 1 })],
+        },
+      });
+
+      const head = readRoomHeadSeq(directory, roomId);
+      for (const [index, client] of [owner, member, admin].entries()) {
+        await client.request({
+          type: "room.subscribe.v2", requestId: `governance-subscribe-${index}`, roomId,
+          cursor: { version: 1, roomId, afterSeq: head },
+        }, "room.subscribed.v2");
+      }
+      await expect(owner.request({
+        type: "room.reopen", requestId: "reopen", roomId,
+        expectedGovernanceRevision: 2, idempotencyKey: "reopen",
+      }, "room.governance.ack")).resolves.toMatchObject({
+        eventIds: [expect.any(String)], replayed: false,
+        governance: { lifecycle: "active", governanceRevision: 3, archiveGeneration: 1 },
+      });
+      for (const client of [owner, member, admin]) {
+        await client.waitFor((frame) => frame.type === "room.event" &&
+          frame.event.type === "room.reopened" && frame.event.roomId === roomId);
+      }
+
+      const raced = await Promise.allSettled([
+        owner.request({
+          type: "room.member.remove", requestId: "remove-d-one", roomId,
+          targetActorId: "human-d", expectedGovernanceRevision: 3,
+          idempotencyKey: "remove-d-one",
+        }, "room.governance.ack"),
+        ownerPeer.request({
+          type: "room.member.remove", requestId: "remove-d-two", roomId,
+          targetActorId: "human-d", expectedGovernanceRevision: 3,
+          idempotencyKey: "remove-d-two",
+        }, "room.governance.ack"),
+      ]);
+      expect(raced.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+      expect(raced.find((result) => result.status === "rejected")).toMatchObject({
+        status: "rejected", reason: { status: 409, code: "room_revision_conflict" },
+      });
+
+      const leave = {
+        type: "room.member.leave" as const, requestId: "member-leave", roomId,
+        expectedGovernanceRevision: 4, idempotencyKey: "member-leave",
+      };
+      const left = await member.request(leave, "room.governance.ack");
+      expect(left).toMatchObject({ eventIds: [expect.any(String)], replayed: false,
+        governance: { governanceRevision: 5 } });
+      await expect(member.request({
+        type: "room.governance.get", requestId: "removed-read", roomId,
+      }, "room.governance")).rejects.toMatchObject({ status: 403, code: "room_forbidden" });
+      await expect(member.request({ ...leave, requestId: "member-leave-replay" },
+        "room.governance.ack")).resolves.toMatchObject({
+        eventIds: left.type === "room.governance.ack" ? left.eventIds : [], replayed: true,
+      });
+
+      const beforeBlocked = new DatabaseSync(join(directory, "authority.sqlite"), { readOnly: true });
+      const blockedCounts = beforeBlocked.prepare(
+        `SELECT (SELECT governance_revision FROM rooms WHERE id = ?) AS revision,
+                (SELECT COUNT(*) FROM room_audit) AS audits,
+                (SELECT COUNT(*) FROM events) AS events,
+                (SELECT COUNT(*) FROM outbox_deliveries) AS outbox,
+                (SELECT COUNT(*) FROM idempotency_records) AS receipts`,
+      ).get(roomId);
+      beforeBlocked.close();
+      admin.send({
+        type: "room.member.leave", requestId: "blocked-admin-leave", roomId,
+        expectedGovernanceRevision: 5, idempotencyKey: "blocked-admin-leave",
+      });
+      await expect(admin.waitFor((frame) => frame.type === "error" &&
+        frame.requestId === "blocked-admin-leave")).resolves.toMatchObject({
+        status: 409, code: "departure_blocked",
+        details: { roomId, targetActorId: "human-c",
+          conflicts: [expect.objectContaining({ kind: "next_action" })] },
+      });
+      const afterBlocked = new DatabaseSync(join(directory, "authority.sqlite"), { readOnly: true });
+      expect(afterBlocked.prepare(
+        `SELECT (SELECT governance_revision FROM rooms WHERE id = ?) AS revision,
+                (SELECT COUNT(*) FROM room_audit) AS audits,
+                (SELECT COUNT(*) FROM events) AS events,
+                (SELECT COUNT(*) FROM outbox_deliveries) AS outbox,
+                (SELECT COUNT(*) FROM idempotency_records) AS receipts`,
+      ).get(roomId)).toEqual(blockedCounts);
+      expect(afterBlocked.prepare(
+        "SELECT COUNT(*) AS count FROM room_memberships WHERE room_id = ? AND actor_id = 'human-c'",
+      ).get(roomId)).toEqual({ count: 1 });
+      afterBlocked.close();
+    } finally {
+      for (const client of clients) client.close();
+      for (const child of children) await stopChild(child).catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   for (const [faultPoint, expectedExit] of [
     ["after-domain-write", 81],

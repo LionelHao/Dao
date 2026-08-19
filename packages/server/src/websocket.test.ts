@@ -5103,7 +5103,7 @@ const departureConflictList: DepartureConflictList = {
   conflicts: [{
     conflictId: "next-action:next-1:3",
     roomId,
-    subjectId: "human-2",
+    subjectId: "next-1",
     kind: "next_action",
     title: "待转交行动",
     state: "open",
@@ -5348,7 +5348,6 @@ describe("closed FT-02B/FT-02C WebSocket governance", () => {
               targetActorId: input.targetActorId,
               conflicts: [{
                 ...departureConflictList.conflicts[0],
-                subjectId: input.targetActorId,
                 title: "x".repeat(1_025),
               }],
             };
@@ -5356,10 +5355,6 @@ describe("closed FT-02B/FT-02C WebSocket governance", () => {
           return {
             ...departureConflictList,
             targetActorId: input.targetActorId,
-            conflicts: departureConflictList.conflicts.map((conflict) => ({
-              ...conflict,
-              subjectId: input.targetActorId,
-            })),
           };
         },
         async executeHumanGovernance(_context, command) {
@@ -5382,10 +5377,6 @@ describe("closed FT-02B/FT-02C WebSocket governance", () => {
               : {
                   ...departureConflictList,
                   targetActorId,
-                  conflicts: departureConflictList.conflicts.map((conflict) => ({
-                    ...conflict,
-                    subjectId: targetActorId,
-                  })),
                 },
           });
         },

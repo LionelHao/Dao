@@ -312,6 +312,23 @@ async function start(
           return acknowledgement;
         },
       } satisfies Parameters<typeof createMessageService>[0]["commandStore"];
+    const governanceStore = {
+      executeHuman: commandStore.executeHuman,
+      readRoomGovernance: authority.readRoomGovernance,
+      readDepartureConflicts: authority.readDepartureConflicts,
+      async executeHumanGovernance(
+        ...args: Parameters<typeof authority.executeHumanGovernance>
+      ) {
+        try {
+          return await authority.executeHumanGovernance(...args);
+        } catch (error: unknown) {
+          if (transactionFault !== undefined) {
+            process.exit(transactionFault === "after-domain-write" ? 81 : 82);
+          }
+          throw error;
+        }
+      },
+    } satisfies NonNullable<Parameters<typeof startMessageWebSocketServer>[0]["governance"]>;
     const service = createMessageService({
       commandStore,
       queryStore: authority,
@@ -471,7 +488,7 @@ async function start(
       agentRuntime: runtime,
       collaboration: primitives,
       ballRuntime,
-      governance: authority,
+      governance: governanceStore,
     });
   } catch (error: unknown) {
     stopCacheInvalidationRecovery?.();

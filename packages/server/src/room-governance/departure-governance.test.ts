@@ -559,6 +559,19 @@ describe("FT-02B departure governance", () => {
       }), 409, "room_revision_conflict");
     });
     expect(list).not.toHaveBeenCalled();
+
+    database.exec(`
+      DELETE FROM room_memberships WHERE actor_id = 'human-member';
+      UPDATE rooms SET governance_revision = 8 WHERE id = 'room-1';
+    `);
+    withTransaction(database, (transaction) => {
+      expectCommandError(() => coordinator.beginMutationInTransaction(transaction, {
+        operation: "remove", roomId: "room-1",
+        authenticatedHumanActorId: "human-owner", targetHumanActorId: "human-member",
+        expectedGovernanceRevision: 7,
+      }), 409, "room_revision_conflict");
+    });
+    expect(list).not.toHaveBeenCalled();
   });
 
   it("rechecks role and CAS at finalize and never reuses or serializes an attempt", () => {

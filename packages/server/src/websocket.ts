@@ -210,7 +210,6 @@ function closeDepartureConflictList(
     value.targetActorId !== expectedTargetActorId ||
     value.conflicts.length > 256 ||
     value.conflicts.some((conflict) =>
-      conflict.subjectId !== expectedTargetActorId ||
       conflict.revision <= 0 ||
       !isBoundedWireText(conflict.conflictId, 256) ||
       !isBoundedWireText(conflict.subjectId, 256) ||
