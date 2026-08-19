@@ -333,7 +333,7 @@ describe("authority SQLite v18 Room Memory Authority & Steward", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(AUTHORITY_V18_STATEMENT_COUNT_FOR_TEST).toBe(60);
+      expect(AUTHORITY_V18_STATEMENT_COUNT_FOR_TEST).toBe(61);
       for (const [table, columns] of Object.entries(V18_TABLE_COLUMNS)) {
         expect(listAuthorityTables(database)).toContain(table);
         expect(tableColumns(database, table)).toEqual(columns);
@@ -437,6 +437,15 @@ describe("authority SQLite v18 Room Memory Authority & Steward", () => {
       expect(database.prepare(
         "SELECT COUNT(*) AS count FROM room_memory_source_transitions",
       ).get()).toEqual({ count: 1 });
+      database.exec(`
+        UPDATE rooms
+        SET status = 'archived', archived_at = '${NOW}', archive_generation = 1
+        WHERE id = 'memory-room'
+      `);
+      expect(database.prepare(`
+        SELECT lifecycle_generation AS lifecycleGeneration
+        FROM room_memory_stewards WHERE room_id = 'memory-room'
+      `).get()).toEqual({ lifecycleGeneration: 1 });
     });
   });
 
@@ -625,7 +634,7 @@ describe("authority SQLite v18 Room Memory Authority & Steward", () => {
   });
 
   it("rolls every meaningful v18 statement back to an identical populated v17 database", () => {
-    expect(AUTHORITY_V18_STATEMENT_COUNT_FOR_TEST).toBe(60);
+    expect(AUTHORITY_V18_STATEMENT_COUNT_FOR_TEST).toBe(61);
     for (let statement = 1; statement <= AUTHORITY_V18_STATEMENT_COUNT_FOR_TEST; statement += 1) {
       withDatabase((database) => {
         migrateAuthorityDatabaseToHistoricalVersionForTest(database, 17);
