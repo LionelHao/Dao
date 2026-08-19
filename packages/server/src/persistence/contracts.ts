@@ -355,7 +355,17 @@ export interface MessageRecallReceipt {
   readonly recalledAt: string;
   readonly eventId: string;
   readonly replayed: boolean;
-  readonly abortTargets: readonly string[];
+  readonly abortTargets: readonly MessageRecallExecutionCancellation[];
+}
+
+export interface MessageRecallExecutionCancellation {
+  readonly sourceMessageId: string;
+  readonly sourceRevision: number;
+  readonly invocationIntentId: string;
+  readonly executionId: string;
+  readonly attemptSeq: number;
+  readonly cancellationReason: "message_recalled";
+  readonly sideEffectState: "none" | "dispatched-retained" | "outcome-unknown-retained";
 }
 
 export interface AgentMessageCommitReceipt extends MessageAuthorityMutationReceipt {

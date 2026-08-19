@@ -477,6 +477,43 @@ async function start(
           },
         }
       : authority;
+    const messageAuthority = {
+      async submitHumanMessage(...args: Parameters<typeof authority.submitHumanMessage>) {
+        const receipt = await authority.submitHumanMessage(...args);
+        return {
+          messageId: receipt.messageId,
+          persistedAt: receipt.persistedAt,
+          targetOutcomes: receipt.targetOutcomes,
+        };
+      },
+      async reviseHumanMessage(...args: Parameters<typeof authority.reviseHumanMessage>) {
+        const receipt = await authority.reviseHumanMessage(...args);
+        return {
+          messageId: receipt.messageId,
+          revision: receipt.revision,
+          persistedAt: receipt.persistedAt,
+        };
+      },
+      async recallHumanMessage(...args: Parameters<typeof authority.recallHumanMessage>) {
+        const receipt = await authority.recallHumanMessage(...args);
+        try {
+          runtime?.applyCommittedMessageRecall({
+            sourceMessageId: receipt.messageId,
+            cancellations: receipt.abortTargets,
+          });
+        } catch {
+          // The recall/fence/cancellation transaction is already durable. Restart recovery
+          // observes cancelled executions, so an in-process abort failure cannot change the ACK.
+        }
+        return {
+          messageId: receipt.messageId,
+          revision: receipt.revision,
+          recalledAt: receipt.recalledAt,
+        };
+      },
+      readMessageHistory: authority.readMessageHistory,
+      readMessageRevisions: authority.readMessageRevisions,
+    } satisfies NonNullable<Parameters<typeof startMessageWebSocketServer>[0]["messageAuthority"]>;
     transport = await startMessageWebSocketServer({
       auth,
       service,
@@ -488,6 +525,7 @@ async function start(
       agentRuntime: runtime,
       collaboration: primitives,
       ballRuntime,
+      messageAuthority,
       governance: governanceStore,
     });
   } catch (error: unknown) {

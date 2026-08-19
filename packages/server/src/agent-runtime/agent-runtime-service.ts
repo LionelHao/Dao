@@ -82,6 +82,18 @@ export interface AgentRuntimeService extends AgentRuntime {
     intent: AgentInvocationIntent,
   ): Promise<readonly AgentExecution[]>;
   applyCommittedHumanFence(cancelledExecutions: readonly AgentExecution[]): void;
+  applyCommittedMessageRecall(input: Readonly<{
+    sourceMessageId: string;
+    cancellations: readonly Readonly<{
+      sourceMessageId: string;
+      sourceRevision: number;
+      invocationIntentId: string;
+      executionId: string;
+      attemptSeq: number;
+      cancellationReason: "message_recalled";
+      sideEffectState: "none" | "dispatched-retained" | "outcome-unknown-retained";
+    }>[];
+  }>): void;
   whenIdle(): Promise<void>;
   recover(): Promise<void>;
 }
@@ -165,6 +177,15 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
   let active = 0;
   let closed = false;
   let closePromise: Promise<void> | undefined;
+
+  const exactOwnKeys = (value: object, keys: readonly string[]): boolean => {
+    const allowed = new Set(keys);
+    return keys.every((key) => Object.hasOwn(value, key)) &&
+      Reflect.ownKeys(value).every((key) => typeof key === "string" && allowed.has(key));
+  };
+
+  const nonEmptyId = (value: unknown): value is string =>
+    typeof value === "string" && value.length > 0 && value === value.trim() && value.length <= 256;
 
   const isIdle = (): boolean => active === 0 && [...queues.values()].every((queue) => queue.length === 0);
   const signalIdle = (): void => {
@@ -518,6 +539,54 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         for (const [confirmationId, pending] of pendingConfirmations) {
           if (pending.job.execution.id === cancelled.id) pendingConfirmations.delete(confirmationId);
         }
+      }
+      signalIdle();
+    },
+    applyCommittedMessageRecall(input) {
+      if (typeof input !== "object" || input === null ||
+          !exactOwnKeys(input, ["sourceMessageId", "cancellations"]) ||
+          !nonEmptyId(input.sourceMessageId) || !Array.isArray(input.cancellations) ||
+          input.cancellations.length > 256) {
+        throw new TypeError("Committed message recall tuple was malformed");
+      }
+      const executionIds = new Set<string>();
+      for (const cancellation of input.cancellations) {
+        if (typeof cancellation !== "object" || cancellation === null ||
+            !exactOwnKeys(cancellation, [
+              "sourceMessageId", "sourceRevision", "invocationIntentId", "executionId",
+              "attemptSeq", "cancellationReason", "sideEffectState",
+            ]) || cancellation.sourceMessageId !== input.sourceMessageId ||
+            !Number.isSafeInteger(cancellation.sourceRevision) || cancellation.sourceRevision < 1 ||
+            !nonEmptyId(cancellation.invocationIntentId) || !nonEmptyId(cancellation.executionId) ||
+            !Number.isSafeInteger(cancellation.attemptSeq) || cancellation.attemptSeq < 1 ||
+            cancellation.cancellationReason !== "message_recalled" ||
+            (cancellation.sideEffectState !== "none" &&
+              cancellation.sideEffectState !== "dispatched-retained" &&
+              cancellation.sideEffectState !== "outcome-unknown-retained") ||
+            executionIds.has(cancellation.executionId)) {
+          throw new TypeError("Committed message recall tuple was malformed");
+        }
+        executionIds.add(cancellation.executionId);
+        const job = jobsByExecution.get(cancellation.executionId);
+        if (job !== undefined &&
+            (job.intent.sourceMessageId !== cancellation.sourceMessageId ||
+              job.execution.currentAttemptSeq !== cancellation.attemptSeq)) {
+          throw new TypeError("Committed message recall tuple did not match runtime state");
+        }
+      }
+      for (const cancellation of input.cancellations) {
+        controllers.get(cancellation.executionId)?.abort("message_recalled");
+        for (const queue of queues.values()) {
+          const index = queue.findIndex((candidate) =>
+            candidate.execution.id === cancellation.executionId);
+          if (index >= 0) queue.splice(index, 1);
+        }
+        for (const [confirmationId, pending] of pendingConfirmations) {
+          if (pending.job.execution.id === cancellation.executionId) {
+            pendingConfirmations.delete(confirmationId);
+          }
+        }
+        jobsByExecution.delete(cancellation.executionId);
       }
       signalIdle();
     },

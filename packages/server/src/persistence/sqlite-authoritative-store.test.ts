@@ -4869,7 +4869,15 @@ describe("SQLite authoritative sessions", () => {
         expectedRevision: 1,
       },
     );
-    expect(recallReceipt.abortTargets).toEqual(["execution-agent-recalled"]);
+    expect(recallReceipt.abortTargets).toEqual([{
+      sourceMessageId: recalledSourceId,
+      sourceRevision: 1,
+      invocationIntentId: recalledIntentId,
+      executionId: "execution-agent-recalled",
+      attemptSeq: 1,
+      cancellationReason: "message_recalled",
+      sideEffectState: "none",
+    }]);
     await expect(fixture.store.commitAgentMessage(
       mintInternalAgentMessageCommitContext({
         agentActorId: "agent-review",
@@ -4900,6 +4908,10 @@ describe("SQLite authoritative sessions", () => {
     expect(database.prepare(
       "SELECT COUNT(*) AS count FROM messages WHERE id = 'message-agent-after-recall'",
     ).get()).toEqual({ count: 0 });
+    expect(database.prepare(
+      `SELECT status, cancellation_reason AS cancellationReason
+       FROM agent_executions WHERE id = 'execution-agent-recalled'`,
+    ).get()).toEqual({ status: "cancelled", cancellationReason: "message_recalled" });
     expect(database.prepare(
       `SELECT scope_kind AS scopeKind FROM message_recall_fences
        WHERE source_message_id = ? ORDER BY scope_kind`,

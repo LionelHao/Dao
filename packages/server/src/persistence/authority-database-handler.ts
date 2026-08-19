@@ -79,6 +79,7 @@ import {
   type MessageHistoryPage,
   type MessageHistoryQuery,
   type MessageRecallCommand,
+  type MessageRecallExecutionCancellation,
   type MessageRecallReceipt,
   type MessageRevisionCommand,
   type MessageRevisionPage,
@@ -7017,6 +7018,22 @@ function isMutationReceiptBase(value: unknown): value is {
     typeof value.replayed === "boolean";
 }
 
+function isMessageRecallExecutionCancellation(
+  value: unknown,
+): value is MessageRecallExecutionCancellation {
+  return isRecord(value) && authorityExactKeys(value, [
+    "sourceMessageId", "sourceRevision", "invocationIntentId", "executionId",
+    "attemptSeq", "cancellationReason", "sideEffectState",
+  ]) && typeof value.sourceMessageId === "string" && value.sourceMessageId.length > 0 &&
+    Number.isSafeInteger(value.sourceRevision) && Number(value.sourceRevision) > 0 &&
+    typeof value.invocationIntentId === "string" && value.invocationIntentId.length > 0 &&
+    typeof value.executionId === "string" && value.executionId.length > 0 &&
+    Number.isSafeInteger(value.attemptSeq) && Number(value.attemptSeq) > 0 &&
+    value.cancellationReason === "message_recalled" &&
+    (value.sideEffectState === "none" || value.sideEffectState === "dispatched-retained" ||
+      value.sideEffectState === "outcome-unknown-retained");
+}
+
 function parseStoredMessageAuthorityReceipt(
   value: string,
   kind: "submit" | "revise" | "recall" | "agent",
@@ -7051,8 +7068,10 @@ function parseStoredMessageAuthorityReceipt(
       typeof field("recalledAt") === "string" && String(field("recalledAt")).length > 0 &&
       typeof field("eventId") === "string" && String(field("eventId")).length > 0 &&
       typeof field("replayed") === "boolean" && Array.isArray(field("abortTargets")) &&
-      (field("abortTargets") as unknown[]).every((target: unknown) =>
-        typeof target === "string" && target.length > 0)) {
+      (field("abortTargets") as unknown[]).every(isMessageRecallExecutionCancellation) &&
+      new Set((field("abortTargets") as MessageRecallExecutionCancellation[])
+        .map((target) => target.executionId)).size ===
+        (field("abortTargets") as unknown[]).length) {
     return record as unknown as MessageRecallReceipt;
   }
   if (kind === "agent" && authorityExactKeys(record, [
@@ -7580,16 +7599,17 @@ export function recallHumanMessageDatabaseCommand(
         }
         const executions = database.prepare(
           `SELECT link.intent_id AS intentId, link.execution_id AS executionId,
-                  execution.status
+                  execution.status, execution.current_attempt_seq AS attemptSeq
            FROM agent_execution_intent_links AS link
            JOIN agent_invocation_intents AS intent ON intent.id = link.intent_id
            JOIN agent_executions AS execution ON execution.id = link.execution_id
            WHERE intent.source_message_id = ?
            ORDER BY link.intent_id, link.execution_ordinal`,
         ).all(input.command.messageId);
-        const abortTargets: string[] = [];
+        const abortTargets: MessageRecallExecutionCancellation[] = [];
         for (const execution of executions) {
-          if (typeof execution.intentId !== "string" || typeof execution.executionId !== "string") {
+          if (typeof execution.intentId !== "string" || typeof execution.executionId !== "string" ||
+              typeof execution.attemptSeq !== "number") {
             return fail("storage_unavailable", "Message execution lineage is corrupt");
           }
           database.prepare(
@@ -7612,7 +7632,53 @@ export function recallHumanMessageDatabaseCommand(
             recalledAt,
           );
           if (execution.status === "queued" || execution.status === "running") {
-            abortTargets.push(execution.executionId);
+            const dispatch = database.prepare(
+              `SELECT state FROM tool_dispatches
+               WHERE execution_id = ? AND attempt_seq = ?
+               ORDER BY rowid DESC LIMIT 1`,
+            ).get(execution.executionId, execution.attemptSeq);
+            const sideEffectState = dispatch?.state === "outcome_unknown"
+              ? "outcome-unknown-retained" as const
+              : dispatch?.state === "dispatched" || dispatch?.state === "succeeded"
+                ? "dispatched-retained" as const
+                : "none" as const;
+            const cancelled = database.prepare(
+              `UPDATE agent_executions
+               SET status = 'cancelled', cancellation_reason = 'message_recalled',
+                   completed_at = ?, updated_at = ?, next_retry_at = NULL
+               WHERE id = ? AND current_attempt_seq = ? AND status IN ('queued', 'running')`,
+            ).run(
+              recalledAt,
+              recalledAt,
+              execution.executionId,
+              execution.attemptSeq,
+            );
+            if (cancelled.changes !== 1) {
+              return fail("execution_conflict", "Message recall execution cancellation was stale");
+            }
+            database.prepare(
+              `UPDATE agent_execution_attempts
+               SET status = 'cancelled', finished_at = ?, error_code = 'message_recalled',
+                   next_retry_at = NULL
+               WHERE execution_id = ? AND attempt_seq = ? AND status IN ('queued', 'running')`,
+            ).run(recalledAt, execution.executionId, execution.attemptSeq);
+            const cancelledExecution = runtimeExecutionById(database, execution.executionId);
+            appendRuntimeExecutionEvent(
+              database,
+              cancelledExecution,
+              recalledAt,
+              "cancelled",
+              "message_recalled",
+            );
+            abortTargets.push({
+              sourceMessageId: input.command.messageId,
+              sourceRevision: input.command.expectedRevision,
+              invocationIntentId: execution.intentId,
+              executionId: execution.executionId,
+              attemptSeq: execution.attemptSeq,
+              cancellationReason: "message_recalled",
+              sideEffectState,
+            });
           }
         }
         const updated = database.prepare(

@@ -1129,8 +1129,20 @@ function isRecallReceipt(value: unknown): value is MessageRecallReceipt {
   ]) && isText(value.messageId) && Number.isSafeInteger(value.revision) &&
     Number(value.revision) > 0 && isIsoUtcTimestamp(value.recalledAt) &&
     isText(value.eventId) && typeof value.replayed === "boolean" &&
-    Array.isArray(value.abortTargets) && value.abortTargets.every(isText) &&
-    new Set(value.abortTargets).size === value.abortTargets.length;
+    Array.isArray(value.abortTargets) && value.abortTargets.length <= 256 &&
+    value.abortTargets.every((target) => isRecord(target) && hasExactKeys(target, [
+      "sourceMessageId", "sourceRevision", "invocationIntentId", "executionId",
+      "attemptSeq", "cancellationReason", "sideEffectState",
+    ]) && isText(target.sourceMessageId) &&
+      Number.isSafeInteger(target.sourceRevision) && Number(target.sourceRevision) > 0 &&
+      isText(target.invocationIntentId) && isText(target.executionId) &&
+      Number.isSafeInteger(target.attemptSeq) && Number(target.attemptSeq) > 0 &&
+      target.cancellationReason === "message_recalled" &&
+      (target.sideEffectState === "none" ||
+        target.sideEffectState === "dispatched-retained" ||
+        target.sideEffectState === "outcome-unknown-retained")) &&
+    new Set(value.abortTargets.map((target) => target.executionId)).size ===
+      value.abortTargets.length;
 }
 
 function isAgentMessageReceipt(value: unknown): value is AgentMessageCommitReceipt {
