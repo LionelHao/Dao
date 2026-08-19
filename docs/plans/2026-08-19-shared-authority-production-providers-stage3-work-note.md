@@ -1,13 +1,13 @@
 # Shared Authority Production Providers · 第三阶段工作记录
 
 > 日期：2026-08-19  
-> 状态：实施中；不是 FT、Blueprint 或阶段 verified 声明  
-> 集成分支：`codex/shared-authority-providers-stage3`  
-> 集成 worktree：`/Users/leo/code/Dao-stage3-integrator`
+> 状态：生产代码、CI 与依赖合入已完成；等待 owner 验收；不是 FT、Blueprint 或阶段 verified 声明
+> 原集成分支：`codex/shared-authority-providers-stage3`
+> 原集成 worktree：`/Users/leo/code/Dao-stage3-integrator`
 
 ## 1. 开工基线与工作区保护
 
-- 开工前执行 `git fetch origin --prune`；实际 predecessor 为 `origin/main@d012d7f79ff366f6583a0d7366288b8db9c71136`，与 Shared Contract Spine PR #32 的 squash merge commit 一致。
+- 开工前执行 `git fetch origin --prune`；任务起始 predecessor 为 `origin/main@d012d7f79ff366f6583a0d7366288b8db9c71136`，与 Shared Contract Spine PR #32 的 squash merge commit 一致。实现分支落地前，transaction database capability prerequisite PR #33 合入，后续生产切片全部基于当时最新 `origin/main@f1e2812492914f286c6ee143427739255ee0324e`；该 prerequisite 未改变 predecessor schema v13。
 - predecessor schema 为 v13；v13 checksum 为 `0d008e577b5514d5fd51fa65c9c31ef51e32e55e09483c8a2e3a707d6ca42e3e`，fingerprint 为 `037df6a2818f2a90b7394240a4cf71d77949faf31df6534c5546c9ed6b7e7191`。
 - 开工时开放 PR 为 0。基线测试口径为 59 文件 / 1010 测试；57 文件 / 1008 测试通过，2 文件 / 2 个 opt-in live smoke 跳过。
 - 原 `/Users/leo/code/Dao` 工作区仍在 `codex/ft02a-delivery-trace-fix@979863e`，含四个未跟踪 FT-09/FT-10 文档。本阶段不 clean、stash、reset、移动、覆盖或提交它们。
@@ -44,7 +44,7 @@
 | `room-cache-invalidation` | `dao.access.room-cache-invalidation.v1` | FT-13 owner；`access/room-cache-invalidation-port.ts` | durable replayable intent |
 | `offline-lease-invalidation` | `dao.access.offline-lease-invalidation.v1` | FT-13/14 owner；`access/offline-lease-invalidation-port.ts` | generation-bound lease/invalidation facts |
 
-本阶段唯一 schema/migration owner 为总集成 Agent。预计在真实 v13 predecessor 后分配单个 **v14** batch；若合入前 `origin/main` 前进，则重新编号。v1-v13 statement/checksum/fingerprint 不变。AuthorityWorker、handler/protocol、worker client、`authoritative-server.ts`、repair中央 assembly由总集成 Agent串行修改。
+本阶段唯一 schema/migration owner 为总集成 Agent。真实 v13 predecessor 后只追加单个 **v14** batch；v1-v13 statement/checksum/fingerprint 不变。v14 migration checksum 为 `a0236646cdbc9d018e120caf8ccde012433e0d32fb7a011c2b4a2be34404085d`，完整 schema fingerprint 为 `b4f1034ce034203fd14f5bc32391cb8855f7d6eed64c0b01f75d41e331a8b5c5`。AuthorityWorker、handler/protocol、worker client、`authoritative-server.ts`、repair中央 assembly由总集成 Agent串行修改。
 
 ## 4. 并行 ownership 与 shared-file 窗口
 
@@ -69,3 +69,22 @@
 7. 按可审计依赖拆 PR：`central-prerequisite` → `message/runtime/access providers` → `departure/tool/assignment/timer providers` → `final composition + delivery`。每个后继 PR 基于最新 main；CI 两组 quality checks通过后按序 squash merge。
 
 Public leave/remove/archive/reopen 在本阶段全部继续 fail closed；Provider注册不能自动开启旧 permissive command。
+
+## 6. 实际合入与验证记录
+
+| PR | 范围 | head | squash merge | 最终 CI |
+| --- | --- | --- | --- | --- |
+| [#34](https://github.com/LionelHao/Dao/pull/34) | transaction host；FT-03、FT-08、FT-13/14、lifecycle repair/access Wave 1 | `aa7c6ecd382c065f67dd8b89f225ccad2612bb4d` | `328fd81890800783cc96a17e801d39b39f73d93b` | Node 22.13.1 与 Node 22.x 两组 `quality` success |
+| [#35](https://github.com/LionelHao/Dao/pull/35) | FT-09、FT-10、FT-07 assignment/timer Wave 2；严格 persistence test scheduling | `2a130ff7cdda92078ce3fb9b935d5fae112c0be1` | `afa46413e9197d73de41d7d9eb9c001833e2efd4` | Node 22.13.1 与 Node 22.x 两组 `quality` success |
+| [#36](https://github.com/LionelHao/Dao/pull/36) | v14 central schema、10/10 composition、startup recovery、真实 cache purge、lease secret sentinel | `43db0b0c56112ffef59ab201aac62198ec982f0b` | `e6bf0b43d0ed3efe0f6fb20f4115869584c630d5` | Node 22.13.1 与 Node 22.x 两组 `quality` success |
+
+最终本地生产树运行结果：
+
+- `corepack pnpm typecheck`、`corepack pnpm lint`、`corepack pnpm build`、两项 boundary verification、`git diff --check` 全部通过。
+- 全量：72 个测试文件；70 passed、2 skipped、0 failed。1084 个测试；1082 passed、2 skipped、0 failed。
+- provider/registry/schema focused matrix：14 文件 / 123 测试通过。
+- historical v13 archived-room AuthorityWorker restart recovery：1 测试通过（同文件其余 49 项按过滤条件 skipped）。
+- runtime + offline lease secret sentinel：2 文件 / 7 测试通过。
+- PR #35 首轮暴露既有 schema/legacy SQLite Worker 测试在并行 runner 上触发 5 秒墙钟竞争；修复只把两个完整测试文件移入 single-fork persistence project，未修改测试、未减少覆盖、未扩大 5 秒 timeout。最终两个 Node 矩阵均通过。
+
+原 `/Users/leo/code/Dao` 的四个未跟踪 FT-09/FT-10 文档保持原样；本阶段全部 feature、integration 与 PR worktree 均无未提交修改。Blueprint、renderer 和 Desktop 可见状态均未修改；设计偏离：**无**。
