@@ -468,6 +468,86 @@ afterEach(async () => {
 });
 
 describe("AuthorityWorker closed protocol", () => {
+  it("closes Attachment Authority worker operations and safe result envelopes", () => {
+    const operation = {
+      kind: "upload-begin" as const,
+      context: {
+        kind: "human" as const,
+        sessionId: "attachment-session",
+        sessionFamilyId: "attachment-family",
+        principal: { accountId: "attachment-account", actorId: "attachment-actor" },
+      },
+      command: {
+        requestId: "attachment-request",
+        roomId: "attachment-room",
+        uploadKey: "attachment-upload-key",
+        originalFilename: "safe.txt",
+        declaredMime: "text/plain" as const,
+        expectedBytes: 4,
+        expectedSha256: "a".repeat(64),
+      },
+    };
+    expect(isAuthorityWorkerRequest({
+      type: "authority.attachment",
+      requestId: "worker-attachment-request",
+      operation,
+      now: 1_000,
+    })).toBe(true);
+    expect(isAuthorityWorkerRequest({
+      type: "authority.attachment",
+      requestId: "worker-attachment-forged",
+      operation: { ...operation, path: "/private/leak" },
+      now: 1_000,
+    })).toBe(false);
+    expect(isAuthorityWorkerResponse({
+      type: "authority.attachment-result",
+      requestId: "worker-attachment-request",
+      result: {
+        uploadId: "upload-1",
+        acknowledgedBytes: 0,
+        expectedBytes: 4,
+        status: "open",
+        replayed: false,
+      },
+    })).toBe(true);
+    expect(isAuthorityWorkerResponse({
+      type: "authority.attachment-result",
+      requestId: "worker-attachment-request",
+      result: {
+        uploadId: "upload-1",
+        acknowledgedBytes: 0,
+        expectedBytes: 4,
+        status: "open",
+        replayed: false,
+        rawBytes: "forged",
+      },
+    })).toBe(false);
+    expect(isAuthorityWorkerRequest({
+      type: "authority.attachment",
+      requestId: "worker-attachment-reconcile",
+      operation: {
+        kind: "object-references",
+        context: { kind: "attachment-worker", workerId: "object-reconciler" },
+      },
+      now: 1_000,
+    })).toBe(true);
+    const referenceResult = {
+      referencedUploadIds: ["00000000-0000-4000-8000-000000000001"],
+      referencedQuarantineAttachmentIds: ["00000000-0000-4000-8000-000000000101"],
+      referencedObjectKeys: [`object_${"a".repeat(64)}`],
+    };
+    expect(isAuthorityWorkerResponse({
+      type: "authority.attachment-result",
+      requestId: "worker-attachment-reconcile",
+      result: referenceResult,
+    })).toBe(true);
+    expect(isAuthorityWorkerResponse({
+      type: "authority.attachment-result",
+      requestId: "worker-attachment-reconcile-forged",
+      result: { ...referenceResult, rawBytes: "forged" },
+    })).toBe(false);
+  });
+
   it("rejects symbol and non-enumerable own keys in Message Authority requests", () => {
     const request = {
       type: "authority.message-submit" as const,

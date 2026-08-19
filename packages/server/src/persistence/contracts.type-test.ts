@@ -160,8 +160,11 @@ export type PublicClientCannotMarkOutboxFailed = Assert<
 export type SessionFamilyDeliveryCarriesOnlyRevocation = Assert<
   Exclude<SessionFamilyEventType, "identity.session.revoked"> extends never ? true : false
 >;
-export type PrincipalDeliveryCarriesOnlyRoomAccess = Assert<
-  Exclude<PrincipalEventType, "identity.room-access.changed"> extends never ? true : false
+export type PrincipalDeliveryCarriesOnlyPrivateAuthority = Assert<
+  Exclude<
+    PrincipalEventType,
+    "identity.room-access.changed" | "attachment.private.status-changed"
+  > extends never ? true : false
 >;
 export type MintedContextIsInternal = Assert<
   ReturnType<typeof mintInternalAgentCommandContext> extends InternalAgentCommandContext

@@ -15,6 +15,7 @@ export type AttachmentReadAuthorization = Readonly<{
 }>;
 
 export type AttachmentReadGrantContext = Readonly<{
+  sessionId: string;
   sessionFamilyId: string;
   principal: Readonly<{ accountId: string; actorId: string }>;
 }>;
@@ -67,8 +68,8 @@ function nonnegative(value: unknown): value is number {
 }
 
 function validateContext(value: AttachmentReadGrantContext): void {
-  if (!record(value) || !exact(value, ["sessionFamilyId", "principal"]) ||
-      !identifier(value.sessionFamilyId) || !record(value.principal) ||
+  if (!record(value) || !exact(value, ["sessionId", "sessionFamilyId", "principal"]) ||
+      !identifier(value.sessionId) || !identifier(value.sessionFamilyId) || !record(value.principal) ||
       !exact(value.principal, ["accountId", "actorId"]) ||
       !identifier(value.principal.accountId) || !identifier(value.principal.actorId)) {
     throw new TypeError("Attachment read grant context is invalid");
@@ -100,7 +101,7 @@ function validateAuthorization(value: AttachmentReadAuthorization): void {
 }
 
 function sameContext(left: AttachmentReadGrantContext, right: AttachmentReadGrantContext): boolean {
-  return left.sessionFamilyId === right.sessionFamilyId &&
+  return left.sessionId === right.sessionId && left.sessionFamilyId === right.sessionFamilyId &&
     left.principal.accountId === right.principal.accountId &&
     left.principal.actorId === right.principal.actorId;
 }
@@ -202,6 +203,7 @@ export function createAttachmentReadGrantRegistry(options: {
       grants.set(streamId, {
         streamId,
         context: Object.freeze({
+          sessionId: context.sessionId,
           sessionFamilyId: context.sessionFamilyId,
           principal: Object.freeze({ ...context.principal }),
         }),

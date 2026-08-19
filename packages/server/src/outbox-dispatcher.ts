@@ -1,4 +1,4 @@
-import { isMessage } from "@native-im/core";
+import { isAttachmentPrivateEvent, isMessage, type AttachmentPrivateEvent } from "@native-im/core";
 import type {
   OutboxDelivery,
   OutboxDeliveryFailureReason,
@@ -17,6 +17,7 @@ export type OutboxDispatchFrame =
   | MessageCreatedFrame
   | RoomEventFrame
   | IdentityRoomAccessChangedFrame
+  | AttachmentPrivateEvent
   | AuthSessionRevokedFrame;
 
 export type OutboxSendResult =
@@ -62,8 +63,15 @@ function dispatchFrame(delivery: OutboxDelivery): OutboxDispatchFrame {
     return { type: "room.event", event: delivery.event };
   }
   if (delivery.targetKind === "principal") {
+    if (delivery.event.type === "attachment.private.status-changed") {
+      const event = { ...delivery.event, streamKind: "principal" };
+      if (!isAttachmentPrivateEvent(event)) {
+        throw new TypeError("Principal attachment delivery is invalid");
+      }
+      return event;
+    }
     if (delivery.event.type !== "identity.room-access.changed") {
-      throw new TypeError("Principal delivery must carry a room-access identity event");
+      throw new TypeError("Principal delivery must carry a private identity event");
     }
     return delivery.event;
   }

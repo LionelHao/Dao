@@ -91,6 +91,35 @@ const principalEvent: PersistedIdentityEvent = {
   payload: { roomId: "room-1", change: "removed" },
 };
 
+const attachmentPrincipalEvent: PersistedIdentityEvent = {
+  eventId: "event-attachment-private-1",
+  streamKind: "identity",
+  streamId: "human-author",
+  streamSeq: 4,
+  actorId: "human-author",
+  occurredAt: "2026-08-19T00:00:01.000Z",
+  type: "attachment.private.status-changed",
+  payload: {
+    attachment: {
+      attachmentId: "attachment-1",
+      roomId: "room-1",
+      originalFilename: "safe.txt",
+      format: "txt",
+      declaredMime: "text/plain",
+      detectedMime: "text/plain",
+      byteSize: 5,
+      sha256: "a".repeat(64),
+      uploaderActorId: "human-author",
+      createdAt: "2026-08-19T00:00:00.000Z",
+      readyAt: null,
+      processingStatus: "accepted-quarantined",
+      generation: 1,
+      sourceMessageId: null,
+      provenance: null,
+    },
+  },
+};
+
 const revokedEvent: PersistedIdentityEvent = {
   eventId: "event-revoked-1",
   streamKind: "identity",
@@ -201,6 +230,28 @@ class MemoryOutboxStore implements OutboxDispatchStore {
 }
 
 describe("OutboxDispatcher", () => {
+  it("converts internal identity attachment status into a private principal frame", async () => {
+    const registry = createSubscriptionRegistry();
+    const uploader = connection("attachment-uploader", "human-author");
+    registry.addPrincipal({ principalId: "human-author", connection: uploader });
+    const item = delivery(
+      "delivery-attachment-private",
+      "principal",
+      "human-author",
+      attachmentPrincipalEvent,
+    );
+    const store = new MemoryOutboxStore([item], () => true);
+    const send = vi.fn(async () => ({ accepted: true as const }));
+    const dispatcher = createOutboxDispatcher({ store, registry, send });
+
+    await expect(dispatcher.flushOnce()).resolves.toBe(1);
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({ connectionId: uploader.connectionId }),
+      { ...attachmentPrincipalEvent, streamKind: "principal" },
+      item,
+    );
+  });
+
   it("dispatches Message Authority events without downgrading them to legacy message.created", async () => {
     const registry = createSubscriptionRegistry();
     const member = connection("message-v2-member", "human-member");

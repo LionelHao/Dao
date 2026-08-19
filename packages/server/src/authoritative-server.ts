@@ -1,4 +1,5 @@
-import type { Actor } from "@native-im/core";
+import { randomUUID } from "node:crypto";
+import { ATTACHMENT_AUTHORITY_LIMITS, type Actor } from "@native-im/core";
 import { isDeepStrictEqual } from "node:util";
 import { mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -45,6 +46,22 @@ import {
   createSourceScopedRuntimeBoundary,
   type SourceScopedRuntimeBoundary,
 } from "./message-authority/runtime/source-scoped-runtime-coordinator.js";
+import { AttachmentObjectStore } from "./attachment-authority/object-store.js";
+import { reconcileAttachmentObjectStore } from "./attachment-authority/object-reconciliation.js";
+import {
+  createAttachmentAuthorityService,
+  type AttachmentAuthorityCommandPort,
+} from "./attachment-authority/authority-service.js";
+import {
+  createAttachmentProcessingRuntime,
+  type AttachmentProcessingRuntime,
+} from "./attachment-authority/processing-runtime.js";
+import { createProductionAttachmentProcessingPipeline } from "./attachment-authority/processing-pipeline.js";
+import {
+  probeProductionAttachmentCapabilities,
+  type ProductionClamdPolicy,
+} from "./attachment-authority/production-capabilities.js";
+import type { ClamdEndpoint } from "./attachment-authority/clamd-scanner.js";
 
 export { createProductionSharedAuthorityParticipantComposition } from "./room-governance/production-participant-composition.js";
 
@@ -88,6 +105,22 @@ export interface StartAuthoritativeServerOptions {
     readonly lightTaskDeadlineMs?: number;
     readonly scanIntervalMs?: number;
   };
+  readonly attachmentRuntime?: {
+    readonly storageRoot: string;
+    readonly cwd: string;
+    readonly ocrLanguage: string;
+    readonly capabilityProbeTimeoutMs: number;
+    readonly clamd: Readonly<{
+      endpoint: ClamdEndpoint;
+      databaseSha256: string;
+      databaseUpdatedAt: string;
+      policy: ProductionClamdPolicy;
+    }>;
+    readonly pdfinfo: Readonly<{ executable: string; argvPrefix?: readonly string[] }>;
+    readonly pdftotext: Readonly<{ executable: string; argvPrefix?: readonly string[] }>;
+    readonly pdftoppm: Readonly<{ executable: string; argvPrefix?: readonly string[] }>;
+    readonly tesseract: Readonly<{ executable: string; argvPrefix?: readonly string[] }>;
+  };
 }
 
 interface AuthoritativeServerTestOptions {
@@ -100,7 +133,17 @@ interface AuthoritativeServerTestOptions {
   readonly snapshotMaxRecordsPerPage?: number;
   readonly initialize?: (facades: AuthoritativeServerTestFacades) => Promise<void>;
   readonly registerMissingActors?: false;
-  readonly afterCloseForTest?: Partial<Record<"transport" | "route" | "runtime" | "ball" | "snapshots" | "worker", () => void>>;
+  readonly afterCloseForTest?: Partial<Record<
+    | "transport"
+    | "attachment-authority"
+    | "attachment-processing"
+    | "route"
+    | "runtime"
+    | "ball"
+    | "snapshots"
+    | "worker",
+    () => void
+  >>;
   readonly blueprintBallProjectionPort?: BlueprintBallProjectionPort;
   readonly agentRuntimeProviderForTest?: ProviderAdapter;
 }
@@ -159,6 +202,9 @@ async function start(
   let ballRuntime: BallRuntimeService | undefined;
   let humanPreemptionRuntime: HumanPreemptionRuntime | undefined;
   let stopCacheInvalidationRecovery: (() => void) | undefined;
+  let attachmentAuthority: AttachmentAuthorityCommandPort | undefined;
+  let attachmentProcessing: AttachmentProcessingRuntime | undefined;
+  let stopAttachmentRecovery: (() => void) | undefined;
   try {
     worker = transactionFault === undefined
       ? await createWorkerDatabaseClient({
@@ -539,6 +585,102 @@ async function start(
       readMessageHistory: authority.readMessageHistory,
       readMessageRevisions: authority.readMessageRevisions,
     } satisfies NonNullable<Parameters<typeof startMessageWebSocketServer>[0]["messageAuthority"]>;
+    const attachmentConfiguration = options.attachmentRuntime;
+    if (attachmentConfiguration !== undefined) {
+      const capabilities = await probeProductionAttachmentCapabilities({
+        cwd: attachmentConfiguration.cwd,
+        timeoutMs: attachmentConfiguration.capabilityProbeTimeoutMs,
+        clamd: attachmentConfiguration.clamd,
+        poppler: {
+          executable: attachmentConfiguration.pdfinfo.executable,
+          argv: [...(attachmentConfiguration.pdfinfo.argvPrefix ?? []), "-v"],
+        },
+        tesseract: {
+          executable: attachmentConfiguration.tesseract.executable,
+          argv: [...(attachmentConfiguration.tesseract.argvPrefix ?? []), "--version"],
+        },
+      });
+      if (capabilities.attachmentReadiness === "ready" &&
+          capabilities.scanner.version !== null && capabilities.poppler.version !== null &&
+          capabilities.tesseract.version !== null) {
+        const objectStore = new AttachmentObjectStore({
+          root: attachmentConfiguration.storageRoot,
+          limits: {
+            maxChunkBytes: ATTACHMENT_AUTHORITY_LIMITS.maxChunkBytes,
+            maxFileBytes: ATTACHMENT_AUTHORITY_LIMITS.maxFileBytes,
+            maxExtractionBytes: ATTACHMENT_AUTHORITY_LIMITS.maxExtractionArtifactBytes,
+            reconcileMaxEntries: 1_024,
+            reconcileMaxBytes: 512 * 1_024 * 1_024,
+          },
+        });
+        await objectStore.initialize();
+        await reconcileAttachmentObjectStore({
+          database: worker,
+          objectStore,
+          nowMs: Date.now,
+          maxPasses: 64,
+        });
+        const tools = Object.freeze({
+          cwd: attachmentConfiguration.cwd,
+          extractTimeoutMs: 60_000,
+          ocrTimeoutMs: 180_000,
+          ocrLanguage: attachmentConfiguration.ocrLanguage,
+          pdfinfo: Object.freeze({
+            executable: attachmentConfiguration.pdfinfo.executable,
+            argvPrefix: Object.freeze([...(attachmentConfiguration.pdfinfo.argvPrefix ?? [])]),
+            version: capabilities.poppler.version,
+          }),
+          pdftotext: Object.freeze({
+            executable: attachmentConfiguration.pdftotext.executable,
+            argvPrefix: Object.freeze([...(attachmentConfiguration.pdftotext.argvPrefix ?? [])]),
+            version: capabilities.poppler.version,
+          }),
+          pdftoppm: Object.freeze({
+            executable: attachmentConfiguration.pdftoppm.executable,
+            argvPrefix: Object.freeze([...(attachmentConfiguration.pdftoppm.argvPrefix ?? [])]),
+            version: capabilities.poppler.version,
+          }),
+          tesseract: Object.freeze({
+            executable: attachmentConfiguration.tesseract.executable,
+            argvPrefix: Object.freeze([...(attachmentConfiguration.tesseract.argvPrefix ?? [])]),
+            version: capabilities.tesseract.version,
+          }),
+        });
+        attachmentProcessing = createAttachmentProcessingRuntime({
+          database: worker,
+          objectStore,
+          tools,
+          scanner: {
+            name: "clamav",
+            version: capabilities.scanner.version,
+            timeoutMs: attachmentConfiguration.clamd.policy.scanTimeoutMs,
+          },
+          nowMs: Date.now,
+          createPipeline: (generation) => createProductionAttachmentProcessingPipeline({
+            clamd: {
+              endpoint: attachmentConfiguration.clamd.endpoint,
+              timeoutMs: attachmentConfiguration.clamd.policy.scanTimeoutMs,
+              version: capabilities.scanner.version!,
+            },
+            generation,
+            tools,
+          }),
+        });
+        await attachmentProcessing.recover();
+        const recoveryTimer = setInterval(() => {
+          void attachmentProcessing?.recover().catch(() => undefined);
+        }, 5_000);
+        recoveryTimer.unref();
+        stopAttachmentRecovery = () => clearInterval(recoveryTimer);
+        attachmentAuthority = createAttachmentAuthorityService({
+          database: worker,
+          objectStore,
+          processor: attachmentProcessing,
+          nowMs: Date.now,
+          nextGrantId: randomUUID,
+        });
+      }
+    }
     transport = await startMessageWebSocketServer({
       auth,
       service,
@@ -551,11 +693,15 @@ async function start(
       collaboration: primitives,
       ballRuntime,
       messageAuthority,
+      ...(attachmentAuthority === undefined ? {} : { attachmentAuthority }),
       governance: governanceStore,
     });
   } catch (error: unknown) {
     stopCacheInvalidationRecovery?.();
+    stopAttachmentRecovery?.();
     await transport?.close().catch(() => undefined);
+    attachmentAuthority?.close();
+    await attachmentProcessing?.close().catch(() => undefined);
     await routeRuntime?.close().catch(() => undefined);
     await ballRuntime?.close().catch(() => undefined);
     await runtime?.close().catch(() => undefined);
@@ -570,9 +716,12 @@ async function start(
     close() {
       closePromise ??= (async () => {
         stopCacheInvalidationRecovery?.();
+        stopAttachmentRecovery?.();
         const failures: unknown[] = [];
         for (const [stage, close] of [
           ["transport", () => transport.close()],
+          ["attachment-authority", async () => attachmentAuthority?.close()],
+          ["attachment-processing", async () => attachmentProcessing?.close()],
           ["route", () => routeRuntime!.close()],
           ["runtime", () => runtime!.close()],
           ["ball", () => ballRuntime!.close()],

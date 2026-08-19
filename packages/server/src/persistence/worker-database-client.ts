@@ -75,6 +75,10 @@ import type {
   CommittedRoomCacheInvalidationIntent,
   RoomCacheInvalidationIntentAuthority,
 } from "../access/room-cache-invalidation-port.js";
+import type {
+  AttachmentDatabaseOperation,
+  AttachmentDatabaseOperationResult,
+} from "../attachment-authority/database-contracts.js";
 import {
   ROOM_SYNC_DEFAULT_LIMIT,
   toAgentWorkerCommandContext,
@@ -94,6 +98,10 @@ export interface AuthoritySchemaInspection {
 
 export interface WorkerDatabaseClient {
   inspectSchema(): Promise<AuthoritySchemaInspection>;
+  executeAttachment(
+    operation: AttachmentDatabaseOperation,
+    now: number,
+  ): Promise<AttachmentDatabaseOperationResult>;
   importLegacyState(paths: LegacyImportPaths): Promise<LegacyImportResult>;
   inspectLegacyImport(): Promise<LegacyImportInspection>;
   registerActors(actors: readonly Actor[]): Promise<number>;
@@ -310,17 +318,19 @@ export type AuthorityWorkerClientErrorCode =
 
 function authorityWorkerClientErrorStatus(
   code: AuthorityWorkerClientErrorCode,
-): 400 | 401 | 403 | 404 | 409 | 410 | 429 | 503 {
+): 400 | 401 | 403 | 404 | 409 | 410 | 413 | 415 | 422 | 429 | 503 {
   switch (code) {
     case "agent_permissions_invalid":
     case "agent_required":
     case "calibration_source_invalid":
     case "invalid_parameters":
     case "invalid_request":
+    case "invalid_chunk":
     case "invitee_required":
       return 400;
     case "invalid_token":
     case "token_expired":
+    case "unauthenticated":
       return 401;
     case "agent_missing_permission":
     case "confirmation_forbidden":
@@ -328,6 +338,7 @@ function authorityWorkerClientErrorStatus(
     case "identity_forbidden":
     case "invitation_forbidden":
     case "room_forbidden":
+    case "attachment_forbidden":
     case "session_revoked":
     case "snapshot_family_revoked":
       return 403;
@@ -352,6 +363,10 @@ function authorityWorkerClientErrorStatus(
     case "session_limit_reached":
     case "execution_not_running":
     case "idempotency_conflict":
+    case "attachment_already_bound":
+    case "generation_conflict":
+    case "attachment_not_ready":
+    case "upload_offset_conflict":
     case "agent_final_immutable":
     case "message_version_conflict":
     case "invitation_consumed":
@@ -374,10 +389,27 @@ function authorityWorkerClientErrorStatus(
     case "snapshot_expired":
     case "confirmation_expired":
     case "protocol_upgrade_required":
+    case "upload_expired":
+    case "attachment_gone":
       return 410;
+    case "attachment_too_large":
+    case "chunk_too_large":
+      return 413;
+    case "attachment_type_unsupported":
+    case "type_mismatch":
+      return 415;
+    case "attachment_malformed":
+    case "encrypted_pdf":
+    case "archive_bomb":
+    case "image_bomb":
+      return 422;
     case "snapshot_busy":
     case "agent_queue_full":
+    case "attachment_capacity_limited":
       return 429;
+    case "scanner_unavailable":
+    case "extractor_unavailable":
+    case "ocr_unavailable":
     case "authority_not_initialized":
     case "authority_worker_closed":
     case "authority_worker_error":
@@ -841,6 +873,22 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
         throw this.#terminalError;
       }
       return { version: response.schemaVersion };
+    });
+  }
+
+  executeAttachment(
+    operation: AttachmentDatabaseOperation,
+    now: number,
+  ): Promise<AttachmentDatabaseOperationResult> {
+    if (this.#terminalError !== undefined) return this.#rejectTerminal();
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) return Promise.reject(unavailable);
+    return this.#send({ type: "authority.attachment", operation, now }).then((response) => {
+      if (response.type !== "authority.attachment-result") {
+        this.#failProtocol("Authority worker returned the wrong attachment response");
+        throw this.#terminalError;
+      }
+      return response.result;
     });
   }
 
@@ -1850,6 +1898,8 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
         responseType === "authority.departure-conflicts") ||
       (requestType === "authority.execute-agent" &&
         responseType === "authority.command-acknowledged") ||
+      (requestType === "authority.attachment" &&
+        responseType === "authority.attachment-result") ||
       (requestType === "authority.message-submit" &&
         responseType === "authority.message-submitted") ||
       (requestType === "authority.message-revise" &&

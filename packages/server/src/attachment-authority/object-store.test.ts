@@ -99,6 +99,7 @@ describe("AttachmentObjectStore", () => {
       byteLength: whole.byteLength,
       sha256: digest(whole),
     });
+    expect(await store.readQuarantineForProcessing(attachmentId)).toEqual(whole);
 
     const published = await store.publishCleanObject({ attachmentId });
     expect(published.objectKey).toMatch(/^object_[a-f0-9]{64}$/u);
@@ -171,6 +172,32 @@ describe("AttachmentObjectStore", () => {
     await expect(store.publishCleanObject({ attachmentId })).rejects.toMatchObject({
       reason: "quarantine_missing",
     });
+  });
+
+  it("retains quarantine through the cross-resource READY commit window", async () => {
+    const storeRoot = await root();
+    const store = new AttachmentObjectStore({ root: storeRoot, limits });
+    await store.initialize();
+    const uploadId = randomUUID();
+    const attachmentId = randomUUID();
+    const bytes = Buffer.from("crash-safe publication");
+    const sha256 = digest(bytes);
+    await store.writeChunk({ uploadId, ordinal: 0, bytes, sha256 });
+    await store.assembleQuarantine({
+      uploadId,
+      attachmentId,
+      chunkCount: 1,
+      expectedBytes: bytes.byteLength,
+      expectedSha256: sha256,
+    });
+    const published = await store.publishCleanObject({ attachmentId, retainQuarantine: true });
+    await expect(store.readQuarantineForProcessing(attachmentId)).resolves.toEqual(bytes);
+    await expect(store.readForAuthorizedOperation(published.objectKey)).resolves.toEqual(bytes);
+    await store.discardQuarantine(attachmentId);
+    await expect(store.readQuarantineForProcessing(attachmentId)).rejects.toMatchObject({
+      reason: "quarantine_missing",
+    });
+    await expect(store.readForAuthorizedOperation(published.objectKey)).resolves.toEqual(bytes);
   });
 
   it("rejects a symlink root and creates private directories and files", async () => {

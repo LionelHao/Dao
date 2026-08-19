@@ -68,7 +68,7 @@ const SCHEMA_FINGERPRINTS = {
   14: "b4f1034ce034203fd14f5bc32391cb8855f7d6eed64c0b01f75d41e331a8b5c5",
   15: "e8010dc3c03c71d51f20ef4054a815d3580abdcbd0762791508226a68918b426",
   16: "86a3512dcb625bc3e0f3d79e5a5d6542819523bee8ac851990148bcad8e38737",
-  17: "8f2d032e4c62f54882fbfc51a950da5b8b1e8d7318736deccc6bd63cbb6359e8",
+  17: "cc4b260ec841765f0349040a238a44281aa3ed9a792623ebd6540fd3e9f6b0b0",
 } as const;
 
 const V1_STATEMENTS = [
@@ -2829,7 +2829,7 @@ const V17_STATEMENTS = [
       AND instr(quarantine_object_key, char(92)) = 0
       AND instr(quarantine_object_key, '..') = 0
     ),
-    object_key TEXT UNIQUE CHECK (
+    object_key TEXT CHECK (
       object_key IS NULL OR (
         length(object_key) BETWEEN 1 AND 200
         AND instr(object_key, '/') = 0
@@ -3177,7 +3177,7 @@ const V17_STATEMENTS = [
     ),
     tool_name TEXT NOT NULL CHECK (length(trim(tool_name)) BETWEEN 1 AND 128),
     tool_version TEXT NOT NULL CHECK (length(trim(tool_version)) BETWEEN 1 AND 128),
-    object_key TEXT NOT NULL UNIQUE CHECK (
+    object_key TEXT NOT NULL CHECK (
       length(object_key) BETWEEN 1 AND 200
       AND instr(object_key, '/') = 0
       AND instr(object_key, char(92)) = 0

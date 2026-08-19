@@ -100,6 +100,11 @@ import {
   requireMessageMutationAllowedInTransaction,
 } from "../message-authority/archived-message-gate.js";
 import {
+  AttachmentAuthorityDatabaseError,
+  bindAttachmentToMessageInTransaction,
+} from "../attachment-authority/database-authority.js";
+import type { AttachmentAuthorityIdFactory } from "../attachment-authority/database-contracts.js";
+import {
   readOperationalMessageAuthorityEvent,
   readOperationalTimelineMessage,
 } from
@@ -1131,6 +1136,46 @@ function messageEventMatchesCurrentProjection(
     authority.recalledAt === row.occurredAt;
 }
 
+function attachmentEventMatchesCurrentProjection(
+  database: DatabaseSync,
+  row: Record<string, unknown>,
+): boolean {
+  if (row.eventType !== "room.attachment.bound" &&
+      row.eventType !== "room.attachment.excluded") return true;
+  if (typeof row.payloadJson !== "string") return false;
+  let payload: unknown;
+  try {
+    payload = JSON.parse(row.payloadJson) as unknown;
+  } catch {
+    return false;
+  }
+  if (!isRecord(payload)) return false;
+  const attachmentId = row.eventType === "room.attachment.bound" && isRecord(payload.attachment)
+    ? payload.attachment.attachmentId
+    : payload.attachmentId;
+  const messageId = row.eventType === "room.attachment.bound" && isRecord(payload.attachment)
+    ? payload.attachment.sourceMessageId
+    : payload.sourceMessageId;
+  if (typeof attachmentId !== "string" || typeof messageId !== "string") return false;
+  const expected = row.eventType === "room.attachment.bound" ? "active" : "excluded_recalled";
+  return database.prepare(`
+    SELECT 1 AS current
+    FROM message_attachment_links AS link
+    JOIN attachments AS attachment ON attachment.attachment_id = link.attachment_id
+    JOIN message_envelopes AS envelope ON envelope.message_id = link.message_id
+    WHERE link.attachment_id = ? AND link.message_id = ?
+      AND link.operational_state = ?
+      AND attachment.source_operational_state = ?
+      AND envelope.lifecycle = ?
+  `).get(
+    attachmentId,
+    messageId,
+    expected,
+    expected === "active" ? "bound-active" : "excluded-recalled",
+    expected === "active" ? "active" : "recalled",
+  )?.current === 1;
+}
+
 function parseRoomSyncEvent(
   database: DatabaseSync,
   row: Record<string, unknown>,
@@ -1597,6 +1642,12 @@ function isRoomAccessChangedEvent(
   return event.type === "identity.room-access.changed";
 }
 
+function isAttachmentPrivateStatusEvent(
+  event: PersistedIdentityEvent,
+): event is PersistedIdentityEvent & { readonly type: "attachment.private.status-changed" } {
+  return event.type === "attachment.private.status-changed";
+}
+
 export function listPendingOutboxDatabaseQuery(
   database: DatabaseSync,
   limit: number,
@@ -1667,7 +1718,7 @@ export function listPendingOutboxDatabaseQuery(
     if (
       row.targetKind === "principal" &&
       event.streamKind === "identity" &&
-      isRoomAccessChangedEvent(event) &&
+      (isRoomAccessChangedEvent(event) || isAttachmentPrivateStatusEvent(event)) &&
       event.streamId === row.targetId
     ) {
       return {
@@ -1728,6 +1779,10 @@ export function authorizeOutboxCandidateDatabaseQuery(
       !messageEventMatchesCurrentProjection(
         database, delivery, messageId, delivery.targetId,
       )) {
+    return false;
+  }
+  if (delivery.targetKind === "room" &&
+      !attachmentEventMatchesCurrentProjection(database, delivery)) {
     return false;
   }
   if (delivery.targetKind === "session-family") {
@@ -7202,6 +7257,7 @@ export type MessageAuthoritySubmitFaultPointForTest =
   | "after-outcome"
   | "after-event"
   | "after-outbox"
+  | "after-attachment"
   | "after-receipt";
 
 type StoredMessageAuthorityReceipt =
@@ -7442,12 +7498,6 @@ export function submitHumanMessageDatabaseCommand(
     if (!isHumanMessageSubmit(input.message)) {
       return fail("invalid_parameters", "Structured Human message was rejected");
     }
-    if (input.message.attachments.length !== 0) {
-      return fail(
-        "invalid_parameters",
-        "Message attachments require the FT-04 authority validator",
-      );
-    }
     const actorId = requireHumanSession(database, input.context, input.now);
     requireCurrentHumanRoomMembership(database, actorId, input.message.roomId);
     requireMessageMutationAllowed(
@@ -7657,6 +7707,61 @@ export function submitHumanMessageDatabaseCommand(
           input.message.messageId,
         );
         input.onFaultPointForTest?.("after-outbox");
+        const attachmentIds: AttachmentAuthorityIdFactory = {
+          nextUploadId() {
+            throw new Error("Message attachment binding cannot allocate uploads");
+          },
+          attachmentIdForUpload() {
+            throw new Error("Message attachment binding cannot allocate artifacts");
+          },
+          nextEventId(purpose, aggregateId) {
+            return stableId(
+              "message-attachment-event",
+              scope,
+              input.message.messageId,
+              purpose,
+              aggregateId,
+            );
+          },
+          nextOutboxId(boundEventId, targetKind, targetId) {
+            return stableId(
+              "message-attachment-outbox",
+              scope,
+              boundEventId,
+              targetKind,
+              targetId,
+            );
+          },
+          nextExtractionArtifactId() {
+            throw new Error("Message attachment binding cannot allocate extraction artifacts");
+          },
+        };
+        for (const attachment of input.message.attachments) {
+          try {
+            bindAttachmentToMessageInTransaction(database, {
+              context: {
+                kind: "human",
+                sessionId: input.context.sessionId,
+                sessionFamilyId: input.context.sessionFamilyId,
+                principal: input.context.principal,
+              },
+              command: {
+                requestId: input.context.requestId,
+                roomId: input.message.roomId,
+                messageId: input.message.messageId,
+                attachmentId: attachment.attachmentId,
+              },
+              clock: { nowMs: () => input.now },
+              ids: attachmentIds,
+            });
+          } catch (error: unknown) {
+            if (error instanceof AttachmentAuthorityDatabaseError) {
+              return fail(error.code, error.message);
+            }
+            throw error;
+          }
+          input.onFaultPointForTest?.("after-attachment");
+        }
         return {
           messageId: input.message.messageId,
           persistedAt,
@@ -7944,6 +8049,20 @@ export function recallHumanMessageDatabaseCommand(
             });
           }
         }
+        const linkedAttachments = database.prepare(`
+          SELECT link.attachment_id AS attachmentId,
+                 attachment.processing_generation AS generation
+          FROM message_attachment_links AS link
+          JOIN attachments AS attachment ON attachment.attachment_id = link.attachment_id
+          WHERE link.message_id = ? AND link.operational_state = 'active'
+          ORDER BY link.attachment_id
+        `).all(input.command.messageId);
+        for (const attachment of linkedAttachments) {
+          if (typeof attachment.attachmentId !== "string" ||
+              typeof attachment.generation !== "number") {
+            return fail("storage_unavailable", "Message attachment lineage is corrupt");
+          }
+        }
         const updated = database.prepare(
           `UPDATE message_envelopes
            SET lifecycle = 'recalled', recalled_at = ?, recalled_by_actor_id = ?
@@ -7991,6 +8110,39 @@ export function recallHumanMessageDatabaseCommand(
           database, eventId, input.command.roomId, streamSeq, recalledAt,
           scope, businessKey,
         );
+        for (const attachment of linkedAttachments) {
+          const attachmentId = attachment.attachmentId as string;
+          const attachmentEventId = stableId(
+            "message-attachment-excluded-event",
+            input.command.roomId,
+            input.command.messageId,
+            attachmentId,
+            String(input.command.expectedRevision),
+          );
+          const attachmentStreamSeq = appendRoomEvent(database, {
+            eventId: attachmentEventId,
+            roomId: input.command.roomId,
+            actorId,
+            eventType: "room.attachment.excluded",
+            occurredAt: recalledAt,
+            payload: {
+              attachmentId,
+              sourceMessageId: input.command.messageId,
+              generation: attachment.generation as number,
+              sourceEligibility: "excluded-recalled",
+              reason: "message-recalled",
+            },
+          });
+          appendRoomOutbox(
+            database,
+            attachmentEventId,
+            input.command.roomId,
+            attachmentStreamSeq,
+            recalledAt,
+            `${scope}:attachment-excluded`,
+            `${businessKey}:${attachmentId}`,
+          );
+        }
         return {
           messageId: input.command.messageId,
           revision: input.command.expectedRevision,

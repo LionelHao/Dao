@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { parentPort, workerData } from "node:worker_threads";
 import { isRoomGovernanceView, type DepartureConflictList } from "@native-im/core";
@@ -77,6 +77,31 @@ import { assignmentSecurityReductionParticipantRegistration } from "../room-assi
 import { roomCacheInvalidationRegistration } from "../access/room-cache-invalidation-port.js";
 import { createOfflineLeaseInvalidationRegistration } from "../access/offline-lease-invalidation-port.js";
 import { createProductionSharedAuthorityParticipantComposition } from "../room-governance/production-participant-composition.js";
+import {
+  AttachmentAuthorityDatabaseError,
+  authorizeAgentAttachmentExtractionDatabaseQuery,
+  authorizeAttachmentAccessDatabaseQuery,
+  beginAttachmentUploadInTransaction,
+  cancelAttachmentUploadInTransaction,
+  claimAttachmentProcessingAttemptInTransaction,
+  completeAttachmentProcessingAttemptInTransaction,
+  finalizeAttachmentUploadInTransaction,
+  markAttachmentReadyInTransaction,
+  listRecoverableAttachmentProcessingDatabaseQuery,
+  readAttachmentObjectReferencesDatabaseQuery,
+  readAttachmentProcessingPlanDatabaseQuery,
+  readAttachmentStatusDatabaseQuery,
+  readAttachmentUploadAssemblyPlanDatabaseQuery,
+  recordAttachmentChunkInTransaction,
+  retryAttachmentProcessingInTransaction,
+  runAttachmentAuthorityImmediateTransaction,
+  startAttachmentProcessingAttemptInTransaction,
+} from "../attachment-authority/database-authority.js";
+import type {
+  AttachmentAuthorityIdFactory,
+  AttachmentDatabaseOperation,
+  AttachmentDatabaseOperationResult,
+} from "../attachment-authority/database-contracts.js";
 
 interface AuthorityWorkerData {
   readonly databasePath: string;
@@ -1913,6 +1938,157 @@ function requireNoMessageRepairBarrier(roomId: string, now: number): void {
   }
 }
 
+function deterministicAttachmentId(uploadId: string): string {
+  const bytes = createHash("sha256").update("dao-attachment\0").update(uploadId).digest().subarray(0, 16);
+  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+const attachmentAuthorityIds: AttachmentAuthorityIdFactory = Object.freeze({
+  nextUploadId: () => randomUUID(),
+  attachmentIdForUpload: deterministicAttachmentId,
+  nextEventId: () => randomUUID(),
+  nextOutboxId: () => randomUUID(),
+  nextExtractionArtifactId: () => randomUUID(),
+});
+
+function executeAttachmentDatabaseOperation(
+  operation: AttachmentDatabaseOperation,
+  now: number,
+): AttachmentDatabaseOperationResult {
+  const database = requireAuthorityTransactionDatabase();
+  const clock = { nowMs: () => now } as const;
+  switch (operation.kind) {
+    case "upload-begin":
+      return runAttachmentAuthorityImmediateTransaction(database, () =>
+        beginAttachmentUploadInTransaction(database, {
+          context: operation.context,
+          command: operation.command,
+          clock,
+          ids: attachmentAuthorityIds,
+        }));
+    case "upload-chunk":
+      return runAttachmentAuthorityImmediateTransaction(database, () =>
+        recordAttachmentChunkInTransaction(database, {
+          context: operation.context,
+          command: operation.command,
+          clock,
+        }));
+    case "upload-plan":
+      return readAttachmentUploadAssemblyPlanDatabaseQuery(database, {
+        context: operation.context,
+        uploadId: operation.uploadId,
+        clock,
+        ids: attachmentAuthorityIds,
+      });
+    case "upload-finalize":
+      return runAttachmentAuthorityImmediateTransaction(database, () =>
+        finalizeAttachmentUploadInTransaction(database, {
+          context: operation.context,
+          command: operation.command,
+          clock,
+          ids: attachmentAuthorityIds,
+        }));
+    case "upload-cancel":
+      return runAttachmentAuthorityImmediateTransaction(database, () =>
+        cancelAttachmentUploadInTransaction(database, {
+          context: operation.context,
+          command: operation.command,
+          clock,
+          ids: attachmentAuthorityIds,
+        }));
+    case "processing-retry":
+      return runAttachmentAuthorityImmediateTransaction(database, () =>
+        retryAttachmentProcessingInTransaction(database, {
+          context: operation.context,
+          command: operation.command,
+          clock,
+          ids: attachmentAuthorityIds,
+        }));
+    case "processing-inspect":
+      return readAttachmentProcessingPlanDatabaseQuery(database, {
+        context: operation.context,
+        attachmentId: operation.attachmentId,
+        expectedGeneration: operation.expectedGeneration,
+      });
+    case "processing-recover":
+      return listRecoverableAttachmentProcessingDatabaseQuery(database, {
+        context: operation.context,
+        limit: operation.limit,
+      });
+    case "object-references":
+      return readAttachmentObjectReferencesDatabaseQuery(database, {
+        context: operation.context,
+      });
+    case "processing-claim":
+      return runAttachmentAuthorityImmediateTransaction(database, () =>
+        claimAttachmentProcessingAttemptInTransaction(database, {
+          context: operation.context,
+          command: operation.command,
+          clock,
+          ids: attachmentAuthorityIds,
+        }));
+    case "processing-start":
+      return runAttachmentAuthorityImmediateTransaction(database, () =>
+        startAttachmentProcessingAttemptInTransaction(database, {
+          context: operation.context,
+          command: operation.command,
+          clock,
+        }));
+    case "processing-complete":
+      return runAttachmentAuthorityImmediateTransaction(database, () =>
+        completeAttachmentProcessingAttemptInTransaction(database, {
+          context: operation.context,
+          command: operation.command,
+          clock,
+          ids: attachmentAuthorityIds,
+        }));
+    case "attachment-ready":
+      return runAttachmentAuthorityImmediateTransaction(database, () =>
+        markAttachmentReadyInTransaction(database, {
+          context: operation.context,
+          command: operation.command,
+          clock,
+          ids: attachmentAuthorityIds,
+        }));
+    case "status-read":
+      return readAttachmentStatusDatabaseQuery(database, {
+        context: operation.context,
+        attachmentId: operation.attachmentId,
+        clock,
+      });
+    case "access-authorize":
+      return authorizeAttachmentAccessDatabaseQuery(database, {
+        context: operation.context,
+        command: operation.command,
+        clock,
+      });
+    case "agent-extraction-authorize":
+      return authorizeAgentAttachmentExtractionDatabaseQuery(database, {
+        context: operation.context,
+        attachmentId: operation.attachmentId,
+        expectedAttachmentGeneration: operation.expectedAttachmentGeneration,
+      });
+  }
+}
+
+function executeAttachment(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.attachment") throw new TypeError("wrong attachment operation");
+  try {
+    const result = executeAttachmentDatabaseOperation(request.operation, request.now);
+    respond({ type: "authority.attachment-result", requestId: request.requestId, result });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AttachmentAuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithError(request.requestId, "storage_unavailable", "Attachment authority failed");
+  }
+}
+
 function submitHumanMessage(request: AuthorityWorkerRequest): void {
   if (request.type !== "authority.message-submit") throw new TypeError("wrong message submit");
   try {
@@ -2549,6 +2725,9 @@ async function dispatch(value: unknown): Promise<void> {
       return;
     case "authority.execute-agent":
       executeAgent(value);
+      return;
+    case "authority.attachment":
+      executeAttachment(value);
       return;
     case "authority.message-submit":
       submitHumanMessage(value);

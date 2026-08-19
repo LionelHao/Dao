@@ -19,6 +19,7 @@ const authorization: AttachmentReadAuthorization = Object.freeze({
   originalFilename: "safe.txt",
 });
 const context = Object.freeze({
+  sessionId: "session-1",
   sessionFamilyId: "family-1",
   principal: Object.freeze({ accountId: "account-1", actorId: "actor-1" }),
 });
