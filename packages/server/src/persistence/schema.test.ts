@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import {
   AUTHORITY_SCHEMA_VERSION,
   AUTHORITY_V14_STATEMENT_COUNT_FOR_TEST,
+  AUTHORITY_V15_STATEMENT_COUNT_FOR_TEST,
   configureAuthorityConnection,
   listAuthorityTables,
   migrateAuthorityDatabase,
@@ -571,6 +572,25 @@ describe("authority SQLite schema", () => {
     }
   }, 20_000);
 
+  it("rolls every v15 migration statement back with v14 schema and history intact", () => {
+    for (
+      let failAfterStatement = 1;
+      failAfterStatement <= AUTHORITY_V15_STATEMENT_COUNT_FOR_TEST;
+      failAfterStatement += 1
+    ) {
+      withDatabase((database) => {
+        migrateAuthorityDatabaseToPreviousVersionForTest(database);
+        const before = snapshot(database);
+
+        expect(() => migrateAuthorityDatabase(database, { failAfterStatement }))
+          .toThrow(/injected migration failure/i);
+
+        expect(readSchemaVersion(database)).toBe(14);
+        expect(snapshot(database)).toEqual(before);
+      });
+    }
+  }, 20_000);
+
   it("rejects a same-version message gate that outruns the Room lifecycle generation", () => {
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
@@ -987,7 +1007,7 @@ describe("authority SQLite schema", () => {
         {
           version: 15,
           name: "truthful-room-lifecycle-audit-vocabulary",
-          checksum: "65a371b2faf68d906c8241195f3dff0d4937e8acfde2d46bb7961c748d9a15a8",
+          checksum: "41740e7d34f6807248bf7879f34f9026844802dfe5a43f0ee18bf498a24dc0c9",
           applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
         },
       ]);
