@@ -401,10 +401,19 @@ function seedMixedRoomRecords(databasePath: string, roomId: string): Record<stri
        INNER JOIN route_jobs AS job ON job.id = candidate.route_job_id
        WHERE job.room_id = ?`,
     ).get(roomId) as { readonly count: number };
+    const messageRevisionCount = database.prepare(
+      `SELECT COUNT(*) AS count
+       FROM message_revisions AS revision
+       INNER JOIN message_envelopes AS envelope ON envelope.message_id = revision.message_id
+       WHERE envelope.room_id = ? AND envelope.lifecycle = 'active'
+         AND envelope.message_kind = 'human'
+         AND revision.revision <= envelope.current_revision`,
+    ).get(roomId) as { readonly count: number };
     const mixedCounts = {
       room: 1,
       membership: count("room_memberships"),
       "timeline-message": count("messages"),
+      "message-revision": messageRevisionCount.count,
       "human-read": count("human_read_receipts"),
       "agent-judgement": count("agent_judgments"),
       "open-item": count("open_items"),

@@ -132,6 +132,7 @@ describe("Desktop message authority operational replica", () => {
       event(3, "room.message.recalled", tombstone()),
     );
     expect(replica.timeline).toEqual([tombstone()]);
+    expect(replica.revisions).toEqual([]);
     expect(JSON.stringify(replica)).not.toContain("RECALLED-RAW-SENTINEL");
     expect(JSON.stringify(replica)).not.toContain("mentionedTargets");
     expect(JSON.stringify(replica)).not.toContain("attachments");
@@ -301,12 +302,42 @@ describe("Desktop message authority operational replica", () => {
     expect(JSON.stringify(locked)).not.toContain("OLD-COMPLETE-SENTINEL");
   });
 
-  it("rejects audit revision records and never stages raw revisions for operational repair", () => {
-    const replica = beginMessageAuthorityRepair(
+  it("rebuilds active revision chains but rejects raw revisions for recalled messages", () => {
+    let replica = beginMessageAuthorityRepair(
       createMessageAuthorityReplica("room-1"),
       { snapshotId: "snapshot-1", watermark: 2, generation: 2 },
     );
-    const auditRecord: MessageAuthorityRepairRecord = {
+    replica = stageMessageAuthorityRepairRecord(
+      replica,
+      "snapshot-1",
+      record(human(2, "current body")),
+    );
+    for (const [revision, body] of [[1, "old body"], [2, "current body"]] as const) {
+      replica = stageMessageAuthorityRepairRecord(replica, "snapshot-1", {
+        kind: "message-revision",
+        roomId: "room-1",
+        value: {
+          messageId: "message-human",
+          revision,
+          body,
+          revisedAt: `2026-08-19T08:0${revision - 1}:00.000Z`,
+          revisedByActorId: "human-1",
+        },
+      });
+    }
+    replica = commitMessageAuthorityRepair(replica, {
+      snapshotId: "snapshot-1",
+      watermark: 2,
+      generation: 2,
+    });
+    expect(replica.revisions.map(({ body }) => body)).toEqual(["old body", "current body"]);
+
+    let recalled = beginMessageAuthorityRepair(
+      replica,
+      { snapshotId: "snapshot-2", watermark: 3, generation: 3 },
+    );
+    recalled = stageMessageAuthorityRepairRecord(recalled, "snapshot-2", record(tombstone()));
+    const recalledRawRecord: MessageAuthorityRepairRecord = {
       kind: "message-revision",
       roomId: "room-1",
       value: {
@@ -319,11 +350,11 @@ describe("Desktop message authority operational replica", () => {
     };
 
     expect(() => stageMessageAuthorityRepairRecord(
-      replica,
-      "snapshot-1",
-      auditRecord,
-    )).toThrow(new MessageAuthorityReplicaError("audit_record_forbidden"));
-    expect(JSON.stringify(replica)).not.toContain("AUDIT-RAW-SENTINEL");
+      recalled,
+      "snapshot-2",
+      recalledRawRecord,
+    )).toThrow(new MessageAuthorityReplicaError("invalid_repair"));
+    expect(JSON.stringify(recalled)).not.toContain("AUDIT-RAW-SENTINEL");
   });
 
   it("keeps offline state read-only and clears all Room state on explicit revoke", () => {

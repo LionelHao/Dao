@@ -43,6 +43,8 @@ function recordIdentity(record: RoomRepairRecord): string {
     case "membership": return `membership\0${record.value.actorId}`;
     case "message": return `message\0${record.value.id}`;
     case "timeline-message": return `timeline-message\0${record.value.id}`;
+    case "message-revision": return `message-revision\0${record.value.messageId}\0${record.value.revision}`;
+    case "attachment": return `attachment\0${record.value.attachment.attachmentId}`;
     case "human-read": return `human-read\0${record.value.id}`;
     case "agent-judgement": return `agent-judgement\0${record.value.id}`;
     case "open-item": return `open-item\0${record.value.id}`;

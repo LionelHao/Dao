@@ -3,8 +3,10 @@ import { rmSync, statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { parentPort, workerData } from "node:worker_threads";
 import {
+  isAttachmentRepairRecord,
   isCalibrationSignal,
   isLightTask,
+  isMessageAuthorityRepairRecord,
   isRoomRepairPage,
   isRouteJob,
   isRouteJudgment,
@@ -631,22 +633,29 @@ function lightTaskRecord(row: Record<string, unknown>): RoomRepairRecord {
 
 type RoomRepairKind = RoomRepairRecord["kind"];
 
-const ROOM_REPAIR_KINDS = Object.freeze([
-  "room",
-  "governance",
-  "membership",
-  "timeline-message",
-  "human-read",
-  "agent-judgement",
-  "open-item",
-  "open-item-agent-failure",
-  "light-task",
-  "agent-execution",
-  "route-job",
-  "route-judgment",
-  "calibration",
-  "legacy-unknown-calibration",
-] as const satisfies readonly RoomRepairKind[]);
+const ROOM_REPAIR_KIND_MAP = Object.freeze({
+  room: true,
+  governance: true,
+  membership: true,
+  message: true,
+  "timeline-message": true,
+  "message-revision": true,
+  attachment: true,
+  "human-read": true,
+  "agent-judgement": true,
+  "open-item": true,
+  "open-item-agent-failure": true,
+  "light-task": true,
+  "agent-execution": true,
+  "route-job": true,
+  "route-judgment": true,
+  calibration: true,
+  "legacy-unknown-calibration": true,
+} as const satisfies Readonly<Record<RoomRepairKind, true>>);
+
+const ROOM_REPAIR_KINDS = Object.freeze(
+  Object.keys(ROOM_REPAIR_KIND_MAP) as RoomRepairKind[],
+);
 
 function singleRoomMetadataRow(input: RepairKeysetPageInput): readonly Record<string, unknown>[] {
   if (input.afterKey !== undefined) return [];
@@ -685,6 +694,92 @@ function humanReadRecord(roomId: string, row: Record<string, unknown>): RoomRepa
     readerId: row.actorId,
     readAt: row.readAt,
   }};
+}
+
+function messageRevisionRecord(row: Record<string, unknown>): RoomRepairRecord {
+  const record = {
+    kind: "message-revision",
+    roomId: row.roomId,
+    value: {
+      messageId: row.messageId,
+      revision: row.revision,
+      body: row.body,
+      revisedAt: row.revisedAt,
+      revisedByActorId: row.revisedByActorId,
+    },
+  };
+  if (!isMessageAuthorityRepairRecord(record)) {
+    throw new SnapshotBuildError("storage_unavailable", "Snapshot message revision is corrupt");
+  }
+  return record;
+}
+
+function extractionMethodForRepair(
+  format: unknown,
+  artifactMethod: unknown,
+): "plain-text" | "csv-text" | "office-xml" | "pdf-text" | "ocr" | undefined {
+  if (artifactMethod === "ocr-text") return "ocr";
+  if (format === "txt") return "plain-text";
+  if (format === "csv") return "csv-text";
+  if (format === "docx" || format === "xlsx") return "office-xml";
+  if (format === "pdf" && artifactMethod === "extracted-text") return "pdf-text";
+  return undefined;
+}
+
+function extractionToolForRepair(
+  method: ReturnType<typeof extractionMethodForRepair>,
+): "builtin" | "bounded-zip" | "pdftotext" | "tesseract" | undefined {
+  if (method === "plain-text" || method === "csv-text") return "builtin";
+  if (method === "office-xml") return "bounded-zip";
+  if (method === "pdf-text") return "pdftotext";
+  if (method === "ocr") return "tesseract";
+  return undefined;
+}
+
+function attachmentRepairRecord(row: Record<string, unknown>): RoomRepairRecord {
+  const method = extractionMethodForRepair(row.format, row.artifactMethod);
+  const tool = extractionToolForRepair(method);
+  const pageCount = typeof row.pageEnd === "number" ? row.pageEnd : null;
+  const record = {
+    kind: "attachment",
+    value: {
+      attachment: {
+        attachmentId: row.attachmentId,
+        roomId: row.roomId,
+        originalFilename: row.originalFilename,
+        format: row.format,
+        declaredMime: row.declaredMime,
+        detectedMime: row.detectedMime,
+        byteSize: row.byteSize,
+        sha256: row.sha256,
+        uploaderActorId: row.uploaderActorId,
+        createdAt: row.createdAt,
+        readyAt: row.readyAt,
+        processingStatus: "ready",
+        generation: row.generation,
+        sourceMessageId: row.sourceMessageId,
+        provenance: {
+          scanner: { kind: "clamav", version: row.scannerVersion },
+          extraction: {
+            method,
+            tool,
+            version: row.artifactToolVersion,
+            artifactSha256: row.artifactSha256,
+            artifactByteSize: row.artifactByteSize,
+            pageCount,
+          },
+          ocr: method === "ocr"
+            ? { kind: "tesseract", version: row.artifactToolVersion, pageCount }
+            : null,
+        },
+      },
+      sourceEligibility: "bound-active",
+    },
+  };
+  if (!isAttachmentRepairRecord(record)) {
+    throw new SnapshotBuildError("storage_unavailable", "Snapshot attachment is corrupt");
+  }
+  return record;
 }
 
 function openItemRecord(row: Record<string, unknown>): RoomRepairRecord {
@@ -763,7 +858,77 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
       String(record.kind === "timeline-message" ? record.value.id : ""),
   },
   {
-    descriptorId: "dao.repair.human-read.v1", descriptorVersion: 1, kind: "human-read", order: 4,
+    descriptorId: "dao.repair.message-revision.v1", descriptorVersion: 1,
+    kind: "message-revision", order: 4,
+    readKeysetPage: (input: RepairKeysetPageInput) => keysetRows(input.database,
+      `SELECT room_id AS roomId, message_id AS messageId, revision, body,
+              revised_at AS revisedAt, revised_by_actor_id AS revisedByActorId,
+              stable_key AS stableKey
+       FROM (
+         SELECT envelope.room_id, revision.message_id, revision.revision, revision.body,
+                revision.revised_at, revision.revised_by_actor_id,
+                printf('%s:%020d', revision.message_id, revision.revision) AS stable_key
+         FROM message_revisions AS revision
+         JOIN message_envelopes AS envelope
+           ON envelope.message_id = revision.message_id
+         WHERE envelope.room_id = ? AND envelope.lifecycle = 'active'
+           AND envelope.message_kind = 'human'
+           AND revision.revision <= envelope.current_revision
+       ) WHERE 1 = 1`, [input.roomId], "stable_key", input.afterKey, input.limit),
+    mapRow: (row: unknown) => messageRevisionRecord(row as Record<string, unknown>),
+    stableKey: (record: RoomRepairRecord) => record.kind === "message-revision"
+      ? `${record.value.messageId}:${String(record.value.revision).padStart(20, "0")}`
+      : "",
+  },
+  {
+    descriptorId: "dao.repair.attachment.v1", descriptorVersion: 1,
+    kind: "attachment", order: 5,
+    readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
+      `SELECT attachment.attachment_id AS attachmentId,
+              attachment.room_id AS roomId,
+              attachment.original_filename AS originalFilename,
+              attachment.format, attachment.declared_mime AS declaredMime,
+              attachment.detected_mime AS detectedMime,
+              attachment.byte_size AS byteSize, attachment.sha256,
+              attachment.uploader_actor_id AS uploaderActorId,
+              attachment.created_at AS createdAt, attachment.ready_at AS readyAt,
+              attachment.processing_generation AS generation,
+              attachment.source_message_id AS sourceMessageId,
+              artifact.method AS artifactMethod,
+              artifact.tool_version AS artifactToolVersion,
+              artifact.sha256 AS artifactSha256,
+              artifact.byte_size AS artifactByteSize,
+              artifact.page_end AS pageEnd,
+              (
+                SELECT attempt.adapter_version
+                FROM attachment_processing_attempts AS attempt
+                WHERE attempt.attachment_id = attachment.attachment_id
+                  AND attempt.processing_generation = attachment.processing_generation
+                  AND attempt.adapter_kind = 'scanner' AND attempt.status = 'succeeded'
+                ORDER BY attempt.attempt_number DESC LIMIT 1
+              ) AS scannerVersion
+       FROM attachments AS attachment
+       JOIN attachment_extraction_artifacts AS artifact
+         ON artifact.artifact_id = (
+           SELECT candidate.artifact_id
+           FROM attachment_extraction_artifacts AS candidate
+           WHERE candidate.attachment_id = attachment.attachment_id
+             AND candidate.processing_generation = attachment.processing_generation
+           ORDER BY candidate.artifact_id LIMIT 1
+         )
+       JOIN message_envelopes AS envelope
+         ON envelope.message_id = attachment.source_message_id
+        AND envelope.room_id = attachment.room_id
+       WHERE attachment.room_id = ? AND attachment.processing_status = 'ready'
+         AND attachment.source_operational_state = 'bound-active'
+         AND envelope.lifecycle = 'active'`, "attachment.attachment_id"),
+    mapRow: (row: unknown) => attachmentRepairRecord(row as Record<string, unknown>),
+    stableKey: (record: RoomRepairRecord) => record.kind === "attachment"
+      ? record.value.attachment.attachmentId
+      : "",
+  },
+  {
+    descriptorId: "dao.repair.human-read.v1", descriptorVersion: 1, kind: "human-read", order: 6,
     readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
       `SELECT room_id AS roomId, actor_id AS actorId, message_id AS messageId, read_at AS readAt
        FROM human_read_receipts WHERE room_id = ?`, "actor_id"),
@@ -776,7 +941,7 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
   },
   {
     descriptorId: "dao.repair.agent-judgement.v1", descriptorVersion: 1,
-    kind: "agent-judgement", order: 5,
+    kind: "agent-judgement", order: 7,
     readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
       "SELECT id, judgment_json AS json FROM agent_judgments WHERE room_id = ?", "id"),
     mapRow: (row: unknown) => ({
@@ -787,7 +952,7 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
       String(record.kind === "agent-judgement" ? record.value.id : ""),
   },
   {
-    descriptorId: "dao.repair.open-item.v1", descriptorVersion: 1, kind: "open-item", order: 6,
+    descriptorId: "dao.repair.open-item.v1", descriptorVersion: 1, kind: "open-item", order: 8,
     readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
       `SELECT id, room_id AS roomId, source_message_id AS sourceMessageId,
               requester_actor_id AS requesterId, current_owner_actor_id AS currentOwnerId,
@@ -801,7 +966,7 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
   },
   {
     descriptorId: "dao.repair.open-item-agent-failure.v1", descriptorVersion: 1,
-    kind: "open-item-agent-failure", order: 7,
+    kind: "open-item-agent-failure", order: 9,
     readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
       `SELECT failure.id, failure.open_item_id AS openItemId,
               failure.execution_id AS executionId, failure.attempt_seq AS attemptSeq,
@@ -814,7 +979,7 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
       String(record.kind === "open-item-agent-failure" ? record.value.id : ""),
   },
   {
-    descriptorId: "dao.repair.light-task.v1", descriptorVersion: 1, kind: "light-task", order: 8,
+    descriptorId: "dao.repair.light-task.v1", descriptorVersion: 1, kind: "light-task", order: 10,
     readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
       `SELECT id, room_id AS roomId, source_message_id AS sourceMessageId, title,
               claimant_actor_id AS claimant, claimant_role_at_claim AS claimantRoleAtClaim,
@@ -827,7 +992,7 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
   },
   {
     descriptorId: "dao.repair.agent-execution.v1", descriptorVersion: 1,
-    kind: "agent-execution", order: 9,
+    kind: "agent-execution", order: 11,
     readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
       `SELECT id, room_id AS roomId, trigger_message_id AS sourceMessageId,
               requester_actor_id AS requesterId, agent_id AS agentId, tool_name AS toolName,
@@ -851,7 +1016,7 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
       String(record.kind === "agent-execution" ? record.value.id : ""),
   },
   {
-    descriptorId: "dao.repair.route-job.v1", descriptorVersion: 1, kind: "route-job", order: 10,
+    descriptorId: "dao.repair.route-job.v1", descriptorVersion: 1, kind: "route-job", order: 12,
     readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
       `SELECT id, room_id AS roomId, source_message_id AS sourceMessageId, status,
               current_attempt AS currentAttempt, topic_key AS topicKey,
@@ -865,7 +1030,7 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
   },
   {
     descriptorId: "dao.repair.route-judgment.v1", descriptorVersion: 1,
-    kind: "route-judgment", order: 11,
+    kind: "route-judgment", order: 13,
     readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
       `SELECT judgment.id, judgment.route_job_id AS routeJobId,
               judgment.source_message_id AS sourceMessageId,
@@ -880,7 +1045,7 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
       String(record.kind === "route-judgment" ? record.value.id : ""),
   },
   {
-    descriptorId: "dao.repair.calibration.v1", descriptorVersion: 1, kind: "calibration", order: 12,
+    descriptorId: "dao.repair.calibration.v1", descriptorVersion: 1, kind: "calibration", order: 14,
     readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
       `SELECT id, source_message_id AS sourceMessageId, actor_id AS actorId,
               agent_id AS agentId, signal, created_at AS createdAt
@@ -892,7 +1057,7 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
   },
   {
     descriptorId: "dao.repair.legacy-unknown-calibration.v1", descriptorVersion: 1,
-    kind: "legacy-unknown-calibration", order: 13,
+    kind: "legacy-unknown-calibration", order: 15,
     readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
       `SELECT id, source_message_id AS sourceMessageId, actor_id AS actorId,
               agent_id AS agentId, signal, created_at AS createdAt
@@ -901,6 +1066,19 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
     mapRow: (row: unknown) => calibrationRecord(row as Record<string, unknown>),
     stableKey: (record: RoomRepairRecord) =>
       String(record.kind === "legacy-unknown-calibration" ? record.value.id : ""),
+  },
+  {
+    descriptorId: "dao.repair.message-deprecated.v1", descriptorVersion: 1,
+    kind: "message", order: 16,
+    readKeysetPage: () => [],
+    mapRow: (): never => {
+      throw new SnapshotBuildError(
+        "storage_unavailable",
+        "Deprecated message repair records cannot be materialized",
+      );
+    },
+    stableKey: (record: RoomRepairRecord) =>
+      String(record.kind === "message" ? record.value.id : ""),
   },
 ] as const satisfies readonly RoomRepairSegmentDescriptor<RoomRepairKind, RoomRepairRecord>[]);
 
@@ -1363,8 +1541,101 @@ function cachedPageValues(
         typeof value.value.id === "string" && value.value.id.length > 0) {
       return { kind: "timeline-message-reference", messageId: value.value.id };
     }
+    if (isRecord(value) && value.kind === "message-revision" &&
+        typeof value.roomId === "string" && isRecord(value.value) &&
+        typeof value.value.messageId === "string" &&
+        typeof value.value.revision === "number") {
+      return {
+        kind: "message-revision-reference",
+        roomId: value.roomId,
+        messageId: value.value.messageId,
+        revision: value.value.revision,
+      };
+    }
+    if (isRecord(value) && value.kind === "attachment" && isRecord(value.value) &&
+        isRecord(value.value.attachment) &&
+        typeof value.value.attachment.attachmentId === "string") {
+      return {
+        kind: "attachment-reference",
+        attachmentId: value.value.attachment.attachmentId,
+      };
+    }
     return value;
   });
+}
+
+function hydrateMessageRevisionReference(
+  authority: DatabaseSync,
+  roomId: string,
+  messageId: string,
+  revision: number,
+): RoomRepairRecord {
+  const row = authority.prepare(`
+    SELECT envelope.room_id AS roomId, revision.message_id AS messageId,
+           revision.revision, revision.body, revision.revised_at AS revisedAt,
+           revision.revised_by_actor_id AS revisedByActorId
+    FROM message_revisions AS revision
+    JOIN message_envelopes AS envelope ON envelope.message_id = revision.message_id
+    WHERE envelope.room_id = ? AND envelope.lifecycle = 'active'
+      AND envelope.message_kind = 'human' AND revision.message_id = ?
+      AND revision.revision = ? AND revision.revision <= envelope.current_revision
+  `).get(roomId, messageId, revision);
+  if (!isRecord(row)) {
+    throw new SnapshotBuildError("snapshot_stale", "Snapshot revision reference is stale");
+  }
+  return messageRevisionRecord(row);
+}
+
+function hydrateAttachmentReference(
+  authority: DatabaseSync,
+  roomId: string,
+  attachmentId: string,
+): RoomRepairRecord {
+  const row = authority.prepare(`
+    SELECT attachment.attachment_id AS attachmentId,
+           attachment.room_id AS roomId,
+           attachment.original_filename AS originalFilename,
+           attachment.format, attachment.declared_mime AS declaredMime,
+           attachment.detected_mime AS detectedMime,
+           attachment.byte_size AS byteSize, attachment.sha256,
+           attachment.uploader_actor_id AS uploaderActorId,
+           attachment.created_at AS createdAt, attachment.ready_at AS readyAt,
+           attachment.processing_generation AS generation,
+           attachment.source_message_id AS sourceMessageId,
+           artifact.method AS artifactMethod,
+           artifact.tool_version AS artifactToolVersion,
+           artifact.sha256 AS artifactSha256,
+           artifact.byte_size AS artifactByteSize,
+           artifact.page_end AS pageEnd,
+           (
+             SELECT attempt.adapter_version
+             FROM attachment_processing_attempts AS attempt
+             WHERE attempt.attachment_id = attachment.attachment_id
+               AND attempt.processing_generation = attachment.processing_generation
+               AND attempt.adapter_kind = 'scanner' AND attempt.status = 'succeeded'
+             ORDER BY attempt.attempt_number DESC LIMIT 1
+           ) AS scannerVersion
+    FROM attachments AS attachment
+    JOIN attachment_extraction_artifacts AS artifact
+      ON artifact.artifact_id = (
+        SELECT candidate.artifact_id
+        FROM attachment_extraction_artifacts AS candidate
+        WHERE candidate.attachment_id = attachment.attachment_id
+          AND candidate.processing_generation = attachment.processing_generation
+        ORDER BY candidate.artifact_id LIMIT 1
+      )
+    JOIN message_envelopes AS envelope
+      ON envelope.message_id = attachment.source_message_id
+     AND envelope.room_id = attachment.room_id
+    WHERE attachment.room_id = ? AND attachment.attachment_id = ?
+      AND attachment.processing_status = 'ready'
+      AND attachment.source_operational_state = 'bound-active'
+      AND envelope.lifecycle = 'active'
+  `).get(roomId, attachmentId);
+  if (!isRecord(row)) {
+    throw new SnapshotBuildError("snapshot_stale", "Snapshot attachment reference is stale");
+  }
+  return attachmentRepairRecord(row);
 }
 
 function hydrateRoomPageReferences(
@@ -1391,10 +1662,28 @@ function hydrateRoomPageReferences(
         }
         return record;
       }
+      if (isRecord(value) && value.kind === "message-revision-reference" &&
+          exact(value, ["kind", "roomId", "messageId", "revision"]) &&
+          value.roomId === manifest.roomId && text(value.messageId) &&
+          Number.isSafeInteger(value.revision) && Number(value.revision) > 0) {
+        return hydrateMessageRevisionReference(
+          authority,
+          manifest.roomId,
+          value.messageId,
+          Number(value.revision),
+        );
+      }
+      if (isRecord(value) && value.kind === "attachment-reference" &&
+          exact(value, ["kind", "attachmentId"]) && text(value.attachmentId)) {
+        return hydrateAttachmentReference(authority, manifest.roomId, value.attachmentId);
+      }
       if (isRecord(value) &&
-          (value.kind === "timeline-message" || value.kind === "timeline-message-reference")) {
+          (value.kind === "timeline-message" || value.kind === "timeline-message-reference" ||
+           value.kind === "message-revision" ||
+           value.kind === "message-revision-reference" ||
+           value.kind === "attachment" || value.kind === "attachment-reference")) {
         throw new SnapshotBuildError(
-          "storage_unavailable", "Snapshot message reference is corrupt",
+          "storage_unavailable", "Snapshot authority reference is corrupt",
         );
       }
       return value;

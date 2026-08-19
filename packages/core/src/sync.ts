@@ -34,6 +34,12 @@ import {
   type RouteJudgment,
 } from "./collaboration.js";
 import {
+  isAttachmentRepairRecord,
+  isAttachmentRoomEvent,
+  type AttachmentRepairRecord,
+  type AttachmentRoomEvent,
+} from "./attachment-authority.js";
+import {
   isMessageAuthorityEvent,
   isMessageAuthorityRepairRecord,
   type MessageAuthorityEvent,
@@ -60,10 +66,7 @@ export interface LegacyUnknownCalibrationSignal {
   readonly createdAt: string;
 }
 
-type OperationalMessageAuthorityRepairRecord = Extract<
-  MessageAuthorityRepairRecord,
-  { readonly kind: "timeline-message" }
->;
+type OperationalMessageAuthorityRepairRecord = MessageAuthorityRepairRecord;
 
 export type RoomRepairRecord =
   | { readonly kind: "room"; readonly value: Omit<ManagedRoom, "members"> }
@@ -81,7 +84,8 @@ export type RoomRepairRecord =
   | { readonly kind: "calibration"; readonly value: CalibrationSignal }
   | { readonly kind: "legacy-unknown-calibration";
       readonly value: LegacyUnknownCalibrationSignal }
-  | OperationalMessageAuthorityRepairRecord;
+  | OperationalMessageAuthorityRepairRecord
+  | AttachmentRepairRecord;
 
 export type SnapshotVersion =
   | { readonly kind: "room"; readonly roomId: string; readonly watermark: number }
@@ -201,6 +205,7 @@ export type PersistedRoomEvent =
   | RoomEvent<"agent.configured", { readonly membership: AgentRoomMembership }>
   | RoomEvent<"room.message.accepted", Message>
   | MessageAuthorityEvent
+  | AttachmentRoomEvent
   | RoomEvent<"room.human_read.recorded", HumanReadReceipt>
   | RoomEvent<"room.agent_judgment.recorded", AgentJudgement>
   | RoomEvent<"room.open_item.changed", OpenItem>
@@ -364,12 +369,12 @@ export function isSnapshotCompleted(value: unknown): value is SnapshotCompleted 
 }
 
 function isRepairRecord(value: unknown, expectedRoomId?: string): value is RoomRepairRecord {
-  if (!isRecord(value) || !exact(value, ["kind", "value"])) {
-    return false;
-  }
-  if (value.kind === "timeline-message") {
+  if (!isRecord(value)) return false;
+  if (value.kind === "timeline-message" || value.kind === "message-revision") {
     return isMessageAuthorityRepairRecord(value, expectedRoomId);
   }
+  if (value.kind === "attachment") return isAttachmentRepairRecord(value, expectedRoomId);
+  if (!exact(value, ["kind", "value"])) return false;
   if (value.kind === "human-read") return isHumanReadReceipt(value.value);
   if (value.kind === "agent-judgement") return isAgentJudgement(value.value);
   if (value.kind === "open-item") return isOpenItem(value.value);
@@ -403,6 +408,7 @@ function isPersistedRoomEventValue(value: unknown): value is PersistedRoomEvent 
   }
   const payload = value.payload;
   if (isMessageAuthorityEvent(value)) return true;
+  if (isAttachmentRoomEvent(value)) return true;
   if (value.type === "room.created" || value.type === "room.renamed") {
     return exact(payload, ["room"]) && isManagedRoomValue(payload.room) && payload.room.id === value.roomId;
   }

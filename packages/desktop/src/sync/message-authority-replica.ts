@@ -25,8 +25,7 @@ export type MessageAuthorityReplicaFailureReason =
   | "room_locked"
   | "repair_in_progress"
   | "invalid_repair"
-  | "repair_not_active"
-  | "audit_record_forbidden";
+  | "repair_not_active";
 
 export class MessageAuthorityReplicaError extends Error {
   readonly reason: MessageAuthorityReplicaFailureReason;
@@ -59,6 +58,7 @@ export type MessageAuthorityRepairStage = Readonly<{
   watermark: number;
   generation: number;
   timeline: readonly TimelineMessage[];
+  revisions: readonly MessageRevision[];
 }>;
 
 export type MessageAuthorityReplica = Readonly<{
@@ -68,6 +68,7 @@ export type MessageAuthorityReplica = Readonly<{
   checkpoint: number;
   afterSeq: number;
   timeline: readonly TimelineMessage[];
+  revisions: readonly MessageRevision[];
   eventLedger: readonly MessageAuthorityEventLedgerEntry[];
   repair?: MessageAuthorityRepairStage;
 }>;
@@ -244,12 +245,17 @@ function freezeTimeline(values: readonly TimelineMessage[]): readonly TimelineMe
   return Object.freeze(values.map(cloneTimelineMessage));
 }
 
+function freezeRevisions(values: readonly MessageRevision[]): readonly MessageRevision[] {
+  return Object.freeze(values.map(cloneRevision));
+}
+
 function freezeStage(value: MessageAuthorityRepairStage): MessageAuthorityRepairStage {
   return Object.freeze({
     snapshotId: value.snapshotId,
     watermark: value.watermark,
     generation: value.generation,
     timeline: freezeTimeline(value.timeline),
+    revisions: freezeRevisions(value.revisions),
   });
 }
 
@@ -261,6 +267,7 @@ function freezeReplica(value: MessageAuthorityReplica): MessageAuthorityReplica 
     checkpoint: value.checkpoint,
     afterSeq: value.afterSeq,
     timeline: freezeTimeline(value.timeline),
+    revisions: freezeRevisions(value.revisions),
     eventLedger: freezeLedger(value.eventLedger),
     ...(value.repair === undefined ? {} : { repair: freezeStage(value.repair) }),
   });
@@ -338,10 +345,27 @@ function reduceTimeline(
   return freezeTimeline(next);
 }
 
+function reduceRevisions(
+  revisions: readonly MessageRevision[],
+  event: MessageAuthorityEvent,
+): readonly MessageRevision[] {
+  if (event.type === "room.message.recalled") {
+    return freezeRevisions(revisions.filter(({ messageId }) => messageId !== event.payload.id));
+  }
+  if (event.payload.authorKind === "agent") return revisions;
+  const nextRevision = event.payload.currentRevision;
+  if (revisions.some(({ messageId, revision }) =>
+    messageId === nextRevision.messageId && revision === nextRevision.revision)) {
+    reject("revision_regression");
+  }
+  return freezeRevisions([...revisions, nextRevision]);
+}
+
 export type MessageAuthorityReplicaSeed = Readonly<{
   generation: number;
   checkpoint: number;
   timeline: readonly TimelineMessage[];
+  revisions?: readonly MessageRevision[];
 }>;
 
 export function createMessageAuthorityReplica(
@@ -355,6 +379,8 @@ export function createMessageAuthorityReplica(
     reject("invalid_repair");
   }
   if (seed !== undefined) validateCommittedTimeline(seed.timeline);
+  const seededRevisions = seed?.revisions ?? [];
+  validateRepairRevisions(seed?.timeline ?? [], seededRevisions);
   return freezeReplica({
     roomId,
     mode: "online",
@@ -362,6 +388,7 @@ export function createMessageAuthorityReplica(
     checkpoint: seed?.checkpoint ?? 0,
     afterSeq: seed?.checkpoint ?? 0,
     timeline: seed?.timeline ?? [],
+    revisions: seededRevisions,
     eventLedger: [],
   });
 }
@@ -388,10 +415,12 @@ export function applyMessageAuthorityEvent(
   if (event.streamSeq !== replica.afterSeq + 1) reject("event_gap");
 
   const timeline = reduceTimeline(replica.timeline, event);
+  const revisions = reduceRevisions(replica.revisions, event);
   return freezeReplica({
     ...replica,
     afterSeq: event.streamSeq,
     timeline,
+    revisions,
     eventLedger: [
       ...replica.eventLedger,
       { eventId: event.eventId, streamSeq: event.streamSeq },
@@ -454,6 +483,7 @@ export function beginMessageAuthorityRepair(
       watermark: input.watermark,
       generation: input.generation,
       timeline: [],
+      revisions: [],
     },
   });
 }
@@ -480,7 +510,21 @@ export function stageMessageAuthorityRepairRecord(
 ): MessageAuthorityReplica {
   const repair = activeRepair(replica, snapshotId);
   if (isMessageAuthorityRepairRecord(record) && record.kind === "message-revision") {
-    reject("audit_record_forbidden");
+    if (record.roomId !== replica.roomId) reject("invalid_repair");
+    const source = repair.timeline.find(({ id }) => id === record.value.messageId);
+    if (source === undefined || source.lifecycle !== "active" || source.authorKind !== "human" ||
+        record.value.revision > source.revisionCount ||
+        repair.revisions.some(({ messageId, revision }) =>
+          messageId === record.value.messageId && revision === record.value.revision)) {
+      reject("invalid_repair");
+    }
+    return freezeReplica({
+      ...replica,
+      repair: {
+        ...repair,
+        revisions: [...repair.revisions, record.value],
+      },
+    });
   }
   if (!isTimelineRepairRecord(record) || record.value.roomId !== replica.roomId) {
     reject("invalid_repair");
@@ -509,6 +553,37 @@ function validateCommittedTimeline(timeline: readonly TimelineMessage[]): void {
   }
 }
 
+function validateRepairRevisions(
+  timeline: readonly TimelineMessage[],
+  revisions: readonly MessageRevision[],
+): void {
+  const grouped = new Map<string, MessageRevision[]>();
+  for (const revision of revisions) {
+    const source = timeline.find(({ id }) => id === revision.messageId);
+    if (source === undefined || source.lifecycle !== "active" || source.authorKind !== "human") {
+      reject("invalid_repair");
+    }
+    const chain = grouped.get(revision.messageId) ?? [];
+    if (chain.some((candidate) => candidate.revision === revision.revision)) {
+      reject("invalid_repair");
+    }
+    chain.push(revision);
+    grouped.set(revision.messageId, chain);
+  }
+  for (const [messageId, chain] of grouped) {
+    const source = timeline.find(({ id }) => id === messageId);
+    if (source === undefined || source.lifecycle !== "active" || source.authorKind !== "human" ||
+        chain.length !== source.revisionCount) {
+      reject("invalid_repair");
+    }
+    const ordered = [...chain].sort((left, right) => left.revision - right.revision);
+    if (ordered.some((revision, index) => revision.revision !== index + 1) ||
+        !sameValue(ordered.at(-1), source.currentRevision)) {
+      reject("invalid_repair");
+    }
+  }
+}
+
 export function commitMessageAuthorityRepair(
   replica: MessageAuthorityReplica,
   input: CommitMessageAuthorityRepairInput,
@@ -518,6 +593,7 @@ export function commitMessageAuthorityRepair(
     reject("invalid_repair");
   }
   validateCommittedTimeline(repair.timeline);
+  validateRepairRevisions(repair.timeline, repair.revisions);
   return freezeReplica({
     roomId: replica.roomId,
     mode: "online",
@@ -525,6 +601,7 @@ export function commitMessageAuthorityRepair(
     checkpoint: repair.watermark,
     afterSeq: repair.watermark,
     timeline: repair.timeline,
+    revisions: repair.revisions,
     eventLedger: [],
   });
 }
@@ -542,6 +619,7 @@ export function failMessageAuthorityRepair(
     checkpoint: replica.checkpoint,
     afterSeq: replica.afterSeq,
     timeline: replica.timeline,
+    revisions: replica.revisions,
     eventLedger: replica.eventLedger,
   });
 }
@@ -565,6 +643,7 @@ export function revokeMessageAuthorityRoom(
     checkpoint: 0,
     afterSeq: 0,
     timeline: [],
+    revisions: [],
     eventLedger: [],
   });
 }
