@@ -145,8 +145,8 @@ FK、UNIQUE、CHECK 与 trigger 还必须证明：单 key canonical idempotency�
 ```text
 parts/<uploadId>/<ordinal>.part
 quarantine/<attachmentId>.blob
-objects/<sha256>.blob
-extractions/<attachmentId>/<generation>.utf8
+objects/object_<sha256>
+extractions/extraction_<sha256>
 ```
 
 这些是说明性逻辑域；对 renderer/事件/错误不可见。实际 filename 只由已验证的 server UUID/SHA 生成，使用 no-follow/exclusive open；所有写入受 per-file 和 global byte budget 控制。
@@ -161,7 +161,7 @@ extractions/<attachmentId>/<generation>.utf8
 | scanner clean / extraction file rename 后、ready commit 前 | object/extraction orphan；DB仍不可访问；reconciler清理或 worker 同 generation重试 |
 | ready commit 后、outbox 前 | bind前只有 private query；bind transaction 自带 Room event/outbox；不会靠 FS 推断 |
 
-reconciler 每次最多 `128` 项/`256 MiB`，启动与周期执行；不遍历无界目录到内存。上传 idle `30 min`，绝对 TTL `24 h`；每 principal+Room 最多 `4` active、全局 `32` active；processing queue `64`、并发 `2`。
+reconciler 单次最多 `1,024` 项/`512 MiB`，启动时最多执行 `64` 个 bounded pass；目录扫描与删除都在这些预算内，不能把无界目录一次载入内存。上传 idle `30 min`，绝对 TTL `24 h`；每 principal+Room 最多 `4` active、全局 `32` active；processing queue `64`、并发 `2`。
 
 ## 7. 真实 scanner / extraction / OCR 组合
 
@@ -169,7 +169,7 @@ reconciler 每次最多 `128` 项/`256 MiB`，启动与周期执行；不遍历�
 
 | 格式 | 类型/安全校验 | 处理 |
 | --- | --- | --- |
-| 全部 | 内建 signature + `/usr/bin/file --mime-type` 交叉检查；ClamAV `clamscan` 必须 clean | scanner timeout 120s；exit 0 clean、1 malware、2/error unavailable |
+| 全部 | `file-type@22.0.2` signature、格式专用结构解析与声明 MIME 交叉检查；ClamD `INSTREAM` 必须 clean | ClamD 只允许 Unix/loopback endpoint，scan timeout 120s；clean/malware/error 归一化且不暴露 signature/raw banner |
 | TXT/CSV | UTF-8/BOM、NUL/控制字符、CSV row/column bounds | 内建 streaming decoder；提取最多 8 MiB/200k chars |
 | DOCX/XLSX | ZIP central directory、path traversal、entry count 10k、expanded 200 MiB、ratio 100:1 | 精确锁定纯 JS ZIP 解码；只读已知 XML parts，不执行宏/外链/公式 |
 | PDF | header/xref/page count 500/对象与嵌入文件 bounds；encrypted 拒绝 | `pdfinfo`/`pdftotext`；无文本页通过 `pdftoppm` 受控 raster 后 OCR |
@@ -185,6 +185,7 @@ Desktop main：
 - main 按 32 KiB 读、计算 chunk/whole SHA-256、调用 attachment-specific authority client；最多 1 个文件/2 个 in-flight chunks；取消关闭 fd、清 handle、发送 closed cancel。
 - download 先授权再弹 native save dialog，写受控用户目标的 temp + fsync + atomic rename；renderer不接收目标路径或字节。
 - preview：TXT/CSV 只显示 bounded escaped text；PDF/image 在独立 sandboxed `BrowserWindow`/受控内存响应中显示，`nodeIntegration:false`、`contextIsolation:true`、`sandbox:true`、`webSecurity:true`、拒绝 navigation/window open/permissions/network；DOCX/XLSX 显示服务端提取的安全 text/table preview，不加载 Office active content。每次打开重新授权，没有 bearer URL。
+- Agent extraction reader 是 server-private relative import，不进入 package root/public WS。AuthorityWorker 只为 `running` execution、相同 active Room、current 且未 paused 的 Agent assignment、`ready + bound-active` attachment、active source envelope/link 和匹配 execution/attachment generation 颁发 opaque extraction authority。reader 每个至多 32 KiB range 在读取前后都重新查询；recall/archive/assignment removal/access revision/lifecycle 或 generation 漂移会丢弃已读 range 并 fail closed。对未来 FT-05/06/10 只返回 bounded UTF-8 text、`sourceMessageId + revision` 与 method/tool/version/page/hash/bytes provenance，不返回 object key/path/token；本阶段不把它接成完整 context compiler。
 
 Renderer 组件包含 selection row、progress、processing status、ready chip、failure recovery、malware/revoke terminal、bind/source indication。键盘可选择、取消、重试、预览、下载、移除；失败后 focus 到摘要/恢复按钮，关闭 preview 回触发器。只设置一个低频 `aria-live=polite`，按状态边播报短摘要，不逐 chunk/page；preview `aria-live=off`。支持 1440×900 的 100/125/150/200% 与 840×560 的 100/125/150%，无核心动作裁切或页面双轴滚动；`prefers-reduced-motion` 禁用非必要动画。
 
@@ -202,6 +203,6 @@ Electron 是 Desktop 运行时，即使列在 devDependencies 也按生产攻击
 
 ## 11. 非目标与未来 seam
 
-- FT-05/06 将消费已授权的 operational attachment/extraction reader；本期只提供 server-private port，不把提取正文放事件或 repair。
+- FT-05/06/10 将消费已授权的 operational attachment/extraction reader；本期只提供上述 server-private port，不把提取正文放事件或 repair，也不把该 seam 冒充 memory/context/tool 产品。
 - 不做任意文件类型、在线 Office 编辑、公共分享 URL、renderer 直接 fetch、generic filesystem bridge、background auto-upload、无限断点保留或跨 Room attachment reuse。
 - 不修改 Blueprint 或任务状态；交付说明只能记录真实证据，不能自称 owner verified。

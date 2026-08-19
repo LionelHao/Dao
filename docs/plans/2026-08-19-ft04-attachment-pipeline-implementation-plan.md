@@ -42,7 +42,7 @@
 | A02 | finalize size/hash/type mismatch、archive/revoke/repair barrier race | 接受前零 artifact；先安全 reduction 则零 business result |
 | A03 | scanner clean/malware/unavailable、extract/OCR success/error/timeout/cancel | fail closed；malware terminal；retry generation CAS；late result zero write |
 | A04 | source bind two messages/recall/archive/revoke races | one transaction one winner；message/link/source/event/outbox/receipt 全有或全无 |
-| A05 | preview/download/context auth denied | object adapter/file read 调用计数 0；授权时每请求恰一次 authority check |
+| A05 | preview/download/context auth denied | object adapter/file read 调用计数 0；Human stream 每 range 重验，Agent extraction 每 range 前后重验；授权漂移丢弃 bytes |
 
 ### 2.3 Store / process hardening
 
@@ -154,7 +154,7 @@ corepack pnpm build
 corepack pnpm verify:core-boundary
 corepack pnpm verify:desktop-boundary
 corepack pnpm audit --json
-corepack pnpm --filter @native-im/desktop smoke:electron
+corepack pnpm --filter @native-im/desktop smoke
 git diff --check
 ```
 
