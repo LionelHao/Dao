@@ -157,9 +157,30 @@ export interface ToolConfirmationRequiredPayload {
   readonly expiresAt: string;
 }
 
+export interface RoomArchivedEventPayload {
+  readonly governance: RoomGovernanceView;
+  readonly archiveGeneration: number;
+  readonly frozenTimerCount: number;
+}
+
+export interface RoomReopenedEventPayload {
+  readonly governance: RoomGovernanceView;
+  readonly archiveGeneration: number;
+  readonly resumedTimerCount: number;
+}
+
+export interface RoomSecurityReducedEventPayload {
+  readonly governance: RoomGovernanceView;
+  readonly archiveGeneration: number;
+  readonly assignmentRevision: number;
+}
+
 export type PersistedRoomEvent =
-  | RoomEvent<"room.created" | "room.renamed" | "room.archived", { readonly room: ManagedRoom }>
+  | RoomEvent<"room.created" | "room.renamed", { readonly room: ManagedRoom }>
   | RoomEvent<"room.governance.changed", { readonly governance: RoomGovernanceView }>
+  | RoomEvent<"room.archived", RoomArchivedEventPayload>
+  | RoomEvent<"room.reopened", RoomReopenedEventPayload>
+  | RoomEvent<"room.security.reduced", RoomSecurityReducedEventPayload>
   | RoomEvent<"human.invitation.issued", { readonly invitationId: string; readonly inviteeActorId: string }>
   | RoomEvent<"human.invitation.accepted", { readonly invitationId: string; readonly membership: HumanRoomMembership }>
   | RoomEvent<"human.invitation.rejected", { readonly invitationId: string; readonly targetActorId: string }>
@@ -364,7 +385,7 @@ function isPersistedRoomEventValue(value: unknown): value is PersistedRoomEvent 
     return false;
   }
   const payload = value.payload;
-  if (value.type === "room.created" || value.type === "room.renamed" || value.type === "room.archived") {
+  if (value.type === "room.created" || value.type === "room.renamed") {
     return exact(payload, ["room"]) && isManagedRoomValue(payload.room) && payload.room.id === value.roomId;
   }
   if (value.type === "human.invitation.issued") {
@@ -382,6 +403,33 @@ function isPersistedRoomEventValue(value: unknown): value is PersistedRoomEvent 
   if (value.type === "room.governance.changed") {
     return exact(payload, ["governance"]) && isRoomGovernanceView(payload.governance) &&
       payload.governance.roomId === value.roomId;
+  }
+  if (value.type === "room.archived") {
+    return exact(payload, ["governance", "archiveGeneration", "frozenTimerCount"]) &&
+      isRoomGovernanceView(payload.governance) &&
+      payload.governance.roomId === value.roomId &&
+      payload.governance.lifecycle === "archived" && count(payload.archiveGeneration) &&
+      payload.archiveGeneration > 0 &&
+      payload.governance.archiveGeneration === payload.archiveGeneration &&
+      count(payload.frozenTimerCount);
+  }
+  if (value.type === "room.reopened") {
+    return exact(payload, ["governance", "archiveGeneration", "resumedTimerCount"]) &&
+      isRoomGovernanceView(payload.governance) &&
+      payload.governance.roomId === value.roomId &&
+      payload.governance.lifecycle === "active" && count(payload.archiveGeneration) &&
+      payload.archiveGeneration > 0 &&
+      payload.governance.archiveGeneration === payload.archiveGeneration &&
+      count(payload.resumedTimerCount);
+  }
+  if (value.type === "room.security.reduced") {
+    return exact(payload, ["governance", "archiveGeneration", "assignmentRevision"]) &&
+      isRoomGovernanceView(payload.governance) &&
+      payload.governance.roomId === value.roomId &&
+      payload.governance.lifecycle === "archived" && count(payload.archiveGeneration) &&
+      payload.archiveGeneration > 0 &&
+      payload.governance.archiveGeneration === payload.archiveGeneration &&
+      count(payload.assignmentRevision);
   }
   if (value.type === "member.removed") {
     return exact(payload, ["targetActorId"]) && text(payload.targetActorId);
