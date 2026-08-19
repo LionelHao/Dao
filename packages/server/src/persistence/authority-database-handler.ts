@@ -80,6 +80,7 @@ import {
   requireMessageMutationAllowedInTransaction,
 } from "../message-authority/archived-message-gate.js";
 import { canStartRuntimeGenerationInTransaction } from "../agent-runtime/runtime-archive-fence-participant.js";
+import type { CommittedRoomCacheInvalidationIntent } from "../access/room-cache-invalidation-port.js";
 
 export class AuthorityDatabaseError extends Error {
   constructor(
@@ -1479,6 +1480,79 @@ export function markOutboxFailedDatabaseCommand(
     if (existing?.status !== "dispatched") {
       return fail("storage_unavailable", "Authority outbox delivery does not exist");
     }
+  }
+}
+
+export function listCommittedRoomCacheInvalidationIntentsDatabaseQuery(
+  database: DatabaseSync,
+  limit: number,
+): readonly CommittedRoomCacheInvalidationIntent[] {
+  if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 256) {
+    return fail("invalid_request", "Room cache invalidation limit was invalid");
+  }
+  const rows = database.prepare(
+    `SELECT id AS invalidationIntentId, room_id AS roomId,
+            lifecycle_generation AS lifecycleGeneration,
+            access_revision AS accessRevision, reason
+     FROM room_cache_invalidation_intents
+     WHERE status = 'pending' AND available_at <= CURRENT_TIMESTAMP
+     ORDER BY available_at, created_at, id
+     LIMIT ?`,
+  ).all(limit);
+  return rows.map((row) => {
+    if (typeof row.invalidationIntentId !== "string" ||
+        typeof row.roomId !== "string" ||
+        typeof row.lifecycleGeneration !== "number" ||
+        !Number.isSafeInteger(row.lifecycleGeneration) || row.lifecycleGeneration < 0 ||
+        typeof row.accessRevision !== "number" ||
+        !Number.isSafeInteger(row.accessRevision) || row.accessRevision < 0 ||
+        row.reason !== "room_archived") {
+      return fail("storage_unavailable", "Room cache invalidation intent was corrupt");
+    }
+    return {
+      invalidationIntentId: row.invalidationIntentId,
+      roomId: row.roomId,
+      lifecycleGeneration: row.lifecycleGeneration,
+      accessRevision: row.accessRevision,
+      reason: "room_archived" as const,
+    };
+  });
+}
+
+export function markRoomCacheInvalidationCompletedDatabaseCommand(
+  database: DatabaseSync,
+  invalidationIntentId: string,
+): void {
+  const updated = database.prepare(
+    `UPDATE room_cache_invalidation_intents
+     SET status = 'completed', completed_at = CURRENT_TIMESTAMP, last_error_code = NULL
+     WHERE id = ? AND status = 'pending'`,
+  ).run(invalidationIntentId);
+  if (updated.changes === 1) return;
+  const existing = database.prepare(
+    "SELECT status FROM room_cache_invalidation_intents WHERE id = ?",
+  ).get(invalidationIntentId);
+  if (existing?.status !== "completed") {
+    return fail("storage_unavailable", "Room cache invalidation intent does not exist");
+  }
+}
+
+export function markRoomCacheInvalidationFailedDatabaseCommand(
+  database: DatabaseSync,
+  invalidationIntentId: string,
+  errorCode: "purge_failed" | "authority_unavailable",
+): void {
+  const updated = database.prepare(
+    `UPDATE room_cache_invalidation_intents
+     SET attempts = attempts + 1, last_error_code = ?, available_at = CURRENT_TIMESTAMP
+     WHERE id = ? AND status = 'pending'`,
+  ).run(errorCode, invalidationIntentId);
+  if (updated.changes === 1) return;
+  const existing = database.prepare(
+    "SELECT status FROM room_cache_invalidation_intents WHERE id = ?",
+  ).get(invalidationIntentId);
+  if (existing?.status !== "completed" && existing?.status !== "dead_letter") {
+    return fail("storage_unavailable", "Room cache invalidation intent does not exist");
   }
 }
 

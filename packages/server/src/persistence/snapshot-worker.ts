@@ -37,6 +37,11 @@ import {
   SNAPSHOT_CACHE_SCHEMA_VERSION,
   validateSnapshotCachePhysicalSchema,
 } from "./schema.js";
+import {
+  createClosedRepairProjectionRegistry,
+  type RepairKeysetPageInput,
+  type RoomRepairSegmentDescriptor,
+} from "./repair-projection-registry.js";
 
 interface SnapshotWorkerData {
   readonly authorityPath: string;
@@ -639,7 +644,12 @@ function streamingValues(
   lease: StreamingRepairLease,
 ): Iterable<RoomRepairRecord | RoomSummary> {
   return lease.scope.kind === "room"
-    ? roomRecords(authority, lease.scope.roomId, () => undefined)
+    ? registeredRoomRecords(
+        authority,
+        lease.scope.roomId,
+        lease.version.kind === "room" ? lease.version.watermark : 0,
+        () => undefined,
+      )
     : catalogRooms(authority, lease.scope.principalId, () => undefined);
 }
 
@@ -665,13 +675,14 @@ function keysetRows(
   keyColumn: string,
   lastKey: string | undefined,
   limit: number,
+  trackStreamingScan = false,
 ): readonly Record<string, unknown>[] {
   const statement = authority.prepare(
     `${baseSql}${lastKey === undefined ? "" : ` AND ${keyColumn} > ?`}
      ORDER BY ${keyColumn} LIMIT ?`,
   );
   const rows = statement.all(...parameters, ...(lastKey === undefined ? [] : [lastKey]), limit);
-  if (data.pauseState !== undefined) {
+  if (trackStreamingScan && data.pauseState !== undefined) {
     Atomics.add(new Int32Array(data.pauseState), 1, rows.length);
   }
   return rows;
@@ -801,7 +812,390 @@ function lightTaskRecord(row: Record<string, unknown>): RoomRepairRecord {
   return { kind: "light-task", value: task };
 }
 
+type RoomRepairKind = RoomRepairRecord["kind"];
+
+const ROOM_REPAIR_KINDS = Object.freeze([
+  "room",
+  "governance",
+  "membership",
+  "message",
+  "human-read",
+  "agent-judgement",
+  "open-item",
+  "open-item-agent-failure",
+  "light-task",
+  "agent-execution",
+  "route-job",
+  "route-judgment",
+  "calibration",
+  "legacy-unknown-calibration",
+] as const satisfies readonly RoomRepairKind[]);
+
+function singleRoomMetadataRow(input: RepairKeysetPageInput): readonly Record<string, unknown>[] {
+  if (input.afterKey !== undefined) return [];
+  const row = input.database.prepare(
+    `SELECT id, name, status, created_at AS createdAt, owner_actor_id AS ownerActorId,
+            governance_revision AS governanceRevision,
+            archive_generation AS archiveGeneration, archived_at AS archivedAt
+     FROM rooms WHERE id = ?`,
+  ).get(input.roomId);
+  const rows = row === undefined ? [] : [row];
+  return rows;
+}
+
+function roomMetadataRecord(row: unknown): RoomRepairRecord {
+  if (!isRecord(row) || typeof row.id !== "string" || typeof row.name !== "string" ||
+      (row.status !== "active" && row.status !== "archived") ||
+      typeof row.createdAt !== "string") {
+    throw new SnapshotBuildError("storage_unavailable", "Snapshot room metadata is corrupt");
+  }
+  return { kind: "room", value: {
+    id: row.id,
+    name: row.name,
+    status: row.status,
+    createdAt: row.createdAt,
+  }};
+}
+
+function governanceRecord(row: unknown): RoomRepairRecord {
+  if (!isRecord(row) || typeof row.id !== "string" ||
+      (row.status !== "active" && row.status !== "archived") ||
+      typeof row.ownerActorId !== "string" || typeof row.governanceRevision !== "number" ||
+      typeof row.archiveGeneration !== "number") {
+    throw new SnapshotBuildError("storage_unavailable", "Snapshot governance is corrupt");
+  }
+  return { kind: "governance", value: {
+    roomId: row.id,
+    projectId: row.id,
+    lifecycle: row.status,
+    governanceRevision: row.governanceRevision,
+    ownerActorId: row.ownerActorId,
+    archiveGeneration: row.archiveGeneration,
+    ...(row.status === "archived" && typeof row.archivedAt === "string"
+      ? { archivedAt: row.archivedAt }
+      : {}),
+  }};
+}
+
+function humanReadRecord(roomId: string, row: Record<string, unknown>): RoomRepairRecord {
+  if (typeof row.actorId !== "string" || typeof row.messageId !== "string" ||
+      typeof row.readAt !== "string") {
+    throw new SnapshotBuildError("storage_unavailable", "Snapshot receipt is corrupt");
+  }
+  return { kind: "human-read", value: {
+    id: `human-read:${roomId}:${row.actorId}`,
+    messageId: row.messageId,
+    readerId: row.actorId,
+    readAt: row.readAt,
+  }};
+}
+
+function openItemRecord(row: Record<string, unknown>): RoomRepairRecord {
+  return { kind: "open-item", value: {
+    id: String(row.id), roomId: String(row.roomId), sourceMessageId: String(row.sourceMessageId),
+    requesterId: String(row.requesterId),
+    currentOwnerId: row.currentOwnerId === null ? null : String(row.currentOwnerId),
+    content: String(row.content), status: row.status as OpenItem["status"],
+    origin: row.originKind === "agent_proposal" ? {
+      kind: "agent_proposal", proposalKind: String(row.proposalKind) as "risk" | "challenge",
+      sourceExecutionId: String(row.sourceExecutionId), reason: String(row.proposalReason),
+    } : { kind: String(row.originKind) as "human_mention" | "manual_unfinished" },
+    createdAt: String(row.createdAt),
+    ...(typeof row.respondedAt === "string" ? { respondedAt: row.respondedAt } : {}),
+    transferChain: parseJson(row.transferChainJson) as [],
+  }};
+}
+
+function openItemFailureRecord(row: Record<string, unknown>): RoomRepairRecord {
+  return { kind: "open-item-agent-failure", value: {
+    id: String(row.id), openItemId: String(row.openItemId),
+    executionId: String(row.executionId), attemptSeq: Number(row.attemptSeq),
+    reasonCode: String(row.reasonCode), failedAt: String(row.failedAt),
+  }};
+}
+
+function roomSegmentRows(
+  input: RepairKeysetPageInput,
+  baseSql: string,
+  keyColumn: string,
+): readonly Record<string, unknown>[] {
+  return keysetRows(
+    input.database,
+    baseSql,
+    [input.roomId],
+    keyColumn,
+    input.afterKey,
+    input.limit,
+  );
+}
+
+const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
+  {
+    descriptorId: "dao.repair.room.v1", descriptorVersion: 1, kind: "room", order: 0,
+    readKeysetPage: singleRoomMetadataRow,
+    mapRow: roomMetadataRecord,
+    stableKey: (record: RoomRepairRecord) => String(record.kind === "room" ? record.value.id : ""),
+  },
+  {
+    descriptorId: "dao.repair.governance.v1", descriptorVersion: 1, kind: "governance", order: 1,
+    readKeysetPage: singleRoomMetadataRow,
+    mapRow: governanceRecord,
+    stableKey: (record: RoomRepairRecord) => String(record.kind === "governance" ? record.value.roomId : ""),
+  },
+  {
+    descriptorId: "dao.repair.membership.v1", descriptorVersion: 1, kind: "membership", order: 2,
+    readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
+      `SELECT membership.actor_id AS actorId, membership.kind,
+              CASE WHEN membership.actor_id = room.owner_actor_id
+                THEN 'owner' ELSE membership.role END AS role, membership.participation,
+              membership.tool_permissions_json AS toolPermissionsJson,
+              membership.joined_at AS joinedAt, membership.configured_at AS configuredAt
+       FROM room_memberships AS membership
+       JOIN rooms AS room ON room.id = membership.room_id
+       WHERE membership.room_id = ?`, "membership.actor_id"),
+    mapRow: (row: unknown) => membershipRecord(row as Record<string, unknown>),
+    stableKey: (record: RoomRepairRecord) =>
+      String(record.kind === "membership" ? record.value.actorId : ""),
+  },
+  {
+    descriptorId: "dao.repair.message.v1", descriptorVersion: 1, kind: "message", order: 3,
+    readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
+      `SELECT id, room_id AS roomId, author_id AS authorId, author_kind AS authorKind,
+              body, sent_at AS sentAt FROM messages WHERE room_id = ?`, "id"),
+    mapRow: (row: unknown) => messageRecord(row as Record<string, unknown>),
+    stableKey: (record: RoomRepairRecord) => String(record.kind === "message" ? record.value.id : ""),
+  },
+  {
+    descriptorId: "dao.repair.human-read.v1", descriptorVersion: 1, kind: "human-read", order: 4,
+    readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
+      `SELECT room_id AS roomId, actor_id AS actorId, message_id AS messageId, read_at AS readAt
+       FROM human_read_receipts WHERE room_id = ?`, "actor_id"),
+    mapRow: (row: unknown) => {
+      const record = row as Record<string, unknown>;
+      return humanReadRecord(String(record.roomId ?? ""), record);
+    },
+    stableKey: (record: RoomRepairRecord) =>
+      String(record.kind === "human-read" ? record.value.readerId : ""),
+  },
+  {
+    descriptorId: "dao.repair.agent-judgement.v1", descriptorVersion: 1,
+    kind: "agent-judgement", order: 5,
+    readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
+      "SELECT id, judgment_json AS json FROM agent_judgments WHERE room_id = ?", "id"),
+    mapRow: (row: unknown) => ({
+      kind: "agent-judgement",
+      value: parseJson((row as Record<string, unknown>).json) as RoomRepairRecord & never,
+    }),
+    stableKey: (record: RoomRepairRecord) =>
+      String(record.kind === "agent-judgement" ? record.value.id : ""),
+  },
+  {
+    descriptorId: "dao.repair.open-item.v1", descriptorVersion: 1, kind: "open-item", order: 6,
+    readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
+      `SELECT id, room_id AS roomId, source_message_id AS sourceMessageId,
+              requester_actor_id AS requesterId, current_owner_actor_id AS currentOwnerId,
+              body AS content, status, created_at AS createdAt,
+              responded_at AS respondedAt, transfer_chain_json AS transferChainJson,
+              origin_kind AS originKind, proposal_kind AS proposalKind,
+              source_execution_id AS sourceExecutionId, proposal_reason AS proposalReason
+       FROM open_items WHERE room_id = ?`, "id"),
+    mapRow: (row: unknown) => openItemRecord(row as Record<string, unknown>),
+    stableKey: (record: RoomRepairRecord) => String(record.kind === "open-item" ? record.value.id : ""),
+  },
+  {
+    descriptorId: "dao.repair.open-item-agent-failure.v1", descriptorVersion: 1,
+    kind: "open-item-agent-failure", order: 7,
+    readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
+      `SELECT failure.id, failure.open_item_id AS openItemId,
+              failure.execution_id AS executionId, failure.attempt_seq AS attemptSeq,
+              failure.reason_code AS reasonCode, failure.failed_at AS failedAt
+       FROM open_item_agent_failures AS failure
+       JOIN open_items AS item ON item.id = failure.open_item_id
+       WHERE item.room_id = ?`, "failure.id"),
+    mapRow: (row: unknown) => openItemFailureRecord(row as Record<string, unknown>),
+    stableKey: (record: RoomRepairRecord) =>
+      String(record.kind === "open-item-agent-failure" ? record.value.id : ""),
+  },
+  {
+    descriptorId: "dao.repair.light-task.v1", descriptorVersion: 1, kind: "light-task", order: 8,
+    readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
+      `SELECT id, room_id AS roomId, source_message_id AS sourceMessageId, title,
+              claimant_actor_id AS claimant, claimant_role_at_claim AS claimantRoleAtClaim,
+              verifier_role AS verifierRole, verifier_actor_id AS verifierActorId,
+              criteria_json AS criteriaJson, status, created_at AS createdAt,
+              claimed_at AS claimedAt, delivered_at AS deliveredAt, verified_at AS verifiedAt
+       FROM light_tasks WHERE room_id = ?`, "id"),
+    mapRow: (row: unknown) => lightTaskRecord(row as Record<string, unknown>),
+    stableKey: (record: RoomRepairRecord) => String(record.kind === "light-task" ? record.value.id : ""),
+  },
+  {
+    descriptorId: "dao.repair.agent-execution.v1", descriptorVersion: 1,
+    kind: "agent-execution", order: 9,
+    readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
+      `SELECT id, room_id AS roomId, trigger_message_id AS sourceMessageId,
+              requester_actor_id AS requesterId, agent_id AS agentId, tool_name AS toolName,
+              status, started_at AS startedAt, completed_at AS completedAt,
+              result_json AS resultJson, action_category AS actionCategory,
+              tool_dispatch_phase AS toolDispatchPhase, current_attempt_seq AS currentAttemptSeq,
+              retry_cycle AS retryCycle, retry_ordinal AS retryOrdinal,
+              provider_id AS providerId, model_id AS modelId, recovery_cursor AS recoveryCursor,
+              queued_at AS queuedAt, updated_at AS updatedAt,
+              cancellation_reason AS cancellationReason, terminal_error_code AS terminalErrorCode,
+              dead_lettered_at AS deadLetteredAt, result_message_id AS resultMessageId,
+              next_retry_at AS nextRetryAt, manual_retry_of_execution_id AS manualRetryOfExecutionId,
+              compensates_execution_id AS compensatesExecutionId,
+              supersedes_execution_ids_json AS supersedesExecutionIdsJson
+       FROM agent_executions WHERE room_id = ?`, "id"),
+    mapRow: (row: unknown) => ({
+      kind: "agent-execution",
+      value: canonicalLegacyExecution(row as Record<string, unknown>),
+    }),
+    stableKey: (record: RoomRepairRecord) =>
+      String(record.kind === "agent-execution" ? record.value.id : ""),
+  },
+  {
+    descriptorId: "dao.repair.route-job.v1", descriptorVersion: 1, kind: "route-job", order: 10,
+    readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
+      `SELECT id, room_id AS roomId, source_message_id AS sourceMessageId, status,
+              current_attempt AS currentAttempt, topic_key AS topicKey,
+              embedding_model_version AS embeddingModelVersion, window_size AS windowSize,
+              cosine_threshold AS cosineThreshold, room_phase AS roomPhase,
+              created_at AS createdAt, updated_at AS updatedAt, completed_at AS completedAt,
+              terminal_error_code AS terminalErrorCode, next_retry_at AS nextRetryAt
+       FROM route_jobs WHERE room_id = ?`, "id"),
+    mapRow: (row: unknown) => routeJobRecord(row as Record<string, unknown>),
+    stableKey: (record: RoomRepairRecord) => String(record.kind === "route-job" ? record.value.id : ""),
+  },
+  {
+    descriptorId: "dao.repair.route-judgment.v1", descriptorVersion: 1,
+    kind: "route-judgment", order: 11,
+    readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
+      `SELECT judgment.id, judgment.route_job_id AS routeJobId,
+              judgment.source_message_id AS sourceMessageId,
+              judgment.agent_id AS agentId, judgment.outcome,
+              judgment.reason_code AS reasonCode, judgment.reason_text AS reasonText,
+              judgment.route_attempt AS routeAttempt, judgment.decided_at AS decidedAt
+       FROM route_judgments AS judgment
+       JOIN route_jobs AS route ON route.id = judgment.route_job_id
+       WHERE route.room_id = ?`, "judgment.id"),
+    mapRow: (row: unknown) => routeJudgmentRecord(row as Record<string, unknown>),
+    stableKey: (record: RoomRepairRecord) =>
+      String(record.kind === "route-judgment" ? record.value.id : ""),
+  },
+  {
+    descriptorId: "dao.repair.calibration.v1", descriptorVersion: 1, kind: "calibration", order: 12,
+    readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
+      `SELECT id, source_message_id AS sourceMessageId, actor_id AS actorId,
+              agent_id AS agentId, signal, created_at AS createdAt
+       FROM calibration_signals
+       WHERE room_id = ? AND NOT (source_message_id IS NULL AND actor_id IS NULL)`, "id"),
+    mapRow: (row: unknown) => calibrationRecord(row as Record<string, unknown>),
+    stableKey: (record: RoomRepairRecord) =>
+      String(record.kind === "calibration" ? record.value.id : ""),
+  },
+  {
+    descriptorId: "dao.repair.legacy-unknown-calibration.v1", descriptorVersion: 1,
+    kind: "legacy-unknown-calibration", order: 13,
+    readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
+      `SELECT id, source_message_id AS sourceMessageId, actor_id AS actorId,
+              agent_id AS agentId, signal, created_at AS createdAt
+       FROM calibration_signals
+       WHERE room_id = ? AND source_message_id IS NULL AND actor_id IS NULL`, "id"),
+    mapRow: (row: unknown) => calibrationRecord(row as Record<string, unknown>),
+    stableKey: (record: RoomRepairRecord) =>
+      String(record.kind === "legacy-unknown-calibration" ? record.value.id : ""),
+  },
+] as const satisfies readonly RoomRepairSegmentDescriptor<RoomRepairKind, RoomRepairRecord>[]);
+
+const ROOM_REPAIR_REGISTRY = createClosedRepairProjectionRegistry<
+  RoomRepairKind,
+  RoomRepairRecord
+>({
+  knownKinds: ROOM_REPAIR_KINDS,
+  descriptors: ROOM_REPAIR_DESCRIPTORS,
+});
+
+function registeredRoomRecords(
+  authority: DatabaseSync,
+  roomId: string,
+  watermark: number,
+  recordScanned: () => void,
+): readonly RoomRepairRecord[] {
+  if (ROOM_REPAIR_REGISTRY.descriptors.length === 0) {
+    return Object.freeze([...roomRecords(authority, roomId, recordScanned)]);
+  }
+  const records: RoomRepairRecord[] = [];
+  for (const descriptor of ROOM_REPAIR_REGISTRY.descriptors) {
+    let afterKey: string | undefined;
+    while (true) {
+      const page = ROOM_REPAIR_REGISTRY.readStablePage({
+        database: authority,
+        roomId,
+        watermark,
+        afterKey,
+        limit: data.limits.scanBatchSize,
+        kind: descriptor.kind,
+      });
+      for (const record of page) {
+        records.push(record);
+        recordScanned();
+      }
+      if (page.length < data.limits.scanBatchSize) break;
+      const last = page.at(-1);
+      if (last === undefined) break;
+      afterKey = descriptor.stableKey(last);
+    }
+  }
+  return Object.freeze(records);
+}
+
 function keysetRoomPage(
+  authority: DatabaseSync,
+  roomId: string,
+  watermark: number,
+  initial: StreamingCursor | undefined,
+  limit: number,
+): { readonly values: readonly RoomRepairRecord[]; readonly cursor: StreamingCursor } {
+  if (ROOM_REPAIR_REGISTRY.descriptors.length === 0) {
+    return legacyKeysetRoomPage(authority, roomId, initial, limit);
+  }
+  const values: RoomRepairRecord[] = [];
+  let segment = initial?.segment ?? 0;
+  let key = initial?.key;
+  while (values.length < limit && segment < ROOM_REPAIR_REGISTRY.descriptors.length) {
+    const descriptor = ROOM_REPAIR_REGISTRY.descriptors[segment];
+    if (descriptor === undefined) break;
+    const remaining = limit - values.length;
+    const page = ROOM_REPAIR_REGISTRY.readStablePage({
+      database: authority,
+      roomId,
+      watermark,
+      afterKey: key,
+      limit: remaining,
+      kind: descriptor.kind,
+    });
+    if (descriptor.kind !== "room" && data.pauseState !== undefined) {
+      Atomics.add(new Int32Array(data.pauseState), 1, page.length);
+    }
+    values.push(...page);
+    if (page.length < remaining) {
+      segment += 1;
+      key = undefined;
+      continue;
+    }
+    const last = page.at(-1);
+    if (last === undefined) {
+      throw new SnapshotBuildError("storage_unavailable", "Snapshot registry cursor was corrupt");
+    }
+    key = descriptor.stableKey(last);
+  }
+  return {
+    values: Object.freeze(values),
+    cursor: { segment, ...(key === undefined ? {} : { key }) },
+  };
+}
+
+function legacyKeysetRoomPage(
   authority: DatabaseSync,
   roomId: string,
   initial: StreamingCursor | undefined,
@@ -1010,7 +1404,7 @@ function keysetCatalogPage(
      FROM room_memberships AS membership
      JOIN rooms AS room ON room.id = membership.room_id
      WHERE membership.actor_id = ? AND membership.kind = 'human' AND room.status = 'active'`,
-    [principalId], "room.id", initial?.key, limit);
+    [principalId], "room.id", initial?.key, limit, true);
   return {
     values: rows.map((row) => ({
       roomId: String(row.roomId), name: String(row.name), status: row.status as "active",
@@ -1116,7 +1510,11 @@ function readStreamingPage(
   try {
     const selected = lease.scope.kind === "room"
       ? keysetRoomPage(
-          authority, lease.scope.roomId, state.cursor, data.limits.maxRecordsPerPage,
+          authority,
+          lease.scope.roomId,
+          lease.version.kind === "room" ? lease.version.watermark : 0,
+          state.cursor,
+          data.limits.maxRecordsPerPage,
         )
       : keysetCatalogPage(
           authority, lease.scope.principalId, state.cursor, data.limits.maxRecordsPerPage,
@@ -1495,7 +1893,7 @@ function build(
         authority.exec("COMMIT"); readTransactionOpen = false;
         return pageFromCache(reusable, request.responseRequestId, 0);
       }
-      values = [...roomRecords(authority, request.roomId, recordScanned)];
+      values = registeredRoomRecords(authority, request.roomId, watermark, recordScanned);
       version = { roomId: request.roomId, watermark };
       const checksum = canonicalChecksum("room", values);
       const snapshotId = randomUUID();

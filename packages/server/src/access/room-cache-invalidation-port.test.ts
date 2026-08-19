@@ -8,6 +8,11 @@ import {
   releaseDatabaseAuthorityTransactionView,
 } from "../persistence/authority-transaction-database.js";
 import { isParticipantRegistration } from "../room-governance/private-participant-contracts.js";
+import { migrateAuthorityDatabase } from "../persistence/schema.js";
+import {
+  createWorkerDatabaseClient,
+  createWorkerRoomCacheInvalidationIntentAuthority,
+} from "../persistence/worker-database-client.js";
 import {
   ROOM_ACCESS_AUTHORITY_SCHEMA_STATEMENTS,
   ROOM_CACHE_INVALIDATION_SCHEMA_STATEMENTS,
@@ -153,6 +158,76 @@ describe("room cache invalidation production port", () => {
     } finally {
       reader?.close();
       writer?.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("dispatches a committed intent through the real AuthorityWorker RPC", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "dao-cache-invalidation-worker-"));
+    const path = join(directory, "authority.sqlite");
+    const setup = new DatabaseSync(path);
+    let worker: Awaited<ReturnType<typeof createWorkerDatabaseClient>> | undefined;
+    try {
+      migrateAuthorityDatabase(setup);
+      setup.exec(`
+        INSERT INTO actors (id, kind, display_name)
+        VALUES ('cache-owner', 'human', 'Cache Owner');
+        INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+        VALUES ('identity', 'cache-owner', 0, 1), ('room', 'cache-room', 0, 1);
+        INSERT INTO rooms (id, name, status, created_at)
+        VALUES ('cache-room', 'Cache Room', 'active', '2026-08-19T00:00:00.000Z');
+        INSERT INTO room_memberships (
+          room_id, actor_id, kind, role, participation, tool_permissions_json,
+          joined_at, configured_at, access_revision
+        ) VALUES (
+          'cache-room', 'cache-owner', 'human', 'member', NULL, '[]',
+          '2026-08-19T00:00:00.000Z', NULL, 0
+        );
+        UPDATE rooms SET owner_actor_id = 'cache-owner' WHERE id = 'cache-room';
+      `);
+      setup.exec("BEGIN IMMEDIATE");
+      const transaction = mintDatabaseAuthorityTransactionView(
+        setup,
+        "cache-room",
+        "worker-rpc-commit",
+      );
+      roomCacheInvalidationRegistration.participant?.invalidateRoomCacheInTransaction(
+        transaction,
+        { roomId: "cache-room", lifecycleGeneration: 0, reason: "room_archived" },
+      );
+      releaseDatabaseAuthorityTransactionView(transaction);
+      setup.exec("COMMIT");
+      setup.close();
+
+      worker = await createWorkerDatabaseClient({ databasePath: path });
+      const purged: string[] = [];
+      const dispatcher = new RoomCacheInvalidationPostCommitDispatcher({
+        authority: createWorkerRoomCacheInvalidationIntentAuthority(worker),
+        purge: {
+          async purgeCommittedRoom(intent) {
+            purged.push(intent.invalidationIntentId);
+          },
+        },
+        batchLimit: 8,
+      });
+      await expect(dispatcher.dispatchReadyBatch()).resolves.toEqual({
+        attempted: 1,
+        completed: 1,
+        failed: 0,
+      });
+      expect(purged).toHaveLength(1);
+      await expect(dispatcher.dispatchReadyBatch()).resolves.toEqual({
+        attempted: 0,
+        completed: 0,
+        failed: 0,
+      });
+    } finally {
+      await worker?.close();
+      try {
+        setup.close();
+      } catch {
+        // The committed setup connection is already closed on the success path.
+      }
       rmSync(directory, { recursive: true, force: true });
     }
   });

@@ -47,10 +47,14 @@ const AUTHORITY_TABLES = [
   "light_tasks",
   "message_topics",
   "messages",
+  "offline_read_lease_invalidations",
+  "offline_read_lease_issuances",
   "open_item_agent_failures",
   "open_items",
   "outbox_deliveries",
+  "room_access_authority",
   "room_audit",
+  "room_cache_invalidation_intents",
   "room_invitations",
   "room_memberships",
   "room_message_archive_gates",
@@ -471,7 +475,7 @@ describe("authority SQLite schema", () => {
   });
 
   it("rolls every v14 migration statement back with v13 schema and history intact", () => {
-    for (let failAfterStatement = 1; failAfterStatement <= 8; failAfterStatement += 1) {
+    for (let failAfterStatement = 1; failAfterStatement <= 15; failAfterStatement += 1) {
       withDatabase((database) => {
         migrateAuthorityDatabaseToPreviousVersionForTest(database);
         const before = snapshot(database);

@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { MAX_ACTIVE_SESSION_FAMILIES } from "./contracts.js";
+import {
+  ROOM_ACCESS_AUTHORITY_SCHEMA_STATEMENTS,
+  ROOM_CACHE_INVALIDATION_SCHEMA_STATEMENTS,
+} from "../access/room-cache-invalidation-port.js";
+import { OFFLINE_READ_LEASE_SCHEMA_STATEMENTS } from "../access/offline-lease-invalidation-port.js";
 
 export const AUTHORITY_SCHEMA_VERSION = 14 as const;
 
@@ -56,7 +61,7 @@ const SCHEMA_FINGERPRINTS = {
   11: "83e48fc5a4b1b1c19863efd785ea098308d100c1899d638d2b5f95c5b0c119a6",
   12: "7232d27114e9acf32dcfbc2d59f3c3128eed10955de3cc2703ddeedf92892741",
   13: "037df6a2818f2a90b7394240a4cf71d77949faf31df6534c5546c9ed6b7e7191",
-  14: "4c04a497104479ee92da9533426a09338925500dadc797923703eb5c818f4890",
+  14: "186018d645cc93912dbd6a4d723a5dfe95f68d5082773ff45b8f99afcdfafc8d",
 } as const;
 
 const V1_STATEMENTS = [
@@ -1213,6 +1218,9 @@ const V14_STATEMENTS = [
    ON agent_executions(room_id, room_archive_generation, status, queued_at, id)`,
   `CREATE INDEX tool_dispatches_execution_attempt_v14
    ON tool_dispatches(execution_id, attempt_seq)`,
+  ...ROOM_ACCESS_AUTHORITY_SCHEMA_STATEMENTS,
+  ...ROOM_CACHE_INVALIDATION_SCHEMA_STATEMENTS,
+  ...OFFLINE_READ_LEASE_SCHEMA_STATEMENTS,
 ] as const;
 
 const V2_STATEMENTS = [
@@ -1945,6 +1953,24 @@ const V14_SCHEMA_CONTRACT = {
   room_message_archive_gates: [
     "room_id", "gate_generation", "blocked_at",
   ],
+  room_access_authority: [
+    "room_id", "access_revision", "lease_generation",
+  ],
+  room_cache_invalidation_intents: [
+    "id", "room_id", "lifecycle_generation", "access_revision", "reason",
+    "status", "attempts", "available_at", "created_at", "completed_at",
+    "last_error_code",
+  ],
+  offline_read_lease_issuances: [
+    "lease_id", "room_id", "account_id", "actor_id", "session_family_id",
+    "device_id", "installation_id", "server_subject", "key_id",
+    "lifecycle_generation", "access_revision", "lease_generation",
+    "issued_at_ms", "not_before_ms", "expires_at_ms", "revoked_at_ms",
+  ],
+  offline_read_lease_invalidations: [
+    "id", "room_id", "lifecycle_generation", "access_revision",
+    "lease_generation", "revoked_lease_count", "reason", "created_at",
+  ],
   runtime_archive_fence_members: [
     "room_id", "archive_generation", "execution_id", "attempt_seq",
     "disposition", "fenced_at",
@@ -2575,6 +2601,58 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
           OR execution.current_attempt_seq <> member.attempt_seq
        LIMIT 1`,
       "runtime archive fence members must match Room, generation, and current attempt",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM room_access_authority AS access
+       JOIN rooms AS room ON room.id = access.room_id
+       WHERE access.access_revision < COALESCE((
+               SELECT MAX(membership.access_revision)
+               FROM room_memberships AS membership
+               WHERE membership.room_id = access.room_id
+             ), 0)
+          OR access.lease_generation < 0
+       LIMIT 1`,
+      "room access authority must not trail durable membership revisions",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM room_cache_invalidation_intents AS intent
+       JOIN rooms AS room ON room.id = intent.room_id
+       LEFT JOIN room_access_authority AS access ON access.room_id = intent.room_id
+       WHERE intent.lifecycle_generation > room.archive_generation
+          OR access.room_id IS NULL
+          OR intent.access_revision > access.access_revision
+       LIMIT 1`,
+      "room cache invalidations must be bounded by lifecycle and access authority",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM offline_read_lease_issuances AS issuance
+       JOIN rooms AS room ON room.id = issuance.room_id
+       LEFT JOIN room_access_authority AS access ON access.room_id = issuance.room_id
+       WHERE issuance.lifecycle_generation > room.archive_generation
+          OR access.room_id IS NULL
+          OR issuance.access_revision > access.access_revision
+          OR issuance.lease_generation > access.lease_generation
+       LIMIT 1`,
+      "offline lease issuances must be bounded by lifecycle and access authority",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM offline_read_lease_invalidations AS invalidation
+       JOIN rooms AS room ON room.id = invalidation.room_id
+       LEFT JOIN room_access_authority AS access ON access.room_id = invalidation.room_id
+       WHERE invalidation.lifecycle_generation > room.archive_generation
+          OR access.room_id IS NULL
+          OR invalidation.access_revision > access.access_revision
+          OR invalidation.lease_generation > access.lease_generation
+       LIMIT 1`,
+      "offline lease invalidations must be bounded by lifecycle and access authority",
     );
   }
 }
