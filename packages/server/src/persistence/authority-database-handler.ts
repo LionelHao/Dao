@@ -730,8 +730,8 @@ export function revalidateSnapshotDatabaseQuery(
     if (room === undefined) {
       return fail("room_not_found", "Snapshot room was not found");
     }
-    if (room.status !== "active") {
-      return fail("room_archived", "Snapshot room is archived");
+    if (room.status !== "active" && room.status !== "archived") {
+      return fail("storage_unavailable", "Snapshot room lifecycle is corrupt");
     }
     const membership = database.prepare(
       `SELECT access_revision AS accessRevision
@@ -785,8 +785,8 @@ export function inspectStreamingRepairScopeDatabaseQuery(
       if (room === undefined) return fail("room_not_found", "Streaming room was not found");
       return fail("room_forbidden", "Streaming room membership was rejected");
     }
-    if (row.roomStatus !== "active") {
-      return fail("room_archived", "Streaming room is archived");
+    if (row.roomStatus !== "active" && row.roomStatus !== "archived") {
+      return fail("storage_unavailable", "Streaming room lifecycle is corrupt");
     }
     if (typeof row.accessRevision !== "number" || typeof row.watermark !== "number") {
       return fail("storage_unavailable", "Streaming room version is corrupt");
@@ -847,7 +847,7 @@ export function readHistoryDatabaseQuery(
   now: number,
 ): readonly Message[] {
   const actorId = requireHumanSession(database, context, now);
-  requireRoomMembership(database, actorId, roomId);
+  requireCurrentHumanRoomMembership(database, actorId, roomId);
   return database.prepare(
     `SELECT id, room_id AS roomId, author_id AS authorId,
             author_kind AS authorKind, body, sent_at AS sentAt
@@ -889,7 +889,7 @@ function runAuthorityReadTransaction<Result>(
   }
 }
 
-function requireActiveHumanRoomMembership(
+function requireSyncHumanRoomMembership(
   database: DatabaseSync,
   actorId: string,
   roomId: string,
@@ -902,7 +902,7 @@ function requireActiveHumanRoomMembership(
        AND membership.actor_id = ?
        AND membership.kind = 'human'`,
   ).get(roomId, actorId);
-  if (row?.roomStatus !== "active") {
+  if (row?.roomStatus !== "active" && row?.roomStatus !== "archived") {
     fail("room_forbidden", "Authority room sync access was rejected");
   }
 }
@@ -940,7 +940,7 @@ export function syncRoomDatabaseQuery(
 ): RoomSyncResult {
   return runAuthorityReadTransaction(database, () => {
     const actorId = requireHumanSession(database, context, now);
-    requireActiveHumanRoomMembership(database, actorId, request.roomId);
+    requireSyncHumanRoomMembership(database, actorId, request.roomId);
     const stream = database.prepare(
       `SELECT head_seq AS headSeq, retained_from_seq AS retainedFromSeq
        FROM streams WHERE stream_kind = 'room' AND stream_id = ?`,
@@ -1198,7 +1198,7 @@ export function readRoomGovernanceDatabaseQuery(
   now: number,
 ): import("@native-im/core").RoomGovernanceView {
   const actorId = requireHumanSession(database, context, now);
-  requireRoomMembership(database, actorId, roomId);
+  requireCurrentHumanRoomMembership(database, actorId, roomId);
   return readGovernanceView(database, roomId);
 }
 
@@ -1215,7 +1215,7 @@ export function canAccessRoomDatabaseQuery(
      JOIN rooms AS room ON room.id = membership.room_id
      WHERE membership.room_id = ? AND membership.actor_id = ? AND membership.kind = 'human'`,
   ).get(roomId, actorId);
-  return membership?.roomStatus === "active";
+  return membership?.roomStatus === "active" || membership?.roomStatus === "archived";
 }
 
 export function readRoomAuditDatabaseQuery(
@@ -1225,7 +1225,7 @@ export function readRoomAuditDatabaseQuery(
   now: number,
 ): readonly RoomAuditRecord[] {
   const actorId = requireHumanSession(database, context, now);
-  requireRoomMembership(database, actorId, roomId);
+  requireCurrentHumanRoomMembership(database, actorId, roomId);
   return database.prepare(
     `SELECT id, type, room_id AS roomId, actor_id AS actorId,
             result, timestamp, details_json AS detailsJson
@@ -1599,6 +1599,24 @@ function requireRoomMembership(
     .get(roomId, actorId);
   if (membership?.roomStatus !== "active") {
     fail("room_forbidden", "Authority room access was rejected");
+  }
+}
+
+function requireCurrentHumanRoomMembership(
+  database: DatabaseSync,
+  actorId: string,
+  roomId: string,
+): void {
+  const membership = database.prepare(
+    `SELECT room.status AS roomStatus
+     FROM room_memberships AS membership
+     JOIN rooms AS room ON room.id = membership.room_id
+     JOIN actors AS actor ON actor.id = membership.actor_id
+     WHERE membership.room_id = ? AND membership.actor_id = ?
+       AND membership.kind = 'human' AND actor.kind = 'human'`,
+  ).get(roomId, actorId);
+  if (membership?.roomStatus !== "active" && membership?.roomStatus !== "archived") {
+    fail("room_forbidden", "Authority Human room membership was rejected");
   }
 }
 
