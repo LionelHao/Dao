@@ -50,7 +50,7 @@ const V13_MIGRATION_CHECKSUM =
 const V15_MIGRATION_CHECKSUM =
   "41740e7d34f6807248bf7879f34f9026844802dfe5a43f0ee18bf498a24dc0c9";
 const V16_MIGRATION_CHECKSUM =
-  "fe5e0cd58db3351d7ccc34d9e1a61b47ffe8ed2cce92fe36961356087338fe72";
+  "51e5b5114b90bc8407d7eec86a559da0170cec1ec0bfc1c5587d828a5765f1a7";
 const SCHEMA_FINGERPRINTS = {
   1: "03f2bbba4aa7082ec01819824726ce1bd9b4bd14cebea71afc93c6821dbf405c",
   2: "01c37d92ec2f303613a7bb8b592ca846fbea7c829b3c81fe4521699db949dfcc",
@@ -67,7 +67,7 @@ const SCHEMA_FINGERPRINTS = {
   13: "037df6a2818f2a90b7394240a4cf71d77949faf31df6534c5546c9ed6b7e7191",
   14: "b4f1034ce034203fd14f5bc32391cb8855f7d6eed64c0b01f75d41e331a8b5c5",
   15: "e8010dc3c03c71d51f20ef4054a815d3580abdcbd0762791508226a68918b426",
-  16: "731b820e7b18e6f9d794784fa88ccb478224195cff0d56d7a255a582d5a49cbc",
+  16: "86a3512dcb625bc3e0f3d79e5a5d6542819523bee8ac851990148bcad8e38737",
 } as const;
 
 const V1_STATEMENTS = [
@@ -2026,16 +2026,16 @@ const V16_STATEMENTS = [
    BEFORE INSERT ON agent_invocation_intents
    WHEN length(NEW.id) = 0 OR length(NEW.room_id) = 0
       OR COALESCE((SELECT kind FROM actors WHERE id = NEW.target_agent_id), '') <> 'agent'
-      OR COALESCE((SELECT kind FROM actors WHERE id = NEW.requester_actor_id), '') <> 'human'
-      OR NOT EXISTS (
-        SELECT 1 FROM messages AS source
-        WHERE source.id = NEW.source_message_id
-          AND source.room_id = NEW.room_id
-          AND source.author_id = NEW.requester_actor_id
-          AND source.author_kind = 'human'
-      )
       OR (NEW.origin_kind = 'message_target' AND (
-        NEW.status <> 'pending' OR NEW.execution_id IS NOT NULL
+        COALESCE((SELECT kind FROM actors WHERE id = NEW.requester_actor_id), '') <> 'human'
+        OR NOT EXISTS (
+          SELECT 1 FROM messages AS source
+          WHERE source.id = NEW.source_message_id
+            AND source.room_id = NEW.room_id
+            AND source.author_id = NEW.requester_actor_id
+            AND source.author_kind = 'human'
+        )
+        OR NEW.status <> 'pending' OR NEW.execution_id IS NOT NULL
         OR NEW.intent_kind <> 'direct_mention'
         OR NEW.source_revision <> 1
         OR NEW.message_transaction_id <> NEW.source_message_id
@@ -2045,6 +2045,19 @@ const V16_STATEMENTS = [
             AND mention.target_id = NEW.target_id
             AND mention.target_kind = 'agent-invocation'
             AND mention.target_actor_id = NEW.target_agent_id
+        )
+      ))
+      OR (NEW.origin_kind = 'legacy_runtime' AND (
+        COALESCE((SELECT kind FROM actors WHERE id = NEW.requester_actor_id), '')
+          NOT IN ('human', 'agent')
+        OR NOT EXISTS (
+          SELECT 1
+          FROM messages AS source
+          JOIN actors AS requester ON requester.id = NEW.requester_actor_id
+          WHERE source.id = NEW.source_message_id
+            AND source.room_id = NEW.room_id
+            AND source.author_id = requester.id
+            AND source.author_kind = requester.kind
         )
       ))
    BEGIN
@@ -4498,12 +4511,13 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
        JOIN actors AS requester ON requester.id = intent.requester_actor_id
        JOIN actors AS target ON target.id = intent.target_agent_id
        JOIN messages AS source ON source.id = intent.source_message_id
-       WHERE requester.kind <> 'human' OR target.kind <> 'agent'
-          OR source.author_kind <> 'human'
+       WHERE target.kind <> 'agent'
           OR source.author_id <> intent.requester_actor_id
+          OR source.author_kind <> requester.kind
           OR source.room_id <> intent.room_id
           OR (intent.origin_kind = 'message_target' AND (
-                intent.target_id IS NULL OR intent.message_transaction_id IS NULL
+                requester.kind <> 'human' OR source.author_kind <> 'human'
+                OR intent.target_id IS NULL OR intent.message_transaction_id IS NULL
                 OR intent.lineage_id IS NULL OR intent.turn_id IS NULL
                 OR intent.execution_id IS NOT NULL
                 OR NOT EXISTS (

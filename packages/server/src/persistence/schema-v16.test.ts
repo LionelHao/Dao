@@ -269,7 +269,7 @@ describe("authority SQLite v16 Message Authority", () => {
         "SELECT name, checksum FROM schema_migrations WHERE version = 16",
       ).get()).toEqual({
         name: "message-authority-vnext",
-        checksum: "fe5e0cd58db3351d7ccc34d9e1a61b47ffe8ed2cce92fe36961356087338fe72",
+        checksum: "51e5b5114b90bc8407d7eec86a559da0170cec1ec0bfc1c5587d828a5765f1a7",
       });
       const indexes = database.prepare(
         `SELECT name FROM sqlite_schema
@@ -423,6 +423,99 @@ describe("authority SQLite v16 Message Authority", () => {
       expect(database.prepare("SELECT COUNT(*) AS count FROM events").get()).toEqual(beforeEvents);
       expect(database.prepare("SELECT COUNT(*) AS count FROM outbox_deliveries").get())
         .toEqual(beforeOutbox);
+    });
+  });
+
+  it("accepts legacy runtime intent from its exact Agent source without weakening message targets", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabaseToVersion15ForTest(database);
+      seedRoomAndLegacyMessages(database);
+      database.exec(`
+        INSERT INTO agent_executions (
+          id, room_id, room_archive_generation, agent_id, trigger_message_id,
+          status, started_at, completed_at, result_json, requester_actor_id,
+          tool_name, action_category, tool_dispatch_phase, current_attempt_seq,
+          retry_cycle, retry_ordinal, provider_id, model_id, recovery_cursor,
+          queued_at, updated_at
+        ) VALUES (
+          'backfilled-agent-execution', 'v16-room', 0, 'v16-agent-2', 'legacy-agent',
+          'queued', '2026-08-19T00:03:00.000Z', NULL, NULL, 'v16-agent',
+          'model.generate', 'model_generation', NULL, 1, 1, 1, NULL, NULL, 0,
+          '2026-08-19T00:03:00.000Z', '2026-08-19T00:03:00.000Z'
+        );
+        INSERT INTO agent_execution_attempts (
+          execution_id, attempt_seq, retry_cycle, retry_ordinal, status,
+          action_category, recovery_cursor
+        ) VALUES (
+          'backfilled-agent-execution', 1, 1, 1, 'queued', 'model_generation', 0
+        );
+        INSERT INTO agent_invocation_intents (
+          id, room_id, source_message_id, target_agent_id, requester_actor_id,
+          intent_kind, execution_id, created_at
+        ) VALUES (
+          'backfilled-agent-intent', 'v16-room', 'legacy-agent', 'v16-agent-2',
+          'v16-agent', 'direct_mention', 'backfilled-agent-execution',
+          '2026-08-19T00:03:00.000Z'
+        );
+      `);
+      migrateAuthorityDatabase(database);
+      expect(database.prepare(
+        `SELECT requester_actor_id AS requesterActorId, origin_kind AS originKind
+         FROM agent_invocation_intents WHERE id = 'backfilled-agent-intent'`,
+      ).get()).toEqual({ requesterActorId: "v16-agent", originKind: "legacy_runtime" });
+      database.exec(`
+        INSERT INTO agent_executions (
+          id, room_id, room_archive_generation, agent_id, trigger_message_id,
+          status, started_at, completed_at, result_json, requester_actor_id,
+          tool_name, action_category, tool_dispatch_phase, current_attempt_seq,
+          retry_cycle, retry_ordinal, provider_id, model_id, recovery_cursor,
+          queued_at, updated_at
+        ) VALUES (
+          'agent-source-execution', 'v16-room', 0, 'v16-agent-2', 'legacy-agent',
+          'queued', '2026-08-19T00:04:00.000Z', NULL, NULL, 'v16-agent',
+          'model.generate', 'model_generation', NULL, 1, 1, 1, NULL, NULL, 0,
+          '2026-08-19T00:04:00.000Z', '2026-08-19T00:04:00.000Z'
+        );
+        INSERT INTO agent_execution_attempts (
+          execution_id, attempt_seq, retry_cycle, retry_ordinal, status,
+          action_category, recovery_cursor
+        ) VALUES (
+          'agent-source-execution', 1, 1, 1, 'queued', 'model_generation', 0
+        );
+      `);
+
+      expect(() => database.prepare(
+        `INSERT INTO agent_invocation_intents (
+           id, room_id, source_message_id, target_agent_id, requester_actor_id,
+           intent_kind, execution_id, created_at
+         ) VALUES (
+           'agent-source-intent', 'v16-room', 'legacy-agent', 'v16-agent-2',
+           'v16-agent', 'direct_mention', 'agent-source-execution',
+           '2026-08-19T00:04:00.000Z'
+         )`,
+      ).run()).not.toThrow();
+      expect(() => database.prepare(
+        `INSERT INTO agent_invocation_intents (
+           id, room_id, source_message_id, target_agent_id, requester_actor_id,
+           intent_kind, execution_id, created_at
+         ) VALUES (
+           'mismatched-requester', 'v16-room', 'legacy-agent', 'v16-agent-2',
+           'v16-human', 'direct_mention', NULL, '2026-08-19T00:05:00.000Z'
+         )`,
+      ).run()).toThrow(/binding/i);
+      expect(() => database.prepare(
+        `INSERT INTO agent_invocation_intents (
+           id, room_id, source_message_id, target_agent_id, requester_actor_id,
+           intent_kind, execution_id, created_at, message_transaction_id,
+           target_id, source_revision, lineage_id, turn_id, origin_kind, status
+         ) VALUES (
+           'agent-message-target', 'v16-room', 'legacy-agent', 'v16-agent-2',
+           'v16-agent', 'direct_mention', NULL, '2026-08-19T00:05:00.000Z',
+           'legacy-agent', 'target-agent', 1, 'agent-lineage', 'agent-turn',
+           'message_target', 'pending'
+         )`,
+      ).run()).toThrow(/binding/i);
+      expect(() => migrateAuthorityDatabase(database)).not.toThrow();
     });
   });
 
