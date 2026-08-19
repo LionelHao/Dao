@@ -70,6 +70,8 @@ function seedArchivedRoom(database: DatabaseSync): void {
     WHERE id = 'archived-room';
     INSERT INTO room_message_archive_gates (room_id, gate_generation, blocked_at)
     VALUES ('archived-room', 1, '2026-08-19T00:01:00.000Z');
+    INSERT INTO room_access_authority (room_id, access_revision, lease_generation)
+    VALUES ('archived-room', 9, 1);
     INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
     VALUES (
       'history-message', 'archived-room', 'owner', 'human', 'historical fact',
@@ -100,13 +102,13 @@ describe("archived Room current-Human read authority", () => {
         kind: "room",
         context,
         roomId: "archived-room",
-        accessRevision: 7,
+        accessRevision: 9,
       }, 2)).not.toThrow();
       expect(inspectStreamingRepairScopeDatabaseQuery(database, context, {
         kind: "room", roomId: "archived-room",
       }, 2)).toEqual({
         version: { kind: "room", roomId: "archived-room", watermark: 0 },
-        authorizationRevision: 7,
+        authorizationRevision: 9,
       });
 
       database.prepare(

@@ -814,9 +814,15 @@ export function revalidateSnapshotDatabaseQuery(
       return fail("storage_unavailable", "Snapshot room lifecycle is corrupt");
     }
     const membership = database.prepare(
-      `SELECT access_revision AS accessRevision
-       FROM room_memberships
-       WHERE room_id = ? AND actor_id = ? AND kind = 'human'`,
+      `SELECT CASE
+                WHEN access.access_revision IS NULL OR
+                     membership.access_revision > access.access_revision
+                  THEN membership.access_revision
+                ELSE access.access_revision
+              END AS accessRevision
+       FROM room_memberships AS membership
+       LEFT JOIN room_access_authority AS access ON access.room_id = membership.room_id
+       WHERE membership.room_id = ? AND membership.actor_id = ? AND membership.kind = 'human'`,
     ).get(validation.roomId, actorId);
     if (membership === undefined) {
       return fail("room_forbidden", "Snapshot room membership was rejected");
@@ -852,11 +858,17 @@ export function inspectStreamingRepairScopeDatabaseQuery(
     }
     const row = database.prepare(
       `SELECT room.status AS roomStatus,
-              membership.access_revision AS accessRevision,
+              CASE
+                WHEN access.access_revision IS NULL OR
+                     membership.access_revision > access.access_revision
+                  THEN membership.access_revision
+                ELSE access.access_revision
+              END AS accessRevision,
               stream.head_seq AS watermark
        FROM rooms AS room
        JOIN room_memberships AS membership ON membership.room_id = room.id
        JOIN streams AS stream ON stream.stream_kind = 'room' AND stream.stream_id = room.id
+       LEFT JOIN room_access_authority AS access ON access.room_id = room.id
        WHERE room.id = ? AND membership.actor_id = ? AND membership.kind = 'human'`,
     ).get(scope.roomId, actorId);
     if (row === undefined) {

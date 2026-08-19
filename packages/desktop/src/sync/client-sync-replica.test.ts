@@ -5,6 +5,7 @@ import type {
   RoomCursor,
   RoomRepairPage,
   RoomRepairRecord,
+  RoomGovernanceView,
   RoomSummary,
   RoomSyncRequest,
   RoomSyncResult,
@@ -13,6 +14,7 @@ import type {
   WorkspaceBootstrapPage,
 } from "@native-im/core";
 import { describe, expect, it, vi } from "vitest";
+import { createGovernanceReplicaFeed } from "../governance/controller.js";
 
 import {
   ClientSyncReplicaError,
@@ -77,6 +79,44 @@ function event(sequence: number, id = `event-${sequence}`): PersistedRoomEvent {
       body: `message ${sequence}`,
       sentAt: "2026-08-12T00:00:00.000Z",
     },
+  };
+}
+
+const governanceView: RoomGovernanceView = {
+  roomId: "room-1",
+  projectId: "room-1",
+  lifecycle: "archived",
+  governanceRevision: 8,
+  ownerActorId: "human-1",
+  archivedAt: "2026-08-19T08:00:00.000Z",
+  archiveGeneration: 1,
+};
+
+function governanceEvent(sequence: number, id = `governance-event-${sequence}`): PersistedRoomEvent {
+  return {
+    eventId: id,
+    streamKind: "room",
+    streamId: "room-1",
+    streamSeq: sequence,
+    roomId: "room-1",
+    actorId: "human-1",
+    occurredAt: "2026-08-19T08:00:00.000Z",
+    type: "room.governance.changed",
+    payload: { governance: governanceView },
+  };
+}
+
+function archivedEvent(sequence: number, id = `archived-event-${sequence}`): PersistedRoomEvent {
+  return {
+    eventId: id,
+    streamKind: "room",
+    streamId: "room-1",
+    streamSeq: sequence,
+    roomId: "room-1",
+    actorId: "human-1",
+    occurredAt: "2026-08-19T08:00:00.000Z",
+    type: "room.archived",
+    payload: { governance: governanceView, archiveGeneration: 1, frozenTimerCount: 0 },
   };
 }
 
@@ -292,6 +332,72 @@ function statusError(status: number): Error & { status: number } {
 }
 
 describe("ClientSyncReplica", () => {
+  it("publishes governance event IDs and projection only after the cache applies the stable batch", async () => {
+    const transport = new FakeTransport();
+    const cache = new MemoryCache();
+    const applied = vi.fn((application) => {
+      expect(cache.liveRoom("room-1")?.events.map((item) => item.eventId)).toContain("event-archive");
+      expect(application).toEqual({
+        source: "events", roomId: "room-1", eventIds: ["event-archive"], governance: governanceView,
+      });
+    });
+    const governanceFeed = createGovernanceReplicaFeed();
+    governanceFeed.subscribe(applied);
+    const replica = createClientSyncReplica({
+      transport, cache, governanceObserver: governanceFeed,
+    });
+    await replica.restoreWorkspace();
+
+    await transport.observer?.events(
+      [governanceEvent(10, "event-archive")],
+      { version: 1, roomId: "room-1", afterSeq: 10 },
+    );
+    expect(applied).toHaveBeenCalledOnce();
+  });
+
+  it("publishes the governance carried by a closed lifecycle event for ACK convergence", async () => {
+    const transport = new FakeTransport();
+    const cache = new MemoryCache();
+    const applied = vi.fn();
+    const replica = createClientSyncReplica({ transport, cache, governanceObserver: { applied } });
+    await replica.restoreWorkspace();
+
+    await transport.observer?.events(
+      [archivedEvent(10, "event-lifecycle-archive")],
+      { version: 1, roomId: "room-1", afterSeq: 10 },
+    );
+
+    expect(applied).toHaveBeenLastCalledWith({
+      source: "events", roomId: "room-1", eventIds: ["event-lifecycle-archive"],
+      governance: governanceView,
+    });
+  });
+
+  it("publishes a repair governance projection only after atomic generation commit", async () => {
+    const transport = new FakeTransport();
+    const cache = new MemoryCache();
+    const records: readonly RoomRepairRecord[] = [
+      roomRecord,
+      { kind: "governance", value: governanceView },
+    ];
+    transport.repairs.set("room-1", [repairPage({
+      records,
+      snapshotChecksum: checksum("room", records),
+    })]);
+    const applied = vi.fn((application) => {
+      expect(cache.liveRoom("room-1")?.records).toEqual(records);
+      expect(application).toEqual({
+        source: "repair", roomId: "room-1", eventIds: [], governance: governanceView,
+      });
+    });
+    const replica = createClientSyncReplica({
+      transport, cache, governanceObserver: { applied },
+    });
+
+    await replica.restoreWorkspace();
+    expect(applied).toHaveBeenCalledOnce();
+  });
+
   it("keeps replica buffering O(page) and delegates staged canonical verification to the cache", async () => {
     const transport = new FakeTransport();
     const cache = new MemoryCache();

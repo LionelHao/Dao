@@ -1,5 +1,6 @@
 import {
   isRoomRepairPage,
+  isRoomGovernanceView,
   isRoomCursor,
   isRoomSyncResult,
   isSnapshotCompleted,
@@ -7,6 +8,7 @@ import {
   type PersistedRoomEvent,
   type RoomCursor,
   type RoomRepairPage,
+  type RoomGovernanceView,
   type RoomSyncRequest,
   type RoomSyncResult,
   type SnapshotCompleted,
@@ -15,14 +17,14 @@ import {
 } from "@native-im/core";
 
 export interface RoomSubscriptionObserver {
-  events(events: readonly PersistedRoomEvent[], cursor: RoomCursor): Promise<void>;
+  events(events: readonly DesktopRoomEvent[], cursor: RoomCursor): Promise<void>;
   retry(restartFrom: RoomCursor): Promise<void>;
 }
 
 export interface SyncTransport {
   bootstrapBegin(requestId: string): Promise<WorkspaceBootstrapPage>;
   bootstrapPage(requestId: string, snapshotId: string, afterPage: number): Promise<WorkspaceBootstrapPage>;
-  syncRoom(request: RoomSyncRequest): Promise<RoomSyncResult>;
+  syncRoom(request: RoomSyncRequest): Promise<DesktopRoomSyncResult>;
   repairRoomBegin(requestId: string, roomId: string): Promise<RoomRepairPage>;
   repairRoomPage(requestId: string, snapshotId: string, afterPage: number): Promise<RoomRepairPage>;
   completeSnapshot(
@@ -56,11 +58,64 @@ export interface ClientAuthorityCache {
   commitRoom(roomId: string, watermark: number, checksum: string): void;
   applyRoomEvents(
     roomId: string,
-    events: readonly PersistedRoomEvent[],
+    events: readonly DesktopRoomEvent[],
     cursor: RoomCursor,
   ): void;
   discardSnapshot(snapshotId: string): void;
   clear(): void;
+}
+
+export type DesktopRoomEvent = PersistedRoomEvent;
+export type DesktopRoomSyncResult =
+  | Exclude<RoomSyncResult, { readonly mode: "delta" }>
+  | (Omit<Extract<RoomSyncResult, { readonly mode: "delta" }>, "events"> & {
+      readonly events: readonly DesktopRoomEvent[];
+    });
+
+type UnknownRecord = Record<string, unknown>;
+function record(value: unknown): value is UnknownRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function exact(value: UnknownRecord, required: readonly string[]): boolean {
+  const fields = new Set(required);
+  return Reflect.ownKeys(value).length === fields.size &&
+    required.every((key) => Object.hasOwn(value, key)) &&
+    Reflect.ownKeys(value).every((key) => typeof key === "string" && fields.has(key));
+}
+function text(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 512;
+}
+function count(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+export function isDesktopRoomEvent(value: unknown): value is DesktopRoomEvent {
+  if (!record(value) || !text(value.roomId) || !count(value.streamSeq)) return false;
+  return isRoomSyncResult({
+    type: "room.sync.result", requestId: "desktop-event-validation", mode: "delta", events: [value],
+    nextCursor: { version: 1, roomId: value.roomId, afterSeq: value.streamSeq },
+    watermark: value.streamSeq, hasMore: false,
+  });
+}
+
+export function isDesktopRoomSyncResult(value: unknown): value is DesktopRoomSyncResult {
+  if (isRoomSyncResult(value)) return true;
+  if (!record(value) || !exact(value, [
+    "type", "requestId", "mode", "events", "nextCursor", "watermark", "hasMore",
+  ]) || value.type !== "room.sync.result" || !text(value.requestId) || value.mode !== "delta" ||
+      !Array.isArray(value.events) || !value.events.every(isDesktopRoomEvent) ||
+      !isRoomCursor(value.nextCursor) || !count(value.watermark) || typeof value.hasMore !== "boolean") return false;
+  const events = value.events;
+  const nextCursor = value.nextCursor as RoomCursor;
+  if (new Set(events.map((event) => event.eventId)).size !== events.length ||
+      events.some((event) => event.roomId !== nextCursor.roomId) ||
+      nextCursor.afterSeq > value.watermark ||
+      value.hasMore !== (nextCursor.afterSeq < value.watermark) ||
+      (value.hasMore ? nextCursor.watermark !== value.watermark
+        : Object.hasOwn(nextCursor, "watermark"))) return false;
+  if (events.length === 0) return nextCursor.afterSeq === value.watermark;
+  return events.at(-1)?.streamSeq === nextCursor.afterSeq &&
+    events.every((event, index) => index === 0 || event.streamSeq === events[index - 1]!.streamSeq + 1);
 }
 
 export class ClientSyncReplicaError extends Error {
@@ -86,6 +141,24 @@ export interface ClientSyncReplica {
   repairRoom(roomId: string): Promise<void>;
   clearAndRestore(): Promise<void>;
   close(): void;
+}
+
+export type ClientGovernanceApplication =
+  | {
+      readonly source: "events";
+      readonly roomId: string;
+      readonly eventIds: readonly string[];
+      readonly governance?: RoomGovernanceView;
+    }
+  | {
+      readonly source: "repair";
+      readonly roomId: string;
+      readonly eventIds: readonly [];
+      readonly governance: RoomGovernanceView;
+    };
+
+export interface ClientGovernanceObserver {
+  applied(application: ClientGovernanceApplication): void;
 }
 
 interface SnapshotEnvelope {
@@ -137,10 +210,10 @@ function validateRoomPage(
 }
 
 function deduplicateEvents(
-  events: readonly PersistedRoomEvent[],
+  events: readonly DesktopRoomEvent[],
   seen: Set<string>,
-): readonly PersistedRoomEvent[] {
-  const result: PersistedRoomEvent[] = [];
+): readonly DesktopRoomEvent[] {
+  const result: DesktopRoomEvent[] = [];
   for (const event of events) {
     if (!seen.has(event.eventId)) {
       seen.add(event.eventId);
@@ -150,13 +223,13 @@ function deduplicateEvents(
   return result;
 }
 
-function validateEventShape(roomId: string, event: PersistedRoomEvent): void {
+function validateEventShape(roomId: string, event: DesktopRoomEvent): void {
   const eventCursor: RoomCursor = {
     version: 1,
     roomId,
     afterSeq: event.streamSeq,
   };
-  if (!isRoomSyncResult({
+  if (!isDesktopRoomSyncResult({
     type: "room.sync.result",
     requestId: "observer-event-validation",
     mode: "delta",
@@ -172,7 +245,7 @@ function validateEventShape(roomId: string, event: PersistedRoomEvent): void {
 function validateEventAdvance(
   roomId: string,
   current: RoomCursor,
-  events: readonly PersistedRoomEvent[],
+  events: readonly DesktopRoomEvent[],
   next: RoomCursor,
 ): void {
   if (!isRoomCursor(current) || !isRoomCursor(next) ||
@@ -201,6 +274,7 @@ function validateEventAdvance(
 export function createClientSyncReplica(options: {
   readonly transport: SyncTransport;
   readonly cache: ClientAuthorityCache;
+  readonly governanceObserver?: ClientGovernanceObserver;
 }): ClientSyncReplica {
   const { transport, cache } = options;
   const subscriptions = new Map<string, RoomSubscription>();
@@ -229,7 +303,7 @@ export function createClientSyncReplica(options: {
 
   const applyEvents = (
     roomId: string,
-    events: readonly PersistedRoomEvent[],
+    events: readonly DesktopRoomEvent[],
     cursor: RoomCursor,
   ): void => {
     const current = cache.roomCursor(roomId) ?? { version: 1, roomId, afterSeq: 0 };
@@ -239,6 +313,25 @@ export function createClientSyncReplica(options: {
     const fresh = deduplicateEvents(events, candidateSeen);
     validateEventAdvance(roomId, current, fresh, cursor);
     cache.applyRoomEvents(roomId, fresh, cursor);
+    if (fresh.length > 0) {
+      let governance: RoomGovernanceView | undefined;
+      for (const event of fresh) {
+        if (event.type === "room.governance.changed" || event.type === "room.archived" ||
+            event.type === "room.reopened" || event.type === "room.security.reduced") {
+          governance = event.payload.governance;
+        }
+      }
+      try {
+        options.governanceObserver?.applied({
+          source: "events",
+          roomId,
+          eventIds: fresh.map((event) => event.eventId),
+          ...(governance === undefined ? {} : { governance }),
+        });
+      } catch {
+        // Projection listeners cannot roll back an already committed authority cache update.
+      }
+    }
     for (const event of fresh) seen.add(event.eventId);
     seenByRoom.set(roomId, seen);
   };
@@ -246,13 +339,13 @@ export function createClientSyncReplica(options: {
   const syncFrom = async (
     roomId: string,
     initialCursor: RoomCursor,
-    apply: (events: readonly PersistedRoomEvent[], cursor: RoomCursor) => void =
+    apply: (events: readonly DesktopRoomEvent[], cursor: RoomCursor) => void =
       (events, cursor) => applyEvents(roomId, events, cursor),
     assertCurrent: () => void = requireOpen,
   ): Promise<RoomCursor> => {
     let cursor = initialCursor;
     let fixedWatermark: number | undefined;
-    const events: PersistedRoomEvent[] = [];
+    const events: DesktopRoomEvent[] = [];
     for (;;) {
       const request: RoomSyncRequest = {
         type: "room.sync",
@@ -262,7 +355,7 @@ export function createClientSyncReplica(options: {
       };
       const result = await transport.syncRoom(request);
       assertCurrent();
-      if (!isRoomSyncResult(result) || result.requestId !== request.requestId) {
+      if (!isDesktopRoomSyncResult(result) || result.requestId !== request.requestId) {
         throw invalid("Room sync result did not match its request");
       }
       if (result.mode === "repair_required") {
@@ -297,7 +390,7 @@ export function createClientSyncReplica(options: {
   ): Promise<void> => {
     const assertCurrent = options.assertCurrent ?? requireOpen;
     const generation = (subscriptionGenerations.get(roomId) ?? 0) + 1;
-    const buffered: { events: readonly PersistedRoomEvent[]; cursor: RoomCursor }[] = [];
+    const buffered: { events: readonly DesktopRoomEvent[]; cursor: RoomCursor }[] = [];
     let activated = false;
     const observer: RoomSubscriptionObserver = {
       events: async (events, nextCursor) => {
@@ -357,7 +450,7 @@ export function createClientSyncReplica(options: {
     }
     const bufferedSeen = new Set(seenByRoom.get(roomId) ?? []);
     let bufferedCursor = cursor;
-    const prepared: { events: readonly PersistedRoomEvent[]; cursor: RoomCursor }[] = [];
+    const prepared: { events: readonly DesktopRoomEvent[]; cursor: RoomCursor }[] = [];
     try {
       for (const item of buffered) {
         for (const event of item.events) validateEventShape(roomId, event);
@@ -445,9 +538,17 @@ export function createClientSyncReplica(options: {
       checksum: first.snapshotChecksum,
       watermark: first.watermark,
     } as const;
+    let repairGovernance: RoomGovernanceView | undefined;
+    const captureGovernance = (page: RoomRepairPage): void => {
+      for (const record of page.records) {
+        if (record.kind === "governance" && isRoomGovernanceView(record.value) &&
+            record.value.roomId === roomId) repairGovernance = record.value;
+      }
+    };
     try {
       cache.beginRoom(roomId, first.snapshotId);
       cache.stageRoomPage(first);
+      captureGovernance(first);
       let page = first;
       while (page.hasMore) {
         const pageRequestId = requestId("room-repair-page");
@@ -456,6 +557,7 @@ export function createClientSyncReplica(options: {
         validateRoomPage(next, roomId, page.page + 1, envelope);
         if (next.requestId !== pageRequestId) throw invalid("Room repair response did not match its request");
         cache.stageRoomPage(next);
+        captureGovernance(next);
         page = next;
       }
       if (!await cache.finalizeRoom(first.snapshotId, first.snapshotChecksum)) {
@@ -471,6 +573,15 @@ export function createClientSyncReplica(options: {
       }
       assertCurrent();
       cache.commitRoom(roomId, first.watermark, first.snapshotChecksum);
+      if (repairGovernance !== undefined) {
+        try {
+          options.governanceObserver?.applied({
+            source: "repair", roomId, eventIds: [], governance: repairGovernance,
+          });
+        } catch {
+          // Projection listeners cannot roll back an atomically committed repair generation.
+        }
+      }
       seenByRoom.set(roomId, new Set<string>());
       const cursor = await syncFrom(
         roomId,
