@@ -56,7 +56,7 @@ const SCHEMA_FINGERPRINTS = {
   11: "83e48fc5a4b1b1c19863efd785ea098308d100c1899d638d2b5f95c5b0c119a6",
   12: "7232d27114e9acf32dcfbc2d59f3c3128eed10955de3cc2703ddeedf92892741",
   13: "037df6a2818f2a90b7394240a4cf71d77949faf31df6534c5546c9ed6b7e7191",
-  14: "79bb22503b76bcbb1826f52cf827cea2cfa0db04abf2419ad7ed30ff81681cf6",
+  14: "4c04a497104479ee92da9533426a09338925500dadc797923703eb5c818f4890",
 } as const;
 
 const V1_STATEMENTS = [
@@ -1176,6 +1176,43 @@ const V14_STATEMENTS = [
    WHERE status = 'archived'
      AND archive_generation > 0
      AND archived_at IS NOT NULL`,
+  `ALTER TABLE agent_executions
+   ADD COLUMN room_archive_generation INTEGER NOT NULL DEFAULT 0
+   CHECK (room_archive_generation >= 0)`,
+  `CREATE TABLE runtime_archive_fences (
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    archive_generation INTEGER NOT NULL CHECK (archive_generation > 0),
+    fenced_at TEXT NOT NULL,
+    fenced_queued_count INTEGER NOT NULL DEFAULT 0 CHECK (fenced_queued_count >= 0),
+    fenced_waiting_count INTEGER NOT NULL DEFAULT 0 CHECK (fenced_waiting_count >= 0),
+    preserved_dispatched_count INTEGER NOT NULL DEFAULT 0
+      CHECK (preserved_dispatched_count >= 0),
+    preserved_outcome_review_count INTEGER NOT NULL DEFAULT 0
+      CHECK (preserved_outcome_review_count >= 0),
+    PRIMARY KEY (room_id, archive_generation)
+  ) STRICT`,
+  `CREATE TABLE runtime_archive_fence_members (
+    room_id TEXT NOT NULL,
+    archive_generation INTEGER NOT NULL,
+    execution_id TEXT NOT NULL REFERENCES agent_executions(id),
+    attempt_seq INTEGER NOT NULL CHECK (attempt_seq >= 1),
+    disposition TEXT NOT NULL CHECK (disposition IN (
+      'cancelled_queued', 'cancelled_waiting',
+      'preserved_dispatched', 'preserved_outcome_review'
+    )),
+    fenced_at TEXT NOT NULL,
+    PRIMARY KEY (room_id, archive_generation, execution_id),
+    FOREIGN KEY (room_id, archive_generation)
+      REFERENCES runtime_archive_fences(room_id, archive_generation),
+    FOREIGN KEY (execution_id, attempt_seq)
+      REFERENCES agent_execution_attempts(execution_id, attempt_seq)
+  ) STRICT`,
+  `CREATE INDEX runtime_archive_fence_members_execution
+   ON runtime_archive_fence_members(execution_id, archive_generation)`,
+  `CREATE INDEX agent_executions_room_generation_status_v14
+   ON agent_executions(room_id, room_archive_generation, status, queued_at, id)`,
+  `CREATE INDEX tool_dispatches_execution_attempt_v14
+   ON tool_dispatches(execution_id, attempt_seq)`,
 ] as const;
 
 const V2_STATEMENTS = [
@@ -1901,8 +1938,21 @@ const V13_SCHEMA_CONTRACT = {
 
 const V14_SCHEMA_CONTRACT = {
   ...V13_SCHEMA_CONTRACT,
+  agent_executions: [
+    ...V13_SCHEMA_CONTRACT.agent_executions,
+    "room_archive_generation",
+  ],
   room_message_archive_gates: [
     "room_id", "gate_generation", "blocked_at",
+  ],
+  runtime_archive_fence_members: [
+    "room_id", "archive_generation", "execution_id", "attempt_seq",
+    "disposition", "fenced_at",
+  ],
+  runtime_archive_fences: [
+    "room_id", "archive_generation", "fenced_at", "fenced_queued_count",
+    "fenced_waiting_count", "preserved_dispatched_count",
+    "preserved_outcome_review_count",
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
@@ -2470,6 +2520,61 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
               ))
        LIMIT 1`,
       "message archive gates must match the current archived generation",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_executions AS execution
+       JOIN rooms AS room ON room.id = execution.room_id
+       WHERE execution.room_archive_generation < 0
+          OR execution.room_archive_generation > room.archive_generation
+       LIMIT 1`,
+      "runtime execution generations must not outrun Room lifecycle generations",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM runtime_archive_fences AS fence
+       JOIN rooms AS room ON room.id = fence.room_id
+       WHERE fence.archive_generation > room.archive_generation
+          OR fence.archive_generation <= 0
+          OR fence.fenced_queued_count <> (
+            SELECT COUNT(*) FROM runtime_archive_fence_members AS member
+            WHERE member.room_id = fence.room_id
+              AND member.archive_generation = fence.archive_generation
+              AND member.disposition = 'cancelled_queued'
+          )
+          OR fence.fenced_waiting_count <> (
+            SELECT COUNT(*) FROM runtime_archive_fence_members AS member
+            WHERE member.room_id = fence.room_id
+              AND member.archive_generation = fence.archive_generation
+              AND member.disposition = 'cancelled_waiting'
+          )
+          OR fence.preserved_dispatched_count <> (
+            SELECT COUNT(*) FROM runtime_archive_fence_members AS member
+            WHERE member.room_id = fence.room_id
+              AND member.archive_generation = fence.archive_generation
+              AND member.disposition = 'preserved_dispatched'
+          )
+          OR fence.preserved_outcome_review_count <> (
+            SELECT COUNT(*) FROM runtime_archive_fence_members AS member
+            WHERE member.room_id = fence.room_id
+              AND member.archive_generation = fence.archive_generation
+              AND member.disposition = 'preserved_outcome_review'
+          )
+       LIMIT 1`,
+      "runtime archive fence counts must match their durable member ledger",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM runtime_archive_fence_members AS member
+       JOIN agent_executions AS execution ON execution.id = member.execution_id
+       WHERE execution.room_id <> member.room_id
+          OR execution.room_archive_generation > member.archive_generation
+          OR execution.current_attempt_seq <> member.attempt_seq
+       LIMIT 1`,
+      "runtime archive fence members must match Room, generation, and current attempt",
     );
   }
 }

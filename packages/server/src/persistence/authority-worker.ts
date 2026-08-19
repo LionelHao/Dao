@@ -43,6 +43,7 @@ import {
   repairMutationImpactDatabaseQuery,
   revalidateSnapshotDatabaseQuery,
   runAuthorityImmediateTransaction,
+  runAuthorityParticipantImmediateTransaction,
   syncRoomDatabaseQuery,
   inspectStreamingRepairScopeDatabaseQuery,
 } from "./authority-database-handler.js";
@@ -56,6 +57,7 @@ import {
   type StreamingRepairLease,
 } from "../fallback-repair-coordinator.js";
 import { MAX_ACTIVE_SESSION_FAMILIES } from "./contracts.js";
+import { recoverRuntimeArchiveFenceInTransaction } from "../agent-runtime/runtime-archive-fence-participant.js";
 
 interface AuthorityWorkerData {
   readonly databasePath: string;
@@ -149,6 +151,40 @@ function respondWithError(
   });
 }
 
+function recoverArchivedRuntimeFences(openedDatabase: DatabaseSync): void {
+  const recoveryTime = new Date().toISOString();
+  let afterRoomId = "";
+  while (true) {
+    const rooms = openedDatabase.prepare(
+      `SELECT id
+       FROM rooms
+       WHERE status = 'archived' AND id > ?
+       ORDER BY id
+       LIMIT 64`,
+    ).all(afterRoomId);
+    if (rooms.length === 0) return;
+    for (const room of rooms) {
+      if (typeof room.id !== "string" || room.id.length === 0) {
+        throw new Error("Archived runtime recovery room was corrupt");
+      }
+      runAuthorityParticipantImmediateTransaction(
+        openedDatabase,
+        room.id,
+        `runtime-archive-recovery:${room.id}`,
+        (transaction) => recoverRuntimeArchiveFenceInTransaction(transaction, {
+          roomId: room.id as string,
+          now: recoveryTime,
+        }),
+      );
+    }
+    const last = rooms.at(-1)?.id;
+    if (typeof last !== "string") {
+      throw new Error("Archived runtime recovery cursor was corrupt");
+    }
+    afterRoomId = last;
+  }
+}
+
 function openAuthorityDatabase(): DatabaseSync {
   if (!isAuthorityWorkerData(workerData)) {
     throw new Error("Invalid authority worker data");
@@ -156,6 +192,7 @@ function openAuthorityDatabase(): DatabaseSync {
   const openedDatabase = new DatabaseSync(workerData.databasePath);
   try {
     migrateAuthorityDatabase(openedDatabase);
+    recoverArchivedRuntimeFences(openedDatabase);
     return openedDatabase;
   } catch (error: unknown) {
     try {

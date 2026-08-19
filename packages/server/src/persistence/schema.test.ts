@@ -63,6 +63,8 @@ const AUTHORITY_TABLES = [
   "route_jobs",
   "route_judgments",
   "route_metrics",
+  "runtime_archive_fence_members",
+  "runtime_archive_fences",
   "schema_migrations",
   "session_families",
   "sessions",
@@ -469,7 +471,7 @@ describe("authority SQLite schema", () => {
   });
 
   it("rolls every v14 migration statement back with v13 schema and history intact", () => {
-    for (let failAfterStatement = 1; failAfterStatement <= 2; failAfterStatement += 1) {
+    for (let failAfterStatement = 1; failAfterStatement <= 8; failAfterStatement += 1) {
       withDatabase((database) => {
         migrateAuthorityDatabaseToPreviousVersionForTest(database);
         const before = snapshot(database);

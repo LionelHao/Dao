@@ -79,6 +79,7 @@ import {
   ArchivedMessageMutationBlockedError,
   requireMessageMutationAllowedInTransaction,
 } from "../message-authority/archived-message-gate.js";
+import { canStartRuntimeGenerationInTransaction } from "../agent-runtime/runtime-archive-fence-participant.js";
 
 export class AuthorityDatabaseError extends Error {
   constructor(
@@ -150,6 +151,60 @@ function requireMessageMutationAllowed(
     }
     return fail("dependency_unavailable", "Message mutation gate was unavailable");
   }
+}
+
+function currentRoomArchiveGeneration(
+  database: DatabaseSync,
+  roomId: string,
+): number {
+  const row = database.prepare(
+    "SELECT archive_generation AS archiveGeneration FROM rooms WHERE id = ?",
+  ).get(roomId);
+  if (typeof row?.archiveGeneration !== "number" ||
+      !Number.isSafeInteger(row.archiveGeneration) || row.archiveGeneration < 0) {
+    return fail("storage_unavailable", "Authority Room lifecycle proof was unavailable");
+  }
+  return row.archiveGeneration;
+}
+
+function requireRuntimeGenerationAllowed(
+  database: DatabaseSync,
+  roomId: string,
+  archiveGeneration: number,
+  transactionId: string,
+): void {
+  try {
+    const allowed = withDatabaseAuthorityTransactionView(
+      database,
+      roomId,
+      transactionId,
+      (transaction) => canStartRuntimeGenerationInTransaction(transaction, {
+        roomId,
+        archiveGeneration,
+      }),
+    );
+    if (!allowed) return fail("room_archived", "Authority Room runtime generation is fenced");
+  } catch (error: unknown) {
+    if (error instanceof AuthorityDatabaseError) throw error;
+    return fail("dependency_unavailable", "Runtime archive fence was unavailable");
+  }
+}
+
+function requireExecutionRuntimeGenerationAllowed(
+  database: DatabaseSync,
+  executionId: string,
+  transactionId: string,
+): Readonly<{ roomId: string; archiveGeneration: number }> {
+  const row = database.prepare(
+    `SELECT room_id AS roomId, room_archive_generation AS archiveGeneration
+     FROM agent_executions WHERE id = ?`,
+  ).get(executionId);
+  if (typeof row?.roomId !== "string" || typeof row.archiveGeneration !== "number" ||
+      !Number.isSafeInteger(row.archiveGeneration) || row.archiveGeneration < 0) {
+    return fail("storage_unavailable", "Agent runtime generation proof was unavailable");
+  }
+  requireRuntimeGenerationAllowed(database, row.roomId, row.archiveGeneration, transactionId);
+  return { roomId: row.roomId, archiveGeneration: row.archiveGeneration };
 }
 
 function ballFactsForRoom(
@@ -3770,6 +3825,13 @@ function executeAgentExecutionTransition(
       command.roomId,
       command.payload.sourceMessageId,
     );
+    const roomArchiveGeneration = currentRoomArchiveGeneration(database, command.roomId);
+    requireRuntimeGenerationAllowed(
+      database,
+      command.roomId,
+      roomArchiveGeneration,
+      stableId("legacy-runtime-gate", command.payload.executionId),
+    );
     execution = {
       id: command.payload.executionId,
       roomId: command.roomId,
@@ -3790,14 +3852,15 @@ function executeAgentExecutionTransition(
     };
     database.prepare(
       `INSERT INTO agent_executions (
-         id, room_id, agent_id, trigger_message_id, status, started_at,
+         id, room_id, room_archive_generation, agent_id, trigger_message_id, status, started_at,
          completed_at, result_json, requester_actor_id, tool_name,
          action_category, tool_dispatch_phase, queued_at, updated_at
-       ) VALUES (?, ?, ?, ?, 'running', ?, NULL, NULL, ?, ?,
+       ) VALUES (?, ?, ?, ?, ?, 'running', ?, NULL, NULL, ?, ?,
                  'tool_call', 'not_started', ?, ?)`,
     ).run(
       command.payload.executionId,
       command.roomId,
+      roomArchiveGeneration,
       agentId,
       command.payload.sourceMessageId,
       acceptedAt,
@@ -3822,6 +3885,11 @@ function executeAgentExecutionTransition(
     if (current.status !== "running" || command.payload.status === "running") {
       return fail("execution_not_running", "Authority Agent execution is not running");
     }
+    requireExecutionRuntimeGenerationAllowed(
+      database,
+      command.payload.executionId,
+      stableId("legacy-runtime-terminal-gate", command.payload.executionId),
+    );
     execution = {
       id: command.payload.executionId,
       roomId: command.roomId,
@@ -4812,6 +4880,11 @@ export function executeRuntimeAuthorityOperation(
          WHERE source_message_id = ? AND target_agent_id = ?`,
       ).get(route.sourceMessageId, operation.targetAgentId);
       if (typeof existing?.executionId === "string") {
+        requireExecutionRuntimeGenerationAllowed(
+          database,
+          existing.executionId,
+          stableId("fence-replacement-replay-gate", existing.executionId),
+        );
         const execution = runtimeExecutionById(database, existing.executionId);
         const replacement = database.prepare(
           `SELECT 1 AS present FROM agent_fence_replacements
@@ -4856,16 +4929,24 @@ export function executeRuntimeAuthorityOperation(
         "message_intent",
         stableId("fence-replacement-intent-gate", operation.routeJobId, operation.targetAgentId),
       );
+      const roomArchiveGeneration = currentRoomArchiveGeneration(database, route.roomId);
+      requireRuntimeGenerationAllowed(
+        database,
+        route.roomId,
+        roomArchiveGeneration,
+        stableId("fence-replacement-runtime-gate", executionId),
+      );
       database.prepare(
         `INSERT INTO agent_executions (
-           id, room_id, agent_id, trigger_message_id, status, started_at,
+           id, room_id, room_archive_generation, agent_id, trigger_message_id, status, started_at,
            completed_at, result_json, requester_actor_id, tool_name,
            action_category, tool_dispatch_phase, current_attempt_seq,
            retry_cycle, retry_ordinal, provider_id, model_id, recovery_cursor,
            queued_at, updated_at, supersedes_execution_ids_json
-         ) VALUES (?, ?, ?, ?, 'queued', ?, NULL, NULL, ?, 'model.generate',
+         ) VALUES (?, ?, ?, ?, ?, 'queued', ?, NULL, NULL, ?, 'model.generate',
                    'model_generation', NULL, 1, 1, 1, ?, ?, 0, ?, ?, ?)`,
-      ).run(executionId, route.roomId, operation.targetAgentId, route.sourceMessageId,
+      ).run(executionId, route.roomId, roomArchiveGeneration,
+        operation.targetAgentId, route.sourceMessageId,
         occurredAt, route.requesterId, operation.providerId, operation.modelId,
         occurredAt, occurredAt, JSON.stringify(supersedesExecutionIds));
       database.prepare(
@@ -4896,6 +4977,11 @@ export function executeRuntimeAuthorityOperation(
     }
     if (operation.type === "runtime.read-context") {
       const execution = runtimeExecutionById(database, operation.executionId);
+      requireExecutionRuntimeGenerationAllowed(
+        database,
+        execution.id,
+        stableId("runtime-model-generation-gate", execution.id, String(execution.currentAttemptSeq)),
+      );
       requireAgentCommandAuthority(database, execution.agentId, execution.roomId);
       const permissionRow = database.prepare(
         `SELECT actor.tool_permissions_json AS capabilityJson,
@@ -4974,6 +5060,11 @@ export function executeRuntimeAuthorityOperation(
          FROM agent_invocation_intents WHERE source_message_id = ? AND target_agent_id = ?`,
       ).get(operation.intent.sourceMessageId, operation.intent.targetAgentId);
       if (typeof existing?.executionId === "string") {
+        requireExecutionRuntimeGenerationAllowed(
+          database,
+          existing.executionId,
+          stableId("runtime-invoke-replay-gate", operation.executionId),
+        );
         if (operation.intent.kind === "direct_mention" && existing.intentKind !== "direct_mention") {
           requireMessageMutationAllowed(
             database,
@@ -5000,18 +5091,26 @@ export function executeRuntimeAuthorityOperation(
         "message_intent",
         stableId("runtime-intent-gate", operation.intentId),
       );
+      const roomArchiveGeneration = currentRoomArchiveGeneration(database, operation.intent.roomId);
+      requireRuntimeGenerationAllowed(
+        database,
+        operation.intent.roomId,
+        roomArchiveGeneration,
+        stableId("runtime-invoke-generation-gate", operation.executionId),
+      );
       database.prepare(
         `INSERT INTO agent_executions (
-           id, room_id, agent_id, trigger_message_id, status, started_at,
+           id, room_id, room_archive_generation, agent_id, trigger_message_id, status, started_at,
            completed_at, result_json, requester_actor_id, tool_name,
            action_category, tool_dispatch_phase, current_attempt_seq,
            retry_cycle, retry_ordinal, provider_id, model_id, recovery_cursor,
            queued_at, updated_at
-         ) VALUES (?, ?, ?, ?, 'queued', ?, NULL, NULL, ?, 'model.generate',
+         ) VALUES (?, ?, ?, ?, ?, 'queued', ?, NULL, NULL, ?, 'model.generate',
                    'model_generation', NULL, 1, 1, 1, ?, ?, 0, ?, ?)`,
       ).run(
         operation.executionId,
         operation.intent.roomId,
+        roomArchiveGeneration,
         operation.intent.targetAgentId,
         operation.intent.sourceMessageId,
         occurredAt,
@@ -5079,6 +5178,11 @@ export function executeRuntimeAuthorityOperation(
          FROM agent_invocation_intents WHERE source_message_id = ? AND target_agent_id = ?`,
       ).get(operation.intent.sourceMessageId, operation.intent.targetAgentId);
       if (typeof existing?.executionId === "string") {
+        requireExecutionRuntimeGenerationAllowed(
+          database,
+          existing.executionId,
+          stableId("runtime-routed-replay-gate", operation.executionId),
+        );
         if (operation.intent.kind === "direct_mention" && existing.intentKind !== "direct_mention") {
           requireMessageMutationAllowed(
             database,
@@ -5105,18 +5209,26 @@ export function executeRuntimeAuthorityOperation(
         "message_intent",
         stableId("routed-intent-gate", operation.intentId),
       );
+      const roomArchiveGeneration = currentRoomArchiveGeneration(database, operation.intent.roomId);
+      requireRuntimeGenerationAllowed(
+        database,
+        operation.intent.roomId,
+        roomArchiveGeneration,
+        stableId("runtime-routed-generation-gate", operation.executionId),
+      );
       database.prepare(
         `INSERT INTO agent_executions (
-           id, room_id, agent_id, trigger_message_id, status, started_at,
+           id, room_id, room_archive_generation, agent_id, trigger_message_id, status, started_at,
            completed_at, result_json, requester_actor_id, tool_name,
            action_category, tool_dispatch_phase, current_attempt_seq,
            retry_cycle, retry_ordinal, provider_id, model_id, recovery_cursor,
            queued_at, updated_at
-         ) VALUES (?, ?, ?, ?, 'queued', ?, NULL, NULL, ?, 'model.generate',
+         ) VALUES (?, ?, ?, ?, ?, 'queued', ?, NULL, NULL, ?, 'model.generate',
                    'model_generation', NULL, 1, 1, 1, ?, ?, 0, ?, ?)`,
       ).run(
         operation.executionId,
         operation.intent.roomId,
+        roomArchiveGeneration,
         operation.intent.targetAgentId,
         operation.intent.sourceMessageId,
         occurredAt,
@@ -5158,6 +5270,11 @@ export function executeRuntimeAuthorityOperation(
       if (current.status !== "queued" || current.currentAttemptSeq !== operation.attemptSeq) {
         return fail("execution_conflict", "Agent attempt claim was stale");
       }
+      requireExecutionRuntimeGenerationAllowed(
+        database,
+        current.id,
+        stableId("runtime-claim-generation-gate", current.id, String(operation.attemptSeq)),
+      );
       if (hasPendingHumanPreemptionAfterSource(database, current)) {
         return fail("execution_conflict", "Agent attempt is behind a durable human fence");
       }
@@ -5188,6 +5305,17 @@ export function executeRuntimeAuthorityOperation(
           hasPendingHumanPreemptionAfterSource(database, current)) {
         return fail("execution_conflict", "Agent completion is behind a durable human fence");
       }
+      requireExecutionRuntimeGenerationAllowed(
+        database,
+        current.id,
+        stableId("runtime-complete-generation-gate", current.id, String(operation.attemptSeq)),
+      );
+      requireMessageMutationAllowed(
+        database,
+        current.roomId,
+        "message",
+        stableId("runtime-complete-message-gate", current.id, String(operation.attemptSeq)),
+      );
       database.prepare(
         `INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
          VALUES (?, ?, ?, 'agent', ?, ?)`,
@@ -5230,6 +5358,11 @@ export function executeRuntimeAuthorityOperation(
       if (current.status !== "running" || current.currentAttemptSeq !== operation.attemptSeq) {
         return fail("execution_conflict", "Agent retry result was stale");
       }
+      requireExecutionRuntimeGenerationAllowed(
+        database,
+        current.id,
+        stableId("runtime-retry-generation-gate", current.id, String(operation.attemptSeq)),
+      );
       const shouldRetry = operation.nextRetryAt !== undefined && current.retryOrdinal < 3;
       database.prepare(
         `UPDATE agent_execution_attempts
@@ -5328,18 +5461,31 @@ export function executeRuntimeAuthorityOperation(
         `SELECT id FROM agent_executions WHERE manual_retry_of_execution_id = ? ORDER BY queued_at LIMIT 1`,
       ).get(old.id);
       if (typeof existing?.id === "string") {
+        requireExecutionRuntimeGenerationAllowed(
+          database,
+          existing.id,
+          stableId("runtime-manual-retry-replay-gate", existing.id),
+        );
         return { kind: "invocation", execution: runtimeExecutionById(database, existing.id), replayed: true };
       }
+      const roomArchiveGeneration = currentRoomArchiveGeneration(database, old.roomId);
+      requireRuntimeGenerationAllowed(
+        database,
+        old.roomId,
+        roomArchiveGeneration,
+        stableId("runtime-manual-retry-generation-gate", operation.newExecutionId),
+      );
       database.prepare(
         `INSERT INTO agent_executions (
-           id, room_id, agent_id, trigger_message_id, status, started_at,
+           id, room_id, room_archive_generation, agent_id, trigger_message_id, status, started_at,
            completed_at, result_json, requester_actor_id, tool_name,
            action_category, tool_dispatch_phase, current_attempt_seq,
            retry_cycle, retry_ordinal, provider_id, model_id, recovery_cursor,
            queued_at, updated_at, manual_retry_of_execution_id
-         ) VALUES (?, ?, ?, ?, 'queued', ?, NULL, NULL, ?, 'model.generate',
+         ) VALUES (?, ?, ?, ?, ?, 'queued', ?, NULL, NULL, ?, 'model.generate',
                    'model_generation', NULL, 1, 1, 1, ?, ?, 0, ?, ?, ?)`,
-      ).run(operation.newExecutionId, old.roomId, old.agentId, old.sourceMessageId, occurredAt,
+      ).run(operation.newExecutionId, old.roomId, roomArchiveGeneration,
+        old.agentId, old.sourceMessageId, occurredAt,
         operation.context.principal.actorId, old.providerId ?? "openai-responses", old.modelId ?? "configured", occurredAt, occurredAt, old.id);
       database.prepare(
         `INSERT INTO agent_execution_attempts (
@@ -5396,6 +5542,11 @@ export function executeRuntimeAuthorityOperation(
         `SELECT id FROM agent_executions WHERE compensates_execution_id = ? ORDER BY queued_at LIMIT 1`,
       ).get(old.id);
       if (typeof existing?.id === "string") {
+        requireExecutionRuntimeGenerationAllowed(
+          database,
+          existing.id,
+          stableId("runtime-compensation-replay-gate", existing.id),
+        );
         const execution = runtimeExecutionById(database, existing.id);
         const dispatch = database.prepare(
           `SELECT dispatch_id AS dispatchId FROM tool_dispatches WHERE execution_id = ?`,
@@ -5412,15 +5563,23 @@ export function executeRuntimeAuthorityOperation(
           replayed: true,
         };
       }
+      const roomArchiveGeneration = currentRoomArchiveGeneration(database, old.roomId);
+      requireRuntimeGenerationAllowed(
+        database,
+        old.roomId,
+        roomArchiveGeneration,
+        stableId("runtime-compensation-generation-gate", operation.newExecutionId),
+      );
       database.prepare(
         `INSERT INTO agent_executions (
-           id, room_id, agent_id, trigger_message_id, status, started_at,
+           id, room_id, room_archive_generation, agent_id, trigger_message_id, status, started_at,
            requester_actor_id, tool_name, action_category, tool_dispatch_phase,
            current_attempt_seq, retry_cycle, retry_ordinal, recovery_cursor,
            queued_at, updated_at, compensates_execution_id
-         ) VALUES (?, ?, ?, ?, 'running', ?, ?, 'sandbox-file.write', 'tool_call',
+         ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, 'sandbox-file.write', 'tool_call',
                    'dispatched', 1, 1, 1, 0, ?, ?, ?)`,
-      ).run(operation.newExecutionId, old.roomId, old.agentId, old.sourceMessageId,
+      ).run(operation.newExecutionId, old.roomId, roomArchiveGeneration,
+        old.agentId, old.sourceMessageId,
         occurredAt, humanId, occurredAt, occurredAt, old.id);
       database.prepare(
         `INSERT INTO agent_execution_attempts (
@@ -5511,6 +5670,11 @@ export function executeRuntimeAuthorityOperation(
       if (current.status !== "running" || current.currentAttemptSeq !== operation.attemptSeq) {
         return fail("execution_conflict", "Tool preparation targeted a stale Agent attempt");
       }
+      requireExecutionRuntimeGenerationAllowed(
+        database,
+        current.id,
+        stableId("runtime-tool-prepare-generation-gate", current.id, String(operation.attemptSeq)),
+      );
       const permissions = database.prepare(
         `SELECT actor.kind AS actorKind, actor.readiness AS readiness,
                 actor.tool_permissions_json AS capabilityJson,
@@ -5663,6 +5827,11 @@ export function executeRuntimeAuthorityOperation(
             current.actionCategory === "waiting_upstream")) {
         return fail("execution_conflict", "Tool claim targeted a stale Agent attempt");
       }
+      requireExecutionRuntimeGenerationAllowed(
+        database,
+        current.id,
+        stableId("runtime-tool-dispatch-generation-gate", current.id, String(operation.attemptSeq)),
+      );
       const grant = database.prepare(
         `SELECT grant.agent_id AS agentId, grant.room_id AS roomId, grant.tool_id AS toolId,
                 grant.parameter_sha256 AS parameterSha256, grant.expires_at AS expiresAt,
@@ -5780,6 +5949,11 @@ export function executeRuntimeAuthorityOperation(
       if (current.status !== "running" || current.currentAttemptSeq !== operation.attemptSeq) {
         return fail("execution_conflict", "Checkpoint targeted a stale Agent attempt");
       }
+      requireExecutionRuntimeGenerationAllowed(
+        database,
+        current.id,
+        stableId("runtime-checkpoint-generation-gate", current.id, String(operation.attemptSeq)),
+      );
       database.prepare(
         `INSERT INTO agent_execution_steps (
            execution_id, attempt_seq, step_seq, step_kind, input_sha256,
@@ -5804,7 +5978,13 @@ export function executeRuntimeAuthorityOperation(
     }
 
     const recoverable = database.prepare(
-      `SELECT id FROM agent_executions WHERE status IN ('queued', 'running') ORDER BY queued_at, id`,
+      `SELECT execution.id
+       FROM agent_executions AS execution
+       JOIN rooms AS room ON room.id = execution.room_id
+       WHERE execution.status IN ('queued', 'running')
+         AND room.status = 'active'
+         AND execution.room_archive_generation = room.archive_generation
+       ORDER BY execution.queued_at, execution.id`,
     ).all();
     const records: { execution: AgentExecution; outcome: "enqueue" | "failed" | "fail_outcome_unknown" | "wait_confirmation" }[] = [];
     for (const row of recoverable) {

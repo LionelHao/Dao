@@ -213,10 +213,10 @@ function preserveDispatch(
     const execution = database.prepare(
       `UPDATE agent_executions
        SET status = 'failed', completed_at = ?, updated_at = ?,
-           cancellation_reason = NULL, terminal_error_code = ?, dead_lettered_at = ?,
+           cancellation_reason = NULL, terminal_error_code = ?, dead_lettered_at = NULL,
            next_retry_at = NULL
        WHERE id = ? AND current_attempt_seq = ? AND status IN ('queued', 'running')`,
-    ).run(now, now, errorCode, now, candidate.id, candidate.currentAttemptSeq);
+    ).run(now, now, errorCode, candidate.id, candidate.currentAttemptSeq);
     if (execution.changes !== 1) {
       throw new Error("Runtime archive dispatch terminal transition was stale");
     }

@@ -1039,7 +1039,7 @@ describe("SQLite authoritative sessions", () => {
       accountId: "account-li",
       actorId: "human-li",
     });
-    await expect(client.inspectSchema()).resolves.toEqual({ version: 13 });
+    await expect(client.inspectSchema()).resolves.toEqual({ version: 14 });
     await client.close();
   });
 
@@ -1716,6 +1716,10 @@ describe("SQLite authoritative sessions", () => {
     archivedDatabase.prepare(
       "UPDATE rooms SET status = 'archived', archived_at = ?, archive_generation = 1 WHERE id = ?",
     ).run("2026-08-18T00:00:00.000Z", fixture.roomId);
+    archivedDatabase.prepare(
+      `INSERT INTO room_message_archive_gates (room_id, gate_generation, blocked_at)
+       VALUES (?, 1, ?)`,
+    ).run(fixture.roomId, "2026-08-18T00:00:00.000Z");
     archivedDatabase.close();
     const archivedClient = await createWorkerDatabaseClient({ databasePath });
     const archivedAuthority = createSqliteAuthoritativeStore(archivedClient, { clock: () => 2_000 });
@@ -3519,6 +3523,10 @@ describe("SQLite authoritative sessions", () => {
       `UPDATE rooms SET status = 'archived', archived_at = ?, archive_generation = 1
        WHERE id = ?`,
     ).run("2026-08-18T00:00:00.000Z", fixture.roomId);
+    membershipDatabase.prepare(
+      `INSERT INTO room_message_archive_gates (room_id, gate_generation, blocked_at)
+       VALUES (?, 1, ?)`,
+    ).run(fixture.roomId, "2026-08-18T00:00:00.000Z");
     membershipDatabase.close();
 
     const restartedClient = await createWorkerDatabaseClient({ databasePath });
