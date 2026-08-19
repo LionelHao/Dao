@@ -1,5 +1,6 @@
 import type { IdentityBridge } from "../identity/contracts.js";
 import type { GovernanceBridge } from "../governance/contracts.js";
+import type { MessageAuthorityBridge } from "../message-authority/contracts.js";
 import {
   mountGovernanceSurface,
   renderM2PrimitivesPreview,
@@ -7,6 +8,7 @@ import {
   renderVisualSeparationPreview,
 } from "./app.js";
 import { mountIdentityApp } from "./identity.js";
+import { mountMessageAuthorityBridgeSurface } from "./message-authority/bridge-adapter.js";
 
 export interface DesktopRendererEntryPorts {
   readonly renderM2PrimitivesPreview: (root: HTMLElement) => void;
@@ -16,6 +18,11 @@ export interface DesktopRendererEntryPorts {
   readonly mountGovernanceSurface: (
     root: HTMLElement,
     bridge: GovernanceBridge,
+    roomId: string,
+  ) => () => void;
+  readonly mountMessageAuthoritySurface: (
+    root: HTMLElement,
+    bridge: MessageAuthorityBridge,
     roomId: string,
   ) => () => void;
 }
@@ -37,11 +44,32 @@ const DEFAULT_PORTS: DesktopRendererEntryPorts = Object.freeze({
         root.append(notice);
       },
     }),
+  mountMessageAuthoritySurface: (
+    root: HTMLElement,
+    bridge: MessageAuthorityBridge,
+    roomId: string,
+  ) => mountMessageAuthorityBridgeSurface(root, bridge, roomId, {
+    createMessageId: () => `message-${globalThis.crypto.randomUUID()}`,
+    createTargetId: () => `target-${globalThis.crypto.randomUUID()}`,
+    reducedMotion: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false,
+  }),
 });
 
 const encoder = new TextEncoder();
 function governanceRoomId(route: URLSearchParams): string | undefined {
   const values = route.getAll("governance-room");
+  if (values.length !== 1 || [...route.keys()].length !== 1) return undefined;
+  const roomId = values[0]!;
+  const printable = Array.from(roomId).every((character) => {
+    const codePoint = character.codePointAt(0)!;
+    return codePoint > 31 && codePoint !== 127;
+  });
+  return roomId === roomId.trim() && encoder.encode(roomId).byteLength <= 256 &&
+    printable && roomId.length > 0 ? roomId : undefined;
+}
+
+function messageRoomId(route: URLSearchParams): string | undefined {
+  const values = route.getAll("message-room");
   if (values.length !== 1 || [...route.keys()].length !== 1) return undefined;
   const roomId = values[0]!;
   const printable = Array.from(roomId).every((character) => {
@@ -64,15 +92,42 @@ function renderGovernanceRouteFailure(root: HTMLElement, reason: string): void {
   root.replaceChildren(error);
 }
 
+function renderMessageAuthorityRouteFailure(root: HTMLElement, reason: string): void {
+  const error = document.createElement("section");
+  error.dataset.messageAuthorityRouteLocked = "true";
+  error.setAttribute("role", "alert");
+  const heading = document.createElement("h1");
+  heading.textContent = "无法安全打开 Room 消息";
+  const explanation = document.createElement("p");
+  explanation.textContent = reason;
+  error.append(heading, explanation);
+  root.replaceChildren(error);
+}
+
 export function mountDesktopRendererEntry(
   root: HTMLElement,
   search: string,
   identity: IdentityBridge | undefined,
   governance: GovernanceBridge | undefined,
+  messageAuthority: MessageAuthorityBridge | undefined,
   ports: DesktopRendererEntryPorts = DEFAULT_PORTS,
 ): (() => void) | undefined {
   const route = new URLSearchParams(search);
   root.dataset.governanceRouteContract = "closed-v1";
+  root.dataset.messageAuthorityRouteContract = "closed-v2";
+
+  if (route.has("message-room")) {
+    const roomId = messageRoomId(route);
+    if (roomId === undefined) {
+      renderMessageAuthorityRouteFailure(root, "Room 标识无效或 route 含未批准参数。");
+      return undefined;
+    }
+    if (messageAuthority === undefined) {
+      renderMessageAuthorityRouteFailure(root, "Desktop 消息桥未加载，Room 内容保持锁定。");
+      return undefined;
+    }
+    return ports.mountMessageAuthoritySurface(root, messageAuthority, roomId);
+  }
 
   if (route.has("governance-room")) {
     const roomId = governanceRoomId(route);

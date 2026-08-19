@@ -16,6 +16,11 @@ import {
 } from "./governance/production-runtime.js";
 import { registerGovernanceIpc } from "./governance/ipc.js";
 import {
+  createMessageAuthorityController,
+} from "./message-authority/controller.js";
+import { registerMessageAuthorityIpc } from "./message-authority/ipc.js";
+import { createDesktopMessageAuthorityRuntime } from "./message-authority/production-runtime.js";
+import {
   blankGroupChatWindowOptions,
   installWindowSecurityPolicy,
 } from "./window.js";
@@ -29,6 +34,11 @@ async function createWindow(): Promise<void> {
   let identity: ReturnType<typeof createDesktopIdentityRuntime> | undefined;
   let governance: ReturnType<typeof createDesktopGovernanceRuntime> | undefined;
   let disposeGovernanceIpc: (() => void) | undefined;
+  let messageAuthorityRuntime: ReturnType<
+    typeof createDesktopMessageAuthorityRuntime
+  > | undefined;
+  let messageAuthority: ReturnType<typeof createMessageAuthorityController> | undefined;
+  let disposeMessageAuthorityIpc: (() => void) | undefined;
 
   try {
     installWindowSecurityPolicy(window);
@@ -48,7 +58,10 @@ async function createWindow(): Promise<void> {
       ipcMain,
       webContents: window.webContents,
       authorizedState: {
-        invalidate: () => governance?.invalidateAuthorizedState(),
+        invalidate: () => {
+          governance?.invalidateAuthorizedState();
+          messageAuthorityRuntime?.invalidateAuthorizedState();
+        },
       },
     });
     governance = createDesktopGovernanceRuntime({
@@ -65,10 +78,27 @@ async function createWindow(): Promise<void> {
       webContents: window.webContents,
       controller: governance.controller,
     });
+    messageAuthorityRuntime = createDesktopMessageAuthorityRuntime({
+      endpoint: process.env.NATIVE_IM_IDENTITY_WS_URL ?? "ws://127.0.0.1:8787",
+      session: () => identity?.getCurrentAuthoritySession(),
+      webSocketFactory: (endpoint) => new WebSocket(endpoint),
+    });
+    messageAuthority = createMessageAuthorityController({
+      client: messageAuthorityRuntime.client,
+      createRequestId: (operation) => `message-${operation}-${randomUUID()}`,
+    });
+    disposeMessageAuthorityIpc = registerMessageAuthorityIpc({
+      ipcMain,
+      webContents: window.webContents,
+      controller: messageAuthority,
+    });
     window.once("closed", () => {
       disposeGovernanceIpc?.();
+      disposeMessageAuthorityIpc?.();
       identity?.close();
       governance?.close();
+      messageAuthority?.close();
+      messageAuthorityRuntime?.close();
     });
 
     await Promise.all([window.loadFile(rendererPath), identity.initialize()]);
@@ -76,6 +106,7 @@ async function createWindow(): Promise<void> {
       `JSON.stringify({
         identityMethods: Object.keys(globalThis.dao?.identity ?? {}).sort(),
         governanceMethods: Object.keys(globalThis.dao?.governance ?? {}).sort(),
+        messageAuthorityMethods: Object.keys(globalThis.dao?.messageAuthority ?? {}).sort(),
         namespaces: Object.keys(globalThis.dao ?? {}).sort(),
         bridgeMissing: document.querySelector("[data-identity-bridge-missing]") !== null,
         governanceRouteContract: document.querySelector("#app")?.dataset.governanceRouteContract ?? "",
@@ -97,6 +128,14 @@ async function createWindow(): Promise<void> {
       "onStateChanged",
       "submit",
     ];
+    const expectedMessageAuthorityMethods = [
+      "historyV2",
+      "onAuthorityInput",
+      "recall",
+      "revise",
+      "revisionsQuery",
+      "sendV2",
+    ];
     let startupProbe: unknown;
     try {
       startupProbe = typeof startupProbeJson === "string"
@@ -114,8 +153,13 @@ async function createWindow(): Promise<void> {
         startupProbe.governanceMethods.length !== expectedGovernanceMethods.length ||
         !startupProbe.governanceMethods.every(
           (method, index) => method === expectedGovernanceMethods[index],
+        ) || !("messageAuthorityMethods" in startupProbe) ||
+        !Array.isArray(startupProbe.messageAuthorityMethods) ||
+        startupProbe.messageAuthorityMethods.length !== expectedMessageAuthorityMethods.length ||
+        !startupProbe.messageAuthorityMethods.every(
+          (method, index) => method === expectedMessageAuthorityMethods[index],
         ) || !("namespaces" in startupProbe) || !Array.isArray(startupProbe.namespaces) ||
-        startupProbe.namespaces.join(",") !== "governance,identity" ||
+        startupProbe.namespaces.join(",") !== "governance,identity,messageAuthority" ||
         !("governanceRouteContract" in startupProbe) ||
         startupProbe.governanceRouteContract !== "closed-v1" ||
         !("bridgeMissing" in startupProbe) || startupProbe.bridgeMissing !== false ||
@@ -136,8 +180,11 @@ async function createWindow(): Promise<void> {
     console.info("Native IM desktop Identity surface started.");
   } catch (error: unknown) {
     disposeGovernanceIpc?.();
+    disposeMessageAuthorityIpc?.();
     identity?.close();
     governance?.close();
+    messageAuthority?.close();
+    messageAuthorityRuntime?.close();
     if (!window.isDestroyed()) window.destroy();
     throw error;
   }

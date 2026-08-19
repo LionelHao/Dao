@@ -5,8 +5,10 @@ import { build } from "esbuild";
 const packageRoot = resolve(import.meta.dirname, "..");
 const rendererSource = resolve(packageRoot, "src/renderer");
 const rendererOutput = resolve(packageRoot, "dist/renderer");
+const messageAuthorityOutput = resolve(rendererOutput, "message-authority");
 
 await mkdir(rendererOutput, { recursive: true });
+await mkdir(messageAuthorityOutput, { recursive: true });
 await build({
   bundle: true,
   entryPoints: [resolve(rendererSource, "main.ts")],
@@ -25,3 +27,7 @@ if (rendererBundle.includes("@native-im/core") ||
 }
 await cp(resolve(rendererSource, "index.html"), resolve(rendererOutput, "index.html"));
 await cp(resolve(rendererSource, "styles.css"), resolve(rendererOutput, "styles.css"));
+await cp(
+  resolve(rendererSource, "message-authority/message-authority.css"),
+  resolve(messageAuthorityOutput, "message-authority.css"),
+);

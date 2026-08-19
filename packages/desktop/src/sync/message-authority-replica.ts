@@ -49,6 +49,11 @@ export type MessageAuthorityEventLedgerEntry = Readonly<{
   streamSeq: number;
 }>;
 
+export type MessageAuthorityCursorAdvance = Readonly<{
+  eventId: string;
+  streamSeq: number;
+}>;
+
 export type MessageAuthorityRepairStage = Readonly<{
   snapshotId: string;
   watermark: number;
@@ -333,15 +338,30 @@ function reduceTimeline(
   return freezeTimeline(next);
 }
 
-export function createMessageAuthorityReplica(roomId: string): MessageAuthorityReplica {
+export type MessageAuthorityReplicaSeed = Readonly<{
+  generation: number;
+  checkpoint: number;
+  timeline: readonly TimelineMessage[];
+}>;
+
+export function createMessageAuthorityReplica(
+  roomId: string,
+  seed?: MessageAuthorityReplicaSeed,
+): MessageAuthorityReplica {
   if (!isIdentifier(roomId)) reject("invalid_room");
+  if (seed !== undefined && (!isPositiveSafeInteger(seed.generation) ||
+      !isNonNegativeSafeInteger(seed.checkpoint) ||
+      seed.timeline.some((message) => message.roomId !== roomId))) {
+    reject("invalid_repair");
+  }
+  if (seed !== undefined) validateCommittedTimeline(seed.timeline);
   return freezeReplica({
     roomId,
     mode: "online",
-    generation: 1,
-    checkpoint: 0,
-    afterSeq: 0,
-    timeline: [],
+    generation: seed?.generation ?? 1,
+    checkpoint: seed?.checkpoint ?? 0,
+    afterSeq: seed?.checkpoint ?? 0,
+    timeline: seed?.timeline ?? [],
     eventLedger: [],
   });
 }
@@ -375,6 +395,37 @@ export function applyMessageAuthorityEvent(
     eventLedger: [
       ...replica.eventLedger,
       { eventId: event.eventId, streamSeq: event.streamSeq },
+    ],
+  });
+}
+
+export function advanceMessageAuthorityCursor(
+  replica: MessageAuthorityReplica,
+  input: MessageAuthorityCursorAdvance,
+): MessageAuthorityReplica {
+  assertMutableAuthorityMode(replica);
+  if (!isIdentifier(input.eventId) || !isPositiveSafeInteger(input.streamSeq)) {
+    reject("invalid_event");
+  }
+
+  const sameId = replica.eventLedger.find(({ eventId }) => eventId === input.eventId);
+  if (sameId !== undefined) {
+    if (sameId.streamSeq === input.streamSeq) return replica;
+    reject("event_conflict");
+  }
+  const sameSequence = replica.eventLedger.find(({ streamSeq }) =>
+    streamSeq === input.streamSeq);
+  if (sameSequence !== undefined) reject("event_conflict");
+  if (input.streamSeq <= replica.checkpoint) return replica;
+  if (input.streamSeq <= replica.afterSeq) reject("event_conflict");
+  if (input.streamSeq !== replica.afterSeq + 1) reject("event_gap");
+
+  return freezeReplica({
+    ...replica,
+    afterSeq: input.streamSeq,
+    eventLedger: [
+      ...replica.eventLedger,
+      { eventId: input.eventId, streamSeq: input.streamSeq },
     ],
   });
 }
