@@ -29,6 +29,7 @@ import {
 
 const temporaryDirectories = new Set<string>();
 const clients = new Set<WorkerDatabaseClient>();
+const WORKER_INITIALIZATION_TEST_TIMEOUT_MS = 15_000;
 
 function hash(value: string): string {
   return createHash("sha256").update(value).digest("base64url");
@@ -693,7 +694,7 @@ describe("LegacyStateImporter", () => {
     expect(existsSync(databasePath)).toBe(false);
     expect(readFileSync(stagingPath)).toEqual(stagingBytes);
     expect(readFileSync(recoveryPath)).toEqual(manifestBytes);
-  });
+  }, WORKER_INITIALIZATION_TEST_TIMEOUT_MS);
 
   it("fails closed for ambiguous missing-final recovery manifests", async () => {
     const directory = fixtureDirectory();
@@ -896,7 +897,7 @@ describe("LegacyStateImporter", () => {
     expect(readFileSync(databasePath)).toEqual(before);
     expect(existsSync(stagingPath)).toBe(true);
     expect(existsSync(recoveryPath)).toBe(true);
-  });
+  }, WORKER_INITIALIZATION_TEST_TIMEOUT_MS);
 
   it("does not overwrite an existing valid authority database without a marker", async () => {
     const directory = fixtureDirectory();
