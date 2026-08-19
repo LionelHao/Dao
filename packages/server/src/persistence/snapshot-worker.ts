@@ -438,14 +438,25 @@ function* catalogRooms(
               THEN 'owner' ELSE membership.role END AS role
      FROM room_memberships AS membership
      JOIN rooms AS room ON room.id = membership.room_id
-     WHERE membership.actor_id = ? AND membership.kind = 'human' AND room.status = 'active'`,
+     WHERE membership.actor_id = ? AND membership.kind = 'human'`,
     principalId, "room.id", "roomId")) {
-    yield {
-      roomId: String(row.roomId), name: String(row.name), status: row.status as "active",
-      role: row.role as "owner" | "admin" | "member",
-    };
+    yield roomSummary(row);
     recordScanned();
   }
+}
+
+function roomSummary(row: Record<string, unknown>): RoomSummary {
+  if (typeof row.roomId !== "string" || typeof row.name !== "string" ||
+      (row.status !== "active" && row.status !== "archived") ||
+      (row.role !== "owner" && row.role !== "admin" && row.role !== "member")) {
+    throw new SnapshotBuildError("storage_unavailable", "Snapshot room summary is corrupt");
+  }
+  return {
+    roomId: row.roomId,
+    name: row.name,
+    status: row.status,
+    role: row.role,
+  };
 }
 
 function streamingValues(
@@ -985,13 +996,10 @@ function keysetCatalogPage(
               THEN 'owner' ELSE membership.role END AS role
      FROM room_memberships AS membership
      JOIN rooms AS room ON room.id = membership.room_id
-     WHERE membership.actor_id = ? AND membership.kind = 'human' AND room.status = 'active'`,
+     WHERE membership.actor_id = ? AND membership.kind = 'human'`,
     [principalId], "room.id", initial?.key, limit, true);
   return {
-    values: rows.map((row) => ({
-      roomId: String(row.roomId), name: String(row.name), status: row.status as "active",
-      role: row.role as "owner" | "admin" | "member",
-    })),
+    values: rows.map(roomSummary),
     cursor: {
       segment: 0,
       ...(rows.length === 0 ? (initial?.key === undefined ? {} : { key: initial.key })
@@ -1361,15 +1369,19 @@ function findReusableForRequest(
     let reuseKey: string;
     if (request.type === "snapshot.begin-room") {
       const row = authority.prepare(
-        `SELECT room.status AS roomStatus, membership.access_revision AS accessRevision,
+        `SELECT room.status AS roomStatus,
+                CASE WHEN access.access_revision IS NULL OR
+                          membership.access_revision > access.access_revision
+                  THEN membership.access_revision ELSE access.access_revision END AS accessRevision,
                 stream.head_seq AS watermark
          FROM rooms AS room
          JOIN room_memberships AS membership ON membership.room_id = room.id
          JOIN streams AS stream ON stream.stream_kind = 'room' AND stream.stream_id = room.id
+         LEFT JOIN room_access_authority AS access ON access.room_id = room.id
          WHERE room.id = ? AND membership.actor_id = ? AND membership.kind = 'human'`,
       ).get(request.roomId, request.context.principal.actorId);
       if (row === undefined) return undefined;
-      if (row.roomStatus !== "active") return undefined;
+      if (row.roomStatus !== "active" && row.roomStatus !== "archived") return undefined;
       reuseKey = canonicalJson([request.context.principal.actorId,
         request.context.sessionFamilyId, request.roomId,
         Number(row.watermark), Number(row.accessRevision)]);
@@ -1453,11 +1465,15 @@ function build(
     let reuseKey: string;
     if (request.type === "snapshot.begin-room") {
       const row = authority.prepare(
-        `SELECT room.status AS roomStatus, membership.access_revision AS accessRevision,
+        `SELECT room.status AS roomStatus,
+                CASE WHEN access.access_revision IS NULL OR
+                          membership.access_revision > access.access_revision
+                  THEN membership.access_revision ELSE access.access_revision END AS accessRevision,
                 stream.head_seq AS watermark
          FROM rooms AS room
          JOIN room_memberships AS membership ON membership.room_id = room.id
          JOIN streams AS stream ON stream.stream_kind = 'room' AND stream.stream_id = room.id
+         LEFT JOIN room_access_authority AS access ON access.room_id = room.id
          WHERE room.id = ? AND membership.actor_id = ? AND membership.kind = 'human'`,
       ).get(request.roomId, request.context.principal.actorId);
       if (row === undefined) {
@@ -1465,7 +1481,9 @@ function build(
         if (exists === undefined) throw new SnapshotBuildError("room_not_found", "Snapshot room was not found");
         throw new SnapshotBuildError("room_forbidden", "Snapshot room is forbidden");
       }
-      if (row.roomStatus !== "active") throw new SnapshotBuildError("room_archived", "Snapshot room is archived");
+      if (row.roomStatus !== "active" && row.roomStatus !== "archived") {
+        throw new SnapshotBuildError("storage_unavailable", "Snapshot room lifecycle is corrupt");
+      }
       const accessRevision = Number(row.accessRevision);
       const watermark = Number(row.watermark);
       reuseKey = canonicalJson([request.context.principal.actorId, request.context.sessionFamilyId,
