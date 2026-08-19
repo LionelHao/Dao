@@ -141,7 +141,7 @@ function workerThatRuns(scriptBody: string): Worker {
         parentPort.postMessage({
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 17,
+          schemaVersion: 18,
         });
         return;
       }
@@ -207,7 +207,7 @@ class MessageErrorTransport extends EventEmitter implements AuthorityWorkerTrans
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 17,
+          schemaVersion: 18,
         } satisfies AuthorityWorkerResponse);
       });
       return;
@@ -229,7 +229,7 @@ class CapabilityProbeTransport extends EventEmitter implements AuthorityWorkerTr
       queueMicrotask(() => this.emit("message", {
         type: "authority.ready",
         requestId: request.requestId,
-        schemaVersion: 17,
+        schemaVersion: 18,
       } satisfies AuthorityWorkerResponse));
       return;
     }
@@ -264,7 +264,7 @@ class SyncResultProbeTransport extends EventEmitter implements AuthorityWorkerTr
       queueMicrotask(() => this.emit("message", {
         type: "authority.ready",
         requestId: request.requestId,
-        schemaVersion: 17,
+        schemaVersion: 18,
       } satisfies AuthorityWorkerResponse));
       return;
     }
@@ -295,7 +295,7 @@ class CompactionResultProbeTransport extends EventEmitter implements AuthorityWo
       queueMicrotask(() => this.emit("message", {
         type: "authority.ready",
         requestId: request.requestId,
-        schemaVersion: 17,
+        schemaVersion: 18,
       } satisfies AuthorityWorkerResponse));
       return;
     }
@@ -327,7 +327,7 @@ class ThrowingPostTransport extends EventEmitter implements AuthorityWorkerTrans
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 17,
+          schemaVersion: 18,
         } satisfies AuthorityWorkerResponse);
       });
     }
@@ -350,7 +350,7 @@ class DeferredTerminationTransport
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 17,
+          schemaVersion: 18,
         } satisfies AuthorityWorkerResponse);
       });
       return;
@@ -379,7 +379,7 @@ class RejectingTerminationTransport
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 17,
+          schemaVersion: 18,
         } satisfies AuthorityWorkerResponse);
       });
       return;
@@ -407,7 +407,7 @@ class CloseRaceTransport extends EventEmitter implements AuthorityWorkerTranspor
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 17,
+          schemaVersion: 18,
         } satisfies AuthorityWorkerResponse);
       });
       return;
@@ -436,7 +436,7 @@ class CloseRaceTransport extends EventEmitter implements AuthorityWorkerTranspor
     this.emit("message", {
       type: "authority.schema",
       requestId: this.#inspectRequest.requestId,
-      schemaVersion: 17,
+      schemaVersion: 18,
     } satisfies AuthorityWorkerResponse);
   }
 
@@ -825,7 +825,7 @@ describe("AuthorityWorker closed protocol", () => {
       isAuthorityWorkerResponse({
         type: "authority.ready",
         requestId: "1",
-        schemaVersion: 17,
+        schemaVersion: 18,
       }),
     ).toBe(true);
     expect(isAuthorityWorkerResponse({
@@ -942,7 +942,7 @@ describe("AuthorityWorker closed protocol", () => {
       isAuthorityWorkerResponse({
         type: "authority.schema",
         requestId: "2",
-        schemaVersion: 17,
+        schemaVersion: 18,
       }),
     ).toBe(true);
     expect(
@@ -1015,7 +1015,7 @@ describe("AuthorityWorker closed protocol", () => {
       isAuthorityWorkerResponse({
         type: "authority.schema",
         requestId: "5",
-        schemaVersion: 17,
+        schemaVersion: 18,
         rows: [],
       }),
     ).toBe(false);
@@ -1091,7 +1091,7 @@ describe("AuthorityWorker closed protocol", () => {
     let response = once(worker, "message");
     worker.postMessage({ type: "authority.initialize", requestId: "1" });
     await expect(response).resolves.toEqual([
-      { type: "authority.ready", requestId: "1", schemaVersion: 17 },
+      { type: "authority.ready", requestId: "1", schemaVersion: 18 },
     ]);
 
     response = once(worker, "message");
@@ -1108,7 +1108,7 @@ describe("AuthorityWorker closed protocol", () => {
     response = once(worker, "message");
     worker.postMessage({ type: "authority.inspect-schema", requestId: "2" });
     await expect(response).resolves.toEqual([
-      { type: "authority.schema", requestId: "2", schemaVersion: 17 },
+      { type: "authority.schema", requestId: "2", schemaVersion: 18 },
     ]);
   });
 });
@@ -1860,7 +1860,7 @@ describe("WorkerDatabaseClient", () => {
         setImmediate(() => parentPort.postMessage({
           type: "authority.schema",
           requestId: first.requestId,
-          schemaVersion: 17,
+          schemaVersion: 18,
         }));
       }
     `);
@@ -1942,7 +1942,7 @@ describe("WorkerDatabaseClient", () => {
       parentPort.postMessage({
         type: "authority.schema",
         requestId: request.requestId,
-        schemaVersion: 17,
+        schemaVersion: 18,
         extra: true,
       });
     `);
