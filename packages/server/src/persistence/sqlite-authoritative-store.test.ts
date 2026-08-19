@@ -4401,6 +4401,43 @@ describe("SQLite authoritative sessions", () => {
     ).toBe(false);
   });
 
+  it("fails closed without writes when an attachment validator is unavailable", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-message-attachment-gate-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const fixture = await createCommandMatrixFixture(databasePath);
+    const messageId = "message-v2-attachment-rejected";
+
+    await expect(fixture.store.submitHumanMessage(
+      {
+        ...fixture.contexts.owner,
+        requestId: "message-v2-attachment-rejected",
+        idempotencyKey: messageId,
+      },
+      {
+        messageId,
+        roomId: fixture.contexts.roomId,
+        body: "attachment is not yet authoritative",
+        mentionedTargets: [],
+        attachments: [{ attachmentId: "attachment-unvalidated" }],
+      },
+    )).rejects.toMatchObject({ status: 400, code: "invalid_parameters" });
+
+    await fixture.client.close();
+    const database = new DatabaseSync(databasePath, { readOnly: true });
+    expect(database.prepare(
+      `SELECT
+         (SELECT COUNT(*) FROM messages WHERE id = ?) AS messages,
+         (SELECT COUNT(*) FROM message_envelopes WHERE message_id = ?) AS envelopes,
+         (SELECT COUNT(*) FROM message_attachment_links WHERE message_id = ?) AS attachments`,
+    ).get(messageId, messageId, messageId)).toEqual({
+      messages: 0,
+      envelopes: 0,
+      attachments: 0,
+    });
+    database.close();
+  });
+
   it("atomically submits structured targets, replays ACK loss, revises, recalls, and projects a tombstone", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-message-authority-"));
     temporaryDirectories.push(directory);
@@ -4436,7 +4473,7 @@ describe("SQLite authoritative sessions", () => {
         },
       ],
       replyToMessageId: "matrix-human-source",
-      attachments: [{ attachmentId: "attachment-v2-1" }],
+      attachments: [],
     } as const;
 
     expect(isAuthorityWorkerRequest({
@@ -4587,7 +4624,7 @@ describe("SQLite authoritative sessions", () => {
     expect(database.prepare(
       `SELECT operational_state AS operationalState FROM message_attachment_links
        WHERE message_id = ?`,
-    ).all(message.messageId)).toEqual([{ operationalState: "excluded_recalled" }]);
+    ).all(message.messageId)).toEqual([]);
     expect(database.prepare(
       `SELECT scope_kind AS scopeKind FROM message_recall_fences
        WHERE source_message_id = ? ORDER BY scope_kind DESC`,

@@ -7180,6 +7180,12 @@ export function submitHumanMessageDatabaseCommand(
     if (!isHumanMessageSubmit(input.message)) {
       return fail("invalid_parameters", "Structured Human message was rejected");
     }
+    if (input.message.attachments.length !== 0) {
+      return fail(
+        "invalid_parameters",
+        "Message attachments require the FT-04 authority validator",
+      );
+    }
     const actorId = requireHumanSession(database, input.context, input.now);
     requireCurrentHumanRoomMembership(database, actorId, input.message.roomId);
     requireMessageMutationAllowed(
@@ -7358,17 +7364,6 @@ export function submitHumanMessageDatabaseCommand(
             `INSERT INTO message_reply_links (message_id, room_id, reply_to_message_id)
              VALUES (?, ?, ?)`,
           ).run(input.message.messageId, input.message.roomId, input.message.replyToMessageId);
-        }
-        for (const attachment of input.message.attachments) {
-          database.prepare(
-            `INSERT INTO message_attachment_links (
-               message_id, room_id, attachment_id, operational_state
-             ) VALUES (?, ?, ?, 'active')`,
-          ).run(
-            input.message.messageId,
-            input.message.roomId,
-            attachment.attachmentId,
-          );
         }
         const timeline = readOperationalTimelineMessage(database, input.message.messageId);
         if (timeline.authorKind !== "human" || timeline.lifecycle !== "active") {
