@@ -33,8 +33,11 @@ import {
   canAccessRoomDatabaseQuery,
   compactRoomStreamDatabaseCommand,
   listPendingOutboxDatabaseQuery,
+  listCommittedRoomCacheInvalidationIntentsDatabaseQuery,
   markOutboxDispatchedDatabaseCommand,
   markOutboxFailedDatabaseCommand,
+  markRoomCacheInvalidationCompletedDatabaseCommand,
+  markRoomCacheInvalidationFailedDatabaseCommand,
   readActorDatabaseQuery,
   readHistoryDatabaseQuery,
   readRoomAuditDatabaseQuery,
@@ -43,6 +46,7 @@ import {
   repairMutationImpactDatabaseQuery,
   revalidateSnapshotDatabaseQuery,
   runAuthorityImmediateTransaction,
+  runAuthorityParticipantImmediateTransaction,
   syncRoomDatabaseQuery,
   inspectStreamingRepairScopeDatabaseQuery,
 } from "./authority-database-handler.js";
@@ -56,6 +60,7 @@ import {
   type StreamingRepairLease,
 } from "../fallback-repair-coordinator.js";
 import { MAX_ACTIVE_SESSION_FAMILIES } from "./contracts.js";
+import { recoverRuntimeArchiveFenceInTransaction } from "../agent-runtime/runtime-archive-fence-participant.js";
 
 interface AuthorityWorkerData {
   readonly databasePath: string;
@@ -149,6 +154,40 @@ function respondWithError(
   });
 }
 
+function recoverArchivedRuntimeFences(openedDatabase: DatabaseSync): void {
+  const recoveryTime = new Date().toISOString();
+  let afterRoomId = "";
+  while (true) {
+    const rooms = openedDatabase.prepare(
+      `SELECT id
+       FROM rooms
+       WHERE status = 'archived' AND id > ?
+       ORDER BY id
+       LIMIT 64`,
+    ).all(afterRoomId);
+    if (rooms.length === 0) return;
+    for (const room of rooms) {
+      if (typeof room.id !== "string" || room.id.length === 0) {
+        throw new Error("Archived runtime recovery room was corrupt");
+      }
+      runAuthorityParticipantImmediateTransaction(
+        openedDatabase,
+        room.id,
+        `runtime-archive-recovery:${room.id}`,
+        (transaction) => recoverRuntimeArchiveFenceInTransaction(transaction, {
+          roomId: room.id as string,
+          now: recoveryTime,
+        }),
+      );
+    }
+    const last = rooms.at(-1)?.id;
+    if (typeof last !== "string") {
+      throw new Error("Archived runtime recovery cursor was corrupt");
+    }
+    afterRoomId = last;
+  }
+}
+
 function openAuthorityDatabase(): DatabaseSync {
   if (!isAuthorityWorkerData(workerData)) {
     throw new Error("Invalid authority worker data");
@@ -156,6 +195,7 @@ function openAuthorityDatabase(): DatabaseSync {
   const openedDatabase = new DatabaseSync(workerData.databasePath);
   try {
     migrateAuthorityDatabase(openedDatabase);
+    recoverArchivedRuntimeFences(openedDatabase);
     return openedDatabase;
   } catch (error: unknown) {
     try {
@@ -1911,6 +1951,78 @@ function markOutboxFailed(request: AuthorityWorkerRequest): void {
   }
 }
 
+function listRoomCacheInvalidations(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.room-cache-invalidation-list") {
+    throw new TypeError("listRoomCacheInvalidations received the wrong request type");
+  }
+  try {
+    const intents = listCommittedRoomCacheInvalidationIntentsDatabaseQuery(
+      requireAuthorityDatabase(),
+      request.limit,
+    );
+    respond({
+      type: "authority.room-cache-invalidations",
+      requestId: request.requestId,
+      intents,
+    });
+  } catch (error: unknown) {
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithError(
+      request.requestId,
+      "storage_unavailable",
+      "Authority room cache invalidation query failed",
+    );
+  }
+}
+
+function markRoomCacheInvalidationCompleted(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.room-cache-invalidation-completed") {
+    throw new TypeError("markRoomCacheInvalidationCompleted received the wrong request type");
+  }
+  try {
+    markRoomCacheInvalidationCompletedDatabaseCommand(
+      requireAuthorityTransactionDatabase(),
+      request.invalidationIntentId,
+    );
+    respond({
+      type: "authority.room-cache-invalidation-updated",
+      requestId: request.requestId,
+    });
+  } catch {
+    respondWithError(
+      request.requestId,
+      "storage_unavailable",
+      "Authority room cache invalidation update failed",
+    );
+  }
+}
+
+function markRoomCacheInvalidationFailed(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.room-cache-invalidation-failed") {
+    throw new TypeError("markRoomCacheInvalidationFailed received the wrong request type");
+  }
+  try {
+    markRoomCacheInvalidationFailedDatabaseCommand(
+      requireAuthorityTransactionDatabase(),
+      request.invalidationIntentId,
+      request.errorCode,
+    );
+    respond({
+      type: "authority.room-cache-invalidation-updated",
+      requestId: request.requestId,
+    });
+  } catch {
+    respondWithError(
+      request.requestId,
+      "storage_unavailable",
+      "Authority room cache invalidation update failed",
+    );
+  }
+}
+
 function syncRoom(request: AuthorityWorkerRequest): void {
   if (request.type !== "authority.sync-room") {
     throw new TypeError("syncRoom received the wrong request type");
@@ -2118,6 +2230,15 @@ async function dispatch(value: unknown): Promise<void> {
       return;
     case "authority.outbox-failed":
       markOutboxFailed(value);
+      return;
+    case "authority.room-cache-invalidation-list":
+      listRoomCacheInvalidations(value);
+      return;
+    case "authority.room-cache-invalidation-completed":
+      markRoomCacheInvalidationCompleted(value);
+      return;
+    case "authority.room-cache-invalidation-failed":
+      markRoomCacheInvalidationFailed(value);
       return;
     case "authority.sync-room":
       syncRoom(value);

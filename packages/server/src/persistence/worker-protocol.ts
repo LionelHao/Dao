@@ -40,6 +40,7 @@ import {
   isBallAuthorityOperation,
   type BallAuthorityOperation,
 } from "../ball-runtime/ball-authority-protocol.js";
+import type { CommittedRoomCacheInvalidationIntent } from "../access/room-cache-invalidation-port.js";
 import type {
   AgentCollaborationCommand,
   AgentWorkerCommandContext,
@@ -326,6 +327,22 @@ export type AuthorityWorkerRequest =
       readonly reason: "closed" | "backpressure" | "send_rejected";
     }
   | {
+      readonly type: "authority.room-cache-invalidation-list";
+      readonly requestId: string;
+      readonly limit: number;
+    }
+  | {
+      readonly type: "authority.room-cache-invalidation-completed";
+      readonly requestId: string;
+      readonly invalidationIntentId: string;
+    }
+  | {
+      readonly type: "authority.room-cache-invalidation-failed";
+      readonly requestId: string;
+      readonly invalidationIntentId: string;
+      readonly errorCode: "purge_failed" | "authority_unavailable";
+    }
+  | {
       readonly type: "authority.sync-room";
       readonly requestId: string;
       readonly context: AuthenticatedSessionContext;
@@ -404,12 +421,12 @@ export type AuthorityWorkerResponse =
   | {
       readonly type: "authority.ready";
       readonly requestId: string;
-      readonly schemaVersion: 13;
+      readonly schemaVersion: 14;
     }
   | {
       readonly type: "authority.schema";
       readonly requestId: string;
-      readonly schemaVersion: 13;
+      readonly schemaVersion: 14;
     }
   | {
       readonly type: "authority.legacy-imported";
@@ -501,6 +518,15 @@ export type AuthorityWorkerResponse =
       readonly authorized: boolean;
     }
   | { readonly type: "authority.outbox-updated"; readonly requestId: string }
+  | {
+      readonly type: "authority.room-cache-invalidations";
+      readonly requestId: string;
+      readonly intents: readonly CommittedRoomCacheInvalidationIntent[];
+    }
+  | {
+      readonly type: "authority.room-cache-invalidation-updated";
+      readonly requestId: string;
+    }
   | {
       readonly type: "authority.room-synced";
       readonly requestId: string;
@@ -926,6 +952,16 @@ function isOutboxDelivery(value: unknown): value is OutboxDelivery {
     event.payload.familyId === value.targetId;
 }
 
+function isCommittedRoomCacheInvalidationIntent(
+  value: unknown,
+): value is CommittedRoomCacheInvalidationIntent {
+  return isRecord(value) && hasExactKeys(value, [
+    "invalidationIntentId", "roomId", "lifecycleGeneration", "accessRevision", "reason",
+  ]) && isText(value.invalidationIntentId) && isText(value.roomId) &&
+    isNonNegativeSafeInteger(value.lifecycleGeneration) &&
+    isNonNegativeSafeInteger(value.accessRevision) && value.reason === "room_archived";
+}
+
 export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWorkerRequest {
   if (!isRecord(value) || !hasRequestId(value) || typeof value.type !== "string") {
     return false;
@@ -1073,6 +1109,17 @@ export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWork
         (value.reason === "closed" ||
           value.reason === "backpressure" ||
           value.reason === "send_rejected");
+    case "authority.room-cache-invalidation-list":
+      return hasExactKeys(value, ["type", "requestId", "limit"]) &&
+        isNonNegativeSafeInteger(value.limit) && value.limit > 0 && value.limit <= 256;
+    case "authority.room-cache-invalidation-completed":
+      return hasExactKeys(value, ["type", "requestId", "invalidationIntentId"]) &&
+        isText(value.invalidationIntentId);
+    case "authority.room-cache-invalidation-failed":
+      return hasExactKeys(value, [
+        "type", "requestId", "invalidationIntentId", "errorCode",
+      ]) && isText(value.invalidationIntentId) &&
+        (value.errorCode === "purge_failed" || value.errorCode === "authority_unavailable");
     case "authority.sync-room": {
       const parsed = parseRoomSyncRequest(value.request);
       return hasExactKeys(value, ["type", "requestId", "context", "request", "now"]) &&
@@ -1138,7 +1185,7 @@ export function isAuthorityWorkerResponse(
     case "authority.schema":
       return (
         hasExactKeys(value, ["type", "requestId", "schemaVersion"]) &&
-        value.schemaVersion === 13
+        value.schemaVersion === 14
       );
     case "authority.closed":
       return hasExactKeys(value, ["type", "requestId"]);
@@ -1208,6 +1255,12 @@ export function isAuthorityWorkerResponse(
       return hasExactKeys(value, ["type", "requestId", "authorized"]) &&
         typeof value.authorized === "boolean";
     case "authority.outbox-updated":
+      return hasExactKeys(value, ["type", "requestId"]);
+    case "authority.room-cache-invalidations":
+      return hasExactKeys(value, ["type", "requestId", "intents"]) &&
+        Array.isArray(value.intents) && value.intents.length <= 256 &&
+        value.intents.every(isCommittedRoomCacheInvalidationIntent);
+    case "authority.room-cache-invalidation-updated":
       return hasExactKeys(value, ["type", "requestId"]);
     case "authority.room-synced":
       return hasExactKeys(value, ["type", "requestId", "result"]) &&

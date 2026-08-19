@@ -49,6 +49,10 @@ import type {
 import type { RuntimeAuthorityOperation } from "../agent-runtime/runtime-authority-protocol.js";
 import type { RouteAuthorityOperation } from "../route-runtime/route-authority-protocol.js";
 import type { BallAuthorityOperation } from "../ball-runtime/ball-authority-protocol.js";
+import type {
+  CommittedRoomCacheInvalidationIntent,
+  RoomCacheInvalidationIntentAuthority,
+} from "../access/room-cache-invalidation-port.js";
 import {
   ROOM_SYNC_DEFAULT_LIMIT,
   toAgentWorkerCommandContext,
@@ -59,7 +63,7 @@ export interface CreateWorkerDatabaseClientOptions {
 }
 
 export interface AuthoritySchemaInspection {
-  readonly version: 13;
+  readonly version: 14;
 }
 
 export interface WorkerDatabaseClient {
@@ -173,6 +177,14 @@ export interface WorkerDatabaseClient {
   markOutboxFailed(
     deliveryId: string,
     reason: OutboxDeliveryFailureReason,
+  ): Promise<void>;
+  listCommittedRoomCacheInvalidations(
+    limit: number,
+  ): Promise<readonly CommittedRoomCacheInvalidationIntent[]>;
+  markRoomCacheInvalidationCompleted(invalidationIntentId: string): Promise<void>;
+  markRoomCacheInvalidationFailed(
+    invalidationIntentId: string,
+    errorCode: "purge_failed" | "authority_unavailable",
   ): Promise<void>;
   executeRuntime(operation: RuntimeAuthorityOperation): Promise<unknown>;
   executeRoute(operation: RouteAuthorityOperation): Promise<unknown>;
@@ -1352,6 +1364,47 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
       });
   }
 
+  listCommittedRoomCacheInvalidations(
+    limit: number,
+  ): Promise<readonly CommittedRoomCacheInvalidationIntent[]> {
+    return this.#send({ type: "authority.room-cache-invalidation-list", limit })
+      .then((response) => {
+        if (response.type !== "authority.room-cache-invalidations") {
+          this.#failProtocol("Authority worker returned the wrong room-cache invalidation response");
+          throw this.#terminalError;
+        }
+        return response.intents;
+      });
+  }
+
+  markRoomCacheInvalidationCompleted(invalidationIntentId: string): Promise<void> {
+    return this.#send({
+      type: "authority.room-cache-invalidation-completed",
+      invalidationIntentId,
+    }).then((response) => {
+      if (response.type !== "authority.room-cache-invalidation-updated") {
+        this.#failProtocol("Authority worker returned the wrong room-cache completion response");
+        throw this.#terminalError;
+      }
+    });
+  }
+
+  markRoomCacheInvalidationFailed(
+    invalidationIntentId: string,
+    errorCode: "purge_failed" | "authority_unavailable",
+  ): Promise<void> {
+    return this.#send({
+      type: "authority.room-cache-invalidation-failed",
+      invalidationIntentId,
+      errorCode,
+    }).then((response) => {
+      if (response.type !== "authority.room-cache-invalidation-updated") {
+        this.#failProtocol("Authority worker returned the wrong room-cache failure response");
+        throw this.#terminalError;
+      }
+    });
+  }
+
   close(): Promise<void> {
     if (this.#closePromise !== undefined) {
       return this.#closePromise;
@@ -1549,6 +1602,11 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
         responseType === "authority.outbox-updated") ||
       (requestType === "authority.outbox-failed" &&
         responseType === "authority.outbox-updated") ||
+      (requestType === "authority.room-cache-invalidation-list" &&
+        responseType === "authority.room-cache-invalidations") ||
+      ((requestType === "authority.room-cache-invalidation-completed" ||
+        requestType === "authority.room-cache-invalidation-failed") &&
+        responseType === "authority.room-cache-invalidation-updated") ||
       (requestType === "authority.sync-room" &&
         responseType === "authority.room-synced") ||
       (requestType === "authority.snapshot-revalidate" &&
@@ -1610,6 +1668,23 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
     });
     return error;
   }
+}
+
+export function createWorkerRoomCacheInvalidationIntentAuthority(
+  worker: Pick<WorkerDatabaseClient,
+    | "listCommittedRoomCacheInvalidations"
+    | "markRoomCacheInvalidationCompleted"
+    | "markRoomCacheInvalidationFailed">,
+): RoomCacheInvalidationIntentAuthority {
+  return Object.freeze({
+    listCommittedReady: (limit: number) => worker.listCommittedRoomCacheInvalidations(limit),
+    markCompleted: (invalidationIntentId: string) =>
+      worker.markRoomCacheInvalidationCompleted(invalidationIntentId),
+    markFailed: (
+      invalidationIntentId: string,
+      errorCode: "purge_failed" | "authority_unavailable",
+    ) => worker.markRoomCacheInvalidationFailed(invalidationIntentId, errorCode),
+  });
 }
 
 type AuthorityWorkerFactory = (

@@ -1,8 +1,13 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { MAX_ACTIVE_SESSION_FAMILIES } from "./contracts.js";
+import {
+  ROOM_ACCESS_AUTHORITY_SCHEMA_STATEMENTS,
+  ROOM_CACHE_INVALIDATION_SCHEMA_STATEMENTS,
+} from "../access/room-cache-invalidation-port.js";
+import { OFFLINE_READ_LEASE_SCHEMA_STATEMENTS } from "../access/offline-lease-invalidation-port.js";
 
-export const AUTHORITY_SCHEMA_VERSION = 13 as const;
+export const AUTHORITY_SCHEMA_VERSION = 14 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -56,6 +61,7 @@ const SCHEMA_FINGERPRINTS = {
   11: "83e48fc5a4b1b1c19863efd785ea098308d100c1899d638d2b5f95c5b0c119a6",
   12: "7232d27114e9acf32dcfbc2d59f3c3128eed10955de3cc2703ddeedf92892741",
   13: "037df6a2818f2a90b7394240a4cf71d77949faf31df6534c5546c9ed6b7e7191",
+  14: "186018d645cc93912dbd6a4d723a5dfe95f68d5082773ff45b8f99afcdfafc8d",
 } as const;
 
 const V1_STATEMENTS = [
@@ -1161,6 +1167,62 @@ const V13_STATEMENTS = [
    BEFORE DELETE ON room_audit BEGIN SELECT RAISE(ABORT, 'room audit is immutable'); END`,
 ] as const;
 
+const V14_STATEMENTS = [
+  `CREATE TABLE room_message_archive_gates (
+    room_id TEXT PRIMARY KEY REFERENCES rooms(id),
+    gate_generation INTEGER NOT NULL CHECK (gate_generation > 0),
+    blocked_at TEXT NOT NULL
+  ) STRICT`,
+  `INSERT INTO room_message_archive_gates (
+     room_id, gate_generation, blocked_at
+   )
+   SELECT id, archive_generation, archived_at
+   FROM rooms
+   WHERE status = 'archived'
+     AND archive_generation > 0
+     AND archived_at IS NOT NULL`,
+  `ALTER TABLE agent_executions
+   ADD COLUMN room_archive_generation INTEGER NOT NULL DEFAULT 0
+   CHECK (room_archive_generation >= 0)`,
+  `CREATE TABLE runtime_archive_fences (
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    archive_generation INTEGER NOT NULL CHECK (archive_generation > 0),
+    fenced_at TEXT NOT NULL,
+    fenced_queued_count INTEGER NOT NULL DEFAULT 0 CHECK (fenced_queued_count >= 0),
+    fenced_waiting_count INTEGER NOT NULL DEFAULT 0 CHECK (fenced_waiting_count >= 0),
+    preserved_dispatched_count INTEGER NOT NULL DEFAULT 0
+      CHECK (preserved_dispatched_count >= 0),
+    preserved_outcome_review_count INTEGER NOT NULL DEFAULT 0
+      CHECK (preserved_outcome_review_count >= 0),
+    PRIMARY KEY (room_id, archive_generation)
+  ) STRICT`,
+  `CREATE TABLE runtime_archive_fence_members (
+    room_id TEXT NOT NULL,
+    archive_generation INTEGER NOT NULL,
+    execution_id TEXT NOT NULL REFERENCES agent_executions(id),
+    attempt_seq INTEGER NOT NULL CHECK (attempt_seq >= 1),
+    disposition TEXT NOT NULL CHECK (disposition IN (
+      'cancelled_queued', 'cancelled_waiting',
+      'preserved_dispatched', 'preserved_outcome_review'
+    )),
+    fenced_at TEXT NOT NULL,
+    PRIMARY KEY (room_id, archive_generation, execution_id),
+    FOREIGN KEY (room_id, archive_generation)
+      REFERENCES runtime_archive_fences(room_id, archive_generation),
+    FOREIGN KEY (execution_id, attempt_seq)
+      REFERENCES agent_execution_attempts(execution_id, attempt_seq)
+  ) STRICT`,
+  `CREATE INDEX runtime_archive_fence_members_execution
+   ON runtime_archive_fence_members(execution_id, archive_generation)`,
+  `CREATE INDEX agent_executions_room_generation_status_v14
+   ON agent_executions(room_id, room_archive_generation, status, queued_at, id)`,
+  `CREATE INDEX tool_dispatches_execution_attempt_v14
+   ON tool_dispatches(execution_id, attempt_seq)`,
+  ...ROOM_ACCESS_AUTHORITY_SCHEMA_STATEMENTS,
+  ...ROOM_CACHE_INVALIDATION_SCHEMA_STATEMENTS,
+  ...OFFLINE_READ_LEASE_SCHEMA_STATEMENTS,
+] as const;
+
 const V2_STATEMENTS = [
   `ALTER TABLE actors
    ADD COLUMN catalog_revision INTEGER NOT NULL DEFAULT 0
@@ -1560,6 +1622,7 @@ const MIGRATIONS = [
     V13_STATEMENTS,
     V13_MIGRATION_CHECKSUM,
   ),
+  defineMigration(14, "shared-authority-production-providers", V14_STATEMENTS),
 ] as const satisfies readonly Migration[];
 
 const V1_SCHEMA_CONTRACT = {
@@ -1881,6 +1944,44 @@ const V13_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V14_SCHEMA_CONTRACT = {
+  ...V13_SCHEMA_CONTRACT,
+  agent_executions: [
+    ...V13_SCHEMA_CONTRACT.agent_executions,
+    "room_archive_generation",
+  ],
+  room_message_archive_gates: [
+    "room_id", "gate_generation", "blocked_at",
+  ],
+  room_access_authority: [
+    "room_id", "access_revision", "lease_generation",
+  ],
+  room_cache_invalidation_intents: [
+    "id", "room_id", "lifecycle_generation", "access_revision", "reason",
+    "status", "attempts", "available_at", "created_at", "completed_at",
+    "last_error_code",
+  ],
+  offline_read_lease_issuances: [
+    "lease_id", "room_id", "account_id", "actor_id", "session_family_id",
+    "device_id", "installation_id", "server_subject", "key_id",
+    "lifecycle_generation", "access_revision", "lease_generation",
+    "issued_at_ms", "not_before_ms", "expires_at_ms", "revoked_at_ms",
+  ],
+  offline_read_lease_invalidations: [
+    "id", "room_id", "lifecycle_generation", "access_revision",
+    "lease_generation", "revoked_lease_count", "reason", "created_at",
+  ],
+  runtime_archive_fence_members: [
+    "room_id", "archive_generation", "execution_id", "attempt_seq",
+    "disposition", "fenced_at",
+  ],
+  runtime_archive_fences: [
+    "room_id", "archive_generation", "fenced_at", "fenced_queued_count",
+    "fenced_waiting_count", "preserved_dispatched_count",
+    "preserved_outcome_review_count",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
@@ -1895,6 +1996,7 @@ const SCHEMA_CONTRACTS = {
   11: V11_SCHEMA_CONTRACT,
   12: V12_SCHEMA_CONTRACT,
   13: V13_SCHEMA_CONTRACT,
+  14: V14_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -2427,6 +2529,132 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
       "v13 membership roles must keep Human governance separate from Agent participation",
     );
   }
+  if (schemaVersion >= 14) {
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM rooms AS room
+       LEFT JOIN room_message_archive_gates AS gate ON gate.room_id = room.id
+       WHERE (room.status = 'archived' AND (
+                gate.room_id IS NULL
+                OR gate.gate_generation <> room.archive_generation
+                OR gate.blocked_at <> room.archived_at
+              ))
+          OR (gate.room_id IS NOT NULL AND (
+                gate.gate_generation <= 0
+                OR gate.gate_generation > room.archive_generation
+              ))
+       LIMIT 1`,
+      "message archive gates must match the current archived generation",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_executions AS execution
+       JOIN rooms AS room ON room.id = execution.room_id
+       WHERE execution.room_archive_generation < 0
+          OR execution.room_archive_generation > room.archive_generation
+       LIMIT 1`,
+      "runtime execution generations must not outrun Room lifecycle generations",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM runtime_archive_fences AS fence
+       JOIN rooms AS room ON room.id = fence.room_id
+       WHERE fence.archive_generation > room.archive_generation
+          OR fence.archive_generation <= 0
+          OR fence.fenced_queued_count <> (
+            SELECT COUNT(*) FROM runtime_archive_fence_members AS member
+            WHERE member.room_id = fence.room_id
+              AND member.archive_generation = fence.archive_generation
+              AND member.disposition = 'cancelled_queued'
+          )
+          OR fence.fenced_waiting_count <> (
+            SELECT COUNT(*) FROM runtime_archive_fence_members AS member
+            WHERE member.room_id = fence.room_id
+              AND member.archive_generation = fence.archive_generation
+              AND member.disposition = 'cancelled_waiting'
+          )
+          OR fence.preserved_dispatched_count <> (
+            SELECT COUNT(*) FROM runtime_archive_fence_members AS member
+            WHERE member.room_id = fence.room_id
+              AND member.archive_generation = fence.archive_generation
+              AND member.disposition = 'preserved_dispatched'
+          )
+          OR fence.preserved_outcome_review_count <> (
+            SELECT COUNT(*) FROM runtime_archive_fence_members AS member
+            WHERE member.room_id = fence.room_id
+              AND member.archive_generation = fence.archive_generation
+              AND member.disposition = 'preserved_outcome_review'
+          )
+       LIMIT 1`,
+      "runtime archive fence counts must match their durable member ledger",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM runtime_archive_fence_members AS member
+       JOIN agent_executions AS execution ON execution.id = member.execution_id
+       WHERE execution.room_id <> member.room_id
+          OR execution.room_archive_generation > member.archive_generation
+          OR execution.current_attempt_seq <> member.attempt_seq
+       LIMIT 1`,
+      "runtime archive fence members must match Room, generation, and current attempt",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM room_access_authority AS access
+       JOIN rooms AS room ON room.id = access.room_id
+       WHERE access.access_revision < COALESCE((
+               SELECT MAX(membership.access_revision)
+               FROM room_memberships AS membership
+               WHERE membership.room_id = access.room_id
+             ), 0)
+          OR access.lease_generation < 0
+       LIMIT 1`,
+      "room access authority must not trail durable membership revisions",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM room_cache_invalidation_intents AS intent
+       JOIN rooms AS room ON room.id = intent.room_id
+       LEFT JOIN room_access_authority AS access ON access.room_id = intent.room_id
+       WHERE intent.lifecycle_generation > room.archive_generation
+          OR access.room_id IS NULL
+          OR intent.access_revision > access.access_revision
+       LIMIT 1`,
+      "room cache invalidations must be bounded by lifecycle and access authority",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM offline_read_lease_issuances AS issuance
+       JOIN rooms AS room ON room.id = issuance.room_id
+       LEFT JOIN room_access_authority AS access ON access.room_id = issuance.room_id
+       WHERE issuance.lifecycle_generation > room.archive_generation
+          OR access.room_id IS NULL
+          OR issuance.access_revision > access.access_revision
+          OR issuance.lease_generation > access.lease_generation
+       LIMIT 1`,
+      "offline lease issuances must be bounded by lifecycle and access authority",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM offline_read_lease_invalidations AS invalidation
+       JOIN rooms AS room ON room.id = invalidation.room_id
+       LEFT JOIN room_access_authority AS access ON access.room_id = invalidation.room_id
+       WHERE invalidation.lifecycle_generation > room.archive_generation
+          OR access.room_id IS NULL
+          OR invalidation.access_revision > access.access_revision
+          OR invalidation.lease_generation > access.lease_generation
+       LIMIT 1`,
+      "offline lease invalidations must be bounded by lifecycle and access authority",
+    );
+  }
 }
 
 function validateExistingSchema(database: DatabaseSync, currentVersion: number): void {
@@ -2638,6 +2866,12 @@ export function migrateAuthorityDatabaseToPreviousVersionForTest(
   database: DatabaseSync,
 ): void {
   migrateAuthorityDatabaseToVersion(database, AUTHORITY_SCHEMA_VERSION - 1);
+}
+
+export function migrateAuthorityDatabaseToVersion12ForTest(
+  database: DatabaseSync,
+): void {
+  migrateAuthorityDatabaseToVersion(database, 12);
 }
 
 export function migrateAuthorityDatabaseToVersion11ForTest(

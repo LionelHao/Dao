@@ -826,7 +826,7 @@ describe("permission-aware retained room sync", () => {
       ).get(),
     }).toEqual(before);
     database.close();
-    await expect(fixture.client.inspectSchema()).resolves.toEqual({ version: 13 });
+    await expect(fixture.client.inspectSchema()).resolves.toEqual({ version: 14 });
     const context = fixture.contexts[0];
     if (context === undefined) throw new Error("missing fixture context");
     await expect(fixture.sync.syncRoom(
