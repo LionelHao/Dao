@@ -84,7 +84,7 @@
 
 | Wave | 分支 / Agent | 独占文件范围 | 交付门槛 |
 | --- | --- | --- | --- |
-| 1A | `codex/ft03-stage5-core` | `packages/core/src/message-authority*`、必要的 Core export/type tests | exact guards/type negative tests RED→GREEN |
+| 1A | `codex/ft03-stage5-core` | `packages/core/src/message-authority*`、必要的 Core export/type tests 与显式 build include | exact guards/type negative tests RED→GREEN |
 | 1B | `codex/ft03-stage5-schema` | `packages/server/src/persistence/schema.ts`、schema tests（含把历史冻结测试显式固定到 v15 的最小改动） | v15→v16/backfill/fingerprint/fault rollback RED→GREEN |
 | 1C | `codex/ft03-stage5-desktop` | 新增 `packages/desktop/src/renderer/message-authority/**` | DESIGN_CONTRACT、view model/component contract RED→GREEN；无 fake transport |
 | 1R | integration root | 本工作说明、只读审计、共享接口裁决 | 不与子 Agent 同时改共享文件 |
@@ -106,3 +106,15 @@
   Electron bridge 必须是显式 allowlist，不能把 socket、session token 或内部 Agent capability 暴露给 renderer。
 - 结论：本阶段不需要外部依赖升级或新增。若后续实现发现必须新增依赖，应先补充维护状态、license、版本固定、
   Electron/Node 兼容性和供应链风险证据，再等待 owner 裁决。
+
+## 8. 未改生产代码的基线证据
+
+- 必须使用仓库 `packageManager` 声明的 `corepack pnpm@10.14.0`。Codex fallback pnpm 11.19.0 会把现有
+  Electron/esbuild build allowlist 误判为 ignored builds；该工具链失败发生在编译前，不是产品测试失败。
+- `corepack pnpm typecheck`：通过。
+- `corepack pnpm lint`：通过。
+- `corepack pnpm test`：84 files passed、2 skipped；1234 tests passed、2 skipped。
+- `corepack pnpm build`：Core、Server、Desktop 全部通过。
+- `corepack pnpm --filter @native-im/desktop smoke`：`Electron Identity smoke passed`。
+- fallback pnpm 造成的临时 node_modules 缺少 Electron binary 已通过执行锁定版本包自身的 install script 修复；
+  `pnpm-workspace.yaml`、lockfile 与 dependency version 均无最终改动。
