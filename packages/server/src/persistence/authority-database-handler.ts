@@ -73,6 +73,8 @@ import type {
 } from "../fallback-repair-coordinator.js";
 import type { SnapshotVersion } from "@native-im/core";
 import { assignTopicKey } from "../route-runtime/route-decision.js";
+import type { AuthorityTransactionView } from "../room-governance/private-participant-contracts.js";
+import { withDatabaseAuthorityTransactionView } from "./authority-transaction-database.js";
 
 export class AuthorityDatabaseError extends Error {
   constructor(
@@ -367,6 +369,25 @@ export function runAuthorityImmediateTransaction<Result>(
     }
     throw error;
   }
+}
+
+export function runAuthorityParticipantImmediateTransaction<Result>(
+  database: DatabaseSync,
+  roomId: string,
+  transactionId: string,
+  operation: (transaction: AuthorityTransactionView) => Result,
+  beforeCommit?: () => void,
+): Result {
+  return runAuthorityImmediateTransaction(
+    database,
+    () => withDatabaseAuthorityTransactionView(
+      database,
+      roomId,
+      transactionId,
+      operation,
+    ),
+    beforeCommit,
+  );
 }
 
 function canonicalJson(value: unknown): string {
