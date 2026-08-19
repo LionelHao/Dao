@@ -4,6 +4,9 @@ import { describe, expect, it } from "vitest";
 
 const PRIVATE_MARKERS = [
   "AuthorityTransactionView",
+  "mintDatabaseAuthorityTransactionView",
+  "releaseDatabaseAuthorityTransactionView",
+  "useAuthorityTransactionDatabase",
   "ParticipantRegistration",
   "DepartureResponsibilityContributor",
   "PendingConfirmationDepartureContributor",
