@@ -333,15 +333,30 @@ function reduceTimeline(
   return freezeTimeline(next);
 }
 
-export function createMessageAuthorityReplica(roomId: string): MessageAuthorityReplica {
+export type MessageAuthorityReplicaSeed = Readonly<{
+  generation: number;
+  checkpoint: number;
+  timeline: readonly TimelineMessage[];
+}>;
+
+export function createMessageAuthorityReplica(
+  roomId: string,
+  seed?: MessageAuthorityReplicaSeed,
+): MessageAuthorityReplica {
   if (!isIdentifier(roomId)) reject("invalid_room");
+  if (seed !== undefined && (!isPositiveSafeInteger(seed.generation) ||
+      !isNonNegativeSafeInteger(seed.checkpoint) ||
+      seed.timeline.some((message) => message.roomId !== roomId))) {
+    reject("invalid_repair");
+  }
+  if (seed !== undefined) validateCommittedTimeline(seed.timeline);
   return freezeReplica({
     roomId,
     mode: "online",
-    generation: 1,
-    checkpoint: 0,
-    afterSeq: 0,
-    timeline: [],
+    generation: seed?.generation ?? 1,
+    checkpoint: seed?.checkpoint ?? 0,
+    afterSeq: seed?.checkpoint ?? 0,
+    timeline: seed?.timeline ?? [],
     eventLedger: [],
   });
 }

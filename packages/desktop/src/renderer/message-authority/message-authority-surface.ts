@@ -10,6 +10,7 @@ import {
 } from "./view-model.js";
 
 export interface MessageAuthoritySurfaceActions {
+  readonly onDraftBodyChange: (body: string) => void;
   readonly onSend: (draft: MessageDraft) => void;
   readonly onRetry: (draft: MessageDraft) => void;
   readonly onSelectMention: (actor: MessageActorOption) => void;
@@ -344,15 +345,16 @@ function renderComposer(
   input.dataset.messageComposer = "true";
   input.value = state.draft.body;
   input.disabled = !state.composerEnabled || state.submission.status === "submitting";
+  input.addEventListener("input", () => actions.onDraftBodyChange(input.value));
   label.append(input);
   composer.append(label);
   const send = button(state.submission.status === "submitting" ? "发送中…" : "发送", "send-message");
   send.disabled = !state.composerEnabled || state.submission.status === "submitting";
-  send.addEventListener("click", () => actions.onSend(state.draft));
+  send.addEventListener("click", () => actions.onSend({ ...state.draft, body: input.value }));
   input.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && !send.disabled) {
       event.preventDefault();
-      actions.onSend(state.draft);
+      actions.onSend({ ...state.draft, body: input.value });
     }
   });
   composer.append(send);

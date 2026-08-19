@@ -96,6 +96,7 @@ function state(overrides: Partial<MessageAuthorityState> = {}): MessageAuthority
 
 function actions(): MessageAuthoritySurfaceActions {
   return {
+    onDraftBodyChange: vi.fn(),
     onSend: vi.fn(),
     onRetry: vi.fn(),
     onSelectMention: vi.fn(),

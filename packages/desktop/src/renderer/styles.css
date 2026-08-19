@@ -1,3 +1,5 @@
+@import "./message-authority/message-authority.css";
+
 :root {
   --app-background: #f8fafc;
   --semantic-success: #027a48;

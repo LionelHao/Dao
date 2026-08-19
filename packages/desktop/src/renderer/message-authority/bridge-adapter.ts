@@ -1,0 +1,560 @@
+import type {
+  HumanMessageSubmit,
+  MessageAuthorityEvent,
+  TimelineMessage as CoreTimelineMessage,
+} from "@native-im/core";
+
+import type {
+  MessageAuthorityBridge,
+  MessageAuthorityBridgeInput,
+  MessageAuthorityReadyHistory,
+} from "../../message-authority/contracts.js";
+import {
+  applyMessageAuthorityEvent,
+  beginMessageAuthorityRepair,
+  commitMessageAuthorityRepair,
+  createMessageAuthorityReplica,
+  markMessageAuthorityOfflineReadOnly,
+  revokeMessageAuthorityRoom,
+  stageMessageAuthorityRepairRecord,
+  type MessageAuthorityReplica,
+} from "../../sync/message-authority-replica.js";
+import {
+  applyMessageAuthorityInput,
+  beginMessageSubmission,
+  commitRepairGeneration,
+  createMessageAuthorityState,
+  failRepairGeneration,
+  retryMessageSubmission,
+  type MessageActorOption,
+  type MessageAuthorityInput,
+  type MessageAuthorityState,
+  type MessageDraft,
+  type TimelineMessage,
+} from "./view-model.js";
+import {
+  renderMessageAuthoritySurface,
+  type MessageAuthoritySurfaceActions,
+} from "./message-authority-surface.js";
+
+export interface MessageAuthorityBridgeSurfaceOptions {
+  readonly createMessageId: () => string;
+  readonly createTargetId: () => string;
+  readonly reducedMotion?: boolean;
+}
+
+type RevisionTarget = Readonly<{ messageId: string; expectedRevision: number }>;
+type AwaitingReceipt = {
+  readonly payload: MessageDraft;
+  readonly queued: MessageAuthorityBridgeInput[];
+};
+
+function emptyDraft(roomId: string, messageId: string): MessageDraft {
+  return {
+    messageId,
+    roomId,
+    body: "",
+    mentionedTargets: [],
+    attachments: [],
+  };
+}
+
+function mapTimelineMessage(message: CoreTimelineMessage): TimelineMessage {
+  if (message.lifecycle === "recalled") {
+    return {
+      kind: "tombstone",
+      messageId: message.id,
+      roomId: message.roomId,
+      authorId: message.authorId,
+      createdAt: message.createdAt,
+      recalledAt: message.recalledAt,
+      revisionCount: message.revisionCount,
+    };
+  }
+  if (message.authorKind === "agent") {
+    return {
+      kind: "agent-final",
+      messageId: message.id,
+      roomId: message.roomId,
+      authorId: message.authorId,
+      createdAt: message.createdAt,
+      finalBody: message.finalBody,
+      sourceInvocationIntentId: message.sourceInvocationIntentId,
+      sourceExecutionId: message.sourceExecutionId,
+      ...(message.correctsMessageId === undefined
+        ? {}
+        : { correctsMessageId: message.correctsMessageId }),
+    };
+  }
+  return {
+    kind: "human",
+    messageId: message.id,
+    roomId: message.roomId,
+    authorId: message.authorId,
+    createdAt: message.createdAt,
+    body: message.currentRevision.body,
+    revision: message.currentRevision.revision,
+    revisionCount: message.revisionCount,
+    mentionedTargets: message.mentionedTargets,
+    ...(message.replyToMessageId === undefined
+      ? {}
+      : { replyToMessageId: message.replyToMessageId }),
+    attachments: message.attachments,
+    targetOutcomes: message.targetOutcomes,
+  };
+}
+
+function replaceState(
+  state: MessageAuthorityState,
+  patch: Partial<MessageAuthorityState>,
+): MessageAuthorityState {
+  return createMessageAuthorityState({ ...state, ...patch });
+}
+
+function eventInput(event: MessageAuthorityEvent): MessageAuthorityInput {
+  if (event.type === "room.message.accepted") {
+    return {
+      type: "room.message.accepted",
+      eventId: event.eventId,
+      message: mapTimelineMessage(event.payload),
+    };
+  }
+  if (event.type === "room.message.revised") {
+    return {
+      type: "room.message.revised",
+      eventId: event.eventId,
+      messageId: event.payload.id,
+      revision: event.payload.currentRevision.revision,
+      body: event.payload.currentRevision.body,
+      revisedAt: event.payload.currentRevision.revisedAt,
+    };
+  }
+  return {
+    type: "room.message.recalled",
+    eventId: event.eventId,
+    tombstone: mapTimelineMessage(event.payload) as Extract<
+      TimelineMessage,
+      { readonly kind: "tombstone" }
+    >,
+  };
+}
+
+function renderLoading(root: HTMLElement): void {
+  const status = document.createElement("section");
+  status.dataset.messageAuthorityLoading = "true";
+  status.setAttribute("role", "status");
+  status.setAttribute("aria-live", "polite");
+  status.textContent = "正在载入 Room 权威消息…";
+  root.replaceChildren(status);
+}
+
+export function mountMessageAuthorityBridgeSurface(
+  root: HTMLElement,
+  bridge: MessageAuthorityBridge,
+  roomId: string,
+  options: MessageAuthorityBridgeSurfaceOptions,
+): () => void {
+  let disposed = false;
+  let state: MessageAuthorityState | undefined;
+  let replica: MessageAuthorityReplica | undefined;
+  let revisionTarget: RevisionTarget | undefined;
+  let awaitingReceipt: AwaitingReceipt | undefined;
+  const beforeHistory: MessageAuthorityBridgeInput[] = [];
+
+  const render = (): void => {
+    if (disposed || state === undefined) return;
+    renderMessageAuthoritySurface(root, state, actions);
+    if (revisionTarget !== undefined) {
+      const send = root.querySelector<HTMLButtonElement>("[data-action='send-message']");
+      if (send !== null) send.textContent = "保存修订";
+    }
+  };
+
+  const applyStableEvent = (input: Extract<MessageAuthorityBridgeInput, { type: "room.event" }>): void => {
+    if (state === undefined || replica === undefined || input.event.roomId !== roomId) return;
+    if (input.generation !== replica.generation || input.cursorBefore !== replica.afterSeq) {
+      state = state.connection.status === "repairing"
+        ? failRepairGeneration(state, "event_cursor_mismatch")
+        : replaceState(state, {
+          connection: { status: "repair-failed", errorCode: "event_cursor_mismatch" },
+          announcement: "事件游标不连续；旧完整 projection 已锁定并等待 repair",
+        });
+      render();
+      return;
+    }
+    try {
+      replica = applyMessageAuthorityEvent(replica, input.event);
+      state = applyMessageAuthorityInput(state, eventInput(input.event));
+      state = replaceState(state, {
+        timeline: replica.timeline.map(mapTimelineMessage),
+        projectionGeneration: replica.generation,
+      });
+    } catch {
+      state = replaceState(state, {
+        connection: { status: "repair-failed", errorCode: "event_projection_invalid" },
+        announcement: "事件无法安全投影；旧完整 projection 已锁定并等待 repair",
+      });
+    }
+    render();
+  };
+
+  const applyConnection = (
+    input: Extract<MessageAuthorityBridgeInput, { type: "message.connection" }>,
+  ): void => {
+    if (state === undefined || replica === undefined || input.roomId !== roomId) return;
+    const connection = input.connection;
+    if (connection.status === "revoked") {
+      replica = revokeMessageAuthorityRoom(replica);
+      state = replaceState(state, {
+        connection,
+        timeline: [],
+        actors: [],
+        previews: [],
+        executions: [],
+        appliedEventIds: [],
+        draft: emptyDraft(roomId, options.createMessageId()),
+        announcement: "访问已撤销；Room 消息缓存已清除",
+      });
+    } else if (connection.status === "fatal") {
+      replica = revokeMessageAuthorityRoom(replica);
+      state = replaceState(state, {
+        connection,
+        timeline: [],
+        previews: [],
+        announcement: "无法验证权威消息状态；内容已锁定",
+      });
+    } else if (connection.status === "offline") {
+      if (replica.mode === "online") replica = markMessageAuthorityOfflineReadOnly(replica);
+      state = replaceState(state, {
+        connection,
+        announcement: "当前离线；显示旧完整缓存，消息写入已禁用",
+      });
+    } else if (connection.status === "repairing") {
+      state = applyMessageAuthorityInput(state, {
+        type: "repair.started",
+        watermark: connection.watermark,
+      });
+    } else if (connection.status === "repair-failed") {
+      state = state.connection.status === "repairing"
+        ? failRepairGeneration(state, connection.errorCode)
+        : replaceState(state, { connection });
+    } else {
+      replica = createMessageAuthorityReplica(roomId, {
+        generation: replica.generation,
+        checkpoint: replica.afterSeq,
+        timeline: replica.timeline,
+      });
+      state = replaceState(state, { connection });
+    }
+    render();
+  };
+
+  const applyRepair = (
+    input: Extract<MessageAuthorityBridgeInput, { type: "message.repair.completed" }>,
+  ): void => {
+    if (state === undefined || replica === undefined || input.roomId !== roomId ||
+        input.generation <= replica.generation) return;
+    const snapshotId = `message-repair-${input.generation}-${input.watermark}`;
+    try {
+      let stagingBase = createMessageAuthorityReplica(roomId, {
+        generation: replica.generation,
+        checkpoint: replica.afterSeq,
+        timeline: replica.timeline,
+      });
+      stagingBase = beginMessageAuthorityRepair(stagingBase, {
+        snapshotId,
+        generation: input.generation,
+        watermark: input.watermark,
+      });
+      for (const message of input.messages) {
+        stagingBase = stageMessageAuthorityRepairRecord(stagingBase, snapshotId, {
+          kind: "timeline-message",
+          value: message,
+        });
+      }
+      replica = commitMessageAuthorityRepair(stagingBase, {
+        snapshotId,
+        generation: input.generation,
+        watermark: input.watermark,
+      });
+      if (state.connection.status !== "repairing" ||
+          state.connection.watermark !== input.watermark) {
+        state = replaceState(state, {
+          connection: { status: "repairing", watermark: input.watermark },
+        });
+      }
+      state = commitRepairGeneration(state, {
+        generation: input.generation,
+        watermark: input.watermark,
+        timeline: replica.timeline.map(mapTimelineMessage),
+        executions: [],
+        appliedEventIds: input.eventIds,
+      });
+    } catch {
+      state = state.connection.status === "repairing"
+        ? failRepairGeneration(state, "repair_projection_invalid")
+        : replaceState(state, {
+          connection: { status: "repair-failed", errorCode: "repair_projection_invalid" },
+        });
+    }
+    render();
+  };
+
+  const applyInput = (input: MessageAuthorityBridgeInput): void => {
+    if (state === undefined) {
+      beforeHistory.push(input);
+      return;
+    }
+    if (input.type === "room.event") {
+      if (awaitingReceipt !== undefined &&
+          input.event.payload.id === awaitingReceipt.payload.messageId) {
+        awaitingReceipt.queued.push(input);
+        return;
+      }
+      applyStableEvent(input);
+      return;
+    }
+    if (input.type === "message.connection") {
+      applyConnection(input);
+      return;
+    }
+    if (input.type === "message.repair.completed") {
+      applyRepair(input);
+      return;
+    }
+    if (awaitingReceipt !== undefined) {
+      awaitingReceipt.queued.push(input);
+      return;
+    }
+    if (input.type === "message.accepted" || input.type === "message.error") {
+      state = applyMessageAuthorityInput(state, input);
+      render();
+      return;
+    }
+    state = replaceState(state, {
+      announcement: input.type === "message.revision.accepted"
+        ? `修订 ACK · v${input.revision} 已持久化，等待 stable event`
+        : "撤回 ACK · 已持久化，等待 stable event",
+    });
+    render();
+  };
+
+  const newDraft = (): MessageDraft => emptyDraft(roomId, options.createMessageId());
+
+  const sendDraft = async (payload: MessageDraft, retry: boolean): Promise<void> => {
+    if (state === undefined || !state.composerEnabled || awaitingReceipt !== undefined) return;
+    if (revisionTarget !== undefined) {
+      const target = revisionTarget;
+      state = replaceState(state, { draft: payload, announcement: "正在提交消息修订" });
+      render();
+      try {
+        await bridge.revise({
+          type: "message.revise",
+          roomId,
+          messageId: target.messageId,
+          expectedRevision: target.expectedRevision,
+          body: payload.body,
+        });
+        revisionTarget = undefined;
+      } catch {
+        state = replaceState(state, { announcement: "修订命令未进入闭合 bridge；正文已保留" });
+      }
+      render();
+      return;
+    }
+    const pending: AwaitingReceipt = { payload, queued: [] };
+    awaitingReceipt = pending;
+    state = replaceState(state, { draft: payload });
+    try {
+      const receipt = await bridge.sendV2({
+        type: "message.send.v2",
+        message: payload as HumanMessageSubmit,
+      });
+      state = retry
+        ? retryMessageSubmission(state, receipt.requestId)
+        : beginMessageSubmission(state, receipt.requestId);
+      state = replaceState(state, { draft: newDraft() });
+      awaitingReceipt = undefined;
+      render();
+      for (const queued of pending.queued) applyInput(queued);
+    } catch {
+      awaitingReceipt = undefined;
+      state = replaceState(state, {
+        announcement: "消息命令未进入闭合 bridge；输入已保留",
+      });
+      render();
+    }
+  };
+
+  const actions: MessageAuthoritySurfaceActions = {
+    onDraftBodyChange(body) {
+      if (state === undefined) return;
+      state = replaceState(state, { draft: { ...state.draft, body } });
+    },
+    onSend: (draft) => { void sendDraft(draft, false); },
+    onRetry: (draft) => { void sendDraft(draft, true); },
+    onSelectMention(actor: MessageActorOption) {
+      if (state === undefined || !state.composerEnabled) return;
+      const prefix = state.draft.body.length === 0 || state.draft.body.endsWith(" ") ? "" : " ";
+      const mention = `@${actor.displayName}`;
+      const startUtf16 = state.draft.body.length + prefix.length;
+      state = replaceState(state, {
+        draft: {
+          ...state.draft,
+          body: `${state.draft.body}${prefix}${mention}`,
+          mentionedTargets: [...state.draft.mentionedTargets, {
+            id: options.createTargetId(),
+            kind: actor.kind === "human" ? "human-request" : "agent-invocation",
+            targetActorId: actor.actorId,
+            range: { startUtf16, endUtf16: startUtf16 + mention.length },
+          }],
+        },
+      });
+      render();
+    },
+    onRevise(messageId) {
+      if (state === undefined || !state.composerEnabled) return;
+      const message = state.timeline.find((candidate) =>
+        candidate.messageId === messageId && candidate.kind === "human");
+      if (message?.kind !== "human") return;
+      void bridge.revisionsQuery({
+        type: "message.revisions.query",
+        roomId,
+        messageId,
+      }).then((result) => {
+        if (disposed || state === undefined) return;
+        if (result.type === "message.error") {
+          state = replaceState(state, {
+            announcement: `无法载入修订历史；${result.status} ${result.code}`,
+          });
+          render();
+          return;
+        }
+        const latest = result.revisions.at(-1);
+        if (latest === undefined) return;
+        revisionTarget = { messageId, expectedRevision: latest.revision };
+        state = replaceState(state, {
+          draft: { ...newDraft(), body: latest.body },
+          announcement: `已载入 v${latest.revision}；保存将提交 revision intent`,
+        });
+        render();
+      }).catch(() => {
+        if (state === undefined) return;
+        state = replaceState(state, { announcement: "无法载入修订历史" });
+        render();
+      });
+    },
+    onRecall(messageId) {
+      if (state === undefined || !state.composerEnabled) return;
+      const message = state.timeline.find((candidate) => candidate.messageId === messageId);
+      if (message?.kind !== "human") return;
+      void bridge.recall({
+        type: "message.recall",
+        roomId,
+        messageId,
+        expectedRevision: message.revision,
+      });
+    },
+    onRetryRepair: () => { void loadHistory(); },
+    onReauthenticate: () => { void loadHistory(); },
+    onRefreshProjection: () => { void loadHistory(); },
+    onDismissReply() {
+      if (state === undefined) return;
+      const draft: MessageDraft = {
+        messageId: state.draft.messageId,
+        roomId: state.draft.roomId,
+        body: state.draft.body,
+        mentionedTargets: state.draft.mentionedTargets,
+        attachments: state.draft.attachments,
+      };
+      state = replaceState(state, { draft });
+      render();
+    },
+  };
+
+  const acceptHistory = (history: MessageAuthorityReadyHistory): void => {
+    replica = createMessageAuthorityReplica(roomId, {
+      generation: history.generation,
+      checkpoint: history.watermark,
+      timeline: history.messages,
+    });
+    state = createMessageAuthorityState({
+      roomId,
+      viewerActorId: history.viewerActorId,
+      lifecycle: history.lifecycle,
+      connection: history.connection,
+      actors: history.actors,
+      draft: newDraft(),
+      timeline: history.messages.map(mapTimelineMessage),
+      executions: [],
+      previews: [],
+      appliedEventIds: [],
+      projectionGeneration: history.generation,
+      reducedMotion: options.reducedMotion ?? false,
+      announcement: "Room 权威消息已载入",
+    });
+  };
+
+  const loadHistory = async (): Promise<void> => {
+    if (disposed) return;
+    renderLoading(root);
+    try {
+      const history = await bridge.historyV2({ type: "room.history.v2", roomId });
+      if (disposed) return;
+      if (history.status === "ready") {
+        acceptHistory(history);
+      } else {
+        replica = createMessageAuthorityReplica(roomId);
+        if (history.connection.status === "revoked") replica = revokeMessageAuthorityRoom(replica);
+        state = createMessageAuthorityState({
+          roomId,
+          viewerActorId: "unavailable",
+          lifecycle: "active",
+          connection: history.connection,
+          actors: [],
+          draft: newDraft(),
+          timeline: [],
+          executions: [],
+          previews: [],
+          appliedEventIds: [],
+          projectionGeneration: 0,
+          reducedMotion: options.reducedMotion ?? false,
+          announcement: "Room 权威消息不可用；已 fail closed",
+        });
+      }
+      render();
+      const queued = beforeHistory.splice(0);
+      for (const input of queued) applyInput(input);
+    } catch {
+      if (disposed) return;
+      replica = revokeMessageAuthorityRoom(createMessageAuthorityReplica(roomId));
+      state = createMessageAuthorityState({
+        roomId,
+        viewerActorId: "unavailable",
+        lifecycle: "active",
+        connection: { status: "fatal", errorCode: "history_unavailable" },
+        actors: [],
+        draft: newDraft(),
+        timeline: [],
+        executions: [],
+        previews: [],
+        appliedEventIds: [],
+        projectionGeneration: 0,
+        reducedMotion: options.reducedMotion ?? false,
+        announcement: "Room 权威消息不可用；已 fail closed",
+      });
+      render();
+    }
+  };
+
+  renderLoading(root);
+  const unsubscribe = bridge.onAuthorityInput(applyInput);
+  void loadHistory();
+
+  return () => {
+    if (disposed) return;
+    disposed = true;
+    unsubscribe();
+    root.replaceChildren();
+  };
+}
