@@ -392,6 +392,7 @@ export function mountMessageAuthorityBridgeSurface(
   const sendDraft = async (payload: MessageDraft, retry: boolean): Promise<void> => {
     if (state === undefined || !state.composerEnabled || awaitingReceipt !== undefined ||
         awaitingMutationReceipt !== undefined || state.mutation.status === "pending" ||
+        state.mutation.status === "event-observed" ||
         state.mutation.status === "acknowledged") return;
     if (revisionTarget !== undefined) {
       const target = revisionTarget;
@@ -480,7 +481,8 @@ export function mountMessageAuthorityBridgeSurface(
     },
     onRevise(messageId) {
       if (state === undefined || !state.composerEnabled || awaitingMutationReceipt !== undefined ||
-          state.mutation.status === "pending" || state.mutation.status === "acknowledged") return;
+          state.mutation.status === "pending" || state.mutation.status === "event-observed" ||
+          state.mutation.status === "acknowledged") return;
       const message = state.timeline.find((candidate) =>
         candidate.messageId === messageId && candidate.kind === "human");
       if (message?.kind !== "human") return;
@@ -513,7 +515,8 @@ export function mountMessageAuthorityBridgeSurface(
     },
     onRecall(messageId) {
       if (state === undefined || !state.composerEnabled || awaitingMutationReceipt !== undefined ||
-          state.mutation.status === "pending" || state.mutation.status === "acknowledged") return;
+          state.mutation.status === "pending" || state.mutation.status === "event-observed" ||
+          state.mutation.status === "acknowledged") return;
       const message = state.timeline.find((candidate) => candidate.messageId === messageId);
       if (message?.kind !== "human") return;
       const pending: AwaitingMutationReceipt = {

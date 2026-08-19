@@ -149,6 +149,9 @@ export type MessageMutationState =
   | { readonly status: "idle" }
   | { readonly status: "pending"; readonly kind: "revise" | "recall"; readonly requestId: string;
       readonly messageId: string; readonly expectedRevision: number; readonly body?: string }
+  | { readonly status: "event-observed"; readonly kind: "revise" | "recall";
+      readonly requestId: string; readonly messageId: string; readonly expectedRevision: number;
+      readonly body?: string }
   | { readonly status: "acknowledged"; readonly kind: "revise" | "recall";
       readonly requestId: string; readonly messageId: string; readonly expectedRevision: number;
       readonly body?: string }
@@ -359,7 +362,7 @@ export function beginMessageMutation(
 ): MessageAuthorityState {
   nonEmpty(operation.requestId, "requestId");
   nonEmpty(operation.messageId, "messageId");
-  if (state.mutation.status === "pending") return state;
+  if (state.mutation.status !== "idle" && state.mutation.status !== "failed") return state;
   return withState(state, {
     mutation: { status: "pending", ...operation },
     announcement: operation.kind === "revise"
@@ -424,7 +427,8 @@ function applyError(
   const error = { ...input } as MessageClosedError & { readonly type?: never; readonly requestId?: never };
   Reflect.deleteProperty(error, "type");
   Reflect.deleteProperty(error, "requestId");
-  if (state.mutation.status === "pending" && state.mutation.requestId === input.requestId) {
+  if ((state.mutation.status === "pending" || state.mutation.status === "event-observed") &&
+      state.mutation.requestId === input.requestId) {
     return withState(state, {
       mutation: { ...state.mutation, status: "failed", error },
       announcement: `${state.mutation.kind === "revise" ? "修订" : "撤回"}失败；${input.status} ${input.code}；原 projection 与输入已保留`,
@@ -449,8 +453,15 @@ function applyMutationAck(
     { type: "message.revision.accepted" | "message.recall.accepted" }>,
 ): MessageAuthorityState {
   const mutation = state.mutation;
-  if (mutation.status !== "pending" || mutation.requestId !== input.requestId ||
+  if ((mutation.status !== "pending" && mutation.status !== "event-observed") ||
+      mutation.requestId !== input.requestId ||
       mutation.messageId !== input.messageId) return state;
+  if (mutation.status === "event-observed") {
+    return withState(state, {
+      mutation: { status: "idle" },
+      announcement: `${mutation.kind === "revise" ? "修订" : "撤回"} stable event 与 ACK 已收敛`,
+    });
+  }
   return withState(state, {
     mutation: { ...mutation, status: "acknowledged" },
     announcement: `${mutation.kind === "revise" ? "修订" : "撤回"} ACK 已持久化；等待 stable event，ACK 不会替换 projection`,
@@ -492,13 +503,19 @@ function applyRevisionEvent(
   }
   const timeline = [...state.timeline];
   timeline[index] = { ...current, body: input.body, revision: input.revision, revisionCount: input.revision };
+  const mutation = state.mutation.status === "idle" ||
+      state.mutation.messageId !== input.messageId
+    ? undefined
+    : state.mutation.status === "pending"
+      ? { ...state.mutation, status: "event-observed" as const }
+      : state.mutation.status === "acknowledged"
+        ? { status: "idle" as const }
+        : state.mutation;
   return withState(state, {
     timeline,
     appliedEventIds: addEvent(state, input.eventId),
     announcement: `消息已修订至 v${input.revision}`,
-    ...(state.mutation.status !== "idle" && state.mutation.messageId === input.messageId
-      ? { mutation: { status: "idle" as const } }
-      : {}),
+    ...(mutation === undefined ? {} : { mutation }),
   });
 }
 
@@ -508,13 +525,19 @@ function applyRecallEvent(
 ): MessageAuthorityState {
   if (seenEvent(state, input.eventId)) return state;
   if (input.tombstone.roomId !== state.roomId) return state;
+  const mutation = state.mutation.status === "idle" ||
+      state.mutation.messageId !== input.tombstone.messageId
+    ? undefined
+    : state.mutation.status === "pending"
+      ? { ...state.mutation, status: "event-observed" as const }
+      : state.mutation.status === "acknowledged"
+        ? { status: "idle" as const }
+        : state.mutation;
   return withState(state, {
     timeline: upsertTimeline(state.timeline, input.tombstone),
     appliedEventIds: addEvent(state, input.eventId),
     announcement: "消息已撤回；时间线已收敛为 tombstone",
-    ...(state.mutation.status !== "idle" && state.mutation.messageId === input.tombstone.messageId
-      ? { mutation: { status: "idle" as const } }
-      : {}),
+    ...(mutation === undefined ? {} : { mutation }),
   });
 }
 

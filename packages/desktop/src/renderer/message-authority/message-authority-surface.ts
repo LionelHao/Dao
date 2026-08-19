@@ -332,6 +332,9 @@ function renderMutation(
   const label = mutation.kind === "revise" ? "修订" : "撤回";
   if (mutation.status === "pending") {
     panel.append(text("strong", `LOCAL · ${label} intent 正在提交；尚无成功事实。`));
+  } else if (mutation.status === "event-observed") {
+    panel.append(text("strong", `EVT · ${label} projection 已更新；等待本地 request 结果`));
+    panel.append(text("p", "另一设备或本地 intent 均可能产生该事件；匹配 requestId 的 ACK/错误仍须独立收敛。"));
   } else if (mutation.status === "acknowledged") {
     panel.append(text("strong", `ACK · ${label}已持久化；等待 stable event`));
     panel.append(text("p", "ACK 不会替换 projection；当前正文保持到 stable event。"));

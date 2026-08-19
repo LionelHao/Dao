@@ -424,11 +424,12 @@ describe("Message Authority bridge renderer adapter", () => {
     authority.close();
   });
 
-  it("correlates revise conflicts by requestId, preserves the losing body, and offers refresh", async () => {
+  it("keeps two-device revise/recall losers visible when the winning event precedes local 409", async () => {
     const authority = authorityHarness();
-    vi.mocked(authority.port.revise).mockRejectedValueOnce(
-      new MessageAuthorityClientFailure({ status: 409, code: "message_version_conflict" }),
-    );
+    let rejectRevise: ((error: unknown) => void) | undefined;
+    vi.mocked(authority.port.revise).mockImplementationOnce(() => new Promise((_, reject) => {
+      rejectRevise = reject;
+    }));
     const root = document.createElement("main");
     const dispose = mountMessageAuthorityBridgeSurface(root, authority.bridge, "room-1", {
       createMessageId: () => "message-new",
@@ -440,23 +441,36 @@ describe("Message Authority bridge renderer adapter", () => {
     composer(root).value = "Losing concurrent revision";
     composer(root).dispatchEvent(new Event("input", { bubbles: true }));
     send(root).click();
-
+    await vi.waitFor(() => expect(authority.port.revise).toHaveBeenCalledOnce());
+    authority.publish({ type: "room.event", cursorBefore: 9, generation: 4,
+      event: revisedEvent(10, 2, "Winning device revision") });
+    await vi.waitFor(() => expect(root.textContent).toContain("Winning device revision"));
+    rejectRevise!(new MessageAuthorityClientFailure({
+      status: 409, code: "message_version_conflict",
+    }));
     await vi.waitFor(() => expect(root.querySelector("[data-mutation-error='message_version_conflict']"))
       .not.toBeNull());
     expect(root.querySelector("[data-mutation-request-id='revise-3']")).not.toBeNull();
     expect(composer(root).value).toBe("Losing concurrent revision");
     expect(root.textContent).toContain("ACK 不会替换 projection");
     expect(root.querySelector("[data-action='refresh-projection']")).not.toBeNull();
-    expect(root.textContent).toContain("Existing authority message");
+    expect(root.textContent).toContain("Winning device revision");
 
-    vi.mocked(authority.port.recall).mockRejectedValueOnce(
-      new MessageAuthorityClientFailure({ status: 503, code: "dependency_unavailable" }),
-    );
+    let rejectRecall: ((error: unknown) => void) | undefined;
+    vi.mocked(authority.port.recall).mockImplementationOnce(() => new Promise((_, reject) => {
+      rejectRecall = reject;
+    }));
     root.querySelector<HTMLButtonElement>("[data-action='recall-message']")!.click();
-    await vi.waitFor(() => expect(root.querySelector("[data-mutation-error='dependency_unavailable']"))
+    await vi.waitFor(() => expect(authority.port.recall).toHaveBeenCalledOnce());
+    authority.publish({ type: "room.event", cursorBefore: 10, generation: 4,
+      event: recalledEvent(11) });
+    await vi.waitFor(() => expect(root.textContent).toContain("消息已撤回"));
+    rejectRecall!(new MessageAuthorityClientFailure({ status: 409, code: "message_recalled" }));
+    await vi.waitFor(() => expect(root.querySelector("[data-mutation-error='message_recalled']"))
       .not.toBeNull());
     expect(root.querySelector("[data-mutation-request-id='recall-4']")).not.toBeNull();
-    expect(root.textContent).toContain("Existing authority message");
+    expect(root.textContent).toContain("消息已撤回");
+    expect(root.textContent).not.toContain("Winning device revision");
     expect(root.querySelector("[data-action='refresh-projection']")).not.toBeNull();
     root.querySelector<HTMLButtonElement>("[data-action='refresh-projection']")!.click();
     await vi.waitFor(() => expect(authority.port.historyV2).toHaveBeenCalledTimes(2));
