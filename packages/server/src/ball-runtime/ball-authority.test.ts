@@ -8,6 +8,8 @@ import {
   executeHumanDatabaseCommand,
   executeRuntimeAuthorityOperation,
 } from "../persistence/authority-database-handler.js";
+import { insertLegacyMessageAuthorityRecord } from
+  "../persistence/message-authority-legacy-adapter.js";
 import { migrateAuthorityDatabase } from "../persistence/schema.js";
 
 const directories: string[] = [];
@@ -47,10 +49,16 @@ function openDatabase(): { readonly path: string; readonly database: DatabaseSyn
       ('room-1', 'human-2', 'human', 'member', NULL, '2026-08-17T00:00:00.000Z', NULL),
       ('room-1', 'agent-1', 'agent', NULL, 'active', NULL, '2026-08-17T00:00:00.000Z');
     UPDATE rooms SET owner_actor_id = 'human-1', governance_revision = 1 WHERE id = 'room-1';
-    INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
-    VALUES
-      ('message-open', 'room-1', 'human-1', 'human', 'Explicit request', '2026-08-17T00:00:00.000Z'),
-      ('message-task', 'room-1', 'human-1', 'human', 'Explicit task', '2026-08-17T00:00:00.000Z');
+  `);
+  insertLegacyMessageAuthorityRecord(database, {
+    id: "message-open", roomId: "room-1", authorId: "human-1", authorKind: "human",
+    body: "Explicit request", sentAt: "2026-08-17T00:00:00.000Z",
+  });
+  insertLegacyMessageAuthorityRecord(database, {
+    id: "message-task", roomId: "room-1", authorId: "human-1", authorKind: "human",
+    body: "Explicit task", sentAt: "2026-08-17T00:00:00.000Z",
+  });
+  database.exec(`
     INSERT INTO open_items (
       id, room_id, source_message_id, current_owner_actor_id, status, body,
       created_at, requester_actor_id, transfer_chain_json, origin_kind

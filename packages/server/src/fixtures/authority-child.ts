@@ -12,6 +12,8 @@ import {
 import { DatabaseSync } from "node:sqlite";
 import type { IdentityAdapter, LoginCredentials } from "../auth.js";
 import { mintInternalAgentCommandContext } from "../persistence/contracts.js";
+import { createLegacyMessageAuthorityInserter } from
+  "../persistence/message-authority-legacy-adapter.js";
 import { createWorkerDatabaseClient } from "../persistence/worker-database-client.js";
 import {
   startAuthoritativeServer,
@@ -224,10 +226,7 @@ function seedMixedRoomRecords(databasePath: string, roomId: string): Record<stri
          tool_permissions_json, joined_at, configured_at, access_revision)
        VALUES (?, ?, 'human', 'member', NULL, '[]', ?, NULL, 0)`,
     );
-    const insertMessage = database.prepare(
-      `INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
-       VALUES (?, ?, 'human-a', 'human', ?, ?)`,
-    );
+    const insertMessage = createLegacyMessageAuthorityInserter(database);
     const insertRead = database.prepare(
       "INSERT INTO human_read_receipts (room_id, actor_id, message_id, read_at) VALUES (?, ?, ?, ?)",
     );
@@ -291,7 +290,7 @@ function seedMixedRoomRecords(databasePath: string, roomId: string): Record<stri
           authorId: "human-a", authorKind: "human" as const,
           body: `m${suffix}`, sentAt: "t" };
         if (!isMessage(message)) throw new TypeError("Mixed message fixture is not closed");
-        insertMessage.run(message.id, roomId, message.body, message.sentAt);
+        insertMessage(message);
       }
       for (let index = 0; index < 499; index += 1) {
         const suffix = index.toString(36);
