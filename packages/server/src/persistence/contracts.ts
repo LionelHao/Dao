@@ -7,6 +7,7 @@ import {
   isHumanReadReceipt,
   isHumanPreemptionNotice,
   isLightTask,
+  isMessageAuthorityEvent,
   isRoomCursor,
   isRoomGovernanceView,
   isHumanRoomMembership,
@@ -24,6 +25,10 @@ import type {
   DepartureConflictList,
   ManagedRoom,
   Message,
+  HumanMessageSubmit,
+  MessageRevision,
+  MessageTargetOutcome,
+  TimelineMessage,
   MessageDraft,
   PersistedIdentityEvent,
   PersistedRoomEvent,
@@ -39,6 +44,7 @@ export const SNAPSHOT_REQUEST_ID_MAX_BYTES = 128;
 export const MAX_ACTIVE_SESSION_FAMILIES = 96;
 import type { AuthenticatedPrincipal } from "../auth.js";
 import type { RoomAuditRecord } from "../room-lifecycle.js";
+import type { InternalAgentMessageCommitContext } from "../message-authority/internal-message-capability.js";
 
 export interface AuthenticatedSessionContext {
   readonly sessionId: string;
@@ -306,6 +312,104 @@ export interface AuthenticatedCommandContext extends AuthenticatedSessionContext
   readonly kind: "human";
   readonly requestId: string;
   readonly idempotencyKey: string;
+}
+
+export interface MessageRevisionCommand {
+  readonly roomId: string;
+  readonly messageId: string;
+  readonly expectedRevision: number;
+  readonly body: string;
+}
+
+export interface MessageRecallCommand {
+  readonly roomId: string;
+  readonly messageId: string;
+  readonly expectedRevision: number;
+}
+
+export interface AgentMessageCommitCommand {
+  readonly messageId: string;
+  readonly roomId: string;
+  readonly body: string;
+  readonly correctsMessageId?: string;
+}
+
+export interface MessageAuthorityMutationReceipt {
+  readonly messageId: string;
+  readonly persistedAt: string;
+  readonly eventId: string;
+  readonly replayed: boolean;
+}
+
+export interface HumanMessageSubmissionReceipt extends MessageAuthorityMutationReceipt {
+  readonly targetOutcomes: readonly MessageTargetOutcome[];
+}
+
+export interface MessageRevisionReceipt extends MessageAuthorityMutationReceipt {
+  readonly revision: number;
+}
+
+export interface MessageRecallReceipt {
+  readonly messageId: string;
+  readonly revision: number;
+  readonly recalledAt: string;
+  readonly eventId: string;
+  readonly replayed: boolean;
+  readonly abortTargets: readonly string[];
+}
+
+export interface AgentMessageCommitReceipt extends MessageAuthorityMutationReceipt {
+  readonly message: Extract<TimelineMessage, { readonly authorKind: "agent" }>;
+}
+
+export interface MessageHistoryQuery {
+  readonly roomId: string;
+  readonly afterMessageId?: string;
+  readonly limit?: number;
+}
+
+export interface MessageRevisionQuery {
+  readonly roomId: string;
+  readonly messageId: string;
+  readonly afterRevision?: number;
+  readonly limit?: number;
+}
+
+export interface MessageHistoryPage {
+  readonly messages: readonly TimelineMessage[];
+  readonly hasMore: boolean;
+}
+
+export interface MessageRevisionPage {
+  readonly revisions: readonly MessageRevision[];
+  readonly hasMore: boolean;
+}
+
+export interface MessageAuthorityStore {
+  submitHumanMessage(
+    context: AuthenticatedCommandContext,
+    message: HumanMessageSubmit,
+  ): Promise<HumanMessageSubmissionReceipt>;
+  reviseHumanMessage(
+    context: AuthenticatedCommandContext,
+    command: MessageRevisionCommand,
+  ): Promise<MessageRevisionReceipt>;
+  recallHumanMessage(
+    context: AuthenticatedCommandContext,
+    command: MessageRecallCommand,
+  ): Promise<MessageRecallReceipt>;
+  commitAgentMessage(
+    context: InternalAgentMessageCommitContext,
+    command: AgentMessageCommitCommand,
+  ): Promise<AgentMessageCommitReceipt>;
+  readMessageHistory(
+    context: AuthenticatedSessionContext,
+    query: MessageHistoryQuery,
+  ): Promise<MessageHistoryPage>;
+  readMessageRevisions(
+    context: AuthenticatedSessionContext,
+    query: MessageRevisionQuery,
+  ): Promise<MessageRevisionPage>;
 }
 
 export interface AgentPrincipal {
@@ -730,7 +834,9 @@ function isRecord(value: unknown): value is UnknownRecord {
 
 function exact(value: UnknownRecord, required: readonly string[], optional: readonly string[] = []): boolean {
   const allowed = new Set([...required, ...optional]);
-  return required.every((key) => Object.hasOwn(value, key)) && Object.keys(value).every((key) => allowed.has(key));
+  const ownKeys = Reflect.ownKeys(value);
+  return required.every((key) => Object.hasOwn(value, key)) &&
+    ownKeys.every((key) => typeof key === "string" && allowed.has(key));
 }
 
 function text(value: unknown): value is string {
@@ -1095,6 +1201,11 @@ function validRoomEventPayload(
 export function parsePersistedRoomEvent(
   value: unknown,
 ): ContractParseResult<PersistedRoomEvent, "invalid_event"> {
+  if (isMessageAuthorityEvent(value)) {
+    // The integration branch widens PersistedRoomEvent to this closed Core union.
+    // Keep this compatibility cast until that Core declaration is present here.
+    return { ok: true, value: value as unknown as PersistedRoomEvent };
+  }
   return isRecord(value) && roomEventEnvelope(value) && validRoomEventPayload(
     value.type,
     value.payload as UnknownRecord,

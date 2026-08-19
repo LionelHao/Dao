@@ -3,6 +3,8 @@ import type { DatabaseSync } from "node:sqlite";
 import type {
   AgentExecution,
   Actor,
+  HumanMessageSubmit,
+  MessageTargetOutcome,
   DepartureConflictList,
   LightTask,
   ManagedRoom,
@@ -19,6 +21,11 @@ import type {
 } from "@native-im/core";
 import {
   isLightTask,
+  isAgentFinalMessage,
+  isHumanMessageSubmit,
+  isMessageRevision,
+  isMessageTargetOutcome,
+  isUtf16Range,
   isOpenItem,
   projectBallsInCourt,
   type BallInCourt,
@@ -66,6 +73,17 @@ import {
   type PersistentCommand,
   type RoomGovernanceCommand,
   type SnapshotRevalidationRequest,
+  type AgentMessageCommitCommand,
+  type AgentMessageCommitReceipt,
+  type HumanMessageSubmissionReceipt,
+  type MessageHistoryPage,
+  type MessageHistoryQuery,
+  type MessageRecallCommand,
+  type MessageRecallReceipt,
+  type MessageRevisionCommand,
+  type MessageRevisionPage,
+  type MessageRevisionQuery,
+  type MessageRevisionReceipt,
 } from "./contracts.js";
 import type { AuthorityWorkerErrorCode } from "./worker-protocol.js";
 import type {
@@ -80,6 +98,8 @@ import {
   ArchivedMessageMutationBlockedError,
   requireMessageMutationAllowedInTransaction,
 } from "../message-authority/archived-message-gate.js";
+import { readOperationalTimelineMessage } from
+  "../message-authority/sqlite-operational-message-projection.js";
 import { canStartRuntimeGenerationInTransaction } from "../agent-runtime/runtime-archive-fence-participant.js";
 import type { CommittedRoomCacheInvalidationIntent } from "../access/room-cache-invalidation-port.js";
 import {
@@ -101,6 +121,7 @@ import {
 } from "../room-governance/archive-coordinator.js";
 import { AuthorityParticipantUnavailableError } from "../room-governance/private-participant-registry.js";
 import { insertLegacyMessageAuthorityRecord } from "./message-authority-legacy-adapter.js";
+import type { AgentMessageWorkerContext } from "../message-authority/internal-message-capability.js";
 import {
   coordinateMemberAccessRevocationInTransaction,
   MemberAccessRevocationError,
@@ -942,6 +963,24 @@ export function readHistoryDatabaseQuery(
 ): readonly Message[] {
   const actorId = requireHumanSession(database, context, now);
   requireCurrentHumanRoomMembership(database, actorId, roomId);
+  const authorityOnly = database.prepare(
+    `SELECT 1 AS present
+     FROM message_envelopes AS envelope
+     WHERE envelope.room_id = ?
+       AND (envelope.current_revision > 1 OR envelope.lifecycle = 'recalled')
+     UNION ALL
+     SELECT 1 AS present
+     FROM agent_message_corrections AS correction
+     JOIN messages AS message ON message.id = correction.correction_message_id
+     WHERE message.room_id = ?
+     LIMIT 1`,
+  ).get(roomId, roomId);
+  if (authorityOnly?.present === 1) {
+    return fail(
+      "protocol_upgrade_required",
+      "Message history requires the Message Authority vNext protocol",
+    );
+  }
   return database.prepare(
     `SELECT id, room_id AS roomId, author_id AS authorId,
             author_kind AS authorKind, body, sent_at AS sentAt
@@ -6941,4 +6980,1043 @@ export function executeHumanDatabaseCommand(
   return afterCommitRescan === undefined || result.disposition !== "applied"
     ? result
     : { ...result, afterCommitRescan };
+}
+
+const MESSAGE_AUTHORITY_DEFAULT_PAGE = 50;
+const MESSAGE_AUTHORITY_MAX_PAGE = 200;
+
+type StoredMessageAuthorityReceipt =
+  | HumanMessageSubmissionReceipt
+  | MessageRevisionReceipt
+  | MessageRecallReceipt
+  | AgentMessageCommitReceipt;
+
+function authorityExactKeys(
+  value: object,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): boolean {
+  const allowed = new Set([...required, ...optional]);
+  return required.every((key) => Object.hasOwn(value, key)) &&
+    Reflect.ownKeys(value).every((key) => typeof key === "string" && allowed.has(key));
+}
+
+function messageAuthorityHash(value: unknown): string {
+  return createHash("sha256").update(canonicalJson(value)).digest("base64url");
+}
+
+function isMutationReceiptBase(value: unknown): value is {
+  readonly messageId: string;
+  readonly persistedAt: string;
+  readonly eventId: string;
+  readonly replayed: boolean;
+} {
+  return isRecord(value) && typeof value.messageId === "string" && value.messageId.length > 0 &&
+    typeof value.persistedAt === "string" && value.persistedAt.length > 0 &&
+    typeof value.eventId === "string" && value.eventId.length > 0 &&
+    typeof value.replayed === "boolean";
+}
+
+function parseStoredMessageAuthorityReceipt(
+  value: string,
+  kind: "submit" | "revise" | "recall" | "agent",
+): StoredMessageAuthorityReceipt {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value) as unknown;
+  } catch {
+    return fail("storage_unavailable", "Stored message authority receipt is corrupt");
+  }
+  if (!isRecord(parsed)) {
+    return fail("storage_unavailable", "Stored message authority receipt is corrupt");
+  }
+  const record = parsed as Record<string, unknown>;
+  const field = (key: string): unknown => (parsed as Record<string, unknown>)[key];
+  if (kind === "submit" && authorityExactKeys(record, [
+    "messageId", "persistedAt", "eventId", "replayed", "targetOutcomes",
+  ]) && isMutationReceiptBase(record) && Array.isArray(field("targetOutcomes")) &&
+      (field("targetOutcomes") as unknown[]).every(isMessageTargetOutcome)) {
+    return record as unknown as HumanMessageSubmissionReceipt;
+  }
+  if (kind === "revise" && authorityExactKeys(record, [
+    "messageId", "persistedAt", "eventId", "replayed", "revision",
+  ]) && isMutationReceiptBase(record) && Number.isSafeInteger(field("revision")) &&
+      Number(field("revision")) > 0) {
+    return record as unknown as MessageRevisionReceipt;
+  }
+  if (kind === "recall" && authorityExactKeys(record, [
+    "messageId", "revision", "recalledAt", "eventId", "replayed", "abortTargets",
+  ]) && typeof field("messageId") === "string" && String(field("messageId")).length > 0 &&
+      Number.isSafeInteger(field("revision")) && Number(field("revision")) > 0 &&
+      typeof field("recalledAt") === "string" && String(field("recalledAt")).length > 0 &&
+      typeof field("eventId") === "string" && String(field("eventId")).length > 0 &&
+      typeof field("replayed") === "boolean" && Array.isArray(field("abortTargets")) &&
+      (field("abortTargets") as unknown[]).every((target: unknown) =>
+        typeof target === "string" && target.length > 0)) {
+    return record as unknown as MessageRecallReceipt;
+  }
+  if (kind === "agent" && authorityExactKeys(record, [
+    "messageId", "persistedAt", "eventId", "replayed", "message",
+  ]) && isMutationReceiptBase(record) && isAgentFinalMessage(field("message"))) {
+    return record as unknown as AgentMessageCommitReceipt;
+  }
+  return fail("storage_unavailable", "Stored message authority receipt is corrupt");
+}
+
+function executeMessageAuthorityIdempotently<Receipt extends StoredMessageAuthorityReceipt>(
+  database: DatabaseSync,
+  input: {
+    readonly scope: string;
+    readonly key: string;
+    readonly command: unknown;
+    readonly kind: "submit" | "revise" | "recall" | "agent";
+    readonly now: number;
+    readonly execute: (persistedAt: string) => Receipt;
+  },
+): Receipt {
+  const requestHash = messageAuthorityHash(input.command);
+  const existing = database.prepare(
+    `SELECT request_hash AS requestHash, response_json AS responseJson
+     FROM idempotency_records WHERE scope = ? AND key = ?`,
+  ).get(input.scope, input.key);
+  if (existing !== undefined) {
+    if (existing.requestHash !== requestHash) {
+      return fail("idempotency_conflict", "Message authority idempotency payload changed");
+    }
+    if (typeof existing.responseJson !== "string") {
+      return fail("storage_unavailable", "Stored message authority receipt is corrupt");
+    }
+    const receipt = parseStoredMessageAuthorityReceipt(existing.responseJson, input.kind);
+    return { ...receipt, replayed: true } as Receipt;
+  }
+  const persistedAt = new Date(input.now).toISOString();
+  const receipt = input.execute(persistedAt);
+  database.prepare(
+    `INSERT INTO idempotency_records (
+       scope, key, request_hash, response_json, status_code, created_at, expires_at
+     ) VALUES (?, ?, ?, ?, 200, ?, ?)`,
+  ).run(
+    input.scope,
+    input.key,
+    requestHash,
+    canonicalJson(receipt),
+    persistedAt,
+    new Date(input.now + 30 * 24 * 60 * 60 * 1_000).toISOString(),
+  );
+  return receipt;
+}
+
+function messageAuthorityPageLimit(limit: number | undefined): number {
+  if (limit === undefined) return MESSAGE_AUTHORITY_DEFAULT_PAGE;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MESSAGE_AUTHORITY_MAX_PAGE) {
+    return fail("invalid_parameters", "Message authority page limit was rejected");
+  }
+  return limit;
+}
+
+function requireHumanMessageAuthority(
+  database: DatabaseSync,
+  actorId: string,
+  roomId: string,
+  messageId: string,
+): {
+  readonly lifecycle: "active" | "recalled";
+  readonly currentRevision: number;
+} {
+  const row = database.prepare(
+    `SELECT message.author_id AS authorId, message.author_kind AS authorKind,
+            envelope.message_kind AS messageKind, envelope.lifecycle,
+            envelope.current_revision AS currentRevision
+     FROM messages AS message
+     JOIN message_envelopes AS envelope ON envelope.message_id = message.id
+     WHERE message.id = ? AND message.room_id = ? AND envelope.room_id = ?`,
+  ).get(messageId, roomId, roomId);
+  if (row === undefined) return fail("message_not_found", "Message was not found");
+  if (row.authorKind !== "human" || row.messageKind !== "human") {
+    return fail("agent_final_immutable", "Agent final messages are immutable");
+  }
+  if (row.authorId !== actorId) {
+    return fail("permission_denied", "Only the Human message author may mutate it");
+  }
+  if ((row.lifecycle !== "active" && row.lifecycle !== "recalled") ||
+      typeof row.currentRevision !== "number") {
+    return fail("storage_unavailable", "Message authority state is corrupt");
+  }
+  return { lifecycle: row.lifecycle, currentRevision: row.currentRevision };
+}
+
+function validateRevisionCommand(command: MessageRevisionCommand): void {
+  if (!authorityExactKeys(command, ["roomId", "messageId", "expectedRevision", "body"]) ||
+      !isMessageRevision({
+        messageId: command.messageId,
+        revision: command.expectedRevision,
+        body: command.body,
+        revisedAt: "1970-01-01T00:00:00.000Z",
+        revisedByActorId: "authority-validation",
+      }) || typeof command.roomId !== "string" || command.roomId.trim().length === 0) {
+    return fail("invalid_parameters", "Message revision command was rejected");
+  }
+}
+
+function validateRecallCommand(command: MessageRecallCommand): void {
+  if (!authorityExactKeys(command, ["roomId", "messageId", "expectedRevision"]) ||
+      typeof command.roomId !== "string" || command.roomId.trim().length === 0 ||
+      typeof command.messageId !== "string" || command.messageId.trim().length === 0 ||
+      !Number.isSafeInteger(command.expectedRevision) || command.expectedRevision < 1) {
+    return fail("invalid_parameters", "Message recall command was rejected");
+  }
+}
+
+export function submitHumanMessageDatabaseCommand(
+  database: DatabaseSync,
+  input: {
+    readonly context: AuthenticatedCommandContext;
+    readonly message: HumanMessageSubmit;
+    readonly now: number;
+    readonly beforeApply?: () => void;
+  },
+): HumanMessageSubmissionReceipt {
+  return runAuthorityImmediateTransaction(database, () => {
+    if (!isHumanMessageSubmit(input.message)) {
+      return fail("invalid_parameters", "Structured Human message was rejected");
+    }
+    const actorId = requireHumanSession(database, input.context, input.now);
+    requireCurrentHumanRoomMembership(database, actorId, input.message.roomId);
+    requireMessageMutationAllowed(
+      database,
+      input.message.roomId,
+      "message",
+      stableId("message-v2-gate", actorId, input.message.roomId, input.message.messageId),
+    );
+    if (input.message.replyToMessageId !== undefined) {
+      const reply = database.prepare(
+        `SELECT 1 AS present FROM message_envelopes
+         WHERE message_id = ? AND room_id = ?`,
+      ).get(input.message.replyToMessageId, input.message.roomId);
+      if (reply === undefined) return fail("message_not_found", "Reply target was not found");
+    }
+    const scope = [
+      actorId, "message.send.v2", input.message.roomId, input.message.messageId,
+    ].join("\u0000");
+    return executeMessageAuthorityIdempotently(database, {
+      scope,
+      key: input.message.messageId,
+      command: input.message,
+      kind: "submit",
+      now: input.now,
+      execute(persistedAt) {
+        input.beforeApply?.();
+        if (database.prepare("SELECT 1 AS present FROM messages WHERE id = ?").get(
+          input.message.messageId,
+        ) !== undefined) {
+          return fail("idempotency_conflict", "Message identity already exists");
+        }
+        const baseMessage: Message = {
+          id: input.message.messageId,
+          roomId: input.message.roomId,
+          authorId: actorId,
+          authorKind: "human",
+          body: input.message.body,
+          sentAt: persistedAt,
+        };
+        insertLegacyMessageAuthorityRecord(database, baseMessage);
+        const outcomes: MessageTargetOutcome[] = [];
+        for (const [targetOrder, target] of input.message.mentionedTargets.entries()) {
+          const actor = database.prepare("SELECT kind FROM actors WHERE id = ?").get(
+            target.targetActorId,
+          );
+          if (actor === undefined) {
+            return fail("invalid_parameters", "Message target actor was not found");
+          }
+          database.prepare(
+            `INSERT INTO message_mentions (
+               message_id, room_id, target_id, target_kind, target_actor_id,
+               range_start_utf16, range_end_utf16, target_order
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          ).run(
+            input.message.messageId,
+            input.message.roomId,
+            target.id,
+            target.kind,
+            target.targetActorId,
+            target.range.startUtf16,
+            target.range.endUtf16,
+            targetOrder,
+          );
+          const membership = database.prepare(
+            `SELECT kind, participation FROM room_memberships
+             WHERE room_id = ? AND actor_id = ?`,
+          ).get(input.message.roomId, target.targetActorId);
+          let outcome: MessageTargetOutcome;
+          const expectedActorKind = target.kind === "human-request" ? "human" : "agent";
+          if (actor.kind !== expectedActorKind ||
+              (membership !== undefined && membership.kind !== expectedActorKind)) {
+            outcome = {
+              targetId: target.id,
+              targetActorId: target.targetActorId,
+              kind: target.kind,
+              status: "rejected",
+              code: "target_kind_mismatch",
+            };
+          } else if (membership === undefined) {
+            outcome = {
+              targetId: target.id,
+              targetActorId: target.targetActorId,
+              kind: target.kind,
+              status: "rejected",
+              code: "target_not_member",
+            };
+          } else if (target.kind === "agent-invocation" && membership.participation !== "active") {
+            outcome = {
+              targetId: target.id,
+              targetActorId: target.targetActorId,
+              kind: target.kind,
+              status: "rejected",
+              code: "target_assignment_inactive",
+            };
+          } else if (target.kind === "human-request") {
+            const requestIntentId = stableId(
+              "human-request-intent", actorId, input.message.messageId, target.id,
+            );
+            database.prepare(
+              `INSERT INTO human_request_intents (
+                 id, room_id, source_message_id, target_id, source_revision,
+                 requester_human_actor_id, target_human_actor_id, status,
+                 created_at, claimed_at, cancelled_at, cancellation_reason
+               ) VALUES (?, ?, ?, ?, 1, ?, ?, 'pending', ?, NULL, NULL, NULL)`,
+            ).run(
+              requestIntentId,
+              input.message.roomId,
+              input.message.messageId,
+              target.id,
+              actorId,
+              target.targetActorId,
+              persistedAt,
+            );
+            outcome = {
+              targetId: target.id,
+              targetActorId: target.targetActorId,
+              kind: target.kind,
+              status: "request-created",
+              requestIntentId,
+            };
+          } else {
+            const invocationIntentId = stableId(
+              "agent-invocation-intent", actorId, input.message.messageId, target.id,
+            );
+            database.prepare(
+              `INSERT INTO agent_invocation_intents (
+                 id, room_id, source_message_id, target_agent_id,
+                 requester_actor_id, intent_kind, execution_id, created_at,
+                 message_transaction_id, target_id, source_revision, lineage_id,
+                 turn_id, origin_kind, status, claimed_at, cancelled_at,
+                 cancellation_reason, supersedes_intent_id
+               ) VALUES (?, ?, ?, ?, ?, 'direct_mention', NULL, ?, ?, ?, 1, ?, ?,
+                         'message_target', 'pending', NULL, NULL, NULL, NULL)`,
+            ).run(
+              invocationIntentId,
+              input.message.roomId,
+              input.message.messageId,
+              target.targetActorId,
+              actorId,
+              persistedAt,
+              input.message.messageId,
+              target.id,
+              stableId("message-lineage", input.message.messageId, target.id),
+              stableId("message-turn", input.message.messageId, target.id),
+            );
+            outcome = {
+              targetId: target.id,
+              targetActorId: target.targetActorId,
+              kind: target.kind,
+              status: "invocation-intent-created",
+              invocationIntentId,
+            };
+          }
+          database.prepare(
+            `INSERT INTO message_target_outcomes (
+               message_id, room_id, target_id, target_actor_id, target_kind,
+               status, request_intent_id, invocation_intent_id, rejection_code,
+               created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ).run(
+            input.message.messageId,
+            input.message.roomId,
+            target.id,
+            target.targetActorId,
+            target.kind,
+            outcome.status,
+            outcome.status === "request-created" ? outcome.requestIntentId : null,
+            outcome.status === "invocation-intent-created" ? outcome.invocationIntentId : null,
+            outcome.status === "rejected" ? outcome.code : null,
+            persistedAt,
+          );
+          outcomes.push(outcome);
+        }
+        if (input.message.replyToMessageId !== undefined) {
+          database.prepare(
+            `INSERT INTO message_reply_links (message_id, room_id, reply_to_message_id)
+             VALUES (?, ?, ?)`,
+          ).run(input.message.messageId, input.message.roomId, input.message.replyToMessageId);
+        }
+        for (const attachment of input.message.attachments) {
+          database.prepare(
+            `INSERT INTO message_attachment_links (
+               message_id, room_id, attachment_id, operational_state
+             ) VALUES (?, ?, ?, 'active')`,
+          ).run(
+            input.message.messageId,
+            input.message.roomId,
+            attachment.attachmentId,
+          );
+        }
+        const timeline = readOperationalTimelineMessage(database, input.message.messageId);
+        if (timeline.authorKind !== "human" || timeline.lifecycle !== "active") {
+          return fail("storage_unavailable", "Submitted Human message projection is corrupt");
+        }
+        const eventId = stableId("message-authority-event", scope, input.message.messageId, "accepted");
+        const streamSeq = appendRoomEvent(database, {
+          eventId,
+          roomId: input.message.roomId,
+          actorId,
+          eventType: "room.message.accepted",
+          occurredAt: persistedAt,
+          payload: timeline as unknown as JsonValue,
+        });
+        appendRoomOutbox(
+          database,
+          eventId,
+          input.message.roomId,
+          streamSeq,
+          persistedAt,
+          scope,
+          input.message.messageId,
+        );
+        return {
+          messageId: input.message.messageId,
+          persistedAt,
+          targetOutcomes: outcomes,
+          eventId,
+          replayed: false,
+        };
+      },
+    }) as HumanMessageSubmissionReceipt;
+  });
+}
+
+export function reviseHumanMessageDatabaseCommand(
+  database: DatabaseSync,
+  input: {
+    readonly context: AuthenticatedCommandContext;
+    readonly command: MessageRevisionCommand;
+    readonly now: number;
+    readonly beforeApply?: () => void;
+  },
+): MessageRevisionReceipt {
+  return runAuthorityImmediateTransaction(database, () => {
+    validateRevisionCommand(input.command);
+    const actorId = requireHumanSession(database, input.context, input.now);
+    requireCurrentHumanRoomMembership(database, actorId, input.command.roomId);
+    requireMessageMutationAllowed(
+      database,
+      input.command.roomId,
+      "message",
+      stableId("message-revision-gate", actorId, input.command.messageId),
+    );
+    const authority = requireHumanMessageAuthority(
+      database, actorId, input.command.roomId, input.command.messageId,
+    );
+    const scope = [actorId, "message.revise", input.command.roomId, input.command.messageId].join("\u0000");
+    const businessKey = `${input.command.messageId}:revision:${input.command.expectedRevision}`;
+    return executeMessageAuthorityIdempotently(database, {
+      scope,
+      key: businessKey,
+      command: input.command,
+      kind: "revise",
+      now: input.now,
+      execute(persistedAt) {
+        input.beforeApply?.();
+        if (authority.lifecycle !== "active" ||
+            authority.currentRevision !== input.command.expectedRevision) {
+          return fail("message_version_conflict", "Message revision compare-and-set failed");
+        }
+        const ranges = database.prepare(
+          `SELECT range_start_utf16 AS startUtf16, range_end_utf16 AS endUtf16
+           FROM message_mentions WHERE message_id = ? ORDER BY target_order`,
+        ).all(input.command.messageId);
+        if (ranges.some((range) => !isUtf16Range({
+          startUtf16: range.startUtf16,
+          endUtf16: range.endUtf16,
+        }, input.command.body))) {
+          return fail(
+            "invalid_parameters",
+            "Message revision invalidated a structured mention range",
+          );
+        }
+        const revision = input.command.expectedRevision + 1;
+        database.prepare(
+          `INSERT INTO message_revisions (
+             message_id, revision, body, revised_at, revised_by_actor_id
+           ) VALUES (?, ?, ?, ?, ?)`,
+        ).run(input.command.messageId, revision, input.command.body, persistedAt, actorId);
+        const updated = database.prepare(
+          `UPDATE message_envelopes
+           SET current_revision = ?, revision_count = ?
+           WHERE message_id = ? AND room_id = ? AND message_kind = 'human'
+             AND lifecycle = 'active' AND current_revision = ?`,
+        ).run(
+          revision,
+          revision,
+          input.command.messageId,
+          input.command.roomId,
+          input.command.expectedRevision,
+        );
+        if (updated.changes !== 1) {
+          return fail("message_version_conflict", "Message revision compare-and-set failed");
+        }
+        const timeline = readOperationalTimelineMessage(database, input.command.messageId);
+        if (timeline.authorKind !== "human" || timeline.lifecycle !== "active") {
+          return fail("storage_unavailable", "Revised Human message projection is corrupt");
+        }
+        const eventId = stableId("message-authority-event", scope, businessKey);
+        const streamSeq = appendRoomEvent(database, {
+          eventId,
+          roomId: input.command.roomId,
+          actorId,
+          eventType: "room.message.revised",
+          occurredAt: persistedAt,
+          payload: timeline as unknown as JsonValue,
+        });
+        appendRoomOutbox(
+          database, eventId, input.command.roomId, streamSeq, persistedAt,
+          scope, businessKey,
+        );
+        return {
+          messageId: input.command.messageId,
+          revision,
+          persistedAt,
+          eventId,
+          replayed: false,
+        };
+      },
+    }) as MessageRevisionReceipt;
+  });
+}
+
+export function recallHumanMessageDatabaseCommand(
+  database: DatabaseSync,
+  input: {
+    readonly context: AuthenticatedCommandContext;
+    readonly command: MessageRecallCommand;
+    readonly now: number;
+    readonly beforeApply?: () => void;
+  },
+): MessageRecallReceipt {
+  return runAuthorityImmediateTransaction(database, () => {
+    validateRecallCommand(input.command);
+    const actorId = requireHumanSession(database, input.context, input.now);
+    requireCurrentHumanRoomMembership(database, actorId, input.command.roomId);
+    requireMessageMutationAllowed(
+      database,
+      input.command.roomId,
+      "message",
+      stableId("message-recall-gate", actorId, input.command.messageId),
+    );
+    const authority = requireHumanMessageAuthority(
+      database, actorId, input.command.roomId, input.command.messageId,
+    );
+    const scope = [actorId, "message.recall", input.command.roomId, input.command.messageId].join("\u0000");
+    const businessKey = `${input.command.messageId}:recall:${input.command.expectedRevision}`;
+    return executeMessageAuthorityIdempotently(database, {
+      scope,
+      key: businessKey,
+      command: input.command,
+      kind: "recall",
+      now: input.now,
+      execute(recalledAt) {
+        input.beforeApply?.();
+        if (authority.lifecycle !== "active" ||
+            authority.currentRevision !== input.command.expectedRevision) {
+          return fail("message_version_conflict", "Message recall compare-and-set failed");
+        }
+        database.prepare(
+          `UPDATE human_request_intents
+           SET status = 'cancelled', cancelled_at = ?, cancellation_reason = 'message_recalled'
+           WHERE source_message_id = ? AND status = 'pending'`,
+        ).run(recalledAt, input.command.messageId);
+        database.prepare(
+          `UPDATE agent_invocation_intents
+           SET status = 'cancelled', cancelled_at = ?, cancellation_reason = 'message_recalled'
+           WHERE source_message_id = ? AND status = 'pending'`,
+        ).run(recalledAt, input.command.messageId);
+        database.prepare(
+          `INSERT INTO message_recall_fences (
+             fence_id, room_id, source_message_id, source_revision, scope_kind,
+             invocation_intent_id, execution_id, reason, created_at
+           ) VALUES (?, ?, ?, ?, 'message', NULL, NULL, 'message_recalled', ?)`,
+        ).run(
+          stableId("message-recall-fence", input.command.messageId),
+          input.command.roomId,
+          input.command.messageId,
+          input.command.expectedRevision,
+          recalledAt,
+        );
+        const intents = database.prepare(
+          `SELECT id FROM agent_invocation_intents
+           WHERE source_message_id = ? ORDER BY id`,
+        ).all(input.command.messageId);
+        for (const intent of intents) {
+          if (typeof intent.id !== "string") {
+            return fail("storage_unavailable", "Message invocation intent is corrupt");
+          }
+          database.prepare(
+            `INSERT INTO message_recall_fences (
+               fence_id, room_id, source_message_id, source_revision, scope_kind,
+               invocation_intent_id, execution_id, reason, created_at
+             ) VALUES (?, ?, ?, ?, 'invocation-intent', ?, NULL, 'message_recalled', ?)`,
+          ).run(
+            stableId("message-recall-intent-fence", input.command.messageId, intent.id),
+            input.command.roomId,
+            input.command.messageId,
+            input.command.expectedRevision,
+            intent.id,
+            recalledAt,
+          );
+        }
+        const executions = database.prepare(
+          `SELECT link.intent_id AS intentId, link.execution_id AS executionId,
+                  execution.status
+           FROM agent_execution_intent_links AS link
+           JOIN agent_invocation_intents AS intent ON intent.id = link.intent_id
+           JOIN agent_executions AS execution ON execution.id = link.execution_id
+           WHERE intent.source_message_id = ?
+           ORDER BY link.intent_id, link.execution_ordinal`,
+        ).all(input.command.messageId);
+        const abortTargets: string[] = [];
+        for (const execution of executions) {
+          if (typeof execution.intentId !== "string" || typeof execution.executionId !== "string") {
+            return fail("storage_unavailable", "Message execution lineage is corrupt");
+          }
+          database.prepare(
+            `INSERT INTO message_recall_fences (
+               fence_id, room_id, source_message_id, source_revision, scope_kind,
+               invocation_intent_id, execution_id, reason, created_at
+             ) VALUES (?, ?, ?, ?, 'execution', ?, ?, 'message_recalled', ?)`,
+          ).run(
+            stableId(
+              "message-recall-execution-fence",
+              input.command.messageId,
+              execution.intentId,
+              execution.executionId,
+            ),
+            input.command.roomId,
+            input.command.messageId,
+            input.command.expectedRevision,
+            execution.intentId,
+            execution.executionId,
+            recalledAt,
+          );
+          if (execution.status === "queued" || execution.status === "running") {
+            abortTargets.push(execution.executionId);
+          }
+        }
+        const updated = database.prepare(
+          `UPDATE message_envelopes
+           SET lifecycle = 'recalled', recalled_at = ?, recalled_by_actor_id = ?
+           WHERE message_id = ? AND room_id = ? AND message_kind = 'human'
+             AND lifecycle = 'active' AND current_revision = ?`,
+        ).run(
+          recalledAt,
+          actorId,
+          input.command.messageId,
+          input.command.roomId,
+          input.command.expectedRevision,
+        );
+        if (updated.changes !== 1) {
+          return fail("message_version_conflict", "Message recall compare-and-set failed");
+        }
+        database.prepare(
+          `UPDATE message_attachment_links SET operational_state = 'excluded_recalled'
+           WHERE message_id = ? AND operational_state = 'active'`,
+        ).run(input.command.messageId);
+        const timeline = readOperationalTimelineMessage(database, input.command.messageId);
+        if (timeline.lifecycle !== "recalled") {
+          return fail("storage_unavailable", "Recalled message projection is corrupt");
+        }
+        const eventId = stableId("message-authority-event", scope, businessKey);
+        const streamSeq = appendRoomEvent(database, {
+          eventId,
+          roomId: input.command.roomId,
+          actorId,
+          eventType: "room.message.recalled",
+          occurredAt: recalledAt,
+          payload: timeline as unknown as JsonValue,
+        });
+        appendRoomOutbox(
+          database, eventId, input.command.roomId, streamSeq, recalledAt,
+          scope, businessKey,
+        );
+        return {
+          messageId: input.command.messageId,
+          revision: input.command.expectedRevision,
+          recalledAt,
+          eventId,
+          replayed: false,
+          abortTargets,
+        };
+      },
+    }) as MessageRecallReceipt;
+  });
+}
+
+export function readMessageHistoryDatabaseQuery(
+  database: DatabaseSync,
+  context: AuthenticatedSessionContext,
+  query: MessageHistoryQuery,
+  now: number,
+): MessageHistoryPage {
+  return runAuthorityReadTransaction(database, () => {
+    if (!authorityExactKeys(query, ["roomId"], ["afterMessageId", "limit"]) ||
+        typeof query.roomId !== "string" || query.roomId.trim().length === 0 ||
+        (query.afterMessageId !== undefined &&
+          (typeof query.afterMessageId !== "string" || query.afterMessageId.trim().length === 0))) {
+      return fail("invalid_parameters", "Message history query was rejected");
+    }
+    const actorId = requireHumanSession(database, context, now);
+    requireSyncHumanRoomMembership(database, actorId, query.roomId);
+    const limit = messageAuthorityPageLimit(query.limit);
+    let afterCreatedAt: string | undefined;
+    if (query.afterMessageId !== undefined) {
+      const after = database.prepare(
+        `SELECT created_at AS createdAt FROM message_envelopes
+         WHERE message_id = ? AND room_id = ?`,
+      ).get(query.afterMessageId, query.roomId);
+      if (typeof after?.createdAt !== "string") {
+        return fail("message_not_found", "Message history cursor was not found");
+      }
+      afterCreatedAt = after.createdAt;
+    }
+    const rows = afterCreatedAt === undefined
+      ? database.prepare(
+          `SELECT message_id AS messageId FROM message_envelopes
+           WHERE room_id = ? ORDER BY created_at, message_id LIMIT ?`,
+        ).all(query.roomId, limit + 1)
+      : database.prepare(
+          `SELECT message_id AS messageId FROM message_envelopes
+           WHERE room_id = ? AND (created_at > ? OR (created_at = ? AND message_id > ?))
+           ORDER BY created_at, message_id LIMIT ?`,
+        ).all(query.roomId, afterCreatedAt, afterCreatedAt, query.afterMessageId!, limit + 1);
+    const hasMore = rows.length > limit;
+    return {
+      messages: rows.slice(0, limit).map((row) => typeof row.messageId === "string"
+        ? readOperationalTimelineMessage(database, row.messageId)
+        : fail("storage_unavailable", "Message history row is corrupt")),
+      hasMore,
+    };
+  });
+}
+
+export function readMessageRevisionsDatabaseQuery(
+  database: DatabaseSync,
+  context: AuthenticatedSessionContext,
+  query: MessageRevisionQuery,
+  now: number,
+): MessageRevisionPage {
+  return runAuthorityReadTransaction(database, () => {
+    if (!authorityExactKeys(query, ["roomId", "messageId"], ["afterRevision", "limit"]) ||
+        typeof query.roomId !== "string" || query.roomId.trim().length === 0 ||
+        typeof query.messageId !== "string" || query.messageId.trim().length === 0 ||
+        (query.afterRevision !== undefined &&
+          (!Number.isSafeInteger(query.afterRevision) || query.afterRevision < 0))) {
+      return fail("invalid_parameters", "Message revision query was rejected");
+    }
+    const actorId = requireHumanSession(database, context, now);
+    requireSyncHumanRoomMembership(database, actorId, query.roomId);
+    const envelope = database.prepare(
+      `SELECT message_kind AS messageKind, lifecycle FROM message_envelopes
+       WHERE message_id = ? AND room_id = ?`,
+    ).get(query.messageId, query.roomId);
+    if (envelope === undefined) return fail("message_not_found", "Message was not found");
+    if (envelope.messageKind !== "human") {
+      return fail("agent_final_immutable", "Agent final messages have no revision query");
+    }
+    if (envelope.lifecycle === "recalled") return { revisions: [], hasMore: false };
+    const limit = messageAuthorityPageLimit(query.limit);
+    const rows = database.prepare(
+      `SELECT message_id AS messageId, revision, body, revised_at AS revisedAt,
+              revised_by_actor_id AS revisedByActorId
+       FROM message_revisions WHERE message_id = ? AND revision > ?
+       ORDER BY revision LIMIT ?`,
+    ).all(query.messageId, query.afterRevision ?? 0, limit + 1);
+    const hasMore = rows.length > limit;
+    const revisions = rows.slice(0, limit).map((row) => ({
+      messageId: row.messageId,
+      revision: row.revision,
+      body: row.body,
+      revisedAt: row.revisedAt,
+      revisedByActorId: row.revisedByActorId,
+    })).map((revision) => isMessageRevision(revision)
+      ? revision
+      : fail("storage_unavailable", "Message revision row is corrupt"));
+    return { revisions, hasMore };
+  });
+}
+
+function validateAgentMessageCommand(command: AgentMessageCommitCommand): void {
+  if (!authorityExactKeys(command, ["messageId", "roomId", "body"], ["correctsMessageId"]) ||
+      !isAgentFinalMessage({
+        id: command.messageId,
+        roomId: command.roomId,
+        authorId: "authority-agent",
+        authorKind: "agent",
+        createdAt: "1970-01-01T00:00:00.000Z",
+        lifecycle: "active",
+        finalBody: command.body,
+        sourceInvocationIntentId: "authority-intent",
+        sourceExecutionId: "authority-execution",
+        ...(command.correctsMessageId === undefined
+          ? {}
+          : { correctsMessageId: command.correctsMessageId }),
+      })) {
+    return fail("invalid_parameters", "Agent message commit command was rejected");
+  }
+}
+
+export function commitAgentMessageDatabaseCommand(
+  database: DatabaseSync,
+  input: {
+    readonly context: AgentMessageWorkerContext;
+    readonly command: AgentMessageCommitCommand;
+    readonly now: number;
+    readonly beforeApply?: () => void;
+  },
+): AgentMessageCommitReceipt {
+  return runAuthorityImmediateTransaction(database, () => {
+    validateAgentMessageCommand(input.command);
+    if (!authorityExactKeys(input.context, [
+      "kind", "agent", "invocationIntentId", "executionId", "attemptSeq", "executionGeneration",
+    ]) || input.context.kind !== "agent-message" ||
+        !authorityExactKeys(input.context.agent, ["actorId", "kind"]) ||
+        input.context.agent.kind !== "agent" ||
+        typeof input.context.agent.actorId !== "string" || input.context.agent.actorId.length === 0 ||
+        typeof input.context.invocationIntentId !== "string" || input.context.invocationIntentId.length === 0 ||
+        typeof input.context.executionId !== "string" || input.context.executionId.length === 0 ||
+        !Number.isSafeInteger(input.context.attemptSeq) || input.context.attemptSeq < 1 ||
+        !Number.isSafeInteger(input.context.executionGeneration) || input.context.executionGeneration < 1) {
+      return fail("permission_denied", "Agent message capability binding was rejected");
+    }
+    const scope = [
+      input.context.agent.actorId,
+      "agent.message.commit",
+      input.command.roomId,
+      input.context.invocationIntentId,
+      input.context.executionId,
+      String(input.context.attemptSeq),
+      String(input.context.executionGeneration),
+    ].join("\u0000");
+    const existingReceipt = database.prepare(
+      "SELECT request_hash AS requestHash, response_json AS responseJson FROM idempotency_records WHERE scope = ? AND key = ?",
+    ).get(scope, input.command.messageId);
+    if (existingReceipt !== undefined) {
+      if (existingReceipt.requestHash !== messageAuthorityHash(input.command)) {
+        return fail("idempotency_conflict", "Agent message idempotency payload changed");
+      }
+      if (typeof existingReceipt.responseJson !== "string") {
+        return fail("storage_unavailable", "Stored Agent message receipt is corrupt");
+      }
+      const replay = parseStoredMessageAuthorityReceipt(existingReceipt.responseJson, "agent");
+      return { ...replay, replayed: true } as AgentMessageCommitReceipt;
+    }
+    const lineage = database.prepare(
+      `SELECT intent.room_id AS roomId, intent.source_message_id AS sourceMessageId,
+              intent.source_revision AS sourceRevision, intent.target_agent_id AS targetAgentId,
+              intent.status AS intentStatus, execution.status AS executionStatus,
+              execution.current_attempt_seq AS currentAttemptSeq,
+              execution.execution_generation AS executionGeneration,
+              execution.result_message_id AS resultMessageId,
+              room.status AS roomStatus, membership.participation,
+              source.lifecycle AS sourceLifecycle
+       FROM agent_invocation_intents AS intent
+       JOIN agent_execution_intent_links AS link
+         ON link.intent_id = intent.id AND link.execution_id = ?
+       JOIN agent_executions AS execution ON execution.id = link.execution_id
+       JOIN rooms AS room ON room.id = intent.room_id
+       JOIN room_memberships AS membership
+         ON membership.room_id = intent.room_id
+        AND membership.actor_id = intent.target_agent_id
+        AND membership.kind = 'agent'
+       JOIN message_envelopes AS source ON source.message_id = intent.source_message_id
+       WHERE intent.id = ?`,
+    ).get(input.context.executionId, input.context.invocationIntentId);
+    if (lineage === undefined) {
+      return fail("execution_conflict", "Agent message source lineage was not found");
+    }
+    if (lineage.roomId !== input.command.roomId ||
+        lineage.targetAgentId !== input.context.agent.actorId ||
+        lineage.intentStatus !== "claimed" || lineage.executionStatus !== "running" ||
+        lineage.currentAttemptSeq !== input.context.attemptSeq ||
+        lineage.executionGeneration !== input.context.executionGeneration ||
+        lineage.resultMessageId !== null || lineage.roomStatus !== "active" ||
+        lineage.participation !== "active" || lineage.sourceLifecycle !== "active") {
+      return fail("execution_conflict", "Agent message terminal compare-and-set failed");
+    }
+    if (typeof lineage.sourceMessageId !== "string" ||
+        typeof lineage.sourceRevision !== "number") {
+      return fail("storage_unavailable", "Agent message source lineage is corrupt");
+    }
+    const sourceMessageId = lineage.sourceMessageId;
+    const sourceRevision = lineage.sourceRevision;
+    const fenced = database.prepare(
+      `SELECT 1 AS present FROM message_recall_fences
+       WHERE source_message_id = ? AND (
+         scope_kind = 'message'
+         OR (scope_kind = 'invocation-intent' AND invocation_intent_id = ?)
+         OR (scope_kind = 'execution' AND invocation_intent_id = ? AND execution_id = ?)
+       ) LIMIT 1`,
+    ).get(
+      sourceMessageId,
+      input.context.invocationIntentId,
+      input.context.invocationIntentId,
+      input.context.executionId,
+    );
+    if (fenced !== undefined) {
+      return fail("execution_conflict", "Agent message source was recalled");
+    }
+    if (database.prepare("SELECT 1 AS present FROM messages WHERE id = ?").get(
+      input.command.messageId,
+    ) !== undefined) {
+      return fail("idempotency_conflict", "Agent message identity already exists");
+    }
+    if (input.command.correctsMessageId !== undefined) {
+      const correction = database.prepare(
+        `SELECT envelope.room_id AS roomId, envelope.message_kind AS messageKind,
+                message.author_id AS authorId
+         FROM message_envelopes AS envelope
+         JOIN messages AS message ON message.id = envelope.message_id
+         WHERE envelope.message_id = ?`,
+      ).get(input.command.correctsMessageId);
+      if (correction?.roomId !== input.command.roomId ||
+          correction.messageKind !== "agent-final" ||
+          correction.authorId !== input.context.agent.actorId) {
+        return fail("agent_final_immutable", "Agent correction target was rejected");
+      }
+    }
+    return executeMessageAuthorityIdempotently(database, {
+      scope,
+      key: input.command.messageId,
+      command: input.command,
+      kind: "agent",
+      now: input.now,
+      execute(persistedAt) {
+        input.beforeApply?.();
+        database.prepare(
+          `INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+           VALUES (?, ?, ?, 'agent', ?, ?)`,
+        ).run(
+          input.command.messageId,
+          input.command.roomId,
+          input.context.agent.actorId,
+          input.command.body,
+          persistedAt,
+        );
+        database.prepare(
+          `INSERT INTO message_revisions (
+             message_id, revision, body, revised_at, revised_by_actor_id
+           ) VALUES (?, 1, ?, ?, ?)`,
+        ).run(
+          input.command.messageId,
+          input.command.body,
+          persistedAt,
+          input.context.agent.actorId,
+        );
+        database.prepare(
+          `INSERT INTO message_envelopes (
+             message_id, room_id, message_kind, lifecycle, current_revision,
+             revision_count, created_at, recalled_at, recalled_by_actor_id
+           ) VALUES (?, ?, ?, 'active', 1, 1, ?, NULL, NULL)`,
+        ).run(
+          input.command.messageId,
+          input.command.roomId,
+          input.command.correctsMessageId === undefined ? "agent-final" : "agent-correction",
+          persistedAt,
+        );
+        database.prepare(
+          `INSERT INTO agent_message_sources (
+             message_id, room_id, invocation_intent_id, execution_id,
+             attempt_seq, execution_generation, source_message_id,
+             source_revision, committed_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          input.command.messageId,
+          input.command.roomId,
+          input.context.invocationIntentId,
+          input.context.executionId,
+          input.context.attemptSeq,
+          input.context.executionGeneration,
+          sourceMessageId,
+          sourceRevision,
+          persistedAt,
+        );
+        if (input.command.correctsMessageId !== undefined) {
+          database.prepare(
+            `INSERT INTO agent_message_corrections (
+               correction_message_id, corrects_message_id, room_id,
+               agent_actor_id, created_at
+             ) VALUES (?, ?, ?, ?, ?)`,
+          ).run(
+            input.command.messageId,
+            input.command.correctsMessageId,
+            input.command.roomId,
+            input.context.agent.actorId,
+            persistedAt,
+          );
+        }
+        const attemptUpdated = database.prepare(
+          `UPDATE agent_execution_attempts
+           SET status = 'completed', finished_at = ?
+           WHERE execution_id = ? AND attempt_seq = ? AND status = 'running'`,
+        ).run(persistedAt, input.context.executionId, input.context.attemptSeq);
+        const executionUpdated = database.prepare(
+          `UPDATE agent_executions
+           SET status = 'completed', completed_at = ?, updated_at = ?, result_message_id = ?
+           WHERE id = ? AND status = 'running' AND current_attempt_seq = ?
+             AND execution_generation = ? AND result_message_id IS NULL`,
+        ).run(
+          persistedAt,
+          persistedAt,
+          input.command.messageId,
+          input.context.executionId,
+          input.context.attemptSeq,
+          input.context.executionGeneration,
+        );
+        if (executionUpdated.changes !== 1 || attemptUpdated.changes !== 1) {
+          return fail("execution_conflict", "Agent message terminal compare-and-set failed");
+        }
+        const message = readOperationalTimelineMessage(database, input.command.messageId);
+        if (message.authorKind !== "agent") {
+          return fail("storage_unavailable", "Agent message projection is corrupt");
+        }
+        const eventId = stableId("message-authority-event", scope, input.command.messageId);
+        const streamSeq = appendRoomEvent(database, {
+          eventId,
+          roomId: input.command.roomId,
+          actorId: input.context.agent.actorId,
+          eventType: "room.message.accepted",
+          occurredAt: persistedAt,
+          payload: message as unknown as JsonValue,
+        });
+        appendRoomOutbox(
+          database, eventId, input.command.roomId, streamSeq, persistedAt,
+          scope, input.command.messageId,
+        );
+        return {
+          messageId: input.command.messageId,
+          persistedAt,
+          eventId,
+          replayed: false,
+          message,
+        };
+      },
+    }) as AgentMessageCommitReceipt;
+  });
 }

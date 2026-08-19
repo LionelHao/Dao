@@ -421,6 +421,60 @@ describe("closed authority contracts", () => {
     expect(parsePersistedRoomEvent(event)).toMatchObject({ ok: true, value: event });
   });
 
+  it("accepts the closed message authority event union alongside legacy accepted events", () => {
+    const activeMessage = {
+      id: "message-v2",
+      roomId: "room-1",
+      authorId: "human-1",
+      authorKind: "human" as const,
+      createdAt: "2026-08-19T01:02:03.004Z",
+      lifecycle: "active" as const,
+      currentRevision: {
+        messageId: "message-v2",
+        revision: 1,
+        body: "hello",
+        revisedAt: "2026-08-19T01:02:03.004Z",
+        revisedByActorId: "human-1",
+      },
+      revisionCount: 1,
+      mentionedTargets: [],
+      attachments: [],
+      targetOutcomes: [],
+    };
+    const envelope = {
+      eventId: "event-message-v2",
+      streamKind: "room" as const,
+      streamId: "room-1",
+      streamSeq: 10,
+      roomId: "room-1",
+      actorId: "human-1",
+      occurredAt: "2026-08-19T01:02:03.004Z",
+    };
+    const recalledMessage = {
+      id: activeMessage.id,
+      roomId: activeMessage.roomId,
+      authorId: activeMessage.authorId,
+      authorKind: activeMessage.authorKind,
+      createdAt: activeMessage.createdAt,
+      lifecycle: "recalled" as const,
+      recalledAt: "2026-08-19T01:03:04.005Z",
+      revisionCount: 1,
+    };
+
+    for (const event of [
+      { ...envelope, type: "room.message.accepted", payload: activeMessage },
+      { ...envelope, type: "room.message.revised", payload: activeMessage },
+      {
+        ...envelope,
+        occurredAt: recalledMessage.recalledAt,
+        type: "room.message.recalled",
+        payload: recalledMessage,
+      },
+    ]) {
+      expect(parsePersistedRoomEvent(event)).toMatchObject({ ok: true, value: event });
+    }
+  });
+
   it.each(acceptedIdentityEvents)("accepts a canonical persisted identity event", (event) => {
     expect(parsePersistedIdentityEvent(event)).toMatchObject({ ok: true, value: event });
   });

@@ -3,8 +3,10 @@ import type {
   AuthenticatedCommandContext,
   HumanCollaborationCommand,
   InternalAgentCommandContext,
+  MessageAuthorityStore,
   OutboxDelivery,
 } from "./contracts.js";
+import type { HumanMessageSubmit } from "@native-im/core";
 import { mintInternalAgentCommandContext } from "./contracts.js";
 import type { CanonicalIdentityEventInput } from "./authority-database-handler.js";
 import type { StartAuthoritativeServerOptions } from "../index.js";
@@ -56,6 +58,15 @@ type PublicJsonAgentContext = {
   readonly idempotencyKey: "key-1";
 };
 
+type PublicJsonAgentMessageContext = {
+  readonly kind: "agent-message";
+  readonly agent: { readonly actorId: "agent-1"; readonly kind: "agent" };
+  readonly invocationIntentId: "intent-1";
+  readonly executionId: "execution-1";
+  readonly attemptSeq: 1;
+  readonly executionGeneration: 1;
+};
+
 type HumanReadWithInjectedActor = {
   readonly type: "human.read.record";
   readonly roomId: "room-1";
@@ -89,6 +100,17 @@ type HumanMessageWithInjectedAuthor = {
     readonly sentAt: "2026-08-10T00:00:00.000Z";
     readonly authorKind: "human";
   };
+};
+
+type StructuredSubmitWithServerAuthority = {
+  readonly messageId: "message-1";
+  readonly roomId: "room-1";
+  readonly body: "hello";
+  readonly mentionedTargets: readonly [];
+  readonly attachments: readonly [];
+  readonly authorActorId: "human-1";
+  readonly capability: "forged";
+  readonly kind: "agent-message";
 };
 
 type LightTaskCreateWithInjectedBlueprintField = {
@@ -157,6 +179,20 @@ export type AgentJudgementCannotInjectAgent = Assert<
 >;
 export type HumanMessageCannotInjectAuthorKind = Assert<
   HumanMessageWithInjectedAuthor extends HumanCollaborationCommand ? false : true
+>;
+export type StructuredSubmitCannotInjectServerAuthority = Assert<
+  StructuredSubmitWithServerAuthority extends HumanMessageSubmit ? false : true
+>;
+export type MessageAuthorityStoreUsesOpaqueAgentCommit = Assert<
+  Parameters<MessageAuthorityStore["commitAgentMessage"]>[0] extends {
+    readonly kind: "agent-message";
+  } ? true : false
+>;
+export type PublicJsonCannotConstructAgentMessageCommitContext = Assert<
+  PublicJsonAgentMessageContext extends
+    Parameters<MessageAuthorityStore["commitAgentMessage"]>[0]
+    ? false
+    : true
 >;
 export type LightTaskCreateCannotInjectBlueprintFields = Assert<
   LightTaskCreateWithInjectedBlueprintField extends HumanCollaborationCommand ? false : true

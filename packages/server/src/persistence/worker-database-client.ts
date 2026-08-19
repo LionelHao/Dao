@@ -6,6 +6,7 @@ import { Worker } from "node:worker_threads";
 import type {
   Actor,
   DepartureConflictList,
+  HumanMessageSubmit,
   ManagedRoom,
   Message,
   RoomSyncRequest,
@@ -30,6 +31,8 @@ import type {
 } from "./legacy-importer.js";
 import type {
   AgentCollaborationCommand,
+  AgentMessageCommitCommand,
+  AgentMessageCommitReceipt,
   AuthenticatedSessionContext,
   AuthenticatedCommandContext,
   ClosedRoomGovernanceAcknowledgement,
@@ -38,17 +41,30 @@ import type {
   HashedSessionIssue,
   HashedSessionRotation,
   HumanCollaborationCommand,
+  HumanMessageSubmissionReceipt,
   InternalAgentCommandContext,
   IssuedSessionRecord,
   PublicSession,
   OutboxDelivery,
   OutboxDeliveryFailureReason,
   OutboxDispatchCandidate,
+  MessageHistoryPage,
+  MessageHistoryQuery,
+  MessageRecallCommand,
+  MessageRecallReceipt,
+  MessageRevisionCommand,
+  MessageRevisionPage,
+  MessageRevisionQuery,
+  MessageRevisionReceipt,
   RoomGovernanceCommand,
   RepairScope,
   StreamingRepairLease,
   SnapshotRevalidationRequest,
 } from "./contracts.js";
+import {
+  toAgentMessageWorkerContext,
+  type InternalAgentMessageCommitContext,
+} from "../message-authority/internal-message-capability.js";
 import type { RuntimeAuthorityOperation } from "../agent-runtime/runtime-authority-protocol.js";
 import type { RouteAuthorityOperation } from "../route-runtime/route-authority-protocol.js";
 import type {
@@ -123,6 +139,42 @@ export interface WorkerDatabaseClient {
     command: AgentCollaborationCommand,
     now: number,
   ): Promise<CommandAcknowledgement>;
+}
+
+export interface MessageAuthorityWorkerDatabaseClient {
+  submitHumanMessage(
+    context: AuthenticatedCommandContext,
+    message: HumanMessageSubmit,
+    now: number,
+  ): Promise<HumanMessageSubmissionReceipt>;
+  reviseHumanMessage(
+    context: AuthenticatedCommandContext,
+    command: MessageRevisionCommand,
+    now: number,
+  ): Promise<MessageRevisionReceipt>;
+  recallHumanMessage(
+    context: AuthenticatedCommandContext,
+    command: MessageRecallCommand,
+    now: number,
+  ): Promise<MessageRecallReceipt>;
+  commitAgentMessage(
+    context: InternalAgentMessageCommitContext,
+    command: AgentMessageCommitCommand,
+    now: number,
+  ): Promise<AgentMessageCommitReceipt>;
+  readMessageHistory(
+    context: AuthenticatedSessionContext,
+    query: MessageHistoryQuery,
+    now: number,
+  ): Promise<MessageHistoryPage>;
+  readMessageRevisions(
+    context: AuthenticatedSessionContext,
+    query: MessageRevisionQuery,
+    now: number,
+  ): Promise<MessageRevisionPage>;
+}
+
+export interface WorkerDatabaseClient {
   readHistory(
     context: AuthenticatedSessionContext,
     roomId: string,
@@ -212,6 +264,9 @@ export interface WorkerDatabaseClient {
   close(): Promise<void>;
 }
 
+export type CompleteWorkerDatabaseClient = WorkerDatabaseClient &
+  MessageAuthorityWorkerDatabaseClient;
+
 export interface AuthorityWorkerTransport {
   postMessage(message: AuthorityWorkerRequest): void;
   on(event: "message", listener: (message: unknown) => void): this;
@@ -297,6 +352,8 @@ function authorityWorkerClientErrorStatus(
     case "session_limit_reached":
     case "execution_not_running":
     case "idempotency_conflict":
+    case "agent_final_immutable":
+    case "message_version_conflict":
     case "invitation_consumed":
     case "invitation_pending":
     case "room_archived":
@@ -316,6 +373,7 @@ function authorityWorkerClientErrorStatus(
       return 403;
     case "snapshot_expired":
     case "confirmation_expired":
+    case "protocol_upgrade_required":
       return 410;
     case "snapshot_busy":
     case "agent_queue_full":
@@ -385,7 +443,9 @@ function hasExactKeys(
   value: Record<string, unknown>,
   expectedKeys: readonly string[],
 ): boolean {
-  const actualKeys = Object.keys(value).sort();
+  const ownKeys = Reflect.ownKeys(value);
+  if (ownKeys.some((key) => typeof key !== "string")) return false;
+  const actualKeys = (ownKeys as string[]).sort();
   const sortedExpectedKeys = [...expectedKeys].sort();
   return (
     actualKeys.length === sortedExpectedKeys.length &&
@@ -712,7 +772,7 @@ function createAuthorityWorker(
   });
 }
 
-class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
+class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient {
   readonly #pending = new Map<string, PendingRequest>();
   readonly #worker: AuthorityWorkerTransport;
   readonly #releaseCoordinator: () => void;
@@ -1117,6 +1177,129 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
       }
       return response.acknowledgement;
     });
+  }
+
+  submitHumanMessage(
+    context: AuthenticatedCommandContext,
+    message: HumanMessageSubmit,
+    now: number,
+  ): Promise<HumanMessageSubmissionReceipt> {
+    if (this.#terminalError !== undefined) return this.#rejectTerminal();
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) return Promise.reject(unavailable);
+    return this.#send({ type: "authority.message-submit", context, message, now }).then(
+      (response) => {
+        if (response.type !== "authority.message-submitted") {
+          this.#failProtocol("Authority worker returned the wrong message submit response");
+          throw this.#terminalError;
+        }
+        return response.receipt;
+      },
+    );
+  }
+
+  reviseHumanMessage(
+    context: AuthenticatedCommandContext,
+    command: MessageRevisionCommand,
+    now: number,
+  ): Promise<MessageRevisionReceipt> {
+    if (this.#terminalError !== undefined) return this.#rejectTerminal();
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) return Promise.reject(unavailable);
+    return this.#send({ type: "authority.message-revise", context, command, now }).then(
+      (response) => {
+        if (response.type !== "authority.message-revised") {
+          this.#failProtocol("Authority worker returned the wrong message revision response");
+          throw this.#terminalError;
+        }
+        return response.receipt;
+      },
+    );
+  }
+
+  recallHumanMessage(
+    context: AuthenticatedCommandContext,
+    command: MessageRecallCommand,
+    now: number,
+  ): Promise<MessageRecallReceipt> {
+    if (this.#terminalError !== undefined) return this.#rejectTerminal();
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) return Promise.reject(unavailable);
+    return this.#send({ type: "authority.message-recall", context, command, now }).then(
+      (response) => {
+        if (response.type !== "authority.message-recalled") {
+          this.#failProtocol("Authority worker returned the wrong message recall response");
+          throw this.#terminalError;
+        }
+        return response.receipt;
+      },
+    );
+  }
+
+  commitAgentMessage(
+    context: InternalAgentMessageCommitContext,
+    command: AgentMessageCommitCommand,
+    now: number,
+  ): Promise<AgentMessageCommitReceipt> {
+    let workerContext: ReturnType<typeof toAgentMessageWorkerContext>;
+    try {
+      workerContext = toAgentMessageWorkerContext(context);
+    } catch (error: unknown) {
+      return Promise.reject(error);
+    }
+    if (this.#terminalError !== undefined) return this.#rejectTerminal();
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) return Promise.reject(unavailable);
+    return this.#send({
+      type: "authority.agent-message-commit",
+      context: workerContext,
+      command,
+      now,
+    }).then((response) => {
+      if (response.type !== "authority.agent-message-committed") {
+        this.#failProtocol("Authority worker returned the wrong Agent message response");
+        throw this.#terminalError;
+      }
+      return response.receipt;
+    });
+  }
+
+  readMessageHistory(
+    context: AuthenticatedSessionContext,
+    query: MessageHistoryQuery,
+    now: number,
+  ): Promise<MessageHistoryPage> {
+    if (this.#terminalError !== undefined) return this.#rejectTerminal();
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) return Promise.reject(unavailable);
+    return this.#send({ type: "authority.message-history", context, query, now }).then(
+      (response) => {
+        if (response.type !== "authority.message-history") {
+          this.#failProtocol("Authority worker returned the wrong message history response");
+          throw this.#terminalError;
+        }
+        return response.page;
+      },
+    );
+  }
+
+  readMessageRevisions(
+    context: AuthenticatedSessionContext,
+    query: MessageRevisionQuery,
+    now: number,
+  ): Promise<MessageRevisionPage> {
+    if (this.#terminalError !== undefined) return this.#rejectTerminal();
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) return Promise.reject(unavailable);
+    return this.#send({ type: "authority.message-revisions", context, query, now }).then(
+      (response) => {
+        if (response.type !== "authority.message-revisions") {
+          this.#failProtocol("Authority worker returned the wrong message revisions response");
+          throw this.#terminalError;
+        }
+        return response.page;
+      },
+    );
   }
 
   executeRuntime(operation: RuntimeAuthorityOperation): Promise<unknown> {
@@ -1666,6 +1849,18 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
         responseType === "authority.departure-conflicts") ||
       (requestType === "authority.execute-agent" &&
         responseType === "authority.command-acknowledged") ||
+      (requestType === "authority.message-submit" &&
+        responseType === "authority.message-submitted") ||
+      (requestType === "authority.message-revise" &&
+        responseType === "authority.message-revised") ||
+      (requestType === "authority.message-recall" &&
+        responseType === "authority.message-recalled") ||
+      (requestType === "authority.agent-message-commit" &&
+        responseType === "authority.agent-message-committed") ||
+      (requestType === "authority.message-history" &&
+        responseType === "authority.message-history") ||
+      (requestType === "authority.message-revisions" &&
+        responseType === "authority.message-revisions") ||
       (requestType === "authority.runtime" &&
         responseType === "authority.runtime-result") ||
       (requestType === "authority.route" &&
@@ -1779,7 +1974,7 @@ type AuthorityWorkerFactory = (
 async function createClient(
   options: CreateWorkerDatabaseClientOptions,
   workerFactory: AuthorityWorkerFactory,
-): Promise<WorkerDatabaseClient> {
+): Promise<CompleteWorkerDatabaseClient> {
   const reservation = await reserveAuthorityCoordinator(options.databasePath);
   let worker: AuthorityWorkerTransport;
   try {
@@ -1824,7 +2019,7 @@ async function createClient(
 
 export function createWorkerDatabaseClient(
   options: CreateWorkerDatabaseClientOptions,
-): Promise<WorkerDatabaseClient> {
+): Promise<CompleteWorkerDatabaseClient> {
   return createClient(options, (databasePath, recovery) =>
     createAuthorityWorker({ ...options, databasePath }, recovery),
   );
@@ -1834,14 +2029,14 @@ export function createWorkerDatabaseClient(
 export function createWorkerDatabaseClientForTest(
   _options: CreateWorkerDatabaseClientOptions,
   workerFactory: AuthorityWorkerFactory,
-): Promise<WorkerDatabaseClient> {
+): Promise<CompleteWorkerDatabaseClient> {
   return createClient(_options, workerFactory);
 }
 
 // Module-local integration seam. It is intentionally absent from the package root export.
 export function createWorkerDatabaseClientWithRollbackFailureForTest(
   options: CreateWorkerDatabaseClientOptions,
-): Promise<WorkerDatabaseClient> {
+): Promise<CompleteWorkerDatabaseClient> {
   return createClient(options, (databasePath, recovery) =>
     createAuthorityWorker({ ...options, databasePath }, recovery, true),
   );
@@ -1851,7 +2046,7 @@ export function createWorkerDatabaseClientWithRollbackFailureForTest(
 export function createWorkerDatabaseClientWithTransactionFaultForTest(
   options: CreateWorkerDatabaseClientOptions,
   faultPoint: "after-domain-write" | "before-commit",
-): Promise<WorkerDatabaseClient> {
+): Promise<CompleteWorkerDatabaseClient> {
   return createClient(options, (databasePath, recovery) =>
     createAuthorityWorker({ ...options, databasePath }, recovery, false, faultPoint),
   );

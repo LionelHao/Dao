@@ -468,6 +468,47 @@ afterEach(async () => {
 });
 
 describe("AuthorityWorker closed protocol", () => {
+  it("rejects symbol and non-enumerable own keys in Message Authority requests", () => {
+    const request = {
+      type: "authority.message-submit" as const,
+      requestId: "message-submit-exact",
+      context: {
+        kind: "human" as const,
+        sessionId: createHash("sha256").update("message-session").digest("base64url"),
+        sessionFamilyId: createHash("sha256").update("message-family").digest("base64url"),
+        principal: { accountId: "account-1", actorId: "human-1" },
+        requestId: "message-submit-command",
+        idempotencyKey: "message-submit-key",
+      },
+      message: {
+        messageId: "message-exact",
+        roomId: "room-exact",
+        body: "@Agent hello",
+        mentionedTargets: [{
+          id: "target-agent",
+          kind: "agent-invocation" as const,
+          targetActorId: "agent-1",
+          range: { startUtf16: 0, endUtf16: 6 },
+        }],
+        attachments: [],
+      },
+      now: 1_000,
+    };
+    expect(isAuthorityWorkerRequest(request)).toBe(true);
+
+    const symbolExtra = structuredClone(request) as typeof request & Record<PropertyKey, unknown>;
+    symbolExtra[Symbol("authority-extra")] = true;
+    expect(isAuthorityWorkerRequest(symbolExtra)).toBe(false);
+
+    const nonEnumerableExtra = structuredClone(request) as typeof request &
+      Record<PropertyKey, unknown>;
+    Object.defineProperty(nonEnumerableExtra.message.mentionedTargets[0], "capability", {
+      configurable: true,
+      value: "forged",
+    });
+    expect(isAuthorityWorkerRequest(nonEnumerableExtra)).toBe(false);
+  });
+
   it("accepts only exact request variants", () => {
     const repairContext = {
       sessionId: createHash("sha256").update("repair-session").digest("base64url"),
