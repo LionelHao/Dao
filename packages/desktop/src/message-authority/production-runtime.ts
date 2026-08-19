@@ -165,17 +165,27 @@ export function createDesktopMessageAuthorityRuntime(options: {
         state.watermark = event.streamSeq;
         continue;
       }
-      if (state.desynchronized || event.streamSeq !== state.watermark + 1 ||
-          !isMessageAuthorityEvent(event)) {
+      if (state.desynchronized || event.streamSeq !== state.watermark + 1) {
         failMixedCursor(state);
         return;
       }
-      publish({
-        type: "room.event",
-        cursorBefore: state.watermark,
-        generation: state.generation,
-        event,
-      });
+      if (isMessageAuthorityEvent(event)) {
+        publish({
+          type: "room.event",
+          cursorBefore: state.watermark,
+          generation: state.generation,
+          event,
+        });
+      } else {
+        publish({
+          type: "room.cursor.advanced",
+          roomId: state.roomId,
+          cursorBefore: state.watermark,
+          generation: state.generation,
+          eventId: event.eventId,
+          streamSeq: event.streamSeq,
+        });
+      }
       state.watermark = event.streamSeq;
     }
   };

@@ -49,9 +49,34 @@ describe("Message Authority preload bridge", () => {
     const listener = vi.fn();
     const dispose = bridge.onAuthorityInput(listener);
     listeners.get(MESSAGE_AUTHORITY_IPC_CHANNELS.authorityInput)?.({}, {
+      type: "room.cursor.advanced",
+      roomId: "room-1",
+      cursorBefore: 4,
+      generation: 2,
+      eventId: "room-renamed-5",
+      streamSeq: 5,
+    });
+    expect(listener).toHaveBeenCalledWith({
+      type: "room.cursor.advanced",
+      roomId: "room-1",
+      cursorBefore: 4,
+      generation: 2,
+      eventId: "room-renamed-5",
+      streamSeq: 5,
+    });
+    listeners.get(MESSAGE_AUTHORITY_IPC_CHANNELS.authorityInput)?.({}, {
       type: "room.event", token: "leak",
     });
-    expect(listener).not.toHaveBeenCalled();
+    listeners.get(MESSAGE_AUTHORITY_IPC_CHANNELS.authorityInput)?.({}, {
+      type: "room.cursor.advanced",
+      roomId: "room-1",
+      cursorBefore: 5,
+      generation: 2,
+      eventId: "room-renamed-6",
+      streamSeq: 6,
+      token: "leak",
+    });
+    expect(listener).toHaveBeenCalledOnce();
     dispose();
     dispose();
     expect(ipc.removeListener).toHaveBeenCalledOnce();

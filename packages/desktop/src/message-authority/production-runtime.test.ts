@@ -122,7 +122,7 @@ describe("production Desktop Message Authority runtime", () => {
     runtime.close();
   });
 
-  it("publishes offline/revoked terminal states and fails closed on mixed Room cursor gaps", async () => {
+  it("advances mixed Room cursors and publishes offline/revoked terminal states", async () => {
     const server = await runtimeServer();
     const runtime = createDesktopMessageAuthorityRuntime({
       endpoint: server.endpoint,
@@ -145,9 +145,26 @@ describe("production Desktop Message Authority runtime", () => {
         members: [] } },
     } });
     await vi.waitFor(() => expect(inputs).toContainEqual({
-      type: "message.connection", roomId: "room-1",
-      connection: { status: "repair-failed", errorCode: "mixed_room_cursor_requires_repair" },
+      type: "room.cursor.advanced", roomId: "room-1", cursorBefore: 0, generation: 1,
+      eventId: "room-renamed-1", streamSeq: 1,
     }));
+    server.send({ type: "room.event", event: {
+      eventId: "message-after-rename-2", streamKind: "room", streamId: "room-1",
+      streamSeq: 2, roomId: "room-1", actorId: "human-1", occurredAt: now,
+      type: "room.message.accepted", payload: {
+        ...message,
+        id: "message-after-rename",
+        currentRevision: {
+          ...message.currentRevision,
+          messageId: "message-after-rename",
+          body: "After rename",
+        },
+      },
+    } });
+    await vi.waitFor(() => expect(inputs).toContainEqual(expect.objectContaining({
+      type: "room.event", cursorBefore: 1, generation: 1,
+      event: expect.objectContaining({ eventId: "message-after-rename-2", streamSeq: 2 }),
+    })));
 
     server.send({ type: "auth.session-revoked", eventId: "session-revoked-1" });
     await vi.waitFor(() => expect(inputs).toContainEqual({

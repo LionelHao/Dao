@@ -10,6 +10,7 @@ import type {
   MessageAuthorityReadyHistory,
 } from "../../message-authority/contracts.js";
 import {
+  advanceMessageAuthorityCursor,
   applyMessageAuthorityEvent,
   beginMessageAuthorityRepair,
   commitMessageAuthorityRepair,
@@ -198,6 +199,34 @@ export function mountMessageAuthorityBridgeSurface(
     render();
   };
 
+  const applyCursorAdvance = (
+    input: Extract<MessageAuthorityBridgeInput, { type: "room.cursor.advanced" }>,
+  ): void => {
+    if (state === undefined || replica === undefined || input.roomId !== roomId) return;
+    if (input.generation !== replica.generation || input.cursorBefore !== replica.afterSeq) {
+      state = state.connection.status === "repairing"
+        ? failRepairGeneration(state, "event_cursor_mismatch")
+        : replaceState(state, {
+          connection: { status: "repair-failed", errorCode: "event_cursor_mismatch" },
+          announcement: "事件游标不连续；旧完整 projection 已锁定并等待 repair",
+        });
+      render();
+      return;
+    }
+    try {
+      replica = advanceMessageAuthorityCursor(replica, {
+        eventId: input.eventId,
+        streamSeq: input.streamSeq,
+      });
+    } catch {
+      state = replaceState(state, {
+        connection: { status: "repair-failed", errorCode: "event_projection_invalid" },
+        announcement: "事件无法安全投影；旧完整 projection 已锁定并等待 repair",
+      });
+      render();
+    }
+  };
+
   const applyConnection = (
     input: Extract<MessageAuthorityBridgeInput, { type: "message.connection" }>,
   ): void => {
@@ -312,6 +341,10 @@ export function mountMessageAuthorityBridgeSurface(
         return;
       }
       applyStableEvent(input);
+      return;
+    }
+    if (input.type === "room.cursor.advanced") {
+      applyCursorAdvance(input);
       return;
     }
     if (input.type === "message.connection") {

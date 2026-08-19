@@ -172,6 +172,37 @@ function send(root: HTMLElement): HTMLButtonElement {
 }
 
 describe("Message Authority bridge renderer adapter", () => {
+  it("advances across non-message Room events without adding a timeline row", async () => {
+    const authority = authorityHarness();
+    const root = document.createElement("main");
+    const dispose = mountMessageAuthorityBridgeSurface(root, authority.bridge, "room-1", {
+      createMessageId: () => "message-new",
+      createTargetId: () => "target-new",
+    });
+    await vi.waitFor(() => expect(root.textContent).toContain("Existing authority message"));
+
+    authority.publish({
+      type: "room.cursor.advanced",
+      roomId: "room-1",
+      cursorBefore: 9,
+      generation: 4,
+      eventId: "room-renamed-10",
+      streamSeq: 10,
+    });
+    authority.publish({
+      type: "room.event",
+      cursorBefore: 10,
+      generation: 4,
+      event: acceptedEvent(11, "message-after-rename", "After rename"),
+    });
+
+    await vi.waitFor(() => expect(root.textContent).toContain("After rename"));
+    expect(root.textContent).not.toContain("event_cursor_mismatch");
+    expect(root.querySelectorAll("[data-message-id]")).toHaveLength(2);
+    dispose();
+    authority.close();
+  });
+
   it("runs real send controls through the closed bridge and converges every ACK/event order", async () => {
     const authority = authorityHarness();
     const root = document.createElement("main");

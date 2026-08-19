@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   MessageAuthorityReplicaError,
+  advanceMessageAuthorityCursor,
   applyMessageAuthorityEvent,
   beginMessageAuthorityRepair,
   commitMessageAuthorityRepair,
@@ -156,6 +157,30 @@ describe("Desktop message authority operational replica", () => {
       replica,
       event(3, "room.message.revised", human(2)),
     )).toThrow(new MessageAuthorityReplicaError("event_gap"));
+  });
+
+  it("advances across non-message Room events without inventing a message sequence", () => {
+    let replica = createMessageAuthorityReplica("room-1");
+    replica = advanceMessageAuthorityCursor(replica, {
+      eventId: "room-renamed-1",
+      streamSeq: 1,
+    });
+    expect(replica).toMatchObject({
+      afterSeq: 1,
+      timeline: [],
+      eventLedger: [{ eventId: "room-renamed-1", streamSeq: 1 }],
+    });
+
+    replica = applyMessageAuthorityEvent(
+      replica,
+      event(2, "room.message.accepted", human(), "message-event-2"),
+    );
+    expect(replica.afterSeq).toBe(2);
+    expect(replica.timeline).toEqual([human()]);
+    expect(() => advanceMessageAuthorityCursor(replica, {
+      eventId: "wrong-attempt",
+      streamSeq: 4,
+    })).toThrow(new MessageAuthorityReplicaError("event_gap"));
   });
 
   it("rejects revision regression and changes to frozen targets, reply, attachments, or outcomes", () => {

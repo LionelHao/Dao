@@ -141,6 +141,14 @@ export type MessageAuthorityPortInput =
       event: MessageAuthorityEvent;
     }>
   | Readonly<{
+      type: "room.cursor.advanced";
+      roomId: string;
+      cursorBefore: number;
+      generation: number;
+      eventId: string;
+      streamSeq: number;
+    }>
+  | Readonly<{
       type: "message.connection";
       roomId: string;
       connection: MessageConnectionState;
@@ -366,6 +374,13 @@ export function isMessageAuthorityPortInput(value: unknown): value is MessageAut
     return keys(value, ["type", "cursorBefore", "generation", "event"]) &&
       count(value.cursorBefore) && positive(value.generation) &&
       isMessageAuthorityEvent(value.event) && value.event.streamSeq === value.cursorBefore + 1;
+  }
+  if (value.type === "room.cursor.advanced") {
+    return keys(value, [
+      "type", "roomId", "cursorBefore", "generation", "eventId", "streamSeq",
+    ]) && text(value.roomId) && count(value.cursorBefore) && positive(value.generation) &&
+      text(value.eventId) && positive(value.streamSeq) &&
+      value.streamSeq === value.cursorBefore + 1;
   }
   if (value.type === "message.connection") {
     return keys(value, ["type", "roomId", "connection"]) && text(value.roomId) &&
