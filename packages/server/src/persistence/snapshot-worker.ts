@@ -18,6 +18,8 @@ import type {
   RoomRepairRecord,
   RoomSummary,
 } from "@native-im/core";
+import { lifecycleRepairSegmentDescriptor } from
+  "../room-governance/lifecycle-repair-descriptor.js";
 import type {
   AuthenticatedSessionContext,
   MaterializedSnapshotManifest,
@@ -857,26 +859,6 @@ function roomMetadataRecord(row: unknown): RoomRepairRecord {
   }};
 }
 
-function governanceRecord(row: unknown): RoomRepairRecord {
-  if (!isRecord(row) || typeof row.id !== "string" ||
-      (row.status !== "active" && row.status !== "archived") ||
-      typeof row.ownerActorId !== "string" || typeof row.governanceRevision !== "number" ||
-      typeof row.archiveGeneration !== "number") {
-    throw new SnapshotBuildError("storage_unavailable", "Snapshot governance is corrupt");
-  }
-  return { kind: "governance", value: {
-    roomId: row.id,
-    projectId: row.id,
-    lifecycle: row.status,
-    governanceRevision: row.governanceRevision,
-    ownerActorId: row.ownerActorId,
-    archiveGeneration: row.archiveGeneration,
-    ...(row.status === "archived" && typeof row.archivedAt === "string"
-      ? { archivedAt: row.archivedAt }
-      : {}),
-  }};
-}
-
 function humanReadRecord(roomId: string, row: Record<string, unknown>): RoomRepairRecord {
   if (typeof row.actorId !== "string" || typeof row.messageId !== "string" ||
       typeof row.readAt !== "string") {
@@ -936,12 +918,7 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
     mapRow: roomMetadataRecord,
     stableKey: (record: RoomRepairRecord) => String(record.kind === "room" ? record.value.id : ""),
   },
-  {
-    descriptorId: "dao.repair.governance.v1", descriptorVersion: 1, kind: "governance", order: 1,
-    readKeysetPage: singleRoomMetadataRow,
-    mapRow: governanceRecord,
-    stableKey: (record: RoomRepairRecord) => String(record.kind === "governance" ? record.value.roomId : ""),
-  },
+  lifecycleRepairSegmentDescriptor,
   {
     descriptorId: "dao.repair.membership.v1", descriptorVersion: 1, kind: "membership", order: 2,
     readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
