@@ -3618,6 +3618,72 @@ describe("authenticated message WebSocket service", () => {
     });
   });
 
+  it("fails closed when Message Authority vNext is not installed", async () => {
+    const fixture = await createFixture();
+    fixtures.push(fixture);
+    const client = await fixture.connect();
+    const frames = [
+      {
+        type: "message.send.v2",
+        requestId: "message-v2-unavailable",
+        message: {
+          messageId: "message-v2-1",
+          roomId,
+          body: "hello",
+          mentionedTargets: [],
+          attachments: [],
+        },
+      },
+      {
+        type: "message.revise",
+        requestId: "message-revise-unavailable",
+        roomId,
+        messageId: "message-v2-1",
+        expectedRevision: 1,
+        body: "revised",
+      },
+      {
+        type: "message.recall",
+        requestId: "message-recall-unavailable",
+        roomId,
+        messageId: "message-v2-1",
+        expectedRevision: 1,
+      },
+      {
+        type: "room.history.v2",
+        requestId: "message-history-unavailable",
+        roomId,
+        limit: 25,
+      },
+      {
+        type: "message.revisions.query",
+        requestId: "message-revisions-unavailable",
+        roomId,
+        messageId: "message-v2-1",
+        limit: 25,
+      },
+    ] as const;
+
+    client.send(frames[0]);
+    await expect(client.waitForError("unauthenticated", frames[0].requestId))
+      .resolves.toMatchObject({ frame: { status: 401 } });
+
+    await client.login(humans[0], "message-authority-login");
+    for (const frame of frames) {
+      client.send(frame);
+      await expect(client.waitForError("dependency_unavailable", frame.requestId))
+        .resolves.toMatchObject({
+          frame: {
+            type: "error",
+            status: 503,
+            code: "dependency_unavailable",
+            message: "dependency_unavailable",
+            requestId: frame.requestId,
+          },
+        });
+    }
+  });
+
   it("closes an inbound frame larger than 64 KiB", async () => {
     const fixture = await createFixture();
     fixtures.push(fixture);

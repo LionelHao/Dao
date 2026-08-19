@@ -998,6 +998,11 @@ function isCorrelatedRecoveryResponse(
       | "auth.sessions.list"
       | "auth.session.revoke"
       | "message.send"
+      | "message.send.v2"
+      | "message.revise"
+      | "message.recall"
+      | "room.history.v2"
+      | "message.revisions.query"
       | "room.history"
       | "room.subscribe"
       | "room.subscribe.v2"
@@ -1093,6 +1098,11 @@ async function handleRecoveryFrame(
       | "auth.sessions.list"
       | "auth.session.revoke"
       | "message.send"
+      | "message.send.v2"
+      | "message.revise"
+      | "message.recall"
+      | "room.history.v2"
+      | "message.revisions.query"
       | "room.history"
       | "room.subscribe"
       | "room.subscribe.v2"
@@ -1888,6 +1898,23 @@ async function handleFrame(
     case "auth.session.revoke":
       await handleTargetedRevoke(socket, frame, options, context);
       return;
+    case "message.send.v2":
+    case "message.revise":
+    case "message.recall":
+    case "room.history.v2":
+    case "message.revisions.query": {
+      const session = await requireSession(socket, frame.requestId, options, context);
+      if (session === undefined) {
+        return;
+      }
+      sendFrame(socket, errorFrame(
+        503,
+        "dependency_unavailable",
+        "dependency_unavailable",
+        frame.requestId,
+      ));
+      return;
+    }
     case "message.send": {
       const principal = await requirePrincipal(socket, frame.requestId, options, context);
       if (principal === undefined) {
