@@ -3722,6 +3722,13 @@ describe("authenticated message WebSocket service", () => {
     const readMessageHistory = vi.fn(async () => ({
       messages: [acceptedMessage],
       hasMore: false,
+      lifecycle: "active" as const,
+      actors: [
+        { actorId: "human-1", kind: "human" as const, displayName: "Sam",
+          secondaryLabel: "Owner" },
+        { actorId: "agent-1", kind: "agent" as const, displayName: "Sam",
+          secondaryLabel: "On-mention Agent" },
+      ],
     }));
     const readMessageRevisions = vi.fn(async () => ({
       revisions: [acceptedMessage.currentRevision],
@@ -3786,7 +3793,12 @@ describe("authenticated message WebSocket service", () => {
           frame.requestId === "message-v2-history",
         "message v2 history",
       )).resolves.toMatchObject({ frame: {
-        roomId, messages: [acceptedMessage], hasMore: false,
+        roomId, messages: [acceptedMessage], hasMore: false, lifecycle: "active",
+        actors: [
+          { actorId: "human-1", kind: "human", displayName: "Sam", secondaryLabel: "Owner" },
+          { actorId: "agent-1", kind: "agent", displayName: "Sam",
+            secondaryLabel: "On-mention Agent" },
+        ],
       } });
 
       client.send({

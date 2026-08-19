@@ -248,6 +248,26 @@ function seedMixedRoomRecords(databasePath: string, roomId: string): Record<stri
        VALUES (?, ?, 'agent-a', ?, 'running', ?, NULL, NULL, 'human-a', 'x',
          'tool_call', 'not_started', ?, ?)`,
     );
+    const insertInvocationIntent = database.prepare(
+      `INSERT INTO agent_invocation_intents (
+         id, room_id, source_message_id, target_agent_id, requester_actor_id,
+         intent_kind, execution_id, created_at, source_revision, lineage_id,
+         turn_id, origin_kind, status, claimed_at
+       ) VALUES (?, ?, ?, 'agent-a', 'human-a', 'direct_mention', ?, ?, 1, ?,
+                 'legacy', 'legacy_runtime', 'claimed', ?)`,
+    );
+    const insertExecutionAttempt = database.prepare(
+      `INSERT INTO agent_execution_attempts (
+         execution_id, attempt_seq, retry_cycle, retry_ordinal, status,
+         action_category, started_at, recovery_cursor
+       ) VALUES (?, 1, 1, 1, 'running', 'tool_call', ?, 0)`,
+    );
+    const insertExecutionIntentLink = database.prepare(
+      `INSERT INTO agent_execution_intent_links (
+         intent_id, execution_id, execution_ordinal, retry_of_execution_id,
+         source_revision, linked_at
+       ) VALUES (?, ?, 1, NULL, 1, ?)`,
+    );
     const insertCalibration = database.prepare(
       `INSERT INTO calibration_signals (id, room_id, agent_id, judgment_id, signal,
          created_at, source_message_id, actor_id)
@@ -288,7 +308,7 @@ function seedMixedRoomRecords(databasePath: string, roomId: string): Record<stri
         const suffix = index.toString(36);
         const message = { id: `m${suffix}`, roomId,
           authorId: "human-a", authorKind: "human" as const,
-          body: `m${suffix}`, sentAt: "t" };
+          body: `m${suffix}`, sentAt: "2026-08-12T10:00:00.000Z" };
         if (!isMessage(message)) throw new TypeError("Mixed message fixture is not closed");
         insertMessage(message);
       }
@@ -324,6 +344,18 @@ function seedMixedRoomRecords(databasePath: string, roomId: string): Record<stri
           execution.startedAt,
           execution.startedAt,
         );
+        const invocationIntentId = `i${suffix}`;
+        insertInvocationIntent.run(
+          invocationIntentId,
+          roomId,
+          messageId,
+          execution.id,
+          execution.startedAt,
+          invocationIntentId,
+          execution.startedAt,
+        );
+        insertExecutionAttempt.run(execution.id, execution.startedAt);
+        insertExecutionIntentLink.run(invocationIntentId, execution.id, execution.startedAt);
       }
       for (let index = 0; index < 999; index += 1) {
         const suffix = index.toString(36);
@@ -356,7 +388,7 @@ function seedMixedRoomRecords(databasePath: string, roomId: string): Record<stri
     const mixedCounts = {
       room: 1,
       membership: count("room_memberships"),
-      message: count("messages"),
+      "timeline-message": count("messages"),
       "human-read": count("human_read_receipts"),
       "agent-judgement": count("agent_judgments"),
       "open-item": count("open_items"),

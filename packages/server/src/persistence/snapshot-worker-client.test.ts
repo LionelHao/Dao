@@ -474,6 +474,26 @@ describe("durable materialized snapshot worker", () => {
       id: "message-human", roomId: "room-mixed", authorId: context.principal.actorId,
       authorKind: "human", body: "question", sentAt: "2026-08-11T00:00:02.000Z",
     });
+    insertLegacyMessageAuthorityRecord(database, {
+      id: "message-recalled", roomId: "room-mixed", authorId: context.principal.actorId,
+      authorKind: "human", body: "RECALLED-SNAPSHOT-RAW-SENTINEL",
+      sentAt: "2026-08-11T00:00:02.500Z",
+    });
+    database.prepare(
+      `INSERT INTO message_recall_fences (
+         fence_id, room_id, source_message_id, source_revision, scope_kind,
+         invocation_intent_id, execution_id, reason, created_at
+       ) VALUES (
+         'fence-message-recalled', 'room-mixed', 'message-recalled', 1, 'message',
+         NULL, NULL, 'message_recalled', '2026-08-11T00:00:03.500Z'
+       )`,
+    ).run();
+    database.prepare(
+      `UPDATE message_envelopes
+       SET lifecycle = 'recalled', recalled_at = '2026-08-11T00:00:03.500Z',
+           recalled_by_actor_id = ?
+       WHERE message_id = 'message-recalled'`,
+    ).run(context.principal.actorId);
     database.prepare(
       `INSERT INTO human_read_receipts (room_id, actor_id, message_id, read_at)
        VALUES ('room-mixed', ?, 'message-agent', '2026-08-11T00:00:04.000Z')`,
@@ -538,10 +558,25 @@ describe("durable materialized snapshot worker", () => {
     if ("kind" in page && page.kind === "fallback") throw new Error("unexpected fallback");
     expect(page.hasMore).toBe(false);
     expect(page.records.map((record) => record.kind)).toEqual([
-      "room", "governance", "membership", "membership", "message", "message", "human-read",
-      "agent-judgement", "open-item", "open-item-agent-failure", "light-task",
-      "agent-execution", "calibration",
+      "room", "governance", "membership", "membership", "timeline-message",
+      "timeline-message", "timeline-message", "human-read", "agent-judgement", "open-item",
+      "open-item-agent-failure", "light-task", "agent-execution", "calibration",
     ]);
+    const timelineMessages = page.records.filter((record) =>
+      record.kind === "timeline-message").map((record) => record.value);
+    expect(timelineMessages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "message-human", lifecycle: "active",
+        currentRevision: expect.objectContaining({ body: "question" }) }),
+      expect.objectContaining({ id: "message-agent", authorKind: "agent",
+        finalBody: "agent answer" }),
+      {
+        id: "message-recalled", roomId: "room-mixed",
+        authorId: context.principal.actorId, authorKind: "human",
+        createdAt: "2026-08-11T00:00:02.500Z", lifecycle: "recalled",
+        recalledAt: "2026-08-11T00:00:03.500Z", revisionCount: 1,
+      },
+    ]));
+    expect(JSON.stringify(page)).not.toContain("RECALLED-SNAPSHOT-RAW-SENTINEL");
     expect(page.records.find((record) => record.kind === "light-task"))
       .toMatchObject({ kind: "light-task", value: {
         id: "light-task-a", status: "todo", claimant: null, verifierRole: "owner",
@@ -651,7 +686,7 @@ describe("durable materialized snapshot worker", () => {
       rooms: [{ roomId: "room-bytes", messageCount: 3, body: () => "界".repeat(120) }],
     });
     const context = fixture.contexts[0]!;
-    const maxPageBytes = 1_100;
+    const maxPageBytes = 2_000;
     const client = await createSnapshotWorkerClient({
       authorityPath: fixture.authorityPath, cachePath: fixture.cachePath,
       revalidate: async () => undefined, clock: () => 2_000,
@@ -1273,7 +1308,7 @@ describe("durable materialized snapshot worker", () => {
     }
     expect(records).toHaveLength(10_010);
     expect(new Set(records.map((record) => record.kind))).toEqual(new Set([
-      "room", "governance", "membership", "message", "human-read", "agent-judgement",
+      "room", "governance", "membership", "timeline-message", "human-read", "agent-judgement",
       "open-item", "light-task", "agent-execution", "calibration",
     ]));
     expect(page0.snapshotChecksum).toBe(createHash("sha256")
@@ -1346,7 +1381,7 @@ describe("durable materialized snapshot worker", () => {
     inspection.close();
     await client.close();
     await authority.close();
-  });
+  }, 60_000);
 
   it("replays exact idempotency before the barrier and reports conflicts as 409", async () => {
     const fixture = await createDatabaseFixture({
@@ -1471,7 +1506,7 @@ describe("durable materialized snapshot worker", () => {
       }
       expect(records).toHaveLength(10_010);
       expect(new Set(records.map((record) => record.kind))).toEqual(new Set([
-        "room", "governance", "membership", "message", "human-read", "agent-judgement",
+        "room", "governance", "membership", "timeline-message", "human-read", "agent-judgement",
         "open-item", "light-task", "agent-execution", "calibration",
       ]));
       expect(page0.snapshotChecksum).toBe(createHash("sha256")

@@ -19,6 +19,8 @@ import type {
 } from "@native-im/core";
 import { lifecycleRepairSegmentDescriptor } from
   "../room-governance/lifecycle-repair-descriptor.js";
+import { readOperationalMessageRepairPage } from
+  "../message-authority/sqlite-operational-message-projection.js";
 import type {
   AuthenticatedSessionContext,
   MaterializedSnapshotManifest,
@@ -531,17 +533,6 @@ function membershipRecord(row: Record<string, unknown>): RoomRepairRecord {
   throw new SnapshotBuildError("storage_unavailable", "Snapshot membership is corrupt");
 }
 
-function messageRecord(row: Record<string, unknown>): RoomRepairRecord {
-  if (typeof row.id !== "string" || typeof row.roomId !== "string" ||
-      typeof row.authorId !== "string" ||
-      (row.authorKind !== "human" && row.authorKind !== "agent") ||
-      typeof row.body !== "string" || typeof row.sentAt !== "string") {
-    throw new SnapshotBuildError("storage_unavailable", "Snapshot message is corrupt");
-  }
-  return { kind: "message", value: { id: row.id, roomId: row.roomId,
-    authorId: row.authorId, authorKind: row.authorKind, body: row.body, sentAt: row.sentAt }};
-}
-
 function routeJobRecord(row: Record<string, unknown>): RoomRepairRecord {
   const value = {
     id: row.id,
@@ -641,7 +632,7 @@ const ROOM_REPAIR_KINDS = Object.freeze([
   "room",
   "governance",
   "membership",
-  "message",
+  "timeline-message",
   "human-read",
   "agent-judgement",
   "open-item",
@@ -756,12 +747,17 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
       String(record.kind === "membership" ? record.value.actorId : ""),
   },
   {
-    descriptorId: "dao.repair.message.v1", descriptorVersion: 1, kind: "message", order: 3,
-    readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
-      `SELECT id, room_id AS roomId, author_id AS authorId, author_kind AS authorKind,
-              body, sent_at AS sentAt FROM messages WHERE room_id = ?`, "id"),
-    mapRow: (row: unknown) => messageRecord(row as Record<string, unknown>),
-    stableKey: (record: RoomRepairRecord) => String(record.kind === "message" ? record.value.id : ""),
+    descriptorId: "dao.repair.timeline-message.v1", descriptorVersion: 1,
+    kind: "timeline-message", order: 3,
+    readKeysetPage: (input: RepairKeysetPageInput) => readOperationalMessageRepairPage(
+      input.database,
+      { roomId: input.roomId, afterMessageId: input.afterKey, limit: input.limit },
+    ),
+    mapRow: (row: unknown) => row as Extract<RoomRepairRecord, {
+      readonly kind: "timeline-message";
+    }>,
+    stableKey: (record: RoomRepairRecord) =>
+      String(record.kind === "timeline-message" ? record.value.id : ""),
   },
   {
     descriptorId: "dao.repair.human-read.v1", descriptorVersion: 1, kind: "human-read", order: 4,

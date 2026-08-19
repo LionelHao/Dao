@@ -311,6 +311,69 @@ describe("bounded Agent runtime scheduler", () => {
       .toEqual(["cancelled", "cancelled"]);
   });
 
+  it("applies only exact source-scoped message recall tuples after durable cancellation", async () => {
+    const runtimeAuthority = authority();
+    const ordering: string[] = [];
+    let started!: () => void;
+    const sawStart = new Promise<void>((resolve) => { started = resolve; });
+    const complete = vi.spyOn(runtimeAuthority, "complete");
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      provider: provider(async function* (_input, signal) {
+        started();
+        await new Promise<void>((resolve) => signal.addEventListener("abort", () => {
+          ordering.push("source-abort-propagated");
+          resolve();
+        }, { once: true }));
+        yield { type: "response_started", sequence: 1 };
+      }),
+      modelId: "fake-model",
+      buildProviderInput: providerInput,
+      limits: { maxActive: 1, maxQueuedPerRoom: 2, maxPartialBytes: 1_024 },
+    });
+    const activeSourceMessageId = "message-source-active";
+    const queuedSourceMessageId = "message-source-queued";
+    const active = await runtime.invoke(context, intent("room-a", activeSourceMessageId));
+    const queued = await runtime.invoke(
+      { ...context, requestId: "source-recall-r2", idempotencyKey: "source-recall-k2" },
+      intent("room-a", queuedSourceMessageId),
+    );
+    await sawStart;
+
+    ordering.push("source-cancel-committed");
+    runtime.applyCommittedMessageRecall({
+      sourceMessageId: activeSourceMessageId,
+      cancellations: [{
+        sourceMessageId: activeSourceMessageId,
+        sourceRevision: 1,
+        invocationIntentId: "intent-active",
+        executionId: active.execution.id,
+        attemptSeq: 1,
+        cancellationReason: "message_recalled",
+        sideEffectState: "none",
+      }],
+    });
+    await vi.waitFor(() => {
+      expect(ordering).toEqual(["source-cancel-committed", "source-abort-propagated"]);
+    });
+    expect(complete).not.toHaveBeenCalled();
+    expect(runtimeAuthority.executions.get(queued.execution.id)?.status)
+      .toMatch(/queued|running/);
+    expect(() => runtime.applyCommittedMessageRecall({
+      sourceMessageId: queuedSourceMessageId,
+      cancellations: [{
+        sourceMessageId: queuedSourceMessageId,
+        sourceRevision: 1,
+        invocationIntentId: "intent-queued",
+        executionId: queued.execution.id,
+        attemptSeq: 2,
+        cancellationReason: "message_recalled",
+        sideEffectState: "none",
+      }],
+    })).toThrow(/tuple/i);
+    await runtime.close();
+  });
+
   it("executes a closed provider tool plan and continues with only bounded tool output", async () => {
     const runtimeAuthority = authority();
     runtimeAuthority.prepareTool = vi.fn(async (executionId, _attempt, tool) => {

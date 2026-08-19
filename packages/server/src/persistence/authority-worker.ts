@@ -26,7 +26,11 @@ import {
   AuthorityRollbackFatalError,
   appendCanonicalIdentityEvent,
   executeAgentDatabaseCommand,
+  commitAgentMessageDatabaseCommand,
   executeHumanDatabaseCommand,
+  submitHumanMessageDatabaseCommand,
+  reviseHumanMessageDatabaseCommand,
+  recallHumanMessageDatabaseCommand,
   executeRuntimeAuthorityOperation,
   executeRouteAuthorityOperation,
   executeBallAuthorityOperation,
@@ -41,6 +45,8 @@ import {
   markRoomCacheInvalidationFailedDatabaseCommand,
   readActorDatabaseQuery,
   readHistoryDatabaseQuery,
+  readMessageHistoryDatabaseQuery,
+  readMessageRevisionsDatabaseQuery,
   readRoomAuditDatabaseQuery,
   readRoomDatabaseQuery,
   readRoomGovernanceDatabaseQuery,
@@ -1880,6 +1886,129 @@ function executeAgent(request: AuthorityWorkerRequest): void {
   }
 }
 
+function respondMessageAuthorityFailure(
+  requestId: string,
+  error: unknown,
+  fallbackMessage: string,
+): void {
+  if (handleRollbackFatal(requestId, error)) return;
+  if (error instanceof AuthorityDatabaseError) {
+    respondWithError(requestId, error.code, error.message);
+    return;
+  }
+  if (error instanceof FallbackRepairError) {
+    respondWithError(requestId, error.code, error.message);
+    return;
+  }
+  respondWithError(requestId, "storage_unavailable", fallbackMessage);
+}
+
+function requireNoMessageRepairBarrier(roomId: string, now: number): void {
+  if (repairs.blockingLeases({ roomIds: [roomId], catalogPrincipalIds: [] }, now).length > 0) {
+    throw new FallbackRepairError("repair_barrier_active");
+  }
+}
+
+function submitHumanMessage(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.message-submit") throw new TypeError("wrong message submit");
+  try {
+    const receipt = submitHumanMessageDatabaseCommand(
+      requireAuthorityTransactionDatabase(),
+      {
+        context: request.context,
+        message: request.message,
+        now: request.now,
+        beforeApply: () => requireNoMessageRepairBarrier(request.message.roomId, request.now),
+      },
+    );
+    respond({ type: "authority.message-submitted", requestId: request.requestId, receipt });
+  } catch (error: unknown) {
+    respondMessageAuthorityFailure(request.requestId, error, "Message submit failed");
+  }
+}
+
+function reviseHumanMessage(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.message-revise") throw new TypeError("wrong message revision");
+  try {
+    const receipt = reviseHumanMessageDatabaseCommand(
+      requireAuthorityTransactionDatabase(),
+      {
+        context: request.context,
+        command: request.command,
+        now: request.now,
+        beforeApply: () => requireNoMessageRepairBarrier(request.command.roomId, request.now),
+      },
+    );
+    respond({ type: "authority.message-revised", requestId: request.requestId, receipt });
+  } catch (error: unknown) {
+    respondMessageAuthorityFailure(request.requestId, error, "Message revision failed");
+  }
+}
+
+function recallHumanMessage(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.message-recall") throw new TypeError("wrong message recall");
+  try {
+    const receipt = recallHumanMessageDatabaseCommand(
+      requireAuthorityTransactionDatabase(),
+      {
+        context: request.context,
+        command: request.command,
+        now: request.now,
+        beforeApply: () => requireNoMessageRepairBarrier(request.command.roomId, request.now),
+      },
+    );
+    respond({ type: "authority.message-recalled", requestId: request.requestId, receipt });
+  } catch (error: unknown) {
+    respondMessageAuthorityFailure(request.requestId, error, "Message recall failed");
+  }
+}
+
+function commitAgentMessage(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.agent-message-commit") {
+    throw new TypeError("wrong Agent message commit");
+  }
+  try {
+    const receipt = commitAgentMessageDatabaseCommand(
+      requireAuthorityTransactionDatabase(),
+      {
+        context: request.context,
+        command: request.command,
+        now: request.now,
+        beforeApply: () => requireNoMessageRepairBarrier(request.command.roomId, request.now),
+      },
+    );
+    respond({ type: "authority.agent-message-committed", requestId: request.requestId, receipt });
+  } catch (error: unknown) {
+    respondMessageAuthorityFailure(request.requestId, error, "Agent message commit failed");
+  }
+}
+
+function readMessageHistory(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.message-history") throw new TypeError("wrong message history");
+  try {
+    const page = readMessageHistoryDatabaseQuery(
+      requireAuthorityTransactionDatabase(), request.context, request.query, request.now,
+    );
+    respond({ type: "authority.message-history", requestId: request.requestId, page });
+  } catch (error: unknown) {
+    respondMessageAuthorityFailure(request.requestId, error, "Message history failed");
+  }
+}
+
+function readMessageRevisions(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.message-revisions") {
+    throw new TypeError("wrong message revisions");
+  }
+  try {
+    const page = readMessageRevisionsDatabaseQuery(
+      requireAuthorityTransactionDatabase(), request.context, request.query, request.now,
+    );
+    respond({ type: "authority.message-revisions", requestId: request.requestId, page });
+  } catch (error: unknown) {
+    respondMessageAuthorityFailure(request.requestId, error, "Message revisions failed");
+  }
+}
+
 function executeRuntime(request: AuthorityWorkerRequest): void {
   if (request.type !== "authority.runtime") {
     throw new TypeError("executeRuntime received the wrong request type");
@@ -2416,6 +2545,24 @@ async function dispatch(value: unknown): Promise<void> {
       return;
     case "authority.execute-agent":
       executeAgent(value);
+      return;
+    case "authority.message-submit":
+      submitHumanMessage(value);
+      return;
+    case "authority.message-revise":
+      reviseHumanMessage(value);
+      return;
+    case "authority.message-recall":
+      recallHumanMessage(value);
+      return;
+    case "authority.agent-message-commit":
+      commitAgentMessage(value);
+      return;
+    case "authority.message-history":
+      readMessageHistory(value);
+      return;
+    case "authority.message-revisions":
+      readMessageRevisions(value);
       return;
     case "authority.runtime":
       executeRuntime(value);

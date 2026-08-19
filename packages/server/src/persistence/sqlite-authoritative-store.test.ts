@@ -13,6 +13,8 @@ import {
   type LoginCredentials,
 } from "../auth.js";
 import { createAesGcmInvitationSecretProtector } from "../invitation-secret-protector.js";
+import { mintInternalAgentMessageCommitContext } from
+  "../message-authority/internal-message-capability.js";
 import { createSqliteAuthoritativeStore } from "./sqlite-authoritative-store.js";
 import {
   mintInternalAgentCommandContext,
@@ -41,6 +43,71 @@ function tokenSequence(...tokens: readonly string[]): () => string {
 
 function tokenHash(token: string): string {
   return createHash("sha256").update(token).digest("base64url");
+}
+
+function claimMessageAuthorityExecution(
+  databasePath: string,
+  input: {
+    readonly intentId: string;
+    readonly executionId: string;
+    readonly roomId: string;
+    readonly sourceMessageId: string;
+    readonly agentId: string;
+    readonly requesterActorId: string;
+  },
+): void {
+  const database = new DatabaseSync(databasePath);
+  try {
+    database.exec("PRAGMA foreign_keys = ON; BEGIN IMMEDIATE");
+    const timestamp = "2026-08-19T01:05:00.000Z";
+    database.prepare(
+      `UPDATE agent_invocation_intents
+       SET status = 'claimed', claimed_at = ?
+       WHERE id = ? AND status = 'pending'`,
+    ).run(timestamp, input.intentId);
+    database.prepare(
+      `INSERT INTO agent_executions (
+         id, room_id, agent_id, trigger_message_id, status, started_at,
+         completed_at, result_json, requester_actor_id, tool_name,
+         action_category, tool_dispatch_phase, current_attempt_seq,
+         retry_cycle, retry_ordinal, recovery_cursor, queued_at, updated_at,
+         room_archive_generation
+       ) VALUES (?, ?, ?, ?, 'running', ?, NULL, NULL, ?, 'message-authority',
+                 'model_generation', NULL, 1, 1, 1, 0, ?, ?, 0)`,
+    ).run(
+      input.executionId,
+      input.roomId,
+      input.agentId,
+      input.sourceMessageId,
+      timestamp,
+      input.requesterActorId,
+      timestamp,
+      timestamp,
+    );
+    database.prepare(
+      `INSERT INTO agent_execution_attempts (
+         execution_id, attempt_seq, retry_cycle, retry_ordinal, status,
+         action_category, started_at, finished_at, error_code,
+         next_retry_at, recovery_cursor
+       ) VALUES (?, 1, 1, 1, 'running', 'model_generation', ?, NULL, NULL, NULL, 0)`,
+    ).run(input.executionId, timestamp);
+    database.prepare(
+      `INSERT INTO agent_execution_intent_links (
+         intent_id, execution_id, execution_ordinal, retry_of_execution_id,
+         source_revision, linked_at
+       ) VALUES (?, ?, 1, NULL, 1, ?)`,
+    ).run(input.intentId, input.executionId, timestamp);
+    database.exec("COMMIT");
+  } catch (error: unknown) {
+    try {
+      database.exec("ROLLBACK");
+    } catch {
+      // The original database failure is authoritative for this test helper.
+    }
+    throw error;
+  } finally {
+    database.close();
+  }
 }
 
 function identitySessionMutationSnapshot(databasePath: string): unknown {
@@ -4332,5 +4399,603 @@ describe("SQLite authoritative sessions", () => {
         now: 1_000,
       }),
     ).toBe(false);
+  });
+
+  it("fails closed without writes when an attachment validator is unavailable", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-message-attachment-gate-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const fixture = await createCommandMatrixFixture(databasePath);
+    const messageId = "message-v2-attachment-rejected";
+
+    await expect(fixture.store.submitHumanMessage(
+      {
+        ...fixture.contexts.owner,
+        requestId: "message-v2-attachment-rejected",
+        idempotencyKey: messageId,
+      },
+      {
+        messageId,
+        roomId: fixture.contexts.roomId,
+        body: "attachment is not yet authoritative",
+        mentionedTargets: [],
+        attachments: [{ attachmentId: "attachment-unvalidated" }],
+      },
+    )).rejects.toMatchObject({ status: 400, code: "invalid_parameters" });
+
+    await fixture.client.close();
+    const database = new DatabaseSync(databasePath, { readOnly: true });
+    expect(database.prepare(
+      `SELECT
+         (SELECT COUNT(*) FROM messages WHERE id = ?) AS messages,
+         (SELECT COUNT(*) FROM message_envelopes WHERE message_id = ?) AS envelopes,
+         (SELECT COUNT(*) FROM message_attachment_links WHERE message_id = ?) AS attachments`,
+    ).get(messageId, messageId, messageId)).toEqual({
+      messages: 0,
+      envelopes: 0,
+      attachments: 0,
+    });
+    database.close();
+  });
+
+  it("atomically submits structured targets, replays ACK loss, revises, recalls, and projects a tombstone", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-message-authority-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const fixture = await createCommandMatrixFixture(databasePath);
+    const ownerSession = {
+      sessionId: fixture.contexts.owner.sessionId,
+      sessionFamilyId: fixture.contexts.owner.sessionFamilyId,
+      principal: fixture.contexts.owner.principal,
+    };
+    const message = {
+      messageId: "message-v2-structured",
+      roomId: fixture.contexts.roomId,
+      body: "@Chen @Reviewer @Alternate hello",
+      mentionedTargets: [
+        {
+          id: "target-human",
+          kind: "human-request",
+          targetActorId: "human-chen",
+          range: { startUtf16: 0, endUtf16: 5 },
+        },
+        {
+          id: "target-agent",
+          kind: "agent-invocation",
+          targetActorId: "agent-review",
+          range: { startUtf16: 6, endUtf16: 15 },
+        },
+        {
+          id: "target-nonmember",
+          kind: "human-request",
+          targetActorId: "human-alternate",
+          range: { startUtf16: 16, endUtf16: 26 },
+        },
+      ],
+      replyToMessageId: "matrix-human-source",
+      attachments: [],
+    } as const;
+
+    expect(isAuthorityWorkerRequest({
+      type: "authority.message-submit",
+      requestId: "worker-message-submit",
+      context: { ...fixture.contexts.owner, requestId: "message-v2-first", idempotencyKey: "ignored-first" },
+      message,
+      now: 5_000,
+    })).toBe(true);
+
+    const accepted = await fixture.store.submitHumanMessage(
+      { ...fixture.contexts.owner, requestId: "message-v2-first", idempotencyKey: "ignored-first" },
+      message,
+    );
+    expect(accepted).toMatchObject({
+      messageId: message.messageId,
+      persistedAt: "1970-01-01T00:00:05.000Z",
+      eventId: expect.stringMatching(/\S/),
+      replayed: false,
+      targetOutcomes: [
+        {
+          targetId: "target-human", targetActorId: "human-chen", kind: "human-request",
+          status: "request-created", requestIntentId: expect.stringMatching(/\S/),
+        },
+        {
+          targetId: "target-agent", targetActorId: "agent-review", kind: "agent-invocation",
+          status: "invocation-intent-created", invocationIntentId: expect.stringMatching(/\S/),
+        },
+        {
+          targetId: "target-nonmember", targetActorId: "human-alternate", kind: "human-request",
+          status: "rejected", code: "target_not_member",
+        },
+      ],
+    });
+    const ackLossRepair = await fixture.client.acquireStreamingRepair(
+      ownerSession,
+      { kind: "room", roomId: message.roomId },
+      5_000,
+    );
+    await expect(fixture.store.submitHumanMessage(
+      { ...fixture.contexts.owner, requestId: "message-v2-ack-loss", idempotencyKey: "changed" },
+      message,
+    )).resolves.toEqual({ ...accepted, replayed: true });
+    await fixture.client.releaseStreamingRepair(
+      ownerSession,
+      ackLossRepair.snapshotId,
+      5_000,
+    );
+    await expect(fixture.store.submitHumanMessage(
+      { ...fixture.contexts.owner, requestId: "message-v2-conflict", idempotencyKey: "changed-again" },
+      { ...message, body: `${message.body}!` },
+    )).rejects.toMatchObject({ status: 409, code: "idempotency_conflict" });
+
+    const revised = await fixture.store.reviseHumanMessage(
+      { ...fixture.contexts.owner, requestId: "revision-first", idempotencyKey: "revision-v2-1" },
+      {
+        roomId: message.roomId, messageId: message.messageId, expectedRevision: 1,
+        body: "@Chen @Reviewer @Alternate revised",
+      },
+    );
+    expect(revised).toMatchObject({ messageId: message.messageId, revision: 2, replayed: false });
+    await expect(fixture.store.reviseHumanMessage(
+      {
+        ...fixture.contexts.owner,
+        requestId: "revision-ack-loss",
+        idempotencyKey: "changed-revision-key",
+      },
+      {
+        roomId: message.roomId,
+        messageId: message.messageId,
+        expectedRevision: 1,
+        body: "@Chen @Reviewer @Alternate revised",
+      },
+    )).resolves.toEqual({ ...revised, replayed: true });
+    await expect(fixture.store.readHistory(ownerSession, message.roomId)).rejects.toMatchObject({
+      status: 410,
+      code: "protocol_upgrade_required",
+    });
+    await expect(fixture.store.reviseHumanMessage(
+      { ...fixture.contexts.owner, requestId: "revision-stale", idempotencyKey: "revision-v2-stale" },
+      { roomId: message.roomId, messageId: message.messageId, expectedRevision: 1, body: "stale" },
+    )).rejects.toMatchObject({ status: 409, code: "idempotency_conflict" });
+    await expect(fixture.store.reviseHumanMessage(
+      {
+        ...fixture.contexts.owner,
+        requestId: "revision-version-conflict",
+        idempotencyKey: "revision-v2-version-conflict",
+      },
+      { roomId: message.roomId, messageId: message.messageId, expectedRevision: 7, body: "stale" },
+    )).rejects.toMatchObject({ status: 409, code: "message_version_conflict" });
+    await expect(fixture.store.reviseHumanMessage(
+      {
+        ...fixture.contexts.owner,
+        requestId: "revision-invalid-range",
+        idempotencyKey: "revision-v2-invalid-range",
+      },
+      { roomId: message.roomId, messageId: message.messageId, expectedRevision: 2, body: "x" },
+    )).rejects.toMatchObject({ status: 400, code: "invalid_parameters" });
+
+    const revisions = await fixture.store.readMessageRevisions(ownerSession, {
+      roomId: message.roomId, messageId: message.messageId,
+    });
+    expect(revisions).toMatchObject({ hasMore: false, revisions: [
+      { messageId: message.messageId, revision: 1, body: message.body },
+      { messageId: message.messageId, revision: 2, body: "@Chen @Reviewer @Alternate revised" },
+    ] });
+
+    const recalled = await fixture.store.recallHumanMessage(
+      { ...fixture.contexts.owner, requestId: "recall-first", idempotencyKey: "recall-v2-2" },
+      { roomId: message.roomId, messageId: message.messageId, expectedRevision: 2 },
+    );
+    expect(recalled).toMatchObject({
+      messageId: message.messageId, revision: 2, replayed: false, abortTargets: [],
+    });
+    await expect(fixture.store.recallHumanMessage(
+      {
+        ...fixture.contexts.owner,
+        requestId: "recall-ack-loss",
+        idempotencyKey: "changed-recall-key",
+      },
+      { roomId: message.roomId, messageId: message.messageId, expectedRevision: 2 },
+    )).resolves.toEqual({ ...recalled, replayed: true });
+    const history = await fixture.store.readMessageHistory(ownerSession, {
+      roomId: message.roomId,
+    });
+    expect(history).toMatchObject({
+      lifecycle: "active",
+      actors: expect.arrayContaining([
+        { actorId: "human-li", kind: "human", displayName: "Lionel", secondaryLabel: "Owner" },
+        { actorId: "human-chen", kind: "human", displayName: "Chen", secondaryLabel: "Member" },
+        { actorId: "agent-review", kind: "agent", displayName: "Reviewer",
+          secondaryLabel: "Active Agent" },
+      ]),
+    });
+    expect(history.actors.some(({ actorId }) => actorId === "human-alternate")).toBe(false);
+    expect(history.messages.find((entry) => entry.id === message.messageId)).toEqual({
+      id: message.messageId,
+      roomId: message.roomId,
+      authorId: "human-li",
+      authorKind: "human",
+      createdAt: accepted.persistedAt,
+      lifecycle: "recalled",
+      recalledAt: recalled.recalledAt,
+      revisionCount: 2,
+    });
+
+    await fixture.client.close();
+    const database = new DatabaseSync(databasePath, { readOnly: true });
+    expect(database.prepare(
+      "SELECT COUNT(*) AS count FROM message_target_outcomes WHERE message_id = ?",
+    ).get(message.messageId)).toEqual({ count: 3 });
+    expect(database.prepare(
+      "SELECT status FROM human_request_intents WHERE source_message_id = ?",
+    ).all(message.messageId)).toEqual([{ status: "cancelled" }]);
+    expect(database.prepare(
+      "SELECT status FROM agent_invocation_intents WHERE source_message_id = ?",
+    ).all(message.messageId)).toEqual([{ status: "cancelled" }]);
+    expect(database.prepare(
+      `SELECT operational_state AS operationalState FROM message_attachment_links
+       WHERE message_id = ?`,
+    ).all(message.messageId)).toEqual([]);
+    expect(database.prepare(
+      `SELECT scope_kind AS scopeKind FROM message_recall_fences
+       WHERE source_message_id = ? ORDER BY scope_kind DESC`,
+    ).all(message.messageId)).toEqual([
+      { scopeKind: "message" },
+      { scopeKind: "invocation-intent" },
+    ]);
+    expect(database.prepare(
+      "SELECT COUNT(*) AS count FROM events WHERE event_type IN ('room.message.accepted', 'room.message.revised', 'room.message.recalled') AND stream_id = ?",
+    ).get(message.roomId)).toEqual({ count: 3 });
+    database.close();
+  });
+
+  it("commits Agent finals and corrections only from current unfenced execution lineage", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-agent-message-authority-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const fixture = await createCommandMatrixFixture(databasePath);
+    await fixture.store.registerActors([{
+      id: "agent-alternate",
+      kind: "agent",
+      displayName: "Alternate Agent",
+      readiness: "ready",
+      toolPermissions: [],
+    }]);
+    const alternateMembership = new DatabaseSync(databasePath);
+    alternateMembership.prepare(
+      `INSERT INTO room_memberships (
+         room_id, actor_id, kind, role, participation, tool_permissions_json,
+         joined_at, configured_at, access_revision
+       ) VALUES (?, 'agent-alternate', 'agent', NULL, 'active', '[]', NULL, ?, 1)`,
+    ).run(fixture.contexts.roomId, "2026-08-19T01:04:00.000Z");
+    alternateMembership.close();
+    const ownerSession = {
+      sessionId: fixture.contexts.owner.sessionId,
+      sessionFamilyId: fixture.contexts.owner.sessionFamilyId,
+      principal: fixture.contexts.owner.principal,
+    };
+
+    const submitAgentSource = async (
+      messageId: string,
+      requestId: string,
+      targetAgentId = "agent-review",
+    ) => {
+      const mention = targetAgentId === "agent-review" ? "@Reviewer" : "@Other";
+      const receipt = await fixture.store.submitHumanMessage(
+        { ...fixture.contexts.owner, requestId, idempotencyKey: messageId },
+        {
+          messageId,
+          roomId: fixture.contexts.roomId,
+          body: `${mention} please answer`,
+          mentionedTargets: [{
+            id: `${messageId}-target`,
+            kind: "agent-invocation",
+            targetActorId: targetAgentId,
+            range: { startUtf16: 0, endUtf16: mention.length },
+          }],
+          attachments: [],
+        },
+      );
+      const outcome = receipt.targetOutcomes[0];
+      if (outcome?.status !== "invocation-intent-created") {
+        throw new Error("Expected an Agent invocation intent");
+      }
+      return outcome.invocationIntentId;
+    };
+
+    const finalSourceId = "message-agent-final-source";
+    const finalIntentId = await submitAgentSource(finalSourceId, "submit-agent-final-source");
+    claimMessageAuthorityExecution(databasePath, {
+      intentId: finalIntentId,
+      executionId: "execution-agent-final",
+      roomId: fixture.contexts.roomId,
+      sourceMessageId: finalSourceId,
+      agentId: "agent-review",
+      requesterActorId: "human-li",
+    });
+    const finalCommand = {
+      messageId: "message-agent-final-v2",
+      roomId: fixture.contexts.roomId,
+      body: "The requested review is complete.",
+    } as const;
+    await expect(fixture.store.commitAgentMessage(
+      mintInternalAgentMessageCommitContext({
+        agentActorId: "agent-review",
+        invocationIntentId: finalIntentId,
+        executionId: "execution-agent-final",
+        attemptSeq: 1,
+        executionGeneration: 2,
+      }),
+      finalCommand,
+    )).rejects.toMatchObject({ status: 409, code: "execution_conflict" });
+
+    const finalContext = mintInternalAgentMessageCommitContext({
+      agentActorId: "agent-review",
+      invocationIntentId: finalIntentId,
+      executionId: "execution-agent-final",
+      attemptSeq: 1,
+      executionGeneration: 1,
+    });
+    const finalReceipt = await fixture.store.commitAgentMessage(finalContext, finalCommand);
+    expect(finalReceipt).toMatchObject({
+      messageId: finalCommand.messageId,
+      replayed: false,
+      message: {
+        id: finalCommand.messageId,
+        authorId: "agent-review",
+        authorKind: "agent",
+        finalBody: finalCommand.body,
+        sourceInvocationIntentId: finalIntentId,
+        sourceExecutionId: "execution-agent-final",
+      },
+    });
+    await expect(fixture.store.commitAgentMessage(finalContext, finalCommand)).resolves.toEqual({
+      ...finalReceipt,
+      replayed: true,
+    });
+    await expect(fixture.store.commitAgentMessage(
+      {
+        kind: "agent-message",
+        agent: { actorId: "agent-review", kind: "agent" },
+        invocationIntentId: finalIntentId,
+        executionId: "execution-agent-final",
+        attemptSeq: 1,
+        executionGeneration: 1,
+      } as never,
+      { ...finalCommand, messageId: "message-agent-forged" },
+    )).rejects.toMatchObject({
+      status: 403,
+      code: "agent_message_capability_forbidden",
+    });
+
+    const alternateSourceId = "message-agent-alternate-source";
+    const alternateIntentId = await submitAgentSource(
+      alternateSourceId,
+      "submit-agent-alternate-source",
+      "agent-alternate",
+    );
+    claimMessageAuthorityExecution(databasePath, {
+      intentId: alternateIntentId,
+      executionId: "execution-agent-alternate",
+      roomId: fixture.contexts.roomId,
+      sourceMessageId: alternateSourceId,
+      agentId: "agent-alternate",
+      requesterActorId: "human-li",
+    });
+    await expect(fixture.store.commitAgentMessage(
+      mintInternalAgentMessageCommitContext({
+        agentActorId: "agent-alternate",
+        invocationIntentId: alternateIntentId,
+        executionId: "execution-agent-alternate",
+        attemptSeq: 1,
+        executionGeneration: 1,
+      }),
+      {
+        messageId: "message-agent-cross-author-correction",
+        roomId: fixture.contexts.roomId,
+        body: "A different Agent cannot correct this final.",
+        correctsMessageId: finalCommand.messageId,
+      },
+    )).rejects.toMatchObject({ status: 409, code: "agent_final_immutable" });
+
+    const correctionSourceId = "message-agent-correction-source";
+    const correctionIntentId = await submitAgentSource(
+      correctionSourceId,
+      "submit-agent-correction-source",
+    );
+    claimMessageAuthorityExecution(databasePath, {
+      intentId: correctionIntentId,
+      executionId: "execution-agent-correction",
+      roomId: fixture.contexts.roomId,
+      sourceMessageId: correctionSourceId,
+      agentId: "agent-review",
+      requesterActorId: "human-li",
+    });
+    const correctionReceipt = await fixture.store.commitAgentMessage(
+      mintInternalAgentMessageCommitContext({
+        agentActorId: "agent-review",
+        invocationIntentId: correctionIntentId,
+        executionId: "execution-agent-correction",
+        attemptSeq: 1,
+        executionGeneration: 1,
+      }),
+      {
+        messageId: "message-agent-correction-v2",
+        roomId: fixture.contexts.roomId,
+        body: "Correction: the review is complete with one caveat.",
+        correctsMessageId: finalCommand.messageId,
+      },
+    );
+    expect(correctionReceipt.message).toMatchObject({
+      correctsMessageId: finalCommand.messageId,
+      authorId: "agent-review",
+    });
+    await expect(
+      fixture.store.readHistory(ownerSession, fixture.contexts.roomId),
+    ).rejects.toMatchObject({ status: 410, code: "protocol_upgrade_required" });
+    const completedSourceRecall = await fixture.store.recallHumanMessage(
+      {
+        ...fixture.contexts.owner,
+        requestId: "recall-completed-agent-source",
+        idempotencyKey: finalSourceId,
+      },
+      {
+        roomId: fixture.contexts.roomId,
+        messageId: finalSourceId,
+        expectedRevision: 1,
+      },
+    );
+    expect(completedSourceRecall.abortTargets).toEqual([]);
+    await expect(fixture.store.readMessageHistory(ownerSession, {
+      roomId: fixture.contexts.roomId,
+    })).resolves.toEqual(expect.objectContaining({
+      messages: expect.arrayContaining([
+        expect.objectContaining({ id: finalSourceId, lifecycle: "recalled" }),
+        expect.objectContaining({ id: finalCommand.messageId, lifecycle: "active" }),
+      ]),
+    }));
+
+    const recalledSourceId = "message-agent-recalled-source";
+    const recalledIntentId = await submitAgentSource(
+      recalledSourceId,
+      "submit-agent-recalled-source",
+    );
+    claimMessageAuthorityExecution(databasePath, {
+      intentId: recalledIntentId,
+      executionId: "execution-agent-recalled",
+      roomId: fixture.contexts.roomId,
+      sourceMessageId: recalledSourceId,
+      agentId: "agent-review",
+      requesterActorId: "human-li",
+    });
+    const recallReceipt = await fixture.store.recallHumanMessage(
+      {
+        ...fixture.contexts.owner,
+        requestId: "recall-agent-source",
+        idempotencyKey: recalledSourceId,
+      },
+      {
+        roomId: fixture.contexts.roomId,
+        messageId: recalledSourceId,
+        expectedRevision: 1,
+      },
+    );
+    expect(recallReceipt.abortTargets).toEqual([{
+      sourceMessageId: recalledSourceId,
+      sourceRevision: 1,
+      invocationIntentId: recalledIntentId,
+      executionId: "execution-agent-recalled",
+      attemptSeq: 1,
+      cancellationReason: "message_recalled",
+      sideEffectState: "none",
+    }]);
+    await expect(fixture.store.commitAgentMessage(
+      mintInternalAgentMessageCommitContext({
+        agentActorId: "agent-review",
+        invocationIntentId: recalledIntentId,
+        executionId: "execution-agent-recalled",
+        attemptSeq: 1,
+        executionGeneration: 1,
+      }),
+      {
+        messageId: "message-agent-after-recall",
+        roomId: fixture.contexts.roomId,
+        body: "This late result must never commit.",
+      },
+    )).rejects.toMatchObject({ status: 409, code: "execution_conflict" });
+
+    await fixture.client.close();
+    const database = new DatabaseSync(databasePath, { readOnly: true });
+    expect(database.prepare(
+      `SELECT message_id AS messageId, execution_id AS executionId
+       FROM agent_message_sources ORDER BY message_id`,
+    ).all()).toEqual([
+      {
+        messageId: "message-agent-correction-v2",
+        executionId: "execution-agent-correction",
+      },
+      { messageId: finalCommand.messageId, executionId: "execution-agent-final" },
+    ]);
+    expect(database.prepare(
+      "SELECT COUNT(*) AS count FROM messages WHERE id = 'message-agent-after-recall'",
+    ).get()).toEqual({ count: 0 });
+    expect(database.prepare(
+      `SELECT status, cancellation_reason AS cancellationReason
+       FROM agent_executions WHERE id = 'execution-agent-recalled'`,
+    ).get()).toEqual({ status: "cancelled", cancellationReason: "message_recalled" });
+    expect(database.prepare(
+      `SELECT scope_kind AS scopeKind FROM message_recall_fences
+       WHERE source_message_id = ? ORDER BY scope_kind`,
+    ).all(recalledSourceId)).toEqual([
+      { scopeKind: "execution" },
+      { scopeKind: "invocation-intent" },
+      { scopeKind: "message" },
+    ]);
+    database.close();
+  });
+
+  it("requires a protocol upgrade before legacy history can expose a recalled revision-one message", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-recalled-legacy-history-"));
+    temporaryDirectories.push(directory);
+    const fixture = await createCommandMatrixFixture(
+      join(directory, "authority.sqlite"),
+    );
+    const messageId = "message-recalled-revision-one";
+    const ownerSession = {
+      sessionId: fixture.contexts.owner.sessionId,
+      sessionFamilyId: fixture.contexts.owner.sessionFamilyId,
+      principal: fixture.contexts.owner.principal,
+    };
+    const repair = await fixture.client.acquireStreamingRepair(
+      ownerSession,
+      { kind: "room", roomId: fixture.contexts.roomId },
+      5_000,
+    );
+    await expect(fixture.store.submitHumanMessage(
+      {
+        ...fixture.contexts.owner,
+        requestId: "submit-behind-repair",
+        idempotencyKey: messageId,
+      },
+      {
+        messageId,
+        roomId: fixture.contexts.roomId,
+        body: "recall this message",
+        mentionedTargets: [],
+        attachments: [],
+      },
+    )).rejects.toMatchObject({ status: 503, code: "repair_barrier_active" });
+    await fixture.client.releaseStreamingRepair(
+      ownerSession,
+      repair.snapshotId,
+      5_000,
+    );
+    await fixture.store.submitHumanMessage(
+      {
+        ...fixture.contexts.owner,
+        requestId: "submit-recalled-revision-one",
+        idempotencyKey: messageId,
+      },
+      {
+        messageId,
+        roomId: fixture.contexts.roomId,
+        body: "recall this message",
+        mentionedTargets: [],
+        attachments: [],
+      },
+    );
+    await fixture.store.recallHumanMessage(
+      {
+        ...fixture.contexts.owner,
+        requestId: "recall-revision-one",
+        idempotencyKey: messageId,
+      },
+      { roomId: fixture.contexts.roomId, messageId, expectedRevision: 1 },
+    );
+    await expect(fixture.store.readHistory(ownerSession, fixture.contexts.roomId))
+      .rejects.toMatchObject({
+      status: 410,
+      code: "protocol_upgrade_required",
+      });
+    await fixture.client.close();
   });
 });

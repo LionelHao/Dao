@@ -21,6 +21,18 @@ import type {
   HashedSessionIssue,
   HashedSessionRotation,
   HumanCollaborationCommand,
+  MessageAuthorityStore,
+  HumanMessageSubmissionReceipt,
+  MessageRevisionCommand,
+  MessageRevisionReceipt,
+  MessageRecallCommand,
+  MessageRecallReceipt,
+  AgentMessageCommitCommand,
+  AgentMessageCommitReceipt,
+  MessageHistoryQuery,
+  MessageHistoryPage,
+  MessageRevisionQuery,
+  MessageRevisionPage,
   InternalAgentCommandContext,
   IssuedSessionRecord,
   OutboxDelivery,
@@ -32,11 +44,17 @@ import type {
   SnapshotRevalidationStore,
   SyncQueryStore,
 } from "./contracts.js";
-import type { WorkerDatabaseClient } from "./worker-database-client.js";
+import type {
+  CompleteWorkerDatabaseClient,
+  WorkerDatabaseClient,
+} from "./worker-database-client.js";
+import type { HumanMessageSubmit } from "@native-im/core";
+import type { InternalAgentMessageCommitContext } from "../message-authority/internal-message-capability.js";
 
 export interface SqliteAuthoritativeStore extends
   SessionAuthority,
   CommandStore,
+  MessageAuthorityStore,
   ClosedRoomGovernanceTransportStore,
   SnapshotRevalidationStore,
   Pick<
@@ -111,6 +129,23 @@ export interface SqliteAuthoritativeStoreOptions {
   ) => Promise<void> | void;
   readonly invitationSecretProtector?: InvitationSecretProtector;
   readonly invitationTokenFactory?: () => string;
+}
+
+function requireMessageAuthorityClient(
+  client: WorkerDatabaseClient,
+): CompleteWorkerDatabaseClient {
+  const methodNames = [
+    "submitHumanMessage",
+    "reviseHumanMessage",
+    "recallHumanMessage",
+    "commitAgentMessage",
+    "readMessageHistory",
+    "readMessageRevisions",
+  ] as const;
+  if (!methodNames.every((method) => typeof Reflect.get(client, method) === "function")) {
+    throw new TypeError("Worker database client lacks Message Authority support");
+  }
+  return client as CompleteWorkerDatabaseClient;
 }
 
 function invitationTokenResult(
@@ -264,6 +299,48 @@ export function createSqliteAuthoritativeStore(
       command: AgentCollaborationCommand,
     ): Promise<CommandAcknowledgement> {
       return client.executeAgent(context, command, clock());
+    },
+
+    submitHumanMessage(
+      context: AuthenticatedCommandContext,
+      message: HumanMessageSubmit,
+    ): Promise<HumanMessageSubmissionReceipt> {
+      return requireMessageAuthorityClient(client).submitHumanMessage(context, message, clock());
+    },
+
+    reviseHumanMessage(
+      context: AuthenticatedCommandContext,
+      command: MessageRevisionCommand,
+    ): Promise<MessageRevisionReceipt> {
+      return requireMessageAuthorityClient(client).reviseHumanMessage(context, command, clock());
+    },
+
+    recallHumanMessage(
+      context: AuthenticatedCommandContext,
+      command: MessageRecallCommand,
+    ): Promise<MessageRecallReceipt> {
+      return requireMessageAuthorityClient(client).recallHumanMessage(context, command, clock());
+    },
+
+    commitAgentMessage(
+      context: InternalAgentMessageCommitContext,
+      command: AgentMessageCommitCommand,
+    ): Promise<AgentMessageCommitReceipt> {
+      return requireMessageAuthorityClient(client).commitAgentMessage(context, command, clock());
+    },
+
+    readMessageHistory(
+      context: AuthenticatedSessionContext,
+      query: MessageHistoryQuery,
+    ): Promise<MessageHistoryPage> {
+      return requireMessageAuthorityClient(client).readMessageHistory(context, query, clock());
+    },
+
+    readMessageRevisions(
+      context: AuthenticatedSessionContext,
+      query: MessageRevisionQuery,
+    ): Promise<MessageRevisionPage> {
+      return requireMessageAuthorityClient(client).readMessageRevisions(context, query, clock());
     },
 
     readHistory(

@@ -1,7 +1,13 @@
 import {
   isDepartureConflictList,
   isActor,
+  isAgentFinalMessage,
+  isHumanMessageSubmit,
+  isIsoUtcTimestamp,
   isMessage,
+  isMessageRevision,
+  isMessageTargetOutcome,
+  isTimelineMessage,
   isRoomGovernanceView,
   isRoomSyncResult,
   isSnapshotCompleted,
@@ -9,6 +15,7 @@ import {
 } from "@native-im/core";
 import type {
   Actor,
+  HumanMessageSubmit,
   DepartureConflictList,
   ManagedRoom,
   Message,
@@ -46,6 +53,8 @@ import {
 import type { CommittedRoomCacheInvalidationIntent } from "../access/room-cache-invalidation-port.js";
 import type {
   AgentCollaborationCommand,
+  AgentMessageCommitCommand,
+  AgentMessageCommitReceipt,
   AgentWorkerCommandContext,
   AuthenticatedSessionContext,
   AuthenticatedCommandContext,
@@ -55,8 +64,17 @@ import type {
   HashedSessionIssue,
   HashedSessionRotation,
   HumanCollaborationCommand,
+  HumanMessageSubmissionReceipt,
   IssuedSessionRecord,
   JsonValue,
+  MessageHistoryPage,
+  MessageHistoryQuery,
+  MessageRecallCommand,
+  MessageRecallReceipt,
+  MessageRevisionCommand,
+  MessageRevisionPage,
+  MessageRevisionQuery,
+  MessageRevisionReceipt,
   OutboxDelivery,
   OutboxDispatchCandidate,
   RoomGovernanceCommand,
@@ -66,10 +84,12 @@ import type {
   SessionDevice,
   StreamingRepairLease,
 } from "./contracts.js";
+import type { AgentMessageWorkerContext } from "../message-authority/internal-message-capability.js";
 
 export type AuthorityWorkerErrorCode =
   | "actor_conflict"
   | "agent_missing_permission"
+  | "agent_final_immutable"
   | "agent_queue_full"
   | "agent_permissions_invalid"
   | "agent_required"
@@ -102,8 +122,10 @@ export type AuthorityWorkerErrorCode =
   | "light_task_not_found"
   | "member_not_found"
   | "message_not_found"
+  | "message_version_conflict"
   | "open_item_not_found"
   | "permission_denied"
+  | "protocol_upgrade_required"
   | "role_forbidden"
   | "room_revision_conflict"
   | "ownership_transfer_required"
@@ -137,6 +159,7 @@ export function isAuthorityWorkerErrorCode(
   switch (value) {
     case "actor_conflict":
     case "agent_missing_permission":
+    case "agent_final_immutable":
     case "agent_queue_full":
     case "agent_permissions_invalid":
     case "agent_required":
@@ -169,8 +192,10 @@ export function isAuthorityWorkerErrorCode(
     case "light_task_not_found":
     case "member_not_found":
     case "message_not_found":
+    case "message_version_conflict":
     case "open_item_not_found":
     case "permission_denied":
+    case "protocol_upgrade_required":
     case "role_forbidden":
     case "room_revision_conflict":
     case "ownership_transfer_required":
@@ -295,6 +320,48 @@ export type AuthorityWorkerRequest =
       readonly requestId: string;
       readonly context: AgentWorkerCommandContext;
       readonly command: AgentCollaborationCommand;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.message-submit";
+      readonly requestId: string;
+      readonly context: AuthenticatedCommandContext;
+      readonly message: HumanMessageSubmit;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.message-revise";
+      readonly requestId: string;
+      readonly context: AuthenticatedCommandContext;
+      readonly command: MessageRevisionCommand;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.message-recall";
+      readonly requestId: string;
+      readonly context: AuthenticatedCommandContext;
+      readonly command: MessageRecallCommand;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.agent-message-commit";
+      readonly requestId: string;
+      readonly context: AgentMessageWorkerContext;
+      readonly command: AgentMessageCommitCommand;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.message-history";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly query: MessageHistoryQuery;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.message-revisions";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly query: MessageRevisionQuery;
       readonly now: number;
     }
   | {
@@ -516,6 +583,36 @@ export type AuthorityWorkerResponse =
       readonly acknowledgement: CommandAcknowledgement;
     }
   | {
+      readonly type: "authority.message-submitted";
+      readonly requestId: string;
+      readonly receipt: HumanMessageSubmissionReceipt;
+    }
+  | {
+      readonly type: "authority.message-revised";
+      readonly requestId: string;
+      readonly receipt: MessageRevisionReceipt;
+    }
+  | {
+      readonly type: "authority.message-recalled";
+      readonly requestId: string;
+      readonly receipt: MessageRecallReceipt;
+    }
+  | {
+      readonly type: "authority.agent-message-committed";
+      readonly requestId: string;
+      readonly receipt: AgentMessageCommitReceipt;
+    }
+  | {
+      readonly type: "authority.message-history";
+      readonly requestId: string;
+      readonly page: MessageHistoryPage;
+    }
+  | {
+      readonly type: "authority.message-revisions";
+      readonly requestId: string;
+      readonly page: MessageRevisionPage;
+    }
+  | {
       readonly type: "authority.governance-acknowledged";
       readonly requestId: string;
       readonly acknowledgement: ClosedRoomGovernanceAcknowledgement;
@@ -626,7 +723,9 @@ function hasExactKeys(
   value: Record<string, unknown>,
   expectedKeys: readonly string[],
 ): boolean {
-  const actualKeys = Object.keys(value).sort();
+  const ownKeys = Reflect.ownKeys(value);
+  if (ownKeys.some((key) => typeof key !== "string")) return false;
+  const actualKeys = (ownKeys as string[]).sort();
   const sortedExpectedKeys = [...expectedKeys].sort();
   return (
     actualKeys.length === sortedExpectedKeys.length &&
@@ -932,6 +1031,149 @@ function isCommandAcknowledgement(value: unknown): value is CommandAcknowledgeme
   );
 }
 
+function isRevisionCommand(value: unknown): value is MessageRevisionCommand {
+  return isRecord(value) && hasExactKeys(
+    value, ["roomId", "messageId", "expectedRevision", "body"],
+  ) && isText(value.roomId) && isMessageRevision({
+    messageId: value.messageId,
+    revision: value.expectedRevision,
+    body: value.body,
+    revisedAt: "1970-01-01T00:00:00.000Z",
+    revisedByActorId: "authority-validation",
+  });
+}
+
+function isRecallCommand(value: unknown): value is MessageRecallCommand {
+  return isRecord(value) && hasExactKeys(
+    value, ["roomId", "messageId", "expectedRevision"],
+  ) && isText(value.roomId) && isText(value.messageId) &&
+    Number.isSafeInteger(value.expectedRevision) && Number(value.expectedRevision) > 0;
+}
+
+function isAgentMessageWorkerContext(value: unknown): value is AgentMessageWorkerContext {
+  return isRecord(value) && hasExactKeys(value, [
+    "kind", "agent", "invocationIntentId", "executionId", "attemptSeq", "executionGeneration",
+  ]) && value.kind === "agent-message" && isRecord(value.agent) &&
+    hasExactKeys(value.agent, ["actorId", "kind"]) && value.agent.kind === "agent" &&
+    isText(value.agent.actorId) && isText(value.invocationIntentId) &&
+    isText(value.executionId) && Number.isSafeInteger(value.attemptSeq) &&
+    Number(value.attemptSeq) > 0 && Number.isSafeInteger(value.executionGeneration) &&
+    Number(value.executionGeneration) > 0;
+}
+
+function isAgentMessageCommand(value: unknown): value is AgentMessageCommitCommand {
+  if (!isRecord(value) || !hasExactKeys(
+    value,
+    ["messageId", "roomId", "body", ...(Object.hasOwn(value, "correctsMessageId")
+      ? ["correctsMessageId"]
+      : [])],
+  )) return false;
+  return isAgentFinalMessage({
+    id: value.messageId,
+    roomId: value.roomId,
+    authorId: "authority-agent",
+    authorKind: "agent",
+    createdAt: "1970-01-01T00:00:00.000Z",
+    lifecycle: "active",
+    finalBody: value.body,
+    sourceInvocationIntentId: "authority-intent",
+    sourceExecutionId: "authority-execution",
+    ...(Object.hasOwn(value, "correctsMessageId")
+      ? { correctsMessageId: value.correctsMessageId }
+      : {}),
+  });
+}
+
+function isMessageHistoryQuery(value: unknown): value is MessageHistoryQuery {
+  return isRecord(value) && hasExactKeys(value, [
+    "roomId",
+    ...(Object.hasOwn(value, "afterMessageId") ? ["afterMessageId"] : []),
+    ...(Object.hasOwn(value, "limit") ? ["limit"] : []),
+  ]) && isText(value.roomId) &&
+    (!Object.hasOwn(value, "afterMessageId") || isText(value.afterMessageId)) &&
+    (!Object.hasOwn(value, "limit") ||
+      (Number.isSafeInteger(value.limit) && Number(value.limit) >= 1 && Number(value.limit) <= 200));
+}
+
+function isMessageRevisionQuery(value: unknown): value is MessageRevisionQuery {
+  return isRecord(value) && hasExactKeys(value, [
+    "roomId", "messageId",
+    ...(Object.hasOwn(value, "afterRevision") ? ["afterRevision"] : []),
+    ...(Object.hasOwn(value, "limit") ? ["limit"] : []),
+  ]) && isText(value.roomId) && isText(value.messageId) &&
+    (!Object.hasOwn(value, "afterRevision") ||
+      (Number.isSafeInteger(value.afterRevision) && Number(value.afterRevision) >= 0)) &&
+    (!Object.hasOwn(value, "limit") ||
+      (Number.isSafeInteger(value.limit) && Number(value.limit) >= 1 && Number(value.limit) <= 200));
+}
+
+function isMutationReceipt(value: unknown): value is MessageRevisionReceipt {
+  return isRecord(value) && hasExactKeys(value, [
+    "messageId", "persistedAt", "eventId", "replayed", "revision",
+  ]) && isText(value.messageId) && isIsoUtcTimestamp(value.persistedAt) &&
+    isText(value.eventId) && typeof value.replayed === "boolean" &&
+    Number.isSafeInteger(value.revision) && Number(value.revision) > 0;
+}
+
+function isSubmissionReceipt(value: unknown): value is HumanMessageSubmissionReceipt {
+  return isRecord(value) && hasExactKeys(value, [
+    "messageId", "persistedAt", "eventId", "replayed", "targetOutcomes",
+  ]) && isText(value.messageId) && isIsoUtcTimestamp(value.persistedAt) &&
+    isText(value.eventId) && typeof value.replayed === "boolean" &&
+    Array.isArray(value.targetOutcomes) && value.targetOutcomes.every(isMessageTargetOutcome);
+}
+
+function isRecallReceipt(value: unknown): value is MessageRecallReceipt {
+  return isRecord(value) && hasExactKeys(value, [
+    "messageId", "revision", "recalledAt", "eventId", "replayed", "abortTargets",
+  ]) && isText(value.messageId) && Number.isSafeInteger(value.revision) &&
+    Number(value.revision) > 0 && isIsoUtcTimestamp(value.recalledAt) &&
+    isText(value.eventId) && typeof value.replayed === "boolean" &&
+    Array.isArray(value.abortTargets) && value.abortTargets.length <= 256 &&
+    value.abortTargets.every((target) => isRecord(target) && hasExactKeys(target, [
+      "sourceMessageId", "sourceRevision", "invocationIntentId", "executionId",
+      "attemptSeq", "cancellationReason", "sideEffectState",
+    ]) && isText(target.sourceMessageId) &&
+      Number.isSafeInteger(target.sourceRevision) && Number(target.sourceRevision) > 0 &&
+      isText(target.invocationIntentId) && isText(target.executionId) &&
+      Number.isSafeInteger(target.attemptSeq) && Number(target.attemptSeq) > 0 &&
+      target.cancellationReason === "message_recalled" &&
+      (target.sideEffectState === "none" ||
+        target.sideEffectState === "dispatched-retained" ||
+        target.sideEffectState === "outcome-unknown-retained")) &&
+    new Set(value.abortTargets.map((target) => target.executionId)).size ===
+      value.abortTargets.length;
+}
+
+function isAgentMessageReceipt(value: unknown): value is AgentMessageCommitReceipt {
+  return isRecord(value) && hasExactKeys(value, [
+    "messageId", "persistedAt", "eventId", "replayed", "message",
+  ]) && isText(value.messageId) && isIsoUtcTimestamp(value.persistedAt) &&
+    isText(value.eventId) && typeof value.replayed === "boolean" &&
+    isAgentFinalMessage(value.message) && value.message.id === value.messageId;
+}
+
+function isMessageHistoryPage(value: unknown): value is MessageHistoryPage {
+  return isRecord(value) && hasExactKeys(value, [
+    "messages", "hasMore", "lifecycle", "actors",
+  ]) &&
+    Array.isArray(value.messages) && value.messages.every(isTimelineMessage) &&
+    typeof value.hasMore === "boolean" &&
+    (value.lifecycle === "active" || value.lifecycle === "archived") &&
+    Array.isArray(value.actors) && value.actors.length <= 512 &&
+    value.actors.every((actor) => isRecord(actor) && hasExactKeys(actor, [
+      "actorId", "kind", "displayName", "secondaryLabel",
+    ]) && isText(actor.actorId) && (actor.kind === "human" || actor.kind === "agent") &&
+      isText(actor.displayName) && isText(actor.secondaryLabel)) &&
+    new Set(value.actors.map((actor) => actor.actorId)).size === value.actors.length;
+}
+
+function isMessageRevisionPage(value: unknown): value is MessageRevisionPage {
+  return isRecord(value) && hasExactKeys(value, ["revisions", "hasMore"]) &&
+    Array.isArray(value.revisions) && value.revisions.every(isMessageRevision) &&
+    typeof value.hasMore === "boolean";
+}
+
 function isClosedRoomGovernanceAcknowledgement(
   value: unknown,
 ): value is ClosedRoomGovernanceAcknowledgement {
@@ -1147,6 +1389,30 @@ export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWork
         isAgentCommand(value.command) &&
         isNonNegativeSafeInteger(value.now)
       );
+    case "authority.message-submit":
+      return hasExactKeys(value, ["type", "requestId", "context", "message", "now"]) &&
+        isAuthenticatedCommandContext(value.context) && isHumanMessageSubmit(value.message) &&
+        isNonNegativeSafeInteger(value.now);
+    case "authority.message-revise":
+      return hasExactKeys(value, ["type", "requestId", "context", "command", "now"]) &&
+        isAuthenticatedCommandContext(value.context) && isRevisionCommand(value.command) &&
+        isNonNegativeSafeInteger(value.now);
+    case "authority.message-recall":
+      return hasExactKeys(value, ["type", "requestId", "context", "command", "now"]) &&
+        isAuthenticatedCommandContext(value.context) && isRecallCommand(value.command) &&
+        isNonNegativeSafeInteger(value.now);
+    case "authority.agent-message-commit":
+      return hasExactKeys(value, ["type", "requestId", "context", "command", "now"]) &&
+        isAgentMessageWorkerContext(value.context) && isAgentMessageCommand(value.command) &&
+        isNonNegativeSafeInteger(value.now);
+    case "authority.message-history":
+      return hasExactKeys(value, ["type", "requestId", "context", "query", "now"]) &&
+        isAuthenticatedSessionContext(value.context) && isMessageHistoryQuery(value.query) &&
+        isNonNegativeSafeInteger(value.now);
+    case "authority.message-revisions":
+      return hasExactKeys(value, ["type", "requestId", "context", "query", "now"]) &&
+        isAuthenticatedSessionContext(value.context) && isMessageRevisionQuery(value.query) &&
+        isNonNegativeSafeInteger(value.now);
     case "authority.read-history":
       return hasExactKeys(value, ["type", "requestId", "context", "roomId", "now"]) &&
         isAuthenticatedSessionContext(value.context) && isText(value.roomId) &&
@@ -1298,6 +1564,24 @@ export function isAuthorityWorkerResponse(
         hasExactKeys(value, ["type", "requestId", "acknowledgement"]) &&
         isCommandAcknowledgement(value.acknowledgement)
       );
+    case "authority.message-submitted":
+      return hasExactKeys(value, ["type", "requestId", "receipt"]) &&
+        isSubmissionReceipt(value.receipt);
+    case "authority.message-revised":
+      return hasExactKeys(value, ["type", "requestId", "receipt"]) &&
+        isMutationReceipt(value.receipt);
+    case "authority.message-recalled":
+      return hasExactKeys(value, ["type", "requestId", "receipt"]) &&
+        isRecallReceipt(value.receipt);
+    case "authority.agent-message-committed":
+      return hasExactKeys(value, ["type", "requestId", "receipt"]) &&
+        isAgentMessageReceipt(value.receipt);
+    case "authority.message-history":
+      return hasExactKeys(value, ["type", "requestId", "page"]) &&
+        isMessageHistoryPage(value.page);
+    case "authority.message-revisions":
+      return hasExactKeys(value, ["type", "requestId", "page"]) &&
+        isMessageRevisionPage(value.page);
     case "authority.governance-acknowledged":
       return hasExactKeys(value, ["type", "requestId", "acknowledgement"]) &&
         isClosedRoomGovernanceAcknowledgement(value.acknowledgement);
