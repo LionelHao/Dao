@@ -96,4 +96,69 @@ describe("production Desktop authority cache", () => {
       lifecycle: "active", governanceRevision: 9, archiveGeneration: 1,
     });
   });
+
+  it("keeps memory repair identities distinct and invalidates stale projections on minimal events", async () => {
+    const memoryRecords: readonly RoomRepairRecord[] = [
+      ...records,
+      {
+        kind: "memory", roomId: "room-1", value: { recordType: "status", status: {
+          roomId: "room-1", health: {
+            state: "healthy", reason: "none", memoryWatermark: 9, corpusHead: 9,
+            lag: 0, lastAttemptAt: null, retryable: false, recoveryRequired: false,
+          }, recoveryGeneration: 1, updatedAt: "2026-08-19T00:00:00.000Z",
+        } },
+      },
+      {
+        kind: "memory", roomId: "room-1", value: { recordType: "projection", projection: {
+          projectionKind: "memory", roomId: "room-1", memoryRecordId: "memory-1",
+          kind: "context", currentVersion: {
+            roomId: "room-1", memoryRecordId: "memory-1", memoryVersionId: "memory-version-1",
+            version: 1, kind: "context", state: "active", derivedText: "Safe derived context",
+            sourceRefs: [{
+              sourceKind: "message", sourceId: "message:message-1", sourceRevision: 1,
+              eligibility: "eligible", availability: "readable",
+            }], createdAt: "2026-08-19T00:00:00.000Z", replacesMemoryVersionId: null,
+          }, disputes: [], resolutions: [],
+        } },
+      },
+    ];
+    const cache = createDesktopAuthorityCache();
+    cache.beginRoom("room-1", "memory-snapshot");
+    cache.stageRoomPage({
+      ...page(), snapshotId: "memory-snapshot", records: memoryRecords,
+      snapshotChecksum: authoritySnapshotChecksum("room", memoryRecords),
+    });
+    expect(await cache.finalizeRoom(
+      "memory-snapshot", authoritySnapshotChecksum("room", memoryRecords),
+    )).toBe(true);
+    cache.commitRoom("room-1", 9, authoritySnapshotChecksum("room", memoryRecords));
+    expect(cache.roomRepairRecords("room-1")?.filter((record) => record.kind === "memory"))
+      .toHaveLength(2);
+
+    const events: readonly PersistedRoomEvent[] = [{
+      eventId: "memory-version-event", streamKind: "room", streamId: "room-1", streamSeq: 10,
+      roomId: "room-1", actorId: "memory-service", occurredAt: "2026-08-19T00:01:00.000Z",
+      type: "room.memory.version.changed", payload: {
+        memoryRecordId: "memory-1", memoryVersionId: "memory-version-2", kind: "context",
+        state: "disputed", sourceIds: ["message:message-1"], memoryWatermark: 9,
+      },
+    }, {
+      eventId: "memory-health-event", streamKind: "room", streamId: "room-1", streamSeq: 11,
+      roomId: "room-1", actorId: "memory-service", occurredAt: "2026-08-19T00:02:00.000Z",
+      type: "room.memory.health.changed", payload: {
+        roomId: "room-1", health: {
+          state: "degraded", reason: "invalid_provider_output", memoryWatermark: 9,
+          corpusHead: 10, lag: 1, lastAttemptAt: "2026-08-19T00:02:00.000Z",
+          retryable: true, recoveryRequired: false,
+        }, recoveryGeneration: 1, updatedAt: "2026-08-19T00:02:00.000Z",
+      },
+    }];
+    cache.applyRoomEvents("room-1", events, { version: 1, roomId: "room-1", afterSeq: 11 });
+    const currentMemory = cache.roomRepairRecords("room-1")
+      ?.filter((record) => record.kind === "memory");
+    expect(currentMemory).toHaveLength(1);
+    expect(currentMemory?.[0]).toMatchObject({
+      value: { recordType: "status", status: { health: { state: "degraded" } } },
+    });
+  });
 });
