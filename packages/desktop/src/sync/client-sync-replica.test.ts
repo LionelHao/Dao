@@ -106,6 +106,20 @@ function governanceEvent(sequence: number, id = `governance-event-${sequence}`):
   };
 }
 
+function archivedEvent(sequence: number, id = `archived-event-${sequence}`): PersistedRoomEvent {
+  return {
+    eventId: id,
+    streamKind: "room",
+    streamId: "room-1",
+    streamSeq: sequence,
+    roomId: "room-1",
+    actorId: "human-1",
+    occurredAt: "2026-08-19T08:00:00.000Z",
+    type: "room.archived",
+    payload: { governance: governanceView, archiveGeneration: 1, frozenTimerCount: 0 },
+  };
+}
+
 function catalogPage(overrides: Partial<WorkspaceBootstrapPage> = {}): WorkspaceBootstrapPage {
   const rooms = overrides.rooms ?? [roomSummary];
   return {
@@ -339,6 +353,24 @@ describe("ClientSyncReplica", () => {
       { version: 1, roomId: "room-1", afterSeq: 10 },
     );
     expect(applied).toHaveBeenCalledOnce();
+  });
+
+  it("publishes the governance carried by a closed lifecycle event for ACK convergence", async () => {
+    const transport = new FakeTransport();
+    const cache = new MemoryCache();
+    const applied = vi.fn();
+    const replica = createClientSyncReplica({ transport, cache, governanceObserver: { applied } });
+    await replica.restoreWorkspace();
+
+    await transport.observer?.events(
+      [archivedEvent(10, "event-lifecycle-archive")],
+      { version: 1, roomId: "room-1", afterSeq: 10 },
+    );
+
+    expect(applied).toHaveBeenLastCalledWith({
+      source: "events", roomId: "room-1", eventIds: ["event-lifecycle-archive"],
+      governance: governanceView,
+    });
   });
 
   it("publishes a repair governance projection only after atomic generation commit", async () => {

@@ -136,6 +136,77 @@ describe("closed Governance controller", () => {
     controller.close();
   });
 
+  it("accepts a matching atomic repair when lifecycle preemption prevents live ACK events", async () => {
+    const authority = adapter();
+    const feed = new Feed();
+    const controller = createGovernanceController({
+      authority: authority.value,
+      replica: feed,
+      createRequestIdentity: () => ({ requestId: "request-repair", idempotencyKey: "key-repair" }),
+    });
+    await controller.getSurface({ roomId: "room-1" });
+    controller.submit({ roomId: "room-1", intent: {
+      command: "room.archive", expectedGovernanceRevision: 7,
+    } });
+    const archived = {
+      ...projection, lifecycle: "archived" as const, governanceRevision: 8, archiveGeneration: 1,
+      archivedAt: "2026-08-19T08:00:00.000Z",
+    };
+    authority.resolveAck({
+      type: "ack", requestId: "request-repair", command: "room.archive", result: "accepted",
+      eventIds: ["preempted-room-event"], projection: archived, replayed: false,
+    });
+    await vi.waitFor(() => expect(controller.current("room-1")).toMatchObject({
+      operation: { status: "acknowledged" }, projection: { lifecycle: "active" },
+    }));
+
+    feed.listener?.({
+      source: "repair", roomId: "room-1", eventIds: [],
+      governance: {
+        roomId: "room-1", projectId: "room-1", lifecycle: "archived",
+        governanceRevision: 8, archiveGeneration: 1, ownerActorId: "owner-1",
+        archivedAt: "2026-08-19T08:00:00.000Z",
+      },
+    });
+    expect(controller.current("room-1")).toMatchObject({
+      operation: { status: "succeeded" }, projection: { lifecycle: "archived" },
+    });
+    controller.close();
+  });
+
+  it("converges when the stable repair projection arrives before its ACK", async () => {
+    const authority = adapter();
+    const feed = new Feed();
+    const controller = createGovernanceController({
+      authority: authority.value,
+      replica: feed,
+      createRequestIdentity: () => ({ requestId: "request-race", idempotencyKey: "key-race" }),
+    });
+    await controller.getSurface({ roomId: "room-1" });
+    controller.submit({ roomId: "room-1", intent: {
+      command: "room.archive", expectedGovernanceRevision: 7,
+    } });
+    const governance: RoomGovernanceView = {
+      roomId: "room-1", projectId: "room-1", lifecycle: "archived",
+      governanceRevision: 8, archiveGeneration: 1, ownerActorId: "owner-1",
+      archivedAt: "2026-08-19T08:00:00.000Z",
+    };
+    feed.listener?.({ source: "repair", roomId: "room-1", eventIds: [], governance });
+    authority.resolveAck({
+      type: "ack", requestId: "request-race", command: "room.archive", result: "accepted",
+      eventIds: ["event-race"], replayed: false,
+      projection: {
+        ...projection, lifecycle: "archived", governanceRevision: 8, archiveGeneration: 1,
+        archivedAt: "2026-08-19T08:00:00.000Z",
+      },
+    });
+    await vi.waitFor(() => expect(controller.current("room-1")).toMatchObject({
+      operation: { status: "succeeded", requestId: "request-race" },
+      projection: { lifecycle: "archived", governanceRevision: 8 },
+    }));
+    controller.close();
+  });
+
   it("replaces final departure conflicts and refreshes stale revision without claiming success", async () => {
     const feed = new Feed();
     const finalConflicts = {

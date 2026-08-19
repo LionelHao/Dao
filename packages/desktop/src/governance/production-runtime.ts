@@ -167,6 +167,17 @@ export function createDesktopGovernanceRuntime(options: {
     cache.clear();
     for (const roomId of roomIds) feed.revoked({ roomId, scope: "session", purgeCompleted: true });
   });
+  const unsubscribeRoomAccess = transport.onRoomAccessChanged((roomId, change) => {
+    if (change === "removed") {
+      cache.clearRoom(roomId);
+      feed.revoked({ roomId, scope: "room", purgeCompleted: true });
+      return;
+    }
+    void replica.repairRoom(roomId).catch(() => {
+      cache.clearRoom(roomId);
+      feed.fatal({ roomId, errorCode: "repair_unavailable" });
+    });
+  });
   const unsubscribeFailure = transport.onConnectionFailure(() => {
     const roomIds = cache.roomIds();
     cache.clear();
@@ -185,7 +196,8 @@ export function createDesktopGovernanceRuntime(options: {
     close() {
       if (closed) return;
       closed = true;
-      unsubscribeTerminal(); unsubscribeFailure(); controller.close(); replica.close(); transport.close(); cache.clear();
+      unsubscribeTerminal(); unsubscribeRoomAccess(); unsubscribeFailure(); controller.close();
+      replica.close(); transport.close(); cache.clear();
     },
   });
 }

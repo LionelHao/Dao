@@ -64,18 +64,22 @@ function replaceRecord(records: RoomRepairRecord[], next: RoomRepairRecord): voi
 
 function applyProjectionEvent(records: RoomRepairRecord[], event: DesktopRoomEvent): void {
   switch (event.type) {
+    case "room.archived":
     case "room.reopened": {
       const current = records.find(
         (record): record is Extract<RoomRepairRecord, { kind: "room" }> => record.kind === "room",
       );
       if (current !== undefined) replaceRecord(records, {
-        kind: "room", value: { ...current.value, status: "active" },
+        kind: "room", value: {
+          ...current.value,
+          status: event.type === "room.archived" ? "archived" : "active",
+        },
       });
+      replaceRecord(records, { kind: "governance", value: event.payload.governance });
       return;
     }
     case "room.created":
-    case "room.renamed":
-    case "room.archived": {
+    case "room.renamed": {
       replaceRecord(records, { kind: "room", value: {
         id: event.payload.room.id,
         name: event.payload.room.name,
@@ -85,6 +89,9 @@ function applyProjectionEvent(records: RoomRepairRecord[], event: DesktopRoomEve
       return;
     }
     case "room.governance.changed":
+      replaceRecord(records, { kind: "governance", value: event.payload.governance });
+      return;
+    case "room.security.reduced":
       replaceRecord(records, { kind: "governance", value: event.payload.governance });
       return;
     case "human.invitation.accepted":
@@ -109,6 +116,7 @@ export interface DesktopAuthorityCache extends ClientAuthorityCache {
   governanceProjection(roomId: string): GovernanceProjection | undefined;
   roomIds(): readonly string[];
   updatedAt(roomId: string): string | undefined;
+  clearRoom(roomId: string): void;
 }
 
 export function createDesktopAuthorityCache(
@@ -189,6 +197,17 @@ export function createDesktopAuthorityCache(
       catalog = [];
       roomStages.clear();
       rooms.clear();
+    },
+    clearRoom(roomId) {
+      if (catalogStage !== undefined) {
+        catalogStage = {
+          ...catalogStage,
+          rooms: catalogStage.rooms.filter((room) => room.roomId !== roomId),
+        };
+      }
+      catalog = catalog.filter((room) => room.roomId !== roomId);
+      roomStages.delete(roomId);
+      rooms.delete(roomId);
     },
     governanceProjection(roomId) {
       const records = rooms.get(roomId)?.records;

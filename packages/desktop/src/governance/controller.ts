@@ -302,6 +302,14 @@ export function createGovernanceController(options: {
         });
         return;
       }
+      if (projectionGovernanceMatches(current.projection, ack.projection)) {
+        emit({
+          ...current,
+          projection: ack.projection,
+          operation: { status: "succeeded", requestId, command: ack.command },
+        });
+        return;
+      }
       pending.set(roomId, { ack, appliedEventIds: new Set() });
       emit({
         ...current,
@@ -363,6 +371,18 @@ export function createGovernanceController(options: {
       if (application.governance !== undefined) {
         emit(mergeGovernance(current, application.governance));
       }
+      return;
+    }
+    if (application.source === "repair" && application.governance !== undefined &&
+        governanceMatchesProjection(application.governance, waiting.ack.projection)) {
+      pending.delete(application.roomId);
+      emit({
+        ...current,
+        projection: waiting.ack.projection,
+        operation: {
+          status: "succeeded", requestId: waiting.ack.requestId, command: waiting.ack.command,
+        },
+      });
       return;
     }
     for (const eventId of application.eventIds) waiting.appliedEventIds.add(eventId);

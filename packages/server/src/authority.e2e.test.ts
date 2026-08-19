@@ -37,6 +37,20 @@ import {
   type RoomSubscriptionObserver,
   type SyncTransport,
 } from "../../desktop/src/sync/client-sync-replica.js";
+import { createDesktopGovernanceRuntime } from "../../desktop/src/governance/production-runtime.js";
+import {
+  type GovernanceWebSocketLike,
+} from "../../desktop/src/governance/websocket-authority.js";
+import {
+  registerGovernanceIpc,
+  type GovernanceIpcMain,
+  type GovernanceIpcWebContents,
+} from "../../desktop/src/governance/ipc.js";
+import {
+  createGovernanceBridge,
+  type GovernanceIpcRenderer,
+} from "../../desktop/src/governance/preload-bridge.js";
+import { mountDesktopRendererEntry } from "../../desktop/src/renderer/entry.js";
 import type {
   Actor,
   PersistedRoomEvent,
@@ -639,13 +653,19 @@ class JsonWebSocketClient {
     });
   }
 
-  async login(
+  async issueSession(
     requestId = "login",
     identity: Readonly<{ accountId: string; secret: string }> = {
       accountId: "account-a",
       secret: "test-secret",
     },
-  ): Promise<string> {
+  ): Promise<{
+    readonly accountId: string;
+    readonly actorId: string;
+    readonly sessionId: string;
+    readonly accessToken: string;
+    readonly expiresAt: string;
+  }> {
     const frame = await this.request({
       type: "auth.login",
       requestId,
@@ -657,8 +677,27 @@ class JsonWebSocketClient {
         platform: "unknown",
       },
     }, "auth.authenticated");
-    if (frame.type !== "auth.authenticated") throw new TypeError("wrong login frame");
-    return frame.accessToken;
+    if (frame.type !== "auth.authenticated" || typeof frame.sessionId !== "string" ||
+        typeof frame.accessToken !== "string" || typeof frame.expiresAt !== "string") {
+      throw new TypeError("wrong login frame");
+    }
+    return {
+      accountId: frame.accountId,
+      actorId: frame.actorId,
+      sessionId: frame.sessionId,
+      accessToken: frame.accessToken,
+      expiresAt: frame.expiresAt,
+    };
+  }
+
+  async login(
+    requestId = "login",
+    identity: Readonly<{ accountId: string; secret: string }> = {
+      accountId: "account-a",
+      secret: "test-secret",
+    },
+  ): Promise<string> {
+    return (await this.issueSession(requestId, identity)).accessToken;
   }
 
   async resume(accessToken: string, requestId = "resume"): Promise<void> {
@@ -1733,6 +1772,193 @@ describe("authoritative server real-process harness", () => {
       peer?.close();
       if (first !== undefined) await stopChild(first);
       if (second !== undefined) await stopChild(second);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("drives the production Desktop entry through IPC, AuthorityWorker, SQLite, and stable Room events", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-desktop-governance-"));
+    let started: Awaited<ReturnType<typeof spawnAuthorityChild>> | undefined;
+    let bootstrapClient: JsonWebSocketClient | undefined;
+    let runtime: ReturnType<typeof createDesktopGovernanceRuntime> | undefined;
+    let unregisterIpc: (() => void) | undefined;
+    let unmountRenderer: (() => void) | undefined;
+    try {
+      started = await spawnAuthorityChild({ directory, seedGovernanceRoom: true });
+      bootstrapClient = await JsonWebSocketClient.connect(started.url);
+      const issued = await bootstrapClient.issueSession("desktop-governance-login");
+      const roomId = await discoverRoom(bootstrapClient);
+
+      let requestSequence = 0;
+      const governanceFrames: string[] = [];
+      runtime = createDesktopGovernanceRuntime({
+        endpoint: started.url,
+        session: () => ({
+          actorId: issued.actorId,
+          sessionId: issued.sessionId,
+          accessToken: issued.accessToken,
+          expiresAt: issued.expiresAt,
+        }),
+        webSocketFactory: (endpoint) => {
+          const socket = new WebSocket(endpoint);
+          socket.on("message", (raw) => governanceFrames.push(raw.toString("utf8")));
+          return socket as unknown as GovernanceWebSocketLike;
+        },
+        createRequestIdentity: () => {
+          const sequence = ++requestSequence;
+          return {
+            requestId: `desktop-governance-${sequence}`,
+            idempotencyKey: `desktop-governance-key-${sequence}`,
+          };
+        },
+        timeoutMs: 5_000,
+      });
+
+      type IpcHandler = (
+        event: { readonly sender: unknown; readonly senderFrame: unknown },
+        ...args: unknown[]
+      ) => unknown;
+      const handlers = new Map<string, IpcHandler>();
+      const rendererListeners = new Map<string, Set<(event: unknown, value: unknown) => void>>();
+      const rendererTraffic: unknown[] = [];
+      const trustedFrame = Object.freeze({ kind: "main-frame" });
+      const webContents: GovernanceIpcWebContents = {
+        mainFrame: trustedFrame,
+        isDestroyed: () => false,
+        send(channel, state) {
+          rendererTraffic.push({ direction: "main-to-renderer", channel, state });
+          for (const listener of rendererListeners.get(channel) ?? []) listener({}, state);
+        },
+      };
+      const ipcMain: GovernanceIpcMain = {
+        handle(channel, handler) {
+          if (handlers.has(channel)) throw new TypeError("duplicate Governance IPC handler");
+          handlers.set(channel, handler);
+        },
+        removeHandler(channel) {
+          handlers.delete(channel);
+        },
+      };
+      const ipcRenderer: GovernanceIpcRenderer = {
+        async invoke(channel, ...args) {
+          rendererTraffic.push({ direction: "renderer-to-main", channel, args });
+          const handler = handlers.get(channel);
+          if (handler === undefined) throw new TypeError("Governance IPC handler is absent");
+          return await handler({ sender: webContents, senderFrame: trustedFrame }, ...args);
+        },
+        on(channel, listener) {
+          const listeners = rendererListeners.get(channel) ?? new Set();
+          listeners.add(listener);
+          rendererListeners.set(channel, listeners);
+        },
+        removeListener(channel, listener) {
+          rendererListeners.get(channel)?.delete(listener);
+        },
+      };
+      unregisterIpc = registerGovernanceIpc({
+        ipcMain,
+        webContents,
+        controller: runtime.controller,
+      });
+      const bridge = createGovernanceBridge(ipcRenderer);
+      const root = document.createElement("main");
+      document.body.replaceChildren(root);
+      unmountRenderer = mountDesktopRendererEntry(
+        root,
+        `?governance-room=${encodeURIComponent(roomId)}`,
+        undefined,
+        bridge,
+      );
+
+      expect(root.dataset.governanceRouteContract).toBe("closed-v1");
+      await vi.waitFor(() => {
+        const archive = root.querySelector<HTMLButtonElement>("[data-archive-room]");
+        const evidence = `${root.innerHTML}\n${governanceFrames.join("\n")}`;
+        expect(archive, evidence).not.toBeNull();
+        expect(archive!.disabled, evidence).toBe(false);
+      }, { timeout: 10_000, interval: 20 });
+
+      root.querySelector<HTMLButtonElement>("[data-archive-room]")!.click();
+      root.querySelector<HTMLButtonElement>("[data-action='confirm-archive']")!.click();
+      await vi.waitFor(() => {
+        const evidence = `${root.innerHTML}\n${governanceFrames.join("\n")}`;
+        expect(root.querySelector("[data-archived-banner]"), evidence).not.toBeNull();
+        expect(root.querySelector("[data-governance-success]")?.textContent, evidence)
+          .toContain("归档成功");
+      }, { timeout: 10_000, interval: 20 });
+      expect(runtime.cache.governanceProjection(roomId)).toMatchObject({
+        lifecycle: "archived", governanceRevision: 2, archiveGeneration: 1,
+      });
+
+      root.querySelector<HTMLButtonElement>("[data-action='reopen-room']")!.click();
+      await vi.waitFor(() => {
+        expect(root.querySelector("[data-archived-banner]")).toBeNull();
+        expect(root.querySelector("[data-governance-success]")?.textContent).toContain("重开成功");
+      }, { timeout: 10_000, interval: 20 });
+      expect(runtime.cache.governanceProjection(roomId)).toMatchObject({
+        lifecycle: "active", governanceRevision: 3, archiveGeneration: 1,
+      });
+
+      const database = new DatabaseSync(join(directory, "authority.sqlite"), { readOnly: true });
+      try {
+        expect(database.prepare(
+          `SELECT status, governance_revision AS governanceRevision,
+                  archive_generation AS archiveGeneration, archived_at AS archivedAt
+             FROM rooms WHERE id = ?`,
+        ).get(roomId)).toEqual({
+          status: "active", governanceRevision: 3, archiveGeneration: 1, archivedAt: null,
+        });
+        expect(database.prepare(
+          `SELECT type, result FROM room_audit
+            WHERE room_id = ? AND type IN ('room.archived', 'room.reopened')
+            ORDER BY rowid`,
+        ).all(roomId)).toEqual([
+          { type: "room.archived", result: "archived" },
+          { type: "room.reopened", result: "reopened" },
+        ]);
+        expect(database.prepare(
+          `SELECT event_type AS eventType FROM events
+            WHERE room_id = ? AND event_type IN (
+              'room.archived', 'room.security.reduced', 'room.reopened'
+            ) ORDER BY stream_seq`,
+        ).all(roomId)).toEqual([
+          { eventType: "room.archived" },
+          { eventType: "room.security.reduced" },
+          { eventType: "room.reopened" },
+        ]);
+        expect(database.prepare(
+          `SELECT COUNT(*) AS count FROM outbox_deliveries
+            WHERE event_id IN (
+              SELECT event_id FROM events WHERE room_id = ? AND event_type IN (
+                'room.archived', 'room.security.reduced', 'room.reopened'
+              )
+            ) AND status = 'dispatched'`,
+        ).get(roomId)).toEqual({ count: 3 });
+        expect(database.prepare(
+          `SELECT COUNT(*) AS count FROM idempotency_records
+            WHERE key IN ('desktop-governance-key-1', 'desktop-governance-key-2')`,
+        ).get()).toEqual({ count: 2 });
+      } finally {
+        database.close();
+      }
+
+      expect(rendererTraffic.some((entry) => JSON.stringify(entry).includes("governance:get-surface")))
+        .toBe(true);
+      expect(rendererTraffic.some((entry) => JSON.stringify(entry).includes("governance:submit")))
+        .toBe(true);
+      const serializedRendererBoundary = JSON.stringify(rendererTraffic);
+      expect(serializedRendererBoundary).not.toContain(issued.accessToken);
+      expect(root.textContent).not.toContain(issued.accessToken);
+      expect(Object.keys(bridge)).toEqual([
+        "getSurface", "getDepartureConflicts", "submit", "onStateChanged",
+      ]);
+    } finally {
+      unmountRenderer?.();
+      unregisterIpc?.();
+      runtime?.close();
+      bootstrapClient?.close();
+      document.body.replaceChildren();
+      if (started !== undefined) await stopChild(started.child);
       await rm(directory, { recursive: true, force: true });
     }
   });

@@ -74,6 +74,10 @@ export interface GovernanceAuthorityTransport extends SyncTransport {
   }): Promise<DepartureConflictList>;
   execute(command: GovernanceAuthorityCommand): Promise<GovernanceWireAck>;
   onTerminalRevoked(listener: () => void): () => void;
+  onRoomAccessChanged(listener: (
+    roomId: string,
+    change: "joined" | "updated" | "removed" | "archived",
+  ) => void): () => void;
   onConnectionFailure(listener: (error: GovernanceTransportError) => void): () => void;
   resetSession(): void;
   close(): void;
@@ -114,6 +118,11 @@ function text(value: unknown, bytes = 512): value is string {
 function count(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 0;
 }
+function timestamp(value: unknown): value is string {
+  if (!text(value, 64)) return false;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
+}
 
 type ParsedFrame =
   | { readonly type: "auth.authenticated"; readonly requestId: string; readonly actorId: string; readonly sessionId: string }
@@ -124,6 +133,13 @@ type ParsedFrame =
   | { readonly type: "room.subscribe.v2.retry"; readonly requestId: string; readonly roomId: string; readonly reason: "gate_overflow"; readonly restartFrom: RoomCursor }
   | { readonly type: "room.event"; readonly event: DesktopRoomEvent }
   | { readonly type: "auth.session-revoked"; readonly eventId: string }
+  | {
+      readonly type: "identity.room-access.changed";
+      readonly eventId: string;
+      readonly actorId: string;
+      readonly roomId: string;
+      readonly change: "joined" | "updated" | "removed" | "archived";
+    }
   | { readonly type: "error"; readonly requestId?: string; readonly error: GovernanceTransportError };
 
 const commands = new Set<GovernanceCommand>([
@@ -199,6 +215,24 @@ export function parseGovernanceServerFrame(raw: string): ParsedFrame | undefined
     case "auth.session-revoked":
       return exact(value, ["type", "eventId"]) && text(value.eventId, 512)
         ? { type: value.type, eventId: value.eventId } : undefined;
+    case "identity.room-access.changed":
+      return exact(value, [
+        "eventId", "streamKind", "streamId", "streamSeq", "actorId", "occurredAt", "type", "payload",
+      ]) && text(value.eventId, 512) && value.streamKind === "identity" &&
+        text(value.streamId, 256) && count(value.streamSeq) && value.streamSeq > 0 &&
+        text(value.actorId, 256) && value.actorId === value.streamId && timestamp(value.occurredAt) &&
+        record(value.payload) && exact(value.payload, ["roomId", "change"]) &&
+        text(value.payload.roomId, 256) &&
+        (value.payload.change === "joined" || value.payload.change === "updated" ||
+          value.payload.change === "removed" || value.payload.change === "archived")
+        ? {
+            type: value.type,
+            eventId: value.eventId,
+            actorId: value.actorId,
+            roomId: value.payload.roomId,
+            change: value.payload.change,
+          }
+        : undefined;
     case "error": {
       if (!exact(value, ["type", "status", "code", "message"], ["requestId", "details"]) ||
           typeof value.status !== "number" || !statuses.has(value.status) || typeof value.code !== "string" ||
@@ -221,6 +255,7 @@ interface LiveSubscription {
   readonly requestId: string;
   readonly observer: RoomSubscriptionObserver;
   cursor: RoomCursor;
+  delivery: Promise<void>;
   closed: boolean;
 }
 
@@ -244,6 +279,10 @@ export function createGovernanceWebSocketAuthority(options: {
   const pending = new Map<string, Pending>();
   const subscriptions = new Map<string, LiveSubscription>();
   const terminalListeners = new Set<() => void>();
+  const roomAccessChangedListeners = new Set<(
+    roomId: string,
+    change: "joined" | "updated" | "removed" | "archived",
+  ) => void>();
   const failureListeners = new Set<(error: GovernanceTransportError) => void>();
 
   const rejectAll = (error: GovernanceTransportError): void => {
@@ -252,6 +291,15 @@ export function createGovernanceWebSocketAuthority(options: {
   };
   const notifyFailure = (error: GovernanceTransportError): void => {
     for (const listener of [...failureListeners]) { try { listener(error); } catch { /* observer */ } }
+  };
+  const queueLiveDelivery = (
+    live: LiveSubscription,
+    deliver: () => Promise<void>,
+  ): void => {
+    live.delivery = live.delivery.then(async () => {
+      if (!live.closed) await deliver();
+    });
+    void live.delivery.catch(() => protocolFailure());
   };
   const disposeSocket = (code = 1000, reason = "replace connection"): void => {
     const current = socket;
@@ -276,12 +324,43 @@ export function createGovernanceWebSocketAuthority(options: {
       for (const listener of [...terminalListeners]) listener();
       return;
     }
+    if (frame.type === "identity.room-access.changed") {
+      if (frame.actorId !== options.session()?.actorId) { protocolFailure(); return; }
+      for (const listener of [...roomAccessChangedListeners]) listener(frame.roomId, frame.change);
+      return;
+    }
     if (frame.type === "room.event") {
       const live = subscriptions.get(frame.event.roomId);
-      if (live === undefined || live.closed || frame.event.streamSeq <= live.cursor.afterSeq) return;
-      live.cursor = { version: 1, roomId: frame.event.roomId, afterSeq: frame.event.streamSeq };
-      void live.observer.events([frame.event], live.cursor).catch(() => protocolFailure());
+      if (live === undefined || live.closed) return;
+      queueLiveDelivery(live, async () => {
+        if (frame.event.streamSeq <= live.cursor.afterSeq) return;
+        const cursor = {
+          version: 1 as const,
+          roomId: frame.event.roomId,
+          afterSeq: frame.event.streamSeq,
+        };
+        await live.observer.events([frame.event], cursor);
+        live.cursor = cursor;
+      });
       return;
+    }
+    if (frame.type === "room.sync.result") {
+      const live = [...subscriptions.values()].find(
+        (candidate) => candidate.requestId === frame.requestId,
+      );
+      if (live === undefined) {
+        // Ordinary room.sync RPC responses are resolved by the generic pending-request path.
+      } else if (live.closed || frame.mode !== "delta" ||
+          frame.nextCursor.roomId !== live.cursor.roomId) {
+        protocolFailure();
+        return;
+      } else {
+        queueLiveDelivery(live, async () => {
+          await live.observer.events(frame.events, frame.nextCursor);
+          live.cursor = structuredClone(frame.nextCursor);
+        });
+        return;
+      }
     }
     if (frame.type === "room.subscribe.v2.retry") {
       const live = subscriptions.get(frame.roomId);
@@ -401,12 +480,19 @@ export function createGovernanceWebSocketAuthority(options: {
       { type: "snapshot.complete", requestId, snapshotId, version, snapshotChecksum: checksum }, "snapshot.completed"),
     async subscribeRoom(roomId, cursor, observer): Promise<RoomSubscription> {
       const requestId = `room-subscribe-${++sequence}`;
-      const live: LiveSubscription = { requestId, observer, cursor: structuredClone(cursor), closed: false };
+      const live: LiveSubscription = {
+        requestId,
+        observer,
+        cursor: structuredClone(cursor),
+        delivery: Promise.resolve(),
+        closed: false,
+      };
       subscriptions.set(roomId, live);
       try {
         const response = await exactRequest<Extract<ParsedFrame, { type: "room.subscribed.v2" }>>(
           { type: "room.subscribe.v2", requestId, roomId, cursor }, "room.subscribed.v2");
         if (response.roomId !== roomId) throw new GovernanceTransportError("protocol_error");
+        await live.delivery;
         live.cursor = structuredClone(response.cursor);
         return { get cursor() { return structuredClone(live.cursor); }, close() {
           live.closed = true;
@@ -438,6 +524,10 @@ export function createGovernanceWebSocketAuthority(options: {
       return response;
     },
     onTerminalRevoked(listener) { terminalListeners.add(listener); return () => terminalListeners.delete(listener); },
+    onRoomAccessChanged(listener) {
+      roomAccessChangedListeners.add(listener);
+      return () => roomAccessChangedListeners.delete(listener);
+    },
     onConnectionFailure(listener) { failureListeners.add(listener); return () => failureListeners.delete(listener); },
     resetSession() {
       terminal = false;
@@ -449,7 +539,8 @@ export function createGovernanceWebSocketAuthority(options: {
       if (closed) return;
       closed = true;
       rejectAll(new GovernanceTransportError("client_closed"));
-      subscriptions.clear(); terminalListeners.clear(); failureListeners.clear(); disposeSocket(1000, "client closed");
+      subscriptions.clear(); terminalListeners.clear(); roomAccessChangedListeners.clear();
+      failureListeners.clear(); disposeSocket(1000, "client closed");
     },
   };
 }

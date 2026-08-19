@@ -65,23 +65,7 @@ export interface ClientAuthorityCache {
   clear(): void;
 }
 
-/** Desktop compatibility contract for the approved FT-02C event while Core lands in the integration tree. */
-export interface DesktopRoomReopenedEvent {
-  readonly eventId: string;
-  readonly streamKind: "room";
-  readonly streamId: string;
-  readonly streamSeq: number;
-  readonly roomId: string;
-  readonly actorId: string;
-  readonly occurredAt: string;
-  readonly type: "room.reopened";
-  readonly payload: {
-    readonly archiveGeneration: number;
-    readonly resumedTimerCount: number;
-  };
-}
-
-export type DesktopRoomEvent = PersistedRoomEvent | DesktopRoomReopenedEvent;
+export type DesktopRoomEvent = PersistedRoomEvent;
 export type DesktopRoomSyncResult =
   | Exclude<RoomSyncResult, { readonly mode: "delta" }>
   | (Omit<Extract<RoomSyncResult, { readonly mode: "delta" }>, "events"> & {
@@ -106,16 +90,6 @@ function count(value: unknown): value is number {
 }
 
 export function isDesktopRoomEvent(value: unknown): value is DesktopRoomEvent {
-  if (record(value) && value.type === "room.reopened") {
-    return exact(value, [
-      "eventId", "streamKind", "streamId", "streamSeq", "roomId", "actorId", "occurredAt", "type", "payload",
-    ]) && text(value.eventId) && value.streamKind === "room" && text(value.streamId) &&
-      value.streamId === value.roomId && count(value.streamSeq) && value.streamSeq > 0 &&
-      text(value.roomId) && text(value.actorId) && text(value.occurredAt) && record(value.payload) &&
-      exact(value.payload, ["archiveGeneration", "resumedTimerCount"]) &&
-      count(value.payload.archiveGeneration) && value.payload.archiveGeneration > 0 &&
-      count(value.payload.resumedTimerCount);
-  }
   if (!record(value) || !text(value.roomId) || !count(value.streamSeq)) return false;
   return isRoomSyncResult({
     type: "room.sync.result", requestId: "desktop-event-validation", mode: "delta", events: [value],
@@ -342,7 +316,10 @@ export function createClientSyncReplica(options: {
     if (fresh.length > 0) {
       let governance: RoomGovernanceView | undefined;
       for (const event of fresh) {
-        if (event.type === "room.governance.changed") governance = event.payload.governance;
+        if (event.type === "room.governance.changed" || event.type === "room.archived" ||
+            event.type === "room.reopened" || event.type === "room.security.reduced") {
+          governance = event.payload.governance;
+        }
       }
       try {
         options.governanceObserver?.applied({

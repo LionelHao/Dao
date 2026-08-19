@@ -57,14 +57,19 @@ function event(
   return type === "room.governance.changed"
     ? { ...base, type, payload: { governance: governance(lifecycle, revision) } }
     : type === "room.reopened"
-      ? { ...base, type, payload: { archiveGeneration: 1, resumedTimerCount: 0 } }
-    : { ...base, type, payload: { room: room(lifecycle) } };
+      ? { ...base, type, payload: {
+          governance: governance(lifecycle, revision), archiveGeneration: 1, resumedTimerCount: 0,
+        } }
+      : { ...base, type, payload: {
+          governance: governance(lifecycle, revision), archiveGeneration: 1, frozenTimerCount: 0,
+        } };
 }
 
 async function loopbackAuthority(): Promise<{
   readonly endpoint: string;
   readonly received: readonly Record<string, unknown>[];
   disconnect(): void;
+  removeRoomAccess(): void;
 }> {
   const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
   servers.push(server);
@@ -116,6 +121,10 @@ async function loopbackAuthority(): Promise<{
           return;
         }
         case "room.subscribe.v2":
+          send({
+            type: "room.sync.result", requestId, mode: "delta", events: [],
+            nextCursor: frame.cursor, watermark, hasMore: false,
+          });
           send({ type: "room.subscribed.v2", requestId, roomId: "room-1", cursor: frame.cursor, watermark });
           return;
         case "room.departure.conflicts":
@@ -159,6 +168,13 @@ async function loopbackAuthority(): Promise<{
     endpoint: `ws://127.0.0.1:${address.port}`,
     received,
     disconnect() { for (const client of server.clients) client.terminate(); },
+    removeRoomAccess() {
+      for (const client of server.clients) client.send(JSON.stringify({
+        eventId: "identity-room-removed", streamKind: "identity", streamId: "owner-1",
+        streamSeq: 3, actorId: "owner-1", occurredAt: "2026-08-19T08:10:00.000Z",
+        type: "identity.room-access.changed", payload: { roomId: "room-1", change: "removed" },
+      }));
+    },
   };
 }
 
@@ -184,6 +200,19 @@ describe("production Desktop Governance loopback wire contract fixture", () => {
       type: "room.departure.conflicts", requestId: "r", conflicts: {
         roomId: "room-1", targetActorId: "member-1", governanceRevision: 7, conflicts: [],
       },
+    }))).toBeUndefined();
+    expect(parseGovernanceServerFrame(JSON.stringify({
+      eventId: "identity-room-removed", streamKind: "identity", streamId: "owner-1",
+      streamSeq: 3, actorId: "owner-1", occurredAt: "2026-08-19T08:10:00.000Z",
+      type: "identity.room-access.changed", payload: { roomId: "room-1", change: "removed" },
+    }))).toMatchObject({
+      type: "identity.room-access.changed", actorId: "owner-1", roomId: "room-1", change: "removed",
+    });
+    expect(parseGovernanceServerFrame(JSON.stringify({
+      eventId: "identity-room-removed", streamKind: "identity", streamId: "owner-1",
+      streamSeq: 3, actorId: "owner-1", occurredAt: "2026-08-19T08:10:00.000Z",
+      type: "identity.room-access.changed",
+      payload: { roomId: "room-1", change: "removed", accessToken: "injected" },
     }))).toBeUndefined();
   });
 
@@ -270,11 +299,14 @@ describe("production Desktop Governance loopback wire contract fixture", () => {
     await expect(runtime.controller.getSurface({ roomId: "room-1" })).resolves.toMatchObject({
       status: "ready", connection: { status: "online" },
     });
-    runtime.invalidateAuthorizedState();
+    authority.removeRoomAccess();
+    await vi.waitFor(() => expect(runtime.controller.current("room-1")).toMatchObject({
+      status: "locked", connection: { status: "revoked", scope: "room", purgeCompleted: true },
+    }));
     expect(runtime.cache.governanceProjection("room-1")).toBeUndefined();
     expect(runtime.controller.current("room-1")).toEqual({
       status: "locked", roomId: "room-1",
-      connection: { status: "revoked", scope: "session", purgeCompleted: true },
+      connection: { status: "revoked", scope: "room", purgeCompleted: true },
     });
     runtime.close();
   });

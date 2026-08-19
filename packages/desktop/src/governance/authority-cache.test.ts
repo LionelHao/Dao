@@ -63,32 +63,37 @@ describe("production Desktop authority cache", () => {
     cache.stageRoomPage(repair);
     expect(await cache.finalizeRoom(repair.snapshotId, repair.snapshotChecksum)).toBe(true);
     cache.commitRoom("room-1", 9, repair.snapshotChecksum);
-    const archivedRoom = {
-      id: "room-1", name: "Alpha", status: "archived" as const,
-      createdAt: "2026-08-19T00:00:00.000Z",
-      members: records.filter((record) => record.kind === "membership").map((record) => record.value),
+    const archivedGovernance = {
+      roomId: "room-1", projectId: "room-1", lifecycle: "archived" as const,
+      governanceRevision: 8, ownerActorId: "owner-1", archiveGeneration: 1,
+      archivedAt: "2026-08-19T00:01:00.000Z",
     };
     const events: readonly PersistedRoomEvent[] = [
       {
         eventId: "event-room-archived", streamKind: "room", streamId: "room-1", streamSeq: 10,
         roomId: "room-1", actorId: "owner-1", occurredAt: "2026-08-19T00:01:00.000Z",
-        type: "room.archived", payload: { room: archivedRoom },
+        type: "room.archived", payload: {
+          governance: archivedGovernance, archiveGeneration: 1, frozenTimerCount: 0,
+        },
       },
       {
-        eventId: "event-governance", streamKind: "room", streamId: "room-1", streamSeq: 11,
-        roomId: "room-1", actorId: "owner-1", occurredAt: "2026-08-19T00:01:00.000Z",
-        type: "room.governance.changed",
+        eventId: "event-room-reopened", streamKind: "room", streamId: "room-1", streamSeq: 11,
+        roomId: "room-1", actorId: "owner-1", occurredAt: "2026-08-19T00:02:00.000Z",
+        type: "room.reopened",
         payload: { governance: {
-          roomId: "room-1", projectId: "room-1", lifecycle: "archived",
-          governanceRevision: 8, ownerActorId: "owner-1", archiveGeneration: 1,
-          archivedAt: "2026-08-19T00:01:00.000Z",
-        } },
+          roomId: "room-1", projectId: "room-1", lifecycle: "active",
+          governanceRevision: 9, ownerActorId: "owner-1", archiveGeneration: 1,
+        }, archiveGeneration: 1, resumedTimerCount: 0 },
       },
     ];
-    cache.applyRoomEvents("room-1", events, { version: 1, roomId: "room-1", afterSeq: 11 });
+    cache.applyRoomEvents("room-1", [events[0]!], { version: 1, roomId: "room-1", afterSeq: 10 });
     expect(cache.governanceProjection("room-1")).toMatchObject({
       lifecycle: "archived", governanceRevision: 8, archiveGeneration: 1,
       archivedAt: "2026-08-19T00:01:00.000Z",
+    });
+    cache.applyRoomEvents("room-1", [events[1]!], { version: 1, roomId: "room-1", afterSeq: 11 });
+    expect(cache.governanceProjection("room-1")).toMatchObject({
+      lifecycle: "active", governanceRevision: 9, archiveGeneration: 1,
     });
   });
 });
