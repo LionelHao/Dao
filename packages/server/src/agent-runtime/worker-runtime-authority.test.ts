@@ -6,6 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
 import type { Actor } from "@native-im/core";
 import { createSqliteAuthoritativeStore } from "../persistence/sqlite-authoritative-store.js";
+import { insertLegacyMessageAuthorityRecord } from "../persistence/message-authority-legacy-adapter.js";
 import { migrateAuthorityDatabase } from "../persistence/schema.js";
 import { createWorkerDatabaseClient } from "../persistence/worker-database-client.js";
 import { createWorkerRuntimeAuthority } from "./worker-runtime-authority.js";
@@ -64,17 +65,17 @@ describe("real AuthorityWorker runtime authority", () => {
            NULL, '2026-08-17T00:00:00.000Z', 0);
         UPDATE rooms SET owner_actor_id = 'human-runtime', governance_revision = 1
         WHERE id = 'room-runtime';
-        INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
-        VALUES
-          ('message-runtime-1', 'room-runtime', 'human-runtime', 'human', 'first', '2026-08-17T00:00:01.000Z'),
-          ('message-runtime-2', 'room-runtime', 'human-runtime', 'human', 'second', '2026-08-17T00:00:02.000Z'),
-          ('message-runtime-3', 'room-runtime', 'human-runtime', 'human', 'third', '2026-08-17T00:00:03.000Z'),
-          ('message-runtime-4', 'room-runtime', 'human-runtime', 'human', 'fourth', '2026-08-17T00:00:04.000Z');
-        INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
-        VALUES
-          ('message-runtime-5', 'room-runtime', 'human-runtime', 'human', 'fifth', '2026-08-17T00:00:05.000Z'),
-          ('message-runtime-6', 'room-runtime', 'human-runtime', 'human', 'sixth', '2026-08-17T00:00:06.000Z');
       `);
+      for (const [index, body] of ["first", "second", "third", "fourth", "fifth", "sixth"].entries()) {
+        insertLegacyMessageAuthorityRecord(database, {
+          id: `message-runtime-${index + 1}`,
+          roomId: "room-runtime",
+          authorId: "human-runtime",
+          authorKind: "human",
+          body,
+          sentAt: `2026-08-17T00:00:0${index + 1}.000Z`,
+        });
+      }
       database.close();
 
       const context = {

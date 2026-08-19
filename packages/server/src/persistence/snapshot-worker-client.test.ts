@@ -33,6 +33,10 @@ import type {
   StreamingRepairLease,
 } from "./contracts.js";
 import { mintInternalAgentCommandContext } from "./contracts.js";
+import {
+  createLegacyMessageAuthorityInserter,
+  insertLegacyMessageAuthorityRecord,
+} from "./message-authority-legacy-adapter.js";
 import { createWorkerDatabaseClient } from "./worker-database-client.js";
 
 const temporaryDirectories: string[] = [];
@@ -100,6 +104,7 @@ function seedRoom(
   roomId: string,
   messageCount = 0,
   body: (index: number) => string = (index) => `message-${index}`,
+  agentMessage?: { readonly index: number; readonly actorId: string },
 ): void {
   database.prepare(
     "INSERT INTO rooms (id, name, status, created_at) VALUES (?, ?, 'active', ?)",
@@ -117,14 +122,17 @@ function seedRoom(
     `INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
      VALUES ('room', ?, ?, 1)`,
   ).run(roomId, messageCount);
-  const insert = database.prepare(
-    `INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
-     VALUES (?, ?, ?, 'human', ?, ?)`,
-  );
+  const insertMessage = createLegacyMessageAuthorityInserter(database);
   for (let index = 0; index < messageCount; index += 1) {
-    insert.run(`message-${String(index).padStart(4, "0")}`, roomId,
-      context.principal.actorId, body(index),
-      new Date(Date.UTC(2026, 7, 11, 0, 0, index)).toISOString());
+    const agentAuthored = agentMessage?.index === index;
+    insertMessage({
+      id: `message-${String(index).padStart(4, "0")}`,
+      roomId,
+      authorId: agentAuthored ? agentMessage.actorId : context.principal.actorId,
+      authorKind: agentAuthored ? "agent" : "human",
+      body: body(index),
+      sentAt: new Date(Date.UTC(2026, 7, 11, 0, 0, index)).toISOString(),
+    });
   }
 }
 
@@ -134,19 +142,14 @@ function seedClosedMixedStressRecords(
   roomId: string,
 ): void {
   database.prepare(
-    `INSERT INTO actors (
+    `INSERT OR IGNORE INTO actors (
        id, kind, display_name, reachability, readiness, tool_permissions_json
      ) VALUES ('stress-agent', 'agent', 'Stress Agent', NULL, 'ready', '["review.read"]')`,
   ).run();
   database.prepare(
-    `INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+    `INSERT OR IGNORE INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
      VALUES ('identity', 'stress-agent', 0, 1)`,
   ).run();
-  database.prepare(
-    `UPDATE messages
-     SET author_id = 'stress-agent', author_kind = 'agent'
-     WHERE id = 'message-9999' AND room_id = ?`,
-  ).run(roomId);
   database.prepare(
     `INSERT INTO room_memberships (
        room_id, actor_id, kind, role, participation, tool_permissions_json,
@@ -201,7 +204,8 @@ function seedClosedMixedStressRecords(
 
 async function createDatabaseFixture(options: {
   readonly rooms?: readonly { readonly roomId: string; readonly messageCount?: number;
-    readonly body?: (index: number) => string }[];
+    readonly body?: (index: number) => string;
+    readonly agentMessage?: { readonly index: number; readonly actorId: string } }[];
   readonly contexts?: readonly AuthenticatedSessionContext[];
   readonly catalogRevision?: number;
 } = {}) {
@@ -216,8 +220,17 @@ async function createDatabaseFixture(options: {
   try {
     for (const context of contexts) seedHuman(database, context, options.catalogRevision ?? 0);
     for (const room of options.rooms ?? []) {
+      if (room.agentMessage !== undefined) {
+        database.prepare(
+          `INSERT OR IGNORE INTO actors (
+             id, kind, display_name, reachability, readiness, tool_permissions_json
+           ) VALUES (?, 'agent', 'Stress Agent', NULL, 'ready', '["review.read"]')`,
+        ).run(room.agentMessage.actorId);
+      }
+    }
+    for (const room of options.rooms ?? []) {
       seedRoom(database, contexts[0]!, room.roomId, room.messageCount,
-        room.body ?? ((index) => `message-${index}`));
+        room.body ?? ((index) => `message-${index}`), room.agentMessage);
     }
     database.exec("COMMIT");
   } catch (cause: unknown) {
@@ -453,12 +466,14 @@ describe("durable materialized snapshot worker", () => {
        ) VALUES ('room-mixed', 'agent-a', 'agent', NULL, 'active', '["tool"]',
          NULL, '2026-08-11T00:00:01.000Z', 0)`,
     ).run();
-    database.prepare(
-      `INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
-       VALUES
-       ('message-agent', 'room-mixed', 'agent-a', 'agent', 'agent answer', '2026-08-11T00:00:03.000Z'),
-       ('message-human', 'room-mixed', ?, 'human', 'question', '2026-08-11T00:00:02.000Z')`,
-    ).run(context.principal.actorId);
+    insertLegacyMessageAuthorityRecord(database, {
+      id: "message-agent", roomId: "room-mixed", authorId: "agent-a",
+      authorKind: "agent", body: "agent answer", sentAt: "2026-08-11T00:00:03.000Z",
+    });
+    insertLegacyMessageAuthorityRecord(database, {
+      id: "message-human", roomId: "room-mixed", authorId: context.principal.actorId,
+      authorKind: "human", body: "question", sentAt: "2026-08-11T00:00:02.000Z",
+    });
     database.prepare(
       `INSERT INTO human_read_receipts (room_id, actor_id, message_id, read_at)
        VALUES ('room-mixed', ?, 'message-agent', '2026-08-11T00:00:04.000Z')`,
@@ -1147,7 +1162,8 @@ describe("durable materialized snapshot worker", () => {
     const fixture = await createDatabaseFixture({
       contexts: [original, refreshed, otherFamily],
       rooms: [
-        { roomId: "stream-room", messageCount: 10_000 },
+        { roomId: "stream-room", messageCount: 10_000,
+          agentMessage: { index: 9_999, actorId: "stress-agent" } },
         { roomId: "unrelated-room", messageCount: 0 },
       ],
     });
@@ -1392,7 +1408,8 @@ describe("durable materialized snapshot worker", () => {
     "automatically streams after %s materialization fallback",
     async (reason) => {
       const fixture = await createDatabaseFixture({
-        rooms: [{ roomId: `automatic-${reason}`, messageCount: 10_000 }],
+        rooms: [{ roomId: `automatic-${reason}`, messageCount: 10_000,
+          agentMessage: { index: 9_999, actorId: "stress-agent" } }],
       });
       const context = fixture.contexts[0]!;
       const normalized = new DatabaseSync(fixture.authorityPath);

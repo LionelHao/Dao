@@ -4,11 +4,10 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import {
-  AUTHORITY_SCHEMA_VERSION,
   AUTHORITY_V15_STATEMENT_COUNT_FOR_TEST,
-  migrateAuthorityDatabase,
   migrateAuthorityDatabaseToHistoricalVersionForTest,
-  migrateAuthorityDatabaseToPreviousVersionForTest,
+  migrateAuthorityDatabaseToVersion14ForTest,
+  migrateAuthorityDatabaseToVersion15ForTest,
   readSchemaVersion,
 } from "./schema.js";
 
@@ -39,11 +38,11 @@ function authorityTableCounts(database: DatabaseSync): Readonly<Record<string, n
 
 describe("authority SQLite v15 room lifecycle audit vocabulary", () => {
   it("upgrades every immutable historical authority schema through v15", () => {
-    for (let version = 1; version < AUTHORITY_SCHEMA_VERSION; version += 1) {
+    for (let version = 1; version < 15; version += 1) {
       withDatabase((database) => {
         migrateAuthorityDatabaseToHistoricalVersionForTest(database, version);
         expect(readSchemaVersion(database)).toBe(version);
-        migrateAuthorityDatabase(database);
+        migrateAuthorityDatabaseToVersion15ForTest(database);
         expect(readSchemaVersion(database)).toBe(15);
         expect(database.prepare(
           "SELECT COUNT(*) AS count FROM schema_migrations",
@@ -54,9 +53,8 @@ describe("authority SQLite v15 room lifecycle audit vocabulary", () => {
 
   it("persists truthful member-left and room-reopened audit facts", () => {
     withDatabase((database) => {
-      migrateAuthorityDatabase(database);
+      migrateAuthorityDatabaseToVersion15ForTest(database);
 
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(15);
       expect(readSchemaVersion(database)).toBe(15);
 
       database.exec(`
@@ -120,7 +118,7 @@ describe("authority SQLite v15 room lifecycle audit vocabulary", () => {
       failAfterStatement += 1
     ) {
       withDatabase((database) => {
-        migrateAuthorityDatabaseToPreviousVersionForTest(database);
+        migrateAuthorityDatabaseToVersion14ForTest(database);
         expect(readSchemaVersion(database)).toBe(14);
         database.exec(`
           INSERT INTO actors (id, kind, display_name)
@@ -147,7 +145,10 @@ describe("authority SQLite v15 room lifecycle audit vocabulary", () => {
           );
         `);
 
-        expect(() => migrateAuthorityDatabase(database, { failAfterStatement }))
+        expect(() => migrateAuthorityDatabaseToVersion15ForTest(
+          database,
+          { failAfterStatement },
+        ))
           .toThrow(/injected migration failure/i);
 
         expect(readSchemaVersion(database)).toBe(14);
@@ -172,7 +173,7 @@ describe("authority SQLite v15 room lifecycle audit vocabulary", () => {
 
   it("allows remove, re-add, and remove again in one lifecycle generation", () => {
     withDatabase((database) => {
-      migrateAuthorityDatabase(database);
+      migrateAuthorityDatabaseToVersion15ForTest(database);
       database.exec(`
         INSERT INTO actors (id, kind, display_name)
         VALUES ('cycle-owner', 'human', 'Owner'), ('cycle-target', 'human', 'Target');
@@ -223,7 +224,7 @@ describe("authority SQLite v15 room lifecycle audit vocabulary", () => {
 
   it("preserves complete v14 row counts, provider ledgers, actions, and sealed secrets", () => {
     withDatabase((database) => {
-      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      migrateAuthorityDatabaseToVersion14ForTest(database);
       database.exec(`
         INSERT INTO actors (id, kind, display_name)
         VALUES ('preserve-owner', 'human', 'Owner');
@@ -297,7 +298,7 @@ describe("authority SQLite v15 room lifecycle audit vocabulary", () => {
       `);
       const before = authorityTableCounts(database);
 
-      migrateAuthorityDatabase(database);
+      migrateAuthorityDatabaseToVersion15ForTest(database);
 
       expect(authorityTableCounts(database)).toEqual(before);
       expect(database.prepare(
@@ -324,7 +325,7 @@ describe("authority SQLite v15 room lifecycle audit vocabulary", () => {
 
   it("preserves v14 rows and makes the expanded v15 audit immutable", () => {
     withDatabase((database) => {
-      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      migrateAuthorityDatabaseToVersion14ForTest(database);
       database.exec(`
         INSERT INTO actors (id, kind, display_name)
         VALUES ('history-owner', 'human', 'Owner');
@@ -348,7 +349,7 @@ describe("authority SQLite v15 room lifecycle audit vocabulary", () => {
         );
       `);
 
-      migrateAuthorityDatabase(database);
+      migrateAuthorityDatabaseToVersion15ForTest(database);
 
       expect(database.prepare(
         "SELECT id, type, result FROM room_audit",

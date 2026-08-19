@@ -32,6 +32,7 @@ import {
   readSchemaVersion,
 } from "./schema.js";
 import { MAX_ACTIVE_SESSION_FAMILIES } from "./contracts.js";
+import { insertLegacyMessageAuthorityRecord } from "./message-authority-legacy-adapter.js";
 
 const IMPORT_MARKER_SCOPE = "__authority_legacy_import__";
 const IMPORT_MARKER_KEY = "t0039-v1";
@@ -450,20 +451,8 @@ function importRows(
         auditDetails(audit),
       );
     }
-    const insertMessage = database.prepare(
-      `INSERT INTO messages (
-         id, room_id, author_id, author_kind, body, sent_at
-       ) VALUES (?, ?, ?, ?, ?, ?)`,
-    );
     for (const message of state.messages) {
-      insertMessage.run(
-        message.id,
-        message.roomId,
-        message.authorId,
-        message.authorKind,
-        message.body,
-        message.sentAt,
-      );
+      insertLegacyMessageAuthorityRecord(database, message);
     }
     const insertStream = database.prepare(
       `INSERT INTO streams (

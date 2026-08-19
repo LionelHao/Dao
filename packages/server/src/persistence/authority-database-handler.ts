@@ -100,6 +100,7 @@ import {
   type ReopenAfterCommitRescan,
 } from "../room-governance/archive-coordinator.js";
 import { AuthorityParticipantUnavailableError } from "../room-governance/private-participant-registry.js";
+import { insertLegacyMessageAuthorityRecord } from "./message-authority-legacy-adapter.js";
 import {
   coordinateMemberAccessRevocationInTransaction,
   MemberAccessRevocationError,
@@ -3204,19 +3205,7 @@ function executeMessageSend(
     "message",
     stableId("message-gate", scope, key),
   );
-  database
-    .prepare(
-      `INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    )
-    .run(
-      message.id,
-      message.roomId,
-      message.authorId,
-      message.authorKind,
-      message.body,
-      message.sentAt,
-    );
+  insertLegacyMessageAuthorityRecord(database, message);
   afterDomainWrite?.();
   const streamSeq = appendRoomEvent(database, {
     eventId,
@@ -4629,6 +4618,83 @@ function appendRuntimeExecutionEvent(
   );
 }
 
+function insertLegacyRuntimeInvocationLineage(
+  database: DatabaseSync,
+  input: {
+    readonly intentId: string;
+    readonly roomId: string;
+    readonly sourceMessageId: string;
+    readonly targetAgentId: string;
+    readonly requesterActorId: string;
+    readonly intentKind: "direct_mention" | "structured_help" | "routed_candidate";
+    readonly executionId: string;
+    readonly createdAt: string;
+  },
+): void {
+  database.prepare(
+    `INSERT INTO agent_invocation_intents (
+       id, room_id, source_message_id, target_agent_id, requester_actor_id,
+       intent_kind, execution_id, created_at, message_transaction_id, target_id,
+       source_revision, lineage_id, turn_id, origin_kind, status, claimed_at,
+       cancelled_at, cancellation_reason, supersedes_intent_id
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 1, ?, 'legacy',
+               'legacy_runtime', 'claimed', ?, NULL, NULL, NULL)`,
+  ).run(
+    input.intentId,
+    input.roomId,
+    input.sourceMessageId,
+    input.targetAgentId,
+    input.requesterActorId,
+    input.intentKind,
+    input.executionId,
+    input.createdAt,
+    input.intentId,
+    input.createdAt,
+  );
+  database.prepare(
+    `INSERT INTO agent_execution_intent_links (
+       intent_id, execution_id, execution_ordinal, retry_of_execution_id,
+       source_revision, linked_at
+     ) VALUES (?, ?, 1, NULL, 1, ?)`,
+  ).run(input.intentId, input.executionId, input.createdAt);
+}
+
+function linkDerivedRuntimeExecution(
+  database: DatabaseSync,
+  input: {
+    readonly sourceExecutionId: string;
+    readonly derivedExecutionId: string;
+    readonly linkedAt: string;
+  },
+): void {
+  const lineage = database.prepare(
+    `SELECT link.intent_id AS intentId, link.source_revision AS sourceRevision,
+            COALESCE(MAX(existing.execution_ordinal), 0) + 1 AS executionOrdinal
+     FROM agent_execution_intent_links AS link
+     JOIN agent_execution_intent_links AS existing ON existing.intent_id = link.intent_id
+     WHERE link.execution_id = ?
+     GROUP BY link.intent_id, link.source_revision`,
+  ).get(input.sourceExecutionId);
+  if (typeof lineage?.intentId !== "string" ||
+      typeof lineage.sourceRevision !== "number" ||
+      typeof lineage.executionOrdinal !== "number") {
+    return fail("execution_conflict", "Derived Agent execution lineage was stale");
+  }
+  database.prepare(
+    `INSERT INTO agent_execution_intent_links (
+       intent_id, execution_id, execution_ordinal, retry_of_execution_id,
+       source_revision, linked_at
+     ) VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(
+    lineage.intentId,
+    input.derivedExecutionId,
+    lineage.executionOrdinal,
+    input.sourceExecutionId,
+    lineage.sourceRevision,
+    input.linkedAt,
+  );
+}
+
 function requireRuntimeHumanAuthority(
   database: DatabaseSync,
   context: AuthenticatedCommandContext,
@@ -5484,13 +5550,16 @@ export function executeRuntimeAuthorityOperation(
            action_category, recovery_cursor
          ) VALUES (?, 1, 1, 1, 'queued', 'model_generation', 0)`,
       ).run(executionId);
-      database.prepare(
-        `INSERT INTO agent_invocation_intents (
-           id, room_id, source_message_id, target_agent_id, requester_actor_id,
-           intent_kind, execution_id, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).run(intentId, route.roomId, route.sourceMessageId, operation.targetAgentId,
-        route.requesterId, route.intentKind, executionId, occurredAt);
+      insertLegacyRuntimeInvocationLineage(database, {
+        intentId,
+        roomId: route.roomId,
+        sourceMessageId: route.sourceMessageId,
+        targetAgentId: operation.targetAgentId,
+        requesterActorId: route.requesterId,
+        intentKind: route.intentKind,
+        executionId,
+        createdAt: occurredAt,
+      });
       for (const old of oldRows) {
         database.prepare(
           `INSERT INTO agent_fence_replacements (
@@ -5656,21 +5725,16 @@ export function executeRuntimeAuthorityOperation(
            recovery_cursor
          ) VALUES (?, 1, 1, 1, 'queued', 'model_generation', NULL, NULL, NULL, NULL, 0)`,
       ).run(operation.executionId);
-      database.prepare(
-        `INSERT INTO agent_invocation_intents (
-           id, room_id, source_message_id, target_agent_id, requester_actor_id,
-           intent_kind, execution_id, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).run(
-        operation.intentId,
-        operation.intent.roomId,
-        operation.intent.sourceMessageId,
-        operation.intent.targetAgentId,
-        requesterId,
-        operation.intent.kind,
-        operation.executionId,
-        occurredAt,
-      );
+      insertLegacyRuntimeInvocationLineage(database, {
+        intentId: operation.intentId,
+        roomId: operation.intent.roomId,
+        sourceMessageId: operation.intent.sourceMessageId,
+        targetAgentId: operation.intent.targetAgentId,
+        requesterActorId: requesterId,
+        intentKind: operation.intent.kind,
+        executionId: operation.executionId,
+        createdAt: occurredAt,
+      });
       const execution = runtimeExecutionById(database, operation.executionId);
       appendRuntimeExecutionEvent(database, execution, occurredAt, "queued");
       return { kind: "invocation", execution, replayed: false };
@@ -5774,21 +5838,16 @@ export function executeRuntimeAuthorityOperation(
            recovery_cursor
          ) VALUES (?, 1, 1, 1, 'queued', 'model_generation', NULL, NULL, NULL, NULL, 0)`,
       ).run(operation.executionId);
-      database.prepare(
-        `INSERT INTO agent_invocation_intents (
-           id, room_id, source_message_id, target_agent_id, requester_actor_id,
-           intent_kind, execution_id, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).run(
-        operation.intentId,
-        operation.intent.roomId,
-        operation.intent.sourceMessageId,
-        operation.intent.targetAgentId,
-        routeIntent.requesterId,
-        operation.intent.kind,
-        operation.executionId,
-        occurredAt,
-      );
+      insertLegacyRuntimeInvocationLineage(database, {
+        intentId: operation.intentId,
+        roomId: operation.intent.roomId,
+        sourceMessageId: operation.intent.sourceMessageId,
+        targetAgentId: operation.intent.targetAgentId,
+        requesterActorId: routeIntent.requesterId,
+        intentKind: operation.intent.kind,
+        executionId: operation.executionId,
+        createdAt: occurredAt,
+      });
       const execution = runtimeExecutionById(database, operation.executionId);
       appendRuntimeExecutionEvent(database, execution, occurredAt, "queued");
       return { kind: "invocation", execution, replayed: false };
@@ -5845,10 +5904,6 @@ export function executeRuntimeAuthorityOperation(
         "message",
         stableId("runtime-complete-message-gate", current.id, String(operation.attemptSeq)),
       );
-      database.prepare(
-        `INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
-         VALUES (?, ?, ?, 'agent', ?, ?)`,
-      ).run(operation.messageId, current.roomId, current.agentId, operation.body, occurredAt);
       const messageEventId = stableId("runtime-message", current.id, String(operation.attemptSeq));
       const message = {
         id: operation.messageId,
@@ -5858,6 +5913,65 @@ export function executeRuntimeAuthorityOperation(
         body: operation.body,
         sentAt: occurredAt,
       };
+      insertLegacyMessageAuthorityRecord(database, message);
+      const source = database.prepare(
+        `SELECT intent.id AS invocationIntentId,
+                intent.source_message_id AS sourceMessageId,
+                intent.source_revision AS sourceRevision,
+                execution.execution_generation AS executionGeneration
+         FROM agent_executions AS execution
+         JOIN agent_execution_intent_links AS link
+           ON link.execution_id = execution.id
+         JOIN agent_invocation_intents AS intent ON intent.id = link.intent_id
+         WHERE execution.id = ? AND intent.room_id = execution.room_id
+           AND intent.target_agent_id = execution.agent_id
+           AND intent.status = 'claimed'`,
+      ).get(operation.executionId);
+      if (typeof source?.invocationIntentId !== "string" ||
+          typeof source.sourceMessageId !== "string" ||
+          typeof source.sourceRevision !== "number" ||
+          typeof source.executionGeneration !== "number") {
+        return fail("execution_conflict", "Agent completion lineage was stale");
+      }
+      database.prepare(
+        `INSERT INTO agent_message_sources (
+           message_id, room_id, invocation_intent_id, execution_id, attempt_seq,
+           execution_generation, source_message_id, source_revision, committed_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        operation.messageId,
+        current.roomId,
+        source.invocationIntentId,
+        operation.executionId,
+        operation.attemptSeq,
+        source.executionGeneration,
+        source.sourceMessageId,
+        source.sourceRevision,
+        occurredAt,
+      );
+      const attemptTerminal = database.prepare(
+        `UPDATE agent_execution_attempts SET status = 'completed', finished_at = ?
+         WHERE execution_id = ? AND attempt_seq = ? AND status = 'running'`,
+      ).run(occurredAt, operation.executionId, operation.attemptSeq);
+      if (attemptTerminal.changes !== 1) {
+        return fail("execution_conflict", "Agent completion attempt CAS was stale");
+      }
+      const executionTerminal = database.prepare(
+        `UPDATE agent_executions
+         SET status = 'completed', completed_at = ?, updated_at = ?, result_message_id = ?
+         WHERE id = ? AND current_attempt_seq = ? AND execution_generation = ?
+           AND status = 'running' AND result_message_id IS NULL`,
+      ).run(
+        occurredAt,
+        occurredAt,
+        operation.messageId,
+        operation.executionId,
+        operation.attemptSeq,
+        source.executionGeneration,
+      );
+      if (executionTerminal.changes !== 1) {
+        return fail("execution_conflict", "Agent completion execution CAS was stale");
+      }
       const messageSeq = appendRoomEvent(database, {
         eventId: messageEventId,
         roomId: current.roomId,
@@ -5868,15 +5982,6 @@ export function executeRuntimeAuthorityOperation(
       });
       appendRoomOutbox(database, messageEventId, current.roomId, messageSeq, occurredAt, "runtime", "message");
       enqueueRouteJobForMessage(database, message, occurredAt);
-      database.prepare(
-        `UPDATE agent_executions
-         SET status = 'completed', completed_at = ?, updated_at = ?, result_message_id = ?
-         WHERE id = ? AND current_attempt_seq = ? AND status = 'running'`,
-      ).run(occurredAt, occurredAt, operation.messageId, operation.executionId, operation.attemptSeq);
-      database.prepare(
-        `UPDATE agent_execution_attempts SET status = 'completed', finished_at = ?
-         WHERE execution_id = ? AND attempt_seq = ? AND status = 'running'`,
-      ).run(occurredAt, operation.executionId, operation.attemptSeq);
       const execution = runtimeExecutionById(database, operation.executionId);
       appendRuntimeExecutionEvent(database, execution, occurredAt, "completed");
       return { kind: "execution", execution };
@@ -6016,6 +6121,11 @@ export function executeRuntimeAuthorityOperation(
       ).run(operation.newExecutionId, old.roomId, roomArchiveGeneration,
         old.agentId, old.sourceMessageId, occurredAt,
         operation.context.principal.actorId, old.providerId ?? "openai-responses", old.modelId ?? "configured", occurredAt, occurredAt, old.id);
+      linkDerivedRuntimeExecution(database, {
+        sourceExecutionId: old.id,
+        derivedExecutionId: operation.newExecutionId,
+        linkedAt: occurredAt,
+      });
       database.prepare(
         `INSERT INTO agent_execution_attempts (
            execution_id, attempt_seq, retry_cycle, retry_ordinal, status, action_category, recovery_cursor
@@ -6110,6 +6220,11 @@ export function executeRuntimeAuthorityOperation(
       ).run(operation.newExecutionId, old.roomId, roomArchiveGeneration,
         old.agentId, old.sourceMessageId,
         occurredAt, humanId, occurredAt, occurredAt, old.id);
+      linkDerivedRuntimeExecution(database, {
+        sourceExecutionId: old.id,
+        derivedExecutionId: operation.newExecutionId,
+        linkedAt: occurredAt,
+      });
       database.prepare(
         `INSERT INTO agent_execution_attempts (
            execution_id, attempt_seq, retry_cycle, retry_ordinal, status,

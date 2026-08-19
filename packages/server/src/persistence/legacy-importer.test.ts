@@ -29,6 +29,7 @@ import {
 
 const temporaryDirectories = new Set<string>();
 const clients = new Set<WorkerDatabaseClient>();
+const WORKER_INITIALIZATION_TEST_TIMEOUT_MS = 15_000;
 
 function hash(value: string): string {
   return createHash("sha256").update(value).digest("base64url");
@@ -342,6 +343,46 @@ describe("LegacyStateImporter", () => {
       expect(database.prepare("SELECT COUNT(*) AS count FROM events").get()).toEqual({
         count: 0,
       });
+      expect(
+        database.prepare(
+          `SELECT envelope.message_id AS messageId,
+                  envelope.message_kind AS messageKind,
+                  envelope.lifecycle,
+                  envelope.current_revision AS currentRevision,
+                  envelope.revision_count AS revisionCount,
+                  revision.body,
+                  revision.revised_at AS revisedAt,
+                  revision.revised_by_actor_id AS revisedByActorId
+           FROM message_envelopes AS envelope
+           JOIN message_revisions AS revision
+             ON revision.message_id = envelope.message_id
+            AND revision.revision = 1
+           ORDER BY envelope.message_id`,
+        ).all(),
+      ).toEqual([
+        {
+          messageId: "message-agent",
+          messageKind: "agent-final",
+          lifecycle: "active",
+          currentRevision: 1,
+          revisionCount: 1,
+          body: "ready",
+          revisedAt: "2026-08-09T08:02:00.000Z",
+          revisedByActorId: "agent-helper",
+        },
+        {
+          messageId: "message-human",
+          messageKind: "human",
+          lifecycle: "active",
+          currentRevision: 1,
+          revisionCount: 1,
+          body: "hello",
+          revisedAt: "2026-08-09T08:01:00.000Z",
+          revisedByActorId: "human-owner",
+        },
+      ]);
+      expect(database.prepare("SELECT COUNT(*) AS count FROM message_target_outcomes").get())
+        .toEqual({ count: 0 });
     } finally {
       database.close();
     }
@@ -631,7 +672,7 @@ describe("LegacyStateImporter", () => {
     const creator = track(
       await createWorkerDatabaseClient({ databasePath: stagingPath }),
     );
-    await expect(creator.inspectSchema()).resolves.toEqual({ version: 15 });
+    await expect(creator.inspectSchema()).resolves.toEqual({ version: 16 });
     await creator.close();
     writeFileSync(
       recoveryPath,
@@ -653,7 +694,7 @@ describe("LegacyStateImporter", () => {
     expect(existsSync(databasePath)).toBe(false);
     expect(readFileSync(stagingPath)).toEqual(stagingBytes);
     expect(readFileSync(recoveryPath)).toEqual(manifestBytes);
-  });
+  }, WORKER_INITIALIZATION_TEST_TIMEOUT_MS);
 
   it("fails closed for ambiguous missing-final recovery manifests", async () => {
     const directory = fixtureDirectory();
@@ -731,7 +772,7 @@ describe("LegacyStateImporter", () => {
     expect(lstatSync(databasePath, { bigint: true }).nlink).toBe(1n);
 
     const restarted = track(await createWorkerDatabaseClient({ databasePath }));
-    await expect(restarted.inspectSchema()).resolves.toEqual({ version: 15 });
+    await expect(restarted.inspectSchema()).resolves.toEqual({ version: 16 });
     await expect(restarted.inspectLegacyImport()).resolves.toMatchObject({
       markerVersion: 1,
       actors: 3,
@@ -744,7 +785,7 @@ describe("LegacyStateImporter", () => {
     for (const [path, bytes] of fixture.originalBytes) {
       expect(readFileSync(path)).toEqual(bytes);
     }
-  });
+  }, WORKER_INITIALIZATION_TEST_TIMEOUT_MS);
 
   it("never clobbers a database that wins the activation race", async () => {
     const directory = fixtureDirectory();
@@ -813,7 +854,7 @@ describe("LegacyStateImporter", () => {
     rmSync(unrelatedHardlinkPath);
 
     const restarted = track(await createWorkerDatabaseClient({ databasePath }));
-    await expect(restarted.inspectSchema()).resolves.toEqual({ version: 15 });
+    await expect(restarted.inspectSchema()).resolves.toEqual({ version: 16 });
     await expect(restarted.inspectLegacyImport()).resolves.toMatchObject({
       markerVersion: 1,
       actors: 3,
@@ -829,7 +870,7 @@ describe("LegacyStateImporter", () => {
     const directory = fixtureDirectory();
     const databasePath = join(directory, "authority.sqlite");
     const creator = track(await createWorkerDatabaseClient({ databasePath }));
-    await expect(creator.inspectSchema()).resolves.toEqual({ version: 15 });
+    await expect(creator.inspectSchema()).resolves.toEqual({ version: 16 });
     await creator.close();
     const before = readFileSync(databasePath);
     const nonce = "00000000-0000-4000-8000-000000000040";
@@ -856,14 +897,14 @@ describe("LegacyStateImporter", () => {
     expect(readFileSync(databasePath)).toEqual(before);
     expect(existsSync(stagingPath)).toBe(true);
     expect(existsSync(recoveryPath)).toBe(true);
-  });
+  }, WORKER_INITIALIZATION_TEST_TIMEOUT_MS);
 
   it("does not overwrite an existing valid authority database without a marker", async () => {
     const directory = fixtureDirectory();
     const databasePath = join(directory, "authority.sqlite");
     const fixture = writeLegacyFixture(directory);
     const creator = track(await createWorkerDatabaseClient({ databasePath }));
-    await expect(creator.inspectSchema()).resolves.toEqual({ version: 15 });
+    await expect(creator.inspectSchema()).resolves.toEqual({ version: 16 });
     await creator.close();
     const before = readFileSync(databasePath);
 
@@ -875,7 +916,7 @@ describe("LegacyStateImporter", () => {
     await importer.close();
 
     expect(readFileSync(databasePath)).toEqual(before);
-  });
+  }, WORKER_INITIALIZATION_TEST_TIMEOUT_MS);
 
   it("closes successfully without opening or creating the authority database", async () => {
     const directory = fixtureDirectory();
