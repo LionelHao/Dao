@@ -3144,7 +3144,7 @@ describe("SQLite authoritative sessions", () => {
       database.close();
     });
 
-    it("fails room.archive closed until settlement and repair dependencies exist", async () => {
+    it("requires closed archive CAS input and replays the production participant result", async () => {
       const directory = await mkdtemp(join(tmpdir(), "native-im-archive-command-"));
       temporaryDirectories.push(directory);
       const databasePath = join(directory, "authority.sqlite");
@@ -3155,17 +3155,27 @@ describe("SQLite authoritative sessions", () => {
         idempotencyKey: "archive-key",
       };
       const command = {
-        type: "room.archive",
+        type: "room.archive" as const,
         roomId: fixture.roomId,
-        payload: {},
-      } as const;
+        payload: { expectedGovernanceRevision: 1 },
+      };
 
       const before = authoritativeCountSnapshot(databasePath);
-      await expect(fixture.authority.executeHuman(context, command))
-        .rejects.toMatchObject({ status: 503, code: "dependency_unavailable" });
-      expect(authoritativeCountSnapshot(databasePath)).toEqual(before);
+      const archived = await fixture.authority.executeHumanGovernance(context, command);
+      expect(archived).toMatchObject({
+        governance: {
+          roomId: fixture.roomId, lifecycle: "archived",
+          governanceRevision: 2, archiveGeneration: 1,
+        },
+        replayed: false,
+      });
+      expect(archived.eventIds.length).toBeGreaterThanOrEqual(2);
+      const afterArchive = authoritativeCountSnapshot(databasePath);
+      expect(afterArchive.rooms).toBe(before.rooms);
+      expect(afterArchive.room_audit).toBe(before.room_audit + 1);
+      expect(afterArchive.idempotency_records).toBe(before.idempotency_records + 1);
       await expect(
-        fixture.authority.executeHuman(
+        fixture.authority.executeHumanGovernance(
           { ...context, requestId: "archive-invalid" },
           {
             ...command,
@@ -3173,25 +3183,25 @@ describe("SQLite authoritative sessions", () => {
           } as never,
         ),
       ).rejects.toMatchObject({ status: 400, code: "invalid_request" });
-      expect(authoritativeCountSnapshot(databasePath)).toEqual(before);
+      expect(authoritativeCountSnapshot(databasePath)).toEqual(afterArchive);
       await fixture.client.close();
 
       const restartedClient = await createWorkerDatabaseClient({ databasePath });
       const restartedAuthority = createSqliteAuthoritativeStore(restartedClient, {
         clock: () => 9_000,
       });
-      await expect(restartedAuthority.executeHuman(
+      await expect(restartedAuthority.executeHumanGovernance(
         { ...context, requestId: "archive-restart" }, command,
-      )).rejects.toMatchObject({ status: 503, code: "dependency_unavailable" });
+      )).resolves.toEqual({ ...archived, replayed: true });
       await expect(
-        restartedAuthority.executeHuman(
-          { ...context, requestId: "archive-other-scope" },
+        restartedAuthority.executeHumanGovernance(
+          { ...context, requestId: "archive-other-scope", idempotencyKey: "archive-other-scope" },
           { ...command, roomId: `${fixture.roomId}-other` },
         ),
       ).rejects.toMatchObject({ status: 403, code: "room_forbidden" });
       await restartedClient.close();
 
-      expect(authoritativeCountSnapshot(databasePath)).toEqual(before);
+      expect(authoritativeCountSnapshot(databasePath)).toEqual(afterArchive);
     });
   });
 

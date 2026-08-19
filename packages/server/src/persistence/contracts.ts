@@ -21,6 +21,7 @@ import type {
   AgentJudgementOutcome,
   AgentParticipation,
   Actor,
+  DepartureConflictList,
   ManagedRoom,
   Message,
   MessageDraft,
@@ -166,6 +167,7 @@ export type SnapshotWorkerRequest =
       readonly requestId: string;
       readonly roomId: string;
       readonly accessRevision: number;
+      readonly targetActorId?: string;
     }
   | { readonly type: "snapshot.cache-count"; readonly requestId: string }
   | { readonly type: "snapshot.full-validation-count"; readonly requestId: string }
@@ -529,7 +531,7 @@ export type AgentCollaborationCommand = Extract<
 export type RoomGovernanceCommand =
   | { readonly type: "room.create"; readonly payload: { readonly name: string } }
   | { readonly type: "room.rename"; readonly roomId: string; readonly payload: { readonly name: string } }
-  | { readonly type: "room.archive"; readonly roomId: string; readonly payload: Record<string, never> }
+  | { readonly type: "room.archive"; readonly roomId: string; readonly payload: { readonly expectedGovernanceRevision: number } }
   | { readonly type: "room.reopen"; readonly roomId: string; readonly payload: { readonly expectedGovernanceRevision: number } }
   | {
       readonly type: "room.ownership.transfer";
@@ -549,6 +551,14 @@ export type RoomGovernanceCommand =
       readonly type: "room.member.leave";
       readonly roomId: string;
       readonly payload: { readonly expectedGovernanceRevision: number };
+    }
+  | {
+      readonly type: "room.member.remove";
+      readonly roomId: string;
+      readonly payload: {
+        readonly targetActorId: string;
+        readonly expectedGovernanceRevision: number;
+      };
     }
   | {
       readonly type: "human.invitation.issue";
@@ -579,6 +589,17 @@ export type RoomGovernanceCommand =
       readonly payload: { readonly targetActorId: string };
     };
 
+export type ClosedRoomGovernanceMutationCommand = Extract<
+  RoomGovernanceCommand,
+  {
+    readonly type:
+      | "room.member.leave"
+      | "room.member.remove"
+      | "room.archive"
+      | "room.reopen";
+  }
+>;
+
 export type PersistentCommand = CollaborationCommand | RoomGovernanceCommand;
 
 export type JsonValue =
@@ -594,6 +615,23 @@ export interface CommandAcknowledgement {
   readonly eventIds: readonly string[];
   readonly acceptedAt: string;
   readonly result: JsonValue;
+}
+
+export interface ClosedRoomGovernanceAcknowledgement {
+  readonly governance: RoomGovernanceView;
+  readonly eventIds: readonly string[];
+  readonly replayed: boolean;
+}
+
+export interface ClosedRoomGovernanceTransportStore {
+  readDepartureConflicts(
+    context: AuthenticatedSessionContext,
+    input: { readonly roomId: string; readonly targetActorId: string },
+  ): Promise<DepartureConflictList>;
+  executeHumanGovernance(
+    context: AuthenticatedCommandContext,
+    command: ClosedRoomGovernanceMutationCommand,
+  ): Promise<ClosedRoomGovernanceAcknowledgement>;
 }
 
 interface OutboxDeliveryBase {
@@ -701,6 +739,10 @@ function text(value: unknown): value is string {
 
 function count(value: unknown, minimum = 0): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= minimum;
+}
+
+function boundedText(value: unknown, maximumBytes: number): value is string {
+  return text(value) && Buffer.byteLength(value, "utf8") <= maximumBytes;
 }
 
 function stringList(value: unknown): value is readonly string[] {
@@ -832,11 +874,16 @@ function isGovernanceCommand(value: UnknownRecord): boolean {
   if (value.type === "room.create" || value.type === "room.rename") {
     return exact(payload, ["name"]) && text(payload.name);
   }
-  if (value.type === "room.archive") {
-    return exact(payload, []);
-  }
-  if (value.type === "room.reopen" || value.type === "room.member.leave") {
+  if (
+    value.type === "room.archive" ||
+    value.type === "room.reopen" ||
+    value.type === "room.member.leave"
+  ) {
     return exact(payload, ["expectedGovernanceRevision"]) && count(payload.expectedGovernanceRevision);
+  }
+  if (value.type === "room.member.remove") {
+    return exact(payload, ["targetActorId", "expectedGovernanceRevision"]) &&
+      text(payload.targetActorId) && count(payload.expectedGovernanceRevision);
   }
   if (value.type === "room.ownership.transfer") {
     return exact(payload, ["targetActorId", "expectedGovernanceRevision"]) && text(payload.targetActorId) &&
@@ -871,6 +918,41 @@ export function parsePersistentCommand(
   return isRecord(value) && (isCollaborationCommand(value) || isGovernanceCommand(value))
     ? { ok: true, value: value as PersistentCommand }
     : { ok: false, code: "invalid_command" };
+}
+
+const GOVERNANCE_IDENTIFIER_MAX_BYTES = 256;
+
+export function parseClosedRoomGovernanceMutationCommand(
+  value: unknown,
+): ContractParseResult<ClosedRoomGovernanceMutationCommand, "invalid_command"> {
+  if (
+    !isRecord(value) ||
+    !exact(value, ["type", "roomId", "payload"]) ||
+    !boundedText(value.roomId, GOVERNANCE_IDENTIFIER_MAX_BYTES) ||
+    !isRecord(value.payload)
+  ) {
+    return { ok: false, code: "invalid_command" };
+  }
+  const payload = value.payload;
+  const validCas = count(payload.expectedGovernanceRevision);
+  if (
+    (value.type === "room.member.leave" ||
+      value.type === "room.archive" ||
+      value.type === "room.reopen") &&
+    exact(payload, ["expectedGovernanceRevision"]) &&
+    validCas
+  ) {
+    return { ok: true, value: value as ClosedRoomGovernanceMutationCommand };
+  }
+  if (
+    value.type === "room.member.remove" &&
+    exact(payload, ["targetActorId", "expectedGovernanceRevision"]) &&
+    boundedText(payload.targetActorId, GOVERNANCE_IDENTIFIER_MAX_BYTES) &&
+    validCas
+  ) {
+    return { ok: true, value: value as ClosedRoomGovernanceMutationCommand };
+  }
+  return { ok: false, code: "invalid_command" };
 }
 
 function roomEventEnvelope(value: UnknownRecord): value is UnknownRecord {
@@ -911,13 +993,34 @@ function validRoomEventPayload(
   eventActorId: string,
   occurredAt: string,
 ): boolean {
-  if (type === "room.created" || type === "room.renamed" || type === "room.archived") {
+  if (type === "room.created" || type === "room.renamed") {
     return exact(payload, ["room"]) && strictManagedRoom(payload.room) &&
       (payload.room as { readonly id: string }).id === roomId;
   }
   if (type === "room.governance.changed") {
     return exact(payload, ["governance"]) && isRoomGovernanceView(payload.governance) &&
       payload.governance.roomId === roomId;
+  }
+  if (type === "room.archived") {
+    return exact(payload, ["governance", "archiveGeneration", "frozenTimerCount"]) &&
+      isRoomGovernanceView(payload.governance) && payload.governance.roomId === roomId &&
+      payload.governance.lifecycle === "archived" && count(payload.archiveGeneration, 1) &&
+      payload.governance.archiveGeneration === payload.archiveGeneration &&
+      count(payload.frozenTimerCount);
+  }
+  if (type === "room.reopened") {
+    return exact(payload, ["governance", "archiveGeneration", "resumedTimerCount"]) &&
+      isRoomGovernanceView(payload.governance) && payload.governance.roomId === roomId &&
+      payload.governance.lifecycle === "active" && count(payload.archiveGeneration, 1) &&
+      payload.governance.archiveGeneration === payload.archiveGeneration &&
+      count(payload.resumedTimerCount);
+  }
+  if (type === "room.security.reduced") {
+    return exact(payload, ["governance", "archiveGeneration", "assignmentRevision"]) &&
+      isRoomGovernanceView(payload.governance) && payload.governance.roomId === roomId &&
+      payload.governance.lifecycle === "archived" && count(payload.archiveGeneration, 1) &&
+      payload.governance.archiveGeneration === payload.archiveGeneration &&
+      count(payload.assignmentRevision);
   }
   if (type === "human.invitation.issued") {
     return exact(payload, ["invitationId", "inviteeActorId"]) && text(payload.invitationId) && text(payload.inviteeActorId);

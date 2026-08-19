@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { parentPort, workerData } from "node:worker_threads";
+import { isRoomGovernanceView, type DepartureConflictList } from "@native-im/core";
 import {
   AUTHORITY_SCHEMA_VERSION,
   migrateAuthorityDatabase,
@@ -43,6 +44,7 @@ import {
   readRoomAuditDatabaseQuery,
   readRoomDatabaseQuery,
   readRoomGovernanceDatabaseQuery,
+  readDepartureConflictsDatabaseQuery,
   repairMutationImpactDatabaseQuery,
   revalidateSnapshotDatabaseQuery,
   runAuthorityImmediateTransaction,
@@ -68,6 +70,7 @@ import { archiveToolSafetyParticipantRegistration } from "../tool-safety/archive
 import { assignmentSecurityReductionParticipantRegistration } from "../room-assignment/assignment-security-reduction-participant.js";
 import { roomCacheInvalidationRegistration } from "../access/room-cache-invalidation-port.js";
 import { createOfflineLeaseInvalidationRegistration } from "../access/offline-lease-invalidation-port.js";
+import { createProductionSharedAuthorityParticipantComposition } from "../room-governance/production-participant-composition.js";
 
 interface AuthorityWorkerData {
   readonly databasePath: string;
@@ -168,6 +171,17 @@ let workerClosed = false;
 let rollbackFailureForTestAvailable =
   isAuthorityWorkerData(workerData) && workerData.rollbackFailureForTest === true;
 const repairs = new FallbackRepairCoordinator();
+const workerAuthorityPolicy = isAuthorityWorkerData(workerData)
+  ? workerData.sharedAuthorityRecovery
+  : undefined;
+const governanceParticipantComposition = createProductionSharedAuthorityParticipantComposition({
+  ballPolicy: workerAuthorityPolicy?.ballPolicy ?? {
+    openItemDeadlineMs: 24 * 60 * 60 * 1_000,
+    lightTaskDeadlineMs: 24 * 60 * 60 * 1_000,
+  },
+  maxOfflineReadLeaseMs:
+    workerAuthorityPolicy?.maxOfflineReadLeaseMs ?? 24 * 60 * 60 * 1_000,
+});
 
 function respond(response: AuthorityWorkerResponse): void {
   authorityPort.postMessage(response);
@@ -177,13 +191,22 @@ function respondWithError(
   requestId: string,
   code: AuthorityWorkerErrorCode,
   message: string,
+  details?: DepartureConflictList,
 ): void {
-  respond({
-    type: "authority.error",
-    requestId,
-    code,
-    message,
-  });
+  if (code === "departure_blocked" && details !== undefined) {
+    respond({ type: "authority.error", requestId, code, message, details });
+    return;
+  }
+  if (code === "departure_blocked") {
+    respond({
+      type: "authority.error",
+      requestId,
+      code: "dependency_unavailable",
+      message: "Authority departure conflict details were unavailable",
+    });
+    return;
+  }
+  respond({ type: "authority.error", requestId, code, message });
 }
 
 function recoverArchivedAuthorityParticipants(openedDatabase: DatabaseSync): void {
@@ -1601,12 +1624,14 @@ function releaseRepair(request: AuthorityWorkerRequest): void {
 }
 
 function isAccessReducingForLease(
-  command: Extract<AuthorityWorkerRequest, { readonly type: "authority.execute-human" }>["command"],
+  command: Extract<AuthorityWorkerRequest, {
+    readonly type: "authority.execute-human" | "authority.execute-human-governance";
+  }>["command"],
   lease: StreamingRepairLease,
   roleDowngradeTargetId: string | undefined,
 ): boolean {
   if (command.type === "room.archive") return true;
-  if (command.type === "member.remove") {
+  if (command.type === "member.remove" || command.type === "room.member.remove") {
     return command.payload.targetActorId === lease.principalId;
   }
   return command.type === "human.role.change" &&
@@ -1615,7 +1640,9 @@ function isAccessReducingForLease(
 
 function humanRepairGate(
   opened: DatabaseSync,
-  request: Extract<AuthorityWorkerRequest, { readonly type: "authority.execute-human" }>,
+  request: Extract<AuthorityWorkerRequest, {
+    readonly type: "authority.execute-human" | "authority.execute-human-governance";
+  }>,
   actorId: string,
 ): {
   readonly impact: ReturnType<typeof repairMutationImpactDatabaseQuery>;
@@ -1643,7 +1670,7 @@ function humanRepairGate(
   if (request.command.type === "room.archive") {
     return { impact, preemption: { code: "room_archived" } };
   }
-  if (request.command.type === "member.remove") {
+  if (request.command.type === "member.remove" || request.command.type === "room.member.remove") {
     return { impact, preemption: {
       code: "snapshot_stale",
       roomPrincipalIds: [request.command.payload.targetActorId],
@@ -1668,6 +1695,7 @@ function executeHuman(request: AuthorityWorkerRequest): void {
     const result = executeHumanDatabaseCommand(openedDatabase, {
       context: request.context,
       command: request.command,
+      participantComposition: governanceParticipantComposition,
       ...(request.invitationSecret === undefined
         ? {}
         : { invitationSecret: request.invitationSecret }),
@@ -1700,7 +1728,7 @@ function executeHuman(request: AuthorityWorkerRequest): void {
   } catch (error: unknown) {
     if (handleRollbackFatal(request.requestId, error)) return;
     if (error instanceof AuthorityDatabaseError) {
-      respondWithError(request.requestId, error.code, error.message);
+      respondWithError(request.requestId, error.code, error.message, error.details);
       return;
     }
     if (error instanceof FallbackRepairError) {
@@ -1711,6 +1739,104 @@ function executeHuman(request: AuthorityWorkerRequest): void {
       request.requestId,
       "storage_unavailable",
       "Authority command validation failed",
+    );
+  }
+}
+
+function executeHumanGovernance(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.execute-human-governance") {
+    throw new TypeError("executeHumanGovernance received the wrong request type");
+  }
+  try {
+    const openedDatabase = requireAuthorityTransactionDatabase();
+    let gate: ReturnType<typeof humanRepairGate> | undefined;
+    const result = executeHumanDatabaseCommand(openedDatabase, {
+      context: request.context,
+      command: request.command,
+      participantComposition: governanceParticipantComposition,
+      now: request.now,
+      beforeApply(actorId) {
+        gate = humanRepairGate(openedDatabase, request, actorId);
+      },
+      ...(isAuthorityWorkerData(workerData) &&
+        workerData.transactionFaultPoint === "after-domain-write"
+        ? { afterDomainWrite: () => process.exit(81) }
+        : {}),
+      ...(isAuthorityWorkerData(workerData) &&
+        workerData.transactionFaultPoint === "before-commit"
+        ? { beforeCommit: () => process.exit(82) }
+        : {}),
+    });
+    const acknowledgementResult = result.acknowledgement.result;
+    const governance = typeof acknowledgementResult === "object" &&
+        acknowledgementResult !== null && !Array.isArray(acknowledgementResult) &&
+        "governance" in acknowledgementResult
+      ? acknowledgementResult.governance
+      : undefined;
+    if (!isRoomGovernanceView(governance) || governance.roomId !== request.command.roomId) {
+      throw new AuthorityDatabaseError(
+        "storage_unavailable",
+        "Authority governance acknowledgement is corrupt",
+      );
+    }
+    respond({
+      type: "authority.governance-acknowledged",
+      requestId: request.requestId,
+      acknowledgement: {
+        governance,
+        eventIds: result.acknowledgement.eventIds,
+        replayed: result.disposition === "replayed",
+      },
+    });
+    if (result.disposition === "applied" && gate?.preemption !== undefined) {
+      repairs.preemptAfterCommit({
+        ...gate.impact,
+        familyIds: [],
+        ...gate.preemption,
+        now: request.now,
+      });
+    }
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message, error.details);
+      return;
+    }
+    if (error instanceof FallbackRepairError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithError(
+      request.requestId,
+      "storage_unavailable",
+      "Authority governance command validation failed",
+    );
+  }
+}
+
+function readDepartureConflicts(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.departure-conflicts") {
+    throw new TypeError("readDepartureConflicts received the wrong request type");
+  }
+  try {
+    const conflicts = readDepartureConflictsDatabaseQuery(
+      requireAuthorityTransactionDatabase(),
+      request.context,
+      { roomId: request.roomId, targetActorId: request.targetActorId },
+      request.now,
+      governanceParticipantComposition,
+    );
+    respond({ type: "authority.departure-conflicts", requestId: request.requestId, conflicts });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message, error.details);
+      return;
+    }
+    respondWithError(
+      request.requestId,
+      "storage_unavailable",
+      "Authority departure query validation failed",
     );
   }
 }
@@ -2281,6 +2407,12 @@ async function dispatch(value: unknown): Promise<void> {
       return;
     case "authority.execute-human":
       executeHuman(value);
+      return;
+    case "authority.execute-human-governance":
+      executeHumanGovernance(value);
+      return;
+    case "authority.departure-conflicts":
+      readDepartureConflicts(value);
       return;
     case "authority.execute-agent":
       executeAgent(value);

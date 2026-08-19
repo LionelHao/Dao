@@ -162,8 +162,11 @@ function isRequest(value: unknown): value is SnapshotWorkerRequest {
     case "snapshot.invalidate":
       return exact(value, ["type", "requestId", "snapshotId"]) && text(value.snapshotId);
     case "snapshot.invalidate-room":
-      return exact(value, ["type", "requestId", "roomId", "accessRevision"]) &&
-        text(value.roomId) && count(value.accessRevision);
+      return exact(value, [
+        "type", "requestId", "roomId", "accessRevision",
+        ...(Object.hasOwn(value, "targetActorId") ? ["targetActorId"] : []),
+      ]) && text(value.roomId) && count(value.accessRevision) &&
+        (!Object.hasOwn(value, "targetActorId") || text(value.targetActorId));
     default:
       return false;
   }
@@ -1632,8 +1635,14 @@ function dispatch(value: unknown): void {
     if (value.type === "snapshot.invalidate-room") {
       cache.prepare(
         `DELETE FROM repair_snapshots
-         WHERE kind = 'room' AND room_id = ? AND access_revision <= ?`,
-      ).run(value.roomId, value.accessRevision);
+         WHERE kind = 'room' AND room_id = ? AND access_revision <= ?
+           AND (? IS NULL OR principal_id = ?)`,
+      ).run(
+        value.roomId,
+        value.accessRevision,
+        value.targetActorId ?? null,
+        value.targetActorId ?? null,
+      );
       respond({ type: "snapshot.room-invalidated", requestId: value.requestId }); return;
     }
     const countValue = value.type === "snapshot.full-validation-count"

@@ -46,10 +46,9 @@ function installIntegratedV15InvalidationTables(database: DatabaseSync): void {
         (reason IN ('member_removed', 'access_revoked') AND target_actor_id IS NOT NULL)
       )
     ) STRICT;
-    CREATE UNIQUE INDEX room_cache_invalidation_scope_v15
-    ON room_cache_invalidation_intents(
-      room_id, lifecycle_generation, reason, COALESCE(target_actor_id, '')
-    );
+    CREATE UNIQUE INDEX room_cache_target_invalidation_scope_v15
+    ON room_cache_invalidation_intents(room_id, target_actor_id, access_revision, reason)
+    WHERE reason IN ('member_removed', 'access_revoked') AND target_actor_id IS NOT NULL;
     CREATE INDEX room_cache_invalidation_ready
     ON room_cache_invalidation_intents(status, available_at, created_at, id);
 
@@ -71,10 +70,9 @@ function installIntegratedV15InvalidationTables(database: DatabaseSync): void {
         (reason IN ('member_removed', 'access_revoked') AND target_actor_id IS NOT NULL)
       )
     ) STRICT;
-    CREATE UNIQUE INDEX offline_read_lease_invalidation_scope_v15
-    ON offline_read_lease_invalidations(
-      room_id, lifecycle_generation, reason, COALESCE(target_actor_id, '')
-    );
+    CREATE UNIQUE INDEX offline_read_lease_target_invalidation_scope_v15
+    ON offline_read_lease_invalidations(room_id, target_actor_id, access_revision, reason)
+    WHERE reason IN ('member_removed', 'access_revoked') AND target_actor_id IS NOT NULL;
   `);
 }
 
@@ -377,16 +375,12 @@ describe("FT-02B target access revocation production adapter", () => {
       cacheInvalidation: {
         targetColumn: "target_actor_id TEXT REFERENCES actors(id)",
         reasonValue: "member_removed",
-        uniqueKey: [
-          "room_id", "lifecycle_generation", "reason", "COALESCE(target_actor_id, '')",
-        ],
+        uniqueKey: ["room_id", "target_actor_id", "access_revision", "reason"],
       },
       offlineLeaseInvalidation: {
         targetColumn: "target_actor_id TEXT REFERENCES actors(id)",
         reasonValue: "member_removed",
-        uniqueKey: [
-          "room_id", "lifecycle_generation", "reason", "COALESCE(target_actor_id, '')",
-        ],
+        uniqueKey: ["room_id", "target_actor_id", "access_revision", "reason"],
       },
       archiveScopeRule: "room_archived requires target_actor_id IS NULL",
       memberScopeRule: "member_removed requires target_actor_id IS NOT NULL",

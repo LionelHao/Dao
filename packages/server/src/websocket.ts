@@ -2,11 +2,14 @@ import { createServer, type Server as HttpServer } from "node:http";
 import { isIP } from "node:net";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import {
+  isDepartureConflictList,
   isRoomRepairPage,
+  isRoomGovernanceView,
   isRoomSyncResult,
   isSnapshotCompleted,
   isWorkspaceBootstrapPage,
   type PersistedRoomEvent,
+  type DepartureConflictList,
   type RoomCursor,
   type SnapshotVersion,
 } from "@native-im/core";
@@ -25,6 +28,8 @@ import {
 } from "./outbox-dispatcher.js";
 import type {
   AuthenticatedSessionContext,
+  ClosedRoomGovernanceAcknowledgement,
+  ClosedRoomGovernanceTransportStore,
   CommandStore,
   SyncQueryStore,
 } from "./persistence/contracts.js";
@@ -90,7 +95,8 @@ export interface StartMessageWebSocketServerOptions {
   >;
   readonly ballRuntime?: Pick<BallRuntimeService, "query">;
   readonly governance?: Pick<CommandStore, "executeHuman"> &
-    Pick<SyncQueryStore, "readRoomGovernance">;
+    Pick<SyncQueryStore, "readRoomGovernance"> &
+    Partial<ClosedRoomGovernanceTransportStore>;
 }
 
 type RuntimeMessageWebSocketServerOptions = StartMessageWebSocketServerOptions & {
@@ -165,9 +171,129 @@ interface V2SubscriptionGate {
   unsubscribe: (() => void) | undefined;
 }
 
+type DepartureScope = {
+  readonly roomId: string;
+  readonly targetActorId: string;
+};
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasOnlyOwnFields(value: Record<string, unknown>, fields: readonly string[]): boolean {
+  const allowed = new Set(fields);
+  return fields.every((field) => Object.hasOwn(value, field)) &&
+    Reflect.ownKeys(value).every((key) => typeof key === "string" && allowed.has(key));
+}
+
+function isServiceErrorCode<TCode extends string>(
+  error: unknown,
+  code: TCode,
+): error is { readonly status: unknown; readonly code: TCode; readonly details?: unknown } {
+  return isObjectRecord(error) && error.code === code && Object.hasOwn(error, "status");
+}
+
+function isBoundedWireText(value: string, maximumBytes: number): boolean {
+  return value.trim().length > 0 && Buffer.byteLength(value, "utf8") <= maximumBytes;
+}
+
+function closeDepartureConflictList(
+  value: unknown,
+  expectedRoomId: string | undefined,
+  expectedTargetActorId: string | undefined,
+): DepartureConflictList | undefined {
+  if (
+    expectedRoomId === undefined ||
+    expectedTargetActorId === undefined ||
+    !isDepartureConflictList(value) ||
+    value.roomId !== expectedRoomId ||
+    value.targetActorId !== expectedTargetActorId ||
+    value.conflicts.length > 256 ||
+    value.conflicts.some((conflict) =>
+      conflict.revision <= 0 ||
+      !isBoundedWireText(conflict.conflictId, 256) ||
+      !isBoundedWireText(conflict.subjectId, 256) ||
+      !isBoundedWireText(conflict.sourceId, 256) ||
+      !isBoundedWireText(conflict.title, 1_024) ||
+      !isBoundedWireText(conflict.state, 1_024))
+  ) {
+    return undefined;
+  }
+  return {
+    roomId: value.roomId,
+    targetActorId: value.targetActorId,
+    governanceRevision: value.governanceRevision,
+    conflicts: value.conflicts.map((conflict) => ({
+      conflictId: conflict.conflictId,
+      roomId: conflict.roomId,
+      subjectId: conflict.subjectId,
+      kind: conflict.kind,
+      title: conflict.title,
+      state: conflict.state,
+      allowedResolutions: [...conflict.allowedResolutions],
+      sourceId: conflict.sourceId,
+      revision: conflict.revision,
+    })),
+  };
+}
+
+function closeGovernanceView(value: unknown, roomId: string) {
+  if (
+    !isRoomGovernanceView(value) ||
+    value.roomId !== roomId ||
+    value.projectId !== roomId ||
+    !isBoundedWireText(value.ownerActorId, 256) ||
+    (value.archivedAt !== undefined && !isBoundedWireText(value.archivedAt, 64))
+  ) {
+    return undefined;
+  }
+  return {
+    roomId: value.roomId,
+    projectId: value.projectId,
+    lifecycle: value.lifecycle,
+    governanceRevision: value.governanceRevision,
+    ownerActorId: value.ownerActorId,
+    archiveGeneration: value.archiveGeneration,
+    ...(value.archivedAt === undefined ? {} : { archivedAt: value.archivedAt }),
+  };
+}
+
+function closeGovernanceAcknowledgement(
+  value: unknown,
+  roomId: string,
+  operation: "room.member.leave" | "room.member.remove" | "room.archive" | "room.reopen",
+): ClosedRoomGovernanceAcknowledgement | undefined {
+  if (
+    !isObjectRecord(value) ||
+    !hasOnlyOwnFields(value, ["governance", "eventIds", "replayed"])
+  ) {
+    return undefined;
+  }
+  const governance = closeGovernanceView(value.governance, roomId);
+  if (
+    governance === undefined ||
+    !Array.isArray(value.eventIds) ||
+    value.eventIds.length > 256 ||
+    !value.eventIds.every((eventId) =>
+      typeof eventId === "string" && eventId.trim().length > 0 &&
+      Buffer.byteLength(eventId, "utf8") <= 256) ||
+    new Set(value.eventIds).size !== value.eventIds.length ||
+    typeof value.replayed !== "boolean" ||
+    (operation === "room.archive" && governance.lifecycle !== "archived") ||
+    (operation === "room.reopen" && governance.lifecycle !== "active")
+  ) {
+    return undefined;
+  }
+  return {
+    governance,
+    eventIds: [...value.eventIds] as readonly string[],
+    replayed: value.replayed,
+  };
+}
+
 function errorFrame(
   status: ProtocolErrorFrame["status"],
-  code: ProtocolErrorFrame["code"],
+  code: Exclude<ProtocolErrorFrame["code"], "departure_blocked">,
   message: string,
   requestId?: string,
 ): ProtocolErrorFrame {
@@ -177,7 +303,35 @@ function errorFrame(
   return { type: "error", status, code, message, requestId };
 }
 
-function mappedError(error: unknown, requestId: string): ProtocolErrorFrame {
+function departureBlockedFrame(
+  requestId: string,
+  details: DepartureConflictList,
+): ProtocolErrorFrame {
+  return {
+    type: "error",
+    status: 409,
+    code: "departure_blocked",
+    message: "departure_blocked",
+    requestId,
+    details,
+  };
+}
+
+function mappedError(
+  error: unknown,
+  requestId: string,
+  departureScope?: DepartureScope,
+): ProtocolErrorFrame {
+  if (isServiceErrorCode(error, "departure_blocked")) {
+    const details = closeDepartureConflictList(
+      error.details,
+      departureScope?.roomId,
+      departureScope?.targetActorId,
+    );
+    return error.status === 409 && details !== undefined
+      ? departureBlockedFrame(requestId, details)
+      : errorFrame(503, "dependency_unavailable", "dependency_unavailable", requestId);
+  }
   if (error instanceof AuthenticationError) {
     return errorFrame(error.status, error.code, error.code, requestId);
   }
@@ -208,7 +362,9 @@ async function revokeUnacknowledgedSession(
   }
 }
 
-const MAPPED_SERVICE_ERROR_STATUSES = new Map<ProtocolErrorFrame["code"], ProtocolErrorFrame["status"]>([
+type GenericProtocolErrorCode = Exclude<ProtocolErrorFrame["code"], "departure_blocked">;
+
+const MAPPED_SERVICE_ERROR_STATUSES = new Map<GenericProtocolErrorCode, ProtocolErrorFrame["status"]>([
   ["invalid_token", 401],
   ["token_expired", 401],
   ["session_revoked", 403],
@@ -224,6 +380,10 @@ const MAPPED_SERVICE_ERROR_STATUSES = new Map<ProtocolErrorFrame["code"], Protoc
   ["role_forbidden", 403],
   ["room_revision_conflict", 409],
   ["ownership_transfer_required", 409],
+  ["member_not_found", 404],
+  ["idempotency_conflict", 409],
+  ["confirmation_rejected", 409],
+  ["grant_revoked", 409],
   ["dependency_unavailable", 503],
   ["snapshot_stale", 409],
   ["snapshot_expired", 410],
@@ -271,7 +431,7 @@ const STORAGE_UNAVAILABLE_ERROR_CODES = new Set([
 
 function normalizeServiceError(error: unknown): {
   readonly status: ProtocolErrorFrame["status"];
-  readonly code: ProtocolErrorFrame["code"];
+  readonly code: GenericProtocolErrorCode;
 } | undefined {
   if (
     typeof error !== "object" ||
@@ -285,7 +445,7 @@ function normalizeServiceError(error: unknown): {
   if (STORAGE_UNAVAILABLE_ERROR_CODES.has(error.code) && error.status === 503) {
     return { status: 503, code: "storage_unavailable" };
   }
-  const code = error.code as ProtocolErrorFrame["code"];
+  const code = error.code as GenericProtocolErrorCode;
   const status = MAPPED_SERVICE_ERROR_STATUSES.get(code);
   return status !== undefined && status === error.status ? { status, code } : undefined;
 }
@@ -842,6 +1002,7 @@ function isCorrelatedRecoveryResponse(
       | "room.subscribe"
       | "room.subscribe.v2"
       | "room.governance.get"
+      | "room.departure.conflicts"
       | "room.ownership.transfer"
       | "room.member.role.set"
       | "room.member.leave"
@@ -936,6 +1097,7 @@ async function handleRecoveryFrame(
       | "room.subscribe"
       | "room.subscribe.v2"
       | "room.governance.get"
+      | "room.departure.conflicts"
       | "room.ownership.transfer"
       | "room.member.role.set"
       | "room.member.leave"
@@ -1760,19 +1922,60 @@ async function handleFrame(
         return;
       }
       try {
-        const governance = await options.governance.readRoomGovernance(session, frame.roomId);
+        const governance = closeGovernanceView(
+          await options.governance.readRoomGovernance(session, frame.roomId),
+          frame.roomId,
+        );
+        if (governance === undefined) {
+          sendFrame(socket, errorFrame(
+            503, "dependency_unavailable", "dependency_unavailable", frame.requestId,
+          ));
+          return;
+        }
         sendFrame(socket, { type: "room.governance", requestId: frame.requestId, governance });
       } catch (error: unknown) {
         sendFrame(socket, mappedError(error, frame.requestId));
       }
       return;
     }
+    case "room.departure.conflicts": {
+      const session = await requireSession(socket, frame.requestId, options, context);
+      if (session === undefined) return;
+      const governanceService = options.governance;
+      const query = governanceService?.readDepartureConflicts;
+      if (query === undefined) {
+        sendFrame(socket, errorFrame(
+          503, "dependency_unavailable", "dependency_unavailable", frame.requestId,
+        ));
+        return;
+      }
+      try {
+        const conflicts = closeDepartureConflictList(
+          await query.call(governanceService, session, {
+            roomId: frame.roomId,
+            targetActorId: frame.targetActorId,
+          }),
+          frame.roomId,
+          frame.targetActorId,
+        );
+        if (conflicts === undefined) {
+          sendFrame(socket, errorFrame(
+            503, "dependency_unavailable", "dependency_unavailable", frame.requestId,
+          ));
+          return;
+        }
+        sendFrame(socket, {
+          type: "room.departure.conflicts.result",
+          requestId: frame.requestId,
+          conflicts,
+        });
+      } catch (error: unknown) {
+        sendFrame(socket, mappedError(error, frame.requestId));
+      }
+      return;
+    }
     case "room.ownership.transfer":
-    case "room.member.role.set":
-    case "room.member.leave":
-    case "room.member.remove":
-    case "room.archive":
-    case "room.reopen": {
+    case "room.member.role.set": {
       const session = await requireSession(socket, frame.requestId, options, context);
       if (session === undefined) return;
       if (options.governance === undefined) {
@@ -1784,35 +1987,94 @@ async function handleFrame(
             targetActorId: frame.targetActorId,
             expectedGovernanceRevision: frame.expectedGovernanceRevision,
           } } as const
-        : frame.type === "room.member.role.set"
-          ? { type: frame.type, roomId: frame.roomId, payload: {
-              targetActorId: frame.targetActorId, role: frame.role,
-              expectedGovernanceRevision: frame.expectedGovernanceRevision,
-            } } as const
-          : frame.type === "room.member.leave"
-            ? { type: frame.type, roomId: frame.roomId, payload: {
-                expectedGovernanceRevision: frame.expectedGovernanceRevision,
-              } } as const
-            : frame.type === "room.member.remove"
-              ? { type: "member.remove" as const, roomId: frame.roomId,
-                  payload: { targetActorId: frame.targetActorId } }
-              : frame.type === "room.reopen"
-                ? { type: frame.type, roomId: frame.roomId, payload: {
-                    expectedGovernanceRevision: frame.expectedGovernanceRevision,
-                  } } as const
-                : { type: "room.archive" as const, roomId: frame.roomId, payload: {} };
+        : { type: frame.type, roomId: frame.roomId, payload: {
+            targetActorId: frame.targetActorId, role: frame.role,
+            expectedGovernanceRevision: frame.expectedGovernanceRevision,
+          } } as const;
       try {
         const acknowledgement = await options.governance.executeHuman({
           ...session, kind: "human", requestId: frame.requestId,
           idempotencyKey: frame.idempotencyKey,
         }, command);
-        const governance = await options.governance.readRoomGovernance(session, frame.roomId);
+        const governance = closeGovernanceView(
+          await options.governance.readRoomGovernance(session, frame.roomId),
+          frame.roomId,
+        );
+        if (governance === undefined) {
+          sendFrame(socket, errorFrame(
+            503, "dependency_unavailable", "dependency_unavailable", frame.requestId,
+          ));
+          return;
+        }
         sendFrame(socket, {
           type: "room.governance.ack", requestId: frame.requestId,
           operation: frame.type, governance, eventIds: acknowledgement.eventIds,
         });
       } catch (error: unknown) {
         sendFrame(socket, mappedError(error, frame.requestId));
+      }
+      return;
+    }
+    case "room.member.leave":
+    case "room.member.remove":
+    case "room.archive":
+    case "room.reopen": {
+      const session = await requireSession(socket, frame.requestId, options, context);
+      if (session === undefined) return;
+      const governanceService = options.governance;
+      const execute = governanceService?.executeHumanGovernance;
+      if (execute === undefined) {
+        sendFrame(socket, errorFrame(
+          503, "dependency_unavailable", "dependency_unavailable", frame.requestId,
+        ));
+        return;
+      }
+      const command = frame.type === "room.member.remove"
+        ? {
+            type: frame.type,
+            roomId: frame.roomId,
+            payload: {
+              targetActorId: frame.targetActorId,
+              expectedGovernanceRevision: frame.expectedGovernanceRevision,
+            },
+          } as const
+        : {
+            type: frame.type,
+            roomId: frame.roomId,
+            payload: { expectedGovernanceRevision: frame.expectedGovernanceRevision },
+          } as const;
+      const departureScope = frame.type === "room.member.leave"
+        ? { roomId: frame.roomId, targetActorId: session.principal.actorId }
+        : frame.type === "room.member.remove"
+          ? { roomId: frame.roomId, targetActorId: frame.targetActorId }
+          : undefined;
+      try {
+        const acknowledgement = closeGovernanceAcknowledgement(
+          await execute.call(governanceService, {
+            ...session,
+            kind: "human",
+            requestId: frame.requestId,
+            idempotencyKey: frame.idempotencyKey,
+          }, command),
+          frame.roomId,
+          frame.type,
+        );
+        if (acknowledgement === undefined) {
+          sendFrame(socket, errorFrame(
+            503, "dependency_unavailable", "dependency_unavailable", frame.requestId,
+          ));
+          return;
+        }
+        sendFrame(socket, {
+          type: "room.governance.ack",
+          requestId: frame.requestId,
+          operation: frame.type,
+          governance: acknowledgement.governance,
+          eventIds: acknowledgement.eventIds,
+          replayed: acknowledgement.replayed,
+        });
+      } catch (error: unknown) {
+        sendFrame(socket, mappedError(error, frame.requestId, departureScope));
       }
       return;
     }

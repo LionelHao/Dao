@@ -474,6 +474,12 @@ describe("AuthorityWorker closed protocol", () => {
       sessionFamilyId: createHash("sha256").update("repair-family").digest("base64url"),
       principal: { accountId: "repair-account", actorId: "repair-actor" },
     };
+    const governanceContext = {
+      ...repairContext,
+      kind: "human" as const,
+      requestId: "governance-command",
+      idempotencyKey: "governance-command",
+    };
     expect(
       isAuthorityWorkerRequest({
         type: "authority.initialize",
@@ -510,6 +516,40 @@ describe("AuthorityWorker closed protocol", () => {
       },
       now: 1_000,
     })).toBe(false);
+    expect(isAuthorityWorkerRequest({
+      type: "authority.execute-human-governance",
+      requestId: "governance-command",
+      context: governanceContext,
+      command: {
+        type: "room.member.remove",
+        roomId: "repair-room",
+        payload: { targetActorId: "target-human", expectedGovernanceRevision: 3 },
+      },
+      now: 1_005,
+    })).toBe(true);
+    expect(isAuthorityWorkerRequest({
+      type: "authority.execute-human-governance",
+      requestId: "governance-injected",
+      context: governanceContext,
+      command: {
+        type: "room.member.remove",
+        roomId: "repair-room",
+        payload: {
+          targetActorId: "target-human",
+          expectedGovernanceRevision: 3,
+          actorId: "forged-owner",
+        },
+      },
+      now: 1_005,
+    })).toBe(false);
+    expect(isAuthorityWorkerRequest({
+      type: "authority.departure-conflicts",
+      requestId: "departure-conflicts",
+      context: repairContext,
+      roomId: "repair-room",
+      targetActorId: "target-human",
+      now: 1_005,
+    })).toBe(true);
     expect(isAuthorityWorkerRequest({
       type: "authority.repair-acquire",
       requestId: "repair-acquire",
@@ -645,6 +685,20 @@ describe("AuthorityWorker closed protocol", () => {
   });
 
   it("accepts only exact response variants", () => {
+    const governance = {
+      roomId: "governance-room",
+      projectId: "governance-room",
+      lifecycle: "active" as const,
+      governanceRevision: 3,
+      ownerActorId: "governance-owner",
+      archiveGeneration: 1,
+    };
+    const conflicts = {
+      roomId: "governance-room",
+      targetActorId: "target-human",
+      governanceRevision: 3,
+      conflicts: [],
+    };
     expect(
       isAuthorityWorkerResponse({
         type: "authority.ready",
@@ -660,6 +714,37 @@ describe("AuthorityWorker closed protocol", () => {
       type: "authority.snapshot-revalidated",
       requestId: "snapshot-revalidated-extra",
       allowed: true,
+    })).toBe(false);
+    expect(isAuthorityWorkerResponse({
+      type: "authority.governance-acknowledged",
+      requestId: "governance-ack",
+      acknowledgement: { governance, eventIds: ["event-1"], replayed: false },
+    })).toBe(true);
+    expect(isAuthorityWorkerResponse({
+      type: "authority.departure-conflicts",
+      requestId: "departure-conflicts",
+      conflicts,
+    })).toBe(true);
+    expect(isAuthorityWorkerResponse({
+      type: "authority.error",
+      requestId: "departure-blocked",
+      code: "departure_blocked",
+      message: "Departure is blocked",
+      details: conflicts,
+    })).toBe(true);
+    expect(isAuthorityWorkerResponse({
+      type: "authority.error",
+      requestId: "departure-blocked-secret",
+      code: "departure_blocked",
+      message: "Departure is blocked",
+      details: { ...conflicts, grant: "secret" },
+    })).toBe(false);
+    expect(isAuthorityWorkerResponse({
+      type: "authority.error",
+      requestId: "generic-secret",
+      code: "role_forbidden",
+      message: "Forbidden",
+      details: conflicts,
     })).toBe(false);
     expect(isAuthorityWorkerResponse({
       type: "authority.repair-lease",

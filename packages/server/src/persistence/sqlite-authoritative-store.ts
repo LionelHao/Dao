@@ -15,6 +15,9 @@ import type {
   AuthenticatedCommandContext,
   CommandStore,
   CommandAcknowledgement,
+  ClosedRoomGovernanceAcknowledgement,
+  ClosedRoomGovernanceMutationCommand,
+  ClosedRoomGovernanceTransportStore,
   HashedSessionIssue,
   HashedSessionRotation,
   HumanCollaborationCommand,
@@ -34,6 +37,7 @@ import type { WorkerDatabaseClient } from "./worker-database-client.js";
 export interface SqliteAuthoritativeStore extends
   SessionAuthority,
   CommandStore,
+  ClosedRoomGovernanceTransportStore,
   SnapshotRevalidationStore,
   Pick<
     SyncQueryStore,
@@ -99,6 +103,11 @@ export interface SqliteAuthoritativeStoreOptions {
   readonly afterCommitHuman?: (
     command: HumanCollaborationCommand | RoomGovernanceCommand,
     acknowledgement: CommandAcknowledgement,
+  ) => Promise<void> | void;
+  readonly afterCommitGovernance?: (
+    context: AuthenticatedCommandContext,
+    command: ClosedRoomGovernanceMutationCommand,
+    acknowledgement: ClosedRoomGovernanceAcknowledgement,
   ) => Promise<void> | void;
   readonly invitationSecretProtector?: InvitationSecretProtector;
   readonly invitationTokenFactory?: () => string;
@@ -238,6 +247,16 @@ export function createSqliteAuthoritativeStore(
         : internalAcknowledgement;
       await options.afterCommitHuman?.(command, acknowledgement);
       return acknowledgement;
+    },
+
+    async executeHumanGovernance(context, command) {
+      const acknowledgement = await client.executeHumanGovernance(context, command, clock());
+      await options.afterCommitGovernance?.(context, command, acknowledgement);
+      return acknowledgement;
+    },
+
+    readDepartureConflicts(context, input) {
+      return client.readDepartureConflicts(context, input, clock());
     },
 
     executeAgent(

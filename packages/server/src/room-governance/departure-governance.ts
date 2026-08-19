@@ -277,6 +277,30 @@ function authorizePreflight(state: RoomDepartureState): void {
   return commandError(403, "role_forbidden", "Caller cannot inspect this departure target");
 }
 
+function assertExpectedGovernanceRevision(
+  transaction: AuthorityTransactionView,
+  roomId: string,
+  expectedGovernanceRevision: number,
+): void {
+  if (!isSafeRevision(expectedGovernanceRevision)) {
+    dependencyUnavailable("malformed_result");
+  }
+  useTransactionDatabase(transaction, (database) => {
+    const room = database.prepare(
+      "SELECT governance_revision AS governanceRevision FROM rooms WHERE id = ?",
+    ).get(roomId);
+    if (room === undefined) {
+      return commandError(404, "room_not_found", "Authority Room was not found");
+    }
+    if (!isSafeRevision(room.governanceRevision)) {
+      return dependencyUnavailable("malformed_result");
+    }
+    if (room.governanceRevision !== expectedGovernanceRevision) {
+      return commandError(409, "room_revision_conflict", "Room governance revision is stale");
+    }
+  });
+}
+
 function authorizeMutation(
   state: RoomDepartureState,
   input: DepartureMutationInput,
@@ -442,6 +466,11 @@ export function createDepartureGovernanceCoordinator(
     transaction: AuthorityTransactionView,
     input: DepartureMutationInput,
   ): DepartureMutationAttempt => {
+    assertExpectedGovernanceRevision(
+      transaction,
+      input.roomId,
+      input.expectedGovernanceRevision,
+    );
     const state = readRoomDepartureState(transaction, input);
     const authorization = authorizeMutation(state, input);
     throwIfBlocked(collectConflictList(composition, transaction, state));
@@ -464,6 +493,11 @@ export function createDepartureGovernanceCoordinator(
     }
     binding.consumed = true;
 
+    assertExpectedGovernanceRevision(
+      transaction,
+      binding.input.roomId,
+      binding.input.expectedGovernanceRevision,
+    );
     const finalState = readRoomDepartureState(transaction, binding.input);
     const finalAuthorization = authorizeMutation(finalState, binding.input);
     if (finalAuthorization.actorRole !== binding.authorization.actorRole ||

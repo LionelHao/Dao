@@ -10,16 +10,12 @@ export const MEMBER_ACCESS_REVOCATION_V15_REQUIREMENTS = Object.freeze({
   cacheInvalidation: Object.freeze({
     targetColumn: "target_actor_id TEXT REFERENCES actors(id)",
     reasonValue: "member_removed",
-    uniqueKey: Object.freeze([
-      "room_id", "lifecycle_generation", "reason", "COALESCE(target_actor_id, '')",
-    ]),
+    uniqueKey: Object.freeze(["room_id", "target_actor_id", "access_revision", "reason"]),
   }),
   offlineLeaseInvalidation: Object.freeze({
     targetColumn: "target_actor_id TEXT REFERENCES actors(id)",
     reasonValue: "member_removed",
-    uniqueKey: Object.freeze([
-      "room_id", "lifecycle_generation", "reason", "COALESCE(target_actor_id, '')",
-    ]),
+    uniqueKey: Object.freeze(["room_id", "target_actor_id", "access_revision", "reason"]),
   }),
   archiveScopeRule: "room_archived requires target_actor_id IS NULL",
   memberScopeRule: "member_removed requires target_actor_id IS NOT NULL",
@@ -155,9 +151,9 @@ function definitions(database: DatabaseSync, table: string): readonly string[] {
 
 function hasTargetScopeUniqueKey(sql: readonly string[]): boolean {
   return sql.some((definition) => definition.includes("unique") &&
-    definition.includes("room_id") && definition.includes("lifecycle_generation") &&
+    definition.includes("room_id") && definition.includes("access_revision") &&
     definition.includes("reason") && definition.includes("target_actor_id") &&
-    definition.includes("coalesce"));
+    definition.includes("member_removed"));
 }
 
 function missingCapabilities(

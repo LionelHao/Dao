@@ -325,7 +325,7 @@ export interface AuthoritativeRoomLifecycleServiceOptions {
   readonly commandStore: CommandStore;
   readonly queryStore: Pick<
     SyncQueryStore,
-    "readActor" | "readRoom" | "canAccessRoom" | "readRoomAudit"
+    "readActor" | "readRoom" | "readRoomGovernance" | "canAccessRoom" | "readRoomAudit"
   >;
 }
 
@@ -1309,11 +1309,17 @@ export function createAuthoritativeRoomLifecycleService(
     },
 
     async archiveRoom(context, roomId) {
-      return authoritativeRoom(await options.commandStore.executeHuman(context, {
+      const governance = await options.queryStore.readRoomGovernance(context, roomId);
+      await options.commandStore.executeHuman(context, {
         type: "room.archive",
         roomId,
-        payload: {},
-      }));
+        payload: { expectedGovernanceRevision: governance.governanceRevision },
+      });
+      const room = await options.queryStore.readRoom(roomId);
+      if (room === undefined || !isManagedRoomShape(room) || room.status !== "archived") {
+        throw new TypeError("Authoritative archive acknowledgement is invalid");
+      }
+      return room;
     },
 
     async inviteHuman(context, request) {

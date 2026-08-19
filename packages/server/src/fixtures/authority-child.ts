@@ -29,6 +29,11 @@ interface AuthorityChildStartCommand {
     readonly actorId: string;
     readonly secret: string;
   };
+  readonly identities?: readonly {
+    readonly accountId: string;
+    readonly actorId: string;
+    readonly secret: string;
+  }[];
   readonly invitationSecretKey: string;
   readonly faultPoint?:
     | "after-domain-write"
@@ -36,6 +41,7 @@ interface AuthorityChildStartCommand {
     | "after-commit-before-outbox"
     | "after-send-before-dispatch-mark";
   readonly seedAllFacts?: true;
+  readonly seedGovernanceRoom?: true;
   readonly forceSnapshotFallback?: true;
   readonly snapshotRecordsPerPage?: number;
   readonly readbackOnly?: true;
@@ -70,9 +76,11 @@ function isStartCommand(value: unknown): value is AuthorityChildStartCommand {
     "snapshotCachePath",
     "actors",
     "identity",
+    ...(value.identities === undefined ? [] : ["identities"]),
     "invitationSecretKey",
     ...(value.faultPoint === undefined ? [] : ["faultPoint"]),
     ...(value.seedAllFacts === undefined ? [] : ["seedAllFacts"]),
+    ...(value.seedGovernanceRoom === undefined ? [] : ["seedGovernanceRoom"]),
     ...(value.forceSnapshotFallback === undefined ? [] : ["forceSnapshotFallback"]),
     ...(value.snapshotRecordsPerPage === undefined ? [] : ["snapshotRecordsPerPage"]),
     ...(value.readbackOnly === undefined ? [] : ["readbackOnly"]),
@@ -92,8 +100,16 @@ function isStartCommand(value: unknown): value is AuthorityChildStartCommand {
       typeof value.identity.accountId !== "string" || value.identity.accountId.length === 0 ||
       typeof value.identity.actorId !== "string" || value.identity.actorId.length === 0 ||
       typeof value.identity.secret !== "string" || value.identity.secret.length === 0 ||
+      (value.identities !== undefined && (!Array.isArray(value.identities) ||
+        value.identities.length === 0 || value.identities.some((identity) =>
+          !isRecord(identity) || !exactKeys(identity, ["accountId", "actorId", "secret"]) ||
+          typeof identity.accountId !== "string" || identity.accountId.length === 0 ||
+          typeof identity.actorId !== "string" || identity.actorId.length === 0 ||
+          typeof identity.secret !== "string" || identity.secret.length === 0))) ||
       typeof value.invitationSecretKey !== "string" ||
       (value.seedAllFacts !== undefined && value.seedAllFacts !== true) ||
+      (value.seedGovernanceRoom !== undefined && value.seedGovernanceRoom !== true) ||
+      (value.seedAllFacts === true && value.seedGovernanceRoom === true) ||
       (value.forceSnapshotFallback !== undefined && value.forceSnapshotFallback !== true) ||
       (value.snapshotRecordsPerPage !== undefined &&
         (!Number.isSafeInteger(value.snapshotRecordsPerPage) ||
@@ -414,13 +430,11 @@ if (command.compactRoom !== undefined) {
 }
 const identities: IdentityAdapter = {
   async verify(credentials: LoginCredentials) {
-    return credentials.accountId === command.identity.accountId &&
-      credentials.secret === command.identity.secret
-      ? {
-          accountId: command.identity.accountId,
-          actorId: command.identity.actorId,
-        }
-      : undefined;
+    const matched = (command.identities ?? [command.identity]).find((identity) =>
+      credentials.accountId === identity.accountId && credentials.secret === identity.secret);
+    return matched === undefined
+      ? undefined
+      : { accountId: matched.accountId, actorId: matched.actorId };
   },
 };
 
@@ -500,6 +514,22 @@ async function seedThroughFacades(
     });
 }
 
+async function seedGovernanceRoomThroughFacades(
+  facades: Parameters<NonNullable<Parameters<typeof startAuthoritativeServerForTest>[1]["initialize"]>>[0],
+): Promise<void> {
+  const issued = await facades.auth.login({
+    accountId: command.identity.accountId,
+    secret: command.identity.secret,
+  });
+  const session = await facades.auth.authenticateSession(issued.accessToken);
+  await facades.lifecycle.createRoom({
+    ...session,
+    kind: "human",
+    requestId: "seed-governance-room",
+    idempotencyKey: "seed-governance-room",
+  }, { name: "Governance process room" });
+}
+
 const serverOptions: StartAuthoritativeServerOptions = {
   databasePath: command.databasePath,
   snapshotCachePath: command.snapshotCachePath,
@@ -517,6 +547,9 @@ const testOptions = {
     ? {}
     : { snapshotMaxRecordsPerPage: command.snapshotRecordsPerPage }),
   ...(command.seedAllFacts === true ? { initialize: seedThroughFacades } : {}),
+  ...(command.seedGovernanceRoom === true
+    ? { initialize: seedGovernanceRoomThroughFacades }
+    : {}),
   ...(command.readbackOnly === true ? { registerMissingActors: false as const } : {}),
   ...(command.closeCleanupProbe === true ? {
     afterCloseForTest: {

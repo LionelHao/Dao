@@ -142,6 +142,12 @@ export type {
   RoomHistoryFrame,
   RoomHistoryRequestFrame,
   RoomEventFrame,
+  RoomDepartureConflictsFrame,
+  RoomDepartureConflictsResultFrame,
+  RoomGovernanceAckFrame,
+  RoomGovernanceFrame,
+  RoomGovernanceGetFrame,
+  RoomGovernanceMutationFrame,
   RoomRepairBeginRequestFrame,
   RoomRepairPageRequestFrame,
   RoomSubscribeFrame,
@@ -199,6 +205,8 @@ export type { AuthoritySchemaInspection, CreateWorkerDatabaseClientOptions };
 export type WorkerDatabaseClient = Omit<
   InternalWorkerDatabaseClient,
   | "executeHuman"
+  | "executeHumanGovernance"
+  | "readDepartureConflicts"
   | "executeAgent"
   | "executeRuntime"
   | "executeRoute"
@@ -248,6 +256,7 @@ export async function createWorkerDatabaseClient(
   };
 }
 export {
+  parseClosedRoomGovernanceMutationCommand,
   parsePersistedIdentityEvent,
   parsePersistedRoomEvent,
   parsePersistentCommand,
@@ -258,6 +267,9 @@ export type {
   AuthenticatedCommandContext,
   AuthenticatedSessionContext,
   CollaborationCommand,
+  ClosedRoomGovernanceAcknowledgement,
+  ClosedRoomGovernanceMutationCommand,
+  ClosedRoomGovernanceTransportStore,
   CommandAcknowledgement,
   CommandStore,
   ContractParseResult,

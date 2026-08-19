@@ -230,6 +230,7 @@ function adminFixture(): RoomLifecycleState {
 describe("authoritative RoomLifecycle facade", () => {
   it("routes every mutation and query through authority ports", async () => {
     const commandsSeen: string[] = [];
+    let archivedRoomReadPending = false;
     const state = ownerFixture();
     const managedRoom = state.rooms[0]!;
     const context: AuthenticatedCommandContext = {
@@ -244,6 +245,10 @@ describe("authoritative RoomLifecycle facade", () => {
       async executeHuman(received, command) {
         expect(received).toBe(context);
         commandsSeen.push(command.type);
+        if (command.type === "room.archive") {
+          expect(command.payload).toEqual({ expectedGovernanceRevision: 1 });
+          archivedRoomReadPending = true;
+        }
         if (command.type === "human.invitation.issue") {
           return {
             aggregateId: "invitation-authority",
@@ -298,7 +303,23 @@ describe("authoritative RoomLifecycle facade", () => {
       },
       async readRoom(roomId) {
         expect(roomId).toBe(managedRoom.id);
+        if (archivedRoomReadPending) {
+          archivedRoomReadPending = false;
+          return { ...managedRoom, status: "archived" };
+        }
         return managedRoom;
+      },
+      async readRoomGovernance(received, roomId) {
+        expect(received).toBe(context);
+        expect(roomId).toBe(managedRoom.id);
+        return {
+          roomId,
+          projectId: roomId,
+          lifecycle: "active",
+          governanceRevision: 1,
+          ownerActorId: owner.id,
+          archiveGeneration: 0,
+        };
       },
       async canAccessRoom(received, roomId) {
         expect(received).toEqual({

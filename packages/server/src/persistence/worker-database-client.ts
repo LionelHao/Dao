@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
 import type {
   Actor,
+  DepartureConflictList,
   ManagedRoom,
   Message,
   RoomSyncRequest,
@@ -31,6 +32,8 @@ import type {
   AgentCollaborationCommand,
   AuthenticatedSessionContext,
   AuthenticatedCommandContext,
+  ClosedRoomGovernanceAcknowledgement,
+  ClosedRoomGovernanceMutationCommand,
   CommandAcknowledgement,
   HashedSessionIssue,
   HashedSessionRotation,
@@ -105,6 +108,16 @@ export interface WorkerDatabaseClient {
       readonly sealedToken: string;
     },
   ): Promise<CommandAcknowledgement>;
+  executeHumanGovernance(
+    context: AuthenticatedCommandContext,
+    command: ClosedRoomGovernanceMutationCommand,
+    now: number,
+  ): Promise<ClosedRoomGovernanceAcknowledgement>;
+  readDepartureConflicts(
+    context: AuthenticatedSessionContext,
+    input: { readonly roomId: string; readonly targetActorId: string },
+    now: number,
+  ): Promise<DepartureConflictList>;
   executeAgent(
     context: InternalAgentCommandContext,
     command: AgentCollaborationCommand,
@@ -211,12 +224,18 @@ export interface AuthorityWorkerTransport {
 export class AuthorityWorkerClientError extends Error {
   readonly status: number;
   readonly retryAfterMs: number | undefined;
+  readonly details?: DepartureConflictList;
 
-  constructor(readonly code: AuthorityWorkerClientErrorCode, message: string) {
+  constructor(
+    readonly code: AuthorityWorkerClientErrorCode,
+    message: string,
+    details?: DepartureConflictList,
+  ) {
     super(message);
     this.name = "AuthorityWorkerClientError";
     this.status = authorityWorkerClientErrorStatus(code);
     this.retryAfterMs = code === "repair_barrier_active" ? 250 : undefined;
+    if (details !== undefined) this.details = details;
   }
 
 }
@@ -288,6 +307,9 @@ function authorityWorkerClientErrorStatus(
     case "room_revision_conflict":
     case "snapshot_stale":
     case "confirmation_replayed":
+    case "confirmation_rejected":
+    case "departure_blocked":
+    case "grant_revoked":
       return 409;
     case "snapshot_forbidden":
     case "role_forbidden":
@@ -1020,6 +1042,51 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
     });
   }
 
+  executeHumanGovernance(
+    context: AuthenticatedCommandContext,
+    command: ClosedRoomGovernanceMutationCommand,
+    now: number,
+  ): Promise<ClosedRoomGovernanceAcknowledgement> {
+    if (this.#terminalError !== undefined) return this.#rejectTerminal();
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) return Promise.reject(unavailable);
+    return this.#send({
+      type: "authority.execute-human-governance",
+      context,
+      command,
+      now,
+    }).then((response) => {
+      if (response.type !== "authority.governance-acknowledged") {
+        this.#failProtocol("Authority worker returned the wrong governance command response");
+        throw this.#terminalError;
+      }
+      return response.acknowledgement;
+    });
+  }
+
+  readDepartureConflicts(
+    context: AuthenticatedSessionContext,
+    input: { readonly roomId: string; readonly targetActorId: string },
+    now: number,
+  ): Promise<DepartureConflictList> {
+    if (this.#terminalError !== undefined) return this.#rejectTerminal();
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) return Promise.reject(unavailable);
+    return this.#send({
+      type: "authority.departure-conflicts",
+      context,
+      roomId: input.roomId,
+      targetActorId: input.targetActorId,
+      now,
+    }).then((response) => {
+      if (response.type !== "authority.departure-conflicts") {
+        this.#failProtocol("Authority worker returned the wrong departure query response");
+        throw this.#terminalError;
+      }
+      return response.conflicts;
+    });
+  }
+
   executeAgent(
     context: InternalAgentCommandContext,
     command: AgentCollaborationCommand,
@@ -1526,7 +1593,11 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
     }
 
     if (message.type === "authority.error") {
-      const error = new AuthorityWorkerClientError(message.code, message.message);
+      const error = new AuthorityWorkerClientError(
+        message.code,
+        message.message,
+        message.code === "departure_blocked" ? message.details : undefined,
+      );
       if (
         message.code === "storage_unavailable" ||
         pending.requestType === "authority.initialize" ||
@@ -1589,6 +1660,10 @@ class WorkerDatabaseClientImplementation implements WorkerDatabaseClient {
         responseType === "authority.session-target-revoked") ||
       (requestType === "authority.execute-human" &&
         responseType === "authority.command-acknowledged") ||
+      (requestType === "authority.execute-human-governance" &&
+        responseType === "authority.governance-acknowledged") ||
+      (requestType === "authority.departure-conflicts" &&
+        responseType === "authority.departure-conflicts") ||
       (requestType === "authority.execute-agent" &&
         responseType === "authority.command-acknowledged") ||
       (requestType === "authority.runtime" &&

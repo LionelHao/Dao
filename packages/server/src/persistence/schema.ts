@@ -48,7 +48,7 @@ const V12_MIGRATION_CHECKSUM =
 const V13_MIGRATION_CHECKSUM =
   "0d008e577b5514d5fd51fa65c9c31ef51e32e55e09483c8a2e3a707d6ca42e3e";
 const V15_MIGRATION_CHECKSUM =
-  "65a371b2faf68d906c8241195f3dff0d4937e8acfde2d46bb7961c748d9a15a8";
+  "41740e7d34f6807248bf7879f34f9026844802dfe5a43f0ee18bf498a24dc0c9";
 const SCHEMA_FINGERPRINTS = {
   1: "03f2bbba4aa7082ec01819824726ce1bd9b4bd14cebea71afc93c6821dbf405c",
   2: "01c37d92ec2f303613a7bb8b592ca846fbea7c829b3c81fe4521699db949dfcc",
@@ -64,7 +64,7 @@ const SCHEMA_FINGERPRINTS = {
   12: "7232d27114e9acf32dcfbc2d59f3c3128eed10955de3cc2703ddeedf92892741",
   13: "037df6a2818f2a90b7394240a4cf71d77949faf31df6534c5546c9ed6b7e7191",
   14: "b4f1034ce034203fd14f5bc32391cb8855f7d6eed64c0b01f75d41e331a8b5c5",
-  15: "ab8750a11a2c2eef071b395a291505b5879854f8748fd12bf852cf8ba6a0b366",
+  15: "e8010dc3c03c71d51f20ef4054a815d3580abdcbd0762791508226a68918b426",
 } as const;
 
 const V1_STATEMENTS = [
@@ -1711,10 +1711,15 @@ const V15_STATEMENTS = [
   `DROP TABLE room_cache_invalidation_intents`,
   `ALTER TABLE room_cache_invalidation_intents_v15
    RENAME TO room_cache_invalidation_intents`,
-  `CREATE UNIQUE INDEX room_cache_invalidation_scope_v15
+  `CREATE UNIQUE INDEX room_cache_archive_invalidation_scope_v15
+   ON room_cache_invalidation_intents(room_id, lifecycle_generation, reason)
+   WHERE reason = 'room_archived' AND target_actor_id IS NULL`,
+  `CREATE UNIQUE INDEX room_cache_target_invalidation_scope_v15
    ON room_cache_invalidation_intents(
-     room_id, lifecycle_generation, reason, COALESCE(target_actor_id, '')
-   )`,
+     room_id, target_actor_id, access_revision, reason
+   )
+   WHERE reason IN ('member_removed', 'access_revoked')
+     AND target_actor_id IS NOT NULL`,
   `CREATE INDEX room_cache_invalidation_ready
    ON room_cache_invalidation_intents(status, available_at, created_at, id)`,
   `CREATE TABLE offline_read_lease_invalidations_v15 (
@@ -1744,10 +1749,15 @@ const V15_STATEMENTS = [
   `DROP TABLE offline_read_lease_invalidations`,
   `ALTER TABLE offline_read_lease_invalidations_v15
    RENAME TO offline_read_lease_invalidations`,
-  `CREATE UNIQUE INDEX offline_read_lease_invalidation_scope_v15
+  `CREATE UNIQUE INDEX offline_read_lease_archive_invalidation_scope_v15
+   ON offline_read_lease_invalidations(room_id, lifecycle_generation, reason)
+   WHERE reason = 'room_archived' AND target_actor_id IS NULL`,
+  `CREATE UNIQUE INDEX offline_read_lease_target_invalidation_scope_v15
    ON offline_read_lease_invalidations(
-     room_id, lifecycle_generation, reason, COALESCE(target_actor_id, '')
-   )`,
+     room_id, target_actor_id, access_revision, reason
+   )
+   WHERE reason IN ('member_removed', 'access_revoked')
+     AND target_actor_id IS NOT NULL`,
 ] as const;
 
 export const AUTHORITY_V14_STATEMENT_COUNT_FOR_TEST = V14_STATEMENTS.length;
@@ -3462,8 +3472,9 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
        JOIN rooms AS room ON room.id = intent.room_id
        LEFT JOIN room_access_authority AS access ON access.room_id = intent.room_id
        WHERE intent.lifecycle_generation > room.archive_generation
-          OR access.room_id IS NULL
-          OR intent.access_revision > access.access_revision
+          OR (intent.reason = 'room_archived' AND (
+                access.room_id IS NULL OR intent.access_revision > access.access_revision
+              ))
        LIMIT 1`,
       "room cache invalidations must be bounded by lifecycle and access authority",
     );
@@ -3487,9 +3498,16 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
        JOIN rooms AS room ON room.id = invalidation.room_id
        LEFT JOIN room_access_authority AS access ON access.room_id = invalidation.room_id
        WHERE invalidation.lifecycle_generation > room.archive_generation
-          OR access.room_id IS NULL
-          OR invalidation.access_revision > access.access_revision
-          OR invalidation.lease_generation > access.lease_generation
+          OR (invalidation.reason = 'room_archived' AND (
+                access.room_id IS NULL
+                OR invalidation.access_revision > access.access_revision
+                OR invalidation.lease_generation > access.lease_generation
+              ))
+          OR (invalidation.reason <> 'room_archived' AND (
+                (access.room_id IS NULL AND invalidation.lease_generation <> 0)
+                OR (access.room_id IS NOT NULL
+                    AND invalidation.lease_generation > access.lease_generation)
+              ))
        LIMIT 1`,
       "offline lease invalidations must be bounded by lifecycle and access authority",
     );
@@ -3705,6 +3723,16 @@ export function migrateAuthorityDatabaseToPreviousVersionForTest(
   database: DatabaseSync,
 ): void {
   migrateAuthorityDatabaseToVersion(database, AUTHORITY_SCHEMA_VERSION - 1);
+}
+
+export function migrateAuthorityDatabaseToHistoricalVersionForTest(
+  database: DatabaseSync,
+  version: number,
+): void {
+  if (version >= AUTHORITY_SCHEMA_VERSION) {
+    throw new TypeError("historical authority schema version must precede current");
+  }
+  migrateAuthorityDatabaseToVersion(database, version);
 }
 
 export function migrateAuthorityDatabaseToVersion13ForTest(

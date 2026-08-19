@@ -1,4 +1,5 @@
 import {
+  isDepartureConflictList,
   isActor,
   isMessage,
   isRoomGovernanceView,
@@ -8,6 +9,7 @@ import {
 } from "@native-im/core";
 import type {
   Actor,
+  DepartureConflictList,
   ManagedRoom,
   Message,
   RoomSyncRequest,
@@ -22,6 +24,7 @@ import {
   type RoomAuditRecord,
 } from "../room-lifecycle.js";
 import {
+  parseClosedRoomGovernanceMutationCommand,
   parsePersistedIdentityEvent,
   parsePersistedRoomEvent,
   parsePersistentCommand,
@@ -46,6 +49,8 @@ import type {
   AgentWorkerCommandContext,
   AuthenticatedSessionContext,
   AuthenticatedCommandContext,
+  ClosedRoomGovernanceAcknowledgement,
+  ClosedRoomGovernanceMutationCommand,
   CommandAcknowledgement,
   HashedSessionIssue,
   HashedSessionRotation,
@@ -74,7 +79,9 @@ export type AuthorityWorkerErrorCode =
   | "calibration_source_invalid"
   | "confirmation_expired"
   | "confirmation_forbidden"
+  | "confirmation_rejected"
   | "confirmation_replayed"
+  | "departure_blocked"
   | "execution_conflict"
   | "execution_not_found"
   | "execution_not_running"
@@ -91,6 +98,7 @@ export type AuthorityWorkerErrorCode =
   | "invitee_required"
   | "legacy_import_failed"
   | "legacy_import_unavailable"
+  | "grant_revoked"
   | "light_task_not_found"
   | "member_not_found"
   | "message_not_found"
@@ -138,7 +146,9 @@ export function isAuthorityWorkerErrorCode(
     case "calibration_source_invalid":
     case "confirmation_expired":
     case "confirmation_forbidden":
+    case "confirmation_rejected":
     case "confirmation_replayed":
+    case "departure_blocked":
     case "execution_conflict":
     case "execution_not_found":
     case "execution_not_running":
@@ -155,6 +165,7 @@ export function isAuthorityWorkerErrorCode(
     case "invitee_required":
     case "legacy_import_failed":
     case "legacy_import_unavailable":
+    case "grant_revoked":
     case "light_task_not_found":
     case "member_not_found":
     case "message_not_found":
@@ -262,6 +273,21 @@ export type AuthorityWorkerRequest =
         readonly tokenHash: string;
         readonly sealedToken: string;
       };
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.execute-human-governance";
+      readonly requestId: string;
+      readonly context: AuthenticatedCommandContext;
+      readonly command: ClosedRoomGovernanceMutationCommand;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.departure-conflicts";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext;
+      readonly roomId: string;
+      readonly targetActorId: string;
       readonly now: number;
     }
   | {
@@ -490,6 +516,16 @@ export type AuthorityWorkerResponse =
       readonly acknowledgement: CommandAcknowledgement;
     }
   | {
+      readonly type: "authority.governance-acknowledged";
+      readonly requestId: string;
+      readonly acknowledgement: ClosedRoomGovernanceAcknowledgement;
+    }
+  | {
+      readonly type: "authority.departure-conflicts";
+      readonly requestId: string;
+      readonly conflicts: DepartureConflictList;
+    }
+  | {
       readonly type: "authority.history";
       readonly requestId: string;
       readonly messages: readonly Message[];
@@ -570,8 +606,16 @@ export type AuthorityWorkerResponse =
   | {
       readonly type: "authority.error";
       readonly requestId: string;
-      readonly code: AuthorityWorkerErrorCode;
+      readonly code: Exclude<AuthorityWorkerErrorCode, "departure_blocked">;
       readonly message: string;
+      readonly details?: never;
+    }
+  | {
+      readonly type: "authority.error";
+      readonly requestId: string;
+      readonly code: "departure_blocked";
+      readonly message: string;
+      readonly details: DepartureConflictList;
     };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -888,6 +932,17 @@ function isCommandAcknowledgement(value: unknown): value is CommandAcknowledgeme
   );
 }
 
+function isClosedRoomGovernanceAcknowledgement(
+  value: unknown,
+): value is ClosedRoomGovernanceAcknowledgement {
+  return isRecord(value) &&
+    hasExactKeys(value, ["governance", "eventIds", "replayed"]) &&
+    isRoomGovernanceView(value.governance) && Array.isArray(value.eventIds) &&
+    value.eventIds.length <= 1_024 && value.eventIds.every(isText) &&
+    new Set(value.eventIds).size === value.eventIds.length &&
+    typeof value.replayed === "boolean";
+}
+
 function isOutboxDispatchCandidate(value: unknown): value is OutboxDispatchCandidate {
   return isRecord(value) &&
     hasExactKeys(value, [
@@ -955,11 +1010,17 @@ function isOutboxDelivery(value: unknown): value is OutboxDelivery {
 function isCommittedRoomCacheInvalidationIntent(
   value: unknown,
 ): value is CommittedRoomCacheInvalidationIntent {
-  return isRecord(value) && hasExactKeys(value, [
+  if (!isRecord(value) || !isText(value.invalidationIntentId) || !isText(value.roomId) ||
+      !isNonNegativeSafeInteger(value.lifecycleGeneration) ||
+      !isNonNegativeSafeInteger(value.accessRevision)) return false;
+  if (value.reason === "room_archived") return hasExactKeys(value, [
     "invalidationIntentId", "roomId", "lifecycleGeneration", "accessRevision", "reason",
-  ]) && isText(value.invalidationIntentId) && isText(value.roomId) &&
-    isNonNegativeSafeInteger(value.lifecycleGeneration) &&
-    isNonNegativeSafeInteger(value.accessRevision) && value.reason === "room_archived";
+  ]);
+  return (value.reason === "member_removed" || value.reason === "access_revoked") &&
+    hasExactKeys(value, [
+      "invalidationIntentId", "roomId", "lifecycleGeneration", "accessRevision", "reason",
+      "targetActorId",
+    ]) && isText(value.targetActorId);
 }
 
 export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWorkerRequest {
@@ -1068,6 +1129,17 @@ export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWork
             !Object.hasOwn(value, "invitationSecret"))) &&
         isNonNegativeSafeInteger(value.now)
       );
+    case "authority.execute-human-governance": {
+      const parsed = parseClosedRoomGovernanceMutationCommand(value.command);
+      return hasExactKeys(value, ["type", "requestId", "context", "command", "now"]) &&
+        isAuthenticatedCommandContext(value.context) && parsed.ok &&
+        isNonNegativeSafeInteger(value.now);
+    }
+    case "authority.departure-conflicts":
+      return hasExactKeys(value, [
+        "type", "requestId", "context", "roomId", "targetActorId", "now",
+      ]) && isAuthenticatedSessionContext(value.context) && isText(value.roomId) &&
+        isText(value.targetActorId) && isNonNegativeSafeInteger(value.now);
     case "authority.execute-agent":
       return (
         hasExactKeys(value, ["type", "requestId", "context", "command", "now"]) &&
@@ -1226,6 +1298,12 @@ export function isAuthorityWorkerResponse(
         hasExactKeys(value, ["type", "requestId", "acknowledgement"]) &&
         isCommandAcknowledgement(value.acknowledgement)
       );
+    case "authority.governance-acknowledged":
+      return hasExactKeys(value, ["type", "requestId", "acknowledgement"]) &&
+        isClosedRoomGovernanceAcknowledgement(value.acknowledgement);
+    case "authority.departure-conflicts":
+      return hasExactKeys(value, ["type", "requestId", "conflicts"]) &&
+        isDepartureConflictList(value.conflicts);
     case "authority.history":
       return hasExactKeys(value, ["type", "requestId", "messages"]) &&
         Array.isArray(value.messages) && value.messages.every(isMessage);
@@ -1327,12 +1405,12 @@ export function isAuthorityWorkerResponse(
         isNonNegativeSafeInteger(value.identityHeadSeq)
       );
     case "authority.error":
-      return (
-        hasExactKeys(value, ["type", "requestId", "code", "message"]) &&
+      return typeof value.message === "string" && value.message.length > 0 &&
         isAuthorityWorkerErrorCode(value.code) &&
-        typeof value.message === "string" &&
-        value.message.length > 0
-      );
+        (value.code === "departure_blocked"
+          ? hasExactKeys(value, ["type", "requestId", "code", "message", "details"]) &&
+            isDepartureConflictList(value.details)
+          : hasExactKeys(value, ["type", "requestId", "code", "message"]));
     default:
       return false;
   }
