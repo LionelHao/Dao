@@ -4960,6 +4960,107 @@ describe("SQLite authoritative sessions", () => {
     }
   });
 
+  it("claims an active Agent route source through its current authority envelope", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-route-active-agent-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const fixture = await createCommandMatrixFixture(databasePath);
+    const sourceMessageId = "message-agent-active-route-source";
+    await fixture.store.executeAgent(
+      mintInternalAgentCommandContext({
+        agentId: "agent-review",
+        requestId: "active-agent-route-submit",
+        idempotencyKey: "active-agent-route-submit",
+      }),
+      {
+        type: "message.send",
+        roomId: fixture.contexts.roomId,
+        payload: {
+          id: sourceMessageId,
+          roomId: fixture.contexts.roomId,
+          body: "active Agent route body",
+          sentAt: "2026-08-19T09:00:00.000Z",
+        },
+      },
+    );
+
+    await expect(fixture.client.executeRoute({
+      type: "route.claim",
+      sourceMessageId,
+      now: 5_100,
+    })).resolves.toMatchObject({
+      kind: "route-claimed",
+      providerInput: {
+        sourceMessageId,
+        message: {
+          authorId: "agent-review",
+          authorKind: "agent",
+          summary: "active Agent route body",
+        },
+      },
+    });
+    await fixture.client.close();
+  });
+
+  it("routes the current Human revision without exposing the retained old body", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-route-current-revision-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const fixture = await createCommandMatrixFixture(databasePath);
+    const sourceMessageId = "message-v2-route-current-revision";
+    const oldBody = "OLD-ROUTE-REVISION-SENTINEL";
+    const currentBody = "current authoritative route revision";
+    await fixture.store.submitHumanMessage(
+      {
+        ...fixture.contexts.owner,
+        requestId: "route-current-revision-submit",
+        idempotencyKey: sourceMessageId,
+      },
+      {
+        messageId: sourceMessageId,
+        roomId: fixture.contexts.roomId,
+        body: oldBody,
+        mentionedTargets: [],
+        attachments: [],
+      },
+    );
+    await fixture.client.executeRuntime({
+      type: "runtime.cancel-for-human-fence",
+      sourceHumanMessageId: sourceMessageId,
+      now: 5_100,
+    });
+    await fixture.client.executeRuntime({
+      type: "runtime.create-route-after-human-fence",
+      sourceHumanMessageId: sourceMessageId,
+      now: 5_101,
+    });
+    await fixture.store.reviseHumanMessage(
+      {
+        ...fixture.contexts.ownerSecondDevice,
+        requestId: "route-current-revision-revise",
+        idempotencyKey: "route-current-revision-revise-transport",
+      },
+      {
+        roomId: fixture.contexts.roomId,
+        messageId: sourceMessageId,
+        expectedRevision: 1,
+        body: currentBody,
+      },
+    );
+
+    const claimed = await fixture.client.executeRoute({
+      type: "route.claim",
+      sourceMessageId,
+      now: 5_200,
+    });
+    expect(claimed).toMatchObject({
+      kind: "route-claimed",
+      providerInput: { message: { summary: currentBody } },
+    });
+    expect(JSON.stringify(claimed)).not.toContain(oldBody);
+    await fixture.client.close();
+  });
+
   it("rejects route claim after its Human source is recalled without exposing raw body", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-route-recalled-source-"));
     temporaryDirectories.push(directory);

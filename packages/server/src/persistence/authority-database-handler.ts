@@ -5160,13 +5160,11 @@ export function executeRouteAuthorityOperation(
          JOIN message_envelopes AS envelope
            ON envelope.message_id = stored.id
           AND envelope.room_id = stored.room_id
-          AND envelope.message_kind = 'human'
           AND envelope.lifecycle = 'active'
          JOIN message_revisions AS revision
            ON revision.message_id = envelope.message_id
           AND revision.revision = envelope.current_revision
          WHERE stored.id = ? AND stored.room_id = ?
-           AND stored.author_kind = 'human'
            AND NOT EXISTS (
              SELECT 1 FROM message_recall_fences AS recall
              WHERE recall.source_message_id = stored.id
@@ -5177,7 +5175,8 @@ export function executeRouteAuthorityOperation(
       if (message === undefined) {
         return fail("route_conflict", "Route source message was no longer active");
       }
-      if (typeof message.authorId !== "string" || message.authorKind !== "human" ||
+      if (typeof message.authorId !== "string" ||
+          (message.authorKind !== "human" && message.authorKind !== "agent") ||
           typeof message.body !== "string" || typeof message.sentAt !== "string") {
         return fail("storage_unavailable", "Route source message was corrupt");
       }
