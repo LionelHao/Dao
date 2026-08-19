@@ -205,6 +205,8 @@ export type { AuthoritySchemaInspection, CreateWorkerDatabaseClientOptions };
 export type WorkerDatabaseClient = Omit<
   InternalWorkerDatabaseClient,
   | "executeHuman"
+  | "executeHumanGovernance"
+  | "readDepartureConflicts"
   | "executeAgent"
   | "executeRuntime"
   | "executeRoute"

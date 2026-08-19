@@ -138,13 +138,21 @@ export const roomCacheInvalidationRegistration = Object.freeze({
   participant: roomCacheInvalidationPort,
 }) satisfies ParticipantRegistration<RoomCacheInvalidationPort>;
 
-export interface CommittedRoomCacheInvalidationIntent {
+interface CommittedRoomCacheInvalidationIntentBase {
   readonly invalidationIntentId: string;
   readonly roomId: string;
   readonly lifecycleGeneration: number;
   readonly accessRevision: number;
-  readonly reason: "room_archived";
 }
+
+export type CommittedRoomCacheInvalidationIntent =
+  | (CommittedRoomCacheInvalidationIntentBase & {
+      readonly reason: "room_archived";
+    })
+  | (CommittedRoomCacheInvalidationIntentBase & {
+      readonly reason: "member_removed" | "access_revoked";
+      readonly targetActorId: string;
+    });
 
 export interface RoomCacheInvalidationIntentAuthority {
   listCommittedReady(limit: number): Promise<readonly CommittedRoomCacheInvalidationIntent[]>;
@@ -211,10 +219,14 @@ function isCommittedInvalidationIntent(
 ): value is CommittedRoomCacheInvalidationIntent {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const candidate = value as Partial<CommittedRoomCacheInvalidationIntent>;
-  return Object.keys(value).length === 5 &&
-    typeof candidate.invalidationIntentId === "string" && candidate.invalidationIntentId.length > 0 &&
+  const common = typeof candidate.invalidationIntentId === "string" &&
+    candidate.invalidationIntentId.length > 0 &&
     typeof candidate.roomId === "string" && candidate.roomId.length > 0 &&
     Number.isSafeInteger(candidate.lifecycleGeneration) && candidate.lifecycleGeneration! >= 0 &&
-    Number.isSafeInteger(candidate.accessRevision) && candidate.accessRevision! >= 0 &&
-    candidate.reason === "room_archived";
+    Number.isSafeInteger(candidate.accessRevision) && candidate.accessRevision! >= 0;
+  if (!common) return false;
+  if (candidate.reason === "room_archived") return Object.keys(value).length === 5;
+  return (candidate.reason === "member_removed" || candidate.reason === "access_revoked") &&
+    Object.keys(value).length === 6 && typeof candidate.targetActorId === "string" &&
+    candidate.targetActorId.length > 0;
 }

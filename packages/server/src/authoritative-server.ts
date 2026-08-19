@@ -38,23 +38,10 @@ import {
   createHumanPreemptionRuntime,
   type HumanPreemptionRuntime,
 } from "./human-preemption/human-preemption-runtime.js";
-import {
-  AUTHORITY_PARTICIPANT_FEATURES,
-  type FeatureEnablementManifest,
-} from "./room-governance/private-participant-contracts.js";
-import { assertSharedAuthorityParticipantComposition } from "./room-governance/private-participant-registry.js";
-import { createDepartureResponsibilityRegistration } from "./project-loop/departure-responsibility-port.js";
-import { pendingConfirmationDepartureContributorRegistration } from "./tool-safety/pending-confirmation-departure-contributor.js";
-import { archivedMessageGateRegistration } from "./message-authority/archived-message-gate.js";
-import { createBusinessTimerSuspensionProductionRegistration } from "./business-timers/business-timer-suspension-participant.js";
-import { archiveToolSafetyParticipantRegistration } from "./tool-safety/archive-tool-safety-participant.js";
-import { runtimeArchiveFenceParticipantRegistration } from "./agent-runtime/runtime-archive-fence-participant.js";
-import { assignmentSecurityReductionParticipantRegistration } from "./room-assignment/assignment-security-reduction-participant.js";
-import { lifecycleRepairDescriptorRegistration } from "./room-governance/lifecycle-repair-descriptor.js";
-import { roomCacheInvalidationRegistration } from "./access/room-cache-invalidation-port.js";
-import { createOfflineLeaseInvalidationRegistration } from "./access/offline-lease-invalidation-port.js";
-import type { BallDeadlinePolicy } from "./ball-runtime/ball-authority-protocol.js";
 import { RoomCacheInvalidationPostCommitDispatcher } from "./access/room-cache-invalidation-port.js";
+import { createProductionSharedAuthorityParticipantComposition } from "./room-governance/production-participant-composition.js";
+
+export { createProductionSharedAuthorityParticipantComposition } from "./room-governance/production-participant-composition.js";
 
 export const AUTHORITATIVE_SERVER_DEFAULT_HOST = "127.0.0.1";
 export const AUTHORITATIVE_SERVER_DEFAULT_PORT = 8_787;
@@ -96,40 +83,6 @@ export interface StartAuthoritativeServerOptions {
     readonly lightTaskDeadlineMs?: number;
     readonly scanIntervalMs?: number;
   };
-}
-
-export function createProductionSharedAuthorityParticipantComposition(options: Readonly<{
-  maxOfflineReadLeaseMs: number;
-  ballPolicy: BallDeadlinePolicy;
-}>): Readonly<{
-  manifest: FeatureEnablementManifest;
-  registrations: readonly unknown[];
-}> {
-  const pendingConfirmation = pendingConfirmationDepartureContributorRegistration;
-  const manifest = Object.freeze(Object.fromEntries(
-    AUTHORITY_PARTICIPANT_FEATURES.map((feature) => [feature, true]),
-  )) as FeatureEnablementManifest;
-  const registrations = Object.freeze([
-    createDepartureResponsibilityRegistration({
-      pendingConfirmation: {
-        enabled: true,
-        registrations: [pendingConfirmation],
-      },
-    }),
-    pendingConfirmation,
-    archivedMessageGateRegistration,
-    createBusinessTimerSuspensionProductionRegistration(options.ballPolicy),
-    archiveToolSafetyParticipantRegistration,
-    runtimeArchiveFenceParticipantRegistration,
-    assignmentSecurityReductionParticipantRegistration,
-    lifecycleRepairDescriptorRegistration,
-    roomCacheInvalidationRegistration,
-    createOfflineLeaseInvalidationRegistration({
-      maxOfflineReadLeaseMs: options.maxOfflineReadLeaseMs,
-    }),
-  ]);
-  assertSharedAuthorityParticipantComposition(manifest, registrations);
-  return Object.freeze({ manifest, registrations });
 }
 
 interface AuthoritativeServerTestOptions {
@@ -225,6 +178,23 @@ async function start(
       ...(testOptions.faultPoint === "after-commit-before-outbox"
         ? { afterCommitHuman: () => process.exit(83) }
         : {}),
+      async afterCommitGovernance(context, command, acknowledgement) {
+        if (testOptions.faultPoint === "after-commit-before-outbox") process.exit(83);
+        if (command.type !== "room.reopen" || acknowledgement.replayed ||
+            acknowledgement.eventIds.length === 0) return;
+        try {
+          const current = await worker!.readRoomGovernance(context, command.roomId, Date.now());
+          if (current.lifecycle !== "active" ||
+              current.archiveGeneration !== acknowledgement.governance.archiveGeneration ||
+              current.governanceRevision !== acknowledgement.governance.governanceRevision) {
+            return;
+          }
+          ballRuntime?.track(command.roomId);
+          void ballRuntime?.scan(command.roomId).catch(() => undefined);
+        } catch {
+          // The committed ACK remains authoritative; normal recovery performs a bounded rescan.
+        }
+      },
     });
     const missingActors: Actor[] = [];
     for (const actor of options.actors) {

@@ -772,6 +772,7 @@ class SnapshotWorkerClientImplementation implements SnapshotWorkerClient {
       type: "snapshot.invalidate-room",
       roomId: intent.roomId,
       accessRevision: intent.accessRevision,
+      ...(intent.reason === "room_archived" ? {} : { targetActorId: intent.targetActorId }),
     });
     if (response.type !== "snapshot.room-invalidated") {
       throw new SnapshotWorkerClientError("storage_unavailable", "Snapshot room purge failed");

@@ -167,6 +167,7 @@ export type SnapshotWorkerRequest =
       readonly requestId: string;
       readonly roomId: string;
       readonly accessRevision: number;
+      readonly targetActorId?: string;
     }
   | { readonly type: "snapshot.cache-count"; readonly requestId: string }
   | { readonly type: "snapshot.full-validation-count"; readonly requestId: string }

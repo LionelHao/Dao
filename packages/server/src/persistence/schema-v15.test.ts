@@ -7,6 +7,7 @@ import {
   AUTHORITY_SCHEMA_VERSION,
   AUTHORITY_V15_STATEMENT_COUNT_FOR_TEST,
   migrateAuthorityDatabase,
+  migrateAuthorityDatabaseToHistoricalVersionForTest,
   migrateAuthorityDatabaseToPreviousVersionForTest,
   readSchemaVersion,
 } from "./schema.js";
@@ -22,7 +23,35 @@ function withDatabase(operation: (database: DatabaseSync) => void): void {
   }
 }
 
+function authorityTableCounts(database: DatabaseSync): Readonly<Record<string, number>> {
+  const tables = database.prepare(
+    `SELECT name FROM sqlite_master
+     WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name <> 'schema_migrations'
+     ORDER BY name`,
+  ).all();
+  return Object.freeze(Object.fromEntries(tables.map((row) => {
+    if (typeof row.name !== "string") throw new TypeError("authority table name is corrupt");
+    const count = database.prepare(`SELECT COUNT(*) AS count FROM "${row.name}"`).get()?.count;
+    if (typeof count !== "number") throw new TypeError("authority table count is corrupt");
+    return [row.name, count];
+  })));
+}
+
 describe("authority SQLite v15 room lifecycle audit vocabulary", () => {
+  it("upgrades every immutable historical authority schema through v15", () => {
+    for (let version = 1; version < AUTHORITY_SCHEMA_VERSION; version += 1) {
+      withDatabase((database) => {
+        migrateAuthorityDatabaseToHistoricalVersionForTest(database, version);
+        expect(readSchemaVersion(database)).toBe(version);
+        migrateAuthorityDatabase(database);
+        expect(readSchemaVersion(database)).toBe(15);
+        expect(database.prepare(
+          "SELECT COUNT(*) AS count FROM schema_migrations",
+        ).get()).toEqual({ count: 15 });
+      });
+    }
+  });
+
   it("persists truthful member-left and room-reopened audit facts", () => {
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
@@ -141,6 +170,158 @@ describe("authority SQLite v15 room lifecycle audit vocabulary", () => {
     }
   });
 
+  it("allows remove, re-add, and remove again in one lifecycle generation", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabase(database);
+      database.exec(`
+        INSERT INTO actors (id, kind, display_name)
+        VALUES ('cycle-owner', 'human', 'Owner'), ('cycle-target', 'human', 'Target');
+        INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+        VALUES
+          ('identity', 'cycle-owner', 0, 1),
+          ('identity', 'cycle-target', 0, 1),
+          ('room', 'cycle-room', 0, 1);
+        INSERT INTO rooms (id, name, status, created_at)
+        VALUES ('cycle-room', 'Cycle Room', 'active', '2026-08-19T00:00:00.000Z');
+        INSERT INTO room_memberships (
+          room_id, actor_id, kind, role, participation, tool_permissions_json,
+          joined_at, configured_at, access_revision
+        ) VALUES (
+          'cycle-room', 'cycle-owner', 'human', 'member', NULL, '[]',
+          '2026-08-19T00:00:00.000Z', NULL, 0
+        );
+        UPDATE rooms SET owner_actor_id = 'cycle-owner' WHERE id = 'cycle-room';
+        INSERT INTO room_cache_invalidation_intents (
+          id, room_id, lifecycle_generation, access_revision, reason, target_actor_id
+        ) VALUES
+          ('cycle-cache-1', 'cycle-room', 0, 1, 'member_removed', 'cycle-target'),
+          ('cycle-cache-2', 'cycle-room', 0, 2, 'member_removed', 'cycle-target');
+        INSERT INTO offline_read_lease_invalidations (
+          id, room_id, lifecycle_generation, access_revision, lease_generation,
+          revoked_lease_count, reason, target_actor_id
+        ) VALUES
+          ('cycle-lease-1', 'cycle-room', 0, 1, 0, 1,
+           'member_removed', 'cycle-target'),
+          ('cycle-lease-2', 'cycle-room', 0, 2, 0, 1,
+           'member_removed', 'cycle-target');
+      `);
+
+      expect(database.prepare(
+        `SELECT access_revision AS accessRevision
+         FROM room_cache_invalidation_intents
+         WHERE target_actor_id = 'cycle-target'
+         ORDER BY access_revision`,
+      ).all()).toEqual([{ accessRevision: 1 }, { accessRevision: 2 }]);
+      expect(database.prepare(
+        `SELECT access_revision AS accessRevision
+         FROM offline_read_lease_invalidations
+         WHERE target_actor_id = 'cycle-target'
+         ORDER BY access_revision`,
+      ).all()).toEqual([{ accessRevision: 1 }, { accessRevision: 2 }]);
+    });
+  });
+
+  it("preserves complete v14 row counts, provider ledgers, actions, and sealed secrets", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabaseToPreviousVersionForTest(database);
+      database.exec(`
+        INSERT INTO actors (id, kind, display_name)
+        VALUES ('preserve-owner', 'human', 'Owner');
+        INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+        VALUES
+          ('identity', 'preserve-owner', 0, 1),
+          ('room', 'preserve-room', 0, 1);
+        INSERT INTO rooms (id, name, status, created_at)
+        VALUES ('preserve-room', 'Preserve', 'active', '2026-08-19T00:00:00.000Z');
+        INSERT INTO room_memberships (
+          room_id, actor_id, kind, role, participation, tool_permissions_json,
+          joined_at, configured_at, access_revision
+        ) VALUES (
+          'preserve-room', 'preserve-owner', 'human', 'member', NULL, '[]',
+          '2026-08-19T00:00:00.000Z', NULL, 7
+        );
+        UPDATE rooms
+        SET owner_actor_id = 'preserve-owner', status = 'archived',
+            governance_revision = 4, archive_generation = 1,
+            archived_at = '2026-08-19T00:01:00.000Z'
+        WHERE id = 'preserve-room';
+        INSERT INTO room_audit (
+          id, type, room_id, actor_id, result, timestamp, details_json
+        ) VALUES (
+          'preserve-audit', 'room.archived', 'preserve-room', 'preserve-owner',
+          'archived', '2026-08-19T00:01:00.000Z', '{}'
+        );
+        INSERT INTO room_message_archive_gates (
+          room_id, gate_generation, blocked_at
+        ) VALUES ('preserve-room', 1, '2026-08-19T00:01:00.000Z');
+        INSERT INTO runtime_archive_fences (
+          room_id, archive_generation, fenced_at, fenced_queued_count,
+          fenced_waiting_count, preserved_dispatched_count,
+          preserved_outcome_review_count
+        ) VALUES ('preserve-room', 1, '2026-08-19T00:01:00.000Z', 0, 0, 0, 0);
+        INSERT INTO tool_archive_settlements (
+          room_id, archive_generation, settled_at, rejected_pending_count,
+          revoked_grant_count, fenced_waiting_count, preserved_dispatched_count
+        ) VALUES ('preserve-room', 1, '2026-08-19T00:01:00.000Z', 0, 0, 0, 0);
+        INSERT INTO room_business_timer_freeze_batches (
+          room_id, archive_generation, suspended_at, suspended_count,
+          resumed_at, resumed_count, descriptor_ids_json
+        ) VALUES ('preserve-room', 1, '2026-08-19T00:01:00.000Z', 0, NULL, NULL, '[]');
+        INSERT INTO room_assignment_archive_policies (
+          room_id, archive_generation, policy_version, assignment_revision,
+          expansion_blocked, reduced_at
+        ) VALUES ('preserve-room', 1, 1, 0, 1, '2026-08-19T00:01:00.000Z');
+        INSERT INTO project_next_actions (
+          id, room_id, source_room_id, source_id, revision, owner_kind,
+          owner_actor_id, verifier_human_actor_id, status
+        ) VALUES (
+          'preserve-action', 'preserve-room', 'preserve-room', 'source-1', 1,
+          'human', 'preserve-owner', NULL, 'in_progress'
+        );
+        INSERT INTO room_access_authority (room_id, access_revision, lease_generation)
+        VALUES ('preserve-room', 7, 3);
+        INSERT INTO room_cache_invalidation_intents (
+          id, room_id, lifecycle_generation, access_revision, reason
+        ) VALUES ('preserve-cache', 'preserve-room', 1, 7, 'room_archived');
+        INSERT INTO offline_read_lease_invalidations (
+          id, room_id, lifecycle_generation, access_revision, lease_generation,
+          revoked_lease_count, reason
+        ) VALUES ('preserve-lease', 'preserve-room', 1, 7, 3, 0, 'room_archived');
+        INSERT INTO idempotency_records (
+          scope, key, request_hash, response_json, status_code, created_at, expires_at
+        ) VALUES (
+          'preserve-scope', 'preserve-key', 'preserve-hash',
+          '{"sealedToken":"ciphertext-secret-sentinel-v14"}', 200,
+          '2026-08-19T00:00:00.000Z', '2026-08-20T00:00:00.000Z'
+        );
+      `);
+      const before = authorityTableCounts(database);
+
+      migrateAuthorityDatabase(database);
+
+      expect(authorityTableCounts(database)).toEqual(before);
+      expect(database.prepare(
+        "SELECT response_json AS responseJson FROM idempotency_records WHERE key = 'preserve-key'",
+      ).get()).toEqual({
+        responseJson: '{"sealedToken":"ciphertext-secret-sentinel-v14"}',
+      });
+      expect(database.prepare(
+        `SELECT
+           (SELECT COUNT(*) FROM runtime_archive_fences) AS runtimeLedgers,
+           (SELECT COUNT(*) FROM tool_archive_settlements) AS toolLedgers,
+           (SELECT COUNT(*) FROM room_business_timer_freeze_batches) AS timerLedgers,
+           (SELECT COUNT(*) FROM room_assignment_archive_policies) AS assignmentLedgers,
+           (SELECT COUNT(*) FROM project_next_actions) AS actions`,
+      ).get()).toEqual({
+        runtimeLedgers: 1,
+        toolLedgers: 1,
+        timerLedgers: 1,
+        assignmentLedgers: 1,
+        actions: 1,
+      });
+    });
+  });
+
   it("preserves v14 rows and makes the expanded v15 audit immutable", () => {
     withDatabase((database) => {
       migrateAuthorityDatabaseToPreviousVersionForTest(database);
@@ -180,7 +361,7 @@ describe("authority SQLite v15 room lifecycle audit vocabulary", () => {
         "SELECT name, checksum FROM schema_migrations WHERE version = 15",
       ).get()).toEqual({
         name: "truthful-room-lifecycle-audit-vocabulary",
-        checksum: "65a371b2faf68d906c8241195f3dff0d4937e8acfde2d46bb7961c748d9a15a8",
+        checksum: "41740e7d34f6807248bf7879f34f9026844802dfe5a43f0ee18bf498a24dc0c9",
       });
       expect(() => database.prepare(
         "UPDATE room_audit SET details_json = '{}' WHERE id = ?",

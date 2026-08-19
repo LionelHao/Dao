@@ -791,6 +791,68 @@ describe("durable materialized snapshot worker", () => {
     await client.close();
   });
 
+  it("purges only the removed Human cache slice for a targeted invalidation", async () => {
+    const target = contextFor("target");
+    const peer = {
+      ...contextFor("peer"),
+      principal: { accountId: "account-peer", actorId: "human-peer" },
+    };
+    const fixture = await createDatabaseFixture({
+      contexts: [target, peer],
+      rooms: [{ roomId: "room-target-purge", messageCount: 1 }],
+    });
+    const authority = new DatabaseSync(fixture.authorityPath);
+    authority.prepare(
+      `INSERT INTO room_memberships (
+         room_id, actor_id, kind, role, participation, tool_permissions_json,
+         joined_at, configured_at, access_revision
+       ) VALUES (?, ?, 'human', 'member', NULL, '[]', ?, NULL, 7)`,
+    ).run("room-target-purge", peer.principal.actorId, "2026-08-11T00:00:00.000Z");
+    authority.close();
+
+    const client = await createSnapshotWorkerClient({
+      authorityPath: fixture.authorityPath,
+      cachePath: fixture.cachePath,
+      revalidate: async () => undefined,
+      clock: () => 2_000,
+    });
+    const targetSnapshot = await client.beginRoomRepair(
+      target,
+      "target-build",
+      "room-target-purge",
+    );
+    const peerSnapshot = await client.beginRoomRepair(
+      peer,
+      "peer-build",
+      "room-target-purge",
+    );
+    if (("kind" in targetSnapshot && targetSnapshot.kind === "fallback") ||
+        ("kind" in peerSnapshot && peerSnapshot.kind === "fallback")) {
+      throw new Error("unexpected fallback");
+    }
+
+    await client.purgeCommittedRoom({
+      invalidationIntentId: "intent-target-purge",
+      roomId: "room-target-purge",
+      lifecycleGeneration: 0,
+      accessRevision: 8,
+      reason: "member_removed",
+      targetActorId: target.principal.actorId,
+    });
+    await expect(client.readRoomRepairPage(
+      target,
+      "target-invalidated",
+      targetSnapshot.snapshotId,
+      0,
+    )).rejects.toMatchObject({ status: 404, code: "snapshot_not_found" });
+    await expect(client.beginRoomRepair(
+      peer,
+      "peer-reuse",
+      "room-target-purge",
+    )).resolves.toMatchObject({ snapshotId: peerSnapshot.snapshotId });
+    await client.close();
+  });
+
   it("keeps an expired snapshot at 410 after cleanup removed its manifest and pages", async () => {
     let now = 2_000;
     const fixture = await createDatabaseFixture({
@@ -1667,14 +1729,18 @@ describe("durable materialized snapshot worker", () => {
                   expectedGovernanceRevision: 1,
                 },
               }
-            : { type: "room.archive" as const, roomId, payload: {} };
+            : {
+                type: "room.archive" as const,
+                roomId,
+                payload: { expectedGovernanceRevision: 1 },
+              };
         const execution = expect(authority.executeHuman({
           ...owner,
           kind: "human",
           requestId: `catalog-governance-${governance}`,
           idempotencyKey: `catalog-governance-${governance}`,
         }, command, 2_001));
-        if (governance === "member removal" || governance === "room archive") {
+        if (governance === "member removal") {
           await execution.rejects.toMatchObject({ status: 503, code: "dependency_unavailable" });
           await expect(client.readWorkspaceBootstrapPage(
             target, `catalog-governance-after-${governance}`, page0.snapshotId, 0,
@@ -1876,7 +1942,11 @@ describe("durable materialized snapshot worker", () => {
     }) },
     { name: "room archive", command: (roomId: string, targetId: string) => {
       void targetId;
-      return { type: "room.archive" as const, roomId, payload: {} };
+      return {
+        type: "room.archive" as const,
+        roomId,
+        payload: { expectedGovernanceRevision: 1 },
+      };
     } },
   ])("applies or fails $name closed before touching the affected lease", async ({ command }) => {
     const owner: AuthenticatedSessionContext = {
@@ -1921,8 +1991,8 @@ describe("durable materialized snapshot worker", () => {
       requestId: `preempt-${command.name}`,
       idempotencyKey: `preempt-${command.name}`,
     }, governanceCommand, 2_001));
-    if (governanceCommand.type === "member.remove" || governanceCommand.type === "room.archive"
-      || governanceCommand.type === "room.member.role.set") {
+    if (governanceCommand.type === "member.remove" ||
+        governanceCommand.type === "room.member.role.set") {
       await execution.rejects.toMatchObject({
         status: 503,
         code: governanceCommand.type === "room.member.role.set"
@@ -1967,9 +2037,12 @@ describe("durable materialized snapshot worker", () => {
     await authority.close();
   });
 
-  it.each(["member.remove", "room.archive"] as const)(
-    "does not preempt a lease when rejected %s is retried",
-    async (type) => {
+  it.each([
+    { type: "member.remove", behavior: "rejected legacy removal is retried" },
+    { type: "room.archive", behavior: "an applied archive is exactly replayed" },
+  ] as const)(
+    "does not preempt a newly acquired lease when $behavior",
+    async ({ type }) => {
       const owner: AuthenticatedSessionContext = {
         sessionId: tokenHash(`replay-owner-access-${type}`),
         sessionFamilyId: tokenHash(`replay-owner-family-${type}`),
@@ -1997,15 +2070,20 @@ describe("durable materialized snapshot worker", () => {
       const authority = await createWorkerDatabaseClient({ databasePath: fixture.authorityPath });
       const command = type === "member.remove"
         ? { type, roomId, payload: { targetActorId: target.principal.actorId } }
-        : { type, roomId, payload: {} };
+        : { type, roomId, payload: { expectedGovernanceRevision: 1 } };
       const commandContext = {
         ...owner,
         kind: "human" as const,
         requestId: `replay-preempt-first-${type}`,
         idempotencyKey: `replay-preempt-${type}`,
       };
-      await expect(authority.executeHuman(commandContext, command, 2_000))
-        .rejects.toMatchObject({ status: 503, code: "dependency_unavailable" });
+      const firstArchive = type === "room.archive"
+        ? await authority.executeHuman(commandContext, command, 2_000)
+        : undefined;
+      if (type === "member.remove") {
+        await expect(authority.executeHuman(commandContext, command, 2_000))
+          .rejects.toMatchObject({ status: 503, code: "dependency_unavailable" });
+      }
       const client = await createSnapshotWorkerClient({
         authorityPath: fixture.authorityPath,
         cachePath: fixture.cachePath,
@@ -2018,12 +2096,17 @@ describe("durable materialized snapshot worker", () => {
         target, `replay-preempt-zero-${type}`, roomId,
       );
       if ("kind" in page0) throw new Error("expected streaming page zero");
-      await expect(authority.executeHuman({
+      const replay = authority.executeHuman({
         ...commandContext,
         requestId: `replay-preempt-second-${type}`,
-      }, command, 2_002)).rejects.toMatchObject({
-        status: 503, code: "dependency_unavailable",
-      });
+      }, command, 2_002);
+      if (type === "member.remove") {
+        await expect(replay).rejects.toMatchObject({
+          status: 503, code: "dependency_unavailable",
+        });
+      } else {
+        await expect(replay).resolves.toEqual(firstArchive);
+      }
       await expect(client.readRoomRepairPage(
         target, `replay-preempt-one-${type}`, page0.snapshotId, 0,
       )).resolves.toMatchObject({ mode: "streaming", page: 1 });

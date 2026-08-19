@@ -3,6 +3,7 @@ import type { DatabaseSync } from "node:sqlite";
 import type {
   AgentExecution,
   Actor,
+  DepartureConflictList,
   LightTask,
   ManagedRoom,
   Message,
@@ -85,15 +86,42 @@ import {
   BALL_BOUNDARY_TIMER_DESCRIPTOR_ID,
   isBusinessTimerClaimAllowedInTransaction,
 } from "../business-timers/business-timer-suspension-participant.js";
+import {
+  createDepartureGovernanceCoordinator,
+  DepartureGovernanceCommandError,
+  type DepartureGovernanceComposition,
+  type DepartureMutationAuthorization,
+} from "../room-governance/departure-governance.js";
+import {
+  ArchiveCoordinatorCommandError,
+  coordinateArchiveInTransaction,
+  coordinateReopenInTransaction,
+  type ArchiveCoordinatorComposition,
+  type ReopenAfterCommitRescan,
+} from "../room-governance/archive-coordinator.js";
+import { AuthorityParticipantUnavailableError } from "../room-governance/private-participant-registry.js";
+import {
+  coordinateMemberAccessRevocationInTransaction,
+  MemberAccessRevocationError,
+} from "../room-governance/member-access-revocation-adapter.js";
 
 export class AuthorityDatabaseError extends Error {
+  readonly details?: DepartureConflictList;
+
   constructor(
     readonly code: AuthorityWorkerErrorCode,
     message: string,
+    details?: DepartureConflictList,
   ) {
     super(message);
     this.name = "AuthorityDatabaseError";
+    if (details !== undefined) this.details = details;
   }
+}
+
+export interface SharedAuthorityParticipantComposition {
+  readonly manifest: DepartureGovernanceComposition["manifest"];
+  readonly registrations: readonly unknown[];
 }
 
 export interface ExecuteHumanDatabaseCommandInput {
@@ -104,6 +132,7 @@ export interface ExecuteHumanDatabaseCommandInput {
     readonly sealedToken: string;
   };
   readonly now: number;
+  readonly participantComposition?: SharedAuthorityParticipantComposition;
   readonly beforeApply?: (actorId: string) => void;
   readonly afterDomainWrite?: () => void;
   readonly beforeCommit?: () => void;
@@ -119,10 +148,61 @@ export interface ExecuteAgentDatabaseCommandInput {
 export interface DatabaseCommandResult {
   readonly acknowledgement: CommandAcknowledgement;
   readonly disposition: "applied" | "replayed";
+  readonly afterCommitRescan?: ReopenAfterCommitRescan;
 }
 
 function fail(code: AuthorityWorkerErrorCode, message: string): never {
   throw new AuthorityDatabaseError(code, message);
+}
+
+function failFromGovernanceCoordinator(error: unknown): never {
+  if (error instanceof DepartureGovernanceCommandError) {
+    throw new AuthorityDatabaseError(error.code, error.message, error.details);
+  }
+  if (error instanceof ArchiveCoordinatorCommandError) {
+    throw new AuthorityDatabaseError(
+      error.code === "transaction_mismatch" ? "dependency_unavailable" : error.code,
+      error.message,
+    );
+  }
+  if (error instanceof AuthorityParticipantUnavailableError) {
+    throw new AuthorityDatabaseError(
+      "dependency_unavailable",
+      "Authority governance participant was unavailable",
+    );
+  }
+  if (error instanceof MemberAccessRevocationError) {
+    const code: AuthorityWorkerErrorCode = error.code === "member_access_revision_conflict"
+      ? "room_revision_conflict"
+      : error.code === "transaction_mismatch"
+        ? "dependency_unavailable"
+        : error.code;
+    throw new AuthorityDatabaseError(code, "Target member access revocation failed");
+  }
+  throw error;
+}
+
+function requireSharedAuthorityComposition(
+  composition: SharedAuthorityParticipantComposition | undefined,
+): SharedAuthorityParticipantComposition {
+  if (composition === undefined) {
+    return fail(
+      "dependency_unavailable",
+      "Authority governance participant composition is unavailable",
+    );
+  }
+  return composition;
+}
+
+function archiveCoordinatorComposition(
+  composition: SharedAuthorityParticipantComposition,
+): ArchiveCoordinatorComposition {
+  return Object.freeze({
+    manifest: composition.manifest,
+    transactionRegistrations: composition.registrations,
+    lifecycleRepairRegistrations: composition.registrations,
+    accessInvalidationRegistrations: composition.registrations,
+  });
 }
 
 function requireMessageMutationAllowed(
@@ -834,7 +914,8 @@ export function repairMutationImpactDatabaseQuery(
   } else if (command.type === "human.invitation.decide" &&
       command.payload.decision === "accept") {
     catalogPrincipalIds = [actorId];
-  } else if (command.type === "human.role.change" || command.type === "member.remove") {
+  } else if (command.type === "human.role.change" || command.type === "member.remove" ||
+      command.type === "room.member.remove") {
     catalogPrincipalIds = [command.payload.targetActorId];
   }
   return { roomIds: [roomId], catalogPrincipalIds };
@@ -1202,6 +1283,34 @@ export function readRoomGovernanceDatabaseQuery(
   return readGovernanceView(database, roomId);
 }
 
+export function readDepartureConflictsDatabaseQuery(
+  database: DatabaseSync,
+  context: AuthenticatedSessionContext,
+  input: { readonly roomId: string; readonly targetActorId: string },
+  now: number,
+  inputComposition: SharedAuthorityParticipantComposition | undefined,
+): DepartureConflictList {
+  return runAuthorityReadTransaction(database, () => {
+    const actorId = requireHumanSession(database, context, now);
+    const composition = requireSharedAuthorityComposition(inputComposition);
+    try {
+      return withDatabaseAuthorityTransactionView(
+        database,
+        input.roomId,
+        stableId("departure-preflight", actorId, input.roomId, input.targetActorId),
+        (transaction) => createDepartureGovernanceCoordinator(composition)
+          .preflightInTransaction(transaction, {
+            roomId: input.roomId,
+            authenticatedHumanActorId: actorId,
+            targetHumanActorId: input.targetActorId,
+          }),
+      );
+    } catch (error: unknown) {
+      return failFromGovernanceCoordinator(error);
+    }
+  });
+}
+
 export function canAccessRoomDatabaseQuery(
   database: DatabaseSync,
   context: AuthenticatedSessionContext,
@@ -1521,7 +1630,8 @@ export function listCommittedRoomCacheInvalidationIntentsDatabaseQuery(
   const rows = database.prepare(
     `SELECT id AS invalidationIntentId, room_id AS roomId,
             lifecycle_generation AS lifecycleGeneration,
-            access_revision AS accessRevision, reason
+            access_revision AS accessRevision, reason,
+            target_actor_id AS targetActorId
      FROM room_cache_invalidation_intents
      WHERE status = 'pending' AND available_at <= CURRENT_TIMESTAMP
      ORDER BY available_at, created_at, id
@@ -1534,16 +1644,21 @@ export function listCommittedRoomCacheInvalidationIntentsDatabaseQuery(
         !Number.isSafeInteger(row.lifecycleGeneration) || row.lifecycleGeneration < 0 ||
         typeof row.accessRevision !== "number" ||
         !Number.isSafeInteger(row.accessRevision) || row.accessRevision < 0 ||
-        row.reason !== "room_archived") {
+        (row.reason !== "room_archived" && row.reason !== "member_removed" &&
+          row.reason !== "access_revoked") ||
+        (row.reason === "room_archived" && row.targetActorId !== null) ||
+        (row.reason !== "room_archived" && typeof row.targetActorId !== "string")) {
       return fail("storage_unavailable", "Room cache invalidation intent was corrupt");
     }
-    return {
+    const common = {
       invalidationIntentId: row.invalidationIntentId,
       roomId: row.roomId,
       lifecycleGeneration: row.lifecycleGeneration,
       accessRevision: row.accessRevision,
-      reason: "room_archived" as const,
     };
+    return row.reason === "room_archived"
+      ? { ...common, reason: "room_archived" as const }
+      : { ...common, reason: row.reason, targetActorId: row.targetActorId as string };
   });
 }
 
@@ -2752,19 +2867,301 @@ function executeMemberRemove(
   return fail("dependency_unavailable", "Departure responsibility cleanup is unavailable");
 }
 
-function executeMemberLeave(
+function commitClosedDeparture(
   database: DatabaseSync,
-  actorId: string,
-  command: Extract<RoomGovernanceCommand, { readonly type: "room.member.leave" }>,
+  transaction: AuthorityTransactionView,
+  authorization: DepartureMutationAuthorization,
+  acceptedAt: string,
+  scope: string,
+  key: string,
+  afterDomainWrite?: () => void,
 ): CommandAcknowledgement {
-  const governance = readGovernanceView(database, command.roomId);
-  if (governance.ownerActorId === actorId) {
+  const targetActorId = authorization.targetHumanActorId;
+  const operationEventType = authorization.operation === "leave"
+    ? "room.member.left"
+    : "room.member.removed";
+  const operationResult = authorization.operation === "leave" ? "left" : "removed";
+
+  const membership = database.prepare(
+        `SELECT access_revision AS accessRevision
+         FROM room_memberships
+         WHERE room_id = ? AND actor_id = ? AND kind = 'human'`,
+      ).get(authorization.roomId, targetActorId);
+  if (typeof membership?.accessRevision !== "number" ||
+      !Number.isSafeInteger(membership.accessRevision) || membership.accessRevision < 0) {
+    return fail("storage_unavailable", "Departure target access revision is corrupt");
+  }
+  const revocation = coordinateMemberAccessRevocationInTransaction(transaction, {
+    roomId: authorization.roomId,
+    targetActorId,
+    expectedAccessRevision: membership.accessRevision,
+    occurredAtMs: Date.parse(acceptedAt),
+  });
+  if (revocation.outcome === "schema_capability_blocked") {
     return fail(
-      "ownership_transfer_required",
-      "Room owner must transfer ownership before leaving",
+      "dependency_unavailable",
+      "Target member access revocation dependency was unavailable",
     );
   }
-  return fail("dependency_unavailable", "Departure responsibility cleanup is unavailable");
+  const removed = database.prepare(
+        `DELETE FROM room_memberships
+         WHERE room_id = ? AND actor_id = ? AND kind = 'human'`,
+      ).run(authorization.roomId, targetActorId);
+  if (removed.changes !== 1) {
+    return fail("room_revision_conflict", "Departure membership changed concurrently");
+  }
+  const revision = database.prepare(
+        `UPDATE rooms SET governance_revision = governance_revision + 1
+         WHERE id = ? AND governance_revision = ?`,
+      ).run(authorization.roomId, authorization.previousGovernanceRevision);
+  if (revision.changes !== 1) {
+    return fail("room_revision_conflict", "Room governance revision changed concurrently");
+  }
+  const catalog = database.prepare(
+        "UPDATE actors SET catalog_revision = catalog_revision + 1 WHERE id = ?",
+      ).run(targetActorId);
+  if (catalog.changes !== 1) {
+    return fail("storage_unavailable", "Departure target catalog is unavailable");
+  }
+  database.prepare(
+        `INSERT INTO room_audit (
+           id, type, room_id, actor_id, result, timestamp, details_json
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        stableId("audit", scope, key),
+        operationEventType,
+        authorization.roomId,
+        authorization.actorId,
+        operationResult,
+        acceptedAt,
+        canonicalJson({ targetActorId }),
+      );
+  const governance = readGovernanceView(database, authorization.roomId);
+  if (governance.governanceRevision !== authorization.nextGovernanceRevision) {
+    return fail("storage_unavailable", "Departure governance revision is corrupt");
+  }
+  const roomEventId = stableId("event", scope, key, "0");
+  const roomSeq = appendRoomEvent(database, {
+        eventId: roomEventId,
+        roomId: authorization.roomId,
+        actorId: authorization.actorId,
+        eventType: "room.governance.changed",
+        occurredAt: acceptedAt,
+        payload: { governance } as unknown as JsonValue,
+      });
+  appendRoomOutbox(
+        database,
+        roomEventId,
+        authorization.roomId,
+        roomSeq,
+        acceptedAt,
+        scope,
+        key,
+      );
+  const identityEventId = stableId("event", scope, key, "1");
+  const identitySeq = appendCanonicalIdentityEvent(database, {
+        eventId: identityEventId,
+        principalId: targetActorId,
+        eventType: "identity.room-access.changed",
+        occurredAt: acceptedAt,
+        payload: { roomId: authorization.roomId, change: "removed" },
+      });
+  appendPrincipalOutbox(
+        database,
+        identityEventId,
+        targetActorId,
+        identitySeq,
+        acceptedAt,
+        scope,
+        key,
+      );
+  const acknowledgement = {
+    aggregateId: authorization.roomId,
+    eventIds: [roomEventId, identityEventId],
+    acceptedAt,
+    result: { governance } as unknown as JsonValue,
+  };
+  afterDomainWrite?.();
+  return acknowledgement;
+}
+
+function executeClosedDeparture(
+  database: DatabaseSync,
+  actorId: string,
+  command: Extract<RoomGovernanceCommand, {
+    readonly type: "room.member.leave" | "room.member.remove";
+  }>,
+  acceptedAt: string,
+  scope: string,
+  key: string,
+  inputComposition: SharedAuthorityParticipantComposition | undefined,
+  afterDomainWrite?: () => void,
+): CommandAcknowledgement {
+  const composition = requireSharedAuthorityComposition(inputComposition);
+  const targetActorId = command.type === "room.member.leave"
+    ? actorId
+    : command.payload.targetActorId;
+  try {
+    return withDatabaseAuthorityTransactionView(
+      database,
+      command.roomId,
+      stableId("departure-governance", scope, key),
+      (transaction) => createDepartureGovernanceCoordinator(composition)
+        .coordinateMutationInTransaction(transaction, {
+          roomId: command.roomId,
+          authenticatedHumanActorId: actorId,
+          targetHumanActorId: targetActorId,
+          operation: command.type === "room.member.leave" ? "leave" : "remove",
+          expectedGovernanceRevision: command.payload.expectedGovernanceRevision,
+        }, (authorization) => commitClosedDeparture(
+          database,
+          transaction,
+          authorization,
+          acceptedAt,
+          scope,
+          key,
+          afterDomainWrite,
+        )),
+    );
+  } catch (error: unknown) {
+    return failFromGovernanceCoordinator(error);
+  }
+}
+
+function executeClosedLifecycle(
+  database: DatabaseSync,
+  actorId: string,
+  command: Extract<RoomGovernanceCommand, { readonly type: "room.archive" | "room.reopen" }>,
+  acceptedAt: string,
+  scope: string,
+  key: string,
+  inputComposition: SharedAuthorityParticipantComposition | undefined,
+  onAfterCommitRescan: (rescan: ReopenAfterCommitRescan) => void,
+  afterDomainWrite?: () => void,
+): CommandAcknowledgement {
+  const composition = archiveCoordinatorComposition(
+    requireSharedAuthorityComposition(inputComposition),
+  );
+  try {
+    return withDatabaseAuthorityTransactionView(
+      database,
+      command.roomId,
+      stableId("room-lifecycle-governance", scope, key),
+      (transaction) => {
+        const coordinatorInput = {
+          roomId: command.roomId,
+          actorId,
+          expectedGovernanceRevision: command.payload.expectedGovernanceRevision,
+          occurredAt: acceptedAt,
+        };
+        const result = command.type === "room.archive"
+          ? coordinateArchiveInTransaction(transaction, coordinatorInput, composition)
+          : coordinateReopenInTransaction(transaction, coordinatorInput, composition);
+        if (result.outcome === "already_archived" || result.outcome === "already_active") {
+          return {
+            aggregateId: command.roomId,
+            eventIds: [],
+            acceptedAt,
+            result: { governance: result.governance } as unknown as JsonValue,
+          };
+        }
+
+        const auditType = command.type === "room.archive" ? "room.archived" : "room.reopened";
+        const auditResult = command.type === "room.archive" ? "archived" : "reopened";
+        database.prepare(
+          `INSERT INTO room_audit (
+             id, type, room_id, actor_id, result, timestamp, details_json
+           ) VALUES (?, ?, ?, ?, ?, ?, '{}')`,
+        ).run(
+          stableId("audit", scope, key),
+          auditType,
+          command.roomId,
+          actorId,
+          auditResult,
+          acceptedAt,
+        );
+
+        const lifecycleEventId = stableId("event", scope, key, "0");
+        const lifecycleSeq = appendRoomEvent(database, {
+          eventId: lifecycleEventId,
+          roomId: command.roomId,
+          actorId,
+          eventType: auditType,
+          occurredAt: acceptedAt,
+          payload: command.type === "room.archive"
+            ? {
+                governance: result.governance,
+                archiveGeneration: result.governance.archiveGeneration,
+                frozenTimerCount: result.participants.businessTimers.affectedCount,
+              } as unknown as JsonValue
+            : {
+                governance: result.governance,
+                archiveGeneration: result.governance.archiveGeneration,
+                resumedTimerCount: result.participants.businessTimers.affectedCount,
+              } as unknown as JsonValue,
+        });
+        appendRoomOutbox(
+          database,
+          lifecycleEventId,
+          command.roomId,
+          lifecycleSeq,
+          acceptedAt,
+          scope,
+          key,
+        );
+
+        const eventIds: string[] = [lifecycleEventId];
+        let catalogStartIndex = 1;
+        if (command.type === "room.archive" &&
+            "assignmentSecurity" in result.participants) {
+          const securityEventId = stableId("event", scope, key, "1");
+          const securitySeq = appendRoomEvent(database, {
+            eventId: securityEventId,
+            roomId: command.roomId,
+            actorId,
+            eventType: "room.security.reduced",
+            occurredAt: acceptedAt,
+            payload: {
+              governance: result.governance,
+              archiveGeneration: result.governance.archiveGeneration,
+              assignmentRevision: result.participants.assignmentSecurity.assignmentRevision,
+            } as unknown as JsonValue,
+          });
+          appendRoomOutbox(
+            database,
+            securityEventId,
+            command.roomId,
+            securitySeq,
+            acceptedAt,
+            scope,
+            key,
+          );
+          eventIds.push(securityEventId);
+          catalogStartIndex = 2;
+        } else if ("afterCommitRescan" in result) {
+          onAfterCommitRescan(result.afterCommitRescan);
+        }
+        const catalogEventIds = appendCatalogEvents(database, {
+          roomId: command.roomId,
+          change: command.type === "room.archive" ? "archived" : "updated",
+          acceptedAt,
+          scope,
+          key,
+          startIndex: catalogStartIndex,
+        });
+        eventIds.push(...catalogEventIds);
+        afterDomainWrite?.();
+        return {
+          aggregateId: command.roomId,
+          eventIds,
+          acceptedAt,
+          result: { governance: result.governance } as unknown as JsonValue,
+        };
+      },
+    );
+  } catch (error: unknown) {
+    return failFromGovernanceCoordinator(error);
+  }
 }
 
 function executeMessageSend(
@@ -3806,7 +4203,7 @@ function recheckHumanCommandAuthority(
     return;
   }
   if (command.type === "room.member.leave") {
-    requireRoomMembership(database, actorId, command.roomId);
+    requireCurrentHumanRoomMembership(database, actorId, command.roomId);
     return;
   }
   if (
@@ -3815,6 +4212,7 @@ function recheckHumanCommandAuthority(
     command.type === "room.reopen" ||
     command.type === "human.invitation.issue" ||
     command.type === "agent.configure" ||
+    command.type === "room.member.remove" ||
     command.type === "member.remove"
   ) {
     requireRoomManager(database, actorId, command.roomId);
@@ -6302,7 +6700,8 @@ export function executeHumanDatabaseCommand(
   database: DatabaseSync,
   input: ExecuteHumanDatabaseCommandInput,
 ): DatabaseCommandResult {
-  return runAuthorityImmediateTransaction(database, () => {
+  let afterCommitRescan: ReopenAfterCommitRescan | undefined;
+  const result = runAuthorityImmediateTransaction(database, () => {
     const parsed = parsePersistentCommand(input.command);
     if (!parsed.ok) {
       return fail("invalid_request", "Authority command payload was rejected");
@@ -6319,7 +6718,6 @@ export function executeHumanDatabaseCommand(
               : fail("storage_unavailable", "Authority invitation is corrupt");
           })()
         : input.command.roomId;
-    recheckHumanCommandAuthority(database, actorId, input.command);
     return executeIdempotently(database, {
       actorId,
       command: input.command,
@@ -6330,6 +6728,7 @@ export function executeHumanDatabaseCommand(
         : input.context.idempotencyKey,
       now: input.now,
       beforeApply() {
+        recheckHumanCommandAuthority(database, actorId, input.command);
         input.beforeApply?.(actorId);
       },
       execute(acceptedAt, scope, key) {
@@ -6361,8 +6760,20 @@ export function executeHumanDatabaseCommand(
                 ? executeCalibrationRecord(database, actorId, input.command, acceptedAt, scope, key)
             : input.command.type === "room.create"
               ? executeRoomCreate(database, actorId, input.command, acceptedAt, scope, key)
-              : input.command.type === "room.rename" || input.command.type === "room.archive"
+              : input.command.type === "room.rename"
                 ? executeRenameOrArchive(database, actorId, input.command, acceptedAt, scope, key)
+                : input.command.type === "room.archive" || input.command.type === "room.reopen"
+                  ? executeClosedLifecycle(
+                      database,
+                      actorId,
+                      input.command,
+                      acceptedAt,
+                      scope,
+                      key,
+                      input.participantComposition,
+                      (rescan) => { afterCommitRescan = rescan; },
+                      input.afterDomainWrite,
+                    )
                 : input.command.type === "room.ownership.transfer"
                   ? executeOwnershipTransfer(database, actorId, input.command, acceptedAt, scope, key)
                 : input.command.type === "agent.configure"
@@ -6381,9 +6792,19 @@ export function executeHumanDatabaseCommand(
                       ? executeInvitationDecision(database, actorId, input.command, acceptedAt, scope, key)
                       : input.command.type === "room.member.role.set"
                         ? executeHumanRoleChange(database, actorId, input.command, acceptedAt, scope, key)
-                        : input.command.type === "room.member.leave"
-                          ? executeMemberLeave(database, actorId, input.command)
-                        : input.command.type === "human.role.change" || input.command.type === "room.reopen"
+                        : input.command.type === "room.member.leave" ||
+                            input.command.type === "room.member.remove"
+                          ? executeClosedDeparture(
+                              database,
+                              actorId,
+                              input.command,
+                              acceptedAt,
+                              scope,
+                              key,
+                              input.participantComposition,
+                              input.afterDomainWrite,
+                            )
+                        : input.command.type === "human.role.change"
                           ? fail("dependency_unavailable", "Legacy or dependency-bound governance path is unavailable")
                         : input.command.type === "member.remove"
                           ? executeMemberRemove(database, actorId, input.command)
@@ -6391,4 +6812,7 @@ export function executeHumanDatabaseCommand(
       },
     });
   }, input.beforeCommit);
+  return afterCommitRescan === undefined || result.disposition !== "applied"
+    ? result
+    : { ...result, afterCommitRescan };
 }
