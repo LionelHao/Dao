@@ -13,7 +13,7 @@ export default defineConfig({
             ...configDefaults.exclude,
             "packages/server/src/authority.e2e.test.ts",
             "packages/server/src/persistence/legacy-importer.test.ts",
-            "packages/server/src/persistence/schema.test.ts",
+            "packages/server/src/persistence/schema*.test.ts",
             "packages/server/src/persistence/snapshot-worker-client.test.ts",
             "packages/server/src/sync-service.test.ts",
           ],
@@ -26,7 +26,7 @@ export default defineConfig({
           environment: "jsdom",
           include: [
             "packages/server/src/persistence/legacy-importer.test.ts",
-            "packages/server/src/persistence/schema.test.ts",
+            "packages/server/src/persistence/schema*.test.ts",
           ],
           pool: "forks",
           poolOptions: { forks: { singleFork: true } },
