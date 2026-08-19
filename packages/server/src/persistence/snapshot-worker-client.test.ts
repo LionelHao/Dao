@@ -749,6 +749,48 @@ describe("durable materialized snapshot worker", () => {
     cache.close();
   });
 
+  it("purges only committed same-Room snapshots through the production cache adapter", async () => {
+    const fixture = await createDatabaseFixture({
+      rooms: [
+        { roomId: "room-purge", messageCount: 2 },
+        { roomId: "room-preserve", messageCount: 0 },
+      ],
+    });
+    const context = fixture.contexts[0]!;
+    const client = await createSnapshotWorkerClient({
+      authorityPath: fixture.authorityPath,
+      cachePath: fixture.cachePath,
+      revalidate: async () => undefined,
+      clock: () => 2_000,
+    });
+    const purged = await client.beginRoomRepair(context, "purge-build", "room-purge");
+    const preserved = await client.beginRoomRepair(context, "preserve-build", "room-preserve");
+    if (("kind" in purged && purged.kind === "fallback") ||
+        ("kind" in preserved && preserved.kind === "fallback")) {
+      throw new Error("unexpected fallback");
+    }
+
+    await client.purgeCommittedRoom({
+      invalidationIntentId: "intent-room-purge",
+      roomId: "room-purge",
+      lifecycleGeneration: 1,
+      accessRevision: 7,
+      reason: "room_archived",
+    });
+    await expect(client.readRoomRepairPage(
+      context,
+      "purged-read",
+      purged.snapshotId,
+      0,
+    )).rejects.toMatchObject({ status: 404, code: "snapshot_not_found" });
+    await expect(client.beginRoomRepair(
+      context,
+      "preserved-reuse",
+      "room-preserve",
+    )).resolves.toMatchObject({ snapshotId: preserved.snapshotId });
+    await client.close();
+  });
+
   it("keeps an expired snapshot at 410 after cleanup removed its manifest and pages", async () => {
     let now = 2_000;
     const fixture = await createDatabaseFixture({

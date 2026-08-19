@@ -81,6 +81,10 @@ import {
 } from "../message-authority/archived-message-gate.js";
 import { canStartRuntimeGenerationInTransaction } from "../agent-runtime/runtime-archive-fence-participant.js";
 import type { CommittedRoomCacheInvalidationIntent } from "../access/room-cache-invalidation-port.js";
+import {
+  BALL_BOUNDARY_TIMER_DESCRIPTOR_ID,
+  isBusinessTimerClaimAllowedInTransaction,
+} from "../business-timers/business-timer-suspension-participant.js";
 
 export class AuthorityDatabaseError extends Error {
   constructor(
@@ -349,10 +353,32 @@ export function executeBallAuthorityOperation(
     const agentTriggers: BallOverdueTrigger[] = [];
     const reminders: ReminderCandidate[] = [];
     const ballSummaries: BallSummary[] = [];
+    return withDatabaseAuthorityTransactionView(
+      database,
+      operation.roomId,
+      stableId("ball-business-timer-claim", operation.roomId, occurredAt),
+      (transaction) => {
     for (const ball of balls) {
-      if (operation.now < Date.parse(ball.deadline)) continue;
       const holderKind = holderKinds.get(ball.holderId);
       if (holderKind === undefined) continue;
+      let effectiveBall = ball;
+      if (ball.sourceKind === "open-item" || ball.sourceKind === "light-task") {
+        const decision = isBusinessTimerClaimAllowedInTransaction(transaction, {
+          roomId: ball.roomId,
+          descriptorId: BALL_BOUNDARY_TIMER_DESCRIPTOR_ID,
+          sourceKind: ball.sourceKind,
+          sourceId: ball.sourceId,
+          holderActorId: ball.holderId,
+          holderKind,
+          sinceAt: ball.since,
+          defaultDueAt: ball.deadline,
+          now: operation.now,
+        });
+        if (!decision.allowed) continue;
+        effectiveBall = { ...ball, deadline: decision.dueAt };
+      } else if (operation.now < Date.parse(ball.deadline)) {
+        continue;
+      }
       const boundaryKind = holderKind === "agent" ? "agent_trigger" : "human_reminder";
       const claimId = stableId(
         "ball-boundary", ball.roomId, ball.sourceKind, ball.sourceId, ball.holderId,
@@ -365,19 +391,19 @@ export function executeBallAuthorityOperation(
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         claimId, ball.roomId, ball.sourceKind, ball.sourceId, ball.holderId, holderKind,
-        ball.reason.slice(0, 1_024), ball.since, ball.deadline, boundaryKind, occurredAt,
+        ball.reason.slice(0, 1_024), ball.since, effectiveBall.deadline, boundaryKind, occurredAt,
       );
       if (inserted.changes !== 1) continue;
       if (holderKind === "human") {
         reminders.push({
           roomId: ball.roomId, recipientId: ball.holderId, sourceKind: ball.sourceKind,
-          sourceId: ball.sourceId, dueAt: ball.deadline,
+          sourceId: ball.sourceId, dueAt: effectiveBall.deadline,
         });
         continue;
       }
       const trigger: BallOverdueTrigger = {
         id: stableId("ball-overdue-trigger", claimId), roomId: ball.roomId,
-        agentId: ball.holderId, ball, triggeredAt: occurredAt,
+        agentId: ball.holderId, ball: effectiveBall, triggeredAt: occurredAt,
       };
       const eventId = stableId("ball-overdue-event", trigger.id);
       const streamSeq = appendRoomEvent(database, {
@@ -395,10 +421,12 @@ export function executeBallAuthorityOperation(
       agentTriggers.push(trigger);
       ballSummaries.push({
         agentId: ball.holderId, sourceKind: ball.sourceKind, sourceId: ball.sourceId,
-        reason: ball.reason, since: ball.since, deadline: ball.deadline,
+        reason: ball.reason, since: ball.since, deadline: effectiveBall.deadline,
       });
     }
     return { kind: "ball-overdue-scan", agentTriggers, reminders, ballSummaries };
+      },
+    );
   });
 }
 
@@ -5664,10 +5692,11 @@ export function executeRuntimeAuthorityOperation(
       database.prepare(
         `INSERT INTO agent_execution_grants (
            grant_id, execution_id, attempt_seq, agent_id, room_id, tool_id,
-           parameter_sha256, issued_at, expires_at, consumed_at
-         ) VALUES (?, ?, 1, ?, ?, 'sandbox-file.write', ?, ?, ?, ?)`,
+           parameter_sha256, issued_at, expires_at, consumed_at,
+           grant_state, grant_revision, grant_changed_at
+         ) VALUES (?, ?, 1, ?, ?, 'sandbox-file.write', ?, ?, ?, ?, 'claimed', 1, ?)`,
       ).run(operation.grantId, operation.newExecutionId, old.agentId, old.roomId,
-        authority.parameterSha256, occurredAt, occurredAt, occurredAt);
+        authority.parameterSha256, occurredAt, occurredAt, occurredAt, occurredAt);
       database.prepare(
         `INSERT INTO tool_dispatches (
            dispatch_id, execution_id, attempt_seq, grant_id, tool_id,
@@ -5695,7 +5724,9 @@ export function executeRuntimeAuthorityOperation(
       const pending = database.prepare(
         `SELECT confirmation.expires_at AS expiresAt,
                 confirmation.consumed_at AS consumedAt,
+                confirmation.confirmation_state AS confirmationState,
                 grant.grant_id AS grantId,
+                grant.grant_state AS grantState,
                 grant.tool_id AS toolId,
                 step.tool_call_json AS toolCallJson
          FROM tool_confirmations AS confirmation
@@ -5710,9 +5741,12 @@ export function executeRuntimeAuthorityOperation(
           AND step.step_kind = 'tool'
          WHERE confirmation.confirmation_id = ?
            AND confirmation.execution_id = ?
+           AND confirmation.confirmation_state = 'pending'
+           AND grant.grant_state = 'active'
          ORDER BY step.step_seq DESC LIMIT 1`,
       ).get(operation.confirmationId, current.id);
       if (pending === undefined || pending.consumedAt !== null ||
+          pending.confirmationState !== "pending" || pending.grantState !== "active" ||
           typeof pending.expiresAt !== "string" || Date.parse(pending.expiresAt) <= operation.now ||
           typeof pending.grantId !== "string" || typeof pending.toolId !== "string" ||
           typeof pending.toolCallJson !== "string") {
@@ -5780,8 +5814,8 @@ export function executeRuntimeAuthorityOperation(
       database.prepare(
         `INSERT INTO agent_execution_grants (
            grant_id, execution_id, attempt_seq, agent_id, room_id, tool_id,
-           parameter_sha256, issued_at, expires_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           parameter_sha256, issued_at, expires_at, grant_state
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
       ).run(operation.grantId, current.id, current.currentAttemptSeq, current.agentId,
         current.roomId, operation.tool.id, parameterSha256, occurredAt, operation.expiresAt);
       if (operation.tool.effect === "side-effecting") {
@@ -5802,8 +5836,8 @@ export function executeRuntimeAuthorityOperation(
           `INSERT INTO tool_confirmations (
              confirmation_id, execution_id, attempt_seq, tool_id, parameter_sha256,
              room_id, human_principal_id, session_family_id, expires_at,
-             target, impact, reversibility
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             target, impact, reversibility, confirmation_state
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
         ).run(confirmationId, current.id, current.currentAttemptSeq, operation.tool.id,
           parameterSha256, current.roomId, humanId, confirmationContext.sessionFamilyId,
           operation.expiresAt, operation.tool.id, "bounded-side-effect", operation.tool.reversibility);
@@ -5909,7 +5943,7 @@ export function executeRuntimeAuthorityOperation(
       const grant = database.prepare(
         `SELECT grant.agent_id AS agentId, grant.room_id AS roomId, grant.tool_id AS toolId,
                 grant.parameter_sha256 AS parameterSha256, grant.expires_at AS expiresAt,
-                grant.consumed_at AS consumedAt,
+                grant.consumed_at AS consumedAt, grant.grant_state AS grantState,
                 actor.kind AS actorKind, actor.readiness AS readiness,
                 actor.tool_permissions_json AS capabilityJson,
                 membership.kind AS membershipKind,
@@ -5931,7 +5965,8 @@ export function executeRuntimeAuthorityOperation(
       if (grant?.agentId !== current.agentId || grant.roomId !== current.roomId ||
           typeof grant.toolId !== "string" || grant.parameterSha256 !== parameterSha256 ||
           typeof grant.expiresAt !== "string" || Date.parse(grant.expiresAt) <= operation.now ||
-          grant.consumedAt !== null || grant.actorKind !== "agent" || grant.readiness !== "ready" ||
+          grant.consumedAt !== null || grant.grantState !== "active" ||
+          grant.actorKind !== "agent" || grant.readiness !== "ready" ||
           grant.membershipKind !== "agent" || grant.participation !== "active" || grant.roomStatus !== "active" ||
           !Array.isArray(capability) || !capability.includes(grant.toolId) ||
           !Array.isArray(membershipPermissions) || !membershipPermissions.includes(grant.toolId)) {
@@ -5949,11 +5984,14 @@ export function executeRuntimeAuthorityOperation(
           `SELECT execution_id AS executionId, attempt_seq AS attemptSeq, tool_id AS toolId,
                   parameter_sha256 AS parameterSha256, room_id AS roomId,
                   human_principal_id AS principalId, session_family_id AS sessionFamilyId,
-                  expires_at AS expiresAt, consumed_at AS consumedAt
+                  expires_at AS expiresAt, consumed_at AS consumedAt,
+                  confirmation_state AS confirmationState
            FROM tool_confirmations WHERE confirmation_id = ?`,
         ).get(operation.confirmation.input.confirmationId);
         if (confirmation === undefined) return fail("confirmation_forbidden", "Tool confirmation was not found");
-        if (confirmation.consumedAt !== null) return fail("confirmation_replayed", "Tool confirmation was already consumed");
+        if (confirmation.consumedAt !== null || confirmation.confirmationState !== "pending") {
+          return fail("confirmation_replayed", "Tool confirmation was already consumed");
+        }
         if (typeof confirmation.expiresAt !== "string" || Date.parse(confirmation.expiresAt) <= operation.now) {
           return fail("confirmation_expired", "Tool confirmation expired");
         }
@@ -5964,17 +6002,23 @@ export function executeRuntimeAuthorityOperation(
           return fail("confirmation_forbidden", "Tool confirmation binding was forbidden");
         }
         const consumed = database.prepare(
-          `UPDATE tool_confirmations SET consumed_at = ?
-           WHERE confirmation_id = ? AND consumed_at IS NULL`,
-        ).run(occurredAt, operation.confirmation.input.confirmationId);
+          `UPDATE tool_confirmations
+           SET confirmation_state = 'confirmed', consumed_at = ?,
+               confirmation_revision = confirmation_revision + 1,
+               confirmation_changed_at = ?
+           WHERE confirmation_id = ?
+             AND confirmation_state = 'pending' AND consumed_at IS NULL`,
+        ).run(occurredAt, occurredAt, operation.confirmation.input.confirmationId);
         if (consumed.changes !== 1) return fail("confirmation_replayed", "Tool confirmation was already consumed");
       } else if (operation.confirmation !== undefined) {
         return fail("confirmation_forbidden", "Read-only tool did not accept confirmation");
       }
       const consumedGrant = database.prepare(
-        `UPDATE agent_execution_grants SET consumed_at = ?
-         WHERE grant_id = ? AND consumed_at IS NULL`,
-      ).run(occurredAt, operation.grantId);
+        `UPDATE agent_execution_grants
+         SET grant_state = 'claimed', consumed_at = ?,
+             grant_revision = grant_revision + 1, grant_changed_at = ?
+         WHERE grant_id = ? AND grant_state = 'active' AND consumed_at IS NULL`,
+      ).run(occurredAt, occurredAt, operation.grantId);
       if (consumedGrant.changes !== 1) return fail("execution_conflict", "Tool grant was already consumed");
       database.prepare(
         `INSERT INTO tool_dispatches (
@@ -6085,7 +6129,8 @@ export function executeRuntimeAuthorityOperation(
         if (current.actionCategory === "waiting_upstream") {
           const confirmation = database.prepare(
             `SELECT expires_at AS expiresAt FROM tool_confirmations
-             WHERE execution_id = ? AND attempt_seq = ? AND consumed_at IS NULL
+             WHERE execution_id = ? AND attempt_seq = ?
+               AND confirmation_state = 'pending' AND consumed_at IS NULL
              ORDER BY expires_at DESC LIMIT 1`,
           ).get(current.id, current.currentAttemptSeq);
           if (typeof confirmation?.expiresAt === "string" && Date.parse(confirmation.expiresAt) > operation.now) {

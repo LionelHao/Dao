@@ -48,7 +48,10 @@ import type {
 } from "./contracts.js";
 import type { RuntimeAuthorityOperation } from "../agent-runtime/runtime-authority-protocol.js";
 import type { RouteAuthorityOperation } from "../route-runtime/route-authority-protocol.js";
-import type { BallAuthorityOperation } from "../ball-runtime/ball-authority-protocol.js";
+import type {
+  BallAuthorityOperation,
+  BallDeadlinePolicy,
+} from "../ball-runtime/ball-authority-protocol.js";
 import type {
   CommittedRoomCacheInvalidationIntent,
   RoomCacheInvalidationIntentAuthority,
@@ -60,6 +63,10 @@ import {
 
 export interface CreateWorkerDatabaseClientOptions {
   readonly databasePath: string;
+  readonly sharedAuthorityRecovery?: {
+    readonly ballPolicy: BallDeadlinePolicy;
+    readonly maxOfflineReadLeaseMs: number;
+  };
 }
 
 export interface AuthoritySchemaInspection {
@@ -674,6 +681,8 @@ function createAuthorityWorker(
   return new Worker(authorityWorkerUrl(), {
     workerData: {
       databasePath: options.databasePath,
+      ...(options.sharedAuthorityRecovery === undefined
+        ? {} : { sharedAuthorityRecovery: options.sharedAuthorityRecovery }),
       ...(recovery === undefined ? {} : { recovery }),
       ...(rollbackFailureForTest ? { rollbackFailureForTest: true } : {}),
       ...(transactionFaultPoint === undefined ? {} : { transactionFaultPoint }),
@@ -1742,7 +1751,7 @@ export function createWorkerDatabaseClient(
   options: CreateWorkerDatabaseClientOptions,
 ): Promise<WorkerDatabaseClient> {
   return createClient(options, (databasePath, recovery) =>
-    createAuthorityWorker({ databasePath }, recovery),
+    createAuthorityWorker({ ...options, databasePath }, recovery),
   );
 }
 
@@ -1759,7 +1768,7 @@ export function createWorkerDatabaseClientWithRollbackFailureForTest(
   options: CreateWorkerDatabaseClientOptions,
 ): Promise<WorkerDatabaseClient> {
   return createClient(options, (databasePath, recovery) =>
-    createAuthorityWorker({ databasePath }, recovery, true),
+    createAuthorityWorker({ ...options, databasePath }, recovery, true),
   );
 }
 
@@ -1769,6 +1778,6 @@ export function createWorkerDatabaseClientWithTransactionFaultForTest(
   faultPoint: "after-domain-write" | "before-commit",
 ): Promise<WorkerDatabaseClient> {
   return createClient(options, (databasePath, recovery) =>
-    createAuthorityWorker({ databasePath }, recovery, false, faultPoint),
+    createAuthorityWorker({ ...options, databasePath }, recovery, false, faultPoint),
   );
 }

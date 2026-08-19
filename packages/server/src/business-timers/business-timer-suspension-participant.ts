@@ -579,6 +579,17 @@ export function createBusinessTimerSuspensionParticipant(options: Readonly<{
           }
           const descriptorResults = invokeDescriptors(transaction, input, parsed);
           if (typeof descriptorResults === "string") return fail(descriptorResults);
+          database.prepare(
+            `INSERT INTO room_business_timer_freeze_batches (
+               room_id, archive_generation, suspended_at, suspended_count,
+               resumed_at, resumed_count, descriptor_ids_json
+             ) VALUES (?, ?, ?, 0, NULL, NULL, ?)`,
+          ).run(
+            input.roomId,
+            input.archiveGeneration,
+            input.archivedAt,
+            JSON.stringify(descriptorIds),
+          );
           const archivedAt = Date.parse(input.archivedAt);
           for (const descriptorResult of descriptorResults) {
             for (const timer of descriptorResult.timers) {
@@ -609,18 +620,12 @@ export function createBusinessTimerSuspensionParticipant(options: Readonly<{
              WHERE room_id = ? AND archive_generation = ? AND state = 'frozen'`,
           ).get(input.roomId, input.archiveGeneration)?.count;
           if (!nonNegativeInteger(affectedCount)) throw new Error("Timer count is corrupt");
-          database.prepare(
-            `INSERT INTO room_business_timer_freeze_batches (
-               room_id, archive_generation, suspended_at, suspended_count,
-               resumed_at, resumed_count, descriptor_ids_json
-             ) VALUES (?, ?, ?, ?, NULL, NULL, ?)`,
-          ).run(
-            input.roomId,
-            input.archiveGeneration,
-            input.archivedAt,
-            affectedCount,
-            JSON.stringify(descriptorIds),
-          );
+          const updated = database.prepare(
+            `UPDATE room_business_timer_freeze_batches
+             SET suspended_count = ?
+             WHERE room_id = ? AND archive_generation = ? AND suspended_count = 0`,
+          ).run(affectedCount, input.roomId, input.archiveGeneration);
+          if (updated.changes !== 1) throw new Error("Timer suspension batch CAS was stale");
           return Object.freeze({
             ok: true as const,
             result: result(

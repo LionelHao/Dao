@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import {
   AUTHORITY_SCHEMA_VERSION,
+  AUTHORITY_V14_STATEMENT_COUNT_FOR_TEST,
   configureAuthorityConnection,
   listAuthorityTables,
   migrateAuthorityDatabase,
@@ -38,6 +39,7 @@ const AUTHORITY_TABLES = [
   "agent_human_fences",
   "agent_invocation_intents",
   "agent_judgments",
+  "agent_profiles",
   "ball_boundary_claims",
   "calibration_signals",
   "events",
@@ -52,8 +54,16 @@ const AUTHORITY_TABLES = [
   "open_item_agent_failures",
   "open_items",
   "outbox_deliveries",
+  "project_next_actions",
+  "project_obstacles",
+  "project_requests",
+  "project_transfer_proposals",
   "room_access_authority",
+  "room_agent_assignments",
+  "room_assignment_archive_policies",
   "room_audit",
+  "room_business_timer_freeze_batches",
+  "room_business_timer_freezes",
   "room_cache_invalidation_intents",
   "room_invitations",
   "room_memberships",
@@ -73,6 +83,8 @@ const AUTHORITY_TABLES = [
   "session_families",
   "sessions",
   "streams",
+  "tool_archive_settlement_members",
+  "tool_archive_settlements",
   "tool_confirmations",
   "tool_dispatches",
 ] as const;
@@ -434,10 +446,13 @@ describe("authority SQLite schema", () => {
       expect(readSchemaVersion(database)).toBe(13);
       database.exec(`
         INSERT INTO actors (id, kind, display_name)
-        VALUES ('v14-owner', 'human', 'Owner');
+        VALUES
+          ('v14-owner', 'human', 'Owner'),
+          ('v14-agent', 'agent', 'Agent');
         INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
         VALUES
           ('identity', 'v14-owner', 0, 1),
+          ('identity', 'v14-agent', 0, 1),
           ('room', 'v14-active', 0, 1),
           ('room', 'v14-archived', 0, 1);
         INSERT INTO rooms (id, name, status, created_at)
@@ -457,6 +472,53 @@ describe("authority SQLite schema", () => {
         SET status = 'archived', archive_generation = 4,
             archived_at = '2026-08-19T00:04:00.000Z'
         WHERE id = 'v14-archived';
+        INSERT INTO agent_executions (
+          id, room_id, agent_id, status, started_at, action_category,
+          tool_dispatch_phase, queued_at, updated_at
+        ) VALUES
+          ('v14-execution-pending', 'v14-active', 'v14-agent', 'running',
+           '2026-08-19T00:01:00.000Z', 'waiting_upstream', NULL,
+           '2026-08-19T00:01:00.000Z', '2026-08-19T00:01:00.000Z'),
+          ('v14-execution-consumed', 'v14-active', 'v14-agent', 'running',
+           '2026-08-19T00:01:00.000Z', 'tool_call', 'dispatched',
+           '2026-08-19T00:01:00.000Z', '2026-08-19T00:01:00.000Z');
+        INSERT INTO agent_execution_attempts (
+          execution_id, attempt_seq, retry_cycle, retry_ordinal, status,
+          action_category, started_at, recovery_cursor
+        ) VALUES
+          ('v14-execution-pending', 1, 1, 1, 'running', 'waiting_upstream',
+           '2026-08-19T00:01:00.000Z', 0),
+          ('v14-execution-consumed', 1, 1, 1, 'running', 'tool_call',
+           '2026-08-19T00:01:00.000Z', 0);
+        INSERT INTO agent_execution_grants (
+          grant_id, execution_id, attempt_seq, agent_id, room_id, tool_id,
+          parameter_sha256, issued_at, expires_at, consumed_at
+        ) VALUES
+          ('v14-grant-pending', 'v14-execution-pending', 1, 'v14-agent',
+           'v14-active', 'sandbox-file.write',
+           '0000000000000000000000000000000000000000000000000000000000000000',
+           '2026-08-19T00:01:00.000Z', '2026-08-19T01:01:00.000Z', NULL),
+          ('v14-grant-consumed', 'v14-execution-consumed', 1, 'v14-agent',
+           'v14-active', 'sandbox-file.write',
+           '1111111111111111111111111111111111111111111111111111111111111111',
+           '2026-08-19T00:01:00.000Z', '2026-08-19T01:01:00.000Z',
+           '2026-08-19T00:02:00.000Z');
+        INSERT INTO tool_confirmations (
+          confirmation_id, execution_id, attempt_seq, tool_id, parameter_sha256,
+          room_id, human_principal_id, session_family_id, expires_at,
+          target, impact, reversibility, consumed_at
+        ) VALUES
+          ('v14-confirmation-pending', 'v14-execution-pending', 1,
+           'sandbox-file.write',
+           '0000000000000000000000000000000000000000000000000000000000000000',
+           'v14-active', 'v14-owner', 'v14-family', '2026-08-19T01:01:00.000Z',
+           'sandbox-file.write', 'bounded-side-effect', 'compensatable', NULL),
+          ('v14-confirmation-consumed', 'v14-execution-consumed', 1,
+           'sandbox-file.write',
+           '1111111111111111111111111111111111111111111111111111111111111111',
+           'v14-active', 'v14-owner', 'v14-family', '2026-08-19T01:01:00.000Z',
+           'sandbox-file.write', 'bounded-side-effect', 'compensatable',
+           '2026-08-19T00:02:00.000Z');
       `);
 
       migrateAuthorityDatabase(database);
@@ -471,11 +533,30 @@ describe("authority SQLite schema", () => {
         gateGeneration: 4,
         blockedAt: "2026-08-19T00:04:00.000Z",
       }]);
+      expect(database.prepare(
+        `SELECT grant_id AS id, grant_state AS state, grant_reason AS reason
+         FROM agent_execution_grants ORDER BY grant_id`,
+      ).all()).toEqual([
+        { id: "v14-grant-consumed", state: "claimed", reason: null },
+        { id: "v14-grant-pending", state: "revoked", reason: "legacy_unbound" },
+      ]);
+      expect(database.prepare(
+        `SELECT confirmation_id AS id, confirmation_state AS state,
+                confirmation_reason AS reason
+         FROM tool_confirmations ORDER BY confirmation_id`,
+      ).all()).toEqual([
+        { id: "v14-confirmation-consumed", state: "confirmed", reason: null },
+        { id: "v14-confirmation-pending", state: "rejected", reason: "legacy_unbound" },
+      ]);
     });
   });
 
   it("rolls every v14 migration statement back with v13 schema and history intact", () => {
-    for (let failAfterStatement = 1; failAfterStatement <= 15; failAfterStatement += 1) {
+    for (
+      let failAfterStatement = 1;
+      failAfterStatement <= AUTHORITY_V14_STATEMENT_COUNT_FOR_TEST;
+      failAfterStatement += 1
+    ) {
       withDatabase((database) => {
         migrateAuthorityDatabaseToPreviousVersionForTest(database);
         const before = snapshot(database);
@@ -487,7 +568,7 @@ describe("authority SQLite schema", () => {
         expect(snapshot(database)).toEqual(before);
       });
     }
-  });
+  }, 20_000);
 
   it("rejects a same-version message gate that outruns the Room lifecycle generation", () => {
     withDatabase((database) => {

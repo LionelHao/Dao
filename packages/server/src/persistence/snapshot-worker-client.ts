@@ -25,6 +25,10 @@ import type {
   StreamingSnapshotManifest,
 } from "./contracts.js";
 import { SNAPSHOT_REQUEST_ID_MAX_BYTES } from "./contracts.js";
+import type {
+  CommittedRoomCacheInvalidationIntent,
+  RoomCachePurgeAdapter,
+} from "../access/room-cache-invalidation-port.js";
 
 export const SNAPSHOT_MAX_CONCURRENT_BUILDS = 1;
 export const SNAPSHOT_QUEUE_LIMIT = 16;
@@ -72,7 +76,7 @@ export interface SnapshotMaterializationFallback {
 export type SnapshotRoomBeginResult = RoomRepairPage | SnapshotMaterializationFallback;
 export type SnapshotCatalogBeginResult = WorkspaceBootstrapPage | SnapshotMaterializationFallback;
 
-export interface SnapshotWorkerClient {
+export interface SnapshotWorkerClient extends RoomCachePurgeAdapter {
   beginRoomRepair(
     context: AuthenticatedSessionContext,
     requestId: string,
@@ -105,6 +109,7 @@ export interface SnapshotWorkerClient {
     context: AuthenticatedSessionContext,
     snapshotId: string,
   ): Promise<void>;
+  purgeCommittedRoom(intent: CommittedRoomCacheInvalidationIntent): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -338,8 +343,9 @@ function isWorkerErrorCode(value: unknown): value is SnapshotWorkerErrorCode {
 
 function isWorkerResponse(value: unknown): value is SnapshotWorkerResponse {
   if (!isRecord(value) || !text(value.type) || !text(value.requestId)) return false;
-  if (value.type === "snapshot.ready" || value.type === "snapshot.closed" ||
-      value.type === "snapshot.invalidated" || value.type === "snapshot.streaming-released") {
+    if (value.type === "snapshot.ready" || value.type === "snapshot.closed" ||
+      value.type === "snapshot.invalidated" || value.type === "snapshot.room-invalidated" ||
+      value.type === "snapshot.streaming-released") {
     return exact(value, ["type", "requestId"]);
   }
   if (value.type === "snapshot.page") {
@@ -761,6 +767,17 @@ class SnapshotWorkerClientImplementation implements SnapshotWorkerClient {
     }
   }
 
+  async purgeCommittedRoom(intent: CommittedRoomCacheInvalidationIntent): Promise<void> {
+    const response = await this.#send({
+      type: "snapshot.invalidate-room",
+      roomId: intent.roomId,
+      accessRevision: intent.accessRevision,
+    });
+    if (response.type !== "snapshot.room-invalidated") {
+      throw new SnapshotWorkerClientError("storage_unavailable", "Snapshot room purge failed");
+    }
+  }
+
   async #beginStreaming(
     context: AuthenticatedSessionContext,
     requestId: string,
@@ -1062,6 +1079,9 @@ class SnapshotWorkerClientImplementation implements SnapshotWorkerClient {
     if (command.type === "snapshot.initialize") return response.type === "snapshot.ready";
     if (command.type === "snapshot.close") return response.type === "snapshot.closed";
     if (command.type === "snapshot.invalidate") return response.type === "snapshot.invalidated";
+    if (command.type === "snapshot.invalidate-room") {
+      return response.type === "snapshot.room-invalidated";
+    }
     if (command.type === "snapshot.release-streaming") {
       return response.type === "snapshot.streaming-released";
     }

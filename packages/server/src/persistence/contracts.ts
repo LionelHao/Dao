@@ -161,6 +161,12 @@ export type SnapshotWorkerRequest =
       readonly requestId: string;
       readonly snapshotId: string;
     }
+  | {
+      readonly type: "snapshot.invalidate-room";
+      readonly requestId: string;
+      readonly roomId: string;
+      readonly accessRevision: number;
+    }
   | { readonly type: "snapshot.cache-count"; readonly requestId: string }
   | { readonly type: "snapshot.full-validation-count"; readonly requestId: string }
   | { readonly type: "snapshot.close"; readonly requestId: string };
@@ -210,6 +216,7 @@ export type SnapshotWorkerResponse =
       readonly count: number;
     }
   | { readonly type: "snapshot.invalidated"; readonly requestId: string }
+  | { readonly type: "snapshot.room-invalidated"; readonly requestId: string }
   | { readonly type: "snapshot.streaming-released"; readonly requestId: string }
   | { readonly type: "snapshot.closed"; readonly requestId: string }
   | {

@@ -1098,6 +1098,7 @@ describe("authoritative server real-process harness", () => {
     const serverOptions = {
       databasePath,
       snapshotCachePath,
+      sharedAuthority: { maxOfflineReadLeaseMs: 60_000 },
       listen: { host: "127.0.0.1", port: 0 },
       actors,
       identities,

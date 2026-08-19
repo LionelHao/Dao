@@ -61,7 +61,7 @@ const SCHEMA_FINGERPRINTS = {
   11: "83e48fc5a4b1b1c19863efd785ea098308d100c1899d638d2b5f95c5b0c119a6",
   12: "7232d27114e9acf32dcfbc2d59f3c3128eed10955de3cc2703ddeedf92892741",
   13: "037df6a2818f2a90b7394240a4cf71d77949faf31df6534c5546c9ed6b7e7191",
-  14: "186018d645cc93912dbd6a4d723a5dfe95f68d5082773ff45b8f99afcdfafc8d",
+  14: "b4f1034ce034203fd14f5bc32391cb8855f7d6eed64c0b01f75d41e331a8b5c5",
 } as const;
 
 const V1_STATEMENTS = [
@@ -1217,11 +1217,436 @@ const V14_STATEMENTS = [
   `CREATE INDEX agent_executions_room_generation_status_v14
    ON agent_executions(room_id, room_archive_generation, status, queued_at, id)`,
   `CREATE INDEX tool_dispatches_execution_attempt_v14
-   ON tool_dispatches(execution_id, attempt_seq)`,
+   ON tool_dispatches(execution_id, attempt_seq, state)`,
+  `ALTER TABLE tool_confirmations
+   ADD COLUMN confirmation_state TEXT NOT NULL DEFAULT 'pending'
+   CHECK (confirmation_state IN ('pending', 'confirmed', 'rejected', 'expired'))`,
+  `ALTER TABLE tool_confirmations ADD COLUMN confirmation_reason TEXT`,
+  `ALTER TABLE tool_confirmations
+   ADD COLUMN confirmation_revision INTEGER NOT NULL DEFAULT 0
+   CHECK (confirmation_revision >= 0)`,
+  `ALTER TABLE tool_confirmations ADD COLUMN confirmation_changed_at TEXT`,
+  `ALTER TABLE agent_execution_grants
+   ADD COLUMN grant_state TEXT NOT NULL DEFAULT 'active'
+   CHECK (grant_state IN ('active', 'claimed', 'revoked', 'expired'))`,
+  `ALTER TABLE agent_execution_grants ADD COLUMN grant_reason TEXT`,
+  `ALTER TABLE agent_execution_grants
+   ADD COLUMN grant_revision INTEGER NOT NULL DEFAULT 0
+   CHECK (grant_revision >= 0)`,
+  `ALTER TABLE agent_execution_grants ADD COLUMN grant_changed_at TEXT`,
+  `UPDATE tool_confirmations
+   SET confirmation_state = CASE
+         WHEN consumed_at IS NULL THEN 'rejected' ELSE 'confirmed' END,
+       confirmation_reason = CASE
+         WHEN consumed_at IS NULL THEN 'legacy_unbound' ELSE NULL END`,
+  `UPDATE agent_execution_grants
+   SET grant_state = CASE
+         WHEN consumed_at IS NULL THEN 'revoked' ELSE 'claimed' END,
+       grant_reason = CASE
+         WHEN consumed_at IS NULL THEN 'legacy_unbound' ELSE NULL END`,
+  `CREATE TABLE tool_archive_settlements (
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    archive_generation INTEGER NOT NULL CHECK (archive_generation > 0),
+    settled_at TEXT NOT NULL,
+    rejected_pending_count INTEGER NOT NULL DEFAULT 0
+      CHECK (rejected_pending_count >= 0),
+    revoked_grant_count INTEGER NOT NULL DEFAULT 0 CHECK (revoked_grant_count >= 0),
+    fenced_waiting_count INTEGER NOT NULL DEFAULT 0 CHECK (fenced_waiting_count >= 0),
+    preserved_dispatched_count INTEGER NOT NULL DEFAULT 0
+      CHECK (preserved_dispatched_count >= 0),
+    PRIMARY KEY (room_id, archive_generation)
+  ) STRICT`,
+  `CREATE TABLE tool_archive_settlement_members (
+    room_id TEXT NOT NULL,
+    archive_generation INTEGER NOT NULL,
+    subject_kind TEXT NOT NULL CHECK (
+      subject_kind IN ('confirmation', 'grant', 'execution', 'dispatch')
+    ),
+    subject_id TEXT NOT NULL,
+    disposition TEXT NOT NULL CHECK (disposition IN (
+      'rejected_pending', 'revoked_unclaimed', 'fenced_waiting', 'preserved_dispatched'
+    )),
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (room_id, archive_generation, subject_kind, subject_id),
+    FOREIGN KEY (room_id, archive_generation)
+      REFERENCES tool_archive_settlements(room_id, archive_generation)
+  ) STRICT`,
+  `CREATE INDEX tool_confirmations_departure_v14
+   ON tool_confirmations(
+     room_id, human_principal_id, confirmation_state, expires_at, confirmation_id
+   )`,
+  `CREATE INDEX agent_execution_grants_archive_v14
+   ON agent_execution_grants(room_id, grant_state, grant_id)`,
+  `CREATE INDEX tool_archive_settlement_members_disposition_v14
+   ON tool_archive_settlement_members(
+     room_id, archive_generation, disposition, subject_id
+   )`,
+  `CREATE TRIGGER tool_confirmations_binding_immutable_v14
+   BEFORE UPDATE OF execution_id, attempt_seq, tool_id, parameter_sha256, room_id,
+     human_principal_id, session_family_id, expires_at ON tool_confirmations
+   BEGIN
+     SELECT RAISE(ABORT, 'tool confirmation binding is immutable');
+   END`,
+  `CREATE TRIGGER tool_confirmations_state_insert_v14
+   BEFORE INSERT ON tool_confirmations
+   WHEN (NEW.confirmation_state = 'pending' AND NEW.consumed_at IS NOT NULL)
+     OR (NEW.confirmation_state = 'confirmed' AND NEW.consumed_at IS NULL)
+     OR (NEW.confirmation_state IN ('rejected', 'expired') AND NEW.consumed_at IS NOT NULL)
+     OR (NEW.confirmation_revision > 0 AND NEW.confirmation_changed_at IS NULL)
+   BEGIN
+     SELECT RAISE(ABORT, 'tool confirmation state is invalid');
+   END`,
+  `CREATE TRIGGER tool_confirmations_state_update_v14
+   BEFORE UPDATE OF confirmation_state, confirmation_reason, confirmation_revision,
+     confirmation_changed_at, consumed_at ON tool_confirmations
+   WHEN NOT (
+     OLD.confirmation_state = 'pending'
+     AND NEW.confirmation_state IN ('confirmed', 'rejected', 'expired')
+     AND NEW.confirmation_revision = OLD.confirmation_revision + 1
+     AND NEW.confirmation_changed_at IS NOT NULL
+     AND (
+       (NEW.confirmation_state = 'confirmed' AND NEW.consumed_at IS NOT NULL)
+       OR (NEW.confirmation_state IN ('rejected', 'expired') AND NEW.consumed_at IS NULL)
+     )
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'tool confirmation transition is invalid');
+   END`,
+  `CREATE TRIGGER agent_execution_grants_binding_immutable_v14
+   BEFORE UPDATE OF execution_id, attempt_seq, agent_id, room_id, tool_id,
+     parameter_sha256, issued_at, expires_at ON agent_execution_grants
+   BEGIN
+     SELECT RAISE(ABORT, 'tool grant binding is immutable');
+   END`,
+  `CREATE TRIGGER agent_execution_grants_state_insert_v14
+   BEFORE INSERT ON agent_execution_grants
+   WHEN (NEW.grant_state = 'active' AND NEW.consumed_at IS NOT NULL)
+     OR (NEW.grant_state = 'claimed' AND NEW.consumed_at IS NULL)
+     OR (NEW.grant_state IN ('revoked', 'expired') AND NEW.consumed_at IS NOT NULL)
+     OR (NEW.grant_revision > 0 AND NEW.grant_changed_at IS NULL)
+   BEGIN
+     SELECT RAISE(ABORT, 'tool grant state is invalid');
+   END`,
+  `CREATE TRIGGER agent_execution_grants_state_update_v14
+   BEFORE UPDATE OF grant_state, grant_reason, grant_revision, grant_changed_at,
+     consumed_at ON agent_execution_grants
+   WHEN NOT (
+     OLD.grant_state = 'active'
+     AND NEW.grant_state IN ('claimed', 'revoked', 'expired')
+     AND NEW.grant_revision = OLD.grant_revision + 1
+     AND NEW.grant_changed_at IS NOT NULL
+     AND (
+       (NEW.grant_state = 'claimed' AND NEW.consumed_at IS NOT NULL)
+       OR (NEW.grant_state IN ('revoked', 'expired') AND NEW.consumed_at IS NULL)
+     )
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'tool grant transition is invalid');
+   END`,
+  `CREATE TABLE agent_profiles (
+    id TEXT PRIMARY KEY,
+    actor_id TEXT NOT NULL UNIQUE REFERENCES actors(id),
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    status TEXT NOT NULL CHECK (status IN ('enabled', 'disabled')),
+    capability_ceiling_json TEXT NOT NULL CHECK (
+      json_valid(capability_ceiling_json) AND json_type(capability_ceiling_json) = 'array'
+    ),
+    tool_ceiling_json TEXT NOT NULL CHECK (
+      json_valid(tool_ceiling_json) AND json_type(tool_ceiling_json) = 'array'
+    )
+  ) STRICT`,
+  `CREATE TABLE room_agent_assignments (
+    id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    profile_id TEXT NOT NULL REFERENCES agent_profiles(id),
+    agent_actor_id TEXT NOT NULL REFERENCES actors(id),
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    status TEXT NOT NULL CHECK (status IN ('current', 'removed')),
+    participation TEXT NOT NULL CHECK (participation IN ('active', 'on-mention')),
+    paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
+    capability_subset_json TEXT NOT NULL CHECK (
+      json_valid(capability_subset_json) AND json_type(capability_subset_json) = 'array'
+    ),
+    tool_subset_json TEXT NOT NULL CHECK (
+      json_valid(tool_subset_json) AND json_type(tool_subset_json) = 'array'
+    )
+  ) STRICT`,
+  `CREATE UNIQUE INDEX room_agent_assignments_one_current_agent_v14
+   ON room_agent_assignments(room_id, agent_actor_id) WHERE status = 'current'`,
+  `CREATE TRIGGER agent_profiles_agent_binding_insert_v14
+   BEFORE INSERT ON agent_profiles
+   WHEN COALESCE((SELECT kind FROM actors WHERE id = NEW.actor_id), '') <> 'agent'
+   BEGIN
+     SELECT RAISE(ABORT, 'agent profile actor must be an Agent');
+   END`,
+  `CREATE TRIGGER agent_profiles_agent_binding_update_v14
+   BEFORE UPDATE OF actor_id ON agent_profiles
+   WHEN COALESCE((SELECT kind FROM actors WHERE id = NEW.actor_id), '') <> 'agent'
+   BEGIN
+     SELECT RAISE(ABORT, 'agent profile actor must be an Agent');
+   END`,
+  `CREATE TRIGGER room_agent_assignments_authority_insert_v14
+   BEFORE INSERT ON room_agent_assignments
+   WHEN COALESCE((SELECT kind FROM actors WHERE id = NEW.agent_actor_id), '') <> 'agent'
+     OR COALESCE((SELECT actor_id FROM agent_profiles WHERE id = NEW.profile_id), '')
+       <> NEW.agent_actor_id
+     OR EXISTS (
+       SELECT value FROM json_each(NEW.capability_subset_json)
+       EXCEPT SELECT value FROM json_each((
+         SELECT capability_ceiling_json FROM agent_profiles WHERE id = NEW.profile_id
+       ))
+     )
+     OR EXISTS (
+       SELECT value FROM json_each(NEW.tool_subset_json)
+       EXCEPT SELECT value FROM json_each((
+         SELECT tool_ceiling_json FROM agent_profiles WHERE id = NEW.profile_id
+       ))
+     )
+   BEGIN
+     SELECT RAISE(ABORT, 'Room Assignment exceeds its Agent Profile authority');
+   END`,
+  `CREATE TRIGGER room_agent_assignments_authority_update_v14
+   BEFORE UPDATE OF profile_id, agent_actor_id, capability_subset_json, tool_subset_json
+     ON room_agent_assignments
+   WHEN COALESCE((SELECT kind FROM actors WHERE id = NEW.agent_actor_id), '') <> 'agent'
+     OR COALESCE((SELECT actor_id FROM agent_profiles WHERE id = NEW.profile_id), '')
+       <> NEW.agent_actor_id
+     OR EXISTS (
+       SELECT value FROM json_each(NEW.capability_subset_json)
+       EXCEPT SELECT value FROM json_each((
+         SELECT capability_ceiling_json FROM agent_profiles WHERE id = NEW.profile_id
+       ))
+     )
+     OR EXISTS (
+       SELECT value FROM json_each(NEW.tool_subset_json)
+       EXCEPT SELECT value FROM json_each((
+         SELECT tool_ceiling_json FROM agent_profiles WHERE id = NEW.profile_id
+       ))
+     )
+   BEGIN
+     SELECT RAISE(ABORT, 'Room Assignment exceeds its Agent Profile authority');
+   END`,
+  `CREATE TRIGGER agent_profiles_ceiling_update_v14
+   BEFORE UPDATE OF actor_id, capability_ceiling_json, tool_ceiling_json ON agent_profiles
+   WHEN EXISTS (
+     SELECT 1 FROM room_agent_assignments AS assignment
+     WHERE assignment.profile_id = OLD.id AND assignment.status = 'current'
+       AND (
+         assignment.agent_actor_id <> NEW.actor_id
+         OR EXISTS (
+           SELECT value FROM json_each(assignment.capability_subset_json)
+           EXCEPT SELECT value FROM json_each(NEW.capability_ceiling_json)
+         )
+         OR EXISTS (
+           SELECT value FROM json_each(assignment.tool_subset_json)
+           EXCEPT SELECT value FROM json_each(NEW.tool_ceiling_json)
+         )
+       )
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'Agent Profile update would exceed current Room Assignment authority');
+   END`,
+  `CREATE TABLE room_assignment_archive_policies (
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    archive_generation INTEGER NOT NULL CHECK (archive_generation > 0),
+    policy_version INTEGER NOT NULL CHECK (policy_version > 0),
+    assignment_revision INTEGER NOT NULL CHECK (assignment_revision >= 0),
+    expansion_blocked INTEGER NOT NULL CHECK (expansion_blocked = 1),
+    reduced_at TEXT NOT NULL,
+    PRIMARY KEY (room_id, archive_generation),
+    UNIQUE (room_id, policy_version)
+  ) STRICT`,
+  `CREATE TABLE room_business_timer_freeze_batches (
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    archive_generation INTEGER NOT NULL CHECK (archive_generation > 0),
+    suspended_at TEXT NOT NULL,
+    suspended_count INTEGER NOT NULL CHECK (suspended_count >= 0),
+    resumed_at TEXT,
+    resumed_count INTEGER CHECK (resumed_count >= 0),
+    descriptor_ids_json TEXT NOT NULL CHECK (
+      json_valid(descriptor_ids_json) AND json_type(descriptor_ids_json) = 'array'
+    ),
+    PRIMARY KEY (room_id, archive_generation),
+    CHECK ((resumed_at IS NULL) = (resumed_count IS NULL))
+  ) STRICT`,
+  `CREATE TABLE room_business_timer_freezes (
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    archive_generation INTEGER NOT NULL CHECK (archive_generation > 0),
+    descriptor_id TEXT NOT NULL CHECK (length(trim(descriptor_id)) > 0),
+    timer_key TEXT NOT NULL CHECK (length(trim(timer_key)) > 0),
+    source_kind TEXT NOT NULL CHECK (length(trim(source_kind)) > 0),
+    source_id TEXT NOT NULL CHECK (length(trim(source_id)) > 0),
+    original_due_at TEXT NOT NULL,
+    remaining_ms INTEGER NOT NULL CHECK (remaining_ms >= 0),
+    frozen_at TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('frozen', 'resumed', 'discarded')),
+    resumed_due_at TEXT,
+    resolved_at TEXT,
+    PRIMARY KEY (room_id, archive_generation, timer_key),
+    FOREIGN KEY (room_id, archive_generation)
+      REFERENCES room_business_timer_freeze_batches(room_id, archive_generation),
+    CHECK (
+      (state = 'frozen' AND resumed_due_at IS NULL AND resolved_at IS NULL)
+      OR (state = 'resumed' AND resumed_due_at IS NOT NULL AND resolved_at IS NOT NULL)
+      OR (state = 'discarded' AND resumed_due_at IS NULL AND resolved_at IS NOT NULL)
+    )
+  ) STRICT`,
+  `CREATE INDEX room_business_timer_freezes_latest_v14
+   ON room_business_timer_freezes(
+     room_id, descriptor_id, timer_key, archive_generation DESC
+   )`,
+  `CREATE INDEX room_business_timer_freezes_generation_state_v14
+   ON room_business_timer_freezes(room_id, archive_generation, state)`,
+  `CREATE TABLE project_requests (
+    id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    source_room_id TEXT NOT NULL REFERENCES rooms(id) CHECK (source_room_id = room_id),
+    source_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    requester_human_actor_id TEXT NOT NULL REFERENCES actors(id),
+    target_human_actor_id TEXT NOT NULL REFERENCES actors(id),
+    status TEXT NOT NULL CHECK (
+      status IN ('pending_acceptance', 'accepted', 'rejected', 'cancelled')
+    )
+  ) STRICT`,
+  `CREATE TABLE project_next_actions (
+    id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    source_room_id TEXT NOT NULL REFERENCES rooms(id) CHECK (source_room_id = room_id),
+    source_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    owner_kind TEXT NOT NULL CHECK (owner_kind IN ('human', 'agent')),
+    owner_actor_id TEXT NOT NULL REFERENCES actors(id),
+    verifier_human_actor_id TEXT REFERENCES actors(id),
+    status TEXT NOT NULL CHECK (status IN (
+      'proposed', 'accepted', 'in_progress', 'delivered', 'done', 'rejected', 'cancelled'
+    )),
+    CHECK (owner_kind = 'human' OR verifier_human_actor_id IS NOT NULL)
+  ) STRICT`,
+  `CREATE TABLE project_obstacles (
+    id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    source_room_id TEXT NOT NULL REFERENCES rooms(id) CHECK (source_room_id = room_id),
+    source_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    kind TEXT NOT NULL CHECK (kind IN ('blocker', 'open_question')),
+    owner_kind TEXT NOT NULL CHECK (owner_kind IN ('human', 'agent')),
+    owner_actor_id TEXT NOT NULL REFERENCES actors(id),
+    status TEXT NOT NULL CHECK (status IN ('open', 'resolved', 'deferred', 'cannot_answer'))
+  ) STRICT`,
+  `CREATE TABLE project_transfer_proposals (
+    id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    source_room_id TEXT NOT NULL REFERENCES rooms(id) CHECK (source_room_id = room_id),
+    source_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    subject_kind TEXT NOT NULL CHECK (
+      subject_kind IN ('next_action', 'blocker', 'open_question')
+    ),
+    subject_id TEXT NOT NULL,
+    to_owner_kind TEXT NOT NULL CHECK (to_owner_kind IN ('human', 'agent')),
+    to_owner_actor_id TEXT NOT NULL REFERENCES actors(id),
+    status TEXT NOT NULL CHECK (
+      status IN ('pending', 'accepted', 'rejected', 'cancelled', 'expired')
+    )
+  ) STRICT`,
+  `CREATE INDEX project_requests_departure_v14
+   ON project_requests(
+     room_id, status, requester_human_actor_id, target_human_actor_id, id
+   )`,
+  `CREATE INDEX project_next_actions_departure_v14
+   ON project_next_actions(
+     room_id, status, owner_kind, owner_actor_id, verifier_human_actor_id, id
+   )`,
+  `CREATE INDEX project_obstacles_departure_v14
+   ON project_obstacles(room_id, status, owner_kind, owner_actor_id, kind, id)`,
+  `CREATE INDEX project_transfer_proposals_departure_v14
+   ON project_transfer_proposals(
+     room_id, status, to_owner_kind, to_owner_actor_id, id
+   )`,
+  `CREATE TRIGGER project_requests_actor_binding_insert_v14
+   BEFORE INSERT ON project_requests
+   WHEN COALESCE((SELECT kind FROM actors WHERE id = NEW.requester_human_actor_id), '') <> 'human'
+     OR COALESCE((SELECT kind FROM actors WHERE id = NEW.target_human_actor_id), '') <> 'human'
+   BEGIN
+     SELECT RAISE(ABORT, 'Project Request actors must be Human');
+   END`,
+  `CREATE TRIGGER project_requests_actor_binding_update_v14
+   BEFORE UPDATE OF requester_human_actor_id, target_human_actor_id ON project_requests
+   WHEN COALESCE((SELECT kind FROM actors WHERE id = NEW.requester_human_actor_id), '') <> 'human'
+     OR COALESCE((SELECT kind FROM actors WHERE id = NEW.target_human_actor_id), '') <> 'human'
+   BEGIN
+     SELECT RAISE(ABORT, 'Project Request actors must be Human');
+   END`,
+  `CREATE TRIGGER project_next_actions_actor_binding_insert_v14
+   BEFORE INSERT ON project_next_actions
+   WHEN COALESCE((SELECT kind FROM actors WHERE id = NEW.owner_actor_id), '') <> NEW.owner_kind
+     OR (NEW.verifier_human_actor_id IS NOT NULL AND
+       COALESCE((SELECT kind FROM actors WHERE id = NEW.verifier_human_actor_id), '') <> 'human')
+   BEGIN
+     SELECT RAISE(ABORT, 'Project NextAction actors do not match their authority kinds');
+   END`,
+  `CREATE TRIGGER project_next_actions_actor_binding_update_v14
+   BEFORE UPDATE OF owner_kind, owner_actor_id, verifier_human_actor_id ON project_next_actions
+   WHEN COALESCE((SELECT kind FROM actors WHERE id = NEW.owner_actor_id), '') <> NEW.owner_kind
+     OR (NEW.verifier_human_actor_id IS NOT NULL AND
+       COALESCE((SELECT kind FROM actors WHERE id = NEW.verifier_human_actor_id), '') <> 'human')
+   BEGIN
+     SELECT RAISE(ABORT, 'Project NextAction actors do not match their authority kinds');
+   END`,
+  `CREATE TRIGGER project_obstacles_actor_binding_insert_v14
+   BEFORE INSERT ON project_obstacles
+   WHEN COALESCE((SELECT kind FROM actors WHERE id = NEW.owner_actor_id), '') <> NEW.owner_kind
+   BEGIN
+     SELECT RAISE(ABORT, 'Project Obstacle owner does not match its authority kind');
+   END`,
+  `CREATE TRIGGER project_obstacles_actor_binding_update_v14
+   BEFORE UPDATE OF owner_kind, owner_actor_id ON project_obstacles
+   WHEN COALESCE((SELECT kind FROM actors WHERE id = NEW.owner_actor_id), '') <> NEW.owner_kind
+   BEGIN
+     SELECT RAISE(ABORT, 'Project Obstacle owner does not match its authority kind');
+   END`,
+  `CREATE TRIGGER project_transfer_proposals_binding_insert_v14
+   BEFORE INSERT ON project_transfer_proposals
+   WHEN COALESCE((SELECT kind FROM actors WHERE id = NEW.to_owner_actor_id), '')
+       <> NEW.to_owner_kind
+     OR NOT (
+       (NEW.subject_kind = 'next_action' AND EXISTS (
+         SELECT 1 FROM project_next_actions
+         WHERE id = NEW.subject_id AND room_id = NEW.room_id
+       ))
+       OR (NEW.subject_kind IN ('blocker', 'open_question') AND EXISTS (
+         SELECT 1 FROM project_obstacles
+         WHERE id = NEW.subject_id AND room_id = NEW.room_id AND kind = NEW.subject_kind
+       ))
+     )
+   BEGIN
+     SELECT RAISE(ABORT, 'Project TransferProposal binding is invalid');
+   END`,
+  `CREATE TRIGGER project_transfer_proposals_binding_update_v14
+   BEFORE UPDATE OF room_id, subject_kind, subject_id, to_owner_kind, to_owner_actor_id
+     ON project_transfer_proposals
+   WHEN COALESCE((SELECT kind FROM actors WHERE id = NEW.to_owner_actor_id), '')
+       <> NEW.to_owner_kind
+     OR NOT (
+       (NEW.subject_kind = 'next_action' AND EXISTS (
+         SELECT 1 FROM project_next_actions
+         WHERE id = NEW.subject_id AND room_id = NEW.room_id
+       ))
+       OR (NEW.subject_kind IN ('blocker', 'open_question') AND EXISTS (
+         SELECT 1 FROM project_obstacles
+         WHERE id = NEW.subject_id AND room_id = NEW.room_id AND kind = NEW.subject_kind
+       ))
+     )
+   BEGIN
+     SELECT RAISE(ABORT, 'Project TransferProposal binding is invalid');
+   END`,
   ...ROOM_ACCESS_AUTHORITY_SCHEMA_STATEMENTS,
   ...ROOM_CACHE_INVALIDATION_SCHEMA_STATEMENTS,
   ...OFFLINE_READ_LEASE_SCHEMA_STATEMENTS,
 ] as const;
+
+export const AUTHORITY_V14_STATEMENT_COUNT_FOR_TEST = V14_STATEMENTS.length;
 
 const V2_STATEMENTS = [
   `ALTER TABLE actors
@@ -1950,6 +2375,60 @@ const V14_SCHEMA_CONTRACT = {
     ...V13_SCHEMA_CONTRACT.agent_executions,
     "room_archive_generation",
   ],
+  agent_execution_grants: [
+    ...V13_SCHEMA_CONTRACT.agent_execution_grants,
+    "grant_state", "grant_reason", "grant_revision", "grant_changed_at",
+  ],
+  tool_confirmations: [
+    ...V13_SCHEMA_CONTRACT.tool_confirmations,
+    "confirmation_state", "confirmation_reason", "confirmation_revision",
+    "confirmation_changed_at",
+  ],
+  agent_profiles: [
+    "id", "actor_id", "revision", "status", "capability_ceiling_json",
+    "tool_ceiling_json",
+  ],
+  room_agent_assignments: [
+    "id", "room_id", "profile_id", "agent_actor_id", "revision", "status",
+    "participation", "paused", "capability_subset_json", "tool_subset_json",
+  ],
+  room_assignment_archive_policies: [
+    "room_id", "archive_generation", "policy_version", "assignment_revision",
+    "expansion_blocked", "reduced_at",
+  ],
+  room_business_timer_freeze_batches: [
+    "room_id", "archive_generation", "suspended_at", "suspended_count",
+    "resumed_at", "resumed_count", "descriptor_ids_json",
+  ],
+  room_business_timer_freezes: [
+    "room_id", "archive_generation", "descriptor_id", "timer_key", "source_kind",
+    "source_id", "original_due_at", "remaining_ms", "frozen_at", "state",
+    "resumed_due_at", "resolved_at",
+  ],
+  project_requests: [
+    "id", "room_id", "source_room_id", "source_id", "revision",
+    "requester_human_actor_id", "target_human_actor_id", "status",
+  ],
+  project_next_actions: [
+    "id", "room_id", "source_room_id", "source_id", "revision", "owner_kind",
+    "owner_actor_id", "verifier_human_actor_id", "status",
+  ],
+  project_obstacles: [
+    "id", "room_id", "source_room_id", "source_id", "revision", "kind",
+    "owner_kind", "owner_actor_id", "status",
+  ],
+  project_transfer_proposals: [
+    "id", "room_id", "source_room_id", "source_id", "revision", "subject_kind",
+    "subject_id", "to_owner_kind", "to_owner_actor_id", "status",
+  ],
+  tool_archive_settlements: [
+    "room_id", "archive_generation", "settled_at", "rejected_pending_count",
+    "revoked_grant_count", "fenced_waiting_count", "preserved_dispatched_count",
+  ],
+  tool_archive_settlement_members: [
+    "room_id", "archive_generation", "subject_kind", "subject_id", "disposition",
+    "recorded_at",
+  ],
   room_message_archive_gates: [
     "room_id", "gate_generation", "blocked_at",
   ],
@@ -2601,6 +3080,242 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
           OR execution.current_attempt_seq <> member.attempt_seq
        LIMIT 1`,
       "runtime archive fence members must match Room, generation, and current attempt",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM tool_confirmations
+       WHERE (confirmation_state = 'pending' AND consumed_at IS NOT NULL)
+          OR (confirmation_state = 'confirmed' AND consumed_at IS NULL)
+          OR (confirmation_state IN ('rejected', 'expired') AND consumed_at IS NOT NULL)
+          OR (confirmation_revision = 0 AND confirmation_changed_at IS NOT NULL)
+          OR (confirmation_revision > 0 AND confirmation_changed_at IS NULL)
+       LIMIT 1`,
+      "tool confirmations must keep closed state, consumption, and revision evidence",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM agent_execution_grants
+       WHERE (grant_state = 'active' AND consumed_at IS NOT NULL)
+          OR (grant_state = 'claimed' AND consumed_at IS NULL)
+          OR (grant_state IN ('revoked', 'expired') AND consumed_at IS NOT NULL)
+          OR (grant_revision = 0 AND grant_changed_at IS NOT NULL)
+          OR (grant_revision > 0 AND grant_changed_at IS NULL)
+       LIMIT 1`,
+      "tool grants must keep closed state, consumption, and revision evidence",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM tool_archive_settlements AS settlement
+       JOIN rooms AS room ON room.id = settlement.room_id
+       WHERE settlement.archive_generation > room.archive_generation
+          OR settlement.rejected_pending_count <> (
+            SELECT COUNT(*) FROM tool_archive_settlement_members AS member
+            WHERE member.room_id = settlement.room_id
+              AND member.archive_generation = settlement.archive_generation
+              AND member.disposition = 'rejected_pending'
+          )
+          OR settlement.revoked_grant_count <> (
+            SELECT COUNT(*) FROM tool_archive_settlement_members AS member
+            WHERE member.room_id = settlement.room_id
+              AND member.archive_generation = settlement.archive_generation
+              AND member.disposition = 'revoked_unclaimed'
+          )
+          OR settlement.fenced_waiting_count <> (
+            SELECT COUNT(*) FROM tool_archive_settlement_members AS member
+            WHERE member.room_id = settlement.room_id
+              AND member.archive_generation = settlement.archive_generation
+              AND member.disposition = 'fenced_waiting'
+          )
+          OR settlement.preserved_dispatched_count <> (
+            SELECT COUNT(*) FROM tool_archive_settlement_members AS member
+            WHERE member.room_id = settlement.room_id
+              AND member.archive_generation = settlement.archive_generation
+              AND member.disposition = 'preserved_dispatched'
+          )
+       LIMIT 1`,
+      "tool archive settlement counts must match their durable member ledger",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM tool_archive_settlement_members AS member
+       LEFT JOIN tool_confirmations AS confirmation
+         ON member.subject_kind = 'confirmation'
+        AND confirmation.confirmation_id = member.subject_id
+       LEFT JOIN agent_execution_grants AS grant
+         ON member.subject_kind = 'grant' AND grant.grant_id = member.subject_id
+       LEFT JOIN agent_executions AS execution
+         ON member.subject_kind = 'execution' AND execution.id = member.subject_id
+       LEFT JOIN tool_dispatches AS dispatch
+         ON member.subject_kind = 'dispatch' AND dispatch.dispatch_id = member.subject_id
+       LEFT JOIN agent_executions AS dispatch_execution
+         ON dispatch_execution.id = dispatch.execution_id
+       WHERE (member.subject_kind = 'confirmation' AND (
+                confirmation.confirmation_id IS NULL
+                OR confirmation.room_id <> member.room_id
+                OR member.disposition <> 'rejected_pending'
+              ))
+          OR (member.subject_kind = 'grant' AND (
+                grant.grant_id IS NULL OR grant.room_id <> member.room_id
+                OR member.disposition <> 'revoked_unclaimed'
+              ))
+          OR (member.subject_kind = 'execution' AND (
+                execution.id IS NULL OR execution.room_id <> member.room_id
+                OR member.disposition <> 'fenced_waiting'
+              ))
+          OR (member.subject_kind = 'dispatch' AND (
+                dispatch.dispatch_id IS NULL OR dispatch_execution.room_id <> member.room_id
+                OR member.disposition <> 'preserved_dispatched'
+              ))
+       LIMIT 1`,
+      "tool archive settlement members must match their same-Room authority facts",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM room_business_timer_freeze_batches AS batch
+       JOIN rooms AS room ON room.id = batch.room_id
+       WHERE batch.archive_generation > room.archive_generation
+          OR batch.descriptor_ids_json NOT IN (
+            '[]', '["dao.ball-runtime.business-boundaries.v1"]'
+          )
+          OR batch.suspended_count <> (
+            SELECT COUNT(*) FROM room_business_timer_freezes AS timer
+            WHERE timer.room_id = batch.room_id
+              AND timer.archive_generation = batch.archive_generation
+          )
+          OR (batch.resumed_at IS NULL AND EXISTS (
+            SELECT 1 FROM room_business_timer_freezes AS timer
+            WHERE timer.room_id = batch.room_id
+              AND timer.archive_generation = batch.archive_generation
+              AND timer.state <> 'frozen'
+          ))
+          OR (batch.resumed_at IS NOT NULL AND (
+            batch.resumed_count <> (
+              SELECT COUNT(*) FROM room_business_timer_freezes AS timer
+              WHERE timer.room_id = batch.room_id
+                AND timer.archive_generation = batch.archive_generation
+                AND timer.state = 'resumed'
+            )
+            OR EXISTS (
+              SELECT 1 FROM room_business_timer_freezes AS timer
+              WHERE timer.room_id = batch.room_id
+                AND timer.archive_generation = batch.archive_generation
+                AND timer.state = 'frozen'
+            )
+          ))
+       LIMIT 1`,
+      "business timer batches must match their durable freeze ledger",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM room_business_timer_freezes AS timer
+       WHERE timer.descriptor_id <> 'dao.ball-runtime.business-boundaries.v1'
+          OR timer.timer_key NOT LIKE 'dao.ball-runtime.business-boundaries.v1:%'
+          OR NOT EXISTS (
+            SELECT 1 FROM room_business_timer_freeze_batches AS batch
+            WHERE batch.room_id = timer.room_id
+              AND batch.archive_generation = timer.archive_generation
+              AND batch.suspended_at = timer.frozen_at
+          )
+       LIMIT 1`,
+      "business timer freezes must match the registered descriptor and archive batch",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM room_agent_assignments AS assignment
+       JOIN agent_profiles AS profile ON profile.id = assignment.profile_id
+       JOIN actors AS actor ON actor.id = assignment.agent_actor_id
+       WHERE actor.kind <> 'agent'
+          OR profile.actor_id <> assignment.agent_actor_id
+          OR EXISTS (
+            SELECT value FROM json_each(assignment.capability_subset_json)
+            EXCEPT SELECT value FROM json_each(profile.capability_ceiling_json)
+          )
+          OR EXISTS (
+            SELECT value FROM json_each(assignment.tool_subset_json)
+            EXCEPT SELECT value FROM json_each(profile.tool_ceiling_json)
+          )
+       LIMIT 1`,
+      "Room Assignments must remain within their Agent Profile authority ceiling",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM (
+         SELECT capability_ceiling_json AS authority_json FROM agent_profiles
+         UNION ALL SELECT tool_ceiling_json FROM agent_profiles
+         UNION ALL SELECT capability_subset_json FROM room_agent_assignments
+         UNION ALL SELECT tool_subset_json FROM room_agent_assignments
+       ) AS authority_set,
+       json_each(authority_set.authority_json) AS entry
+       WHERE typeof(entry.value) <> 'text'
+          OR length(entry.value) = 0
+          OR EXISTS (
+            SELECT 1 FROM json_each(authority_set.authority_json) AS successor
+            WHERE CAST(successor.key AS INTEGER) = CAST(entry.key AS INTEGER) + 1
+              AND entry.value >= successor.value
+          )
+       LIMIT 1`,
+      "Agent Profile and Room Assignment authority sets must be canonical",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM room_assignment_archive_policies AS policy
+       JOIN rooms AS room ON room.id = policy.room_id
+       WHERE policy.archive_generation > room.archive_generation
+       LIMIT 1`,
+      "Room Assignment archive policies must not outrun lifecycle generations",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM project_requests AS request
+       JOIN actors AS requester ON requester.id = request.requester_human_actor_id
+       JOIN actors AS target ON target.id = request.target_human_actor_id
+       WHERE requester.kind <> 'human' OR target.kind <> 'human'
+       LIMIT 1`,
+      "Project Requests must remain bound to Human actors",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM project_next_actions AS action
+       JOIN actors AS owner ON owner.id = action.owner_actor_id
+       LEFT JOIN actors AS verifier ON verifier.id = action.verifier_human_actor_id
+       WHERE owner.kind <> action.owner_kind
+          OR (action.verifier_human_actor_id IS NOT NULL AND verifier.kind <> 'human')
+       LIMIT 1`,
+      "Project NextActions must remain bound to actor-kind authority",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM project_obstacles AS obstacle
+       JOIN actors AS owner ON owner.id = obstacle.owner_actor_id
+       WHERE owner.kind <> obstacle.owner_kind
+       LIMIT 1`,
+      "Project Obstacles must remain bound to actor-kind authority",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM project_transfer_proposals AS proposal
+       JOIN actors AS target ON target.id = proposal.to_owner_actor_id
+       WHERE target.kind <> proposal.to_owner_kind
+          OR NOT (
+            (proposal.subject_kind = 'next_action' AND EXISTS (
+              SELECT 1 FROM project_next_actions AS action
+              WHERE action.id = proposal.subject_id AND action.room_id = proposal.room_id
+            ))
+            OR (proposal.subject_kind IN ('blocker', 'open_question') AND EXISTS (
+              SELECT 1 FROM project_obstacles AS obstacle
+              WHERE obstacle.id = proposal.subject_id
+                AND obstacle.room_id = proposal.room_id
+                AND obstacle.kind = proposal.subject_kind
+            ))
+          )
+       LIMIT 1`,
+      "Project TransferProposals must remain same-Room and actor-kind bound",
     );
     requireNoRows(
       database,

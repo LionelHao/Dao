@@ -16,6 +16,7 @@ import { createSnapshotWorkerClient } from "./persistence/snapshot-worker-client
 import { createSqliteAuthoritativeStore } from "./persistence/sqlite-authoritative-store.js";
 import {
   createWorkerDatabaseClient,
+  createWorkerRoomCacheInvalidationIntentAuthority,
   createWorkerDatabaseClientWithTransactionFaultForTest,
   type WorkerDatabaseClient,
 } from "./persistence/worker-database-client.js";
@@ -37,6 +38,23 @@ import {
   createHumanPreemptionRuntime,
   type HumanPreemptionRuntime,
 } from "./human-preemption/human-preemption-runtime.js";
+import {
+  AUTHORITY_PARTICIPANT_FEATURES,
+  type FeatureEnablementManifest,
+} from "./room-governance/private-participant-contracts.js";
+import { assertSharedAuthorityParticipantComposition } from "./room-governance/private-participant-registry.js";
+import { createDepartureResponsibilityRegistration } from "./project-loop/departure-responsibility-port.js";
+import { pendingConfirmationDepartureContributorRegistration } from "./tool-safety/pending-confirmation-departure-contributor.js";
+import { archivedMessageGateRegistration } from "./message-authority/archived-message-gate.js";
+import { createBusinessTimerSuspensionProductionRegistration } from "./business-timers/business-timer-suspension-participant.js";
+import { archiveToolSafetyParticipantRegistration } from "./tool-safety/archive-tool-safety-participant.js";
+import { runtimeArchiveFenceParticipantRegistration } from "./agent-runtime/runtime-archive-fence-participant.js";
+import { assignmentSecurityReductionParticipantRegistration } from "./room-assignment/assignment-security-reduction-participant.js";
+import { lifecycleRepairDescriptorRegistration } from "./room-governance/lifecycle-repair-descriptor.js";
+import { roomCacheInvalidationRegistration } from "./access/room-cache-invalidation-port.js";
+import { createOfflineLeaseInvalidationRegistration } from "./access/offline-lease-invalidation-port.js";
+import type { BallDeadlinePolicy } from "./ball-runtime/ball-authority-protocol.js";
+import { RoomCacheInvalidationPostCommitDispatcher } from "./access/room-cache-invalidation-port.js";
 
 export const AUTHORITATIVE_SERVER_DEFAULT_HOST = "127.0.0.1";
 export const AUTHORITATIVE_SERVER_DEFAULT_PORT = 8_787;
@@ -61,6 +79,9 @@ export interface StartAuthoritativeServerOptions {
   readonly actors: readonly Actor[];
   readonly identities: IdentityAdapter;
   readonly invitationSecretKey: Uint8Array;
+  readonly sharedAuthority: {
+    readonly maxOfflineReadLeaseMs: number;
+  };
   readonly agentRuntime?: {
     readonly model?: string;
     readonly endpoint?: string;
@@ -75,6 +96,40 @@ export interface StartAuthoritativeServerOptions {
     readonly lightTaskDeadlineMs?: number;
     readonly scanIntervalMs?: number;
   };
+}
+
+export function createProductionSharedAuthorityParticipantComposition(options: Readonly<{
+  maxOfflineReadLeaseMs: number;
+  ballPolicy: BallDeadlinePolicy;
+}>): Readonly<{
+  manifest: FeatureEnablementManifest;
+  registrations: readonly unknown[];
+}> {
+  const pendingConfirmation = pendingConfirmationDepartureContributorRegistration;
+  const manifest = Object.freeze(Object.fromEntries(
+    AUTHORITY_PARTICIPANT_FEATURES.map((feature) => [feature, true]),
+  )) as FeatureEnablementManifest;
+  const registrations = Object.freeze([
+    createDepartureResponsibilityRegistration({
+      pendingConfirmation: {
+        enabled: true,
+        registrations: [pendingConfirmation],
+      },
+    }),
+    pendingConfirmation,
+    archivedMessageGateRegistration,
+    createBusinessTimerSuspensionProductionRegistration(options.ballPolicy),
+    archiveToolSafetyParticipantRegistration,
+    runtimeArchiveFenceParticipantRegistration,
+    assignmentSecurityReductionParticipantRegistration,
+    lifecycleRepairDescriptorRegistration,
+    roomCacheInvalidationRegistration,
+    createOfflineLeaseInvalidationRegistration({
+      maxOfflineReadLeaseMs: options.maxOfflineReadLeaseMs,
+    }),
+  ]);
+  assertSharedAuthorityParticipantComposition(manifest, registrations);
+  return Object.freeze({ manifest, registrations });
 }
 
 interface AuthoritativeServerTestOptions {
@@ -116,6 +171,15 @@ async function start(
   options: StartAuthoritativeServerOptions,
   testOptions: AuthoritativeServerTestOptions,
 ): Promise<AuthoritativeServer> {
+  const ballConfiguration = options.ballRuntime ?? {};
+  const ballPolicy = Object.freeze({
+    openItemDeadlineMs: ballConfiguration.openItemDeadlineMs ?? 24 * 60 * 60 * 1_000,
+    lightTaskDeadlineMs: ballConfiguration.lightTaskDeadlineMs ?? 24 * 60 * 60 * 1_000,
+  });
+  createProductionSharedAuthorityParticipantComposition({
+    maxOfflineReadLeaseMs: options.sharedAuthority.maxOfflineReadLeaseMs,
+    ballPolicy,
+  });
   const actorIds = new Set<string>();
   for (const actor of options.actors) {
     if (actorIds.has(actor.id)) {
@@ -134,11 +198,24 @@ async function start(
   let routeRuntime: RouteRuntimeService | undefined;
   let ballRuntime: BallRuntimeService | undefined;
   let humanPreemptionRuntime: HumanPreemptionRuntime | undefined;
+  let stopCacheInvalidationRecovery: (() => void) | undefined;
   try {
     worker = transactionFault === undefined
-      ? await createWorkerDatabaseClient({ databasePath: options.databasePath })
+      ? await createWorkerDatabaseClient({
+          databasePath: options.databasePath,
+          sharedAuthorityRecovery: {
+            ballPolicy,
+            maxOfflineReadLeaseMs: options.sharedAuthority.maxOfflineReadLeaseMs,
+          },
+        })
       : await createWorkerDatabaseClientWithTransactionFaultForTest(
-          { databasePath: options.databasePath },
+          {
+            databasePath: options.databasePath,
+            sharedAuthorityRecovery: {
+              ballPolicy,
+              maxOfflineReadLeaseMs: options.sharedAuthority.maxOfflineReadLeaseMs,
+            },
+          },
           transactionFault,
         );
     const authority = createSqliteAuthoritativeStore(worker, {
@@ -183,6 +260,27 @@ async function start(
           }),
     });
     snapshots = snapshotClient;
+    const cacheInvalidationDispatcher = new RoomCacheInvalidationPostCommitDispatcher({
+      authority: createWorkerRoomCacheInvalidationIntentAuthority(worker),
+      purge: snapshotClient,
+      batchLimit: 64,
+    });
+    let cacheInvalidationDispatchRunning = false;
+    const dispatchCacheInvalidations = async (): Promise<void> => {
+      if (cacheInvalidationDispatchRunning) return;
+      cacheInvalidationDispatchRunning = true;
+      try {
+        await cacheInvalidationDispatcher.dispatchReadyBatch();
+      } finally {
+        cacheInvalidationDispatchRunning = false;
+      }
+    };
+    await dispatchCacheInvalidations();
+    const cacheInvalidationTimer = setInterval(() => {
+      void dispatchCacheInvalidations().catch(() => undefined);
+    }, 1_000);
+    cacheInvalidationTimer.unref();
+    stopCacheInvalidationRecovery = () => clearInterval(cacheInvalidationTimer);
     const materializedSnapshots = {
       async beginRoomRepair(...args: Parameters<typeof snapshotClient.beginRoomRepair>) {
         const result = await snapshotClient.beginRoomRepair(...args);
@@ -364,14 +462,10 @@ async function start(
       },
     });
     await humanPreemptionRuntime.recover();
-    const ballConfiguration = options.ballRuntime ?? {};
     ballRuntime = createBallRuntimeService({
       worker,
       blueprint: testOptions.blueprintBallProjectionPort ?? createEmptyBlueprintBallProjectionPort(),
-      policy: {
-        openItemDeadlineMs: ballConfiguration.openItemDeadlineMs ?? 24 * 60 * 60 * 1_000,
-        lightTaskDeadlineMs: ballConfiguration.lightTaskDeadlineMs ?? 24 * 60 * 60 * 1_000,
-      },
+      policy: ballPolicy,
       ...(ballConfiguration.scanIntervalMs === undefined
         ? {} : { scanIntervalMs: ballConfiguration.scanIntervalMs }),
     });
@@ -410,6 +504,7 @@ async function start(
       governance: authority,
     });
   } catch (error: unknown) {
+    stopCacheInvalidationRecovery?.();
     await transport?.close().catch(() => undefined);
     await routeRuntime?.close().catch(() => undefined);
     await ballRuntime?.close().catch(() => undefined);
@@ -424,6 +519,7 @@ async function start(
     url: transport.url,
     close() {
       closePromise ??= (async () => {
+        stopCacheInvalidationRecovery?.();
         const failures: unknown[] = [];
         for (const [stage, close] of [
           ["transport", () => transport.close()],

@@ -61,9 +61,20 @@ import {
 } from "../fallback-repair-coordinator.js";
 import { MAX_ACTIVE_SESSION_FAMILIES } from "./contracts.js";
 import { recoverRuntimeArchiveFenceInTransaction } from "../agent-runtime/runtime-archive-fence-participant.js";
+import type { BallDeadlinePolicy } from "../ball-runtime/ball-authority-protocol.js";
+import { archivedMessageGateRegistration } from "../message-authority/archived-message-gate.js";
+import { createBusinessTimerSuspensionProductionRegistration } from "../business-timers/business-timer-suspension-participant.js";
+import { archiveToolSafetyParticipantRegistration } from "../tool-safety/archive-tool-safety-participant.js";
+import { assignmentSecurityReductionParticipantRegistration } from "../room-assignment/assignment-security-reduction-participant.js";
+import { roomCacheInvalidationRegistration } from "../access/room-cache-invalidation-port.js";
+import { createOfflineLeaseInvalidationRegistration } from "../access/offline-lease-invalidation-port.js";
 
 interface AuthorityWorkerData {
   readonly databasePath: string;
+  readonly sharedAuthorityRecovery?: {
+    readonly ballPolicy: BallDeadlinePolicy;
+    readonly maxOfflineReadLeaseMs: number;
+  };
   readonly recovery?: LegacyImportRecovery;
   readonly rollbackFailureForTest?: true;
   readonly transactionFaultPoint?: "after-domain-write" | "before-commit";
@@ -78,12 +89,33 @@ function isAuthorityWorkerData(value: unknown): value is AuthorityWorkerData {
   if (typeof record.databasePath !== "string" || record.databasePath.length === 0 ||
       keys.some((key) =>
         key !== "databasePath" && key !== "recovery" && key !== "rollbackFailureForTest" &&
-        key !== "transactionFaultPoint") ||
+        key !== "transactionFaultPoint" && key !== "sharedAuthorityRecovery") ||
       (record.rollbackFailureForTest !== undefined && record.rollbackFailureForTest !== true) ||
       (record.transactionFaultPoint !== undefined &&
         record.transactionFaultPoint !== "after-domain-write" &&
         record.transactionFaultPoint !== "before-commit")) {
     return false;
+  }
+  if (record.sharedAuthorityRecovery !== undefined) {
+    const authority = record.sharedAuthorityRecovery;
+    if (typeof authority !== "object" || authority === null || Array.isArray(authority)) {
+      return false;
+    }
+    const policy = (authority as Record<string, unknown>).ballPolicy;
+    const maxOfflineReadLeaseMs =
+      (authority as Record<string, unknown>).maxOfflineReadLeaseMs;
+    if (Object.keys(authority).sort().join("\u0000") !==
+        ["ballPolicy", "maxOfflineReadLeaseMs"].sort().join("\u0000") ||
+        typeof policy !== "object" || policy === null || Array.isArray(policy) ||
+        Object.keys(policy).sort().join("\u0000") !==
+          ["lightTaskDeadlineMs", "openItemDeadlineMs"].sort().join("\u0000") ||
+        !Number.isSafeInteger((policy as Record<string, unknown>).openItemDeadlineMs) ||
+        Number((policy as Record<string, unknown>).openItemDeadlineMs) <= 0 ||
+        !Number.isSafeInteger((policy as Record<string, unknown>).lightTaskDeadlineMs) ||
+        Number((policy as Record<string, unknown>).lightTaskDeadlineMs) <= 0 ||
+        !Number.isSafeInteger(maxOfflineReadLeaseMs) || Number(maxOfflineReadLeaseMs) <= 0) {
+      return false;
+    }
   }
   if (record.recovery === undefined) {
     return true;
@@ -154,12 +186,24 @@ function respondWithError(
   });
 }
 
-function recoverArchivedRuntimeFences(openedDatabase: DatabaseSync): void {
+function recoverArchivedAuthorityParticipants(openedDatabase: DatabaseSync): void {
   const recoveryTime = new Date().toISOString();
+  const recoveryPolicy = workerData.sharedAuthorityRecovery;
+  const businessTimers = createBusinessTimerSuspensionProductionRegistration(
+    recoveryPolicy?.ballPolicy ?? {
+      openItemDeadlineMs: 24 * 60 * 60 * 1_000,
+      lightTaskDeadlineMs: 24 * 60 * 60 * 1_000,
+    },
+  );
+  const offlineLeases = recoveryPolicy === undefined
+    ? undefined
+    : createOfflineLeaseInvalidationRegistration({
+        maxOfflineReadLeaseMs: recoveryPolicy.maxOfflineReadLeaseMs,
+      });
   let afterRoomId = "";
   while (true) {
     const rooms = openedDatabase.prepare(
-      `SELECT id
+      `SELECT id, archive_generation AS archiveGeneration, archived_at AS archivedAt
        FROM rooms
        WHERE status = 'archived' AND id > ?
        ORDER BY id
@@ -167,17 +211,66 @@ function recoverArchivedRuntimeFences(openedDatabase: DatabaseSync): void {
     ).all(afterRoomId);
     if (rooms.length === 0) return;
     for (const room of rooms) {
-      if (typeof room.id !== "string" || room.id.length === 0) {
-        throw new Error("Archived runtime recovery room was corrupt");
+      if (typeof room.id !== "string" || room.id.length === 0 ||
+          typeof room.archiveGeneration !== "number" || room.archiveGeneration <= 0 ||
+          typeof room.archivedAt !== "string" ||
+          !Number.isFinite(Date.parse(room.archivedAt))) {
+        throw new Error("Archived participant recovery room was corrupt");
       }
       runAuthorityParticipantImmediateTransaction(
         openedDatabase,
         room.id,
-        `runtime-archive-recovery:${room.id}`,
-        (transaction) => recoverRuntimeArchiveFenceInTransaction(transaction, {
-          roomId: room.id as string,
-          now: recoveryTime,
-        }),
+        `shared-authority-archive-recovery:${room.id}:${String(room.archiveGeneration)}`,
+        (transaction) => {
+          const roomId = room.id as string;
+          const archiveGeneration = room.archiveGeneration as number;
+          const archivedAt = room.archivedAt as string;
+          const results = [
+            archivedMessageGateRegistration.participant!.blockForArchive(transaction, {
+              roomId,
+              archiveGeneration,
+            }),
+            businessTimers.participant!.suspendForArchive(transaction, {
+              roomId,
+              archiveGeneration,
+              archivedAt,
+            }),
+            archiveToolSafetyParticipantRegistration.participant!.settleUndispatched(
+              transaction,
+              { roomId, archiveGeneration, now: archivedAt },
+            ),
+          ];
+          if (results.some((result) => !result.ok)) {
+            throw new Error("Archived participant recovery failed closed");
+          }
+          recoverRuntimeArchiveFenceInTransaction(transaction, {
+            roomId,
+            now: recoveryTime,
+          });
+          const assignment = assignmentSecurityReductionParticipantRegistration
+            .participant!.reduceForArchive(transaction, {
+              roomId,
+              archiveGeneration,
+              now: archivedAt,
+            });
+          const cache = roomCacheInvalidationRegistration.participant!
+            .invalidateRoomCacheInTransaction(transaction, {
+              roomId,
+              lifecycleGeneration: archiveGeneration,
+              reason: "room_archived",
+            });
+          const lease = offlineLeases?.participant!.invalidateOfflineLeasesInTransaction(
+            transaction,
+            {
+              roomId,
+              lifecycleGeneration: archiveGeneration,
+              reason: "room_archived",
+            },
+          );
+          if (!assignment.ok || !cache.ok || lease?.ok === false) {
+            throw new Error("Archived participant recovery failed closed");
+          }
+        },
       );
     }
     const last = rooms.at(-1)?.id;
@@ -195,7 +288,7 @@ function openAuthorityDatabase(): DatabaseSync {
   const openedDatabase = new DatabaseSync(workerData.databasePath);
   try {
     migrateAuthorityDatabase(openedDatabase);
-    recoverArchivedRuntimeFences(openedDatabase);
+    recoverArchivedAuthorityParticipants(openedDatabase);
     return openedDatabase;
   } catch (error: unknown) {
     try {
