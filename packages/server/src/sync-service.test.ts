@@ -649,7 +649,7 @@ describe("permission-aware retained room sync", () => {
     await fixture.client.close();
   });
 
-  it("rechecks session and active human membership before cursor semantics", async () => {
+  it("rechecks current human membership while allowing archived read-only sync", async () => {
     const fixture = await createFixture({ eventCount: 2 });
     const [allowed, , , removed] = fixture.contexts;
     if (allowed === undefined || removed === undefined) throw new Error("missing fixture contexts");
@@ -664,7 +664,7 @@ describe("permission-aware retained room sync", () => {
     await expect(fixture.sync.syncRoom(
       allowed,
       request(fixture.roomId, "archived", 2),
-    )).rejects.toMatchObject({ status: 403, code: "room_forbidden" });
+    )).resolves.toMatchObject({ mode: "delta" });
     await fixture.client.close();
   });
 
@@ -826,7 +826,7 @@ describe("permission-aware retained room sync", () => {
       ).get(),
     }).toEqual(before);
     database.close();
-    await expect(fixture.client.inspectSchema()).resolves.toEqual({ version: 14 });
+    await expect(fixture.client.inspectSchema()).resolves.toEqual({ version: 15 });
     const context = fixture.contexts[0];
     if (context === undefined) throw new Error("missing fixture context");
     await expect(fixture.sync.syncRoom(

@@ -1039,7 +1039,7 @@ describe("SQLite authoritative sessions", () => {
       accountId: "account-li",
       actorId: "human-li",
     });
-    await expect(client.inspectSchema()).resolves.toEqual({ version: 14 });
+    await expect(client.inspectSchema()).resolves.toEqual({ version: 15 });
     await client.close();
   });
 
@@ -1723,9 +1723,9 @@ describe("SQLite authoritative sessions", () => {
     archivedDatabase.close();
     const archivedClient = await createWorkerDatabaseClient({ databasePath });
     const archivedAuthority = createSqliteAuthoritativeStore(archivedClient, { clock: () => 2_000 });
-    await expect(archivedAuthority.canAccessRoom(session, fixture.roomId)).resolves.toBe(false);
+    await expect(archivedAuthority.canAccessRoom(session, fixture.roomId)).resolves.toBe(true);
     await expect(archivedAuthority.readRoomAudit(session, fixture.roomId))
-      .rejects.toMatchObject({ status: 403, code: "room_forbidden" });
+      .resolves.toHaveLength(1);
     await archivedClient.close();
 
     const removedDatabase = new DatabaseSync(databasePath);

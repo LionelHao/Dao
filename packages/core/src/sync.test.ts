@@ -9,6 +9,64 @@ import {
 } from "./sync.js";
 
 describe("pure synchronization contracts", () => {
+  it("keeps archive, reopen, and security-reduction lifecycle events distinct and closed", () => {
+    const archivedGovernance = {
+      roomId: "room-1", projectId: "room-1", lifecycle: "archived",
+      governanceRevision: 4, ownerActorId: "human-1", archiveGeneration: 1,
+      archivedAt: "2026-08-19T00:01:00.000Z",
+    } as const;
+    const activeGovernance = {
+      roomId: "room-1", projectId: "room-1", lifecycle: "active",
+      governanceRevision: 5, ownerActorId: "human-1", archiveGeneration: 1,
+    } as const;
+    const eventBase = {
+      eventId: "event-lifecycle", streamKind: "room", streamId: "room-1", streamSeq: 1,
+      roomId: "room-1", actorId: "human-1", occurredAt: "2026-08-19T00:01:00.000Z",
+    } as const;
+    const archived = {
+      ...eventBase,
+      type: "room.archived",
+      payload: { governance: archivedGovernance, archiveGeneration: 1, frozenTimerCount: 2 },
+    } as const;
+    const reopened = {
+      ...eventBase,
+      eventId: "event-reopened",
+      type: "room.reopened",
+      payload: { governance: activeGovernance, archiveGeneration: 1, resumedTimerCount: 1 },
+    } as const;
+    const reduced = {
+      ...eventBase,
+      eventId: "event-reduced",
+      type: "room.security.reduced",
+      payload: { governance: archivedGovernance, archiveGeneration: 1, assignmentRevision: 3 },
+    } as const;
+    const result = (event: unknown) => ({
+      type: "room.sync.result", requestId: "request-lifecycle", mode: "delta",
+      events: [event], nextCursor: { version: 1, roomId: "room-1", afterSeq: 1 },
+      watermark: 1, hasMore: false,
+    });
+
+    expect(isRoomSyncResult(result(archived))).toBe(true);
+    expect(isRoomSyncResult(result(reopened))).toBe(true);
+    expect(isRoomSyncResult(result(reduced))).toBe(true);
+    expect(isRoomSyncResult(result({
+      ...archived,
+      payload: { room: { id: "room-1" } },
+    }))).toBe(false);
+    expect(isRoomSyncResult(result({
+      ...reopened,
+      payload: { ...reopened.payload, governance: archivedGovernance },
+    }))).toBe(false);
+    expect(isRoomSyncResult(result({
+      ...reduced,
+      payload: { ...reduced.payload, rawGrantToken: "secret" },
+    }))).toBe(false);
+    expect(isRoomSyncResult(result({
+      ...archived,
+      payload: { ...archived.payload, archiveGeneration: 2 },
+    }))).toBe(false);
+  });
+
   it("keeps governance delta and repair projections closed and room-bound", () => {
     const governance = {
       roomId: "room-1", projectId: "room-1", lifecycle: "active",

@@ -7,7 +7,7 @@ import {
 } from "../access/room-cache-invalidation-port.js";
 import { OFFLINE_READ_LEASE_SCHEMA_STATEMENTS } from "../access/offline-lease-invalidation-port.js";
 
-export const AUTHORITY_SCHEMA_VERSION = 14 as const;
+export const AUTHORITY_SCHEMA_VERSION = 15 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -47,6 +47,8 @@ const V12_MIGRATION_CHECKSUM =
   "66276cc21f02f19f5e60758039acd43030ba8a9666b37c0fef65ad30852929fa";
 const V13_MIGRATION_CHECKSUM =
   "0d008e577b5514d5fd51fa65c9c31ef51e32e55e09483c8a2e3a707d6ca42e3e";
+const V15_MIGRATION_CHECKSUM =
+  "65a371b2faf68d906c8241195f3dff0d4937e8acfde2d46bb7961c748d9a15a8";
 const SCHEMA_FINGERPRINTS = {
   1: "03f2bbba4aa7082ec01819824726ce1bd9b4bd14cebea71afc93c6821dbf405c",
   2: "01c37d92ec2f303613a7bb8b592ca846fbea7c829b3c81fe4521699db949dfcc",
@@ -62,6 +64,7 @@ const SCHEMA_FINGERPRINTS = {
   12: "7232d27114e9acf32dcfbc2d59f3c3128eed10955de3cc2703ddeedf92892741",
   13: "037df6a2818f2a90b7394240a4cf71d77949faf31df6534c5546c9ed6b7e7191",
   14: "b4f1034ce034203fd14f5bc32391cb8855f7d6eed64c0b01f75d41e331a8b5c5",
+  15: "ab8750a11a2c2eef071b395a291505b5879854f8748fd12bf852cf8ba6a0b366",
 } as const;
 
 const V1_STATEMENTS = [
@@ -1646,7 +1649,109 @@ const V14_STATEMENTS = [
   ...OFFLINE_READ_LEASE_SCHEMA_STATEMENTS,
 ] as const;
 
+const V15_STATEMENTS = [
+  `CREATE TABLE room_audit_v15 (
+    id TEXT PRIMARY KEY,
+    type TEXT NOT NULL CHECK (type IN (
+      'room.created', 'room.renamed', 'room.archived', 'room.reopened',
+      'room.human.invited', 'room.invitation.accepted', 'room.invitation.rejected',
+      'room.agent.configured', 'room.member.left', 'room.member.removed',
+      'room.member.role.changed', 'room.ownership.transferred'
+    )),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    actor_id TEXT NOT NULL REFERENCES actors(id),
+    result TEXT NOT NULL CHECK (result IN (
+      'created', 'renamed', 'archived', 'reopened', 'pending', 'accepted',
+      'rejected', 'configured', 'left', 'removed', 'role-changed',
+      'ownership-transferred'
+    )),
+    timestamp TEXT NOT NULL,
+    details_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(details_json))
+  ) STRICT`,
+  `INSERT INTO room_audit_v15
+   SELECT id, type, room_id, actor_id, result, timestamp, details_json FROM room_audit`,
+  `DROP TABLE room_audit`,
+  `ALTER TABLE room_audit_v15 RENAME TO room_audit`,
+  `CREATE TRIGGER room_audit_v15_immutable_update
+   BEFORE UPDATE ON room_audit BEGIN SELECT RAISE(ABORT, 'room audit is immutable'); END`,
+  `CREATE TRIGGER room_audit_v15_immutable_delete
+   BEFORE DELETE ON room_audit BEGIN SELECT RAISE(ABORT, 'room audit is immutable'); END`,
+  `CREATE TABLE room_cache_invalidation_intents_v15 (
+    id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    lifecycle_generation INTEGER NOT NULL CHECK (lifecycle_generation >= 0),
+    access_revision INTEGER NOT NULL CHECK (access_revision >= 0),
+    reason TEXT NOT NULL CHECK (reason IN (
+      'room_archived', 'member_removed', 'access_revoked'
+    )),
+    status TEXT NOT NULL DEFAULT 'pending'
+      CHECK (status IN ('pending', 'completed', 'dead_letter')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    available_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TEXT,
+    last_error_code TEXT CHECK (
+      last_error_code IS NULL OR last_error_code IN ('purge_failed', 'authority_unavailable')
+    ),
+    target_actor_id TEXT REFERENCES actors(id),
+    CHECK (
+      (reason = 'room_archived' AND target_actor_id IS NULL) OR
+      (reason IN ('member_removed', 'access_revoked') AND target_actor_id IS NOT NULL)
+    )
+  ) STRICT`,
+  `INSERT INTO room_cache_invalidation_intents_v15 (
+     id, room_id, lifecycle_generation, access_revision, reason,
+     target_actor_id, status, attempts, available_at, created_at,
+     completed_at, last_error_code
+   )
+   SELECT id, room_id, lifecycle_generation, access_revision, reason,
+          NULL, status, attempts, available_at, created_at,
+          completed_at, last_error_code
+   FROM room_cache_invalidation_intents`,
+  `DROP TABLE room_cache_invalidation_intents`,
+  `ALTER TABLE room_cache_invalidation_intents_v15
+   RENAME TO room_cache_invalidation_intents`,
+  `CREATE UNIQUE INDEX room_cache_invalidation_scope_v15
+   ON room_cache_invalidation_intents(
+     room_id, lifecycle_generation, reason, COALESCE(target_actor_id, '')
+   )`,
+  `CREATE INDEX room_cache_invalidation_ready
+   ON room_cache_invalidation_intents(status, available_at, created_at, id)`,
+  `CREATE TABLE offline_read_lease_invalidations_v15 (
+    id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    lifecycle_generation INTEGER NOT NULL CHECK (lifecycle_generation >= 0),
+    access_revision INTEGER NOT NULL CHECK (access_revision >= 0),
+    lease_generation INTEGER NOT NULL CHECK (lease_generation >= 0),
+    revoked_lease_count INTEGER NOT NULL CHECK (revoked_lease_count >= 0),
+    reason TEXT NOT NULL CHECK (reason IN (
+      'room_archived', 'member_removed', 'access_revoked'
+    )),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    target_actor_id TEXT REFERENCES actors(id),
+    CHECK (
+      (reason = 'room_archived' AND target_actor_id IS NULL) OR
+      (reason IN ('member_removed', 'access_revoked') AND target_actor_id IS NOT NULL)
+    )
+  ) STRICT`,
+  `INSERT INTO offline_read_lease_invalidations_v15 (
+     id, room_id, lifecycle_generation, access_revision, lease_generation,
+     revoked_lease_count, reason, target_actor_id, created_at
+   )
+   SELECT id, room_id, lifecycle_generation, access_revision, lease_generation,
+          revoked_lease_count, reason, NULL, created_at
+   FROM offline_read_lease_invalidations`,
+  `DROP TABLE offline_read_lease_invalidations`,
+  `ALTER TABLE offline_read_lease_invalidations_v15
+   RENAME TO offline_read_lease_invalidations`,
+  `CREATE UNIQUE INDEX offline_read_lease_invalidation_scope_v15
+   ON offline_read_lease_invalidations(
+     room_id, lifecycle_generation, reason, COALESCE(target_actor_id, '')
+   )`,
+] as const;
+
 export const AUTHORITY_V14_STATEMENT_COUNT_FOR_TEST = V14_STATEMENTS.length;
+export const AUTHORITY_V15_STATEMENT_COUNT_FOR_TEST = V15_STATEMENTS.length;
 
 const V2_STATEMENTS = [
   `ALTER TABLE actors
@@ -2048,6 +2153,12 @@ const MIGRATIONS = [
     V13_MIGRATION_CHECKSUM,
   ),
   defineMigration(14, "shared-authority-production-providers", V14_STATEMENTS),
+  defineMigration(
+    15,
+    "truthful-room-lifecycle-audit-vocabulary",
+    V15_STATEMENTS,
+    V15_MIGRATION_CHECKSUM,
+  ),
 ] as const satisfies readonly Migration[];
 
 const V1_SCHEMA_CONTRACT = {
@@ -2461,6 +2572,18 @@ const V14_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V15_SCHEMA_CONTRACT = {
+  ...V14_SCHEMA_CONTRACT,
+  room_cache_invalidation_intents: [
+    ...V14_SCHEMA_CONTRACT.room_cache_invalidation_intents,
+    "target_actor_id",
+  ],
+  offline_read_lease_invalidations: [
+    ...V14_SCHEMA_CONTRACT.offline_read_lease_invalidations,
+    "target_actor_id",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
@@ -2476,6 +2599,7 @@ const SCHEMA_CONTRACTS = {
   12: V12_SCHEMA_CONTRACT,
   13: V13_SCHEMA_CONTRACT,
   14: V14_SCHEMA_CONTRACT,
+  15: V15_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -3581,6 +3705,12 @@ export function migrateAuthorityDatabaseToPreviousVersionForTest(
   database: DatabaseSync,
 ): void {
   migrateAuthorityDatabaseToVersion(database, AUTHORITY_SCHEMA_VERSION - 1);
+}
+
+export function migrateAuthorityDatabaseToVersion13ForTest(
+  database: DatabaseSync,
+): void {
+  migrateAuthorityDatabaseToVersion(database, 13);
 }
 
 export function migrateAuthorityDatabaseToVersion12ForTest(

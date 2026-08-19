@@ -79,6 +79,12 @@ const ROLE_CHANGE_AUDIT_FIELDS = new Set([
   ...TARGET_AUDIT_FIELDS,
   "role",
 ]);
+const OWNERSHIP_TRANSFER_AUDIT_FIELDS = new Set([
+  ...TARGET_AUDIT_FIELDS,
+  "previousOwnerActorId",
+  "previousGovernanceRevision",
+  "governanceRevision",
+]);
 const AGENT_CONFIGURATION_AUDIT_FIELDS = new Set([
   ...TARGET_AUDIT_FIELDS,
   "participation",
@@ -133,23 +139,29 @@ export type RoomAuditType =
   | "room.created"
   | "room.renamed"
   | "room.archived"
+  | "room.reopened"
   | "room.human.invited"
   | "room.invitation.accepted"
   | "room.invitation.rejected"
   | "room.agent.configured"
   | "room.member.removed"
-  | "room.member.role.changed";
+  | "room.member.left"
+  | "room.member.role.changed"
+  | "room.ownership.transferred";
 
 export type RoomAuditResult =
   | "created"
   | "renamed"
   | "archived"
+  | "reopened"
   | "pending"
   | "accepted"
   | "rejected"
   | "configured"
   | "removed"
-  | "role-changed";
+  | "left"
+  | "role-changed"
+  | "ownership-transferred";
 
 interface BaseRoomAuditRecord<
   Type extends RoomAuditType,
@@ -174,6 +186,7 @@ export type RoomAuditRecord =
   | BaseRoomAuditRecord<"room.created", "created">
   | BaseRoomAuditRecord<"room.renamed", "renamed">
   | BaseRoomAuditRecord<"room.archived", "archived">
+  | BaseRoomAuditRecord<"room.reopened", "reopened">
   | (TargetRoomAuditRecord<"room.human.invited", "pending"> & {
       readonly invitationId: string;
     })
@@ -190,8 +203,14 @@ export type RoomAuditRecord =
       readonly toolPermissions: readonly string[];
     })
   | TargetRoomAuditRecord<"room.member.removed", "removed">
+  | TargetRoomAuditRecord<"room.member.left", "left">
   | (TargetRoomAuditRecord<"room.member.role.changed", "role-changed"> & {
       readonly role: "admin" | "member";
+    })
+  | (TargetRoomAuditRecord<"room.ownership.transferred", "ownership-transferred"> & {
+      readonly previousOwnerActorId: string;
+      readonly previousGovernanceRevision: number;
+      readonly governanceRevision: number;
     });
 
 type RoomAuditInput = RoomAuditRecord extends infer RecordType
@@ -520,6 +539,8 @@ function auditExpectation(type: unknown): {
       return { fields: BASE_AUDIT_FIELDS, result: "renamed" };
     case "room.archived":
       return { fields: BASE_AUDIT_FIELDS, result: "archived" };
+    case "room.reopened":
+      return { fields: BASE_AUDIT_FIELDS, result: "reopened" };
     case "room.human.invited":
       return { fields: INVITATION_ISSUANCE_AUDIT_FIELDS, result: "pending" };
     case "room.invitation.accepted":
@@ -536,8 +557,15 @@ function auditExpectation(type: unknown): {
       return { fields: AGENT_CONFIGURATION_AUDIT_FIELDS, result: "configured" };
     case "room.member.removed":
       return { fields: TARGET_AUDIT_FIELDS, result: "removed" };
+    case "room.member.left":
+      return { fields: TARGET_AUDIT_FIELDS, result: "left" };
     case "room.member.role.changed":
       return { fields: ROLE_CHANGE_AUDIT_FIELDS, result: "role-changed" };
+    case "room.ownership.transferred":
+      return {
+        fields: OWNERSHIP_TRANSFER_AUDIT_FIELDS,
+        result: "ownership-transferred",
+      };
     default:
       return undefined;
   }
@@ -565,6 +593,17 @@ export function isRoomAuditRecord(value: unknown): value is RoomAuditRecord {
     (!expectation.fields.has("role") ||
       value.role === "admin" ||
       value.role === "member") &&
+    (!expectation.fields.has("previousOwnerActorId") ||
+      isNonEmptyString(value.previousOwnerActorId)) &&
+    (!expectation.fields.has("previousGovernanceRevision") ||
+      (typeof value.previousGovernanceRevision === "number" &&
+        Number.isSafeInteger(value.previousGovernanceRevision) &&
+        value.previousGovernanceRevision >= 0)) &&
+    (!expectation.fields.has("governanceRevision") ||
+      (typeof value.governanceRevision === "number" &&
+        Number.isSafeInteger(value.governanceRevision) &&
+        typeof value.previousGovernanceRevision === "number" &&
+        value.governanceRevision > value.previousGovernanceRevision)) &&
     (!expectation.fields.has("participation") ||
       (typeof value.participation === "string" &&
         agentParticipations.has(value.participation as AgentParticipation))) &&
@@ -871,6 +910,12 @@ function isRoomAuthorityReachable(
         }
         isActive = false;
         break;
+      case "room.reopened":
+        if (isActive || !isManagerMembership(memberships.get(record.actorId))) {
+          return false;
+        }
+        isActive = true;
+        break;
       case "room.human.invited": {
         const invitation = invitationsById.get(record.invitationId);
         const pendingKey = `${record.roomId}\u0000${record.targetActorId}`;
@@ -929,17 +974,31 @@ function isRoomAuthorityReachable(
           configuredAt: record.timestamp,
         });
         break;
+      case "room.member.left":
       case "room.member.removed": {
         const target = memberships.get(record.targetActorId);
         if (
-          !isActive ||
-          !isManagerMembership(memberships.get(record.actorId)) ||
+          (record.type === "room.member.left"
+            ? record.actorId !== record.targetActorId
+            : !isManagerMembership(memberships.get(record.actorId))) ||
           target === undefined ||
           (target.kind === "human" && target.role === "owner")
         ) {
           return false;
         }
         memberships.delete(record.targetActorId);
+        break;
+      }
+      case "room.ownership.transferred": {
+        const previousOwner = memberships.get(record.previousOwnerActorId);
+        const target = memberships.get(record.targetActorId);
+        if (record.actorId !== record.previousOwnerActorId ||
+          previousOwner?.kind !== "human" || previousOwner.role !== "owner" ||
+          target?.kind !== "human" || target.role === "owner") {
+          return false;
+        }
+        memberships.set(record.previousOwnerActorId, { ...previousOwner, role: "member" });
+        memberships.set(record.targetActorId, { ...target, role: "owner" });
         break;
       }
       case "room.member.role.changed": {
@@ -994,6 +1053,7 @@ function isAuditSemanticallyConsistent(
     case "room.created":
     case "room.renamed":
     case "room.archived":
+    case "room.reopened":
       return actor?.kind === "human";
     case "room.human.invited":
       return (
@@ -1022,11 +1082,17 @@ function isAuditSemanticallyConsistent(
       return (
         actor?.kind === "human" && actorsById.has(record.targetActorId)
       );
+    case "room.member.left":
+      return actor?.kind === "human" && record.actorId === record.targetActorId;
     case "room.member.role.changed":
       return (
         actor?.kind === "human" &&
         actorsById.get(record.targetActorId)?.kind === "human"
       );
+    case "room.ownership.transferred":
+      return actor?.kind === "human" &&
+        actorsById.get(record.targetActorId)?.kind === "human" &&
+        record.actorId === record.previousOwnerActorId;
   }
 }
 
