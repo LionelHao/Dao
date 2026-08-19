@@ -85,6 +85,14 @@ import type {
   StreamingRepairLease,
 } from "./contracts.js";
 import type { AgentMessageWorkerContext } from "../message-authority/internal-message-capability.js";
+import type {
+  AttachmentDatabaseOperation,
+  AttachmentDatabaseOperationResult,
+} from "../attachment-authority/database-contracts.js";
+import {
+  isAttachmentDatabaseOperation,
+  isAttachmentDatabaseOperationResult,
+} from "../attachment-authority/database-contracts.js";
 
 export type AuthorityWorkerErrorCode =
   | "actor_conflict"
@@ -96,6 +104,27 @@ export type AuthorityWorkerErrorCode =
   | "authority_already_initialized"
   | "authority_not_initialized"
   | "authority_worker_closed"
+  | "unauthenticated"
+  | "invalid_chunk"
+  | "attachment_forbidden"
+  | "attachment_already_bound"
+  | "generation_conflict"
+  | "attachment_not_ready"
+  | "upload_offset_conflict"
+  | "upload_expired"
+  | "attachment_gone"
+  | "attachment_too_large"
+  | "chunk_too_large"
+  | "attachment_type_unsupported"
+  | "type_mismatch"
+  | "attachment_malformed"
+  | "encrypted_pdf"
+  | "archive_bomb"
+  | "image_bomb"
+  | "attachment_capacity_limited"
+  | "scanner_unavailable"
+  | "extractor_unavailable"
+  | "ocr_unavailable"
   | "calibration_source_invalid"
   | "confirmation_expired"
   | "confirmation_forbidden"
@@ -166,6 +195,27 @@ export function isAuthorityWorkerErrorCode(
     case "authority_already_initialized":
     case "authority_not_initialized":
     case "authority_worker_closed":
+    case "unauthenticated":
+    case "invalid_chunk":
+    case "attachment_forbidden":
+    case "attachment_already_bound":
+    case "generation_conflict":
+    case "attachment_not_ready":
+    case "upload_offset_conflict":
+    case "upload_expired":
+    case "attachment_gone":
+    case "attachment_too_large":
+    case "chunk_too_large":
+    case "attachment_type_unsupported":
+    case "type_mismatch":
+    case "attachment_malformed":
+    case "encrypted_pdf":
+    case "archive_bomb":
+    case "image_bomb":
+    case "attachment_capacity_limited":
+    case "scanner_unavailable":
+    case "extractor_unavailable":
+    case "ocr_unavailable":
     case "calibration_source_invalid":
     case "confirmation_expired":
     case "confirmation_forbidden":
@@ -320,6 +370,12 @@ export type AuthorityWorkerRequest =
       readonly requestId: string;
       readonly context: AgentWorkerCommandContext;
       readonly command: AgentCollaborationCommand;
+      readonly now: number;
+    }
+  | {
+      readonly type: "authority.attachment";
+      readonly requestId: string;
+      readonly operation: AttachmentDatabaseOperation;
       readonly now: number;
     }
   | {
@@ -581,6 +637,11 @@ export type AuthorityWorkerResponse =
       readonly type: "authority.command-acknowledged";
       readonly requestId: string;
       readonly acknowledgement: CommandAcknowledgement;
+    }
+  | {
+      readonly type: "authority.attachment-result";
+      readonly requestId: string;
+      readonly result: AttachmentDatabaseOperationResult;
     }
   | {
       readonly type: "authority.message-submitted";
@@ -1244,7 +1305,8 @@ function isOutboxDelivery(value: unknown): value is OutboxDelivery {
   if (value.targetKind === "principal") {
     return event.streamKind === "identity" &&
       event.streamId === value.targetId &&
-      event.type === "identity.room-access.changed";
+      (event.type === "identity.room-access.changed" ||
+        event.type === "attachment.private.status-changed");
   }
   return event.streamKind === "identity" &&
     event.type === "identity.session.revoked" &&
@@ -1391,6 +1453,9 @@ export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWork
         isAgentCommand(value.command) &&
         isNonNegativeSafeInteger(value.now)
       );
+    case "authority.attachment":
+      return hasExactKeys(value, ["type", "requestId", "operation", "now"]) &&
+        isAttachmentDatabaseOperation(value.operation) && isNonNegativeSafeInteger(value.now);
     case "authority.message-submit":
       return hasExactKeys(value, ["type", "requestId", "context", "message", "now"]) &&
         isAuthenticatedCommandContext(value.context) && isHumanMessageSubmit(value.message) &&
@@ -1566,6 +1631,9 @@ export function isAuthorityWorkerResponse(
         hasExactKeys(value, ["type", "requestId", "acknowledgement"]) &&
         isCommandAcknowledgement(value.acknowledgement)
       );
+    case "authority.attachment-result":
+      return hasExactKeys(value, ["type", "requestId", "result"]) &&
+        isAttachmentDatabaseOperationResult(value.result);
     case "authority.message-submitted":
       return hasExactKeys(value, ["type", "requestId", "receipt"]) &&
         isSubmissionReceipt(value.receipt);

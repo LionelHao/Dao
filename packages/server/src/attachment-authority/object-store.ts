@@ -385,7 +385,10 @@ export class AttachmentObjectStore {
     }
   }
 
-  async publishCleanObject(input: Readonly<{ attachmentId: string }>): Promise<Readonly<{
+  async publishCleanObject(input: Readonly<{
+    attachmentId: string;
+    retainQuarantine?: boolean;
+  }>): Promise<Readonly<{
     objectKey: string;
     byteLength: number;
     sha256: string;
@@ -403,7 +406,10 @@ export class AttachmentObjectStore {
         if (existing.byteLength !== bytes.byteLength || sha256(existing) !== actualSha256) {
           fail("object_conflict");
         }
-        await unlink(quarantinePath);
+        if (input.retainQuarantine !== true) await unlink(quarantinePath);
+      } else if (input.retainQuarantine === true) {
+        await link(quarantinePath, objectPath);
+        await chmod(objectPath, 0o600);
       } else {
         await rename(quarantinePath, objectPath);
         await chmod(objectPath, 0o600);
@@ -415,6 +421,27 @@ export class AttachmentObjectStore {
       if (error instanceof AttachmentObjectStoreError) throw error;
       fail("storage_unavailable");
     }
+  }
+
+  async discardQuarantine(attachmentId: string): Promise<void> {
+    this.#ready();
+    const quarantinePath = this.#quarantinePath(attachmentId);
+    try {
+      await unlink(quarantinePath).catch((error: unknown) => {
+        if (errorCode(error) !== "ENOENT") throw error;
+      });
+      await syncDirectory(this.#quarantine);
+    } catch (error) {
+      if (error instanceof AttachmentObjectStoreError) throw error;
+      fail("storage_unavailable");
+    }
+  }
+
+  async readQuarantineForProcessing(attachmentId: string): Promise<Uint8Array> {
+    this.#ready();
+    const path = this.#quarantinePath(attachmentId);
+    if (!(await pathExists(path))) fail("quarantine_missing");
+    return privateRegularFile(path, this.#limits.maxFileBytes);
   }
 
   async storeExtractionArtifact(input: Readonly<{

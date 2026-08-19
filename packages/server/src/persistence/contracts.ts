@@ -3,6 +3,8 @@ import {
   isAgentExecution,
   isAgentJudgement,
   isAgentRoomMembership,
+  isAttachmentPrivateEvent,
+  isAttachmentRoomEvent,
   isCalibrationSignal,
   isHumanReadReceipt,
   isHumanPreemptionNotice,
@@ -774,6 +776,10 @@ type PersistedRoomAccessChangedEvent = PersistedIdentityEvent & {
   readonly type: "identity.room-access.changed";
 };
 
+type PersistedAttachmentPrivateStatusEvent = PersistedIdentityEvent & {
+  readonly type: "attachment.private.status-changed";
+};
+
 export type OutboxDelivery =
   | (OutboxDeliveryBase & {
       readonly targetKind: "room";
@@ -781,7 +787,7 @@ export type OutboxDelivery =
     })
   | (OutboxDeliveryBase & {
       readonly targetKind: "principal";
-      readonly event: PersistedRoomAccessChangedEvent;
+      readonly event: PersistedRoomAccessChangedEvent | PersistedAttachmentPrivateStatusEvent;
     })
   | (OutboxDeliveryBase & {
       readonly targetKind: "session-family";
@@ -1226,6 +1232,9 @@ export function parsePersistedRoomEvent(
     // Keep this compatibility cast until that Core declaration is present here.
     return { ok: true, value: value as unknown as PersistedRoomEvent };
   }
+  if (isAttachmentRoomEvent(value)) {
+    return { ok: true, value: value as PersistedRoomEvent };
+  }
   return isRecord(value) && roomEventEnvelope(value) && validRoomEventPayload(
     value.type,
     value.payload as UnknownRecord,
@@ -1269,6 +1278,10 @@ function validIdentityEventPayload(type: unknown, payload: UnknownRecord): boole
 export function parsePersistedIdentityEvent(
   value: unknown,
 ): ContractParseResult<PersistedIdentityEvent, "invalid_event"> {
+  if (isRecord(value) && value.streamKind === "identity" &&
+      isAttachmentPrivateEvent({ ...value, streamKind: "principal" })) {
+    return { ok: true, value: value as unknown as PersistedIdentityEvent };
+  }
   return isRecord(value) && identityEventEnvelope(value) && validIdentityEventPayload(value.type, value.payload as UnknownRecord) &&
     (value.type !== "identity.actor.registered" ||
       (value.payload as { readonly actor: { readonly id: string } }).actor.id === value.streamId)

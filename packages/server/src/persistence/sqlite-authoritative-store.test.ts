@@ -4477,7 +4477,7 @@ describe("SQLite authoritative sessions", () => {
     ).toBe(false);
   });
 
-  it("fails closed without writes when an attachment validator is unavailable", async () => {
+  it("fails closed without writes when a submitted attachment is not authoritative", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-message-attachment-gate-"));
     temporaryDirectories.push(directory);
     const databasePath = join(directory, "authority.sqlite");
@@ -4497,7 +4497,7 @@ describe("SQLite authoritative sessions", () => {
         mentionedTargets: [],
         attachments: [{ attachmentId: "attachment-unvalidated" }],
       },
-    )).rejects.toMatchObject({ status: 400, code: "invalid_parameters" });
+    )).rejects.toMatchObject({ status: 410, code: "attachment_gone" });
 
     await fixture.client.close();
     const database = new DatabaseSync(databasePath, { readOnly: true });

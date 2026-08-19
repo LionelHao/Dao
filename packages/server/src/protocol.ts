@@ -1207,17 +1207,6 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
           ),
         };
       }
-      if (Array.isArray(value.message.attachments) && value.message.attachments.length > 0) {
-        return {
-          ok: false,
-          error: protocolError(
-            "Message attachments are unavailable until the FT-04 validator is active",
-            requestId,
-            400,
-            "attachment_feature_unavailable",
-          ),
-        };
-      }
       if (!hasValidV2MessageBasics(value.message)) {
         return {
           ok: false,

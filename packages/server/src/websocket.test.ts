@@ -3701,7 +3701,7 @@ describe("authenticated message WebSocket service", () => {
       },
       revisionCount: 1,
       mentionedTargets: [],
-      attachments: [],
+      attachments: [{ attachmentId: "attachment-ready-1" }],
       targetOutcomes: [],
     };
     const submitHumanMessage = vi.fn(async () => ({
@@ -3757,7 +3757,7 @@ describe("authenticated message WebSocket service", () => {
           roomId,
           body: "hello",
           mentionedTargets: [],
-          attachments: [],
+          attachments: [{ attachmentId: "attachment-ready-1" }],
         },
       });
       await expect(client.waitForFrame(
@@ -3832,7 +3832,11 @@ describe("authenticated message WebSocket service", () => {
         kind: "human",
         requestId: "message-v2-send",
         idempotencyKey: "message-v2-1",
-      }, expect.objectContaining({ messageId: "message-v2-1", roomId }));
+      }, expect.objectContaining({
+        messageId: "message-v2-1",
+        roomId,
+        attachments: [{ attachmentId: "attachment-ready-1" }],
+      }));
       expect(reviseHumanMessage).toHaveBeenCalledTimes(1);
       expect(recallHumanMessage).toHaveBeenCalledTimes(1);
       expect(readMessageHistory).toHaveBeenCalledWith(
@@ -5887,6 +5891,69 @@ describe("closed FT-02B/FT-02C WebSocket governance", () => {
       expect(client.frameCount((frame) => hasType(frame, "room.governance.ack") &&
         frame.requestId === "archive-malformed")).toBe(0);
       expect(JSON.stringify(failure.frame)).not.toContain("must-not-cross-wire");
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("routes closed attachment commands only through the authenticated authority port", async () => {
+    const uploadId = "00000000-0000-4000-8000-000000000101";
+    const execute = vi.fn(async (_context, frame) => ({
+      type: "attachment.upload.begun" as const,
+      requestId: frame.requestId,
+      uploadId,
+      acknowledgedBytes: 0,
+    }));
+    const server = await startMessageWebSocketServer({
+      auth: governanceAuthenticationService(),
+      service: idleMessageService(),
+      attachmentAuthority: {
+        execute,
+        invalidateFamily() {},
+        close() {},
+      },
+    });
+    const client = await LoopbackClient.connect(server.url);
+    const request = {
+      type: "attachment.upload.begin",
+      requestId: "attachment-begin",
+      roomId,
+      uploadKey: "attachment-upload-key",
+      originalFilename: "safe.txt",
+      declaredMime: "text/plain",
+      expectedBytes: 5,
+      expectedSha256: createHash("sha256").update("hello").digest("hex"),
+    } as const;
+
+    try {
+      client.send(request);
+      await expect(client.waitForError("unauthenticated", request.requestId)).resolves.toMatchObject({
+        frame: { status: 401 },
+      });
+      expect(execute).not.toHaveBeenCalled();
+
+      await client.login(humans[0], "attachment-login");
+      client.send(request);
+      const response = await client.waitForFrame(
+        (frame) => hasType(frame, "attachment.upload.begun") &&
+          frame.requestId === request.requestId,
+        "attachment upload begun",
+      );
+      expect(response.frame).toEqual({
+        type: "attachment.upload.begun",
+        requestId: request.requestId,
+        uploadId,
+        acknowledgedBytes: 0,
+      });
+      expect(execute).toHaveBeenCalledOnce();
+      expect(execute.mock.calls[0]?.[0]).toMatchObject({
+        kind: "human",
+        sessionId: governanceSession.sessionId,
+        sessionFamilyId: governanceSession.sessionFamilyId,
+        principal: governanceSession.principal,
+      });
+      expect(execute.mock.calls[0]?.[1]).toEqual(request);
     } finally {
       await client.close();
       await server.close();

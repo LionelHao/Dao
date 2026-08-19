@@ -89,19 +89,31 @@ describe("Message Authority vNext public protocol", () => {
       });
   });
 
-  it("keeps the FT-04 attachment seam closed", () => {
+  it("accepts closed attachment references for FT-04 AuthorityWorker binding", () => {
+    const attachmentMessage = {
+      ...message,
+      attachments: [{ attachmentId: "attachment-1" }],
+    };
     expect(parse({
       type: "message.send.v2",
       requestId: "send-attachment",
-      message: { ...message, attachments: [{ attachmentId: "attachment-1" }] },
-    })).toMatchObject({
-      ok: false,
-      error: {
-        status: 400,
-        code: "attachment_feature_unavailable",
+      message: attachmentMessage,
+    })).toEqual({
+      ok: true,
+      frame: {
+        type: "message.send.v2",
         requestId: "send-attachment",
+        message: attachmentMessage,
       },
     });
+    expect(parse({
+      type: "message.send.v2",
+      requestId: "send-attachment-forged",
+      message: {
+        ...message,
+        attachments: [{ attachmentId: "attachment-1", path: "/tmp/private" }],
+      },
+    })).toMatchObject({ ok: false, error: { code: "invalid_message" } });
   });
 
   it.each([

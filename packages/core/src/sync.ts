@@ -36,6 +36,7 @@ import {
 import {
   isAttachmentRepairRecord,
   isAttachmentRoomEvent,
+  type AttachmentPrivateEvent,
   type AttachmentRepairRecord,
   type AttachmentRoomEvent,
 } from "./attachment-authority.js";
@@ -246,6 +247,11 @@ type IdentityEvent<TType extends string, TPayload> = PersistedEventBase & {
   readonly payload: TPayload;
 };
 
+export type PersistedAttachmentPrivateEvent = Omit<
+  AttachmentPrivateEvent,
+  "streamKind"
+> & Readonly<{ streamKind: "identity" }>;
+
 export type PersistedIdentityEvent =
   | IdentityEvent<"identity.actor.registered", { readonly actor: Actor }>
   | IdentityEvent<
@@ -255,7 +261,8 @@ export type PersistedIdentityEvent =
   | IdentityEvent<
       "identity.room-access.changed",
       { readonly roomId: string; readonly change: "joined" | "updated" | "removed" | "archived" }
-    >;
+    >
+  | PersistedAttachmentPrivateEvent;
 
 export type RoomSyncResult =
   | {

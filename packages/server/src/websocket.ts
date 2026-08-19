@@ -54,6 +54,7 @@ import type { SyncService } from "./sync-service.js";
 import type { AgentRuntime } from "./agent-runtime/contracts.js";
 import type { AuthoritativeCollaborationPrimitives } from "./primitives.js";
 import type { BallRuntimeService } from "./ball-runtime/ball-runtime-service.js";
+import type { AttachmentAuthorityCommandPort } from "./attachment-authority/authority-service.js";
 import {
   parseClientFrame,
   PROTOCOL_FIELD_LIMITS,
@@ -147,6 +148,7 @@ export interface StartMessageWebSocketServerOptions {
   >;
   readonly ballRuntime?: Pick<BallRuntimeService, "query">;
   readonly messageAuthority?: MessageAuthorityTransport;
+  readonly attachmentAuthority?: AttachmentAuthorityCommandPort;
   readonly governance?: Pick<CommandStore, "executeHuman"> &
     Pick<SyncQueryStore, "readRoomGovernance"> &
     Partial<ClosedRoomGovernanceTransportStore>;
@@ -1728,6 +1730,9 @@ async function handleRevoke(
   context.authOperationPending = true;
   try {
     await options.auth.revoke(accessToken);
+    if (context.session !== undefined) {
+      options.attachmentAuthority?.invalidateFamily(context.session.sessionFamilyId);
+    }
     if (options.outboxStore === undefined) {
       clearAuthentication(context);
       sendFrame(socket, { type: "auth.revoked", requestId: frame.requestId });
@@ -2182,6 +2187,46 @@ async function handleFrame(
     case "auth.session.revoke":
       await handleTargetedRevoke(socket, frame, options, context);
       return;
+    case "attachment.upload.begin":
+    case "attachment.upload.chunk":
+    case "attachment.upload.finalize":
+    case "attachment.upload.cancel":
+    case "attachment.processing.retry":
+    case "attachment.status.query":
+    case "attachment.preview.open":
+    case "attachment.download.open":
+    case "attachment.stream.read": {
+      const session = await requireSession(socket, frame.requestId, options, context);
+      if (session === undefined) return;
+      const authority = options.attachmentAuthority;
+      if (authority === undefined) {
+        sendFrame(socket, errorFrame(
+          503,
+          "storage_unavailable",
+          "storage_unavailable",
+          frame.requestId,
+        ));
+        return;
+      }
+      const credentialGeneration = context.credentialGeneration;
+      try {
+        const response = await authority.execute({
+          ...session,
+          kind: "human",
+          requestId: frame.requestId,
+          idempotencyKey: `attachment:${frame.type}:${frame.requestId}`,
+        }, frame);
+        sendCurrentGeneration(socket, response, credentialGeneration, context);
+      } catch (error: unknown) {
+        sendCurrentGeneration(
+          socket,
+          mappedError(error, frame.requestId),
+          credentialGeneration,
+          context,
+        );
+      }
+      return;
+    }
     case "message.send.v2":
     case "message.revise":
     case "message.recall":
@@ -2822,6 +2867,9 @@ export async function startMessageWebSocketServer(
             !samePrincipal(session.principal, candidate.principal)
           ) {
             return { accepted: false, reason: "closed" };
+          }
+          if (delivery.targetKind === "session-family") {
+            options.attachmentAuthority?.invalidateFamily(delivery.targetId);
           }
           if (delivery.targetKind === "room" && delivery.event.streamKind === "room") {
             const gate = live.context.v2GatesByRoom.get(delivery.targetId);
