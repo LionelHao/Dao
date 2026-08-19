@@ -8,6 +8,7 @@ import {
   parsePersistentCommand,
   toAgentWorkerCommandContext,
 } from "./contracts.js";
+import { parseClosedRoomGovernanceMutationCommand as parsePublicClosedGovernanceCommand } from "../index.js";
 
 const acceptedCommands: readonly unknown[] = [
   {
@@ -83,7 +84,14 @@ const acceptedCommands: readonly unknown[] = [
   { type: "calibration.record", roomId: "room-1", payload: { sourceMessageId: "message-agent", feedback: "useful" } },
   { type: "room.create", payload: { name: "原生 IM" } },
   { type: "room.rename", roomId: "room-1", payload: { name: "新名字" } },
-  { type: "room.archive", roomId: "room-1", payload: {} },
+  { type: "room.archive", roomId: "room-1", payload: { expectedGovernanceRevision: 4 } },
+  { type: "room.reopen", roomId: "room-1", payload: { expectedGovernanceRevision: 5 } },
+  { type: "room.member.leave", roomId: "room-1", payload: { expectedGovernanceRevision: 4 } },
+  {
+    type: "room.member.remove",
+    roomId: "room-1",
+    payload: { targetActorId: "human-2", expectedGovernanceRevision: 4 },
+  },
   { type: "human.invitation.issue", roomId: "room-1", payload: { inviteeActorId: "human-2" } },
   { type: "human.invitation.decide", payload: { token: "invite-token", decision: "accept" } },
   {
@@ -146,10 +154,41 @@ const humanMembership = {
   joinedAt: "2026-08-10T00:00:00.000Z",
 } as const;
 
+const archivedGovernance = {
+  roomId: "room-1",
+  projectId: "room-1",
+  lifecycle: "archived",
+  governanceRevision: 8,
+  ownerActorId: "human-1",
+  archivedAt: "2026-08-19T00:00:00.000Z",
+  archiveGeneration: 2,
+} as const;
+
+const reopenedGovernance = {
+  ...archivedGovernance,
+  lifecycle: "active",
+  governanceRevision: 9,
+  archivedAt: undefined,
+} as const;
+
 const acceptedRoomEvents: readonly unknown[] = [
   { ...roomEventBase, type: "room.created", payload: { room: managedRoom } },
   { ...roomEventBase, type: "room.renamed", payload: { room: { ...managedRoom, name: "新名字" } } },
-  { ...roomEventBase, type: "room.archived", payload: { room: { ...managedRoom, status: "archived" } } },
+  {
+    ...roomEventBase,
+    type: "room.archived",
+    payload: { governance: archivedGovernance, archiveGeneration: 2, frozenTimerCount: 3 },
+  },
+  {
+    ...roomEventBase,
+    type: "room.reopened",
+    payload: { governance: reopenedGovernance, archiveGeneration: 2, resumedTimerCount: 2 },
+  },
+  {
+    ...roomEventBase,
+    type: "room.security.reduced",
+    payload: { governance: archivedGovernance, archiveGeneration: 2, assignmentRevision: 7 },
+  },
   {
     ...roomEventBase,
     type: "human.invitation.issued",
@@ -430,6 +469,9 @@ describe("closed authority contracts", () => {
       payload: { messageId: "message-1", outcome: "will_respond", reason: "" },
     })).toEqual({ ok: false, code: "invalid_command" });
     expect(parsePersistentCommand({
+      type: "room.archive", roomId: "room-1", payload: {},
+    })).toEqual({ ok: false, code: "invalid_command" });
+    expect(parsePersistentCommand({
       type: "human.read.record",
       roomId: "room-1",
       payload: { messageId: "message-1", agentId: "agent-search" },
@@ -535,6 +577,50 @@ describe("closed authority contracts", () => {
     })).toEqual({ ok: false, code: "invalid_event" });
   });
 
+  it.each([
+    ["legacy archive room payload", {
+      ...roomEventBase,
+      type: "room.archived",
+      payload: { room: { ...managedRoom, status: "archived" } },
+    }],
+    ["archive secret", {
+      ...roomEventBase,
+      type: "room.archived",
+      payload: {
+        governance: archivedGovernance,
+        archiveGeneration: 2,
+        frozenTimerCount: 3,
+        grant: "secret-grant",
+      },
+    }],
+    ["cross-room archive governance", {
+      ...roomEventBase,
+      type: "room.archived",
+      payload: {
+        governance: { ...archivedGovernance, roomId: "room-2", projectId: "room-2" },
+        archiveGeneration: 2,
+        frozenTimerCount: 3,
+      },
+    }],
+    ["archive generation mismatch", {
+      ...roomEventBase,
+      type: "room.archived",
+      payload: { governance: archivedGovernance, archiveGeneration: 3, frozenTimerCount: 3 },
+    }],
+    ["reopen archived governance", {
+      ...roomEventBase,
+      type: "room.reopened",
+      payload: { governance: archivedGovernance, archiveGeneration: 2, resumedTimerCount: 2 },
+    }],
+    ["security reduction active governance", {
+      ...roomEventBase,
+      type: "room.security.reduced",
+      payload: { governance: reopenedGovernance, archiveGeneration: 2, assignmentRevision: 7 },
+    }],
+  ])("rejects closed lifecycle event violation: %s", (_name, event) => {
+    expect(parsePersistedRoomEvent(event)).toEqual({ ok: false, code: "invalid_event" });
+  });
+
   it("keeps identity events out of the room stream", () => {
     expect(parsePersistedIdentityEvent({
       eventId: "event-identity-1",
@@ -606,6 +692,13 @@ describe("closed FT-02B/FT-02C governance transport contracts", () => {
     expect(parseClosedRoomGovernanceMutationCommand(command)).toEqual({
       ok: true,
       value: command,
+    });
+  });
+
+  it("exports the closed parser from the public server surface", () => {
+    expect(parsePublicClosedGovernanceCommand(commands[1])).toEqual({
+      ok: true,
+      value: commands[1],
     });
   });
 
