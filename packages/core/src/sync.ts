@@ -33,6 +33,12 @@ import {
   type RouteJob,
   type RouteJudgment,
 } from "./collaboration.js";
+import {
+  isMessageAuthorityEvent,
+  isMessageAuthorityRepairRecord,
+  type MessageAuthorityEvent,
+  type MessageAuthorityRepairRecord,
+} from "./message-authority.js";
 
 export interface RoomSummary {
   readonly roomId: string;
@@ -54,6 +60,11 @@ export interface LegacyUnknownCalibrationSignal {
   readonly createdAt: string;
 }
 
+type OperationalMessageAuthorityRepairRecord = Extract<
+  MessageAuthorityRepairRecord,
+  { readonly kind: "timeline-message" }
+>;
+
 export type RoomRepairRecord =
   | { readonly kind: "room"; readonly value: Omit<ManagedRoom, "members"> }
   | { readonly kind: "governance"; readonly value: RoomGovernanceView }
@@ -69,7 +80,8 @@ export type RoomRepairRecord =
   | { readonly kind: "route-judgment"; readonly value: RouteJudgment }
   | { readonly kind: "calibration"; readonly value: CalibrationSignal }
   | { readonly kind: "legacy-unknown-calibration";
-      readonly value: LegacyUnknownCalibrationSignal };
+      readonly value: LegacyUnknownCalibrationSignal }
+  | OperationalMessageAuthorityRepairRecord;
 
 export type SnapshotVersion =
   | { readonly kind: "room"; readonly roomId: string; readonly watermark: number }
@@ -188,6 +200,7 @@ export type PersistedRoomEvent =
   | RoomEvent<"member.removed", { readonly targetActorId: string }>
   | RoomEvent<"agent.configured", { readonly membership: AgentRoomMembership }>
   | RoomEvent<"room.message.accepted", Message>
+  | MessageAuthorityEvent
   | RoomEvent<"room.human_read.recorded", HumanReadReceipt>
   | RoomEvent<"room.agent_judgment.recorded", AgentJudgement>
   | RoomEvent<"room.open_item.changed", OpenItem>
@@ -266,7 +279,8 @@ function isRecord(value: unknown): value is UnknownRecord {
 
 function exact(value: UnknownRecord, required: readonly string[], optional: readonly string[] = []): boolean {
   const allowed = new Set([...required, ...optional]);
-  return required.every((key) => Object.hasOwn(value, key)) && Object.keys(value).every((key) => allowed.has(key));
+  return required.every((key) => Object.hasOwn(value, key)) &&
+    Reflect.ownKeys(value).every((key) => typeof key === "string" && allowed.has(key));
 }
 
 function text(value: unknown): value is string {
@@ -349,9 +363,12 @@ export function isSnapshotCompleted(value: unknown): value is SnapshotCompleted 
     isSnapshotVersion(value.version);
 }
 
-function isRepairRecord(value: unknown): value is RoomRepairRecord {
+function isRepairRecord(value: unknown, expectedRoomId?: string): value is RoomRepairRecord {
   if (!isRecord(value) || !exact(value, ["kind", "value"])) {
     return false;
+  }
+  if (value.kind === "timeline-message") {
+    return isMessageAuthorityRepairRecord(value, expectedRoomId);
   }
   if (value.kind === "human-read") return isHumanReadReceipt(value.value);
   if (value.kind === "agent-judgement") return isAgentJudgement(value.value);
@@ -385,6 +402,7 @@ function isPersistedRoomEventValue(value: unknown): value is PersistedRoomEvent 
     return false;
   }
   const payload = value.payload;
+  if (isMessageAuthorityEvent(value)) return true;
   if (value.type === "room.created" || value.type === "room.renamed") {
     return exact(payload, ["room"]) && isManagedRoomValue(payload.room) && payload.room.id === value.roomId;
   }
@@ -523,7 +541,9 @@ export function isRoomRepairPage(value: unknown): value is RoomRepairPage {
       ["expiresAt", "idleExpiresAt"],
     ) &&
     value.type === "room.repair.page" && text(value.requestId) && text(value.snapshotId) && text(value.roomId) && count(value.page) &&
-    Array.isArray(value.records) && value.records.every(isRepairRecord) && count(value.watermark) &&
+    Array.isArray(value.records) &&
+    value.records.every((record) => isRepairRecord(record, value.roomId as string)) &&
+    count(value.watermark) &&
     text(value.snapshotChecksum) && typeof value.hasMore === "boolean" && isDeliveryMode(value);
 }
 

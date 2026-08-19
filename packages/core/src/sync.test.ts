@@ -9,6 +9,59 @@ import {
 } from "./sync.js";
 
 describe("pure synchronization contracts", () => {
+  it("accepts closed Message Authority events and only operational timeline repair records", () => {
+    const currentRevision = {
+      messageId: "message-v2-1", revision: 1, body: "hello",
+      revisedAt: "2026-08-19T00:00:00.000Z", revisedByActorId: "human-1",
+    } as const;
+    const active = {
+      id: "message-v2-1", roomId: "room-1", authorId: "human-1",
+      authorKind: "human", createdAt: "2026-08-19T00:00:00.000Z",
+      lifecycle: "active", currentRevision, revisionCount: 1,
+      mentionedTargets: [], attachments: [], targetOutcomes: [],
+    } as const;
+    const tombstone = {
+      id: active.id, roomId: active.roomId, authorId: active.authorId,
+      authorKind: "human", createdAt: active.createdAt, lifecycle: "recalled",
+      recalledAt: "2026-08-19T00:02:00.000Z", revisionCount: 1,
+    } as const;
+    const event = (type: string, payload: unknown) => ({
+      eventId: `event-${type}`, streamKind: "room", streamId: "room-1", streamSeq: 1,
+      roomId: "room-1", actorId: "human-1", occurredAt: "2026-08-19T00:03:00.000Z",
+      type, payload,
+    });
+    const delta = (messageEvent: unknown) => ({
+      type: "room.sync.result", requestId: "request-message-authority", mode: "delta",
+      events: [messageEvent], nextCursor: { version: 1, roomId: "room-1", afterSeq: 1 },
+      watermark: 1, hasMore: false,
+    });
+    const repair = (record: unknown) => ({
+      type: "room.repair.page", requestId: "request-message-repair",
+      snapshotId: "snapshot-message", roomId: "room-1", page: 0, records: [record],
+      watermark: 1, snapshotChecksum: "sha256:message", hasMore: false,
+      mode: "streaming", idleExpiresAt: "2026-08-19T00:04:00.000Z",
+    });
+
+    expect(isRoomSyncResult(delta(event("room.message.accepted", active)))).toBe(true);
+    expect(isRoomSyncResult(delta(event("room.message.revised", active)))).toBe(true);
+    expect(isRoomSyncResult(delta(event("room.message.recalled", tombstone)))).toBe(true);
+    expect(isRoomSyncResult(delta(event("room.message.recalled", {
+      ...tombstone, body: "recalled-raw-sentinel",
+    })))).toBe(false);
+    expect(isRoomSyncResult(delta({
+      ...event("room.message.accepted", active),
+      payload: Object.defineProperty({ ...active }, "capability", { value: "hidden" }),
+    }))).toBe(false);
+
+    expect(isRoomRepairPage(repair({ kind: "timeline-message", value: tombstone }))).toBe(true);
+    expect(isRoomRepairPage(repair({
+      kind: "timeline-message", value: { ...tombstone, roomId: "room-2" },
+    }))).toBe(false);
+    expect(isRoomRepairPage(repair({
+      kind: "message-revision", roomId: "room-1", value: currentRevision,
+    }))).toBe(false);
+  });
+
   it("keeps archive, reopen, and security-reduction lifecycle events distinct and closed", () => {
     const archivedGovernance = {
       roomId: "room-1", projectId: "room-1", lifecycle: "archived",

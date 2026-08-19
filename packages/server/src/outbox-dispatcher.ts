@@ -1,3 +1,4 @@
+import { isMessage } from "@native-im/core";
 import type {
   OutboxDelivery,
   OutboxDeliveryFailureReason,
@@ -54,7 +55,8 @@ export interface OutboxDispatcherOptions {
 
 function dispatchFrame(delivery: OutboxDelivery): OutboxDispatchFrame {
   if (delivery.targetKind === "room") {
-    if (delivery.event.type === "room.message.accepted") {
+    if (delivery.event.type === "room.message.accepted" &&
+        isMessage(delivery.event.payload)) {
       return { type: "message.created", message: delivery.event.payload };
     }
     return { type: "room.event", event: delivery.event };
