@@ -1,4 +1,7 @@
 import { generateKeyPairSync } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import {
@@ -18,8 +21,8 @@ import {
 const NOW = 1_800_000_000_000;
 const MAX_LEASE_MS = 60_000;
 
-function createDatabase(): DatabaseSync {
-  const database = new DatabaseSync(":memory:");
+function createDatabase(path = ":memory:"): DatabaseSync {
+  const database = new DatabaseSync(path);
   database.exec(`
     PRAGMA foreign_keys = ON;
     CREATE TABLE actors (
@@ -145,6 +148,51 @@ describe("offline lease production authority", () => {
       expect(verifier.verify(issued.token, expectedBinding())).toEqual(issued.claims);
     } finally {
       database.close();
+    }
+  });
+
+  it("keeps signing material and bearer lease tokens out of SQLite and WAL bytes", () => {
+    const directory = mkdtempSync(join(tmpdir(), "dao-offline-lease-secret-"));
+    const path = join(directory, "authority.sqlite");
+    const database = createDatabase(path);
+    const { privateKey } = generateKeyPairSync("ed25519");
+    const privateKeyBytes = privateKey.export({ format: "der", type: "pkcs8" });
+    try {
+      database.exec("PRAGMA journal_mode = WAL; BEGIN IMMEDIATE");
+      const tx = mintDatabaseAuthorityTransactionView(database, "room-1", "tx-secret-sentinel");
+      const issued = new OfflineReadLeaseIssuer({
+        tenantId: "tenant-secret-sentinel",
+        serverSubject: "server-secret-sentinel",
+        keyId: "key-secret-sentinel",
+        privateKey,
+        maxOfflineReadLeaseMs: MAX_LEASE_MS,
+        now: () => NOW,
+        createLeaseId: () => "lease-secret-sentinel",
+      }).issueInTransaction(tx, {
+        roomId: "room-1",
+        accountId: "account-1",
+        actorId: "human-1",
+        sessionFamilyId: "family-1",
+        deviceId: "device-1",
+        installationId: "installation-1",
+        requestedLeaseMs: 30_000,
+        expectedLifecycleGeneration: 0,
+        expectedAccessRevision: 0,
+        expectedLeaseGeneration: 0,
+      });
+      releaseDatabaseAuthorityTransactionView(tx);
+      database.exec("COMMIT");
+
+      const durableBytes = [path, `${path}-wal`, `${path}-shm`]
+        .filter(existsSync)
+        .map((file) => readFileSync(file));
+      for (const bytes of durableBytes) {
+        expect(bytes.indexOf(privateKeyBytes)).toBe(-1);
+        expect(bytes.toString("utf8")).not.toContain(issued.token);
+      }
+    } finally {
+      database.close();
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 

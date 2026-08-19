@@ -46,40 +46,6 @@ function openDatabase(path?: string): DatabaseSync {
   const database = new DatabaseSync(resolvedPath);
   migrateAuthorityDatabase(database);
   database.exec(`
-    CREATE TABLE room_business_timer_freeze_batches (
-      room_id TEXT NOT NULL REFERENCES rooms(id),
-      archive_generation INTEGER NOT NULL CHECK (archive_generation > 0),
-      suspended_at TEXT NOT NULL,
-      suspended_count INTEGER NOT NULL CHECK (suspended_count >= 0),
-      resumed_at TEXT,
-      resumed_count INTEGER CHECK (resumed_count >= 0),
-      descriptor_ids_json TEXT NOT NULL
-        CHECK (json_valid(descriptor_ids_json) AND json_type(descriptor_ids_json) = 'array'),
-      PRIMARY KEY (room_id, archive_generation),
-      CHECK ((resumed_at IS NULL) = (resumed_count IS NULL))
-    ) STRICT;
-    CREATE TABLE room_business_timer_freezes (
-      room_id TEXT NOT NULL REFERENCES rooms(id),
-      archive_generation INTEGER NOT NULL CHECK (archive_generation > 0),
-      descriptor_id TEXT NOT NULL CHECK (length(trim(descriptor_id)) > 0),
-      timer_key TEXT NOT NULL CHECK (length(trim(timer_key)) > 0),
-      source_kind TEXT NOT NULL CHECK (length(trim(source_kind)) > 0),
-      source_id TEXT NOT NULL CHECK (length(trim(source_id)) > 0),
-      original_due_at TEXT NOT NULL,
-      remaining_ms INTEGER NOT NULL CHECK (remaining_ms >= 0),
-      frozen_at TEXT NOT NULL,
-      state TEXT NOT NULL CHECK (state IN ('frozen', 'resumed', 'discarded')),
-      resumed_due_at TEXT,
-      resolved_at TEXT,
-      PRIMARY KEY (room_id, archive_generation, timer_key),
-      CHECK (
-        (state = 'frozen' AND resumed_due_at IS NULL AND resolved_at IS NULL)
-        OR (state = 'resumed' AND resumed_due_at IS NOT NULL AND resolved_at IS NOT NULL)
-        OR (state = 'discarded' AND resumed_due_at IS NULL AND resolved_at IS NOT NULL)
-      )
-    ) STRICT;
-  `);
-  database.exec(`
     INSERT INTO actors (id, kind, display_name, readiness, tool_permissions_json)
     VALUES
       ('human-owner', 'human', 'Owner', NULL, '[]'),

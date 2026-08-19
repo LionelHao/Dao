@@ -426,7 +426,11 @@ describe("real AuthorityWorker runtime authority", () => {
       });
       const consumed = evidence.prepare(
         `SELECT grant.consumed_at AS grantConsumedAt,
-                confirmation.consumed_at AS confirmationConsumedAt
+                grant.grant_state AS grantState,
+                grant.grant_revision AS grantRevision,
+                confirmation.consumed_at AS confirmationConsumedAt,
+                confirmation.confirmation_state AS confirmationState,
+                confirmation.confirmation_revision AS confirmationRevision
          FROM agent_execution_grants AS grant
          JOIN tool_confirmations AS confirmation
            ON confirmation.execution_id = grant.execution_id
@@ -435,6 +439,12 @@ describe("real AuthorityWorker runtime authority", () => {
       ).get(prepared.grantId);
       expect(typeof consumed?.grantConsumedAt).toBe("string");
       expect(typeof consumed?.confirmationConsumedAt).toBe("string");
+      expect(consumed).toMatchObject({
+        grantState: "claimed",
+        grantRevision: 1,
+        confirmationState: "confirmed",
+        confirmationRevision: 1,
+      });
       const lifecycleEvents = evidence.prepare(
         `SELECT event_type AS eventType, payload_json AS payloadJson
          FROM events

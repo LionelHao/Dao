@@ -503,6 +503,7 @@ async function seedThroughFacades(
 const serverOptions: StartAuthoritativeServerOptions = {
   databasePath: command.databasePath,
   snapshotCachePath: command.snapshotCachePath,
+  sharedAuthority: { maxOfflineReadLeaseMs: 60_000 },
   listen: { host: "127.0.0.1", port: 0 },
   actors: command.actors,
   identities,

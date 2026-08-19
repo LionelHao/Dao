@@ -161,6 +161,9 @@ function isRequest(value: unknown): value is SnapshotWorkerRequest {
       return exact(value, ["type", "requestId", "snapshotId"]) && text(value.snapshotId);
     case "snapshot.invalidate":
       return exact(value, ["type", "requestId", "snapshotId"]) && text(value.snapshotId);
+    case "snapshot.invalidate-room":
+      return exact(value, ["type", "requestId", "roomId", "accessRevision"]) &&
+        text(value.roomId) && count(value.accessRevision);
     default:
       return false;
   }
@@ -1607,6 +1610,13 @@ function dispatch(value: unknown): void {
     if (value.type === "snapshot.invalidate") {
       cache.prepare("DELETE FROM repair_snapshots WHERE snapshot_id = ?").run(value.snapshotId);
       respond({ type: "snapshot.invalidated", requestId: value.requestId }); return;
+    }
+    if (value.type === "snapshot.invalidate-room") {
+      cache.prepare(
+        `DELETE FROM repair_snapshots
+         WHERE kind = 'room' AND room_id = ? AND access_revision <= ?`,
+      ).run(value.roomId, value.accessRevision);
+      respond({ type: "snapshot.room-invalidated", requestId: value.requestId }); return;
     }
     const countValue = value.type === "snapshot.full-validation-count"
       ? fullValidationCount

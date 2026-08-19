@@ -37,43 +37,6 @@ function openDatabase(path?: string): DatabaseSync {
   const database = new DatabaseSync(resolvedPath);
   migrateAuthorityDatabase(database);
   database.exec(`
-    CREATE TABLE agent_profiles (
-      id TEXT PRIMARY KEY,
-      actor_id TEXT NOT NULL UNIQUE REFERENCES actors(id),
-      revision INTEGER NOT NULL CHECK (revision > 0),
-      status TEXT NOT NULL CHECK (status IN ('enabled', 'disabled')),
-      capability_ceiling_json TEXT NOT NULL
-        CHECK (json_valid(capability_ceiling_json) AND json_type(capability_ceiling_json) = 'array'),
-      tool_ceiling_json TEXT NOT NULL
-        CHECK (json_valid(tool_ceiling_json) AND json_type(tool_ceiling_json) = 'array')
-    ) STRICT;
-    CREATE TABLE room_agent_assignments (
-      id TEXT PRIMARY KEY,
-      room_id TEXT NOT NULL REFERENCES rooms(id),
-      profile_id TEXT NOT NULL REFERENCES agent_profiles(id),
-      agent_actor_id TEXT NOT NULL REFERENCES actors(id),
-      revision INTEGER NOT NULL CHECK (revision > 0),
-      status TEXT NOT NULL CHECK (status IN ('current', 'removed')),
-      participation TEXT NOT NULL CHECK (participation IN ('active', 'on-mention')),
-      capability_subset_json TEXT NOT NULL
-        CHECK (json_valid(capability_subset_json) AND json_type(capability_subset_json) = 'array'),
-      tool_subset_json TEXT NOT NULL
-        CHECK (json_valid(tool_subset_json) AND json_type(tool_subset_json) = 'array'),
-      paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
-      UNIQUE (room_id, agent_actor_id)
-    ) STRICT;
-    CREATE TABLE room_assignment_archive_policies (
-      room_id TEXT NOT NULL REFERENCES rooms(id),
-      archive_generation INTEGER NOT NULL CHECK (archive_generation > 0),
-      policy_version INTEGER NOT NULL CHECK (policy_version > 0),
-      assignment_revision INTEGER NOT NULL CHECK (assignment_revision >= 0),
-      expansion_blocked INTEGER NOT NULL CHECK (expansion_blocked = 1),
-      reduced_at TEXT NOT NULL,
-      PRIMARY KEY (room_id, archive_generation),
-      UNIQUE (room_id, policy_version)
-    ) STRICT;
-  `);
-  database.exec(`
     INSERT INTO actors (id, kind, display_name, readiness, tool_permissions_json)
     VALUES
       ('human-owner', 'human', 'Owner', NULL, '[]'),
@@ -281,6 +244,7 @@ describe("AssignmentSecurityReductionParticipant production provider", () => {
         }));
       });
 
+      database.exec("DROP TRIGGER room_agent_assignments_authority_update_v14");
       database.prepare(
         `UPDATE room_agent_assignments
          SET capability_subset_json = '["project.read","admin.escalate"]'

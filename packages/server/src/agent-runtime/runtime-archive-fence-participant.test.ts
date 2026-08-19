@@ -165,9 +165,12 @@ function seedExecution(
   database.prepare(
     `INSERT INTO agent_execution_grants (
        grant_id, execution_id, attempt_seq, agent_id, room_id, tool_id,
-       parameter_sha256, issued_at, expires_at, consumed_at
-     ) VALUES (?, ?, 1, 'agent-1', 'room-1', 'sandbox-file.write', ?, ?, ?, ?)`,
-  ).run(`grant-${id}`, id, hash, now, "2026-08-20T00:00:00.000Z", now);
+       parameter_sha256, issued_at, expires_at, consumed_at,
+       grant_state, grant_revision, grant_changed_at
+     ) VALUES (
+       ?, ?, 1, 'agent-1', 'room-1', 'sandbox-file.write', ?, ?, ?, ?, 'claimed', 1, ?
+     )`,
+  ).run(`grant-${id}`, id, hash, now, "2026-08-20T00:00:00.000Z", now, now);
   database.prepare(
     `INSERT INTO tool_dispatches (
        dispatch_id, execution_id, attempt_seq, grant_id, tool_id,

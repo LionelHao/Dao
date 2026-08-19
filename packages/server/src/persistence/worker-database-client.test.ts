@@ -37,7 +37,10 @@ import {
   type AuthorityWorkerResponse,
 } from "./worker-protocol.js";
 import { MAX_ACTIVE_SESSION_FAMILIES } from "./contracts.js";
-import { migrateAuthorityDatabase } from "./schema.js";
+import {
+  migrateAuthorityDatabase,
+  migrateAuthorityDatabaseToPreviousVersionForTest,
+} from "./schema.js";
 
 const temporaryDirectories = new Set<string>();
 const clients = new Set<WorkerDatabaseClient>();
@@ -1309,6 +1312,78 @@ describe("public worker transport errors", () => {
 });
 
 describe("WorkerDatabaseClient", () => {
+  it("migrates and idempotently recovers every archived authority participant on restart", async () => {
+    const path = databasePath();
+    const legacy = new DatabaseSync(path);
+    migrateAuthorityDatabaseToPreviousVersionForTest(legacy);
+    legacy.exec(`
+      INSERT INTO actors (id, kind, display_name)
+      VALUES ('recovery-owner', 'human', 'Recovery Owner');
+      INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+      VALUES
+        ('identity', 'recovery-owner', 0, 1),
+        ('room', 'recovery-room', 0, 1);
+      INSERT INTO rooms (id, name, status, created_at)
+      VALUES ('recovery-room', 'Recovery Room', 'active', '2026-08-19T00:00:00.000Z');
+      INSERT INTO room_memberships (
+        room_id, actor_id, kind, role, participation, tool_permissions_json,
+        joined_at, configured_at, access_revision
+      ) VALUES (
+        'recovery-room', 'recovery-owner', 'human', 'member', NULL, '[]',
+        '2026-08-19T00:00:00.000Z', NULL, 0
+      );
+      UPDATE rooms
+      SET owner_actor_id = 'recovery-owner', governance_revision = 1
+      WHERE id = 'recovery-room';
+      UPDATE rooms
+      SET status = 'archived', archive_generation = 1,
+          archived_at = '2026-08-19T00:01:00.000Z'
+      WHERE id = 'recovery-room';
+    `);
+    legacy.close();
+
+    const options = {
+      databasePath: path,
+      sharedAuthorityRecovery: {
+        ballPolicy: { openItemDeadlineMs: 41_000, lightTaskDeadlineMs: 43_000 },
+        maxOfflineReadLeaseMs: 30_000,
+      },
+    } as const;
+    let client = await createWorkerDatabaseClient(options);
+    await client.close();
+    client = await createWorkerDatabaseClient(options);
+    await client.close();
+
+    const recovered = new DatabaseSync(path, { readOnly: true });
+    try {
+      for (const table of [
+        "room_message_archive_gates",
+        "room_business_timer_freeze_batches",
+        "tool_archive_settlements",
+        "runtime_archive_fences",
+        "room_assignment_archive_policies",
+        "room_cache_invalidation_intents",
+        "offline_read_lease_invalidations",
+      ]) {
+        expect(recovered.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get(), table)
+          .toEqual({ count: 1 });
+      }
+      expect(recovered.prepare(
+        `SELECT suspended_count AS suspendedCount, descriptor_ids_json AS descriptorIds
+         FROM room_business_timer_freeze_batches WHERE room_id = 'recovery-room'`,
+      ).get()).toEqual({
+        suspendedCount: 0,
+        descriptorIds: '["dao.ball-runtime.business-boundaries.v1"]',
+      });
+      expect(recovered.prepare(
+        `SELECT access_revision AS accessRevision, lease_generation AS leaseGeneration
+         FROM room_access_authority WHERE room_id = 'recovery-room'`,
+      ).get()).toEqual({ accessRevision: 1, leaseGeneration: 1 });
+    } finally {
+      recovered.close();
+    }
+  });
+
   it("fires after-domain-write after the message fact but before event, outbox, and idempotency", () => {
     const path = databasePath();
     const context = {
