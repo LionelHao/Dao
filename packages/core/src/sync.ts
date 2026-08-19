@@ -266,7 +266,7 @@ export type RoomSyncResult =
       readonly type: "room.sync.result";
       readonly requestId: string;
       readonly mode: "repair_required";
-      readonly reason: "cursor_absent" | "cursor_expired";
+      readonly reason: "cursor_absent" | "cursor_expired" | "operational_projection_changed";
       readonly retainedFromSeq: number;
       readonly watermark: number;
     };
@@ -553,7 +553,8 @@ export function isRoomSyncResult(value: unknown): value is RoomSyncResult {
   }
   if (value.mode === "repair_required") {
     return exact(value, ["type", "requestId", "mode", "reason", "retainedFromSeq", "watermark"]) &&
-      (value.reason === "cursor_absent" || value.reason === "cursor_expired") &&
+      (value.reason === "cursor_absent" || value.reason === "cursor_expired" ||
+        value.reason === "operational_projection_changed") &&
       count(value.retainedFromSeq) && value.retainedFromSeq >= 1 &&
       count(value.watermark) && value.retainedFromSeq <= value.watermark + 1;
   }

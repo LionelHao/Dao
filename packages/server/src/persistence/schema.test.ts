@@ -2392,11 +2392,11 @@ describe("authority SQLite schema", () => {
 });
 
 describe("derived snapshot cache schema", () => {
-  it("creates independent v1 WAL/FULL tables without changing authority v16", () => {
+  it("creates independent v2 WAL/FULL tables without changing authority v16", () => {
     withDatabase((database) => {
       migrateSnapshotCacheDatabase(database);
-      expect(SNAPSHOT_CACHE_SCHEMA_VERSION).toBe(1);
-      expect(readSchemaVersion(database)).toBe(1);
+      expect(SNAPSHOT_CACHE_SCHEMA_VERSION).toBe(2);
+      expect(readSchemaVersion(database)).toBe(2);
       expect(listSnapshotCacheTables(database)).toEqual([
         "expired_snapshot_tombstones",
         "repair_snapshot_pages",
@@ -2411,7 +2411,7 @@ describe("derived snapshot cache schema", () => {
     expect(AUTHORITY_SCHEMA_VERSION).toBe(16);
   });
 
-  it("fails closed on version-one corruption and refuses future versions", () => {
+  it("fails closed on version-two corruption and refuses future versions", () => {
     withDatabase((database) => {
       migrateSnapshotCacheDatabase(database);
       database.exec("ALTER TABLE repair_snapshot_pages DROP COLUMN canonical_bytes");
@@ -2419,9 +2419,9 @@ describe("derived snapshot cache schema", () => {
       expect(() => migrateSnapshotCacheDatabase(database)).toThrow(/column contract/i);
     });
     withDatabase((database) => {
-      database.exec("PRAGMA user_version = 2");
+      database.exec("PRAGMA user_version = 3");
       expect(() => migrateSnapshotCacheDatabase(database)).toThrow(/incompatible/i);
-      expect(readSchemaVersion(database)).toBe(2);
+      expect(readSchemaVersion(database)).toBe(3);
     });
   });
 

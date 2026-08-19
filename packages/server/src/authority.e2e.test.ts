@@ -11,6 +11,7 @@ import { WebSocket } from "ws";
 import {
   createIdentitySessionController,
   type AuthorizedStateInvalidator,
+  type IdentityAuthoritySession,
   type IdentitySessionController,
 } from "../../desktop/src/identity/controller.js";
 import {
@@ -30,6 +31,8 @@ import {
   startAuthoritativeServer,
   type AuthoritativeServer,
 } from "./authoritative-server.js";
+import { createWorkerDatabaseClient } from "./persistence/worker-database-client.js";
+import { createWorkerRuntimeAuthority } from "./agent-runtime/worker-runtime-authority.js";
 import type { ServerFrame } from "./protocol.js";
 import {
   createClientSyncReplica,
@@ -38,6 +41,12 @@ import {
   type SyncTransport,
 } from "../../desktop/src/sync/client-sync-replica.js";
 import { createDesktopGovernanceRuntime } from "../../desktop/src/governance/production-runtime.js";
+import {
+  createDesktopMessageAuthorityRuntime,
+  type DesktopMessageAuthorityRuntime,
+} from "../../desktop/src/message-authority/production-runtime.js";
+import type { MessageAuthorityPortInput } from
+  "../../desktop/src/message-authority/contracts.js";
 import {
   type GovernanceWebSocketLike,
 } from "../../desktop/src/governance/websocket-authority.js";
@@ -80,6 +89,13 @@ const actors = [
     toolPermissions: ["authority.inspect"],
   },
 ] as const;
+const previewActors = [
+  actors[0],
+  {
+    ...actors[1],
+    toolPermissions: ["repository.git-status"],
+  },
+] as const satisfies readonly Actor[];
 const childStderr = new WeakMap<ChildProcessWithoutNullStreams, string>();
 const stressPageSize = 50;
 
@@ -138,6 +154,10 @@ class NodeIdentityWebSocketAdapter implements IdentityWebSocketLike {
 
   close(code?: number, reason?: string): void {
     this.#socket.close(code, reason);
+  }
+
+  terminate(): void {
+    this.#socket.terminate();
   }
 }
 
@@ -225,6 +245,8 @@ interface ChildStartOptions {
   readonly seedMixedRoomId?: string;
   readonly emitUnrelatedWarningForTest?: true;
   readonly closeCleanupProbe?: true;
+  readonly seedRuntimeRoomForTest?: true;
+  readonly previewSentinelForTest?: string;
   readonly compactRoom?: {
     readonly roomId: string;
     readonly retainedFromSeq: number;
@@ -269,6 +291,12 @@ function startCommand(options: ChildStartOptions): Record<string, unknown> {
     ...(options.emitUnrelatedWarningForTest === undefined
       ? {} : { emitUnrelatedWarningForTest: true }),
     ...(options.closeCleanupProbe === undefined ? {} : { closeCleanupProbe: true }),
+    ...(options.seedRuntimeRoomForTest === undefined
+      ? {}
+      : { seedRuntimeRoomForTest: true }),
+    ...(options.previewSentinelForTest === undefined
+      ? {}
+      : { previewSentinelForTest: options.previewSentinelForTest }),
   };
 }
 
@@ -727,6 +755,35 @@ class JsonWebSocketClient {
   }
 }
 
+async function loginAuthorityDevice(
+  client: JsonWebSocketClient,
+  input: {
+    readonly requestId: string;
+    readonly accountId: string;
+    readonly secret: string;
+    readonly deviceId: string;
+  },
+): Promise<IdentityAuthoritySession> {
+  const frame = await client.request({
+    type: "auth.login",
+    requestId: input.requestId,
+    accountId: input.accountId,
+    secret: input.secret,
+    device: {
+      id: input.deviceId,
+      label: `Authority E2E ${input.deviceId}`,
+      platform: "unknown",
+    },
+  }, "auth.authenticated");
+  if (frame.type !== "auth.authenticated") throw new TypeError("wrong device login frame");
+  return {
+    actorId: frame.actorId,
+    sessionId: frame.sessionId,
+    accessToken: frame.accessToken,
+    expiresAt: frame.expiresAt,
+  };
+}
+
 function recordKey(record: RoomRepairRecord): string {
   const value = record.value as unknown as Record<string, unknown>;
   return `${record.kind}:${String(value.id ?? value.actorId ?? "room")}`;
@@ -1002,26 +1059,61 @@ async function discoverRoom(client: JsonWebSocketClient): Promise<string> {
 }
 
 async function repairRecords(client: JsonWebSocketClient, roomId: string) {
-  const first = await client.request({
-    type: "room.repair.begin",
-    requestId: "repair-begin",
-    roomId,
-  }, "room.repair.page");
-  if (!isRoomRepairPage(first)) throw new TypeError("wrong repair frame");
-  const records = [...first.records];
-  let page = first;
-  while (page.hasMore) {
-    const next = await client.request({
-      type: "room.repair.page",
-      requestId: `repair-page-${page.page}`,
-      snapshotId: page.snapshotId,
-      afterPage: page.page,
-    }, "room.repair.page");
-    if (!isRoomRepairPage(next)) throw new TypeError("wrong repair page");
-    records.push(...next.records);
-    page = next;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const first = await client.request({
+        type: "room.repair.begin",
+        requestId: `repair-begin-${attempt}`,
+        roomId,
+      }, "room.repair.page");
+      if (!isRoomRepairPage(first)) throw new TypeError("wrong repair frame");
+      const records = [...first.records];
+      let page = first;
+      while (page.hasMore) {
+        const next = await client.request({
+          type: "room.repair.page",
+          requestId: `repair-page-${attempt}-${page.page}`,
+          snapshotId: page.snapshotId,
+          afterPage: page.page,
+        }, "room.repair.page");
+        if (!isRoomRepairPage(next)) throw new TypeError("wrong repair page");
+        records.push(...next.records);
+        page = next;
+      }
+      return { records, watermark: first.watermark, checksum: first.snapshotChecksum };
+    } catch (error: unknown) {
+      if (!isRecord(error) || error.code !== "snapshot_stale" || attempt === 2) throw error;
+    }
   }
-  return { records, watermark: first.watermark, checksum: first.snapshotChecksum };
+  throw new Error("Room repair retry bound was exhausted");
+}
+
+function authoritySentinelHits(databasePath: string, sentinel: string): readonly string[] {
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    const hits: string[] = [];
+    const tables = database.prepare(
+      `SELECT name FROM sqlite_schema
+       WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+       ORDER BY name`,
+    ).all() as Array<{ readonly name: string }>;
+    for (const { name } of tables) {
+      const quotedTable = `"${name.replaceAll('"', '""')}"`;
+      const columns = database.prepare(`PRAGMA table_info(${quotedTable})`).all() as
+        Array<{ readonly name: string }>;
+      for (const column of columns) {
+        const quotedColumn = `"${column.name.replaceAll('"', '""')}"`;
+        const row = database.prepare(
+          `SELECT COUNT(*) AS count FROM ${quotedTable}
+           WHERE instr(CAST(${quotedColumn} AS TEXT), ?) > 0`,
+        ).get(sentinel) as { readonly count: number };
+        if (row.count > 0) hits.push(`${name}.${column.name}:${row.count}`);
+      }
+    }
+    return hits;
+  } finally {
+    database.close();
+  }
 }
 
 async function seedDirectory(directory: string): Promise<string> {
@@ -1214,6 +1306,732 @@ describe("authoritative server real-process harness", () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+
+  it("replays one structured v2 aggregate after an unconsumed ACK, changed requests, and restart", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-ft03-message-replay-"));
+    const messageActors = [
+      ...actors,
+      { id: "human-b", kind: "human", displayName: "Human B", reachability: "online" },
+    ] satisfies readonly Actor[];
+    const identities = [
+      { accountId: "account-a", actorId: "human-a", secret: "test-secret" },
+      { accountId: "account-b", actorId: "human-b", secret: "test-secret-b" },
+    ] as const;
+    const clients: JsonWebSocketClient[] = [];
+    let started: Awaited<ReturnType<typeof spawnAuthorityChild>> | undefined;
+    try {
+      const seeded = await spawnAuthorityChild({
+        directory,
+        actors: messageActors,
+        identities,
+        seedAllFacts: true,
+      });
+      const seedClient = await JsonWebSocketClient.connect(seeded.url);
+      clients.push(seedClient);
+      await loginAuthorityDevice(seedClient, {
+        requestId: "message-v2-replay-seed-login",
+        accountId: "account-a",
+        secret: "test-secret",
+        deviceId: "message-v2-seed-device",
+      });
+      const roomId = await discoverRoom(seedClient);
+      seedClient.close();
+      await stopChild(seeded.child);
+
+      const setup = new DatabaseSync(join(directory, "authority.sqlite"));
+      setup.prepare(
+        `INSERT INTO room_memberships (
+           room_id, actor_id, kind, role, participation, tool_permissions_json,
+           joined_at, configured_at, access_revision
+         ) VALUES (?, 'human-b', 'human', 'member', NULL, '[]', ?, NULL, 0)`,
+      ).run(roomId, "2026-08-19T00:00:00.000Z");
+      setup.close();
+
+      started = await spawnAuthorityChild({ directory, actors: messageActors, identities });
+      const [observerA, sender, observerB] = await Promise.all([
+        JsonWebSocketClient.connect(started.url),
+        JsonWebSocketClient.connect(started.url),
+        JsonWebSocketClient.connect(started.url),
+      ]);
+      clients.push(observerA, sender, observerB);
+      await Promise.all([
+        loginAuthorityDevice(observerA, {
+          requestId: "message-v2-device-a-login",
+          accountId: "account-a",
+          secret: "test-secret",
+          deviceId: "message-v2-device-a",
+        }),
+        loginAuthorityDevice(sender, {
+          requestId: "message-v2-device-b-login",
+          accountId: "account-a",
+          secret: "test-secret",
+          deviceId: "message-v2-device-b",
+        }),
+        loginAuthorityDevice(observerB, {
+          requestId: "message-v2-human-b-login",
+          accountId: "account-b",
+          secret: "test-secret-b",
+          deviceId: "message-v2-human-b-device",
+        }),
+      ]);
+      const head = readRoomHeadSeq(directory, roomId);
+      await Promise.all([observerA, observerB].map((client, index) => client.request({
+        type: "room.subscribe.v2",
+        requestId: `message-v2-replay-subscribe-${index}`,
+        roomId,
+        cursor: { version: 1, roomId, afterSeq: head },
+      }, "room.subscribed.v2")));
+
+      const message = {
+        messageId: "message-v2-ack-loss-replay",
+        roomId,
+        body: "@Human B @Agent A production request",
+        mentionedTargets: [
+          {
+            id: "target-human-b",
+            kind: "human-request",
+            targetActorId: "human-b",
+            range: { startUtf16: 0, endUtf16: 8 },
+          },
+          {
+            id: "target-agent-a",
+            kind: "agent-invocation",
+            targetActorId: "agent-a",
+            range: { startUtf16: 9, endUtf16: 17 },
+          },
+        ],
+        replyToMessageId: "message-human-authority",
+        attachments: [],
+      } as const;
+      const observerAEvent = observerA.waitFor((frame) => frame.type === "room.event" &&
+        frame.event.roomId === roomId && frame.event.type === "room.message.accepted" &&
+        frame.event.payload.id === message.messageId);
+      const observerBEvent = observerB.waitFor((frame) => frame.type === "room.event" &&
+        frame.event.roomId === roomId && frame.event.type === "room.message.accepted" &&
+        frame.event.payload.id === message.messageId);
+      sender.send({
+        type: "message.send.v2",
+        requestId: "message-v2-unconsumed-ack",
+        message,
+      });
+      let stableEventA: ServerFrame;
+      let stableEventB: ServerFrame;
+      try {
+        [stableEventA, stableEventB] = await Promise.all([observerAEvent, observerBEvent]);
+      } catch (error: unknown) {
+        throw new Error(`Structured v2 event did not converge: ${JSON.stringify({
+          observerA: observerA.frames(),
+          sender: sender.frames(),
+          observerB: observerB.frames(),
+        })}`, { cause: error });
+      }
+      expect(stableEventA).toEqual(stableEventB);
+      if (stableEventA.type !== "room.event") throw new TypeError("wrong stable message event");
+      sender.terminate();
+
+      const replayClient = await JsonWebSocketClient.connect(started.url);
+      clients.push(replayClient);
+      await loginAuthorityDevice(replayClient, {
+        requestId: "message-v2-replay-login",
+        accountId: "account-a",
+        secret: "test-secret",
+        deviceId: "message-v2-replay-device",
+      });
+      const replay = await replayClient.request({
+        type: "message.send.v2",
+        requestId: "message-v2-replay-new-request",
+        message,
+      }, "message.accepted");
+      expect(replay).toMatchObject({
+        type: "message.accepted",
+        requestId: "message-v2-replay-new-request",
+        messageId: message.messageId,
+        targetOutcomes: [
+          {
+            targetId: "target-human-b",
+            targetActorId: "human-b",
+            kind: "human-request",
+            status: "request-created",
+            requestIntentId: expect.any(String),
+          },
+          {
+            targetId: "target-agent-a",
+            targetActorId: "agent-a",
+            kind: "agent-invocation",
+            status: "invocation-intent-created",
+            invocationIntentId: expect.any(String),
+          },
+        ],
+      });
+      if (replay.type !== "message.accepted") throw new TypeError("wrong replay ACK");
+
+      const changedMessages = [
+        { ...message, body: `${message.body}!` },
+        {
+          ...message,
+          mentionedTargets: [
+            { ...message.mentionedTargets[0], targetActorId: "human-a" },
+            message.mentionedTargets[1],
+          ],
+        },
+        {
+          ...message,
+          mentionedTargets: [
+            { ...message.mentionedTargets[0], range: { startUtf16: 0, endUtf16: 7 } },
+            message.mentionedTargets[1],
+          ],
+        },
+        {
+          messageId: message.messageId,
+          roomId: message.roomId,
+          body: message.body,
+          mentionedTargets: message.mentionedTargets,
+          attachments: message.attachments,
+        },
+      ] as const;
+      for (const [index, changed] of changedMessages.entries()) {
+        await expect(replayClient.request({
+          type: "message.send.v2",
+          requestId: `message-v2-changed-${index}`,
+          message: changed,
+        }, "message.accepted")).rejects.toMatchObject({
+          status: 409,
+          code: "idempotency_conflict",
+        });
+      }
+
+      for (const client of [observerA, observerB, replayClient]) client.close();
+      await stopChild(started.child);
+      started = await spawnAuthorityChild({ directory, actors: messageActors, identities });
+      const restartedClient = await JsonWebSocketClient.connect(started.url);
+      clients.push(restartedClient);
+      await loginAuthorityDevice(restartedClient, {
+        requestId: "message-v2-restart-login",
+        accountId: "account-a",
+        secret: "test-secret",
+        deviceId: "message-v2-restart-device",
+      });
+      await expect(restartedClient.request({
+        type: "message.send.v2",
+        requestId: "message-v2-restart-replay",
+        message,
+      }, "message.accepted")).resolves.toEqual({
+        ...replay,
+        requestId: "message-v2-restart-replay",
+      });
+      restartedClient.close();
+      await stopChild(started.child);
+      started = undefined;
+
+      const database = new DatabaseSync(join(directory, "authority.sqlite"), { readOnly: true });
+      try {
+        expect(database.prepare(
+          `SELECT
+             (SELECT COUNT(*) FROM messages WHERE id = ?) AS messages,
+             (SELECT COUNT(*) FROM message_revisions WHERE message_id = ?) AS revisions,
+             (SELECT COUNT(*) FROM message_envelopes WHERE message_id = ?) AS envelopes,
+             (SELECT COUNT(*) FROM message_mentions WHERE message_id = ?) AS mentions,
+             (SELECT COUNT(*) FROM message_target_outcomes WHERE message_id = ?) AS outcomes,
+             (SELECT COUNT(*) FROM human_request_intents WHERE source_message_id = ?) AS humanIntents,
+             (SELECT COUNT(*) FROM agent_invocation_intents
+                WHERE source_message_id = ? AND origin_kind = 'message_target') AS agentIntents,
+             (SELECT COUNT(*) FROM message_reply_links WHERE message_id = ?) AS replyLinks,
+             (SELECT COUNT(*) FROM message_attachment_links WHERE message_id = ?) AS attachments,
+             (SELECT COUNT(*) FROM events WHERE event_id = ?) AS events,
+             (SELECT COUNT(*) FROM outbox_deliveries WHERE event_id = ?) AS outbox,
+             (SELECT COUNT(*) FROM idempotency_records WHERE key = ?) AS receipts`,
+        ).get(
+          message.messageId,
+          message.messageId,
+          message.messageId,
+          message.messageId,
+          message.messageId,
+          message.messageId,
+          message.messageId,
+          message.messageId,
+          message.messageId,
+          stableEventA.event.eventId,
+          stableEventA.event.eventId,
+          message.messageId,
+        )).toEqual({
+          messages: 1,
+          revisions: 1,
+          envelopes: 1,
+          mentions: 2,
+          outcomes: 2,
+          humanIntents: 1,
+          agentIntents: 1,
+          replyLinks: 1,
+          attachments: 0,
+          events: 1,
+          outbox: 1,
+          receipts: 1,
+        });
+      } finally {
+        database.close();
+      }
+    } finally {
+      for (const client of clients) client.close();
+      if (started !== undefined) await stopChild(started.child);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("keeps provider preview transient across source recall while preserving completed and dispatched facts", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-preview-recall-sentinel-"));
+    const databasePath = join(directory, "authority.sqlite");
+    const sentinel = "PREVIEW-MUST-STAY-TRANSIENT-7D04FBD1";
+    let started: Awaited<ReturnType<typeof spawnAuthorityChild>> | undefined;
+    let client: JsonWebSocketClient | undefined;
+    let runtimeClient: Awaited<ReturnType<typeof createWorkerDatabaseClient>> | undefined;
+    try {
+      started = await spawnAuthorityChild({
+        directory,
+        actors: previewActors,
+        seedRuntimeRoomForTest: true,
+        previewSentinelForTest: sentinel,
+      });
+      client = await JsonWebSocketClient.connect(started.url);
+      await client.login("preview-recall-login");
+      const roomId = await discoverRoom(client);
+      await client.request({
+        type: "room.subscribe.v2",
+        requestId: "preview-recall-subscribe",
+        roomId,
+        cursor: { version: 1, roomId, afterSeq: readRoomHeadSeq(directory, roomId) },
+      }, "room.subscribed.v2");
+
+      const submit = async (messageId: string, body: string): Promise<void> => {
+        await expect(client!.request({
+          type: "message.send.v2",
+          requestId: `submit-${messageId}`,
+          message: { messageId, roomId, body, mentionedTargets: [], attachments: [] },
+        }, "message.accepted")).resolves.toMatchObject({ messageId, targetOutcomes: [] });
+      };
+      const invoke = async (messageId: string) => {
+        const frame = await client!.request({
+          type: "agent.invoke",
+          requestId: `invoke-${messageId}`,
+          intent: {
+            kind: "direct_mention",
+            roomId,
+            sourceMessageId: messageId,
+            targetAgentId: "agent-a",
+          },
+        }, "agent.execution.ack");
+        if (frame.type !== "agent.execution.ack") throw new TypeError("wrong execution ACK");
+        return frame.execution;
+      };
+
+      const completedSourceId = "message-preview-completed";
+      await submit(completedSourceId, "complete before source recall");
+      const completedExecution = await invoke(completedSourceId);
+      await vi.waitFor(() => {
+        const database = new DatabaseSync(databasePath, { readOnly: true });
+        try {
+          expect(database.prepare(
+            "SELECT status FROM agent_executions WHERE id = ?",
+          ).get(completedExecution.id)).toEqual({ status: "completed" });
+        } finally {
+          database.close();
+        }
+      });
+      await expect(client.request({
+        type: "message.recall",
+        requestId: "recall-completed-preview-source",
+        roomId,
+        messageId: completedSourceId,
+        expectedRevision: 1,
+      }, "message.recall.accepted")).resolves.toMatchObject({
+        messageId: completedSourceId,
+        revision: 1,
+      });
+
+      const previewSourceId = "message-preview-running";
+      await submit(previewSourceId, "run a read tool then wait on preview");
+      const runningExecution = await invoke(previewSourceId);
+      await expect(client.waitFor((frame) =>
+        frame.type === "agent.execution.preview" &&
+        frame.executionId === runningExecution.id && frame.delta === sentinel,
+      )).resolves.toMatchObject({
+        type: "agent.execution.preview",
+        executionId: runningExecution.id,
+        delta: sentinel,
+        authoritative: false,
+      });
+
+      const beforeRecall = new DatabaseSync(databasePath, { readOnly: true });
+      let retainedDispatch: unknown;
+      try {
+        retainedDispatch = beforeRecall.prepare(
+          `SELECT dispatch_id AS dispatchId, state
+           FROM tool_dispatches WHERE execution_id = ?`,
+        ).get(runningExecution.id);
+        expect(retainedDispatch).toEqual(expect.objectContaining({ state: "succeeded" }));
+        expect(authoritySentinelHits(databasePath, sentinel)).toEqual([]);
+      } finally {
+        beforeRecall.close();
+      }
+
+      await expect(client.request({
+        type: "message.recall",
+        requestId: "recall-running-preview-source",
+        roomId,
+        messageId: previewSourceId,
+        expectedRevision: 1,
+      }, "message.recall.accepted")).resolves.toMatchObject({
+        messageId: previewSourceId,
+        revision: 1,
+      });
+
+      const history = await client.request({
+        type: "room.history.v2",
+        requestId: "preview-sentinel-history",
+        roomId,
+      }, "room.history.v2");
+      const revisions = await client.request({
+        type: "message.revisions.query",
+        requestId: "preview-sentinel-revisions",
+        roomId,
+        messageId: previewSourceId,
+      }, "message.revisions");
+      const repair = await repairRecords(client, roomId);
+      expect(JSON.stringify({ history, revisions, repair })).not.toContain(sentinel);
+      expect(revisions).toMatchObject({ revisions: [] });
+
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      try {
+        expect(database.prepare(
+          "SELECT status FROM agent_executions WHERE id = ?",
+        ).get(runningExecution.id)).toEqual({ status: "cancelled" });
+        expect(database.prepare(
+          "SELECT status FROM agent_executions WHERE id = ?",
+        ).get(completedExecution.id)).toEqual({ status: "completed" });
+        expect(database.prepare(
+          `SELECT dispatch_id AS dispatchId, state
+           FROM tool_dispatches WHERE execution_id = ?`,
+        ).get(runningExecution.id)).toEqual(retainedDispatch);
+        expect(database.prepare(
+          `SELECT COUNT(*) AS count FROM messages
+           WHERE author_kind = 'agent' AND body = ?`,
+        ).get(sentinel)).toEqual({ count: 0 });
+        expect(database.prepare(
+          `SELECT COUNT(*) AS count FROM messages
+           WHERE author_kind = 'agent'`,
+        ).get()).toEqual({ count: 1 });
+        expect(authoritySentinelHits(databasePath, sentinel)).toEqual([]);
+      } finally {
+        database.close();
+      }
+
+      client.close();
+      client = undefined;
+      await stopChild(started.child);
+      started = undefined;
+      runtimeClient = await createWorkerDatabaseClient({ databasePath });
+      const runtimeContext = await createWorkerRuntimeAuthority(runtimeClient)
+        .readContext(runningExecution.id);
+      expect(JSON.stringify(runtimeContext)).not.toContain(sentinel);
+      await runtimeClient.close();
+      runtimeClient = undefined;
+      const durableBytes = Buffer.concat(await readAllRegularFiles(directory));
+      expect(durableBytes.includes(Buffer.from(sentinel, "utf8"))).toBe(false);
+    } finally {
+      await runtimeClient?.close().catch(() => undefined);
+      client?.close();
+      if (started !== undefined) await stopChild(started.child).catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("does not turn a provider preview into authority data after crash and reconnect repair", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-preview-crash-sentinel-"));
+    const databasePath = join(directory, "authority.sqlite");
+    const sentinel = "PREVIEW-CRASH-RECONNECT-ZERO-WRITE-58C3";
+    let first: Awaited<ReturnType<typeof spawnAuthorityChild>> | undefined;
+    let second: Awaited<ReturnType<typeof spawnAuthorityChild>> | undefined;
+    let client: JsonWebSocketClient | undefined;
+    try {
+      first = await spawnAuthorityChild({
+        directory,
+        actors: previewActors,
+        seedRuntimeRoomForTest: true,
+        previewSentinelForTest: sentinel,
+      });
+      client = await JsonWebSocketClient.connect(first.url);
+      await client.login("preview-crash-login");
+      const roomId = await discoverRoom(client);
+      await client.request({
+        type: "room.subscribe.v2",
+        requestId: "preview-crash-subscribe",
+        roomId,
+        cursor: { version: 1, roomId, afterSeq: readRoomHeadSeq(directory, roomId) },
+      }, "room.subscribed.v2");
+      const sourceMessageId = "message-preview-crash-running";
+      await client.request({
+        type: "message.send.v2",
+        requestId: "preview-crash-submit",
+        message: {
+          messageId: sourceMessageId,
+          roomId,
+          body: "crash after provider preview",
+          mentionedTargets: [],
+          attachments: [],
+        },
+      }, "message.accepted");
+      const invoked = await client.request({
+        type: "agent.invoke",
+        requestId: "preview-crash-invoke",
+        intent: {
+          kind: "direct_mention",
+          roomId,
+          sourceMessageId,
+          targetAgentId: "agent-a",
+        },
+      }, "agent.execution.ack");
+      if (invoked.type !== "agent.execution.ack") throw new TypeError("wrong execution ACK");
+      await client.waitFor((frame) => frame.type === "agent.execution.preview" &&
+        frame.executionId === invoked.execution.id && frame.delta === sentinel);
+
+      client.terminate();
+      client = undefined;
+      first.child.kill("SIGKILL");
+      await childExit(first.child);
+      first = undefined;
+      expect(authoritySentinelHits(databasePath, sentinel)).toEqual([]);
+
+      second = await spawnAuthorityChild({
+        directory,
+        actors: previewActors,
+        readbackOnly: true,
+        previewSentinelForTest: sentinel,
+      });
+      client = await JsonWebSocketClient.connect(second.url);
+      await client.login("preview-reconnect-login");
+      const repairedRoomId = await discoverRoom(client);
+      const repair = await repairRecords(client, repairedRoomId);
+      const history = await client.request({
+        type: "room.history.v2",
+        requestId: "preview-reconnect-history",
+        roomId: repairedRoomId,
+      }, "room.history.v2");
+      expect(JSON.stringify({ repair, history })).not.toContain(sentinel);
+      expect(authoritySentinelHits(databasePath, sentinel)).toEqual([]);
+      const durableBytes = Buffer.concat(await readAllRegularFiles(directory));
+      expect(durableBytes.includes(Buffer.from(sentinel, "utf8"))).toBe(false);
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      try {
+        expect(database.prepare(
+          `SELECT COUNT(*) AS count FROM messages
+           WHERE author_kind = 'agent' AND body = ?`,
+        ).get(sentinel)).toEqual({ count: 0 });
+      } finally {
+        database.close();
+      }
+    } finally {
+      client?.close();
+      if (first !== undefined) await stopChild(first.child).catch(() => undefined);
+      if (second !== undefined) await stopChild(second.child).catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("restores three production Desktop message runtimes from an expired cursor through revise, recall, clear, and restart", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-ft03-desktop-repair-"));
+    const runtimes: DesktopMessageAuthorityRuntime[] = [];
+    const rawClients: JsonWebSocketClient[] = [];
+    let started: Awaited<ReturnType<typeof spawnAuthorityChild>> | undefined;
+    try {
+      const roomId = await seedDirectory(directory);
+      const seededHead = readRoomHeadSeq(directory, roomId);
+      expect(seededHead).toBeGreaterThan(1);
+      await compactRoomStream(directory, roomId, seededHead);
+
+      started = await spawnAuthorityChild({ directory });
+      const sessions: IdentityAuthoritySession[] = [];
+      for (const deviceId of ["desktop-message-a", "desktop-message-b", "desktop-message-c"]) {
+        const loginClient = await JsonWebSocketClient.connect(started.url);
+        rawClients.push(loginClient);
+        sessions.push(await loginAuthorityDevice(loginClient, {
+          requestId: `${deviceId}-login`,
+          accountId: "account-a",
+          secret: "test-secret",
+          deviceId,
+        }));
+        loginClient.close();
+      }
+
+      const socketGroups = sessions.map(() => [] as NodeIdentityWebSocketAdapter[]);
+      const inputs = sessions.map(() => [] as MessageAuthorityPortInput[]);
+      const active = sessions.map((session, index) => {
+        const runtime = createDesktopMessageAuthorityRuntime({
+          endpoint: started!.url,
+          session: () => session,
+          webSocketFactory(endpoint) {
+            const socket = new NodeIdentityWebSocketAdapter(endpoint);
+            socketGroups[index]!.push(socket);
+            return socket;
+          },
+          timeoutMs: 5_000,
+        });
+        runtimes.push(runtime);
+        runtime.client.subscribe((input) => inputs[index]!.push(structuredClone(input)));
+        return runtime;
+      });
+      const initial = await Promise.all(active.map((runtime, index) =>
+        runtime.client.historyV2({
+          type: "room.history.v2",
+          requestId: `desktop-message-initial-${index}`,
+          roomId,
+        })));
+      expect(initial.every((history) => history.status === "ready")).toBe(true);
+      const initialWatermarks = initial.map((history) =>
+        history.status === "ready" ? history.watermark : -1);
+      expect(new Set(initialWatermarks).size).toBe(1);
+      const initialWatermark = initialWatermarks[0]!;
+      expect(initialWatermark).toBeGreaterThanOrEqual(seededHead);
+      for (const received of inputs) {
+        expect(received).toContainEqual({
+          type: "message.connection",
+          roomId,
+          connection: { status: "repairing", watermark: initialWatermark },
+        });
+      }
+
+      const acceptedBody = "DESKTOP-V2-ACCEPTED-RAW-SENTINEL";
+      const revisedBody = "DESKTOP-V2-REVISED-RAW-SENTINEL";
+      const messageId = "message-v2-desktop-repair";
+      await expect(active[0]!.client.sendV2({
+        type: "message.send.v2",
+        requestId: "desktop-message-send",
+        message: {
+          messageId,
+          roomId,
+          body: acceptedBody,
+          mentionedTargets: [],
+          attachments: [],
+        },
+      })).resolves.toMatchObject({
+        type: "message.accepted",
+        requestId: "desktop-message-send",
+        messageId,
+      });
+      await vi.waitFor(() => {
+        expect(inputs.every((received) => received.some((input) =>
+          input.type === "room.event" && input.event.type === "room.message.accepted" &&
+          input.event.payload.id === messageId))).toBe(true);
+      }, { timeout: 5_000 });
+
+      socketGroups[2]!.at(-1)!.terminate();
+      await vi.waitFor(() => {
+        expect(inputs[2]).toContainEqual({
+          type: "message.connection",
+          roomId,
+          connection: expect.objectContaining({ status: "offline" }),
+        });
+      }, { timeout: 5_000 });
+      await expect(active[0]!.client.revise({
+        type: "message.revise",
+        requestId: "desktop-message-revise",
+        roomId,
+        messageId,
+        expectedRevision: 1,
+        body: revisedBody,
+      })).resolves.toMatchObject({
+        type: "message.revision.accepted",
+        requestId: "desktop-message-revise",
+        messageId,
+        revision: 2,
+      });
+      await vi.waitFor(() => {
+        expect(inputs.slice(0, 2).every((received) => received.some((input) =>
+          input.type === "room.event" && input.event.type === "room.message.revised" &&
+          input.event.payload.id === messageId))).toBe(true);
+      }, { timeout: 5_000 });
+
+      const reconnected = await active[2]!.client.historyV2({
+        type: "room.history.v2",
+        requestId: "desktop-message-reconnect-c",
+        roomId,
+      });
+      if (reconnected.status !== "ready") throw new TypeError("Desktop C did not reconnect");
+      expect(reconnected.messages).toContainEqual(expect.objectContaining({
+        id: messageId,
+        lifecycle: "active",
+        currentRevision: expect.objectContaining({ revision: 2, body: revisedBody }),
+      }));
+
+      active[1]!.clearAndRestore(roomId);
+      const cleared = await active[1]!.client.historyV2({
+        type: "room.history.v2",
+        requestId: "desktop-message-clear-b",
+        roomId,
+      });
+      if (cleared.status !== "ready") throw new TypeError("Desktop B did not clear and restore");
+      expect(cleared.generation).toBeGreaterThan(
+        initial[1]!.status === "ready" ? initial[1].generation : 0,
+      );
+      expect(cleared.messages).toContainEqual(expect.objectContaining({
+        id: messageId,
+        currentRevision: expect.objectContaining({ revision: 2, body: revisedBody }),
+      }));
+
+      for (const received of inputs) received.length = 0;
+      await expect(active[0]!.client.recall({
+        type: "message.recall",
+        requestId: "desktop-message-recall",
+        roomId,
+        messageId,
+        expectedRevision: 2,
+      })).resolves.toMatchObject({
+        type: "message.recall.accepted",
+        requestId: "desktop-message-recall",
+        messageId,
+        revision: 2,
+      });
+      await vi.waitFor(() => {
+        expect(inputs.every((received) => received.some((input) =>
+          input.type === "room.event" && input.event.type === "room.message.recalled" &&
+          input.event.payload.id === messageId))).toBe(true);
+      }, { timeout: 5_000 });
+      expect(JSON.stringify(inputs)).not.toContain(acceptedBody);
+      expect(JSON.stringify(inputs)).not.toContain(revisedBody);
+
+      for (const runtime of active) runtime.close();
+      await stopChild(started.child);
+      started = await spawnAuthorityChild({ directory });
+      const restarted = sessions.map((session) => {
+        const runtime = createDesktopMessageAuthorityRuntime({
+          endpoint: started!.url,
+          session: () => session,
+          webSocketFactory: (endpoint) => new NodeIdentityWebSocketAdapter(endpoint),
+          timeoutMs: 5_000,
+        });
+        runtimes.push(runtime);
+        return runtime;
+      });
+      const finalHistories = await Promise.all(restarted.map((runtime, index) =>
+        runtime.client.historyV2({
+          type: "room.history.v2",
+          requestId: `desktop-message-restart-${index}`,
+          roomId,
+        })));
+      for (const history of finalHistories) {
+        if (history.status !== "ready") throw new TypeError("Desktop restart was not ready");
+        expect(history.messages).toContainEqual(expect.objectContaining({
+          id: messageId,
+          lifecycle: "recalled",
+        }));
+      }
+      expect(JSON.stringify(finalHistories)).not.toContain(acceptedBody);
+      expect(JSON.stringify(finalHistories)).not.toContain(revisedBody);
+    } finally {
+      for (const runtime of runtimes) runtime.close();
+      for (const client of rawClients) client.close();
+      if (started !== undefined) await stopChild(started.child);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it("drives three isolated Desktop Identity controllers through real password login and targeted device revocation", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-ft01-desktop-authority-"));

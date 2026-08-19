@@ -188,6 +188,36 @@ export interface SourceScopedRuntimeCoordinator {
   discardTransientPreviews(reason: TransientPreviewResetReason): void;
 }
 
+export interface CommittedMessageRecallRuntimeInput {
+  readonly sourceMessageId: string;
+  readonly cancellations: readonly CommittedSourceExecutionCancellation[];
+}
+
+export interface RuntimeProviderPreview extends TransientAgentPreview {
+  readonly roomId: string;
+}
+
+export interface SourceScopedRuntimeBoundaryOptions {
+  readonly runtime?: Readonly<{
+    applyCommittedMessageRecall(input: CommittedMessageRecallRuntimeInput): void | Promise<void>;
+  }>;
+  readonly preview?: Readonly<{
+    publish(preview: RuntimeProviderPreview): void;
+  }>;
+  readonly onPostCommitError?: (
+    error: unknown,
+    context: SourceScopedRuntimePostCommitErrorContext,
+  ) => void;
+}
+
+export interface SourceScopedRuntimeBoundary {
+  coordinateRecallCommit<Receipt>(
+    commit: () => Promise<Receipt>,
+    selectRuntimeInput: (receipt: Receipt) => CommittedMessageRecallRuntimeInput,
+  ): Promise<Receipt>;
+  publishPreview(preview: RuntimeProviderPreview): void;
+}
+
 type UnknownRecord = Record<string, unknown>;
 
 interface ActiveSourceState {
@@ -369,6 +399,109 @@ function validPreview(value: unknown): value is TransientAgentPreview {
 
 function contractError(message: string): TypeError {
   return new TypeError(message);
+}
+
+function validCommittedRecallRuntimeInput(
+  value: unknown,
+): value is CommittedMessageRecallRuntimeInput {
+  if (!record(value) || !exact(value, ["sourceMessageId", "cancellations"]) ||
+      !identifier(value.sourceMessageId) || !Array.isArray(value.cancellations) ||
+      value.cancellations.length > MAX_SOURCE_EFFECTS) {
+    return false;
+  }
+  const executionIds = new Set<string>();
+  for (const cancellation of value.cancellations) {
+    if (!record(cancellation) || cancellation.sourceMessageId !== value.sourceMessageId ||
+        !positiveInteger(cancellation.sourceRevision) ||
+        !executionCancellation(
+          cancellation,
+          value.sourceMessageId,
+          cancellation.sourceRevision,
+        ) || executionIds.has(cancellation.executionId)) {
+      return false;
+    }
+    executionIds.add(cancellation.executionId);
+  }
+  return true;
+}
+
+/**
+ * Production composition boundary for effects that are allowed only after the
+ * AuthorityWorker recall transaction resolves. It deliberately has no
+ * persistence method: provider previews cannot be routed back into authority.
+ */
+export function createSourceScopedRuntimeBoundary(
+  options: SourceScopedRuntimeBoundaryOptions,
+): SourceScopedRuntimeBoundary {
+  const report = (
+    error: unknown,
+    context: SourceScopedRuntimePostCommitErrorContext,
+  ): void => {
+    try {
+      options.onPostCommitError?.(error, context);
+    } catch {
+      // Diagnostics cannot change a committed authority result or preview lifecycle.
+    }
+  };
+  return Object.freeze({
+    async coordinateRecallCommit<Receipt>(
+      commit: () => Promise<Receipt>,
+      selectRuntimeInput: (receipt: Receipt) => CommittedMessageRecallRuntimeInput,
+    ): Promise<Receipt> {
+      const receipt = await commit();
+      let selected: unknown;
+      try {
+        selected = selectRuntimeInput(receipt);
+      } catch (error: unknown) {
+        report(error, { phase: "abort" });
+        return receipt;
+      }
+      if (!validCommittedRecallRuntimeInput(selected)) {
+        const sourceMessageId = record(selected) && typeof selected.sourceMessageId === "string"
+          ? selected.sourceMessageId
+          : undefined;
+        report(
+          contractError("Committed message recall runtime input was malformed"),
+          sourceMessageId === undefined
+            ? { phase: "abort" }
+            : { phase: "abort", sourceMessageId },
+        );
+        return receipt;
+      }
+      const input = selected;
+      try {
+        await options.runtime?.applyCommittedMessageRecall(input);
+      } catch (error: unknown) {
+        report(error, {
+          phase: "abort",
+          sourceMessageId: input.sourceMessageId,
+        });
+      }
+      return receipt;
+    },
+    publishPreview(preview: RuntimeProviderPreview): void {
+      if (!record(preview) || !exact(preview, [
+        "roomId", "sourceMessageId", "executionId", "attemptSeq", "streamSeq", "delta",
+      ]) || !identifier(preview.roomId) || !validPreview({
+        sourceMessageId: preview.sourceMessageId,
+        executionId: preview.executionId,
+        attemptSeq: preview.attemptSeq,
+        streamSeq: preview.streamSeq,
+        delta: preview.delta,
+      })) {
+        throw contractError("Transient Agent preview was malformed");
+      }
+      try {
+        options.preview?.publish(preview);
+      } catch (error: unknown) {
+        report(error, {
+          phase: "preview",
+          sourceMessageId: preview.sourceMessageId,
+          executionId: preview.executionId,
+        });
+      }
+    },
+  });
 }
 
 export function createSourceScopedRuntimeCoordinator(

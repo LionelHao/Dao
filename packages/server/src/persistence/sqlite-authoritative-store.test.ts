@@ -15,6 +15,10 @@ import {
 import { createAesGcmInvitationSecretProtector } from "../invitation-secret-protector.js";
 import { mintInternalAgentMessageCommitContext } from
   "../message-authority/internal-message-capability.js";
+import {
+  submitHumanMessageDatabaseCommand,
+  type MessageAuthoritySubmitFaultPointForTest,
+} from "./authority-database-handler.js";
 import { createSqliteAuthoritativeStore } from "./sqlite-authoritative-store.js";
 import {
   mintInternalAgentCommandContext,
@@ -519,6 +523,7 @@ const matrixIdentities: IdentityAdapter = {
 interface MatrixContexts {
   readonly roomId: string;
   readonly owner: AuthenticatedCommandContext;
+  readonly ownerSecondDevice: AuthenticatedCommandContext;
   readonly invitee: AuthenticatedCommandContext;
 }
 
@@ -603,12 +608,20 @@ async function createCommandMatrixFixture(databasePath: string): Promise<{
     tokenFactory: tokenSequence(
       "matrix-owner-access", "matrix-owner-refresh",
       "matrix-invitee-access", "matrix-invitee-refresh",
+      "matrix-owner-second-access", "matrix-owner-second-refresh",
     ),
   });
   const ownerIssued = await authentication.login({ accountId: "account-li", secret: "correct" });
   const inviteeIssued = await authentication.login({ accountId: "account-invitee", secret: "correct" });
+  const ownerSecondIssued = await authentication.login({
+    accountId: "account-li",
+    secret: "correct",
+  });
   const ownerSession = await authentication.authenticateSession(ownerIssued.accessToken);
   const inviteeSession = await authentication.authenticateSession(inviteeIssued.accessToken);
+  const ownerSecondSession = await authentication.authenticateSession(
+    ownerSecondIssued.accessToken,
+  );
   await bootstrapClient.close();
 
   const database = new DatabaseSync(databasePath);
@@ -676,6 +689,12 @@ async function createCommandMatrixFixture(databasePath: string): Promise<{
         requestId: "matrix-owner",
         idempotencyKey: "matrix-owner",
       },
+      ownerSecondDevice: {
+        ...ownerSecondSession,
+        kind: "human",
+        requestId: "matrix-owner-second",
+        idempotencyKey: "matrix-owner-second",
+      },
       invitee: {
         ...inviteeSession,
         kind: "human",
@@ -698,6 +717,63 @@ function authoritativeCountSnapshot(databasePath: string): Readonly<Record<strin
       table,
       Number(database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get()?.count),
     ]));
+  } finally {
+    database.close();
+  }
+}
+
+function messageAuthorityAggregateSnapshot(
+  databasePath: string,
+  messageId: string,
+): Readonly<Record<string, number>> {
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    const count = (sql: string, ...parameters: readonly unknown[]): number =>
+      Number(database.prepare(sql).get(...parameters)?.count);
+    return {
+      messages: count("SELECT COUNT(*) AS count FROM messages WHERE id = ?", messageId),
+      envelopes: count(
+        "SELECT COUNT(*) AS count FROM message_envelopes WHERE message_id = ?",
+        messageId,
+      ),
+      revisions: count(
+        "SELECT COUNT(*) AS count FROM message_revisions WHERE message_id = ?",
+        messageId,
+      ),
+      targets: count(
+        "SELECT COUNT(*) AS count FROM message_mentions WHERE message_id = ?",
+        messageId,
+      ),
+      outcomes: count(
+        "SELECT COUNT(*) AS count FROM message_target_outcomes WHERE message_id = ?",
+        messageId,
+      ),
+      humanIntents: count(
+        "SELECT COUNT(*) AS count FROM human_request_intents WHERE source_message_id = ?",
+        messageId,
+      ),
+      agentIntents: count(
+        "SELECT COUNT(*) AS count FROM agent_invocation_intents WHERE source_message_id = ?",
+        messageId,
+      ),
+      events: count(
+        `SELECT COUNT(*) AS count FROM events
+         WHERE event_type = 'room.message.accepted'
+           AND json_extract(payload_json, '$.id') = ?`,
+        messageId,
+      ),
+      outbox: count(
+        `SELECT COUNT(*) AS count FROM outbox_deliveries AS delivery
+         JOIN events AS event ON event.event_id = delivery.event_id
+         WHERE event.event_type = 'room.message.accepted'
+           AND json_extract(event.payload_json, '$.id') = ?`,
+        messageId,
+      ),
+      receipts: count(
+        "SELECT COUNT(*) AS count FROM idempotency_records WHERE key = ?",
+        messageId,
+      ),
+    };
   } finally {
     database.close();
   }
@@ -2554,7 +2630,7 @@ describe("SQLite authoritative sessions", () => {
           .get(created.aggregateId)).toEqual({ status: "claimed" });
         inspection.close();
       }
-    });
+    }, 15_000);
   });
 
   describe("Agent execution authoritative facts", () => {
@@ -4438,6 +4514,743 @@ describe("SQLite authoritative sessions", () => {
     database.close();
   });
 
+  it("serializes two devices of one Human revising the same expected revision to one winner", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-message-two-device-revise-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const fixture = await createCommandMatrixFixture(databasePath);
+    const messageId = "message-v2-two-device-revise";
+    expect(fixture.contexts.owner.principal).toEqual(
+      fixture.contexts.ownerSecondDevice.principal,
+    );
+    expect(fixture.contexts.owner.sessionFamilyId).not.toBe(
+      fixture.contexts.ownerSecondDevice.sessionFamilyId,
+    );
+    await fixture.store.submitHumanMessage(
+      { ...fixture.contexts.owner, requestId: "two-device-submit", idempotencyKey: messageId },
+      {
+        messageId,
+        roomId: fixture.contexts.roomId,
+        body: "original body",
+        mentionedTargets: [],
+        attachments: [],
+      },
+    );
+
+    const contenders = await Promise.allSettled([
+      fixture.store.reviseHumanMessage(
+        {
+          ...fixture.contexts.owner,
+          requestId: "two-device-revise-a",
+          idempotencyKey: "transport-key-a",
+        },
+        {
+          roomId: fixture.contexts.roomId,
+          messageId,
+          expectedRevision: 1,
+          body: "device A revision",
+        },
+      ),
+      fixture.store.reviseHumanMessage(
+        {
+          ...fixture.contexts.ownerSecondDevice,
+          requestId: "two-device-revise-b",
+          idempotencyKey: "transport-key-b",
+        },
+        {
+          roomId: fixture.contexts.roomId,
+          messageId,
+          expectedRevision: 1,
+          body: "device B revision",
+        },
+      ),
+    ]);
+    const winners = contenders.filter((result) => result.status === "fulfilled");
+    const losers = contenders.filter((result) => result.status === "rejected");
+    expect(winners).toHaveLength(1);
+    expect(losers).toHaveLength(1);
+    expect(losers[0]).toMatchObject({
+      reason: { status: 409, code: "idempotency_conflict" },
+    });
+
+    await fixture.client.close();
+    const database = new DatabaseSync(databasePath, { readOnly: true });
+    expect(database.prepare(
+      `SELECT lifecycle, current_revision AS currentRevision,
+              revision_count AS revisionCount
+       FROM message_envelopes WHERE message_id = ?`,
+    ).get(messageId)).toEqual({ lifecycle: "active", currentRevision: 2, revisionCount: 2 });
+    expect(database.prepare(
+      "SELECT revision, body FROM message_revisions WHERE message_id = ? ORDER BY revision",
+    ).all(messageId)).toEqual([
+      { revision: 1, body: "original body" },
+      { revision: 2, body: expect.stringMatching(/^device [AB] revision$/u) },
+    ]);
+    expect(database.prepare(
+      `SELECT COUNT(*) AS count FROM events
+       WHERE event_type = 'room.message.revised'
+         AND json_extract(payload_json, '$.id') = ?`,
+    ).get(messageId)).toEqual({ count: 1 });
+    expect(database.prepare(
+      "SELECT COUNT(*) AS count FROM idempotency_records WHERE key = ?",
+    ).get(`${messageId}:revision:1`)).toEqual({ count: 1 });
+    database.close();
+  });
+
+  it.each(["revise-first", "recall-first"] as const)(
+    "serializes %s revise-vs-recall to one CAS winner",
+    async (order) => {
+      const directory = await mkdtemp(join(tmpdir(), `native-im-message-${order}-`));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createCommandMatrixFixture(databasePath);
+      const messageId = `message-v2-${order}`;
+      await fixture.store.submitHumanMessage(
+        { ...fixture.contexts.owner, requestId: `${order}-submit`, idempotencyKey: messageId },
+        {
+          messageId,
+          roomId: fixture.contexts.roomId,
+          body: "race source",
+          mentionedTargets: [],
+          attachments: [],
+        },
+      );
+      const revise = () => fixture.store.reviseHumanMessage(
+        {
+          ...fixture.contexts.owner,
+          requestId: `${order}-revise`,
+          idempotencyKey: `${order}-revise-transport`,
+        },
+        {
+          roomId: fixture.contexts.roomId,
+          messageId,
+          expectedRevision: 1,
+          body: "race revision",
+        },
+      );
+      const recall = () => fixture.store.recallHumanMessage(
+        {
+          ...fixture.contexts.ownerSecondDevice,
+          requestId: `${order}-recall`,
+          idempotencyKey: `${order}-recall-transport`,
+        },
+        { roomId: fixture.contexts.roomId, messageId, expectedRevision: 1 },
+      );
+      const contenders = await Promise.allSettled(
+        order === "revise-first" ? [revise(), recall()] : [recall(), revise()],
+      );
+      expect(contenders.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+      expect(contenders.filter((result) => result.status === "rejected")).toEqual([
+        expect.objectContaining({
+          reason: expect.objectContaining({ status: 409, code: "message_version_conflict" }),
+        }),
+      ]);
+
+      await fixture.client.close();
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      const envelope = database.prepare(
+        `SELECT lifecycle, current_revision AS currentRevision,
+                revision_count AS revisionCount
+         FROM message_envelopes WHERE message_id = ?`,
+      ).get(messageId);
+      expect(envelope).toEqual(order === "revise-first"
+        ? { lifecycle: "active", currentRevision: 2, revisionCount: 2 }
+        : { lifecycle: "recalled", currentRevision: 1, revisionCount: 1 });
+      expect(database.prepare(
+        `SELECT event_type AS eventType FROM events
+         WHERE event_type IN ('room.message.revised', 'room.message.recalled')
+           AND json_extract(payload_json, '$.id') = ?`,
+      ).all(messageId)).toEqual([{
+        eventType: order === "revise-first" ? "room.message.revised" : "room.message.recalled",
+      }]);
+      database.close();
+    },
+  );
+
+  it.each([
+    ["human", "authority-cut-first"],
+    ["human", "send-first"],
+    ["agent", "authority-cut-first"],
+    ["agent", "send-first"],
+  ] as const)(
+    "serializes %s target authority with %s and never rewrites the committed outcome",
+    async (targetKind, order) => {
+      const directory = await mkdtemp(join(
+        tmpdir(),
+        `native-im-message-target-${targetKind}-${order}-`,
+      ));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createCommandMatrixFixture(databasePath);
+      const messageId = `message-v2-target-${targetKind}-${order}`;
+      const targetActorId = targetKind === "human" ? "human-chen" : "agent-review";
+      const targetId = `${messageId}-target`;
+      const mention = targetKind === "human" ? "@Chen" : "@Reviewer";
+      const submit = () => fixture.store.submitHumanMessage(
+        {
+          ...fixture.contexts.ownerSecondDevice,
+          requestId: `${messageId}-submit`,
+          idempotencyKey: messageId,
+        },
+        {
+          messageId,
+          roomId: fixture.contexts.roomId,
+          body: `${mention} race`,
+          mentionedTargets: [{
+            id: targetId,
+            kind: targetKind === "human" ? "human-request" : "agent-invocation",
+            targetActorId,
+            range: { startUtf16: 0, endUtf16: mention.length },
+          }],
+          attachments: [],
+        },
+      );
+      const cutAuthority = () => fixture.store.executeHuman(
+        {
+          ...fixture.contexts.owner,
+          requestId: `${messageId}-cut`,
+          idempotencyKey: `${messageId}-cut`,
+        },
+        targetKind === "human"
+          ? {
+              type: "room.member.remove",
+              roomId: fixture.contexts.roomId,
+              payload: { targetActorId, expectedGovernanceRevision: 1 },
+            }
+          : {
+              type: "agent.configure",
+              roomId: fixture.contexts.roomId,
+              payload: {
+                agentId: targetActorId,
+                participation: "silent",
+                toolPermissions: ["review.read"],
+              },
+            },
+      );
+
+      let submission: ReturnType<typeof submit>;
+      let authorityCut: ReturnType<typeof cutAuthority>;
+      if (order === "authority-cut-first") {
+        authorityCut = cutAuthority();
+        await authorityCut;
+        submission = submit();
+      } else {
+        submission = submit();
+        authorityCut = cutAuthority();
+      }
+      await Promise.all([submission, authorityCut]);
+      const receipt = await submission;
+      expect(receipt.targetOutcomes).toEqual([order === "authority-cut-first"
+        ? {
+            targetId,
+            targetActorId,
+            kind: targetKind === "human" ? "human-request" : "agent-invocation",
+            status: "rejected",
+            code: targetKind === "human" ? "target_not_member" : "target_assignment_inactive",
+          }
+        : expect.objectContaining({
+            targetId,
+            targetActorId,
+            kind: targetKind === "human" ? "human-request" : "agent-invocation",
+            status: targetKind === "human" ? "request-created" : "invocation-intent-created",
+          })]);
+
+      await fixture.client.close();
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      expect(database.prepare(
+        `SELECT status, rejection_code AS rejectionCode
+         FROM message_target_outcomes WHERE message_id = ? AND target_id = ?`,
+      ).get(messageId, targetId)).toEqual(order === "authority-cut-first"
+        ? {
+            status: "rejected",
+            rejectionCode: targetKind === "human"
+              ? "target_not_member"
+              : "target_assignment_inactive",
+          }
+        : {
+            status: targetKind === "human"
+              ? "request-created"
+              : "invocation-intent-created",
+            rejectionCode: null,
+          });
+      const intentTable = targetKind === "human"
+        ? "human_request_intents"
+        : "agent_invocation_intents";
+      expect(database.prepare(
+        `SELECT status FROM ${intentTable} WHERE source_message_id = ?`,
+      ).all(messageId)).toEqual(order === "authority-cut-first" ? [] : [{ status: "pending" }]);
+      expect(database.prepare(
+        `SELECT role, participation FROM room_memberships
+         WHERE room_id = ? AND actor_id = ?`,
+      ).get(fixture.contexts.roomId, targetActorId)).toEqual(targetKind === "human"
+        ? undefined
+        : { role: null, participation: "silent" });
+      database.close();
+    },
+  );
+
+  it.each(["final-first", "recall-first"] as const)(
+    "keeps the %s recall-vs-final CAS state closed across AuthorityWorker restart",
+    async (order) => {
+      const directory = await mkdtemp(join(tmpdir(), `native-im-message-${order}-restart-`));
+      temporaryDirectories.push(directory);
+      const databasePath = join(directory, "authority.sqlite");
+      const fixture = await createCommandMatrixFixture(databasePath);
+      const sourceMessageId = `message-v2-source-${order}`;
+      const finalMessageId = `message-v2-final-${order}`;
+      const submitted = await fixture.store.submitHumanMessage(
+        {
+          ...fixture.contexts.owner,
+          requestId: `${order}-source-submit`,
+          idempotencyKey: sourceMessageId,
+        },
+        {
+          messageId: sourceMessageId,
+          roomId: fixture.contexts.roomId,
+          body: "@Reviewer race",
+          mentionedTargets: [{
+            id: `${sourceMessageId}-target`,
+            kind: "agent-invocation",
+            targetActorId: "agent-review",
+            range: { startUtf16: 0, endUtf16: 9 },
+          }],
+          attachments: [],
+        },
+      );
+      const targetOutcome = submitted.targetOutcomes[0];
+      if (targetOutcome?.status !== "invocation-intent-created") {
+        throw new Error("Expected Agent invocation intent");
+      }
+      const invocationIntentId = targetOutcome.invocationIntentId;
+      const executionId = `execution-v2-${order}`;
+      claimMessageAuthorityExecution(databasePath, {
+        intentId: invocationIntentId,
+        executionId,
+        roomId: fixture.contexts.roomId,
+        sourceMessageId,
+        agentId: "agent-review",
+        requesterActorId: "human-li",
+      });
+      const commitFinal = () => fixture.store.commitAgentMessage(
+        mintInternalAgentMessageCommitContext({
+          agentActorId: "agent-review",
+          invocationIntentId,
+          executionId,
+          attemptSeq: 1,
+          executionGeneration: 1,
+        }),
+        {
+          messageId: finalMessageId,
+          roomId: fixture.contexts.roomId,
+          body: `authoritative ${order} final`,
+        },
+      );
+      const recallSource = () => fixture.store.recallHumanMessage(
+        {
+          ...fixture.contexts.ownerSecondDevice,
+          requestId: `${order}-source-recall`,
+          idempotencyKey: `${order}-source-recall-transport`,
+        },
+        { roomId: fixture.contexts.roomId, messageId: sourceMessageId, expectedRevision: 1 },
+      );
+      const contenders = await Promise.allSettled(
+        order === "final-first"
+          ? [commitFinal(), recallSource()]
+          : [recallSource(), commitFinal()],
+      );
+      if (order === "final-first") {
+        expect(contenders.every((result) => result.status === "fulfilled")).toBe(true);
+      } else {
+        expect(contenders.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+        expect(contenders.filter((result) => result.status === "rejected")).toEqual([
+          expect.objectContaining({
+            reason: expect.objectContaining({ status: 409, code: "execution_conflict" }),
+          }),
+        ]);
+      }
+
+      await fixture.client.close();
+      const restartedClient = await createWorkerDatabaseClient({ databasePath });
+      const restartedStore = createSqliteAuthoritativeStore(restartedClient, { clock: () => 6_000 });
+      const history = await restartedStore.readMessageHistory({
+        sessionId: fixture.contexts.owner.sessionId,
+        sessionFamilyId: fixture.contexts.owner.sessionFamilyId,
+        principal: fixture.contexts.owner.principal,
+      }, { roomId: fixture.contexts.roomId });
+      expect(history.messages).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: sourceMessageId, lifecycle: "recalled" }),
+      ]));
+      expect(history.messages.some((message) => message.id === finalMessageId)).toBe(
+        order === "final-first",
+      );
+      await restartedClient.close();
+
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      expect(database.prepare(
+        `SELECT status, result_message_id AS resultMessageId,
+                cancellation_reason AS cancellationReason
+         FROM agent_executions WHERE id = ?`,
+      ).get(executionId)).toEqual(order === "final-first"
+        ? { status: "completed", resultMessageId: finalMessageId, cancellationReason: null }
+        : { status: "cancelled", resultMessageId: null, cancellationReason: "message_recalled" });
+      expect(database.prepare(
+        "SELECT message_id AS messageId FROM agent_message_sources WHERE execution_id = ?",
+      ).all(executionId)).toEqual(order === "final-first"
+        ? [{ messageId: finalMessageId }]
+        : []);
+      database.close();
+    },
+  );
+
+  it("rolls a v2 submit back at every named aggregate boundary", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-message-v2-fault-boundaries-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const fixture = await createCommandMatrixFixture(databasePath);
+    await fixture.client.close();
+    const faultPoints: readonly MessageAuthoritySubmitFaultPointForTest[] = [
+      "after-message",
+      "after-target",
+      "after-outcome",
+      "after-event",
+      "after-outbox",
+      "after-receipt",
+    ];
+    const zero = {
+      messages: 0,
+      envelopes: 0,
+      revisions: 0,
+      targets: 0,
+      outcomes: 0,
+      humanIntents: 0,
+      agentIntents: 0,
+      events: 0,
+      outbox: 0,
+      receipts: 0,
+    };
+
+    for (const faultPoint of faultPoints) {
+      const messageId = `message-v2-fault-${faultPoint}`;
+      const database = new DatabaseSync(databasePath);
+      expect(() => submitHumanMessageDatabaseCommand(database, {
+        context: {
+          ...fixture.contexts.owner,
+          requestId: `${messageId}-request`,
+          idempotencyKey: `${messageId}-transport`,
+        },
+        message: {
+          messageId,
+          roomId: fixture.contexts.roomId,
+          body: "@Reviewer rollback",
+          mentionedTargets: [{
+            id: `${messageId}-target`,
+            kind: "agent-invocation",
+            targetActorId: "agent-review",
+            range: { startUtf16: 0, endUtf16: 9 },
+          }],
+          attachments: [],
+        },
+        now: 5_000,
+        onFaultPointForTest(point) {
+          if (point === faultPoint) throw new Error(`injected-${faultPoint}`);
+        },
+      })).toThrow(`injected-${faultPoint}`);
+      database.close();
+      expect(messageAuthorityAggregateSnapshot(databasePath, messageId)).toEqual(zero);
+    }
+  });
+
+  it("claims an active Agent route source through its current authority envelope", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-route-active-agent-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const fixture = await createCommandMatrixFixture(databasePath);
+    const sourceMessageId = "message-agent-active-route-source";
+    await fixture.store.executeAgent(
+      mintInternalAgentCommandContext({
+        agentId: "agent-review",
+        requestId: "active-agent-route-submit",
+        idempotencyKey: "active-agent-route-submit",
+      }),
+      {
+        type: "message.send",
+        roomId: fixture.contexts.roomId,
+        payload: {
+          id: sourceMessageId,
+          roomId: fixture.contexts.roomId,
+          body: "active Agent route body",
+          sentAt: "2026-08-19T09:00:00.000Z",
+        },
+      },
+    );
+
+    await expect(fixture.client.executeRoute({
+      type: "route.claim",
+      sourceMessageId,
+      now: 5_100,
+    })).resolves.toMatchObject({
+      kind: "route-claimed",
+      providerInput: {
+        sourceMessageId,
+        message: {
+          authorId: "agent-review",
+          authorKind: "agent",
+          summary: "active Agent route body",
+        },
+      },
+    });
+    await fixture.client.close();
+  });
+
+  it("routes the current Human revision without exposing the retained old body", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-route-current-revision-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const fixture = await createCommandMatrixFixture(databasePath);
+    const sourceMessageId = "message-v2-route-current-revision";
+    const oldBody = "OLD-ROUTE-REVISION-SENTINEL";
+    const currentBody = "current authoritative route revision";
+    await fixture.store.submitHumanMessage(
+      {
+        ...fixture.contexts.owner,
+        requestId: "route-current-revision-submit",
+        idempotencyKey: sourceMessageId,
+      },
+      {
+        messageId: sourceMessageId,
+        roomId: fixture.contexts.roomId,
+        body: oldBody,
+        mentionedTargets: [],
+        attachments: [],
+      },
+    );
+    await fixture.client.executeRuntime({
+      type: "runtime.cancel-for-human-fence",
+      sourceHumanMessageId: sourceMessageId,
+      now: 5_100,
+    });
+    await fixture.client.executeRuntime({
+      type: "runtime.create-route-after-human-fence",
+      sourceHumanMessageId: sourceMessageId,
+      now: 5_101,
+    });
+    await fixture.store.reviseHumanMessage(
+      {
+        ...fixture.contexts.ownerSecondDevice,
+        requestId: "route-current-revision-revise",
+        idempotencyKey: "route-current-revision-revise-transport",
+      },
+      {
+        roomId: fixture.contexts.roomId,
+        messageId: sourceMessageId,
+        expectedRevision: 1,
+        body: currentBody,
+      },
+    );
+
+    const claimed = await fixture.client.executeRoute({
+      type: "route.claim",
+      sourceMessageId,
+      now: 5_200,
+    });
+    expect(claimed).toMatchObject({
+      kind: "route-claimed",
+      providerInput: { message: { summary: currentBody } },
+    });
+    expect(JSON.stringify(claimed)).not.toContain(oldBody);
+    await fixture.client.close();
+  });
+
+  it("rejects route claim after its Human source is recalled without exposing raw body", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-route-recalled-source-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const fixture = await createCommandMatrixFixture(databasePath);
+    const sourceMessageId = "message-v2-route-recalled-source";
+    await fixture.store.submitHumanMessage(
+      {
+        ...fixture.contexts.owner,
+        requestId: "route-recalled-source-submit",
+        idempotencyKey: sourceMessageId,
+      },
+      {
+        messageId: sourceMessageId,
+        roomId: fixture.contexts.roomId,
+        body: "recalled route body sentinel",
+        mentionedTargets: [],
+        attachments: [],
+      },
+    );
+    await fixture.client.executeRuntime({
+      type: "runtime.cancel-for-human-fence",
+      sourceHumanMessageId: sourceMessageId,
+      now: 5_100,
+    });
+    await fixture.client.executeRuntime({
+      type: "runtime.create-route-after-human-fence",
+      sourceHumanMessageId: sourceMessageId,
+      now: 5_101,
+    });
+    await fixture.store.recallHumanMessage(
+      {
+        ...fixture.contexts.ownerSecondDevice,
+        requestId: "route-recalled-source-recall",
+        idempotencyKey: "route-recalled-source-recall-transport",
+      },
+      { roomId: fixture.contexts.roomId, messageId: sourceMessageId, expectedRevision: 1 },
+    );
+
+    await expect(fixture.client.executeRoute({
+      type: "route.claim",
+      sourceMessageId,
+      now: 5_200,
+    })).rejects.toMatchObject({ status: 409, code: "route_conflict" });
+    await fixture.client.close();
+
+    const database = new DatabaseSync(databasePath, { readOnly: true });
+    expect(database.prepare(
+      `SELECT job.status, attempt.status AS attemptStatus
+       FROM route_jobs AS job
+       JOIN route_attempts AS attempt ON attempt.route_job_id = job.id
+       WHERE job.source_message_id = ? AND attempt.attempt_seq = 1`,
+    ).get(sourceMessageId)).toEqual({ status: "queued", attemptStatus: "queued" });
+    database.close();
+  });
+
+  it("keeps recalled Human sources out of pending fences and post-fence route creation", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-recalled-fences-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const fixture = await createCommandMatrixFixture(databasePath);
+    const pendingMessageId = "message-v2-recalled-pending-fence";
+    const createMessageId = "message-v2-recalled-create-route";
+    for (const messageId of [pendingMessageId, createMessageId]) {
+      await fixture.store.submitHumanMessage(
+        {
+          ...fixture.contexts.owner,
+          requestId: `${messageId}-submit`,
+          idempotencyKey: messageId,
+        },
+        {
+          messageId,
+          roomId: fixture.contexts.roomId,
+          body: `${messageId} raw sentinel`,
+          mentionedTargets: [],
+          attachments: [],
+        },
+      );
+    }
+    await fixture.store.recallHumanMessage(
+      {
+        ...fixture.contexts.ownerSecondDevice,
+        requestId: `${pendingMessageId}-recall`,
+        idempotencyKey: `${pendingMessageId}-recall-transport`,
+      },
+      { roomId: fixture.contexts.roomId, messageId: pendingMessageId, expectedRevision: 1 },
+    );
+    await expect(fixture.client.executeRuntime({
+      type: "runtime.list-pending-human-fences",
+      now: 5_100,
+    })).resolves.toMatchObject({
+      kind: "pending-human-fences",
+      sourceHumanMessageIds: [createMessageId],
+    });
+
+    await fixture.client.executeRuntime({
+      type: "runtime.cancel-for-human-fence",
+      sourceHumanMessageId: createMessageId,
+      now: 5_101,
+    });
+    await fixture.store.recallHumanMessage(
+      {
+        ...fixture.contexts.ownerSecondDevice,
+        requestId: `${createMessageId}-recall`,
+        idempotencyKey: `${createMessageId}-recall-transport`,
+      },
+      { roomId: fixture.contexts.roomId, messageId: createMessageId, expectedRevision: 1 },
+    );
+    await expect(fixture.client.executeRuntime({
+      type: "runtime.create-route-after-human-fence",
+      sourceHumanMessageId: createMessageId,
+      now: 5_200,
+    })).rejects.toMatchObject({ status: 409, code: "execution_conflict" });
+    await fixture.client.close();
+
+    const database = new DatabaseSync(databasePath, { readOnly: true });
+    expect(database.prepare(
+      `SELECT COUNT(*) AS count FROM route_jobs
+       WHERE source_message_id IN (?, ?)`,
+    ).get(pendingMessageId, createMessageId)).toEqual({ count: 0 });
+    expect(database.prepare(
+      `SELECT COUNT(*) AS count FROM events
+       WHERE event_type = 'route.started'
+         AND payload_json LIKE ?`,
+    ).get(`%${createMessageId}%`)).toEqual({ count: 0 });
+    database.close();
+  });
+
+  it("excludes recalled Human raw bodies from calibration topic memory", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-calibration-recalled-topic-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "authority.sqlite");
+    const fixture = await createAgentFactFixture(databasePath);
+    const recalledMessageId = "message-v2-recalled-topic-sentinel";
+    const recalledTopicKey = "topic-recalled-raw-sentinel";
+    await fixture.authority.submitHumanMessage(
+      {
+        ...fixture.humanContext,
+        requestId: "calibration-recalled-topic-submit",
+        idempotencyKey: recalledMessageId,
+      },
+      {
+        messageId: recalledMessageId,
+        roomId: "room-facts",
+        body: "review complete",
+        mentionedTargets: [],
+        attachments: [],
+      },
+    );
+    const setup = new DatabaseSync(databasePath);
+    setup.prepare(
+      `INSERT INTO message_topics (
+         message_id, room_id, topic_key, embedding_model_version,
+         window_size, cosine_threshold, created_at
+       ) VALUES (?, 'room-facts', ?, 'dao-topic-embedding-v1', 8, 0.82, ?)`,
+    ).run(recalledMessageId, recalledTopicKey, "1970-01-01T00:00:03.000Z");
+    setup.close();
+    await fixture.authority.recallHumanMessage(
+      {
+        ...fixture.humanContext,
+        requestId: "calibration-recalled-topic-recall",
+        idempotencyKey: "calibration-recalled-topic-recall-transport",
+      },
+      { roomId: "room-facts", messageId: recalledMessageId, expectedRevision: 1 },
+    );
+    await fixture.authority.executeHuman(
+      {
+        ...fixture.humanContext,
+        requestId: "calibration-after-recalled-topic",
+        idempotencyKey: "calibration-after-recalled-topic",
+      },
+      {
+        type: "calibration.record",
+        roomId: "room-facts",
+        payload: { sourceMessageId: "message-agent-source", feedback: "useful" },
+      },
+    );
+    await fixture.client.close();
+
+    const database = new DatabaseSync(databasePath, { readOnly: true });
+    expect(database.prepare(
+      `SELECT topic_key AS topicKey FROM route_calibration_facts
+       WHERE source_message_id = 'message-agent-source'`,
+    ).get()).toEqual({ topicKey: expect.not.stringMatching(/recalled-raw-sentinel/u) });
+    expect(database.prepare(
+      "SELECT topic_key AS topicKey FROM message_topics WHERE message_id = 'message-agent-source'",
+    ).get()).toEqual({ topicKey: expect.not.stringMatching(/recalled-raw-sentinel/u) });
+    database.close();
+  });
+
   it("atomically submits structured targets, replays ACK loss, revises, recalls, and projects a tombstone", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-message-authority-"));
     temporaryDirectories.push(directory);
@@ -4448,10 +5261,17 @@ describe("SQLite authoritative sessions", () => {
       sessionFamilyId: fixture.contexts.owner.sessionFamilyId,
       principal: fixture.contexts.owner.principal,
     };
+    const recallRawSentinel = "RECALLED-RAW-MESSAGE-V2-SENTINEL-7A4D";
+    const beforeMessageDatabase = new DatabaseSync(databasePath, { readOnly: true });
+    const beforeMessageHead = beforeMessageDatabase.prepare(
+      `SELECT head_seq AS headSeq FROM streams
+       WHERE stream_kind = 'room' AND stream_id = ?`,
+    ).get(fixture.contexts.roomId) as { readonly headSeq: number };
+    beforeMessageDatabase.close();
     const message = {
       messageId: "message-v2-structured",
       roomId: fixture.contexts.roomId,
-      body: "@Chen @Reviewer @Alternate hello",
+      body: `@Chen @Reviewer @Alternate hello ${recallRawSentinel}`,
       mentionedTargets: [
         {
           id: "target-human",
@@ -4580,6 +5400,34 @@ describe("SQLite authoritative sessions", () => {
       { messageId: message.messageId, revision: 1, body: message.body },
       { messageId: message.messageId, revision: 2, body: "@Chen @Reviewer @Alternate revised" },
     ] });
+    await expect(fixture.store.syncRoom(ownerSession, {
+      type: "room.sync",
+      requestId: "revised-message-stale-accepted",
+      roomId: message.roomId,
+      cursor: { version: 1, roomId: message.roomId, afterSeq: beforeMessageHead.headSeq },
+    })).resolves.toMatchObject({
+      mode: "repair_required",
+      reason: "operational_projection_changed",
+    });
+    const revisedDelta = await fixture.store.syncRoom(ownerSession, {
+      type: "room.sync",
+      requestId: "revised-message-current-event",
+      roomId: message.roomId,
+      cursor: {
+        version: 1,
+        roomId: message.roomId,
+        afterSeq: beforeMessageHead.headSeq + 1,
+      },
+    });
+    expect(revisedDelta).toMatchObject({
+      mode: "delta",
+      events: [{
+        type: "room.message.revised",
+        payload: { id: message.messageId, currentRevision: { revision: 2 } },
+      }],
+    });
+    expect(JSON.stringify(await fixture.store.listPendingOutbox(10)))
+      .not.toContain(recallRawSentinel);
 
     const recalled = await fixture.store.recallHumanMessage(
       { ...fixture.contexts.owner, requestId: "recall-first", idempotencyKey: "recall-v2-2" },
@@ -4619,9 +5467,52 @@ describe("SQLite authoritative sessions", () => {
       recalledAt: recalled.recalledAt,
       revisionCount: 2,
     });
+    expect(JSON.stringify(history)).not.toContain(recallRawSentinel);
+    await expect(fixture.store.syncRoom(ownerSession, {
+      type: "room.sync",
+      requestId: "recalled-message-stale-cursor",
+      roomId: message.roomId,
+      cursor: { version: 1, roomId: message.roomId, afterSeq: beforeMessageHead.headSeq },
+    })).resolves.toMatchObject({
+      type: "room.sync.result",
+      requestId: "recalled-message-stale-cursor",
+      mode: "repair_required",
+      reason: "operational_projection_changed",
+    });
 
     await fixture.client.close();
     const database = new DatabaseSync(databasePath, { readOnly: true });
+    expect(database.prepare(
+      `SELECT body FROM message_revisions
+       WHERE message_id = ? AND instr(body, ?) > 0`,
+    ).all(message.messageId, recallRawSentinel)).toHaveLength(1);
+    const messageEventPayloads = database.prepare(
+      `SELECT event_type AS eventType, payload_json AS payloadJson
+       FROM events
+       WHERE stream_id = ?
+         AND event_type IN ('room.message.accepted', 'room.message.revised', 'room.message.recalled')
+         AND json_extract(payload_json, '$.id') = ?
+       ORDER BY stream_seq`,
+    ).all(message.roomId, message.messageId);
+    expect(messageEventPayloads).toEqual([
+      { eventType: "room.message.accepted", payloadJson: JSON.stringify({ id: message.messageId }) },
+      { eventType: "room.message.revised", payloadJson: JSON.stringify({ id: message.messageId }) },
+      { eventType: "room.message.recalled", payloadJson: JSON.stringify({ id: message.messageId }) },
+    ]);
+    expect(JSON.stringify(messageEventPayloads)).not.toContain(recallRawSentinel);
+    expect(database.prepare(
+      `SELECT event.event_type AS eventType, delivery.status
+       FROM outbox_deliveries AS delivery
+       JOIN events AS event ON event.event_id = delivery.event_id
+       WHERE event.stream_id = ?
+         AND event.event_type IN ('room.message.accepted', 'room.message.revised', 'room.message.recalled')
+         AND json_extract(event.payload_json, '$.id') = ?
+       ORDER BY event.stream_seq`,
+    ).all(message.roomId, message.messageId)).toEqual([
+      { eventType: "room.message.accepted", status: "dispatched" },
+      { eventType: "room.message.revised", status: "dispatched" },
+      { eventType: "room.message.recalled", status: "pending" },
+    ]);
     expect(database.prepare(
       "SELECT COUNT(*) AS count FROM message_target_outcomes WHERE message_id = ?",
     ).get(message.messageId)).toEqual({ count: 3 });

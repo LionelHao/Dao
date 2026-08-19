@@ -103,6 +103,7 @@ describe("archived Room current-Human read authority", () => {
         context,
         roomId: "archived-room",
         accessRevision: 9,
+        watermark: 0,
       }, 2)).not.toThrow();
       expect(inspectStreamingRepairScopeDatabaseQuery(database, context, {
         kind: "room", roomId: "archived-room",

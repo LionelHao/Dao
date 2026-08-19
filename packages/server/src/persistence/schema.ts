@@ -4929,7 +4929,7 @@ export function migrateAuthorityDatabaseToVersion2ForTest(
   migrateAuthorityDatabaseToVersion(database, 2);
 }
 
-export const SNAPSHOT_CACHE_SCHEMA_VERSION = 1 as const;
+export const SNAPSHOT_CACHE_SCHEMA_VERSION = 2 as const;
 export const SNAPSHOT_CACHE_BUSY_TIMEOUT_MS = 5_000;
 const SNAPSHOT_CACHE_SCHEMA_FINGERPRINT =
   "bc416cc7c65942d8eb36036eb43d70e039eea6703b94222d5185147f309a01dc";

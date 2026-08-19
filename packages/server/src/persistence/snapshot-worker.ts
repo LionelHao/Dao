@@ -19,7 +19,10 @@ import type {
 } from "@native-im/core";
 import { lifecycleRepairSegmentDescriptor } from
   "../room-governance/lifecycle-repair-descriptor.js";
-import { readOperationalMessageRepairPage } from
+import {
+  readOperationalMessageRepairPage,
+  readOperationalMessageRepairRecord,
+} from
   "../message-authority/sqlite-operational-message-projection.js";
 import type {
   AuthenticatedSessionContext,
@@ -1336,13 +1339,69 @@ function pageFromCache(manifest: MaterializedSnapshotManifest, requestId: string
     "SELECT payload_json AS payloadJson FROM repair_snapshot_pages WHERE snapshot_id = ? AND page_number = ?",
   ).get(manifest.snapshotId, pageNumber);
   if (typeof row?.payloadJson !== "string") throw new SnapshotBuildError("storage_unavailable", "Snapshot page is missing");
-  const values = parseJson(row.payloadJson);
-  if (!Array.isArray(values)) throw new SnapshotBuildError("storage_unavailable", "Snapshot page is corrupt");
+  const storedValues = parseJson(row.payloadJson);
+  if (!Array.isArray(storedValues)) {
+    throw new SnapshotBuildError("storage_unavailable", "Snapshot page is corrupt");
+  }
+  const values = manifest.kind === "room"
+    ? hydrateRoomPageReferences(manifest, storedValues)
+    : storedValues;
   const version = manifest.kind === "room"
     ? { roomId: manifest.roomId, watermark: manifest.watermark }
     : { catalogRevision: manifest.catalogRevision };
   return pageEnvelope(manifest.kind, requestId, manifest.snapshotId, pageNumber, values,
     version, manifest.checksum, manifest.expiresAt, pageNumber + 1 < manifest.pageCount);
+}
+
+function cachedPageValues(
+  kind: "room" | "catalog",
+  values: readonly unknown[],
+): readonly unknown[] {
+  if (kind === "catalog") return values;
+  return values.map((value) => {
+    if (isRecord(value) && value.kind === "timeline-message" && isRecord(value.value) &&
+        typeof value.value.id === "string" && value.value.id.length > 0) {
+      return { kind: "timeline-message-reference", messageId: value.value.id };
+    }
+    return value;
+  });
+}
+
+function hydrateRoomPageReferences(
+  manifest: Extract<MaterializedSnapshotManifest, { readonly kind: "room" }>,
+  values: readonly unknown[],
+): readonly unknown[] {
+  const authority = openAuthorityPreflight();
+  try {
+    const stream = authority.prepare(
+      `SELECT head_seq AS headSeq FROM streams
+       WHERE stream_kind = 'room' AND stream_id = ?`,
+    ).get(manifest.roomId);
+    if (stream?.headSeq !== manifest.watermark) {
+      throw new SnapshotBuildError("snapshot_stale", "Snapshot Room watermark changed");
+    }
+    return values.map((value) => {
+      if (isRecord(value) && value.kind === "timeline-message-reference" &&
+          exact(value, ["kind", "messageId"]) && text(value.messageId)) {
+        const record = readOperationalMessageRepairRecord(authority, value.messageId);
+        if (record.value.roomId !== manifest.roomId) {
+          throw new SnapshotBuildError(
+            "storage_unavailable", "Snapshot message reference escaped its Room",
+          );
+        }
+        return record;
+      }
+      if (isRecord(value) &&
+          (value.kind === "timeline-message" || value.kind === "timeline-message-reference")) {
+        throw new SnapshotBuildError(
+          "storage_unavailable", "Snapshot message reference is corrupt",
+        );
+      }
+      return value;
+    });
+  } finally {
+    authority.close();
+  }
 }
 
 function findReusable(reuseKey: string, now: number): MaterializedSnapshotManifest | undefined {
@@ -1402,7 +1461,7 @@ function findReusableForRequest(
 
 function persistSnapshot(manifest: MaterializedSnapshotManifest, reuseKey: string, pages: readonly (readonly unknown[])[]): void {
   if (cache === undefined) throw new SnapshotBuildError("storage_unavailable", "Snapshot cache is unavailable");
-  const payloads = pages.map((page) => canonicalJson(page));
+  const payloads = pages.map((page) => canonicalJson(cachedPageValues(manifest.kind, page)));
   const incomingBytes = payloads.reduce((sum, payload) => sum + Buffer.byteLength(payload, "utf8"), 0);
   if (cacheAllocatedBytes() + incomingBytes > data.limits.cacheQuotaBytes) throw new SnapshotFallback("quota");
   cache.exec("BEGIN IMMEDIATE");

@@ -901,8 +901,10 @@ function isSnapshotRevalidationRequest(
     return false;
   }
   if (value.kind === "room") {
-    return hasExactKeys(value, ["kind", "context", "roomId", "accessRevision"]) &&
-      isText(value.roomId) && isNonNegativeSafeInteger(value.accessRevision);
+    return hasExactKeys(value, [
+      "kind", "context", "roomId", "accessRevision", "watermark",
+    ]) && isText(value.roomId) && isNonNegativeSafeInteger(value.accessRevision) &&
+      isNonNegativeSafeInteger(value.watermark);
   }
   return value.kind === "catalog" &&
     hasExactKeys(value, ["kind", "context", "catalogRevision"]) &&

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -449,6 +449,87 @@ describe("durable materialized snapshot worker", () => {
     await expect(client.readRoomRepairPage(context, "negative", page0.snapshotId, -1))
       .rejects.toMatchObject({ status: 400, code: "invalid_request" });
     await client.close();
+  });
+
+  it("stores message references without raw bodies in the materialized cache or WAL", async () => {
+    const raw = "MATERIALIZED-MESSAGE-RAW-SENTINEL-4E71";
+    const fixture = await createDatabaseFixture({
+      rooms: [{ roomId: "room-reference-cache", messageCount: 1, body: () => raw }],
+    });
+    const client = await createSnapshotWorkerClient({
+      authorityPath: fixture.authorityPath,
+      cachePath: fixture.cachePath,
+      revalidate: async () => undefined,
+      clock: () => 2_000,
+      limits: { maxRecordsPerPage: 1 },
+    });
+    try {
+      await expect(client.beginRoomRepair(
+        fixture.contexts[0]!, "reference-cache", "room-reference-cache",
+      )).resolves.toMatchObject({ mode: "materialized" });
+      const cache = new DatabaseSync(fixture.cachePath, { readOnly: true });
+      const payloads = cache.prepare(
+        "SELECT payload_json AS payloadJson FROM repair_snapshot_pages ORDER BY page_number",
+      ).all();
+      cache.close();
+      expect(JSON.stringify(payloads)).not.toContain(raw);
+      const physical = await Promise.all(["", "-wal", "-shm"].map(async (suffix) =>
+        readFile(`${fixture.cachePath}${suffix}`).catch(() => Buffer.alloc(0))));
+      expect(Buffer.concat(physical).includes(Buffer.from(raw))).toBe(false);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("rejects a materialized continuation before hydration when the Room watermark changed", async () => {
+    const fixture = await createDatabaseFixture({
+      rooms: [{
+        roomId: "room-stale-message-cache",
+        messageCount: 1,
+        body: () => "STALE-MATERIALIZED-MESSAGE-SENTINEL-8B2C",
+      }],
+    });
+    const context = fixture.contexts[0]!;
+    const client = await createSnapshotWorkerClient({
+      authorityPath: fixture.authorityPath,
+      cachePath: fixture.cachePath,
+      revalidate: async () => undefined,
+      clock: () => 2_000,
+      limits: { maxRecordsPerPage: 1 },
+    });
+    try {
+      const page0 = await client.beginRoomRepair(
+        context, "stale-cache-begin", "room-stale-message-cache",
+      );
+      if ("kind" in page0 && page0.kind === "fallback") throw new Error("unexpected fallback");
+      const authority = new DatabaseSync(fixture.authorityPath);
+      authority.prepare(
+        `INSERT INTO message_recall_fences (
+           fence_id, room_id, source_message_id, source_revision, scope_kind,
+           invocation_intent_id, execution_id, reason, created_at
+         ) VALUES (
+           'stale-cache-fence', 'room-stale-message-cache', 'message-0000', 1,
+           'message', NULL, NULL, 'message_recalled', '2026-08-11T00:01:00.000Z'
+         )`,
+      ).run();
+      authority.prepare(
+        `UPDATE message_envelopes
+         SET lifecycle = 'recalled', recalled_at = '2026-08-11T00:01:00.000Z',
+             recalled_by_actor_id = ?
+         WHERE message_id = 'message-0000'`,
+      ).run(context.principal.actorId);
+      authority.prepare(
+        `UPDATE streams SET head_seq = head_seq + 1
+         WHERE stream_kind = 'room' AND stream_id = 'room-stale-message-cache'`,
+      ).run();
+      authority.close();
+
+      await expect(client.readRoomRepairPage(
+        context, "stale-cache-next", page0.snapshotId, 0,
+      )).rejects.toMatchObject({ code: "snapshot_stale" });
+    } finally {
+      await client.close();
+    }
   });
 
   it("materializes every closed room repair record in stable table/entity order", async () => {
@@ -1100,7 +1181,7 @@ describe("durable materialized snapshot worker", () => {
   it("rebuilds a future derived schema but fails closed on same-version corruption", async () => {
     const fixture = await createDatabaseFixture();
     const future = new DatabaseSync(fixture.cachePath);
-    future.exec("CREATE TABLE future_cache (value TEXT) STRICT; PRAGMA user_version = 2");
+    future.exec("CREATE TABLE future_cache (value TEXT) STRICT; PRAGMA user_version = 3");
     future.close();
     const client = await createSnapshotWorkerClient({
       authorityPath: fixture.authorityPath, cachePath: fixture.cachePath,
@@ -1125,6 +1206,47 @@ describe("durable materialized snapshot worker", () => {
     await expect(retry.beginWorkspaceBootstrap(fixture.contexts[0]!, "retry-after-init-error"))
       .resolves.toMatchObject({ page: 0 });
     await retry.close();
+  });
+
+  it("rebuilds a v1 cache before serving so legacy raw page payloads cannot survive upgrade", async () => {
+    const raw = "LEGACY-SNAPSHOT-CACHE-RAW-SENTINEL-7C19";
+    const fixture = await createDatabaseFixture();
+    const legacy = new DatabaseSync(fixture.cachePath);
+    migrateSnapshotCacheDatabase(legacy);
+    legacy.prepare(
+      `INSERT INTO repair_snapshots (
+         snapshot_id, kind, principal_id, session_family_id, room_id,
+         access_revision, watermark, catalog_revision, checksum, page_count,
+         expires_at, reuse_key, complete, invalid
+       ) VALUES (
+         'legacy-v1-raw', 'catalog', 'human-a', 'legacy-family', NULL,
+         NULL, NULL, 0, 'legacy-checksum', 1, 999999, 'legacy-reuse', 1, 0
+       )`,
+    ).run();
+    const legacyPayload = JSON.stringify([{ kind: "message", value: { body: raw } }]);
+    legacy.prepare(
+      `INSERT INTO repair_snapshot_pages (
+         snapshot_id, page_number, payload_json, canonical_bytes
+       ) VALUES ('legacy-v1-raw', 0, ?, ?)`,
+    ).run(legacyPayload, Buffer.byteLength(legacyPayload));
+    legacy.exec("PRAGMA user_version = 1");
+    legacy.close();
+
+    const client = await createSnapshotWorkerClient({
+      authorityPath: fixture.authorityPath,
+      cachePath: fixture.cachePath,
+      revalidate: async () => undefined,
+      clock: () => 2_000,
+    });
+    try {
+      await expect((client as typeof client & { cacheCountForTest(): Promise<number> })
+        .cacheCountForTest()).resolves.toBe(0);
+      const physical = await Promise.all(["", "-wal", "-shm"].map(async (suffix) =>
+        readFile(`${fixture.cachePath}${suffix}`).catch(() => Buffer.alloc(0))));
+      expect(Buffer.concat(physical).includes(Buffer.from(raw))).toBe(false);
+    } finally {
+      await client.close();
+    }
   });
 
   it("rejects disabled or nonfinite safety limits at construction", async () => {

@@ -76,6 +76,29 @@ describe("real AuthorityWorker runtime authority", () => {
           sentAt: `2026-08-17T00:00:0${index + 1}.000Z`,
         });
       }
+      insertLegacyMessageAuthorityRecord(database, {
+        id: "message-runtime-recalled",
+        roomId: "room-runtime",
+        authorId: "human-runtime",
+        authorKind: "human",
+        body: "RECALLED-RUNTIME-CONTEXT-SENTINEL-98F1",
+        sentAt: "2026-08-17T00:00:07.000Z",
+      });
+      database.prepare(
+        `INSERT INTO message_recall_fences (
+           fence_id, room_id, source_message_id, source_revision, scope_kind,
+           invocation_intent_id, execution_id, reason, created_at
+         ) VALUES (
+           'runtime-recalled-fence', 'room-runtime', 'message-runtime-recalled', 1,
+           'message', NULL, NULL, 'message_recalled', '2026-08-17T00:00:08.000Z'
+         )`,
+      ).run();
+      database.prepare(
+        `UPDATE message_envelopes
+         SET lifecycle = 'recalled', recalled_at = '2026-08-17T00:00:08.000Z',
+             recalled_by_actor_id = 'human-runtime'
+         WHERE message_id = 'message-runtime-recalled'`,
+      ).run();
       database.close();
 
       const context = {
@@ -94,13 +117,16 @@ describe("real AuthorityWorker runtime authority", () => {
         sourceMessageId: "message-runtime-1",
         targetAgentId: "agent-runtime",
       }, "openai-responses", "configured-model");
-      await expect(authority.readContext(first.execution.id)).resolves.toMatchObject({
+      const firstContext = await authority.readContext(first.execution.id);
+      expect(firstContext).toMatchObject({
         openItemTargets: [
           { actorId: "agent-git", kind: "agent" },
           { actorId: "agent-runtime", kind: "agent" },
           { actorId: "human-runtime", kind: "human" },
         ],
       });
+      expect(JSON.stringify(firstContext.visibleConversation))
+        .not.toContain("RECALLED-RUNTIME-CONTEXT-SENTINEL-98F1");
       const runningFirst = await authority.claim(first.execution.id, 1);
       const completed = await authority.complete(runningFirst.id, 1, "durable answer");
       expect(completed).toMatchObject({ status: "completed", currentAttemptSeq: 1 });
@@ -404,12 +430,19 @@ describe("real AuthorityWorker runtime authority", () => {
       })).rejects.toMatchObject({ code: "permission_denied" });
       expect(deniedExecute).not.toHaveBeenCalled();
 
-      const history = await client.readHistory({
+      const history = await client.readMessageHistory({
         sessionId: context.sessionId,
         sessionFamilyId: context.sessionFamilyId,
         principal: context.principal,
-      }, "room-runtime", Date.now());
-      expect(history.map((message) => message.body)).toContain("durable answer");
+      }, { roomId: "room-runtime" }, Date.now());
+      expect(history.messages).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          authorKind: "agent",
+          finalBody: "durable answer",
+        }),
+      ]));
+      expect(JSON.stringify(history))
+        .not.toContain("RECALLED-RUNTIME-CONTEXT-SENTINEL-98F1");
       await client.close();
       const evidence = new DatabaseSync(databasePath);
       expect(evidence.prepare(

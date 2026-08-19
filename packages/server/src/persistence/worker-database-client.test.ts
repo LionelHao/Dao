@@ -539,6 +539,7 @@ describe("AuthorityWorker closed protocol", () => {
         },
         roomId: "room",
         accessRevision: 1,
+        watermark: 2,
       },
       now: 1_000,
     })).toBe(true);
@@ -1640,7 +1641,7 @@ describe("WorkerDatabaseClient", () => {
 
     const client = trackClient(await createWorkerDatabaseClient({ databasePath: path }));
     await expect(client.revalidateSnapshot({
-      kind: "room", context, roomId: "snapshot-room", accessRevision: 3,
+      kind: "room", context, roomId: "snapshot-room", accessRevision: 3, watermark: 0,
     }, 1_000)).resolves.toBeUndefined();
     await expect(client.revalidateSnapshot({
       kind: "catalog", context, catalogRevision: 4,
@@ -1652,7 +1653,7 @@ describe("WorkerDatabaseClient", () => {
     ).run(context.principal.actorId);
     writer.close();
     await expect(client.revalidateSnapshot({
-      kind: "room", context, roomId: "snapshot-room", accessRevision: 3,
+      kind: "room", context, roomId: "snapshot-room", accessRevision: 3, watermark: 0,
     }, 1_000)).rejects.toMatchObject({ status: 409, code: "snapshot_stale" });
   });
 

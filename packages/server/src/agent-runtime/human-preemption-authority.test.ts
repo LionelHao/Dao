@@ -8,6 +8,7 @@ import {
   executeHumanDatabaseCommand,
   executeRouteAuthorityOperation,
   executeRuntimeAuthorityOperation,
+  recallHumanMessageDatabaseCommand,
 } from "../persistence/authority-database-handler.js";
 import { migrateAuthorityDatabase } from "../persistence/schema.js";
 import { createWorkerDatabaseClient } from "../persistence/worker-database-client.js";
@@ -119,6 +120,83 @@ function makeRunning(
 }
 
 describe("real SQLite human-preemption authority", () => {
+  it("never rebuilds or claims legacy Room-wide routes from a recalled Human source", () => {
+    const database = fixture();
+    const sendHuman = (messageId: string, body: string, offset: number): void => {
+      executeHumanDatabaseCommand(database, {
+        context: {
+          ...humanContext,
+          requestId: `send-${messageId}`,
+          idempotencyKey: `send-${messageId}`,
+        },
+        command: { type: "message.send", roomId: "room-1", payload: {
+          id: messageId,
+          roomId: "room-1",
+          body,
+          sentAt: new Date(t0 + offset).toISOString(),
+        } },
+        now: t0 + offset,
+      });
+    };
+    const recallHuman = (messageId: string, offset: number): void => {
+      recallHumanMessageDatabaseCommand(database, {
+        context: {
+          ...humanContext,
+          requestId: `recall-${messageId}`,
+          idempotencyKey: `recall-${messageId}`,
+        },
+        command: { roomId: "room-1", messageId, expectedRevision: 1 },
+        now: t0 + offset,
+      });
+    };
+
+    sendHuman("human-recalled-pending", "RECALLED-ROUTE-RAW-PENDING-91C2", 20_000);
+    recallHuman("human-recalled-pending", 20_001);
+    expect(executeRuntimeAuthorityOperation(database, {
+      type: "runtime.list-pending-human-fences",
+      now: t0 + 20_002,
+    })).toEqual({ kind: "pending-human-fences", sourceHumanMessageIds: [] });
+
+    sendHuman("human-recalled-before-route", "RECALLED-ROUTE-RAW-CREATE-74E1", 21_000);
+    executeRuntimeAuthorityOperation(database, {
+      type: "runtime.cancel-for-human-fence",
+      sourceHumanMessageId: "human-recalled-before-route",
+      now: t0 + 21_001,
+    });
+    recallHuman("human-recalled-before-route", 21_002);
+    expect(() => executeRuntimeAuthorityOperation(database, {
+      type: "runtime.create-route-after-human-fence",
+      sourceHumanMessageId: "human-recalled-before-route",
+      now: t0 + 21_003,
+    })).toThrow(/recalled|fence|conflict|cancellation.*route/i);
+    expect(database.prepare(
+      "SELECT COUNT(*) AS count FROM route_jobs WHERE source_message_id = 'human-recalled-before-route'",
+    ).get()).toEqual({ count: 0 });
+
+    sendHuman("human-recalled-before-claim", "RECALLED-ROUTE-RAW-CLAIM-CE38", 22_000);
+    executeRuntimeAuthorityOperation(database, {
+      type: "runtime.cancel-for-human-fence",
+      sourceHumanMessageId: "human-recalled-before-claim",
+      now: t0 + 22_001,
+    });
+    executeRuntimeAuthorityOperation(database, {
+      type: "runtime.create-route-after-human-fence",
+      sourceHumanMessageId: "human-recalled-before-claim",
+      now: t0 + 22_002,
+    });
+    recallHuman("human-recalled-before-claim", 22_003);
+    expect(() => executeRouteAuthorityOperation(database, {
+      type: "route.claim",
+      sourceMessageId: "human-recalled-before-claim",
+      now: t0 + 22_004,
+    })).toThrow(/recalled|fence|conflict|no longer active/i);
+    expect(database.prepare(
+      `SELECT status FROM route_jobs
+       WHERE source_message_id = 'human-recalled-before-claim'`,
+    ).get()).toEqual({ status: "queued" });
+    database.close();
+  });
+
   it("commits the eligibility matrix before route creation, fences late results, and replaces only the selected Agent", () => {
     let database = fixture();
     const sources = [1, 2, 3, 4, 5].map((index) => sendAgentSource(database, index));

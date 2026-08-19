@@ -99,7 +99,10 @@ import {
   ArchivedMessageMutationBlockedError,
   requireMessageMutationAllowedInTransaction,
 } from "../message-authority/archived-message-gate.js";
-import { readOperationalTimelineMessage } from
+import {
+  readOperationalMessageAuthorityEvent,
+  readOperationalTimelineMessage,
+} from
   "../message-authority/sqlite-operational-message-projection.js";
 import { canStartRuntimeGenerationInTransaction } from "../agent-runtime/runtime-archive-fence-participant.js";
 import type { CommittedRoomCacheInvalidationIntent } from "../access/room-cache-invalidation-port.js";
@@ -828,7 +831,13 @@ export function revalidateSnapshotDatabaseQuery(
       }
       return;
     }
-    const room = database.prepare("SELECT status FROM rooms WHERE id = ?")
+    const room = database.prepare(
+      `SELECT room.status, stream.head_seq AS watermark
+       FROM rooms AS room
+       JOIN streams AS stream
+         ON stream.stream_kind = 'room' AND stream.stream_id = room.id
+       WHERE room.id = ?`,
+    )
       .get(validation.roomId);
     if (room === undefined) {
       return fail("room_not_found", "Snapshot room was not found");
@@ -852,6 +861,9 @@ export function revalidateSnapshotDatabaseQuery(
     }
     if (membership.accessRevision !== validation.accessRevision) {
       return fail("snapshot_stale", "Snapshot room access revision changed");
+    }
+    if (room.watermark !== validation.watermark) {
+      return fail("snapshot_stale", "Snapshot Room watermark changed");
     }
   });
 }
@@ -1041,7 +1053,88 @@ function requireSyncHumanRoomMembership(
   }
 }
 
-function parseRoomSyncEvent(row: Record<string, unknown>): PersistedRoomEvent {
+function isMessageAuthorityEventType(
+  value: unknown,
+): value is "room.message.accepted" | "room.message.revised" | "room.message.recalled" {
+  return value === "room.message.accepted" || value === "room.message.revised" ||
+    value === "room.message.recalled";
+}
+
+function storedMessageEventId(row: Record<string, unknown>): string | undefined {
+  if (!isMessageAuthorityEventType(row.eventType) || typeof row.payloadJson !== "string") {
+    return undefined;
+  }
+  try {
+    const payload = JSON.parse(row.payloadJson) as unknown;
+    return isRecord(payload) && typeof payload.id === "string" && payload.id.length > 0
+      ? payload.id
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isStoredMessageEventPointer(row: Record<string, unknown>): boolean {
+  if (!isMessageAuthorityEventType(row.eventType) || typeof row.payloadJson !== "string") {
+    return false;
+  }
+  try {
+    const payload = JSON.parse(row.payloadJson) as unknown;
+    return isRecord(payload) && Reflect.ownKeys(payload).length === 1 &&
+      typeof payload.id === "string" && payload.id.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function messageEventMatchesCurrentProjection(
+  database: DatabaseSync,
+  row: Record<string, unknown>,
+  messageId: string,
+  roomId: string,
+): boolean {
+  const authority = database.prepare(
+    `SELECT envelope.lifecycle, envelope.current_revision AS currentRevision,
+            envelope.recalled_at AS recalledAt, revision.revised_at AS revisedAt,
+            (
+              SELECT MAX(event.stream_seq)
+              FROM events AS event
+              WHERE event.stream_kind = 'room' AND event.stream_id = envelope.room_id
+                AND event.event_type IN (
+                  'room.message.accepted', 'room.message.revised', 'room.message.recalled'
+                )
+                AND json_extract(event.payload_json, '$.id') = envelope.message_id
+            ) AS latestMessageEventSeq
+     FROM message_envelopes AS envelope
+     JOIN message_revisions AS revision
+       ON revision.message_id = envelope.message_id
+      AND revision.revision = envelope.current_revision
+     WHERE envelope.message_id = ? AND envelope.room_id = ?`,
+  ).get(messageId, roomId);
+  if (authority === undefined) return !isStoredMessageEventPointer(row);
+  if (row.eventType === "room.message.accepted" && !isStoredMessageEventPointer(row)) {
+    return authority.lifecycle === "active" && authority.currentRevision === 1;
+  }
+  if (typeof row.occurredAt !== "string" || authority.latestMessageEventSeq !== row.streamSeq) {
+    return false;
+  }
+  if (row.eventType === "room.message.accepted") {
+    return authority.lifecycle === "active" && authority.currentRevision === 1 &&
+      authority.revisedAt === row.occurredAt;
+  }
+  if (row.eventType === "room.message.revised") {
+    return authority.lifecycle === "active" &&
+      typeof authority.currentRevision === "number" && authority.currentRevision > 1 &&
+      authority.revisedAt === row.occurredAt;
+  }
+  return row.eventType === "room.message.recalled" && authority.lifecycle === "recalled" &&
+    authority.recalledAt === row.occurredAt;
+}
+
+function parseRoomSyncEvent(
+  database: DatabaseSync,
+  row: Record<string, unknown>,
+): PersistedRoomEvent {
   let payload: unknown;
   try {
     payload = typeof row.payloadJson === "string"
@@ -1049,6 +1142,21 @@ function parseRoomSyncEvent(row: Record<string, unknown>): PersistedRoomEvent {
       : undefined;
   } catch {
     return fail("storage_unavailable", "Stored room sync event is corrupt");
+  }
+  const messageId = storedMessageEventId(row);
+  if (messageId !== undefined && isRecord(payload) &&
+      Reflect.ownKeys(payload).length === 1 && Object.hasOwn(payload, "id")) {
+    return readOperationalMessageAuthorityEvent(database, {
+      eventId: row.eventId as string,
+      streamKind: row.streamKind as "room",
+      streamId: row.streamId as string,
+      streamSeq: row.streamSeq as number,
+      roomId: row.roomId as string,
+      type: row.eventType as "room.message.accepted" | "room.message.revised" |
+        "room.message.recalled",
+      actorId: row.actorId as string,
+      occurredAt: row.occurredAt as string,
+    }, messageId);
   }
   const parsed = parsePersistedRoomEvent({
     eventId: row.eventId,
@@ -1138,7 +1246,19 @@ export function syncRoomDatabaseQuery(
     let expectedSeq = request.cursor.afterSeq + 1;
     let eventBytesTotal = 0;
     for (const row of rows) {
-      const event = parseRoomSyncEvent(row);
+      const messageId = storedMessageEventId(row);
+      if (messageId !== undefined &&
+          !messageEventMatchesCurrentProjection(database, row, messageId, request.roomId)) {
+        return roomSyncResultWithinPageLimit({
+          type: "room.sync.result",
+          requestId: request.requestId,
+          mode: "repair_required",
+          reason: "operational_projection_changed",
+          retainedFromSeq,
+          watermark: currentHeadSeq,
+        });
+      }
+      const event = parseRoomSyncEvent(database, row);
       if (
         event.streamSeq !== expectedSeq ||
         event.streamId !== request.roomId ||
@@ -1420,12 +1540,30 @@ export function readRoomAuditDatabaseQuery(
   });
 }
 
-function parseOutboxEvent(row: Record<string, unknown>): PersistedRoomEvent | PersistedIdentityEvent {
+function parseOutboxEvent(
+  database: DatabaseSync,
+  row: Record<string, unknown>,
+): PersistedRoomEvent | PersistedIdentityEvent {
   let payload: unknown;
   try {
     payload = typeof row.payloadJson === "string" ? JSON.parse(row.payloadJson) : undefined;
   } catch {
     return fail("storage_unavailable", "Stored outbox event payload is corrupt");
+  }
+  const messageId = storedMessageEventId(row);
+  if (row.streamKind === "room" && messageId !== undefined && isRecord(payload) &&
+      Reflect.ownKeys(payload).length === 1 && Object.hasOwn(payload, "id")) {
+    return readOperationalMessageAuthorityEvent(database, {
+      eventId: row.eventId as string,
+      streamKind: "room",
+      streamId: row.streamId as string,
+      streamSeq: row.streamSeq as number,
+      roomId: row.roomId as string,
+      type: row.eventType as "room.message.accepted" | "room.message.revised" |
+        "room.message.recalled",
+      actorId: row.actorId as string,
+      occurredAt: row.occurredAt as string,
+    }, messageId);
   }
   const envelope = {
     eventId: row.eventId,
@@ -1507,7 +1645,7 @@ export function listPendingOutboxDatabaseQuery(
     ) {
       return fail("storage_unavailable", "Stored outbox delivery is corrupt");
     }
-    const event = parseOutboxEvent(row);
+    const event = parseOutboxEvent(database, row);
     if (event.eventId !== row.eventId || event.streamSeq !== row.streamSeq) {
       return fail("storage_unavailable", "Stored outbox delivery event does not match");
     }
@@ -1570,15 +1708,26 @@ export function authorizeOutboxCandidateDatabaseQuery(
 ): boolean {
   const delivery = database
     .prepare(
-      `SELECT target_kind AS targetKind, target_id AS targetId
-       FROM outbox_deliveries
-       WHERE id = ? AND status = 'pending'`,
+      `SELECT delivery.target_kind AS targetKind, delivery.target_id AS targetId,
+              event.stream_seq AS streamSeq, event.event_type AS eventType,
+              event.occurred_at AS occurredAt,
+              event.payload_json AS payloadJson
+       FROM outbox_deliveries AS delivery
+       JOIN events AS event ON event.event_id = delivery.event_id
+       WHERE delivery.id = ? AND delivery.status = 'pending'`,
     )
     .get(deliveryId);
   if (
     typeof delivery?.targetKind !== "string" ||
     typeof delivery.targetId !== "string"
   ) {
+    return false;
+  }
+  const messageId = storedMessageEventId(delivery);
+  if (messageId !== undefined && delivery.targetKind === "room" &&
+      !messageEventMatchesCurrentProjection(
+        database, delivery, messageId, delivery.targetId,
+      )) {
     return false;
   }
   if (delivery.targetKind === "session-family") {
@@ -3281,9 +3430,14 @@ function enqueueRouteJobForMessage(
   const recentTopics = database.prepare(
     `SELECT topic_key AS topicKey, body AS summary
      FROM (
-       SELECT topic.topic_key, prior.body, prior.sent_at, prior.id
+       SELECT topic.topic_key, revision.body, prior.sent_at, prior.id
        FROM message_topics AS topic
        JOIN messages AS prior ON prior.id = topic.message_id
+       JOIN message_envelopes AS envelope
+         ON envelope.message_id = prior.id AND envelope.lifecycle = 'active'
+       JOIN message_revisions AS revision
+         ON revision.message_id = envelope.message_id
+        AND revision.revision = envelope.current_revision
        WHERE topic.room_id = ? AND prior.id <> ?
        ORDER BY prior.sent_at DESC, prior.id DESC
        LIMIT 8
@@ -4110,9 +4264,14 @@ function executeCalibrationRecord(
   let topicKey = typeof source.topicKey === "string" ? source.topicKey : undefined;
   if (topicKey === undefined) {
     const recentTopics = database.prepare(
-      `SELECT topic.topic_key AS topicKey, prior.body AS summary
+      `SELECT topic.topic_key AS topicKey, revision.body AS summary
        FROM message_topics AS topic
        JOIN messages AS prior ON prior.id = topic.message_id
+       JOIN message_envelopes AS envelope
+         ON envelope.message_id = prior.id AND envelope.lifecycle = 'active'
+       JOIN message_revisions AS revision
+         ON revision.message_id = envelope.message_id
+        AND revision.revision = envelope.current_revision
        WHERE topic.room_id = ? AND prior.id <> ?
        ORDER BY prior.sent_at DESC, prior.id DESC
        LIMIT 8`,
@@ -4994,6 +5153,33 @@ export function executeRouteAuthorityOperation(
           (queued.nextRetryAt !== undefined && Date.parse(queued.nextRetryAt) > operation.now)) {
         return fail("route_conflict", "Route job was not claimable");
       }
+      const message = database.prepare(
+        `SELECT stored.author_id AS authorId, stored.author_kind AS authorKind,
+                revision.body, stored.sent_at AS sentAt
+         FROM messages AS stored
+         JOIN message_envelopes AS envelope
+           ON envelope.message_id = stored.id
+          AND envelope.room_id = stored.room_id
+          AND envelope.lifecycle = 'active'
+         JOIN message_revisions AS revision
+           ON revision.message_id = envelope.message_id
+          AND revision.revision = envelope.current_revision
+         WHERE stored.id = ? AND stored.room_id = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM message_recall_fences AS recall
+             WHERE recall.source_message_id = stored.id
+               AND recall.room_id = stored.room_id
+               AND recall.scope_kind = 'message'
+           )`,
+      ).get(queued.sourceMessageId, queued.roomId);
+      if (message === undefined) {
+        return fail("route_conflict", "Route source message was no longer active");
+      }
+      if (typeof message.authorId !== "string" ||
+          (message.authorKind !== "human" && message.authorKind !== "agent") ||
+          typeof message.body !== "string" || typeof message.sentAt !== "string") {
+        return fail("storage_unavailable", "Route source message was corrupt");
+      }
       const claimed = database.prepare(
         `UPDATE route_jobs SET status = 'running', updated_at = ?, next_retry_at = NULL
          WHERE id = ? AND status = 'queued' AND current_attempt = ?`,
@@ -5004,16 +5190,6 @@ export function executeRouteAuthorityOperation(
          WHERE route_job_id = ? AND attempt_seq = ? AND status = 'queued'`,
       ).run(occurredAt, queued.id, queued.currentAttempt);
       appendRouteLifecycleEvent(database, routeJobById(database, queued.id), occurredAt, "started");
-
-      const message = database.prepare(
-        `SELECT author_id AS authorId, author_kind AS authorKind, body, sent_at AS sentAt
-         FROM messages WHERE id = ? AND room_id = ?`,
-      ).get(queued.sourceMessageId, queued.roomId);
-      if (typeof message?.authorId !== "string" ||
-          (message.authorKind !== "human" && message.authorKind !== "agent") ||
-          typeof message.body !== "string" || typeof message.sentAt !== "string") {
-        return fail("storage_unavailable", "Route source message was corrupt");
-      }
       const memberRows = database.prepare(
         `SELECT snapshot.agent_id AS agentId, snapshot.participation, snapshot.role,
                 snapshot.capabilities_json AS capabilitiesJson,
@@ -5303,6 +5479,14 @@ export function executeRuntimeAuthorityOperation(
       const rows = database.prepare(
         `SELECT message.id
          FROM messages AS message
+         JOIN message_envelopes AS envelope
+           ON envelope.message_id = message.id
+          AND envelope.room_id = message.room_id
+          AND envelope.message_kind = 'human'
+          AND envelope.lifecycle = 'active'
+         JOIN message_revisions AS revision
+           ON revision.message_id = envelope.message_id
+          AND revision.revision = envelope.current_revision
          JOIN events AS accepted
            ON accepted.stream_kind = 'room' AND accepted.stream_id = message.room_id
           AND accepted.event_type = 'room.message.accepted'
@@ -5324,6 +5508,14 @@ export function executeRuntimeAuthorityOperation(
         `SELECT message.id, message.room_id AS roomId, message.author_id AS humanActorId,
                 event.occurred_at AS acceptedAt
          FROM messages AS message
+         JOIN message_envelopes AS envelope
+           ON envelope.message_id = message.id
+          AND envelope.room_id = message.room_id
+          AND envelope.message_kind = 'human'
+          AND envelope.lifecycle = 'active'
+         JOIN message_revisions AS revision
+           ON revision.message_id = envelope.message_id
+          AND revision.revision = envelope.current_revision
          JOIN events AS event
            ON event.stream_kind = 'room' AND event.stream_id = message.room_id
           AND event.room_id = message.room_id AND event.actor_id = message.author_id
@@ -5433,9 +5625,21 @@ export function executeRuntimeAuthorityOperation(
       const fence = database.prepare(
         `SELECT fence.room_id AS roomId, fence.human_actor_id AS humanActorId,
                 fence.accepted_at AS acceptedAt, fence.route_job_id AS routeJobId,
-                message.body, message.sent_at AS sentAt
+                revision.body, message.sent_at AS sentAt
          FROM human_preemption_fences AS fence
-         JOIN messages AS message ON message.id = fence.source_human_message_id
+         JOIN messages AS message
+           ON message.id = fence.source_human_message_id
+          AND message.room_id = fence.room_id
+          AND message.author_id = fence.human_actor_id
+          AND message.author_kind = 'human'
+         JOIN message_envelopes AS envelope
+           ON envelope.message_id = message.id
+          AND envelope.room_id = message.room_id
+          AND envelope.message_kind = 'human'
+          AND envelope.lifecycle = 'active'
+         JOIN message_revisions AS revision
+           ON revision.message_id = envelope.message_id
+          AND revision.revision = envelope.current_revision
          WHERE fence.source_human_message_id = ?`,
       ).get(operation.sourceHumanMessageId);
       if (typeof fence?.roomId !== "string" || typeof fence.humanActorId !== "string" ||
@@ -5641,12 +5845,18 @@ export function executeRuntimeAuthorityOperation(
             typeof entry === "string" && allowedIds.has(entry) && membershipPermissions.includes(entry))
         : [];
       const messages = database.prepare(
-        `SELECT id AS messageId, author_id AS authorId, body
+        `SELECT message.id AS messageId, message.author_id AS authorId, revision.body
          FROM (
-           SELECT id, author_id, body, sent_at
-           FROM messages WHERE room_id = ?
-           ORDER BY sent_at DESC, id DESC LIMIT 64
-         ) ORDER BY sent_at, messageId`,
+           SELECT envelope.message_id, envelope.current_revision, envelope.created_at
+           FROM message_envelopes AS envelope
+           WHERE envelope.room_id = ? AND envelope.lifecycle = 'active'
+           ORDER BY envelope.created_at DESC, envelope.message_id DESC LIMIT 64
+         ) AS current
+         JOIN messages AS message ON message.id = current.message_id
+         JOIN message_revisions AS revision
+           ON revision.message_id = current.message_id
+          AND revision.revision = current.current_revision
+         ORDER BY current.created_at, messageId`,
       ).all(execution.roomId);
       if (!messages.every((message) => typeof message.messageId === "string" &&
           typeof message.authorId === "string" && typeof message.body === "string")) {
@@ -6018,7 +6228,7 @@ export function executeRuntimeAuthorityOperation(
         actorId: current.agentId,
         eventType: "room.message.accepted",
         occurredAt,
-        payload: message,
+        payload: { id: message.id },
       });
       appendRoomOutbox(database, messageEventId, current.roomId, messageSeq, occurredAt, "runtime", "message");
       enqueueRouteJobForMessage(database, message, occurredAt);
@@ -6986,6 +7196,14 @@ export function executeHumanDatabaseCommand(
 const MESSAGE_AUTHORITY_DEFAULT_PAGE = 50;
 const MESSAGE_AUTHORITY_MAX_PAGE = 200;
 
+export type MessageAuthoritySubmitFaultPointForTest =
+  | "after-message"
+  | "after-target"
+  | "after-outcome"
+  | "after-event"
+  | "after-outbox"
+  | "after-receipt";
+
 type StoredMessageAuthorityReceipt =
   | HumanMessageSubmissionReceipt
   | MessageRevisionReceipt
@@ -7091,6 +7309,7 @@ function executeMessageAuthorityIdempotently<Receipt extends StoredMessageAuthor
     readonly kind: "submit" | "revise" | "recall" | "agent";
     readonly now: number;
     readonly execute: (persistedAt: string) => Receipt;
+    readonly afterReceiptForTest?: () => void;
   },
 ): Receipt {
   const requestHash = messageAuthorityHash(input.command);
@@ -7122,6 +7341,7 @@ function executeMessageAuthorityIdempotently<Receipt extends StoredMessageAuthor
     persistedAt,
     new Date(input.now + 30 * 24 * 60 * 60 * 1_000).toISOString(),
   );
+  input.afterReceiptForTest?.();
   return receipt;
 }
 
@@ -7186,6 +7406,28 @@ function validateRecallCommand(command: MessageRecallCommand): void {
   }
 }
 
+function messageRecallLogicalNow(
+  database: DatabaseSync,
+  sourceMessageId: string,
+  requestedNow: number,
+): number {
+  const row = database.prepare(
+    `SELECT MAX(committed_at) AS latestCommittedAt
+     FROM agent_message_sources WHERE source_message_id = ?`,
+  ).get(sourceMessageId);
+  if (row?.latestCommittedAt === null || row?.latestCommittedAt === undefined) {
+    return requestedNow;
+  }
+  if (typeof row.latestCommittedAt !== "string") {
+    return fail("storage_unavailable", "Agent message source timestamp is corrupt");
+  }
+  const latestCommittedAt = Date.parse(row.latestCommittedAt);
+  if (!Number.isFinite(latestCommittedAt)) {
+    return fail("storage_unavailable", "Agent message source timestamp is corrupt");
+  }
+  return Math.max(requestedNow, latestCommittedAt + 1);
+}
+
 export function submitHumanMessageDatabaseCommand(
   database: DatabaseSync,
   input: {
@@ -7193,6 +7435,7 @@ export function submitHumanMessageDatabaseCommand(
     readonly message: HumanMessageSubmit;
     readonly now: number;
     readonly beforeApply?: () => void;
+    readonly onFaultPointForTest?: (point: MessageAuthoritySubmitFaultPointForTest) => void;
   },
 ): HumanMessageSubmissionReceipt {
   return runAuthorityImmediateTransaction(database, () => {
@@ -7229,6 +7472,9 @@ export function submitHumanMessageDatabaseCommand(
       command: input.message,
       kind: "submit",
       now: input.now,
+      ...(input.onFaultPointForTest === undefined
+        ? {}
+        : { afterReceiptForTest: () => input.onFaultPointForTest?.("after-receipt") }),
       execute(persistedAt) {
         input.beforeApply?.();
         if (database.prepare("SELECT 1 AS present FROM messages WHERE id = ?").get(
@@ -7245,6 +7491,7 @@ export function submitHumanMessageDatabaseCommand(
           sentAt: persistedAt,
         };
         insertLegacyMessageAuthorityRecord(database, baseMessage);
+        input.onFaultPointForTest?.("after-message");
         const outcomes: MessageTargetOutcome[] = [];
         for (const [targetOrder, target] of input.message.mentionedTargets.entries()) {
           const actor = database.prepare("SELECT kind FROM actors WHERE id = ?").get(
@@ -7268,6 +7515,7 @@ export function submitHumanMessageDatabaseCommand(
             target.range.endUtf16,
             targetOrder,
           );
+          input.onFaultPointForTest?.("after-target");
           const membership = database.prepare(
             `SELECT kind, participation FROM room_memberships
              WHERE room_id = ? AND actor_id = ?`,
@@ -7376,6 +7624,7 @@ export function submitHumanMessageDatabaseCommand(
             outcome.status === "rejected" ? outcome.code : null,
             persistedAt,
           );
+          input.onFaultPointForTest?.("after-outcome");
           outcomes.push(outcome);
         }
         if (input.message.replyToMessageId !== undefined) {
@@ -7395,8 +7644,9 @@ export function submitHumanMessageDatabaseCommand(
           actorId,
           eventType: "room.message.accepted",
           occurredAt: persistedAt,
-          payload: timeline as unknown as JsonValue,
+          payload: { id: timeline.id },
         });
+        input.onFaultPointForTest?.("after-event");
         appendRoomOutbox(
           database,
           eventId,
@@ -7406,6 +7656,7 @@ export function submitHumanMessageDatabaseCommand(
           scope,
           input.message.messageId,
         );
+        input.onFaultPointForTest?.("after-outbox");
         return {
           messageId: input.message.messageId,
           persistedAt,
@@ -7488,6 +7739,17 @@ export function reviseHumanMessageDatabaseCommand(
         if (updated.changes !== 1) {
           return fail("message_version_conflict", "Message revision compare-and-set failed");
         }
+        database.prepare(
+          `UPDATE outbox_deliveries
+           SET status = 'dispatched', delivered_at = ?,
+               last_error = 'superseded_by_message_revision'
+           WHERE status = 'pending' AND event_id IN (
+             SELECT event_id FROM events
+             WHERE stream_kind = 'room' AND stream_id = ?
+               AND event_type IN ('room.message.accepted', 'room.message.revised')
+               AND json_extract(payload_json, '$.id') = ?
+           )`,
+        ).run(persistedAt, input.command.roomId, input.command.messageId);
         const timeline = readOperationalTimelineMessage(database, input.command.messageId);
         if (timeline.authorKind !== "human" || timeline.lifecycle !== "active") {
           return fail("storage_unavailable", "Revised Human message projection is corrupt");
@@ -7499,7 +7761,7 @@ export function reviseHumanMessageDatabaseCommand(
           actorId,
           eventType: "room.message.revised",
           occurredAt: persistedAt,
-          payload: timeline as unknown as JsonValue,
+          payload: { id: timeline.id },
         });
         appendRoomOutbox(
           database, eventId, input.command.roomId, streamSeq, persistedAt,
@@ -7541,12 +7803,13 @@ export function recallHumanMessageDatabaseCommand(
     );
     const scope = [actorId, "message.recall", input.command.roomId, input.command.messageId].join("\u0000");
     const businessKey = `${input.command.messageId}:recall:${input.command.expectedRevision}`;
+    const logicalNow = messageRecallLogicalNow(database, input.command.messageId, input.now);
     return executeMessageAuthorityIdempotently(database, {
       scope,
       key: businessKey,
       command: input.command,
       kind: "recall",
-      now: input.now,
+      now: logicalNow,
       execute(recalledAt) {
         input.beforeApply?.();
         if (authority.lifecycle !== "active" ||
@@ -7700,6 +7963,17 @@ export function recallHumanMessageDatabaseCommand(
           `UPDATE message_attachment_links SET operational_state = 'excluded_recalled'
            WHERE message_id = ? AND operational_state = 'active'`,
         ).run(input.command.messageId);
+        database.prepare(
+          `UPDATE outbox_deliveries
+           SET status = 'dispatched', delivered_at = ?,
+               last_error = 'superseded_by_message_recall'
+           WHERE status = 'pending' AND event_id IN (
+             SELECT event_id FROM events
+             WHERE stream_kind = 'room' AND stream_id = ?
+               AND event_type IN ('room.message.accepted', 'room.message.revised')
+               AND json_extract(payload_json, '$.id') = ?
+           )`,
+        ).run(recalledAt, input.command.roomId, input.command.messageId);
         const timeline = readOperationalTimelineMessage(database, input.command.messageId);
         if (timeline.lifecycle !== "recalled") {
           return fail("storage_unavailable", "Recalled message projection is corrupt");
@@ -7711,7 +7985,7 @@ export function recallHumanMessageDatabaseCommand(
           actorId,
           eventType: "room.message.recalled",
           occurredAt: recalledAt,
-          payload: timeline as unknown as JsonValue,
+          payload: { id: timeline.id },
         });
         appendRoomOutbox(
           database, eventId, input.command.roomId, streamSeq, recalledAt,
@@ -8115,7 +8389,7 @@ export function commitAgentMessageDatabaseCommand(
           actorId: input.context.agent.actorId,
           eventType: "room.message.accepted",
           occurredAt: persistedAt,
-          payload: message as unknown as JsonValue,
+          payload: { id: message.id },
         });
         appendRoomOutbox(
           database, eventId, input.command.roomId, streamSeq, persistedAt,
