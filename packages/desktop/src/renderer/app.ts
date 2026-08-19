@@ -34,6 +34,150 @@ import {
   type RoomGovernanceView,
   type ManagedRoom,
 } from "@native-im/core";
+import type { GovernanceBridge, GovernanceRemoteState } from "../governance/contracts.js";
+import {
+  renderGovernanceSurface as renderGovernanceFeatureSurface,
+} from "./governance/governance-surface.js";
+import type {
+  DepartureConflict,
+  DepartureResolution,
+  GovernanceDialog,
+  GovernanceSurfaceState,
+} from "./governance/view-model.js";
+
+function renderLockedGovernance(root: HTMLElement, state: Extract<GovernanceRemoteState, { status: "locked" }>): void {
+  const locked = document.createElement("section");
+  locked.className = "governance-locked";
+  locked.dataset.governanceLocked = "true";
+  locked.setAttribute("role", "alert");
+  const heading = document.createElement("h1");
+  heading.textContent = state.connection.status === "revoked" ? "Room 访问已撤销" : "治理服务不可用";
+  const explanation = document.createElement("p");
+  explanation.textContent = state.connection.status === "revoked"
+    ? state.connection.purgeCompleted ? "缓存已清除" : "正在清除缓存"
+    : `无法安全显示 Room · ${state.connection.errorCode}`;
+  locked.append(heading, explanation);
+  root.replaceChildren(locked);
+}
+
+export function mountGovernanceSurface(
+  root: HTMLElement,
+  bridge: GovernanceBridge,
+  options: {
+    readonly roomId: string;
+    readonly reducedMotion: boolean;
+    readonly onNavigateConflictResolution: (
+      conflict: DepartureConflict,
+      resolution: DepartureResolution,
+    ) => void;
+  },
+): () => void {
+  let active = true;
+  let remote: Extract<GovernanceRemoteState, { status: "ready" }> | undefined;
+  let dialog: GovernanceDialog | null = null;
+  let authoritySequence = 0;
+
+  const render = (): void => {
+    if (remote === undefined) return;
+    const state: GovernanceSurfaceState = {
+      projection: remote.projection,
+      viewerActorId: remote.viewerActorId,
+      connection: remote.connection,
+      operation: remote.operation,
+      ...(remote.departureConflicts === undefined
+        ? {} : { departureConflicts: remote.departureConflicts }),
+      dialog,
+      reducedMotion: options.reducedMotion,
+    };
+    renderGovernanceFeatureSurface(root, state, {
+      onIntent(intent) {
+        dialog = null;
+        render();
+        void bridge.submit({ roomId: options.roomId, intent }).then((result) => {
+          if (active) applyRemote(result.state);
+        }).catch(() => {
+          if (active) void refresh();
+        });
+      },
+      onOpenDialog(next) {
+        dialog = next;
+        render();
+      },
+      onRetry(error) {
+        if (error.status === 409 && error.code === "departure_blocked" &&
+            remote?.departureConflicts !== undefined) {
+          const current = remote;
+          const conflicts = current.departureConflicts;
+          if (conflicts === undefined) return;
+          void bridge.getDepartureConflicts({
+            roomId: options.roomId,
+            targetActorId: conflicts.targetActorId,
+            expectedGovernanceRevision: current.projection.governanceRevision,
+          }).then((conflicts) => {
+            if (!active || remote === undefined) return;
+            remote = { ...remote, departureConflicts: conflicts };
+            dialog = "departure_conflicts";
+            render();
+          }).catch(() => undefined);
+        } else {
+          void refresh();
+        }
+      },
+      onResolveConflict: options.onNavigateConflictResolution,
+      onCloseDialog(closed) {
+        if (dialog === closed) dialog = null;
+        render();
+      },
+    });
+  };
+
+  const applyRemote = (state: GovernanceRemoteState): void => {
+    authoritySequence += 1;
+    if (state.status === "locked") {
+      remote = undefined;
+      dialog = null;
+      renderLockedGovernance(root, state);
+      return;
+    }
+    if (state.projection.roomId !== options.roomId) return;
+    remote = state;
+    if (state.operation.status === "failed" &&
+        state.operation.error.status === 409 &&
+        state.operation.error.code === "departure_blocked") {
+      dialog = "departure_conflicts";
+    }
+    render();
+  };
+
+  const refresh = async (): Promise<void> => {
+    const startedAt = authoritySequence;
+    try {
+      const state = await bridge.getSurface({ roomId: options.roomId });
+      if (active && authoritySequence === startedAt) applyRemote(state);
+    } catch {
+      if (active && authoritySequence === startedAt) {
+        applyRemote({
+          status: "locked", roomId: options.roomId,
+          connection: { status: "fatal", errorCode: "governance_bridge_unavailable" },
+        });
+      }
+    }
+  };
+
+  const loading = document.createElement("p");
+  loading.setAttribute("role", "status");
+  loading.textContent = "正在载入 Room 治理权威状态";
+  root.replaceChildren(loading);
+  const unsubscribe = bridge.onStateChanged((envelope) => {
+    if (active && envelope.roomId === options.roomId) applyRemote(envelope.state);
+  });
+  void refresh();
+  return () => {
+    if (!active) return;
+    active = false;
+    unsubscribe();
+  };
+}
 
 export function renderRoomGovernanceProjection(
   root: HTMLElement,

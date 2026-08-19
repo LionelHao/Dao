@@ -52,3 +52,11 @@
 - shutdown/reconnect：subscription 可取消且有界；重连先 auth/catalog/access recheck，再 sync/repair；offline mutation 在 transport 前 fail closed。
 
 不得用 mock callback、generic IPC、generic WebSocket send、token 透传或 renderer local lifecycle 来满足这些 seam。
+
+## 第二波 closed live bridge 状态
+
+- preload 只暴露 `getSurface`、`getDepartureConflicts`、`submit`、`onStateChanged`；main IPC 对 trusted main frame、参数字段和返回 DTO 做 exact allowlist。
+- main controller 生成 requestId/idempotency key；idempotency key 永不返回 renderer。accepted ACK 只进入 acknowledged，ACK 的 eventIds 被 ClientSyncReplica 实际 applied event IDs 覆盖且 governance projection 完全一致后才进入 succeeded。
+- `ClientSyncReplica` 只在 live cache event batch apply 后发布 eventIds/governance；repair governance 只在 atomic generation commit 后发布。重复、错误 Room、错误 eventId 或错误 projection 不收敛 operation。
+- final `departure_blocked` 替换旧冲突；`room_revision_conflict` authority refresh 后仍保持 failed，不伪称成功；offline/repair mutation 在 authority adapter 前 fail closed；revoked/fatal DTO 已 redacted，不携带 Room 名称、成员或内容。
+- server governance WebSocket adapter 与生产 ClientAuthorityCache 尚未合入，因此 `main.ts` 当前注册的是显式 `governance_authority_unavailable` adapter：可证明 bridge fail closed，但不会返回任何成功。真实 adapter、replica feed composition 和默认 selected-Room navigation 仍是 real E2E 接线项。

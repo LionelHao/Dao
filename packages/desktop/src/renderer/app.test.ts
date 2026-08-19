@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import type { GovernanceBridge, GovernanceRemoteState } from "../governance/contracts.js";
 import type {
   AgentActor,
   AgentConfigurationRequest,
@@ -160,6 +161,116 @@ describe("room governance projection", () => {
       memberships: [],
       viewerActorId: "human-admin",
     })).toThrow("owner projection is inconsistent");
+  });
+});
+
+describe("live closed Governance surface", () => {
+  it("renders submit/ACK/event projection convergence, final conflicts, and redacted revoke", async () => {
+    const root = document.createElement("main");
+    document.body.append(root);
+    const projection = {
+      roomId: "room-1", projectId: "room-1", roomName: "Alpha", lifecycle: "active" as const,
+      governanceRevision: 7, archiveGeneration: 0, ownerActorId: "owner-1",
+      members: [
+        { kind: "human" as const, actorId: "owner-1", displayName: "Owner", role: "member" as const },
+        { kind: "human" as const, actorId: "member-1", displayName: "Member", role: "member" as const },
+      ],
+    };
+    const initial: GovernanceRemoteState = {
+      status: "ready", projection, viewerActorId: "owner-1",
+      connection: { status: "online" }, operation: { status: "idle" },
+    };
+    let listener: ((state: { readonly roomId: string; readonly state: GovernanceRemoteState }) => void) | undefined;
+    const submit = vi.fn(async () => ({
+      requestId: "request-archive",
+      state: {
+        ...initial,
+        operation: { status: "submitting" as const, requestId: "request-archive", command: "room.archive" as const },
+      },
+    }));
+    const unsubscribe = vi.fn();
+    const bridge: GovernanceBridge = {
+      getSurface: vi.fn(async () => initial),
+      getDepartureConflicts: vi.fn(),
+      submit,
+      onStateChanged(callback) { listener = callback; return unsubscribe; },
+    };
+    const navigate = vi.fn();
+    const dispose = importedApp.mountGovernanceSurface(root, bridge, {
+      roomId: "room-1", reducedMotion: true, onNavigateConflictResolution: navigate,
+    });
+    await vi.waitFor(() => expect(root.querySelector("[data-archive-room]")).not.toBeNull());
+    root.querySelector<HTMLButtonElement>("[data-archive-room]")?.click();
+    root.querySelector<HTMLButtonElement>("[data-action='confirm-archive']")?.click();
+    await vi.waitFor(() => expect(submit).toHaveBeenCalledWith({
+      roomId: "room-1", intent: { command: "room.archive", expectedGovernanceRevision: 7 },
+    }));
+    await vi.waitFor(() => expect(root.querySelector("[aria-live='polite']")?.textContent)
+      .toContain("正在提交归档"));
+
+    listener?.({
+      roomId: "room-1",
+      state: {
+        ...initial,
+        operation: { status: "acknowledged", requestId: "request-archive", command: "room.archive" },
+      },
+    });
+    expect(root.querySelector("[data-archived-banner]")).toBeNull();
+    expect(root.querySelector("[aria-live='polite']")?.textContent).toContain("等待 stable event");
+
+    const archived = {
+      ...projection,
+      lifecycle: "archived" as const,
+      governanceRevision: 8,
+      archiveGeneration: 1,
+      archivedAt: "2026-08-19T08:00:00.000Z",
+    };
+    listener?.({
+      roomId: "room-1",
+      state: {
+        ...initial,
+        projection: archived,
+        operation: { status: "succeeded", requestId: "request-archive", command: "room.archive" },
+      },
+    });
+    expect(root.querySelector("[data-archived-banner]")).not.toBeNull();
+    expect(document.activeElement).toBe(root.querySelector("[data-governance-success]"));
+
+    const finalConflicts = {
+      roomId: "room-1", targetActorId: "member-1", governanceRevision: 8,
+      conflicts: [{
+        conflictId: "final-conflict", roomId: "room-1", subjectId: "request-1",
+        kind: "request" as const, summary: "Final conflict", state: "accepted",
+        sourceRef: "request-1", revision: 2, allowedResolutions: ["transfer" as const],
+      }],
+    };
+    listener?.({
+      roomId: "room-1",
+      state: {
+        ...initial,
+        projection: archived,
+        departureConflicts: finalConflicts,
+        operation: {
+          status: "failed", requestId: "request-remove", command: "room.member.remove",
+          error: { status: 409, code: "departure_blocked", details: finalConflicts },
+        },
+      },
+    });
+    expect(root.querySelector("[data-conflict-id='final-conflict']")?.textContent).toContain("Final conflict");
+    expect(document.activeElement).toBe(root.querySelector("[data-departure-conflicts] h2"));
+
+    listener?.({
+      roomId: "room-1",
+      state: {
+        status: "locked", roomId: "room-1",
+        connection: { status: "revoked", scope: "room", purgeCompleted: true },
+      },
+    });
+    expect(root.querySelector("[data-governance-locked]")?.textContent).toContain("缓存已清除");
+    expect(root.textContent).not.toContain("Alpha");
+    dispose();
+    expect(unsubscribe).toHaveBeenCalledOnce();
+    root.remove();
   });
 });
 

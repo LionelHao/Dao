@@ -1,5 +1,6 @@
 import {
   isRoomRepairPage,
+  isRoomGovernanceView,
   isRoomCursor,
   isRoomSyncResult,
   isSnapshotCompleted,
@@ -7,6 +8,7 @@ import {
   type PersistedRoomEvent,
   type RoomCursor,
   type RoomRepairPage,
+  type RoomGovernanceView,
   type RoomSyncRequest,
   type RoomSyncResult,
   type SnapshotCompleted,
@@ -86,6 +88,24 @@ export interface ClientSyncReplica {
   repairRoom(roomId: string): Promise<void>;
   clearAndRestore(): Promise<void>;
   close(): void;
+}
+
+export type ClientGovernanceApplication =
+  | {
+      readonly source: "events";
+      readonly roomId: string;
+      readonly eventIds: readonly string[];
+      readonly governance?: RoomGovernanceView;
+    }
+  | {
+      readonly source: "repair";
+      readonly roomId: string;
+      readonly eventIds: readonly [];
+      readonly governance: RoomGovernanceView;
+    };
+
+export interface ClientGovernanceObserver {
+  applied(application: ClientGovernanceApplication): void;
 }
 
 interface SnapshotEnvelope {
@@ -201,6 +221,7 @@ function validateEventAdvance(
 export function createClientSyncReplica(options: {
   readonly transport: SyncTransport;
   readonly cache: ClientAuthorityCache;
+  readonly governanceObserver?: ClientGovernanceObserver;
 }): ClientSyncReplica {
   const { transport, cache } = options;
   const subscriptions = new Map<string, RoomSubscription>();
@@ -239,6 +260,22 @@ export function createClientSyncReplica(options: {
     const fresh = deduplicateEvents(events, candidateSeen);
     validateEventAdvance(roomId, current, fresh, cursor);
     cache.applyRoomEvents(roomId, fresh, cursor);
+    if (fresh.length > 0) {
+      let governance: RoomGovernanceView | undefined;
+      for (const event of fresh) {
+        if (event.type === "room.governance.changed") governance = event.payload.governance;
+      }
+      try {
+        options.governanceObserver?.applied({
+          source: "events",
+          roomId,
+          eventIds: fresh.map((event) => event.eventId),
+          ...(governance === undefined ? {} : { governance }),
+        });
+      } catch {
+        // Projection listeners cannot roll back an already committed authority cache update.
+      }
+    }
     for (const event of fresh) seen.add(event.eventId);
     seenByRoom.set(roomId, seen);
   };
@@ -445,9 +482,17 @@ export function createClientSyncReplica(options: {
       checksum: first.snapshotChecksum,
       watermark: first.watermark,
     } as const;
+    let repairGovernance: RoomGovernanceView | undefined;
+    const captureGovernance = (page: RoomRepairPage): void => {
+      for (const record of page.records) {
+        if (record.kind === "governance" && isRoomGovernanceView(record.value) &&
+            record.value.roomId === roomId) repairGovernance = record.value;
+      }
+    };
     try {
       cache.beginRoom(roomId, first.snapshotId);
       cache.stageRoomPage(first);
+      captureGovernance(first);
       let page = first;
       while (page.hasMore) {
         const pageRequestId = requestId("room-repair-page");
@@ -456,6 +501,7 @@ export function createClientSyncReplica(options: {
         validateRoomPage(next, roomId, page.page + 1, envelope);
         if (next.requestId !== pageRequestId) throw invalid("Room repair response did not match its request");
         cache.stageRoomPage(next);
+        captureGovernance(next);
         page = next;
       }
       if (!await cache.finalizeRoom(first.snapshotId, first.snapshotChecksum)) {
@@ -471,6 +517,15 @@ export function createClientSyncReplica(options: {
       }
       assertCurrent();
       cache.commitRoom(roomId, first.watermark, first.snapshotChecksum);
+      if (repairGovernance !== undefined) {
+        try {
+          options.governanceObserver?.applied({
+            source: "repair", roomId, eventIds: [], governance: repairGovernance,
+          });
+        } catch {
+          // Projection listeners cannot roll back an atomically committed repair generation.
+        }
+      }
       seenByRoom.set(roomId, new Set<string>());
       const cursor = await syncFrom(
         roomId,

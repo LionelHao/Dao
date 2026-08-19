@@ -302,11 +302,15 @@ describe("Desktop Governance accessibility/layout contract", () => {
 
   it("defines reflow-safe 100%-200% structure and reduced-motion CSS without hiding core actions", () => {
     const css = readFileSync(resolve(import.meta.dirname, "governance.css"), "utf8");
+    const productionCss = readFileSync(resolve(import.meta.dirname, "..", "styles.css"), "utf8");
     expect(css).toContain("max-inline-size: 100%");
     expect(css).toContain("overflow-wrap: anywhere");
     expect(css).toMatch(/@media\s*\(max-width:\s*52\.5rem\)/u);
     expect(css).toMatch(/@media\s*\(prefers-reduced-motion:\s*reduce\)/u);
     expect(css).toContain("animation-duration: 0.01ms");
     expect(css).not.toMatch(/display:\s*none[^}]*data-action/u);
+    expect(productionCss).toContain(".dao-governance");
+    expect(productionCss).toMatch(/@media\s*\(max-width:\s*52\.5rem\)/u);
+    expect(productionCss).toMatch(/@media\s*\(prefers-reduced-motion:\s*reduce\)/u);
   });
 });

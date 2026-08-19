@@ -15,13 +15,13 @@ describe("Desktop preload entry", () => {
     exposeInMainWorld.mockClear();
   });
 
-  it("exposes one frozen dao namespace containing only the Identity bridge", async () => {
+  it("exposes one frozen dao namespace containing only closed Identity and Governance bridges", async () => {
     await import("./preload.js");
 
     expect(exposeInMainWorld).toHaveBeenCalledOnce();
     const [name, value] = exposeInMainWorld.mock.calls[0] as [string, unknown];
     expect(name).toBe("dao");
-    expect(Object.keys(value as object)).toEqual(["identity"]);
+    expect(Object.keys(value as object)).toEqual(["identity", "governance"]);
     expect(Object.isFrozen(value)).toBe(true);
     expect(Object.keys((value as { identity: object }).identity).sort()).toEqual([
       "getState",
@@ -30,6 +30,9 @@ describe("Desktop preload entry", () => {
       "onStateChanged",
       "refreshSessions",
       "revokeSession",
+    ]);
+    expect(Object.keys((value as { governance: object }).governance).sort()).toEqual([
+      "getDepartureConflicts", "getSurface", "onStateChanged", "submit",
     ]);
     expect(JSON.stringify(value)).not.toMatch(/token|secret|ipcRenderer|shell|filesystem/u);
   });
