@@ -248,6 +248,25 @@ describe("production OpenAI MemoryStewardProvider", () => {
     },
   );
 
+  it.each([
+    "Open https://example.com/private",
+    "Read /Users/alice/.ssh/id_ed25519",
+    "Read C:\\Users\\alice\\secret.txt",
+    "Use Bearer provider-token-value",
+    "The key is sk-proj-1234567890abcdef",
+    "Run rm -rf ./workspace",
+    "<reasoning>hidden chain of thought</reasoning>",
+  ])("rejects forbidden authority/tool/path/URL/secret/reasoning content inside derived text", async (derivedText) => {
+    const candidate = {
+      operation: "create", kind: "context", derivedText,
+      sourceRefs: [{ sourceId: "message:message-1", sourceRevision: 1 }],
+      dedupeKey: "forbidden-derived-content", replacesMemoryRecordId: null,
+    };
+    await expect(provider(async () => responsePlan(plan({ candidates: [candidate] }))).generate(
+      input(), validators(), new AbortController().signal,
+    )).rejects.toMatchObject({ code: "provider_malformed" });
+  });
+
   it("rejects duplicate JSON keys in both the Responses envelope and the closed plan", async () => {
     const duplicateEnvelope = new Response(
       '{"output":[],"output":[]}',

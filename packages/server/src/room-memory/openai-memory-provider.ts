@@ -48,6 +48,15 @@ const OPERATIONS = new Set(["create", "replace", "merge", "no_change"]);
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
 const SAFE_DEDUPE_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const encoder = new TextEncoder();
+const FORBIDDEN_DERIVED_TEXT = [
+  /\b[a-z][a-z0-9+.-]*:\/\//iu,
+  /(?:^|[\s"'`])(?:\/[A-Za-z0-9._~-]+){2,}/u,
+  /\b[A-Za-z]:\\(?:[^\\\s]+\\)+/u,
+  /\bBearer\s+[A-Za-z0-9._~+/-]{8,}/iu,
+  /\bsk-[A-Za-z0-9_-]{12,}/u,
+  /(?:^|\s)(?:sudo\b|rm\s+-rf\b|chmod\b|chown\b|powershell\b|cmd\.exe\b)/iu,
+  /<\/?reasoning>|chain[- ]of[- ]thought|hidden reasoning/iu,
+] as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -76,6 +85,10 @@ function validUnicode(value: string): boolean {
 
 function byteLength(value: string): number {
   return encoder.encode(value).byteLength;
+}
+
+function containsForbiddenDerivedText(value: string): boolean {
+  return FORBIDDEN_DERIVED_TEXT.some((pattern) => pattern.test(value));
 }
 
 function positiveSafeInteger(value: unknown): value is number {
@@ -259,6 +272,7 @@ function validatePlan(
     ]) || typeof candidate.operation !== "string" || !OPERATIONS.has(candidate.operation) ||
         typeof candidate.kind !== "string" || !MEMORY_KINDS.has(candidate.kind as RoomMemoryKind) ||
         typeof candidate.derivedText !== "string" || !validUnicode(candidate.derivedText) ||
+        containsForbiddenDerivedText(candidate.derivedText) ||
         byteLength(candidate.derivedText) < 1 ||
         byteLength(candidate.derivedText) > MEMORY_STEWARD_MAX_DERIVED_TEXT_BYTES ||
         !Array.isArray(candidate.sourceRefs) || candidate.sourceRefs.length < 1 ||

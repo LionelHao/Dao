@@ -1,4 +1,7 @@
+import type { RoomMemoryKind, RoomMemorySourceKind } from "@native-im/core";
 import type { SecretProvider } from "../agent-runtime/contracts.js";
+
+export type { RoomMemoryKind, RoomMemorySourceKind } from "@native-im/core";
 
 export const MEMORY_STEWARD_SCHEMA_VERSION = 1 as const;
 export const MEMORY_STEWARD_MAX_SOURCES = 32;
@@ -11,20 +14,6 @@ export const MEMORY_STEWARD_MAX_DERIVED_TEXT_BYTES = 4_096;
 export const MEMORY_STEWARD_MAX_SOURCE_REFS = 16;
 export const MEMORY_STEWARD_MAX_DEDUPE_KEY_BYTES = 128;
 export const MEMORY_STEWARD_TIMEOUT_MS = 60_000;
-
-export type RoomMemorySourceKind =
-  | "message"
-  | "message_revision"
-  | "message_tombstone"
-  | "attachment_extraction"
-  | "project_fact_checkpoint";
-
-export type RoomMemoryKind =
-  | "goal"
-  | "decision"
-  | "context"
-  | "next_action"
-  | "open_question_or_blocker";
 
 export type MemoryStewardCandidateOperation = "create" | "replace" | "merge" | "no_change";
 
