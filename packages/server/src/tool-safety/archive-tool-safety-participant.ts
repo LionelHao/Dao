@@ -180,13 +180,16 @@ function validateConfirmationBindings(database: DatabaseSync, roomId: string): v
         !PARAMETER_HASH.test(row.parameterSha256) || row.roomId !== roomId ||
         !["pending", "confirmed", "rejected", "expired"].includes(row.confirmationState as string) ||
         !isNonNegativeInteger(row.confirmationRevision) || row.executionRoomId !== roomId ||
-        !isPositiveInteger(row.currentAttemptSeq) || row.currentAttemptSeq !== row.attemptSeq ||
+        !isPositiveInteger(row.currentAttemptSeq) ||
         !isNonEmptyString(row.attemptStatus) || !isNonEmptyString(row.grantId) ||
         row.grantExecutionId !== row.executionId || row.grantAttemptSeq !== row.attemptSeq ||
         row.grantRoomId !== roomId || row.grantToolId !== row.toolId ||
         row.grantParameterSha256 !== row.parameterSha256 ||
         !["active", "claimed", "revoked", "expired"].includes(row.grantState as string)) {
       throw new Error("Tool confirmation binding is corrupt");
+    }
+    if (row.confirmationState === "pending" && row.currentAttemptSeq !== row.attemptSeq) {
+      throw new Error("Pending confirmation targeted a stale attempt");
     }
     if (row.confirmationState === "pending" && row.consumedAt !== null) {
       throw new Error("Pending confirmation is already consumed");

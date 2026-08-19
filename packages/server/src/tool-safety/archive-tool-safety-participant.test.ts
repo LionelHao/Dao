@@ -405,6 +405,93 @@ describe("ArchiveToolSafetyParticipant production provider", () => {
     }
   });
 
+  it("preserves a closed prior-attempt confirmation and grant while settling the current attempt", () => {
+    const database = createDatabase();
+    seedRoom(database);
+    insertToolWork(database, {
+      id: "prior-closed",
+      confirmationState: "rejected",
+      grantState: "revoked",
+      attemptStatus: "cancelled",
+    });
+    database.prepare(
+      `INSERT INTO agent_execution_attempts (
+         execution_id, attempt_seq, status, action_category
+       ) VALUES ('execution-prior-closed', 2, 'running', 'waiting_upstream')`,
+    ).run();
+    database.prepare(
+      `UPDATE agent_executions
+       SET current_attempt_seq = 2
+       WHERE id = 'execution-prior-closed'`,
+    ).run();
+    try {
+      expect(settle(database)).toEqual({
+        roomId: "room-1",
+        archiveGeneration: 3,
+        rejectedPendingCount: 0,
+        revokedGrantCount: 0,
+        fencedWaitingCount: 1,
+        preservedDispatchedCount: 0,
+      });
+      expect(database.prepare(
+        `SELECT confirmation_state AS state, consumed_at AS consumedAt,
+                confirmation_revision AS revision
+         FROM tool_confirmations
+         WHERE confirmation_id = 'confirmation-prior-closed'`,
+      ).get()).toEqual({ state: "rejected", consumedAt: null, revision: 0 });
+      expect(database.prepare(
+        `SELECT grant_state AS state, consumed_at AS consumedAt,
+                grant_revision AS revision
+         FROM agent_execution_grants
+         WHERE grant_id = 'grant-prior-closed'`,
+      ).get()).toEqual({ state: "revoked", consumedAt: null, revision: 0 });
+      expect(database.prepare(
+        `SELECT status, cancellation_reason AS reason, current_attempt_seq AS attemptSeq
+         FROM agent_executions
+         WHERE id = 'execution-prior-closed'`,
+      ).get()).toEqual({ status: "cancelled", reason: "room_archived", attemptSeq: 2 });
+    } finally {
+      database.close();
+    }
+  });
+
+  it("still fails closed when a pending confirmation targets a non-current attempt", () => {
+    const database = createDatabase();
+    seedRoom(database);
+    insertToolWork(database, { id: "stale-pending" });
+    database.prepare(
+      `INSERT INTO agent_execution_attempts (
+         execution_id, attempt_seq, status, action_category
+       ) VALUES ('execution-stale-pending', 2, 'running', 'waiting_upstream')`,
+    ).run();
+    database.prepare(
+      `UPDATE agent_executions
+       SET current_attempt_seq = 2
+       WHERE id = 'execution-stale-pending'`,
+    ).run();
+    try {
+      const envelope = withTransaction(database, "room-1", (transaction) =>
+        createArchiveToolSafetyParticipant().settleUndispatched(transaction, {
+          roomId: "room-1",
+          archiveGeneration: 3,
+          now: NOW,
+        }));
+      expect(envelope).toMatchObject({
+        ok: false,
+        error: { dependency: "archive-settlement", reason: "participant_threw" },
+      });
+      expect(database.prepare(
+        `SELECT confirmation_state AS state
+         FROM tool_confirmations
+         WHERE confirmation_id = 'confirmation-stale-pending'`,
+      ).get()).toEqual({ state: "pending" });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM tool_archive_settlements").get())
+        .toEqual({ count: 0 });
+    } finally {
+      database.close();
+    }
+  });
+
   it("linearizes both archive-before-claim and claim-before-archive with adapter zero-call on rejection", () => {
     const archiveFirst = createDatabase();
     seedRoom(archiveFirst);
