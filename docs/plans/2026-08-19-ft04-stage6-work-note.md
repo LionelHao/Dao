@@ -2,7 +2,7 @@
 
 > 日期：2026-08-19
 > owner：本 Stage integration owner
-> 状态：实施中；本文按真实提交与证据更新，不代表 owner 验收或 Blueprint 状态变化。
+> 状态：Stage 6 代码与受保护 CI 已交付远端 main；等待 delivery truth PR 与 owner 验收，不代表 Blueprint 状态变化。
 
 ## 1. 基线与隔离
 
@@ -28,29 +28,37 @@
 - 存储：SQLite 仅 metadata/provenance；bytes/extracted text 在 server-controlled bounded store；FS+DB 以 crash truth table恢复，不宣称跨资源 ACID。
 - production dependency：真实 ClamAV + bounded Poppler/Tesseract/ZIP/text adapters；缺失 fail closed/degraded，不 fallback fake。
 
-## 4. Wave 0 审计
+## 4. Wave 0 审计与后续复审
 
-三名只读 Agent 都从同一 `origin/main` SHA 建独立 clean worktree，所有权为“无”，不改代码/文档/Blueprint：
+三名 Agent 都使用彼此独立的 worktree/branch；没有一个 Agent 修改原始混合工作树或 Blueprint。初始只读审计与集成后复审给出的关键结论如下：
 
-| 审计 | 关键结论 |
+| 审计 | 结论与处理 |
 | --- | --- |
-| adversarial | unbound metadata不能进 Room；十态必须四轴；32 KiB chunk；source bind/recall/archive/revoke/worker race；FS+DB crash truth；bomb limits；发现既有 `message-revision` repair contract/runtime 漏接 |
-| code seam | 进行中；将补 Core/Worker/WS/sync/Desktop 文件级切片 |
-| dependency/security | 发现 Electron 37.x runtime advisory 阻断附件 preview 隔离；`pnpm audit --prod` 不能隐藏 Electron；将补官方版本、license 与真实组合建议 |
+| adversarial | 冻结 unbound principal-private、四轴十态、32 KiB chunk、source/recall/archive/revoke/generation、FS+SQLite crash truth、bomb budgets；发现并修复 Stage 5 `message-revision` repair registry/desktop blanket reject 漏接。末轮又发现 Agent extraction/read port、跨设备 metadata hydration、public `message.send.v2` attachment parser gate 与 combined sentinel 证据缺口；均作为发布阻断处理，不以文档降级。 |
+| code seam / E2E | 分波实现 Core、store、protocol、Worker/DB/service、process pipeline、sync/repair；末轮用真实 AuthorityWorker/SQLite/loopback WS/ClamD protocol fixture/Desktop controller chain闭合三客户端、restart、repair 与 privacy evidence。 |
+| dependency/security | Electron 37.x 的附件隔离 advisory 是 blocker；已精确升级 Electron `43.4.1`，精确锁 `file-type@22.0.2`、`fflate@0.8.3`、`saxes@6.0.0`，override 位于 `pnpm-workspace.yaml`；full audit 0。外部 ClamAV/Poppler/Tesseract 缺失必须 capability degraded，绝不 fake ready。 |
 
-已登记 Stage 5 recovery debt：Core `MessageAuthorityRepairRecord` 含 `message-revision`，但 Room repair runtime registry/descriptor 及 Desktop replica 没有完成 active revision chain repair；Stage 6 在增加 attachment record 前修复，recalled raw revision仍禁止。
+没有发现需要 owner 另作产品裁决的 PRD/protocol/formal design 冲突。`docs/protocols/identity-room-lifecycle.md` 的旧 archive/silent 文案没有覆盖 approved PRD/FT-02 裁决。
 
-## 5. 实施流水账
+## 5. 实施事实
 
-| 时间/阶段 | 事实 |
+| 切片 | 已完成事实 |
 | --- | --- |
-| baseline | 权威 PRD、approved map、protocol、formal design、FT-03/13 与 Stage 5 交付已审阅；无需要 owner 先裁决的产品冲突 |
-| design freeze | 新建设计与实施计划；吸收 privacy、race、repair、payload、bomb、dependency review；等待 Wave 0 final 后冻结首个提交 |
-| Wave 1+ | 待真实 commit/测试后填写 |
+| Core / J-02 | closed attachment metadata/event/repair/error contracts；50 MiB、七格式、32 KiB；local/transport、durable processing、source eligibility、access projection 四轴确定性映射十态；exact own-key/symbol/hidden-field guards 与 type-negative tests。 |
+| schema v17 | 唯一 append-only v17，31 条 meaningful statements；fresh、v1～v16逐版升级、restart、future/physical/history checksum tamper；31/31 statement fault rollback；v1～v16 statement/fingerprint 未改写。 |
+| object/process | 私有 tmp/quarantine/object/extraction 域、no-follow/TOCTOU、fsync/rename/content address、bounded reconciliation；`file-type` + 格式结构校验；ClamD INSTREAM、Poppler、Tesseract 的 real production composition；队列/并发/timeout/stdout/stderr/body 全有界。 |
+| DB / single writer | AuthorityWorker 唯一 SQLite writer；upload exact replay、chunk checkpoints、finalize/private outbox、processing CAS、ready provenance、message/link/source/Room event/outbox/receipt 同事务；全局 32 active、principal+Room 4 active。 |
+| access / future seam | Human preview/download 每个 range 重新授权并绑定 session family/lifecycle/access/generation；server-private Agent extraction reader 只接受 current running execution/assignment 与 active source，range 读取前后重验，返回 bounded UTF-8 + source revision/provenance，不公开 object key/path/token；不实现 FT-05/06 compiler。 |
+| sync / recovery | uploader-private status 不进 Room；bind 后 metadata-rich Room event/repair；`message-revision` 与 `attachment` runtime registry 穷举；streaming/materialized fixed-watermark repair、checksum、clear-cache/restart；recall 输出 tombstone/excluded，无 raw revision/extracted text。 |
+| Desktop | exact 8-method preload/main IPC、native dialog/opaque handle、32 KiB ACK progress、cancel/retry；每次 reauth preview/download、atomic native save；独立非持久 sandbox preview 拒 Node/navigation/window/permission/network；composer 与正式 J-02 十态/焦点/aria/zoom/reduced-motion 挂载；跨设备 private status 与历史 bound card 安全 metadata hydration。 |
+| public bind | 已移除遗留 `attachment_feature_unavailable` parser gate；closed `AttachmentReference` 经 public `message.send.v2` 进入现有 Message Authority，并在 AuthorityWorker transaction 内只绑定 ready/same-Room/current-uploader/unoccupied source。 |
 
-## 6. 待完成门禁
+主要 TDD RED 都保留在 Agent 回报与提交历史中：缺模块、schema 16≠17、repair kind 漏接、cross-realm bytes 503、default jsdom parser、全局第 33 个 upload 被接受、Agent read port缺失、第二设备 private status被丢弃、历史 card 不发 status query，以及 public attachment bind 400。没有通过删除/skip/放宽原测试获得 GREEN。
 
-- Core closed contracts、schema v17、object store、real adapters、AuthorityWorker、protocol/WS、message bind、sync/repair/private outbox、Desktop closed bridge/J-02 UI 尚待实现。
-- Electron 安全版本、lockfile audit 与实际 binary smoke 尚待完成。
-- crash/restart、malware/OCR dependency-aware live smoke、全量质量门、ready PR/CI/squash merge/remote main 回读尚待完成。
-- 最终交付说明只在上述事实完成后创建；Blueprint 与 owner acceptance 状态不由本 Stage 修改。
+## 6. 最终门禁状态
+
+- 三认证客户端 public WS upload→ClamD/processing→READY→public `message.send.v2` bind→三端 live→restart delta/history→materialized/streaming repair 已通过；combined sentinel 对 SQLite/WAL/SHM、snapshot/cache、event/outbox、live/delta/history/repair、Desktop bridge、error/log/stdout/stderr 零禁区命中。
+- 最终 integration：Test Files `133 passed / 2 skipped / 0 failed (135)`；Tests `1607 passed / 2 skipped / 0 failed (1609)`；typecheck、lint（0 warning）、build、Core/Desktop boundaries、diff check 全通过；Electron 输出 `app bridge, native selection, and secure preview loaded`。
+- 四个 ready PR 均从当时最新 `origin/main` 创建，Node `22.13.1` 与 `22.x` 受保护 checks 全绿后 squash merge：[#49](https://github.com/LionelHao/Dao/pull/49) `b16953d`、[#50](https://github.com/LionelHao/Dao/pull/50) `7689cda`、[#51](https://github.com/LionelHao/Dao/pull/51) `bdc4782`、[#52](https://github.com/LionelHao/Dao/pull/52) `2cee92a`。代码交付 main 已回读为 `2cee92a322569235d08a6af0b28e5964f503073d`。
+- 本机没有 ClamAV、Tesseract、`pdftotext`，且可见 `pdftoppm 26.05.0` 低于冻结 `26.07.0`；external-tool live smoke 安全 skip。deterministic evidence 使用真实 child process、真实 loopback ClamD wire protocol和真实 temp filesystem；production capability probe 在缺失/旧版时 degraded/fail closed，不把 fixture冒充部署 capability。
+- Blueprint 与 owner acceptance 状态未修改；FT-05/06/10 没有被本阶段冒充完成。最终证据与 PR/CI 明细进入 `docs/deliveries/FT-04-Attachment-Pipeline-Stage6-交付说明.md`。
