@@ -831,7 +831,13 @@ export function revalidateSnapshotDatabaseQuery(
       }
       return;
     }
-    const room = database.prepare("SELECT status FROM rooms WHERE id = ?")
+    const room = database.prepare(
+      `SELECT room.status, stream.head_seq AS watermark
+       FROM rooms AS room
+       JOIN streams AS stream
+         ON stream.stream_kind = 'room' AND stream.stream_id = room.id
+       WHERE room.id = ?`,
+    )
       .get(validation.roomId);
     if (room === undefined) {
       return fail("room_not_found", "Snapshot room was not found");
@@ -855,6 +861,9 @@ export function revalidateSnapshotDatabaseQuery(
     }
     if (membership.accessRevision !== validation.accessRevision) {
       return fail("snapshot_stale", "Snapshot room access revision changed");
+    }
+    if (room.watermark !== validation.watermark) {
+      return fail("snapshot_stale", "Snapshot Room watermark changed");
     }
   });
 }

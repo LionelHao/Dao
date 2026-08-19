@@ -145,7 +145,10 @@ export class ArchiveReadRepairAccessAuthority implements StreamingRepairAuthorit
       return;
     }
     const proof = this.#readRoomProof(actorId, request.roomId, false);
-    if (proof.accessRevision !== request.accessRevision) reject("snapshot_stale");
+    if (proof.accessRevision !== request.accessRevision ||
+        proof.fixedWatermark !== request.watermark) {
+      reject("snapshot_stale");
+    }
   }
 
   async acquireStreamingRepair(

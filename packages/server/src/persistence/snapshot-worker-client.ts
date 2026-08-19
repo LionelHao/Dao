@@ -1000,7 +1000,8 @@ class SnapshotWorkerClientImplementation implements SnapshotWorkerClient {
     }
     const request: SnapshotRevalidationRequest = response.manifest.kind === "room"
       ? { kind: "room", context, roomId: response.manifest.roomId,
-          accessRevision: response.manifest.accessRevision }
+          accessRevision: response.manifest.accessRevision,
+          watermark: response.manifest.watermark }
       : { kind: "catalog", context, catalogRevision: response.manifest.catalogRevision };
     try {
       await this.#revalidate(request);

@@ -1522,6 +1522,9 @@ function revalidateRepairLease(
   context: Extract<AuthorityWorkerRequest, { readonly type: "authority.repair-authorize-page" }>["context"],
   now: number,
 ): void {
+  if ((lease.scope.kind === "room") !== (lease.version.kind === "room")) {
+    throw new TypeError("Streaming repair lease scope/version mismatch");
+  }
   revalidateSnapshotDatabaseQuery(
     requireAuthorityTransactionDatabase(),
     lease.scope.kind === "room"
@@ -1530,6 +1533,7 @@ function revalidateRepairLease(
           context,
           roomId: lease.scope.roomId,
           accessRevision: lease.authorizationRevision,
+          watermark: lease.version.kind === "room" ? lease.version.watermark : 0,
         }
       : {
           kind: "catalog",

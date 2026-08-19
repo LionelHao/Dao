@@ -94,6 +94,7 @@ export type SnapshotRevalidationRequest =
       readonly context: AuthenticatedSessionContext;
       readonly roomId: string;
       readonly accessRevision: number;
+      readonly watermark: number;
     }
   | {
       readonly kind: "catalog";
