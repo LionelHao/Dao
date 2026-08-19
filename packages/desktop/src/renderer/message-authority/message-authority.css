@@ -141,9 +141,31 @@
 }
 
 .message-authority__mention-picker,
-.message-authority__message-actions {
+.message-authority__message-actions,
+.message-authority__attachments,
+.message-authority__attachment {
   display: flex;
   flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.message-authority__attachments {
+  margin: 0.75rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.message-authority__attachment {
+  align-items: center;
+  padding: 0.5rem;
+  border: 1px solid var(--message-line);
+  border-radius: 0.375rem;
+  overflow-wrap: anywhere;
+}
+
+.message-authority__attachment-composer {
+  display: grid;
+  min-inline-size: 0;
   gap: 0.5rem;
 }
 

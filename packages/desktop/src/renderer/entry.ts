@@ -1,6 +1,7 @@
 import type { IdentityBridge } from "../identity/contracts.js";
 import type { GovernanceBridge } from "../governance/contracts.js";
 import type { MessageAuthorityBridge } from "../message-authority/contracts.js";
+import type { AttachmentAuthorityBridge } from "../attachment-authority/contracts.js";
 import {
   mountGovernanceSurface,
   renderM2PrimitivesPreview,
@@ -24,6 +25,7 @@ export interface DesktopRendererEntryPorts {
     root: HTMLElement,
     bridge: MessageAuthorityBridge,
     roomId: string,
+    attachmentBridge?: AttachmentAuthorityBridge,
   ) => () => void;
 }
 
@@ -48,10 +50,12 @@ const DEFAULT_PORTS: DesktopRendererEntryPorts = Object.freeze({
     root: HTMLElement,
     bridge: MessageAuthorityBridge,
     roomId: string,
+    attachmentBridge?: AttachmentAuthorityBridge,
   ) => mountMessageAuthorityBridgeSurface(root, bridge, roomId, {
     createMessageId: () => `message-${globalThis.crypto.randomUUID()}`,
     createTargetId: () => `target-${globalThis.crypto.randomUUID()}`,
     reducedMotion: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false,
+    ...(attachmentBridge === undefined ? {} : { attachmentBridge }),
   }),
 });
 
@@ -111,6 +115,7 @@ export function mountDesktopRendererEntry(
   governance: GovernanceBridge | undefined,
   messageAuthority: MessageAuthorityBridge | undefined,
   ports: DesktopRendererEntryPorts = DEFAULT_PORTS,
+  attachmentAuthority?: AttachmentAuthorityBridge,
 ): (() => void) | undefined {
   const route = new URLSearchParams(search);
   root.dataset.governanceRouteContract = "closed-v1";
@@ -126,7 +131,9 @@ export function mountDesktopRendererEntry(
       renderMessageAuthorityRouteFailure(root, "Desktop 消息桥未加载，Room 内容保持锁定。");
       return undefined;
     }
-    return ports.mountMessageAuthoritySurface(root, messageAuthority, roomId);
+    return attachmentAuthority === undefined
+      ? ports.mountMessageAuthoritySurface(root, messageAuthority, roomId)
+      : ports.mountMessageAuthoritySurface(root, messageAuthority, roomId, attachmentAuthority);
   }
 
   if (route.has("governance-room")) {

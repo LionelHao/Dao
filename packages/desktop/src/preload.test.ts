@@ -21,7 +21,9 @@ describe("Desktop preload entry", () => {
     expect(exposeInMainWorld).toHaveBeenCalledOnce();
     const [name, value] = exposeInMainWorld.mock.calls[0] as [string, unknown];
     expect(name).toBe("dao");
-    expect(Object.keys(value as object)).toEqual(["identity", "governance", "messageAuthority"]);
+    expect(Object.keys(value as object)).toEqual([
+      "identity", "governance", "messageAuthority", "attachmentAuthority",
+    ]);
     expect(Object.isFrozen(value)).toBe(true);
     expect(Object.keys((value as { identity: object }).identity).sort()).toEqual([
       "getState",
@@ -36,6 +38,10 @@ describe("Desktop preload entry", () => {
     ]);
     expect(Object.keys((value as { messageAuthority: object }).messageAuthority).sort()).toEqual([
       "historyV2", "onAuthorityInput", "recall", "revise", "revisionsQuery", "sendV2",
+    ]);
+    expect(Object.keys((value as { attachmentAuthority: object }).attachmentAuthority).sort()).toEqual([
+      "cancel", "download", "onAuthorityInput", "preview", "removeSelection",
+      "retryProcessing", "select", "status", "upload",
     ]);
     expect(JSON.stringify(value)).not.toMatch(/token|secret|idempotency|ipcRenderer|shell|filesystem|websocket/iu);
   });

@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import {
   attachmentDetectedMime,
+  isAttachmentMetadata,
   type AttachmentError,
-  type AttachmentProcessingStatus,
 } from "@native-im/core";
 import type { AuthenticatedCommandContext } from "../persistence/contracts.js";
 import type { WorkerDatabaseClient } from "../persistence/worker-database-client.js";
@@ -158,7 +158,17 @@ function isAccessDecision(result: AttachmentDatabaseOperationResult): result is 
 }
 
 function isStatusResult(result: AttachmentDatabaseOperationResult): result is AttachmentStatusResult {
-  return "attachment" in result && "sourceEligibility" in result;
+  if (!("attachment" in result) || !("sourceEligibility" in result) ||
+      !("accessProjection" in result) || Reflect.ownKeys(result).length !== 3 ||
+      !isAttachmentMetadata(result.attachment) ||
+      (result.sourceEligibility !== "unbound" && result.sourceEligibility !== "bound-active" &&
+        result.sourceEligibility !== "excluded-recalled") ||
+      (result.accessProjection !== "authorized" && result.accessProjection !== "archived-read-only")) {
+    return false;
+  }
+  return result.sourceEligibility === "unbound"
+    ? result.attachment.sourceMessageId === null
+    : result.attachment.processingStatus === "ready" && result.attachment.sourceMessageId !== null;
 }
 
 function databaseProtocolFailure(): never {
@@ -363,12 +373,18 @@ export function createAttachmentAuthorityService(options: {
             attachmentId: result.attachmentId,
             generation: result.generation,
           });
+          const current = await executeDatabase({
+            kind: "status-read",
+            context: human,
+            attachmentId: result.attachmentId,
+          });
+          if (!isStatusResult(current)) return databaseProtocolFailure();
           return Object.freeze({
             type: "attachment.status",
             requestId: frame.requestId,
-            attachmentId: result.attachmentId,
-            processingStatus: "accepted-quarantined",
-            generation: result.generation,
+            attachment: current.attachment,
+            sourceEligibility: current.sourceEligibility,
+            accessProjection: current.accessProjection,
           });
         }
         case "attachment.status.query": {
@@ -381,9 +397,9 @@ export function createAttachmentAuthorityService(options: {
           return Object.freeze({
             type: "attachment.status",
             requestId: frame.requestId,
-            attachmentId: result.attachment.attachmentId,
-            processingStatus: result.attachment.processingStatus as AttachmentProcessingStatus,
-            generation: result.attachment.generation,
+            attachment: result.attachment,
+            sourceEligibility: result.sourceEligibility,
+            accessProjection: result.accessProjection,
           });
         }
         case "attachment.preview.open":

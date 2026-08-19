@@ -1,4 +1,5 @@
 @import "./message-authority/message-authority.css";
+@import "./attachment-authority/attachment-authority.css";
 
 :root {
   --app-background: #f8fafc;

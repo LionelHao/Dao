@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash, scryptSync } from "node:crypto";
-import { access, readFile, readdir, unlink } from "node:fs/promises";
+import { access, readFile, readdir, unlink, writeFile } from "node:fs/promises";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -59,6 +59,18 @@ import {
   createGovernanceBridge,
   type GovernanceIpcRenderer,
 } from "../../desktop/src/governance/preload-bridge.js";
+import { createDesktopAttachmentAuthorityRuntime } from
+  "../../desktop/src/attachment-authority/production-runtime.js";
+import type {
+  AttachmentAuthorityIpcMain,
+  AttachmentAuthorityIpcWebContents,
+} from "../../desktop/src/attachment-authority/ipc.js";
+import {
+  createAttachmentAuthorityBridge,
+  type AttachmentAuthorityIpcRenderer,
+} from "../../desktop/src/attachment-authority/preload-bridge.js";
+import { mountAttachmentComposerBridge } from
+  "../../desktop/src/renderer/attachment-authority/composer-bridge.js";
 import { mountDesktopRendererEntry } from "../../desktop/src/renderer/entry.js";
 import type {
   Actor,
@@ -97,6 +109,7 @@ const previewActors = [
   },
 ] as const satisfies readonly Actor[];
 const childStderr = new WeakMap<ChildProcessWithoutNullStreams, string>();
+const childStdout = new WeakMap<ChildProcessWithoutNullStreams, string>();
 const stressPageSize = 50;
 const materializedPageSize = 100;
 
@@ -160,6 +173,60 @@ class NodeIdentityWebSocketAdapter implements IdentityWebSocketLike {
   terminate(): void {
     this.#socket.terminate();
   }
+}
+
+function createAttachmentIpcHarness(): Readonly<{
+  ipcMain: AttachmentAuthorityIpcMain;
+  webContents: AttachmentAuthorityIpcWebContents;
+  ipcRenderer: AttachmentAuthorityIpcRenderer;
+  registeredHandlers(): number;
+}> {
+  type IpcEvent = Readonly<{ sender: unknown; senderFrame: unknown }>;
+  type Handler = (event: IpcEvent, ...args: unknown[]) => unknown;
+  type Listener = (event: unknown, input: unknown) => void;
+  const handlers = new Map<string, Handler>();
+  const listeners = new Map<string, Set<Listener>>();
+  const mainFrame = Object.freeze({ kind: "attachment-e2e-main-frame" });
+  const ipcMain: AttachmentAuthorityIpcMain = {
+    handle(channel, handler) {
+      handlers.set(channel, handler as Handler);
+    },
+    removeHandler(channel) {
+      handlers.delete(channel);
+    },
+  };
+  const webContents: AttachmentAuthorityIpcWebContents = {
+    mainFrame,
+    isDestroyed: () => false,
+    send(channel, input) {
+      for (const listener of listeners.get(channel) ?? []) {
+        listener(Object.freeze({ sender: webContents }), structuredClone(input));
+      }
+    },
+  };
+  const ipcRenderer: AttachmentAuthorityIpcRenderer = {
+    async invoke(channel, ...args) {
+      const handler = handlers.get(channel);
+      if (handler === undefined) throw new TypeError("Attachment E2E IPC handler is missing");
+      return await handler({ sender: webContents, senderFrame: mainFrame }, ...args);
+    },
+    on(channel, listener) {
+      const current = listeners.get(channel) ?? new Set<Listener>();
+      current.add(listener);
+      listeners.set(channel, current);
+    },
+    removeListener(channel, listener) {
+      const current = listeners.get(channel);
+      current?.delete(listener);
+      if (current?.size === 0) listeners.delete(channel);
+    },
+  };
+  return Object.freeze({
+    ipcMain,
+    webContents,
+    ipcRenderer,
+    registeredHandlers: () => handlers.size,
+  });
 }
 
 function createMemoryCredentialVault(initial?: IdentityStoredCredentials): {
@@ -229,6 +296,57 @@ async function readAllRegularFiles(directory: string): Promise<readonly Buffer[]
   return contents;
 }
 
+async function readRegularFileEntries(directory: string): Promise<readonly Readonly<{
+  path: string;
+  bytes: Buffer;
+}>[]> {
+  const contents: Array<Readonly<{ path: string; bytes: Buffer }>> = [];
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) {
+      contents.push(...await readRegularFileEntries(path));
+    } else if (entry.isFile()) {
+      contents.push(Object.freeze({ path, bytes: await readFile(path) }));
+    }
+  }
+  return contents;
+}
+
+async function readAuthorityCheckpointFiles(directory: string): Promise<readonly Readonly<{
+  path: string;
+  bytes: Buffer;
+}>[]> {
+  const names = await readdir(directory);
+  return await Promise.all(names
+    .filter((name) => /^(?:authority|snapshot-cache)\.sqlite(?:-(?:wal|shm))?$/u.test(name))
+    .sort()
+    .map(async (name) => Object.freeze({
+      path: join(directory, name),
+      bytes: await readFile(join(directory, name)),
+    })));
+}
+
+function byteSentinelHits(
+  entries: readonly Readonly<{ path: string; bytes: Uint8Array }>[],
+  sentinels: readonly string[],
+): readonly string[] {
+  const hits: string[] = [];
+  for (const entry of entries) {
+    for (const sentinel of sentinels) {
+      if (Buffer.from(entry.bytes).includes(Buffer.from(sentinel, "utf8"))) {
+        hits.push(`${entry.path}:${sentinel}`);
+      }
+    }
+  }
+  return hits;
+}
+
+function jsonSentinelHits(label: string, value: unknown, sentinels: readonly string[]): readonly string[] {
+  const encoded = JSON.stringify(value);
+  return sentinels.filter((sentinel) => encoded.includes(sentinel))
+    .map((sentinel) => `${label}:${sentinel}`);
+}
+
 interface ChildStartOptions {
   readonly directory: string;
   readonly actors?: readonly Actor[];
@@ -247,6 +365,7 @@ interface ChildStartOptions {
   readonly emitUnrelatedWarningForTest?: true;
   readonly closeCleanupProbe?: true;
   readonly seedRuntimeRoomForTest?: true;
+  readonly enableAttachmentFixture?: true;
   readonly previewSentinelForTest?: string;
   readonly compactRoom?: {
     readonly roomId: string;
@@ -295,6 +414,9 @@ function startCommand(options: ChildStartOptions): Record<string, unknown> {
     ...(options.seedRuntimeRoomForTest === undefined
       ? {}
       : { seedRuntimeRoomForTest: true }),
+    ...(options.enableAttachmentFixture === undefined
+      ? {}
+      : { enableAttachmentFixture: true }),
     ...(options.previewSentinelForTest === undefined
       ? {}
       : { previewSentinelForTest: options.previewSentinelForTest }),
@@ -404,6 +526,51 @@ function readRoomHeadSeq(directory: string, roomId: string): number {
   }
 }
 
+async function waitForRoomAuthorityQuiescence(
+  directory: string,
+  roomId: string,
+  timeoutMs = 5_000,
+): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  let previousHead = -1;
+  let stableSamples = 0;
+  let pendingDeliveries = -1;
+  while (Date.now() <= deadline) {
+    const database = new DatabaseSync(join(directory, "authority.sqlite"), { readOnly: true });
+    let headSeq: number;
+    try {
+      const stream = database.prepare(
+        `SELECT head_seq AS headSeq FROM streams
+         WHERE stream_kind = 'room' AND stream_id = ?`,
+      ).get(roomId) as { readonly headSeq: number } | undefined;
+      if (stream === undefined || !Number.isSafeInteger(stream.headSeq)) {
+        throw new TypeError("Authority quiescence observed an invalid Room stream");
+      }
+      headSeq = stream.headSeq;
+      const pending = database.prepare(
+        `SELECT COUNT(*) AS count
+         FROM outbox_deliveries AS delivery
+         INNER JOIN events AS event ON event.event_id = delivery.event_id
+         WHERE event.stream_kind = 'room' AND event.stream_id = ?
+           AND delivery.status <> 'dispatched'`,
+      ).get(roomId) as { readonly count: number };
+      pendingDeliveries = pending.count;
+    } finally {
+      database.close();
+    }
+    stableSamples = pendingDeliveries === 0 && headSeq === previousHead
+      ? stableSamples + 1
+      : 0;
+    if (stableSamples >= 2) return headSeq;
+    previousHead = headSeq;
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(
+    `Room authority did not quiesce within ${timeoutMs}ms ` +
+      `(head=${previousHead}, pendingDeliveries=${pendingDeliveries})`,
+  );
+}
+
 async function spawnAuthorityChild(options: ChildStartOptions): Promise<{
   readonly child: ChildProcessWithoutNullStreams;
   readonly url: string;
@@ -417,6 +584,10 @@ async function spawnAuthorityChild(options: ChildStartOptions): Promise<{
     stdio: ["pipe", "pipe", "pipe"],
   });
   childStderr.set(child, "");
+  childStdout.set(child, "");
+  child.stdout.on("data", (chunk: Buffer) => {
+    childStdout.set(child, `${childStdout.get(child) ?? ""}${chunk.toString("utf8")}`);
+  });
   child.stderr.on("data", (chunk: Buffer) => {
     childStderr.set(child, `${childStderr.get(child) ?? ""}${chunk.toString("utf8")}`);
   });
@@ -496,6 +667,10 @@ async function runAuthorityUtility(options: ChildStartOptions): Promise<unknown>
     stdio: ["pipe", "pipe", "pipe"],
   });
   childStderr.set(child, "");
+  childStdout.set(child, "");
+  child.stdout.on("data", (chunk: Buffer) => {
+    childStdout.set(child, `${childStdout.get(child) ?? ""}${chunk.toString("utf8")}`);
+  });
   child.stderr.on("data", (chunk: Buffer) => {
     childStderr.set(child, `${childStderr.get(child) ?? ""}${chunk.toString("utf8")}`);
   });
@@ -1100,7 +1275,12 @@ async function repairRecords(client: JsonWebSocketClient, roomId: string) {
         records.push(...next.records);
         page = next;
       }
-      return { records, watermark: first.watermark, checksum: first.snapshotChecksum };
+      return {
+        records,
+        watermark: first.watermark,
+        checksum: first.snapshotChecksum,
+        mode: first.mode,
+      };
     } catch (error: unknown) {
       if (!isRecord(error) || error.code !== "snapshot_stale" || attempt === 2) throw error;
     }
@@ -1141,7 +1321,9 @@ async function seedDirectory(directory: string): Promise<string> {
   const client = await JsonWebSocketClient.connect(started.url);
   try {
     await client.login("seed-login");
-    return await discoverRoom(client);
+    const roomId = await discoverRoom(client);
+    await waitForRoomAuthorityQuiescence(directory, roomId);
+    return roomId;
   } finally {
     client.close();
     await stopChild(started.child);
@@ -1164,6 +1346,40 @@ function sendMessage(
       sentAt: "2026-08-12T10:00:00.000Z",
     },
   });
+}
+
+const attachmentRawSentinel = "FT04_E2E_RAW_PDF_SENTINEL";
+const attachmentExtractionSentinel = "FT04_E2E_EXTRACTED_TEXT";
+const attachmentScannerRawSentinel = "FT04_E2E_SCANNER_RAW_SIGNATURE";
+const attachmentScannerPathSentinel = "/private/ft04-e2e/clamd.sock";
+const attachmentScannerTokenSentinel = "FT04_E2E_BEARER_TOKEN";
+const attachmentForbiddenSentinels = Object.freeze([
+  attachmentRawSentinel,
+  attachmentExtractionSentinel,
+  attachmentScannerRawSentinel,
+  attachmentScannerPathSentinel,
+  attachmentScannerTokenSentinel,
+]);
+
+function attachmentE2ePdf(): Buffer {
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+    `<< /Padding (${attachmentRawSentinel}${"a".repeat(40_000)}) >>`,
+  ];
+  let body = "%PDF-1.7\n";
+  const offsets: number[] = [];
+  for (const [index, object] of objects.entries()) {
+    offsets.push(Buffer.byteLength(body, "latin1"));
+    body += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  }
+  const xref = Buffer.byteLength(body, "latin1");
+  body += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (const offset of offsets) body += `${String(offset).padStart(10, "0")} 00000 n \n`;
+  body += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\n`;
+  body += `startxref\n${xref}\n%%EOF\n`;
+  return Buffer.from(body, "latin1");
 }
 
 describe("authoritative server real-process harness", () => {
@@ -1326,6 +1542,428 @@ describe("authoritative server real-process harness", () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+
+  it("converges a processed attachment through three authenticated clients, stable sync, and repair", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-ft04-e2e-"));
+    const clients: JsonWebSocketClient[] = [];
+    let started: Awaited<ReturnType<typeof spawnAuthorityChild>> | undefined;
+    let desktopRuntime: ReturnType<typeof createDesktopAttachmentAuthorityRuntime> | undefined;
+    let composer: ReturnType<typeof mountAttachmentComposerBridge> | undefined;
+    let rendererRoot: HTMLElement | undefined;
+    const authorityFrames: ServerFrame[] = [];
+    const childTranscripts: Array<Readonly<{ stdout: string; stderr: string }>> = [];
+    try {
+      const bytes = attachmentE2ePdf();
+      const selectedPath = join(directory, "e2e-evidence.pdf");
+      await writeFile(selectedPath, bytes, { mode: 0o600 });
+      started = await spawnAuthorityChild({
+        directory,
+        seedAllFacts: true,
+        enableAttachmentFixture: true,
+      });
+      const connected = await Promise.all([
+        JsonWebSocketClient.connect(started.url),
+        JsonWebSocketClient.connect(started.url),
+        JsonWebSocketClient.connect(started.url),
+      ]);
+      clients.push(...connected);
+      for (const client of connected) client.listen((frame) => authorityFrames.push(frame));
+      const sessions = await Promise.all(connected.map((client, index) => loginAuthorityDevice(client, {
+        requestId: `attachment-e2e-login-${index}`,
+        accountId: "account-a",
+        secret: "test-secret",
+        deviceId: `attachment-e2e-device-${index}`,
+      })));
+      const roomId = await discoverRoom(connected[0]!);
+      const head = readRoomHeadSeq(directory, roomId);
+      await Promise.all(connected.map((client, index) => client.request({
+        type: "room.subscribe.v2",
+        requestId: `attachment-e2e-subscribe-${index}`,
+        roomId,
+        cursor: { version: 1, roomId, afterSeq: head },
+      }, "room.subscribed.v2")));
+
+      const privateReady = connected.map((client) => client.waitFor((frame) =>
+        frame.type === "attachment.private.status-changed" &&
+        frame.payload.attachment.originalFilename === "e2e-evidence.pdf" &&
+        frame.payload.attachment.processingStatus === "ready"));
+
+      const ipc = createAttachmentIpcHarness();
+      desktopRuntime = createDesktopAttachmentAuthorityRuntime({
+        endpoint: started.url,
+        session: () => sessions[0],
+        webSocketFactory: (endpoint) => new NodeIdentityWebSocketAdapter(endpoint),
+        openFileDialog: {
+          async showOpenFile() {
+            return Object.freeze({ canceled: false, filePaths: Object.freeze([selectedPath]) });
+          },
+        },
+        saveDialog: { chooseDestination: async () => undefined },
+        previewHost: { openSandboxed: async () => undefined, closeAll: () => undefined },
+        ipcMain: ipc.ipcMain,
+        webContents: ipc.webContents,
+        timeoutMs: 5_000,
+      });
+      expect(ipc.registeredHandlers()).toBe(8);
+      const bridge = createAttachmentAuthorityBridge(ipc.ipcRenderer);
+      const bridgeInputs: unknown[] = [];
+      const stopBridgeTrace = bridge.onAuthorityInput((input) => bridgeInputs.push(input));
+      const readyIds: string[][] = [];
+      let bindRequest: Promise<ServerFrame> | undefined;
+      rendererRoot = document.createElement("section");
+      document.body.append(rendererRoot);
+      composer = mountAttachmentComposerBridge(rendererRoot, bridge, roomId, {
+        accessProjection: () => "authorized",
+        onReadyAttachmentIdsChange: (attachmentIds) => readyIds.push([...attachmentIds]),
+        onBindRequested() {
+          const attachmentId = readyIds.at(-1)?.[0];
+          if (attachmentId === undefined || bindRequest !== undefined) return;
+          bindRequest = connected[0]!.request({
+            type: "message.send.v2",
+            requestId: "attachment-e2e-bind",
+            message: {
+              messageId: "message-ft04-e2e",
+              roomId,
+              body: "Attachment E2E source message",
+              mentionedTargets: [],
+              attachments: [{ attachmentId }],
+            },
+          }, "message.accepted");
+        },
+      });
+
+      await composer.select();
+      expect(rendererRoot.dataset.attachmentState).toBe("local-selected");
+      expect(rendererRoot.textContent).toContain("e2e-evidence.pdf");
+      rendererRoot.querySelector<HTMLButtonElement>("[data-action='upload']")?.click();
+
+      const readyPrivateEvents = await Promise.all(privateReady);
+      await vi.waitFor(() => {
+        expect(rendererRoot?.dataset.attachmentState).toBe("ready");
+        expect(readyIds.at(-1)).toHaveLength(1);
+      }, { timeout: 10_000 });
+      const attachmentId = readyIds.at(-1)![0]!;
+      expect(readyPrivateEvents.every((frame) =>
+        frame.type === "attachment.private.status-changed" &&
+        frame.payload.attachment.attachmentId === attachmentId &&
+        frame.payload.attachment.sourceMessageId === null)).toBe(true);
+      const progress = bridgeInputs.filter((input): input is {
+        readonly type: "attachment.upload.progress";
+        readonly acknowledgedBytes: number;
+        readonly totalBytes: number;
+      } => isRecord(input) && input.type === "attachment.upload.progress" &&
+        typeof input.acknowledgedBytes === "number" && typeof input.totalBytes === "number");
+      expect(progress.map((input) => input.acknowledgedBytes)).toEqual([
+        32_768,
+        bytes.byteLength,
+      ]);
+      expect(progress.every((input) => input.totalBytes === bytes.byteLength)).toBe(true);
+      expect(rendererRoot.querySelector("[data-authority-source='stable-event']")).not.toBeNull();
+
+      const liveBound = connected.map((client) => client.waitFor((frame) =>
+        frame.type === "room.event" &&
+        frame.event.type === "room.attachment.bound" &&
+        frame.event.payload.attachment.attachmentId === attachmentId));
+      const liveMessage = connected.map((client) => client.waitFor((frame) =>
+        frame.type === "room.event" &&
+        frame.event.type === "room.message.accepted" &&
+        frame.event.payload.id === "message-ft04-e2e"));
+      rendererRoot.querySelector<HTMLButtonElement>("[data-action='bind']")?.click();
+      expect(bindRequest).toBeDefined();
+      await expect(bindRequest).resolves.toMatchObject({
+        type: "message.accepted",
+        requestId: "attachment-e2e-bind",
+        messageId: "message-ft04-e2e",
+      });
+      const [boundEvents, messageEvents] = await Promise.all([
+        Promise.all(liveBound),
+        Promise.all(liveMessage),
+      ]);
+      expect(new Set(boundEvents.map((frame) =>
+        frame.type === "room.event" ? frame.event.eventId : undefined)).size).toBe(1);
+      for (const frame of messageEvents) {
+        if (frame.type !== "room.event" || frame.event.type !== "room.message.accepted") {
+          throw new TypeError("Attachment E2E did not receive the message event");
+        }
+        expect(frame.event.payload.attachments).toEqual([
+          expect.objectContaining({ attachmentId }),
+        ]);
+      }
+
+      const database = new DatabaseSync(join(directory, "authority.sqlite"), { readOnly: true });
+      try {
+        expect(database.prepare(`
+          SELECT attachment.processing_status AS processingStatus,
+                 attachment.source_message_id AS sourceMessageId,
+                 attachment.source_operational_state AS sourceState,
+                 link.operational_state AS linkState,
+                 envelope.lifecycle AS messageLifecycle
+          FROM attachments AS attachment
+          INNER JOIN message_attachment_links AS link
+            ON link.attachment_id = attachment.attachment_id
+          INNER JOIN message_envelopes AS envelope
+            ON envelope.message_id = link.message_id
+          WHERE attachment.attachment_id = ?
+        `).get(attachmentId)).toEqual({
+          processingStatus: "ready",
+          sourceMessageId: "message-ft04-e2e",
+          sourceState: "bound-active",
+          linkState: "active",
+          messageLifecycle: "active",
+        });
+        expect(database.prepare(`
+          SELECT adapter_kind AS adapterKind, adapter_name AS adapterName, status
+          FROM attachment_processing_attempts
+          WHERE attachment_id = ? ORDER BY attempt_number
+        `).all(attachmentId)).toEqual([
+          { adapterKind: "scanner", adapterName: "clamav", status: "succeeded" },
+          { adapterKind: "extractor", adapterName: "pdftotext", status: "succeeded" },
+        ]);
+        expect(database.prepare(`
+          SELECT method, tool_name AS toolName, byte_size AS byteSize
+          FROM attachment_extraction_artifacts WHERE attachment_id = ?
+        `).get(attachmentId)).toEqual({
+          method: "extracted-text",
+          toolName: "pdftotext",
+          byteSize: Buffer.byteLength(`${attachmentExtractionSentinel}\n`, "utf8"),
+        });
+        expect(database.prepare(`
+          SELECT event_type AS eventType FROM events
+          WHERE stream_kind = 'room' AND stream_id = ?
+            AND event_type IN ('room.message.accepted', 'room.attachment.bound')
+          ORDER BY stream_seq DESC LIMIT 2
+        `).all(roomId).map((row) => row.eventType).sort()).toEqual([
+          "room.attachment.bound",
+          "room.message.accepted",
+        ]);
+      } finally {
+        database.close();
+      }
+      for (const sentinel of attachmentForbiddenSentinels) {
+        expect(authoritySentinelHits(join(directory, "authority.sqlite"), sentinel)).toEqual([]);
+      }
+      await vi.waitFor(async () => {
+        const entries = await readRegularFileEntries(join(directory, "attachment-store"));
+        const rawHits = byteSentinelHits(entries, [attachmentRawSentinel]);
+        expect(rawHits.length).toBeGreaterThan(0);
+        expect(rawHits.some((hit) => hit.includes("/attachment-store/objects/"))).toBe(true);
+      }, { timeout: 5_000 });
+      const storedEntries = await readRegularFileEntries(join(directory, "attachment-store"));
+      const rawObjectHits = byteSentinelHits(storedEntries, [attachmentRawSentinel]);
+      const extractionObjectHits = byteSentinelHits(
+        storedEntries,
+        [attachmentExtractionSentinel],
+      );
+      expect(rawObjectHits.length).toBeGreaterThan(0);
+      expect(rawObjectHits.every((hit) => hit.includes("/attachment-store/"))).toBe(true);
+      expect(rawObjectHits.some((hit) => hit.includes("/attachment-store/objects/"))).toBe(true);
+      expect(extractionObjectHits).toHaveLength(1);
+      expect(extractionObjectHits[0]).toContain("/attachment-store/extractions/");
+      expect(byteSentinelHits(storedEntries, [
+        attachmentScannerRawSentinel,
+        attachmentScannerPathSentinel,
+        attachmentScannerTokenSentinel,
+      ])).toEqual([]);
+      const activeAuthorityCheckpoint = await readAuthorityCheckpointFiles(directory);
+      expect(activeAuthorityCheckpoint.map(({ path }) => path)).toEqual(expect.arrayContaining([
+        join(directory, "authority.sqlite"),
+        join(directory, "authority.sqlite-wal"),
+        join(directory, "authority.sqlite-shm"),
+      ]));
+      expect(byteSentinelHits(activeAuthorityCheckpoint, attachmentForbiddenSentinels)).toEqual([]);
+      await unlink(selectedPath);
+
+      composer.dispose();
+      composer = undefined;
+      stopBridgeTrace();
+      desktopRuntime.close();
+      desktopRuntime = undefined;
+      expect(ipc.registeredHandlers()).toBe(0);
+      rendererRoot.remove();
+      rendererRoot = undefined;
+      for (const client of clients) client.close();
+      clients.length = 0;
+      const firstChild = started.child;
+      await stopChild(firstChild);
+      childTranscripts.push(Object.freeze({
+        stdout: childStdout.get(firstChild) ?? "",
+        stderr: childStderr.get(firstChild) ?? "",
+      }));
+      started = undefined;
+
+      started = await spawnAuthorityChild({ directory, enableAttachmentFixture: true });
+      const restarted = await Promise.all([
+        JsonWebSocketClient.connect(started.url),
+        JsonWebSocketClient.connect(started.url),
+        JsonWebSocketClient.connect(started.url),
+      ]);
+      clients.push(...restarted);
+      for (const client of restarted) client.listen((frame) => authorityFrames.push(frame));
+      await Promise.all(restarted.map((client, index) => loginAuthorityDevice(client, {
+        requestId: `attachment-e2e-restart-login-${index}`,
+        accountId: "account-a",
+        secret: "test-secret",
+        deviceId: `attachment-e2e-restart-device-${index}`,
+      })));
+      const syncResults = await Promise.all(restarted.map((client, index) => client.request({
+        type: "room.sync",
+        requestId: `attachment-e2e-sync-${index}`,
+        roomId,
+        cursor: { version: 1, roomId, afterSeq: head },
+      }, "room.sync.result")));
+      for (const result of syncResults) {
+        if (result.type !== "room.sync.result" || result.mode !== "delta") {
+          throw new TypeError("Attachment E2E sync did not return a retained delta");
+        }
+        expect(result.events).toEqual(expect.arrayContaining([
+          expect.objectContaining({ type: "room.message.accepted" }),
+          expect.objectContaining({ type: "room.attachment.bound" }),
+        ]));
+      }
+      const histories = await Promise.all(restarted.map((client, index) => client.request({
+        type: "room.history.v2",
+        requestId: `attachment-e2e-history-${index}`,
+        roomId,
+      }, "room.history.v2")));
+      for (const history of histories) {
+        if (history.type !== "room.history.v2") {
+          throw new TypeError("Attachment E2E history returned the wrong frame");
+        }
+        expect(history.messages).toEqual(expect.arrayContaining([
+          expect.objectContaining({
+            id: "message-ft04-e2e",
+            attachments: [expect.objectContaining({ attachmentId })],
+          }),
+        ]));
+      }
+      await waitForRoomAuthorityQuiescence(directory, roomId);
+      const repairs = await Promise.all(restarted.map((client) => repairRecords(client, roomId)));
+      expect(repairs.map((repair) => repair.mode)).toEqual([
+        "materialized",
+        "materialized",
+        "materialized",
+      ]);
+      const attachmentRepairs = repairs.map(({ records }) => records.find((record) =>
+        record.kind === "attachment" && record.value.attachment.attachmentId === attachmentId));
+      expect(attachmentRepairs.every((record) => record !== undefined)).toBe(true);
+      expect(attachmentRepairs[1]).toEqual(attachmentRepairs[0]);
+      expect(attachmentRepairs[2]).toEqual(attachmentRepairs[0]);
+      expect(attachmentRepairs[0]).toMatchObject({
+        kind: "attachment",
+        value: {
+          sourceEligibility: "bound-active",
+          attachment: {
+            attachmentId,
+            sourceMessageId: "message-ft04-e2e",
+            processingStatus: "ready",
+            provenance: {
+              scanner: { kind: "clamav", version: "1.5.3" },
+              extraction: { method: "pdf-text", tool: "pdftotext", version: "26.07.0" },
+            },
+          },
+        },
+      });
+      expect(new Set(repairs.map((repair) => repair.checksum)).size).toBe(1);
+      expect(new Set(repairs.map((repair) => repair.watermark)).size).toBe(1);
+      const activeMaterializedCheckpoint = await readAuthorityCheckpointFiles(directory);
+      expect(activeMaterializedCheckpoint.map(({ path }) => path)).toEqual(expect.arrayContaining([
+        join(directory, "snapshot-cache.sqlite"),
+      ]));
+      expect(byteSentinelHits(
+        activeMaterializedCheckpoint,
+        attachmentForbiddenSentinels,
+      )).toEqual([]);
+      for (const client of clients) client.close();
+      clients.length = 0;
+      const materializedChild = started.child;
+      await stopChild(materializedChild);
+      childTranscripts.push(Object.freeze({
+        stdout: childStdout.get(materializedChild) ?? "",
+        stderr: childStderr.get(materializedChild) ?? "",
+      }));
+      started = undefined;
+
+      const materializedCheckpoint = await readAuthorityCheckpointFiles(directory);
+      expect(materializedCheckpoint.map(({ path }) => path)).toEqual(expect.arrayContaining([
+        join(directory, "authority.sqlite"),
+        join(directory, "snapshot-cache.sqlite"),
+      ]));
+      expect(byteSentinelHits(materializedCheckpoint, attachmentForbiddenSentinels)).toEqual([]);
+      for (const sentinel of attachmentForbiddenSentinels) {
+        expect(authoritySentinelHits(join(directory, "authority.sqlite"), sentinel)).toEqual([]);
+        expect(authoritySentinelHits(join(directory, "snapshot-cache.sqlite"), sentinel)).toEqual([]);
+      }
+
+      await Promise.all([
+        "snapshot-cache.sqlite",
+        "snapshot-cache.sqlite-wal",
+        "snapshot-cache.sqlite-shm",
+      ].map(async (name) => await unlink(join(directory, name)).catch(() => undefined)));
+      started = await spawnAuthorityChild({
+        directory,
+        enableAttachmentFixture: true,
+        forceSnapshotFallback: true,
+        snapshotRecordsPerPage: 1,
+      });
+      const streamingClient = await JsonWebSocketClient.connect(started.url);
+      clients.push(streamingClient);
+      streamingClient.listen((frame) => authorityFrames.push(frame));
+      await loginAuthorityDevice(streamingClient, {
+        requestId: "attachment-e2e-streaming-login",
+        accountId: "account-a",
+        secret: "test-secret",
+        deviceId: "attachment-e2e-streaming-device",
+      });
+      const streamingRepair = await repairRecords(streamingClient, roomId);
+      expect(streamingRepair.mode).toBe("streaming");
+      expect(streamingRepair.records.find((record) =>
+        record.kind === "attachment" &&
+        record.value.attachment.attachmentId === attachmentId)).toEqual(attachmentRepairs[0]);
+      streamingClient.close();
+      clients.length = 0;
+      const streamingChild = started.child;
+      await stopChild(streamingChild);
+      childTranscripts.push(Object.freeze({
+        stdout: childStdout.get(streamingChild) ?? "",
+        stderr: childStderr.get(streamingChild) ?? "",
+      }));
+      started = undefined;
+
+      const finalCheckpoint = await readAuthorityCheckpointFiles(directory);
+      expect(byteSentinelHits(finalCheckpoint, attachmentForbiddenSentinels)).toEqual([]);
+      const safeAuthorityEvidence = {
+        readyPrivateEvents,
+        boundEvents,
+        messageEvents,
+        bridgeInputs,
+        authorityFrames,
+        syncResults,
+        histories,
+        repairs,
+        streamingRepair,
+      };
+      expect(jsonSentinelHits(
+        "live-sync-history-repair",
+        safeAuthorityEvidence,
+        attachmentForbiddenSentinels,
+      )).toEqual([]);
+      expect(byteSentinelHits(
+        childTranscripts.flatMap((transcript, index) => [
+          { path: `child-${index}-stdout`, bytes: Buffer.from(transcript.stdout) },
+          { path: `child-${index}-stderr`, bytes: Buffer.from(transcript.stderr) },
+        ]),
+        attachmentForbiddenSentinels,
+      )).toEqual([]);
+      expect(authorityFrames.filter((frame) => frame.type === "error")).toEqual([]);
+    } finally {
+      composer?.dispose();
+      desktopRuntime?.close();
+      rendererRoot?.remove();
+      for (const client of clients) client.close();
+      if (started !== undefined) await stopChild(started.child).catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it("replays one structured v2 aggregate after an unconsumed ACK, changed requests, and restart", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-ft03-message-replay-"));
