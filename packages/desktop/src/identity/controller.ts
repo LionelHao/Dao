@@ -47,6 +47,7 @@ export class IdentityControllerError extends Error {
 
 export interface IdentitySessionController {
   getState(): IdentityPublicState;
+  getCurrentAuthoritySession(): IdentityAuthoritySession | undefined;
   initialize(): Promise<IdentityPublicState>;
   login(input: IdentityLoginInput): Promise<IdentityPublicState>;
   refreshSessions(): Promise<IdentityPublicState>;
@@ -54,6 +55,14 @@ export interface IdentitySessionController {
   logout(): Promise<IdentityPublicState>;
   subscribe(listener: (state: IdentityPublicState) => void): () => void;
   close(): void;
+}
+
+/** Main-process-only authority material. This is never part of IdentityPublicState or preload. */
+export interface IdentityAuthoritySession {
+  readonly actorId: string;
+  readonly sessionId: string;
+  readonly accessToken: string;
+  readonly expiresAt: string;
 }
 
 const PUBLIC_ERRORS = Object.freeze({
@@ -129,6 +138,16 @@ export function createIdentitySessionController(options: {
   let operationTail: Promise<void> = Promise.resolve();
 
   const getState = (): IdentityPublicState => cloneIdentityPublicState(state);
+  const getCurrentAuthoritySession = (): IdentityAuthoritySession | undefined => {
+    const credentials = activeCredentials;
+    if (state.status !== "authenticated" || credentials === undefined) return undefined;
+    return Object.freeze({
+      actorId: credentials.actorId,
+      sessionId: credentials.sessionId,
+      accessToken: credentials.accessToken,
+      expiresAt: credentials.expiresAt,
+    });
+  };
 
   const publish = (next: IdentityPublicState): IdentityPublicState => {
     const closedState = cloneIdentityPublicState(next);
@@ -394,6 +413,7 @@ export function createIdentitySessionController(options: {
 
   return {
     getState,
+    getCurrentAuthoritySession,
     initialize() {
       return enqueue(restore);
     },

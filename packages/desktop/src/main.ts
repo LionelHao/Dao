@@ -12,11 +12,8 @@ import {
 } from "./identity/runtime.js";
 import { installDesktopWindowLifecycle } from "./main-lifecycle.js";
 import {
-  GovernanceAuthorityFailure,
-  createGovernanceController,
-  createGovernanceReplicaFeed,
-  type GovernanceAuthorityAdapter,
-} from "./governance/controller.js";
+  createDesktopGovernanceRuntime,
+} from "./governance/production-runtime.js";
 import { registerGovernanceIpc } from "./governance/ipc.js";
 import {
   blankGroupChatWindowOptions,
@@ -30,7 +27,7 @@ async function createWindow(): Promise<void> {
   const rendererPath = join(currentDirectory, "renderer", "index.html");
   const window = new BrowserWindow(blankGroupChatWindowOptions(preloadPath));
   let identity: ReturnType<typeof createDesktopIdentityRuntime> | undefined;
-  let governance: ReturnType<typeof createGovernanceController> | undefined;
+  let governance: ReturnType<typeof createDesktopGovernanceRuntime> | undefined;
   let disposeGovernanceIpc: (() => void) | undefined;
 
   try {
@@ -50,26 +47,14 @@ async function createWindow(): Promise<void> {
       webSocketFactory: (endpoint) => new WebSocket(endpoint),
       ipcMain,
       webContents: window.webContents,
+      authorizedState: {
+        invalidate: () => governance?.invalidateAuthorizedState(),
+      },
     });
-    const governanceReplica = createGovernanceReplicaFeed();
-    const unavailableGovernanceAuthority: GovernanceAuthorityAdapter = {
-      async querySurface({ roomId }) {
-        return {
-          status: "locked",
-          roomId,
-          connection: { status: "fatal", errorCode: "governance_authority_unavailable" },
-        };
-      },
-      async queryDepartureConflicts() {
-        throw new GovernanceAuthorityFailure({ status: 503, code: "dependency_unavailable" });
-      },
-      async execute() {
-        throw new GovernanceAuthorityFailure({ status: 503, code: "dependency_unavailable" });
-      },
-    };
-    governance = createGovernanceController({
-      authority: unavailableGovernanceAuthority,
-      replica: governanceReplica,
+    governance = createDesktopGovernanceRuntime({
+      endpoint: process.env.NATIVE_IM_IDENTITY_WS_URL ?? "ws://127.0.0.1:8787",
+      session: () => identity?.getCurrentAuthoritySession(),
+      webSocketFactory: (endpoint) => new WebSocket(endpoint),
       createRequestIdentity: () => ({
         requestId: `governance-${randomUUID()}`,
         idempotencyKey: randomUUID(),
@@ -78,12 +63,12 @@ async function createWindow(): Promise<void> {
     disposeGovernanceIpc = registerGovernanceIpc({
       ipcMain,
       webContents: window.webContents,
-      controller: governance,
+      controller: governance.controller,
     });
     window.once("closed", () => {
       disposeGovernanceIpc?.();
-      governance?.close();
       identity?.close();
+      governance?.close();
     });
 
     await Promise.all([window.loadFile(rendererPath), identity.initialize()]);
@@ -148,8 +133,8 @@ async function createWindow(): Promise<void> {
     console.info("Native IM desktop Identity surface started.");
   } catch (error: unknown) {
     disposeGovernanceIpc?.();
-    governance?.close();
     identity?.close();
+    governance?.close();
     if (!window.isDestroyed()) window.destroy();
     throw error;
   }

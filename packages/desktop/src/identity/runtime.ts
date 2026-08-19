@@ -8,6 +8,7 @@ import {
   createIdentitySessionController,
   NOOP_AUTHORIZED_STATE_INVALIDATOR,
   type AuthorizedStateInvalidator,
+  type IdentityAuthoritySession,
   type IdentitySessionController,
 } from "./controller.js";
 import {
@@ -84,6 +85,7 @@ export function createIdentityDeviceLabel(appName: string, hostName: string): st
 
 export interface DesktopIdentityRuntime {
   readonly controller: IdentitySessionController;
+  getCurrentAuthoritySession(): IdentityAuthoritySession | undefined;
   initialize(): Promise<IdentityPublicState>;
   close(): void;
 }
@@ -131,6 +133,7 @@ export function createDesktopIdentityRuntime(options: {
 
   return Object.freeze({
     controller,
+    getCurrentAuthoritySession: () => controller.getCurrentAuthoritySession(),
     initialize: () => controller.initialize(),
     close() {
       if (closed) return;

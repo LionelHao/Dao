@@ -2,6 +2,7 @@ import { isRoomGovernanceView, type RoomGovernanceView } from "@native-im/core";
 import type {
   DepartureConflictList,
   GovernanceClosedError,
+  GovernanceConnectionState,
   GovernanceOperationState,
 } from "../renderer/governance/view-model.js";
 import {
@@ -55,6 +56,12 @@ export type GovernanceReplicaApplication =
       readonly roomId: string;
       readonly eventIds: readonly [];
       readonly errorCode: string;
+    }
+  | {
+      readonly source: "connection";
+      readonly roomId: string;
+      readonly eventIds: readonly [];
+      readonly connection: Exclude<GovernanceConnectionState, { status: "revoked" | "fatal" }>;
     };
 
 export interface GovernanceReplicaFeed {
@@ -69,6 +76,10 @@ export interface GovernanceReplicaFeedPort extends GovernanceReplicaFeed {
     readonly purgeCompleted: boolean;
   }): void;
   fatal(input: { readonly roomId: string; readonly errorCode: string }): void;
+  connection(input: {
+    readonly roomId: string;
+    readonly connection: Exclude<GovernanceConnectionState, { status: "revoked" | "fatal" }>;
+  }): void;
 }
 
 export function createGovernanceReplicaFeed(): GovernanceReplicaFeedPort {
@@ -92,6 +103,12 @@ export function createGovernanceReplicaFeed(): GovernanceReplicaFeedPort {
     },
     fatal(input: { readonly roomId: string; readonly errorCode: string }) {
       publish({ source: "fatal", eventIds: [], ...input });
+    },
+    connection(input: {
+      readonly roomId: string;
+      readonly connection: Exclude<GovernanceConnectionState, { status: "revoked" | "fatal" }>;
+    }) {
+      publish({ source: "connection", eventIds: [], ...input });
     },
     subscribe(listener: (application: GovernanceReplicaApplication) => void) {
       listeners.add(listener);
@@ -289,6 +306,11 @@ export function createGovernanceController(options: {
         status: "locked", roomId: application.roomId,
         connection: { status: "fatal", errorCode: application.errorCode },
       });
+      return;
+    }
+    if (application.source === "connection") {
+      const current = states.get(application.roomId);
+      if (current?.status === "ready") emit({ ...current, connection: application.connection });
       return;
     }
     if (application.governance !== undefined &&
