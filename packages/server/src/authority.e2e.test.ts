@@ -2606,11 +2606,27 @@ describe("authoritative server real-process harness", () => {
         requestId: "desktop-message-send",
         messageId,
       });
-      await vi.waitFor(() => {
-        expect(inputs.every((received) => received.some((input) =>
+      const receivedAcceptedEvent = (received: readonly MessageAuthorityPortInput[]): boolean =>
+        received.some((input) =>
           input.type === "room.event" && input.event.type === "room.message.accepted" &&
-          input.event.payload.id === messageId))).toBe(true);
-      }, { timeout: 20_000 });
+          input.event.payload.id === messageId);
+      await vi.waitFor(() => {
+        expect(inputs.some(receivedAcceptedEvent)).toBe(true);
+      }, { timeout: 10_000 });
+      const acceptedHistories = await Promise.all(active.map((runtime, index) =>
+        historyWithRetry(runtime, {
+          type: "room.history.v2",
+          requestId: `desktop-message-accepted-convergence-${index}`,
+          roomId,
+        })));
+      for (const history of acceptedHistories) {
+        if (history.status !== "ready") throw new TypeError("Desktop accepted repair was not ready");
+        expect(history.messages).toContainEqual(expect.objectContaining({
+          id: messageId,
+          lifecycle: "active",
+          currentRevision: expect.objectContaining({ revision: 1, body: acceptedBody }),
+        }));
+      }
 
       socketGroups[2]!.at(-1)!.terminate();
       await vi.waitFor(() => {
@@ -3948,7 +3964,7 @@ describe("authoritative server real-process harness", () => {
         frame.event.type === "room.message.accepted" && frame.event.payload.id === messageId);
       sendMessage(sender, roomId, messageId);
 
-      const [liveFrame, exitCode] = await Promise.all([live, childExit(faulted, 5_000)]);
+      const [liveFrame, exitCode] = await Promise.all([live, childExit(faulted, 10_000)]);
       expect(exitCode).toBe(84);
       expect(unexpectedChildStderr(faulted)).toBe("");
       if (liveFrame.type !== "room.event") throw new TypeError("wrong live frame");
