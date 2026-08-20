@@ -2,7 +2,7 @@
 
 > 日期：2026-08-19
 > owner：本 Stage integration owner
-> 状态：实施中；不代表 Blueprint 状态变化或 owner 验收。
+> 状态：已达到交付条件；本记录随最终 documentation-only PR 合入远端 `main` 后构成完整交付，等待 owner 验收；不代表 Blueprint 状态变化或 owner 已验收。
 
 ## 1. 基线与隔离
 
@@ -38,25 +38,58 @@
 
 ## 5. Wave 组织与 RED/GREEN 证据
 
-| Wave | Agent/owner | worktree/branch | scope/status |
+| Wave | Agent/owner | worktree/branch | scope/result |
 | --- | --- | --- | --- |
 | 0 | adversarial audit | `/Users/leo/code/Dao-stage7-ft05-adversarial` / `codex/ft05-stage7-adversarial` | 只读审查五类memory、FT-06/09、recall/watermark/degraded |
 | 0 | code seams | `/Users/leo/code/Dao-stage7-ft05-code-seams` / `codex/ft05-stage7-code-seams` | 只读定位64、source/repair/runtime接入 |
 | 0 | provider/security | `/Users/leo/code/Dao-stage7-ft05-provider-security` / `codex/ft05-stage7-provider-security` | 只读Provider/Secret/structured output/dependency/sentinel |
+| 1 | Core contracts | `/Users/leo/code/Dao-stage7-ft05-adversarial` | RED：module/exports/type shape missing；GREEN：五类memory、source/version/health、dispute/resolve、private raw-delta、public frames/events/repair closed guards及negative type tests |
+| 1 | schema v18 | `/Users/leo/code/Dao-stage7-ft05-provider-security` | RED：v17、v18表族缺失；GREEN：fresh与v1～v17升级/restart、12表、61/61逐statement rollback、tamper/future拒绝 |
+| 1 | Provider | `/Users/leo/code/Dao-stage7-ft05-code-seams` | RED：provider/parser/contracts module missing；GREEN：duplicate-key aware bounded JSON、strict Responses schema、noauth零fetch、closed errors与live opt-in |
+| 2 | DB authority/corpus/steward | `/Users/leo/code/Dao-stage7-ft05-db-authority`及integration worktree | RED：corpus/source/job/dispute/runtime seam缺失；GREEN：唯一AuthorityWorker事务、FIFO steward、32-source batch、3 attempts、revision/recall/attachment fence |
+| 2 | sync/repair | `/Users/leo/code/Dao-stage7-ft05-core-sync`、`Dao-stage7-ft05-repair-descriptor` | RED：Core union与中央registry exhaustiveness失败；GREEN：唯一memory descriptor/order 17、fixed-watermark/checksum、event dedupe/repair closed projection |
+| 2 | Desktop | `/Users/leo/code/Dao-stage7-ft05-desktop-controller`及integration worktree | RED：client/cache/controller/bridge module missing；GREEN：production IPC/preload/controller/cache/surface、全状态、source deep-link与a11y合同 |
+| 3 | degraded route/runtime | `/Users/leo/code/Dao-stage7-ft05-route-gate`及integration worktree | RED：noauth/degraded仍调用semantic Provider；GREEN：semantic/risk proactive gate，direct mention/help/健康Ball deterministic保留，explicit invocation使用memory snapshot+delta |
+| 4 | adversarial hardening | `/Users/leo/code/Dao-stage7-ft05-hardening` | 真实CI先后暴露随机event ID前缀、Authority操作瞬态不可用、heavy project竞争和重复noauth造成repair checksum漂移；逐项以生产修复与确定性回归闭合 |
 
-后续每个Agent的base SHA、所有权、RED、GREEN、commit、files/tests/risks将在本节逐波追加。共享文件只由integration owner按依赖串行接线。
+所有子Agent先报告独立worktree、branch、base、文件所有权与真实RED，再报告GREEN/commit/risk。共享 `schema.ts`、Worker protocol/handler、`sync.ts`、snapshot registry、WebSocket、production composition与Desktop root由integration owner按依赖串行接线；没有复制整棵目录覆盖。
 
 ## 6. 实施与PR事实
 
-尚未开始生产编码。设计冻结见：
+冻结设计与计划：
 
 - `docs/plans/2026-08-19-ft05-room-memory-authority-design.md`
 - `docs/plans/2026-08-19-ft05-room-memory-implementation-plan.md`
 
-本节只在真实提交、测试、ready PR、CI与squash merge发生后记录，不预填成功或SHA。
+代码按五个受保护PR顺序squash进入远端 `main`：
+
+| PR | 范围 | ready head | 双Node CI run | squash merge |
+| --- | --- | --- | --- | --- |
+| [#54](https://github.com/LionelHao/Dao/pull/54) | Core/schema/provider/design foundation | `dae7ea9fd7c4272ed4b04617cf7e7388b82eb9fa` | [32371872606](https://github.com/LionelHao/Dao/actions/runs/32371872606) | `a820a65493bdf283d8cad7760b01dc6f541395ba` |
+| [#55](https://github.com/LionelHao/Dao/pull/55) | corpus/DB authority/steward/protocol/repair/runtime | `06fbc6085c910703985623969c680b19b1cb1c5b` | [32377138394](https://github.com/LionelHao/Dao/actions/runs/32377138394) | `c7879d0de8728fe859d7a0b4e7d8ea724a333175` |
+| [#57](https://github.com/LionelHao/Dao/pull/57) | transient Authority operation recovery | `cd8e975a85d9132edf46383aaf0b0e8de7258aaf` | [32388081790](https://github.com/LionelHao/Dao/actions/runs/32388081790) | `1ae46ab66421681266184648d9d4d859b2d5ae7f` |
+| [#56](https://github.com/LionelHao/Dao/pull/56) | Desktop Memory panel与三端E2E | `d462b82977d49ed472721e3b68adf487ba5adbf3` | [32389497440](https://github.com/LionelHao/Dao/actions/runs/32389497440) | `db1d3af96c158e0443a97568e651121da2989df0` |
+| [#58](https://github.com/LionelHao/Dao/pull/58) | invocation/degraded/sentinel/archive/runtime hardening | `ca891898917b6ceafc4089bf03d9324b619efb62` | [32399055191](https://github.com/LionelHao/Dao/actions/runs/32399055191) | `c2f38a432a008ecbec93aac706ac19164e4289f8` |
+
+每个最终run的Node `22.13.1`与Node `22.x` jobs均为success。没有绕过required check、直接推送或force push `main`。
+
+关键review闭环：
+
+- 随机503最终定位为`room.memory.health.changed`裸base64url digest偶尔以`-`/`_`起始，不满足Core stable identifier；生产ID统一加`room-memory:`命名空间，并用可确定产生标点首字符的timestamp回归验证event/outbox解析。
+- `authority_operation_unavailable`按内部、非terminal、一次性503处理；真实`storage_unavailable`与rollback poison仍terminal fail closed，SQLite BUSY/LOCKED只做有界分类。
+- 重复`mark-noauth`原本无条件改`updated_at`并制造新health event/checksum；最终改成状态/原因/retry标志未变时零写、零event。该修复有独立RED、13/13 focused GREEN和真实Authority E2E连续5轮120/120证据。
+- heavy Authority/snapshot/sync E2E拆成三个single-fork project，不删除断言、测试或扩大业务权限。
 
 ## 7. 最终门禁与交付
 
-尚未执行Stage 7最终门禁。最终交付文档将是 `docs/deliveries/FT-05-Room-Memory-Stage7-交付说明.md`，并记录精确测试计数、schema statement rollback、live smoke、CI/PR/squash SHA、最终origin/main与两个worktree状态。
+最终可执行代码基线 `origin/main@c2f38a432a008ecbec93aac706ac19164e4289f8` 上，同一完整HEAD门禁结果：
+
+- `corepack pnpm typecheck`、`lint`、`test`、`build`、`verify:core-boundary`、`verify:desktop-boundary`、`git diff --check`全部退出0；lint 0 warnings。
+- 全仓 Test Files `158 passed / 3 skipped / 0 failed (161)`；Tests `1796 passed / 3 skipped / 0 failed (1799)`。
+- Core `6 files / 77 tests`；Desktop `57 files / 433 tests`；Server `95 passed / 3 skipped files`、`1286 passed / 3 skipped tests`。
+- schema v18 `8/8`，61 meaningful statements / 61 rollback；真实AuthorityWorker/WebSocket/restart E2E `24/24`，修复后另连续5轮`120/120`。
+- 三个skip均为显式环境门控的OpenAI live smoke；未设置`DAO_OPENAI_LIVE_SMOKE=1`与真实secret，因此如实记为未运行，不伪报通过。
+
+最终交付说明为 `docs/deliveries/FT-05-Room-Memory-Stage7-交付说明.md`。documentation-only PR合入后再从远端 `main` 建全新clean worktree重复最终门禁并回读最终SHA。
 
 Blueprint HTML/JSON与任务状态不在本阶段修改范围；在owner验收前不使用 `verified` 或声称owner已验收。
