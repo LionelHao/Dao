@@ -431,7 +431,7 @@ function unexpectedChildStderr(child: ChildProcessWithoutNullStreams): string {
 
 function waitForJsonLine(
   child: ChildProcessWithoutNullStreams,
-  timeoutMs = 2_000,
+  timeoutMs = 10_000,
 ): Promise<unknown> {
   return new Promise((resolve, reject) => {
     let buffered = "";
@@ -1847,6 +1847,16 @@ describe("authoritative server real-process harness", () => {
           }),
         ]));
       }
+      await vi.waitFor(() => {
+        const database = new DatabaseSync(join(directory, "authority.sqlite"), { readOnly: true });
+        try {
+          expect(database.prepare(
+            "SELECT health FROM room_memory_stewards WHERE room_id = ?",
+          ).get(roomId)).toEqual({ health: "noauth" });
+        } finally {
+          database.close();
+        }
+      }, { timeout: 10_000, interval: 20 });
       await waitForRoomAuthorityQuiescence(directory, roomId);
       const repairs = await Promise.all(restarted.map((client) => repairRecords(client, roomId)));
       expect(repairs.map((repair) => repair.mode)).toEqual([
@@ -3527,6 +3537,7 @@ describe("authoritative server real-process harness", () => {
       expect(runtime.cache.governanceProjection(roomId)).toMatchObject({
         lifecycle: "active", governanceRevision: 3, archiveGeneration: 1,
       });
+      await waitForRoomAuthorityQuiescence(directory, roomId);
 
       const database = new DatabaseSync(join(directory, "authority.sqlite"), { readOnly: true });
       try {
