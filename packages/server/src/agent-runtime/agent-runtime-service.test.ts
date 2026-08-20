@@ -46,12 +46,29 @@ function execution(id: string, roomId: string, attempt = 1, retryOrdinal: 1 | 2 
   };
 }
 
+const emptyRoomMemoryContext = {
+  status: {
+    roomId: "room-a",
+    health: { state: "healthy", reason: "none", memoryWatermark: 0, corpusHead: 0,
+      lag: 0, lastAttemptAt: null, retryable: false, recoveryRequired: false },
+    recoveryGeneration: 1,
+    updatedAt: "2026-08-20T00:00:00.000Z",
+  },
+  injectableSnapshot: [],
+  rawDelta: { roomId: "room-a", fromWatermarkExclusive: 0, toCorpusSeqInclusive: 0,
+    authorizationEpoch: 0, cursor: null, entries: [], nextCursor: null, hasMore: false },
+} as const;
+
 function authority(): RuntimeAuthority & { executions: Map<string, AgentExecution> } {
   const executions = new Map<string, AgentExecution>();
   let next = 0;
   return {
     executions,
-    async readContext() { return { visibleConversation: [], toolIds: [], openItemTargets: [] }; },
+    async readContext() {
+      return { visibleConversation: [], toolIds: [], openItemTargets: [],
+        roomMemory: emptyRoomMemoryContext };
+    },
+    async readMemoryDelta() { return emptyRoomMemoryContext.rawDelta; },
     beginCompensation: vi.fn(),
     readPendingConfirmation: vi.fn(),
     async invoke(_context, invocation) {

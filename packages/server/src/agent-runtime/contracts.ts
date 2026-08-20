@@ -3,6 +3,9 @@ import type {
   AgentInvocationIntent,
   AgentRuntimeProviderInput,
   ProviderEvent,
+  RoomMemoryRawDeltaPage,
+  RoomMemoryStatus,
+  RoomMemoryVersionProjection,
   ToolConfirmationInput,
   ToolDescriptor,
 } from "@native-im/core";
@@ -152,7 +155,13 @@ export interface RuntimeAuthority {
     readonly visibleConversation: readonly { readonly messageId: string; readonly authorId: string; readonly body: string }[];
     readonly toolIds: readonly ToolDescriptor["id"][];
     readonly openItemTargets: readonly { readonly actorId: string; readonly kind: "human" | "agent" }[];
+    readonly roomMemory: Readonly<{
+      status: RoomMemoryStatus;
+      injectableSnapshot: readonly RoomMemoryVersionProjection[];
+      rawDelta: RoomMemoryRawDeltaPage;
+    }>;
   }>;
+  readMemoryDelta(executionId: string, cursor: string): Promise<RoomMemoryRawDeltaPage>;
   invoke(
     context: AuthenticatedCommandContext | InternalAgentCommandContext,
     intent: AgentInvocationIntent,

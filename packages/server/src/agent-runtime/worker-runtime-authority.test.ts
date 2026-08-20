@@ -9,6 +9,7 @@ import { createSqliteAuthoritativeStore } from "../persistence/sqlite-authoritat
 import { insertLegacyMessageAuthorityRecord } from "../persistence/message-authority-legacy-adapter.js";
 import { migrateAuthorityDatabase } from "../persistence/schema.js";
 import { createWorkerDatabaseClient } from "../persistence/worker-database-client.js";
+import { registerMemoryCorpusSource } from "../room-memory/corpus-database-authority.js";
 import { createWorkerRuntimeAuthority } from "./worker-runtime-authority.js";
 import { createToolGateway } from "./tool-gateway.js";
 import { createRepositoryGitStatusAdapter } from "./tools/repository-git-status.js";
@@ -66,14 +67,27 @@ describe("real AuthorityWorker runtime authority", () => {
         UPDATE rooms SET owner_actor_id = 'human-runtime', governance_revision = 1
         WHERE id = 'room-runtime';
       `);
-      for (const [index, body] of ["first", "second", "third", "fourth", "fifth", "sixth"].entries()) {
+      for (let index = 0; index < 70; index += 1) {
         insertLegacyMessageAuthorityRecord(database, {
           id: `message-runtime-${index + 1}`,
           roomId: "room-runtime",
           authorId: "human-runtime",
           authorKind: "human",
-          body,
-          sentAt: `2026-08-17T00:00:0${index + 1}.000Z`,
+          body: `message-${index + 1}`,
+          sentAt: new Date(Date.UTC(2026, 7, 17, 0, 0, index + 1)).toISOString(),
+        });
+        registerMemoryCorpusSource(database, {
+          roomId: "room-runtime",
+          sourceKind: "message",
+          sourceId: `message:message-runtime-${index + 1}`,
+          sourceRevision: 1,
+          serverStreamSeq: index + 1,
+          eligibility: "eligible",
+          availability: "readable",
+          sourceActorId: "human-runtime",
+          safeMetadata: { authorKind: "human", messageId: `message-runtime-${index + 1}` },
+          readReference: `message-authority:message-runtime-${index + 1}:revision:1`,
+          occurredAt: new Date(Date.UTC(2026, 7, 17, 0, 0, index + 1)).toISOString(),
         });
       }
       insertLegacyMessageAuthorityRecord(database, {
@@ -110,6 +124,11 @@ describe("real AuthorityWorker runtime authority", () => {
         idempotencyKey: "key-runtime-1",
       };
       client = await createWorkerDatabaseClient({ databasePath });
+      await client.executeMemory({
+        type: "memory.mark-noauth",
+        roomId: "room-runtime",
+        now: Date.now(),
+      });
       let authority = createWorkerRuntimeAuthority(client);
       const first = await authority.invoke(context, {
         kind: "direct_mention",
@@ -119,6 +138,9 @@ describe("real AuthorityWorker runtime authority", () => {
       }, "openai-responses", "configured-model");
       const firstContext = await authority.readContext(first.execution.id);
       expect(firstContext).toMatchObject({
+        roomMemory: {
+          status: { roomId: "room-runtime", health: { state: "noauth" } },
+        },
         openItemTargets: [
           { actorId: "agent-git", kind: "agent" },
           { actorId: "agent-runtime", kind: "agent" },
@@ -127,6 +149,13 @@ describe("real AuthorityWorker runtime authority", () => {
       });
       expect(JSON.stringify(firstContext.visibleConversation))
         .not.toContain("RECALLED-RUNTIME-CONTEXT-SENTINEL-98F1");
+      expect(firstContext.roomMemory.rawDelta.entries).toHaveLength(64);
+      const continuedDelta = await authority.readMemoryDelta(
+        first.execution.id,
+        firstContext.roomMemory.rawDelta.nextCursor!,
+      );
+      expect(continuedDelta.entries.map(({ corpusSeq }) => corpusSeq)).toEqual([65, 66, 67, 68, 69, 70]);
+      expect(continuedDelta.hasMore).toBe(false);
       const runningFirst = await authority.claim(first.execution.id, 1);
       const completed = await authority.complete(runningFirst.id, 1, "durable answer");
       expect(completed).toMatchObject({ status: "completed", currentAttemptSeq: 1 });
@@ -434,7 +463,7 @@ describe("real AuthorityWorker runtime authority", () => {
         sessionId: context.sessionId,
         sessionFamilyId: context.sessionFamilyId,
         principal: context.principal,
-      }, { roomId: "room-runtime" }, Date.now());
+      }, { roomId: "room-runtime", limit: 200 }, Date.now());
       expect(history.messages).toEqual(expect.arrayContaining([
         expect.objectContaining({
           authorKind: "agent",

@@ -2,6 +2,9 @@ import {
   type AgentExecution,
   type AgentInvocationIntent,
   type HumanPreemptionNotice,
+  type RoomMemoryRawDeltaPage,
+  type RoomMemoryStatus,
+  type RoomMemoryVersionProjection,
   type ToolConfirmationInput,
   type ToolDescriptor,
 } from "@native-im/core";
@@ -17,6 +20,12 @@ import type {
 
 export type RuntimeAuthorityOperation =
   | { readonly type: "runtime.read-context"; readonly executionId: string; readonly now: number }
+  | {
+      readonly type: "runtime.read-memory-delta";
+      readonly executionId: string;
+      readonly cursor: string;
+      readonly now: number;
+    }
   | {
       readonly type: "runtime.invoke";
       readonly context: AuthenticatedCommandContext | AgentWorkerCommandContext;
@@ -155,7 +164,13 @@ export type RuntimeAuthorityOperationResult =
       readonly visibleConversation: readonly { readonly messageId: string; readonly authorId: string; readonly body: string }[];
       readonly toolIds: readonly ToolDescriptor["id"][];
       readonly openItemTargets: readonly { readonly actorId: string; readonly kind: "human" | "agent" }[];
+      readonly roomMemory: Readonly<{
+        status: RoomMemoryStatus;
+        injectableSnapshot: readonly RoomMemoryVersionProjection[];
+        rawDelta: RoomMemoryRawDeltaPage;
+      }>;
     }
+  | { readonly kind: "memory-delta"; readonly rawDelta: RoomMemoryRawDeltaPage }
   | { readonly kind: "invocation"; readonly execution: AgentExecution; readonly replayed: boolean }
   | { readonly kind: "execution"; readonly execution: AgentExecution }
   | {
@@ -289,6 +304,11 @@ export function isRuntimeAuthorityOperation(value: unknown): value is RuntimeAut
   if (!record(value) || !text(value.type)) return false;
   if (value.type === "runtime.read-context") {
     return exact(value, ["type", "executionId", "now"]) && text(value.executionId) && count(value.now);
+  }
+  if (value.type === "runtime.read-memory-delta") {
+    return exact(value, ["type", "executionId", "cursor", "now"]) &&
+      text(value.executionId) && text(value.cursor) &&
+      Buffer.byteLength(value.cursor, "utf8") <= 2_048 && count(value.now);
   }
   if (value.type === "runtime.invoke") {
     return exact(value, ["type", "context", "intent", "executionId", "intentId", "providerId", "modelId", "now"]) &&
