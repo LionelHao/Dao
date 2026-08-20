@@ -69,7 +69,7 @@ const SCHEMA_FINGERPRINTS = {
   15: "e8010dc3c03c71d51f20ef4054a815d3580abdcbd0762791508226a68918b426",
   16: "86a3512dcb625bc3e0f3d79e5a5d6542819523bee8ac851990148bcad8e38737",
   17: "cc4b260ec841765f0349040a238a44281aa3ed9a792623ebd6540fd3e9f6b0b0",
-  18: "29e9eaf945306c186ac4c1923cad40ed7fa852fbea5e4608bc0bb512a80dbcaf",
+  18: "d1344ba94d7dd4253f2dcc9e392c3bc4b8b1ec5b4fbba614e3fe2a10392797e5",
 } as const;
 
 const V1_STATEMENTS = [
@@ -3344,7 +3344,6 @@ const V18_STATEMENTS = [
    WHEN NEW.room_id <> OLD.room_id OR NEW.steward_id <> OLD.steward_id
       OR NEW.created_at <> OLD.created_at
       OR NEW.lifecycle_generation < OLD.lifecycle_generation
-      OR NEW.lifecycle_generation > OLD.lifecycle_generation + 1
       OR NEW.lifecycle_generation <> COALESCE((
         SELECT archive_generation FROM rooms WHERE id = OLD.room_id
       ), -1)
@@ -4151,7 +4150,7 @@ const V18_STATEMENTS = [
    END`,
   `CREATE TRIGGER rooms_v18_advance_memory_lifecycle
    AFTER UPDATE OF archive_generation ON rooms
-   WHEN NEW.archive_generation = OLD.archive_generation + 1
+   WHEN NEW.archive_generation > OLD.archive_generation
    BEGIN
      UPDATE room_memory_stewards
      SET lifecycle_generation = NEW.archive_generation,

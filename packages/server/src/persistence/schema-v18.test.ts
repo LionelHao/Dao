@@ -446,6 +446,19 @@ describe("authority SQLite v18 Room Memory Authority & Steward", () => {
         SELECT lifecycle_generation AS lifecycleGeneration
         FROM room_memory_stewards WHERE room_id = 'memory-room'
       `).get()).toEqual({ lifecycleGeneration: 1 });
+      database.exec(`
+        UPDATE rooms
+        SET status = 'active', archived_at = NULL, archive_generation = 3
+        WHERE id = 'memory-room'
+      `);
+      expect(database.prepare(`
+        SELECT lifecycle_generation AS lifecycleGeneration
+        FROM room_memory_stewards WHERE room_id = 'memory-room'
+      `).get()).toEqual({ lifecycleGeneration: 3 });
+      expect(() => database.exec(`
+        UPDATE room_memory_stewards SET lifecycle_generation = 4
+        WHERE room_id = 'memory-room'
+      `)).toThrow(/generation|checkpoint/i);
     });
   });
 
