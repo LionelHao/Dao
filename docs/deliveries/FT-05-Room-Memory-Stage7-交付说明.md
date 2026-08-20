@@ -126,7 +126,7 @@ resolve只允许原disputing Human，或owner/admin在steward reevaluation后提
 | [#57](https://github.com/LionelHao/Dao/pull/57) | transient Authority operation recovery | `cd8e975a85d9132edf46383aaf0b0e8de7258aaf` | [32388081790](https://github.com/LionelHao/Dao/actions/runs/32388081790)：jobs `96487348507`/`96487348795` success | `1ae46ab66421681266184648d9d4d859b2d5ae7f` |
 | [#56](https://github.com/LionelHao/Dao/pull/56) | Desktop Memory与三端E2E | `d462b82977d49ed472721e3b68adf487ba5adbf3` | [32389497440](https://github.com/LionelHao/Dao/actions/runs/32389497440)：jobs `96491924728`/`96491924931` success | `db1d3af96c158e0443a97568e651121da2989df0` |
 | [#58](https://github.com/LionelHao/Dao/pull/58) | invocation/degraded/sentinel/archive/runtime hardening | `ca891898917b6ceafc4089bf03d9324b619efb62` | [32399055191](https://github.com/LionelHao/Dao/actions/runs/32399055191)：jobs `96522621298`/`96522621709` success | `c2f38a432a008ecbec93aac706ac19164e4289f8` |
-| 最终documentation-only PR | 本文与Stage 7工作记录 | 待创建后回填 | Node 22.13.1 / 22.x必须双绿后才squash | 待最终回读 |
+| [#59](https://github.com/LionelHao/Dao/pull/59) | 本文与Stage 7工作记录 | 最终ready head不能自含于该commit；以GitHub最终回读为准 | Node 22.13.1 / 22.x必须双绿后才squash | merge SHA以任务完成后的远端回读为准 |
 
 所有代码PR依赖序为foundation→authority→recovery→Desktop→runtime hardening。没有绕过失败check、把draft当交付、直接推送或force push `main`。PR #58最终CI前的失败暴露了真实事件identity/idempotency和测试静稳问题；均有生产修复、确定性回归与最新双绿，未靠blind rerun结案。
 

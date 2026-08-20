@@ -92,4 +92,6 @@
 
 最终交付说明为 `docs/deliveries/FT-05-Room-Memory-Stage7-交付说明.md`。documentation-only PR合入后再从远端 `main` 建全新clean worktree重复最终门禁并回读最终SHA。
 
+最终documentation-only载体为[#59](https://github.com/LionelHao/Dao/pull/59)。该PR自身的最终ready head、双Node run/jobs和squash SHA无法无穷自指写入其commit正文，以GitHub和本任务结束时的远端回读为权威证据。
+
 Blueprint HTML/JSON与任务状态不在本阶段修改范围；在owner验收前不使用 `verified` 或声称owner已验收。
