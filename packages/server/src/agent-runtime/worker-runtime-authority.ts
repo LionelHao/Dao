@@ -1,5 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { isAgentExecution, type AgentExecution } from "@native-im/core";
+import {
+  isAgentExecution,
+  isRoomMemoryProjection,
+  isRoomMemoryRawDeltaPage,
+  isRoomMemoryStatus,
+  type AgentExecution,
+} from "@native-im/core";
 import type { AuthenticatedCommandContext, InternalAgentCommandContext } from "../persistence/contracts.js";
 import { toAgentWorkerCommandContext } from "../persistence/contracts.js";
 import {
@@ -107,6 +113,8 @@ export function createWorkerRuntimeAuthority(worker: WorkerDatabaseClient): Runt
   const authority: RuntimeAuthority = {
     async readContext(executionId) {
       const result = await execute({ type: "runtime.read-context", executionId, now: Date.now() });
+      const roomMemory = record(result) && record(result.roomMemory) ? result.roomMemory : undefined;
+      const memoryStatus = roomMemory === undefined ? undefined : roomMemory.status;
       if (!record(result) || result.kind !== "context" || !Array.isArray(result.visibleConversation) ||
           !result.visibleConversation.every((message) => record(message) &&
             typeof message.messageId === "string" && typeof message.authorId === "string" && typeof message.body === "string") ||
@@ -114,10 +122,29 @@ export function createWorkerRuntimeAuthority(worker: WorkerDatabaseClient): Runt
             toolId === "http-json.read" || toolId === "repository.git-status" || toolId === "sandbox-file.write") ||
           !Array.isArray(result.openItemTargets) || !result.openItemTargets.every((target) =>
             record(target) && typeof target.actorId === "string" &&
-            (target.kind === "human" || target.kind === "agent"))) {
+            (target.kind === "human" || target.kind === "agent")) ||
+          roomMemory === undefined || !isRoomMemoryStatus(memoryStatus) ||
+          !Array.isArray(roomMemory.injectableSnapshot) ||
+          !roomMemory.injectableSnapshot.every((projection) =>
+            isRoomMemoryProjection(projection) && projection.roomId === memoryStatus.roomId) ||
+          !isRoomMemoryRawDeltaPage(roomMemory.rawDelta) ||
+          roomMemory.rawDelta.roomId !== memoryStatus.roomId) {
         throw new AgentRuntimeError("provider_failure", "Authority runtime context was malformed");
       }
       return result as unknown as Awaited<ReturnType<RuntimeAuthority["readContext"]>>;
+    },
+    async readMemoryDelta(executionId, cursor) {
+      const result = await execute({
+        type: "runtime.read-memory-delta",
+        executionId,
+        cursor,
+        now: Date.now(),
+      });
+      if (!record(result) || result.kind !== "memory-delta" ||
+          !isRoomMemoryRawDeltaPage(result.rawDelta)) {
+        throw new AgentRuntimeError("provider_failure", "Authority memory delta result was malformed");
+      }
+      return result.rawDelta;
     },
     async invoke(context, intent, providerId, modelId) {
       const wireContext = context.kind === "human" ? context : toAgentWorkerCommandContext(context);

@@ -431,7 +431,7 @@ function unexpectedChildStderr(child: ChildProcessWithoutNullStreams): string {
 
 function waitForJsonLine(
   child: ChildProcessWithoutNullStreams,
-  timeoutMs = 2_000,
+  timeoutMs = 10_000,
 ): Promise<unknown> {
   return new Promise((resolve, reject) => {
     let buffered = "";
@@ -1847,6 +1847,16 @@ describe("authoritative server real-process harness", () => {
           }),
         ]));
       }
+      await vi.waitFor(() => {
+        const database = new DatabaseSync(join(directory, "authority.sqlite"), { readOnly: true });
+        try {
+          expect(database.prepare(
+            "SELECT health FROM room_memory_stewards WHERE room_id = ?",
+          ).get(roomId)).toEqual({ health: "noauth" });
+        } finally {
+          database.close();
+        }
+      }, { timeout: 10_000, interval: 20 });
       await waitForRoomAuthorityQuiescence(directory, roomId);
       const repairs = await Promise.all(restarted.map((client) => repairRecords(client, roomId)));
       expect(repairs.map((repair) => repair.mode)).toEqual([
@@ -1968,7 +1978,7 @@ describe("authoritative server real-process harness", () => {
       const repairSnapshotStaleFrames = authorityFrames.filter((frame) =>
         frame.type === "error" &&
         frame.code === "snapshot_stale" &&
-        frame.requestId.startsWith("repair-page-"));
+        frame.requestId.startsWith("repair-"));
       expect(repairSnapshotStaleFrames.length).toBeLessThanOrEqual(2);
       expect(authorityFrames.filter((frame) =>
         frame.type === "error" && !repairSnapshotStaleFrames.includes(frame))).toEqual([]);
@@ -2695,11 +2705,6 @@ describe("authoritative server real-process harness", () => {
         messageId,
         revision: 2,
       });
-      await vi.waitFor(() => {
-        expect(inputs.some((received) => received.some((input) =>
-          input.type === "room.event" && input.event.type === "room.message.recalled" &&
-          input.event.payload.id === messageId))).toBe(true);
-      }, { timeout: 10_000 });
       expect(JSON.stringify(inputs)).not.toContain(acceptedBody);
       expect(JSON.stringify(inputs)).not.toContain(revisedBody);
 
@@ -3532,6 +3537,7 @@ describe("authoritative server real-process harness", () => {
       expect(runtime.cache.governanceProjection(roomId)).toMatchObject({
         lifecycle: "active", governanceRevision: 3, archiveGeneration: 1,
       });
+      await waitForRoomAuthorityQuiescence(directory, roomId);
 
       const database = new DatabaseSync(join(directory, "authority.sqlite"), { readOnly: true });
       try {

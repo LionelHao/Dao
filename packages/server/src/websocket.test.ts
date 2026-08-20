@@ -45,6 +45,7 @@ import {
 import {
   formatMessageWebSocketUrl,
   validateMessageWebSocketListener,
+  type RoomMemoryAuthorityTransport,
 } from "./websocket.js";
 
 const humans = [
@@ -620,6 +621,7 @@ async function populateRoom(rooms: RoomLifecycleService): Promise<void> {
 
 async function createFixture(options: {
   readonly maxBufferedAmountBytes?: number;
+  readonly memoryAuthority?: RoomMemoryAuthorityTransport;
 } = {}): Promise<{
   readonly connect: () => Promise<LoopbackClient>;
   readonly clients: readonly LoopbackClient[];
@@ -671,6 +673,7 @@ async function createFixture(options: {
       auth,
       service,
       maxBufferedAmountBytes: options.maxBufferedAmountBytes,
+      memoryAuthority: options.memoryAuthority,
       afterSubscribeRegistered: async () => {
         const hook = afterSubscribeRegistered;
         afterSubscribeRegistered = undefined;
@@ -4703,6 +4706,80 @@ describe("authenticated message WebSocket service", () => {
     expect(receivedBySecond.receivedAt - sentAt).toBeLessThan(1_000);
     expect(receivedByThird.receivedAt - sentAt).toBeLessThan(1_000);
     await expect(fixture.messages()).resolves.toEqual([messageFor(humans[0], message.id)]);
+  });
+
+  it("converges one Context dispute across three authenticated Memory Authority clients", async () => {
+    const createdAt = "2026-08-20T00:00:00.000Z";
+    let disputedBy: string | undefined;
+    const projection = () => ({
+      projectionKind: "memory" as const,
+      roomId,
+      memoryRecordId: "memory-context-1",
+      kind: "context" as const,
+      currentVersion: {
+        roomId,
+        memoryRecordId: "memory-context-1",
+        memoryVersionId: disputedBy === undefined ? "memory-version-1" : "memory-version-2",
+        version: disputedBy === undefined ? 1 : 2,
+        kind: "context" as const,
+        state: disputedBy === undefined ? "active" as const : "disputed" as const,
+        derivedText: "Launch is Friday.",
+        sourceRefs: [{ sourceKind: "message" as const, sourceId: "message:source-1",
+          sourceRevision: 1, eligibility: "eligible" as const, availability: "readable" as const }],
+        createdAt,
+        replacesMemoryVersionId: disputedBy === undefined ? null : "memory-version-1",
+      },
+      disputes: disputedBy === undefined ? [] : [{ disputeId: "memory-dispute-1", roomId,
+        memoryRecordId: "memory-context-1", memoryVersionId: "memory-version-2",
+        operatorActorId: disputedBy, reason: "The date changed", status: "open" as const,
+        createdAt }],
+      resolutions: [],
+    });
+    const status = { roomId, health: { state: "healthy" as const, reason: "none" as const,
+      memoryWatermark: 1, corpusHead: 1, lag: 0, lastAttemptAt: createdAt,
+      retryable: false, recoveryRequired: false }, recoveryGeneration: 0, updatedAt: createdAt };
+    const memoryAuthority: RoomMemoryAuthorityTransport = {
+      async execute(context, request) {
+        if (request.type === "room.memory.context.dispute.v1") {
+          expect(Reflect.ownKeys(request)).not.toContain("actorId");
+          disputedBy = context.principal.actorId;
+          return { type: "room.memory.context.dispute.accepted.v1",
+            requestId: request.requestId, roomId, dispute: projection().disputes[0]!,
+            projection: projection() };
+        }
+        if (request.type === "room.memory.query.v1") return {
+          type: "room.memory.page.v1", requestId: request.requestId, roomId,
+          items: [projection()], nextCursor: null, status,
+        };
+        return { type: "room.memory.status.v1", requestId: request.requestId,
+          roomId, status };
+      },
+    };
+    const fixture = await createFixture({ memoryAuthority });
+    fixtures.push(fixture);
+    const clients = await Promise.all([fixture.connect(), fixture.connect(), fixture.connect()]);
+    await Promise.all(clients.map((client, index) => client.login(humans[index]!)));
+    clients[1]!.send({ type: "room.memory.context.dispute.v1", requestId: "dispute-device-2",
+      roomId, memoryRecordId: "memory-context-1", expectedVersion: 1,
+      reason: "The date changed" });
+    await clients[1]!.waitForFrame((frame) => hasType(
+      frame,
+      "room.memory.context.dispute.accepted.v1",
+    ), "memory dispute acknowledgement");
+    clients[0]!.send({ type: "room.memory.query.v1", requestId: "memory-query-device-1",
+      roomId, limit: 50 });
+    clients[2]!.send({ type: "room.memory.query.v1", requestId: "memory-query-device-3",
+      roomId, limit: 50 });
+    const converged = await Promise.all([
+      clients[0]!.waitForFrame((frame) => hasType(frame, "room.memory.page.v1") &&
+        frame.requestId === "memory-query-device-1", "device one memory projection"),
+      clients[2]!.waitForFrame((frame) => hasType(frame, "room.memory.page.v1") &&
+        frame.requestId === "memory-query-device-3", "device three memory projection"),
+    ]);
+    for (const received of converged) {
+      expect(received.frame).toMatchObject({ items: [{ currentVersion: { state: "disputed" },
+        disputes: [{ operatorActorId: humans[1].id }] }] });
+    }
   });
 
   it("registers live delivery before the history snapshot without a history/live gap", async () => {

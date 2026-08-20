@@ -301,4 +301,65 @@ describe("FT-05 AuthorityWorker Room Memory operations", () => {
       value.close();
     }
   });
+
+  it("keeps repeated noauth readiness reports idempotent without changing repair state", () => {
+    const value = fixture();
+    try {
+      executeMemoryAuthorityOperation(value.database, {
+        type: "memory.mark-noauth", roomId: "room-1", now: T1,
+      });
+      const first = value.database.prepare(`
+        SELECT updated_at AS updatedAt FROM room_memory_stewards WHERE room_id = 'room-1'
+      `).get();
+
+      executeMemoryAuthorityOperation(value.database, {
+        type: "memory.mark-noauth", roomId: "room-1", now: T1 + 1,
+      });
+
+      expect(value.database.prepare(`
+        SELECT updated_at AS updatedAt FROM room_memory_stewards WHERE room_id = 'room-1'
+      `).get()).toEqual(first);
+      expect(value.database.prepare(`
+        SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.memory.health.changed'
+      `).get()).toEqual({ count: 1 });
+    } finally {
+      value.close();
+    }
+  });
+
+  it("names a memory health event safely when the raw base64url digest starts with punctuation", () => {
+    const value = fixture();
+    try {
+      executeMemoryAuthorityOperation(value.database, {
+        type: "memory.mark-noauth",
+        roomId: "room-1",
+        now: T0 + 26,
+      });
+      const row = value.database.prepare(`
+        SELECT event_id AS eventId, stream_kind AS streamKind, stream_id AS streamId,
+               stream_seq AS streamSeq, room_id AS roomId, actor_id AS actorId,
+               occurred_at AS occurredAt, event_type AS type, payload_json AS payloadJson
+        FROM events WHERE event_type = 'room.memory.health.changed'
+      `).get();
+      expect(row?.eventId).toBe(
+        "room-memory:-Sqt0aGFd_OuG-rOpxbnEeRYb7SS1_mAE-oDHasSAs0",
+      );
+      expect(parsePersistedRoomEvent({
+        eventId: row?.eventId,
+        streamKind: row?.streamKind,
+        streamId: row?.streamId,
+        streamSeq: row?.streamSeq,
+        roomId: row?.roomId,
+        actorId: row?.actorId,
+        occurredAt: row?.occurredAt,
+        type: row?.type,
+        payload: JSON.parse(row?.payloadJson as string) as unknown,
+      }).ok).toBe(true);
+      expect(value.database.prepare(`
+        SELECT id FROM outbox_deliveries WHERE event_id = ?
+      `).get(row?.eventId)).toEqual({ id: expect.stringMatching(/^room-memory:/) });
+    } finally {
+      value.close();
+    }
+  });
 });

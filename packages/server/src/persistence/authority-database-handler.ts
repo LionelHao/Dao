@@ -111,6 +111,7 @@ import {
   type MemoryCorpusSourceIdentity,
 } from "../room-memory/corpus-database-authority.js";
 import { invalidateRoomMemorySource } from "../room-memory/database-authority.js";
+import { readRoomMemoryRuntimeContext } from "../room-memory/runtime-context-authority.js";
 import {
   readOperationalMessageAuthorityEvent,
   readOperationalTimelineMessage,
@@ -5890,7 +5891,8 @@ export function executeRuntimeAuthorityOperation(
       const permissionRow = database.prepare(
         `SELECT actor.tool_permissions_json AS capabilityJson,
                 membership.tool_permissions_json AS membershipJson,
-                membership.participation AS participation, room.status AS roomStatus
+                membership.participation AS participation, room.status AS roomStatus,
+                membership.access_revision AS accessRevision
          FROM actors AS actor
          JOIN room_memberships AS membership ON membership.actor_id = actor.id
          JOIN rooms AS room ON room.id = membership.room_id
@@ -5900,6 +5902,10 @@ export function executeRuntimeAuthorityOperation(
         ? JSON.parse(permissionRow.capabilityJson) as unknown : [];
       const membershipPermissions = typeof permissionRow?.membershipJson === "string"
         ? JSON.parse(permissionRow.membershipJson) as unknown : [];
+      if (typeof permissionRow?.accessRevision !== "number" ||
+          !Number.isSafeInteger(permissionRow.accessRevision) || permissionRow.accessRevision < 0) {
+        return fail("storage_unavailable", "Agent Room authorization revision was corrupt");
+      }
       const allowedIds = new Set(["http-json.read", "repository.git-status", "sandbox-file.write"]);
       const toolIds = permissionRow?.roomStatus === "active" && permissionRow.participation === "active" &&
         Array.isArray(capabilities) && Array.isArray(membershipPermissions)
@@ -5940,6 +5946,37 @@ export function executeRuntimeAuthorityOperation(
         visibleConversation: messages as { messageId: string; authorId: string; body: string }[],
         toolIds,
         openItemTargets: openItemTargets as { actorId: string; kind: "human" | "agent" }[],
+        roomMemory: readRoomMemoryRuntimeContext(database, {
+          roomId: execution.roomId,
+          authorizationEpoch: permissionRow.accessRevision,
+        }),
+      };
+    }
+    if (operation.type === "runtime.read-memory-delta") {
+      const execution = runtimeExecutionById(database, operation.executionId);
+      requireExecutionRuntimeGenerationAllowed(
+        database,
+        execution.id,
+        stableId("runtime-memory-delta-gate", execution.id, String(execution.currentAttemptSeq)),
+      );
+      requireAgentCommandAuthority(database, execution.agentId, execution.roomId);
+      const permissionRow = database.prepare(
+        `SELECT membership.access_revision AS accessRevision
+         FROM room_memberships AS membership
+         WHERE membership.room_id = ? AND membership.actor_id = ?
+           AND membership.kind = 'agent' AND membership.participation = 'active'`,
+      ).get(execution.roomId, execution.agentId);
+      if (typeof permissionRow?.accessRevision !== "number" ||
+          !Number.isSafeInteger(permissionRow.accessRevision) || permissionRow.accessRevision < 0) {
+        return fail("storage_unavailable", "Agent Room authorization revision was corrupt");
+      }
+      return {
+        kind: "memory-delta",
+        rawDelta: readRoomMemoryRuntimeContext(database, {
+          roomId: execution.roomId,
+          authorizationEpoch: permissionRow.accessRevision,
+          cursor: operation.cursor,
+        }).rawDelta,
       };
     }
     if (operation.type === "runtime.invoke") {

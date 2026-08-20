@@ -46,7 +46,9 @@ function fail(code: AuthorityWorkerErrorCode, message: string): never {
 }
 
 function stableId(...parts: readonly string[]): string {
-  return createHash("sha256").update(parts.join("\u0000")).digest("base64url");
+  return `room-memory:${createHash("sha256")
+    .update(parts.join("\u0000"))
+    .digest("base64url")}`;
 }
 
 function canonicalJson(value: unknown): string {

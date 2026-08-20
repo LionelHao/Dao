@@ -80,7 +80,7 @@ T-0039 的 `RoomLifecycleService` 当前只暴露服务端内部方法，caller 
 | 移出真人或 agent | 允许 | 允许，但不能移出 owner | 403 |
 | 把真人设为 admin/member | 允许 | 403 | 403 |
 
-归档是幂等终态：归档房间不再可用于消息访问，后续重命名、邀请、配置和移除被拒绝。界面可以根据角色隐藏操作，但隐藏不是权限控制，服务端方法始终重新检查当前成员关系和角色。
+归档是幂等的只读生命周期状态：当前仍有权的 Human 可以继续浏览消息，并执行授权范围内的 sync、fixed-watermark repair 与只读来源导航；发送消息、Agent invocation、steward/timer 等业务运行以及重命名、邀请、配置和移除均被冻结。经 FT-02 权威 reopen 命令恢复 active 后，业务运行只从 durable generation/checkpoint 继续，不能重放归档前已提交结果。界面可以根据角色隐藏操作，但隐藏不是权限控制，服务端方法始终重新检查当前成员关系、角色和 Room lifecycle。
 
 ## 6. 消息访问、移除与审计
 
