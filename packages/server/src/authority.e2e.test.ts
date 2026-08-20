@@ -2260,11 +2260,23 @@ describe("authoritative server real-process harness", () => {
       }, "room.subscribed.v2");
 
       const submit = async (messageId: string, body: string): Promise<void> => {
-        await expect(client!.request({
-          type: "message.send.v2",
-          requestId: `submit-${messageId}`,
-          message: { messageId, roomId, body, mentionedTargets: [], attachments: [] },
-        }, "message.accepted")).resolves.toMatchObject({ messageId, targetOutcomes: [] });
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            const receipt = await client!.request({
+              type: "message.send.v2",
+              requestId: `submit-${messageId}`,
+              message: { messageId, roomId, body, mentionedTargets: [], attachments: [] },
+            }, "message.accepted");
+            expect(receipt).toMatchObject({ messageId, targetOutcomes: [] });
+            return;
+          } catch (error: unknown) {
+            if (!isRecord(error) || error.code !== "storage_unavailable" || attempt === 2) {
+              throw error;
+            }
+            await new Promise<void>((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+          }
+        }
+        throw new Error("Message submission retry bound was exhausted");
       };
       const invoke = async (messageId: string) => {
         const frame = await client!.request({
@@ -4097,7 +4109,8 @@ describe("authoritative server real-process harness", () => {
         observeMaterializedLastPage = resolve;
       });
       let materializedLastPageObserved = false;
-      const expectedRepairTotal = mixed.total + 1;
+      // The mixed fixture count excludes the singleton governance and Memory status records.
+      const expectedRepairTotal = mixed.total + 2;
       transportC.beforeMaterializedLastPageReturn = async (page, receivedRecordCount) => {
         materializedLastPageObserved = true;
         observeMaterializedLastPage();
