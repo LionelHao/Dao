@@ -110,6 +110,21 @@ describe("Message Authority WebSocket transport", () => {
       type: "error", requestId: "send-archived",
       error: { closedError: { status: 403, code: "room_forbidden" } },
     });
+    expect(parseMessageAuthorityServerFrame(JSON.stringify({
+      type: "room.memory.status.v1",
+      requestId: "memory-status-1",
+      roomId: "room-1",
+      status: { roomId: "room-1", health: { state: "healthy", reason: "none",
+        memoryWatermark: 0, corpusHead: 0, lag: 0, lastAttemptAt: null,
+        retryable: false, recoveryRequired: false }, recoveryGeneration: 0,
+      updatedAt: createdAt },
+    }))).toMatchObject({ type: "room.memory.status.v1", requestId: "memory-status-1" });
+    expect(parseMessageAuthorityServerFrame(JSON.stringify({
+      type: "error", requestId: "memory-1", status: 409,
+      code: "memory_version_conflict", message: "Conflict", objectId: "memory-1",
+      retryable: false,
+    }))).toMatchObject({ type: "error", requestId: "memory-1",
+      error: { memoryError: { code: "memory_version_conflict" } } });
   });
 
   it("authenticates once, sends the five exact operations, and delivers event-before-ACK", async () => {
@@ -205,6 +220,40 @@ describe("Message Authority WebSocket transport", () => {
       .every((frame) => !Object.hasOwn(frame, "accessToken") &&
         !Object.hasOwn(frame, "actorId") && !Object.hasOwn(frame, "idempotencyKey"))).toBe(true);
     subscription.close();
+    transport.close();
+  });
+
+  it("round-trips closed Memory Authority success and error frames", async () => {
+    const authority = await listen((frame, send) => {
+      const requestId = frame.requestId as string;
+      if (frame.type === "auth.resume") {
+        send({ type: "auth.authenticated", requestId, accountId: "account-1",
+          actorId: "human-1", sessionId: "session-1" });
+      } else if (frame.type === "room.memory.status.query.v1") {
+        send({ type: "room.memory.status.v1", requestId, roomId: "room-1",
+          status: { roomId: "room-1", health: { state: "healthy", reason: "none",
+            memoryWatermark: 0, corpusHead: 0, lag: 0, lastAttemptAt: null,
+            retryable: false, recoveryRequired: false }, recoveryGeneration: 0,
+          updatedAt: createdAt } });
+      } else if (frame.type === "room.memory.context.dispute.v1") {
+        send({ type: "error", requestId, status: 409, code: "memory_version_conflict",
+          message: "Conflict", objectId: "memory-1", retryable: false });
+      }
+    });
+    const transport = createMessageAuthorityWebSocketTransport({
+      endpoint: authority.endpoint, session: authoritySession,
+      webSocketFactory: (endpoint) =>
+        new WebSocket(endpoint) as unknown as MessageAuthorityWebSocketLike,
+    });
+    await expect(transport.memoryRequest({ type: "room.memory.status.query.v1",
+      requestId: "memory-status-1", roomId: "room-1" })).resolves.toMatchObject({
+      type: "room.memory.status.v1", roomId: "room-1",
+    });
+    await expect(transport.memoryRequest({ type: "room.memory.context.dispute.v1",
+      requestId: "memory-dispute-1", roomId: "room-1", memoryRecordId: "memory-1",
+      expectedVersion: 1, reason: "Wrong context" })).resolves.toMatchObject({
+      type: "error", status: 409, code: "memory_version_conflict",
+    });
     transport.close();
   });
 

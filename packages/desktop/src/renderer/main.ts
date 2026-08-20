@@ -14,6 +14,7 @@ const dispose = mountDesktopRendererEntry(
   window.dao?.messageAuthority,
   undefined,
   window.dao?.attachmentAuthority,
+  window.dao?.memoryAuthority,
 );
 if (dispose !== undefined) {
   window.addEventListener("beforeunload", dispose, { once: true });

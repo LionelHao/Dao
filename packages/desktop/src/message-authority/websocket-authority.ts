@@ -1,8 +1,14 @@
 import {
   isMessageRevision,
+  isRoomMemoryError,
+  isRoomMemoryProtocolFrame,
+  isRoomMemoryRequest,
   isRoomCursor,
   isTimelineMessage,
   type MessageRevision,
+  type RoomMemoryError,
+  type RoomMemoryRequest,
+  type RoomMemorySuccessFrame,
   type RoomCursor,
   type TimelineMessage,
 } from "@native-im/core";
@@ -63,6 +69,7 @@ export class MessageAuthorityTransportError extends Error {
       retainedFromSeq: number;
       watermark: number;
     }>,
+    readonly memoryError?: RoomMemoryError,
   ) {
     super(`Message Authority transport failed: ${code}`);
     this.name = "MessageAuthorityTransportError";
@@ -85,6 +92,7 @@ export interface MessageAuthorityWireTransport {
   sendV2(command: MessageSendV2Command): Promise<MessageAcceptedResult>;
   revise(command: MessageReviseCommand): Promise<MessageRevisionAcceptedResult>;
   recall(command: MessageRecallCommand): Promise<MessageRecallAcceptedResult>;
+  memoryRequest(command: RoomMemoryRequest): Promise<RoomMemorySuccessFrame | RoomMemoryError>;
   subscribeRoom(
     roomId: string,
     cursor: RoomCursor,
@@ -166,6 +174,7 @@ type ParsedFrame =
   | MessageRecallAcceptedResult
   | MessageHistoryV2WireResult
   | MessageRevisionsResult
+  | RoomMemorySuccessFrame
   | DesktopRoomSyncResult
   | Readonly<{
       type: "room.subscribed.v2";
@@ -269,6 +278,10 @@ export function parseMessageAuthorityServerFrame(raw: string): ParsedFrame | und
     return undefined;
   }
   if (!record(value) || typeof value.type !== "string") return undefined;
+  if (value.type !== "error" && isRoomMemoryProtocolFrame(value) &&
+      !isRoomMemoryRequest(value)) {
+    return structuredClone(value) as RoomMemorySuccessFrame;
+  }
   switch (value.type) {
     case "auth.authenticated":
       return exact(value, ["type", "requestId", "accountId", "actorId", "sessionId"]) &&
@@ -353,6 +366,19 @@ export function parseMessageAuthorityServerFrame(raw: string): ParsedFrame | und
           roomId: value.payload.roomId, change: value.payload.change }
         : undefined;
     case "error": {
+      if (isRoomMemoryError(value)) {
+        return {
+          type: "error",
+          ...(value.requestId === undefined ? {} : { requestId: value.requestId }),
+          error: new MessageAuthorityTransportError(
+            value.status === 401 ? "authentication_required"
+              : value.status === 403 ? "access_revoked" : "protocol_error",
+            undefined,
+            undefined,
+            structuredClone(value),
+          ),
+        };
+      }
       if (!exact(value, ["type", "status", "code", "message"], ["requestId", "details"]) ||
           typeof value.status !== "number" || !text(value.code, 128) || !text(value.message) ||
           (value.requestId !== undefined && !text(value.requestId, 128))) return undefined;
@@ -742,6 +768,31 @@ export function createMessageAuthorityWebSocketTransport(options: {
       { ...command },
       "message.recall.accepted",
     ),
+    async memoryRequest(command) {
+      if (!isRoomMemoryRequest(command)) {
+        throw new MessageAuthorityTransportError("protocol_error");
+      }
+      const expected: Readonly<Record<RoomMemoryRequest["type"], RoomMemorySuccessFrame["type"]>> = {
+        "room.memory.query.v1": "room.memory.page.v1",
+        "room.memory.source.query.v1": "room.memory.source.v1",
+        "room.memory.context.dispute.v1": "room.memory.context.dispute.accepted.v1",
+        "room.memory.context.resolve.v1": "room.memory.context.resolve.accepted.v1",
+        "room.memory.status.query.v1": "room.memory.status.v1",
+        "room.memory.retry.v1": "room.memory.retry.accepted.v1",
+      };
+      try {
+        return structuredClone(await exactRequest<RoomMemorySuccessFrame>(
+          { ...command },
+          expected[command.type],
+        ));
+      } catch (error) {
+        if (error instanceof MessageAuthorityTransportError && error.memoryError !== undefined &&
+            error.memoryError.requestId === command.requestId) {
+          return structuredClone(error.memoryError);
+        }
+        throw error;
+      }
+    },
     async subscribeRoom(roomId, cursor, observer) {
       if (!isRoomCursor(cursor) || cursor.roomId !== roomId) {
         throw new MessageAuthorityTransportError("protocol_error");

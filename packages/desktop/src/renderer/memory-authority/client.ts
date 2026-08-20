@@ -49,6 +49,13 @@ export type MemoryAuthorityClientApplication =
       errorCode: string;
     }>
   | Readonly<{
+      type: "room.memory.context";
+      roomId: string;
+      accessEpoch: number;
+      lifecycle: "active" | "archived";
+      viewer: Readonly<{ actorId: string; currentHuman: boolean }>;
+    }>
+  | Readonly<{
       type: "room.memory.connection";
       roomId: string;
       accessEpoch: number;
@@ -211,9 +218,24 @@ function parseVersionEvent(value: UnknownRecord): MemoryAuthorityClientApplicati
   });
 }
 
-function parseApplication(input: unknown): MemoryAuthorityClientApplication | undefined {
+export function parseMemoryAuthorityClientApplication(
+  input: unknown,
+): MemoryAuthorityClientApplication | undefined {
   if (!isRecord(input) || typeof input.type !== "string") return undefined;
   if (input.type === "room.memory.event") return parseVersionEvent(input);
+  if (input.type === "room.memory.context") {
+    if (!hasExactKeys(input, ["type", "roomId", "accessEpoch", "lifecycle", "viewer"]) ||
+        !isIdentifier(input.roomId) || !isPositiveSafeInteger(input.accessEpoch) ||
+        (input.lifecycle !== "active" && input.lifecycle !== "archived") ||
+        !isRecord(input.viewer) || !hasExactKeys(input.viewer, ["actorId", "currentHuman"]) ||
+        !isIdentifier(input.viewer.actorId) || typeof input.viewer.currentHuman !== "boolean") {
+      return undefined;
+    }
+    return Object.freeze({ type: input.type, roomId: input.roomId,
+      accessEpoch: input.accessEpoch, lifecycle: input.lifecycle,
+      viewer: Object.freeze({ actorId: input.viewer.actorId,
+        currentHuman: input.viewer.currentHuman }) });
+  }
   if (input.type === "room.memory.repair.completed") {
     const roomId = input.roomId;
     if (!hasExactKeys(input, ["type", "roomId", "accessEpoch", "generation", "records"]) ||
@@ -259,7 +281,7 @@ export function createMemoryAuthorityClient(rawBridge: MemoryAuthorityRawBridge)
   let closed = false;
   const stop = rawBridge.onAuthorityInput((input) => {
     if (closed) return;
-    const parsed = parseApplication(input);
+    const parsed = parseMemoryAuthorityClientApplication(input);
     if (parsed === undefined) return;
     for (const listener of listeners) listener(structuredClone(parsed));
   });

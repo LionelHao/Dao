@@ -29,6 +29,8 @@ import {
 } from "./message-authority/controller.js";
 import { registerMessageAuthorityIpc } from "./message-authority/ipc.js";
 import { createDesktopMessageAuthorityRuntime } from "./message-authority/production-runtime.js";
+import { createDesktopMemoryAuthorityRuntime } from "./memory-authority/production-runtime.js";
+import { registerMemoryAuthorityIpc } from "./memory-authority/ipc.js";
 import { createDesktopAttachmentAuthorityRuntime } from "./attachment-authority/production-runtime.js";
 import {
   createElectronAttachmentPorts,
@@ -54,6 +56,8 @@ async function createWindow(): Promise<void> {
   > | undefined;
   let messageAuthority: ReturnType<typeof createMessageAuthorityController> | undefined;
   let disposeMessageAuthorityIpc: (() => void) | undefined;
+  let memoryAuthorityRuntime: ReturnType<typeof createDesktopMemoryAuthorityRuntime> | undefined;
+  let disposeMemoryAuthorityIpc: (() => void) | undefined;
   let disposeAttachmentGovernanceState: (() => void) | undefined;
   const attachmentRuntimeHost = createElectronAttachmentRuntimeHost({
     createRuntime: () => {
@@ -111,6 +115,7 @@ async function createWindow(): Promise<void> {
         invalidate: () => {
           governance?.invalidateAuthorizedState();
           messageAuthorityRuntime?.invalidateAuthorizedState();
+          memoryAuthorityRuntime?.invalidateAuthorizedState();
           attachmentRuntimeHost.invalidateIdentity();
         },
       },
@@ -147,15 +152,27 @@ async function createWindow(): Promise<void> {
       webContents: window.webContents,
       controller: messageAuthority,
     });
+    memoryAuthorityRuntime = createDesktopMemoryAuthorityRuntime({
+      endpoint: process.env.NATIVE_IM_IDENTITY_WS_URL ?? "ws://127.0.0.1:8787",
+      session: () => identity?.getCurrentAuthoritySession(),
+      webSocketFactory: (endpoint) => new WebSocket(endpoint),
+    });
+    disposeMemoryAuthorityIpc = registerMemoryAuthorityIpc({
+      ipcMain,
+      webContents: window.webContents,
+      runtime: memoryAuthorityRuntime,
+    });
     window.once("closed", () => {
       disposeGovernanceIpc?.();
       disposeMessageAuthorityIpc?.();
+      disposeMemoryAuthorityIpc?.();
       disposeAttachmentGovernanceState?.();
       attachmentRuntimeHost.close();
       identity?.close();
       governance?.close();
       messageAuthority?.close();
       messageAuthorityRuntime?.close();
+      memoryAuthorityRuntime?.close();
     });
 
     await Promise.all([window.loadFile(rendererPath), identity.initialize()]);
@@ -165,6 +182,7 @@ async function createWindow(): Promise<void> {
         governanceMethods: Object.keys(globalThis.dao?.governance ?? {}).sort(),
         messageAuthorityMethods: Object.keys(globalThis.dao?.messageAuthority ?? {}).sort(),
         attachmentAuthorityMethods: Object.keys(globalThis.dao?.attachmentAuthority ?? {}).sort(),
+        memoryAuthorityMethods: Object.keys(globalThis.dao?.memoryAuthority ?? {}).sort(),
         namespaces: Object.keys(globalThis.dao ?? {}).sort(),
         bridgeMissing: document.querySelector("[data-identity-bridge-missing]") !== null,
         governanceRouteContract: document.querySelector("#app")?.dataset.governanceRouteContract ?? "",
@@ -205,6 +223,7 @@ async function createWindow(): Promise<void> {
       "status",
       "upload",
     ];
+    const expectedMemoryAuthorityMethods = ["context", "onAuthorityInput", "request"];
     let startupProbe: unknown;
     try {
       startupProbe = typeof startupProbeJson === "string"
@@ -232,9 +251,14 @@ async function createWindow(): Promise<void> {
         startupProbe.attachmentAuthorityMethods.length !== expectedAttachmentAuthorityMethods.length ||
         !startupProbe.attachmentAuthorityMethods.every(
           (method, index) => method === expectedAttachmentAuthorityMethods[index],
+        ) || !("memoryAuthorityMethods" in startupProbe) ||
+        !Array.isArray(startupProbe.memoryAuthorityMethods) ||
+        startupProbe.memoryAuthorityMethods.length !== expectedMemoryAuthorityMethods.length ||
+        !startupProbe.memoryAuthorityMethods.every(
+          (method, index) => method === expectedMemoryAuthorityMethods[index],
         ) || !("namespaces" in startupProbe) || !Array.isArray(startupProbe.namespaces) ||
         startupProbe.namespaces.join(",") !==
-          "attachmentAuthority,governance,identity,messageAuthority" ||
+          "attachmentAuthority,governance,identity,memoryAuthority,messageAuthority" ||
         !("governanceRouteContract" in startupProbe) ||
         startupProbe.governanceRouteContract !== "closed-v1" ||
         !("bridgeMissing" in startupProbe) || startupProbe.bridgeMissing !== false ||
@@ -256,12 +280,14 @@ async function createWindow(): Promise<void> {
   } catch (error: unknown) {
     disposeGovernanceIpc?.();
     disposeMessageAuthorityIpc?.();
+    disposeMemoryAuthorityIpc?.();
     disposeAttachmentGovernanceState?.();
     attachmentRuntimeHost.close();
     identity?.close();
     governance?.close();
     messageAuthority?.close();
     messageAuthorityRuntime?.close();
+    memoryAuthorityRuntime?.close();
     if (!window.isDestroyed()) window.destroy();
     throw error;
   }

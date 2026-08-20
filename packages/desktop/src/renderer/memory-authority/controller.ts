@@ -461,6 +461,12 @@ export function createMemoryAuthorityController(options: ControllerOptions): Mem
       revoke(entry, input.accessEpoch);
       return;
     }
+    if (input.type === "room.memory.context") {
+      entry.context = Object.freeze({ ...entry.context, lifecycle: input.lifecycle,
+        viewer: clone(input.viewer) });
+      setFromCache(entry);
+      return;
+    }
     if (input.type === "room.memory.connection") {
       setFromCache(entry, { status: input.connection.status });
       return;
