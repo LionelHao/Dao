@@ -7,7 +7,7 @@ import {
 } from "../access/room-cache-invalidation-port.js";
 import { OFFLINE_READ_LEASE_SCHEMA_STATEMENTS } from "../access/offline-lease-invalidation-port.js";
 
-export const AUTHORITY_SCHEMA_VERSION = 17 as const;
+export const AUTHORITY_SCHEMA_VERSION = 18 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -69,6 +69,7 @@ const SCHEMA_FINGERPRINTS = {
   15: "e8010dc3c03c71d51f20ef4054a815d3580abdcbd0762791508226a68918b426",
   16: "86a3512dcb625bc3e0f3d79e5a5d6542819523bee8ac851990148bcad8e38737",
   17: "cc4b260ec841765f0349040a238a44281aa3ed9a792623ebd6540fd3e9f6b0b0",
+  18: "d1344ba94d7dd4253f2dcc9e392c3bc4b8b1ec5b4fbba614e3fe2a10392797e5",
 } as const;
 
 const V1_STATEMENTS = [
@@ -3297,10 +3298,889 @@ const V17_STATEMENTS = [
    END`,
 ] as const;
 
+const V18_STATEMENTS = [
+  `CREATE TABLE room_memory_stewards (
+    room_id TEXT PRIMARY KEY REFERENCES rooms(id),
+    steward_id TEXT NOT NULL UNIQUE CHECK (length(steward_id) BETWEEN 1 AND 256),
+    lifecycle_generation INTEGER NOT NULL CHECK (lifecycle_generation >= 0),
+    memory_watermark INTEGER NOT NULL DEFAULT 0 CHECK (memory_watermark >= 0),
+    corpus_head INTEGER NOT NULL DEFAULT 0 CHECK (corpus_head >= 0),
+    health TEXT NOT NULL CHECK (
+      health IN ('healthy', 'catching_up', 'noauth', 'degraded', 'failed')
+    ),
+    health_reason_code TEXT CHECK (
+      health_reason_code IS NULL OR length(trim(health_reason_code)) BETWEEN 1 AND 128
+    ),
+    recovery_generation INTEGER NOT NULL DEFAULT 1 CHECK (recovery_generation >= 1),
+    last_attempt_at TEXT,
+    retryable INTEGER NOT NULL DEFAULT 0 CHECK (retryable IN (0, 1)),
+    recovery_required INTEGER NOT NULL DEFAULT 0 CHECK (recovery_required IN (0, 1)),
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+    updated_at TEXT NOT NULL CHECK (length(updated_at) > 0),
+    CHECK (memory_watermark <= corpus_head),
+    CHECK (
+      (health = 'healthy' AND memory_watermark = corpus_head
+        AND health_reason_code IS NULL AND recovery_required = 0)
+      OR (health = 'catching_up' AND memory_watermark < corpus_head
+        AND recovery_required = 0)
+      OR (health IN ('noauth', 'degraded', 'failed')
+        AND health_reason_code IS NOT NULL)
+    ),
+    CHECK (health <> 'failed' OR recovery_required = 1)
+  ) STRICT`,
+  `CREATE TRIGGER room_memory_stewards_v18_validate_insert
+   BEFORE INSERT ON room_memory_stewards
+   WHEN NEW.steward_id <> 'room-memory-steward:' || NEW.room_id
+      OR EXISTS (SELECT 1 FROM actors WHERE id = NEW.steward_id)
+      OR NOT EXISTS (
+        SELECT 1 FROM rooms
+        WHERE id = NEW.room_id AND archive_generation = NEW.lifecycle_generation
+      )
+   BEGIN
+     SELECT RAISE(ABORT, 'Room memory steward identity is invalid');
+   END`,
+  `CREATE TRIGGER room_memory_stewards_v18_validate_update
+   BEFORE UPDATE ON room_memory_stewards
+   WHEN NEW.room_id <> OLD.room_id OR NEW.steward_id <> OLD.steward_id
+      OR NEW.created_at <> OLD.created_at
+      OR NEW.lifecycle_generation < OLD.lifecycle_generation
+      OR NEW.lifecycle_generation <> COALESCE((
+        SELECT archive_generation FROM rooms WHERE id = OLD.room_id
+      ), -1)
+      OR NEW.memory_watermark < OLD.memory_watermark
+      OR NEW.corpus_head < OLD.corpus_head
+      OR NEW.corpus_head > OLD.corpus_head + 1
+      OR NEW.corpus_head <> COALESCE((
+        SELECT MAX(corpus_seq) FROM room_memory_sources WHERE room_id = OLD.room_id
+      ), 0)
+      OR NEW.recovery_generation < OLD.recovery_generation
+      OR NEW.recovery_generation > OLD.recovery_generation + 1
+      OR (NEW.memory_watermark > OLD.memory_watermark AND NOT EXISTS (
+        SELECT 1 FROM room_memory_jobs AS job
+        WHERE job.room_id = OLD.room_id
+          AND job.recovery_generation = NEW.recovery_generation
+          AND job.from_watermark_exclusive = OLD.memory_watermark
+          AND job.to_corpus_seq_inclusive = NEW.memory_watermark
+          AND job.status = 'completed'
+      ))
+   BEGIN
+     SELECT RAISE(ABORT, 'Room memory steward checkpoint is invalid');
+   END`,
+  `CREATE TRIGGER room_memory_stewards_v18_immutable_delete
+   BEFORE DELETE ON room_memory_stewards
+   BEGIN SELECT RAISE(ABORT, 'Room memory steward is immutable'); END`,
+  `CREATE TABLE room_memory_sources (
+    room_id TEXT NOT NULL REFERENCES room_memory_stewards(room_id),
+    corpus_seq INTEGER NOT NULL CHECK (corpus_seq >= 1),
+    source_kind TEXT NOT NULL CHECK (source_kind IN (
+      'message', 'message_revision', 'message_tombstone',
+      'attachment_extraction', 'project_fact_checkpoint'
+    )),
+    source_id TEXT NOT NULL CHECK (length(trim(source_id)) BETWEEN 1 AND 256),
+    source_revision INTEGER NOT NULL CHECK (source_revision >= 1),
+    server_stream_seq INTEGER NOT NULL CHECK (server_stream_seq >= 1),
+    eligibility TEXT NOT NULL CHECK (eligibility IN (
+      'eligible', 'excluded_recalled', 'excluded_revised', 'excluded_revoked',
+      'excluded_unbound', 'excluded_unsafe', 'unavailable'
+    )),
+    availability TEXT NOT NULL CHECK (availability IN (
+      'readable', 'tombstone', 'metadata_only', 'temporarily_unavailable'
+    )),
+    source_actor_id TEXT REFERENCES actors(id),
+    safe_metadata_json TEXT NOT NULL DEFAULT '{}' CHECK (
+      json_valid(safe_metadata_json)
+      AND json_type(safe_metadata_json) = 'object'
+      AND length(CAST(safe_metadata_json AS BLOB)) <= 4096
+    ),
+    read_reference TEXT NOT NULL CHECK (
+      length(trim(read_reference)) BETWEEN 1 AND 512
+      AND instr(read_reference, '://') = 0
+      AND instr(read_reference, '/') = 0
+      AND instr(read_reference, char(92)) = 0
+      AND instr(read_reference, '..') = 0
+    ),
+    occurred_at TEXT NOT NULL CHECK (length(occurred_at) > 0),
+    updated_at TEXT NOT NULL CHECK (length(updated_at) > 0),
+    PRIMARY KEY (room_id, source_kind, source_id, source_revision),
+    UNIQUE (room_id, corpus_seq),
+    CHECK (eligibility <> 'eligible' OR availability = 'readable')
+  ) STRICT`,
+  `CREATE INDEX room_memory_sources_eligibility_v18
+   ON room_memory_sources(room_id, eligibility, availability, corpus_seq)`,
+  `CREATE TRIGGER room_memory_sources_v18_validate_insert
+   BEFORE INSERT ON room_memory_sources
+   WHEN NEW.corpus_seq <> COALESCE((
+     SELECT corpus_head + 1 FROM room_memory_stewards WHERE room_id = NEW.room_id
+   ), -1)
+   BEGIN
+     SELECT RAISE(ABORT, 'Room memory corpus sequence is not contiguous');
+   END`,
+  `CREATE TRIGGER room_memory_sources_v18_validate_update
+   BEFORE UPDATE ON room_memory_sources
+   WHEN NEW.room_id <> OLD.room_id OR NEW.corpus_seq <> OLD.corpus_seq
+      OR NEW.source_kind <> OLD.source_kind OR NEW.source_id <> OLD.source_id
+      OR NEW.source_revision <> OLD.source_revision
+      OR NEW.server_stream_seq <> OLD.server_stream_seq
+      OR NEW.source_actor_id IS NOT OLD.source_actor_id
+      OR NEW.safe_metadata_json <> OLD.safe_metadata_json
+      OR NEW.read_reference <> OLD.read_reference
+      OR NEW.occurred_at <> OLD.occurred_at
+      OR (NEW.eligibility = OLD.eligibility AND NEW.availability = OLD.availability)
+   BEGIN
+     SELECT RAISE(ABORT, 'Room memory source identity is immutable');
+   END`,
+  `CREATE TRIGGER room_memory_sources_v18_immutable_delete
+   BEFORE DELETE ON room_memory_sources
+   BEGIN SELECT RAISE(ABORT, 'Room memory source identity is immutable'); END`,
+  `CREATE TABLE room_memory_source_transitions (
+    transition_id INTEGER PRIMARY KEY,
+    room_id TEXT NOT NULL,
+    source_kind TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    source_revision INTEGER NOT NULL,
+    from_eligibility TEXT CHECK (from_eligibility IS NULL OR from_eligibility IN (
+      'eligible', 'excluded_recalled', 'excluded_revised', 'excluded_revoked',
+      'excluded_unbound', 'excluded_unsafe', 'unavailable'
+    )),
+    to_eligibility TEXT NOT NULL CHECK (to_eligibility IN (
+      'eligible', 'excluded_recalled', 'excluded_revised', 'excluded_revoked',
+      'excluded_unbound', 'excluded_unsafe', 'unavailable'
+    )),
+    from_availability TEXT CHECK (from_availability IS NULL OR from_availability IN (
+      'readable', 'tombstone', 'metadata_only', 'temporarily_unavailable'
+    )),
+    to_availability TEXT NOT NULL CHECK (to_availability IN (
+      'readable', 'tombstone', 'metadata_only', 'temporarily_unavailable'
+    )),
+    reason_code TEXT NOT NULL CHECK (length(trim(reason_code)) BETWEEN 1 AND 128),
+    transitioned_at TEXT NOT NULL CHECK (length(transitioned_at) > 0),
+    FOREIGN KEY (room_id, source_kind, source_id, source_revision)
+      REFERENCES room_memory_sources(room_id, source_kind, source_id, source_revision)
+  ) STRICT`,
+  `CREATE TRIGGER room_memory_source_transitions_v18_validate_insert
+   BEFORE INSERT ON room_memory_source_transitions
+   WHEN NOT EXISTS (
+     SELECT 1 FROM room_memory_sources AS source
+     WHERE source.room_id = NEW.room_id
+       AND source.source_kind = NEW.source_kind
+       AND source.source_id = NEW.source_id
+       AND source.source_revision = NEW.source_revision
+       AND source.eligibility = NEW.to_eligibility
+       AND source.availability = NEW.to_availability
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'Room memory source transition is invalid');
+   END`,
+  `CREATE TRIGGER room_memory_source_transitions_v18_immutable_update
+   BEFORE UPDATE ON room_memory_source_transitions
+   BEGIN SELECT RAISE(ABORT, 'Room memory source transition is immutable'); END`,
+  `CREATE TRIGGER room_memory_source_transitions_v18_immutable_delete
+   BEFORE DELETE ON room_memory_source_transitions
+   BEGIN SELECT RAISE(ABORT, 'Room memory source transition is immutable'); END`,
+  `CREATE TRIGGER room_memory_sources_v18_audit_insert
+   AFTER INSERT ON room_memory_sources
+   BEGIN
+     INSERT INTO room_memory_source_transitions (
+       room_id, source_kind, source_id, source_revision,
+       from_eligibility, to_eligibility, from_availability, to_availability,
+       reason_code, transitioned_at
+     ) VALUES (
+       NEW.room_id, NEW.source_kind, NEW.source_id, NEW.source_revision,
+       NULL, NEW.eligibility, NULL, NEW.availability, 'indexed', NEW.occurred_at
+     );
+   END`,
+  `CREATE TRIGGER room_memory_sources_v18_audit_update
+   AFTER UPDATE OF eligibility, availability ON room_memory_sources
+   BEGIN
+     INSERT INTO room_memory_source_transitions (
+       room_id, source_kind, source_id, source_revision,
+       from_eligibility, to_eligibility, from_availability, to_availability,
+       reason_code, transitioned_at
+     ) VALUES (
+       NEW.room_id, NEW.source_kind, NEW.source_id, NEW.source_revision,
+       OLD.eligibility, NEW.eligibility, OLD.availability, NEW.availability,
+       NEW.eligibility, NEW.updated_at
+     );
+   END`,
+  `CREATE TRIGGER room_memory_sources_v18_advance_head
+   AFTER INSERT ON room_memory_sources
+   BEGIN
+     UPDATE room_memory_stewards
+     SET corpus_head = NEW.corpus_seq,
+         health = CASE WHEN health = 'healthy' THEN 'catching_up' ELSE health END,
+         updated_at = NEW.updated_at
+     WHERE room_id = NEW.room_id;
+   END`,
+  `CREATE TABLE room_memory_jobs (
+    job_id TEXT PRIMARY KEY CHECK (length(trim(job_id)) BETWEEN 1 AND 256),
+    room_id TEXT NOT NULL REFERENCES room_memory_stewards(room_id),
+    recovery_generation INTEGER NOT NULL CHECK (recovery_generation >= 1),
+    lifecycle_generation INTEGER NOT NULL CHECK (lifecycle_generation >= 0),
+    from_watermark_exclusive INTEGER NOT NULL CHECK (from_watermark_exclusive >= 0),
+    to_corpus_seq_inclusive INTEGER NOT NULL CHECK (
+      to_corpus_seq_inclusive > from_watermark_exclusive
+    ),
+    source_count INTEGER NOT NULL CHECK (source_count BETWEEN 1 AND 32),
+    frozen_sources_json TEXT NOT NULL CHECK (
+      json_valid(frozen_sources_json)
+      AND json_type(frozen_sources_json) = 'array'
+      AND json_array_length(frozen_sources_json) = source_count
+      AND length(CAST(frozen_sources_json AS BLOB)) <= 65536
+    ),
+    status TEXT NOT NULL CHECK (status IN (
+      'queued', 'running', 'retry_wait', 'completed', 'failed', 'cancelled'
+    )),
+    current_attempt INTEGER NOT NULL DEFAULT 0 CHECK (current_attempt BETWEEN 0 AND 3),
+    available_at TEXT NOT NULL CHECK (length(available_at) > 0),
+    claimed_at TEXT,
+    completed_at TEXT,
+    last_error_code TEXT CHECK (
+      last_error_code IS NULL OR length(trim(last_error_code)) BETWEEN 1 AND 128
+    ),
+    result_sha256 TEXT CHECK (
+      result_sha256 IS NULL OR (
+        length(result_sha256) = 64 AND result_sha256 NOT GLOB '*[^0-9a-f]*'
+      )
+    ),
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+    updated_at TEXT NOT NULL CHECK (length(updated_at) > 0),
+    UNIQUE (room_id, recovery_generation, from_watermark_exclusive, to_corpus_seq_inclusive),
+    CHECK (source_count = to_corpus_seq_inclusive - from_watermark_exclusive),
+    CHECK (
+      (status = 'queued' AND current_attempt = 0 AND claimed_at IS NULL
+        AND completed_at IS NULL AND last_error_code IS NULL AND result_sha256 IS NULL)
+      OR (status = 'running' AND current_attempt BETWEEN 1 AND 3
+        AND claimed_at IS NOT NULL AND completed_at IS NULL
+        AND last_error_code IS NULL AND result_sha256 IS NULL)
+      OR (status = 'retry_wait' AND current_attempt BETWEEN 1 AND 2
+        AND claimed_at IS NOT NULL AND completed_at IS NULL
+        AND last_error_code IS NOT NULL AND result_sha256 IS NULL)
+      OR (status = 'completed' AND current_attempt BETWEEN 1 AND 3
+        AND claimed_at IS NOT NULL AND completed_at IS NOT NULL
+        AND last_error_code IS NULL AND result_sha256 IS NOT NULL)
+      OR (status IN ('failed', 'cancelled') AND completed_at IS NOT NULL
+        AND last_error_code IS NOT NULL AND result_sha256 IS NULL)
+    )
+  ) STRICT`,
+  `CREATE INDEX room_memory_jobs_recovery_v18
+   ON room_memory_jobs(status, available_at, room_id, recovery_generation)`,
+  `CREATE TRIGGER room_memory_jobs_v18_validate_insert
+   BEFORE INSERT ON room_memory_jobs
+   WHEN NEW.status <> 'queued' OR NEW.current_attempt <> 0
+      OR NOT EXISTS (
+        SELECT 1 FROM room_memory_stewards AS steward
+        JOIN rooms AS room ON room.id = steward.room_id
+        WHERE steward.room_id = NEW.room_id
+          AND steward.recovery_generation = NEW.recovery_generation
+          AND steward.lifecycle_generation = NEW.lifecycle_generation
+          AND steward.memory_watermark = NEW.from_watermark_exclusive
+          AND steward.corpus_head >= NEW.to_corpus_seq_inclusive
+          AND room.status = 'active'
+          AND room.archive_generation = NEW.lifecycle_generation
+      )
+      OR (SELECT COUNT(*) FROM room_memory_sources AS source
+          WHERE source.room_id = NEW.room_id
+            AND source.corpus_seq > NEW.from_watermark_exclusive
+            AND source.corpus_seq <= NEW.to_corpus_seq_inclusive) <> NEW.source_count
+      OR EXISTS (
+        SELECT 1 FROM room_memory_jobs AS job
+        WHERE job.room_id = NEW.room_id
+          AND job.recovery_generation = NEW.recovery_generation
+          AND job.status IN ('queued', 'running', 'retry_wait')
+      )
+   BEGIN
+     SELECT RAISE(ABORT, 'Room memory job claim range or generation is invalid');
+   END`,
+  `CREATE TRIGGER room_memory_jobs_v18_validate_update
+   BEFORE UPDATE ON room_memory_jobs
+   WHEN NEW.job_id <> OLD.job_id OR NEW.room_id <> OLD.room_id
+      OR NEW.recovery_generation <> OLD.recovery_generation
+      OR NEW.lifecycle_generation <> OLD.lifecycle_generation
+      OR NEW.from_watermark_exclusive <> OLD.from_watermark_exclusive
+      OR NEW.to_corpus_seq_inclusive <> OLD.to_corpus_seq_inclusive
+      OR NEW.source_count <> OLD.source_count
+      OR NEW.frozen_sources_json <> OLD.frozen_sources_json
+      OR NEW.created_at <> OLD.created_at
+      OR NEW.current_attempt < OLD.current_attempt
+      OR NEW.current_attempt > OLD.current_attempt + 1
+      OR NEW.recovery_generation <> COALESCE((
+        SELECT recovery_generation FROM room_memory_stewards WHERE room_id = OLD.room_id
+      ), -1)
+      OR NOT (
+        (OLD.status = 'queued' AND NEW.status IN ('running', 'cancelled'))
+        OR (OLD.status = 'running' AND NEW.status IN (
+          'retry_wait', 'completed', 'failed', 'cancelled'
+        ))
+        OR (OLD.status = 'retry_wait' AND NEW.status IN ('running', 'failed', 'cancelled'))
+      )
+      OR (NEW.status = 'running' AND NOT EXISTS (
+        SELECT 1 FROM room_memory_attempts AS attempt
+        WHERE attempt.job_id = OLD.job_id
+          AND attempt.recovery_generation = OLD.recovery_generation
+          AND attempt.attempt_number = NEW.current_attempt
+          AND attempt.status = 'running'
+      ))
+      OR (NEW.status = 'completed' AND NOT EXISTS (
+        SELECT 1 FROM room_memory_attempts AS attempt
+        WHERE attempt.job_id = OLD.job_id
+          AND attempt.recovery_generation = OLD.recovery_generation
+          AND attempt.attempt_number = NEW.current_attempt
+          AND attempt.status = 'succeeded'
+          AND attempt.output_sha256 = NEW.result_sha256
+      ))
+      OR (NEW.status = 'retry_wait' AND NOT EXISTS (
+        SELECT 1 FROM room_memory_attempts AS attempt
+        WHERE attempt.job_id = OLD.job_id
+          AND attempt.attempt_number = NEW.current_attempt
+          AND attempt.status = 'retryable_failed'
+          AND attempt.error_code = NEW.last_error_code
+      ))
+      OR (NEW.status = 'failed' AND NOT EXISTS (
+        SELECT 1 FROM room_memory_attempts AS attempt
+        WHERE attempt.job_id = OLD.job_id
+          AND attempt.attempt_number = NEW.current_attempt
+          AND attempt.status IN ('retryable_failed', 'terminal_failed')
+          AND attempt.error_code = NEW.last_error_code
+      ))
+   BEGIN
+     SELECT RAISE(ABORT, 'Room memory job transition or generation is invalid');
+   END`,
+  `CREATE TRIGGER room_memory_jobs_v18_immutable_delete
+   BEFORE DELETE ON room_memory_jobs
+   BEGIN SELECT RAISE(ABORT, 'Room memory job is immutable'); END`,
+  `CREATE TABLE room_memory_attempts (
+    attempt_id TEXT PRIMARY KEY CHECK (length(trim(attempt_id)) BETWEEN 1 AND 256),
+    job_id TEXT NOT NULL REFERENCES room_memory_jobs(job_id),
+    room_id TEXT NOT NULL REFERENCES room_memory_stewards(room_id),
+    recovery_generation INTEGER NOT NULL CHECK (recovery_generation >= 1),
+    attempt_number INTEGER NOT NULL CHECK (attempt_number BETWEEN 1 AND 3),
+    status TEXT NOT NULL CHECK (status IN (
+      'running', 'succeeded', 'retryable_failed', 'terminal_failed', 'cancelled'
+    )),
+    input_sha256 TEXT NOT NULL CHECK (
+      length(input_sha256) = 64 AND input_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    output_sha256 TEXT CHECK (
+      output_sha256 IS NULL OR (
+        length(output_sha256) = 64 AND output_sha256 NOT GLOB '*[^0-9a-f]*'
+      )
+    ),
+    error_code TEXT CHECK (
+      error_code IS NULL OR length(trim(error_code)) BETWEEN 1 AND 128
+    ),
+    started_at TEXT NOT NULL CHECK (length(started_at) > 0),
+    finished_at TEXT,
+    available_at TEXT NOT NULL CHECK (length(available_at) > 0),
+    UNIQUE (job_id, attempt_number),
+    CHECK (
+      (status = 'running' AND output_sha256 IS NULL
+        AND error_code IS NULL AND finished_at IS NULL)
+      OR (status = 'succeeded' AND output_sha256 IS NOT NULL
+        AND error_code IS NULL AND finished_at IS NOT NULL)
+      OR (status IN ('retryable_failed', 'terminal_failed', 'cancelled')
+        AND output_sha256 IS NULL AND error_code IS NOT NULL AND finished_at IS NOT NULL)
+    )
+  ) STRICT`,
+  `CREATE INDEX room_memory_attempts_job_v18
+   ON room_memory_attempts(job_id, attempt_number, status)`,
+  `CREATE TRIGGER room_memory_attempts_v18_validate_insert
+   BEFORE INSERT ON room_memory_attempts
+   WHEN NEW.status <> 'running'
+      OR NOT EXISTS (
+        SELECT 1 FROM room_memory_jobs AS job
+        JOIN room_memory_stewards AS steward ON steward.room_id = job.room_id
+        WHERE job.job_id = NEW.job_id
+          AND job.room_id = NEW.room_id
+          AND job.recovery_generation = NEW.recovery_generation
+          AND steward.recovery_generation = NEW.recovery_generation
+          AND job.status IN ('queued', 'retry_wait')
+          AND NEW.attempt_number = job.current_attempt + 1
+      )
+   BEGIN
+     SELECT RAISE(ABORT, 'Room memory attempt sequence or generation is invalid');
+   END`,
+  `CREATE TRIGGER room_memory_attempts_v18_begin_job
+   AFTER INSERT ON room_memory_attempts
+   BEGIN
+     UPDATE room_memory_jobs
+     SET status = 'running', current_attempt = NEW.attempt_number,
+         claimed_at = NEW.started_at, last_error_code = NULL,
+         available_at = NEW.available_at, updated_at = NEW.started_at
+     WHERE job_id = NEW.job_id;
+   END`,
+  `CREATE TRIGGER room_memory_attempts_v18_validate_update
+   BEFORE UPDATE ON room_memory_attempts
+   WHEN NEW.attempt_id <> OLD.attempt_id OR NEW.job_id <> OLD.job_id
+      OR NEW.room_id <> OLD.room_id
+      OR NEW.recovery_generation <> OLD.recovery_generation
+      OR NEW.attempt_number <> OLD.attempt_number
+      OR NEW.input_sha256 <> OLD.input_sha256
+      OR NEW.started_at <> OLD.started_at OR NEW.available_at <> OLD.available_at
+      OR OLD.status <> 'running'
+      OR NEW.status NOT IN ('succeeded', 'retryable_failed', 'terminal_failed', 'cancelled')
+      OR NEW.recovery_generation <> COALESCE((
+        SELECT recovery_generation FROM room_memory_stewards WHERE room_id = OLD.room_id
+      ), -1)
+      OR NOT EXISTS (
+        SELECT 1 FROM room_memory_jobs AS job
+        WHERE job.job_id = OLD.job_id
+          AND job.room_id = OLD.room_id
+          AND job.recovery_generation = OLD.recovery_generation
+          AND job.current_attempt = OLD.attempt_number
+          AND job.status = 'running'
+      )
+   BEGIN
+     SELECT RAISE(ABORT, 'Room memory attempt result is late or invalid');
+   END`,
+  `CREATE TRIGGER room_memory_attempts_v18_immutable_delete
+   BEFORE DELETE ON room_memory_attempts
+   BEGIN SELECT RAISE(ABORT, 'Room memory attempt is immutable'); END`,
+  `CREATE TABLE room_memory_records (
+    memory_record_id TEXT PRIMARY KEY CHECK (
+      length(trim(memory_record_id)) BETWEEN 1 AND 256
+    ),
+    room_id TEXT NOT NULL REFERENCES room_memory_stewards(room_id),
+    kind TEXT NOT NULL CHECK (kind IN (
+      'goal', 'decision', 'context', 'next_action', 'open_question_or_blocker'
+    )),
+    dedupe_key TEXT NOT NULL CHECK (
+      length(dedupe_key) BETWEEN 1 AND 128
+      AND dedupe_key NOT GLOB '*[^ -~]*'
+    ),
+    current_version_id TEXT,
+    current_version_number INTEGER NOT NULL DEFAULT 0 CHECK (current_version_number >= 0),
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+    updated_at TEXT NOT NULL CHECK (length(updated_at) > 0),
+    UNIQUE (room_id, memory_record_id),
+    UNIQUE (room_id, kind, dedupe_key),
+    CHECK (
+      (current_version_number = 0 AND current_version_id IS NULL)
+      OR (current_version_number >= 1 AND current_version_id IS NOT NULL)
+    )
+  ) STRICT`,
+  `CREATE INDEX room_memory_records_projection_v18
+   ON room_memory_records(room_id, kind, current_version_number, memory_record_id)`,
+  `CREATE TRIGGER room_memory_records_v18_validate_insert
+   BEFORE INSERT ON room_memory_records
+   WHEN NEW.current_version_id IS NOT NULL OR NEW.current_version_number <> 0
+   BEGIN
+     SELECT RAISE(ABORT, 'Room memory record must begin without a current version');
+   END`,
+  `CREATE TRIGGER room_memory_records_v18_validate_update
+   BEFORE UPDATE ON room_memory_records
+   WHEN NEW.memory_record_id <> OLD.memory_record_id OR NEW.room_id <> OLD.room_id
+      OR NEW.kind <> OLD.kind OR NEW.dedupe_key <> OLD.dedupe_key
+      OR NEW.created_at <> OLD.created_at
+      OR NEW.current_version_number <> OLD.current_version_number + 1
+      OR NOT EXISTS (
+        SELECT 1 FROM room_memory_versions AS version
+        WHERE version.memory_version_id = NEW.current_version_id
+          AND version.memory_record_id = OLD.memory_record_id
+          AND version.room_id = OLD.room_id
+          AND version.kind = OLD.kind
+          AND version.version_number = NEW.current_version_number
+      )
+   BEGIN
+     SELECT RAISE(ABORT, 'Room memory record version pointer is invalid');
+   END`,
+  `CREATE TRIGGER room_memory_records_v18_immutable_delete
+   BEFORE DELETE ON room_memory_records
+   BEGIN SELECT RAISE(ABORT, 'Room memory record is immutable'); END`,
+  `CREATE TABLE room_memory_versions (
+    memory_version_id TEXT PRIMARY KEY CHECK (
+      length(trim(memory_version_id)) BETWEEN 1 AND 256
+    ),
+    memory_record_id TEXT NOT NULL REFERENCES room_memory_records(memory_record_id),
+    room_id TEXT NOT NULL,
+    version_number INTEGER NOT NULL CHECK (version_number >= 1),
+    kind TEXT NOT NULL CHECK (kind IN (
+      'goal', 'decision', 'context', 'next_action', 'open_question_or_blocker'
+    )),
+    state TEXT NOT NULL CHECK (state IN (
+      'proposal', 'active', 'disputed', 'review_required',
+      'resolved', 'superseded', 'invalidated'
+    )),
+    derived_text TEXT NOT NULL CHECK (
+      length(trim(derived_text)) > 0
+      AND length(CAST(derived_text AS BLOB)) <= 4096
+    ),
+    proposal_id TEXT CHECK (
+      proposal_id IS NULL OR length(trim(proposal_id)) BETWEEN 1 AND 256
+    ),
+    origin_kind TEXT NOT NULL CHECK (origin_kind IN (
+      'steward', 'human_resolution', 'source_invalidation', 'project_checkpoint'
+    )),
+    created_by_actor_id TEXT REFERENCES actors(id),
+    source_job_id TEXT REFERENCES room_memory_jobs(job_id),
+    replaces_version_id TEXT REFERENCES room_memory_versions(memory_version_id),
+    source_count INTEGER NOT NULL CHECK (source_count BETWEEN 1 AND 16),
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+    UNIQUE (memory_record_id, version_number),
+    UNIQUE (room_id, memory_version_id),
+    FOREIGN KEY (room_id, memory_record_id)
+      REFERENCES room_memory_records(room_id, memory_record_id),
+    CHECK (state <> 'active' OR kind = 'context'),
+    CHECK (state <> 'disputed' OR kind = 'context'),
+    CHECK (state <> 'resolved' OR kind = 'context'),
+    CHECK (state <> 'proposal' OR kind <> 'context'),
+    CHECK ((kind = 'context' AND proposal_id IS NULL)
+      OR (kind <> 'context' AND proposal_id IS NOT NULL)),
+    CHECK ((origin_kind = 'human_resolution' AND created_by_actor_id IS NOT NULL)
+      OR (origin_kind <> 'human_resolution' AND created_by_actor_id IS NULL))
+  ) STRICT`,
+  `CREATE INDEX room_memory_versions_projection_v18
+   ON room_memory_versions(room_id, kind, state, memory_record_id, version_number)`,
+  `CREATE TRIGGER room_memory_versions_v18_validate_insert
+   BEFORE INSERT ON room_memory_versions
+   WHEN NOT EXISTS (
+     SELECT 1 FROM room_memory_records AS record
+     WHERE record.memory_record_id = NEW.memory_record_id
+       AND record.room_id = NEW.room_id
+       AND record.kind = NEW.kind
+       AND NEW.version_number = record.current_version_number + 1
+       AND NEW.replaces_version_id IS record.current_version_id
+   )
+      OR (NEW.origin_kind = 'human_resolution' AND NOT EXISTS (
+        SELECT 1 FROM actors AS actor
+        JOIN room_memberships AS membership ON membership.actor_id = actor.id
+        WHERE actor.id = NEW.created_by_actor_id AND actor.kind = 'human'
+          AND membership.room_id = NEW.room_id AND membership.kind = 'human'
+      ))
+      OR (NEW.version_number = 1 AND NOT (
+        (NEW.kind = 'context' AND NEW.state = 'active' AND NEW.origin_kind = 'steward')
+        OR (NEW.kind <> 'context' AND NEW.state = 'proposal'
+          AND NEW.origin_kind IN ('steward', 'project_checkpoint'))
+      ))
+      OR (NEW.version_number > 1 AND NOT EXISTS (
+        SELECT 1 FROM room_memory_versions AS previous
+        WHERE previous.memory_version_id = NEW.replaces_version_id
+          AND previous.memory_record_id = NEW.memory_record_id
+          AND previous.version_number = NEW.version_number - 1
+          AND (
+            (previous.state = 'active'
+              AND NEW.state IN ('disputed', 'review_required', 'superseded', 'invalidated'))
+            OR (previous.state = 'disputed'
+              AND NEW.state IN ('resolved', 'superseded', 'invalidated'))
+            OR (previous.state = 'resolved'
+              AND NEW.state IN ('active', 'superseded', 'invalidated'))
+            OR (previous.state = 'review_required'
+              AND NEW.state IN ('superseded', 'invalidated'))
+            OR (previous.state = 'proposal'
+              AND NEW.state IN ('superseded', 'review_required', 'invalidated'))
+            OR (previous.state = 'superseded' AND (
+              (NEW.kind = 'context' AND NEW.state = 'active')
+              OR (NEW.kind <> 'context' AND NEW.state = 'proposal')
+            ))
+            OR (previous.state = 'invalidated' AND (
+              (NEW.kind = 'context' AND NEW.state = 'active')
+              OR (NEW.kind <> 'context' AND NEW.state = 'proposal')
+            ))
+          )
+      ))
+   BEGIN
+     SELECT RAISE(ABORT, 'Room memory version transition is invalid');
+   END`,
+  `CREATE TRIGGER room_memory_versions_v18_advance_record
+   AFTER INSERT ON room_memory_versions
+   BEGIN
+     UPDATE room_memory_records
+     SET current_version_id = NEW.memory_version_id,
+         current_version_number = NEW.version_number,
+         updated_at = NEW.created_at
+     WHERE memory_record_id = NEW.memory_record_id;
+   END`,
+  `CREATE TRIGGER room_memory_versions_v18_immutable_update
+   BEFORE UPDATE ON room_memory_versions
+   BEGIN SELECT RAISE(ABORT, 'Room memory version is immutable'); END`,
+  `CREATE TRIGGER room_memory_versions_v18_immutable_delete
+   BEFORE DELETE ON room_memory_versions
+   BEGIN SELECT RAISE(ABORT, 'Room memory version is immutable'); END`,
+  `CREATE TABLE room_memory_source_edges (
+    edge_id TEXT PRIMARY KEY CHECK (length(trim(edge_id)) BETWEEN 1 AND 256),
+    memory_version_id TEXT NOT NULL REFERENCES room_memory_versions(memory_version_id),
+    memory_record_id TEXT NOT NULL REFERENCES room_memory_records(memory_record_id),
+    room_id TEXT NOT NULL,
+    source_kind TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    source_revision INTEGER NOT NULL,
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+    UNIQUE (memory_version_id, source_kind, source_id, source_revision),
+    FOREIGN KEY (room_id, memory_record_id)
+      REFERENCES room_memory_records(room_id, memory_record_id),
+    FOREIGN KEY (room_id, source_kind, source_id, source_revision)
+      REFERENCES room_memory_sources(room_id, source_kind, source_id, source_revision)
+  ) STRICT`,
+  `CREATE TRIGGER room_memory_source_edges_v18_validate_insert
+   BEFORE INSERT ON room_memory_source_edges
+   WHEN NOT EXISTS (
+     SELECT 1 FROM room_memory_versions AS version
+     JOIN room_memory_records AS record
+       ON record.memory_record_id = version.memory_record_id
+     JOIN room_memory_sources AS source
+       ON source.room_id = NEW.room_id
+      AND source.source_kind = NEW.source_kind
+      AND source.source_id = NEW.source_id
+      AND source.source_revision = NEW.source_revision
+     WHERE version.memory_version_id = NEW.memory_version_id
+       AND version.memory_record_id = NEW.memory_record_id
+       AND version.room_id = NEW.room_id
+       AND record.current_version_id = NEW.memory_version_id
+       AND source.eligibility = 'eligible' AND source.availability = 'readable'
+       AND (SELECT COUNT(*) FROM room_memory_source_edges AS edge
+            WHERE edge.memory_version_id = NEW.memory_version_id) < version.source_count
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'Room memory source edge is cross-Room or ineligible');
+   END`,
+  `CREATE TRIGGER room_memory_source_edges_v18_immutable_update
+   BEFORE UPDATE ON room_memory_source_edges
+   BEGIN SELECT RAISE(ABORT, 'Room memory source edge is immutable'); END`,
+  `CREATE TRIGGER room_memory_source_edges_v18_immutable_delete
+   BEFORE DELETE ON room_memory_source_edges
+   BEGIN SELECT RAISE(ABORT, 'Room memory source edge is immutable'); END`,
+  `CREATE TABLE room_memory_disputes (
+    dispute_id TEXT PRIMARY KEY CHECK (length(trim(dispute_id)) BETWEEN 1 AND 256),
+    room_id TEXT NOT NULL,
+    memory_record_id TEXT NOT NULL REFERENCES room_memory_records(memory_record_id),
+    expected_version_id TEXT NOT NULL REFERENCES room_memory_versions(memory_version_id),
+    disputed_version_id TEXT NOT NULL UNIQUE REFERENCES room_memory_versions(memory_version_id),
+    expected_version_number INTEGER NOT NULL CHECK (expected_version_number >= 1),
+    operator_kind TEXT NOT NULL CHECK (operator_kind = 'human'),
+    operator_actor_id TEXT NOT NULL REFERENCES actors(id),
+    reason TEXT NOT NULL CHECK (
+      length(trim(reason)) > 0 AND length(CAST(reason AS BLOB)) <= 2048
+    ),
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+    FOREIGN KEY (room_id, memory_record_id)
+      REFERENCES room_memory_records(room_id, memory_record_id)
+  ) STRICT`,
+  `CREATE TRIGGER room_memory_disputes_v18_validate_insert
+   BEFORE INSERT ON room_memory_disputes
+   WHEN NEW.operator_kind <> 'human'
+      OR NOT EXISTS (
+        SELECT 1 FROM actors AS actor
+        JOIN room_memberships AS membership ON membership.actor_id = actor.id
+        WHERE actor.id = NEW.operator_actor_id AND actor.kind = 'human'
+          AND membership.room_id = NEW.room_id AND membership.kind = 'human'
+      )
+      OR NOT EXISTS (
+        SELECT 1 FROM room_memory_records AS record
+        JOIN room_memory_versions AS expected
+          ON expected.memory_version_id = NEW.expected_version_id
+        JOIN room_memory_versions AS disputed
+          ON disputed.memory_version_id = NEW.disputed_version_id
+        WHERE record.memory_record_id = NEW.memory_record_id
+          AND record.room_id = NEW.room_id AND record.kind = 'context'
+          AND record.current_version_id = NEW.disputed_version_id
+          AND expected.memory_record_id = record.memory_record_id
+          AND expected.version_number = NEW.expected_version_number
+          AND expected.state = 'active'
+          AND disputed.memory_record_id = record.memory_record_id
+          AND disputed.state = 'disputed'
+          AND disputed.replaces_version_id = expected.memory_version_id
+      )
+   BEGIN
+     SELECT RAISE(ABORT, 'Room memory dispute operator or expected version is invalid');
+   END`,
+  `CREATE TRIGGER room_memory_disputes_v18_immutable_update
+   BEFORE UPDATE ON room_memory_disputes
+   BEGIN SELECT RAISE(ABORT, 'Room memory dispute is immutable'); END`,
+  `CREATE TRIGGER room_memory_disputes_v18_immutable_delete
+   BEFORE DELETE ON room_memory_disputes
+   BEGIN SELECT RAISE(ABORT, 'Room memory dispute is immutable'); END`,
+  `CREATE TABLE room_memory_resolutions (
+    resolution_id TEXT PRIMARY KEY CHECK (length(trim(resolution_id)) BETWEEN 1 AND 256),
+    dispute_id TEXT NOT NULL UNIQUE REFERENCES room_memory_disputes(dispute_id),
+    room_id TEXT NOT NULL,
+    memory_record_id TEXT NOT NULL REFERENCES room_memory_records(memory_record_id),
+    expected_disputed_version_id TEXT NOT NULL REFERENCES room_memory_versions(memory_version_id),
+    resolution_version_id TEXT NOT NULL UNIQUE REFERENCES room_memory_versions(memory_version_id),
+    replacement_version_id TEXT UNIQUE REFERENCES room_memory_versions(memory_version_id),
+    operator_kind TEXT NOT NULL CHECK (operator_kind = 'human'),
+    operator_actor_id TEXT NOT NULL REFERENCES actors(id),
+    resolution TEXT NOT NULL CHECK (resolution IN (
+      'accept', 'replace', 'dismiss', 're_evaluate'
+    )),
+    reason TEXT NOT NULL CHECK (
+      length(trim(reason)) > 0 AND length(CAST(reason AS BLOB)) <= 2048
+    ),
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+    FOREIGN KEY (room_id, memory_record_id)
+      REFERENCES room_memory_records(room_id, memory_record_id)
+  ) STRICT`,
+  `CREATE TRIGGER room_memory_resolutions_v18_validate_insert
+   BEFORE INSERT ON room_memory_resolutions
+   WHEN NEW.operator_kind <> 'human'
+      OR NOT EXISTS (
+        SELECT 1 FROM actors AS actor
+        JOIN room_memberships AS membership ON membership.actor_id = actor.id
+        WHERE actor.id = NEW.operator_actor_id AND actor.kind = 'human'
+          AND membership.room_id = NEW.room_id AND membership.kind = 'human'
+      )
+      OR NOT EXISTS (
+        SELECT 1 FROM room_memory_disputes AS dispute
+        JOIN room_memory_versions AS disputed
+          ON disputed.memory_version_id = NEW.expected_disputed_version_id
+        JOIN room_memory_versions AS resolution
+          ON resolution.memory_version_id = NEW.resolution_version_id
+        JOIN room_memory_records AS record
+          ON record.memory_record_id = NEW.memory_record_id
+        WHERE dispute.dispute_id = NEW.dispute_id
+          AND dispute.room_id = NEW.room_id
+          AND dispute.memory_record_id = NEW.memory_record_id
+          AND dispute.disputed_version_id = NEW.expected_disputed_version_id
+          AND disputed.state = 'disputed'
+          AND resolution.memory_record_id = NEW.memory_record_id
+          AND resolution.state IN ('resolved', 'superseded')
+          AND resolution.replaces_version_id = disputed.memory_version_id
+          AND (
+            (NEW.replacement_version_id IS NULL
+              AND record.current_version_id = resolution.memory_version_id)
+            OR EXISTS (
+              SELECT 1 FROM room_memory_versions AS replacement
+              WHERE replacement.memory_version_id = NEW.replacement_version_id
+                AND replacement.memory_record_id = NEW.memory_record_id
+                AND replacement.state = 'active'
+                AND replacement.replaces_version_id = resolution.memory_version_id
+                AND record.current_version_id = replacement.memory_version_id
+            )
+          )
+      )
+   BEGIN
+     SELECT RAISE(ABORT, 'Room memory resolution operator or version chain is invalid');
+   END`,
+  `CREATE TRIGGER room_memory_resolutions_v18_immutable_update
+   BEFORE UPDATE ON room_memory_resolutions
+   BEGIN SELECT RAISE(ABORT, 'Room memory resolution is immutable'); END`,
+  `CREATE TRIGGER room_memory_resolutions_v18_immutable_delete
+   BEFORE DELETE ON room_memory_resolutions
+   BEGIN SELECT RAISE(ABORT, 'Room memory resolution is immutable'); END`,
+  `CREATE TABLE room_memory_idempotency (
+    scope TEXT NOT NULL CHECK (scope IN (
+      'memory_dispute', 'memory_resolve', 'memory_retry'
+    )),
+    idempotency_key TEXT NOT NULL CHECK (
+      length(trim(idempotency_key)) BETWEEN 1 AND 256
+    ),
+    room_id TEXT NOT NULL REFERENCES room_memory_stewards(room_id),
+    actor_id TEXT NOT NULL REFERENCES actors(id),
+    request_sha256 TEXT NOT NULL CHECK (
+      length(request_sha256) = 64 AND request_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    response_json TEXT NOT NULL CHECK (
+      json_valid(response_json) AND json_type(response_json) = 'object'
+      AND length(CAST(response_json AS BLOB)) <= 16384
+    ),
+    status_code INTEGER NOT NULL CHECK (status_code BETWEEN 200 AND 599),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    expires_at_ms INTEGER NOT NULL CHECK (
+      expires_at_ms > created_at_ms
+      AND expires_at_ms - created_at_ms <= 2592000000
+    ),
+    PRIMARY KEY (scope, idempotency_key)
+  ) STRICT`,
+  `CREATE TRIGGER room_memory_idempotency_v18_validate_insert
+   BEFORE INSERT ON room_memory_idempotency
+   WHEN NOT EXISTS (
+     SELECT 1 FROM actors AS actor
+     JOIN room_memberships AS membership ON membership.actor_id = actor.id
+     WHERE actor.id = NEW.actor_id AND actor.kind = 'human'
+       AND membership.room_id = NEW.room_id AND membership.kind = 'human'
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'Room memory idempotency actor is invalid');
+   END`,
+  `CREATE TRIGGER room_memory_idempotency_v18_immutable_update
+   BEFORE UPDATE ON room_memory_idempotency
+   BEGIN SELECT RAISE(ABORT, 'Room memory idempotency receipt is immutable'); END`,
+  `CREATE TABLE room_memory_project_checkpoint (
+    room_id TEXT PRIMARY KEY REFERENCES room_memory_stewards(room_id),
+    mode TEXT NOT NULL CHECK (mode IN ('disabled', 'enabled')),
+    participant_id TEXT CHECK (
+      participant_id IS NULL OR length(trim(participant_id)) BETWEEN 1 AND 256
+    ),
+    checkpoint_id TEXT CHECK (
+      checkpoint_id IS NULL OR length(trim(checkpoint_id)) BETWEEN 1 AND 256
+    ),
+    checkpoint_version INTEGER NOT NULL DEFAULT 0 CHECK (checkpoint_version >= 0),
+    health TEXT NOT NULL CHECK (health IN ('disabled', 'ready', 'degraded')),
+    health_reason_code TEXT CHECK (
+      health_reason_code IS NULL OR length(trim(health_reason_code)) BETWEEN 1 AND 128
+    ),
+    updated_at TEXT NOT NULL CHECK (length(updated_at) > 0),
+    CHECK (
+      (mode = 'disabled' AND participant_id IS NULL AND checkpoint_id IS NULL
+        AND checkpoint_version = 0 AND health = 'disabled'
+        AND health_reason_code IS NULL)
+      OR (mode = 'enabled' AND participant_id IS NOT NULL AND checkpoint_id IS NOT NULL
+        AND checkpoint_version >= 1 AND health IN ('ready', 'degraded'))
+    ),
+    CHECK (health <> 'degraded' OR health_reason_code IS NOT NULL)
+  ) STRICT`,
+  `CREATE TRIGGER room_memory_project_checkpoint_v18_validate_update
+   BEFORE UPDATE ON room_memory_project_checkpoint
+   WHEN NEW.room_id <> OLD.room_id
+      OR (OLD.mode = 'enabled' AND NEW.mode = 'disabled')
+      OR NEW.checkpoint_version < OLD.checkpoint_version
+   BEGIN
+     SELECT RAISE(ABORT, 'Room memory project checkpoint transition is invalid');
+   END`,
+  `CREATE TRIGGER room_memory_project_checkpoint_v18_immutable_delete
+   BEFORE DELETE ON room_memory_project_checkpoint
+   BEGIN SELECT RAISE(ABORT, 'Room memory project checkpoint is immutable'); END`,
+  `CREATE TRIGGER room_memory_stewards_v18_create_project_checkpoint
+   AFTER INSERT ON room_memory_stewards
+   BEGIN
+     INSERT INTO room_memory_project_checkpoint (
+       room_id, mode, participant_id, checkpoint_id, checkpoint_version,
+       health, health_reason_code, updated_at
+     ) VALUES (NEW.room_id, 'disabled', NULL, NULL, 0, 'disabled', NULL, NEW.created_at);
+   END`,
+  `CREATE TRIGGER rooms_v18_create_memory_steward
+   AFTER INSERT ON rooms
+   BEGIN
+     INSERT INTO room_memory_stewards (
+       room_id, steward_id, lifecycle_generation, memory_watermark, corpus_head,
+       health, health_reason_code, recovery_generation, last_attempt_at,
+       retryable, recovery_required, created_at, updated_at
+     ) VALUES (
+       NEW.id, 'room-memory-steward:' || NEW.id, NEW.archive_generation, 0, 0,
+       'healthy', NULL, 1, NULL, 0, 0, NEW.created_at, NEW.created_at
+     );
+   END`,
+  `CREATE TRIGGER rooms_v18_advance_memory_lifecycle
+   AFTER UPDATE OF archive_generation ON rooms
+   WHEN NEW.archive_generation > OLD.archive_generation
+   BEGIN
+     UPDATE room_memory_stewards
+     SET lifecycle_generation = NEW.archive_generation,
+         updated_at = COALESCE(NEW.archived_at, updated_at)
+     WHERE room_id = NEW.id;
+   END`,
+  `CREATE TRIGGER actors_v18_reject_memory_steward_identity
+   BEFORE INSERT ON actors
+   WHEN EXISTS (
+     SELECT 1 FROM room_memory_stewards WHERE steward_id = NEW.id
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'Room memory steward cannot be an actor');
+   END`,
+  `INSERT INTO room_memory_stewards (
+     room_id, steward_id, lifecycle_generation, memory_watermark, corpus_head,
+     health, health_reason_code, recovery_generation, last_attempt_at,
+     retryable, recovery_required, created_at, updated_at
+   )
+   SELECT room.id, 'room-memory-steward:' || room.id, room.archive_generation, 0, 0,
+          'healthy', NULL, 1, NULL, 0, 0, room.created_at, room.created_at
+   FROM rooms AS room
+   ORDER BY room.id`,
+] as const;
+
 export const AUTHORITY_V14_STATEMENT_COUNT_FOR_TEST = V14_STATEMENTS.length;
 export const AUTHORITY_V15_STATEMENT_COUNT_FOR_TEST = V15_STATEMENTS.length;
 export const AUTHORITY_V16_STATEMENT_COUNT_FOR_TEST = V16_STATEMENTS.length;
 export const AUTHORITY_V17_STATEMENT_COUNT_FOR_TEST = V17_STATEMENTS.length;
+export const AUTHORITY_V18_STATEMENT_COUNT_FOR_TEST = V18_STATEMENTS.length;
 
 const V2_STATEMENTS = [
   `ALTER TABLE actors
@@ -3718,6 +4598,11 @@ const MIGRATIONS = [
     17,
     "attachment-authority-pipeline",
     V17_STATEMENTS,
+  ),
+  defineMigration(
+    18,
+    "room-memory-authority-steward",
+    V18_STATEMENTS,
   ),
 ] as const satisfies readonly Migration[];
 
@@ -4235,6 +5120,68 @@ const V17_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V18_SCHEMA_CONTRACT = {
+  ...V17_SCHEMA_CONTRACT,
+  room_memory_attempts: [
+    "attempt_id", "job_id", "room_id", "recovery_generation", "attempt_number",
+    "status", "input_sha256", "output_sha256", "error_code", "started_at",
+    "finished_at", "available_at",
+  ],
+  room_memory_disputes: [
+    "dispute_id", "room_id", "memory_record_id", "expected_version_id",
+    "disputed_version_id", "expected_version_number", "operator_kind",
+    "operator_actor_id", "reason", "created_at",
+  ],
+  room_memory_idempotency: [
+    "scope", "idempotency_key", "room_id", "actor_id", "request_sha256",
+    "response_json", "status_code", "created_at_ms", "expires_at_ms",
+  ],
+  room_memory_jobs: [
+    "job_id", "room_id", "recovery_generation", "lifecycle_generation",
+    "from_watermark_exclusive", "to_corpus_seq_inclusive", "source_count",
+    "frozen_sources_json", "status", "current_attempt", "available_at",
+    "claimed_at", "completed_at", "last_error_code", "result_sha256",
+    "created_at", "updated_at",
+  ],
+  room_memory_project_checkpoint: [
+    "room_id", "mode", "participant_id", "checkpoint_id", "checkpoint_version",
+    "health", "health_reason_code", "updated_at",
+  ],
+  room_memory_records: [
+    "memory_record_id", "room_id", "kind", "dedupe_key", "current_version_id",
+    "current_version_number", "created_at", "updated_at",
+  ],
+  room_memory_resolutions: [
+    "resolution_id", "dispute_id", "room_id", "memory_record_id",
+    "expected_disputed_version_id", "resolution_version_id", "replacement_version_id",
+    "operator_kind", "operator_actor_id", "resolution", "reason", "created_at",
+  ],
+  room_memory_source_edges: [
+    "edge_id", "memory_version_id", "memory_record_id", "room_id", "source_kind",
+    "source_id", "source_revision", "created_at",
+  ],
+  room_memory_source_transitions: [
+    "transition_id", "room_id", "source_kind", "source_id", "source_revision",
+    "from_eligibility", "to_eligibility", "from_availability", "to_availability",
+    "reason_code", "transitioned_at",
+  ],
+  room_memory_sources: [
+    "room_id", "corpus_seq", "source_kind", "source_id", "source_revision",
+    "server_stream_seq", "eligibility", "availability", "source_actor_id",
+    "safe_metadata_json", "read_reference", "occurred_at", "updated_at",
+  ],
+  room_memory_stewards: [
+    "room_id", "steward_id", "lifecycle_generation", "memory_watermark",
+    "corpus_head", "health", "health_reason_code", "recovery_generation",
+    "last_attempt_at", "retryable", "recovery_required", "created_at", "updated_at",
+  ],
+  room_memory_versions: [
+    "memory_version_id", "memory_record_id", "room_id", "version_number", "kind",
+    "state", "derived_text", "proposal_id", "origin_kind", "created_by_actor_id",
+    "source_job_id", "replaces_version_id", "source_count", "created_at",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
@@ -4253,6 +5200,7 @@ const SCHEMA_CONTRACTS = {
   15: V15_SCHEMA_CONTRACT,
   16: V16_SCHEMA_CONTRACT,
   17: V17_SCHEMA_CONTRACT,
+  18: V18_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -5505,6 +6453,132 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
           )
        LIMIT 1`,
       "attachment extraction metadata must retain successful processing provenance",
+    );
+  }
+  if (schemaVersion >= 18) {
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM rooms AS room
+       LEFT JOIN room_memory_stewards AS steward ON steward.room_id = room.id
+       LEFT JOIN room_memory_project_checkpoint AS checkpoint
+         ON checkpoint.room_id = room.id
+       WHERE steward.room_id IS NULL OR checkpoint.room_id IS NULL
+          OR steward.steward_id <> 'room-memory-steward:' || room.id
+          OR steward.lifecycle_generation <> room.archive_generation
+          OR EXISTS (SELECT 1 FROM actors WHERE id = steward.steward_id)
+       LIMIT 1`,
+      "every Room must have one non-actor memory steward and checkpoint mode",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM room_memory_stewards AS steward
+       WHERE steward.memory_watermark > steward.corpus_head
+          OR steward.corpus_head <> COALESCE((
+            SELECT MAX(source.corpus_seq)
+            FROM room_memory_sources AS source
+            WHERE source.room_id = steward.room_id
+          ), 0)
+          OR steward.corpus_head <> (
+            SELECT COUNT(*) FROM room_memory_sources AS source
+            WHERE source.room_id = steward.room_id
+          )
+       LIMIT 1`,
+      "memory corpus sequence and watermark must remain contiguous",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM room_memory_sources AS source
+       WHERE NOT EXISTS (
+         SELECT 1 FROM room_memory_source_transitions AS transition
+         WHERE transition.room_id = source.room_id
+           AND transition.source_kind = source.source_kind
+           AND transition.source_id = source.source_id
+           AND transition.source_revision = source.source_revision
+       )
+       LIMIT 1`,
+      "every memory source must retain an append-only transition audit",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM room_memory_jobs AS job
+       LEFT JOIN room_memory_stewards AS steward ON steward.room_id = job.room_id
+       WHERE steward.room_id IS NULL
+          OR job.recovery_generation > steward.recovery_generation
+          OR job.to_corpus_seq_inclusive > steward.corpus_head
+          OR job.source_count < 1 OR job.source_count > 32
+       LIMIT 1`,
+      "memory jobs must remain bounded by steward generation and corpus head",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM room_memory_attempts AS attempt
+       LEFT JOIN room_memory_jobs AS job ON job.job_id = attempt.job_id
+       WHERE job.job_id IS NULL OR attempt.room_id <> job.room_id
+          OR attempt.recovery_generation <> job.recovery_generation
+          OR attempt.attempt_number > job.current_attempt
+       LIMIT 1`,
+      "memory attempts must remain bound to one job generation",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM room_memory_records AS record
+       WHERE (record.current_version_number = 0 AND record.current_version_id IS NOT NULL)
+          OR (record.current_version_number > 0 AND NOT EXISTS (
+            SELECT 1 FROM room_memory_versions AS version
+            WHERE version.memory_version_id = record.current_version_id
+              AND version.memory_record_id = record.memory_record_id
+              AND version.room_id = record.room_id
+              AND version.kind = record.kind
+              AND version.version_number = record.current_version_number
+          ))
+       LIMIT 1`,
+      "memory records must point at one same-kind current version",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM room_memory_versions AS version
+       WHERE version.source_count <> (
+         SELECT COUNT(*) FROM room_memory_source_edges AS edge
+         WHERE edge.memory_version_id = version.memory_version_id
+       )
+          OR EXISTS (
+            SELECT 1 FROM room_memory_source_edges AS edge
+            LEFT JOIN room_memory_sources AS source
+              ON source.room_id = edge.room_id
+             AND source.source_kind = edge.source_kind
+             AND source.source_id = edge.source_id
+             AND source.source_revision = edge.source_revision
+            WHERE edge.memory_version_id = version.memory_version_id
+              AND (source.source_id IS NULL OR version.room_id <> edge.room_id
+                OR version.memory_record_id <> edge.memory_record_id)
+          )
+       LIMIT 1`,
+      "memory versions must retain a complete same-Room source support set",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM room_memory_disputes AS dispute
+       LEFT JOIN actors AS actor ON actor.id = dispute.operator_actor_id
+       WHERE dispute.operator_kind <> 'human' OR actor.kind IS NOT 'human'
+       LIMIT 1`,
+      "memory disputes must retain a current Human operator",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM room_memory_resolutions AS resolution
+       LEFT JOIN actors AS actor ON actor.id = resolution.operator_actor_id
+       WHERE resolution.operator_kind <> 'human' OR actor.kind IS NOT 'human'
+       LIMIT 1`,
+      "memory resolutions must retain a current Human operator",
     );
   }
 }

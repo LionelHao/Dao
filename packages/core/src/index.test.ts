@@ -16,9 +16,28 @@ type DomainUnderTest = {
   isRoom?: (value: unknown) => boolean;
   isRoomGovernanceView?: (value: unknown) => boolean;
   isDepartureConflictList?: (value: unknown) => boolean;
+  isRoomMemorySource?: (value: unknown) => boolean;
+  isRoomMemoryVersion?: (value: unknown) => boolean;
+  isRoomMemoryHealth?: (value: unknown) => boolean;
+  isRoomMemoryRawDeltaPage?: (value: unknown) => boolean;
+  isRoomMemoryRequest?: (value: unknown) => boolean;
+  isRoomMemoryProtocolFrame?: (value: unknown) => boolean;
+  isRoomMemoryRepairRecord?: (value: unknown, expectedRoomId?: string) => boolean;
 };
 
 const domain = importedDomain as unknown as DomainUnderTest;
+
+describe("room memory root exports", () => {
+  it("exposes the FT-05 closed contract guards", () => {
+    expect(domain.isRoomMemorySource).toBeTypeOf("function");
+    expect(domain.isRoomMemoryVersion).toBeTypeOf("function");
+    expect(domain.isRoomMemoryHealth).toBeTypeOf("function");
+    expect(domain.isRoomMemoryRawDeltaPage).toBeTypeOf("function");
+    expect(domain.isRoomMemoryRequest).toBeTypeOf("function");
+    expect(domain.isRoomMemoryProtocolFrame).toBeTypeOf("function");
+    expect(domain.isRoomMemoryRepairRecord).toBeTypeOf("function");
+  });
+});
 
 describe("room governance guards", () => {
   const governance = {

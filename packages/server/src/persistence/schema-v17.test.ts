@@ -259,16 +259,16 @@ function insertMessage(database: DatabaseSync, messageId: string, roomId = "atta
 }
 
 describe("authority SQLite v17 Attachment Authority", () => {
-  it("upgrades fresh and every immutable v1-v16 schema to v17 and restarts idempotently", () => {
+  it("upgrades fresh and every immutable v1-v16 schema through v17 and restarts idempotently", () => {
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(17);
-      expect(readSchemaVersion(database)).toBe(17);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(18);
+      expect(readSchemaVersion(database)).toBe(18);
       expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get())
-        .toEqual({ count: 17 });
+        .toEqual({ count: 18 });
       expect(() => migrateAuthorityDatabase(database)).not.toThrow();
       expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get())
-        .toEqual({ count: 17 });
+        .toEqual({ count: 18 });
     });
 
     for (let version = 1; version <= 16; version += 1) {
@@ -276,17 +276,17 @@ describe("authority SQLite v17 Attachment Authority", () => {
         migrateAuthorityDatabaseToHistoricalVersionForTest(database, version);
         expect(readSchemaVersion(database)).toBe(version);
         migrateAuthorityDatabase(database);
-        expect(readSchemaVersion(database)).toBe(17);
+        expect(readSchemaVersion(database)).toBe(18);
         expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get())
-          .toEqual({ count: 17 });
+          .toEqual({ count: 18 });
       });
     }
 
     withRestartedDatabase((database) => {
       expect(() => migrateAuthorityDatabase(database)).not.toThrow();
-      expect(readSchemaVersion(database)).toBe(17);
+      expect(readSchemaVersion(database)).toBe(18);
       expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get())
-        .toEqual({ count: 17 });
+        .toEqual({ count: 18 });
     });
   }, 60_000);
 
@@ -599,9 +599,9 @@ describe("authority SQLite v17 Attachment Authority", () => {
 
   it("refuses future and physically tampered v17 schemas", () => {
     withDatabase((database) => {
-      database.exec("PRAGMA user_version = 18");
+      database.exec("PRAGMA user_version = 19");
       expect(() => migrateAuthorityDatabase(database)).toThrow(/future schema/i);
-      expect(readSchemaVersion(database)).toBe(18);
+      expect(readSchemaVersion(database)).toBe(19);
     });
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
