@@ -836,7 +836,8 @@ describe("closed v2 recovery protocol", () => {
   it("routes only exact FT-05 Room Memory v1 requests", () => {
     const requests = [
       { type: "room.memory.query.v1", requestId: "memory-query", roomId: "room-1", limit: 50 },
-      { type: "room.memory.source.query.v1", requestId: "memory-source", roomId: "room-1", sourceId: "message:message-1" },
+      { type: "room.memory.source.query.v1", requestId: "memory-source", roomId: "room-1",
+        sourceKind: "message", sourceId: "message:message-1", sourceRevision: 1 },
       { type: "room.memory.context.dispute.v1", requestId: "memory-dispute", roomId: "room-1", memoryRecordId: "memory-1", expectedVersion: 1, reason: "Incorrect context" },
       { type: "room.memory.context.resolve.v1", requestId: "memory-resolve", roomId: "room-1", memoryRecordId: "memory-1", expectedVersion: 2, resolution: "re_evaluate", reason: "Recheck sources" },
       { type: "room.memory.status.query.v1", requestId: "memory-status", roomId: "room-1" },

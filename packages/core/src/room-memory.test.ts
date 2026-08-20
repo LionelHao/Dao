@@ -367,7 +367,9 @@ describe("FT-05 Room Memory Core contracts", () => {
         type: "room.memory.source.query.v1",
         requestId: "request-2",
         roomId: "room-1",
+        sourceKind: "message",
         sourceId: "message:message-1",
+        sourceRevision: 1,
       },
       {
         type: "room.memory.context.dispute.v1",

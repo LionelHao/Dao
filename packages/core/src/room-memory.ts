@@ -253,7 +253,9 @@ export type RoomMemorySourceQueryRequest = Omit<RoomMemoryPublicAuthorityForbidd
   type: "room.memory.source.query.v1";
   requestId: string;
   roomId: string;
+  sourceKind: RoomMemorySourceKind;
   sourceId: string;
+  sourceRevision: number;
 }>;
 
 export type RoomMemoryContextDisputeRequest =
@@ -1008,8 +1010,13 @@ export function isRoomMemoryRequest(value: unknown): value is RoomMemoryRequest 
         (value.kind === undefined || isRoomMemoryKind(value.kind)) &&
         (value.state === undefined || isVersionState(value.state));
     case "room.memory.source.query.v1":
-      return hasExactKeys(value, ["type", "requestId", "roomId", "sourceId"]) &&
-        isRequestBase(value) && isIdentifier(value.sourceId);
+      return hasExactKeys(value, [
+        "type", "requestId", "roomId", "sourceKind", "sourceId", "sourceRevision",
+      ]) && isRequestBase(value) && isRoomMemorySourceIdentity({
+        sourceKind: value.sourceKind,
+        sourceId: value.sourceId,
+        sourceRevision: value.sourceRevision,
+      });
     case "room.memory.context.dispute.v1":
       return hasExactKeys(value, [
         "type", "requestId", "roomId", "memoryRecordId", "expectedVersion", "reason",
