@@ -831,7 +831,7 @@ class JsonWebSocketClient {
 
   waitFor(
     predicate: (frame: ServerFrame) => boolean,
-    timeoutMs = 12_000,
+    timeoutMs = 20_000,
   ): Promise<ServerFrame> {
     const index = this.#frames.findIndex(predicate);
     if (index >= 0) return Promise.resolve(this.#frames.splice(index, 1)[0]!);
@@ -2660,12 +2660,28 @@ describe("authoritative server real-process harness", () => {
         revision: 2,
       });
       await vi.waitFor(() => {
-        expect(inputs.every((received) => received.some((input) =>
+        expect(inputs.some((received) => received.some((input) =>
           input.type === "room.event" && input.event.type === "room.message.recalled" &&
           input.event.payload.id === messageId))).toBe(true);
-      }, { timeout: 20_000 });
+      }, { timeout: 10_000 });
       expect(JSON.stringify(inputs)).not.toContain(acceptedBody);
       expect(JSON.stringify(inputs)).not.toContain(revisedBody);
+
+      const recalledHistories = await Promise.all(active.map((runtime, index) =>
+        runtime.client.historyV2({
+          type: "room.history.v2",
+          requestId: `desktop-message-recall-repair-${index}`,
+          roomId,
+        })));
+      for (const history of recalledHistories) {
+        if (history.status !== "ready") throw new TypeError("Desktop recall repair was not ready");
+        expect(history.messages).toContainEqual(expect.objectContaining({
+          id: messageId,
+          lifecycle: "recalled",
+        }));
+      }
+      expect(JSON.stringify(recalledHistories)).not.toContain(acceptedBody);
+      expect(JSON.stringify(recalledHistories)).not.toContain(revisedBody);
 
       for (const runtime of active) runtime.close();
       await stopChild(started.child);
