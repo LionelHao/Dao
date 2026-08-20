@@ -848,6 +848,59 @@ describe("authenticated message WebSocket service", () => {
     }
   });
 
+  it("keeps an established session installed across a transient authority authentication check", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "transient-authentication-check");
+    const sessionContext = {
+      sessionId: "transient-authentication-session",
+      sessionFamilyId: "transient-authentication-family",
+      principal,
+    };
+    let authenticateSessionCalls = 0;
+    const auth: AuthenticationService = {
+      async login() { return session; },
+      async authenticate() { return principal; },
+      async authenticateSession() {
+        authenticateSessionCalls += 1;
+        if (authenticateSessionCalls === 2) {
+          throw new AuthorityWorkerClientError(
+            "storage_unavailable",
+            "transient-authentication-secret",
+          );
+        }
+        return sessionContext;
+      },
+      async refresh() { return session; },
+      async revoke() {},
+      async listSessions() { return []; },
+      async revokeSession() {},
+    };
+    const server = await startMessageWebSocketServer({
+      auth,
+      service: idleMessageService(),
+      outboxStore: idleOutboxStore(),
+    });
+    const client = await LoopbackClient.connect(server.url);
+
+    try {
+      await client.login(humans[0], "transient-authentication-login");
+      client.send({ type: "auth.sessions.list", requestId: "transient-authentication-failure" });
+      const failed = await client.waitForError(
+        "storage_unavailable",
+        "transient-authentication-failure",
+      );
+      expect(failed.frame).toMatchObject({ status: 503 });
+      expect(JSON.stringify(failed.frame)).not.toContain("transient-authentication-secret");
+      await expect(client.listSessions("transient-authentication-retry")).resolves.toMatchObject({
+        frame: { type: "auth.sessions", sessions: [] },
+      });
+      expect(authenticateSessionCalls).toBe(3);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
   it("revokes a login committed after its socket closes while issuance is pending", async () => {
     const principal = { accountId: "account-human-1", actorId: humans[0].id };
     const session = issuedSession(principal, "closed-login-compensation");

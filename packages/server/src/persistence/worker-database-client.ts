@@ -314,8 +314,15 @@ type AuthorityWorkerClientLocalErrorCode =
   | "authority_worker_post_failed"
   | "authority_worker_protocol_error";
 
+type AuthorityWorkerClientPublicErrorCode = Exclude<
+  AuthorityWorkerErrorCode,
+  | "authority_operation_unavailable"
+  | "authority_storage_poisoned"
+  | "authority_storage_transient"
+>;
+
 export type AuthorityWorkerClientErrorCode =
-  | AuthorityWorkerErrorCode
+  | AuthorityWorkerClientPublicErrorCode
   | AuthorityWorkerClientLocalErrorCode;
 
 function authorityWorkerClientErrorStatus(
@@ -1848,6 +1855,26 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
     }
 
     if (message.type === "authority.error") {
+      if (
+        message.code === "authority_operation_unavailable" ||
+        message.code === "authority_storage_transient"
+      ) {
+        this.#pending.delete(message.requestId);
+        pending.reject(new AuthorityWorkerClientError(
+          "storage_unavailable",
+          message.code === "authority_storage_transient"
+            ? "Authority storage is temporarily unavailable"
+            : "Authority operation is temporarily unavailable",
+        ));
+        return;
+      }
+      if (message.code === "authority_storage_poisoned") {
+        this.#failTerminal(new AuthorityWorkerClientError(
+          "storage_unavailable",
+          "Authority storage became unavailable",
+        ));
+        return;
+      }
       const error = new AuthorityWorkerClientError(
         message.code,
         message.message,

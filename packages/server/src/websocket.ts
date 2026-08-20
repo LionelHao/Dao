@@ -1108,7 +1108,7 @@ async function authenticateCurrent(
       error.code === "session_revoked"
     ) {
       context.terminalRevocationPending = true;
-    } else {
+    } else if (normalizeServiceError(error)?.code !== "storage_unavailable") {
       clearAuthentication(
         context,
         credentialGeneration,

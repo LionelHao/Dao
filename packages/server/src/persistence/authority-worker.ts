@@ -104,6 +104,7 @@ import type {
   AttachmentDatabaseOperation,
   AttachmentDatabaseOperationResult,
 } from "../attachment-authority/database-contracts.js";
+import { isTransientSQLiteContention } from "./sqlite-contention.js";
 
 interface AuthorityWorkerData {
   readonly databasePath: string;
@@ -570,7 +571,7 @@ function poisonAuthorityStorage(requestId: string): void {
   }
   respondWithError(
     requestId,
-    "storage_unavailable",
+    "authority_storage_poisoned",
     "Authority storage became unavailable",
   );
   authorityPort.close();
@@ -582,6 +583,24 @@ function handleRollbackFatal(requestId: string, error: unknown): boolean {
   }
   poisonAuthorityStorage(requestId);
   return true;
+}
+
+function respondWithStorageFailure(
+  requestId: string,
+  error: unknown,
+  fallbackMessage: string,
+): void {
+  if (error instanceof AuthorityDatabaseError) {
+    respondWithError(requestId, error.code, error.message, error.details);
+    return;
+  }
+  respondWithError(
+    requestId,
+    isTransientSQLiteContention(error)
+      ? "authority_storage_transient"
+      : "authority_operation_unavailable",
+    fallbackMessage,
+  );
 }
 
 function stableId(...parts: readonly string[]): string {
@@ -664,15 +683,18 @@ function registerActors(request: AuthorityWorkerRequest): void {
     });
   } catch (error: unknown) {
     if (handleRollbackFatal(request.requestId, error)) return;
-    const code = error instanceof Error && error.message === "actor_conflict"
-      ? "actor_conflict"
-      : "storage_unavailable";
+    if (!(error instanceof Error) || error.message !== "actor_conflict") {
+      respondWithStorageFailure(
+        request.requestId,
+        error,
+        "Authority actor registration failed",
+      );
+      return;
+    }
     respondWithError(
       request.requestId,
-      code,
-      code === "actor_conflict"
-        ? "Authority actor registration conflicts with existing state"
-        : "Authority actor registration failed",
+      "actor_conflict",
+      "Authority actor registration conflicts with existing state",
     );
   }
 }
@@ -801,7 +823,15 @@ function issueSession(request: AuthorityWorkerRequest): void {
         ? "session_id_conflict"
         : error instanceof Error && error.message === "session_limit_reached"
           ? "session_limit_reached"
-        : "storage_unavailable";
+          : undefined;
+    if (code === undefined) {
+      respondWithStorageFailure(
+        request.requestId,
+        error,
+        "Authority session issuance failed",
+      );
+      return;
+    }
     respondWithError(
       request.requestId,
       code,
@@ -809,9 +839,7 @@ function issueSession(request: AuthorityWorkerRequest): void {
         ? "Session actor is forbidden"
         : code === "session_id_conflict"
           ? "Session identifier conflicts with existing state"
-          : code === "session_limit_reached"
-            ? "Active session family limit reached"
-          : "Authority session issuance failed",
+          : "Active session family limit reached",
     );
   }
 }
@@ -894,9 +922,9 @@ function authenticateSession(request: AuthorityWorkerRequest): void {
     });
   } catch (error: unknown) {
     if (handleRollbackFatal(request.requestId, error)) return;
-    respondWithError(
+    respondWithStorageFailure(
       request.requestId,
-      "storage_unavailable",
+      error,
       "Authority session authentication failed",
     );
   }
@@ -1194,9 +1222,9 @@ function validateSessionRefresh(request: AuthorityWorkerRequest): void {
     });
   } catch (error: unknown) {
     if (handleRollbackFatal(request.requestId, error)) return;
-    respondWithError(
+    respondWithStorageFailure(
       request.requestId,
-      "storage_unavailable",
+      error,
       "Authority refresh validation failed",
     );
   }
@@ -1308,9 +1336,9 @@ function rotateSession(request: AuthorityWorkerRequest): void {
     });
   } catch (error: unknown) {
     if (handleRollbackFatal(request.requestId, error)) return;
-    respondWithError(
+    respondWithStorageFailure(
       request.requestId,
-      "storage_unavailable",
+      error,
       "Authority session rotation failed",
     );
   }
@@ -1369,9 +1397,9 @@ function revokeSession(request: AuthorityWorkerRequest): void {
     respond({ type: "authority.session-revoked", requestId: request.requestId });
   } catch (error: unknown) {
     if (handleRollbackFatal(request.requestId, error)) return;
-    respondWithError(
+    respondWithStorageFailure(
       request.requestId,
-      "storage_unavailable",
+      error,
       "Authority session revoke failed",
     );
   }
@@ -1448,9 +1476,9 @@ function listSessions(request: AuthorityWorkerRequest): void {
     });
   } catch (error: unknown) {
     if (handleRollbackFatal(request.requestId, error)) return;
-    respondWithError(
+    respondWithStorageFailure(
       request.requestId,
-      "storage_unavailable",
+      error,
       "Authority session list failed",
     );
   }
@@ -1524,9 +1552,9 @@ function revokeTargetSession(request: AuthorityWorkerRequest): void {
     });
   } catch (error: unknown) {
     if (handleRollbackFatal(request.requestId, error)) return;
-    respondWithError(
+    respondWithStorageFailure(
       request.requestId,
-      "storage_unavailable",
+      error,
       "Authority targeted session revoke failed",
     );
   }
@@ -1541,7 +1569,7 @@ function respondRepairFailure(requestId: string, cause: unknown, fallbackMessage
     respondWithError(requestId, cause.code, cause.message);
     return;
   }
-  respondWithError(requestId, "storage_unavailable", fallbackMessage);
+  respondWithStorageFailure(requestId, cause, fallbackMessage);
 }
 
 function revalidateRepairLease(
@@ -1772,9 +1800,9 @@ function executeHuman(request: AuthorityWorkerRequest): void {
       respondWithError(request.requestId, error.code, error.message);
       return;
     }
-    respondWithError(
+    respondWithStorageFailure(
       request.requestId,
-      "storage_unavailable",
+      error,
       "Authority command validation failed",
     );
   }
@@ -1843,9 +1871,9 @@ function executeHumanGovernance(request: AuthorityWorkerRequest): void {
       respondWithError(request.requestId, error.code, error.message);
       return;
     }
-    respondWithError(
+    respondWithStorageFailure(
       request.requestId,
-      "storage_unavailable",
+      error,
       "Authority governance command validation failed",
     );
   }
@@ -1870,9 +1898,9 @@ function readDepartureConflicts(request: AuthorityWorkerRequest): void {
       respondWithError(request.requestId, error.code, error.message, error.details);
       return;
     }
-    respondWithError(
+    respondWithStorageFailure(
       request.requestId,
-      "storage_unavailable",
+      error,
       "Authority departure query validation failed",
     );
   }
@@ -1909,9 +1937,9 @@ function executeAgent(request: AuthorityWorkerRequest): void {
       respondWithError(request.requestId, error.code, error.message);
       return;
     }
-    respondWithError(
+    respondWithStorageFailure(
       request.requestId,
-      "storage_unavailable",
+      error,
       "Authority Agent command failed",
     );
   }
@@ -1931,7 +1959,7 @@ function respondMessageAuthorityFailure(
     respondWithError(requestId, error.code, error.message);
     return;
   }
-  respondWithError(requestId, "storage_unavailable", fallbackMessage);
+  respondWithStorageFailure(requestId, error, fallbackMessage);
 }
 
 function requireNoMessageRepairBarrier(roomId: string, now: number): void {
@@ -2087,7 +2115,7 @@ function executeAttachment(request: AuthorityWorkerRequest): void {
       respondWithError(request.requestId, error.code, error.message);
       return;
     }
-    respondWithError(request.requestId, "storage_unavailable", "Attachment authority failed");
+    respondWithStorageFailure(request.requestId, error, "Attachment authority failed");
   }
 }
 
@@ -2211,7 +2239,11 @@ function executeRuntime(request: AuthorityWorkerRequest): void {
       respondWithError(request.requestId, error.code, error.message);
       return;
     }
-    respondWithError(request.requestId, "storage_unavailable", "Authority runtime operation failed");
+    respondWithStorageFailure(
+      request.requestId,
+      error,
+      "Authority runtime operation failed",
+    );
   }
 }
 
@@ -2259,7 +2291,7 @@ function executeRoute(request: AuthorityWorkerRequest): void {
       respondWithError(request.requestId, error.code, error.message);
       return;
     }
-    respondWithError(request.requestId, "storage_unavailable", "Authority route operation failed");
+    respondWithStorageFailure(request.requestId, error, "Authority route operation failed");
   }
 }
 
@@ -2283,7 +2315,7 @@ function executeBall(request: AuthorityWorkerRequest): void {
       respondWithError(request.requestId, error.code, error.message);
       return;
     }
-    respondWithError(request.requestId, "storage_unavailable", "Authority ball operation failed");
+    respondWithStorageFailure(request.requestId, error, "Authority ball operation failed");
   }
 }
 
@@ -2315,7 +2347,7 @@ function executeMemory(request: AuthorityWorkerRequest): void {
       respondWithError(request.requestId, error.code, error.message);
       return;
     }
-    respondWithError(request.requestId, "storage_unavailable", "Authority memory operation failed");
+    respondWithStorageFailure(request.requestId, error, "Authority memory operation failed");
   }
 }
 
@@ -2340,7 +2372,7 @@ function readHistory(request: AuthorityWorkerRequest): void {
       respondWithError(request.requestId, error.code, error.message);
       return;
     }
-    respondWithError(request.requestId, "storage_unavailable", "Authority history query failed");
+    respondWithStorageFailure(request.requestId, error, "Authority history query failed");
   }
 }
 
@@ -2355,8 +2387,8 @@ function readActor(request: AuthorityWorkerRequest): void {
       requestId: request.requestId,
       ...(actor === undefined ? {} : { actor }),
     });
-  } catch {
-    respondWithError(request.requestId, "storage_unavailable", "Authority actor query failed");
+  } catch (error: unknown) {
+    respondWithStorageFailure(request.requestId, error, "Authority actor query failed");
   }
 }
 
@@ -2371,8 +2403,8 @@ function readRoom(request: AuthorityWorkerRequest): void {
       requestId: request.requestId,
       ...(room === undefined ? {} : { room }),
     });
-  } catch {
-    respondWithError(request.requestId, "storage_unavailable", "Authority room query failed");
+  } catch (error: unknown) {
+    respondWithStorageFailure(request.requestId, error, "Authority room query failed");
   }
 }
 
@@ -2390,7 +2422,7 @@ function readRoomGovernance(request: AuthorityWorkerRequest): void {
       respondWithError(request.requestId, error.code, error.message);
       return;
     }
-    respondWithError(request.requestId, "storage_unavailable", "Authority governance query failed");
+    respondWithStorageFailure(request.requestId, error, "Authority governance query failed");
   }
 }
 
@@ -2411,7 +2443,7 @@ function canAccessRoom(request: AuthorityWorkerRequest): void {
       respondWithError(request.requestId, error.code, "Authority room access query was rejected");
       return;
     }
-    respondWithError(request.requestId, "storage_unavailable", "Authority room access query failed");
+    respondWithStorageFailure(request.requestId, error, "Authority room access query failed");
   }
 }
 
@@ -2432,7 +2464,7 @@ function readRoomAudit(request: AuthorityWorkerRequest): void {
       respondWithError(request.requestId, error.code, "Authority room audit query was rejected");
       return;
     }
-    respondWithError(request.requestId, "storage_unavailable", "Authority room audit query failed");
+    respondWithStorageFailure(request.requestId, error, "Authority room audit query failed");
   }
 }
 
@@ -2452,7 +2484,7 @@ function listPendingOutbox(request: AuthorityWorkerRequest): void {
       respondWithError(request.requestId, error.code, error.message);
       return;
     }
-    respondWithError(request.requestId, "storage_unavailable", "Authority outbox query failed");
+    respondWithStorageFailure(request.requestId, error, "Authority outbox query failed");
   }
 }
 
@@ -2472,10 +2504,10 @@ function authorizeOutboxCandidate(request: AuthorityWorkerRequest): void {
       requestId: request.requestId,
       authorized,
     });
-  } catch {
-    respondWithError(
+  } catch (error: unknown) {
+    respondWithStorageFailure(
       request.requestId,
-      "storage_unavailable",
+      error,
       "Authority outbox authorization failed",
     );
   }
@@ -2492,8 +2524,8 @@ function markOutboxDispatched(request: AuthorityWorkerRequest): void {
       request.now,
     );
     respond({ type: "authority.outbox-updated", requestId: request.requestId });
-  } catch {
-    respondWithError(request.requestId, "storage_unavailable", "Authority outbox update failed");
+  } catch (error: unknown) {
+    respondWithStorageFailure(request.requestId, error, "Authority outbox update failed");
   }
 }
 
@@ -2508,8 +2540,8 @@ function markOutboxFailed(request: AuthorityWorkerRequest): void {
       request.reason,
     );
     respond({ type: "authority.outbox-updated", requestId: request.requestId });
-  } catch {
-    respondWithError(request.requestId, "storage_unavailable", "Authority outbox update failed");
+  } catch (error: unknown) {
+    respondWithStorageFailure(request.requestId, error, "Authority outbox update failed");
   }
 }
 
@@ -2532,9 +2564,9 @@ function listRoomCacheInvalidations(request: AuthorityWorkerRequest): void {
       respondWithError(request.requestId, error.code, error.message);
       return;
     }
-    respondWithError(
+    respondWithStorageFailure(
       request.requestId,
-      "storage_unavailable",
+      error,
       "Authority room cache invalidation query failed",
     );
   }
@@ -2553,10 +2585,10 @@ function markRoomCacheInvalidationCompleted(request: AuthorityWorkerRequest): vo
       type: "authority.room-cache-invalidation-updated",
       requestId: request.requestId,
     });
-  } catch {
-    respondWithError(
+  } catch (error: unknown) {
+    respondWithStorageFailure(
       request.requestId,
-      "storage_unavailable",
+      error,
       "Authority room cache invalidation update failed",
     );
   }
@@ -2576,10 +2608,10 @@ function markRoomCacheInvalidationFailed(request: AuthorityWorkerRequest): void 
       type: "authority.room-cache-invalidation-updated",
       requestId: request.requestId,
     });
-  } catch {
-    respondWithError(
+  } catch (error: unknown) {
+    respondWithStorageFailure(
       request.requestId,
-      "storage_unavailable",
+      error,
       "Authority room cache invalidation update failed",
     );
   }
@@ -2603,7 +2635,7 @@ function syncRoom(request: AuthorityWorkerRequest): void {
       respondWithError(request.requestId, error.code, error.message);
       return;
     }
-    respondWithError(request.requestId, "storage_unavailable", "Authority room sync failed");
+    respondWithStorageFailure(request.requestId, error, "Authority room sync failed");
   }
 }
 
@@ -2624,9 +2656,9 @@ function revalidateSnapshot(request: AuthorityWorkerRequest): void {
       respondWithError(request.requestId, error.code, error.message);
       return;
     }
-    respondWithError(
+    respondWithStorageFailure(
       request.requestId,
-      "storage_unavailable",
+      error,
       "Authority snapshot revalidation failed",
     );
   }
@@ -2654,9 +2686,9 @@ function compactRoomStream(request: AuthorityWorkerRequest): void {
       respondWithError(request.requestId, error.code, error.message);
       return;
     }
-    respondWithError(
+    respondWithStorageFailure(
       request.requestId,
-      "storage_unavailable",
+      error,
       "Authority room stream compaction failed",
     );
   }
