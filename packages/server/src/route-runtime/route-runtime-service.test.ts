@@ -12,6 +12,7 @@ import type {
 } from "./contracts.js";
 import { RouteRuntimeError } from "./contracts.js";
 import { createRouteRuntimeService } from "./route-runtime-service.js";
+import type { MemoryRuntimeReadiness } from "../room-memory/runtime-readiness.js";
 
 function routeJob(sourceMessageId: string, roomId: string, attempt: 1 | 2 | 3 = 1): RouteJob {
   return {
@@ -61,14 +62,34 @@ function claim(job: RouteJob): RouteAuthorityClaim {
   };
 }
 
-function fakeAuthority(jobs: readonly RouteJob[]) {
+function readiness(status: MemoryRuntimeReadiness["status"]): MemoryRuntimeReadiness {
+  return {
+    status,
+    memoryWatermark: status === "healthy" ? 12 : 10,
+    corpusHead: 12,
+    rawDeltaComplete: status !== "failed",
+    injectableSnapshotReadable: status !== "failed",
+  };
+}
+
+const healthyMemoryReadiness = Object.freeze({
+  async read(): Promise<MemoryRuntimeReadiness> {
+    return readiness("healthy");
+  },
+});
+
+function fakeAuthority(
+  jobs: readonly RouteJob[],
+  claimFactory: (job: RouteJob) => RouteAuthorityClaim = claim,
+) {
   const bySource = new Map(jobs.map((job) => [job.sourceMessageId, job]));
   const completed: { readonly job: RouteJob; readonly terminal?: string; readonly intents: readonly RouteInvocationIntent[] }[] = [];
+  const failed: { readonly job: RouteJob; readonly code: string }[] = [];
   const authority: RouteAuthority = {
     async claim(sourceMessageId) {
       const job = bySource.get(sourceMessageId);
       if (job === undefined) throw new Error("missing job");
-      return claim(job);
+      return claimFactory(job);
     },
     async complete(job, _judgments, intents, terminalErrorCode) {
       const terminal = terminalErrorCode === undefined
@@ -78,7 +99,8 @@ function fakeAuthority(jobs: readonly RouteJob[]) {
       bySource.delete(job.sourceMessageId);
       return { job: terminal, intents };
     },
-    async fail(job) {
+    async fail(job, errorCode) {
+      failed.push({ job, code: errorCode });
       const retryAfterMs = job.currentAttempt === 1 ? 250 : 1_000;
       const next = { ...job, status: "queued" as const, currentAttempt: (job.currentAttempt + 1) as 2 | 3 };
       bySource.set(job.sourceMessageId, next);
@@ -88,7 +110,7 @@ function fakeAuthority(jobs: readonly RouteJob[]) {
       return [...bySource.values()];
     },
   };
-  return { authority, completed };
+  return { authority, completed, failed };
 }
 
 afterEach(() => {
@@ -96,6 +118,160 @@ afterEach(() => {
 });
 
 describe("bounded single-route runtime", () => {
+  it.each(["catching_up", "noauth", "degraded", "failed"] as const)(
+    "claims then gates %s semantic routing with zero Provider/retry calls",
+    async (status) => {
+      const order: string[] = [];
+      const base = routeJob(`message-${status}`, `room-${status}`);
+      const fixture = fakeAuthority([base], (job) => {
+        order.push("claim");
+        const claimed = claim(job);
+        return {
+          ...claimed,
+          providerInput: {
+            ...claimed.providerInput,
+            message: { ...claimed.providerInput.message, authorKind: "agent" as const },
+          },
+          decisionContext: {
+            ...claimed.decisionContext,
+            structuredHelpAgentIds: ["agent-active"],
+          },
+        };
+      });
+      let providerCalls = 0;
+      const invoked: RouteInvocationIntent[] = [];
+      const runtime = createRouteRuntimeService({
+        authority: fixture.authority,
+        memoryReadiness: {
+          async read(roomId) {
+            order.push(`memory:${roomId}`);
+            return readiness(status);
+          },
+        },
+        provider: {
+          async decide() {
+            providerCalls += 1;
+            order.push("provider");
+            return { candidates: [] };
+          },
+        },
+        invoke: async (_routeJobId, intent) => { invoked.push(intent); },
+      });
+
+      expect(runtime.notify(base.roomId, base.sourceMessageId)).toBe(true);
+      await runtime.whenIdle();
+
+      expect(order).toEqual(["claim", `memory:${base.roomId}`]);
+      expect(providerCalls).toBe(0);
+      expect(fixture.failed).toEqual([]);
+      expect(fixture.completed).toHaveLength(1);
+      expect(fixture.completed[0]?.terminal).toBeUndefined();
+      expect(invoked.map((intent) => intent.reasonCode))
+        .toEqual(["direct_mention", "structured_help"]);
+      await runtime.close();
+    },
+  );
+
+  it("calls the Provider after claim only when semantic memory readiness is healthy", async () => {
+    const order: string[] = [];
+    const base = routeJob("message-healthy", "room-healthy");
+    const fixture = fakeAuthority([base], (job) => {
+      order.push("claim");
+      return claim(job);
+    });
+    const runtime = createRouteRuntimeService({
+      authority: fixture.authority,
+      memoryReadiness: {
+        async read(roomId) {
+          order.push(`memory:${roomId}`);
+          return readiness("healthy");
+        },
+      },
+      provider: {
+        async decide() {
+          order.push("provider");
+          return { candidates: [] };
+        },
+      },
+      invoke: async () => undefined,
+    });
+
+    runtime.notify(base.roomId, base.sourceMessageId);
+    await runtime.whenIdle();
+
+    expect(order).toEqual(["claim", `memory:${base.roomId}`, "provider"]);
+    expect(fixture.failed).toEqual([]);
+    expect(fixture.completed).toHaveLength(1);
+    await runtime.close();
+  });
+
+  it("fails a broken readiness seam closed without manufacturing Provider failure", async () => {
+    const base = routeJob("message-readiness-error", "room-readiness-error");
+    const fixture = fakeAuthority([base]);
+    const diagnostic = new Error("readiness unavailable");
+    const errors: unknown[] = [];
+    let providerCalls = 0;
+    const runtime = createRouteRuntimeService({
+      authority: fixture.authority,
+      memoryReadiness: { async read() { throw diagnostic; } },
+      provider: {
+        async decide() {
+          providerCalls += 1;
+          return { candidates: [] };
+        },
+      },
+      invoke: async () => undefined,
+      onError: (error) => { errors.push(error); },
+    });
+
+    runtime.notify(base.roomId, base.sourceMessageId);
+    await runtime.whenIdle();
+
+    expect(providerCalls).toBe(0);
+    expect(fixture.failed).toEqual([]);
+    expect(fixture.completed).toHaveLength(1);
+    expect(fixture.completed[0]?.terminal).toBeUndefined();
+    expect(errors).toEqual([diagnostic]);
+    await runtime.close();
+  });
+
+  it("does not let the semantic gate suppress an existing deterministic Ball intent", async () => {
+    const base = routeJob("message-ball", "room-ball");
+    const fixture = fakeAuthority([base], (job) => {
+      const claimed = claim(job);
+      return {
+        ...claimed,
+        providerInput: {
+          ...claimed.providerInput,
+          agents: claimed.providerInput.agents.map((agent) =>
+            agent.agentId === "agent-active" ? { ...agent, hasBall: true } : agent),
+        },
+      };
+    });
+    const invoked: RouteInvocationIntent[] = [];
+    let providerCalls = 0;
+    const runtime = createRouteRuntimeService({
+      authority: fixture.authority,
+      memoryReadiness: { async read() { return readiness("noauth"); } },
+      provider: {
+        async decide() {
+          providerCalls += 1;
+          return { candidates: [] };
+        },
+      },
+      invoke: async (_routeJobId, intent) => { invoked.push(intent); },
+    });
+
+    runtime.notify(base.roomId, base.sourceMessageId);
+    await runtime.whenIdle();
+
+    expect(providerCalls).toBe(0);
+    expect(invoked.map((intent) => intent.reasonCode))
+      .toEqual(["direct_mention", "ball_due"]);
+    expect(fixture.failed).toEqual([]);
+    await runtime.close();
+  });
+
   it("passes only the closed summary input and invokes merged mandatory/provider intents once", async () => {
     const fixture = fakeAuthority([routeJob("message-1", "room-1")]);
     const inputs: RouterProviderInput[] = [];
@@ -111,6 +287,7 @@ describe("bounded single-route runtime", () => {
     const invoked: RouteInvocationIntent[] = [];
     const runtime = createRouteRuntimeService({
       authority: fixture.authority,
+      memoryReadiness: healthyMemoryReadiness,
       provider,
       invoke: async (_routeJobId, intent) => { invoked.push(intent); },
     });
@@ -142,6 +319,7 @@ describe("bounded single-route runtime", () => {
     };
     const runtime = createRouteRuntimeService({
       authority: fixture.authority,
+      memoryReadiness: healthyMemoryReadiness,
       provider,
       invoke: async () => undefined,
       maxActiveRooms: 8,
@@ -164,6 +342,7 @@ describe("bounded single-route runtime", () => {
     let calls = 0;
     const runtime = createRouteRuntimeService({
       authority: fixture.authority,
+      memoryReadiness: healthyMemoryReadiness,
       provider: { async decide() { calls += 1; return { candidates: [], extra: true } as never; } },
       invoke: async () => undefined,
     });
@@ -191,6 +370,7 @@ describe("bounded single-route runtime", () => {
     let calls = 0;
     const runtime = createRouteRuntimeService({
       authority: fixture.authority,
+      memoryReadiness: healthyMemoryReadiness,
       provider: {
         async decide(_input, signal) {
           calls += 1;
@@ -227,6 +407,7 @@ describe("bounded single-route runtime", () => {
     };
     const runtime = createRouteRuntimeService({
       authority,
+      memoryReadiness: healthyMemoryReadiness,
       provider: { async decide() { return { candidates: [] }; } },
       invoke: async () => undefined,
       maxQueuedPerRoom: 2,
@@ -251,6 +432,7 @@ describe("bounded single-route runtime", () => {
     let calls = 0;
     const runtime = createRouteRuntimeService({
       authority: fixture.authority,
+      memoryReadiness: healthyMemoryReadiness,
       provider: { async decide() { calls += 1; return { candidates: [] }; } },
       invoke: async () => undefined,
     });
