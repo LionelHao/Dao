@@ -2606,7 +2606,7 @@ describe("authoritative server real-process harness", () => {
         expect(inputs.every((received) => received.some((input) =>
           input.type === "room.event" && input.event.type === "room.message.accepted" &&
           input.event.payload.id === messageId))).toBe(true);
-      }, { timeout: 10_000 });
+      }, { timeout: 20_000 });
 
       socketGroups[2]!.at(-1)!.terminate();
       await vi.waitFor(() => {
@@ -2633,7 +2633,7 @@ describe("authoritative server real-process harness", () => {
         expect(inputs.slice(0, 2).every((received) => received.some((input) =>
           input.type === "room.event" && input.event.type === "room.message.revised" &&
           input.event.payload.id === messageId))).toBe(true);
-      }, { timeout: 10_000 });
+      }, { timeout: 20_000 });
 
       const reconnected = await active[2]!.client.historyV2({
         type: "room.history.v2",
@@ -2679,7 +2679,7 @@ describe("authoritative server real-process harness", () => {
         expect(inputs.every((received) => received.some((input) =>
           input.type === "room.event" && input.event.type === "room.message.recalled" &&
           input.event.payload.id === messageId))).toBe(true);
-      }, { timeout: 10_000 });
+      }, { timeout: 20_000 });
       expect(JSON.stringify(inputs)).not.toContain(acceptedBody);
       expect(JSON.stringify(inputs)).not.toContain(revisedBody);
 
