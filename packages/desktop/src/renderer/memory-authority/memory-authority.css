@@ -1,0 +1,130 @@
+.room-authority-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(18rem, 24rem);
+  gap: 1rem;
+  width: 100%;
+  min-height: 100%;
+  align-items: start;
+}
+
+.room-authority-workspace__timeline,
+.room-authority-workspace__memory {
+  min-width: 0;
+}
+
+.room-authority-workspace__memory {
+  position: sticky;
+  top: 1rem;
+  max-height: calc(100vh - 2rem);
+  overflow: auto;
+}
+
+.memory-authority-panel {
+  box-sizing: border-box;
+  display: grid;
+  gap: .75rem;
+  padding: 1rem;
+  color: #172033;
+  background: #f8fafc;
+  border: 1px solid #cbd5e1;
+  border-radius: .875rem;
+}
+
+.memory-authority-panel *,
+.memory-authority-panel *::before,
+.memory-authority-panel *::after {
+  box-sizing: border-box;
+}
+
+.memory-authority-panel :focus-visible {
+  outline: 3px solid #1d4ed8;
+  outline-offset: 3px;
+}
+
+.memory-authority-panel h2,
+.memory-authority-panel h3,
+.memory-authority-panel p {
+  margin: 0;
+}
+
+.memory-card-list,
+.memory-sources {
+  display: grid;
+  gap: .625rem;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+
+.memory-card {
+  display: grid;
+  gap: .5rem;
+  padding: .875rem;
+  background: #fff;
+  border: 1px solid #d8dee9;
+  border-radius: .75rem;
+}
+
+.memory-card button,
+.memory-authority-panel > button,
+.memory-dialog button {
+  min-height: 2.75rem;
+  padding: .625rem .875rem;
+  color: #172033;
+  background: #fff;
+  border: 1px solid #94a3b8;
+  border-radius: .5rem;
+  font: inherit;
+  cursor: pointer;
+}
+
+.memory-card button:disabled,
+.memory-authority-panel > button:disabled {
+  color: #64748b;
+  cursor: not-allowed;
+  background: #eef2f7;
+}
+
+.memory-dialog {
+  position: fixed;
+  z-index: 20;
+  inset: 50% auto auto 50%;
+  display: grid;
+  gap: .75rem;
+  width: min(28rem, calc(100vw - 2rem));
+  padding: 1rem;
+  background: #fff;
+  border: 2px solid #334155;
+  border-radius: .875rem;
+  box-shadow: 0 1rem 3rem rgb(15 23 42 / 24%);
+  transform: translate(-50%, -50%);
+}
+
+.memory-dialog textarea {
+  width: 100%;
+  min-height: 7rem;
+  padding: .75rem;
+  font: inherit;
+}
+
+@media (max-width: 840px) {
+  .room-authority-workspace {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .room-authority-workspace__memory {
+    position: static;
+    max-height: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .memory-authority-panel *,
+  .memory-authority-panel *::before,
+  .memory-authority-panel *::after {
+    scroll-behavior: auto !important;
+    transition-duration: .001ms !important;
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

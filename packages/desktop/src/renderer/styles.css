@@ -1,4 +1,5 @@
 @import "./message-authority/message-authority.css";
+@import "./memory-authority/memory-authority.css";
 @import "./attachment-authority/attachment-authority.css";
 
 :root {

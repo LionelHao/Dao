@@ -3,12 +3,14 @@ import type { IdentityBridge } from "../identity/contracts.js";
 import type { GovernanceBridge } from "../governance/contracts.js";
 import type { MessageAuthorityBridge } from "../message-authority/contracts.js";
 import type { AttachmentAuthorityBridge } from "../attachment-authority/contracts.js";
+import type { MemoryAuthorityBridge } from "../memory-authority/contracts.js";
 import { mountDesktopRendererEntry } from "./entry.js";
 
 const bridge = {} as IdentityBridge;
 const governance = {} as GovernanceBridge;
 const messageAuthority = {} as MessageAuthorityBridge;
 const attachmentAuthority = {} as AttachmentAuthorityBridge;
+const memoryAuthority = {} as MemoryAuthorityBridge;
 
 function ports() {
   return {
@@ -18,6 +20,7 @@ function ports() {
     mountIdentityApp: vi.fn(() => vi.fn()),
     mountGovernanceSurface: vi.fn(() => vi.fn()),
     mountMessageAuthoritySurface: vi.fn(() => vi.fn()),
+    mountMemoryAuthoritySurface: vi.fn(() => vi.fn()),
   };
 }
 
@@ -138,6 +141,30 @@ describe("Desktop renderer route entry", () => {
     );
   });
 
+  it("mounts Memory Authority in the current Room right rail without blocking chat", () => {
+    const root = document.createElement("main");
+    const renderers = ports();
+    const disposeMessage = vi.fn();
+    const disposeMemory = vi.fn();
+    renderers.mountMessageAuthoritySurface.mockReturnValue(disposeMessage);
+    renderers.mountMemoryAuthoritySurface.mockReturnValue(disposeMemory);
+    const dispose = mountDesktopRendererEntry(
+      root, "?message-room=room-1", bridge, governance, messageAuthority, renderers,
+      undefined, memoryAuthority,
+    );
+    const timeline = root.querySelector<HTMLElement>(".room-authority-workspace__timeline")!;
+    const memory = root.querySelector<HTMLElement>(".room-authority-workspace__memory")!;
+    expect(renderers.mountMessageAuthoritySurface).toHaveBeenCalledWith(
+      timeline, messageAuthority, "room-1",
+    );
+    expect(renderers.mountMemoryAuthoritySurface).toHaveBeenCalledWith(
+      memory, memoryAuthority, "room-1",
+    );
+    dispose?.();
+    expect(disposeMemory).toHaveBeenCalledOnce();
+    expect(disposeMessage).toHaveBeenCalledOnce();
+  });
+
   it.each([
     "?message-room=", "?message-room=%20room", "?message-room=room-1&extra=true",
     "?message-room=room-1&message-room=room-2",
@@ -165,6 +192,7 @@ describe("Desktop renderer route entry", () => {
     expect(source).toContain("window.dao?.governance");
     expect(source).toContain("window.dao?.messageAuthority");
     expect(source).toContain("window.dao?.attachmentAuthority");
+    expect(source).toContain("window.dao?.memoryAuthority");
     expect(source).toContain("mountDesktopRendererEntry");
     expect(source).not.toMatch(/WebSocket|accessToken|ipcRenderer/u);
   });

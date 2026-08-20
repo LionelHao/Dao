@@ -22,7 +22,7 @@ describe("Desktop preload entry", () => {
     const [name, value] = exposeInMainWorld.mock.calls[0] as [string, unknown];
     expect(name).toBe("dao");
     expect(Object.keys(value as object)).toEqual([
-      "identity", "governance", "messageAuthority", "attachmentAuthority",
+      "identity", "governance", "messageAuthority", "attachmentAuthority", "memoryAuthority",
     ]);
     expect(Object.isFrozen(value)).toBe(true);
     expect(Object.keys((value as { identity: object }).identity).sort()).toEqual([
@@ -42,6 +42,9 @@ describe("Desktop preload entry", () => {
     expect(Object.keys((value as { attachmentAuthority: object }).attachmentAuthority).sort()).toEqual([
       "cancel", "download", "onAuthorityInput", "preview", "removeSelection",
       "retryProcessing", "select", "status", "upload",
+    ]);
+    expect(Object.keys((value as { memoryAuthority: object }).memoryAuthority).sort()).toEqual([
+      "context", "onAuthorityInput", "request",
     ]);
     expect(JSON.stringify(value)).not.toMatch(/token|secret|idempotency|ipcRenderer|shell|filesystem|websocket/iu);
   });
