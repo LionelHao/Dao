@@ -590,11 +590,15 @@ function respondWithStorageFailure(
   error: unknown,
   fallbackMessage: string,
 ): void {
+  if (error instanceof AuthorityDatabaseError) {
+    respondWithError(requestId, error.code, error.message, error.details);
+    return;
+  }
   respondWithError(
     requestId,
     isTransientSQLiteContention(error)
       ? "authority_storage_transient"
-      : "storage_unavailable",
+      : "authority_operation_unavailable",
     fallbackMessage,
   );
 }

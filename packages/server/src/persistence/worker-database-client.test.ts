@@ -221,7 +221,7 @@ class MessageErrorTransport extends EventEmitter implements AuthorityWorkerTrans
 }
 
 class OperationStorageProbeTransport extends EventEmitter implements AuthorityWorkerTransport {
-  #failedInspection = false;
+  #failedInspections = 0;
 
   postMessage(request: AuthorityWorkerRequest): void {
     if (request.type === "authority.initialize") {
@@ -240,12 +240,15 @@ class OperationStorageProbeTransport extends EventEmitter implements AuthorityWo
       return;
     }
     if (request.type !== "authority.inspect-schema") throw new Error("unexpected request");
-    if (!this.#failedInspection) {
-      this.#failedInspection = true;
+    if (this.#failedInspections < 2) {
+      const code = this.#failedInspections === 0
+        ? "authority_storage_transient" as const
+        : "authority_operation_unavailable" as const;
+      this.#failedInspections += 1;
       queueMicrotask(() => this.emit("message", {
         type: "authority.error",
         requestId: request.requestId,
-        code: "authority_storage_transient",
+        code,
         message: "Authority database inspection failed",
       } satisfies AuthorityWorkerResponse));
       return;
@@ -1383,6 +1386,10 @@ describe("authority database coordinator registry", () => {
       () => transport,
     ));
 
+    await expect(client.inspectSchema()).rejects.toMatchObject({
+      code: "storage_unavailable",
+      status: 503,
+    });
     await expect(client.inspectSchema()).rejects.toMatchObject({
       code: "storage_unavailable",
       status: 503,
