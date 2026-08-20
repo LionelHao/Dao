@@ -249,7 +249,7 @@ export type RoomMemoryQueryRequest = RoomMemoryPublicAuthorityForbidden & Readon
   state?: RoomMemoryVersionState;
 }>;
 
-export type RoomMemorySourceQueryRequest = RoomMemoryPublicAuthorityForbidden & Readonly<{
+export type RoomMemorySourceQueryRequest = Omit<RoomMemoryPublicAuthorityForbidden, "sourceRevision"> & Readonly<{
   type: "room.memory.source.query.v1";
   requestId: string;
   roomId: string;

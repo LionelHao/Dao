@@ -108,9 +108,9 @@ import {
   MemoryCorpusDatabaseError,
   readMemoryCorpusSource,
   registerMemoryCorpusSource,
-  transitionMemoryCorpusSource,
   type MemoryCorpusSourceIdentity,
 } from "../room-memory/corpus-database-authority.js";
+import { invalidateRoomMemorySource } from "../room-memory/database-authority.js";
 import {
   readOperationalMessageAuthorityEvent,
   readOperationalTimelineMessage,
@@ -7548,16 +7548,41 @@ function transitionExistingMemorySource(
   roomId: string,
   identity: MemoryCorpusLocalIdentity,
   eligibility: "excluded_recalled" | "excluded_revised",
+  actorId: string,
   occurredAt: string,
 ): void {
   if (readMemoryCorpusSource(database, { roomId, ...identity }) === undefined) return;
-  commitMemoryCorpusMutation(() => transitionMemoryCorpusSource(database, {
+  const invalidated = commitMemoryCorpusMutation(() => invalidateRoomMemorySource(database, {
     roomId,
     ...identity,
     eligibility,
     availability: "metadata_only",
     occurredAt,
   }));
+  const watermark = database.prepare(
+    "SELECT memory_watermark AS memoryWatermark FROM room_memory_stewards WHERE room_id = ?",
+  ).get(roomId)?.memoryWatermark;
+  if (typeof watermark !== "number") return fail("storage_unavailable", "Room memory watermark was corrupt");
+  for (const projection of invalidated.projections) {
+    const version = projection.currentVersion;
+    const eventId = stableId("room-memory-version", version.memoryVersionId);
+    const streamSeq = appendRoomEvent(database, {
+      eventId,
+      roomId,
+      actorId,
+      eventType: "room.memory.version.changed",
+      occurredAt,
+      payload: {
+        memoryRecordId: projection.memoryRecordId,
+        memoryVersionId: version.memoryVersionId,
+        kind: projection.kind,
+        state: version.state,
+        sourceIds: version.sourceRefs.map((source) => source.sourceId),
+        memoryWatermark: watermark,
+      },
+    });
+    appendRoomOutbox(database, eventId, roomId, streamSeq, occurredAt, "room-memory", version.memoryVersionId);
+  }
 }
 
 function registerMessageTombstoneMemorySource(
@@ -8042,6 +8067,7 @@ export function reviseHumanMessageDatabaseCommand(
           input.command.roomId,
           messageMemorySourceIdentity(input.command.messageId, input.command.expectedRevision),
           "excluded_revised",
+          actorId,
           persistedAt,
         );
         registerMessageMemorySource(database, {
@@ -8296,6 +8322,7 @@ export function recallHumanMessageDatabaseCommand(
           input.command.roomId,
           messageMemorySourceIdentity(input.command.messageId, input.command.expectedRevision),
           "excluded_recalled",
+          actorId,
           recalledAt,
         );
         for (const attachment of linkedAttachments) {
@@ -8303,7 +8330,7 @@ export function recallHumanMessageDatabaseCommand(
             sourceKind: "attachment_extraction",
             sourceId: `attachment-extraction:${String(attachment.attachmentId)}`,
             sourceRevision: attachment.generation as number,
-          }, "excluded_recalled", recalledAt);
+          }, "excluded_recalled", actorId, recalledAt);
         }
         registerMessageTombstoneMemorySource(database, {
           roomId: input.command.roomId,

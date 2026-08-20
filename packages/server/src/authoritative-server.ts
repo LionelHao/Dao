@@ -62,6 +62,13 @@ import {
   type ProductionClamdPolicy,
 } from "./attachment-authority/production-capabilities.js";
 import type { ClamdEndpoint } from "./attachment-authority/clamd-scanner.js";
+import { createWorkerMemoryAuthority } from "./room-memory/worker-memory-authority.js";
+import { createOpenAIMemoryStewardProvider } from "./room-memory/openai-memory-provider.js";
+import { createMemoryStewardProviderAdapter } from "./room-memory/steward-provider-adapter.js";
+import {
+  createMemoryStewardRuntime,
+  type MemoryStewardRuntime,
+} from "./room-memory/memory-steward-runtime.js";
 
 export { createProductionSharedAuthorityParticipantComposition } from "./room-governance/production-participant-composition.js";
 
@@ -137,6 +144,7 @@ interface AuthoritativeServerTestOptions {
     | "transport"
     | "attachment-authority"
     | "attachment-processing"
+    | "memory"
     | "route"
     | "runtime"
     | "ball"
@@ -205,6 +213,9 @@ async function start(
   let attachmentAuthority: AttachmentAuthorityCommandPort | undefined;
   let attachmentProcessing: AttachmentProcessingRuntime | undefined;
   let stopAttachmentRecovery: (() => void) | undefined;
+  let attachmentObjectStore: AttachmentObjectStore | undefined;
+  let memoryRuntime: MemoryStewardRuntime | undefined;
+  let stopMemoryRecovery: (() => void) | undefined;
   try {
     worker = transactionFault === undefined
       ? await createWorkerDatabaseClient({
@@ -244,6 +255,7 @@ async function start(
           }
           ballRuntime?.track(command.roomId);
           void ballRuntime?.scan(command.roomId).catch(() => undefined);
+          memoryRuntime?.enqueue(command.roomId);
         } catch {
           // The committed ACK remains authoritative; normal recovery performs a bounded rescan.
         }
@@ -338,6 +350,7 @@ async function start(
             const acknowledgement = await authority.executeHuman(context, command);
             if (command.type === "message.send") {
               await humanPreemptionRuntime?.handle(acknowledgement.aggregateId);
+              memoryRuntime?.enqueue(command.roomId);
             }
             if (command.type === "open-item.create" || command.type === "open-item.transition" ||
                 command.type === "light-task.create" || command.type === "light-task.transition" ||
@@ -357,6 +370,7 @@ async function start(
           const acknowledgement = await authority.executeAgent(context, command);
           if (command.type === "message.send") {
             routeRuntime?.notify(command.roomId, acknowledgement.aggregateId);
+            memoryRuntime?.enqueue(command.roomId);
           }
           if (command.type.startsWith("open-item.")) {
             ballRuntime?.track(command.roomId);
@@ -394,6 +408,7 @@ async function start(
     await testOptions.initialize?.({ auth, lifecycle, messages: service, primitives });
     const runtimeConfiguration = options.agentRuntime ?? {};
     const secretProvider = createEnvironmentSecretProvider();
+    const memoryAuthority = createWorkerMemoryAuthority({ worker, nowMs: Date.now });
     const provider = testOptions.agentRuntimeProviderForTest ?? createOpenAIResponsesProvider({
       endpoint: runtimeConfiguration.endpoint ?? "https://api.openai.com/v1/responses",
       model: runtimeConfiguration.model ?? "gpt-5-mini",
@@ -453,6 +468,7 @@ async function start(
       onMessageCommitted(execution) {
         if (execution.resultMessageId !== undefined) {
           routeRuntime?.notify(execution.roomId, execution.resultMessageId);
+          memoryRuntime?.enqueue(execution.roomId);
         }
       },
       async proposeOpenItem(input) {
@@ -503,6 +519,7 @@ async function start(
     routeRuntime = createRouteRuntimeService({
       authority: routeAuthority,
       provider: routerProvider,
+      memoryReadiness: { read: memoryAuthority.readReadiness },
       async invoke(routeJobId, intent) {
         const runtimeIntent = {
           kind: intent.kind,
@@ -554,6 +571,7 @@ async function start(
     const messageAuthority = {
       async submitHumanMessage(...args: Parameters<typeof authority.submitHumanMessage>) {
         const receipt = await authority.submitHumanMessage(...args);
+        memoryRuntime?.enqueue(args[1].roomId);
         return {
           messageId: receipt.messageId,
           persistedAt: receipt.persistedAt,
@@ -562,6 +580,7 @@ async function start(
       },
       async reviseHumanMessage(...args: Parameters<typeof authority.reviseHumanMessage>) {
         const receipt = await authority.reviseHumanMessage(...args);
+        memoryRuntime?.enqueue(args[1].roomId);
         return {
           messageId: receipt.messageId,
           revision: receipt.revision,
@@ -576,6 +595,7 @@ async function start(
             cancellations: committed.abortTargets,
           }),
         );
+        memoryRuntime?.enqueue(args[1].roomId);
         return {
           messageId: receipt.messageId,
           revision: receipt.revision,
@@ -614,6 +634,7 @@ async function start(
           },
         });
         await objectStore.initialize();
+        attachmentObjectStore = objectStore;
         await reconcileAttachmentObjectStore({
           database: worker,
           objectStore,
@@ -681,6 +702,36 @@ async function start(
         });
       }
     }
+    const memoryProvider = createOpenAIMemoryStewardProvider({
+      endpoint: runtimeConfiguration.endpoint ?? "https://api.openai.com/v1/responses",
+      model: runtimeConfiguration.model ?? "gpt-5-mini",
+      secretProvider,
+    });
+    memoryRuntime = createMemoryStewardRuntime({
+      authority: memoryAuthority,
+      provider: createMemoryStewardProviderAdapter({
+        authority: memoryAuthority,
+        provider: memoryProvider,
+        readiness: () => secretProvider.getSecret("OPENAI_API_KEY") === undefined ? "noauth" : "ready",
+        ...(attachmentObjectStore === undefined ? {} : { objectStore: attachmentObjectStore }),
+      }),
+    });
+    await memoryRuntime.recover();
+    const memoryRecoveryTimer = setInterval(() => {
+      void memoryRuntime?.recover().catch(() => undefined);
+    }, 5_000);
+    memoryRecoveryTimer.unref();
+    stopMemoryRecovery = () => clearInterval(memoryRecoveryTimer);
+    const publicMemoryAuthority = {
+      async execute(
+        context: Parameters<typeof memoryAuthority.executePublic>[0],
+        request: Parameters<typeof memoryAuthority.executePublic>[1],
+      ) {
+        const frame = await memoryAuthority.executePublic(context, request);
+        if (request.type === "room.memory.retry.v1") memoryRuntime?.enqueue(request.roomId);
+        return frame;
+      },
+    };
     transport = await startMessageWebSocketServer({
       auth,
       service,
@@ -693,13 +744,16 @@ async function start(
       collaboration: primitives,
       ballRuntime,
       messageAuthority,
+      memoryAuthority: publicMemoryAuthority,
       ...(attachmentAuthority === undefined ? {} : { attachmentAuthority }),
       governance: governanceStore,
     });
   } catch (error: unknown) {
     stopCacheInvalidationRecovery?.();
     stopAttachmentRecovery?.();
+    stopMemoryRecovery?.();
     await transport?.close().catch(() => undefined);
+    await memoryRuntime?.stop().catch(() => undefined);
     attachmentAuthority?.close();
     await attachmentProcessing?.close().catch(() => undefined);
     await routeRuntime?.close().catch(() => undefined);
@@ -717,11 +771,13 @@ async function start(
       closePromise ??= (async () => {
         stopCacheInvalidationRecovery?.();
         stopAttachmentRecovery?.();
+        stopMemoryRecovery?.();
         const failures: unknown[] = [];
         for (const [stage, close] of [
           ["transport", () => transport.close()],
           ["attachment-authority", async () => attachmentAuthority?.close()],
           ["attachment-processing", async () => attachmentProcessing?.close()],
+          ["memory", async () => memoryRuntime?.stop()],
           ["route", () => routeRuntime!.close()],
           ["runtime", () => runtime!.close()],
           ["ball", () => ballRuntime!.close()],

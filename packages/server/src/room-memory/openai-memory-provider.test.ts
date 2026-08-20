@@ -40,7 +40,7 @@ const plan = (overrides: Record<string, unknown> = {}): Record<string, unknown> 
     operation: "create",
     kind: "context",
     derivedText: "Launch is scheduled for Friday.",
-    sourceRefs: [{ sourceId: "message:message-1", sourceRevision: 1 }],
+    sourceRefs: [{ sourceKind: "message", sourceId: "message:message-1", sourceRevision: 1 }],
     dedupeKey: "launch-date",
     replacesMemoryRecordId: null,
   }],
@@ -202,28 +202,28 @@ describe("production OpenAI MemoryStewardProvider", () => {
   it.each([
     ["unknown source", plan({ candidates: [{
       operation: "create", kind: "context", derivedText: "x",
-      sourceRefs: [{ sourceId: "message:unknown", sourceRevision: 1 }],
+      sourceRefs: [{ sourceKind: "message", sourceId: "message:unknown", sourceRevision: 1 }],
       dedupeKey: "unknown", replacesMemoryRecordId: null,
     }] })],
     ["stale source revision", plan({ candidates: [{
       operation: "create", kind: "context", derivedText: "x",
-      sourceRefs: [{ sourceId: "message:message-1", sourceRevision: 2 }],
+      sourceRefs: [{ sourceKind: "message", sourceId: "message:message-1", sourceRevision: 2 }],
       dedupeKey: "stale", replacesMemoryRecordId: null,
     }] })],
     ["unknown field", plan({ candidates: [{
       operation: "create", kind: "context", derivedText: "x",
-      sourceRefs: [{ sourceId: "message:message-1", sourceRevision: 1 }],
+      sourceRefs: [{ sourceKind: "message", sourceId: "message:message-1", sourceRevision: 1 }],
       dedupeKey: "extra", replacesMemoryRecordId: null, reasoning: "hidden",
     }] })],
     ["duplicate candidate", plan({ candidates: [
       {
         operation: "create", kind: "context", derivedText: "x",
-        sourceRefs: [{ sourceId: "message:message-1", sourceRevision: 1 }],
+      sourceRefs: [{ sourceKind: "message", sourceId: "message:message-1", sourceRevision: 1 }],
         dedupeKey: "same-key", replacesMemoryRecordId: null,
       },
       {
         operation: "create", kind: "context", derivedText: "y",
-        sourceRefs: [{ sourceId: "message:message-1", sourceRevision: 1 }],
+      sourceRefs: [{ sourceKind: "message", sourceId: "message:message-1", sourceRevision: 1 }],
         dedupeKey: "same-key", replacesMemoryRecordId: null,
       },
     ] })],
@@ -238,7 +238,7 @@ describe("production OpenAI MemoryStewardProvider", () => {
     async (field) => {
       const candidate = {
         operation: "create", kind: "context", derivedText: "x",
-        sourceRefs: [{ sourceId: "message:message-1", sourceRevision: 1 }],
+        sourceRefs: [{ sourceKind: "message", sourceId: "message:message-1", sourceRevision: 1 }],
         dedupeKey: `extra-${field}`, replacesMemoryRecordId: null,
         [field]: "forbidden",
       };
@@ -259,7 +259,7 @@ describe("production OpenAI MemoryStewardProvider", () => {
   ])("rejects forbidden authority/tool/path/URL/secret/reasoning content inside derived text", async (derivedText) => {
     const candidate = {
       operation: "create", kind: "context", derivedText,
-      sourceRefs: [{ sourceId: "message:message-1", sourceRevision: 1 }],
+      sourceRefs: [{ sourceKind: "message", sourceId: "message:message-1", sourceRevision: 1 }],
       dedupeKey: "forbidden-derived-content", replacesMemoryRecordId: null,
     };
     await expect(provider(async () => responsePlan(plan({ candidates: [candidate] }))).generate(
@@ -311,7 +311,7 @@ describe("production OpenAI MemoryStewardProvider", () => {
   it("enforces candidate, derived text, source ref, and total output byte limits", async () => {
     const candidate = {
       operation: "create", kind: "context", derivedText: "x",
-      sourceRefs: [{ sourceId: "message:message-1", sourceRevision: 1 }],
+      sourceRefs: [{ sourceKind: "message", sourceId: "message:message-1", sourceRevision: 1 }],
       dedupeKey: "bounded", replacesMemoryRecordId: null,
     };
     const malformed = [
@@ -339,7 +339,7 @@ describe("production OpenAI MemoryStewardProvider", () => {
       operation: "create",
       kind: "context",
       derivedText: index === 0 ? `${"界".repeat(1_365)}a` : `candidate ${index}`,
-      sourceRefs: [{ sourceId: "message:message-1", sourceRevision: 1 }],
+      sourceRefs: [{ sourceKind: "message", sourceId: "message:message-1", sourceRevision: 1 }],
       dedupeKey: `exact-${index}`,
       replacesMemoryRecordId: null,
     })) });
@@ -382,7 +382,7 @@ describe("production OpenAI MemoryStewardProvider", () => {
   it("rejects an unknown replacement memory record through the authority validator", async () => {
     const replacementPlan = plan({ candidates: [{
       operation: "replace", kind: "context", derivedText: "updated",
-      sourceRefs: [{ sourceId: "message:message-1", sourceRevision: 1 }],
+      sourceRefs: [{ sourceKind: "message", sourceId: "message:message-1", sourceRevision: 1 }],
       dedupeKey: "launch-date", replacesMemoryRecordId: "memory-unknown",
     }] });
     const targetValidator = vi.fn(async () => false);

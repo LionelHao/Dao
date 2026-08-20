@@ -17,11 +17,26 @@ function batch(roomId: string, ordinal: number): MemoryStewardBatch {
     fromWatermarkExclusive: ordinal - 1,
     toCorpusSeqInclusive: ordinal,
     sourceCount: 1,
+    sources: [{
+      corpusSeq: ordinal,
+      sourceKind: "message",
+      sourceId: `message:${ordinal}`,
+      sourceRevision: 1,
+      eligibility: "eligible",
+      availability: "readable",
+    }],
   };
 }
 
 function result(value: MemoryStewardBatch): MemoryStewardBatchResult {
-  return { jobId: value.jobId, attemptId: value.attemptId, recoveryGeneration: value.recoveryGeneration, candidateCount: 1 };
+  return {
+    jobId: value.jobId,
+    attemptId: value.attemptId,
+    recoveryGeneration: value.recoveryGeneration,
+    candidateCount: 1,
+    outputSha256: "a".repeat(64),
+    plan: { schemaVersion: 1, candidates: [] },
+  };
 }
 
 function authority(seed: Readonly<Record<string, readonly MemoryStewardBatch[]>>): MemoryStewardAuthority & {

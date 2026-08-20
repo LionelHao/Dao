@@ -528,6 +528,17 @@ function projectionForRecord(database: DatabaseSync, memoryRecordId: string): Ro
   return result;
 }
 
+export function readRoomMemoryProjection(
+  database: DatabaseSync,
+  roomId: string,
+  memoryRecordId: string,
+): RoomMemoryVersionProjection {
+  if (!identifier(roomId) || !identifier(memoryRecordId)) authorityError("invalid_input");
+  const projection = projectionForRecord(database, memoryRecordId);
+  if (projection.roomId !== roomId) authorityError("record_not_found");
+  return projection;
+}
+
 export function readRoomMemorySnapshot(
   database: DatabaseSync,
   roomId: string,
@@ -961,8 +972,13 @@ export function settleRoomMemoryAttempt(
   });
 }
 
-function validateSourceRef(value: unknown): value is Readonly<{ sourceId: string; sourceRevision: number }> {
-  return record(value) && exact(value, ["sourceId", "sourceRevision"]) &&
+function validateSourceRef(value: unknown): value is Readonly<{
+  sourceKind: RoomMemorySourceKind;
+  sourceId: string;
+  sourceRevision: number;
+}> {
+  return record(value) && exact(value, ["sourceKind", "sourceId", "sourceRevision"]) &&
+    SOURCE_KINDS.has(value.sourceKind as RoomMemorySourceKind) &&
     identifier(value.sourceId) && positiveInteger(value.sourceRevision);
 }
 
@@ -984,7 +1000,7 @@ function validateCandidate(value: unknown): value is MemoryStewardCandidate {
   const identities = new Set<string>();
   return value.sourceRefs.every((sourceRef) => {
     if (!validateSourceRef(sourceRef)) return false;
-    const key = `${sourceRef.sourceId}\0${sourceRef.sourceRevision}`;
+    const key = `${sourceRef.sourceKind}\0${sourceRef.sourceId}\0${sourceRef.sourceRevision}`;
     if (identities.has(key)) return false;
     identities.add(key);
     return true;
@@ -1048,18 +1064,17 @@ interface EligibleSourceRow {
 function eligibleSourceForRef(
   database: DatabaseSync,
   roomId: string,
+  sourceKind: RoomMemorySourceKind,
   sourceId: string,
   sourceRevision: number,
 ): EligibleSourceRow {
-  const rows = database.prepare(`
+  const row = sqlRow(database.prepare(`
     SELECT source_kind AS sourceKind, source_id AS sourceId, source_revision AS sourceRevision
     FROM room_memory_sources
-    WHERE room_id = ? AND source_id = ? AND source_revision = ?
+    WHERE room_id = ? AND source_kind = ? AND source_id = ? AND source_revision = ?
       AND eligibility = 'eligible' AND availability = 'readable'
-  `).all(roomId, sourceId, sourceRevision);
-  if (rows.length !== 1) authorityError("source_stale");
-  const row = sqlRow(rows[0]);
-  if (row === undefined) authorityError("storage_invariant");
+  `).get(roomId, sourceKind, sourceId, sourceRevision));
+  if (row === undefined) authorityError("source_stale");
   return Object.freeze({
     sourceKind: requiredString(row, "sourceKind") as RoomMemorySourceKind,
     sourceId: requiredString(row, "sourceId"),
@@ -1118,16 +1133,18 @@ function candidateSources(
 ): readonly EligibleSourceRow[] {
   const frozen = new Map<string, FrozenRoomMemoryJobSource[]>();
   for (const source of job.frozenSources) {
-    const key = `${source.sourceId}\0${source.sourceRevision}`;
+    const key = `${source.sourceKind}\0${source.sourceId}\0${source.sourceRevision}`;
     const values = frozen.get(key) ?? [];
     values.push(source);
     frozen.set(key, values);
   }
   return Object.freeze(candidate.sourceRefs.map((ref) => {
-    const values = frozen.get(`${ref.sourceId}\0${ref.sourceRevision}`);
+    const values = frozen.get(`${ref.sourceKind}\0${ref.sourceId}\0${ref.sourceRevision}`);
     if (values?.length !== 1 || values[0]?.eligibility !== "eligible" ||
         values[0].availability !== "readable") authorityError("source_stale");
-    const current = eligibleSourceForRef(database, roomId, ref.sourceId, ref.sourceRevision);
+    const current = eligibleSourceForRef(
+      database, roomId, ref.sourceKind, ref.sourceId, ref.sourceRevision,
+    );
     if (current.sourceKind !== values[0].sourceKind) authorityError("source_stale");
     return current;
   }));
@@ -1398,7 +1415,9 @@ export function invalidateRoomMemorySource(database: DatabaseSync, input: {
         .filter((ref) => !(ref.sourceKind === input.sourceKind && ref.sourceId === input.sourceId &&
           ref.sourceRevision === input.sourceRevision))
         .filter((ref) => ref.eligibility === "eligible" && ref.availability === "readable")
-        .map((ref) => eligibleSourceForRef(database, input.roomId, ref.sourceId, ref.sourceRevision));
+        .map((ref) => eligibleSourceForRef(
+          database, input.roomId, ref.sourceKind, ref.sourceId, ref.sourceRevision,
+        ));
       let state: "review_required" | "invalidated" | undefined;
       if (current.state === "active" || current.state === "proposal") {
         state = remaining.length > 0 ? "review_required" : "invalidated";
@@ -1410,7 +1429,9 @@ export function invalidateRoomMemorySource(database: DatabaseSync, input: {
       if (state === undefined) continue;
       const transitionSources = remaining.length > 0
         ? remaining
-        : [eligibleSourceForRef(database, input.roomId, input.sourceId, input.sourceRevision)];
+        : [eligibleSourceForRef(
+            database, input.roomId, input.sourceKind, input.sourceId, input.sourceRevision,
+          )];
       insertVersionWithEdges(database, {
         memoryVersionId: generatedId(
           "memory-version",
@@ -1516,15 +1537,19 @@ function currentHumanMembership(database: DatabaseSync, roomId: string, actorId:
 function eligibleSourcesFromRefs(
   database: DatabaseSync,
   roomId: string,
-  refs: readonly Readonly<{ sourceId: string; sourceRevision: number }>[],
+  refs: readonly Readonly<{
+    sourceKind: RoomMemorySourceKind;
+    sourceId: string;
+    sourceRevision: number;
+  }>[],
 ): readonly EligibleSourceRow[] {
   if (refs.length < 1 || refs.length > 16) authorityError("invalid_input");
   const seen = new Set<string>();
   return Object.freeze(refs.map((ref) => {
-    const key = `${ref.sourceId}\0${ref.sourceRevision}`;
+    const key = `${ref.sourceKind}\0${ref.sourceId}\0${ref.sourceRevision}`;
     if (seen.has(key)) authorityError("invalid_input");
     seen.add(key);
-    return eligibleSourceForRef(database, roomId, ref.sourceId, ref.sourceRevision);
+    return eligibleSourceForRef(database, roomId, ref.sourceKind, ref.sourceId, ref.sourceRevision);
   }));
 }
 
@@ -1580,6 +1605,7 @@ export function disputeRoomMemoryContext(database: DatabaseSync, input: {
       database,
       input.roomId,
       sourceRefsForVersion(database, current.currentVersionId).map((ref) => ({
+        sourceKind: ref.sourceKind,
         sourceId: ref.sourceId,
         sourceRevision: ref.sourceRevision,
       })),
@@ -1676,7 +1702,11 @@ export function resolveRoomMemoryContext(database: DatabaseSync, input: {
   readonly action: "resolve" | "re_evaluate";
   readonly reason: string;
   readonly replacementDerivedText: string;
-  readonly sourceRefs: readonly Readonly<{ sourceId: string; sourceRevision: number }>[];
+  readonly sourceRefs: readonly Readonly<{
+    sourceKind: RoomMemorySourceKind;
+    sourceId: string;
+    sourceRevision: number;
+  }>[];
   readonly reevaluationProof: RoomMemoryReevaluationProof | null;
   readonly occurredAt: string;
 }): ResolveRoomMemoryContextResult {

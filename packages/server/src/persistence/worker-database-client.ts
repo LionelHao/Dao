@@ -67,6 +67,7 @@ import {
 } from "../message-authority/internal-message-capability.js";
 import type { RuntimeAuthorityOperation } from "../agent-runtime/runtime-authority-protocol.js";
 import type { RouteAuthorityOperation } from "../route-runtime/route-authority-protocol.js";
+import type { MemoryAuthorityOperation } from "../room-memory/authority-protocol.js";
 import type {
   BallAuthorityOperation,
   BallDeadlinePolicy,
@@ -269,6 +270,7 @@ export interface WorkerDatabaseClient {
   executeRuntime(operation: RuntimeAuthorityOperation): Promise<unknown>;
   executeRoute(operation: RouteAuthorityOperation): Promise<unknown>;
   executeBall(operation: BallAuthorityOperation): Promise<unknown>;
+  executeMemory(operation: MemoryAuthorityOperation): Promise<unknown>;
   close(): Promise<void>;
 }
 
@@ -347,6 +349,8 @@ function authorityWorkerClientErrorStatus(
     case "message_not_found":
     case "light_task_not_found":
     case "open_item_not_found":
+    case "memory_not_found":
+    case "memory_source_not_found":
     case "execution_not_found":
     case "route_job_not_found":
     case "room_member_not_found":
@@ -369,6 +373,8 @@ function authorityWorkerClientErrorStatus(
     case "upload_offset_conflict":
     case "agent_final_immutable":
     case "message_version_conflict":
+    case "memory_version_conflict":
+    case "memory_recovery_generation_conflict":
     case "invitation_consumed":
     case "invitation_pending":
     case "room_archived":
@@ -391,6 +397,7 @@ function authorityWorkerClientErrorStatus(
     case "protocol_upgrade_required":
     case "upload_expired":
     case "attachment_gone":
+    case "memory_source_gone":
       return 410;
     case "attachment_too_large":
     case "chunk_too_large":
@@ -406,6 +413,7 @@ function authorityWorkerClientErrorStatus(
     case "snapshot_busy":
     case "agent_queue_full":
     case "attachment_capacity_limited":
+    case "memory_capacity_limited":
       return 429;
     case "scanner_unavailable":
     case "extractor_unavailable":
@@ -422,6 +430,8 @@ function authorityWorkerClientErrorStatus(
     case "legacy_import_failed":
     case "legacy_import_unavailable":
     case "storage_unavailable":
+    case "memory_unavailable":
+    case "memory_dependency_unavailable":
     case "repair_barrier_active":
     case "dependency_unavailable":
       return 503;
@@ -1390,6 +1400,19 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
     });
   }
 
+  executeMemory(operation: MemoryAuthorityOperation): Promise<unknown> {
+    if (this.#terminalError !== undefined) return this.#rejectTerminal();
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) return Promise.reject(unavailable);
+    return this.#send({ type: "authority.memory", operation }).then((response) => {
+      if (response.type !== "authority.memory-result") {
+        this.#failProtocol("Authority worker returned the wrong memory response");
+        throw this.#terminalError;
+      }
+      return response.result;
+    });
+  }
+
   readHistory(
     context: AuthenticatedSessionContext,
     roomId: string,
@@ -1918,6 +1941,8 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
         responseType === "authority.route-result") ||
       (requestType === "authority.ball" &&
         responseType === "authority.ball-result") ||
+      (requestType === "authority.memory" &&
+        responseType === "authority.memory-result") ||
       (requestType === "authority.read-history" &&
         responseType === "authority.history") ||
       (requestType === "authority.read-actor" && responseType === "authority.actor") ||

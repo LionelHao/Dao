@@ -124,6 +124,7 @@ function createCandidate(input: {
     kind: input.kind,
     derivedText: input.derivedText,
     sourceRefs: input.sourceOrdinals.map((ordinal) => ({
+      sourceKind: "message" as const,
       sourceId: `message:message-${ordinal}`,
       sourceRevision: 1,
     })),
@@ -347,7 +348,7 @@ describe("FT-05 Room Memory database authority", () => {
         roomId: "room-1", actorId: "human-member", requestId: "resolve-original",
         memoryRecordId: original.memoryRecordId, expectedVersion: 2, action: "resolve",
         reason: "Corrected by the disputer.", replacementDerivedText: "Corrected.",
-        sourceRefs: [{ sourceId: "message:message-1", sourceRevision: 1 }],
+        sourceRefs: [{ sourceKind: "message", sourceId: "message:message-1", sourceRevision: 1 }],
         reevaluationProof: null, occurredAt: T3,
       });
       expect(resolved.projection.currentVersion).toMatchObject({ state: "active", version: 4, derivedText: "Corrected." });
@@ -361,14 +362,14 @@ describe("FT-05 Room Memory database authority", () => {
         roomId: "room-1", actorId: "human-owner", requestId: "resolve-no-proof",
         memoryRecordId: ownerProof.memoryRecordId, expectedVersion: 2, action: "re_evaluate",
         reason: "Owner attempted without proof.", replacementDerivedText: "Re-evaluated.",
-        sourceRefs: [{ sourceId: "message:message-1", sourceRevision: 1 }],
+        sourceRefs: [{ sourceKind: "message", sourceId: "message:message-1", sourceRevision: 1 }],
         reevaluationProof: null, occurredAt: T3,
       })).toThrowError(expect.objectContaining({ code: "forbidden" }));
       expect(() => resolveRoomMemoryContext(database, {
         roomId: "room-1", actorId: "human-owner", requestId: "resolve-stale-proof",
         memoryRecordId: ownerProof.memoryRecordId, expectedVersion: 2, action: "re_evaluate",
         reason: "Stale proof.", replacementDerivedText: "Re-evaluated.",
-        sourceRefs: [{ sourceId: "message:message-1", sourceRevision: 1 }],
+        sourceRefs: [{ sourceKind: "message", sourceId: "message:message-1", sourceRevision: 1 }],
         reevaluationProof: {
           jobId: "job-seed", attemptId: "attempt-seed", recoveryGeneration: 1, resultSha256: SHA_B,
         },
@@ -385,7 +386,7 @@ describe("FT-05 Room Memory database authority", () => {
         roomId: "room-1", actorId: "human-owner", requestId: "resolve-with-proof",
         memoryRecordId: ownerProof.memoryRecordId, expectedVersion: 2, action: "re_evaluate",
         reason: "Re-evaluated against the later completed generation.", replacementDerivedText: "Re-evaluated.",
-        sourceRefs: [{ sourceId: "message:message-1", sourceRevision: 1 }],
+        sourceRefs: [{ sourceKind: "message", sourceId: "message:message-1", sourceRevision: 1 }],
         reevaluationProof: {
           jobId: "job-reevaluate", attemptId: "attempt-reevaluate", recoveryGeneration: 1, resultSha256: SHA_C,
         },
