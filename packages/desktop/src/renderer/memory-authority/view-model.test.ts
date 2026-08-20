@@ -92,7 +92,7 @@ describe("FT-05 Memory panel authority-state mapping", () => {
       derivedText: "Re-evaluation required.", sources: [
         { sourceId: "message:1", sourceKind: "message", revision: 2, availability: "active", navigation: { kind: "message", messageId: "message-1" } },
         { sourceId: "message:2", sourceKind: "message_tombstone", revision: 1, availability: "recalled", navigation: { kind: "tombstone", messageId: "message-2" } },
-        { sourceId: "attachment:3", sourceKind: "attachment_extraction", revision: 4, availability: "unavailable", navigation: { kind: "attachment", messageId: "message-3", attachmentId: "attachment-3" } },
+        { sourceId: "attachment:3", sourceKind: "attachment_extraction", revision: 4, availability: "unavailable", navigation: { kind: "attachment", attachmentId: "attachment-3" } },
       ],
     }] }));
     expect(model.cards[0]?.injectable).toBe(false);
@@ -100,6 +100,25 @@ describe("FT-05 Memory panel authority-state mapping", () => {
       "SOURCE · ACTIVE", "SOURCE · RECALLED TOMBSTONE", "SOURCE · UNAVAILABLE",
     ]);
     expect(JSON.stringify(model)).not.toMatch(/rawBody|extraction|provider|secret/iu);
+  });
+
+  it("mirrors closed Core attachment/project navigation without inventing a messageId or generic URL", () => {
+    const model = createMemoryAuthorityViewModel(input({ memories: [{
+      memoryRecordId: "memory-navigation", version: 1, kind: "context", state: "review_required",
+      derivedText: "Source navigation is authority-scoped.", sources: [
+        { sourceId: "attachment-extraction:attachment-1:1", sourceKind: "attachment_extraction",
+          revision: 1, availability: "active",
+          navigation: { kind: "attachment", attachmentId: "attachment-1" } },
+        { sourceId: "project-fact:fact-1:1", sourceKind: "project_fact_checkpoint",
+          revision: 1, availability: "unavailable",
+          navigation: { kind: "project_fact", projectFactId: "fact-1" } },
+      ],
+    }] }));
+    expect(model.cards[0]?.sources.map((item) => item.navigation)).toEqual([
+      { kind: "attachment", attachmentId: "attachment-1" },
+      { kind: "project_fact", projectFactId: "fact-1" },
+    ]);
+    expect(JSON.stringify(model)).not.toMatch(/messageId.*attachment|https?:|url/iu);
   });
 
   it("maps closed errors to finite safe recovery and preserves request correlation", () => {

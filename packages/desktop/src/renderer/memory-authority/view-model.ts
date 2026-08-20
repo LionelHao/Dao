@@ -12,7 +12,8 @@ export type MemoryVersionState =
   | "review_required"
   | "resolved"
   | "superseded"
-  | "invalidated";
+  | "invalidated"
+  | "confirmed_project_reference";
 
 export type MemoryHealthStatus = "healthy" | "catching_up" | "noauth" | "degraded" | "failed";
 export type MemoryPanelVisibleState =
@@ -32,7 +33,8 @@ export type MemoryPanelVisibleState =
 export type MemorySourceNavigation =
   | { readonly kind: "message"; readonly messageId: string }
   | { readonly kind: "tombstone"; readonly messageId: string }
-  | { readonly kind: "attachment"; readonly messageId: string; readonly attachmentId: string };
+  | { readonly kind: "attachment"; readonly attachmentId: string }
+  | { readonly kind: "project_fact"; readonly projectFactId: string };
 
 export interface MemorySourceProjection {
   readonly sourceId: string;
@@ -174,6 +176,7 @@ const stateLabel: Readonly<Record<MemoryVersionState, string>> = {
   resolved: "RESOLVED",
   superseded: "SUPERSEDED",
   invalidated: "INVALIDATED",
+  confirmed_project_reference: "CONFIRMED PROJECT REFERENCE",
 };
 const availabilityLabel: Readonly<Record<MemorySourceProjection["availability"], string>> = {
   active: "SOURCE · ACTIVE",
