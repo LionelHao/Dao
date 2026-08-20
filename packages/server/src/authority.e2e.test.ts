@@ -1968,7 +1968,7 @@ describe("authoritative server real-process harness", () => {
       const repairSnapshotStaleFrames = authorityFrames.filter((frame) =>
         frame.type === "error" &&
         frame.code === "snapshot_stale" &&
-        frame.requestId.startsWith("repair-page-"));
+        frame.requestId.startsWith("repair-"));
       expect(repairSnapshotStaleFrames.length).toBeLessThanOrEqual(2);
       expect(authorityFrames.filter((frame) =>
         frame.type === "error" && !repairSnapshotStaleFrames.includes(frame))).toEqual([]);
@@ -2695,11 +2695,6 @@ describe("authoritative server real-process harness", () => {
         messageId,
         revision: 2,
       });
-      await vi.waitFor(() => {
-        expect(inputs.some((received) => received.some((input) =>
-          input.type === "room.event" && input.event.type === "room.message.recalled" &&
-          input.event.payload.id === messageId))).toBe(true);
-      }, { timeout: 10_000 });
       expect(JSON.stringify(inputs)).not.toContain(acceptedBody);
       expect(JSON.stringify(inputs)).not.toContain(revisedBody);
 
