@@ -849,19 +849,19 @@ class JsonWebSocketClient {
     value: { readonly requestId: string },
     type: ServerFrame["type"],
   ): Promise<ServerFrame> {
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
       const response = this.waitFor((frame) => "requestId" in frame &&
         frame.requestId === value.requestId && (frame.type === type || frame.type === "error"));
       this.send(value);
       const frame = await response;
       if (frame.type !== "error") return frame;
-      if (frame.code !== "storage_unavailable" || attempt === 2) {
+      if (frame.code !== "storage_unavailable" || attempt === 4) {
         throw Object.assign(new Error(`${frame.code}: ${frame.message}`), {
           code: frame.code,
           status: frame.status,
         });
       }
-      await new Promise<void>((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+      await new Promise<void>((resolve) => setTimeout(resolve, 50 * (2 ** attempt)));
     }
     throw new Error("Authority request retry bound was exhausted");
   }
