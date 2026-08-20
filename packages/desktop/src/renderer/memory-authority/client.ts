@@ -147,7 +147,10 @@ function matchesRequest(frame: RoomMemorySuccessFrame, request: RoomMemoryReques
   if (frame.type !== expectedResponseType[request.type] || frame.requestId !== request.requestId ||
       frame.roomId !== request.roomId) return false;
   if (request.type === "room.memory.source.query.v1") {
-    return frame.type === "room.memory.source.v1" && frame.source.sourceId === request.sourceId;
+    return frame.type === "room.memory.source.v1" &&
+      frame.source.sourceKind === request.sourceKind &&
+      frame.source.sourceId === request.sourceId &&
+      frame.source.sourceRevision === request.sourceRevision;
   }
   if (request.type === "room.memory.context.dispute.v1") {
     return frame.type === "room.memory.context.dispute.accepted.v1" &&

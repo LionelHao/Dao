@@ -136,7 +136,8 @@ describe("closed renderer Memory Authority client", () => {
     const client = createMemoryAuthorityClient(raw.value);
     await expect(client.request({ accessEpoch: 1, frame: {
       type: "room.memory.source.query.v1", requestId: "source-1",
-      roomId: "room-1", sourceId: "message:message-1",
+      roomId: "room-1", sourceKind: "message", sourceId: "message:message-1",
+      sourceRevision: 1,
     } })).resolves.toMatchObject({ frame: { source } });
   });
 });

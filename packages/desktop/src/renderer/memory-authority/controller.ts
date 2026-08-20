@@ -349,7 +349,9 @@ export function createMemoryAuthorityController(options: ControllerOptions): Mem
         type: "room.memory.source.query.v1",
         requestId: options.createRequestId("source"),
         roomId,
+        sourceKind: sourceRef.sourceKind,
         sourceId: sourceRef.sourceId,
+        sourceRevision: sourceRef.sourceRevision,
       };
       if (!isRoomMemoryRequest(frame)) throw dependencyFailure({ accessEpoch, frame });
       const response = await requireResponse({ accessEpoch, frame }, "room.memory.source.v1");
