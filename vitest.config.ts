@@ -35,17 +35,35 @@ export default defineConfig({
       }),
       defineProject({
         test: {
-          name: "heavy-persistence-e2e",
+          name: "authority-real-process-e2e",
           environment: "jsdom",
-          include: [
-            "packages/server/src/authority.e2e.test.ts",
-            "packages/server/src/persistence/snapshot-worker-client.test.ts",
-            "packages/server/src/sync-service.test.ts",
-          ],
+          include: ["packages/server/src/authority.e2e.test.ts"],
           pool: "forks",
           poolOptions: { forks: { singleFork: true } },
           testTimeout: 15_000,
           sequence: { groupOrder: 2 },
+        },
+      }),
+      defineProject({
+        test: {
+          name: "snapshot-worker-e2e",
+          environment: "jsdom",
+          include: ["packages/server/src/persistence/snapshot-worker-client.test.ts"],
+          pool: "forks",
+          poolOptions: { forks: { singleFork: true } },
+          testTimeout: 15_000,
+          sequence: { groupOrder: 3 },
+        },
+      }),
+      defineProject({
+        test: {
+          name: "sync-service-e2e",
+          environment: "jsdom",
+          include: ["packages/server/src/sync-service.test.ts"],
+          pool: "forks",
+          poolOptions: { forks: { singleFork: true } },
+          testTimeout: 15_000,
+          sequence: { groupOrder: 4 },
         },
       }),
     ],

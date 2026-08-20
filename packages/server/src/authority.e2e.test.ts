@@ -770,9 +770,6 @@ async function compactRoomStream(
   }
 }
 
-const AUTHORITY_TRANSIENT_RETRY_ATTEMPTS = 8;
-const AUTHORITY_TRANSIENT_RETRY_BASE_MS = 50;
-
 class JsonWebSocketClient {
   readonly #socket: WebSocket;
   readonly #frames: ServerFrame[] = [];
@@ -852,21 +849,19 @@ class JsonWebSocketClient {
     value: { readonly requestId: string },
     type: ServerFrame["type"],
   ): Promise<ServerFrame> {
-    for (let attempt = 0; attempt < AUTHORITY_TRANSIENT_RETRY_ATTEMPTS; attempt += 1) {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
       const response = this.waitFor((frame) => "requestId" in frame &&
         frame.requestId === value.requestId && (frame.type === type || frame.type === "error"));
       this.send(value);
       const frame = await response;
       if (frame.type !== "error") return frame;
-      if (frame.code !== "storage_unavailable" ||
-          attempt === AUTHORITY_TRANSIENT_RETRY_ATTEMPTS - 1) {
+      if (frame.code !== "storage_unavailable" || attempt === 4) {
         throw Object.assign(new Error(`${frame.code}: ${frame.message}`), {
           code: frame.code,
           status: frame.status,
         });
       }
-      await new Promise<void>((resolve) =>
-        setTimeout(resolve, AUTHORITY_TRANSIENT_RETRY_BASE_MS * (2 ** attempt)));
+      await new Promise<void>((resolve) => setTimeout(resolve, 50 * (2 ** attempt)));
     }
     throw new Error("Authority request retry bound was exhausted");
   }
@@ -2554,18 +2549,16 @@ describe("authoritative server real-process harness", () => {
         return runtime;
       });
       const withDesktopRetry = async <T>(operation: () => Promise<T>): Promise<T> => {
-        for (let attempt = 0; attempt < AUTHORITY_TRANSIENT_RETRY_ATTEMPTS; attempt += 1) {
+        for (let attempt = 0; attempt < 5; attempt += 1) {
           try {
             return await operation();
           } catch (error: unknown) {
             const closed = isRecord(error) && isRecord(error.error) ? error.error : undefined;
             if ((closed?.code !== "service_unavailable" &&
-                closed?.code !== "repair_unavailable") ||
-              attempt === AUTHORITY_TRANSIENT_RETRY_ATTEMPTS - 1) {
+                closed?.code !== "repair_unavailable") || attempt === 4) {
               throw error;
             }
-            await new Promise<void>((resolve) =>
-              setTimeout(resolve, AUTHORITY_TRANSIENT_RETRY_BASE_MS * (2 ** attempt)));
+            await new Promise<void>((resolve) => setTimeout(resolve, 50 * (2 ** attempt)));
           }
         }
         throw new Error("Desktop authority retry bound was exhausted");
