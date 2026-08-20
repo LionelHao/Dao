@@ -2548,8 +2548,26 @@ describe("authoritative server real-process harness", () => {
         runtime.client.subscribe((input) => inputs[index]!.push(structuredClone(input)));
         return runtime;
       });
+      const historyWithRetry = async (
+        runtime: DesktopMessageAuthorityRuntime,
+        command: Parameters<DesktopMessageAuthorityRuntime["client"]["historyV2"]>[0],
+      ): ReturnType<DesktopMessageAuthorityRuntime["client"]["historyV2"]> => {
+        for (let attempt = 0; attempt < 5; attempt += 1) {
+          try {
+            return await runtime.client.historyV2(command);
+          } catch (error: unknown) {
+            const closed = isRecord(error) && isRecord(error.error) ? error.error : undefined;
+            if ((closed?.code !== "service_unavailable" &&
+                closed?.code !== "repair_unavailable") || attempt === 4) {
+              throw error;
+            }
+            await new Promise<void>((resolve) => setTimeout(resolve, 50 * (2 ** attempt)));
+          }
+        }
+        throw new Error("Desktop history retry bound was exhausted");
+      };
       const initial = await Promise.all(active.map((runtime, index) =>
-        runtime.client.historyV2({
+        historyWithRetry(runtime, {
           type: "room.history.v2",
           requestId: `desktop-message-initial-${index}`,
           roomId,
@@ -2619,7 +2637,7 @@ describe("authoritative server real-process harness", () => {
           input.event.payload.id === messageId))).toBe(true);
       }, { timeout: 20_000 });
 
-      const reconnected = await active[2]!.client.historyV2({
+      const reconnected = await historyWithRetry(active[2]!, {
         type: "room.history.v2",
         requestId: "desktop-message-reconnect-c",
         roomId,
@@ -2632,7 +2650,7 @@ describe("authoritative server real-process harness", () => {
       }));
 
       active[1]!.clearAndRestore(roomId);
-      const cleared = await active[1]!.client.historyV2({
+      const cleared = await historyWithRetry(active[1]!, {
         type: "room.history.v2",
         requestId: "desktop-message-clear-b",
         roomId,
@@ -2668,7 +2686,7 @@ describe("authoritative server real-process harness", () => {
       expect(JSON.stringify(inputs)).not.toContain(revisedBody);
 
       const recalledHistories = await Promise.all(active.map((runtime, index) =>
-        runtime.client.historyV2({
+        historyWithRetry(runtime, {
           type: "room.history.v2",
           requestId: `desktop-message-recall-repair-${index}`,
           roomId,
@@ -2697,7 +2715,7 @@ describe("authoritative server real-process harness", () => {
         return runtime;
       });
       const finalHistories = await Promise.all(restarted.map((runtime, index) =>
-        runtime.client.historyV2({
+        historyWithRetry(runtime, {
           type: "room.history.v2",
           requestId: `desktop-message-restart-${index}`,
           roomId,
