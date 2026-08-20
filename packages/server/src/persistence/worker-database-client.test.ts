@@ -220,6 +220,48 @@ class MessageErrorTransport extends EventEmitter implements AuthorityWorkerTrans
   }
 }
 
+class OperationStorageProbeTransport extends EventEmitter implements AuthorityWorkerTransport {
+  #failedInspection = false;
+
+  postMessage(request: AuthorityWorkerRequest): void {
+    if (request.type === "authority.initialize") {
+      queueMicrotask(() => this.emit("message", {
+        type: "authority.ready",
+        requestId: request.requestId,
+        schemaVersion: 18,
+      } satisfies AuthorityWorkerResponse));
+      return;
+    }
+    if (request.type === "authority.close") {
+      queueMicrotask(() => this.emit("message", {
+        type: "authority.closed",
+        requestId: request.requestId,
+      } satisfies AuthorityWorkerResponse));
+      return;
+    }
+    if (request.type !== "authority.inspect-schema") throw new Error("unexpected request");
+    if (!this.#failedInspection) {
+      this.#failedInspection = true;
+      queueMicrotask(() => this.emit("message", {
+        type: "authority.error",
+        requestId: request.requestId,
+        code: "authority_storage_transient",
+        message: "Authority database inspection failed",
+      } satisfies AuthorityWorkerResponse));
+      return;
+    }
+    queueMicrotask(() => this.emit("message", {
+      type: "authority.schema",
+      requestId: request.requestId,
+      schemaVersion: 18,
+    } satisfies AuthorityWorkerResponse));
+  }
+
+  async terminate(): Promise<number> {
+    return 0;
+  }
+}
+
 class CapabilityProbeTransport extends EventEmitter implements AuthorityWorkerTransport {
   readonly requests: AuthorityWorkerRequest[] = [];
 
@@ -1332,6 +1374,20 @@ describe("authority database coordinator registry", () => {
     expect(firstError).toMatchObject({ code: "storage_unavailable" });
 
     await expectDatabasePathEventuallyReusable(path);
+  });
+
+  it("keeps the worker usable after an operation-level storage outage", async () => {
+    const transport = new OperationStorageProbeTransport();
+    const client = trackClient(await createWorkerDatabaseClientForTest(
+      { databasePath: databasePath() },
+      () => transport,
+    ));
+
+    await expect(client.inspectSchema()).rejects.toMatchObject({
+      code: "storage_unavailable",
+      status: 503,
+    });
+    await expect(client.inspectSchema()).resolves.toEqual({ version: 18 });
   });
 
   it("releases the path after a worker crash so a replacement can start", async () => {

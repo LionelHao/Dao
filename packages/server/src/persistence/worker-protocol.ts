@@ -107,6 +107,8 @@ export type AuthorityWorkerErrorCode =
   | "agent_required"
   | "authority_already_initialized"
   | "authority_not_initialized"
+  | "authority_storage_poisoned"
+  | "authority_storage_transient"
   | "authority_worker_closed"
   | "unauthenticated"
   | "invalid_chunk"
@@ -206,6 +208,8 @@ export function isAuthorityWorkerErrorCode(
     case "agent_required":
     case "authority_already_initialized":
     case "authority_not_initialized":
+    case "authority_storage_poisoned":
+    case "authority_storage_transient":
     case "authority_worker_closed":
     case "unauthenticated":
     case "invalid_chunk":
