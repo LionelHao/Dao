@@ -845,19 +845,25 @@ class JsonWebSocketClient {
     });
   }
 
-  request(value: { readonly requestId: string }, type: ServerFrame["type"]): Promise<ServerFrame> {
-    const response = this.waitFor((frame) => "requestId" in frame &&
-      frame.requestId === value.requestId && (frame.type === type || frame.type === "error"));
-    this.send(value);
-    return response.then((frame) => {
-      if (frame.type === "error") {
+  async request(
+    value: { readonly requestId: string },
+    type: ServerFrame["type"],
+  ): Promise<ServerFrame> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const response = this.waitFor((frame) => "requestId" in frame &&
+        frame.requestId === value.requestId && (frame.type === type || frame.type === "error"));
+      this.send(value);
+      const frame = await response;
+      if (frame.type !== "error") return frame;
+      if (frame.code !== "storage_unavailable" || attempt === 2) {
         throw Object.assign(new Error(`${frame.code}: ${frame.message}`), {
           code: frame.code,
           status: frame.status,
         });
       }
-      return frame;
-    });
+      await new Promise<void>((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+    }
+    throw new Error("Authority request retry bound was exhausted");
   }
 
   async issueSession(
@@ -2273,44 +2279,22 @@ describe("authoritative server real-process harness", () => {
       }, "room.subscribed.v2");
 
       const submit = async (messageId: string, body: string): Promise<void> => {
-        for (let attempt = 0; attempt < 3; attempt += 1) {
-          try {
-            const receipt = await client!.request({
-              type: "message.send.v2",
-              requestId: `submit-${messageId}`,
-              message: { messageId, roomId, body, mentionedTargets: [], attachments: [] },
-            }, "message.accepted");
-            expect(receipt).toMatchObject({ messageId, targetOutcomes: [] });
-            return;
-          } catch (error: unknown) {
-            if (!isRecord(error) || error.code !== "storage_unavailable" || attempt === 2) {
-              throw error;
-            }
-            await new Promise<void>((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
-          }
-        }
-        throw new Error("Message submission retry bound was exhausted");
+        const receipt = await client!.request({
+          type: "message.send.v2",
+          requestId: `submit-${messageId}`,
+          message: { messageId, roomId, body, mentionedTargets: [], attachments: [] },
+        }, "message.accepted");
+        expect(receipt).toMatchObject({ messageId, targetOutcomes: [] });
       };
       const recall = async (messageId: string, requestId: string): Promise<void> => {
-        for (let attempt = 0; attempt < 3; attempt += 1) {
-          try {
-            const receipt = await client!.request({
-              type: "message.recall",
-              requestId,
-              roomId,
-              messageId,
-              expectedRevision: 1,
-            }, "message.recall.accepted");
-            expect(receipt).toMatchObject({ messageId, revision: 1 });
-            return;
-          } catch (error: unknown) {
-            if (!isRecord(error) || error.code !== "storage_unavailable" || attempt === 2) {
-              throw error;
-            }
-            await new Promise<void>((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
-          }
-        }
-        throw new Error("Message recall retry bound was exhausted");
+        const receipt = await client!.request({
+          type: "message.recall",
+          requestId,
+          roomId,
+          messageId,
+          expectedRevision: 1,
+        }, "message.recall.accepted");
+        expect(receipt).toMatchObject({ messageId, revision: 1 });
       };
       const invoke = async (messageId: string) => {
         const frame = await client!.request({
