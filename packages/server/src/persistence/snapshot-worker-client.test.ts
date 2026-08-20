@@ -756,6 +756,7 @@ describe("durable materialized snapshot worker", () => {
       "timeline-message", "timeline-message", "message-revision", "attachment", "human-read",
       "agent-judgement", "open-item",
       "open-item-agent-failure", "light-task", "agent-execution", "calibration",
+      "memory",
     ]);
     const timelineMessages = page.records.filter((record) =>
       record.kind === "timeline-message").map((record) => record.value);
@@ -933,7 +934,7 @@ describe("durable materialized snapshot worker", () => {
     expect(pages.every((entry) =>
       Buffer.byteLength(canonicalJsonForTest(entry), "utf8") <= maxPageBytes)).toBe(true);
     const records = pages.flatMap((entry) => entry.records);
-    expect(records).toHaveLength(9);
+    expect(records).toHaveLength(10);
     expect(records.filter((record) => record.kind === "message-revision")).toHaveLength(3);
     await client.close();
   });
@@ -1576,11 +1577,11 @@ describe("durable materialized snapshot worker", () => {
       expect(page.mode).toBe("streaming");
       records.push(...page.records);
     }
-    expect(records).toHaveLength(20_009);
+    expect(records).toHaveLength(20_010);
     expect(new Set(records.map((record) => record.kind))).toEqual(new Set([
       "room", "governance", "membership", "timeline-message", "message-revision",
       "human-read", "agent-judgement",
-      "open-item", "light-task", "agent-execution", "calibration",
+      "open-item", "light-task", "agent-execution", "calibration", "memory",
     ]));
     expect(page0.snapshotChecksum).toBe(createHash("sha256")
       .update(canonicalJsonForTest({ kind: "room", values: records, version: 1 }), "utf8")
@@ -1775,11 +1776,11 @@ describe("durable materialized snapshot worker", () => {
         });
         records.push(...page.records);
       }
-      expect(records).toHaveLength(20_009);
+      expect(records).toHaveLength(20_010);
       expect(new Set(records.map((record) => record.kind))).toEqual(new Set([
         "room", "governance", "membership", "timeline-message", "message-revision",
         "human-read", "agent-judgement",
-        "open-item", "light-task", "agent-execution", "calibration",
+        "open-item", "light-task", "agent-execution", "calibration", "memory",
       ]));
       expect(page0.snapshotChecksum).toBe(createHash("sha256")
         .update(canonicalJsonForTest({ kind: "room", values: records, version: 1 }), "utf8")

@@ -22,6 +22,10 @@ import type {
 import { lifecycleRepairSegmentDescriptor } from
   "../room-governance/lifecycle-repair-descriptor.js";
 import {
+  memoryRepairSegmentDescriptor,
+  ROOM_MEMORY_REPAIR_KEYSET_LIMIT,
+} from "../room-memory/repair-descriptor.js";
+import {
   readOperationalMessageRepairPage,
   readOperationalMessageRepairRecord,
 } from
@@ -651,6 +655,7 @@ const ROOM_REPAIR_KIND_MAP = Object.freeze({
   "route-judgment": true,
   calibration: true,
   "legacy-unknown-calibration": true,
+  memory: true,
 } as const satisfies Readonly<Record<RoomRepairKind, true>>);
 
 const ROOM_REPAIR_KINDS = Object.freeze(
@@ -1080,6 +1085,7 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
     stableKey: (record: RoomRepairRecord) =>
       String(record.kind === "message" ? record.value.id : ""),
   },
+  memoryRepairSegmentDescriptor,
 ] as const satisfies readonly RoomRepairSegmentDescriptor<RoomRepairKind, RoomRepairRecord>[]);
 
 const ROOM_REPAIR_REGISTRY = createClosedRepairProjectionRegistry<
@@ -1135,19 +1141,22 @@ function keysetRoomPage(
     const descriptor = ROOM_REPAIR_REGISTRY.descriptors[segment];
     if (descriptor === undefined) break;
     const remaining = limit - values.length;
+    const descriptorLimit = descriptor.kind === "memory"
+      ? Math.min(remaining, ROOM_MEMORY_REPAIR_KEYSET_LIMIT)
+      : remaining;
     const page = ROOM_REPAIR_REGISTRY.readStablePage({
       database: authority,
       roomId,
       watermark,
       afterKey: key,
-      limit: remaining,
+      limit: descriptorLimit,
       kind: descriptor.kind,
     });
     if (descriptor.kind !== "room" && data.pauseState !== undefined) {
       Atomics.add(new Int32Array(data.pauseState), 1, page.length);
     }
     values.push(...page);
-    if (page.length < remaining) {
+    if (page.length < descriptorLimit) {
       segment += 1;
       key = undefined;
       continue;
