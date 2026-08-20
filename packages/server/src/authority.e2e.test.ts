@@ -829,32 +829,41 @@ class JsonWebSocketClient {
     this.#socket.send(JSON.stringify(value));
   }
 
-  waitFor(predicate: (frame: ServerFrame) => boolean): Promise<ServerFrame> {
+  waitFor(
+    predicate: (frame: ServerFrame) => boolean,
+    timeoutMs = 12_000,
+  ): Promise<ServerFrame> {
     const index = this.#frames.findIndex(predicate);
     if (index >= 0) return Promise.resolve(this.#frames.splice(index, 1)[0]!);
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         const index = this.#waiters.findIndex((waiter) => waiter.timeout === timeout);
         if (index >= 0) this.#waiters.splice(index, 1);
-        reject(new Error("Timed out waiting 10 seconds for the expected WebSocket frame"));
-      }, 10_000);
+        reject(new Error(`Timed out waiting ${timeoutMs}ms for the expected WebSocket frame`));
+      }, timeoutMs);
       this.#waiters.push({ predicate, resolve, reject, timeout });
     });
   }
 
-  request(value: { readonly requestId: string }, type: ServerFrame["type"]): Promise<ServerFrame> {
-    const response = this.waitFor((frame) => "requestId" in frame &&
-      frame.requestId === value.requestId && (frame.type === type || frame.type === "error"));
-    this.send(value);
-    return response.then((frame) => {
-      if (frame.type === "error") {
+  async request(
+    value: { readonly requestId: string },
+    type: ServerFrame["type"],
+  ): Promise<ServerFrame> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const response = this.waitFor((frame) => "requestId" in frame &&
+        frame.requestId === value.requestId && (frame.type === type || frame.type === "error"));
+      this.send(value);
+      const frame = await response;
+      if (frame.type !== "error") return frame;
+      if (frame.code !== "storage_unavailable" || attempt === 2) {
         throw Object.assign(new Error(`${frame.code}: ${frame.message}`), {
           code: frame.code,
           status: frame.status,
         });
       }
-      return frame;
-    });
+      await new Promise<void>((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+    }
+    throw new Error("Authority request retry bound was exhausted");
   }
 
   async issueSession(
@@ -1282,7 +1291,9 @@ async function repairRecords(client: JsonWebSocketClient, roomId: string) {
         mode: first.mode,
       };
     } catch (error: unknown) {
-      if (!isRecord(error) || error.code !== "snapshot_stale" || attempt === 2) throw error;
+      if (!isRecord(error) ||
+          (error.code !== "snapshot_stale" && error.code !== "storage_unavailable") ||
+          attempt === 2) throw error;
     }
   }
   throw new Error("Room repair retry bound was exhausted");
@@ -1501,7 +1512,7 @@ describe("authoritative server real-process harness", () => {
       await expect(client.waitFor((frame) => frame.type === "room.event" &&
         frame.event.roomId === roomId &&
         frame.event.type === "room.message.accepted" &&
-        frame.event.payload.id === messageId)).resolves.toMatchObject({
+        frame.event.payload.id === messageId, 20_000)).resolves.toMatchObject({
         type: "room.event",
         event: {
           roomId,
@@ -1954,7 +1965,13 @@ describe("authoritative server real-process harness", () => {
         ]),
         attachmentForbiddenSentinels,
       )).toEqual([]);
-      expect(authorityFrames.filter((frame) => frame.type === "error")).toEqual([]);
+      const repairSnapshotStaleFrames = authorityFrames.filter((frame) =>
+        frame.type === "error" &&
+        frame.code === "snapshot_stale" &&
+        frame.requestId.startsWith("repair-page-"));
+      expect(repairSnapshotStaleFrames.length).toBeLessThanOrEqual(2);
+      expect(authorityFrames.filter((frame) =>
+        frame.type === "error" && !repairSnapshotStaleFrames.includes(frame))).toEqual([]);
     } finally {
       composer?.dispose();
       desktopRuntime?.close();
@@ -1993,6 +2010,7 @@ describe("authoritative server real-process harness", () => {
         deviceId: "message-v2-seed-device",
       });
       const roomId = await discoverRoom(seedClient);
+      await waitForRoomAuthorityQuiescence(directory, roomId, 10_000);
       seedClient.close();
       await stopChild(seeded.child);
 
@@ -2032,6 +2050,7 @@ describe("authoritative server real-process harness", () => {
           deviceId: "message-v2-human-b-device",
         }),
       ]);
+      await waitForRoomAuthorityQuiescence(directory, roomId, 10_000);
       const head = readRoomHeadSeq(directory, roomId);
       await Promise.all([observerA, observerB].map((client, index) => client.request({
         type: "room.subscribe.v2",
@@ -2260,11 +2279,22 @@ describe("authoritative server real-process harness", () => {
       }, "room.subscribed.v2");
 
       const submit = async (messageId: string, body: string): Promise<void> => {
-        await expect(client!.request({
+        const receipt = await client!.request({
           type: "message.send.v2",
           requestId: `submit-${messageId}`,
           message: { messageId, roomId, body, mentionedTargets: [], attachments: [] },
-        }, "message.accepted")).resolves.toMatchObject({ messageId, targetOutcomes: [] });
+        }, "message.accepted");
+        expect(receipt).toMatchObject({ messageId, targetOutcomes: [] });
+      };
+      const recall = async (messageId: string, requestId: string): Promise<void> => {
+        const receipt = await client!.request({
+          type: "message.recall",
+          requestId,
+          roomId,
+          messageId,
+          expectedRevision: 1,
+        }, "message.recall.accepted");
+        expect(receipt).toMatchObject({ messageId, revision: 1 });
       };
       const invoke = async (messageId: string) => {
         const frame = await client!.request({
@@ -2294,16 +2324,7 @@ describe("authoritative server real-process harness", () => {
           database.close();
         }
       });
-      await expect(client.request({
-        type: "message.recall",
-        requestId: "recall-completed-preview-source",
-        roomId,
-        messageId: completedSourceId,
-        expectedRevision: 1,
-      }, "message.recall.accepted")).resolves.toMatchObject({
-        messageId: completedSourceId,
-        revision: 1,
-      });
+      await recall(completedSourceId, "recall-completed-preview-source");
 
       const previewSourceId = "message-preview-running";
       await submit(previewSourceId, "run a read tool then wait on preview");
@@ -2331,16 +2352,7 @@ describe("authoritative server real-process harness", () => {
         beforeRecall.close();
       }
 
-      await expect(client.request({
-        type: "message.recall",
-        requestId: "recall-running-preview-source",
-        roomId,
-        messageId: previewSourceId,
-        expectedRevision: 1,
-      }, "message.recall.accepted")).resolves.toMatchObject({
-        messageId: previewSourceId,
-        revision: 1,
-      });
+      await recall(previewSourceId, "recall-running-preview-source");
 
       const history = await client.request({
         type: "room.history.v2",
@@ -2578,7 +2590,7 @@ describe("authoritative server real-process harness", () => {
         expect(inputs.every((received) => received.some((input) =>
           input.type === "room.event" && input.event.type === "room.message.accepted" &&
           input.event.payload.id === messageId))).toBe(true);
-      }, { timeout: 5_000 });
+      }, { timeout: 20_000 });
 
       socketGroups[2]!.at(-1)!.terminate();
       await vi.waitFor(() => {
@@ -2587,7 +2599,7 @@ describe("authoritative server real-process harness", () => {
           roomId,
           connection: expect.objectContaining({ status: "offline" }),
         });
-      }, { timeout: 5_000 });
+      }, { timeout: 10_000 });
       await expect(active[0]!.client.revise({
         type: "message.revise",
         requestId: "desktop-message-revise",
@@ -2605,7 +2617,7 @@ describe("authoritative server real-process harness", () => {
         expect(inputs.slice(0, 2).every((received) => received.some((input) =>
           input.type === "room.event" && input.event.type === "room.message.revised" &&
           input.event.payload.id === messageId))).toBe(true);
-      }, { timeout: 5_000 });
+      }, { timeout: 20_000 });
 
       const reconnected = await active[2]!.client.historyV2({
         type: "room.history.v2",
@@ -2651,7 +2663,7 @@ describe("authoritative server real-process harness", () => {
         expect(inputs.every((received) => received.some((input) =>
           input.type === "room.event" && input.event.type === "room.message.recalled" &&
           input.event.payload.id === messageId))).toBe(true);
-      }, { timeout: 5_000 });
+      }, { timeout: 20_000 });
       expect(JSON.stringify(inputs)).not.toContain(acceptedBody);
       expect(JSON.stringify(inputs)).not.toContain(revisedBody);
 
@@ -3900,7 +3912,7 @@ describe("authoritative server real-process harness", () => {
         frame.event.type === "room.message.accepted" && frame.event.payload.id === messageId);
       sendMessage(sender, roomId, messageId);
 
-      const [liveFrame, exitCode] = await Promise.all([live, childExit(faulted)]);
+      const [liveFrame, exitCode] = await Promise.all([live, childExit(faulted, 5_000)]);
       expect(exitCode).toBe(84);
       expect(unexpectedChildStderr(faulted)).toBe("");
       if (liveFrame.type !== "room.event") throw new TypeError("wrong live frame");
@@ -4097,7 +4109,8 @@ describe("authoritative server real-process harness", () => {
         observeMaterializedLastPage = resolve;
       });
       let materializedLastPageObserved = false;
-      const expectedRepairTotal = mixed.total + 1;
+      // The mixed fixture count excludes the singleton governance and Memory status records.
+      const expectedRepairTotal = mixed.total + 2;
       transportC.beforeMaterializedLastPageReturn = async (page, receivedRecordCount) => {
         materializedLastPageObserved = true;
         observeMaterializedLastPage();

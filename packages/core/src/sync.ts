@@ -46,6 +46,12 @@ import {
   type MessageAuthorityEvent,
   type MessageAuthorityRepairRecord,
 } from "./message-authority.js";
+import {
+  isRoomMemoryEvent,
+  isRoomMemoryRepairRecord,
+  type RoomMemoryEvent,
+  type RoomMemoryRepairRecord,
+} from "./room-memory.js";
 
 export interface RoomSummary {
   readonly roomId: string;
@@ -86,7 +92,8 @@ export type RoomRepairRecord =
   | { readonly kind: "legacy-unknown-calibration";
       readonly value: LegacyUnknownCalibrationSignal }
   | OperationalMessageAuthorityRepairRecord
-  | AttachmentRepairRecord;
+  | AttachmentRepairRecord
+  | RoomMemoryRepairRecord;
 
 export type SnapshotVersion =
   | { readonly kind: "room"; readonly roomId: string; readonly watermark: number }
@@ -207,6 +214,7 @@ export type PersistedRoomEvent =
   | RoomEvent<"room.message.accepted", Message>
   | MessageAuthorityEvent
   | AttachmentRoomEvent
+  | RoomMemoryEvent
   | RoomEvent<"room.human_read.recorded", HumanReadReceipt>
   | RoomEvent<"room.agent_judgment.recorded", AgentJudgement>
   | RoomEvent<"room.open_item.changed", OpenItem>
@@ -381,6 +389,7 @@ function isRepairRecord(value: unknown, expectedRoomId?: string): value is RoomR
     return isMessageAuthorityRepairRecord(value, expectedRoomId);
   }
   if (value.kind === "attachment") return isAttachmentRepairRecord(value, expectedRoomId);
+  if (value.kind === "memory") return isRoomMemoryRepairRecord(value, expectedRoomId);
   if (!exact(value, ["kind", "value"])) return false;
   if (value.kind === "human-read") return isHumanReadReceipt(value.value);
   if (value.kind === "agent-judgement") return isAgentJudgement(value.value);
@@ -416,6 +425,7 @@ function isPersistedRoomEventValue(value: unknown): value is PersistedRoomEvent 
   const payload = value.payload;
   if (isMessageAuthorityEvent(value)) return true;
   if (isAttachmentRoomEvent(value)) return true;
+  if (isRoomMemoryEvent(value)) return true;
   if (value.type === "room.created" || value.type === "room.renamed") {
     return exact(payload, ["room"]) && isManagedRoomValue(payload.room) && payload.room.id === value.roomId;
   }

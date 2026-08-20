@@ -37,6 +37,7 @@ export interface MemoryStewardProviderInput {
 }
 
 export interface MemoryStewardSourceRef {
+  readonly sourceKind: RoomMemorySourceKind;
   readonly sourceId: string;
   readonly sourceRevision: number;
 }

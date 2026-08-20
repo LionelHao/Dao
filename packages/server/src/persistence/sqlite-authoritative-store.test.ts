@@ -5536,6 +5536,47 @@ describe("SQLite authoritative sessions", () => {
     expect(database.prepare(
       "SELECT COUNT(*) AS count FROM events WHERE event_type IN ('room.message.accepted', 'room.message.revised', 'room.message.recalled') AND stream_id = ?",
     ).get(message.roomId)).toEqual({ count: 3 });
+    const memorySources = database.prepare(
+      `SELECT source_kind AS sourceKind, source_id AS sourceId,
+              source_revision AS sourceRevision, eligibility, availability,
+              safe_metadata_json AS safeMetadataJson, read_reference AS readReference
+       FROM room_memory_sources
+       WHERE room_id = ? AND json_extract(safe_metadata_json, '$.messageId') = ?
+       ORDER BY corpus_seq`,
+    ).all(message.roomId, message.messageId);
+    expect(memorySources).toEqual([
+      {
+        sourceKind: "message",
+        sourceId: `message:${message.messageId}`,
+        sourceRevision: 1,
+        eligibility: "excluded_revised",
+        availability: "metadata_only",
+        safeMetadataJson: JSON.stringify({ authorKind: "human", messageId: message.messageId }),
+        readReference: `message-authority:${message.messageId}:revision:1`,
+      },
+      {
+        sourceKind: "message_revision",
+        sourceId: `message-revision:${message.messageId}`,
+        sourceRevision: 2,
+        eligibility: "excluded_recalled",
+        availability: "metadata_only",
+        safeMetadataJson: JSON.stringify({ authorKind: "human", messageId: message.messageId }),
+        readReference: `message-authority:${message.messageId}:revision:2`,
+      },
+      {
+        sourceKind: "message_tombstone",
+        sourceId: `message-tombstone:${message.messageId}`,
+        sourceRevision: 2,
+        eligibility: "excluded_recalled",
+        availability: "tombstone",
+        safeMetadataJson: JSON.stringify({ messageId: message.messageId, lifecycle: "recalled" }),
+        readReference: `message-authority:tombstone:${message.messageId}:revision:2`,
+      },
+    ]);
+    expect(JSON.stringify(memorySources)).not.toContain(recallRawSentinel);
+    expect(database.prepare(
+      `SELECT corpus_head AS corpusHead FROM room_memory_stewards WHERE room_id = ?`,
+    ).get(message.roomId)).toEqual({ corpusHead: 3 });
     database.close();
   });
 
@@ -5820,6 +5861,30 @@ describe("SQLite authoritative sessions", () => {
       { scopeKind: "execution" },
       { scopeKind: "invocation-intent" },
       { scopeKind: "message" },
+    ]);
+    expect(database.prepare(
+      `SELECT source_id AS sourceId, source_revision AS sourceRevision,
+              eligibility, availability
+       FROM room_memory_sources
+       WHERE source_id IN (?, ?, ?)
+       ORDER BY source_id`,
+    ).all(
+      `message:${finalCommand.messageId}`,
+      "message:message-agent-correction-v2",
+      "message:message-agent-after-recall",
+    )).toEqual([
+      {
+        sourceId: "message:message-agent-correction-v2",
+        sourceRevision: 1,
+        eligibility: "eligible",
+        availability: "readable",
+      },
+      {
+        sourceId: `message:${finalCommand.messageId}`,
+        sourceRevision: 1,
+        eligibility: "eligible",
+        availability: "readable",
+      },
     ]);
     database.close();
   });

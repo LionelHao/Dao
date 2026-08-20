@@ -144,12 +144,11 @@ function validateFrozenInput(input: MemoryStewardProviderInput): readonly Frozen
     if (contentBytes > MEMORY_STEWARD_MAX_SOURCE_CONTENT_BYTES) return invalidInput();
     totalContentBytes += contentBytes;
     if (totalContentBytes > MEMORY_STEWARD_MAX_TOTAL_CONTENT_BYTES) return invalidInput();
-    const identity = `${source.sourceId}\u0000${source.sourceRevision}`;
+    const identity = `${source.sourceKind}\u0000${source.sourceId}\u0000${source.sourceRevision}`;
     if (identities.has(identity)) return invalidInput();
     identities.add(identity);
     previousCorpusSeq = source.corpusSeq;
   }
-  if (previousCorpusSeq !== input.toCorpusSeqInclusive) return invalidInput();
   return Object.freeze(input.sources.map((source) => Object.freeze({
     roomId: source.roomId,
     sourceId: source.sourceId,
@@ -237,8 +236,12 @@ function extractSingularOutputText(envelope: unknown): string {
   return texts[0]!;
 }
 
-function freezeRef(sourceId: string, sourceRevision: number): MemoryStewardSourceRef {
-  return Object.freeze({ sourceId, sourceRevision });
+function freezeRef(
+  sourceKind: FrozenMemoryStewardSource["sourceKind"],
+  sourceId: string,
+  sourceRevision: number,
+): MemoryStewardSourceRef {
+  return Object.freeze({ sourceKind, sourceId, sourceRevision });
 }
 
 function malformedOutput(): never {
@@ -256,7 +259,7 @@ function validatePlan(
   }
   const frozenByIdentity = new Map<string, FrozenMemoryStewardSource>();
   for (const source of frozenSources) {
-    frozenByIdentity.set(`${source.sourceId}\u0000${source.sourceRevision}`, source);
+    frozenByIdentity.set(`${source.sourceKind}\u0000${source.sourceId}\u0000${source.sourceRevision}`, source);
   }
   const referenced = new Map<string, FrozenMemoryStewardSource>();
   const candidateIdentities = new Set<string>();
@@ -290,17 +293,18 @@ function validatePlan(
     const refIdentities = new Set<string>();
     const refs: MemoryStewardSourceRef[] = [];
     for (const ref of candidate.sourceRefs) {
-      if (!isRecord(ref) || !exactOwnKeys(ref, ["sourceId", "sourceRevision"]) ||
+      if (!isRecord(ref) || !exactOwnKeys(ref, ["sourceKind", "sourceId", "sourceRevision"]) ||
+          typeof ref.sourceKind !== "string" || !SOURCE_KINDS.has(ref.sourceKind) ||
           typeof ref.sourceId !== "string" || !SAFE_ID.test(ref.sourceId) ||
           !positiveSafeInteger(ref.sourceRevision)) {
         return malformedOutput();
       }
-      const identity = `${ref.sourceId}\u0000${ref.sourceRevision}`;
+      const identity = `${ref.sourceKind}\u0000${ref.sourceId}\u0000${ref.sourceRevision}`;
       const source = frozenByIdentity.get(identity);
       if (source === undefined || refIdentities.has(identity)) return malformedOutput();
       refIdentities.add(identity);
       referenced.set(identity, source);
-      refs.push(freezeRef(ref.sourceId, ref.sourceRevision));
+      refs.push(freezeRef(source.sourceKind, ref.sourceId, ref.sourceRevision));
     }
     candidates.push(Object.freeze({
       operation: candidate.operation as MemoryStewardCandidate["operation"],
@@ -353,8 +357,9 @@ function responseSchema(sources: readonly FrozenMemoryStewardSource[]): Readonly
                 anyOf: sources.map((source) => ({
                   type: "object",
                   additionalProperties: false,
-                  required: ["sourceId", "sourceRevision"],
+                  required: ["sourceKind", "sourceId", "sourceRevision"],
                   properties: {
+                    sourceKind: { type: "string", const: source.sourceKind },
                     sourceId: { type: "string", const: source.sourceId },
                     sourceRevision: { type: "integer", const: source.sourceRevision },
                   },

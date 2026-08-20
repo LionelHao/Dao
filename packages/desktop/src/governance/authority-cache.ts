@@ -55,6 +55,9 @@ function recordIdentity(record: RoomRepairRecord): string {
     case "route-judgment": return `route-judgment\0${record.value.id}`;
     case "calibration": return `calibration\0${record.value.id}`;
     case "legacy-unknown-calibration": return `legacy-calibration\0${record.value.id}`;
+    case "memory": return record.value.recordType === "status"
+      ? "memory\0status"
+      : `memory\0projection\0${record.value.projection.memoryRecordId}`;
   }
 }
 
@@ -110,6 +113,20 @@ function applyProjectionEvent(records: RoomRepairRecord[], event: DesktopRoomEve
       if (index !== -1) records.splice(index, 1);
       return;
     }
+    case "room.memory.health.changed":
+      replaceRecord(records, {
+        kind: "memory",
+        roomId: event.roomId,
+        value: { recordType: "status", status: event.payload },
+      });
+      return;
+    case "room.memory.version.changed": {
+      const index = records.findIndex((record) => record.kind === "memory" &&
+        record.value.recordType === "projection" &&
+        record.value.projection.memoryRecordId === event.payload.memoryRecordId);
+      if (index !== -1) records.splice(index, 1);
+      return;
+    }
     default:
       return;
   }
@@ -119,6 +136,7 @@ export interface DesktopAuthorityCache extends ClientAuthorityCache {
   governanceProjection(roomId: string): GovernanceProjection | undefined;
   roomIds(): readonly string[];
   updatedAt(roomId: string): string | undefined;
+  roomRepairRecords(roomId: string): readonly RoomRepairRecord[] | undefined;
   clearRoom(roomId: string): void;
 }
 
@@ -254,6 +272,10 @@ export function createDesktopAuthorityCache(
     },
     updatedAt(roomId) {
       return rooms.get(roomId)?.updatedAt;
+    },
+    roomRepairRecords(roomId) {
+      const records = rooms.get(roomId)?.records;
+      return records === undefined ? undefined : structuredClone(records);
     },
   };
 }

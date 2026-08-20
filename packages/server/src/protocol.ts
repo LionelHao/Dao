@@ -5,6 +5,7 @@ import {
   isRoomCursor,
   isMessageDraft,
   isSnapshotVersion,
+  isRoomMemoryRequest,
   type Message,
   type MessageAcceptedAck,
   type MessageDraft,
@@ -34,6 +35,8 @@ import {
   type AttachmentPrivateEvent,
   type AttachmentMetadata,
   type AttachmentSourceEligibility,
+  type RoomMemoryRequest,
+  type RoomMemorySuccessFrame,
 } from "@native-im/core";
 import {
   parseAttachmentClientFrame,
@@ -457,7 +460,8 @@ export type ClientFrame =
   | LightTaskCreateFrame
   | LightTaskTransitionFrame
   | LightTaskCriterionSetFrame
-  | AttachmentClientFrame;
+  | AttachmentClientFrame
+  | RoomMemoryRequest;
 
 export interface AuthenticatedFrame {
   readonly type: "auth.authenticated";
@@ -790,6 +794,14 @@ export type ProtocolErrorCode =
   | "provider_rate_limited"
   | "provider_timeout"
   | "provider_unavailable"
+  | "memory_not_found"
+  | "memory_source_not_found"
+  | "memory_version_conflict"
+  | "memory_recovery_generation_conflict"
+  | "memory_source_gone"
+  | "memory_capacity_limited"
+  | "memory_unavailable"
+  | "memory_dependency_unavailable"
   | "side_effect_outcome_unknown"
   | "tool_failure"
   | "tool_target_busy"
@@ -847,6 +859,7 @@ export type ServerFrame =
   | LightTaskAckFrame
   | BallQueryResultFrame
   | AttachmentAuthorityServerFrame
+  | RoomMemorySuccessFrame
   | ProtocolErrorFrame;
 
 export type ClientFrameParseResult =
@@ -1003,6 +1016,15 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
   )
     ? value.requestId
     : undefined;
+  if (typeof value.type === "string" && value.type.startsWith("room.memory.")) {
+    if (requestId !== undefined && isRoomMemoryRequest(value)) {
+      return { ok: true, frame: value };
+    }
+    return {
+      ok: false,
+      error: protocolError("Invalid Room Memory request", requestId),
+    };
+  }
   if (typeof value.type === "string" && value.type.startsWith("attachment.")) {
     const parsed = parseAttachmentClientFrame(value);
     if (parsed.ok) return parsed;

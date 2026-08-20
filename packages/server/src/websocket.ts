@@ -17,6 +17,8 @@ import {
   type MessageRevision,
   type MessageTargetOutcome,
   type PersistedRoomEvent,
+  type RoomMemoryRequest,
+  type RoomMemorySuccessFrame,
   type DepartureConflictList,
   type RoomCursor,
   type SnapshotVersion,
@@ -122,6 +124,13 @@ export interface MessageAuthorityTransport {
   ): Promise<unknown>;
 }
 
+export interface RoomMemoryAuthorityTransport {
+  execute(
+    context: AuthenticatedSessionContext,
+    request: RoomMemoryRequest,
+  ): Promise<RoomMemorySuccessFrame>;
+}
+
 export interface StartMessageWebSocketServerOptions {
   readonly auth: AuthenticationService;
   readonly service: MessageService;
@@ -148,6 +157,7 @@ export interface StartMessageWebSocketServerOptions {
   >;
   readonly ballRuntime?: Pick<BallRuntimeService, "query">;
   readonly messageAuthority?: MessageAuthorityTransport;
+  readonly memoryAuthority?: RoomMemoryAuthorityTransport;
   readonly attachmentAuthority?: AttachmentAuthorityCommandPort;
   readonly governance?: Pick<CommandStore, "executeHuman"> &
     Pick<SyncQueryStore, "readRoomGovernance"> &
@@ -621,6 +631,8 @@ const MAPPED_SERVICE_ERROR_STATUSES = new Map<GenericProtocolErrorCode, Protocol
   ["snapshot_forbidden", 403],
   ["snapshot_not_found", 404],
   ["room_not_found", 404],
+  ["memory_not_found", 404],
+  ["memory_source_not_found", 404],
   ["reply_target_not_found", 404],
   ["room_archived", 409],
   ["role_forbidden", 403],
@@ -633,11 +645,14 @@ const MAPPED_SERVICE_ERROR_STATUSES = new Map<GenericProtocolErrorCode, Protocol
   ["attachment_not_ready", 409],
   ["upload_offset_conflict", 409],
   ["message_version_conflict", 409],
+  ["memory_version_conflict", 409],
+  ["memory_recovery_generation_conflict", 409],
   ["message_recalled", 409],
   ["agent_final_immutable", 409],
   ["protocol_upgrade_required", 410],
   ["upload_expired", 410],
   ["attachment_gone", 410],
+  ["memory_source_gone", 410],
   ["attachment_too_large", 413],
   ["chunk_too_large", 413],
   ["attachment_type_unsupported", 415],
@@ -653,8 +668,11 @@ const MAPPED_SERVICE_ERROR_STATUSES = new Map<GenericProtocolErrorCode, Protocol
   ["snapshot_expired", 410],
   ["snapshot_busy", 429],
   ["attachment_capacity_limited", 429],
+  ["memory_capacity_limited", 429],
   ["repair_barrier_active", 503],
   ["storage_unavailable", 503],
+  ["memory_unavailable", 503],
+  ["memory_dependency_unavailable", 503],
   ["scanner_unavailable", 503],
   ["extractor_unavailable", 503],
   ["ocr_unavailable", 503],
@@ -1301,7 +1319,13 @@ function isCorrelatedRecoveryResponse(
       | "light-task.create"
       | "light-task.transition"
       | "light-task.criterion.set"
-      | "ball.query";
+      | "ball.query"
+      | "room.memory.query.v1"
+      | "room.memory.source.query.v1"
+      | "room.memory.context.dispute.v1"
+      | "room.memory.context.resolve.v1"
+      | "room.memory.status.query.v1"
+      | "room.memory.retry.v1";
   }>,
   response: unknown,
 ): response is ServerFrame {
@@ -1410,7 +1434,13 @@ async function handleRecoveryFrame(
       | "light-task.create"
       | "light-task.transition"
       | "light-task.criterion.set"
-      | "ball.query";
+      | "ball.query"
+      | "room.memory.query.v1"
+      | "room.memory.source.query.v1"
+      | "room.memory.context.dispute.v1"
+      | "room.memory.context.resolve.v1"
+      | "room.memory.status.query.v1"
+      | "room.memory.retry.v1";
   }>,
   options: StartMessageWebSocketServerOptions,
   context: ConnectionContext,
@@ -2770,6 +2800,29 @@ async function handleFrame(
     case "room.subscribe.v2":
       await handleSubscribeV2(socket, frame, options, context);
       return;
+    case "room.memory.query.v1":
+    case "room.memory.source.query.v1":
+    case "room.memory.context.dispute.v1":
+    case "room.memory.context.resolve.v1":
+    case "room.memory.status.query.v1":
+    case "room.memory.retry.v1": {
+      const session = await requireSession(socket, frame.requestId, options, context);
+      if (session === undefined) return;
+      if (options.memoryAuthority === undefined) {
+        sendFrame(socket, errorFrame(
+          503, "memory_dependency_unavailable", "memory_dependency_unavailable", frame.requestId,
+        ));
+        return;
+      }
+      const generation = context.credentialGeneration;
+      try {
+        const response = await options.memoryAuthority.execute(session, frame);
+        sendCurrentGeneration(socket, response, generation, context);
+      } catch (error: unknown) {
+        sendCurrentGeneration(socket, mappedError(error, frame.requestId), generation, context);
+      }
+      return;
+    }
     case "workspace.bootstrap.begin":
     case "workspace.bootstrap.page":
     case "room.sync":

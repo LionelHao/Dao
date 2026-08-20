@@ -5,6 +5,10 @@ import {
 } from "@native-im/core";
 import type { RouteProviderFailureCode } from "./route-authority-protocol.js";
 import {
+  evaluateMemoryRuntimeGate,
+  type MemoryRuntimeReadiness,
+} from "../room-memory/runtime-readiness.js";
+import {
   RouteRuntimeError,
   type RouteAuthority,
   type RouterProvider,
@@ -23,8 +27,13 @@ export interface RouteRuntimeService {
   close(): Promise<void>;
 }
 
+export interface RouteMemoryReadinessPort {
+  read(roomId: string): Promise<MemoryRuntimeReadiness>;
+}
+
 export interface CreateRouteRuntimeServiceOptions {
   readonly authority: RouteAuthority;
+  readonly memoryReadiness: RouteMemoryReadinessPort;
   readonly provider: RouterProvider;
   readonly invoke: (routeJobId: string, intent: RouteInvocationIntent) => Promise<void>;
   readonly maxActiveRooms?: number;
@@ -160,34 +169,47 @@ export function createRouteRuntimeService(
   const process = async (entry: QueuedRoute): Promise<void> => {
     const claimed = await options.authority.claim(entry.sourceMessageId);
     const { job, providerInput, decisionContext } = claimed;
-    const controller = new AbortController();
-    controllers.set(entry.roomId, controller);
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    let timedOut = false;
     let plan: RouterPlan | undefined;
     let failure: RouteProviderFailureCode | undefined;
+    let semanticProviderAllowed = false;
     try {
-      timeout = setTimeout(() => {
-        timedOut = true;
-        controller.abort(new Error("route provider timeout"));
-      }, providerInput.limits.timeoutMs);
-      const candidatePlan = await options.provider.decide(providerInput, controller.signal);
-      const agentIds = new Set(providerInput.agents.map((agent) => agent.agentId));
-      if (!planMatchesClosedInput(
-        candidatePlan,
-        agentIds,
-        providerInput.limits.maxCandidates,
-        providerInput.message.authorKind,
-      )) {
-        failure = "provider_malformed";
-      } else {
-        plan = candidatePlan;
-      }
+      const memory = await options.memoryReadiness.read(job.roomId);
+      semanticProviderAllowed = evaluateMemoryRuntimeGate({
+        kind: "semantic_proactive",
+        memory,
+      }).allowed;
     } catch (error: unknown) {
-      failure = providerFailureCode(error, timedOut);
-    } finally {
-      if (timeout !== undefined) clearTimeout(timeout);
-      controllers.delete(entry.roomId);
+      report(error);
+    }
+    if (closed) return;
+    if (semanticProviderAllowed) {
+      const controller = new AbortController();
+      controllers.set(entry.roomId, controller);
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      let timedOut = false;
+      try {
+        timeout = setTimeout(() => {
+          timedOut = true;
+          controller.abort(new Error("route provider timeout"));
+        }, providerInput.limits.timeoutMs);
+        const candidatePlan = await options.provider.decide(providerInput, controller.signal);
+        const agentIds = new Set(providerInput.agents.map((agent) => agent.agentId));
+        if (!planMatchesClosedInput(
+          candidatePlan,
+          agentIds,
+          providerInput.limits.maxCandidates,
+          providerInput.message.authorKind,
+        )) {
+          failure = "provider_malformed";
+        } else {
+          plan = candidatePlan;
+        }
+      } catch (error: unknown) {
+        failure = providerFailureCode(error, timedOut);
+      } finally {
+        if (timeout !== undefined) clearTimeout(timeout);
+        controllers.delete(entry.roomId);
+      }
     }
     if (closed) return;
     if (failure !== undefined && job.currentAttempt < 3) {

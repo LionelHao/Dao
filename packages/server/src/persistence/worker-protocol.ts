@@ -50,6 +50,10 @@ import {
   isBallAuthorityOperation,
   type BallAuthorityOperation,
 } from "../ball-runtime/ball-authority-protocol.js";
+import {
+  isMemoryAuthorityOperation,
+  type MemoryAuthorityOperation,
+} from "../room-memory/authority-protocol.js";
 import type { CommittedRoomCacheInvalidationIntent } from "../access/room-cache-invalidation-port.js";
 import type {
   AgentCollaborationCommand,
@@ -152,6 +156,14 @@ export type AuthorityWorkerErrorCode =
   | "member_not_found"
   | "message_not_found"
   | "message_version_conflict"
+  | "memory_not_found"
+  | "memory_source_not_found"
+  | "memory_version_conflict"
+  | "memory_recovery_generation_conflict"
+  | "memory_source_gone"
+  | "memory_capacity_limited"
+  | "memory_unavailable"
+  | "memory_dependency_unavailable"
   | "open_item_not_found"
   | "permission_denied"
   | "protocol_upgrade_required"
@@ -243,6 +255,14 @@ export function isAuthorityWorkerErrorCode(
     case "member_not_found":
     case "message_not_found":
     case "message_version_conflict":
+    case "memory_not_found":
+    case "memory_source_not_found":
+    case "memory_version_conflict":
+    case "memory_recovery_generation_conflict":
+    case "memory_source_gone":
+    case "memory_capacity_limited":
+    case "memory_unavailable":
+    case "memory_dependency_unavailable":
     case "open_item_not_found":
     case "permission_denied":
     case "protocol_upgrade_required":
@@ -564,6 +584,11 @@ export type AuthorityWorkerRequest =
       readonly requestId: string;
       readonly operation: BallAuthorityOperation;
     }
+  | {
+      readonly type: "authority.memory";
+      readonly requestId: string;
+      readonly operation: MemoryAuthorityOperation;
+    }
   | { readonly type: "authority.close"; readonly requestId: string };
 
 export type AuthorityWorkerResponse =
@@ -757,6 +782,11 @@ export type AuthorityWorkerResponse =
     }
   | {
       readonly type: "authority.ball-result";
+      readonly requestId: string;
+      readonly result: JsonValue;
+    }
+  | {
+      readonly type: "authority.memory-result";
       readonly requestId: string;
       readonly result: JsonValue;
     }
@@ -1573,6 +1603,9 @@ export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWork
     case "authority.ball":
       return hasExactKeys(value, ["type", "requestId", "operation"]) &&
         isBallAuthorityOperation(value.operation);
+    case "authority.memory":
+      return hasExactKeys(value, ["type", "requestId", "operation"]) &&
+        isMemoryAuthorityOperation(value.operation);
     default:
       return false;
   }
@@ -1722,6 +1755,9 @@ export function isAuthorityWorkerResponse(
       return hasExactKeys(value, ["type", "requestId", "result"]) &&
         isJsonValue(value.result);
     case "authority.ball-result":
+      return hasExactKeys(value, ["type", "requestId", "result"]) &&
+        isJsonValue(value.result);
+    case "authority.memory-result":
       return hasExactKeys(value, ["type", "requestId", "result"]) &&
         isJsonValue(value.result);
     case "authority.legacy-imported":

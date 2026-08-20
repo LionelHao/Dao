@@ -12,6 +12,7 @@ import {
   isMessageAuthorityEvent,
   isRoomCursor,
   isRoomGovernanceView,
+  isRoomMemoryEvent,
   isHumanRoomMembership,
   isMessage,
   isOpenItem,
@@ -1227,6 +1228,9 @@ function validRoomEventPayload(
 export function parsePersistedRoomEvent(
   value: unknown,
 ): ContractParseResult<PersistedRoomEvent, "invalid_event"> {
+  if (isRoomMemoryEvent(value)) {
+    return { ok: true, value };
+  }
   if (isMessageAuthorityEvent(value)) {
     // The integration branch widens PersistedRoomEvent to this closed Core union.
     // Keep this compatibility cast until that Core declaration is present here.

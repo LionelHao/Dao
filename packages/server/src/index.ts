@@ -211,6 +211,7 @@ export type WorkerDatabaseClient = Omit<
   | "executeRuntime"
   | "executeRoute"
   | "executeBall"
+  | "executeMemory"
   | "executeAttachment"
   | "readActor"
   | "readRoom"

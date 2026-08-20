@@ -1,3 +1,10 @@
+import type {
+  RoomMemorySourceAvailability,
+  RoomMemorySourceEligibility,
+  RoomMemorySourceKind,
+} from "@native-im/core";
+import type { MemoryStewardPlan } from "./contracts.js";
+
 export interface MemoryStewardBatch {
   readonly roomId: string;
   readonly jobId: string;
@@ -6,6 +13,14 @@ export interface MemoryStewardBatch {
   readonly fromWatermarkExclusive: number;
   readonly toCorpusSeqInclusive: number;
   readonly sourceCount: number;
+  readonly sources: readonly Readonly<{
+    corpusSeq: number;
+    sourceKind: RoomMemorySourceKind;
+    sourceId: string;
+    sourceRevision: number;
+    eligibility: RoomMemorySourceEligibility;
+    availability: RoomMemorySourceAvailability;
+  }>[];
 }
 
 export interface MemoryStewardBatchResult {
@@ -13,6 +28,8 @@ export interface MemoryStewardBatchResult {
   readonly attemptId: string;
   readonly recoveryGeneration: number;
   readonly candidateCount: number;
+  readonly outputSha256: string;
+  readonly plan: MemoryStewardPlan;
 }
 
 export interface MemoryStewardAuthority {

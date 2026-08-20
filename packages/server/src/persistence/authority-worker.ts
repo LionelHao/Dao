@@ -61,6 +61,8 @@ import {
 import { ballResultAsJson } from "../ball-runtime/ball-authority-protocol.js";
 import { runtimeResultAsJson } from "../agent-runtime/runtime-authority-protocol.js";
 import { routeResultAsJson } from "../route-runtime/route-authority-protocol.js";
+import { memoryResultAsJson } from "../room-memory/authority-protocol.js";
+import { executeMemoryAuthorityOperation } from "../room-memory/authority-database-handler.js";
 import {
   FallbackRepairCoordinator,
   FallbackRepairError,
@@ -2285,6 +2287,38 @@ function executeBall(request: AuthorityWorkerRequest): void {
   }
 }
 
+function executeMemory(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.memory") throw new TypeError("executeMemory received the wrong request type");
+  try {
+    const result = executeMemoryAuthorityOperation(requireAuthorityTransactionDatabase(), request.operation);
+    respond({
+      type: "authority.memory-result", requestId: request.requestId, result: memoryResultAsJson(result),
+    });
+    const roomId = request.operation.type === "memory.public"
+      ? request.operation.request.roomId
+      : request.operation.type === "memory.discover"
+        ? undefined
+        : request.operation.type === "memory.source-authorize" || request.operation.type === "memory.complete" ||
+            request.operation.type === "memory.fail" || request.operation.type === "memory.abandon"
+          ? request.operation.batch.roomId
+          : request.operation.roomId;
+    if (roomId !== undefined && request.operation.type !== "memory.readiness" &&
+        request.operation.type !== "memory.source-authorize" && request.operation.type !== "memory.record-known") {
+      repairs.preemptAfterCommit({
+        roomIds: [roomId], catalogPrincipalIds: [], familyIds: [],
+        code: "snapshot_stale", now: "now" in request.operation ? request.operation.now : Date.now(),
+      });
+    }
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithError(request.requestId, "storage_unavailable", "Authority memory operation failed");
+  }
+}
+
 function readHistory(request: AuthorityWorkerRequest): void {
   if (request.type !== "authority.read-history") {
     throw new TypeError("readHistory received the wrong request type");
@@ -2755,6 +2789,9 @@ async function dispatch(value: unknown): Promise<void> {
       return;
     case "authority.ball":
       executeBall(value);
+      return;
+    case "authority.memory":
+      executeMemory(value);
       return;
     case "authority.read-history":
       readHistory(value);
