@@ -56,7 +56,7 @@ const MEMORY_REPAIR_SQL = `
       '[]' AS disputesJson,
       '[]' AS resolutionsJson
     FROM room_memory_stewards AS steward
-    WHERE steward.room_id = ?1
+    WHERE steward.room_id = ?
 
     UNION ALL
 
@@ -155,11 +155,11 @@ const MEMORY_REPAIR_SQL = `
      AND version.room_id = record.room_id
      AND version.kind = record.kind
      AND version.version_number = record.current_version_number
-    WHERE record.room_id = ?1
+    WHERE record.room_id = ?
   ) AS candidate
-  WHERE candidate.stableKey > ?2
+  WHERE candidate.stableKey > ?
   ORDER BY candidate.stableKey
-  LIMIT ?3
+  LIMIT ?
 `;
 
 function reject(reason: RoomMemoryRepairDescriptorFailureReason): never {
@@ -281,6 +281,7 @@ function readMemoryKeysetPage(input: RepairKeysetPageInput): readonly unknown[] 
   validateReadInput(input);
   const afterKey = input.afterKey ?? "";
   const rows = input.database.prepare(MEMORY_REPAIR_SQL).all(
+    input.roomId,
     input.roomId,
     afterKey,
     input.limit,
