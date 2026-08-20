@@ -839,6 +839,10 @@ export function markRoomMemoryNoauth(database: DatabaseSync, input: {
       SET health = 'noauth', health_reason_code = 'provider_secret_missing',
           retryable = 0, recovery_required = 0, updated_at = ?
       WHERE room_id = ?
+        AND (health <> 'noauth'
+          OR health_reason_code IS NOT 'provider_secret_missing'
+          OR retryable <> 0
+          OR recovery_required <> 0)
     `).run(input.occurredAt, input.roomId);
     return readRoomMemoryStatus(database, input.roomId);
   });

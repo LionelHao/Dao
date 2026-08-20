@@ -302,6 +302,31 @@ describe("FT-05 AuthorityWorker Room Memory operations", () => {
     }
   });
 
+  it("keeps repeated noauth readiness reports idempotent without changing repair state", () => {
+    const value = fixture();
+    try {
+      executeMemoryAuthorityOperation(value.database, {
+        type: "memory.mark-noauth", roomId: "room-1", now: T1,
+      });
+      const first = value.database.prepare(`
+        SELECT updated_at AS updatedAt FROM room_memory_stewards WHERE room_id = 'room-1'
+      `).get();
+
+      executeMemoryAuthorityOperation(value.database, {
+        type: "memory.mark-noauth", roomId: "room-1", now: T1 + 1,
+      });
+
+      expect(value.database.prepare(`
+        SELECT updated_at AS updatedAt FROM room_memory_stewards WHERE room_id = 'room-1'
+      `).get()).toEqual(first);
+      expect(value.database.prepare(`
+        SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.memory.health.changed'
+      `).get()).toEqual({ count: 1 });
+    } finally {
+      value.close();
+    }
+  });
+
   it("names a memory health event safely when the raw base64url digest starts with punctuation", () => {
     const value = fixture();
     try {
