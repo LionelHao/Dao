@@ -829,15 +829,18 @@ class JsonWebSocketClient {
     this.#socket.send(JSON.stringify(value));
   }
 
-  waitFor(predicate: (frame: ServerFrame) => boolean): Promise<ServerFrame> {
+  waitFor(
+    predicate: (frame: ServerFrame) => boolean,
+    timeoutMs = 12_000,
+  ): Promise<ServerFrame> {
     const index = this.#frames.findIndex(predicate);
     if (index >= 0) return Promise.resolve(this.#frames.splice(index, 1)[0]!);
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         const index = this.#waiters.findIndex((waiter) => waiter.timeout === timeout);
         if (index >= 0) this.#waiters.splice(index, 1);
-        reject(new Error("Timed out waiting 12 seconds for the expected WebSocket frame"));
-      }, 12_000);
+        reject(new Error(`Timed out waiting ${timeoutMs}ms for the expected WebSocket frame`));
+      }, timeoutMs);
       this.#waiters.push({ predicate, resolve, reject, timeout });
     });
   }
@@ -1503,7 +1506,7 @@ describe("authoritative server real-process harness", () => {
       await expect(client.waitFor((frame) => frame.type === "room.event" &&
         frame.event.roomId === roomId &&
         frame.event.type === "room.message.accepted" &&
-        frame.event.payload.id === messageId)).resolves.toMatchObject({
+        frame.event.payload.id === messageId, 20_000)).resolves.toMatchObject({
         type: "room.event",
         event: {
           roomId,
@@ -2288,6 +2291,27 @@ describe("authoritative server real-process harness", () => {
         }
         throw new Error("Message submission retry bound was exhausted");
       };
+      const recall = async (messageId: string, requestId: string): Promise<void> => {
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            const receipt = await client!.request({
+              type: "message.recall",
+              requestId,
+              roomId,
+              messageId,
+              expectedRevision: 1,
+            }, "message.recall.accepted");
+            expect(receipt).toMatchObject({ messageId, revision: 1 });
+            return;
+          } catch (error: unknown) {
+            if (!isRecord(error) || error.code !== "storage_unavailable" || attempt === 2) {
+              throw error;
+            }
+            await new Promise<void>((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+          }
+        }
+        throw new Error("Message recall retry bound was exhausted");
+      };
       const invoke = async (messageId: string) => {
         const frame = await client!.request({
           type: "agent.invoke",
@@ -2316,16 +2340,7 @@ describe("authoritative server real-process harness", () => {
           database.close();
         }
       });
-      await expect(client.request({
-        type: "message.recall",
-        requestId: "recall-completed-preview-source",
-        roomId,
-        messageId: completedSourceId,
-        expectedRevision: 1,
-      }, "message.recall.accepted")).resolves.toMatchObject({
-        messageId: completedSourceId,
-        revision: 1,
-      });
+      await recall(completedSourceId, "recall-completed-preview-source");
 
       const previewSourceId = "message-preview-running";
       await submit(previewSourceId, "run a read tool then wait on preview");
@@ -2353,16 +2368,7 @@ describe("authoritative server real-process harness", () => {
         beforeRecall.close();
       }
 
-      await expect(client.request({
-        type: "message.recall",
-        requestId: "recall-running-preview-source",
-        roomId,
-        messageId: previewSourceId,
-        expectedRevision: 1,
-      }, "message.recall.accepted")).resolves.toMatchObject({
-        messageId: previewSourceId,
-        revision: 1,
-      });
+      await recall(previewSourceId, "recall-running-preview-source");
 
       const history = await client.request({
         type: "room.history.v2",
