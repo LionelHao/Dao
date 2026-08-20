@@ -2548,13 +2548,10 @@ describe("authoritative server real-process harness", () => {
         runtime.client.subscribe((input) => inputs[index]!.push(structuredClone(input)));
         return runtime;
       });
-      const historyWithRetry = async (
-        runtime: DesktopMessageAuthorityRuntime,
-        command: Parameters<DesktopMessageAuthorityRuntime["client"]["historyV2"]>[0],
-      ): ReturnType<DesktopMessageAuthorityRuntime["client"]["historyV2"]> => {
+      const withDesktopRetry = async <T>(operation: () => Promise<T>): Promise<T> => {
         for (let attempt = 0; attempt < 5; attempt += 1) {
           try {
-            return await runtime.client.historyV2(command);
+            return await operation();
           } catch (error: unknown) {
             const closed = isRecord(error) && isRecord(error.error) ? error.error : undefined;
             if ((closed?.code !== "service_unavailable" &&
@@ -2564,8 +2561,13 @@ describe("authoritative server real-process harness", () => {
             await new Promise<void>((resolve) => setTimeout(resolve, 50 * (2 ** attempt)));
           }
         }
-        throw new Error("Desktop history retry bound was exhausted");
+        throw new Error("Desktop authority retry bound was exhausted");
       };
+      const historyWithRetry = (
+        runtime: DesktopMessageAuthorityRuntime,
+        command: Parameters<DesktopMessageAuthorityRuntime["client"]["historyV2"]>[0],
+      ): ReturnType<DesktopMessageAuthorityRuntime["client"]["historyV2"]> =>
+        withDesktopRetry(() => runtime.client.historyV2(command));
       const initial = await Promise.all(active.map((runtime, index) =>
         historyWithRetry(runtime, {
           type: "room.history.v2",
@@ -2589,7 +2591,7 @@ describe("authoritative server real-process harness", () => {
       const acceptedBody = "DESKTOP-V2-ACCEPTED-RAW-SENTINEL";
       const revisedBody = "DESKTOP-V2-REVISED-RAW-SENTINEL";
       const messageId = "message-v2-desktop-repair";
-      await expect(active[0]!.client.sendV2({
+      await expect(withDesktopRetry(() => active[0]!.client.sendV2({
         type: "message.send.v2",
         requestId: "desktop-message-send",
         message: {
@@ -2599,7 +2601,7 @@ describe("authoritative server real-process harness", () => {
           mentionedTargets: [],
           attachments: [],
         },
-      })).resolves.toMatchObject({
+      }))).resolves.toMatchObject({
         type: "message.accepted",
         requestId: "desktop-message-send",
         messageId,
@@ -2618,14 +2620,14 @@ describe("authoritative server real-process harness", () => {
           connection: expect.objectContaining({ status: "offline" }),
         });
       }, { timeout: 10_000 });
-      await expect(active[0]!.client.revise({
+      await expect(withDesktopRetry(() => active[0]!.client.revise({
         type: "message.revise",
         requestId: "desktop-message-revise",
         roomId,
         messageId,
         expectedRevision: 1,
         body: revisedBody,
-      })).resolves.toMatchObject({
+      }))).resolves.toMatchObject({
         type: "message.revision.accepted",
         requestId: "desktop-message-revise",
         messageId,
@@ -2665,13 +2667,13 @@ describe("authoritative server real-process harness", () => {
       }));
 
       for (const received of inputs) received.length = 0;
-      await expect(active[0]!.client.recall({
+      await expect(withDesktopRetry(() => active[0]!.client.recall({
         type: "message.recall",
         requestId: "desktop-message-recall",
         roomId,
         messageId,
         expectedRevision: 2,
-      })).resolves.toMatchObject({
+      }))).resolves.toMatchObject({
         type: "message.recall.accepted",
         requestId: "desktop-message-recall",
         messageId,
