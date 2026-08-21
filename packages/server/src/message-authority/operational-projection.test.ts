@@ -270,6 +270,7 @@ describe("canonical operational message projection", () => {
       finalBody: "Immutable final",
       sourceInvocationIntentId: "invocation-intent-1",
       sourceExecutionId: "execution-1",
+      citations: [],
     });
     expect(correction).toEqual({
       id: "message-agent-correction",
@@ -281,6 +282,7 @@ describe("canonical operational message projection", () => {
       finalBody: "Corrected final",
       sourceInvocationIntentId: "invocation-intent-1",
       sourceExecutionId: "execution-2",
+      citations: [],
       correctsMessageId: "message-agent-final",
     });
     expect(final.finalBody).toBe("Immutable final");

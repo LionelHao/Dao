@@ -190,6 +190,7 @@ describe("SQLite canonical operational message projection", () => {
       finalBody: "legacy final",
       sourceInvocationIntentId: "legacy:message-agent-legacy:invocation",
       sourceExecutionId: "legacy:message-agent-legacy:execution",
+      citations: [],
     });
     database.close();
   });
