@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   CONTEXT_COMPILER_CONFIG_V1,
   compileContextV1,
+  verifyContextCompileResultV1,
 } from "./context-compiler.js";
+import { estimateStructuredTokensV1, utf8ByteLength } from "./token-estimator.js";
 import type { ContextCompilerInputV1 } from "@native-im/core";
-import { isContextCompileResultV1 } from "@native-im/core";
+import { isCompiledContextEnvelopeV1, isContextCompileResultV1 } from "@native-im/core";
 
 const occurredAt = "2026-08-21T01:02:03.004Z";
 
@@ -29,7 +31,8 @@ function candidate(sourceId: string, corpusSeq: number, body: string, overrides:
 function makeInput(): ContextCompilerInputV1 {
   return {
     version: "context_compiler_input_v1",
-    invocation: { invocationId: "invocation-1", executionId: "execution-1", roomId: "room-1" },
+    invocation: { invocationId: "invocation-1", executionId: "execution-1", roomId: "room-1",
+      intent: { kind: "direct_mention", sourceMessageId: "trigger", targetAgentId: "agent-1", reasonCode: "direct_mention", reasonText: "direct mandatory address" } },
     agent: { agentId: "agent-1", displayName: "Build Agent", responsibility: { availability: "unavailable", reason: "ft07_not_delivered" } },
     room: { roomId: "room-1", name: "Release room", goal: { availability: "unavailable", reason: "ft09_not_delivered" } },
     trigger: {
@@ -41,8 +44,8 @@ function makeInput(): ContextCompilerInputV1 {
       occurredAt,
       replyTo: { sourceId: "message-0", revision: 2 },
       mentions: [
-        { startUtf16: 13, endUtf16: 20, targetKind: "human", targetId: "human-2" },
-        { startUtf16: 0, endUtf16: 12, targetKind: "agent", targetId: "agent-1" },
+        { targetId: "target-human-2", targetKind: "human-request", targetActorId: "human-2", range: { startUtf16: 13, endUtf16: 20 } },
+        { targetId: "target-agent-1", targetKind: "agent-invocation", targetActorId: "agent-1", range: { startUtf16: 0, endUtf16: 12 } },
       ],
       readRef: "read:trigger",
     },
@@ -69,7 +72,13 @@ function makeInput(): ContextCompilerInputV1 {
       },
     ],
     delta: [
-      candidate("trigger", 9, "duplicate trigger delta", { source: source("trigger", 9) }),
+      { source: source("trigger", 9), body: "@Build Agent summarize the release.\r\nInclude citations.", availability: "readable",
+        author: { actorId: "human-1", kind: "human", displayName: "Leo" }, occurredAt,
+        replyTo: { sourceId: "message-0", revision: 2 },
+        mentions: [
+          { targetId: "target-human-2", targetKind: "human-request", targetActorId: "human-2", range: { startUtf16: 13, endUtf16: 20 } },
+          { targetId: "target-agent-1", targetKind: "agent-invocation", targetActorId: "agent-1", range: { startUtf16: 0, endUtf16: 12 } },
+        ], readRef: "read:trigger" },
       candidate("delta-8", 8, "The canary is green."),
       candidate("delta-7", 7, "Release notes are ready."),
       candidate("delta-6", 6, "Tests passed."),
@@ -99,7 +108,8 @@ describe("compileContextV1", () => {
     expect(first.envelope.groupContent.map((item) => item.section)).toEqual([
       "trigger", "memory", "memory", "delta", "delta", "delta", "retrieval", "attachment",
     ]);
-    expect(first.envelope.groupContent[0]?.mentions.map((mention) => mention.targetId)).toEqual(["agent-1", "human-2"]);
+    expect(first.envelope.groupContent.filter((item) => item.section === "memory").map((item) => item.memoryKind)).toEqual(["goal", "decision"]);
+    expect(first.envelope.groupContent[0]?.mentions.map((mention) => mention.targetActorId)).toEqual(["agent-1", "human-2"]);
     expect(first.envelope.groupContent[0]?.replyTo).toEqual({ sourceId: "message-0", revision: 2 });
     expect(first.envelope.availableTools.map((tool) => tool.id)).toEqual(["a-tool", "z-tool"]);
     expect(first.envelope.projectContext).toEqual({ availability: "disabled", reason: "ft09_not_delivered" });
@@ -109,14 +119,50 @@ describe("compileContextV1", () => {
     expect(first.manifest.manifestHash).toMatch(/^[0-9a-f]{64}$/);
     expect(first.envelopeSha256).toMatch(/^[0-9a-f]{64}$/);
     expect(first.manifestSha256).toMatch(/^[0-9a-f]{64}$/);
-    expect(first.envelopeSha256).toBe("dd869f614c0a1782da9ab78f0e25e433594d6f45bb5da53e3ca9954962f48b90");
-    expect(first.manifestSha256).toBe("f45c32cc7f83bc1d537187f33ea5698e54e10b0e3670b4473e314679154e80dc");
+    expect(first.envelopeSha256).toBe("cd1fd7ea8be47d5bbb4e6be62b624938f9221c395de307e3e60ce3f6245a7faa");
+    expect(first.manifestSha256).toBe("c8d7690a2a1b49dfd4c9422bf23cea853d13db05c44d82262c8a310a167be0f1");
     expect(first.envelope.trusted.developer.agent.responsibility).toEqual({ availability: "unavailable", reason: "ft07_not_delivered" });
     expect(first.envelope.trusted.developer.room.goal).toEqual({ availability: "unavailable", reason: "ft09_not_delivered" });
     expect(first.envelope.trusted.developer.triggerType).toBe("message");
     expect(isContextCompileResultV1(first)).toBe(true);
+    expect(verifyContextCompileResultV1(first)).toBe(true);
     expect(isContextCompileResultV1({ ...first, manifestSha256: "0".repeat(64), covert: true })).toBe(false);
     expect(first.canonicalEnvelope).not.toContain("visibleConversation");
+  });
+
+  it("rejects cross-field, canonical-byte, and cryptographic tampering at the correct boundary", () => {
+    const result = compileContextV1(makeInput(), CONTEXT_COMPILER_CONFIG_V1);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    const divergentIntentEnvelope = {
+      ...result.envelope,
+      trusted: { ...result.envelope.trusted, developer: { ...result.envelope.trusted.developer,
+        invocationIntent: { kind: "structured_help", sourceMessageId: "trigger", targetAgentId: "agent-1",
+          reasonCode: "structured_help", reasonText: "forged" } } },
+    };
+    expect(isCompiledContextEnvelopeV1(divergentIntentEnvelope)).toBe(false);
+
+    const divergentAccountingEnvelope = {
+      ...result.envelope,
+      manifest: { ...result.envelope.manifest, accounting: { ...result.envelope.manifest.accounting,
+        inputTokens: result.envelope.manifest.accounting.inputTokens + 1,
+        envelopeBytes: result.envelope.manifest.accounting.envelopeBytes + 1,
+        totalTokens: result.envelope.manifest.accounting.totalTokens + 1 } },
+    };
+    expect(isCompiledContextEnvelopeV1(divergentAccountingEnvelope)).toBe(false);
+
+    const forgedGroupEnvelope = { ...result.envelope, groupContent: result.envelope.groupContent.map((item, index) => index === 0
+      ? { ...item, citationLabel: result.envelope.groupContent[1]!.citationLabel }
+      : item) };
+    expect(isCompiledContextEnvelopeV1(forgedGroupEnvelope)).toBe(false);
+
+    const nonCanonicalBytes = { ...result, canonicalEnvelope: ` ${result.canonicalEnvelope}` };
+    expect(isContextCompileResultV1(nonCanonicalBytes)).toBe(true);
+    expect(verifyContextCompileResultV1(nonCanonicalBytes)).toBe(false);
+    const forgedSha = { ...result, envelopeSha256: "0".repeat(64) };
+    expect(isContextCompileResultV1(forgedSha)).toBe(true);
+    expect(verifyContextCompileResultV1(forgedSha)).toBe(false);
   });
 
   it("does not change output for input array and object insertion permutations", () => {
@@ -140,14 +186,89 @@ describe("compileContextV1", () => {
     expect(compileContextV1(permuted, CONTEXT_COMPILER_CONFIG_V1)).toEqual(compileContextV1(base, CONTEXT_COMPILER_CONFIG_V1));
   });
 
+  it("round-trips routed invocation authority without rebuilding a direct mention", () => {
+    const input = makeInput();
+    input.invocation.intent = { kind: "routed_candidate", sourceMessageId: "trigger", targetAgentId: "agent-1", reasonCode: "risk_detected", reasonText: "migration is risky" };
+    const result = compileContextV1(input, CONTEXT_COMPILER_CONFIG_V1);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.envelope.invocation.intent).toEqual(input.invocation.intent);
+    expect(result.envelope.trusted.developer.invocationIntent).toEqual(input.invocation.intent);
+  });
+
   it("deduplicates one stable source identity so its body appears in only the highest-priority section", () => {
     const input = makeInput();
-    input.retrieval = [candidate("delta-6", 6, "duplicate body must not appear")];
+    input.retrieval = [{ ...input.delta.find((entry) => entry.source.sourceId === "delta-6")! }];
     const result = compileContextV1(input, CONTEXT_COMPILER_CONFIG_V1);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.manifest.items.filter((item) => item.source.sourceId === "delta-6")).toHaveLength(1);
-    expect(result.canonicalEnvelope).not.toContain("duplicate body must not appear");
+    expect(result.canonicalEnvelope.match(/Tests passed\./g)).toHaveLength(1);
+  });
+
+  it("rejects conflicting and normalization-colliding source, memory, and tool identities", () => {
+    const sourceConflict = makeInput();
+    sourceConflict.retrieval = [candidate("delta-6", 6, "conflicting body")];
+    expect(compileContextV1(sourceConflict, CONTEXT_COMPILER_CONFIG_V1)).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+
+    const newlineCollision = makeInput();
+    newlineCollision.retrieval = [{ ...newlineCollision.delta.find((entry) => entry.source.sourceId === "delta-6")!, body: "Tests passed.\r\n" }];
+    newlineCollision.delta = newlineCollision.delta.map((entry) => entry.source.sourceId === "delta-6" ? { ...entry, body: "Tests passed.\n" } : entry);
+    expect(compileContextV1(newlineCollision, CONTEXT_COMPILER_CONFIG_V1)).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+
+    const memoryConflict = makeInput();
+    memoryConflict.memories = [...memoryConflict.memories, { ...memoryConflict.memories[0]!, body: "different" }];
+    expect(compileContextV1(memoryConflict, CONTEXT_COMPILER_CONFIG_V1)).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+
+    const toolConflict = makeInput();
+    toolConflict.tools = [...toolConflict.tools, { ...toolConflict.tools[0]!, description: "different" }];
+    expect(compileContextV1(toolConflict, CONTEXT_COMPILER_CONFIG_V1)).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+  });
+
+  it("deduplicates canonically identical memory, attachment, and tool identities", () => {
+    const input = makeInput();
+    input.memories = [...input.memories, { ...input.memories[0]!, sourceRefs: [...input.memories[0]!.sourceRefs].reverse() }];
+    input.attachments = [...input.attachments, { ...input.attachments[0]! }];
+    input.tools = [...input.tools, { ...input.tools[0]! }];
+    const result = compileContextV1(input, CONTEXT_COMPILER_CONFIG_V1);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.manifest.items.filter((item) => item.source?.sourceId === "mv-b")).toHaveLength(1);
+    expect(result.manifest.items.filter((item) => item.source?.sourceId === "attachment-1")).toHaveLength(1);
+    expect(result.envelope.availableTools.filter((tool) => tool.id === "z-tool")).toHaveLength(1);
+  });
+
+  it("uses immutable memory version identities and keeps same-record versions distinct", () => {
+    const input = makeInput();
+    input.memories = [
+      {
+        kind: "decision",
+        memoryRecordId: "memory-stable",
+        memoryVersionId: "memory-version-2",
+        version: 2,
+        body: "Current decision",
+        sourceRefs: [source("old-source", 3)],
+        availability: "readable",
+      },
+      {
+        kind: "decision",
+        memoryRecordId: "memory-stable",
+        memoryVersionId: "memory-version-1",
+        version: 1,
+        body: "Superseded decision",
+        sourceRefs: [source("older-source", 2)],
+        availability: "invalidated",
+      },
+    ];
+    const result = compileContextV1(input, CONTEXT_COMPILER_CONFIG_V1);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const memoryItems = result.manifest.items.filter((item) => item.section === "memory");
+    expect(memoryItems.map((item) => item.source?.sourceId)).toEqual(["memory-version-1", "memory-version-2"]);
+    expect(memoryItems.map((item) => item.memoryKind)).toEqual(["decision", "decision"]);
+    expect(memoryItems[0]).toMatchObject({ disposition: "invalidated", citationLabel: null });
+    expect(result.envelope.groupContent.filter((item) => item.section === "memory").map((item) => item.source.sourceId))
+      .toEqual(["memory-version-2"]);
   });
 
   it("records every closed disposition and never disguises unavailable or invalidated sources", () => {
@@ -156,7 +277,7 @@ describe("compileContextV1", () => {
       candidate("gone", 6, "", { body: null, availability: "temporarily_unavailable" }),
       candidate("recalled", 7, "", { body: null, availability: "invalidated" }),
       candidate("tombstone", 8, "", { body: null, availability: "tombstone", source: source("tombstone", 8, "message_tombstone") }),
-      candidate("trigger", 9, "duplicate trigger delta", { source: source("trigger", 9) }),
+      { ...input.delta.find((entry) => entry.source.sourceId === "trigger")! },
     ];
     const result = compileContextV1(input, CONTEXT_COMPILER_CONFIG_V1);
     expect(result.ok).toBe(true);
@@ -171,6 +292,9 @@ describe("compileContextV1", () => {
     const input = makeInput();
     input.trigger.body = `${"🙂".repeat(10_000)}e\u0301${"x".repeat(20_000)}`;
     input.trigger.mentions = [];
+    input.delta = input.delta.map((entry) => entry.source.sourceId === "trigger"
+      ? { ...entry, body: input.trigger.body, mentions: [] }
+      : entry);
     const degraded = compileContextV1(input, CONTEXT_COMPILER_CONFIG_V1);
     expect(degraded.ok).toBe(true);
     if (degraded.ok) {
@@ -205,6 +329,56 @@ describe("compileContextV1", () => {
     expect(result.envelope.accounting.sectionTokens.retrieval).toBeGreaterThan(0);
     expect(result.envelope.accounting.sectionTokens.attachment).toBeGreaterThan(0);
     expect(result.envelope.accounting.totalTokens).toBeLessThanOrEqual(CONTEXT_COMPILER_CONFIG_V1.hardLimitTokens);
+    expect(result.envelope.accounting.inputTokens).toBe(Buffer.byteLength(result.canonicalEnvelope, "utf8"));
+    expect(result.envelope.accounting.totalTokens).toBe(
+      result.envelope.accounting.inputTokens
+        + CONTEXT_COMPILER_CONFIG_V1.outputReserveTokens
+        + CONTEXT_COMPILER_CONFIG_V1.toolSchemaBudgetTokens,
+    );
+    expect(Object.values(result.envelope.accounting.sectionTokens).reduce((sum, tokens) => sum + tokens, 0))
+      .toBe(result.envelope.accounting.inputTokens);
+  });
+
+  it("enforces the configured single-segment token/byte caps and validates pre-segmented bodies", () => {
+    const input = makeInput();
+    input.retrieval = [candidate("huge-segment", 1, "🙂".repeat(4_000))];
+    const result = compileContextV1(input, CONTEXT_COMPILER_CONFIG_V1);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const represented = result.envelope.groupContent.find((item) => item.source.sourceId === "huge-segment")!;
+    expect(utf8ByteLength(represented.representation.text)).toBeLessThanOrEqual(CONTEXT_COMPILER_CONFIG_V1.singleSegmentBytes);
+    expect(estimateStructuredTokensV1(represented.representation.text, "content")).toBeLessThanOrEqual(CONTEXT_COMPILER_CONFIG_V1.singleSegmentTokens);
+
+    const invalid = makeInput();
+    invalid.attachments = [candidate("bad-segment", 2, "abc", {
+      source: source("bad-segment", 2, "attachment_extraction"),
+      segment: { index: 0, count: 1, startByte: 0, endByte: 2 },
+    })];
+    expect(compileContextV1(invalid, CONTEXT_COMPILER_CONFIG_V1)).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+  });
+
+  it("budgets available project authority and emits manifest-backed citations with source refs", () => {
+    const input = makeInput();
+    input.project = {
+      availability: "available",
+      projectId: "project-1",
+      revision: 3,
+      goals: ["Ship safely"],
+      decisions: ["Two reviewers"],
+      nextActions: ["Deploy canary"],
+      blockers: ["None"],
+      balls: ["agent-1"],
+      due: ["2026-08-22"],
+      criteria: ["All checks green"],
+      sourceRefs: [source("project-checkpoint", 5, "project_fact_checkpoint")],
+    };
+    const result = compileContextV1(input, CONTEXT_COMPILER_CONFIG_V1);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.envelope.projectContext).toMatchObject({ availability: "available", projectId: "project-1", revision: 3 });
+    expect(result.envelope.projectContext.citationLabel).toMatch(/^ctx-/);
+    expect(result.envelope.projectContext.sourceRefs).toEqual(input.project.sourceRefs);
+    expect(result.manifest.items.some((item) => item.section === "project" && item.citationLabel === result.envelope.projectContext.citationLabel)).toBe(true);
   });
 
   it("aggregates a large complete delta tail into one deterministic source-index range", () => {
@@ -218,15 +392,28 @@ describe("compileContextV1", () => {
       index + 1,
       `delta-${index + 1}:${"x".repeat(512)}`,
     ));
+    const triggerCandidate = input.delta[511]!;
+    input.trigger.body = triggerCandidate.body!;
+    input.trigger.author = triggerCandidate.author!;
+    input.trigger.occurredAt = triggerCandidate.occurredAt;
+    input.trigger.replyTo = triggerCandidate.replyTo;
+    input.trigger.mentions = triggerCandidate.mentions;
+    input.trigger.readRef = triggerCandidate.readRef;
+    input.invocation.intent = { ...input.invocation.intent, sourceMessageId: "bulk-512" };
     const result = compileContextV1(input, CONTEXT_COMPILER_CONFIG_V1);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     const ranges = result.manifest.items.filter((item) => item.source === null);
     expect(ranges).toHaveLength(1);
-    expect(ranges[0]).toMatchObject({ section: "delta", disposition: "omitted", count: 506, fromCorpusSeq: 6, toCorpusSeq: 511 });
-    expect(ranges[0]?.sourceIndexHash).toBe("868b9a3a10254a601dd5424e4b1c6568e0ce190172cb9c679b35baacf9138f6f");
+    expect(ranges[0]).toMatchObject({ section: "delta", disposition: "index_only", toCorpusSeq: 511 });
+    expect(ranges[0]?.fromCorpusSeq).toBeGreaterThan(6);
+    expect(ranges[0]?.citationLabel).toMatch(/^ctx-/);
+    expect(ranges[0]?.readRef).toMatch(/^delta-range:/);
+    expect(ranges[0]?.sourceIndexHash).toMatch(/^[0-9a-f]{64}$/);
     expect(isContextCompileResultV1(result)).toBe(true);
-    expect(result.envelope.accounting.sectionTokens.manifest).toBeLessThanOrEqual(CONTEXT_COMPILER_CONFIG_V1.manifestBudgetTokens);
+    expect(result.envelope.accounting.sectionTokens.manifest).toBe(Buffer.byteLength(result.canonicalManifest, "utf8"));
+    expect(Object.values(result.envelope.accounting.sectionTokens).reduce((sum, tokens) => sum + tokens, 0))
+      .toBe(result.envelope.accounting.inputTokens);
     expect(Buffer.byteLength(result.canonicalManifest, "utf8")).toBeLessThanOrEqual(CONTEXT_COMPILER_CONFIG_V1.manifestBytes);
   });
 });

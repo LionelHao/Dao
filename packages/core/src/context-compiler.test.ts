@@ -22,9 +22,8 @@ const source = {
 const input = {
   version: "context_compiler_input_v1" as const,
   invocation: {
-    invocationId: "invocation-1",
-    executionId: "execution-1",
-    roomId: "room-1",
+    invocationId: "invocation-1", executionId: "execution-1", roomId: "room-1",
+    intent: { kind: "direct_mention" as const, sourceMessageId: "message-1", targetAgentId: "agent-1", reasonCode: "direct_mention" as const, reasonText: "direct mention" },
   },
   agent: { agentId: "agent-1", displayName: "Build Agent", responsibility: { availability: "unavailable" as const, reason: "ft07_not_delivered" as const } },
   room: { roomId: "room-1", name: "Release room", goal: { availability: "unavailable" as const, reason: "ft09_not_delivered" as const } },
@@ -36,7 +35,7 @@ const input = {
     author: { actorId: "human-1", kind: "human" as const, displayName: "Leo" },
     occurredAt,
     replyTo: null,
-    mentions: [{ startUtf16: 0, endUtf16: 12, targetKind: "agent" as const, targetId: "agent-1" }],
+    mentions: [{ targetId: "target-1", targetKind: "agent-invocation" as const, targetActorId: "agent-1", range: { startUtf16: 0, endUtf16: 12 } }],
     readRef: "read:trigger",
   },
   memoryWatermark: 6,
@@ -79,6 +78,13 @@ describe("FT-06 Context Compiler Core contracts", () => {
     expect(isContextCompilerInputV1(hidden({ ...input }, "secret", "token"))).toBe(false);
     expect(isContextCompilerInputV1({ ...input, [Symbol("secret")]: true })).toBe(false);
     expect(isContextCompilerInputV1({ ...input, trigger: { ...input.trigger, source: { ...source, roomId: "room-2" } } })).toBe(false);
+    expect(isContextCompilerInputV1({ ...input, invocation: { ...input.invocation,
+      intent: { ...input.invocation.intent, sourceMessageId: "other-message" } } })).toBe(false);
+    expect(isContextCompilerInputV1({ ...input, invocation: { ...input.invocation,
+      intent: { ...input.invocation.intent, targetAgentId: "other-agent" } } })).toBe(false);
+    expect(isContextCompilerInputV1({ ...input, trigger: { ...input.trigger, mentions: [
+      { ...input.trigger.mentions[0]!, targetKind: "agent" },
+    ] } })).toBe(false);
     expect(isContextCompilerInputV1({ ...input, memoryWatermark: 8 })).toBe(false);
   });
 

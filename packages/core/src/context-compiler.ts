@@ -44,7 +44,10 @@ export type ContextSourceIdentityV1 = Readonly<{
 export type ContextActorV1 = Readonly<{ actorId: string; kind: "human" | "agent" | "system"; displayName: string }>;
 export type ContextReplyRefV1 = Readonly<{ sourceId: string; revision: number }>;
 export type ContextMentionV1 = Readonly<{
-  startUtf16: number; endUtf16: number; targetKind: "human" | "agent"; targetId: string;
+  targetId: string;
+  targetKind: "human-request" | "agent-invocation";
+  targetActorId: string;
+  range: Readonly<{ startUtf16: number; endUtf16: number }>;
 }>;
 export type ContextSegmentV1 = Readonly<{ index: number; count: number; startByte: number; endByte: number }>;
 export type ContextSourceAvailabilityV1 = "readable" | "metadata_only" | "tombstone" | "temporarily_unavailable" | "invalidated";
@@ -86,6 +89,10 @@ export type ContextTriggerV1 = Readonly<{
   mentions: readonly ContextMentionV1[];
   readRef: string;
 }>;
+export type ContextInvocationIntentV1 =
+  | Readonly<{ kind: "direct_mention"; sourceMessageId: string; targetAgentId: string; reasonCode: "direct_mention"; reasonText: string }>
+  | Readonly<{ kind: "structured_help"; sourceMessageId: string; targetAgentId: string; reasonCode: "structured_help"; reasonText: string }>
+  | Readonly<{ kind: "routed_candidate"; sourceMessageId: string; targetAgentId: string; reasonCode: "domain_match" | "risk_detected" | "ball_due"; reasonText: string }>;
 export type ContextToolDescriptorV1 = Readonly<{
   id: string; description: string; effect: "read-only" | "reversible-write" | "irreversible-write"; inputSchemaCanonical: string;
 }>;
@@ -99,7 +106,7 @@ export type ProjectContextInputV1 =
     }>;
 export type ContextCompilerInputV1 = Readonly<{
   version: typeof CONTEXT_COMPILER_INPUT_VERSION;
-  invocation: Readonly<{ invocationId: string; executionId: string; roomId: string }>;
+  invocation: Readonly<{ invocationId: string; executionId: string; roomId: string; intent: ContextInvocationIntentV1 }>;
   agent: Readonly<{ agentId: string; displayName: string; responsibility: ContextAgentResponsibilityV1 }>;
   room: Readonly<{ roomId: string; name: string; goal: ContextRoomGoalV1 }>;
   trigger: ContextTriggerV1;
@@ -135,6 +142,7 @@ export type ContextManifestReasonV1 = "within_budget" | "presegmented" | "sectio
   | "project_disabled" | "project_unavailable";
 export type ContextManifestItemV1 = Readonly<{
   ordinal: number; section: ContextManifestSectionV1; disposition: ContextManifestDispositionV1;
+  memoryKind: ContextMemoryKindV1 | null;
   source: ContextSourceIdentityV1; canonicalOrder: string; originalBytes: number; includedBytes: number;
   originalTokens: number; includedTokens: number; reason: ContextManifestReasonV1;
   citationLabel: string | null; contentHash: string | null; segment: ContextSegmentV1 | null;
@@ -142,19 +150,20 @@ export type ContextManifestItemV1 = Readonly<{
   availability: ContextSourceAvailabilityV1; readRef: string | null;
 }>;
 export type ContextManifestRangeV1 = Readonly<{
-  ordinal: number; section: "delta"; disposition: "omitted" | "index_only"; source: null;
+  ordinal: number; section: "delta"; disposition: "index_only"; memoryKind: null; source: null;
   canonicalOrder: string; fromCorpusSeq: number; toCorpusSeq: number; count: number;
   originalBytes: number; includedBytes: 0; originalTokens: number; includedTokens: 0;
-  reason: "section_budget"; citationLabel: null; sourceIndexHash: string;
+  reason: "section_budget"; citationLabel: string; sourceIndexHash: string; readRef: string;
 }>;
 export type ContextManifestEntryV1 = ContextManifestItemV1 | ContextManifestRangeV1;
 export type ContextSectionAccountingV1 = Readonly<{
   tools: number; trusted: number; trigger: number; identity: number; memory: number; delta: number;
-  retrieval: number; attachment: number; manifest: number; framing: number;
+  retrieval: number; attachment: number; project: number; manifest: number; framing: number;
 }>;
 export type ContextAccountingV1 = Readonly<{
   estimatorVersion: typeof CONTEXT_TOKEN_ESTIMATOR_VERSION; configVersion: string;
-  hardLimitTokens: number; totalTokens: number; envelopeBytes: number; outputReserveTokens: number;
+  hardLimitTokens: number; inputTokens: number; totalTokens: number; envelopeBytes: number;
+  outputReserveTokens: number; toolSchemaReserveTokens: number;
   sectionTokens: ContextSectionAccountingV1;
 }>;
 export type CompiledContextGroupItemV1 = Readonly<{
@@ -166,7 +175,16 @@ export type CompiledContextGroupItemV1 = Readonly<{
   author: ContextActorV1 | null; occurredAt: string | null; replyTo: ContextReplyRefV1 | null;
   mentions: readonly ContextMentionV1[];
   sourceRefs: readonly ContextSourceIdentityV1[];
+  memoryKind: ContextMemoryKindV1 | null;
 }>;
+export type CompiledProjectContextV1 =
+  | Extract<ProjectContextInputV1, { availability: "disabled" | "unavailable" }>
+  | Readonly<{
+      availability: "available"; projectId: string; revision: number;
+      representation: CompiledContextGroupItemV1["representation"] | null;
+      disposition: ContextManifestDispositionV1; citationLabel: string | null;
+      sourceRefs: readonly ContextSourceIdentityV1[];
+    }>;
 export type ContextManifestV1 = Readonly<{
   version: "context_manifest_v1"; compilerVersion: typeof CONTEXT_COMPILER_VERSION; configVersion: string;
   modelId: string; estimatorVersion: typeof CONTEXT_TOKEN_ESTIMATOR_VERSION; memoryWatermark: number;
@@ -182,10 +200,11 @@ export type CompiledContextEnvelopeV1 = Readonly<{
     developer: Readonly<{
       policy: string; agent: ContextCompilerInputV1["agent"]; room: ContextCompilerInputV1["room"];
       triggerType: ContextTriggerV1["triggerType"]; triggerReason: ContextTriggerV1["reason"];
+      invocationIntent: ContextInvocationIntentV1;
       citationContract: "manifest_labels_only";
     }>;
   }>;
-  groupContent: readonly CompiledContextGroupItemV1[]; projectContext: ProjectContextInputV1;
+  groupContent: readonly CompiledContextGroupItemV1[]; projectContext: CompiledProjectContextV1;
   availableTools: readonly ContextToolDescriptorV1[];
   degradationNotes: readonly Readonly<{
     citationLabel: string | null; section: ContextManifestSectionV1;
@@ -216,6 +235,17 @@ function exact(value: unknown, keys: readonly string[]): value is Record<string,
   const own = Reflect.ownKeys(value);
   return own.length === keys.length && own.every((key) => typeof key === "string" && keys.includes(key)
     && Object.prototype.propertyIsEnumerable.call(value, key));
+}
+function sameJsonValue(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left) && Array.isArray(right) && left.length === right.length
+      && left.every((entry, index) => sameJsonValue(entry, right[index]));
+  }
+  if (typeof left !== "object" || left === null || typeof right !== "object" || right === null) return false;
+  const leftKeys = Object.keys(left); const rightKeys = Object.keys(right);
+  return leftKeys.length === rightKeys.length && leftKeys.every((key) => Object.hasOwn(right, key)
+    && sameJsonValue((left as Record<string, unknown>)[key], (right as Record<string, unknown>)[key]));
 }
 function dense(value: unknown): value is readonly unknown[] {
   if (!Array.isArray(value) || Reflect.ownKeys(value).some((key) => typeof key === "symbol")) return false;
@@ -254,14 +284,22 @@ function reply(value: unknown): value is ContextReplyRefV1 {
   return exact(value, ["sourceId", "revision"]) && text(value.sourceId) && uint(value.revision, true);
 }
 function mentions(value: unknown): value is readonly ContextMentionV1[] {
-  return dense(value) && value.every((entry) => exact(entry, ["startUtf16", "endUtf16", "targetKind", "targetId"])
-    && uint(entry.startUtf16) && uint(entry.endUtf16, true) && entry.endUtf16 > entry.startUtf16
-    && ["human", "agent"].includes(String(entry.targetKind)) && text(entry.targetId));
+  return dense(value) && value.every((entry) => exact(entry, ["targetId", "targetKind", "targetActorId", "range"])
+    && text(entry.targetId) && ["human-request", "agent-invocation"].includes(String(entry.targetKind))
+    && text(entry.targetActorId) && exact(entry.range, ["startUtf16", "endUtf16"])
+    && uint(entry.range.startUtf16) && uint(entry.range.endUtf16, true) && entry.range.endUtf16 > entry.range.startUtf16);
 }
 function mentionsFitBody(body: string, values: readonly ContextMentionV1[]): boolean {
-  return values.every((value) => value.endUtf16 <= body.length
-    && !(value.startUtf16 > 0 && /[\ud800-\udbff]/.test(body[value.startUtf16 - 1]!))
-    && !/[\ud800-\udbff]/.test(body[value.endUtf16 - 1] ?? ""));
+  return values.every((value) => value.range.endUtf16 <= body.length
+    && !(value.range.startUtf16 > 0 && /[\ud800-\udbff]/.test(body[value.range.startUtf16 - 1]!))
+    && !/[\ud800-\udbff]/.test(body[value.range.endUtf16 - 1] ?? ""));
+}
+function invocationIntent(value: unknown): value is ContextInvocationIntentV1 {
+  if (!exact(value, ["kind", "sourceMessageId", "targetAgentId", "reasonCode", "reasonText"])
+    || !text(value.sourceMessageId) || !text(value.targetAgentId) || !text(value.reasonText)) return false;
+  if (value.kind === "direct_mention") return value.reasonCode === "direct_mention";
+  if (value.kind === "structured_help") return value.reasonCode === "structured_help";
+  return value.kind === "routed_candidate" && ["domain_match", "risk_detected", "ball_due"].includes(String(value.reasonCode));
 }
 function timestamp(value: unknown): value is string {
   return text(value) && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value);
@@ -313,12 +351,13 @@ function project(value: unknown, roomId: string): value is ProjectContextInputV1
     && value.availability === "available" && text(value.projectId) && uint(value.revision, true)
     && [value.goals, value.decisions, value.nextActions, value.blockers, value.balls, value.due, value.criteria]
       .every((entries) => dense(entries) && entries.every((entry) => text(entry)))
-    && dense(value.sourceRefs) && value.sourceRefs.every((entry) => source(entry, roomId));
+    && dense(value.sourceRefs) && value.sourceRefs.length > 0
+    && value.sourceRefs.every((entry) => source(entry, roomId));
 }
 export function isContextCompilerInputV1(value: unknown): value is ContextCompilerInputV1 {
   if (!exact(value, INPUT_KEYS) || value.version !== CONTEXT_COMPILER_INPUT_VERSION) return false;
-  if (!exact(value.invocation, ["invocationId", "executionId", "roomId"]) || !text(value.invocation.invocationId)
-    || !text(value.invocation.executionId) || !text(value.invocation.roomId)) return false;
+  if (!exact(value.invocation, ["invocationId", "executionId", "roomId", "intent"]) || !text(value.invocation.invocationId)
+    || !text(value.invocation.executionId) || !text(value.invocation.roomId) || !invocationIntent(value.invocation.intent)) return false;
   const roomId = value.invocation.roomId;
   if (!agentIdentity(value.agent) || !roomIdentity(value.room, roomId)) return false;
   if (!exact(value.trigger, ["triggerType", "reason", "source", "body", "author", "occurredAt", "replyTo", "mentions", "readRef"])
@@ -327,6 +366,8 @@ export function isContextCompilerInputV1(value: unknown): value is ContextCompil
     || !source(value.trigger.source, roomId) || !text(value.trigger.body, true) || !actor(value.trigger.author)
     || !timestamp(value.trigger.occurredAt) || !(value.trigger.replyTo === null || reply(value.trigger.replyTo))
     || !mentions(value.trigger.mentions) || !mentionsFitBody(value.trigger.body, value.trigger.mentions) || !text(value.trigger.readRef)) return false;
+  if (value.invocation.intent.sourceMessageId !== value.trigger.source.sourceId
+    || value.invocation.intent.targetAgentId !== value.agent.agentId) return false;
   if (value.trigger.triggerType === "reply" && value.trigger.replyTo === null) return false;
   if (!uint(value.memoryWatermark) || !uint(value.corpusHead) || value.memoryWatermark > value.corpusHead) return false;
   if (!dense(value.memories) || !value.memories.every((entry) => memory(entry, roomId))) return false;
@@ -368,21 +409,23 @@ export function isContextManifestV1(value: unknown): value is ContextManifestV1 
     && value.deltaRange.fromExclusive === value.memoryWatermark && value.deltaRange.toInclusive === value.corpusHead
     && ["available", "disabled", "unavailable"].includes(String(value.projectAvailability))
     && dense(value.items) && value.items.every((item, index) => isManifestEntry(item, index + 1))
-    && isAccounting(value.accounting)
+    && isAccounting(value.accounting) && value.accounting.configVersion === value.configVersion
     && /^[0-9a-f]{64}$/.test(String(value.manifestHash));
 }
 
 function isManifestEntry(value: unknown, ordinal: number): value is ContextManifestEntryV1 {
-  if (exact(value, ["ordinal", "section", "disposition", "source", "canonicalOrder", "fromCorpusSeq", "toCorpusSeq", "count", "originalBytes", "includedBytes", "originalTokens", "includedTokens", "reason", "citationLabel", "sourceIndexHash"])) {
-    return value.ordinal === ordinal && value.section === "delta" && ["omitted", "index_only"].includes(String(value.disposition))
-      && value.source === null && text(value.canonicalOrder) && uint(value.fromCorpusSeq, true) && uint(value.toCorpusSeq, true)
+  if (exact(value, ["ordinal", "section", "disposition", "memoryKind", "source", "canonicalOrder", "fromCorpusSeq", "toCorpusSeq", "count", "originalBytes", "includedBytes", "originalTokens", "includedTokens", "reason", "citationLabel", "sourceIndexHash", "readRef"])) {
+    return value.ordinal === ordinal && value.section === "delta" && value.disposition === "index_only"
+      && value.memoryKind === null && value.source === null && text(value.canonicalOrder) && uint(value.fromCorpusSeq, true) && uint(value.toCorpusSeq, true)
       && value.fromCorpusSeq <= value.toCorpusSeq && uint(value.count, true)
       && value.count === value.toCorpusSeq - value.fromCorpusSeq + 1 && uint(value.originalBytes)
       && value.includedBytes === 0 && uint(value.originalTokens) && value.includedTokens === 0
-      && value.reason === "section_budget" && value.citationLabel === null && /^[0-9a-f]{64}$/.test(String(value.sourceIndexHash));
+      && value.reason === "section_budget" && /^ctx-\d{4,}$/.test(String(value.citationLabel))
+      && /^[0-9a-f]{64}$/.test(String(value.sourceIndexHash)) && text(value.readRef);
   }
-  return exact(value, ["ordinal", "section", "disposition", "source", "canonicalOrder", "originalBytes", "includedBytes", "originalTokens", "includedTokens", "reason", "citationLabel", "contentHash", "segment", "range", "availability", "readRef"])
+  return exact(value, ["ordinal", "section", "disposition", "memoryKind", "source", "canonicalOrder", "originalBytes", "includedBytes", "originalTokens", "includedTokens", "reason", "citationLabel", "contentHash", "segment", "range", "availability", "readRef"])
     && value.ordinal === ordinal && source(value.source) && text(value.canonicalOrder)
+    && (value.memoryKind === null || ["goal", "decision", "context", "next_action", "open_question_or_blocker"].includes(String(value.memoryKind)))
     && ["trigger", "memory", "delta", "retrieval", "attachment", "project"].includes(String(value.section))
     && ["included", "excerpted", "segmented", "digested", "index_only", "omitted", "unavailable", "invalidated"].includes(String(value.disposition))
     && uint(value.originalBytes) && uint(value.includedBytes) && uint(value.originalTokens) && uint(value.includedTokens)
@@ -399,42 +442,98 @@ function isManifestEntry(value: unknown, ordinal: number): value is ContextManif
 }
 
 function isAccounting(value: unknown): value is ContextAccountingV1 {
-  if (!exact(value, ["estimatorVersion", "configVersion", "hardLimitTokens", "totalTokens", "envelopeBytes", "outputReserveTokens", "sectionTokens"])) return false;
+  if (!exact(value, ["estimatorVersion", "configVersion", "hardLimitTokens", "inputTokens", "totalTokens", "envelopeBytes", "outputReserveTokens", "toolSchemaReserveTokens", "sectionTokens"])) return false;
   if (value.estimatorVersion !== CONTEXT_TOKEN_ESTIMATOR_VERSION || !text(value.configVersion)
     || !uint(value.hardLimitTokens, true) || !uint(value.totalTokens) || value.totalTokens > value.hardLimitTokens
-    || !uint(value.envelopeBytes) || !uint(value.outputReserveTokens)) return false;
-  if (!exact(value.sectionTokens, ["tools", "trusted", "trigger", "identity", "memory", "delta", "retrieval", "attachment", "manifest", "framing"])) return false;
-  return Object.values(value.sectionTokens).every((entry) => uint(entry));
+    || !uint(value.inputTokens) || !uint(value.envelopeBytes) || value.inputTokens !== value.envelopeBytes
+    || !uint(value.outputReserveTokens) || !uint(value.toolSchemaReserveTokens)
+    || value.totalTokens !== value.inputTokens + value.outputReserveTokens + value.toolSchemaReserveTokens) return false;
+  if (!exact(value.sectionTokens, ["tools", "trusted", "trigger", "identity", "memory", "delta", "retrieval", "attachment", "project", "manifest", "framing"])) return false;
+  const sections = Object.values(value.sectionTokens);
+  return sections.every((entry) => uint(entry))
+    && sections.reduce((total, entry) => total + Number(entry), 0) === value.inputTokens;
 }
 
 export function isCompiledContextEnvelopeV1(value: unknown): value is CompiledContextEnvelopeV1 {
   if (!exact(value, ["version", "compilerVersion", "invocation", "trusted", "groupContent", "projectContext", "availableTools", "degradationNotes", "manifest", "accounting"])
     || value.version !== "compiled_context_envelope_v1" || value.compilerVersion !== CONTEXT_COMPILER_VERSION) return false;
-  if (!exact(value.invocation, ["invocationId", "executionId", "roomId"])
-    || !text(value.invocation.invocationId) || !text(value.invocation.executionId) || !text(value.invocation.roomId)) return false;
+  if (!exact(value.invocation, ["invocationId", "executionId", "roomId", "intent"])
+    || !text(value.invocation.invocationId) || !text(value.invocation.executionId) || !text(value.invocation.roomId)
+    || !invocationIntent(value.invocation.intent)) return false;
+  const envelopeInvocation = value.invocation as ContextCompilerInputV1["invocation"];
   if (!exact(value.trusted, ["system", "developer"]) || !text(value.trusted.system)
-    || !exact(value.trusted.developer, ["policy", "agent", "room", "triggerType", "triggerReason", "citationContract"])
+    || !exact(value.trusted.developer, ["policy", "agent", "room", "triggerType", "triggerReason", "invocationIntent", "citationContract"])
     || !text(value.trusted.developer.policy) || !agentIdentity(value.trusted.developer.agent)
     || !roomIdentity(value.trusted.developer.room, value.invocation.roomId)
     || !["message", "reply", "manual", "tool_continuation"].includes(String(value.trusted.developer.triggerType))
     || !["mention", "reply", "manual", "tool_continuation"].includes(String(value.trusted.developer.triggerReason))
+    || !invocationIntent(value.trusted.developer.invocationIntent)
+    || !sameJsonValue(value.trusted.developer.invocationIntent, value.invocation.intent)
+    || value.invocation.intent.targetAgentId !== value.trusted.developer.agent.agentId
     || value.trusted.developer.citationContract !== "manifest_labels_only") return false;
-  if (!dense(value.groupContent) || !value.groupContent.every((item) => exact(item, ["section", "trust", "citationLabel", "source", "representation", "author", "occurredAt", "replyTo", "mentions", "sourceRefs"])
+  if (!dense(value.groupContent) || !value.groupContent.every((item) => exact(item, ["section", "trust", "citationLabel", "source", "representation", "author", "occurredAt", "replyTo", "mentions", "sourceRefs", "memoryKind"])
     && ["trigger", "memory", "delta", "retrieval", "attachment"].includes(String(item.section))
     && item.trust === "untrusted_group_content" && /^ctx-\d{4,}$/.test(String(item.citationLabel)) && source(item.source)
     && exact(item.representation, ["kind", "text"]) && ["content", "excerpt", "segment", "digest", "index"].includes(String(item.representation.kind))
     && text(item.representation.text, true) && (item.author === null || actor(item.author))
     && (item.occurredAt === null || timestamp(item.occurredAt)) && (item.replyTo === null || reply(item.replyTo))
-    && mentions(item.mentions) && dense(item.sourceRefs) && item.sourceRefs.every((entry) => source(entry)))) return false;
-  if (!project(value.projectContext, value.invocation.roomId)) return false;
+    && mentions(item.mentions) && dense(item.sourceRefs) && item.sourceRefs.every((entry) => source(entry))
+    && (item.memoryKind === null || ["goal", "decision", "context", "next_action", "open_question_or_blocker"].includes(String(item.memoryKind))))) return false;
+  if (!isCompiledProject(value.projectContext, value.invocation.roomId)) return false;
   if (!dense(value.availableTools) || !value.availableTools.every((tool) => exact(tool, ["id", "description", "effect", "inputSchemaCanonical"])
     && text(tool.id) && text(tool.description) && ["read-only", "reversible-write", "irreversible-write"].includes(String(tool.effect))
     && text(tool.inputSchemaCanonical))) return false;
   if (!dense(value.degradationNotes) || !value.degradationNotes.every((note) => exact(note, ["citationLabel", "section", "disposition", "reason"])
     && (note.citationLabel === null || /^ctx-\d{4,}$/.test(String(note.citationLabel)))
     && ["trigger", "memory", "delta", "retrieval", "attachment", "project"].includes(String(note.section))
-    && ["excerpted", "segmented", "digested", "index_only", "omitted", "unavailable", "invalidated"].includes(String(note.disposition)))) return false;
-  return isContextManifestV1(value.manifest) && isAccounting(value.accounting);
+    && ["excerpted", "segmented", "digested", "index_only", "omitted", "unavailable", "invalidated"].includes(String(note.disposition))
+    && ["within_budget", "presegmented", "section_budget", "byte_budget", "metadata_only", "source_tombstone", "source_unavailable", "source_invalidated", "project_disabled", "project_unavailable"].includes(String(note.reason)))) return false;
+  if (!isContextManifestV1(value.manifest) || !isAccounting(value.accounting)
+    || !sameJsonValue(value.accounting, value.manifest.accounting)
+    || value.projectContext.availability !== value.manifest.projectAvailability) return false;
+  const manifestItems = value.manifest.items;
+  const groupContent = value.groupContent as readonly CompiledContextGroupItemV1[];
+  const triggerGroups = groupContent.filter((item) => item.section === "trigger");
+  if (triggerGroups.length !== 1 || triggerGroups[0]!.source.sourceId !== envelopeInvocation.intent.sourceMessageId
+    || groupContent.some((item) => item.source.roomId !== envelopeInvocation.roomId)
+    || manifestItems.some((item) => item.source !== null && item.source.roomId !== envelopeInvocation.roomId)) return false;
+  const manifestLabels = manifestItems.flatMap((item) => item.citationLabel === null ? [] : [item.citationLabel]);
+  if (new Set(manifestLabels).size !== manifestLabels.length) return false;
+  const representationForDisposition: Partial<Record<ContextManifestDispositionV1, CompiledContextGroupItemV1["representation"]["kind"]>> = {
+    included: "content", excerpted: "excerpt", segmented: "segment", digested: "digest", index_only: "index",
+  };
+  for (const group of groupContent) {
+    const matches = manifestItems.filter((item) => item.source !== null && item.citationLabel === group.citationLabel
+      && item.section === group.section && sameJsonValue(item.source, group.source) && item.memoryKind === group.memoryKind);
+    if (matches.length !== 1 || representationForDisposition[matches[0]!.disposition] !== group.representation.kind) return false;
+  }
+  for (const item of manifestItems) {
+    if (item.source === null || item.section === "project" || item.citationLabel === null) continue;
+    if (groupContent.filter((group) => group.citationLabel === item.citationLabel).length !== 1) return false;
+  }
+  if (value.projectContext.availability === "available") {
+    const projects = manifestItems.filter((item) => item.section === "project");
+    if (projects.length !== 1 || projects[0]!.disposition !== value.projectContext.disposition
+      || projects[0]!.citationLabel !== value.projectContext.citationLabel
+      || (value.projectContext.representation === null) !== (projects[0]!.citationLabel === null)
+      || (value.projectContext.representation !== null
+        && representationForDisposition[projects[0]!.disposition] !== value.projectContext.representation.kind)) return false;
+  } else if (manifestItems.some((item) => item.section === "project")) return false;
+  const expectedNotes = manifestItems.filter((item) => item.disposition !== "included").map((item) => ({
+    citationLabel: item.citationLabel, section: item.section, disposition: item.disposition, reason: item.reason,
+  }));
+  return sameJsonValue(value.degradationNotes, expectedNotes);
+}
+
+function isCompiledProject(value: unknown, roomId: string): value is CompiledProjectContextV1 {
+  if (exact(value, ["availability", "reason"])) return ["disabled", "unavailable"].includes(String(value.availability)) && text(value.reason);
+  return exact(value, ["availability", "projectId", "revision", "representation", "disposition", "citationLabel", "sourceRefs"])
+    && value.availability === "available" && text(value.projectId) && uint(value.revision, true)
+    && (value.representation === null || (exact(value.representation, ["kind", "text"])
+      && ["content", "excerpt", "segment", "digest", "index"].includes(String(value.representation.kind)) && text(value.representation.text, true)))
+    && ["included", "excerpted", "segmented", "digested", "index_only", "omitted", "unavailable", "invalidated"].includes(String(value.disposition))
+    && (value.citationLabel === null || /^ctx-\d{4,}$/.test(String(value.citationLabel)))
+    && dense(value.sourceRefs) && value.sourceRefs.every((entry) => source(entry, roomId));
 }
 
 export function isContextCompileResultV1(value: unknown): value is ContextCompileResultV1 {
@@ -449,7 +548,14 @@ export function isContextCompileResultV1(value: unknown): value is ContextCompil
   }
   if (!exact(value, ["ok", "envelope", "manifest", "canonicalEnvelope", "canonicalManifest", "envelopeSha256", "manifestSha256"])) return false;
   const result = value as Record<string, unknown>;
-  return result.ok === true && isCompiledContextEnvelopeV1(result.envelope) && isContextManifestV1(result.manifest)
-    && typeof result.canonicalEnvelope === "string" && typeof result.canonicalManifest === "string"
-    && /^[0-9a-f]{64}$/.test(String(result.envelopeSha256)) && /^[0-9a-f]{64}$/.test(String(result.manifestSha256));
+  if (result.ok !== true || !isCompiledContextEnvelopeV1(result.envelope) || !isContextManifestV1(result.manifest)
+    || !sameJsonValue(result.manifest, result.envelope.manifest)
+    || typeof result.canonicalEnvelope !== "string" || typeof result.canonicalManifest !== "string"
+    || !/^[0-9a-f]{64}$/.test(String(result.envelopeSha256)) || !/^[0-9a-f]{64}$/.test(String(result.manifestSha256))) return false;
+  try {
+    return sameJsonValue(JSON.parse(result.canonicalEnvelope), result.envelope)
+      && sameJsonValue(JSON.parse(result.canonicalManifest), result.manifest);
+  } catch {
+    return false;
+  }
 }

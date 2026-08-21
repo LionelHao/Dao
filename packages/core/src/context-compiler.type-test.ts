@@ -24,6 +24,16 @@ const forgedResponsibility: ContextCompilerInputV1 = { ...input, agent: { ...inp
 const forgedGoal: ContextCompilerInputV1 = { ...input, room: { ...input.room, goal: { availability: "unavailable", reason: "client_missing" } } };
 // @ts-expect-error Trigger type is a closed authority classification.
 const forgedTriggerType: ContextCompilerInputV1 = { ...input, trigger: { ...input.trigger, triggerType: "cron" } };
+const forgedMentionKind: ContextCompilerInputV1 = { ...input, trigger: { ...input.trigger, mentions: [
+  { targetId: "target",
+    // @ts-expect-error Mention target kind uses the authoritative message model vocabulary.
+    targetKind: "agent", targetActorId: "agent-1", range: { startUtf16: 0, endUtf16: 1 } },
+] } };
+const forgedRouteReason: ContextCompilerInputV1 = { ...input, invocation: { ...input.invocation, intent: {
+  kind: "routed_candidate", sourceMessageId: "message-1", targetAgentId: "agent-1",
+  // @ts-expect-error Routed intent reason codes are a closed authority union.
+  reasonCode: "guess", reasonText: "forged",
+} } };
 // @ts-expect-error Config versions are closed and cannot select an online tokenizer.
 const onlineEstimator: ContextCompilerConfigV1 = { ...config, estimatorVersion: "online_tokenizer" };
 // @ts-expect-error Every group-origin body remains explicitly untrusted.
@@ -46,6 +56,8 @@ void forgedBudget;
 void forgedResponsibility;
 void forgedGoal;
 void forgedTriggerType;
+void forgedMentionKind;
+void forgedRouteReason;
 void onlineEstimator;
 void trustedGroup;
 void sourceUrl;

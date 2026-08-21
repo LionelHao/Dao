@@ -648,6 +648,7 @@ export {
 export type {
   CompiledContextEnvelopeV1,
   CompiledContextGroupItemV1,
+  CompiledProjectContextV1,
   ContextAccountingV1,
   ContextAgentResponsibilityV1,
   ContextActorV1,
@@ -655,6 +656,7 @@ export type {
   ContextCompileResultV1,
   ContextCompilerConfigV1,
   ContextCompilerInputV1,
+  ContextInvocationIntentV1,
   ContextManifestDispositionV1,
   ContextManifestEntryV1,
   ContextManifestItemV1,
