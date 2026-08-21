@@ -51,6 +51,7 @@ import {
   readRoomDatabaseQuery,
   readRoomGovernanceDatabaseQuery,
   readDepartureConflictsDatabaseQuery,
+  readContextFinalExecution,
   repairMutationImpactDatabaseQuery,
   revalidateSnapshotDatabaseQuery,
   runAuthorityImmediateTransaction,
@@ -64,12 +65,17 @@ import { routeResultAsJson } from "../route-runtime/route-authority-protocol.js"
 import { memoryResultAsJson } from "../room-memory/authority-protocol.js";
 import { executeMemoryAuthorityOperation } from "../room-memory/authority-database-handler.js";
 import {
+  ContextSnapshotDatabaseError,
+  contextSnapshotResultAsJson,
+  executeContextSnapshotAuthorityOperation,
+} from "./context-snapshot-database-authority.js";
+import {
   FallbackRepairCoordinator,
   FallbackRepairError,
   type RepairPreemptionCode,
   type StreamingRepairLease,
 } from "../fallback-repair-coordinator.js";
-import { MAX_ACTIVE_SESSION_FAMILIES } from "./contracts.js";
+import { MAX_ACTIVE_SESSION_FAMILIES, type JsonValue } from "./contracts.js";
 import { recoverRuntimeArchiveFenceInTransaction } from "../agent-runtime/runtime-archive-fence-participant.js";
 import type { BallDeadlinePolicy } from "../ball-runtime/ball-authority-protocol.js";
 import { archivedMessageGateRegistration } from "../message-authority/archived-message-gate.js";
@@ -2247,6 +2253,67 @@ function executeRuntime(request: AuthorityWorkerRequest): void {
   }
 }
 
+function executeContext(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.context") {
+    throw new TypeError("executeContext received the wrong request type");
+  }
+  try {
+    if (request.operation.type === "context.finalize-agent-message") {
+      const operation = request.operation;
+      const receipt = commitAgentMessageDatabaseCommand(
+        requireAuthorityTransactionDatabase(),
+        {
+          context: operation.context,
+          command: operation.command,
+          now: operation.now,
+          beforeApply: () => requireNoMessageRepairBarrier(
+            operation.command.roomId,
+            operation.now,
+          ),
+          contextCitations: {
+            snapshotId: operation.snapshotId,
+            snapshotGeneration: operation.snapshotGeneration,
+            citationLabels: operation.citationLabels,
+          },
+        },
+      );
+      respond({
+        type: "authority.context-result",
+        requestId: request.requestId,
+        result: {
+          kind: "context-finalized",
+          receipt,
+          execution: readContextFinalExecution(
+            requireAuthorityTransactionDatabase(),
+            operation.context.executionId,
+          ),
+        } as unknown as JsonValue,
+      });
+      return;
+    }
+    const result = executeContextSnapshotAuthorityOperation(
+      requireAuthorityTransactionDatabase(),
+      request.operation,
+    );
+    respond({
+      type: "authority.context-result",
+      requestId: request.requestId,
+      result: contextSnapshotResultAsJson(result) as unknown as JsonValue,
+    });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof ContextSnapshotDatabaseError || error instanceof AuthorityDatabaseError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithError(
+      request.requestId,
+      "context_storage_unavailable",
+      "Authority context operation failed",
+    );
+  }
+}
+
 function executeRoute(request: AuthorityWorkerRequest): void {
   if (request.type !== "authority.route") {
     throw new TypeError("executeRoute received the wrong request type");
@@ -2815,6 +2882,9 @@ async function dispatch(value: unknown): Promise<void> {
       return;
     case "authority.runtime":
       executeRuntime(value);
+      return;
+    case "authority.context":
+      executeContext(value);
       return;
     case "authority.route":
       executeRoute(value);

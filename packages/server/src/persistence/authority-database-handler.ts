@@ -87,6 +87,10 @@ import {
   type MessageRevisionReceipt,
 } from "./contracts.js";
 import type { AuthorityWorkerErrorCode } from "./worker-protocol.js";
+import {
+  bindContextAttemptInTransaction,
+  commitFinalContextCitationsInTransaction,
+} from "./context-snapshot-database-authority.js";
 import type {
   RepairMutationImpact,
   RepairScope,
@@ -4818,6 +4822,13 @@ function runtimeExecutionById(database: DatabaseSync, executionId: string): Agen
   return execution;
 }
 
+export function readContextFinalExecution(
+  database: DatabaseSync,
+  executionId: string,
+): AgentExecution {
+  return runtimeExecutionById(database, executionId);
+}
+
 function appendRuntimeExecutionEvent(
   database: DatabaseSync,
   execution: AgentExecution,
@@ -6346,12 +6357,26 @@ export function executeRuntimeAuthorityOperation(
         current.id,
         stableId("runtime-retry-generation-gate", current.id, String(operation.attemptSeq)),
       );
-      const shouldRetry = operation.nextRetryAt !== undefined && current.retryOrdinal < 3;
+      const contextState = database.prepare(
+        `SELECT snapshot.state
+         FROM agent_execution_context_bindings AS binding
+         JOIN context_snapshots AS snapshot ON snapshot.snapshot_id = binding.snapshot_id
+         WHERE binding.execution_id = ?`,
+      ).get(current.id)?.state;
+      const shouldRetry = operation.nextRetryAt !== undefined && current.retryOrdinal < 3 &&
+        (contextState === undefined || contextState === "active");
       database.prepare(
         `UPDATE agent_execution_attempts
          SET status = 'failed', finished_at = ?, error_code = ?, next_retry_at = ?
          WHERE execution_id = ? AND attempt_seq = ? AND status = 'running'`,
-      ).run(occurredAt, operation.errorCode, operation.nextRetryAt ?? null, current.id, current.currentAttemptSeq);
+      ).run(
+        occurredAt,
+        contextState !== undefined && contextState !== "active"
+          ? "context_snapshot_invalidated" : operation.errorCode,
+        shouldRetry ? operation.nextRetryAt! : null,
+        current.id,
+        current.currentAttemptSeq,
+      );
       if (shouldRetry) {
         const nextAttempt = current.currentAttemptSeq + 1;
         const nextOrdinal = current.retryOrdinal + 1;
@@ -6368,6 +6393,19 @@ export function executeRuntimeAuthorityOperation(
              recovery_cursor
            ) VALUES (?, ?, ?, ?, 'queued', ?, NULL, NULL, NULL, ?, ?)`,
         ).run(current.id, nextAttempt, current.retryCycle, nextOrdinal, current.actionCategory, operation.nextRetryAt, current.recoveryCursor);
+        const retryGeneration = database.prepare(
+          "SELECT execution_generation AS executionGeneration FROM agent_executions WHERE id = ?",
+        ).get(current.id)?.executionGeneration;
+        if (typeof retryGeneration !== "number") {
+          return fail("storage_unavailable", "Retry execution generation was unavailable");
+        }
+        bindContextAttemptInTransaction(database, {
+          executionId: current.id,
+          attemptSeq: nextAttempt,
+          expectedExecutionGeneration: retryGeneration,
+          reuseKind: "automatic_retry",
+          boundAt: occurredAt,
+        });
         const execution = runtimeExecutionById(database, current.id);
         appendRuntimeExecutionEvent(database, execution, occurredAt, "retry-scheduled", operation.errorCode);
         return { kind: "execution", execution };
@@ -7000,6 +7038,31 @@ export function executeRuntimeAuthorityOperation(
       if (typeof row.id !== "string") return fail("storage_unavailable", "Recovery execution was corrupt");
       let current = runtimeExecutionById(database, row.id);
       if (current.status === "running") {
+        const contextState = database.prepare(
+          `SELECT snapshot.state
+           FROM agent_execution_context_bindings AS binding
+           JOIN context_snapshots AS snapshot ON snapshot.snapshot_id = binding.snapshot_id
+           WHERE binding.execution_id = ?`,
+        ).get(current.id)?.state;
+        if (contextState !== undefined && contextState !== "active") {
+          database.prepare(
+            `UPDATE agent_execution_attempts
+             SET status = 'failed', finished_at = ?, error_code = 'context_snapshot_invalidated'
+             WHERE execution_id = ? AND attempt_seq = ? AND status = 'running'`,
+          ).run(occurredAt, current.id, current.currentAttemptSeq);
+          database.prepare(
+            `UPDATE agent_executions
+             SET status = 'failed', completed_at = ?, updated_at = ?,
+                 terminal_error_code = 'context_snapshot_invalidated', dead_lettered_at = ?
+             WHERE id = ? AND current_attempt_seq = ? AND status = 'running'`,
+          ).run(occurredAt, occurredAt, occurredAt, current.id, current.currentAttemptSeq);
+          current = runtimeExecutionById(database, current.id);
+          appendRuntimeExecutionEvent(
+            database, current, occurredAt, "recovered", "context_snapshot_invalidated",
+          );
+          records.push({ execution: current, outcome: "failed" });
+          continue;
+        }
         if (current.providerId === undefined) {
           database.prepare(
             `UPDATE agent_execution_attempts
@@ -7098,6 +7161,19 @@ export function executeRuntimeAuthorityOperation(
              execution_id, attempt_seq, retry_cycle, retry_ordinal, status, action_category, next_retry_at, recovery_cursor
            ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)`,
         ).run(current.id, nextAttempt, current.retryCycle, current.retryOrdinal + 1, current.actionCategory, occurredAt, current.recoveryCursor);
+        const recoveryGeneration = database.prepare(
+          "SELECT execution_generation AS executionGeneration FROM agent_executions WHERE id = ?",
+        ).get(current.id)?.executionGeneration;
+        if (typeof recoveryGeneration !== "number") {
+          return fail("storage_unavailable", "Recovery execution generation was unavailable");
+        }
+        bindContextAttemptInTransaction(database, {
+          executionId: current.id,
+          attemptSeq: nextAttempt,
+          expectedExecutionGeneration: recoveryGeneration,
+          reuseKind: "crash_recovery",
+          boundAt: occurredAt,
+        });
         current = runtimeExecutionById(database, current.id);
         appendRuntimeExecutionEvent(database, current, occurredAt, "recovered", "runtime_restarted");
       }
@@ -8599,6 +8675,11 @@ export function commitAgentMessageDatabaseCommand(
     readonly command: AgentMessageCommitCommand;
     readonly now: number;
     readonly beforeApply?: () => void;
+    readonly contextCitations?: {
+      readonly snapshotId: string;
+      readonly snapshotGeneration: number;
+      readonly citationLabels: readonly string[];
+    };
   },
 ): AgentMessageCommitReceipt {
   return runAuthorityImmediateTransaction(database, () => {
@@ -8614,6 +8695,18 @@ export function commitAgentMessageDatabaseCommand(
         !Number.isSafeInteger(input.context.attemptSeq) || input.context.attemptSeq < 1 ||
         !Number.isSafeInteger(input.context.executionGeneration) || input.context.executionGeneration < 1) {
       return fail("permission_denied", "Agent message capability binding was rejected");
+    }
+    const hasContextBinding = database.prepare(
+      `SELECT 1 AS present FROM agent_execution_context_bindings
+       WHERE execution_id = ?`,
+    ).get(input.context.executionId) !== undefined;
+    if (hasContextBinding !== (input.contextCitations !== undefined)) {
+      return fail(
+        "execution_conflict",
+        hasContextBinding
+          ? "Context-bound Agent final must use atomic citation finalization"
+          : "Agent final supplied citations without a context snapshot binding",
+      );
     }
     const scope = [
       input.context.agent.actorId,
@@ -8635,6 +8728,19 @@ export function commitAgentMessageDatabaseCommand(
         return fail("storage_unavailable", "Stored Agent message receipt is corrupt");
       }
       const replay = parseStoredMessageAuthorityReceipt(existingReceipt.responseJson, "agent");
+      if (input.contextCitations !== undefined) {
+        const expectedHashes = [...input.contextCitations.citationLabels]
+          .sort()
+          .map((label) => createHash("sha256").update(label).digest("hex"));
+        const actualHashes = database.prepare(
+          `SELECT citation_label_sha256 AS citationLabelSha256
+           FROM agent_message_citations WHERE message_id = ? ORDER BY citation_label_sha256`,
+        ).all(input.command.messageId).map((row) => String(row.citationLabelSha256));
+        if (expectedHashes.length !== actualHashes.length ||
+            expectedHashes.some((hash, index) => hash !== actualHashes[index])) {
+          return fail("idempotency_conflict", "Agent message citation declaration changed");
+        }
+      }
       return { ...replay, replayed: true } as AgentMessageCommitReceipt;
     }
     const lineage = database.prepare(
@@ -8667,7 +8773,8 @@ export function commitAgentMessageDatabaseCommand(
         lineage.currentAttemptSeq !== input.context.attemptSeq ||
         lineage.executionGeneration !== input.context.executionGeneration ||
         lineage.resultMessageId !== null || lineage.roomStatus !== "active" ||
-        lineage.participation !== "active" || lineage.sourceLifecycle !== "active") {
+        (lineage.participation !== "active" && lineage.participation !== "on-mention") ||
+        lineage.sourceLifecycle !== "active") {
       return fail("execution_conflict", "Agent message terminal compare-and-set failed");
     }
     if (typeof lineage.sourceMessageId !== "string" ||
@@ -8767,6 +8874,18 @@ export function commitAgentMessageDatabaseCommand(
           sourceRevision,
           persistedAt,
         );
+        if (input.contextCitations !== undefined) {
+          commitFinalContextCitationsInTransaction(database, {
+            snapshotId: input.contextCitations.snapshotId,
+            snapshotGeneration: input.contextCitations.snapshotGeneration,
+            executionId: input.context.executionId,
+            attemptSeq: input.context.attemptSeq,
+            expectedExecutionGeneration: input.context.executionGeneration,
+            messageId: input.command.messageId,
+            citationLabels: input.contextCitations.citationLabels,
+            committedAt: persistedAt,
+          });
+        }
         if (input.command.correctsMessageId !== undefined) {
           database.prepare(
             `INSERT INTO agent_message_corrections (

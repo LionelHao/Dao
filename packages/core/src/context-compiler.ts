@@ -382,13 +382,20 @@ export function isContextCompilerInputV1(value: unknown): value is ContextCompil
   const memoryWatermark = Number(value.memoryWatermark);
   const corpusHead = Number(value.corpusHead);
   if (value.trigger.source.corpusSeq !== null && value.trigger.source.corpusSeq > corpusHead) return false;
+  if (!value.attachments.every((entry) => entry.source.sourceKind === "attachment_extraction")) return false;
   if (!value.delta.every((entry) => entry.source.corpusSeq !== null
     && entry.source.corpusSeq > memoryWatermark && entry.source.corpusSeq <= corpusHead)) return false;
-  const deltaSeqs = value.delta.map((entry) => entry.source.corpusSeq!).sort((left, right) => left - right);
-  if (deltaSeqs.length !== corpusHead - memoryWatermark
-    || deltaSeqs.some((corpusSeq, index) => corpusSeq !== memoryWatermark + index + 1)) return false;
+  const corpusAttachments = value.attachments.filter((entry) => entry.source.corpusSeq !== null);
+  if (!corpusAttachments.every((entry) => entry.source.corpusSeq! > memoryWatermark
+    && entry.source.corpusSeq! <= corpusHead)) return false;
+  const corpusSources = [...new Map(
+    [...value.delta, ...corpusAttachments].map((entry) => [sourceIdentityKey(entry.source), entry]),
+  ).values()];
+  const corpusSeqs = corpusSources.map((entry) => entry.source.corpusSeq!)
+    .sort((left, right) => left - right);
+  if (corpusSeqs.length !== corpusHead - memoryWatermark
+    || corpusSeqs.some((corpusSeq, index) => corpusSeq !== memoryWatermark + index + 1)) return false;
   if (new Set(value.delta.map((entry) => sourceIdentityKey(entry.source))).size !== value.delta.length) return false;
-  if (!value.attachments.every((entry) => entry.source.sourceKind === "attachment_extraction")) return false;
   if (![...value.retrieval, ...value.attachments].every((entry) => entry.source.corpusSeq === null || entry.source.corpusSeq <= corpusHead)) return false;
   if (!value.memories.every((entry) => entry.sourceRefs.every((entrySource) => entrySource.corpusSeq === null || entrySource.corpusSeq <= memoryWatermark))) return false;
   return true;

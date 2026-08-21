@@ -74,7 +74,7 @@ describe("compileContextV1 deterministic properties", () => {
         version: 1, body: "stable memory", sourceRefs: [{ roomId: "room-property", sourceKind: "message" as const,
           sourceId: "message-00", revision: 1, corpusSeq: 1 }], availability: "readable" as const };
       const attachment = { ...input.delta[0]!, source: { ...input.delta[0]!.source,
-        sourceKind: "attachment_extraction" as const, sourceId: "attachment-property", corpusSeq: 1 }, readRef: "attachment-read" };
+        sourceKind: "attachment_extraction" as const, sourceId: "attachment-property", corpusSeq: null }, readRef: "attachment-read" };
       const tool = { id: "property-tool", description: "read authority", effect: "read-only" as const, inputSchemaCanonical: "{}" };
       input.memories = [memory, { ...memory, sourceRefs: [...memory.sourceRefs].reverse() }];
       input.retrieval = [input.delta[0]!, { ...input.delta[0]! }];

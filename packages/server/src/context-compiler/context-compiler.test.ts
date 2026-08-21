@@ -81,7 +81,6 @@ function makeInput(): ContextCompilerInputV1 {
           { targetId: "target-agent-1", targetKind: "agent-invocation", targetActorId: "agent-1", range: { startUtf16: 0, endUtf16: 12 } },
         ], readRef: "read:trigger" },
       candidate("delta-8", 8, "The canary is green."),
-      candidate("delta-7", 7, "Release notes are ready."),
       candidate("delta-6", 6, "Tests passed."),
     ],
     retrieval: [candidate("retrieved-1", 1, "An older decision remains relevant.")],
@@ -107,7 +106,7 @@ describe("compileContextV1", () => {
     expect(first.envelope.trusted.system).toBe("Follow room authorization.");
     expect(first.envelope.groupContent.every((item) => item.trust === "untrusted_group_content")).toBe(true);
     expect(first.envelope.groupContent.map((item) => item.section)).toEqual([
-      "trigger", "memory", "memory", "delta", "delta", "delta", "retrieval", "attachment",
+      "trigger", "memory", "memory", "delta", "delta", "retrieval", "attachment",
     ]);
     expect(first.envelope.groupContent.filter((item) => item.section === "memory").map((item) => item.memoryKind)).toEqual(["goal", "decision"]);
     expect(first.envelope.groupContent[0]?.mentions.map((mention) => mention.targetActorId)).toEqual(["agent-1", "human-2"]);
@@ -115,13 +114,13 @@ describe("compileContextV1", () => {
     expect(first.envelope.availableTools.map((tool) => tool.id)).toEqual(["a-tool", "z-tool"]);
     expect(first.envelope.projectContext).toEqual({ availability: "disabled", reason: "ft09_not_delivered" });
     expect(first.manifest.items.map((item) => item.citationLabel)).toEqual([
-      "ctx-0001", "ctx-0002", "ctx-0003", "ctx-0004", "ctx-0005", "ctx-0006", "ctx-0007", "ctx-0008",
+      "ctx-0001", "ctx-0002", "ctx-0003", "ctx-0004", "ctx-0005", "ctx-0006", "ctx-0007",
     ]);
     expect(first.manifest.manifestHash).toMatch(/^[0-9a-f]{64}$/);
     expect(first.envelopeSha256).toMatch(/^[0-9a-f]{64}$/);
     expect(first.manifestSha256).toMatch(/^[0-9a-f]{64}$/);
-    expect(first.envelopeSha256).toBe("cd1fd7ea8be47d5bbb4e6be62b624938f9221c395de307e3e60ce3f6245a7faa");
-    expect(first.manifestSha256).toBe("c8d7690a2a1b49dfd4c9422bf23cea853d13db05c44d82262c8a310a167be0f1");
+    expect(first.envelopeSha256).toBe("adbfe4d2da61fe3285979e6934e4c8d7d66b55c80891ce40b93b70d532c2f470");
+    expect(first.manifestSha256).toBe("a6ab70c0b13914270b6061eb06d0f94aa4fce646d1f624fe78a492d63e87340b");
     expect(first.envelope.trusted.developer.agent.responsibility).toEqual({ availability: "unavailable", reason: "ft07_not_delivered" });
     expect(first.envelope.trusted.developer.room.goal).toEqual({ availability: "unavailable", reason: "ft09_not_delivered" });
     expect(first.envelope.trusted.developer.triggerType).toBe("message");
@@ -226,6 +225,15 @@ describe("compileContextV1", () => {
   });
 
   it("rejects conflicting and normalization-colliding source, memory, and tool identities", () => {
+    const corpusCollision = makeInput();
+    corpusCollision.attachments = [...corpusCollision.attachments,
+      candidate("attachment-collision", 6, "different corpus source", {
+        source: source("attachment-collision", 6, "attachment_extraction"),
+      })];
+    expect(compileContextV1(corpusCollision, CONTEXT_COMPILER_CONFIG_V1)).toMatchObject({
+      ok: false, error: { code: "invalid_input" },
+    });
+
     const sourceConflict = makeInput();
     sourceConflict.retrieval = [candidate("delta-6", 6, "conflicting body")];
     expect(compileContextV1(sourceConflict, CONTEXT_COMPILER_CONFIG_V1)).toMatchObject({ ok: false, error: { code: "invalid_input" } });
@@ -292,6 +300,7 @@ describe("compileContextV1", () => {
 
   it("records every closed disposition and never disguises unavailable or invalidated sources", () => {
     const input = makeInput();
+    input.attachments = [];
     input.delta = [
       candidate("gone", 6, "", { body: null, availability: "temporarily_unavailable" }),
       candidate("recalled", 7, "", { body: null, availability: "invalidated" }),
@@ -337,7 +346,9 @@ describe("compileContextV1", () => {
   it("keeps corrected retrieval and attachment budgets separate and respects all byte/token bounds", () => {
     const input = makeInput();
     input.retrieval = [candidate("large-retrieval", 1, "r".repeat(30_000))];
-    input.attachments = [candidate("large-attachment", 2, "a".repeat(30_000), { source: source("large-attachment", 2, "attachment_extraction") })];
+    input.attachments = [candidate("large-attachment", 2, "a".repeat(30_000), {
+      source: source("large-attachment", 7, "attachment_extraction"),
+    })];
     const result = compileContextV1(input, CONTEXT_COMPILER_CONFIG_V1);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -405,6 +416,7 @@ describe("compileContextV1", () => {
     input.memoryWatermark = 0;
     input.corpusHead = 512;
     input.memories = [];
+    input.attachments = [];
     input.trigger.source = source("bulk-512", 512);
     input.delta = Array.from({ length: 512 }, (_, index) => candidate(
       `bulk-${index + 1}`,

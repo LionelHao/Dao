@@ -97,6 +97,20 @@ import {
   isAttachmentDatabaseOperation,
   isAttachmentDatabaseOperationResult,
 } from "../attachment-authority/database-contracts.js";
+import {
+  isContextSnapshotAuthorityOperation,
+  type ContextSnapshotAuthorityOperation,
+} from "./context-snapshot-database-authority.js";
+
+export type ContextWorkerOperation = ContextSnapshotAuthorityOperation | {
+  readonly type: "context.finalize-agent-message";
+  readonly context: AgentMessageWorkerContext;
+  readonly command: AgentMessageCommitCommand;
+  readonly snapshotId: string;
+  readonly snapshotGeneration: number;
+  readonly citationLabels: readonly string[];
+  readonly now: number;
+};
 
 export type AuthorityWorkerErrorCode =
   | "actor_conflict"
@@ -137,6 +151,13 @@ export type AuthorityWorkerErrorCode =
   | "confirmation_forbidden"
   | "confirmation_rejected"
   | "confirmation_replayed"
+  | "context_forbidden"
+  | "context_generation_conflict"
+  | "context_snapshot_conflict"
+  | "context_snapshot_invalidated"
+  | "context_source_gone"
+  | "context_capacity_limited"
+  | "context_storage_unavailable"
   | "departure_blocked"
   | "execution_conflict"
   | "execution_not_found"
@@ -239,6 +260,13 @@ export function isAuthorityWorkerErrorCode(
     case "confirmation_forbidden":
     case "confirmation_rejected":
     case "confirmation_replayed":
+    case "context_forbidden":
+    case "context_generation_conflict":
+    case "context_snapshot_conflict":
+    case "context_snapshot_invalidated":
+    case "context_source_gone":
+    case "context_capacity_limited":
+    case "context_storage_unavailable":
     case "departure_blocked":
     case "execution_conflict":
     case "execution_not_found":
@@ -581,6 +609,11 @@ export type AuthorityWorkerRequest =
       readonly operation: RuntimeAuthorityOperation;
     }
   | {
+      readonly type: "authority.context";
+      readonly requestId: string;
+      readonly operation: ContextWorkerOperation;
+    }
+  | {
       readonly type: "authority.route";
       readonly requestId: string;
       readonly operation: RouteAuthorityOperation;
@@ -601,12 +634,12 @@ export type AuthorityWorkerResponse =
   | {
       readonly type: "authority.ready";
       readonly requestId: string;
-      readonly schemaVersion: 18;
+      readonly schemaVersion: 19;
     }
   | {
       readonly type: "authority.schema";
       readonly requestId: string;
-      readonly schemaVersion: 18;
+      readonly schemaVersion: 19;
     }
   | {
       readonly type: "authority.legacy-imported";
@@ -778,6 +811,11 @@ export type AuthorityWorkerResponse =
     }
   | {
       readonly type: "authority.runtime-result";
+      readonly requestId: string;
+      readonly result: JsonValue;
+    }
+  | {
+      readonly type: "authority.context-result";
       readonly requestId: string;
       readonly result: JsonValue;
     }
@@ -1182,6 +1220,20 @@ function isAgentMessageCommand(value: unknown): value is AgentMessageCommitComma
       ? { correctsMessageId: value.correctsMessageId }
       : {}),
   });
+}
+
+function isContextWorkerOperation(value: unknown): value is ContextWorkerOperation {
+  if (isContextSnapshotAuthorityOperation(value)) return true;
+  return isRecord(value) && value.type === "context.finalize-agent-message" &&
+    hasExactKeys(value, [
+      "type", "context", "command", "snapshotId", "snapshotGeneration",
+      "citationLabels", "now",
+    ]) && isAgentMessageWorkerContext(value.context) &&
+    isAgentMessageCommand(value.command) && isText(value.snapshotId) &&
+    isNonNegativeSafeInteger(value.snapshotGeneration) && value.snapshotGeneration > 0 &&
+    Array.isArray(value.citationLabels) && value.citationLabels.length <= 4096 &&
+    value.citationLabels.every((label) => typeof label === "string" && label.length <= 128) &&
+    isNonNegativeSafeInteger(value.now);
 }
 
 function isMessageHistoryQuery(value: unknown): value is MessageHistoryQuery {
@@ -1604,6 +1656,9 @@ export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWork
     case "authority.runtime":
       return hasExactKeys(value, ["type", "requestId", "operation"]) &&
         isRuntimeAuthorityOperation(value.operation);
+    case "authority.context":
+      return hasExactKeys(value, ["type", "requestId", "operation"]) &&
+        isContextWorkerOperation(value.operation);
     case "authority.route":
       return hasExactKeys(value, ["type", "requestId", "operation"]) &&
         isRouteAuthorityOperation(value.operation);
@@ -1630,7 +1685,7 @@ export function isAuthorityWorkerResponse(
     case "authority.schema":
       return (
         hasExactKeys(value, ["type", "requestId", "schemaVersion"]) &&
-        value.schemaVersion === 18
+        value.schemaVersion === 19
       );
     case "authority.closed":
       return hasExactKeys(value, ["type", "requestId"]);
@@ -1756,6 +1811,9 @@ export function isAuthorityWorkerResponse(
         isNonNegativeSafeInteger(value.headSeq) &&
         value.retainedFromSeq <= value.headSeq + 1;
     case "authority.runtime-result":
+      return hasExactKeys(value, ["type", "requestId", "result"]) &&
+        isJsonValue(value.result);
+    case "authority.context-result":
       return hasExactKeys(value, ["type", "requestId", "result"]) &&
         isJsonValue(value.result);
     case "authority.route-result":
