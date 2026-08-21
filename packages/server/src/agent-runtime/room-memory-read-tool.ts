@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 import type { ToolInvocation, ToolOutcome } from "./contracts.js";
-import type {
-  CitationReceiptAuthority,
-  CitationReceiptSourceKind,
+import {
+  isReadCitationLabelV1,
+  type CitationReceiptAuthority,
+  type CitationReceiptSourceKind,
 } from "./citation-receipt-authority.js";
 
 export const ROOM_MEMORY_READ_LIMITS = Object.freeze({
@@ -147,7 +148,7 @@ function continuationCursor(value: unknown): value is string {
 }
 
 function citationLabel(value: unknown): value is string {
-  return typeof value === "string" && /^read:[A-Za-z0-9_-]{43}$/u.test(value);
+  return isReadCitationLabelV1(value);
 }
 
 function positive(value: unknown): value is number {

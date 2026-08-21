@@ -23,7 +23,7 @@ const page: RoomMemoryReadPage = {
   }],
   continuation: null,
 };
-const receiptLabel = `read:${"a".repeat(43)}`;
+const receiptLabel = `read:${Buffer.alloc(32, 7).toString("base64url")}`;
 
 function authority(overrides: Partial<RoomMemoryReadAuthority> = {}): RoomMemoryReadAuthority {
   return {

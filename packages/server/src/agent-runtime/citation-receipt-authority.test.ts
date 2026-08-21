@@ -59,6 +59,18 @@ describe("citation receipt authority", () => {
     })).resolves.toEqual(["manifest-a", "manifest-b", issued.citationLabel].sort());
   });
 
+  it("rejects non-canonical base64url receipt declarations before store lookup", async () => {
+    const receipts = store();
+    const authority = createCitationReceiptAuthority({ store: receipts });
+    await expect(authority.validateDeclarations({
+      roomId: "room-1", executionId: "execution-1", snapshotId: "snapshot-1", snapshotGeneration: 2,
+      declarations: [`read:${"A".repeat(42)}B`],
+      manifestLabels: [],
+      revalidate: async () => true,
+    })).rejects.toMatchObject({ status: 409, code: "citation_declaration_invalid" });
+    expect(receipts.findByLabelHash).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["roomId", "room-2"], ["executionId", "execution-2"], ["snapshotId", "snapshot-2"],
     ["snapshotGeneration", 3],

@@ -82,6 +82,17 @@ function hashLabel(label: string): string {
   return createHash("sha256").update(label, "utf8").digest("hex");
 }
 
+export function isReadCitationLabelV1(value: unknown): value is string {
+  if (typeof value !== "string" || !/^read:[A-Za-z0-9_-]{43}$/u.test(value)) return false;
+  const encoded = value.slice("read:".length);
+  try {
+    const bytes = Buffer.from(encoded, "base64url");
+    return bytes.byteLength === 32 && bytes.toString("base64url") === encoded;
+  } catch {
+    return false;
+  }
+}
+
 function validateBinding(binding: CitationReceiptBinding): void {
   if (!identifier(binding.roomId) || !identifier(binding.executionId) || !identifier(binding.snapshotId) ||
       !positive(binding.snapshotGeneration) || !identifier(binding.sourceLabel) || !identifier(binding.sourceId) ||
@@ -154,6 +165,9 @@ export function createCitationReceiptAuthority(options: Readonly<{
         if (manifest.has(declaration)) {
           target = Object.freeze({ kind: "manifest", label: declaration });
         } else {
+          if (!isReadCitationLabelV1(declaration)) {
+            throw new CitationReceiptError(409, "citation_declaration_invalid");
+          }
           let receipt: CitationReceiptRecord | undefined;
           try {
             receipt = await options.store.findByLabelHash(hashLabel(declaration));
