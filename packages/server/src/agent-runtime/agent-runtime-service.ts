@@ -303,7 +303,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         if (options.toolGateway === undefined || options.tools === undefined) {
           throw new AgentRuntimeError("provider_malformed", "Provider requested an unavailable tool");
         }
-        const toolsByName = new Map(options.tools.map((tool) => [
+        const toolsByName = new Map(input.availableTools.map((tool) => [
           tool.id.replaceAll(".", "_").replaceAll("-", "_"), tool,
         ]));
         for (const [callId, call] of toolCalls) {

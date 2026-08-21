@@ -157,6 +157,13 @@ const providerInput = async (value: AgentExecution, invocation: AgentInvocationI
   limits: { maxInputBytes: 1_024, maxOutputTokens: 256, maxOutputBytes: 1_024, timeoutMs: 5_000 },
 });
 
+const providerInputWithTools = (
+  availableTools: AgentRuntimeProviderInput["availableTools"],
+) => async (value: AgentExecution, invocation: AgentInvocationIntent): Promise<AgentRuntimeProviderInput> => ({
+  ...(await providerInput(value, invocation)),
+  availableTools,
+});
+
 describe("bounded Agent runtime scheduler", () => {
   it("reports noauth before creating work and never falls back to a provider mock", async () => {
     const runtimeAuthority = authority();
@@ -494,7 +501,7 @@ describe("bounded Agent runtime scheduler", () => {
         }
       }),
       modelId: "fake-model",
-      buildProviderInput: providerInput,
+      buildProviderInput: providerInputWithTools([adapter.descriptor]),
       tools: [adapter.descriptor],
       toolGateway: gateway,
     });
@@ -504,6 +511,60 @@ describe("bounded Agent runtime scheduler", () => {
     expect(execute).toHaveBeenCalledTimes(1);
     expect(runtimeAuthority.checkpoint).toHaveBeenCalledTimes(1);
     expect(runtimeAuthority.executions.get(accepted.execution.id)?.status).toBe("completed");
+  });
+
+  it("rejects a configured tool omitted by the compiled context before grant or adapter calls", async () => {
+    const runtimeAuthority = authority();
+    runtimeAuthority.prepareTool = vi.fn(async (executionId, _attempt, tool) => ({
+      execution: runtimeAuthority.executions.get(executionId)!,
+      grantId: `grant-${tool.id}`,
+    }));
+    runtimeAuthority.claimTool = vi.fn(async (_executionId, _attempt, _grant, parameters) => ({
+      dispatchId: "dispatch-omitted",
+      toolId: "repository.git-status" as const,
+      parameters,
+    }));
+    const adapter: ToolAdapter = {
+      descriptor: {
+        id: "repository.git-status",
+        displayName: "Git status",
+        effect: "read-only",
+        reversibility: "compensatable",
+      },
+      execute: vi.fn(async () => ({ summary: { lines: 0 }, modelInput: "clean" })),
+    };
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      provider: provider(async function* (input) {
+        yield { type: "response_started", sequence: 1 };
+        if (input.toolContinuations !== undefined) {
+          yield { type: "agent_final", sequence: 2, body: "unexpected continuation", citations: [] };
+          return;
+        }
+        yield {
+          type: "tool_call_started",
+          sequence: 2,
+          callId: "call-omitted",
+          toolName: "repository_git_status",
+        };
+        yield { type: "tool_call_delta", sequence: 3, callId: "call-omitted", delta: "{}" };
+        yield { type: "completed", sequence: 4 };
+      }),
+      modelId: "fake-model",
+      buildProviderInput: providerInput,
+      tools: [adapter.descriptor],
+      toolGateway: createToolGateway({ authority: runtimeAuthority, adapters: [adapter] }),
+    });
+
+    const accepted = await runtime.invoke(context, intent("room-a", "tool-omitted"));
+    await runtime.whenIdle();
+
+    expect(runtimeAuthority.prepareTool).not.toHaveBeenCalled();
+    expect(adapter.execute).not.toHaveBeenCalled();
+    expect(runtimeAuthority.executions.get(accepted.execution.id)).toMatchObject({
+      status: "failed",
+      terminalErrorCode: "provider_malformed",
+    });
   });
 
   it("revalidates the frozen context before dispatching a completed tool result", async () => {
@@ -547,7 +608,7 @@ describe("bounded Agent runtime scheduler", () => {
         if (contextReads === 2) {
           throw new AgentRuntimeError("execution_conflict", "Snapshot was invalidated after source read");
         }
-        return providerInput(executionValue, invocationValue);
+        return providerInputWithTools([adapter.descriptor])(executionValue, invocationValue);
       },
       tools: [adapter.descriptor],
       toolGateway: gateway,
@@ -655,7 +716,7 @@ describe("bounded Agent runtime scheduler", () => {
         yield { type: "completed", sequence: 4 };
       }),
       modelId: "fake-model",
-      buildProviderInput: providerInput,
+      buildProviderInput: providerInputWithTools([adapter.descriptor]),
       tools: [adapter.descriptor],
       toolGateway: gateway,
     });
@@ -683,7 +744,7 @@ describe("bounded Agent runtime scheduler", () => {
         yield { type: "agent_final", sequence: 2, body: "restored completion", citations: [] };
       }),
       modelId: "fake-model",
-      buildProviderInput: providerInput,
+      buildProviderInput: providerInputWithTools([adapter.descriptor]),
       tools: [adapter.descriptor],
       toolGateway: gateway,
     });
