@@ -149,6 +149,9 @@ void invalidConfigurablePreemption;
 declare const runtimeProviderInput: AgentRuntimeProviderInput;
 declare const routerProviderInput: RouterProviderInput;
 
+// @ts-expect-error Compiled runtime input cannot expose the retired raw conversation window.
+const invalidLegacyConversation = runtimeProviderInput.visibleConversation;
+
 // @ts-expect-error Router input cannot receive the full runtime conversation/tool context.
 const invalidRouterInput: RouterProviderInput = runtimeProviderInput;
 // @ts-expect-error Runtime input cannot receive the closed routing-summary contract.
@@ -167,3 +170,4 @@ void invalidLightTaskPlanningField;
 void invalidBallHolderSet;
 void invalidRouterInput;
 void invalidRuntimeInput;
+void invalidLegacyConversation;
