@@ -506,6 +506,63 @@ describe("bounded Agent runtime scheduler", () => {
     expect(runtimeAuthority.executions.get(accepted.execution.id)?.status).toBe("completed");
   });
 
+  it("revalidates the frozen context before dispatching a completed tool result", async () => {
+    const runtimeAuthority = authority();
+    runtimeAuthority.complete = vi.fn(runtimeAuthority.complete);
+    runtimeAuthority.prepareTool = vi.fn(async (executionId, _attempt, tool) => ({
+      execution: runtimeAuthority.executions.get(executionId)!,
+      grantId: `grant-${tool.id}`,
+    }));
+    runtimeAuthority.claimTool = vi.fn(async (_executionId, _attempt, _grant, parameters) => ({
+      dispatchId: "dispatch-read",
+      toolId: "repository.git-status" as const,
+      parameters,
+    }));
+    runtimeAuthority.settleTool = vi.fn(async () => undefined);
+    runtimeAuthority.checkpoint = vi.fn(async () => undefined);
+    const adapter: ToolAdapter = {
+      descriptor: {
+        id: "repository.git-status",
+        displayName: "Git status",
+        effect: "read-only",
+        reversibility: "compensatable",
+      },
+      execute: vi.fn(async () => ({ summary: { lines: 1 }, modelInput: "bounded result" })),
+    };
+    const gateway = createToolGateway({ authority: runtimeAuthority, adapters: [adapter] });
+    let providerDispatches = 0;
+    let contextReads = 0;
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      provider: provider(async function* () {
+        providerDispatches += 1;
+        yield { type: "response_started", sequence: 1 };
+        yield { type: "tool_call_started", sequence: 2, callId: "call-read", toolName: "repository_git_status" };
+        yield { type: "tool_call_delta", sequence: 3, callId: "call-read", delta: "{}" };
+        yield { type: "completed", sequence: 4 };
+      }),
+      modelId: "fake-model",
+      buildProviderInput: async (executionValue, invocationValue) => {
+        contextReads += 1;
+        if (contextReads === 2) {
+          throw new AgentRuntimeError("execution_conflict", "Snapshot was invalidated after source read");
+        }
+        return providerInput(executionValue, invocationValue);
+      },
+      tools: [adapter.descriptor],
+      toolGateway: gateway,
+    });
+
+    const accepted = await runtime.invoke(context, intent("room-a", "source-read-race"));
+    await runtime.whenIdle();
+
+    expect(contextReads).toBe(2);
+    expect(providerDispatches).toBe(1);
+    expect(adapter.execute).toHaveBeenCalledTimes(1);
+    expect(runtimeAuthority.complete).not.toHaveBeenCalled();
+    expect(runtimeAuthority.executions.get(accepted.execution.id)?.status).toBe("running");
+  });
+
   it("turns only a closed provider risk/challenge function into an authoritative OpenItem proposal", async () => {
     const runtimeAuthority = authority();
     runtimeAuthority.checkpoint = vi.fn(async () => undefined);
