@@ -28,6 +28,7 @@ export interface DesktopRendererEntryPorts {
     bridge: MessageAuthorityBridge,
     roomId: string,
     attachmentBridge?: AttachmentAuthorityBridge,
+    memoryBridge?: MemoryAuthorityBridge,
   ) => () => void;
   readonly mountMemoryAuthoritySurface?: (
     root: HTMLElement,
@@ -58,11 +59,13 @@ const DEFAULT_PORTS: DesktopRendererEntryPorts = Object.freeze({
     bridge: MessageAuthorityBridge,
     roomId: string,
     attachmentBridge?: AttachmentAuthorityBridge,
+    memoryBridge?: MemoryAuthorityBridge,
   ) => mountMessageAuthorityBridgeSurface(root, bridge, roomId, {
     createMessageId: () => `message-${globalThis.crypto.randomUUID()}`,
     createTargetId: () => `target-${globalThis.crypto.randomUUID()}`,
     reducedMotion: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false,
     ...(attachmentBridge === undefined ? {} : { attachmentBridge }),
+    ...(memoryBridge === undefined ? {} : { memoryBridge }),
   }),
   mountMemoryAuthoritySurface: (
     root: HTMLElement,
@@ -166,9 +169,13 @@ export function mountDesktopRendererEntry(
     memory.setAttribute("aria-label", "Room 重要记忆");
     workspace.append(timeline, memory);
     root.replaceChildren(workspace);
-    const disposeMessage = attachmentAuthority === undefined
-      ? ports.mountMessageAuthoritySurface(timeline, messageAuthority, roomId)
-      : ports.mountMessageAuthoritySurface(timeline, messageAuthority, roomId, attachmentAuthority);
+    const disposeMessage = ports.mountMessageAuthoritySurface(
+      timeline,
+      messageAuthority,
+      roomId,
+      attachmentAuthority,
+      memoryAuthority,
+    );
     const disposeMemory = ports.mountMemoryAuthoritySurface(memory, memoryAuthority, roomId);
     return () => {
       disposeMemory();

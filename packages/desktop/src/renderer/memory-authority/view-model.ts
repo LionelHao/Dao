@@ -46,6 +46,7 @@ export interface MemorySourceProjection {
 
 export interface MemoryProjection {
   readonly memoryRecordId: string;
+  readonly memoryVersionId?: string;
   readonly version: number;
   readonly kind: MemoryKind;
   readonly state: MemoryVersionState;
@@ -112,6 +113,7 @@ export interface MemorySourceCardViewModel {
 
 export interface MemoryCardViewModel {
   readonly memoryRecordId: string;
+  readonly memoryVersionId?: string;
   readonly version: number;
   readonly kind: MemoryKind;
   readonly state: MemoryVersionState;
@@ -224,6 +226,7 @@ export function createMemoryAuthorityViewModel(input: MemoryPanelInput): MemoryA
   const writeLocked = input.lifecycle === "archived" || input.connection.status !== "online";
   const cards = state === "revoked" ? [] : input.memories.map((memory): MemoryCardViewModel => Object.freeze({
     memoryRecordId: memory.memoryRecordId,
+    ...(memory.memoryVersionId === undefined ? {} : { memoryVersionId: memory.memoryVersionId }),
     version: memory.version,
     kind: memory.kind,
     state: memory.state,

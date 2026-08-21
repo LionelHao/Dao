@@ -192,6 +192,7 @@ function cloneAgent(value: AgentFinalMessage): AgentFinalMessage {
     finalBody: value.finalBody,
     sourceInvocationIntentId: value.sourceInvocationIntentId,
     sourceExecutionId: value.sourceExecutionId,
+    citations: Object.freeze(value.citations.map((citation) => Object.freeze({ ...citation }))),
     ...(value.correctsMessageId === undefined
       ? {}
       : { correctsMessageId: value.correctsMessageId }),

@@ -135,6 +135,7 @@ function agentSource(
       attemptSeq: correction ? 2 : 1,
       executionGeneration: 1,
     },
+    citations: [],
     correction: correction
       ? {
           correctionMessageId: messageId,
@@ -270,6 +271,7 @@ describe("canonical operational message projection", () => {
       finalBody: "Immutable final",
       sourceInvocationIntentId: "invocation-intent-1",
       sourceExecutionId: "execution-1",
+      citations: [],
     });
     expect(correction).toEqual({
       id: "message-agent-correction",
@@ -281,6 +283,7 @@ describe("canonical operational message projection", () => {
       finalBody: "Corrected final",
       sourceInvocationIntentId: "invocation-intent-1",
       sourceExecutionId: "execution-2",
+      citations: [],
       correctsMessageId: "message-agent-final",
     });
     expect(final.finalBody).toBe("Immutable final");
@@ -290,6 +293,54 @@ describe("canonical operational message projection", () => {
       ...broken,
       correction: null,
     })).toThrow(new OperationalMessageProjectionError("invalid_source"));
+  });
+
+  it("projects only authority-confirmed citation rows with public one-based ordinals", () => {
+    const source = agentSource();
+    const projection = projectOperationalTimelineMessage({
+      ...source,
+      citations: [
+        {
+          ordinal: 1,
+          sourceKind: "message_revision",
+          sourceId: "message-human-1",
+          sourceRevision: 2,
+        },
+        {
+          ordinal: 2,
+          sourceKind: "delta_range",
+          sourceId: "a".repeat(64),
+          sourceRevision: 1,
+        },
+      ],
+    }) as AgentFinalMessage;
+
+    expect(projection.citations).toEqual([
+      {
+        ordinal: 1,
+        sourceKind: "message_revision",
+        sourceId: "message-human-1",
+        sourceRevision: 2,
+      },
+      {
+        ordinal: 2,
+        sourceKind: "delta_range",
+        sourceId: "a".repeat(64),
+        sourceRevision: 1,
+      },
+    ]);
+    expect(Object.isFrozen(projection.citations)).toBe(true);
+    expect(Object.isFrozen(projection.citations[0])).toBe(true);
+
+    expect(() => projectOperationalTimelineMessage({
+      ...source,
+      citations: [{
+        ordinal: 0,
+        sourceKind: "message_revision",
+        sourceId: "message-human-1",
+        sourceRevision: 2,
+      }],
+    })).toThrow(new OperationalMessageProjectionError("invalid_projection"));
   });
 
   it("uses the same canonical payload for history, stable event, and repair", () => {

@@ -1,10 +1,11 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   isAgentExecution,
   isRoomMemoryProjection,
   isRoomMemoryRawDeltaPage,
   isRoomMemoryStatus,
   type AgentExecution,
+  type AgentInvocationIntent,
 } from "@native-im/core";
 import type { AuthenticatedCommandContext, InternalAgentCommandContext } from "../persistence/contracts.js";
 import { toAgentWorkerCommandContext } from "../persistence/contracts.js";
@@ -12,10 +13,12 @@ import {
   AuthorityWorkerClientError,
   type WorkerDatabaseClient,
 } from "../persistence/worker-database-client.js";
+import type { ContextAuthorityWorkerDatabaseClient } from "../persistence/worker-database-client.js";
+import { canonicalJsonV1 } from "../context-compiler/canonical-json.js";
 import {
   AgentRuntimeError,
   type AgentRuntimeErrorCode,
-  type InvocationAccepted,
+  type InvocationAcceptedWithIntent,
   type RuntimeAuthority,
 } from "./contracts.js";
 
@@ -39,6 +42,13 @@ function mappedError(error: unknown): AgentRuntimeError {
       confirmation_expired: "confirmation_expired",
       confirmation_forbidden: "confirmation_forbidden",
       confirmation_replayed: "confirmation_replayed",
+      context_capacity_limited: "context_capacity_limited",
+      context_forbidden: "context_forbidden",
+      context_generation_conflict: "context_generation_conflict",
+      context_snapshot_conflict: "context_snapshot_conflict",
+      context_snapshot_invalidated: "context_snapshot_invalidated",
+      context_source_gone: "context_source_gone",
+      context_storage_unavailable: "context_storage_unavailable",
     };
     return new AgentRuntimeError(
       mapping[error.code] ?? "provider_failure",
@@ -56,11 +66,23 @@ function executionResult(value: unknown): AgentExecution {
   return value.execution;
 }
 
-function invocationResult(value: unknown): InvocationAccepted {
-  if (!record(value) || value.kind !== "invocation" || typeof value.replayed !== "boolean" || !isAgentExecution(value.execution)) {
+function invocationIntent(value: unknown): value is AgentInvocationIntent {
+  return record(value) &&
+    (value.kind === "direct_mention" || value.kind === "structured_help" ||
+      value.kind === "routed_candidate") &&
+    typeof value.roomId === "string" && typeof value.sourceMessageId === "string" &&
+    typeof value.targetAgentId === "string";
+}
+
+function invocationResult(value: unknown): InvocationAcceptedWithIntent {
+  if (!record(value) || value.kind !== "invocation" || typeof value.replayed !== "boolean" ||
+      !isAgentExecution(value.execution) || !invocationIntent(value.intent) ||
+      value.intent.roomId !== value.execution.roomId ||
+      value.intent.sourceMessageId !== value.execution.sourceMessageId ||
+      value.intent.targetAgentId !== value.execution.agentId) {
     throw new AgentRuntimeError("provider_failure", "Authority invocation result was malformed");
   }
-  return { execution: value.execution, replayed: value.replayed };
+  return { execution: value.execution, intent: value.intent, replayed: value.replayed };
 }
 
 function fenceReplacementResult(
@@ -85,7 +107,8 @@ function preparedToolResult(value: unknown): ReturnType<RuntimeAuthority["prepar
 
 function claimedToolResult(value: unknown): ReturnType<RuntimeAuthority["claimTool"]> extends Promise<infer Result> ? Result : never {
   if (!record(value) || value.kind !== "claimed-tool" || typeof value.dispatchId !== "string" ||
-      (value.toolId !== "http-json.read" && value.toolId !== "repository.git-status" && value.toolId !== "sandbox-file.write") ||
+      (value.toolId !== "http-json.read" && value.toolId !== "repository.git-status" &&
+       value.toolId !== "sandbox-file.write" && value.toolId !== "room-memory.read") ||
       !record(value.parameters)) {
     throw new AgentRuntimeError("provider_failure", "Authority claimed-tool result was malformed");
   }
@@ -94,6 +117,9 @@ function claimedToolResult(value: unknown): ReturnType<RuntimeAuthority["claimTo
 
 function pendingConfirmationResult(value: unknown): Awaited<ReturnType<RuntimeAuthority["readPendingConfirmation"]>> {
   if (!record(value) || value.kind !== "pending-confirmation" || !isAgentExecution(value.execution) ||
+      !invocationIntent(value.intent) || value.intent.roomId !== value.execution.roomId ||
+      value.intent.sourceMessageId !== value.execution.sourceMessageId ||
+      value.intent.targetAgentId !== value.execution.agentId ||
       typeof value.grantId !== "string" ||
       (value.toolId !== "http-json.read" && value.toolId !== "repository.git-status" && value.toolId !== "sandbox-file.write") ||
       !record(value.parameters) || typeof value.callId !== "string" || typeof value.argumentsJson !== "string") {
@@ -102,7 +128,33 @@ function pendingConfirmationResult(value: unknown): Awaited<ReturnType<RuntimeAu
   return value as unknown as Awaited<ReturnType<RuntimeAuthority["readPendingConfirmation"]>>;
 }
 
-export function createWorkerRuntimeAuthority(worker: WorkerDatabaseClient): RuntimeAuthority {
+export function createWorkerRuntimeAuthority(
+  worker: WorkerDatabaseClient,
+  options: Readonly<{ contextWorker?: ContextAuthorityWorkerDatabaseClient }> = {},
+): RuntimeAuthority {
+  const executions = new Map<string, AgentExecution>();
+  const sourceGrants = new Map<string, Readonly<{
+    executionId: string;
+    attemptSeq: number;
+    parameterSha256: string;
+  }>>();
+  const sourceDispatches = new Set<string>();
+  const remember = (execution: AgentExecution): AgentExecution => {
+    executions.set(execution.id, execution);
+    return execution;
+  };
+  const contextExecute = async (
+    operation: Parameters<ContextAuthorityWorkerDatabaseClient["executeContext"]>[0],
+  ): Promise<unknown> => {
+    if (options.contextWorker === undefined) {
+      throw new AgentRuntimeError("provider_failure", "Context authority was unavailable");
+    }
+    try {
+      return await options.contextWorker.executeContext(operation);
+    } catch (error: unknown) {
+      throw mappedError(error);
+    }
+  };
   const execute = async (operation: Parameters<WorkerDatabaseClient["executeRuntime"]>[0]): Promise<unknown> => {
     try {
       return await worker.executeRuntime(operation);
@@ -148,7 +200,7 @@ export function createWorkerRuntimeAuthority(worker: WorkerDatabaseClient): Runt
     },
     async invoke(context, intent, providerId, modelId) {
       const wireContext = context.kind === "human" ? context : toAgentWorkerCommandContext(context);
-      return invocationResult(await execute({
+      const result = invocationResult(await execute({
         type: "runtime.invoke",
         context: wireContext,
         intent,
@@ -158,9 +210,11 @@ export function createWorkerRuntimeAuthority(worker: WorkerDatabaseClient): Runt
         modelId,
         now: Date.now(),
       }));
+      remember(result.execution);
+      return result;
     },
     async invokeRouted(routeJobId, intent, providerId, modelId) {
-      return invocationResult(await execute({
+      const result = invocationResult(await execute({
         type: "runtime.invoke-routed",
         routeJobId,
         intent,
@@ -170,9 +224,11 @@ export function createWorkerRuntimeAuthority(worker: WorkerDatabaseClient): Runt
         modelId,
         now: Date.now(),
       }));
+      remember(result.execution);
+      return result;
     },
     async enqueueFenceReplacements(routeJobId, targetAgentId, providerId, modelId) {
-      return fenceReplacementResult(await execute({
+      const result = fenceReplacementResult(await execute({
         type: "runtime.enqueue-fence-replacements",
         routeJobId,
         targetAgentId,
@@ -180,29 +236,74 @@ export function createWorkerRuntimeAuthority(worker: WorkerDatabaseClient): Runt
         modelId,
         now: Date.now(),
       }));
+      for (const execution of result.executions) remember(execution);
+      return result;
     },
     async claim(executionId, attemptSeq) {
-      return executionResult(await execute({ type: "runtime.claim", executionId, attemptSeq, now: Date.now() }));
+      return remember(executionResult(await execute({
+        type: "runtime.claim", executionId, attemptSeq, now: Date.now(),
+      })));
     },
-    async complete(executionId, attemptSeq, body) {
-      return executionResult(await execute({
+    async complete(executionId, attemptSeq, body, citationLabels = []) {
+      const currentExecution = executions.get(executionId);
+      if (options.contextWorker !== undefined && currentExecution?.actionCategory === "model_generation") {
+        const prepared = await contextExecute({
+          type: "context.prepare", executionId, attemptSeq, now: Date.now(),
+        });
+        if (!record(prepared) || prepared.kind !== "context-preparation" ||
+            !record(prepared.preparation) || !record(prepared.snapshot) ||
+            typeof prepared.preparation.executionGeneration !== "number" ||
+            typeof prepared.preparation.invocationIntentId !== "string" ||
+            typeof prepared.preparation.agentId !== "string" ||
+            typeof prepared.preparation.roomId !== "string" ||
+            typeof prepared.snapshot.snapshotId !== "string" ||
+            typeof prepared.snapshot.snapshotGeneration !== "number") {
+          throw new AgentRuntimeError("provider_failure", "Context finalization facts were malformed");
+        }
+        const result = await contextExecute({
+          type: "context.finalize-agent-message",
+          context: {
+            kind: "agent-message",
+            agent: { actorId: prepared.preparation.agentId, kind: "agent" },
+            invocationIntentId: prepared.preparation.invocationIntentId,
+            executionId,
+            attemptSeq,
+            executionGeneration: prepared.preparation.executionGeneration,
+          },
+          command: {
+            messageId: `message-agent-${randomUUID()}`,
+            roomId: prepared.preparation.roomId,
+            body,
+          },
+          snapshotId: prepared.snapshot.snapshotId,
+          snapshotGeneration: prepared.snapshot.snapshotGeneration,
+          citationLabels,
+          now: Date.now(),
+        });
+        if (!record(result) || result.kind !== "context-finalized" ||
+            !isAgentExecution(result.execution)) {
+          throw new AgentRuntimeError("provider_failure", "Context finalization result was malformed");
+        }
+        return remember(result.execution);
+      }
+      return remember(executionResult(await execute({
         type: "runtime.complete",
         executionId,
         attemptSeq,
         messageId: `message-agent-${randomUUID()}`,
         body,
         now: Date.now(),
-      }));
+      })));
     },
     async scheduleRetry(executionId, attemptSeq, errorCode, nextRetryAt) {
-      return executionResult(await execute({
+      return remember(executionResult(await execute({
         type: "runtime.schedule-retry",
         executionId,
         attemptSeq,
         errorCode,
         ...(nextRetryAt === undefined ? {} : { nextRetryAt }),
         now: Date.now(),
-      }));
+      })));
     },
     async interrupt(context: AuthenticatedCommandContext, executionId, reason) {
       return executionResult(await execute({
@@ -214,7 +315,7 @@ export function createWorkerRuntimeAuthority(worker: WorkerDatabaseClient): Runt
       }));
     },
     async retry(context: AuthenticatedCommandContext, executionId) {
-      return invocationResult(await execute({
+      const result = invocationResult(await execute({
         type: "runtime.manual-retry",
         context,
         executionId,
@@ -222,6 +323,8 @@ export function createWorkerRuntimeAuthority(worker: WorkerDatabaseClient): Runt
         newIntentId: `intent-${randomUUID()}`,
         now: Date.now(),
       }));
+      remember(result.execution);
+      return result;
     },
     async beginCompensation(context, executionId) {
       const result = await execute({
@@ -244,13 +347,50 @@ export function createWorkerRuntimeAuthority(worker: WorkerDatabaseClient): Runt
       const result = await execute({ type: "runtime.recover", now: Date.now() });
       if (!record(result) || result.kind !== "recovery" || !Array.isArray(result.records) ||
           !result.records.every((entry) => record(entry) && isAgentExecution(entry.execution) &&
+            invocationIntent(entry.intent) && entry.intent.roomId === entry.execution.roomId &&
+            entry.intent.sourceMessageId === entry.execution.sourceMessageId &&
+            entry.intent.targetAgentId === entry.execution.agentId &&
             (entry.outcome === "enqueue" || entry.outcome === "failed" || entry.outcome === "fail_outcome_unknown" || entry.outcome === "wait_confirmation"))) {
         throw new AgentRuntimeError("provider_failure", "Authority recovery result was malformed");
       }
+      for (const entry of result.records) remember(entry.execution as AgentExecution);
       return result.records as ReturnType<RuntimeAuthority["recover"]> extends Promise<infer Records> ? Records : never;
     },
     async prepareTool(executionId, attemptSeq, tool, parameters, confirmationContext, providerCall) {
       const expiresAt = new Date(Date.now() + 5 * 60_000).toISOString();
+      if (tool.id === "room-memory.read") {
+        const execution = executions.get(executionId);
+        if (execution === undefined || execution.currentAttemptSeq !== attemptSeq ||
+            execution.status !== "running" || providerCall === undefined) {
+          throw new AgentRuntimeError("execution_conflict", "Source read execution was not current");
+        }
+        const prepared = await contextExecute({
+          type: "context.prepare", executionId, attemptSeq, now: Date.now(),
+        });
+        if (!record(prepared) || prepared.kind !== "context-preparation" ||
+            !record(prepared.snapshot) || typeof prepared.snapshot.snapshotGeneration !== "number") {
+          throw new AgentRuntimeError("provider_failure", "Source read snapshot was unavailable");
+        }
+        const grantId = `context-grant-${randomUUID()}`;
+        const parameterSha256 = createHash("sha256")
+          .update(canonicalJsonV1(parameters), "utf8").digest("hex");
+        const granted = await contextExecute({
+          type: "context.source-read-grant",
+          grantId,
+          executionId,
+          attemptSeq,
+          expectedSnapshotGeneration: prepared.snapshot.snapshotGeneration,
+          parameterSha256,
+          expiresAt,
+          now: Date.now(),
+        });
+        if (!record(granted) || granted.kind !== "context-source-read-grant" ||
+            granted.grantId !== grantId) {
+          throw new AgentRuntimeError("provider_failure", "Source read grant was malformed");
+        }
+        sourceGrants.set(grantId, { executionId, attemptSeq, parameterSha256 });
+        return { execution, grantId };
+      }
       return preparedToolResult(await execute({
         type: "runtime.prepare-tool",
         executionId,
@@ -275,7 +415,37 @@ export function createWorkerRuntimeAuthority(worker: WorkerDatabaseClient): Runt
         now: Date.now(),
       }));
     },
-    async claimTool(executionId, attemptSeq, grantId, parameters, confirmation) {
+    async claimTool(executionId, attemptSeq, grantId, parameters, confirmation, providerCall) {
+      const sourceGrant = sourceGrants.get(grantId);
+      if (sourceGrant !== undefined) {
+        try {
+          if (sourceGrant.executionId !== executionId || sourceGrant.attemptSeq !== attemptSeq ||
+              providerCall === undefined || createHash("sha256")
+                .update(canonicalJsonV1(parameters), "utf8").digest("hex") !==
+                sourceGrant.parameterSha256) {
+            throw new AgentRuntimeError("execution_conflict", "Source read dispatch changed its grant");
+          }
+          const dispatchId = `context-dispatch-${randomUUID()}`;
+          const dispatched = await contextExecute({
+            type: "context.source-read-dispatch",
+            grantId,
+            dispatchId,
+            executionId,
+            attemptSeq,
+            callId: providerCall.callId,
+            parameterSha256: sourceGrant.parameterSha256,
+            now: Date.now(),
+          });
+          if (!record(dispatched) || dispatched.kind !== "context-source-read-dispatch" ||
+              dispatched.dispatchId !== dispatchId) {
+            throw new AgentRuntimeError("provider_failure", "Source read dispatch was malformed");
+          }
+          sourceDispatches.add(dispatchId);
+          return { dispatchId, toolId: "room-memory.read", parameters };
+        } finally {
+          sourceGrants.delete(grantId);
+        }
+      }
       return claimedToolResult(await execute({
         type: "runtime.claim-tool",
         executionId,
@@ -288,6 +458,7 @@ export function createWorkerRuntimeAuthority(worker: WorkerDatabaseClient): Runt
       }));
     },
     async settleTool(dispatchId, state, summary, compensationToken) {
+      if (sourceDispatches.delete(dispatchId)) return;
       const result = await execute({
         type: "runtime.settle-tool",
         dispatchId,

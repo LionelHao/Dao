@@ -77,6 +77,12 @@ const agentFinal = {
   finalBody: "Checked and complete.",
   sourceInvocationIntentId: agentOutcome.invocationIntentId,
   sourceExecutionId: "execution-1",
+  citations: [{
+    ordinal: 1,
+    sourceKind: "message_revision" as const,
+    sourceId: "message-1",
+    sourceRevision: 1,
+  }],
 };
 
 const tombstone = {
@@ -281,6 +287,7 @@ describe("Message Authority vNext closed guards", () => {
   it("keeps Human, Agent final/correction and tombstone projections disjoint", () => {
     expect(messageAuthority.isTimelineMessage(activeHuman)).toBe(true);
     expect(messageAuthority.isAgentFinalMessage(agentFinal)).toBe(true);
+    expect(messageAuthority.isAgentMessageCitation(agentFinal.citations[0])).toBe(true);
     expect(messageAuthority.isTimelineMessage(agentFinal)).toBe(true);
     expect(messageAuthority.isMessageTombstone(tombstone)).toBe(true);
     expect(messageAuthority.isTimelineMessage(tombstone)).toBe(true);
@@ -319,6 +326,23 @@ describe("Message Authority vNext closed guards", () => {
       ...agentFinal,
       correctsMessageId: agentFinal.id,
     })).toBe(false);
+    expect(messageAuthority.isAgentFinalMessage({
+      ...agentFinal,
+      citations: [{ ...agentFinal.citations[0], ordinal: 2 }],
+    })).toBe(false);
+    expect(messageAuthority.isAgentFinalMessage({
+      ...agentFinal,
+      citations: [agentFinal.citations[0], agentFinal.citations[0]],
+    })).toBe(false);
+    expect(messageAuthority.isAgentMessageCitation({
+      ...agentFinal.citations[0], snapshotId: "must-not-cross-projection",
+    })).toBe(false);
+    expect(messageAuthority.isAgentMessageCitation({
+      ordinal: 1,
+      sourceKind: "delta_range",
+      sourceId: "b".repeat(64),
+      sourceRevision: 4,
+    })).toBe(true);
     expect(messageAuthority.isMessageTombstone({
       ...tombstone,
       recalledAt: "2026-08-18T23:59:59.999Z",

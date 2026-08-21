@@ -13,6 +13,10 @@ const invocation = {
   attemptSeq: 1,
   roomId: "room-1",
   agentId: "agent-1",
+  callId: "call-1",
+  grantId: "grant-1",
+  dispatchId: "dispatch-1",
+  toolId: "http-json.read",
   signal: new AbortController().signal,
 } as const;
 

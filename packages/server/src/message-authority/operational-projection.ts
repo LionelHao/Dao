@@ -8,6 +8,7 @@ import {
   isTimelineMessage,
   type ActiveHumanMessage,
   type AgentFinalMessage,
+  type AgentMessageCitation,
   type AttachmentReference,
   type MentionTarget,
   type MessageAuthorityEvent,
@@ -104,6 +105,7 @@ export type OperationalAgentMessageSource = Readonly<{
   envelope: OperationalMessageEnvelopeRow;
   finalRevision: MessageRevision;
   sourceLineage: OperationalAgentSourceLineageRow;
+  citations: readonly AgentMessageCitation[];
   correction: OperationalAgentCorrectionRow | null;
 }>;
 
@@ -335,7 +337,7 @@ function projectRecalledHuman(
 }
 
 function projectAgentMessage(source: OperationalAgentMessageSource): AgentFinalMessage {
-  const { envelope, sourceLineage, correction } = source;
+  const { envelope, sourceLineage, citations, correction } = source;
   if (envelope.authorKind !== "agent" || envelope.lifecycle !== "active" ||
       envelope.recalledAt !== null ||
       (envelope.messageKind !== "agent-final" && envelope.messageKind !== "agent-correction") ||
@@ -361,6 +363,12 @@ function projectAgentMessage(source: OperationalAgentMessageSource): AgentFinalM
     reject("invalid_projection");
   }
 
+  const frozenCitations = Object.freeze(citations.map((citation) => Object.freeze({
+    ordinal: citation.ordinal,
+    sourceKind: citation.sourceKind,
+    sourceId: citation.sourceId,
+    sourceRevision: citation.sourceRevision,
+  })));
   const projection: AgentFinalMessage = Object.freeze({
     id: envelope.messageId,
     roomId: envelope.roomId,
@@ -371,6 +379,7 @@ function projectAgentMessage(source: OperationalAgentMessageSource): AgentFinalM
     finalBody: source.finalRevision.body,
     sourceInvocationIntentId: sourceLineage.invocationIntentId,
     sourceExecutionId: sourceLineage.executionId,
+    citations: frozenCitations,
     ...(correction === null ? {} : { correctsMessageId: correction.correctsMessageId }),
   });
   if (!isTimelineMessage(projection)) reject("invalid_projection");
@@ -396,7 +405,7 @@ export function projectOperationalTimelineMessage(
   }
   if (value.kind === "agent-message") {
     if (!hasExactKeys(value, [
-      "kind", "envelope", "finalRevision", "sourceLineage", "correction",
+      "kind", "envelope", "finalRevision", "sourceLineage", "citations", "correction",
     ]) || !isEnvelopeRow(value.envelope)) reject("invalid_source");
     return projectAgentMessage(value as OperationalAgentMessageSource);
   }

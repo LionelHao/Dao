@@ -205,6 +205,7 @@ function mapProjection(
   const openDispute = projection.disputes.find((dispute) => dispute.status === "open");
   return Object.freeze({
     memoryRecordId: projection.memoryRecordId,
+    memoryVersionId: projection.currentVersion.memoryVersionId,
     version: projection.currentVersion.version,
     kind: projection.kind,
     state: projection.currentVersion.state,

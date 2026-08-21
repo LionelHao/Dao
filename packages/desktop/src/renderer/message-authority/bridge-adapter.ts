@@ -14,6 +14,10 @@ import type {
   AttachmentStatusResult,
 } from "../../attachment-authority/contracts.js";
 import {
+  isMemoryAuthorityEpochResponse,
+  type MemoryAuthorityBridge,
+} from "../../memory-authority/contracts.js";
+import {
   advanceMessageAuthorityCursor,
   applyMessageAuthorityEvent,
   beginMessageAuthorityRepair,
@@ -32,6 +36,7 @@ import {
   createMessageAuthorityState,
   failRepairGeneration,
   retryMessageSubmission,
+  type AgentMessageCitationProjection,
   type MessageActorOption,
   type MessageAuthorityInput,
   type MessageAuthorityState,
@@ -52,6 +57,7 @@ export interface MessageAuthorityBridgeSurfaceOptions {
   readonly createTargetId: () => string;
   readonly reducedMotion?: boolean;
   readonly attachmentBridge?: AttachmentAuthorityBridge;
+  readonly memoryBridge?: MemoryAuthorityBridge;
 }
 
 type RevisionTarget = Readonly<{ messageId: string; expectedRevision: number }>;
@@ -99,6 +105,7 @@ function mapTimelineMessage(message: CoreTimelineMessage): TimelineMessage {
       finalBody: message.finalBody,
       sourceInvocationIntentId: message.sourceInvocationIntentId,
       sourceExecutionId: message.sourceExecutionId,
+      citations: message.citations,
       ...(message.correctsMessageId === undefined
         ? {}
         : { correctsMessageId: message.correctsMessageId }),
@@ -173,6 +180,7 @@ export function mountMessageAuthorityBridgeSurface(
   options: MessageAuthorityBridgeSurfaceOptions,
 ): () => void {
   const attachmentBridge = options.attachmentBridge;
+  const memoryBridge = options.memoryBridge;
   let disposed = false;
   let state: MessageAuthorityState | undefined;
   let replica: MessageAuthorityReplica | undefined;
@@ -187,6 +195,18 @@ export function mountMessageAuthorityBridgeSurface(
   const attachmentPending = new Map<string, number>();
   let attachmentHydrationEpoch = 0;
   const beforeHistory: MessageAuthorityBridgeInput[] = [];
+
+  const roomMemorySourceId = (citation: AgentMessageCitationProjection): string => {
+    const prefix = citation.sourceKind === "message" ? "message:"
+      : citation.sourceKind === "message_revision" ? "message-revision:"
+        : citation.sourceKind === "message_tombstone" ? "message-tombstone:"
+          : citation.sourceKind === "attachment_extraction" ? "attachment-extraction:"
+            : citation.sourceKind === "project_fact_checkpoint" ? "project-fact:"
+              : "";
+    return prefix.length === 0 || citation.sourceId.startsWith(prefix)
+      ? citation.sourceId
+      : `${prefix}${citation.sourceId}`;
+  };
 
   const attachmentTargets = (): ReadonlyMap<string, string> => {
     const result = new Map<string, string>();
@@ -752,6 +772,58 @@ export function mountMessageAuthorityBridgeSurface(
       state = replaceState(state, { draft });
       render();
     },
+    ...(memoryBridge === undefined ? {} : {
+      onOpenCitation(citation) {
+        if (state === undefined || state.connection.status !== "online") return;
+        const citationSourceKind = citation.sourceKind;
+        if (citationSourceKind === "delta_range") return;
+        const openedFrom = state;
+        void memoryBridge.context({ roomId }).then(async (context) => {
+          if (disposed || state === undefined || state !== openedFrom ||
+              context.roomId !== roomId || context.lifecycle !== "active") throw new Error("citation context stale");
+          if (citationSourceKind === "memory") {
+            const target = [...document.querySelectorAll<HTMLElement>("[data-memory-version-id]")]
+              .find((candidate) => candidate.dataset.memoryVersionId === citation.sourceId);
+            if (target === undefined) throw new Error("citation source unavailable");
+            target.tabIndex = -1;
+            target.scrollIntoView?.({ block: "center", behavior: "auto" });
+            target.focus({ preventScroll: true });
+            return;
+          }
+          const response = await memoryBridge.request({
+            accessEpoch: context.accessEpoch,
+            frame: {
+              type: "room.memory.source.query.v1",
+              requestId: `citation-${globalThis.crypto.randomUUID()}`,
+              roomId,
+              sourceKind: citationSourceKind,
+              sourceId: roomMemorySourceId(citation),
+              sourceRevision: citation.sourceRevision,
+            },
+          });
+          if (!isMemoryAuthorityEpochResponse(response) || response.accessEpoch !== context.accessEpoch ||
+              response.frame.type !== "room.memory.source.v1") {
+            throw new Error("citation source unavailable");
+          }
+          const navigation = response.frame.source.navigation;
+          const targetId = navigation.kind === "attachment"
+            ? navigation.attachmentId
+            : navigation.kind === "project_fact" ? undefined : navigation.messageId;
+          const attribute = navigation.kind === "attachment" ? "data-attachment-id" : "data-message-id";
+          const target = targetId === undefined ? undefined
+            : [...document.querySelectorAll<HTMLElement>(`[${attribute}]`)]
+              .find((candidate) => candidate.getAttribute(attribute) === targetId);
+          if (target === undefined) throw new Error("citation source unavailable");
+          target.tabIndex = -1;
+          target.scrollIntoView?.({ block: "center", behavior: "auto" });
+          target.focus({ preventScroll: true });
+        }).catch(() => {
+          if (disposed || state === undefined) return;
+          state = replaceState(state, { announcement: "来源不可访问；未显示来源正文" });
+          render();
+        });
+      },
+    }),
     ...(attachmentBridge === undefined ? {} : {
       attachmentSubmissionBlocked: () => attachmentSubmissionBlocked,
       onSelectAttachment() {

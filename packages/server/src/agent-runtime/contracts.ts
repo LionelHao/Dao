@@ -23,6 +23,14 @@ export type AgentRuntimeErrorCode =
   | "confirmation_expired"
   | "confirmation_forbidden"
   | "confirmation_replayed"
+  | "content_too_large"
+  | "context_capacity_limited"
+  | "context_forbidden"
+  | "context_generation_conflict"
+  | "context_snapshot_conflict"
+  | "context_snapshot_invalidated"
+  | "context_source_gone"
+  | "context_storage_unavailable"
   | "execution_conflict"
   | "execution_not_found"
   | "invalid_parameters"
@@ -44,6 +52,14 @@ const errorStatuses: Readonly<Record<AgentRuntimeErrorCode, 400 | 403 | 404 | 40
   confirmation_expired: 410,
   confirmation_forbidden: 403,
   confirmation_replayed: 409,
+  content_too_large: 400,
+  context_capacity_limited: 429,
+  context_forbidden: 403,
+  context_generation_conflict: 409,
+  context_snapshot_conflict: 409,
+  context_snapshot_invalidated: 410,
+  context_source_gone: 410,
+  context_storage_unavailable: 503,
   execution_conflict: 409,
   execution_not_found: 404,
   invalid_parameters: 400,
@@ -87,6 +103,10 @@ export interface ToolInvocation {
   readonly attemptSeq: number;
   readonly roomId: string;
   readonly agentId: string;
+  readonly callId: string;
+  readonly grantId: string;
+  readonly dispatchId: string;
+  readonly toolId: ToolDescriptor["id"];
   readonly parameters: Readonly<Record<string, unknown>>;
   readonly signal: AbortSignal;
 }
@@ -108,6 +128,10 @@ export interface InvocationAccepted {
   readonly replayed: boolean;
 }
 
+export interface InvocationAcceptedWithIntent extends InvocationAccepted {
+  readonly intent: AgentInvocationIntent;
+}
+
 export interface PreparedToolCall {
   readonly execution: AgentExecution;
   readonly grantId: string;
@@ -125,6 +149,7 @@ export interface ClaimedToolDispatch {
 
 export interface PendingToolConfirmation {
   readonly execution: AgentExecution;
+  readonly intent: AgentInvocationIntent;
   readonly grantId: string;
   readonly toolId: ToolDescriptor["id"];
   readonly parameters: Readonly<Record<string, unknown>>;
@@ -142,6 +167,7 @@ export interface BegunCompensation {
 
 export interface RuntimeRecoveryRecord {
   readonly execution: AgentExecution;
+  readonly intent: AgentInvocationIntent;
   readonly outcome: "enqueue" | "failed" | "fail_outcome_unknown" | "wait_confirmation";
 }
 
@@ -167,13 +193,13 @@ export interface RuntimeAuthority {
     intent: AgentInvocationIntent,
     providerId: string,
     modelId: string,
-  ): Promise<InvocationAccepted>;
+  ): Promise<InvocationAcceptedWithIntent>;
   invokeRouted(
     routeJobId: string,
     intent: AgentInvocationIntent,
     providerId: string,
     modelId: string,
-  ): Promise<InvocationAccepted>;
+  ): Promise<InvocationAcceptedWithIntent>;
   enqueueFenceReplacements(
     routeJobId: string,
     targetAgentId: string,
@@ -181,7 +207,12 @@ export interface RuntimeAuthority {
     modelId: string,
   ): Promise<FenceReplacementAccepted>;
   claim(executionId: string, attemptSeq: number): Promise<AgentExecution>;
-  complete(executionId: string, attemptSeq: number, body: string): Promise<AgentExecution>;
+  complete(
+    executionId: string,
+    attemptSeq: number,
+    body: string,
+    citationLabels?: readonly string[],
+  ): Promise<AgentExecution>;
   scheduleRetry(
     executionId: string,
     attemptSeq: number,
@@ -196,7 +227,7 @@ export interface RuntimeAuthority {
   retry(
     context: AuthenticatedCommandContext,
     executionId: string,
-  ): Promise<InvocationAccepted>;
+  ): Promise<InvocationAcceptedWithIntent>;
   beginCompensation(
     context: AuthenticatedCommandContext,
     executionId: string,
@@ -219,6 +250,7 @@ export interface RuntimeAuthority {
     grantId: string,
     parameters: Readonly<Record<string, unknown>>,
     confirmation?: { readonly context: AuthenticatedCommandContext; readonly input: ToolConfirmationInput },
+    providerCall?: { readonly callId: string },
   ): Promise<ClaimedToolDispatch>;
   settleTool(
     dispatchId: string,

@@ -22,6 +22,7 @@ import {
   type AuthorityWorkerErrorCode,
   type AuthorityWorkerRequest,
   type AuthorityWorkerResponse,
+  type ContextWorkerOperation,
 } from "./worker-protocol.js";
 import type {
   LegacyImportInspection,
@@ -94,7 +95,7 @@ export interface CreateWorkerDatabaseClientOptions {
 }
 
 export interface AuthoritySchemaInspection {
-  readonly version: 18;
+  readonly version: 19;
 }
 
 export interface WorkerDatabaseClient {
@@ -275,7 +276,11 @@ export interface WorkerDatabaseClient {
 }
 
 export type CompleteWorkerDatabaseClient = WorkerDatabaseClient &
-  MessageAuthorityWorkerDatabaseClient;
+  MessageAuthorityWorkerDatabaseClient & ContextAuthorityWorkerDatabaseClient;
+
+export interface ContextAuthorityWorkerDatabaseClient {
+  executeContext(operation: ContextWorkerOperation): Promise<unknown>;
+}
 
 export interface AuthorityWorkerTransport {
   postMessage(message: AuthorityWorkerRequest): void;
@@ -350,6 +355,7 @@ function authorityWorkerClientErrorStatus(
     case "attachment_forbidden":
     case "session_revoked":
     case "snapshot_family_revoked":
+    case "context_forbidden":
       return 403;
     case "invitation_not_found":
     case "member_not_found":
@@ -395,6 +401,8 @@ function authorityWorkerClientErrorStatus(
     case "confirmation_rejected":
     case "departure_blocked":
     case "grant_revoked":
+    case "context_generation_conflict":
+    case "context_snapshot_conflict":
       return 409;
     case "snapshot_forbidden":
     case "role_forbidden":
@@ -405,6 +413,8 @@ function authorityWorkerClientErrorStatus(
     case "upload_expired":
     case "attachment_gone":
     case "memory_source_gone":
+    case "context_snapshot_invalidated":
+    case "context_source_gone":
       return 410;
     case "attachment_too_large":
     case "chunk_too_large":
@@ -421,6 +431,7 @@ function authorityWorkerClientErrorStatus(
     case "agent_queue_full":
     case "attachment_capacity_limited":
     case "memory_capacity_limited":
+    case "context_capacity_limited":
       return 429;
     case "scanner_unavailable":
     case "extractor_unavailable":
@@ -441,6 +452,7 @@ function authorityWorkerClientErrorStatus(
     case "memory_dependency_unavailable":
     case "repair_barrier_active":
     case "dependency_unavailable":
+    case "context_storage_unavailable":
       return 503;
     default: {
       const unreachable: never = code;
@@ -1381,6 +1393,19 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
     });
   }
 
+  executeContext(operation: ContextWorkerOperation): Promise<unknown> {
+    if (this.#terminalError !== undefined) return this.#rejectTerminal();
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) return Promise.reject(unavailable);
+    return this.#send({ type: "authority.context", operation }).then((response) => {
+      if (response.type !== "authority.context-result") {
+        this.#failProtocol("Authority worker returned the wrong context response");
+        throw this.#terminalError;
+      }
+      return response.result;
+    });
+  }
+
   executeRoute(operation: RouteAuthorityOperation): Promise<unknown> {
     if (this.#terminalError !== undefined) return this.#rejectTerminal();
     const unavailable = this.#unavailableError();
@@ -1964,6 +1989,8 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
         responseType === "authority.message-revisions") ||
       (requestType === "authority.runtime" &&
         responseType === "authority.runtime-result") ||
+      (requestType === "authority.context" &&
+        responseType === "authority.context-result") ||
       (requestType === "authority.route" &&
         responseType === "authority.route-result") ||
       (requestType === "authority.ball" &&

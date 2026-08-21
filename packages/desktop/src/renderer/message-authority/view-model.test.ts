@@ -306,6 +306,7 @@ describe("REQ-MSG-004/005/006/007/008 timeline authority", () => {
         finalBody: "最终结论",
         sourceInvocationIntentId: "invocation-intent-1",
         sourceExecutionId: "execution-1",
+        citations: [],
       },
     });
     const corrected = applyMessageAuthorityInput(final, {
@@ -320,6 +321,7 @@ describe("REQ-MSG-004/005/006/007/008 timeline authority", () => {
         finalBody: "更正后的结论",
         sourceInvocationIntentId: "invocation-intent-1",
         sourceExecutionId: "execution-2",
+        citations: [],
         correctsMessageId: "message-agent-final",
       },
     });

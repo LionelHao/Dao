@@ -777,6 +777,7 @@ export type ProtocolErrorCode =
   | "protocol_upgrade_required"
   | "departure_blocked"
   | "confirmation_rejected"
+  | "content_too_large"
   | "grant_revoked"
   | "dependency_unavailable"
   | "agent_configuration_missing"

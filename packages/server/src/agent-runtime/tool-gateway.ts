@@ -6,10 +6,18 @@ import {
   type ToolAdapter,
   type ToolOutcome,
 } from "./contracts.js";
+import {
+  isRoomMemoryReadError,
+  type RoomMemoryReadError,
+  type RoomMemoryReadToolAdapter,
+} from "./room-memory-read-tool.js";
+
+type RuntimeToolId = ToolDescriptor["id"] | "room-memory.read";
+type RuntimeToolAdapter = ToolAdapter | RoomMemoryReadToolAdapter;
 
 interface ToolGatewayOptions {
   readonly authority: RuntimeAuthority;
-  readonly adapters: readonly ToolAdapter[];
+  readonly adapters: readonly RuntimeToolAdapter[];
 }
 
 interface GatewayExecutionInput {
@@ -17,8 +25,9 @@ interface GatewayExecutionInput {
   readonly attemptSeq: number;
   readonly roomId: string;
   readonly agentId: string;
+  readonly callId: string;
   readonly grantId: string;
-  readonly toolId: ToolDescriptor["id"];
+  readonly toolId: RuntimeToolId;
   readonly parameters: Readonly<Record<string, unknown>>;
   readonly confirmation?: {
     readonly context: AuthenticatedCommandContext;
@@ -31,8 +40,24 @@ export interface ToolGateway {
   execute(input: GatewayExecutionInput): Promise<ToolOutcome>;
 }
 
+function runtimeSourceReadError(error: RoomMemoryReadError): AgentRuntimeError {
+  if (error.status === 403) {
+    return new AgentRuntimeError("context_forbidden", "Context source read was forbidden");
+  }
+  if (error.status === 409) {
+    return new AgentRuntimeError("context_generation_conflict", "Context source read was stale");
+  }
+  if (error.status === 410) {
+    return new AgentRuntimeError("context_source_gone", "Context source was invalidated");
+  }
+  if (error.status === 429) {
+    return new AgentRuntimeError("context_capacity_limited", "Context source read capacity was exceeded");
+  }
+  return new AgentRuntimeError("context_storage_unavailable", "Context source authority was unavailable");
+}
+
 export function createToolGateway(options: ToolGatewayOptions): ToolGateway {
-  const adapters = new Map<ToolDescriptor["id"], ToolAdapter>();
+  const adapters = new Map<RuntimeToolId, RuntimeToolAdapter>();
   for (const adapter of options.adapters) {
     if (adapters.has(adapter.descriptor.id)) throw new TypeError(`Duplicate tool adapter: ${adapter.descriptor.id}`);
     adapters.set(adapter.descriptor.id, adapter);
@@ -47,8 +72,9 @@ export function createToolGateway(options: ToolGatewayOptions): ToolGateway {
         input.grantId,
         input.parameters,
         input.confirmation,
+        { callId: input.callId },
       );
-      if (dispatch.toolId !== input.toolId) {
+      if ((dispatch.toolId as RuntimeToolId) !== input.toolId) {
         throw new AgentRuntimeError("execution_conflict", "Claimed tool identity changed");
       }
       try {
@@ -57,6 +83,10 @@ export function createToolGateway(options: ToolGatewayOptions): ToolGateway {
           attemptSeq: input.attemptSeq,
           roomId: input.roomId,
           agentId: input.agentId,
+          callId: input.callId,
+          grantId: input.grantId,
+          dispatchId: dispatch.dispatchId,
+          toolId: input.toolId,
           parameters: dispatch.parameters,
           signal: input.signal,
         });
@@ -82,6 +112,7 @@ export function createToolGateway(options: ToolGatewayOptions): ToolGateway {
         }
         await options.authority.settleTool(dispatch.dispatchId, "failed", { outcome: "failed" });
         if (error instanceof AgentRuntimeError) throw error;
+        if (isRoomMemoryReadError(error)) throw runtimeSourceReadError(error);
         throw new AgentRuntimeError("tool_failure", "Tool execution failed");
       }
     },

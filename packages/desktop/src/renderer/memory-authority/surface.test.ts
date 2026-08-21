@@ -9,7 +9,8 @@ function state(overrides: Partial<MemoryPanelInput> = {}): MemoryPanelInput {
     health: { status: "healthy", memoryWatermark: 9, corpusHead: 9, lag: 0, retryable: false, recoveryRequired: false },
     viewer: { actorId: "human-1", currentHuman: true }, operation: { status: "idle" }, reducedMotion: false,
     memories: [{
-      memoryRecordId: "context-1", version: 2, kind: "context", state: "active",
+      memoryRecordId: "context-1", memoryVersionId: "memory-version-2",
+      version: 2, kind: "context", state: "active",
       derivedText: "Ship only after the review.", sources: [{
         sourceId: "message:1", sourceKind: "message", revision: 3, availability: "active",
         navigation: { kind: "message", messageId: "message-1" },
@@ -32,6 +33,7 @@ describe("FT-05 live Memory right-rail DOM contract", () => {
     renderMemoryAuthoritySurface(root, state(), handlers);
     expect(root.querySelector("[data-memory-panel]")?.getAttribute("aria-label")).toBe("重要记忆 · 5 类");
     expect(root.querySelector("[data-memory-record-id='context-1']")?.textContent).toContain("CONTEXT · ACTIVE");
+    expect(root.querySelector("[data-memory-version-id='memory-version-2']")).not.toBeNull();
     expect(root.querySelector("[data-memory-watermark]")?.textContent).toBe("STEWARD · #9 · 已同步");
     root.querySelector<HTMLButtonElement>("[data-source-id='message:1']")?.click();
     expect(handlers.onNavigateSource).toHaveBeenCalledWith({ kind: "message", messageId: "message-1" });

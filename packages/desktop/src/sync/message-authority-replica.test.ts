@@ -80,6 +80,7 @@ function agent(id = "message-agent", correctsMessageId?: string): AgentFinalMess
     finalBody: correctsMessageId === undefined ? "Final" : "Correction",
     sourceInvocationIntentId: "intent-1",
     sourceExecutionId: correctsMessageId === undefined ? "execution-1" : "execution-2",
+    citations: [],
     ...(correctsMessageId === undefined ? {} : { correctsMessageId }),
   };
 }

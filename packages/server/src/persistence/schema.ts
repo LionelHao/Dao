@@ -7,7 +7,7 @@ import {
 } from "../access/room-cache-invalidation-port.js";
 import { OFFLINE_READ_LEASE_SCHEMA_STATEMENTS } from "../access/offline-lease-invalidation-port.js";
 
-export const AUTHORITY_SCHEMA_VERSION = 18 as const;
+export const AUTHORITY_SCHEMA_VERSION = 19 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -70,6 +70,7 @@ const SCHEMA_FINGERPRINTS = {
   16: "86a3512dcb625bc3e0f3d79e5a5d6542819523bee8ac851990148bcad8e38737",
   17: "cc4b260ec841765f0349040a238a44281aa3ed9a792623ebd6540fd3e9f6b0b0",
   18: "d1344ba94d7dd4253f2dcc9e392c3bc4b8b1ec5b4fbba614e3fe2a10392797e5",
+  19: "e458dedc7c0d85c04bca92dc2f6289b02367fb97fc7edbe1c7dba011470812b7",
 } as const;
 
 const V1_STATEMENTS = [
@@ -4176,11 +4177,1403 @@ const V18_STATEMENTS = [
    ORDER BY room.id`,
 ] as const;
 
+const V19_STATEMENTS = [
+  `CREATE TABLE context_snapshots (
+    snapshot_id TEXT PRIMARY KEY CHECK (length(trim(snapshot_id)) BETWEEN 1 AND 256),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    invocation_intent_id TEXT NOT NULL REFERENCES agent_invocation_intents(id),
+    agent_id TEXT NOT NULL REFERENCES actors(id),
+    provider_id TEXT NOT NULL CHECK (length(trim(provider_id)) BETWEEN 1 AND 128),
+    model_id TEXT NOT NULL CHECK (length(trim(model_id)) BETWEEN 1 AND 256),
+    compiler_version TEXT NOT NULL CHECK (length(trim(compiler_version)) BETWEEN 1 AND 128),
+    compiler_config_version TEXT NOT NULL CHECK (
+      length(trim(compiler_config_version)) BETWEEN 1 AND 128
+    ),
+    estimator_version TEXT NOT NULL CHECK (estimator_version = 'deterministic_utf8_v1'),
+    preparation_sha256 TEXT NOT NULL CHECK (
+      length(preparation_sha256) = 64 AND preparation_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    trigger_message_id TEXT NOT NULL REFERENCES message_envelopes(message_id),
+    trigger_revision INTEGER NOT NULL CHECK (trigger_revision >= 1),
+    trigger_reason TEXT NOT NULL CHECK (
+      trigger_reason IN ('direct_mention', 'structured_help', 'routed_candidate')
+    ),
+    memory_watermark INTEGER NOT NULL CHECK (memory_watermark >= 0),
+    corpus_head INTEGER NOT NULL CHECK (corpus_head >= memory_watermark),
+    raw_delta_from_exclusive INTEGER NOT NULL CHECK (raw_delta_from_exclusive >= 0),
+    raw_delta_to_inclusive INTEGER NOT NULL CHECK (
+      raw_delta_to_inclusive >= raw_delta_from_exclusive
+    ),
+    room_lifecycle_generation INTEGER NOT NULL CHECK (room_lifecycle_generation >= 0),
+    membership_access_revision INTEGER NOT NULL CHECK (membership_access_revision >= 0),
+    tool_capability_revision INTEGER NOT NULL CHECK (tool_capability_revision >= 0),
+    budget_json TEXT NOT NULL CHECK (
+      json_valid(budget_json) AND json_type(budget_json) = 'object'
+      AND length(CAST(budget_json AS BLOB)) BETWEEN 2 AND 32768
+    ),
+    manifest_sha256 TEXT NOT NULL CHECK (
+      length(manifest_sha256) = 64 AND manifest_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    envelope_sha256 TEXT NOT NULL CHECK (
+      length(envelope_sha256) = 64 AND envelope_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    state TEXT NOT NULL CHECK (state IN ('active', 'invalidated', 'superseded', 'retired')),
+    snapshot_generation INTEGER NOT NULL CHECK (snapshot_generation >= 1),
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+    invalidated_at TEXT,
+    invalidation_reason TEXT CHECK (
+      invalidation_reason IS NULL OR invalidation_reason IN (
+        'message_recalled', 'message_revised', 'memory_invalidated',
+        'attachment_invalidated', 'membership_revoked', 'room_archived',
+        'source_gone', 'authorization_changed'
+      )
+    ),
+    superseded_at TEXT,
+    retired_at TEXT,
+    retain_until TEXT,
+    payload_retention_state TEXT NOT NULL CHECK (
+      payload_retention_state IN ('required', 'purge_pending', 'purged')
+    ),
+    UNIQUE (snapshot_id, snapshot_generation),
+    FOREIGN KEY (trigger_message_id, trigger_revision)
+      REFERENCES message_revisions(message_id, revision),
+    CHECK (raw_delta_from_exclusive = memory_watermark),
+    CHECK (raw_delta_to_inclusive = corpus_head),
+    CHECK (
+      (state = 'active' AND invalidated_at IS NULL AND invalidation_reason IS NULL
+        AND superseded_at IS NULL AND retired_at IS NULL)
+      OR (state = 'invalidated' AND invalidated_at IS NOT NULL
+        AND invalidation_reason IS NOT NULL AND superseded_at IS NULL AND retired_at IS NULL)
+      OR (state = 'superseded' AND invalidated_at IS NULL
+        AND invalidation_reason IS NULL AND superseded_at IS NOT NULL AND retired_at IS NULL)
+      OR (state = 'retired' AND invalidated_at IS NULL
+        AND invalidation_reason IS NULL AND superseded_at IS NULL AND retired_at IS NOT NULL)
+    ),
+    CHECK (
+      (payload_retention_state = 'required' AND retain_until IS NULL)
+      OR (payload_retention_state IN ('purge_pending', 'purged') AND retain_until IS NOT NULL)
+    )
+  ) STRICT`,
+  `CREATE INDEX context_snapshots_room_state_v19
+   ON context_snapshots(room_id, state, snapshot_generation, snapshot_id)`,
+  `CREATE INDEX context_snapshots_retention_v19
+   ON context_snapshots(payload_retention_state, retain_until, snapshot_id)`,
+  `CREATE INDEX context_snapshots_trigger_v19
+   ON context_snapshots(trigger_message_id, trigger_revision, state, snapshot_id)`,
+  `CREATE TRIGGER context_snapshots_v19_validate_insert
+   BEFORE INSERT ON context_snapshots
+   WHEN NEW.state <> 'active' OR NEW.snapshot_generation <> 1
+      OR NEW.payload_retention_state <> 'required'
+      OR NOT EXISTS (
+        SELECT 1
+        FROM agent_invocation_intents AS intent
+        JOIN rooms AS room ON room.id = intent.room_id
+        JOIN actors AS agent ON agent.id = intent.target_agent_id
+        JOIN room_memberships AS membership
+          ON membership.room_id = intent.room_id
+         AND membership.actor_id = intent.target_agent_id
+         AND membership.kind = 'agent'
+        JOIN message_envelopes AS trigger
+          ON trigger.message_id = intent.source_message_id
+        LEFT JOIN room_memory_stewards AS steward ON steward.room_id = intent.room_id
+        WHERE intent.id = NEW.invocation_intent_id
+          AND intent.room_id = NEW.room_id
+          AND intent.target_agent_id = NEW.agent_id
+          AND intent.source_message_id = NEW.trigger_message_id
+          AND intent.source_revision = NEW.trigger_revision
+          AND intent.intent_kind = NEW.trigger_reason
+          AND intent.status = 'claimed'
+          AND room.status = 'active'
+          AND room.archive_generation = NEW.room_lifecycle_generation
+          AND agent.kind = 'agent'
+          AND agent.catalog_revision = NEW.tool_capability_revision
+          AND membership.participation IN ('active', 'on-mention')
+          AND membership.access_revision = NEW.membership_access_revision
+          AND trigger.lifecycle = 'active'
+          AND COALESCE(steward.memory_watermark, 0) = NEW.memory_watermark
+          AND COALESCE(steward.corpus_head, 0) = NEW.corpus_head
+      )
+   BEGIN
+     SELECT RAISE(ABORT, 'Context snapshot preparation authority is stale');
+   END`,
+  `CREATE TRIGGER context_snapshots_v19_validate_update
+   BEFORE UPDATE ON context_snapshots
+   WHEN NEW.snapshot_id <> OLD.snapshot_id OR NEW.room_id <> OLD.room_id
+      OR NEW.invocation_intent_id <> OLD.invocation_intent_id
+      OR NEW.agent_id <> OLD.agent_id OR NEW.provider_id <> OLD.provider_id
+      OR NEW.model_id <> OLD.model_id OR NEW.compiler_version <> OLD.compiler_version
+      OR NEW.compiler_config_version <> OLD.compiler_config_version
+      OR NEW.estimator_version <> OLD.estimator_version
+      OR NEW.preparation_sha256 <> OLD.preparation_sha256
+      OR NEW.trigger_message_id <> OLD.trigger_message_id
+      OR NEW.trigger_revision <> OLD.trigger_revision
+      OR NEW.trigger_reason <> OLD.trigger_reason
+      OR NEW.memory_watermark <> OLD.memory_watermark
+      OR NEW.corpus_head <> OLD.corpus_head
+      OR NEW.raw_delta_from_exclusive <> OLD.raw_delta_from_exclusive
+      OR NEW.raw_delta_to_inclusive <> OLD.raw_delta_to_inclusive
+      OR NEW.room_lifecycle_generation <> OLD.room_lifecycle_generation
+      OR NEW.membership_access_revision <> OLD.membership_access_revision
+      OR NEW.tool_capability_revision <> OLD.tool_capability_revision
+      OR NEW.budget_json <> OLD.budget_json
+      OR NEW.manifest_sha256 <> OLD.manifest_sha256
+      OR NEW.envelope_sha256 <> OLD.envelope_sha256
+      OR NEW.created_at <> OLD.created_at
+      OR NOT (
+        (NEW.state = OLD.state AND NEW.snapshot_generation = OLD.snapshot_generation
+          AND NEW.invalidated_at IS OLD.invalidated_at
+          AND NEW.invalidation_reason IS OLD.invalidation_reason
+          AND NEW.superseded_at IS OLD.superseded_at
+          AND NEW.retired_at IS OLD.retired_at
+          AND ((OLD.payload_retention_state = 'required'
+                AND NEW.payload_retention_state = 'purge_pending'
+                AND OLD.retain_until IS NULL AND NEW.retain_until IS NOT NULL
+                AND EXISTS (
+                  SELECT 1
+                  FROM agent_execution_context_bindings AS binding
+                  JOIN agent_executions AS execution ON execution.id = binding.execution_id
+                  WHERE binding.snapshot_id = OLD.snapshot_id
+                    AND execution.status IN ('completed', 'failed', 'cancelled')
+                ))
+            OR (OLD.payload_retention_state = 'purge_pending'
+                AND NEW.payload_retention_state = 'purged'
+                AND NEW.retain_until = OLD.retain_until)))
+        OR (OLD.state = 'active' AND NEW.snapshot_generation = OLD.snapshot_generation + 1
+          AND NEW.payload_retention_state = OLD.payload_retention_state
+          AND NEW.retain_until IS OLD.retain_until
+          AND ((NEW.state = 'invalidated' AND NEW.invalidated_at IS NOT NULL
+                AND NEW.invalidation_reason IS NOT NULL
+                AND NEW.superseded_at IS NULL AND NEW.retired_at IS NULL)
+            OR (NEW.state = 'superseded' AND NEW.invalidated_at IS NULL
+                AND NEW.invalidation_reason IS NULL
+                AND NEW.superseded_at IS NOT NULL AND NEW.retired_at IS NULL)
+            OR (NEW.state = 'retired' AND NEW.invalidated_at IS NULL
+                AND NEW.invalidation_reason IS NULL
+                AND NEW.superseded_at IS NULL AND NEW.retired_at IS NOT NULL)))
+      )
+   BEGIN
+     SELECT RAISE(ABORT, 'Context snapshot transition or retention CAS is invalid');
+   END`,
+  `CREATE TRIGGER context_snapshots_v19_immutable_delete
+   BEFORE DELETE ON context_snapshots
+   BEGIN SELECT RAISE(ABORT, 'Context snapshot metadata is immutable'); END`,
+  `CREATE TRIGGER agent_executions_v19_schedule_context_retention
+   AFTER UPDATE OF status ON agent_executions
+   WHEN NEW.status IN ('completed', 'failed', 'cancelled')
+     AND OLD.status NOT IN ('completed', 'failed', 'cancelled')
+   BEGIN
+     UPDATE context_snapshots
+     SET payload_retention_state = 'purge_pending',
+         retain_until = strftime('%Y-%m-%dT%H:%M:%fZ', NEW.updated_at, '+30 days')
+     WHERE snapshot_id IN (
+       SELECT binding.snapshot_id FROM agent_execution_context_bindings AS binding
+       WHERE binding.execution_id = NEW.id
+     ) AND payload_retention_state = 'required';
+   END`,
+  `CREATE TABLE context_snapshot_transitions (
+    transition_id INTEGER PRIMARY KEY,
+    snapshot_id TEXT NOT NULL REFERENCES context_snapshots(snapshot_id),
+    from_state TEXT CHECK (from_state IS NULL OR from_state IN (
+      'active', 'invalidated', 'superseded', 'retired'
+    )),
+    to_state TEXT NOT NULL CHECK (to_state IN (
+      'active', 'invalidated', 'superseded', 'retired'
+    )),
+    from_generation INTEGER CHECK (from_generation IS NULL OR from_generation >= 1),
+    to_generation INTEGER NOT NULL CHECK (to_generation >= 1),
+    reason_code TEXT NOT NULL CHECK (length(trim(reason_code)) BETWEEN 1 AND 128),
+    transitioned_at TEXT NOT NULL CHECK (length(transitioned_at) > 0),
+    UNIQUE (snapshot_id, to_generation),
+    CHECK (
+      (from_state IS NULL AND from_generation IS NULL
+        AND to_state = 'active' AND to_generation = 1 AND reason_code = 'created')
+      OR (from_state IS NOT NULL AND from_generation IS NOT NULL
+        AND to_generation = from_generation + 1 AND to_state <> from_state)
+    )
+  ) STRICT`,
+  `CREATE INDEX context_snapshot_transitions_snapshot_v19
+   ON context_snapshot_transitions(snapshot_id, to_generation, transition_id)`,
+  `CREATE TRIGGER context_snapshot_transitions_v19_validate_insert
+   BEFORE INSERT ON context_snapshot_transitions
+   WHEN NOT EXISTS (
+     SELECT 1 FROM context_snapshots AS snapshot
+     WHERE snapshot.snapshot_id = NEW.snapshot_id
+       AND snapshot.state = NEW.to_state
+       AND snapshot.snapshot_generation = NEW.to_generation
+   )
+   BEGIN SELECT RAISE(ABORT, 'Context snapshot transition does not match current state'); END`,
+  `CREATE TRIGGER context_snapshot_transitions_v19_immutable_update
+   BEFORE UPDATE ON context_snapshot_transitions
+   BEGIN SELECT RAISE(ABORT, 'Context snapshot transition is immutable'); END`,
+  `CREATE TRIGGER context_snapshot_transitions_v19_immutable_delete
+   BEFORE DELETE ON context_snapshot_transitions
+   BEGIN SELECT RAISE(ABORT, 'Context snapshot transition is immutable'); END`,
+  `CREATE TRIGGER context_snapshots_v19_audit_insert
+   AFTER INSERT ON context_snapshots
+   BEGIN
+     INSERT INTO context_snapshot_transitions (
+       snapshot_id, from_state, to_state, from_generation, to_generation,
+       reason_code, transitioned_at
+     ) VALUES (
+       NEW.snapshot_id, NULL, 'active', NULL, 1, 'created', NEW.created_at
+     );
+   END`,
+  `CREATE TRIGGER context_snapshots_v19_audit_state_update
+   AFTER UPDATE OF state, snapshot_generation ON context_snapshots
+   WHEN NEW.state <> OLD.state OR NEW.snapshot_generation <> OLD.snapshot_generation
+   BEGIN
+     INSERT INTO context_snapshot_transitions (
+       snapshot_id, from_state, to_state, from_generation, to_generation,
+       reason_code, transitioned_at
+     ) VALUES (
+       NEW.snapshot_id, OLD.state, NEW.state, OLD.snapshot_generation,
+       NEW.snapshot_generation,
+       CASE NEW.state
+         WHEN 'invalidated' THEN NEW.invalidation_reason
+         WHEN 'superseded' THEN 'superseded'
+         ELSE 'retention_expired'
+       END,
+       COALESCE(NEW.invalidated_at, NEW.superseded_at, NEW.retired_at)
+     );
+   END`,
+  `CREATE TABLE context_manifests (
+    manifest_id TEXT PRIMARY KEY CHECK (length(trim(manifest_id)) BETWEEN 1 AND 256),
+    snapshot_id TEXT NOT NULL UNIQUE REFERENCES context_snapshots(snapshot_id),
+    manifest_version TEXT NOT NULL CHECK (length(trim(manifest_version)) BETWEEN 1 AND 128),
+    manifest_sha256 TEXT NOT NULL CHECK (
+      length(manifest_sha256) = 64 AND manifest_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    canonical_manifest_json TEXT NOT NULL CHECK (
+      json_valid(canonical_manifest_json)
+      AND json_type(canonical_manifest_json) = 'object'
+      AND length(CAST(canonical_manifest_json AS BLOB)) BETWEEN 2 AND 131072
+    ),
+    item_count INTEGER NOT NULL CHECK (item_count >= 1 AND item_count <= 4096),
+    total_original_bytes INTEGER NOT NULL CHECK (total_original_bytes >= 0),
+    total_included_bytes INTEGER NOT NULL CHECK (total_included_bytes >= 0),
+    total_original_tokens INTEGER NOT NULL CHECK (total_original_tokens >= 0),
+    total_included_tokens INTEGER NOT NULL CHECK (total_included_tokens >= 0),
+    accounting_json TEXT NOT NULL CHECK (
+      json_valid(accounting_json) AND json_type(accounting_json) = 'object'
+      AND length(CAST(accounting_json AS BLOB)) BETWEEN 2 AND 32768
+    ),
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0)
+  ) STRICT`,
+  `CREATE TRIGGER context_manifests_v19_validate_insert
+   BEFORE INSERT ON context_manifests
+   WHEN NOT EXISTS (
+     SELECT 1 FROM context_snapshots AS snapshot
+     WHERE snapshot.snapshot_id = NEW.snapshot_id
+       AND snapshot.manifest_sha256 = NEW.manifest_sha256
+       AND snapshot.created_at = NEW.created_at
+   )
+   BEGIN SELECT RAISE(ABORT, 'Context manifest does not match snapshot'); END`,
+  `CREATE TRIGGER context_manifests_v19_immutable_update
+   BEFORE UPDATE ON context_manifests
+   BEGIN SELECT RAISE(ABORT, 'Context manifest is immutable'); END`,
+  `CREATE TRIGGER context_manifests_v19_immutable_delete
+   BEFORE DELETE ON context_manifests
+   BEGIN SELECT RAISE(ABORT, 'Context manifest is immutable'); END`,
+  `CREATE TABLE context_manifest_items (
+    manifest_id TEXT NOT NULL REFERENCES context_manifests(manifest_id),
+    snapshot_id TEXT NOT NULL REFERENCES context_snapshots(snapshot_id),
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0 AND ordinal < 4096),
+    section TEXT NOT NULL CHECK (section IN (
+      'trusted_system', 'trusted_developer', 'trigger', 'memory', 'delta',
+      'retrieval', 'attachment', 'project', 'tools', 'degradation'
+    )),
+    disposition TEXT NOT NULL CHECK (disposition IN (
+      'included', 'excerpted', 'segmented', 'digested', 'index_only',
+      'omitted', 'unavailable', 'invalidated'
+    )),
+    canonical_sort_key TEXT NOT NULL CHECK (
+      length(CAST(canonical_sort_key AS BLOB)) BETWEEN 1 AND 1024
+    ),
+    source_label_sha256 TEXT CHECK (
+      source_label_sha256 IS NULL OR (
+        length(source_label_sha256) = 64 AND source_label_sha256 NOT GLOB '*[^0-9a-f]*'
+      )
+    ),
+    source_kind TEXT CHECK (source_kind IN (
+      'policy', 'trigger', 'message', 'message_revision', 'message_tombstone',
+      'memory', 'attachment', 'attachment_extraction', 'project',
+      'project_fact_checkpoint', 'tool', 'retrieval'
+    )),
+    source_id TEXT CHECK (source_id IS NULL OR length(trim(source_id)) BETWEEN 1 AND 512),
+    source_revision INTEGER CHECK (source_revision IS NULL OR source_revision >= 0),
+    content_sha256 TEXT CHECK (
+      content_sha256 IS NULL OR (
+        length(content_sha256) = 64 AND content_sha256 NOT GLOB '*[^0-9a-f]*'
+      )
+    ),
+    original_bytes INTEGER NOT NULL CHECK (original_bytes >= 0),
+    included_bytes INTEGER NOT NULL CHECK (
+      included_bytes >= 0 AND (disposition = 'index_only' OR included_bytes <= original_bytes)
+    ),
+    original_tokens INTEGER NOT NULL CHECK (original_tokens >= 0),
+    included_tokens INTEGER NOT NULL CHECK (
+      included_tokens >= 0 AND (disposition = 'index_only' OR included_tokens <= original_tokens)
+    ),
+    reason_code TEXT CHECK (reason_code IS NULL OR length(trim(reason_code)) BETWEEN 1 AND 128),
+    segment_json TEXT CHECK (
+      segment_json IS NULL OR (
+        json_valid(segment_json) AND json_type(segment_json) = 'object'
+        AND length(CAST(segment_json AS BLOB)) <= 4096
+      )
+    ),
+    availability TEXT NOT NULL CHECK (
+      availability IN ('readable', 'metadata_only', 'unavailable', 'invalidated')
+    ),
+    PRIMARY KEY (manifest_id, ordinal),
+    UNIQUE (snapshot_id, ordinal),
+    UNIQUE (manifest_id, canonical_sort_key),
+    UNIQUE (snapshot_id, source_label_sha256),
+    CHECK (
+      (source_kind IS NULL AND source_id IS NULL AND source_revision IS NULL
+        AND section = 'delta' AND disposition = 'index_only'
+        AND source_label_sha256 IS NOT NULL AND segment_json IS NOT NULL)
+      OR (source_kind IS NOT NULL AND source_id IS NOT NULL AND source_revision IS NOT NULL)
+    ),
+    CHECK (
+      (disposition IN ('included', 'excerpted', 'segmented') AND included_bytes > 0)
+      OR (disposition IN ('digested', 'index_only') AND included_bytes >= 0)
+      OR (disposition IN ('omitted', 'unavailable', 'invalidated') AND included_bytes = 0)
+    ),
+    CHECK (
+      reason_code IS NOT NULL
+    )
+  ) STRICT`,
+  `CREATE INDEX context_manifest_items_source_v19
+   ON context_manifest_items(source_kind, source_id, source_revision, snapshot_id)`,
+  `CREATE TRIGGER context_manifest_items_v19_validate_insert
+   BEFORE INSERT ON context_manifest_items
+   WHEN NEW.ordinal <> (
+       SELECT COUNT(*) FROM context_manifest_items WHERE manifest_id = NEW.manifest_id
+     )
+      OR NOT EXISTS (
+        SELECT 1 FROM context_manifests AS manifest
+        WHERE manifest.manifest_id = NEW.manifest_id
+          AND manifest.snapshot_id = NEW.snapshot_id
+          AND NEW.ordinal < manifest.item_count
+      )
+   BEGIN SELECT RAISE(ABORT, 'Context manifest item order or binding is invalid'); END`,
+  `CREATE TRIGGER context_manifest_items_v19_immutable_update
+   BEFORE UPDATE ON context_manifest_items
+   BEGIN SELECT RAISE(ABORT, 'Context manifest item is immutable'); END`,
+  `CREATE TRIGGER context_manifest_items_v19_immutable_delete
+   BEFORE DELETE ON context_manifest_items
+   BEGIN SELECT RAISE(ABORT, 'Context manifest item is immutable'); END`,
+  `CREATE TABLE context_snapshot_sources (
+    snapshot_id TEXT NOT NULL REFERENCES context_snapshots(snapshot_id),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    source_kind TEXT NOT NULL CHECK (source_kind IN (
+      'message_revision', 'message_tombstone', 'memory',
+      'attachment_extraction', 'project_fact_checkpoint'
+    )),
+    source_id TEXT NOT NULL CHECK (length(trim(source_id)) BETWEEN 1 AND 512),
+    source_revision INTEGER NOT NULL CHECK (source_revision >= 1),
+    source_label_sha256 TEXT CHECK (
+      source_label_sha256 IS NULL OR (
+        length(source_label_sha256) = 64 AND source_label_sha256 NOT GLOB '*[^0-9a-f]*'
+      )
+    ),
+    currently_required INTEGER NOT NULL CHECK (currently_required IN (0, 1)),
+    authorization_revision INTEGER NOT NULL CHECK (authorization_revision >= 0),
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+    PRIMARY KEY (snapshot_id, source_kind, source_id, source_revision),
+    UNIQUE (snapshot_id, source_label_sha256)
+  ) STRICT`,
+  `CREATE INDEX context_snapshot_sources_lookup_v19
+   ON context_snapshot_sources(room_id, source_kind, source_id, source_revision, snapshot_id)`,
+  `CREATE TRIGGER context_snapshot_sources_v19_validate_insert
+   BEFORE INSERT ON context_snapshot_sources
+   WHEN NOT EXISTS (
+       SELECT 1 FROM context_snapshots AS snapshot
+       WHERE snapshot.snapshot_id = NEW.snapshot_id
+         AND snapshot.room_id = NEW.room_id AND snapshot.state = 'active'
+         AND NEW.authorization_revision = CASE
+           WHEN NEW.source_kind = 'attachment_extraction' AND NEW.currently_required = 1
+             THEN COALESCE((
+             SELECT attachment.access_revision FROM attachments AS attachment
+             WHERE substr(NEW.source_id, 1, 22) = 'attachment-extraction:'
+               AND attachment.attachment_id = substr(NEW.source_id, 23)
+               AND attachment.room_id = NEW.room_id
+           ), -1)
+           ELSE snapshot.membership_access_revision
+         END
+     )
+      OR (NEW.currently_required = 0 AND NEW.source_kind <> 'message_tombstone' AND (
+        NOT EXISTS (
+          SELECT 1 FROM context_manifest_items AS item
+          WHERE item.snapshot_id = NEW.snapshot_id
+            AND item.source_id = NEW.source_id
+            AND item.source_revision = NEW.source_revision
+            AND item.availability IN ('unavailable', 'invalidated')
+            AND ((NEW.source_kind = 'message_revision'
+                  AND item.source_kind IN ('message', 'trigger', 'message_revision'))
+              OR (NEW.source_kind = 'attachment_extraction'
+                  AND item.source_kind IN ('attachment', 'attachment_extraction'))
+              OR (NEW.source_kind = 'project_fact_checkpoint'
+                  AND item.source_kind IN ('project', 'project_fact_checkpoint'))
+              OR item.source_kind = NEW.source_kind)
+        )
+        OR EXISTS (
+          SELECT 1 FROM context_manifest_items AS item
+          WHERE item.snapshot_id = NEW.snapshot_id
+            AND item.source_id = NEW.source_id
+            AND item.source_revision = NEW.source_revision
+            AND item.availability IN ('readable', 'metadata_only')
+            AND ((NEW.source_kind = 'message_revision'
+                  AND item.source_kind IN ('message', 'trigger', 'message_revision'))
+              OR (NEW.source_kind = 'attachment_extraction'
+                  AND item.source_kind IN ('attachment', 'attachment_extraction'))
+              OR (NEW.source_kind = 'project_fact_checkpoint'
+                  AND item.source_kind IN ('project', 'project_fact_checkpoint'))
+              OR item.source_kind = NEW.source_kind)
+        )
+      ))
+      OR (NEW.currently_required = 1 AND (
+        NEW.source_kind = 'message_tombstone'
+        OR (
+          EXISTS (
+            SELECT 1 FROM context_manifest_items AS item
+            WHERE item.snapshot_id = NEW.snapshot_id
+              AND item.source_id = NEW.source_id
+              AND item.source_revision = NEW.source_revision
+              AND item.availability IN ('unavailable', 'invalidated')
+              AND ((NEW.source_kind = 'message_revision'
+                    AND item.source_kind IN ('message', 'trigger', 'message_revision'))
+                OR (NEW.source_kind = 'attachment_extraction'
+                    AND item.source_kind IN ('attachment', 'attachment_extraction'))
+                OR (NEW.source_kind = 'project_fact_checkpoint'
+                    AND item.source_kind IN ('project', 'project_fact_checkpoint'))
+                OR item.source_kind = NEW.source_kind)
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM context_manifest_items AS item
+            WHERE item.snapshot_id = NEW.snapshot_id
+              AND item.source_id = NEW.source_id
+              AND item.source_revision = NEW.source_revision
+              AND item.availability IN ('readable', 'metadata_only')
+              AND ((NEW.source_kind = 'message_revision'
+                    AND item.source_kind IN ('message', 'trigger', 'message_revision'))
+                OR (NEW.source_kind = 'attachment_extraction'
+                    AND item.source_kind IN ('attachment', 'attachment_extraction'))
+                OR (NEW.source_kind = 'project_fact_checkpoint'
+                    AND item.source_kind IN ('project', 'project_fact_checkpoint'))
+                OR item.source_kind = NEW.source_kind)
+          )
+        )
+      ))
+      OR NOT (
+        EXISTS (
+          SELECT 1 FROM context_manifest_items AS item
+          WHERE item.snapshot_id = NEW.snapshot_id
+            AND item.source_label_sha256 IS NEW.source_label_sha256
+            AND item.source_id = NEW.source_id
+            AND item.source_revision = NEW.source_revision
+            AND ((NEW.source_kind IN ('message_revision', 'message_tombstone')
+                  AND item.source_kind IN (
+                    'message', 'trigger', 'message_revision', 'message_tombstone'
+                  ))
+              OR (NEW.source_kind = 'attachment_extraction'
+                  AND item.source_kind IN ('attachment', 'attachment_extraction'))
+              OR (NEW.source_kind = 'project_fact_checkpoint'
+                  AND item.source_kind IN ('project', 'project_fact_checkpoint'))
+              OR item.source_kind = NEW.source_kind)
+        )
+        OR (NEW.source_label_sha256 IS NULL AND EXISTS (
+          SELECT 1
+          FROM context_snapshots AS snapshot
+          JOIN room_memory_sources AS corpus
+            ON corpus.room_id = snapshot.room_id
+           AND corpus.source_revision = NEW.source_revision
+           AND (corpus.source_id = NEW.source_id OR (
+             NEW.source_kind IN ('message_revision', 'message_tombstone')
+             AND json_extract(corpus.safe_metadata_json, '$.messageId') = NEW.source_id
+           ))
+          WHERE snapshot.snapshot_id = NEW.snapshot_id
+            AND corpus.corpus_seq > snapshot.raw_delta_from_exclusive
+            AND corpus.corpus_seq <= snapshot.raw_delta_to_inclusive
+            AND ((NEW.source_kind IN ('message_revision', 'message_tombstone')
+                  AND corpus.source_kind IN ('message', 'message_revision', 'message_tombstone'))
+              OR corpus.source_kind = NEW.source_kind)
+        ))
+      )
+      OR NOT (
+        (NEW.source_kind = 'message_revision' AND EXISTS (
+          SELECT 1 FROM message_envelopes AS envelope
+          WHERE envelope.message_id = NEW.source_id
+            AND envelope.room_id = NEW.room_id
+            AND envelope.current_revision = NEW.source_revision
+            AND envelope.lifecycle = 'active'
+        ))
+        OR (NEW.source_kind = 'message_tombstone' AND NEW.currently_required = 0
+          AND EXISTS (
+            SELECT 1 FROM message_envelopes AS envelope
+            WHERE envelope.message_id = NEW.source_id
+              AND envelope.room_id = NEW.room_id
+              AND envelope.current_revision = NEW.source_revision
+              AND envelope.lifecycle = 'recalled'
+          ))
+        OR (NEW.source_kind = 'memory' AND EXISTS (
+          SELECT 1 FROM room_memory_versions AS version
+          JOIN room_memory_records AS record
+            ON record.memory_record_id = version.memory_record_id
+           AND record.room_id = version.room_id
+           AND record.current_version_id = version.memory_version_id
+          WHERE version.memory_version_id = NEW.source_id
+            AND version.room_id = NEW.room_id
+            AND version.version_number = NEW.source_revision
+            AND version.state = 'active'
+        ))
+        OR (NEW.source_kind = 'attachment_extraction' AND EXISTS (
+          SELECT 1 FROM attachments AS attachment
+          WHERE substr(NEW.source_id, 1, 22) = 'attachment-extraction:'
+            AND attachment.attachment_id = substr(NEW.source_id, 23)
+            AND attachment.room_id = NEW.room_id
+            AND attachment.processing_generation = NEW.source_revision
+            AND attachment.processing_status = 'ready'
+            AND attachment.source_operational_state = 'bound-active'
+        ))
+        OR (NEW.source_kind = 'project_fact_checkpoint' AND EXISTS (
+          SELECT 1 FROM room_memory_project_checkpoint AS checkpoint
+          WHERE checkpoint.room_id = NEW.room_id AND checkpoint.mode = 'enabled'
+            AND checkpoint.health IN ('ready', 'degraded')
+            AND checkpoint.checkpoint_id = NEW.source_id
+            AND checkpoint.checkpoint_version = NEW.source_revision
+        ))
+        OR (NEW.currently_required = 0 AND (
+          (NEW.source_kind = 'message_revision' AND EXISTS (
+            SELECT 1
+            FROM message_revisions AS revision
+            JOIN messages AS message ON message.id = revision.message_id
+            WHERE revision.message_id = NEW.source_id
+              AND revision.revision = NEW.source_revision
+              AND message.room_id = NEW.room_id
+          ))
+          OR (NEW.source_kind = 'memory' AND EXISTS (
+            SELECT 1 FROM room_memory_versions AS version
+            WHERE version.memory_version_id = NEW.source_id
+              AND version.room_id = NEW.room_id
+              AND version.version_number = NEW.source_revision
+          ))
+          OR (NEW.source_kind = 'attachment_extraction' AND EXISTS (
+            SELECT 1 FROM attachments AS attachment
+            JOIN attachment_extraction_artifacts AS artifact
+              ON artifact.attachment_id = attachment.attachment_id
+             AND artifact.processing_generation = NEW.source_revision
+            WHERE substr(NEW.source_id, 1, 22) = 'attachment-extraction:'
+              AND attachment.attachment_id = substr(NEW.source_id, 23)
+              AND attachment.room_id = NEW.room_id
+          ))
+        ))
+      )
+   BEGIN SELECT RAISE(ABORT, 'Context snapshot source is unavailable or cross-Room'); END`,
+  `CREATE TRIGGER context_snapshot_sources_v19_immutable_update
+   BEFORE UPDATE ON context_snapshot_sources
+   BEGIN SELECT RAISE(ABORT, 'Context snapshot source is immutable'); END`,
+  `CREATE TRIGGER context_snapshot_sources_v19_immutable_delete
+   BEFORE DELETE ON context_snapshot_sources
+   BEGIN SELECT RAISE(ABORT, 'Context snapshot source is immutable'); END`,
+  `CREATE TABLE context_manifest_range_sources (
+    manifest_id TEXT NOT NULL,
+    snapshot_id TEXT NOT NULL,
+    range_ordinal INTEGER NOT NULL CHECK (range_ordinal >= 0 AND range_ordinal < 4096),
+    range_label_sha256 TEXT NOT NULL CHECK (
+      length(range_label_sha256) = 64 AND range_label_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    corpus_seq INTEGER NOT NULL CHECK (corpus_seq >= 1),
+    source_kind TEXT NOT NULL CHECK (source_kind IN (
+      'message_revision', 'message_tombstone', 'attachment_extraction'
+    )),
+    source_id TEXT NOT NULL CHECK (length(trim(source_id)) BETWEEN 1 AND 512),
+    source_revision INTEGER NOT NULL CHECK (source_revision >= 1),
+    source_index_sha256 TEXT NOT NULL CHECK (
+      length(source_index_sha256) = 64 AND source_index_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+    PRIMARY KEY (snapshot_id, range_ordinal, corpus_seq),
+    UNIQUE (snapshot_id, range_ordinal, source_kind, source_id, source_revision),
+    FOREIGN KEY (manifest_id, range_ordinal)
+      REFERENCES context_manifest_items(manifest_id, ordinal),
+    FOREIGN KEY (snapshot_id, source_kind, source_id, source_revision)
+      REFERENCES context_snapshot_sources(snapshot_id, source_kind, source_id, source_revision)
+  ) STRICT`,
+  `CREATE INDEX context_manifest_range_sources_lookup_v19
+   ON context_manifest_range_sources(snapshot_id, range_label_sha256, corpus_seq)`,
+  `CREATE TRIGGER context_manifest_range_sources_v19_validate_insert
+   BEFORE INSERT ON context_manifest_range_sources
+   WHEN NOT EXISTS (
+     SELECT 1
+     FROM context_manifest_items AS item
+     JOIN context_snapshots AS snapshot ON snapshot.snapshot_id = item.snapshot_id
+     JOIN room_memory_sources AS corpus
+       ON corpus.room_id = snapshot.room_id
+      AND corpus.corpus_seq = NEW.corpus_seq
+     WHERE item.manifest_id = NEW.manifest_id AND item.snapshot_id = NEW.snapshot_id
+       AND item.ordinal = NEW.range_ordinal AND item.source_kind IS NULL
+       AND item.section = 'delta' AND item.disposition = 'index_only'
+       AND item.source_label_sha256 = NEW.range_label_sha256
+       AND json_extract(item.segment_json, '$.sourceIndexHash') = NEW.source_index_sha256
+       AND (corpus.source_id = NEW.source_id OR (
+         NEW.source_kind IN ('message_revision', 'message_tombstone')
+         AND json_extract(corpus.safe_metadata_json, '$.messageId') = NEW.source_id
+       ))
+       AND corpus.source_revision = NEW.source_revision
+       AND ((NEW.source_kind IN ('message_revision', 'message_tombstone')
+             AND corpus.source_kind IN ('message', 'message_revision', 'message_tombstone'))
+         OR corpus.source_kind = NEW.source_kind)
+   )
+   BEGIN SELECT RAISE(ABORT, 'Context manifest range source index is forged'); END`,
+  `CREATE TRIGGER context_manifest_range_sources_v19_immutable_update
+   BEFORE UPDATE ON context_manifest_range_sources
+   BEGIN SELECT RAISE(ABORT, 'Context manifest range source index is immutable'); END`,
+  `CREATE TRIGGER context_manifest_range_sources_v19_immutable_delete
+   BEFORE DELETE ON context_manifest_range_sources
+   BEGIN SELECT RAISE(ABORT, 'Context manifest range source index is immutable'); END`,
+  `CREATE TABLE context_snapshot_bodies (
+    snapshot_id TEXT PRIMARY KEY REFERENCES context_snapshots(snapshot_id),
+    envelope_schema_version TEXT NOT NULL CHECK (
+      length(trim(envelope_schema_version)) BETWEEN 1 AND 128
+    ),
+    canonical_envelope_json TEXT NOT NULL CHECK (
+      json_valid(canonical_envelope_json)
+      AND json_type(canonical_envelope_json) = 'object'
+      AND length(CAST(canonical_envelope_json AS BLOB)) BETWEEN 2 AND 262144
+    ),
+    envelope_sha256 TEXT NOT NULL CHECK (
+      length(envelope_sha256) = 64 AND envelope_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    byte_count INTEGER NOT NULL CHECK (byte_count BETWEEN 2 AND 262144),
+    token_count INTEGER NOT NULL CHECK (token_count BETWEEN 1 AND 65536),
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0)
+  ) STRICT`,
+  `CREATE TRIGGER context_snapshot_bodies_v19_validate_insert
+   BEFORE INSERT ON context_snapshot_bodies
+   WHEN NEW.byte_count <> length(CAST(NEW.canonical_envelope_json AS BLOB))
+      OR NOT EXISTS (
+        SELECT 1 FROM context_snapshots AS snapshot
+        WHERE snapshot.snapshot_id = NEW.snapshot_id
+          AND snapshot.envelope_sha256 = NEW.envelope_sha256
+          AND snapshot.created_at = NEW.created_at
+          AND snapshot.state = 'active'
+          AND snapshot.payload_retention_state = 'required'
+      )
+   BEGIN SELECT RAISE(ABORT, 'Restricted context body does not match snapshot'); END`,
+  `CREATE TRIGGER context_snapshot_bodies_v19_immutable_update
+   BEFORE UPDATE ON context_snapshot_bodies
+   BEGIN SELECT RAISE(ABORT, 'Restricted context body is immutable'); END`,
+  `CREATE TRIGGER context_snapshot_bodies_v19_validate_delete
+   BEFORE DELETE ON context_snapshot_bodies
+   WHEN NOT EXISTS (
+     SELECT 1 FROM context_snapshots AS snapshot
+     WHERE snapshot.snapshot_id = OLD.snapshot_id
+       AND snapshot.payload_retention_state = 'purge_pending'
+   )
+   BEGIN SELECT RAISE(ABORT, 'Restricted context body is still required'); END`,
+  `CREATE TRIGGER context_snapshot_bodies_v19_mark_purged
+   AFTER DELETE ON context_snapshot_bodies
+   BEGIN
+     UPDATE context_snapshots SET payload_retention_state = 'purged'
+     WHERE snapshot_id = OLD.snapshot_id AND payload_retention_state = 'purge_pending';
+   END`,
+  `CREATE TABLE agent_execution_context_bindings (
+    execution_id TEXT PRIMARY KEY REFERENCES agent_executions(id),
+    snapshot_id TEXT NOT NULL UNIQUE REFERENCES context_snapshots(snapshot_id),
+    invocation_intent_id TEXT NOT NULL REFERENCES agent_invocation_intents(id),
+    execution_generation INTEGER NOT NULL CHECK (execution_generation >= 1),
+    bound_at TEXT NOT NULL CHECK (length(bound_at) > 0),
+    UNIQUE (execution_id, snapshot_id)
+  ) STRICT`,
+  `CREATE INDEX agent_execution_context_bindings_intent_v19
+   ON agent_execution_context_bindings(invocation_intent_id, execution_id)`,
+  `CREATE TRIGGER agent_execution_context_bindings_v19_validate_insert
+   BEFORE INSERT ON agent_execution_context_bindings
+   WHEN NOT EXISTS (
+     SELECT 1
+     FROM agent_executions AS execution
+     JOIN agent_execution_intent_links AS link
+       ON link.execution_id = execution.id
+     JOIN agent_invocation_intents AS intent ON intent.id = link.intent_id
+     JOIN context_snapshots AS snapshot ON snapshot.snapshot_id = NEW.snapshot_id
+     JOIN agent_execution_attempts AS attempt
+       ON attempt.execution_id = execution.id AND attempt.attempt_seq = 1
+     WHERE execution.id = NEW.execution_id
+       AND execution.execution_generation = NEW.execution_generation
+       AND execution.room_id = snapshot.room_id
+       AND execution.agent_id = snapshot.agent_id
+       AND execution.trigger_message_id = snapshot.trigger_message_id
+       AND execution.provider_id = snapshot.provider_id
+       AND execution.model_id = snapshot.model_id
+       AND link.intent_id = NEW.invocation_intent_id
+       AND intent.id = snapshot.invocation_intent_id
+       AND snapshot.state = 'active'
+       AND snapshot.snapshot_generation = 1
+       AND execution.status IN ('queued', 'running')
+       AND attempt.status IN ('queued', 'running')
+   )
+   BEGIN SELECT RAISE(ABORT, 'Execution context binding is stale or divergent'); END`,
+  `CREATE TRIGGER agent_execution_context_bindings_v19_immutable_update
+   BEFORE UPDATE ON agent_execution_context_bindings
+   BEGIN SELECT RAISE(ABORT, 'Execution context binding is immutable'); END`,
+  `CREATE TRIGGER agent_execution_context_bindings_v19_immutable_delete
+   BEFORE DELETE ON agent_execution_context_bindings
+   BEGIN SELECT RAISE(ABORT, 'Execution context binding is immutable'); END`,
+  `CREATE TABLE agent_execution_context_attempts (
+    execution_id TEXT NOT NULL,
+    attempt_seq INTEGER NOT NULL CHECK (attempt_seq >= 1),
+    snapshot_id TEXT NOT NULL,
+    snapshot_generation INTEGER NOT NULL CHECK (snapshot_generation >= 1),
+    reuse_kind TEXT NOT NULL CHECK (
+      reuse_kind IN ('first', 'automatic_retry', 'crash_recovery')
+    ),
+    bound_at TEXT NOT NULL CHECK (length(bound_at) > 0),
+    PRIMARY KEY (execution_id, attempt_seq),
+    FOREIGN KEY (execution_id, attempt_seq)
+      REFERENCES agent_execution_attempts(execution_id, attempt_seq),
+    FOREIGN KEY (execution_id, snapshot_id)
+      REFERENCES agent_execution_context_bindings(execution_id, snapshot_id)
+  ) STRICT`,
+  `CREATE INDEX agent_execution_context_attempts_snapshot_v19
+   ON agent_execution_context_attempts(snapshot_id, attempt_seq, execution_id)`,
+  `CREATE TRIGGER agent_execution_context_attempts_v19_validate_insert
+   BEFORE INSERT ON agent_execution_context_attempts
+   WHEN NOT EXISTS (
+     SELECT 1
+     FROM agent_execution_context_bindings AS binding
+     JOIN context_snapshots AS snapshot ON snapshot.snapshot_id = binding.snapshot_id
+     JOIN agent_execution_attempts AS attempt
+       ON attempt.execution_id = binding.execution_id
+      AND attempt.attempt_seq = NEW.attempt_seq
+     WHERE binding.execution_id = NEW.execution_id
+       AND binding.snapshot_id = NEW.snapshot_id
+       AND snapshot.snapshot_generation = NEW.snapshot_generation
+       AND snapshot.state = 'active'
+       AND ((NEW.attempt_seq = 1 AND NEW.reuse_kind = 'first')
+         OR (NEW.attempt_seq > 1 AND NEW.reuse_kind IN (
+           'automatic_retry', 'crash_recovery'
+         )))
+   )
+   BEGIN SELECT RAISE(ABORT, 'Attempt context binding is stale or divergent'); END`,
+  `CREATE TRIGGER agent_execution_context_attempts_v19_immutable_update
+   BEFORE UPDATE ON agent_execution_context_attempts
+   BEGIN SELECT RAISE(ABORT, 'Attempt context binding is immutable'); END`,
+  `CREATE TRIGGER agent_execution_context_attempts_v19_immutable_delete
+   BEFORE DELETE ON agent_execution_context_attempts
+   BEGIN SELECT RAISE(ABORT, 'Attempt context binding is immutable'); END`,
+  `CREATE TABLE context_snapshot_lineage (
+    child_snapshot_id TEXT NOT NULL REFERENCES context_snapshots(snapshot_id),
+    parent_snapshot_id TEXT NOT NULL REFERENCES context_snapshots(snapshot_id),
+    child_execution_id TEXT NOT NULL REFERENCES agent_executions(id),
+    parent_execution_id TEXT NOT NULL REFERENCES agent_executions(id),
+    relation TEXT NOT NULL CHECK (relation IN ('manual_retry', 'supersede')),
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+    CHECK (child_snapshot_id <> parent_snapshot_id),
+    CHECK (child_execution_id <> parent_execution_id),
+    PRIMARY KEY (child_snapshot_id, parent_snapshot_id),
+    UNIQUE (child_execution_id, parent_execution_id)
+  ) STRICT`,
+  `CREATE INDEX context_snapshot_lineage_parent_v19
+   ON context_snapshot_lineage(parent_snapshot_id, child_snapshot_id)`,
+  `CREATE UNIQUE INDEX context_snapshot_lineage_manual_parent_v19
+   ON context_snapshot_lineage(child_snapshot_id)
+   WHERE relation = 'manual_retry'`,
+  `CREATE TRIGGER context_snapshot_lineage_v19_validate_insert
+   BEFORE INSERT ON context_snapshot_lineage
+   WHEN NOT EXISTS (
+     SELECT 1
+     FROM agent_execution_context_bindings AS child_binding
+     JOIN agent_execution_context_bindings AS parent_binding
+       ON parent_binding.execution_id = NEW.parent_execution_id
+     JOIN context_snapshots AS child_snapshot
+       ON child_snapshot.snapshot_id = child_binding.snapshot_id
+     JOIN context_snapshots AS parent_snapshot
+       ON parent_snapshot.snapshot_id = parent_binding.snapshot_id
+     JOIN agent_executions AS child_execution
+       ON child_execution.id = child_binding.execution_id
+     LEFT JOIN agent_execution_intent_links AS child_link
+       ON child_link.execution_id = child_execution.id
+     WHERE child_binding.execution_id = NEW.child_execution_id
+       AND child_binding.snapshot_id = NEW.child_snapshot_id
+       AND parent_binding.snapshot_id = NEW.parent_snapshot_id
+       AND child_snapshot.room_id = parent_snapshot.room_id
+       AND child_snapshot.agent_id = parent_snapshot.agent_id
+       AND ((NEW.relation = 'manual_retry'
+             AND child_link.retry_of_execution_id = NEW.parent_execution_id
+             AND child_execution.manual_retry_of_execution_id = NEW.parent_execution_id)
+         OR (NEW.relation = 'supersede'
+             AND EXISTS (
+               SELECT 1 FROM json_each(child_execution.supersedes_execution_ids_json)
+               WHERE value = NEW.parent_execution_id
+             )))
+   )
+   BEGIN SELECT RAISE(ABORT, 'Context snapshot lineage is inconsistent with execution lineage'); END`,
+  `CREATE TRIGGER context_snapshot_lineage_v19_immutable_update
+   BEFORE UPDATE ON context_snapshot_lineage
+   BEGIN SELECT RAISE(ABORT, 'Context snapshot lineage is immutable'); END`,
+  `CREATE TRIGGER context_snapshot_lineage_v19_immutable_delete
+   BEFORE DELETE ON context_snapshot_lineage
+   BEGIN SELECT RAISE(ABORT, 'Context snapshot lineage is immutable'); END`,
+  `CREATE TABLE context_source_read_grants (
+    grant_id TEXT PRIMARY KEY CHECK (length(trim(grant_id)) BETWEEN 1 AND 256),
+    execution_id TEXT NOT NULL,
+    attempt_seq INTEGER NOT NULL CHECK (attempt_seq >= 1),
+    snapshot_id TEXT NOT NULL REFERENCES context_snapshots(snapshot_id),
+    snapshot_generation INTEGER NOT NULL CHECK (snapshot_generation >= 1),
+    tool_id TEXT NOT NULL CHECK (tool_id = 'room-memory.read'),
+    parameter_sha256 TEXT NOT NULL CHECK (
+      length(parameter_sha256) = 64 AND parameter_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    issued_at TEXT NOT NULL CHECK (length(issued_at) > 0),
+    expires_at TEXT NOT NULL CHECK (length(expires_at) > 0 AND expires_at > issued_at),
+    FOREIGN KEY (execution_id, attempt_seq)
+      REFERENCES agent_execution_context_attempts(execution_id, attempt_seq)
+  ) STRICT`,
+  `CREATE TRIGGER context_source_read_grants_v19_immutable_update
+   BEFORE UPDATE ON context_source_read_grants
+   BEGIN SELECT RAISE(ABORT, 'Context source read grant is immutable'); END`,
+  `CREATE TRIGGER context_source_read_grants_v19_immutable_delete
+   BEFORE DELETE ON context_source_read_grants
+   BEGIN SELECT RAISE(ABORT, 'Context source read grant is immutable'); END`,
+  `CREATE TABLE context_source_read_dispatches (
+    dispatch_id TEXT PRIMARY KEY CHECK (length(trim(dispatch_id)) BETWEEN 1 AND 256),
+    grant_id TEXT NOT NULL UNIQUE REFERENCES context_source_read_grants(grant_id),
+    execution_id TEXT NOT NULL,
+    attempt_seq INTEGER NOT NULL CHECK (attempt_seq >= 1),
+    call_id TEXT NOT NULL CHECK (length(trim(call_id)) BETWEEN 1 AND 256),
+    tool_id TEXT NOT NULL CHECK (tool_id = 'room-memory.read'),
+    request_sha256 TEXT NOT NULL CHECK (
+      length(request_sha256) = 64 AND request_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    dispatched_at TEXT NOT NULL CHECK (length(dispatched_at) > 0),
+    UNIQUE (execution_id, attempt_seq, call_id),
+    FOREIGN KEY (execution_id, attempt_seq)
+      REFERENCES agent_execution_context_attempts(execution_id, attempt_seq)
+  ) STRICT`,
+  `CREATE TRIGGER context_source_read_dispatches_v19_validate_insert
+   BEFORE INSERT ON context_source_read_dispatches
+   WHEN NOT EXISTS (
+     SELECT 1 FROM context_source_read_grants AS grant
+     WHERE grant.grant_id = NEW.grant_id
+       AND grant.execution_id = NEW.execution_id
+       AND grant.attempt_seq = NEW.attempt_seq
+       AND grant.tool_id = NEW.tool_id
+       AND grant.parameter_sha256 = NEW.request_sha256
+       AND grant.issued_at <= NEW.dispatched_at
+       AND grant.expires_at > NEW.dispatched_at
+   )
+   BEGIN SELECT RAISE(ABORT, 'Context source read dispatch is outside its grant'); END`,
+  `CREATE TRIGGER context_source_read_dispatches_v19_immutable_update
+   BEFORE UPDATE ON context_source_read_dispatches
+   BEGIN SELECT RAISE(ABORT, 'Context source read dispatch is immutable'); END`,
+  `CREATE TRIGGER context_source_read_dispatches_v19_immutable_delete
+   BEFORE DELETE ON context_source_read_dispatches
+   BEGIN SELECT RAISE(ABORT, 'Context source read dispatch is immutable'); END`,
+  `CREATE TABLE context_source_reads (
+    read_id TEXT PRIMARY KEY CHECK (length(trim(read_id)) BETWEEN 1 AND 256),
+    snapshot_id TEXT NOT NULL REFERENCES context_snapshots(snapshot_id),
+    execution_id TEXT NOT NULL,
+    attempt_seq INTEGER NOT NULL CHECK (attempt_seq >= 1),
+    snapshot_generation INTEGER NOT NULL CHECK (snapshot_generation >= 1),
+    call_id TEXT NOT NULL CHECK (length(trim(call_id)) BETWEEN 1 AND 256),
+    grant_id TEXT NOT NULL REFERENCES context_source_read_grants(grant_id),
+    dispatch_id TEXT NOT NULL UNIQUE REFERENCES context_source_read_dispatches(dispatch_id),
+    tool_id TEXT NOT NULL CHECK (tool_id = 'room-memory.read'),
+    request_sha256 TEXT NOT NULL CHECK (
+      length(request_sha256) = 64 AND request_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    source_label_sha256 TEXT NOT NULL CHECK (
+      length(source_label_sha256) = 64 AND source_label_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    mode TEXT NOT NULL CHECK (mode IN (
+      'source', 'neighbors', 'attachment_segment', 'memory_sources', 'project_object'
+    )),
+    source_kind TEXT NOT NULL CHECK (source_kind IN (
+      'message_revision', 'message_tombstone', 'memory',
+      'attachment_extraction', 'project_fact_checkpoint', 'delta_range'
+    )),
+    source_id TEXT NOT NULL CHECK (length(trim(source_id)) BETWEEN 1 AND 512),
+    source_revision INTEGER NOT NULL CHECK (source_revision >= 1),
+    authorization_epoch INTEGER NOT NULL CHECK (authorization_epoch >= 0),
+    page_size INTEGER NOT NULL CHECK (page_size BETWEEN 1 AND 8),
+    page_offset INTEGER NOT NULL CHECK (page_offset BETWEEN 0 AND 262144),
+    cursor_sha256 TEXT CHECK (
+      cursor_sha256 IS NULL OR (
+        length(cursor_sha256) = 64 AND cursor_sha256 NOT GLOB '*[^0-9a-f]*'
+      )
+    ),
+    artifact_sha256 TEXT CHECK (
+      artifact_sha256 IS NULL OR (
+        length(artifact_sha256) = 64 AND artifact_sha256 NOT GLOB '*[^0-9a-f]*'
+      )
+    ),
+    artifact_range_start INTEGER CHECK (
+      artifact_range_start IS NULL OR artifact_range_start >= 0
+    ),
+    artifact_range_end INTEGER CHECK (
+      artifact_range_end IS NULL OR artifact_range_end > artifact_range_start
+    ),
+    status TEXT NOT NULL CHECK (status IN (
+      'claimed', 'page_ready', 'completed', 'failed', 'invalidated'
+    )),
+    result_sha256 TEXT CHECK (
+      result_sha256 IS NULL OR (
+        length(result_sha256) = 64 AND result_sha256 NOT GLOB '*[^0-9a-f]*'
+      )
+    ),
+    result_bytes INTEGER CHECK (result_bytes IS NULL OR result_bytes BETWEEN 2 AND 32768),
+    result_tokens INTEGER CHECK (result_tokens IS NULL OR result_tokens BETWEEN 1 AND 32768),
+    accounted_bytes INTEGER CHECK (
+      accounted_bytes IS NULL OR accounted_bytes BETWEEN 1 AND 262144
+    ),
+    error_code TEXT CHECK (error_code IS NULL OR length(trim(error_code)) BETWEEN 1 AND 128),
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+    completed_at TEXT,
+    UNIQUE (execution_id, attempt_seq, call_id),
+    FOREIGN KEY (execution_id, attempt_seq)
+      REFERENCES agent_execution_context_attempts(execution_id, attempt_seq),
+    FOREIGN KEY (execution_id, attempt_seq, call_id)
+      REFERENCES context_source_read_dispatches(execution_id, attempt_seq, call_id),
+    CHECK (
+      (artifact_sha256 IS NULL AND artifact_range_start IS NULL AND artifact_range_end IS NULL)
+      OR (mode = 'attachment_segment' AND source_kind = 'attachment_extraction'
+          AND artifact_sha256 IS NOT NULL AND artifact_range_start IS NOT NULL
+          AND artifact_range_end IS NOT NULL)
+    ),
+    CHECK (
+      (status = 'claimed' AND result_sha256 IS NULL AND result_bytes IS NULL
+        AND result_tokens IS NULL AND accounted_bytes IS NULL
+        AND error_code IS NULL AND completed_at IS NULL)
+      OR (status = 'page_ready' AND result_sha256 IS NOT NULL AND result_bytes IS NOT NULL
+        AND result_tokens IS NOT NULL AND accounted_bytes IS NOT NULL
+        AND error_code IS NULL AND completed_at IS NOT NULL)
+      OR (status = 'completed' AND result_sha256 IS NOT NULL AND result_bytes IS NOT NULL
+        AND result_tokens IS NOT NULL AND accounted_bytes IS NOT NULL
+        AND error_code IS NULL AND completed_at IS NOT NULL)
+      OR (status IN ('failed', 'invalidated') AND result_sha256 IS NULL
+        AND result_bytes IS NULL AND result_tokens IS NULL AND accounted_bytes IS NULL
+        AND error_code IS NOT NULL AND completed_at IS NOT NULL)
+    )
+  ) STRICT`,
+  `CREATE INDEX context_source_reads_snapshot_v19
+   ON context_source_reads(snapshot_id, status, created_at, read_id)`,
+  `CREATE TRIGGER context_source_reads_v19_validate_insert
+   BEFORE INSERT ON context_source_reads
+   WHEN NEW.status <> 'claimed'
+      OR NOT EXISTS (
+        SELECT 1
+        FROM agent_execution_context_attempts AS attempt_binding
+        JOIN context_snapshots AS snapshot
+          ON snapshot.snapshot_id = attempt_binding.snapshot_id
+        JOIN agent_execution_attempts AS attempt
+          ON attempt.execution_id = attempt_binding.execution_id
+         AND attempt.attempt_seq = attempt_binding.attempt_seq
+        JOIN context_snapshot_sources AS source
+          ON source.snapshot_id = attempt_binding.snapshot_id
+        WHERE attempt_binding.execution_id = NEW.execution_id
+          AND attempt_binding.attempt_seq = NEW.attempt_seq
+          AND attempt_binding.snapshot_id = NEW.snapshot_id
+          AND attempt_binding.snapshot_generation = NEW.snapshot_generation
+          AND snapshot.state = 'active'
+          AND attempt.status = 'running'
+          AND ((source.source_label_sha256 = NEW.source_label_sha256
+                AND source.source_kind = NEW.source_kind
+                AND source.source_id = NEW.source_id
+                AND source.source_revision = NEW.source_revision
+                AND source.authorization_revision = NEW.authorization_epoch)
+            OR (NEW.source_kind = 'delta_range'
+                AND NEW.authorization_epoch = snapshot.membership_access_revision
+                AND EXISTS (
+                  SELECT 1 FROM context_manifest_range_sources AS range_source
+                  WHERE range_source.snapshot_id = NEW.snapshot_id
+                    AND range_source.range_label_sha256 = NEW.source_label_sha256
+                    AND range_source.source_index_sha256 = NEW.source_id
+                    AND range_source.range_ordinal + 1 = NEW.source_revision
+                )))
+      )
+      OR (SELECT COUNT(*) FROM context_source_reads
+          WHERE execution_id = NEW.execution_id) >= 32
+      OR NOT EXISTS (
+        SELECT 1
+        FROM context_source_read_grants AS grant
+        JOIN context_source_read_dispatches AS dispatch
+          ON dispatch.grant_id = grant.grant_id
+        WHERE grant.grant_id = NEW.grant_id
+          AND dispatch.dispatch_id = NEW.dispatch_id
+          AND grant.execution_id = NEW.execution_id
+          AND dispatch.execution_id = NEW.execution_id
+          AND grant.attempt_seq = NEW.attempt_seq
+          AND dispatch.attempt_seq = NEW.attempt_seq
+          AND dispatch.call_id = NEW.call_id
+          AND grant.tool_id = NEW.tool_id
+          AND dispatch.tool_id = NEW.tool_id
+          AND grant.parameter_sha256 = dispatch.request_sha256
+          AND grant.expires_at > NEW.created_at
+      )
+   BEGIN SELECT RAISE(ABORT, 'Context source read authority or capacity is invalid'); END`,
+  `CREATE TRIGGER context_source_reads_v19_validate_update
+   BEFORE UPDATE ON context_source_reads
+   WHEN NEW.read_id <> OLD.read_id OR NEW.snapshot_id <> OLD.snapshot_id
+      OR NEW.execution_id <> OLD.execution_id OR NEW.attempt_seq <> OLD.attempt_seq
+      OR NEW.snapshot_generation <> OLD.snapshot_generation
+      OR NEW.call_id <> OLD.call_id OR NEW.grant_id <> OLD.grant_id
+      OR NEW.dispatch_id <> OLD.dispatch_id OR NEW.tool_id <> OLD.tool_id
+      OR NEW.request_sha256 <> OLD.request_sha256
+      OR NEW.source_label_sha256 <> OLD.source_label_sha256 OR NEW.mode <> OLD.mode
+      OR NEW.source_kind <> OLD.source_kind OR NEW.source_id <> OLD.source_id
+      OR NEW.source_revision <> OLD.source_revision
+      OR NEW.authorization_epoch <> OLD.authorization_epoch
+      OR NEW.page_size <> OLD.page_size OR NEW.page_offset <> OLD.page_offset
+      OR NEW.cursor_sha256 IS NOT OLD.cursor_sha256 OR NEW.created_at <> OLD.created_at
+      OR NOT ((OLD.status = 'claimed' AND NEW.status IN (
+                'page_ready', 'failed', 'invalidated'
+              ))
+        OR (OLD.status = 'page_ready' AND NEW.status = 'completed'
+            AND NEW.result_sha256 = OLD.result_sha256
+            AND NEW.result_bytes = OLD.result_bytes
+            AND NEW.result_tokens = OLD.result_tokens
+            AND NEW.accounted_bytes = OLD.accounted_bytes
+            AND NEW.completed_at = OLD.completed_at
+            AND NEW.artifact_sha256 IS OLD.artifact_sha256
+            AND NEW.artifact_range_start IS OLD.artifact_range_start
+            AND NEW.artifact_range_end IS OLD.artifact_range_end)
+        OR (OLD.status = 'page_ready' AND NEW.status IN ('failed', 'invalidated')
+            AND NEW.result_sha256 IS NULL AND NEW.result_bytes IS NULL
+            AND NEW.result_tokens IS NULL AND NEW.accounted_bytes IS NULL))
+      OR (OLD.status <> 'claimed' AND (
+            NEW.artifact_sha256 IS NOT OLD.artifact_sha256
+            OR NEW.artifact_range_start IS NOT OLD.artifact_range_start
+            OR NEW.artifact_range_end IS NOT OLD.artifact_range_end
+          ))
+      OR NOT EXISTS (
+        SELECT 1 FROM context_snapshots AS snapshot
+        WHERE snapshot.snapshot_id = OLD.snapshot_id
+          AND snapshot.snapshot_generation = OLD.snapshot_generation
+          AND (NEW.status = 'invalidated' OR snapshot.state = 'active')
+      )
+   BEGIN SELECT RAISE(ABORT, 'Context source read terminal CAS is invalid'); END`,
+  `CREATE TRIGGER context_source_reads_v19_immutable_delete
+   BEFORE DELETE ON context_source_reads
+   BEGIN SELECT RAISE(ABORT, 'Context source read metadata is immutable'); END`,
+  `CREATE TABLE context_source_read_payloads (
+    read_id TEXT PRIMARY KEY REFERENCES context_source_reads(read_id),
+    canonical_result_json TEXT NOT NULL CHECK (
+      json_valid(canonical_result_json) AND json_type(canonical_result_json) = 'object'
+      AND length(CAST(canonical_result_json AS BLOB)) BETWEEN 2 AND 32768
+    ),
+    result_sha256 TEXT NOT NULL CHECK (
+      length(result_sha256) = 64 AND result_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    byte_count INTEGER NOT NULL CHECK (byte_count BETWEEN 2 AND 32768),
+    token_count INTEGER NOT NULL CHECK (token_count BETWEEN 1 AND 32768),
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0)
+  ) STRICT`,
+  `CREATE TRIGGER context_source_read_payloads_v19_validate_insert
+   BEFORE INSERT ON context_source_read_payloads
+   WHEN NEW.byte_count <> length(CAST(NEW.canonical_result_json AS BLOB))
+      OR NOT EXISTS (
+        SELECT 1 FROM context_source_reads AS source_read
+        WHERE source_read.read_id = NEW.read_id
+          AND source_read.status IN ('page_ready', 'completed')
+          AND source_read.result_sha256 = NEW.result_sha256
+          AND source_read.result_bytes = NEW.byte_count
+          AND source_read.result_tokens = NEW.token_count
+          AND source_read.completed_at = NEW.created_at
+      )
+   BEGIN SELECT RAISE(ABORT, 'Restricted source read payload does not match receipt'); END`,
+  `CREATE TRIGGER context_source_read_payloads_v19_immutable_update
+   BEFORE UPDATE ON context_source_read_payloads
+   BEGIN SELECT RAISE(ABORT, 'Restricted source read payload is immutable'); END`,
+  `CREATE TRIGGER context_source_read_payloads_v19_validate_delete
+   BEFORE DELETE ON context_source_read_payloads
+   WHEN EXISTS (
+     SELECT 1
+     FROM context_source_reads AS source_read
+     JOIN context_snapshots AS snapshot ON snapshot.snapshot_id = source_read.snapshot_id
+     WHERE source_read.read_id = OLD.read_id
+       AND snapshot.payload_retention_state = 'required'
+       AND source_read.status NOT IN ('failed', 'invalidated')
+   )
+   BEGIN SELECT RAISE(ABORT, 'Restricted source read payload is still required'); END`,
+  `CREATE TABLE context_source_read_receipts (
+    receipt_id TEXT PRIMARY KEY CHECK (length(trim(receipt_id)) BETWEEN 1 AND 256),
+    read_id TEXT NOT NULL UNIQUE REFERENCES context_source_reads(read_id),
+    snapshot_id TEXT NOT NULL REFERENCES context_snapshots(snapshot_id),
+    execution_id TEXT NOT NULL REFERENCES agent_executions(id),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    attempt_seq INTEGER NOT NULL CHECK (attempt_seq >= 1),
+    call_id TEXT NOT NULL CHECK (length(trim(call_id)) BETWEEN 1 AND 256),
+    dispatch_id TEXT NOT NULL UNIQUE REFERENCES context_source_read_dispatches(dispatch_id),
+    source_label_sha256 TEXT NOT NULL CHECK (
+      length(source_label_sha256) = 64 AND source_label_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    source_kind TEXT NOT NULL CHECK (source_kind IN (
+      'message_revision', 'message_tombstone', 'memory',
+      'attachment_extraction', 'project_fact_checkpoint', 'delta_range'
+    )),
+    source_id TEXT NOT NULL CHECK (length(trim(source_id)) BETWEEN 1 AND 512),
+    source_revision INTEGER NOT NULL CHECK (source_revision >= 1),
+    snapshot_generation INTEGER NOT NULL CHECK (snapshot_generation >= 1),
+    citation_label_sha256 TEXT NOT NULL CHECK (
+      length(citation_label_sha256) = 64 AND citation_label_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    result_sha256 TEXT NOT NULL CHECK (
+      length(result_sha256) = 64 AND result_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    representation TEXT NOT NULL CHECK (representation IN (
+      'source', 'neighbors', 'attachment_segment', 'memory_sources'
+    )),
+    range_text TEXT NOT NULL CHECK (length(trim(range_text)) BETWEEN 1 AND 1024),
+    content_sha256 TEXT NOT NULL CHECK (
+      length(content_sha256) = 64 AND content_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    content_bytes INTEGER NOT NULL CHECK (content_bytes BETWEEN 2 AND 32768),
+    authorization_epoch INTEGER NOT NULL CHECK (authorization_epoch >= 0),
+    issued_at TEXT NOT NULL CHECK (length(issued_at) > 0),
+    UNIQUE (snapshot_id, citation_label_sha256)
+  ) STRICT`,
+  `CREATE INDEX context_source_read_receipts_source_v19
+   ON context_source_read_receipts(source_kind, source_id, source_revision, snapshot_id)`,
+  `CREATE TRIGGER context_source_read_receipts_v19_validate_insert
+   BEFORE INSERT ON context_source_read_receipts
+   WHEN NOT EXISTS (
+     SELECT 1
+     FROM context_source_reads AS source_read
+     JOIN context_source_read_payloads AS payload ON payload.read_id = source_read.read_id
+     JOIN context_snapshots AS snapshot ON snapshot.snapshot_id = source_read.snapshot_id
+     WHERE source_read.read_id = NEW.read_id
+       AND source_read.status = 'completed'
+       AND source_read.snapshot_id = NEW.snapshot_id
+       AND source_read.execution_id = NEW.execution_id
+       AND snapshot.room_id = NEW.room_id
+       AND source_read.attempt_seq = NEW.attempt_seq
+       AND source_read.call_id = NEW.call_id
+       AND source_read.dispatch_id = NEW.dispatch_id
+       AND source_read.source_label_sha256 = NEW.source_label_sha256
+       AND source_read.source_kind = NEW.source_kind
+       AND source_read.source_id = NEW.source_id
+       AND source_read.source_revision = NEW.source_revision
+       AND source_read.snapshot_generation = NEW.snapshot_generation
+       AND source_read.result_sha256 = NEW.result_sha256
+       AND source_read.mode = NEW.representation
+       AND source_read.authorization_epoch = NEW.authorization_epoch
+       AND source_read.completed_at = NEW.issued_at
+       AND payload.result_sha256 = NEW.result_sha256
+       AND snapshot.state = 'active'
+   )
+   BEGIN SELECT RAISE(ABORT, 'Context source read receipt is forged or stale'); END`,
+  `CREATE TRIGGER context_source_read_receipts_v19_immutable_update
+   BEFORE UPDATE ON context_source_read_receipts
+   BEGIN SELECT RAISE(ABORT, 'Context source read receipt is immutable'); END`,
+  `CREATE TRIGGER context_source_read_receipts_v19_immutable_delete
+   BEFORE DELETE ON context_source_read_receipts
+   BEGIN SELECT RAISE(ABORT, 'Context source read receipt is immutable'); END`,
+  `CREATE TABLE agent_message_citations (
+    message_id TEXT NOT NULL REFERENCES agent_message_sources(message_id),
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0 AND ordinal < 4096),
+    execution_id TEXT NOT NULL REFERENCES agent_executions(id),
+    snapshot_id TEXT NOT NULL REFERENCES context_snapshots(snapshot_id),
+    receipt_id TEXT REFERENCES context_source_read_receipts(receipt_id),
+    manifest_item_ordinal INTEGER,
+    citation_label_sha256 TEXT NOT NULL CHECK (
+      length(citation_label_sha256) = 64 AND citation_label_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    source_kind TEXT NOT NULL CHECK (source_kind IN (
+      'policy', 'trigger', 'message', 'message_revision', 'message_tombstone',
+      'memory', 'attachment', 'attachment_extraction', 'project',
+      'project_fact_checkpoint', 'tool', 'retrieval', 'delta_range'
+    )),
+    source_id TEXT NOT NULL CHECK (length(trim(source_id)) BETWEEN 1 AND 512),
+    source_revision INTEGER NOT NULL CHECK (source_revision >= 0),
+    snapshot_generation INTEGER NOT NULL CHECK (snapshot_generation >= 1),
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+    PRIMARY KEY (message_id, ordinal),
+    UNIQUE (message_id, citation_label_sha256),
+    CHECK ((receipt_id IS NULL) <> (manifest_item_ordinal IS NULL))
+  ) STRICT`,
+  `CREATE INDEX agent_message_citations_snapshot_v19
+   ON agent_message_citations(snapshot_id, source_kind, source_id, source_revision)`,
+  `CREATE TRIGGER agent_message_citations_v19_validate_insert
+   BEFORE INSERT ON agent_message_citations
+   WHEN NEW.ordinal <> (
+       SELECT COUNT(*) FROM agent_message_citations WHERE message_id = NEW.message_id
+     )
+      OR NOT EXISTS (
+        SELECT 1
+        FROM agent_message_sources AS message_source
+        JOIN agent_execution_context_bindings AS binding
+          ON binding.execution_id = message_source.execution_id
+        JOIN context_snapshots AS snapshot ON snapshot.snapshot_id = binding.snapshot_id
+        WHERE message_source.message_id = NEW.message_id
+          AND message_source.execution_id = NEW.execution_id
+          AND binding.snapshot_id = NEW.snapshot_id
+          AND snapshot.snapshot_generation = NEW.snapshot_generation
+          AND snapshot.state = 'active'
+      )
+      OR NOT (
+        (NEW.receipt_id IS NULL AND EXISTS (
+          SELECT 1 FROM context_manifest_items AS item
+          WHERE item.snapshot_id = NEW.snapshot_id
+            AND item.ordinal = NEW.manifest_item_ordinal
+            AND item.source_label_sha256 = NEW.citation_label_sha256
+            AND item.source_kind = NEW.source_kind
+            AND item.source_id = NEW.source_id
+            AND item.source_revision = NEW.source_revision
+            AND item.disposition NOT IN ('omitted', 'unavailable', 'invalidated')
+        ))
+        OR (NEW.manifest_item_ordinal IS NULL AND EXISTS (
+          SELECT 1 FROM context_source_read_receipts AS receipt
+          WHERE receipt.receipt_id = NEW.receipt_id
+            AND receipt.snapshot_id = NEW.snapshot_id
+            AND receipt.execution_id = NEW.execution_id
+            AND receipt.citation_label_sha256 = NEW.citation_label_sha256
+            AND receipt.source_kind = NEW.source_kind
+            AND receipt.source_id = NEW.source_id
+            AND receipt.source_revision = NEW.source_revision
+            AND receipt.snapshot_generation = NEW.snapshot_generation
+        ))
+      )
+   BEGIN SELECT RAISE(ABORT, 'Agent message citation is forged or stale'); END`,
+  `CREATE TRIGGER agent_message_citations_v19_immutable_update
+   BEFORE UPDATE ON agent_message_citations
+   BEGIN SELECT RAISE(ABORT, 'Agent message citation is immutable'); END`,
+  `CREATE TRIGGER agent_message_citations_v19_immutable_delete
+   BEFORE DELETE ON agent_message_citations
+   BEGIN SELECT RAISE(ABORT, 'Agent message citation is immutable'); END`,
+  `CREATE TRIGGER message_envelopes_v19_invalidate_context_recall
+   AFTER UPDATE OF lifecycle ON message_envelopes
+   WHEN NEW.lifecycle = 'recalled' AND OLD.lifecycle = 'active'
+   BEGIN
+     UPDATE context_snapshots
+     SET state = 'invalidated', snapshot_generation = snapshot_generation + 1,
+         invalidated_at = NEW.recalled_at, invalidation_reason = 'message_recalled'
+     WHERE state = 'active' AND (
+       (trigger_message_id = NEW.message_id AND trigger_revision = NEW.current_revision)
+       OR snapshot_id IN (
+         SELECT source.snapshot_id FROM context_snapshot_sources AS source
+         WHERE source.room_id = NEW.room_id
+           AND source.currently_required = 1
+           AND source.source_kind IN ('message_revision', 'message_tombstone')
+           AND source.source_id = NEW.message_id
+       )
+     );
+   END`,
+  `CREATE TRIGGER message_envelopes_v19_invalidate_context_revision
+   AFTER UPDATE OF current_revision ON message_envelopes
+   WHEN NEW.current_revision <> OLD.current_revision
+   BEGIN
+     UPDATE context_snapshots
+     SET state = 'invalidated', snapshot_generation = snapshot_generation + 1,
+         invalidated_at = NEW.created_at, invalidation_reason = 'message_revised'
+     WHERE state = 'active' AND (
+       (trigger_message_id = NEW.message_id AND trigger_revision = OLD.current_revision)
+       OR snapshot_id IN (
+         SELECT source.snapshot_id FROM context_snapshot_sources AS source
+         WHERE source.room_id = NEW.room_id AND source.currently_required = 1
+           AND source.source_kind = 'message_revision'
+           AND source.source_id = NEW.message_id
+           AND source.source_revision = OLD.current_revision
+       )
+     );
+   END`,
+  `CREATE TRIGGER rooms_v19_invalidate_context_archive
+   AFTER UPDATE OF status ON rooms
+   WHEN NEW.status = 'archived' AND OLD.status = 'active'
+   BEGIN
+     UPDATE context_snapshots
+     SET state = 'invalidated', snapshot_generation = snapshot_generation + 1,
+         invalidated_at = COALESCE(NEW.archived_at, NEW.created_at),
+         invalidation_reason = 'room_archived'
+     WHERE room_id = NEW.id AND state = 'active';
+   END`,
+  `CREATE TRIGGER room_memberships_v19_invalidate_context_update
+   AFTER UPDATE OF participation, access_revision, tool_permissions_json ON room_memberships
+   WHEN NEW.kind = 'agent' AND (
+     NEW.participation IS NOT OLD.participation
+     OR NEW.access_revision <> OLD.access_revision
+     OR NEW.tool_permissions_json <> OLD.tool_permissions_json
+   )
+   BEGIN
+     UPDATE context_snapshots
+     SET state = 'invalidated', snapshot_generation = snapshot_generation + 1,
+         invalidated_at = COALESCE(NEW.configured_at, NEW.joined_at, created_at),
+         invalidation_reason = 'authorization_changed'
+     WHERE room_id = NEW.room_id AND agent_id = NEW.actor_id AND state = 'active';
+   END`,
+  `CREATE TRIGGER room_memberships_v19_invalidate_context_delete
+   AFTER DELETE ON room_memberships
+   WHEN OLD.kind = 'agent'
+   BEGIN
+     UPDATE context_snapshots
+     SET state = 'invalidated', snapshot_generation = snapshot_generation + 1,
+         invalidated_at = OLD.configured_at, invalidation_reason = 'membership_revoked'
+     WHERE room_id = OLD.room_id AND agent_id = OLD.actor_id AND state = 'active';
+   END`,
+  `CREATE TRIGGER room_memory_sources_v19_invalidate_context
+   AFTER UPDATE OF eligibility, availability ON room_memory_sources
+   WHEN NEW.eligibility <> 'eligible' OR NEW.availability <> 'readable'
+   BEGIN
+     UPDATE context_snapshots
+     SET state = 'invalidated', snapshot_generation = snapshot_generation + 1,
+         invalidated_at = NEW.updated_at, invalidation_reason = 'memory_invalidated'
+     WHERE state = 'active' AND snapshot_id IN (
+       SELECT source.snapshot_id FROM context_snapshot_sources AS source
+       WHERE source.room_id = NEW.room_id
+         AND source.currently_required = 1
+         AND ((source.source_kind = 'message_revision'
+               AND NEW.source_kind IN ('message', 'message_revision'))
+           OR (source.source_kind = 'message_tombstone'
+               AND NEW.source_kind = 'message_tombstone')
+           OR (source.source_kind = 'attachment_extraction'
+               AND NEW.source_kind IN ('attachment', 'attachment_extraction')))
+         AND source.source_id = CASE
+           WHEN NEW.source_kind IN ('message', 'message_revision', 'message_tombstone')
+             THEN COALESCE(json_extract(NEW.safe_metadata_json, '$.messageId'), NEW.source_id)
+           ELSE NEW.source_id
+         END
+         AND source.source_revision = NEW.source_revision
+     );
+   END`,
+  `CREATE TRIGGER room_memory_records_v19_invalidate_context
+   AFTER UPDATE OF current_version_id ON room_memory_records
+   WHEN NEW.current_version_id IS NOT OLD.current_version_id
+   BEGIN
+     UPDATE context_snapshots
+     SET state = 'invalidated', snapshot_generation = snapshot_generation + 1,
+         invalidated_at = NEW.updated_at, invalidation_reason = 'memory_invalidated'
+     WHERE state = 'active' AND snapshot_id IN (
+       SELECT source.snapshot_id FROM context_snapshot_sources AS source
+       WHERE source.room_id = NEW.room_id AND source.currently_required = 1
+         AND source.source_kind = 'memory'
+         AND source.source_id = OLD.current_version_id
+     );
+   END`,
+  `CREATE TRIGGER attachments_v19_invalidate_context
+   AFTER UPDATE OF processing_status, processing_generation, source_operational_state ON attachments
+   WHEN NEW.processing_status <> 'ready' OR NEW.source_operational_state <> 'bound-active'
+      OR NEW.processing_generation <> OLD.processing_generation
+   BEGIN
+     UPDATE context_snapshots
+     SET state = 'invalidated', snapshot_generation = snapshot_generation + 1,
+         invalidated_at = NEW.updated_at, invalidation_reason = 'attachment_invalidated'
+     WHERE state = 'active' AND snapshot_id IN (
+       SELECT source.snapshot_id FROM context_snapshot_sources AS source
+       WHERE source.room_id = NEW.room_id
+         AND source.currently_required = 1
+         AND source.source_kind = 'attachment_extraction'
+         AND source.source_id = 'attachment-extraction:' || NEW.attachment_id
+         AND source.source_revision = OLD.processing_generation
+     );
+   END`,
+] as const;
+
 export const AUTHORITY_V14_STATEMENT_COUNT_FOR_TEST = V14_STATEMENTS.length;
 export const AUTHORITY_V15_STATEMENT_COUNT_FOR_TEST = V15_STATEMENTS.length;
 export const AUTHORITY_V16_STATEMENT_COUNT_FOR_TEST = V16_STATEMENTS.length;
 export const AUTHORITY_V17_STATEMENT_COUNT_FOR_TEST = V17_STATEMENTS.length;
 export const AUTHORITY_V18_STATEMENT_COUNT_FOR_TEST = V18_STATEMENTS.length;
+export const AUTHORITY_V19_STATEMENT_COUNT_FOR_TEST = V19_STATEMENTS.length;
 
 const V2_STATEMENTS = [
   `ALTER TABLE actors
@@ -4603,6 +5996,11 @@ const MIGRATIONS = [
     18,
     "room-memory-authority-steward",
     V18_STATEMENTS,
+  ),
+  defineMigration(
+    19,
+    "context-snapshot-authority",
+    V19_STATEMENTS,
   ),
 ] as const satisfies readonly Migration[];
 
@@ -5182,6 +6580,98 @@ const V18_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V19_SCHEMA_CONTRACT = {
+  ...V18_SCHEMA_CONTRACT,
+  agent_execution_context_attempts: [
+    "execution_id", "attempt_seq", "snapshot_id", "snapshot_generation",
+    "reuse_kind", "bound_at",
+  ],
+  agent_execution_context_bindings: [
+    "execution_id", "snapshot_id", "invocation_intent_id",
+    "execution_generation", "bound_at",
+  ],
+  agent_message_citations: [
+    "message_id", "ordinal", "execution_id", "snapshot_id", "receipt_id",
+    "manifest_item_ordinal", "citation_label_sha256", "source_kind", "source_id",
+    "source_revision", "snapshot_generation", "created_at",
+  ],
+  context_manifest_items: [
+    "manifest_id", "snapshot_id", "ordinal", "section", "disposition",
+    "canonical_sort_key", "source_label_sha256", "source_kind", "source_id",
+    "source_revision", "content_sha256", "original_bytes", "included_bytes",
+    "original_tokens", "included_tokens", "reason_code", "segment_json",
+    "availability",
+  ],
+  context_manifests: [
+    "manifest_id", "snapshot_id", "manifest_version", "manifest_sha256",
+    "canonical_manifest_json", "item_count", "total_original_bytes",
+    "total_included_bytes", "total_original_tokens", "total_included_tokens",
+    "accounting_json", "created_at",
+  ],
+  context_manifest_range_sources: [
+    "manifest_id", "snapshot_id", "range_ordinal", "range_label_sha256",
+    "corpus_seq", "source_kind", "source_id", "source_revision",
+    "source_index_sha256", "created_at",
+  ],
+  context_snapshot_bodies: [
+    "snapshot_id", "envelope_schema_version", "canonical_envelope_json",
+    "envelope_sha256", "byte_count", "token_count", "created_at",
+  ],
+  context_snapshot_lineage: [
+    "child_snapshot_id", "parent_snapshot_id", "child_execution_id",
+    "parent_execution_id", "relation", "created_at",
+  ],
+  context_snapshot_sources: [
+    "snapshot_id", "room_id", "source_kind", "source_id", "source_revision",
+    "source_label_sha256", "currently_required", "authorization_revision", "created_at",
+  ],
+  context_snapshot_transitions: [
+    "transition_id", "snapshot_id", "from_state", "to_state",
+    "from_generation", "to_generation", "reason_code", "transitioned_at",
+  ],
+  context_snapshots: [
+    "snapshot_id", "room_id", "invocation_intent_id", "agent_id",
+    "provider_id", "model_id", "compiler_version", "compiler_config_version",
+    "estimator_version", "preparation_sha256", "trigger_message_id",
+    "trigger_revision", "trigger_reason", "memory_watermark", "corpus_head",
+    "raw_delta_from_exclusive", "raw_delta_to_inclusive",
+    "room_lifecycle_generation", "membership_access_revision",
+    "tool_capability_revision", "budget_json", "manifest_sha256",
+    "envelope_sha256", "state", "snapshot_generation", "created_at",
+    "invalidated_at", "invalidation_reason", "superseded_at", "retired_at",
+    "retain_until", "payload_retention_state",
+  ],
+  context_source_read_payloads: [
+    "read_id", "canonical_result_json", "result_sha256", "byte_count",
+    "token_count", "created_at",
+  ],
+  context_source_read_grants: [
+    "grant_id", "execution_id", "attempt_seq", "snapshot_id",
+    "snapshot_generation", "tool_id", "parameter_sha256", "issued_at", "expires_at",
+  ],
+  context_source_read_dispatches: [
+    "dispatch_id", "grant_id", "execution_id", "attempt_seq", "call_id",
+    "tool_id", "request_sha256", "dispatched_at",
+  ],
+  context_source_read_receipts: [
+    "receipt_id", "read_id", "snapshot_id", "execution_id", "room_id", "attempt_seq",
+    "call_id", "dispatch_id", "source_label_sha256",
+    "source_kind", "source_id", "source_revision", "snapshot_generation",
+    "citation_label_sha256", "result_sha256", "representation", "range_text",
+    "content_sha256", "content_bytes", "authorization_epoch", "issued_at",
+  ],
+  context_source_reads: [
+    "read_id", "snapshot_id", "execution_id", "attempt_seq",
+    "snapshot_generation", "call_id", "grant_id", "dispatch_id", "tool_id",
+    "request_sha256", "source_label_sha256",
+    "mode", "source_kind", "source_id", "source_revision",
+    "authorization_epoch", "page_size", "page_offset", "cursor_sha256",
+    "artifact_sha256", "artifact_range_start", "artifact_range_end", "status",
+    "result_sha256", "result_bytes", "result_tokens", "accounted_bytes", "error_code",
+    "created_at", "completed_at",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
@@ -5201,6 +6691,7 @@ const SCHEMA_CONTRACTS = {
   16: V16_SCHEMA_CONTRACT,
   17: V17_SCHEMA_CONTRACT,
   18: V18_SCHEMA_CONTRACT,
+  19: V19_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -6579,6 +8070,114 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
        WHERE resolution.operator_kind <> 'human' OR actor.kind IS NOT 'human'
        LIMIT 1`,
       "memory resolutions must retain a current Human operator",
+    );
+  }
+  if (schemaVersion >= 19) {
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM context_snapshots AS snapshot
+       LEFT JOIN context_manifests AS manifest ON manifest.snapshot_id = snapshot.snapshot_id
+       LEFT JOIN context_snapshot_bodies AS body ON body.snapshot_id = snapshot.snapshot_id
+       LEFT JOIN context_snapshot_transitions AS transition
+         ON transition.snapshot_id = snapshot.snapshot_id
+        AND transition.to_generation = snapshot.snapshot_generation
+       WHERE manifest.snapshot_id IS NULL
+          OR manifest.manifest_sha256 <> snapshot.manifest_sha256
+          OR (snapshot.payload_retention_state = 'required' AND body.snapshot_id IS NULL)
+          OR (snapshot.payload_retention_state = 'purged' AND body.snapshot_id IS NOT NULL)
+          OR transition.snapshot_id IS NULL
+          OR transition.to_state <> snapshot.state
+          OR (SELECT COUNT(*) FROM context_manifest_items AS item
+              WHERE item.manifest_id = manifest.manifest_id) <> manifest.item_count
+       LIMIT 1`,
+      "context snapshots must retain one complete manifest, transition, and restricted body state",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_execution_context_bindings AS binding
+       JOIN agent_executions AS execution ON execution.id = binding.execution_id
+       JOIN agent_execution_intent_links AS link ON link.execution_id = execution.id
+       JOIN context_snapshots AS snapshot ON snapshot.snapshot_id = binding.snapshot_id
+       LEFT JOIN agent_execution_context_attempts AS first_attempt
+         ON first_attempt.execution_id = binding.execution_id
+        AND first_attempt.attempt_seq = 1
+       WHERE binding.execution_generation <> execution.execution_generation
+          OR binding.invocation_intent_id <> link.intent_id
+          OR snapshot.invocation_intent_id <> link.intent_id
+          OR snapshot.room_id <> execution.room_id
+          OR snapshot.agent_id <> execution.agent_id
+          OR snapshot.provider_id <> execution.provider_id
+          OR snapshot.model_id <> execution.model_id
+          OR first_attempt.snapshot_id IS NULL
+          OR first_attempt.snapshot_id <> binding.snapshot_id
+          OR first_attempt.reuse_kind <> 'first'
+       LIMIT 1`,
+      "every execution must retain one immutable first-attempt context binding",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_execution_context_attempts AS attempt_binding
+       JOIN agent_execution_context_bindings AS binding
+         ON binding.execution_id = attempt_binding.execution_id
+       JOIN agent_execution_attempts AS attempt
+         ON attempt.execution_id = attempt_binding.execution_id
+        AND attempt.attempt_seq = attempt_binding.attempt_seq
+       JOIN context_snapshots AS snapshot ON snapshot.snapshot_id = binding.snapshot_id
+       WHERE attempt_binding.snapshot_id <> binding.snapshot_id
+          OR attempt_binding.snapshot_generation > snapshot.snapshot_generation
+          OR (attempt_binding.attempt_seq = 1 AND attempt_binding.reuse_kind <> 'first')
+          OR (attempt_binding.attempt_seq > 1
+              AND attempt_binding.reuse_kind NOT IN ('automatic_retry', 'crash_recovery'))
+       LIMIT 1`,
+      "automatic retry and crash attempts must reuse the execution snapshot",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM context_source_reads AS source_read
+       JOIN context_snapshots AS snapshot ON snapshot.snapshot_id = source_read.snapshot_id
+       LEFT JOIN context_source_read_payloads AS payload ON payload.read_id = source_read.read_id
+       LEFT JOIN context_source_read_receipts AS receipt ON receipt.read_id = source_read.read_id
+       WHERE (source_read.status = 'completed' AND (
+                receipt.read_id IS NULL
+                OR receipt.result_sha256 <> source_read.result_sha256
+                OR (snapshot.payload_retention_state <> 'purged' AND (
+                      payload.read_id IS NULL
+                      OR payload.result_sha256 <> source_read.result_sha256
+                    ))
+                OR (snapshot.payload_retention_state = 'purged'
+                    AND payload.read_id IS NOT NULL)
+              ))
+          OR (source_read.status = 'page_ready' AND (
+                receipt.read_id IS NOT NULL
+                OR (snapshot.payload_retention_state <> 'purged' AND (
+                      payload.read_id IS NULL
+                      OR payload.result_sha256 <> source_read.result_sha256
+                    ))
+                OR (snapshot.payload_retention_state = 'purged'
+                    AND payload.read_id IS NOT NULL)
+              ))
+          OR (source_read.status NOT IN ('page_ready', 'completed') AND (
+                payload.read_id IS NOT NULL OR receipt.read_id IS NOT NULL
+              ))
+       LIMIT 1`,
+      "checkpointed context source reads must retain the exact payload and terminal receipt",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_message_citations AS citation
+       JOIN agent_message_sources AS message_source
+         ON message_source.message_id = citation.message_id
+       JOIN agent_execution_context_bindings AS binding
+         ON binding.execution_id = message_source.execution_id
+       WHERE citation.execution_id <> message_source.execution_id
+          OR citation.snapshot_id <> binding.snapshot_id
+       LIMIT 1`,
+      "final citations must remain bound to the Agent message execution snapshot",
     );
   }
 }

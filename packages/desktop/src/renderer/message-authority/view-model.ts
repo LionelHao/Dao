@@ -87,8 +87,17 @@ export interface AgentFinalTimelineMessage extends TimelineMessageBase {
   readonly finalBody: string;
   readonly sourceInvocationIntentId: string;
   readonly sourceExecutionId: string;
+  readonly citations: readonly AgentMessageCitationProjection[];
   readonly correctsMessageId?: string;
   readonly replyToMessageId?: never;
+}
+
+export interface AgentMessageCitationProjection {
+  readonly ordinal: number;
+  readonly sourceKind: "message" | "message_revision" | "message_tombstone" |
+    "attachment_extraction" | "memory" | "project_fact_checkpoint" | "delta_range";
+  readonly sourceId: string;
+  readonly sourceRevision: number;
 }
 
 export interface MessageTombstone extends TimelineMessageBase {
@@ -263,6 +272,18 @@ function validateTimeline(timeline: readonly TimelineMessage[], roomId: string):
       }
     } else if (message.kind === "tombstone") {
       validIso(message.recalledAt, "recalledAt");
+    } else {
+      const identities = new Set<string>();
+      if (message.citations.length > 128 || message.citations.some((citation, index) => {
+        const identity = `${citation.sourceKind}\u0000${citation.sourceId}\u0000${citation.sourceRevision}`;
+        const invalid = citation.ordinal !== index + 1 ||
+          !Number.isSafeInteger(citation.sourceRevision) || citation.sourceRevision < 1 ||
+          !["message", "message_revision", "message_tombstone", "attachment_extraction",
+            "memory", "project_fact_checkpoint", "delta_range"].includes(citation.sourceKind) ||
+          citation.sourceId.length === 0 || identities.has(identity);
+        identities.add(identity);
+        return invalid;
+      })) throw new TypeError("Agent citation projection is invalid");
     }
   }
 }

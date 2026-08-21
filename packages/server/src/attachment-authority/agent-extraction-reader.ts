@@ -39,6 +39,27 @@ export interface AttachmentAgentExtractionReadPort {
     }>;
     text: string;
   }>>;
+  readSegment(input: Readonly<{
+    executionId: string;
+    executionGeneration: number;
+    attachmentId: string;
+    attachmentGeneration: number;
+    offset: number;
+    maximumBytes: number;
+  }>): Promise<Readonly<{
+    attachmentId: string;
+    source: Readonly<{ messageId: string; revision: number }>;
+    provenance: Readonly<{
+      method: AttachmentAgentExtractionAuthorization["method"];
+      tool: AttachmentAgentExtractionAuthorization["tool"];
+      version: string;
+      pageCount: number | null;
+      sha256: string;
+      byteSize: number;
+    }>;
+    segment: Readonly<{ startByte: number; endByte: number; eof: boolean }>;
+    text: string;
+  }>>;
 }
 
 type Value = Record<string, unknown>;
@@ -210,6 +231,97 @@ export function createAttachmentAgentExtractionReader(options: {
           pageCount: initial.pageCount,
           sha256: initial.sha256,
           byteSize: initial.byteSize,
+        }),
+        text,
+      });
+    },
+    async readSegment(input: Readonly<{
+      executionId: string;
+      executionGeneration: number;
+      attachmentId: string;
+      attachmentGeneration: number;
+      offset: number;
+      maximumBytes: number;
+    }>) {
+      if (!record(input) || !exact(input, [
+        "executionId", "executionGeneration", "attachmentId", "attachmentGeneration",
+        "offset", "maximumBytes",
+      ]) || !identifier(input.executionId) || !positive(input.executionGeneration) ||
+          !identifier(input.attachmentId) || !positive(input.attachmentGeneration) ||
+          !Number.isSafeInteger(input.offset) || input.offset < 0 ||
+          !positive(input.maximumBytes) ||
+          input.maximumBytes > ATTACHMENT_AUTHORITY_LIMITS.maxChunkBytes) {
+        throw new AttachmentAgentExtractionReaderError("invalid_request");
+      }
+      const authorityInput = {
+        executionId: input.executionId,
+        executionGeneration: input.executionGeneration,
+        attachmentId: input.attachmentId,
+        attachmentGeneration: input.attachmentGeneration,
+      };
+      const initial = await authorize(authorityInput);
+      if (input.offset >= initial.byteSize) {
+        throw new AttachmentAgentExtractionReaderError("invalid_request");
+      }
+      const before = await authorize(authorityInput);
+      if (!sameAuthorization(initial, before)) {
+        throw new AttachmentAgentExtractionReaderError("attachment_forbidden");
+      }
+      let range: Readonly<{ bytes: Uint8Array; byteSize: number; eof: boolean }>;
+      try {
+        range = await options.objectStore.readAuthorizedRange(
+          initial.objectKey,
+          input.offset,
+          Math.min(input.maximumBytes, initial.byteSize - input.offset),
+        );
+      } catch {
+        throw new AttachmentAgentExtractionReaderError("storage_unavailable");
+      }
+      const after = await authorize(authorityInput);
+      if (!sameAuthorization(initial, after)) {
+        throw new AttachmentAgentExtractionReaderError("attachment_forbidden");
+      }
+      if (!record(range) || !exact(range, ["bytes", "byteSize", "eof"]) ||
+          !nodeTypes.isUint8Array(range.bytes) || range.bytes.byteLength === 0 ||
+          range.bytes.byteLength > input.maximumBytes || range.byteSize !== initial.byteSize ||
+          typeof range.eof !== "boolean" ||
+          range.eof !== (input.offset + range.bytes.byteLength === initial.byteSize)) {
+        throw new AttachmentAgentExtractionReaderError("storage_unavailable");
+      }
+      let usableBytes = range.bytes.byteLength;
+      const minimumUsableBytes = Math.max(1, range.bytes.byteLength - 3);
+      let text: string | undefined;
+      while (usableBytes >= minimumUsableBytes && text === undefined) {
+        try {
+          text = new TextDecoder("utf-8", { fatal: true }).decode(
+            range.bytes.subarray(0, usableBytes),
+          );
+        } catch {
+          usableBytes -= 1;
+        }
+      }
+      if (text === undefined || usableBytes === 0) {
+        throw new AttachmentAgentExtractionReaderError("storage_unavailable");
+      }
+      const endByte = input.offset + usableBytes;
+      return Object.freeze({
+        attachmentId: initial.attachmentId,
+        source: Object.freeze({
+          messageId: initial.sourceMessageId,
+          revision: initial.sourceRevision,
+        }),
+        provenance: Object.freeze({
+          method: initial.method,
+          tool: initial.tool,
+          version: initial.toolVersion,
+          pageCount: initial.pageCount,
+          sha256: initial.sha256,
+          byteSize: initial.byteSize,
+        }),
+        segment: Object.freeze({
+          startByte: input.offset,
+          endByte,
+          eof: endByte === initial.byteSize,
         }),
         text,
       });
