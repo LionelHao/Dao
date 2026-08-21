@@ -44,5 +44,4 @@ FT-09尚未正式交付；production project adapter必须disabled/unavailable�
 
 ## 6. Review与PR日志
 
-待实现后填写子分支commit、adversarial reviewer发现、修复、集成PR、CI、merge SHA与worktree清理结果。任何“通过”必须链接到实际命令或GitHub状态；本文不使用`verified`作为项目状态。
-
+待实现后填写子分支commit、adversarial reviewer发现、修复、集成PR、CI、merge SHA与worktree清理结果。任何“通过”必须链接到实际命令、GitHub状态或远端读取结果；本文不使用`verified`作为项目状态。

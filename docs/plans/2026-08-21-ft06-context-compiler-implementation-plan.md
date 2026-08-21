@@ -63,4 +63,3 @@ live suite仅在显式flag和server-side secret同时存在时运行；否则按
 ## 6. 退出门
 
 九条Requirement均有production代码和测试；Provider只消费compiled envelope；snapshot/retry/crash不漂移；budget可解释；source read真实且每次授权；citation闭合且atomic；v19全部历史迁移通过；privacy、worker/restart/WebSocket/Desktop/CI通过；交付文档与清理完成；用户四文件和Blueprint保持不变；结论只使用owner规定文案。
-
