@@ -14,6 +14,10 @@ import type {
   AttachmentStatusResult,
 } from "../../attachment-authority/contracts.js";
 import {
+  isMemoryAuthorityEpochResponse,
+  type MemoryAuthorityBridge,
+} from "../../memory-authority/contracts.js";
+import {
   advanceMessageAuthorityCursor,
   applyMessageAuthorityEvent,
   beginMessageAuthorityRepair,
@@ -52,6 +56,7 @@ export interface MessageAuthorityBridgeSurfaceOptions {
   readonly createTargetId: () => string;
   readonly reducedMotion?: boolean;
   readonly attachmentBridge?: AttachmentAuthorityBridge;
+  readonly memoryBridge?: MemoryAuthorityBridge;
 }
 
 type RevisionTarget = Readonly<{ messageId: string; expectedRevision: number }>;
@@ -99,6 +104,7 @@ function mapTimelineMessage(message: CoreTimelineMessage): TimelineMessage {
       finalBody: message.finalBody,
       sourceInvocationIntentId: message.sourceInvocationIntentId,
       sourceExecutionId: message.sourceExecutionId,
+      citations: message.citations,
       ...(message.correctsMessageId === undefined
         ? {}
         : { correctsMessageId: message.correctsMessageId }),
@@ -173,6 +179,7 @@ export function mountMessageAuthorityBridgeSurface(
   options: MessageAuthorityBridgeSurfaceOptions,
 ): () => void {
   const attachmentBridge = options.attachmentBridge;
+  const memoryBridge = options.memoryBridge;
   let disposed = false;
   let state: MessageAuthorityState | undefined;
   let replica: MessageAuthorityReplica | undefined;
@@ -752,6 +759,56 @@ export function mountMessageAuthorityBridgeSurface(
       state = replaceState(state, { draft });
       render();
     },
+    ...(memoryBridge === undefined ? {} : {
+      onOpenCitation(citation) {
+        if (state === undefined || state.connection.status !== "online") return;
+        const openedFrom = state;
+        void memoryBridge.context({ roomId }).then(async (context) => {
+          if (disposed || state === undefined || state !== openedFrom ||
+              context.roomId !== roomId || context.lifecycle !== "active") throw new Error("citation context stale");
+          if (citation.sourceKind === "memory") {
+            const target = [...document.querySelectorAll<HTMLElement>("[data-memory-record-id]")]
+              .find((candidate) => candidate.dataset.memoryRecordId === citation.sourceId);
+            if (target === undefined) throw new Error("citation source unavailable");
+            target.tabIndex = -1;
+            target.scrollIntoView?.({ block: "center", behavior: "auto" });
+            target.focus({ preventScroll: true });
+            return;
+          }
+          const response = await memoryBridge.request({
+            accessEpoch: context.accessEpoch,
+            frame: {
+              type: "room.memory.source.query.v1",
+              requestId: `citation-${globalThis.crypto.randomUUID()}`,
+              roomId,
+              sourceKind: citation.sourceKind,
+              sourceId: citation.sourceId,
+              sourceRevision: citation.sourceRevision,
+            },
+          });
+          if (!isMemoryAuthorityEpochResponse(response) || response.accessEpoch !== context.accessEpoch ||
+              response.frame.type !== "room.memory.source.v1") {
+            throw new Error("citation source unavailable");
+          }
+          const navigation = response.frame.source.navigation;
+          const targetId = navigation.kind === "attachment"
+            ? navigation.attachmentId
+            : navigation.kind === "project_fact" ? undefined : navigation.messageId;
+          const attribute = navigation.kind === "attachment" ? "data-attachment-id" : "data-message-id";
+          const target = targetId === undefined ? undefined
+            : [...document.querySelectorAll<HTMLElement>(`[${attribute}]`)]
+              .find((candidate) => candidate.getAttribute(attribute) === targetId);
+          if (target === undefined) throw new Error("citation source unavailable");
+          target.tabIndex = -1;
+          target.scrollIntoView?.({ block: "center", behavior: "auto" });
+          target.focus({ preventScroll: true });
+        }).catch(() => {
+          if (disposed || state === undefined) return;
+          state = replaceState(state, { announcement: "来源不可访问；未显示来源正文" });
+          render();
+        });
+      },
+    }),
     ...(attachmentBridge === undefined ? {} : {
       attachmentSubmissionBlocked: () => attachmentSubmissionBlocked,
       onSelectAttachment() {

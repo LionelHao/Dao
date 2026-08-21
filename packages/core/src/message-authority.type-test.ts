@@ -49,6 +49,7 @@ const agentWithMention: AgentFinalMessage = {
   finalBody: "Final",
   sourceInvocationIntentId: "intent-1",
   sourceExecutionId: "execution-1",
+  citations: [],
   // @ts-expect-error Agent final creation does not have public mention capability.
   mentionedTargets: [],
 };

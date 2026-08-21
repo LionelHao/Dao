@@ -1177,6 +1177,7 @@ function isAgentMessageCommand(value: unknown): value is AgentMessageCommitComma
     finalBody: value.body,
     sourceInvocationIntentId: "authority-intent",
     sourceExecutionId: "authority-execution",
+    citations: [],
     ...(Object.hasOwn(value, "correctsMessageId")
       ? { correctsMessageId: value.correctsMessageId }
       : {}),

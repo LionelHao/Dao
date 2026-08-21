@@ -494,6 +494,7 @@ export {
   MESSAGE_AUTHORITY_LIMITS,
   isActiveHumanMessage,
   isAgentFinalMessage,
+  isAgentMessageCitation,
   isAttachmentReference,
   isHumanMessageSubmit,
   isIsoUtcTimestamp,
@@ -508,6 +509,8 @@ export {
 } from "./message-authority.js";
 export type {
   ActiveHumanMessage,
+  AgentMessageCitation,
+  AgentMessageCitationSourceKind,
   AgentFinalMessageLinkContext,
   AgentFinalMessage,
   AttachmentReference,

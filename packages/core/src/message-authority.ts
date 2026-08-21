@@ -4,6 +4,7 @@ export const MESSAGE_AUTHORITY_LIMITS = Object.freeze({
   targets: 64,
   attachments: 64,
   targetOutcomes: 64,
+  citations: 128,
 });
 
 export type Utf16Range = Readonly<{
@@ -120,7 +121,23 @@ export type AgentFinalMessage = Readonly<{
   finalBody: string;
   sourceInvocationIntentId: string;
   sourceExecutionId: string;
+  citations: readonly AgentMessageCitation[];
   correctsMessageId?: string;
+}>;
+
+export type AgentMessageCitationSourceKind =
+  | "message"
+  | "message_revision"
+  | "message_tombstone"
+  | "attachment_extraction"
+  | "memory"
+  | "project_fact_checkpoint";
+
+export type AgentMessageCitation = Readonly<{
+  ordinal: number;
+  sourceKind: AgentMessageCitationSourceKind;
+  sourceId: string;
+  sourceRevision: number;
 }>;
 
 export type AgentFinalMessageLinkContext = Readonly<{
@@ -173,6 +190,14 @@ const rejectionCodes = new Set<MessageTargetRejectionCode>([
   "target_kind_mismatch",
   "target_assignment_inactive",
   "target_room_archived",
+]);
+const citationSourceKinds = new Set<AgentMessageCitationSourceKind>([
+  "message",
+  "message_revision",
+  "message_tombstone",
+  "attachment_extraction",
+  "memory",
+  "project_fact_checkpoint",
 ]);
 const canonicalUtcTimestamp = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
@@ -398,13 +423,14 @@ export function isAgentFinalMessage(
     value,
     [
       "id", "roomId", "authorId", "authorKind", "createdAt", "lifecycle", "finalBody",
-      "sourceInvocationIntentId", "sourceExecutionId",
+      "sourceInvocationIntentId", "sourceExecutionId", "citations",
     ],
     ["correctsMessageId"],
   ) || !isIdentifier(value.id) || !isIdentifier(value.roomId) || !isIdentifier(value.authorId) ||
       value.authorKind !== "agent" || value.lifecycle !== "active" ||
       !isIsoUtcTimestamp(value.createdAt) || !isMessageBody(value.finalBody) ||
-      !isIdentifier(value.sourceInvocationIntentId) || !isIdentifier(value.sourceExecutionId)) {
+      !isIdentifier(value.sourceInvocationIntentId) || !isIdentifier(value.sourceExecutionId) ||
+      !areAgentMessageCitationsValid(value.citations)) {
     return false;
   }
   if (value.correctsMessageId !== undefined &&
@@ -429,6 +455,26 @@ export function isAgentFinalMessage(
       linkContext.correctionTargetAuthorId === value.authorId;
   }
   return true;
+}
+
+export function isAgentMessageCitation(value: unknown): value is AgentMessageCitation {
+  return isRecord(value) && hasExactKeys(value, [
+    "ordinal", "sourceKind", "sourceId", "sourceRevision",
+  ]) && isPositiveSafeInteger(value.ordinal) &&
+    citationSourceKinds.has(value.sourceKind as AgentMessageCitationSourceKind) &&
+    isIdentifier(value.sourceId) && isPositiveSafeInteger(value.sourceRevision);
+}
+
+function areAgentMessageCitationsValid(value: unknown): value is readonly AgentMessageCitation[] {
+  if (!Array.isArray(value) || value.length > MESSAGE_AUTHORITY_LIMITS.citations) return false;
+  const identities = new Set<string>();
+  return value.every((citation, index) => {
+    if (!isAgentMessageCitation(citation) || citation.ordinal !== index + 1) return false;
+    const identity = `${citation.sourceKind}\u0000${citation.sourceId}\u0000${citation.sourceRevision}`;
+    if (identities.has(identity)) return false;
+    identities.add(identity);
+    return true;
+  });
 }
 
 export function isMessageTombstone(value: unknown): value is MessageTombstone {

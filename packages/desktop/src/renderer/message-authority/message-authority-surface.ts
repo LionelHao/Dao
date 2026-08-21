@@ -3,6 +3,7 @@ import {
   messageControls,
   replyLabel,
   type MessageActorOption,
+  type AgentMessageCitationProjection,
   type MessageAuthorityState,
   type MessageClosedError,
   type MessageDraft,
@@ -34,6 +35,7 @@ export interface MessageAuthoritySurfaceActions {
   readonly onReauthenticate: () => void;
   readonly onRefreshProjection: () => void;
   readonly onDismissReply: () => void;
+  readonly onOpenCitation?: (citation: AgentMessageCitationProjection) => void;
   readonly onSelectAttachment?: () => void;
   readonly onPreviewAttachment?: (attachmentId: string) => void;
   readonly onDownloadAttachment?: (attachmentId: string) => void;
@@ -266,6 +268,7 @@ function renderTombstone(
 function renderAgentMessage(
   state: MessageAuthorityState,
   message: Extract<TimelineMessage, { kind: "agent-final" }>,
+  actions: MessageAuthoritySurfaceActions,
 ): HTMLElement {
   const correction = message.correctsMessageId !== undefined;
   const card = element("article", "message-authority__message message-authority__message--agent");
@@ -280,6 +283,33 @@ function renderAgentMessage(
     card.append(text("p", `更正 ${message.correctsMessageId}；原 final 保留不可变`, "message-authority__metadata"));
   }
   card.append(text("p", message.finalBody, "message-authority__body"));
+  if (message.citations.length > 0) {
+    const sources = element("div", "message-authority__citations");
+    sources.dataset.agentCitations = "server-confirmed";
+    sources.setAttribute("aria-label", "服务器确认的回答来源");
+    for (const citation of message.citations) {
+      const label = citation.sourceKind === "attachment_extraction"
+        ? `来源 · 附件片段 v${citation.sourceRevision}`
+        : citation.sourceKind === "memory"
+          ? `来源 · 重要记忆 v${citation.sourceRevision}`
+          : citation.sourceKind === "project_fact_checkpoint"
+            ? "来源暂不可访问"
+            : `来源 · 消息 v${citation.sourceRevision}`;
+      const source = button(label, "open-agent-citation");
+      source.dataset.citationSourceKind = citation.sourceKind;
+      source.dataset.citationSourceId = citation.sourceId;
+      source.dataset.citationSourceRevision = String(citation.sourceRevision);
+      const available = state.connection.status === "online" &&
+        citation.sourceKind !== "project_fact_checkpoint" && actions.onOpenCitation !== undefined;
+      source.disabled = !available;
+      source.setAttribute("aria-label", available
+        ? `来源 ${citation.ordinal}；${label}；引用 ${citation.sourceId}；打开前将重新检查 Room 权限`
+        : `来源 ${citation.ordinal}；${label}；引用 ${citation.sourceId}；当前不可打开`);
+      if (available) source.addEventListener("click", () => actions.onOpenCitation?.(citation));
+      sources.append(source);
+    }
+    card.append(sources);
+  }
   card.append(text("p", `execution ${message.sourceExecutionId} · intent ${message.sourceInvocationIntentId}`, "message-authority__metadata"));
   return card;
 }
@@ -298,7 +328,7 @@ function renderTimeline(
   for (const message of state.timeline) {
     timeline.append(message.kind === "human" ? renderHumanMessage(state, message, actions)
       : message.kind === "tombstone" ? renderTombstone(state, message)
-      : renderAgentMessage(state, message));
+      : renderAgentMessage(state, message, actions));
   }
   return timeline;
 }

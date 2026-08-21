@@ -155,7 +155,7 @@ describe("Desktop renderer route entry", () => {
     const timeline = root.querySelector<HTMLElement>(".room-authority-workspace__timeline")!;
     const memory = root.querySelector<HTMLElement>(".room-authority-workspace__memory")!;
     expect(renderers.mountMessageAuthoritySurface).toHaveBeenCalledWith(
-      timeline, messageAuthority, "room-1",
+      timeline, messageAuthority, "room-1", undefined, memoryAuthority,
     );
     expect(renderers.mountMemoryAuthoritySurface).toHaveBeenCalledWith(
       memory, memoryAuthority, "room-1",

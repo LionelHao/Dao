@@ -70,6 +70,9 @@ function state(overrides: Partial<MessageAuthorityState> = {}): MessageAuthority
         finalBody: "原 final",
         sourceInvocationIntentId: "i1",
         sourceExecutionId: "e1",
+        citations: [{
+          ordinal: 1, sourceKind: "message_revision", sourceId: "message-human", sourceRevision: 2,
+        }],
       },
       {
         kind: "agent-final",
@@ -80,6 +83,7 @@ function state(overrides: Partial<MessageAuthorityState> = {}): MessageAuthority
         finalBody: "更正 final",
         sourceInvocationIntentId: "i1",
         sourceExecutionId: "e2",
+        citations: [],
         correctsMessageId: "message-agent-final",
       },
     ],
@@ -132,6 +136,26 @@ describe("J-02/J-03/J-04 message authority DOM", () => {
     expect(root.querySelector("[data-message-id='message-agent-final']")?.textContent).toContain("FINAL");
     expect(root.querySelector("[data-message-id='message-agent-correction']")?.textContent).toContain("CORRECTION");
     expect(root.textContent).not.toContain("撤回前秘密正文");
+  });
+
+  it("renders only server-confirmed citation metadata and rechecks through the host action", () => {
+    const root = document.createElement("main");
+    const handlers = { ...actions(), onOpenCitation: vi.fn() };
+    renderMessageAuthoritySurface(root, state(), handlers);
+    const source = root.querySelector<HTMLButtonElement>("[data-citation-source-id='message-human']");
+    expect(source?.dataset.agentSnapshotId).toBeUndefined();
+    expect(source?.closest("[data-agent-citations]")?.getAttribute("aria-label"))
+      .toBe("服务器确认的回答来源");
+    source?.click();
+    expect(handlers.onOpenCitation).toHaveBeenCalledWith({
+      ordinal: 1, sourceKind: "message_revision", sourceId: "message-human", sourceRevision: 2,
+    });
+
+    renderMessageAuthoritySurface(root, state({
+      connection: { status: "offline", asOf: "2026-08-19T09:09:00.000Z" },
+    }), handlers);
+    expect(root.querySelector<HTMLButtonElement>("[data-citation-source-id='message-human']")?.disabled)
+      .toBe(true);
   });
 
   it("uses distinct target outcome wording and does not call intent registration completion", () => {

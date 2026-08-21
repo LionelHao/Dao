@@ -371,6 +371,7 @@ function projectAgentMessage(source: OperationalAgentMessageSource): AgentFinalM
     finalBody: source.finalRevision.body,
     sourceInvocationIntentId: sourceLineage.invocationIntentId,
     sourceExecutionId: sourceLineage.executionId,
+    citations: [],
     ...(correction === null ? {} : { correctsMessageId: correction.correctsMessageId }),
   });
   if (!isTimelineMessage(projection)) reject("invalid_projection");

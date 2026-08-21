@@ -8583,6 +8583,7 @@ function validateAgentMessageCommand(command: AgentMessageCommitCommand): void {
         finalBody: command.body,
         sourceInvocationIntentId: "authority-intent",
         sourceExecutionId: "authority-execution",
+        citations: [],
         ...(command.correctsMessageId === undefined
           ? {}
           : { correctsMessageId: command.correctsMessageId }),
