@@ -290,6 +290,7 @@ export interface AgentRuntimeProviderInput {
       revision: number;
     }>;
     content: string;
+    memoryKind?: "goal" | "decision" | "context" | "next_action" | "open_question_or_blocker";
     speaker?: Readonly<{ actorId: string; kind: "human" | "agent" }>;
     serverTime?: string;
     replyTo?: Readonly<{ messageId: string; revision: number }>;
@@ -300,7 +301,25 @@ export interface AgentRuntimeProviderInput {
       targetActorId: string;
     }>[];
   }>[];
-  readonly projectContext: Readonly<{ status: "disabled" | "unavailable" }>;
+  readonly projectContext:
+    | Readonly<{ status: "disabled" | "unavailable"; reason: string }>
+    | Readonly<{
+        status: "available";
+        projectId: string;
+        revision: number;
+        representation: Readonly<{ kind: "content" | "excerpt" | "segment" | "digest" | "index"; text: string }> | null;
+        disposition: "included" | "excerpted" | "segmented" | "digested" | "index_only" |
+          "omitted" | "unavailable" | "invalidated";
+        citationLabel: string | null;
+        sourceRefs: readonly Readonly<{
+          roomId: string;
+          sourceKind: "message" | "message_revision" | "message_tombstone" |
+            "attachment_extraction" | "memory" | "project_fact_checkpoint";
+          sourceId: string;
+          revision: number;
+          corpusSeq: number | null;
+        }>[];
+      }>;
   readonly availableTools: readonly ToolDescriptor[];
   readonly openItemTargets?: readonly {
     readonly actorId: string;

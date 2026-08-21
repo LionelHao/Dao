@@ -37,7 +37,7 @@ describe("opt-in OpenAI Responses live smoke", () => {
         speaker: { actorId: "live-smoke-human", kind: "human" },
         content: "Reply with exactly: DAO live smoke ok",
       }],
-      projectContext: { status: "disabled" },
+      projectContext: { status: "disabled", reason: "ft09_not_delivered" },
       availableTools: [],
       committedSteps: [],
       limits: {

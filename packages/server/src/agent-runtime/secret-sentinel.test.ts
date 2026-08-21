@@ -60,7 +60,7 @@ describe("Agent runtime secret sentinel", () => {
           speaker: { actorId: "human-sentinel", kind: "human" },
           content: "safe",
         }],
-        projectContext: { status: "disabled" },
+        projectContext: { status: "disabled", reason: "ft09_not_delivered" },
         availableTools: [],
         openItemTargets: [],
         committedSteps: [],

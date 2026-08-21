@@ -151,7 +151,7 @@ const providerInput = async (value: AgentExecution, invocation: AgentInvocationI
     content: "bounded",
     speaker: { actorId: value.requesterId, kind: "human" },
   }],
-  projectContext: { status: "disabled" },
+  projectContext: { status: "disabled", reason: "ft09_not_delivered" },
   availableTools: [],
   committedSteps: [],
   limits: { maxInputBytes: 1_024, maxOutputTokens: 256, maxOutputBytes: 1_024, timeoutMs: 5_000 },

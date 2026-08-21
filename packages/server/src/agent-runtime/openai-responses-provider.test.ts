@@ -52,12 +52,13 @@ const input: CompiledProviderEnvelopeV1 = {
     },
     {
       kind: "memory",
+      memoryKind: "decision",
       trust: "untrusted_group_content",
       source: { label: "memory-1", kind: "memory", revision: 2 },
       content: "Room memory body.",
     },
   ],
-  projectContext: { status: "disabled" },
+  projectContext: { status: "disabled", reason: "ft09_not_delivered" },
   availableTools: [{
     id: "room-memory.read",
     displayName: "Read Room memory source",

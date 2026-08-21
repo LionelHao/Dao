@@ -1,5 +1,6 @@
 import type {
   AgentInvocationIntent,
+  AgentRuntimeProviderInput,
   ProviderNeutralCheckpoint,
   ToolDescriptor,
 } from "@native-im/core";
@@ -59,6 +60,7 @@ export interface CompiledGroupContentBlockV1 {
     revision: number;
   }>;
   readonly content: string;
+  readonly memoryKind?: "goal" | "decision" | "context" | "next_action" | "open_question_or_blocker";
   readonly speaker?: Readonly<{ actorId: string; kind: "human" | "agent" }>;
   readonly serverTime?: string;
   readonly replyTo?: Readonly<{ messageId: string; revision: number }>;
@@ -80,7 +82,7 @@ export interface CompiledProviderEnvelopeV1 {
     developer: readonly CompiledTrustedDeveloperBlockV1[];
   }>;
   readonly groupContent: readonly CompiledGroupContentBlockV1[];
-  readonly projectContext: Readonly<{ status: "disabled" | "unavailable" }>;
+  readonly projectContext: AgentRuntimeProviderInput["projectContext"];
   readonly availableTools: readonly CompiledProviderToolDescriptorV1[];
   readonly openItemTargets?: readonly Readonly<{ actorId: string; kind: "human" | "agent" }>[];
   readonly committedSteps: readonly ProviderNeutralCheckpoint[];
@@ -193,10 +195,14 @@ function isMention(value: unknown): value is NonNullable<CompiledGroupContentBlo
 
 function isGroupBlock(value: unknown): value is CompiledGroupContentBlockV1 {
   if (!record(value) || !exact(value, ["kind", "trust", "source", "content"], [
-    "speaker", "serverTime", "replyTo", "mentions",
+    "memoryKind", "speaker", "serverTime", "replyTo", "mentions",
   ]) || !groupKinds.has(value.kind as CompiledGroupContentKindV1) ||
       value.trust !== "untrusted_group_content" || !isSource(value.source) ||
       typeof value.content !== "string" || value.content.length > 262_144) return false;
+  if (Object.hasOwn(value, "memoryKind") &&
+      !["goal", "decision", "context", "next_action", "open_question_or_blocker"]
+        .includes(String(value.memoryKind))) return false;
+  if ((value.kind === "memory") !== Object.hasOwn(value, "memoryKind")) return false;
   if (Object.hasOwn(value, "speaker") && !isSpeaker(value.speaker)) return false;
   if (Object.hasOwn(value, "serverTime") && (typeof value.serverTime !== "string" ||
       !Number.isFinite(Date.parse(value.serverTime)))) return false;
@@ -215,6 +221,29 @@ function isGroupBlock(value: unknown): value is CompiledGroupContentBlockV1 {
   if (value.kind === "human_message" && (!isSpeaker(value.speaker) || value.speaker.kind !== "human")) return false;
   if (value.kind === "agent_message" && (!isSpeaker(value.speaker) || value.speaker.kind !== "agent")) return false;
   return true;
+}
+
+function isProjectContext(value: unknown): value is AgentRuntimeProviderInput["projectContext"] {
+  if (!record(value)) return false;
+  if (value.status === "disabled" || value.status === "unavailable") {
+    return exact(value, ["status", "reason"]) && text(value.reason);
+  }
+  if (value.status !== "available" || !exact(value, [
+    "status", "projectId", "revision", "representation", "disposition", "citationLabel", "sourceRefs",
+  ]) || !text(value.projectId) || !positive(value.revision) ||
+      !["included", "excerpted", "segmented", "digested", "index_only", "omitted", "unavailable", "invalidated"]
+        .includes(String(value.disposition)) ||
+      !(value.citationLabel === null || text(value.citationLabel)) || !Array.isArray(value.sourceRefs) ||
+      value.sourceRefs.length === 0 || !value.sourceRefs.every((source) => record(source) && exact(source, [
+        "roomId", "sourceKind", "sourceId", "revision", "corpusSeq",
+      ]) && text(source.roomId) && sourceKinds.has(source.sourceKind as CompiledGroupContentBlockV1["source"]["kind"]) &&
+        text(source.sourceId) && positive(source.revision) &&
+        (source.corpusSeq === null || nonnegative(source.corpusSeq)))) return false;
+  if (value.representation === null) return value.citationLabel === null;
+  return record(value.representation) && exact(value.representation, ["kind", "text"]) &&
+    ["content", "excerpt", "segment", "digest", "index"].includes(String(value.representation.kind)) &&
+    typeof value.representation.text === "string" && value.representation.text.length <= 262_144 &&
+    value.citationLabel !== null;
 }
 
 function isTool(value: unknown): value is CompiledProviderToolDescriptorV1 {
@@ -260,8 +289,7 @@ export function isCompiledProviderEnvelopeV1(value: unknown): value is CompiledP
       !value.trusted.system.every(isSystemBlock) || !Array.isArray(value.trusted.developer) ||
       !value.trusted.developer.every(isDeveloperBlock)) return false;
   if (!Array.isArray(value.groupContent) || !value.groupContent.every(isGroupBlock) ||
-      !record(value.projectContext) || !exact(value.projectContext, ["status"]) ||
-      (value.projectContext.status !== "disabled" && value.projectContext.status !== "unavailable") ||
+      !isProjectContext(value.projectContext) ||
       !Array.isArray(value.availableTools) || !value.availableTools.every(isTool) ||
       new Set(value.availableTools.map((tool) => tool.id)).size !== value.availableTools.length ||
       !Array.isArray(value.committedSteps) || !value.committedSteps.every(isCheckpoint)) return false;
