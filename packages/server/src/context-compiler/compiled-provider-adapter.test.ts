@@ -79,14 +79,16 @@ function compilerInput(): ContextCompilerInputV1 {
 
 describe("compiled context to Provider adapter", () => {
   it("preserves closed identity/source semantics and emits no legacy conversation window", () => {
-    const result = compileContextV1(compilerInput(), {
+    const compilerConfig = {
       ...CONTEXT_COMPILER_CONFIG_V1,
       modelId: "configured-model",
-    });
+    };
+    const result = compileContextV1(compilerInput(), compilerConfig);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     const provider = buildCompiledProviderEnvelopeV1({
       result,
+      compilerConfig,
       snapshotId: "snapshot-1",
       snapshotGeneration: 1,
       invocation: {
@@ -127,6 +129,7 @@ describe("compiled context to Provider adapter", () => {
     if (!result.ok) return;
     expect(() => buildCompiledProviderEnvelopeV1({
       result: { ...result, envelopeSha256: "0".repeat(64) },
+      compilerConfig: CONTEXT_COMPILER_CONFIG_V1,
       snapshotId: "snapshot-1",
       snapshotGeneration: 1,
       invocation: {

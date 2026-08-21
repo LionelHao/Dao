@@ -2,6 +2,7 @@ import type {
   AgentInvocationIntent,
   AgentRuntimeProviderInput,
   ContextCompileResultV1,
+  ContextCompilerConfigV1,
   ProviderNeutralCheckpoint,
   ToolDescriptor,
 } from "@native-im/core";
@@ -16,6 +17,7 @@ type SuccessfulCompileResult = Extract<ContextCompileResultV1, { readonly ok: tr
 
 export interface CompiledProviderAdapterInputV1 {
   readonly result: SuccessfulCompileResult;
+  readonly compilerConfig: ContextCompilerConfigV1;
   readonly snapshotId: string;
   readonly snapshotGeneration: number;
   readonly invocation: AgentInvocationIntent;
@@ -125,7 +127,7 @@ function assertInvocation(
 export function buildCompiledProviderEnvelopeV1(
   input: CompiledProviderAdapterInputV1,
 ): CompiledProviderEnvelopeV1 {
-  if (!verifyContextCompileResultV1(input.result) || !input.result.ok) {
+  if (!verifyContextCompileResultV1(input.result, input.compilerConfig) || !input.result.ok) {
     throw new TypeError("Context compile result was not verified");
   }
   assertInvocation(input.result, input.invocation);
