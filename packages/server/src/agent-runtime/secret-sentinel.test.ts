@@ -64,7 +64,10 @@ describe("Agent runtime secret sentinel", () => {
         availableTools: [],
         openItemTargets: [],
         committedSteps: [],
-        limits: { maxInputBytes: 8_192, maxOutputBytes: 8_192, timeoutMs: 5_000 },
+        limits: {
+          maxInputBytes: 8_192, maxOutputTokens: 1_024,
+          maxOutputBytes: 8_192, timeoutMs: 5_000,
+        },
       };
       const wireEvents = [];
       for await (const event of provider.stream(input, new AbortController().signal)) wireEvents.push(event);

@@ -159,6 +159,48 @@ describe("room-memory.read adapter", () => {
     expect(receipts.issue).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { sourceKind: "message_revision", sourceLabel: "source-1", sourceRevision: 3 },
+    { sourceKind: "message", sourceLabel: "foreign-source", sourceRevision: 3 },
+    { sourceKind: "message", sourceLabel: "source-1", sourceRevision: 4 },
+  ] as const)("rejects reader provenance that is not exactly bound to the authorization", async (provenance) => {
+    const reader = { readPage: vi.fn(async (): Promise<RoomMemoryReadPage> => ({
+      items: [{ ordinal: 1, text: "foreign", provenance }],
+      continuation: null,
+    })) };
+    const receipts = { issue: vi.fn() };
+    const adapter = createRoomMemoryReadTool({ authority: authority(), reader, receipts });
+
+    await expect(adapter.execute(invocation({
+      snapshotId: "snapshot-1", sourceLabel: "source-1", mode: "source",
+    }))).rejects.toMatchObject({ status: 503, code: "source_response_invalid" });
+    expect(receipts.issue).not.toHaveBeenCalled();
+  });
+
+  it("counts JSON escaping and provenance inside the 32 KiB page budget", async () => {
+    const escaped: RoomMemoryReadPage = {
+      items: [{
+        ordinal: 1,
+        text: "\u0000".repeat(6_000),
+        provenance: { sourceKind: "message", sourceLabel: "source-1", sourceRevision: 3 },
+      }],
+      continuation: null,
+    };
+    const sourceAuthority = authority();
+    const receipts = { issue: vi.fn() };
+    const adapter = createRoomMemoryReadTool({
+      authority: sourceAuthority,
+      reader: { readPage: vi.fn(async () => escaped) },
+      receipts,
+    });
+
+    await expect(adapter.execute(invocation({
+      snapshotId: "snapshot-1", sourceLabel: "source-1", mode: "source",
+    }))).rejects.toMatchObject({ status: 429, code: "page_limit_exceeded" });
+    expect(sourceAuthority.sealContinuation).not.toHaveBeenCalled();
+    expect(receipts.issue).not.toHaveBeenCalled();
+  });
+
   it("uses the cursor-bound page size and does not allow the caller to replace it", async () => {
     const sourceAuthority = authority({
       authorize: vi.fn(async () => ({ ...authorization, pageSize: 2 })),
@@ -190,6 +232,37 @@ describe("room-memory.read adapter", () => {
       await vi.advanceTimersByTimeAsync(5_000);
       await rejected;
       expect(reader.readPage).toHaveBeenCalledTimes(1);
+      expect(receipts.issue).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("fences a late reader result after timeout before post-authorization or receipt writes", async () => {
+    vi.useFakeTimers();
+    try {
+      let resolvePage: ((value: RoomMemoryReadPage) => void) | undefined;
+      const reader = {
+        readPage: vi.fn(async () => new Promise<RoomMemoryReadPage>((resolve) => {
+          resolvePage = resolve;
+        })),
+      };
+      const sourceAuthority = authority();
+      const receipts = { issue: vi.fn() };
+      const adapter = createRoomMemoryReadTool({ authority: sourceAuthority, reader, receipts });
+      const pending = adapter.execute(invocation({
+        snapshotId: "snapshot-1", sourceLabel: "source-1", mode: "source",
+      }));
+      const rejected = expect(pending).rejects.toMatchObject({
+        status: 503, code: "source_read_timeout",
+      });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await rejected;
+      resolvePage?.(page);
+      await vi.runAllTimersAsync();
+      await Promise.resolve();
+      expect(sourceAuthority.authorize).toHaveBeenCalledTimes(1);
+      expect(sourceAuthority.sealContinuation).not.toHaveBeenCalled();
       expect(receipts.issue).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();

@@ -74,7 +74,10 @@ const input: CompiledProviderEnvelopeV1 = {
     }),
     modelInput: JSON.stringify({ type: "room-memory.read.result.v1", content: "bounded" }),
   }],
-  limits: { maxInputBytes: 65_536, maxOutputBytes: 262_144, timeoutMs: 5_000 },
+  limits: {
+    maxInputBytes: 65_536, maxOutputTokens: 8_192,
+    maxOutputBytes: 262_144, timeoutMs: 5_000,
+  },
 };
 
 function streamResponse(final: Readonly<{ body: string; citations: readonly string[] }>): Response {
@@ -115,9 +118,11 @@ describe("OpenAI Responses compiled-context adapter", () => {
       readonly tools: readonly Record<string, unknown>[];
       readonly parallel_tool_calls: boolean;
       readonly store: boolean;
+      readonly max_output_tokens: number;
     };
     expect(request.store).toBe(false);
     expect(request.parallel_tool_calls).toBe(false);
+    expect(request.max_output_tokens).toBe(8_192);
     expect(request.text).toEqual({
       format: { type: "json_schema", name: "AgentFinalDraftV1", strict: true, schema: AGENT_FINAL_DRAFT_SCHEMA },
     });
@@ -125,7 +130,7 @@ describe("OpenAI Responses compiled-context adapter", () => {
     expect(request.input[1]).toMatchObject({ role: "developer" });
     expect(JSON.stringify(request.input[1])).toContain("room.active");
     expect(request.input[2]).toMatchObject({ role: "user" });
-    expect(request.input[3]).toMatchObject({ role: "assistant" });
+    expect(request.input[3]).toMatchObject({ role: "user" });
     expect(request.input[4]).toMatchObject({ role: "user" });
     expect(JSON.stringify(request.input[0])).not.toContain("Ignore the system");
     expect(JSON.stringify(request.input[1])).not.toContain("Ignore the system");
@@ -265,5 +270,33 @@ describe("OpenAI Responses compiled-context adapter", () => {
     expect(thrown).toMatchObject({ code: "provider_rate_limited" });
     expect(JSON.stringify(thrown)).not.toContain(sentinel);
     expect(String(thrown)).not.toContain(sentinel);
+  });
+
+  it("cancels an unfinished response body when output exceeds its bound", async () => {
+    const cancel = vi.fn();
+    const oversized = "x".repeat(input.limits.maxOutputBytes + 1);
+    const responseBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode([
+          'event: response.created\ndata: {"type":"response.created"}\n\n',
+          `event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":${JSON.stringify(oversized)}}\n\n`,
+        ].join("")));
+      },
+      cancel,
+    });
+    const provider = createOpenAIResponsesProvider({
+      endpoint: "https://api.openai.com/v1/responses", model: "configured-model",
+      secretProvider: { getSecret: () => "server-secret" },
+      maxSseBufferBytes: 1_048_576,
+      fetch: async () => new Response(responseBody, {
+        status: 200, headers: { "content-type": "text/event-stream" },
+      }),
+    });
+    const consume = async (): Promise<void> => {
+      for await (const _event of provider.stream(input, new AbortController().signal)) void _event;
+    };
+
+    await expect(consume()).rejects.toMatchObject({ code: "provider_malformed" });
+    expect(cancel).toHaveBeenCalledTimes(1);
   });
 });

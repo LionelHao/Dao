@@ -28,7 +28,10 @@ describe("opt-in OpenAI Responses live smoke", () => {
       }],
       availableTools: [],
       committedSteps: [],
-      limits: { maxInputBytes: 16 * 1_024, maxOutputBytes: 16 * 1_024, timeoutMs: 30_000 },
+      limits: {
+        maxInputBytes: 16 * 1_024, maxOutputTokens: 2_048,
+        maxOutputBytes: 16 * 1_024, timeoutMs: 30_000,
+      },
     };
     const events = [];
     for await (const event of provider.stream(input, AbortSignal.timeout(30_000))) {

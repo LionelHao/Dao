@@ -92,8 +92,8 @@ function functionParameters(tool: CompiledProviderToolDescriptorV1): Readonly<Re
   return { type: "object", properties: {}, additionalProperties: false };
 }
 
-function groupRole(block: CompiledGroupContentBlockV1): "user" | "assistant" {
-  return block.kind === "agent_message" ? "assistant" : "user";
+function groupRole(_block: CompiledGroupContentBlockV1): "user" {
+  return "user";
 }
 
 function buildProviderInput(input: CompiledProviderEnvelopeV1): unknown[] {
@@ -148,13 +148,18 @@ function buildProviderInput(input: CompiledProviderEnvelopeV1): unknown[] {
 
 async function* responseBodyChunks(body: ReadableStream<Uint8Array>): AsyncIterable<Uint8Array> {
   const reader = body.getReader();
+  let completed = false;
   try {
     while (true) {
       const next = await reader.read();
-      if (next.done) return;
+      if (next.done) {
+        completed = true;
+        return;
+      }
       yield next.value;
     }
   } finally {
+    if (!completed) await reader.cancel().catch(() => undefined);
     reader.releaseLock();
   }
 }
@@ -214,6 +219,7 @@ export function createOpenAIResponsesProvider(
         model,
         stream: true,
         store: false,
+        max_output_tokens: input.limits.maxOutputTokens,
         parallel_tool_calls: false,
         input: buildProviderInput(input),
         tools: [

@@ -92,6 +92,7 @@ export interface CompiledProviderEnvelopeV1 {
   }>[];
   readonly limits: Readonly<{
     maxInputBytes: number;
+    maxOutputTokens: number;
     maxOutputBytes: number;
     timeoutMs: number;
   }>;
@@ -269,8 +270,11 @@ export function isCompiledProviderEnvelopeV1(value: unknown): value is CompiledP
         text(target.actorId) && (target.kind === "human" || target.kind === "agent")))) return false;
   if (Object.hasOwn(value, "toolContinuations") && (!Array.isArray(value.toolContinuations) ||
       !value.toolContinuations.every(isContinuation))) return false;
-  return record(value.limits) && exact(value.limits, ["maxInputBytes", "maxOutputBytes", "timeoutMs"]) &&
+  return record(value.limits) && exact(value.limits, [
+    "maxInputBytes", "maxOutputTokens", "maxOutputBytes", "timeoutMs",
+  ]) &&
     positive(value.limits.maxInputBytes) && value.limits.maxInputBytes <= 262_144 &&
+    positive(value.limits.maxOutputTokens) && value.limits.maxOutputTokens <= 65_536 &&
     positive(value.limits.maxOutputBytes) && value.limits.maxOutputBytes <= 262_144 &&
     positive(value.limits.timeoutMs) && value.limits.timeoutMs <= 120_000;
 }

@@ -202,7 +202,12 @@ function sameAuthorization(left: RoomMemoryReadAuthorization, right: RoomMemoryR
     left.readerCapability === right.readerCapability;
 }
 
-function validatePage(page: RoomMemoryReadPage, pageSize: number): number {
+function validatePage(
+  page: RoomMemoryReadPage,
+  pageSize: number,
+  authorization: RoomMemoryReadAuthorization,
+  mode: Exclude<RoomMemoryReadMode, "project_object">,
+): Readonly<{ canonicalItems: string; itemBytes: number; budgetBytes: number }> {
   if (!record(page) || !exact(page, ["items", "continuation"]) || !Array.isArray(page.items) ||
       page.items.length === 0 || page.items.length > pageSize ||
       page.items.length > ROOM_MEMORY_READ_LIMITS.maximumPageItems ||
@@ -216,15 +221,36 @@ function validatePage(page: RoomMemoryReadPage, pageSize: number): number {
         !exact(item.provenance, ["sourceKind", "sourceLabel", "sourceRevision"]) ||
         !["message", "message_revision", "message_tombstone", "attachment_extraction", "memory", "project_fact_checkpoint"]
           .includes(String(item.provenance.sourceKind)) || !identifier(item.provenance.sourceLabel) ||
-        !positive(item.provenance.sourceRevision)) {
+        !positive(item.provenance.sourceRevision) ||
+        item.provenance.sourceKind !== authorization.sourceKind ||
+        item.provenance.sourceLabel !== authorization.sourceLabel ||
+        item.provenance.sourceRevision !== authorization.sourceRevision) {
       throw new RoomMemoryReadError(503, "source_response_invalid");
     }
     pageBytes += Buffer.byteLength(item.text, "utf8");
   }
-  if (pageBytes > ROOM_MEMORY_READ_LIMITS.maximumPageBytes) {
+  const canonicalItems = JSON.stringify(page.items);
+  const itemBytes = Buffer.byteLength(canonicalItems, "utf8");
+  const worstCasePayload = JSON.stringify({
+    type: "room-memory.read.result.v1",
+    snapshotId: authorization.snapshotId,
+    sourceLabel: authorization.sourceLabel,
+    mode,
+    sourceRevision: authorization.sourceRevision,
+    items: page.items,
+    nextCursor: "x".repeat(ROOM_MEMORY_READ_LIMITS.maximumCursorLength),
+    citationLabel: "x".repeat(256),
+  });
+  const budgetBytes = Buffer.byteLength(worstCasePayload, "utf8");
+  if (pageBytes > ROOM_MEMORY_READ_LIMITS.maximumPageBytes ||
+      budgetBytes > ROOM_MEMORY_READ_LIMITS.maximumPageBytes) {
     throw new RoomMemoryReadError(429, "page_limit_exceeded");
   }
-  return pageBytes;
+  return Object.freeze({ canonicalItems, itemBytes, budgetBytes });
+}
+
+function requireActive(signal: AbortSignal): void {
+  if (signal.aborted) throw new RoomMemoryReadError(503, "source_read_timeout");
 }
 
 async function withinDeadline<T>(
@@ -281,6 +307,7 @@ export function createRoomMemoryReadTool(options: Readonly<{
           if (isRoomMemoryReadError(error)) throw error;
           throw new RoomMemoryReadError(503, "authority_unavailable");
         }
+        requireActive(signal);
         validateAuthorization(initial, invocation, parameters);
         if (initial.callCount >= ROOM_MEMORY_READ_LIMITS.maximumExecutionCalls ||
             initial.cumulativeBytes >= ROOM_MEMORY_READ_LIMITS.maximumExecutionBytes) {
@@ -303,6 +330,7 @@ export function createRoomMemoryReadTool(options: Readonly<{
           if (isRoomMemoryReadError(error)) throw error;
           throw new RoomMemoryReadError(503, "source_unavailable");
         }
+        requireActive(signal);
         let current: RoomMemoryReadAuthorization;
         try {
           current = await options.authority.authorize({
@@ -319,35 +347,42 @@ export function createRoomMemoryReadTool(options: Readonly<{
           if (isRoomMemoryReadError(error)) throw error;
           throw new RoomMemoryReadError(503, "authority_unavailable");
         }
+        requireActive(signal);
         validateAuthorization(current, invocation, parameters);
         if (!sameAuthorization(initial, current)) throw new RoomMemoryReadError(409, "stale_context");
 
-        const pageBytes = validatePage(page, initial.pageSize);
-        if (initial.cumulativeBytes + pageBytes > ROOM_MEMORY_READ_LIMITS.maximumExecutionBytes) {
+        const pageAccounting = validatePage(page, initial.pageSize, initial, parameters.mode);
+        if (initial.cumulativeBytes + pageAccounting.budgetBytes >
+            ROOM_MEMORY_READ_LIMITS.maximumExecutionBytes) {
           throw new RoomMemoryReadError(429, "read_budget_exhausted");
         }
 
         let nextCursor: string | null;
+        requireActive(signal);
         try {
           nextCursor = await options.authority.sealContinuation({
             authorization: current,
             continuation: page.continuation,
-            pageBytes,
+            pageBytes: pageAccounting.budgetBytes,
             signal,
           });
         } catch (error: unknown) {
           if (isRoomMemoryReadError(error)) throw error;
           throw new RoomMemoryReadError(503, "authority_unavailable");
         }
+        requireActive(signal);
         if (nextCursor !== null && !identifier(nextCursor, ROOM_MEMORY_READ_LIMITS.maximumCursorLength)) {
           throw new RoomMemoryReadError(503, "authority_unavailable");
         }
 
-        const canonicalItems = JSON.stringify(page.items);
-        const range = parameters.cursor === undefined
-          ? `page:${initial.callCount + 1}`
-          : `cursor-page:${initial.callCount + 1}`;
+        const firstOrdinal = page.items[0]!.ordinal;
+        const lastOrdinal = page.items.at(-1)!.ordinal;
+        const cursorBinding = parameters.cursor === undefined
+          ? "initial"
+          : createHash("sha256").update(parameters.cursor, "utf8").digest("hex").slice(0, 16);
+        const range = `items:${firstOrdinal}-${lastOrdinal};cursor:${cursorBinding}`;
         let issued: Readonly<{ citationLabel: string }>;
+        requireActive(signal);
         try {
           issued = await options.receipts.issue({
             roomId: initial.roomId,
@@ -361,13 +396,14 @@ export function createRoomMemoryReadTool(options: Readonly<{
             authorizationEpoch: initial.authorizationEpoch,
             representation: parameters.mode,
             range,
-            contentSha256: createHash("sha256").update(canonicalItems, "utf8").digest("hex"),
-            contentBytes: pageBytes,
+            contentSha256: createHash("sha256").update(pageAccounting.canonicalItems, "utf8").digest("hex"),
+            contentBytes: pageAccounting.itemBytes,
           });
         } catch (error: unknown) {
           void error;
           throw new RoomMemoryReadError(503, "receipt_unavailable");
         }
+        requireActive(signal);
         if (!identifier(issued.citationLabel)) throw new RoomMemoryReadError(503, "receipt_unavailable");
         const modelResult = {
           type: "room-memory.read.result.v1",
@@ -379,8 +415,15 @@ export function createRoomMemoryReadTool(options: Readonly<{
           nextCursor,
           citationLabel: issued.citationLabel,
         } as const;
+        if (Buffer.byteLength(JSON.stringify(modelResult), "utf8") >
+            ROOM_MEMORY_READ_LIMITS.maximumPageBytes) {
+          throw new RoomMemoryReadError(429, "page_limit_exceeded");
+        }
         return Object.freeze({
-          summary: Object.freeze({ outcome: "succeeded", itemCount: page.items.length, pageBytes }),
+          summary: Object.freeze({
+            outcome: "succeeded", itemCount: page.items.length,
+            pageBytes: pageAccounting.budgetBytes,
+          }),
           modelInput: JSON.stringify(modelResult),
         });
       });
