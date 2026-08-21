@@ -1113,7 +1113,7 @@ describe("v19 Context Snapshot database authority", () => {
           snapshotId: "context-snapshot", snapshotGeneration: 1,
           executionId: "context-execution", attemptSeq: 1,
           expectedExecutionGeneration: 1, messageId: "context-final",
-          citationLabels: [receipt.citationLabel], committedAt: NOW,
+          citationLabels: ["ctx-0001", receipt.citationLabel], committedAt: NOW,
         });
         database.exec(`
           UPDATE agent_execution_attempts SET status = 'completed', finished_at = '${NOW}'
@@ -1126,12 +1126,20 @@ describe("v19 Context Snapshot database authority", () => {
         `);
       });
       expect(database.prepare(`
-        SELECT citation_label_sha256 AS citationLabelSha256, receipt_id AS receiptId
+        SELECT ordinal, citation_label_sha256 AS citationLabelSha256,
+               receipt_id AS receiptId, manifest_item_ordinal AS manifestItemOrdinal
         FROM agent_message_citations WHERE message_id = 'context-final'
-      `).get()).toEqual({
-        citationLabelSha256: sha256(receipt.citationLabel),
-        receiptId: receipt.receiptId,
-      });
+        ORDER BY ordinal
+      `).all()).toEqual([
+        {
+          ordinal: 0, citationLabelSha256: sha256("ctx-0001"),
+          receiptId: null, manifestItemOrdinal: 0,
+        },
+        {
+          ordinal: 1, citationLabelSha256: sha256(receipt.citationLabel),
+          receiptId: receipt.receiptId, manifestItemOrdinal: null,
+        },
+      ]);
       database.exec("PRAGMA wal_checkpoint(FULL)");
       const databasePath = String(database.prepare("PRAGMA database_list").get()?.file);
       for (const path of [databasePath, `${databasePath}-wal`, `${databasePath}-shm`]) {
@@ -1558,6 +1566,42 @@ describe("v19 Context Snapshot database authority", () => {
     } finally {
       if (database.isOpen) database.close();
       rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("returns the immutable invocation intent for every crash-recovered execution kind", async () => {
+    for (const kind of ["direct_mention", "structured_help", "routed_candidate"] as const) {
+      const directory = mkdtempSync(join(tmpdir(), `dao-context-intent-${kind}-`));
+      const databasePath = join(directory, "authority.sqlite");
+      const database = new DatabaseSync(databasePath);
+      try {
+        migrateAuthorityDatabase(database);
+        seedExecution(database, "active");
+        database.prepare(
+          "UPDATE agent_invocation_intents SET intent_kind = ? WHERE id = 'context-intent'",
+        ).run(kind);
+      } finally {
+        database.close();
+      }
+      const worker = await createWorkerDatabaseClient({ databasePath });
+      try {
+        await expect(worker.executeRuntime({
+          type: "runtime.recover", now: NOW_MS + 1_000,
+        })).resolves.toMatchObject({
+          kind: "recovery",
+          records: [{
+            outcome: "enqueue",
+            execution: { id: "context-execution", status: "queued", currentAttemptSeq: 2 },
+            intent: {
+              kind, roomId: "context-room", sourceMessageId: "context-trigger",
+              targetAgentId: "context-agent",
+            },
+          }],
+        });
+      } finally {
+        await worker.close();
+        rmSync(directory, { recursive: true, force: true });
+      }
     }
   });
 

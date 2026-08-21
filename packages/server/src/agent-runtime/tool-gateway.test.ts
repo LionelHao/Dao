@@ -140,7 +140,7 @@ describe("tool gateway authority fence", () => {
       grantId: "grant-1", toolId: "room-memory.read",
       parameters: { snapshotId: "snapshot-1", sourceLabel: "source-1", mode: "source" },
       signal: new AbortController().signal,
-    })).rejects.toMatchObject({ status: 410, code: "source_gone" });
+    })).rejects.toMatchObject({ status: 410, code: "context_source_gone" });
     expect(runtimeAuthority.settleTool).toHaveBeenCalledWith(
       "dispatch-room-memory", "failed", { outcome: "failed" },
     );

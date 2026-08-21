@@ -178,6 +178,9 @@ export function buildCompiledProviderEnvelopeV1(
     ...(input.toolContinuations === undefined ? {} : { toolContinuations: input.toolContinuations }),
     limits: {
       maxInputBytes: 262_144,
+      compiledInputTokens: envelope.accounting.inputTokens,
+      maxContextInputTokens: input.compilerConfig.hardLimitTokens -
+        input.compilerConfig.outputReserveTokens - input.compilerConfig.toolSchemaBudgetTokens,
       maxOutputTokens: envelope.accounting.outputReserveTokens,
       maxOutputBytes: 262_144,
       timeoutMs: input.timeoutMs,

@@ -5,6 +5,7 @@ import {
   isRoomMemoryRawDeltaPage,
   isRoomMemoryStatus,
   type AgentExecution,
+  type AgentInvocationIntent,
 } from "@native-im/core";
 import type { AuthenticatedCommandContext, InternalAgentCommandContext } from "../persistence/contracts.js";
 import { toAgentWorkerCommandContext } from "../persistence/contracts.js";
@@ -17,7 +18,7 @@ import { canonicalJsonV1 } from "../context-compiler/canonical-json.js";
 import {
   AgentRuntimeError,
   type AgentRuntimeErrorCode,
-  type InvocationAccepted,
+  type InvocationAcceptedWithIntent,
   type RuntimeAuthority,
 } from "./contracts.js";
 
@@ -65,11 +66,23 @@ function executionResult(value: unknown): AgentExecution {
   return value.execution;
 }
 
-function invocationResult(value: unknown): InvocationAccepted {
-  if (!record(value) || value.kind !== "invocation" || typeof value.replayed !== "boolean" || !isAgentExecution(value.execution)) {
+function invocationIntent(value: unknown): value is AgentInvocationIntent {
+  return record(value) &&
+    (value.kind === "direct_mention" || value.kind === "structured_help" ||
+      value.kind === "routed_candidate") &&
+    typeof value.roomId === "string" && typeof value.sourceMessageId === "string" &&
+    typeof value.targetAgentId === "string";
+}
+
+function invocationResult(value: unknown): InvocationAcceptedWithIntent {
+  if (!record(value) || value.kind !== "invocation" || typeof value.replayed !== "boolean" ||
+      !isAgentExecution(value.execution) || !invocationIntent(value.intent) ||
+      value.intent.roomId !== value.execution.roomId ||
+      value.intent.sourceMessageId !== value.execution.sourceMessageId ||
+      value.intent.targetAgentId !== value.execution.agentId) {
     throw new AgentRuntimeError("provider_failure", "Authority invocation result was malformed");
   }
-  return { execution: value.execution, replayed: value.replayed };
+  return { execution: value.execution, intent: value.intent, replayed: value.replayed };
 }
 
 function fenceReplacementResult(
@@ -331,6 +344,9 @@ export function createWorkerRuntimeAuthority(
       const result = await execute({ type: "runtime.recover", now: Date.now() });
       if (!record(result) || result.kind !== "recovery" || !Array.isArray(result.records) ||
           !result.records.every((entry) => record(entry) && isAgentExecution(entry.execution) &&
+            invocationIntent(entry.intent) && entry.intent.roomId === entry.execution.roomId &&
+            entry.intent.sourceMessageId === entry.execution.sourceMessageId &&
+            entry.intent.targetAgentId === entry.execution.agentId &&
             (entry.outcome === "enqueue" || entry.outcome === "failed" || entry.outcome === "fail_outcome_unknown" || entry.outcome === "wait_confirmation"))) {
         throw new AgentRuntimeError("provider_failure", "Authority recovery result was malformed");
       }
@@ -420,6 +436,7 @@ export function createWorkerRuntimeAuthority(
             dispatched.dispatchId !== dispatchId) {
           throw new AgentRuntimeError("provider_failure", "Source read dispatch was malformed");
         }
+        sourceGrants.delete(grantId);
         sourceDispatches.add(dispatchId);
         return { dispatchId, toolId: "room-memory.read", parameters };
       }

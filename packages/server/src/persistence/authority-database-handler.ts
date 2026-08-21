@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type {
   AgentExecution,
+  AgentInvocationIntent,
   Actor,
   HumanMessageSubmit,
   MessageTargetOutcome,
@@ -4822,6 +4823,31 @@ function runtimeExecutionById(database: DatabaseSync, executionId: string): Agen
   return execution;
 }
 
+function runtimeInvocationIntentByExecution(
+  database: DatabaseSync,
+  executionId: string,
+): AgentInvocationIntent {
+  const row = database.prepare(
+    `SELECT intent.intent_kind AS kind, intent.room_id AS roomId,
+            intent.source_message_id AS sourceMessageId,
+            intent.target_agent_id AS targetAgentId
+     FROM agent_execution_intent_links AS link
+     JOIN agent_invocation_intents AS intent ON intent.id = link.intent_id
+     WHERE link.execution_id = ?`,
+  ).get(executionId);
+  if ((row?.kind !== "direct_mention" && row?.kind !== "structured_help" &&
+       row?.kind !== "routed_candidate") || typeof row.roomId !== "string" ||
+      typeof row.sourceMessageId !== "string" || typeof row.targetAgentId !== "string") {
+    return fail("storage_unavailable", "Agent invocation intent lineage was corrupt");
+  }
+  return {
+    kind: row.kind,
+    roomId: row.roomId,
+    sourceMessageId: row.sourceMessageId,
+    targetAgentId: row.targetAgentId,
+  };
+}
+
 export function readContextFinalExecution(
   database: DatabaseSync,
   executionId: string,
@@ -6035,7 +6061,11 @@ export function executeRuntimeAuthorityOperation(
              WHERE source_message_id = ? AND target_agent_id = ?`,
           ).run(operation.intent.sourceMessageId, operation.intent.targetAgentId);
         }
-        return { kind: "invocation", execution: runtimeExecutionById(database, existing.executionId), replayed: true };
+        const execution = runtimeExecutionById(database, existing.executionId);
+        return {
+          kind: "invocation", execution,
+          intent: runtimeInvocationIntentByExecution(database, execution.id), replayed: true,
+        };
       }
       const queued = database.prepare(
         `SELECT COUNT(*) AS count FROM agent_executions WHERE room_id = ? AND status = 'queued'`,
@@ -6097,7 +6127,7 @@ export function executeRuntimeAuthorityOperation(
       });
       const execution = runtimeExecutionById(database, operation.executionId);
       appendRuntimeExecutionEvent(database, execution, occurredAt, "queued");
-      return { kind: "invocation", execution, replayed: false };
+      return { kind: "invocation", execution, intent: operation.intent, replayed: false };
     }
 
     if (operation.type === "runtime.invoke-routed") {
@@ -6148,7 +6178,11 @@ export function executeRuntimeAuthorityOperation(
              WHERE source_message_id = ? AND target_agent_id = ?`,
           ).run(operation.intent.sourceMessageId, operation.intent.targetAgentId);
         }
-        return { kind: "invocation", execution: runtimeExecutionById(database, existing.executionId), replayed: true };
+        const execution = runtimeExecutionById(database, existing.executionId);
+        return {
+          kind: "invocation", execution,
+          intent: runtimeInvocationIntentByExecution(database, execution.id), replayed: true,
+        };
       }
       const queued = database.prepare(
         `SELECT COUNT(*) AS count FROM agent_executions WHERE room_id = ? AND status = 'queued'`,
@@ -6210,7 +6244,7 @@ export function executeRuntimeAuthorityOperation(
       });
       const execution = runtimeExecutionById(database, operation.executionId);
       appendRuntimeExecutionEvent(database, execution, occurredAt, "queued");
-      return { kind: "invocation", execution, replayed: false };
+      return { kind: "invocation", execution, intent: operation.intent, replayed: false };
     }
 
     if (operation.type === "runtime.claim") {
@@ -6487,7 +6521,11 @@ export function executeRuntimeAuthorityOperation(
           existing.id,
           stableId("runtime-manual-retry-replay-gate", existing.id),
         );
-        return { kind: "invocation", execution: runtimeExecutionById(database, existing.id), replayed: true };
+        const execution = runtimeExecutionById(database, existing.id);
+        return {
+          kind: "invocation", execution,
+          intent: runtimeInvocationIntentByExecution(database, execution.id), replayed: true,
+        };
       }
       const roomArchiveGeneration = currentRoomArchiveGeneration(database, old.roomId);
       requireRuntimeGenerationAllowed(
@@ -6520,7 +6558,10 @@ export function executeRuntimeAuthorityOperation(
       ).run(operation.newExecutionId);
       const execution = runtimeExecutionById(database, operation.newExecutionId);
       appendRuntimeExecutionEvent(database, execution, occurredAt, "manual-retry-queued");
-      return { kind: "invocation", execution, replayed: false };
+      return {
+        kind: "invocation", execution,
+        intent: runtimeInvocationIntentByExecution(database, execution.id), replayed: false,
+      };
     }
 
     if (operation.type === "runtime.begin-compensation") {
@@ -7179,7 +7220,13 @@ export function executeRuntimeAuthorityOperation(
       }
       records.push({ execution: current, outcome: current.actionCategory === "waiting_upstream" ? "wait_confirmation" : "enqueue" });
     }
-    return { kind: "recovery", records };
+    return {
+      kind: "recovery",
+      records: records.map((record) => ({
+        ...record,
+        intent: runtimeInvocationIntentByExecution(database, record.execution.id),
+      })),
+    };
   });
 }
 

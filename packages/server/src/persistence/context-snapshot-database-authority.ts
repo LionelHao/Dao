@@ -716,11 +716,15 @@ function readCompilerInputFacts(database: DatabaseSync, row: PreparationRow): Co
             reply.reply_to_message_id AS replyToMessageId,
             reply_envelope.current_revision AS replyToRevision,
             (SELECT source.corpus_seq FROM room_memory_sources AS source
-             WHERE source.room_id = room.id AND source.source_id = message.id
+             WHERE source.room_id = room.id
+               AND source.source_kind IN ('message', 'message_revision')
+               AND json_extract(source.safe_metadata_json, '$.messageId') = message.id
                AND source.source_revision = trigger_revision.revision
              ORDER BY source.corpus_seq LIMIT 1) AS triggerCorpusSeq,
             (SELECT source.read_reference FROM room_memory_sources AS source
-             WHERE source.room_id = room.id AND source.source_id = message.id
+             WHERE source.room_id = room.id
+               AND source.source_kind IN ('message', 'message_revision')
+               AND json_extract(source.safe_metadata_json, '$.messageId') = message.id
                AND source.source_revision = trigger_revision.revision
              ORDER BY source.corpus_seq LIMIT 1) AS triggerReadReference
      FROM rooms AS room
@@ -837,11 +841,15 @@ function readCompilerInputFacts(database: DatabaseSync, row: PreparationRow): Co
      FROM room_memory_sources AS source
      LEFT JOIN message_revisions AS revision
        ON source.source_kind IN ('message', 'message_revision')
-      AND revision.message_id = source.source_id
+      AND revision.message_id = COALESCE(
+        json_extract(source.safe_metadata_json, '$.messageId'), source.source_id
+      )
       AND revision.revision = source.source_revision
      LEFT JOIN messages AS message
        ON source.source_kind IN ('message', 'message_revision', 'message_tombstone')
-      AND message.id = source.source_id
+      AND message.id = COALESCE(
+        json_extract(source.safe_metadata_json, '$.messageId'), source.source_id
+      )
      LEFT JOIN actors AS author ON author.id = message.author_id
      LEFT JOIN message_reply_links AS reply ON reply.message_id = message.id
      LEFT JOIN message_envelopes AS reply_envelope
@@ -859,7 +867,9 @@ function readCompilerInputFacts(database: DatabaseSync, row: PreparationRow): Co
             mention.range_start_utf16 AS rangeStartUtf16,
             mention.range_end_utf16 AS rangeEndUtf16, mention.target_order AS targetOrder
      FROM room_memory_sources AS source
-     JOIN message_mentions AS mention ON mention.message_id = source.source_id
+     JOIN message_mentions AS mention ON mention.message_id = COALESCE(
+       json_extract(source.safe_metadata_json, '$.messageId'), source.source_id
+     )
      WHERE source.room_id = ? AND source.corpus_seq > ? AND source.corpus_seq <= ?
      ORDER BY source.corpus_seq, mention.target_order
      LIMIT 4097`,
@@ -911,6 +921,17 @@ function readCompilerInputFacts(database: DatabaseSync, row: PreparationRow): Co
         ? "attachment_extraction"
         : kind === "project_fact_checkpoint" ? "project_fact_checkpoint"
           : kind === "memory" ? "memory" : "message_revision";
+  const sourceId = (
+    kind: string,
+    storedId: string,
+    metadata: Readonly<Record<string, unknown>>,
+  ): string => {
+    if ((kind === "message" || kind === "message_revision" || kind === "message_tombstone") &&
+        isText(metadata.messageId)) {
+      return metadata.messageId;
+    }
+    return storedId;
+  };
   const memoryAvailability: ContextCompilerInputV1["memories"][number]["availability"] =
     row.memoryHealth === "healthy" && row.memoryRecoveryRequired === 0
       ? "readable"
@@ -923,7 +944,7 @@ function readCompilerInputFacts(database: DatabaseSync, row: PreparationRow): Co
     source: {
       roomId: row.roomId,
       sourceKind: sourceKind(entry.sourceKind),
-      sourceId: entry.sourceId,
+      sourceId: sourceId(entry.sourceKind, entry.sourceId, entry.safeMetadata),
       revision: entry.sourceRevision,
       corpusSeq: entry.corpusSeq,
     },
@@ -1327,7 +1348,8 @@ function validateCompleteSourceSet(
         sourceKind,
         sourceId: item.sourceId,
         sourceRevision: item.sourceRevision,
-        currentlyRequired: sourceKind !== "message_tombstone",
+        currentlyRequired: sourceKind !== "message_tombstone" &&
+          item.availability !== "invalidated" && item.availability !== "unavailable",
         authorizationRevision: authorizationRevision(sourceKind, item.sourceId),
       };
       expected.set(key(binding), binding);
@@ -1337,18 +1359,23 @@ function validateCompleteSourceSet(
     sourceKind: ContextSnapshotSourceKind,
     sourceId: string,
     sourceRevision: number,
+    currentlyRequired: boolean,
   ): void => {
     const binding = {
       sourceLabel: null,
       sourceKind,
       sourceId,
       sourceRevision,
-      currentlyRequired: sourceKind !== "message_tombstone",
+      currentlyRequired: sourceKind !== "message_tombstone" && currentlyRequired,
       authorizationRevision: authorizationRevision(sourceKind, sourceId),
     };
-    if (!expected.has(key(binding))) expected.set(key(binding), binding);
+    const existing = expected.get(key(binding));
+    if (existing === undefined) expected.set(key(binding), binding);
+    else if (!existing.currentlyRequired && binding.currentlyRequired) {
+      expected.set(key(binding), { ...existing, currentlyRequired: true });
+    }
   };
-  addRaw("message_revision", preparation.triggerMessageId, preparation.triggerRevision);
+  addRaw("message_revision", preparation.triggerMessageId, preparation.triggerRevision, true);
   for (const delta of [
     ...preparation.compilerInputFacts.delta,
     ...preparation.compilerInputFacts.attachments,
@@ -1360,10 +1387,11 @@ function validateCompleteSourceSet(
             : "message_revision",
       delta.source.sourceId,
       delta.source.revision,
+      delta.availability === "readable" || delta.availability === "metadata_only",
     );
   }
   for (const memory of preparation.compilerInputFacts.memories) {
-    addRaw("memory", memory.memoryVersionId, memory.version);
+    addRaw("memory", memory.memoryVersionId, memory.version, memory.availability === "readable");
   }
   for (const range of operation.compilerResult.manifest.items) {
     if (range.source !== null) continue;
@@ -1604,7 +1632,9 @@ function insertSnapshot(database: DatabaseSync, operation: ContextSnapshotCommit
     }
   }
   for (const source of operation.sources) {
-    requireCurrentSource(database, { ...source, roomId: preparation.roomId });
+    if (source.currentlyRequired || source.sourceKind === "message_tombstone") {
+      requireCurrentSource(database, { ...source, roomId: preparation.roomId });
+    }
   }
   const createdAt = new Date(operation.now).toISOString();
   database.prepare(

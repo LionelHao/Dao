@@ -65,7 +65,8 @@ describe("Agent runtime secret sentinel", () => {
         openItemTargets: [],
         committedSteps: [],
         limits: {
-          maxInputBytes: 8_192, maxOutputTokens: 1_024,
+          maxInputBytes: 8_192, compiledInputTokens: 4_096,
+          maxContextInputTokens: 6_144, maxOutputTokens: 1_024,
           maxOutputBytes: 8_192, timeoutMs: 5_000,
         },
       };

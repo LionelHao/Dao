@@ -7,6 +7,7 @@ import type {
   ToolDescriptor,
 } from "@native-im/core";
 import type { AuthenticatedCommandContext, InternalAgentCommandContext } from "../persistence/contracts.js";
+import { canonicalJsonV1, compareUtf8 } from "../context-compiler/canonical-json.js";
 import {
   AGENT_RUNTIME_MAX_ACTIVE,
   AGENT_RUNTIME_MAX_ATTEMPTS,
@@ -150,7 +151,20 @@ function validateLimits(limits: RuntimeLimits): void {
 
 function transient(code: AgentRuntimeError["code"]): boolean {
   return code === "provider_rate_limited" || code === "provider_timeout" ||
-    code === "provider_unavailable" || code === "tool_target_busy";
+    code === "provider_unavailable" || code === "tool_target_busy" ||
+    code === "context_storage_unavailable";
+}
+
+function assertProviderInputBudget(input: AgentRuntimeProviderInput): void {
+  const continuationTokens = input.toolContinuations === undefined ? 0 :
+    Buffer.byteLength(canonicalJsonV1({ toolContinuations: input.toolContinuations }), "utf8");
+  if (input.limits.compiledInputTokens + continuationTokens >
+      input.limits.maxContextInputTokens) {
+    throw new AgentRuntimeError(
+      "content_too_large",
+      "Compiled context and tool continuations exceeded the deterministic input budget",
+    );
+  }
 }
 
 export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): AgentRuntimeService {
@@ -217,15 +231,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
       throw new AgentRuntimeError("execution_conflict", "Agent attempt was not runnable");
     }
     job.execution = claimed;
-    const baseInput = await options.buildProviderInput(claimed, job.intent, job.context);
-    const input: AgentRuntimeProviderInput = {
-      ...baseInput,
-      ...(job.toolContinuations.length === 0 ? {} : { toolContinuations: job.toolContinuations }),
-    };
-    if (!Number.isSafeInteger(input.limits.timeoutMs) || input.limits.timeoutMs < 1 || input.limits.timeoutMs > 30_000) {
-      throw new AgentRuntimeError("invalid_parameters", "Provider timeout limit was invalid");
-    }
-    const timeout = setTimeout(() => controller.abort("provider_timeout"), input.limits.timeoutMs);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     let partial = "";
     let finalDraft: Readonly<{ body: string; citations: readonly string[] }> | undefined;
     let sawStarted = false;
@@ -233,6 +239,17 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
     let lastSequence = 0;
     const toolCalls = new Map<string, { toolName: string; argumentsJson: string }>();
     try {
+      const baseInput = await options.buildProviderInput(claimed, job.intent, job.context);
+      const input: AgentRuntimeProviderInput = {
+        ...baseInput,
+        ...(job.toolContinuations.length === 0 ? {} : { toolContinuations: job.toolContinuations }),
+      };
+      assertProviderInputBudget(input);
+      if (!Number.isSafeInteger(input.limits.timeoutMs) || input.limits.timeoutMs < 1 ||
+          input.limits.timeoutMs > 30_000) {
+        throw new AgentRuntimeError("invalid_parameters", "Provider timeout limit was invalid");
+      }
+      timeout = setTimeout(() => controller.abort("provider_timeout"), input.limits.timeoutMs);
       for await (const event of options.provider.stream(input, controller.signal)) {
         if (event.sequence !== lastSequence + 1) {
           throw new AgentRuntimeError("provider_malformed", "Provider event sequence was invalid");
@@ -286,7 +303,10 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
           })) {
             throw new AgentRuntimeError("provider_malformed", "Provider final citations were invalid");
           }
-          finalDraft = Object.freeze({ body: event.body, citations: Object.freeze([...event.citations]) });
+          finalDraft = Object.freeze({
+            body: event.body,
+            citations: Object.freeze([...event.citations].sort(compareUtf8)),
+          });
         } else if (event.type === "completed") {
           if (!sawStarted || sawCompleted || finalDraft !== undefined) {
             throw new AgentRuntimeError("provider_malformed", "Provider completion order was invalid");
@@ -421,9 +441,13 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         await options.authority.scheduleRetry(claimed.id, claimed.currentAttemptSeq, runtimeError.code, undefined);
         return;
       }
-      const retryDelay = ordinal < AGENT_RUNTIME_MAX_ATTEMPTS
+      const configuredRetryDelay = ordinal < AGENT_RUNTIME_MAX_ATTEMPTS
         ? AGENT_RUNTIME_RETRY_DELAYS_MS[ordinal - 1]
         : undefined;
+      const retryDelay = configuredRetryDelay === undefined ? undefined
+        : Number.isSafeInteger(runtimeError.retryAfterMs) && runtimeError.retryAfterMs! >= 0
+          ? runtimeError.retryAfterMs
+          : configuredRetryDelay;
       const nextRetryAt = retryDelay === undefined
         ? undefined
         : new Date(clock.now() + retryDelay).toISOString();
@@ -643,12 +667,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
       if (accepted.replayed && prior !== undefined) return accepted;
       const job: RuntimeJob = {
         execution: accepted.execution,
-        intent: prior?.intent ?? {
-          kind: "direct_mention",
-          roomId: accepted.execution.roomId,
-          sourceMessageId: accepted.execution.sourceMessageId,
-          targetAgentId: accepted.execution.agentId,
-        },
+        intent: prior?.intent ?? accepted.intent,
         context,
         toolContinuations: [],
         sideEffectDispatched: false,
@@ -802,12 +821,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         if (existing !== undefined) continue;
         enqueue({
           execution: record.execution,
-          intent: {
-            kind: "direct_mention",
-            roomId: record.execution.roomId,
-            sourceMessageId: record.execution.sourceMessageId,
-            targetAgentId: record.execution.agentId,
-          },
+          intent: record.intent,
           context: undefined,
           toolContinuations: [],
           sideEffectDispatched: false,

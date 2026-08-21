@@ -41,7 +41,8 @@ describe("opt-in OpenAI Responses live smoke", () => {
       availableTools: [],
       committedSteps: [],
       limits: {
-        maxInputBytes: 16 * 1_024, maxOutputTokens: 2_048,
+        maxInputBytes: 16 * 1_024, compiledInputTokens: 8 * 1_024,
+        maxContextInputTokens: 12 * 1_024, maxOutputTokens: 2_048,
         maxOutputBytes: 16 * 1_024, timeoutMs: 30_000,
       },
     };

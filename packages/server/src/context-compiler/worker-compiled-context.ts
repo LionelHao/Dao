@@ -211,19 +211,27 @@ async function sourceSet(
     sourceId: string,
     sourceRevision: number,
     sourceLabel: string | null,
+    currentlyRequired: boolean,
   ): Promise<void> => {
     const source: ContextSnapshotSourceInput = {
       sourceKind: kind,
       sourceId,
       sourceRevision,
       sourceLabel,
-      currentlyRequired: kind !== "message_tombstone",
+      currentlyRequired: kind !== "message_tombstone" && currentlyRequired,
       authorizationRevision: await authorizationRevision(kind, sourceId, sourceRevision),
     };
     const identity = key(source);
     const existing = values.get(identity);
-    if (existing === undefined || (existing.sourceLabel === null && sourceLabel !== null)) {
+    if (existing === undefined) {
       values.set(identity, source);
+    } else if ((existing.sourceLabel === null && sourceLabel !== null) ||
+        (!existing.currentlyRequired && source.currentlyRequired)) {
+      values.set(identity, {
+        ...existing,
+        ...(existing.sourceLabel === null && sourceLabel !== null ? { sourceLabel } : {}),
+        currentlyRequired: existing.currentlyRequired || source.currentlyRequired,
+      });
     }
   };
   for (const item of result.manifest.items) {
@@ -233,9 +241,12 @@ async function sourceSet(
       item.source.sourceId,
       item.source.revision,
       item.citationLabel,
+      item.availability !== "invalidated" &&
+        item.availability !== "temporarily_unavailable" &&
+        item.availability !== "tombstone",
     );
   }
-  await add("message_revision", preparation.triggerMessageId, preparation.triggerRevision, null);
+  await add("message_revision", preparation.triggerMessageId, preparation.triggerRevision, null, true);
   for (const candidate of [
     ...preparation.compilerInputFacts.delta,
     ...preparation.compilerInputFacts.attachments,
@@ -245,10 +256,14 @@ async function sourceSet(
       candidate.source.sourceId,
       candidate.source.revision,
       null,
+      candidate.availability === "readable" || candidate.availability === "metadata_only",
     );
   }
   for (const memory of preparation.compilerInputFacts.memories) {
-    await add("memory", memory.memoryVersionId, memory.version, null);
+    await add(
+      "memory", memory.memoryVersionId, memory.version, null,
+      memory.availability === "readable",
+    );
   }
   return Object.freeze([...values.values()]);
 }
@@ -417,7 +432,10 @@ export function createWorkerCompiledContextBuilder(options: Readonly<{
       let snapshot: ContextSnapshotRecord;
       if (prepared.disposition === "candidate") {
         if (execution.currentAttemptSeq !== 1) {
-          throw new AgentRuntimeError("execution_conflict", "Retry execution lost its context snapshot");
+          throw new AgentRuntimeError(
+            "context_snapshot_conflict",
+            "Retry execution lost its frozen context snapshot",
+          );
         }
         const config = { ...CONTEXT_COMPILER_CONFIG_V1, modelId: prepared.preparation.modelId };
         const compiled = compileContextV1(prepared.preparation.compilerInputFacts, config);

@@ -128,6 +128,10 @@ export interface InvocationAccepted {
   readonly replayed: boolean;
 }
 
+export interface InvocationAcceptedWithIntent extends InvocationAccepted {
+  readonly intent: AgentInvocationIntent;
+}
+
 export interface PreparedToolCall {
   readonly execution: AgentExecution;
   readonly grantId: string;
@@ -162,6 +166,7 @@ export interface BegunCompensation {
 
 export interface RuntimeRecoveryRecord {
   readonly execution: AgentExecution;
+  readonly intent: AgentInvocationIntent;
   readonly outcome: "enqueue" | "failed" | "fail_outcome_unknown" | "wait_confirmation";
 }
 
@@ -187,13 +192,13 @@ export interface RuntimeAuthority {
     intent: AgentInvocationIntent,
     providerId: string,
     modelId: string,
-  ): Promise<InvocationAccepted>;
+  ): Promise<InvocationAcceptedWithIntent>;
   invokeRouted(
     routeJobId: string,
     intent: AgentInvocationIntent,
     providerId: string,
     modelId: string,
-  ): Promise<InvocationAccepted>;
+  ): Promise<InvocationAcceptedWithIntent>;
   enqueueFenceReplacements(
     routeJobId: string,
     targetAgentId: string,
@@ -221,7 +226,7 @@ export interface RuntimeAuthority {
   retry(
     context: AuthenticatedCommandContext,
     executionId: string,
-  ): Promise<InvocationAccepted>;
+  ): Promise<InvocationAcceptedWithIntent>;
   beginCompensation(
     context: AuthenticatedCommandContext,
     executionId: string,

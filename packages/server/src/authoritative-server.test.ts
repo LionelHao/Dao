@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { AUTHORITY_PARTICIPANT_FEATURES } from "./room-governance/private-participant-contracts.js";
-import { createProductionSharedAuthorityParticipantComposition } from "./authoritative-server.js";
+import {
+  assertAgentRuntimeModelContextCapability,
+  createProductionSharedAuthorityParticipantComposition,
+} from "./authoritative-server.js";
 
 const EXPECTED_REGISTRATIONS = [
   "dao.project-loop.departure-responsibility.v1",
@@ -37,5 +40,18 @@ describe("production shared-authority participant composition", () => {
       maxOfflineReadLeaseMs: 0,
       ballPolicy: { openItemDeadlineMs: 41_000, lightTaskDeadlineMs: 43_000 },
     })).toThrow(/invalid_policy/i);
+  });
+
+  it("fails startup capability validation for unknown or undersized model windows", () => {
+    expect(assertAgentRuntimeModelContextCapability({ model: "gpt-5-mini" }))
+      .toBeGreaterThanOrEqual(65_536);
+    expect(() => assertAgentRuntimeModelContextCapability({ model: "unknown-model" }))
+      .toThrow(/missing or below 65536/u);
+    expect(() => assertAgentRuntimeModelContextCapability({
+      model: "deployment-model", configuredContextWindowTokens: 65_535,
+    })).toThrow(/missing or below 65536/u);
+    expect(assertAgentRuntimeModelContextCapability({
+      model: "deployment-model", configuredContextWindowTokens: 65_536,
+    })).toBe(65_536);
   });
 });

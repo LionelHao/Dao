@@ -70,7 +70,7 @@ const SCHEMA_FINGERPRINTS = {
   16: "86a3512dcb625bc3e0f3d79e5a5d6542819523bee8ac851990148bcad8e38737",
   17: "cc4b260ec841765f0349040a238a44281aa3ed9a792623ebd6540fd3e9f6b0b0",
   18: "d1344ba94d7dd4253f2dcc9e392c3bc4b8b1ec5b4fbba614e3fe2a10392797e5",
-  19: "7d24d29490408e6687ca837aac743955754376eceafb7e76803a07bb4847f0cb",
+  19: "e29b9a79b49af133b60afce011d58c20b16ee370e68c3a00fe9ea4b950c01ce2",
 } as const;
 
 const V1_STATEMENTS = [
@@ -4623,8 +4623,11 @@ const V19_STATEMENTS = [
           FROM context_snapshots AS snapshot
           JOIN room_memory_sources AS corpus
             ON corpus.room_id = snapshot.room_id
-           AND corpus.source_id = NEW.source_id
            AND corpus.source_revision = NEW.source_revision
+           AND (corpus.source_id = NEW.source_id OR (
+             NEW.source_kind IN ('message_revision', 'message_tombstone')
+             AND json_extract(corpus.safe_metadata_json, '$.messageId') = NEW.source_id
+           ))
           WHERE snapshot.snapshot_id = NEW.snapshot_id
             AND corpus.corpus_seq > snapshot.raw_delta_from_exclusive
             AND corpus.corpus_seq <= snapshot.raw_delta_to_inclusive
@@ -4676,6 +4679,29 @@ const V19_STATEMENTS = [
             AND checkpoint.checkpoint_id = NEW.source_id
             AND checkpoint.checkpoint_version = NEW.source_revision
         ))
+        OR (NEW.currently_required = 0 AND (
+          (NEW.source_kind = 'message_revision' AND EXISTS (
+            SELECT 1
+            FROM message_revisions AS revision
+            JOIN messages AS message ON message.id = revision.message_id
+            WHERE revision.message_id = NEW.source_id
+              AND revision.revision = NEW.source_revision
+              AND message.room_id = NEW.room_id
+          ))
+          OR (NEW.source_kind = 'memory' AND EXISTS (
+            SELECT 1 FROM room_memory_versions AS version
+            WHERE version.memory_version_id = NEW.source_id
+              AND version.room_id = NEW.room_id
+              AND version.version_number = NEW.source_revision
+          ))
+          OR (NEW.source_kind = 'attachment_extraction' AND EXISTS (
+            SELECT 1 FROM attachments AS attachment
+            WHERE substr(NEW.source_id, 1, 22) = 'attachment-extraction:'
+              AND attachment.attachment_id = substr(NEW.source_id, 23)
+              AND attachment.room_id = NEW.room_id
+              AND attachment.processing_generation = NEW.source_revision
+          ))
+        ))
       )
    BEGIN SELECT RAISE(ABORT, 'Context snapshot source is unavailable or cross-Room'); END`,
   `CREATE TRIGGER context_snapshot_sources_v19_immutable_update
@@ -4724,7 +4750,10 @@ const V19_STATEMENTS = [
        AND item.section = 'delta' AND item.disposition = 'index_only'
        AND item.source_label_sha256 = NEW.range_label_sha256
        AND json_extract(item.segment_json, '$.sourceIndexHash') = NEW.source_index_sha256
-       AND corpus.source_id = NEW.source_id
+       AND (corpus.source_id = NEW.source_id OR (
+         NEW.source_kind IN ('message_revision', 'message_tombstone')
+         AND json_extract(corpus.safe_metadata_json, '$.messageId') = NEW.source_id
+       ))
        AND corpus.source_revision = NEW.source_revision
        AND ((NEW.source_kind IN ('message_revision', 'message_tombstone')
              AND corpus.source_kind IN ('message', 'message_revision', 'message_tombstone'))

@@ -8,6 +8,7 @@ import {
 } from "./contracts.js";
 import {
   isRoomMemoryReadError,
+  type RoomMemoryReadError,
   type RoomMemoryReadToolAdapter,
 } from "./room-memory-read-tool.js";
 
@@ -37,6 +38,22 @@ interface GatewayExecutionInput {
 
 export interface ToolGateway {
   execute(input: GatewayExecutionInput): Promise<ToolOutcome>;
+}
+
+function runtimeSourceReadError(error: RoomMemoryReadError): AgentRuntimeError {
+  if (error.status === 403) {
+    return new AgentRuntimeError("context_forbidden", "Context source read was forbidden");
+  }
+  if (error.status === 409) {
+    return new AgentRuntimeError("context_generation_conflict", "Context source read was stale");
+  }
+  if (error.status === 410) {
+    return new AgentRuntimeError("context_source_gone", "Context source was invalidated");
+  }
+  if (error.status === 429) {
+    return new AgentRuntimeError("context_capacity_limited", "Context source read capacity was exceeded");
+  }
+  return new AgentRuntimeError("context_storage_unavailable", "Context source authority was unavailable");
 }
 
 export function createToolGateway(options: ToolGatewayOptions): ToolGateway {
@@ -94,7 +111,8 @@ export function createToolGateway(options: ToolGatewayOptions): ToolGateway {
           );
         }
         await options.authority.settleTool(dispatch.dispatchId, "failed", { outcome: "failed" });
-        if (error instanceof AgentRuntimeError || isRoomMemoryReadError(error)) throw error;
+        if (error instanceof AgentRuntimeError) throw error;
+        if (isRoomMemoryReadError(error)) throw runtimeSourceReadError(error);
         throw new AgentRuntimeError("tool_failure", "Tool execution failed");
       }
     },

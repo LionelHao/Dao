@@ -10,6 +10,7 @@ import {
 } from "./contracts.js";
 import { createAgentRuntimeService } from "./agent-runtime-service.js";
 import { createToolGateway } from "./tool-gateway.js";
+import { RoomMemoryReadError } from "./room-memory-read-tool.js";
 
 const context: AuthenticatedCommandContext = {
   kind: "human",
@@ -76,7 +77,7 @@ function authority(): RuntimeAuthority & { executions: Map<string, AgentExecutio
       const value = { ...execution(`execution-${next}`, invocation.roomId),
         sourceMessageId: invocation.sourceMessageId };
       executions.set(value.id, value);
-      return { execution: value, replayed: false };
+      return { execution: value, intent: invocation, replayed: false };
     },
     invokeRouted: vi.fn(),
     enqueueFenceReplacements: vi.fn(),
@@ -154,7 +155,10 @@ const providerInput = async (value: AgentExecution, invocation: AgentInvocationI
   projectContext: { status: "disabled", reason: "ft09_not_delivered" },
   availableTools: [],
   committedSteps: [],
-  limits: { maxInputBytes: 1_024, maxOutputTokens: 256, maxOutputBytes: 1_024, timeoutMs: 5_000 },
+  limits: {
+    maxInputBytes: 4_096, compiledInputTokens: 512, maxContextInputTokens: 3_072,
+    maxOutputTokens: 256, maxOutputBytes: 1_024, timeoutMs: 5_000,
+  },
 });
 
 const providerInputWithTools = (
@@ -323,6 +327,129 @@ describe("bounded Agent runtime scheduler", () => {
         status: "failed",
         terminalErrorCode: "provider_malformed",
       });
+    }
+  });
+
+  it("sorts distinct provider citations before the authority final boundary", async () => {
+    const runtimeAuthority = authority();
+    const complete = vi.spyOn(runtimeAuthority, "complete");
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      provider: provider(async function* () {
+        yield { type: "response_started", sequence: 1 };
+        yield {
+          type: "agent_final", sequence: 2, body: "answer",
+          citations: ["read:z-source", "ctx-0002", "ctx-0001"],
+        };
+      }),
+      modelId: "fake-model",
+      buildProviderInput: providerInput,
+    });
+    await runtime.invoke(context, intent("room-a", "citation-order"));
+    await runtime.whenIdle();
+    expect(complete).toHaveBeenCalledWith(
+      expect.any(String), 1, "answer", ["ctx-0001", "ctx-0002", "read:z-source"],
+    );
+  });
+
+  it("retries context storage 503 using its Retry-After before Provider dispatch", async () => {
+    const runtimeAuthority = authority();
+    const waits: number[] = [];
+    const clock: RuntimeClock = {
+      now: () => Date.parse("2026-08-17T00:00:00.000Z"),
+      wait: vi.fn(async (milliseconds) => { waits.push(milliseconds); }),
+    };
+    let builds = 0;
+    const stream = vi.fn(async function* (input: AgentRuntimeProviderInput) {
+      yield { type: "response_started" as const, sequence: 1 };
+      yield { type: "agent_final" as const, sequence: 2, body: "recovered", citations: [] };
+      expect(input.snapshot.snapshotId).toContain("execution-");
+    });
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      provider: provider(stream),
+      modelId: "fake-model",
+      async buildProviderInput(executionValue, invocationValue) {
+        builds += 1;
+        if (builds === 1) {
+          throw new AgentRuntimeError(
+            "context_storage_unavailable", "busy", 7,
+          );
+        }
+        return providerInput(executionValue, invocationValue);
+      },
+      clock,
+    });
+    const accepted = await runtime.invoke(context, intent("room-a", "context-503"));
+    await runtime.whenIdle();
+    expect(waits).toEqual([7]);
+    expect(builds).toBe(2);
+    expect(stream).toHaveBeenCalledTimes(1);
+    expect(runtimeAuthority.executions.get(accepted.execution.id)).toMatchObject({
+      status: "completed", currentAttemptSeq: 2,
+    });
+  });
+
+  it("preserves all authoritative invocation kinds across restart recovery and manual retry", async () => {
+    const kinds = ["direct_mention", "structured_help", "routed_candidate"] as const;
+    for (const kind of kinds) {
+      const recoveredAuthority = authority();
+      const recoveredIntent: AgentInvocationIntent = {
+        kind, roomId: `room-${kind}`, sourceMessageId: `source-${kind}`,
+        targetAgentId: `agent-room-${kind}`,
+      };
+      const recoveredExecution = {
+        ...execution(`recovered-${kind}`, recoveredIntent.roomId),
+        sourceMessageId: recoveredIntent.sourceMessageId,
+      };
+      recoveredAuthority.executions.set(recoveredExecution.id, recoveredExecution);
+      recoveredAuthority.recover = vi.fn(async () => [{
+        execution: recoveredExecution, intent: recoveredIntent, outcome: "enqueue" as const,
+      }]);
+      const recoveredInputs: AgentInvocationIntent[] = [];
+      const recoveredRuntime = createAgentRuntimeService({
+        authority: recoveredAuthority,
+        provider: provider(async function* () {
+          yield { type: "response_started", sequence: 1 };
+          yield { type: "agent_final", sequence: 2, body: "recovered", citations: [] };
+        }),
+        modelId: "fake-model",
+        async buildProviderInput(executionValue, invocationValue) {
+          recoveredInputs.push(invocationValue);
+          return providerInput(executionValue, invocationValue);
+        },
+      });
+      await recoveredRuntime.recover();
+      await recoveredRuntime.whenIdle();
+      expect(recoveredInputs).toEqual([recoveredIntent]);
+      expect(recoveredAuthority.executions.get(recoveredExecution.id)?.status).toBe("completed");
+
+      const retryAuthority = authority();
+      const retryExecution = {
+        ...execution(`retry-${kind}`, recoveredIntent.roomId),
+        sourceMessageId: recoveredIntent.sourceMessageId,
+      };
+      retryAuthority.executions.set(retryExecution.id, retryExecution);
+      retryAuthority.retry = vi.fn(async () => ({
+        execution: retryExecution, intent: recoveredIntent, replayed: false,
+      }));
+      const retryInputs: AgentInvocationIntent[] = [];
+      const retryRuntime = createAgentRuntimeService({
+        authority: retryAuthority,
+        provider: provider(async function* () {
+          yield { type: "response_started", sequence: 1 };
+          yield { type: "agent_final", sequence: 2, body: "retried", citations: [] };
+        }),
+        modelId: "fake-model",
+        async buildProviderInput(executionValue, invocationValue) {
+          retryInputs.push(invocationValue);
+          return providerInput(executionValue, invocationValue);
+        },
+      });
+      await retryRuntime.retry(context, `terminal-${kind}`);
+      await retryRuntime.whenIdle();
+      expect(retryInputs).toEqual([recoveredIntent]);
+      expect(retryAuthority.executions.get(retryExecution.id)?.status).toBe("completed");
     }
   });
 
@@ -536,6 +663,102 @@ describe("bounded Agent runtime scheduler", () => {
     expect(execute).toHaveBeenCalledTimes(1);
     expect(runtimeAuthority.checkpoint).toHaveBeenCalledTimes(1);
     expect(runtimeAuthority.executions.get(accepted.execution.id)?.status).toBe("completed");
+  });
+
+  it("terminalizes an invalidated source read without a second Provider dispatch", async () => {
+    const runtimeAuthority = authority();
+    runtimeAuthority.prepareTool = vi.fn(async (executionId) => ({
+      execution: runtimeAuthority.executions.get(executionId)!, grantId: "grant-source-gone",
+    }));
+    runtimeAuthority.claimTool = vi.fn(async (_executionId, _attempt, _grant, parameters) => ({
+      dispatchId: "dispatch-source-gone", toolId: "room-memory.read" as const, parameters,
+    }));
+    runtimeAuthority.settleTool = vi.fn(async () => undefined);
+    const sourceTool = {
+      descriptor: {
+        id: "room-memory.read" as const,
+        displayName: "Room memory read",
+        effect: "read-only" as const,
+        reversibility: "irreversible" as const,
+      },
+      execute: vi.fn(async () => {
+        throw new RoomMemoryReadError(410, "source_invalidated");
+      }),
+    };
+    let providerDispatches = 0;
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      provider: provider(async function* () {
+        providerDispatches += 1;
+        yield { type: "response_started", sequence: 1 };
+        yield {
+          type: "tool_call_started", sequence: 2,
+          callId: "call-source-gone", toolName: "room_memory_read",
+        };
+        yield {
+          type: "tool_call_delta", sequence: 3, callId: "call-source-gone",
+          delta: JSON.stringify({
+            snapshotId: "snapshot-execution-1", sourceLabel: "ctx-0001", mode: "source",
+          }),
+        };
+        yield { type: "completed", sequence: 4 };
+      }),
+      modelId: "fake-model",
+      buildProviderInput: providerInputWithTools([sourceTool.descriptor]),
+      tools: [sourceTool.descriptor],
+      toolGateway: createToolGateway({ authority: runtimeAuthority, adapters: [sourceTool] }),
+    });
+    const accepted = await runtime.invoke(context, intent("room-a", "source-gone"));
+    await runtime.whenIdle();
+    expect(providerDispatches).toBe(1);
+    expect(sourceTool.execute).toHaveBeenCalledTimes(1);
+    expect(runtimeAuthority.executions.get(accepted.execution.id)).toMatchObject({
+      status: "failed", terminalErrorCode: "context_source_gone",
+    });
+  });
+
+  it("rejects a tool continuation that exceeds the frozen deterministic input budget", async () => {
+    const runtimeAuthority = authority();
+    runtimeAuthority.prepareTool = vi.fn(async (executionId) => ({
+      execution: runtimeAuthority.executions.get(executionId)!, grantId: "grant-large-read",
+    }));
+    runtimeAuthority.claimTool = vi.fn(async (_executionId, _attempt, _grant, parameters) => ({
+      dispatchId: "dispatch-large-read", toolId: "repository.git-status" as const, parameters,
+    }));
+    runtimeAuthority.settleTool = vi.fn(async () => undefined);
+    runtimeAuthority.checkpoint = vi.fn(async () => undefined);
+    const adapter: ToolAdapter = {
+      descriptor: {
+        id: "repository.git-status", displayName: "Git status", effect: "read-only",
+        reversibility: "compensatable",
+      },
+      execute: vi.fn(async () => ({ summary: { bytes: 3_000 }, modelInput: "x".repeat(3_000) })),
+    };
+    let providerDispatches = 0;
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      provider: provider(async function* () {
+        providerDispatches += 1;
+        yield { type: "response_started", sequence: 1 };
+        yield {
+          type: "tool_call_started", sequence: 2,
+          callId: "call-large-read", toolName: "repository_git_status",
+        };
+        yield { type: "tool_call_delta", sequence: 3, callId: "call-large-read", delta: "{}" };
+        yield { type: "completed", sequence: 4 };
+      }),
+      modelId: "fake-model",
+      buildProviderInput: providerInputWithTools([adapter.descriptor]),
+      tools: [adapter.descriptor],
+      toolGateway: createToolGateway({ authority: runtimeAuthority, adapters: [adapter] }),
+    });
+    const accepted = await runtime.invoke(context, intent("room-a", "large-continuation"));
+    await runtime.whenIdle();
+    expect(providerDispatches).toBe(1);
+    expect(adapter.execute).toHaveBeenCalledTimes(1);
+    expect(runtimeAuthority.executions.get(accepted.execution.id)).toMatchObject({
+      status: "failed", terminalErrorCode: "content_too_large",
+    });
   });
 
   it("rejects a configured tool omitted by the compiled context before grant or adapter calls", async () => {

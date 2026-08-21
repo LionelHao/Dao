@@ -175,6 +175,10 @@ describe("real AuthorityWorker runtime authority", () => {
       expect(recovered).toEqual([
         expect.objectContaining({
           outcome: "enqueue",
+          intent: {
+            kind: "direct_mention", roomId: "room-runtime",
+            sourceMessageId: "message-runtime-2", targetAgentId: "agent-runtime",
+          },
           execution: expect.objectContaining({
             id: second.execution.id,
             status: "queued",
@@ -425,6 +429,10 @@ describe("real AuthorityWorker runtime authority", () => {
         status: "queued",
         manualRetryOfExecutionId: deadLettered.id,
         currentAttemptSeq: 1,
+      });
+      expect(manualRetry.intent).toEqual({
+        kind: "direct_mention", roomId: "room-runtime",
+        sourceMessageId: "message-runtime-5", targetAgentId: "agent-runtime",
       });
       expect(manualRetry.execution.id).not.toBe(deadLettered.id);
 

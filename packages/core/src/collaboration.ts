@@ -334,6 +334,8 @@ export interface AgentRuntimeProviderInput {
   }[];
   readonly limits: {
     readonly maxInputBytes: number;
+    readonly compiledInputTokens: number;
+    readonly maxContextInputTokens: number;
     readonly maxOutputTokens: number;
     readonly maxOutputBytes: number;
     readonly timeoutMs: number;

@@ -76,7 +76,8 @@ const input: CompiledProviderEnvelopeV1 = {
     modelInput: JSON.stringify({ type: "room-memory.read.result.v1", content: "bounded" }),
   }],
   limits: {
-    maxInputBytes: 65_536, maxOutputTokens: 8_192,
+    maxInputBytes: 65_536, compiledInputTokens: 32_768,
+    maxContextInputTokens: 51_200, maxOutputTokens: 8_192,
     maxOutputBytes: 262_144, timeoutMs: 5_000,
   },
 };
@@ -229,7 +230,10 @@ describe("OpenAI Responses compiled-context adapter", () => {
       invocation: input.invocation,
       visibleConversation: [{ messageId: "message-1", authorId: "human-1", body: "legacy" }],
       availableTools: [], committedSteps: [],
-      limits: { maxInputBytes: 8_192, maxOutputBytes: 8_192, timeoutMs: 5_000 },
+      limits: {
+        maxInputBytes: 8_192, compiledInputTokens: 4_096,
+        maxContextInputTokens: 6_144, maxOutputBytes: 8_192, timeoutMs: 5_000,
+      },
     } as unknown as AgentRuntimeProviderInput;
     const consume = async (): Promise<void> => {
       for await (const _event of provider.stream(legacy, new AbortController().signal)) void _event;

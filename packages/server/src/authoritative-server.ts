@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { ATTACHMENT_AUTHORITY_LIMITS, type Actor } from "@native-im/core";
+import { ATTACHMENT_AUTHORITY_LIMITS, CONTEXT_COMPILER_LIMITS, type Actor } from "@native-im/core";
 import { isDeepStrictEqual } from "node:util";
 import { mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -108,6 +108,8 @@ export interface StartAuthoritativeServerOptions {
   };
   readonly agentRuntime?: {
     readonly model?: string;
+    /** Deployment-owned, conservative context window for models outside the built-in registry. */
+    readonly modelContextWindowTokens?: number;
     readonly endpoint?: string;
     readonly httpJsonOrigin?: string;
     readonly httpJsonPathPrefix?: string;
@@ -171,6 +173,27 @@ export interface AuthoritativeServerTestFacades {
   readonly primitives: ReturnType<typeof createAuthoritativeCollaborationPrimitives>;
 }
 
+const AGENT_MODEL_CONTEXT_WINDOWS: Readonly<Record<string, number>> = Object.freeze({
+  "gpt-5-mini": 400_000,
+});
+
+export function assertAgentRuntimeModelContextCapability(input: Readonly<{
+  model: string;
+  configuredContextWindowTokens?: number;
+}>): number {
+  const model = input.model.trim();
+  if (model.length === 0) throw new TypeError("Agent runtime model must be non-empty");
+  const contextWindowTokens = input.configuredContextWindowTokens ??
+    AGENT_MODEL_CONTEXT_WINDOWS[model];
+  if (!Number.isSafeInteger(contextWindowTokens) || contextWindowTokens === undefined ||
+      contextWindowTokens < CONTEXT_COMPILER_LIMITS.hardLimitTokens) {
+    throw new TypeError(
+      `Agent runtime model context capability is missing or below ${CONTEXT_COMPILER_LIMITS.hardLimitTokens}`,
+    );
+  }
+  return contextWindowTokens;
+}
+
 export function startAuthoritativeServer(
   options: StartAuthoritativeServerOptions,
 ): Promise<AuthoritativeServer> {
@@ -189,6 +212,13 @@ async function start(
   options: StartAuthoritativeServerOptions,
   testOptions: AuthoritativeServerTestOptions,
 ): Promise<AuthoritativeServer> {
+  const runtimeModel = options.agentRuntime?.model ?? "gpt-5-mini";
+  assertAgentRuntimeModelContextCapability({
+    model: runtimeModel,
+    ...(options.agentRuntime?.modelContextWindowTokens === undefined ? {} : {
+      configuredContextWindowTokens: options.agentRuntime.modelContextWindowTokens,
+    }),
+  });
   const ballConfiguration = options.ballRuntime ?? {};
   const ballPolicy = Object.freeze({
     openItemDeadlineMs: ballConfiguration.openItemDeadlineMs ?? 24 * 60 * 60 * 1_000,
@@ -223,6 +253,17 @@ async function start(
   let stopAttachmentRecovery: (() => void) | undefined;
   let attachmentObjectStore: AttachmentObjectStore | undefined;
   let attachmentExtractionReader: AttachmentAgentExtractionReadPort | undefined;
+  let attachmentReaderReadySettled = false;
+  let settleAttachmentReaderReady!: (reader: AttachmentAgentExtractionReadPort | undefined) => void;
+  const attachmentReaderReady = new Promise<AttachmentAgentExtractionReadPort | undefined>(
+    (resolveReady) => { settleAttachmentReaderReady = resolveReady; },
+  );
+  const settleAttachmentReader = (reader: AttachmentAgentExtractionReadPort | undefined): void => {
+    if (attachmentReaderReadySettled) return;
+    attachmentReaderReadySettled = true;
+    settleAttachmentReaderReady(reader);
+  };
+  if (options.attachmentRuntime === undefined) settleAttachmentReader(undefined);
   let memoryRuntime: MemoryStewardRuntime | undefined;
   let stopMemoryRecovery: (() => void) | undefined;
   try {
@@ -421,7 +462,7 @@ async function start(
     const memoryAuthority = createWorkerMemoryAuthority({ worker, nowMs: Date.now });
     const provider = testOptions.agentRuntimeProviderForTest ?? createOpenAIResponsesProvider({
       endpoint: runtimeConfiguration.endpoint ?? "https://api.openai.com/v1/responses",
-      model: runtimeConfiguration.model ?? "gpt-5-mini",
+      model: runtimeModel,
       secretProvider,
     });
     const sandboxRoot = resolve(
@@ -449,7 +490,7 @@ async function start(
     const roomMemoryRead = createWorkerRoomMemoryReadAdapter({
       worker: authorityWorker,
       cursorSecret: options.invitationSecretKey,
-      attachmentReader: () => attachmentExtractionReader,
+      attachmentReader: () => attachmentReaderReady,
     });
     const runtimeTools = [...tools, roomMemoryRead] as const;
     const runtimeAuthority = createWorkerRuntimeAuthority(
@@ -487,7 +528,7 @@ async function start(
     runtime = createAgentRuntimeService({
       authority: runtimeAuthority,
       provider,
-      modelId: runtimeConfiguration.model ?? "gpt-5-mini",
+      modelId: runtimeModel,
       readiness: () => testOptions.agentRuntimeProviderForTest !== undefined ||
           secretProvider.getSecret("OPENAI_API_KEY") !== undefined
         ? "ready"
@@ -549,7 +590,7 @@ async function start(
     const routeAuthority = createWorkerRouteAuthority(worker);
     const routerProvider = createOpenAIRouterProvider({
       endpoint: runtimeConfiguration.endpoint ?? "https://api.openai.com/v1/responses",
-      model: runtimeConfiguration.model ?? "gpt-5-mini",
+      model: runtimeModel,
       secretProvider,
     });
     routeRuntime = createRouteRuntimeService({
@@ -742,10 +783,11 @@ async function start(
           nextGrantId: randomUUID,
         });
       }
+      settleAttachmentReader(attachmentExtractionReader);
     }
     const memoryProvider = createOpenAIMemoryStewardProvider({
       endpoint: runtimeConfiguration.endpoint ?? "https://api.openai.com/v1/responses",
-      model: runtimeConfiguration.model ?? "gpt-5-mini",
+      model: runtimeModel,
       secretProvider,
     });
     memoryRuntime = createMemoryStewardRuntime({
@@ -790,6 +832,7 @@ async function start(
       governance: governanceStore,
     });
   } catch (error: unknown) {
+    settleAttachmentReader(undefined);
     stopCacheInvalidationRecovery?.();
     stopAttachmentRecovery?.();
     stopMemoryRecovery?.();

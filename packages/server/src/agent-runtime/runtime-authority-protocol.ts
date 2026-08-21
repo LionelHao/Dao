@@ -171,7 +171,12 @@ export type RuntimeAuthorityOperationResult =
       }>;
     }
   | { readonly kind: "memory-delta"; readonly rawDelta: RoomMemoryRawDeltaPage }
-  | { readonly kind: "invocation"; readonly execution: AgentExecution; readonly replayed: boolean }
+  | {
+      readonly kind: "invocation";
+      readonly execution: AgentExecution;
+      readonly intent: AgentInvocationIntent;
+      readonly replayed: boolean;
+    }
   | { readonly kind: "execution"; readonly execution: AgentExecution }
   | {
       readonly kind: "prepared-tool";

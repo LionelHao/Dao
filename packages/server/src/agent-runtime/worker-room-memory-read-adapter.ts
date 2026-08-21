@@ -1,4 +1,4 @@
-import { createHash, createHmac, randomBytes } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import type { ContextAuthorityWorkerDatabaseClient } from "../persistence/worker-database-client.js";
 import type { AttachmentAgentExtractionReadPort } from "../attachment-authority/agent-extraction-reader.js";
 import { AttachmentAgentExtractionReaderError } from "../attachment-authority/agent-extraction-reader.js";
@@ -33,6 +33,7 @@ interface InternalRead {
 interface CursorPayload {
   readonly version: "context-source-cursor.v1";
   readonly executionId: string;
+  readonly roomId: string;
   readonly snapshotId: string;
   readonly snapshotGeneration: number;
   readonly sourceLabel: string;
@@ -43,7 +44,11 @@ interface CursorPayload {
   readonly mode: RoomMemoryReadParameters["mode"];
   readonly pageSize: number;
   readonly offset: number;
+  readonly expiresAtMs: number;
 }
+
+const SOURCE_CURSOR_TTL_MS = 5 * 60_000;
+const SOURCE_CURSOR_AAD = Buffer.from("dao.context-source-cursor.v1", "utf8");
 
 function record(value: unknown): value is Value {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -87,34 +92,47 @@ function sourceError(error: unknown): RoomMemoryReadError {
   return new RoomMemoryReadError(503, "authority_unavailable");
 }
 
-function cursorCodec(secret: Uint8Array) {
+function cursorCodec(secret: Uint8Array, nowMs: () => number) {
   if (!(secret instanceof Uint8Array) || secret.byteLength < 32) {
     throw new TypeError("Source cursor secret must contain at least 256 bits");
   }
+  const key = createHash("sha256").update(secret).digest();
   const seal = (payload: CursorPayload): string => {
-    const canonicalPayload = canonicalJsonV1(payload);
-    const mac = createHmac("sha256", secret).update(canonicalPayload, "utf8").digest("base64url");
-    return Buffer.from(canonicalJsonV1({ mac, payload }), "utf8").toString("base64url");
+    const nonce = randomBytes(12);
+    const cipher = createCipheriv("aes-256-gcm", key, nonce);
+    cipher.setAAD(SOURCE_CURSOR_AAD);
+    const ciphertext = Buffer.concat([
+      cipher.update(canonicalJsonV1(payload), "utf8"),
+      cipher.final(),
+    ]);
+    return Buffer.concat([nonce, cipher.getAuthTag(), ciphertext]).toString("base64url");
   };
   const open = (cursor: string): CursorPayload => {
     try {
-      const canonical = Buffer.from(cursor, "base64url").toString("utf8");
-      const envelope: unknown = JSON.parse(canonical);
-      if (!record(envelope) || canonicalJsonV1(envelope) !== canonical ||
-          typeof envelope.mac !== "string" || !record(envelope.payload)) {
+      const sealed = Buffer.from(cursor, "base64url");
+      if (sealed.toString("base64url") !== cursor || sealed.byteLength <= 28) {
         throw new TypeError("malformed cursor");
       }
-      const payloadJson = canonicalJsonV1(envelope.payload);
-      const expected = createHmac("sha256", secret).update(payloadJson, "utf8").digest("base64url");
-      if (envelope.mac !== expected) throw new TypeError("bad cursor mac");
-      const payload = envelope.payload;
+      const decipher = createDecipheriv("aes-256-gcm", key, sealed.subarray(0, 12));
+      decipher.setAAD(SOURCE_CURSOR_AAD);
+      decipher.setAuthTag(sealed.subarray(12, 28));
+      const canonical = Buffer.concat([
+        decipher.update(sealed.subarray(28)),
+        decipher.final(),
+      ]).toString("utf8");
+      const payload: unknown = JSON.parse(canonical);
+      if (!record(payload) || canonicalJsonV1(payload) !== canonical) {
+        throw new TypeError("malformed cursor payload");
+      }
       if (payload.version !== "context-source-cursor.v1" ||
-          typeof payload.executionId !== "string" || typeof payload.snapshotId !== "string" ||
+          typeof payload.executionId !== "string" || typeof payload.roomId !== "string" ||
+          typeof payload.snapshotId !== "string" ||
           !positive(payload.snapshotGeneration) || typeof payload.sourceLabel !== "string" ||
           typeof payload.sourceKind !== "string" || typeof payload.sourceId !== "string" ||
           !positive(payload.sourceRevision) || !nonnegative(payload.authorizationEpoch) ||
           typeof payload.mode !== "string" || !positive(payload.pageSize) ||
-          !nonnegative(payload.offset)) {
+          !nonnegative(payload.offset) || !positive(payload.expiresAtMs) ||
+          payload.expiresAtMs <= nowMs()) {
         throw new TypeError("bad cursor payload");
       }
       return payload as unknown as CursorPayload;
@@ -173,6 +191,7 @@ function sameCursorAuthority(
   parameters: RoomMemoryReadParameters,
 ): boolean {
   return cursor.executionId === authorization.executionId &&
+    cursor.roomId === authorization.roomId &&
     cursor.snapshotId === authorization.snapshotId &&
     cursor.snapshotGeneration === authorization.snapshotGeneration &&
     cursor.sourceLabel === authorization.sourceLabel && cursor.sourceKind === authorization.sourceKind &&
@@ -207,7 +226,8 @@ function parsePage(value: unknown): RoomMemoryReadPage {
 export function createWorkerRoomMemoryReadAdapter(options: Readonly<{
   worker: ContextAuthorityWorkerDatabaseClient;
   cursorSecret: Uint8Array;
-  attachmentReader: () => AttachmentAgentExtractionReadPort | undefined;
+  attachmentReader: () => AttachmentAgentExtractionReadPort | undefined |
+    Promise<AttachmentAgentExtractionReadPort | undefined>;
   nowMs?: () => number;
   nextReadId?: () => string;
   nextCitationLabel?: () => string;
@@ -216,7 +236,7 @@ export function createWorkerRoomMemoryReadAdapter(options: Readonly<{
   const nextReadId = options.nextReadId ?? (() => `context-read-${randomBytes(32).toString("base64url")}`);
   const nextCitationLabel = options.nextCitationLabel ??
     (() => `read:${randomBytes(32).toString("base64url")}`);
-  const codec = cursorCodec(options.cursorSecret);
+  const codec = cursorCodec(options.cursorSecret, nowMs);
   const internals = new WeakMap<RoomMemoryReadAuthorization, InternalRead>();
   const activeByExecution = new Map<string, InternalRead>();
   const activeByDispatch = new Map<string, InternalRead>();
@@ -370,6 +390,7 @@ export function createWorkerRoomMemoryReadAdapter(options: Readonly<{
         return codec.seal({
           version: "context-source-cursor.v1",
           executionId: input.authorization.executionId,
+          roomId: input.authorization.roomId,
           snapshotId: input.authorization.snapshotId,
           snapshotGeneration: input.authorization.snapshotGeneration,
           sourceLabel: input.authorization.sourceLabel,
@@ -380,6 +401,7 @@ export function createWorkerRoomMemoryReadAdapter(options: Readonly<{
           mode: internal.mode,
           pageSize: input.authorization.pageSize,
           offset,
+          expiresAtMs: nowMs() + SOURCE_CURSOR_TTL_MS,
         });
       },
     },
@@ -393,7 +415,7 @@ export function createWorkerRoomMemoryReadAdapter(options: Readonly<{
             throw new RoomMemoryReadError(409, "stale_context");
           }
           const attachmentId = input.authorization.sourceId.slice(prefix.length);
-          const attachmentReader = options.attachmentReader();
+          const attachmentReader = await options.attachmentReader();
           if (attachmentReader === undefined || attachmentId.length === 0) {
             throw new RoomMemoryReadError(503, "source_unavailable");
           }

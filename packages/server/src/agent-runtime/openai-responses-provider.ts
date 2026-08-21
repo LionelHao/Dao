@@ -2,7 +2,6 @@ import type { AgentRuntimeProviderInput, ProviderEvent } from "@native-im/core";
 import {
   canonicalJson,
   isCompiledProviderEnvelopeV1,
-  type CompiledGroupContentBlockV1,
   type CompiledProviderEnvelopeV1,
   type CompiledProviderToolDescriptorV1,
   type CompiledProviderToolIdV1,
@@ -92,10 +91,6 @@ function functionParameters(tool: CompiledProviderToolDescriptorV1): Readonly<Re
   return { type: "object", properties: {}, additionalProperties: false };
 }
 
-function groupRole(_block: CompiledGroupContentBlockV1): "user" {
-  return "user";
-}
-
 function buildProviderInput(input: CompiledProviderEnvelopeV1): unknown[] {
   const providerInput: unknown[] = [
     {
@@ -119,7 +114,7 @@ function buildProviderInput(input: CompiledProviderEnvelopeV1): unknown[] {
       }],
     },
     ...input.groupContent.map((block) => ({
-      role: groupRole(block),
+      role: "user",
       content: [{
         type: "input_text",
         text: canonicalJson({
