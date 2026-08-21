@@ -36,6 +36,7 @@ import {
   createMessageAuthorityState,
   failRepairGeneration,
   retryMessageSubmission,
+  type AgentMessageCitationProjection,
   type MessageActorOption,
   type MessageAuthorityInput,
   type MessageAuthorityState,
@@ -194,6 +195,18 @@ export function mountMessageAuthorityBridgeSurface(
   const attachmentPending = new Map<string, number>();
   let attachmentHydrationEpoch = 0;
   const beforeHistory: MessageAuthorityBridgeInput[] = [];
+
+  const roomMemorySourceId = (citation: AgentMessageCitationProjection): string => {
+    const prefix = citation.sourceKind === "message" ? "message:"
+      : citation.sourceKind === "message_revision" ? "message-revision:"
+        : citation.sourceKind === "message_tombstone" ? "message-tombstone:"
+          : citation.sourceKind === "attachment_extraction" ? "attachment-extraction:"
+            : citation.sourceKind === "project_fact_checkpoint" ? "project-fact:"
+              : "";
+    return prefix.length === 0 || citation.sourceId.startsWith(prefix)
+      ? citation.sourceId
+      : `${prefix}${citation.sourceId}`;
+  };
 
   const attachmentTargets = (): ReadonlyMap<string, string> => {
     const result = new Map<string, string>();
@@ -767,8 +780,8 @@ export function mountMessageAuthorityBridgeSurface(
           if (disposed || state === undefined || state !== openedFrom ||
               context.roomId !== roomId || context.lifecycle !== "active") throw new Error("citation context stale");
           if (citation.sourceKind === "memory") {
-            const target = [...document.querySelectorAll<HTMLElement>("[data-memory-record-id]")]
-              .find((candidate) => candidate.dataset.memoryRecordId === citation.sourceId);
+            const target = [...document.querySelectorAll<HTMLElement>("[data-memory-version-id]")]
+              .find((candidate) => candidate.dataset.memoryVersionId === citation.sourceId);
             if (target === undefined) throw new Error("citation source unavailable");
             target.tabIndex = -1;
             target.scrollIntoView?.({ block: "center", behavior: "auto" });
@@ -782,7 +795,7 @@ export function mountMessageAuthorityBridgeSurface(
               requestId: `citation-${globalThis.crypto.randomUUID()}`,
               roomId,
               sourceKind: citation.sourceKind,
-              sourceId: citation.sourceId,
+              sourceId: roomMemorySourceId(citation),
               sourceRevision: citation.sourceRevision,
             },
           });
