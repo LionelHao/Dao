@@ -433,13 +433,47 @@ export function compileContextV1(inputValue: ContextCompilerInputV1, configValue
     envelopeSha256: sha256HexV1(canonicalEnvelope), manifestSha256: sha256HexV1(canonicalManifest) };
 }
 
-export function verifyContextCompileResultV1(value: unknown): value is ContextCompileResultV1 {
-  if (!isContextCompileResultV1(value)) return false;
+export function verifyContextCompileResultV1(
+  value: unknown,
+  config: ContextCompilerConfigV1 = CONTEXT_COMPILER_CONFIG_V1,
+): value is ContextCompileResultV1 {
+  if (!isContextCompilerConfigV1(config) || !isContextCompileResultV1(value)) return false;
   if (!value.ok) return true;
   const { manifestHash, ...manifestBase } = value.manifest;
-  return value.canonicalEnvelope === canonicalJsonV1(value.envelope)
-    && value.canonicalManifest === canonicalJsonV1(value.manifest)
-    && value.envelopeSha256 === sha256HexV1(value.canonicalEnvelope)
-    && value.manifestSha256 === sha256HexV1(value.canonicalManifest)
-    && manifestHash === sha256HexV1(canonicalJsonV1(manifestBase));
+  if (value.canonicalEnvelope !== canonicalJsonV1(value.envelope)
+    || value.canonicalManifest !== canonicalJsonV1(value.manifest)
+    || value.envelopeSha256 !== sha256HexV1(value.canonicalEnvelope)
+    || value.manifestSha256 !== sha256HexV1(value.canonicalManifest)
+    || manifestHash !== sha256HexV1(canonicalJsonV1(manifestBase))) return false;
+  const inputTokens = utf8ByteLength(value.canonicalEnvelope);
+  const accounting = value.envelope.accounting;
+  if (value.manifest.configVersion !== config.configVersion || value.manifest.modelId !== config.modelId
+    || accounting.hardLimitTokens !== config.hardLimitTokens
+    || accounting.outputReserveTokens !== config.outputReserveTokens
+    || accounting.toolSchemaReserveTokens !== config.toolSchemaBudgetTokens
+    || accounting.inputTokens !== inputTokens || accounting.envelopeBytes !== inputTokens
+    || accounting.totalTokens !== inputTokens + config.outputReserveTokens + config.toolSchemaBudgetTokens
+    || accounting.totalTokens > config.hardLimitTokens || inputTokens > config.envelopeBytes
+    || utf8ByteLength(value.canonicalManifest) > config.manifestBytes
+    || canonicalJsonV1(accounting.sectionTokens) !== canonicalJsonV1(
+      accountEnvelopeSections(value.envelope, value.canonicalManifest, inputTokens),
+    )) return false;
+  const representations = new Map(value.envelope.groupContent.map((group) => [group.citationLabel, group.representation]));
+  if (value.envelope.projectContext.availability === "available" && value.envelope.projectContext.citationLabel !== null
+    && value.envelope.projectContext.representation !== null) {
+    representations.set(value.envelope.projectContext.citationLabel, value.envelope.projectContext.representation);
+  }
+  for (const item of value.manifest.items) {
+    if (item.source === null) continue;
+    const representation = item.citationLabel === null ? undefined : representations.get(item.citationLabel);
+    if (representation === undefined) {
+      if (item.includedBytes !== 0 || item.includedTokens !== 0) return false;
+      continue;
+    }
+    if (item.includedBytes !== utf8ByteLength(representation.text)
+      || item.includedTokens !== estimateStructuredTokensV1(representation.text, "content")
+      || ((item.disposition === "included" || (item.disposition === "segmented" && item.segment !== null))
+        && item.contentHash !== sha256HexV1(representation.text))) return false;
+  }
+  return true;
 }

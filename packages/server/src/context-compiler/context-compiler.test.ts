@@ -4,6 +4,7 @@ import {
   compileContextV1,
   verifyContextCompileResultV1,
 } from "./context-compiler.js";
+import { canonicalJsonV1, sha256HexV1 } from "./canonical-json.js";
 import { estimateStructuredTokensV1, utf8ByteLength } from "./token-estimator.js";
 import type { ContextCompilerInputV1 } from "@native-im/core";
 import { isCompiledContextEnvelopeV1, isContextCompileResultV1 } from "@native-im/core";
@@ -163,6 +164,24 @@ describe("compileContextV1", () => {
     const forgedSha = { ...result, envelopeSha256: "0".repeat(64) };
     expect(isContextCompileResultV1(forgedSha)).toBe(true);
     expect(verifyContextCompileResultV1(forgedSha)).toBe(false);
+
+    const replaceRepresentation = (text: string) => ({
+      ...result.envelope,
+      groupContent: result.envelope.groupContent.map((item, index) => index === 0
+        ? { ...item, representation: { ...item.representation, text } }
+        : item),
+    });
+    const rehashEnvelope = (envelope: typeof result.envelope) => {
+      const canonicalEnvelope = canonicalJsonV1(envelope);
+      return { ...result, envelope, canonicalEnvelope, envelopeSha256: sha256HexV1(canonicalEnvelope) };
+    };
+    const originalText = result.envelope.groupContent[0]!.representation.text;
+    const sameSizeForgery = rehashEnvelope(replaceRepresentation(originalText.replace(/[A-Za-z]/g, "x")));
+    expect(isContextCompileResultV1(sameSizeForgery)).toBe(true);
+    expect(verifyContextCompileResultV1(sameSizeForgery)).toBe(false);
+    const staleAccountingForgery = rehashEnvelope(replaceRepresentation(`${originalText} forged`));
+    expect(isContextCompileResultV1(staleAccountingForgery)).toBe(true);
+    expect(verifyContextCompileResultV1(staleAccountingForgery)).toBe(false);
   });
 
   it("does not change output for input array and object insertion permutations", () => {

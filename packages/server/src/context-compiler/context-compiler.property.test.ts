@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ContextCompilerInputV1, ContextSourceCandidateV1 } from "@native-im/core";
-import { CONTEXT_COMPILER_CONFIG_V1, compileContextV1 } from "./context-compiler.js";
+import { CONTEXT_COMPILER_CONFIG_V1, compileContextV1, verifyContextCompileResultV1 } from "./context-compiler.js";
 
 const PROPERTY_SEEDS = [0x43545806, 0x4d454d07, 0xdecafbad] as const;
 const RUNS_PER_SEED = 256;
@@ -89,6 +89,7 @@ describe("compileContextV1 deterministic properties", () => {
         const result = compileContextV1(permuted, CONTEXT_COMPILER_CONFIG_V1);
         expect(result).toEqual(baseline);
         if (result.ok) {
+          expect(verifyContextCompileResultV1(result)).toBe(true);
           expect(result.envelope.accounting.totalTokens).toBeLessThanOrEqual(CONTEXT_COMPILER_CONFIG_V1.hardLimitTokens);
           expect(result.envelope.accounting.envelopeBytes).toBeLessThanOrEqual(CONTEXT_COMPILER_CONFIG_V1.envelopeBytes);
           expect(result.envelope.accounting.inputTokens).toBe(Buffer.byteLength(result.canonicalEnvelope, "utf8"));
@@ -132,6 +133,7 @@ describe("compileContextV1 deterministic properties", () => {
         const result = compileContextV1({ ...input, delta: shuffle(input.delta, random(seed ^ 0x9e3779b9 ^ run)) }, CONTEXT_COMPILER_CONFIG_V1);
         expect(result).toEqual(baseline);
         if (result.ok) {
+          expect(verifyContextCompileResultV1(result)).toBe(true);
           expect(result.envelope.accounting.sectionTokens.manifest).toBe(Buffer.byteLength(result.canonicalManifest, "utf8"));
           expect(result.envelope.accounting.inputTokens).toBe(Buffer.byteLength(result.canonicalEnvelope, "utf8"));
           expect(result.envelope.accounting.totalTokens).toBe(
