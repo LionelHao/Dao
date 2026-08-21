@@ -22,7 +22,7 @@ import {
   type WorkerDatabaseClient,
 } from "./persistence/worker-database-client.js";
 import { createAgentRuntimeService, type AgentRuntimeService } from "./agent-runtime/agent-runtime-service.js";
-import type { ProviderAdapter } from "./agent-runtime/contracts.js";
+import { AgentRuntimeError, type ProviderAdapter } from "./agent-runtime/contracts.js";
 import { createEnvironmentSecretProvider } from "./agent-runtime/environment-secret-provider.js";
 import { createOpenAIResponsesProvider } from "./agent-runtime/openai-responses-provider.js";
 import { createWorkerRuntimeAuthority } from "./agent-runtime/worker-runtime-authority.js";
@@ -449,18 +449,11 @@ async function start(
       tools: tools.map((tool) => tool.descriptor),
       toolGateway,
       toolAdapters: tools,
-      async buildProviderInput(execution, intent) {
-        const runtimeContext = await runtimeAuthority.readContext(execution.id);
-        const allowed = new Set(runtimeContext.toolIds);
-        return {
-          purpose: "agent_runtime",
-          invocation: intent,
-          visibleConversation: runtimeContext.visibleConversation,
-          availableTools: tools.map((tool) => tool.descriptor).filter((tool) => allowed.has(tool.id)),
-          openItemTargets: runtimeContext.openItemTargets,
-          committedSteps: [],
-          limits: { maxInputBytes: 256 * 1_024, maxOutputBytes: 256 * 1_024, timeoutMs: 30_000 },
-        };
+      async buildProviderInput() {
+        throw new AgentRuntimeError(
+          "provider_failure",
+          "Compiled context snapshot authority is not yet connected",
+        );
       },
       emitPreview(preview) {
         sourceScopedRuntimeBoundary?.publishPreview(preview);

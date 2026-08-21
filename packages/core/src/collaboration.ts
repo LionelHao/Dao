@@ -230,7 +230,7 @@ export type ToolEffect = "read-only" | "side-effecting";
 export type ToolReversibility = "compensatable" | "irreversible";
 
 export interface ToolDescriptor {
-  readonly id: "http-json.read" | "repository.git-status" | "sandbox-file.write";
+  readonly id: "http-json.read" | "repository.git-status" | "sandbox-file.write" | "room-memory.read";
   readonly displayName: string;
   readonly effect: ToolEffect;
   readonly reversibility: ToolReversibility;
@@ -251,12 +251,56 @@ export interface ProviderNeutralCheckpoint {
 
 export interface AgentRuntimeProviderInput {
   readonly purpose: "agent_runtime";
+  readonly schemaVersion: "compiled-context-envelope.v1";
+  readonly snapshot: Readonly<{
+    snapshotId: string;
+    generation: number;
+    manifestHash: string;
+    compilerVersion: string;
+    configVersion: string;
+    modelId: string;
+  }>;
   readonly invocation: AgentInvocationIntent;
-  readonly visibleConversation: readonly {
-    readonly messageId: string;
-    readonly authorId: string;
-    readonly body: string;
-  }[];
+  readonly trusted: Readonly<{
+    system: readonly Readonly<{
+      kind: "product_policy" | "safety_policy";
+      text: string;
+    }>[];
+    developer: readonly (
+      | Readonly<{
+          kind: "agent_identity" | "responsibility" | "room_goal" | "trigger_contract" |
+            "citation_contract" | "authority_fact";
+          data: Readonly<Record<string, unknown>>;
+        }>
+      | Readonly<{
+          kind: "agent_identity" | "responsibility" | "room_goal" | "trigger_contract" |
+            "citation_contract" | "authority_fact";
+          text: string;
+        }>
+    )[];
+  }>;
+  readonly groupContent: readonly Readonly<{
+    kind: "trigger" | "human_message" | "agent_message" | "memory" | "raw_delta" |
+      "retrieval" | "attachment_extraction" | "omission";
+    trust: "untrusted_group_content";
+    source: Readonly<{
+      label: string;
+      kind: "message" | "message_revision" | "message_tombstone" |
+        "attachment_extraction" | "memory" | "project_fact_checkpoint";
+      revision: number;
+    }>;
+    content: string;
+    speaker?: Readonly<{ actorId: string; kind: "human" | "agent" }>;
+    serverTime?: string;
+    replyTo?: Readonly<{ messageId: string; revision: number }>;
+    mentions?: readonly Readonly<{
+      startUtf16: number;
+      endUtf16: number;
+      targetKind: "human-request" | "agent-invocation";
+      targetActorId: string;
+    }>[];
+  }>[];
+  readonly projectContext: Readonly<{ status: "disabled" | "unavailable" }>;
   readonly availableTools: readonly ToolDescriptor[];
   readonly openItemTargets?: readonly {
     readonly actorId: string;
@@ -271,6 +315,7 @@ export interface AgentRuntimeProviderInput {
   }[];
   readonly limits: {
     readonly maxInputBytes: number;
+    readonly maxOutputTokens: number;
     readonly maxOutputBytes: number;
     readonly timeoutMs: number;
   };
@@ -391,6 +436,7 @@ export type ProviderEvent =
   | { readonly type: "tool_call_started"; readonly sequence: number; readonly callId: string; readonly toolName: string }
   | { readonly type: "tool_call_delta"; readonly sequence: number; readonly callId: string; readonly delta: string }
   | { readonly type: "usage"; readonly sequence: number; readonly inputTokens: number; readonly outputTokens: number }
+  | { readonly type: "agent_final"; readonly sequence: number; readonly body: string; readonly citations: readonly string[] }
   | { readonly type: "completed"; readonly sequence: number };
 
 export interface SocialReaction {

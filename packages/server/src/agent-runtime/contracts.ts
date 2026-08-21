@@ -181,7 +181,12 @@ export interface RuntimeAuthority {
     modelId: string,
   ): Promise<FenceReplacementAccepted>;
   claim(executionId: string, attemptSeq: number): Promise<AgentExecution>;
-  complete(executionId: string, attemptSeq: number, body: string): Promise<AgentExecution>;
+  complete(
+    executionId: string,
+    attemptSeq: number,
+    body: string,
+    citationLabels?: readonly string[],
+  ): Promise<AgentExecution>;
   scheduleRetry(
     executionId: string,
     attemptSeq: number,

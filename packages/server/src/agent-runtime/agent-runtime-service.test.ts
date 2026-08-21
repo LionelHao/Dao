@@ -130,11 +130,31 @@ function provider(run: (input: AgentRuntimeProviderInput, signal: AbortSignal) =
 
 const providerInput = async (value: AgentExecution, invocation: AgentInvocationIntent): Promise<AgentRuntimeProviderInput> => ({
   purpose: "agent_runtime",
+  schemaVersion: "compiled-context-envelope.v1",
+  snapshot: {
+    snapshotId: `snapshot-${value.id}`,
+    generation: 1,
+    manifestHash: "a".repeat(64),
+    compilerVersion: "context_compiler_v1",
+    configVersion: "ft06_test_v1",
+    modelId: "fake-model",
+  },
   invocation,
-  visibleConversation: [{ messageId: value.sourceMessageId, authorId: value.requesterId, body: "bounded" }],
+  trusted: {
+    system: [{ kind: "product_policy", text: "Follow authority." }],
+    developer: [{ kind: "citation_contract", data: { kind: "manifest_labels_only" } }],
+  },
+  groupContent: [{
+    kind: "trigger",
+    trust: "untrusted_group_content",
+    source: { label: "ctx-0001", kind: "message", revision: 1 },
+    content: "bounded",
+    speaker: { actorId: value.requesterId, kind: "human" },
+  }],
+  projectContext: { status: "disabled" },
   availableTools: [],
   committedSteps: [],
-  limits: { maxInputBytes: 1_024, maxOutputBytes: 1_024, timeoutMs: 5_000 },
+  limits: { maxInputBytes: 1_024, maxOutputTokens: 256, maxOutputBytes: 1_024, timeoutMs: 5_000 },
 });
 
 describe("bounded Agent runtime scheduler", () => {
@@ -160,14 +180,14 @@ describe("bounded Agent runtime scheduler", () => {
 
   it("runs FIFO within a room while allowing bounded cross-room parallelism", async () => {
     const runtimeAuthority = authority();
+    const complete = vi.spyOn(runtimeAuthority, "complete");
     const order: string[] = [];
     const runtime = createAgentRuntimeService({
       authority: runtimeAuthority,
       provider: provider(async function* (input) {
         order.push(`start:${input.invocation.sourceMessageId}`);
         yield { type: "response_started", sequence: 1 };
-        yield { type: "text_delta", sequence: 2, delta: "ok" };
-        yield { type: "completed", sequence: 3 };
+        yield { type: "agent_final", sequence: 2, body: "ok", citations: ["ctx-0001"] };
         order.push(`done:${input.invocation.sourceMessageId}`);
       }),
       modelId: "fake-model",
@@ -181,6 +201,8 @@ describe("bounded Agent runtime scheduler", () => {
     ]);
     await runtime.whenIdle();
     expect(order.indexOf("done:a-1")).toBeLessThan(order.indexOf("start:a-2"));
+    expect(complete.mock.calls.every((call) => call[2] === "ok" &&
+      JSON.stringify(call[3]) === JSON.stringify(["ctx-0001"]))).toBe(true);
     expect([...runtimeAuthority.executions.values()].every((value) => value.status === "completed")).toBe(true);
   });
 
@@ -193,7 +215,7 @@ describe("bounded Agent runtime scheduler", () => {
       provider: provider(async function* () {
         yield { type: "response_started", sequence: 1 };
         await blocked;
-        yield { type: "completed", sequence: 2 };
+        yield { type: "agent_final", sequence: 2, body: "ok", citations: [] };
       }),
       modelId: "fake-model",
       buildProviderInput: providerInput,
@@ -434,8 +456,7 @@ describe("bounded Agent runtime scheduler", () => {
             argumentsJson: "{}",
             modelInput: "M README.md",
           }]);
-          yield { type: "text_delta", sequence: 2, delta: "repository changed" };
-          yield { type: "completed", sequence: 3 };
+          yield { type: "agent_final", sequence: 2, body: "repository changed", citations: ["ctx-0001"] };
         }
       }),
       modelId: "fake-model",
@@ -477,8 +498,7 @@ describe("bounded Agent runtime scheduler", () => {
             }),
             modelInput: "OpenItem open-item-proposed was authoritatively created.",
           }]);
-          yield { type: "text_delta", sequence: 2, delta: "已创建待答项" };
-          yield { type: "completed", sequence: 3 };
+          yield { type: "agent_final", sequence: 2, body: "已创建待答项", citations: [] };
         }
       }),
       modelId: "fake-model",
@@ -569,8 +589,7 @@ describe("bounded Agent runtime scheduler", () => {
           modelInput: "write succeeded",
         }]);
         yield { type: "response_started", sequence: 1 };
-        yield { type: "text_delta", sequence: 2, delta: "restored completion" };
-        yield { type: "completed", sequence: 3 };
+        yield { type: "agent_final", sequence: 2, body: "restored completion", citations: [] };
       }),
       modelId: "fake-model",
       buildProviderInput: providerInput,

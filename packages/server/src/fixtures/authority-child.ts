@@ -721,8 +721,7 @@ function createPreviewSentinelProvider(
     ): AsyncIterable<ProviderEvent> {
       if (input.invocation.sourceMessageId.includes("completed")) {
         yield { type: "response_started", sequence: 1 };
-        yield { type: "text_delta", sequence: 2, delta: "durable completed final" };
-        yield { type: "completed", sequence: 3 };
+        yield { type: "agent_final", sequence: 2, body: "durable completed final", citations: [] };
         return;
       }
       if (input.toolContinuations === undefined) {

@@ -223,13 +223,13 @@ describe("OpenAI Responses compiled-context adapter", () => {
       endpoint: "https://api.openai.com/v1/responses", model: "configured-model",
       secretProvider: { getSecret: () => "server-secret" }, fetch,
     });
-    const legacy: AgentRuntimeProviderInput = {
+    const legacy = {
       purpose: "agent_runtime",
       invocation: input.invocation,
       visibleConversation: [{ messageId: "message-1", authorId: "human-1", body: "legacy" }],
       availableTools: [], committedSteps: [],
       limits: { maxInputBytes: 8_192, maxOutputBytes: 8_192, timeoutMs: 5_000 },
-    };
+    } as unknown as AgentRuntimeProviderInput;
     const consume = async (): Promise<void> => {
       for await (const _event of provider.stream(legacy, new AbortController().signal)) void _event;
     };

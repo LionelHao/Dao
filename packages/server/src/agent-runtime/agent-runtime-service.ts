@@ -227,6 +227,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
     }
     const timeout = setTimeout(() => controller.abort("provider_timeout"), input.limits.timeoutMs);
     let partial = "";
+    let finalDraft: Readonly<{ body: string; citations: readonly string[] }> | undefined;
     let sawStarted = false;
     let sawCompleted = false;
     let lastSequence = 0;
@@ -268,12 +269,34 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
           if (Buffer.byteLength(call.argumentsJson, "utf8") > 64 * 1_024) {
             throw new AgentRuntimeError("provider_malformed", "Provider tool arguments exceeded their limit");
           }
+        } else if (event.type === "agent_final") {
+          if (!sawStarted || sawCompleted || finalDraft !== undefined || partial.length > 0 ||
+              toolCalls.size > 0 || event.body.length === 0 ||
+              Buffer.byteLength(event.body, "utf8") > input.limits.maxOutputBytes ||
+              event.citations.length > 128) {
+            throw new AgentRuntimeError("provider_malformed", "Provider final order was invalid");
+          }
+          const labels = new Set<string>();
+          if (!event.citations.every((label) => {
+            if (typeof label !== "string" || label.length === 0 || label.length > 256 ||
+                label !== label.trim() || label.normalize("NFC") !== label ||
+                /[\p{Cc}\p{Cf}]/u.test(label) || labels.has(label)) return false;
+            labels.add(label);
+            return true;
+          })) {
+            throw new AgentRuntimeError("provider_malformed", "Provider final citations were invalid");
+          }
+          finalDraft = Object.freeze({ body: event.body, citations: Object.freeze([...event.citations]) });
         } else if (event.type === "completed") {
-          if (!sawStarted || sawCompleted) throw new AgentRuntimeError("provider_malformed", "Provider completion order was invalid");
+          if (!sawStarted || sawCompleted || finalDraft !== undefined) {
+            throw new AgentRuntimeError("provider_malformed", "Provider completion order was invalid");
+          }
           sawCompleted = true;
         }
       }
-      if (!sawStarted || !sawCompleted || controller.signal.aborted) {
+      if (!sawStarted || controller.signal.aborted ||
+          (toolCalls.size > 0 ? !sawCompleted || finalDraft !== undefined
+            : finalDraft === undefined || sawCompleted)) {
         throw new AgentRuntimeError("provider_malformed", "Provider stream did not complete");
       }
       if (toolCalls.size > 0) {
@@ -370,7 +393,12 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         await runAttempt(job, controller);
         return;
       }
-      const completed = await options.authority.complete(claimed.id, claimed.currentAttemptSeq, partial);
+      const completed = await options.authority.complete(
+        claimed.id,
+        claimed.currentAttemptSeq,
+        finalDraft!.body,
+        finalDraft!.citations,
+      );
       try {
         options.onMessageCommitted?.(completed);
       } catch {
