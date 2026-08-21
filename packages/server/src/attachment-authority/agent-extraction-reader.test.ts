@@ -117,6 +117,55 @@ describe("server-private Agent attachment extraction reader", () => {
     expect(JSON.stringify(result)).not.toContain("extraction_");
   });
 
+  it("reads reauthorized UTF-8-safe extraction segments without loading the full artifact", async () => {
+    const artifact = new TextEncoder().encode("A💙B");
+    const expected = authorization({ byteSize: artifact.byteLength });
+    const executeAttachment = vi.fn(async () => expected);
+    const readAuthorizedRange = vi.fn(async (_key: string, offset: number, maximum: number) => {
+      const bytes = artifact.slice(offset, offset + maximum);
+      return {
+        bytes,
+        byteSize: artifact.byteLength,
+        eof: offset + bytes.byteLength === artifact.byteLength,
+      };
+    });
+    const reader = createAttachmentAgentExtractionReader({
+      database: { executeAttachment },
+      objectStore: { readAuthorizedRange },
+      nowMs: () => 1,
+    });
+
+    const first = await reader.readSegment({
+      executionId: "execution-1",
+      executionGeneration: 2,
+      attachmentId: "attachment-1",
+      attachmentGeneration: 5,
+      offset: 0,
+      maximumBytes: 4,
+    });
+    const second = await reader.readSegment({
+      executionId: "execution-1",
+      executionGeneration: 2,
+      attachmentId: "attachment-1",
+      attachmentGeneration: 5,
+      offset: first.segment.endByte,
+      maximumBytes: 5,
+    });
+
+    expect(first).toMatchObject({
+      text: "A",
+      segment: { startByte: 0, endByte: 1, eof: false },
+      provenance: { sha256: SHA, byteSize: artifact.byteLength },
+    });
+    expect(second).toMatchObject({
+      text: "💙B",
+      segment: { startByte: 1, endByte: artifact.byteLength, eof: true },
+    });
+    expect(readAuthorizedRange).toHaveBeenNthCalledWith(1, `extraction_${SHA}`, 0, 4);
+    expect(readAuthorizedRange).toHaveBeenNthCalledWith(2, `extraction_${SHA}`, 1, 5);
+    expect(executeAttachment).toHaveBeenCalledTimes(6);
+  });
+
   it("reads zero bytes when initial authorization is denied", async () => {
     const denied = new Error("attachment_forbidden");
     const readAuthorizedRange = vi.fn();
