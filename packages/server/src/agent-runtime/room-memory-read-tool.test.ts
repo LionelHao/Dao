@@ -23,6 +23,7 @@ const page: RoomMemoryReadPage = {
   }],
   continuation: null,
 };
+const receiptLabel = `read:${"a".repeat(43)}`;
 
 function authority(overrides: Partial<RoomMemoryReadAuthority> = {}): RoomMemoryReadAuthority {
   return {
@@ -43,7 +44,7 @@ describe("room-memory.read adapter", () => {
   it("reauthorizes before and after every bounded page and emits a receipt", async () => {
     const sourceAuthority = authority();
     const reader = { readPage: vi.fn(async () => page) };
-    const receipts = { issue: vi.fn(async () => ({ citationLabel: "receipt-1" })) };
+    const receipts = { issue: vi.fn(async () => ({ citationLabel: receiptLabel })) };
     const adapter = createRoomMemoryReadTool({ authority: sourceAuthority, reader, receipts });
 
     const outcome = await adapter.execute(invocation({
@@ -68,7 +69,7 @@ describe("room-memory.read adapter", () => {
       sourceRevision: 3,
       items: page.items,
       nextCursor: null,
-      citationLabel: "receipt-1",
+      citationLabel: receiptLabel,
     });
   });
 
@@ -231,7 +232,7 @@ describe("room-memory.read adapter", () => {
     });
     const reader = { readPage: vi.fn(async () => page) };
     const adapter = createRoomMemoryReadTool({
-      authority: sourceAuthority, reader, receipts: { issue: vi.fn(async () => ({ citationLabel: "receipt-2" })) },
+      authority: sourceAuthority, reader, receipts: { issue: vi.fn(async () => ({ citationLabel: receiptLabel })) },
     });
     await adapter.execute(invocation({
       snapshotId: "snapshot-1", sourceLabel: "source-1", mode: "source", cursor: "opaque-cursor",
@@ -239,6 +240,29 @@ describe("room-memory.read adapter", () => {
     expect(reader.readPage).toHaveBeenCalledWith(expect.objectContaining({
       cursor: "opaque-cursor", pageSize: 2,
     }));
+  });
+
+  it.each([
+    { kind: "cursor", cursor: "😀" },
+    { kind: "citation", cursor: null },
+  ] as const)("rejects non-closed $kind authority output without returning source content", async ({ kind, cursor }) => {
+    const sourceAuthority = authority({
+      sealContinuation: vi.fn(async () => cursor),
+    });
+    const receipts = {
+      issue: vi.fn(async () => ({
+        citationLabel: kind === "citation" ? "receipt-not-opaque" : receiptLabel,
+      })),
+    };
+    const adapter = createRoomMemoryReadTool({
+      authority: sourceAuthority, reader: { readPage: vi.fn(async () => page) }, receipts,
+    });
+    await expect(adapter.execute(invocation({
+      snapshotId: "snapshot-1", sourceLabel: "source-1", mode: "source",
+    }))).rejects.toMatchObject({
+      status: 503,
+      code: kind === "cursor" ? "authority_unavailable" : "receipt_unavailable",
+    });
   });
 
   it("closes a stalled source read at the frozen five-second deadline", async () => {

@@ -137,6 +137,15 @@ function identifier(value: unknown, maximum = 256): value is string {
     value === value.trim() && value.normalize("NFC") === value && !/[\p{Cc}\p{Cf}]/u.test(value);
 }
 
+function continuationCursor(value: unknown): value is string {
+  return identifier(value, ROOM_MEMORY_READ_LIMITS.maximumCursorLength) &&
+    /^[A-Za-z0-9_-]+$/u.test(value);
+}
+
+function citationLabel(value: unknown): value is string {
+  return typeof value === "string" && /^read:[A-Za-z0-9_-]{43}$/u.test(value);
+}
+
 function positive(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
@@ -151,8 +160,7 @@ function parseParameters(value: Readonly<Record<string, unknown>>): RoomMemoryRe
       !["source", "neighbors", "attachment_segment", "memory_sources", "project_object"].includes(String(value.mode)) ||
       (Object.hasOwn(value, "pageSize") && (!positive(value.pageSize) ||
         value.pageSize > ROOM_MEMORY_READ_LIMITS.maximumPageItems)) ||
-      (Object.hasOwn(value, "cursor") && (!identifier(value.cursor, ROOM_MEMORY_READ_LIMITS.maximumCursorLength) ||
-        !/^[A-Za-z0-9_-]+$/u.test(value.cursor as string) ||
+      (Object.hasOwn(value, "cursor") && (!continuationCursor(value.cursor) ||
         Object.hasOwn(value, "pageSize")))) {
     throw new RoomMemoryReadError(400, "invalid_request");
   }
@@ -245,7 +253,7 @@ function validatePage(
     sourceRevision: authorization.sourceRevision,
     items: page.items,
     nextCursor: "x".repeat(ROOM_MEMORY_READ_LIMITS.maximumCursorLength),
-    citationLabel: "x".repeat(256),
+    citationLabel: `read:${"x".repeat(43)}`,
   });
   const budgetBytes = Buffer.byteLength(worstCasePayload, "utf8");
   if (pageBytes > ROOM_MEMORY_READ_LIMITS.maximumPageBytes ||
@@ -377,7 +385,7 @@ export function createRoomMemoryReadTool(options: Readonly<{
           throw new RoomMemoryReadError(503, "authority_unavailable");
         }
         requireActive(signal);
-        if (nextCursor !== null && !identifier(nextCursor, ROOM_MEMORY_READ_LIMITS.maximumCursorLength)) {
+        if (nextCursor !== null && !continuationCursor(nextCursor)) {
           throw new RoomMemoryReadError(503, "authority_unavailable");
         }
 
@@ -410,7 +418,9 @@ export function createRoomMemoryReadTool(options: Readonly<{
           throw new RoomMemoryReadError(503, "receipt_unavailable");
         }
         requireActive(signal);
-        if (!identifier(issued.citationLabel)) throw new RoomMemoryReadError(503, "receipt_unavailable");
+        if (!citationLabel(issued.citationLabel)) {
+          throw new RoomMemoryReadError(503, "receipt_unavailable");
+        }
         const modelResult = {
           type: "room-memory.read.result.v1",
           snapshotId: initial.snapshotId,
