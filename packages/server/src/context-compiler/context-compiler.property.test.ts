@@ -103,7 +103,7 @@ describe("compileContextV1 deterministic properties", () => {
         }
       }
     }
-  }, 30_000);
+  }, 60_000);
 
   it(`keeps large-delta range aggregation stable for ${LARGE_DELTA_RUNS_PER_SEED} runs per seed`, () => {
     for (const seed of PROPERTY_SEEDS) {

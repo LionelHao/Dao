@@ -1,6 +1,6 @@
 # FT-06 Stage 8 工作笔记
 
-状态：执行中。此文件记录可复核事实，不把计划写成完成证据。
+状态：本地实现、门禁与独立审阅完成，等待远端 PR/CI/merge。此文件记录可复核事实，不把计划写成完成证据。
 
 ## 1. 基线
 
@@ -40,8 +40,32 @@ FT-09尚未正式交付；production project adapter必须disabled/unavailable�
 
 ## 5. 验证日志
 
-待实现后填写每条命令、精确files/tests计数、schema migration/invariant/rollback、worker/restart/WebSocket、property seed/runs、Electron与live skip/pass。
+最终本地候选在无并发构建进程的独占状态下执行：
+
+- `corepack pnpm test`：172 passed / 3 skipped files，1927 passed / 3 skipped tests，202.87s；命令内 core boundary 与 Desktop renderer boundary 同时通过。三个 skip 恰为 Agent、route、memory OpenAI live suite；未同时提供显式 live flag 与 server-side secret，因此按批准合同安全跳过，未读取、输出或派生 secret。
+- `corepack pnpm typecheck`：通过，包括 workspace build graph、core/server negative type tests 与 Vitest config strict check。
+- `corepack pnpm lint`：通过，0 warnings。
+- `corepack pnpm build`：core、server、desktop 三个 workspace build 通过；Desktop preload/renderer copy 同时完成。
+- `corepack pnpm verify:core-boundary`：通过；core 无 I/O dependency/import。
+- `corepack pnpm verify:desktop-boundary`：通过；20个renderer production source无Node/Electron authority。
+- `git diff --check`：通过。
+- 最终聚焦回归：7个受影响测试文件52/52通过；`context-snapshot-database-authority.test.ts` 19/19单独复跑通过；property seeds `1129601030,1296387335,3737844653` 每seed 256次、large-delta每seed 32次顺序复跑2/2通过。固定768次permutation property的测试时限从30秒调整为60秒，运行规模和断言没有降低。
+- v19 migration：fresh及每个v1-v18升级/restart、89条statement逐条rollback、future/history/physical tamper均在`schema-v19.test.ts` 4/4通过；v1-v18 fingerprint未改，v19 fingerprint为`e458dedc7c0d85c04bca92dc2f6289b02367fb97fc7edbe1c7dba011470812b7`。
+- 真实路径覆盖包含AuthorityWorker/SQLite restart、real-process server 24项、WebSocket/history/repair、Electron smoke、attachment extraction、source read/cursor/citation、privacy sentinel与既有FT-01～05/07～08回归。
+
+两次更早的全量运行受到独立审阅Agent在共享worktree并发执行`tsc -b --force`、改写`dist/tsbuildinfo`的干扰，触发artifact hash与Worker瞬时失败；其进程组停止后，三条失败定向复跑全绿，并以上述独占全量复跑作为唯一最终证据。
 
 ## 6. Review与PR日志
 
-待实现后填写子分支commit、adversarial reviewer发现、修复、集成PR、CI、merge SHA与worktree清理结果。任何“通过”必须链接到实际命令、GitHub状态或远端读取结果；本文不使用`verified`作为项目状态。
+独立对抗审阅先后发现并关闭：range receipt namespace/`delta_range`投影、Provider compiled-only closure、source pagination evidence、retry/recovery漂移、legacy execution抢占、pending confirmation intent丢失、attachment readiness启动竞态、FT-05 prefixed identity、`currently_required=false`生命周期/授权/物理约束以及dispatch失败后grant泄漏。
+
+最终审阅对象`12a3ba6e424f6bd92cebdb6147502810da366934`，结论`APPROVE`，blocker=0、non-blocker=0。审阅确认v19保持89条statement、v1-v18 fingerprint不变，并逐项核对上述五个最后blocker的production代码与回归。
+
+原工作区四个用户文件在本地交付候选完成后仍为untracked且SHA-256未变：
+
+- FT-09 design：`88a98e90739f79bfb97f90282a673d6a444cc57e12c782b721e6ba2f87a8f122`
+- FT-09 implementation：`8600eca88483da83ad9c2b4722cda4f891635990cef2be115218874250a5649c`
+- FT-10 design：`8c75b4e4a77cd4f0cce3fcccea58eeb51f497547a05ca9ac839e2d24e6ed9578`
+- FT-10 implementation：`8b535d6bafd118d977690071cfc499870dedc78e61f6a7f9b33874886007fdcd`
+
+Blueprint未修改。PR、CI、squash merge SHA与worktree清理将在真实远端操作完成后写入最终交付记录。任何“通过”均绑定上述命令或后续GitHub状态；本文不使用`verified`作为项目状态。

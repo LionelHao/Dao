@@ -83,6 +83,8 @@
 
 `context hard limit - output reserve - tool schema reserve = 51,200` tokens。上述输入区段合计 47,104 tokens，剩余 4,096 tokens 固定为 canonical JSON/framing overhead；任何区段不得借用 framing/output/tool reserve。全局优先级固定为：安全/权限/trusted → trigger identity/semantics → Agent/Room/Goal → confirmed memory → delta → explicit retrieval → attachment segment → supplementary context。区段 reserve 未用额度可按该顺序进入共享池，反向借用禁止。
 
+生产启动还必须从闭合 model context capability registry 或显式 server 配置取得模型窗口；当前注册的 `gpt-5-mini` 为 400,000 tokens。未知模型、非整数窗口或窗口小于 65,536 均在 server 启动时拒绝，不能在首次调用时猜测。每次 Provider dispatch（包括 tool continuation）都重新计算 `compiledInputTokens + canonical toolContinuations UTF-8 bytes`，超过冻结 `maxContextInputTokens` 立即返回 `content_too_large`；工具结果不能绕过首次编译预算。
+
 降级顺序固定：完整 included → UTF-8/Unicode scalar 安全 excerpt（头尾并保留长度/hash）→ fixed-size segments → deterministic digest（source identity、length、hash、首尾摘要）→ index-only → omitted note。trigger 不得进入 omitted；若正文过大，至少输出 identity、语义 digest、segment index 与 read ref。只有这些表示自身仍不能装入 hard limit 时返回 `content_too_large`，并指出 source label 与恢复动作。
 
 ## 6. Manifest
@@ -106,7 +108,13 @@ v19 仅追加 migration；v1-v18 statement/checksum/fingerprint 逐字不改。`
 
 自动 retry 与 crash recovery读取 binding/body，不重新编译。人工 retry 新 execution、新 snapshot，并写 `manual_retry` lineage。显式 supersede 新 execution/新 snapshot并写 `supersede` lineage；旧 terminal 不复活。旧 attempt 或 generation CAS 不命中为 409。
 
+pending confirmation recovery 从 `agent_execution_intent_links → agent_invocation_intents` 恢复原始 immutable intent，并再次核对 room/source/target Agent；`direct_mention`、`structured_help`、`routed` 都保持原 kind/reason，缺失或错绑 lineage 一律 fail-closed。未建立 FT-06 intent link 的历史 collaboration execution 仍由其原 runtime owner 处理，不得被新 runtime 抢占或改写。
+
+Authority server 启动时先完成 attachment object-store reconcile、processing recovery 与 extraction reader capability 的 ready/no-capability 收敛，再启动 Agent、route、human-preemption、ball runtime recovery；因此 crash recovery 不会在 attachment reader 半初始化时消耗 5 秒/3 次 source-read 预算。
+
 Provider 每次 dispatch 前对 room active、Agent active membership/capability revision、snapshot state/generation和全部 currently-required source visibility做 fail-closed revalidation。recall、source revision invalidation、memory dispute、room archive/membership revoke会把 snapshot 标为 invalidated或使 revalidation 拒绝；不得静默重编译或继续发送旧正文。
+
+FT-05 持久化 identity 中 `message:*`、`message-revision:*`、`message-tombstone:*` 进入 compiler/snapshot 后统一使用 `safe_metadata_json.messageId` 的逻辑 message id；attachment仍保留 `attachment-extraction:${attachmentId}`。`currently_required=false` 只表示 manifest 已明确 `unavailable/invalidated` 的历史审计来源：不参与 source-specific invalidation，也没有可读取 citation label；attachment历史项还必须有同 generation 的 immutable extraction artifact。v19 insert trigger双向拒绝“readable却false”和“unavailable却true”，普通false source不能claim，唯一例外是每次重验后仍为recalled的tombstone metadata。
 
 retention：active/nonterminal execution 保留；terminal 后 30 天清除 restricted body与read payload，但永久保留闭合 hash/accounting/lineage/citation metadata；invalidation 立即禁止再次读取正文。清理由后续 operations job执行，v19 先记录 `retain_until`。正文不进入 events/outbox/history/repair/WebSocket/Desktop、普通日志、stdout/stderr或diagnostic export。
 
@@ -119,6 +127,8 @@ tool id 固定为 `room-memory.read`，effect=`read-only`。参数只允许 `{sn
 closed status 映射：401 身份/会话无效；403 capability/membership/visibility；409 execution/snapshot/generation/cursor冲突；410 room/source/snapshot gone或invalidated；429页/次数/累计预算；503 authority/extraction暂不可用。offline 不执行工具；repair 完成前返回503；超时为503且不扩展范围。
 
 cursor 是 server opaque authenticated binding，包含 room、execution、snapshot、generation、source label/revision、range/page、authorization epoch与expiry。返回值只包含 bounded data、provenance、immutable revision、next cursor与一次 read receipt/citation label。receipt label 固定为 `read:` 加恰好32 bytes随机值的canonical unpadded base64url（总长48字符）；数据库只保存整个含前缀label的SHA-256。裸43字符、非canonical编码和跨namespace label均拒绝。
+
+cursor payload 使用由server secret派生的AES-256-GCM密钥、96-bit随机nonce和固定AAD `dao.context-source-cursor.v1` 密封，TTL固定5分钟；解码后必须canonical JSON逐字回编码一致，并重新绑定execution/room/snapshot/generation/source/revision/mode/page/offset/authorization epoch。篡改、过期、跨上下文重放统一映射为409，不回显差异。
 
 FT-09 尚未交付，production `ProjectContextAdapter` 固定返回 `disabled`；`project_object` 读取返回 unavailable，不从消息推断。
 

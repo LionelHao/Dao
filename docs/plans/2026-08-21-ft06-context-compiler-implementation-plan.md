@@ -1,6 +1,6 @@
 # FT-06 Context Compiler 实施计划
 
-状态：**执行中**。基线 `origin/main=c0dc4421b3b5d5c00c4676e86bd205c482aa332c`，Node >=22.13，pnpm 10.14，schema v18，158 passed/3 skipped test files、1796 passed/3 skipped tests。
+状态：**本地实现与独立审阅完成，等待远端 PR/CI/merge。** 基线 `origin/main=c0dc4421b3b5d5c00c4676e86bd205c482aa332c`，Node >=22.13，pnpm 10.14，schema v18，158 passed/3 skipped test files、1796 passed/3 skipped tests。实现候选为 schema v19；独占全量复跑为172 passed/3 skipped test files、1927 passed/3 skipped tests。
 
 ## 1. 交付切片与依赖
 
