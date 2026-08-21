@@ -70,18 +70,18 @@
 | trusted system/developer reserve | 4,096 | 32,768 bytes |
 | trigger reserve | 8,192 | 32,768 bytes |
 | identity/Room/Goal reserve | 4,096 | 24,576 bytes |
-| memory budget | 12,288 | 49,152 bytes |
-| raw-delta budget | 10,240 | 40,960 bytes |
-| retrieval budget | 8,192 | 32,768 bytes |
+| memory budget | 10,240 | 49,152 bytes |
+| raw-delta budget | 8,192 | 40,960 bytes |
+| retrieval budget | 6,144 | 32,768 bytes |
 | attachment budget | 4,096 | 16,384 bytes |
-| degradation/manifest reserve | 4,096 | manifest 131,072 bytes |
+| degradation/manifest reserve | 2,048 | manifest 131,072 bytes |
 | single segment | 2,048 | 8,192 bytes |
 | source-read page / execution | 8 items / 32 calls | 32,768 / 262,144 bytes |
 | source-read timeout | — | 5,000 ms |
 
 `deterministic_utf8_v1` 的 content token estimate 是 UTF-8 byte length（保守的一 byte 一 token）加固定结构 overhead；它不是在线 tokenizer 猜测，也不动态抓模型窗口。Provider 的真实模型上限必须大于等于该配置，否则 server 启动失败。所有 accounting 都记录 estimator/config version。
 
-全局优先级固定为：安全/权限/trusted → trigger identity/semantics → Agent/Room/Goal → confirmed memory → delta → explicit retrieval → attachment segment → supplementary context。区段 reserve 未用额度可按该顺序进入共享池，反向借用禁止。
+`context hard limit - output reserve - tool schema reserve = 51,200` tokens。上述输入区段合计 47,104 tokens，剩余 4,096 tokens 固定为 canonical JSON/framing overhead；任何区段不得借用 framing/output/tool reserve。全局优先级固定为：安全/权限/trusted → trigger identity/semantics → Agent/Room/Goal → confirmed memory → delta → explicit retrieval → attachment segment → supplementary context。区段 reserve 未用额度可按该顺序进入共享池，反向借用禁止。
 
 降级顺序固定：完整 included → UTF-8/Unicode scalar 安全 excerpt（头尾并保留长度/hash）→ fixed-size segments → deterministic digest（source identity、length、hash、首尾摘要）→ index-only → omitted note。trigger 不得进入 omitted；若正文过大，至少输出 identity、语义 digest、segment index 与 read ref。只有这些表示自身仍不能装入 hard limit 时返回 `content_too_large`，并指出 source label 与恢复动作。
 
@@ -148,4 +148,3 @@ FT-06主要是server/runtime。对应J-03 `@Agent → execution → final`、J-0
 - citation：arbitrary text不解析、foreign snapshot/receipt/revision/generation拒绝、commit前失效整笔回滚、history/repair/restart一致；
 - Provider：request roles/layers、tool-output、store:false、noauth、bounded SSE/cancel/error、secret sentinel；
 - migration：fresh与v1…v18到v19、future/checksum/fingerprint拒绝、fault rollback、schema equivalence、旧facts不变。
-
