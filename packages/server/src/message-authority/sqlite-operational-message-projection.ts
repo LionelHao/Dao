@@ -30,6 +30,7 @@ type OperationalProjectionStatements = Readonly<{
   reply: SqliteStatement;
   attachments: SqliteStatement;
   agentSource: SqliteStatement;
+  agentCitations: SqliteStatement;
   correction: SqliteStatement;
 }>;
 
@@ -95,6 +96,13 @@ function statementsFor(database: DatabaseSync): OperationalProjectionStatements 
               source_revision AS sourceRevision, attempt_seq AS attemptSeq,
               execution_generation AS executionGeneration
        FROM agent_message_sources WHERE message_id = ?`,
+    ),
+    agentCitations: database.prepare(
+      `SELECT ordinal + 1 AS ordinal, source_kind AS sourceKind,
+              source_id AS sourceId, source_revision AS sourceRevision
+       FROM agent_message_citations
+       WHERE message_id = ?
+       ORDER BY ordinal`,
     ),
     correction: database.prepare(
       `SELECT correction_message_id AS correctionMessageId,
@@ -206,6 +214,12 @@ function agentMessageSource(
 ): OperationalAgentMessageSource {
   const statements = statementsFor(database);
   const lineage = statements.agentSource.get(envelope.messageId);
+  const citations = statements.agentCitations.all(envelope.messageId).map((row) => ({
+    ordinal: row.ordinal,
+    sourceKind: row.sourceKind,
+    sourceId: row.sourceId,
+    sourceRevision: row.sourceRevision,
+  }));
   const correction = statements.correction.get(envelope.messageId);
   if (envelope.messageKind === "agent-correction" &&
       (lineage === undefined || correction === undefined)) {
@@ -231,6 +245,7 @@ function agentMessageSource(
     finalRevision: currentRevision(database, envelope.messageId) as
       OperationalAgentMessageSource["finalRevision"],
     sourceLineage: sourceLineage as OperationalAgentMessageSource["sourceLineage"],
+    citations: citations as unknown as OperationalAgentMessageSource["citations"],
     correction: correction === undefined
       ? null
       : correction as OperationalAgentMessageSource["correction"],
@@ -342,6 +357,15 @@ export function readOperationalMessageRepairPage(
        AND operational_state = 'active'
      ORDER BY message_id, attachment_id`,
   ).all(...rangeParameters));
+  const citations = groupedRows(database.prepare(
+    `SELECT citation.message_id AS messageId, citation.ordinal + 1 AS ordinal,
+            citation.source_kind AS sourceKind, citation.source_id AS sourceId,
+            citation.source_revision AS sourceRevision
+     FROM agent_message_citations AS citation
+     JOIN messages AS message ON message.id = citation.message_id
+     WHERE message.room_id = ? AND citation.message_id >= ? AND citation.message_id <= ?
+     ORDER BY citation.message_id, citation.ordinal`,
+  ).all(...rangeParameters));
 
   return Object.freeze(rows.map((row) => {
     const envelope = envelopeFromRow(row);
@@ -411,6 +435,12 @@ export function readOperationalMessageRepairPage(
               attemptSeq: 1,
               executionGeneration: 1,
             },
+        citations: (citations.get(envelope.messageId) ?? []).map((citation) => ({
+          ordinal: citation.ordinal as number,
+          sourceKind: citation.sourceKind as OperationalAgentMessageSource["citations"][number]["sourceKind"],
+          sourceId: citation.sourceId as string,
+          sourceRevision: citation.sourceRevision as number,
+        })),
         correction: typeof row.correctionMessageId === "string"
           ? {
               correctionMessageId: row.correctionMessageId,
