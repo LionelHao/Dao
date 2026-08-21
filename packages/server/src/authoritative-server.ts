@@ -19,6 +19,7 @@ import {
   createWorkerDatabaseClient,
   createWorkerRoomCacheInvalidationIntentAuthority,
   createWorkerDatabaseClientWithTransactionFaultForTest,
+  type CompleteWorkerDatabaseClient,
   type WorkerDatabaseClient,
 } from "./persistence/worker-database-client.js";
 import { createAgentRuntimeService, type AgentRuntimeService } from "./agent-runtime/agent-runtime-service.js";
@@ -30,6 +31,8 @@ import { createHttpJsonReadAdapter } from "./agent-runtime/tools/http-json-read.
 import { createRepositoryGitStatusAdapter } from "./agent-runtime/tools/repository-git-status.js";
 import { createSandboxFileWriteAdapter } from "./agent-runtime/tools/sandbox-file-write.js";
 import { createToolGateway } from "./agent-runtime/tool-gateway.js";
+import { createWorkerRoomMemoryReadAdapter } from "./agent-runtime/worker-room-memory-read-adapter.js";
+import { createWorkerCompiledContextBuilder } from "./context-compiler/worker-compiled-context.js";
 import { createOpenAIRouterProvider } from "./route-runtime/openai-router-provider.js";
 import { createRouteRuntimeService, type RouteRuntimeService } from "./route-runtime/route-runtime-service.js";
 import { createWorkerRouteAuthority } from "./route-runtime/worker-route-authority.js";
@@ -57,6 +60,11 @@ import {
   type AttachmentProcessingRuntime,
 } from "./attachment-authority/processing-runtime.js";
 import { createProductionAttachmentProcessingPipeline } from "./attachment-authority/processing-pipeline.js";
+import {
+  createAttachmentAgentExtractionReader,
+  type AttachmentAgentExtractionReadPort,
+} from "./attachment-authority/agent-extraction-reader.js";
+import { isAttachmentDatabaseOperationResult } from "./attachment-authority/database-contracts.js";
 import {
   probeProductionAttachmentCapabilities,
   type ProductionClamdPolicy,
@@ -214,6 +222,7 @@ async function start(
   let attachmentProcessing: AttachmentProcessingRuntime | undefined;
   let stopAttachmentRecovery: (() => void) | undefined;
   let attachmentObjectStore: AttachmentObjectStore | undefined;
+  let attachmentExtractionReader: AttachmentAgentExtractionReadPort | undefined;
   let memoryRuntime: MemoryStewardRuntime | undefined;
   let stopMemoryRecovery: (() => void) | undefined;
   try {
@@ -407,6 +416,7 @@ async function start(
     const primitives = createAuthoritativeCollaborationPrimitives({ commandStore });
     await testOptions.initialize?.({ auth, lifecycle, messages: service, primitives });
     const runtimeConfiguration = options.agentRuntime ?? {};
+    const authorityWorker = worker as CompleteWorkerDatabaseClient;
     const secretProvider = createEnvironmentSecretProvider();
     const memoryAuthority = createWorkerMemoryAuthority({ worker, nowMs: Date.now });
     const provider = testOptions.agentRuntimeProviderForTest ?? createOpenAIResponsesProvider({
@@ -436,8 +446,44 @@ async function start(
         maxContentBytes: 256 * 1_024,
       }),
     ] as const;
-    const runtimeAuthority = createWorkerRuntimeAuthority(worker);
-    const toolGateway = createToolGateway({ authority: runtimeAuthority, adapters: tools });
+    const roomMemoryRead = createWorkerRoomMemoryReadAdapter({
+      worker: authorityWorker,
+      cursorSecret: options.invitationSecretKey,
+      attachmentReader: () => attachmentExtractionReader,
+    });
+    const runtimeTools = [...tools, roomMemoryRead] as const;
+    const runtimeAuthority = createWorkerRuntimeAuthority(
+      authorityWorker,
+      { contextWorker: authorityWorker },
+    );
+    const contextBuilder = createWorkerCompiledContextBuilder({
+      worker: authorityWorker,
+      availableTools: runtimeTools.map((tool) => tool.descriptor),
+      timeoutMs: 30_000,
+      async attachmentAuthorizationRevision(sourceId, sourceRevision, preparation) {
+        const prefix = "attachment-extraction:";
+        if (!sourceId.startsWith(prefix) || sourceId.length === prefix.length) {
+          throw new AgentRuntimeError("context_snapshot_conflict", "Attachment source identity was malformed");
+        }
+        const result = await authorityWorker.executeAttachment({
+          kind: "agent-extraction-authorize",
+          context: {
+            kind: "agent-execution",
+            executionId: preparation.executionId,
+            expectedExecutionGeneration: preparation.executionGeneration,
+          },
+          attachmentId: sourceId.slice(prefix.length),
+          expectedAttachmentGeneration: sourceRevision,
+        }, Date.now());
+        if (!isAttachmentDatabaseOperationResult(result) || !("kind" in result) ||
+            result.kind !== "agent-extraction" ||
+            result.attachmentGeneration !== sourceRevision) {
+          throw new AgentRuntimeError("context_storage_unavailable", "Attachment source authority was malformed");
+        }
+        return result.roomAccessRevision;
+      },
+    });
+    const toolGateway = createToolGateway({ authority: runtimeAuthority, adapters: runtimeTools });
     runtime = createAgentRuntimeService({
       authority: runtimeAuthority,
       provider,
@@ -446,14 +492,11 @@ async function start(
           secretProvider.getSecret("OPENAI_API_KEY") !== undefined
         ? "ready"
         : "noauth",
-      tools: tools.map((tool) => tool.descriptor),
+      tools: runtimeTools.map((tool) => tool.descriptor),
       toolGateway,
-      toolAdapters: tools,
-      async buildProviderInput() {
-        throw new AgentRuntimeError(
-          "provider_failure",
-          "Compiled context snapshot authority is not yet connected",
-        );
+      toolAdapters: runtimeTools,
+      async buildProviderInput(execution, invocation) {
+        return contextBuilder.build(execution, invocation);
       },
       emitPreview(preview) {
         sourceScopedRuntimeBoundary?.publishPreview(preview);
@@ -628,6 +671,11 @@ async function start(
         });
         await objectStore.initialize();
         attachmentObjectStore = objectStore;
+        attachmentExtractionReader = createAttachmentAgentExtractionReader({
+          database: authorityWorker,
+          objectStore,
+          nowMs: Date.now,
+        });
         await reconcileAttachmentObjectStore({
           database: worker,
           objectStore,

@@ -55,6 +55,7 @@ export function createToolGateway(options: ToolGatewayOptions): ToolGateway {
         input.grantId,
         input.parameters,
         input.confirmation,
+        { callId: input.callId },
       );
       if ((dispatch.toolId as RuntimeToolId) !== input.toolId) {
         throw new AgentRuntimeError("execution_conflict", "Claimed tool identity changed");

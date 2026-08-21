@@ -295,6 +295,9 @@ function sha256(value: unknown): value is string {
 const errorCodes = new Set<AgentRuntimeErrorCode>([
   "agent_configuration_missing", "agent_queue_full", "agent_runtime_closed", "confirmation_expired",
   "confirmation_forbidden", "confirmation_replayed", "content_too_large", "execution_conflict", "execution_not_found",
+  "context_capacity_limited", "context_forbidden", "context_generation_conflict",
+  "context_snapshot_conflict", "context_snapshot_invalidated", "context_source_gone",
+  "context_storage_unavailable",
   "invalid_parameters", "permission_denied", "provider_authentication", "provider_failure",
   "provider_malformed", "provider_rate_limited", "provider_timeout", "provider_unavailable",
   "side_effect_outcome_unknown", "tool_failure", "tool_target_busy",

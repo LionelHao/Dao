@@ -8,6 +8,7 @@ import type {
 } from "@native-im/core";
 import { compileContextV1, CONTEXT_COMPILER_CONFIG_V1 } from "./context-compiler.js";
 import { createWorkerCompiledContextBuilder } from "./worker-compiled-context.js";
+import { AuthorityWorkerClientError } from "../persistence/worker-database-client.js";
 
 const tool: ToolDescriptor = Object.freeze({
   id: "repository.git-status",
@@ -187,7 +188,6 @@ describe("production Worker compiled context builder", () => {
       availableTools: [tool],
       timeoutMs: 5_000,
       nextId: (kind) => `${kind}-test`,
-      loadOpenItemTargets: async () => [{ actorId: "human-1", kind: "human" }],
     });
 
     const result = await builder.build(execution, intent);
@@ -204,7 +204,7 @@ describe("production Worker compiled context builder", () => {
       invocation: intent,
       availableTools: [tool],
       projectContext: { status: "disabled", reason: "ft09_not_delivered" },
-      openItemTargets: [{ actorId: "human-1", kind: "human" }],
+      openItemTargets: [],
     });
     expect(JSON.stringify(result)).not.toContain("visibleConversation");
   });
@@ -258,11 +258,49 @@ describe("production Worker compiled context builder", () => {
       worker,
       availableTools: [tool],
       timeoutMs: 5_000,
-      loadOpenItemTargets: async () => [],
     });
 
     await builder.build({ ...execution, currentAttemptSeq: 2, retryOrdinal: 2 }, intent);
 
     expect(operations).toEqual(["context.prepare", "context.bind-attempt", "context.read"]);
+  });
+
+  it("preserves a closed invalidated-snapshot error before Provider dispatch", async () => {
+    const compiled = compileContextV1(compilerInput(), {
+      ...CONTEXT_COMPILER_CONFIG_V1, modelId: "model-1",
+    });
+    if (!compiled.ok) throw new Error("fixture compile failed");
+    const worker = {
+      executeContext: vi.fn(async (operation: Record<string, unknown>) => {
+        if (operation.type === "context.prepare") {
+          return {
+            kind: "context-preparation", disposition: "existing",
+            preparation: {
+              executionId: execution.id, attemptSeq: 1, executionGeneration: 1,
+              invocationIntentId: "intent-1", roomId: execution.roomId,
+              agentId: execution.agentId, providerId: execution.providerId!,
+              modelId: execution.modelId!, triggerMessageId: execution.sourceMessageId,
+              triggerRevision: 1, triggerReason: "direct_mention",
+            },
+            snapshot: {
+              snapshotId: "snapshot-invalid", executionId: execution.id, attemptSeq: 1,
+              snapshotGeneration: 2, executionGeneration: 1, state: "invalidated",
+              manifestSha256: compiled.manifestSha256,
+              envelopeSha256: compiled.envelopeSha256, payloadRetentionState: "required",
+            },
+          };
+        }
+        throw new AuthorityWorkerClientError(
+          "context_snapshot_invalidated", "snapshot invalidated",
+        );
+      }),
+    };
+    const builder = createWorkerCompiledContextBuilder({
+      worker, availableTools: [tool], timeoutMs: 5_000,
+    });
+
+    await expect(builder.build(execution, intent)).rejects.toMatchObject({
+      code: "context_snapshot_invalidated", status: 410,
+    });
   });
 });

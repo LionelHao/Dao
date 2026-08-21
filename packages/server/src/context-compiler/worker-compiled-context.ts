@@ -8,12 +8,16 @@ import {
   type ContextManifestEntryV1,
   type ToolDescriptor,
 } from "@native-im/core";
-import type { ContextAuthorityWorkerDatabaseClient } from "../persistence/worker-database-client.js";
+import {
+  AuthorityWorkerClientError,
+  type ContextAuthorityWorkerDatabaseClient,
+} from "../persistence/worker-database-client.js";
 import type {
   ContextManifestItemInput,
   ContextSnapshotCommitOperation,
   ContextSnapshotPreparation,
   ContextSnapshotRecord,
+  ContextSnapshotReusePreparation,
   ContextSnapshotSourceInput,
 } from "../persistence/context-snapshot-database-authority.js";
 import { AgentRuntimeError } from "../agent-runtime/contracts.js";
@@ -28,12 +32,37 @@ import {
 type SuccessfulCompile = Extract<ContextCompileResultV1, { readonly ok: true }>;
 type ContextWorker = ContextAuthorityWorkerDatabaseClient;
 
-type SnapshotPreparationResult = Readonly<{
-  kind: "context-preparation";
-  disposition: "candidate" | "existing";
-  preparation: ContextSnapshotPreparation;
-  snapshot?: ContextSnapshotRecord;
-}>;
+function mappedWorkerError(error: unknown): AgentRuntimeError {
+  if (error instanceof AgentRuntimeError) return error;
+  if (error instanceof AuthorityWorkerClientError) {
+    const contextCodes = new Set([
+      "context_capacity_limited", "context_forbidden", "context_generation_conflict",
+      "context_snapshot_conflict", "context_snapshot_invalidated", "context_source_gone",
+      "context_storage_unavailable",
+    ]);
+    if (contextCodes.has(error.code)) {
+      return new AgentRuntimeError(
+        error.code as AgentRuntimeError["code"],
+        `Context authority rejected the Provider input (${error.code})`,
+        error.retryAfterMs,
+      );
+    }
+  }
+  return new AgentRuntimeError("provider_failure", "Context authority was unavailable");
+}
+
+type SnapshotPreparationResult =
+  | Readonly<{
+      kind: "context-preparation";
+      disposition: "candidate";
+      preparation: ContextSnapshotPreparation;
+    }>
+  | Readonly<{
+      kind: "context-preparation";
+      disposition: "existing";
+      preparation: ContextSnapshotReusePreparation;
+      snapshot: ContextSnapshotRecord;
+    }>;
 
 export interface WorkerCompiledContextBuilder {
   build(
@@ -75,13 +104,16 @@ function preparationResult(value: unknown): SnapshotPreparationResult {
       typeof preparation.invocationIntentId !== "string" ||
       typeof preparation.roomId !== "string" || typeof preparation.agentId !== "string" ||
       typeof preparation.providerId !== "string" || typeof preparation.modelId !== "string" ||
-      typeof preparation.triggerMessageId !== "string" || !positive(preparation.triggerRevision) ||
-      !Array.isArray(preparation.expectedLineage) ||
-      !isContextCompilerInputV1(preparation.compilerInputFacts) ||
-      !sha256(preparation.preparationSha256)) {
+      typeof preparation.triggerMessageId !== "string" || !positive(preparation.triggerRevision)) {
     throw new AgentRuntimeError("provider_failure", "Context preparation facts were malformed");
   }
-  if (value.disposition === "existing" && !snapshotRecord(value.snapshot)) {
+  if (value.disposition === "candidate") {
+    if (!Array.isArray(preparation.expectedLineage) ||
+        !isContextCompilerInputV1(preparation.compilerInputFacts) ||
+        !sha256(preparation.preparationSha256)) {
+      throw new AgentRuntimeError("provider_failure", "Candidate context facts were malformed");
+    }
+  } else if (!snapshotRecord(value.snapshot)) {
     throw new AgentRuntimeError("provider_failure", "Existing context snapshot was malformed");
   }
   return value as unknown as SnapshotPreparationResult;
@@ -282,7 +314,7 @@ async function commitOperation(
 
 function compiledBody(
   value: unknown,
-  preparation: ContextSnapshotPreparation,
+  preparation: Pick<ContextSnapshotPreparation, "modelId">,
 ): Readonly<{ result: SuccessfulCompile; snapshot: ContextSnapshotRecord }> {
   if (!record(value) || value.kind !== "context-body" || !snapshotRecord(value.snapshot) ||
       typeof value.canonicalEnvelopeJson !== "string" ||
@@ -331,9 +363,6 @@ export function createWorkerCompiledContextBuilder(options: Readonly<{
   worker: ContextWorker;
   availableTools: readonly ToolDescriptor[];
   timeoutMs: number;
-  loadOpenItemTargets: (
-    executionId: string,
-  ) => Promise<readonly Readonly<{ actorId: string; kind: "human" | "agent" }>[]>;
   attachmentAuthorizationRevision?: (
     sourceId: string,
     sourceRevision: number,
@@ -354,13 +383,22 @@ export function createWorkerCompiledContextBuilder(options: Readonly<{
         "Attachment context authorization adapter was unavailable",
       );
     });
+  const executeContext = async (
+    operation: Parameters<ContextWorker["executeContext"]>[0],
+  ): Promise<unknown> => {
+    try {
+      return await options.worker.executeContext(operation);
+    } catch (error: unknown) {
+      throw mappedWorkerError(error);
+    }
+  };
 
   return Object.freeze({
     async build(
       execution: AgentExecution,
       invocation: AgentInvocationIntent,
     ): Promise<AgentRuntimeProviderInput> {
-      const prepared = preparationResult(await options.worker.executeContext({
+      const prepared = preparationResult(await executeContext({
         type: "context.prepare",
         executionId: execution.id,
         attemptSeq: execution.currentAttemptSeq,
@@ -371,11 +409,9 @@ export function createWorkerCompiledContextBuilder(options: Readonly<{
           prepared.preparation.roomId !== execution.roomId ||
           prepared.preparation.agentId !== execution.agentId ||
           prepared.preparation.modelId !== execution.modelId ||
-          prepared.preparation.compilerInputFacts.invocation.intent.kind !== invocation.kind ||
-          prepared.preparation.compilerInputFacts.invocation.intent.sourceMessageId !==
-            invocation.sourceMessageId ||
-          prepared.preparation.compilerInputFacts.invocation.intent.targetAgentId !==
-            invocation.targetAgentId) {
+          prepared.preparation.triggerReason !== invocation.kind ||
+          prepared.preparation.triggerMessageId !== invocation.sourceMessageId ||
+          prepared.preparation.agentId !== invocation.targetAgentId) {
         throw new AgentRuntimeError("execution_conflict", "Context preparation changed execution identity");
       }
       let snapshot: ContextSnapshotRecord;
@@ -386,7 +422,7 @@ export function createWorkerCompiledContextBuilder(options: Readonly<{
         const config = { ...CONTEXT_COMPILER_CONFIG_V1, modelId: prepared.preparation.modelId };
         const compiled = compileContextV1(prepared.preparation.compilerInputFacts, config);
         if (!compiled.ok) compileFailure(compiled);
-        snapshot = snapshotResult(await options.worker.executeContext(await commitOperation(
+        snapshot = snapshotResult(await executeContext(await commitOperation(
           prepared.preparation,
           compiled,
           nowMs(),
@@ -400,7 +436,7 @@ export function createWorkerCompiledContextBuilder(options: Readonly<{
       } else {
         snapshot = prepared.snapshot!;
         if (execution.currentAttemptSeq > 1) {
-          snapshot = snapshotResult(await options.worker.executeContext({
+          snapshot = snapshotResult(await executeContext({
             type: "context.bind-attempt",
             executionId: execution.id,
             attemptSeq: execution.currentAttemptSeq,
@@ -410,16 +446,13 @@ export function createWorkerCompiledContextBuilder(options: Readonly<{
           }));
         }
       }
-      const [body, openItemTargets] = await Promise.all([
-        options.worker.executeContext({
-          type: "context.read",
-          executionId: execution.id,
-          attemptSeq: execution.currentAttemptSeq,
-          expectedExecutionGeneration: prepared.preparation.executionGeneration,
-          now: nowMs(),
-        }),
-        options.loadOpenItemTargets(execution.id),
-      ]);
+      const body = await executeContext({
+        type: "context.read",
+        executionId: execution.id,
+        attemptSeq: execution.currentAttemptSeq,
+        expectedExecutionGeneration: prepared.preparation.executionGeneration,
+        now: nowMs(),
+      });
       const verified = compiledBody(body, prepared.preparation);
       if (verified.snapshot.snapshotId !== snapshot.snapshotId ||
           verified.snapshot.snapshotGeneration !== snapshot.snapshotGeneration) {
@@ -438,7 +471,9 @@ export function createWorkerCompiledContextBuilder(options: Readonly<{
           snapshotGeneration: snapshot.snapshotGeneration,
           invocation,
           availableTools,
-          openItemTargets,
+          // OpenItem targets are a live projection today. Keep the proposal function closed
+          // until a future contract freezes those targets in the authoritative snapshot.
+          openItemTargets: [],
           committedSteps: [],
           timeoutMs: options.timeoutMs,
         });

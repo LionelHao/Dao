@@ -788,6 +788,17 @@ describe("v19 Context Snapshot database authority", () => {
         SET status = 'queued', current_attempt_seq = 2, retry_ordinal = 2,
             updated_at = '${NOW}' WHERE id = 'context-execution';
       `);
+      seedLargeDeltaTail(database, 128);
+      const reused = executeContextSnapshotAuthorityOperation(database, {
+        type: "context.prepare", executionId: "context-execution", attemptSeq: 2,
+        now: NOW_MS,
+      });
+      expect(reused).toMatchObject({
+        kind: "context-preparation", disposition: "existing",
+        snapshot: { snapshotId: "context-snapshot", snapshotGeneration: 1 },
+      });
+      expect(reused.kind === "context-preparation" &&
+        Object.hasOwn(reused.preparation, "compilerInputFacts")).toBe(false);
       const automatic = executeContextSnapshotAuthorityOperation(database, {
         type: "context.bind-attempt", executionId: "context-execution", attemptSeq: 2,
         expectedExecutionGeneration: 1, reuseKind: "automatic_retry", now: NOW_MS,

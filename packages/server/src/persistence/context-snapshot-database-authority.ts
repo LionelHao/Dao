@@ -283,6 +283,20 @@ export interface ContextSnapshotPreparation {
   readonly preparationSha256: string;
 }
 
+export type ContextSnapshotReusePreparation = Pick<ContextSnapshotPreparation,
+  | "executionId"
+  | "attemptSeq"
+  | "executionGeneration"
+  | "invocationIntentId"
+  | "roomId"
+  | "agentId"
+  | "providerId"
+  | "modelId"
+  | "triggerMessageId"
+  | "triggerRevision"
+  | "triggerReason"
+>;
+
 export type ContextCompilerInputFacts = ContextCompilerInputV1;
 
 export interface ContextSnapshotRecord {
@@ -306,7 +320,7 @@ export type ContextSnapshotAuthorityResult =
   | {
       readonly kind: "context-preparation";
       readonly disposition: "existing";
-      readonly preparation: ContextSnapshotPreparation;
+      readonly preparation: ContextSnapshotReusePreparation;
       readonly snapshot: ContextSnapshotRecord;
     }
   | { readonly kind: "context-snapshot"; readonly snapshot: ContextSnapshotRecord }
@@ -1149,6 +1163,43 @@ function existingSnapshot(
     "SELECT 1 AS present FROM agent_execution_context_bindings WHERE execution_id = ?",
   ).get(executionId);
   return exists === undefined ? undefined : readSnapshotRecord(database, executionId);
+}
+
+function reusePreparation(
+  database: DatabaseSync,
+  executionId: string,
+  attemptSeq: number,
+): ContextSnapshotReusePreparation {
+  const row = database.prepare(
+    `SELECT binding.execution_id AS executionId, ? AS attemptSeq,
+            binding.execution_generation AS executionGeneration,
+            snapshot.invocation_intent_id AS invocationIntentId,
+            snapshot.room_id AS roomId, snapshot.agent_id AS agentId,
+            snapshot.provider_id AS providerId, snapshot.model_id AS modelId,
+            snapshot.trigger_message_id AS triggerMessageId,
+            snapshot.trigger_revision AS triggerRevision,
+            snapshot.trigger_reason AS triggerReason,
+            execution.current_attempt_seq AS currentAttemptSeq,
+            execution.status AS executionStatus, attempt.status AS attemptStatus
+     FROM agent_execution_context_bindings AS binding
+     JOIN context_snapshots AS snapshot ON snapshot.snapshot_id = binding.snapshot_id
+     JOIN agent_executions AS execution ON execution.id = binding.execution_id
+     JOIN agent_execution_attempts AS attempt
+       ON attempt.execution_id = binding.execution_id AND attempt.attempt_seq = ?
+     WHERE binding.execution_id = ?`,
+  ).get(attemptSeq, attemptSeq, executionId);
+  if (row === undefined || row.currentAttemptSeq !== attemptSeq ||
+      !["queued", "running"].includes(String(row.executionStatus)) ||
+      !["queued", "running"].includes(String(row.attemptStatus)) ||
+      !isText(row.executionId) || !isPositiveInteger(row.executionGeneration) ||
+      !isText(row.invocationIntentId) || !isText(row.roomId) || !isText(row.agentId) ||
+      !isText(row.providerId) || !isText(row.modelId) || !isText(row.triggerMessageId) ||
+      !isPositiveInteger(row.triggerRevision) ||
+      (row.triggerReason !== "direct_mention" && row.triggerReason !== "structured_help" &&
+       row.triggerReason !== "routed_candidate")) {
+    return fail("context_generation_conflict", "Reusable context attempt was not current");
+  }
+  return row as unknown as ContextSnapshotReusePreparation;
 }
 
 function validateCanonicalJsonObject(value: string, label: string): Record<string, unknown> {
@@ -2908,15 +2959,21 @@ export function executeContextSnapshotAuthorityOperation(
 ): ContextSnapshotAuthorityResult {
   return runImmediate(database, () => {
     if (operation.type === "context.prepare") {
+      const snapshot = existingSnapshot(database, operation.executionId);
+      if (snapshot !== undefined) {
+        return {
+          kind: "context-preparation",
+          disposition: "existing",
+          preparation: reusePreparation(database, operation.executionId, operation.attemptSeq),
+          snapshot,
+        };
+      }
       const preparation = preparationFromRow(
         database,
         readPreparationRow(database, operation.executionId, operation.attemptSeq),
         operation.attemptSeq,
       );
-      const snapshot = existingSnapshot(database, operation.executionId);
-      return snapshot === undefined
-        ? { kind: "context-preparation", disposition: "candidate", preparation }
-        : { kind: "context-preparation", disposition: "existing", preparation, snapshot };
+      return { kind: "context-preparation", disposition: "candidate", preparation };
     }
     if (operation.type === "context.commit") {
       return { kind: "context-snapshot", snapshot: insertSnapshot(database, operation) };

@@ -185,6 +185,31 @@ describe("bounded Agent runtime scheduler", () => {
     expect(stream).not.toHaveBeenCalled();
   });
 
+  it("terminalizes an invalidated frozen snapshot before any Provider stream begins", async () => {
+    const runtimeAuthority = authority();
+    const stream = vi.fn(async function* (): AsyncIterable<ProviderEvent> {
+      yield { type: "response_started", sequence: 1 };
+    });
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      provider: provider(stream),
+      modelId: "fake-model",
+      async buildProviderInput() {
+        throw new AgentRuntimeError(
+          "context_snapshot_invalidated", "Frozen context snapshot was invalidated",
+        );
+      },
+    });
+
+    const accepted = await runtime.invoke(context, intent("room-a", "invalidated"));
+    await runtime.whenIdle();
+
+    expect(stream).not.toHaveBeenCalled();
+    expect(runtimeAuthority.executions.get(accepted.execution.id)).toMatchObject({
+      status: "failed", terminalErrorCode: "context_snapshot_invalidated",
+    });
+  });
+
   it("runs FIFO within a room while allowing bounded cross-room parallelism", async () => {
     const runtimeAuthority = authority();
     const complete = vi.spyOn(runtimeAuthority, "complete");
