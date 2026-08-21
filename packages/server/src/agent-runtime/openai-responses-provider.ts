@@ -1,5 +1,18 @@
-import type { AgentRuntimeProviderInput, ProviderEvent, ToolDescriptor } from "@native-im/core";
-import { AgentRuntimeError, type ProviderAdapter, type SecretProvider } from "./contracts.js";
+import type { AgentRuntimeProviderInput, ProviderEvent } from "@native-im/core";
+import {
+  canonicalJson,
+  isCompiledProviderEnvelopeV1,
+  type CompiledGroupContentBlockV1,
+  type CompiledProviderEnvelopeV1,
+  type CompiledProviderToolDescriptorV1,
+  type CompiledProviderToolIdV1,
+} from "./compiled-provider-envelope.js";
+import { AgentRuntimeError, type SecretProvider } from "./contracts.js";
+import {
+  AGENT_FINAL_DRAFT_SCHEMA,
+  parseAgentFinalDraftV1,
+  type AgentFinalProviderEventV1,
+} from "./provider-final.js";
 import { parseOpenAIResponseSse } from "./sse-parser.js";
 
 type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
@@ -12,6 +25,19 @@ interface OpenAIResponsesProviderOptions {
   readonly maxSseBufferBytes?: number;
 }
 
+export type OpenAIResponsesProviderEventV1 = ProviderEvent | AgentFinalProviderEventV1;
+
+/**
+ * Transitional local overload. The core contract is migrated by the integration slice; the
+ * legacy overload keeps this isolated slice structurally assignable until that migration lands.
+ * Runtime validation nevertheless rejects the legacy visibleConversation payload.
+ */
+export interface OpenAIResponsesProviderAdapterV1 {
+  readonly id: string;
+  stream(input: CompiledProviderEnvelopeV1, signal: AbortSignal): AsyncIterable<OpenAIResponsesProviderEventV1>;
+  stream(input: AgentRuntimeProviderInput, signal: AbortSignal): AsyncIterable<ProviderEvent>;
+}
+
 function configuredText(value: string, field: string): string {
   if (value.trim().length === 0) throw new TypeError(`${field} must be non-empty`);
   return value;
@@ -19,14 +45,13 @@ function configuredText(value: string, field: string): string {
 
 const OPEN_ITEM_PROPOSAL_FUNCTION = "dao_propose_open_item";
 
-function functionName(tool: ToolDescriptor | ToolDescriptor["id"] | "open-item.propose"): string {
-  const id = typeof tool === "string" ? tool : tool.id;
-  return id === "open-item.propose"
+function functionName(tool: CompiledProviderToolIdV1 | "open-item.propose"): string {
+  return tool === "open-item.propose"
     ? OPEN_ITEM_PROPOSAL_FUNCTION
-    : id.replaceAll(".", "_").replaceAll("-", "_");
+    : tool.replaceAll(".", "_").replaceAll("-", "_");
 }
 
-function functionParameters(tool: ToolDescriptor): Readonly<Record<string, unknown>> {
+function functionParameters(tool: CompiledProviderToolDescriptorV1): Readonly<Record<string, unknown>> {
   if (tool.id === "http-json.read") {
     return {
       type: "object",
@@ -47,7 +72,78 @@ function functionParameters(tool: ToolDescriptor): Readonly<Record<string, unkno
       additionalProperties: false,
     };
   }
+  if (tool.id === "room-memory.read") {
+    return {
+      type: "object",
+      properties: {
+        snapshotId: { type: "string", minLength: 1, maxLength: 256 },
+        sourceLabel: { type: "string", minLength: 1, maxLength: 256 },
+        mode: {
+          type: "string",
+          enum: ["source", "neighbors", "attachment_segment", "memory_sources", "project_object"],
+        },
+        pageSize: { type: "integer", minimum: 1, maximum: 8 },
+        cursor: { type: "string", minLength: 1, maxLength: 4_096 },
+      },
+      required: ["snapshotId", "sourceLabel", "mode"],
+      additionalProperties: false,
+    };
+  }
   return { type: "object", properties: {}, additionalProperties: false };
+}
+
+function groupRole(block: CompiledGroupContentBlockV1): "user" | "assistant" {
+  return block.kind === "agent_message" ? "assistant" : "user";
+}
+
+function buildProviderInput(input: CompiledProviderEnvelopeV1): unknown[] {
+  const providerInput: unknown[] = [
+    {
+      role: "system",
+      content: [{
+        type: "input_text",
+        text: canonicalJson({ schemaVersion: "trusted-system.v1", blocks: input.trusted.system }),
+      }],
+    },
+    {
+      role: "developer",
+      content: [{
+        type: "input_text",
+        text: canonicalJson({
+          schemaVersion: "trusted-developer.v1",
+          snapshot: input.snapshot,
+          invocation: input.invocation,
+          projectContext: input.projectContext,
+          blocks: input.trusted.developer,
+        }),
+      }],
+    },
+    ...input.groupContent.map((block) => ({
+      role: groupRole(block),
+      content: [{
+        type: "input_text",
+        text: canonicalJson({
+          schemaVersion: "untrusted-group-content.v1",
+          trust: "untrusted_group_content",
+          data: block,
+        }),
+      }],
+    })),
+  ];
+  for (const continuation of input.toolContinuations ?? []) {
+    providerInput.push({
+      type: "function_call",
+      call_id: continuation.callId,
+      name: functionName(continuation.toolId),
+      arguments: continuation.argumentsJson,
+    });
+    providerInput.push({
+      type: "function_call_output",
+      call_id: continuation.callId,
+      output: continuation.modelInput,
+    });
+  }
+  return providerInput;
 }
 
 async function* responseBodyChunks(body: ReadableStream<Uint8Array>): AsyncIterable<Uint8Array> {
@@ -79,9 +175,13 @@ function closedHttpError(status: number): AgentRuntimeError {
   return new AgentRuntimeError("provider_failure", "Provider rejected the request");
 }
 
+function malformed(message: string): AgentRuntimeError {
+  return new AgentRuntimeError("provider_malformed", message);
+}
+
 export function createOpenAIResponsesProvider(
   options: OpenAIResponsesProviderOptions,
-): ProviderAdapter {
+): OpenAIResponsesProviderAdapterV1 {
   const endpoint = new URL(configuredText(options.endpoint, "endpoint"));
   if (endpoint.protocol !== "https:" || endpoint.username !== "" || endpoint.password !== "" || endpoint.hash !== "") {
     throw new TypeError("OpenAI Responses endpoint must be a credential-free HTTPS URL");
@@ -93,12 +193,16 @@ export function createOpenAIResponsesProvider(
     throw new TypeError("maxSseBufferBytes must be between 1024 and 1048576");
   }
 
-  return Object.freeze({
+  const adapter = Object.freeze({
     id: "openai-responses",
-    async *stream(input: AgentRuntimeProviderInput, signal: AbortSignal): AsyncIterable<ProviderEvent> {
-      if (input.purpose !== "agent_runtime") {
-        throw new AgentRuntimeError("provider_failure", "Provider input purpose was rejected");
+    async *stream(
+      rawInput: AgentRuntimeProviderInput | CompiledProviderEnvelopeV1,
+      signal: AbortSignal,
+    ): AsyncIterable<OpenAIResponsesProviderEventV1> {
+      if (!isCompiledProviderEnvelopeV1(rawInput) || rawInput.snapshot.modelId !== model) {
+        throw new AgentRuntimeError("provider_failure", "Compiled Provider input was rejected");
       }
+      const input = rawInput;
       const secret = options.secretProvider.getSecret("OPENAI_API_KEY");
       if (secret === undefined || secret.length === 0) {
         throw new AgentRuntimeError(
@@ -106,32 +210,16 @@ export function createOpenAIResponsesProvider(
           "Agent model authentication is not configured",
         );
       }
-      const conversationInput: unknown[] = input.visibleConversation.map((entry) => ({
-        role: "user",
-        content: [{ type: "input_text", text: entry.body }],
-      }));
-      for (const continuation of input.toolContinuations ?? []) {
-        conversationInput.push({
-          type: "function_call",
-          call_id: continuation.callId,
-          name: functionName(continuation.toolId),
-          arguments: continuation.argumentsJson,
-        });
-        conversationInput.push({
-          type: "function_call_output",
-          call_id: continuation.callId,
-          output: continuation.modelInput,
-        });
-      }
       const requestBody = JSON.stringify({
         model,
         stream: true,
         store: false,
-        input: conversationInput,
+        parallel_tool_calls: false,
+        input: buildProviderInput(input),
         tools: [
           ...input.availableTools.map((tool) => ({
             type: "function",
-            name: functionName(tool),
+            name: functionName(tool.id),
             description: tool.displayName,
             strict: true,
             parameters: functionParameters(tool),
@@ -155,6 +243,14 @@ export function createOpenAIResponsesProvider(
             },
           }]),
         ],
+        text: {
+          format: {
+            type: "json_schema",
+            name: "AgentFinalDraftV1",
+            strict: true,
+            schema: AGENT_FINAL_DRAFT_SCHEMA,
+          },
+        },
       });
       if (Buffer.byteLength(requestBody, "utf8") > input.limits.maxInputBytes) {
         throw new AgentRuntimeError("invalid_parameters", "Provider input exceeded its byte limit");
@@ -183,21 +279,49 @@ export function createOpenAIResponsesProvider(
       if (!response.ok) throw closedHttpError(response.status);
       const contentType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
       if (contentType !== "text/event-stream" || response.body === null) {
-        throw new AgentRuntimeError("provider_malformed", "Provider stream content type was rejected");
+        throw malformed("Provider stream content type was rejected");
       }
 
       let outputBytes = 0;
+      let finalText = "";
+      let sawToolCall = false;
       for await (const event of parseOpenAIResponseSse(responseBodyChunks(response.body), {
         maxBufferedBytes: maxSseBufferBytes,
       })) {
         if (event.type === "text_delta" || event.type === "tool_call_delta") {
           outputBytes += Buffer.byteLength(event.delta, "utf8");
           if (outputBytes > input.limits.maxOutputBytes) {
-            throw new AgentRuntimeError("provider_malformed", "Provider output exceeded its byte limit");
+            throw malformed("Provider output exceeded its byte limit");
           }
+        }
+        if (event.type === "text_delta") {
+          if (sawToolCall) throw malformed("Provider mixed tool calls and final output");
+          finalText += event.delta;
+          continue;
+        }
+        if (event.type === "tool_call_started" || event.type === "tool_call_delta") {
+          if (finalText.length > 0) throw malformed("Provider mixed tool calls and final output");
+          sawToolCall = true;
+          yield event;
+          continue;
+        }
+        if (event.type === "completed") {
+          if (sawToolCall) {
+            yield event;
+          } else {
+            const final = parseAgentFinalDraftV1(finalText);
+            yield Object.freeze({
+              type: "agent_final",
+              sequence: event.sequence,
+              body: final.body,
+              citations: final.citations,
+            });
+          }
+          continue;
         }
         yield event;
       }
     },
   });
+  return adapter as OpenAIResponsesProviderAdapterV1;
 }

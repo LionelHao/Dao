@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { RuntimeAuthority, ToolAdapter } from "./contracts.js";
 import { AgentRuntimeError } from "./contracts.js";
+import { RoomMemoryReadError, type RoomMemoryReadToolAdapter } from "./room-memory-read-tool.js";
 import { createToolGateway } from "./tool-gateway.js";
 
 function authority(claimTool: RuntimeAuthority["claimTool"]): RuntimeAuthority {
@@ -80,6 +81,58 @@ describe("tool gateway authority fence", () => {
     expect(execute).toHaveBeenCalledTimes(1);
     expect(runtimeAuthority.settleTool).toHaveBeenCalledWith(
       "dispatch-1", "outcome_unknown", { outcome: "unknown" },
+    );
+  });
+
+  it("keeps a room-memory claim rejection before the source adapter", async () => {
+    const execute = vi.fn();
+    const adapter: RoomMemoryReadToolAdapter = {
+      descriptor: {
+        id: "room-memory.read", displayName: "read source", effect: "read-only", reversibility: "compensatable",
+      },
+      execute,
+    };
+    const gateway = createToolGateway({
+      authority: authority(async () => {
+        throw new AgentRuntimeError("permission_denied", "closed source permission");
+      }),
+      adapters: [adapter],
+    });
+    await expect(gateway.execute({
+      executionId: "execution-1", attemptSeq: 1, roomId: "room-1", agentId: "agent-1",
+      grantId: "grant-1", toolId: "room-memory.read",
+      parameters: { snapshotId: "snapshot-1", sourceLabel: "source-1", mode: "source" },
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({ code: "permission_denied" });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("settles a dispatched read failure while preserving its closed status", async () => {
+    const execute = vi.fn(async () => {
+      throw new RoomMemoryReadError(410, "source_gone");
+    });
+    const runtimeAuthority = authority((async () => ({
+      dispatchId: "dispatch-room-memory",
+      toolId: "room-memory.read",
+      parameters: { snapshotId: "snapshot-1", sourceLabel: "source-1", mode: "source" },
+    })) as unknown as RuntimeAuthority["claimTool"]);
+    const gateway = createToolGateway({
+      authority: runtimeAuthority,
+      adapters: [{
+        descriptor: {
+          id: "room-memory.read", displayName: "read source", effect: "read-only", reversibility: "compensatable",
+        },
+        execute,
+      }],
+    });
+    await expect(gateway.execute({
+      executionId: "execution-1", attemptSeq: 1, roomId: "room-1", agentId: "agent-1",
+      grantId: "grant-1", toolId: "room-memory.read",
+      parameters: { snapshotId: "snapshot-1", sourceLabel: "source-1", mode: "source" },
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({ status: 410, code: "source_gone" });
+    expect(runtimeAuthority.settleTool).toHaveBeenCalledWith(
+      "dispatch-room-memory", "failed", { outcome: "failed" },
     );
   });
 });

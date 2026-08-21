@@ -6,10 +6,17 @@ import {
   type ToolAdapter,
   type ToolOutcome,
 } from "./contracts.js";
+import {
+  isRoomMemoryReadError,
+  type RoomMemoryReadToolAdapter,
+} from "./room-memory-read-tool.js";
+
+type RuntimeToolId = ToolDescriptor["id"] | "room-memory.read";
+type RuntimeToolAdapter = ToolAdapter | RoomMemoryReadToolAdapter;
 
 interface ToolGatewayOptions {
   readonly authority: RuntimeAuthority;
-  readonly adapters: readonly ToolAdapter[];
+  readonly adapters: readonly RuntimeToolAdapter[];
 }
 
 interface GatewayExecutionInput {
@@ -18,7 +25,7 @@ interface GatewayExecutionInput {
   readonly roomId: string;
   readonly agentId: string;
   readonly grantId: string;
-  readonly toolId: ToolDescriptor["id"];
+  readonly toolId: RuntimeToolId;
   readonly parameters: Readonly<Record<string, unknown>>;
   readonly confirmation?: {
     readonly context: AuthenticatedCommandContext;
@@ -32,7 +39,7 @@ export interface ToolGateway {
 }
 
 export function createToolGateway(options: ToolGatewayOptions): ToolGateway {
-  const adapters = new Map<ToolDescriptor["id"], ToolAdapter>();
+  const adapters = new Map<RuntimeToolId, RuntimeToolAdapter>();
   for (const adapter of options.adapters) {
     if (adapters.has(adapter.descriptor.id)) throw new TypeError(`Duplicate tool adapter: ${adapter.descriptor.id}`);
     adapters.set(adapter.descriptor.id, adapter);
@@ -48,7 +55,7 @@ export function createToolGateway(options: ToolGatewayOptions): ToolGateway {
         input.parameters,
         input.confirmation,
       );
-      if (dispatch.toolId !== input.toolId) {
+      if ((dispatch.toolId as RuntimeToolId) !== input.toolId) {
         throw new AgentRuntimeError("execution_conflict", "Claimed tool identity changed");
       }
       try {
@@ -81,7 +88,7 @@ export function createToolGateway(options: ToolGatewayOptions): ToolGateway {
           );
         }
         await options.authority.settleTool(dispatch.dispatchId, "failed", { outcome: "failed" });
-        if (error instanceof AgentRuntimeError) throw error;
+        if (error instanceof AgentRuntimeError || isRoomMemoryReadError(error)) throw error;
         throw new AgentRuntimeError("tool_failure", "Tool execution failed");
       }
     },

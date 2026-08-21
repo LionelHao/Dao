@@ -4,9 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
-import type { AgentRuntimeProviderInput, RouterProviderInput } from "@native-im/core";
+import type { RouterProviderInput } from "@native-im/core";
 import { migrateAuthorityDatabase } from "../persistence/schema.js";
 import { createOpenAIRouterProvider } from "../route-runtime/openai-router-provider.js";
+import type { CompiledProviderEnvelopeV1 } from "./compiled-provider-envelope.js";
 import { createOpenAIResponsesProvider } from "./openai-responses-provider.js";
 
 describe("Agent runtime secret sentinel", () => {
@@ -24,7 +25,8 @@ describe("Agent runtime secret sentinel", () => {
       ).run();
       const fetch = vi.fn(async () => new Response(
         'event: response.created\ndata: {"type":"response.created"}\n\n' +
-        'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"safe"}\n\n' +
+        `event: response.output_item.done\ndata: {"type":"response.output_item.done","raw_private_metadata":${JSON.stringify(sentinel)}}\n\n` +
+        'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"{\\"body\\":\\"safe\\",\\"citations\\":[]}"}\n\n' +
         'event: response.completed\ndata: {"type":"response.completed"}\n\n',
         { status: 200, headers: { "content-type": "text/event-stream" } },
       ));
@@ -34,16 +36,33 @@ describe("Agent runtime secret sentinel", () => {
         secretProvider: { getSecret: () => sentinel },
         fetch,
       });
-      const input: AgentRuntimeProviderInput = {
+      const input: CompiledProviderEnvelopeV1 = {
         purpose: "agent_runtime",
+        schemaVersion: "compiled-context-envelope.v1",
+        snapshot: {
+          snapshotId: "snapshot-sentinel", generation: 1, manifestHash: "a".repeat(64),
+          compilerVersion: "context-compiler-v1", configVersion: "context-budget-v1",
+          modelId: "configured-model",
+        },
         invocation: {
           kind: "direct_mention",
           roomId: "room-sentinel",
           sourceMessageId: "message-sentinel",
           targetAgentId: "agent-sentinel",
         },
-        visibleConversation: [{ messageId: "message-sentinel", authorId: "human-sentinel", body: "safe" }],
+        trusted: {
+          system: [{ kind: "product_policy", text: "Follow server authority." }],
+          developer: [{ kind: "agent_identity", data: { agentId: "agent-sentinel" } }],
+        },
+        groupContent: [{
+          kind: "human_message", trust: "untrusted_group_content",
+          source: { label: "source-sentinel", kind: "message", revision: 1 },
+          speaker: { actorId: "human-sentinel", kind: "human" },
+          content: "safe",
+        }],
+        projectContext: { status: "disabled" },
         availableTools: [],
+        openItemTargets: [],
         committedSteps: [],
         limits: { maxInputBytes: 8_192, maxOutputBytes: 8_192, timeoutMs: 5_000 },
       };
