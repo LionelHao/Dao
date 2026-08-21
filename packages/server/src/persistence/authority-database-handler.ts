@@ -7068,6 +7068,8 @@ export function executeRuntimeAuthorityOperation(
     const recoverable = database.prepare(
       `SELECT execution.id
        FROM agent_executions AS execution
+       JOIN agent_execution_intent_links AS intent_link
+         ON intent_link.execution_id = execution.id
        JOIN rooms AS room ON room.id = execution.room_id
        WHERE execution.status IN ('queued', 'running')
          AND room.status = 'active'

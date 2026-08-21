@@ -113,6 +113,26 @@ describe("real AuthorityWorker runtime authority", () => {
              recalled_by_actor_id = 'human-runtime'
          WHERE message_id = 'message-runtime-recalled'`,
       ).run();
+      database.exec(`
+        INSERT INTO agent_executions (
+          id, room_id, room_archive_generation, agent_id, trigger_message_id,
+          status, started_at, requester_actor_id, tool_name, action_category,
+          tool_dispatch_phase, current_attempt_seq, retry_cycle, retry_ordinal,
+          recovery_cursor, queued_at, updated_at
+        ) VALUES (
+          'legacy-collaboration-execution', 'room-runtime', 0, 'agent-runtime',
+          'message-runtime-1', 'running', '2026-08-17T00:00:09.000Z',
+          'human-runtime', 'sandbox-file.write', 'tool_call', 'not_started',
+          1, 1, 1, 0, '2026-08-17T00:00:09.000Z', '2026-08-17T00:00:09.000Z'
+        );
+        INSERT INTO agent_execution_attempts (
+          execution_id, attempt_seq, retry_cycle, retry_ordinal, status,
+          action_category, started_at, recovery_cursor
+        ) VALUES (
+          'legacy-collaboration-execution', 1, 1, 1, 'running', 'tool_call',
+          '2026-08-17T00:00:09.000Z', 0
+        );
+      `);
       database.close();
 
       const context = {
@@ -187,6 +207,11 @@ describe("real AuthorityWorker runtime authority", () => {
           }),
         }),
       ]);
+      const legacyRead = new DatabaseSync(databasePath, { readOnly: true });
+      expect(legacyRead.prepare(
+        "SELECT status, current_attempt_seq AS attemptSeq FROM agent_executions WHERE id = ?",
+      ).get("legacy-collaboration-execution")).toEqual({ status: "running", attemptSeq: 1 });
+      legacyRead.close();
       await expect(authority.complete(second.execution.id, 1, "late stale result"))
         .rejects.toMatchObject({ code: "execution_conflict" });
       const runningSecond = await authority.claim(second.execution.id, 2);
