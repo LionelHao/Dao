@@ -289,8 +289,9 @@ export function createAttachmentAgentExtractionReader(options: {
         throw new AttachmentAgentExtractionReaderError("storage_unavailable");
       }
       let usableBytes = range.bytes.byteLength;
+      const minimumUsableBytes = Math.max(1, range.bytes.byteLength - 3);
       let text: string | undefined;
-      while (usableBytes > 0 && text === undefined) {
+      while (usableBytes >= minimumUsableBytes && text === undefined) {
         try {
           text = new TextDecoder("utf-8", { fatal: true }).decode(
             range.bytes.subarray(0, usableBytes),

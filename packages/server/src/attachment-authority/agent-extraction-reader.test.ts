@@ -234,5 +234,21 @@ describe("server-private Agent attachment extraction reader", () => {
       executionId: "execution-1", executionGeneration: 2,
       attachmentId: "attachment-1", attachmentGeneration: 5, maximumBytes: 5,
     })).rejects.toMatchObject({ code: "storage_unavailable" });
+
+    const malformedSegment = createAttachmentAgentExtractionReader({
+      ...base,
+      objectStore: {
+        readAuthorizedRange: vi.fn(async () => ({
+          bytes: new Uint8Array([0x41, 0xff, 0xff, 0xff, 0xff]),
+          byteSize: 5,
+          eof: true,
+        })),
+      },
+    });
+    await expect(malformedSegment.readSegment({
+      executionId: "execution-1", executionGeneration: 2,
+      attachmentId: "attachment-1", attachmentGeneration: 5,
+      offset: 0, maximumBytes: 5,
+    })).rejects.toMatchObject({ code: "storage_unavailable" });
   });
 });
