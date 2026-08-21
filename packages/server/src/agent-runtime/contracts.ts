@@ -23,6 +23,7 @@ export type AgentRuntimeErrorCode =
   | "confirmation_expired"
   | "confirmation_forbidden"
   | "confirmation_replayed"
+  | "content_too_large"
   | "execution_conflict"
   | "execution_not_found"
   | "invalid_parameters"
@@ -44,6 +45,7 @@ const errorStatuses: Readonly<Record<AgentRuntimeErrorCode, 400 | 403 | 404 | 40
   confirmation_expired: 410,
   confirmation_forbidden: 403,
   confirmation_replayed: 409,
+  content_too_large: 400,
   execution_conflict: 409,
   execution_not_found: 404,
   invalid_parameters: 400,
