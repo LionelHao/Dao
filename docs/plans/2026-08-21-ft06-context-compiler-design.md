@@ -118,15 +118,15 @@ tool id 固定为 `room-memory.read`，effect=`read-only`。参数只允许 `{sn
 
 closed status 映射：401 身份/会话无效；403 capability/membership/visibility；409 execution/snapshot/generation/cursor冲突；410 room/source/snapshot gone或invalidated；429页/次数/累计预算；503 authority/extraction暂不可用。offline 不执行工具；repair 完成前返回503；超时为503且不扩展范围。
 
-cursor 是 server opaque authenticated binding，包含 room、execution、snapshot、generation、source label/revision、range/page、authorization epoch与expiry。返回值只包含 bounded data、provenance、immutable revision、next cursor与一次 read receipt/citation label。
+cursor 是 server opaque authenticated binding，包含 room、execution、snapshot、generation、source label/revision、range/page、authorization epoch与expiry。返回值只包含 bounded data、provenance、immutable revision、next cursor与一次 read receipt/citation label。receipt label 固定为 `read:` 加恰好32 bytes随机值的canonical unpadded base64url（总长48字符）；数据库只保存整个含前缀label的SHA-256。裸43字符、非canonical编码和跨namespace label均拒绝。
 
 FT-09 尚未交付，production `ProjectContextAdapter` 固定返回 `disabled`；`project_object` 读取返回 unavailable，不从消息推断。
 
 ## 9. Citation 闭环
 
-Provider final 使用闭合 citation declaration：正文中的任意自然语言 source id 不解析；只有 Adapter 识别的独立 citation token part/严格标记才成为 declaration。token 必须是本 snapshot manifest label或successful source-read receipt label。server 校验 room、execution、snapshot、source revision、generation、visibility与 declaration 子集，去重并按 label 排序。
+Provider final 使用闭合 citation declaration：正文中的任意自然语言 source id 不解析；只有 Adapter 识别的独立 citation token part/严格标记才成为 declaration。token 必须是本 snapshot 中有真实immutable source identity且携带预算内表示的manifest label，或successful source-read receipt label。`source:null` 的delta range manifest label只可用于发起bounded read，不可直接final-cite；读取成功后的receipt可final-cite并投影为`delta_range(sourceIndexSha256, rangeOrdinal+1)`。server 校验 room、execution、snapshot、source revision、generation、visibility与 declaration 子集，去重并按 label 排序。
 
-final commit 在 AuthorityWorker 单事务中再次 revalidate，插入 Agent message、verified `agent_message_citations`、execution terminal与既有 event/outbox。失败则整笔回滚且无 final。客户端只能接收 server-confirmed citation projection；点击仍走现有授权 source query。source recall/撤权显示正式 unavailable/tombstone，不泄漏正文。Stage 8 不新增未经正式设计覆盖的 Desktop 控件；若现有 timeline/source projection可承载，citation metadata只作为server-confirmed可选字段接入。
+final commit 在 AuthorityWorker 单事务中再次 revalidate，插入 Agent message、verified `agent_message_citations`、execution terminal与既有 event/outbox。失败则整笔回滚且无 final。客户端只能接收 server-confirmed citation projection；点击仍走现有授权 source query。source recall/撤权显示正式 unavailable/tombstone，不泄漏正文。现有query尚不能表达aggregate `delta_range`，因此其receipt-backed来源显示“历史范围（已读取）”但明确不可打开，绝不拼成message deep-link；正式range resolver属于后续闭合协议扩展。Stage 8 不新增未经正式设计覆盖的 Desktop 控件；若现有 timeline/source projection可承载，citation metadata只作为server-confirmed可选字段接入。
 
 ## 10. Provider 与隐私
 
