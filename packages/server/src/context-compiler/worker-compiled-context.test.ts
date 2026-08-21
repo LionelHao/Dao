@@ -209,6 +209,93 @@ describe("production Worker compiled context builder", () => {
     expect(JSON.stringify(result)).not.toContain("visibleConversation");
   });
 
+  it("records an unavailable attachment as non-required without requesting extraction authority", async () => {
+    const input: ContextCompilerInputV1 = {
+      ...compilerInput(),
+      corpusHead: 1,
+      attachments: [{
+        source: {
+          roomId: "room-1", sourceKind: "attachment_extraction",
+          sourceId: "attachment-extraction:historical", revision: 1, corpusSeq: 1,
+        },
+        body: null,
+        availability: "temporarily_unavailable",
+        author: null,
+        occurredAt: "2026-08-21T00:00:00.000Z",
+        replyTo: null,
+        mentions: [],
+        readRef: "attachment-historical-ref",
+      }],
+    };
+    const prepared = {
+      ...preparation(),
+      corpusHead: 1,
+      membershipAccessRevision: 7,
+      compilerInputFacts: input,
+    };
+    let committedSources: ReadonlyArray<Record<string, unknown>> = [];
+    const compiled = compileContextV1(input, {
+      ...CONTEXT_COMPILER_CONFIG_V1, modelId: "model-1",
+    });
+    if (!compiled.ok) throw new Error("fixture compile failed");
+    const worker = {
+      executeContext: vi.fn(async (operation: Record<string, unknown>) => {
+        if (operation.type === "context.prepare") {
+          return { kind: "context-preparation", disposition: "candidate", preparation: prepared };
+        }
+        if (operation.type === "context.commit") {
+          committedSources = operation.sources as ReadonlyArray<Record<string, unknown>>;
+          return {
+            kind: "context-snapshot",
+            snapshot: {
+              snapshotId: operation.snapshotId, executionId: execution.id, attemptSeq: 1,
+              snapshotGeneration: 1, executionGeneration: 1, state: "active",
+              manifestSha256: compiled.manifestSha256,
+              envelopeSha256: compiled.envelopeSha256, payloadRetentionState: "required",
+            },
+          };
+        }
+        if (operation.type === "context.read") {
+          return {
+            kind: "context-body",
+            snapshot: {
+              snapshotId: "snapshot-unavailable-attachment", executionId: execution.id,
+              attemptSeq: 1, snapshotGeneration: 1, executionGeneration: 1,
+              state: "active", manifestSha256: compiled.manifestSha256,
+              envelopeSha256: compiled.envelopeSha256, payloadRetentionState: "required",
+            },
+            envelopeSchemaVersion: compiled.envelope.version,
+            canonicalEnvelopeJson: compiled.canonicalEnvelope,
+            byteCount: Buffer.byteLength(compiled.canonicalEnvelope, "utf8"),
+            tokenCount: compiled.manifest.accounting.inputTokens,
+          };
+        }
+        throw new Error(`unexpected operation ${String(operation.type)}`);
+      }),
+    };
+    const attachmentAuthorizationRevision = vi.fn(async () => {
+      throw new Error("unavailable attachment must not be authorized");
+    });
+    const builder = createWorkerCompiledContextBuilder({
+      worker,
+      availableTools: [tool],
+      timeoutMs: 5_000,
+      attachmentAuthorizationRevision,
+      nextId: (kind) => `${kind}-unavailable-attachment`,
+    });
+
+    await expect(builder.build(execution, intent)).resolves.toMatchObject({
+      snapshot: { generation: 1 },
+    });
+    expect(attachmentAuthorizationRevision).not.toHaveBeenCalled();
+    expect(committedSources).toContainEqual(expect.objectContaining({
+      sourceKind: "attachment_extraction",
+      sourceId: "attachment-extraction:historical",
+      currentlyRequired: false,
+      authorizationRevision: 7,
+    }));
+  });
+
   it("binds an automatic retry to the existing snapshot before revalidation", async () => {
     const compiled = compileContextV1(compilerInput(), {
       ...CONTEXT_COMPILER_CONFIG_V1,

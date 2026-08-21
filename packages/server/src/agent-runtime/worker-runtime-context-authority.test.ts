@@ -87,6 +87,51 @@ describe("worker runtime context authority composition", () => {
     expect(runtimeOperations).toHaveLength(1);
   });
 
+  it("forgets an in-process source grant after a failed dispatch", async () => {
+    const worker = {
+      executeRuntime: vi.fn(async (operation: Record<string, unknown>) => {
+        if (operation.type === "runtime.claim") return { kind: "execution", execution };
+        if (operation.type === "runtime.claim-tool") {
+          return {
+            kind: "claimed-tool", dispatchId: "fallback-dispatch",
+            toolId: "room-memory.read", parameters: operation.parameters,
+          };
+        }
+        throw new Error(`unexpected runtime operation ${String(operation.type)}`);
+      }),
+    } as unknown as WorkerDatabaseClient;
+    const contextWorker = {
+      executeContext: vi.fn(async (operation: Record<string, unknown>) => {
+        if (operation.type === "context.prepare") return contextPreparation();
+        if (operation.type === "context.source-read-grant") {
+          return { kind: "context-source-read-grant", grantId: operation.grantId };
+        }
+        if (operation.type === "context.source-read-dispatch") {
+          throw new Error("temporary context authority failure");
+        }
+        throw new Error(`unexpected context operation ${String(operation.type)}`);
+      }),
+    } as unknown as ContextAuthorityWorkerDatabaseClient;
+    const authority = createWorkerRuntimeAuthority(worker, { contextWorker });
+    await authority.claim(execution.id, 1);
+    const parameters = {
+      snapshotId: "snapshot-context", sourceLabel: "source:one", mode: "source",
+    } as const;
+    const prepared = await authority.prepareTool(
+      execution.id, 1, sourceTool, parameters, undefined,
+      { callId: "call-source", argumentsJson: JSON.stringify(parameters) },
+    );
+
+    await expect(authority.claimTool(
+      execution.id, 1, prepared.grantId, parameters, undefined, { callId: "call-source" },
+    )).rejects.toMatchObject({ code: "provider_failure" });
+    await expect(authority.claimTool(
+      execution.id, 1, prepared.grantId, parameters, undefined, { callId: "call-source" },
+    )).resolves.toMatchObject({ dispatchId: "fallback-dispatch" });
+    expect(contextWorker.executeContext).toHaveBeenCalledTimes(3);
+    expect(worker.executeRuntime).toHaveBeenCalledTimes(2);
+  });
+
   it("atomically finalizes the Agent message with the active snapshot and citations", async () => {
     const operations: Record<string, unknown>[] = [];
     const worker = {

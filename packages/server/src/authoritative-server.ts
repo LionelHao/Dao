@@ -586,7 +586,6 @@ async function start(
         },
       },
     });
-    await runtime.recover();
     const routeAuthority = createWorkerRouteAuthority(worker);
     const routerProvider = createOpenAIRouterProvider({
       endpoint: runtimeConfiguration.endpoint ?? "https://api.openai.com/v1/responses",
@@ -608,7 +607,6 @@ async function start(
         if (replacements.length === 0) await runtime!.invokeRouted(routeJobId, runtimeIntent);
       },
     });
-    await routeRuntime.recover();
     humanPreemptionRuntime = createHumanPreemptionRuntime({
       worker,
       runtime,
@@ -616,7 +614,6 @@ async function start(
         return routeRuntime!.notify(roomId, sourceMessageId);
       },
     });
-    await humanPreemptionRuntime.recover();
     ballRuntime = createBallRuntimeService({
       worker,
       blueprint: testOptions.blueprintBallProjectionPort ?? createEmptyBlueprintBallProjectionPort(),
@@ -624,7 +621,6 @@ async function start(
       ...(ballConfiguration.scanIntervalMs === undefined
         ? {} : { scanIntervalMs: ballConfiguration.scanIntervalMs }),
     });
-    await ballRuntime.recover();
     const sendBeforeMarkFaultDeliveries = new Set<string>();
     const outboxStore = testOptions.faultPoint === "after-send-before-dispatch-mark"
       ? {
@@ -785,6 +781,10 @@ async function start(
       }
       settleAttachmentReader(attachmentExtractionReader);
     }
+    await runtime.recover();
+    await routeRuntime.recover();
+    await humanPreemptionRuntime.recover();
+    await ballRuntime.recover();
     const memoryProvider = createOpenAIMemoryStewardProvider({
       endpoint: runtimeConfiguration.endpoint ?? "https://api.openai.com/v1/responses",
       model: runtimeModel,

@@ -203,7 +203,8 @@ async function sourceSet(
     kind: ContextSnapshotSourceInput["sourceKind"],
     sourceId: string,
     sourceRevision: number,
-  ): Promise<number> => kind === "attachment_extraction"
+    currentlyRequired: boolean,
+  ): Promise<number> => kind === "attachment_extraction" && currentlyRequired
     ? attachmentAuthorizationRevision(sourceId, sourceRevision)
     : preparation.membershipAccessRevision;
   const add = async (
@@ -213,13 +214,14 @@ async function sourceSet(
     sourceLabel: string | null,
     currentlyRequired: boolean,
   ): Promise<void> => {
+    const required = kind !== "message_tombstone" && currentlyRequired;
     const source: ContextSnapshotSourceInput = {
       sourceKind: kind,
       sourceId,
       sourceRevision,
       sourceLabel,
-      currentlyRequired: kind !== "message_tombstone" && currentlyRequired,
-      authorizationRevision: await authorizationRevision(kind, sourceId, sourceRevision),
+      currentlyRequired: required,
+      authorizationRevision: await authorizationRevision(kind, sourceId, sourceRevision, required),
     };
     const identity = key(source);
     const existing = values.get(identity);
@@ -231,6 +233,9 @@ async function sourceSet(
         ...existing,
         ...(existing.sourceLabel === null && sourceLabel !== null ? { sourceLabel } : {}),
         currentlyRequired: existing.currentlyRequired || source.currentlyRequired,
+        authorizationRevision: source.currentlyRequired
+          ? source.authorizationRevision
+          : existing.authorizationRevision,
       });
     }
   };

@@ -968,11 +968,16 @@ describe("bounded Agent runtime scheduler", () => {
       tools: [adapter.descriptor],
       toolGateway: gateway,
     });
-    const accepted = await beforeRestart.invoke(context, intent("room-a", "a-restored"));
+    const restoredIntent = {
+      ...intent("room-a", "a-restored"),
+      kind: "structured_help" as const,
+    };
+    const accepted = await beforeRestart.invoke(context, restoredIntent);
     await beforeRestart.whenIdle();
     await beforeRestart.close();
     runtimeAuthority.readPendingConfirmation = vi.fn(async () => ({
       execution: runtimeAuthority.executions.get(accepted.execution.id)!,
+      intent: restoredIntent,
       grantId: "grant-restored",
       toolId: "sandbox-file.write",
       parameters: { path: "a.txt" },
@@ -992,7 +997,10 @@ describe("bounded Agent runtime scheduler", () => {
         yield { type: "agent_final", sequence: 2, body: "restored completion", citations: [] };
       }),
       modelId: "fake-model",
-      buildProviderInput: providerInputWithTools([adapter.descriptor]),
+      async buildProviderInput(executionValue, invocationValue) {
+        expect(invocationValue).toEqual(restoredIntent);
+        return providerInputWithTools([adapter.descriptor])(executionValue, invocationValue);
+      },
       tools: [adapter.descriptor],
       toolGateway: gateway,
     });

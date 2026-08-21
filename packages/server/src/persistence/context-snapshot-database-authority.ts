@@ -767,7 +767,10 @@ function readCompilerInputFacts(database: DatabaseSync, row: PreparationRow): Co
   }));
   const sourceRows = database.prepare(
     `SELECT edge.memory_version_id AS memoryVersionId, edge.source_kind AS sourceKind,
-            edge.source_id AS sourceId, edge.source_revision AS sourceRevision,
+            CASE WHEN edge.source_kind IN ('message', 'message_revision', 'message_tombstone')
+              THEN COALESCE(json_extract(source.safe_metadata_json, '$.messageId'), edge.source_id)
+              ELSE edge.source_id END AS sourceId,
+            edge.source_revision AS sourceRevision,
             source.corpus_seq AS corpusSeq
      FROM room_memory_source_edges AS edge
      JOIN room_memory_records AS record
@@ -1243,8 +1246,21 @@ function requireCurrentSource(
     ? database.prepare(
         `SELECT 1 AS present FROM message_envelopes
          WHERE message_id = ? AND room_id = ? AND current_revision = ?
-           AND lifecycle = 'active'`,
-      ).get(source.sourceId, source.roomId, source.sourceRevision)
+           AND lifecycle = 'active'
+           AND NOT EXISTS (
+             SELECT 1 FROM room_memory_sources AS corpus
+             WHERE corpus.room_id = ?
+               AND corpus.source_kind IN ('message', 'message_revision')
+               AND COALESCE(
+                 json_extract(corpus.safe_metadata_json, '$.messageId'), corpus.source_id
+               ) = ?
+               AND corpus.source_revision = ?
+               AND (corpus.eligibility <> 'eligible' OR corpus.availability <> 'readable')
+           )`,
+      ).get(
+        source.sourceId, source.roomId, source.sourceRevision,
+        source.roomId, source.sourceId, source.sourceRevision,
+      )
     : source.sourceKind === "message_tombstone"
       ? source.currentlyRequired
         ? undefined
@@ -1327,8 +1343,9 @@ function validateCompleteSourceSet(
   const authorizationRevision = (
     sourceKind: ContextSnapshotSourceKind,
     sourceId: string,
+    currentlyRequired: boolean,
   ): number => {
-    if (sourceKind !== "attachment_extraction") {
+    if (sourceKind !== "attachment_extraction" || !currentlyRequired) {
       return preparation.membershipAccessRevision;
     }
     const attachment = database.prepare(
@@ -1343,14 +1360,17 @@ function validateCompleteSourceSet(
   for (const item of operation.manifest.items) {
     const sourceKind = manifestSourceKind(item.sourceKind);
     if (sourceKind !== undefined && item.sourceId !== null && item.sourceRevision !== null) {
+      const currentlyRequired = sourceKind !== "message_tombstone" &&
+        item.availability !== "invalidated" && item.availability !== "unavailable";
       const binding = {
         sourceLabel: item.sourceLabel,
         sourceKind,
         sourceId: item.sourceId,
         sourceRevision: item.sourceRevision,
-        currentlyRequired: sourceKind !== "message_tombstone" &&
-          item.availability !== "invalidated" && item.availability !== "unavailable",
-        authorizationRevision: authorizationRevision(sourceKind, item.sourceId),
+        currentlyRequired,
+        authorizationRevision: authorizationRevision(
+          sourceKind, item.sourceId, currentlyRequired,
+        ),
       };
       expected.set(key(binding), binding);
     }
@@ -1361,18 +1381,23 @@ function validateCompleteSourceSet(
     sourceRevision: number,
     currentlyRequired: boolean,
   ): void => {
+    const required = sourceKind !== "message_tombstone" && currentlyRequired;
     const binding = {
       sourceLabel: null,
       sourceKind,
       sourceId,
       sourceRevision,
-      currentlyRequired: sourceKind !== "message_tombstone" && currentlyRequired,
-      authorizationRevision: authorizationRevision(sourceKind, sourceId),
+      currentlyRequired: required,
+      authorizationRevision: authorizationRevision(sourceKind, sourceId, required),
     };
     const existing = expected.get(key(binding));
     if (existing === undefined) expected.set(key(binding), binding);
     else if (!existing.currentlyRequired && binding.currentlyRequired) {
-      expected.set(key(binding), { ...existing, currentlyRequired: true });
+      expected.set(key(binding), {
+        ...existing,
+        currentlyRequired: true,
+        authorizationRevision: binding.authorizationRevision,
+      });
     }
   };
   addRaw("message_revision", preparation.triggerMessageId, preparation.triggerRevision, true);
@@ -1988,6 +2013,7 @@ function invalidateSource(
      FROM context_snapshots AS snapshot
      JOIN context_snapshot_sources AS source ON source.snapshot_id = snapshot.snapshot_id
      WHERE snapshot.room_id = ? AND snapshot.state = 'active'
+       AND source.currently_required = 1
        AND source.source_kind = ? AND source.source_id = ? AND source.source_revision = ?
      ORDER BY snapshot.snapshot_id`,
   ).all(operation.roomId, operation.sourceKind, operation.sourceId, operation.sourceRevision);
@@ -2143,7 +2169,8 @@ function claimSourceRead(
   let source = database.prepare(
     `SELECT room_id AS roomId, source_kind AS sourceKind, source_id AS sourceId,
             source_revision AS sourceRevision,
-            authorization_revision AS authorizationRevision
+            authorization_revision AS authorizationRevision,
+            currently_required AS currentlyRequired
      FROM context_snapshot_sources
      WHERE snapshot_id = ? AND source_label_sha256 = ?`,
   ).get(snapshot.snapshotId, sha256(operation.sourceLabel));
@@ -2152,7 +2179,8 @@ function claimSourceRead(
       `SELECT snapshot.room_id AS roomId, 'delta_range' AS sourceKind,
               range_source.source_index_sha256 AS sourceId,
               range_source.range_ordinal + 1 AS sourceRevision,
-              snapshot.membership_access_revision AS authorizationRevision
+              snapshot.membership_access_revision AS authorizationRevision,
+              1 AS currentlyRequired
        FROM context_manifest_range_sources AS range_source
        JOIN context_snapshots AS snapshot ON snapshot.snapshot_id = range_source.snapshot_id
        WHERE range_source.snapshot_id = ? AND range_source.range_label_sha256 = ?
@@ -2162,6 +2190,20 @@ function claimSourceRead(
   }
   if (source === undefined) {
     return fail("context_forbidden", "Source label is not present in the snapshot manifest");
+  }
+  if (source.currentlyRequired !== 1 && source.sourceKind !== "message_tombstone") {
+    return fail("context_forbidden", "Source label is not readable in the frozen snapshot");
+  }
+  if (source.sourceKind === "message_tombstone") {
+    requireCurrentSource(database, {
+      roomId: String(source.roomId),
+      sourceKind: "message_tombstone",
+      sourceId: String(source.sourceId),
+      sourceRevision: Number(source.sourceRevision),
+      sourceLabel: operation.sourceLabel,
+      currentlyRequired: false,
+      authorizationRevision: Number(source.authorizationRevision),
+    });
   }
   const dispatchAuthority = database.prepare(
     `SELECT grant.parameter_sha256 AS parameterSha256, grant.expires_at AS expiresAt
@@ -2401,7 +2443,10 @@ function readSourcePage(
     ).all(String(source?.roomId), String(read.sourceId), limit + 1);
   } else if (read.mode === "memory_sources" && read.sourceKind === "memory") {
     rows = database.prepare(
-      `SELECT edge.source_kind AS sourceKind, edge.source_id AS sourceId,
+      `SELECT edge.source_kind AS sourceKind,
+              CASE WHEN edge.source_kind IN ('message', 'message_revision', 'message_tombstone')
+                THEN COALESCE(json_extract(source.safe_metadata_json, '$.messageId'), edge.source_id)
+                ELSE edge.source_id END AS sourceId,
               edge.source_revision AS sourceRevision, source.availability,
               source.safe_metadata_json AS safeMetadataJson,
               CASE WHEN source.availability = 'readable'
@@ -2414,7 +2459,9 @@ function readSourcePage(
         AND source.source_revision = edge.source_revision
        LEFT JOIN message_revisions AS revision
          ON source.source_kind IN ('message', 'message_revision')
-        AND revision.message_id = source.source_id
+        AND revision.message_id = COALESCE(
+          json_extract(source.safe_metadata_json, '$.messageId'), source.source_id
+        )
         AND revision.revision = source.source_revision
        WHERE edge.memory_version_id = ?
        ORDER BY edge.source_kind, edge.source_id, edge.source_revision

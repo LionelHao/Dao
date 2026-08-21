@@ -22,6 +22,7 @@ import {
   compileContextV1,
 } from "../context-compiler/context-compiler.js";
 import { canonicalJsonV1 } from "../context-compiler/canonical-json.js";
+import { registerMemoryCorpusSource } from "../room-memory/corpus-database-authority.js";
 
 const NOW_MS = Date.parse("2026-08-21T12:00:00.000Z");
 const NOW = new Date(NOW_MS).toISOString();
@@ -304,7 +305,9 @@ function commitInput(
       sourceId: entry.source.sourceId,
       sourceRevision: entry.source.revision,
       sourceLabel: entry.citationLabel,
-      currentlyRequired: entry.source.sourceKind !== "message_tombstone",
+      currentlyRequired: entry.source.sourceKind !== "message_tombstone" &&
+        entry.availability !== "invalidated" &&
+        entry.availability !== "temporarily_unavailable",
       authorizationRevision: 0,
     } as const;
     authoritativeSources.set(sourceKey(source), source);
@@ -313,23 +316,31 @@ function commitInput(
     sourceKind: SnapshotSource["sourceKind"],
     sourceId: string,
     sourceRevision: number,
+    currentlyRequired = true,
   ) => {
     const source = {
       sourceKind, sourceId, sourceRevision, sourceLabel: null,
-      currentlyRequired: sourceKind !== "message_tombstone", authorizationRevision: 0,
+      currentlyRequired: sourceKind !== "message_tombstone" && currentlyRequired,
+      authorizationRevision: 0,
     } as const;
-    if (!authoritativeSources.has(sourceKey(source))) {
+    const existing = authoritativeSources.get(sourceKey(source));
+    if (existing === undefined) {
       authoritativeSources.set(sourceKey(source), source);
+    } else if (!existing.currentlyRequired && source.currentlyRequired) {
+      authoritativeSources.set(sourceKey(source), { ...existing, currentlyRequired: true });
     }
   };
   addRawSource("message_revision", facts.trigger.source.sourceId, facts.trigger.source.revision);
   for (const delta of [...facts.delta, ...facts.attachments]) {
     addRawSource(
       normalizedKind(delta.source.sourceKind), delta.source.sourceId, delta.source.revision,
+      delta.availability === "readable" || delta.availability === "metadata_only",
     );
   }
   for (const memory of facts.memories) {
-    addRawSource("memory", memory.memoryVersionId, memory.version);
+    addRawSource(
+      "memory", memory.memoryVersionId, memory.version, memory.availability === "readable",
+    );
   }
   const totals = items.reduce((sum, item) => ({
     originalBytes: sum.originalBytes + item.originalBytes,
@@ -523,13 +534,24 @@ function seedReadyAttachmentExtraction(database: DatabaseSync): string {
       ready_at = '${NOW}' WHERE attachment_id = 'context-attachment';
     INSERT INTO message_attachment_links (message_id, room_id, attachment_id, operational_state)
     VALUES ('context-trigger', 'context-room', 'context-attachment', 'active');
-    INSERT INTO room_memory_sources (
-      room_id, corpus_seq, source_kind, source_id, source_revision,
-      server_stream_seq, eligibility, availability, source_actor_id,
-      safe_metadata_json, read_reference, occurred_at, updated_at
-    ) VALUES ('context-room', 1, 'attachment_extraction', '${sourceId}', 1, 1,
-      'eligible', 'readable', 'context-human', '{}', 'attachment-ref', '${NOW}', '${NOW}');
   `);
+  registerMemoryCorpusSource(database, {
+    roomId: "context-room",
+    sourceKind: "attachment_extraction",
+    sourceId,
+    sourceRevision: 1,
+    serverStreamSeq: 1,
+    eligibility: "eligible",
+    availability: "readable",
+    sourceActorId: "context-human",
+    safeMetadata: {
+      attachmentId: "context-attachment",
+      messageId: "context-trigger",
+      status: "ready-bound-active",
+    },
+    readReference: "attachment-authority:context-attachment:generation:1",
+    occurredAt: NOW,
+  });
   return artifactSha256;
 }
 
@@ -699,19 +721,46 @@ describe("v19 Context Snapshot database authority", () => {
     });
   });
 
-  it("returns closed compiler facts and never injects disputed memory", () => {
+  it("returns closed compiler facts and normalizes prefixed memory sources", () => {
     withDatabase((database) => {
       seedExecution(database, "active");
+      registerMemoryCorpusSource(database, {
+        roomId: "context-room",
+        sourceKind: "message",
+        sourceId: "message:context-trigger",
+        sourceRevision: 1,
+        serverStreamSeq: 1,
+        eligibility: "eligible",
+        availability: "readable",
+        sourceActorId: "context-human",
+        safeMetadata: { authorKind: "human", messageId: "context-trigger" },
+        readReference: "message-authority:context-trigger:revision:1",
+        occurredAt: NOW,
+      });
       database.exec(`
-        INSERT INTO room_memory_sources (
-          room_id, corpus_seq, source_kind, source_id, source_revision,
-          server_stream_seq, eligibility, availability, source_actor_id,
-          safe_metadata_json, read_reference, occurred_at, updated_at
-        ) VALUES ('context-room', 1, 'message_revision', 'context-trigger', 1,
-          1, 'eligible', 'readable', 'context-human', '{}',
-          'context-trigger-ref', '${NOW}', '${NOW}');
+        INSERT INTO room_memory_jobs (
+          job_id, room_id, recovery_generation, lifecycle_generation,
+          from_watermark_exclusive, to_corpus_seq_inclusive, source_count,
+          frozen_sources_json, status, current_attempt, available_at, claimed_at,
+          completed_at, last_error_code, result_sha256, created_at, updated_at
+        ) VALUES ('context-memory-job', 'context-room', 1, 0, 0, 1, 1,
+          '[{"sourceId":"message:context-trigger","sourceRevision":1}]',
+          'queued', 0, '${NOW}', NULL, NULL, NULL, NULL, '${NOW}', '${NOW}');
+        INSERT INTO room_memory_attempts (
+          attempt_id, job_id, room_id, recovery_generation, attempt_number,
+          status, input_sha256, output_sha256, error_code, started_at,
+          finished_at, available_at
+        ) VALUES ('context-memory-attempt', 'context-memory-job', 'context-room', 1, 1,
+          'running', '${"a".repeat(64)}', NULL, NULL, '${NOW}', NULL, '${NOW}');
+        UPDATE room_memory_attempts
+        SET status = 'succeeded', output_sha256 = '${"b".repeat(64)}', finished_at = '${NOW}'
+        WHERE attempt_id = 'context-memory-attempt';
+        UPDATE room_memory_jobs
+        SET status = 'completed', completed_at = '${NOW}', result_sha256 = '${"b".repeat(64)}',
+            updated_at = '${NOW}'
+        WHERE job_id = 'context-memory-job';
         UPDATE room_memory_stewards
-        SET corpus_head = 1, health = 'catching_up', updated_at = '${NOW}'
+        SET corpus_head = 1, memory_watermark = 1, health = 'healthy', updated_at = '${NOW}'
         WHERE room_id = 'context-room';
         INSERT INTO room_memory_records (
           memory_record_id, room_id, kind, dedupe_key, current_version_id,
@@ -729,21 +778,8 @@ describe("v19 Context Snapshot database authority", () => {
           edge_id, memory_version_id, memory_record_id, room_id, source_kind,
           source_id, source_revision, created_at
         ) VALUES ('context-memory-edge-v1', 'context-memory-v1',
-          'context-memory-record', 'context-room', 'message_revision',
-          'context-trigger', 1, '${NOW}');
-        INSERT INTO room_memory_versions (
-          memory_version_id, memory_record_id, room_id, version_number, kind, state,
-          derived_text, proposal_id, origin_kind, created_by_actor_id, source_job_id,
-          replaces_version_id, source_count, created_at
-        ) VALUES ('context-memory-v2', 'context-memory-record', 'context-room', 2,
-          'context', 'disputed', 'DISPUTED_PRIVATE_CONTEXT', NULL,
-          'human_resolution', 'context-human', NULL, 'context-memory-v1', 1, '${NOW}');
-        INSERT INTO room_memory_source_edges (
-          edge_id, memory_version_id, memory_record_id, room_id, source_kind,
-          source_id, source_revision, created_at
-        ) VALUES ('context-memory-edge-v2', 'context-memory-v2',
-          'context-memory-record', 'context-room', 'message_revision',
-          'context-trigger', 1, '${NOW}');
+          'context-memory-record', 'context-room', 'message',
+          'message:context-trigger', 1, '${NOW}');
       `);
       const prepared = preparation(database);
       expect(prepared.compilerInputFacts).toMatchObject({
@@ -760,15 +796,261 @@ describe("v19 Context Snapshot database authority", () => {
           author: { actorId: "context-human", kind: "human" }, replyTo: null,
         },
       });
+      expect(prepared.compilerInputFacts.memories).toHaveLength(1);
       expect(prepared.compilerInputFacts.memories.every(
-        (memory) => memory.availability === "temporarily_unavailable",
+        (memory) => memory.availability === "readable",
       )).toBe(true);
-      expect(JSON.stringify(prepared.compilerInputFacts)).not.toContain("DISPUTED_PRIVATE_CONTEXT");
-      expect(prepared.compilerInputFacts.delta).toMatchObject([{
-        source: { sourceId: "context-trigger", revision: 1 },
-        author: { actorId: "context-human", displayName: "Human", kind: "human" },
-        body: "frozen trigger", mentions: [{ targetActorId: "context-agent" }],
+      expect(prepared.compilerInputFacts.memories[0]?.sourceRefs).toEqual([{
+        roomId: "context-room", sourceKind: "message_revision",
+        sourceId: "context-trigger", revision: 1, corpusSeq: 1,
       }]);
+      expect(prepared.compilerInputFacts.delta).toEqual([]);
+      const operation = commitInput(
+        prepared.preparationSha256, {}, prepared.compilerInputFacts,
+      );
+      executeContextSnapshotAuthorityOperation(database, operation);
+      const memoryItem = operation.manifest.items.find((item) => item.sourceKind === "memory");
+      if (memoryItem?.sourceLabel === null || memoryItem === undefined) {
+        throw new Error("memory manifest item missing");
+      }
+      const request = {
+        executionId: "context-execution", attemptSeq: 1, snapshotGeneration: 1,
+        callId: "prefixed-memory-call", grantId: "prefixed-memory-grant",
+        dispatchId: "prefixed-memory-dispatch", parameterSha256: sha256("prefixed-memory"),
+      } as const;
+      grantAndDispatchSourceRead(database, request);
+      executeContextSnapshotAuthorityOperation(database, {
+        type: "context.source-read-claim", readId: "prefixed-memory-read",
+        executionId: request.executionId, attemptSeq: 1, expectedSnapshotGeneration: 1,
+        callId: request.callId, grantId: request.grantId, dispatchId: request.dispatchId,
+        toolId: "room-memory.read", requestSha256: sha256(JSON.stringify({
+          executionId: request.executionId, attemptSeq: 1,
+          snapshotId: "context-snapshot", snapshotGeneration: 1,
+          callId: request.callId, grantId: request.grantId,
+          dispatchId: request.dispatchId, toolId: "room-memory.read",
+          parameterSha256: request.parameterSha256,
+          sourceLabel: memoryItem.sourceLabel, mode: "memory_sources",
+          pageSize: 8, offset: 0, cursorSha256: null,
+        })),
+        sourceLabel: memoryItem.sourceLabel, mode: "memory_sources", pageSize: 8,
+        offset: 0, now: NOW_MS,
+      });
+      const page = executeContextSnapshotAuthorityOperation(database, {
+        type: "context.source-read-page", readId: "prefixed-memory-read",
+        expectedSnapshotGeneration: 1, expectedExecutionGeneration: 1,
+        offset: 0, now: NOW_MS,
+      });
+      expect(page).toMatchObject({ kind: "context-source-page", hasMore: false });
+      if (page.kind !== "context-source-page") throw new Error("wrong memory source page");
+      expect(page.canonicalResultJson).toContain('\\"sourceId\\":\\"context-trigger\\"');
+      expect(page.canonicalResultJson).toContain('\\"body\\":\\"frozen trigger\\"');
+    });
+  });
+
+  it("normalizes production message-revision and tombstone corpus identities", () => {
+    withDatabase((database) => {
+      seedExecution(database, "active");
+      database.exec(`
+        INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+        VALUES
+          ('context-revised', 'context-room', 'context-human', 'human',
+           'original revision', '${NOW}'),
+          ('context-recalled', 'context-room', 'context-human', 'human',
+           'recalled body', '${NOW}');
+        INSERT INTO message_revisions (
+          message_id, revision, body, revised_at, revised_by_actor_id
+        ) VALUES
+          ('context-revised', 1, 'original revision', '${NOW}', 'context-human'),
+          ('context-recalled', 1, 'recalled body', '${NOW}', 'context-human');
+        INSERT INTO message_envelopes (
+          message_id, room_id, message_kind, lifecycle, current_revision,
+          revision_count, created_at, recalled_at, recalled_by_actor_id
+        ) VALUES
+          ('context-revised', 'context-room', 'human', 'active', 1, 1,
+           '${NOW}', NULL, NULL),
+          ('context-recalled', 'context-room', 'human', 'recalled', 1, 1,
+           '${NOW}', '${NOW}', 'context-human');
+        INSERT INTO message_revisions (
+          message_id, revision, body, revised_at, revised_by_actor_id
+        ) VALUES ('context-revised', 2, 'current revision', '${NOW}', 'context-human');
+        UPDATE message_envelopes
+        SET current_revision = 2, revision_count = 2
+        WHERE message_id = 'context-revised';
+      `);
+      registerMemoryCorpusSource(database, {
+        roomId: "context-room",
+        sourceKind: "message_revision",
+        sourceId: "message-revision:context-revised",
+        sourceRevision: 2,
+        serverStreamSeq: 1,
+        eligibility: "eligible",
+        availability: "readable",
+        sourceActorId: "context-human",
+        safeMetadata: { authorKind: "human", messageId: "context-revised" },
+        readReference: "message-authority:context-revised:revision:2",
+        occurredAt: NOW,
+      });
+      registerMemoryCorpusSource(database, {
+        roomId: "context-room",
+        sourceKind: "message_tombstone",
+        sourceId: "message-tombstone:context-recalled",
+        sourceRevision: 1,
+        serverStreamSeq: 2,
+        eligibility: "excluded_recalled",
+        availability: "tombstone",
+        sourceActorId: "context-human",
+        safeMetadata: { messageId: "context-recalled", lifecycle: "recalled" },
+        readReference: "message-authority:tombstone:context-recalled:revision:1",
+        occurredAt: NOW,
+      });
+
+      const prepared = preparation(database);
+      expect(prepared.compilerInputFacts.delta.map((entry) => ({
+        sourceKind: entry.source.sourceKind,
+        sourceId: entry.source.sourceId,
+        revision: entry.source.revision,
+        availability: entry.availability,
+      }))).toEqual([
+        {
+          sourceKind: "message_revision",
+          sourceId: "context-revised",
+          revision: 2,
+          availability: "readable",
+        },
+        {
+          sourceKind: "message_tombstone",
+          sourceId: "context-recalled",
+          revision: 1,
+          availability: "tombstone",
+        },
+      ]);
+      executeContextSnapshotAuthorityOperation(database, commitInput(
+        prepared.preparationSha256, {}, prepared.compilerInputFacts,
+      ));
+      expect(database.prepare(`
+        SELECT source_kind AS sourceKind, source_id AS sourceId,
+               source_revision AS sourceRevision,
+               currently_required AS currentlyRequired
+        FROM context_snapshot_sources
+        WHERE snapshot_id = 'context-snapshot'
+          AND source_id IN ('context-revised', 'context-recalled')
+        ORDER BY source_id
+      `).all()).toEqual([
+        {
+          sourceKind: "message_tombstone",
+          sourceId: "context-recalled",
+          sourceRevision: 1,
+          currentlyRequired: 0,
+        },
+        {
+          sourceKind: "message_revision",
+          sourceId: "context-revised",
+          sourceRevision: 2,
+          currentlyRequired: 1,
+        },
+      ]);
+    });
+  });
+
+  it("normalizes FT05 corpus identities and ignores lifecycle cuts for non-required history", () => {
+    withDatabase((database) => {
+      seedExecution(database, "active");
+      database.exec(`
+        INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
+        VALUES ('context-history', 'context-room', 'context-human', 'human',
+          'historical body', '${NOW}');
+        INSERT INTO message_revisions (
+          message_id, revision, body, revised_at, revised_by_actor_id
+        ) VALUES ('context-history', 1, 'historical body', '${NOW}', 'context-human');
+        INSERT INTO message_envelopes (
+          message_id, room_id, message_kind, lifecycle, current_revision,
+          revision_count, created_at, recalled_at, recalled_by_actor_id
+        ) VALUES ('context-history', 'context-room', 'human', 'active', 1, 1,
+          '${NOW}', NULL, NULL);
+      `);
+      registerMemoryCorpusSource(database, {
+        roomId: "context-room",
+        sourceKind: "message",
+        sourceId: "message:context-history",
+        sourceRevision: 1,
+        serverStreamSeq: 1,
+        eligibility: "unavailable",
+        availability: "temporarily_unavailable",
+        sourceActorId: "context-human",
+        safeMetadata: { authorKind: "human", messageId: "context-history" },
+        readReference: "message-authority:context-history:revision:1",
+        occurredAt: NOW,
+      });
+      const prepared = preparation(database);
+      const operation = commitInput(
+        prepared.preparationSha256, {}, prepared.compilerInputFacts,
+      );
+      executeContextSnapshotAuthorityOperation(database, operation);
+      expect(database.prepare(`
+        SELECT currently_required AS currentlyRequired
+        FROM context_snapshot_sources
+        WHERE snapshot_id = 'context-snapshot'
+          AND source_kind = 'message_revision' AND source_id = 'context-history'
+      `).get()).toEqual({ currentlyRequired: 0 });
+
+      expect(executeContextSnapshotAuthorityOperation(database, {
+        type: "context.invalidate-source", roomId: "context-room",
+        sourceKind: "message_revision", sourceId: "context-history", sourceRevision: 1,
+        reason: "source_gone", now: NOW_MS + 1,
+      })).toEqual({ kind: "context-invalidated", snapshotIds: [] });
+      database.exec(`
+        INSERT INTO message_revisions (
+          message_id, revision, body, revised_at, revised_by_actor_id
+        ) VALUES ('context-history', 2, 'revised history', '${NOW}', 'context-human');
+        UPDATE message_envelopes SET current_revision = 2, revision_count = 2
+        WHERE message_id = 'context-history';
+        UPDATE room_memory_sources
+        SET availability = 'metadata_only', updated_at = '${NOW}'
+        WHERE room_id = 'context-room' AND source_id = 'message:context-history';
+      `);
+      expect(database.prepare(
+        "SELECT state, snapshot_generation AS generation FROM context_snapshots WHERE snapshot_id = 'context-snapshot'",
+      ).get()).toEqual({ state: "active", generation: 1 });
+    });
+  });
+
+  it("invalidates a required raw message source when its prefixed FT05 corpus row is cut", () => {
+    withDatabase((database) => {
+      seedExecution(database, "active");
+      registerMemoryCorpusSource(database, {
+        roomId: "context-room",
+        sourceKind: "message",
+        sourceId: "message:context-trigger",
+        sourceRevision: 1,
+        serverStreamSeq: 1,
+        eligibility: "eligible",
+        availability: "readable",
+        sourceActorId: "context-human",
+        safeMetadata: { authorKind: "human", messageId: "context-trigger" },
+        readReference: "message-authority:context-trigger:revision:1",
+        occurredAt: NOW,
+      });
+      const prepared = preparation(database);
+      const operation = commitInput(
+        prepared.preparationSha256, {}, prepared.compilerInputFacts,
+      );
+      expect(() => executeContextSnapshotAuthorityOperation(database, {
+        ...operation,
+        sources: operation.sources.map((source) => source.sourceKind === "message_revision"
+          && source.sourceId === "context-trigger"
+          ? { ...source, currentlyRequired: false }
+          : source),
+      })).toThrowError(expect.objectContaining({ code: "context_snapshot_conflict" }));
+      executeContextSnapshotAuthorityOperation(database, operation);
+      database.exec(`
+        UPDATE room_memory_sources
+        SET eligibility = 'unavailable', availability = 'temporarily_unavailable',
+            updated_at = '${NOW}'
+        WHERE room_id = 'context-room' AND source_id = 'message:context-trigger';
+      `);
+      expect(database.prepare(
+        "SELECT state, snapshot_generation AS generation FROM context_snapshots WHERE snapshot_id = 'context-snapshot'",
+      ).get()).toEqual({ state: "invalidated", generation: 2 });
     });
   });
 
@@ -1273,7 +1555,7 @@ describe("v19 Context Snapshot database authority", () => {
           revision: 1,
         },
         availability: "metadata_only",
-        readRef: "attachment-ref",
+        readRef: "attachment-authority:context-attachment:generation:1",
       }]);
       const operation = commitInput(
         prepared.preparationSha256, {}, prepared.compilerInputFacts,
@@ -1336,6 +1618,70 @@ describe("v19 Context Snapshot database authority", () => {
                artifact_range_start AS rangeStart, artifact_range_end AS rangeEnd
         FROM context_source_reads WHERE read_id = 'attachment-read'
       `).get()).toEqual({ artifactSha256, rangeStart: 0, rangeEnd: 4 });
+    });
+  });
+
+  it("keeps an unavailable historical attachment non-required and unreadable", () => {
+    withDatabase((database) => {
+      seedExecution(database, "active");
+      seedReadyAttachmentExtraction(database);
+      database.exec(`
+        UPDATE room_memory_sources
+        SET eligibility = 'unavailable', availability = 'temporarily_unavailable',
+            updated_at = '${NOW}'
+        WHERE room_id = 'context-room'
+          AND source_id = 'attachment-extraction:context-attachment';
+      `);
+      const prepared = preparation(database);
+      const operation = commitInput(
+        prepared.preparationSha256, {}, prepared.compilerInputFacts,
+      );
+      expect(() => executeContextSnapshotAuthorityOperation(database, {
+        ...operation,
+        sources: operation.sources.map((source) => source.sourceKind === "attachment_extraction"
+          ? { ...source, currentlyRequired: true }
+          : source),
+      })).toThrowError(expect.objectContaining({ code: "context_snapshot_conflict" }));
+      executeContextSnapshotAuthorityOperation(database, operation);
+      const historicalSource = operation.sources.find(
+        (source) => source.sourceKind === "attachment_extraction",
+      );
+      if (historicalSource === undefined) {
+        throw new Error("historical attachment snapshot source missing");
+      }
+      expect(historicalSource).toMatchObject({
+        sourceId: "attachment-extraction:context-attachment",
+        sourceRevision: 1,
+        sourceLabel: null,
+        currentlyRequired: false,
+      });
+      expect(operation.manifest.items.find((item) =>
+        item.sourceId === "attachment-extraction:context-attachment")).toMatchObject({
+        sourceKind: "attachment_extraction",
+        sourceLabel: null,
+        availability: "invalidated",
+      });
+      expect(database.prepare(`
+        SELECT currently_required AS currentlyRequired,
+               authorization_revision AS authorizationRevision,
+               source_label_sha256 AS sourceLabelSha256
+        FROM context_snapshot_sources
+        WHERE snapshot_id = 'context-snapshot'
+          AND source_kind = 'attachment_extraction'
+      `).get()).toEqual({
+        currentlyRequired: 0,
+        authorizationRevision: 0,
+        sourceLabelSha256: null,
+      });
+      expect(executeContextSnapshotAuthorityOperation(database, {
+        type: "context.invalidate-source", roomId: "context-room",
+        sourceKind: "attachment_extraction",
+        sourceId: "attachment-extraction:context-attachment", sourceRevision: 1,
+        reason: "attachment_invalidated", now: NOW_MS + 1,
+      })).toEqual({ kind: "context-invalidated", snapshotIds: [] });
+      expect(database.prepare(
+        "SELECT state, snapshot_generation AS generation FROM context_snapshots WHERE snapshot_id = 'context-snapshot'",
+      ).get()).toEqual({ state: "active", generation: 1 });
     });
   });
 

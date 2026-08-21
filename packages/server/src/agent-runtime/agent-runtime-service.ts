@@ -690,12 +690,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         pending = {
           job: {
             execution: restored.execution,
-            intent: {
-              kind: "direct_mention",
-              roomId: restored.execution.roomId,
-              sourceMessageId: restored.execution.sourceMessageId,
-              targetAgentId: restored.execution.agentId,
-            },
+            intent: restored.intent,
             context,
             toolContinuations: [],
             sideEffectDispatched: false,

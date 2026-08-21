@@ -6735,6 +6735,7 @@ export function executeRuntimeAuthorityOperation(
       return {
         kind: "pending-confirmation",
         execution: current,
+        intent: runtimeInvocationIntentByExecution(database, current.id),
         grantId: pending.grantId,
         toolId: pending.toolId as "http-json.read" | "repository.git-status" | "sandbox-file.write",
         parameters: toolCall.parameters,

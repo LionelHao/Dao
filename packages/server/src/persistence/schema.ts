@@ -70,7 +70,7 @@ const SCHEMA_FINGERPRINTS = {
   16: "86a3512dcb625bc3e0f3d79e5a5d6542819523bee8ac851990148bcad8e38737",
   17: "cc4b260ec841765f0349040a238a44281aa3ed9a792623ebd6540fd3e9f6b0b0",
   18: "d1344ba94d7dd4253f2dcc9e392c3bc4b8b1ec5b4fbba614e3fe2a10392797e5",
-  19: "e29b9a79b49af133b60afce011d58c20b16ee370e68c3a00fe9ea4b950c01ce2",
+  19: "e458dedc7c0d85c04bca92dc2f6289b02367fb97fc7edbe1c7dba011470812b7",
 } as const;
 
 const V1_STATEMENTS = [
@@ -4592,7 +4592,8 @@ const V19_STATEMENTS = [
        WHERE snapshot.snapshot_id = NEW.snapshot_id
          AND snapshot.room_id = NEW.room_id AND snapshot.state = 'active'
          AND NEW.authorization_revision = CASE
-           WHEN NEW.source_kind = 'attachment_extraction' THEN COALESCE((
+           WHEN NEW.source_kind = 'attachment_extraction' AND NEW.currently_required = 1
+             THEN COALESCE((
              SELECT attachment.access_revision FROM attachments AS attachment
              WHERE substr(NEW.source_id, 1, 22) = 'attachment-extraction:'
                AND attachment.attachment_id = substr(NEW.source_id, 23)
@@ -4601,6 +4602,69 @@ const V19_STATEMENTS = [
            ELSE snapshot.membership_access_revision
          END
      )
+      OR (NEW.currently_required = 0 AND NEW.source_kind <> 'message_tombstone' AND (
+        NOT EXISTS (
+          SELECT 1 FROM context_manifest_items AS item
+          WHERE item.snapshot_id = NEW.snapshot_id
+            AND item.source_id = NEW.source_id
+            AND item.source_revision = NEW.source_revision
+            AND item.availability IN ('unavailable', 'invalidated')
+            AND ((NEW.source_kind = 'message_revision'
+                  AND item.source_kind IN ('message', 'trigger', 'message_revision'))
+              OR (NEW.source_kind = 'attachment_extraction'
+                  AND item.source_kind IN ('attachment', 'attachment_extraction'))
+              OR (NEW.source_kind = 'project_fact_checkpoint'
+                  AND item.source_kind IN ('project', 'project_fact_checkpoint'))
+              OR item.source_kind = NEW.source_kind)
+        )
+        OR EXISTS (
+          SELECT 1 FROM context_manifest_items AS item
+          WHERE item.snapshot_id = NEW.snapshot_id
+            AND item.source_id = NEW.source_id
+            AND item.source_revision = NEW.source_revision
+            AND item.availability IN ('readable', 'metadata_only')
+            AND ((NEW.source_kind = 'message_revision'
+                  AND item.source_kind IN ('message', 'trigger', 'message_revision'))
+              OR (NEW.source_kind = 'attachment_extraction'
+                  AND item.source_kind IN ('attachment', 'attachment_extraction'))
+              OR (NEW.source_kind = 'project_fact_checkpoint'
+                  AND item.source_kind IN ('project', 'project_fact_checkpoint'))
+              OR item.source_kind = NEW.source_kind)
+        )
+      ))
+      OR (NEW.currently_required = 1 AND (
+        NEW.source_kind = 'message_tombstone'
+        OR (
+          EXISTS (
+            SELECT 1 FROM context_manifest_items AS item
+            WHERE item.snapshot_id = NEW.snapshot_id
+              AND item.source_id = NEW.source_id
+              AND item.source_revision = NEW.source_revision
+              AND item.availability IN ('unavailable', 'invalidated')
+              AND ((NEW.source_kind = 'message_revision'
+                    AND item.source_kind IN ('message', 'trigger', 'message_revision'))
+                OR (NEW.source_kind = 'attachment_extraction'
+                    AND item.source_kind IN ('attachment', 'attachment_extraction'))
+                OR (NEW.source_kind = 'project_fact_checkpoint'
+                    AND item.source_kind IN ('project', 'project_fact_checkpoint'))
+                OR item.source_kind = NEW.source_kind)
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM context_manifest_items AS item
+            WHERE item.snapshot_id = NEW.snapshot_id
+              AND item.source_id = NEW.source_id
+              AND item.source_revision = NEW.source_revision
+              AND item.availability IN ('readable', 'metadata_only')
+              AND ((NEW.source_kind = 'message_revision'
+                    AND item.source_kind IN ('message', 'trigger', 'message_revision'))
+                OR (NEW.source_kind = 'attachment_extraction'
+                    AND item.source_kind IN ('attachment', 'attachment_extraction'))
+                OR (NEW.source_kind = 'project_fact_checkpoint'
+                    AND item.source_kind IN ('project', 'project_fact_checkpoint'))
+                OR item.source_kind = NEW.source_kind)
+          )
+        )
+      ))
       OR NOT (
         EXISTS (
           SELECT 1 FROM context_manifest_items AS item
@@ -4696,10 +4760,12 @@ const V19_STATEMENTS = [
           ))
           OR (NEW.source_kind = 'attachment_extraction' AND EXISTS (
             SELECT 1 FROM attachments AS attachment
+            JOIN attachment_extraction_artifacts AS artifact
+              ON artifact.attachment_id = attachment.attachment_id
+             AND artifact.processing_generation = NEW.source_revision
             WHERE substr(NEW.source_id, 1, 22) = 'attachment-extraction:'
               AND attachment.attachment_id = substr(NEW.source_id, 23)
               AND attachment.room_id = NEW.room_id
-              AND attachment.processing_generation = NEW.source_revision
           ))
         ))
       )
@@ -5387,6 +5453,7 @@ const V19_STATEMENTS = [
        OR snapshot_id IN (
          SELECT source.snapshot_id FROM context_snapshot_sources AS source
          WHERE source.room_id = NEW.room_id
+           AND source.currently_required = 1
            AND source.source_kind IN ('message_revision', 'message_tombstone')
            AND source.source_id = NEW.message_id
        )
@@ -5403,7 +5470,8 @@ const V19_STATEMENTS = [
        (trigger_message_id = NEW.message_id AND trigger_revision = OLD.current_revision)
        OR snapshot_id IN (
          SELECT source.snapshot_id FROM context_snapshot_sources AS source
-         WHERE source.room_id = NEW.room_id AND source.source_kind = 'message_revision'
+         WHERE source.room_id = NEW.room_id AND source.currently_required = 1
+           AND source.source_kind = 'message_revision'
            AND source.source_id = NEW.message_id
            AND source.source_revision = OLD.current_revision
        )
@@ -5452,8 +5520,18 @@ const V19_STATEMENTS = [
      WHERE state = 'active' AND snapshot_id IN (
        SELECT source.snapshot_id FROM context_snapshot_sources AS source
        WHERE source.room_id = NEW.room_id
-         AND source.source_kind IN ('message_revision', 'attachment_extraction')
-         AND source.source_id = NEW.source_id
+         AND source.currently_required = 1
+         AND ((source.source_kind = 'message_revision'
+               AND NEW.source_kind IN ('message', 'message_revision'))
+           OR (source.source_kind = 'message_tombstone'
+               AND NEW.source_kind = 'message_tombstone')
+           OR (source.source_kind = 'attachment_extraction'
+               AND NEW.source_kind IN ('attachment', 'attachment_extraction')))
+         AND source.source_id = CASE
+           WHEN NEW.source_kind IN ('message', 'message_revision', 'message_tombstone')
+             THEN COALESCE(json_extract(NEW.safe_metadata_json, '$.messageId'), NEW.source_id)
+           ELSE NEW.source_id
+         END
          AND source.source_revision = NEW.source_revision
      );
    END`,
@@ -5466,7 +5544,8 @@ const V19_STATEMENTS = [
          invalidated_at = NEW.updated_at, invalidation_reason = 'memory_invalidated'
      WHERE state = 'active' AND snapshot_id IN (
        SELECT source.snapshot_id FROM context_snapshot_sources AS source
-       WHERE source.room_id = NEW.room_id AND source.source_kind = 'memory'
+       WHERE source.room_id = NEW.room_id AND source.currently_required = 1
+         AND source.source_kind = 'memory'
          AND source.source_id = OLD.current_version_id
      );
    END`,
@@ -5481,6 +5560,7 @@ const V19_STATEMENTS = [
      WHERE state = 'active' AND snapshot_id IN (
        SELECT source.snapshot_id FROM context_snapshot_sources AS source
        WHERE source.room_id = NEW.room_id
+         AND source.currently_required = 1
          AND source.source_kind = 'attachment_extraction'
          AND source.source_id = 'attachment-extraction:' || NEW.attachment_id
          AND source.source_revision = OLD.processing_generation

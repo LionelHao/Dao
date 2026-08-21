@@ -196,6 +196,7 @@ export type RuntimeAuthorityOperationResult =
   | {
       readonly kind: "pending-confirmation";
       readonly execution: AgentExecution;
+      readonly intent: AgentInvocationIntent;
       readonly grantId: string;
       readonly toolId: ToolDescriptor["id"];
       readonly parameters: Readonly<Record<string, unknown>>;

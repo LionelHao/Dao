@@ -149,6 +149,7 @@ export interface ClaimedToolDispatch {
 
 export interface PendingToolConfirmation {
   readonly execution: AgentExecution;
+  readonly intent: AgentInvocationIntent;
   readonly grantId: string;
   readonly toolId: ToolDescriptor["id"];
   readonly parameters: Readonly<Record<string, unknown>>;

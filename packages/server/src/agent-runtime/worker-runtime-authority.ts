@@ -117,6 +117,9 @@ function claimedToolResult(value: unknown): ReturnType<RuntimeAuthority["claimTo
 
 function pendingConfirmationResult(value: unknown): Awaited<ReturnType<RuntimeAuthority["readPendingConfirmation"]>> {
   if (!record(value) || value.kind !== "pending-confirmation" || !isAgentExecution(value.execution) ||
+      !invocationIntent(value.intent) || value.intent.roomId !== value.execution.roomId ||
+      value.intent.sourceMessageId !== value.execution.sourceMessageId ||
+      value.intent.targetAgentId !== value.execution.agentId ||
       typeof value.grantId !== "string" ||
       (value.toolId !== "http-json.read" && value.toolId !== "repository.git-status" && value.toolId !== "sandbox-file.write") ||
       !record(value.parameters) || typeof value.callId !== "string" || typeof value.argumentsJson !== "string") {
@@ -415,30 +418,33 @@ export function createWorkerRuntimeAuthority(
     async claimTool(executionId, attemptSeq, grantId, parameters, confirmation, providerCall) {
       const sourceGrant = sourceGrants.get(grantId);
       if (sourceGrant !== undefined) {
-        if (sourceGrant.executionId !== executionId || sourceGrant.attemptSeq !== attemptSeq ||
-            providerCall === undefined || createHash("sha256")
-              .update(canonicalJsonV1(parameters), "utf8").digest("hex") !==
-              sourceGrant.parameterSha256) {
-          throw new AgentRuntimeError("execution_conflict", "Source read dispatch changed its grant");
+        try {
+          if (sourceGrant.executionId !== executionId || sourceGrant.attemptSeq !== attemptSeq ||
+              providerCall === undefined || createHash("sha256")
+                .update(canonicalJsonV1(parameters), "utf8").digest("hex") !==
+                sourceGrant.parameterSha256) {
+            throw new AgentRuntimeError("execution_conflict", "Source read dispatch changed its grant");
+          }
+          const dispatchId = `context-dispatch-${randomUUID()}`;
+          const dispatched = await contextExecute({
+            type: "context.source-read-dispatch",
+            grantId,
+            dispatchId,
+            executionId,
+            attemptSeq,
+            callId: providerCall.callId,
+            parameterSha256: sourceGrant.parameterSha256,
+            now: Date.now(),
+          });
+          if (!record(dispatched) || dispatched.kind !== "context-source-read-dispatch" ||
+              dispatched.dispatchId !== dispatchId) {
+            throw new AgentRuntimeError("provider_failure", "Source read dispatch was malformed");
+          }
+          sourceDispatches.add(dispatchId);
+          return { dispatchId, toolId: "room-memory.read", parameters };
+        } finally {
+          sourceGrants.delete(grantId);
         }
-        const dispatchId = `context-dispatch-${randomUUID()}`;
-        const dispatched = await contextExecute({
-          type: "context.source-read-dispatch",
-          grantId,
-          dispatchId,
-          executionId,
-          attemptSeq,
-          callId: providerCall.callId,
-          parameterSha256: sourceGrant.parameterSha256,
-          now: Date.now(),
-        });
-        if (!record(dispatched) || dispatched.kind !== "context-source-read-dispatch" ||
-            dispatched.dispatchId !== dispatchId) {
-          throw new AgentRuntimeError("provider_failure", "Source read dispatch was malformed");
-        }
-        sourceGrants.delete(grantId);
-        sourceDispatches.add(dispatchId);
-        return { dispatchId, toolId: "room-memory.read", parameters };
       }
       return claimedToolResult(await execute({
         type: "runtime.claim-tool",
