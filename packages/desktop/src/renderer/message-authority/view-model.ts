@@ -95,7 +95,7 @@ export interface AgentFinalTimelineMessage extends TimelineMessageBase {
 export interface AgentMessageCitationProjection {
   readonly ordinal: number;
   readonly sourceKind: "message" | "message_revision" | "message_tombstone" |
-    "attachment_extraction" | "memory" | "project_fact_checkpoint";
+    "attachment_extraction" | "memory" | "project_fact_checkpoint" | "delta_range";
   readonly sourceId: string;
   readonly sourceRevision: number;
 }
@@ -279,7 +279,7 @@ function validateTimeline(timeline: readonly TimelineMessage[], roomId: string):
         const invalid = citation.ordinal !== index + 1 ||
           !Number.isSafeInteger(citation.sourceRevision) || citation.sourceRevision < 1 ||
           !["message", "message_revision", "message_tombstone", "attachment_extraction",
-            "memory", "project_fact_checkpoint"].includes(citation.sourceKind) ||
+            "memory", "project_fact_checkpoint", "delta_range"].includes(citation.sourceKind) ||
           citation.sourceId.length === 0 || identities.has(identity);
         identities.add(identity);
         return invalid;

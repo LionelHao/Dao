@@ -1,12 +1,12 @@
 import { createHash, randomBytes as cryptoRandomBytes } from "node:crypto";
 
 export type CitationReceiptSourceKind =
-  | "message"
   | "message_revision"
   | "message_tombstone"
   | "attachment_extraction"
   | "memory"
-  | "project_fact_checkpoint";
+  | "project_fact_checkpoint"
+  | "delta_range";
 
 export interface CitationReceiptBinding {
   readonly roomId: string;
@@ -86,7 +86,7 @@ function validateBinding(binding: CitationReceiptBinding): void {
   if (!identifier(binding.roomId) || !identifier(binding.executionId) || !identifier(binding.snapshotId) ||
       !positive(binding.snapshotGeneration) || !identifier(binding.sourceLabel) || !identifier(binding.sourceId) ||
       !positive(binding.sourceRevision) || !nonnegative(binding.authorizationEpoch) ||
-      !["message", "message_revision", "message_tombstone", "attachment_extraction", "memory", "project_fact_checkpoint"]
+      !["message_revision", "message_tombstone", "attachment_extraction", "memory", "project_fact_checkpoint", "delta_range"]
         .includes(binding.sourceKind) ||
       !["source", "neighbors", "attachment_segment", "memory_sources"].includes(binding.representation) ||
       !identifier(binding.range, 1_024) || !/^[a-f0-9]{64}$/u.test(binding.contentSha256) ||

@@ -198,7 +198,7 @@ function validateAuthorization(
       value.pageSize > ROOM_MEMORY_READ_LIMITS.maximumPageItems ||
       (parameters.pageSize !== undefined && parameters.pageSize !== value.pageSize) ||
       !identifier(value.readerCapability, 4_096) ||
-      !["message", "message_revision", "message_tombstone", "attachment_extraction", "memory", "project_fact_checkpoint"]
+      !["message_revision", "message_tombstone", "attachment_extraction", "memory", "project_fact_checkpoint", "delta_range"]
         .includes(value.sourceKind)) {
     throw new RoomMemoryReadError(409, "stale_context");
   }
@@ -233,7 +233,7 @@ function validatePage(
     if (!record(item) || !exact(item, ["ordinal", "text", "provenance"]) || !positive(item.ordinal) ||
         typeof item.text !== "string" || !record(item.provenance) ||
         !exact(item.provenance, ["sourceKind", "sourceLabel", "sourceRevision"]) ||
-        !["message", "message_revision", "message_tombstone", "attachment_extraction", "memory", "project_fact_checkpoint"]
+        !["message_revision", "message_tombstone", "attachment_extraction", "memory", "project_fact_checkpoint", "delta_range"]
           .includes(String(item.provenance.sourceKind)) || !identifier(item.provenance.sourceLabel) ||
         !positive(item.provenance.sourceRevision) ||
         item.provenance.sourceKind !== authorization.sourceKind ||

@@ -10,7 +10,7 @@ import {
 const authorization: RoomMemoryReadAuthorization = {
   executionId: "execution-1", attemptSeq: 1, roomId: "room-1", agentId: "agent-1",
   snapshotId: "snapshot-1", snapshotGeneration: 2,
-  sourceLabel: "source-1", sourceKind: "message", sourceId: "message-1", sourceRevision: 3,
+  sourceLabel: "source-1", sourceKind: "message_revision", sourceId: "message-1", sourceRevision: 3,
   authorizationEpoch: 4, callCount: 0, cumulativeBytes: 0, pageSize: 8,
   readerCapability: "opaque-reader-capability",
 };
@@ -19,7 +19,7 @@ const page: RoomMemoryReadPage = {
   items: [{
     ordinal: 1,
     text: "bounded source",
-    provenance: { sourceKind: "message", sourceLabel: "source-1", sourceRevision: 3 },
+    provenance: { sourceKind: "message_revision", sourceLabel: "source-1", sourceRevision: 3 },
   }],
   continuation: null,
 };
@@ -75,6 +75,42 @@ describe("room-memory.read adapter", () => {
       nextCursor: null,
       citationLabel: receiptLabel,
     });
+  });
+
+  it("accepts a manifest-authorized delta range without disguising it as a message", async () => {
+    const rangeAuthorization: RoomMemoryReadAuthorization = {
+      ...authorization,
+      sourceKind: "delta_range",
+      sourceId: "b".repeat(64),
+      sourceRevision: 4,
+    };
+    const rangePage: RoomMemoryReadPage = {
+      items: [{
+        ordinal: 1,
+        text: "bounded range source index",
+        provenance: {
+          sourceKind: "delta_range",
+          sourceLabel: rangeAuthorization.sourceLabel,
+          sourceRevision: rangeAuthorization.sourceRevision,
+        },
+      }],
+      continuation: null,
+    };
+    const sourceAuthority = authority({
+      authorize: vi.fn(async () => rangeAuthorization),
+    });
+    const reader = { readPage: vi.fn(async () => rangePage) };
+    const receipts = { issue: vi.fn(async () => ({ citationLabel: receiptLabel })) };
+    const adapter = createRoomMemoryReadTool({ authority: sourceAuthority, reader, receipts });
+
+    await expect(adapter.execute(invocation({
+      snapshotId: "snapshot-1", sourceLabel: "source-1", mode: "source", pageSize: 8,
+    }))).resolves.toMatchObject({ summary: { outcome: "succeeded", itemCount: 1 } });
+    expect(receipts.issue).toHaveBeenCalledWith(expect.objectContaining({
+      sourceKind: "delta_range",
+      sourceId: "b".repeat(64),
+      sourceRevision: 4,
+    }));
   });
 
   it.each([
@@ -149,7 +185,7 @@ describe("room-memory.read adapter", () => {
     const tooLarge: RoomMemoryReadPage = {
       items: [{
         ordinal: 1, text: "x".repeat(32_769),
-        provenance: { sourceKind: "message", sourceLabel: "source-1", sourceRevision: 3 },
+        provenance: { sourceKind: "message_revision", sourceLabel: "source-1", sourceRevision: 3 },
       }],
       continuation: null,
     };
@@ -166,9 +202,9 @@ describe("room-memory.read adapter", () => {
   });
 
   it.each([
-    { sourceKind: "message_revision", sourceLabel: "source-1", sourceRevision: 3 },
-    { sourceKind: "message", sourceLabel: "foreign-source", sourceRevision: 3 },
-    { sourceKind: "message", sourceLabel: "source-1", sourceRevision: 4 },
+    { sourceKind: "delta_range", sourceLabel: "source-1", sourceRevision: 3 },
+    { sourceKind: "message_revision", sourceLabel: "foreign-source", sourceRevision: 3 },
+    { sourceKind: "message_revision", sourceLabel: "source-1", sourceRevision: 4 },
   ] as const)("rejects reader provenance that is not exactly bound to the authorization", async (provenance) => {
     const reader = { readPage: vi.fn(async (): Promise<RoomMemoryReadPage> => ({
       items: [{ ordinal: 1, text: "foreign", provenance }],
@@ -188,7 +224,7 @@ describe("room-memory.read adapter", () => {
       items: [{
         ordinal: 1,
         text: "\u0000".repeat(6_000),
-        provenance: { sourceKind: "message", sourceLabel: "source-1", sourceRevision: 3 },
+        provenance: { sourceKind: "message_revision", sourceLabel: "source-1", sourceRevision: 3 },
       }],
       continuation: null,
     };
@@ -216,7 +252,7 @@ describe("room-memory.read adapter", () => {
       items: [first, second].map((ordinal) => ({
         ordinal,
         text: `item-${ordinal}`,
-        provenance: { sourceKind: "message", sourceLabel: "source-1", sourceRevision: 3 },
+        provenance: { sourceKind: "message_revision", sourceLabel: "source-1", sourceRevision: 3 },
       })),
       continuation: null,
     };

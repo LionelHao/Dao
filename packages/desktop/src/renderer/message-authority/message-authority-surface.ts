@@ -292,6 +292,8 @@ function renderAgentMessage(
         ? `来源 · 附件片段 v${citation.sourceRevision}`
         : citation.sourceKind === "memory"
           ? `来源 · 重要记忆 v${citation.sourceRevision}`
+          : citation.sourceKind === "delta_range"
+            ? "来源 · 历史范围（已读取）"
           : citation.sourceKind === "project_fact_checkpoint"
             ? "来源暂不可访问"
             : `来源 · 消息 v${citation.sourceRevision}`;
@@ -300,7 +302,8 @@ function renderAgentMessage(
       source.dataset.citationSourceId = citation.sourceId;
       source.dataset.citationSourceRevision = String(citation.sourceRevision);
       const available = state.connection.status === "online" &&
-        citation.sourceKind !== "project_fact_checkpoint" && actions.onOpenCitation !== undefined;
+        citation.sourceKind !== "project_fact_checkpoint" && citation.sourceKind !== "delta_range" &&
+        actions.onOpenCitation !== undefined;
       source.disabled = !available;
       source.setAttribute("aria-label", available
         ? `来源 ${citation.ordinal}；${label}；引用 ${citation.sourceId}；打开前将重新检查 Room 权限`

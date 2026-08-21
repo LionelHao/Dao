@@ -22,7 +22,7 @@ function store(): CitationReceiptStore & { readonly records: CitationReceiptReco
 
 const binding = {
   roomId: "room-1", executionId: "execution-1", snapshotId: "snapshot-1",
-  snapshotGeneration: 2, sourceLabel: "source-1", sourceKind: "message",
+  snapshotGeneration: 2, sourceLabel: "source-1", sourceKind: "message_revision",
   sourceId: "message-1", sourceRevision: 3, authorizationEpoch: 4,
   representation: "source", range: "item:1", contentSha256: "a".repeat(64), contentBytes: 12,
 } as const;

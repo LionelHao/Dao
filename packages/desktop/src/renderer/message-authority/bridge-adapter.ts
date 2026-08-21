@@ -775,11 +775,13 @@ export function mountMessageAuthorityBridgeSurface(
     ...(memoryBridge === undefined ? {} : {
       onOpenCitation(citation) {
         if (state === undefined || state.connection.status !== "online") return;
+        const citationSourceKind = citation.sourceKind;
+        if (citationSourceKind === "delta_range") return;
         const openedFrom = state;
         void memoryBridge.context({ roomId }).then(async (context) => {
           if (disposed || state === undefined || state !== openedFrom ||
               context.roomId !== roomId || context.lifecycle !== "active") throw new Error("citation context stale");
-          if (citation.sourceKind === "memory") {
+          if (citationSourceKind === "memory") {
             const target = [...document.querySelectorAll<HTMLElement>("[data-memory-version-id]")]
               .find((candidate) => candidate.dataset.memoryVersionId === citation.sourceId);
             if (target === undefined) throw new Error("citation source unavailable");
@@ -794,7 +796,7 @@ export function mountMessageAuthorityBridgeSurface(
               type: "room.memory.source.query.v1",
               requestId: `citation-${globalThis.crypto.randomUUID()}`,
               roomId,
-              sourceKind: citation.sourceKind,
+              sourceKind: citationSourceKind,
               sourceId: roomMemorySourceId(citation),
               sourceRevision: citation.sourceRevision,
             },

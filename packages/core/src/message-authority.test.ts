@@ -337,6 +337,12 @@ describe("Message Authority vNext closed guards", () => {
     expect(messageAuthority.isAgentMessageCitation({
       ...agentFinal.citations[0], snapshotId: "must-not-cross-projection",
     })).toBe(false);
+    expect(messageAuthority.isAgentMessageCitation({
+      ordinal: 1,
+      sourceKind: "delta_range",
+      sourceId: "b".repeat(64),
+      sourceRevision: 4,
+    })).toBe(true);
     expect(messageAuthority.isMessageTombstone({
       ...tombstone,
       recalledAt: "2026-08-18T23:59:59.999Z",

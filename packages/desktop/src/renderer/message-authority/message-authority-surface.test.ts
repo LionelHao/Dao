@@ -158,6 +158,27 @@ describe("J-02/J-03/J-04 message authority DOM", () => {
       .toBe(true);
   });
 
+  it("renders a read delta range honestly without forging a message deep-link", () => {
+    const root = document.createElement("main");
+    const current = state();
+    const timeline = current.timeline.map((message) => message.kind === "agent-final" &&
+      message.messageId === "message-agent-final"
+      ? { ...message, citations: [{
+          ordinal: 1, sourceKind: "delta_range" as const,
+          sourceId: "b".repeat(64), sourceRevision: 4,
+        }] }
+      : message);
+    const handlers = { ...actions(), onOpenCitation: vi.fn() };
+
+    renderMessageAuthoritySurface(root, state({ timeline }), handlers);
+
+    const source = root.querySelector<HTMLButtonElement>("[data-citation-source-kind='delta_range']");
+    expect(source?.textContent).toContain("历史范围（已读取）");
+    expect(source?.disabled).toBe(true);
+    source?.click();
+    expect(handlers.onOpenCitation).not.toHaveBeenCalled();
+  });
+
   it("uses distinct target outcome wording and does not call intent registration completion", () => {
     const root = document.createElement("main");
     renderMessageAuthoritySurface(root, state(), actions());

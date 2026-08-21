@@ -131,7 +131,8 @@ export type AgentMessageCitationSourceKind =
   | "message_tombstone"
   | "attachment_extraction"
   | "memory"
-  | "project_fact_checkpoint";
+  | "project_fact_checkpoint"
+  | "delta_range";
 
 export type AgentMessageCitation = Readonly<{
   ordinal: number;
@@ -198,6 +199,7 @@ const citationSourceKinds = new Set<AgentMessageCitationSourceKind>([
   "attachment_extraction",
   "memory",
   "project_fact_checkpoint",
+  "delta_range",
 ]);
 const canonicalUtcTimestamp = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
