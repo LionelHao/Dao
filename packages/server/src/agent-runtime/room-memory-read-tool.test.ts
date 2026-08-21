@@ -77,6 +77,7 @@ describe("room-memory.read adapter", () => {
     [{ snapshotId: "snapshot-1", sourceLabel: "source-1", mode: "source", extra: true }, "invalid_request"],
     [{ snapshotId: "snapshot-1", sourceLabel: "source-1", mode: "source", pageSize: 9 }, "invalid_request"],
     [{ snapshotId: "snapshot-1", sourceLabel: "source-1", mode: "source", cursor: "x", pageSize: 1 }, "invalid_request"],
+    [{ snapshotId: "snapshot-1", sourceLabel: "source-1", mode: "source", cursor: "😀" }, "invalid_request"],
     [{ snapshotId: "snapshot-1", sourceLabel: "source-1", mode: "attachment_segment", pageSize: 0 }, "invalid_request"],
     [{ snapshotId: "snapshot-1", sourceLabel: "source-1", mode: "sql" }, "invalid_request"],
   ])("rejects non-closed parameters before authority/source calls", async (parameters, code) => {
@@ -198,6 +199,29 @@ describe("room-memory.read adapter", () => {
       snapshotId: "snapshot-1", sourceLabel: "source-1", mode: "source",
     }))).rejects.toMatchObject({ status: 429, code: "page_limit_exceeded" });
     expect(sourceAuthority.sealContinuation).not.toHaveBeenCalled();
+    expect(receipts.issue).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [1, 1],
+    [2, 1],
+    [1, 3],
+  ])("rejects duplicate, descending, or discontinuous page ordinals", async (first, second) => {
+    const malformed: RoomMemoryReadPage = {
+      items: [first, second].map((ordinal) => ({
+        ordinal,
+        text: `item-${ordinal}`,
+        provenance: { sourceKind: "message", sourceLabel: "source-1", sourceRevision: 3 },
+      })),
+      continuation: null,
+    };
+    const receipts = { issue: vi.fn() };
+    const adapter = createRoomMemoryReadTool({
+      authority: authority(), reader: { readPage: vi.fn(async () => malformed) }, receipts,
+    });
+    await expect(adapter.execute(invocation({
+      snapshotId: "snapshot-1", sourceLabel: "source-1", mode: "source",
+    }))).rejects.toMatchObject({ status: 503, code: "source_response_invalid" });
     expect(receipts.issue).not.toHaveBeenCalled();
   });
 

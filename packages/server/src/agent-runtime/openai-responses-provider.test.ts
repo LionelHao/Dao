@@ -105,7 +105,7 @@ describe("OpenAI Responses compiled-context adapter", () => {
 
     expect(events).toEqual([
       { type: "response_started", sequence: 1 },
-      { type: "agent_final", sequence: 3, body: "answer", citations: ["source-1"] },
+      { type: "agent_final", sequence: 2, body: "answer", citations: ["source-1"] },
     ]);
     const request = JSON.parse(String(fetch.mock.calls[0]![1].body)) as {
       readonly input: readonly Readonly<{
@@ -193,7 +193,7 @@ describe("OpenAI Responses compiled-context adapter", () => {
     const events = [];
     for await (const event of provider.stream(input, new AbortController().signal)) events.push(event);
     expect(events.at(-1)).toEqual({
-      type: "agent_final", sequence: 3, body: "[source: forged] message-999", citations: [],
+      type: "agent_final", sequence: 2, body: "[source: forged] message-999", citations: [],
     });
   });
 
@@ -270,6 +270,26 @@ describe("OpenAI Responses compiled-context adapter", () => {
     expect(thrown).toMatchObject({ code: "provider_rate_limited" });
     expect(JSON.stringify(thrown)).not.toContain(sentinel);
     expect(String(thrown)).not.toContain(sentinel);
+  });
+
+  it.each([
+    { status: 429, contentType: "text/event-stream", code: "provider_rate_limited" },
+    { status: 200, contentType: "text/plain", code: "provider_malformed" },
+  ])("cancels rejected response bodies before returning $code", async ({ status, contentType, code }) => {
+    const cancel = vi.fn();
+    const body = new ReadableStream<Uint8Array>({ cancel });
+    const provider = createOpenAIResponsesProvider({
+      endpoint: "https://api.openai.com/v1/responses", model: "configured-model",
+      secretProvider: { getSecret: () => "server-secret" },
+      fetch: async () => new Response(body, {
+        status, headers: { "content-type": contentType },
+      }),
+    });
+    const consume = async (): Promise<void> => {
+      for await (const _event of provider.stream(input, new AbortController().signal)) void _event;
+    };
+    await expect(consume()).rejects.toMatchObject({ code });
+    expect(cancel).toHaveBeenCalledTimes(1);
   });
 
   it("cancels an unfinished response body when output exceeds its bound", async () => {

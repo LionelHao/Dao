@@ -152,6 +152,7 @@ function parseParameters(value: Readonly<Record<string, unknown>>): RoomMemoryRe
       (Object.hasOwn(value, "pageSize") && (!positive(value.pageSize) ||
         value.pageSize > ROOM_MEMORY_READ_LIMITS.maximumPageItems)) ||
       (Object.hasOwn(value, "cursor") && (!identifier(value.cursor, ROOM_MEMORY_READ_LIMITS.maximumCursorLength) ||
+        !/^[A-Za-z0-9_-]+$/u.test(value.cursor as string) ||
         Object.hasOwn(value, "pageSize")))) {
     throw new RoomMemoryReadError(400, "invalid_request");
   }
@@ -215,6 +216,7 @@ function validatePage(
     throw new RoomMemoryReadError(503, "source_response_invalid");
   }
   let pageBytes = 0;
+  let previousOrdinal: number | undefined;
   for (const item of page.items) {
     if (!record(item) || !exact(item, ["ordinal", "text", "provenance"]) || !positive(item.ordinal) ||
         typeof item.text !== "string" || !record(item.provenance) ||
@@ -227,6 +229,10 @@ function validatePage(
         item.provenance.sourceRevision !== authorization.sourceRevision) {
       throw new RoomMemoryReadError(503, "source_response_invalid");
     }
+    if (previousOrdinal !== undefined && item.ordinal !== previousOrdinal + 1) {
+      throw new RoomMemoryReadError(503, "source_response_invalid");
+    }
+    previousOrdinal = item.ordinal;
     pageBytes += Buffer.byteLength(item.text, "utf8");
   }
   const canonicalItems = JSON.stringify(page.items);

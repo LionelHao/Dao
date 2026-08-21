@@ -159,9 +159,13 @@ async function* responseBodyChunks(body: ReadableStream<Uint8Array>): AsyncItera
       yield next.value;
     }
   } finally {
-    if (!completed) await reader.cancel().catch(() => undefined);
+    if (!completed) void reader.cancel().catch(() => undefined);
     reader.releaseLock();
   }
+}
+
+function cancelResponseBody(response: Response): void {
+  if (response.body !== null) void response.body.cancel().catch(() => undefined);
 }
 
 function closedHttpError(status: number): AgentRuntimeError {
@@ -282,15 +286,20 @@ export function createOpenAIResponsesProvider(
         void error;
         throw new AgentRuntimeError("provider_unavailable", "Provider request could not be completed");
       }
-      if (!response.ok) throw closedHttpError(response.status);
+      if (!response.ok) {
+        cancelResponseBody(response);
+        throw closedHttpError(response.status);
+      }
       const contentType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
       if (contentType !== "text/event-stream" || response.body === null) {
+        cancelResponseBody(response);
         throw malformed("Provider stream content type was rejected");
       }
 
       let outputBytes = 0;
       let finalText = "";
       let sawToolCall = false;
+      let outputSequence = 0;
       for await (const event of parseOpenAIResponseSse(responseBodyChunks(response.body), {
         maxBufferedBytes: maxSseBufferBytes,
       })) {
@@ -308,24 +317,24 @@ export function createOpenAIResponsesProvider(
         if (event.type === "tool_call_started" || event.type === "tool_call_delta") {
           if (finalText.length > 0) throw malformed("Provider mixed tool calls and final output");
           sawToolCall = true;
-          yield event;
+          yield Object.freeze({ ...event, sequence: ++outputSequence });
           continue;
         }
         if (event.type === "completed") {
           if (sawToolCall) {
-            yield event;
+            yield Object.freeze({ ...event, sequence: ++outputSequence });
           } else {
             const final = parseAgentFinalDraftV1(finalText);
             yield Object.freeze({
               type: "agent_final",
-              sequence: event.sequence,
+              sequence: ++outputSequence,
               body: final.body,
               citations: final.citations,
             });
           }
           continue;
         }
-        yield event;
+        yield Object.freeze({ ...event, sequence: ++outputSequence });
       }
     },
   });
