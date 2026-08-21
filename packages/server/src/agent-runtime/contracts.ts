@@ -87,6 +87,10 @@ export interface ToolInvocation {
   readonly attemptSeq: number;
   readonly roomId: string;
   readonly agentId: string;
+  readonly callId: string;
+  readonly grantId: string;
+  readonly dispatchId: string;
+  readonly toolId: ToolDescriptor["id"];
   readonly parameters: Readonly<Record<string, unknown>>;
   readonly signal: AbortSignal;
 }

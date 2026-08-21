@@ -24,6 +24,7 @@ interface GatewayExecutionInput {
   readonly attemptSeq: number;
   readonly roomId: string;
   readonly agentId: string;
+  readonly callId: string;
   readonly grantId: string;
   readonly toolId: RuntimeToolId;
   readonly parameters: Readonly<Record<string, unknown>>;
@@ -64,6 +65,10 @@ export function createToolGateway(options: ToolGatewayOptions): ToolGateway {
           attemptSeq: input.attemptSeq,
           roomId: input.roomId,
           agentId: input.agentId,
+          callId: input.callId,
+          grantId: input.grantId,
+          dispatchId: dispatch.dispatchId,
+          toolId: input.toolId,
           parameters: dispatch.parameters,
           signal: input.signal,
         });

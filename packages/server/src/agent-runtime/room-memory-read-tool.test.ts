@@ -36,6 +36,7 @@ function authority(overrides: Partial<RoomMemoryReadAuthority> = {}): RoomMemory
 function invocation(parameters: Readonly<Record<string, unknown>>) {
   return {
     executionId: "execution-1", attemptSeq: 1, roomId: "room-1", agentId: "agent-1",
+    callId: "call-1", grantId: "grant-1", dispatchId: "dispatch-1", toolId: "room-memory.read" as const,
     parameters, signal: new AbortController().signal,
   };
 }
@@ -52,7 +53,10 @@ describe("room-memory.read adapter", () => {
     }));
 
     expect(sourceAuthority.authorize).toHaveBeenCalledTimes(2);
-    expect(sourceAuthority.authorize).toHaveBeenNthCalledWith(1, expect.objectContaining({ phase: "before" }));
+    expect(sourceAuthority.authorize).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      phase: "before", callId: "call-1", grantId: "grant-1", dispatchId: "dispatch-1",
+      toolId: "room-memory.read",
+    }));
     expect(sourceAuthority.authorize).toHaveBeenNthCalledWith(2, expect.objectContaining({
       phase: "after", expected: authorization,
     }));

@@ -69,6 +69,10 @@ interface RoomMemoryAuthorizationRequest {
   readonly attemptSeq: number;
   readonly roomId: string;
   readonly agentId: string;
+  readonly callId: string;
+  readonly grantId: string;
+  readonly dispatchId: string;
+  readonly toolId: "room-memory.read";
   readonly parameters: RoomMemoryReadParameters;
   readonly signal: AbortSignal;
   readonly expected?: RoomMemoryReadAuthorization;
@@ -304,6 +308,9 @@ export function createRoomMemoryReadTool(options: Readonly<{
       reversibility: "compensatable",
     }),
     async execute(invocation: ToolInvocation) {
+      if (invocation.toolId !== "room-memory.read") {
+        throw new RoomMemoryReadError(409, "stale_context");
+      }
       const parameters = parseParameters(invocation.parameters);
       return withinDeadline(invocation.signal, async (signal) => {
         let initial: RoomMemoryReadAuthorization;
@@ -314,6 +321,10 @@ export function createRoomMemoryReadTool(options: Readonly<{
             attemptSeq: invocation.attemptSeq,
             roomId: invocation.roomId,
             agentId: invocation.agentId,
+            callId: invocation.callId,
+            grantId: invocation.grantId,
+            dispatchId: invocation.dispatchId,
+            toolId: "room-memory.read",
             parameters,
             signal,
           });
@@ -353,6 +364,10 @@ export function createRoomMemoryReadTool(options: Readonly<{
             attemptSeq: invocation.attemptSeq,
             roomId: invocation.roomId,
             agentId: invocation.agentId,
+            callId: invocation.callId,
+            grantId: invocation.grantId,
+            dispatchId: invocation.dispatchId,
+            toolId: "room-memory.read",
             parameters,
             signal,
             expected: initial,

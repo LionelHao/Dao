@@ -43,6 +43,7 @@ describe("tool gateway authority fence", () => {
       attemptSeq: 1,
       roomId: "room-1",
       agentId: "agent-1",
+      callId: "call-1",
       grantId: "grant-1",
       toolId: "sandbox-file.write",
       parameters: { path: "x", content: "y" },
@@ -73,12 +74,19 @@ describe("tool gateway authority fence", () => {
       attemptSeq: 1,
       roomId: "room-1",
       agentId: "agent-1",
+      callId: "call-1",
       grantId: "grant-1",
       toolId: "sandbox-file.write",
       parameters: { path: "x", content: "y" },
       signal: new AbortController().signal,
     })).rejects.toMatchObject({ code: "side_effect_outcome_unknown" });
     expect(execute).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledWith(expect.objectContaining({
+      callId: "call-1",
+      grantId: "grant-1",
+      dispatchId: "dispatch-1",
+      toolId: "sandbox-file.write",
+    }));
     expect(runtimeAuthority.settleTool).toHaveBeenCalledWith(
       "dispatch-1", "outcome_unknown", { outcome: "unknown" },
     );
@@ -100,6 +108,7 @@ describe("tool gateway authority fence", () => {
     });
     await expect(gateway.execute({
       executionId: "execution-1", attemptSeq: 1, roomId: "room-1", agentId: "agent-1",
+      callId: "call-room-memory",
       grantId: "grant-1", toolId: "room-memory.read",
       parameters: { snapshotId: "snapshot-1", sourceLabel: "source-1", mode: "source" },
       signal: new AbortController().signal,
@@ -127,6 +136,7 @@ describe("tool gateway authority fence", () => {
     });
     await expect(gateway.execute({
       executionId: "execution-1", attemptSeq: 1, roomId: "room-1", agentId: "agent-1",
+      callId: "call-room-memory",
       grantId: "grant-1", toolId: "room-memory.read",
       parameters: { snapshotId: "snapshot-1", sourceLabel: "source-1", mode: "source" },
       signal: new AbortController().signal,
