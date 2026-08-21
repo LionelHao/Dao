@@ -14,7 +14,7 @@
 - CI workflow：[quality run 32496971258](https://github.com/LionelHao/Dao/actions/runs/32496971258)。
   - [Node 22.x job](https://github.com/LionelHao/Dao/actions/runs/32496971258/job/96817579220)：success，6m11s。
   - [Node 22.13.1 job](https://github.com/LionelHao/Dao/actions/runs/32496971258/job/96817579405)：success，6m49s。
-- 本交付记录 PR：合入时由本节后续提交补记。
+- 本交付记录 PR：[PR #61 — docs(ft06): record Stage 8 delivery evidence](https://github.com/LionelHao/Dao/pull/61)。
 
 ## 2. Requirement、设计旅程与权威状态
 
