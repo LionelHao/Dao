@@ -260,6 +260,40 @@ describe("bounded Agent runtime scheduler", () => {
     });
   });
 
+  it("rejects duplicate citation labels and mixed preview/final output before authority commit", async () => {
+    const malformedStreams = [
+      provider(async function* () {
+        yield { type: "response_started", sequence: 1 };
+        yield { type: "agent_final", sequence: 2, body: "answer", citations: ["ctx-0001", "ctx-0001"] };
+      }),
+      provider(async function* () {
+        yield { type: "response_started", sequence: 1 };
+        yield { type: "text_delta", sequence: 2, delta: "preview" };
+        yield { type: "agent_final", sequence: 3, body: "answer", citations: [] };
+      }),
+    ];
+    for (const [index, malformedProvider] of malformedStreams.entries()) {
+      const runtimeAuthority = authority();
+      const complete = vi.spyOn(runtimeAuthority, "complete");
+      const runtime = createAgentRuntimeService({
+        authority: runtimeAuthority,
+        provider: malformedProvider,
+        modelId: "fake-model",
+        buildProviderInput: providerInput,
+      });
+      const accepted = await runtime.invoke(
+        { ...context, requestId: `malformed-${index}`, idempotencyKey: `malformed-${index}` },
+        intent("room-a", `malformed-${index}`),
+      );
+      await runtime.whenIdle();
+      expect(complete).not.toHaveBeenCalled();
+      expect(runtimeAuthority.executions.get(accepted.execution.id)).toMatchObject({
+        status: "failed",
+        terminalErrorCode: "provider_malformed",
+      });
+    }
+  });
+
   it("commits cancelled before aborting and never completes a partial stream", async () => {
     const runtimeAuthority = authority();
     const ordering: string[] = [];
