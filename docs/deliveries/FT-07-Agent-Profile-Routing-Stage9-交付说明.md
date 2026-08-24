@@ -8,7 +8,7 @@
 - 起始基线：`5234b9a9a043ef03cb5ecf37f00a4671800612b8`（FT-06 Stage 8 evidence，Authority schema v19）。
 - FT-07 最终实现 `main` SHA：`a48b8b454b13645fe6b18f2e4bcee9a851ecb7cb`（PR #69 squash merge）。
 - schema：v20 交付 Profile/Routing Authority；v21 只追加 immutable direct invocation binding，不改写 v1-v20 历史。
-- 本交付记录 PR：创建后回填；其 squash merge 将成为本阶段证据 tip。
+- 本交付记录：[PR #70 — docs(ft07): record Stage 9 delivery evidence](https://github.com/LionelHao/Dao/pull/70)；其 squash merge 将成为本阶段证据 tip。
 
 | PR | 范围 | merge SHA | 必需 CI |
 | --- | --- | --- | --- |
