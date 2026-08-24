@@ -79,6 +79,9 @@ UI映射与正式设计偏离记录见rebaseline第1、6、7节；偏离为“�
 - 第三至第五轮独立竞态审阅继续发现并关闭：bootstrap/repair snapshot与live event安装顺序、removed Assignment旧upsert复活、已订阅recover旧repair覆盖live remove、repair期间revoke后旧authority写回、repair event buffer无界、周期Profile sync推进后被旧catalog snapshot回退。最终runtime使用authority epoch/generation/current-Room fence、snapshot/periodic sync双向串行化、每Assignment removal revision tombstone、repair watermark、event-ID去重与512条硬上限；overflow从未推进的authoritative Room cursor继续catch-up。
 - 对应确定性Desktop回归为production runtime 9项、view-model 14项，共2 files / 23 tests；另有600事件buffer上限、1ms周期sync与held repair、governance await期间revoke等专门反例。typecheck、lint、build均通过。
 - 第六轮最终独立只读审阅对象：`25fde4e431a42b62f8aba14069af6084a04637a9`。结论：无blocker；审阅者另行运行Desktop聚焦23/23与真实authority E2E 26/26，确认worktree clean、`git diff --check`通过。
+- 最终冻结代码加审阅记录的独占全量门禁：200 files（197 passed / 3 skipped / 0 failed），2173 tests（2170 passed / 3 skipped / 0 failed），247.89s；分包为Core 9 files / 94 tests、Desktop 61 files / 480 tests、Server 127 passed + 3 skipped files / 1596 passed + 3 skipped tests。命令内Core I/O boundary与Desktop renderer boundary（23 production sources）均通过。
+- 同一冻结代码另行通过typecheck、lint、build、Desktop Electron smoke；真实Desktop Agent Settings WebSocket/AuthorityWorker/SQLite E2E连续3轮均为1 passed / 25 skipped，无flake。
+- 因没有显式live flag和/或OpenAI secret，Agent、Router与Memory live smoke安全跳过；CI fake、SSE parser、Router closed output、取消、noauth、错误与secret sentinel覆盖未降低。未读取、打印或派生secret。
 - CI链接与merge SHA待GitHub事实产生后写入交付说明。
 
 ## 7. PR、CI、review与清理日志（持续更新）
