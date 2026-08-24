@@ -53,6 +53,7 @@ export interface Room {
 }
 
 export type HumanRoomRole = "owner" | "admin" | "member";
+/** @deprecated Historical v1 Room membership decoder only. New Assignment writes use AgentAssignmentParticipation. */
 export type AgentParticipation = "active" | "on-mention" | "silent";
 export type RoomStatus = "active" | "archived";
 export type RoomLifecycleState = "active" | "archived";
@@ -125,6 +126,7 @@ export interface AgentConfigurationRequest {
   readonly kind: "agent-configuration";
   readonly roomId: string;
   readonly agentId: string;
+  /** @deprecated Legacy command decoder; the FT-07 Assignment command is closed separately. */
   readonly participation: AgentParticipation;
   readonly toolPermissions: readonly string[];
   readonly inviteeActorId?: never;
@@ -389,6 +391,45 @@ export function isMessageDraft(value: unknown): value is MessageDraft {
     !("authorKind" in value)
   );
 }
+
+export {
+  AGENT_CAPABILITY_IDS,
+  AGENT_TOOL_IDS,
+  asAgentActorId,
+  asAgentAssignmentId,
+  asAgentProfileId,
+  canonicalizeAgentCapabilities,
+  canonicalizeAgentTools,
+  deriveAgentAvailability,
+  intersectAgentAuthority,
+  isAgentActorId,
+  isAgentAssignmentId,
+  isAgentAssignmentRecord,
+  isAgentAvailabilityFacts,
+  isAgentCapabilityId,
+  isAgentProfileId,
+  isAgentProfileRecord,
+  isAgentToolId,
+  isAssignmentWithinProfileCeiling,
+  isCanonicalAgentCapabilitySet,
+  isCanonicalAgentToolSet,
+  isRoomAgentProjection,
+} from "./agent-profile.js";
+export type {
+  AgentActorId,
+  AgentAssignmentId,
+  AgentAssignmentRecord,
+  AgentAssignmentStatus,
+  AgentAvailability,
+  AgentAvailabilityFacts,
+  AgentCapabilityId,
+  AgentAssignmentParticipation,
+  AgentProfileId,
+  AgentProfileRecord,
+  AgentProfileStatus,
+  AgentToolId,
+  RoomAgentProjection,
+} from "./agent-profile.js";
 
 export {
   isAgentExecution,
