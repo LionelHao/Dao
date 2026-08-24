@@ -71,6 +71,7 @@ import {
 } from "./attachment-authority/production-capabilities.js";
 import type { ClamdEndpoint } from "./attachment-authority/clamd-scanner.js";
 import { createWorkerMemoryAuthority } from "./room-memory/worker-memory-authority.js";
+import { WorkerAgentSettingsAdapter } from "./agent-settings/worker-agent-settings-adapter.js";
 import { createOpenAIMemoryStewardProvider } from "./room-memory/openai-memory-provider.js";
 import { createMemoryStewardProviderAdapter } from "./room-memory/steward-provider-adapter.js";
 import {
@@ -424,7 +425,9 @@ async function start(
       completeSnapshot: snapshotClient.completeSnapshot.bind(snapshotClient),
       releaseSnapshot: snapshotClient.releaseSnapshot.bind(snapshotClient),
     };
-    const sync = createSyncService({ store: authority, snapshots: materializedSnapshots });
+    const agentSettings = new WorkerAgentSettingsAdapter(worker, Date.now);
+    const sync = createSyncService({ store: authority, snapshots: materializedSnapshots,
+      agentSettings });
     const auth = createAuthenticationService({
       actors: {
         getActor(actorId) {
@@ -862,6 +865,7 @@ async function start(
       ballRuntime,
       messageAuthority,
       memoryAuthority: publicMemoryAuthority,
+      agentSettingsAuthority: agentSettings,
       ...(attachmentAuthority === undefined ? {} : { attachmentAuthority }),
       governance: governanceStore,
     });
