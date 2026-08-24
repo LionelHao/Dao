@@ -32,6 +32,7 @@ import {
   reviseHumanMessageDatabaseCommand,
   recallHumanMessageDatabaseCommand,
   executeRuntimeAuthorityOperation,
+  executeTenantAdministrationAuthorityOperation,
   executeRouteAuthorityOperation,
   executeBallAuthorityOperation,
   authorizeOutboxCandidateDatabaseQuery,
@@ -111,6 +112,8 @@ import type {
   AttachmentDatabaseOperationResult,
 } from "../attachment-authority/database-contracts.js";
 import { isTransientSQLiteContention } from "./sqlite-contention.js";
+import type { DeploymentProviderDisclosure } from
+  "../tenant-administration/authority-service.js";
 
 interface AuthorityWorkerData {
   readonly databasePath: string;
@@ -118,6 +121,7 @@ interface AuthorityWorkerData {
     readonly ballPolicy: BallDeadlinePolicy;
     readonly maxOfflineReadLeaseMs: number;
   };
+  readonly deploymentProviderDisclosure?: DeploymentProviderDisclosure;
   readonly recovery?: LegacyImportRecovery;
   readonly rollbackFailureForTest?: true;
   readonly transactionFaultPoint?: "after-domain-write" | "before-commit";
@@ -132,7 +136,8 @@ function isAuthorityWorkerData(value: unknown): value is AuthorityWorkerData {
   if (typeof record.databasePath !== "string" || record.databasePath.length === 0 ||
       keys.some((key) =>
         key !== "databasePath" && key !== "recovery" && key !== "rollbackFailureForTest" &&
-        key !== "transactionFaultPoint" && key !== "sharedAuthorityRecovery") ||
+        key !== "transactionFaultPoint" && key !== "sharedAuthorityRecovery" &&
+        key !== "deploymentProviderDisclosure") ||
       (record.rollbackFailureForTest !== undefined && record.rollbackFailureForTest !== true) ||
       (record.transactionFaultPoint !== undefined &&
         record.transactionFaultPoint !== "after-domain-write" &&
@@ -157,6 +162,18 @@ function isAuthorityWorkerData(value: unknown): value is AuthorityWorkerData {
         !Number.isSafeInteger((policy as Record<string, unknown>).lightTaskDeadlineMs) ||
         Number((policy as Record<string, unknown>).lightTaskDeadlineMs) <= 0 ||
         !Number.isSafeInteger(maxOfflineReadLeaseMs) || Number(maxOfflineReadLeaseMs) <= 0) {
+      return false;
+    }
+  }
+  if (record.deploymentProviderDisclosure !== undefined) {
+    const disclosure = record.deploymentProviderDisclosure;
+    if (typeof disclosure !== "object" || disclosure === null || Array.isArray(disclosure) ||
+        Object.keys(disclosure).sort().join("\0") !==
+          ["credentialReadiness", "modelId", "providerId"].sort().join("\0") ||
+        typeof (disclosure as Record<string, unknown>).providerId !== "string" ||
+        typeof (disclosure as Record<string, unknown>).modelId !== "string" ||
+        ((disclosure as Record<string, unknown>).credentialReadiness !== "ready" &&
+         (disclosure as Record<string, unknown>).credentialReadiness !== "noauth")) {
       return false;
     }
   }
@@ -640,6 +657,19 @@ function registerActors(request: AuthorityWorkerRequest): void {
            stream_kind, stream_id, head_seq, retained_from_seq
          ) VALUES ('identity', ?, 0, 1)`,
       );
+      const insertStaticAgentProfile = openedDatabase.prepare(
+        `INSERT INTO agent_profiles (
+           id, actor_id, revision, status, capability_ceiling_json, tool_ceiling_json,
+           display_name, global_responsibility, created_at, updated_at, source_kind
+         ) VALUES (?, ?, 1, 'disabled', '[]', '[]', ?, ?, ?, ?, 'static_bootstrap')`,
+      );
+      const insertStaticAgentProfileRevision = openedDatabase.prepare(
+        `INSERT INTO agent_profile_revisions (
+           profile_id, revision, actor_id, display_name, global_responsibility, status,
+           capability_ceiling_json, tool_ceiling_json, changed_by_human_actor_id,
+           changed_at, operation
+         ) VALUES (?, 1, ?, ?, ?, 'disabled', '[]', '[]', NULL, ?, 'static_bootstrap')`,
+      );
 
       for (const actor of request.actors) {
         const reachability = actor.kind === "human" ? actor.reachability : null;
@@ -649,13 +679,13 @@ function registerActors(request: AuthorityWorkerRequest): void {
         );
         const existing = selectActor.get(actor.id);
         if (existing !== undefined) {
-          if (
-            existing.kind !== actor.kind ||
+          const humanCatalogConflict = actor.kind === "human" && (
             existing.displayName !== actor.displayName ||
             existing.reachability !== reachability ||
             existing.readiness !== readiness ||
             existing.toolPermissionsJson !== toolPermissionsJson
-          ) {
+          );
+          if (existing.kind !== actor.kind || humanCatalogConflict) {
             throw new Error("actor_conflict");
           }
           continue;
@@ -670,6 +700,26 @@ function registerActors(request: AuthorityWorkerRequest): void {
           toolPermissionsJson,
         );
         insertStream.run(actor.id);
+        const occurredAt = new Date().toISOString();
+        if (actor.kind === "agent") {
+          const profileId = `static-profile:${stableId("agent-profile", actor.id)}`;
+          const responsibility = "Review static Agent configuration before enabling.";
+          insertStaticAgentProfile.run(
+            profileId,
+            actor.id,
+            actor.displayName,
+            responsibility,
+            occurredAt,
+            occurredAt,
+          );
+          insertStaticAgentProfileRevision.run(
+            profileId,
+            actor.id,
+            actor.displayName,
+            responsibility,
+            occurredAt,
+          );
+        }
         const payload = { actor };
         appendCanonicalIdentityEvent(openedDatabase, {
           principalId: actor.id,
@@ -677,7 +727,7 @@ function registerActors(request: AuthorityWorkerRequest): void {
             "identity.actor.registered", actor.id, canonicalPayloadJson,
           ),
           eventType: "identity.actor.registered",
-          occurredAt: new Date().toISOString(),
+          occurredAt,
           payload,
         });
       }
@@ -2125,6 +2175,31 @@ function executeAttachment(request: AuthorityWorkerRequest): void {
   }
 }
 
+async function executeTenantAdministration(request: AuthorityWorkerRequest): Promise<void> {
+  if (request.type !== "authority.tenant-administration") {
+    throw new TypeError("executeTenantAdministration received the wrong request type");
+  }
+  try {
+    const result = await executeTenantAdministrationAuthorityOperation(
+      requireAuthorityTransactionDatabase(),
+      request.operation,
+      {
+        ...(isAuthorityWorkerData(workerData) &&
+          workerData.deploymentProviderDisclosure !== undefined
+          ? { provider: workerData.deploymentProviderDisclosure } : {}),
+      },
+    );
+    respond({ type: "authority.tenant-administration-result", requestId: request.requestId, result });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    respondWithStorageFailure(
+      request.requestId,
+      error,
+      "Tenant administration authority operation failed",
+    );
+  }
+}
+
 function submitHumanMessage(request: AuthorityWorkerRequest): void {
   if (request.type !== "authority.message-submit") throw new TypeError("wrong message submit");
   try {
@@ -2861,6 +2936,9 @@ async function dispatch(value: unknown): Promise<void> {
       return;
     case "authority.attachment":
       executeAttachment(value);
+      return;
+    case "authority.tenant-administration":
+      await executeTenantAdministration(value);
       return;
     case "authority.message-submit":
       submitHumanMessage(value);

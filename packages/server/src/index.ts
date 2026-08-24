@@ -213,6 +213,7 @@ export type WorkerDatabaseClient = Omit<
   | "executeBall"
   | "executeMemory"
   | "executeAttachment"
+  | "executeTenantAdministration"
   | "readActor"
   | "readRoom"
   | "readRoomGovernance"

@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
+import { seedCanonicalAgentProfileFixture } from "../fixtures/agent-authority-fixture.js";
 import {
   executeAgentDatabaseCommand,
   executeHumanDatabaseCommand,
@@ -50,6 +51,12 @@ function fixture(): DatabaseSync {
       ('room-1', 'agent-2', 'agent', NULL, 'active', NULL, '2026-08-17T00:00:00.000Z');
     UPDATE rooms SET owner_actor_id = 'human-1', governance_revision = 1 WHERE id = 'room-1';
   `);
+  seedCanonicalAgentProfileFixture(database, {
+    actorId: "agent-1", displayName: "Agent One",
+  });
+  seedCanonicalAgentProfileFixture(database, {
+    actorId: "agent-2", displayName: "Agent Two",
+  });
   database.prepare(
     `INSERT INTO session_families (
        family_id, public_id, account_id, actor_id, device_id, device_label,

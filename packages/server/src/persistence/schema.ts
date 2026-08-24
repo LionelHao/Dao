@@ -7,7 +7,7 @@ import {
 } from "../access/room-cache-invalidation-port.js";
 import { OFFLINE_READ_LEASE_SCHEMA_STATEMENTS } from "../access/offline-lease-invalidation-port.js";
 
-export const AUTHORITY_SCHEMA_VERSION = 19 as const;
+export const AUTHORITY_SCHEMA_VERSION = 20 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -71,6 +71,7 @@ const SCHEMA_FINGERPRINTS = {
   17: "cc4b260ec841765f0349040a238a44281aa3ed9a792623ebd6540fd3e9f6b0b0",
   18: "d1344ba94d7dd4253f2dcc9e392c3bc4b8b1ec5b4fbba614e3fe2a10392797e5",
   19: "e458dedc7c0d85c04bca92dc2f6289b02367fb97fc7edbe1c7dba011470812b7",
+  20: "1ca2a806a52cd2ce9632b02e215a25ba13bc3ebc4336f5152c48f21d60faa2a0",
 } as const;
 
 const V1_STATEMENTS = [
@@ -5568,12 +5569,1150 @@ const V19_STATEMENTS = [
    END`,
 ] as const;
 
+const V20_STATEMENTS = [
+  `ALTER TABLE agent_profiles ADD COLUMN display_name TEXT NOT NULL
+   DEFAULT 'Migrated Agent' CHECK (
+     length(trim(display_name)) BETWEEN 1 AND 120 AND display_name = trim(display_name)
+   )`,
+  `ALTER TABLE agent_profiles ADD COLUMN global_responsibility TEXT NOT NULL
+   DEFAULT 'Review migrated Agent configuration before use.' CHECK (
+     length(trim(global_responsibility)) BETWEEN 1 AND 4000
+     AND global_responsibility = trim(global_responsibility)
+   )`,
+  `ALTER TABLE agent_profiles ADD COLUMN created_at TEXT NOT NULL
+   DEFAULT '1970-01-01T00:00:00.000Z' CHECK (length(created_at) > 0)`,
+  `ALTER TABLE agent_profiles ADD COLUMN updated_at TEXT NOT NULL
+   DEFAULT '1970-01-01T00:00:00.000Z' CHECK (length(updated_at) > 0)`,
+  `ALTER TABLE agent_profiles ADD COLUMN source_kind TEXT NOT NULL
+   DEFAULT 'legacy_v20_migration' CHECK (
+     source_kind IN ('legacy_v20_migration', 'administrator_command', 'static_bootstrap')
+   )`,
+  `ALTER TABLE room_agent_assignments ADD COLUMN room_responsibility TEXT NOT NULL
+   DEFAULT 'Review migrated Room assignment before use.' CHECK (
+     length(trim(room_responsibility)) BETWEEN 1 AND 4000
+     AND room_responsibility = trim(room_responsibility)
+   )`,
+  `ALTER TABLE room_agent_assignments ADD COLUMN created_at TEXT NOT NULL
+   DEFAULT '1970-01-01T00:00:00.000Z' CHECK (length(created_at) > 0)`,
+  `ALTER TABLE room_agent_assignments ADD COLUMN updated_at TEXT NOT NULL
+   DEFAULT '1970-01-01T00:00:00.000Z' CHECK (length(updated_at) > 0)`,
+  `ALTER TABLE room_agent_assignments ADD COLUMN removed_at TEXT
+   CHECK (removed_at IS NULL OR length(removed_at) > 0)`,
+  `ALTER TABLE room_agent_assignments ADD COLUMN source_kind TEXT NOT NULL
+   DEFAULT 'legacy_v20_migration' CHECK (
+     source_kind IN ('legacy_v20_migration', 'room_command', 'static_bootstrap')
+   )`,
+  `CREATE TABLE agent_authority_migration_provenance (
+    source_kind TEXT NOT NULL CHECK (source_kind IN (
+      'existing_v14_profile', 'legacy_actor_profile', 'existing_v14_assignment',
+      'legacy_room_membership_assignment', 'legacy_silent_assignment',
+      'unknown_authority_reduction'
+    )),
+    source_object_id TEXT NOT NULL,
+    actor_id TEXT NOT NULL REFERENCES actors(id),
+    profile_id TEXT REFERENCES agent_profiles(id),
+    room_id TEXT REFERENCES rooms(id),
+    assignment_id TEXT REFERENCES room_agent_assignments(id),
+    source_schema_version INTEGER NOT NULL CHECK (source_schema_version = 19),
+    source_participation TEXT CHECK (
+      source_participation IS NULL OR source_participation IN ('active', 'on-mention', 'silent')
+    ),
+    source_authority_json TEXT NOT NULL CHECK (
+      json_valid(source_authority_json) AND json_type(source_authority_json) = 'object'
+    ),
+    review_required INTEGER NOT NULL CHECK (review_required IN (0, 1)),
+    migrated_at TEXT NOT NULL,
+    PRIMARY KEY (source_kind, source_object_id)
+  ) STRICT`,
+  `INSERT INTO agent_authority_migration_provenance (
+     source_kind, source_object_id, actor_id, profile_id, room_id, assignment_id,
+     source_schema_version, source_participation, source_authority_json,
+     review_required, migrated_at
+   )
+   SELECT 'existing_v14_profile', profile.id, profile.actor_id, profile.id, NULL, NULL,
+     19, NULL, json_object(
+       'capabilityCeiling', json(profile.capability_ceiling_json),
+       'toolCeiling', json(profile.tool_ceiling_json)
+     ),
+     CASE WHEN EXISTS (
+       SELECT 1 FROM json_each(profile.capability_ceiling_json)
+       WHERE value NOT IN (
+         'room.conversation.read', 'room.memory.read', 'room.project.read', 'room.respond'
+       )
+     ) OR EXISTS (
+       SELECT 1 FROM json_each(profile.tool_ceiling_json)
+       WHERE value NOT IN (
+         'http-json.read', 'repository.git-status', 'room-memory.read', 'sandbox-file.write'
+       )
+     ) THEN 1 ELSE 0 END,
+     strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+   FROM agent_profiles AS profile`,
+  `INSERT INTO agent_authority_migration_provenance (
+     source_kind, source_object_id, actor_id, profile_id, room_id, assignment_id,
+     source_schema_version, source_participation, source_authority_json,
+     review_required, migrated_at
+   )
+   SELECT 'existing_v14_assignment', assignment.id, assignment.agent_actor_id,
+     assignment.profile_id, assignment.room_id, assignment.id, 19,
+     assignment.participation, json_object(
+       'capabilitySubset', json(assignment.capability_subset_json),
+       'toolSubset', json(assignment.tool_subset_json),
+       'paused', json(assignment.paused)
+     ),
+     CASE WHEN EXISTS (
+       SELECT 1 FROM json_each(assignment.capability_subset_json)
+       WHERE value NOT IN (
+         'room.conversation.read', 'room.memory.read', 'room.project.read', 'room.respond'
+       )
+     ) OR EXISTS (
+       SELECT 1 FROM json_each(assignment.tool_subset_json)
+       WHERE value NOT IN (
+         'http-json.read', 'repository.git-status', 'room-memory.read', 'sandbox-file.write'
+       )
+     ) THEN 1 ELSE 0 END,
+     strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+   FROM room_agent_assignments AS assignment`,
+  `INSERT INTO agent_authority_migration_provenance (
+     source_kind, source_object_id, actor_id, profile_id, room_id, assignment_id,
+     source_schema_version, source_participation, source_authority_json,
+     review_required, migrated_at
+   )
+   SELECT 'legacy_silent_assignment', json_array(membership.room_id, membership.actor_id),
+     membership.actor_id, profile.id, membership.room_id, assignment.id, 19,
+     'silent', json_object('toolPermissions', json(membership.tool_permissions_json)),
+     1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+   FROM room_memberships AS membership
+   LEFT JOIN agent_profiles AS profile ON profile.actor_id = membership.actor_id
+   LEFT JOIN room_agent_assignments AS assignment
+     ON assignment.room_id = membership.room_id
+    AND assignment.agent_actor_id = membership.actor_id
+    AND assignment.status = 'current'
+   WHERE membership.kind = 'agent' AND membership.participation = 'silent'`,
+  `UPDATE room_agent_assignments
+   SET paused = CASE
+         WHEN EXISTS (
+           SELECT 1 FROM json_each(capability_subset_json)
+           WHERE value NOT IN (
+             'room.conversation.read', 'room.memory.read', 'room.project.read', 'room.respond'
+           )
+         ) OR EXISTS (
+           SELECT 1 FROM json_each(tool_subset_json)
+           WHERE value NOT IN (
+             'http-json.read', 'repository.git-status', 'room-memory.read', 'sandbox-file.write'
+           )
+         ) THEN 1 ELSE paused END,
+       capability_subset_json = COALESCE((
+         SELECT json_group_array(value) FROM (
+           SELECT DISTINCT value FROM json_each(capability_subset_json)
+           WHERE value IN (
+             'room.conversation.read', 'room.memory.read', 'room.project.read', 'room.respond'
+           ) ORDER BY value
+         )
+       ), '[]'),
+       tool_subset_json = COALESCE((
+         SELECT json_group_array(value) FROM (
+           SELECT DISTINCT value FROM json_each(tool_subset_json)
+           WHERE value IN (
+             'http-json.read', 'repository.git-status', 'room-memory.read', 'sandbox-file.write'
+           ) ORDER BY value
+         )
+       ), '[]'),
+       removed_at = CASE WHEN status = 'removed' THEN COALESCE(removed_at,
+         strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) ELSE NULL END,
+       created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
+  `UPDATE agent_profiles
+   SET display_name = (SELECT actor.display_name FROM actors AS actor
+                       WHERE actor.id = agent_profiles.actor_id),
+       status = CASE WHEN EXISTS (
+         SELECT 1 FROM json_each(capability_ceiling_json)
+         WHERE value NOT IN (
+           'room.conversation.read', 'room.memory.read', 'room.project.read', 'room.respond'
+         )
+       ) OR EXISTS (
+         SELECT 1 FROM json_each(tool_ceiling_json)
+         WHERE value NOT IN (
+           'http-json.read', 'repository.git-status', 'room-memory.read', 'sandbox-file.write'
+         )
+       ) THEN 'disabled' ELSE status END,
+       capability_ceiling_json = COALESCE((
+         SELECT json_group_array(value) FROM (
+           SELECT DISTINCT value FROM json_each(capability_ceiling_json)
+           WHERE value IN (
+             'room.conversation.read', 'room.memory.read', 'room.project.read', 'room.respond'
+           ) ORDER BY value
+         )
+       ), '[]'),
+       tool_ceiling_json = COALESCE((
+         SELECT json_group_array(value) FROM (
+           SELECT DISTINCT value FROM json_each(tool_ceiling_json)
+           WHERE value IN (
+             'http-json.read', 'repository.git-status', 'room-memory.read', 'sandbox-file.write'
+           ) ORDER BY value
+         )
+       ), '[]'),
+       created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
+  `INSERT INTO agent_profiles (
+     id, actor_id, revision, status, capability_ceiling_json, tool_ceiling_json,
+     display_name, global_responsibility, created_at, updated_at, source_kind
+   )
+   SELECT 'legacy-profile:' || actor.id, actor.id, 1,
+     CASE WHEN EXISTS (
+       SELECT 1 FROM json_each(actor.tool_permissions_json)
+       WHERE value NOT IN (
+         'http-json.read', 'repository.git-status', 'room-memory.read', 'sandbox-file.write'
+       )
+     ) THEN 'disabled' ELSE 'enabled' END,
+     '[]', COALESCE((
+       SELECT json_group_array(value) FROM (
+         SELECT DISTINCT value FROM json_each(actor.tool_permissions_json)
+         WHERE value IN (
+           'http-json.read', 'repository.git-status', 'room-memory.read', 'sandbox-file.write'
+         ) ORDER BY value
+       )
+     ), '[]'), actor.display_name, 'Review migrated Agent configuration before use.',
+     strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+     'legacy_v20_migration'
+   FROM actors AS actor
+   WHERE actor.kind = 'agent'
+     AND NOT EXISTS (SELECT 1 FROM agent_profiles AS profile WHERE profile.actor_id = actor.id)`,
+  `INSERT INTO agent_authority_migration_provenance (
+     source_kind, source_object_id, actor_id, profile_id, room_id, assignment_id,
+     source_schema_version, source_participation, source_authority_json,
+     review_required, migrated_at
+   )
+   SELECT 'legacy_actor_profile', actor.id, actor.id, profile.id, NULL, NULL, 19,
+     NULL, json_object(
+       'displayName', actor.display_name,
+       'toolPermissions', json(actor.tool_permissions_json),
+       'legacyReadiness', actor.readiness
+     ),
+     CASE WHEN profile.status = 'disabled' THEN 1 ELSE 0 END,
+     strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+   FROM actors AS actor
+   JOIN agent_profiles AS profile ON profile.actor_id = actor.id
+   WHERE actor.kind = 'agent'
+     AND NOT EXISTS (
+       SELECT 1 FROM agent_authority_migration_provenance AS provenance
+       WHERE provenance.source_kind = 'existing_v14_profile'
+         AND provenance.profile_id = profile.id
+     )`,
+  `INSERT INTO room_agent_assignments (
+     id, room_id, profile_id, agent_actor_id, revision, status, participation,
+     paused, capability_subset_json, tool_subset_json, room_responsibility,
+     created_at, updated_at, removed_at, source_kind
+   )
+   SELECT 'legacy-assignment:' || membership.room_id || ':' || membership.actor_id,
+     membership.room_id, profile.id, membership.actor_id, 1, 'current',
+     CASE WHEN membership.participation = 'active' THEN 'active' ELSE 'on-mention' END,
+     CASE WHEN membership.participation = 'silent' OR profile.status = 'disabled'
+       OR EXISTS (
+         SELECT 1 FROM json_each(membership.tool_permissions_json)
+         WHERE value NOT IN (
+           'http-json.read', 'repository.git-status', 'room-memory.read', 'sandbox-file.write'
+         )
+       ) THEN 1 ELSE 0 END,
+     '[]', COALESCE((
+       SELECT json_group_array(value) FROM (
+         SELECT DISTINCT member_tool.value
+         FROM json_each(membership.tool_permissions_json) AS member_tool
+         JOIN json_each(profile.tool_ceiling_json) AS profile_tool
+           ON profile_tool.value = member_tool.value
+         ORDER BY member_tool.value
+       )
+     ), '[]'), 'Review migrated Room assignment before use.',
+     COALESCE(membership.configured_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+     strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), NULL, 'legacy_v20_migration'
+   FROM room_memberships AS membership
+   JOIN agent_profiles AS profile ON profile.actor_id = membership.actor_id
+   WHERE membership.kind = 'agent'
+     AND NOT EXISTS (
+       SELECT 1 FROM room_agent_assignments AS assignment
+       WHERE assignment.room_id = membership.room_id
+         AND assignment.agent_actor_id = membership.actor_id
+         AND assignment.status = 'current'
+     )`,
+  `INSERT INTO agent_authority_migration_provenance (
+     source_kind, source_object_id, actor_id, profile_id, room_id, assignment_id,
+     source_schema_version, source_participation, source_authority_json,
+     review_required, migrated_at
+   )
+   SELECT 'legacy_room_membership_assignment',
+     json_array(membership.room_id, membership.actor_id), membership.actor_id,
+     assignment.profile_id, membership.room_id, assignment.id, 19,
+     membership.participation,
+     json_object('toolPermissions', json(membership.tool_permissions_json)),
+     CASE WHEN assignment.paused = 1 THEN 1 ELSE 0 END,
+     strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+   FROM room_memberships AS membership
+   JOIN room_agent_assignments AS assignment
+     ON assignment.room_id = membership.room_id
+    AND assignment.agent_actor_id = membership.actor_id
+    AND assignment.status = 'current'
+   WHERE membership.kind = 'agent'
+     AND NOT EXISTS (
+       SELECT 1 FROM agent_authority_migration_provenance AS provenance
+       WHERE provenance.source_kind = 'existing_v14_assignment'
+         AND provenance.assignment_id = assignment.id
+     )`,
+  `UPDATE agent_authority_migration_provenance
+   SET profile_id = (
+         SELECT assignment.profile_id
+         FROM room_agent_assignments AS assignment
+         WHERE assignment.room_id = agent_authority_migration_provenance.room_id
+           AND assignment.agent_actor_id = agent_authority_migration_provenance.actor_id
+           AND assignment.status = 'current'
+       ),
+       assignment_id = (
+         SELECT assignment.id
+         FROM room_agent_assignments AS assignment
+         WHERE assignment.room_id = agent_authority_migration_provenance.room_id
+           AND assignment.agent_actor_id = agent_authority_migration_provenance.actor_id
+           AND assignment.status = 'current'
+       )
+   WHERE source_kind = 'legacy_silent_assignment'`,
+  `UPDATE room_memberships SET participation = 'on-mention'
+   WHERE kind = 'agent' AND participation = 'silent'`,
+  `CREATE TABLE agent_profile_revisions (
+    profile_id TEXT NOT NULL REFERENCES agent_profiles(id),
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    actor_id TEXT NOT NULL REFERENCES actors(id),
+    display_name TEXT NOT NULL CHECK (length(trim(display_name)) BETWEEN 1 AND 120),
+    global_responsibility TEXT NOT NULL CHECK (
+      length(trim(global_responsibility)) BETWEEN 1 AND 4000
+    ),
+    status TEXT NOT NULL CHECK (status IN ('enabled', 'disabled')),
+    capability_ceiling_json TEXT NOT NULL CHECK (
+      json_valid(capability_ceiling_json) AND json_type(capability_ceiling_json) = 'array'
+    ),
+    tool_ceiling_json TEXT NOT NULL CHECK (
+      json_valid(tool_ceiling_json) AND json_type(tool_ceiling_json) = 'array'
+    ),
+    changed_by_human_actor_id TEXT REFERENCES actors(id),
+    changed_at TEXT NOT NULL,
+    operation TEXT NOT NULL CHECK (
+      operation IN (
+        'create', 'update', 'enable', 'disable', 'legacy_migration', 'static_bootstrap'
+      )
+    ),
+    PRIMARY KEY (profile_id, revision)
+  ) STRICT`,
+  `INSERT INTO agent_profile_revisions (
+     profile_id, revision, actor_id, display_name, global_responsibility, status,
+     capability_ceiling_json, tool_ceiling_json, changed_by_human_actor_id,
+     changed_at, operation
+   ) SELECT id, revision, actor_id, display_name, global_responsibility, status,
+     capability_ceiling_json, tool_ceiling_json, NULL, updated_at, 'legacy_migration'
+   FROM agent_profiles`,
+  `CREATE TABLE room_agent_assignment_revisions (
+    assignment_id TEXT NOT NULL REFERENCES room_agent_assignments(id),
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    profile_id TEXT NOT NULL REFERENCES agent_profiles(id),
+    agent_actor_id TEXT NOT NULL REFERENCES actors(id),
+    room_responsibility TEXT NOT NULL CHECK (
+      length(trim(room_responsibility)) BETWEEN 1 AND 4000
+    ),
+    status TEXT NOT NULL CHECK (status IN ('current', 'removed')),
+    participation TEXT NOT NULL CHECK (participation IN ('active', 'on-mention')),
+    paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
+    capability_subset_json TEXT NOT NULL CHECK (
+      json_valid(capability_subset_json) AND json_type(capability_subset_json) = 'array'
+    ),
+    tool_subset_json TEXT NOT NULL CHECK (
+      json_valid(tool_subset_json) AND json_type(tool_subset_json) = 'array'
+    ),
+    changed_by_human_actor_id TEXT REFERENCES actors(id),
+    changed_at TEXT NOT NULL,
+    operation TEXT NOT NULL CHECK (
+      operation IN ('create', 'update', 'pause', 'resume', 'remove', 'legacy_migration')
+    ),
+    PRIMARY KEY (assignment_id, revision)
+  ) STRICT`,
+  `INSERT INTO room_agent_assignment_revisions (
+     assignment_id, revision, room_id, profile_id, agent_actor_id,
+     room_responsibility, status, participation, paused, capability_subset_json,
+     tool_subset_json, changed_by_human_actor_id, changed_at, operation
+   ) SELECT id, revision, room_id, profile_id, agent_actor_id, room_responsibility,
+     status, participation, paused, capability_subset_json, tool_subset_json,
+     NULL, updated_at, 'legacy_migration' FROM room_agent_assignments`,
+  `CREATE TABLE tenant_administrator_registry (
+    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    bootstrap_configuration_sha256 TEXT NOT NULL CHECK (
+      length(bootstrap_configuration_sha256) = 64
+      AND bootstrap_configuration_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    initialized_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  ) STRICT`,
+  `CREATE TABLE tenant_administrators (
+    human_actor_id TEXT PRIMARY KEY REFERENCES actors(id),
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    status TEXT NOT NULL CHECK (status IN ('active', 'removed')),
+    source_kind TEXT NOT NULL CHECK (source_kind IN ('bootstrap', 'administrator_command')),
+    created_by_human_actor_id TEXT REFERENCES actors(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    removed_at TEXT,
+    CHECK (
+      (status = 'active' AND removed_at IS NULL)
+      OR (status = 'removed' AND removed_at IS NOT NULL)
+    )
+  ) STRICT`,
+  `CREATE TABLE tenant_administrator_revisions (
+    human_actor_id TEXT NOT NULL REFERENCES tenant_administrators(human_actor_id),
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    status TEXT NOT NULL CHECK (status IN ('active', 'removed')),
+    operation TEXT NOT NULL CHECK (operation IN ('bootstrap', 'add', 'remove')),
+    changed_by_human_actor_id TEXT REFERENCES actors(id),
+    changed_at TEXT NOT NULL,
+    PRIMARY KEY (human_actor_id, revision)
+  ) STRICT`,
+  `CREATE TABLE deployment_idempotency_records (
+    scope TEXT NOT NULL CHECK (scope IN (
+      'administrator.bootstrap', 'administrator.add', 'administrator.remove',
+      'profile.create', 'profile.update', 'profile.enable', 'profile.disable',
+      'provider-configuration.disclose', 'provider-configuration.mutate'
+    )),
+    idempotency_key TEXT NOT NULL,
+    principal_actor_id TEXT NOT NULL REFERENCES actors(id),
+    request_sha256 TEXT NOT NULL CHECK (
+      length(request_sha256) = 64 AND request_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    response_json TEXT NOT NULL CHECK (json_valid(response_json)),
+    status_code INTEGER NOT NULL CHECK (status_code BETWEEN 200 AND 599),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms > created_at_ms),
+    PRIMARY KEY (scope, idempotency_key)
+  ) STRICT`,
+  `CREATE TABLE deployment_audit (
+    audit_id TEXT PRIMARY KEY,
+    event_kind TEXT NOT NULL CHECK (event_kind IN (
+      'administrator.bootstrap', 'administrator.add', 'administrator.remove',
+      'profile.create', 'profile.update', 'profile.enable', 'profile.disable',
+      'provider-configuration.disclosed', 'provider-configuration.change-unsupported'
+    )),
+    principal_human_actor_id TEXT REFERENCES actors(id),
+    subject_kind TEXT NOT NULL CHECK (
+      subject_kind IN ('tenant_administrator', 'agent_profile', 'provider_configuration')
+    ),
+    subject_id TEXT NOT NULL,
+    subject_revision INTEGER NOT NULL CHECK (subject_revision > 0),
+    request_id TEXT NOT NULL CHECK (length(trim(request_id)) BETWEEN 1 AND 200),
+    occurred_at TEXT NOT NULL,
+    details_json TEXT NOT NULL CHECK (
+      json_valid(details_json) AND json_type(details_json) = 'object'
+    )
+  ) STRICT`,
+  `CREATE TABLE deployment_stream (
+    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    head_seq INTEGER NOT NULL CHECK (head_seq >= 0),
+    retained_from_seq INTEGER NOT NULL CHECK (
+      retained_from_seq >= 1 AND retained_from_seq <= head_seq + 1
+    )
+  ) STRICT`,
+  `INSERT INTO deployment_stream (singleton_id, head_seq, retained_from_seq)
+   VALUES (1, 0, 1)`,
+  `CREATE TABLE deployment_agent_profile_events (
+    event_id TEXT PRIMARY KEY,
+    stream_seq INTEGER NOT NULL UNIQUE CHECK (stream_seq > 0),
+    profile_id TEXT NOT NULL REFERENCES agent_profiles(id),
+    profile_revision INTEGER NOT NULL CHECK (profile_revision > 0),
+    actor_id TEXT NOT NULL REFERENCES actors(id),
+    event_kind TEXT NOT NULL CHECK (event_kind IN (
+      'profile.created', 'profile.updated', 'profile.enabled', 'profile.disabled'
+    )),
+    occurred_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL CHECK (
+      json_valid(payload_json) AND json_type(payload_json) = 'object'
+    ),
+    payload_sha256 TEXT NOT NULL CHECK (
+      length(payload_sha256) = 64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    UNIQUE (profile_id, profile_revision)
+  ) STRICT`,
+  `CREATE TABLE deployment_profile_outbox (
+    id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL REFERENCES deployment_agent_profile_events(event_id),
+    recipient_human_actor_id TEXT NOT NULL REFERENCES tenant_administrators(human_actor_id),
+    stream_seq INTEGER NOT NULL CHECK (stream_seq > 0),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'dispatched')),
+    attempts INTEGER NOT NULL CHECK (attempts >= 0),
+    available_at TEXT NOT NULL,
+    delivered_at TEXT,
+    last_error TEXT CHECK (
+      last_error IS NULL OR last_error IN ('delivery_failed', 'recipient_unavailable')
+    ),
+    UNIQUE (event_id, recipient_human_actor_id)
+  ) STRICT`,
+  `CREATE INDEX deployment_profile_outbox_pending_v20
+   ON deployment_profile_outbox(status, available_at, stream_seq, id)`,
+  `CREATE TABLE deployment_agent_profile_repair_records (
+    profile_id TEXT PRIMARY KEY REFERENCES agent_profiles(id),
+    profile_revision INTEGER NOT NULL CHECK (profile_revision > 0),
+    record_version INTEGER NOT NULL CHECK (record_version = 1),
+    event_id TEXT NOT NULL UNIQUE REFERENCES deployment_agent_profile_events(event_id),
+    stream_seq INTEGER NOT NULL UNIQUE CHECK (stream_seq > 0),
+    projection_json TEXT NOT NULL CHECK (
+      json_valid(projection_json) AND json_type(projection_json) = 'object'
+    ),
+    projection_sha256 TEXT NOT NULL CHECK (
+      length(projection_sha256) = 64 AND projection_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    updated_at TEXT NOT NULL
+  ) STRICT`,
+  `CREATE TABLE agent_profile_invalidation_facts (
+    invalidation_id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL REFERENCES agent_profiles(id),
+    from_revision INTEGER NOT NULL CHECK (from_revision > 0),
+    to_revision INTEGER NOT NULL CHECK (to_revision > from_revision),
+    reason TEXT NOT NULL CHECK (
+      reason IN ('profile_updated', 'profile_disabled', 'profile_enabled')
+    ),
+    invalidated_context_count INTEGER NOT NULL CHECK (invalidated_context_count >= 0),
+    cancelled_route_intent_count INTEGER NOT NULL CHECK (cancelled_route_intent_count >= 0),
+    affected_assignment_count INTEGER NOT NULL CHECK (affected_assignment_count >= 0),
+    occurred_at TEXT NOT NULL,
+    UNIQUE (profile_id, to_revision)
+  ) STRICT`,
+  `CREATE TRIGGER tenant_administrators_v20_validate_insert
+   BEFORE INSERT ON tenant_administrators
+   WHEN COALESCE((SELECT kind FROM actors WHERE id = NEW.human_actor_id), '') <> 'human'
+      OR (NEW.source_kind = 'bootstrap' AND NEW.created_by_human_actor_id IS NOT NULL)
+      OR (NEW.source_kind = 'administrator_command'
+          AND COALESCE((SELECT kind FROM actors WHERE id = NEW.created_by_human_actor_id), '') <> 'human')
+      OR NOT EXISTS (SELECT 1 FROM tenant_administrator_registry WHERE singleton_id = 1)
+   BEGIN SELECT RAISE(ABORT, 'Tenant Administrator must bind current Human authority'); END`,
+  `CREATE TRIGGER tenant_administrators_v20_validate_update
+   BEFORE UPDATE ON tenant_administrators
+   WHEN NEW.human_actor_id <> OLD.human_actor_id
+      OR NEW.created_by_human_actor_id <> OLD.created_by_human_actor_id
+      OR NEW.created_at <> OLD.created_at
+      OR NEW.revision <> OLD.revision + 1
+      OR (OLD.status = 'active' AND NEW.status = 'removed' AND
+          (SELECT COUNT(*) FROM tenant_administrators WHERE status = 'active') <= 1)
+   BEGIN SELECT RAISE(ABORT, 'Tenant Administrator transition is invalid'); END`,
+  `CREATE TRIGGER tenant_administrators_v20_immutable_delete
+   BEFORE DELETE ON tenant_administrators
+   BEGIN SELECT RAISE(ABORT, 'Tenant Administrator history is immutable'); END`,
+  `CREATE TRIGGER tenant_administrator_registry_v20_validate_update
+   BEFORE UPDATE ON tenant_administrator_registry
+   WHEN NEW.singleton_id <> OLD.singleton_id
+      OR NEW.bootstrap_configuration_sha256 <> OLD.bootstrap_configuration_sha256
+      OR NEW.initialized_at <> OLD.initialized_at
+      OR NEW.revision <> OLD.revision + 1
+   BEGIN SELECT RAISE(ABORT, 'Tenant Administrator registry transition is invalid'); END`,
+  `CREATE TRIGGER tenant_administrator_registry_v20_immutable_delete
+   BEFORE DELETE ON tenant_administrator_registry
+   BEGIN SELECT RAISE(ABORT, 'Tenant Administrator registry is immutable'); END`,
+  `CREATE TRIGGER tenant_administrator_revisions_v20_validate_insert
+   BEFORE INSERT ON tenant_administrator_revisions
+   WHEN (NEW.operation = 'bootstrap' AND NEW.changed_by_human_actor_id IS NOT NULL)
+      OR (NEW.operation <> 'bootstrap'
+          AND COALESCE((SELECT kind FROM actors WHERE id = NEW.changed_by_human_actor_id), '') <> 'human')
+      OR NOT EXISTS (
+        SELECT 1 FROM tenant_administrators AS administrator
+        WHERE administrator.human_actor_id = NEW.human_actor_id
+          AND administrator.revision = NEW.revision
+          AND administrator.status = NEW.status
+      )
+   BEGIN SELECT RAISE(ABORT, 'Tenant Administrator revision actor must be Human'); END`,
+  `CREATE TRIGGER tenant_administrator_revisions_v20_immutable_update
+   BEFORE UPDATE ON tenant_administrator_revisions
+   BEGIN SELECT RAISE(ABORT, 'Tenant Administrator revisions are immutable'); END`,
+  `CREATE TRIGGER tenant_administrator_revisions_v20_immutable_delete
+   BEFORE DELETE ON tenant_administrator_revisions
+   BEGIN SELECT RAISE(ABORT, 'Tenant Administrator revisions are immutable'); END`,
+  `CREATE TRIGGER deployment_audit_v20_validate_insert
+   BEFORE INSERT ON deployment_audit
+   WHEN (NEW.event_kind = 'administrator.bootstrap'
+         AND NEW.principal_human_actor_id IS NOT NULL)
+      OR (NEW.event_kind <> 'administrator.bootstrap'
+          AND COALESCE((SELECT kind FROM actors WHERE id = NEW.principal_human_actor_id), '') <> 'human')
+      OR EXISTS (
+        SELECT 1 FROM json_tree(NEW.details_json)
+        WHERE lower(COALESCE(key, '')) IN (
+          'secret', 'secretvalue', 'credential', 'apikey', 'authorization', 'token'
+        )
+      )
+   BEGIN SELECT RAISE(ABORT, 'Deployment audit principal or secret boundary is invalid'); END`,
+  `CREATE TRIGGER deployment_audit_v20_immutable_update
+   BEFORE UPDATE ON deployment_audit
+   BEGIN SELECT RAISE(ABORT, 'Deployment audit is immutable'); END`,
+  `CREATE TRIGGER deployment_audit_v20_immutable_delete
+   BEFORE DELETE ON deployment_audit
+   BEGIN SELECT RAISE(ABORT, 'Deployment audit is immutable'); END`,
+  `CREATE TRIGGER deployment_stream_v20_validate_update
+   BEFORE UPDATE ON deployment_stream
+   WHEN NEW.singleton_id <> OLD.singleton_id
+      OR NEW.head_seq <> OLD.head_seq + 1
+      OR NEW.retained_from_seq < OLD.retained_from_seq
+      OR NEW.retained_from_seq > NEW.head_seq + 1
+   BEGIN SELECT RAISE(ABORT, 'Deployment stream transition is invalid'); END`,
+  `CREATE TRIGGER deployment_stream_v20_immutable_delete
+   BEFORE DELETE ON deployment_stream
+   BEGIN SELECT RAISE(ABORT, 'Deployment stream is immutable'); END`,
+  `CREATE TRIGGER deployment_agent_profile_events_v20_validate_insert
+   BEFORE INSERT ON deployment_agent_profile_events
+   WHEN NEW.stream_seq <> COALESCE((
+          SELECT head_seq FROM deployment_stream WHERE singleton_id = 1
+        ), 0)
+      OR NOT EXISTS (
+        SELECT 1 FROM agent_profiles AS profile
+        WHERE profile.id = NEW.profile_id
+          AND profile.actor_id = NEW.actor_id
+          AND profile.revision = NEW.profile_revision
+          AND (NEW.event_kind <> 'profile.created' OR profile.revision = 1)
+          AND (NEW.event_kind <> 'profile.enabled' OR profile.status = 'enabled')
+          AND (NEW.event_kind <> 'profile.disabled' OR profile.status = 'disabled')
+      )
+      OR EXISTS (
+        SELECT 1 FROM json_tree(NEW.payload_json)
+        WHERE lower(COALESCE(key, '')) IN (
+          'roomid', 'roomname', 'message', 'messages', 'member', 'members',
+          'goal', 'ball', 'assignment', 'secret', 'secretvalue', 'credential',
+          'apikey', 'authorization', 'token'
+        )
+      )
+   BEGIN SELECT RAISE(ABORT, 'Deployment Profile event is invalid'); END`,
+  `CREATE TRIGGER deployment_agent_profile_events_v20_immutable_update
+   BEFORE UPDATE ON deployment_agent_profile_events
+   BEGIN SELECT RAISE(ABORT, 'Deployment Profile event is immutable'); END`,
+  `CREATE TRIGGER deployment_agent_profile_events_v20_immutable_delete
+   BEFORE DELETE ON deployment_agent_profile_events
+   BEGIN SELECT RAISE(ABORT, 'Deployment Profile event is immutable'); END`,
+  `CREATE TRIGGER deployment_profile_outbox_v20_validate_insert
+   BEFORE INSERT ON deployment_profile_outbox
+   WHEN NEW.status <> 'pending' OR NEW.attempts <> 0
+      OR NEW.delivered_at IS NOT NULL OR NEW.last_error IS NOT NULL
+      OR NOT EXISTS (
+        SELECT 1 FROM deployment_agent_profile_events AS event
+        WHERE event.event_id = NEW.event_id AND event.stream_seq = NEW.stream_seq
+      )
+      OR COALESCE((
+        SELECT status FROM tenant_administrators
+        WHERE human_actor_id = NEW.recipient_human_actor_id
+      ), '') <> 'active'
+   BEGIN SELECT RAISE(ABORT, 'Deployment Profile outbox row is invalid'); END`,
+  `CREATE TRIGGER deployment_profile_outbox_v20_validate_update
+   BEFORE UPDATE ON deployment_profile_outbox
+   WHEN NEW.id <> OLD.id OR NEW.event_id <> OLD.event_id
+      OR NEW.recipient_human_actor_id <> OLD.recipient_human_actor_id
+      OR NEW.stream_seq <> OLD.stream_seq OR NEW.available_at <> OLD.available_at
+      OR OLD.status <> 'pending' OR NEW.status NOT IN ('pending', 'dispatched')
+      OR NEW.attempts < OLD.attempts OR NEW.attempts > OLD.attempts + 1
+      OR (NEW.status = 'dispatched' AND NEW.delivered_at IS NULL)
+      OR (NEW.status = 'pending' AND NEW.delivered_at IS NOT NULL)
+   BEGIN SELECT RAISE(ABORT, 'Deployment Profile outbox transition is invalid'); END`,
+  `CREATE TRIGGER deployment_profile_outbox_v20_immutable_delete
+   BEFORE DELETE ON deployment_profile_outbox
+   BEGIN SELECT RAISE(ABORT, 'Deployment Profile outbox is immutable'); END`,
+  `CREATE TRIGGER deployment_agent_profile_repair_v20_validate_insert
+   BEFORE INSERT ON deployment_agent_profile_repair_records
+   WHEN NOT EXISTS (
+        SELECT 1 FROM deployment_agent_profile_events AS event
+        JOIN agent_profiles AS profile ON profile.id = event.profile_id
+        WHERE event.event_id = NEW.event_id AND event.stream_seq = NEW.stream_seq
+          AND event.profile_id = NEW.profile_id
+          AND event.profile_revision = NEW.profile_revision
+          AND profile.revision = NEW.profile_revision
+      )
+      OR COALESCE(json_extract(NEW.projection_json, '$.profileId'), '') <> NEW.profile_id
+      OR COALESCE(json_extract(NEW.projection_json, '$.revision'), 0) <> NEW.profile_revision
+      OR EXISTS (
+        SELECT 1 FROM json_tree(NEW.projection_json)
+        WHERE lower(COALESCE(key, '')) IN (
+          'roomid', 'roomname', 'message', 'messages', 'member', 'members',
+          'goal', 'ball', 'assignment', 'secret', 'secretvalue', 'credential',
+          'apikey', 'authorization', 'token'
+        )
+      )
+   BEGIN SELECT RAISE(ABORT, 'Deployment Profile repair record is invalid'); END`,
+  `CREATE TRIGGER deployment_agent_profile_repair_v20_validate_update
+   BEFORE UPDATE ON deployment_agent_profile_repair_records
+   WHEN NEW.profile_id <> OLD.profile_id OR NEW.record_version <> OLD.record_version
+      OR NEW.profile_revision <= OLD.profile_revision OR NEW.stream_seq <= OLD.stream_seq
+      OR NOT EXISTS (
+        SELECT 1 FROM deployment_agent_profile_events AS event
+        JOIN agent_profiles AS profile ON profile.id = event.profile_id
+        WHERE event.event_id = NEW.event_id AND event.stream_seq = NEW.stream_seq
+          AND event.profile_id = NEW.profile_id
+          AND event.profile_revision = NEW.profile_revision
+          AND profile.revision = NEW.profile_revision
+      )
+      OR COALESCE(json_extract(NEW.projection_json, '$.profileId'), '') <> NEW.profile_id
+      OR COALESCE(json_extract(NEW.projection_json, '$.revision'), 0) <> NEW.profile_revision
+      OR EXISTS (
+        SELECT 1 FROM json_tree(NEW.projection_json)
+        WHERE lower(COALESCE(key, '')) IN (
+          'roomid', 'roomname', 'message', 'messages', 'member', 'members',
+          'goal', 'ball', 'assignment', 'secret', 'secretvalue', 'credential',
+          'apikey', 'authorization', 'token'
+        )
+      )
+   BEGIN SELECT RAISE(ABORT, 'Deployment Profile repair transition is invalid'); END`,
+  `CREATE TRIGGER deployment_agent_profile_repair_v20_immutable_delete
+   BEFORE DELETE ON deployment_agent_profile_repair_records
+   BEGIN SELECT RAISE(ABORT, 'Deployment Profile repair is immutable'); END`,
+  `CREATE TRIGGER agent_profile_invalidation_facts_v20_validate_insert
+   BEFORE INSERT ON agent_profile_invalidation_facts
+   WHEN COALESCE((SELECT revision FROM agent_profiles WHERE id = NEW.profile_id), 0)
+        <> NEW.to_revision
+   BEGIN SELECT RAISE(ABORT, 'Profile invalidation fact is stale'); END`,
+  `CREATE TRIGGER agent_profile_invalidation_facts_v20_immutable_update
+   BEFORE UPDATE ON agent_profile_invalidation_facts
+   BEGIN SELECT RAISE(ABORT, 'Profile invalidation facts are immutable'); END`,
+  `CREATE TRIGGER agent_profile_invalidation_facts_v20_immutable_delete
+   BEFORE DELETE ON agent_profile_invalidation_facts
+   BEGIN SELECT RAISE(ABORT, 'Profile invalidation facts are immutable'); END`,
+  `CREATE TRIGGER agent_profile_revisions_v20_validate_insert
+   BEFORE INSERT ON agent_profile_revisions
+   WHEN (NEW.operation IN ('legacy_migration', 'static_bootstrap')
+         AND NEW.changed_by_human_actor_id IS NOT NULL)
+      OR (NEW.operation NOT IN ('legacy_migration', 'static_bootstrap')
+          AND COALESCE((SELECT kind FROM actors WHERE id = NEW.changed_by_human_actor_id), '') <> 'human')
+      OR NOT EXISTS (
+        SELECT 1 FROM agent_profiles AS profile
+        WHERE profile.id = NEW.profile_id AND profile.revision = NEW.revision
+          AND profile.actor_id = NEW.actor_id AND profile.display_name = NEW.display_name
+          AND profile.global_responsibility = NEW.global_responsibility
+          AND profile.status = NEW.status
+          AND profile.capability_ceiling_json = NEW.capability_ceiling_json
+          AND profile.tool_ceiling_json = NEW.tool_ceiling_json
+      )
+   BEGIN SELECT RAISE(ABORT, 'Agent Profile revision is not current Human authority'); END`,
+  `CREATE TRIGGER agent_profile_revisions_v20_immutable_update
+   BEFORE UPDATE ON agent_profile_revisions
+   BEGIN SELECT RAISE(ABORT, 'Agent Profile revisions are immutable'); END`,
+  `CREATE TRIGGER agent_profile_revisions_v20_immutable_delete
+   BEFORE DELETE ON agent_profile_revisions
+   BEGIN SELECT RAISE(ABORT, 'Agent Profile revisions are immutable'); END`,
+  `CREATE TRIGGER room_agent_assignment_revisions_v20_validate_insert
+   BEFORE INSERT ON room_agent_assignment_revisions
+   WHEN (NEW.operation = 'legacy_migration' AND NEW.changed_by_human_actor_id IS NOT NULL)
+      OR (NEW.operation <> 'legacy_migration'
+          AND COALESCE((SELECT kind FROM actors WHERE id = NEW.changed_by_human_actor_id), '') <> 'human')
+      OR NOT EXISTS (
+        SELECT 1 FROM room_agent_assignments AS assignment
+        WHERE assignment.id = NEW.assignment_id AND assignment.revision = NEW.revision
+          AND assignment.room_id = NEW.room_id AND assignment.profile_id = NEW.profile_id
+          AND assignment.agent_actor_id = NEW.agent_actor_id
+          AND assignment.room_responsibility = NEW.room_responsibility
+          AND assignment.status = NEW.status
+          AND assignment.participation = NEW.participation
+          AND assignment.paused = NEW.paused
+          AND assignment.capability_subset_json = NEW.capability_subset_json
+          AND assignment.tool_subset_json = NEW.tool_subset_json
+      )
+   BEGIN SELECT RAISE(ABORT, 'Room Assignment revision is not current Human authority'); END`,
+  `CREATE TRIGGER room_agent_assignment_revisions_v20_immutable_update
+   BEFORE UPDATE ON room_agent_assignment_revisions
+   BEGIN SELECT RAISE(ABORT, 'Room Assignment revisions are immutable'); END`,
+  `CREATE TRIGGER room_agent_assignment_revisions_v20_immutable_delete
+   BEFORE DELETE ON room_agent_assignment_revisions
+   BEGIN SELECT RAISE(ABORT, 'Room Assignment revisions are immutable'); END`,
+  `CREATE TRIGGER agent_authority_migration_provenance_v20_immutable_update
+   BEFORE UPDATE ON agent_authority_migration_provenance
+   BEGIN SELECT RAISE(ABORT, 'Agent authority migration provenance is immutable'); END`,
+  `CREATE TRIGGER agent_authority_migration_provenance_v20_immutable_delete
+   BEFORE DELETE ON agent_authority_migration_provenance
+   BEGIN SELECT RAISE(ABORT, 'Agent authority migration provenance is immutable'); END`,
+  `CREATE TRIGGER deployment_idempotency_records_v20_validate_insert
+   BEFORE INSERT ON deployment_idempotency_records
+   WHEN COALESCE((SELECT kind FROM actors WHERE id = NEW.principal_actor_id), '') <> 'human'
+   BEGIN SELECT RAISE(ABORT, 'Deployment idempotency principal must be Human'); END`,
+  `CREATE TRIGGER agent_profiles_v20_validate_insert
+   BEFORE INSERT ON agent_profiles
+   WHEN EXISTS (
+     SELECT 1 FROM json_each(NEW.capability_ceiling_json)
+     WHERE typeof(value) <> 'text' OR value NOT IN (
+       'room.conversation.read', 'room.memory.read', 'room.project.read', 'room.respond'
+     )
+   ) OR EXISTS (
+     SELECT 1 FROM json_each(NEW.tool_ceiling_json)
+     WHERE typeof(value) <> 'text' OR value NOT IN (
+       'http-json.read', 'repository.git-status', 'room-memory.read', 'sandbox-file.write'
+     )
+   ) OR EXISTS (
+     SELECT 1 FROM json_each(NEW.capability_ceiling_json) AS entry
+     JOIN json_each(NEW.capability_ceiling_json) AS successor
+       ON CAST(successor.key AS INTEGER) = CAST(entry.key AS INTEGER) + 1
+     WHERE entry.value >= successor.value
+   ) OR EXISTS (
+     SELECT 1 FROM json_each(NEW.tool_ceiling_json) AS entry
+     JOIN json_each(NEW.tool_ceiling_json) AS successor
+       ON CAST(successor.key AS INTEGER) = CAST(entry.key AS INTEGER) + 1
+     WHERE entry.value >= successor.value
+   )
+   BEGIN SELECT RAISE(ABORT, 'Agent Profile authority set is not canonical'); END`,
+  `CREATE TRIGGER agent_profiles_v20_validate_update
+   BEFORE UPDATE ON agent_profiles
+   WHEN NEW.id <> OLD.id OR NEW.actor_id <> OLD.actor_id
+      OR NEW.created_at <> OLD.created_at
+      OR (NEW.source_kind <> OLD.source_kind AND NOT (
+        OLD.source_kind IN ('legacy_v20_migration', 'static_bootstrap')
+        AND NEW.source_kind = 'administrator_command'
+      ))
+      OR NEW.revision <> OLD.revision + 1
+      OR EXISTS (
+        SELECT 1 FROM json_each(NEW.capability_ceiling_json)
+        WHERE typeof(value) <> 'text' OR value NOT IN (
+          'room.conversation.read', 'room.memory.read', 'room.project.read', 'room.respond'
+        )
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(NEW.tool_ceiling_json)
+        WHERE typeof(value) <> 'text' OR value NOT IN (
+          'http-json.read', 'repository.git-status', 'room-memory.read', 'sandbox-file.write'
+        )
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(NEW.capability_ceiling_json) AS entry
+        JOIN json_each(NEW.capability_ceiling_json) AS successor
+          ON CAST(successor.key AS INTEGER) = CAST(entry.key AS INTEGER) + 1
+        WHERE entry.value >= successor.value
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(NEW.tool_ceiling_json) AS entry
+        JOIN json_each(NEW.tool_ceiling_json) AS successor
+          ON CAST(successor.key AS INTEGER) = CAST(entry.key AS INTEGER) + 1
+        WHERE entry.value >= successor.value
+      )
+   BEGIN SELECT RAISE(ABORT, 'Agent Profile transition or authority set is invalid'); END`,
+  `CREATE TRIGGER room_agent_assignments_v20_validate_insert
+   BEFORE INSERT ON room_agent_assignments
+   WHEN (NEW.status = 'removed' AND (NEW.paused <> 1 OR NEW.removed_at IS NULL))
+      OR (NEW.status = 'current' AND NEW.removed_at IS NOT NULL)
+      OR EXISTS (
+        SELECT 1 FROM json_each(NEW.capability_subset_json)
+        WHERE typeof(value) <> 'text' OR value NOT IN (
+          'room.conversation.read', 'room.memory.read', 'room.project.read', 'room.respond'
+        )
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(NEW.tool_subset_json)
+        WHERE typeof(value) <> 'text' OR value NOT IN (
+          'http-json.read', 'repository.git-status', 'room-memory.read', 'sandbox-file.write'
+        )
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(NEW.capability_subset_json) AS entry
+        JOIN json_each(NEW.capability_subset_json) AS successor
+          ON CAST(successor.key AS INTEGER) = CAST(entry.key AS INTEGER) + 1
+        WHERE entry.value >= successor.value
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(NEW.tool_subset_json) AS entry
+        JOIN json_each(NEW.tool_subset_json) AS successor
+          ON CAST(successor.key AS INTEGER) = CAST(entry.key AS INTEGER) + 1
+        WHERE entry.value >= successor.value
+      )
+   BEGIN SELECT RAISE(ABORT, 'Room Assignment lifecycle or authority set is invalid'); END`,
+  `CREATE TRIGGER room_agent_assignments_v20_validate_update
+   BEFORE UPDATE ON room_agent_assignments
+   WHEN NEW.id <> OLD.id OR NEW.room_id <> OLD.room_id
+      OR NEW.profile_id <> OLD.profile_id OR NEW.agent_actor_id <> OLD.agent_actor_id
+      OR NEW.created_at <> OLD.created_at
+      OR (NEW.source_kind <> OLD.source_kind AND NOT (
+        OLD.source_kind IN ('legacy_v20_migration', 'static_bootstrap')
+        AND NEW.source_kind = 'room_command'
+      ))
+      OR NEW.revision <> OLD.revision + 1 OR OLD.status = 'removed'
+      OR (NEW.status = 'removed' AND (NEW.paused <> 1 OR NEW.removed_at IS NULL))
+      OR (NEW.status = 'current' AND NEW.removed_at IS NOT NULL)
+      OR EXISTS (
+        SELECT 1 FROM json_each(NEW.capability_subset_json)
+        WHERE typeof(value) <> 'text' OR value NOT IN (
+          'room.conversation.read', 'room.memory.read', 'room.project.read', 'room.respond'
+        )
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(NEW.tool_subset_json)
+        WHERE typeof(value) <> 'text' OR value NOT IN (
+          'http-json.read', 'repository.git-status', 'room-memory.read', 'sandbox-file.write'
+        )
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(NEW.capability_subset_json) AS entry
+        JOIN json_each(NEW.capability_subset_json) AS successor
+          ON CAST(successor.key AS INTEGER) = CAST(entry.key AS INTEGER) + 1
+        WHERE entry.value >= successor.value
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(NEW.tool_subset_json) AS entry
+        JOIN json_each(NEW.tool_subset_json) AS successor
+          ON CAST(successor.key AS INTEGER) = CAST(entry.key AS INTEGER) + 1
+        WHERE entry.value >= successor.value
+      )
+   BEGIN SELECT RAISE(ABORT, 'Room Assignment transition or authority set is invalid'); END`,
+  `ALTER TABLE route_jobs ADD COLUMN revision INTEGER NOT NULL DEFAULT 1
+   CHECK (revision > 0)`,
+  `CREATE TABLE route_candidate_snapshots (
+    id TEXT PRIMARY KEY,
+    route_job_id TEXT NOT NULL UNIQUE REFERENCES route_jobs(id),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    room_revision INTEGER NOT NULL CHECK (room_revision > 0),
+    source_message_id TEXT NOT NULL REFERENCES messages(id),
+    source_message_revision INTEGER NOT NULL CHECK (source_message_revision > 0),
+    source_author_kind TEXT NOT NULL CHECK (source_author_kind IN ('human', 'agent')),
+    source_message_kind TEXT NOT NULL CHECK (
+      source_message_kind IN ('human', 'agent-final', 'agent-correction')
+    ),
+    snapshot_version INTEGER NOT NULL CHECK (snapshot_version = 1),
+    candidate_count INTEGER NOT NULL CHECK (candidate_count >= 0),
+    snapshot_sha256 TEXT NOT NULL CHECK (
+      length(snapshot_sha256) = 64 AND snapshot_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    created_at TEXT NOT NULL,
+    UNIQUE (id, route_job_id),
+    FOREIGN KEY (source_message_id, source_message_revision)
+      REFERENCES message_revisions(message_id, revision)
+  ) STRICT`,
+  `CREATE TRIGGER route_candidate_snapshots_v20_validate_insert
+   BEFORE INSERT ON route_candidate_snapshots
+   WHEN NOT EXISTS (
+     SELECT 1 FROM route_jobs AS job
+     JOIN messages AS message ON message.id = job.source_message_id
+     JOIN message_envelopes AS envelope ON envelope.message_id = message.id
+     WHERE job.id = NEW.route_job_id
+       AND job.room_id = NEW.room_id
+       AND job.source_message_id = NEW.source_message_id
+       AND message.room_id = NEW.room_id
+       AND message.author_kind = NEW.source_author_kind
+       AND envelope.message_kind = NEW.source_message_kind
+       AND envelope.current_revision = NEW.source_message_revision
+       AND envelope.lifecycle = 'active'
+   )
+   BEGIN SELECT RAISE(ABORT, 'Route candidate snapshot source is stale or invalid'); END`,
+  `ALTER TABLE route_jobs ADD COLUMN candidate_snapshot_id TEXT
+   REFERENCES route_candidate_snapshots(id)`,
+  `CREATE UNIQUE INDEX route_jobs_candidate_snapshot_v20
+   ON route_jobs(candidate_snapshot_id) WHERE candidate_snapshot_id IS NOT NULL`,
+  `CREATE TRIGGER route_jobs_v20_validate_candidate_snapshot_update
+   BEFORE UPDATE OF candidate_snapshot_id ON route_jobs
+   WHEN (OLD.candidate_snapshot_id IS NOT NULL
+         AND NEW.candidate_snapshot_id <> OLD.candidate_snapshot_id)
+      OR (NEW.candidate_snapshot_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM route_candidate_snapshots AS snapshot
+        WHERE snapshot.id = NEW.candidate_snapshot_id
+          AND snapshot.route_job_id = OLD.id
+          AND snapshot.room_id = OLD.room_id
+          AND snapshot.source_message_id = OLD.source_message_id
+      ))
+   BEGIN SELECT RAISE(ABORT, 'Route job candidate snapshot binding is invalid'); END`,
+  `CREATE TABLE route_candidate_snapshot_agents (
+    snapshot_id TEXT NOT NULL REFERENCES route_candidate_snapshots(id),
+    route_job_id TEXT NOT NULL REFERENCES route_jobs(id),
+    agent_actor_id TEXT NOT NULL REFERENCES actors(id),
+    profile_id TEXT NOT NULL REFERENCES agent_profiles(id),
+    profile_revision INTEGER NOT NULL CHECK (profile_revision > 0),
+    assignment_id TEXT NOT NULL REFERENCES room_agent_assignments(id),
+    assignment_revision INTEGER NOT NULL CHECK (assignment_revision > 0),
+    access_revision INTEGER NOT NULL CHECK (access_revision >= 0),
+    participation TEXT NOT NULL CHECK (participation IN ('active', 'on-mention')),
+    availability TEXT NOT NULL CHECK (availability IN ('ready', 'busy', 'paused', 'noauth')),
+    room_responsibility TEXT NOT NULL CHECK (length(trim(room_responsibility)) > 0),
+    effective_capabilities_json TEXT NOT NULL CHECK (
+      json_valid(effective_capabilities_json)
+      AND json_type(effective_capabilities_json) = 'array'
+    ),
+    effective_tools_json TEXT NOT NULL CHECK (
+      json_valid(effective_tools_json) AND json_type(effective_tools_json) = 'array'
+    ),
+    calibration_score INTEGER NOT NULL CHECK (calibration_score BETWEEN -3 AND 3),
+    has_ball INTEGER NOT NULL CHECK (has_ball IN (0, 1)),
+    goal_fact_revision INTEGER CHECK (goal_fact_revision > 0),
+    project_fact_revision INTEGER CHECK (project_fact_revision > 0),
+    ball_fact_revision INTEGER CHECK (ball_fact_revision > 0),
+    candidate_order INTEGER NOT NULL CHECK (candidate_order >= 0),
+    PRIMARY KEY (snapshot_id, agent_actor_id),
+    UNIQUE (snapshot_id, candidate_order),
+    FOREIGN KEY (snapshot_id, route_job_id)
+      REFERENCES route_candidate_snapshots(id, route_job_id),
+    CHECK ((has_ball = 1) = (ball_fact_revision IS NOT NULL))
+  ) STRICT`,
+  `CREATE TABLE route_decisions (
+    id TEXT PRIMARY KEY,
+    route_job_id TEXT NOT NULL UNIQUE REFERENCES route_jobs(id),
+    expected_route_job_revision INTEGER NOT NULL CHECK (expected_route_job_revision > 0),
+    snapshot_id TEXT NOT NULL REFERENCES route_candidate_snapshots(id),
+    outcome TEXT NOT NULL CHECK (outcome IN ('selected', 'suppressed', 'failed')),
+    reason_code TEXT NOT NULL CHECK (reason_code IN (
+      'selected', 'candidate_not_found', 'revision_changed', 'not_active', 'unavailable',
+      'missing_authority_facts', 'stale_authority_facts', 'ball_fact_unavailable',
+      'source_not_human', 'provider_failed'
+    )),
+    decided_at TEXT NOT NULL,
+    UNIQUE (id, route_job_id, snapshot_id)
+  ) STRICT`,
+  `CREATE TABLE routed_agent_invocation_intents (
+    id TEXT PRIMARY KEY,
+    route_decision_id TEXT NOT NULL REFERENCES route_decisions(id),
+    route_job_id TEXT NOT NULL REFERENCES route_jobs(id),
+    snapshot_id TEXT NOT NULL REFERENCES route_candidate_snapshots(id),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    source_message_id TEXT NOT NULL REFERENCES messages(id),
+    source_message_revision INTEGER NOT NULL CHECK (source_message_revision > 0),
+    target_agent_actor_id TEXT NOT NULL REFERENCES actors(id),
+    profile_id TEXT NOT NULL REFERENCES agent_profiles(id),
+    profile_revision INTEGER NOT NULL CHECK (profile_revision > 0),
+    assignment_id TEXT NOT NULL REFERENCES room_agent_assignments(id),
+    assignment_revision INTEGER NOT NULL CHECK (assignment_revision > 0),
+    access_revision INTEGER NOT NULL CHECK (access_revision >= 0),
+    trigger_kind TEXT NOT NULL CHECK (trigger_kind IN ('domain', 'risk', 'ball')),
+    reason_text TEXT NOT NULL CHECK (length(trim(reason_text)) > 0),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'claimed', 'cancelled')),
+    created_at TEXT NOT NULL,
+    claimed_at TEXT,
+    cancelled_at TEXT,
+    cancellation_reason TEXT,
+    UNIQUE (route_decision_id, target_agent_actor_id),
+    FOREIGN KEY (route_decision_id, route_job_id, snapshot_id)
+      REFERENCES route_decisions(id, route_job_id, snapshot_id),
+    FOREIGN KEY (source_message_id, source_message_revision)
+      REFERENCES message_revisions(message_id, revision),
+    CHECK (
+      (status = 'pending' AND claimed_at IS NULL AND cancelled_at IS NULL
+       AND cancellation_reason IS NULL)
+      OR (status = 'claimed' AND claimed_at IS NOT NULL AND cancelled_at IS NULL
+          AND cancellation_reason IS NULL)
+      OR (status = 'cancelled' AND cancelled_at IS NOT NULL
+          AND cancellation_reason IS NOT NULL)
+    )
+  ) STRICT`,
+  `CREATE INDEX routed_agent_invocation_intents_pending_v20
+   ON routed_agent_invocation_intents(status, created_at, id)`,
+  `CREATE TRIGGER route_candidate_snapshot_agents_v20_validate_insert
+   BEFORE INSERT ON route_candidate_snapshot_agents
+   WHEN NEW.participation <> 'active' OR NEW.availability <> 'ready'
+      OR COALESCE((SELECT actor_id FROM agent_profiles WHERE id = NEW.profile_id), '')
+         <> NEW.agent_actor_id
+      OR COALESCE((SELECT revision FROM agent_profiles WHERE id = NEW.profile_id), 0)
+         <> NEW.profile_revision
+      OR COALESCE((SELECT status FROM agent_profiles WHERE id = NEW.profile_id), '')
+         <> 'enabled'
+      OR COALESCE((SELECT profile_id FROM room_agent_assignments WHERE id = NEW.assignment_id), '')
+         <> NEW.profile_id
+      OR COALESCE((SELECT agent_actor_id FROM room_agent_assignments WHERE id = NEW.assignment_id), '')
+         <> NEW.agent_actor_id
+      OR COALESCE((SELECT revision FROM room_agent_assignments WHERE id = NEW.assignment_id), 0)
+         <> NEW.assignment_revision
+      OR COALESCE((SELECT status FROM room_agent_assignments WHERE id = NEW.assignment_id), '')
+         <> 'current'
+      OR COALESCE((SELECT paused FROM room_agent_assignments WHERE id = NEW.assignment_id), 1)
+         <> 0
+      OR COALESCE((SELECT participation FROM room_agent_assignments WHERE id = NEW.assignment_id), '')
+         <> 'active'
+      OR EXISTS (
+        SELECT 1 FROM json_each(NEW.effective_capabilities_json)
+        WHERE typeof(value) <> 'text' OR value NOT IN (
+          'room.conversation.read', 'room.memory.read', 'room.project.read', 'room.respond'
+        )
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(NEW.effective_tools_json)
+        WHERE typeof(value) <> 'text' OR value NOT IN (
+          'http-json.read', 'repository.git-status', 'room-memory.read', 'sandbox-file.write'
+        )
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(NEW.effective_capabilities_json) AS entry
+        JOIN json_each(NEW.effective_capabilities_json) AS successor
+          ON CAST(successor.key AS INTEGER) = CAST(entry.key AS INTEGER) + 1
+        WHERE entry.value >= successor.value
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(NEW.effective_tools_json) AS entry
+        JOIN json_each(NEW.effective_tools_json) AS successor
+          ON CAST(successor.key AS INTEGER) = CAST(entry.key AS INTEGER) + 1
+        WHERE entry.value >= successor.value
+      )
+   BEGIN SELECT RAISE(ABORT, 'Route candidate authority is invalid'); END`,
+  `CREATE TRIGGER route_candidate_snapshots_v20_immutable_update
+   BEFORE UPDATE ON route_candidate_snapshots
+   BEGIN SELECT RAISE(ABORT, 'Route candidate snapshot is immutable'); END`,
+  `CREATE TRIGGER route_candidate_snapshots_v20_immutable_delete
+   BEFORE DELETE ON route_candidate_snapshots
+   BEGIN SELECT RAISE(ABORT, 'Route candidate snapshot is immutable'); END`,
+  `CREATE TRIGGER route_candidate_snapshot_agents_v20_immutable_update
+   BEFORE UPDATE ON route_candidate_snapshot_agents
+   BEGIN SELECT RAISE(ABORT, 'Route candidate is immutable'); END`,
+  `CREATE TRIGGER route_candidate_snapshot_agents_v20_immutable_delete
+   BEFORE DELETE ON route_candidate_snapshot_agents
+   BEGIN SELECT RAISE(ABORT, 'Route candidate is immutable'); END`,
+  `CREATE TRIGGER route_decisions_v20_validate_insert
+   BEFORE INSERT ON route_decisions
+   WHEN NOT EXISTS (
+     SELECT 1 FROM route_candidate_snapshots AS snapshot
+     JOIN route_jobs AS job ON job.id = snapshot.route_job_id
+     WHERE snapshot.id = NEW.snapshot_id AND snapshot.route_job_id = NEW.route_job_id
+       AND job.candidate_snapshot_id = snapshot.id
+       AND snapshot.candidate_count = (
+         SELECT COUNT(*) FROM route_candidate_snapshot_agents AS candidate
+         WHERE candidate.snapshot_id = snapshot.id
+       )
+   ) OR COALESCE((SELECT revision FROM route_jobs WHERE id = NEW.route_job_id), 0)
+        <> NEW.expected_route_job_revision
+      OR (NEW.outcome = 'selected') <> (NEW.reason_code = 'selected')
+   BEGIN SELECT RAISE(ABORT, 'Route decision provenance is stale or invalid'); END`,
+  `CREATE TRIGGER route_decisions_v20_immutable_update
+   BEFORE UPDATE ON route_decisions
+   BEGIN SELECT RAISE(ABORT, 'Route decision is immutable'); END`,
+  `CREATE TRIGGER route_decisions_v20_immutable_delete
+   BEFORE DELETE ON route_decisions
+   BEGIN SELECT RAISE(ABORT, 'Route decision is immutable'); END`,
+  `CREATE TRIGGER routed_agent_invocation_intents_v20_validate_insert
+   BEFORE INSERT ON routed_agent_invocation_intents
+   WHEN NOT EXISTS (
+     SELECT 1 FROM route_decisions AS decision
+     JOIN route_candidate_snapshots AS snapshot ON snapshot.id = decision.snapshot_id
+     WHERE decision.id = NEW.route_decision_id
+       AND decision.route_job_id = NEW.route_job_id
+       AND decision.snapshot_id = NEW.snapshot_id
+       AND decision.outcome = 'selected'
+       AND snapshot.room_id = NEW.room_id
+       AND snapshot.source_message_id = NEW.source_message_id
+       AND snapshot.source_message_revision = NEW.source_message_revision
+   ) OR NOT EXISTS (
+     SELECT 1 FROM route_candidate_snapshot_agents AS candidate
+     WHERE candidate.snapshot_id = NEW.snapshot_id
+       AND candidate.route_job_id = NEW.route_job_id
+       AND candidate.agent_actor_id = NEW.target_agent_actor_id
+       AND candidate.profile_id = NEW.profile_id
+       AND candidate.profile_revision = NEW.profile_revision
+       AND candidate.assignment_id = NEW.assignment_id
+       AND candidate.assignment_revision = NEW.assignment_revision
+       AND candidate.access_revision = NEW.access_revision
+   )
+   BEGIN SELECT RAISE(ABORT, 'Routed invocation is not bound to its candidate snapshot'); END`,
+  `CREATE TRIGGER routed_agent_invocation_intents_v20_validate_update
+   BEFORE UPDATE ON routed_agent_invocation_intents
+   WHEN NEW.id <> OLD.id OR NEW.route_decision_id <> OLD.route_decision_id
+      OR NEW.route_job_id <> OLD.route_job_id OR NEW.snapshot_id <> OLD.snapshot_id
+      OR NEW.room_id <> OLD.room_id OR NEW.source_message_id <> OLD.source_message_id
+      OR NEW.source_message_revision <> OLD.source_message_revision
+      OR NEW.target_agent_actor_id <> OLD.target_agent_actor_id
+      OR NEW.profile_id <> OLD.profile_id OR NEW.profile_revision <> OLD.profile_revision
+      OR NEW.assignment_id <> OLD.assignment_id
+      OR NEW.assignment_revision <> OLD.assignment_revision
+      OR NEW.access_revision <> OLD.access_revision OR NEW.trigger_kind <> OLD.trigger_kind
+      OR NEW.reason_text <> OLD.reason_text OR NEW.created_at <> OLD.created_at
+      OR OLD.status <> 'pending' OR NEW.status NOT IN ('claimed', 'cancelled')
+   BEGIN SELECT RAISE(ABORT, 'Routed invocation transition is invalid'); END`,
+  `CREATE TRIGGER routed_agent_invocation_intents_v20_immutable_delete
+   BEFORE DELETE ON routed_agent_invocation_intents
+   BEGIN SELECT RAISE(ABORT, 'Routed invocation intent is immutable'); END`,
+] as const;
+
 export const AUTHORITY_V14_STATEMENT_COUNT_FOR_TEST = V14_STATEMENTS.length;
 export const AUTHORITY_V15_STATEMENT_COUNT_FOR_TEST = V15_STATEMENTS.length;
 export const AUTHORITY_V16_STATEMENT_COUNT_FOR_TEST = V16_STATEMENTS.length;
 export const AUTHORITY_V17_STATEMENT_COUNT_FOR_TEST = V17_STATEMENTS.length;
 export const AUTHORITY_V18_STATEMENT_COUNT_FOR_TEST = V18_STATEMENTS.length;
 export const AUTHORITY_V19_STATEMENT_COUNT_FOR_TEST = V19_STATEMENTS.length;
+export const AUTHORITY_V20_STATEMENT_COUNT_FOR_TEST = V20_STATEMENTS.length;
+export const AUTHORITY_V20_TRIGGER_INVARIANT_STATEMENT_COUNT_FOR_TEST =
+  V20_STATEMENTS.filter((statement) => statement.startsWith("CREATE TRIGGER ")).length;
+export const AUTHORITY_V20_STARTUP_INVARIANT_STATEMENT_COUNT_FOR_TEST = 9;
+export const AUTHORITY_V20_INVARIANT_STATEMENT_COUNT_FOR_TEST =
+  AUTHORITY_V20_TRIGGER_INVARIANT_STATEMENT_COUNT_FOR_TEST
+  + AUTHORITY_V20_STARTUP_INVARIANT_STATEMENT_COUNT_FOR_TEST;
+export const AUTHORITY_V20_ROLLBACK_ASSERTION_COUNT_FOR_TEST = V20_STATEMENTS.length;
+export const AUTHORITY_V20_MIGRATION_CHECKSUM_FOR_TEST = migrationChecksum(
+  20,
+  "agent-profile-routing-authority",
+  V20_STATEMENTS,
+);
 
 const V2_STATEMENTS = [
   `ALTER TABLE actors
@@ -6001,6 +7140,11 @@ const MIGRATIONS = [
     19,
     "context-snapshot-authority",
     V19_STATEMENTS,
+  ),
+  defineMigration(
+    20,
+    "agent-profile-routing-authority",
+    V20_STATEMENTS,
   ),
 ] as const satisfies readonly Migration[];
 
@@ -6672,6 +7816,99 @@ const V19_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V20_SCHEMA_CONTRACT = {
+  ...V19_SCHEMA_CONTRACT,
+  agent_profiles: [
+    ...V19_SCHEMA_CONTRACT.agent_profiles,
+    "display_name", "global_responsibility", "created_at", "updated_at", "source_kind",
+  ],
+  room_agent_assignments: [
+    ...V19_SCHEMA_CONTRACT.room_agent_assignments,
+    "room_responsibility", "created_at", "updated_at", "removed_at", "source_kind",
+  ],
+  route_jobs: [
+    ...V19_SCHEMA_CONTRACT.route_jobs, "revision", "candidate_snapshot_id",
+  ],
+  agent_authority_migration_provenance: [
+    "source_kind", "source_object_id", "actor_id", "profile_id", "room_id",
+    "assignment_id", "source_schema_version", "source_participation",
+    "source_authority_json", "review_required", "migrated_at",
+  ],
+  agent_profile_revisions: [
+    "profile_id", "revision", "actor_id", "display_name", "global_responsibility",
+    "status", "capability_ceiling_json", "tool_ceiling_json",
+    "changed_by_human_actor_id", "changed_at", "operation",
+  ],
+  room_agent_assignment_revisions: [
+    "assignment_id", "revision", "room_id", "profile_id", "agent_actor_id",
+    "room_responsibility", "status", "participation", "paused",
+    "capability_subset_json", "tool_subset_json", "changed_by_human_actor_id",
+    "changed_at", "operation",
+  ],
+  tenant_administrator_registry: [
+    "singleton_id", "revision", "bootstrap_configuration_sha256",
+    "initialized_at", "updated_at",
+  ],
+  tenant_administrators: [
+    "human_actor_id", "revision", "status", "source_kind",
+    "created_by_human_actor_id", "created_at", "updated_at", "removed_at",
+  ],
+  tenant_administrator_revisions: [
+    "human_actor_id", "revision", "status", "operation",
+    "changed_by_human_actor_id", "changed_at",
+  ],
+  deployment_idempotency_records: [
+    "scope", "idempotency_key", "principal_actor_id", "request_sha256",
+    "response_json", "status_code", "created_at_ms", "expires_at_ms",
+  ],
+  deployment_audit: [
+    "audit_id", "event_kind", "principal_human_actor_id", "subject_kind",
+    "subject_id", "subject_revision", "request_id", "occurred_at", "details_json",
+  ],
+  deployment_stream: ["singleton_id", "head_seq", "retained_from_seq"],
+  deployment_agent_profile_events: [
+    "event_id", "stream_seq", "profile_id", "profile_revision", "actor_id",
+    "event_kind", "occurred_at", "payload_json", "payload_sha256",
+  ],
+  deployment_profile_outbox: [
+    "id", "event_id", "recipient_human_actor_id", "stream_seq", "status",
+    "attempts", "available_at", "delivered_at", "last_error",
+  ],
+  deployment_agent_profile_repair_records: [
+    "profile_id", "profile_revision", "record_version", "event_id", "stream_seq",
+    "projection_json", "projection_sha256", "updated_at",
+  ],
+  agent_profile_invalidation_facts: [
+    "invalidation_id", "profile_id", "from_revision", "to_revision", "reason",
+    "invalidated_context_count", "cancelled_route_intent_count",
+    "affected_assignment_count", "occurred_at",
+  ],
+  route_candidate_snapshots: [
+    "id", "route_job_id", "room_id", "room_revision", "source_message_id",
+    "source_message_revision", "source_author_kind", "source_message_kind",
+    "snapshot_version", "candidate_count", "snapshot_sha256", "created_at",
+  ],
+  route_candidate_snapshot_agents: [
+    "snapshot_id", "route_job_id", "agent_actor_id", "profile_id",
+    "profile_revision", "assignment_id", "assignment_revision", "access_revision",
+    "participation", "availability", "room_responsibility",
+    "effective_capabilities_json", "effective_tools_json", "calibration_score",
+    "has_ball", "goal_fact_revision", "project_fact_revision", "ball_fact_revision",
+    "candidate_order",
+  ],
+  route_decisions: [
+    "id", "route_job_id", "expected_route_job_revision", "snapshot_id",
+    "outcome", "reason_code", "decided_at",
+  ],
+  routed_agent_invocation_intents: [
+    "id", "route_decision_id", "route_job_id", "snapshot_id", "room_id",
+    "source_message_id", "source_message_revision", "target_agent_actor_id",
+    "profile_id", "profile_revision", "assignment_id", "assignment_revision",
+    "access_revision", "trigger_kind", "reason_text", "status", "created_at",
+    "claimed_at", "cancelled_at", "cancellation_reason",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
@@ -6692,6 +7929,7 @@ const SCHEMA_CONTRACTS = {
   17: V17_SCHEMA_CONTRACT,
   18: V18_SCHEMA_CONTRACT,
   19: V19_SCHEMA_CONTRACT,
+  20: V20_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -8178,6 +9416,182 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
           OR citation.snapshot_id <> binding.snapshot_id
        LIMIT 1`,
       "final citations must remain bound to the Agent message execution snapshot",
+    );
+  }
+  if (schemaVersion >= 20) {
+    requireNoRows(
+      database,
+      `SELECT 1 FROM actors AS actor
+       LEFT JOIN agent_profiles AS profile ON profile.actor_id = actor.id
+       WHERE actor.kind = 'agent' AND profile.id IS NULL LIMIT 1`,
+      "every legacy Agent actor must retain one canonical Global Profile",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_profiles AS profile
+       JOIN actors AS actor ON actor.id = profile.actor_id
+       LEFT JOIN agent_profile_revisions AS revision
+         ON revision.profile_id = profile.id AND revision.revision = profile.revision
+       WHERE actor.kind <> 'agent' OR revision.profile_id IS NULL
+          OR revision.actor_id <> profile.actor_id
+          OR revision.display_name <> profile.display_name
+          OR revision.global_responsibility <> profile.global_responsibility
+          OR revision.status <> profile.status
+          OR revision.capability_ceiling_json <> profile.capability_ceiling_json
+          OR revision.tool_ceiling_json <> profile.tool_ceiling_json
+          OR EXISTS (
+            SELECT 1 FROM json_each(profile.capability_ceiling_json)
+            WHERE typeof(value) <> 'text' OR value NOT IN (
+              'room.conversation.read', 'room.memory.read', 'room.project.read', 'room.respond'
+            )
+          ) OR EXISTS (
+            SELECT 1 FROM json_each(profile.tool_ceiling_json)
+            WHERE typeof(value) <> 'text' OR value NOT IN (
+              'http-json.read', 'repository.git-status', 'room-memory.read', 'sandbox-file.write'
+            )
+          )
+       LIMIT 1`,
+      "Global Profiles must retain a closed current revision bound to one Agent actor",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM room_agent_assignments AS assignment
+       JOIN agent_profiles AS profile ON profile.id = assignment.profile_id
+       LEFT JOIN room_agent_assignment_revisions AS revision
+         ON revision.assignment_id = assignment.id AND revision.revision = assignment.revision
+       WHERE revision.assignment_id IS NULL
+          OR assignment.agent_actor_id <> profile.actor_id
+          OR revision.room_id <> assignment.room_id
+          OR revision.profile_id <> assignment.profile_id
+          OR revision.agent_actor_id <> assignment.agent_actor_id
+          OR revision.status <> assignment.status
+          OR revision.participation <> assignment.participation
+          OR revision.paused <> assignment.paused
+          OR revision.capability_subset_json <> assignment.capability_subset_json
+          OR revision.tool_subset_json <> assignment.tool_subset_json
+          OR (assignment.status = 'removed'
+              AND (assignment.paused <> 1 OR assignment.removed_at IS NULL))
+          OR (assignment.status = 'current' AND assignment.removed_at IS NOT NULL)
+          OR EXISTS (
+            SELECT value FROM json_each(assignment.capability_subset_json)
+            EXCEPT SELECT value FROM json_each(profile.capability_ceiling_json)
+          )
+          OR EXISTS (
+            SELECT value FROM json_each(assignment.tool_subset_json)
+            EXCEPT SELECT value FROM json_each(profile.tool_ceiling_json)
+          )
+       LIMIT 1`,
+      "Room Assignments must retain a closed current revision within their Profile ceiling",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM room_memberships AS membership
+       WHERE membership.kind = 'agent' AND membership.participation = 'silent'
+       LIMIT 1`,
+      "legacy silent membership must be migrated out of the production projection",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM tenant_administrator_registry AS registry
+       WHERE (SELECT COUNT(*) FROM tenant_administrators WHERE status = 'active') < 1
+       UNION ALL
+       SELECT 1 FROM tenant_administrators AS administrator
+       JOIN actors AS actor ON actor.id = administrator.human_actor_id
+       LEFT JOIN tenant_administrator_registry AS registry ON registry.singleton_id = 1
+       WHERE actor.kind <> 'human' OR registry.singleton_id IS NULL
+       LIMIT 1`,
+      "configured Tenant Administrator authority must retain one active Human principal",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM deployment_audit AS audit
+       LEFT JOIN actors AS principal ON principal.id = audit.principal_human_actor_id
+       WHERE (audit.event_kind = 'administrator.bootstrap'
+              AND audit.principal_human_actor_id IS NOT NULL)
+          OR (audit.event_kind <> 'administrator.bootstrap' AND principal.kind <> 'human')
+          OR EXISTS (
+            SELECT 1 FROM json_tree(audit.details_json)
+            WHERE lower(COALESCE(key, '')) IN (
+              'secret', 'secretvalue', 'credential', 'apikey', 'authorization', 'token'
+            )
+          )
+       LIMIT 1`,
+      "deployment audit must remain Human-authored and secret-free",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM deployment_stream AS stream
+       WHERE stream.singleton_id <> 1 OR stream.head_seq < 0
+          OR stream.retained_from_seq < 1
+          OR stream.retained_from_seq > stream.head_seq + 1
+       UNION ALL
+       SELECT 1 FROM deployment_agent_profile_events AS event
+       LEFT JOIN agent_profiles AS profile ON profile.id = event.profile_id
+       WHERE profile.id IS NULL OR profile.actor_id <> event.actor_id
+          OR event.profile_revision > profile.revision
+          OR event.stream_seq > (
+            SELECT head_seq FROM deployment_stream WHERE singleton_id = 1
+          )
+       UNION ALL
+       SELECT 1 FROM deployment_agent_profile_repair_records AS repair
+       LEFT JOIN deployment_agent_profile_events AS event ON event.event_id = repair.event_id
+       LEFT JOIN agent_profiles AS profile ON profile.id = repair.profile_id
+       WHERE event.event_id IS NULL OR profile.id IS NULL
+          OR event.profile_id <> repair.profile_id
+          OR event.profile_revision <> repair.profile_revision
+          OR event.stream_seq <> repair.stream_seq
+          OR profile.revision <> repair.profile_revision
+       UNION ALL
+       SELECT 1 FROM deployment_profile_outbox AS outbox
+       LEFT JOIN deployment_agent_profile_events AS event ON event.event_id = outbox.event_id
+       LEFT JOIN tenant_administrators AS administrator
+         ON administrator.human_actor_id = outbox.recipient_human_actor_id
+       WHERE event.event_id IS NULL OR event.stream_seq <> outbox.stream_seq
+          OR administrator.human_actor_id IS NULL
+       LIMIT 1`,
+      "deployment Profile stream, outbox, and repair must retain exact authority bindings",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM route_candidate_snapshots AS snapshot
+       JOIN route_jobs AS job ON job.id = snapshot.route_job_id
+       WHERE job.candidate_snapshot_id <> snapshot.id
+          OR snapshot.candidate_count <> (
+         SELECT COUNT(*) FROM route_candidate_snapshot_agents AS candidate
+         WHERE candidate.snapshot_id = snapshot.id
+       ) OR EXISTS (
+         SELECT 1 FROM route_candidate_snapshot_agents AS candidate
+         WHERE candidate.snapshot_id = snapshot.id
+           AND (candidate.participation <> 'active' OR candidate.availability <> 'ready')
+       )
+       LIMIT 1`,
+      "route candidate snapshots must contain only their exact ready active candidate set",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM routed_agent_invocation_intents AS intent
+       JOIN route_decisions AS decision ON decision.id = intent.route_decision_id
+       LEFT JOIN route_candidate_snapshot_agents AS candidate
+         ON candidate.snapshot_id = intent.snapshot_id
+        AND candidate.route_job_id = intent.route_job_id
+        AND candidate.agent_actor_id = intent.target_agent_actor_id
+       WHERE decision.route_job_id <> intent.route_job_id
+          OR decision.snapshot_id <> intent.snapshot_id
+          OR decision.outcome <> 'selected'
+          OR candidate.agent_actor_id IS NULL
+          OR candidate.profile_id <> intent.profile_id
+          OR candidate.profile_revision <> intent.profile_revision
+          OR candidate.assignment_id <> intent.assignment_id
+          OR candidate.assignment_revision <> intent.assignment_revision
+          OR candidate.access_revision <> intent.access_revision
+       LIMIT 1`,
+      "routed invocation intents must retain exact route decision provenance",
     );
   }
 }

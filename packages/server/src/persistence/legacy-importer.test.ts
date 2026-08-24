@@ -310,6 +310,40 @@ describe("LegacyStateImporter", () => {
       expect(database.prepare("SELECT DISTINCT catalog_revision FROM actors").all())
         .toEqual([{ catalog_revision: 0 }]);
       expect(
+        database.prepare(
+          `SELECT profile.id, profile.actor_id AS actorId,
+                  profile.revision, profile.status,
+                  profile.capability_ceiling_json AS capabilityCeilingJson,
+                  profile.tool_ceiling_json AS toolCeilingJson,
+                  profile.display_name AS displayName,
+                  profile.global_responsibility AS globalResponsibility,
+                  profile.source_kind AS sourceKind,
+                  revision.operation,
+                  provenance.source_kind AS provenanceSourceKind,
+                  provenance.review_required AS reviewRequired
+           FROM agent_profiles AS profile
+           JOIN agent_profile_revisions AS revision
+             ON revision.profile_id = profile.id
+            AND revision.revision = profile.revision
+           JOIN agent_authority_migration_provenance AS provenance
+             ON provenance.profile_id = profile.id
+            AND provenance.source_kind = 'legacy_actor_profile'`,
+        ).all(),
+      ).toEqual([{
+        id: "legacy-profile:agent-helper",
+        actorId: "agent-helper",
+        revision: 1,
+        status: "disabled",
+        capabilityCeilingJson: "[]",
+        toolCeilingJson: "[]",
+        displayName: "Helper",
+        globalResponsibility: "Review migrated Agent configuration before use.",
+        sourceKind: "legacy_v20_migration",
+        operation: "legacy_migration",
+        provenanceSourceKind: "legacy_actor_profile",
+        reviewRequired: 1,
+      }]);
+      expect(
         database.prepare("SELECT DISTINCT access_revision FROM room_memberships").all(),
       ).toEqual([{ access_revision: 0 }]);
       expect(
@@ -672,7 +706,7 @@ describe("LegacyStateImporter", () => {
     const creator = track(
       await createWorkerDatabaseClient({ databasePath: stagingPath }),
     );
-    await expect(creator.inspectSchema()).resolves.toEqual({ version: 19 });
+    await expect(creator.inspectSchema()).resolves.toEqual({ version: 20 });
     await creator.close();
     writeFileSync(
       recoveryPath,
@@ -772,7 +806,7 @@ describe("LegacyStateImporter", () => {
     expect(lstatSync(databasePath, { bigint: true }).nlink).toBe(1n);
 
     const restarted = track(await createWorkerDatabaseClient({ databasePath }));
-    await expect(restarted.inspectSchema()).resolves.toEqual({ version: 19 });
+    await expect(restarted.inspectSchema()).resolves.toEqual({ version: 20 });
     await expect(restarted.inspectLegacyImport()).resolves.toMatchObject({
       markerVersion: 1,
       actors: 3,
@@ -854,7 +888,7 @@ describe("LegacyStateImporter", () => {
     rmSync(unrelatedHardlinkPath);
 
     const restarted = track(await createWorkerDatabaseClient({ databasePath }));
-    await expect(restarted.inspectSchema()).resolves.toEqual({ version: 19 });
+    await expect(restarted.inspectSchema()).resolves.toEqual({ version: 20 });
     await expect(restarted.inspectLegacyImport()).resolves.toMatchObject({
       markerVersion: 1,
       actors: 3,
@@ -870,7 +904,7 @@ describe("LegacyStateImporter", () => {
     const directory = fixtureDirectory();
     const databasePath = join(directory, "authority.sqlite");
     const creator = track(await createWorkerDatabaseClient({ databasePath }));
-    await expect(creator.inspectSchema()).resolves.toEqual({ version: 19 });
+    await expect(creator.inspectSchema()).resolves.toEqual({ version: 20 });
     await creator.close();
     const before = readFileSync(databasePath);
     const nonce = "00000000-0000-4000-8000-000000000040";
@@ -904,7 +938,7 @@ describe("LegacyStateImporter", () => {
     const databasePath = join(directory, "authority.sqlite");
     const fixture = writeLegacyFixture(directory);
     const creator = track(await createWorkerDatabaseClient({ databasePath }));
-    await expect(creator.inspectSchema()).resolves.toEqual({ version: 19 });
+    await expect(creator.inspectSchema()).resolves.toEqual({ version: 20 });
     await creator.close();
     const before = readFileSync(databasePath);
 

@@ -62,6 +62,12 @@ import type {
   StreamingRepairLease,
   SnapshotRevalidationRequest,
 } from "./contracts.js";
+import type { DeploymentProviderDisclosure } from
+  "../tenant-administration/authority-service.js";
+import type {
+  TenantAdministrationOperation,
+  TenantAdministrationResult,
+} from "../tenant-administration/authority-protocol.js";
 import {
   toAgentMessageWorkerContext,
   type InternalAgentMessageCommitContext,
@@ -92,10 +98,11 @@ export interface CreateWorkerDatabaseClientOptions {
     readonly ballPolicy: BallDeadlinePolicy;
     readonly maxOfflineReadLeaseMs: number;
   };
+  readonly deploymentProviderDisclosure?: DeploymentProviderDisclosure;
 }
 
 export interface AuthoritySchemaInspection {
-  readonly version: 19;
+  readonly version: 20;
 }
 
 export interface WorkerDatabaseClient {
@@ -272,6 +279,9 @@ export interface WorkerDatabaseClient {
   executeRoute(operation: RouteAuthorityOperation): Promise<unknown>;
   executeBall(operation: BallAuthorityOperation): Promise<unknown>;
   executeMemory(operation: MemoryAuthorityOperation): Promise<unknown>;
+  executeTenantAdministration(
+    operation: TenantAdministrationOperation,
+  ): Promise<TenantAdministrationResult>;
   close(): Promise<void>;
 }
 
@@ -347,6 +357,7 @@ function authorityWorkerClientErrorStatus(
     case "unauthenticated":
       return 401;
     case "agent_missing_permission":
+    case "administrator_required":
     case "confirmation_forbidden":
     case "permission_denied":
     case "identity_forbidden":
@@ -358,6 +369,8 @@ function authorityWorkerClientErrorStatus(
     case "context_forbidden":
       return 403;
     case "invitation_not_found":
+    case "administrator_not_found":
+    case "profile_not_found":
     case "member_not_found":
     case "message_not_found":
     case "light_task_not_found":
@@ -372,6 +385,8 @@ function authorityWorkerClientErrorStatus(
     case "session_not_found":
       return 404;
     case "actor_conflict":
+    case "administrator_already_exists":
+    case "bootstrap_conflict":
     case "authority_already_initialized":
     case "authority_coordinator_exists":
     case "execution_conflict":
@@ -380,6 +395,9 @@ function authorityWorkerClientErrorStatus(
     case "session_limit_reached":
     case "execution_not_running":
     case "idempotency_conflict":
+    case "last_administrator_required":
+    case "profile_state_conflict":
+    case "revision_conflict":
     case "attachment_already_bound":
     case "generation_conflict":
     case "attachment_not_ready":
@@ -437,6 +455,7 @@ function authorityWorkerClientErrorStatus(
     case "extractor_unavailable":
     case "ocr_unavailable":
     case "authority_not_initialized":
+    case "administrator_configuration_unavailable":
     case "authority_worker_closed":
     case "authority_worker_error":
     case "authority_worker_exited":
@@ -452,6 +471,8 @@ function authorityWorkerClientErrorStatus(
     case "memory_dependency_unavailable":
     case "repair_barrier_active":
     case "dependency_unavailable":
+    case "configuration_unsupported":
+    case "provider_configuration_unavailable":
     case "context_storage_unavailable":
       return 503;
     default: {
@@ -827,6 +848,8 @@ function createAuthorityWorker(
       databasePath: options.databasePath,
       ...(options.sharedAuthorityRecovery === undefined
         ? {} : { sharedAuthorityRecovery: options.sharedAuthorityRecovery }),
+      ...(options.deploymentProviderDisclosure === undefined
+        ? {} : { deploymentProviderDisclosure: options.deploymentProviderDisclosure }),
       ...(recovery === undefined ? {} : { recovery }),
       ...(rollbackFailureForTest ? { rollbackFailureForTest: true } : {}),
       ...(transactionFaultPoint === undefined ? {} : { transactionFaultPoint }),
@@ -1387,6 +1410,21 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
     return this.#send({ type: "authority.runtime", operation }).then((response) => {
       if (response.type !== "authority.runtime-result") {
         this.#failProtocol("Authority worker returned the wrong runtime response");
+        throw this.#terminalError;
+      }
+      return response.result;
+    });
+  }
+
+  executeTenantAdministration(
+    operation: TenantAdministrationOperation,
+  ): Promise<TenantAdministrationResult> {
+    if (this.#terminalError !== undefined) return this.#rejectTerminal();
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) return Promise.reject(unavailable);
+    return this.#send({ type: "authority.tenant-administration", operation }).then((response) => {
+      if (response.type !== "authority.tenant-administration-result") {
+        this.#failProtocol("Authority worker returned the wrong tenant administration response");
         throw this.#terminalError;
       }
       return response.result;
@@ -1975,6 +2013,8 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
         responseType === "authority.command-acknowledged") ||
       (requestType === "authority.attachment" &&
         responseType === "authority.attachment-result") ||
+      (requestType === "authority.tenant-administration" &&
+        responseType === "authority.tenant-administration-result") ||
       (requestType === "authority.message-submit" &&
         responseType === "authority.message-submitted") ||
       (requestType === "authority.message-revise" &&
