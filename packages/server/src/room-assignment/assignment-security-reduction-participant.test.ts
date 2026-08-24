@@ -4,6 +4,10 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  seedCanonicalAgentProfileFixture,
+  seedCanonicalRoomAssignmentFixture,
+} from "../fixtures/agent-authority-fixture.js";
+import {
   mintDatabaseAuthorityTransactionView,
   releaseDatabaseAuthorityTransactionView,
 } from "../persistence/authority-transaction-database.js";
@@ -54,20 +58,24 @@ function openDatabase(path?: string): DatabaseSync {
     UPDATE rooms
     SET owner_actor_id = 'human-owner', governance_revision = 1
     WHERE id = 'room-1';
-    INSERT INTO agent_profiles (
-      id, actor_id, revision, status, capability_ceiling_json, tool_ceiling_json
-    ) VALUES (
-      'profile-1', 'agent-1', 4, 'enabled', '["project.read","route.participate"]',
-      '["repository.git-status","sandbox-file.write"]'
-    );
-    INSERT INTO room_agent_assignments (
-      id, room_id, profile_id, agent_actor_id, revision, status, participation,
-      capability_subset_json, tool_subset_json, paused
-    ) VALUES (
-      'assignment-1', 'room-1', 'profile-1', 'agent-1', 7, 'current', 'active',
-      '["project.read"]', '["repository.git-status"]', 0
-    );
   `);
+  seedCanonicalAgentProfileFixture(database, {
+    actorId: "agent-1",
+    profileId: "profile-1",
+    revision: 4,
+    displayName: "Agent One",
+    capabilityCeiling: ["room.project.read"],
+    toolCeiling: ["repository.git-status", "sandbox-file.write"],
+  });
+  seedCanonicalRoomAssignmentFixture(database, {
+    assignmentId: "assignment-1",
+    roomId: "room-1",
+    profileId: "profile-1",
+    actorId: "agent-1",
+    revision: 7,
+    capabilitySubset: ["room.project.read"],
+    toolSubset: ["repository.git-status"],
+  });
   return database;
 }
 
@@ -247,7 +255,9 @@ describe("AssignmentSecurityReductionParticipant production provider", () => {
       database.exec("DROP TRIGGER room_agent_assignments_authority_update_v14");
       database.prepare(
         `UPDATE room_agent_assignments
-         SET capability_subset_json = '["project.read","admin.escalate"]'
+         SET capability_subset_json = '["room.project.read","room.respond"]',
+             revision = revision + 1,
+             updated_at = '${now}'
          WHERE id = 'assignment-1'`,
       ).run();
       const corrupt = withTransaction(database, (transaction) =>
