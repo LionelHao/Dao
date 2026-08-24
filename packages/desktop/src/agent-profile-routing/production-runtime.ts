@@ -64,7 +64,7 @@ export function createDesktopAgentSettingsRuntime(options: {
   createRequestIdentity: () => Readonly<{ requestId: string; idempotencyKey: string }>;
   timeoutMs?: number;
   syncIntervalMs?: number;
-}): AgentSettingsBridge & { close(): void } {
+}): AgentSettingsBridge & { close(): void; invalidateAuthorizedState(): void } {
   const listeners = new Set<(message: AgentSettingsAuthorityMessage) => void>();
   const pending = new Map<string, PendingRequest>();
   const acknowledgedRequestsByEventId = new Map<string, string>();
@@ -102,6 +102,28 @@ export function createDesktopAgentSettingsRuntime(options: {
     const asOf = new Date().toISOString();
     publish({ type: "offline", asOf,
       leaseExpiresAt: new Date(Date.parse(asOf) + 30_000).toISOString() });
+  };
+
+  const purgeAuthority = (scope: "room" | "session"): void => {
+    const candidate = socket;
+    socket = undefined;
+    connection = undefined;
+    authenticated = false;
+    subscribedRoomId = undefined;
+    subscription = undefined;
+    settleSubscription?.(new Error(scope === "session" ? "session_revoked" : "room_forbidden"));
+    settleSubscription = undefined;
+    subscriptionRequestId = undefined;
+    rejectPending(new Error(scope === "session" ? "session_revoked" : "room_forbidden"));
+    currentRoomId = undefined;
+    roomCursor = 0;
+    lastSnapshot = undefined;
+    acknowledgedRequestsByEventId.clear();
+    observedEvents.clear();
+    for (const waiters of eventWaiters.values()) for (const resolve of waiters) resolve();
+    eventWaiters.clear();
+    try { candidate?.close(); } catch { /* authority purge is already complete */ }
+    publish({ type: "access-revoked", scope, purgeCompleted: true });
   };
 
   const stableEvent = (
@@ -170,6 +192,36 @@ export function createDesktopAgentSettingsRuntime(options: {
         roomRevision: payload.roomRevision, assignmentId: payload.assignmentId,
         actorId: payload.actorId, assignmentRevision: payload.assignmentRevision };
     } else return;
+    if (lastSnapshot?.room.status === "available" &&
+        event.kind === "assignment.upserted") {
+      const current = lastSnapshot.room.assignments.find((assignment) =>
+        assignment.assignmentId === event.assignment.assignmentId);
+      if (current !== undefined &&
+          (event.assignment.assignmentRevision < current.assignmentRevision ||
+           (event.assignment.assignmentRevision === current.assignmentRevision &&
+            event.assignment.accessRevision < current.accessRevision))) {
+        acceptStableEvent(stableEvent(frame.event.eventId, frame.event.streamSeq, event));
+        return;
+      }
+      const assignments = lastSnapshot.room.assignments
+        .filter((assignment) => assignment.assignmentId !== event.assignment.assignmentId);
+      lastSnapshot = { ...lastSnapshot, room: { ...lastSnapshot.room,
+        roomRevision: Math.max(lastSnapshot.room.roomRevision, event.roomRevision),
+        assignments: [...assignments, event.assignment]
+          .sort((left, right) => left.assignmentId.localeCompare(right.assignmentId)) } };
+    } else if (lastSnapshot?.room.status === "available" &&
+        event.kind === "assignment.removed") {
+      const current = lastSnapshot.room.assignments.find((assignment) =>
+        assignment.assignmentId === event.assignmentId);
+      if (current === undefined || event.assignmentRevision <= current.assignmentRevision) {
+        acceptStableEvent(stableEvent(frame.event.eventId, frame.event.streamSeq, event));
+        return;
+      }
+      lastSnapshot = { ...lastSnapshot, room: { ...lastSnapshot.room,
+        roomRevision: Math.max(lastSnapshot.room.roomRevision, event.roomRevision),
+        assignments: lastSnapshot.room.assignments
+          .filter((assignment) => assignment.assignmentId !== event.assignmentId) } };
+    }
     acceptStableEvent(stableEvent(frame.event.eventId, frame.event.streamSeq, event));
   };
 
@@ -215,6 +267,16 @@ export function createDesktopAgentSettingsRuntime(options: {
         let value: unknown;
         try { value = JSON.parse(raw); } catch { return; }
         if (!record(value)) return;
+        if (value.type === "auth.session-revoked") {
+          purgeAuthority("session");
+          return;
+        }
+        if (value.type === "identity.room-access.changed" &&
+            value.actorId === options.session()?.actorId && value.roomId === currentRoomId &&
+            value.change === "removed") {
+          purgeAuthority("room");
+          return;
+        }
         if (value.type === "auth.authenticated" && value.requestId === authRequestId) {
           if (settled) return;
           settled = true;
@@ -373,7 +435,11 @@ export function createDesktopAgentSettingsRuntime(options: {
     lastSnapshot = structuredClone(value);
     await subscribeRoom(roomId);
     if (syncTimer === undefined) {
-      syncTimer = setInterval(() => void synchronize().catch(() => undefined),
+      syncTimer = setInterval(() => void synchronize().catch((error: unknown) => {
+        const status = (error as { status?: unknown }).status;
+        if (status === 401) purgeAuthority("session");
+        else if (status === 403 && lastSnapshot !== undefined) purgeAuthority("room");
+      }),
         options.syncIntervalMs ?? 1_000);
     }
     return structuredClone(value);
@@ -544,6 +610,9 @@ export function createDesktopAgentSettingsRuntime(options: {
     onAuthorityMessage(listener: Parameters<AgentSettingsBridge["onAuthorityMessage"]>[0]) {
       listeners.add(listener);
       return () => listeners.delete(listener);
+    },
+    invalidateAuthorizedState() {
+      purgeAuthority("session");
     },
     close() {
       closed = true;

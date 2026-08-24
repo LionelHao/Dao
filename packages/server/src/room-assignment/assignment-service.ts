@@ -218,6 +218,7 @@ function projection(
   }>,
   accessRevision: number,
   availability: "ready" | "busy" | "paused" | "noauth",
+  effectiveTools: readonly string[],
 ): AssignmentChangedProjection {
   return Object.freeze({
     recordVersion: "room-agent-assignment.v1" as const,
@@ -236,7 +237,7 @@ function projection(
     effectiveCapabilities: assignment.capabilitySubset,
     toolCeiling: profile.toolCeiling,
     toolSubset: assignment.toolSubset,
-    effectiveTools: assignment.toolSubset,
+    effectiveTools,
     profileRevision: profile.revision,
     assignmentRevision: assignment.revision,
     accessRevision,
@@ -292,7 +293,13 @@ function completeCommand(
     ? Object.freeze({
         change: "upserted" as const,
         roomRevision,
-        assignment: projection(assignment, profile, accessRevision, availability.availability),
+        assignment: projection(
+          assignment,
+          profile,
+          accessRevision,
+          availability.availability,
+          assignment.toolSubset.filter((tool) => runtime.membershipTools.includes(tool)),
+        ),
       })
     : Object.freeze({
         change: "removed" as const,

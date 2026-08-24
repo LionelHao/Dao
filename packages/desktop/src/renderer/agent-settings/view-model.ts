@@ -165,9 +165,9 @@ export function beginAgentSettingsMutation(
 }
 
 function patchSnapshot(snapshot: AgentSettingsSnapshot, message: Extract<AgentSettingsAuthorityMessage, { type: "stable-event" }>): AgentSettingsSnapshot {
-  if (message.cursor <= snapshot.cursor) return snapshot;
   const event = message.event;
   if (event.kind === "profile.upserted" && snapshot.profileCatalog.status === "available") {
+    if (message.cursor <= snapshot.cursor) return snapshot;
     const profiles = snapshot.profileCatalog.profiles.filter((profile) => profile.profileId !== event.profile.profileId);
     return Object.freeze({
       ...snapshot,
@@ -181,25 +181,32 @@ function patchSnapshot(snapshot: AgentSettingsSnapshot, message: Extract<AgentSe
   }
   if (event.kind === "assignment.upserted" && snapshot.room.status === "available" &&
       event.assignment.roomId === snapshot.room.roomId) {
+    const current = snapshot.room.assignments.find((assignment) =>
+      assignment.assignmentId === event.assignment.assignmentId);
+    if (current !== undefined &&
+        (event.assignment.assignmentRevision < current.assignmentRevision ||
+         (event.assignment.assignmentRevision === current.assignmentRevision &&
+          event.assignment.accessRevision < current.accessRevision))) return snapshot;
     const assignments = snapshot.room.assignments.filter((assignment) => assignment.assignmentId !== event.assignment.assignmentId);
     return Object.freeze({
       ...snapshot,
-      cursor: message.cursor,
       room: Object.freeze({
         ...snapshot.room,
-        roomRevision: event.roomRevision,
+        roomRevision: Math.max(snapshot.room.roomRevision, event.roomRevision),
         assignments: Object.freeze([...assignments, event.assignment].sort((left, right) => left.assignmentId.localeCompare(right.assignmentId))),
       }),
     });
   }
   if (event.kind === "assignment.removed" && snapshot.room.status === "available" &&
       event.roomId === snapshot.room.roomId) {
+    const current = snapshot.room.assignments.find((assignment) =>
+      assignment.assignmentId === event.assignmentId);
+    if (current === undefined || event.assignmentRevision <= current.assignmentRevision) return snapshot;
     return Object.freeze({
       ...snapshot,
-      cursor: message.cursor,
       room: Object.freeze({
         ...snapshot.room,
-        roomRevision: event.roomRevision,
+        roomRevision: Math.max(snapshot.room.roomRevision, event.roomRevision),
         assignments: Object.freeze(snapshot.room.assignments.filter((assignment) => assignment.assignmentId !== event.assignmentId)),
       }),
     });

@@ -43,6 +43,10 @@ import { createDesktopGovernanceRuntime } from "../../desktop/src/governance/pro
 import { createDesktopAgentSettingsRuntime } from
   "../../desktop/src/agent-profile-routing/production-runtime.js";
 import {
+  applyAgentSettingsAuthorityMessage,
+  createAgentSettingsInitialState,
+} from "../../desktop/src/renderer/agent-settings/view-model.js";
+import {
   createDesktopMessageAuthorityRuntime,
   type DesktopMessageAuthorityRuntime,
 } from "../../desktop/src/message-authority/production-runtime.js";
@@ -1481,8 +1485,15 @@ describe("authoritative server real-process harness", () => {
         syncIntervalMs: 20,
       });
       const observed: unknown[] = [];
-      runtime.onAuthorityMessage((message) => observed.push(message));
+      let rendererState = createAgentSettingsInitialState();
+      runtime.onAuthorityMessage((message) => {
+        observed.push(message);
+        rendererState = applyAgentSettingsAuthorityMessage(rendererState, message);
+      });
       const initial = await runtime.getSnapshot({ roomId });
+      rendererState = applyAgentSettingsAuthorityMessage(rendererState, {
+        type: "snapshot", snapshot: initial,
+      });
       expect(initial).toMatchObject({
         viewer: { actorId: "human-a", tenantAdministrator: true, roomRole: "owner" },
         profileCatalog: { status: "available", profiles: [
@@ -1528,6 +1539,9 @@ describe("authoritative server real-process harness", () => {
         replayed: false, acceptedRevision: 1, eventIds: [expect.any(String)],
       });
       const converged = await runtime.getSnapshot({ roomId });
+      rendererState = applyAgentSettingsAuthorityMessage(rendererState, {
+        type: "snapshot", snapshot: converged,
+      });
       expect(converged.room).toMatchObject({
         status: "available",
         assignments: [{
@@ -1598,6 +1612,11 @@ describe("authoritative server real-process harness", () => {
           event: expect.objectContaining({ kind: "assignment.upserted",
             assignment: expect.objectContaining({ paused: true, availability: "paused" }) }),
         })]));
+        expect(rendererState.snapshot?.room.status).toBe("available");
+        expect(rendererState.snapshot?.room.status === "available"
+          ? rendererState.snapshot.room.assignments[0] : undefined).toMatchObject({
+          paused: true, availability: "paused",
+        });
       }, { timeout: 2_000, interval: 20 });
       const publicEvidence = JSON.stringify({ initial, converged, observed });
       expect(publicEvidence).not.toContain(passwordCanary);

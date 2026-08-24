@@ -52,6 +52,7 @@ export interface AssignmentRuntimeAuthorityRow {
   readonly roomActive: boolean;
   readonly accessRevision: number;
   readonly accessValid: boolean;
+  readonly membershipTools: readonly string[];
   readonly runningExecutionCount: number;
 }
 
@@ -539,6 +540,7 @@ function createRepository(database: DatabaseSync): RoomAssignmentRepository {
       const row = database.prepare(
         `SELECT profile.revision AS profileRevision, profile.status AS profileStatus,
                 room.status AS roomStatus, membership.access_revision AS accessRevision,
+                membership.tool_permissions_json AS membershipToolsJson,
                 CASE WHEN membership.kind = 'agent' THEN 1 ELSE 0 END AS accessValid,
                 (SELECT COUNT(*) FROM agent_executions AS execution
                  WHERE execution.room_id = assignment.room_id
@@ -559,6 +561,8 @@ function createRepository(database: DatabaseSync): RoomAssignmentRepository {
           (row.roomStatus !== "active" && row.roomStatus !== "archived") ||
           (row.accessValid !== 0 && row.accessValid !== 1) ||
           (row.accessValid === 1 ? !nonnegative(row.accessRevision) : row.accessRevision !== null) ||
+          (row.accessValid === 1 ? typeof row.membershipToolsJson !== "string"
+            : row.membershipToolsJson !== null) ||
           !nonnegative(row.runningExecutionCount)) {
         throw new Error("Room Assignment runtime authority is corrupt");
       }
@@ -569,6 +573,8 @@ function createRepository(database: DatabaseSync): RoomAssignmentRepository {
         roomActive: row.roomStatus === "active",
         accessRevision: row.accessValid === 1 ? row.accessRevision as number : 0,
         accessValid: row.accessValid === 1,
+        membershipTools: row.accessValid === 1
+          ? canonicalSet(row.membershipToolsJson, tools) : Object.freeze([]),
         runningExecutionCount: row.runningExecutionCount,
       });
     },

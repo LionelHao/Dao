@@ -54,6 +54,7 @@ interface AssignmentFanoutTarget {
   readonly roomResponsibility: string;
   readonly capabilitySubset: readonly string[];
   readonly toolSubset: readonly string[];
+  readonly membershipTools: readonly string[];
   readonly createdAt: string;
   readonly roomStatus: "active" | "archived";
   readonly roomRevision: number;
@@ -215,7 +216,7 @@ function roomAssignmentProjection(
     effectiveCapabilities: target.capabilitySubset,
     toolCeiling: profile.toolCeiling,
     toolSubset: target.toolSubset,
-    effectiveTools: target.toolSubset,
+    effectiveTools: intersect(target.toolSubset, target.membershipTools),
     profileRevision: profile.revision,
     assignmentRevision: target.revision,
     accessRevision: target.accessRevision ?? 0,
@@ -583,6 +584,7 @@ export function createSqliteTenantAdministrationRepository(
                         room.governance_revision AS roomRevision,
                         membership.kind AS membershipKind,
                         membership.access_revision AS accessRevision,
+                        membership.tool_permissions_json AS membershipToolsJson,
                         (SELECT COUNT(*) FROM agent_executions AS execution
                          WHERE execution.room_id = assignment.room_id
                            AND execution.agent_id = assignment.agent_actor_id
@@ -611,6 +613,8 @@ export function createSqliteTenantAdministrationRepository(
                     !nonNegativeInteger(row.roomRevision) ||
                     (row.membershipKind !== null && row.membershipKind !== "agent") ||
                     (row.accessRevision !== null && !nonNegativeInteger(row.accessRevision)) ||
+                    (row.membershipKind === "agent" ? typeof row.membershipToolsJson !== "string"
+                      : row.membershipToolsJson !== null) ||
                     !nonNegativeInteger(row.runningExecutionCount)) {
                   throw new Error("Profile Assignment fan-out authority is corrupt");
                 }
@@ -659,6 +663,8 @@ export function createSqliteTenantAdministrationRepository(
                   roomResponsibility: row.roomResponsibility,
                   capabilitySubset,
                   toolSubset,
+                  membershipTools: row.membershipKind === "agent"
+                    ? parseCanonicalSet(row.membershipToolsJson) : Object.freeze([]),
                   createdAt: row.createdAt,
                   roomStatus: row.roomStatus,
                   roomRevision: row.roomRevision,

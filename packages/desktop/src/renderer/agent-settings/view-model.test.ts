@@ -109,6 +109,22 @@ describe("FT-07 Agent Settings authority state", () => {
     expect(correlatedReplay.appliedEventIds).toEqual(["event-race"]);
   });
 
+  it("orders Room Assignment events by Room revision instead of the deployment cursor", () => {
+    const ready = applyAgentSettingsAuthorityMessage(createAgentSettingsInitialState(), {
+      type: "snapshot", snapshot: snapshot({ cursor: 50 }),
+    });
+    const converged = applyAgentSettingsAuthorityMessage(ready, {
+      type: "stable-event", eventId: "room-event-6", cursor: 6,
+      event: { kind: "assignment.upserted", roomRevision: 13,
+        assignment: assignment({ availability: "paused", paused: true, assignmentRevision: 9 }) },
+    });
+    expect(converged.snapshot?.cursor).toBe(50);
+    expect(converged.snapshot?.room.roomRevision).toBe(13);
+    expect(converged.snapshot?.room.assignments[0]).toMatchObject({
+      paused: true, availability: "paused",
+    });
+  });
+
   it("retains the last complete projection through offline/repair failure and flips repair atomically", () => {
     const ready = applyAgentSettingsAuthorityMessage(createAgentSettingsInitialState(), {
       type: "snapshot", snapshot: snapshot(),

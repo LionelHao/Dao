@@ -472,6 +472,10 @@ describe("SQLite Tenant Administrator and Global Profile repository", () => {
     const f = fixture({ profileAssignmentFanoutLimit: 2, credentialReadiness: "noauth" });
     const created = await createProfile(f);
     seedAssignments(f.database, created.profile, 2);
+    f.database.prepare(
+      `UPDATE room_memberships SET tool_permissions_json = '["room-memory.read"]'
+       WHERE room_id = 'room-1' AND actor_id = ?`,
+    ).run(created.profile.actorId);
     const renameCommand = {
       profileId: created.profile.profileId,
       expectedRevision: 1,
@@ -512,6 +516,8 @@ describe("SQLite Tenant Administrator and Global Profile repository", () => {
       expect(roomChanges[0]).toMatchObject({ assignment: {
         actorId: created.profile.actorId, displayName: "Renamed Researcher",
         availability: "noauth", profileRevision: 2, assignmentRevision: 2,
+        effectiveTools: roomId === "room-1"
+          ? ["room-memory.read"] : ["repository.git-status", "room-memory.read"],
       } });
       expect(roomChanges[1]).toMatchObject({
         actorId: created.profile.actorId, assignmentRevision: 3,

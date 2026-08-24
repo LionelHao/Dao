@@ -118,6 +118,7 @@ async function createWindow(): Promise<void> {
       authorizedState: {
         invalidate: () => {
           governance?.invalidateAuthorizedState();
+          agentSettings?.invalidateAuthorizedState();
           messageAuthorityRuntime?.invalidateAuthorizedState();
           memoryAuthorityRuntime?.invalidateAuthorizedState();
           attachmentRuntimeHost.invalidateIdentity();
