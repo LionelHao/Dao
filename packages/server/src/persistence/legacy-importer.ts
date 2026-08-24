@@ -315,6 +315,78 @@ function insertActor(database: DatabaseSync, actor: Actor): void {
     );
 }
 
+function insertCanonicalLegacyAgentProfile(
+  database: DatabaseSync,
+  actor: Extract<Actor, { readonly kind: "agent" }>,
+): void {
+  database
+    .prepare(
+      `INSERT INTO agent_profiles (
+         id, actor_id, revision, status, capability_ceiling_json, tool_ceiling_json,
+         display_name, global_responsibility, created_at, updated_at, source_kind
+       )
+       SELECT 'legacy-profile:' || imported_actor.id, imported_actor.id, 1,
+         CASE WHEN EXISTS (
+           SELECT 1 FROM json_each(imported_actor.tool_permissions_json)
+           WHERE value NOT IN (
+             'http-json.read', 'repository.git-status', 'room-memory.read',
+             'sandbox-file.write'
+           )
+         ) THEN 'disabled' ELSE 'enabled' END,
+         '[]', COALESCE((
+           SELECT json_group_array(value) FROM (
+             SELECT DISTINCT value
+             FROM json_each(imported_actor.tool_permissions_json)
+             WHERE value IN (
+               'http-json.read', 'repository.git-status', 'room-memory.read',
+               'sandbox-file.write'
+             )
+             ORDER BY value
+           )
+         ), '[]'), imported_actor.display_name,
+         'Review migrated Agent configuration before use.',
+         strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+         strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'legacy_v20_migration'
+       FROM actors AS imported_actor
+       WHERE imported_actor.id = ? AND imported_actor.kind = 'agent'`,
+    )
+    .run(actor.id);
+  database
+    .prepare(
+      `INSERT INTO agent_profile_revisions (
+         profile_id, revision, actor_id, display_name, global_responsibility,
+         status, capability_ceiling_json, tool_ceiling_json,
+         changed_by_human_actor_id, changed_at, operation
+       )
+       SELECT id, revision, actor_id, display_name, global_responsibility,
+         status, capability_ceiling_json, tool_ceiling_json, NULL, updated_at,
+         'legacy_migration'
+       FROM agent_profiles WHERE actor_id = ?`,
+    )
+    .run(actor.id);
+  database
+    .prepare(
+      `INSERT INTO agent_authority_migration_provenance (
+         source_kind, source_object_id, actor_id, profile_id, room_id,
+         assignment_id, source_schema_version, source_participation,
+         source_authority_json, review_required, migrated_at
+       )
+       SELECT 'legacy_actor_profile', imported_actor.id, imported_actor.id,
+         profile.id, NULL, NULL, 19, NULL,
+         json_object(
+           'displayName', imported_actor.display_name,
+           'toolPermissions', json(imported_actor.tool_permissions_json),
+           'legacyReadiness', imported_actor.readiness
+         ),
+         CASE WHEN profile.status = 'disabled' THEN 1 ELSE 0 END,
+         profile.updated_at
+       FROM actors AS imported_actor
+       JOIN agent_profiles AS profile ON profile.actor_id = imported_actor.id
+       WHERE imported_actor.id = ? AND imported_actor.kind = 'agent'`,
+    )
+    .run(actor.id);
+}
+
 function importRows(
   database: DatabaseSync,
   state: ValidatedLegacyState,
@@ -325,6 +397,9 @@ function importRows(
   try {
     for (const actor of state.lifecycle.actors) {
       insertActor(database, actor);
+      if (actor.kind === "agent") {
+        insertCanonicalLegacyAgentProfile(database, actor);
+      }
     }
     const families = new Map<string, typeof state.sessions.sessions>();
     for (const session of state.sessions.sessions) {
