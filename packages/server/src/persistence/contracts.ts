@@ -1035,7 +1035,7 @@ function isGovernanceCommand(value: UnknownRecord): boolean {
   }
   if (value.type === "agent.configure") {
     return exact(payload, ["agentId", "participation", "toolPermissions"]) && text(payload.agentId) &&
-      (payload.participation === "active" || payload.participation === "on-mention" || payload.participation === "silent") &&
+      (payload.participation === "active" || payload.participation === "on-mention") &&
       stringList(payload.toolPermissions);
   }
   if (value.type === "human.role.change") {

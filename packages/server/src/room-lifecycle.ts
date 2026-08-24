@@ -109,7 +109,6 @@ const humanRoles = new Set(["owner", "admin", "member"]);
 const agentParticipations = new Set<AgentParticipation>([
   "active",
   "on-mention",
-  "silent",
 ]);
 
 export type HumanInvitationStatus = "pending" | "accepted" | "rejected";

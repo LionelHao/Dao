@@ -15,7 +15,7 @@ function input(overrides: Partial<RouteDecisionInput> = {}): RouteDecisionInput 
     roomPhase: "discussion",
     topicKey: "topic-1",
     agents: [
-      { agentId: "silent", participation: "silent", calibrationScore: 0, hasBall: false },
+      { agentId: "direct", participation: "on-mention", calibrationScore: 0, hasBall: false },
       { agentId: "mention", participation: "on-mention", calibrationScore: 0, hasBall: false },
       { agentId: "active", participation: "active", calibrationScore: 0, hasBall: false },
     ],
@@ -36,29 +36,28 @@ describe("single RouteJob deterministic decision layer", () => {
       { agentId: "mention", trigger: "structured_mention", order: 2, reasonCode: "structured_help", reasonText: "provider duplicate" },
     ] };
     const result = evaluateRoutePlan(input({
-      directMentionAgentIds: ["silent", "mention"],
+      directMentionAgentIds: ["direct", "mention"],
       structuredHelpAgentIds: ["mention"],
       providerPlan: plan,
     }));
     expect(result.intents.map((intent) => [intent.targetAgentId, intent.kind, intent.priority]))
       .toEqual([
-        ["silent", "direct_mention", 1],
+        ["direct", "direct_mention", 1],
         ["mention", "direct_mention", 1],
         ["active", "routed_candidate", 3],
       ]);
     expect(new Set(result.intents.map((intent) => intent.targetAgentId)).size).toBe(3);
   });
 
-  it("enforces silent, on-mention, and active participation exactly", () => {
+  it("excludes on-mention from proactive routing while preserving a trusted structured target", () => {
     const providerPlan: RouterPlan = { candidates: [
-      { agentId: "silent", trigger: "risk", order: 1, reasonCode: "risk_detected", reasonText: "risk" },
       { agentId: "mention", trigger: "domain", order: 2, reasonCode: "domain_match", reasonText: "domain" },
       { agentId: "active", trigger: "domain", order: 3, reasonCode: "domain_match", reasonText: "domain" },
     ] };
     const result = evaluateRoutePlan(input({ structuredHelpAgentIds: ["mention"], providerPlan }));
     expect(result.intents.map((intent) => intent.targetAgentId)).toEqual(["mention", "active"]);
-    expect(result.judgments.find((value) => value.agentId === "silent")).toMatchObject({
-      outcome: "suppressed", reasonCode: "participation_silent",
+    expect(result.judgments.find((value) => value.agentId === "direct")).toMatchObject({
+      outcome: "no_response_needed", reasonCode: "provider_omitted",
     });
   });
 
@@ -156,9 +155,9 @@ describe("single RouteJob deterministic decision layer", () => {
     expect(failed.judgments).toHaveLength(3);
     expect(failed.judgments.every((value) => value.reasonCode === "provider_failed")).toBe(true);
     const omitted = evaluateRoutePlan(input({
-      directMentionAgentIds: ["silent"], providerFailureCode: "provider_malformed",
+      directMentionAgentIds: ["direct"], providerFailureCode: "provider_malformed",
     }));
-    expect(omitted.judgments.find((value) => value.agentId === "silent")?.reasonCode).toBe("direct_mention");
+    expect(omitted.judgments.find((value) => value.agentId === "direct")?.reasonCode).toBe("direct_mention");
     expect(omitted.judgments.filter((value) => value.reasonCode === "provider_failed")).toHaveLength(2);
   });
 

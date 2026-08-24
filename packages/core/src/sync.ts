@@ -330,7 +330,7 @@ function isHumanMembershipValue(value: unknown): value is HumanRoomMembership {
 function isAgentMembershipValue(value: unknown): value is AgentRoomMembership {
   return isRecord(value) && exact(value, ["kind", "actorId", "participation", "toolPermissions", "configuredAt"]) &&
     value.kind === "agent" && text(value.actorId) &&
-    (value.participation === "active" || value.participation === "on-mention" || value.participation === "silent") &&
+    (value.participation === "active" || value.participation === "on-mention") &&
     stringList(value.toolPermissions) && text(value.configuredAt);
 }
 

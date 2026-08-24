@@ -9,7 +9,7 @@ import type {
 
 export interface RouteDecisionAgent {
   readonly agentId: string;
-  readonly participation: "active" | "on-mention" | "silent";
+  readonly participation: "active" | "on-mention";
   readonly calibrationScore: number;
   readonly hasBall: boolean;
 }
@@ -76,7 +76,7 @@ export function evaluateRoutePlan(input: RouteDecisionInput): RouteDecisionResul
   }
   for (const agentId of input.sourceAuthorKind === "agent" ? input.structuredHelpAgentIds : []) {
     const agent = agents.get(agentId);
-    if (agent === undefined || agent.participation === "silent") continue;
+    if (agent === undefined) continue;
     add(agentId, {
       kind: "structured_help", roomId: input.roomId, sourceMessageId: input.sourceMessageId,
       targetAgentId: agentId, reasonCode: "structured_help", reasonText: "structured agent help", priority: 2,
@@ -94,10 +94,6 @@ export function evaluateRoutePlan(input: RouteDecisionInput): RouteDecisionResul
     if (agent === undefined || selected.has(candidate.agentId)) continue;
     if (candidate.trigger === "structured_mention" && input.sourceAuthorKind !== "agent") {
       suppressed.set(agent.agentId, "not_selected");
-      continue;
-    }
-    if (agent.participation === "silent") {
-      suppressed.set(agent.agentId, "participation_silent");
       continue;
     }
     if (agent.participation === "on-mention") {

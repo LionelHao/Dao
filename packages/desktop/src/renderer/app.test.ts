@@ -1481,6 +1481,9 @@ describe("room join controls", () => {
     expect(options[1]?.textContent).toContain("未声明工具");
     expect(options[2]?.textContent).toContain("未声明工具");
     expect(participation?.disabled).toBe(true);
+    expect(Array.from(participation?.options ?? [], (option) => option.value)).toEqual([
+      "", "active", "on-mention",
+    ]);
     expect(submitButton?.disabled).toBe(true);
     expect(agentSelect?.getAttribute("aria-invalid")).toBe("false");
     expect(root.querySelector("[data-join-kind='agent-configuration'] [role='status']")?.textContent)
@@ -1490,7 +1493,7 @@ describe("room join controls", () => {
       agentSelect!.value = agentId;
       agentSelect!.dispatchEvent(new Event("change", { bubbles: true }));
       participation!.disabled = false;
-      participation!.value = "silent";
+      participation!.value = "on-mention";
       submit(form!);
 
       expect(requests).toEqual([]);

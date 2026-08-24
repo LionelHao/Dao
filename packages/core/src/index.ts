@@ -54,7 +54,7 @@ export interface Room {
 
 export type HumanRoomRole = "owner" | "admin" | "member";
 /** @deprecated Historical v1 Room membership decoder only. New Assignment writes use AgentAssignmentParticipation. */
-export type AgentParticipation = "active" | "on-mention" | "silent";
+export type AgentParticipation = "active" | "on-mention";
 export type RoomStatus = "active" | "archived";
 export type RoomLifecycleState = "active" | "archived";
 
@@ -157,7 +157,6 @@ const humanRoomRoles = new Set<HumanRoomRole>(["owner", "admin", "member"]);
 const agentParticipations = new Set<AgentParticipation>([
   "active",
   "on-mention",
-  "silent",
 ]);
 
 function isRecord(value: unknown): value is UnknownRecord {
