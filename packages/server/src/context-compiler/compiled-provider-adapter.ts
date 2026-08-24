@@ -150,10 +150,18 @@ export function buildCompiledProviderEnvelopeV1(
         { kind: "authority_fact", text: envelope.trusted.developer.policy },
         { kind: "agent_identity", data: {
           agentId: envelope.trusted.developer.agent.agentId,
+          profileId: envelope.trusted.developer.agent.profileId,
+          assignmentId: envelope.trusted.developer.agent.assignmentId,
           displayName: envelope.trusted.developer.agent.displayName,
+          participation: envelope.trusted.developer.agent.participation,
+          availability: envelope.trusted.developer.agent.availability,
+          effectiveCapabilities: envelope.trusted.developer.agent.effectiveCapabilities,
+          effectiveTools: envelope.trusted.developer.agent.effectiveTools,
+          revisions: envelope.trusted.developer.agent.revisions,
         } },
         { kind: "responsibility", data: {
-          responsibility: envelope.trusted.developer.agent.responsibility,
+          global: envelope.trusted.developer.agent.globalResponsibility,
+          room: envelope.trusted.developer.agent.roomResponsibility,
         } },
         { kind: "room_goal", data: {
           room: envelope.trusted.developer.room,

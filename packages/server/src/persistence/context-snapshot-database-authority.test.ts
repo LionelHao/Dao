@@ -44,8 +44,11 @@ function compilerInput(): ContextCompilerInputV1 {
       },
     },
     agent: {
-      agentId: "context-agent", displayName: "Agent",
-      responsibility: { availability: "unavailable", reason: "ft07_not_delivered" },
+      agentId: "context-agent", profileId: "profile-context-agent", assignmentId: "assignment-context-agent",
+      displayName: "Agent", globalResponsibility: "Build engineering", roomResponsibility: "Own releases",
+      participation: "on-mention", availability: "ready",
+      effectiveCapabilities: ["room.conversation.read", "room.respond"], effectiveTools: ["room-memory.read"],
+      revisions: { profile: 2, assignment: 3, access: 4 },
     },
     room: {
       roomId: "context-room", name: "Context",

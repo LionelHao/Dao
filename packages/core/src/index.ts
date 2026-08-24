@@ -705,7 +705,7 @@ export type {
   CompiledContextGroupItemV1,
   CompiledProjectContextV1,
   ContextAccountingV1,
-  ContextAgentResponsibilityV1,
+  ContextAgentAuthorityV1,
   ContextActorV1,
   ContextCompileErrorV1,
   ContextCompileResultV1,

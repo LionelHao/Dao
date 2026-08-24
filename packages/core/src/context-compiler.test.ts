@@ -25,7 +25,19 @@ const input = {
     invocationId: "invocation-1", executionId: "execution-1", roomId: "room-1",
     intent: { kind: "direct_mention" as const, sourceMessageId: "message-1", targetAgentId: "agent-1", reasonCode: "direct_mention" as const, reasonText: "direct mention" },
   },
-  agent: { agentId: "agent-1", displayName: "Build Agent", responsibility: { availability: "unavailable" as const, reason: "ft07_not_delivered" as const } },
+  agent: {
+    agentId: "agent-1",
+    profileId: "profile-1",
+    assignmentId: "assignment-1",
+    displayName: "Build Agent",
+    globalResponsibility: "Build and release engineering",
+    roomResponsibility: "Own the release pipeline",
+    participation: "on-mention" as const,
+    availability: "ready" as const,
+    effectiveCapabilities: ["room.conversation.read", "room.respond"] as const,
+    effectiveTools: [] as const,
+    revisions: { profile: 3, assignment: 5, access: 8 },
+  },
   room: { roomId: "room-1", name: "Release room", goal: { availability: "unavailable" as const, reason: "ft09_not_delivered" as const } },
   trigger: {
     triggerType: "message" as const,
@@ -82,6 +94,12 @@ describe("FT-06 Context Compiler Core contracts", () => {
       intent: { ...input.invocation.intent, sourceMessageId: "other-message" } } })).toBe(false);
     expect(isContextCompilerInputV1({ ...input, invocation: { ...input.invocation,
       intent: { ...input.invocation.intent, targetAgentId: "other-agent" } } })).toBe(false);
+    expect(isContextCompilerInputV1({ ...input, agent: {
+      ...input.agent, effectiveCapabilities: ["room.respond", "room.conversation.read"],
+    } })).toBe(false);
+    expect(isContextCompilerInputV1({ ...input, agent: {
+      ...input.agent, revisions: { ...input.agent.revisions, assignment: 0 },
+    } })).toBe(false);
     expect(isContextCompilerInputV1({ ...input, trigger: { ...input.trigger, mentions: [
       { ...input.trigger.mentions[0]!, targetKind: "agent" },
     ] } })).toBe(false);

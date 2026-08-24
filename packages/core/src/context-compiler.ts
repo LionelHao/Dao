@@ -72,9 +72,23 @@ export type ContextMemoryCandidateV1 = Readonly<{
   sourceRefs: readonly ContextSourceIdentityV1[];
   availability: "readable" | "invalidated" | "temporarily_unavailable";
 }>;
-export type ContextAgentResponsibilityV1 =
-  | Readonly<{ availability: "available"; text: string; version: number }>
-  | Readonly<{ availability: "unavailable"; reason: "ft07_not_delivered" | "authority_unavailable" }>;
+export type ContextAgentAuthorityV1 = Readonly<{
+  agentId: string;
+  profileId: string;
+  assignmentId: string;
+  displayName: string;
+  globalResponsibility: string;
+  roomResponsibility: string;
+  participation: AgentAssignmentParticipation;
+  availability: AgentAvailability;
+  effectiveCapabilities: readonly AgentCapabilityId[];
+  effectiveTools: readonly AgentToolId[];
+  revisions: Readonly<{
+    profile: number;
+    assignment: number;
+    access: number;
+  }>;
+}>;
 export type ContextRoomGoalV1 =
   | Readonly<{ availability: "available"; text: string; version: number }>
   | Readonly<{ availability: "unavailable"; reason: "ft09_not_delivered" | "authority_unavailable" }>;
@@ -107,7 +121,7 @@ export type ProjectContextInputV1 =
 export type ContextCompilerInputV1 = Readonly<{
   version: typeof CONTEXT_COMPILER_INPUT_VERSION;
   invocation: Readonly<{ invocationId: string; executionId: string; roomId: string; intent: ContextInvocationIntentV1 }>;
-  agent: Readonly<{ agentId: string; displayName: string; responsibility: ContextAgentResponsibilityV1 }>;
+  agent: ContextAgentAuthorityV1;
   room: Readonly<{ roomId: string; name: string; goal: ContextRoomGoalV1 }>;
   trigger: ContextTriggerV1;
   memoryWatermark: number;
@@ -304,12 +318,6 @@ function invocationIntent(value: unknown): value is ContextInvocationIntentV1 {
 function timestamp(value: unknown): value is string {
   return text(value) && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value);
 }
-function responsibility(value: unknown): value is ContextAgentResponsibilityV1 {
-  return (exact(value, ["availability", "text", "version"]) && value.availability === "available"
-      && text(value.text) && uint(value.version, true))
-    || (exact(value, ["availability", "reason"]) && value.availability === "unavailable"
-      && ["ft07_not_delivered", "authority_unavailable"].includes(String(value.reason)));
-}
 function goal(value: unknown): value is ContextRoomGoalV1 {
   return (exact(value, ["availability", "text", "version"]) && value.availability === "available"
       && text(value.text) && uint(value.version, true))
@@ -317,8 +325,20 @@ function goal(value: unknown): value is ContextRoomGoalV1 {
       && ["ft09_not_delivered", "authority_unavailable"].includes(String(value.reason)));
 }
 function agentIdentity(value: unknown): value is ContextCompilerInputV1["agent"] {
-  return exact(value, ["agentId", "displayName", "responsibility"])
-    && text(value.agentId) && text(value.displayName) && responsibility(value.responsibility);
+  return exact(value, [
+    "agentId", "profileId", "assignmentId", "displayName", "globalResponsibility",
+    "roomResponsibility", "participation", "availability", "effectiveCapabilities",
+    "effectiveTools", "revisions",
+  ]) && text(value.agentId) && text(value.profileId) && text(value.assignmentId)
+    && text(value.displayName) && text(value.globalResponsibility)
+    && text(value.roomResponsibility)
+    && ["active", "on-mention"].includes(String(value.participation))
+    && ["ready", "busy", "paused", "noauth"].includes(String(value.availability))
+    && isCanonicalAgentCapabilitySet(value.effectiveCapabilities)
+    && isCanonicalAgentToolSet(value.effectiveTools)
+    && exact(value.revisions, ["profile", "assignment", "access"])
+    && uint(value.revisions.profile, true) && uint(value.revisions.assignment, true)
+    && uint(value.revisions.access);
 }
 function roomIdentity(value: unknown, roomId?: string): value is ContextCompilerInputV1["room"] {
   return exact(value, ["roomId", "name", "goal"]) && text(value.roomId)
@@ -378,6 +398,10 @@ export function isContextCompilerInputV1(value: unknown): value is ContextCompil
   if (!dense(value.tools) || !value.tools.every((tool) => exact(tool, ["id", "description", "effect", "inputSchemaCanonical"])
     && text(tool.id) && text(tool.description) && ["read-only", "reversible-write", "irreversible-write"].includes(String(tool.effect))
     && text(tool.inputSchemaCanonical))) return false;
+  const toolIds = value.tools.map((tool) => tool.id).sort();
+  if (new Set(toolIds).size !== toolIds.length ||
+      toolIds.length !== value.agent.effectiveTools.length ||
+      toolIds.some((toolId, index) => toolId !== value.agent.effectiveTools[index])) return false;
   if (!exact(value.trusted, ["system", "developerPolicy"]) || !text(value.trusted.system) || !text(value.trusted.developerPolicy)) return false;
   const memoryWatermark = Number(value.memoryWatermark);
   const corpusHead = Number(value.corpusHead);
@@ -566,3 +590,13 @@ export function isContextCompileResultV1(value: unknown): value is ContextCompil
     return false;
   }
 }
+import type {
+  AgentAssignmentParticipation,
+  AgentAvailability,
+  AgentCapabilityId,
+  AgentToolId,
+} from "./agent-profile.js";
+import {
+  isCanonicalAgentCapabilitySet,
+  isCanonicalAgentToolSet,
+} from "./agent-profile.js";

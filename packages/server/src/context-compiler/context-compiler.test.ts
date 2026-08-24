@@ -34,7 +34,10 @@ function makeInput(): ContextCompilerInputV1 {
     version: "context_compiler_input_v1",
     invocation: { invocationId: "invocation-1", executionId: "execution-1", roomId: "room-1",
       intent: { kind: "direct_mention", sourceMessageId: "trigger", targetAgentId: "agent-1", reasonCode: "direct_mention", reasonText: "direct mandatory address" } },
-    agent: { agentId: "agent-1", displayName: "Build Agent", responsibility: { availability: "unavailable", reason: "ft07_not_delivered" } },
+    agent: { agentId: "agent-1", profileId: "profile-1", assignmentId: "assignment-1",
+      displayName: "Build Agent", globalResponsibility: "Build engineering", roomResponsibility: "Own releases",
+      participation: "on-mention", availability: "ready", effectiveCapabilities: ["room.conversation.read", "room.respond"],
+      effectiveTools: ["repository.git-status", "room-memory.read"], revisions: { profile: 2, assignment: 3, access: 4 } },
     room: { roomId: "room-1", name: "Release room", goal: { availability: "unavailable", reason: "ft09_not_delivered" } },
     trigger: {
       triggerType: "message",
@@ -87,8 +90,8 @@ function makeInput(): ContextCompilerInputV1 {
     attachments: [candidate("attachment-1", 7, "Extracted release checklist.", { source: source("attachment-1", 7, "attachment_extraction"), segment: { index: 0, count: 2, startByte: 0, endByte: 28 } })],
     project: { availability: "disabled", reason: "ft09_not_delivered" },
     tools: [
-      { id: "z-tool", description: "Last", effect: "read-only", inputSchemaCanonical: "{}" },
-      { id: "a-tool", description: "First", effect: "read-only", inputSchemaCanonical: "{}" },
+      { id: "room-memory.read", description: "Last", effect: "read-only", inputSchemaCanonical: "{}" },
+      { id: "repository.git-status", description: "First", effect: "read-only", inputSchemaCanonical: "{}" },
     ],
     trusted: { system: "Follow room authorization.", developerPolicy: "Cite manifest labels only." },
   };
@@ -121,7 +124,15 @@ describe("compileContextV1", () => {
     expect(first.manifestSha256).toMatch(/^[0-9a-f]{64}$/);
     expect(first.envelopeSha256).toBe("adbfe4d2da61fe3285979e6934e4c8d7d66b55c80891ce40b93b70d532c2f470");
     expect(first.manifestSha256).toBe("a6ab70c0b13914270b6061eb06d0f94aa4fce646d1f624fe78a492d63e87340b");
-    expect(first.envelope.trusted.developer.agent.responsibility).toEqual({ availability: "unavailable", reason: "ft07_not_delivered" });
+    expect(first.envelope.trusted.developer.agent).toMatchObject({
+      profileId: "profile-1",
+      assignmentId: "assignment-1",
+      globalResponsibility: "Build engineering",
+      roomResponsibility: "Own releases",
+      participation: "on-mention",
+      availability: "ready",
+      revisions: { profile: 2, assignment: 3, access: 4 },
+    });
     expect(first.envelope.trusted.developer.room.goal).toEqual({ availability: "unavailable", reason: "ft09_not_delivered" });
     expect(first.envelope.trusted.developer.triggerType).toBe("message");
     expect(isContextCompileResultV1(first)).toBe(true);

@@ -41,7 +41,10 @@ function makeInput(seed: number): ContextCompilerInputV1 {
     version: "context_compiler_input_v1",
     invocation: { invocationId: "invocation-property", executionId: "execution-property", roomId: "room-property",
       intent: { kind: "routed_candidate", sourceMessageId: "message-11", targetAgentId: "agent-property", reasonCode: "domain_match", reasonText: "property route" } },
-    agent: { agentId: "agent-property", displayName: "Property Agent", responsibility: { availability: "unavailable", reason: "ft07_not_delivered" } },
+    agent: { agentId: "agent-property", profileId: "profile-property", assignmentId: "assignment-property",
+      displayName: "Property Agent", globalResponsibility: "Property analysis", roomResponsibility: "Analyze this Room",
+      participation: "active", availability: "ready", effectiveCapabilities: ["room.conversation.read", "room.respond"],
+      effectiveTools: [], revisions: { profile: 2, assignment: 3, access: 4 } },
     room: { roomId: "room-property", name: "Property", goal: { availability: "unavailable", reason: "ft09_not_delivered" } },
     trigger: {
       triggerType: "message",
