@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { ATTACHMENT_AUTHORITY_LIMITS, CONTEXT_COMPILER_LIMITS, type Actor } from "@native-im/core";
 import { isDeepStrictEqual } from "node:util";
 import { mkdir } from "node:fs/promises";
@@ -105,6 +105,14 @@ export interface StartAuthoritativeServerOptions {
   readonly invitationSecretKey: Uint8Array;
   readonly sharedAuthority: {
     readonly maxOfflineReadLeaseMs: number;
+  };
+  /**
+   * Owner-controlled deployment bootstrap. The first successful startup seals
+   * this exact Human principal set in SQLite; later startup configuration can
+   * never replace the authoritative administrator registry.
+   */
+  readonly tenantAdministration?: {
+    readonly bootstrapHumanActorIds: readonly string[];
   };
   readonly agentRuntime?: {
     readonly model?: string;
@@ -239,6 +247,16 @@ async function start(
     testOptions.faultPoint === "after-domain-write" || testOptions.faultPoint === "before-commit"
       ? testOptions.faultPoint
       : undefined;
+  const secretProvider = createEnvironmentSecretProvider();
+  const deploymentProviderDisclosure = Object.freeze({
+    providerId: "openai-responses",
+    modelId: runtimeModel,
+    credentialReadiness:
+      testOptions.agentRuntimeProviderForTest !== undefined ||
+        secretProvider.getSecret("OPENAI_API_KEY") !== undefined
+        ? "ready" as const
+        : "noauth" as const,
+  });
   let worker: WorkerDatabaseClient | undefined;
   let snapshots: Awaited<ReturnType<typeof createSnapshotWorkerClient>> | undefined;
   let transport: Awaited<ReturnType<typeof startMessageWebSocketServer>> | undefined;
@@ -274,6 +292,7 @@ async function start(
             ballPolicy,
             maxOfflineReadLeaseMs: options.sharedAuthority.maxOfflineReadLeaseMs,
           },
+          deploymentProviderDisclosure,
         })
       : await createWorkerDatabaseClientWithTransactionFaultForTest(
           {
@@ -282,6 +301,7 @@ async function start(
               ballPolicy,
               maxOfflineReadLeaseMs: options.sharedAuthority.maxOfflineReadLeaseMs,
             },
+            deploymentProviderDisclosure,
           },
           transactionFault,
         );
@@ -324,6 +344,25 @@ async function start(
         throw new TypeError("Persisted authoritative actors are missing");
       }
       await authority.registerActors(missingActors);
+    }
+    if (options.tenantAdministration !== undefined) {
+      const principalIds = [...options.tenantAdministration.bootstrapHumanActorIds]
+        .sort((left, right) => left.localeCompare(right));
+      if (principalIds.length === 0 || principalIds.some((principalId) =>
+        principalId.trim() !== principalId || principalId.length === 0) ||
+        new Set(principalIds).size !== principalIds.length) {
+        throw new TypeError("Tenant administrator bootstrap principals must be non-empty, unique Human actor IDs");
+      }
+      const configurationSha256 = createHash("sha256")
+        .update(JSON.stringify({ version: 1, principalIds }), "utf8")
+        .digest("hex");
+      await worker.executeTenantAdministration({
+        version: 1,
+        type: "tenant-administrator.bootstrap",
+        principalIds,
+        configurationSha256,
+        now: Date.now(),
+      });
     }
     const snapshotClient = await createSnapshotWorkerClient({
       authorityPath: options.databasePath,
@@ -458,7 +497,6 @@ async function start(
     await testOptions.initialize?.({ auth, lifecycle, messages: service, primitives });
     const runtimeConfiguration = options.agentRuntime ?? {};
     const authorityWorker = worker as CompleteWorkerDatabaseClient;
-    const secretProvider = createEnvironmentSecretProvider();
     const memoryAuthority = createWorkerMemoryAuthority({ worker, nowMs: Date.now });
     const provider = testOptions.agentRuntimeProviderForTest ?? createOpenAIResponsesProvider({
       endpoint: runtimeConfiguration.endpoint ?? "https://api.openai.com/v1/responses",
