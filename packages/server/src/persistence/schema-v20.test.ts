@@ -232,7 +232,7 @@ describe("authority SQLite v20 Agent Profile and Routing Authority", () => {
     expect(AUTHORITY_V20_INVARIANT_STATEMENT_COUNT_FOR_TEST).toBe(60);
     expect(AUTHORITY_V20_ROLLBACK_ASSERTION_COUNT_FOR_TEST).toBe(97);
     expect(AUTHORITY_V20_MIGRATION_CHECKSUM_FOR_TEST)
-      .toBe("66715c97b8551d4f27ccbc7074dbaa8e68976e3dc3fa82cd254370c8a940861c");
+      .toBe("26de266c7ec72ed3a3aebdcee4218ebaf14fa7357393ba3f8cb09834b9b40676");
     for (let statement = 1; statement <= AUTHORITY_V20_STATEMENT_COUNT_FOR_TEST; statement += 1) {
       withDatabase((database) => {
         migrateAuthorityDatabaseToHistoricalVersionForTest(database, 19);

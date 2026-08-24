@@ -71,7 +71,7 @@ const SCHEMA_FINGERPRINTS = {
   17: "cc4b260ec841765f0349040a238a44281aa3ed9a792623ebd6540fd3e9f6b0b0",
   18: "d1344ba94d7dd4253f2dcc9e392c3bc4b8b1ec5b4fbba614e3fe2a10392797e5",
   19: "e458dedc7c0d85c04bca92dc2f6289b02367fb97fc7edbe1c7dba011470812b7",
-  20: "eccbf96ac683cbaaef8dc4359b78271e722069ec3b6bb3e37f2855ecbdd0cdbc",
+  20: "c5990a5bebcea5443baccf442d8fa67fbcc156d1957d53d1100bb85222f017c6",
 } as const;
 
 const V1_STATEMENTS = [
@@ -6040,7 +6040,9 @@ const V20_STATEMENTS = [
     attempts INTEGER NOT NULL CHECK (attempts >= 0),
     available_at TEXT NOT NULL,
     delivered_at TEXT,
-    last_error TEXT,
+    last_error TEXT CHECK (
+      last_error IS NULL OR last_error IN ('delivery_failed', 'recipient_unavailable')
+    ),
     UNIQUE (event_id, recipient_human_actor_id)
   ) STRICT`,
   `CREATE INDEX deployment_profile_outbox_pending_v20
@@ -6160,6 +6162,9 @@ const V20_STATEMENTS = [
         WHERE profile.id = NEW.profile_id
           AND profile.actor_id = NEW.actor_id
           AND profile.revision = NEW.profile_revision
+          AND (NEW.event_kind <> 'profile.created' OR profile.revision = 1)
+          AND (NEW.event_kind <> 'profile.enabled' OR profile.status = 'enabled')
+          AND (NEW.event_kind <> 'profile.disabled' OR profile.status = 'disabled')
       )
       OR EXISTS (
         SELECT 1 FROM json_tree(NEW.payload_json)
