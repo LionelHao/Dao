@@ -7,7 +7,7 @@ import {
 } from "../access/room-cache-invalidation-port.js";
 import { OFFLINE_READ_LEASE_SCHEMA_STATEMENTS } from "../access/offline-lease-invalidation-port.js";
 
-export const AUTHORITY_SCHEMA_VERSION = 20 as const;
+export const AUTHORITY_SCHEMA_VERSION = 21 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -72,6 +72,7 @@ const SCHEMA_FINGERPRINTS = {
   18: "d1344ba94d7dd4253f2dcc9e392c3bc4b8b1ec5b4fbba614e3fe2a10392797e5",
   19: "e458dedc7c0d85c04bca92dc2f6289b02367fb97fc7edbe1c7dba011470812b7",
   20: "1ca2a806a52cd2ce9632b02e215a25ba13bc3ebc4336f5152c48f21d60faa2a0",
+  21: "dca0a24a346060b1e04b98ee5a73e016421796d6c13bd0bd2841179f405c44af",
 } as const;
 
 const V1_STATEMENTS = [
@@ -6714,6 +6715,115 @@ export const AUTHORITY_V20_MIGRATION_CHECKSUM_FOR_TEST = migrationChecksum(
   V20_STATEMENTS,
 );
 
+const V21_STATEMENTS = [
+  `CREATE TABLE direct_agent_invocation_authority_bindings (
+    intent_id TEXT PRIMARY KEY REFERENCES agent_invocation_intents(id),
+    profile_id TEXT NOT NULL REFERENCES agent_profiles(id),
+    profile_revision INTEGER NOT NULL CHECK (profile_revision > 0),
+    assignment_id TEXT NOT NULL REFERENCES room_agent_assignments(id),
+    assignment_revision INTEGER NOT NULL CHECK (assignment_revision > 0),
+    access_revision INTEGER NOT NULL CHECK (access_revision >= 0),
+    FOREIGN KEY (profile_id, profile_revision)
+      REFERENCES agent_profile_revisions(profile_id, revision),
+    FOREIGN KEY (assignment_id, assignment_revision)
+      REFERENCES room_agent_assignment_revisions(assignment_id, revision)
+  ) STRICT`,
+  `CREATE TRIGGER direct_agent_invocation_authority_bindings_v21_validate_insert
+   BEFORE INSERT ON direct_agent_invocation_authority_bindings
+   WHEN NOT EXISTS (
+     SELECT 1
+     FROM agent_invocation_intents AS intent
+     JOIN message_mentions AS mention
+       ON mention.message_id = intent.source_message_id
+      AND mention.target_id = intent.target_id
+      AND mention.target_actor_id = intent.target_agent_id
+      AND mention.target_kind = 'agent-invocation'
+     JOIN agent_profiles AS profile
+       ON profile.id = NEW.profile_id
+      AND profile.actor_id = intent.target_agent_id
+      AND profile.revision = NEW.profile_revision
+      AND profile.status = 'enabled'
+     JOIN agent_profile_revisions AS profile_revision
+       ON profile_revision.profile_id = NEW.profile_id
+      AND profile_revision.revision = NEW.profile_revision
+      AND profile_revision.actor_id = intent.target_agent_id
+     JOIN room_agent_assignments AS assignment
+       ON assignment.id = NEW.assignment_id
+      AND assignment.room_id = intent.room_id
+      AND assignment.profile_id = NEW.profile_id
+      AND assignment.agent_actor_id = intent.target_agent_id
+      AND assignment.revision = NEW.assignment_revision
+      AND assignment.status = 'current'
+      AND assignment.paused = 0
+      AND assignment.participation IN ('active', 'on-mention')
+     JOIN room_agent_assignment_revisions AS assignment_revision
+       ON assignment_revision.assignment_id = NEW.assignment_id
+      AND assignment_revision.revision = NEW.assignment_revision
+      AND assignment_revision.room_id = intent.room_id
+      AND assignment_revision.profile_id = NEW.profile_id
+      AND assignment_revision.agent_actor_id = intent.target_agent_id
+     JOIN room_memberships AS membership
+       ON membership.room_id = intent.room_id
+      AND membership.actor_id = intent.target_agent_id
+      AND membership.kind = 'agent'
+      AND membership.access_revision = NEW.access_revision
+     WHERE intent.id = NEW.intent_id
+       AND intent.origin_kind = 'message_target'
+       AND intent.intent_kind = 'direct_mention'
+       AND intent.message_transaction_id = intent.source_message_id
+       AND intent.source_revision = 1
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'Direct invocation authority binding is invalid or stale');
+   END`,
+  `CREATE TRIGGER direct_agent_invocation_authority_bindings_v21_immutable_update
+   BEFORE UPDATE ON direct_agent_invocation_authority_bindings
+   BEGIN SELECT RAISE(ABORT, 'Direct invocation authority binding is immutable'); END`,
+  `CREATE TRIGGER direct_agent_invocation_authority_bindings_v21_immutable_delete
+   BEFORE DELETE ON direct_agent_invocation_authority_bindings
+   BEGIN SELECT RAISE(ABORT, 'Direct invocation authority binding is immutable'); END`,
+  `CREATE TRIGGER message_target_outcomes_v21_require_direct_authority_binding
+   BEFORE INSERT ON message_target_outcomes
+   WHEN NEW.status = 'invocation-intent-created' AND NOT EXISTS (
+     SELECT 1
+     FROM direct_agent_invocation_authority_bindings AS binding
+     JOIN agent_invocation_intents AS intent ON intent.id = binding.intent_id
+     WHERE binding.intent_id = NEW.invocation_intent_id
+       AND intent.room_id = NEW.room_id
+       AND intent.source_message_id = NEW.message_id
+       AND intent.target_id = NEW.target_id
+       AND intent.target_agent_id = NEW.target_actor_id
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'Direct invocation outcome lacks immutable authority binding');
+   END`,
+  `CREATE TRIGGER agent_invocation_intents_v21_require_binding_before_claim
+   BEFORE UPDATE OF status ON agent_invocation_intents
+   WHEN OLD.origin_kind = 'message_target' AND OLD.status = 'pending'
+      AND NEW.status = 'claimed'
+      AND NOT EXISTS (
+        SELECT 1 FROM direct_agent_invocation_authority_bindings AS binding
+        WHERE binding.intent_id = OLD.id
+      )
+   BEGIN
+     SELECT RAISE(ABORT, 'Direct invocation claim lacks immutable authority binding');
+   END`,
+] as const;
+
+export const AUTHORITY_V21_STATEMENT_COUNT_FOR_TEST = V21_STATEMENTS.length;
+export const AUTHORITY_V21_TRIGGER_INVARIANT_STATEMENT_COUNT_FOR_TEST =
+  V21_STATEMENTS.filter((statement) => statement.startsWith("CREATE TRIGGER ")).length;
+export const AUTHORITY_V21_STARTUP_INVARIANT_STATEMENT_COUNT_FOR_TEST = 1;
+export const AUTHORITY_V21_INVARIANT_STATEMENT_COUNT_FOR_TEST =
+  AUTHORITY_V21_TRIGGER_INVARIANT_STATEMENT_COUNT_FOR_TEST
+  + AUTHORITY_V21_STARTUP_INVARIANT_STATEMENT_COUNT_FOR_TEST;
+export const AUTHORITY_V21_ROLLBACK_ASSERTION_COUNT_FOR_TEST = V21_STATEMENTS.length;
+export const AUTHORITY_V21_MIGRATION_CHECKSUM_FOR_TEST = migrationChecksum(
+  21,
+  "direct-invocation-authority-binding",
+  V21_STATEMENTS,
+);
+
 const V2_STATEMENTS = [
   `ALTER TABLE actors
    ADD COLUMN catalog_revision INTEGER NOT NULL DEFAULT 0
@@ -7145,6 +7255,11 @@ const MIGRATIONS = [
     20,
     "agent-profile-routing-authority",
     V20_STATEMENTS,
+  ),
+  defineMigration(
+    21,
+    "direct-invocation-authority-binding",
+    V21_STATEMENTS,
   ),
 ] as const satisfies readonly Migration[];
 
@@ -7909,6 +8024,14 @@ const V20_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V21_SCHEMA_CONTRACT = {
+  ...V20_SCHEMA_CONTRACT,
+  direct_agent_invocation_authority_bindings: [
+    "intent_id", "profile_id", "profile_revision", "assignment_id",
+    "assignment_revision", "access_revision",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
@@ -7930,6 +8053,7 @@ const SCHEMA_CONTRACTS = {
   18: V18_SCHEMA_CONTRACT,
   19: V19_SCHEMA_CONTRACT,
   20: V20_SCHEMA_CONTRACT,
+  21: V21_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -9594,6 +9718,31 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
       "routed invocation intents must retain exact route decision provenance",
     );
   }
+  if (schemaVersion >= 21) {
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM direct_agent_invocation_authority_bindings AS binding
+       LEFT JOIN agent_invocation_intents AS intent ON intent.id = binding.intent_id
+       LEFT JOIN agent_profile_revisions AS profile_revision
+         ON profile_revision.profile_id = binding.profile_id
+        AND profile_revision.revision = binding.profile_revision
+       LEFT JOIN room_agent_assignment_revisions AS assignment_revision
+         ON assignment_revision.assignment_id = binding.assignment_id
+        AND assignment_revision.revision = binding.assignment_revision
+       WHERE intent.id IS NULL OR intent.origin_kind <> 'message_target'
+          OR intent.intent_kind <> 'direct_mention'
+          OR intent.message_transaction_id <> intent.source_message_id
+          OR profile_revision.profile_id IS NULL
+          OR profile_revision.actor_id <> intent.target_agent_id
+          OR assignment_revision.assignment_id IS NULL
+          OR assignment_revision.room_id <> intent.room_id
+          OR assignment_revision.profile_id <> binding.profile_id
+          OR assignment_revision.agent_actor_id <> intent.target_agent_id
+       LIMIT 1`,
+      "direct invocation bindings must retain exact immutable authority revisions",
+    );
+  }
 }
 
 function validateExistingSchema(database: DatabaseSync, currentVersion: number): void {
@@ -9828,6 +9977,13 @@ export function migrateAuthorityDatabaseToVersion16ForTest(
   fault?: MigrationFaultOptions,
 ): void {
   migrateAuthorityDatabaseToVersion(database, 16, fault);
+}
+
+export function migrateAuthorityDatabaseToVersion20ForTest(
+  database: DatabaseSync,
+  fault?: MigrationFaultOptions,
+): void {
+  migrateAuthorityDatabaseToVersion(database, 20, fault);
 }
 
 export function migrateAuthorityDatabaseToVersion15ForTest(

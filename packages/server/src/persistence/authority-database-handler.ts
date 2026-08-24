@@ -8286,9 +8286,28 @@ export function submitHumanMessageDatabaseCommand(
           );
           input.onFaultPointForTest?.("after-target");
           const membership = database.prepare(
-            `SELECT kind, participation FROM room_memberships
+            `SELECT kind, participation, access_revision AS accessRevision
+             FROM room_memberships
              WHERE room_id = ? AND actor_id = ?`,
           ).get(input.message.roomId, target.targetActorId);
+          const directAuthority = target.kind === "agent-invocation"
+            ? database.prepare(
+              `SELECT profile.id AS profileId, profile.revision AS profileRevision,
+                      profile.status AS profileStatus,
+                      assignment.id AS assignmentId,
+                      assignment.revision AS assignmentRevision,
+                      assignment.status AS assignmentStatus,
+                      assignment.participation AS assignmentParticipation,
+                      assignment.paused AS assignmentPaused
+               FROM agent_profiles AS profile
+               LEFT JOIN room_agent_assignments AS assignment
+                 ON assignment.room_id = ?
+                AND assignment.profile_id = profile.id
+                AND assignment.agent_actor_id = profile.actor_id
+                AND assignment.status = 'current'
+               WHERE profile.actor_id = ?`,
+            ).get(input.message.roomId, target.targetActorId)
+            : undefined;
           let outcome: MessageTargetOutcome;
           const expectedActorKind = target.kind === "human-request" ? "human" : "agent";
           if (actor.kind !== expectedActorKind ||
@@ -8310,6 +8329,23 @@ export function submitHumanMessageDatabaseCommand(
             };
           } else if (target.kind === "agent-invocation" &&
               membership.participation !== "active" && membership.participation !== "on-mention") {
+            outcome = {
+              targetId: target.id,
+              targetActorId: target.targetActorId,
+              kind: target.kind,
+              status: "rejected",
+              code: "target_assignment_inactive",
+            };
+          } else if (target.kind === "agent-invocation" &&
+              (directAuthority === undefined || directAuthority.profileStatus !== "enabled" ||
+               directAuthority.assignmentStatus !== "current" ||
+               directAuthority.assignmentPaused !== 0 ||
+               directAuthority.assignmentParticipation !== membership.participation ||
+               typeof directAuthority.profileId !== "string" ||
+               typeof directAuthority.assignmentId !== "string" ||
+               typeof directAuthority.profileRevision !== "number" ||
+               typeof directAuthority.assignmentRevision !== "number" ||
+               typeof membership.accessRevision !== "number")) {
             outcome = {
               targetId: target.id,
               targetActorId: target.targetActorId,
@@ -8367,6 +8403,19 @@ export function submitHumanMessageDatabaseCommand(
               target.id,
               stableId("message-lineage", input.message.messageId, target.id),
               stableId("message-turn", input.message.messageId, target.id),
+            );
+            database.prepare(
+              `INSERT INTO direct_agent_invocation_authority_bindings (
+                 intent_id, profile_id, profile_revision, assignment_id,
+                 assignment_revision, access_revision
+               ) VALUES (?, ?, ?, ?, ?, ?)`,
+            ).run(
+              invocationIntentId,
+              directAuthority!.profileId as string,
+              directAuthority!.profileRevision as number,
+              directAuthority!.assignmentId as string,
+              directAuthority!.assignmentRevision as number,
+              membership.accessRevision as number,
             );
             outcome = {
               targetId: target.id,

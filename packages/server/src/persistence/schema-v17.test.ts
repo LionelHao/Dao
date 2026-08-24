@@ -262,13 +262,13 @@ describe("authority SQLite v17 Attachment Authority", () => {
   it("upgrades fresh and every immutable v1-v16 schema through v17 and restarts idempotently", () => {
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(20);
-      expect(readSchemaVersion(database)).toBe(20);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(21);
+      expect(readSchemaVersion(database)).toBe(21);
       expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get())
-        .toEqual({ count: 20 });
+        .toEqual({ count: 21 });
       expect(() => migrateAuthorityDatabase(database)).not.toThrow();
       expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get())
-        .toEqual({ count: 20 });
+        .toEqual({ count: 21 });
     });
 
     for (let version = 1; version <= 16; version += 1) {
@@ -276,17 +276,17 @@ describe("authority SQLite v17 Attachment Authority", () => {
         migrateAuthorityDatabaseToHistoricalVersionForTest(database, version);
         expect(readSchemaVersion(database)).toBe(version);
         migrateAuthorityDatabase(database);
-        expect(readSchemaVersion(database)).toBe(20);
+        expect(readSchemaVersion(database)).toBe(21);
         expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get())
-          .toEqual({ count: 20 });
+          .toEqual({ count: 21 });
       });
     }
 
     withRestartedDatabase((database) => {
       expect(() => migrateAuthorityDatabase(database)).not.toThrow();
-      expect(readSchemaVersion(database)).toBe(20);
+      expect(readSchemaVersion(database)).toBe(21);
       expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get())
-        .toEqual({ count: 20 });
+        .toEqual({ count: 21 });
     });
   }, 60_000);
 
@@ -599,9 +599,9 @@ describe("authority SQLite v17 Attachment Authority", () => {
 
   it("refuses future and physically tampered v17 schemas", () => {
     withDatabase((database) => {
-      database.exec("PRAGMA user_version = 21");
+      database.exec("PRAGMA user_version = 22");
       expect(() => migrateAuthorityDatabase(database)).toThrow(/future schema/i);
-      expect(readSchemaVersion(database)).toBe(21);
+      expect(readSchemaVersion(database)).toBe(22);
     });
     withDatabase((database) => {
       migrateAuthorityDatabase(database);

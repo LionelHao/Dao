@@ -642,6 +642,37 @@ async function createCommandMatrixFixture(databasePath: string): Promise<{
     WHERE id = 'room-matrix';
     INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
     VALUES ('room', 'room-matrix', 0, 1);
+    UPDATE agent_profiles
+    SET revision = revision + 1, status = 'enabled', updated_at = '2026-08-10T14:00:00.000Z',
+        source_kind = 'administrator_command'
+    WHERE actor_id = 'agent-review';
+    INSERT INTO agent_profile_revisions (
+      profile_id, revision, actor_id, display_name, global_responsibility, status,
+      capability_ceiling_json, tool_ceiling_json, changed_by_human_actor_id,
+      changed_at, operation
+    ) SELECT id, revision, actor_id, display_name, global_responsibility, status,
+             capability_ceiling_json, tool_ceiling_json, 'human-li',
+             '2026-08-10T14:00:00.000Z', 'enable'
+      FROM agent_profiles WHERE actor_id = 'agent-review';
+    INSERT INTO room_agent_assignments (
+      id, room_id, profile_id, agent_actor_id, revision, status, participation,
+      paused, capability_subset_json, tool_subset_json, room_responsibility,
+      created_at, updated_at, removed_at, source_kind
+    ) SELECT 'matrix-assignment-agent-review', 'room-matrix', id, actor_id, 1,
+             'current', 'active', 0, '[]', '[]', 'Review Matrix Room.',
+             '2026-08-10T14:00:00.000Z', '2026-08-10T14:00:00.000Z', NULL,
+             'room_command'
+      FROM agent_profiles WHERE actor_id = 'agent-review';
+    INSERT INTO room_agent_assignment_revisions (
+      assignment_id, revision, room_id, profile_id, agent_actor_id,
+      room_responsibility, status, participation, paused,
+      capability_subset_json, tool_subset_json, changed_by_human_actor_id,
+      changed_at, operation
+    ) SELECT id, revision, room_id, profile_id, agent_actor_id,
+             room_responsibility, status, participation, paused,
+             capability_subset_json, tool_subset_json, 'human-li',
+             '2026-08-10T14:00:00.000Z', 'create'
+      FROM room_agent_assignments WHERE id = 'matrix-assignment-agent-review';
   `);
   insertLegacyMessageAuthorityRecord(database, {
     id: "matrix-human-source", roomId: "room-matrix", authorId: "human-li",
@@ -1190,7 +1221,7 @@ describe("SQLite authoritative sessions", () => {
       accountId: "account-li",
       actorId: "human-li",
     });
-    await expect(client.inspectSchema()).resolves.toEqual({ version: 20 });
+    await expect(client.inspectSchema()).resolves.toEqual({ version: 21 });
     await client.close();
   });
 
@@ -4770,8 +4801,8 @@ describe("SQLite authoritative sessions", () => {
       }
       await Promise.all([submission, authorityCut]);
       const receipt = await submission;
-      const targetWasRevokedBeforeSend = targetKind === "human" && order === "authority-cut-first";
-      expect(receipt.targetOutcomes).toEqual([targetWasRevokedBeforeSend
+      const targetWasInvalidatedBeforeSend = order === "authority-cut-first";
+      expect(receipt.targetOutcomes).toEqual([targetWasInvalidatedBeforeSend
         ? {
             targetId,
             targetActorId,
@@ -4791,7 +4822,7 @@ describe("SQLite authoritative sessions", () => {
       expect(database.prepare(
         `SELECT status, rejection_code AS rejectionCode
          FROM message_target_outcomes WHERE message_id = ? AND target_id = ?`,
-      ).get(messageId, targetId)).toEqual(targetWasRevokedBeforeSend
+      ).get(messageId, targetId)).toEqual(targetWasInvalidatedBeforeSend
         ? {
             status: "rejected",
             rejectionCode: targetKind === "human"
@@ -4809,7 +4840,27 @@ describe("SQLite authoritative sessions", () => {
         : "agent_invocation_intents";
       expect(database.prepare(
         `SELECT status FROM ${intentTable} WHERE source_message_id = ?`,
-      ).all(messageId)).toEqual(targetWasRevokedBeforeSend ? [] : [{ status: "pending" }]);
+      ).all(messageId)).toEqual(targetWasInvalidatedBeforeSend ? [] : [{ status: "pending" }]);
+      if (targetKind === "agent" && !targetWasInvalidatedBeforeSend) {
+        expect(database.prepare(
+          `SELECT binding.profile_id AS profileId,
+                  binding.profile_revision AS profileRevision,
+                  binding.assignment_id AS assignmentId,
+                  binding.assignment_revision AS assignmentRevision,
+                  binding.access_revision AS accessRevision
+           FROM direct_agent_invocation_authority_bindings AS binding
+           JOIN agent_invocation_intents AS intent ON intent.id = binding.intent_id
+           WHERE intent.source_message_id = ?`,
+        ).all(messageId)).toEqual([
+          expect.objectContaining({
+            profileId: expect.any(String),
+            profileRevision: expect.any(Number),
+            assignmentId: expect.any(String),
+            assignmentRevision: expect.any(Number),
+            accessRevision: expect.any(Number),
+          }),
+        ]);
+      }
       expect(database.prepare(
         `SELECT role, participation FROM room_memberships
          WHERE room_id = ? AND actor_id = ?`,
@@ -5778,6 +5829,39 @@ describe("SQLite authoritative sessions", () => {
          joined_at, configured_at, access_revision
        ) VALUES (?, 'agent-alternate', 'agent', NULL, 'active', '[]', NULL, ?, 1)`,
     ).run(fixture.contexts.roomId, "2026-08-19T01:04:00.000Z");
+    alternateMembership.exec(`
+      UPDATE agent_profiles
+      SET revision = revision + 1, status = 'enabled',
+          updated_at = '2026-08-19T01:04:00.000Z', source_kind = 'administrator_command'
+      WHERE actor_id = 'agent-alternate';
+      INSERT INTO agent_profile_revisions (
+        profile_id, revision, actor_id, display_name, global_responsibility, status,
+        capability_ceiling_json, tool_ceiling_json, changed_by_human_actor_id,
+        changed_at, operation
+      ) SELECT id, revision, actor_id, display_name, global_responsibility, status,
+               capability_ceiling_json, tool_ceiling_json, 'human-li',
+               '2026-08-19T01:04:00.000Z', 'enable'
+        FROM agent_profiles WHERE actor_id = 'agent-alternate';
+      INSERT INTO room_agent_assignments (
+        id, room_id, profile_id, agent_actor_id, revision, status, participation,
+        paused, capability_subset_json, tool_subset_json, room_responsibility,
+        created_at, updated_at, removed_at, source_kind
+      ) SELECT 'matrix-assignment-agent-alternate', 'room-matrix', id, actor_id, 1,
+               'current', 'active', 0, '[]', '[]', 'Answer in Matrix Room.',
+               '2026-08-19T01:04:00.000Z', '2026-08-19T01:04:00.000Z', NULL,
+               'room_command'
+        FROM agent_profiles WHERE actor_id = 'agent-alternate';
+      INSERT INTO room_agent_assignment_revisions (
+        assignment_id, revision, room_id, profile_id, agent_actor_id,
+        room_responsibility, status, participation, paused,
+        capability_subset_json, tool_subset_json, changed_by_human_actor_id,
+        changed_at, operation
+      ) SELECT id, revision, room_id, profile_id, agent_actor_id,
+               room_responsibility, status, participation, paused,
+               capability_subset_json, tool_subset_json, 'human-li',
+               '2026-08-19T01:04:00.000Z', 'create'
+        FROM room_agent_assignments WHERE id = 'matrix-assignment-agent-alternate';
+    `);
     alternateMembership.close();
     const ownerSession = {
       sessionId: fixture.contexts.owner.sessionId,

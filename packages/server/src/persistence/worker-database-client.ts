@@ -110,7 +110,7 @@ export interface CreateWorkerDatabaseClientOptions {
 }
 
 export interface AuthoritySchemaInspection {
-  readonly version: 20;
+  readonly version: 21;
 }
 
 export interface WorkerDatabaseClient {

@@ -37,6 +37,16 @@ function installFixture(database: DatabaseSync): void {
       agent_actor_id TEXT NOT NULL, revision INTEGER NOT NULL, status TEXT NOT NULL,
       participation TEXT NOT NULL, paused INTEGER NOT NULL
     ) STRICT;
+    CREATE TABLE agent_profile_revisions (
+      profile_id TEXT NOT NULL, revision INTEGER NOT NULL, actor_id TEXT NOT NULL,
+      PRIMARY KEY (profile_id, revision)
+    ) STRICT;
+    CREATE TABLE room_agent_assignment_revisions (
+      assignment_id TEXT NOT NULL, revision INTEGER NOT NULL, room_id TEXT NOT NULL,
+      profile_id TEXT NOT NULL, agent_actor_id TEXT NOT NULL,
+      participation TEXT NOT NULL,
+      PRIMARY KEY (assignment_id, revision)
+    ) STRICT;
     CREATE TABLE messages (
       id TEXT PRIMARY KEY, room_id TEXT NOT NULL, author_id TEXT NOT NULL,
       author_kind TEXT NOT NULL
@@ -63,6 +73,11 @@ function installFixture(database: DatabaseSync): void {
       claimed_at TEXT, cancelled_at TEXT, cancellation_reason TEXT,
       supersedes_intent_id TEXT,
       UNIQUE (message_transaction_id, target_id)
+    ) STRICT;
+    CREATE TABLE direct_agent_invocation_authority_bindings (
+      intent_id TEXT PRIMARY KEY, profile_id TEXT NOT NULL,
+      profile_revision INTEGER NOT NULL, assignment_id TEXT NOT NULL,
+      assignment_revision INTEGER NOT NULL, access_revision INTEGER NOT NULL
     ) STRICT;
     CREATE TABLE route_jobs (
       id TEXT PRIMARY KEY, room_id TEXT NOT NULL, source_message_id TEXT NOT NULL,
@@ -114,6 +129,11 @@ function installFixture(database: DatabaseSync): void {
     INSERT INTO room_agent_assignments VALUES
       ('assignment-a', 'room-1', 'profile-a', 'agent-a', 11, 'current', 'active', 0),
       ('assignment-b', 'room-1', 'profile-b', 'agent-b', 12, 'current', 'active', 0);
+    INSERT INTO agent_profile_revisions VALUES
+      ('profile-a', 7, 'agent-a'), ('profile-b', 8, 'agent-b');
+    INSERT INTO room_agent_assignment_revisions VALUES
+      ('assignment-a', 11, 'room-1', 'profile-a', 'agent-a', 'active'),
+      ('assignment-b', 12, 'room-1', 'profile-b', 'agent-b', 'active');
     INSERT INTO messages VALUES ('message-1', 'room-1', 'human-1', 'human');
     INSERT INTO message_revisions VALUES ('message-1', 1);
     INSERT INTO message_envelopes VALUES
@@ -184,6 +204,15 @@ describe("durable trusted intent Authority transaction", () => {
     expect(database.prepare(
       "SELECT status, origin_kind AS originKind, target_id AS targetId FROM agent_invocation_intents",
     ).get()).toEqual({ status: "pending", originKind: "message_target", targetId: "target-a" });
+    expect(database.prepare(
+      `SELECT profile_id AS profileId, profile_revision AS profileRevision,
+              assignment_id AS assignmentId, assignment_revision AS assignmentRevision,
+              access_revision AS accessRevision
+       FROM direct_agent_invocation_authority_bindings`,
+    ).get()).toEqual({
+      profileId: "profile-a", profileRevision: 7,
+      assignmentId: "assignment-a", assignmentRevision: 11, accessRevision: 5,
+    });
   });
 
   it("rejects structural origin forgery and cross-Room probing without writing", () => {
@@ -262,6 +291,29 @@ describe("durable trusted intent Authority transaction", () => {
     expect(() => transact("room-1", (transaction) => createDirectInvocationIntent(transaction, {
       ...input, intentId: "different-id",
     }))).toThrowError(expect.objectContaining({ code: "idempotency_conflict" }));
+  });
+
+  it("replays the immutable direct binding after Profile rename and authority reduction", () => {
+    const origin = mintDirectInvocationOrigin({
+      kind: "message_target", roomId: "room-1", messageId: "message-1", messageRevision: 1,
+      targetOutcomeId: "target-a", targetActorId: "agent-a", profileId: "profile-a",
+      profileRevision: 7, assignmentId: "assignment-a", assignmentRevision: 11,
+      accessRevision: 5,
+    });
+    const input = { origin, intentId: "direct-race", requesterActorId: "human-1",
+      lineageId: "lineage-race", turnId: "turn-race", createdAt: NOW } as const;
+    const created = transact("room-1", (transaction) =>
+      createDirectInvocationIntent(transaction, input));
+    database.exec(`
+      UPDATE agent_profiles SET revision = 8, status = 'disabled' WHERE id = 'profile-a';
+      UPDATE room_agent_assignments
+      SET revision = 12, status = 'removed', paused = 1 WHERE id = 'assignment-a';
+      UPDATE room_memberships SET access_revision = 6 WHERE room_id = 'room-1' AND actor_id = 'agent-a';
+    `);
+    const replayed = transact("room-1", (transaction) =>
+      createDirectInvocationIntent(transaction, input));
+    expect(replayed.disposition).toBe("already-created");
+    expect(replayed.binding).toEqual(created.binding);
   });
 
   it("reads pending routed intents in stable bounded Room-local order", () => {
