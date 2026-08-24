@@ -107,6 +107,10 @@ function positiveRevision(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
+function accessRevision(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
 function nullableRevision(value: unknown): value is number | null {
   return value === null || positiveRevision(value);
 }
@@ -125,7 +129,7 @@ function candidate(value: unknown): value is RouteCandidateSnapshotEntry {
   ])) return false;
   return text(value.actorId) && text(value.profileId) && positiveRevision(value.profileRevision) &&
     text(value.assignmentId) && positiveRevision(value.assignmentRevision) &&
-    positiveRevision(value.accessRevision) &&
+    accessRevision(value.accessRevision) &&
     (value.participation === "active" || value.participation === "on-mention") &&
     (value.availability === "ready" || value.availability === "busy" ||
       value.availability === "paused" || value.availability === "noauth") &&
@@ -142,7 +146,7 @@ export function isRouteProviderSelection(value: unknown): value is RouteProvider
   return record(value) && exact(value, [
     "actorId", "profileRevision", "assignmentRevision", "accessRevision", "trigger", "reasonText",
   ]) && text(value.actorId) && positiveRevision(value.profileRevision) &&
-    positiveRevision(value.assignmentRevision) && positiveRevision(value.accessRevision) &&
+    positiveRevision(value.assignmentRevision) && accessRevision(value.accessRevision) &&
     (value.trigger === "domain" || value.trigger === "risk" || value.trigger === "ball") &&
     text(value.reasonText) && value.reasonText.length <= 2_000;
 }

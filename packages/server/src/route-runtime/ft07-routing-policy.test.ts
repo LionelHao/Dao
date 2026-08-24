@@ -106,6 +106,18 @@ describe("FT-07 RouteCandidateSnapshot", () => {
     expect(names.get("agent-active")).toBe("After rename");
     expect(after).toEqual(before);
   });
+
+  it("accepts the schema-defined initial access revision zero", () => {
+    const zeroSnapshot = {
+      ...snapshot,
+      candidates: [{ ...snapshot.candidates[0], accessRevision: 0 }],
+    };
+    const zeroSelection = { ...activeSelection, accessRevision: 0 };
+    expect(isRouteCandidateSnapshot(zeroSnapshot)).toBe(true);
+    expect(isRouteProviderSelection(zeroSelection)).toBe(true);
+    expect(evaluateTrustedRouteSelections(zeroSnapshot, facts, [zeroSelection]).intents[0])
+      .toMatchObject({ accessRevision: 0 });
+  });
 });
 
 describe("FT-07 trusted route selection policy", () => {

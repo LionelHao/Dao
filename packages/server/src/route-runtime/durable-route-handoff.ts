@@ -60,6 +60,10 @@ function revision(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
+function accessRevision(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
 function time(value: unknown): value is string {
   return text(value) && Number.isFinite(Date.parse(value));
 }
@@ -70,7 +74,7 @@ function intent(value: unknown): value is RouteHandoffIntentInput {
     "assignmentRevision", "accessRevision", "trigger", "reasonText",
   ]) && text(value.intentId) && text(value.actorId) && text(value.profileId) &&
     revision(value.profileRevision) && text(value.assignmentId) &&
-    revision(value.assignmentRevision) && revision(value.accessRevision) &&
+    revision(value.assignmentRevision) && accessRevision(value.accessRevision) &&
     (value.trigger === "domain" || value.trigger === "risk" || value.trigger === "ball") &&
     text(value.reasonText) && value.reasonText.length <= 2_000;
 }

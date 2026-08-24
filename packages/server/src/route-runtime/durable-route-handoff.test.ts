@@ -123,6 +123,15 @@ describe("route decision to durable intent handoff", () => {
     expect(fixture.records.size).toBe(1);
   });
 
+  it("preserves the schema-defined initial access revision zero", () => {
+    const zeroTarget = { ...routeTarget, accessRevision: 0 };
+    const zeroIntent = { ...intent, accessRevision: 0 };
+    const operation = createRouteDurableIntentOperation(
+      origin([zeroTarget]), [zeroIntent], "2026-08-24T00:00:00.000Z",
+    );
+    expect(isRouteDurableIntentOperation(operation)).toBe(true);
+  });
+
   it("binds every atomic multi-target intent to the decision-wide authority", () => {
     const secondTarget = {
       actorId: "agent-2", profileId: "profile-2", profileRevision: 7,

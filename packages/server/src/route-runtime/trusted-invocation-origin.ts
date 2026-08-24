@@ -13,6 +13,8 @@ interface TargetBoundTrustedOriginBase {
 
 export interface DirectInvocationOrigin extends TargetBoundTrustedOriginBase {
   readonly kind: "message_target";
+  readonly profileId: string;
+  readonly assignmentId: string;
   readonly messageId: string;
   readonly messageRevision: number;
   readonly targetOutcomeId: string;
@@ -58,13 +60,22 @@ function text(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+function exact(value: object, keys: readonly string[]): boolean {
+  return Object.keys(value).length === keys.length && keys.every((key) =>
+    Object.hasOwn(value, key));
+}
+
 function revision(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
+function accessRevision(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
 function common(input: Omit<TargetBoundTrustedOriginBase, typeof trustedInvocationOriginBrand>): void {
   if (!text(input.roomId) || !text(input.targetActorId) || !revision(input.profileRevision) ||
-      !revision(input.assignmentRevision) || !revision(input.accessRevision)) {
+      !revision(input.assignmentRevision) || !accessRevision(input.accessRevision)) {
     throw new TypeError("Trusted invocation origin binding is invalid");
   }
 }
@@ -76,8 +87,13 @@ function mint<T extends object>(value: T): T {
 }
 
 export function mintDirectInvocationOrigin(input: DirectInput): DirectInvocationOrigin {
+  if (!exact(input, [
+    "kind", "roomId", "targetActorId", "profileId", "profileRevision", "assignmentId",
+    "assignmentRevision", "accessRevision", "messageId", "messageRevision", "targetOutcomeId",
+  ])) throw new TypeError("Direct invocation evidence is invalid");
   common(input);
-  if (input.kind !== "message_target" || !text(input.messageId) ||
+  if (input.kind !== "message_target" || !text(input.profileId) || !text(input.assignmentId) ||
+      !text(input.messageId) ||
       !revision(input.messageRevision) || !text(input.targetOutcomeId)) {
     throw new TypeError("Direct invocation evidence is invalid");
   }
@@ -85,12 +101,17 @@ export function mintDirectInvocationOrigin(input: DirectInput): DirectInvocation
 }
 
 export function mintRouteDecisionOrigin(input: RouteInput): RouteDecisionOrigin {
-  if (input.kind !== "route_decision" || !text(input.roomId) || !text(input.routeJobId) ||
+  if (!exact(input, [
+    "kind", "roomId", "routeJobId", "routeJobRevision", "snapshotId", "decisionId", "targets",
+  ]) || input.kind !== "route_decision" || !text(input.roomId) || !text(input.routeJobId) ||
       !revision(input.routeJobRevision) || !text(input.snapshotId) || !text(input.decisionId) ||
       !Array.isArray(input.targets) || input.targets.length > 256 ||
-      !input.targets.every((target) => text(target.actorId) && text(target.profileId) &&
+      !input.targets.every((target) => exact(target, [
+        "actorId", "profileId", "profileRevision", "assignmentId", "assignmentRevision",
+        "accessRevision",
+      ]) && text(target.actorId) && text(target.profileId) &&
         revision(target.profileRevision) && text(target.assignmentId) &&
-        revision(target.assignmentRevision) && revision(target.accessRevision)) ||
+        revision(target.assignmentRevision) && accessRevision(target.accessRevision)) ||
       new Set(input.targets.map((target) => target.actorId)).size !== input.targets.length ||
       !input.targets.every((target, index) =>
         index === 0 || input.targets[index - 1]!.actorId.localeCompare(target.actorId) < 0)) {
@@ -103,6 +124,10 @@ export function mintRouteDecisionOrigin(input: RouteInput): RouteDecisionOrigin 
 }
 
 export function mintProjectBoundaryOrigin(input: ProjectInput): ProjectBoundaryOrigin {
+  if (!exact(input, [
+    "kind", "roomId", "targetActorId", "profileRevision", "assignmentRevision",
+    "accessRevision", "projectFactKind", "projectFactId", "projectFactRevision",
+  ])) throw new TypeError("Project boundary evidence is invalid");
   common(input);
   if (input.kind !== "project_boundary" ||
       (input.projectFactKind !== "checkpoint" && input.projectFactKind !== "due" &&

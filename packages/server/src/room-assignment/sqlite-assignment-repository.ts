@@ -390,7 +390,7 @@ function createRepository(database: DatabaseSync): RoomAssignmentRepository {
                 (SELECT COUNT(*) FROM agent_executions AS execution
                  WHERE execution.room_id = assignment.room_id
                    AND execution.agent_id = assignment.agent_actor_id
-                   AND execution.status = 'running') AS runningExecutionCount
+                   AND execution.status IN ('queued', 'running')) AS runningExecutionCount
          FROM room_agent_assignments AS assignment
          JOIN agent_profiles AS profile ON profile.id = assignment.profile_id
          JOIN rooms AS room ON room.id = assignment.room_id

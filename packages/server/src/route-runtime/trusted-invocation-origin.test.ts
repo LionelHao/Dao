@@ -27,6 +27,8 @@ describe("server-private trusted invocation origins", () => {
   it("mints the three closed origins from authority evidence", () => {
     const direct = mintDirectInvocationOrigin({
       ...binding,
+      profileId: "profile-1",
+      assignmentId: "assignment-1",
       kind: "message_target",
       messageId: "message-1",
       messageRevision: 1,
@@ -66,6 +68,35 @@ describe("server-private trusted invocation origins", () => {
     expect(isTrustedInvocationOrigin({ ...origin })).toBe(false);
     expect(isTrustedInvocationOrigin(JSON.parse(JSON.stringify(origin)))).toBe(false);
     expect(isTrustedInvocationOrigin(structuredClone(origin))).toBe(false);
+    expect(() => mintDirectInvocationOrigin({
+      ...binding,
+      profileId: "profile-1",
+      assignmentId: "assignment-1",
+      kind: "message_target",
+      messageId: "message-1",
+      messageRevision: 1,
+      targetOutcomeId: "outcome-1",
+      clientToken: "not-authority",
+    } as Parameters<typeof mintDirectInvocationOrigin>[0])).toThrow("evidence is invalid");
+  });
+
+  it("accepts the schema-defined initial access revision zero", () => {
+    const direct = mintDirectInvocationOrigin({
+      ...binding,
+      profileId: "profile-1",
+      assignmentId: "assignment-1",
+      accessRevision: 0,
+      kind: "message_target",
+      messageId: "message-1",
+      messageRevision: 1,
+      targetOutcomeId: "outcome-1",
+    });
+    const routed = mintRouteDecisionOrigin({
+      kind: "route_decision", roomId: "room-1", routeJobId: "route-1",
+      routeJobRevision: 2, snapshotId: "snapshot-1", decisionId: "decision-1",
+      targets: [{ ...routeTarget, accessRevision: 0 }],
+    });
+    expect([direct, routed].every(isTrustedInvocationOrigin)).toBe(true);
   });
 
   it("rejects incomplete or unknown authority evidence", () => {
