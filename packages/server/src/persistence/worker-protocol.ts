@@ -101,6 +101,12 @@ import {
   isContextSnapshotAuthorityOperation,
   type ContextSnapshotAuthorityOperation,
 } from "./context-snapshot-database-authority.js";
+import {
+  isTenantAdministrationOperation,
+  isTenantAdministrationResult,
+  type TenantAdministrationOperation,
+  type TenantAdministrationResult,
+} from "../tenant-administration/authority-protocol.js";
 
 export type ContextWorkerOperation = ContextSnapshotAuthorityOperation | {
   readonly type: "context.finalize-agent-message";
@@ -119,12 +125,17 @@ export type AuthorityWorkerErrorCode =
   | "agent_queue_full"
   | "agent_permissions_invalid"
   | "agent_required"
+  | "administrator_required"
+  | "administrator_already_exists"
+  | "administrator_not_found"
   | "authority_already_initialized"
   | "authority_not_initialized"
   | "authority_operation_unavailable"
   | "authority_storage_poisoned"
   | "authority_storage_transient"
   | "authority_worker_closed"
+  | "bootstrap_conflict"
+  | "credential_mutation_unsupported"
   | "unauthenticated"
   | "invalid_chunk"
   | "attachment_forbidden"
@@ -175,6 +186,7 @@ export type AuthorityWorkerErrorCode =
   | "invitee_required"
   | "legacy_import_failed"
   | "legacy_import_unavailable"
+  | "last_administrator_required"
   | "grant_revoked"
   | "light_task_not_found"
   | "member_not_found"
@@ -205,6 +217,10 @@ export type AuthorityWorkerErrorCode =
   | "repair_barrier_active"
   | "route_conflict"
   | "route_job_not_found"
+  | "profile_not_found"
+  | "profile_state_conflict"
+  | "provider_configuration_unavailable"
+  | "revision_conflict"
   | "session_revoked"
   | "session_not_found"
   | "session_id_conflict"
@@ -228,12 +244,17 @@ export function isAuthorityWorkerErrorCode(
     case "agent_queue_full":
     case "agent_permissions_invalid":
     case "agent_required":
+    case "administrator_required":
+    case "administrator_already_exists":
+    case "administrator_not_found":
     case "authority_already_initialized":
     case "authority_not_initialized":
     case "authority_operation_unavailable":
     case "authority_storage_poisoned":
     case "authority_storage_transient":
     case "authority_worker_closed":
+    case "bootstrap_conflict":
+    case "credential_mutation_unsupported":
     case "unauthenticated":
     case "invalid_chunk":
     case "attachment_forbidden":
@@ -284,6 +305,7 @@ export function isAuthorityWorkerErrorCode(
     case "invitee_required":
     case "legacy_import_failed":
     case "legacy_import_unavailable":
+    case "last_administrator_required":
     case "grant_revoked":
     case "light_task_not_found":
     case "member_not_found":
@@ -314,6 +336,10 @@ export function isAuthorityWorkerErrorCode(
     case "repair_barrier_active":
     case "route_conflict":
     case "route_job_not_found":
+    case "profile_not_found":
+    case "profile_state_conflict":
+    case "provider_configuration_unavailable":
+    case "revision_conflict":
     case "session_revoked":
     case "session_not_found":
     case "session_id_conflict":
@@ -431,6 +457,11 @@ export type AuthorityWorkerRequest =
       readonly requestId: string;
       readonly operation: AttachmentDatabaseOperation;
       readonly now: number;
+    }
+  | {
+      readonly type: "authority.tenant-administration";
+      readonly requestId: string;
+      readonly operation: TenantAdministrationOperation;
     }
   | {
       readonly type: "authority.message-submit";
@@ -706,6 +737,11 @@ export type AuthorityWorkerResponse =
       readonly type: "authority.attachment-result";
       readonly requestId: string;
       readonly result: AttachmentDatabaseOperationResult;
+    }
+  | {
+      readonly type: "authority.tenant-administration-result";
+      readonly requestId: string;
+      readonly result: TenantAdministrationResult;
     }
   | {
       readonly type: "authority.message-submitted";
@@ -1545,6 +1581,9 @@ export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWork
     case "authority.attachment":
       return hasExactKeys(value, ["type", "requestId", "operation", "now"]) &&
         isAttachmentDatabaseOperation(value.operation) && isNonNegativeSafeInteger(value.now);
+    case "authority.tenant-administration":
+      return hasExactKeys(value, ["type", "requestId", "operation"]) &&
+        isTenantAdministrationOperation(value.operation);
     case "authority.message-submit":
       return hasExactKeys(value, ["type", "requestId", "context", "message", "now"]) &&
         isAuthenticatedCommandContext(value.context) && isHumanMessageSubmit(value.message) &&
@@ -1729,6 +1768,9 @@ export function isAuthorityWorkerResponse(
     case "authority.attachment-result":
       return hasExactKeys(value, ["type", "requestId", "result"]) &&
         isAttachmentDatabaseOperationResult(value.result);
+    case "authority.tenant-administration-result":
+      return hasExactKeys(value, ["type", "requestId", "result"]) &&
+        isTenantAdministrationResult(value.result);
     case "authority.message-submitted":
       return hasExactKeys(value, ["type", "requestId", "receipt"]) &&
         isSubmissionReceipt(value.receipt);

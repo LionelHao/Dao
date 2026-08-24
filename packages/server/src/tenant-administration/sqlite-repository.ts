@@ -1,7 +1,9 @@
+import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { AuthenticatedSessionContext } from "../persistence/contracts.js";
 import type {
   DeploymentAuditRecord,
+  DeploymentProfileMutationRecord,
   GlobalAgentProfile,
   PrincipalKind,
   StoredReplay,
@@ -138,6 +140,127 @@ function exactContextRow(
 
 function sameSet(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function deploymentProfileProjection(record: DeploymentProfileMutationRecord): string {
+  const { profile } = record;
+  return JSON.stringify({
+    schemaVersion: 1,
+    profileId: profile.profileId,
+    actorId: profile.actorId,
+    displayName: profile.displayName,
+    globalResponsibility: profile.globalResponsibility,
+    status: profile.status,
+    capabilityCeiling: profile.capabilityCeiling,
+    toolCeiling: profile.toolCeiling,
+    revision: profile.revision,
+    createdAt: profile.createdAt,
+    updatedAt: profile.updatedAt,
+  });
+}
+
+function appendDeploymentProfileMutation(
+  database: DatabaseSync,
+  record: DeploymentProfileMutationRecord,
+): void {
+  const { profile } = record;
+  let invalidatedContextCount = 0;
+  let cancelledRouteIntentCount = 0;
+  let affectedAssignmentCount = 0;
+  if (record.previousRevision !== null) {
+    const assignmentRow = database.prepare(
+      `SELECT COUNT(*) AS count FROM room_agent_assignments
+       WHERE profile_id = ? AND status = 'current'`,
+    ).get(profile.profileId) as { readonly count?: unknown } | undefined;
+    if (typeof assignmentRow?.count !== "number" || !Number.isSafeInteger(assignmentRow.count) ||
+        assignmentRow.count < 0) {
+      throw new Error("Profile Assignment impact is corrupt");
+    }
+    affectedAssignmentCount = assignmentRow.count;
+    invalidatedContextCount = Number(database.prepare(
+      `UPDATE context_snapshots
+       SET state = 'invalidated', snapshot_generation = snapshot_generation + 1,
+           invalidated_at = ?, invalidation_reason = 'authorization_changed'
+       WHERE agent_id = ? AND state = 'active'`,
+    ).run(record.occurredAt, profile.actorId).changes);
+    cancelledRouteIntentCount = Number(database.prepare(
+      `UPDATE routed_agent_invocation_intents
+       SET status = 'cancelled', cancelled_at = ?,
+           cancellation_reason = 'profile_revision_changed'
+       WHERE profile_id = ? AND profile_revision = ? AND status = 'pending'`,
+    ).run(record.occurredAt, profile.profileId, record.previousRevision).changes);
+    const reason = record.eventKind === "profile.updated" ? "profile_updated"
+      : record.eventKind === "profile.disabled" ? "profile_disabled" : "profile_enabled";
+    database.prepare(
+      `INSERT INTO agent_profile_invalidation_facts (
+         invalidation_id, profile_id, from_revision, to_revision, reason,
+         invalidated_context_count, cancelled_route_intent_count,
+         affected_assignment_count, occurred_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(`profile-invalidation-${sha256(record.eventId)}`, profile.profileId,
+      record.previousRevision, profile.revision, reason, invalidatedContextCount,
+      cancelledRouteIntentCount, affectedAssignmentCount, record.occurredAt);
+  }
+
+  const stream = database.prepare(
+    `UPDATE deployment_stream SET head_seq = head_seq + 1
+     WHERE singleton_id = 1 RETURNING head_seq AS streamSeq`,
+  ).get() as { readonly streamSeq?: unknown } | undefined;
+  if (typeof stream?.streamSeq !== "number" || !positiveInteger(stream.streamSeq)) {
+    throw new Error("Deployment Profile stream is unavailable");
+  }
+  const projectionJson = deploymentProfileProjection(record);
+  const payloadJson = JSON.stringify({
+    schemaVersion: 1,
+    eventId: record.eventId,
+    eventKind: record.eventKind,
+    occurredAt: record.occurredAt,
+    profile: JSON.parse(projectionJson) as unknown,
+  });
+  database.prepare(
+    `INSERT INTO deployment_agent_profile_events (
+       event_id, stream_seq, profile_id, profile_revision, actor_id, event_kind,
+       occurred_at, payload_json, payload_sha256
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(record.eventId, stream.streamSeq, profile.profileId, profile.revision,
+    profile.actorId, record.eventKind, record.occurredAt, payloadJson, sha256(payloadJson));
+  database.prepare(
+    `INSERT INTO deployment_agent_profile_repair_records (
+       profile_id, profile_revision, record_version, event_id, stream_seq,
+       projection_json, projection_sha256, updated_at
+     ) VALUES (?, ?, 1, ?, ?, ?, ?, ?)
+     ON CONFLICT(profile_id) DO UPDATE SET
+       profile_revision = excluded.profile_revision,
+       event_id = excluded.event_id,
+       stream_seq = excluded.stream_seq,
+       projection_json = excluded.projection_json,
+       projection_sha256 = excluded.projection_sha256,
+       updated_at = excluded.updated_at`,
+  ).run(profile.profileId, profile.revision, record.eventId, stream.streamSeq,
+    projectionJson, sha256(projectionJson), record.occurredAt);
+  const administrators = database.prepare(
+    `SELECT human_actor_id AS principalId FROM tenant_administrators
+     WHERE status = 'active' ORDER BY human_actor_id`,
+  ).all() as unknown as readonly { readonly principalId?: unknown }[];
+  for (const administrator of administrators) {
+    if (!nonEmpty(administrator.principalId)) {
+      throw new Error("Deployment Profile outbox recipient is corrupt");
+    }
+    const outboxId = `deployment-profile-outbox-${sha256(
+      `${record.eventId}\0${administrator.principalId}`,
+    )}`;
+    database.prepare(
+      `INSERT INTO deployment_profile_outbox (
+         id, event_id, recipient_human_actor_id, stream_seq, status, attempts,
+         available_at, delivered_at, last_error
+       ) VALUES (?, ?, ?, ?, 'pending', 0, ?, NULL, NULL)`,
+    ).run(outboxId, record.eventId, administrator.principalId,
+      stream.streamSeq, record.occurredAt);
+  }
 }
 
 export function createSqliteTenantAdministrationRepository(
@@ -312,6 +435,12 @@ export function createSqliteTenantAdministrationRepository(
             ).run(profile.profileId, profile.revision, profile.actorId, profile.displayName,
               profile.globalResponsibility, profile.status, capabilityJson, toolJson,
               currentSession.principal.actorId, profile.updatedAt, operationKind);
+          },
+          appendProfileMutation(record) {
+            if (currentSession === undefined) {
+              throw new Error("Profile event requires current session");
+            }
+            appendDeploymentProfileMutation(database, record);
           },
           readReplay(key): StoredReplay | undefined {
             const separator = key.indexOf("\0");

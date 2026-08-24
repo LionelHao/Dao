@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import type { AuthenticatedSessionContext } from "../persistence/contracts.js";
 
 const MAX_ID_BYTES = 128;
-const MAX_DISPLAY_NAME_BYTES = 128;
-const MAX_RESPONSIBILITY_BYTES = 4_096;
+const MAX_DISPLAY_NAME_BYTES = 120;
+const MAX_RESPONSIBILITY_BYTES = 4_000;
 const MAX_CONFIGURATION_DIGEST_BYTES = 256;
 
 export type PrincipalKind = "human" | "agent";
@@ -61,6 +61,21 @@ export interface StoredReplay {
   readonly result: unknown;
 }
 
+export type DeploymentProfileEventKind =
+  | "profile.created"
+  | "profile.updated"
+  | "profile.enabled"
+  | "profile.disabled";
+
+/** Server-private deployment fact. Its closed shape cannot carry Room or credential data. */
+export interface DeploymentProfileMutationRecord {
+  readonly eventId: string;
+  readonly eventKind: DeploymentProfileEventKind;
+  readonly profile: GlobalAgentProfile;
+  readonly previousRevision: number | null;
+  readonly occurredAt: string;
+}
+
 /**
  * Private transaction seam for the single Authority SQLite writer.
  *
@@ -76,6 +91,7 @@ export interface TenantAdministrationTransaction {
   listProfiles(): readonly GlobalAgentProfile[];
   createAgentActor(actorId: string, displayName: string): void;
   writeProfile(profile: GlobalAgentProfile): void;
+  appendProfileMutation(record: DeploymentProfileMutationRecord): void;
   readReplay(key: string): StoredReplay | undefined;
   writeReplay(key: string, fingerprint: string, result: unknown): void;
   appendAudit(record: DeploymentAuditRecord): void;
@@ -129,6 +145,7 @@ export interface TenantAdministrationAuthorityOptions {
   readonly profileIdFactory: () => string;
   readonly actorIdFactory: () => string;
   readonly auditIdFactory: () => string;
+  readonly profileEventIdFactory: () => string;
 }
 
 export interface TenantCommandContext {
@@ -178,6 +195,11 @@ export interface TenantAdministrationAuthority {
     readonly profiles: readonly GlobalAgentProfile[];
     readonly provider: DeploymentProviderDisclosure;
   }>;
+  getProfile(accessToken: string, profileId: string): Promise<{
+    readonly profile: GlobalAgentProfile;
+    readonly provider: DeploymentProviderDisclosure;
+  }>;
+  discloseProvider(accessToken: string): Promise<DeploymentProviderDisclosure>;
   createProfile(context: TenantCommandContext, command: CreateGlobalProfileCommand):
     Promise<{ readonly profile: GlobalAgentProfile }>;
   updateProfile(context: TenantCommandContext, command: UpdateGlobalProfileCommand):
@@ -310,6 +332,22 @@ function immutableAudit(
   });
 }
 
+function profileMutation(
+  options: TenantAdministrationAuthorityOptions,
+  eventKind: DeploymentProfileEventKind,
+  profile: GlobalAgentProfile,
+  previousRevision: number | null,
+  occurredAt: string,
+): DeploymentProfileMutationRecord {
+  return Object.freeze({
+    eventId: options.profileEventIdFactory(),
+    eventKind,
+    profile,
+    previousRevision,
+    occurredAt,
+  });
+}
+
 export function createTenantAdministrationAuthority(
   options: TenantAdministrationAuthorityOptions,
 ): TenantAdministrationAuthority {
@@ -322,6 +360,10 @@ export function createTenantAdministrationAuthority(
     throw new TypeError("Tenant administration registries must be closed and unique");
   }
   const clock = options.clock ?? (() => new Date().toISOString());
+
+  function requireProvider(): void {
+    freezeProvider(options.providerDisclosure());
+  }
 
   async function authenticated<TResult>(
     accessToken: string,
@@ -409,6 +451,7 @@ export function createTenantAdministrationAuthority(
   ): Promise<{ readonly profile: GlobalAgentProfile }> {
     return idempotent(`profile.${action}`, context, command,
       (transaction, session, _registry, occurredAt) => {
+        requireProvider();
         if (!validText(command.profileId, MAX_ID_BYTES) ||
             !validPositiveRevision(command.expectedRevision)) {
           throw new TenantAdministrationError(400, "invalid_profile");
@@ -428,6 +471,8 @@ export function createTenantAdministrationAuthority(
         transaction.appendAudit(immutableAudit(options, `profile.${action}`,
           session.principal.actorId, profile.profileId, profile.revision,
           context.requestId, occurredAt));
+        transaction.appendProfileMutation(profileMutation(options, `profile.${action}d`,
+          profile, current.revision, occurredAt));
         return Object.freeze({ profile });
       });
   }
@@ -486,9 +531,28 @@ export function createTenantAdministrationAuthority(
       }));
     },
 
+    getProfile(accessToken, profileId) {
+      if (!validText(profileId, MAX_ID_BYTES)) {
+        return Promise.reject(new TenantAdministrationError(400, "invalid_profile"));
+      }
+      return authenticated(accessToken, (transaction) => {
+        const profile = transaction.readProfile(profileId);
+        if (profile === undefined) throw new TenantAdministrationError(404, "profile_not_found");
+        return Object.freeze({
+          profile: freezeProfile(profile),
+          provider: freezeProvider(options.providerDisclosure()),
+        });
+      });
+    },
+
+    discloseProvider(accessToken) {
+      return authenticated(accessToken, () => freezeProvider(options.providerDisclosure()));
+    },
+
     createProfile(context, command) {
       return idempotent("profile.create", context, command,
         (transaction, session, _registry, occurredAt) => {
+          requireProvider();
           if (command.expectedRevision !== 0) {
             throw new TenantAdministrationError(409, "revision_conflict");
           }
@@ -509,6 +573,8 @@ export function createTenantAdministrationAuthority(
           transaction.appendAudit(immutableAudit(options, "profile.create",
             session.principal.actorId, profile.profileId, profile.revision,
             context.requestId, occurredAt));
+          transaction.appendProfileMutation(profileMutation(options, "profile.created",
+            profile, null, occurredAt));
           return Object.freeze({ profile });
         });
     },
@@ -516,6 +582,7 @@ export function createTenantAdministrationAuthority(
     updateProfile(context, command) {
       return idempotent("profile.update", context, command,
         (transaction, session, _registry, occurredAt) => {
+          requireProvider();
           if (!validText(command.profileId, MAX_ID_BYTES) ||
               !validPositiveRevision(command.expectedRevision)) {
             throw new TenantAdministrationError(400, "invalid_profile");
@@ -534,6 +601,8 @@ export function createTenantAdministrationAuthority(
           transaction.appendAudit(immutableAudit(options, "profile.update",
             session.principal.actorId, profile.profileId, profile.revision,
             context.requestId, occurredAt));
+          transaction.appendProfileMutation(profileMutation(options, "profile.updated",
+            profile, current.revision, occurredAt));
           return Object.freeze({ profile });
         });
     },

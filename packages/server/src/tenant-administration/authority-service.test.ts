@@ -4,6 +4,7 @@ import {
   createTenantAdministrationAuthority,
   TenantAdministrationError,
   type DeploymentAuditRecord,
+  type DeploymentProfileMutationRecord,
   type GlobalAgentProfile,
   type TenantAdministrationTransaction,
   type TenantAdministratorRegistry,
@@ -19,6 +20,7 @@ interface TestState {
   readonly profiles: Map<string, GlobalAgentProfile>;
   readonly actors: Map<string, "human" | "agent">;
   readonly audits: DeploymentAuditRecord[];
+  readonly profileMutations: DeploymentProfileMutationRecord[];
   readonly replay: Map<string, { fingerprint: string; result: unknown }>;
 }
 
@@ -35,7 +37,7 @@ function fixture() {
       ["agent-existing", "agent"],
     ]),
     currentSessions: new Set(["session-owner", "session-admin", "session-member", "session-agent"]),
-    profiles: new Map(), actors: new Map(), audits: [], replay: new Map(),
+    profiles: new Map(), actors: new Map(), audits: [], profileMutations: [], replay: new Map(),
   };
   const principals = new Map([
     ["owner-token", { sessionId: "session-owner", sessionFamilyId: "family-owner",
@@ -61,6 +63,7 @@ function fixture() {
         const snapshot = clone({
           registry: state.registry,
           profiles: [...state.profiles], actors: [...state.actors], audits: state.audits,
+          profileMutations: state.profileMutations,
           replay: [...state.replay],
         });
         const transaction: TenantAdministrationTransaction = {
@@ -79,6 +82,7 @@ function fixture() {
             state.actors.set(actorId, "agent");
           },
           writeProfile(profile) { state.profiles.set(profile.profileId, clone(profile)); },
+          appendProfileMutation(record) { state.profileMutations.push(record); },
           readReplay(key) { return state.replay.get(key); },
           writeReplay(key, fingerprint, result) {
             state.replay.set(key, { fingerprint, result: clone(result) });
@@ -93,6 +97,8 @@ function fixture() {
           state.actors.clear(); for (const entry of snapshot.actors) state.actors.set(...entry);
           state.audits.splice(0, state.audits.length,
             ...snapshot.audits.map((record) => Object.freeze(record)));
+          state.profileMutations.splice(0, state.profileMutations.length,
+            ...snapshot.profileMutations.map((record) => Object.freeze(record)));
           state.replay.clear(); for (const entry of snapshot.replay) state.replay.set(...entry);
           throw error;
         }
@@ -107,6 +113,7 @@ function fixture() {
     profileIdFactory: () => `profile-${++id}`,
     actorIdFactory: () => `agent-${id}`,
     auditIdFactory: () => `audit-${id}-${state.audits.length + 1}`,
+    profileEventIdFactory: () => `event-${id}-${state.profileMutations.length + 1}`,
   });
   return { authority, state };
 }
@@ -222,6 +229,17 @@ describe("Global Agent Profile authority", () => {
       profileId: created.profile.profileId, expectedRevision: 3,
     });
     expect(enabled.profile).toMatchObject({ status: "enabled", revision: 4 });
+    expect(f.state.profileMutations.map(({ eventKind, previousRevision, profile }) => ({
+      eventKind, previousRevision, revision: profile.revision,
+    }))).toEqual([
+      { eventKind: "profile.created", previousRevision: null, revision: 1 },
+      { eventKind: "profile.updated", previousRevision: 1, revision: 2 },
+      { eventKind: "profile.disabled", previousRevision: 2, revision: 3 },
+      { eventKind: "profile.enabled", previousRevision: 3, revision: 4 },
+    ]);
+    expect(JSON.stringify(f.state.profileMutations)).not.toMatch(
+      /roomId|roomName|message|member|assignment|secret|credential|apiKey|authorization|token/i,
+    );
   });
 
   it("fails closed for unknown/noncanonical authority sets and idempotency-key payload changes", async () => {

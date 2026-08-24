@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type {
   AgentExecution,
@@ -148,6 +148,17 @@ import {
   coordinateMemberAccessRevocationInTransaction,
   MemberAccessRevocationError,
 } from "../room-governance/member-access-revocation-adapter.js";
+import {
+  createTenantAdministrationAuthority,
+  TenantAdministrationError,
+  type DeploymentProviderDisclosure,
+} from "../tenant-administration/authority-service.js";
+import { createSqliteTenantAdministrationRepository } from
+  "../tenant-administration/sqlite-repository.js";
+import type {
+  TenantAdministrationOperation,
+  TenantAdministrationResult,
+} from "../tenant-administration/authority-protocol.js";
 
 export class AuthorityDatabaseError extends Error {
   readonly details?: DepartureConflictList;
@@ -161,6 +172,185 @@ export class AuthorityDatabaseError extends Error {
     this.name = "AuthorityDatabaseError";
     if (details !== undefined) this.details = details;
   }
+}
+
+const AGENT_PROFILE_CAPABILITIES = [
+  "room.conversation.read", "room.memory.read", "room.project.read", "room.respond",
+] as const;
+const AGENT_PROFILE_TOOLS = [
+  "http-json.read", "repository.git-status", "room-memory.read", "sandbox-file.write",
+] as const;
+const TRUSTED_TENANT_AUTHORITY_TOKEN = "authority-worker-current-session";
+
+function isProviderIdentifier(value: unknown): value is string {
+  return typeof value === "string" && value.trim() === value && value.length > 0 &&
+    Buffer.byteLength(value, "utf8") <= 128;
+}
+
+export interface TenantAdministrationDatabaseOptions {
+  readonly provider?: DeploymentProviderDisclosure;
+  readonly profileIdFactory?: () => string;
+  readonly actorIdFactory?: () => string;
+  readonly auditIdFactory?: () => string;
+  readonly profileEventIdFactory?: () => string;
+}
+
+function tenantAdministrationError(error: unknown): never {
+  if (error instanceof TenantAdministrationError) {
+    const codes: Record<TenantAdministrationError["code"], AuthorityWorkerErrorCode> = {
+      invalid_bootstrap: "invalid_request",
+      bootstrap_conflict: "bootstrap_conflict",
+      human_principal_required: "identity_forbidden",
+      administrator_required: "administrator_required",
+      administrator_already_exists: "administrator_already_exists",
+      administrator_not_found: "administrator_not_found",
+      last_administrator_required: "last_administrator_required",
+      revision_conflict: "revision_conflict",
+      idempotency_conflict: "idempotency_conflict",
+      invalid_profile: "invalid_parameters",
+      profile_not_found: "profile_not_found",
+      profile_state_conflict: "profile_state_conflict",
+      credential_mutation_unsupported: "credential_mutation_unsupported",
+    };
+    throw new AuthorityDatabaseError(codes[error.code], error.message);
+  }
+  if (typeof error === "object" && error !== null) {
+    const code = Reflect.get(error, "code");
+    if (code === "session_revoked" || code === "idempotency_conflict") {
+      throw new AuthorityDatabaseError(code, `Tenant administration ${code}`);
+    }
+  }
+  throw error;
+}
+
+export async function executeTenantAdministrationAuthorityOperation(
+  database: DatabaseSync,
+  operation: TenantAdministrationOperation,
+  options: TenantAdministrationDatabaseOptions = {},
+): Promise<TenantAdministrationResult> {
+  let authenticatedContext: AuthenticatedSessionContext | undefined;
+  if ("context" in operation) authenticatedContext = operation.context;
+  const provider = options.provider;
+  function deploymentProvider(): DeploymentProviderDisclosure {
+    if (provider === undefined || !isProviderIdentifier(provider.providerId) ||
+        !isProviderIdentifier(provider.modelId) ||
+        (provider.credentialReadiness !== "ready" && provider.credentialReadiness !== "noauth")) {
+      throw new AuthorityDatabaseError(
+        "provider_configuration_unavailable",
+        "Deployment Provider configuration is unavailable",
+      );
+    }
+    return provider;
+  }
+  const authority = createTenantAdministrationAuthority({
+    sessions: {
+      async authenticateSession(accessToken) {
+        if (accessToken !== TRUSTED_TENANT_AUTHORITY_TOKEN || authenticatedContext === undefined) {
+          throw new AuthorityDatabaseError("unauthenticated", "Tenant administration is unauthenticated");
+        }
+        return authenticatedContext;
+      },
+    },
+    repository: createSqliteTenantAdministrationRepository({
+      database,
+      nowMs: () => operation.now,
+    }),
+    providerDisclosure() {
+      return deploymentProvider();
+    },
+    capabilities: AGENT_PROFILE_CAPABILITIES,
+    tools: AGENT_PROFILE_TOOLS,
+    clock: () => new Date(operation.now).toISOString(),
+    profileIdFactory: options.profileIdFactory ?? (() => `profile-${randomUUID()}`),
+    actorIdFactory: options.actorIdFactory ?? (() => `agent-${randomUUID()}`),
+    auditIdFactory: options.auditIdFactory ?? (() => `deployment-audit-${randomUUID()}`),
+    profileEventIdFactory: options.profileEventIdFactory ??
+      (() => `deployment-profile-event-${randomUUID()}`),
+  });
+  const token = TRUSTED_TENANT_AUTHORITY_TOKEN;
+  try {
+    switch (operation.type) {
+      case "tenant-administrator.bootstrap":
+        return { kind: "tenant-administrator-registry", registry:
+          await authority.bootstrapFromOwnerConfiguration({
+            principalIds: operation.principalIds,
+            configurationDigest: operation.configurationSha256,
+          }) };
+      case "tenant-administrator.list":
+        return { kind: "tenant-administrator-registry",
+          registry: await authority.listAdministrators(token) };
+      case "tenant-administrator.add":
+      case "tenant-administrator.remove": {
+        const mutation = operation.type === "tenant-administrator.add"
+          ? authority.addAdministrator.bind(authority)
+          : authority.removeAdministrator.bind(authority);
+        const result = await mutation({
+          accessToken: token,
+          requestId: operation.context.requestId,
+          idempotencyKey: operation.context.idempotencyKey,
+        }, { targetPrincipalId: operation.targetPrincipalId,
+          expectedRevision: operation.expectedRevision });
+        return { kind: "tenant-administrator-registry", registry: result.registry };
+      }
+      case "agent-profile.list": {
+        const result = await authority.queryProfiles(token);
+        return { kind: "agent-profiles", profiles: result.profiles, provider: result.provider };
+      }
+      case "agent-profile.get": {
+        const result = await authority.getProfile(token, operation.profileId);
+        return { kind: "agent-profile", profile: result.profile, provider: result.provider };
+      }
+      case "agent-profile.create": {
+        const result = await authority.createProfile({ accessToken: token,
+          requestId: operation.context.requestId,
+          idempotencyKey: operation.context.idempotencyKey }, {
+          expectedRevision: 0,
+          displayName: operation.displayName,
+          globalResponsibility: operation.globalResponsibility,
+          capabilityCeiling: operation.capabilityCeiling,
+          toolCeiling: operation.toolCeiling,
+        });
+        return { kind: "agent-profile", profile: result.profile,
+          provider: deploymentProvider() };
+      }
+      case "agent-profile.update": {
+        const result = await authority.updateProfile({ accessToken: token,
+          requestId: operation.context.requestId,
+          idempotencyKey: operation.context.idempotencyKey }, {
+          profileId: operation.profileId,
+          expectedRevision: operation.expectedRevision,
+          displayName: operation.displayName,
+          globalResponsibility: operation.globalResponsibility,
+          capabilityCeiling: operation.capabilityCeiling,
+          toolCeiling: operation.toolCeiling,
+        });
+        return { kind: "agent-profile", profile: result.profile,
+          provider: deploymentProvider() };
+      }
+      case "agent-profile.enable":
+      case "agent-profile.disable": {
+        const transition = operation.type === "agent-profile.enable"
+          ? authority.enableProfile.bind(authority) : authority.disableProfile.bind(authority);
+        const result = await transition({ accessToken: token,
+          requestId: operation.context.requestId,
+          idempotencyKey: operation.context.idempotencyKey }, {
+          profileId: operation.profileId, expectedRevision: operation.expectedRevision,
+        });
+        return { kind: "agent-profile", profile: result.profile,
+          provider: deploymentProvider() };
+      }
+      case "provider-configuration.disclose":
+        return { kind: "provider-configuration", provider: await authority.discloseProvider(token) };
+      case "provider-configuration.mutate":
+        await authority.rejectUnsupportedCredentialMutation(token, undefined);
+    }
+  } catch (error: unknown) {
+    tenantAdministrationError(error);
+  }
+  throw new AuthorityDatabaseError(
+    "authority_operation_unavailable",
+    "Tenant administration operation was not handled",
+  );
 }
 
 export interface SharedAuthorityParticipantComposition {
