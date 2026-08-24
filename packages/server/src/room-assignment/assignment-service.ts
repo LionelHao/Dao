@@ -12,9 +12,14 @@ import {
 } from "./assignment-policy.js";
 import {
   withSqliteRoomAssignmentRepository,
+  type AssignmentChangedProjection,
   type RoomAssignmentRepository,
   type SqliteAssignmentRecord,
 } from "./sqlite-assignment-repository.js";
+import {
+  requireAssignmentExpansionAllowedInTransaction,
+  requireAssignmentSecurityReductionAllowedInTransaction,
+} from "./assignment-security-reduction-participant.js";
 
 export type RoomAssignmentServiceErrorCode =
   | "unauthenticated"
@@ -39,8 +44,38 @@ export class RoomAssignmentServiceError extends Error {
 export interface RoomAssignmentCommandResult {
   readonly requestId: string;
   readonly changed: boolean;
+  readonly assignmentId: string;
+  readonly acceptedRevision: number;
   readonly roomRevision: number;
-  readonly assignment: SqliteAssignmentRecord;
+  readonly eventIds: readonly [string];
+}
+
+declare const assignmentProviderReadinessBrand: unique symbol;
+
+export interface AssignmentProviderReadiness {
+  readonly [assignmentProviderReadinessBrand]: true;
+  readonly actorId: string;
+  readonly providerAuthenticated: boolean;
+  readonly observedAt: string;
+}
+
+const trustedProviderReadiness = new WeakSet<object>();
+
+export function mintAssignmentProviderReadiness(input: Readonly<{
+  actorId: string;
+  providerAuthenticated: boolean;
+  observedAt: string;
+}>): AssignmentProviderReadiness {
+  if (Object.keys(input).length !== 3 || !Object.hasOwn(input, "actorId") ||
+      !Object.hasOwn(input, "providerAuthenticated") || !Object.hasOwn(input, "observedAt") ||
+      typeof input.actorId !== "string" || input.actorId.trim().length === 0 ||
+      typeof input.providerAuthenticated !== "boolean" ||
+      typeof input.observedAt !== "string" || !Number.isFinite(Date.parse(input.observedAt))) {
+    throw new TypeError("Assignment Provider readiness is invalid");
+  }
+  const readiness = Object.freeze({ ...input });
+  trustedProviderReadiness.add(readiness);
+  return readiness as AssignmentProviderReadiness;
 }
 
 export interface AssignmentRevisionGateInput {
@@ -49,7 +84,7 @@ export interface AssignmentRevisionGateInput {
   readonly expectedProfileRevision: number;
   readonly expectedAssignmentRevision: number;
   readonly expectedAccessRevision: number;
-  readonly providerReady: boolean;
+  readonly providerReadiness: AssignmentProviderReadiness;
 }
 
 export type AssignmentRevisionGateResult = Readonly<{
@@ -98,24 +133,47 @@ function parseReceipt(value: string): RoomAssignmentCommandResult {
     return fail(503, "storage_unavailable");
   }
   const result = parsed as Record<string, unknown>;
-  if (Object.keys(result).length !== 4 || typeof result.requestId !== "string" ||
-      typeof result.changed !== "boolean" || typeof result.roomRevision !== "number" ||
-      typeof result.assignment !== "object" || result.assignment === null) {
+  if (Object.keys(result).length !== 6 || typeof result.requestId !== "string" ||
+      result.requestId.trim().length === 0 || typeof result.changed !== "boolean" ||
+      typeof result.assignmentId !== "string" || result.assignmentId.trim().length === 0 ||
+      typeof result.acceptedRevision !== "number" ||
+      !Number.isSafeInteger(result.acceptedRevision) || result.acceptedRevision < 1 ||
+      typeof result.roomRevision !== "number" || !Number.isSafeInteger(result.roomRevision) ||
+      result.roomRevision < 0 ||
+      !Array.isArray(result.eventIds) || result.eventIds.length !== 1 ||
+      typeof result.eventIds[0] !== "string" || result.eventIds[0].length === 0) {
     return fail(503, "storage_unavailable");
   }
   return parsed as RoomAssignmentCommandResult;
 }
 
-function idempotencyScope(roomId: string, actorId: string): string {
-  return `room-assignment:${roomId}:${actorId}`;
+function idempotencyScope(request: AssignmentMutationRequest, actorId: string): string {
+  return ["room-assignment", actorId, request.roomId, request.kind].join("\u0000");
 }
 
 function auditId(request: AssignmentMutationRequest, actorId: string): string {
-  return `assignment-audit:${sha256([request.roomId, actorId, request.requestId]).slice(0, 40)}`;
+  return `assignment-audit:${sha256([request.roomId, actorId, request.kind,
+    request.idempotencyKey]).slice(0, 40)}`;
 }
 
 function assignmentId(request: AssignmentMutationRequest, actorId: string): string {
-  return `assignment:${sha256([request.roomId, actorId, request.requestId]).slice(0, 40)}`;
+  return `assignment:${sha256([request.roomId, actorId, request.kind,
+    request.idempotencyKey]).slice(0, 40)}`;
+}
+
+function requestFingerprint(request: AssignmentMutationRequest, actorId: string): string {
+  const business = Object.fromEntries(Object.entries(request).filter(([key]) =>
+    key !== "requestId" && key !== "idempotencyKey"));
+  return sha256({ principalActorId: actorId, roomId: request.roomId,
+    operation: request.kind, business });
+}
+
+function eventId(scope: string, key: string): string {
+  return `assignment-event:${sha256([scope, key, "room.agent-assignment.changed"]).slice(0, 40)}`;
+}
+
+function outboxId(event: string): string {
+  return `assignment-outbox:${sha256([event, "room"]).slice(0, 40)}`;
 }
 
 function requireAuthenticatedRoom(
@@ -140,7 +198,7 @@ function persistReceipt(
 ): void {
   repository.insertReceipt({
     scope,
-    key: request.requestId,
+    key: request.idempotencyKey,
     requestHash,
     responseJson: JSON.stringify(result),
     statusCode: 200,
@@ -149,7 +207,92 @@ function persistReceipt(
   });
 }
 
+function projection(
+  assignment: SqliteAssignmentRecord,
+  profile: Readonly<{
+    revision: number;
+    displayName: string;
+    globalResponsibility: string;
+  }>,
+  accessRevision: number,
+): AssignmentChangedProjection {
+  return Object.freeze({
+    recordKind: "room-agent-assignment" as const,
+    recordVersion: 1 as const,
+    roomId: assignment.roomId,
+    assignmentId: assignment.assignmentId,
+    actorId: assignment.actorId,
+    profileId: assignment.profileId,
+    profileRevision: profile.revision,
+    profileDisplayName: profile.displayName,
+    profileGlobalResponsibility: profile.globalResponsibility,
+    assignmentRevision: assignment.revision,
+    accessRevision,
+    status: assignment.status,
+    participation: assignment.participation,
+    paused: assignment.paused,
+    roomResponsibility: assignment.roomResponsibility,
+    capabilitySubset: assignment.capabilitySubset,
+    toolSubset: assignment.toolSubset,
+    updatedAt: assignment.updatedAt,
+  });
+}
+
+function completeCommand(
+  repository: RoomAssignmentRepository,
+  context: AuthenticatedSessionContext,
+  request: AssignmentMutationRequest,
+  requestHash: string,
+  scope: string,
+  assignment: SqliteAssignmentRecord,
+  profile: Readonly<{
+    revision: number;
+    displayName: string;
+    globalResponsibility: string;
+  }>,
+  accessRevision: number,
+  changed: boolean,
+  roomRevision: number,
+  now: number,
+): RoomAssignmentCommandResult {
+  const occurredAt = timestamp(now);
+  const stableEventId = eventId(scope, request.idempotencyKey);
+  repository.insertAudit({
+    auditId: auditId(request, context.principal.actorId),
+    roomId: request.roomId,
+    actorId: context.principal.actorId,
+    assignmentId: assignment.assignmentId,
+    assignmentActorId: assignment.actorId,
+    assignmentRevision: assignment.revision,
+    profileRevision: profile.revision,
+    operation: request.kind,
+    occurredAt,
+  });
+  repository.appendChangedEvent({
+    eventId: stableEventId,
+    outboxId: outboxId(stableEventId),
+    roomId: request.roomId,
+    actorId: context.principal.actorId,
+    operation: request.kind,
+    changed,
+    acceptedRevision: assignment.revision,
+    projection: projection(assignment, profile, accessRevision),
+    occurredAt,
+  });
+  const result = Object.freeze({
+    requestId: request.requestId,
+    changed,
+    assignmentId: assignment.assignmentId,
+    acceptedRevision: assignment.revision,
+    roomRevision,
+    eventIds: Object.freeze([stableEventId]) as readonly [string],
+  });
+  persistReceipt(repository, scope, request, requestHash, result, now);
+  return result;
+}
+
 function execute(
+  transaction: AuthorityTransactionView,
   repository: RoomAssignmentRepository,
   context: AuthenticatedSessionContext,
   request: AssignmentMutationRequest,
@@ -158,9 +301,9 @@ function execute(
   const room = requireAuthenticatedRoom(repository, context, request.roomId, now);
   if (room.role !== "owner" && room.role !== "admin") fail(403, "forbidden");
 
-  const scope = idempotencyScope(request.roomId, context.principal.actorId);
-  const requestHash = sha256(request);
-  const receipt = repository.readReceipt(scope, request.requestId);
+  const scope = idempotencyScope(request, context.principal.actorId);
+  const requestHash = requestFingerprint(request, context.principal.actorId);
+  const receipt = repository.readReceipt(scope, request.idempotencyKey);
   if (receipt !== undefined) {
     if (receipt.requestHash !== requestHash) fail(409, "idempotency_conflict");
     return parseReceipt(receipt.responseJson);
@@ -174,16 +317,7 @@ function execute(
     current = repository.readAssignment(request.roomId, request.assignmentId!);
     if (current === undefined) fail(404, "not_found");
     if (current.status === "removed") {
-      if (request.kind !== "remove") fail(410, "gone");
-      if (current.revision !== request.expectedAssignmentRevision) fail(409, "conflict");
-      const stable = Object.freeze({
-        requestId: request.requestId,
-        changed: false,
-        roomRevision: room.governanceRevision,
-        assignment: current,
-      });
-      persistReceipt(repository, scope, request, requestHash, stable, now);
-      return stable;
+      return fail(410, "gone");
     }
     profileId = current.profileId;
   }
@@ -206,18 +340,26 @@ function execute(
   if (!decision.allowed) fail(statusForDenial(decision.reason),
     decision.reason === "forbidden" ? "forbidden" : "conflict");
 
+  if (decision.securityReduction) {
+    requireAssignmentSecurityReductionAllowedInTransaction(transaction, {
+      roomId: request.roomId, expectedArchiveGeneration: room.archiveGeneration,
+    });
+  } else if (!requireAssignmentExpansionAllowedInTransaction(transaction, {
+    roomId: request.roomId, expectedArchiveGeneration: room.archiveGeneration,
+  })) {
+    fail(409, "conflict");
+  }
+
   const changedAt = timestamp(now);
   if (current !== undefined &&
       ((request.kind === "pause" && current.paused) ||
        (request.kind === "resume" && !current.paused))) {
-    const stable = Object.freeze({
-      requestId: request.requestId,
-      changed: false,
-      roomRevision: room.governanceRevision,
-      assignment: current,
-    });
-    persistReceipt(repository, scope, request, requestHash, stable, now);
-    return stable;
+    const runtime = repository.readRuntimeAuthority(request.roomId, current.assignmentId);
+    if (runtime === undefined) fail(503, "storage_unavailable");
+    return completeCommand(
+      repository, context, request, requestHash, scope, current, profile,
+      runtime.accessRevision, false, room.governanceRevision, now,
+    );
   }
 
   let updated: SqliteAssignmentRecord;
@@ -254,26 +396,20 @@ function execute(
       changedAt,
     });
   }
-  const roomRevision = repository.advanceRoomRevision(request.roomId, room.governanceRevision);
-  repository.insertAudit({
-    auditId: auditId(request, context.principal.actorId),
-    roomId: request.roomId,
-    actorId: context.principal.actorId,
-    assignmentId: updated.assignmentId,
-    assignmentActorId: updated.actorId,
-    assignmentRevision: updated.revision,
-    profileRevision: profile.revision,
-    operation: request.kind,
-    occurredAt: changedAt,
-  });
-  const result = Object.freeze({
-    requestId: request.requestId,
-    changed: true,
-    roomRevision,
+  const accessRevision = repository.synchronizeMembershipProjection({
     assignment: updated,
+    changedAt,
   });
-  persistReceipt(repository, scope, request, requestHash, result, now);
-  return result;
+  const roomRevision = repository.advanceRoomRevision(request.roomId, room.governanceRevision);
+  repository.invalidateAssignmentContext({
+    roomId: request.roomId,
+    actorId: updated.actorId,
+    invalidatedAt: changedAt,
+  });
+  return completeCommand(
+    repository, context, request, requestHash, scope, updated, profile,
+    accessRevision, true, roomRevision, now,
+  );
 }
 
 export function executeRoomAssignmentCommandInTransaction(
@@ -287,7 +423,7 @@ export function executeRoomAssignmentCommandInTransaction(
   }
   try {
     return withSqliteRoomAssignmentRepository(transaction, (repository) =>
-      execute(repository, context, request, now));
+      execute(transaction, repository, context, request, now));
   } catch (error: unknown) {
     if (error instanceof RoomAssignmentServiceError) throw error;
     return fail(503, "storage_unavailable");
@@ -312,6 +448,29 @@ export function listRoomAssignmentsInTransaction(
   }
 }
 
+export function getRoomAssignmentInTransaction(
+  transaction: AuthorityTransactionView,
+  context: AuthenticatedSessionContext,
+  roomId: string,
+  assignmentId: string,
+  now: number,
+): SqliteAssignmentRecord {
+  if (transaction.roomId !== roomId || typeof assignmentId !== "string" ||
+      assignmentId.trim().length === 0) return fail(403, "forbidden");
+  try {
+    return withSqliteRoomAssignmentRepository(transaction, (repository) => {
+      requireAuthenticatedRoom(repository, context, roomId, now);
+      const assignment = repository.readAssignment(roomId, assignmentId);
+      if (assignment === undefined) return fail(404, "not_found");
+      if (assignment.status === "removed") return fail(410, "gone");
+      return assignment;
+    });
+  } catch (error: unknown) {
+    if (error instanceof RoomAssignmentServiceError) throw error;
+    return fail(503, "storage_unavailable");
+  }
+}
+
 export function readAssignmentRevisionGateInTransaction(
   transaction: AuthorityTransactionView,
   input: AssignmentRevisionGateInput,
@@ -325,6 +484,10 @@ export function readAssignmentRevisionGateInTransaction(
           authority.accessRevision !== input.expectedAccessRevision) {
         return Object.freeze({ current: false as const });
       }
+      if (!trustedProviderReadiness.has(input.providerReadiness) ||
+          input.providerReadiness.actorId !== authority.assignment.actorId) {
+        return fail(503, "storage_unavailable");
+      }
       return Object.freeze({
         current: true as const,
         availability: deriveAssignmentAvailability({
@@ -333,12 +496,13 @@ export function readAssignmentRevisionGateInTransaction(
           roomActive: authority.roomActive,
           membershipCurrent: authority.accessValid,
           durablePaused: authority.assignment.paused,
-          providerAuthenticated: input.providerReady,
+          providerAuthenticated: input.providerReadiness.providerAuthenticated,
           durableRunningExecutionCount: authority.runningExecutionCount,
         }),
       });
     });
-  } catch {
+  } catch (error: unknown) {
+    if (error instanceof RoomAssignmentServiceError) throw error;
     return Object.freeze({ current: false as const });
   }
 }

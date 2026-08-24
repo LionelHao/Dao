@@ -11,6 +11,7 @@ import {
 const createRequest: AssignmentMutationRequest = {
   kind: "create",
   requestId: "request-1",
+  idempotencyKey: "key-1",
   roomId: "room-1",
   expectedRoomRevision: 4,
   profileId: "profile-1",
@@ -36,18 +37,21 @@ describe("Room Assignment request and authority policy", () => {
     expect(isAssignmentMutationRequest(createRequest)).toBe(true);
     expect(isAssignmentMutationRequest({ ...createRequest, participation: "on-mention" })).toBe(true);
     expect(isAssignmentMutationRequest({ ...createRequest, participation: "silent" })).toBe(false);
+    const withoutIdempotencyKey = { ...createRequest } as Record<string, unknown>;
+    delete withoutIdempotencyKey.idempotencyKey;
+    expect(isAssignmentMutationRequest(withoutIdempotencyKey)).toBe(false);
     expect(isAssignmentMutationRequest({ ...createRequest, availability: "ready" })).toBe(false);
     expect(isAssignmentMutationRequest({
-      kind: "pause", requestId: "request-2", roomId: "room-1",
+      kind: "pause", requestId: "request-2", idempotencyKey: "key-2", roomId: "room-1",
       assignmentId: "assignment-1", expectedRoomRevision: 4, expectedAssignmentRevision: 2,
     })).toBe(true);
     expect(isAssignmentMutationRequest({
-      kind: "pause", requestId: "request-2", roomId: "room-1",
+      kind: "pause", requestId: "request-2", idempotencyKey: "key-2", roomId: "room-1",
       assignmentId: "assignment-1", expectedRoomRevision: 4,
       expectedAssignmentRevision: 2, paused: true,
     })).toBe(false);
     expect(isAssignmentMutationRequest({
-      kind: "pause", requestId: "request-2", roomId: "room-1",
+      kind: "pause", requestId: "request-2", idempotencyKey: "key-2", roomId: "room-1",
       assignmentId: "assignment-1", expectedRoomRevision: 4, expectedAssignmentRevision: 0,
     })).toBe(false);
     expect(isAssignmentMutationRequest({
@@ -75,7 +79,7 @@ describe("Room Assignment request and authority policy", () => {
     expect(evaluateAssignmentMutation(createRequest, { ...authority, roomRevision: 5 }))
       .toEqual({ allowed: false, reason: "room_revision_conflict" });
     expect(evaluateAssignmentMutation({
-      kind: "pause", requestId: "request-2", roomId: "room-1",
+      kind: "pause", requestId: "request-2", idempotencyKey: "key-2", roomId: "room-1",
       assignmentId: "assignment-1", expectedRoomRevision: 4, expectedAssignmentRevision: 7,
     }, {
       ...authority,
@@ -106,7 +110,8 @@ describe("Room Assignment request and authority policy", () => {
       },
     };
     const base = {
-      requestId: "request-3", roomId: "room-1", expectedRoomRevision: 4,
+      requestId: "request-3", idempotencyKey: "key-3", roomId: "room-1",
+      expectedRoomRevision: 4,
       assignmentId: "assignment-1", expectedAssignmentRevision: 3,
     } as const;
     expect(evaluateAssignmentMutation({ kind: "pause", ...base }, archived))

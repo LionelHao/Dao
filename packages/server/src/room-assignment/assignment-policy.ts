@@ -5,6 +5,7 @@ export type AssignmentMutationKind = "create" | "update" | "pause" | "resume" | 
 export interface AssignmentMutationRequest {
   readonly kind: AssignmentMutationKind;
   readonly requestId: string;
+  readonly idempotencyKey: string;
   readonly roomId: string;
   readonly expectedRoomRevision: number;
   readonly expectedAssignmentRevision?: number;
@@ -134,7 +135,7 @@ function intersection(...sets: readonly (readonly string[])[]): readonly string[
 }
 
 function requestKeys(value: UnknownRecord): readonly string[] | undefined {
-  const common = ["kind", "requestId", "roomId", "expectedRoomRevision"];
+  const common = ["kind", "requestId", "idempotencyKey", "roomId", "expectedRoomRevision"];
   if (value.kind === "create") {
     return [...common, "profileId", "participation", "roomResponsibility", "capabilitySubset", "toolSubset"];
   }
@@ -151,6 +152,7 @@ export function isAssignmentMutationRequest(value: unknown): value is Assignment
   if (!record(value)) return false;
   const keys = requestKeys(value);
   if (keys === undefined || !exact(value, keys) || !text(value.requestId) ||
+      !text(value.idempotencyKey) ||
       !text(value.roomId) || !revision(value.expectedRoomRevision)) return false;
   if (value.kind === "create" || value.kind === "update") {
     if (!text(value.roomResponsibility) || value.roomResponsibility.length > 4_000 ||

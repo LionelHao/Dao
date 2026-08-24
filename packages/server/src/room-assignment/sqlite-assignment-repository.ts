@@ -12,6 +12,8 @@ import type {
 export interface SqliteProfileAuthority {
   readonly profileId: string;
   readonly actorId: string;
+  readonly displayName: string;
+  readonly globalResponsibility: string;
   readonly revision: number;
   readonly status: "enabled" | "disabled";
   readonly capabilityCeiling: readonly string[];
@@ -51,6 +53,27 @@ export interface AssignmentRuntimeAuthorityRow {
   readonly accessRevision: number;
   readonly accessValid: boolean;
   readonly runningExecutionCount: number;
+}
+
+export interface AssignmentChangedProjection {
+  readonly recordKind: "room-agent-assignment";
+  readonly recordVersion: 1;
+  readonly roomId: string;
+  readonly assignmentId: string;
+  readonly actorId: string;
+  readonly profileId: string;
+  readonly profileRevision: number;
+  readonly profileDisplayName: string;
+  readonly profileGlobalResponsibility: string;
+  readonly assignmentRevision: number;
+  readonly accessRevision: number;
+  readonly status: "current" | "removed";
+  readonly participation: AssignmentParticipation;
+  readonly paused: boolean;
+  readonly roomResponsibility: string;
+  readonly capabilitySubset: readonly string[];
+  readonly toolSubset: readonly string[];
+  readonly updatedAt: string;
 }
 
 export interface RoomAssignmentRepository {
@@ -93,6 +116,10 @@ export interface RoomAssignmentRepository {
     changedBy: string;
     changedAt: string;
   }>): SqliteAssignmentRecord;
+  synchronizeMembershipProjection(input: Readonly<{
+    assignment: SqliteAssignmentRecord;
+    changedAt: string;
+  }>): number;
   advanceRoomRevision(roomId: string, expectedRevision: number): number;
   insertAudit(input: Readonly<{
     auditId: string;
@@ -105,6 +132,22 @@ export interface RoomAssignmentRepository {
     operation: "create" | "update" | "pause" | "resume" | "remove";
     occurredAt: string;
   }>): void;
+  appendChangedEvent(input: Readonly<{
+    eventId: string;
+    outboxId: string;
+    roomId: string;
+    actorId: string;
+    operation: "create" | "update" | "pause" | "resume" | "remove";
+    changed: boolean;
+    acceptedRevision: number;
+    projection: AssignmentChangedProjection;
+    occurredAt: string;
+  }>): void;
+  invalidateAssignmentContext(input: Readonly<{
+    roomId: string;
+    actorId: string;
+    invalidatedAt: string;
+  }>): number;
   readRuntimeAuthority(roomId: string, assignmentId: string): AssignmentRuntimeAuthorityRow | undefined;
 }
 
@@ -237,7 +280,9 @@ function createRepository(database: DatabaseSync): RoomAssignmentRepository {
     readProfile(profileId) {
       const row = database.prepare(
         `SELECT profile.id AS profileId, profile.actor_id AS actorId,
-                actor.kind AS actorKind, profile.revision, profile.status,
+                actor.kind AS actorKind, profile.display_name AS displayName,
+                profile.global_responsibility AS globalResponsibility,
+                profile.revision, profile.status,
                 capability_ceiling_json AS capabilityCeilingJson,
                 tool_ceiling_json AS toolCeilingJson
          FROM agent_profiles AS profile
@@ -246,13 +291,15 @@ function createRepository(database: DatabaseSync): RoomAssignmentRepository {
       ).get(profileId) as UnknownRow | undefined;
       if (row === undefined) return undefined;
       if (row.profileId !== profileId || !text(row.actorId) || row.actorKind !== "agent" ||
-          !positive(row.revision) ||
+          !text(row.displayName) || !text(row.globalResponsibility) || !positive(row.revision) ||
           (row.status !== "enabled" && row.status !== "disabled")) {
         throw new Error("Agent Profile authority is corrupt");
       }
       return Object.freeze({
         profileId,
         actorId: row.actorId,
+        displayName: row.displayName,
+        globalResponsibility: row.globalResponsibility,
         revision: row.revision,
         status: row.status,
         capabilityCeiling: canonicalSet(row.capabilityCeilingJson, capabilities),
@@ -358,6 +405,58 @@ function createRepository(database: DatabaseSync): RoomAssignmentRepository {
       );
       return repository.readAssignment(input.assignment.roomId, input.assignment.assignmentId)!;
     },
+    synchronizeMembershipProjection(input) {
+      const membership = database.prepare(
+        `SELECT kind, access_revision AS accessRevision
+         FROM room_memberships WHERE room_id = ? AND actor_id = ?`,
+      ).get(input.assignment.roomId, input.assignment.actorId) as UnknownRow | undefined;
+      if (input.assignment.status === "removed") {
+        if (membership === undefined || membership.kind !== "agent" ||
+            !nonnegative(membership.accessRevision) ||
+            membership.accessRevision >= Number.MAX_SAFE_INTEGER) {
+          throw new Error("Removed Assignment membership projection is unavailable");
+        }
+        const revokedRevision = membership.accessRevision + 1;
+        const removed = database.prepare(
+          `DELETE FROM room_memberships
+           WHERE room_id = ? AND actor_id = ? AND kind = 'agent' AND access_revision = ?`,
+        ).run(input.assignment.roomId, input.assignment.actorId, membership.accessRevision);
+        if (removed.changes !== 1) {
+          throw new Error("Assignment membership projection changed concurrently");
+        }
+        return revokedRevision;
+      }
+      if (membership === undefined) {
+        database.prepare(
+          `INSERT INTO room_memberships (
+             room_id, actor_id, kind, role, participation, tool_permissions_json,
+             joined_at, configured_at, access_revision
+           ) VALUES (?, ?, 'agent', NULL, ?, ?, ?, ?, 0)`,
+        ).run(
+          input.assignment.roomId, input.assignment.actorId, input.assignment.participation,
+          JSON.stringify(input.assignment.toolSubset), input.changedAt, input.changedAt,
+        );
+        return 0;
+      }
+      if (membership.kind !== "agent" || !nonnegative(membership.accessRevision) ||
+          membership.accessRevision >= Number.MAX_SAFE_INTEGER) {
+        throw new Error("Assignment membership projection is corrupt");
+      }
+      const accessRevision = membership.accessRevision + 1;
+      const updated = database.prepare(
+        `UPDATE room_memberships
+         SET participation = ?, tool_permissions_json = ?, configured_at = ?, access_revision = ?
+         WHERE room_id = ? AND actor_id = ? AND kind = 'agent' AND access_revision = ?`,
+      ).run(
+        input.assignment.participation, JSON.stringify(input.assignment.toolSubset),
+        input.changedAt, accessRevision, input.assignment.roomId, input.assignment.actorId,
+        membership.accessRevision,
+      );
+      if (updated.changes !== 1) {
+        throw new Error("Assignment membership projection changed concurrently");
+      }
+      return accessRevision;
+    },
     advanceRoomRevision(roomId, expectedRevision) {
       const result = database.prepare(
         `UPDATE rooms SET governance_revision = governance_revision + 1
@@ -381,6 +480,53 @@ function createRepository(database: DatabaseSync): RoomAssignmentRepository {
           operation: input.operation,
         }),
       );
+    },
+    appendChangedEvent(input) {
+      const stream = database.prepare(
+        `SELECT head_seq AS headSeq FROM streams
+         WHERE stream_kind = 'room' AND stream_id = ?`,
+      ).get(input.roomId) as UnknownRow | undefined;
+      if (stream === undefined || !nonnegative(stream.headSeq) ||
+          stream.headSeq >= Number.MAX_SAFE_INTEGER) {
+        throw new Error("Room Assignment event stream is unavailable");
+      }
+      const streamSeq = stream.headSeq + 1;
+      const advanced = database.prepare(
+        `UPDATE streams SET head_seq = ?
+         WHERE stream_kind = 'room' AND stream_id = ? AND head_seq = ?`,
+      ).run(streamSeq, input.roomId, stream.headSeq);
+      if (advanced.changes !== 1) throw new Error("Room Assignment event stream changed concurrently");
+      database.prepare(
+        `INSERT INTO events (
+           event_id, stream_kind, stream_id, stream_seq, room_id,
+           actor_id, event_type, occurred_at, payload_json
+         ) VALUES (?, 'room', ?, ?, ?, ?, 'room.agent-assignment.changed', ?, ?)`,
+      ).run(
+        input.eventId, input.roomId, streamSeq, input.roomId, input.actorId,
+        input.occurredAt, JSON.stringify({
+          operation: input.operation,
+          changed: input.changed,
+          acceptedRevision: input.acceptedRevision,
+          projection: input.projection,
+        }),
+      );
+      database.prepare(
+        `INSERT INTO outbox_deliveries (
+           id, event_id, target_kind, target_id, stream_seq, status,
+           attempts, available_at, delivered_at, last_error
+         ) VALUES (?, ?, 'room', ?, ?, 'pending', 0, ?, NULL, NULL)`,
+      ).run(
+        input.outboxId, input.eventId, input.roomId, streamSeq, input.occurredAt,
+      );
+    },
+    invalidateAssignmentContext(input) {
+      const result = database.prepare(
+        `UPDATE context_snapshots
+         SET state = 'invalidated', snapshot_generation = snapshot_generation + 1,
+             invalidated_at = ?, invalidation_reason = 'authorization_changed'
+         WHERE room_id = ? AND agent_id = ? AND state = 'active'`,
+      ).run(input.invalidatedAt, input.roomId, input.actorId);
+      return Number(result.changes);
     },
     readRuntimeAuthority(roomId, assignmentId) {
       const row = database.prepare(
