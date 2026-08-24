@@ -39,15 +39,16 @@ describe("Room Assignment request and authority policy", () => {
     expect(isAssignmentMutationRequest({ ...createRequest, availability: "ready" })).toBe(false);
     expect(isAssignmentMutationRequest({
       kind: "pause", requestId: "request-2", roomId: "room-1",
-      expectedRoomRevision: 4, expectedAssignmentRevision: 2,
+      assignmentId: "assignment-1", expectedRoomRevision: 4, expectedAssignmentRevision: 2,
     })).toBe(true);
     expect(isAssignmentMutationRequest({
       kind: "pause", requestId: "request-2", roomId: "room-1",
-      expectedRoomRevision: 4, expectedAssignmentRevision: 2, paused: true,
+      assignmentId: "assignment-1", expectedRoomRevision: 4,
+      expectedAssignmentRevision: 2, paused: true,
     })).toBe(false);
     expect(isAssignmentMutationRequest({
       kind: "pause", requestId: "request-2", roomId: "room-1",
-      expectedRoomRevision: 4, expectedAssignmentRevision: 0,
+      assignmentId: "assignment-1", expectedRoomRevision: 4, expectedAssignmentRevision: 0,
     })).toBe(false);
     expect(isAssignmentMutationRequest({
       ...createRequest, roomResponsibility: "x".repeat(4_000),
@@ -75,7 +76,7 @@ describe("Room Assignment request and authority policy", () => {
       .toEqual({ allowed: false, reason: "room_revision_conflict" });
     expect(evaluateAssignmentMutation({
       kind: "pause", requestId: "request-2", roomId: "room-1",
-      expectedRoomRevision: 4, expectedAssignmentRevision: 7,
+      assignmentId: "assignment-1", expectedRoomRevision: 4, expectedAssignmentRevision: 7,
     }, {
       ...authority,
       currentAssignment: {
@@ -106,7 +107,7 @@ describe("Room Assignment request and authority policy", () => {
     };
     const base = {
       requestId: "request-3", roomId: "room-1", expectedRoomRevision: 4,
-      expectedAssignmentRevision: 3,
+      assignmentId: "assignment-1", expectedAssignmentRevision: 3,
     } as const;
     expect(evaluateAssignmentMutation({ kind: "pause", ...base }, archived))
       .toEqual({ allowed: true, securityReduction: true });

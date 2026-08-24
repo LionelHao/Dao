@@ -8,6 +8,7 @@ export interface AssignmentMutationRequest {
   readonly roomId: string;
   readonly expectedRoomRevision: number;
   readonly expectedAssignmentRevision?: number;
+  readonly assignmentId?: string;
   readonly profileId?: string;
   readonly participation?: AssignmentParticipation;
   readonly roomResponsibility?: string;
@@ -138,10 +139,10 @@ function requestKeys(value: UnknownRecord): readonly string[] | undefined {
     return [...common, "profileId", "participation", "roomResponsibility", "capabilitySubset", "toolSubset"];
   }
   if (value.kind === "update") {
-    return [...common, "expectedAssignmentRevision", "participation", "roomResponsibility", "capabilitySubset", "toolSubset"];
+    return [...common, "assignmentId", "expectedAssignmentRevision", "participation", "roomResponsibility", "capabilitySubset", "toolSubset"];
   }
   if (value.kind === "pause" || value.kind === "resume" || value.kind === "remove") {
-    return [...common, "expectedAssignmentRevision"];
+    return [...common, "assignmentId", "expectedAssignmentRevision"];
   }
   return undefined;
 }
@@ -157,7 +158,7 @@ export function isAssignmentMutationRequest(value: unknown): value is Assignment
         !canonicalSet(value.capabilitySubset) || !canonicalSet(value.toolSubset)) return false;
   }
   if (value.kind === "create") return text(value.profileId);
-  return positiveRevision(value.expectedAssignmentRevision);
+  return text(value.assignmentId) && positiveRevision(value.expectedAssignmentRevision);
 }
 
 function deny(reason: AssignmentMutationDenial): AssignmentMutationDecision {
