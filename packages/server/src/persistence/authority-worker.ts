@@ -2413,6 +2413,10 @@ function executeContext(request: AuthorityWorkerRequest): void {
     const result = executeContextSnapshotAuthorityOperation(
       requireAuthorityTransactionDatabase(),
       request.operation,
+      {
+        providerAuthenticated: isAuthorityWorkerData(workerData) &&
+          workerData.deploymentProviderDisclosure?.credentialReadiness === "ready",
+      },
     );
     respond({
       type: "authority.context-result",

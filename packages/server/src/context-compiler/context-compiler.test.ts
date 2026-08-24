@@ -114,7 +114,9 @@ describe("compileContextV1", () => {
     expect(first.envelope.groupContent.filter((item) => item.section === "memory").map((item) => item.memoryKind)).toEqual(["goal", "decision"]);
     expect(first.envelope.groupContent[0]?.mentions.map((mention) => mention.targetActorId)).toEqual(["agent-1", "human-2"]);
     expect(first.envelope.groupContent[0]?.replyTo).toEqual({ sourceId: "message-0", revision: 2 });
-    expect(first.envelope.availableTools.map((tool) => tool.id)).toEqual(["a-tool", "z-tool"]);
+    expect(first.envelope.availableTools.map((tool) => tool.id)).toEqual([
+      "repository.git-status", "room-memory.read",
+    ]);
     expect(first.envelope.projectContext).toEqual({ availability: "disabled", reason: "ft09_not_delivered" });
     expect(first.manifest.items.map((item) => item.citationLabel)).toEqual([
       "ctx-0001", "ctx-0002", "ctx-0003", "ctx-0004", "ctx-0005", "ctx-0006", "ctx-0007",
@@ -122,8 +124,8 @@ describe("compileContextV1", () => {
     expect(first.manifest.manifestHash).toMatch(/^[0-9a-f]{64}$/);
     expect(first.envelopeSha256).toMatch(/^[0-9a-f]{64}$/);
     expect(first.manifestSha256).toMatch(/^[0-9a-f]{64}$/);
-    expect(first.envelopeSha256).toBe("adbfe4d2da61fe3285979e6934e4c8d7d66b55c80891ce40b93b70d532c2f470");
-    expect(first.manifestSha256).toBe("a6ab70c0b13914270b6061eb06d0f94aa4fce646d1f624fe78a492d63e87340b");
+    expect(first.envelopeSha256).toBe("01af78b315eef321806bb03820b77d1a413437640f004996d134d920b331accc");
+    expect(first.manifestSha256).toBe("cd44fe4da1b2a2c7f79abaf7bc2822d6e113d25a2b39b106fc460ac072975a95");
     expect(first.envelope.trusted.developer.agent).toMatchObject({
       profileId: "profile-1",
       assignmentId: "assignment-1",
@@ -273,7 +275,7 @@ describe("compileContextV1", () => {
     if (!result.ok) return;
     expect(result.manifest.items.filter((item) => item.source?.sourceId === "mv-b")).toHaveLength(1);
     expect(result.manifest.items.filter((item) => item.source?.sourceId === "attachment-1")).toHaveLength(1);
-    expect(result.envelope.availableTools.filter((tool) => tool.id === "z-tool")).toHaveLength(1);
+    expect(result.envelope.availableTools.filter((tool) => tool.id === "room-memory.read")).toHaveLength(1);
   });
 
   it("uses immutable memory version identities and keeps same-record versions distinct", () => {

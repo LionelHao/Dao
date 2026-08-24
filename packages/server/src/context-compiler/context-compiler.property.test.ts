@@ -78,11 +78,12 @@ describe("compileContextV1 deterministic properties", () => {
           sourceId: "message-00", revision: 1, corpusSeq: 1 }], availability: "readable" as const };
       const attachment = { ...input.delta[0]!, source: { ...input.delta[0]!.source,
         sourceKind: "attachment_extraction" as const, sourceId: "attachment-property", corpusSeq: null }, readRef: "attachment-read" };
-      const tool = { id: "property-tool", description: "read authority", effect: "read-only" as const, inputSchemaCanonical: "{}" };
+      const tool = { id: "room-memory.read", description: "read authority", effect: "read-only" as const, inputSchemaCanonical: "{}" };
       input.memories = [memory, { ...memory, sourceRefs: [...memory.sourceRefs].reverse() }];
       input.retrieval = [input.delta[0]!, { ...input.delta[0]! }];
       input.attachments = [attachment, { ...attachment }];
       input.tools = [tool, { ...tool }];
+      input.agent.effectiveTools = ["room-memory.read"];
       const baseline = compileContextV1(input, CONTEXT_COMPILER_CONFIG_V1);
       expect(baseline.ok).toBe(true);
       for (let run = 0; run < RUNS_PER_SEED; run += 1) {

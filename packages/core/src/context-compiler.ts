@@ -374,12 +374,19 @@ function project(value: unknown, roomId: string): value is ProjectContextInputV1
     && dense(value.sourceRefs) && value.sourceRefs.length > 0
     && value.sourceRefs.every((entry) => source(entry, roomId));
 }
+function toolDescriptor(value: unknown): value is ContextToolDescriptorV1 {
+  return exact(value, ["id", "description", "effect", "inputSchemaCanonical"])
+    && text(value.id) && text(value.description)
+    && ["read-only", "reversible-write", "irreversible-write"].includes(String(value.effect))
+    && text(value.inputSchemaCanonical);
+}
 export function isContextCompilerInputV1(value: unknown): value is ContextCompilerInputV1 {
   if (!exact(value, INPUT_KEYS) || value.version !== CONTEXT_COMPILER_INPUT_VERSION) return false;
   if (!exact(value.invocation, ["invocationId", "executionId", "roomId", "intent"]) || !text(value.invocation.invocationId)
     || !text(value.invocation.executionId) || !text(value.invocation.roomId) || !invocationIntent(value.invocation.intent)) return false;
   const roomId = value.invocation.roomId;
-  if (!agentIdentity(value.agent) || !roomIdentity(value.room, roomId)) return false;
+  const agent = value.agent;
+  if (!agentIdentity(agent) || !roomIdentity(value.room, roomId)) return false;
   if (!exact(value.trigger, ["triggerType", "reason", "source", "body", "author", "occurredAt", "replyTo", "mentions", "readRef"])
     || !["message", "reply", "manual", "tool_continuation"].includes(String(value.trigger.triggerType))
     || !["mention", "reply", "manual", "tool_continuation"].includes(String(value.trigger.reason))
@@ -387,7 +394,7 @@ export function isContextCompilerInputV1(value: unknown): value is ContextCompil
     || !timestamp(value.trigger.occurredAt) || !(value.trigger.replyTo === null || reply(value.trigger.replyTo))
     || !mentions(value.trigger.mentions) || !mentionsFitBody(value.trigger.body, value.trigger.mentions) || !text(value.trigger.readRef)) return false;
   if (value.invocation.intent.sourceMessageId !== value.trigger.source.sourceId
-    || value.invocation.intent.targetAgentId !== value.agent.agentId) return false;
+    || value.invocation.intent.targetAgentId !== agent.agentId) return false;
   if (value.trigger.triggerType === "reply" && value.trigger.replyTo === null) return false;
   if (!uint(value.memoryWatermark) || !uint(value.corpusHead) || value.memoryWatermark > value.corpusHead) return false;
   if (!dense(value.memories) || !value.memories.every((entry) => memory(entry, roomId))) return false;
@@ -395,13 +402,10 @@ export function isContextCompilerInputV1(value: unknown): value is ContextCompil
   if (!dense(value.retrieval) || !value.retrieval.every((entry) => candidate(entry, roomId))) return false;
   if (!dense(value.attachments) || !value.attachments.every((entry) => candidate(entry, roomId))) return false;
   if (!project(value.project, roomId)) return false;
-  if (!dense(value.tools) || !value.tools.every((tool) => exact(tool, ["id", "description", "effect", "inputSchemaCanonical"])
-    && text(tool.id) && text(tool.description) && ["read-only", "reversible-write", "irreversible-write"].includes(String(tool.effect))
-    && text(tool.inputSchemaCanonical))) return false;
-  const toolIds = value.tools.map((tool) => tool.id).sort();
-  if (new Set(toolIds).size !== toolIds.length ||
-      toolIds.length !== value.agent.effectiveTools.length ||
-      toolIds.some((toolId, index) => toolId !== value.agent.effectiveTools[index])) return false;
+  if (!dense(value.tools) || !value.tools.every(toolDescriptor)) return false;
+  const toolIds = [...new Set(value.tools.map((tool) => tool.id))].sort();
+  if (toolIds.length !== agent.effectiveTools.length ||
+      toolIds.some((toolId, index) => toolId !== agent.effectiveTools[index])) return false;
   if (!exact(value.trusted, ["system", "developerPolicy"]) || !text(value.trusted.system) || !text(value.trusted.developerPolicy)) return false;
   const memoryWatermark = Number(value.memoryWatermark);
   const corpusHead = Number(value.corpusHead);
