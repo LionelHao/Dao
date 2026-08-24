@@ -2916,10 +2916,10 @@ describe("SQLite authoritative sessions", () => {
       humanMatrixCase(
         "agent.configure",
         "agent.configured",
-        "SELECT COUNT(*) AS count FROM room_memberships WHERE actor_id = 'agent-review' AND participation = 'silent'",
+        "SELECT COUNT(*) AS count FROM room_memberships WHERE actor_id = 'agent-review' AND participation = 'active'",
         ({ roomId }) => ({
           type: "agent.configure", roomId,
-          payload: { agentId: "agent-review", participation: "silent", toolPermissions: ["review.read"] },
+          payload: { agentId: "agent-review", participation: "active", toolPermissions: ["review.read"] },
         }),
         ({ roomId }) => ({
           type: "agent.configure", roomId,
@@ -3184,7 +3184,7 @@ describe("SQLite authoritative sessions", () => {
             roomId,
             payload: {
               agentId: "agent-review",
-              participation: "silent",
+              participation: "on-mention",
               toolPermissions: ["review.read"],
             },
           } as const;
@@ -3258,7 +3258,7 @@ describe("SQLite authoritative sessions", () => {
           roomId: fixture.roomId,
           payload: {
             agentId: "agent-review",
-            participation: "silent",
+            participation: "on-mention",
             toolPermissions: ["review.read"],
           },
         },
@@ -4722,7 +4722,7 @@ describe("SQLite authoritative sessions", () => {
               roomId: fixture.contexts.roomId,
               payload: {
                 agentId: targetActorId,
-                participation: "silent",
+                participation: "on-mention",
                 toolPermissions: ["review.read"],
               },
             },
@@ -4740,7 +4740,8 @@ describe("SQLite authoritative sessions", () => {
       }
       await Promise.all([submission, authorityCut]);
       const receipt = await submission;
-      expect(receipt.targetOutcomes).toEqual([order === "authority-cut-first"
+      const targetWasRevokedBeforeSend = targetKind === "human" && order === "authority-cut-first";
+      expect(receipt.targetOutcomes).toEqual([targetWasRevokedBeforeSend
         ? {
             targetId,
             targetActorId,
@@ -4760,7 +4761,7 @@ describe("SQLite authoritative sessions", () => {
       expect(database.prepare(
         `SELECT status, rejection_code AS rejectionCode
          FROM message_target_outcomes WHERE message_id = ? AND target_id = ?`,
-      ).get(messageId, targetId)).toEqual(order === "authority-cut-first"
+      ).get(messageId, targetId)).toEqual(targetWasRevokedBeforeSend
         ? {
             status: "rejected",
             rejectionCode: targetKind === "human"
@@ -4778,13 +4779,13 @@ describe("SQLite authoritative sessions", () => {
         : "agent_invocation_intents";
       expect(database.prepare(
         `SELECT status FROM ${intentTable} WHERE source_message_id = ?`,
-      ).all(messageId)).toEqual(order === "authority-cut-first" ? [] : [{ status: "pending" }]);
+      ).all(messageId)).toEqual(targetWasRevokedBeforeSend ? [] : [{ status: "pending" }]);
       expect(database.prepare(
         `SELECT role, participation FROM room_memberships
          WHERE room_id = ? AND actor_id = ?`,
       ).get(fixture.contexts.roomId, targetActorId)).toEqual(targetKind === "human"
         ? undefined
-        : { role: null, participation: "silent" });
+        : { role: null, participation: "on-mention" });
       database.close();
     },
   );

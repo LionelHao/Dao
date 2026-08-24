@@ -7929,7 +7929,8 @@ export function submitHumanMessageDatabaseCommand(
               status: "rejected",
               code: "target_not_member",
             };
-          } else if (target.kind === "agent-invocation" && membership.participation !== "active") {
+          } else if (target.kind === "agent-invocation" &&
+              membership.participation !== "active" && membership.participation !== "on-mention") {
             outcome = {
               targetId: target.id,
               targetActorId: target.targetActorId,
