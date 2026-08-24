@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
+import { seedCanonicalAgentProfileFixture } from "../fixtures/agent-authority-fixture.js";
 import {
   migrateAuthorityDatabase,
   migrateAuthorityDatabaseToVersion3ForTest,
@@ -146,6 +147,11 @@ function seedClosedMixedStressRecords(
        id, kind, display_name, reachability, readiness, tool_permissions_json
      ) VALUES ('stress-agent', 'agent', 'Stress Agent', NULL, 'ready', '["review.read"]')`,
   ).run();
+  seedCanonicalAgentProfileFixture(database, {
+    actorId: "stress-agent",
+    displayName: "Stress Agent",
+    status: "disabled",
+  });
   database.prepare(
     `INSERT OR IGNORE INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
      VALUES ('identity', 'stress-agent', 0, 1)`,
@@ -323,6 +329,7 @@ async function createDatabaseFixture(options: {
   database.exec("BEGIN IMMEDIATE");
   try {
     for (const context of contexts) seedHuman(database, context, options.catalogRevision ?? 0);
+    const seededAgentIds = new Set<string>();
     for (const room of options.rooms ?? []) {
       if (room.agentMessage !== undefined) {
         database.prepare(
@@ -330,7 +337,15 @@ async function createDatabaseFixture(options: {
              id, kind, display_name, reachability, readiness, tool_permissions_json
            ) VALUES (?, 'agent', 'Stress Agent', NULL, 'ready', '["review.read"]')`,
         ).run(room.agentMessage.actorId);
+        seededAgentIds.add(room.agentMessage.actorId);
       }
+    }
+    for (const actorId of seededAgentIds) {
+      seedCanonicalAgentProfileFixture(database, {
+        actorId,
+        displayName: "Stress Agent",
+        status: "disabled",
+      });
     }
     for (const room of options.rooms ?? []) {
       seedRoom(database, contexts[0]!, room.roomId, room.messageCount,
@@ -652,6 +667,11 @@ describe("durable materialized snapshot worker", () => {
       `INSERT INTO actors (id, kind, display_name, reachability, readiness, tool_permissions_json)
        VALUES ('agent-a', 'agent', 'Agent', NULL, 'ready', '["tool"]')`,
     ).run();
+    seedCanonicalAgentProfileFixture(database, {
+      actorId: "agent-a",
+      displayName: "Agent",
+      status: "disabled",
+    });
     database.prepare(
       `INSERT INTO room_memberships (
          room_id, actor_id, kind, role, participation, tool_permissions_json,

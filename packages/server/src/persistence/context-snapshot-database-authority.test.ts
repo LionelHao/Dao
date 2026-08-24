@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
+import { seedCanonicalAgentProfileFixture } from "../fixtures/agent-authority-fixture.js";
 import {
   commitFinalContextCitationsInTransaction,
   ContextSnapshotDatabaseError,
@@ -201,6 +202,12 @@ function seedExecution(
     ) VALUES ('context-trigger', 'context-room', 'human', 'active', 1, 1,
       '${NOW}', NULL, NULL);
   `);
+  seedCanonicalAgentProfileFixture(database, {
+    actorId: "context-agent",
+    displayName: "Agent",
+    toolCeiling: ["room-memory.read"],
+    now: NOW,
+  });
   begin(database, () => {
     database.exec(`
       INSERT INTO message_mentions (

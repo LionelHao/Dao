@@ -4,6 +4,11 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import {
+  seedCanonicalAgentProfileFixture,
+  seedCanonicalRoomAssignmentFixture,
+  transitionRoomAssignmentPauseFixture,
+} from "../fixtures/agent-authority-fixture.js";
+import {
   AUTHORITY_SCHEMA_VERSION,
   migrateAuthorityDatabase,
 } from "../persistence/schema.js";
@@ -1397,18 +1402,8 @@ describe("SQLite Attachment Authority transaction functions", () => {
           room_id, actor_id, kind, role, participation, tool_permissions_json,
           joined_at, configured_at, access_revision
         ) VALUES (
-          'attachment-room', 'attachment-agent', 'agent', 'member', 'active', '[]',
+          'attachment-room', 'attachment-agent', 'agent', NULL, 'active', '[]',
           '2026-08-19T08:00:00.000Z', '2026-08-19T08:00:00.000Z', 0
-        );
-        INSERT INTO agent_profiles (
-          id, actor_id, revision, status, capability_ceiling_json, tool_ceiling_json
-        ) VALUES ('attachment-profile', 'attachment-agent', 1, 'enabled', '[]', '[]');
-        INSERT INTO room_agent_assignments (
-          id, room_id, profile_id, agent_actor_id, revision, status,
-          participation, paused, capability_subset_json, tool_subset_json
-        ) VALUES (
-          'attachment-assignment', 'attachment-room', 'attachment-profile',
-          'attachment-agent', 1, 'current', 'active', 0, '[]', '[]'
         );
         INSERT INTO agent_executions (
           id, room_id, room_archive_generation, agent_id, trigger_message_id, status,
@@ -1423,6 +1418,19 @@ describe("SQLite Attachment Authority transaction functions", () => {
           '2026-08-19T08:00:00.000Z', 1
         );
       `);
+      seedCanonicalAgentProfileFixture(database, {
+        actorId: "attachment-agent",
+        profileId: "attachment-profile",
+        displayName: "Attachment Agent",
+        now: "2026-08-19T08:00:00.000Z",
+      });
+      seedCanonicalRoomAssignmentFixture(database, {
+        assignmentId: "attachment-assignment",
+        roomId: "attachment-room",
+        profileId: "attachment-profile",
+        actorId: "attachment-agent",
+        now: "2026-08-19T08:00:00.000Z",
+      });
       const input = {
         context: {
           kind: "agent-execution" as const,
@@ -1455,10 +1463,22 @@ describe("SQLite Attachment Authority transaction functions", () => {
         byteSize: 3,
       });
 
-      database.exec("UPDATE room_agent_assignments SET paused = 1 WHERE id = 'attachment-assignment'");
+      transitionRoomAssignmentPauseFixture(database, {
+        assignmentId: "attachment-assignment",
+        expectedRevision: 1,
+        paused: true,
+        changedByHumanActorId: "attachment-human",
+        now: "2026-08-19T08:01:00.000Z",
+      });
       expectDatabaseError(() => authorizeAgentAttachmentExtractionDatabaseQuery(database, input),
         403, "attachment_forbidden");
-      database.exec("UPDATE room_agent_assignments SET paused = 0 WHERE id = 'attachment-assignment'");
+      transitionRoomAssignmentPauseFixture(database, {
+        assignmentId: "attachment-assignment",
+        expectedRevision: 2,
+        paused: false,
+        changedByHumanActorId: "attachment-human",
+        now: "2026-08-19T08:02:00.000Z",
+      });
       recallHumanMessageDatabaseCommand(database, {
         context: {
           ...UPLOADER,

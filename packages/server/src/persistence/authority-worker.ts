@@ -640,6 +640,19 @@ function registerActors(request: AuthorityWorkerRequest): void {
            stream_kind, stream_id, head_seq, retained_from_seq
          ) VALUES ('identity', ?, 0, 1)`,
       );
+      const insertStaticAgentProfile = openedDatabase.prepare(
+        `INSERT INTO agent_profiles (
+           id, actor_id, revision, status, capability_ceiling_json, tool_ceiling_json,
+           display_name, global_responsibility, created_at, updated_at, source_kind
+         ) VALUES (?, ?, 1, 'disabled', '[]', '[]', ?, ?, ?, ?, 'static_bootstrap')`,
+      );
+      const insertStaticAgentProfileRevision = openedDatabase.prepare(
+        `INSERT INTO agent_profile_revisions (
+           profile_id, revision, actor_id, display_name, global_responsibility, status,
+           capability_ceiling_json, tool_ceiling_json, changed_by_human_actor_id,
+           changed_at, operation
+         ) VALUES (?, 1, ?, ?, ?, 'disabled', '[]', '[]', NULL, ?, 'static_bootstrap')`,
+      );
 
       for (const actor of request.actors) {
         const reachability = actor.kind === "human" ? actor.reachability : null;
@@ -649,13 +662,13 @@ function registerActors(request: AuthorityWorkerRequest): void {
         );
         const existing = selectActor.get(actor.id);
         if (existing !== undefined) {
-          if (
-            existing.kind !== actor.kind ||
+          const humanCatalogConflict = actor.kind === "human" && (
             existing.displayName !== actor.displayName ||
             existing.reachability !== reachability ||
             existing.readiness !== readiness ||
             existing.toolPermissionsJson !== toolPermissionsJson
-          ) {
+          );
+          if (existing.kind !== actor.kind || humanCatalogConflict) {
             throw new Error("actor_conflict");
           }
           continue;
@@ -670,6 +683,26 @@ function registerActors(request: AuthorityWorkerRequest): void {
           toolPermissionsJson,
         );
         insertStream.run(actor.id);
+        const occurredAt = new Date().toISOString();
+        if (actor.kind === "agent") {
+          const profileId = `static-profile:${stableId("agent-profile", actor.id)}`;
+          const responsibility = "Review static Agent configuration before enabling.";
+          insertStaticAgentProfile.run(
+            profileId,
+            actor.id,
+            actor.displayName,
+            responsibility,
+            occurredAt,
+            occurredAt,
+          );
+          insertStaticAgentProfileRevision.run(
+            profileId,
+            actor.id,
+            actor.displayName,
+            responsibility,
+            occurredAt,
+          );
+        }
         const payload = { actor };
         appendCanonicalIdentityEvent(openedDatabase, {
           principalId: actor.id,
@@ -677,7 +710,7 @@ function registerActors(request: AuthorityWorkerRequest): void {
             "identity.actor.registered", actor.id, canonicalPayloadJson,
           ),
           eventType: "identity.actor.registered",
-          occurredAt: new Date().toISOString(),
+          occurredAt,
           payload,
         });
       }

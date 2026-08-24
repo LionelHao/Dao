@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
+import { seedCanonicalAgentProfileFixture } from "../fixtures/agent-authority-fixture.js";
 import {
   executeBallAuthorityOperation,
   executeHumanDatabaseCommand,
@@ -50,6 +51,9 @@ function openDatabase(): { readonly path: string; readonly database: DatabaseSyn
       ('room-1', 'agent-1', 'agent', NULL, 'active', NULL, '2026-08-17T00:00:00.000Z');
     UPDATE rooms SET owner_actor_id = 'human-1', governance_revision = 1 WHERE id = 'room-1';
   `);
+  seedCanonicalAgentProfileFixture(database, {
+    actorId: "agent-1", displayName: "Agent One",
+  });
   insertLegacyMessageAuthorityRecord(database, {
     id: "message-open", roomId: "room-1", authorId: "human-1", authorKind: "human",
     body: "Explicit request", sentAt: "2026-08-17T00:00:00.000Z",
