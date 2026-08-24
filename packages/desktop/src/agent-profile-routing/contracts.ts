@@ -298,7 +298,7 @@ export function isRoomAgentAssignmentProjection(value: unknown): value is RoomAg
       !canonicalClosedList(value.effectiveCapabilities, capabilities) ||
       !canonicalClosedList(value.toolCeiling, tools) || !canonicalClosedList(value.toolSubset, tools) ||
       !canonicalClosedList(value.effectiveTools, tools) || !revision(value.profileRevision) ||
-      !revision(value.assignmentRevision) || !revision(value.accessRevision)) return false;
+      !revision(value.assignmentRevision) || !revision(value.accessRevision, true)) return false;
   if (value.paused !== (value.availability === "paused")) return false;
   return subset(value.capabilitySubset, value.capabilityCeiling) &&
     subset(value.effectiveCapabilities, value.capabilitySubset) &&

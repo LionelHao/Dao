@@ -7,6 +7,7 @@ import {
   type AgentSettingsBridge,
   type AgentSettingsMutationIntent,
   type AgentSettingsSnapshot,
+  type AgentSettingsStableEventPayload,
 } from "./contracts.js";
 
 export interface AgentSettingsWebSocketLike {
@@ -25,6 +26,7 @@ export function createDesktopAgentSettingsRuntime(options: {
   webSocketFactory: (endpoint: string) => AgentSettingsWebSocketLike;
   governance: (roomId: string) => Promise<Governance>;
   createRequestIdentity: () => Readonly<{ requestId: string; idempotencyKey: string }>;
+  timeoutMs?: number;
 }): AgentSettingsBridge & { close(): void } {
   const listeners = new Set<(message: AgentSettingsAuthorityMessage) => void>();
   let closed = false;
@@ -34,15 +36,21 @@ export function createDesktopAgentSettingsRuntime(options: {
     if (!isAgentSettingsAuthorityMessage(message)) throw new TypeError("Agent Settings message is not closed");
     for (const listener of listeners) listener(structuredClone(message));
   };
-  async function exchange(frame: Record<string, unknown>): Promise<Record<string, unknown>> {
+  async function exchangeOnce(frame: Record<string, unknown>): Promise<Record<string, unknown>> {
     if (closed) throw new Error("authority_unavailable");
     const session = options.session();
     if (session === undefined) throw Object.assign(new Error("authentication_required"), { status: 401 });
     return new Promise((resolve, reject) => {
       const socket = options.webSocketFactory(options.endpoint);
-      const timeout = setTimeout(() => finish(undefined, new Error("authority_unavailable")), 10_000);
+      const timeout = setTimeout(
+        () => finish(undefined, new Error("authority_unavailable")),
+        options.timeoutMs ?? 10_000,
+      );
       let resumed = false;
+      let settled = false;
       const finish = (value?: Record<string, unknown>, error?: Error) => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timeout); socket.close();
         if (error !== undefined) reject(error); else resolve(value!);
       };
@@ -69,7 +77,24 @@ export function createDesktopAgentSettingsRuntime(options: {
         accessToken: session.accessToken,
       })));
       socket.addEventListener("error", () => finish(undefined, new Error("authority_unavailable")));
+      socket.addEventListener("close", () => finish(undefined, new Error("authority_unavailable")));
     });
+  }
+  async function exchange(frame: Record<string, unknown>): Promise<Record<string, unknown>> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        return await exchangeOnce(frame);
+      } catch (error: unknown) {
+        lastError = error;
+        const status = (error as { status?: unknown }).status;
+        const retryable = status === 503 ||
+          (error instanceof Error && error.message === "authority_unavailable");
+        if (!retryable || attempt === 2 || closed) throw error;
+        await new Promise<void>((resolve) => setTimeout(resolve, 25 * (2 ** attempt)));
+      }
+    }
+    throw lastError;
   }
   async function snapshot(roomId: string): Promise<AgentSettingsSnapshot> {
     currentRoomId = roomId;
@@ -128,6 +153,7 @@ export function createDesktopAgentSettingsRuntime(options: {
     getSnapshot(input: { roomId: string }) { return snapshot(input.roomId); },
     async submit(input: Parameters<AgentSettingsBridge["submit"]>[0]) {
       if (!isAgentSettingsMutationIntent(input.intent)) throw new TypeError("Agent Settings intent is not closed");
+      const intent = input.intent;
       const identity = options.createRequestIdentity();
       const before = lastSnapshot;
       const response = await exchange(wire(input.intent, identity.requestId, identity.idempotencyKey));
@@ -141,28 +167,66 @@ export function createDesktopAgentSettingsRuntime(options: {
         publish({ type: "snapshot", snapshot: authoritative });
         const eventId = (response.eventIds as string[])[0];
         if (eventId !== undefined) {
-          const event = input.intent.command.startsWith("profile.") &&
-              authoritative.profileCatalog.status === "available"
-            ? { kind: "profile.upserted" as const,
-                catalogRevision: authoritative.profileCatalog.revision,
-                profile: authoritative.profileCatalog.profiles.find((item) =>
-                  item.revision === response.acceptedRevision)! }
-            : input.intent.command === "assignment.remove"
-              ? { kind: "assignment.removed" as const, roomId: currentRoomId,
-                  roomRevision: authoritative.room.status === "available" ? authoritative.room.roomRevision : 0,
-                  assignmentId: "assignmentId" in input.intent ? input.intent.assignmentId : "removed",
-                  actorId: before?.room.status === "available"
-                    ? before.room.assignments.find((item) => item.assignmentId ===
-                      ("assignmentId" in input.intent ? input.intent.assignmentId : "removed"))?.actorId ?? "removed"
-                    : "removed", assignmentRevision: response.acceptedRevision as number }
-              : authoritative.room.status === "available"
-                ? { kind: "assignment.upserted" as const,
-                    roomRevision: authoritative.room.roomRevision,
-                    assignment: authoritative.room.assignments.find((item) =>
-                      item.assignmentRevision === response.acceptedRevision)! }
-                : undefined;
-          if (event !== undefined && !("profile" in event && event.profile === undefined) &&
-              !("assignment" in event && event.assignment === undefined)) {
+          const currentProfiles = authoritative.profileCatalog.status === "available"
+            ? authoritative.profileCatalog.profiles : [];
+          const previousProfileIds = new Set(before?.profileCatalog.status === "available"
+            ? before.profileCatalog.profiles.map((profile) => profile.profileId) : []);
+          let profile = currentProfiles.find(() => false);
+          switch (intent.command) {
+            case "profile.create":
+              profile = currentProfiles.find((candidate) =>
+                !previousProfileIds.has(candidate.profileId) &&
+                candidate.revision === response.acceptedRevision &&
+                candidate.displayName === intent.displayName &&
+                candidate.globalResponsibility === intent.globalResponsibility);
+              break;
+            case "profile.update":
+            case "profile.disable":
+            case "profile.enable":
+              profile = currentProfiles.find((candidate) => candidate.profileId === intent.profileId &&
+                candidate.revision === response.acceptedRevision);
+              break;
+          }
+          const currentAssignments = authoritative.room.status === "available"
+            ? authoritative.room.assignments : [];
+          const previousAssignmentIds = new Set(before?.room.status === "available"
+            ? before.room.assignments.map((assignment) => assignment.assignmentId) : []);
+          let assignment = currentAssignments.find(() => false);
+          switch (intent.command) {
+            case "assignment.create":
+              assignment = currentAssignments.find((candidate) =>
+                !previousAssignmentIds.has(candidate.assignmentId) &&
+                candidate.profileId === intent.profileId &&
+                candidate.assignmentRevision === response.acceptedRevision);
+              break;
+            case "assignment.update":
+            case "assignment.pause":
+            case "assignment.resume":
+              assignment = currentAssignments.find((candidate) =>
+                candidate.assignmentId === intent.assignmentId &&
+                candidate.assignmentRevision === response.acceptedRevision);
+              break;
+          }
+          let event: AgentSettingsStableEventPayload | undefined;
+          if (intent.command.startsWith("profile.") && profile !== undefined &&
+              authoritative.profileCatalog.status === "available") {
+            event = { kind: "profile.upserted",
+              catalogRevision: authoritative.profileCatalog.revision, profile };
+          } else if (intent.command === "assignment.remove") {
+            event = { kind: "assignment.removed", roomId: currentRoomId,
+              roomRevision: authoritative.room.status === "available"
+                ? authoritative.room.roomRevision : 0,
+              assignmentId: intent.assignmentId,
+              actorId: before?.room.status === "available"
+                ? before.room.assignments.find((item) =>
+                    item.assignmentId === intent.assignmentId)?.actorId ?? "removed"
+                : "removed",
+              assignmentRevision: response.acceptedRevision as number };
+          } else if (authoritative.room.status === "available" && assignment !== undefined) {
+            event = { kind: "assignment.upserted",
+              roomRevision: authoritative.room.roomRevision, assignment };
+          }
+          if (event !== undefined) {
             publish({ type: "stable-event", eventId, cursor: Math.max(1, authoritative.cursor),
               causationRequestId: input.requestId, event });
           }

@@ -29,6 +29,7 @@ import {
 import { createScryptIdentityAdapter, MAX_ACTIVE_SESSION_FAMILIES } from "./auth.js";
 import {
   startAuthoritativeServer,
+  startAuthoritativeServerForTest,
   type AuthoritativeServer,
 } from "./authoritative-server.js";
 import type { ServerFrame } from "./protocol.js";
@@ -39,6 +40,8 @@ import {
   type SyncTransport,
 } from "../../desktop/src/sync/client-sync-replica.js";
 import { createDesktopGovernanceRuntime } from "../../desktop/src/governance/production-runtime.js";
+import { createDesktopAgentSettingsRuntime } from
+  "../../desktop/src/agent-profile-routing/production-runtime.js";
 import {
   createDesktopMessageAuthorityRuntime,
   type DesktopMessageAuthorityRuntime,
@@ -1392,6 +1395,164 @@ function attachmentE2ePdf(): Buffer {
 }
 
 describe("authoritative server real-process harness", () => {
+  it("drives the Desktop Agent Settings runtime through real WS, Worker, and SQLite authority", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-ft07-desktop-authority-"));
+    const databasePath = join(directory, "authority.sqlite");
+    const snapshotCachePath = join(directory, "snapshot-cache.sqlite");
+    const accountId = "account-ft07-owner";
+    const passwordCanary = "ft07-desktop-password-canary";
+    const salt = Buffer.from("ft07-desktop-scrypt-salt", "utf8");
+    const identities = createScryptIdentityAdapter([{
+      accountId,
+      actorId: "human-a",
+      salt: salt.toString("base64url"),
+      hash: scryptSync(passwordCanary, salt, 64).toString("base64url"),
+    }]);
+    let roomId: string | undefined;
+    let server: AuthoritativeServer | undefined;
+    let loginClient: JsonWebSocketClient | undefined;
+    let runtime: ReturnType<typeof createDesktopAgentSettingsRuntime> | undefined;
+    try {
+      server = await startAuthoritativeServerForTest({
+        databasePath,
+        snapshotCachePath,
+        sharedAuthority: { maxOfflineReadLeaseMs: 60_000 },
+        listen: { host: "127.0.0.1", port: 0 },
+        actors,
+        identities,
+        invitationSecretKey: new Uint8Array(32).fill(47),
+        tenantAdministration: { bootstrapHumanActorIds: ["human-a"] },
+      }, {
+        initialize: async (facades) => {
+          const issued = await facades.auth.login({ accountId, secret: passwordCanary });
+          const authenticated = await facades.auth.authenticateSession(issued.accessToken);
+          const room = await facades.lifecycle.createRoom({
+            ...authenticated,
+            kind: "human",
+            requestId: "ft07-desktop-seed-room",
+            idempotencyKey: "ft07-desktop-seed-room",
+          }, { name: "FT-07 Desktop Authority" });
+          roomId = room.id;
+        },
+      });
+      if (roomId === undefined) throw new TypeError("FT-07 Room initialization did not complete");
+      loginClient = await JsonWebSocketClient.connect(server.url);
+      const issued = await loginClient.issueSession("ft07-desktop-login", {
+        accountId, secret: passwordCanary,
+      });
+      const session: IdentityAuthoritySession = {
+        actorId: issued.actorId,
+        sessionId: issued.sessionId,
+        accessToken: issued.accessToken,
+        expiresAt: issued.expiresAt,
+      };
+      let requestOrdinal = 0;
+      runtime = createDesktopAgentSettingsRuntime({
+        endpoint: server.url,
+        session: () => session,
+        webSocketFactory: (endpoint) => {
+          const socket = new NodeIdentityWebSocketAdapter(endpoint);
+          return {
+            addEventListener: socket.addEventListener.bind(socket),
+            removeEventListener: socket.removeEventListener.bind(socket),
+            send: socket.send.bind(socket),
+            close: () => socket.terminate(),
+          };
+        },
+        governance: async (requestedRoomId) => ({
+          roomId: requestedRoomId,
+          roomName: "FT-07 Desktop Authority",
+          lifecycle: "active",
+          roomRevision: 1,
+          roomRole: "owner",
+        }),
+        createRequestIdentity: () => {
+          requestOrdinal += 1;
+          return {
+            requestId: `ft07-desktop-authority-${requestOrdinal}`,
+            idempotencyKey: `ft07-desktop-authority-key-${requestOrdinal}`,
+          };
+        },
+        timeoutMs: 2_000,
+      });
+      const observed: unknown[] = [];
+      runtime.onAuthorityMessage((message) => observed.push(message));
+      const initial = await runtime.getSnapshot({ roomId });
+      expect(initial).toMatchObject({
+        viewer: { actorId: "human-a", tenantAdministrator: true, roomRole: "owner" },
+        profileCatalog: { status: "available", profiles: [
+          expect.objectContaining({ actorId: "agent-a", status: "disabled", revision: 1 }),
+        ] },
+        room: { status: "available", roomId, assignments: [] },
+      });
+      await expect(runtime.submit({
+        requestId: "renderer-profile-create",
+        intent: {
+          command: "profile.create",
+          displayName: "FT-07 Research Agent",
+          globalResponsibility: "Research authoritative sources for the Room.",
+          capabilityCeiling: ["room.conversation.read", "room.memory.read", "room.respond"],
+          toolCeiling: ["room-memory.read"],
+        },
+      })).resolves.toMatchObject({
+        type: "ack", requestId: "renderer-profile-create", command: "profile.create",
+        replayed: false, acceptedRevision: 1, eventIds: [expect.any(String)],
+      });
+      const afterProfile = await runtime.getSnapshot({ roomId });
+      if (afterProfile.profileCatalog.status !== "available" ||
+          afterProfile.room.status !== "available") {
+        throw new TypeError("FT-07 authority snapshot unexpectedly became forbidden");
+      }
+      const profile = afterProfile.profileCatalog.profiles.find((candidate) =>
+        candidate.displayName === "FT-07 Research Agent");
+      if (profile === undefined) throw new TypeError("FT-07 Profile was not re-read from authority");
+      await expect(runtime.submit({
+        requestId: "renderer-assignment-create",
+        intent: {
+          command: "assignment.create",
+          roomId,
+          profileId: profile.profileId,
+          expectedRoomRevision: afterProfile.room.roomRevision,
+          roomResponsibility: "Answer only when mentioned and cite Room memory.",
+          participation: "on-mention",
+          capabilitySubset: ["room.conversation.read", "room.memory.read", "room.respond"],
+          toolSubset: ["room-memory.read"],
+        },
+      })).resolves.toMatchObject({
+        type: "ack", requestId: "renderer-assignment-create", command: "assignment.create",
+        replayed: false, acceptedRevision: 1, eventIds: [expect.any(String)],
+      });
+      const converged = await runtime.getSnapshot({ roomId });
+      expect(converged.room).toMatchObject({
+        status: "available",
+        assignments: [{
+          profileId: profile.profileId,
+          participation: "on-mention",
+          availability: "noauth",
+          effectiveTools: ["room-memory.read"],
+          profileRevision: 1,
+          assignmentRevision: 1,
+        }],
+      });
+      expect(observed).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "ack", requestId: "renderer-profile-create" }),
+        expect.objectContaining({ type: "stable-event",
+          event: expect.objectContaining({ kind: "profile.upserted" }) }),
+        expect.objectContaining({ type: "ack", requestId: "renderer-assignment-create" }),
+        expect.objectContaining({ type: "stable-event",
+          event: expect.objectContaining({ kind: "assignment.upserted" }) }),
+      ]));
+      const publicEvidence = JSON.stringify({ initial, converged, observed });
+      expect(publicEvidence).not.toContain(passwordCanary);
+      expect(publicEvidence).not.toContain(issued.accessToken);
+    } finally {
+      runtime?.close();
+      loginClient?.terminate();
+      if (server !== undefined) await server.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("bounds silent child cleanup and escalates an ignored SIGTERM to SIGKILL", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-silent-child-"));
     const fixturePath = join(process.cwd(), "packages/server/dist/fixtures/authority-child.js");

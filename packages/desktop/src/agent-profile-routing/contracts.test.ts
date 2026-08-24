@@ -149,6 +149,15 @@ describe("FT-07 public Profile / Assignment DTO guards", () => {
     }
   });
 
+  it("accepts the initial authoritative membership access revision", () => {
+    expect(isAgentSettingsSnapshot(snapshot({
+      room: {
+        ...snapshot().room,
+        assignments: [assignment({ accessRevision: 0 })],
+      },
+    }))).toBe(true);
+  });
+
   it("guards ACK, closed error, stable event and atomic repair messages", () => {
     const messages = [
       {

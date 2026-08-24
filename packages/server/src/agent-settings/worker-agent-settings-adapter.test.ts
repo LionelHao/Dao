@@ -96,6 +96,14 @@ describe("WorkerAgentSettingsAdapter production composition", () => {
     expect(catalog).toMatchObject({ type: "room-agent-assignment.catalog", roomId: room.aggregateId,
       roomRevision: governance.governanceRevision + 1, assignments: [{ availability: "ready", paused: false,
         profileRevision: 1, assignmentRevision: 1, accessRevision: 0 }] });
+    await expect(worker.listPendingOutbox(100, NOW + 1_000)).resolves.toEqual(
+      expect.arrayContaining([expect.objectContaining({
+        event: expect.objectContaining({
+          eventId: assignmentAck.eventIds[0],
+          type: "room.agent-assignment.changed",
+        }),
+      })]),
+    );
 
     const sync = createSyncService({ store: { async syncRoom() { throw new Error("unused"); } },
       agentSettings: adapter });
