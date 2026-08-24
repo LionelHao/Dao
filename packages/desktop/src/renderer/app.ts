@@ -706,7 +706,6 @@ const agentParticipationLabels: ReadonlyArray<
 > = [
   ["active", "主动参与"],
   ["on-mention", "被提及时参与"],
-  ["silent", "静默待命"],
 ];
 const agentParticipationValues = new Set<AgentParticipation>(
   agentParticipationLabels.map(([value]) => value),
