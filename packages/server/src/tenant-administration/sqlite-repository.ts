@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { AuthenticatedSessionContext } from "../persistence/contracts.js";
 import type {
+  CredentialReadiness,
   DeploymentAuditRecord,
   DeploymentProfileMutationRecord,
   GlobalAgentProfile,
@@ -11,11 +12,13 @@ import type {
   TenantAdministrationTransaction,
   TenantAdministratorRegistry,
 } from "./authority-service.js";
+import { TenantAdministrationError } from "./authority-service.js";
 
 export interface SqliteTenantAdministrationRepositoryOptions {
   readonly database: DatabaseSync;
   readonly nowMs?: () => number;
   readonly idempotencyTtlMs?: number;
+  readonly profileAssignmentFanoutLimit?: number;
 }
 
 interface RegistryRow {
@@ -38,6 +41,35 @@ interface ProfileRow {
 }
 
 const DEFAULT_IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1_000;
+export const DEFAULT_PROFILE_ASSIGNMENT_FANOUT_LIMIT = 64;
+
+interface AssignmentFanoutTarget {
+  readonly assignmentId: string;
+  readonly roomId: string;
+  readonly profileId: string;
+  readonly actorId: string;
+  readonly revision: number;
+  readonly participation: "active" | "on-mention";
+  readonly paused: boolean;
+  readonly roomResponsibility: string;
+  readonly capabilitySubset: readonly string[];
+  readonly toolSubset: readonly string[];
+  readonly createdAt: string;
+  readonly roomStatus: "active" | "archived";
+  readonly roomRevision: number;
+  readonly accessRevision: number | null;
+  readonly accessValid: boolean;
+  readonly runningExecutionCount: number;
+}
+
+interface AppliedProfileFanout {
+  readonly profileId: string;
+  readonly fromProfileRevision: number;
+  readonly toProfileRevision: number;
+  readonly credentialReadiness: CredentialReadiness;
+  readonly targets: readonly AssignmentFanoutTarget[];
+  readonly invalidatedContextCount: number;
+}
 
 function nonEmpty(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
@@ -45,6 +77,10 @@ function nonEmpty(value: unknown): value is string {
 
 function positiveInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function nonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function parseCanonicalSet(value: unknown): readonly string[] {
@@ -146,6 +182,108 @@ function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
+function intersect(
+  subset: readonly string[],
+  ceiling: readonly string[],
+): readonly string[] {
+  const allowed = new Set(ceiling);
+  return Object.freeze(subset.filter((entry) => allowed.has(entry)));
+}
+
+function roomAssignmentProjection(
+  profile: GlobalAgentProfile,
+  target: AssignmentFanoutTarget,
+  credentialReadiness: CredentialReadiness,
+): Readonly<Record<string, unknown>> {
+  const availability = target.paused ? "paused"
+    : credentialReadiness === "noauth" ? "noauth"
+    : target.runningExecutionCount > 0 ? "busy" : "ready";
+  return Object.freeze({
+    recordVersion: "room-agent-assignment.v1",
+    assignmentId: target.assignmentId,
+    roomId: target.roomId,
+    profileId: profile.profileId,
+    actorId: profile.actorId,
+    displayName: profile.displayName,
+    globalResponsibility: profile.globalResponsibility,
+    roomResponsibility: target.roomResponsibility,
+    participation: target.participation,
+    availability,
+    paused: target.paused,
+    capabilityCeiling: profile.capabilityCeiling,
+    capabilitySubset: target.capabilitySubset,
+    effectiveCapabilities: target.capabilitySubset,
+    toolCeiling: profile.toolCeiling,
+    toolSubset: target.toolSubset,
+    effectiveTools: target.toolSubset,
+    profileRevision: profile.revision,
+    assignmentRevision: target.revision,
+    accessRevision: target.accessRevision ?? 0,
+    updatedAt: profile.updatedAt,
+  });
+}
+
+function appendRoomProfileFanout(
+  database: DatabaseSync,
+  record: DeploymentProfileMutationRecord,
+  fanout: AppliedProfileFanout,
+): void {
+  const { profile } = record;
+  for (const target of fanout.targets) {
+    const eventId = `profile-room-event-${sha256(`${record.eventId}\0${target.assignmentId}`)}`;
+    const visible = profile.status === "enabled" && target.roomStatus === "active" &&
+      target.accessValid && target.accessRevision !== null;
+    const payload = visible
+      ? { change: "upserted", roomRevision: target.roomRevision,
+          assignment: roomAssignmentProjection(profile, target, fanout.credentialReadiness) }
+      : { change: "removed", roomRevision: target.roomRevision,
+          assignmentId: target.assignmentId, actorId: target.actorId,
+          assignmentRevision: target.revision };
+    const stream = database.prepare(
+      `SELECT head_seq AS headSeq FROM streams
+       WHERE stream_kind = 'room' AND stream_id = ?`,
+    ).get(target.roomId) as { readonly headSeq?: unknown } | undefined;
+    if (!nonNegativeInteger(stream?.headSeq) || stream.headSeq >= Number.MAX_SAFE_INTEGER) {
+      throw new Error("Profile fan-out Room stream is unavailable");
+    }
+    const streamSeq = stream.headSeq + 1;
+    const advanced = database.prepare(
+      `UPDATE streams SET head_seq = ?
+       WHERE stream_kind = 'room' AND stream_id = ? AND head_seq = ?`,
+    ).run(streamSeq, target.roomId, stream.headSeq);
+    if (advanced.changes !== 1) {
+      throw new Error("Profile fan-out Room stream changed concurrently");
+    }
+    database.prepare(
+      `INSERT INTO events (
+         event_id, stream_kind, stream_id, stream_seq, room_id,
+         actor_id, event_type, occurred_at, payload_json
+       ) VALUES (?, 'room', ?, ?, ?, ?, 'room.agent-assignment.changed', ?, ?)`,
+    ).run(eventId, target.roomId, streamSeq, target.roomId, target.actorId,
+      record.occurredAt, JSON.stringify(payload));
+    database.prepare(
+      `INSERT INTO outbox_deliveries (
+         id, event_id, target_kind, target_id, stream_seq, status,
+         attempts, available_at, delivered_at, last_error
+       ) VALUES (?, ?, 'room', ?, ?, 'pending', 0, ?, NULL, NULL)`,
+    ).run(`profile-room-outbox-${sha256(eventId)}`, eventId, target.roomId,
+      streamSeq, record.occurredAt);
+    database.prepare(
+      `INSERT INTO room_audit (
+         id, type, room_id, actor_id, result, timestamp, details_json
+       ) VALUES (?, 'room.agent.configured', ?, ?, 'configured', ?, ?)`,
+    ).run(`profile-room-audit-${sha256(eventId)}`, target.roomId, target.actorId,
+      record.occurredAt, JSON.stringify({
+        operation: "profile-fanout",
+        reason: record.eventKind,
+        profileId: profile.profileId,
+        profileRevision: profile.revision,
+        assignmentId: target.assignmentId,
+        assignmentRevision: target.revision,
+      }));
+  }
+}
+
 function deploymentProfileProjection(record: DeploymentProfileMutationRecord): string {
   const { profile } = record;
   return JSON.stringify({
@@ -166,22 +304,20 @@ function deploymentProfileProjection(record: DeploymentProfileMutationRecord): s
 function appendDeploymentProfileMutation(
   database: DatabaseSync,
   record: DeploymentProfileMutationRecord,
+  fanout?: AppliedProfileFanout,
 ): void {
   const { profile } = record;
   let invalidatedContextCount = 0;
   let cancelledRouteIntentCount = 0;
   let affectedAssignmentCount = 0;
   if (record.previousRevision !== null) {
-    const assignmentRow = database.prepare(
-      `SELECT COUNT(*) AS count FROM room_agent_assignments
-       WHERE profile_id = ? AND status = 'current'`,
-    ).get(profile.profileId) as { readonly count?: unknown } | undefined;
-    if (typeof assignmentRow?.count !== "number" || !Number.isSafeInteger(assignmentRow.count) ||
-        assignmentRow.count < 0) {
-      throw new Error("Profile Assignment impact is corrupt");
+    if (fanout === undefined || fanout.profileId !== profile.profileId ||
+        fanout.fromProfileRevision !== record.previousRevision ||
+        fanout.toProfileRevision !== profile.revision) {
+      throw new Error("Profile Assignment fan-out plan is unavailable");
     }
-    affectedAssignmentCount = assignmentRow.count;
-    invalidatedContextCount = Number(database.prepare(
+    affectedAssignmentCount = fanout.targets.length;
+    invalidatedContextCount = fanout.invalidatedContextCount + Number(database.prepare(
       `UPDATE context_snapshots
        SET state = 'invalidated', snapshot_generation = snapshot_generation + 1,
            invalidated_at = ?, invalidation_reason = 'authorization_changed'
@@ -204,6 +340,7 @@ function appendDeploymentProfileMutation(
     ).run(`profile-invalidation-${sha256(record.eventId)}`, profile.profileId,
       record.previousRevision, profile.revision, reason, invalidatedContextCount,
       cancelledRouteIntentCount, affectedAssignmentCount, record.occurredAt);
+    appendRoomProfileFanout(database, record, fanout);
   }
 
   const stream = database.prepare(
@@ -269,14 +406,21 @@ export function createSqliteTenantAdministrationRepository(
   const database = options.database;
   const nowMs = options.nowMs ?? Date.now;
   const idempotencyTtlMs = options.idempotencyTtlMs ?? DEFAULT_IDEMPOTENCY_TTL_MS;
+  const profileAssignmentFanoutLimit = options.profileAssignmentFanoutLimit ??
+    DEFAULT_PROFILE_ASSIGNMENT_FANOUT_LIMIT;
   if (!Number.isSafeInteger(idempotencyTtlMs) || idempotencyTtlMs <= 0) {
     throw new TypeError("deployment idempotency TTL must be positive");
+  }
+  if (!Number.isSafeInteger(profileAssignmentFanoutLimit) ||
+      profileAssignmentFanoutLimit <= 0 || profileAssignmentFanoutLimit > 256) {
+    throw new TypeError("Profile Assignment fan-out limit must be between 1 and 256");
   }
 
   return Object.freeze({
     async transact<TResult>(operation: (transaction: TenantAdministrationTransaction) => TResult) {
       database.exec("BEGIN IMMEDIATE");
       let currentSession: AuthenticatedSessionContext | undefined;
+      let appliedProfileFanout: AppliedProfileFanout | undefined;
       try {
         const transaction: TenantAdministrationTransaction = {
           requireCurrentSession(context) {
@@ -390,7 +534,10 @@ export function createSqliteTenantAdministrationRepository(
                VALUES ('identity', ?, 0, 1)`,
             ).run(actorId);
           },
-          writeProfile(profile) {
+          writeProfile(profile, credentialReadiness) {
+            if (currentSession === undefined) {
+              throw new Error("Profile write requires current session");
+            }
             const previous = queryProfile(database, profile.profileId);
             const capabilityJson = JSON.stringify(profile.capabilityCeiling);
             const toolJson = JSON.stringify(profile.toolCeiling);
@@ -406,9 +553,119 @@ export function createSqliteTenantAdministrationRepository(
                 capabilityJson, toolJson, profile.displayName, profile.globalResponsibility,
                 profile.createdAt, profile.updatedAt);
             } else {
+              if (credentialReadiness !== "ready" && credentialReadiness !== "noauth") {
+                throw new Error("Profile Assignment fan-out credential readiness is unavailable");
+              }
               if (profile.actorId !== previous.actorId || profile.createdAt !== previous.createdAt ||
                   profile.revision !== previous.revision + 1) {
                 throw new Error("Global Agent Profile identity or CAS is invalid");
+              }
+              const countRow = database.prepare(
+                `SELECT COUNT(*) AS count FROM room_agent_assignments
+                 WHERE profile_id = ? AND status = 'current'`,
+              ).get(profile.profileId) as { readonly count?: unknown } | undefined;
+              if (!nonNegativeInteger(countRow?.count)) {
+                throw new Error("Profile Assignment fan-out count is corrupt");
+              }
+              if (countRow.count > profileAssignmentFanoutLimit) {
+                throw new TenantAdministrationError(429, "profile_fanout_capacity_limited");
+              }
+              const rows = database.prepare(
+                `SELECT assignment.id AS assignmentId, assignment.room_id AS roomId,
+                        assignment.profile_id AS profileId,
+                        assignment.agent_actor_id AS actorId, assignment.revision,
+                        assignment.participation, assignment.paused,
+                        assignment.room_responsibility AS roomResponsibility,
+                        assignment.capability_subset_json AS capabilitySubsetJson,
+                        assignment.tool_subset_json AS toolSubsetJson,
+                        assignment.created_at AS createdAt,
+                        room.status AS roomStatus,
+                        room.governance_revision AS roomRevision,
+                        membership.kind AS membershipKind,
+                        membership.access_revision AS accessRevision,
+                        (SELECT COUNT(*) FROM agent_executions AS execution
+                         WHERE execution.room_id = assignment.room_id
+                           AND execution.agent_id = assignment.agent_actor_id
+                           AND execution.status IN ('queued', 'running')) AS runningExecutionCount
+                 FROM room_agent_assignments AS assignment
+                 JOIN rooms AS room ON room.id = assignment.room_id
+                 LEFT JOIN room_memberships AS membership
+                   ON membership.room_id = assignment.room_id
+                  AND membership.actor_id = assignment.agent_actor_id
+                 WHERE assignment.profile_id = ? AND assignment.status = 'current'
+                 ORDER BY assignment.room_id, assignment.id`,
+              ).all(profile.profileId) as unknown as readonly Record<string, unknown>[];
+              if (rows.length !== countRow.count) {
+                throw new Error("Profile Assignment fan-out enumeration changed concurrently");
+              }
+              const targets: AssignmentFanoutTarget[] = [];
+              let invalidatedContextCount = 0;
+              for (const row of rows) {
+                if (!nonEmpty(row.assignmentId) || !nonEmpty(row.roomId) ||
+                    row.profileId !== profile.profileId || row.actorId !== profile.actorId ||
+                    !positiveInteger(row.revision) ||
+                    (row.participation !== "active" && row.participation !== "on-mention") ||
+                    (row.paused !== 0 && row.paused !== 1) ||
+                    !nonEmpty(row.roomResponsibility) || !nonEmpty(row.createdAt) ||
+                    (row.roomStatus !== "active" && row.roomStatus !== "archived") ||
+                    !nonNegativeInteger(row.roomRevision) ||
+                    (row.membershipKind !== null && row.membershipKind !== "agent") ||
+                    (row.accessRevision !== null && !nonNegativeInteger(row.accessRevision)) ||
+                    !nonNegativeInteger(row.runningExecutionCount)) {
+                  throw new Error("Profile Assignment fan-out authority is corrupt");
+                }
+                const capabilitySubset = intersect(
+                  parseCanonicalSet(row.capabilitySubsetJson), profile.capabilityCeiling,
+                );
+                const toolSubset = intersect(
+                  parseCanonicalSet(row.toolSubsetJson), profile.toolCeiling,
+                );
+                const revision = row.revision + 1;
+                const updated = database.prepare(
+                  `UPDATE room_agent_assignments
+                   SET revision = ?, capability_subset_json = ?, tool_subset_json = ?,
+                       updated_at = ?
+                   WHERE id = ? AND profile_id = ? AND revision = ? AND status = 'current'`,
+                ).run(revision, JSON.stringify(capabilitySubset), JSON.stringify(toolSubset),
+                  profile.updatedAt, row.assignmentId, profile.profileId, row.revision);
+                if (updated.changes !== 1) {
+                  throw new Error("Profile Assignment fan-out CAS failed");
+                }
+                database.prepare(
+                  `INSERT INTO room_agent_assignment_revisions (
+                     assignment_id, revision, room_id, profile_id, agent_actor_id,
+                     room_responsibility, status, participation, paused,
+                     capability_subset_json, tool_subset_json, changed_by_human_actor_id,
+                     changed_at, operation
+                   ) VALUES (?, ?, ?, ?, ?, ?, 'current', ?, ?, ?, ?, ?, ?, 'update')`,
+                ).run(row.assignmentId, revision, row.roomId, profile.profileId, profile.actorId,
+                  row.roomResponsibility, row.participation, row.paused,
+                  JSON.stringify(capabilitySubset), JSON.stringify(toolSubset),
+                  currentSession.principal.actorId, profile.updatedAt);
+                invalidatedContextCount += Number(database.prepare(
+                  `UPDATE context_snapshots
+                   SET state = 'invalidated', snapshot_generation = snapshot_generation + 1,
+                       invalidated_at = ?, invalidation_reason = 'authorization_changed'
+                   WHERE room_id = ? AND agent_id = ? AND state = 'active'`,
+                ).run(profile.updatedAt, row.roomId, profile.actorId).changes);
+                targets.push(Object.freeze({
+                  assignmentId: row.assignmentId,
+                  roomId: row.roomId,
+                  profileId: profile.profileId,
+                  actorId: profile.actorId,
+                  revision,
+                  participation: row.participation,
+                  paused: row.paused === 1,
+                  roomResponsibility: row.roomResponsibility,
+                  capabilitySubset,
+                  toolSubset,
+                  createdAt: row.createdAt,
+                  roomStatus: row.roomStatus,
+                  roomRevision: row.roomRevision,
+                  accessRevision: row.accessRevision,
+                  accessValid: row.membershipKind === "agent",
+                  runningExecutionCount: row.runningExecutionCount,
+                }));
               }
               operationKind = profile.status !== previous.status
                 ? (profile.status === "enabled" ? "enable" : "disable") : "update";
@@ -424,8 +681,15 @@ export function createSqliteTenantAdministrationRepository(
               if (updated.changes !== 1) throw new Error("Global Agent Profile CAS failed");
               database.prepare("UPDATE actors SET display_name = ? WHERE id = ? AND kind = 'agent'")
                 .run(profile.displayName, profile.actorId);
+              appliedProfileFanout = Object.freeze({
+                profileId: profile.profileId,
+                fromProfileRevision: previous.revision,
+                toProfileRevision: profile.revision,
+                credentialReadiness,
+                targets: Object.freeze(targets),
+                invalidatedContextCount,
+              });
             }
-            if (currentSession === undefined) throw new Error("Profile write requires current session");
             database.prepare(
               `INSERT INTO agent_profile_revisions (
                  profile_id, revision, actor_id, display_name, global_responsibility, status,
@@ -440,7 +704,7 @@ export function createSqliteTenantAdministrationRepository(
             if (currentSession === undefined) {
               throw new Error("Profile event requires current session");
             }
-            appendDeploymentProfileMutation(database, record);
+            appendDeploymentProfileMutation(database, record, appliedProfileFanout);
           },
           readReplay(key): StoredReplay | undefined {
             const separator = key.indexOf("\0");

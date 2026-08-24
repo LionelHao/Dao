@@ -159,6 +159,16 @@ import type {
   TenantAdministrationOperation,
   TenantAdministrationResult,
 } from "../tenant-administration/authority-protocol.js";
+import {
+  executeRoomAssignmentCommandInTransaction,
+  getRoomAssignmentInTransaction,
+  listRoomAssignmentsInTransaction,
+  RoomAssignmentServiceError,
+} from "../room-assignment/assignment-service.js";
+import type {
+  RoomAssignmentOperation,
+  RoomAssignmentResult,
+} from "../room-assignment/authority-protocol.js";
 
 export class AuthorityDatabaseError extends Error {
   readonly details?: DepartureConflictList;
@@ -211,6 +221,7 @@ function tenantAdministrationError(error: unknown): never {
       invalid_profile: "invalid_parameters",
       profile_not_found: "profile_not_found",
       profile_state_conflict: "profile_state_conflict",
+      profile_fanout_capacity_limited: "profile_fanout_capacity_limited",
       configuration_unsupported: "configuration_unsupported",
     };
     throw new AuthorityDatabaseError(codes[error.code], error.message);
@@ -352,6 +363,83 @@ export async function executeTenantAdministrationAuthorityOperation(
     "authority_operation_unavailable",
     "Tenant administration operation was not handled",
   );
+}
+
+function roomAssignmentError(error: unknown): never {
+  if (error instanceof RoomAssignmentServiceError) {
+    const codes: Record<RoomAssignmentServiceError["code"], AuthorityWorkerErrorCode> = {
+      unauthenticated: "unauthenticated",
+      forbidden: "room_forbidden",
+      invalid_request: "invalid_request",
+      not_found: "assignment_not_found",
+      gone: "assignment_gone",
+      conflict: "revision_conflict",
+      idempotency_conflict: "idempotency_conflict",
+      storage_unavailable: "storage_unavailable",
+    };
+    throw new AuthorityDatabaseError(codes[error.code], `Room Assignment ${error.code}`);
+  }
+  throw error;
+}
+
+export function executeRoomAssignmentAuthorityOperation(
+  database: DatabaseSync,
+  operation: RoomAssignmentOperation,
+  providerCredentialReadiness: "ready" | "noauth" = "noauth",
+): RoomAssignmentResult {
+  try {
+    switch (operation.type) {
+      case "room-assignment.mutate":
+        return {
+          kind: "room-assignment-command",
+          acknowledgement: runAuthorityParticipantImmediateTransaction(
+            database,
+            operation.request.roomId,
+            `room-assignment:${operation.request.requestId}`,
+            (transaction) => executeRoomAssignmentCommandInTransaction(
+              transaction,
+              operation.context,
+              operation.request,
+              operation.now,
+              providerCredentialReadiness === "ready",
+            ),
+          ),
+        };
+      case "room-assignment.list":
+        return {
+          kind: "room-assignments",
+          assignments: withDatabaseAuthorityTransactionView(
+            database,
+            operation.roomId,
+            `room-assignment-list:${operation.roomId}`,
+            (transaction) => listRoomAssignmentsInTransaction(
+              transaction,
+              operation.context,
+              operation.roomId,
+              operation.now,
+            ),
+          ),
+        };
+      case "room-assignment.get":
+        return {
+          kind: "room-assignment",
+          assignment: withDatabaseAuthorityTransactionView(
+            database,
+            operation.roomId,
+            `room-assignment-get:${operation.roomId}:${operation.assignmentId}`,
+            (transaction) => getRoomAssignmentInTransaction(
+              transaction,
+              operation.context,
+              operation.roomId,
+              operation.assignmentId,
+              operation.now,
+            ),
+          ),
+        };
+    }
+  } catch (error: unknown) {
+    roomAssignmentError(error);
+  }
 }
 
 export interface SharedAuthorityParticipantComposition {

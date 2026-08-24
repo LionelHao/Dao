@@ -19,6 +19,7 @@ import { DatabaseSync } from "node:sqlite";
 import { Worker } from "node:worker_threads";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import {
+  AuthorityWorkerClientError,
   createWorkerDatabaseClient,
   createWorkerDatabaseClientWithRollbackFailureForTest,
   createWorkerDatabaseClientForTest,
@@ -31,6 +32,7 @@ import {
   runAuthorityImmediateTransaction,
 } from "./authority-database-handler.js";
 import {
+  isAuthorityWorkerErrorCode,
   isAuthorityWorkerRequest,
   isAuthorityWorkerResponse,
   type AuthorityWorkerRequest,
@@ -1587,6 +1589,14 @@ describe("public worker transport errors", () => {
 });
 
 describe("WorkerDatabaseClient", () => {
+  it("maps the closed Profile fan-out capacity code to 429", () => {
+    expect(isAuthorityWorkerErrorCode("profile_fanout_capacity_limited")).toBe(true);
+    expect(new AuthorityWorkerClientError(
+      "profile_fanout_capacity_limited",
+      "Profile Assignment fan-out capacity was exceeded",
+    )).toMatchObject({ status: 429, code: "profile_fanout_capacity_limited" });
+  });
+
   it("migrates and idempotently recovers every archived authority participant on restart", async () => {
     const path = databasePath();
     const legacy = new DatabaseSync(path);

@@ -68,6 +68,10 @@ import type {
   TenantAdministrationOperation,
   TenantAdministrationResult,
 } from "../tenant-administration/authority-protocol.js";
+import type {
+  RoomAssignmentOperation,
+  RoomAssignmentResult,
+} from "../room-assignment/authority-protocol.js";
 import {
   toAgentMessageWorkerContext,
   type InternalAgentMessageCommitContext,
@@ -282,6 +286,7 @@ export interface WorkerDatabaseClient {
   executeTenantAdministration(
     operation: TenantAdministrationOperation,
   ): Promise<TenantAdministrationResult>;
+  executeRoomAssignment(operation: RoomAssignmentOperation): Promise<RoomAssignmentResult>;
   close(): Promise<void>;
 }
 
@@ -370,6 +375,7 @@ function authorityWorkerClientErrorStatus(
       return 403;
     case "invitation_not_found":
     case "administrator_not_found":
+    case "assignment_not_found":
     case "profile_not_found":
     case "member_not_found":
     case "message_not_found":
@@ -433,6 +439,7 @@ function authorityWorkerClientErrorStatus(
     case "memory_source_gone":
     case "context_snapshot_invalidated":
     case "context_source_gone":
+    case "assignment_gone":
       return 410;
     case "attachment_too_large":
     case "chunk_too_large":
@@ -450,6 +457,7 @@ function authorityWorkerClientErrorStatus(
     case "attachment_capacity_limited":
     case "memory_capacity_limited":
     case "context_capacity_limited":
+    case "profile_fanout_capacity_limited":
       return 429;
     case "scanner_unavailable":
     case "extractor_unavailable":
@@ -1431,6 +1439,19 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
     });
   }
 
+  executeRoomAssignment(operation: RoomAssignmentOperation): Promise<RoomAssignmentResult> {
+    if (this.#terminalError !== undefined) return this.#rejectTerminal();
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) return Promise.reject(unavailable);
+    return this.#send({ type: "authority.room-assignment", operation }).then((response) => {
+      if (response.type !== "authority.room-assignment-result") {
+        this.#failProtocol("Authority worker returned the wrong Room Assignment response");
+        throw this.#terminalError;
+      }
+      return response.result;
+    });
+  }
+
   executeContext(operation: ContextWorkerOperation): Promise<unknown> {
     if (this.#terminalError !== undefined) return this.#rejectTerminal();
     const unavailable = this.#unavailableError();
@@ -2015,6 +2036,8 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
         responseType === "authority.attachment-result") ||
       (requestType === "authority.tenant-administration" &&
         responseType === "authority.tenant-administration-result") ||
+      (requestType === "authority.room-assignment" &&
+        responseType === "authority.room-assignment-result") ||
       (requestType === "authority.message-submit" &&
         responseType === "authority.message-submitted") ||
       (requestType === "authority.message-revise" &&

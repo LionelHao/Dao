@@ -214,6 +214,7 @@ export type WorkerDatabaseClient = Omit<
   | "executeMemory"
   | "executeAttachment"
   | "executeTenantAdministration"
+  | "executeRoomAssignment"
   | "readActor"
   | "readRoom"
   | "readRoomGovernance"

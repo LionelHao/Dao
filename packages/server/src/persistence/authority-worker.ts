@@ -33,6 +33,7 @@ import {
   recallHumanMessageDatabaseCommand,
   executeRuntimeAuthorityOperation,
   executeTenantAdministrationAuthorityOperation,
+  executeRoomAssignmentAuthorityOperation,
   executeRouteAuthorityOperation,
   executeBallAuthorityOperation,
   authorizeOutboxCandidateDatabaseQuery,
@@ -2200,6 +2201,30 @@ async function executeTenantAdministration(request: AuthorityWorkerRequest): Pro
   }
 }
 
+function executeRoomAssignment(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.room-assignment") {
+    throw new TypeError("executeRoomAssignment received the wrong request type");
+  }
+  try {
+    const result = executeRoomAssignmentAuthorityOperation(
+      requireAuthorityTransactionDatabase(),
+      request.operation,
+      isAuthorityWorkerData(workerData) &&
+          workerData.deploymentProviderDisclosure?.credentialReadiness === "ready"
+        ? "ready"
+        : "noauth",
+    );
+    respond({ type: "authority.room-assignment-result", requestId: request.requestId, result });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    respondWithStorageFailure(
+      request.requestId,
+      error,
+      "Room Assignment authority operation failed",
+    );
+  }
+}
+
 function submitHumanMessage(request: AuthorityWorkerRequest): void {
   if (request.type !== "authority.message-submit") throw new TypeError("wrong message submit");
   try {
@@ -2939,6 +2964,9 @@ async function dispatch(value: unknown): Promise<void> {
       return;
     case "authority.tenant-administration":
       await executeTenantAdministration(value);
+      return;
+    case "authority.room-assignment":
+      executeRoomAssignment(value);
       return;
     case "authority.message-submit":
       submitHumanMessage(value);

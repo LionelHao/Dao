@@ -90,7 +90,7 @@ export interface TenantAdministrationTransaction {
   readProfile(profileId: string): GlobalAgentProfile | undefined;
   listProfiles(): readonly GlobalAgentProfile[];
   createAgentActor(actorId: string, displayName: string): void;
-  writeProfile(profile: GlobalAgentProfile): void;
+  writeProfile(profile: GlobalAgentProfile, credentialReadiness?: CredentialReadiness): void;
   appendProfileMutation(record: DeploymentProfileMutationRecord): void;
   readReplay(key: string): StoredReplay | undefined;
   writeReplay(key: string, fingerprint: string, result: unknown): void;
@@ -119,14 +119,15 @@ export type TenantAdministrationErrorCode =
   | "invalid_profile"
   | "profile_not_found"
   | "profile_state_conflict"
+  | "profile_fanout_capacity_limited"
   | "configuration_unsupported";
 
 export class TenantAdministrationError extends Error {
-  readonly status: 400 | 403 | 404 | 409 | 503;
+  readonly status: 400 | 403 | 404 | 409 | 429 | 503;
   readonly code: TenantAdministrationErrorCode;
 
   constructor(
-    status: 400 | 403 | 404 | 409 | 503,
+    status: 400 | 403 | 404 | 409 | 429 | 503,
     code: TenantAdministrationErrorCode,
   ) {
     super(code);
@@ -365,8 +366,8 @@ export function createTenantAdministrationAuthority(
   }
   const clock = options.clock ?? (() => new Date().toISOString());
 
-  function requireProvider(): void {
-    freezeProvider(options.providerDisclosure());
+  function requireProvider(): DeploymentProviderDisclosure {
+    return freezeProvider(options.providerDisclosure());
   }
 
   async function authenticated<TResult>(
@@ -455,7 +456,7 @@ export function createTenantAdministrationAuthority(
   ): Promise<{ readonly profile: GlobalAgentProfile }> {
     return idempotent(`profile.${action}`, context, command,
       (transaction, session, _registry, occurredAt) => {
-        requireProvider();
+        const provider = requireProvider();
         if (!validText(command.profileId, MAX_ID_BYTES) ||
             !validPositiveRevision(command.expectedRevision)) {
           throw new TenantAdministrationError(400, "invalid_profile");
@@ -471,7 +472,7 @@ export function createTenantAdministrationAuthority(
         }
         const profile = freezeProfile({ ...current, status, revision: current.revision + 1,
           updatedAt: occurredAt });
-        transaction.writeProfile(profile);
+        transaction.writeProfile(profile, provider.credentialReadiness);
         transaction.appendAudit(immutableAudit(options, `profile.${action}`,
           session.principal.actorId, profile.profileId, profile.revision,
           context.requestId, occurredAt));
@@ -589,7 +590,7 @@ export function createTenantAdministrationAuthority(
     updateProfile(context, command) {
       return idempotent("profile.update", context, command,
         (transaction, session, _registry, occurredAt) => {
-          requireProvider();
+          const provider = requireProvider();
           if (!validText(command.profileId, MAX_ID_BYTES) ||
               !validPositiveRevision(command.expectedRevision)) {
             throw new TenantAdministrationError(400, "invalid_profile");
@@ -604,7 +605,7 @@ export function createTenantAdministrationAuthority(
             globalResponsibility: command.globalResponsibility,
             capabilityCeiling: command.capabilityCeiling, toolCeiling: command.toolCeiling,
             revision: current.revision + 1, updatedAt: occurredAt });
-          transaction.writeProfile(profile);
+          transaction.writeProfile(profile, provider.credentialReadiness);
           transaction.appendAudit(immutableAudit(options, "profile.update",
             session.principal.actorId, profile.profileId, profile.revision,
             context.requestId, occurredAt));
