@@ -503,6 +503,13 @@ export type {
   ToolReversibility,
 } from "./collaboration.js";
 export {
+  isAgentProfileProjection,
+  isDeploymentAgentProfileRepairSnapshot,
+  isDeploymentAgentProfileSyncResult,
+  isDeploymentProviderDisclosure,
+  isPersistedDeploymentAgentProfileEvent,
+  isRoomAgentAssignmentProjection,
+  isRoomAgentAssignmentRepairSnapshot,
   isRoomCursor,
   isRoomRepairPage,
   isRoomSyncResult,
@@ -511,7 +518,12 @@ export {
   isWorkspaceBootstrapPage,
 } from "./sync.js";
 export type {
+  AgentProfileProjection,
+  DeploymentAgentProfileRepairSnapshot,
+  DeploymentAgentProfileSyncResult,
+  DeploymentProviderDisclosure,
   AgentExecutionLifecyclePayload,
+  PersistedDeploymentAgentProfileEvent,
   PersistedIdentityEvent,
   PersistedRoomEvent,
   LegacyUnknownCalibrationSignal,
@@ -519,6 +531,9 @@ export type {
   RoomArchivedEventPayload,
   RoomRepairPage,
   RoomRepairRecord,
+  RoomAgentAssignmentChangedPayload,
+  RoomAgentAssignmentProjection,
+  RoomAgentAssignmentRepairSnapshot,
   RoomReopenedEventPayload,
   RoomSecurityReducedEventPayload,
   RoomSummary,

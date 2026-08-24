@@ -40,6 +40,7 @@ import {
   type OutboxDispatchStore,
   type RoomLifecycleService,
   type SyncService,
+  createSyncService,
   createSubscriptionRegistry,
 } from "./index.js";
 import {
@@ -6128,6 +6129,276 @@ describe("closed FT-02B/FT-02C WebSocket governance", () => {
         principal: governanceSession.principal,
       });
       expect(execute.mock.calls[0]?.[1]).toEqual(request);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+});
+
+describe("closed FT-07 Agent Settings WebSocket authority", () => {
+  const provider = {
+    providerId: "openai",
+    modelId: "gpt-5",
+    credentialReadiness: "ready",
+  } as const;
+  const assignment = {
+    recordVersion: "room-agent-assignment.v1",
+    assignmentId: "assignment-1",
+    roomId,
+    profileId: "profile-1",
+    actorId: "agent-1",
+    displayName: "Research",
+    globalResponsibility: "Review evidence",
+    roomResponsibility: "Review this Room",
+    participation: "on-mention",
+    availability: "ready",
+    paused: false,
+    capabilityCeiling: ["room.conversation.read", "room.respond"],
+    capabilitySubset: ["room.conversation.read"],
+    effectiveCapabilities: ["room.conversation.read"],
+    toolCeiling: ["room-memory.read"],
+    toolSubset: ["room-memory.read"],
+    effectiveTools: ["room-memory.read"],
+    profileRevision: 2,
+    assignmentRevision: 3,
+    accessRevision: 4,
+    updatedAt: "2026-08-24T00:00:00.000Z",
+  } as const;
+
+  it("requires authentication and a real authority port", async () => {
+    const server = await startMessageWebSocketServer({
+      auth: governanceAuthenticationService(),
+      service: idleMessageService(),
+    });
+    const client = await LoopbackClient.connect(server.url);
+    try {
+      client.send({ type: "agent-profile.list", requestId: "profile-unauthenticated" });
+      await expect(client.waitForError("unauthenticated", "profile-unauthenticated"))
+        .resolves.toMatchObject({ frame: { status: 401 } });
+      await client.login(humans[0], "profile-login");
+      client.send({ type: "agent-profile.list", requestId: "profile-unavailable" });
+      await expect(client.waitForError("storage_unavailable", "profile-unavailable"))
+        .resolves.toMatchObject({ frame: { status: 503 } });
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("routes deployment queries, room queries, repair and mutations through typed authority seams", async () => {
+    const executeQuery = vi.fn(async (_context, frame: Record<string, unknown>) =>
+      frame.type === "room-agent-assignment.get"
+        ? {
+            type: "room-agent-assignment.detail",
+            requestId: frame.requestId,
+            roomId,
+            assignment,
+            provider,
+          }
+        : frame.type === "room-agent-assignment.list"
+        ? {
+            type: "room-agent-assignment.catalog",
+            requestId: frame.requestId,
+            roomId,
+            roomRevision: 5,
+            assignments: [],
+            provider,
+          }
+        : {
+            type: "agent-profile.catalog",
+            requestId: frame.requestId,
+            catalogRevision: 7,
+            profiles: [],
+            provider,
+          });
+    const executeMutation = vi.fn(async (_context, frame: Record<string, unknown>) => ({
+      type: "agent-settings.ack",
+      requestId: frame.requestId,
+      operation: frame.type,
+      acceptedRevision: 6,
+      eventIds: ["assignment-event-1"],
+      replayed: false,
+    }));
+    const repair = vi.fn(async (_context, requestId: string) => ({
+      type: "agent-profile.repair.snapshot",
+      requestId,
+      watermark: 7,
+      profiles: [],
+      provider,
+    }));
+    const syncProfiles = vi.fn(async (_context, input: { requestId: string; afterSeq?: number }) => ({
+      type: "agent-profile.sync.result",
+      requestId: input.requestId,
+      mode: "delta",
+      events: [],
+      nextCursor: input.afterSeq ?? 0,
+      watermark: input.afterSeq ?? 0,
+      hasMore: false,
+    }));
+    const sync = createSyncService({
+      store: { async syncRoom() { throw new Error("not used"); } },
+      agentSettings: {
+        syncAgentProfiles: syncProfiles,
+        repairAgentProfiles: repair,
+        async repairRoomAgentAssignments() { throw new Error("not used"); },
+      },
+    });
+    const server = await startMessageWebSocketServer({
+      auth: governanceAuthenticationService(),
+      service: idleMessageService(),
+      agentSettingsAuthority: { executeQuery, executeMutation },
+      sync,
+    });
+    const client = await LoopbackClient.connect(server.url);
+    try {
+      await client.login(humans[0], "agent-settings-login");
+      client.send({ type: "agent-profile.list", requestId: "profile-list" });
+      await client.waitForFrame((frame) => hasType(frame, "agent-profile.catalog") &&
+        frame.requestId === "profile-list", "Profile catalog");
+      client.send({
+        type: "room-agent-assignment.list", requestId: "assignment-list", roomId,
+      });
+      await client.waitForFrame((frame) => hasType(frame, "room-agent-assignment.catalog") &&
+        frame.requestId === "assignment-list", "Assignment catalog");
+      client.send({
+        type: "room-agent-assignment.get", requestId: "assignment-get", roomId,
+        assignmentId: "assignment-1",
+      });
+      await client.waitForFrame((frame) => hasType(frame, "room-agent-assignment.detail") &&
+        frame.requestId === "assignment-get" &&
+        frame.assignment.assignmentId === "assignment-1", "Assignment detail");
+      client.send({
+        type: "agent-profile.sync", requestId: "profile-sync", afterSeq: 6, limit: 32,
+      });
+      await client.waitForFrame((frame) => hasType(frame, "agent-profile.sync.result") &&
+        frame.requestId === "profile-sync" && frame.nextCursor === 6, "Profile delta sync");
+      client.send({ type: "agent-profile.repair", requestId: "profile-repair" });
+      await client.waitForFrame((frame) => hasType(frame, "agent-profile.repair.snapshot") &&
+        frame.requestId === "profile-repair", "Profile repair");
+      client.send({
+        type: "room-agent-assignment.pause",
+        requestId: "assignment-pause",
+        idempotencyKey: "assignment-pause-key",
+        roomId,
+        assignmentId: "assignment-1",
+        expectedRoomRevision: 5,
+        expectedAssignmentRevision: 2,
+      });
+      const acknowledgement = await client.waitForFrame((frame) =>
+        hasType(frame, "agent-settings.ack") && frame.requestId === "assignment-pause",
+      "Assignment ACK");
+      expect(acknowledgement.frame).toEqual({
+        type: "agent-settings.ack",
+        requestId: "assignment-pause",
+        operation: "room-agent-assignment.pause",
+        acceptedRevision: 6,
+        eventIds: ["assignment-event-1"],
+        replayed: false,
+      });
+      expect(acknowledgement.frame).not.toHaveProperty("assignment");
+      expect(executeQuery).toHaveBeenCalledTimes(3);
+      expect(syncProfiles).toHaveBeenCalledWith(governanceSession, {
+        requestId: "profile-sync", afterSeq: 6, limit: 32,
+      });
+      expect(repair).toHaveBeenCalledOnce();
+      expect(executeMutation).toHaveBeenCalledOnce();
+      expect(executeMutation.mock.calls[0]?.[0]).toMatchObject({
+        ...governanceSession,
+        kind: "human",
+        requestId: "assignment-pause",
+        idempotencyKey: "assignment-pause-key",
+      });
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("rejects malformed authority results instead of inventing stable state", async () => {
+    const server = await startMessageWebSocketServer({
+      auth: governanceAuthenticationService(),
+      service: idleMessageService(),
+      agentSettingsAuthority: {
+        async executeQuery(_context, frame) {
+          return {
+            type: "agent-profile.catalog",
+            requestId: frame.requestId,
+            catalogRevision: 1,
+            profiles: [],
+            provider: { ...provider, credential: "secret-canary" },
+          };
+        },
+        async executeMutation(_context, frame) {
+          return {
+            type: "agent-settings.ack", requestId: frame.requestId, operation: frame.type,
+            acceptedRevision: 2, eventIds: ["duplicate", "duplicate"], replayed: false,
+          };
+        },
+      },
+      sync: createSyncService({
+        store: { async syncRoom() { throw new Error("not used"); } },
+        agentSettings: {
+          async syncAgentProfiles() { throw new Error("not used"); },
+          async repairAgentProfiles(_context, requestId) {
+            return { type: "agent-profile.repair.snapshot", requestId,
+              watermark: 1, profiles: [], provider: { ...provider, roomId: "room-secret" } };
+          },
+          async repairRoomAgentAssignments() { throw new Error("not used"); },
+        },
+      }),
+    });
+    const client = await LoopbackClient.connect(server.url);
+    try {
+      await client.login(humans[0], "malformed-agent-settings-login");
+      client.send({ type: "agent-profile.list", requestId: "malformed-profile" });
+      const profileError = await client.waitForError("storage_unavailable", "malformed-profile");
+      expect(JSON.stringify(profileError.frame)).not.toContain("secret-canary");
+      client.send({ type: "agent-profile.repair", requestId: "malformed-repair" });
+      const repairError = await client.waitForError("storage_unavailable", "malformed-repair");
+      expect(JSON.stringify(repairError.frame)).not.toContain("room-secret");
+      client.send({
+        type: "agent-profile.disable", requestId: "malformed-ack", idempotencyKey: "key",
+        profileId: "profile-1", expectedProfileRevision: 1,
+      });
+      await expect(client.waitForError("storage_unavailable", "malformed-ack"))
+        .resolves.toMatchObject({ frame: { status: 503 } });
+      expect(client.frameCount((frame) => hasType(frame, "agent-settings.ack"))).toBe(0);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it.each([
+    [400, "invalid_request"],
+    [401, "unauthenticated"],
+    [403, "administrator_required"],
+    [404, "profile_not_found"],
+    [409, "administrator_revision_conflict"],
+    [409, "assignment_already_exists"],
+    [409, "profile_revision_conflict"],
+    [410, "profile_gone"],
+    [429, "capacity_limited"],
+    [503, "provider_configuration_unavailable"],
+  ] as const)("preserves the closed %i/%s authority error", async (status, code) => {
+    const server = await startMessageWebSocketServer({
+      auth: governanceAuthenticationService(),
+      service: idleMessageService(),
+      agentSettingsAuthority: {
+        async executeQuery() { throw Object.assign(new Error("private-detail"), { status, code }); },
+        async executeMutation() { throw new Error("not used"); },
+      },
+    });
+    const client = await LoopbackClient.connect(server.url);
+    try {
+      await client.login(humans[0], `agent-settings-error-${status}`);
+      client.send({ type: "agent-profile.list", requestId: `profile-error-${status}` });
+      const failure = await client.waitForError(code, `profile-error-${status}`);
+      expect(failure.frame).toEqual({
+        type: "error", status, code, message: code, requestId: `profile-error-${status}`,
+      });
+      expect(JSON.stringify(failure.frame)).not.toContain("private-detail");
     } finally {
       await client.close();
       await server.close();

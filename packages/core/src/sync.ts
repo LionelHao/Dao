@@ -52,6 +52,119 @@ import {
   type RoomMemoryEvent,
   type RoomMemoryRepairRecord,
 } from "./room-memory.js";
+import {
+  isAgentProfileRecord,
+  isCanonicalAgentCapabilitySet,
+  isCanonicalAgentToolSet,
+  type AgentAvailability,
+  type AgentProfileRecord,
+  type AgentAssignmentParticipation,
+  type AgentCapabilityId,
+  type AgentToolId,
+} from "./agent-profile.js";
+
+export interface DeploymentProviderDisclosure {
+  readonly providerId: string;
+  readonly modelId: string;
+  readonly credentialReadiness: "ready" | "noauth";
+}
+
+export type AgentProfileProjection = AgentProfileRecord & Readonly<{
+  recordVersion: "agent-profile.v1";
+}>;
+
+export interface RoomAgentAssignmentProjection {
+  readonly recordVersion: "room-agent-assignment.v1";
+  readonly assignmentId: string;
+  readonly roomId: string;
+  readonly profileId: string;
+  readonly actorId: string;
+  readonly displayName: string;
+  readonly globalResponsibility: string;
+  readonly roomResponsibility: string;
+  readonly participation: AgentAssignmentParticipation;
+  readonly availability: AgentAvailability;
+  readonly paused: boolean;
+  readonly capabilityCeiling: readonly AgentCapabilityId[];
+  readonly capabilitySubset: readonly AgentCapabilityId[];
+  readonly effectiveCapabilities: readonly AgentCapabilityId[];
+  readonly toolCeiling: readonly AgentToolId[];
+  readonly toolSubset: readonly AgentToolId[];
+  readonly effectiveTools: readonly AgentToolId[];
+  readonly profileRevision: number;
+  readonly assignmentRevision: number;
+  readonly accessRevision: number;
+  readonly updatedAt: string;
+}
+
+export type RoomAgentAssignmentChangedPayload =
+  | Readonly<{
+      change: "upserted" | "availability-changed";
+      roomRevision: number;
+      assignment: RoomAgentAssignmentProjection;
+    }>
+  | Readonly<{
+      change: "removed";
+      roomRevision: number;
+      assignmentId: string;
+      actorId: string;
+      assignmentRevision: number;
+    }>;
+
+export interface PersistedDeploymentAgentProfileEvent {
+  readonly eventId: string;
+  readonly streamKind: "deployment";
+  readonly streamId: "agent-profile";
+  readonly streamSeq: number;
+  readonly actorId: string;
+  readonly occurredAt: string;
+  readonly type:
+    | "agent-profile.created"
+    | "agent-profile.updated"
+    | "agent-profile.enabled"
+    | "agent-profile.disabled";
+  readonly payload: Readonly<{
+    catalogRevision: number;
+    profile: AgentProfileProjection;
+  }>;
+}
+
+export interface DeploymentAgentProfileRepairSnapshot {
+  readonly type: "agent-profile.repair.snapshot";
+  readonly requestId: string;
+  readonly watermark: number;
+  readonly profiles: readonly AgentProfileProjection[];
+  readonly provider: DeploymentProviderDisclosure;
+}
+
+export type DeploymentAgentProfileSyncResult =
+  | Readonly<{
+      type: "agent-profile.sync.result";
+      requestId: string;
+      mode: "delta";
+      events: readonly PersistedDeploymentAgentProfileEvent[];
+      nextCursor: number;
+      watermark: number;
+      hasMore: boolean;
+    }>
+  | Readonly<{
+      type: "agent-profile.sync.result";
+      requestId: string;
+      mode: "repair_required";
+      reason: "cursor_absent" | "cursor_expired" | "projection_changed";
+      retainedFromSeq: number;
+      watermark: number;
+    }>;
+
+export interface RoomAgentAssignmentRepairSnapshot {
+  readonly type: "room-agent-assignment.repair.snapshot";
+  readonly requestId: string;
+  readonly roomId: string;
+  readonly watermark: number;
+  readonly roomRevision: number;
+  readonly assignments: readonly RoomAgentAssignmentProjection[];
+  readonly provider: DeploymentProviderDisclosure;
+}
 
 export interface RoomSummary {
   readonly roomId: string;
@@ -211,6 +324,7 @@ export type PersistedRoomEvent =
   | RoomEvent<"human.role.changed", { readonly membership: HumanRoomMembership }>
   | RoomEvent<"member.removed", { readonly targetActorId: string }>
   | RoomEvent<"agent.configured", { readonly membership: AgentRoomMembership }>
+  | RoomEvent<"room.agent-assignment.changed", RoomAgentAssignmentChangedPayload>
   | RoomEvent<"room.message.accepted", Message>
   | MessageAuthorityEvent
   | AttachmentRoomEvent
@@ -358,6 +472,137 @@ function isDeliveryMode(value: UnknownRecord): boolean {
     : value.mode === "streaming" && text(value.idleExpiresAt) && !Object.hasOwn(value, "expiresAt");
 }
 
+function canonicalSubset(candidate: readonly string[], ceiling: readonly string[]): boolean {
+  const allowed = new Set(ceiling);
+  return candidate.every((value) => allowed.has(value));
+}
+
+export function isDeploymentProviderDisclosure(
+  value: unknown,
+): value is DeploymentProviderDisclosure {
+  return isRecord(value) && exact(value, [
+    "providerId", "modelId", "credentialReadiness",
+  ]) && text(value.providerId) && text(value.modelId) &&
+    (value.credentialReadiness === "ready" || value.credentialReadiness === "noauth");
+}
+
+export function isAgentProfileProjection(value: unknown): value is AgentProfileProjection {
+  if (!isRecord(value) || value.recordVersion !== "agent-profile.v1") return false;
+  const { recordVersion, ...profile } = value;
+  void recordVersion;
+  return isAgentProfileRecord(profile);
+}
+
+export function isRoomAgentAssignmentProjection(
+  value: unknown,
+  expectedRoomId?: string,
+): value is RoomAgentAssignmentProjection {
+  if (!isRecord(value) || !exact(value, [
+    "recordVersion", "assignmentId", "roomId", "profileId", "actorId", "displayName",
+    "globalResponsibility", "roomResponsibility", "participation", "availability", "paused",
+    "capabilityCeiling", "capabilitySubset", "effectiveCapabilities", "toolCeiling",
+    "toolSubset", "effectiveTools", "profileRevision", "assignmentRevision", "accessRevision",
+    "updatedAt",
+  ]) || value.recordVersion !== "room-agent-assignment.v1" || !text(value.assignmentId) ||
+      !text(value.roomId) || (expectedRoomId !== undefined && value.roomId !== expectedRoomId) ||
+      !text(value.profileId) || !text(value.actorId) || !text(value.displayName) ||
+      !text(value.globalResponsibility) || !text(value.roomResponsibility) ||
+      (value.participation !== "active" && value.participation !== "on-mention") ||
+      (value.availability !== "ready" && value.availability !== "busy" &&
+       value.availability !== "paused" && value.availability !== "noauth") ||
+      typeof value.paused !== "boolean" ||
+      !isCanonicalAgentCapabilitySet(value.capabilityCeiling) ||
+      !isCanonicalAgentCapabilitySet(value.capabilitySubset) ||
+      !isCanonicalAgentCapabilitySet(value.effectiveCapabilities) ||
+      !isCanonicalAgentToolSet(value.toolCeiling) ||
+      !isCanonicalAgentToolSet(value.toolSubset) ||
+      !isCanonicalAgentToolSet(value.effectiveTools) ||
+      !count(value.profileRevision) || value.profileRevision === 0 ||
+      !count(value.assignmentRevision) || value.assignmentRevision === 0 ||
+      !count(value.accessRevision) || !text(value.updatedAt) ||
+      !Number.isFinite(Date.parse(value.updatedAt as string))) return false;
+  return value.paused === (value.availability === "paused") &&
+    canonicalSubset(value.capabilitySubset, value.capabilityCeiling) &&
+    canonicalSubset(value.effectiveCapabilities, value.capabilitySubset) &&
+    canonicalSubset(value.toolSubset, value.toolCeiling) &&
+    canonicalSubset(value.effectiveTools, value.toolSubset);
+}
+
+export function isPersistedDeploymentAgentProfileEvent(
+  value: unknown,
+): value is PersistedDeploymentAgentProfileEvent {
+  if (!isRecord(value) || !exact(value, [
+    "eventId", "streamKind", "streamId", "streamSeq", "actorId", "occurredAt", "type", "payload",
+  ]) || !text(value.eventId) || value.streamKind !== "deployment" ||
+      value.streamId !== "agent-profile" || !count(value.streamSeq) || value.streamSeq === 0 ||
+      !text(value.actorId) || !text(value.occurredAt) ||
+      (value.type !== "agent-profile.created" && value.type !== "agent-profile.updated" &&
+       value.type !== "agent-profile.enabled" && value.type !== "agent-profile.disabled") ||
+      !isRecord(value.payload) || !exact(value.payload, ["catalogRevision", "profile"]) ||
+      !count(value.payload.catalogRevision) || value.payload.catalogRevision === 0 ||
+      !isAgentProfileProjection(value.payload.profile)) return false;
+  const profile = value.payload.profile;
+  return profile.actorId === value.actorId && value.payload.catalogRevision === value.streamSeq &&
+    (value.type !== "agent-profile.enabled" || profile.status === "enabled") &&
+    (value.type !== "agent-profile.disabled" || profile.status === "disabled");
+}
+
+export function isDeploymentAgentProfileRepairSnapshot(
+  value: unknown,
+): value is DeploymentAgentProfileRepairSnapshot {
+  return isRecord(value) && exact(value, [
+    "type", "requestId", "watermark", "profiles", "provider",
+  ]) && value.type === "agent-profile.repair.snapshot" && text(value.requestId) &&
+    count(value.watermark) && Array.isArray(value.profiles) && value.profiles.length <= 256 &&
+    value.profiles.every(isAgentProfileProjection) &&
+    new Set(value.profiles.map((profile) => profile.profileId)).size === value.profiles.length &&
+    isDeploymentProviderDisclosure(value.provider);
+}
+
+export function isDeploymentAgentProfileSyncResult(
+  value: unknown,
+): value is DeploymentAgentProfileSyncResult {
+  if (!isRecord(value) || value.type !== "agent-profile.sync.result" || text(value.requestId) === false) {
+    return false;
+  }
+  if (value.mode === "repair_required") {
+    return exact(value, [
+      "type", "requestId", "mode", "reason", "retainedFromSeq", "watermark",
+    ]) && (value.reason === "cursor_absent" || value.reason === "cursor_expired" ||
+      value.reason === "projection_changed") && count(value.retainedFromSeq) &&
+      value.retainedFromSeq > 0 && count(value.watermark) &&
+      value.retainedFromSeq <= value.watermark + 1;
+  }
+  if (value.mode !== "delta" || !exact(value, [
+    "type", "requestId", "mode", "events", "nextCursor", "watermark", "hasMore",
+  ]) || !Array.isArray(value.events) || value.events.length > 256 ||
+      !value.events.every(isPersistedDeploymentAgentProfileEvent) || !count(value.nextCursor) ||
+      !count(value.watermark) || value.nextCursor > value.watermark ||
+      typeof value.hasMore !== "boolean") return false;
+  const events = value.events as readonly PersistedDeploymentAgentProfileEvent[];
+  const nextCursor = value.nextCursor as number;
+  return value.hasMore === (nextCursor < value.watermark) &&
+    new Set(events.map((event) => event.eventId)).size === events.length &&
+    events.every((event, index) =>
+      event.streamSeq === nextCursor - events.length + index + 1);
+}
+
+export function isRoomAgentAssignmentRepairSnapshot(
+  value: unknown,
+): value is RoomAgentAssignmentRepairSnapshot {
+  return isRecord(value) && exact(value, [
+    "type", "requestId", "roomId", "watermark", "roomRevision", "assignments", "provider",
+  ]) && value.type === "room-agent-assignment.repair.snapshot" && text(value.requestId) &&
+    text(value.roomId) && count(value.watermark) && count(value.roomRevision) &&
+    Array.isArray(value.assignments) && value.assignments.length <= 256 &&
+    value.assignments.every((assignment) =>
+      isRoomAgentAssignmentProjection(assignment, value.roomId as string)) &&
+    new Set(value.assignments.map((assignment) => assignment.assignmentId)).size ===
+      value.assignments.length &&
+    new Set(value.assignments.map((assignment) => assignment.actorId)).size ===
+      value.assignments.length && isDeploymentProviderDisclosure(value.provider);
+}
+
 export function isRoomCursor(value: unknown): value is RoomCursor {
   return isRecord(value) &&
     exact(
@@ -477,6 +722,18 @@ function isPersistedRoomEventValue(value: unknown): value is PersistedRoomEvent 
   }
   if (value.type === "agent.configured") {
     return exact(payload, ["membership"]) && isAgentMembershipValue(payload.membership);
+  }
+  if (value.type === "room.agent-assignment.changed") {
+    if (payload.change === "removed") {
+      return exact(payload, [
+        "change", "roomRevision", "assignmentId", "actorId", "assignmentRevision",
+      ]) && count(payload.roomRevision) && text(payload.assignmentId) && text(payload.actorId) &&
+        count(payload.assignmentRevision) && payload.assignmentRevision > 0;
+    }
+    return (payload.change === "upserted" || payload.change === "availability-changed") &&
+      exact(payload, ["change", "roomRevision", "assignment"]) &&
+      count(payload.roomRevision) &&
+      isRoomAgentAssignmentProjection(payload.assignment, value.roomId);
   }
   if (value.type === "room.message.accepted") {
     return isMessageValue(payload) && payload.roomId === value.roomId && payload.authorId === value.actorId;
