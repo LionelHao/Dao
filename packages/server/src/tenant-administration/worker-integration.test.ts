@@ -127,6 +127,11 @@ describe("Tenant administration AuthorityWorker integration", () => {
       targetPrincipalId: "human-admin", expectedRevision: 1, now: NOW,
     })).resolves.toMatchObject({ kind: "tenant-administrator-registry",
       registry: { revision: 2, principalIds: ["human-admin", "human-owner"] } });
+    await expect(client.executeTenantAdministration({
+      version: 1, type: "tenant-administrator.bootstrap", principalIds: ["human-owner"],
+      configurationSha256: DIGEST, now: NOW,
+    })).resolves.toMatchObject({ kind: "tenant-administrator-registry",
+      registry: { revision: 2, principalIds: ["human-admin", "human-owner"] } });
   });
 
   it("rechecks revocation and closes credential mutation without an approved store as 503", async () => {

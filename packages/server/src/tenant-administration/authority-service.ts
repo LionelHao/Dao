@@ -490,8 +490,11 @@ export function createTenantAdministrationAuthority(
       return options.repository.transact((transaction) => {
         const existing = transaction.readAdministratorRegistry();
         if (existing !== undefined) {
-          if (existing.configurationDigest === input.configurationDigest &&
-              JSON.stringify(existing.principalIds) === JSON.stringify(principalIds)) return existing;
+          // The deployment bootstrap is a one-time root of authority. Later
+          // administrator add/remove commands intentionally change the live
+          // principal set; a normal restart with the same sealed owner
+          // configuration must preserve that newer authoritative state.
+          if (existing.configurationDigest === input.configurationDigest) return existing;
           throw new TenantAdministrationError(409, "bootstrap_conflict");
         }
         for (const principalId of principalIds) {

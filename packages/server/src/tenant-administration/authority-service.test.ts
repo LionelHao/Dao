@@ -153,6 +153,7 @@ describe("Tenant Administrator authority", () => {
     });
     expect(added.registry).toMatchObject({ revision: 2,
       principalIds: ["human-admin", "human-owner"] });
+    await expect(bootstrap(f)).resolves.toEqual(added.registry);
     await expect(f.authority.addAdministrator(command(), {
       targetPrincipalId: "human-admin", expectedRevision: 1,
     })).resolves.toEqual(added);
