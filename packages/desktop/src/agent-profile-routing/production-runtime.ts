@@ -76,8 +76,12 @@ export function createDesktopAgentSettingsRuntime(options: {
   let closed = false;
   let currentRoomId: string | undefined;
   let roomCursor = 0;
+  let roomRepairWatermark = 0;
   let lastSnapshot: AgentSettingsSnapshot | undefined;
   let syncRunning = false;
+  let repairActive = false;
+  const deferredRoomFrames: WireRecord[] = [];
+  const removedAssignmentRevisions = new Map<string, number>();
   let repairGeneration = 0;
   let syncTimer: ReturnType<typeof setInterval> | undefined;
   let subscribedRoomId: string | undefined;
@@ -117,7 +121,11 @@ export function createDesktopAgentSettingsRuntime(options: {
     rejectPending(new Error(scope === "session" ? "session_revoked" : "room_forbidden"));
     currentRoomId = undefined;
     roomCursor = 0;
+    roomRepairWatermark = 0;
     lastSnapshot = undefined;
+    repairActive = false;
+    deferredRoomFrames.length = 0;
+    removedAssignmentRevisions.clear();
     acknowledgedRequestsByEventId.clear();
     observedEvents.clear();
     for (const waiters of eventWaiters.values()) for (const resolve of waiters) resolve();
@@ -176,6 +184,11 @@ export function createDesktopAgentSettingsRuntime(options: {
     if (!record(frame.event) || frame.event.type !== "room.agent-assignment.changed" ||
         frame.event.roomId !== currentRoomId || typeof frame.event.eventId !== "string" ||
         typeof frame.event.streamSeq !== "number" || !record(frame.event.payload)) return;
+    if (repairActive) {
+      deferredRoomFrames.push(structuredClone(frame));
+      return;
+    }
+    if (frame.event.streamSeq <= roomRepairWatermark) return;
     const payload = frame.event.payload;
     let event: Extract<AgentSettingsAuthorityMessage, { type: "stable-event" }>["event"];
     if (payload.change === "upserted" || payload.change === "availability-changed") {
@@ -183,14 +196,23 @@ export function createDesktopAgentSettingsRuntime(options: {
       const assignment = { ...payload.assignment };
       delete assignment.updatedAt;
       if (!isRoomAgentAssignmentProjection(assignment)) return;
+      const removedRevision = removedAssignmentRevisions.get(assignment.assignmentId);
+      if (removedRevision !== undefined && removedRevision >= assignment.assignmentRevision) return;
+      if (removedRevision !== undefined) removedAssignmentRevisions.delete(assignment.assignmentId);
       event = { kind: "assignment.upserted", roomRevision: payload.roomRevision,
         assignment };
     } else if (payload.change === "removed" && typeof payload.roomRevision === "number" &&
         typeof payload.assignmentId === "string" && typeof payload.actorId === "string" &&
         typeof payload.assignmentRevision === "number" && currentRoomId !== undefined) {
+      const removedRevision = removedAssignmentRevisions.get(payload.assignmentId);
+      if (removedRevision !== undefined && removedRevision >= payload.assignmentRevision) return;
       event = { kind: "assignment.removed", roomId: currentRoomId,
         roomRevision: payload.roomRevision, assignmentId: payload.assignmentId,
         actorId: payload.actorId, assignmentRevision: payload.assignmentRevision };
+      removedAssignmentRevisions.set(payload.assignmentId, Math.max(
+        removedAssignmentRevisions.get(payload.assignmentId) ?? 0,
+        payload.assignmentRevision,
+      ));
     } else return;
     if (lastSnapshot?.room.status === "available" &&
         event.kind === "assignment.upserted") {
@@ -200,7 +222,6 @@ export function createDesktopAgentSettingsRuntime(options: {
           (event.assignment.assignmentRevision < current.assignmentRevision ||
            (event.assignment.assignmentRevision === current.assignmentRevision &&
             event.assignment.accessRevision < current.accessRevision))) {
-        acceptStableEvent(stableEvent(frame.event.eventId, frame.event.streamSeq, event));
         return;
       }
       const assignments = lastSnapshot.room.assignments
@@ -214,7 +235,6 @@ export function createDesktopAgentSettingsRuntime(options: {
       const current = lastSnapshot.room.assignments.find((assignment) =>
         assignment.assignmentId === event.assignmentId);
       if (current === undefined || event.assignmentRevision <= current.assignmentRevision) {
-        acceptStableEvent(stableEvent(frame.event.eventId, frame.event.streamSeq, event));
         return;
       }
       lastSnapshot = { ...lastSnapshot, room: { ...lastSnapshot.room,
@@ -284,7 +304,7 @@ export function createDesktopAgentSettingsRuntime(options: {
           authenticated = true;
           publish({ type: "online" });
           resolve();
-          if (currentRoomId !== undefined) {
+          if (currentRoomId !== undefined && lastSnapshot !== undefined) {
             queueMicrotask(() => void subscribeRoom(currentRoomId!).catch(() => undefined));
           }
           return;
@@ -414,6 +434,8 @@ export function createDesktopAgentSettingsRuntime(options: {
       roomId,
     });
     roomCursor = Number(assignments?.watermark ?? 0);
+    roomRepairWatermark = roomCursor;
+    removedAssignmentRevisions.clear();
     const providerWire = catalog?.provider ?? assignments?.provider;
     if (providerWire === undefined) throw Object.assign(new Error("room_forbidden"), { status: 403 });
     const value = {
@@ -442,7 +464,7 @@ export function createDesktopAgentSettingsRuntime(options: {
       }),
         options.syncIntervalMs ?? 1_000);
     }
-    return structuredClone(value);
+    return structuredClone(lastSnapshot ?? value);
   }
 
   function applyProfileEvent(event: WireRecord): void {
@@ -466,6 +488,7 @@ export function createDesktopAgentSettingsRuntime(options: {
     if (current === undefined || roomId === undefined) return;
     const generation = ++repairGeneration;
     let repairWatermark = reasonWatermark;
+    repairActive = true;
     try {
       const profileRepair = current.profileCatalog.status === "available"
         ? await exchange({ type: "agent-profile.repair",
@@ -479,6 +502,8 @@ export function createDesktopAgentSettingsRuntime(options: {
       publish({ type: "repair-started", generation, watermark: repairWatermark });
       const governance = await options.governance(roomId);
       roomCursor = Number(assignmentRepair?.watermark ?? roomCursor);
+      roomRepairWatermark = roomCursor;
+      removedAssignmentRevisions.clear();
       const repaired = {
         ...current,
         cursor: Number(profileRepair?.watermark ?? current.cursor),
@@ -501,6 +526,10 @@ export function createDesktopAgentSettingsRuntime(options: {
       publish({ type: "repair-failed", generation, watermark: repairWatermark,
         errorCode: error instanceof Error ? error.message : "repair_unavailable" });
       throw error;
+    } finally {
+      repairActive = false;
+      const deferred = deferredRoomFrames.splice(0);
+      for (const frame of deferred) handleRoomEvent(frame);
     }
   }
 
@@ -550,6 +579,7 @@ export function createDesktopAgentSettingsRuntime(options: {
             handleRoomEvent({ type: "room.event", event });
           }
           roomCursor = delta.nextCursor.afterSeq;
+          roomRepairWatermark = Math.max(roomRepairWatermark, roomCursor);
           if (!delta.hasMore) break;
           if (page === 7) throw new Error("repair_unavailable");
         }

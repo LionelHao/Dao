@@ -238,6 +238,7 @@ export function applyAgentSettingsAuthorityMessage(
         (state.operation.status === "submitting" || state.operation.status === "acknowledged") &&
         state.operation.requestId === message.causationRequestId &&
         (state.operation.status !== "acknowledged" || state.operation.eventIds.includes(message.eventId));
+      if (state.snapshot === undefined) return state;
       if (state.appliedEventIds.includes(message.eventId)) {
         return matches
           ? Object.freeze({ ...state, operation: { status: "succeeded" as const,
