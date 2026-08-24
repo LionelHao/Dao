@@ -41,7 +41,7 @@ function claim(job: RouteJob): RouteAuthorityClaim {
       message: { authorId: "human-1", authorKind: "human", summary: "migration risk" },
       roomPhase: "discussion",
       agents: [
-        { agentId: "agent-direct", participation: "silent", role: "agent", capabilities: [], calibrationScore: 0, hasBall: false },
+        { agentId: "agent-direct", participation: "on-mention", role: "agent", capabilities: [], calibrationScore: 0, hasBall: false },
         { agentId: "agent-active", participation: "active", role: "agent", capabilities: ["review.read"], calibrationScore: 0, hasBall: false },
       ],
       topic: {

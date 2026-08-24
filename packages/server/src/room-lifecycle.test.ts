@@ -1451,7 +1451,7 @@ describe("room lifecycle service", () => {
       kind: "agent-configuration",
       roomId: room.id,
       agentId: searchAgent.id,
-      participation: "silent",
+      participation: "on-mention",
       toolPermissions: ["search"],
     });
     await expect(
@@ -1947,7 +1947,7 @@ describe("room lifecycle service", () => {
         kind: "agent-configuration",
         roomId: room.id,
         agentId: searchAgent.id,
-        participation: "silent",
+        participation: "on-mention",
         toolPermissions: ["summarize"],
       });
 
@@ -1959,7 +1959,7 @@ describe("room lifecycle service", () => {
         expect.objectContaining({
           kind: "agent",
           actorId: searchAgent.id,
-          participation: "silent",
+          participation: "on-mention",
           toolPermissions: ["summarize"],
           configuredAt: "2026-08-09T10:00:02.000Z",
         }),
@@ -1977,7 +1977,7 @@ describe("room lifecycle service", () => {
         }),
         expect.objectContaining({
           targetActorId: searchAgent.id,
-          participation: "silent",
+          participation: "on-mention",
           toolPermissions: ["summarize"],
           timestamp: "2026-08-09T10:00:02.000Z",
         }),
@@ -2045,7 +2045,7 @@ describe("room lifecycle service", () => {
         kind: "agent-configuration",
         roomId: "fixture-room",
         agentId: searchAgent.id,
-        participation: "silent",
+        participation: "on-mention",
         toolPermissions: ["search"],
       }),
     ).resolves.toMatchObject({ id: "fixture-room" });

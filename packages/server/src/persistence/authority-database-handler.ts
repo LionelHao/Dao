@@ -2104,8 +2104,7 @@ function readManagedRoom(database: DatabaseSync, roomId: string): JsonValue {
         member.kind === "agent" &&
         typeof member.actorId === "string" &&
         (member.participation === "active" ||
-          member.participation === "on-mention" ||
-          member.participation === "silent") &&
+          member.participation === "on-mention") &&
         typeof member.toolPermissionsJson === "string" &&
         typeof member.configuredAt === "string"
       ) {
@@ -3571,12 +3570,12 @@ function enqueueRouteJobForMessage(
      WHERE membership.room_id = ?
        AND membership.kind = 'agent'
        AND actor.kind = 'agent'
-       AND membership.participation IN ('active', 'on-mention', 'silent')
+       AND membership.participation IN ('active', 'on-mention')
      ORDER BY membership.actor_id`,
   ).all(topic.topicKey, message.roomId);
   for (const member of members) {
     if (typeof member.agentId !== "string" ||
-        (member.participation !== "active" && member.participation !== "on-mention" && member.participation !== "silent") ||
+        (member.participation !== "active" && member.participation !== "on-mention") ||
         typeof member.role !== "string" || member.role.trim().length === 0 ||
         typeof member.capabilitiesJson !== "string" ||
         typeof member.calibrationScore !== "number") {
@@ -5307,7 +5306,7 @@ export function executeRouteAuthorityOperation(
           return fail("storage_unavailable", "Route capability snapshot was corrupt");
         }
         if (typeof member.agentId !== "string" ||
-            (member.participation !== "active" && member.participation !== "on-mention" && member.participation !== "silent") ||
+            (member.participation !== "active" && member.participation !== "on-mention") ||
             typeof member.role !== "string" || !Array.isArray(capabilities) ||
             !capabilities.every((entry) => typeof entry === "string") ||
             typeof member.calibrationScore !== "number" ||
@@ -8604,17 +8603,14 @@ export function readMessageHistoryDatabaseQuery(
             : row.role === "admin" ? "Admin" : "Member",
         };
       }
-      if (row.participation !== "active" && row.participation !== "on-mention" &&
-          row.participation !== "silent") {
+      if (row.participation !== "active" && row.participation !== "on-mention") {
         return fail("storage_unavailable", "Message history Agent assignment is corrupt");
       }
       return {
         actorId: row.actorId,
         kind: "agent" as const,
         displayName: row.displayName,
-        secondaryLabel: row.participation === "active"
-          ? "Active Agent"
-          : row.participation === "on-mention" ? "On-mention Agent" : "Silent Agent",
+        secondaryLabel: row.participation === "active" ? "Active Agent" : "On-mention Agent",
       };
     });
     const limit = messageAuthorityPageLimit(query.limit);

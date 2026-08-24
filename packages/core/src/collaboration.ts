@@ -354,7 +354,7 @@ export interface RouterProviderInput {
   readonly roomPhase: RouteRoomPhase;
   readonly agents: readonly {
     readonly agentId: string;
-    readonly participation: "active" | "on-mention" | "silent";
+    readonly participation: "active" | "on-mention";
     readonly role: string;
     readonly capabilities: readonly string[];
     readonly calibrationScore: number;
@@ -382,7 +382,6 @@ export type RouteReasonCode =
   | "domain_match"
   | "risk_detected"
   | "ball_due"
-  | "participation_silent"
   | "participation_on_mention"
   | "cooldown"
   | "agent_round_limit"
@@ -519,7 +518,7 @@ export function isAgentJudgement(value: unknown): value is AgentJudgement {
 
 const routeReasonCodes = new Set<RouteReasonCode>([
   "direct_mention", "structured_help", "domain_match", "risk_detected", "ball_due",
-  "participation_silent", "participation_on_mention", "cooldown", "agent_round_limit",
+  "participation_on_mention", "cooldown", "agent_round_limit",
   "human_burst_soft_suppression", "execution_phase", "calibration_suppressed",
   "provider_omitted", "provider_failed", "permission_denied", "not_selected",
 ]);
@@ -600,7 +599,7 @@ export function isRouterProviderInput(value: unknown): value is RouterProviderIn
     if (!isRecord(agent) || !hasExactKeys(agent, [
       "agentId", "participation", "role", "capabilities", "calibrationScore", "hasBall",
     ]) || !isNonEmptyString(agent.agentId) || agentIds.has(agent.agentId) ||
-        (agent.participation !== "active" && agent.participation !== "on-mention" && agent.participation !== "silent") ||
+        (agent.participation !== "active" && agent.participation !== "on-mention") ||
         !isNonEmptyString(agent.role) || !Array.isArray(agent.capabilities) ||
         !agent.capabilities.every(isNonEmptyString) ||
         new Set(agent.capabilities).size !== agent.capabilities.length ||

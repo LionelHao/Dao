@@ -530,8 +530,8 @@ function membershipRecord(row: Record<string, unknown>): RoomRepairRecord {
       role: row.role, joinedAt: row.joinedAt }};
   }
   if (row.kind === "agent" && typeof row.actorId === "string" &&
-      (row.participation === "active" || row.participation === "on-mention" ||
-        row.participation === "silent") && typeof row.configuredAt === "string") {
+      (row.participation === "active" || row.participation === "on-mention") &&
+      typeof row.configuredAt === "string") {
     const permissions = parseJson(row.toolPermissionsJson);
     if (Array.isArray(permissions) && permissions.length > 0 && permissions.every(text)) {
       return { kind: "membership", value: { kind: "agent", actorId: row.actorId,
