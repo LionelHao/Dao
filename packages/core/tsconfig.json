@@ -10,6 +10,7 @@
   },
   "include": [
     "src/index.ts",
+    "src/agent-profile.ts",
     "src/collaboration.ts",
     "src/sync.ts",
     "src/message-authority.ts",
