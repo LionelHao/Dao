@@ -75,6 +75,10 @@ UI映射与正式设计偏离记录见rebaseline第1、6、7节；偏离为“�
 - Context compiler manifest和Agent Settings projection都以`Profile ceiling ∩ Assignment subset ∩ membership tool policy`形成effective tools；测试证明membership撤权后ceiling/subset仍保留，而effective tools与compiled tool manifest均为空。
 - Desktop生产runtime改为单个持久认证WebSocket上的request multiplexing、`agent-profile.sync/repair`、`room.sync`、Assignment repair与Room subscribe；stable event只来自真实deployment/Room persisted event。双真实Desktop客户端E2E证明外部客户端mutation经相同event ID实时收敛，另有stable-event先于ACK correlation的竞态回归。
 - 修复后最终独占全量门禁：199 files（196 passed / 3 skipped / 0 failed），2163 tests（2160 passed / 3 skipped / 0 failed），247.74s；Core I/O boundary与Desktop renderer boundary（23 production sources）均通过。另行通过typecheck、lint、build与真实Desktop Agent Settings聚焦E2E（1 passed / 25 skipped）。三个skip仍是opt-in OpenAI Agent、Router、Memory live suites；未读取或披露secret。
+- 第二轮独立审阅发现：Assignment mutation/Profile fan-out 的持久事件曾遗漏membership tool policy交集，Desktop Assignment事件曾误用deployment cursor，session/Room revoke曾未同步清除Agent Settings authority。三项均已由生产代码与回归关闭。
+- 第三至第五轮独立竞态审阅继续发现并关闭：bootstrap/repair snapshot与live event安装顺序、removed Assignment旧upsert复活、已订阅recover旧repair覆盖live remove、repair期间revoke后旧authority写回、repair event buffer无界、周期Profile sync推进后被旧catalog snapshot回退。最终runtime使用authority epoch/generation/current-Room fence、snapshot/periodic sync双向串行化、每Assignment removal revision tombstone、repair watermark、event-ID去重与512条硬上限；overflow从未推进的authoritative Room cursor继续catch-up。
+- 对应确定性Desktop回归为production runtime 9项、view-model 14项，共2 files / 23 tests；另有600事件buffer上限、1ms周期sync与held repair、governance await期间revoke等专门反例。typecheck、lint、build均通过。
+- 第六轮最终独立只读审阅对象：`25fde4e431a42b62f8aba14069af6084a04637a9`。结论：无blocker；审阅者另行运行Desktop聚焦23/23与真实authority E2E 26/26，确认worktree clean、`git diff --check`通过。
 - CI链接与merge SHA待GitHub事实产生后写入交付说明。
 
 ## 7. PR、CI、review与清理日志（持续更新）
