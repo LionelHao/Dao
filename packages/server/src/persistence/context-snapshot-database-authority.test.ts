@@ -194,9 +194,9 @@ function seedExecution(
   intentKind: "direct_mention" | "structured_help" | "routed_candidate" = "direct_mention",
 ): void {
   database.exec(`
-    INSERT INTO actors (id, kind, display_name, tool_permissions_json)
-    VALUES ('context-human', 'human', 'Human', '[]'),
-           ('context-agent', 'agent', 'Agent', '["room-memory.read"]');
+    INSERT INTO actors (id, kind, display_name, tool_permissions_json, readiness)
+    VALUES ('context-human', 'human', 'Human', '[]', 'ready'),
+           ('context-agent', 'agent', 'Agent', '["room-memory.read"]', 'busy');
     INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
     VALUES ('identity', 'context-human', 0, 1),
            ('identity', 'context-agent', 0, 1),
@@ -1966,7 +1966,64 @@ describe("v19 Context Snapshot database authority", () => {
     }
   });
 
-  it("returns the immutable invocation intent for every crash-recovered execution kind", async () => {
+  it("preserves FT10 outcome_unknown after dispatch when frozen authority changes before restart", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "dao-context-dispatch-authority-recovery-"));
+    const databasePath = join(directory, "authority.sqlite");
+    let database = new DatabaseSync(databasePath);
+    try {
+      migrateAuthorityDatabase(database);
+      seedExecution(database, "active");
+      database.exec(`
+        UPDATE agent_executions
+        SET action_category = 'tool_call', tool_name = 'sandbox-file.write',
+            tool_dispatch_phase = 'dispatched'
+        WHERE id = 'context-execution';
+        UPDATE agent_execution_attempts SET action_category = 'tool_call'
+        WHERE execution_id = 'context-execution' AND attempt_seq = 1;
+        INSERT INTO agent_execution_grants (
+          grant_id, execution_id, attempt_seq, agent_id, room_id, tool_id,
+          parameter_sha256, issued_at, expires_at, consumed_at,
+          grant_state, grant_revision, grant_changed_at
+        ) VALUES (
+          'context-side-effect-grant', 'context-execution', 1, 'context-agent',
+          'context-room', 'sandbox-file.write', '${"a".repeat(64)}', '${NOW}',
+          '2026-08-21T13:00:00.000Z', '${NOW}', 'claimed', 1, '${NOW}'
+        );
+        INSERT INTO tool_dispatches (
+          dispatch_id, execution_id, attempt_seq, grant_id, tool_id,
+          parameter_sha256, state, dispatched_at
+        ) VALUES (
+          'context-side-effect-dispatch', 'context-execution', 1,
+          'context-side-effect-grant', 'sandbox-file.write', '${"a".repeat(64)}',
+          'dispatched', '${NOW}'
+        );
+        UPDATE actors SET readiness = 'paused' WHERE id = 'context-agent';
+      `);
+      database.close();
+
+      const worker = await createWorkerDatabaseClient(readyWorkerOptions(databasePath));
+      await expect(worker.executeRuntime({
+        type: "runtime.recover", now: NOW_MS + 2_000,
+      })).resolves.toMatchObject({
+        kind: "recovery",
+        records: [{
+          outcome: "fail_outcome_unknown",
+          execution: { status: "failed", terminalErrorCode: "side_effect_outcome_unknown" },
+        }],
+      });
+      await worker.close();
+
+      database = new DatabaseSync(databasePath, { readOnly: true });
+      expect(database.prepare(
+        "SELECT state FROM tool_dispatches WHERE dispatch_id = 'context-side-effect-dispatch'",
+      ).get()).toEqual({ state: "outcome_unknown" });
+    } finally {
+      if (database.isOpen) database.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers only executions with the correct durable frozen authority handoff", async () => {
     for (const kind of ["direct_mention", "structured_help", "routed_candidate"] as const) {
       const directory = mkdtempSync(join(tmpdir(), `dao-context-intent-${kind}-`));
       const databasePath = join(directory, "authority.sqlite");
@@ -1979,19 +2036,33 @@ describe("v19 Context Snapshot database authority", () => {
       }
       const worker = await createWorkerDatabaseClient(readyWorkerOptions(databasePath));
       try {
-        await expect(worker.executeRuntime({
+        const recovered = worker.executeRuntime({
           type: "runtime.recover", now: NOW_MS + 1_000,
-        })).resolves.toMatchObject({
-          kind: "recovery",
-          records: [{
-            outcome: "enqueue",
-            execution: { id: "context-execution", status: "queued", currentAttemptSeq: 2 },
-            intent: {
-              kind, roomId: "context-room", sourceMessageId: "context-trigger",
-              targetAgentId: "context-agent",
-            },
-          }],
         });
+        if (kind === "direct_mention") {
+          await expect(recovered).resolves.toMatchObject({
+            kind: "recovery",
+            records: [{
+              outcome: "enqueue",
+              execution: { id: "context-execution", status: "queued", currentAttemptSeq: 2 },
+              intent: {
+                kind, roomId: "context-room", sourceMessageId: "context-trigger",
+                targetAgentId: "context-agent",
+              },
+            }],
+          });
+        } else {
+          await expect(recovered).resolves.toMatchObject({
+            kind: "recovery",
+            records: [{
+              outcome: "failed",
+              execution: {
+                id: "context-execution", status: "failed",
+                terminalErrorCode: "permission_denied",
+              },
+            }],
+          });
+        }
       } finally {
         await worker.close();
         rmSync(directory, { recursive: true, force: true });

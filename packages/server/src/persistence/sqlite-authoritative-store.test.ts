@@ -1491,25 +1491,16 @@ describe("SQLite authoritative sessions", () => {
         modelId: "runtime-model",
         now: 2_300,
       } as const;
-      await expect(client.executeRuntime(routedInvocation)).resolves.toMatchObject({
-        kind: "invocation",
-        replayed: false,
-        execution: {
-          id: "execution-routed-authoritative",
-          requesterId: "human-li",
-          agentId: "agent-review",
-          status: "queued",
-        },
+      await expect(client.executeRuntime(routedInvocation)).rejects.toMatchObject({
+        status: 403, code: "permission_denied",
       });
       await expect(client.executeRuntime({
         ...routedInvocation,
         executionId: "execution-routed-replay-unused",
         intentId: "intent-routed-replay-unused",
         now: 2_301,
-      })).resolves.toMatchObject({
-        kind: "invocation",
-        replayed: true,
-        execution: { id: "execution-routed-authoritative" },
+      })).rejects.toMatchObject({
+        status: 403, code: "permission_denied",
       });
       await expect(client.executeRuntime({
         ...routedInvocation,
@@ -1517,14 +1508,8 @@ describe("SQLite authoritative sessions", () => {
         executionId: "execution-routed-forbidden",
         intentId: "intent-routed-forbidden",
         now: 2_302,
-      })).resolves.toMatchObject({
-        kind: "invocation",
-        replayed: false,
-        execution: {
-          id: "execution-routed-forbidden",
-          agentId: "agent-route-second",
-          status: "queued",
-        },
+      })).rejects.toMatchObject({
+        status: 403, code: "permission_denied",
       });
 
       const retryCommand = {

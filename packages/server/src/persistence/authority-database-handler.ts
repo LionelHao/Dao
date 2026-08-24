@@ -123,6 +123,11 @@ import {
 } from
   "../message-authority/sqlite-operational-message-projection.js";
 import { canStartRuntimeGenerationInTransaction } from "../agent-runtime/runtime-archive-fence-participant.js";
+import {
+  FrozenRuntimeAuthorityError,
+  requireFrozenRuntimeAuthority,
+  type FrozenRuntimeAuthorityHandoff,
+} from "../agent-runtime/frozen-runtime-authority-gate.js";
 import type { CommittedRoomCacheInvalidationIntent } from "../access/room-cache-invalidation-port.js";
 import {
   BALL_BOUNDARY_TIMER_DESCRIPTOR_ID,
@@ -476,6 +481,20 @@ export interface DatabaseCommandResult {
 
 function fail(code: AuthorityWorkerErrorCode, message: string): never {
   throw new AuthorityDatabaseError(code, message);
+}
+
+function requireRuntimeFrozenHandoff(
+  database: DatabaseSync,
+  executionId: string,
+): FrozenRuntimeAuthorityHandoff {
+  try {
+    return requireFrozenRuntimeAuthority(database, executionId);
+  } catch (error) {
+    if (error instanceof FrozenRuntimeAuthorityError) {
+      return fail("permission_denied", error.message);
+    }
+    throw error;
+  }
 }
 
 function failFromGovernanceCoordinator(error: unknown): never {
@@ -5205,6 +5224,7 @@ function insertLegacyRuntimeInvocationLineage(
     readonly intentKind: "direct_mention" | "structured_help" | "routed_candidate";
     readonly executionId: string;
     readonly createdAt: string;
+    readonly frozenAuthorityIntentId?: string;
   },
 ): void {
   database.prepare(
@@ -5224,7 +5244,7 @@ function insertLegacyRuntimeInvocationLineage(
     input.intentKind,
     input.executionId,
     input.createdAt,
-    input.intentId,
+    input.frozenAuthorityIntentId ?? input.intentId,
     input.createdAt,
   );
   database.prepare(
@@ -6298,36 +6318,14 @@ export function executeRuntimeAuthorityOperation(
     }
     if (operation.type === "runtime.read-context") {
       const execution = runtimeExecutionById(database, operation.executionId);
+      const frozenHandoff = requireRuntimeFrozenHandoff(database, execution.id);
       requireExecutionRuntimeGenerationAllowed(
         database,
         execution.id,
         stableId("runtime-model-generation-gate", execution.id, String(execution.currentAttemptSeq)),
       );
       requireAgentCommandAuthority(database, execution.agentId, execution.roomId);
-      const permissionRow = database.prepare(
-        `SELECT actor.tool_permissions_json AS capabilityJson,
-                membership.tool_permissions_json AS membershipJson,
-                membership.participation AS participation, room.status AS roomStatus,
-                membership.access_revision AS accessRevision
-         FROM actors AS actor
-         JOIN room_memberships AS membership ON membership.actor_id = actor.id
-         JOIN rooms AS room ON room.id = membership.room_id
-         WHERE actor.id = ? AND membership.room_id = ? AND actor.kind = 'agent' AND membership.kind = 'agent'`,
-      ).get(execution.agentId, execution.roomId);
-      const capabilities = typeof permissionRow?.capabilityJson === "string"
-        ? JSON.parse(permissionRow.capabilityJson) as unknown : [];
-      const membershipPermissions = typeof permissionRow?.membershipJson === "string"
-        ? JSON.parse(permissionRow.membershipJson) as unknown : [];
-      if (typeof permissionRow?.accessRevision !== "number" ||
-          !Number.isSafeInteger(permissionRow.accessRevision) || permissionRow.accessRevision < 0) {
-        return fail("storage_unavailable", "Agent Room authorization revision was corrupt");
-      }
-      const allowedIds = new Set(["http-json.read", "repository.git-status", "sandbox-file.write"]);
-      const toolIds = permissionRow?.roomStatus === "active" && permissionRow.participation === "active" &&
-        Array.isArray(capabilities) && Array.isArray(membershipPermissions)
-        ? capabilities.filter((entry): entry is "http-json.read" | "repository.git-status" | "sandbox-file.write" =>
-            typeof entry === "string" && allowedIds.has(entry) && membershipPermissions.includes(entry))
-        : [];
+      const toolIds = frozenHandoff.effectiveToolIds;
       const messages = database.prepare(
         `SELECT message.id AS messageId, message.author_id AS authorId, revision.body
          FROM (
@@ -6364,33 +6362,24 @@ export function executeRuntimeAuthorityOperation(
         openItemTargets: openItemTargets as { actorId: string; kind: "human" | "agent" }[],
         roomMemory: readRoomMemoryRuntimeContext(database, {
           roomId: execution.roomId,
-          authorizationEpoch: permissionRow.accessRevision,
+          authorizationEpoch: frozenHandoff.accessRevision,
         }),
       };
     }
     if (operation.type === "runtime.read-memory-delta") {
       const execution = runtimeExecutionById(database, operation.executionId);
+      const frozenHandoff = requireRuntimeFrozenHandoff(database, execution.id);
       requireExecutionRuntimeGenerationAllowed(
         database,
         execution.id,
         stableId("runtime-memory-delta-gate", execution.id, String(execution.currentAttemptSeq)),
       );
       requireAgentCommandAuthority(database, execution.agentId, execution.roomId);
-      const permissionRow = database.prepare(
-        `SELECT membership.access_revision AS accessRevision
-         FROM room_memberships AS membership
-         WHERE membership.room_id = ? AND membership.actor_id = ?
-           AND membership.kind = 'agent' AND membership.participation = 'active'`,
-      ).get(execution.roomId, execution.agentId);
-      if (typeof permissionRow?.accessRevision !== "number" ||
-          !Number.isSafeInteger(permissionRow.accessRevision) || permissionRow.accessRevision < 0) {
-        return fail("storage_unavailable", "Agent Room authorization revision was corrupt");
-      }
       return {
         kind: "memory-delta",
         rawDelta: readRoomMemoryRuntimeContext(database, {
           roomId: execution.roomId,
-          authorizationEpoch: permissionRow.accessRevision,
+          authorizationEpoch: frozenHandoff.accessRevision,
           cursor: operation.cursor,
         }).rawDelta,
       };
@@ -6419,10 +6408,20 @@ export function executeRuntimeAuthorityOperation(
         return fail("permission_denied", "Target Agent membership was forbidden");
       }
       const existing = database.prepare(
-        `SELECT execution_id AS executionId, intent_kind AS intentKind
+        `SELECT id,
+                COALESCE(execution_id, (
+                  SELECT link.execution_id FROM agent_execution_intent_links AS link
+                  WHERE link.intent_id = agent_invocation_intents.id
+                  ORDER BY link.execution_ordinal LIMIT 1
+                )) AS executionId,
+                intent_kind AS intentKind,
+                origin_kind AS originKind, status, requester_actor_id AS requesterActorId
          FROM agent_invocation_intents WHERE source_message_id = ? AND target_agent_id = ?`,
       ).get(operation.intent.sourceMessageId, operation.intent.targetAgentId);
       if (typeof existing?.executionId === "string") {
+        if (existing.originKind !== "message_target") {
+          return fail("permission_denied", "Direct Agent invocation lacked a direct frozen handoff");
+        }
         requireExecutionRuntimeGenerationAllowed(
           database,
           existing.executionId,
@@ -6441,10 +6440,15 @@ export function executeRuntimeAuthorityOperation(
           ).run(operation.intent.sourceMessageId, operation.intent.targetAgentId);
         }
         const execution = runtimeExecutionById(database, existing.executionId);
+        requireRuntimeFrozenHandoff(database, execution.id);
         return {
           kind: "invocation", execution,
           intent: runtimeInvocationIntentByExecution(database, execution.id), replayed: true,
         };
+      }
+      if (typeof existing?.id !== "string" || existing.originKind !== "message_target" ||
+          existing.status !== "pending" || existing.requesterActorId !== requesterId) {
+        return fail("permission_denied", "Direct Agent invocation lacked a direct frozen handoff");
       }
       const queued = database.prepare(
         `SELECT COUNT(*) AS count FROM agent_executions WHERE room_id = ? AND status = 'queued'`,
@@ -6494,22 +6498,45 @@ export function executeRuntimeAuthorityOperation(
            recovery_cursor
          ) VALUES (?, 1, 1, 1, 'queued', 'model_generation', NULL, NULL, NULL, NULL, 0)`,
       ).run(operation.executionId);
-      insertLegacyRuntimeInvocationLineage(database, {
-        intentId: operation.intentId,
-        roomId: operation.intent.roomId,
-        sourceMessageId: operation.intent.sourceMessageId,
-        targetAgentId: operation.intent.targetAgentId,
-        requesterActorId: requesterId,
-        intentKind: operation.intent.kind,
-        executionId: operation.executionId,
-        createdAt: occurredAt,
-      });
+      const claimed = database.prepare(
+        `UPDATE agent_invocation_intents
+         SET status = 'claimed', claimed_at = ?
+         WHERE id = ? AND origin_kind = 'message_target'
+           AND status = 'pending' AND execution_id IS NULL`,
+      ).run(occurredAt, existing.id);
+      if (claimed.changes !== 1) {
+        return fail("execution_conflict", "Direct Agent invocation handoff changed concurrently");
+      }
+      database.prepare(
+        `INSERT INTO agent_execution_intent_links (
+           intent_id, execution_id, execution_ordinal, retry_of_execution_id,
+           source_revision, linked_at
+         ) VALUES (?, ?, 1, NULL, 1, ?)`,
+      ).run(existing.id, operation.executionId, occurredAt);
       const execution = runtimeExecutionById(database, operation.executionId);
+      requireRuntimeFrozenHandoff(database, execution.id);
       appendRuntimeExecutionEvent(database, execution, occurredAt, "queued");
       return { kind: "invocation", execution, intent: operation.intent, replayed: false };
     }
 
     if (operation.type === "runtime.invoke-routed") {
+      const frozenRoutedIntents = database.prepare(
+        `SELECT id, room_id AS roomId, source_message_id AS sourceMessageId,
+                target_agent_actor_id AS targetAgentId
+         FROM routed_agent_invocation_intents
+         WHERE route_job_id = ? AND target_agent_actor_id = ? AND status = 'claimed'
+         ORDER BY id LIMIT 2`,
+      ).all(operation.routeJobId, operation.intent.targetAgentId);
+      if (frozenRoutedIntents.length !== 1) {
+        return fail("permission_denied", "Routed Agent frozen handoff was unavailable");
+      }
+      const frozenRoutedIntent = frozenRoutedIntents[0]!;
+      if (frozenRoutedIntent.roomId !== operation.intent.roomId ||
+          frozenRoutedIntent.sourceMessageId !== operation.intent.sourceMessageId ||
+          frozenRoutedIntent.targetAgentId !== operation.intent.targetAgentId ||
+          typeof frozenRoutedIntent.id !== "string") {
+        return fail("permission_denied", "Routed Agent frozen handoff was mismatched");
+      }
       const routeIntent = database.prepare(
         `SELECT route.room_id AS roomId, route.source_message_id AS sourceMessageId,
                 route.status AS routeStatus, intent.intent_kind AS intentKind,
@@ -6536,10 +6563,15 @@ export function executeRuntimeAuthorityOperation(
         return fail("permission_denied", "Routed target Agent membership was forbidden");
       }
       const existing = database.prepare(
-        `SELECT execution_id AS executionId, intent_kind AS intentKind
+        `SELECT execution_id AS executionId, intent_kind AS intentKind,
+                origin_kind AS originKind, lineage_id AS lineageId
          FROM agent_invocation_intents WHERE source_message_id = ? AND target_agent_id = ?`,
       ).get(operation.intent.sourceMessageId, operation.intent.targetAgentId);
       if (typeof existing?.executionId === "string") {
+        if (existing.originKind !== "legacy_runtime" ||
+            existing.lineageId !== frozenRoutedIntent.id) {
+          return fail("permission_denied", "Routed Agent invocation crossed frozen handoff origins");
+        }
         requireExecutionRuntimeGenerationAllowed(
           database,
           existing.executionId,
@@ -6558,6 +6590,7 @@ export function executeRuntimeAuthorityOperation(
           ).run(operation.intent.sourceMessageId, operation.intent.targetAgentId);
         }
         const execution = runtimeExecutionById(database, existing.executionId);
+        requireRuntimeFrozenHandoff(database, execution.id);
         return {
           kind: "invocation", execution,
           intent: runtimeInvocationIntentByExecution(database, execution.id), replayed: true,
@@ -6620,8 +6653,10 @@ export function executeRuntimeAuthorityOperation(
         intentKind: operation.intent.kind,
         executionId: operation.executionId,
         createdAt: occurredAt,
+        frozenAuthorityIntentId: frozenRoutedIntent.id,
       });
       const execution = runtimeExecutionById(database, operation.executionId);
+      requireRuntimeFrozenHandoff(database, execution.id);
       appendRuntimeExecutionEvent(database, execution, occurredAt, "queued");
       return { kind: "invocation", execution, intent: operation.intent, replayed: false };
     }
@@ -6636,6 +6671,7 @@ export function executeRuntimeAuthorityOperation(
         current.id,
         stableId("runtime-claim-generation-gate", current.id, String(operation.attemptSeq)),
       );
+      requireRuntimeFrozenHandoff(database, current.id);
       if (hasPendingHumanPreemptionAfterSource(database, current)) {
         return fail("execution_conflict", "Agent attempt is behind a durable human fence");
       }
@@ -6657,6 +6693,7 @@ export function executeRuntimeAuthorityOperation(
 
     if (operation.type === "runtime.complete") {
       const current = runtimeExecutionById(database, operation.executionId);
+      requireRuntimeFrozenHandoff(database, current.id);
       requireAgentCommandAuthority(database, current.agentId, current.roomId);
       if (current.status !== "running" || current.currentAttemptSeq !== operation.attemptSeq) {
         return fail("execution_conflict", "Agent completion was stale");
@@ -6769,6 +6806,7 @@ export function executeRuntimeAuthorityOperation(
         current.id,
         stableId("runtime-retry-generation-gate", current.id, String(operation.attemptSeq)),
       );
+      requireRuntimeFrozenHandoff(database, current.id);
       const contextState = database.prepare(
         `SELECT snapshot.state
          FROM agent_execution_context_bindings AS binding
@@ -6886,6 +6924,7 @@ export function executeRuntimeAuthorityOperation(
 
     if (operation.type === "runtime.manual-retry") {
       const old = runtimeExecutionById(database, operation.executionId);
+      requireRuntimeFrozenHandoff(database, old.id);
       requireRuntimeHumanAuthority(database, operation.context, old, operation.now);
       if (old.status !== "failed" && old.status !== "cancelled") {
         return fail("execution_conflict", "Only terminal Agent executions can be retried");
@@ -6935,6 +6974,7 @@ export function executeRuntimeAuthorityOperation(
          ) VALUES (?, 1, 1, 1, 'queued', 'model_generation', 0)`,
       ).run(operation.newExecutionId);
       const execution = runtimeExecutionById(database, operation.newExecutionId);
+      requireRuntimeFrozenHandoff(database, execution.id);
       appendRuntimeExecutionEvent(database, execution, occurredAt, "manual-retry-queued");
       return {
         kind: "invocation", execution,
@@ -7066,6 +7106,7 @@ export function executeRuntimeAuthorityOperation(
 
     if (operation.type === "runtime.read-pending-confirmation") {
       const current = runtimeExecutionById(database, operation.executionId);
+      requireRuntimeFrozenHandoff(database, current.id);
       if (current.status !== "running" || current.actionCategory !== "waiting_upstream") {
         return fail("execution_conflict", "Confirmation targeted a stale Agent execution");
       }
@@ -7132,27 +7173,8 @@ export function executeRuntimeAuthorityOperation(
         current.id,
         stableId("runtime-tool-prepare-generation-gate", current.id, String(operation.attemptSeq)),
       );
-      const permissions = database.prepare(
-        `SELECT actor.kind AS actorKind, actor.readiness AS readiness,
-                actor.tool_permissions_json AS capabilityJson,
-                membership.kind AS membershipKind,
-                membership.participation AS participation,
-                membership.tool_permissions_json AS membershipPermissionsJson,
-                room.status AS roomStatus
-         FROM actors AS actor
-         JOIN room_memberships AS membership ON membership.actor_id = actor.id
-         JOIN rooms AS room ON room.id = membership.room_id
-         WHERE actor.id = ? AND membership.room_id = ?`,
-      ).get(current.agentId, current.roomId);
-      const capability = typeof permissions?.capabilityJson === "string"
-        ? JSON.parse(permissions.capabilityJson) as unknown : undefined;
-      const membershipPermissions = typeof permissions?.membershipPermissionsJson === "string"
-        ? JSON.parse(permissions.membershipPermissionsJson) as unknown : undefined;
-      if (permissions?.actorKind !== "agent" || permissions.readiness !== "ready" ||
-          permissions.membershipKind !== "agent" || permissions.participation !== "active" ||
-          permissions.roomStatus !== "active" || !Array.isArray(capability) ||
-          !capability.includes(operation.tool.id) || !Array.isArray(membershipPermissions) ||
-          !membershipPermissions.includes(operation.tool.id)) {
+      const frozenHandoff = requireRuntimeFrozenHandoff(database, current.id);
+      if (!frozenHandoff.effectiveToolIds.includes(operation.tool.id)) {
         return fail("permission_denied", "Agent tool authority was forbidden");
       }
       const parameterSha256 = createHash("sha256").update(canonicalJson(operation.parameters)).digest("hex");
@@ -7289,36 +7311,23 @@ export function executeRuntimeAuthorityOperation(
         current.id,
         stableId("runtime-tool-dispatch-generation-gate", current.id, String(operation.attemptSeq)),
       );
+      const frozenHandoff = requireRuntimeFrozenHandoff(database, current.id);
       const grant = database.prepare(
         `SELECT grant.agent_id AS agentId, grant.room_id AS roomId, grant.tool_id AS toolId,
                 grant.parameter_sha256 AS parameterSha256, grant.expires_at AS expiresAt,
                 grant.consumed_at AS consumedAt, grant.grant_state AS grantState,
-                actor.kind AS actorKind, actor.readiness AS readiness,
-                actor.tool_permissions_json AS capabilityJson,
-                membership.kind AS membershipKind,
-                membership.participation AS participation,
-                membership.tool_permissions_json AS membershipPermissionsJson,
-                room.status AS roomStatus
+                actor.kind AS actorKind
          FROM agent_execution_grants AS grant
          JOIN actors AS actor ON actor.id = grant.agent_id
-         JOIN room_memberships AS membership
-           ON membership.room_id = grant.room_id AND membership.actor_id = grant.agent_id
-         JOIN rooms AS room ON room.id = grant.room_id
          WHERE grant.grant_id = ? AND grant.execution_id = ? AND grant.attempt_seq = ?`,
       ).get(operation.grantId, current.id, current.currentAttemptSeq);
       const parameterSha256 = createHash("sha256").update(canonicalJson(operation.parameters)).digest("hex");
-      const capability = typeof grant?.capabilityJson === "string"
-        ? JSON.parse(grant.capabilityJson) as unknown : undefined;
-      const membershipPermissions = typeof grant?.membershipPermissionsJson === "string"
-        ? JSON.parse(grant.membershipPermissionsJson) as unknown : undefined;
       if (grant?.agentId !== current.agentId || grant.roomId !== current.roomId ||
           typeof grant.toolId !== "string" || grant.parameterSha256 !== parameterSha256 ||
           typeof grant.expiresAt !== "string" || Date.parse(grant.expiresAt) <= operation.now ||
           grant.consumedAt !== null || grant.grantState !== "active" ||
-          grant.actorKind !== "agent" || grant.readiness !== "ready" ||
-          grant.membershipKind !== "agent" || grant.participation !== "active" || grant.roomStatus !== "active" ||
-          !Array.isArray(capability) || !capability.includes(grant.toolId) ||
-          !Array.isArray(membershipPermissions) || !membershipPermissions.includes(grant.toolId)) {
+          grant.actorKind !== "agent" ||
+          !frozenHandoff.effectiveToolIds.some((toolId) => toolId === grant.toolId)) {
         return fail("permission_denied", "Tool dispatch authority was forbidden");
       }
       if (grant.toolId === "sandbox-file.write") {
@@ -7459,6 +7468,15 @@ export function executeRuntimeAuthorityOperation(
     for (const row of recoverable) {
       if (typeof row.id !== "string") return fail("storage_unavailable", "Recovery execution was corrupt");
       let current = runtimeExecutionById(database, row.id);
+      const latestDispatch = database.prepare(
+        `SELECT tool_id AS toolId, state
+         FROM tool_dispatches
+         WHERE execution_id = ? AND attempt_seq = ?
+         ORDER BY rowid DESC LIMIT 1`,
+      ).get(current.id, current.currentAttemptSeq);
+      const sideEffectMayHaveOccurred = latestDispatch?.toolId === "sandbox-file.write" &&
+        (latestDispatch.state === "dispatched" || latestDispatch.state === "succeeded" ||
+         latestDispatch.state === "outcome_unknown");
       if (current.status === "running") {
         const contextState = database.prepare(
           `SELECT snapshot.state
@@ -7466,7 +7484,7 @@ export function executeRuntimeAuthorityOperation(
            JOIN context_snapshots AS snapshot ON snapshot.snapshot_id = binding.snapshot_id
            WHERE binding.execution_id = ?`,
         ).get(current.id)?.state;
-        if (contextState !== undefined && contextState !== "active") {
+        if (!sideEffectMayHaveOccurred && contextState !== undefined && contextState !== "active") {
           database.prepare(
             `UPDATE agent_execution_attempts
              SET status = 'failed', finished_at = ?, error_code = 'context_snapshot_invalidated'
@@ -7485,6 +7503,30 @@ export function executeRuntimeAuthorityOperation(
           records.push({ execution: current, outcome: "failed" });
           continue;
         }
+      }
+      if (!sideEffectMayHaveOccurred) {
+        try {
+          requireFrozenRuntimeAuthority(database, current.id);
+        } catch (error) {
+          if (!(error instanceof FrozenRuntimeAuthorityError)) throw error;
+          database.prepare(
+            `UPDATE agent_execution_attempts
+             SET status = 'failed', finished_at = ?, error_code = 'permission_denied'
+             WHERE execution_id = ? AND attempt_seq = ? AND status IN ('queued', 'running')`,
+          ).run(occurredAt, current.id, current.currentAttemptSeq);
+          database.prepare(
+            `UPDATE agent_executions
+             SET status = 'failed', completed_at = ?, updated_at = ?,
+                 terminal_error_code = 'permission_denied', dead_lettered_at = ?, next_retry_at = NULL
+             WHERE id = ? AND current_attempt_seq = ? AND status IN ('queued', 'running')`,
+          ).run(occurredAt, occurredAt, occurredAt, current.id, current.currentAttemptSeq);
+          current = runtimeExecutionById(database, current.id);
+          appendRuntimeExecutionEvent(database, current, occurredAt, "recovered", error.reason);
+          records.push({ execution: current, outcome: "failed" });
+          continue;
+        }
+      }
+      if (current.status === "running") {
         if (current.providerId === undefined) {
           database.prepare(
             `UPDATE agent_execution_attempts
@@ -7529,16 +7571,6 @@ export function executeRuntimeAuthorityOperation(
           records.push({ execution: current, outcome: "failed" });
           continue;
         }
-        const latestDispatch = database.prepare(
-          `SELECT tool_id AS toolId, state
-           FROM tool_dispatches
-           WHERE execution_id = ? AND attempt_seq = ?
-           ORDER BY rowid DESC LIMIT 1`,
-        ).get(current.id, current.currentAttemptSeq);
-        const sideEffectMayHaveOccurred = latestDispatch?.toolId === "sandbox-file.write" &&
-          (latestDispatch.state === "dispatched" ||
-           latestDispatch.state === "succeeded" ||
-           latestDispatch.state === "outcome_unknown");
         if (current.actionCategory === "tool_call" &&
             (current.toolDispatchPhase === "dispatched" || sideEffectMayHaveOccurred)) {
           database.prepare(

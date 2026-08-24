@@ -214,6 +214,31 @@ describe("bounded Agent runtime scheduler", () => {
     });
   });
 
+  it("keeps Provider call count zero when the frozen handoff claim gate rejects", async () => {
+    const runtimeAuthority = authority();
+    runtimeAuthority.claim = vi.fn(async () => {
+      throw new AgentRuntimeError("permission_denied", "Frozen Agent authority changed");
+    });
+    runtimeAuthority.scheduleRetry = vi.fn(runtimeAuthority.scheduleRetry);
+    const stream = vi.fn(async function* (): AsyncIterable<ProviderEvent> {
+      yield { type: "response_started", sequence: 1 };
+    });
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      provider: provider(stream),
+      modelId: "fake-model",
+      buildProviderInput: providerInput,
+    });
+
+    await runtime.invoke(context, intent("room-a", "frozen-claim-rejected"));
+    await runtime.whenIdle();
+
+    expect(stream).not.toHaveBeenCalled();
+    expect(runtimeAuthority.scheduleRetry).toHaveBeenCalledWith(
+      "execution-1", 1, "permission_denied", undefined,
+    );
+  });
+
   it("runs FIFO within a room while allowing bounded cross-room parallelism", async () => {
     const runtimeAuthority = authority();
     const complete = vi.spyOn(runtimeAuthority, "complete");

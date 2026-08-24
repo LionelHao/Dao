@@ -86,6 +86,9 @@ import type {
   WorkspaceBootstrapPage,
 } from "@native-im/core";
 import { isActor, isRoomRepairPage } from "@native-im/core";
+import {
+  seedCanonicalRoomAssignmentFixture,
+} from "./fixtures/agent-authority-fixture.js";
 
 const actors = [
   {
@@ -2232,6 +2235,37 @@ describe("authoritative server real-process harness", () => {
            joined_at, configured_at, access_revision
          ) VALUES (?, 'human-b', 'human', 'member', NULL, '[]', ?, NULL, 0)`,
       ).run(roomId, "2026-08-19T00:00:00.000Z");
+      const profile = setup.prepare(
+        "SELECT id, revision FROM agent_profiles WHERE actor_id = 'agent-a' AND status = 'disabled'",
+      ).get();
+      if (typeof profile?.id !== "string" || typeof profile.revision !== "number") {
+        throw new Error("Structured v2 fixture lacked the disabled static Agent Profile");
+      }
+      const profileRevision = profile.revision + 1;
+      setup.prepare(
+        `UPDATE agent_profiles
+         SET revision = ?, status = 'enabled', updated_at = ?, source_kind = 'administrator_command'
+         WHERE id = ? AND revision = ? AND status = 'disabled'`,
+      ).run(profileRevision, "2026-08-24T00:00:00.000Z", profile.id, profile.revision);
+      setup.prepare(
+        `INSERT INTO agent_profile_revisions (
+           profile_id, revision, actor_id, display_name, global_responsibility,
+           status, capability_ceiling_json, tool_ceiling_json,
+           changed_by_human_actor_id, changed_at, operation
+         ) SELECT id, revision, actor_id, display_name, global_responsibility,
+                  status, capability_ceiling_json, tool_ceiling_json,
+                  'human-a', updated_at, 'enable'
+           FROM agent_profiles WHERE id = ?`,
+      ).run(profile.id);
+      seedCanonicalRoomAssignmentFixture(setup, {
+        assignmentId: "message-v2-assignment-agent-a",
+        roomId,
+        profileId: profile.id,
+        actorId: "agent-a",
+        participation: "active",
+        capabilitySubset: [],
+        toolSubset: [],
+      });
       setup.close();
 
       started = await spawnAuthorityChild({ directory, actors: messageActors, identities });

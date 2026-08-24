@@ -12,6 +12,11 @@ import {
   compileContextV1,
   verifyContextCompileResultV1,
 } from "../context-compiler/context-compiler.js";
+import {
+  FrozenRuntimeAuthorityError,
+  requireFrozenRuntimeAuthority,
+  type FrozenRuntimeAuthorityHandoff,
+} from "../agent-runtime/frozen-runtime-authority-gate.js";
 
 export type ContextSnapshotErrorCode =
   | "context_forbidden"
@@ -554,10 +559,25 @@ function canonicalPreparation(
   return canonicalJson(row);
 }
 
+function requireContextFrozenHandoff(
+  database: DatabaseSync,
+  executionId: string,
+): FrozenRuntimeAuthorityHandoff {
+  try {
+    return requireFrozenRuntimeAuthority(database, executionId);
+  } catch (error) {
+    if (error instanceof FrozenRuntimeAuthorityError) {
+      return fail("context_forbidden", error.message);
+    }
+    throw error;
+  }
+}
+
 function readPreparationRow(
   database: DatabaseSync,
   executionId: string,
   attemptSeq: number,
+  handoff: FrozenRuntimeAuthorityHandoff,
 ): PreparationRow {
   const row = database.prepare(
     `SELECT execution.id AS executionId,
@@ -589,8 +609,7 @@ function readPreparationRow(
             trigger.lifecycle AS triggerLifecycle,
             assignment.participation AS membershipParticipation,
             profile.id AS profileId,
-            COALESCE(direct_binding.profile_revision,
-                     routed_binding.profile_revision) AS frozenProfileRevision,
+            ? AS frozenProfileRevision,
             profile.revision AS currentProfileRevision,
             profile.status AS profileStatus,
             profile.display_name AS profileDisplayName,
@@ -598,8 +617,7 @@ function readPreparationRow(
             profile.capability_ceiling_json AS profileCapabilityCeilingJson,
             profile.tool_ceiling_json AS profileToolCeilingJson,
             assignment.id AS assignmentId,
-            COALESCE(direct_binding.assignment_revision,
-                     routed_binding.assignment_revision) AS frozenAssignmentRevision,
+            ? AS frozenAssignmentRevision,
             assignment.revision AS currentAssignmentRevision,
             assignment.status AS assignmentStatus,
             assignment.room_responsibility AS roomResponsibility,
@@ -608,8 +626,7 @@ function readPreparationRow(
             assignment.tool_subset_json AS assignmentToolSubsetJson,
             membership.kind AS membershipKind,
             membership.access_revision AS membershipAccessRevision,
-            COALESCE(direct_binding.access_revision,
-                     routed_binding.access_revision) AS frozenAccessRevision,
+            ? AS frozenAccessRevision,
             membership.tool_permissions_json AS membershipToolsJson,
             (SELECT COUNT(*) FROM agent_executions AS running
              WHERE running.room_id = execution.room_id
@@ -632,30 +649,29 @@ function readPreparationRow(
       AND membership.actor_id = execution.agent_id
       AND membership.kind = 'agent'
      JOIN message_envelopes AS trigger ON trigger.message_id = intent.source_message_id
-     LEFT JOIN direct_agent_invocation_authority_bindings AS direct_binding
-       ON direct_binding.intent_id = intent.id
      LEFT JOIN route_invocation_intents AS route_intent
-      ON route_intent.source_message_id = intent.source_message_id
+      ON intent.origin_kind = 'legacy_runtime'
+      AND route_intent.source_message_id = intent.source_message_id
       AND route_intent.target_agent_id = intent.target_agent_id
-     LEFT JOIN routed_agent_invocation_intents AS routed_binding
-       ON routed_binding.route_job_id = route_intent.route_job_id
-      AND routed_binding.room_id = intent.room_id
-      AND routed_binding.source_message_id = intent.source_message_id
-      AND routed_binding.target_agent_actor_id = intent.target_agent_id
-      AND routed_binding.status = 'claimed'
      JOIN agent_profiles AS profile
-       ON profile.id = COALESCE(direct_binding.profile_id, routed_binding.profile_id)
+       ON profile.id = ?
       AND profile.actor_id = execution.agent_id
      JOIN room_agent_assignments AS assignment
-       ON assignment.id = COALESCE(
-            direct_binding.assignment_id, routed_binding.assignment_id
-          )
+       ON assignment.id = ?
       AND assignment.room_id = execution.room_id
       AND assignment.profile_id = profile.id
       AND assignment.agent_actor_id = execution.agent_id
      LEFT JOIN room_memory_stewards AS steward ON steward.room_id = execution.room_id
      WHERE execution.id = ?`,
-  ).get(attemptSeq, executionId);
+  ).get(
+    handoff.profileRevision,
+    handoff.assignmentRevision,
+    handoff.accessRevision,
+    attemptSeq,
+    handoff.profileId,
+    handoff.assignmentId,
+    executionId,
+  );
   if (row === undefined) {
     return fail("context_snapshot_conflict", "Context execution or attempt was not found");
   }
@@ -862,9 +878,8 @@ function readCompilerInputFacts(
     return fail("context_storage_unavailable", "Context capability authority exceeds its Profile ceiling");
   }
   const toolCeiling = new Set(parseStringArray(row.profileToolCeilingJson));
-  const membershipTools = new Set(parseStringArray(row.membershipToolsJson));
   const effectiveTools = parseStringArray(row.assignmentToolSubsetJson);
-  if (effectiveTools.some((tool) => !toolCeiling.has(tool) || !membershipTools.has(tool))) {
+  if (effectiveTools.some((tool) => !toolCeiling.has(tool))) {
     return fail("context_storage_unavailable", "Context tool authority exceeds its current policy");
   }
   const mentions = database.prepare(
@@ -1742,7 +1757,12 @@ function insertSnapshot(
   }
   const preparation = preparationFromRow(
     database,
-    readPreparationRow(database, operation.executionId, operation.attemptSeq),
+    readPreparationRow(
+      database,
+      operation.executionId,
+      operation.attemptSeq,
+      requireContextFrozenHandoff(database, operation.executionId),
+    ),
     operation.attemptSeq,
     providerAuthenticated,
   );
@@ -3174,6 +3194,10 @@ export function executeContextSnapshotAuthorityOperation(
 ): ContextSnapshotAuthorityResult {
   return runImmediate(database, () => {
     if (operation.type === "context.prepare") {
+      if (!options.providerAuthenticated) {
+        return fail("context_forbidden", "Context Agent Provider authentication is unavailable");
+      }
+      const handoff = requireContextFrozenHandoff(database, operation.executionId);
       const snapshot = existingSnapshot(database, operation.executionId);
       if (snapshot !== undefined) {
         return {
@@ -3185,20 +3209,34 @@ export function executeContextSnapshotAuthorityOperation(
       }
       const preparation = preparationFromRow(
         database,
-        readPreparationRow(database, operation.executionId, operation.attemptSeq),
+        readPreparationRow(database, operation.executionId, operation.attemptSeq, handoff),
         operation.attemptSeq,
         options.providerAuthenticated,
       );
       return { kind: "context-preparation", disposition: "candidate", preparation };
     }
     if (operation.type === "context.commit") {
+      if (!options.providerAuthenticated) {
+        return fail("context_forbidden", "Context Agent Provider authentication is unavailable");
+      }
+      requireContextFrozenHandoff(database, operation.executionId);
       return {
         kind: "context-snapshot",
         snapshot: insertSnapshot(database, operation, options.providerAuthenticated),
       };
     }
-    if (operation.type === "context.read") return readBody(database, operation);
+    if (operation.type === "context.read") {
+      if (!options.providerAuthenticated) {
+        return fail("context_forbidden", "Context Agent Provider authentication is unavailable");
+      }
+      requireContextFrozenHandoff(database, operation.executionId);
+      return readBody(database, operation);
+    }
     if (operation.type === "context.bind-attempt") {
+      if (!options.providerAuthenticated) {
+        return fail("context_forbidden", "Context Agent Provider authentication is unavailable");
+      }
+      requireContextFrozenHandoff(database, operation.executionId);
       const snapshot = bindContextAttemptInTransaction(database, {
         executionId: operation.executionId,
         attemptSeq: operation.attemptSeq,
