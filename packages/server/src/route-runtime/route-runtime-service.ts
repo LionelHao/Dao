@@ -47,6 +47,8 @@ export interface CreateRouteRuntimeServiceOptions {
   readonly memoryReadiness: RouteMemoryReadinessPort;
   readonly projectFacts: ProactiveRouteProjectFactsPort;
   readonly provider: RouterProvider;
+  /** Server-derived single Provider readiness used only to freeze route eligibility. */
+  readonly agentReadiness?: () => "ready" | "noauth";
   readonly maxActiveRooms?: number;
   readonly maxQueuedPerRoom?: number;
   readonly onError?: (error: unknown) => void;
@@ -178,7 +180,10 @@ export function createRouteRuntimeService(
   };
 
   const process = async (entry: QueuedRoute): Promise<void> => {
-    const claimed = await options.authority.claim(entry.sourceMessageId);
+    const claimed = await options.authority.claim(
+      entry.sourceMessageId,
+      (options.agentReadiness?.() ?? "ready") === "ready",
+    );
     const { job, providerInput, decisionContext } = claimed;
     let plan: RouterPlan | undefined;
     let failure: RouteProviderFailureCode | undefined;
@@ -263,9 +268,9 @@ export function createRouteRuntimeService(
           ? agent.hasBall
           : false,
       })),
-      directMentionAgentIds: providerInput.message.authorKind === "human"
-        ? decisionContext.directMentionAgentIds
-        : [],
+      // Direct targets are already frozen by the Human message transaction and
+      // never pass through Router re-selection.
+      directMentionAgentIds: [],
       structuredHelpAgentIds: [],
       recentHumanMessageTimes: decisionContext.recentHumanMessageTimes,
       consecutiveAgentRounds: decisionContext.consecutiveAgentRounds,
@@ -325,8 +330,13 @@ export function createRouteRuntimeService(
   function maybeRecover(): void {
     if (closed || !recoveryNeeded || recoveryTask !== undefined || !workIsIdle()) return;
     recoveryNeeded = false;
-    const task = options.authority.recover()
-      .then((jobs) => {
+    const task = Promise.all([
+      options.authority.recover(),
+      // FT-07 recovery proves every committed handoff remains discoverable.
+      // FT-08 owns consuming/claiming these rows into executions.
+      options.authority.recoverHandoffs(),
+    ])
+      .then(([jobs]) => {
         for (const job of jobs) {
           const entry = { roomId: job.roomId, sourceMessageId: job.sourceMessageId };
           if (job.nextRetryAt === undefined) enqueue(entry);

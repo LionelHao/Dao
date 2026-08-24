@@ -2447,9 +2447,16 @@ function executeRoute(request: AuthorityWorkerRequest): void {
       ? openedDatabase.prepare(
           `SELECT room_id AS roomId FROM messages WHERE id = ?`,
         ).all(request.operation.sourceMessageId)
+      : request.operation.type === "route.handoff.claim"
+        ? [{ roomId: request.operation.roomId }]
       : request.operation.type === "route.recover"
         ? openedDatabase.prepare(
             `SELECT DISTINCT room_id AS roomId FROM route_jobs WHERE status = 'running'`,
+          ).all()
+      : request.operation.type === "route.handoff.recover"
+        ? openedDatabase.prepare(
+            `SELECT DISTINCT room_id AS roomId FROM routed_agent_invocation_intents
+             WHERE status = 'pending'`,
           ).all()
         : openedDatabase.prepare(
             `SELECT room_id AS roomId FROM route_jobs WHERE id = ?`,

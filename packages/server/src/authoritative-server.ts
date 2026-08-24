@@ -643,6 +643,10 @@ async function start(
           return { status: "dependency_unavailable" } as const;
         },
       },
+      agentReadiness: () => testOptions.agentRuntimeProviderForTest !== undefined ||
+          secretProvider.getSecret("OPENAI_API_KEY") !== undefined
+        ? "ready"
+        : "noauth",
     });
     humanPreemptionRuntime = createHumanPreemptionRuntime({
       worker,

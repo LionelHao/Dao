@@ -129,8 +129,8 @@ function readDirect(database: DatabaseSync, executionId: string, origin: Unknown
             membership.kind AS membershipKind,
             membership.participation AS membershipParticipation,
             membership.access_revision AS currentAccessRevision,
-            room.status AS roomStatus, actor.kind AS actorKind,
-            actor.readiness AS readiness
+            membership.tool_permissions_json AS membershipToolsJson,
+            room.status AS roomStatus, actor.kind AS actorKind
      FROM direct_agent_invocation_authority_bindings AS binding
      JOIN agent_profile_revisions AS frozen_profile
        ON frozen_profile.profile_id = binding.profile_id
@@ -186,8 +186,8 @@ function readRouted(database: DatabaseSync, executionId: string, origin: Unknown
             membership.kind AS membershipKind,
             membership.participation AS membershipParticipation,
             membership.access_revision AS currentAccessRevision,
-            room.status AS roomStatus, actor.kind AS actorKind,
-            actor.readiness AS readiness
+            membership.tool_permissions_json AS membershipToolsJson,
+            room.status AS roomStatus, actor.kind AS actorKind
      FROM routed_agent_invocation_intents AS routed
      JOIN agent_profile_revisions AS frozen_profile
        ON frozen_profile.profile_id = routed.profile_id
@@ -256,14 +256,13 @@ function validate(row: UnknownRow): FrozenRuntimeAuthorityHandoff {
       (origin === "routed" && row.currentParticipation !== "active")) {
     throw new FrozenRuntimeAuthorityError("assignment_inactive");
   }
-  if (row.readiness !== "ready" && row.readiness !== "busy") {
-    throw new FrozenRuntimeAuthorityError("provider_unavailable");
-  }
   const ceiling = jsonStringArray(row.frozenToolCeilingJson);
   const subset = jsonStringArray(row.frozenToolSubsetJson);
+  const membershipTools = jsonStringArray(row.membershipToolsJson);
   const effectiveToolIds = Object.freeze(ceiling.filter(
     (toolId): toolId is FrozenRuntimeToolId =>
-      runtimeToolIds.has(toolId as FrozenRuntimeToolId) && subset.includes(toolId),
+      runtimeToolIds.has(toolId as FrozenRuntimeToolId) && subset.includes(toolId) &&
+      membershipTools.includes(toolId),
   ));
   return Object.freeze({
     origin,

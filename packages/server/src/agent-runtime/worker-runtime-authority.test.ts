@@ -14,6 +14,8 @@ import { createWorkerRuntimeAuthority } from "./worker-runtime-authority.js";
 import { createToolGateway } from "./tool-gateway.js";
 import { createRepositoryGitStatusAdapter } from "./tools/repository-git-status.js";
 import { createSandboxFileWriteAdapter } from "./tools/sandbox-file-write.js";
+import { submitHumanMessageDatabaseCommand } from
+  "../persistence/authority-database-handler.js";
 
 function hash(value: string): string {
   return createHash("sha256").update(value).digest("base64url");
@@ -66,30 +68,109 @@ describe("real AuthorityWorker runtime authority", () => {
            NULL, '2026-08-17T00:00:00.000Z', 0);
         UPDATE rooms SET owner_actor_id = 'human-runtime', governance_revision = 1
         WHERE id = 'room-runtime';
+        UPDATE agent_profiles
+        SET revision = 2, status = 'enabled',
+            tool_ceiling_json = CASE actor_id
+              WHEN 'agent-runtime' THEN '["sandbox-file.write"]'
+              ELSE '["repository.git-status"]' END,
+            updated_at = '2026-08-17T00:00:00.000Z',
+            source_kind = 'administrator_command'
+        WHERE actor_id IN ('agent-runtime', 'agent-git');
+        INSERT INTO agent_profile_revisions (
+          profile_id, revision, actor_id, display_name, global_responsibility, status,
+          capability_ceiling_json, tool_ceiling_json, changed_by_human_actor_id,
+          changed_at, operation
+        ) SELECT id, revision, actor_id, display_name, global_responsibility, status,
+                 capability_ceiling_json, tool_ceiling_json, 'human-runtime',
+                 '2026-08-17T00:00:00.000Z', 'enable'
+          FROM agent_profiles WHERE actor_id IN ('agent-runtime', 'agent-git');
+        INSERT INTO room_agent_assignments (
+          id, room_id, profile_id, agent_actor_id, revision, status, participation,
+          paused, capability_subset_json, tool_subset_json, room_responsibility,
+          created_at, updated_at, removed_at, source_kind
+        ) SELECT 'assignment:' || actor_id, 'room-runtime', id, actor_id, 1,
+                 'current', 'active', 0, '[]', tool_ceiling_json,
+                 'Exercise runtime authority.', '2026-08-17T00:00:00.000Z',
+                 '2026-08-17T00:00:00.000Z', NULL, 'room_command'
+          FROM agent_profiles WHERE actor_id IN ('agent-runtime', 'agent-git');
+        INSERT INTO room_agent_assignment_revisions (
+          assignment_id, revision, room_id, profile_id, agent_actor_id,
+          room_responsibility, status, participation, paused,
+          capability_subset_json, tool_subset_json, changed_by_human_actor_id,
+          changed_at, operation
+        ) SELECT id, revision, room_id, profile_id, agent_actor_id,
+                 room_responsibility, status, participation, paused,
+                 capability_subset_json, tool_subset_json, 'human-runtime',
+                 '2026-08-17T00:00:00.000Z', 'create'
+          FROM room_agent_assignments WHERE room_id = 'room-runtime';
       `);
+      const directContext = {
+        kind: "human" as const,
+        sessionId: session.sessionId,
+        sessionFamilyId: session.familyId,
+        principal: { accountId: session.accountId, actorId: session.actorId },
+        requestId: "runtime-direct-fixture",
+        idempotencyKey: "runtime-direct-fixture",
+      };
       for (let index = 0; index < 70; index += 1) {
+        const ordinal = index + 1;
+        const directTarget = ordinal === 3 || ordinal === 4 ? "agent-git" : "agent-runtime";
+        if (ordinal <= 6) {
+          submitHumanMessageDatabaseCommand(database, {
+            context: {
+              ...directContext,
+              requestId: `runtime-direct-${ordinal}`,
+              idempotencyKey: `runtime-direct-${ordinal}`,
+            },
+            message: {
+              messageId: `message-runtime-${ordinal}`,
+              roomId: "room-runtime",
+              body: `@Agent message-${ordinal}`,
+              mentionedTargets: [{
+                id: `runtime-target-${ordinal}`,
+                kind: "agent-invocation",
+                targetActorId: directTarget,
+                range: { startUtf16: 0, endUtf16: 6 },
+              }],
+              attachments: [],
+            },
+            now: now + ordinal,
+          });
+          continue;
+        }
         insertLegacyMessageAuthorityRecord(database, {
-          id: `message-runtime-${index + 1}`,
+          id: `message-runtime-${ordinal}`,
           roomId: "room-runtime",
           authorId: "human-runtime",
           authorKind: "human",
-          body: `message-${index + 1}`,
-          sentAt: new Date(Date.UTC(2026, 7, 17, 0, 0, index + 1)).toISOString(),
+          body: `message-${ordinal}`,
+          sentAt: new Date(Date.UTC(2026, 7, 17, 0, 0, ordinal)).toISOString(),
         });
         registerMemoryCorpusSource(database, {
           roomId: "room-runtime",
           sourceKind: "message",
-          sourceId: `message:message-runtime-${index + 1}`,
+          sourceId: `message:message-runtime-${ordinal}`,
           sourceRevision: 1,
-          serverStreamSeq: index + 1,
+          serverStreamSeq: ordinal,
           eligibility: "eligible",
           availability: "readable",
           sourceActorId: "human-runtime",
-          safeMetadata: { authorKind: "human", messageId: `message-runtime-${index + 1}` },
-          readReference: `message-authority:message-runtime-${index + 1}:revision:1`,
-          occurredAt: new Date(Date.UTC(2026, 7, 17, 0, 0, index + 1)).toISOString(),
+          safeMetadata: { authorKind: "human", messageId: `message-runtime-${ordinal}` },
+          readReference: `message-authority:message-runtime-${ordinal}:revision:1`,
+          occurredAt: new Date(Date.UTC(2026, 7, 17, 0, 0, ordinal)).toISOString(),
         });
       }
+      database.exec(`
+        INSERT INTO human_preemption_fences (
+          source_human_message_id, room_id, human_actor_id, accepted_at,
+          cancelled_count, cancel_committed_at
+        ) SELECT id, room_id, author_id, sent_at, 0, sent_at
+          FROM messages
+          WHERE id IN (
+            'message-runtime-2', 'message-runtime-3', 'message-runtime-4',
+            'message-runtime-5', 'message-runtime-6'
+          );
+      `);
       insertLegacyMessageAuthorityRecord(database, {
         id: "message-runtime-recalled",
         roomId: "room-runtime",
@@ -136,10 +217,7 @@ describe("real AuthorityWorker runtime authority", () => {
       database.close();
 
       const context = {
-        kind: "human" as const,
-        sessionId: session.sessionId,
-        sessionFamilyId: session.familyId,
-        principal: { accountId: session.accountId, actorId: session.actorId },
+        ...directContext,
         requestId: "request-runtime-1",
         idempotencyKey: "key-runtime-1",
       };

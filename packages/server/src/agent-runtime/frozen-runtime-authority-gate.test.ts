@@ -24,6 +24,7 @@ function installFixture(database: DatabaseSync): void {
     CREATE TABLE room_memberships (
       room_id TEXT NOT NULL, actor_id TEXT NOT NULL, kind TEXT NOT NULL,
       participation TEXT, access_revision INTEGER NOT NULL,
+      tool_permissions_json TEXT NOT NULL,
       PRIMARY KEY (room_id, actor_id)
     ) STRICT;
     CREATE TABLE agent_profiles (
@@ -72,7 +73,10 @@ function installFixture(database: DatabaseSync): void {
 
     INSERT INTO rooms VALUES ('room-1', 'active');
     INSERT INTO actors VALUES ('agent-1', 'agent', 'ready');
-    INSERT INTO room_memberships VALUES ('room-1', 'agent-1', 'agent', 'on-mention', 5);
+    INSERT INTO room_memberships VALUES (
+      'room-1', 'agent-1', 'agent', 'on-mention', 5,
+      '["http-json.read","repository.git-status","room-memory.read","sandbox-file.write"]'
+    );
     INSERT INTO agent_profiles VALUES ('profile-1', 'agent-1', 7, 'enabled');
     INSERT INTO agent_profile_revisions VALUES
       ('profile-1', 7, 'agent-1', 'enabled',
@@ -160,13 +164,31 @@ describe("server-private frozen runtime Authority handoff gate", () => {
     ["membership revoke", "DELETE FROM room_memberships", "access_revoked"],
     ["membership participation race", "UPDATE room_memberships SET participation = 'active'", "assignment_inactive"],
     ["access revision race", "UPDATE room_memberships SET access_revision = 6", "access_revision_stale"],
-    ["paused provider", "UPDATE actors SET readiness = 'paused'", "provider_unavailable"],
-    ["noauth provider", "UPDATE actors SET readiness = 'noauth'", "provider_unavailable"],
     ["Room archived", "UPDATE rooms SET status = 'archived'", "room_inactive"],
   ])("fails closed after %s", (_label, mutation, reason) => {
     const database = fixture();
     database.exec(mutation);
     expectReason(database, "direct-execution", reason);
+    database.close();
+  });
+
+  it("does not treat legacy mutable actor readiness as Provider authority", () => {
+    const database = fixture();
+    database.exec("UPDATE actors SET readiness = 'noauth'");
+    expect(requireFrozenRuntimeAuthority(database, "direct-execution")).toMatchObject({
+      origin: "direct", intentId: "direct-intent",
+    });
+    database.close();
+  });
+
+  it("intersects frozen Profile and Assignment tools with current membership policy", () => {
+    const database = fixture();
+    database.exec(`
+      UPDATE room_memberships
+      SET tool_permissions_json = '["repository.git-status","room-memory.read"]'
+    `);
+    expect(requireFrozenRuntimeAuthority(database, "direct-execution").effectiveToolIds)
+      .toEqual(["repository.git-status", "room-memory.read"]);
     database.close();
   });
 

@@ -484,7 +484,7 @@ async function stopChild(
   await childExit(child, killTimeoutMs);
 }
 
-async function waitForRouteJudgmentCount(
+async function waitForRouteDecisionCount(
   directory: string,
   roomId: string,
   expected: number,
@@ -497,8 +497,8 @@ async function waitForRouteJudgmentCount(
     try {
       const count = database.prepare(
         `SELECT COUNT(*) AS count
-         FROM route_judgments AS judgment
-         INNER JOIN route_jobs AS job ON job.id = judgment.route_job_id
+         FROM route_decisions AS decision
+         INNER JOIN route_jobs AS job ON job.id = decision.route_job_id
          WHERE job.room_id = ?`,
       );
       const row = count.get(roomId) as { readonly count: number };
@@ -510,7 +510,7 @@ async function waitForRouteJudgmentCount(
     await new Promise<void>((resolve) => setTimeout(resolve, 20));
   }
   throw new Error(
-    `Route judgments did not settle at ${expected} within ${timeoutMs}ms (actual=${actual})`,
+    `Route decisions did not settle at ${expected} within ${timeoutMs}ms (actual=${actual})`,
   );
 }
 
@@ -3327,7 +3327,7 @@ describe("authoritative server real-process harness", () => {
       client = await JsonWebSocketClient.connect(seeded.url);
       await client.login("seed-readback-login");
       const seededRoomId = await discoverRoom(client);
-      await waitForRouteJudgmentCount(directory, seededRoomId, 1);
+      await waitForRouteDecisionCount(directory, seededRoomId, 1);
       const seededSnapshot = await repairRecords(client, seededRoomId);
       client.close();
       await stopChild(first);
@@ -4243,10 +4243,10 @@ describe("authoritative server real-process harness", () => {
       const stressA = await JsonWebSocketClient.connect(stress.url);
       clients.push(stressA);
       const stressAccessToken = await stressA.login("stress-a-login");
-      await waitForRouteJudgmentCount(
+      await waitForRouteDecisionCount(
         directory,
         roomId,
-        mixed.mixedCounts["route-judgment"] ?? 0,
+        mixed.mixedCounts["route-job"] ?? 0,
       );
       transportA.replaceClient(stressA);
       transportA.beforeStreamingSnapshotComplete = () => {
@@ -4319,7 +4319,7 @@ describe("authoritative server real-process harness", () => {
       expect([stressPagesB, stressPagesC])
         .toEqual([completeMaterializedPages, completeMaterializedPages]);
 
-      expect(mixed.total).toBe(13_507);
+      expect(mixed.total).toBe(13_503);
       expect(mixed.distinctMembershipActors).toBe(2_000);
       expect(mixed.mixedCounts).toEqual({
         room: 1,
@@ -4332,7 +4332,7 @@ describe("authoritative server real-process harness", () => {
         "agent-execution": 500,
         calibration: 1_000,
         "route-job": 4,
-        "route-judgment": 4,
+        "route-judgment": 0,
       });
       const authoritativeHeadSeq = readRoomHeadSeq(directory, roomId);
       const authorityChecksum = cacheA.roomChecksum(roomId);

@@ -114,7 +114,7 @@ function fakeAuthority(
         judgments,
       });
       bySource.delete(job.sourceMessageId);
-      return { job: terminal, intents };
+      return { job: terminal, intents, handoffs: [] };
     },
     async fail(job, errorCode) {
       failed.push({ job, code: errorCode });
@@ -125,6 +125,12 @@ function fakeAuthority(
     },
     async recover() {
       return [...bySource.values()];
+    },
+    async claimHandoff() {
+      throw new Error("no handoff fixture");
+    },
+    async recoverHandoffs() {
+      return [];
     },
   };
   return { authority, completed, failed };
@@ -355,7 +361,7 @@ describe("bounded single-route runtime", () => {
 
     expect(providerCalls).toBe(0);
     expect(fixture.completed[0]?.intents.map((intent) => intent.reasonCode))
-      .toEqual(["direct_mention", "ball_due"]);
+      .toEqual(["ball_due"]);
     expect(fixture.failed).toEqual([]);
     await runtime.close();
   });
@@ -386,7 +392,7 @@ describe("bounded single-route runtime", () => {
     expect(inputs[0]).not.toHaveProperty("visibleConversation");
     expect(inputs[0]).not.toHaveProperty("secret");
     expect(fixture.completed[0]?.intents.map((intent) => intent.targetAgentId))
-      .toEqual(["agent-direct", "agent-active"]);
+      .toEqual(["agent-active"]);
     expect(fixture.completed).toHaveLength(1);
     await runtime.close();
   });
@@ -397,7 +403,10 @@ describe("bounded single-route runtime", () => {
       authority: fixture.authority,
       projectFacts: healthyProjectFacts,
       memoryReadiness: healthyMemoryReadiness,
-      provider: { async decide() { return { candidates: [] }; } },
+      provider: { async decide() { return { candidates: [{
+        agentId: "agent-active", trigger: "domain", order: 1,
+        reasonCode: "domain_match", reasonText: "responsibility match",
+      }] }; } },
     });
 
     runtime.notify("room-durable", "message-durable");
@@ -461,7 +470,7 @@ describe("bounded single-route runtime", () => {
     expect(calls).toBe(3);
     await runtime.whenIdle();
     expect(fixture.completed[0]).toMatchObject({ terminal: "provider_malformed" });
-    expect(fixture.completed[0]?.intents.map((intent) => intent.targetAgentId)).toEqual(["agent-direct"]);
+    expect(fixture.completed[0]?.intents).toEqual([]);
     await runtime.close();
   });
 
@@ -494,7 +503,7 @@ describe("bounded single-route runtime", () => {
     expect(calls).toBe(3);
     expect(fixture.completed[0]).toMatchObject({ terminal: code });
     expect(fixture.completed[0]?.intents.map((intent) => intent.targetAgentId))
-      .toEqual(["agent-direct"]);
+      .toEqual([]);
     await runtime.close();
   });
 

@@ -1387,6 +1387,7 @@ describe("SQLite authoritative sessions", () => {
 
       const claimed = await client.executeRoute({
         type: "route.claim",
+        agentProviderReady: true,
         sourceMessageId: command.payload.id,
         now: 2_100,
       });
@@ -1401,19 +1402,17 @@ describe("SQLite authoritative sessions", () => {
             authorKind: "human",
             summary: command.payload.body,
           },
-          agents: [
-            { agentId: "agent-review", participation: "active", capabilities: ["review.read"] },
-            { agentId: "agent-route-second", participation: "on-mention", capabilities: ["route.read"] },
-          ],
-          limits: { timeoutMs: 1_000, maxCandidates: 2, maxOutputBytes: 65_536 },
+          agents: [],
+          limits: { timeoutMs: 1_000, maxCandidates: 0, maxOutputBytes: 65_536 },
         },
         decisionContext: {
-          directMentionAgentIds: ["agent-review", "agent-route-second"],
+          directMentionAgentIds: [],
           structuredHelpAgentIds: [],
         },
       });
       await expect(client.executeRoute({
         type: "route.claim",
+        agentProviderReady: true,
         sourceMessageId: command.payload.id,
         now: 2_101,
       })).rejects.toMatchObject({ status: 409, code: "route_conflict" });
@@ -1423,27 +1422,8 @@ describe("SQLite authoritative sessions", () => {
         { type: "member.remove", roomId: "room-route", payload: { targetActorId: "agent-route-second" } },
       )).rejects.toMatchObject({ status: 503, code: "dependency_unavailable" });
       const routeJobId = (claimed as { readonly job: { readonly id: string } }).job.id;
-      const decidedAt = "1970-01-01T00:00:02.200Z";
-      const judgments = ["agent-review", "agent-route-second"].map((agentId) => ({
-        id: `judgment-${agentId}`,
-        routeJobId,
-        sourceMessageId: command.payload.id,
-        agentId,
-        outcome: "will_respond" as const,
-        reasonCode: "direct_mention" as const,
-        reasonText: "direct mandatory address",
-        routeAttempt: 1 as const,
-        decidedAt,
-      }));
-      const intents = ["agent-review", "agent-route-second"].map((targetAgentId) => ({
-        kind: "direct_mention" as const,
-        roomId: "room-route",
-        sourceMessageId: command.payload.id,
-        targetAgentId,
-        reasonCode: "direct_mention" as const,
-        reasonText: "direct mandatory address",
-        priority: 1 as const,
-      }));
+      const judgments = [];
+      const intents = [];
       await expect(client.executeRoute({
         type: "route.complete",
         routeJobId,
@@ -1454,26 +1434,18 @@ describe("SQLite authoritative sessions", () => {
       })).resolves.toMatchObject({
         kind: "route-completed",
         job: { status: "completed" },
-        intents: [
-          { targetAgentId: "agent-review" },
-          { targetAgentId: "agent-route-second" },
-        ],
+        intents: [],
+        handoffs: [],
       });
 
       const completedInspection = new DatabaseSync(databasePath, { readOnly: true });
       expect(completedInspection.prepare(
         `SELECT agent_id AS agentId, outcome, reason_code AS reasonCode
          FROM route_judgments ORDER BY agent_id`,
-      ).all()).toEqual([
-        { agentId: "agent-review", outcome: "will_respond", reasonCode: "direct_mention" },
-        { agentId: "agent-route-second", outcome: "will_respond", reasonCode: "direct_mention" },
-      ]);
+      ).all()).toEqual([]);
       expect(completedInspection.prepare(
         `SELECT target_agent_id AS targetAgentId FROM route_invocation_intents`,
-      ).all()).toEqual([
-        { targetAgentId: "agent-review" },
-        { targetAgentId: "agent-route-second" },
-      ]);
+      ).all()).toEqual([]);
       completedInspection.close();
 
       const routedInvocation = {
@@ -1538,6 +1510,7 @@ describe("SQLite authoritative sessions", () => {
       });
       const retryClaim1 = await client.executeRoute({
         type: "route.claim",
+        agentProviderReady: true,
         sourceMessageId: retryCommand.payload.id,
         now: 3_000,
       }) as { readonly job: { readonly id: string } };
@@ -1555,11 +1528,13 @@ describe("SQLite authoritative sessions", () => {
       });
       await expect(client.executeRoute({
         type: "route.claim",
+        agentProviderReady: true,
         sourceMessageId: retryCommand.payload.id,
         now: 3_349,
       })).rejects.toMatchObject({ status: 409, code: "route_conflict" });
       await client.executeRoute({
         type: "route.claim",
+        agentProviderReady: true,
         sourceMessageId: retryCommand.payload.id,
         now: 3_350,
       });
@@ -1576,6 +1551,7 @@ describe("SQLite authoritative sessions", () => {
       });
       await client.executeRoute({
         type: "route.claim",
+        agentProviderReady: true,
         sourceMessageId: retryCommand.payload.id,
         now: 4_400,
       });
@@ -1636,6 +1612,7 @@ describe("SQLite authoritative sessions", () => {
       });
       const restartClaim = await client.executeRoute({
         type: "route.claim",
+        agentProviderReady: true,
         sourceMessageId: restartCommand.payload.id,
         now: 5_000,
       }) as { readonly job: { readonly id: string } };
@@ -5110,6 +5087,7 @@ describe("SQLite authoritative sessions", () => {
 
     await expect(fixture.client.executeRoute({
       type: "route.claim",
+      agentProviderReady: true,
       sourceMessageId,
       now: 5_100,
     })).resolves.toMatchObject({
@@ -5265,6 +5243,7 @@ describe("SQLite authoritative sessions", () => {
 
     const claimed = await fixture.client.executeRoute({
       type: "route.claim",
+      agentProviderReady: true,
       sourceMessageId,
       now: 5_200,
     });
@@ -5317,6 +5296,7 @@ describe("SQLite authoritative sessions", () => {
 
     await expect(fixture.client.executeRoute({
       type: "route.claim",
+      agentProviderReady: true,
       sourceMessageId,
       now: 5_200,
     })).rejects.toMatchObject({ status: 409, code: "route_conflict" });

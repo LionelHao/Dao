@@ -254,6 +254,7 @@ describe("real SQLite human-preemption authority", () => {
     recallHuman("human-recalled-before-claim", 22_003);
     expect(() => executeRouteAuthorityOperation(database, {
       type: "route.claim",
+      agentProviderReady: true,
       sourceMessageId: "human-recalled-before-claim",
       now: t0 + 22_004,
     })).toThrow(/recalled|fence|conflict|no longer active/i);
@@ -357,25 +358,46 @@ describe("real SQLite human-preemption authority", () => {
     expect(routed).toMatchObject({ kind: "human-fence-route", replayed: false });
     if (routed.kind !== "human-fence-route") throw new Error("unexpected route result");
     const claim = executeRouteAuthorityOperation(database, {
-      type: "route.claim", sourceMessageId: "human-message-1", now: t0 + 20_005,
+      type: "route.claim", sourceMessageId: "human-message-1",
+      agentProviderReady: true, now: t0 + 20_005,
     });
     if (claim.kind !== "route-claimed") throw new Error("unexpected claim result");
-    executeRouteAuthorityOperation(database, {
+    const completedRoute = executeRouteAuthorityOperation(database, {
       type: "route.complete", routeJobId: claim.job.id, attempt: claim.job.currentAttempt,
       judgments: [
         { id: "judgment-agent-1", routeJobId: claim.job.id, sourceMessageId: "human-message-1",
           agentId: "agent-1", outcome: "will_respond", reasonCode: "domain_match",
           reasonText: "selected after human fence", routeAttempt: 1,
           decidedAt: new Date(t0 + 20_006).toISOString() },
-        { id: "judgment-agent-2", routeJobId: claim.job.id, sourceMessageId: "human-message-1",
-          agentId: "agent-2", outcome: "suppressed", reasonCode: "provider_omitted",
-          reasonText: "not selected", routeAttempt: 1,
-          decidedAt: new Date(t0 + 20_006).toISOString() },
       ],
       intents: [{ kind: "routed_candidate", roomId: "room-1", sourceMessageId: "human-message-1",
         targetAgentId: "agent-1", reasonCode: "domain_match", reasonText: "selected after human fence",
         priority: 3 }],
       now: t0 + 20_006,
+    });
+    if (completedRoute.kind !== "route-completed" || completedRoute.handoffs.length !== 1) {
+      throw new Error("unexpected durable route handoff");
+    }
+    const durableHandoff = completedRoute.handoffs[0]!;
+    database.close();
+    database = new DatabaseSync(databasePath);
+    migrateAuthorityDatabase(database);
+    expect(executeRouteAuthorityOperation(database, {
+      type: "route.handoff.recover", now: t0 + 20_006,
+    })).toMatchObject({
+      kind: "route-handoff-recovery",
+      intents: [{
+        intentId: durableHandoff.intentId,
+        routeJobId: claim.job.id,
+        roomId: "room-1",
+        actorId: "agent-1",
+        status: "pending",
+      }],
+    });
+    executeRouteAuthorityOperation(database, {
+      type: "route.handoff.claim", roomId: "room-1",
+      intentId: durableHandoff.intentId,
+      providerReady: true, now: t0 + 20_006,
     });
     const replacement = executeRuntimeAuthorityOperation(database, {
       type: "runtime.enqueue-fence-replacements", routeJobId: routed.routeJobId,
