@@ -110,7 +110,8 @@ async function expectDatabasePathReusable(path: string): Promise<void> {
 
 async function expectDatabasePathEventuallyReusable(path: string): Promise<void> {
   let coordinatorError: unknown;
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  const deadline = Date.now() + 2_000;
+  do {
     try {
       await expectDatabasePathReusable(path);
       return;
@@ -122,9 +123,9 @@ async function expectDatabasePathEventuallyReusable(path: string): Promise<void>
         throw error;
       }
       coordinatorError = error;
-      await new Promise<void>((resolveImmediate) => setImmediate(resolveImmediate));
+      await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 10));
     }
-  }
+  } while (Date.now() < deadline);
   throw coordinatorError;
 }
 
