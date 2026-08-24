@@ -107,6 +107,12 @@ import {
   type TenantAdministrationOperation,
   type TenantAdministrationResult,
 } from "../tenant-administration/authority-protocol.js";
+import {
+  isRoomAssignmentOperation,
+  isRoomAssignmentResult,
+  type RoomAssignmentOperation,
+  type RoomAssignmentResult,
+} from "../room-assignment/authority-protocol.js";
 
 export type ContextWorkerOperation = ContextSnapshotAuthorityOperation | {
   readonly type: "context.finalize-agent-message";
@@ -129,6 +135,8 @@ export type AuthorityWorkerErrorCode =
   | "administrator_required"
   | "administrator_already_exists"
   | "administrator_not_found"
+  | "assignment_gone"
+  | "assignment_not_found"
   | "authority_already_initialized"
   | "authority_not_initialized"
   | "authority_operation_unavailable"
@@ -249,6 +257,8 @@ export function isAuthorityWorkerErrorCode(
     case "administrator_required":
     case "administrator_already_exists":
     case "administrator_not_found":
+    case "assignment_gone":
+    case "assignment_not_found":
     case "authority_already_initialized":
     case "authority_not_initialized":
     case "authority_operation_unavailable":
@@ -464,6 +474,11 @@ export type AuthorityWorkerRequest =
       readonly type: "authority.tenant-administration";
       readonly requestId: string;
       readonly operation: TenantAdministrationOperation;
+    }
+  | {
+      readonly type: "authority.room-assignment";
+      readonly requestId: string;
+      readonly operation: RoomAssignmentOperation;
     }
   | {
       readonly type: "authority.message-submit";
@@ -744,6 +759,11 @@ export type AuthorityWorkerResponse =
       readonly type: "authority.tenant-administration-result";
       readonly requestId: string;
       readonly result: TenantAdministrationResult;
+    }
+  | {
+      readonly type: "authority.room-assignment-result";
+      readonly requestId: string;
+      readonly result: RoomAssignmentResult;
     }
   | {
       readonly type: "authority.message-submitted";
@@ -1586,6 +1606,9 @@ export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWork
     case "authority.tenant-administration":
       return hasExactKeys(value, ["type", "requestId", "operation"]) &&
         isTenantAdministrationOperation(value.operation);
+    case "authority.room-assignment":
+      return hasExactKeys(value, ["type", "requestId", "operation"]) &&
+        isRoomAssignmentOperation(value.operation);
     case "authority.message-submit":
       return hasExactKeys(value, ["type", "requestId", "context", "message", "now"]) &&
         isAuthenticatedCommandContext(value.context) && isHumanMessageSubmit(value.message) &&
@@ -1773,6 +1796,9 @@ export function isAuthorityWorkerResponse(
     case "authority.tenant-administration-result":
       return hasExactKeys(value, ["type", "requestId", "result"]) &&
         isTenantAdministrationResult(value.result);
+    case "authority.room-assignment-result":
+      return hasExactKeys(value, ["type", "requestId", "result"]) &&
+        isRoomAssignmentResult(value.result);
     case "authority.message-submitted":
       return hasExactKeys(value, ["type", "requestId", "receipt"]) &&
         isSubmissionReceipt(value.receipt);
