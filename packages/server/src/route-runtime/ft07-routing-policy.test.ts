@@ -88,6 +88,14 @@ describe("FT-07 RouteCandidateSnapshot", () => {
       ...snapshot,
       candidates: [...snapshot.candidates].reverse(),
     })).toBe(false);
+    expect(isRouteCandidateSnapshot({
+      ...snapshot,
+      candidates: [{ ...snapshot.candidates[0], roomResponsibility: "x".repeat(4_000) }],
+    })).toBe(true);
+    expect(isRouteCandidateSnapshot({
+      ...snapshot,
+      candidates: [{ ...snapshot.candidates[0], roomResponsibility: "x".repeat(4_001) }],
+    })).toBe(false);
   });
 
   it("is metamorphically invariant to external display-name changes", () => {

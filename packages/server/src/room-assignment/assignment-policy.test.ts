@@ -49,6 +49,12 @@ describe("Room Assignment request and authority policy", () => {
       kind: "pause", requestId: "request-2", roomId: "room-1",
       expectedRoomRevision: 4, expectedAssignmentRevision: 0,
     })).toBe(false);
+    expect(isAssignmentMutationRequest({
+      ...createRequest, roomResponsibility: "x".repeat(4_000),
+    })).toBe(true);
+    expect(isAssignmentMutationRequest({
+      ...createRequest, roomResponsibility: "x".repeat(4_001),
+    })).toBe(false);
   });
 
   it.each(["member", null] as const)("forbids a current %s from mutation", (roomRole) => {
@@ -170,6 +176,7 @@ describe("Assignment availability and execution gate", () => {
   it("gives an on-mention direct invocation the full approved intersection", () => {
     const result = evaluateAssignmentExecutionGate({
       ...readyFacts,
+      stage: "execution",
       participation: "on-mention",
       origin: "direct",
       profileCapabilities: ["room.project.read", "room.respond"],
@@ -181,14 +188,16 @@ describe("Assignment availability and execution gate", () => {
     });
     expect(result).toEqual({
       allowed: true,
+      admission: "start",
       effectiveCapabilities: ["room.respond"],
       effectiveTools: ["repository.git-status"],
     });
   });
 
-  it("excludes on-mention from routed work and gates paused/noauth/busy", () => {
+  it("queues busy direct work but excludes busy routed/project work", () => {
     const base = {
       ...readyFacts,
+      stage: "intent-admission" as const,
       participation: "on-mention" as const,
       origin: "routed" as const,
       profileCapabilities: ["room.respond"], assignmentCapabilities: ["room.respond"],
@@ -196,14 +205,38 @@ describe("Assignment availability and execution gate", () => {
       assignmentTools: ["room-memory.read"], membershipTools: ["room-memory.read"],
     };
     expect(evaluateAssignmentExecutionGate(base).allowed).toBe(false);
+    const busyDirect = evaluateAssignmentExecutionGate({
+      ...base, origin: "direct", durableRunningExecutionCount: 1,
+    });
+    expect(busyDirect).toEqual({
+      allowed: true,
+      admission: "queue",
+      effectiveCapabilities: ["room.respond"],
+      effectiveTools: ["room-memory.read"],
+    });
     expect(evaluateAssignmentExecutionGate({
-      ...base, participation: "active", durablePaused: true,
+      ...base, participation: "active", origin: "routed", durableRunningExecutionCount: 1,
     }).allowed).toBe(false);
     expect(evaluateAssignmentExecutionGate({
-      ...base, participation: "active", providerAuthenticated: false,
+      ...base, participation: "active", origin: "project-boundary",
+      durableRunningExecutionCount: 1,
     }).allowed).toBe(false);
     expect(evaluateAssignmentExecutionGate({
-      ...base, participation: "active", durableRunningExecutionCount: 1,
+      ...base, stage: "execution", origin: "direct", durableRunningExecutionCount: 1,
     }).allowed).toBe(false);
+  });
+
+  it("denies direct invocation while paused or noauth", () => {
+    const base = {
+      ...readyFacts,
+      stage: "intent-admission" as const,
+      participation: "on-mention" as const,
+      origin: "direct" as const,
+      profileCapabilities: ["room.respond"], assignmentCapabilities: ["room.respond"],
+      membershipCapabilities: ["room.respond"], profileTools: ["room-memory.read"],
+      assignmentTools: ["room-memory.read"], membershipTools: ["room-memory.read"],
+    };
+    expect(evaluateAssignmentExecutionGate({ ...base, durablePaused: true }).allowed).toBe(false);
+    expect(evaluateAssignmentExecutionGate({ ...base, providerAuthenticated: false }).allowed).toBe(false);
   });
 });

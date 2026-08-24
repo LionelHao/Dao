@@ -109,9 +109,17 @@ export function createRouteDurableIntentOperation(
     createdAt,
     intents: Object.freeze(intents.map((entry) => Object.freeze({ ...entry }))),
   };
-  if (!isRouteDurableIntentOperation(operation) ||
-      (operation.intents.length > 0 &&
-        !operation.intents.some((entry) => entry.actorId === origin.targetActorId))) {
+  const targetByActorId = new Map(origin.targets.map((target) => [target.actorId, target]));
+  const allIntentsBound = operation.intents.length === origin.targets.length &&
+    operation.intents.every((entry) => {
+      const target = targetByActorId.get(entry.actorId);
+      return target !== undefined && target.profileId === entry.profileId &&
+        target.profileRevision === entry.profileRevision &&
+        target.assignmentId === entry.assignmentId &&
+        target.assignmentRevision === entry.assignmentRevision &&
+        target.accessRevision === entry.accessRevision;
+    });
+  if (!isRouteDurableIntentOperation(operation) || !allIntentsBound) {
     throw new TypeError("Route durable intent operation is invalid");
   }
   return Object.freeze(operation);

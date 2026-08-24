@@ -14,6 +14,15 @@ const binding = {
   accessRevision: 8,
 } as const;
 
+const routeTarget = {
+  actorId: "agent-1",
+  profileId: "profile-1",
+  profileRevision: 3,
+  assignmentId: "assignment-1",
+  assignmentRevision: 5,
+  accessRevision: 8,
+} as const;
+
 describe("server-private trusted invocation origins", () => {
   it("mints the three closed origins from authority evidence", () => {
     const direct = mintDirectInvocationOrigin({
@@ -24,12 +33,13 @@ describe("server-private trusted invocation origins", () => {
       targetOutcomeId: "outcome-1",
     });
     const routed = mintRouteDecisionOrigin({
-      ...binding,
       kind: "route_decision",
+      roomId: "room-1",
       routeJobId: "route-1",
       routeJobRevision: 2,
       snapshotId: "snapshot-1",
       decisionId: "decision-1",
+      targets: [routeTarget],
     });
     const boundary = mintProjectBoundaryOrigin({
       ...binding,
@@ -45,12 +55,13 @@ describe("server-private trusted invocation origins", () => {
 
   it("does not trust JSON/public lookalikes or structured clones", () => {
     const origin = mintRouteDecisionOrigin({
-      ...binding,
       kind: "route_decision",
+      roomId: "room-1",
       routeJobId: "route-1",
       routeJobRevision: 2,
       snapshotId: "snapshot-1",
       decisionId: "decision-1",
+      targets: [routeTarget],
     });
     expect(isTrustedInvocationOrigin({ ...origin })).toBe(false);
     expect(isTrustedInvocationOrigin(JSON.parse(JSON.stringify(origin)))).toBe(false);
@@ -59,12 +70,13 @@ describe("server-private trusted invocation origins", () => {
 
   it("rejects incomplete or unknown authority evidence", () => {
     expect(() => mintRouteDecisionOrigin({
-      ...binding,
       kind: "route_decision",
+      roomId: "room-1",
       routeJobId: "route-1",
       routeJobRevision: 0,
       snapshotId: "snapshot-1",
       decisionId: "decision-1",
+      targets: [routeTarget],
     })).toThrow("Route decision evidence is invalid");
     expect(() => mintProjectBoundaryOrigin({
       ...binding,
@@ -73,5 +85,21 @@ describe("server-private trusted invocation origins", () => {
       projectFactId: "",
       projectFactRevision: 9,
     })).toThrow("Project boundary evidence is invalid");
+  });
+
+  it("requires canonical unique decision-wide target bindings", () => {
+    expect(() => mintRouteDecisionOrigin({
+      kind: "route_decision", roomId: "room-1", routeJobId: "route-1",
+      routeJobRevision: 2, snapshotId: "snapshot-1", decisionId: "decision-1",
+      targets: [routeTarget, { ...routeTarget, profileRevision: 4 }],
+    })).toThrow("Route decision evidence is invalid");
+    expect(() => mintRouteDecisionOrigin({
+      kind: "route_decision", roomId: "room-1", routeJobId: "route-1",
+      routeJobRevision: 2, snapshotId: "snapshot-1", decisionId: "decision-1",
+      targets: [
+        { ...routeTarget, actorId: "agent-z" },
+        { ...routeTarget, actorId: "agent-a" },
+      ],
+    })).toThrow("Route decision evidence is invalid");
   });
 });

@@ -71,6 +71,7 @@ export type AssignmentAvailabilityProjection = Readonly<{
 }>;
 
 export interface AssignmentExecutionGateInput extends AssignmentAvailabilityFacts {
+  readonly stage: "intent-admission" | "execution";
   readonly participation: AssignmentParticipation;
   readonly origin: "direct" | "routed" | "project-boundary";
   readonly profileCapabilities: readonly string[];
@@ -87,6 +88,7 @@ export type AssignmentExecutionGate = Readonly<{
   effectiveTools: readonly [];
 }> | Readonly<{
   allowed: true;
+  admission: "start" | "queue";
   effectiveCapabilities: readonly string[];
   effectiveTools: readonly string[];
 }>;
@@ -150,7 +152,7 @@ export function isAssignmentMutationRequest(value: unknown): value is Assignment
   if (keys === undefined || !exact(value, keys) || !text(value.requestId) ||
       !text(value.roomId) || !revision(value.expectedRoomRevision)) return false;
   if (value.kind === "create" || value.kind === "update") {
-    if (!text(value.roomResponsibility) || value.roomResponsibility.length > 2_000 ||
+    if (!text(value.roomResponsibility) || value.roomResponsibility.length > 4_000 ||
         (value.participation !== "active" && value.participation !== "on-mention") ||
         !canonicalSet(value.capabilitySubset) || !canonicalSet(value.toolSubset)) return false;
   }
@@ -230,7 +232,11 @@ export function evaluateAssignmentExecutionGate(
 ): AssignmentExecutionGate {
   const availability = deriveAssignmentAvailability(input);
   const originAllowsParticipation = input.origin === "direct" || input.participation === "active";
-  if (!availability.eligible || availability.availability !== "ready" || !originAllowsParticipation) {
+  const availabilityAllowsOrigin = availability.eligible &&
+    (availability.availability === "ready" ||
+      (input.stage === "intent-admission" && input.origin === "direct" &&
+        availability.availability === "busy"));
+  if (!availabilityAllowsOrigin || !originAllowsParticipation) {
     return Object.freeze({
       allowed: false as const,
       effectiveCapabilities: Object.freeze([]) as readonly [],
@@ -239,6 +245,7 @@ export function evaluateAssignmentExecutionGate(
   }
   return Object.freeze({
     allowed: true as const,
+    admission: availability.availability === "busy" ? "queue" as const : "start" as const,
     effectiveCapabilities: intersection(
       input.profileCapabilities,
       input.assignmentCapabilities,

@@ -129,7 +129,7 @@ function candidate(value: unknown): value is RouteCandidateSnapshotEntry {
     (value.participation === "active" || value.participation === "on-mention") &&
     (value.availability === "ready" || value.availability === "busy" ||
       value.availability === "paused" || value.availability === "noauth") &&
-    text(value.roomResponsibility) && value.roomResponsibility.length <= 2_000 &&
+    text(value.roomResponsibility) && value.roomResponsibility.length <= 4_000 &&
     canonicalSet(value.effectiveCapabilities) && canonicalSet(value.effectiveTools) &&
     typeof value.calibrationScore === "number" && Number.isSafeInteger(value.calibrationScore) &&
     value.calibrationScore >= -3 && value.calibrationScore <= 3 &&

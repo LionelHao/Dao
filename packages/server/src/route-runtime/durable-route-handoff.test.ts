@@ -8,20 +8,30 @@ import {
   type DurableRouteIntentRecord,
   type RouteDurableIntentOperation,
 } from "./durable-route-handoff.js";
-import { mintRouteDecisionOrigin } from "./trusted-invocation-origin.js";
+import {
+  mintRouteDecisionOrigin,
+  type RouteDecisionTargetBinding,
+} from "./trusted-invocation-origin.js";
 
-const origin = () => mintRouteDecisionOrigin({
-  kind: "route_decision",
-  roomId: "room-1",
-  targetActorId: "agent-1",
+const routeTarget = {
+  actorId: "agent-1",
+  profileId: "profile-1",
   profileRevision: 3,
+  assignmentId: "assignment-1",
   assignmentRevision: 5,
   accessRevision: 8,
+} as const;
+
+const origin = (targets: readonly RouteDecisionTargetBinding[] = [routeTarget]) =>
+  mintRouteDecisionOrigin({
+  kind: "route_decision",
+  roomId: "room-1",
   routeJobId: "route-1",
   routeJobRevision: 2,
   snapshotId: "snapshot-1",
   decisionId: "decision-1",
-});
+    targets,
+  });
 
 const intent = {
   intentId: "intent-1",
@@ -111,6 +121,43 @@ describe("route decision to durable intent handoff", () => {
     expect(first).toEqual(replay);
     expect(fixture.decisions.size).toBe(1);
     expect(fixture.records.size).toBe(1);
+  });
+
+  it("binds every atomic multi-target intent to the decision-wide authority", () => {
+    const secondTarget = {
+      actorId: "agent-2", profileId: "profile-2", profileRevision: 7,
+      assignmentId: "assignment-2", assignmentRevision: 11, accessRevision: 13,
+    } as const;
+    const secondIntent = {
+      ...intent,
+      intentId: "intent-2",
+      actorId: "agent-2",
+      profileId: "profile-2",
+      profileRevision: 7,
+      assignmentId: "assignment-2",
+      assignmentRevision: 11,
+      accessRevision: 13,
+    };
+    expect(createRouteDurableIntentOperation(
+      origin([routeTarget, secondTarget]),
+      [intent, secondIntent],
+      "2026-08-24T00:00:00.000Z",
+    ).intents).toEqual([intent, secondIntent]);
+    expect(() => createRouteDurableIntentOperation(
+      origin([routeTarget]),
+      [intent, secondIntent],
+      "2026-08-24T00:00:00.000Z",
+    )).toThrow("operation is invalid");
+    expect(() => createRouteDurableIntentOperation(
+      origin([routeTarget, secondTarget]),
+      [intent, { ...secondIntent, assignmentRevision: 12 }],
+      "2026-08-24T00:00:00.000Z",
+    )).toThrow("operation is invalid");
+    expect(() => createRouteDurableIntentOperation(
+      origin([routeTarget, secondTarget]),
+      [intent],
+      "2026-08-24T00:00:00.000Z",
+    )).toThrow("operation is invalid");
   });
 
   it("recovers the pending durable intent after a crash without best-effort invoke", async () => {
