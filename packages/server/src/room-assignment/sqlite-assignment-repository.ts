@@ -56,25 +56,40 @@ export interface AssignmentRuntimeAuthorityRow {
 }
 
 export interface AssignmentChangedProjection {
-  readonly recordKind: "room-agent-assignment";
-  readonly recordVersion: 1;
-  readonly roomId: string;
+  readonly recordVersion: "room-agent-assignment.v1";
   readonly assignmentId: string;
-  readonly actorId: string;
+  readonly roomId: string;
   readonly profileId: string;
+  readonly actorId: string;
+  readonly displayName: string;
+  readonly globalResponsibility: string;
+  readonly roomResponsibility: string;
+  readonly participation: AssignmentParticipation;
+  readonly availability: "ready" | "busy" | "paused" | "noauth";
+  readonly paused: boolean;
+  readonly capabilityCeiling: readonly string[];
+  readonly capabilitySubset: readonly string[];
+  readonly effectiveCapabilities: readonly string[];
+  readonly toolCeiling: readonly string[];
+  readonly toolSubset: readonly string[];
+  readonly effectiveTools: readonly string[];
   readonly profileRevision: number;
-  readonly profileDisplayName: string;
-  readonly profileGlobalResponsibility: string;
   readonly assignmentRevision: number;
   readonly accessRevision: number;
-  readonly status: "current" | "removed";
-  readonly participation: AssignmentParticipation;
-  readonly paused: boolean;
-  readonly roomResponsibility: string;
-  readonly capabilitySubset: readonly string[];
-  readonly toolSubset: readonly string[];
   readonly updatedAt: string;
 }
+
+export type AssignmentChangedEventPayload = Readonly<{
+  readonly change: "upserted" | "availability-changed";
+  readonly roomRevision: number;
+  readonly assignment: AssignmentChangedProjection;
+}> | Readonly<{
+  readonly change: "removed";
+  readonly roomRevision: number;
+  readonly assignmentId: string;
+  readonly actorId: string;
+  readonly assignmentRevision: number;
+}>;
 
 export interface RoomAssignmentRepository {
   authenticate(context: AuthenticatedSessionContext, now: number): boolean;
@@ -137,10 +152,7 @@ export interface RoomAssignmentRepository {
     outboxId: string;
     roomId: string;
     actorId: string;
-    operation: "create" | "update" | "pause" | "resume" | "remove";
-    changed: boolean;
-    acceptedRevision: number;
-    projection: AssignmentChangedProjection;
+    payload: AssignmentChangedEventPayload;
     occurredAt: string;
   }>): void;
   invalidateAssignmentContext(input: Readonly<{
@@ -503,12 +515,7 @@ function createRepository(database: DatabaseSync): RoomAssignmentRepository {
          ) VALUES (?, 'room', ?, ?, ?, ?, 'room.agent-assignment.changed', ?, ?)`,
       ).run(
         input.eventId, input.roomId, streamSeq, input.roomId, input.actorId,
-        input.occurredAt, JSON.stringify({
-          operation: input.operation,
-          changed: input.changed,
-          acceptedRevision: input.acceptedRevision,
-          projection: input.projection,
-        }),
+        input.occurredAt, JSON.stringify(input.payload),
       );
       database.prepare(
         `INSERT INTO outbox_deliveries (
@@ -550,7 +557,8 @@ function createRepository(database: DatabaseSync): RoomAssignmentRepository {
       if (!positive(row.profileRevision) ||
           (row.profileStatus !== "enabled" && row.profileStatus !== "disabled") ||
           (row.roomStatus !== "active" && row.roomStatus !== "archived") ||
-          !nonnegative(row.accessRevision) || (row.accessValid !== 0 && row.accessValid !== 1) ||
+          (row.accessValid !== 0 && row.accessValid !== 1) ||
+          (row.accessValid === 1 ? !nonnegative(row.accessRevision) : row.accessRevision !== null) ||
           !nonnegative(row.runningExecutionCount)) {
         throw new Error("Room Assignment runtime authority is corrupt");
       }
@@ -559,7 +567,7 @@ function createRepository(database: DatabaseSync): RoomAssignmentRepository {
         profileRevision: row.profileRevision,
         profileEnabled: row.profileStatus === "enabled",
         roomActive: row.roomStatus === "active",
-        accessRevision: row.accessRevision,
+        accessRevision: row.accessValid === 1 ? row.accessRevision as number : 0,
         accessValid: row.accessValid === 1,
         runningExecutionCount: row.runningExecutionCount,
       });

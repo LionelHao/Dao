@@ -2209,6 +2209,10 @@ function executeRoomAssignment(request: AuthorityWorkerRequest): void {
     const result = executeRoomAssignmentAuthorityOperation(
       requireAuthorityTransactionDatabase(),
       request.operation,
+      isAuthorityWorkerData(workerData) &&
+          workerData.deploymentProviderDisclosure?.credentialReadiness === "ready"
+        ? "ready"
+        : "noauth",
     );
     respond({ type: "authority.room-assignment-result", requestId: request.requestId, result });
   } catch (error: unknown) {

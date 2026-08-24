@@ -385,6 +385,7 @@ function roomAssignmentError(error: unknown): never {
 export function executeRoomAssignmentAuthorityOperation(
   database: DatabaseSync,
   operation: RoomAssignmentOperation,
+  providerCredentialReadiness: "ready" | "noauth" = "noauth",
 ): RoomAssignmentResult {
   try {
     switch (operation.type) {
@@ -400,6 +401,7 @@ export function executeRoomAssignmentAuthorityOperation(
               operation.context,
               operation.request,
               operation.now,
+              providerCredentialReadiness === "ready",
             ),
           ),
         };

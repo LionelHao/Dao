@@ -213,27 +213,33 @@ function projection(
     revision: number;
     displayName: string;
     globalResponsibility: string;
+    capabilityCeiling: readonly string[];
+    toolCeiling: readonly string[];
   }>,
   accessRevision: number,
+  availability: "ready" | "busy" | "paused" | "noauth",
 ): AssignmentChangedProjection {
   return Object.freeze({
-    recordKind: "room-agent-assignment" as const,
-    recordVersion: 1 as const,
-    roomId: assignment.roomId,
+    recordVersion: "room-agent-assignment.v1" as const,
     assignmentId: assignment.assignmentId,
-    actorId: assignment.actorId,
+    roomId: assignment.roomId,
     profileId: assignment.profileId,
+    actorId: assignment.actorId,
+    displayName: profile.displayName,
+    globalResponsibility: profile.globalResponsibility,
+    roomResponsibility: assignment.roomResponsibility,
+    participation: assignment.participation,
+    availability,
+    paused: assignment.paused,
+    capabilityCeiling: profile.capabilityCeiling,
+    capabilitySubset: assignment.capabilitySubset,
+    effectiveCapabilities: assignment.capabilitySubset,
+    toolCeiling: profile.toolCeiling,
+    toolSubset: assignment.toolSubset,
+    effectiveTools: assignment.toolSubset,
     profileRevision: profile.revision,
-    profileDisplayName: profile.displayName,
-    profileGlobalResponsibility: profile.globalResponsibility,
     assignmentRevision: assignment.revision,
     accessRevision,
-    status: assignment.status,
-    participation: assignment.participation,
-    paused: assignment.paused,
-    roomResponsibility: assignment.roomResponsibility,
-    capabilitySubset: assignment.capabilitySubset,
-    toolSubset: assignment.toolSubset,
     updatedAt: assignment.updatedAt,
   });
 }
@@ -249,11 +255,14 @@ function completeCommand(
     revision: number;
     displayName: string;
     globalResponsibility: string;
+    capabilityCeiling: readonly string[];
+    toolCeiling: readonly string[];
   }>,
   accessRevision: number,
   changed: boolean,
   roomRevision: number,
   now: number,
+  providerAuthenticated: boolean,
 ): RoomAssignmentCommandResult {
   const occurredAt = timestamp(now);
   const stableEventId = eventId(scope, request.idempotencyKey);
@@ -268,15 +277,36 @@ function completeCommand(
     operation: request.kind,
     occurredAt,
   });
+  const runtime = repository.readRuntimeAuthority(request.roomId, assignment.assignmentId);
+  if (runtime === undefined) fail(503, "storage_unavailable");
+  const availability = deriveAssignmentAvailability({
+    profileEnabled: runtime.profileEnabled,
+    assignmentCurrent: runtime.assignment.status === "current",
+    roomActive: runtime.roomActive,
+    membershipCurrent: runtime.accessValid,
+    durablePaused: runtime.assignment.paused,
+    providerAuthenticated,
+    durableRunningExecutionCount: runtime.runningExecutionCount,
+  });
+  const payload = availability.eligible
+    ? Object.freeze({
+        change: "upserted" as const,
+        roomRevision,
+        assignment: projection(assignment, profile, accessRevision, availability.availability),
+      })
+    : Object.freeze({
+        change: "removed" as const,
+        roomRevision,
+        assignmentId: assignment.assignmentId,
+        actorId: assignment.actorId,
+        assignmentRevision: assignment.revision,
+      });
   repository.appendChangedEvent({
     eventId: stableEventId,
     outboxId: outboxId(stableEventId),
     roomId: request.roomId,
     actorId: context.principal.actorId,
-    operation: request.kind,
-    changed,
-    acceptedRevision: assignment.revision,
-    projection: projection(assignment, profile, accessRevision),
+    payload,
     occurredAt,
   });
   const result = Object.freeze({
@@ -297,6 +327,7 @@ function execute(
   context: AuthenticatedSessionContext,
   request: AssignmentMutationRequest,
   now: number,
+  providerAuthenticated: boolean,
 ): RoomAssignmentCommandResult {
   const room = requireAuthenticatedRoom(repository, context, request.roomId, now);
   if (room.role !== "owner" && room.role !== "admin") fail(403, "forbidden");
@@ -358,7 +389,7 @@ function execute(
     if (runtime === undefined) fail(503, "storage_unavailable");
     return completeCommand(
       repository, context, request, requestHash, scope, current, profile,
-      runtime.accessRevision, false, room.governanceRevision, now,
+      runtime.accessRevision, false, room.governanceRevision, now, providerAuthenticated,
     );
   }
 
@@ -408,7 +439,7 @@ function execute(
   });
   return completeCommand(
     repository, context, request, requestHash, scope, updated, profile,
-    accessRevision, true, roomRevision, now,
+    accessRevision, true, roomRevision, now, providerAuthenticated,
   );
 }
 
@@ -417,13 +448,14 @@ export function executeRoomAssignmentCommandInTransaction(
   context: AuthenticatedSessionContext,
   request: unknown,
   now: number,
+  providerAuthenticated = false,
 ): RoomAssignmentCommandResult {
   if (!isAssignmentMutationRequest(request) || transaction.roomId !== request.roomId) {
     return fail(400, "invalid_request");
   }
   try {
     return withSqliteRoomAssignmentRepository(transaction, (repository) =>
-      execute(transaction, repository, context, request, now));
+      execute(transaction, repository, context, request, now, providerAuthenticated));
   } catch (error: unknown) {
     if (error instanceof RoomAssignmentServiceError) throw error;
     return fail(503, "storage_unavailable");

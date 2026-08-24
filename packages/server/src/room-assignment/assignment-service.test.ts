@@ -321,21 +321,20 @@ describe("SQLite Room Assignment repository and service", () => {
       "SELECT payload_json AS payloadJson FROM events WHERE event_id = ?",
     ).get(result.eventIds[0]) as { payloadJson: string };
     expect(JSON.parse(event.payloadJson)).toMatchObject({
-      operation: "create",
-      changed: true,
-      acceptedRevision: 1,
-      projection: {
-        recordKind: "room-agent-assignment",
-        recordVersion: 1,
+      change: "upserted",
+      roomRevision: 2,
+      assignment: {
+        recordVersion: "room-agent-assignment.v1",
         roomId: "room-1",
         assignmentId: result.assignmentId,
         actorId: "agent-1",
         profileId: "profile-1",
         profileRevision: 2,
-        profileDisplayName: "Review Agent",
-        profileGlobalResponsibility: "Review delivery",
+        displayName: "Review Agent",
+        globalResponsibility: "Review delivery",
         assignmentRevision: 1,
         accessRevision: 8,
+        availability: "noauth",
       },
     });
     expect(event.payloadJson).not.toContain("Other secret");
@@ -363,7 +362,7 @@ describe("SQLite Room Assignment repository and service", () => {
     const event = database.prepare(
       "SELECT payload_json AS payloadJson FROM events WHERE event_id = ?",
     ).get(result.eventIds[0]) as { payloadJson: string };
-    expect(JSON.parse(event.payloadJson).projection.accessRevision).toBe(0);
+    expect(JSON.parse(event.payloadJson).assignment.accessRevision).toBe(0);
   });
 
   it("replays the exact result after authority evolves and rejects changed payload reuse", () => {
