@@ -224,6 +224,51 @@ function renderAssignmentCard(
   return card;
 }
 
+function renderCreateProfile(model: AgentSettingsViewModel, actions: AgentSettingsSurfaceActions): HTMLElement {
+  const form = element("form", "agent-settings-create");
+  form.dataset.createProfile = "true";
+  const name = element("input"); name.name = "displayName"; name.required = true; name.maxLength = 128;
+  const responsibility = element("textarea"); responsibility.name = "globalResponsibility";
+  responsibility.required = true; responsibility.maxLength = 4000;
+  const nameLabel = element("label"); nameLabel.append(text("span", "Profile 显示名称"), name);
+  const responsibilityLabel = element("label"); responsibilityLabel.append(text("span", "全局职责"), responsibility);
+  const submit = button("创建 Global Profile", "profile.create", model.writeLocked);
+  submit.type = "submit";
+  form.append(nameLabel, responsibilityLabel, text("p", "默认最小上限 · room.respond / room-memory.read"), submit);
+  form.addEventListener("submit", (event) => { event.preventDefault();
+    if (!form.reportValidity()) return;
+    actions.onIntent({ command: "profile.create", displayName: name.value.trim(),
+      globalResponsibility: responsibility.value.trim(), capabilityCeiling: ["room.respond"],
+      toolCeiling: ["room-memory.read"] });
+  });
+  return form;
+}
+
+function renderCreateAssignment(model: AgentSettingsViewModel, actions: AgentSettingsSurfaceActions): HTMLElement {
+  const form = element("form", "agent-settings-create"); form.dataset.createAssignment = "true";
+  const profile = element("select"); profile.name = "profileId"; profile.required = true;
+  profile.append(new Option("选择已启用 Global Profile", ""));
+  for (const item of model.profiles.filter((candidate) => candidate.status === "enabled"))
+    profile.append(new Option(`${item.displayName} · ${item.actorId}`, item.profileId));
+  const responsibility = element("textarea"); responsibility.name = "roomResponsibility";
+  responsibility.required = true; responsibility.maxLength = 4000;
+  const participation = element("select"); participation.name = "participation";
+  participation.append(new Option("on-mention · 点名响应", "on-mention"), new Option("active · 受控主动参与", "active"));
+  const submit = button("创建 Room Assignment", "assignment.create", model.writeLocked || model.lifecycle === "archived"); submit.type = "submit";
+  const profileLabel = element("label"); profileLabel.append(text("span", "Global Profile"), profile);
+  const responsibilityLabel = element("label"); responsibilityLabel.append(text("span", "房间职责"), responsibility);
+  const participationLabel = element("label"); participationLabel.append(text("span", "participation"), participation);
+  form.append(profileLabel, responsibilityLabel, participationLabel, submit);
+  form.addEventListener("submit", (event) => { event.preventDefault(); if (!form.reportValidity()) return;
+    const selected = model.profiles.find((item) => item.profileId === profile.value); if (selected === undefined) return;
+    actions.onIntent({ command: "assignment.create", roomId: model.roomId!, profileId: selected.profileId,
+      expectedRoomRevision: model.roomRevision ?? 0, roomResponsibility: responsibility.value.trim(),
+      participation: participation.value === "active" ? "active" : "on-mention",
+      capabilitySubset: selected.capabilityCeiling, toolSubset: selected.toolCeiling });
+  });
+  return form;
+}
+
 export function renderAgentSettingsSurface(
   root: HTMLElement,
   model: AgentSettingsViewModel,
@@ -322,6 +367,7 @@ export function renderAgentSettingsSurface(
       ? "Tenant Administrator 可管理稳定 actorId、全局职责与 capability/tool ceiling；此身份不授予 Room 读取权。"
       : "仅 Tenant Administrator 可管理 Profile；当前表面不显示部署级 Profile catalog。"),
   );
+  if (model.permissions.canManageProfiles) profiles.append(renderCreateProfile(model, actions));
   if (model.profiles.length === 0) profiles.append(text("p", "EMPTY · 没有可显示的 Global Profile。"));
   else for (const profile of model.profiles) profiles.append(renderProfileCard(profile, model, actions));
   shell.append(profiles);
@@ -334,6 +380,8 @@ export function renderAgentSettingsSurface(
       ? "Room owner/admin 可管理房间职责、active/on-mention、全局上限内的 grant 与 durable pause。"
       : "Room member 只读查看职责、participation、availability 与有效 grant。"),
   );
+  if (model.permissions.canManageAssignments && model.roomId !== undefined)
+    assignments.append(renderCreateAssignment(model, actions));
   if (model.assignments.length === 0) assignments.append(text("p", "EMPTY · 当前 Room 没有 Agent Assignment。"));
   else for (const assignment of model.assignments) assignments.append(renderAssignmentCard(assignment, model, actions));
   shell.append(assignments);
