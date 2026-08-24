@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import {
   AUTHORITY_SCHEMA_VERSION,
   AUTHORITY_V20_INVARIANT_STATEMENT_COUNT_FOR_TEST,
+  AUTHORITY_V20_MIGRATION_CHECKSUM_FOR_TEST,
   AUTHORITY_V20_ROLLBACK_ASSERTION_COUNT_FOR_TEST,
   AUTHORITY_V20_STATEMENT_COUNT_FOR_TEST,
   listAuthorityTables,
@@ -227,9 +228,11 @@ describe("authority SQLite v20 Agent Profile and Routing Authority", () => {
   });
 
   it("rolls every v20 statement back to the identical populated v19 database", () => {
-    expect(AUTHORITY_V20_STATEMENT_COUNT_FOR_TEST).toBe(76);
-    expect(AUTHORITY_V20_INVARIANT_STATEMENT_COUNT_FOR_TEST).toBe(45);
-    expect(AUTHORITY_V20_ROLLBACK_ASSERTION_COUNT_FOR_TEST).toBe(76);
+    expect(AUTHORITY_V20_STATEMENT_COUNT_FOR_TEST).toBe(97);
+    expect(AUTHORITY_V20_INVARIANT_STATEMENT_COUNT_FOR_TEST).toBe(60);
+    expect(AUTHORITY_V20_ROLLBACK_ASSERTION_COUNT_FOR_TEST).toBe(97);
+    expect(AUTHORITY_V20_MIGRATION_CHECKSUM_FOR_TEST)
+      .toBe("66715c97b8551d4f27ccbc7074dbaa8e68976e3dc3fa82cd254370c8a940861c");
     for (let statement = 1; statement <= AUTHORITY_V20_STATEMENT_COUNT_FOR_TEST; statement += 1) {
       withDatabase((database) => {
         migrateAuthorityDatabaseToHistoricalVersionForTest(database, 19);
@@ -326,6 +329,89 @@ describe("authority SQLite v20 Agent Profile and Routing Authority", () => {
           'profile-1', 1, 'request-1', '${NOW}', '{"apiKey":"sentinel"}')
       `)).toThrow(/secret boundary/i);
       expect(() => migrateAuthorityDatabase(database)).not.toThrow();
+    });
+  });
+
+  it("binds deployment Profile events, administrator outbox, repair, and invalidation facts", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabaseToHistoricalVersionForTest(database, 19);
+      seedLegacyStaticAgent(database, "active");
+      migrateAuthorityDatabase(database);
+      database.exec(`
+        INSERT INTO tenant_administrator_registry (
+          singleton_id, revision, bootstrap_configuration_sha256, initialized_at, updated_at
+        ) VALUES (1, 1, '${SHA}', '${NOW}', '${NOW}');
+        INSERT INTO tenant_administrators (
+          human_actor_id, revision, status, source_kind, created_by_human_actor_id,
+          created_at, updated_at, removed_at
+        ) VALUES ('legacy-human', 1, 'active', 'bootstrap', NULL, '${NOW}', '${NOW}', NULL);
+        INSERT INTO tenant_administrator_revisions (
+          human_actor_id, revision, status, operation, changed_by_human_actor_id, changed_at
+        ) VALUES ('legacy-human', 1, 'active', 'bootstrap', NULL, '${NOW}');
+        UPDATE deployment_stream SET head_seq = 1 WHERE singleton_id = 1;
+        INSERT INTO deployment_agent_profile_events (
+          event_id, stream_seq, profile_id, profile_revision, actor_id, event_kind,
+          occurred_at, payload_json, payload_sha256
+        ) VALUES ('profile-event-1', 1, 'legacy-profile:legacy-agent', 1, 'legacy-agent',
+          'profile.created', '${NOW}',
+          '{"profileId":"legacy-profile:legacy-agent","actorId":"legacy-agent","revision":1}',
+          '${SHA}');
+        INSERT INTO deployment_profile_outbox (
+          id, event_id, recipient_human_actor_id, stream_seq, status, attempts,
+          available_at, delivered_at, last_error
+        ) VALUES ('profile-outbox-1', 'profile-event-1', 'legacy-human', 1,
+          'pending', 0, '${NOW}', NULL, NULL);
+        INSERT INTO deployment_agent_profile_repair_records (
+          profile_id, profile_revision, record_version, event_id, stream_seq,
+          projection_json, projection_sha256, updated_at
+        ) VALUES ('legacy-profile:legacy-agent', 1, 1, 'profile-event-1', 1,
+          '{"profileId":"legacy-profile:legacy-agent","actorId":"legacy-agent","revision":1}',
+          '${SHA}', '${NOW}');
+        UPDATE agent_profiles SET revision = 2, display_name = 'Renamed Agent',
+          updated_at = '${NOW}' WHERE id = 'legacy-profile:legacy-agent';
+        INSERT INTO agent_profile_revisions (
+          profile_id, revision, actor_id, display_name, global_responsibility, status,
+          capability_ceiling_json, tool_ceiling_json, changed_by_human_actor_id,
+          changed_at, operation
+        ) SELECT id, revision, actor_id, display_name, global_responsibility, status,
+          capability_ceiling_json, tool_ceiling_json, 'legacy-human', '${NOW}', 'update'
+          FROM agent_profiles WHERE id = 'legacy-profile:legacy-agent';
+        UPDATE deployment_stream SET head_seq = 2 WHERE singleton_id = 1;
+        INSERT INTO deployment_agent_profile_events (
+          event_id, stream_seq, profile_id, profile_revision, actor_id, event_kind,
+          occurred_at, payload_json, payload_sha256
+        ) VALUES ('profile-event-2', 2, 'legacy-profile:legacy-agent', 2, 'legacy-agent',
+          'profile.updated', '${NOW}',
+          '{"profileId":"legacy-profile:legacy-agent","actorId":"legacy-agent","revision":2}',
+          '${SHA}');
+        UPDATE deployment_agent_profile_repair_records SET profile_revision = 2,
+          event_id = 'profile-event-2', stream_seq = 2,
+          projection_json =
+            '{"profileId":"legacy-profile:legacy-agent","actorId":"legacy-agent","revision":2}',
+          projection_sha256 = '${SHA}', updated_at = '${NOW}'
+          WHERE profile_id = 'legacy-profile:legacy-agent';
+        INSERT INTO agent_profile_invalidation_facts (
+          invalidation_id, profile_id, from_revision, to_revision, reason,
+          invalidated_context_count, cancelled_route_intent_count,
+          affected_assignment_count, occurred_at
+        ) VALUES ('profile-invalidation-2', 'legacy-profile:legacy-agent', 1, 2,
+          'profile_updated', 0, 0, 1, '${NOW}');
+      `);
+      expect(database.prepare(
+        "SELECT head_seq AS headSeq FROM deployment_stream WHERE singleton_id = 1",
+      ).get()).toEqual({ headSeq: 2 });
+      expect(database.prepare(`
+        SELECT profile_revision AS profileRevision, stream_seq AS streamSeq
+        FROM deployment_agent_profile_repair_records
+        WHERE profile_id = 'legacy-profile:legacy-agent'
+      `).get()).toEqual({ profileRevision: 2, streamSeq: 2 });
+      expect(() => database.exec(`
+        UPDATE deployment_agent_profile_events SET payload_json = '{}'
+        WHERE event_id = 'profile-event-1'
+      `)).toThrow(/immutable/i);
+      expect(() => database.exec(`
+        DELETE FROM deployment_profile_outbox WHERE id = 'profile-outbox-1'
+      `)).toThrow(/immutable/i);
     });
   });
 

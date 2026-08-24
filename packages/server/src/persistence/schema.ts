@@ -71,7 +71,7 @@ const SCHEMA_FINGERPRINTS = {
   17: "cc4b260ec841765f0349040a238a44281aa3ed9a792623ebd6540fd3e9f6b0b0",
   18: "d1344ba94d7dd4253f2dcc9e392c3bc4b8b1ec5b4fbba614e3fe2a10392797e5",
   19: "e458dedc7c0d85c04bca92dc2f6289b02367fb97fc7edbe1c7dba011470812b7",
-  20: "7ef1b6f4161d8fa2589ba3bca3c0585d6db8847216176080092f412e1c5ebcdc",
+  20: "eccbf96ac683cbaaef8dc4359b78271e722069ec3b6bb3e37f2855ecbdd0cdbc",
 } as const;
 
 const V1_STATEMENTS = [
@@ -6004,6 +6004,75 @@ const V20_STATEMENTS = [
       json_valid(details_json) AND json_type(details_json) = 'object'
     )
   ) STRICT`,
+  `CREATE TABLE deployment_stream (
+    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    head_seq INTEGER NOT NULL CHECK (head_seq >= 0),
+    retained_from_seq INTEGER NOT NULL CHECK (
+      retained_from_seq >= 1 AND retained_from_seq <= head_seq + 1
+    )
+  ) STRICT`,
+  `INSERT INTO deployment_stream (singleton_id, head_seq, retained_from_seq)
+   VALUES (1, 0, 1)`,
+  `CREATE TABLE deployment_agent_profile_events (
+    event_id TEXT PRIMARY KEY,
+    stream_seq INTEGER NOT NULL UNIQUE CHECK (stream_seq > 0),
+    profile_id TEXT NOT NULL REFERENCES agent_profiles(id),
+    profile_revision INTEGER NOT NULL CHECK (profile_revision > 0),
+    actor_id TEXT NOT NULL REFERENCES actors(id),
+    event_kind TEXT NOT NULL CHECK (event_kind IN (
+      'profile.created', 'profile.updated', 'profile.enabled', 'profile.disabled'
+    )),
+    occurred_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL CHECK (
+      json_valid(payload_json) AND json_type(payload_json) = 'object'
+    ),
+    payload_sha256 TEXT NOT NULL CHECK (
+      length(payload_sha256) = 64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    UNIQUE (profile_id, profile_revision)
+  ) STRICT`,
+  `CREATE TABLE deployment_profile_outbox (
+    id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL REFERENCES deployment_agent_profile_events(event_id),
+    recipient_human_actor_id TEXT NOT NULL REFERENCES tenant_administrators(human_actor_id),
+    stream_seq INTEGER NOT NULL CHECK (stream_seq > 0),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'dispatched')),
+    attempts INTEGER NOT NULL CHECK (attempts >= 0),
+    available_at TEXT NOT NULL,
+    delivered_at TEXT,
+    last_error TEXT,
+    UNIQUE (event_id, recipient_human_actor_id)
+  ) STRICT`,
+  `CREATE INDEX deployment_profile_outbox_pending_v20
+   ON deployment_profile_outbox(status, available_at, stream_seq, id)`,
+  `CREATE TABLE deployment_agent_profile_repair_records (
+    profile_id TEXT PRIMARY KEY REFERENCES agent_profiles(id),
+    profile_revision INTEGER NOT NULL CHECK (profile_revision > 0),
+    record_version INTEGER NOT NULL CHECK (record_version = 1),
+    event_id TEXT NOT NULL UNIQUE REFERENCES deployment_agent_profile_events(event_id),
+    stream_seq INTEGER NOT NULL UNIQUE CHECK (stream_seq > 0),
+    projection_json TEXT NOT NULL CHECK (
+      json_valid(projection_json) AND json_type(projection_json) = 'object'
+    ),
+    projection_sha256 TEXT NOT NULL CHECK (
+      length(projection_sha256) = 64 AND projection_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    updated_at TEXT NOT NULL
+  ) STRICT`,
+  `CREATE TABLE agent_profile_invalidation_facts (
+    invalidation_id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL REFERENCES agent_profiles(id),
+    from_revision INTEGER NOT NULL CHECK (from_revision > 0),
+    to_revision INTEGER NOT NULL CHECK (to_revision > from_revision),
+    reason TEXT NOT NULL CHECK (
+      reason IN ('profile_updated', 'profile_disabled', 'profile_enabled')
+    ),
+    invalidated_context_count INTEGER NOT NULL CHECK (invalidated_context_count >= 0),
+    cancelled_route_intent_count INTEGER NOT NULL CHECK (cancelled_route_intent_count >= 0),
+    affected_assignment_count INTEGER NOT NULL CHECK (affected_assignment_count >= 0),
+    occurred_at TEXT NOT NULL,
+    UNIQUE (profile_id, to_revision)
+  ) STRICT`,
   `CREATE TRIGGER tenant_administrators_v20_validate_insert
    BEFORE INSERT ON tenant_administrators
    WHEN COALESCE((SELECT kind FROM actors WHERE id = NEW.human_actor_id), '') <> 'human'
@@ -6071,6 +6140,126 @@ const V20_STATEMENTS = [
   `CREATE TRIGGER deployment_audit_v20_immutable_delete
    BEFORE DELETE ON deployment_audit
    BEGIN SELECT RAISE(ABORT, 'Deployment audit is immutable'); END`,
+  `CREATE TRIGGER deployment_stream_v20_validate_update
+   BEFORE UPDATE ON deployment_stream
+   WHEN NEW.singleton_id <> OLD.singleton_id
+      OR NEW.head_seq <> OLD.head_seq + 1
+      OR NEW.retained_from_seq < OLD.retained_from_seq
+      OR NEW.retained_from_seq > NEW.head_seq + 1
+   BEGIN SELECT RAISE(ABORT, 'Deployment stream transition is invalid'); END`,
+  `CREATE TRIGGER deployment_stream_v20_immutable_delete
+   BEFORE DELETE ON deployment_stream
+   BEGIN SELECT RAISE(ABORT, 'Deployment stream is immutable'); END`,
+  `CREATE TRIGGER deployment_agent_profile_events_v20_validate_insert
+   BEFORE INSERT ON deployment_agent_profile_events
+   WHEN NEW.stream_seq <> COALESCE((
+          SELECT head_seq FROM deployment_stream WHERE singleton_id = 1
+        ), 0)
+      OR NOT EXISTS (
+        SELECT 1 FROM agent_profiles AS profile
+        WHERE profile.id = NEW.profile_id
+          AND profile.actor_id = NEW.actor_id
+          AND profile.revision = NEW.profile_revision
+      )
+      OR EXISTS (
+        SELECT 1 FROM json_tree(NEW.payload_json)
+        WHERE lower(COALESCE(key, '')) IN (
+          'roomid', 'roomname', 'message', 'messages', 'member', 'members',
+          'goal', 'ball', 'assignment', 'secret', 'secretvalue', 'credential',
+          'apikey', 'authorization', 'token'
+        )
+      )
+   BEGIN SELECT RAISE(ABORT, 'Deployment Profile event is invalid'); END`,
+  `CREATE TRIGGER deployment_agent_profile_events_v20_immutable_update
+   BEFORE UPDATE ON deployment_agent_profile_events
+   BEGIN SELECT RAISE(ABORT, 'Deployment Profile event is immutable'); END`,
+  `CREATE TRIGGER deployment_agent_profile_events_v20_immutable_delete
+   BEFORE DELETE ON deployment_agent_profile_events
+   BEGIN SELECT RAISE(ABORT, 'Deployment Profile event is immutable'); END`,
+  `CREATE TRIGGER deployment_profile_outbox_v20_validate_insert
+   BEFORE INSERT ON deployment_profile_outbox
+   WHEN NEW.status <> 'pending' OR NEW.attempts <> 0
+      OR NEW.delivered_at IS NOT NULL OR NEW.last_error IS NOT NULL
+      OR NOT EXISTS (
+        SELECT 1 FROM deployment_agent_profile_events AS event
+        WHERE event.event_id = NEW.event_id AND event.stream_seq = NEW.stream_seq
+      )
+      OR COALESCE((
+        SELECT status FROM tenant_administrators
+        WHERE human_actor_id = NEW.recipient_human_actor_id
+      ), '') <> 'active'
+   BEGIN SELECT RAISE(ABORT, 'Deployment Profile outbox row is invalid'); END`,
+  `CREATE TRIGGER deployment_profile_outbox_v20_validate_update
+   BEFORE UPDATE ON deployment_profile_outbox
+   WHEN NEW.id <> OLD.id OR NEW.event_id <> OLD.event_id
+      OR NEW.recipient_human_actor_id <> OLD.recipient_human_actor_id
+      OR NEW.stream_seq <> OLD.stream_seq OR NEW.available_at <> OLD.available_at
+      OR OLD.status <> 'pending' OR NEW.status NOT IN ('pending', 'dispatched')
+      OR NEW.attempts < OLD.attempts OR NEW.attempts > OLD.attempts + 1
+      OR (NEW.status = 'dispatched' AND NEW.delivered_at IS NULL)
+      OR (NEW.status = 'pending' AND NEW.delivered_at IS NOT NULL)
+   BEGIN SELECT RAISE(ABORT, 'Deployment Profile outbox transition is invalid'); END`,
+  `CREATE TRIGGER deployment_profile_outbox_v20_immutable_delete
+   BEFORE DELETE ON deployment_profile_outbox
+   BEGIN SELECT RAISE(ABORT, 'Deployment Profile outbox is immutable'); END`,
+  `CREATE TRIGGER deployment_agent_profile_repair_v20_validate_insert
+   BEFORE INSERT ON deployment_agent_profile_repair_records
+   WHEN NOT EXISTS (
+        SELECT 1 FROM deployment_agent_profile_events AS event
+        JOIN agent_profiles AS profile ON profile.id = event.profile_id
+        WHERE event.event_id = NEW.event_id AND event.stream_seq = NEW.stream_seq
+          AND event.profile_id = NEW.profile_id
+          AND event.profile_revision = NEW.profile_revision
+          AND profile.revision = NEW.profile_revision
+      )
+      OR COALESCE(json_extract(NEW.projection_json, '$.profileId'), '') <> NEW.profile_id
+      OR COALESCE(json_extract(NEW.projection_json, '$.revision'), 0) <> NEW.profile_revision
+      OR EXISTS (
+        SELECT 1 FROM json_tree(NEW.projection_json)
+        WHERE lower(COALESCE(key, '')) IN (
+          'roomid', 'roomname', 'message', 'messages', 'member', 'members',
+          'goal', 'ball', 'assignment', 'secret', 'secretvalue', 'credential',
+          'apikey', 'authorization', 'token'
+        )
+      )
+   BEGIN SELECT RAISE(ABORT, 'Deployment Profile repair record is invalid'); END`,
+  `CREATE TRIGGER deployment_agent_profile_repair_v20_validate_update
+   BEFORE UPDATE ON deployment_agent_profile_repair_records
+   WHEN NEW.profile_id <> OLD.profile_id OR NEW.record_version <> OLD.record_version
+      OR NEW.profile_revision <= OLD.profile_revision OR NEW.stream_seq <= OLD.stream_seq
+      OR NOT EXISTS (
+        SELECT 1 FROM deployment_agent_profile_events AS event
+        JOIN agent_profiles AS profile ON profile.id = event.profile_id
+        WHERE event.event_id = NEW.event_id AND event.stream_seq = NEW.stream_seq
+          AND event.profile_id = NEW.profile_id
+          AND event.profile_revision = NEW.profile_revision
+          AND profile.revision = NEW.profile_revision
+      )
+      OR COALESCE(json_extract(NEW.projection_json, '$.profileId'), '') <> NEW.profile_id
+      OR COALESCE(json_extract(NEW.projection_json, '$.revision'), 0) <> NEW.profile_revision
+      OR EXISTS (
+        SELECT 1 FROM json_tree(NEW.projection_json)
+        WHERE lower(COALESCE(key, '')) IN (
+          'roomid', 'roomname', 'message', 'messages', 'member', 'members',
+          'goal', 'ball', 'assignment', 'secret', 'secretvalue', 'credential',
+          'apikey', 'authorization', 'token'
+        )
+      )
+   BEGIN SELECT RAISE(ABORT, 'Deployment Profile repair transition is invalid'); END`,
+  `CREATE TRIGGER deployment_agent_profile_repair_v20_immutable_delete
+   BEFORE DELETE ON deployment_agent_profile_repair_records
+   BEGIN SELECT RAISE(ABORT, 'Deployment Profile repair is immutable'); END`,
+  `CREATE TRIGGER agent_profile_invalidation_facts_v20_validate_insert
+   BEFORE INSERT ON agent_profile_invalidation_facts
+   WHEN COALESCE((SELECT revision FROM agent_profiles WHERE id = NEW.profile_id), 0)
+        <> NEW.to_revision
+   BEGIN SELECT RAISE(ABORT, 'Profile invalidation fact is stale'); END`,
+  `CREATE TRIGGER agent_profile_invalidation_facts_v20_immutable_update
+   BEFORE UPDATE ON agent_profile_invalidation_facts
+   BEGIN SELECT RAISE(ABORT, 'Profile invalidation facts are immutable'); END`,
+  `CREATE TRIGGER agent_profile_invalidation_facts_v20_immutable_delete
+   BEFORE DELETE ON agent_profile_invalidation_facts
+   BEGIN SELECT RAISE(ABORT, 'Profile invalidation facts are immutable'); END`,
   `CREATE TRIGGER agent_profile_revisions_v20_validate_insert
    BEFORE INSERT ON agent_profile_revisions
    WHEN (NEW.operation = 'legacy_migration' AND NEW.changed_by_human_actor_id IS NOT NULL)
@@ -6506,11 +6695,16 @@ export const AUTHORITY_V19_STATEMENT_COUNT_FOR_TEST = V19_STATEMENTS.length;
 export const AUTHORITY_V20_STATEMENT_COUNT_FOR_TEST = V20_STATEMENTS.length;
 export const AUTHORITY_V20_TRIGGER_INVARIANT_STATEMENT_COUNT_FOR_TEST =
   V20_STATEMENTS.filter((statement) => statement.startsWith("CREATE TRIGGER ")).length;
-export const AUTHORITY_V20_STARTUP_INVARIANT_STATEMENT_COUNT_FOR_TEST = 8;
+export const AUTHORITY_V20_STARTUP_INVARIANT_STATEMENT_COUNT_FOR_TEST = 9;
 export const AUTHORITY_V20_INVARIANT_STATEMENT_COUNT_FOR_TEST =
   AUTHORITY_V20_TRIGGER_INVARIANT_STATEMENT_COUNT_FOR_TEST
   + AUTHORITY_V20_STARTUP_INVARIANT_STATEMENT_COUNT_FOR_TEST;
 export const AUTHORITY_V20_ROLLBACK_ASSERTION_COUNT_FOR_TEST = V20_STATEMENTS.length;
+export const AUTHORITY_V20_MIGRATION_CHECKSUM_FOR_TEST = migrationChecksum(
+  20,
+  "agent-profile-routing-authority",
+  V20_STATEMENTS,
+);
 
 const V2_STATEMENTS = [
   `ALTER TABLE actors
@@ -7662,6 +7856,24 @@ const V20_SCHEMA_CONTRACT = {
   deployment_audit: [
     "audit_id", "event_kind", "principal_human_actor_id", "subject_kind",
     "subject_id", "subject_revision", "request_id", "occurred_at", "details_json",
+  ],
+  deployment_stream: ["singleton_id", "head_seq", "retained_from_seq"],
+  deployment_agent_profile_events: [
+    "event_id", "stream_seq", "profile_id", "profile_revision", "actor_id",
+    "event_kind", "occurred_at", "payload_json", "payload_sha256",
+  ],
+  deployment_profile_outbox: [
+    "id", "event_id", "recipient_human_actor_id", "stream_seq", "status",
+    "attempts", "available_at", "delivered_at", "last_error",
+  ],
+  deployment_agent_profile_repair_records: [
+    "profile_id", "profile_revision", "record_version", "event_id", "stream_seq",
+    "projection_json", "projection_sha256", "updated_at",
+  ],
+  agent_profile_invalidation_facts: [
+    "invalidation_id", "profile_id", "from_revision", "to_revision", "reason",
+    "invalidated_context_count", "cancelled_route_intent_count",
+    "affected_assignment_count", "occurred_at",
   ],
   route_candidate_snapshots: [
     "id", "route_job_id", "room_id", "room_revision", "source_message_id",
@@ -9300,6 +9512,40 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
           )
        LIMIT 1`,
       "deployment audit must remain Human-authored and secret-free",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM deployment_stream AS stream
+       WHERE stream.singleton_id <> 1 OR stream.head_seq < 0
+          OR stream.retained_from_seq < 1
+          OR stream.retained_from_seq > stream.head_seq + 1
+       UNION ALL
+       SELECT 1 FROM deployment_agent_profile_events AS event
+       LEFT JOIN agent_profiles AS profile ON profile.id = event.profile_id
+       WHERE profile.id IS NULL OR profile.actor_id <> event.actor_id
+          OR event.profile_revision > profile.revision
+          OR event.stream_seq > (
+            SELECT head_seq FROM deployment_stream WHERE singleton_id = 1
+          )
+       UNION ALL
+       SELECT 1 FROM deployment_agent_profile_repair_records AS repair
+       LEFT JOIN deployment_agent_profile_events AS event ON event.event_id = repair.event_id
+       LEFT JOIN agent_profiles AS profile ON profile.id = repair.profile_id
+       WHERE event.event_id IS NULL OR profile.id IS NULL
+          OR event.profile_id <> repair.profile_id
+          OR event.profile_revision <> repair.profile_revision
+          OR event.stream_seq <> repair.stream_seq
+          OR profile.revision <> repair.profile_revision
+       UNION ALL
+       SELECT 1 FROM deployment_profile_outbox AS outbox
+       LEFT JOIN deployment_agent_profile_events AS event ON event.event_id = outbox.event_id
+       LEFT JOIN tenant_administrators AS administrator
+         ON administrator.human_actor_id = outbox.recipient_human_actor_id
+       WHERE event.event_id IS NULL OR event.stream_seq <> outbox.stream_seq
+          OR administrator.human_actor_id IS NULL
+       LIMIT 1`,
+      "deployment Profile stream, outbox, and repair must retain exact authority bindings",
     );
     requireNoRows(
       database,
