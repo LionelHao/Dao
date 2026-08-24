@@ -3759,7 +3759,6 @@ function executeMessageSend(
     scope,
     key,
   );
-  if (message.authorKind === "agent") enqueueRouteJobForMessage(database, message, acceptedAt);
   return {
     aggregateId: message.id,
     eventIds: [eventId],
@@ -5324,12 +5323,16 @@ function routeJobFromRow(row: Record<string, unknown> | undefined): RouteJob {
 }
 
 const routeJobSelect = `SELECT
-  id, room_id AS roomId, source_message_id AS sourceMessageId, status,
-  current_attempt AS currentAttempt, topic_key AS topicKey,
-  embedding_model_version AS embeddingModelVersion, window_size AS windowSize,
-  cosine_threshold AS cosineThreshold, room_phase AS roomPhase,
-  created_at AS createdAt, updated_at AS updatedAt, completed_at AS completedAt,
-  terminal_error_code AS terminalErrorCode, next_retry_at AS nextRetryAt
+  route_jobs.id, route_jobs.room_id AS roomId,
+  route_jobs.source_message_id AS sourceMessageId, route_jobs.status,
+  route_jobs.current_attempt AS currentAttempt, route_jobs.topic_key AS topicKey,
+  route_jobs.embedding_model_version AS embeddingModelVersion,
+  route_jobs.window_size AS windowSize,
+  route_jobs.cosine_threshold AS cosineThreshold, route_jobs.room_phase AS roomPhase,
+  route_jobs.created_at AS createdAt, route_jobs.updated_at AS updatedAt,
+  route_jobs.completed_at AS completedAt,
+  route_jobs.terminal_error_code AS terminalErrorCode,
+  route_jobs.next_retry_at AS nextRetryAt
 FROM route_jobs`;
 
 function routeJobById(database: DatabaseSync, routeJobId: string): RouteJob {
@@ -5515,6 +5518,71 @@ function failRouteAttempt(
   return { job: retry, retryAfterMs };
 }
 
+function terminalizeAgentAuthoredRouteJob(
+  database: DatabaseSync,
+  job: RouteJob,
+  occurredAt: string,
+): RouteJob {
+  if (job.status !== "queued" && job.status !== "running") {
+    return fail("route_conflict", "Agent-authored route job was already terminal");
+  }
+  const agents = database.prepare(
+    `SELECT agent_id AS agentId FROM route_job_agents
+     WHERE route_job_id = ? ORDER BY agent_id LIMIT 256`,
+  ).all(job.id);
+  for (const row of agents) {
+    if (typeof row.agentId !== "string") {
+      return fail("storage_unavailable", "Agent-authored route snapshot was corrupt");
+    }
+    const judgment: RouteJudgment = {
+      id: stableId("route-judgment", job.id, row.agentId),
+      routeJobId: job.id,
+      sourceMessageId: job.sourceMessageId,
+      agentId: row.agentId,
+      outcome: "suppressed",
+      reasonCode: "not_selected",
+      reasonText: "agent_authored_source: Agent final messages cannot cascade",
+      routeAttempt: job.currentAttempt,
+      decidedAt: occurredAt,
+    };
+    database.prepare(
+      `INSERT INTO route_judgments (
+         id, route_job_id, source_message_id, agent_id, outcome,
+         reason_code, reason_text, route_attempt, decided_at
+       ) VALUES (?, ?, ?, ?, 'suppressed', 'not_selected', ?, ?, ?)`,
+    ).run(
+      judgment.id,
+      judgment.routeJobId,
+      judgment.sourceMessageId,
+      judgment.agentId,
+      judgment.reasonText,
+      judgment.routeAttempt,
+      judgment.decidedAt,
+    );
+    appendRouteJudgmentEvent(database, job, judgment, occurredAt);
+  }
+  const attempt = database.prepare(
+    `UPDATE route_attempts
+     SET status = 'cancelled', finished_at = ?, error_code = 'agent_authored_source',
+         next_retry_at = NULL
+     WHERE route_job_id = ? AND attempt_seq = ? AND status IN ('queued', 'running')`,
+  ).run(occurredAt, job.id, job.currentAttempt);
+  if (attempt.changes !== 1) {
+    return fail("storage_unavailable", "Agent-authored route attempt was corrupt");
+  }
+  const terminal = database.prepare(
+    `UPDATE route_jobs
+     SET status = 'completed', updated_at = ?, completed_at = ?, next_retry_at = NULL
+     WHERE id = ? AND current_attempt = ? AND status IN ('queued', 'running')`,
+  ).run(occurredAt, occurredAt, job.id, job.currentAttempt);
+  if (terminal.changes !== 1) {
+    return fail("route_conflict", "Agent-authored route terminalization was stale");
+  }
+  const completed = routeJobById(database, job.id);
+  appendRouteLifecycleEvent(database, completed, occurredAt, "completed");
+  return completed;
+}
+
 export function executeRouteAuthorityOperation(
   database: DatabaseSync,
   operation: RouteAuthorityOperation,
@@ -5557,6 +5625,13 @@ export function executeRouteAuthorityOperation(
           (message.authorKind !== "human" && message.authorKind !== "agent") ||
           typeof message.body !== "string" || typeof message.sentAt !== "string") {
         return fail("storage_unavailable", "Route source message was corrupt");
+      }
+      if (message.authorKind === "agent") {
+        return {
+          kind: "route-completed",
+          job: terminalizeAgentAuthoredRouteJob(database, queued, occurredAt),
+          intents: [],
+        };
       }
       const claimed = database.prepare(
         `UPDATE route_jobs SET status = 'running', updated_at = ?, next_retry_at = NULL
@@ -5681,6 +5756,19 @@ export function executeRouteAuthorityOperation(
       const job = routeJobById(database, operation.routeJobId);
       if (job.status !== "running" || job.currentAttempt !== operation.attempt) {
         return fail("route_conflict", "Route completion was stale");
+      }
+      const source = database.prepare(
+        "SELECT author_kind AS authorKind FROM messages WHERE id = ? AND room_id = ?",
+      ).get(job.sourceMessageId, job.roomId);
+      if (source?.authorKind === "agent") {
+        return {
+          kind: "route-completed",
+          job: terminalizeAgentAuthoredRouteJob(database, job, occurredAt),
+          intents: [],
+        };
+      }
+      if (source?.authorKind !== "human") {
+        return fail("storage_unavailable", "Route source author was corrupt");
       }
       const snapshotAgents = database.prepare(
         `SELECT agent_id AS agentId FROM route_job_agents
@@ -5832,16 +5920,29 @@ export function executeRouteAuthorityOperation(
       return { kind: "route-failed", ...failed };
     }
 
+    const agentRows = database.prepare(
+      `${routeJobSelect}
+       JOIN messages AS source ON source.id = route_jobs.source_message_id
+       WHERE route_jobs.status IN ('queued', 'running') AND source.author_kind = 'agent'
+       ORDER BY route_jobs.created_at, route_jobs.id LIMIT 256`,
+    ).all();
+    for (const row of agentRows) {
+      terminalizeAgentAuthoredRouteJob(database, routeJobFromRow(row), occurredAt);
+    }
     const runningRows = database.prepare(
-      `${routeJobSelect} WHERE status = 'running' ORDER BY created_at, id LIMIT 256`,
+      `${routeJobSelect}
+       JOIN messages AS source ON source.id = route_jobs.source_message_id
+       WHERE route_jobs.status = 'running' AND source.author_kind = 'human'
+       ORDER BY route_jobs.created_at, route_jobs.id LIMIT 256`,
     ).all();
     for (const row of runningRows) {
       failRouteAttempt(database, routeJobFromRow(row), "runtime_restarted", operation.now);
     }
     const readyRows = database.prepare(
       `${routeJobSelect}
-       WHERE status = 'queued'
-       ORDER BY room_id, created_at, id LIMIT 256`,
+       JOIN messages AS source ON source.id = route_jobs.source_message_id
+       WHERE route_jobs.status = 'queued' AND source.author_kind = 'human'
+       ORDER BY route_jobs.room_id, route_jobs.created_at, route_jobs.id LIMIT 256`,
     ).all();
     return { kind: "route-recovery", jobs: readyRows.map(routeJobFromRow) };
   });
@@ -6653,7 +6754,6 @@ export function executeRuntimeAuthorityOperation(
         payload: { id: message.id },
       });
       appendRoomOutbox(database, messageEventId, current.roomId, messageSeq, occurredAt, "runtime", "message");
-      enqueueRouteJobForMessage(database, message, occurredAt);
       const execution = runtimeExecutionById(database, operation.executionId);
       appendRuntimeExecutionEvent(database, execution, occurredAt, "completed");
       return { kind: "execution", execution };

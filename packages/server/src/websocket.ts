@@ -2691,7 +2691,17 @@ async function handleFrame(
       }
       return;
     }
-    case "agent.invoke":
+    case "agent.invoke": {
+      const session = await requireSession(socket, frame.requestId, options, context);
+      if (session === undefined) return;
+      sendFrame(socket, errorFrame(
+        410,
+        "protocol_upgrade_required",
+        "protocol_upgrade_required",
+        frame.requestId,
+      ));
+      return;
+    }
     case "agent.interrupt":
     case "agent.retry":
     case "agent.tool.confirm":
@@ -2706,22 +2716,12 @@ async function handleFrame(
         ...session,
         kind: "human" as const,
         requestId: frame.requestId,
-        idempotencyKey: frame.type === "agent.invoke"
-          ? `${frame.intent.sourceMessageId}:${frame.intent.targetAgentId}`
-          : frame.type === "agent.tool.confirm"
+        idempotencyKey: frame.type === "agent.tool.confirm"
             ? `${frame.type}:${frame.confirmation.confirmationId}`
             : `${frame.type}:${frame.executionId}`,
       };
       try {
-        if (frame.type === "agent.invoke") {
-          const accepted = await options.agentRuntime.invoke(commandContext, frame.intent);
-          sendFrame(socket, {
-            type: "agent.execution.ack",
-            requestId: frame.requestId,
-            execution: accepted.execution,
-            replayed: accepted.replayed,
-          });
-        } else if (frame.type === "agent.interrupt") {
+        if (frame.type === "agent.interrupt") {
           const execution = await options.agentRuntime.interrupt(
             commandContext,
             frame.executionId,

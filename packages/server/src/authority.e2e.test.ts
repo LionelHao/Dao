@@ -31,8 +31,6 @@ import {
   startAuthoritativeServer,
   type AuthoritativeServer,
 } from "./authoritative-server.js";
-import { createWorkerDatabaseClient } from "./persistence/worker-database-client.js";
-import { createWorkerRuntimeAuthority } from "./agent-runtime/worker-runtime-authority.js";
 import type { ServerFrame } from "./protocol.js";
 import {
   createClientSyncReplica,
@@ -1475,6 +1473,48 @@ describe("authoritative server real-process harness", () => {
       .resolves.not.toContain("createWorkerDatabaseClientWithTransactionFaultForTest");
   });
 
+  it("does not overwrite a persisted Agent actor from mutable static startup metadata", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-agent-static-restart-"));
+    let first: Awaited<ReturnType<typeof spawnAuthorityChild>> | undefined;
+    let second: Awaited<ReturnType<typeof spawnAuthorityChild>> | undefined;
+    try {
+      first = await spawnAuthorityChild({ directory, actors });
+      await stopChild(first.child);
+      first = undefined;
+
+      second = await spawnAuthorityChild({
+        directory,
+        actors: [
+          actors[0],
+          {
+            ...actors[1],
+            displayName: "Static catalog must not overwrite Profile",
+            readiness: "noauth",
+            toolPermissions: [],
+          },
+        ],
+      });
+
+      const database = new DatabaseSync(join(directory, "authority.sqlite"), { readOnly: true });
+      try {
+        expect(database.prepare(
+          `SELECT display_name AS displayName, readiness, tool_permissions_json AS toolPermissions
+           FROM actors WHERE id = 'agent-a'`,
+        ).get()).toEqual({
+          displayName: "Agent A",
+          readiness: "ready",
+          toolPermissions: JSON.stringify(["authority.inspect"]),
+        });
+      } finally {
+        database.close();
+      }
+    } finally {
+      if (first !== undefined) await stopChild(first.child).catch(() => undefined);
+      if (second !== undefined) await stopChild(second.child).catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("routes message.send.v2 through the production AuthorityWorker and stable Room stream", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-ft03-message-composition-"));
     let started: Awaited<ReturnType<typeof spawnAuthorityChild>> | undefined;
@@ -2264,13 +2304,12 @@ describe("authoritative server real-process harness", () => {
     }
   }, 30_000);
 
-  it("keeps provider preview transient across source recall while preserving completed and dispatched facts", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "native-im-preview-recall-sentinel-"));
+  it("closes every public agent.invoke origin with exact 410 and zero runtime or Provider work", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-public-invoke-closed-"));
     const databasePath = join(directory, "authority.sqlite");
-    const sentinel = "PREVIEW-MUST-STAY-TRANSIENT-7D04FBD1";
+    const sentinel = "PUBLIC-INVOKE-MUST-NOT-REACH-PROVIDER-7D04FBD1";
     let started: Awaited<ReturnType<typeof spawnAuthorityChild>> | undefined;
     let client: JsonWebSocketClient | undefined;
-    let runtimeClient: Awaited<ReturnType<typeof createWorkerDatabaseClient>> | undefined;
     try {
       started = await spawnAuthorityChild({
         directory,
@@ -2279,155 +2318,58 @@ describe("authoritative server real-process harness", () => {
         previewSentinelForTest: sentinel,
       });
       client = await JsonWebSocketClient.connect(started.url);
-      await client.login("preview-recall-login");
+      await client.login("public-invoke-closed-login");
       const roomId = await discoverRoom(client);
+      const sourceMessageId = "message-public-invoke-closed";
       await client.request({
-        type: "room.subscribe.v2",
-        requestId: "preview-recall-subscribe",
-        roomId,
-        cursor: { version: 1, roomId, afterSeq: readRoomHeadSeq(directory, roomId) },
-      }, "room.subscribed.v2");
-
-      const submit = async (messageId: string, body: string): Promise<void> => {
-        const receipt = await client!.request({
-          type: "message.send.v2",
-          requestId: `submit-${messageId}`,
-          message: { messageId, roomId, body, mentionedTargets: [], attachments: [] },
-        }, "message.accepted");
-        expect(receipt).toMatchObject({ messageId, targetOutcomes: [] });
-      };
-      const recall = async (messageId: string, requestId: string): Promise<void> => {
-        const receipt = await client!.request({
-          type: "message.recall",
-          requestId,
+        type: "message.send.v2",
+        requestId: "public-invoke-source",
+        message: {
+          messageId: sourceMessageId,
           roomId,
-          messageId,
-          expectedRevision: 1,
-        }, "message.recall.accepted");
-        expect(receipt).toMatchObject({ messageId, revision: 1 });
-      };
-      const invoke = async (messageId: string) => {
-        const frame = await client!.request({
+          body: "public invoke must remain closed",
+          mentionedTargets: [],
+          attachments: [],
+        },
+      }, "message.accepted");
+
+      for (const kind of ["direct_mention", "structured_help", "routed_candidate"] as const) {
+        await expect(client.request({
           type: "agent.invoke",
-          requestId: `invoke-${messageId}`,
-          intent: {
-            kind: "direct_mention",
-            roomId,
-            sourceMessageId: messageId,
-            targetAgentId: "agent-a",
-          },
-        }, "agent.execution.ack");
-        if (frame.type !== "agent.execution.ack") throw new TypeError("wrong execution ACK");
-        return frame.execution;
-      };
-
-      const completedSourceId = "message-preview-completed";
-      await submit(completedSourceId, "complete before source recall");
-      const completedExecution = await invoke(completedSourceId);
-      await vi.waitFor(() => {
-        const database = new DatabaseSync(databasePath, { readOnly: true });
-        try {
-          expect(database.prepare(
-            "SELECT status FROM agent_executions WHERE id = ?",
-          ).get(completedExecution.id)).toEqual({ status: "completed" });
-        } finally {
-          database.close();
-        }
-      });
-      await recall(completedSourceId, "recall-completed-preview-source");
-
-      const previewSourceId = "message-preview-running";
-      await submit(previewSourceId, "run a read tool then wait on preview");
-      const runningExecution = await invoke(previewSourceId);
-      await expect(client.waitFor((frame) =>
-        frame.type === "agent.execution.preview" &&
-        frame.executionId === runningExecution.id && frame.delta === sentinel,
-      )).resolves.toMatchObject({
-        type: "agent.execution.preview",
-        executionId: runningExecution.id,
-        delta: sentinel,
-        authoritative: false,
-      });
-
-      const beforeRecall = new DatabaseSync(databasePath, { readOnly: true });
-      let retainedDispatch: unknown;
-      try {
-        retainedDispatch = beforeRecall.prepare(
-          `SELECT dispatch_id AS dispatchId, state
-           FROM tool_dispatches WHERE execution_id = ?`,
-        ).get(runningExecution.id);
-        expect(retainedDispatch).toEqual(expect.objectContaining({ state: "succeeded" }));
-        expect(authoritySentinelHits(databasePath, sentinel)).toEqual([]);
-      } finally {
-        beforeRecall.close();
+          requestId: `public-invoke-${kind}`,
+          intent: { kind, roomId, sourceMessageId, targetAgentId: "agent-a" },
+        }, "agent.execution.ack")).rejects.toMatchObject({
+          status: 410,
+          code: "protocol_upgrade_required",
+          message: "protocol_upgrade_required: protocol_upgrade_required",
+        });
       }
-
-      await recall(previewSourceId, "recall-running-preview-source");
-
-      const history = await client.request({
-        type: "room.history.v2",
-        requestId: "preview-sentinel-history",
-        roomId,
-      }, "room.history.v2");
-      const revisions = await client.request({
-        type: "message.revisions.query",
-        requestId: "preview-sentinel-revisions",
-        roomId,
-        messageId: previewSourceId,
-      }, "message.revisions");
-      const repair = await repairRecords(client, roomId);
-      expect(JSON.stringify({ history, revisions, repair })).not.toContain(sentinel);
-      expect(revisions).toMatchObject({ revisions: [] });
 
       const database = new DatabaseSync(databasePath, { readOnly: true });
       try {
         expect(database.prepare(
-          "SELECT status FROM agent_executions WHERE id = ?",
-        ).get(runningExecution.id)).toEqual({ status: "cancelled" });
-        expect(database.prepare(
-          "SELECT status FROM agent_executions WHERE id = ?",
-        ).get(completedExecution.id)).toEqual({ status: "completed" });
-        expect(database.prepare(
-          `SELECT dispatch_id AS dispatchId, state
-           FROM tool_dispatches WHERE execution_id = ?`,
-        ).get(runningExecution.id)).toEqual(retainedDispatch);
-        expect(database.prepare(
-          `SELECT COUNT(*) AS count FROM messages
-           WHERE author_kind = 'agent' AND body = ?`,
-        ).get(sentinel)).toEqual({ count: 0 });
-        expect(database.prepare(
-          `SELECT COUNT(*) AS count FROM messages
-           WHERE author_kind = 'agent'`,
-        ).get()).toEqual({ count: 1 });
+          `SELECT
+             (SELECT COUNT(*) FROM agent_invocation_intents) AS intents,
+             (SELECT COUNT(*) FROM agent_executions) AS executions,
+             (SELECT COUNT(*) FROM agent_execution_attempts) AS attempts,
+             (SELECT COUNT(*) FROM tool_dispatches) AS dispatches,
+             (SELECT COUNT(*) FROM messages WHERE author_kind = 'agent') AS agentMessages`,
+        ).get()).toEqual({ intents: 0, executions: 0, attempts: 0, dispatches: 0, agentMessages: 0 });
         expect(authoritySentinelHits(databasePath, sentinel)).toEqual([]);
       } finally {
         database.close();
       }
-
-      client.close();
-      client = undefined;
-      await stopChild(started.child);
-      started = undefined;
-      runtimeClient = await createWorkerDatabaseClient({ databasePath });
-      const runtimeContext = await createWorkerRuntimeAuthority(runtimeClient)
-        .readContext(runningExecution.id);
-      expect(JSON.stringify(runtimeContext)).not.toContain(sentinel);
-      await runtimeClient.close();
-      runtimeClient = undefined;
-      const durableBytes = Buffer.concat(await readAllRegularFiles(directory));
-      expect(durableBytes.includes(Buffer.from(sentinel, "utf8"))).toBe(false);
     } finally {
-      await runtimeClient?.close().catch(() => undefined);
       client?.close();
       if (started !== undefined) await stopChild(started.child).catch(() => undefined);
       await rm(directory, { recursive: true, force: true });
     }
   }, 30_000);
 
-  it("does not turn a provider preview into authority data after crash and reconnect repair", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "native-im-preview-crash-sentinel-"));
+  it("keeps public agent.invoke closed across restart with zero recovered runtime or Provider work", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-public-invoke-restart-"));
     const databasePath = join(directory, "authority.sqlite");
-    const sentinel = "PREVIEW-CRASH-RECONNECT-ZERO-WRITE-58C3";
+    const sentinel = "PUBLIC-INVOKE-RESTART-MUST-NOT-REACH-PROVIDER-58C3";
     let first: Awaited<ReturnType<typeof spawnAuthorityChild>> | undefined;
     let second: Awaited<ReturnType<typeof spawnAuthorityChild>> | undefined;
     let client: JsonWebSocketClient | undefined;
@@ -2439,46 +2381,26 @@ describe("authoritative server real-process harness", () => {
         previewSentinelForTest: sentinel,
       });
       client = await JsonWebSocketClient.connect(first.url);
-      await client.login("preview-crash-login");
+      await client.login("public-invoke-restart-first-login");
       const roomId = await discoverRoom(client);
-      await client.request({
-        type: "room.subscribe.v2",
-        requestId: "preview-crash-subscribe",
-        roomId,
-        cursor: { version: 1, roomId, afterSeq: readRoomHeadSeq(directory, roomId) },
-      }, "room.subscribed.v2");
-      const sourceMessageId = "message-preview-crash-running";
-      await client.request({
-        type: "message.send.v2",
-        requestId: "preview-crash-submit",
-        message: {
-          messageId: sourceMessageId,
-          roomId,
-          body: "crash after provider preview",
-          mentionedTargets: [],
-          attachments: [],
-        },
-      }, "message.accepted");
-      const invoked = await client.request({
+      const invoke = (requestId: string) => client!.request({
         type: "agent.invoke",
-        requestId: "preview-crash-invoke",
+        requestId,
         intent: {
           kind: "direct_mention",
           roomId,
-          sourceMessageId,
+          sourceMessageId: "source-public-invoke-restart",
           targetAgentId: "agent-a",
         },
       }, "agent.execution.ack");
-      if (invoked.type !== "agent.execution.ack") throw new TypeError("wrong execution ACK");
-      await client.waitFor((frame) => frame.type === "agent.execution.preview" &&
-        frame.executionId === invoked.execution.id && frame.delta === sentinel);
-
-      client.terminate();
+      await expect(invoke("public-invoke-before-restart")).rejects.toMatchObject({
+        status: 410,
+        code: "protocol_upgrade_required",
+      });
+      client.close();
       client = undefined;
-      first.child.kill("SIGKILL");
-      await childExit(first.child);
+      await stopChild(first.child);
       first = undefined;
-      expect(authoritySentinelHits(databasePath, sentinel)).toEqual([]);
 
       second = await spawnAuthorityChild({
         directory,
@@ -2487,24 +2409,22 @@ describe("authoritative server real-process harness", () => {
         previewSentinelForTest: sentinel,
       });
       client = await JsonWebSocketClient.connect(second.url);
-      await client.login("preview-reconnect-login");
-      const repairedRoomId = await discoverRoom(client);
-      const repair = await repairRecords(client, repairedRoomId);
-      const history = await client.request({
-        type: "room.history.v2",
-        requestId: "preview-reconnect-history",
-        roomId: repairedRoomId,
-      }, "room.history.v2");
-      expect(JSON.stringify({ repair, history })).not.toContain(sentinel);
-      expect(authoritySentinelHits(databasePath, sentinel)).toEqual([]);
-      const durableBytes = Buffer.concat(await readAllRegularFiles(directory));
-      expect(durableBytes.includes(Buffer.from(sentinel, "utf8"))).toBe(false);
+      await client.login("public-invoke-restart-second-login");
+      await expect(invoke("public-invoke-after-restart")).rejects.toMatchObject({
+        status: 410,
+        code: "protocol_upgrade_required",
+      });
+
       const database = new DatabaseSync(databasePath, { readOnly: true });
       try {
         expect(database.prepare(
-          `SELECT COUNT(*) AS count FROM messages
-           WHERE author_kind = 'agent' AND body = ?`,
-        ).get(sentinel)).toEqual({ count: 0 });
+          `SELECT
+             (SELECT COUNT(*) FROM agent_invocation_intents) AS intents,
+             (SELECT COUNT(*) FROM agent_executions) AS executions,
+             (SELECT COUNT(*) FROM tool_dispatches) AS dispatches,
+             (SELECT COUNT(*) FROM messages WHERE author_kind = 'agent') AS agentMessages`,
+        ).get()).toEqual({ intents: 0, executions: 0, dispatches: 0, agentMessages: 0 });
+        expect(authoritySentinelHits(databasePath, sentinel)).toEqual([]);
       } finally {
         database.close();
       }
@@ -3212,7 +3132,7 @@ describe("authoritative server real-process harness", () => {
       client = await JsonWebSocketClient.connect(seeded.url);
       await client.login("seed-readback-login");
       const seededRoomId = await discoverRoom(client);
-      await waitForRouteJudgmentCount(directory, seededRoomId, 2);
+      await waitForRouteJudgmentCount(directory, seededRoomId, 1);
       const seededSnapshot = await repairRecords(client, seededRoomId);
       client.close();
       await stopChild(first);
@@ -4204,7 +4124,7 @@ describe("authoritative server real-process harness", () => {
       expect([stressPagesB, stressPagesC])
         .toEqual([completeMaterializedPages, completeMaterializedPages]);
 
-      expect(mixed.total).toBe(13_509);
+      expect(mixed.total).toBe(13_507);
       expect(mixed.distinctMembershipActors).toBe(2_000);
       expect(mixed.mixedCounts).toEqual({
         room: 1,
@@ -4216,8 +4136,8 @@ describe("authoritative server real-process harness", () => {
         "open-item": 500,
         "agent-execution": 500,
         calibration: 1_000,
-        "route-job": 5,
-        "route-judgment": 5,
+        "route-job": 4,
+        "route-judgment": 4,
       });
       const authoritativeHeadSeq = readRoomHeadSeq(directory, roomId);
       const authorityChecksum = cacheA.roomChecksum(roomId);
