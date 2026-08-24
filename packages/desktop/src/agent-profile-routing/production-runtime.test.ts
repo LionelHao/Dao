@@ -114,6 +114,10 @@ class AuthoritySocket implements AgentSettingsWebSocketLike {
     return this.#heldAssignmentRepair !== undefined;
   }
 
+  profileSyncCount(): number {
+    return this.#profileSyncOrdinal;
+  }
+
   releaseHeldAssignmentRepair(): void {
     const release = this.#heldAssignmentRepair;
     this.#heldAssignmentRepair = undefined;
@@ -313,6 +317,20 @@ describe("Desktop Agent Settings production authority invalidation", () => {
     expect(stableEvents).toHaveLength(512);
     expect(snapshot.room.status === "available" ? snapshot.room.assignments[0] : undefined)
       .toMatchObject({ assignmentRevision: 513 });
+    fixture.runtime.close();
+  });
+
+  it("serializes periodic Profile sync behind an already-subscribed snapshot refresh", async () => {
+    const fixture = runtimeFixture({ assignments: [assignment(1)],
+      holdAssignmentRepairOrdinal: 2, syncIntervalMs: 1 });
+    await fixture.runtime.getSnapshot({ roomId: "room-1" });
+    const refresh = fixture.runtime.getSnapshot({ roomId: "room-1" });
+    await vi.waitFor(() => expect(fixture.socket().hasHeldAssignmentRepair()).toBe(true));
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    expect(fixture.socket().profileSyncCount()).toBe(0);
+    fixture.socket().releaseHeldAssignmentRepair();
+    await refresh;
+    await vi.waitFor(() => expect(fixture.socket().profileSyncCount()).toBeGreaterThan(0));
     fixture.runtime.close();
   });
 

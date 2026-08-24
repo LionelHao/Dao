@@ -81,6 +81,7 @@ export function createDesktopAgentSettingsRuntime(options: {
   let roomRepairWatermark = 0;
   let lastSnapshot: AgentSettingsSnapshot | undefined;
   let syncRunning = false;
+  const syncIdleWaiters = new Set<() => void>();
   let authorityEpoch = 0;
   const activeRefreshes = new Set<number>();
   const deferredRoomFrames: WireRecord[] = [];
@@ -458,6 +459,9 @@ export function createDesktopAgentSettingsRuntime(options: {
   }
 
   async function snapshot(roomId: string): Promise<AgentSettingsSnapshot> {
+    if (syncRunning) {
+      await new Promise<void>((resolve) => syncIdleWaiters.add(resolve));
+    }
     currentRoomId = roomId;
     const refresh = beginRefresh();
     let completedSnapshot: AgentSettingsSnapshot | undefined;
@@ -601,7 +605,8 @@ export function createDesktopAgentSettingsRuntime(options: {
   }
 
   async function synchronize(): Promise<void> {
-    if (syncRunning || closed || lastSnapshot === undefined || currentRoomId === undefined) return;
+    if (syncRunning || activeRefreshes.size > 0 || closed || lastSnapshot === undefined ||
+        currentRoomId === undefined) return;
     syncRunning = true;
     try {
       if (lastSnapshot.profileCatalog.status === "available") {
@@ -661,6 +666,8 @@ export function createDesktopAgentSettingsRuntime(options: {
       }
     } finally {
       syncRunning = false;
+      for (const resolve of syncIdleWaiters) resolve();
+      syncIdleWaiters.clear();
     }
   }
 
