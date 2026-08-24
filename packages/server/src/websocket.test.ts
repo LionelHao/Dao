@@ -5660,6 +5660,50 @@ function governanceAuthenticationService(): AuthenticationService {
 }
 
 describe("closed FT-02B/FT-02C WebSocket governance", () => {
+  it.each(["direct_mention", "structured_help", "routed_candidate"] as const)(
+    "closes legacy public agent.invoke %s with 410 and never calls runtime",
+    async (kind) => {
+      const invoke = vi.fn(async () => { throw new Error("legacy invoke must stay closed"); });
+      const server = await startMessageWebSocketServer({
+        auth: governanceAuthenticationService(),
+        service: idleMessageService(),
+        agentRuntime: {
+          invoke,
+          interrupt: vi.fn(),
+          retry: vi.fn(),
+          confirmTool: vi.fn(),
+          compensate: vi.fn(),
+          close: vi.fn(),
+        } as never,
+      });
+      const client = await LoopbackClient.connect(server.url);
+      try {
+        await client.login(humans[0], `legacy-invoke-login-${kind}`);
+        client.send({
+          type: "agent.invoke",
+          requestId: `legacy-invoke-${kind}`,
+          intent: {
+            kind,
+            roomId,
+            sourceMessageId: `source-${kind}`,
+            targetAgentId: "agent-1",
+          },
+        });
+
+        await expect(client.waitForError(
+          "protocol_upgrade_required",
+          `legacy-invoke-${kind}`,
+        )).resolves.toMatchObject({
+          frame: { status: 410, message: "protocol_upgrade_required" },
+        });
+        expect(invoke).not.toHaveBeenCalled();
+      } finally {
+        await client.close();
+        await server.close();
+      }
+    },
+  );
+
   it("fails unauthenticated and missing dependency paths closed without calling a legacy mutation", async () => {
     const executeHuman = vi.fn(async () => ({
       aggregateId: roomId,

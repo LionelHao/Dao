@@ -315,7 +315,8 @@ async function start(
     for (const actor of options.actors) {
       const persisted = await worker.readActor(actor.id);
       if (persisted === undefined) missingActors.push(actor);
-      else if (!isDeepStrictEqual(persisted, actor)) {
+      else if (persisted.kind !== actor.kind ||
+          (actor.kind === "human" && !isDeepStrictEqual(persisted, actor))) {
         throw new TypeError(`Persisted authoritative actor mismatch: ${actor.id}`);
       }
     }
@@ -419,7 +420,6 @@ async function start(
         async executeAgent(context, command) {
           const acknowledgement = await authority.executeAgent(context, command);
           if (command.type === "message.send") {
-            routeRuntime?.notify(command.roomId, acknowledgement.aggregateId);
             memoryRuntime?.enqueue(command.roomId);
           }
           if (command.type.startsWith("open-item.")) {
@@ -544,7 +544,6 @@ async function start(
       },
       onMessageCommitted(execution) {
         if (execution.resultMessageId !== undefined) {
-          routeRuntime?.notify(execution.roomId, execution.resultMessageId);
           memoryRuntime?.enqueue(execution.roomId);
         }
       },
@@ -596,15 +595,12 @@ async function start(
       authority: routeAuthority,
       provider: routerProvider,
       memoryReadiness: { read: memoryAuthority.readReadiness },
-      async invoke(routeJobId, intent) {
-        const runtimeIntent = {
-          kind: intent.kind,
-          roomId: intent.roomId,
-          sourceMessageId: intent.sourceMessageId,
-          targetAgentId: intent.targetAgentId,
-        } as const;
-        const replacements = await runtime!.invokeFenceReplacements(routeJobId, runtimeIntent);
-        if (replacements.length === 0) await runtime!.invokeRouted(routeJobId, runtimeIntent);
+      projectFacts: {
+        async read() {
+          // FT-09 owns versioned Goal/checkpoint/due/Blocker facts. Until that
+          // authority is installed, proactive routing must stop before Provider.
+          return { status: "dependency_unavailable" } as const;
+        },
       },
     });
     humanPreemptionRuntime = createHumanPreemptionRuntime({

@@ -1475,6 +1475,48 @@ describe("authoritative server real-process harness", () => {
       .resolves.not.toContain("createWorkerDatabaseClientWithTransactionFaultForTest");
   });
 
+  it("does not overwrite a persisted Agent actor from mutable static startup metadata", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-agent-static-restart-"));
+    let first: Awaited<ReturnType<typeof spawnAuthorityChild>> | undefined;
+    let second: Awaited<ReturnType<typeof spawnAuthorityChild>> | undefined;
+    try {
+      first = await spawnAuthorityChild({ directory, actors });
+      await stopChild(first.child);
+      first = undefined;
+
+      second = await spawnAuthorityChild({
+        directory,
+        actors: [
+          actors[0],
+          {
+            ...actors[1],
+            displayName: "Static catalog must not overwrite Profile",
+            readiness: "noauth",
+            toolPermissions: [],
+          },
+        ],
+      });
+
+      const database = new DatabaseSync(join(directory, "authority.sqlite"), { readOnly: true });
+      try {
+        expect(database.prepare(
+          `SELECT display_name AS displayName, readiness, tool_permissions_json AS toolPermissions
+           FROM actors WHERE id = 'agent-a'`,
+        ).get()).toEqual({
+          displayName: "Agent A",
+          readiness: "ready",
+          toolPermissions: JSON.stringify(["authority.inspect"]),
+        });
+      } finally {
+        database.close();
+      }
+    } finally {
+      if (first !== undefined) await stopChild(first.child).catch(() => undefined);
+      if (second !== undefined) await stopChild(second.child).catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("routes message.send.v2 through the production AuthorityWorker and stable Room stream", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-ft03-message-composition-"));
     let started: Awaited<ReturnType<typeof spawnAuthorityChild>> | undefined;

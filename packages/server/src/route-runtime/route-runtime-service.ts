@@ -1,6 +1,5 @@
 import {
   isRouterPlan,
-  type RouteInvocationIntent,
   type RouterPlan,
 } from "@native-im/core";
 import type { RouteProviderFailureCode } from "./route-authority-protocol.js";
@@ -31,11 +30,23 @@ export interface RouteMemoryReadinessPort {
   read(roomId: string): Promise<MemoryRuntimeReadiness>;
 }
 
+export type ProactiveRouteProjectFactsReadiness =
+  | { readonly status: "dependency_unavailable" }
+  | {
+      readonly status: "ready";
+      readonly goalRevision: number;
+      readonly projectRevision: number;
+    };
+
+export interface ProactiveRouteProjectFactsPort {
+  read(roomId: string): Promise<ProactiveRouteProjectFactsReadiness>;
+}
+
 export interface CreateRouteRuntimeServiceOptions {
   readonly authority: RouteAuthority;
   readonly memoryReadiness: RouteMemoryReadinessPort;
+  readonly projectFacts: ProactiveRouteProjectFactsPort;
   readonly provider: RouterProvider;
-  readonly invoke: (routeJobId: string, intent: RouteInvocationIntent) => Promise<void>;
   readonly maxActiveRooms?: number;
   readonly maxQueuedPerRoom?: number;
   readonly onError?: (error: unknown) => void;
@@ -171,15 +182,27 @@ export function createRouteRuntimeService(
     const { job, providerInput, decisionContext } = claimed;
     let plan: RouterPlan | undefined;
     let failure: RouteProviderFailureCode | undefined;
+    let projectFactsAvailable = false;
     let semanticProviderAllowed = false;
-    try {
-      const memory = await options.memoryReadiness.read(job.roomId);
-      semanticProviderAllowed = evaluateMemoryRuntimeGate({
-        kind: "semantic_proactive",
-        memory,
-      }).allowed;
-    } catch (error: unknown) {
-      report(error);
+    if (providerInput.message.authorKind === "human") {
+      try {
+        const projectFacts = await options.projectFacts.read(job.roomId);
+        if (projectFacts.status === "ready" &&
+            (!Number.isSafeInteger(projectFacts.goalRevision) || projectFacts.goalRevision < 1 ||
+             !Number.isSafeInteger(projectFacts.projectRevision) || projectFacts.projectRevision < 1)) {
+          throw new TypeError("Proactive route project fact revisions were invalid");
+        }
+        projectFactsAvailable = projectFacts.status === "ready";
+        if (projectFactsAvailable) {
+          const memory = await options.memoryReadiness.read(job.roomId);
+          semanticProviderAllowed = evaluateMemoryRuntimeGate({
+            kind: "semantic_proactive",
+            memory,
+          }).allowed;
+        }
+      } catch (error: unknown) {
+        report(error);
+      }
     }
     if (closed) return;
     if (semanticProviderAllowed) {
@@ -221,7 +244,7 @@ export function createRouteRuntimeService(
       scheduleRetry(entry, failed.retryAfterMs);
       return;
     }
-    const result = evaluateRoutePlan({
+    const evaluated = evaluateRoutePlan({
       routeJobId: job.id,
       roomId: job.roomId,
       sourceMessageId: job.sourceMessageId,
@@ -234,10 +257,14 @@ export function createRouteRuntimeService(
         agentId: agent.agentId,
         participation: agent.participation,
         calibrationScore: agent.calibrationScore,
-        hasBall: agent.hasBall,
+        hasBall: projectFactsAvailable && providerInput.message.authorKind === "human"
+          ? agent.hasBall
+          : false,
       })),
-      directMentionAgentIds: decisionContext.directMentionAgentIds,
-      structuredHelpAgentIds: decisionContext.structuredHelpAgentIds,
+      directMentionAgentIds: providerInput.message.authorKind === "human"
+        ? decisionContext.directMentionAgentIds
+        : [],
+      structuredHelpAgentIds: [],
       recentHumanMessageTimes: decisionContext.recentHumanMessageTimes,
       consecutiveAgentRounds: decisionContext.consecutiveAgentRounds,
       cooldownByAgentId: new Map(decisionContext.cooldownByAgentId.map((entry) => [
@@ -247,19 +274,31 @@ export function createRouteRuntimeService(
       ...(plan === undefined ? {} : { providerPlan: plan }),
       ...(failure === undefined ? {} : { providerFailureCode: failure }),
     });
-    const completed = await options.authority.complete(
+    const suppressionReason = providerInput.message.authorKind === "agent"
+      ? "agent_authored_source: Agent final messages cannot cascade"
+      : !projectFactsAvailable
+        ? "dependency_unavailable: FT-09 project facts are not installed"
+        : undefined;
+    const result = suppressionReason === undefined
+      ? evaluated
+      : {
+          intents: evaluated.intents,
+          judgments: evaluated.judgments.map((judgment) =>
+            judgment.outcome === "will_respond"
+              ? judgment
+              : {
+                  ...judgment,
+                  outcome: "suppressed" as const,
+                  reasonCode: "not_selected" as const,
+                  reasonText: suppressionReason,
+                }),
+        };
+    await options.authority.complete(
       job,
       result.judgments,
       result.intents,
       failure,
     );
-    for (const intent of completed.intents) {
-      try {
-        await options.invoke(job.id, intent);
-      } catch (error: unknown) {
-        report(error);
-      }
-    }
   };
 
   function pump(): void {

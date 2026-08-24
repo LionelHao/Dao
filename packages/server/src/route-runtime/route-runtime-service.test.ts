@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   RouteInvocationIntent,
   RouteJob,
+  RouteJudgment,
   RouterPlan,
   RouterProviderInput,
 } from "@native-im/core";
@@ -78,12 +79,23 @@ const healthyMemoryReadiness = Object.freeze({
   },
 });
 
+const healthyProjectFacts = Object.freeze({
+  async read() {
+    return { status: "ready", goalRevision: 3, projectRevision: 5 } as const;
+  },
+});
+
 function fakeAuthority(
   jobs: readonly RouteJob[],
   claimFactory: (job: RouteJob) => RouteAuthorityClaim = claim,
 ) {
   const bySource = new Map(jobs.map((job) => [job.sourceMessageId, job]));
-  const completed: { readonly job: RouteJob; readonly terminal?: string; readonly intents: readonly RouteInvocationIntent[] }[] = [];
+  const completed: {
+    readonly job: RouteJob;
+    readonly terminal?: string;
+    readonly intents: readonly RouteInvocationIntent[];
+    readonly judgments: readonly RouteJudgment[];
+  }[] = [];
   const failed: { readonly job: RouteJob; readonly code: string }[] = [];
   const authority: RouteAuthority = {
     async claim(sourceMessageId) {
@@ -91,11 +103,16 @@ function fakeAuthority(
       if (job === undefined) throw new Error("missing job");
       return claimFactory(job);
     },
-    async complete(job, _judgments, intents, terminalErrorCode) {
+    async complete(job, judgments, intents, terminalErrorCode) {
       const terminal = terminalErrorCode === undefined
         ? { ...job, status: "completed" as const, completedAt: new Date().toISOString() }
         : { ...job, status: "failed" as const, terminalErrorCode, completedAt: new Date().toISOString() };
-      completed.push({ job: terminal, ...(terminalErrorCode === undefined ? {} : { terminal: terminalErrorCode }), intents });
+      completed.push({
+        job: terminal,
+        ...(terminalErrorCode === undefined ? {} : { terminal: terminalErrorCode }),
+        intents,
+        judgments,
+      });
       bySource.delete(job.sourceMessageId);
       return { job: terminal, intents };
     },
@@ -119,7 +136,7 @@ afterEach(() => {
 
 describe("bounded single-route runtime", () => {
   it.each(["catching_up", "noauth", "degraded", "failed"] as const)(
-    "claims then gates %s semantic routing with zero Provider/retry calls",
+    "does not cascade an Agent-authored final while memory is %s",
     async (status) => {
       const order: string[] = [];
       const base = routeJob(`message-${status}`, `room-${status}`);
@@ -139,9 +156,9 @@ describe("bounded single-route runtime", () => {
         };
       });
       let providerCalls = 0;
-      const invoked: RouteInvocationIntent[] = [];
       const runtime = createRouteRuntimeService({
         authority: fixture.authority,
+        projectFacts: healthyProjectFacts,
         memoryReadiness: {
           async read(roomId) {
             order.push(`memory:${roomId}`);
@@ -155,19 +172,20 @@ describe("bounded single-route runtime", () => {
             return { candidates: [] };
           },
         },
-        invoke: async (_routeJobId, intent) => { invoked.push(intent); },
       });
 
       expect(runtime.notify(base.roomId, base.sourceMessageId)).toBe(true);
       await runtime.whenIdle();
 
-      expect(order).toEqual(["claim", `memory:${base.roomId}`]);
+      expect(order).toEqual(["claim"]);
       expect(providerCalls).toBe(0);
       expect(fixture.failed).toEqual([]);
       expect(fixture.completed).toHaveLength(1);
       expect(fixture.completed[0]?.terminal).toBeUndefined();
-      expect(invoked.map((intent) => intent.reasonCode))
-        .toEqual(["direct_mention", "structured_help"]);
+      expect(fixture.completed[0]?.intents).toEqual([]);
+      expect(fixture.completed[0]?.judgments).toEqual(expect.arrayContaining([
+        expect.objectContaining({ outcome: "suppressed", reasonCode: "not_selected" }),
+      ]));
       await runtime.close();
     },
   );
@@ -181,6 +199,7 @@ describe("bounded single-route runtime", () => {
     });
     const runtime = createRouteRuntimeService({
       authority: fixture.authority,
+      projectFacts: healthyProjectFacts,
       memoryReadiness: {
         async read(roomId) {
           order.push(`memory:${roomId}`);
@@ -193,7 +212,6 @@ describe("bounded single-route runtime", () => {
           return { candidates: [] };
         },
       },
-      invoke: async () => undefined,
     });
 
     runtime.notify(base.roomId, base.sourceMessageId);
@@ -205,6 +223,37 @@ describe("bounded single-route runtime", () => {
     await runtime.close();
   });
 
+  it("suppresses proactive routing before Provider when project facts are unavailable", async () => {
+    const base = routeJob("message-project-unavailable", "room-project-unavailable");
+    const fixture = fakeAuthority([base]);
+    const provider = { decide: vi.fn(async () => ({ candidates: [] })) };
+    const runtime = createRouteRuntimeService({
+      authority: fixture.authority,
+      memoryReadiness: healthyMemoryReadiness,
+      projectFacts: {
+        async read() {
+          return { status: "dependency_unavailable" as const };
+        },
+      },
+      provider,
+    });
+
+    runtime.notify(base.roomId, base.sourceMessageId);
+    await runtime.whenIdle();
+
+    expect(provider.decide).not.toHaveBeenCalled();
+    expect(fixture.completed).toHaveLength(1);
+    expect(fixture.completed[0]?.intents.map((intent) => intent.reasonCode))
+      .toEqual(["direct_mention"]);
+    expect(fixture.completed[0]?.judgments.find((entry) => entry.agentId === "agent-active"))
+      .toMatchObject({
+        outcome: "suppressed",
+        reasonCode: "not_selected",
+        reasonText: "dependency_unavailable: FT-09 project facts are not installed",
+      });
+    await runtime.close();
+  });
+
   it("fails a broken readiness seam closed without manufacturing Provider failure", async () => {
     const base = routeJob("message-readiness-error", "room-readiness-error");
     const fixture = fakeAuthority([base]);
@@ -213,6 +262,7 @@ describe("bounded single-route runtime", () => {
     let providerCalls = 0;
     const runtime = createRouteRuntimeService({
       authority: fixture.authority,
+      projectFacts: healthyProjectFacts,
       memoryReadiness: { async read() { throw diagnostic; } },
       provider: {
         async decide() {
@@ -220,7 +270,6 @@ describe("bounded single-route runtime", () => {
           return { candidates: [] };
         },
       },
-      invoke: async () => undefined,
       onError: (error) => { errors.push(error); },
     });
 
@@ -232,6 +281,35 @@ describe("bounded single-route runtime", () => {
     expect(fixture.completed).toHaveLength(1);
     expect(fixture.completed[0]?.terminal).toBeUndefined();
     expect(errors).toEqual([diagnostic]);
+    await runtime.close();
+  });
+
+  it("rejects an unversioned project-facts readiness result before Provider", async () => {
+    const base = routeJob("message-project-version", "room-project-version");
+    const fixture = fakeAuthority([base]);
+    const provider = { decide: vi.fn(async () => ({ candidates: [] })) };
+    const errors: unknown[] = [];
+    const runtime = createRouteRuntimeService({
+      authority: fixture.authority,
+      projectFacts: {
+        async read() {
+          return { status: "ready", goalRevision: 0, projectRevision: 0 };
+        },
+      },
+      memoryReadiness: healthyMemoryReadiness,
+      provider,
+      onError(error) { errors.push(error); },
+    });
+
+    runtime.notify(base.roomId, base.sourceMessageId);
+    await runtime.whenIdle();
+
+    expect(provider.decide).not.toHaveBeenCalled();
+    expect(errors).toEqual([
+      expect.objectContaining({ message: "Proactive route project fact revisions were invalid" }),
+    ]);
+    expect(fixture.completed[0]?.judgments.find((entry) => entry.agentId === "agent-active"))
+      .toMatchObject({ outcome: "suppressed", reasonCode: "not_selected" });
     await runtime.close();
   });
 
@@ -248,10 +326,10 @@ describe("bounded single-route runtime", () => {
         },
       };
     });
-    const invoked: RouteInvocationIntent[] = [];
     let providerCalls = 0;
     const runtime = createRouteRuntimeService({
       authority: fixture.authority,
+      projectFacts: healthyProjectFacts,
       memoryReadiness: { async read() { return readiness("noauth"); } },
       provider: {
         async decide() {
@@ -259,20 +337,19 @@ describe("bounded single-route runtime", () => {
           return { candidates: [] };
         },
       },
-      invoke: async (_routeJobId, intent) => { invoked.push(intent); },
     });
 
     runtime.notify(base.roomId, base.sourceMessageId);
     await runtime.whenIdle();
 
     expect(providerCalls).toBe(0);
-    expect(invoked.map((intent) => intent.reasonCode))
+    expect(fixture.completed[0]?.intents.map((intent) => intent.reasonCode))
       .toEqual(["direct_mention", "ball_due"]);
     expect(fixture.failed).toEqual([]);
     await runtime.close();
   });
 
-  it("passes only the closed summary input and invokes merged mandatory/provider intents once", async () => {
+  it("passes only the closed summary input and durably completes merged intents once", async () => {
     const fixture = fakeAuthority([routeJob("message-1", "room-1")]);
     const inputs: RouterProviderInput[] = [];
     const provider: RouterProvider = {
@@ -284,12 +361,11 @@ describe("bounded single-route runtime", () => {
         }] };
       },
     };
-    const invoked: RouteInvocationIntent[] = [];
     const runtime = createRouteRuntimeService({
       authority: fixture.authority,
+      projectFacts: healthyProjectFacts,
       memoryReadiness: healthyMemoryReadiness,
       provider,
-      invoke: async (_routeJobId, intent) => { invoked.push(intent); },
     });
 
     expect(runtime.notify("room-1", "message-1")).toBe(true);
@@ -298,8 +374,25 @@ describe("bounded single-route runtime", () => {
     expect(inputs).toHaveLength(1);
     expect(inputs[0]).not.toHaveProperty("visibleConversation");
     expect(inputs[0]).not.toHaveProperty("secret");
-    expect(invoked.map((intent) => intent.targetAgentId)).toEqual(["agent-direct", "agent-active"]);
+    expect(fixture.completed[0]?.intents.map((intent) => intent.targetAgentId))
+      .toEqual(["agent-direct", "agent-active"]);
     expect(fixture.completed).toHaveLength(1);
+    await runtime.close();
+  });
+
+  it("leaves completed intents durable without a best-effort execution callback", async () => {
+    const fixture = fakeAuthority([routeJob("message-durable", "room-durable")]);
+    const runtime = createRouteRuntimeService({
+      authority: fixture.authority,
+      projectFacts: healthyProjectFacts,
+      memoryReadiness: healthyMemoryReadiness,
+      provider: { async decide() { return { candidates: [] }; } },
+    });
+
+    runtime.notify("room-durable", "message-durable");
+    await runtime.whenIdle();
+
+    expect(fixture.completed[0]?.intents).toHaveLength(1);
     await runtime.close();
   });
 
@@ -319,9 +412,9 @@ describe("bounded single-route runtime", () => {
     };
     const runtime = createRouteRuntimeService({
       authority: fixture.authority,
+      projectFacts: healthyProjectFacts,
       memoryReadiness: healthyMemoryReadiness,
       provider,
-      invoke: async () => undefined,
       maxActiveRooms: 8,
     });
     runtime.notify("room-a", "a-1");
@@ -342,9 +435,9 @@ describe("bounded single-route runtime", () => {
     let calls = 0;
     const runtime = createRouteRuntimeService({
       authority: fixture.authority,
+      projectFacts: healthyProjectFacts,
       memoryReadiness: healthyMemoryReadiness,
       provider: { async decide() { calls += 1; return { candidates: [], extra: true } as never; } },
-      invoke: async () => undefined,
     });
     runtime.notify("room-fail", "message-fail");
     await vi.advanceTimersByTimeAsync(0);
@@ -370,6 +463,7 @@ describe("bounded single-route runtime", () => {
     let calls = 0;
     const runtime = createRouteRuntimeService({
       authority: fixture.authority,
+      projectFacts: healthyProjectFacts,
       memoryReadiness: healthyMemoryReadiness,
       provider: {
         async decide(_input, signal) {
@@ -380,7 +474,6 @@ describe("bounded single-route runtime", () => {
           });
         },
       },
-      invoke: async () => undefined,
     });
 
     runtime.notify(`room-${mode}`, `message-${mode}`);
@@ -407,9 +500,9 @@ describe("bounded single-route runtime", () => {
     };
     const runtime = createRouteRuntimeService({
       authority,
+      projectFacts: healthyProjectFacts,
       memoryReadiness: healthyMemoryReadiness,
       provider: { async decide() { return { candidates: [] }; } },
-      invoke: async () => undefined,
       maxQueuedPerRoom: 2,
     });
 
@@ -432,9 +525,9 @@ describe("bounded single-route runtime", () => {
     let calls = 0;
     const runtime = createRouteRuntimeService({
       authority: fixture.authority,
+      projectFacts: healthyProjectFacts,
       memoryReadiness: healthyMemoryReadiness,
       provider: { async decide() { calls += 1; return { candidates: [] }; } },
-      invoke: async () => undefined,
     });
 
     await runtime.recover();
