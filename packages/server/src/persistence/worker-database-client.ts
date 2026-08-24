@@ -457,6 +457,7 @@ function authorityWorkerClientErrorStatus(
     case "attachment_capacity_limited":
     case "memory_capacity_limited":
     case "context_capacity_limited":
+    case "profile_fanout_capacity_limited":
       return 429;
     case "scanner_unavailable":
     case "extractor_unavailable":

@@ -228,6 +228,7 @@ export type AuthorityWorkerErrorCode =
   | "route_job_not_found"
   | "profile_not_found"
   | "profile_state_conflict"
+  | "profile_fanout_capacity_limited"
   | "provider_configuration_unavailable"
   | "revision_conflict"
   | "session_revoked"
@@ -350,6 +351,7 @@ export function isAuthorityWorkerErrorCode(
     case "route_job_not_found":
     case "profile_not_found":
     case "profile_state_conflict":
+    case "profile_fanout_capacity_limited":
     case "provider_configuration_unavailable":
     case "revision_conflict":
     case "session_revoked":

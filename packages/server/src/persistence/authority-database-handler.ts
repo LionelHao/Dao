@@ -221,6 +221,7 @@ function tenantAdministrationError(error: unknown): never {
       invalid_profile: "invalid_parameters",
       profile_not_found: "profile_not_found",
       profile_state_conflict: "profile_state_conflict",
+      profile_fanout_capacity_limited: "profile_fanout_capacity_limited",
       configuration_unsupported: "configuration_unsupported",
     };
     throw new AuthorityDatabaseError(codes[error.code], error.message);
