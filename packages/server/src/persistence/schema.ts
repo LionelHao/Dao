@@ -71,7 +71,7 @@ const SCHEMA_FINGERPRINTS = {
   17: "cc4b260ec841765f0349040a238a44281aa3ed9a792623ebd6540fd3e9f6b0b0",
   18: "d1344ba94d7dd4253f2dcc9e392c3bc4b8b1ec5b4fbba614e3fe2a10392797e5",
   19: "e458dedc7c0d85c04bca92dc2f6289b02367fb97fc7edbe1c7dba011470812b7",
-  20: "c5990a5bebcea5443baccf442d8fa67fbcc156d1957d53d1100bb85222f017c6",
+  20: "1ca2a806a52cd2ce9632b02e215a25ba13bc3ebc4336f5152c48f21d60faa2a0",
 } as const;
 
 const V1_STATEMENTS = [
@@ -5892,7 +5892,9 @@ const V20_STATEMENTS = [
     changed_by_human_actor_id TEXT REFERENCES actors(id),
     changed_at TEXT NOT NULL,
     operation TEXT NOT NULL CHECK (
-      operation IN ('create', 'update', 'enable', 'disable', 'legacy_migration')
+      operation IN (
+        'create', 'update', 'enable', 'disable', 'legacy_migration', 'static_bootstrap'
+      )
     ),
     PRIMARY KEY (profile_id, revision)
   ) STRICT`,
@@ -6267,8 +6269,9 @@ const V20_STATEMENTS = [
    BEGIN SELECT RAISE(ABORT, 'Profile invalidation facts are immutable'); END`,
   `CREATE TRIGGER agent_profile_revisions_v20_validate_insert
    BEFORE INSERT ON agent_profile_revisions
-   WHEN (NEW.operation = 'legacy_migration' AND NEW.changed_by_human_actor_id IS NOT NULL)
-      OR (NEW.operation <> 'legacy_migration'
+   WHEN (NEW.operation IN ('legacy_migration', 'static_bootstrap')
+         AND NEW.changed_by_human_actor_id IS NOT NULL)
+      OR (NEW.operation NOT IN ('legacy_migration', 'static_bootstrap')
           AND COALESCE((SELECT kind FROM actors WHERE id = NEW.changed_by_human_actor_id), '') <> 'human')
       OR NOT EXISTS (
         SELECT 1 FROM agent_profiles AS profile

@@ -3914,6 +3914,15 @@ describe("SQLite authoritative sessions", () => {
 
     await authority.registerActors(actors);
     await authority.registerActors(actors);
+    await expect(authority.registerActors([
+      actors[0],
+      {
+        ...actors[1],
+        displayName: "Mutable catalog name",
+        readiness: "paused",
+        toolPermissions: [],
+      },
+    ])).resolves.toBeUndefined();
     await expect(
       authority.registerActors([
         { ...actors[0], displayName: "Changed Lionel" },
@@ -3925,6 +3934,24 @@ describe("SQLite authoritative sessions", () => {
     const database = new DatabaseSync(databasePath, { readOnly: true });
     expect(database.prepare("SELECT COUNT(*) AS count FROM actors").get()).toEqual({
       count: 2,
+    });
+    expect(database.prepare(`
+      SELECT profile.actor_id AS actorId, profile.display_name AS displayName,
+             profile.status, profile.capability_ceiling_json AS capabilities,
+             profile.tool_ceiling_json AS tools, profile.source_kind AS sourceKind,
+             revision.operation
+      FROM agent_profiles AS profile
+      JOIN agent_profile_revisions AS revision
+        ON revision.profile_id = profile.id AND revision.revision = profile.revision
+      WHERE profile.actor_id = 'agent-review'
+    `).get()).toEqual({
+      actorId: "agent-review",
+      displayName: "Reviewer",
+      status: "disabled",
+      capabilities: "[]",
+      tools: "[]",
+      sourceKind: "static_bootstrap",
+      operation: "static_bootstrap",
     });
     expect(
       database
