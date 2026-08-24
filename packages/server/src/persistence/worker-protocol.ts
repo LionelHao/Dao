@@ -135,7 +135,7 @@ export type AuthorityWorkerErrorCode =
   | "authority_storage_transient"
   | "authority_worker_closed"
   | "bootstrap_conflict"
-  | "credential_mutation_unsupported"
+  | "configuration_unsupported"
   | "unauthenticated"
   | "invalid_chunk"
   | "attachment_forbidden"
@@ -254,7 +254,7 @@ export function isAuthorityWorkerErrorCode(
     case "authority_storage_transient":
     case "authority_worker_closed":
     case "bootstrap_conflict":
-    case "credential_mutation_unsupported":
+    case "configuration_unsupported":
     case "unauthenticated":
     case "invalid_chunk":
     case "attachment_forbidden":

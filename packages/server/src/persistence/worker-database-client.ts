@@ -470,7 +470,7 @@ function authorityWorkerClientErrorStatus(
     case "memory_dependency_unavailable":
     case "repair_barrier_active":
     case "dependency_unavailable":
-    case "credential_mutation_unsupported":
+    case "configuration_unsupported":
     case "provider_configuration_unavailable":
     case "context_storage_unavailable":
       return 503;

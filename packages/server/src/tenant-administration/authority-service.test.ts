@@ -270,7 +270,7 @@ describe("Global Agent Profile authority", () => {
     const sentinel = "sk-secret-sentinel-never-store";
     await expect(f.authority.rejectUnsupportedCredentialMutation("owner-token", {
       providerId: "openai-responses", credential: sentinel,
-    })).rejects.toMatchObject({ status: 503, code: "credential_mutation_unsupported" });
+    })).rejects.toMatchObject({ status: 503, code: "configuration_unsupported" });
     expect(JSON.stringify({ audits: f.state.audits, replay: [...f.state.replay] })).not.toContain(sentinel);
   });
 

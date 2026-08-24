@@ -118,7 +118,7 @@ export type TenantAdministrationErrorCode =
   | "invalid_profile"
   | "profile_not_found"
   | "profile_state_conflict"
-  | "credential_mutation_unsupported";
+  | "configuration_unsupported";
 
 export class TenantAdministrationError extends Error {
   readonly status: 400 | 403 | 404 | 409 | 503;
@@ -617,7 +617,7 @@ export function createTenantAdministrationAuthority(
 
     async rejectUnsupportedCredentialMutation(accessToken): Promise<never> {
       await authenticated(accessToken, () => undefined);
-      throw new TenantAdministrationError(503, "credential_mutation_unsupported");
+      throw new TenantAdministrationError(503, "configuration_unsupported");
     },
   };
   return Object.freeze(authority);

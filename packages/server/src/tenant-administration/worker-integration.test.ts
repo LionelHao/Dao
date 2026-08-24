@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  AuthorityWorkerClientError,
   createWorkerDatabaseClient,
   type CompleteWorkerDatabaseClient,
 } from "../persistence/worker-database-client.js";
@@ -18,15 +17,15 @@ function hash(value: string): string {
   return createHash("sha256").update(value).digest("base64url");
 }
 
-async function fixture(withProvider = true) {
+async function fixture() {
   const directory = mkdtempSync(join(tmpdir(), "dao-tenant-worker-"));
   directories.push(directory);
   const databasePath = join(directory, "authority.sqlite");
   const client = await createWorkerDatabaseClient({
     databasePath,
-    ...(withProvider ? { deploymentProviderDisclosure: {
+    deploymentProviderDisclosure: {
       providerId: "openai-responses", modelId: "gpt-5", credentialReadiness: "noauth" as const,
-    } } : {}),
+    },
   });
   clients.push(client);
   await client.registerActors([
@@ -41,7 +40,7 @@ async function fixture(withProvider = true) {
     accessExpiresAt: NOW + 1_000_000, refreshExpiresAt: NOW + 2_000_000, now: NOW,
   });
   const session = await client.authenticateSession(accessTokenHash, NOW);
-  return { client, session, accessTokenHash, databasePath };
+  return { client, session, accessTokenHash };
 }
 
 afterEach(async () => {
@@ -60,6 +59,11 @@ describe("Tenant administration AuthorityWorker integration", () => {
       revision: 1, principalIds: ["human-owner"], configurationDigest: DIGEST,
       updatedAt: "2026-08-24T08:00:00.000Z",
     } });
+    await expect(client.executeTenantAdministration({
+      version: 1, type: "provider-configuration.disclose", context: session, now: NOW,
+    })).resolves.toEqual({ kind: "provider-configuration", provider: {
+      providerId: "openai-responses", modelId: "gpt-5", credentialReadiness: "noauth",
+    } });
     const context = { ...session, kind: "human" as const, requestId: "profile-create-request",
       idempotencyKey: "profile-create-key" };
     const operation = {
@@ -73,16 +77,49 @@ describe("Tenant administration AuthorityWorker integration", () => {
     await expect(client.executeTenantAdministration(operation)).resolves.toEqual(created);
     expect(created.kind).toBe("agent-profile");
     if (created.kind !== "agent-profile") throw new Error("Profile was not created");
+    const updated = await client.executeTenantAdministration({
+      version: 1, type: "agent-profile.update",
+      context: { ...session, kind: "human", requestId: "profile-update-request",
+        idempotencyKey: "profile-update-key" },
+      profileId: created.profile.profileId, expectedRevision: 1,
+      displayName: "Evidence Researcher", globalResponsibility: "Verify durable evidence",
+      capabilityCeiling: ["room.project.read"], toolCeiling: ["room-memory.read"], now: NOW,
+    });
+    expect(updated).toMatchObject({ kind: "agent-profile",
+      profile: { revision: 2, status: "enabled" },
+      provider: { credentialReadiness: "noauth" } });
+    const disabled = await client.executeTenantAdministration({
+      version: 1, type: "agent-profile.disable",
+      context: { ...session, kind: "human", requestId: "profile-disable-request",
+        idempotencyKey: "profile-disable-key" },
+      profileId: created.profile.profileId, expectedRevision: 2, now: NOW,
+    });
+    expect(disabled).toMatchObject({ kind: "agent-profile",
+      profile: { revision: 3, status: "disabled" },
+      provider: { credentialReadiness: "noauth" } });
+    const enabled = await client.executeTenantAdministration({
+      version: 1, type: "agent-profile.enable",
+      context: { ...session, kind: "human", requestId: "profile-enable-request",
+        idempotencyKey: "profile-enable-key" },
+      profileId: created.profile.profileId, expectedRevision: 3, now: NOW,
+    });
+    expect(enabled).toMatchObject({ kind: "agent-profile",
+      profile: { revision: 4, status: "enabled" },
+      provider: { credentialReadiness: "noauth" } });
+    if (enabled.kind !== "agent-profile") throw new Error("Profile was not enabled");
     const listed = await client.executeTenantAdministration({
       version: 1, type: "agent-profile.list", context: session, now: NOW,
     });
-    expect(listed).toMatchObject({ kind: "agent-profiles", profiles: [created.profile],
+    expect(listed).toMatchObject({ kind: "agent-profiles", profiles: [enabled.profile],
       provider: { providerId: "openai-responses", modelId: "gpt-5",
         credentialReadiness: "noauth" } });
     await expect(client.executeTenantAdministration({
       version: 1, type: "agent-profile.get", context: session,
       profileId: created.profile.profileId, now: NOW,
-    })).resolves.toEqual(created);
+    })).resolves.toEqual(enabled);
+    await expect(client.readActor(created.profile.actorId)).resolves.toMatchObject({
+      id: created.profile.actorId, kind: "agent", readiness: "noauth",
+    });
     await expect(client.executeTenantAdministration({
       version: 1, type: "tenant-administrator.add",
       context: { ...session, kind: "human", requestId: "admin-add-request",
@@ -92,7 +129,7 @@ describe("Tenant administration AuthorityWorker integration", () => {
       registry: { revision: 2, principalIds: ["human-admin", "human-owner"] } });
   });
 
-  it("rechecks revocation and closes unconfigured Provider and credential mutation as 503", async () => {
+  it("rechecks revocation and closes credential mutation without an approved store as 503", async () => {
     const configured = await fixture();
     await configured.client.executeTenantAdministration({
       version: 1, type: "tenant-administrator.bootstrap", principalIds: ["human-owner"],
@@ -100,41 +137,10 @@ describe("Tenant administration AuthorityWorker integration", () => {
     });
     await expect(configured.client.executeTenantAdministration({
       version: 1, type: "provider-configuration.mutate", context: configured.session, now: NOW,
-    })).rejects.toMatchObject({ code: "credential_mutation_unsupported", status: 503 });
+    })).rejects.toMatchObject({ code: "configuration_unsupported", status: 503 });
     await configured.client.revokeSession(configured.accessTokenHash, NOW + 1);
     await expect(configured.client.executeTenantAdministration({
       version: 1, type: "tenant-administrator.list", context: configured.session, now: NOW + 2,
     })).rejects.toMatchObject({ code: "session_revoked", status: 403 });
-
-    const unconfigured = await fixture(false);
-    await unconfigured.client.executeTenantAdministration({
-      version: 1, type: "tenant-administrator.bootstrap", principalIds: ["human-owner"],
-      configurationSha256: DIGEST, now: NOW,
-    });
-    const error = await unconfigured.client.executeTenantAdministration({
-      version: 1, type: "provider-configuration.disclose", context: unconfigured.session, now: NOW,
-    }).catch((cause: unknown) => cause);
-    expect(error).toBeInstanceOf(AuthorityWorkerClientError);
-    expect(error).toMatchObject({ code: "provider_configuration_unavailable", status: 503 });
-    await expect(unconfigured.client.executeTenantAdministration({
-      version: 1, type: "agent-profile.create",
-      context: { ...unconfigured.session, kind: "human", requestId: "closed-create-request",
-        idempotencyKey: "closed-create-key" },
-      expectedRevision: 0, displayName: "Must not persist",
-      globalResponsibility: "Provider is unavailable", capabilityCeiling: [],
-      toolCeiling: [], now: NOW,
-    })).rejects.toMatchObject({ code: "provider_configuration_unavailable", status: 503 });
-    await unconfigured.client.close();
-    clients.splice(clients.indexOf(unconfigured.client), 1);
-    const recovered = await createWorkerDatabaseClient({
-      databasePath: unconfigured.databasePath,
-      deploymentProviderDisclosure: {
-        providerId: "openai-responses", modelId: "gpt-5", credentialReadiness: "ready",
-      },
-    });
-    clients.push(recovered);
-    await expect(recovered.executeTenantAdministration({
-      version: 1, type: "agent-profile.list", context: unconfigured.session, now: NOW,
-    })).resolves.toMatchObject({ kind: "agent-profiles", profiles: [] });
   });
 });
