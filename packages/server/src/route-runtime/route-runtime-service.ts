@@ -184,6 +184,7 @@ export function createRouteRuntimeService(
     let failure: RouteProviderFailureCode | undefined;
     let projectFactsAvailable = false;
     let semanticProviderAllowed = false;
+    let routeGateFailed = false;
     if (providerInput.message.authorKind === "human") {
       try {
         const projectFacts = await options.projectFacts.read(job.roomId);
@@ -201,6 +202,7 @@ export function createRouteRuntimeService(
           }).allowed;
         }
       } catch (error: unknown) {
+        routeGateFailed = true;
         report(error);
       }
     }
@@ -276,22 +278,19 @@ export function createRouteRuntimeService(
     });
     const suppressionReason = providerInput.message.authorKind === "agent"
       ? "agent_authored_source: Agent final messages cannot cascade"
-      : !projectFactsAvailable
+      : routeGateFailed || !projectFactsAvailable
         ? "dependency_unavailable: FT-09 project facts are not installed"
         : undefined;
     const result = suppressionReason === undefined
       ? evaluated
       : {
-          intents: evaluated.intents,
-          judgments: evaluated.judgments.map((judgment) =>
-            judgment.outcome === "will_respond"
-              ? judgment
-              : {
-                  ...judgment,
-                  outcome: "suppressed" as const,
-                  reasonCode: "not_selected" as const,
-                  reasonText: suppressionReason,
-                }),
+          intents: [],
+          judgments: evaluated.judgments.map((judgment) => ({
+            ...judgment,
+            outcome: "suppressed" as const,
+            reasonCode: "not_selected" as const,
+            reasonText: suppressionReason,
+          })),
         };
     await options.authority.complete(
       job,

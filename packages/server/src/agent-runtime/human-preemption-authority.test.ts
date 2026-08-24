@@ -243,6 +243,9 @@ describe("real SQLite human-preemption authority", () => {
       type: "runtime.complete", executionId: "execution-generating", attemptSeq: 1,
       messageId: "allowed-generating-message", body: "generation already started", now: t0 + 20_001,
     })).toMatchObject({ kind: "execution", execution: { status: "completed" } });
+    expect(database.prepare(
+      "SELECT COUNT(*) AS count FROM route_jobs WHERE source_message_id = 'allowed-generating-message'",
+    ).get()).toEqual({ count: 0 });
 
     const cancelled = executeRuntimeAuthorityOperation(database, {
       type: "runtime.cancel-for-human-fence", sourceHumanMessageId: "human-message-1", now: t0 + 20_001,

@@ -243,14 +243,21 @@ describe("bounded single-route runtime", () => {
 
     expect(provider.decide).not.toHaveBeenCalled();
     expect(fixture.completed).toHaveLength(1);
-    expect(fixture.completed[0]?.intents.map((intent) => intent.reasonCode))
-      .toEqual(["direct_mention"]);
-    expect(fixture.completed[0]?.judgments.find((entry) => entry.agentId === "agent-active"))
-      .toMatchObject({
+    expect(fixture.completed[0]?.intents).toEqual([]);
+    expect(fixture.completed[0]?.judgments).toEqual([
+      expect.objectContaining({
+        agentId: "agent-direct",
         outcome: "suppressed",
         reasonCode: "not_selected",
         reasonText: "dependency_unavailable: FT-09 project facts are not installed",
-      });
+      }),
+      expect.objectContaining({
+        agentId: "agent-active",
+        outcome: "suppressed",
+        reasonCode: "not_selected",
+        reasonText: "dependency_unavailable: FT-09 project facts are not installed",
+      }),
+    ]);
     await runtime.close();
   });
 
@@ -280,6 +287,9 @@ describe("bounded single-route runtime", () => {
     expect(fixture.failed).toEqual([]);
     expect(fixture.completed).toHaveLength(1);
     expect(fixture.completed[0]?.terminal).toBeUndefined();
+    expect(fixture.completed[0]?.intents).toEqual([]);
+    expect(fixture.completed[0]?.judgments.every((entry) => entry.outcome === "suppressed"))
+      .toBe(true);
     expect(errors).toEqual([diagnostic]);
     await runtime.close();
   });
@@ -308,8 +318,9 @@ describe("bounded single-route runtime", () => {
     expect(errors).toEqual([
       expect.objectContaining({ message: "Proactive route project fact revisions were invalid" }),
     ]);
-    expect(fixture.completed[0]?.judgments.find((entry) => entry.agentId === "agent-active"))
-      .toMatchObject({ outcome: "suppressed", reasonCode: "not_selected" });
+    expect(fixture.completed[0]?.intents).toEqual([]);
+    expect(fixture.completed[0]?.judgments.every((entry) =>
+      entry.outcome === "suppressed" && entry.reasonCode === "not_selected")).toBe(true);
     await runtime.close();
   });
 

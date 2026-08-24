@@ -2056,6 +2056,9 @@ describe("SQLite authoritative sessions", () => {
       expect(database.prepare(
         "SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.message.accepted'",
       ).get()).toEqual({ count: 1 });
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM route_jobs WHERE source_message_id = ?",
+      ).get(command.payload.id)).toEqual({ count: 0 });
       database.close();
     });
 
@@ -4961,7 +4964,7 @@ describe("SQLite authoritative sessions", () => {
     }
   });
 
-  it("claims an active Agent route source through its current authority envelope", async () => {
+  it("never creates new Agent-source routes and terminalizes bounded historical jobs", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-route-active-agent-"));
     temporaryDirectories.push(directory);
     const databasePath = join(directory, "authority.sqlite");
@@ -4984,23 +4987,171 @@ describe("SQLite authoritative sessions", () => {
         },
       },
     );
+    const completionSourceMessageId = "message-agent-complete-route-source";
+    await fixture.store.executeAgent(
+      mintInternalAgentCommandContext({
+        agentId: "agent-review",
+        requestId: "complete-agent-route-submit",
+        idempotencyKey: "complete-agent-route-submit",
+      }),
+      {
+        type: "message.send",
+        roomId: fixture.contexts.roomId,
+        payload: {
+          id: completionSourceMessageId,
+          roomId: fixture.contexts.roomId,
+          body: "Agent route completion must be suppressed by Authority",
+          sentAt: "2026-08-19T09:00:30.000Z",
+        },
+      },
+    );
+
+    const legacy = new DatabaseSync(databasePath);
+    expect(legacy.prepare(
+      "SELECT COUNT(*) AS count FROM route_jobs WHERE source_message_id IN (?, ?)",
+    ).get(sourceMessageId, completionSourceMessageId)).toEqual({ count: 0 });
+    const legacyRouteRows = [
+      ["route-agent-callback", sourceMessageId, "queued", "2026-08-19T09:01:00.000Z"],
+      ["route-agent-recovery", "matrix-agent-source", "queued", "2026-08-19T09:02:00.000Z"],
+      ["route-agent-complete", completionSourceMessageId, "running", "2026-08-19T09:03:00.000Z"],
+    ] as const;
+    for (const [routeJobId, messageId, status, createdAt] of legacyRouteRows) {
+      legacy.prepare(
+        `INSERT INTO route_jobs (
+           id, room_id, source_message_id, status, current_attempt, topic_key,
+           embedding_model_version, window_size, cosine_threshold, room_phase,
+           created_at, updated_at
+         ) VALUES (?, ?, ?, ?, 1, ?, 'dao-topic-embedding-v1', 8, 0.82,
+                   'discussion', ?, ?)`,
+      ).run(
+        routeJobId,
+        fixture.contexts.roomId,
+        messageId,
+        status,
+        `topic-v1:${routeJobId}`,
+        createdAt,
+        createdAt,
+      );
+      legacy.prepare(
+        `INSERT INTO route_attempts (route_job_id, attempt_seq, status)
+         VALUES (?, 1, ?)`,
+      ).run(routeJobId, status);
+      legacy.prepare(
+        `INSERT INTO route_job_agents (
+           route_job_id, agent_id, participation, role, capabilities_json,
+           calibration_score, has_ball
+         ) VALUES (?, 'agent-review', 'active', 'Reviewer', '["review.read"]', 0, 0)`,
+      ).run(routeJobId);
+    }
+    legacy.close();
 
     await expect(fixture.client.executeRoute({
       type: "route.claim",
       sourceMessageId,
       now: 5_100,
     })).resolves.toMatchObject({
-      kind: "route-claimed",
-      providerInput: {
-        sourceMessageId,
-        message: {
-          authorId: "agent-review",
-          authorKind: "agent",
-          summary: "active Agent route body",
-        },
-      },
+      kind: "route-completed",
+      job: { id: "route-agent-callback", status: "completed" },
+      intents: [],
+    });
+    await expect(fixture.client.executeRoute({
+      type: "route.complete",
+      routeJobId: "route-agent-complete",
+      attempt: 1,
+      judgments: [{
+        id: "untrusted-agent-complete-judgment",
+        routeJobId: "route-agent-complete",
+        sourceMessageId: completionSourceMessageId,
+        agentId: "agent-review",
+        outcome: "will_respond",
+        reasonCode: "direct_mention",
+        reasonText: "must be discarded",
+        routeAttempt: 1,
+        decidedAt: "2026-08-19T09:04:00.000Z",
+      }],
+      intents: [{
+        kind: "direct_mention",
+        roomId: fixture.contexts.roomId,
+        sourceMessageId: completionSourceMessageId,
+        targetAgentId: "agent-review",
+        reasonCode: "direct_mention",
+        reasonText: "must be discarded",
+        priority: 1,
+      }],
+      now: 5_150,
+    })).resolves.toMatchObject({
+      kind: "route-completed",
+      job: { id: "route-agent-complete", status: "completed" },
+      intents: [],
+    });
+    await expect(fixture.client.executeRoute({
+      type: "route.recover",
+      now: 5_200,
+    })).resolves.toEqual({
+      kind: "route-recovery",
+      jobs: [],
     });
     await fixture.client.close();
+
+    const inspection = new DatabaseSync(databasePath, { readOnly: true });
+    expect(inspection.prepare(
+      `SELECT job.id, job.status, attempt.status AS attemptStatus,
+              attempt.error_code AS errorCode
+       FROM route_jobs AS job
+       JOIN route_attempts AS attempt ON attempt.route_job_id = job.id
+       WHERE job.id IN ('route-agent-callback', 'route-agent-complete', 'route-agent-recovery')
+       ORDER BY job.id`,
+    ).all()).toEqual([
+      {
+        id: "route-agent-callback",
+        status: "completed",
+        attemptStatus: "cancelled",
+        errorCode: "agent_authored_source",
+      },
+      {
+        id: "route-agent-complete",
+        status: "completed",
+        attemptStatus: "cancelled",
+        errorCode: "agent_authored_source",
+      },
+      {
+        id: "route-agent-recovery",
+        status: "completed",
+        attemptStatus: "cancelled",
+        errorCode: "agent_authored_source",
+      },
+    ]);
+    expect(inspection.prepare(
+      `SELECT route_job_id AS routeJobId, outcome, reason_code AS reasonCode,
+              reason_text AS reasonText
+       FROM route_judgments
+       WHERE route_job_id IN ('route-agent-callback', 'route-agent-complete', 'route-agent-recovery')
+       ORDER BY route_job_id`,
+    ).all()).toEqual([
+      {
+        routeJobId: "route-agent-callback",
+        outcome: "suppressed",
+        reasonCode: "not_selected",
+        reasonText: "agent_authored_source: Agent final messages cannot cascade",
+      },
+      {
+        routeJobId: "route-agent-complete",
+        outcome: "suppressed",
+        reasonCode: "not_selected",
+        reasonText: "agent_authored_source: Agent final messages cannot cascade",
+      },
+      {
+        routeJobId: "route-agent-recovery",
+        outcome: "suppressed",
+        reasonCode: "not_selected",
+        reasonText: "agent_authored_source: Agent final messages cannot cascade",
+      },
+    ]);
+    expect(inspection.prepare(
+      `SELECT COUNT(*) AS count FROM route_invocation_intents
+       WHERE route_job_id IN ('route-agent-callback', 'route-agent-complete', 'route-agent-recovery')`,
+    ).get()).toEqual({ count: 0 });
+    inspection.close();
   });
 
   it("routes the current Human revision without exposing the retained old body", async () => {
@@ -5851,6 +6002,10 @@ describe("SQLite authoritative sessions", () => {
     expect(database.prepare(
       "SELECT COUNT(*) AS count FROM messages WHERE id = 'message-agent-after-recall'",
     ).get()).toEqual({ count: 0 });
+    expect(database.prepare(
+      `SELECT COUNT(*) AS count FROM route_jobs
+       WHERE source_message_id IN (?, ?)`,
+    ).get(finalCommand.messageId, "message-agent-correction-v2")).toEqual({ count: 0 });
     expect(database.prepare(
       `SELECT status, cancellation_reason AS cancellationReason
        FROM agent_executions WHERE id = 'execution-agent-recalled'`,
