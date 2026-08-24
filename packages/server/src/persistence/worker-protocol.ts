@@ -125,6 +125,7 @@ export type AuthorityWorkerErrorCode =
   | "agent_queue_full"
   | "agent_permissions_invalid"
   | "agent_required"
+  | "administrator_configuration_unavailable"
   | "administrator_required"
   | "administrator_already_exists"
   | "administrator_not_found"
@@ -244,6 +245,7 @@ export function isAuthorityWorkerErrorCode(
     case "agent_queue_full":
     case "agent_permissions_invalid":
     case "agent_required":
+    case "administrator_configuration_unavailable":
     case "administrator_required":
     case "administrator_already_exists":
     case "administrator_not_found":

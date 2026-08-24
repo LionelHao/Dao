@@ -109,6 +109,7 @@ export type TenantAdministrationErrorCode =
   | "invalid_bootstrap"
   | "bootstrap_conflict"
   | "human_principal_required"
+  | "administrator_configuration_unavailable"
   | "administrator_required"
   | "administrator_already_exists"
   | "administrator_not_found"
@@ -298,7 +299,10 @@ function requireAdministrator(
     throw new TenantAdministrationError(403, "human_principal_required");
   }
   const registry = transaction.readAdministratorRegistry();
-  if (registry === undefined || !registry.principalIds.includes(context.principal.actorId)) {
+  if (registry === undefined) {
+    throw new TenantAdministrationError(503, "administrator_configuration_unavailable");
+  }
+  if (!registry.principalIds.includes(context.principal.actorId)) {
     throw new TenantAdministrationError(403, "administrator_required");
   }
   return registry;

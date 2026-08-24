@@ -136,6 +136,9 @@ describe("Tenant administration AuthorityWorker integration", () => {
 
   it("rechecks revocation and closes credential mutation without an approved store as 503", async () => {
     const configured = await fixture();
+    await expect(configured.client.executeTenantAdministration({
+      version: 1, type: "tenant-administrator.list", context: configured.session, now: NOW,
+    })).rejects.toMatchObject({ code: "administrator_configuration_unavailable", status: 503 });
     await configured.client.executeTenantAdministration({
       version: 1, type: "tenant-administrator.bootstrap", principalIds: ["human-owner"],
       configurationSha256: DIGEST, now: NOW,

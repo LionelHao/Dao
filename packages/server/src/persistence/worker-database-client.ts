@@ -455,6 +455,7 @@ function authorityWorkerClientErrorStatus(
     case "extractor_unavailable":
     case "ocr_unavailable":
     case "authority_not_initialized":
+    case "administrator_configuration_unavailable":
     case "authority_worker_closed":
     case "authority_worker_error":
     case "authority_worker_exited":

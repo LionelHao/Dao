@@ -132,6 +132,8 @@ const command = (overrides: Partial<{ accessToken: string; requestId: string;
 describe("Tenant Administrator authority", () => {
   it("bootstraps once from an explicit owner-controlled Human principal configuration", async () => {
     const f = fixture();
+    await expect(f.authority.listAdministrators("owner-token"))
+      .rejects.toMatchObject({ status: 503, code: "administrator_configuration_unavailable" });
     const result = await bootstrap(f);
     expect(result).toEqual({ revision: 1, principalIds: ["human-owner"],
       configurationDigest: BOOTSTRAP_DIGEST, updatedAt: NOW });

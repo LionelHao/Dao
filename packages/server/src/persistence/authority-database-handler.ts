@@ -201,6 +201,7 @@ function tenantAdministrationError(error: unknown): never {
       invalid_bootstrap: "invalid_request",
       bootstrap_conflict: "bootstrap_conflict",
       human_principal_required: "identity_forbidden",
+      administrator_configuration_unavailable: "administrator_configuration_unavailable",
       administrator_required: "administrator_required",
       administrator_already_exists: "administrator_already_exists",
       administrator_not_found: "administrator_not_found",
