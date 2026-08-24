@@ -28,6 +28,8 @@ type PendingRequest = Readonly<{
   timeout: ReturnType<typeof setTimeout>;
 }>;
 
+const MAX_DEFERRED_ROOM_EVENTS = 512;
+
 function record(value: unknown): value is WireRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -79,8 +81,11 @@ export function createDesktopAgentSettingsRuntime(options: {
   let roomRepairWatermark = 0;
   let lastSnapshot: AgentSettingsSnapshot | undefined;
   let syncRunning = false;
-  let repairActive = false;
+  let authorityEpoch = 0;
+  const activeRefreshes = new Set<number>();
   const deferredRoomFrames: WireRecord[] = [];
+  const deferredRoomEventIds = new Set<string>();
+  let deferredRoomOverflow = false;
   const removedAssignmentRevisions = new Map<string, number>();
   let repairGeneration = 0;
   let syncTimer: ReturnType<typeof setInterval> | undefined;
@@ -109,6 +114,7 @@ export function createDesktopAgentSettingsRuntime(options: {
   };
 
   const purgeAuthority = (scope: "room" | "session"): void => {
+    authorityEpoch += 1;
     const candidate = socket;
     socket = undefined;
     connection = undefined;
@@ -123,8 +129,10 @@ export function createDesktopAgentSettingsRuntime(options: {
     roomCursor = 0;
     roomRepairWatermark = 0;
     lastSnapshot = undefined;
-    repairActive = false;
+    activeRefreshes.clear();
     deferredRoomFrames.length = 0;
+    deferredRoomEventIds.clear();
+    deferredRoomOverflow = false;
     removedAssignmentRevisions.clear();
     acknowledgedRequestsByEventId.clear();
     observedEvents.clear();
@@ -184,7 +192,13 @@ export function createDesktopAgentSettingsRuntime(options: {
     if (!record(frame.event) || frame.event.type !== "room.agent-assignment.changed" ||
         frame.event.roomId !== currentRoomId || typeof frame.event.eventId !== "string" ||
         typeof frame.event.streamSeq !== "number" || !record(frame.event.payload)) return;
-    if (repairActive) {
+    if (activeRefreshes.size > 0) {
+      if (deferredRoomEventIds.has(frame.event.eventId)) return;
+      if (deferredRoomFrames.length >= MAX_DEFERRED_ROOM_EVENTS) {
+        deferredRoomOverflow = true;
+        return;
+      }
+      deferredRoomEventIds.add(frame.event.eventId);
       deferredRoomFrames.push(structuredClone(frame));
       return;
     }
@@ -243,6 +257,35 @@ export function createDesktopAgentSettingsRuntime(options: {
           .filter((assignment) => assignment.assignmentId !== event.assignmentId) } };
     }
     acceptStableEvent(stableEvent(frame.event.eventId, frame.event.streamSeq, event));
+  };
+
+  const beginRefresh = (): Readonly<{ token: number; epoch: number }> => {
+    const token = ++repairGeneration;
+    activeRefreshes.add(token);
+    return { token, epoch: authorityEpoch };
+  };
+
+  const assertRefreshCurrent = (
+    refresh: Readonly<{ token: number; epoch: number }>,
+    roomId: string,
+  ): void => {
+    if (closed || refresh.epoch !== authorityEpoch || refresh.token !== repairGeneration ||
+        currentRoomId !== roomId) {
+      throw new Error("authority_invalidated");
+    }
+  };
+
+  const finishRefresh = (refresh: Readonly<{ token: number; epoch: number }>): void => {
+    activeRefreshes.delete(refresh.token);
+    if (activeRefreshes.size > 0) return;
+    const deferred = deferredRoomFrames.splice(0);
+    deferredRoomEventIds.clear();
+    const overflowed = deferredRoomOverflow;
+    deferredRoomOverflow = false;
+    for (const frame of deferred) handleRoomEvent(frame);
+    if (overflowed && !closed && lastSnapshot !== undefined && currentRoomId !== undefined) {
+      setTimeout(() => void synchronize().catch(() => undefined), 0);
+    }
   };
 
   const disconnect = (candidate: AgentSettingsWebSocketLike, error: Error): void => {
@@ -416,55 +459,76 @@ export function createDesktopAgentSettingsRuntime(options: {
 
   async function snapshot(roomId: string): Promise<AgentSettingsSnapshot> {
     currentRoomId = roomId;
-    const governance = await options.governance(roomId);
-    const adminRequest = options.createRequestIdentity().requestId;
-    let administrator = false;
+    const refresh = beginRefresh();
+    let completedSnapshot: AgentSettingsSnapshot | undefined;
     try {
-      await exchange({ type: "tenant-administrator.list", requestId: adminRequest });
-      administrator = true;
-    } catch (error) {
-      if ((error as { status?: number }).status !== 403) throw error;
+      const governance = await options.governance(roomId);
+      assertRefreshCurrent(refresh, roomId);
+      const adminRequest = options.createRequestIdentity().requestId;
+      let administrator = false;
+      try {
+        await exchange({ type: "tenant-administrator.list", requestId: adminRequest });
+        assertRefreshCurrent(refresh, roomId);
+        administrator = true;
+      } catch (error) {
+        assertRefreshCurrent(refresh, roomId);
+        if ((error as { status?: number }).status !== 403) throw error;
+      }
+      let catalog: WireRecord | undefined;
+      if (administrator) {
+        catalog = await exchange({ type: "agent-profile.list",
+          requestId: options.createRequestIdentity().requestId });
+        assertRefreshCurrent(refresh, roomId);
+      }
+      let assignments: WireRecord | undefined;
+      if (governance.roomRole !== null) {
+        assignments = await exchange({
+          type: "room-agent-assignment.repair", requestId: options.createRequestIdentity().requestId,
+          roomId,
+        });
+        assertRefreshCurrent(refresh, roomId);
+      }
+      roomCursor = Number(assignments?.watermark ?? 0);
+      roomRepairWatermark = roomCursor;
+      removedAssignmentRevisions.clear();
+      const providerWire = catalog?.provider ?? assignments?.provider;
+      if (providerWire === undefined) {
+        throw Object.assign(new Error("room_forbidden"), { status: 403 });
+      }
+      const value = {
+        recordVersion: "agent-settings.snapshot.v1",
+        cursor: Number(catalog?.catalogRevision ?? 0),
+        viewer: { actorId: options.session()!.actorId, tenantAdministrator: administrator,
+          roomRole: governance.roomRole },
+        provider: providerProjection(providerWire),
+        profileCatalog: administrator
+          ? { status: "available", revision: catalog!.catalogRevision, profiles: catalog!.profiles }
+          : { status: "forbidden" },
+        room: governance.roomRole === null ? { status: "forbidden", roomId } : {
+          status: "available", roomId, roomName: governance.roomName,
+          lifecycle: governance.lifecycle, roomRevision: assignments!.roomRevision,
+          assignments: assignmentValues(assignments!.assignments),
+        },
+      };
+      if (!isAgentSettingsSnapshot(value)) throw new TypeError("Agent Settings snapshot is not closed");
+      assertRefreshCurrent(refresh, roomId);
+      lastSnapshot = structuredClone(value);
+      await subscribeRoom(roomId);
+      assertRefreshCurrent(refresh, roomId);
+      if (syncTimer === undefined) {
+        syncTimer = setInterval(() => void synchronize().catch((error: unknown) => {
+          const status = (error as { status?: unknown }).status;
+          if (status === 401) purgeAuthority("session");
+          else if (status === 403 && lastSnapshot !== undefined) purgeAuthority("room");
+        }),
+          options.syncIntervalMs ?? 1_000);
+      }
+      completedSnapshot = value;
+    } finally {
+      finishRefresh(refresh);
     }
-    let catalog: WireRecord | undefined;
-    if (administrator) catalog = await exchange({ type: "agent-profile.list",
-      requestId: options.createRequestIdentity().requestId });
-    let assignments: WireRecord | undefined;
-    if (governance.roomRole !== null) assignments = await exchange({
-      type: "room-agent-assignment.repair", requestId: options.createRequestIdentity().requestId,
-      roomId,
-    });
-    roomCursor = Number(assignments?.watermark ?? 0);
-    roomRepairWatermark = roomCursor;
-    removedAssignmentRevisions.clear();
-    const providerWire = catalog?.provider ?? assignments?.provider;
-    if (providerWire === undefined) throw Object.assign(new Error("room_forbidden"), { status: 403 });
-    const value = {
-      recordVersion: "agent-settings.snapshot.v1",
-      cursor: Number(catalog?.catalogRevision ?? 0),
-      viewer: { actorId: options.session()!.actorId, tenantAdministrator: administrator,
-        roomRole: governance.roomRole },
-      provider: providerProjection(providerWire),
-      profileCatalog: administrator
-        ? { status: "available", revision: catalog!.catalogRevision, profiles: catalog!.profiles }
-        : { status: "forbidden" },
-      room: governance.roomRole === null ? { status: "forbidden", roomId } : {
-        status: "available", roomId, roomName: governance.roomName,
-        lifecycle: governance.lifecycle, roomRevision: assignments!.roomRevision,
-        assignments: assignmentValues(assignments!.assignments),
-      },
-    };
-    if (!isAgentSettingsSnapshot(value)) throw new TypeError("Agent Settings snapshot is not closed");
-    lastSnapshot = structuredClone(value);
-    await subscribeRoom(roomId);
-    if (syncTimer === undefined) {
-      syncTimer = setInterval(() => void synchronize().catch((error: unknown) => {
-        const status = (error as { status?: unknown }).status;
-        if (status === 401) purgeAuthority("session");
-        else if (status === 403 && lastSnapshot !== undefined) purgeAuthority("room");
-      }),
-        options.syncIntervalMs ?? 1_000);
-    }
-    return structuredClone(lastSnapshot ?? value);
+    assertRefreshCurrent(refresh, roomId);
+    return structuredClone(lastSnapshot ?? completedSnapshot!);
   }
 
   function applyProfileEvent(event: WireRecord): void {
@@ -486,9 +550,9 @@ export function createDesktopAgentSettingsRuntime(options: {
     const current = lastSnapshot;
     const roomId = currentRoomId;
     if (current === undefined || roomId === undefined) return;
-    const generation = ++repairGeneration;
+    const refresh = beginRefresh();
+    const generation = refresh.token;
     let repairWatermark = reasonWatermark;
-    repairActive = true;
     try {
       const profileRepair = current.profileCatalog.status === "available"
         ? await exchange({ type: "agent-profile.repair",
@@ -498,9 +562,11 @@ export function createDesktopAgentSettingsRuntime(options: {
         ? await exchange({ type: "room-agent-assignment.repair",
             requestId: options.createRequestIdentity().requestId, roomId })
         : undefined;
+      assertRefreshCurrent(refresh, roomId);
       repairWatermark = Number(profileRepair?.watermark ?? current.cursor);
       publish({ type: "repair-started", generation, watermark: repairWatermark });
       const governance = await options.governance(roomId);
+      assertRefreshCurrent(refresh, roomId);
       roomCursor = Number(assignmentRepair?.watermark ?? roomCursor);
       roomRepairWatermark = roomCursor;
       removedAssignmentRevisions.clear();
@@ -523,13 +589,14 @@ export function createDesktopAgentSettingsRuntime(options: {
       publish({ type: "repair-completed", generation, watermark: repairWatermark,
         snapshot: repaired });
     } catch (error: unknown) {
-      publish({ type: "repair-failed", generation, watermark: repairWatermark,
-        errorCode: error instanceof Error ? error.message : "repair_unavailable" });
+      if (refresh.epoch === authorityEpoch && refresh.token === repairGeneration &&
+          currentRoomId === roomId) {
+        publish({ type: "repair-failed", generation, watermark: repairWatermark,
+          errorCode: error instanceof Error ? error.message : "repair_unavailable" });
+      }
       throw error;
     } finally {
-      repairActive = false;
-      const deferred = deferredRoomFrames.splice(0);
-      for (const frame of deferred) handleRoomEvent(frame);
+      finishRefresh(refresh);
     }
   }
 
