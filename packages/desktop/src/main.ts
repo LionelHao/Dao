@@ -31,6 +31,8 @@ import { registerMessageAuthorityIpc } from "./message-authority/ipc.js";
 import { createDesktopMessageAuthorityRuntime } from "./message-authority/production-runtime.js";
 import { createDesktopMemoryAuthorityRuntime } from "./memory-authority/production-runtime.js";
 import { registerMemoryAuthorityIpc } from "./memory-authority/ipc.js";
+import { createDesktopAgentSettingsRuntime } from "./agent-profile-routing/production-runtime.js";
+import { registerAgentSettingsIpc } from "./agent-profile-routing/ipc.js";
 import { createDesktopAttachmentAuthorityRuntime } from "./attachment-authority/production-runtime.js";
 import {
   createElectronAttachmentPorts,
@@ -59,6 +61,8 @@ async function createWindow(): Promise<void> {
   let memoryAuthorityRuntime: ReturnType<typeof createDesktopMemoryAuthorityRuntime> | undefined;
   let disposeMemoryAuthorityIpc: (() => void) | undefined;
   let disposeAttachmentGovernanceState: (() => void) | undefined;
+  let agentSettings: ReturnType<typeof createDesktopAgentSettingsRuntime> | undefined;
+  let disposeAgentSettingsIpc: (() => void) | undefined;
   const attachmentRuntimeHost = createElectronAttachmentRuntimeHost({
     createRuntime: () => {
       const ports = createElectronAttachmentPorts({
@@ -114,6 +118,7 @@ async function createWindow(): Promise<void> {
       authorizedState: {
         invalidate: () => {
           governance?.invalidateAuthorizedState();
+          agentSettings?.invalidateAuthorizedState();
           messageAuthorityRuntime?.invalidateAuthorizedState();
           memoryAuthorityRuntime?.invalidateAuthorizedState();
           attachmentRuntimeHost.invalidateIdentity();
@@ -135,6 +140,27 @@ async function createWindow(): Promise<void> {
       webContents: window.webContents,
       controller: governance.controller,
     });
+    agentSettings = createDesktopAgentSettingsRuntime({
+      endpoint: process.env.NATIVE_IM_IDENTITY_WS_URL ?? "ws://127.0.0.1:8787",
+      session: () => identity?.getCurrentAuthoritySession(),
+      webSocketFactory: (endpoint) => new WebSocket(endpoint),
+      createRequestIdentity: () => ({ requestId: `agent-settings-${randomUUID()}`,
+        idempotencyKey: randomUUID() }),
+      async governance(roomId) {
+        const state = await governance!.controller.getSurface({ roomId });
+        if (state.status !== "ready") return { roomId, roomName: "Room", lifecycle: "active" as const,
+          roomRevision: 0, roomRole: null };
+        const member = state.projection.members.find((entry) => entry.kind === "human" &&
+          entry.actorId === state.viewerActorId);
+        const roomRole = state.projection.ownerActorId === state.viewerActorId ? "owner" as const
+          : member?.kind === "human" ? member.role : null;
+        return { roomId, roomName: state.projection.roomName,
+          lifecycle: state.projection.lifecycle, roomRevision: state.projection.governanceRevision,
+          roomRole };
+      },
+    });
+    disposeAgentSettingsIpc = registerAgentSettingsIpc({ ipcMain,
+      webContents: window.webContents, runtime: agentSettings });
     disposeAttachmentGovernanceState = governance.controller.subscribe((state) => {
       attachmentRuntimeHost.observeGovernanceState(state);
     });
@@ -166,6 +192,7 @@ async function createWindow(): Promise<void> {
       disposeGovernanceIpc?.();
       disposeMessageAuthorityIpc?.();
       disposeMemoryAuthorityIpc?.();
+      disposeAgentSettingsIpc?.();
       disposeAttachmentGovernanceState?.();
       attachmentRuntimeHost.close();
       identity?.close();
@@ -173,6 +200,7 @@ async function createWindow(): Promise<void> {
       messageAuthority?.close();
       messageAuthorityRuntime?.close();
       memoryAuthorityRuntime?.close();
+      agentSettings?.close();
     });
 
     await Promise.all([window.loadFile(rendererPath), identity.initialize()]);
@@ -183,6 +211,7 @@ async function createWindow(): Promise<void> {
         messageAuthorityMethods: Object.keys(globalThis.dao?.messageAuthority ?? {}).sort(),
         attachmentAuthorityMethods: Object.keys(globalThis.dao?.attachmentAuthority ?? {}).sort(),
         memoryAuthorityMethods: Object.keys(globalThis.dao?.memoryAuthority ?? {}).sort(),
+        agentSettingsMethods: Object.keys(globalThis.dao?.agentSettings ?? {}).sort(),
         namespaces: Object.keys(globalThis.dao ?? {}).sort(),
         bridgeMissing: document.querySelector("[data-identity-bridge-missing]") !== null,
         governanceRouteContract: document.querySelector("#app")?.dataset.governanceRouteContract ?? "",
@@ -224,6 +253,7 @@ async function createWindow(): Promise<void> {
       "upload",
     ];
     const expectedMemoryAuthorityMethods = ["context", "onAuthorityInput", "request"];
+    const expectedAgentSettingsMethods = ["getSnapshot", "onAuthorityMessage", "submit"];
     let startupProbe: unknown;
     try {
       startupProbe = typeof startupProbeJson === "string"
@@ -256,9 +286,11 @@ async function createWindow(): Promise<void> {
         startupProbe.memoryAuthorityMethods.length !== expectedMemoryAuthorityMethods.length ||
         !startupProbe.memoryAuthorityMethods.every(
           (method, index) => method === expectedMemoryAuthorityMethods[index],
-        ) || !("namespaces" in startupProbe) || !Array.isArray(startupProbe.namespaces) ||
+        ) || !("agentSettingsMethods" in startupProbe) || !Array.isArray(startupProbe.agentSettingsMethods) ||
+        startupProbe.agentSettingsMethods.join(",") !== expectedAgentSettingsMethods.join(",") ||
+        !("namespaces" in startupProbe) || !Array.isArray(startupProbe.namespaces) ||
         startupProbe.namespaces.join(",") !==
-          "attachmentAuthority,governance,identity,memoryAuthority,messageAuthority" ||
+          "agentSettings,attachmentAuthority,governance,identity,memoryAuthority,messageAuthority" ||
         !("governanceRouteContract" in startupProbe) ||
         startupProbe.governanceRouteContract !== "closed-v1" ||
         !("bridgeMissing" in startupProbe) || startupProbe.bridgeMissing !== false ||
@@ -281,6 +313,7 @@ async function createWindow(): Promise<void> {
     disposeGovernanceIpc?.();
     disposeMessageAuthorityIpc?.();
     disposeMemoryAuthorityIpc?.();
+    disposeAgentSettingsIpc?.();
     disposeAttachmentGovernanceState?.();
     attachmentRuntimeHost.close();
     identity?.close();
@@ -288,6 +321,7 @@ async function createWindow(): Promise<void> {
     messageAuthority?.close();
     messageAuthorityRuntime?.close();
     memoryAuthorityRuntime?.close();
+    agentSettings?.close();
     if (!window.isDestroyed()) window.destroy();
     throw error;
   }

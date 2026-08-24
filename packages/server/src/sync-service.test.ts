@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PersistedRoomEvent, RoomSyncRequest } from "@native-im/core";
 import {
   createSyncService,
@@ -25,6 +25,152 @@ const temporaryDirectories: string[] = [];
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((directory) =>
     rm(directory, { recursive: true, force: true })));
+});
+
+describe("FT-07 scoped projection sync", () => {
+  const provider = {
+    providerId: "openai",
+    modelId: "gpt-5",
+    credentialReadiness: "ready",
+  } as const;
+
+  it("passes current session context to the deployment and Room authority projection port", async () => {
+    const context = contextFor("a");
+    const syncAgentProfiles = vi.fn(async (_context, input) => input.afterSeq === undefined
+      ? {
+          type: "agent-profile.sync.result" as const,
+          requestId: input.requestId,
+          mode: "repair_required" as const,
+          reason: "cursor_absent" as const,
+          retainedFromSeq: 1,
+          watermark: 0,
+        }
+      : {
+          type: "agent-profile.sync.result" as const,
+          requestId: input.requestId,
+          mode: "delta" as const,
+          events: [],
+          nextCursor: input.afterSeq,
+          watermark: input.afterSeq,
+          hasMore: false,
+        });
+    const repairAgentProfiles = vi.fn(async (_context, requestId) => ({
+      type: "agent-profile.repair.snapshot" as const,
+      requestId,
+      watermark: 0,
+      profiles: [],
+      provider,
+    }));
+    const repairRoomAgentAssignments = vi.fn(async (_context, requestId, roomId) => ({
+      type: "room-agent-assignment.repair.snapshot" as const,
+      requestId,
+      roomId,
+      watermark: 4,
+      roomRevision: 5,
+      assignments: [],
+      provider,
+    }));
+    const sync = createSyncService({
+      store: { async syncRoom() { throw new Error("not used"); } },
+      agentSettings: { syncAgentProfiles, repairAgentProfiles, repairRoomAgentAssignments },
+    });
+
+    await expect(sync.syncAgentProfiles(context, "profile-sync", 4))
+      .resolves.toMatchObject({ type: "agent-profile.sync.result", nextCursor: 4 });
+    await expect(sync.repairAgentProfiles(context, "profile-repair"))
+      .resolves.toMatchObject({ type: "agent-profile.repair.snapshot", watermark: 0 });
+    await expect(sync.repairRoomAgentAssignments(context, "room-repair", "room-1"))
+      .resolves.toMatchObject({ type: "room-agent-assignment.repair.snapshot", roomId: "room-1" });
+    expect(syncAgentProfiles).toHaveBeenCalledWith(context, {
+      requestId: "profile-sync", afterSeq: 4, limit: 100,
+    });
+    expect(repairAgentProfiles).toHaveBeenCalledWith(context, "profile-repair");
+    expect(repairRoomAgentAssignments).toHaveBeenCalledWith(context, "room-repair", "room-1");
+  });
+
+  it("fails missing, cross-scope and leaking projection ports closed", async () => {
+    const context = contextFor("a");
+    const absent = createSyncService({
+      store: { async syncRoom() { throw new Error("not used"); } },
+    });
+    await expect(absent.repairAgentProfiles(context, "missing"))
+      .rejects.toMatchObject({ status: 503, code: "storage_unavailable" });
+
+    const corrupt = createSyncService({
+      store: { async syncRoom() { throw new Error("not used"); } },
+      agentSettings: {
+        async syncAgentProfiles(_context, input) {
+          return { type: "agent-profile.sync.result", requestId: input.requestId,
+            mode: "delta", events: [], nextCursor: 0, watermark: 0, hasMore: false,
+            credential: "secret-canary" };
+        },
+        async repairAgentProfiles(_context, requestId) {
+          return { type: "agent-profile.repair.snapshot", requestId, watermark: 0,
+            profiles: [], provider: { ...provider, roomId: "room-secret" } };
+        },
+        async repairRoomAgentAssignments(_context, requestId) {
+          return { type: "room-agent-assignment.repair.snapshot", requestId,
+            roomId: "room-other", watermark: 0, roomRevision: 1,
+            assignments: [], provider };
+        },
+      },
+    });
+    await expect(corrupt.syncAgentProfiles(context, "leaking-sync"))
+      .rejects.toMatchObject({ status: 503, code: "storage_unavailable" });
+    await expect(corrupt.repairAgentProfiles(context, "leaking-repair"))
+      .rejects.toMatchObject({ status: 503, code: "storage_unavailable" });
+    await expect(corrupt.repairRoomAgentAssignments(context, "cross-room", "room-1"))
+      .rejects.toMatchObject({ status: 503, code: "storage_unavailable" });
+  });
+
+  it("rejects projection stores that bypass absent-cursor repair or skip delta sequence", async () => {
+    const context = contextFor("a");
+    const bypassRepair = createSyncService({
+      store: { async syncRoom() { throw new Error("not used"); } },
+      agentSettings: {
+        async syncAgentProfiles(_context, input) {
+          return { type: "agent-profile.sync.result", requestId: input.requestId,
+            mode: "delta", events: [], nextCursor: 0, watermark: 0, hasMore: false };
+        },
+        async repairAgentProfiles() { throw new Error("not used"); },
+        async repairRoomAgentAssignments() { throw new Error("not used"); },
+      },
+    });
+    await expect(bypassRepair.syncAgentProfiles(context, "must-repair"))
+      .rejects.toMatchObject({ status: 503, code: "storage_unavailable" });
+
+    const skippedSequence = createSyncService({
+      store: { async syncRoom() { throw new Error("not used"); } },
+      agentSettings: {
+        async syncAgentProfiles(_context, input) {
+          return { type: "agent-profile.sync.result", requestId: input.requestId,
+            mode: "delta", events: [], nextCursor: 6, watermark: 6, hasMore: false };
+        },
+        async repairAgentProfiles() { throw new Error("not used"); },
+        async repairRoomAgentAssignments() { throw new Error("not used"); },
+      },
+    });
+    await expect(skippedSequence.syncAgentProfiles(context, "must-be-contiguous", 4))
+      .rejects.toMatchObject({ status: 503, code: "storage_unavailable" });
+  });
+
+  it.each([
+    ["", undefined, undefined],
+    ["request", -1, undefined],
+    ["request", undefined, 0],
+    ["request", undefined, 257],
+  ] as const)("rejects invalid deployment cursor request %#", async (requestId, afterSeq, limit) => {
+    const sync = createSyncService({
+      store: { async syncRoom() { throw new Error("not used"); } },
+      agentSettings: {
+        async syncAgentProfiles() { throw new Error("must not run"); },
+        async repairAgentProfiles() { throw new Error("must not run"); },
+        async repairRoomAgentAssignments() { throw new Error("must not run"); },
+      },
+    });
+    await expect(sync.syncAgentProfiles(contextFor("a"), requestId, afterSeq, limit))
+      .rejects.toMatchObject({ status: 400, code: "invalid_request" });
+  });
 });
 
 function tokenHash(value: string): string {
@@ -826,7 +972,7 @@ describe("permission-aware retained room sync", () => {
       ).get(),
     }).toEqual(before);
     database.close();
-    await expect(fixture.client.inspectSchema()).resolves.toEqual({ version: 20 });
+    await expect(fixture.client.inspectSchema()).resolves.toEqual({ version: 21 });
     const context = fixture.contexts[0];
     if (context === undefined) throw new Error("missing fixture context");
     await expect(fixture.sync.syncRoom(

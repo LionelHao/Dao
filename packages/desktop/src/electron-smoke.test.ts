@@ -8,6 +8,7 @@ describe("real Electron smoke contract", () => {
     const preview = readFileSync(resolve(import.meta.dirname, "../scripts/smoke-attachment-preview.mjs"), "utf8");
     expect(smoke).toContain("smoke-attachment-preview.mjs");
     expect(smoke).toContain("attachmentAuthority");
+    expect(readFileSync(resolve(import.meta.dirname, "main.ts"), "utf8")).toContain("agentSettingsMethods");
     expect(preview).toContain("createElectronAttachmentPorts");
     expect(preview).toContain("createNativeSelectionRegistry");
     expect(preview).toContain("NODE_NATIVE_FILE_SYSTEM");

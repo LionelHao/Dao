@@ -29,6 +29,7 @@ import {
 import { createScryptIdentityAdapter, MAX_ACTIVE_SESSION_FAMILIES } from "./auth.js";
 import {
   startAuthoritativeServer,
+  startAuthoritativeServerForTest,
   type AuthoritativeServer,
 } from "./authoritative-server.js";
 import type { ServerFrame } from "./protocol.js";
@@ -39,6 +40,12 @@ import {
   type SyncTransport,
 } from "../../desktop/src/sync/client-sync-replica.js";
 import { createDesktopGovernanceRuntime } from "../../desktop/src/governance/production-runtime.js";
+import { createDesktopAgentSettingsRuntime } from
+  "../../desktop/src/agent-profile-routing/production-runtime.js";
+import {
+  applyAgentSettingsAuthorityMessage,
+  createAgentSettingsInitialState,
+} from "../../desktop/src/renderer/agent-settings/view-model.js";
 import {
   createDesktopMessageAuthorityRuntime,
   type DesktopMessageAuthorityRuntime,
@@ -83,6 +90,9 @@ import type {
   WorkspaceBootstrapPage,
 } from "@native-im/core";
 import { isActor, isRoomRepairPage } from "@native-im/core";
+import {
+  seedCanonicalRoomAssignmentFixture,
+} from "./fixtures/agent-authority-fixture.js";
 
 const actors = [
   {
@@ -478,7 +488,7 @@ async function stopChild(
   await childExit(child, killTimeoutMs);
 }
 
-async function waitForRouteJudgmentCount(
+async function waitForRouteDecisionCount(
   directory: string,
   roomId: string,
   expected: number,
@@ -491,8 +501,8 @@ async function waitForRouteJudgmentCount(
     try {
       const count = database.prepare(
         `SELECT COUNT(*) AS count
-         FROM route_judgments AS judgment
-         INNER JOIN route_jobs AS job ON job.id = judgment.route_job_id
+         FROM route_decisions AS decision
+         INNER JOIN route_jobs AS job ON job.id = decision.route_job_id
          WHERE job.room_id = ?`,
       );
       const row = count.get(roomId) as { readonly count: number };
@@ -504,7 +514,7 @@ async function waitForRouteJudgmentCount(
     await new Promise<void>((resolve) => setTimeout(resolve, 20));
   }
   throw new Error(
-    `Route judgments did not settle at ${expected} within ${timeoutMs}ms (actual=${actual})`,
+    `Route decisions did not settle at ${expected} within ${timeoutMs}ms (actual=${actual})`,
   );
 }
 
@@ -1392,6 +1402,234 @@ function attachmentE2ePdf(): Buffer {
 }
 
 describe("authoritative server real-process harness", () => {
+  it("drives the Desktop Agent Settings runtime through real WS, Worker, and SQLite authority", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-ft07-desktop-authority-"));
+    const databasePath = join(directory, "authority.sqlite");
+    const snapshotCachePath = join(directory, "snapshot-cache.sqlite");
+    const accountId = "account-ft07-owner";
+    const passwordCanary = "ft07-desktop-password-canary";
+    const salt = Buffer.from("ft07-desktop-scrypt-salt", "utf8");
+    const identities = createScryptIdentityAdapter([{
+      accountId,
+      actorId: "human-a",
+      salt: salt.toString("base64url"),
+      hash: scryptSync(passwordCanary, salt, 64).toString("base64url"),
+    }]);
+    let roomId: string | undefined;
+    let server: AuthoritativeServer | undefined;
+    let loginClient: JsonWebSocketClient | undefined;
+    let runtime: ReturnType<typeof createDesktopAgentSettingsRuntime> | undefined;
+    let externalRuntime: ReturnType<typeof createDesktopAgentSettingsRuntime> | undefined;
+    try {
+      server = await startAuthoritativeServerForTest({
+        databasePath,
+        snapshotCachePath,
+        sharedAuthority: { maxOfflineReadLeaseMs: 60_000 },
+        listen: { host: "127.0.0.1", port: 0 },
+        actors,
+        identities,
+        invitationSecretKey: new Uint8Array(32).fill(47),
+        tenantAdministration: { bootstrapHumanActorIds: ["human-a"] },
+      }, {
+        initialize: async (facades) => {
+          const issued = await facades.auth.login({ accountId, secret: passwordCanary });
+          const authenticated = await facades.auth.authenticateSession(issued.accessToken);
+          const room = await facades.lifecycle.createRoom({
+            ...authenticated,
+            kind: "human",
+            requestId: "ft07-desktop-seed-room",
+            idempotencyKey: "ft07-desktop-seed-room",
+          }, { name: "FT-07 Desktop Authority" });
+          roomId = room.id;
+        },
+      });
+      if (roomId === undefined) throw new TypeError("FT-07 Room initialization did not complete");
+      loginClient = await JsonWebSocketClient.connect(server.url);
+      const issued = await loginClient.issueSession("ft07-desktop-login", {
+        accountId, secret: passwordCanary,
+      });
+      const session: IdentityAuthoritySession = {
+        actorId: issued.actorId,
+        sessionId: issued.sessionId,
+        accessToken: issued.accessToken,
+        expiresAt: issued.expiresAt,
+      };
+      let requestOrdinal = 0;
+      runtime = createDesktopAgentSettingsRuntime({
+        endpoint: server.url,
+        session: () => session,
+        webSocketFactory: (endpoint) => {
+          const socket = new NodeIdentityWebSocketAdapter(endpoint);
+          return {
+            addEventListener: socket.addEventListener.bind(socket),
+            removeEventListener: socket.removeEventListener.bind(socket),
+            send: socket.send.bind(socket),
+            close: () => socket.terminate(),
+          };
+        },
+        governance: async (requestedRoomId) => ({
+          roomId: requestedRoomId,
+          roomName: "FT-07 Desktop Authority",
+          lifecycle: "active",
+          roomRevision: 1,
+          roomRole: "owner",
+        }),
+        createRequestIdentity: () => {
+          requestOrdinal += 1;
+          return {
+            requestId: `ft07-desktop-authority-${requestOrdinal}`,
+            idempotencyKey: `ft07-desktop-authority-key-${requestOrdinal}`,
+          };
+        },
+        timeoutMs: 2_000,
+        syncIntervalMs: 20,
+      });
+      const observed: unknown[] = [];
+      let rendererState = createAgentSettingsInitialState();
+      runtime.onAuthorityMessage((message) => {
+        observed.push(message);
+        rendererState = applyAgentSettingsAuthorityMessage(rendererState, message);
+      });
+      const initial = await runtime.getSnapshot({ roomId });
+      rendererState = applyAgentSettingsAuthorityMessage(rendererState, {
+        type: "snapshot", snapshot: initial,
+      });
+      expect(initial).toMatchObject({
+        viewer: { actorId: "human-a", tenantAdministrator: true, roomRole: "owner" },
+        profileCatalog: { status: "available", profiles: [
+          expect.objectContaining({ actorId: "agent-a", status: "disabled", revision: 1 }),
+        ] },
+        room: { status: "available", roomId, assignments: [] },
+      });
+      await expect(runtime.submit({
+        requestId: "renderer-profile-create",
+        intent: {
+          command: "profile.create",
+          displayName: "FT-07 Research Agent",
+          globalResponsibility: "Research authoritative sources for the Room.",
+          capabilityCeiling: ["room.conversation.read", "room.memory.read", "room.respond"],
+          toolCeiling: ["room-memory.read"],
+        },
+      })).resolves.toMatchObject({
+        type: "ack", requestId: "renderer-profile-create", command: "profile.create",
+        replayed: false, acceptedRevision: 1, eventIds: [expect.any(String)],
+      });
+      const afterProfile = await runtime.getSnapshot({ roomId });
+      if (afterProfile.profileCatalog.status !== "available" ||
+          afterProfile.room.status !== "available") {
+        throw new TypeError("FT-07 authority snapshot unexpectedly became forbidden");
+      }
+      const profile = afterProfile.profileCatalog.profiles.find((candidate) =>
+        candidate.displayName === "FT-07 Research Agent");
+      if (profile === undefined) throw new TypeError("FT-07 Profile was not re-read from authority");
+      await expect(runtime.submit({
+        requestId: "renderer-assignment-create",
+        intent: {
+          command: "assignment.create",
+          roomId,
+          profileId: profile.profileId,
+          expectedRoomRevision: afterProfile.room.roomRevision,
+          roomResponsibility: "Answer only when mentioned and cite Room memory.",
+          participation: "on-mention",
+          capabilitySubset: ["room.conversation.read", "room.memory.read", "room.respond"],
+          toolSubset: ["room-memory.read"],
+        },
+      })).resolves.toMatchObject({
+        type: "ack", requestId: "renderer-assignment-create", command: "assignment.create",
+        replayed: false, acceptedRevision: 1, eventIds: [expect.any(String)],
+      });
+      const converged = await runtime.getSnapshot({ roomId });
+      rendererState = applyAgentSettingsAuthorityMessage(rendererState, {
+        type: "snapshot", snapshot: converged,
+      });
+      expect(converged.room).toMatchObject({
+        status: "available",
+        assignments: [{
+          profileId: profile.profileId,
+          participation: "on-mention",
+          availability: "noauth",
+          effectiveTools: ["room-memory.read"],
+          profileRevision: 1,
+          assignmentRevision: 1,
+        }],
+      });
+      expect(observed).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "ack", requestId: "renderer-profile-create" }),
+        expect.objectContaining({ type: "stable-event",
+          event: expect.objectContaining({ kind: "profile.upserted" }) }),
+        expect.objectContaining({ type: "ack", requestId: "renderer-assignment-create" }),
+        expect.objectContaining({ type: "stable-event",
+          event: expect.objectContaining({ kind: "assignment.upserted" }) }),
+      ]));
+
+      let externalOrdinal = 0;
+      externalRuntime = createDesktopAgentSettingsRuntime({
+        endpoint: server.url,
+        session: () => session,
+        webSocketFactory: (endpoint) => {
+          const socket = new NodeIdentityWebSocketAdapter(endpoint);
+          return {
+            addEventListener: socket.addEventListener.bind(socket),
+            removeEventListener: socket.removeEventListener.bind(socket),
+            send: socket.send.bind(socket),
+            close: () => socket.terminate(),
+          };
+        },
+        governance: async (requestedRoomId) => ({
+          roomId: requestedRoomId,
+          roomName: "FT-07 Desktop Authority",
+          lifecycle: "active",
+          roomRevision: 1,
+          roomRole: "owner",
+        }),
+        createRequestIdentity: () => {
+          externalOrdinal += 1;
+          return { requestId: `ft07-external-${externalOrdinal}`,
+            idempotencyKey: `ft07-external-key-${externalOrdinal}` };
+        },
+        timeoutMs: 2_000,
+        syncIntervalMs: 20,
+      });
+      const externalInitial = await externalRuntime.getSnapshot({ roomId });
+      if (externalInitial.room.status !== "available") {
+        throw new TypeError("external FT-07 Room authority was unavailable");
+      }
+      const externalAssignment = externalInitial.room.assignments[0];
+      if (externalAssignment === undefined) throw new TypeError("external Assignment was unavailable");
+      const externalAck = await externalRuntime.submit({
+        requestId: "renderer-external-pause",
+        intent: {
+          command: "assignment.pause", roomId,
+          assignmentId: externalAssignment.assignmentId,
+          expectedRoomRevision: externalInitial.room.roomRevision,
+          expectedAssignmentRevision: externalAssignment.assignmentRevision,
+        },
+      });
+      if (externalAck.type !== "ack") throw new TypeError("external Assignment pause was rejected");
+      await vi.waitFor(() => {
+        expect(observed).toEqual(expect.arrayContaining([expect.objectContaining({
+          type: "stable-event", eventId: externalAck.eventIds[0],
+          event: expect.objectContaining({ kind: "assignment.upserted",
+            assignment: expect.objectContaining({ paused: true, availability: "paused" }) }),
+        })]));
+        expect(rendererState.snapshot?.room.status).toBe("available");
+        expect(rendererState.snapshot?.room.status === "available"
+          ? rendererState.snapshot.room.assignments[0] : undefined).toMatchObject({
+          paused: true, availability: "paused",
+        });
+      }, { timeout: 2_000, interval: 20 });
+      const publicEvidence = JSON.stringify({ initial, converged, observed });
+      expect(publicEvidence).not.toContain(passwordCanary);
+      expect(publicEvidence).not.toContain(issued.accessToken);
+    } finally {
+      externalRuntime?.close();
+      runtime?.close();
+      loginClient?.terminate();
+      if (server !== undefined) await server.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("bounds silent child cleanup and escalates an ignored SIGTERM to SIGKILL", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-silent-child-"));
     const fixturePath = join(process.cwd(), "packages/server/dist/fixtures/authority-child.js");
@@ -2071,6 +2309,37 @@ describe("authoritative server real-process harness", () => {
            joined_at, configured_at, access_revision
          ) VALUES (?, 'human-b', 'human', 'member', NULL, '[]', ?, NULL, 0)`,
       ).run(roomId, "2026-08-19T00:00:00.000Z");
+      const profile = setup.prepare(
+        "SELECT id, revision FROM agent_profiles WHERE actor_id = 'agent-a' AND status = 'disabled'",
+      ).get();
+      if (typeof profile?.id !== "string" || typeof profile.revision !== "number") {
+        throw new Error("Structured v2 fixture lacked the disabled static Agent Profile");
+      }
+      const profileRevision = profile.revision + 1;
+      setup.prepare(
+        `UPDATE agent_profiles
+         SET revision = ?, status = 'enabled', updated_at = ?, source_kind = 'administrator_command'
+         WHERE id = ? AND revision = ? AND status = 'disabled'`,
+      ).run(profileRevision, "2026-08-24T00:00:00.000Z", profile.id, profile.revision);
+      setup.prepare(
+        `INSERT INTO agent_profile_revisions (
+           profile_id, revision, actor_id, display_name, global_responsibility,
+           status, capability_ceiling_json, tool_ceiling_json,
+           changed_by_human_actor_id, changed_at, operation
+         ) SELECT id, revision, actor_id, display_name, global_responsibility,
+                  status, capability_ceiling_json, tool_ceiling_json,
+                  'human-a', updated_at, 'enable'
+           FROM agent_profiles WHERE id = ?`,
+      ).run(profile.id);
+      seedCanonicalRoomAssignmentFixture(setup, {
+        assignmentId: "message-v2-assignment-agent-a",
+        roomId,
+        profileId: profile.id,
+        actorId: "agent-a",
+        participation: "active",
+        capabilitySubset: [],
+        toolSubset: [],
+      });
       setup.close();
 
       started = await spawnAuthorityChild({ directory, actors: messageActors, identities });
@@ -3132,7 +3401,7 @@ describe("authoritative server real-process harness", () => {
       client = await JsonWebSocketClient.connect(seeded.url);
       await client.login("seed-readback-login");
       const seededRoomId = await discoverRoom(client);
-      await waitForRouteJudgmentCount(directory, seededRoomId, 1);
+      await waitForRouteDecisionCount(directory, seededRoomId, 1);
       const seededSnapshot = await repairRecords(client, seededRoomId);
       client.close();
       await stopChild(first);
@@ -4048,10 +4317,10 @@ describe("authoritative server real-process harness", () => {
       const stressA = await JsonWebSocketClient.connect(stress.url);
       clients.push(stressA);
       const stressAccessToken = await stressA.login("stress-a-login");
-      await waitForRouteJudgmentCount(
+      await waitForRouteDecisionCount(
         directory,
         roomId,
-        mixed.mixedCounts["route-judgment"] ?? 0,
+        mixed.mixedCounts["route-job"] ?? 0,
       );
       transportA.replaceClient(stressA);
       transportA.beforeStreamingSnapshotComplete = () => {
@@ -4124,7 +4393,7 @@ describe("authoritative server real-process harness", () => {
       expect([stressPagesB, stressPagesC])
         .toEqual([completeMaterializedPages, completeMaterializedPages]);
 
-      expect(mixed.total).toBe(13_507);
+      expect(mixed.total).toBe(13_503);
       expect(mixed.distinctMembershipActors).toBe(2_000);
       expect(mixed.mixedCounts).toEqual({
         room: 1,
@@ -4137,7 +4406,7 @@ describe("authoritative server real-process harness", () => {
         "agent-execution": 500,
         calibration: 1_000,
         "route-job": 4,
-        "route-judgment": 4,
+        "route-judgment": 0,
       });
       const authoritativeHeadSeq = readRoomHeadSeq(directory, roomId);
       const authorityChecksum = cacheA.roomChecksum(roomId);

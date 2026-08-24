@@ -282,6 +282,42 @@ function sameDirectIntent(row: UnknownRow | undefined, input: CreateDirectInvoca
     (row.status === "pending" || row.status === "claimed" || row.status === "cancelled");
 }
 
+function readPersistedDirectBinding(
+  database: import("node:sqlite").DatabaseSync,
+  intentId: string,
+): DirectIntentAuthorityBinding {
+  const row = database.prepare(
+    `SELECT intent.target_agent_id AS actorId,
+            binding.profile_id AS profileId,
+            binding.profile_revision AS profileRevision,
+            binding.assignment_id AS assignmentId,
+            binding.assignment_revision AS assignmentRevision,
+            binding.access_revision AS accessRevision,
+            assignment_revision.participation
+     FROM direct_agent_invocation_authority_bindings AS binding
+     JOIN agent_invocation_intents AS intent ON intent.id = binding.intent_id
+     JOIN room_agent_assignment_revisions AS assignment_revision
+       ON assignment_revision.assignment_id = binding.assignment_id
+      AND assignment_revision.revision = binding.assignment_revision
+     WHERE binding.intent_id = ?`,
+  ).get(intentId) as UnknownRow | undefined;
+  if (row === undefined || !text(row.actorId) || !text(row.profileId) ||
+      !positive(row.profileRevision) || !text(row.assignmentId) ||
+      !positive(row.assignmentRevision) || !nonnegative(row.accessRevision) ||
+      (row.participation !== "active" && row.participation !== "on-mention")) {
+    throw new DirectIntentAuthorityError("target_not_bound");
+  }
+  return Object.freeze({
+    actorId: row.actorId,
+    profileId: row.profileId,
+    profileRevision: row.profileRevision,
+    assignmentId: row.assignmentId,
+    assignmentRevision: row.assignmentRevision,
+    accessRevision: row.accessRevision,
+    participation: row.participation,
+  });
+}
+
 export function createDirectInvocationIntent(
   transaction: AuthorityTransactionView,
   input: CreateDirectInvocationIntentInput,
@@ -306,7 +342,6 @@ export function createDirectInvocationIntent(
   }
 
   return useAuthorityTransactionDatabase(transaction, (database) => {
-    const binding = readDirectFacts(database, transaction.roomId, input.requesterActorId, input.origin);
     const existing = database.prepare(
       `SELECT id, room_id AS roomId, source_message_id AS sourceMessageId,
               target_agent_id AS targetAgentId, requester_actor_id AS requesterActorId,
@@ -324,6 +359,7 @@ export function createDirectInvocationIntent(
       if (!sameDirectIntent(existing, input)) {
         throw new DirectIntentAuthorityError("idempotency_conflict");
       }
+      const binding = readPersistedDirectBinding(database, input.intentId);
       return Object.freeze({
         disposition: "already-created" as const,
         intentId: input.intentId,
@@ -335,6 +371,13 @@ export function createDirectInvocationIntent(
         binding,
       });
     }
+
+    const binding = readDirectFacts(
+      database,
+      transaction.roomId,
+      input.requesterActorId,
+      input.origin,
+    );
 
     database.prepare(
       `INSERT INTO agent_invocation_intents (
@@ -348,6 +391,19 @@ export function createDirectInvocationIntent(
       input.intentId, transaction.roomId, input.origin.messageId, input.origin.targetActorId,
       input.requesterActorId, input.createdAt, input.origin.messageId,
       input.origin.targetOutcomeId, input.lineageId, input.turnId,
+    );
+    database.prepare(
+      `INSERT INTO direct_agent_invocation_authority_bindings (
+         intent_id, profile_id, profile_revision, assignment_id,
+         assignment_revision, access_revision
+       ) VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      input.intentId,
+      binding.profileId,
+      binding.profileRevision,
+      binding.assignmentId,
+      binding.assignmentRevision,
+      binding.accessRevision,
     );
     return Object.freeze({
       disposition: "created" as const,

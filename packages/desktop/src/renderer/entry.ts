@@ -3,6 +3,8 @@ import type { GovernanceBridge } from "../governance/contracts.js";
 import type { MessageAuthorityBridge } from "../message-authority/contracts.js";
 import type { AttachmentAuthorityBridge } from "../attachment-authority/contracts.js";
 import type { MemoryAuthorityBridge } from "../memory-authority/contracts.js";
+import type { AgentSettingsBridge } from "../agent-profile-routing/contracts.js";
+import { mountAgentSettingsBridgeSurface } from "./agent-settings/bridge-adapter.js";
 import {
   mountGovernanceSurface,
   renderM2PrimitivesPreview,
@@ -35,6 +37,8 @@ export interface DesktopRendererEntryPorts {
     bridge: MemoryAuthorityBridge,
     roomId: string,
   ) => () => void;
+  readonly mountAgentSettingsSurface?: (root: HTMLElement, bridge: AgentSettingsBridge,
+    roomId: string) => () => void;
 }
 
 const DEFAULT_PORTS: DesktopRendererEntryPorts = Object.freeze({
@@ -79,6 +83,9 @@ const DEFAULT_PORTS: DesktopRendererEntryPorts = Object.freeze({
       reducedMotion: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false,
     },
   ),
+  mountAgentSettingsSurface: (root: HTMLElement, bridge: AgentSettingsBridge, roomId: string) => mountAgentSettingsBridgeSurface(
+    root, bridge, roomId, { reducedMotion: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false,
+      onClose: () => history.back() }),
 });
 
 const encoder = new TextEncoder();
@@ -139,10 +146,23 @@ export function mountDesktopRendererEntry(
   ports: DesktopRendererEntryPorts = DEFAULT_PORTS,
   attachmentAuthority?: AttachmentAuthorityBridge,
   memoryAuthority?: MemoryAuthorityBridge,
+  agentSettings?: AgentSettingsBridge,
 ): (() => void) | undefined {
   const route = new URLSearchParams(search);
   root.dataset.governanceRouteContract = "closed-v1";
   root.dataset.messageAuthorityRouteContract = "closed-v2";
+  root.dataset.agentSettingsRouteContract = "closed-v1";
+
+  if (route.has("agent-settings-room")) {
+    const roomId = (() => { const values = route.getAll("agent-settings-room");
+      return values.length === 1 && [...route.keys()].length === 1 && values[0]!.trim() === values[0] &&
+        values[0]!.length > 0 ? values[0] : undefined; })();
+    if (roomId === undefined || agentSettings === undefined || ports.mountAgentSettingsSurface === undefined) {
+      renderGovernanceRouteFailure(root, "Agent Settings bridge 或 Room 标识无效；设置保持锁定。");
+      return undefined;
+    }
+    return ports.mountAgentSettingsSurface(root, agentSettings, roomId);
+  }
 
   if (route.has("message-room")) {
     const roomId = messageRoomId(route);

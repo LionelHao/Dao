@@ -3,9 +3,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
-import { seedCanonicalAgentProfileFixture } from "../fixtures/agent-authority-fixture.js";
 import {
-  executeAgentDatabaseCommand,
+  seedCanonicalAgentProfileFixture,
+  seedCanonicalRoomAssignmentFixture,
+} from "../fixtures/agent-authority-fixture.js";
+import {
   executeHumanDatabaseCommand,
   executeRouteAuthorityOperation,
   executeRuntimeAuthorityOperation,
@@ -30,11 +32,11 @@ function fixture(): DatabaseSync {
   const database = new DatabaseSync(join(directory, "authority.sqlite"));
   migrateAuthorityDatabase(database);
   database.exec(`
-    INSERT INTO actors (id, kind, display_name, tool_permissions_json)
+    INSERT INTO actors (id, kind, display_name, tool_permissions_json, readiness)
     VALUES
-      ('human-1', 'human', 'Human One', '[]'),
-      ('agent-1', 'agent', 'Agent One', '[]'),
-      ('agent-2', 'agent', 'Agent Two', '[]');
+      ('human-1', 'human', 'Human One', '[]', 'ready'),
+      ('agent-1', 'agent', 'Agent One', '[]', 'busy'),
+      ('agent-2', 'agent', 'Agent Two', '[]', 'busy');
     INSERT INTO rooms (id, name, status, created_at)
     VALUES ('room-1', 'Room', 'active', '2026-08-17T00:00:00.000Z');
     INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
@@ -51,11 +53,19 @@ function fixture(): DatabaseSync {
       ('room-1', 'agent-2', 'agent', NULL, 'active', NULL, '2026-08-17T00:00:00.000Z');
     UPDATE rooms SET owner_actor_id = 'human-1', governance_revision = 1 WHERE id = 'room-1';
   `);
-  seedCanonicalAgentProfileFixture(database, {
+  const profile1 = seedCanonicalAgentProfileFixture(database, {
     actorId: "agent-1", displayName: "Agent One",
   });
-  seedCanonicalAgentProfileFixture(database, {
+  const profile2 = seedCanonicalAgentProfileFixture(database, {
     actorId: "agent-2", displayName: "Agent Two",
+  });
+  seedCanonicalRoomAssignmentFixture(database, {
+    assignmentId: "assignment-agent-1", roomId: "room-1", profileId: profile1,
+    actorId: "agent-1", participation: "active",
+  });
+  seedCanonicalRoomAssignmentFixture(database, {
+    assignmentId: "assignment-agent-2", roomId: "room-1", profileId: profile2,
+    actorId: "agent-2", participation: "active",
   });
   database.prepare(
     `INSERT INTO session_families (
@@ -77,15 +87,10 @@ const humanContext = {
   principal: { accountId: "account-1", actorId: "human-1" },
   requestId: "human-command", idempotencyKey: "human-command",
 } as const;
-const agentContext = {
-  kind: "agent", agent: { actorId: "agent-2", kind: "agent" },
-  requestId: "agent-command", idempotencyKey: "agent-command",
-} as const;
-
 function sendAgentSource(database: DatabaseSync, index: number): string {
   const id = `message-agent-source-${index}`;
-  executeAgentDatabaseCommand(database, {
-    context: { ...agentContext, requestId: id, idempotencyKey: id },
+  executeHumanDatabaseCommand(database, {
+    context: { ...humanContext, requestId: id, idempotencyKey: id },
     command: { type: "message.send", roomId: "room-1", payload: {
       id, roomId: "room-1", body: `source ${index}`,
       sentAt: new Date(t0 + index * 1_000).toISOString(),
@@ -96,12 +101,67 @@ function sendAgentSource(database: DatabaseSync, index: number): string {
 }
 
 function invoke(database: DatabaseSync, sourceMessageId: string, executionId: string, targetAgentId: string): void {
+  const authority = database.prepare(
+    `SELECT profile.id AS profileId, profile.revision AS profileRevision,
+            assignment.id AS assignmentId, assignment.revision AS assignmentRevision,
+            membership.access_revision AS accessRevision
+     FROM agent_profiles AS profile
+     JOIN room_agent_assignments AS assignment
+       ON assignment.profile_id = profile.id AND assignment.room_id = 'room-1'
+      AND assignment.agent_actor_id = profile.actor_id AND assignment.status = 'current'
+     JOIN room_memberships AS membership
+       ON membership.room_id = assignment.room_id
+      AND membership.actor_id = assignment.agent_actor_id
+     WHERE profile.actor_id = ?`,
+  ).get(targetAgentId) as {
+    profileId: string; profileRevision: number; assignmentId: string;
+    assignmentRevision: number; accessRevision: number;
+  };
+  const targetId = `target-${executionId}`;
+  const intentId = `intent-${executionId}`;
+  const createdAt = new Date(t0 + 10_000).toISOString();
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    database.prepare(
+      `INSERT INTO message_mentions (
+         message_id, room_id, target_id, target_kind, target_actor_id,
+         range_start_utf16, range_end_utf16, target_order
+       ) VALUES (?, 'room-1', ?, 'agent-invocation', ?, 0, 1, 0)`,
+    ).run(sourceMessageId, targetId, targetAgentId);
+    database.prepare(
+      `INSERT INTO agent_invocation_intents (
+         id, room_id, source_message_id, target_agent_id, requester_actor_id,
+         intent_kind, execution_id, created_at, message_transaction_id, target_id,
+         source_revision, lineage_id, turn_id, origin_kind, status
+       ) VALUES (?, 'room-1', ?, ?, 'human-1', 'direct_mention', NULL, ?, ?, ?,
+                 1, ?, ?, 'message_target', 'pending')`,
+    ).run(intentId, sourceMessageId, targetAgentId, createdAt,
+      sourceMessageId, targetId, `lineage-${executionId}`, `turn-${executionId}`);
+    database.prepare(
+      `INSERT INTO direct_agent_invocation_authority_bindings (
+         intent_id, profile_id, profile_revision, assignment_id,
+         assignment_revision, access_revision
+       ) VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(intentId, authority.profileId, authority.profileRevision, authority.assignmentId,
+      authority.assignmentRevision, authority.accessRevision);
+    database.prepare(
+      `INSERT INTO message_target_outcomes (
+         message_id, room_id, target_id, target_actor_id, target_kind, status,
+         request_intent_id, invocation_intent_id, rejection_code, created_at
+       ) VALUES (?, 'room-1', ?, ?, 'agent-invocation', 'invocation-intent-created',
+                 NULL, ?, NULL, ?)`,
+    ).run(sourceMessageId, targetId, targetAgentId, intentId, createdAt);
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
   executeRuntimeAuthorityOperation(database, {
     type: "runtime.invoke", context: {
-      ...agentContext, requestId: `invoke-${executionId}`, idempotencyKey: `invoke-${executionId}`,
+      ...humanContext, requestId: `invoke-${executionId}`, idempotencyKey: `invoke-${executionId}`,
     },
     intent: { kind: "direct_mention", roomId: "room-1", sourceMessageId, targetAgentId },
-    executionId, intentId: `intent-${executionId}`, providerId: "provider", modelId: "model",
+    executionId, intentId, providerId: "provider", modelId: "model",
     now: t0 + 10_000,
   });
 }
@@ -194,6 +254,7 @@ describe("real SQLite human-preemption authority", () => {
     recallHuman("human-recalled-before-claim", 22_003);
     expect(() => executeRouteAuthorityOperation(database, {
       type: "route.claim",
+      agentProviderReady: true,
       sourceMessageId: "human-recalled-before-claim",
       now: t0 + 22_004,
     })).toThrow(/recalled|fence|conflict|no longer active/i);
@@ -234,7 +295,10 @@ describe("real SQLite human-preemption authority", () => {
     migrateAuthorityDatabase(database);
     expect(executeRuntimeAuthorityOperation(database, {
       type: "runtime.list-pending-human-fences", now: t0 + 20_000,
-    })).toEqual({ kind: "pending-human-fences", sourceHumanMessageIds: ["human-message-1"] });
+    })).toEqual({
+      kind: "pending-human-fences",
+      sourceHumanMessageIds: [...sources, "human-message-1"],
+    });
     expect(() => executeRuntimeAuthorityOperation(database, {
       type: "runtime.claim", executionId: "execution-queued", attemptSeq: 1,
       now: t0 + 20_001,
@@ -294,25 +358,47 @@ describe("real SQLite human-preemption authority", () => {
     expect(routed).toMatchObject({ kind: "human-fence-route", replayed: false });
     if (routed.kind !== "human-fence-route") throw new Error("unexpected route result");
     const claim = executeRouteAuthorityOperation(database, {
-      type: "route.claim", sourceMessageId: "human-message-1", now: t0 + 20_005,
+      type: "route.claim", sourceMessageId: "human-message-1",
+      agentProviderReady: true, now: t0 + 20_005,
     });
     if (claim.kind !== "route-claimed") throw new Error("unexpected claim result");
-    executeRouteAuthorityOperation(database, {
+    const completedRoute = executeRouteAuthorityOperation(database, {
       type: "route.complete", routeJobId: claim.job.id, attempt: claim.job.currentAttempt,
       judgments: [
         { id: "judgment-agent-1", routeJobId: claim.job.id, sourceMessageId: "human-message-1",
           agentId: "agent-1", outcome: "will_respond", reasonCode: "domain_match",
           reasonText: "selected after human fence", routeAttempt: 1,
           decidedAt: new Date(t0 + 20_006).toISOString() },
-        { id: "judgment-agent-2", routeJobId: claim.job.id, sourceMessageId: "human-message-1",
-          agentId: "agent-2", outcome: "suppressed", reasonCode: "provider_omitted",
-          reasonText: "not selected", routeAttempt: 1,
-          decidedAt: new Date(t0 + 20_006).toISOString() },
       ],
       intents: [{ kind: "routed_candidate", roomId: "room-1", sourceMessageId: "human-message-1",
         targetAgentId: "agent-1", reasonCode: "domain_match", reasonText: "selected after human fence",
         priority: 3 }],
+      agentProviderReady: true,
       now: t0 + 20_006,
+    });
+    if (completedRoute.kind !== "route-completed" || completedRoute.handoffs.length !== 1) {
+      throw new Error("unexpected durable route handoff");
+    }
+    const durableHandoff = completedRoute.handoffs[0]!;
+    database.close();
+    database = new DatabaseSync(databasePath);
+    migrateAuthorityDatabase(database);
+    expect(executeRouteAuthorityOperation(database, {
+      type: "route.handoff.recover", now: t0 + 20_006,
+    })).toMatchObject({
+      kind: "route-handoff-recovery",
+      intents: [{
+        intentId: durableHandoff.intentId,
+        routeJobId: claim.job.id,
+        roomId: "room-1",
+        actorId: "agent-1",
+        status: "pending",
+      }],
+    });
+    executeRouteAuthorityOperation(database, {
+      type: "route.handoff.claim", roomId: "room-1",
+      intentId: durableHandoff.intentId,
+      providerReady: true, now: t0 + 20_006,
     });
     const replacement = executeRuntimeAuthorityOperation(database, {
       type: "runtime.enqueue-fence-replacements", routeJobId: routed.routeJobId,
@@ -375,6 +461,66 @@ describe("real SQLite human-preemption authority", () => {
     database.close();
   });
 
+  it("suppresses a selected Agent when frozen access changes after claim and before completion", () => {
+    const database = fixture();
+    database.prepare(
+      `UPDATE room_memberships SET participation = 'on-mention'
+       WHERE room_id = 'room-1' AND actor_id = 'agent-2'`,
+    ).run();
+    executeHumanDatabaseCommand(database, {
+      context: { ...humanContext, requestId: "terminal-revalidation",
+        idempotencyKey: "terminal-revalidation" },
+      command: { type: "message.send", roomId: "room-1", payload: {
+        id: "terminal-revalidation", roomId: "room-1",
+        body: "Revalidate authority after provider routing", sentAt: new Date(t0 + 40_000).toISOString(),
+      } },
+      now: t0 + 40_000,
+    });
+    executeRuntimeAuthorityOperation(database, {
+      type: "runtime.cancel-for-human-fence", sourceHumanMessageId: "terminal-revalidation",
+      now: t0 + 40_001,
+    });
+    executeRuntimeAuthorityOperation(database, {
+      type: "runtime.create-route-after-human-fence", sourceHumanMessageId: "terminal-revalidation",
+      now: t0 + 40_002,
+    });
+    const claim = executeRouteAuthorityOperation(database, {
+      type: "route.claim", sourceMessageId: "terminal-revalidation",
+      agentProviderReady: true, now: t0 + 40_003,
+    });
+    if (claim.kind !== "route-claimed") throw new Error("unexpected route claim");
+    database.prepare(
+      `UPDATE room_memberships SET access_revision = access_revision + 1
+       WHERE room_id = 'room-1' AND actor_id = 'agent-1'`,
+    ).run();
+    const completed = executeRouteAuthorityOperation(database, {
+      type: "route.complete", routeJobId: claim.job.id, attempt: claim.job.currentAttempt,
+      judgments: [{
+        id: "terminal-revalidation-judgment", routeJobId: claim.job.id,
+        sourceMessageId: "terminal-revalidation", agentId: "agent-1",
+        outcome: "will_respond", reasonCode: "domain_match",
+        reasonText: "provider selected before authority changed", routeAttempt: claim.job.currentAttempt,
+        decidedAt: new Date(t0 + 40_004).toISOString(),
+      }],
+      intents: [{ kind: "routed_candidate", roomId: "room-1",
+        sourceMessageId: "terminal-revalidation", targetAgentId: "agent-1",
+        reasonCode: "domain_match", reasonText: "provider selected before authority changed", priority: 1 }],
+      agentProviderReady: true,
+      now: t0 + 40_004,
+    });
+    expect(completed).toMatchObject({ kind: "route-completed", intents: [], handoffs: [] });
+    expect(database.prepare(
+      `SELECT outcome, reason_code AS reasonCode, reason_text AS reasonText
+       FROM route_judgments WHERE id = 'terminal-revalidation-judgment'`,
+    ).get()).toEqual({ outcome: "suppressed", reasonCode: "permission_denied",
+      reasonText: "authority_changed:access_revision_stale" });
+    expect(database.prepare(
+      `SELECT COUNT(*) AS count FROM routed_agent_invocation_intents
+       WHERE source_message_id = 'terminal-revalidation'`,
+    ).get()).toEqual({ count: 0 });
+    database.close();
+  });
+
   it("recovers a durable human fence exactly once across real AuthorityWorker restarts", async () => {
     const database = fixture();
     const source = sendAgentSource(database, 1);
@@ -394,7 +540,7 @@ describe("real SQLite human-preemption authority", () => {
     await expect(worker.executeRuntime({
       type: "runtime.list-pending-human-fences", now: t0 + 20_001,
     })).resolves.toEqual({
-      kind: "pending-human-fences", sourceHumanMessageIds: ["human-worker-restart"],
+      kind: "pending-human-fences", sourceHumanMessageIds: [source, "human-worker-restart"],
     });
     const first = await worker.executeRuntime({
       type: "runtime.cancel-for-human-fence", sourceHumanMessageId: "human-worker-restart",
@@ -413,7 +559,7 @@ describe("real SQLite human-preemption authority", () => {
     })).resolves.toMatchObject({ kind: "human-fence-route", replayed: false });
     await expect(worker.executeRuntime({
       type: "runtime.list-pending-human-fences", now: t0 + 20_005,
-    })).resolves.toEqual({ kind: "pending-human-fences", sourceHumanMessageIds: [] });
+    })).resolves.toEqual({ kind: "pending-human-fences", sourceHumanMessageIds: [source] });
     await worker.close();
 
     const inspection = new DatabaseSync(databasePath, { readOnly: true });

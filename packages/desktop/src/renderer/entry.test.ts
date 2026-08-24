@@ -4,6 +4,7 @@ import type { GovernanceBridge } from "../governance/contracts.js";
 import type { MessageAuthorityBridge } from "../message-authority/contracts.js";
 import type { AttachmentAuthorityBridge } from "../attachment-authority/contracts.js";
 import type { MemoryAuthorityBridge } from "../memory-authority/contracts.js";
+import type { AgentSettingsBridge } from "../agent-profile-routing/contracts.js";
 import { mountDesktopRendererEntry } from "./entry.js";
 
 const bridge = {} as IdentityBridge;
@@ -11,6 +12,7 @@ const governance = {} as GovernanceBridge;
 const messageAuthority = {} as MessageAuthorityBridge;
 const attachmentAuthority = {} as AttachmentAuthorityBridge;
 const memoryAuthority = {} as MemoryAuthorityBridge;
+const agentSettings = {} as AgentSettingsBridge;
 
 function ports() {
   return {
@@ -21,10 +23,18 @@ function ports() {
     mountGovernanceSurface: vi.fn(() => vi.fn()),
     mountMessageAuthoritySurface: vi.fn(() => vi.fn()),
     mountMemoryAuthoritySurface: vi.fn(() => vi.fn()),
+    mountAgentSettingsSurface: vi.fn(() => vi.fn()),
   };
 }
 
 describe("Desktop renderer route entry", () => {
+  it("mounts the real closed Agent Settings route", () => {
+    const root = document.createElement("main"); const renderers = ports();
+    mountDesktopRendererEntry(root, "?agent-settings-room=room-1", bridge, governance,
+      messageAuthority, renderers, attachmentAuthority, memoryAuthority, agentSettings);
+    expect(renderers.mountAgentSettingsSurface).toHaveBeenCalledWith(root, agentSettings, "room-1");
+    expect(root.dataset.agentSettingsRouteContract).toBe("closed-v1");
+  });
   it.each([
     ["?m2-primitives", "renderM2PrimitivesPreview"],
     ["?join-review", "renderRoomJoinReview"],

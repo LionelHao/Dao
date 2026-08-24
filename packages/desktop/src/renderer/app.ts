@@ -784,7 +784,7 @@ function createStatus(initialText: string, id?: string): HTMLElement {
   return status;
 }
 
-function updateStatus(status: HTMLElement, state: "idle" | "error" | "success", text: string): void {
+function updateStatus(status: HTMLElement, state: "idle" | "pending" | "error" | "success", text: string): void {
   status.dataset.state = state;
   status.textContent = text;
 }
@@ -904,10 +904,12 @@ function renderHumanInvitationModule(
     };
 
     setControlInvalid(actorInput, false);
+    button.disabled = true;
+    updateStatus(status, "pending", `正在提交给 ${inviteeActorId} 的邀请；等待 server ACK。`);
     try {
       callback(request);
-      updateStatus(status, "success", `邀请已发送给 ${inviteeActorId}，等待对方接受。`);
     } catch {
+      button.disabled = false;
       updateStatus(status, "error", "邀请未能提交，请重试。");
     }
   });
@@ -928,7 +930,7 @@ function renderAgentConfigurationModule(
     `${sequence}-agent`,
     "Agent 角色",
     "配置加入房间",
-    "配置提交后立即生效，无需接受。请选择参与度与工具权限。",
+    "无需接受；提交后等待 server ACK 与 stable event，再显示权威生效状态。",
   );
   const form = document.createElement("form");
   const agentSelect = document.createElement("select");
@@ -1159,10 +1161,12 @@ function renderAgentConfigurationModule(
     };
 
     setControlInvalid(permissionFieldset, false);
+    button.disabled = true;
+    updateStatus(status, "pending", `正在提交 ${agent.displayName} 的配置；等待 server ACK / stable event。`);
     try {
       callback(request);
-      updateStatus(status, "success", `${agent.displayName} 的配置已提交并立即生效。`);
     } catch {
+      button.disabled = false;
       updateStatus(status, "error", "Agent 配置未能提交，请重试。");
     }
   });

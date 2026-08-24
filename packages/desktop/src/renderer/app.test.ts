@@ -1114,7 +1114,7 @@ describe("room join controls", () => {
     expect(human?.nextElementSibling).toBe(agent);
     expect(human?.textContent).toContain("接受或拒绝");
     expect(human?.textContent).toContain("等待对方接受");
-    expect(agent?.textContent).toContain("立即生效");
+    expect(agent?.textContent).toContain("stable event");
     expect(agent?.textContent).toContain("无需接受");
     expect(agent?.textContent).toContain("参与度");
     expect(agent?.textContent).toContain("工具权限");
@@ -1134,6 +1134,9 @@ describe("room join controls", () => {
     expect(agentSelect).not.toBeNull();
     expect(agent?.querySelector(`label[for='${agentSelect?.id}']`)?.textContent).toContain("Agent");
     expect(participationSelect).not.toBeNull();
+    expect(Array.from(participationSelect?.options ?? [], (option) => option.value)).toEqual([
+      "", "active", "on-mention",
+    ]);
     expect(agent?.querySelector(`label[for='${participationSelect?.id}']`)?.textContent).toContain(
       "参与度",
     );
@@ -1221,7 +1224,8 @@ describe("room join controls", () => {
       "kind",
       "roomId",
     ]);
-    expect(status?.textContent).toContain("等待对方接受");
+    expect(status?.textContent).toContain("等待 server ACK");
+    expect(status?.dataset.state).toBe("pending");
     expect(actorInput?.getAttribute("aria-invalid")).toBe("false");
   });
 
@@ -1316,7 +1320,8 @@ describe("room join controls", () => {
       "roomId",
       "toolPermissions",
     ]);
-    expect(status?.textContent).toContain("立即生效");
+    expect(status?.textContent).toContain("等待 server ACK / stable event");
+    expect(status?.dataset.state).toBe("pending");
     expect(agentSelect?.getAttribute("aria-invalid")).toBe("false");
     expect(participation?.getAttribute("aria-invalid")).toBe("false");
     expect(permissionFieldset?.getAttribute("aria-invalid")).toBe("false");

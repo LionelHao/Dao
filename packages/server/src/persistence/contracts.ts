@@ -17,6 +17,7 @@ import {
   isMessage,
   isOpenItem,
   isOpenItemAgentFailure,
+  isRoomAgentAssignmentProjection,
   isRouteJob,
   isRouteJudgment,
 } from "@native-im/core";
@@ -1172,6 +1173,17 @@ function validRoomEventPayload(
   }
   if (type === "agent.configured") {
     return exact(payload, ["membership"]) && strictAgentMembership(payload.membership);
+  }
+  if (type === "room.agent-assignment.changed") {
+    if (payload.change === "removed") {
+      return exact(payload, [
+        "change", "roomRevision", "assignmentId", "actorId", "assignmentRevision",
+      ]) && count(payload.roomRevision) && text(payload.assignmentId) && text(payload.actorId) &&
+        count(payload.assignmentRevision, 1);
+    }
+    return (payload.change === "upserted" || payload.change === "availability-changed") &&
+      exact(payload, ["change", "roomRevision", "assignment"]) &&
+      count(payload.roomRevision) && isRoomAgentAssignmentProjection(payload.assignment, roomId);
   }
   if (type === "room.message.accepted") {
     return strictMessage(payload) && payload.roomId === roomId && payload.authorId === eventActorId;

@@ -34,7 +34,10 @@ function makeInput(): ContextCompilerInputV1 {
     version: "context_compiler_input_v1",
     invocation: { invocationId: "invocation-1", executionId: "execution-1", roomId: "room-1",
       intent: { kind: "direct_mention", sourceMessageId: "trigger", targetAgentId: "agent-1", reasonCode: "direct_mention", reasonText: "direct mandatory address" } },
-    agent: { agentId: "agent-1", displayName: "Build Agent", responsibility: { availability: "unavailable", reason: "ft07_not_delivered" } },
+    agent: { agentId: "agent-1", profileId: "profile-1", assignmentId: "assignment-1",
+      displayName: "Build Agent", globalResponsibility: "Build engineering", roomResponsibility: "Own releases",
+      participation: "on-mention", availability: "ready", effectiveCapabilities: ["room.conversation.read", "room.respond"],
+      effectiveTools: ["repository.git-status", "room-memory.read"], revisions: { profile: 2, assignment: 3, access: 4 } },
     room: { roomId: "room-1", name: "Release room", goal: { availability: "unavailable", reason: "ft09_not_delivered" } },
     trigger: {
       triggerType: "message",
@@ -87,8 +90,8 @@ function makeInput(): ContextCompilerInputV1 {
     attachments: [candidate("attachment-1", 7, "Extracted release checklist.", { source: source("attachment-1", 7, "attachment_extraction"), segment: { index: 0, count: 2, startByte: 0, endByte: 28 } })],
     project: { availability: "disabled", reason: "ft09_not_delivered" },
     tools: [
-      { id: "z-tool", description: "Last", effect: "read-only", inputSchemaCanonical: "{}" },
-      { id: "a-tool", description: "First", effect: "read-only", inputSchemaCanonical: "{}" },
+      { id: "room-memory.read", description: "Last", effect: "read-only", inputSchemaCanonical: "{}" },
+      { id: "repository.git-status", description: "First", effect: "read-only", inputSchemaCanonical: "{}" },
     ],
     trusted: { system: "Follow room authorization.", developerPolicy: "Cite manifest labels only." },
   };
@@ -111,7 +114,9 @@ describe("compileContextV1", () => {
     expect(first.envelope.groupContent.filter((item) => item.section === "memory").map((item) => item.memoryKind)).toEqual(["goal", "decision"]);
     expect(first.envelope.groupContent[0]?.mentions.map((mention) => mention.targetActorId)).toEqual(["agent-1", "human-2"]);
     expect(first.envelope.groupContent[0]?.replyTo).toEqual({ sourceId: "message-0", revision: 2 });
-    expect(first.envelope.availableTools.map((tool) => tool.id)).toEqual(["a-tool", "z-tool"]);
+    expect(first.envelope.availableTools.map((tool) => tool.id)).toEqual([
+      "repository.git-status", "room-memory.read",
+    ]);
     expect(first.envelope.projectContext).toEqual({ availability: "disabled", reason: "ft09_not_delivered" });
     expect(first.manifest.items.map((item) => item.citationLabel)).toEqual([
       "ctx-0001", "ctx-0002", "ctx-0003", "ctx-0004", "ctx-0005", "ctx-0006", "ctx-0007",
@@ -119,9 +124,17 @@ describe("compileContextV1", () => {
     expect(first.manifest.manifestHash).toMatch(/^[0-9a-f]{64}$/);
     expect(first.envelopeSha256).toMatch(/^[0-9a-f]{64}$/);
     expect(first.manifestSha256).toMatch(/^[0-9a-f]{64}$/);
-    expect(first.envelopeSha256).toBe("adbfe4d2da61fe3285979e6934e4c8d7d66b55c80891ce40b93b70d532c2f470");
-    expect(first.manifestSha256).toBe("a6ab70c0b13914270b6061eb06d0f94aa4fce646d1f624fe78a492d63e87340b");
-    expect(first.envelope.trusted.developer.agent.responsibility).toEqual({ availability: "unavailable", reason: "ft07_not_delivered" });
+    expect(first.envelopeSha256).toBe("01af78b315eef321806bb03820b77d1a413437640f004996d134d920b331accc");
+    expect(first.manifestSha256).toBe("cd44fe4da1b2a2c7f79abaf7bc2822d6e113d25a2b39b106fc460ac072975a95");
+    expect(first.envelope.trusted.developer.agent).toMatchObject({
+      profileId: "profile-1",
+      assignmentId: "assignment-1",
+      globalResponsibility: "Build engineering",
+      roomResponsibility: "Own releases",
+      participation: "on-mention",
+      availability: "ready",
+      revisions: { profile: 2, assignment: 3, access: 4 },
+    });
     expect(first.envelope.trusted.developer.room.goal).toEqual({ availability: "unavailable", reason: "ft09_not_delivered" });
     expect(first.envelope.trusted.developer.triggerType).toBe("message");
     expect(isContextCompileResultV1(first)).toBe(true);
@@ -262,7 +275,7 @@ describe("compileContextV1", () => {
     if (!result.ok) return;
     expect(result.manifest.items.filter((item) => item.source?.sourceId === "mv-b")).toHaveLength(1);
     expect(result.manifest.items.filter((item) => item.source?.sourceId === "attachment-1")).toHaveLength(1);
-    expect(result.envelope.availableTools.filter((tool) => tool.id === "z-tool")).toHaveLength(1);
+    expect(result.envelope.availableTools.filter((tool) => tool.id === "room-memory.read")).toHaveLength(1);
   });
 
   it("uses immutable memory version identities and keeps same-record versions distinct", () => {

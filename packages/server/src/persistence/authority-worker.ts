@@ -115,6 +115,8 @@ import type {
 import { isTransientSQLiteContention } from "./sqlite-contention.js";
 import type { DeploymentProviderDisclosure } from
   "../tenant-administration/authority-service.js";
+import { executeAgentSettingsWorkerOperation } from
+  "../agent-settings/worker-authority-operation.js";
 
 interface AuthorityWorkerData {
   readonly databasePath: string;
@@ -2225,6 +2227,23 @@ function executeRoomAssignment(request: AuthorityWorkerRequest): void {
   }
 }
 
+async function executeAgentSettings(request: AuthorityWorkerRequest): Promise<void> {
+  if (request.type !== "authority.agent-settings") {
+    throw new TypeError("executeAgentSettings received the wrong request type");
+  }
+  try {
+    const result = await executeAgentSettingsWorkerOperation(
+      requireAuthorityTransactionDatabase(),
+      { version: 1, context: request.context, frame: request.frame, now: request.now },
+      isAuthorityWorkerData(workerData) ? workerData.deploymentProviderDisclosure : undefined,
+    );
+    respond({ type: "authority.agent-settings-result", requestId: request.requestId, result });
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    respondWithStorageFailure(request.requestId, error, "Agent Settings authority operation failed");
+  }
+}
+
 function submitHumanMessage(request: AuthorityWorkerRequest): void {
   if (request.type !== "authority.message-submit") throw new TypeError("wrong message submit");
   try {
@@ -2394,6 +2413,10 @@ function executeContext(request: AuthorityWorkerRequest): void {
     const result = executeContextSnapshotAuthorityOperation(
       requireAuthorityTransactionDatabase(),
       request.operation,
+      {
+        providerAuthenticated: isAuthorityWorkerData(workerData) &&
+          workerData.deploymentProviderDisclosure?.credentialReadiness === "ready",
+      },
     );
     respond({
       type: "authority.context-result",
@@ -2424,9 +2447,16 @@ function executeRoute(request: AuthorityWorkerRequest): void {
       ? openedDatabase.prepare(
           `SELECT room_id AS roomId FROM messages WHERE id = ?`,
         ).all(request.operation.sourceMessageId)
+      : request.operation.type === "route.handoff.claim"
+        ? [{ roomId: request.operation.roomId }]
       : request.operation.type === "route.recover"
         ? openedDatabase.prepare(
             `SELECT DISTINCT room_id AS roomId FROM route_jobs WHERE status = 'running'`,
+          ).all()
+      : request.operation.type === "route.handoff.recover"
+        ? openedDatabase.prepare(
+            `SELECT DISTINCT room_id AS roomId FROM routed_agent_invocation_intents
+             WHERE status = 'pending'`,
           ).all()
         : openedDatabase.prepare(
             `SELECT room_id AS roomId FROM route_jobs WHERE id = ?`,
@@ -2967,6 +2997,9 @@ async function dispatch(value: unknown): Promise<void> {
       return;
     case "authority.room-assignment":
       executeRoomAssignment(value);
+      return;
+    case "authority.agent-settings":
+      await executeAgentSettings(value);
       return;
     case "authority.message-submit":
       submitHumanMessage(value);

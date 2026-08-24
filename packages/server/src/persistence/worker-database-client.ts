@@ -72,6 +72,10 @@ import type {
   RoomAssignmentOperation,
   RoomAssignmentResult,
 } from "../room-assignment/authority-protocol.js";
+import type {
+  Ft07AgentSettingsClientFrame,
+  Ft07AgentSettingsServerFrame,
+} from "../ft07-agent-settings-protocol.js";
 import {
   toAgentMessageWorkerContext,
   type InternalAgentMessageCommitContext,
@@ -106,7 +110,7 @@ export interface CreateWorkerDatabaseClientOptions {
 }
 
 export interface AuthoritySchemaInspection {
-  readonly version: 20;
+  readonly version: 21;
 }
 
 export interface WorkerDatabaseClient {
@@ -287,6 +291,11 @@ export interface WorkerDatabaseClient {
     operation: TenantAdministrationOperation,
   ): Promise<TenantAdministrationResult>;
   executeRoomAssignment(operation: RoomAssignmentOperation): Promise<RoomAssignmentResult>;
+  executeAgentSettings(
+    context: AuthenticatedSessionContext | AuthenticatedCommandContext,
+    frame: Ft07AgentSettingsClientFrame,
+    now: number,
+  ): Promise<Ft07AgentSettingsServerFrame>;
   close(): Promise<void>;
 }
 
@@ -1452,6 +1461,23 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
     });
   }
 
+  executeAgentSettings(
+    context: AuthenticatedSessionContext | AuthenticatedCommandContext,
+    frame: Ft07AgentSettingsClientFrame,
+    now: number,
+  ): Promise<Ft07AgentSettingsServerFrame> {
+    if (this.#terminalError !== undefined) return this.#rejectTerminal();
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) return Promise.reject(unavailable);
+    return this.#send({ type: "authority.agent-settings", context, frame, now }).then((response) => {
+      if (response.type !== "authority.agent-settings-result") {
+        this.#failProtocol("Authority worker returned the wrong Agent Settings response");
+        throw this.#terminalError;
+      }
+      return response.result;
+    });
+  }
+
   executeContext(operation: ContextWorkerOperation): Promise<unknown> {
     if (this.#terminalError !== undefined) return this.#rejectTerminal();
     const unavailable = this.#unavailableError();
@@ -2038,6 +2064,8 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
         responseType === "authority.tenant-administration-result") ||
       (requestType === "authority.room-assignment" &&
         responseType === "authority.room-assignment-result") ||
+      (requestType === "authority.agent-settings" &&
+        responseType === "authority.agent-settings-result") ||
       (requestType === "authority.message-submit" &&
         responseType === "authority.message-submitted") ||
       (requestType === "authority.message-revise" &&

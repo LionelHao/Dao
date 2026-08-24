@@ -4,7 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
-import { seedCanonicalAgentProfileFixture } from "../fixtures/agent-authority-fixture.js";
+import {
+  seedCanonicalAgentProfileFixture,
+  seedCanonicalRoomAssignmentFixture,
+} from "../fixtures/agent-authority-fixture.js";
 import {
   commitFinalContextCitationsInTransaction,
   ContextSnapshotDatabaseError,
@@ -28,6 +31,17 @@ import { registerMemoryCorpusSource } from "../room-memory/corpus-database-autho
 const NOW_MS = Date.parse("2026-08-21T12:00:00.000Z");
 const NOW = new Date(NOW_MS).toISOString();
 
+function readyWorkerOptions(databasePath: string) {
+  return {
+    databasePath,
+    deploymentProviderDisclosure: {
+      providerId: "openai-responses",
+      modelId: "configured-model",
+      credentialReadiness: "ready" as const,
+    },
+  };
+}
+
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -44,8 +58,13 @@ function compilerInput(): ContextCompilerInputV1 {
       },
     },
     agent: {
-      agentId: "context-agent", displayName: "Agent",
-      responsibility: { availability: "unavailable", reason: "ft07_not_delivered" },
+      agentId: "context-agent", profileId: "fixture-profile:context-agent", assignmentId: "context-assignment",
+      displayName: "Agent",
+      globalResponsibility: "Exercise authoritative Agent behavior in a closed test fixture.",
+      roomResponsibility: "Exercise authoritative Room behavior in a closed test fixture.",
+      participation: "on-mention", availability: "busy",
+      effectiveCapabilities: ["room.conversation.read", "room.respond"], effectiveTools: ["room-memory.read"],
+      revisions: { profile: 1, assignment: 1, access: 0 },
     },
     room: {
       roomId: "context-room", name: "Context",
@@ -172,11 +191,12 @@ function begin(database: DatabaseSync, operation: () => void): void {
 function seedExecution(
   database: DatabaseSync,
   participation: "active" | "on-mention" = "on-mention",
+  intentKind: "direct_mention" | "structured_help" | "routed_candidate" = "direct_mention",
 ): void {
   database.exec(`
-    INSERT INTO actors (id, kind, display_name, tool_permissions_json)
-    VALUES ('context-human', 'human', 'Human', '[]'),
-           ('context-agent', 'agent', 'Agent', '["room-memory.read"]');
+    INSERT INTO actors (id, kind, display_name, tool_permissions_json, readiness)
+    VALUES ('context-human', 'human', 'Human', '[]', 'ready'),
+           ('context-agent', 'agent', 'Agent', '["room-memory.read"]', 'busy');
     INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
     VALUES ('identity', 'context-human', 0, 1),
            ('identity', 'context-agent', 0, 1),
@@ -202,14 +222,26 @@ function seedExecution(
     ) VALUES ('context-trigger', 'context-room', 'human', 'active', 1, 1,
       '${NOW}', NULL, NULL);
   `);
-  seedCanonicalAgentProfileFixture(database, {
+  const profileId = seedCanonicalAgentProfileFixture(database, {
     actorId: "context-agent",
     displayName: "Agent",
+    capabilityCeiling: ["room.conversation.read", "room.respond"],
     toolCeiling: ["room-memory.read"],
     now: NOW,
   });
-  begin(database, () => {
-    database.exec(`
+  seedCanonicalRoomAssignmentFixture(database, {
+    assignmentId: "context-assignment",
+    roomId: "context-room",
+    profileId,
+    actorId: "context-agent",
+    participation,
+    capabilitySubset: ["room.conversation.read", "room.respond"],
+    toolSubset: ["room-memory.read"],
+    now: NOW,
+  });
+  if (intentKind === "direct_mention") {
+    begin(database, () => {
+      database.exec(`
       INSERT INTO message_mentions (
         message_id, room_id, target_id, target_kind, target_actor_id,
         range_start_utf16, range_end_utf16, target_order
@@ -223,14 +255,32 @@ function seedExecution(
         'context-agent', 'context-human', 'direct_mention', NULL, '${NOW}',
         'context-trigger', 'context-target', 1, 'context-lineage', 'context-turn',
         'message_target', 'pending');
+      INSERT INTO direct_agent_invocation_authority_bindings (
+        intent_id, profile_id, profile_revision, assignment_id,
+        assignment_revision, access_revision
+      ) VALUES (
+        'context-intent', '${profileId}', 1, 'context-assignment', 1, 0
+      );
       INSERT INTO message_target_outcomes (
         message_id, room_id, target_id, target_actor_id, target_kind, status,
         request_intent_id, invocation_intent_id, rejection_code, created_at
       ) VALUES ('context-trigger', 'context-room', 'context-target',
         'context-agent', 'agent-invocation', 'invocation-intent-created', NULL,
         'context-intent', NULL, '${NOW}');
-    `);
-  });
+      `);
+    });
+  } else {
+    database.prepare(`
+      INSERT INTO agent_invocation_intents (
+        id, room_id, source_message_id, target_agent_id, requester_actor_id,
+        intent_kind, execution_id, created_at, message_transaction_id,
+        target_id, source_revision, lineage_id, turn_id, origin_kind, status,
+        claimed_at
+      ) VALUES ('context-intent', 'context-room', 'context-trigger',
+        'context-agent', 'context-human', ?, NULL, '${NOW}', NULL, NULL, 1,
+        'context-lineage', 'context-turn', 'legacy_runtime', 'claimed', '${NOW}')
+    `).run(intentKind);
+  }
   database.exec(`
     UPDATE agent_invocation_intents SET status = 'claimed', claimed_at = '${NOW}'
     WHERE id = 'context-intent';
@@ -395,7 +445,7 @@ function commitSnapshot(database: DatabaseSync) {
   const prepared = preparation(database);
   return executeContextSnapshotAuthorityOperation(
     database,
-    commitInput(prepared.preparationSha256),
+    commitInput(prepared.preparationSha256, {}, prepared.compilerInputFacts),
   );
 }
 
@@ -566,7 +616,6 @@ function seedAdditionalExecution(
   database: DatabaseSync,
   input: {
     readonly executionId: string;
-    readonly intentId: string;
     readonly manualRetryOf?: string;
     readonly supersedes?: readonly string[];
   },
@@ -587,15 +636,10 @@ function seedAdditionalExecution(
     input.executionId, NOW, NOW, NOW, input.manualRetryOf ?? null,
     input.supersedes === undefined ? null : JSON.stringify(input.supersedes),
   );
-  database.prepare(
-    `INSERT INTO agent_invocation_intents (
-       id, room_id, source_message_id, target_agent_id, requester_actor_id,
-       intent_kind, execution_id, created_at, message_transaction_id, target_id,
-       source_revision, lineage_id, turn_id, origin_kind, status, claimed_at
-     ) VALUES (?, 'context-room', 'context-trigger', 'context-agent',
-       'context-human', 'direct_mention', NULL, ?, NULL, NULL, 1, NULL, NULL,
-       'legacy_runtime', 'claimed', ?)`,
-  ).run(input.intentId, NOW, NOW);
+  const nextOrdinal = database.prepare(`
+    SELECT COALESCE(MAX(execution_ordinal), 0) + 1 AS ordinal
+    FROM agent_execution_intent_links WHERE intent_id = 'context-intent'
+  `).get() as { readonly ordinal: number };
   database.prepare(
     `INSERT INTO agent_execution_attempts (
        execution_id, attempt_seq, retry_cycle, retry_ordinal, status,
@@ -606,8 +650,8 @@ function seedAdditionalExecution(
     `INSERT INTO agent_execution_intent_links (
        intent_id, execution_id, execution_ordinal, retry_of_execution_id,
        source_revision, linked_at
-     ) VALUES (?, ?, 1, ?, 1, ?)`,
-  ).run(input.intentId, input.executionId, input.manualRetryOf ?? null, NOW);
+     ) VALUES ('context-intent', ?, ?, ?, 1, ?)`,
+  ).run(input.executionId, nextOrdinal.ordinal, input.manualRetryOf ?? null, NOW);
 }
 
 function commitAdditionalSnapshot(
@@ -662,7 +706,20 @@ describe("v19 Context Snapshot database authority", () => {
   it("prepares on-mention, commits one immutable snapshot, and returns byte-identical body", () => {
     withDatabase((database) => {
       seedExecution(database, "on-mention");
-      const committed = commitSnapshot(database);
+      database.prepare(
+        `UPDATE room_memberships SET tool_permissions_json = '[]'
+         WHERE room_id = 'context-room' AND actor_id = 'context-agent'`,
+      ).run();
+      const prepared = preparation(database);
+      expect(prepared.compilerInputFacts.agent.effectiveTools).toEqual([]);
+      expect(prepared.compilerInputFacts.tools).toEqual([]);
+      const operation = commitInput(
+        prepared.preparationSha256, {}, prepared.compilerInputFacts,
+      );
+      const committed = executeContextSnapshotAuthorityOperation(
+        database,
+        operation,
+      );
       expect(committed).toMatchObject({
         kind: "context-snapshot",
         snapshot: {
@@ -676,7 +733,7 @@ describe("v19 Context Snapshot database authority", () => {
       });
       const replay = executeContextSnapshotAuthorityOperation(
         database,
-        commitInput((committed as { snapshot: { snapshotId: string } }).snapshot.snapshotId),
+        commitInput(prepared.preparationSha256, {}, prepared.compilerInputFacts),
       );
       expect(replay).toBeDefined();
       const read = executeContextSnapshotAuthorityOperation(database, {
@@ -685,8 +742,8 @@ describe("v19 Context Snapshot database authority", () => {
       });
       expect(read).toMatchObject({
         kind: "context-body",
-        snapshot: { envelopeSha256: commitInput("a".repeat(64)).body.envelopeSha256 },
-        canonicalEnvelopeJson: commitInput("a".repeat(64)).body.canonicalEnvelopeJson,
+        snapshot: { envelopeSha256: operation.body.envelopeSha256 },
+        canonicalEnvelopeJson: operation.body.canonicalEnvelopeJson,
       });
       expect(() => database.exec(
         "UPDATE context_manifest_items SET source_id = 'tampered' WHERE snapshot_id = 'context-snapshot'",
@@ -1128,11 +1185,11 @@ describe("v19 Context Snapshot database authority", () => {
       seedExecution(database, "active");
       commitSnapshot(database);
       seedAdditionalExecution(database, {
-        executionId: "context-execution-parent-2", intentId: "context-intent-parent-2",
+        executionId: "context-execution-parent-2",
       });
       commitAdditionalSnapshot(database, "context-execution-parent-2", 2);
       seedAdditionalExecution(database, {
-        executionId: "context-execution-child", intentId: "context-intent-child",
+        executionId: "context-execution-child",
         supersedes: ["context-execution", "context-execution-parent-2"],
       });
       commitAdditionalSnapshot(database, "context-execution-child", 3, [
@@ -1165,7 +1222,7 @@ describe("v19 Context Snapshot database authority", () => {
       ]);
 
       seedAdditionalExecution(database, {
-        executionId: "context-execution-manual", intentId: "context-intent-manual",
+        executionId: "context-execution-manual",
         manualRetryOf: "context-execution-child",
       });
       commitAdditionalSnapshot(database, "context-execution-manual", 4, [{
@@ -1182,7 +1239,7 @@ describe("v19 Context Snapshot database authority", () => {
         { snapshotId: "context-snapshot-4", state: "active" },
       ]);
       seedAdditionalExecution(database, {
-        executionId: "context-execution-manual-bad", intentId: "context-intent-manual-bad",
+        executionId: "context-execution-manual-bad",
         manualRetryOf: "context-execution-child",
       });
       expect(() => commitAdditionalSnapshot(
@@ -1894,7 +1951,7 @@ describe("v19 Context Snapshot database authority", () => {
         WHERE message_id = 'context-trigger';
       `);
       database.close();
-      const worker = await createWorkerDatabaseClient({ databasePath });
+      const worker = await createWorkerDatabaseClient(readyWorkerOptions(databasePath));
       await expect(worker.executeRuntime({
         type: "runtime.recover", now: NOW_MS + 2_000,
       })).resolves.toMatchObject({
@@ -1922,35 +1979,103 @@ describe("v19 Context Snapshot database authority", () => {
     }
   });
 
-  it("returns the immutable invocation intent for every crash-recovered execution kind", async () => {
+  it("preserves FT10 outcome_unknown after dispatch when frozen authority changes before restart", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "dao-context-dispatch-authority-recovery-"));
+    const databasePath = join(directory, "authority.sqlite");
+    let database = new DatabaseSync(databasePath);
+    try {
+      migrateAuthorityDatabase(database);
+      seedExecution(database, "active");
+      database.exec(`
+        UPDATE agent_executions
+        SET action_category = 'tool_call', tool_name = 'sandbox-file.write',
+            tool_dispatch_phase = 'dispatched'
+        WHERE id = 'context-execution';
+        UPDATE agent_execution_attempts SET action_category = 'tool_call'
+        WHERE execution_id = 'context-execution' AND attempt_seq = 1;
+        INSERT INTO agent_execution_grants (
+          grant_id, execution_id, attempt_seq, agent_id, room_id, tool_id,
+          parameter_sha256, issued_at, expires_at, consumed_at,
+          grant_state, grant_revision, grant_changed_at
+        ) VALUES (
+          'context-side-effect-grant', 'context-execution', 1, 'context-agent',
+          'context-room', 'sandbox-file.write', '${"a".repeat(64)}', '${NOW}',
+          '2026-08-21T13:00:00.000Z', '${NOW}', 'claimed', 1, '${NOW}'
+        );
+        INSERT INTO tool_dispatches (
+          dispatch_id, execution_id, attempt_seq, grant_id, tool_id,
+          parameter_sha256, state, dispatched_at
+        ) VALUES (
+          'context-side-effect-dispatch', 'context-execution', 1,
+          'context-side-effect-grant', 'sandbox-file.write', '${"a".repeat(64)}',
+          'dispatched', '${NOW}'
+        );
+        UPDATE actors SET readiness = 'paused' WHERE id = 'context-agent';
+      `);
+      database.close();
+
+      const worker = await createWorkerDatabaseClient(readyWorkerOptions(databasePath));
+      await expect(worker.executeRuntime({
+        type: "runtime.recover", now: NOW_MS + 2_000,
+      })).resolves.toMatchObject({
+        kind: "recovery",
+        records: [{
+          outcome: "fail_outcome_unknown",
+          execution: { status: "failed", terminalErrorCode: "side_effect_outcome_unknown" },
+        }],
+      });
+      await worker.close();
+
+      database = new DatabaseSync(databasePath, { readOnly: true });
+      expect(database.prepare(
+        "SELECT state FROM tool_dispatches WHERE dispatch_id = 'context-side-effect-dispatch'",
+      ).get()).toEqual({ state: "outcome_unknown" });
+    } finally {
+      if (database.isOpen) database.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers only executions with the correct durable frozen authority handoff", async () => {
     for (const kind of ["direct_mention", "structured_help", "routed_candidate"] as const) {
       const directory = mkdtempSync(join(tmpdir(), `dao-context-intent-${kind}-`));
       const databasePath = join(directory, "authority.sqlite");
       const database = new DatabaseSync(databasePath);
       try {
         migrateAuthorityDatabase(database);
-        seedExecution(database, "active");
-        database.prepare(
-          "UPDATE agent_invocation_intents SET intent_kind = ? WHERE id = 'context-intent'",
-        ).run(kind);
+        seedExecution(database, "active", kind);
       } finally {
         database.close();
       }
-      const worker = await createWorkerDatabaseClient({ databasePath });
+      const worker = await createWorkerDatabaseClient(readyWorkerOptions(databasePath));
       try {
-        await expect(worker.executeRuntime({
+        const recovered = worker.executeRuntime({
           type: "runtime.recover", now: NOW_MS + 1_000,
-        })).resolves.toMatchObject({
-          kind: "recovery",
-          records: [{
-            outcome: "enqueue",
-            execution: { id: "context-execution", status: "queued", currentAttemptSeq: 2 },
-            intent: {
-              kind, roomId: "context-room", sourceMessageId: "context-trigger",
-              targetAgentId: "context-agent",
-            },
-          }],
         });
+        if (kind === "direct_mention") {
+          await expect(recovered).resolves.toMatchObject({
+            kind: "recovery",
+            records: [{
+              outcome: "enqueue",
+              execution: { id: "context-execution", status: "queued", currentAttemptSeq: 2 },
+              intent: {
+                kind, roomId: "context-room", sourceMessageId: "context-trigger",
+                targetAgentId: "context-agent",
+              },
+            }],
+          });
+        } else {
+          await expect(recovered).resolves.toMatchObject({
+            kind: "recovery",
+            records: [{
+              outcome: "failed",
+              execution: {
+                id: "context-execution", status: "failed",
+                terminalErrorCode: "permission_denied",
+              },
+            }],
+          });
+        }
       } finally {
         await worker.close();
         rmSync(directory, { recursive: true, force: true });
@@ -1968,7 +2093,7 @@ describe("v19 Context Snapshot database authority", () => {
       seedLargeDeltaTail(database);
       database.close();
 
-      const firstWorker = await createWorkerDatabaseClient({ databasePath });
+      const firstWorker = await createWorkerDatabaseClient(readyWorkerOptions(databasePath));
       const prepared = await firstWorker.executeContext({
         type: "context.prepare", executionId: "context-execution", attemptSeq: 1, now: NOW_MS,
       }) as { preparation: {
@@ -2026,7 +2151,7 @@ describe("v19 Context Snapshot database authority", () => {
       }) as { canonicalResultJson: string };
       await firstWorker.close();
 
-      const retryWorker = await createWorkerDatabaseClient({ databasePath });
+      const retryWorker = await createWorkerDatabaseClient(readyWorkerOptions(databasePath));
       await expect(retryWorker.executeContext({
         type: "context.source-read-claim", readId: "worker-source-read",
         executionId: "context-execution", attemptSeq: 1,
@@ -2084,7 +2209,7 @@ describe("v19 Context Snapshot database authority", () => {
       });
       await retryWorker.close();
 
-      const recoveryWorker = await createWorkerDatabaseClient({ databasePath });
+      const recoveryWorker = await createWorkerDatabaseClient(readyWorkerOptions(databasePath));
       await recoveryWorker.executeRuntime({ type: "runtime.recover", now: NOW_MS + 1_000 });
       await expect(recoveryWorker.executeContext({
         type: "context.read", executionId: "context-execution", attemptSeq: 3,
@@ -2122,7 +2247,7 @@ describe("v19 Context Snapshot database authority", () => {
       `);
       invalidationDatabase.close();
 
-      const invalidatedWorker = await createWorkerDatabaseClient({ databasePath });
+      const invalidatedWorker = await createWorkerDatabaseClient(readyWorkerOptions(databasePath));
       await expect(invalidatedWorker.executeContext({
         type: "context.read", executionId: "context-execution", attemptSeq: 3,
         expectedExecutionGeneration: 1, now: NOW_MS + 2_000,

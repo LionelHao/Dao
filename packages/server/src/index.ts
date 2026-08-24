@@ -215,6 +215,7 @@ export type WorkerDatabaseClient = Omit<
   | "executeAttachment"
   | "executeTenantAdministration"
   | "executeRoomAssignment"
+  | "executeAgentSettings"
   | "readActor"
   | "readRoom"
   | "readRoomGovernance"

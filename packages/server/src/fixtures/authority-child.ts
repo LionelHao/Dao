@@ -476,8 +476,8 @@ function seedMixedRoomRecords(databasePath: string, roomId: string): Record<stri
     };
     const routeJudgmentCount = database.prepare(
       `SELECT COUNT(*) AS count
-       FROM route_job_agents AS candidate
-       INNER JOIN route_jobs AS job ON job.id = candidate.route_job_id
+       FROM route_judgments AS judgment
+       INNER JOIN route_jobs AS job ON job.id = judgment.route_job_id
        WHERE job.room_id = ?`,
     ).get(roomId) as { readonly count: number };
     const messageRevisionCount = database.prepare(
@@ -499,9 +499,8 @@ function seedMixedRoomRecords(databasePath: string, roomId: string): Record<stri
       "agent-execution": count("agent_executions"),
       calibration: count("calibration_signals"),
       "route-job": count("route_jobs"),
-      // A restarted production runtime closes one judgment for every snapshotted
-      // candidate. Count that stable post-recovery set so the stress assertion
-      // remains deterministic while the child finishes pending route work.
+      // Legacy static route_job_agents are no longer an authority candidate set.
+      // Only judgments already persisted from a closed v20 snapshot count here.
       "route-judgment": routeJudgmentCount.count,
     };
     const distinctMembershipActors = database.prepare(

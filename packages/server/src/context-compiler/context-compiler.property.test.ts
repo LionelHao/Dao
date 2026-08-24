@@ -41,7 +41,10 @@ function makeInput(seed: number): ContextCompilerInputV1 {
     version: "context_compiler_input_v1",
     invocation: { invocationId: "invocation-property", executionId: "execution-property", roomId: "room-property",
       intent: { kind: "routed_candidate", sourceMessageId: "message-11", targetAgentId: "agent-property", reasonCode: "domain_match", reasonText: "property route" } },
-    agent: { agentId: "agent-property", displayName: "Property Agent", responsibility: { availability: "unavailable", reason: "ft07_not_delivered" } },
+    agent: { agentId: "agent-property", profileId: "profile-property", assignmentId: "assignment-property",
+      displayName: "Property Agent", globalResponsibility: "Property analysis", roomResponsibility: "Analyze this Room",
+      participation: "active", availability: "ready", effectiveCapabilities: ["room.conversation.read", "room.respond"],
+      effectiveTools: [], revisions: { profile: 2, assignment: 3, access: 4 } },
     room: { roomId: "room-property", name: "Property", goal: { availability: "unavailable", reason: "ft09_not_delivered" } },
     trigger: {
       triggerType: "message",
@@ -75,11 +78,12 @@ describe("compileContextV1 deterministic properties", () => {
           sourceId: "message-00", revision: 1, corpusSeq: 1 }], availability: "readable" as const };
       const attachment = { ...input.delta[0]!, source: { ...input.delta[0]!.source,
         sourceKind: "attachment_extraction" as const, sourceId: "attachment-property", corpusSeq: null }, readRef: "attachment-read" };
-      const tool = { id: "property-tool", description: "read authority", effect: "read-only" as const, inputSchemaCanonical: "{}" };
+      const tool = { id: "room-memory.read", description: "read authority", effect: "read-only" as const, inputSchemaCanonical: "{}" };
       input.memories = [memory, { ...memory, sourceRefs: [...memory.sourceRefs].reverse() }];
       input.retrieval = [input.delta[0]!, { ...input.delta[0]! }];
       input.attachments = [attachment, { ...attachment }];
       input.tools = [tool, { ...tool }];
+      input.agent.effectiveTools = ["room-memory.read"];
       const baseline = compileContextV1(input, CONTEXT_COMPILER_CONFIG_V1);
       expect(baseline.ok).toBe(true);
       for (let run = 0; run < RUNS_PER_SEED; run += 1) {

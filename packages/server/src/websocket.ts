@@ -66,6 +66,13 @@ import {
   type ServerFrame,
 } from "./protocol.js";
 import {
+  FT07_AGENT_SETTINGS_MUTATIONS,
+  isFt07AgentSettingsServerFrame,
+  type Ft07AgentSettingsClientFrame,
+  type Ft07AgentSettingsMutationType,
+  type Ft07AgentSettingsServerFrame,
+} from "./ft07-agent-settings-protocol.js";
+import {
   createSubscriptionRegistry,
   type RegisteredConnection,
   type SubscriptionRegistry,
@@ -131,6 +138,36 @@ export interface RoomMemoryAuthorityTransport {
   ): Promise<RoomMemorySuccessFrame>;
 }
 
+type Ft07AgentSettingsMutationFrame = Extract<
+  Ft07AgentSettingsClientFrame,
+  { readonly type: Ft07AgentSettingsMutationType }
+>;
+type Ft07AgentSettingsRepairFrame = Extract<
+  Ft07AgentSettingsClientFrame,
+  { readonly type: "agent-profile.repair" | "room-agent-assignment.repair" }
+>;
+type Ft07AgentSettingsQueryFrame = Exclude<
+  Ft07AgentSettingsClientFrame,
+  Ft07AgentSettingsMutationFrame | Ft07AgentSettingsRepairFrame
+>;
+
+/**
+ * Server-private adapter seam. Every method must revalidate the supplied current
+ * session in the AuthorityWorker transaction. Deployment queries/repair require
+ * Tenant Administrator; Room queries/mutations require current membership and
+ * owner/admin for writes. Returned values are closed again before crossing WS.
+ */
+export interface Ft07AgentSettingsAuthorityTransport {
+  executeQuery(
+    context: AuthenticatedSessionContext,
+    frame: Ft07AgentSettingsQueryFrame,
+  ): Promise<unknown>;
+  executeMutation(
+    context: AuthenticatedCommandContext,
+    frame: Ft07AgentSettingsMutationFrame,
+  ): Promise<unknown>;
+}
+
 export interface StartMessageWebSocketServerOptions {
   readonly auth: AuthenticationService;
   readonly service: MessageService;
@@ -159,6 +196,7 @@ export interface StartMessageWebSocketServerOptions {
   readonly messageAuthority?: MessageAuthorityTransport;
   readonly memoryAuthority?: RoomMemoryAuthorityTransport;
   readonly attachmentAuthority?: AttachmentAuthorityCommandPort;
+  readonly agentSettingsAuthority?: Ft07AgentSettingsAuthorityTransport;
   readonly governance?: Pick<CommandStore, "executeHuman"> &
     Pick<SyncQueryStore, "readRoomGovernance"> &
     Partial<ClosedRoomGovernanceTransportStore>;
@@ -627,10 +665,15 @@ const MAPPED_SERVICE_ERROR_STATUSES = new Map<GenericProtocolErrorCode, Protocol
   ["invalid_chunk", 400],
   ["unauthenticated", 401],
   ["room_forbidden", 403],
+  ["administrator_required", 403],
+  ["profile_forbidden", 403],
   ["attachment_forbidden", 403],
   ["snapshot_forbidden", 403],
   ["snapshot_not_found", 404],
   ["room_not_found", 404],
+  ["administrator_not_found", 404],
+  ["profile_not_found", 404],
+  ["assignment_not_found", 404],
   ["memory_not_found", 404],
   ["memory_source_not_found", 404],
   ["reply_target_not_found", 404],
@@ -640,6 +683,14 @@ const MAPPED_SERVICE_ERROR_STATUSES = new Map<GenericProtocolErrorCode, Protocol
   ["ownership_transfer_required", 409],
   ["member_not_found", 404],
   ["idempotency_conflict", 409],
+  ["administrator_already_exists", 409],
+  ["last_administrator_required", 409],
+  ["administrator_revision_conflict", 409],
+  ["profile_revision_conflict", 409],
+  ["profile_state_conflict", 409],
+  ["assignment_revision_conflict", 409],
+  ["assignment_already_exists", 409],
+  ["capability_ceiling_conflict", 409],
   ["attachment_already_bound", 409],
   ["generation_conflict", 409],
   ["attachment_not_ready", 409],
@@ -653,6 +704,8 @@ const MAPPED_SERVICE_ERROR_STATUSES = new Map<GenericProtocolErrorCode, Protocol
   ["upload_expired", 410],
   ["attachment_gone", 410],
   ["memory_source_gone", 410],
+  ["profile_gone", 410],
+  ["assignment_gone", 410],
   ["attachment_too_large", 413],
   ["chunk_too_large", 413],
   ["attachment_type_unsupported", 415],
@@ -667,6 +720,7 @@ const MAPPED_SERVICE_ERROR_STATUSES = new Map<GenericProtocolErrorCode, Protocol
   ["snapshot_stale", 409],
   ["snapshot_expired", 410],
   ["snapshot_busy", 429],
+  ["capacity_limited", 429],
   ["attachment_capacity_limited", 429],
   ["memory_capacity_limited", 429],
   ["repair_barrier_active", 503],
@@ -691,6 +745,7 @@ const MAPPED_SERVICE_ERROR_STATUSES = new Map<GenericProtocolErrorCode, Protocol
   ["provider_rate_limited", 503],
   ["provider_timeout", 503],
   ["provider_unavailable", 503],
+  ["provider_configuration_unavailable", 503],
   ["side_effect_outcome_unknown", 409],
   ["tool_failure", 503],
   ["tool_target_busy", 503],
@@ -1325,7 +1380,27 @@ function isCorrelatedRecoveryResponse(
       | "room.memory.context.dispute.v1"
       | "room.memory.context.resolve.v1"
       | "room.memory.status.query.v1"
-      | "room.memory.retry.v1";
+      | "room.memory.retry.v1"
+      | "tenant-administrator.list"
+      | "tenant-administrator.add"
+      | "tenant-administrator.remove"
+      | "agent-profile.list"
+      | "agent-profile.get"
+      | "agent-profile.create"
+      | "agent-profile.update"
+      | "agent-profile.enable"
+      | "agent-profile.disable"
+      | "provider-configuration.disclose"
+      | "agent-profile.sync"
+      | "agent-profile.repair"
+      | "room-agent-assignment.list"
+      | "room-agent-assignment.get"
+      | "room-agent-assignment.create"
+      | "room-agent-assignment.update"
+      | "room-agent-assignment.pause"
+      | "room-agent-assignment.resume"
+      | "room-agent-assignment.remove"
+      | "room-agent-assignment.repair";
   }>,
   response: unknown,
 ): response is ServerFrame {
@@ -1440,7 +1515,27 @@ async function handleRecoveryFrame(
       | "room.memory.context.dispute.v1"
       | "room.memory.context.resolve.v1"
       | "room.memory.status.query.v1"
-      | "room.memory.retry.v1";
+      | "room.memory.retry.v1"
+      | "tenant-administrator.list"
+      | "tenant-administrator.add"
+      | "tenant-administrator.remove"
+      | "agent-profile.list"
+      | "agent-profile.get"
+      | "agent-profile.create"
+      | "agent-profile.update"
+      | "agent-profile.enable"
+      | "agent-profile.disable"
+      | "provider-configuration.disclose"
+      | "agent-profile.sync"
+      | "agent-profile.repair"
+      | "room-agent-assignment.list"
+      | "room-agent-assignment.get"
+      | "room-agent-assignment.create"
+      | "room-agent-assignment.update"
+      | "room-agent-assignment.pause"
+      | "room-agent-assignment.resume"
+      | "room-agent-assignment.remove"
+      | "room-agent-assignment.repair";
   }>,
   options: StartMessageWebSocketServerOptions,
   context: ConnectionContext,
@@ -2191,6 +2286,84 @@ async function handleSubscribeV2(
   }
 }
 
+const ft07MutationTypes = new Set<string>(FT07_AGENT_SETTINGS_MUTATIONS);
+
+function isCorrelatedFt07Response(
+  frame: Ft07AgentSettingsClientFrame,
+  response: unknown,
+): response is Ft07AgentSettingsServerFrame {
+  if (!isFt07AgentSettingsServerFrame(response)) return false;
+  if (!("requestId" in response) || response.requestId !== frame.requestId) return false;
+  switch (frame.type) {
+    case "tenant-administrator.list":
+      return response.type === "tenant-administrator.registry";
+    case "agent-profile.list":
+      return response.type === "agent-profile.catalog";
+    case "agent-profile.get":
+      return response.type === "agent-profile.detail" && response.profile.profileId === frame.profileId;
+    case "provider-configuration.disclose":
+      return response.type === "provider-configuration.disclosure";
+    case "agent-profile.sync":
+      return response.type === "agent-profile.sync.result";
+    case "agent-profile.repair":
+      return response.type === "agent-profile.repair.snapshot";
+    case "room-agent-assignment.list":
+      return response.type === "room-agent-assignment.catalog" && response.roomId === frame.roomId;
+    case "room-agent-assignment.get":
+      return response.type === "room-agent-assignment.detail" && response.roomId === frame.roomId &&
+        response.assignment.assignmentId === frame.assignmentId;
+    case "room-agent-assignment.repair":
+      return response.type === "room-agent-assignment.repair.snapshot" && response.roomId === frame.roomId;
+    default:
+      return response.type === "agent-settings.ack" && response.operation === frame.type;
+  }
+}
+
+async function handleFt07AgentSettingsFrame(
+  socket: WebSocket,
+  frame: Ft07AgentSettingsClientFrame,
+  options: RuntimeMessageWebSocketServerOptions,
+  context: ConnectionContext,
+): Promise<void> {
+  const session = await requireSession(socket, frame.requestId, options, context);
+  if (session === undefined) return;
+  const authority = options.agentSettingsAuthority;
+  const syncOperation = frame.type === "agent-profile.sync" ||
+    frame.type === "agent-profile.repair" || frame.type === "room-agent-assignment.repair";
+  if ((!syncOperation && authority === undefined) || (syncOperation && options.sync === undefined)) {
+    sendFrame(socket, errorFrame(
+      503, "storage_unavailable", "storage_unavailable", frame.requestId,
+    ));
+    return;
+  }
+  const generation = context.credentialGeneration;
+  try {
+    const response = frame.type === "agent-profile.sync"
+      ? await options.sync!.syncAgentProfiles(session, frame.requestId, frame.afterSeq, frame.limit)
+      : frame.type === "agent-profile.repair"
+        ? await options.sync!.repairAgentProfiles(session, frame.requestId)
+        : frame.type === "room-agent-assignment.repair"
+          ? await options.sync!.repairRoomAgentAssignments(session, frame.requestId, frame.roomId)
+          : ft07MutationTypes.has(frame.type)
+      ? await authority!.executeMutation({
+          ...session,
+          kind: "human",
+          requestId: frame.requestId,
+          idempotencyKey: (frame as Ft07AgentSettingsMutationFrame).idempotencyKey,
+        }, frame as Ft07AgentSettingsMutationFrame)
+      : await authority!.executeQuery(session, frame as Ft07AgentSettingsQueryFrame);
+    if (!isCorrelatedFt07Response(frame, response)) {
+      sendCurrentGeneration(socket, errorFrame(
+        503, "storage_unavailable", "storage_unavailable", frame.requestId,
+      ), generation, context);
+      return;
+    }
+    sendCurrentGeneration(socket, response, generation, context);
+  } catch (error: unknown) {
+    sendCurrentGeneration(socket, mappedError(error, frame.requestId), generation, context);
+  }
+}
+
 async function handleFrame(
   socket: WebSocket,
   frame: ClientFrame,
@@ -2201,6 +2374,28 @@ async function handleFrame(
     return;
   }
   switch (frame.type) {
+    case "tenant-administrator.list":
+    case "tenant-administrator.add":
+    case "tenant-administrator.remove":
+    case "agent-profile.list":
+    case "agent-profile.get":
+    case "agent-profile.create":
+    case "agent-profile.update":
+    case "agent-profile.enable":
+    case "agent-profile.disable":
+    case "provider-configuration.disclose":
+    case "agent-profile.sync":
+    case "agent-profile.repair":
+    case "room-agent-assignment.list":
+    case "room-agent-assignment.get":
+    case "room-agent-assignment.create":
+    case "room-agent-assignment.update":
+    case "room-agent-assignment.pause":
+    case "room-agent-assignment.resume":
+    case "room-agent-assignment.remove":
+    case "room-agent-assignment.repair":
+      await handleFt07AgentSettingsFrame(socket, frame, options, context);
+      return;
     case "auth.login":
     case "auth.resume":
       await handleLoginOrResume(socket, frame, options, context);

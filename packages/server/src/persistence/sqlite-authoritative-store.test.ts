@@ -642,6 +642,37 @@ async function createCommandMatrixFixture(databasePath: string): Promise<{
     WHERE id = 'room-matrix';
     INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
     VALUES ('room', 'room-matrix', 0, 1);
+    UPDATE agent_profiles
+    SET revision = revision + 1, status = 'enabled', updated_at = '2026-08-10T14:00:00.000Z',
+        source_kind = 'administrator_command'
+    WHERE actor_id = 'agent-review';
+    INSERT INTO agent_profile_revisions (
+      profile_id, revision, actor_id, display_name, global_responsibility, status,
+      capability_ceiling_json, tool_ceiling_json, changed_by_human_actor_id,
+      changed_at, operation
+    ) SELECT id, revision, actor_id, display_name, global_responsibility, status,
+             capability_ceiling_json, tool_ceiling_json, 'human-li',
+             '2026-08-10T14:00:00.000Z', 'enable'
+      FROM agent_profiles WHERE actor_id = 'agent-review';
+    INSERT INTO room_agent_assignments (
+      id, room_id, profile_id, agent_actor_id, revision, status, participation,
+      paused, capability_subset_json, tool_subset_json, room_responsibility,
+      created_at, updated_at, removed_at, source_kind
+    ) SELECT 'matrix-assignment-agent-review', 'room-matrix', id, actor_id, 1,
+             'current', 'active', 0, '[]', '[]', 'Review Matrix Room.',
+             '2026-08-10T14:00:00.000Z', '2026-08-10T14:00:00.000Z', NULL,
+             'room_command'
+      FROM agent_profiles WHERE actor_id = 'agent-review';
+    INSERT INTO room_agent_assignment_revisions (
+      assignment_id, revision, room_id, profile_id, agent_actor_id,
+      room_responsibility, status, participation, paused,
+      capability_subset_json, tool_subset_json, changed_by_human_actor_id,
+      changed_at, operation
+    ) SELECT id, revision, room_id, profile_id, agent_actor_id,
+             room_responsibility, status, participation, paused,
+             capability_subset_json, tool_subset_json, 'human-li',
+             '2026-08-10T14:00:00.000Z', 'create'
+      FROM room_agent_assignments WHERE id = 'matrix-assignment-agent-review';
   `);
   insertLegacyMessageAuthorityRecord(database, {
     id: "matrix-human-source", roomId: "room-matrix", authorId: "human-li",
@@ -1190,7 +1221,7 @@ describe("SQLite authoritative sessions", () => {
       accountId: "account-li",
       actorId: "human-li",
     });
-    await expect(client.inspectSchema()).resolves.toEqual({ version: 20 });
+    await expect(client.inspectSchema()).resolves.toEqual({ version: 21 });
     await client.close();
   });
 
@@ -1356,6 +1387,7 @@ describe("SQLite authoritative sessions", () => {
 
       const claimed = await client.executeRoute({
         type: "route.claim",
+        agentProviderReady: true,
         sourceMessageId: command.payload.id,
         now: 2_100,
       });
@@ -1370,19 +1402,17 @@ describe("SQLite authoritative sessions", () => {
             authorKind: "human",
             summary: command.payload.body,
           },
-          agents: [
-            { agentId: "agent-review", participation: "active", capabilities: ["review.read"] },
-            { agentId: "agent-route-second", participation: "on-mention", capabilities: ["route.read"] },
-          ],
-          limits: { timeoutMs: 1_000, maxCandidates: 2, maxOutputBytes: 65_536 },
+          agents: [],
+          limits: { timeoutMs: 1_000, maxCandidates: 0, maxOutputBytes: 65_536 },
         },
         decisionContext: {
-          directMentionAgentIds: ["agent-review", "agent-route-second"],
+          directMentionAgentIds: [],
           structuredHelpAgentIds: [],
         },
       });
       await expect(client.executeRoute({
         type: "route.claim",
+        agentProviderReady: true,
         sourceMessageId: command.payload.id,
         now: 2_101,
       })).rejects.toMatchObject({ status: 409, code: "route_conflict" });
@@ -1392,57 +1422,31 @@ describe("SQLite authoritative sessions", () => {
         { type: "member.remove", roomId: "room-route", payload: { targetActorId: "agent-route-second" } },
       )).rejects.toMatchObject({ status: 503, code: "dependency_unavailable" });
       const routeJobId = (claimed as { readonly job: { readonly id: string } }).job.id;
-      const decidedAt = "1970-01-01T00:00:02.200Z";
-      const judgments = ["agent-review", "agent-route-second"].map((agentId) => ({
-        id: `judgment-${agentId}`,
-        routeJobId,
-        sourceMessageId: command.payload.id,
-        agentId,
-        outcome: "will_respond" as const,
-        reasonCode: "direct_mention" as const,
-        reasonText: "direct mandatory address",
-        routeAttempt: 1 as const,
-        decidedAt,
-      }));
-      const intents = ["agent-review", "agent-route-second"].map((targetAgentId) => ({
-        kind: "direct_mention" as const,
-        roomId: "room-route",
-        sourceMessageId: command.payload.id,
-        targetAgentId,
-        reasonCode: "direct_mention" as const,
-        reasonText: "direct mandatory address",
-        priority: 1 as const,
-      }));
+      const judgments = [];
+      const intents = [];
       await expect(client.executeRoute({
         type: "route.complete",
         routeJobId,
         attempt: 1,
         judgments,
         intents,
+        agentProviderReady: true,
         now: 2_200,
       })).resolves.toMatchObject({
         kind: "route-completed",
         job: { status: "completed" },
-        intents: [
-          { targetAgentId: "agent-review" },
-          { targetAgentId: "agent-route-second" },
-        ],
+        intents: [],
+        handoffs: [],
       });
 
       const completedInspection = new DatabaseSync(databasePath, { readOnly: true });
       expect(completedInspection.prepare(
         `SELECT agent_id AS agentId, outcome, reason_code AS reasonCode
          FROM route_judgments ORDER BY agent_id`,
-      ).all()).toEqual([
-        { agentId: "agent-review", outcome: "will_respond", reasonCode: "direct_mention" },
-        { agentId: "agent-route-second", outcome: "will_respond", reasonCode: "direct_mention" },
-      ]);
+      ).all()).toEqual([]);
       expect(completedInspection.prepare(
         `SELECT target_agent_id AS targetAgentId FROM route_invocation_intents`,
-      ).all()).toEqual([
-        { targetAgentId: "agent-review" },
-        { targetAgentId: "agent-route-second" },
-      ]);
+      ).all()).toEqual([]);
       completedInspection.close();
 
       const routedInvocation = {
@@ -1460,25 +1464,16 @@ describe("SQLite authoritative sessions", () => {
         modelId: "runtime-model",
         now: 2_300,
       } as const;
-      await expect(client.executeRuntime(routedInvocation)).resolves.toMatchObject({
-        kind: "invocation",
-        replayed: false,
-        execution: {
-          id: "execution-routed-authoritative",
-          requesterId: "human-li",
-          agentId: "agent-review",
-          status: "queued",
-        },
+      await expect(client.executeRuntime(routedInvocation)).rejects.toMatchObject({
+        status: 403, code: "permission_denied",
       });
       await expect(client.executeRuntime({
         ...routedInvocation,
         executionId: "execution-routed-replay-unused",
         intentId: "intent-routed-replay-unused",
         now: 2_301,
-      })).resolves.toMatchObject({
-        kind: "invocation",
-        replayed: true,
-        execution: { id: "execution-routed-authoritative" },
+      })).rejects.toMatchObject({
+        status: 403, code: "permission_denied",
       });
       await expect(client.executeRuntime({
         ...routedInvocation,
@@ -1486,14 +1481,8 @@ describe("SQLite authoritative sessions", () => {
         executionId: "execution-routed-forbidden",
         intentId: "intent-routed-forbidden",
         now: 2_302,
-      })).resolves.toMatchObject({
-        kind: "invocation",
-        replayed: false,
-        execution: {
-          id: "execution-routed-forbidden",
-          agentId: "agent-route-second",
-          status: "queued",
-        },
+      })).rejects.toMatchObject({
+        status: 403, code: "permission_denied",
       });
 
       const retryCommand = {
@@ -1522,6 +1511,7 @@ describe("SQLite authoritative sessions", () => {
       });
       const retryClaim1 = await client.executeRoute({
         type: "route.claim",
+        agentProviderReady: true,
         sourceMessageId: retryCommand.payload.id,
         now: 3_000,
       }) as { readonly job: { readonly id: string } };
@@ -1539,11 +1529,13 @@ describe("SQLite authoritative sessions", () => {
       });
       await expect(client.executeRoute({
         type: "route.claim",
+        agentProviderReady: true,
         sourceMessageId: retryCommand.payload.id,
         now: 3_349,
       })).rejects.toMatchObject({ status: 409, code: "route_conflict" });
       await client.executeRoute({
         type: "route.claim",
+        agentProviderReady: true,
         sourceMessageId: retryCommand.payload.id,
         now: 3_350,
       });
@@ -1560,6 +1552,7 @@ describe("SQLite authoritative sessions", () => {
       });
       await client.executeRoute({
         type: "route.claim",
+        agentProviderReady: true,
         sourceMessageId: retryCommand.payload.id,
         now: 4_400,
       });
@@ -1620,6 +1613,7 @@ describe("SQLite authoritative sessions", () => {
       });
       const restartClaim = await client.executeRoute({
         type: "route.claim",
+        agentProviderReady: true,
         sourceMessageId: restartCommand.payload.id,
         now: 5_000,
       }) as { readonly job: { readonly id: string } };
@@ -4770,8 +4764,8 @@ describe("SQLite authoritative sessions", () => {
       }
       await Promise.all([submission, authorityCut]);
       const receipt = await submission;
-      const targetWasRevokedBeforeSend = targetKind === "human" && order === "authority-cut-first";
-      expect(receipt.targetOutcomes).toEqual([targetWasRevokedBeforeSend
+      const targetWasInvalidatedBeforeSend = order === "authority-cut-first";
+      expect(receipt.targetOutcomes).toEqual([targetWasInvalidatedBeforeSend
         ? {
             targetId,
             targetActorId,
@@ -4791,7 +4785,7 @@ describe("SQLite authoritative sessions", () => {
       expect(database.prepare(
         `SELECT status, rejection_code AS rejectionCode
          FROM message_target_outcomes WHERE message_id = ? AND target_id = ?`,
-      ).get(messageId, targetId)).toEqual(targetWasRevokedBeforeSend
+      ).get(messageId, targetId)).toEqual(targetWasInvalidatedBeforeSend
         ? {
             status: "rejected",
             rejectionCode: targetKind === "human"
@@ -4809,7 +4803,27 @@ describe("SQLite authoritative sessions", () => {
         : "agent_invocation_intents";
       expect(database.prepare(
         `SELECT status FROM ${intentTable} WHERE source_message_id = ?`,
-      ).all(messageId)).toEqual(targetWasRevokedBeforeSend ? [] : [{ status: "pending" }]);
+      ).all(messageId)).toEqual(targetWasInvalidatedBeforeSend ? [] : [{ status: "pending" }]);
+      if (targetKind === "agent" && !targetWasInvalidatedBeforeSend) {
+        expect(database.prepare(
+          `SELECT binding.profile_id AS profileId,
+                  binding.profile_revision AS profileRevision,
+                  binding.assignment_id AS assignmentId,
+                  binding.assignment_revision AS assignmentRevision,
+                  binding.access_revision AS accessRevision
+           FROM direct_agent_invocation_authority_bindings AS binding
+           JOIN agent_invocation_intents AS intent ON intent.id = binding.intent_id
+           WHERE intent.source_message_id = ?`,
+        ).all(messageId)).toEqual([
+          expect.objectContaining({
+            profileId: expect.any(String),
+            profileRevision: expect.any(Number),
+            assignmentId: expect.any(String),
+            assignmentRevision: expect.any(Number),
+            accessRevision: expect.any(Number),
+          }),
+        ]);
+      }
       expect(database.prepare(
         `SELECT role, participation FROM room_memberships
          WHERE room_id = ? AND actor_id = ?`,
@@ -5074,6 +5088,7 @@ describe("SQLite authoritative sessions", () => {
 
     await expect(fixture.client.executeRoute({
       type: "route.claim",
+      agentProviderReady: true,
       sourceMessageId,
       now: 5_100,
     })).resolves.toMatchObject({
@@ -5105,6 +5120,7 @@ describe("SQLite authoritative sessions", () => {
         reasonText: "must be discarded",
         priority: 1,
       }],
+      agentProviderReady: true,
       now: 5_150,
     })).resolves.toMatchObject({
       kind: "route-completed",
@@ -5229,6 +5245,7 @@ describe("SQLite authoritative sessions", () => {
 
     const claimed = await fixture.client.executeRoute({
       type: "route.claim",
+      agentProviderReady: true,
       sourceMessageId,
       now: 5_200,
     });
@@ -5281,6 +5298,7 @@ describe("SQLite authoritative sessions", () => {
 
     await expect(fixture.client.executeRoute({
       type: "route.claim",
+      agentProviderReady: true,
       sourceMessageId,
       now: 5_200,
     })).rejects.toMatchObject({ status: 409, code: "route_conflict" });
@@ -5778,6 +5796,39 @@ describe("SQLite authoritative sessions", () => {
          joined_at, configured_at, access_revision
        ) VALUES (?, 'agent-alternate', 'agent', NULL, 'active', '[]', NULL, ?, 1)`,
     ).run(fixture.contexts.roomId, "2026-08-19T01:04:00.000Z");
+    alternateMembership.exec(`
+      UPDATE agent_profiles
+      SET revision = revision + 1, status = 'enabled',
+          updated_at = '2026-08-19T01:04:00.000Z', source_kind = 'administrator_command'
+      WHERE actor_id = 'agent-alternate';
+      INSERT INTO agent_profile_revisions (
+        profile_id, revision, actor_id, display_name, global_responsibility, status,
+        capability_ceiling_json, tool_ceiling_json, changed_by_human_actor_id,
+        changed_at, operation
+      ) SELECT id, revision, actor_id, display_name, global_responsibility, status,
+               capability_ceiling_json, tool_ceiling_json, 'human-li',
+               '2026-08-19T01:04:00.000Z', 'enable'
+        FROM agent_profiles WHERE actor_id = 'agent-alternate';
+      INSERT INTO room_agent_assignments (
+        id, room_id, profile_id, agent_actor_id, revision, status, participation,
+        paused, capability_subset_json, tool_subset_json, room_responsibility,
+        created_at, updated_at, removed_at, source_kind
+      ) SELECT 'matrix-assignment-agent-alternate', 'room-matrix', id, actor_id, 1,
+               'current', 'active', 0, '[]', '[]', 'Answer in Matrix Room.',
+               '2026-08-19T01:04:00.000Z', '2026-08-19T01:04:00.000Z', NULL,
+               'room_command'
+        FROM agent_profiles WHERE actor_id = 'agent-alternate';
+      INSERT INTO room_agent_assignment_revisions (
+        assignment_id, revision, room_id, profile_id, agent_actor_id,
+        room_responsibility, status, participation, paused,
+        capability_subset_json, tool_subset_json, changed_by_human_actor_id,
+        changed_at, operation
+      ) SELECT id, revision, room_id, profile_id, agent_actor_id,
+               room_responsibility, status, participation, paused,
+               capability_subset_json, tool_subset_json, 'human-li',
+               '2026-08-19T01:04:00.000Z', 'create'
+        FROM room_agent_assignments WHERE id = 'matrix-assignment-agent-alternate';
+    `);
     alternateMembership.close();
     const ownerSession = {
       sessionId: fixture.contexts.owner.sessionId,

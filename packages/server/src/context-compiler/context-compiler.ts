@@ -339,10 +339,19 @@ export function compileContextV1(inputValue: ContextCompilerInputV1, configValue
   if (trustedTokens > config.trustedBudgetTokens || utf8ByteLength(trustedText) > config.trustedBytes) return tooLarge();
   const invocation = { invocationId: normalize(input.invocation.invocationId), executionId: normalize(input.invocation.executionId),
     roomId: normalize(input.invocation.roomId), intent: normalizeIntent(input.invocation.intent) };
-  const agent = { agentId: normalize(input.agent.agentId), displayName: normalize(input.agent.displayName),
-    responsibility: input.agent.responsibility.availability === "available"
-      ? { ...input.agent.responsibility, text: normalize(input.agent.responsibility.text) }
-      : { ...input.agent.responsibility } };
+  const agent = {
+    agentId: normalize(input.agent.agentId),
+    profileId: normalize(input.agent.profileId),
+    assignmentId: normalize(input.agent.assignmentId),
+    displayName: normalize(input.agent.displayName),
+    globalResponsibility: normalize(input.agent.globalResponsibility),
+    roomResponsibility: normalize(input.agent.roomResponsibility),
+    participation: input.agent.participation,
+    availability: input.agent.availability,
+    effectiveCapabilities: [...input.agent.effectiveCapabilities],
+    effectiveTools: [...input.agent.effectiveTools],
+    revisions: { ...input.agent.revisions },
+  };
   const room = { roomId: normalize(input.room.roomId), name: normalize(input.room.name),
     goal: input.room.goal.availability === "available"
       ? { ...input.room.goal, text: normalize(input.room.goal.text) }

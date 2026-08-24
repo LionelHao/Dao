@@ -113,6 +113,12 @@ import {
   type RoomAssignmentOperation,
   type RoomAssignmentResult,
 } from "../room-assignment/authority-protocol.js";
+import {
+  isFt07AgentSettingsServerFrame,
+  parseFt07AgentSettingsClientFrame,
+  type Ft07AgentSettingsClientFrame,
+  type Ft07AgentSettingsServerFrame,
+} from "../ft07-agent-settings-protocol.js";
 
 export type ContextWorkerOperation = ContextSnapshotAuthorityOperation | {
   readonly type: "context.finalize-agent-message";
@@ -483,6 +489,13 @@ export type AuthorityWorkerRequest =
       readonly operation: RoomAssignmentOperation;
     }
   | {
+      readonly type: "authority.agent-settings";
+      readonly requestId: string;
+      readonly context: AuthenticatedSessionContext | AuthenticatedCommandContext;
+      readonly frame: Ft07AgentSettingsClientFrame;
+      readonly now: number;
+    }
+  | {
       readonly type: "authority.message-submit";
       readonly requestId: string;
       readonly context: AuthenticatedCommandContext;
@@ -684,12 +697,12 @@ export type AuthorityWorkerResponse =
   | {
       readonly type: "authority.ready";
       readonly requestId: string;
-      readonly schemaVersion: 20;
+      readonly schemaVersion: 21;
     }
   | {
       readonly type: "authority.schema";
       readonly requestId: string;
-      readonly schemaVersion: 20;
+      readonly schemaVersion: 21;
     }
   | {
       readonly type: "authority.legacy-imported";
@@ -766,6 +779,11 @@ export type AuthorityWorkerResponse =
       readonly type: "authority.room-assignment-result";
       readonly requestId: string;
       readonly result: RoomAssignmentResult;
+    }
+  | {
+      readonly type: "authority.agent-settings-result";
+      readonly requestId: string;
+      readonly result: Ft07AgentSettingsServerFrame;
     }
   | {
       readonly type: "authority.message-submitted";
@@ -1611,6 +1629,15 @@ export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWork
     case "authority.room-assignment":
       return hasExactKeys(value, ["type", "requestId", "operation"]) &&
         isRoomAssignmentOperation(value.operation);
+    case "authority.agent-settings": {
+      const parsed = parseFt07AgentSettingsClientFrame(value.frame);
+      const mutation = parsed.ok && "idempotencyKey" in parsed.frame;
+      return hasExactKeys(value, ["type", "requestId", "context", "frame", "now"]) &&
+        parsed.ok && (mutation
+          ? isAuthenticatedCommandContext(value.context)
+          : isAuthenticatedSessionContext(value.context)) &&
+        isNonNegativeSafeInteger(value.now);
+    }
     case "authority.message-submit":
       return hasExactKeys(value, ["type", "requestId", "context", "message", "now"]) &&
         isAuthenticatedCommandContext(value.context) && isHumanMessageSubmit(value.message) &&
@@ -1751,7 +1778,7 @@ export function isAuthorityWorkerResponse(
     case "authority.schema":
       return (
         hasExactKeys(value, ["type", "requestId", "schemaVersion"]) &&
-        value.schemaVersion === 20
+        value.schemaVersion === 21
       );
     case "authority.closed":
       return hasExactKeys(value, ["type", "requestId"]);
@@ -1801,6 +1828,9 @@ export function isAuthorityWorkerResponse(
     case "authority.room-assignment-result":
       return hasExactKeys(value, ["type", "requestId", "result"]) &&
         isRoomAssignmentResult(value.result);
+    case "authority.agent-settings-result":
+      return hasExactKeys(value, ["type", "requestId", "result"]) &&
+        isFt07AgentSettingsServerFrame(value.result);
     case "authority.message-submitted":
       return hasExactKeys(value, ["type", "requestId", "receipt"]) &&
         isSubmissionReceipt(value.receipt);

@@ -57,6 +57,12 @@ import {
 } from "./persistence/contracts.js";
 import type { MessageErrorCode } from "./service.js";
 import type { MessageStoreErrorCode } from "./store.js";
+import {
+  isFt07AgentSettingsFrameType,
+  parseFt07AgentSettingsClientFrame,
+  type Ft07AgentSettingsClientFrame,
+  type Ft07AgentSettingsServerFrame,
+} from "./ft07-agent-settings-protocol.js";
 
 const AUTH_LOGIN_FIELDS = new Set(["type", "requestId", "accountId", "secret", "device"]);
 const AUTH_LOGIN_DEVICE_FIELDS = new Set(["id", "label", "platform"]);
@@ -461,7 +467,8 @@ export type ClientFrame =
   | LightTaskTransitionFrame
   | LightTaskCriterionSetFrame
   | AttachmentClientFrame
-  | RoomMemoryRequest;
+  | RoomMemoryRequest
+  | Ft07AgentSettingsClientFrame;
 
 export interface AuthenticatedFrame {
   readonly type: "auth.authenticated";
@@ -725,6 +732,23 @@ export type ProtocolErrorCode =
   | MessageStoreErrorCode
   | "unauthenticated"
   | "room_forbidden"
+  | "administrator_required"
+  | "administrator_already_exists"
+  | "administrator_not_found"
+  | "last_administrator_required"
+  | "administrator_revision_conflict"
+  | "profile_forbidden"
+  | "profile_not_found"
+  | "profile_gone"
+  | "profile_revision_conflict"
+  | "profile_state_conflict"
+  | "assignment_not_found"
+  | "assignment_gone"
+  | "assignment_already_exists"
+  | "assignment_revision_conflict"
+  | "capability_ceiling_conflict"
+  | "capacity_limited"
+  | "provider_configuration_unavailable"
   | "identity_forbidden"
   | "already_authenticated"
   | "invalid_request"
@@ -861,6 +885,7 @@ export type ServerFrame =
   | BallQueryResultFrame
   | AttachmentAuthorityServerFrame
   | RoomMemorySuccessFrame
+  | Ft07AgentSettingsServerFrame
   | ProtocolErrorFrame;
 
 export type ClientFrameParseResult =
@@ -1017,6 +1042,18 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
   )
     ? value.requestId
     : undefined;
+  if (isFt07AgentSettingsFrameType(value.type)) {
+    const parsed = parseFt07AgentSettingsClientFrame(value);
+    return parsed.ok
+      ? parsed
+      : {
+          ok: false,
+          error: protocolError(
+            "FT-07 Agent Settings request must use a closed authority frame",
+            parsed.requestId,
+          ),
+        };
+  }
   if (typeof value.type === "string" && value.type.startsWith("room.memory.")) {
     if (requestId !== undefined && isRoomMemoryRequest(value)) {
       return { ok: true, frame: value };

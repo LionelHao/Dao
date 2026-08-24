@@ -1,0 +1,221 @@
+.dao-agent-settings {
+  display: grid;
+  inline-size: min(45rem, 100%);
+  max-inline-size: 100%;
+  max-block-size: 100%;
+  gap: 1rem;
+  padding: 1rem 1.125rem 1.5rem;
+  overflow: auto;
+  color: #1f2937;
+  background: #fff;
+  overflow-wrap: anywhere;
+}
+
+.agent-settings-header {
+  position: sticky;
+  inset-block-start: -1rem;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.25rem 0.75rem;
+  padding-block: 0.875rem;
+  border-block-end: 1px solid #e2e8f0;
+  background: #fff;
+}
+
+.agent-settings-header h1,
+.agent-settings-header p,
+.dao-agent-settings h2,
+.dao-agent-settings h3,
+.dao-agent-settings p {
+  margin: 0;
+}
+
+.agent-settings-header .agent-settings-metadata {
+  grid-column: 1;
+}
+
+.agent-settings-header [data-action="close-settings"] {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+}
+
+.agent-settings-live {
+  position: absolute;
+  inline-size: 1px;
+  block-size: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.agent-settings-provider,
+.agent-settings-human-path,
+.agent-settings-profile-path,
+.agent-settings-assignment-path,
+.agent-profile-card,
+.agent-assignment-card,
+.agent-settings-error,
+.agent-settings-revoked {
+  display: grid;
+  max-inline-size: 100%;
+  gap: 0.625rem;
+  padding: 0.875rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 0.5625rem;
+  background: #fff;
+}
+
+.agent-settings-human-path {
+  border-style: dashed;
+  border-color: #84adff;
+  background: #f5f8ff;
+}
+
+.agent-settings-assignment-path {
+  border-inline-start: 0.375rem solid #344054;
+  border-start-start-radius: 0;
+  border-end-start-radius: 0;
+  background: #f8fafc;
+}
+
+.agent-profile-card,
+.agent-assignment-card {
+  background: #fff;
+}
+
+.agent-settings-provider {
+  border-color: #84adff;
+  background: #eef4ff;
+}
+
+.agent-settings-field {
+  display: grid;
+  min-inline-size: 0;
+  gap: 0.3125rem;
+  color: #344054;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.agent-settings-field input,
+.agent-settings-field textarea,
+.agent-settings-field select,
+.agent-settings-action {
+  min-block-size: 2.25rem;
+  max-inline-size: 100%;
+  padding: 0.4375rem 0.625rem;
+  border: 1px solid #64748b;
+  border-radius: 0.375rem;
+  color: #1f2937;
+  background: #fff;
+  font: inherit;
+}
+
+.agent-settings-field textarea {
+  min-block-size: 4.5rem;
+  resize: vertical;
+}
+
+.agent-settings-action {
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.agent-settings-action[data-destructive="true"] {
+  border-color: #b42318;
+  color: #8a2118;
+}
+
+.agent-settings-action:disabled,
+.agent-settings-field :disabled {
+  cursor: not-allowed;
+  color: #475569;
+  background: #f1f5f9;
+}
+
+.agent-settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4375rem;
+}
+
+.agent-settings-metadata,
+.agent-settings-grants {
+  color: #475569;
+  font: 500 0.6875rem/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.agent-settings-state-label {
+  border-inline-start: 0.1875rem solid #475569;
+  padding: 0.3125rem 0.5rem;
+  color: #334155;
+  background: #f8fafc;
+  font: 700 0.6875rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.agent-settings-availability[data-availability="ready"] { border-inline-start-style: solid; }
+.agent-settings-availability[data-availability="busy"] { border-inline-start-style: double; }
+.agent-settings-availability[data-availability="paused"] { border-inline-start-style: dashed; }
+.agent-settings-availability[data-availability="noauth"] { border-inline-start-style: dotted; }
+
+.agent-settings-connection,
+.agent-settings-archived {
+  padding: 0.75rem;
+  border: 1px solid #f0c48a;
+  border-inline-start: 0.1875rem solid #b54708;
+  color: #7c4a08;
+  background: #fffaf0;
+}
+
+.agent-settings-error,
+.agent-settings-revoked {
+  border-color: #f0a9a3;
+  border-inline-start: 0.1875rem solid #b42318;
+  color: #6f1d17;
+  background: #fff5f4;
+}
+
+.dao-agent-settings :focus-visible {
+  outline: 0.1875rem solid #2563eb;
+  outline-offset: 0.125rem;
+}
+
+/* Electron's minimum window is 840×560; the drawer becomes the only content column. */
+@media (max-width: 52.5rem) {
+  .dao-agent-settings {
+    inline-size: 100%;
+    padding-inline: 0.75rem;
+  }
+
+  .agent-settings-header {
+    inset-block-start: -1rem;
+  }
+
+  .agent-settings-field input,
+  .agent-settings-field textarea,
+  .agent-settings-field select,
+  .agent-settings-action {
+    inline-size: 100%;
+  }
+}
+
+/* 200% desktop zoom keeps controls in-flow and discoverable instead of hiding them. */
+@media (min-resolution: 2dppx) {
+  .agent-settings-actions {
+    align-items: stretch;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dao-agent-settings,
+  .dao-agent-settings *,
+  .dao-agent-settings *::before,
+  .dao-agent-settings *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

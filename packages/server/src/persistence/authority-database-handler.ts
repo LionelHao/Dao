@@ -123,6 +123,17 @@ import {
 } from
   "../message-authority/sqlite-operational-message-projection.js";
 import { canStartRuntimeGenerationInTransaction } from "../agent-runtime/runtime-archive-fence-participant.js";
+import {
+  FrozenRuntimeAuthorityError,
+  requireFrozenRuntimeAuthority,
+  type FrozenRuntimeAuthorityHandoff,
+} from "../agent-runtime/frozen-runtime-authority-gate.js";
+import {
+  claimRoutedInvocationIntent,
+  readPendingRoutedInvocationIntents,
+  readRoutedInvocationIntent,
+  type RoutedInvocationIntentRecord,
+} from "../agent-runtime/durable-trusted-intent-authority.js";
 import type { CommittedRoomCacheInvalidationIntent } from "../access/room-cache-invalidation-port.js";
 import {
   BALL_BOUNDARY_TIMER_DESCRIPTOR_ID,
@@ -476,6 +487,20 @@ export interface DatabaseCommandResult {
 
 function fail(code: AuthorityWorkerErrorCode, message: string): never {
   throw new AuthorityDatabaseError(code, message);
+}
+
+function requireRuntimeFrozenHandoff(
+  database: DatabaseSync,
+  executionId: string,
+): FrozenRuntimeAuthorityHandoff {
+  try {
+    return requireFrozenRuntimeAuthority(database, executionId);
+  } catch (error) {
+    if (error instanceof FrozenRuntimeAuthorityError) {
+      return fail("permission_denied", error.message);
+    }
+    throw error;
+  }
 }
 
 function failFromGovernanceCoordinator(error: unknown): never {
@@ -5205,6 +5230,7 @@ function insertLegacyRuntimeInvocationLineage(
     readonly intentKind: "direct_mention" | "structured_help" | "routed_candidate";
     readonly executionId: string;
     readonly createdAt: string;
+    readonly frozenAuthorityIntentId?: string;
   },
 ): void {
   database.prepare(
@@ -5224,7 +5250,7 @@ function insertLegacyRuntimeInvocationLineage(
     input.intentKind,
     input.executionId,
     input.createdAt,
-    input.intentId,
+    input.frozenAuthorityIntentId ?? input.intentId,
     input.createdAt,
   );
   database.prepare(
@@ -5420,14 +5446,6 @@ function appendRouteJudgmentEvent(
   appendRoomOutbox(database, eventId, job.roomId, streamSeq, occurredAt, "route-judgment", judgment.id);
 }
 
-function directMentionAgentIds(body: string, agentIds: readonly string[]): readonly string[] {
-  const mentioned = new Set<string>();
-  for (const match of body.matchAll(/@([\p{L}\p{N}_.:-]+)/gu)) {
-    if (match[1] !== undefined) mentioned.add(match[1]);
-  }
-  return agentIds.filter((agentId) => mentioned.has(agentId));
-}
-
 function closeRouteAfterExhaustion(
   database: DatabaseSync,
   job: RouteJob,
@@ -5583,6 +5601,249 @@ function terminalizeAgentAuthoredRouteJob(
   return completed;
 }
 
+function closedStringSet(value: unknown, label: string): readonly string[] {
+  let parsed: unknown;
+  try {
+    parsed = typeof value === "string" ? JSON.parse(value) : undefined;
+  } catch {
+    return fail("storage_unavailable", `${label} was corrupt`);
+  }
+  if (!Array.isArray(parsed) || !parsed.every((entry) =>
+    typeof entry === "string" && entry.trim().length > 0)) {
+    return fail("storage_unavailable", `${label} was corrupt`);
+  }
+  return [...new Set(parsed)].sort((left, right) => left.localeCompare(right));
+}
+
+function ensureRouteCandidateSnapshot(
+  database: DatabaseSync,
+  job: RouteJob,
+  occurredAt: string,
+  providerReady: boolean,
+): string {
+  const existing = database.prepare(
+    "SELECT candidate_snapshot_id AS snapshotId FROM route_jobs WHERE id = ?",
+  ).get(job.id);
+  if (typeof existing?.snapshotId === "string") return existing.snapshotId;
+  const source = database.prepare(
+    `SELECT room.governance_revision AS roomRevision,
+            message.author_kind AS sourceAuthorKind,
+            envelope.message_kind AS sourceMessageKind,
+            envelope.current_revision AS sourceMessageRevision
+     FROM route_jobs AS route
+     JOIN rooms AS room ON room.id = route.room_id
+     JOIN messages AS message ON message.id = route.source_message_id
+     JOIN message_envelopes AS envelope
+       ON envelope.message_id = message.id AND envelope.room_id = route.room_id
+      AND envelope.lifecycle = 'active'
+     WHERE route.id = ?`,
+  ).get(job.id);
+  if (typeof source?.roomRevision !== "number" ||
+      (source.sourceAuthorKind !== "human" && source.sourceAuthorKind !== "agent") ||
+      (source.sourceMessageKind !== "human" && source.sourceMessageKind !== "agent-final" &&
+       source.sourceMessageKind !== "agent-correction") ||
+      typeof source.sourceMessageRevision !== "number") {
+    return fail("storage_unavailable", "Route candidate source authority was unavailable");
+  }
+  const candidates = providerReady ? database.prepare(
+    `SELECT legacy.agent_id AS actorId, profile.id AS profileId,
+            profile.revision AS profileRevision, assignment.id AS assignmentId,
+            assignment.revision AS assignmentRevision,
+            membership.access_revision AS accessRevision,
+            assignment.participation, assignment.room_responsibility AS roomResponsibility,
+            assignment.capability_subset_json AS capabilitiesJson,
+            assignment.tool_subset_json AS assignmentToolsJson,
+            membership.tool_permissions_json AS membershipToolsJson,
+            legacy.calibration_score AS calibrationScore, legacy.has_ball AS hasBall,
+            (SELECT COUNT(*) FROM agent_executions AS execution
+             WHERE execution.room_id = route.room_id
+               AND execution.agent_id = legacy.agent_id
+               AND execution.status IN ('queued', 'running')) AS activeExecutionCount
+     FROM route_jobs AS route
+     JOIN route_job_agents AS legacy ON legacy.route_job_id = route.id
+     JOIN agent_profiles AS profile ON profile.actor_id = legacy.agent_id
+     JOIN room_agent_assignments AS assignment
+       ON assignment.room_id = route.room_id
+      AND assignment.agent_actor_id = legacy.agent_id
+      AND assignment.profile_id = profile.id
+     JOIN room_memberships AS membership
+       ON membership.room_id = route.room_id
+      AND membership.actor_id = legacy.agent_id
+     JOIN rooms AS room ON room.id = route.room_id
+     WHERE route.id = ? AND room.status = 'active' AND profile.status = 'enabled'
+       AND assignment.status = 'current' AND assignment.participation = 'active'
+       AND assignment.paused = 0 AND membership.kind = 'agent'
+       AND membership.participation = 'active'
+     ORDER BY legacy.agent_id`,
+  ).all(job.id).filter((row) => row.activeExecutionCount === 0) : [];
+  const frozen = candidates.map((candidate, candidateOrder) => {
+    if (typeof candidate.actorId !== "string" || typeof candidate.profileId !== "string" ||
+        typeof candidate.profileRevision !== "number" ||
+        typeof candidate.assignmentId !== "string" ||
+        typeof candidate.assignmentRevision !== "number" ||
+        typeof candidate.accessRevision !== "number" || candidate.participation !== "active" ||
+        typeof candidate.roomResponsibility !== "string" ||
+        typeof candidate.calibrationScore !== "number" ||
+        (candidate.hasBall !== 0 && candidate.hasBall !== 1)) {
+      return fail("storage_unavailable", "Route candidate authority was corrupt");
+    }
+    const capabilities = closedStringSet(candidate.capabilitiesJson, "Route capability authority");
+    const assignmentTools = closedStringSet(candidate.assignmentToolsJson, "Route Assignment tools");
+    const membershipTools = new Set(closedStringSet(
+      candidate.membershipToolsJson,
+      "Route membership tools",
+    ));
+    return {
+      actorId: candidate.actorId,
+      profileId: candidate.profileId,
+      profileRevision: candidate.profileRevision,
+      assignmentId: candidate.assignmentId,
+      assignmentRevision: candidate.assignmentRevision,
+      accessRevision: candidate.accessRevision,
+      participation: "active" as const,
+      availability: "ready" as const,
+      roomResponsibility: candidate.roomResponsibility,
+      capabilities,
+      tools: assignmentTools.filter((tool) => membershipTools.has(tool)),
+      calibrationScore: candidate.calibrationScore,
+      hasBall: candidate.hasBall === 1,
+      candidateOrder,
+    };
+  });
+  const snapshotId = stableId("route-candidate-snapshot", job.id, String(job.currentAttempt));
+  const snapshotHash = createHash("sha256").update(canonicalJson({
+    version: 1,
+    routeJobId: job.id,
+    roomId: job.roomId,
+    sourceMessageId: job.sourceMessageId,
+    sourceMessageRevision: source.sourceMessageRevision,
+    candidates: frozen,
+  })).digest("hex");
+  database.prepare(
+    `INSERT INTO route_candidate_snapshots (
+       id, route_job_id, room_id, room_revision, source_message_id,
+       source_message_revision, source_author_kind, source_message_kind,
+       snapshot_version, candidate_count, snapshot_sha256, created_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+  ).run(snapshotId, job.id, job.roomId, Math.max(1, source.roomRevision),
+    job.sourceMessageId, source.sourceMessageRevision, source.sourceAuthorKind,
+    source.sourceMessageKind, frozen.length, snapshotHash, occurredAt);
+  for (const candidate of frozen) {
+    database.prepare(
+      `INSERT INTO route_candidate_snapshot_agents (
+         snapshot_id, route_job_id, agent_actor_id, profile_id, profile_revision,
+         assignment_id, assignment_revision, access_revision, participation,
+         availability, room_responsibility, effective_capabilities_json,
+         effective_tools_json, calibration_score, has_ball, goal_fact_revision,
+         project_fact_revision, ball_fact_revision, candidate_order
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', 'ready', ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`,
+    ).run(snapshotId, job.id, candidate.actorId, candidate.profileId,
+      candidate.profileRevision, candidate.assignmentId, candidate.assignmentRevision,
+      candidate.accessRevision, candidate.roomResponsibility,
+      JSON.stringify(candidate.capabilities), JSON.stringify(candidate.tools),
+      candidate.calibrationScore, candidate.hasBall ? 1 : 0,
+      candidate.hasBall ? 1 : null, candidate.candidateOrder);
+  }
+  const bound = database.prepare(
+    `UPDATE route_jobs SET candidate_snapshot_id = ?
+     WHERE id = ? AND candidate_snapshot_id IS NULL`,
+  ).run(snapshotId, job.id);
+  if (bound.changes !== 1) return fail("route_conflict", "Route candidate snapshot changed concurrently");
+  return snapshotId;
+}
+
+function routeHandoffs(
+  database: DatabaseSync,
+  roomId: string,
+  intentIds: readonly string[],
+): readonly RoutedInvocationIntentRecord[] {
+  return withDatabaseAuthorityTransactionView(
+    database,
+    roomId,
+    stableId("route-handoffs-read", roomId, ...intentIds),
+    (transaction) => Object.freeze(intentIds.map((intentId) => {
+      const intent = readRoutedInvocationIntent(transaction, intentId);
+      if (intent === undefined) return fail("storage_unavailable", "Durable route handoff was unavailable");
+      return intent;
+    })),
+  );
+}
+
+function routeSelectionAuthorityRejection(
+  database: DatabaseSync,
+  job: RouteJob,
+  sourceMessageRevision: number,
+  candidate: Readonly<{
+    agentId: string;
+    profileId: string;
+    profileRevision: number;
+    assignmentId: string;
+    assignmentRevision: number;
+    accessRevision: number;
+  }>,
+  providerReady: boolean,
+): string | undefined {
+  const current = database.prepare(
+    `SELECT room.status AS roomStatus, actor.kind AS actorKind,
+            source.author_kind AS sourceAuthorKind,
+            envelope.message_kind AS sourceMessageKind,
+            envelope.lifecycle AS sourceLifecycle,
+            envelope.current_revision AS currentSourceRevision,
+            profile.actor_id AS profileActorId, profile.status AS profileStatus,
+            profile.revision AS currentProfileRevision,
+            assignment.room_id AS assignmentRoomId,
+            assignment.profile_id AS assignmentProfileId,
+            assignment.agent_actor_id AS assignmentActorId,
+            assignment.status AS assignmentStatus,
+            assignment.participation AS assignmentParticipation,
+            assignment.paused AS assignmentPaused,
+            assignment.revision AS currentAssignmentRevision,
+            membership.kind AS membershipKind,
+            membership.participation AS membershipParticipation,
+            membership.access_revision AS currentAccessRevision,
+            (SELECT COUNT(*) FROM agent_executions AS execution
+             WHERE execution.room_id = room.id AND execution.agent_id = ?
+               AND execution.status IN ('queued', 'running')) AS runningExecutionCount
+     FROM rooms AS room
+     LEFT JOIN actors AS actor ON actor.id = ?
+     LEFT JOIN messages AS source ON source.id = ? AND source.room_id = room.id
+     LEFT JOIN message_envelopes AS envelope
+       ON envelope.message_id = source.id AND envelope.room_id = room.id
+     LEFT JOIN agent_profiles AS profile ON profile.id = ?
+     LEFT JOIN room_agent_assignments AS assignment ON assignment.id = ?
+     LEFT JOIN room_memberships AS membership
+       ON membership.room_id = room.id AND membership.actor_id = ?
+     WHERE room.id = ?`,
+  ).get(candidate.agentId, candidate.agentId, job.sourceMessageId, candidate.profileId,
+    candidate.assignmentId, candidate.agentId, job.roomId);
+  if (current?.roomStatus !== "active") return "room_archived";
+  if (current.sourceAuthorKind !== "human" || current.sourceMessageKind !== "human" ||
+      current.sourceLifecycle !== "active" ||
+      current.currentSourceRevision !== sourceMessageRevision) return "source_revision_stale";
+  if (current.actorKind !== "agent" || current.profileActorId !== candidate.agentId ||
+      current.profileStatus !== "enabled") return "profile_unavailable";
+  if (current.currentProfileRevision !== candidate.profileRevision) return "profile_revision_stale";
+  if (current.assignmentRoomId !== job.roomId ||
+      current.assignmentProfileId !== candidate.profileId ||
+      current.assignmentActorId !== candidate.agentId || current.assignmentStatus !== "current") {
+    return "assignment_removed";
+  }
+  if (current.assignmentPaused === 1) return "assignment_paused";
+  if (current.assignmentParticipation !== "active") return "assignment_inactive";
+  if (current.currentAssignmentRevision !== candidate.assignmentRevision) {
+    return "assignment_revision_stale";
+  }
+  if (current.membershipKind !== "agent" || current.membershipParticipation !== "active") {
+    return "access_revoked";
+  }
+  if (current.currentAccessRevision !== candidate.accessRevision) return "access_revision_stale";
+  if (!providerReady) return "noauth";
+  if (typeof current.runningExecutionCount !== "number" || current.runningExecutionCount > 0) {
+    return "busy";
+  }
+  return undefined;
+}
+
 export function executeRouteAuthorityOperation(
   database: DatabaseSync,
   operation: RouteAuthorityOperation,
@@ -5631,6 +5892,7 @@ export function executeRouteAuthorityOperation(
           kind: "route-completed",
           job: terminalizeAgentAuthoredRouteJob(database, queued, occurredAt),
           intents: [],
+          handoffs: [],
         };
       }
       const claimed = database.prepare(
@@ -5643,14 +5905,22 @@ export function executeRouteAuthorityOperation(
          WHERE route_job_id = ? AND attempt_seq = ? AND status = 'queued'`,
       ).run(occurredAt, queued.id, queued.currentAttempt);
       appendRouteLifecycleEvent(database, routeJobById(database, queued.id), occurredAt, "started");
+      const running = routeJobById(database, queued.id);
+      const candidateSnapshotId = ensureRouteCandidateSnapshot(
+        database,
+        running,
+        occurredAt,
+        operation.agentProviderReady,
+      );
       const memberRows = database.prepare(
-        `SELECT snapshot.agent_id AS agentId, snapshot.participation, snapshot.role,
-                snapshot.capabilities_json AS capabilitiesJson,
+        `SELECT snapshot.agent_actor_id AS agentId, snapshot.participation,
+                snapshot.room_responsibility AS role,
+                snapshot.effective_capabilities_json AS capabilitiesJson,
                 snapshot.calibration_score AS calibrationScore,
                 snapshot.has_ball AS hasBall
-         FROM route_job_agents AS snapshot
-         WHERE snapshot.route_job_id = ? ORDER BY snapshot.agent_id`,
-      ).all(queued.id);
+         FROM route_candidate_snapshot_agents AS snapshot
+         WHERE snapshot.snapshot_id = ? ORDER BY snapshot.candidate_order`,
+      ).all(candidateSnapshotId);
       const agents = memberRows.map((member) => {
         let capabilities: unknown;
         try {
@@ -5712,7 +5982,6 @@ export function executeRouteAuthorityOperation(
         }
         return { agentId: entry.agentId, lastRespondedAt };
       });
-      const running = routeJobById(database, queued.id);
       return {
         kind: "route-claimed",
         job: running,
@@ -5740,10 +6009,10 @@ export function executeRouteAuthorityOperation(
           },
         },
         decisionContext: {
-          directMentionAgentIds: directMentionAgentIds(
-            message.body,
-            agents.map((agent) => agent.agentId),
-          ),
+          // Direct targets are created only from FT-03 structured message targets
+          // in the message transaction. Body text and display names are never a
+          // routing authority input.
+          directMentionAgentIds: [],
           structuredHelpAgentIds: [],
           recentHumanMessageTimes,
           consecutiveAgentRounds,
@@ -5765,18 +6034,48 @@ export function executeRouteAuthorityOperation(
           kind: "route-completed",
           job: terminalizeAgentAuthoredRouteJob(database, job, occurredAt),
           intents: [],
+          handoffs: [],
         };
       }
       if (source?.authorKind !== "human") {
         return fail("storage_unavailable", "Route source author was corrupt");
       }
-      const snapshotAgents = database.prepare(
-        `SELECT agent_id AS agentId FROM route_job_agents
-         WHERE route_job_id = ? ORDER BY agent_id`,
-      ).all(job.id).map((entry) => {
-        if (typeof entry.agentId !== "string") return fail("storage_unavailable", "Route Agent snapshot was corrupt");
-        return entry.agentId;
+      const snapshot = database.prepare(
+        `SELECT snapshot.id AS snapshotId, snapshot.source_message_revision AS sourceMessageRevision,
+                route.revision AS routeRevision
+         FROM route_candidate_snapshots AS snapshot
+         JOIN route_jobs AS route ON route.id = snapshot.route_job_id
+         WHERE snapshot.route_job_id = ? AND snapshot.id = route.candidate_snapshot_id`,
+      ).get(job.id);
+      if (typeof snapshot?.snapshotId !== "string" ||
+          typeof snapshot.sourceMessageRevision !== "number" ||
+          typeof snapshot.routeRevision !== "number") {
+        return fail("storage_unavailable", "Route candidate snapshot was unavailable");
+      }
+      const snapshotCandidateRows = database.prepare(
+        `SELECT agent_actor_id AS agentId, profile_id AS profileId,
+                profile_revision AS profileRevision, assignment_id AS assignmentId,
+                assignment_revision AS assignmentRevision, access_revision AS accessRevision
+         FROM route_candidate_snapshot_agents
+         WHERE snapshot_id = ? ORDER BY candidate_order`,
+      ).all(snapshot.snapshotId);
+      const snapshotCandidates = snapshotCandidateRows.map((entry) => {
+        if (typeof entry.agentId !== "string" || typeof entry.profileId !== "string" ||
+            typeof entry.profileRevision !== "number" || typeof entry.assignmentId !== "string" ||
+            typeof entry.assignmentRevision !== "number" || typeof entry.accessRevision !== "number") {
+          return fail("storage_unavailable", "Route Agent snapshot was corrupt");
+        }
+        return {
+          agentId: entry.agentId,
+          profileId: entry.profileId,
+          profileRevision: entry.profileRevision,
+          assignmentId: entry.assignmentId,
+          assignmentRevision: entry.assignmentRevision,
+          accessRevision: entry.accessRevision,
+        };
       });
+      const snapshotAgents = snapshotCandidates.map((entry) => entry.agentId);
+      const snapshotCandidateByAgent = new Map(snapshotCandidates.map((entry) => [entry.agentId, entry]));
       const expectedAgents = new Set(snapshotAgents);
       const judgmentByAgent = new Map<string, RouteJudgment>();
       for (const judgment of operation.judgments) {
@@ -5790,7 +6089,6 @@ export function executeRouteAuthorityOperation(
       if (judgmentByAgent.size !== expectedAgents.size) {
         return fail("route_conflict", "Route judgment set omitted an Agent");
       }
-      const currentRoom = database.prepare("SELECT status FROM rooms WHERE id = ?").get(job.roomId);
       const acceptedIntents: RouteInvocationIntent[] = [];
       const intentAgents = new Set<string>();
       for (const intent of operation.intents) {
@@ -5799,19 +6097,21 @@ export function executeRouteAuthorityOperation(
           return fail("route_conflict", "Route invocation intent was invalid");
         }
         intentAgents.add(intent.targetAgentId);
-        const membership = database.prepare(
-          `SELECT membership.kind, actor.kind AS actorKind
-           FROM room_memberships AS membership
-           JOIN actors AS actor ON actor.id = membership.actor_id
-           WHERE membership.room_id = ? AND membership.actor_id = ?`,
-        ).get(job.roomId, intent.targetAgentId);
-        if (currentRoom?.status !== "active" || membership?.kind !== "agent" || membership.actorKind !== "agent") {
+        const candidate = snapshotCandidateByAgent.get(intent.targetAgentId)!;
+        const rejection = routeSelectionAuthorityRejection(
+          database,
+          job,
+          snapshot.sourceMessageRevision,
+          candidate,
+          operation.agentProviderReady,
+        );
+        if (rejection !== undefined) {
           const previous = judgmentByAgent.get(intent.targetAgentId)!;
           judgmentByAgent.set(intent.targetAgentId, {
             ...previous,
             outcome: "suppressed",
             reasonCode: "permission_denied",
-            reasonText: "current Agent membership permission denied",
+            reasonText: `authority_changed:${rejection}`,
           });
           continue;
         }
@@ -5866,6 +6166,48 @@ export function executeRouteAuthorityOperation(
           occurredAt,
         );
       }
+      const routedAccepted = acceptedIntents.filter((intent) =>
+        intent.kind === "routed_candidate" &&
+        (intent.reasonCode === "domain_match" || intent.reasonCode === "risk_detected" ||
+         intent.reasonCode === "ball_due"));
+      const decisionId = stableId("route-decision", job.id, String(job.currentAttempt));
+      const decisionOutcome = operation.terminalErrorCode !== undefined ? "failed"
+        : routedAccepted.length > 0 ? "selected" : "suppressed";
+      const decisionReason = decisionOutcome === "selected" ? "selected"
+        : decisionOutcome === "failed" ? "provider_failed"
+          : [...judgmentByAgent.values()].some((judgment) =>
+            judgment.reasonText.startsWith("dependency_unavailable:"))
+            ? "missing_authority_facts"
+            : "candidate_not_found";
+      database.prepare(
+        `INSERT INTO route_decisions (
+           id, route_job_id, expected_route_job_revision, snapshot_id,
+           outcome, reason_code, decided_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).run(decisionId, job.id, snapshot.routeRevision, snapshot.snapshotId,
+        decisionOutcome, decisionReason, occurredAt);
+      const routedIntentIds: string[] = [];
+      for (const intent of routedAccepted) {
+        const candidate = snapshotCandidateByAgent.get(intent.targetAgentId);
+        if (candidate === undefined) return fail("route_conflict", "Routed intent candidate binding was unavailable");
+        const intentId = stableId("routed-invocation-intent", decisionId, intent.targetAgentId);
+        const trigger = intent.reasonCode === "domain_match" ? "domain"
+          : intent.reasonCode === "risk_detected" ? "risk" : "ball";
+        database.prepare(
+          `INSERT INTO routed_agent_invocation_intents (
+             id, route_decision_id, route_job_id, snapshot_id, room_id,
+             source_message_id, source_message_revision, target_agent_actor_id,
+             profile_id, profile_revision, assignment_id, assignment_revision,
+             access_revision, trigger_kind, reason_text, status, created_at,
+             claimed_at, cancelled_at, cancellation_reason
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL, NULL)`,
+        ).run(intentId, decisionId, job.id, snapshot.snapshotId, job.roomId,
+          job.sourceMessageId, snapshot.sourceMessageRevision, intent.targetAgentId,
+          candidate.profileId, candidate.profileRevision, candidate.assignmentId,
+          candidate.assignmentRevision, candidate.accessRevision, trigger,
+          intent.reasonText, occurredAt);
+        routedIntentIds.push(intentId);
+      }
       if (operation.terminalErrorCode === undefined) {
         database.prepare(
           `UPDATE route_attempts SET status = 'completed', finished_at = ?
@@ -5910,6 +6252,7 @@ export function executeRouteAuthorityOperation(
         kind: "route-completed",
         job: terminalJob,
         intents: acceptedIntents,
+        handoffs: routeHandoffs(database, job.roomId, routedIntentIds),
       };
     }
 
@@ -5918,6 +6261,40 @@ export function executeRouteAuthorityOperation(
       if (job.currentAttempt !== operation.attempt) return fail("route_conflict", "Route failure was stale");
       const failed = failRouteAttempt(database, job, operation.errorCode, operation.now);
       return { kind: "route-failed", ...failed };
+    }
+
+    if (operation.type === "route.handoff.claim") {
+      const result = withDatabaseAuthorityTransactionView(
+        database,
+        operation.roomId,
+        stableId("route-handoff-claim", operation.intentId),
+        (transaction) => claimRoutedInvocationIntent(transaction, {
+          intentId: operation.intentId,
+          claimedAt: occurredAt,
+          providerReady: operation.providerReady,
+        }),
+      );
+      return { kind: "route-handoff-claimed", result };
+    }
+
+    if (operation.type === "route.handoff.recover") {
+      const rooms = database.prepare(
+        `SELECT DISTINCT room_id AS roomId FROM routed_agent_invocation_intents
+         WHERE status = 'pending' ORDER BY room_id LIMIT 256`,
+      ).all();
+      const intents = rooms.flatMap((row) => {
+        if (typeof row.roomId !== "string") {
+          return fail("storage_unavailable", "Route handoff recovery Room was corrupt");
+        }
+        return withDatabaseAuthorityTransactionView(
+          database,
+          row.roomId,
+          stableId("route-handoff-recover", row.roomId),
+          (transaction) => [...readPendingRoutedInvocationIntents(transaction, 256)],
+        );
+      }).sort((left, right) => left.createdAt.localeCompare(right.createdAt) ||
+        left.intentId.localeCompare(right.intentId)).slice(0, 256);
+      return { kind: "route-handoff-recovery", intents: Object.freeze(intents) };
     }
 
     const agentRows = database.prepare(
@@ -6168,7 +6545,8 @@ export function executeRuntimeAuthorityOperation(
       }
       const route = database.prepare(
         `SELECT route.room_id AS roomId, route.source_message_id AS sourceMessageId,
-                route.status, source.author_id AS requesterId, intent.intent_kind AS intentKind
+                route.status, source.author_id AS requesterId, intent.intent_kind AS intentKind,
+                frozen.id AS frozenAuthorityIntentId
          FROM route_jobs AS route
          JOIN messages AS source ON source.id = route.source_message_id
          JOIN route_invocation_intents AS intent
@@ -6176,6 +6554,10 @@ export function executeRuntimeAuthorityOperation(
          JOIN route_judgments AS judgment
            ON judgment.route_job_id = route.id AND judgment.agent_id = intent.target_agent_id
           AND judgment.outcome = 'will_respond'
+         JOIN routed_agent_invocation_intents AS frozen
+           ON frozen.route_job_id = route.id
+          AND frozen.target_agent_actor_id = intent.target_agent_id
+          AND frozen.status = 'claimed'
          JOIN human_preemption_fences AS fence
            ON fence.source_human_message_id = route.source_message_id
           AND fence.route_job_id = route.id
@@ -6188,6 +6570,7 @@ export function executeRuntimeAuthorityOperation(
       ).get(operation.targetAgentId, operation.routeJobId);
       if (typeof route?.roomId !== "string" || typeof route.sourceMessageId !== "string" ||
           typeof route.requesterId !== "string" ||
+          typeof route.frozenAuthorityIntentId !== "string" ||
           (route.status !== "completed" && route.status !== "failed") ||
           (route.intentKind !== "direct_mention" && route.intentKind !== "structured_help" &&
             route.intentKind !== "routed_candidate")) {
@@ -6282,6 +6665,7 @@ export function executeRuntimeAuthorityOperation(
         intentKind: route.intentKind,
         executionId,
         createdAt: occurredAt,
+        frozenAuthorityIntentId: route.frozenAuthorityIntentId,
       });
       for (const old of oldRows) {
         database.prepare(
@@ -6298,36 +6682,14 @@ export function executeRuntimeAuthorityOperation(
     }
     if (operation.type === "runtime.read-context") {
       const execution = runtimeExecutionById(database, operation.executionId);
+      const frozenHandoff = requireRuntimeFrozenHandoff(database, execution.id);
       requireExecutionRuntimeGenerationAllowed(
         database,
         execution.id,
         stableId("runtime-model-generation-gate", execution.id, String(execution.currentAttemptSeq)),
       );
       requireAgentCommandAuthority(database, execution.agentId, execution.roomId);
-      const permissionRow = database.prepare(
-        `SELECT actor.tool_permissions_json AS capabilityJson,
-                membership.tool_permissions_json AS membershipJson,
-                membership.participation AS participation, room.status AS roomStatus,
-                membership.access_revision AS accessRevision
-         FROM actors AS actor
-         JOIN room_memberships AS membership ON membership.actor_id = actor.id
-         JOIN rooms AS room ON room.id = membership.room_id
-         WHERE actor.id = ? AND membership.room_id = ? AND actor.kind = 'agent' AND membership.kind = 'agent'`,
-      ).get(execution.agentId, execution.roomId);
-      const capabilities = typeof permissionRow?.capabilityJson === "string"
-        ? JSON.parse(permissionRow.capabilityJson) as unknown : [];
-      const membershipPermissions = typeof permissionRow?.membershipJson === "string"
-        ? JSON.parse(permissionRow.membershipJson) as unknown : [];
-      if (typeof permissionRow?.accessRevision !== "number" ||
-          !Number.isSafeInteger(permissionRow.accessRevision) || permissionRow.accessRevision < 0) {
-        return fail("storage_unavailable", "Agent Room authorization revision was corrupt");
-      }
-      const allowedIds = new Set(["http-json.read", "repository.git-status", "sandbox-file.write"]);
-      const toolIds = permissionRow?.roomStatus === "active" && permissionRow.participation === "active" &&
-        Array.isArray(capabilities) && Array.isArray(membershipPermissions)
-        ? capabilities.filter((entry): entry is "http-json.read" | "repository.git-status" | "sandbox-file.write" =>
-            typeof entry === "string" && allowedIds.has(entry) && membershipPermissions.includes(entry))
-        : [];
+      const toolIds = frozenHandoff.effectiveToolIds;
       const messages = database.prepare(
         `SELECT message.id AS messageId, message.author_id AS authorId, revision.body
          FROM (
@@ -6364,33 +6726,24 @@ export function executeRuntimeAuthorityOperation(
         openItemTargets: openItemTargets as { actorId: string; kind: "human" | "agent" }[],
         roomMemory: readRoomMemoryRuntimeContext(database, {
           roomId: execution.roomId,
-          authorizationEpoch: permissionRow.accessRevision,
+          authorizationEpoch: frozenHandoff.accessRevision,
         }),
       };
     }
     if (operation.type === "runtime.read-memory-delta") {
       const execution = runtimeExecutionById(database, operation.executionId);
+      const frozenHandoff = requireRuntimeFrozenHandoff(database, execution.id);
       requireExecutionRuntimeGenerationAllowed(
         database,
         execution.id,
         stableId("runtime-memory-delta-gate", execution.id, String(execution.currentAttemptSeq)),
       );
       requireAgentCommandAuthority(database, execution.agentId, execution.roomId);
-      const permissionRow = database.prepare(
-        `SELECT membership.access_revision AS accessRevision
-         FROM room_memberships AS membership
-         WHERE membership.room_id = ? AND membership.actor_id = ?
-           AND membership.kind = 'agent' AND membership.participation = 'active'`,
-      ).get(execution.roomId, execution.agentId);
-      if (typeof permissionRow?.accessRevision !== "number" ||
-          !Number.isSafeInteger(permissionRow.accessRevision) || permissionRow.accessRevision < 0) {
-        return fail("storage_unavailable", "Agent Room authorization revision was corrupt");
-      }
       return {
         kind: "memory-delta",
         rawDelta: readRoomMemoryRuntimeContext(database, {
           roomId: execution.roomId,
-          authorizationEpoch: permissionRow.accessRevision,
+          authorizationEpoch: frozenHandoff.accessRevision,
           cursor: operation.cursor,
         }).rawDelta,
       };
@@ -6419,10 +6772,20 @@ export function executeRuntimeAuthorityOperation(
         return fail("permission_denied", "Target Agent membership was forbidden");
       }
       const existing = database.prepare(
-        `SELECT execution_id AS executionId, intent_kind AS intentKind
+        `SELECT id,
+                COALESCE(execution_id, (
+                  SELECT link.execution_id FROM agent_execution_intent_links AS link
+                  WHERE link.intent_id = agent_invocation_intents.id
+                  ORDER BY link.execution_ordinal LIMIT 1
+                )) AS executionId,
+                intent_kind AS intentKind,
+                origin_kind AS originKind, status, requester_actor_id AS requesterActorId
          FROM agent_invocation_intents WHERE source_message_id = ? AND target_agent_id = ?`,
       ).get(operation.intent.sourceMessageId, operation.intent.targetAgentId);
       if (typeof existing?.executionId === "string") {
+        if (existing.originKind !== "message_target") {
+          return fail("permission_denied", "Direct Agent invocation lacked a direct frozen handoff");
+        }
         requireExecutionRuntimeGenerationAllowed(
           database,
           existing.executionId,
@@ -6441,10 +6804,15 @@ export function executeRuntimeAuthorityOperation(
           ).run(operation.intent.sourceMessageId, operation.intent.targetAgentId);
         }
         const execution = runtimeExecutionById(database, existing.executionId);
+        requireRuntimeFrozenHandoff(database, execution.id);
         return {
           kind: "invocation", execution,
           intent: runtimeInvocationIntentByExecution(database, execution.id), replayed: true,
         };
+      }
+      if (typeof existing?.id !== "string" || existing.originKind !== "message_target" ||
+          existing.status !== "pending" || existing.requesterActorId !== requesterId) {
+        return fail("permission_denied", "Direct Agent invocation lacked a direct frozen handoff");
       }
       const queued = database.prepare(
         `SELECT COUNT(*) AS count FROM agent_executions WHERE room_id = ? AND status = 'queued'`,
@@ -6494,22 +6862,45 @@ export function executeRuntimeAuthorityOperation(
            recovery_cursor
          ) VALUES (?, 1, 1, 1, 'queued', 'model_generation', NULL, NULL, NULL, NULL, 0)`,
       ).run(operation.executionId);
-      insertLegacyRuntimeInvocationLineage(database, {
-        intentId: operation.intentId,
-        roomId: operation.intent.roomId,
-        sourceMessageId: operation.intent.sourceMessageId,
-        targetAgentId: operation.intent.targetAgentId,
-        requesterActorId: requesterId,
-        intentKind: operation.intent.kind,
-        executionId: operation.executionId,
-        createdAt: occurredAt,
-      });
+      const claimed = database.prepare(
+        `UPDATE agent_invocation_intents
+         SET status = 'claimed', claimed_at = ?
+         WHERE id = ? AND origin_kind = 'message_target'
+           AND status = 'pending' AND execution_id IS NULL`,
+      ).run(occurredAt, existing.id);
+      if (claimed.changes !== 1) {
+        return fail("execution_conflict", "Direct Agent invocation handoff changed concurrently");
+      }
+      database.prepare(
+        `INSERT INTO agent_execution_intent_links (
+           intent_id, execution_id, execution_ordinal, retry_of_execution_id,
+           source_revision, linked_at
+         ) VALUES (?, ?, 1, NULL, 1, ?)`,
+      ).run(existing.id, operation.executionId, occurredAt);
       const execution = runtimeExecutionById(database, operation.executionId);
+      requireRuntimeFrozenHandoff(database, execution.id);
       appendRuntimeExecutionEvent(database, execution, occurredAt, "queued");
       return { kind: "invocation", execution, intent: operation.intent, replayed: false };
     }
 
     if (operation.type === "runtime.invoke-routed") {
+      const frozenRoutedIntents = database.prepare(
+        `SELECT id, room_id AS roomId, source_message_id AS sourceMessageId,
+                target_agent_actor_id AS targetAgentId
+         FROM routed_agent_invocation_intents
+         WHERE route_job_id = ? AND target_agent_actor_id = ? AND status = 'claimed'
+         ORDER BY id LIMIT 2`,
+      ).all(operation.routeJobId, operation.intent.targetAgentId);
+      if (frozenRoutedIntents.length !== 1) {
+        return fail("permission_denied", "Routed Agent frozen handoff was unavailable");
+      }
+      const frozenRoutedIntent = frozenRoutedIntents[0]!;
+      if (frozenRoutedIntent.roomId !== operation.intent.roomId ||
+          frozenRoutedIntent.sourceMessageId !== operation.intent.sourceMessageId ||
+          frozenRoutedIntent.targetAgentId !== operation.intent.targetAgentId ||
+          typeof frozenRoutedIntent.id !== "string") {
+        return fail("permission_denied", "Routed Agent frozen handoff was mismatched");
+      }
       const routeIntent = database.prepare(
         `SELECT route.room_id AS roomId, route.source_message_id AS sourceMessageId,
                 route.status AS routeStatus, intent.intent_kind AS intentKind,
@@ -6536,10 +6927,15 @@ export function executeRuntimeAuthorityOperation(
         return fail("permission_denied", "Routed target Agent membership was forbidden");
       }
       const existing = database.prepare(
-        `SELECT execution_id AS executionId, intent_kind AS intentKind
+        `SELECT execution_id AS executionId, intent_kind AS intentKind,
+                origin_kind AS originKind, lineage_id AS lineageId
          FROM agent_invocation_intents WHERE source_message_id = ? AND target_agent_id = ?`,
       ).get(operation.intent.sourceMessageId, operation.intent.targetAgentId);
       if (typeof existing?.executionId === "string") {
+        if (existing.originKind !== "legacy_runtime" ||
+            existing.lineageId !== frozenRoutedIntent.id) {
+          return fail("permission_denied", "Routed Agent invocation crossed frozen handoff origins");
+        }
         requireExecutionRuntimeGenerationAllowed(
           database,
           existing.executionId,
@@ -6558,6 +6954,7 @@ export function executeRuntimeAuthorityOperation(
           ).run(operation.intent.sourceMessageId, operation.intent.targetAgentId);
         }
         const execution = runtimeExecutionById(database, existing.executionId);
+        requireRuntimeFrozenHandoff(database, execution.id);
         return {
           kind: "invocation", execution,
           intent: runtimeInvocationIntentByExecution(database, execution.id), replayed: true,
@@ -6620,8 +7017,10 @@ export function executeRuntimeAuthorityOperation(
         intentKind: operation.intent.kind,
         executionId: operation.executionId,
         createdAt: occurredAt,
+        frozenAuthorityIntentId: frozenRoutedIntent.id,
       });
       const execution = runtimeExecutionById(database, operation.executionId);
+      requireRuntimeFrozenHandoff(database, execution.id);
       appendRuntimeExecutionEvent(database, execution, occurredAt, "queued");
       return { kind: "invocation", execution, intent: operation.intent, replayed: false };
     }
@@ -6636,6 +7035,7 @@ export function executeRuntimeAuthorityOperation(
         current.id,
         stableId("runtime-claim-generation-gate", current.id, String(operation.attemptSeq)),
       );
+      requireRuntimeFrozenHandoff(database, current.id);
       if (hasPendingHumanPreemptionAfterSource(database, current)) {
         return fail("execution_conflict", "Agent attempt is behind a durable human fence");
       }
@@ -6657,6 +7057,7 @@ export function executeRuntimeAuthorityOperation(
 
     if (operation.type === "runtime.complete") {
       const current = runtimeExecutionById(database, operation.executionId);
+      requireRuntimeFrozenHandoff(database, current.id);
       requireAgentCommandAuthority(database, current.agentId, current.roomId);
       if (current.status !== "running" || current.currentAttemptSeq !== operation.attemptSeq) {
         return fail("execution_conflict", "Agent completion was stale");
@@ -6769,6 +7170,7 @@ export function executeRuntimeAuthorityOperation(
         current.id,
         stableId("runtime-retry-generation-gate", current.id, String(operation.attemptSeq)),
       );
+      requireRuntimeFrozenHandoff(database, current.id);
       const contextState = database.prepare(
         `SELECT snapshot.state
          FROM agent_execution_context_bindings AS binding
@@ -6886,6 +7288,7 @@ export function executeRuntimeAuthorityOperation(
 
     if (operation.type === "runtime.manual-retry") {
       const old = runtimeExecutionById(database, operation.executionId);
+      requireRuntimeFrozenHandoff(database, old.id);
       requireRuntimeHumanAuthority(database, operation.context, old, operation.now);
       if (old.status !== "failed" && old.status !== "cancelled") {
         return fail("execution_conflict", "Only terminal Agent executions can be retried");
@@ -6935,6 +7338,7 @@ export function executeRuntimeAuthorityOperation(
          ) VALUES (?, 1, 1, 1, 'queued', 'model_generation', 0)`,
       ).run(operation.newExecutionId);
       const execution = runtimeExecutionById(database, operation.newExecutionId);
+      requireRuntimeFrozenHandoff(database, execution.id);
       appendRuntimeExecutionEvent(database, execution, occurredAt, "manual-retry-queued");
       return {
         kind: "invocation", execution,
@@ -7066,6 +7470,7 @@ export function executeRuntimeAuthorityOperation(
 
     if (operation.type === "runtime.read-pending-confirmation") {
       const current = runtimeExecutionById(database, operation.executionId);
+      requireRuntimeFrozenHandoff(database, current.id);
       if (current.status !== "running" || current.actionCategory !== "waiting_upstream") {
         return fail("execution_conflict", "Confirmation targeted a stale Agent execution");
       }
@@ -7132,27 +7537,8 @@ export function executeRuntimeAuthorityOperation(
         current.id,
         stableId("runtime-tool-prepare-generation-gate", current.id, String(operation.attemptSeq)),
       );
-      const permissions = database.prepare(
-        `SELECT actor.kind AS actorKind, actor.readiness AS readiness,
-                actor.tool_permissions_json AS capabilityJson,
-                membership.kind AS membershipKind,
-                membership.participation AS participation,
-                membership.tool_permissions_json AS membershipPermissionsJson,
-                room.status AS roomStatus
-         FROM actors AS actor
-         JOIN room_memberships AS membership ON membership.actor_id = actor.id
-         JOIN rooms AS room ON room.id = membership.room_id
-         WHERE actor.id = ? AND membership.room_id = ?`,
-      ).get(current.agentId, current.roomId);
-      const capability = typeof permissions?.capabilityJson === "string"
-        ? JSON.parse(permissions.capabilityJson) as unknown : undefined;
-      const membershipPermissions = typeof permissions?.membershipPermissionsJson === "string"
-        ? JSON.parse(permissions.membershipPermissionsJson) as unknown : undefined;
-      if (permissions?.actorKind !== "agent" || permissions.readiness !== "ready" ||
-          permissions.membershipKind !== "agent" || permissions.participation !== "active" ||
-          permissions.roomStatus !== "active" || !Array.isArray(capability) ||
-          !capability.includes(operation.tool.id) || !Array.isArray(membershipPermissions) ||
-          !membershipPermissions.includes(operation.tool.id)) {
+      const frozenHandoff = requireRuntimeFrozenHandoff(database, current.id);
+      if (!frozenHandoff.effectiveToolIds.includes(operation.tool.id)) {
         return fail("permission_denied", "Agent tool authority was forbidden");
       }
       const parameterSha256 = createHash("sha256").update(canonicalJson(operation.parameters)).digest("hex");
@@ -7289,36 +7675,23 @@ export function executeRuntimeAuthorityOperation(
         current.id,
         stableId("runtime-tool-dispatch-generation-gate", current.id, String(operation.attemptSeq)),
       );
+      const frozenHandoff = requireRuntimeFrozenHandoff(database, current.id);
       const grant = database.prepare(
         `SELECT grant.agent_id AS agentId, grant.room_id AS roomId, grant.tool_id AS toolId,
                 grant.parameter_sha256 AS parameterSha256, grant.expires_at AS expiresAt,
                 grant.consumed_at AS consumedAt, grant.grant_state AS grantState,
-                actor.kind AS actorKind, actor.readiness AS readiness,
-                actor.tool_permissions_json AS capabilityJson,
-                membership.kind AS membershipKind,
-                membership.participation AS participation,
-                membership.tool_permissions_json AS membershipPermissionsJson,
-                room.status AS roomStatus
+                actor.kind AS actorKind
          FROM agent_execution_grants AS grant
          JOIN actors AS actor ON actor.id = grant.agent_id
-         JOIN room_memberships AS membership
-           ON membership.room_id = grant.room_id AND membership.actor_id = grant.agent_id
-         JOIN rooms AS room ON room.id = grant.room_id
          WHERE grant.grant_id = ? AND grant.execution_id = ? AND grant.attempt_seq = ?`,
       ).get(operation.grantId, current.id, current.currentAttemptSeq);
       const parameterSha256 = createHash("sha256").update(canonicalJson(operation.parameters)).digest("hex");
-      const capability = typeof grant?.capabilityJson === "string"
-        ? JSON.parse(grant.capabilityJson) as unknown : undefined;
-      const membershipPermissions = typeof grant?.membershipPermissionsJson === "string"
-        ? JSON.parse(grant.membershipPermissionsJson) as unknown : undefined;
       if (grant?.agentId !== current.agentId || grant.roomId !== current.roomId ||
           typeof grant.toolId !== "string" || grant.parameterSha256 !== parameterSha256 ||
           typeof grant.expiresAt !== "string" || Date.parse(grant.expiresAt) <= operation.now ||
           grant.consumedAt !== null || grant.grantState !== "active" ||
-          grant.actorKind !== "agent" || grant.readiness !== "ready" ||
-          grant.membershipKind !== "agent" || grant.participation !== "active" || grant.roomStatus !== "active" ||
-          !Array.isArray(capability) || !capability.includes(grant.toolId) ||
-          !Array.isArray(membershipPermissions) || !membershipPermissions.includes(grant.toolId)) {
+          grant.actorKind !== "agent" ||
+          !frozenHandoff.effectiveToolIds.some((toolId) => toolId === grant.toolId)) {
         return fail("permission_denied", "Tool dispatch authority was forbidden");
       }
       if (grant.toolId === "sandbox-file.write") {
@@ -7459,6 +7832,15 @@ export function executeRuntimeAuthorityOperation(
     for (const row of recoverable) {
       if (typeof row.id !== "string") return fail("storage_unavailable", "Recovery execution was corrupt");
       let current = runtimeExecutionById(database, row.id);
+      const latestDispatch = database.prepare(
+        `SELECT tool_id AS toolId, state
+         FROM tool_dispatches
+         WHERE execution_id = ? AND attempt_seq = ?
+         ORDER BY rowid DESC LIMIT 1`,
+      ).get(current.id, current.currentAttemptSeq);
+      const sideEffectMayHaveOccurred = latestDispatch?.toolId === "sandbox-file.write" &&
+        (latestDispatch.state === "dispatched" || latestDispatch.state === "succeeded" ||
+         latestDispatch.state === "outcome_unknown");
       if (current.status === "running") {
         const contextState = database.prepare(
           `SELECT snapshot.state
@@ -7466,7 +7848,7 @@ export function executeRuntimeAuthorityOperation(
            JOIN context_snapshots AS snapshot ON snapshot.snapshot_id = binding.snapshot_id
            WHERE binding.execution_id = ?`,
         ).get(current.id)?.state;
-        if (contextState !== undefined && contextState !== "active") {
+        if (!sideEffectMayHaveOccurred && contextState !== undefined && contextState !== "active") {
           database.prepare(
             `UPDATE agent_execution_attempts
              SET status = 'failed', finished_at = ?, error_code = 'context_snapshot_invalidated'
@@ -7485,6 +7867,30 @@ export function executeRuntimeAuthorityOperation(
           records.push({ execution: current, outcome: "failed" });
           continue;
         }
+      }
+      if (!sideEffectMayHaveOccurred) {
+        try {
+          requireFrozenRuntimeAuthority(database, current.id);
+        } catch (error) {
+          if (!(error instanceof FrozenRuntimeAuthorityError)) throw error;
+          database.prepare(
+            `UPDATE agent_execution_attempts
+             SET status = 'failed', finished_at = ?, error_code = 'permission_denied'
+             WHERE execution_id = ? AND attempt_seq = ? AND status IN ('queued', 'running')`,
+          ).run(occurredAt, current.id, current.currentAttemptSeq);
+          database.prepare(
+            `UPDATE agent_executions
+             SET status = 'failed', completed_at = ?, updated_at = ?,
+                 terminal_error_code = 'permission_denied', dead_lettered_at = ?, next_retry_at = NULL
+             WHERE id = ? AND current_attempt_seq = ? AND status IN ('queued', 'running')`,
+          ).run(occurredAt, occurredAt, occurredAt, current.id, current.currentAttemptSeq);
+          current = runtimeExecutionById(database, current.id);
+          appendRuntimeExecutionEvent(database, current, occurredAt, "recovered", error.reason);
+          records.push({ execution: current, outcome: "failed" });
+          continue;
+        }
+      }
+      if (current.status === "running") {
         if (current.providerId === undefined) {
           database.prepare(
             `UPDATE agent_execution_attempts
@@ -7529,16 +7935,6 @@ export function executeRuntimeAuthorityOperation(
           records.push({ execution: current, outcome: "failed" });
           continue;
         }
-        const latestDispatch = database.prepare(
-          `SELECT tool_id AS toolId, state
-           FROM tool_dispatches
-           WHERE execution_id = ? AND attempt_seq = ?
-           ORDER BY rowid DESC LIMIT 1`,
-        ).get(current.id, current.currentAttemptSeq);
-        const sideEffectMayHaveOccurred = latestDispatch?.toolId === "sandbox-file.write" &&
-          (latestDispatch.state === "dispatched" ||
-           latestDispatch.state === "succeeded" ||
-           latestDispatch.state === "outcome_unknown");
         if (current.actionCategory === "tool_call" &&
             (current.toolDispatchPhase === "dispatched" || sideEffectMayHaveOccurred)) {
           database.prepare(
@@ -8286,9 +8682,28 @@ export function submitHumanMessageDatabaseCommand(
           );
           input.onFaultPointForTest?.("after-target");
           const membership = database.prepare(
-            `SELECT kind, participation FROM room_memberships
+            `SELECT kind, participation, access_revision AS accessRevision
+             FROM room_memberships
              WHERE room_id = ? AND actor_id = ?`,
           ).get(input.message.roomId, target.targetActorId);
+          const directAuthority = target.kind === "agent-invocation"
+            ? database.prepare(
+              `SELECT profile.id AS profileId, profile.revision AS profileRevision,
+                      profile.status AS profileStatus,
+                      assignment.id AS assignmentId,
+                      assignment.revision AS assignmentRevision,
+                      assignment.status AS assignmentStatus,
+                      assignment.participation AS assignmentParticipation,
+                      assignment.paused AS assignmentPaused
+               FROM agent_profiles AS profile
+               LEFT JOIN room_agent_assignments AS assignment
+                 ON assignment.room_id = ?
+                AND assignment.profile_id = profile.id
+                AND assignment.agent_actor_id = profile.actor_id
+                AND assignment.status = 'current'
+               WHERE profile.actor_id = ?`,
+            ).get(input.message.roomId, target.targetActorId)
+            : undefined;
           let outcome: MessageTargetOutcome;
           const expectedActorKind = target.kind === "human-request" ? "human" : "agent";
           if (actor.kind !== expectedActorKind ||
@@ -8310,6 +8725,23 @@ export function submitHumanMessageDatabaseCommand(
             };
           } else if (target.kind === "agent-invocation" &&
               membership.participation !== "active" && membership.participation !== "on-mention") {
+            outcome = {
+              targetId: target.id,
+              targetActorId: target.targetActorId,
+              kind: target.kind,
+              status: "rejected",
+              code: "target_assignment_inactive",
+            };
+          } else if (target.kind === "agent-invocation" &&
+              (directAuthority === undefined || directAuthority.profileStatus !== "enabled" ||
+               directAuthority.assignmentStatus !== "current" ||
+               directAuthority.assignmentPaused !== 0 ||
+               directAuthority.assignmentParticipation !== membership.participation ||
+               typeof directAuthority.profileId !== "string" ||
+               typeof directAuthority.assignmentId !== "string" ||
+               typeof directAuthority.profileRevision !== "number" ||
+               typeof directAuthority.assignmentRevision !== "number" ||
+               typeof membership.accessRevision !== "number")) {
             outcome = {
               targetId: target.id,
               targetActorId: target.targetActorId,
@@ -8367,6 +8799,19 @@ export function submitHumanMessageDatabaseCommand(
               target.id,
               stableId("message-lineage", input.message.messageId, target.id),
               stableId("message-turn", input.message.messageId, target.id),
+            );
+            database.prepare(
+              `INSERT INTO direct_agent_invocation_authority_bindings (
+                 intent_id, profile_id, profile_revision, assignment_id,
+                 assignment_revision, access_revision
+               ) VALUES (?, ?, ?, ?, ?, ?)`,
+            ).run(
+              invocationIntentId,
+              directAuthority!.profileId as string,
+              directAuthority!.profileRevision as number,
+              directAuthority!.assignmentId as string,
+              directAuthority!.assignmentRevision as number,
+              membership.accessRevision as number,
             );
             outcome = {
               targetId: target.id,

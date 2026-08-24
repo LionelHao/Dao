@@ -72,9 +72,23 @@ export type ContextMemoryCandidateV1 = Readonly<{
   sourceRefs: readonly ContextSourceIdentityV1[];
   availability: "readable" | "invalidated" | "temporarily_unavailable";
 }>;
-export type ContextAgentResponsibilityV1 =
-  | Readonly<{ availability: "available"; text: string; version: number }>
-  | Readonly<{ availability: "unavailable"; reason: "ft07_not_delivered" | "authority_unavailable" }>;
+export type ContextAgentAuthorityV1 = Readonly<{
+  agentId: string;
+  profileId: string;
+  assignmentId: string;
+  displayName: string;
+  globalResponsibility: string;
+  roomResponsibility: string;
+  participation: AgentAssignmentParticipation;
+  availability: AgentAvailability;
+  effectiveCapabilities: readonly AgentCapabilityId[];
+  effectiveTools: readonly AgentToolId[];
+  revisions: Readonly<{
+    profile: number;
+    assignment: number;
+    access: number;
+  }>;
+}>;
 export type ContextRoomGoalV1 =
   | Readonly<{ availability: "available"; text: string; version: number }>
   | Readonly<{ availability: "unavailable"; reason: "ft09_not_delivered" | "authority_unavailable" }>;
@@ -107,7 +121,7 @@ export type ProjectContextInputV1 =
 export type ContextCompilerInputV1 = Readonly<{
   version: typeof CONTEXT_COMPILER_INPUT_VERSION;
   invocation: Readonly<{ invocationId: string; executionId: string; roomId: string; intent: ContextInvocationIntentV1 }>;
-  agent: Readonly<{ agentId: string; displayName: string; responsibility: ContextAgentResponsibilityV1 }>;
+  agent: ContextAgentAuthorityV1;
   room: Readonly<{ roomId: string; name: string; goal: ContextRoomGoalV1 }>;
   trigger: ContextTriggerV1;
   memoryWatermark: number;
@@ -304,12 +318,6 @@ function invocationIntent(value: unknown): value is ContextInvocationIntentV1 {
 function timestamp(value: unknown): value is string {
   return text(value) && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value);
 }
-function responsibility(value: unknown): value is ContextAgentResponsibilityV1 {
-  return (exact(value, ["availability", "text", "version"]) && value.availability === "available"
-      && text(value.text) && uint(value.version, true))
-    || (exact(value, ["availability", "reason"]) && value.availability === "unavailable"
-      && ["ft07_not_delivered", "authority_unavailable"].includes(String(value.reason)));
-}
 function goal(value: unknown): value is ContextRoomGoalV1 {
   return (exact(value, ["availability", "text", "version"]) && value.availability === "available"
       && text(value.text) && uint(value.version, true))
@@ -317,8 +325,20 @@ function goal(value: unknown): value is ContextRoomGoalV1 {
       && ["ft09_not_delivered", "authority_unavailable"].includes(String(value.reason)));
 }
 function agentIdentity(value: unknown): value is ContextCompilerInputV1["agent"] {
-  return exact(value, ["agentId", "displayName", "responsibility"])
-    && text(value.agentId) && text(value.displayName) && responsibility(value.responsibility);
+  return exact(value, [
+    "agentId", "profileId", "assignmentId", "displayName", "globalResponsibility",
+    "roomResponsibility", "participation", "availability", "effectiveCapabilities",
+    "effectiveTools", "revisions",
+  ]) && text(value.agentId) && text(value.profileId) && text(value.assignmentId)
+    && text(value.displayName) && text(value.globalResponsibility)
+    && text(value.roomResponsibility)
+    && ["active", "on-mention"].includes(String(value.participation))
+    && ["ready", "busy", "paused", "noauth"].includes(String(value.availability))
+    && isCanonicalAgentCapabilitySet(value.effectiveCapabilities)
+    && isCanonicalAgentToolSet(value.effectiveTools)
+    && exact(value.revisions, ["profile", "assignment", "access"])
+    && uint(value.revisions.profile, true) && uint(value.revisions.assignment, true)
+    && uint(value.revisions.access);
 }
 function roomIdentity(value: unknown, roomId?: string): value is ContextCompilerInputV1["room"] {
   return exact(value, ["roomId", "name", "goal"]) && text(value.roomId)
@@ -354,12 +374,19 @@ function project(value: unknown, roomId: string): value is ProjectContextInputV1
     && dense(value.sourceRefs) && value.sourceRefs.length > 0
     && value.sourceRefs.every((entry) => source(entry, roomId));
 }
+function toolDescriptor(value: unknown): value is ContextToolDescriptorV1 {
+  return exact(value, ["id", "description", "effect", "inputSchemaCanonical"])
+    && text(value.id) && text(value.description)
+    && ["read-only", "reversible-write", "irreversible-write"].includes(String(value.effect))
+    && text(value.inputSchemaCanonical);
+}
 export function isContextCompilerInputV1(value: unknown): value is ContextCompilerInputV1 {
   if (!exact(value, INPUT_KEYS) || value.version !== CONTEXT_COMPILER_INPUT_VERSION) return false;
   if (!exact(value.invocation, ["invocationId", "executionId", "roomId", "intent"]) || !text(value.invocation.invocationId)
     || !text(value.invocation.executionId) || !text(value.invocation.roomId) || !invocationIntent(value.invocation.intent)) return false;
   const roomId = value.invocation.roomId;
-  if (!agentIdentity(value.agent) || !roomIdentity(value.room, roomId)) return false;
+  const agent = value.agent;
+  if (!agentIdentity(agent) || !roomIdentity(value.room, roomId)) return false;
   if (!exact(value.trigger, ["triggerType", "reason", "source", "body", "author", "occurredAt", "replyTo", "mentions", "readRef"])
     || !["message", "reply", "manual", "tool_continuation"].includes(String(value.trigger.triggerType))
     || !["mention", "reply", "manual", "tool_continuation"].includes(String(value.trigger.reason))
@@ -367,7 +394,7 @@ export function isContextCompilerInputV1(value: unknown): value is ContextCompil
     || !timestamp(value.trigger.occurredAt) || !(value.trigger.replyTo === null || reply(value.trigger.replyTo))
     || !mentions(value.trigger.mentions) || !mentionsFitBody(value.trigger.body, value.trigger.mentions) || !text(value.trigger.readRef)) return false;
   if (value.invocation.intent.sourceMessageId !== value.trigger.source.sourceId
-    || value.invocation.intent.targetAgentId !== value.agent.agentId) return false;
+    || value.invocation.intent.targetAgentId !== agent.agentId) return false;
   if (value.trigger.triggerType === "reply" && value.trigger.replyTo === null) return false;
   if (!uint(value.memoryWatermark) || !uint(value.corpusHead) || value.memoryWatermark > value.corpusHead) return false;
   if (!dense(value.memories) || !value.memories.every((entry) => memory(entry, roomId))) return false;
@@ -375,9 +402,10 @@ export function isContextCompilerInputV1(value: unknown): value is ContextCompil
   if (!dense(value.retrieval) || !value.retrieval.every((entry) => candidate(entry, roomId))) return false;
   if (!dense(value.attachments) || !value.attachments.every((entry) => candidate(entry, roomId))) return false;
   if (!project(value.project, roomId)) return false;
-  if (!dense(value.tools) || !value.tools.every((tool) => exact(tool, ["id", "description", "effect", "inputSchemaCanonical"])
-    && text(tool.id) && text(tool.description) && ["read-only", "reversible-write", "irreversible-write"].includes(String(tool.effect))
-    && text(tool.inputSchemaCanonical))) return false;
+  if (!dense(value.tools) || !value.tools.every(toolDescriptor)) return false;
+  const toolIds = [...new Set(value.tools.map((tool) => tool.id))].sort();
+  if (toolIds.length !== agent.effectiveTools.length ||
+      toolIds.some((toolId, index) => toolId !== agent.effectiveTools[index])) return false;
   if (!exact(value.trusted, ["system", "developerPolicy"]) || !text(value.trusted.system) || !text(value.trusted.developerPolicy)) return false;
   const memoryWatermark = Number(value.memoryWatermark);
   const corpusHead = Number(value.corpusHead);
@@ -566,3 +594,13 @@ export function isContextCompileResultV1(value: unknown): value is ContextCompil
     return false;
   }
 }
+import type {
+  AgentAssignmentParticipation,
+  AgentAvailability,
+  AgentCapabilityId,
+  AgentToolId,
+} from "./agent-profile.js";
+import {
+  isCanonicalAgentCapabilitySet,
+  isCanonicalAgentToolSet,
+} from "./agent-profile.js";
