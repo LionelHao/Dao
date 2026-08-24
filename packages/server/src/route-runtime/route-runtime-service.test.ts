@@ -103,7 +103,7 @@ function fakeAuthority(
       if (job === undefined) throw new Error("missing job");
       return claimFactory(job);
     },
-    async complete(job, judgments, intents, terminalErrorCode) {
+    async complete(job, judgments, intents, _agentProviderReady, terminalErrorCode) {
       const terminal = terminalErrorCode === undefined
         ? { ...job, status: "completed" as const, completedAt: new Date().toISOString() }
         : { ...job, status: "failed" as const, terminalErrorCode, completedAt: new Date().toISOString() };

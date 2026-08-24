@@ -878,10 +878,12 @@ function readCompilerInputFacts(
     return fail("context_storage_unavailable", "Context capability authority exceeds its Profile ceiling");
   }
   const toolCeiling = new Set(parseStringArray(row.profileToolCeilingJson));
-  const effectiveTools = parseStringArray(row.assignmentToolSubsetJson);
-  if (effectiveTools.some((tool) => !toolCeiling.has(tool))) {
+  const assignmentTools = parseStringArray(row.assignmentToolSubsetJson);
+  if (assignmentTools.some((tool) => !toolCeiling.has(tool))) {
     return fail("context_storage_unavailable", "Context tool authority exceeds its current policy");
   }
+  const membershipTools = new Set(parseStringArray(identity.membershipToolsJson));
+  const effectiveTools = assignmentTools.filter((tool) => membershipTools.has(tool));
   const mentions = database.prepare(
     `SELECT target_id AS targetId, target_kind AS targetKind,
             target_actor_id AS targetActorId, range_start_utf16 AS rangeStartUtf16,

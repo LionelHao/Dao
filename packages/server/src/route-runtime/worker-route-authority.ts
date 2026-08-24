@@ -177,13 +177,15 @@ export function createWorkerRouteAuthority(worker: WorkerDatabaseClient): RouteA
         type: "route.claim", sourceMessageId, agentProviderReady, now: Date.now(),
       }));
     },
-    async complete(job, judgments: readonly RouteJudgment[], intents, terminalErrorCode) {
+    async complete(job, judgments: readonly RouteJudgment[], intents, agentProviderReady,
+      terminalErrorCode) {
       const result = await execute({
         type: "route.complete",
         routeJobId: job.id,
         attempt: job.currentAttempt,
         judgments,
         intents,
+        agentProviderReady,
         ...(terminalErrorCode === undefined ? {} : { terminalErrorCode }),
         now: Date.now(),
       });

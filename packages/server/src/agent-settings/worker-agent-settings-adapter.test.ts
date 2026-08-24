@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { createSyncService } from "../sync-service.js";
 import {
@@ -136,5 +137,21 @@ describe("WorkerAgentSettingsAdapter production composition", () => {
       .resolves.toMatchObject({ watermark: 1, profiles: [profile] });
     await expect(restarted.repairRoomAgentAssignments(owner, "restart-room-repair", room.aggregateId))
       .resolves.toEqual({ ...assignmentRepair, requestId: "restart-room-repair" });
+
+    await worker.close();
+    clients.splice(clients.indexOf(worker), 1);
+    const database = new DatabaseSync(databasePath);
+    database.prepare(
+      `UPDATE room_memberships SET tool_permissions_json = '[]'
+       WHERE room_id = ? AND actor_id = ?`,
+    ).run(room.aggregateId, profile.actorId);
+    database.close();
+    worker = await open(databasePath);
+    const policyRestricted = new WorkerAgentSettingsAdapter(worker, () => NOW);
+    await expect(policyRestricted.executeQuery(owner, {
+      type: "room-agent-assignment.list", requestId: "membership-tool-policy", roomId: room.aggregateId,
+    })).resolves.toMatchObject({ assignments: [{
+      toolCeiling: ["room-memory.read"], toolSubset: ["room-memory.read"], effectiveTools: [],
+    }] });
   });
 });

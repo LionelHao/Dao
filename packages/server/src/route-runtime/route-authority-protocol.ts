@@ -42,6 +42,7 @@ export type RouteAuthorityOperation =
       readonly attempt: 1 | 2 | 3;
       readonly judgments: readonly RouteJudgment[];
       readonly intents: readonly RouteInvocationIntent[];
+      readonly agentProviderReady: boolean;
       readonly terminalErrorCode?: RouteProviderFailureCode;
       readonly now: number;
     }
@@ -139,7 +140,7 @@ export function isRouteAuthorityOperation(value: unknown): value is RouteAuthori
       count(value.now);
   }
   if (value.type === "route.complete") {
-    const keys = ["type", "routeJobId", "attempt", "judgments", "intents", "now",
+    const keys = ["type", "routeJobId", "attempt", "judgments", "intents", "agentProviderReady", "now",
       ...(Object.hasOwn(value, "terminalErrorCode") ? ["terminalErrorCode"] : [])];
     return exact(value, keys) &&
       text(value.routeJobId) && (value.attempt === 1 || value.attempt === 2 || value.attempt === 3) &&
@@ -147,6 +148,7 @@ export function isRouteAuthorityOperation(value: unknown): value is RouteAuthori
       value.judgments.every(isRouteJudgment) &&
       Array.isArray(value.intents) && value.intents.length <= 256 &&
       value.intents.every(invocationIntent) &&
+      typeof value.agentProviderReady === "boolean" &&
       (!Object.hasOwn(value, "terminalErrorCode") ||
         providerFailureCodes.has(value.terminalErrorCode as RouteProviderFailureCode)) &&
       count(value.now);

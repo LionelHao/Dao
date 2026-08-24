@@ -1415,6 +1415,7 @@ describe("authoritative server real-process harness", () => {
     let server: AuthoritativeServer | undefined;
     let loginClient: JsonWebSocketClient | undefined;
     let runtime: ReturnType<typeof createDesktopAgentSettingsRuntime> | undefined;
+    let externalRuntime: ReturnType<typeof createDesktopAgentSettingsRuntime> | undefined;
     try {
       server = await startAuthoritativeServerForTest({
         databasePath,
@@ -1477,6 +1478,7 @@ describe("authoritative server real-process harness", () => {
           };
         },
         timeoutMs: 2_000,
+        syncIntervalMs: 20,
       });
       const observed: unknown[] = [];
       runtime.onAuthorityMessage((message) => observed.push(message));
@@ -1545,10 +1547,63 @@ describe("authoritative server real-process harness", () => {
         expect.objectContaining({ type: "stable-event",
           event: expect.objectContaining({ kind: "assignment.upserted" }) }),
       ]));
+
+      let externalOrdinal = 0;
+      externalRuntime = createDesktopAgentSettingsRuntime({
+        endpoint: server.url,
+        session: () => session,
+        webSocketFactory: (endpoint) => {
+          const socket = new NodeIdentityWebSocketAdapter(endpoint);
+          return {
+            addEventListener: socket.addEventListener.bind(socket),
+            removeEventListener: socket.removeEventListener.bind(socket),
+            send: socket.send.bind(socket),
+            close: () => socket.terminate(),
+          };
+        },
+        governance: async (requestedRoomId) => ({
+          roomId: requestedRoomId,
+          roomName: "FT-07 Desktop Authority",
+          lifecycle: "active",
+          roomRevision: 1,
+          roomRole: "owner",
+        }),
+        createRequestIdentity: () => {
+          externalOrdinal += 1;
+          return { requestId: `ft07-external-${externalOrdinal}`,
+            idempotencyKey: `ft07-external-key-${externalOrdinal}` };
+        },
+        timeoutMs: 2_000,
+        syncIntervalMs: 20,
+      });
+      const externalInitial = await externalRuntime.getSnapshot({ roomId });
+      if (externalInitial.room.status !== "available") {
+        throw new TypeError("external FT-07 Room authority was unavailable");
+      }
+      const externalAssignment = externalInitial.room.assignments[0];
+      if (externalAssignment === undefined) throw new TypeError("external Assignment was unavailable");
+      const externalAck = await externalRuntime.submit({
+        requestId: "renderer-external-pause",
+        intent: {
+          command: "assignment.pause", roomId,
+          assignmentId: externalAssignment.assignmentId,
+          expectedRoomRevision: externalInitial.room.roomRevision,
+          expectedAssignmentRevision: externalAssignment.assignmentRevision,
+        },
+      });
+      if (externalAck.type !== "ack") throw new TypeError("external Assignment pause was rejected");
+      await vi.waitFor(() => {
+        expect(observed).toEqual(expect.arrayContaining([expect.objectContaining({
+          type: "stable-event", eventId: externalAck.eventIds[0],
+          event: expect.objectContaining({ kind: "assignment.upserted",
+            assignment: expect.objectContaining({ paused: true, availability: "paused" }) }),
+        })]));
+      }, { timeout: 2_000, interval: 20 });
       const publicEvidence = JSON.stringify({ initial, converged, observed });
       expect(publicEvidence).not.toContain(passwordCanary);
       expect(publicEvidence).not.toContain(issued.accessToken);
     } finally {
+      externalRuntime?.close();
       runtime?.close();
       loginClient?.terminate();
       if (server !== undefined) await server.close();

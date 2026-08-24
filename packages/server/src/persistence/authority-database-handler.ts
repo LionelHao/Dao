@@ -5769,6 +5769,81 @@ function routeHandoffs(
   );
 }
 
+function routeSelectionAuthorityRejection(
+  database: DatabaseSync,
+  job: RouteJob,
+  sourceMessageRevision: number,
+  candidate: Readonly<{
+    agentId: string;
+    profileId: string;
+    profileRevision: number;
+    assignmentId: string;
+    assignmentRevision: number;
+    accessRevision: number;
+  }>,
+  providerReady: boolean,
+): string | undefined {
+  const current = database.prepare(
+    `SELECT room.status AS roomStatus, actor.kind AS actorKind,
+            source.author_kind AS sourceAuthorKind,
+            envelope.message_kind AS sourceMessageKind,
+            envelope.lifecycle AS sourceLifecycle,
+            envelope.current_revision AS currentSourceRevision,
+            profile.actor_id AS profileActorId, profile.status AS profileStatus,
+            profile.revision AS currentProfileRevision,
+            assignment.room_id AS assignmentRoomId,
+            assignment.profile_id AS assignmentProfileId,
+            assignment.agent_actor_id AS assignmentActorId,
+            assignment.status AS assignmentStatus,
+            assignment.participation AS assignmentParticipation,
+            assignment.paused AS assignmentPaused,
+            assignment.revision AS currentAssignmentRevision,
+            membership.kind AS membershipKind,
+            membership.participation AS membershipParticipation,
+            membership.access_revision AS currentAccessRevision,
+            (SELECT COUNT(*) FROM agent_executions AS execution
+             WHERE execution.room_id = room.id AND execution.agent_id = ?
+               AND execution.status IN ('queued', 'running')) AS runningExecutionCount
+     FROM rooms AS room
+     LEFT JOIN actors AS actor ON actor.id = ?
+     LEFT JOIN messages AS source ON source.id = ? AND source.room_id = room.id
+     LEFT JOIN message_envelopes AS envelope
+       ON envelope.message_id = source.id AND envelope.room_id = room.id
+     LEFT JOIN agent_profiles AS profile ON profile.id = ?
+     LEFT JOIN room_agent_assignments AS assignment ON assignment.id = ?
+     LEFT JOIN room_memberships AS membership
+       ON membership.room_id = room.id AND membership.actor_id = ?
+     WHERE room.id = ?`,
+  ).get(candidate.agentId, candidate.agentId, job.sourceMessageId, candidate.profileId,
+    candidate.assignmentId, candidate.agentId, job.roomId);
+  if (current?.roomStatus !== "active") return "room_archived";
+  if (current.sourceAuthorKind !== "human" || current.sourceMessageKind !== "human" ||
+      current.sourceLifecycle !== "active" ||
+      current.currentSourceRevision !== sourceMessageRevision) return "source_revision_stale";
+  if (current.actorKind !== "agent" || current.profileActorId !== candidate.agentId ||
+      current.profileStatus !== "enabled") return "profile_unavailable";
+  if (current.currentProfileRevision !== candidate.profileRevision) return "profile_revision_stale";
+  if (current.assignmentRoomId !== job.roomId ||
+      current.assignmentProfileId !== candidate.profileId ||
+      current.assignmentActorId !== candidate.agentId || current.assignmentStatus !== "current") {
+    return "assignment_removed";
+  }
+  if (current.assignmentPaused === 1) return "assignment_paused";
+  if (current.assignmentParticipation !== "active") return "assignment_inactive";
+  if (current.currentAssignmentRevision !== candidate.assignmentRevision) {
+    return "assignment_revision_stale";
+  }
+  if (current.membershipKind !== "agent" || current.membershipParticipation !== "active") {
+    return "access_revoked";
+  }
+  if (current.currentAccessRevision !== candidate.accessRevision) return "access_revision_stale";
+  if (!providerReady) return "noauth";
+  if (typeof current.runningExecutionCount !== "number" || current.runningExecutionCount > 0) {
+    return "busy";
+  }
+  return undefined;
+}
+
 export function executeRouteAuthorityOperation(
   database: DatabaseSync,
   operation: RouteAuthorityOperation,
@@ -5984,10 +6059,23 @@ export function executeRouteAuthorityOperation(
          FROM route_candidate_snapshot_agents
          WHERE snapshot_id = ? ORDER BY candidate_order`,
       ).all(snapshot.snapshotId);
-      const snapshotAgents = snapshotCandidateRows.map((entry) => {
-        if (typeof entry.agentId !== "string") return fail("storage_unavailable", "Route Agent snapshot was corrupt");
-        return entry.agentId;
+      const snapshotCandidates = snapshotCandidateRows.map((entry) => {
+        if (typeof entry.agentId !== "string" || typeof entry.profileId !== "string" ||
+            typeof entry.profileRevision !== "number" || typeof entry.assignmentId !== "string" ||
+            typeof entry.assignmentRevision !== "number" || typeof entry.accessRevision !== "number") {
+          return fail("storage_unavailable", "Route Agent snapshot was corrupt");
+        }
+        return {
+          agentId: entry.agentId,
+          profileId: entry.profileId,
+          profileRevision: entry.profileRevision,
+          assignmentId: entry.assignmentId,
+          assignmentRevision: entry.assignmentRevision,
+          accessRevision: entry.accessRevision,
+        };
       });
+      const snapshotAgents = snapshotCandidates.map((entry) => entry.agentId);
+      const snapshotCandidateByAgent = new Map(snapshotCandidates.map((entry) => [entry.agentId, entry]));
       const expectedAgents = new Set(snapshotAgents);
       const judgmentByAgent = new Map<string, RouteJudgment>();
       for (const judgment of operation.judgments) {
@@ -6001,7 +6089,6 @@ export function executeRouteAuthorityOperation(
       if (judgmentByAgent.size !== expectedAgents.size) {
         return fail("route_conflict", "Route judgment set omitted an Agent");
       }
-      const currentRoom = database.prepare("SELECT status FROM rooms WHERE id = ?").get(job.roomId);
       const acceptedIntents: RouteInvocationIntent[] = [];
       const intentAgents = new Set<string>();
       for (const intent of operation.intents) {
@@ -6010,19 +6097,21 @@ export function executeRouteAuthorityOperation(
           return fail("route_conflict", "Route invocation intent was invalid");
         }
         intentAgents.add(intent.targetAgentId);
-        const membership = database.prepare(
-          `SELECT membership.kind, actor.kind AS actorKind
-           FROM room_memberships AS membership
-           JOIN actors AS actor ON actor.id = membership.actor_id
-           WHERE membership.room_id = ? AND membership.actor_id = ?`,
-        ).get(job.roomId, intent.targetAgentId);
-        if (currentRoom?.status !== "active" || membership?.kind !== "agent" || membership.actorKind !== "agent") {
+        const candidate = snapshotCandidateByAgent.get(intent.targetAgentId)!;
+        const rejection = routeSelectionAuthorityRejection(
+          database,
+          job,
+          snapshot.sourceMessageRevision,
+          candidate,
+          operation.agentProviderReady,
+        );
+        if (rejection !== undefined) {
           const previous = judgmentByAgent.get(intent.targetAgentId)!;
           judgmentByAgent.set(intent.targetAgentId, {
             ...previous,
             outcome: "suppressed",
             reasonCode: "permission_denied",
-            reasonText: "current Agent membership permission denied",
+            reasonText: `authority_changed:${rejection}`,
           });
           continue;
         }
@@ -6099,15 +6188,8 @@ export function executeRouteAuthorityOperation(
         decisionOutcome, decisionReason, occurredAt);
       const routedIntentIds: string[] = [];
       for (const intent of routedAccepted) {
-        const candidate = snapshotCandidateRows.find((entry) =>
-          entry.agentId === intent.targetAgentId);
-        if (candidate === undefined || typeof candidate.profileId !== "string" ||
-            typeof candidate.profileRevision !== "number" ||
-            typeof candidate.assignmentId !== "string" ||
-            typeof candidate.assignmentRevision !== "number" ||
-            typeof candidate.accessRevision !== "number") {
-          return fail("route_conflict", "Routed intent candidate binding was unavailable");
-        }
+        const candidate = snapshotCandidateByAgent.get(intent.targetAgentId);
+        if (candidate === undefined) return fail("route_conflict", "Routed intent candidate binding was unavailable");
         const intentId = stableId("routed-invocation-intent", decisionId, intent.targetAgentId);
         const trigger = intent.reasonCode === "domain_match" ? "domain"
           : intent.reasonCode === "risk_detected" ? "risk" : "ball";

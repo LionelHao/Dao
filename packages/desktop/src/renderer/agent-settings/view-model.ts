@@ -227,12 +227,17 @@ export function applyAgentSettingsAuthorityMessage(
         ? Object.freeze({ ...state, operation: { status: "failed", requestId: message.requestId, command: message.command, error: message.error } }) as AgentSettingsState
         : state;
     case "stable-event": {
-      if (state.appliedEventIds.includes(message.eventId)) return state;
-      const nextSnapshot = state.snapshot === undefined ? undefined : patchSnapshot(state.snapshot, message);
       const matches = message.causationRequestId !== undefined &&
         (state.operation.status === "submitting" || state.operation.status === "acknowledged") &&
         state.operation.requestId === message.causationRequestId &&
         (state.operation.status !== "acknowledged" || state.operation.eventIds.includes(message.eventId));
+      if (state.appliedEventIds.includes(message.eventId)) {
+        return matches
+          ? Object.freeze({ ...state, operation: { status: "succeeded" as const,
+              requestId: state.operation.requestId, command: state.operation.command } }) as AgentSettingsState
+          : state;
+      }
+      const nextSnapshot = state.snapshot === undefined ? undefined : patchSnapshot(state.snapshot, message);
       return Object.freeze({
         ...state,
         ...(nextSnapshot === undefined ? {} : { snapshot: nextSnapshot }),

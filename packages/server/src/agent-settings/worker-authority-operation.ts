@@ -129,6 +129,12 @@ function assignmentProjection(row: Row, readiness: "ready" | "noauth"): RoomAgen
   const capabilitySubset = canonicalSet(row.capabilitySubsetJson);
   const toolCeiling = canonicalSet(row.toolCeilingJson);
   const toolSubset = canonicalSet(row.toolSubsetJson);
+  const membershipTools = new Set(canonicalSet(row.membershipToolsJson));
+  if (capabilitySubset.some((capability) => !capabilityCeiling.includes(capability)) ||
+      toolSubset.some((tool) => !toolCeiling.includes(tool))) {
+    return fail("FT-07 Assignment exceeds its Profile ceiling");
+  }
+  const effectiveTools = Object.freeze(toolSubset.filter((tool) => membershipTools.has(tool)));
   return Object.freeze({
     recordVersion: "room-agent-assignment.v1" as const,
     assignmentId: text(row.assignmentId), roomId: text(row.roomId),
@@ -139,7 +145,7 @@ function assignmentProjection(row: Row, readiness: "ready" | "noauth"): RoomAgen
       ? row.participation : fail("FT-07 Assignment participation is corrupt"),
     availability, paused, capabilityCeiling, capabilitySubset,
     effectiveCapabilities: capabilitySubset, toolCeiling, toolSubset,
-    effectiveTools: toolSubset, profileRevision: positive(row.profileRevision),
+    effectiveTools, profileRevision: positive(row.profileRevision),
     assignmentRevision: positive(row.assignmentRevision), accessRevision: count(row.accessRevision),
     updatedAt: text(row.updatedAt),
   }) as RoomAgentAssignmentProjection;
@@ -159,6 +165,7 @@ const ASSIGNMENT_PROJECTION_SQL = `
          profile.tool_ceiling_json AS toolCeilingJson,
          profile.revision AS profileRevision,
          membership.access_revision AS accessRevision,
+         membership.tool_permissions_json AS membershipToolsJson,
          (SELECT COUNT(*) FROM agent_executions AS execution
           WHERE execution.room_id = assignment.room_id
             AND execution.agent_id = assignment.agent_actor_id

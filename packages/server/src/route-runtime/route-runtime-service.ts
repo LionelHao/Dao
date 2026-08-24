@@ -301,6 +301,7 @@ export function createRouteRuntimeService(
       job,
       result.judgments,
       result.intents,
+      (options.agentReadiness?.() ?? "ready") === "ready",
       failure,
     );
   };

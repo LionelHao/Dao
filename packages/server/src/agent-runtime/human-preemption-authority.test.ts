@@ -373,6 +373,7 @@ describe("real SQLite human-preemption authority", () => {
       intents: [{ kind: "routed_candidate", roomId: "room-1", sourceMessageId: "human-message-1",
         targetAgentId: "agent-1", reasonCode: "domain_match", reasonText: "selected after human fence",
         priority: 3 }],
+      agentProviderReady: true,
       now: t0 + 20_006,
     });
     if (completedRoute.kind !== "route-completed" || completedRoute.handoffs.length !== 1) {
@@ -457,6 +458,66 @@ describe("real SQLite human-preemption authority", () => {
     expect(database.prepare(
       "SELECT COUNT(*) AS count FROM events WHERE event_type = 'room.human_preemption.applied'",
     ).get()).toEqual({ count: 2 });
+    database.close();
+  });
+
+  it("suppresses a selected Agent when frozen access changes after claim and before completion", () => {
+    const database = fixture();
+    database.prepare(
+      `UPDATE room_memberships SET participation = 'on-mention'
+       WHERE room_id = 'room-1' AND actor_id = 'agent-2'`,
+    ).run();
+    executeHumanDatabaseCommand(database, {
+      context: { ...humanContext, requestId: "terminal-revalidation",
+        idempotencyKey: "terminal-revalidation" },
+      command: { type: "message.send", roomId: "room-1", payload: {
+        id: "terminal-revalidation", roomId: "room-1",
+        body: "Revalidate authority after provider routing", sentAt: new Date(t0 + 40_000).toISOString(),
+      } },
+      now: t0 + 40_000,
+    });
+    executeRuntimeAuthorityOperation(database, {
+      type: "runtime.cancel-for-human-fence", sourceHumanMessageId: "terminal-revalidation",
+      now: t0 + 40_001,
+    });
+    executeRuntimeAuthorityOperation(database, {
+      type: "runtime.create-route-after-human-fence", sourceHumanMessageId: "terminal-revalidation",
+      now: t0 + 40_002,
+    });
+    const claim = executeRouteAuthorityOperation(database, {
+      type: "route.claim", sourceMessageId: "terminal-revalidation",
+      agentProviderReady: true, now: t0 + 40_003,
+    });
+    if (claim.kind !== "route-claimed") throw new Error("unexpected route claim");
+    database.prepare(
+      `UPDATE room_memberships SET access_revision = access_revision + 1
+       WHERE room_id = 'room-1' AND actor_id = 'agent-1'`,
+    ).run();
+    const completed = executeRouteAuthorityOperation(database, {
+      type: "route.complete", routeJobId: claim.job.id, attempt: claim.job.currentAttempt,
+      judgments: [{
+        id: "terminal-revalidation-judgment", routeJobId: claim.job.id,
+        sourceMessageId: "terminal-revalidation", agentId: "agent-1",
+        outcome: "will_respond", reasonCode: "domain_match",
+        reasonText: "provider selected before authority changed", routeAttempt: claim.job.currentAttempt,
+        decidedAt: new Date(t0 + 40_004).toISOString(),
+      }],
+      intents: [{ kind: "routed_candidate", roomId: "room-1",
+        sourceMessageId: "terminal-revalidation", targetAgentId: "agent-1",
+        reasonCode: "domain_match", reasonText: "provider selected before authority changed", priority: 1 }],
+      agentProviderReady: true,
+      now: t0 + 40_004,
+    });
+    expect(completed).toMatchObject({ kind: "route-completed", intents: [], handoffs: [] });
+    expect(database.prepare(
+      `SELECT outcome, reason_code AS reasonCode, reason_text AS reasonText
+       FROM route_judgments WHERE id = 'terminal-revalidation-judgment'`,
+    ).get()).toEqual({ outcome: "suppressed", reasonCode: "permission_denied",
+      reasonText: "authority_changed:access_revision_stale" });
+    expect(database.prepare(
+      `SELECT COUNT(*) AS count FROM routed_agent_invocation_intents
+       WHERE source_message_id = 'terminal-revalidation'`,
+    ).get()).toEqual({ count: 0 });
     database.close();
   });
 

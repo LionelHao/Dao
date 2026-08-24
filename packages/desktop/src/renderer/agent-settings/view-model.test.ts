@@ -78,6 +78,37 @@ describe("FT-07 Agent Settings authority state", () => {
     expect(converged.snapshot?.room.assignments[0]?.availability).toBe("paused");
   });
 
+  it("settles an ACK when its real stable event arrived before correlation was known", () => {
+    const ready = applyAgentSettingsAuthorityMessage(createAgentSettingsInitialState(), {
+      type: "snapshot", snapshot: snapshot(),
+    });
+    const submitting = beginAgentSettingsMutation(ready, {
+      requestId: "request-race",
+      intent: {
+        command: "assignment.pause", roomId: "room-dao",
+        assignmentId: "assignment-research", expectedRoomRevision: 12,
+        expectedAssignmentRevision: 8,
+      },
+    });
+    const eventFirst = applyAgentSettingsAuthorityMessage(submitting, {
+      type: "stable-event", eventId: "event-race", cursor: 32,
+      event: { kind: "assignment.upserted", roomRevision: 13,
+        assignment: assignment({ availability: "paused", paused: true, assignmentRevision: 9 }) },
+    });
+    const acknowledged = applyAgentSettingsAuthorityMessage(eventFirst, {
+      type: "ack", requestId: "request-race", command: "assignment.pause",
+      replayed: false, acceptedRevision: 9, eventIds: ["event-race"],
+    });
+    const correlatedReplay = applyAgentSettingsAuthorityMessage(acknowledged, {
+      type: "stable-event", eventId: "event-race", cursor: 32,
+      causationRequestId: "request-race",
+      event: { kind: "assignment.upserted", roomRevision: 13,
+        assignment: assignment({ availability: "paused", paused: true, assignmentRevision: 9 }) },
+    });
+    expect(correlatedReplay.operation.status).toBe("succeeded");
+    expect(correlatedReplay.appliedEventIds).toEqual(["event-race"]);
+  });
+
   it("retains the last complete projection through offline/repair failure and flips repair atomically", () => {
     const ready = applyAgentSettingsAuthorityMessage(createAgentSettingsInitialState(), {
       type: "snapshot", snapshot: snapshot(),

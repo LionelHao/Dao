@@ -706,7 +706,20 @@ describe("v19 Context Snapshot database authority", () => {
   it("prepares on-mention, commits one immutable snapshot, and returns byte-identical body", () => {
     withDatabase((database) => {
       seedExecution(database, "on-mention");
-      const committed = commitSnapshot(database);
+      database.prepare(
+        `UPDATE room_memberships SET tool_permissions_json = '[]'
+         WHERE room_id = 'context-room' AND actor_id = 'context-agent'`,
+      ).run();
+      const prepared = preparation(database);
+      expect(prepared.compilerInputFacts.agent.effectiveTools).toEqual([]);
+      expect(prepared.compilerInputFacts.tools).toEqual([]);
+      const operation = commitInput(
+        prepared.preparationSha256, {}, prepared.compilerInputFacts,
+      );
+      const committed = executeContextSnapshotAuthorityOperation(
+        database,
+        operation,
+      );
       expect(committed).toMatchObject({
         kind: "context-snapshot",
         snapshot: {
@@ -720,7 +733,7 @@ describe("v19 Context Snapshot database authority", () => {
       });
       const replay = executeContextSnapshotAuthorityOperation(
         database,
-        commitInput((committed as { snapshot: { snapshotId: string } }).snapshot.snapshotId),
+        commitInput(prepared.preparationSha256, {}, prepared.compilerInputFacts),
       );
       expect(replay).toBeDefined();
       const read = executeContextSnapshotAuthorityOperation(database, {
@@ -729,8 +742,8 @@ describe("v19 Context Snapshot database authority", () => {
       });
       expect(read).toMatchObject({
         kind: "context-body",
-        snapshot: { envelopeSha256: commitInput("a".repeat(64)).body.envelopeSha256 },
-        canonicalEnvelopeJson: commitInput("a".repeat(64)).body.canonicalEnvelopeJson,
+        snapshot: { envelopeSha256: operation.body.envelopeSha256 },
+        canonicalEnvelopeJson: operation.body.canonicalEnvelopeJson,
       });
       expect(() => database.exec(
         "UPDATE context_manifest_items SET source_id = 'tampered' WHERE snapshot_id = 'context-snapshot'",

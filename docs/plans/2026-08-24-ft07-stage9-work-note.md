@@ -70,6 +70,11 @@ UI映射与正式设计偏离记录见rebaseline第1、6、7节；偏离为“�
 - 私有Route Authority协议新增closed `route.handoff.claim`/`route.handoff.recover`操作；focused protocol/route/SQLite/human-preemption/runtime authority矩阵为6 files / 122 tests全通过。真实进程authority E2E为1 file / 26 tests全通过，并以terminal `route_decisions`等待恢复收敛。
 - 首次最终全量候选暴露3项测试fixture不再符合新权威边界（两个E2E仍等待legacy judgment计数、一个runtime fixture缺真实Profile/Assignment/direct binding）；均已改为生产事实fixture。该次非最终结果为193 files passed / 3 skipped / 2 failed，2153 tests passed / 3 skipped / 3 failed；不作为交付计数。
 - 最终候选独占全量门禁：199 files（196 passed / 3 skipped / 0 failed），2161 tests（2158 passed / 3 skipped / 0 failed），249.58s；同一命令先通过Core I/O boundary与Desktop renderer boundary（23 production sources）。三个skip仍是opt-in OpenAI Agent、Router、Memory live suites；未读取或披露secret。
+- 独立对抗审阅随后指出三项交付阻塞：Route Provider返回后缺少终态Profile/Assignment/access/availability复核，Context与Settings的effective tools遗漏membership policy交集，Desktop生产runtime未持续消费真实sync/repair并从ACK+snapshot伪造stable event。三项均已修复并增加针对性回归；状态待同一审阅者复核。
+- Route terminal现在在同一Authority transaction内逐个复核source revision、Room、Profile及revision、Assignment及revision/participation/pause、membership及access revision、Provider readiness和busy状态；claim后access revision变化的测试证明选择被改写为`suppressed`，且没有handoff或pending routed intent。
+- Context compiler manifest和Agent Settings projection都以`Profile ceiling ∩ Assignment subset ∩ membership tool policy`形成effective tools；测试证明membership撤权后ceiling/subset仍保留，而effective tools与compiled tool manifest均为空。
+- Desktop生产runtime改为单个持久认证WebSocket上的request multiplexing、`agent-profile.sync/repair`、`room.sync`、Assignment repair与Room subscribe；stable event只来自真实deployment/Room persisted event。双真实Desktop客户端E2E证明外部客户端mutation经相同event ID实时收敛，另有stable-event先于ACK correlation的竞态回归。
+- 修复后最终独占全量门禁：199 files（196 passed / 3 skipped / 0 failed），2163 tests（2160 passed / 3 skipped / 0 failed），247.74s；Core I/O boundary与Desktop renderer boundary（23 production sources）均通过。另行通过typecheck、lint、build与真实Desktop Agent Settings聚焦E2E（1 passed / 25 skipped）。三个skip仍是opt-in OpenAI Agent、Router、Memory live suites；未读取或披露secret。
 - CI链接与merge SHA待GitHub事实产生后写入交付说明。
 
 ## 7. PR、CI、review与清理日志（持续更新）

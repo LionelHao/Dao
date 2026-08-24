@@ -1430,6 +1430,7 @@ describe("SQLite authoritative sessions", () => {
         attempt: 1,
         judgments,
         intents,
+        agentProviderReady: true,
         now: 2_200,
       })).resolves.toMatchObject({
         kind: "route-completed",
@@ -5119,6 +5120,7 @@ describe("SQLite authoritative sessions", () => {
         reasonText: "must be discarded",
         priority: 1,
       }],
+      agentProviderReady: true,
       now: 5_150,
     })).resolves.toMatchObject({
       kind: "route-completed",

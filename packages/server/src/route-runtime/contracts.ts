@@ -30,6 +30,7 @@ export interface RouteAuthority {
     job: RouteJob,
     judgments: readonly RouteJudgment[],
     intents: readonly RouteInvocationIntent[],
+    agentProviderReady: boolean,
     terminalErrorCode?: RouteProviderFailureCode,
   ): Promise<{
     readonly job: RouteJob;
