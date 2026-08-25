@@ -4268,9 +4268,13 @@ describe("authoritative server real-process harness", () => {
         setup.prepare(
           `INSERT INTO project_next_actions (
              id, room_id, source_room_id, source_id, revision, owner_kind,
-             owner_actor_id, verifier_human_actor_id, status
-           ) VALUES (?, ?, ?, ?, 1, 'human', 'human-c', NULL, 'in_progress')`,
-        ).run("governance-conflict-action", roomId, roomId, "governance-source");
+             owner_actor_id, verifier_human_actor_id, status, source_kind,
+             source_revision, visibility_room_id, created_by_actor_id, created_at, updated_at
+           ) VALUES (
+             ?, ?, ?, ?, 1, 'human', 'human-c', NULL, 'in_progress', 'message',
+             1, ?, 'human-a', '2026-08-19T00:00:03.000Z', '2026-08-19T00:00:03.000Z'
+           )`,
+        ).run("governance-conflict-action", roomId, roomId, "governance-source", roomId);
         setup.exec("COMMIT");
       } catch (error: unknown) {
         setup.exec("ROLLBACK");
@@ -4790,8 +4794,9 @@ describe("authoritative server real-process harness", () => {
         observeMaterializedLastPage = resolve;
       });
       let materializedLastPageObserved = false;
-      // The mixed fixture count excludes the singleton governance and Memory status records.
-      const expectedRepairTotal = mixed.total + 2;
+      // The mixed fixture count excludes the singleton governance, Memory status,
+      // and Project Loop snapshot records.
+      const expectedRepairTotal = mixed.total + 3;
       transportC.beforeMaterializedLastPageReturn = async (page, receivedRecordCount) => {
         materializedLastPageObserved = true;
         observeMaterializedLastPage();
