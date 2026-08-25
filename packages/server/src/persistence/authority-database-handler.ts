@@ -6966,6 +6966,79 @@ export function executeRuntimeAuthorityOperation(
         }).rawDelta,
       };
     }
+    if (operation.type === "runtime.suppress-project-boundary") {
+      const existing = database.prepare(
+        `SELECT room_id AS roomId, status, invocation_intent_id AS intentId,
+                request_sha256 AS requestSha256, recorded_at AS recordedAt
+         FROM project_boundary_invocation_receipts WHERE boundary_id = ?`,
+      ).get(operation.request.boundaryId);
+      if (existing !== undefined) {
+        if (existing.requestSha256 !== operation.requestSha256 ||
+            existing.roomId !== operation.request.roomId ||
+            existing.status !== "dependency_unavailable" ||
+            typeof existing.recordedAt !== "string") {
+          return fail("execution_conflict", "Project boundary decision changed or was already consumed");
+        }
+        return {
+          kind: "project-boundary",
+          result: {
+            boundaryId: operation.request.boundaryId,
+            roomId: operation.request.roomId,
+            status: "suppressed",
+            reason: "dependency_unavailable",
+            decidedAt: existing.recordedAt,
+          },
+        };
+      }
+      const authority = database.prepare(
+        `SELECT room.status AS roomStatus, actor.kind AS actorKind,
+                membership.kind AS membershipKind
+         FROM rooms AS room
+         JOIN actors AS actor ON actor.id = ?
+         JOIN room_memberships AS membership
+           ON membership.room_id = room.id AND membership.actor_id = actor.id
+         WHERE room.id = ?`,
+      ).get(operation.request.agentId, operation.request.roomId);
+      if (authority?.roomStatus !== "active" || authority.actorKind !== "agent" ||
+          authority.membershipKind !== "agent") {
+        return fail("permission_denied", "Project boundary room or Agent authority was unavailable");
+      }
+      database.prepare(
+        `INSERT INTO project_boundary_invocation_receipts (
+           boundary_id, room_id, source_revision, status, invocation_intent_id,
+           request_sha256, recorded_at
+         ) VALUES (?, ?, ?, 'dependency_unavailable', NULL, ?, ?)`,
+      ).run(
+        operation.request.boundaryId,
+        operation.request.roomId,
+        operation.request.sourceFactRevision,
+        operation.requestSha256,
+        operation.decidedAt,
+      );
+      const result = {
+        boundaryId: operation.request.boundaryId,
+        roomId: operation.request.roomId,
+        status: "suppressed" as const,
+        reason: operation.reason,
+        decidedAt: operation.decidedAt,
+      };
+      const eventId = stableId(
+        "project-boundary-invocation", operation.request.boundaryId, operation.requestSha256,
+      );
+      const streamSeq = appendRoomEvent(database, {
+        eventId,
+        roomId: operation.request.roomId,
+        actorId: operation.request.agentId,
+        eventType: "project.boundary.invocation.decided",
+        occurredAt: operation.decidedAt,
+        payload: result as unknown as JsonValue,
+      });
+      appendRoomOutbox(
+        database, eventId, operation.request.roomId, streamSeq, operation.decidedAt,
+        "project-boundary-invocation", operation.request.boundaryId,
+      );
+      return { kind: "project-boundary", result };
+    }
     if (operation.type === "runtime.claim-pending-direct-intents") {
       const candidates = database.prepare(
         `SELECT intent.id AS intentId, intent.room_id AS roomId,

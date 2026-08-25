@@ -1417,6 +1417,92 @@ function attachmentE2ePdf(): Buffer {
 }
 
 describe("authoritative server real-process harness", () => {
+  it("production-composes the FT-09-unavailable project-boundary seam as durable suppression", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-ft08-project-boundary-"));
+    const databasePath = join(directory, "authority.sqlite");
+    let server: AuthoritativeServer | undefined;
+    let result: unknown;
+    try {
+      server = await startAuthoritativeServerForTest({
+        databasePath,
+        snapshotCachePath: join(directory, "snapshot-cache.sqlite"),
+        sharedAuthority: { maxOfflineReadLeaseMs: 60_000 },
+        listen: { host: "127.0.0.1", port: 0 },
+        actors,
+        identities: {
+          async verify(credentials) {
+            return credentials.accountId === "account-a" && credentials.secret === "test-secret"
+              ? { accountId: "account-a", actorId: "human-a" }
+              : undefined;
+          },
+        },
+        invitationSecretKey: new Uint8Array(32).fill(48),
+        tenantAdministration: { bootstrapHumanActorIds: ["human-a"] },
+      }, {
+        initialize: async (facades) => {
+          const issued = await facades.auth.login({ accountId: "account-a", secret: "test-secret" });
+          const authenticated = await facades.auth.authenticateSession(issued.accessToken);
+          const context = {
+            ...authenticated,
+            kind: "human" as const,
+            requestId: "ft08-project-boundary-room",
+            idempotencyKey: "ft08-project-boundary-room",
+          };
+          const room = await facades.lifecycle.createRoom(context, {
+            name: "FT-08 project boundary fail closed",
+          });
+          await facades.lifecycle.configureAgent({
+            ...context,
+            requestId: "ft08-project-boundary-agent",
+            idempotencyKey: "ft08-project-boundary-agent",
+          }, {
+            kind: "agent-configuration",
+            roomId: room.id,
+            agentId: "agent-a",
+            participation: "active",
+            toolPermissions: ["authority.inspect"],
+          });
+          const request = {
+            purpose: "project_boundary_invocation" as const,
+            boundaryId: "ft08-boundary-unavailable",
+            boundaryKind: "checkpoint" as const,
+            projectId: room.id,
+            roomId: room.id,
+            agentId: "agent-a",
+            sourceFactId: "ft09-unavailable-source",
+            sourceFactRevision: 1,
+          };
+          const first = await facades.projectBoundary.consume(request);
+          const replay = await facades.projectBoundary.consume(request);
+          expect(replay).toEqual(first);
+          result = first;
+        },
+      });
+      expect(result).toMatchObject({
+        boundaryId: "ft08-boundary-unavailable",
+        status: "suppressed",
+        reason: "dependency_unavailable",
+      });
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      try {
+        expect(database.prepare(
+          `SELECT
+             (SELECT COUNT(*) FROM project_boundary_invocation_receipts
+              WHERE boundary_id = 'ft08-boundary-unavailable'
+                AND status = 'dependency_unavailable') AS receipts,
+             (SELECT COUNT(*) FROM agent_executions) AS executions,
+             (SELECT COUNT(*) FROM events
+              WHERE event_type = 'project.boundary.invocation.decided') AS events`,
+        ).get()).toEqual({ receipts: 1, executions: 0, events: 1 });
+      } finally {
+        database.close();
+      }
+    } finally {
+      await server?.close().catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("drives the Desktop Agent Settings runtime through real WS, Worker, and SQLite authority", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-ft07-desktop-authority-"));
     const databasePath = join(directory, "authority.sqlite");

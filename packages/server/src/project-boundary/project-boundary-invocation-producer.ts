@@ -6,6 +6,8 @@ import {
   type ProjectBoundaryInvocationResult,
 } from "@native-im/core";
 import { canonicalJsonV1 } from "../context-compiler/canonical-json.js";
+import type { RuntimeAuthorityOperation } from
+  "../agent-runtime/runtime-authority-protocol.js";
 
 /**
  * FT-08's server-private handoff. FT-09 will supply the versioned Project fact
@@ -23,6 +25,35 @@ export interface ProjectBoundaryInvocationAuthorityPort {
 
 export interface ProjectBoundaryInvocationProducer {
   consume(request: ProjectBoundaryInvocationRequest): Promise<ProjectBoundaryInvocationResult>;
+}
+
+export interface ProjectBoundaryRuntimeOperationExecutor {
+  executeRuntime(operation: RuntimeAuthorityOperation): Promise<unknown>;
+}
+
+export function createWorkerProjectBoundaryInvocationAuthority(
+  worker: ProjectBoundaryRuntimeOperationExecutor,
+): ProjectBoundaryInvocationAuthorityPort {
+  return Object.freeze({
+    async recordSuppressed(
+      input: Parameters<ProjectBoundaryInvocationAuthorityPort["recordSuppressed"]>[0],
+    ) {
+      const result = await worker.executeRuntime({
+        type: "runtime.suppress-project-boundary",
+        request: input.request,
+        requestSha256: input.requestSha256,
+        reason: input.reason,
+        decidedAt: input.decidedAt,
+        now: Date.parse(input.decidedAt),
+      });
+      if (typeof result !== "object" || result === null || !("kind" in result) ||
+          result.kind !== "project-boundary" || !("result" in result) ||
+          !isProjectBoundaryInvocationResult(result.result)) {
+        throw new TypeError("Project boundary worker result was malformed");
+      }
+      return result.result;
+    },
+  });
 }
 
 export function createFailClosedProjectBoundaryInvocationProducer(options: Readonly<{

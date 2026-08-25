@@ -76,6 +76,11 @@ import {
   createMemoryStewardRuntime,
   type MemoryStewardRuntime,
 } from "./room-memory/memory-steward-runtime.js";
+import {
+  createFailClosedProjectBoundaryInvocationProducer,
+  createWorkerProjectBoundaryInvocationAuthority,
+  type ProjectBoundaryInvocationProducer,
+} from "./project-boundary/project-boundary-invocation-producer.js";
 
 export { createProductionSharedAuthorityParticipantComposition } from "./room-governance/production-participant-composition.js";
 
@@ -178,6 +183,7 @@ export interface AuthoritativeServerTestFacades {
   readonly lifecycle: ReturnType<typeof createAuthoritativeRoomLifecycleService>;
   readonly messages: ReturnType<typeof createMessageService>;
   readonly primitives: ReturnType<typeof createAuthoritativeCollaborationPrimitives>;
+  readonly projectBoundary: ProjectBoundaryInvocationProducer;
 }
 
 const AGENT_MODEL_CONTEXT_WINDOWS: Readonly<Record<string, number>> = Object.freeze({
@@ -508,7 +514,14 @@ async function start(
       queryStore: authority,
     });
     const primitives = createAuthoritativeCollaborationPrimitives({ commandStore });
-    await testOptions.initialize?.({ auth, lifecycle, messages: service, primitives });
+    const projectBoundary = createFailClosedProjectBoundaryInvocationProducer({
+      authority: createWorkerProjectBoundaryInvocationAuthority(
+        worker as CompleteWorkerDatabaseClient,
+      ),
+    });
+    await testOptions.initialize?.({
+      auth, lifecycle, messages: service, primitives, projectBoundary,
+    });
     const runtimeConfiguration = options.agentRuntime ?? {};
     const authorityWorker = worker as CompleteWorkerDatabaseClient;
     const memoryAuthority = createWorkerMemoryAuthority({ worker, nowMs: Date.now });

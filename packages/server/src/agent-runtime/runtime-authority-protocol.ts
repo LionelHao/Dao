@@ -1,10 +1,13 @@
 import {
+  isProjectBoundaryInvocationRequest,
   type LegacyAgentExecution as AgentExecution,
   type LegacyAgentInvocationIntent as AgentInvocationIntent,
   type HumanPreemptionNotice,
   type RoomMemoryRawDeltaPage,
   type RoomMemoryStatus,
   type RoomMemoryVersionProjection,
+  type ProjectBoundaryInvocationRequest,
+  type ProjectBoundaryInvocationResult,
   type ToolConfirmationInput,
   type ToolDescriptor,
 } from "@native-im/core";
@@ -54,6 +57,14 @@ export type RuntimeAuthorityOperation =
       readonly providerId: string;
       readonly modelId: string;
       readonly limit: number;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.suppress-project-boundary";
+      readonly request: ProjectBoundaryInvocationRequest;
+      readonly requestSha256: string;
+      readonly reason: "dependency_unavailable";
+      readonly decidedAt: string;
       readonly now: number;
     }
   | { readonly type: "runtime.claim"; readonly executionId: string; readonly attemptSeq: number; readonly now: number }
@@ -226,6 +237,7 @@ export type RuntimeAuthorityOperationResult =
       readonly records: readonly RuntimeRecoveryRecord[];
       readonly hasMore: boolean;
     }
+  | { readonly kind: "project-boundary"; readonly result: ProjectBoundaryInvocationResult }
   | { readonly kind: "execution"; readonly execution: AgentExecution }
   | {
       readonly kind: "prepared-tool";
@@ -399,6 +411,12 @@ export function isRuntimeAuthorityOperation(value: unknown): value is RuntimeAut
     return exact(value, ["type", "providerId", "modelId", "limit", "now"]) &&
       text(value.providerId) && text(value.modelId) && count(value.limit, 1) &&
       value.limit <= 256 && count(value.now);
+  }
+  if (value.type === "runtime.suppress-project-boundary") {
+    return exact(value, [
+      "type", "request", "requestSha256", "reason", "decidedAt", "now",
+    ]) && isProjectBoundaryInvocationRequest(value.request) && sha256(value.requestSha256) &&
+      value.reason === "dependency_unavailable" && text(value.decidedAt) && count(value.now);
   }
   if (value.type === "runtime.claim") {
     return exact(value, ["type", "executionId", "attemptSeq", "now"]) && text(value.executionId) && count(value.attemptSeq, 1) && count(value.now);
