@@ -337,7 +337,7 @@ export type ProjectEvent = Readonly<{
   transitionAuthority:
     | Readonly<{ kind: "human" | "agent"; actorId: string }>
     | Readonly<{ kind: "system_timer" }>;
-  causalActor: ProjectActorRef;
+  causalActor: ProjectActorRef | null;
   occurredAt: string;
   type: ProjectEventType;
   payload: ProjectFact | ProjectProposal | ProjectConfirmation | ProjectTransferProposal | ProjectBallFact;
@@ -1072,7 +1072,9 @@ export function isProjectEvent(value: unknown): value is ProjectEvent {
         (value.transitionAuthority.kind === "human" || value.transitionAuthority.kind === "agent") &&
           hasExactKeys(value.transitionAuthority, ["kind", "actorId"]) &&
           isIdentifier(value.transitionAuthority.actorId)) ||
-      !isProjectActorRef(value.causalActor) || !isIsoTimestamp(value.occurredAt)) return false;
+      (value.transitionAuthority.kind === "system_timer"
+        ? value.causalActor !== null : !isProjectActorRef(value.causalActor)) ||
+      !isIsoTimestamp(value.occurredAt)) return false;
   switch (value.type) {
     case "project.goal.changed": return isProjectGoal(value.payload) && value.payload.roomId === value.roomId;
     case "project.decision.changed": return isProjectDecision(value.payload) && value.payload.roomId === value.roomId;

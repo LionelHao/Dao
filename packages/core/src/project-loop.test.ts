@@ -425,9 +425,11 @@ describe("FT-09 Project Loop closed core contracts", () => {
       capturedAt: later,
     };
     expect(isProjectEvent(event)).toBe(true);
-    expect(isProjectEvent({ ...event, transitionAuthority: { kind: "system_timer" } })).toBe(true);
+    expect(isProjectEvent({ ...event, transitionAuthority: { kind: "system_timer" },
+      causalActor: null })).toBe(true);
     expect(isProjectEvent({ ...event,
-      transitionAuthority: { kind: "system_timer", actorId: "human-1" } })).toBe(false);
+      transitionAuthority: { kind: "system_timer", actorId: "human-1" },
+      causalActor: null })).toBe(false);
     expect(isProjectSnapshot(snapshot)).toBe(true);
     expect(isProjectRepairRecord({ kind: "project-loop", roomId: "room-1", value: snapshot }, "room-1")).toBe(true);
     expect(isProjectEvent({ ...event, streamId: "room-2" })).toBe(false);

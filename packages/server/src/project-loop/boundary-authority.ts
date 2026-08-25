@@ -716,6 +716,7 @@ export function reopenProjectLoopBoundariesInTransaction(database: DatabaseSync,
   }
   const prior = [...latest.values()].sort((left, right) => left.boundaryId.localeCompare(right.boundaryId));
   let changedProjectFacts = 0;
+  const rescheduledFactRevisions = new Map<string, Readonly<{ before: number; after: number }>>();
   const canonicalTimers = hasColumn(database, "project_next_actions", "due_at") &&
     hasColumn(database, "project_obstacles", "source_kind") &&
     hasColumn(database, "project_transfer_proposals", "source_kind") &&
@@ -735,6 +736,8 @@ export function reopenProjectLoopBoundariesInTransaction(database: DatabaseSync,
        WHERE room_id = ? AND id = ? AND revision = ? AND due_at = ?`,
     ).run(resumeTimer(row.dueAt), input.occurredAt, input.roomId, row.id, row.revision, row.dueAt);
     if (updated.changes !== 1) throw new ProjectLoopAuthorityError("revision_conflict", "Project deadline changed");
+    rescheduledFactRevisions.set(`next_action\0${row.id}`,
+      Object.freeze({ before: row.revision, after: row.revision + 1 }));
     const fact = readProjectLoopFactInTransaction(database, "next_action", row.id, input.roomId);
     const state = database.prepare("SELECT revision FROM project_room_states WHERE room_id = ?")
       .get(input.roomId);
@@ -768,6 +771,8 @@ export function reopenProjectLoopBoundariesInTransaction(database: DatabaseSync,
        WHERE room_id = ? AND id = ? AND revision = ?`,
     ).run(dueAt, reviewAt, input.occurredAt, input.roomId, row.id, row.revision);
     if (updated.changes !== 1) throw new ProjectLoopAuthorityError("revision_conflict", "Project obstacle timer changed");
+    rescheduledFactRevisions.set(`${row.kind}\0${row.id}`,
+      Object.freeze({ before: row.revision, after: row.revision + 1 }));
     const fact = readProjectLoopFactInTransaction(database, row.kind, row.id, input.roomId);
     const state = database.prepare("SELECT revision FROM project_room_states WHERE room_id = ?")
       .get(input.roomId);
@@ -782,22 +787,31 @@ export function reopenProjectLoopBoundariesInTransaction(database: DatabaseSync,
   }
   const transferTimers = database.prepare(
     `SELECT id, revision, subject_kind AS subjectKind, subject_id AS subjectId,
+            subject_revision AS subjectRevision,
             expires_at AS scheduledAt FROM project_transfer_proposals
      WHERE room_id = ? AND status = 'pending' AND expires_at IS NOT NULL
      ORDER BY id`,
   ).all(input.roomId);
   for (const timer of transferTimers) {
     if (typeof timer.id !== "string" || typeof timer.revision !== "number" ||
+        typeof timer.subjectRevision !== "number" ||
         typeof timer.scheduledAt !== "string" || typeof timer.subjectId !== "string" ||
         (timer.subjectKind !== "next_action" && timer.subjectKind !== "blocker" &&
           timer.subjectKind !== "open_question")) {
       throw new ProjectLoopAuthorityError("storage_unavailable", "Project transfer timer row is corrupt");
     }
     const scheduledAt = timer.scheduledAt;
+    const rescheduledSubject = rescheduledFactRevisions.get(
+      `${timer.subjectKind}\0${timer.subjectId}`,
+    );
+    const subjectRevision = rescheduledSubject?.before === timer.subjectRevision
+      ? rescheduledSubject.after : timer.subjectRevision;
     const changed = database.prepare(
-      `UPDATE project_transfer_proposals SET expires_at = ?, revision = revision + 1, updated_at = ?
+      `UPDATE project_transfer_proposals SET expires_at = ?, subject_revision = ?,
+         revision = revision + 1, updated_at = ?
        WHERE room_id = ? AND id = ? AND revision = ? AND status = 'pending' AND expires_at = ?`,
-    ).run(resumeTimer(scheduledAt), input.occurredAt, input.roomId, timer.id, timer.revision, scheduledAt);
+    ).run(resumeTimer(scheduledAt), subjectRevision, input.occurredAt,
+      input.roomId, timer.id, timer.revision, scheduledAt);
     if (changed.changes !== 1) {
       throw new ProjectLoopAuthorityError("revision_conflict", "Project transfer timer changed");
     }

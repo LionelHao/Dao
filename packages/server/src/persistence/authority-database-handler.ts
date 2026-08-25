@@ -1587,7 +1587,8 @@ function parseRoomSyncEvent(
       roomId: row.roomId,
       projectId: row.roomId,
       transitionAuthority,
-      causalActor: { kind: row.causalActorKind, actorId: row.causalActorId },
+      causalActor: row.authorityKind === "system_timer"
+        ? null : { kind: row.causalActorKind, actorId: row.causalActorId },
       occurredAt: row.occurredAt,
       type: row.eventType,
       payload,
@@ -2023,7 +2024,8 @@ function parseOutboxEvent(
       roomId: row.roomId,
       projectId: row.roomId,
       transitionAuthority,
-      causalActor: { kind: row.causalActorKind, actorId: row.causalActorId },
+      causalActor: row.authorityKind === "system_timer"
+        ? null : { kind: row.causalActorKind, actorId: row.causalActorId },
       occurredAt: row.occurredAt,
       type: row.eventType,
       payload,

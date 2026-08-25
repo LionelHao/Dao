@@ -73,7 +73,7 @@ describe("authority SQLite v25 Project transition authority", () => {
         .toEqual(expect.arrayContaining([
           expect.objectContaining({ name: "authority_kind", notnull: 1 }),
           expect.objectContaining({ name: "actor_id", notnull: 0 }),
-          expect.objectContaining({ name: "causal_actor_id", notnull: 1 }),
+          expect.objectContaining({ name: "causal_actor_id", notnull: 0 }),
         ]));
       expect(database.prepare(
         `SELECT public.authority_kind AS publicAuthority,
@@ -137,10 +137,31 @@ describe("authority SQLite v25 Project transition authority", () => {
            authority_kind,actor_kind,actor_id,causal_actor_kind,causal_actor_id,
            source_room_id,source_id,source_kind,source_revision,source_visibility,
            occurred_at,payload_json
-         ) VALUES ('forged','room-1','room-1',1,'fact.created','request','request-1',1,
-                   'system_timer',NULL,NULL,'human','human-1','room-1','source-1','legacy',1,
+         ) VALUES ('forged','room-1','room-1',1,'fact.transitioned','goal','goal-1',1,
+                   'system_timer',NULL,NULL,NULL,NULL,'room-1','source-1','legacy',1,
                    'room','2026-08-25T00:00:00.000Z','{"transition":"review_due"}')`,
       ).run()).toThrow(/transition authority is invalid/i);
+      expect(() => fresh.prepare(
+        `INSERT INTO project_events (
+           event_id,room_id,project_id,event_seq,event_type,fact_kind,fact_id,fact_revision,
+           authority_kind,actor_kind,actor_id,causal_actor_kind,causal_actor_id,
+           source_room_id,source_id,source_kind,source_revision,source_visibility,
+           occurred_at,payload_json
+         ) VALUES ('forged-transfer','room-1','room-1',1,'fact.transitioned','next_action',
+                   'action-1',1,'system_timer',NULL,NULL,NULL,NULL,'room-1','source-1',
+                   'legacy',1,'room','2026-08-25T00:00:00.000Z',
+                   '{"transition":"transfer_expired","transferProposalId":"transfer-1"}')`,
+      ).run()).toThrow(/transition authority is invalid/i);
+      fresh.prepare(
+        `INSERT INTO project_events (
+           event_id,room_id,project_id,event_seq,event_type,fact_kind,fact_id,fact_revision,
+           authority_kind,actor_kind,actor_id,causal_actor_kind,causal_actor_id,
+           source_room_id,source_id,source_kind,source_revision,source_visibility,
+           occurred_at,payload_json
+         ) VALUES ('review-event','room-1','room-1',1,'fact.transitioned','blocker',
+                   'blocker-1',1,'system_timer',NULL,NULL,NULL,NULL,'room-1','source-1',
+                   'legacy',1,'room','2026-08-25T00:00:00.000Z','{"transition":"review_due"}')`,
+      ).run();
       fresh.prepare(
         "UPDATE streams SET head_seq = 1 WHERE stream_kind = 'room' AND stream_id = 'room-1'",
       ).run();
@@ -148,8 +169,16 @@ describe("authority SQLite v25 Project transition authority", () => {
         `INSERT INTO events (
            event_id,stream_kind,stream_id,stream_seq,room_id,authority_kind,actor_id,
            event_type,occurred_at,payload_json
-         ) VALUES ('forged-public','room','room-1',1,'room-1','system_timer',NULL,
-                   'project.request.changed','2026-08-25T00:00:00.000Z','{}')`,
+         ) VALUES ('review-event','room','room-1',1,'room-1','system_timer',NULL,
+                   'project.goal.changed','2026-08-25T00:00:00.000Z','{}')`,
+      ).run()).toThrow(/event sequence is outside/i);
+      expect(() => fresh.prepare(
+        `INSERT INTO events (
+           event_id,stream_kind,stream_id,stream_seq,room_id,authority_kind,actor_id,
+           event_type,occurred_at,payload_json
+         ) VALUES ('review-event','room','room-1',1,'room-1','system_timer',NULL,
+                   'project.blocker.changed','2026-08-25T00:00:00.000Z',
+                   '{"obstacleId":"different-blocker","revision":1}')`,
       ).run()).toThrow(/event sequence is outside/i);
     });
     withDatabase((upgraded) => {

@@ -456,7 +456,8 @@ export function readCanonicalProjectEventsDatabaseQuery(database: DatabaseSync, 
     const event = Object.freeze({ eventId: required(row, "eventId"),
       streamKind: "room", streamId: required(row, "streamId"), streamSeq: positive(row, "streamSeq"),
       roomId, projectId: roomId, transitionAuthority,
-      causalActor: actor(row.causalActorKind, row.causalActorId),
+      causalActor: row.authorityKind === "system_timer"
+        ? null : actor(row.causalActorKind, row.causalActorId),
       occurredAt: required(row, "occurredAt"), type: required(row, "type") as ProjectEvent["type"],
       payload: parseObject(row.payloadJson) as unknown as ProjectEvent["payload"] }) as unknown as ProjectEvent;
     if (!isProjectEvent(event)) return fail("Canonical Project event invariant failed");

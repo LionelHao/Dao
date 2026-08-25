@@ -357,6 +357,8 @@ export function appendProjectLoopEventInTransaction(database: DatabaseSync, inpu
     ? "system_timer" as const : input.actorKind;
   const authorityActorKind = input.transitionAuthority === "system_timer" ? null : input.actorKind;
   const authorityActorId = input.transitionAuthority === "system_timer" ? null : input.actorId;
+  const causalActorKind = input.transitionAuthority === "system_timer" ? null : input.actorKind;
+  const causalActorId = input.transitionAuthority === "system_timer" ? null : input.actorId;
   database.prepare(
     `INSERT INTO project_events (
        event_id, room_id, project_id, event_seq, event_type, fact_kind, fact_id,
@@ -367,7 +369,7 @@ export function appendProjectLoopEventInTransaction(database: DatabaseSync, inpu
   ).run(
     id, input.roomId, input.roomId, input.eventSeq, input.eventType, input.factKind,
     input.factId, input.factRevision, authorityKind, authorityActorKind, authorityActorId,
-    input.actorKind, input.actorId, input.source.roomId, input.source.sourceId,
+    causalActorKind, causalActorId, input.source.roomId, input.source.sourceId,
     input.source.kind, input.source.sourceRevision,
     input.source.visibility, input.occurredAt, JSON.stringify(transitionPayload),
   );
@@ -383,7 +385,7 @@ export function appendProjectLoopEventInTransaction(database: DatabaseSync, inpu
      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(`audit:${id}`, input.roomId, input.roomId, input.eventSeq, id, input.eventType,
     input.factKind, input.factId, authorityKind, authorityActorKind, authorityActorId,
-    input.actorKind, input.actorId,
+    causalActorKind, causalActorId,
     JSON.stringify(transitionPayload), input.occurredAt);
   const stream = database.prepare(
     `SELECT head_seq AS headSeq FROM streams WHERE stream_kind = 'room' AND stream_id = ?`,
@@ -1090,14 +1092,20 @@ function targetStatus(kind: ProjectLoopFactKind, current: string, transition: st
     "open_question:cannot_answer:obstacle.reopen": "open",
     "blocker:open:obstacle.transfer_propose": "open",
     "open_question:open:obstacle.transfer_propose": "open",
+    "blocker:deferred:obstacle.transfer_propose": "deferred",
+    "open_question:deferred:obstacle.transfer_propose": "deferred",
     "blocker:cannot_answer:obstacle.transfer_propose": "cannot_answer",
     "open_question:cannot_answer:obstacle.transfer_propose": "cannot_answer",
     "blocker:open:obstacle.transfer_accept": "open",
     "open_question:open:obstacle.transfer_accept": "open",
+    "blocker:deferred:obstacle.transfer_accept": "open",
+    "open_question:deferred:obstacle.transfer_accept": "open",
     "blocker:cannot_answer:obstacle.transfer_accept": "open",
     "open_question:cannot_answer:obstacle.transfer_accept": "open",
     "blocker:open:obstacle.transfer_reject": "open",
     "open_question:open:obstacle.transfer_reject": "open",
+    "blocker:deferred:obstacle.transfer_reject": "deferred",
+    "open_question:deferred:obstacle.transfer_reject": "deferred",
     "blocker:cannot_answer:obstacle.transfer_reject": "cannot_answer",
     "open_question:cannot_answer:obstacle.transfer_reject": "cannot_answer",
   };
