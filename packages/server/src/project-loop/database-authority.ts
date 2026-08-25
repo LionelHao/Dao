@@ -796,7 +796,7 @@ function factSql(kind: ProjectLoopFactKind): string {
   return `SELECT id, room_id AS roomId, revision, status, title, description,
     source_room_id AS sourceRoomId, source_id AS sourceId, source_kind AS sourceKind,
     created_at AS createdAt, updated_at AS updatedAt, source_revision AS sourceRevision,
-    kind AS obstacleKind,
+    kind AS obstacleKind, created_by_actor_id AS createdByActorId,
     owner_kind AS ownerKind, owner_actor_id AS ownerActorId, impact, due_at AS dueAt,
     review_at AS reviewAt, resolution_criteria AS resolutionCriteria, question,
     status_reason AS statusReason, escalation_emitted AS escalationEmitted
@@ -1353,10 +1353,16 @@ function transitionFact(database: DatabaseSync,
     if (transition === "obstacle.transfer_propose") {
       const humanProposer = operation.context.kind === "human"
         ? operation.context.principal.actorId : null;
+      const requesterId = fact.details.createdByActorId;
+      if (typeof requesterId !== "string") {
+        throw new ProjectLoopAuthorityError("storage_unavailable",
+          "Obstacle requester authority is unavailable");
+      }
       const currentOwner = principal.actorId === ownerId;
+      const currentRequester = humanProposer === requesterId;
       const governanceFallback = humanProposer !== null &&
         hasRoomOwnerOrAdminAuthority(database, fact.roomId, humanProposer);
-      if (!currentOwner && !governanceFallback) {
+      if (!currentOwner && !currentRequester && !governanceFallback) {
         throw new ProjectLoopAuthorityError("permission_denied", "Obstacle transfer proposer is invalid");
       }
       const toKind = stringField(payload, "toOwnerKind");

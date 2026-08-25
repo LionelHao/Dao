@@ -802,6 +802,41 @@ describe("Project Loop database authority", () => {
          FROM project_transfer_proposals WHERE id = 'transfer-admin-transfer'`,
       ).get()).toEqual({ proposer: "human-admin", principal: "human-owner" });
 
+      database.exec(`
+        INSERT INTO actors (id, kind, display_name)
+        VALUES ('human-peer', 'human', 'Peer');
+        INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+        VALUES ('identity', 'human-peer', 0, 1);
+        INSERT INTO room_memberships (
+          room_id, actor_id, kind, role, participation, tool_permissions_json,
+          joined_at, configured_at, access_revision
+        ) VALUES (
+          'room-project', 'human-peer', 'human', 'member', NULL, '[]',
+          CURRENT_TIMESTAMP, NULL, 1
+        );
+      `);
+      executeProjectLoopAuthorityOperation(database, createFactProposal({
+        proposalId: "proposal-requester-transfer", factKind: "blocker",
+        factId: "requester-transfer-obstacle", baseRevision: currentRevision(),
+        actorId: "human-member", principalActorId: "human-member",
+        payload: { title: "Requester blocker", description: "Needs owner reassignment",
+          impact: "Delivery risk", resolutionCriteria: "New owner accepts", question: null,
+          ownerKind: "human", ownerActorId: "human-owner", dueAt: null, reviewAt: null },
+      }));
+      executeProjectLoopAuthorityOperation(database, {
+        ...resolveFactProposal("proposal-requester-transfer", 1),
+        context: humanContext("resolve-requester-transfer", "human-member"),
+      });
+      expect(() => obstacleTransfer("peer-cannot-transfer", "requester-transfer-obstacle",
+        humanContext("peer-cannot-transfer", "human-peer"), "human", "human-member"))
+        .toThrowError(expect.objectContaining({ code: "permission_denied" }));
+      obstacleTransfer("requester-can-transfer", "requester-transfer-obstacle",
+        humanContext("requester-can-transfer", "human-member"), "human", "human-peer");
+      expect(database.prepare(
+        `SELECT created_by_actor_id AS proposer, principal_human_actor_id AS principal
+         FROM project_transfer_proposals WHERE id = 'transfer-requester-can-transfer'`,
+      ).get()).toEqual({ proposer: "human-member", principal: "human-peer" });
+
       executeProjectLoopAuthorityOperation(database, createFactProposal({
         proposalId: "proposal-stale-agent-target", factKind: "blocker",
         factId: "stale-agent-target", baseRevision: currentRevision(),
