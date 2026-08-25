@@ -8274,6 +8274,18 @@ export function executeRuntimeAuthorityOperation(
         if (cancelledIntent.changes !== 1) {
           return fail("execution_conflict", "Cancellation lost the invocation intent CAS");
         }
+        // v22 runtime state is canonical and retains human_cancelled. The
+        // immutable v16 compatibility row only accepts message_recalled as a
+        // terminal reason, and its source-recall trigger requires non-pending.
+        const compatibilityIntent = database.prepare(
+          `UPDATE agent_invocation_intents
+           SET status = 'cancelled', cancelled_at = ?,
+               cancellation_reason = 'message_recalled'
+           WHERE id = ? AND status = 'pending'`,
+        ).run(occurredAt, target.intentId);
+        if (compatibilityIntent.changes !== 1) {
+          return fail("execution_conflict", "Cancellation lost the compatibility intent CAS");
+        }
         appendCanonicalInvocationIntentEvent(
           database, target.intentId, occurredAt, "cancelled",
         );

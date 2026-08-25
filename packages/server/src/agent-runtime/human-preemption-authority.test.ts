@@ -599,6 +599,92 @@ describe("real SQLite human-preemption authority", () => {
     },
   );
 
+  it("keeps canonical pending cancellation recallable after an internal authority cut", () => {
+    const database = fixture();
+    const sourceMessageId = "message-pending-profile-disabled";
+    const submitted = submitHumanMessageDatabaseCommand(database, {
+      context: { ...humanContext, requestId: "submit-pending-profile-disabled",
+        idempotencyKey: "submit-pending-profile-disabled" },
+      message: {
+        messageId: sourceMessageId, roomId: "room-1", body: "@Agent pending",
+        mentionedTargets: [{ id: "target-pending-profile-disabled", kind: "agent-invocation",
+          targetActorId: "agent-1", range: { startUtf16: 0, endUtf16: 6 } }],
+        attachments: [],
+      },
+      now: t0 + 51_000,
+    });
+    const intentId = submitted.targetOutcomes[0]?.invocationIntentId;
+    if (intentId === undefined) throw new Error("Pending invocation intent was missing");
+    const input = {
+      producerId: "profile-producer",
+      requestId: "profile-pending-request",
+      capability: "profile_authority" as const,
+      actorId: "agent-1",
+      roomId: "room-1",
+      scope: { kind: "agent_authority" as const, agentId: "agent-1",
+        authority: "profile" as const, authorityRevision: 2 },
+      reason: "profile_disabled" as const,
+      occurredAt: new Date(t0 + 51_001).toISOString(),
+    };
+    const committed = runAuthorityImmediateTransaction(database, () =>
+      commitInternalScopedProducerInTransaction(database, input));
+    const replayed = runAuthorityImmediateTransaction(database, () =>
+      commitInternalScopedProducerInTransaction(database, input));
+    expect(committed.effects).toEqual([expect.objectContaining({
+      invocationIntentId: intentId, disposition: "intent_cancelled",
+    })]);
+    expect(replayed).toEqual({ receipts: [], effects: [] });
+    expect(database.prepare(
+      `SELECT intent.status AS compatibilityStatus,
+              intent.cancellation_reason AS compatibilityReason,
+              runtime.public_status AS canonicalStatus,
+              runtime.cancellation_reason AS canonicalReason
+       FROM agent_invocation_intents AS intent
+       JOIN agent_invocation_intent_runtime_states AS runtime ON runtime.intent_id = intent.id
+       WHERE intent.id = ?`,
+    ).get(intentId)).toEqual({
+      compatibilityStatus: "cancelled",
+      compatibilityReason: "message_recalled",
+      canonicalStatus: "cancelled",
+      canonicalReason: "profile_disabled",
+    });
+    const projection = database.prepare(
+      `SELECT event.payload_json AS payloadJson, event.stream_seq AS streamSeq,
+              delivery.stream_seq AS deliveryStreamSeq, delivery.status
+       FROM events AS event
+       JOIN outbox_deliveries AS delivery ON delivery.event_id = event.event_id
+       WHERE event.event_type = 'agent.invocation.intent.changed'
+         AND json_extract(event.payload_json, '$.intentId') = ?
+         AND json_extract(event.payload_json, '$.status') = 'cancelled'`,
+    ).all(intentId);
+    expect(projection).toHaveLength(1);
+    expect(projection[0]).toMatchObject({
+      streamSeq: expect.any(Number), deliveryStreamSeq: projection[0]?.streamSeq,
+      status: "pending",
+    });
+    expect(JSON.parse(projection[0]?.payloadJson as string)).toMatchObject({
+      intentId, status: "cancelled", cancellationReason: "profile_disabled",
+    });
+
+    const recallInput = {
+      context: { ...humanContext, requestId: "recall-profile-disabled-source",
+        idempotencyKey: "recall-profile-disabled-source" },
+      command: { roomId: "room-1", messageId: sourceMessageId, expectedRevision: 1 },
+      now: t0 + 51_002,
+    } as const;
+    const recalled = recallHumanMessageDatabaseCommand(database, recallInput);
+    const recallReplay = recallHumanMessageDatabaseCommand(database, recallInput);
+    expect(recalled).toMatchObject({ replayed: false, abortTargets: [] });
+    expect(recallReplay).toEqual({ ...recalled, replayed: true });
+    expect(database.prepare(
+      `SELECT COUNT(*) AS count FROM events
+       WHERE event_type = 'agent.invocation.intent.changed'
+         AND json_extract(payload_json, '$.intentId') = ?
+         AND json_extract(payload_json, '$.status') = 'cancelled'`,
+    ).get(intentId)).toEqual({ count: 1 });
+    database.close();
+  });
+
   it("drains 257/513/1025 durable recovery candidates by stable 256-row keysets", () => {
     const database = fixture();
     const sourceMessageId = "message-recovery-source";

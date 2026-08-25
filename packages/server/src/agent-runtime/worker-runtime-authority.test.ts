@@ -387,9 +387,36 @@ describe("real AuthorityWorker runtime authority", () => {
         { intentId: pendingIntentId, expectedVersion: 1 },
         pendingCancelContext.requestId,
       )).resolves.toMatchObject({ replayed: true, receipt: pendingCancellation.receipt });
+      const recallContext = {
+        ...context,
+        requestId: "request-recall-cancelled-pending-source",
+        idempotencyKey: "key-recall-cancelled-pending-source",
+      };
+      const [firstRecall, replayedRecall] = await Promise.all([
+        client.recallHumanMessage(recallContext, {
+          roomId: "room-runtime",
+          messageId: "message-runtime-pending-cancel",
+          expectedRevision: 1,
+        }, now + 103),
+        client.recallHumanMessage(recallContext, {
+          roomId: "room-runtime",
+          messageId: "message-runtime-pending-cancel",
+          expectedRevision: 1,
+        }, now + 103),
+      ]);
+      expect([firstRecall.replayed, replayedRecall.replayed].sort()).toEqual([false, true]);
+      expect({ ...replayedRecall, replayed: firstRecall.replayed })
+        .toEqual(firstRecall);
+      expect(firstRecall).toMatchObject({
+        messageId: "message-runtime-pending-cancel",
+        revision: 1,
+        abortTargets: [],
+      });
       const cancellationDatabase = new DatabaseSync(databasePath, { readOnly: true });
       expect(cancellationDatabase.prepare(
-        `SELECT runtime.public_status AS status,
+        `SELECT intent.status AS compatibilityStatus,
+                intent.cancellation_reason AS compatibilityReason,
+                runtime.public_status AS status,
                 runtime.authority_version AS authorityVersion,
                 runtime.cancellation_reason AS cancellationReason,
                 runtime.cancelled_at AS cancelledAt
@@ -398,6 +425,8 @@ describe("real AuthorityWorker runtime authority", () => {
            ON runtime.intent_id = intent.id
          WHERE intent.id = ?`,
       ).get(pendingIntentId)).toMatchObject({
+        compatibilityStatus: "cancelled",
+        compatibilityReason: "message_recalled",
         status: "cancelled",
         authorityVersion: 2,
         cancelledAt: expect.any(String),
@@ -455,7 +484,7 @@ describe("real AuthorityWorker runtime authority", () => {
         firstContext.roomMemory.rawDelta.nextCursor!,
       );
       expect(continuedDelta.entries.map(({ corpusSeq }) => corpusSeq))
-        .toEqual([65, 66, 67, 68, 69, 70, 71]);
+        .toEqual([65, 66, 67, 68, 69, 70, 71, 72]);
       expect(continuedDelta.hasMore).toBe(false);
       const runningFirst = await authority.claim(first.execution.id, 1);
       const completed = await authority.complete(runningFirst.id, 1, "durable answer");

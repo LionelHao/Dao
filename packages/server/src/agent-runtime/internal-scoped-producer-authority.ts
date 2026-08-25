@@ -3,6 +3,7 @@ import type { DatabaseSync } from "node:sqlite";
 import {
   isAgentExecution,
   isAgentExecutionAttempt,
+  isAgentInvocationIntent,
   isScopedCancellationReceipt,
   type InvocationCancellationReason,
   type ScopedCancellationReceipt,
@@ -137,6 +138,79 @@ function appendCanonicalEvent(
      ) VALUES (?, ?, 'room', ?, ?, 'pending', 0, ?, NULL, NULL)`,
   ).run(stableId("outbox", "internal-scoped-producer", receipt.requestId, eventId,
     "room", receipt.roomId), eventId, receipt.roomId, streamSeq, occurredAt);
+}
+
+function appendCanonicalIntentProjection(
+  database: DatabaseSync,
+  intentId: string,
+  occurredAt: string,
+  transition: string,
+): void {
+  const row = database.prepare(
+    `SELECT intent.id AS intentId, intent.lineage_id AS lineageId,
+            intent.turn_id AS turnId, intent.room_id AS roomId,
+            intent.source_message_id AS sourceMessageId,
+            intent.source_revision AS sourceRevision, intent.target_id AS targetId,
+            intent.target_agent_id AS agentId,
+            intent.message_transaction_id AS messageTransactionId,
+            runtime.public_status AS status, intent.created_at AS createdAt,
+            runtime.claimed_at AS claimedAt, runtime.cancelled_at AS cancelledAt,
+            runtime.cancellation_reason AS cancellationReason,
+            intent.supersedes_intent_id AS supersedesIntentId,
+            binding.profile_revision AS profileRevision,
+            binding.assignment_revision AS assignmentRevision,
+            binding.access_revision AS accessRevision
+     FROM agent_invocation_intents AS intent
+     JOIN agent_invocation_intent_runtime_states AS runtime
+       ON runtime.intent_id = intent.id
+     JOIN direct_agent_invocation_authority_bindings AS binding
+       ON binding.intent_id = intent.id
+     WHERE intent.id = ? AND intent.origin_kind = 'message_target'`,
+  ).get(intentId);
+  const projection = {
+    intentId: row?.intentId, lineageId: row?.lineageId, turnId: row?.turnId,
+    roomId: row?.roomId, sourceMessageId: row?.sourceMessageId,
+    sourceRevision: row?.sourceRevision, targetId: row?.targetId, agentId: row?.agentId,
+    origin: { kind: "message_target" as const,
+      messageTransactionId: row?.messageTransactionId, targetId: row?.targetId },
+    profileRevision: row?.profileRevision, assignmentRevision: row?.assignmentRevision,
+    accessRevision: row?.accessRevision, status: row?.status, createdAt: row?.createdAt,
+    ...(typeof row?.claimedAt === "string" ? { claimedAt: row.claimedAt } : {}),
+    ...(typeof row?.cancelledAt === "string" ? {
+      cancelledAt: row.cancelledAt,
+      ...(typeof row.cancellationReason === "string"
+        ? { cancellationReason: row.cancellationReason } : {}),
+    } : {}),
+    ...(typeof row?.supersedesIntentId === "string"
+      ? { supersedesIntentId: row.supersedesIntentId } : {}),
+  };
+  if (!isAgentInvocationIntent(projection)) {
+    throw new Error("Internal scoped producer intent projection was not canonical");
+  }
+  const eventId = stableId("runtime-canonical-intent", intentId, transition);
+  const stream = database.prepare(
+    `SELECT head_seq AS headSeq FROM streams
+     WHERE stream_kind = 'room' AND stream_id = ?`,
+  ).get(projection.roomId);
+  if (typeof stream?.headSeq !== "number") {
+    throw new Error("Runtime producer room stream is missing");
+  }
+  const streamSeq = stream.headSeq + 1;
+  database.prepare(
+    `UPDATE streams SET head_seq = ? WHERE stream_kind = 'room' AND stream_id = ?`,
+  ).run(streamSeq, projection.roomId);
+  database.prepare(
+    `INSERT INTO events (event_id, stream_kind, stream_id, stream_seq, room_id,
+       actor_id, event_type, occurred_at, payload_json)
+     VALUES (?, 'room', ?, ?, ?, ?, 'agent.invocation.intent.changed', ?, ?)`,
+  ).run(eventId, projection.roomId, streamSeq, projection.roomId,
+    projection.agentId, occurredAt, canonicalJson(projection));
+  database.prepare(
+    `INSERT INTO outbox_deliveries (id, event_id, target_kind, target_id, stream_seq,
+       status, attempts, available_at, delivered_at, last_error)
+     VALUES (?, ?, 'room', ?, ?, 'pending', 0, ?, NULL, NULL)`,
+  ).run(stableId("outbox", "runtime-canonical-intent", transition, eventId),
+    eventId, projection.roomId, streamSeq, occurredAt);
 }
 
 function appendCanonicalTerminalProjection(
@@ -421,14 +495,16 @@ export function commitInternalScopedProducerInTransaction(
          WHERE intent_id = ? AND public_status = 'pending' AND authority_version = ?`,
       ).run(input.occurredAt, input.reason, input.occurredAt, row.intentId, row.authorityVersion);
       if (cancelled.changes !== 1) throw new Error("Internal intent cancellation lost its CAS");
-      // v16 deliberately constrains the legacy intent row to source-message
-      // recall. v22 runtime state is canonical for every newer producer scope;
-      // only mirror the one backwards-compatible reason into the base row.
-      if (input.reason === "message_recalled") {
-        database.prepare(
-          `UPDATE agent_invocation_intents SET status = 'cancelled', cancelled_at = ?,
-             cancellation_reason = 'message_recalled' WHERE id = ? AND status = 'pending'`,
-        ).run(input.occurredAt, row.intentId);
+      // v22 owns the real cancellation reason. The immutable v16 row can only
+      // encode message_recalled, but its historical recall trigger requires a
+      // canonically cancelled pending intent to leave the legacy pending state.
+      // This compatibility sentinel is write-only for v22 runtime readers.
+      const compatibilityIntent = database.prepare(
+        `UPDATE agent_invocation_intents SET status = 'cancelled', cancelled_at = ?,
+           cancellation_reason = 'message_recalled' WHERE id = ? AND status = 'pending'`,
+      ).run(input.occurredAt, row.intentId);
+      if (compatibilityIntent.changes !== 1) {
+        throw new Error("Internal intent cancellation lost its compatibility CAS");
       }
       const effect: ScopedCancellationCommitEffect = {
         sourceMessageId: row.sourceMessageId,
@@ -448,6 +524,8 @@ export function commitInternalScopedProducerInTransaction(
       };
       receipts.push(storeReceipt(database, input, row, canonicalReceipt, effect));
       effects.push(effect);
+      appendCanonicalIntentProjection(database, row.intentId, input.occurredAt,
+        `internal-scoped:${fenceId}`);
       continue;
     }
     if (attemptSeq === undefined) throw new Error("Internal execution attempt was corrupt");
