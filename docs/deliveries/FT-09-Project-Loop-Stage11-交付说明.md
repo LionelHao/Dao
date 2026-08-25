@@ -9,7 +9,7 @@
 - 实现合入后的远端 `main`：`11a73baea42707a7efb12bb9eda01fdd695ea5ef`（Authority schema v25）。
 - 实现 PR：[PR #73 — FT-09: deliver authoritative Project Loop](https://github.com/LionelHao/Dao/pull/73)，squash merge SHA `11a73baea42707a7efb12bb9eda01fdd695ea5ef`。
 - 实现 CI：[quality 32891609467](https://github.com/LionelHao/Dao/actions/runs/32891609467)：[Node 22.13.1](https://github.com/LionelHao/Dao/actions/runs/32891609467/job/97944591202) 与 [Node 22.x](https://github.com/LionelHao/Dao/actions/runs/32891609467/job/97944590913) 均 success。
-- 证据 PR：pending（创建后回填真实 PR、CI 与 merge SHA）。
+- 证据 PR：[PR #74 — docs(ft09): record Stage 11 delivery evidence](https://github.com/LionelHao/Dao/pull/74)；PR 页面保留最终双 Node required checks，最终 squash merge SHA 由 GitHub 在本 PR 合入时记录。
 
 实现 PR 共变更 124 个文件，新增 21,981 行、删除 241 行；没有 Blueprint HTML/JSON、Grand Blueprint 数据或 renderer 变更。仓库禁止 merge commit，因此实现 PR 按 branch protection 允许的 squash 方式合入；没有 force push 或绕过 required checks。
 
