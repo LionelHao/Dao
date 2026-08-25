@@ -921,20 +921,16 @@ describe("real AuthorityWorker runtime authority", () => {
          WHERE event_type = 'room.open_item.agent_attempt_failed'`,
       ).get()).toEqual({ count: 1 });
       failedItem.close();
-      const manualRetry = await authority.retry(
+      await expect(authority.retry(
         { ...context, requestId: "request-manual-retry", idempotencyKey: "key-manual-retry" },
         deadLettered.id,
-      );
-      expect(manualRetry.execution).toMatchObject({
-        status: "queued",
-        manualRetryOfExecutionId: deadLettered.id,
-        currentAttemptSeq: 1,
-      });
-      expect(manualRetry.intent).toEqual({
-        kind: "direct_mention", roomId: "room-runtime",
-        sourceMessageId: "message-runtime-5", targetAgentId: "agent-runtime",
-      });
-      expect(manualRetry.execution.id).not.toBe(deadLettered.id);
+      )).rejects.toMatchObject({ code: "context_source_gone" });
+      const retryEvidence = new DatabaseSync(databasePath, { readOnly: true });
+      expect(retryEvidence.prepare(
+        `SELECT COUNT(*) AS count FROM agent_executions
+         WHERE manual_retry_of_execution_id = ?`,
+      ).get(deadLettered.id)).toEqual({ count: 0 });
+      retryEvidence.close();
 
       const fourth = await authority.invoke(
         { ...context, requestId: "request-runtime-4", idempotencyKey: "key-runtime-4" },

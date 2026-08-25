@@ -3688,9 +3688,11 @@ export async function startMessageWebSocketServer(
       queue.overflowResets.set(attemptKey, {
         preview: resetPreview,
         bytes: resetBytes,
-        publishedAtSubscriptionEpoch:
-          queue.overflowResets.get(attemptKey)?.publishedAtSubscriptionEpoch ??
-          publishedAtSubscriptionEpoch,
+        // The coalesced marker represents the newest lifecycle fact. A
+        // replacement subscription that already existed when that newer fact
+        // was published must receive it, while subscriptions created after the
+        // newest publication remain fenced by this cutoff.
+        publishedAtSubscriptionEpoch,
       });
       queue.overflowResetBytes = nextOverflowResetBytes;
       return Promise.resolve();

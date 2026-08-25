@@ -1220,6 +1220,62 @@ describe("authenticated message WebSocket service", () => {
     }
   });
 
+  it("delivers a newer coalesced terminal reset to its publish-time replacement subscription", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "preview-coalesced-replacement");
+    const blocked = deferred<void>();
+    const blockedStarted = deferred<void>();
+    let blockNext = false;
+    const auth: AuthenticationService = {
+      async login() { return session; }, async authenticate() { return principal; },
+      async authenticateSession() {
+        return { sessionId: session.accessToken, sessionFamilyId: "family-preview", principal };
+      },
+      async refresh() { return session; }, async revoke() {},
+    };
+    const server = await startMessageWebSocketServer({
+      auth, service: idleMessageService(), outboxStore: idleOutboxStore(),
+      previewAuthority: previewDeliveryAuthority(async () => {
+        if (blockNext) {
+          blockNext = false;
+          blockedStarted.resolve();
+          await blocked.promise;
+        }
+        return { authorized: true, authorityEpoch: "coalesced-replacement:1" };
+      }),
+    });
+    const client = await LoopbackClient.connect(server.url);
+    try {
+      await client.login(humans[0]);
+      await client.subscribe(roomId, "subscribe-coalesced-replacement-old");
+      await server.publishAgentPreview({ roomId, executionId: "coalesced-visible",
+        attemptSeq: 1, streamSeq: 1, delta: "VISIBLE-BEFORE-COALESCE" });
+      await client.waitForFrame((frame) => hasType(frame, "agent.execution.preview") &&
+        frame.executionId === "coalesced-visible", "visible before coalesce");
+
+      blockNext = true;
+      const deliveries = [server.publishAgentPreview({ roomId, executionId: "coalesced-head",
+        attemptSeq: 1, streamSeq: 1, delta: "x" })];
+      await blockedStarted.promise;
+      for (let index = 1; index < 32; index += 1) {
+        deliveries.push(server.publishAgentPreview({ roomId, executionId: `coalesced-${index}`,
+          attemptSeq: 1, streamSeq: 1, delta: "x" }));
+      }
+      await server.publishAgentPreview({ roomId, executionId: "coalesced-visible",
+        attemptSeq: 1, streamSeq: 2, delta: "DROPPED-REPAIR-MARKER" });
+      await client.subscribe(roomId, "subscribe-coalesced-replacement-new");
+      await server.resetAgentPreview({ roomId, executionId: "coalesced-visible",
+        attemptSeq: 1, reason: "execution_terminal" });
+      blocked.resolve();
+      await Promise.all(deliveries);
+      await expect(client.waitForFrame((frame) => hasType(frame, "agent.execution.preview.reset") &&
+        frame.executionId === "coalesced-visible", "coalesced terminal reset"))
+        .resolves.toMatchObject({ frame: { reason: "execution_terminal" } });
+    } finally {
+      blocked.resolve(); await client.close(); await server.close();
+    }
+  });
+
   it("fences an authorized preview result to the captured subscription generation", async () => {
     const principal = { accountId: "account-human-1", actorId: humans[0].id };
     const session = issuedSession(principal, "preview-generation");
