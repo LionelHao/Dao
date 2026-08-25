@@ -58,25 +58,33 @@ describe("production Invocation surface", () => {
     expect(root.textContent).toContain("冻结输入保持不变");
   });
 
-  it("focuses actionable 429 recovery and does not forge unsupported 401/403/410 actions", async () => {
+  it("focuses 429 recovery and hands 401/403/410 to closed host callbacks", async () => {
     let listener: ((value: InvocationStateEnvelope) => void) | undefined;
     const cancel = vi.fn().mockResolvedValue({ requestId: "retry-later-2", state: state() });
     const bridge: InvocationBridge = { getSurface: vi.fn().mockResolvedValue(state()),
       cancel, retry: vi.fn(), onStateChanged: (next) => { listener = next; return vi.fn(); } };
+    const onHostAction = vi.fn();
     const root = document.createElement("div");
     document.body.append(root);
-    mountInvocationSurface(root, bridge, "room-1");
+    mountInvocationSurface(root, bridge, "room-1", { onHostAction });
     await vi.waitFor(() => expect(root.textContent).toContain("运行中"));
+    vi.useFakeTimers();
     listener?.({ roomId: "room-1", state: state({ operations: [{ status: "failed",
       requestId: "rate-1", kind: "cancel", executionId: "execution-1", expectedVersion: 2,
       error: { status: 429, code: "rate_limited", recovery: "retry-later",
         retryAfterSeconds: 7 } }] }) });
     const rateRecovery = root.querySelector<HTMLButtonElement>("[data-invocation-recovery='retry-later']");
     expect(rateRecovery?.textContent).toBe("7 秒后重试");
+    expect(rateRecovery?.disabled).toBe(true);
+    vi.advanceTimersByTime(7_000);
+    expect(rateRecovery?.disabled).toBe(false);
+    expect(rateRecovery?.textContent).toBe("重试控制意图");
     expect(document.activeElement).toBe(rateRecovery);
     rateRecovery?.click();
-    await vi.waitFor(() => expect(cancel).toHaveBeenCalledWith({ roomId: "room-1",
-      executionId: "execution-1", expectedVersion: 2 }));
+    await vi.runAllTimersAsync();
+    expect(cancel).toHaveBeenCalledWith({ roomId: "room-1",
+      executionId: "execution-1", expectedVersion: 2 });
+    vi.useRealTimers();
 
     for (const error of [
       { status: 401, code: "authentication_required", recovery: "reauthenticate" },
@@ -86,8 +94,15 @@ describe("production Invocation surface", () => {
       listener?.({ roomId: "room-1", state: state({ operations: [{ status: "failed",
         requestId: `error-${error.status}`, kind: "cancel", executionId: "execution-1",
         expectedVersion: 2, error }] }) });
-      expect(root.querySelector(`[data-recovery-unavailable='${error.recovery}']`)).not.toBeNull();
-      expect(root.querySelector(`[data-invocation-recovery='${error.recovery}']`)).toBeNull();
+      const recovery = root.querySelector<HTMLButtonElement>(
+        `[data-invocation-recovery='${error.recovery}']`,
+      );
+      expect(recovery).not.toBeNull();
+      expect(document.activeElement).toBe(recovery);
+      recovery?.click();
+      expect(onHostAction).toHaveBeenLastCalledWith(error.recovery, {
+        roomId: "room-1", executionId: "execution-1",
+      });
     }
     root.remove();
   });
@@ -100,15 +115,20 @@ describe("production Invocation surface", () => {
     const bridge: InvocationBridge = { getSurface: vi.fn().mockResolvedValue(review), cancel: vi.fn(),
       retry: vi.fn(), onStateChanged: () => vi.fn() };
     const root = document.createElement("div");
+    const hostAction = vi.fn();
+    root.addEventListener("dao:invocation-host-action", hostAction);
     document.body.append(root);
     mountInvocationSurface(root, bridge, "room-1");
     await vi.waitFor(() => expect(root.textContent).toContain("离线只读"));
     expect(root.textContent).toContain("! 失败");
     expect(root.textContent).toContain("需要人工审阅");
     expect(root.textContent).toContain("审阅闭合命令尚未接入");
-    expect(root.querySelector("[data-review-action-unavailable='true']")).not.toBeNull();
-    expect(root.querySelector<HTMLButtonElement>("button")?.disabled).toBe(true);
-    expect(root.querySelector("[role='alert']")).toBe(document.activeElement);
+    const reviewAction = root.querySelector<HTMLButtonElement>("[data-invocation-review-action]");
+    expect(reviewAction?.textContent).toBe("打开人工审阅入口");
+    expect(reviewAction).toBe(document.activeElement);
+    reviewAction?.click();
+    expect(hostAction).toHaveBeenCalledOnce();
+    expect(root.querySelector<HTMLButtonElement>("[data-invocation-action='retry']")?.disabled).toBe(true);
     root.remove();
   });
 });

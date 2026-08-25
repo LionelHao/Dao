@@ -27,6 +27,19 @@ const ERROR_LABEL: Record<InvocationClosedError["status"], string> = {
   429: "请求过于频繁，请稍后重试。", 503: "服务暂不可用，请修复 Room 同步。",
 };
 
+export type InvocationHostAction =
+  | "reauthenticate"
+  | "request-access"
+  | "upgrade-client"
+  | "review-required";
+
+export interface InvocationSurfaceActions {
+  readonly onHostAction: (action: InvocationHostAction, context: Readonly<{
+    roomId: string;
+    executionId: string;
+  }>) => void;
+}
+
 function operationFor(state: InvocationSurfaceState, executionId: string): InvocationOperationState | undefined {
   return state.operations.find((operation) => operation.status !== "idle" && operation.executionId === executionId);
 }
@@ -43,6 +56,8 @@ function renderExecution(
   projection: InvocationExecutionProjection,
   submit: (kind: "cancel" | "retry", executionId: string, expectedVersion: number) => void,
   repair: () => void,
+  hostAction: (action: InvocationHostAction, executionId: string) => void,
+  scheduleRetry: (button: HTMLButtonElement, retryAfterSeconds: number) => void,
 ): HTMLElement {
   const { execution } = projection;
   const card = document.createElement("article");
@@ -63,9 +78,14 @@ function renderExecution(
     review.dataset.invocationReview = execution.executionId;
     review.tabIndex = -1;
     review.setAttribute("role", "alert");
-    const unavailable = appendText(card, "p",
+    appendText(card, "p",
       "审阅闭合命令尚未接入当前 Desktop bridge；请勿重试原 toolCall。等待 FT-10 review authority 接线。");
-    unavailable.dataset.reviewActionUnavailable = "true";
+    const reviewAction = document.createElement("button");
+    reviewAction.type = "button";
+    reviewAction.dataset.invocationReviewAction = execution.executionId;
+    reviewAction.textContent = "打开人工审阅入口";
+    reviewAction.addEventListener("click", () => hostAction("review-required", execution.executionId));
+    card.append(reviewAction);
   } else if (execution.reviewState === "reviewed") {
     appendText(card, "p", "✓ 人工审阅已完成");
   }
@@ -104,17 +124,29 @@ function renderExecution(
         ? operation.error.retryAfterSeconds === undefined ? "稍后重试"
           : `${operation.error.retryAfterSeconds} 秒后重试`
         : operation.error.recovery === "repair-room" ? "修复 Room 同步" : "刷新权威状态";
+      if (operation.error.recovery === "retry-later" &&
+          operation.error.retryAfterSeconds !== undefined) {
+        recover.disabled = true;
+        scheduleRetry(recover, operation.error.retryAfterSeconds);
+      }
       recover.addEventListener("click", operation.error.recovery === "retry-later"
         ? () => submit(operation.kind, operation.executionId, operation.expectedVersion)
         : repair);
       card.append(recover);
     } else {
-      const unavailable = appendText(card, "p", operation.error.recovery === "reauthenticate"
-        ? "请通过全局身份入口重新认证；execution bridge 不持有登录权限。"
+      const recover = document.createElement("button");
+      recover.type = "button";
+      recover.dataset.invocationRecovery = operation.error.recovery;
+      recover.textContent = operation.error.recovery === "reauthenticate"
+        ? "前往重新认证"
         : operation.error.recovery === "request-access"
-          ? "请通过 Room 访问管理申请权限；execution bridge 没有申请访问命令。"
-          : "请通过应用更新入口升级客户端；execution bridge 没有升级命令。");
-      unavailable.dataset.recoveryUnavailable = operation.error.recovery;
+          ? "前往 Room 访问管理"
+          : "打开客户端更新入口";
+      recover.addEventListener("click", () => hostAction(
+        operation.error.recovery as "reauthenticate" | "request-access" | "upgrade-client",
+        operation.executionId,
+      ));
+      card.append(recover);
     }
   }
   const controls = document.createElement("div");
@@ -147,8 +179,10 @@ export function mountInvocationSurface(
   root: HTMLElement,
   bridge: InvocationBridge,
   roomId: string,
+  actions?: InvocationSurfaceActions,
 ): () => void {
   let disposed = false;
+  const retryTimers = new Set<ReturnType<typeof setTimeout>>();
   const reviewRequired = new Set<string>();
   const reportedFailures = new Set<string>();
   const load = async (): Promise<void> => {
@@ -169,8 +203,30 @@ export function mountInvocationSurface(
     try { render((await bridge[kind]({ roomId, executionId, expectedVersion })).state); }
     catch { renderFailure("503 · 控制意图未能提交。权威执行状态未改变。"); }
   };
+  const hostAction = (action: InvocationHostAction, executionId: string): void => {
+    if (actions !== undefined) {
+      actions.onHostAction(action, { roomId, executionId });
+      return;
+    }
+    root.dispatchEvent(new CustomEvent("dao:invocation-host-action", {
+      bubbles: true,
+      detail: { action, roomId, executionId },
+    }));
+  };
+  const scheduleRetry = (button: HTMLButtonElement, retryAfterSeconds: number): void => {
+    const timer = setTimeout(() => {
+      retryTimers.delete(timer);
+      if (disposed || !button.isConnected) return;
+      button.disabled = false;
+      button.textContent = "重试控制意图";
+      button.focus();
+    }, retryAfterSeconds * 1_000);
+    retryTimers.add(timer);
+  };
   const render = (state: InvocationSurfaceState): void => {
     if (disposed || state.roomId !== roomId) return;
+    for (const timer of retryTimers) clearTimeout(timer);
+    retryTimers.clear();
     const active = root.contains(document.activeElement) && document.activeElement instanceof HTMLElement
       ? document.activeElement : undefined;
     const activeCard = active?.closest<HTMLElement>("[data-execution-id]");
@@ -194,7 +250,11 @@ export function mountInvocationSurface(
       banner.setAttribute("role", "status");
     }
     const list = document.createElement("div"); list.className = "invocation-panel__list";
-    for (const execution of state.executions) list.append(renderExecution(state, execution, submit, () => void load()));
+    for (const execution of state.executions) {
+      list.append(renderExecution(
+        state, execution, submit, () => void load(), hostAction, scheduleRetry,
+      ));
+    }
     if (state.executions.length === 0) appendText(list, "p", "当前没有 Agent 执行。 ");
     panel.append(list);
     if (state.projectBoundaries.length > 0) {
@@ -220,8 +280,9 @@ export function mountInvocationSurface(
     }
     if (newlyRequired !== undefined) {
       announcement.textContent = `Agent ${newlyRequired.execution.agentId} 的执行结果需要人工审阅。`;
-      [...panel.querySelectorAll<HTMLElement>("[data-invocation-review]")]
-        .find((element) => element.dataset.invocationReview === newlyRequired.execution.executionId)?.focus();
+      [...panel.querySelectorAll<HTMLButtonElement>("[data-invocation-review-action]")]
+        .find((element) =>
+          element.dataset.invocationReviewAction === newlyRequired.execution.executionId)?.focus();
       return;
     }
     if (newFailure?.status === "failed") {
@@ -252,5 +313,11 @@ export function mountInvocationSurface(
   };
   const unsubscribe = bridge.onStateChanged((envelope) => render(envelope.state));
   void load();
-  return () => { disposed = true; unsubscribe(); root.replaceChildren(); };
+  return () => {
+    disposed = true;
+    for (const timer of retryTimers) clearTimeout(timer);
+    retryTimers.clear();
+    unsubscribe();
+    root.replaceChildren();
+  };
 }
