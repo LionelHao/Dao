@@ -210,6 +210,8 @@ export interface RuntimeRecoveryAuthority {
     readonly cursor: string;
     readonly candidateId: string;
   }>): Promise<void>;
+  /** Returns every still-owned, unstarted candidate to durable pending state. */
+  release?(): Promise<number>;
 }
 
 export interface FenceReplacementAccepted {

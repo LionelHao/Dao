@@ -619,6 +619,19 @@ export function createWorkerRuntimeRecoveryAuthority(
         throw new AgentRuntimeError("provider_failure", "Authority recovery settlement was malformed");
       }
     },
+    async release() {
+      const result = await execute({
+        type: "runtime.recovery-release",
+        leaseOwner,
+        now: Date.now(),
+      });
+      if (!record(result) || result.kind !== "recovery-released" ||
+          typeof result.released !== "number" || !Number.isSafeInteger(result.released) ||
+          result.released < 0) {
+        throw new AgentRuntimeError("provider_failure", "Authority recovery release was malformed");
+      }
+      return result.released;
+    },
   };
   return Object.freeze(recoveryAuthority);
 }

@@ -62,6 +62,9 @@ describe("real AuthorityWorker runtime authority", () => {
     const executeRuntime = vi.fn(async (operation: { type: string }) => {
       if (operation.type === "runtime.recovery-isolate") return { kind: "recovery-isolated" };
       if (operation.type === "runtime.recovery-settle") return { kind: "recovery-settled" };
+      if (operation.type === "runtime.recovery-release") {
+        return { kind: "recovery-released", released: 224 };
+      }
       return { kind: "recovery-page", candidates: [], hasMore: false };
     });
     const recovery = createWorkerRuntimeRecoveryAuthority({
@@ -79,6 +82,7 @@ describe("real AuthorityWorker runtime authority", () => {
       cursor: "00000000000000000002",
       candidateId: "execution-success",
     });
+    await expect(recovery.release?.()).resolves.toBe(224);
 
     expect(executeRuntime.mock.calls[0]?.[0]).toMatchObject({
       type: "runtime.recovery-scan", includeRunning: true, limit: 256,
@@ -100,9 +104,13 @@ describe("real AuthorityWorker runtime authority", () => {
       candidateId: "execution-success",
       leaseOwner: expect.any(String),
     });
+    expect(executeRuntime.mock.calls[4]?.[0]).toMatchObject({
+      type: "runtime.recovery-release",
+      leaseOwner: expect.any(String),
+    });
     const leaseOwners = executeRuntime.mock.calls.map(([operation]) =>
       "leaseOwner" in operation ? operation.leaseOwner : undefined).filter(Boolean);
-    expect(leaseOwners).toHaveLength(4);
+    expect(leaseOwners).toHaveLength(5);
     expect(new Set(leaseOwners).size).toBe(1);
   });
 

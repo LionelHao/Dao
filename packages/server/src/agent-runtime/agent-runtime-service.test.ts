@@ -575,19 +575,34 @@ describe("bounded Agent runtime scheduler", () => {
     });
   });
 
-  it("keeps a timed-out Provider live until a failed authority transition is retried and committed", async () => {
+  it("gates a late Provider final while a failed timeout transition is retried and committed", async () => {
     const runtimeAuthority = authority();
     const originalScheduleRetry = runtimeAuthority.scheduleRetry.bind(runtimeAuthority);
+    const complete = vi.spyOn(runtimeAuthority, "complete");
     let persistenceCalls = 0;
+    let firstPersistenceFailed!: () => void;
+    const firstPersistenceFailure = new Promise<void>((resolve) => {
+      firstPersistenceFailed = resolve;
+    });
     runtimeAuthority.scheduleRetry = vi.fn(async (...args) => {
       persistenceCalls += 1;
+      ordering.push(`persist:${persistenceCalls}`);
       if (persistenceCalls === 1) {
+        firstPersistenceFailed();
         throw new AgentRuntimeError("context_storage_unavailable", "authority unavailable");
       }
       return originalScheduleRetry(...args);
     });
     const ordering: string[] = [];
     const waits: number[] = [];
+    let releasePersistenceRetry!: () => void;
+    const persistenceRetry = new Promise<void>((resolve) => {
+      releasePersistenceRetry = resolve;
+    });
+    let lateFinalOffered!: () => void;
+    const lateFinal = new Promise<void>((resolve) => {
+      lateFinalOffered = resolve;
+    });
     let dispatches = 0;
     const runtime = createAgentRuntimeService({
       authority: runtimeAuthority,
@@ -595,7 +610,12 @@ describe("bounded Agent runtime scheduler", () => {
         dispatches += 1;
         if (dispatches === 1) {
           signal.addEventListener("abort", () => { ordering.push("abort"); }, { once: true });
-          await new Promise<void>(() => undefined);
+          yield { type: "response_started", sequence: 1 };
+          await firstPersistenceFailure;
+          ordering.push("late-final");
+          lateFinalOffered();
+          yield { type: "agent_final", sequence: 2, body: "must-not-commit", citations: [] };
+          return;
         }
         yield { type: "response_started", sequence: 1 };
         yield { type: "agent_final", sequence: 2, body: "recovered", citations: [] };
@@ -609,17 +629,34 @@ describe("bounded Agent runtime scheduler", () => {
       },
       clock: {
         now: () => Date.parse("2026-08-17T00:00:00.000Z"),
-        wait: vi.fn(async (milliseconds) => { waits.push(milliseconds); }),
+        wait: vi.fn(async (milliseconds) => {
+          waits.push(milliseconds);
+          if (waits.length === 1) await persistenceRetry;
+        }),
       },
     });
 
     const accepted = await runtime.invoke(context, intent("room-timeout-storage", "timeout-storage"));
+    await lateFinal;
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    expect(ordering).toEqual(["persist:1", "late-final"]);
+    expect(runtimeAuthority.executions.get(accepted.execution.id)).toMatchObject({ status: "running" });
+    expect(complete).not.toHaveBeenCalled();
+    expect(runtimeAuthority.prepareTool).not.toHaveBeenCalled();
+    expect(runtimeAuthority.checkpoint).not.toHaveBeenCalled();
+
+    releasePersistenceRetry();
     await runtime.whenIdle();
 
-    expect(ordering).toEqual(["abort"]);
+    expect(ordering).toEqual(["persist:1", "late-final", "persist:2", "abort"]);
     expect(waits).toEqual([1_000, 1_000]);
     expect(runtimeAuthority.scheduleRetry).toHaveBeenCalledTimes(2);
-    expect(runtimeAuthority.executions.get(accepted.execution.id)).toMatchObject({ status: "completed" });
+    expect(complete).toHaveBeenCalledTimes(1);
+    expect(complete).toHaveBeenCalledWith(accepted.execution.id, 2, "recovered", []);
+    expect(runtimeAuthority.executions.get(accepted.execution.id)).toMatchObject({
+      status: "completed", currentAttemptSeq: 2,
+    });
   });
 
   it("rejects duplicate citation labels and mixed preview/final output before authority commit", async () => {
@@ -773,6 +810,62 @@ describe("bounded Agent runtime scheduler", () => {
         .toHaveLength(candidateCount);
     },
   );
+
+  it("stops a 257-candidate recovery page at close and releases the 224 unadmitted leases", async () => {
+    const runtimeAuthority = authority();
+    const originalShutdown = runtimeAuthority.shutdown.bind(runtimeAuthority);
+    runtimeAuthority.shutdown = vi.fn(originalShutdown);
+    const records = Array.from({ length: 257 }, (_, index) => {
+      const recoveredIntent = intent("room-recovery-close", `source-${index}`, `agent-${index}`);
+      const recoveredExecution = {
+        ...execution(`recovered-close-${index}`, recoveredIntent.roomId),
+        sourceMessageId: recoveredIntent.sourceMessageId,
+        agentId: recoveredIntent.targetAgentId,
+      };
+      runtimeAuthority.executions.set(recoveredExecution.id, recoveredExecution);
+      return { execution: recoveredExecution, intent: recoveredIntent, outcome: "enqueue" as const };
+    });
+    const release = vi.fn(async () => 224);
+    const recoveryAuthority: RuntimeRecoveryAuthority = {
+      scan: vi.fn(async ({ after }) => after === undefined ? ({
+        candidates: records.slice(0, 256).map((record, index) => ({
+          cursor: String(index).padStart(6, "0"), record,
+        })),
+        hasMore: true,
+      }) : ({ candidates: [], hasMore: false })),
+      isolate: vi.fn(async () => undefined),
+      release,
+    };
+    let eightStarted!: () => void;
+    const activeAtCapacity = new Promise<void>((resolve) => { eightStarted = resolve; });
+    let starts = 0;
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      recoveryAuthority,
+      provider: provider(async function* () {
+        starts += 1;
+        if (starts === 8) eightStarted();
+        await new Promise<void>(() => undefined);
+        yield { type: "response_started", sequence: 1 };
+      }),
+      modelId: "fake-model",
+      buildProviderInput: providerInput,
+    });
+
+    const recovery = runtime.recover();
+    await activeAtCapacity;
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    await runtime.close();
+    await recovery;
+
+    expect(runtimeAuthority.shutdown).toHaveBeenCalledTimes(32);
+    expect(release).toHaveBeenCalledTimes(1);
+    expect([...runtimeAuthority.executions.values()].filter((value) =>
+      value.status === "cancelled" && value.cancellationReason === "runtime_shutdown"))
+      .toHaveLength(32);
+    expect([...runtimeAuthority.executions.values()].filter((value) => value.status === "queued"))
+      .toHaveLength(225);
+  });
 
   it("isolates a poison recovery candidate without blocking larger stable keys", async () => {
     const runtimeAuthority = authority();
@@ -1512,6 +1605,65 @@ describe("bounded Agent runtime scheduler", () => {
     expect(runtimeAuthority.executions.get("execution-1")).toMatchObject({
       status: "cancelled",
       cancellationReason: "runtime_shutdown",
+    });
+  });
+
+  it("converges shutdown while a timed-out attempt is retrying unavailable authority", async () => {
+    const runtimeAuthority = authority();
+    const originalShutdown = runtimeAuthority.shutdown.bind(runtimeAuthority);
+    const ordering: string[] = [];
+    runtimeAuthority.scheduleRetry = vi.fn(async () => {
+      ordering.push("timeout-persist-failed");
+      throw new AgentRuntimeError("context_storage_unavailable", "authority unavailable");
+    });
+    runtimeAuthority.shutdown = vi.fn(async (...args) => {
+      const terminal = await originalShutdown(...args);
+      ordering.push("shutdown-committed");
+      return terminal;
+    });
+    let retrying!: () => void;
+    const retryStarted = new Promise<void>((resolve) => { retrying = resolve; });
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      provider: provider(async function* (_input, signal) {
+        signal.addEventListener("abort", () => ordering.push("provider-aborted"), { once: true });
+        await new Promise<void>(() => undefined);
+        yield { type: "response_started", sequence: 1 };
+      }),
+      modelId: "fake-model",
+      async buildProviderInput(value, invocationValue) {
+        return {
+          ...(await providerInput(value, invocationValue)),
+          limits: { ...(await providerInput(value, invocationValue)).limits, timeoutMs: 10 },
+        };
+      },
+      clock: {
+        now: () => Date.parse("2026-08-17T00:00:00.000Z"),
+        wait: vi.fn(async (_milliseconds, signal) => {
+          retrying();
+          await new Promise<void>((_resolve, reject) => {
+            if (signal.aborted) {
+              reject(new AgentRuntimeError("execution_conflict", "shutdown"));
+              return;
+            }
+            signal.addEventListener("abort", () => {
+              reject(new AgentRuntimeError("execution_conflict", "shutdown"));
+            }, { once: true });
+          });
+        }),
+      },
+      shutdownTimeoutMs: 250,
+    });
+    const accepted = await runtime.invoke(context, intent("room-timeout-close", "timeout-close"));
+    await retryStarted;
+
+    await runtime.close();
+
+    expect(ordering).toEqual([
+      "timeout-persist-failed", "shutdown-committed", "provider-aborted",
+    ]);
+    expect(runtimeAuthority.executions.get(accepted.execution.id)).toMatchObject({
+      status: "cancelled", cancellationReason: "runtime_shutdown",
     });
   });
 

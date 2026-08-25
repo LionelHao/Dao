@@ -409,10 +409,13 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
             }
           }
         })();
+        // Stop consuming the Provider stream at the timeout boundary. The
+        // Provider signal intentionally remains live until the authority has
+        // durably committed retry_scheduled/failed below.
+        rejectTimeout(new AgentRuntimeError("provider_timeout", "Provider attempt timed out"));
         void timeoutSettlement.then(
           () => {
             attemptController.abort("provider_timeout");
-            rejectTimeout(new AgentRuntimeError("provider_timeout", "Provider attempt timed out"));
           },
           (error: unknown) => {
             rejectTimeout(error);
@@ -1209,6 +1212,13 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
             clearTimeout(timeout);
           }
         };
+        // A recovery page may already own up to 256 durable candidates while
+        // local admission is blocked at 32. Stop that producer before taking
+        // the shutdown snapshot, then return every unstarted lease after all
+        // locally admitted jobs have terminalized.
+        for (const resolve of capacityWaiters) resolve();
+        capacityWaiters.clear();
+        if (recoveryPromise !== undefined) await withinDeadline(recoveryPromise);
         const jobs = [...new Map([
           ...jobsByExecution,
           ...durableOverflowJobs,
@@ -1238,6 +1248,9 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
             releaseAdmission(job);
             jobsByExecution.delete(job.execution.id);
           }
+        }
+        if (options.recoveryAuthority?.release !== undefined) {
+          await withinDeadline(options.recoveryAuthority.release());
         }
         for (const resolve of capacityWaiters) resolve();
         capacityWaiters.clear();

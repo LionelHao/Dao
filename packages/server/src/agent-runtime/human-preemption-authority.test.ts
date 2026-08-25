@@ -542,6 +542,85 @@ describe("real SQLite human-preemption authority", () => {
     }
   }, 10_000);
 
+  it("releases a 257-row recovery page across capacity-bound close and restart", () => {
+    const database = fixture();
+    const sourceMessageId = "message-recovery-close";
+    executeHumanDatabaseCommand(database, {
+      context: { ...humanContext, requestId: sourceMessageId, idempotencyKey: sourceMessageId },
+      command: { type: "message.send", roomId: "room-1", payload: {
+        id: sourceMessageId, roomId: "room-1", body: "recover on restart",
+        sentAt: new Date(t0 + 90_000).toISOString(),
+      } },
+      now: t0 + 90_000,
+    });
+    invoke(database, sourceMessageId, "execution-recovery-close-0000", "agent-1");
+    const sourceIntentId = database.prepare(
+      "SELECT intent_id AS intentId FROM agent_execution_intent_links WHERE execution_id = ?",
+    ).get("execution-recovery-close-0000")?.intentId;
+    expect(typeof sourceIntentId).toBe("string");
+    for (let index = 1; index < 257; index += 1) {
+      cloneQueuedInvocation(
+        database,
+        "execution-recovery-close-0000",
+        sourceIntentId as string,
+        index,
+      );
+    }
+
+    const scanNow = t0 + 100_000;
+    const leased = executeRuntimeAuthorityOperation(database, {
+      type: "runtime.recovery-scan", limit: 256, includeRunning: false,
+      leaseOwner: "closing-worker", leaseExpiresAt: new Date(scanNow + 300_000).toISOString(),
+      now: scanNow,
+    });
+    expect(leased.kind).toBe("recovery-page");
+    if (leased.kind !== "recovery-page") throw new Error("unexpected recovery result");
+    expect(leased.candidates).toHaveLength(256);
+
+    // Model the durable Room admission ceiling: 32 candidates reached local
+    // admission, while the other 224 remain leased only by the recovery page.
+    for (const [offset, candidate] of leased.candidates.slice(0, 32).entries()) {
+      executeRuntimeAuthorityOperation(database, {
+        type: "runtime.shutdown", executionId: candidate.record.execution.id,
+        attemptSeq: candidate.record.execution.currentAttemptSeq, now: scanNow + offset + 1,
+      });
+    }
+    const released = executeRuntimeAuthorityOperation(database, {
+      type: "runtime.recovery-release", leaseOwner: "closing-worker", now: scanNow + 200,
+    });
+    expect(released).toEqual({ kind: "recovery-released", released: 224 });
+    expect(database.prepare(
+      `SELECT state, COUNT(*) AS candidateCount FROM invocation_recovery_queue
+       GROUP BY state ORDER BY state`,
+    ).all()).toEqual([
+      { state: "closed", candidateCount: 32 },
+      { state: "pending", candidateCount: 225 },
+    ]);
+
+    const restarted = executeRuntimeAuthorityOperation(database, {
+      type: "runtime.recovery-scan", limit: 256, includeRunning: false,
+      leaseOwner: "restarted-worker", leaseExpiresAt: new Date(scanNow + 600_000).toISOString(),
+      now: scanNow + 300,
+    });
+    expect(restarted.kind).toBe("recovery-page");
+    if (restarted.kind !== "recovery-page") throw new Error("unexpected recovery result");
+    expect(restarted.candidates).toHaveLength(225);
+    expect(new Set(restarted.candidates.map(({ record }) => record.execution.id)).size).toBe(225);
+    expect(restarted.candidates.every(({ record }) => record.execution.status === "queued")).toBe(true);
+
+    const terminal = restarted.candidates[0]!;
+    executeRuntimeAuthorityOperation(database, {
+      type: "runtime.shutdown", executionId: terminal.record.execution.id,
+      attemptSeq: terminal.record.execution.currentAttemptSeq, now: scanNow + 301,
+    });
+    expect(database.prepare(
+      `SELECT state, lease_owner AS leaseOwner, lease_expires_at AS leaseExpiresAt
+       FROM invocation_recovery_queue WHERE execution_id = ?`,
+    ).get(terminal.record.execution.id)).toEqual({
+      state: "closed", leaseOwner: null, leaseExpiresAt: null,
+    });
+  }, 10_000);
+
   it("never rebuilds or claims legacy Room-wide routes from a recalled Human source", () => {
     const database = fixture();
     const sendHuman = (messageId: string, body: string, offset: number): void => {

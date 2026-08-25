@@ -7863,6 +7863,12 @@ export function executeRuntimeAuthorityOperation(
         return fail("execution_conflict", "Runtime shutdown targeted a stale attempt");
       }
       if (current.status === "completed" || current.status === "failed" || current.status === "cancelled") {
+        database.prepare(
+          `UPDATE invocation_recovery_queue
+           SET state = 'closed', lease_owner = NULL, lease_expires_at = NULL,
+               failure_code = NULL, review_required = 0, updated_at = ?
+           WHERE execution_id = ? AND state IN ('pending', 'leased')`,
+        ).run(occurredAt, current.id);
         return { kind: "execution", execution: current };
       }
       const authority = database.prepare(
@@ -7954,7 +7960,7 @@ export function executeRuntimeAuthorityOperation(
       database.prepare(
         `UPDATE invocation_recovery_queue
          SET state = 'closed', lease_owner = NULL, lease_expires_at = NULL,
-             failure_code = 'runtime_shutdown', updated_at = ?
+             failure_code = NULL, review_required = 0, updated_at = ?
          WHERE execution_id = ? AND state IN ('pending', 'leased')`,
       ).run(occurredAt, current.id);
       const cancelled = runtimeExecutionById(database, current.id);
@@ -8920,6 +8926,15 @@ export function executeRuntimeAuthorityOperation(
       return { kind: "checkpoint" };
     }
 
+    if (operation.type === "runtime.recovery-release") {
+      const released = database.prepare(
+        `UPDATE invocation_recovery_queue
+         SET state = 'pending', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+         WHERE state = 'leased' AND lease_owner = ?`,
+      ).run(occurredAt, operation.leaseOwner);
+      return { kind: "recovery-released", released: Number(released.changes) };
+    }
+
     if (operation.type === "runtime.recovery-settle") {
       const recoveryKey = parseRuntimeRecoveryCursor(operation.cursor);
       const settled = database.prepare(
@@ -8999,6 +9014,16 @@ export function executeRuntimeAuthorityOperation(
              updated_at = ?
          WHERE state = 'leased' AND lease_expires_at <= ?`,
       ).run(occurredAt, occurredAt);
+      database.prepare(
+        `UPDATE invocation_recovery_queue
+         SET state = 'closed', lease_owner = NULL, lease_expires_at = NULL,
+             failure_code = NULL, review_required = 0, updated_at = ?
+         WHERE state IN ('pending', 'leased') AND EXISTS (
+           SELECT 1 FROM agent_executions AS execution
+           WHERE execution.id = invocation_recovery_queue.execution_id
+             AND execution.status IN ('completed', 'failed', 'cancelled')
+         )`,
+      ).run(occurredAt);
       database.prepare(
         `INSERT INTO invocation_recovery_queue (
            execution_id, execution_version, state, available_at, updated_at

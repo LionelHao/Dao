@@ -222,6 +222,11 @@ export type RuntimeAuthorityOperation =
       readonly leaseOwner: string;
       readonly now: number;
     }
+  | {
+      readonly type: "runtime.recovery-release";
+      readonly leaseOwner: string;
+      readonly now: number;
+    }
   | { readonly type: "runtime.recover"; readonly now: number };
 
 export type RuntimeAuthorityOperationResult =
@@ -325,7 +330,8 @@ export type RuntimeAuthorityOperationResult =
       readonly hasMore: boolean;
     }
   | { readonly kind: "recovery-isolated" }
-  | { readonly kind: "recovery-settled" };
+  | { readonly kind: "recovery-settled" }
+  | { readonly kind: "recovery-released"; readonly released: number };
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -557,6 +563,10 @@ export function isRuntimeAuthorityOperation(value: unknown): value is RuntimeAut
   if (value.type === "runtime.recovery-settle") {
     return exact(value, ["type", "cursor", "candidateId", "leaseOwner", "now"]) &&
       text(value.cursor) && text(value.candidateId) && text(value.leaseOwner) &&
+      Buffer.byteLength(value.leaseOwner, "utf8") <= 256 && count(value.now);
+  }
+  if (value.type === "runtime.recovery-release") {
+    return exact(value, ["type", "leaseOwner", "now"]) && text(value.leaseOwner) &&
       Buffer.byteLength(value.leaseOwner, "utf8") <= 256 && count(value.now);
   }
   return value.type === "runtime.recover" && exact(value, ["type", "now"]) && count(value.now);
