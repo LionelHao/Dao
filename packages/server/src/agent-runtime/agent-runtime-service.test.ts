@@ -207,6 +207,86 @@ describe("bounded Agent runtime scheduler", () => {
     expect(stream).not.toHaveBeenCalled();
   });
 
+  it.each(["direct", "routed"] as const)(
+    "re-enqueues a %s invocation replay when the durable execution is absent locally",
+    async (kind) => {
+      const runtimeAuthority = authority();
+      const replayIntent = intent("room-replay", `source-${kind}`);
+      const replayExecution = {
+        ...execution(`execution-replay-${kind}`, replayIntent.roomId),
+        sourceMessageId: replayIntent.sourceMessageId,
+        agentId: replayIntent.targetAgentId,
+      };
+      runtimeAuthority.executions.set(replayExecution.id, replayExecution);
+      const accepted = { execution: replayExecution, intent: replayIntent, replayed: true };
+      runtimeAuthority.invoke = vi.fn(async () => accepted);
+      runtimeAuthority.invokeRouted = vi.fn(async () => accepted);
+      const stream = vi.fn(async function* () {
+        yield { type: "response_started" as const, sequence: 1 };
+        yield { type: "agent_final" as const, sequence: 2, body: "replayed", citations: [] };
+      });
+      const runtime = createAgentRuntimeService({
+        authority: runtimeAuthority,
+        provider: provider(stream),
+        modelId: "fake-model",
+        buildProviderInput: providerInput,
+      });
+
+      if (kind === "direct") await runtime.invoke(context, replayIntent);
+      else await runtime.invokeRouted("route-replay", replayIntent);
+      await runtime.whenIdle();
+
+      expect(stream).toHaveBeenCalledTimes(1);
+      expect(runtimeAuthority.executions.get(replayExecution.id)?.status).toBe("completed");
+    },
+  );
+
+  it("keeps a committed retry ACK durable when local admission fills after commit", async () => {
+    const runtimeAuthority = authority();
+    let started!: () => void;
+    const sawStart = new Promise<void>((resolve) => { started = resolve; });
+    const recoveryScan = vi.fn(async () => ({ candidates: [], hasMore: false }));
+    const recoveryAuthority: RuntimeRecoveryAuthority = {
+      scan: recoveryScan,
+      isolate: vi.fn(async () => undefined),
+    };
+    const childIntent = intent("room-full-after-commit", "retry-child");
+    const childExecution = {
+      ...execution("execution-durable-child", childIntent.roomId),
+      sourceMessageId: childIntent.sourceMessageId,
+      agentId: childIntent.targetAgentId,
+    };
+    runtimeAuthority.retry = vi.fn(async () => {
+      runtimeAuthority.executions.set(childExecution.id, childExecution);
+      return { execution: childExecution, intent: childIntent, replayed: false };
+    });
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      recoveryAuthority,
+      provider: provider(async function* (_input, signal) {
+        started();
+        await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+        yield { type: "response_started", sequence: 1 };
+      }),
+      modelId: "fake-model",
+      buildProviderInput: providerInput,
+      limits: { maxActive: 1, maxQueuedPerRoom: 1, maxPartialBytes: 1_024 },
+    });
+    await runtime.invoke(context, intent("room-full-after-commit", "active"));
+    await sawStart;
+    await runtime.invoke(
+      { ...context, requestId: "queued", idempotencyKey: "queued" },
+      intent("room-full-after-commit", "queued"),
+    );
+
+    await expect(runtime.retryInvocation(context, "terminal-parent", 7)).resolves.toMatchObject({
+      execution: { id: childExecution.id }, replayed: false,
+    });
+    await vi.waitFor(() => expect(recoveryScan).toHaveBeenCalled());
+    expect(runtimeAuthority.executions.get(childExecution.id)?.status).toBe("queued");
+    await runtime.close();
+  });
+
   it("terminalizes an invalidated frozen snapshot before any Provider stream begins", async () => {
     const runtimeAuthority = authority();
     const stream = vi.fn(async function* (): AsyncIterable<ProviderEvent> {
@@ -535,7 +615,7 @@ describe("bounded Agent runtime scheduler", () => {
     );
   });
 
-  it("retries context storage 503 using its Retry-After before Provider dispatch", async () => {
+  it("uses the fixed 1s retry backoff even when a transient error suggests Retry-After", async () => {
     const runtimeAuthority = authority();
     const waits: number[] = [];
     const clock: RuntimeClock = {
@@ -565,7 +645,7 @@ describe("bounded Agent runtime scheduler", () => {
     });
     const accepted = await runtime.invoke(context, intent("room-a", "context-503"));
     await runtime.whenIdle();
-    expect(waits).toEqual([7]);
+    expect(waits).toEqual([1_000]);
     expect(builds).toBe(2);
     expect(stream).toHaveBeenCalledTimes(1);
     expect(runtimeAuthority.executions.get(accepted.execution.id)).toMatchObject({
@@ -1256,7 +1336,8 @@ describe("bounded Agent runtime scheduler", () => {
     };
     const accepted = await beforeRestart.invoke(context, restoredIntent);
     await beforeRestart.whenIdle();
-    await beforeRestart.close();
+    // Model an abrupt process loss. A graceful close now terminalizes every
+    // admitted execution before aborting, so it cannot represent a restart.
     runtimeAuthority.readPendingConfirmation = vi.fn(async () => ({
       execution: runtimeAuthority.executions.get(accepted.execution.id)!,
       intent: restoredIntent,
@@ -1322,5 +1403,40 @@ describe("bounded Agent runtime scheduler", () => {
       status: "cancelled",
       cancellationReason: "runtime_shutdown",
     });
+  });
+
+  it("does not abort running or remove queued work when shutdown authority commit fails", async () => {
+    const runtimeAuthority = authority();
+    let started!: () => void;
+    const sawStart = new Promise<void>((resolve) => { started = resolve; });
+    let aborted = false;
+    runtimeAuthority.shutdown = vi.fn(async () => {
+      throw new AgentRuntimeError("provider_failure", "shutdown commit unavailable");
+    });
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      provider: provider(async function* (_input, signal) {
+        started();
+        signal.addEventListener("abort", () => { aborted = true; }, { once: true });
+        await new Promise<void>(() => undefined);
+        yield { type: "response_started", sequence: 1 };
+      }),
+      modelId: "fake-model",
+      buildProviderInput: providerInput,
+      limits: { maxActive: 1, maxQueuedPerRoom: 2, maxPartialBytes: 1_024 },
+      shutdownTimeoutMs: 50,
+    });
+    const running = await runtime.invoke(context, intent("room-close-failure", "running"));
+    await sawStart;
+    const queued = await runtime.invoke(
+      { ...context, requestId: "close-queued", idempotencyKey: "close-queued" },
+      intent("room-close-failure", "queued"),
+    );
+
+    await expect(runtime.close()).rejects.toMatchObject({ code: "provider_failure" });
+    expect(aborted).toBe(false);
+    expect(runtimeAuthority.executions.get(running.execution.id)?.status).toBe("running");
+    expect(runtimeAuthority.executions.get(queued.execution.id)?.status).toBe("queued");
+    expect(runtimeAuthority.shutdown).toHaveBeenCalledTimes(1);
   });
 });

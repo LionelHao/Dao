@@ -225,6 +225,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
   const activeAgents = new Set<string>();
   const controllers = new Map<string, AbortController>();
   const jobsByExecution = new Map<string, RuntimeJob>();
+  const durableOverflowJobs = new Map<string, RuntimeJob>();
   const admittedExecutions = new Set<string>();
   const admittedByRoom = new Map<string, number>();
   const admissionReservations = new Map<string, number>();
@@ -285,7 +286,8 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
   const nonEmptyId = (value: unknown): value is string =>
     typeof value === "string" && value.length > 0 && value === value.trim() && value.length <= 256;
 
-  const isIdle = (): boolean => active === 0 && [...queues.values()].every((queue) => queue.length === 0);
+  const isIdle = (): boolean => active === 0 && durableOverflowJobs.size === 0 &&
+    [...queues.values()].every((queue) => queue.length === 0);
   const signalIdle = (): void => {
     if (!isIdle()) return;
     for (const resolve of idleWaiters) resolve();
@@ -333,10 +335,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
     const configuredRetryDelay = claimed.retryOrdinal < AGENT_RUNTIME_MAX_ATTEMPTS
       ? AGENT_RUNTIME_RETRY_DELAYS_MS[claimed.retryOrdinal - 1]
       : undefined;
-    const retryDelay = configuredRetryDelay === undefined ? undefined
-      : Number.isSafeInteger(runtimeError.retryAfterMs) && runtimeError.retryAfterMs! >= 0
-        ? runtimeError.retryAfterMs
-        : configuredRetryDelay;
+    const retryDelay = configuredRetryDelay;
     const nextRetryAt = retryDelay === undefined
       ? undefined
       : new Date(clock.now() + retryDelay).toISOString();
@@ -677,6 +676,21 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
     signalIdle();
   };
 
+  const enqueueCommitted = (job: RuntimeJob): void => {
+    if (jobsByExecution.has(job.execution.id) || durableOverflowJobs.has(job.execution.id) ||
+        job.execution.status !== "queued") return;
+    try {
+      enqueue(job);
+      pump();
+    } catch (error: unknown) {
+      if (!(error instanceof AgentRuntimeError) || error.code !== "agent_queue_full") throw error;
+      // The authority transaction already committed. Never turn its ACK into a
+      // local 429; the durable recovery scan owns re-admission after capacity drains.
+      durableOverflowJobs.set(job.execution.id, job);
+      queueMicrotask(() => void runtime.recover().catch(() => undefined));
+    }
+  };
+
   const runtime: AgentRuntimeService = {
     async invoke(context, intent): Promise<InvocationAccepted> {
       if (closed) throw new AgentRuntimeError("agent_runtime_closed", "Agent runtime is closed");
@@ -690,10 +704,13 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
       reserveAdmission(intent.roomId);
       try {
         const accepted = await options.authority.invoke(context, intent, options.provider.id, options.modelId);
-        if (!accepted.replayed && accepted.execution.status === "queued") {
-          enqueue({ execution: accepted.execution, intent, context, toolContinuations: [], sideEffectDispatched: false });
-          pump();
-        }
+        enqueueCommitted({
+          execution: accepted.execution,
+          intent: accepted.intent,
+          context,
+          toolContinuations: [],
+          sideEffectDispatched: false,
+        });
         return accepted;
       } finally {
         releaseReservation(intent.roomId);
@@ -716,16 +733,13 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
           options.provider.id,
           options.modelId,
         );
-        if (!accepted.replayed && accepted.execution.status === "queued") {
-          enqueue({
-            execution: accepted.execution,
-            intent,
-            context: undefined,
-            toolContinuations: [],
-            sideEffectDispatched: false,
-          });
-          pump();
-        }
+        enqueueCommitted({
+          execution: accepted.execution,
+          intent: accepted.intent,
+          context: undefined,
+          toolContinuations: [],
+          sideEffectDispatched: false,
+        });
         return accepted;
       } finally {
         releaseReservation(intent.roomId);
@@ -879,8 +893,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         toolContinuations: [],
         sideEffectDispatched: false,
       };
-      enqueue(job);
-      pump();
+      enqueueCommitted(job);
       return accepted;
     },
     async retryInvocation(context, executionId, expectedVersion) {
@@ -898,8 +911,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         toolContinuations: [],
         sideEffectDispatched: false,
       };
-      enqueue(job);
-      pump();
+      enqueueCommitted(job);
       return accepted;
     },
     async confirmTool(context: AuthenticatedCommandContext, confirmation: ToolConfirmationInput) {
@@ -1062,6 +1074,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
           while (!closed) {
             try {
               enqueue(job);
+              durableOverflowJobs.delete(job.execution.id);
               pump();
               return;
             } catch (error: unknown) {
@@ -1135,34 +1148,59 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
     close() {
       closePromise ??= (async () => {
         closed = true;
-        const convergence = Promise.allSettled([...controllers.keys()].map(async (executionId) => {
-          const job = jobsByExecution.get(executionId);
-          if (job === undefined) return;
-          job.execution = await options.authority.shutdown(
-            executionId,
+        const deadline = Date.now() + shutdownTimeoutMs;
+        const withinDeadline = async <Value>(operation: Promise<Value>): Promise<Value> => {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) {
+            throw new AgentRuntimeError("provider_timeout", "Runtime shutdown authority timed out");
+          }
+          let timeout: ReturnType<typeof setTimeout> | undefined;
+          try {
+            return await Promise.race([
+              operation,
+              new Promise<never>((_resolve, reject) => {
+                timeout = setTimeout(() => reject(new AgentRuntimeError(
+                  "provider_timeout", "Runtime shutdown authority timed out",
+                )), remaining);
+              }),
+            ]);
+          } finally {
+            clearTimeout(timeout);
+          }
+        };
+        const jobs = [...new Map([
+          ...jobsByExecution,
+          ...durableOverflowJobs,
+        ]).values()];
+        for (const job of jobs) {
+          const terminal = await withinDeadline(options.authority.shutdown(
+            job.execution.id,
             job.execution.currentAttemptSeq,
-          );
-        }));
-        await Promise.race([
-          convergence,
-          new Promise<void>((resolve) => setTimeout(resolve, shutdownTimeoutMs)),
-        ]);
-        for (const controller of controllers.values()) controller.abort("runtime_shutdown");
-        for (const queue of queues.values()) {
-          for (const job of queue) {
+          ));
+          if (terminal.id !== job.execution.id ||
+              (terminal.status !== "completed" && terminal.status !== "failed" &&
+               terminal.status !== "cancelled")) {
+            throw new AgentRuntimeError(
+              "execution_conflict", "Runtime shutdown authority did not return a terminal execution",
+            );
+          }
+          job.execution = terminal;
+          durableOverflowJobs.delete(job.execution.id);
+          removeQueuedJob(job.execution.id);
+          controllers.get(job.execution.id)?.abort("runtime_shutdown");
+          for (const [confirmationId, pending] of pendingConfirmations) {
+            if (pending.job.execution.id === job.execution.id) {
+              pendingConfirmations.delete(confirmationId);
+            }
+          }
+          if (!controllers.has(job.execution.id)) {
             releaseAdmission(job);
             jobsByExecution.delete(job.execution.id);
           }
-          queue.splice(0);
         }
-        queues.clear();
         for (const resolve of capacityWaiters) resolve();
         capacityWaiters.clear();
-        const drained = runtime.whenIdle();
-        await Promise.race([
-          drained,
-          new Promise<void>((resolve) => setTimeout(resolve, shutdownTimeoutMs)),
-        ]);
+        await withinDeadline(runtime.whenIdle());
       })();
       return closePromise;
     },

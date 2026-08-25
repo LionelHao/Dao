@@ -21,6 +21,7 @@ import {
   type AgentRuntimeErrorCode,
   type InvocationAcceptedWithIntent,
   type RuntimeAuthority,
+  type RuntimeRecoveryAuthority,
 } from "./contracts.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -532,6 +533,64 @@ export function createWorkerRuntimeAuthority(
     },
   };
   return Object.freeze(authority);
+}
+
+/**
+ * Production durable recovery adapter. A process's first complete generation
+ * also fences stale running attempts left by a crash. Later generations are
+ * deliberately queued-only so a post-commit rescan can be triggered at any
+ * time without treating this process's live attempts as crashed.
+ */
+export function createWorkerRuntimeRecoveryAuthority(
+  worker: WorkerDatabaseClient,
+): RuntimeRecoveryAuthority {
+  let completedGenerations = 0;
+  let includeRunningForGeneration = true;
+  const execute = async (
+    operation: Parameters<WorkerDatabaseClient["executeRuntime"]>[0],
+  ): Promise<unknown> => {
+    try {
+      return await worker.executeRuntime(operation);
+    } catch (error: unknown) {
+      throw mappedError(error);
+    }
+  };
+  const recoveryAuthority: RuntimeRecoveryAuthority = {
+    async scan({ after, limit }) {
+      if (after === undefined) {
+        includeRunningForGeneration = completedGenerations === 0;
+      }
+      const result = await execute({
+        type: "runtime.recovery-scan",
+        ...(after === undefined ? {} : { after }),
+        limit,
+        includeRunning: includeRunningForGeneration,
+        now: Date.now(),
+      });
+      if (!record(result) || result.kind !== "recovery-page" ||
+          typeof result.hasMore !== "boolean" || !Array.isArray(result.candidates) ||
+          !result.candidates.every((candidate) => record(candidate) &&
+            typeof candidate.cursor === "string" && candidate.cursor.length > 0 &&
+            Object.hasOwn(candidate, "record"))) {
+        throw new AgentRuntimeError("provider_failure", "Authority recovery page was malformed");
+      }
+      if (result.candidates.length === 0) completedGenerations += 1;
+      return result as Awaited<ReturnType<RuntimeRecoveryAuthority["scan"]>>;
+    },
+    async isolate({ cursor, candidateId, reason }) {
+      const result = await execute({
+        type: "runtime.recovery-isolate",
+        cursor,
+        ...(candidateId === undefined ? {} : { candidateId }),
+        reason,
+        now: Date.now(),
+      });
+      if (!record(result) || result.kind !== "recovery-isolated") {
+        throw new AgentRuntimeError("provider_failure", "Authority recovery isolation was malformed");
+      }
+    },
+  };
+  return Object.freeze(recoveryAuthority);
 }
 
 export type WorkerRuntimeAuthorityContext = AuthenticatedCommandContext | InternalAgentCommandContext;

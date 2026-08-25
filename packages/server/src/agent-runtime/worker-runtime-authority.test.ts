@@ -8,9 +8,15 @@ import type { Actor } from "@native-im/core";
 import { createSqliteAuthoritativeStore } from "../persistence/sqlite-authoritative-store.js";
 import { insertLegacyMessageAuthorityRecord } from "../persistence/message-authority-legacy-adapter.js";
 import { migrateAuthorityDatabase } from "../persistence/schema.js";
-import { createWorkerDatabaseClient } from "../persistence/worker-database-client.js";
+import {
+  createWorkerDatabaseClient,
+  type WorkerDatabaseClient,
+} from "../persistence/worker-database-client.js";
 import { registerMemoryCorpusSource } from "../room-memory/corpus-database-authority.js";
-import { createWorkerRuntimeAuthority } from "./worker-runtime-authority.js";
+import {
+  createWorkerRuntimeAuthority,
+  createWorkerRuntimeRecoveryAuthority,
+} from "./worker-runtime-authority.js";
 import { createToolGateway } from "./tool-gateway.js";
 import { createRepositoryGitStatusAdapter } from "./tools/repository-git-status.js";
 import { createSandboxFileWriteAdapter } from "./tools/sandbox-file-write.js";
@@ -28,6 +34,36 @@ const actors = [
 ] as const satisfies readonly Actor[];
 
 describe("real AuthorityWorker runtime authority", () => {
+  it("allows repeated post-commit recovery generations without re-fencing live running work", async () => {
+    const executeRuntime = vi.fn(async (operation: { type: string }) =>
+      operation.type === "runtime.recovery-isolate"
+        ? { kind: "recovery-isolated" }
+        : { kind: "recovery-page", candidates: [], hasMore: false });
+    const recovery = createWorkerRuntimeRecoveryAuthority({
+      executeRuntime,
+    } as unknown as WorkerDatabaseClient);
+
+    await recovery.scan({ limit: 256 });
+    await recovery.scan({ limit: 256 });
+    await recovery.isolate({
+      cursor: "00000000000000000001",
+      candidateId: "execution-poison",
+      reason: "recovery_candidate_invalid",
+    });
+
+    expect(executeRuntime.mock.calls[0]?.[0]).toMatchObject({
+      type: "runtime.recovery-scan", includeRunning: true, limit: 256,
+    });
+    expect(executeRuntime.mock.calls[1]?.[0]).toMatchObject({
+      type: "runtime.recovery-scan", includeRunning: false, limit: 256,
+    });
+    expect(executeRuntime.mock.calls[2]?.[0]).toMatchObject({
+      type: "runtime.recovery-isolate",
+      cursor: "00000000000000000001",
+      candidateId: "execution-poison",
+    });
+  });
+
   it("persists completion and recovers a running attempt after SQLite/worker restart", async () => {
     const directory = mkdtempSync(join(tmpdir(), "dao-runtime-worker-"));
     const databasePath = join(directory, "authority.sqlite");

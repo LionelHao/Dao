@@ -26,7 +26,10 @@ import { createAgentRuntimeService, type AgentRuntimeService } from "./agent-run
 import { AgentRuntimeError, type ProviderAdapter } from "./agent-runtime/contracts.js";
 import { createEnvironmentSecretProvider } from "./agent-runtime/environment-secret-provider.js";
 import { createOpenAIResponsesProvider } from "./agent-runtime/openai-responses-provider.js";
-import { createWorkerRuntimeAuthority } from "./agent-runtime/worker-runtime-authority.js";
+import {
+  createWorkerRuntimeAuthority,
+  createWorkerRuntimeRecoveryAuthority,
+} from "./agent-runtime/worker-runtime-authority.js";
 import { createHttpJsonReadAdapter } from "./agent-runtime/tools/http-json-read.js";
 import { createRepositoryGitStatusAdapter } from "./agent-runtime/tools/repository-git-status.js";
 import { createSandboxFileWriteAdapter } from "./agent-runtime/tools/sandbox-file-write.js";
@@ -258,6 +261,7 @@ async function start(
   let transport: Awaited<ReturnType<typeof startMessageWebSocketServer>> | undefined;
   let runtime: AgentRuntimeService | undefined;
   let kickDirectIntentConsumer: () => void = () => undefined;
+  let stopRuntimeRecovery: (() => void) | undefined;
   let sourceScopedRuntimeBoundary: SourceScopedRuntimeBoundary | undefined;
   let routeRuntime: RouteRuntimeService | undefined;
   let ballRuntime: BallRuntimeService | undefined;
@@ -545,6 +549,7 @@ async function start(
       authorityWorker,
       { contextWorker: authorityWorker },
     );
+    const runtimeRecoveryAuthority = createWorkerRuntimeRecoveryAuthority(authorityWorker);
     const contextBuilder = createWorkerCompiledContextBuilder({
       worker: authorityWorker,
       availableTools: runtimeTools.map((tool) => tool.descriptor),
@@ -575,6 +580,7 @@ async function start(
     const toolGateway = createToolGateway({ authority: runtimeAuthority, adapters: runtimeTools });
     runtime = createAgentRuntimeService({
       authority: runtimeAuthority,
+      recoveryAuthority: runtimeRecoveryAuthority,
       provider,
       modelId: runtimeModel,
       readiness: () => testOptions.agentRuntimeProviderForTest !== undefined ||
@@ -837,6 +843,11 @@ async function start(
     }
     await runtime.recover();
     kickDirectIntentConsumer();
+    const runtimeRecoveryTimer = setInterval(() => {
+      void runtime?.recover().catch(() => undefined);
+    }, 1_000);
+    runtimeRecoveryTimer.unref();
+    stopRuntimeRecovery = () => clearInterval(runtimeRecoveryTimer);
     await routeRuntime.recover();
     await ballRuntime.recover();
     const memoryProvider = createOpenAIMemoryStewardProvider({
@@ -889,6 +900,7 @@ async function start(
   } catch (error: unknown) {
     settleAttachmentReader(undefined);
     stopCacheInvalidationRecovery?.();
+    stopRuntimeRecovery?.();
     stopAttachmentRecovery?.();
     stopMemoryRecovery?.();
     await transport?.close().catch(() => undefined);
@@ -909,6 +921,7 @@ async function start(
     close() {
       closePromise ??= (async () => {
         stopCacheInvalidationRecovery?.();
+        stopRuntimeRecovery?.();
         stopAttachmentRecovery?.();
         stopMemoryRecovery?.();
         const failures: unknown[] = [];

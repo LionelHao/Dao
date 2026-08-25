@@ -186,7 +186,181 @@ function makeRunning(
   ).run(new Date(t0 + 11_000).toISOString(), actionCategory, executionId);
 }
 
+function cloneRuntimeRow(
+  database: DatabaseSync,
+  table: string,
+  sourceWhere: string,
+  sourceParameters: readonly (string | number)[],
+  overrides: Readonly<Record<string, string | number | null>>,
+): void {
+  const columns = database.prepare(`PRAGMA table_info(${table})`).all()
+    .map((row) => row.name)
+    .filter((name): name is string => typeof name === "string");
+  const overrideValues: (string | number | null)[] = [];
+  const selection = columns.map((column) => {
+    if (!Object.hasOwn(overrides, column)) return `"${column}"`;
+    overrideValues.push(overrides[column]!);
+    return "?";
+  });
+  database.prepare(
+    `INSERT INTO ${table} (${columns.map((column) => `"${column}"`).join(", ")})
+     SELECT ${selection.join(", ")} FROM ${table} WHERE ${sourceWhere}`,
+  ).run(...overrideValues, ...sourceParameters);
+}
+
+function cloneQueuedInvocation(
+  database: DatabaseSync,
+  sourceExecutionId: string,
+  sourceIntentId: string,
+  ordinal: number,
+): void {
+  const executionId = `execution-recovery-${String(ordinal).padStart(4, "0")}`;
+  const intentId = `intent-recovery-${String(ordinal).padStart(4, "0")}`;
+  const targetId = `target-recovery-${String(ordinal).padStart(4, "0")}`;
+  const messageId = `message-recovery-${String(ordinal).padStart(4, "0")}`;
+  const queuedAt = new Date(t0 + 20_000 + ordinal).toISOString();
+  executeHumanDatabaseCommand(database, {
+    context: { ...humanContext, requestId: messageId, idempotencyKey: messageId },
+    command: { type: "message.send", roomId: "room-1", payload: {
+      id: messageId, roomId: "room-1", body: "x", sentAt: queuedAt,
+    } },
+    now: t0 + 20_000 + ordinal,
+  });
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    cloneRuntimeRow(database, "message_mentions", `message_id = (
+    SELECT source_message_id FROM agent_invocation_intents WHERE id = ?
+  ) AND target_id = (
+    SELECT target_id FROM agent_invocation_intents WHERE id = ?
+  )`, [sourceIntentId, sourceIntentId], {
+    message_id: messageId,
+    target_id: targetId,
+    range_start_utf16: 0,
+    range_end_utf16: 1,
+    target_order: 0,
+  });
+  cloneRuntimeRow(database, "agent_invocation_intents", "id = ?", [sourceIntentId], {
+    id: intentId,
+    execution_id: null,
+    source_message_id: messageId,
+    message_transaction_id: messageId,
+    target_id: targetId,
+    lineage_id: `lineage-recovery-${ordinal}`,
+    turn_id: `turn-recovery-${ordinal}`,
+    created_at: queuedAt,
+    status: "pending",
+    claimed_at: null,
+  });
+  cloneRuntimeRow(database, "direct_agent_invocation_authority_bindings", "intent_id = ?", [sourceIntentId], {
+    intent_id: intentId,
+  });
+  cloneRuntimeRow(database, "message_target_outcomes", "invocation_intent_id = ?", [sourceIntentId], {
+    message_id: messageId,
+    target_id: targetId,
+    invocation_intent_id: intentId,
+    created_at: queuedAt,
+  });
+  cloneRuntimeRow(database, "agent_executions", "id = ?", [sourceExecutionId], {
+    id: executionId,
+    trigger_message_id: messageId,
+    queued_at: queuedAt,
+    updated_at: queuedAt,
+  });
+  cloneRuntimeRow(database, "agent_execution_attempts", "execution_id = ? AND attempt_seq = 1", [sourceExecutionId], {
+    execution_id: executionId,
+  });
+  cloneRuntimeRow(database, "agent_execution_intent_links", "execution_id = ?", [sourceExecutionId], {
+    intent_id: intentId,
+    execution_id: executionId,
+    linked_at: queuedAt,
+  });
+    database.prepare(
+      "UPDATE agent_invocation_intents SET status = 'claimed', claimed_at = ? WHERE id = ?",
+    ).run(queuedAt, intentId);
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+}
+
 describe("real SQLite human-preemption authority", () => {
+  it("drains 257/513/1025 durable recovery candidates by stable 256-row keysets", () => {
+    const database = fixture();
+    const sourceMessageId = "message-recovery-source";
+    executeHumanDatabaseCommand(database, {
+      context: { ...humanContext, requestId: sourceMessageId, idempotencyKey: sourceMessageId },
+      command: { type: "message.send", roomId: "room-1", payload: {
+        id: sourceMessageId,
+        roomId: "room-1",
+        body: "x".repeat(1_100),
+        sentAt: new Date(t0 + 90_000).toISOString(),
+      } },
+      now: t0 + 90_000,
+    });
+    invoke(database, sourceMessageId, "execution-recovery-0000", "agent-1");
+    const sourceIntentId = database.prepare(
+      "SELECT intent_id AS intentId FROM agent_execution_intent_links WHERE execution_id = ?",
+    ).get("execution-recovery-0000")?.intentId;
+    expect(typeof sourceIntentId).toBe("string");
+
+    let seeded = 1;
+    for (const candidateCount of [257, 513, 1_025]) {
+      while (seeded < candidateCount) {
+        cloneQueuedInvocation(
+          database,
+          "execution-recovery-0000",
+          sourceIntentId as string,
+          seeded,
+        );
+        seeded += 1;
+      }
+      let after: string | undefined;
+      const cursors: string[] = [];
+      let scans = 0;
+      let scanComplete = false;
+      while (!scanComplete) {
+        const page = executeRuntimeAuthorityOperation(database, {
+          type: "runtime.recovery-scan",
+          ...(after === undefined ? {} : { after }),
+          limit: 256,
+          includeRunning: false,
+          now: t0 + 60_000,
+        });
+        expect(page.kind).toBe("recovery-page");
+        if (page.kind !== "recovery-page") throw new Error("unexpected recovery result");
+        scans += 1;
+        cursors.push(...page.candidates.map((candidate) => candidate.cursor));
+        after = page.candidates.at(-1)?.cursor;
+        scanComplete = page.candidates.length === 0;
+      }
+      expect(cursors).toHaveLength(candidateCount);
+      expect(cursors).toEqual([...cursors].sort());
+      expect(new Set(cursors).size).toBe(candidateCount);
+      expect(scans).toBe(Math.ceil(candidateCount / 256) + 1);
+    }
+
+    const firstPage = executeRuntimeAuthorityOperation(database, {
+      type: "runtime.recovery-scan", limit: 1, includeRunning: false, now: t0 + 60_000,
+    });
+    expect(firstPage.kind).toBe("recovery-page");
+    if (firstPage.kind !== "recovery-page") throw new Error("unexpected recovery result");
+    const poison = firstPage.candidates[0]!;
+    executeRuntimeAuthorityOperation(database, {
+      type: "runtime.recovery-isolate",
+      cursor: poison.cursor,
+      candidateId: poison.record.execution.id,
+      reason: "recovery_candidate_invalid",
+      now: t0 + 60_001,
+    });
+    expect(database.prepare(
+      `SELECT state, failure_code AS failureCode, review_required AS reviewRequired
+       FROM invocation_recovery_queue WHERE execution_id = ?`,
+    ).get(poison.record.execution.id)).toEqual({
+      state: "dead_letter", failureCode: "recovery_candidate_invalid", reviewRequired: 1,
+    });
+  }, 15_000);
+
   it("never rebuilds or claims legacy Room-wide routes from a recalled Human source", () => {
     const database = fixture();
     const sendHuman = (messageId: string, body: string, offset: number): void => {

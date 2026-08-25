@@ -186,6 +186,20 @@ export type RuntimeAuthorityOperation =
       readonly now: number;
     }
   | { readonly type: "runtime.list-pending-human-fences"; readonly now: number }
+  | {
+      readonly type: "runtime.recovery-scan";
+      readonly after?: string;
+      readonly limit: number;
+      readonly includeRunning: boolean;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.recovery-isolate";
+      readonly cursor: string;
+      readonly candidateId?: string;
+      readonly reason: "recovery_candidate_invalid" | "recovery_candidate_conflict";
+      readonly now: number;
+    }
   | { readonly type: "runtime.recover"; readonly now: number };
 
 export type RuntimeAuthorityOperationResult =
@@ -277,7 +291,16 @@ export type RuntimeAuthorityOperationResult =
       readonly sealedCompensation: string;
       readonly replayed: boolean;
     }
-  | { readonly kind: "recovery"; readonly records: readonly RuntimeRecoveryRecord[] };
+  | { readonly kind: "recovery"; readonly records: readonly RuntimeRecoveryRecord[] }
+  | {
+      readonly kind: "recovery-page";
+      readonly candidates: readonly Readonly<{
+        readonly cursor: string;
+        readonly record: RuntimeRecoveryRecord;
+      }>[];
+      readonly hasMore: boolean;
+    }
+  | { readonly kind: "recovery-isolated" };
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -472,6 +495,19 @@ export function isRuntimeAuthorityOperation(value: unknown): value is RuntimeAut
   }
   if (value.type === "runtime.list-pending-human-fences") {
     return exact(value, ["type", "now"]) && count(value.now);
+  }
+  if (value.type === "runtime.recovery-scan") {
+    const optional = Object.hasOwn(value, "after") ? ["after"] : [];
+    return exact(value, ["type", "limit", "includeRunning", "now"], optional) &&
+      count(value.limit, 1) && value.limit <= 256 && typeof value.includeRunning === "boolean" &&
+      (!Object.hasOwn(value, "after") || text(value.after)) && count(value.now);
+  }
+  if (value.type === "runtime.recovery-isolate") {
+    const optional = Object.hasOwn(value, "candidateId") ? ["candidateId"] : [];
+    return exact(value, ["type", "cursor", "reason", "now"], optional) &&
+      text(value.cursor) && (!Object.hasOwn(value, "candidateId") || text(value.candidateId)) &&
+      (value.reason === "recovery_candidate_invalid" ||
+        value.reason === "recovery_candidate_conflict") && count(value.now);
   }
   return value.type === "runtime.recover" && exact(value, ["type", "now"]) && count(value.now);
 }

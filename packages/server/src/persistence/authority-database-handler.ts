@@ -977,6 +977,26 @@ function stableId(...parts: readonly string[]): string {
   return createHash("sha256").update(parts.join("\u0000")).digest("base64url");
 }
 
+const RUNTIME_RECOVERY_CURSOR_WIDTH = 20;
+
+function runtimeRecoveryCursor(recoveryKey: number): string {
+  if (!Number.isSafeInteger(recoveryKey) || recoveryKey < 1) {
+    throw new Error("Runtime recovery key was outside the safe integer range");
+  }
+  return String(recoveryKey).padStart(RUNTIME_RECOVERY_CURSOR_WIDTH, "0");
+}
+
+function parseRuntimeRecoveryCursor(cursor: string): number {
+  if (!new RegExp(`^[0-9]{${RUNTIME_RECOVERY_CURSOR_WIDTH}}$`, "u").test(cursor)) {
+    return fail("invalid_parameters", "Runtime recovery cursor was malformed");
+  }
+  const recoveryKey = Number(cursor);
+  if (!Number.isSafeInteger(recoveryKey) || recoveryKey < 1) {
+    return fail("invalid_parameters", "Runtime recovery cursor was malformed");
+  }
+  return recoveryKey;
+}
+
 function businessHash(command: PersistentCommand): string {
   return createHash("sha256").update(canonicalJson(command)).digest("base64url");
 }
@@ -8433,17 +8453,101 @@ export function executeRuntimeAuthorityOperation(
       return { kind: "checkpoint" };
     }
 
-    const recoverable = database.prepare(
-      `SELECT execution.id
-       FROM agent_executions AS execution
-       JOIN agent_execution_intent_links AS intent_link
-         ON intent_link.execution_id = execution.id
-       JOIN rooms AS room ON room.id = execution.room_id
-       WHERE execution.status IN ('queued', 'running')
-         AND room.status = 'active'
-         AND execution.room_archive_generation = room.archive_generation
-       ORDER BY execution.queued_at, execution.id`,
-    ).all();
+    if (operation.type === "runtime.recovery-isolate") {
+      const recoveryKey = parseRuntimeRecoveryCursor(operation.cursor);
+      const isolated = database.prepare(
+        `UPDATE invocation_recovery_queue
+         SET state = 'dead_letter', lease_owner = NULL, lease_expires_at = NULL,
+             failure_code = ?, review_required = 1, updated_at = ?
+         WHERE recovery_key = ?
+           AND (? IS NULL OR execution_id = ?)
+           AND state <> 'dead_letter'`,
+      ).run(operation.reason, occurredAt, recoveryKey,
+        operation.candidateId ?? null, operation.candidateId ?? null);
+      if (isolated.changes !== 1) {
+        const existing = database.prepare(
+          `SELECT execution_id AS executionId, state
+           FROM invocation_recovery_queue WHERE recovery_key = ?`,
+        ).get(recoveryKey);
+        if (existing?.state !== "dead_letter" ||
+            (operation.candidateId !== undefined && existing.executionId !== operation.candidateId)) {
+          return fail("execution_conflict", "Runtime recovery candidate could not be isolated");
+        }
+      }
+      database.prepare(
+        `UPDATE invocation_recovery_cursors
+         SET last_recovery_key = MAX(last_recovery_key, ?), updated_at = ?
+         WHERE worker_scope = 'invocation-runtime'`,
+      ).run(recoveryKey, occurredAt);
+      return { kind: "recovery-isolated" };
+    }
+
+    const keysetScan = operation.type === "runtime.recovery-scan";
+    let recoverable: Record<string, unknown>[];
+    if (keysetScan) {
+      const afterRecoveryKey = operation.after === undefined
+        ? 0
+        : parseRuntimeRecoveryCursor(operation.after);
+      database.prepare(
+        `UPDATE invocation_recovery_queue
+         SET state = 'pending', lease_owner = NULL, lease_expires_at = NULL,
+             updated_at = ?
+         WHERE state = 'leased' AND lease_expires_at <= ?`,
+      ).run(occurredAt, occurredAt);
+      database.prepare(
+        `INSERT INTO invocation_recovery_queue (
+           execution_id, execution_version, state, available_at, updated_at
+         )
+         SELECT state.execution_id, state.authority_version, 'pending',
+                COALESCE(execution.next_retry_at, execution.queued_at), ?
+         FROM agent_execution_runtime_states AS state
+         JOIN agent_executions AS execution ON execution.id = state.execution_id
+         JOIN agent_execution_intent_links AS intent_link
+           ON intent_link.execution_id = execution.id
+         JOIN rooms AS room ON room.id = execution.room_id
+         WHERE (execution.status = 'queued' OR (? = 1 AND execution.status = 'running'))
+           AND room.status = 'active'
+           AND execution.room_archive_generation = room.archive_generation
+         ON CONFLICT(execution_id) DO UPDATE SET
+           execution_version = excluded.execution_version,
+           available_at = excluded.available_at,
+           updated_at = excluded.updated_at
+         WHERE invocation_recovery_queue.state <> 'dead_letter'`,
+      ).run(occurredAt, operation.includeRunning ? 1 : 0);
+      recoverable = database.prepare(
+        `SELECT execution.id, recovery.recovery_key AS recoveryKey
+         FROM invocation_recovery_queue AS recovery
+         JOIN agent_executions AS execution ON execution.id = recovery.execution_id
+         JOIN agent_execution_intent_links AS intent_link
+           ON intent_link.execution_id = execution.id
+         JOIN rooms AS room ON room.id = execution.room_id
+         WHERE recovery.state = 'pending'
+           AND recovery.recovery_key > ?
+           AND recovery.available_at <= ?
+           AND (execution.status = 'queued' OR (? = 1 AND execution.status = 'running'))
+           AND room.status = 'active'
+           AND execution.room_archive_generation = room.archive_generation
+         ORDER BY recovery.recovery_key
+         LIMIT ?`,
+      ).all(afterRecoveryKey, occurredAt, operation.includeRunning ? 1 : 0, operation.limit);
+      database.prepare(
+        `UPDATE invocation_recovery_cursors
+         SET scan_generation = scan_generation + ?, updated_at = ?
+         WHERE worker_scope = 'invocation-runtime'`,
+      ).run(operation.after === undefined ? 1 : 0, occurredAt);
+    } else {
+      recoverable = database.prepare(
+        `SELECT execution.id
+         FROM agent_executions AS execution
+         JOIN agent_execution_intent_links AS intent_link
+           ON intent_link.execution_id = execution.id
+         JOIN rooms AS room ON room.id = execution.room_id
+         WHERE execution.status IN ('queued', 'running')
+           AND room.status = 'active'
+           AND execution.room_archive_generation = room.archive_generation
+         ORDER BY execution.queued_at, execution.id`,
+      ).all();
+    }
     const records: { execution: AgentExecution; outcome: "enqueue" | "failed" | "fail_outcome_unknown" | "wait_confirmation" }[] = [];
     for (const row of recoverable) {
       if (typeof row.id !== "string") return fail("storage_unavailable", "Recovery execution was corrupt");
@@ -8613,13 +8717,33 @@ export function executeRuntimeAuthorityOperation(
       }
       records.push({ execution: current, outcome: current.actionCategory === "waiting_upstream" ? "wait_confirmation" : "enqueue" });
     }
-    return {
-      kind: "recovery",
-      records: records.map((record) => ({
-        ...record,
-        intent: runtimeInvocationIntentByExecution(database, record.execution.id),
-      })),
-    };
+    const hydratedRecords = records.map((record) => ({
+      ...record,
+      intent: runtimeInvocationIntentByExecution(database, record.execution.id),
+    }));
+    if (keysetScan) {
+      const candidates = hydratedRecords.map((record, index) => {
+        const recoveryKey = recoverable[index]?.recoveryKey;
+        if (typeof recoveryKey !== "number") {
+          return fail("storage_unavailable", "Runtime recovery key was corrupt");
+        }
+        return { cursor: runtimeRecoveryCursor(recoveryKey), record };
+      });
+      const lastRecoveryKey = recoverable.at(-1)?.recoveryKey;
+      if (typeof lastRecoveryKey === "number") {
+        database.prepare(
+          `UPDATE invocation_recovery_cursors
+           SET last_recovery_key = MAX(last_recovery_key, ?), updated_at = ?
+           WHERE worker_scope = 'invocation-runtime'`,
+        ).run(lastRecoveryKey, occurredAt);
+      }
+      return {
+        kind: "recovery-page",
+        candidates,
+        hasMore: candidates.length === operation.limit,
+      };
+    }
+    return { kind: "recovery", records: hydratedRecords };
   });
 }
 
