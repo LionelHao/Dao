@@ -38,7 +38,8 @@
 @media (max-width: 840px) {
   .room-authority-workspace__project,
   .project-loop {
-    grid-column: 1 / -1;
+    grid-column: 1;
+    grid-row: 2;
     border-left: 0;
     border-top: 1px solid #d8dee9;
     min-height: 240px;

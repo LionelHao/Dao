@@ -67,6 +67,7 @@ function renderExecution(
   const card = document.createElement("article");
   card.className = `invocation-card invocation-card--${execution.status}`;
   card.dataset.executionId = execution.executionId;
+  card.dataset.executionRevision = String(execution.version);
   card.dataset.status = execution.status;
   card.dataset.phase = execution.phase;
   card.tabIndex = -1;

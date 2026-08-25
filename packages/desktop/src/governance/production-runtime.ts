@@ -11,6 +11,7 @@ import {
   type GovernanceController,
 } from "./controller.js";
 import { createDesktopAuthorityCache, type DesktopAuthorityCache } from "./authority-cache.js";
+import type { AuthorityCachePersistence } from "./encrypted-authority-cache.js";
 import {
   GovernanceTransportError,
   createGovernanceWebSocketAuthority,
@@ -78,6 +79,8 @@ export interface DesktopGovernanceRuntime {
   readonly controller: GovernanceController;
   readonly invocations: InvocationController;
   readonly cache: DesktopAuthorityCache;
+  repairRoom(roomId: string): Promise<void>;
+  restoreCache(actorId: string): Promise<boolean>;
   invalidateAuthorizedState(): void;
   close(): void;
 }
@@ -89,9 +92,10 @@ export function createDesktopGovernanceRuntime(options: {
   readonly createRequestIdentity: () => { readonly requestId: string; readonly idempotencyKey: string };
   readonly now?: () => string;
   readonly timeoutMs?: number;
+  readonly cachePersistence?: AuthorityCachePersistence;
 }): DesktopGovernanceRuntime {
   const now = options.now ?? (() => new Date().toISOString());
-  const cache = createDesktopAuthorityCache(now);
+  const cache = createDesktopAuthorityCache(now, options.cachePersistence);
   const feed = createGovernanceReplicaFeed();
   const transport = createGovernanceWebSocketAuthority({
     endpoint: options.endpoint,
@@ -193,7 +197,6 @@ export function createDesktopGovernanceRuntime(options: {
   });
   const unsubscribeFailure = transport.onConnectionFailure(() => {
     const roomIds = cache.roomIds();
-    cache.clear();
     for (const roomId of roomIds) {
       invocations.markOffline(roomId);
       feed.offline({ roomId, asOf: now() });
@@ -204,6 +207,8 @@ export function createDesktopGovernanceRuntime(options: {
     controller,
     invocations,
     cache,
+    repairRoom(roomId: string) { return replica.repairRoom(roomId); },
+    restoreCache(actorId: string) { return cache.restore(actorId); },
     invalidateAuthorizedState() {
       const roomIds = cache.roomIds();
       cache.clear();

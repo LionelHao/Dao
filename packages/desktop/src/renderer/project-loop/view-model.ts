@@ -127,7 +127,10 @@ export function createProjectLoopViewModel(
     confirmableProposals,
     empty: facts.length === 0 && state.snapshot.proposals.length === 0 &&
       state.snapshot.transferProposals.length === 0 && state.snapshot.balls.length === 0,
-    mutationDisabled: state.connection.status !== "online" || state.operation.status === "submitting",
+    mutationDisabled: state.connection.status !== "online" || state.operation.status === "submitting" ||
+      state.operation.status === "failed" &&
+        (state.operation.error.status === 401 || state.operation.error.status === 403 ||
+          state.operation.error.status === 410),
     announcement: announcement(state),
   });
 }

@@ -36,6 +36,7 @@ import { registerAgentSettingsIpc } from "./agent-profile-routing/ipc.js";
 import { registerInvocationIpc } from "./invocation-runtime/ipc.js";
 import { createDesktopProjectLoopRuntime } from "./project-loop/production-runtime.js";
 import { registerProjectLoopIpc } from "./project-loop/ipc.js";
+import { createEncryptedAuthorityCachePersistence } from "./governance/encrypted-authority-cache.js";
 import { createDesktopAttachmentAuthorityRuntime } from "./attachment-authority/production-runtime.js";
 import {
   createElectronAttachmentPorts,
@@ -107,17 +108,18 @@ async function createWindow(): Promise<void> {
   try {
     installWindowSecurityPolicy(window);
     const identityPlatform = identityPlatformFromNode(process.platform);
+    const desktopEncryption = createSafeStorageEncryption({
+      isEncryptionAvailable: () => safeStorage.isEncryptionAvailable(),
+      getSelectedStorageBackend: () => safeStorage.getSelectedStorageBackend(),
+      encryptString: (plaintext) => safeStorage.encryptString(plaintext),
+      decryptString: (ciphertext) => safeStorage.decryptString(Buffer.from(ciphertext)),
+    }, identityPlatform);
     identity = createDesktopIdentityRuntime({
       dataDirectory: app.getPath("userData"),
       deviceLabel: createIdentityDeviceLabel(app.getName(), hostname()),
       platform: identityPlatform,
       endpoint: process.env.NATIVE_IM_IDENTITY_WS_URL ?? "ws://127.0.0.1:8787",
-      encryption: createSafeStorageEncryption({
-        isEncryptionAvailable: () => safeStorage.isEncryptionAvailable(),
-        getSelectedStorageBackend: () => safeStorage.getSelectedStorageBackend(),
-        encryptString: (plaintext) => safeStorage.encryptString(plaintext),
-        decryptString: (ciphertext) => safeStorage.decryptString(Buffer.from(ciphertext)),
-      }, identityPlatform),
+      encryption: desktopEncryption,
       webSocketFactory: (endpoint) => new WebSocket(endpoint),
       ipcMain,
       webContents: window.webContents,
@@ -140,6 +142,10 @@ async function createWindow(): Promise<void> {
       createRequestIdentity: () => ({
         requestId: `governance-${randomUUID()}`,
         idempotencyKey: randomUUID(),
+      }),
+      cachePersistence: createEncryptedAuthorityCachePersistence({
+        filePath: join(app.getPath("userData"), "authority-cache.v1.enc"),
+        encryption: desktopEncryption,
       }),
     });
     disposeGovernanceIpc = registerGovernanceIpc({
@@ -201,6 +207,9 @@ async function createWindow(): Promise<void> {
     projectLoop = createDesktopProjectLoopRuntime({
       session: () => identity?.getCurrentAuthoritySession(),
       transport: messageAuthorityRuntime.transport,
+      authorityCache: governance.cache,
+      repairRoom: (roomId) => governance!.repairRoom(roomId),
+      restoreAuthorityCache: (actorId) => governance!.restoreCache(actorId),
       createRequestIdentity: () => ({
         requestId: `project-loop-${randomUUID()}`,
         idempotencyKey: randomUUID(),

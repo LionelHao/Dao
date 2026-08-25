@@ -110,7 +110,9 @@ const DEFAULT_PORTS: DesktopRendererEntryPorts = Object.freeze({
         const selector = segment === "timeline" ? ".room-authority-workspace__timeline"
           : segment === "project" ? ".room-authority-workspace__project"
             : ".room-authority-workspace__memory";
-        const target = root.closest(".room-authority-workspace")?.querySelector<HTMLElement>(selector);
+        const workspace = root.closest<HTMLElement>(".room-authority-workspace");
+        if (workspace !== null) workspace.dataset.compactSegment = segment === "timeline" ? "timeline" : "project";
+        const target = workspace?.querySelector<HTMLElement>(selector);
         if (target !== null && target !== undefined) { target.tabIndex = -1; target.focus(); }
       },
       onReauthenticate: () => navigateRenderer(""),
@@ -315,6 +317,26 @@ export function mountDesktopRendererEntry(
     if (project !== undefined) {
       project.className = "room-authority-workspace__project";
       project.setAttribute("aria-label", "Room Project");
+      workspace.dataset.compactSegment = "timeline";
+      const segments = document.createElement("nav");
+      segments.className = "room-authority-workspace__segments";
+      segments.setAttribute("aria-label", "最小窗口内容分段");
+      for (const [value, label] of [["timeline", "时间线"], ["project", "项目"]] as const) {
+        const segment = document.createElement("button"); segment.type = "button"; segment.textContent = label;
+        segment.dataset.compactSegmentTarget = value;
+        segment.setAttribute("aria-pressed", String(value === "timeline"));
+        segment.addEventListener("click", () => {
+          workspace.dataset.compactSegment = value;
+          for (const candidate of segments.querySelectorAll<HTMLButtonElement>("button")) {
+            candidate.setAttribute("aria-pressed", String(candidate === segment));
+          }
+          const destination = workspace.querySelector<HTMLElement>(value === "timeline"
+            ? ".room-authority-workspace__timeline" : ".room-authority-workspace__project");
+          if (destination !== null) { destination.tabIndex = -1; destination.focus(); }
+        });
+        segments.append(segment);
+      }
+      workspace.append(segments);
     }
     const executions = invocation === undefined || ports.mountInvocationSurface === undefined
       ? undefined : document.createElement("aside");

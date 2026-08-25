@@ -6,6 +6,7 @@ import type { AttachmentAuthorityBridge } from "../attachment-authority/contract
 import type { MemoryAuthorityBridge } from "../memory-authority/contracts.js";
 import type { AgentSettingsBridge } from "../agent-profile-routing/contracts.js";
 import type { InvocationBridge } from "../invocation-runtime/contracts.js";
+import type { ProjectLoopBridge } from "../project-loop/contracts.js";
 import { mountDesktopRendererEntry } from "./entry.js";
 
 const bridge = {} as IdentityBridge;
@@ -15,6 +16,7 @@ const attachmentAuthority = {} as AttachmentAuthorityBridge;
 const memoryAuthority = {} as MemoryAuthorityBridge;
 const agentSettings = {} as AgentSettingsBridge;
 const invocation = {} as InvocationBridge;
+const projectLoop = {} as ProjectLoopBridge;
 
 function ports() {
   return {
@@ -27,6 +29,7 @@ function ports() {
     mountMemoryAuthoritySurface: vi.fn(() => vi.fn()),
     mountAgentSettingsSurface: vi.fn(() => vi.fn()),
     mountInvocationSurface: vi.fn(() => vi.fn()),
+    mountProjectLoopSurface: vi.fn(() => vi.fn()),
   };
 }
 
@@ -222,6 +225,31 @@ describe("Desktop renderer route entry", () => {
     window.removeEventListener("popstate", popstate);
     dispose?.();
     expect(disposeInvocation).toHaveBeenCalledOnce();
+    root.remove();
+  });
+
+  it("mounts the reviewed three-column Project shell with an atomic 840px segment control", () => {
+    const root = document.createElement("main"); const renderers = ports();
+    document.body.append(root);
+    const dispose = mountDesktopRendererEntry(
+      root, "?message-room=room-1", bridge, governance, messageAuthority, renderers,
+      undefined, memoryAuthority, agentSettings, invocation, projectLoop,
+    );
+    const workspace = root.querySelector<HTMLElement>(".room-authority-workspace")!;
+    const timeline = workspace.querySelector<HTMLElement>(".room-authority-workspace__timeline")!;
+    const project = workspace.querySelector<HTMLElement>(".room-authority-workspace__project")!;
+    expect(renderers.mountProjectLoopSurface).toHaveBeenCalledWith(project, projectLoop, "room-1");
+    expect(workspace.dataset.compactSegment).toBe("timeline");
+    const projectSegment = workspace.querySelector<HTMLButtonElement>(
+      '[data-compact-segment-target="project"]',
+    )!;
+    projectSegment.click();
+    expect(workspace.dataset.compactSegment).toBe("project");
+    expect(projectSegment.getAttribute("aria-pressed")).toBe("true");
+    expect(document.activeElement).toBe(project);
+    expect(workspace.querySelector('[data-compact-segment-target="timeline"]')?.textContent).toBe("时间线");
+    expect(timeline.className).toContain("timeline");
+    dispose?.();
     root.remove();
   });
 

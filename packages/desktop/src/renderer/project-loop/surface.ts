@@ -25,8 +25,14 @@ const LABELS: Readonly<Record<ProjectLoopCategory, string>> = {
   goals: "目标", decisions: "决策", requests: "请求", obstacles: "阻塞与问题",
   next_actions: "下一步", ball: "Ball / NeedsAction",
 };
-function button(text: string, action: () => void, disabled = false): HTMLButtonElement {
+const SURFACE_UI = new WeakMap<HTMLElement, {
+  activeCategory: ProjectLoopCategory;
+  escapeControlId?: string;
+  externalFocus?: HTMLElement;
+}>();
+function button(text: string, action: () => void, disabled = false, controlId?: string): HTMLButtonElement {
   const value = document.createElement("button"); value.type = "button"; value.textContent = text;
+  if (controlId !== undefined) value.dataset.projectControlId = controlId;
   value.disabled = disabled; value.addEventListener("click", action); return value;
 }
 function proposalTitle(proposal: ProjectProposal): string {
@@ -57,7 +63,12 @@ export function renderProjectLoopSurface(root: HTMLElement, state: ProjectLoopRe
   if (state.status === "locked") { renderLocked(root, state, actions); return; }
   const vm = createProjectLoopViewModel(state);
   const priorFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-  let activeCategory = options.activeCategory ?? "goals";
+  const retained = SURFACE_UI.get(root) ?? { activeCategory: options.activeCategory ?? "goals" };
+  if (priorFocus !== null && root.contains(priorFocus) && priorFocus.dataset.projectControlId !== undefined) {
+    retained.escapeControlId = priorFocus.dataset.projectControlId;
+  } else if (priorFocus !== null && !root.contains(priorFocus)) retained.externalFocus = priorFocus;
+  let activeCategory = options.activeCategory ?? retained.activeCategory;
+  retained.activeCategory = activeCategory; SURFACE_UI.set(root, retained);
   const panel = document.createElement("section"); panel.className = "project-loop";
   panel.dataset.projectLoopStatus = state.connection.status; panel.dataset.reducedMotion = String(options.reducedMotion === true);
   panel.dataset.roomId = vm.roomId; panel.dataset.minimumViewport = "840x560"; panel.dataset.zoomContract = "100-200";
@@ -70,12 +81,16 @@ export function renderProjectLoopSurface(root: HTMLElement, state: ProjectLoopRe
   announcement.setAttribute("aria-live", "polite");
   announcement.setAttribute("role", state.operation.status === "failed" ? "alert" : "status");
   announcement.textContent = vm.announcement;
+  const sourceStatus = document.createElement("p"); sourceStatus.className = "project-loop__source-status";
+  sourceStatus.setAttribute("role", "status"); sourceStatus.setAttribute("aria-live", "polite");
   const tabs = document.createElement("div"); tabs.className = "project-loop__tabs";
   tabs.setAttribute("role", "tablist"); tabs.setAttribute("aria-label", "Project 分类");
   const content = document.createElement("section"); content.className = "project-loop__content";
   const sourceButton = (source: ProjectSourceRef): HTMLButtonElement => {
     const value = button(`查看来源 ${source.kind}:${source.sourceId} r${source.sourceRevision}`,
-      () => actions.onOpenSource(source)); value.className = "project-loop__source"; return value;
+      () => actions.onOpenSource(source), false,
+      `source:${source.kind}:${source.sourceId}:r${source.sourceRevision}`);
+    value.className = "project-loop__source"; return value;
   };
   const renderRequest = (list: HTMLUListElement, request: ProjectRequest): void => {
     const item = document.createElement("li"); item.dataset.projectFactKind = request.kind;
@@ -88,11 +103,12 @@ export function renderProjectLoopSurface(root: HTMLElement, state: ProjectLoopRe
       if (request.target.actorId === state.viewerActorId) {
         item.append(button("接受请求", () => actions.onIntent({ kind: "request.transition",
           intentId: `accept:${request.requestId}:${request.revision}`, factId: request.requestId,
-          expectedRevision: request.revision, action: "accept" }), vm.mutationDisabled));
+          expectedRevision: request.revision, action: "accept" }), vm.mutationDisabled,
+        `request:${request.requestId}:accept`));
         item.append(button("拒绝请求", () => actions.onIntent({ kind: "request.transition",
           intentId: `reject:${request.requestId}:${request.revision}`, factId: request.requestId,
           expectedRevision: request.revision, action: "reject", reason: "Rejected by target Human from Desktop" }),
-        vm.mutationDisabled));
+        vm.mutationDisabled, `request:${request.requestId}:reject`));
         const label = document.createElement("label"); label.textContent = "转交给 Human actorId";
         const target = document.createElement("input"); target.type = "text"; target.autocomplete = "off";
         target.dataset.requestTransferTarget = request.requestId; label.append(target);
@@ -103,13 +119,13 @@ export function renderProjectLoopSurface(root: HTMLElement, state: ProjectLoopRe
             intentId: `transfer:${request.requestId}:${request.revision}:${actorId}`, factId: request.requestId,
             expectedRevision: request.revision, action: "transfer", target: { kind: "human", actorId },
             reason: "Transferred by target Human from Desktop" });
-        }, vm.mutationDisabled));
+        }, vm.mutationDisabled, `request:${request.requestId}:transfer`));
       }
       if (request.requester.actorId === state.viewerActorId) item.append(button("取消请求", () => actions.onIntent({
         kind: "request.transition", intentId: `cancel:${request.requestId}:${request.revision}`,
         factId: request.requestId, expectedRevision: request.revision, action: "cancel",
         reason: "Cancelled by requester Human from Desktop",
-      }), vm.mutationDisabled));
+      }), vm.mutationDisabled, `request:${request.requestId}:cancel`));
     }
     list.append(item);
   };
@@ -136,13 +152,29 @@ export function renderProjectLoopSurface(root: HTMLElement, state: ProjectLoopRe
       else if ("statement" in entry) summary.textContent = `${entry.statement} · ${entry.status}`;
       else summary.textContent = `${entry.boundaryKind} · ${entry.reason} · ${entry.holder.kind}:${entry.holder.actorId}` +
         `${entry.dueAt === null ? "" : ` · 截止 ${entry.dueAt}`}${entry.reviewAt === null ? "" : ` · 复核 ${entry.reviewAt}`}`;
-      item.append(summary); if ("provenance" in entry) item.append(sourceButton(entry.provenance.source)); list.append(item);
+      item.append(summary);
+      if ("kind" in entry && (entry.kind === "goal" || entry.kind === "decision")) {
+        const audit = document.createElement("p"); audit.className = "project-loop__fact-audit";
+        const supersedes = entry.kind === "goal" ? entry.supersedesGoalId : entry.supersedesDecisionId;
+        const supersededBy = entry.kind === "goal" ? entry.supersededByGoalId : entry.supersededByDecisionId;
+        audit.textContent = [
+          entry.confirmedBy === null ? null : `confirmed by ${entry.confirmedBy.actorId} at ${entry.confirmedAt}`,
+          entry.rejectedBy === null ? null : `rejected by ${entry.rejectedBy.actorId} at ${entry.rejectedAt}: ${entry.rejectionReason}`,
+          supersedes === null ? null : `supersedes ${supersedes}: ${entry.supersedeReason}`,
+          supersededBy === null ? null : `superseded by ${supersededBy}: ${entry.supersedeReason}`,
+          entry.kind === "decision" && entry.affectedFactIds.length > 0
+            ? `affected facts ${entry.affectedFactIds.join(", ")}` : null,
+        ].filter((value): value is string => value !== null).join(" · ") || "尚无具名确认或替代审计";
+        item.append(audit);
+      }
+      if ("provenance" in entry) item.append(sourceButton(entry.provenance.source)); list.append(item);
     }
     content.append(list);
   };
   for (const category of CATEGORIES) {
     const tab = button(LABELS[category], () => {
       activeCategory = category;
+      retained.activeCategory = category;
       for (const candidate of tabs.querySelectorAll<HTMLButtonElement>("button")) {
         const selected = candidate.dataset.category === category;
         candidate.setAttribute("aria-selected", String(selected)); candidate.tabIndex = selected ? 0 : -1;
@@ -156,21 +188,41 @@ export function renderProjectLoopSurface(root: HTMLElement, state: ProjectLoopRe
   }
   renderCategory();
   const proposals = document.createElement("section"); proposals.className = "project-loop__proposals";
-  const proposalHeading = document.createElement("h3"); proposalHeading.textContent = "待具名 Human 确认"; proposals.append(proposalHeading);
-  if (vm.confirmableProposals.length === 0) { const empty = document.createElement("p");
-    empty.textContent = "没有由你确认的 proposal"; proposals.append(empty); }
-  for (const proposal of vm.confirmableProposals) {
+  const proposalHeading = document.createElement("h3"); proposalHeading.textContent = "Proposal 与具名确认"; proposals.append(proposalHeading);
+  if (vm.proposals.length === 0) { const empty = document.createElement("p");
+    empty.textContent = "暂无 proposal"; proposals.append(empty); }
+  for (const proposal of vm.proposals) {
     const card = document.createElement("article"); card.dataset.proposalId = proposal.proposalId;
     card.dataset.authority = "proposal-not-fact"; const title = document.createElement("h4"); title.textContent = proposalTitle(proposal);
-    const authority = document.createElement("p"); authority.textContent = "PROPOSAL · 尚不是权威事实";
-    const confirm = button("确认成为项目事实", () => actions.onIntent({ kind: "proposal.resolve",
-      intentId: `confirm:${proposal.proposalId}:${proposal.revision}`, proposalId: proposal.proposalId,
-      expectedRevision: proposal.revision, resolution: "confirmed", reason: null }), vm.mutationDisabled);
-    const reject = button("拒绝", () => actions.onIntent({ kind: "proposal.resolve",
-      intentId: `reject:${proposal.proposalId}:${proposal.revision}`, proposalId: proposal.proposalId,
-      expectedRevision: proposal.revision, resolution: "rejected", reason: "Rejected by named Human from Desktop" }),
-    vm.mutationDisabled);
-    card.append(title, authority, sourceButton(proposal.provenance.source), confirm, reject); proposals.append(card);
+    const authority = document.createElement("p"); authority.textContent =
+      `PROPOSAL · 尚不是权威事实 · ${proposal.state} · principal ${proposal.principalActorId} · expires ${proposal.expiresAt}` +
+      `${proposal.resolvedAt === null ? "" : ` · resolved ${proposal.resolvedAt}`}` +
+      `${proposal.resolutionReason === null ? "" : ` · ${proposal.resolutionReason}`}`;
+    card.append(title, authority, sourceButton(proposal.provenance.source));
+    if (proposal.state === "pending" && proposal.principalActorId === state.viewerActorId) {
+      card.append(button("确认成为项目事实", () => actions.onIntent({ kind: "proposal.resolve",
+        intentId: `confirm:${proposal.proposalId}:${proposal.revision}`, proposalId: proposal.proposalId,
+        expectedRevision: proposal.revision, resolution: "confirmed", reason: null }), vm.mutationDisabled,
+      `proposal:${proposal.proposalId}:confirm`));
+      card.append(button("拒绝", () => actions.onIntent({ kind: "proposal.resolve",
+        intentId: `reject:${proposal.proposalId}:${proposal.revision}`, proposalId: proposal.proposalId,
+        expectedRevision: proposal.revision, resolution: "rejected", reason: "Rejected by named Human from Desktop" }),
+      vm.mutationDisabled, `proposal:${proposal.proposalId}:reject`));
+    }
+    proposals.append(card);
+  }
+  const confirmations = document.createElement("section"); confirmations.className = "project-loop__confirmations";
+  const confirmationHeading = document.createElement("h3"); confirmationHeading.textContent = "Confirmation 审计";
+  confirmations.append(confirmationHeading);
+  if (vm.confirmations.length === 0) { const empty = document.createElement("p"); empty.textContent = "暂无 confirmation";
+    confirmations.append(empty); }
+  for (const confirmation of vm.confirmations) {
+    const card = document.createElement("article"); card.dataset.confirmationId = confirmation.confirmationId;
+    card.textContent = `CONFIRMATION · ${confirmation.state} · principal ${confirmation.principalActorId}` +
+      `${confirmation.resolvedBy === null ? "" : ` · resolved by ${confirmation.resolvedBy.actorId}`}` +
+      `${confirmation.resolvedAt === null ? "" : ` at ${confirmation.resolvedAt}`}` +
+      `${confirmation.resolutionReason === null ? "" : ` · ${confirmation.resolutionReason}`}`;
+    confirmations.append(card);
   }
   const transfers = document.createElement("section"); transfers.className = "project-loop__transfers";
   const transferHeading = document.createElement("h3"); transferHeading.textContent = "Ball 转交提案"; transfers.append(transferHeading);
@@ -203,7 +255,12 @@ export function renderProjectLoopSurface(root: HTMLElement, state: ProjectLoopRe
       activeCategory = CATEGORIES[(current + delta + CATEGORIES.length) % CATEGORIES.length]!;
       tabs.querySelector<HTMLButtonElement>(`button[data-category="${activeCategory}"]`)?.click();
     } else if (event.key === "Escape") { event.preventDefault();
-      if (priorFocus?.isConnected) priorFocus.focus(); else tabs.querySelector<HTMLButtonElement>('button[aria-selected="true"]')?.focus(); }
+      const replacement = retained.escapeControlId === undefined ? null
+        : [...panel.querySelectorAll<HTMLButtonElement>("[data-project-control-id]")]
+          .find((candidate) => candidate.dataset.projectControlId === retained.escapeControlId && !candidate.disabled) ?? null;
+      if (replacement !== null) replacement.focus();
+      else if (retained.externalFocus?.isConnected) retained.externalFocus.focus();
+      else tabs.querySelector<HTMLButtonElement>('button[aria-selected="true"]')?.focus(); }
   });
   tabs.addEventListener("keydown", (event) => {
     const values = [...tabs.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
@@ -214,5 +271,6 @@ export function renderProjectLoopSurface(root: HTMLElement, state: ProjectLoopRe
         : event.key === "End" ? values.length - 1 : -1;
     if (destination >= 0) { event.preventDefault(); values[destination]?.click(); values[destination]?.focus(); }
   });
-  panel.append(header, announcement, tabs, content, proposals, transfers); root.replaceChildren(panel);
+  panel.append(header, announcement, sourceStatus, tabs, content, proposals, confirmations, transfers);
+  root.replaceChildren(panel);
 }
