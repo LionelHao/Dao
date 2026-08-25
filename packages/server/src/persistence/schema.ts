@@ -7,7 +7,7 @@ import {
 } from "../access/room-cache-invalidation-port.js";
 import { OFFLINE_READ_LEASE_SCHEMA_STATEMENTS } from "../access/offline-lease-invalidation-port.js";
 
-export const AUTHORITY_SCHEMA_VERSION = 23 as const;
+export const AUTHORITY_SCHEMA_VERSION = 24 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -75,6 +75,7 @@ const SCHEMA_FINGERPRINTS = {
   21: "dca0a24a346060b1e04b98ee5a73e016421796d6c13bd0bd2841179f405c44af",
   22: "cbf4ccb27b52c3b88d61667f94811501d36a54795391e0044bbb0b2f41d3c7ce",
   23: "532b7c0589c5ae2f4cb96c43747b19e3a7c83c2f04fd9fea663191ea5a46aced",
+  24: "ef4c3593ee4384350f57c1f92e6d229c523b4c99817f95222718c4abe10db896",
 } as const;
 
 const V1_STATEMENTS = [
@@ -7985,6 +7986,445 @@ export const AUTHORITY_V23_MIGRATION_CHECKSUM_FOR_TEST = migrationChecksum(
   V23_STATEMENTS,
 );
 
+const V24_STATEMENTS = [
+  `CREATE UNIQUE INDEX project_ball_boundaries_invocation_binding_v24
+   ON project_ball_boundaries (
+     boundary_id, room_id, project_id, source_kind, source_id, source_revision,
+     lifecycle_generation, holder_actor_id
+   )`,
+  `CREATE TABLE project_boundary_agent_invocation_intents (
+    intent_id TEXT PRIMARY KEY CHECK (length(trim(intent_id)) BETWEEN 1 AND 256),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    project_id TEXT NOT NULL REFERENCES rooms(id) CHECK (project_id = room_id),
+    boundary_id TEXT NOT NULL REFERENCES project_ball_boundaries(boundary_id),
+    boundary_kind TEXT NOT NULL CHECK (
+      boundary_kind IN ('checkpoint', 'due', 'blocker', 'agent_ball')
+    ),
+    source_kind TEXT NOT NULL CHECK (source_kind IN (
+      'request', 'next_action', 'blocker', 'open_question',
+      'confirmation', 'transfer', 'review', 'due'
+    )),
+    source_id TEXT NOT NULL CHECK (length(trim(source_id)) BETWEEN 1 AND 256),
+    source_revision INTEGER NOT NULL CHECK (source_revision > 0),
+    lifecycle_generation INTEGER NOT NULL CHECK (lifecycle_generation >= 0),
+    target_agent_actor_id TEXT NOT NULL REFERENCES actors(id),
+    profile_id TEXT NOT NULL REFERENCES agent_profiles(id),
+    profile_revision INTEGER NOT NULL CHECK (profile_revision > 0),
+    assignment_id TEXT NOT NULL REFERENCES room_agent_assignments(id),
+    assignment_revision INTEGER NOT NULL CHECK (assignment_revision > 0),
+    access_revision INTEGER NOT NULL CHECK (access_revision >= 0),
+    lineage_id TEXT NOT NULL CHECK (length(trim(lineage_id)) BETWEEN 1 AND 256),
+    turn_id TEXT NOT NULL CHECK (length(trim(turn_id)) BETWEEN 1 AND 256),
+    request_sha256 TEXT NOT NULL CHECK (
+      length(request_sha256) = 64 AND request_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'claimed', 'cancelled')),
+    authority_version INTEGER NOT NULL CHECK (authority_version >= 1),
+    created_at TEXT NOT NULL CHECK (length(trim(created_at)) > 0),
+    claimed_at TEXT,
+    cancelled_at TEXT,
+    cancellation_reason TEXT CHECK (
+      cancellation_reason IS NULL OR cancellation_reason IN (
+        'room_archived', 'membership_revoked', 'assignment_revoked',
+        'profile_disabled', 'capability_revoked', 'source_ineligible',
+        'runtime_shutdown', 'boundary_superseded', 'boundary_resolved'
+      )
+    ),
+    updated_at TEXT NOT NULL CHECK (length(trim(updated_at)) > 0),
+    UNIQUE (boundary_id, source_revision, lifecycle_generation),
+    UNIQUE (intent_id, source_revision, lifecycle_generation),
+    FOREIGN KEY (
+      boundary_id, room_id, project_id, source_kind, source_id, source_revision,
+      lifecycle_generation, target_agent_actor_id
+    ) REFERENCES project_ball_boundaries (
+      boundary_id, room_id, project_id, source_kind, source_id, source_revision,
+      lifecycle_generation, holder_actor_id
+    ),
+    FOREIGN KEY (boundary_id, source_revision)
+      REFERENCES project_agent_boundary_claims(boundary_id, source_revision),
+    FOREIGN KEY (profile_id, profile_revision)
+      REFERENCES agent_profile_revisions(profile_id, revision),
+    FOREIGN KEY (assignment_id, assignment_revision)
+      REFERENCES room_agent_assignment_revisions(assignment_id, revision),
+    CHECK (
+      (status = 'pending' AND claimed_at IS NULL AND cancelled_at IS NULL
+       AND cancellation_reason IS NULL)
+      OR (status = 'claimed' AND claimed_at IS NOT NULL AND cancelled_at IS NULL
+          AND cancellation_reason IS NULL)
+      OR (status = 'cancelled' AND cancelled_at IS NOT NULL
+          AND cancellation_reason IS NOT NULL)
+    )
+  ) STRICT`,
+  `CREATE INDEX project_boundary_agent_invocation_pending_v24
+   ON project_boundary_agent_invocation_intents (
+     status, created_at, intent_id
+   )`,
+  `CREATE TRIGGER project_boundary_agent_invocation_intents_v24_validate_insert
+   BEFORE INSERT ON project_boundary_agent_invocation_intents
+   WHEN NEW.authority_version <> 1
+      OR NOT EXISTS (
+        SELECT 1
+        FROM project_ball_boundaries AS boundary
+        JOIN project_agent_boundary_claims AS claim
+          ON claim.boundary_id = boundary.boundary_id
+         AND claim.source_revision = boundary.source_revision
+        JOIN rooms AS room ON room.id = boundary.room_id
+        JOIN actors AS actor ON actor.id = boundary.holder_actor_id
+        JOIN room_memberships AS membership
+          ON membership.room_id = boundary.room_id
+         AND membership.actor_id = boundary.holder_actor_id
+        JOIN agent_profiles AS profile ON profile.id = NEW.profile_id
+        JOIN agent_profile_revisions AS profile_revision
+          ON profile_revision.profile_id = NEW.profile_id
+         AND profile_revision.revision = NEW.profile_revision
+        JOIN room_agent_assignments AS assignment ON assignment.id = NEW.assignment_id
+        JOIN room_agent_assignment_revisions AS assignment_revision
+          ON assignment_revision.assignment_id = NEW.assignment_id
+         AND assignment_revision.revision = NEW.assignment_revision
+        WHERE boundary.boundary_id = NEW.boundary_id
+          AND boundary.room_id = NEW.room_id
+          AND boundary.project_id = NEW.project_id
+          AND boundary.source_kind = NEW.source_kind
+          AND boundary.source_id = NEW.source_id
+          AND boundary.source_revision = NEW.source_revision
+          AND boundary.lifecycle_generation = NEW.lifecycle_generation
+          AND boundary.holder_kind = 'agent'
+          AND boundary.holder_actor_id = NEW.target_agent_actor_id
+          AND boundary.status = 'active'
+          AND room.status = 'active'
+          AND room.archive_generation = NEW.lifecycle_generation
+          AND actor.kind = 'agent'
+          AND membership.kind = 'agent'
+          AND membership.participation = 'active'
+          AND membership.access_revision = NEW.access_revision
+          AND profile.actor_id = NEW.target_agent_actor_id
+          AND profile.revision = NEW.profile_revision
+          AND profile.status = 'enabled'
+          AND profile_revision.actor_id = NEW.target_agent_actor_id
+          AND profile_revision.status = 'enabled'
+          AND assignment.room_id = NEW.room_id
+          AND assignment.profile_id = NEW.profile_id
+          AND assignment.agent_actor_id = NEW.target_agent_actor_id
+          AND assignment.revision = NEW.assignment_revision
+          AND assignment.status = 'current'
+          AND assignment.participation = 'active'
+          AND assignment.paused = 0
+          AND assignment_revision.room_id = NEW.room_id
+          AND assignment_revision.profile_id = NEW.profile_id
+          AND assignment_revision.agent_actor_id = NEW.target_agent_actor_id
+          AND assignment_revision.status = 'current'
+          AND assignment_revision.participation = 'active'
+          AND assignment_revision.paused = 0
+          AND EXISTS (
+            SELECT 1 FROM json_each(assignment.capability_subset_json)
+            WHERE value = 'room.project.read'
+          )
+          AND EXISTS (
+            SELECT 1 FROM json_each(assignment.capability_subset_json)
+            WHERE value = 'room.respond'
+          )
+          AND claim.room_id = NEW.room_id
+          AND claim.holder_agent_actor_id = NEW.target_agent_actor_id
+          AND claim.request_sha256 = NEW.request_sha256
+          AND claim.status IN ('claimed', 'consumed')
+      )
+   BEGIN
+     SELECT RAISE(ABORT, 'Project boundary Agent invocation authority is invalid or stale');
+   END`,
+  `CREATE TRIGGER project_boundary_agent_invocation_intents_v24_validate_update
+   BEFORE UPDATE ON project_boundary_agent_invocation_intents
+   WHEN NEW.intent_id <> OLD.intent_id
+      OR NEW.room_id <> OLD.room_id
+      OR NEW.project_id <> OLD.project_id
+      OR NEW.boundary_id <> OLD.boundary_id
+      OR NEW.boundary_kind <> OLD.boundary_kind
+      OR NEW.source_kind <> OLD.source_kind
+      OR NEW.source_id <> OLD.source_id
+      OR NEW.source_revision <> OLD.source_revision
+      OR NEW.lifecycle_generation <> OLD.lifecycle_generation
+      OR NEW.target_agent_actor_id <> OLD.target_agent_actor_id
+      OR NEW.profile_id <> OLD.profile_id
+      OR NEW.profile_revision <> OLD.profile_revision
+      OR NEW.assignment_id <> OLD.assignment_id
+      OR NEW.assignment_revision <> OLD.assignment_revision
+      OR NEW.access_revision <> OLD.access_revision
+      OR NEW.lineage_id <> OLD.lineage_id
+      OR NEW.turn_id <> OLD.turn_id
+      OR NEW.request_sha256 <> OLD.request_sha256
+      OR NEW.created_at <> OLD.created_at
+      OR NEW.authority_version <> OLD.authority_version + 1
+      OR OLD.status = 'cancelled'
+      OR (OLD.status = 'pending' AND NEW.status NOT IN ('claimed', 'cancelled'))
+      OR (OLD.status = 'claimed' AND NEW.status <> 'cancelled')
+      OR (OLD.status = 'pending' AND NEW.status = 'claimed'
+          AND (NEW.claimed_at IS NULL OR NEW.cancelled_at IS NOT NULL
+               OR NEW.cancellation_reason IS NOT NULL))
+      OR (OLD.status = 'pending' AND NEW.status = 'cancelled'
+          AND NEW.claimed_at IS NOT NULL)
+      OR (OLD.status = 'claimed' AND NEW.claimed_at IS NOT OLD.claimed_at)
+   BEGIN
+     SELECT RAISE(ABORT, 'Project boundary Agent invocation transition is invalid');
+   END`,
+  `CREATE TRIGGER project_boundary_agent_invocation_intents_v24_immutable_delete
+   BEFORE DELETE ON project_boundary_agent_invocation_intents
+   BEGIN SELECT RAISE(ABORT, 'Project boundary Agent invocation intent is immutable'); END`,
+  `CREATE TABLE project_boundary_agent_executions (
+    execution_id TEXT PRIMARY KEY CHECK (length(trim(execution_id)) BETWEEN 1 AND 256),
+    intent_id TEXT NOT NULL REFERENCES project_boundary_agent_invocation_intents(intent_id),
+    lineage_id TEXT NOT NULL CHECK (length(trim(lineage_id)) BETWEEN 1 AND 256),
+    execution_ordinal INTEGER NOT NULL CHECK (execution_ordinal >= 1),
+    retry_of_execution_id TEXT REFERENCES project_boundary_agent_executions(execution_id),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    project_id TEXT NOT NULL REFERENCES rooms(id) CHECK (project_id = room_id),
+    agent_actor_id TEXT NOT NULL REFERENCES actors(id),
+    source_revision INTEGER NOT NULL CHECK (source_revision > 0),
+    lifecycle_generation INTEGER NOT NULL CHECK (lifecycle_generation >= 0),
+    provider_id TEXT NOT NULL CHECK (length(trim(provider_id)) BETWEEN 1 AND 128),
+    model_id TEXT NOT NULL CHECK (length(trim(model_id)) BETWEEN 1 AND 256),
+    public_status TEXT NOT NULL CHECK (
+      public_status IN ('accepted', 'running', 'completed', 'failed', 'cancelled')
+    ),
+    phase TEXT NOT NULL CHECK (phase IN (
+      'queued', 'retry_scheduled', 'recovery_queued', 'awaiting_capacity',
+      'claiming', 'snapshot_frozen', 'model_generation', 'read_tool',
+      'waiting_confirmation', 'side_effect_claimed', 'final_committing',
+      'completed', 'failed', 'cancelled'
+    )),
+    current_attempt_seq INTEGER NOT NULL CHECK (current_attempt_seq >= 1),
+    authority_version INTEGER NOT NULL CHECK (authority_version >= 1),
+    queued_at TEXT NOT NULL CHECK (length(trim(queued_at)) > 0),
+    started_at TEXT,
+    updated_at TEXT NOT NULL CHECK (length(trim(updated_at)) > 0),
+    completed_at TEXT,
+    cancellation_reason TEXT CHECK (
+      cancellation_reason IS NULL OR cancellation_reason IN (
+        'room_archived', 'membership_revoked', 'assignment_revoked',
+        'profile_disabled', 'capability_revoked', 'source_ineligible',
+        'runtime_shutdown', 'boundary_superseded', 'boundary_resolved'
+      )
+    ),
+    terminal_error_code TEXT CHECK (
+      terminal_error_code IS NULL OR length(trim(terminal_error_code)) BETWEEN 1 AND 128
+    ),
+    result_message_id TEXT REFERENCES messages(id),
+    UNIQUE (intent_id, execution_ordinal),
+    UNIQUE (
+      intent_id, execution_id, execution_ordinal, source_revision, lifecycle_generation
+    ),
+    FOREIGN KEY (intent_id, source_revision, lifecycle_generation)
+      REFERENCES project_boundary_agent_invocation_intents(
+        intent_id, source_revision, lifecycle_generation
+      ),
+    CHECK (
+      (execution_ordinal = 1 AND retry_of_execution_id IS NULL)
+      OR (execution_ordinal > 1 AND retry_of_execution_id IS NOT NULL)
+    ),
+    CHECK (
+      (public_status = 'accepted'
+       AND phase IN ('queued', 'retry_scheduled', 'recovery_queued', 'awaiting_capacity')
+       AND completed_at IS NULL AND cancellation_reason IS NULL
+       AND terminal_error_code IS NULL)
+      OR (public_status = 'running'
+          AND phase IN ('claiming', 'snapshot_frozen', 'model_generation', 'read_tool',
+                        'waiting_confirmation', 'side_effect_claimed', 'final_committing')
+          AND started_at IS NOT NULL AND completed_at IS NULL
+          AND cancellation_reason IS NULL AND terminal_error_code IS NULL)
+      OR (public_status = 'completed' AND phase = 'completed'
+          AND started_at IS NOT NULL AND completed_at IS NOT NULL
+          AND cancellation_reason IS NULL AND terminal_error_code IS NULL)
+      OR (public_status = 'failed' AND phase = 'failed'
+          AND started_at IS NOT NULL AND completed_at IS NOT NULL
+          AND cancellation_reason IS NULL AND terminal_error_code IS NOT NULL)
+      OR (public_status = 'cancelled' AND phase = 'cancelled'
+          AND completed_at IS NOT NULL AND cancellation_reason IS NOT NULL
+          AND terminal_error_code IS NULL)
+    )
+  ) STRICT`,
+  `CREATE TRIGGER project_boundary_agent_executions_v24_validate_insert
+   BEFORE INSERT ON project_boundary_agent_executions
+   WHEN NEW.authority_version <> 1
+      OR NEW.current_attempt_seq <> 1
+      OR NEW.public_status <> 'accepted'
+      OR NOT EXISTS (
+        SELECT 1 FROM project_boundary_agent_invocation_intents AS intent
+        WHERE intent.intent_id = NEW.intent_id
+          AND intent.status = 'claimed'
+          AND intent.lineage_id = NEW.lineage_id
+          AND intent.room_id = NEW.room_id
+          AND intent.project_id = NEW.project_id
+          AND intent.target_agent_actor_id = NEW.agent_actor_id
+          AND intent.source_revision = NEW.source_revision
+          AND intent.lifecycle_generation = NEW.lifecycle_generation
+      )
+      OR NEW.execution_ordinal <> COALESCE((
+        SELECT MAX(execution_ordinal) + 1
+        FROM project_boundary_agent_executions
+        WHERE intent_id = NEW.intent_id
+      ), 1)
+      OR (NEW.retry_of_execution_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM project_boundary_agent_executions AS parent
+        WHERE parent.intent_id = NEW.intent_id
+          AND parent.execution_id = NEW.retry_of_execution_id
+          AND parent.execution_ordinal < NEW.execution_ordinal
+          AND parent.public_status IN ('failed', 'cancelled')
+      ))
+   BEGIN
+     SELECT RAISE(ABORT, 'Project boundary Agent execution authority is invalid');
+   END`,
+  `CREATE TRIGGER project_boundary_agent_executions_v24_validate_update
+   BEFORE UPDATE ON project_boundary_agent_executions
+   WHEN NEW.execution_id <> OLD.execution_id
+      OR NEW.intent_id <> OLD.intent_id
+      OR NEW.lineage_id <> OLD.lineage_id
+      OR NEW.execution_ordinal <> OLD.execution_ordinal
+      OR NEW.retry_of_execution_id IS NOT OLD.retry_of_execution_id
+      OR NEW.room_id <> OLD.room_id
+      OR NEW.project_id <> OLD.project_id
+      OR NEW.agent_actor_id <> OLD.agent_actor_id
+      OR NEW.source_revision <> OLD.source_revision
+      OR NEW.lifecycle_generation <> OLD.lifecycle_generation
+      OR NEW.provider_id <> OLD.provider_id
+      OR NEW.model_id <> OLD.model_id
+      OR NEW.queued_at <> OLD.queued_at
+      OR NEW.authority_version <> OLD.authority_version + 1
+      OR OLD.public_status IN ('completed', 'failed', 'cancelled')
+      OR (OLD.public_status = 'accepted'
+          AND NEW.public_status NOT IN ('accepted', 'running', 'failed', 'cancelled'))
+      OR (OLD.public_status = 'running'
+          AND NEW.public_status NOT IN ('running', 'completed', 'failed', 'cancelled'))
+      OR NEW.current_attempt_seq < OLD.current_attempt_seq
+   BEGIN
+     SELECT RAISE(ABORT, 'Project boundary Agent execution transition is invalid');
+   END`,
+  `CREATE TRIGGER project_boundary_agent_executions_v24_immutable_delete
+   BEFORE DELETE ON project_boundary_agent_executions
+   BEGIN SELECT RAISE(ABORT, 'Project boundary Agent execution is immutable'); END`,
+  `CREATE TABLE project_boundary_agent_execution_links (
+    intent_id TEXT NOT NULL REFERENCES project_boundary_agent_invocation_intents(intent_id),
+    execution_id TEXT NOT NULL UNIQUE REFERENCES project_boundary_agent_executions(execution_id),
+    execution_ordinal INTEGER NOT NULL CHECK (execution_ordinal >= 1),
+    retry_of_execution_id TEXT REFERENCES project_boundary_agent_executions(execution_id),
+    source_revision INTEGER NOT NULL CHECK (source_revision > 0),
+    lifecycle_generation INTEGER NOT NULL CHECK (lifecycle_generation >= 0),
+    linked_at TEXT NOT NULL CHECK (length(trim(linked_at)) > 0),
+    PRIMARY KEY (intent_id, execution_ordinal),
+    UNIQUE (
+      intent_id, execution_id, execution_ordinal, source_revision, lifecycle_generation
+    ),
+    FOREIGN KEY (intent_id, source_revision, lifecycle_generation)
+      REFERENCES project_boundary_agent_invocation_intents(
+        intent_id, source_revision, lifecycle_generation
+      ),
+    CHECK (
+      (execution_ordinal = 1 AND retry_of_execution_id IS NULL)
+      OR (execution_ordinal > 1 AND retry_of_execution_id IS NOT NULL)
+    )
+  ) STRICT`,
+  `CREATE TRIGGER project_boundary_agent_execution_links_v24_validate_insert
+   BEFORE INSERT ON project_boundary_agent_execution_links
+   WHEN NEW.execution_ordinal <> COALESCE((
+          SELECT MAX(execution_ordinal) + 1
+          FROM project_boundary_agent_execution_links
+          WHERE intent_id = NEW.intent_id
+        ), 1)
+      OR NOT EXISTS (
+        SELECT 1
+        FROM project_boundary_agent_invocation_intents AS intent
+        JOIN project_boundary_agent_executions AS execution
+          ON execution.execution_id = NEW.execution_id
+        WHERE intent.intent_id = NEW.intent_id
+          AND intent.status = 'claimed'
+          AND execution.intent_id = NEW.intent_id
+          AND intent.room_id = execution.room_id
+          AND intent.target_agent_actor_id = execution.agent_actor_id
+          AND intent.lifecycle_generation = execution.lifecycle_generation
+      )
+      OR (NEW.retry_of_execution_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM project_boundary_agent_execution_links AS parent
+        WHERE parent.intent_id = NEW.intent_id
+          AND parent.execution_id = NEW.retry_of_execution_id
+          AND parent.execution_ordinal < NEW.execution_ordinal
+      ))
+   BEGIN
+     SELECT RAISE(ABORT, 'Project boundary Agent execution lineage is invalid');
+   END`,
+  `CREATE TRIGGER project_boundary_agent_execution_links_v24_immutable_update
+   BEFORE UPDATE ON project_boundary_agent_execution_links
+   BEGIN SELECT RAISE(ABORT, 'Project boundary Agent execution lineage is immutable'); END`,
+  `CREATE TRIGGER project_boundary_agent_execution_links_v24_immutable_delete
+   BEFORE DELETE ON project_boundary_agent_execution_links
+   BEGIN SELECT RAISE(ABORT, 'Project boundary Agent execution lineage is immutable'); END`,
+  `CREATE UNIQUE INDEX project_fact_checkpoints_context_binding_v24
+   ON project_fact_checkpoints (
+     checkpoint_id, room_id, project_id, project_revision, projection_sha256
+   )`,
+  `CREATE TABLE project_boundary_context_sources (
+    context_source_id TEXT PRIMARY KEY CHECK (
+      length(trim(context_source_id)) BETWEEN 1 AND 256
+    ),
+    intent_id TEXT NOT NULL,
+    execution_id TEXT NOT NULL UNIQUE REFERENCES project_boundary_agent_executions(execution_id),
+    execution_ordinal INTEGER NOT NULL CHECK (execution_ordinal >= 1),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    project_id TEXT NOT NULL REFERENCES rooms(id) CHECK (project_id = room_id),
+    checkpoint_id TEXT NOT NULL REFERENCES project_fact_checkpoints(checkpoint_id),
+    checkpoint_project_revision INTEGER NOT NULL CHECK (checkpoint_project_revision >= 0),
+    checkpoint_projection_sha256 TEXT NOT NULL CHECK (
+      length(checkpoint_projection_sha256) = 64
+      AND checkpoint_projection_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    source_kind TEXT NOT NULL CHECK (source_kind IN (
+      'request', 'next_action', 'blocker', 'open_question',
+      'confirmation', 'transfer', 'review', 'due'
+    )),
+    source_id TEXT NOT NULL CHECK (length(trim(source_id)) BETWEEN 1 AND 256),
+    source_revision INTEGER NOT NULL CHECK (source_revision > 0),
+    lifecycle_generation INTEGER NOT NULL CHECK (lifecycle_generation >= 0),
+    created_at TEXT NOT NULL CHECK (length(trim(created_at)) > 0),
+    UNIQUE (intent_id, execution_ordinal),
+    FOREIGN KEY (
+      intent_id, execution_id, execution_ordinal, source_revision, lifecycle_generation
+    ) REFERENCES project_boundary_agent_execution_links (
+      intent_id, execution_id, execution_ordinal, source_revision, lifecycle_generation
+    ),
+    FOREIGN KEY (
+      checkpoint_id, room_id, project_id, checkpoint_project_revision,
+      checkpoint_projection_sha256
+    ) REFERENCES project_fact_checkpoints (
+      checkpoint_id, room_id, project_id, project_revision, projection_sha256
+    )
+  ) STRICT`,
+  `CREATE TRIGGER project_boundary_context_sources_v24_validate_insert
+   BEFORE INSERT ON project_boundary_context_sources
+   WHEN NOT EXISTS (
+     SELECT 1 FROM project_boundary_agent_invocation_intents AS intent
+     WHERE intent.intent_id = NEW.intent_id
+       AND intent.room_id = NEW.room_id
+       AND intent.project_id = NEW.project_id
+       AND intent.source_kind = NEW.source_kind
+       AND intent.source_id = NEW.source_id
+       AND intent.source_revision = NEW.source_revision
+       AND intent.lifecycle_generation = NEW.lifecycle_generation
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'Project boundary context source is not bound to its invocation');
+   END`,
+  `CREATE TRIGGER project_boundary_context_sources_v24_immutable_update
+   BEFORE UPDATE ON project_boundary_context_sources
+   BEGIN SELECT RAISE(ABORT, 'Project boundary context source is immutable'); END`,
+  `CREATE TRIGGER project_boundary_context_sources_v24_immutable_delete
+   BEFORE DELETE ON project_boundary_context_sources
+   BEGIN SELECT RAISE(ABORT, 'Project boundary context source is immutable'); END`,
+] as const;
+
+export const AUTHORITY_V24_STATEMENT_COUNT_FOR_TEST = V24_STATEMENTS.length;
+export const AUTHORITY_V24_ROLLBACK_ASSERTION_COUNT_FOR_TEST = V24_STATEMENTS.length;
+export const AUTHORITY_V24_MIGRATION_CHECKSUM_FOR_TEST = migrationChecksum(
+  24,
+  "project-boundary-agent-intent-lineage",
+  V24_STATEMENTS,
+);
+
 export const AUTHORITY_V22_STATEMENT_COUNT_FOR_TEST = V22_STATEMENTS.length;
 export const AUTHORITY_V22_TRIGGER_INVARIANT_STATEMENT_COUNT_FOR_TEST =
   V22_STATEMENTS.filter((statement) => statement.startsWith("CREATE TRIGGER ")).length;
@@ -8445,6 +8885,11 @@ const MIGRATIONS = [
     23,
     "project-loop-authority",
     V23_STATEMENTS,
+  ),
+  defineMigration(
+    24,
+    "project-boundary-agent-intent-lineage",
+    V24_STATEMENTS,
   ),
 ] as const satisfies readonly Migration[];
 
@@ -9377,6 +9822,36 @@ const V23_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V24_SCHEMA_CONTRACT = {
+  ...V23_SCHEMA_CONTRACT,
+  project_boundary_agent_invocation_intents: [
+    "intent_id", "room_id", "project_id", "boundary_id", "boundary_kind",
+    "source_kind", "source_id", "source_revision", "lifecycle_generation",
+    "target_agent_actor_id", "profile_id", "profile_revision", "assignment_id",
+    "assignment_revision", "access_revision", "lineage_id", "turn_id",
+    "request_sha256", "status", "authority_version", "created_at", "claimed_at",
+    "cancelled_at", "cancellation_reason", "updated_at",
+  ],
+  project_boundary_agent_executions: [
+    "execution_id", "intent_id", "lineage_id", "execution_ordinal",
+    "retry_of_execution_id", "room_id", "project_id", "agent_actor_id",
+    "source_revision", "lifecycle_generation", "provider_id", "model_id",
+    "public_status", "phase", "current_attempt_seq", "authority_version",
+    "queued_at", "started_at", "updated_at", "completed_at", "cancellation_reason",
+    "terminal_error_code", "result_message_id",
+  ],
+  project_boundary_agent_execution_links: [
+    "intent_id", "execution_id", "execution_ordinal", "retry_of_execution_id",
+    "source_revision", "lifecycle_generation", "linked_at",
+  ],
+  project_boundary_context_sources: [
+    "context_source_id", "intent_id", "execution_id", "execution_ordinal",
+    "room_id", "project_id", "checkpoint_id", "checkpoint_project_revision",
+    "checkpoint_projection_sha256", "source_kind", "source_id", "source_revision",
+    "lifecycle_generation", "created_at",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
@@ -9401,6 +9876,7 @@ const SCHEMA_CONTRACTS = {
   21: V21_SCHEMA_CONTRACT,
   22: V22_SCHEMA_CONTRACT,
   23: V23_SCHEMA_CONTRACT,
+  24: V24_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -11367,6 +11843,83 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
        WHERE delivery.room_id <> event.room_id OR delivery.event_seq <> event.event_seq
        LIMIT 1`,
       "Project outbox records must retain immutable event identity",
+    );
+  }
+  if (schemaVersion >= 24) {
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM project_boundary_agent_invocation_intents AS intent
+       JOIN project_ball_boundaries AS boundary ON boundary.boundary_id = intent.boundary_id
+       JOIN project_agent_boundary_claims AS claim
+         ON claim.boundary_id = intent.boundary_id
+        AND claim.source_revision = intent.source_revision
+       JOIN agent_profile_revisions AS profile_revision
+         ON profile_revision.profile_id = intent.profile_id
+        AND profile_revision.revision = intent.profile_revision
+       JOIN room_agent_assignment_revisions AS assignment_revision
+         ON assignment_revision.assignment_id = intent.assignment_id
+        AND assignment_revision.revision = intent.assignment_revision
+       WHERE intent.room_id <> intent.project_id
+          OR boundary.room_id <> intent.room_id
+          OR boundary.project_id <> intent.project_id
+          OR boundary.source_kind <> intent.source_kind
+          OR boundary.source_id <> intent.source_id
+          OR boundary.source_revision <> intent.source_revision
+          OR boundary.lifecycle_generation <> intent.lifecycle_generation
+          OR boundary.holder_kind <> 'agent'
+          OR boundary.holder_actor_id <> intent.target_agent_actor_id
+          OR claim.room_id <> intent.room_id
+          OR claim.holder_agent_actor_id <> intent.target_agent_actor_id
+          OR claim.request_sha256 <> intent.request_sha256
+          OR profile_revision.actor_id <> intent.target_agent_actor_id
+          OR assignment_revision.room_id <> intent.room_id
+          OR assignment_revision.profile_id <> intent.profile_id
+          OR assignment_revision.agent_actor_id <> intent.target_agent_actor_id
+       LIMIT 1`,
+      "Project boundary Agent intents must retain exact frozen authority and source lineage",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM project_boundary_agent_execution_links AS link
+       JOIN project_boundary_agent_invocation_intents AS intent
+         ON intent.intent_id = link.intent_id
+       JOIN project_boundary_agent_executions AS execution
+         ON execution.execution_id = link.execution_id
+       WHERE link.source_revision <> intent.source_revision
+          OR link.lifecycle_generation <> intent.lifecycle_generation
+          OR execution.room_id <> intent.room_id
+          OR execution.project_id <> intent.project_id
+          OR execution.agent_actor_id <> intent.target_agent_actor_id
+          OR execution.lifecycle_generation <> intent.lifecycle_generation
+       LIMIT 1`,
+      "Project boundary executions must retain message-independent frozen lineage",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM project_boundary_context_sources AS source
+       JOIN project_boundary_agent_invocation_intents AS intent
+         ON intent.intent_id = source.intent_id
+       JOIN project_boundary_agent_execution_links AS link
+         ON link.intent_id = source.intent_id
+        AND link.execution_id = source.execution_id
+        AND link.execution_ordinal = source.execution_ordinal
+       JOIN project_fact_checkpoints AS checkpoint
+         ON checkpoint.checkpoint_id = source.checkpoint_id
+       WHERE source.room_id <> intent.room_id
+          OR source.project_id <> intent.project_id
+          OR source.source_kind <> intent.source_kind
+          OR source.source_id <> intent.source_id
+          OR source.source_revision <> intent.source_revision
+          OR source.lifecycle_generation <> intent.lifecycle_generation
+          OR checkpoint.room_id <> source.room_id
+          OR checkpoint.project_id <> source.project_id
+          OR checkpoint.project_revision <> source.checkpoint_project_revision
+          OR checkpoint.projection_sha256 <> source.checkpoint_projection_sha256
+       LIMIT 1`,
+      "Project boundary context sources must retain exact checkpoint and execution lineage",
     );
   }
 }
