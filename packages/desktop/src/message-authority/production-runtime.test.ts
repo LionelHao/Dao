@@ -133,7 +133,7 @@ describe("production Desktop Message Authority runtime", () => {
     runtime.close();
   });
 
-  it("forwards real preview/reset frames only as transient room inputs", async () => {
+  it("consumes the server normal-completion reset and keeps transient delivery live", async () => {
     const server = await runtimeServer();
     const runtime = createDesktopMessageAuthorityRuntime({
       endpoint: server.endpoint, session,
@@ -153,14 +153,30 @@ describe("production Desktop Message Authority runtime", () => {
     server.send({ type: "agent.execution.preview.reset", roomId: "room-1",
       executionId: "execution-1", attemptSeq: 1,
       reason: "human_cancelled", authoritative: false });
+    server.send({ type: "agent.execution.preview.reset", roomId: "room-1",
+      executionId: "execution-completed", attemptSeq: 1,
+      reason: "execution_terminal", authoritative: false });
+    server.send({ type: "agent.execution.preview", roomId: "room-1",
+      executionId: "execution-after-complete", attemptSeq: 1, streamSeq: 1,
+      delta: "SOCKET-AND-SUBSCRIPTION-STILL-LIVE", authoritative: false });
 
     await vi.waitFor(() => expect(inputs).toContainEqual({
+      type: "agent.execution.preview", roomId: "room-1",
+      executionId: "execution-after-complete", attemptSeq: 1, streamSeq: 1,
+      delta: "SOCKET-AND-SUBSCRIPTION-STILL-LIVE", authoritative: false,
+    }));
+    expect(inputs).toContainEqual({
       type: "agent.execution.preview", roomId: "room-1", executionId: "execution-1",
       attemptSeq: 1, streamSeq: 1, delta: "PREVIEW-WIRE-SENTINEL", authoritative: false,
-    }));
+    });
     expect(inputs).toContainEqual({
       type: "agent.execution.preview.reset", roomId: "room-1", executionId: "execution-1",
       attemptSeq: 1, reason: "human_cancelled", authoritative: false,
+    });
+    expect(inputs).toContainEqual({
+      type: "agent.execution.preview.reset", roomId: "room-1",
+      executionId: "execution-completed", attemptSeq: 1,
+      reason: "execution_terminal", authoritative: false,
     });
     expect(inputs.filter((input) => (input as { type?: string }).type === "room.event"))
       .toHaveLength(0);

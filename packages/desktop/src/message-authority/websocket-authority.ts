@@ -368,7 +368,9 @@ export function parseMessageAuthorityServerFrame(raw: string): ParsedFrame | und
         count(value.attemptSeq) && value.attemptSeq > 0 &&
         (value.reason === "human_cancelled" || value.reason === "message_recalled" ||
           value.reason === "runtime_shutdown" || value.reason === "repair" ||
-          value.reason === "reconnect") && value.authoritative === false
+          value.reason === "reconnect" || value.reason === "execution_terminal" ||
+          value.reason === "attempt_rolled_over" || value.reason === "access_revoked") &&
+        value.authoritative === false
         ? structuredClone(value) as AgentExecutionPreviewResetInput
         : undefined;
     case "auth.session-revoked":
