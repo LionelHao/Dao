@@ -953,7 +953,7 @@ function cleanupV2Gate(
   clearPreviewVisibility = true,
 ): void {
   const wasCurrent = context.v2GatesByRoom.get(gate.roomId) === gate;
-  if (wasCurrent && clearPreviewVisibility) {
+  if (wasCurrent) {
     context.v2GatesByRoom.delete(gate.roomId);
   }
   if (context.unsubscribersByRoom.get(gate.roomId) === gate.unsubscribe) {
@@ -961,7 +961,7 @@ function cleanupV2Gate(
   }
   safelyUnsubscribe(gate.unsubscribe);
   gate.unsubscribe = undefined;
-  if (wasCurrent) {
+  if (wasCurrent && clearPreviewVisibility) {
     context.previewSubscriptionEpochsByRoom.delete(gate.roomId);
     context.clearPreviewVisibilityIfOrphaned(gate.roomId);
   }
@@ -3249,7 +3249,7 @@ export async function startMessageWebSocketServer(
         },
       });
   let closePromise: Promise<void> | undefined;
-  const previewDeliveryQueues = new Map<string, {
+  type PreviewDeliveryQueue = {
     tail: Promise<void>;
     count: number;
     bytes: number;
@@ -3268,7 +3268,8 @@ export async function startMessageWebSocketServer(
     overflowResetBytes: number;
     scheduledAttempts: Map<string, number>;
     failedClosed: boolean;
-  }>();
+  };
+  const previewDeliveryQueues = new Map<string, PreviewDeliveryQueue>();
   const visiblePreviewAttemptsByRoom = new Map<string, Set<string>>();
   let nextPreviewSubscriptionEpoch = 0;
   const maxPreviewDeliveryCountPerRoom = 64;
@@ -3602,6 +3603,32 @@ export async function startMessageWebSocketServer(
     return deliveries.some(Boolean);
   };
 
+  const drainOverflowResets = async (
+    roomId: string,
+    queue: PreviewDeliveryQueue,
+    generation: number,
+    expectedInFlightCount: number,
+  ): Promise<void> => {
+    while (queue.count === expectedInFlightCount &&
+           queue.overflowResets.size > 0 && !queue.failedClosed) {
+      const next = queue.overflowResets.entries().next().value;
+      if (next === undefined) break;
+      const [resetKey, reset] = next;
+      // Pop and debit before awaiting authority so a concurrently coalesced
+      // marker for the same attempt remains a distinct, newer lifecycle fact.
+      queue.overflowResets.delete(resetKey);
+      queue.overflowResetBytes -= reset.bytes;
+      const resetDelivered = await deliverAuthorizedPreview(
+        "reset", reset.preview, reset.publishedAtSubscriptionEpoch,
+        () => queue.generation === generation && !queue.failedClosed);
+      if (resetDelivered) {
+        const visible = visiblePreviewAttemptsByRoom.get(roomId);
+        visible?.delete(resetKey);
+        if (visible?.size === 0) visiblePreviewAttemptsByRoom.delete(roomId);
+      }
+    }
+  };
+
   const enqueuePreviewDelivery = (
     deliveryKind: "preview" | "reset",
     preview: Parameters<typeof deliverAuthorizedPreview>[1],
@@ -3695,7 +3722,26 @@ export async function startMessageWebSocketServer(
         publishedAtSubscriptionEpoch,
       });
       queue.overflowResetBytes = nextOverflowResetBytes;
-      return Promise.resolve();
+      if (queue.count !== 0) return Promise.resolve();
+
+      // An oversized visible delta can create a repair marker while the Room
+      // queue is otherwise idle. Give that marker a bounded serialized drain
+      // job; without one there is no admitted delivery whose finally block can
+      // advance the marker.
+      const generation = queue.generation;
+      queue.count += 1;
+      const idleDrain = queue.tail
+        .then(() => drainOverflowResets(preview.roomId, queue!, generation, 1))
+        .finally(() => {
+          if (queue!.generation !== generation) return;
+          queue!.count -= 1;
+          if (queue!.count === 0 &&
+              (queue!.failedClosed || queue!.overflowResets.size === 0)) {
+            previewDeliveryQueues.delete(preview.roomId);
+          }
+        });
+      queue.tail = idleDrain.catch(() => undefined);
+      return idleDrain;
     }
     const generation = queue.generation;
     const effectiveBytes = bytes;
@@ -3728,27 +3774,7 @@ export async function startMessageWebSocketServer(
         if (queue!.count === 0 && queue!.failedClosed) previewDeliveryQueues.delete(preview.roomId);
         return;
       }
-      while (queue!.count === 0 && queue!.overflowResets.size > 0 && !queue!.failedClosed) {
-        const next = queue!.overflowResets.entries().next().value as
-          | [string, Readonly<{ preview: Readonly<{ roomId: string; executionId: string;
-            attemptSeq: number; reason?: "human_cancelled" | "message_recalled" |
-              "runtime_shutdown" | "repair" | "reconnect" | "execution_terminal" |
-              "attempt_rolled_over" | "access_revoked" }>; bytes: number;
-            publishedAtSubscriptionEpoch: number }>]
-          | undefined;
-        if (next === undefined) break;
-        const [resetKey, reset] = next;
-        queue!.overflowResets.delete(resetKey);
-        queue!.overflowResetBytes -= reset.bytes;
-        const resetDelivered = await deliverAuthorizedPreview(
-          "reset", reset.preview, reset.publishedAtSubscriptionEpoch,
-          () => queue!.generation === generation && !queue!.failedClosed);
-        if (resetDelivered) {
-          const visible = visiblePreviewAttemptsByRoom.get(preview.roomId);
-          visible?.delete(resetKey);
-          if (visible?.size === 0) visiblePreviewAttemptsByRoom.delete(preview.roomId);
-        }
-      }
+      await drainOverflowResets(preview.roomId, queue!, generation, 0);
       if (queue!.count === 0 && queue!.overflowResets.size === 0) {
         previewDeliveryQueues.delete(preview.roomId);
       }
