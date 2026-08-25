@@ -29,7 +29,7 @@ export function createEncryptedAuthorityCachePersistence(options: Readonly<{
   };
   return Object.freeze({
     async load() {
-      await writes;
+      await writes.catch(() => undefined);
       requireEncryption();
       try {
         const metadata = await lstat(options.filePath);
@@ -47,7 +47,7 @@ export function createEncryptedAuthorityCachePersistence(options: Readonly<{
       }
     },
     async save(value: unknown) {
-      writes = writes.then(async () => {
+      writes = writes.catch(() => undefined).then(async () => {
         requireEncryption();
         const ciphertext = options.encryption.encryptString(JSON.stringify(value));
         if (!(ciphertext instanceof Uint8Array) || ciphertext.byteLength === 0 ||
@@ -55,16 +55,22 @@ export function createEncryptedAuthorityCachePersistence(options: Readonly<{
         await mkdir(directory, { recursive: true, mode: 0o700 });
         if (process.platform !== "win32") await chmod(directory, 0o700);
         const temporaryPath = `${options.filePath}.${randomUUID()}.tmp`;
-        const handle = await open(temporaryPath, "wx", 0o600);
-        try { await handle.writeFile(ciphertext); await handle.sync(); }
-        finally { await handle.close(); }
-        await rename(temporaryPath, options.filePath);
+        let renamed = false;
+        try {
+          const handle = await open(temporaryPath, "wx", 0o600);
+          try { await handle.writeFile(ciphertext); await handle.sync(); }
+          finally { await handle.close(); }
+          await rename(temporaryPath, options.filePath);
+          renamed = true;
+        } finally {
+          if (!renamed) await unlink(temporaryPath).catch(() => undefined);
+        }
         if (process.platform !== "win32") await chmod(options.filePath, 0o600);
       });
       return writes;
     },
     async clear() {
-      writes = writes.then(remove);
+      writes = writes.catch(() => undefined).then(remove);
       return writes;
     },
   });
