@@ -312,6 +312,7 @@ export function mountDesktopRendererEntry(
     const memory = document.createElement("aside");
     memory.className = "room-authority-workspace__memory";
     memory.setAttribute("aria-label", "Room 重要记忆");
+    let authorityRail: HTMLElement | undefined;
     const project = projectLoop === undefined || ports.mountProjectLoopSurface === undefined
       ? undefined : document.createElement("aside");
     if (project !== undefined) {
@@ -331,7 +332,7 @@ export function mountDesktopRendererEntry(
             candidate.setAttribute("aria-pressed", String(candidate === segment));
           }
           const destination = workspace.querySelector<HTMLElement>(value === "timeline"
-            ? ".room-authority-workspace__timeline" : ".room-authority-workspace__project");
+            ? ".room-authority-workspace__timeline" : ".room-authority-workspace__rail");
           if (destination !== null) { destination.tabIndex = -1; destination.focus(); }
         });
         segments.append(segment);
@@ -344,9 +345,56 @@ export function mountDesktopRendererEntry(
       executions.className = "room-authority-workspace__invocations";
       executions.setAttribute("aria-label", "Agent 执行");
       if (project === undefined) workspace.append(timeline, executions, memory);
-      else workspace.append(timeline, executions, project, memory);
     } else if (project === undefined) workspace.append(timeline, memory);
-    else workspace.append(timeline, project, memory);
+    if (project !== undefined) {
+      authorityRail = document.createElement("aside");
+      authorityRail.className = "room-authority-workspace__rail";
+      authorityRail.dataset.authorityRail = "project";
+      authorityRail.setAttribute("aria-label", "项目、记忆与 Agent 面板");
+      authorityRail.tabIndex = -1;
+      const railTabs = document.createElement("div");
+      railTabs.className = "room-authority-workspace__rail-tabs";
+      railTabs.setAttribute("role", "tablist");
+      railTabs.setAttribute("aria-label", "Room 权威面板");
+      const panels: Array<readonly ["project" | "memory" | "agent", string, HTMLElement]> = [
+        ["project", "项目", project],
+        ["memory", "记忆", memory],
+      ];
+      if (executions !== undefined) panels.push(["agent", "Agent", executions]);
+      const selectRail = (selected: string, focus = false): void => {
+        authorityRail!.dataset.authorityRail = selected;
+        for (const [value, , panel] of panels) {
+          const active = value === selected;
+          panel.hidden = !active;
+          panel.setAttribute("aria-hidden", String(!active));
+        }
+        for (const candidate of railTabs.querySelectorAll<HTMLButtonElement>("[role='tab']")) {
+          const active = candidate.dataset.authorityRailTab === selected;
+          candidate.setAttribute("aria-selected", String(active)); candidate.tabIndex = active ? 0 : -1;
+          if (active && focus) candidate.focus();
+        }
+      };
+      for (const [value, label, panel] of panels) {
+        panel.id = `room-authority-${roomId}-${value}`;
+        panel.setAttribute("role", "tabpanel");
+        const tab = document.createElement("button"); tab.type = "button"; tab.textContent = label;
+        tab.dataset.authorityRailTab = value; tab.id = `${panel.id}-tab`; tab.setAttribute("role", "tab");
+        tab.setAttribute("aria-controls", panel.id); panel.setAttribute("aria-labelledby", tab.id);
+        tab.addEventListener("click", () => selectRail(value)); railTabs.append(tab);
+      }
+      railTabs.addEventListener("keydown", (event) => {
+        const tabs = [...railTabs.querySelectorAll<HTMLButtonElement>("[role='tab']")];
+        const current = tabs.indexOf(document.activeElement as HTMLButtonElement);
+        if (current < 0) return;
+        const next = event.key === "ArrowLeft" ? (current - 1 + tabs.length) % tabs.length
+          : event.key === "ArrowRight" ? (current + 1) % tabs.length : event.key === "Home" ? 0
+            : event.key === "End" ? tabs.length - 1 : -1;
+        if (next >= 0) { event.preventDefault(); tabs[next]?.click(); tabs[next]?.focus(); }
+      });
+      authorityRail.append(railTabs, ...panels.map(([, , panel]) => panel));
+      selectRail("project");
+      workspace.append(timeline, authorityRail);
+    }
     root.replaceChildren(workspace);
     const disposeMessage = ports.mountMessageAuthoritySurface(
       timeline,

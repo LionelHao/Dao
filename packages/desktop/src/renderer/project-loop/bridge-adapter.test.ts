@@ -60,10 +60,37 @@ describe("FT-09 Project Loop timeline integration", () => {
     const dispose = mountProjectLoopBridgeSurface(project, bridge, "room-1", { reducedMotion: true,
       onSearch: vi.fn(), onNavigateSegment: vi.fn(), onReauthenticate: vi.fn() });
     await vi.waitFor(() => expect(timeline.querySelector('[data-project-request-card="request-1"]')).not.toBeNull());
+    const transferDraft = timeline.querySelector<HTMLInputElement>('[data-timeline-request-transfer-target="request-1"]')!;
+    transferDraft.value = "human-3";
+    transferDraft.dispatchEvent(new Event("input", { bubbles: true }));
+    transferDraft.focus();
     const rerenderedSource = document.createElement("article"); rerenderedSource.dataset.messageId = "message-1";
     rerenderedSource.dataset.messageRevision = "1"; timeline.replaceChildren(rerenderedSource);
     await vi.waitFor(() => expect(rerenderedSource.nextElementSibling?.getAttribute("data-project-request-card"))
       .toBe("request-1"));
+    expect(timeline.querySelector<HTMLInputElement>('[data-timeline-request-transfer-target="request-1"]')?.value)
+      .toBe("human-3");
+    expect(document.activeElement?.getAttribute("data-project-control-id"))
+      .toBe("timeline:request-1:transfer-target");
+    dispose(); workspace.remove();
+  });
+
+  it("does not attach Request actions beside a different source message revision", async () => {
+    const workspace = document.createElement("main"); workspace.className = "room-authority-workspace";
+    const timeline = document.createElement("section"); timeline.className = "room-authority-workspace__timeline";
+    const revisedSource = document.createElement("article"); revisedSource.dataset.messageId = "message-1";
+    revisedSource.dataset.messageRevision = "2"; timeline.append(revisedSource);
+    const project = document.createElement("aside"); project.className = "room-authority-workspace__project";
+    workspace.append(timeline, project); document.body.append(workspace);
+    const ready = { status: "ready" as const, roomId: "room-1", snapshot: projectSnapshot(),
+      viewerActorId: "human-2", connection: { status: "online" as const }, operation: { status: "idle" as const } };
+    const bridge: ProjectLoopBridge = { getSurface: vi.fn(async () => ready), submit: vi.fn(async () => ready),
+      onStateChanged: () => () => {} };
+    const dispose = mountProjectLoopBridgeSurface(project, bridge, "room-1", { reducedMotion: true,
+      onSearch: vi.fn(), onNavigateSegment: vi.fn(), onReauthenticate: vi.fn() });
+    await vi.waitFor(() => expect(project.querySelector('[data-category="requests"]')).not.toBeNull());
+    expect(timeline.querySelector('[data-project-request-card="request-1"]')).toBeNull();
+    expect(revisedSource.nextElementSibling).toBeNull();
     dispose(); workspace.remove();
   });
 

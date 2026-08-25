@@ -37,6 +37,21 @@ function page(): RoomRepairPage {
 }
 
 describe("production Desktop authority cache", () => {
+  it("exposes the durability fence for an asynchronous authorized-state purge", async () => {
+    let releaseClear: (() => void) | undefined;
+    const clearGate = new Promise<void>((resolve) => { releaseClear = resolve; });
+    const persistence = { async load() { return undefined; }, async save() {}, async clear() { await clearGate; } };
+    const cache = createDesktopAuthorityCache(() => "2026-08-25T05:00:00.000Z", persistence);
+    cache.clear();
+    let durable = false;
+    const fence = cache.waitForPersistence().then(() => { durable = true; });
+    await Promise.resolve();
+    expect(durable).toBe(false);
+    releaseClear?.();
+    await fence;
+    expect(durable).toBe(true);
+  });
+
   it("restores only a complete encrypted actor-bound cache and purges it on revocation", async () => {
     let stored: unknown;
     let clearCount = 0;
@@ -65,7 +80,8 @@ describe("production Desktop authority cache", () => {
     expect(restarted.roomRepairRecords("room-1")?.find((record) => record.kind === "project-loop"))
       .toEqual({ kind: "project-loop", roomId: "room-1", value: snapshot });
     restarted.clear();
-    await vi.waitFor(() => expect(clearCount).toBeGreaterThan(0));
+    await restarted.waitForPersistence();
+    expect(clearCount).toBeGreaterThan(0);
     expect(stored).toBeUndefined();
   });
 

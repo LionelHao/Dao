@@ -78,8 +78,14 @@ describe("FT-09 J-04/J-06/J-07 Project surface", () => {
     expect(root.textContent).toContain("confirmed by human-1");
     expect(root.textContent).toContain("superseded by decision-2: New evidence");
     expect(root.textContent).toContain("affected facts request-1");
+    expect(root.textContent).toContain("Use the fixed watermark · superseded · r6");
     expect(root.textContent).toContain("PROPOSAL · 尚不是权威事实 · rejected · principal human-1");
+    expect(root.querySelector('[data-proposal-id="proposal-1"]')?.textContent).toContain("revision r4 · base new");
     expect(root.textContent).toContain("CONFIRMATION · rejected · principal human-1 · resolved by human-1");
+    expect(root.querySelector('[data-confirmation-id="confirmation-1"]')?.textContent)
+      .toContain(`revision r2 · base new · digest sha256:${"a".repeat(64)}`);
+    root.querySelector<HTMLButtonElement>('[data-category="ball"]')?.click();
+    expect(root.querySelector('[role="tabpanel"]')?.textContent).toContain("source r3");
     expect(root.querySelector('[data-proposal-id="proposal-1"]')?.textContent)
       .toContain("Rejected after source review");
   });
@@ -128,8 +134,17 @@ describe("FT-09 J-04/J-06/J-07 Project surface", () => {
     renderProjectLoopSurface(root, ready({ status: "failed", intentId: "cancel:request-1:3",
       error: { status: 409, code: "revision_conflict" } }), ui);
     expect(root.querySelector('[role="tabpanel"]')?.getAttribute("data-category")).toBe("requests");
-    root.querySelector(".project-loop")?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
     expect(document.activeElement?.getAttribute("data-project-control-id")).toBe("request:request-1:cancel");
+    root.remove();
+  });
+
+  it("moves focus to the selected category when an authority rerender removes the invoking action", () => {
+    const root = document.createElement("main"); document.body.append(root); const ui = actions();
+    renderProjectLoopSurface(root, ready(), ui, { activeCategory: "requests" });
+    root.querySelector<HTMLButtonElement>('[data-project-control-id="request:request-1:cancel"]')?.focus();
+    renderProjectLoopSurface(root, { ...ready(), viewerActorId: "human-3" }, ui);
+    expect(document.activeElement?.getAttribute("role")).toBe("tab");
+    expect(document.activeElement?.getAttribute("data-category")).toBe("requests");
     root.remove();
   });
 });

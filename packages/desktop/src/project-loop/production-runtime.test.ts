@@ -29,6 +29,7 @@ function createCacheHarness(snapshots: readonly ProjectSnapshot[]) {
       publish(roomId);
     },
     invalidate(roomId: string) { records.set(roomId, []); publish(roomId); },
+    clear(roomId: string) { records.delete(roomId); publish(roomId); },
     seed(roomId: string, snapshot: ProjectSnapshot) {
       records.set(roomId, [{ kind: "project-loop", roomId, value: snapshot }]);
     },
@@ -169,6 +170,56 @@ describe("FT-09 Desktop Project Loop production runtime", () => {
         action: "cancel", reason: "No longer needed" } });
     }
     expect(mutation).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it("converges three Desktop clients after the same stable invalidation", async () => {
+    const clients = Array.from({ length: 3 }, (_, index) => {
+      const wire = createTransport(async () => { throw new Error("unexpected mutation"); });
+      const cache = createCacheHarness([projectSnapshot(), projectSnapshot({ watermark: 9 })]);
+      const runtime = createDesktopProjectLoopRuntime({ session: () => ({ ...session(), sessionId: `session-${index}` }),
+        transport: wire.transport, authorityCache: cache.cache, repairRoom: (roomId) => cache.repairRoom(roomId),
+        restoreAuthorityCache: async () => false,
+        createRequestIdentity: () => ({ requestId: `request-${index}`, idempotencyKey: `idem-${index}` }) });
+      return { cache, runtime };
+    });
+    await Promise.all(clients.map(({ runtime }) => runtime.getSurface({ roomId: "room-1" })));
+    for (const { cache } of clients) cache.invalidate("room-1");
+    await vi.waitFor(() => expect(clients.map(({ cache }) => cache.repairCount)).toEqual([2, 2, 2]));
+    await expect(Promise.all(clients.map(({ runtime }) => runtime.getSurface({ roomId: "room-1" }))))
+      .resolves.toEqual(expect.arrayContaining([
+        expect.objectContaining({ status: "ready", snapshot: expect.objectContaining({ watermark: 9 }) }),
+      ]));
+    for (const { runtime } of clients) runtime.close();
+  });
+
+  it("rediscovers Project after central clear-cache and follows archived to reopened lifecycle", async () => {
+    const wire = createTransport(async () => { throw new Error("unexpected mutation"); });
+    const cache = createCacheHarness([projectSnapshot({ watermark: 10 })]);
+    let repairEnabled = false;
+    cache.seedRecords("room-1", [{ kind: "room", value: { id: "room-1", name: "Room",
+      status: "archived", createdAt: "2026-08-25T01:00:00.000Z" } },
+    { kind: "project-loop", roomId: "room-1", value: projectSnapshot() }]);
+    const runtime = createDesktopProjectLoopRuntime({ session, transport: wire.transport,
+      authorityCache: cache.cache, repairRoom: (roomId) => repairEnabled
+        ? cache.repairRoom(roomId) : Promise.reject(new Error("offline")),
+      restoreAuthorityCache: async () => true,
+      createRequestIdentity: () => ({ requestId: "request-reopen", idempotencyKey: "idem-reopen" }) });
+    await expect(runtime.getSurface({ roomId: "room-1" })).resolves.toMatchObject({
+      status: "ready", operation: { status: "failed", error: { status: 410, code: "room_archived" } },
+    });
+    cache.seedRecords("room-1", [{ kind: "room", value: { id: "room-1", name: "Room",
+      status: "active", createdAt: "2026-08-25T01:00:00.000Z" } },
+    { kind: "project-loop", roomId: "room-1", value: projectSnapshot({ watermark: 9 }) }]);
+    await expect(runtime.getSurface({ roomId: "room-1" })).resolves.toMatchObject({
+      status: "ready", snapshot: { watermark: 9 }, operation: { status: "idle" },
+    });
+    repairEnabled = true;
+    cache.clear("room-1");
+    await vi.waitFor(() => expect(cache.repairCount).toBe(1));
+    await expect(runtime.getSurface({ roomId: "room-1" })).resolves.toMatchObject({
+      status: "ready", snapshot: { watermark: 10 }, operation: { status: "idle" },
+    });
     runtime.close();
   });
 });

@@ -245,7 +245,14 @@ export function createDesktopProjectLoopRuntime(options: Readonly<{
   });
   const stopCache = options.authorityCache.subscribeRoomRecords((roomId, records) => {
     const state = rooms.get(roomId);
-    if (closed || state === undefined || records === undefined) return;
+    if (closed || state === undefined) return;
+    if (records === undefined) {
+      state.replica.clear();
+      state.remote = { status: "loading", roomId };
+      publish(state);
+      if (state.refresh === undefined) void refresh(state, "repair");
+      return;
+    }
     const record = records.find((candidate) => candidate.kind === "project-loop" &&
       candidate.roomId === roomId);
     if (record !== undefined) {

@@ -189,6 +189,7 @@ export interface DesktopAuthorityCache extends ClientAuthorityCache {
     records: readonly RoomRepairRecord[] | undefined,
   ) => void): () => void;
   clearRoom(roomId: string): void;
+  waitForPersistence(): Promise<void>;
   restore(actorId: string): Promise<boolean>;
 }
 
@@ -201,6 +202,7 @@ export function createDesktopAuthorityCache(
   const roomStages = new Map<string, RoomStage>();
   const rooms = new Map<string, LiveRoom>();
   let activeActorId: string | undefined;
+  let persistenceWork = Promise.resolve();
   const roomListeners = new Set<(
     roomId: string,
     records: readonly RoomRepairRecord[] | undefined,
@@ -212,6 +214,10 @@ export function createDesktopAuthorityCache(
       catch { /* A projection observer cannot alter authoritative cache state. */ }
     }
   };
+  const schedulePersistence = (operation: () => Promise<void>): void => {
+    persistenceWork = persistenceWork.catch(() => undefined).then(operation);
+    void persistenceWork.catch(() => undefined);
+  };
   const persist = (): void => {
     if (persistence === undefined || activeActorId === undefined) return;
     const value = {
@@ -221,7 +227,7 @@ export function createDesktopAuthorityCache(
         cursor: structuredClone(room.cursor), updatedAt: room.updatedAt,
         checksum: authoritySnapshotChecksum("room", room.records) })),
     };
-    void persistence.save(value).catch(() => undefined);
+    schedulePersistence(() => persistence.save(value));
   };
 
   return {
@@ -301,7 +307,7 @@ export function createDesktopAuthorityCache(
       rooms.clear();
       for (const roomId of roomIds) publishRoom(roomId);
       activeActorId = undefined;
-      void persistence?.clear().catch(() => undefined);
+      if (persistence !== undefined) schedulePersistence(() => persistence.clear());
     },
     clearRoom(roomId) {
       if (catalogStage !== undefined) {
@@ -316,6 +322,7 @@ export function createDesktopAuthorityCache(
       publishRoom(roomId);
       persist();
     },
+    waitForPersistence() { return persistenceWork; },
     governanceProjection(roomId) {
       const records = rooms.get(roomId)?.records;
       if (records === undefined) return undefined;
@@ -375,6 +382,7 @@ export function createDesktopAuthorityCache(
         for (const roomId of priorRoomIds) publishRoom(roomId);
       }
       if (persistence === undefined) { activeActorId = actorId; return false; }
+      await persistenceWork;
       const value = await persistence.load();
       if (typeof value !== "object" || value === null || Array.isArray(value) ||
           Reflect.ownKeys(value).length !== 3 ||

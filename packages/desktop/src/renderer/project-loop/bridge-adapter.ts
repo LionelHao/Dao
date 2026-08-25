@@ -17,11 +17,36 @@ export function mountProjectLoopBridgeSurface(
   let authoritySequence = 0;
   let current: ProjectLoopRemoteState = { status: "loading", roomId };
   let timelineObserver: MutationObserver | undefined;
+  let observedTimeline: HTMLElement | undefined;
+  let lastTimelineControlId: string | undefined;
+  let lastTimelineRequestId: string | undefined;
+  const timelineTransferDrafts = new Map<string, string>();
+  const rememberTimelineFocus = (event: FocusEvent): void => {
+    if (!(event.target instanceof HTMLElement)) return;
+    lastTimelineControlId = event.target.dataset.projectControlId;
+    lastTimelineRequestId = event.target.closest<HTMLElement>("[data-project-request-card]")
+      ?.dataset.projectRequestCard;
+  };
 
   const renderTimelineRequests = (): void => {
     const workspace = root.closest(".room-authority-workspace");
     const timeline = workspace?.querySelector<HTMLElement>(".room-authority-workspace__timeline");
     if (timeline === null || timeline === undefined) return;
+    if (observedTimeline !== timeline) {
+      observedTimeline?.removeEventListener("focusin", rememberTimelineFocus);
+      observedTimeline = timeline;
+      observedTimeline.addEventListener("focusin", rememberTimelineFocus);
+    }
+    const priorFocus = document.activeElement instanceof HTMLElement && timeline.contains(document.activeElement)
+      ? document.activeElement : null;
+    const focusedControlId = priorFocus?.dataset.projectControlId ??
+      (document.activeElement === document.body ? lastTimelineControlId : undefined);
+    const focusedRequestId = priorFocus?.closest<HTMLElement>("[data-project-request-card]")
+      ?.dataset.projectRequestCard ?? (document.activeElement === document.body ? lastTimelineRequestId : undefined);
+    for (const input of timeline.querySelectorAll<HTMLInputElement>("[data-timeline-request-transfer-target]")) {
+      const requestId = input.dataset.timelineRequestTransferTarget;
+      if (requestId !== undefined) timelineTransferDrafts.set(requestId, input.value);
+    }
     timelineObserver?.disconnect();
     for (const prior of timeline.querySelectorAll("[data-project-request-card]")) prior.remove();
     if (current.status !== "ready") return;
@@ -29,12 +54,14 @@ export function mountProjectLoopBridgeSurface(
       const source = request.provenance.source;
       if (source.kind !== "message") continue;
       const anchor = [...timeline.querySelectorAll<HTMLElement>("[data-message-id]")]
-        .find((candidate) => candidate.dataset.messageId === source.sourceId) ?? null;
+        .find((candidate) => candidate.dataset.messageId === source.sourceId &&
+          candidate.dataset.messageRevision === String(source.sourceRevision)) ?? null;
       if (anchor === null) continue;
       const card = document.createElement("aside");
       card.className = "project-loop__timeline-request";
       card.dataset.projectRequestCard = request.requestId;
       card.dataset.sourceRevision = String(source.sourceRevision);
+      card.tabIndex = -1;
       card.setAttribute("aria-label", `Request ${request.title}`);
       const tombstone = anchor.classList.contains("message-authority__message--tombstone");
       const summary = document.createElement("p");
@@ -56,6 +83,8 @@ export function mountProjectLoopBridgeSurface(
       };
       const action = (label: string, intent: Parameters<ProjectLoopBridge["submit"]>[0]["intent"]): HTMLButtonElement => {
         const value = document.createElement("button"); value.type = "button"; value.textContent = label;
+        value.dataset.projectControlId = `timeline:${request.requestId}:${intent.kind === "proposal.resolve"
+          ? intent.resolution : intent.action}`;
         value.disabled = mutationDisabled; value.addEventListener("click", () => submit(intent)); return value;
       };
       if (request.status === "pending_acceptance" && request.target.actorId === current.viewerActorId) {
@@ -69,8 +98,12 @@ export function mountProjectLoopBridgeSurface(
         const label = document.createElement("label"); label.textContent = "转交给 Human actorId";
         const input = document.createElement("input"); input.type = "text"; input.autocomplete = "off";
         input.dataset.timelineRequestTransferTarget = request.requestId; input.disabled = mutationDisabled;
+        input.dataset.projectControlId = `timeline:${request.requestId}:transfer-target`;
+        input.value = timelineTransferDrafts.get(request.requestId) ?? "";
+        input.addEventListener("input", () => timelineTransferDrafts.set(request.requestId, input.value));
         label.append(input); card.append(label);
         const transfer = document.createElement("button"); transfer.type = "button"; transfer.textContent = "提交转交";
+        transfer.dataset.projectControlId = `timeline:${request.requestId}:transfer`;
         transfer.disabled = mutationDisabled; transfer.addEventListener("click", () => {
           const actorId = input.value.trim();
           if (actorId.length === 0) { input.setCustomValidity("请输入目标 Human actorId"); input.reportValidity(); return; }
@@ -91,6 +124,14 @@ export function mountProjectLoopBridgeSurface(
     }
     timelineObserver ??= new MutationObserver(() => queueMicrotask(renderTimelineRequests));
     timelineObserver.observe(timeline, { childList: true, subtree: true });
+    if (focusedControlId !== undefined) {
+      const replacement = [...timeline.querySelectorAll<HTMLElement>("[data-project-control-id]")]
+        .find((candidate) => candidate.dataset.projectControlId === focusedControlId &&
+          (!(candidate instanceof HTMLButtonElement || candidate instanceof HTMLInputElement) || !candidate.disabled));
+      if (replacement !== undefined) replacement.focus();
+      else [...timeline.querySelectorAll<HTMLElement>("[data-project-request-card]")]
+        .find((candidate) => candidate.dataset.projectRequestCard === focusedRequestId)?.focus();
+    }
   };
 
   const render = (): void => { renderProjectLoopSurface(root, current, {
@@ -165,6 +206,7 @@ export function mountProjectLoopBridgeSurface(
     if (!active) return;
     active = false;
     timelineObserver?.disconnect();
+    observedTimeline?.removeEventListener("focusin", rememberTimelineFocus);
     unsubscribe();
   };
 }

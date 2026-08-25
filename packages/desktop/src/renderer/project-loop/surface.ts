@@ -66,7 +66,8 @@ export function renderProjectLoopSurface(root: HTMLElement, state: ProjectLoopRe
   const retained = SURFACE_UI.get(root) ?? { activeCategory: options.activeCategory ?? "goals" };
   if (priorFocus !== null && root.contains(priorFocus) && priorFocus.dataset.projectControlId !== undefined) {
     retained.escapeControlId = priorFocus.dataset.projectControlId;
-  } else if (priorFocus !== null && !root.contains(priorFocus)) retained.externalFocus = priorFocus;
+  } else if (priorFocus !== null && priorFocus !== document.body && priorFocus !== document.documentElement &&
+      !root.contains(priorFocus)) retained.externalFocus = priorFocus;
   let activeCategory = options.activeCategory ?? retained.activeCategory;
   retained.activeCategory = activeCategory; SURFACE_UI.set(root, retained);
   const panel = document.createElement("section"); panel.className = "project-loop";
@@ -97,7 +98,7 @@ export function renderProjectLoopSurface(root: HTMLElement, state: ProjectLoopRe
     item.dataset.sourceId = request.requestId; item.dataset.sourceKind = "project_fact";
     item.dataset.sourceRevision = String(request.revision);
     const summary = document.createElement("p");
-    summary.textContent = `${request.title} · ${request.status} · requester ${request.requester.actorId} → target ${request.target.actorId}`;
+    summary.textContent = `${request.title} · ${request.status} · r${request.revision} · requester ${request.requester.actorId} → target ${request.target.actorId}`;
     const authority = document.createElement("p"); authority.textContent = request.status === "pending_acceptance"
       ? "PENDING_ACCEPTANCE · 接受前不形成目标 Human 的责任" : `CONFIRMED FACT · ${request.status}`;
     item.append(summary, authority, sourceButton(request.provenance.source));
@@ -151,13 +152,14 @@ export function renderProjectLoopSurface(root: HTMLElement, state: ProjectLoopRe
           : entry.kind === "next_action" ? entry.nextActionId : entry.obstacleId;
       }
       const summary = document.createElement("p");
-      if ("title" in entry) summary.textContent = `${entry.title} · ${entry.status}` +
+      if ("title" in entry) summary.textContent = `${entry.title} · ${entry.status} · r${entry.revision}` +
         `${"owner" in entry ? ` · owner ${entry.owner.kind}:${entry.owner.actorId}` : ""}` +
         `${"verifier" in entry && entry.verifier !== null ? ` · verifier ${entry.verifier.actorId}` : ""}` +
         `${"dueAt" in entry && entry.dueAt !== null ? ` · 截止 ${entry.dueAt}` : ""}` +
         `${"reviewAt" in entry && entry.reviewAt !== null ? ` · 复核 ${entry.reviewAt}` : ""}`;
-      else if ("statement" in entry) summary.textContent = `${entry.statement} · ${entry.status}`;
+      else if ("statement" in entry) summary.textContent = `${entry.statement} · ${entry.status} · r${entry.revision}`;
       else summary.textContent = `${entry.boundaryKind} · ${entry.reason} · ${entry.holder.kind}:${entry.holder.actorId}` +
+        ` · source r${entry.sourceRevision}` +
         `${entry.dueAt === null ? "" : ` · 截止 ${entry.dueAt}`}${entry.reviewAt === null ? "" : ` · 复核 ${entry.reviewAt}`}`;
       item.append(summary);
       if ("kind" in entry && (entry.kind === "goal" || entry.kind === "decision")) {
@@ -203,6 +205,7 @@ export function renderProjectLoopSurface(root: HTMLElement, state: ProjectLoopRe
     card.dataset.authority = "proposal-not-fact"; const title = document.createElement("h4"); title.textContent = proposalTitle(proposal);
     const authority = document.createElement("p"); authority.textContent =
       `PROPOSAL · 尚不是权威事实 · ${proposal.state} · principal ${proposal.principalActorId} · expires ${proposal.expiresAt}` +
+      ` · revision r${proposal.revision} · base ${proposal.baseRevision === null ? "new" : `r${proposal.baseRevision}`}` +
       `${proposal.resolvedAt === null ? "" : ` · resolved ${proposal.resolvedAt}`}` +
       `${proposal.resolutionReason === null ? "" : ` · ${proposal.resolutionReason}`}`;
     card.append(title, authority, sourceButton(proposal.provenance.source));
@@ -228,7 +231,9 @@ export function renderProjectLoopSurface(root: HTMLElement, state: ProjectLoopRe
     card.textContent = `CONFIRMATION · ${confirmation.state} · principal ${confirmation.principalActorId}` +
       `${confirmation.resolvedBy === null ? "" : ` · resolved by ${confirmation.resolvedBy.actorId}`}` +
       `${confirmation.resolvedAt === null ? "" : ` at ${confirmation.resolvedAt}`}` +
-      `${confirmation.resolutionReason === null ? "" : ` · ${confirmation.resolutionReason}`}`;
+      `${confirmation.resolutionReason === null ? "" : ` · ${confirmation.resolutionReason}`}` +
+      ` · revision r${confirmation.revision} · base ${confirmation.baseRevision === null ? "new" : `r${confirmation.baseRevision}`}` +
+      ` · digest ${confirmation.payloadDigest}`;
     confirmations.append(card);
   }
   const transfers = document.createElement("section"); transfers.className = "project-loop__transfers";
@@ -237,7 +242,8 @@ export function renderProjectLoopSurface(root: HTMLElement, state: ProjectLoopRe
     empty.textContent = "暂无 Ball 转交提案"; transfers.append(empty); }
   for (const transfer of vm.transferProposals) { const item = document.createElement("p");
     item.dataset.transferProposalId = transfer.transferProposalId;
-    item.textContent = `TRANSFER PROPOSAL · ${transfer.fromOwner.actorId} → ${transfer.toOwner.actorId} · ${transfer.status}`;
+    item.textContent = `TRANSFER PROPOSAL · ${transfer.fromOwner.actorId} → ${transfer.toOwner.actorId}` +
+      ` · ${transfer.status} · revision r${transfer.revision}`;
     transfers.append(item); }
   if (state.operation.status === "failed") {
     if (state.operation.error.status === 403) { const denied = document.createElement("p"); denied.dataset.projectRecovery = "403";
@@ -266,7 +272,8 @@ export function renderProjectLoopSurface(root: HTMLElement, state: ProjectLoopRe
         : [...panel.querySelectorAll<HTMLButtonElement>("[data-project-control-id]")]
           .find((candidate) => candidate.dataset.projectControlId === retained.escapeControlId && !candidate.disabled) ?? null;
       if (replacement !== null) replacement.focus();
-      else if (retained.externalFocus?.isConnected) retained.externalFocus.focus();
+      else if (retained.externalFocus?.isConnected && retained.externalFocus !== document.body &&
+          retained.externalFocus !== document.documentElement) retained.externalFocus.focus();
       else tabs.querySelector<HTMLButtonElement>('button[aria-selected="true"]')?.focus(); }
   });
   tabs.addEventListener("keydown", (event) => {
@@ -280,4 +287,14 @@ export function renderProjectLoopSurface(root: HTMLElement, state: ProjectLoopRe
   });
   panel.append(header, announcement, sourceStatus, tabs, content, proposals, confirmations, transfers);
   root.replaceChildren(panel);
+  if (priorFocus !== null && root !== priorFocus && root.contains(panel)) {
+    const replacement = retained.escapeControlId === undefined ? null
+      : [...panel.querySelectorAll<HTMLElement>("[data-project-control-id]")]
+        .find((candidate) => candidate.dataset.projectControlId === retained.escapeControlId &&
+          (!(candidate instanceof HTMLButtonElement) || !candidate.disabled)) ?? null;
+    if (replacement !== null) replacement.focus();
+    else if (root.contains(priorFocus) || !priorFocus.isConnected) {
+      tabs.querySelector<HTMLButtonElement>('button[aria-selected="true"]')?.focus();
+    }
+  }
 }

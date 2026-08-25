@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { IdentityBridge } from "../identity/contracts.js";
 import type { GovernanceBridge } from "../governance/contracts.js";
@@ -228,7 +230,7 @@ describe("Desktop renderer route entry", () => {
     root.remove();
   });
 
-  it("mounts the reviewed three-column Project shell with an atomic 840px segment control", () => {
+  it("mounts one tabbed authority rail and keeps the 840px Project segment non-overlapping", () => {
     const root = document.createElement("main"); const renderers = ports();
     document.body.append(root);
     const dispose = mountDesktopRendererEntry(
@@ -238,7 +240,22 @@ describe("Desktop renderer route entry", () => {
     const workspace = root.querySelector<HTMLElement>(".room-authority-workspace")!;
     const timeline = workspace.querySelector<HTMLElement>(".room-authority-workspace__timeline")!;
     const project = workspace.querySelector<HTMLElement>(".room-authority-workspace__project")!;
+    const memory = workspace.querySelector<HTMLElement>(".room-authority-workspace__memory")!;
+    const executions = workspace.querySelector<HTMLElement>(".room-authority-workspace__invocations")!;
+    const rail = workspace.querySelector<HTMLElement>(".room-authority-workspace__rail")!;
+    expect(rail.contains(project)).toBe(true);
+    expect(rail.contains(memory)).toBe(true);
+    expect(rail.contains(executions)).toBe(true);
     expect(renderers.mountProjectLoopSurface).toHaveBeenCalledWith(project, projectLoop, "room-1");
+    expect(project.hidden).toBe(false);
+    expect(memory.hidden).toBe(true);
+    expect(executions.hidden).toBe(true);
+    const memoryTab = rail.querySelector<HTMLButtonElement>('[data-authority-rail-tab="memory"]')!;
+    memoryTab.click();
+    expect(project.hidden).toBe(true);
+    expect(memory.hidden).toBe(false);
+    expect(executions.hidden).toBe(true);
+    rail.querySelector<HTMLButtonElement>('[data-authority-rail-tab="project"]')?.click();
     expect(workspace.dataset.compactSegment).toBe("timeline");
     const projectSegment = workspace.querySelector<HTMLButtonElement>(
       '[data-compact-segment-target="project"]',
@@ -246,9 +263,14 @@ describe("Desktop renderer route entry", () => {
     projectSegment.click();
     expect(workspace.dataset.compactSegment).toBe("project");
     expect(projectSegment.getAttribute("aria-pressed")).toBe("true");
-    expect(document.activeElement).toBe(project);
+    expect(document.activeElement).toBe(rail);
     expect(workspace.querySelector('[data-compact-segment-target="timeline"]')?.textContent).toBe("时间线");
     expect(timeline.className).toContain("timeline");
+    const css = readFileSync(resolve(process.cwd().endsWith("packages/desktop") ? "src" : "packages/desktop/src",
+      "renderer/memory-authority/memory-authority.css"), "utf8");
+    expect(css).toContain("grid-template-columns: minmax(0, 1fr) minmax(18rem, 24rem)");
+    expect(css).toContain('[data-compact-segment="timeline"] .room-authority-workspace__rail');
+    expect(css).not.toContain(".room-authority-workspace__project,\n  .room-authority-workspace__memory { grid-column: 1; grid-row: 2; }");
     dispose?.();
     root.remove();
   });
