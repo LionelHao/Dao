@@ -138,10 +138,32 @@ function sourceState(database: DatabaseSync, row: ReminderBoundaryRow):
       proposal.status === "pending" };
   }
   if (row.sourceKind === "transfer") {
+    if (!hasColumn(database, "project_transfer_proposals", "subject_revision")) {
+      const legacyProposal = database.prepare(
+        `SELECT revision, status FROM project_transfer_proposals WHERE room_id = ? AND id = ?`,
+      ).get(row.roomId, row.sourceId);
+      return { kind: "transfer", current: legacyProposal?.revision === row.sourceRevision &&
+        (legacyProposal.status === "pending" || legacyProposal.status === "expired") };
+    }
     const proposal = database.prepare(
-      `SELECT revision, status FROM project_transfer_proposals WHERE room_id = ? AND id = ?`,
+      `SELECT proposal.revision, proposal.status,
+              CASE
+                WHEN proposal.subject_kind = 'next_action' THEN EXISTS (
+                  SELECT 1 FROM project_next_actions AS action
+                  WHERE action.room_id = proposal.room_id AND action.id = proposal.subject_id
+                    AND action.revision = proposal.subject_revision
+                    AND action.status IN ('proposed','accepted','in_progress','delivered'))
+                WHEN proposal.subject_kind IN ('blocker','open_question') THEN EXISTS (
+                  SELECT 1 FROM project_obstacles AS obstacle
+                  WHERE obstacle.room_id = proposal.room_id AND obstacle.id = proposal.subject_id
+                    AND obstacle.kind = proposal.subject_kind
+                    AND obstacle.revision = proposal.subject_revision
+                    AND obstacle.status IN ('open','deferred','cannot_answer'))
+                ELSE 0 END AS subjectCurrent
+       FROM project_transfer_proposals AS proposal WHERE proposal.room_id = ? AND proposal.id = ?`,
     ).get(row.roomId, row.sourceId);
     return { kind: "transfer", current: proposal?.revision === row.sourceRevision &&
+      proposal.subjectCurrent === 1 &&
       (proposal.status === "pending" || proposal.status === "expired") };
   }
   if (row.sourceKind === "due") {
@@ -872,6 +894,8 @@ export function reopenProjectLoopBoundariesInTransaction(database: DatabaseSync,
             .get(input.roomId, row.sourceId)?.revision
           : row.sourceRevision;
     if (typeof sourceRevision !== "number") throw new ProjectLoopAuthorityError("storage_unavailable", "Project timer source revision is unavailable");
+    const resumedSource = Object.freeze({ ...row, sourceRevision }) as ReminderBoundaryRow;
+    if (!sourceState(database, resumedSource).current) continue;
     const remaining = row.dueAt === null ? null :
       Math.max(0, Date.parse(row.dueAt) - Date.parse(suspension.suspendedAt));
     const resumedDueAt = remaining === null ? null :

@@ -76,7 +76,7 @@ const SCHEMA_FINGERPRINTS = {
   22: "cbf4ccb27b52c3b88d61667f94811501d36a54795391e0044bbb0b2f41d3c7ce",
   23: "532b7c0589c5ae2f4cb96c43747b19e3a7c83c2f04fd9fea663191ea5a46aced",
   24: "ef4c3593ee4384350f57c1f92e6d229c523b4c99817f95222718c4abe10db896",
-  25: "a9662016d52cdca22c59dea7bf910a74ddcfb8a210e6ee9205b8fbd01f854868",
+  25: "e0cd0a610c4777209877535e0d5651498984681bf9b3c3f825724f4946191815",
 } as const;
 
 const V1_STATEMENTS = [
@@ -8469,10 +8469,16 @@ const V25_STATEMENTS = [
      actor_id, event_type, occurred_at, payload_json
    ) SELECT legacy.event_id, legacy.stream_kind, legacy.stream_id, legacy.stream_seq,
             legacy.room_id,
-            CASE WHEN legacy.event_type LIKE 'project.%'
+            CASE WHEN legacy.event_type LIKE 'project.%' AND
+                json_extract(project.payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN 'system_timer'
+              WHEN legacy.event_type LIKE 'project.%'
               THEN COALESCE(project.actor_kind, actor.kind)
               ELSE 'actor' END,
-            legacy.actor_id, legacy.event_type, legacy.occurred_at, legacy.payload_json
+            CASE WHEN legacy.event_type LIKE 'project.%' AND
+                json_extract(project.payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN NULL ELSE legacy.actor_id END,
+            legacy.event_type, legacy.occurred_at, legacy.payload_json
      FROM events_v24 AS legacy
      LEFT JOIN project_events_v24 AS project ON project.event_id = legacy.event_id
      LEFT JOIN actors AS actor ON actor.id = legacy.actor_id`,
@@ -8509,9 +8515,22 @@ const V25_STATEMENTS = [
      causal_actor_id, source_room_id, source_id, source_kind, source_revision,
      source_visibility, occurred_at, payload_json
    ) SELECT event_id, room_id, project_id, event_seq, event_type, fact_kind, fact_id,
-            fact_revision, actor_kind, actor_kind, actor_id, actor_kind, actor_id,
+            fact_revision,
+            CASE WHEN json_extract(payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN 'system_timer' ELSE actor_kind END,
+            CASE WHEN json_extract(payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN NULL ELSE actor_kind END,
+            CASE WHEN json_extract(payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN NULL ELSE actor_id END,
+            CASE WHEN json_extract(payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN NULL ELSE actor_kind END,
+            CASE WHEN json_extract(payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN NULL ELSE actor_id END,
             source_room_id, source_id, source_kind, source_revision, source_visibility,
-            occurred_at, payload_json FROM project_events_v24`,
+            occurred_at,
+            CASE WHEN json_extract(payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN json_set(payload_json, '$.migratedFromV24', json('true')) ELSE payload_json END
+     FROM project_events_v24`,
   `CREATE TABLE project_transition_audit (
     audit_id TEXT PRIMARY KEY,
     room_id TEXT NOT NULL REFERENCES rooms(id),
@@ -8538,9 +8557,24 @@ const V25_STATEMENTS = [
      audit_id, room_id, project_id, project_revision, event_id, operation, fact_kind,
      fact_id, authority_kind, actor_kind, actor_id, causal_actor_kind, causal_actor_id,
      transition_json, occurred_at
-   ) SELECT audit_id, room_id, project_id, project_revision, event_id, operation,
-            fact_kind, fact_id, actor_kind, actor_kind, actor_id, actor_kind, actor_id,
-            transition_json, occurred_at FROM project_transition_audit_v24`,
+   ) SELECT legacy.audit_id, legacy.room_id, legacy.project_id, legacy.project_revision,
+            legacy.event_id, legacy.operation, legacy.fact_kind, legacy.fact_id,
+            CASE WHEN json_extract(event.payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN 'system_timer' ELSE legacy.actor_kind END,
+            CASE WHEN json_extract(event.payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN NULL ELSE legacy.actor_kind END,
+            CASE WHEN json_extract(event.payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN NULL ELSE legacy.actor_id END,
+            CASE WHEN json_extract(event.payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN NULL ELSE legacy.actor_kind END,
+            CASE WHEN json_extract(event.payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN NULL ELSE legacy.actor_id END,
+            CASE WHEN json_extract(event.payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN json_set(legacy.transition_json, '$.migratedFromV24', json('true'))
+              ELSE legacy.transition_json END,
+            legacy.occurred_at
+     FROM project_transition_audit_v24 AS legacy
+     JOIN project_events_v24 AS event ON event.event_id = legacy.event_id`,
   `CREATE TABLE outbox_deliveries (
     id TEXT NOT NULL UNIQUE,
     event_id TEXT NOT NULL REFERENCES events(event_id),
@@ -8602,7 +8636,8 @@ const V25_STATEMENTS = [
               OR (project.fact_kind = 'open_question' AND NEW.event_type = 'project.open-question.changed'))
               AND json_extract(NEW.payload_json, '$.obstacleId') = project.fact_id
               AND json_extract(NEW.payload_json, '$.revision') = project.fact_revision)
-            OR (json_extract(project.payload_json, '$.transition') = 'transfer_expired'
+            OR (json_extract(project.payload_json, '$.transition') IN (
+                  'transfer_expired','review_due_transfer_rebound')
               AND NEW.event_type = 'project.transfer-proposal.changed'
               AND json_extract(NEW.payload_json, '$.transferProposalId') =
                   json_extract(project.payload_json, '$.transferProposalId')
@@ -8627,11 +8662,14 @@ const V25_STATEMENTS = [
         OR json_type(NEW.payload_json, '$.transition') IS NOT 'text'
         OR (json_extract(NEW.payload_json, '$.transition') = 'review_due'
           AND NEW.fact_kind NOT IN ('blocker','open_question'))
-        OR (json_extract(NEW.payload_json, '$.transition') = 'transfer_expired' AND (
+        OR (json_extract(NEW.payload_json, '$.transition') IN (
+              'transfer_expired','review_due_transfer_rebound') AND (
           NEW.fact_kind NOT IN ('next_action','blocker','open_question')
           OR json_type(NEW.payload_json, '$.transferProposalId') IS NOT 'text'
           OR json_type(NEW.payload_json, '$.transferRevision') IS NOT 'integer'))
-        OR json_extract(NEW.payload_json, '$.transition') NOT IN ('review_due','transfer_expired')))
+        OR json_extract(NEW.payload_json, '$.transition') NOT IN (
+          'review_due','transfer_expired','review_due_transfer_rebound')
+        OR json_extract(NEW.payload_json, '$.migratedFromV24') IS NOT NULL))
    BEGIN SELECT RAISE(ABORT, 'Project event transition authority is invalid'); END`,
   `CREATE TRIGGER project_events_immutable_update_v25 BEFORE UPDATE ON project_events
    BEGIN SELECT RAISE(ABORT, 'Project event is immutable'); END`,
@@ -10375,7 +10413,9 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
       AND stream.stream_id = event.stream_id
      LEFT JOIN actors AS actor ON actor.id = event.actor_id
      WHERE stream.stream_id IS NULL
-        OR actor.id IS NULL
+        OR ${schemaVersion >= 25
+          ? "(event.authority_kind <> 'system_timer' AND actor.id IS NULL)"
+          : "actor.id IS NULL"}
         OR event.stream_seq < 1
         OR event.stream_seq < stream.retained_from_seq
         OR event.stream_seq > stream.head_seq
@@ -12181,7 +12221,11 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
        LEFT JOIN actors AS authority ON authority.id = event.actor_id
        LEFT JOIN actors AS causal ON causal.id = event.causal_actor_id
        LEFT JOIN events AS public ON public.event_id = event.event_id
-       WHERE (event.authority_kind = 'system_timer' AND (
+       LEFT JOIN project_transition_audit AS audit ON audit.event_id = event.event_id
+       LEFT JOIN project_event_outbox AS delivery ON delivery.event_id = event.event_id
+       WHERE audit.event_id IS NULL OR delivery.event_id IS NULL
+          OR delivery.room_id <> event.room_id OR delivery.event_seq <> event.event_seq
+          OR (event.authority_kind = 'system_timer' AND (
             event.actor_kind IS NOT NULL OR event.actor_id IS NOT NULL
             OR event.causal_actor_kind IS NOT NULL OR event.causal_actor_id IS NOT NULL
             OR event.event_type <> 'fact.transitioned'
@@ -12192,16 +12236,29 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
                 THEN 'project.blocker.changed' ELSE 'project.open-question.changed' END
               OR json_extract(public.payload_json, '$.obstacleId') IS NOT event.fact_id
               OR json_extract(public.payload_json, '$.revision') IS NOT event.fact_revision))
-            OR (json_extract(event.payload_json, '$.transition') = 'transfer_expired' AND (
+            OR (json_extract(event.payload_json, '$.transition') IN (
+                  'transfer_expired','review_due_transfer_rebound') AND (
               event.fact_kind NOT IN ('next_action','blocker','open_question')
               OR json_type(event.payload_json, '$.transferProposalId') IS NOT 'text'
-              OR json_type(event.payload_json, '$.transferRevision') IS NOT 'integer'
-              OR public.event_type <> 'project.transfer-proposal.changed'
-              OR json_extract(public.payload_json, '$.transferProposalId') IS NOT
-                  json_extract(event.payload_json, '$.transferProposalId')
-              OR json_extract(public.payload_json, '$.revision') IS NOT
-                  json_extract(event.payload_json, '$.transferRevision')))
-            OR json_extract(event.payload_json, '$.transition') NOT IN ('review_due','transfer_expired')
+              OR (json_extract(event.payload_json, '$.migratedFromV24') IS TRUE AND (
+                json_extract(event.payload_json, '$.transition') <> 'transfer_expired'
+                OR public.event_type <> CASE event.fact_kind
+                  WHEN 'next_action' THEN 'project.next-action.changed'
+                  WHEN 'blocker' THEN 'project.blocker.changed'
+                  ELSE 'project.open-question.changed' END
+                OR json_extract(public.payload_json,
+                     CASE event.fact_kind WHEN 'next_action' THEN '$.nextActionId'
+                       ELSE '$.obstacleId' END) IS NOT event.fact_id
+                OR json_extract(public.payload_json, '$.revision') IS NOT event.fact_revision))
+              OR (json_extract(event.payload_json, '$.migratedFromV24') IS NOT TRUE AND (
+                json_type(event.payload_json, '$.transferRevision') IS NOT 'integer'
+                OR public.event_type <> 'project.transfer-proposal.changed'
+                OR json_extract(public.payload_json, '$.transferProposalId') IS NOT
+                    json_extract(event.payload_json, '$.transferProposalId')
+                OR json_extract(public.payload_json, '$.revision') IS NOT
+                    json_extract(event.payload_json, '$.transferRevision')))))
+            OR json_extract(event.payload_json, '$.transition') NOT IN (
+              'review_due','transfer_expired','review_due_transfer_rebound')
             OR public.event_id IS NULL OR public.authority_kind <> 'system_timer'
             OR public.actor_id IS NOT NULL))
           OR (event.authority_kind IN ('human','agent') AND (

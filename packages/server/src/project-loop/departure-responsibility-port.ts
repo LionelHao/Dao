@@ -462,6 +462,28 @@ function collectTransferAcceptances(
   roomId: string,
   targetHumanActorId: string,
 ): readonly DepartureConflict[] {
+  const subjectRevisionAvailable = database.prepare(
+    `SELECT 1 FROM pragma_table_info('project_transfer_proposals')
+     WHERE name = 'subject_revision'`,
+  ).get() !== undefined;
+  const currentSubject = subjectRevisionAvailable ? `
+       AND (
+         (subject_kind = 'next_action' AND EXISTS (
+           SELECT 1 FROM project_next_actions AS action
+           WHERE action.room_id = project_transfer_proposals.room_id
+             AND action.id = project_transfer_proposals.subject_id
+             AND action.revision = project_transfer_proposals.subject_revision
+             AND action.status IN ('proposed','accepted','in_progress','delivered')
+         ))
+         OR (subject_kind IN ('blocker','open_question') AND EXISTS (
+           SELECT 1 FROM project_obstacles AS obstacle
+           WHERE obstacle.room_id = project_transfer_proposals.room_id
+             AND obstacle.id = project_transfer_proposals.subject_id
+             AND obstacle.kind = project_transfer_proposals.subject_kind
+             AND obstacle.revision = project_transfer_proposals.subject_revision
+             AND obstacle.status IN ('open','deferred','cannot_answer')
+         ))
+       )` : "";
   const rows = database.prepare(
     `SELECT id, room_id AS roomId, source_room_id AS sourceRoomId, source_id AS sourceId,
             revision, subject_kind AS subjectKind, subject_id AS subjectId,
@@ -472,6 +494,7 @@ function collectTransferAcceptances(
        AND ((to_owner_kind = 'human' AND to_owner_actor_id = ?)
             OR (to_owner_kind = 'agent' AND principal_human_actor_id = ?))
        AND status = 'pending'
+       ${currentSubject}
      ORDER BY id`,
   ).all(roomId, targetHumanActorId, targetHumanActorId) as unknown as readonly TransferProposalRow[];
 

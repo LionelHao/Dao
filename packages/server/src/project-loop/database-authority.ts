@@ -592,6 +592,17 @@ function refreshBallBoundary(database: DatabaseSync, fact: ProjectLoopStoredFact
     `UPDATE project_ball_boundaries SET status = 'superseded', released_at = ?
      WHERE room_id = ? AND source_kind = ? AND source_id = ? AND status = 'active'`,
   ).run(now, fact.roomId, fact.kind, fact.id);
+  if (fact.kind === "next_action" || fact.kind === "blocker" || fact.kind === "open_question") {
+    database.prepare(
+      `UPDATE project_ball_boundaries SET status = 'superseded', released_at = ?
+       WHERE room_id = ? AND source_kind = 'transfer' AND status = 'active'
+         AND source_id IN (
+           SELECT id FROM project_transfer_proposals
+           WHERE room_id = ? AND subject_kind = ? AND subject_id = ?
+             AND status = 'pending' AND subject_revision <> ?
+         )`,
+    ).run(now, fact.roomId, fact.roomId, fact.kind, fact.id, fact.revision);
+  }
   let holderKind: "human" | "agent" | undefined;
   let holderId: string | undefined;
   let reason = "";
@@ -1130,6 +1141,7 @@ function transitionFact(database: DatabaseSync,
   const nextStatus = targetStatus(operation.command.factKind, fact.status, transition);
   const payload = operation.command.payload;
   const eventIds: string[] = [];
+  let changedTransfer: Readonly<{ id: string; revision: number }> | null = null;
   if (operation.command.factKind === "request") {
     const requester = String(fact.details.requesterActorId);
     const target = String(fact.details.targetActorId);
@@ -1227,6 +1239,7 @@ function transitionFact(database: DatabaseSync,
       ).run(stringField(payload, "transferProposalId"), fact.roomId, fact.roomId, fact.id,
         fact.id, toKind, toId, ownerKind, ownerId, principalHumanActorId,
         stringField(payload, "reason"), human, timestamp, timestamp, fact.revision, expiresAt);
+      changedTransfer = Object.freeze({ id: stringField(payload, "transferProposalId"), revision: 1 });
       refreshTransferBoundary(database, {
         roomId: fact.roomId, transferId: stringField(payload, "transferProposalId"),
         revision: 1, holderActorId: principalHumanActorId,
@@ -1247,7 +1260,7 @@ function transitionFact(database: DatabaseSync,
       }
       if ((transfer.to_owner_kind !== "human" && transfer.to_owner_kind !== "agent") ||
           typeof transfer.to_owner_actor_id !== "string" || typeof transfer.reason !== "string" ||
-          typeof transfer.expires_at !== "string") {
+          typeof transfer.expires_at !== "string" || typeof transfer.revision !== "number") {
         throw new ProjectLoopAuthorityError("storage_unavailable", "NextAction transfer row is corrupt");
       }
       const expired = Date.parse(transfer.expires_at) <= operation.now;
@@ -1256,11 +1269,17 @@ function transitionFact(database: DatabaseSync,
         requireAssignableActor(database, fact.roomId, transfer.to_owner_actor_id,
           transfer.to_owner_kind);
       }
-      database.prepare(
+      const changed = database.prepare(
         `UPDATE project_transfer_proposals SET status = ?, revision = revision + 1, updated_at = ?,
-           resolved_by_human_actor_id = ?, resolved_at = ?, resolution_reason = ? WHERE id = ?`,
+           resolved_by_human_actor_id = ?, resolved_at = ?, resolution_reason = ?
+         WHERE id = ? AND room_id = ? AND revision = ? AND status = 'pending'`,
       ).run(expired ? "expired" : accepted ? "accepted" : "rejected", timestamp, human, timestamp,
-        expired ? "Transfer proposal expired" : accepted ? null : "Human rejected transfer", transferId);
+        expired ? "Transfer proposal expired" : accepted ? null : "Human rejected transfer",
+        transferId, fact.roomId, Number(transfer.revision));
+      if (changed.changes !== 1) {
+        throw new ProjectLoopAuthorityError("revision_conflict", "NextAction transfer changed concurrently");
+      }
+      changedTransfer = Object.freeze({ id: transferId, revision: Number(transfer.revision) + 1 });
       releaseTransferBoundary(database, fact.roomId, transferId, timestamp);
       if (expired) {
         const escalationHolder = transferEscalationHolder(fact);
@@ -1432,6 +1451,7 @@ function transitionFact(database: DatabaseSync,
         operation.command.factKind, fact.id, toKind, toId, ownerKind, ownerId,
         principalHumanActorId, stringField(payload, "reason"),
         principal.actorId, timestamp, timestamp, fact.revision, expiresAt);
+      changedTransfer = Object.freeze({ id: stringField(payload, "transferProposalId"), revision: 1 });
       refreshTransferBoundary(database, {
         roomId: fact.roomId, transferId: stringField(payload, "transferProposalId"),
         revision: 1, holderActorId: principalHumanActorId,
@@ -1451,7 +1471,7 @@ function transitionFact(database: DatabaseSync,
       }
       if ((transfer.to_owner_kind !== "human" && transfer.to_owner_kind !== "agent") ||
           typeof transfer.to_owner_actor_id !== "string" || typeof transfer.reason !== "string" ||
-          typeof transfer.expires_at !== "string") {
+          typeof transfer.expires_at !== "string" || typeof transfer.revision !== "number") {
         throw new ProjectLoopAuthorityError("storage_unavailable", "Obstacle transfer row is corrupt");
       }
       const expired = Date.parse(transfer.expires_at) <= operation.now;
@@ -1460,11 +1480,17 @@ function transitionFact(database: DatabaseSync,
         requireAssignableActor(database, fact.roomId, transfer.to_owner_actor_id,
           transfer.to_owner_kind);
       }
-      database.prepare(
+      const changed = database.prepare(
         `UPDATE project_transfer_proposals SET status = ?, revision = revision + 1, updated_at = ?,
-           resolved_by_human_actor_id = ?, resolved_at = ?, resolution_reason = ? WHERE id = ?`,
+           resolved_by_human_actor_id = ?, resolved_at = ?, resolution_reason = ?
+         WHERE id = ? AND room_id = ? AND revision = ? AND status = 'pending'`,
       ).run(expired ? "expired" : accepted ? "accepted" : "rejected", timestamp, human, timestamp,
-        expired ? "Transfer proposal expired" : accepted ? null : "Human rejected transfer", transferId);
+        expired ? "Transfer proposal expired" : accepted ? null : "Human rejected transfer",
+        transferId, fact.roomId, Number(transfer.revision));
+      if (changed.changes !== 1) {
+        throw new ProjectLoopAuthorityError("revision_conflict", "Obstacle transfer changed concurrently");
+      }
+      changedTransfer = Object.freeze({ id: transferId, revision: Number(transfer.revision) + 1 });
       releaseTransferBoundary(database, fact.roomId, transferId, timestamp);
       if (expired) refreshTransferBoundary(database, {
         roomId: fact.roomId, transferId, revision: Number(transfer.revision) + 1,
@@ -1535,13 +1561,25 @@ function transitionFact(database: DatabaseSync,
     ).run(escalation.boundaryId, fact.id, fact.roomId);
     updated = readFact(database, operation.command.factKind, fact.id, fact.roomId);
   }
-  const revision = current.revision + eventIds.length + 1;
   const source = fact.source;
-  const id = appendEvent(database, { roomId: fact.roomId, eventSeq: revision,
-    eventType: "fact.transitioned", factKind: fact.kind, factId: fact.id,
-    factRevision: updated.revision, actorKind: principal.kind, actorId: principal.actorId,
-    source, occurredAt: timestamp, payload: operation.command.payload });
-  eventIds.push(id);
+  if (changedTransfer !== null) {
+    eventIds.push(appendEvent(database, { roomId: fact.roomId,
+      eventSeq: current.revision + eventIds.length + 1,
+      eventType: "fact.transitioned", factKind: fact.kind, factId: fact.id,
+      factRevision: updated.revision, actorKind: principal.kind, actorId: principal.actorId,
+      source, occurredAt: timestamp, publicEntity: "transfer",
+      publicEntityId: changedTransfer.id, publicEntityRevision: changedTransfer.revision,
+      payload: Object.freeze({ ...operation.command.payload, transition,
+        transferProposalId: changedTransfer.id, transferRevision: changedTransfer.revision }) }));
+  }
+  if (changedTransfer === null || updated.revision !== fact.revision) {
+    eventIds.push(appendEvent(database, { roomId: fact.roomId,
+      eventSeq: current.revision + eventIds.length + 1,
+      eventType: "fact.transitioned", factKind: fact.kind, factId: fact.id,
+      factRevision: updated.revision, actorKind: principal.kind, actorId: principal.actorId,
+      source, occurredAt: timestamp, payload: operation.command.payload }));
+  }
+  const revision = current.revision + eventIds.length;
   return { kind: "project-loop-mutation", roomId: fact.roomId, projectId: fact.roomId,
     acceptedRevision: revision, eventIds: Object.freeze(eventIds), replayed: false };
 }
@@ -1677,6 +1715,10 @@ export function advanceProjectLoopTimedTransitionsInTransaction(database: Databa
   }
   let reopenedReviews = 0;
   let expiredTransfers = 0;
+  const transferSubjectRevisionAvailable = database.prepare(
+    `SELECT 1 FROM pragma_table_info('project_transfer_proposals')
+     WHERE name = 'subject_revision'`,
+  ).get() !== undefined;
   const reviews = database.prepare(
     `SELECT obstacle.id, obstacle.room_id AS roomId, obstacle.kind,
             obstacle.revision, obstacle.owner_kind AS ownerKind,
@@ -1702,6 +1744,37 @@ export function advanceProjectLoopTimedTransitionsInTransaction(database: Databa
        WHERE id = ? AND room_id = ? AND revision = ? AND status = 'deferred'`,
     ).run(input.now, row.id, row.roomId, row.revision);
     if (changed.changes !== 1) continue;
+    const reboundTransfers = transferSubjectRevisionAvailable ? database.prepare(
+      `SELECT id, revision, principal_human_actor_id AS principalActorId,
+              expires_at AS expiresAt
+       FROM project_transfer_proposals
+       WHERE room_id = ? AND subject_kind = ? AND subject_id = ?
+         AND subject_revision = ? AND status = 'pending'
+       ORDER BY id`,
+    ).all(row.roomId, row.kind, row.id, row.revision) : [];
+    for (const transfer of reboundTransfers) {
+      if (typeof transfer.id !== "string" || typeof transfer.revision !== "number" ||
+          typeof transfer.principalActorId !== "string" ||
+          (transfer.expiresAt !== null && typeof transfer.expiresAt !== "string")) {
+        throw new ProjectLoopAuthorityError("storage_unavailable",
+          "Project review transfer row is corrupt");
+      }
+      const rebound = database.prepare(
+        `UPDATE project_transfer_proposals
+         SET subject_revision = ?, revision = revision + 1, updated_at = ?
+         WHERE id = ? AND room_id = ? AND revision = ? AND status = 'pending'
+           AND subject_kind = ? AND subject_id = ? AND subject_revision = ?`,
+      ).run(row.revision + 1, input.now, transfer.id, row.roomId, transfer.revision,
+        row.kind, row.id, row.revision);
+      if (rebound.changes !== 1) {
+        throw new ProjectLoopAuthorityError("revision_conflict",
+          "Project review transfer changed concurrently");
+      }
+      releaseTransferBoundary(database, row.roomId, transfer.id, input.now);
+      refreshTransferBoundary(database, { roomId: row.roomId, transferId: transfer.id,
+        revision: transfer.revision + 1, holderActorId: transfer.principalActorId,
+        reason: "transfer_acceptance", dueAt: input.now, now: input.now });
+    }
     database.prepare(
       `UPDATE project_ball_boundaries SET status = 'superseded', released_at = ?
        WHERE room_id = ? AND source_kind = 'review' AND source_id = ?
@@ -1710,18 +1783,46 @@ export function advanceProjectLoopTimedTransitionsInTransaction(database: Databa
     const updated = readFact(database, row.kind, row.id, row.roomId);
     refreshBallBoundary(database, updated, input.now);
     const current = state(database, row.roomId, input.now);
-    appendEvent(database, { roomId: row.roomId, eventSeq: current.revision + 1,
+    let eventSeq = current.revision + 1;
+    appendEvent(database, { roomId: row.roomId, eventSeq,
       eventType: "fact.transitioned", factKind: row.kind, factId: row.id,
       factRevision: updated.revision, actorKind: row.ownerKind, actorId: row.ownerActorId,
       source: fact.source, occurredAt: input.now,
       payload: Object.freeze({ transition: "review_due", reason: "Review boundary reached" }),
       transitionAuthority: "system_timer" });
+    for (const transfer of reboundTransfers) {
+      eventSeq += 1;
+      appendEvent(database, { roomId: row.roomId, eventSeq,
+        eventType: "fact.transitioned", factKind: row.kind, factId: row.id,
+        factRevision: updated.revision, actorKind: row.ownerKind, actorId: row.ownerActorId,
+        source: fact.source, occurredAt: input.now, publicEntity: "transfer",
+        publicEntityId: String(transfer.id), publicEntityRevision: Number(transfer.revision) + 1,
+        payload: Object.freeze({ transition: "review_due_transfer_rebound",
+          transferProposalId: String(transfer.id), transferRevision: Number(transfer.revision) + 1 }),
+        transitionAuthority: "system_timer" });
+    }
     writeProjectLoopCheckpointInTransaction(database, { roomId: row.roomId,
-      projectRevision: current.revision + 1, occurredAt: input.now });
+      projectRevision: eventSeq, occurredAt: input.now });
     reopenedReviews += 1;
   }
   const remaining = input.limit - reopenedReviews;
   if (remaining > 0) {
+    const currentTransferSubject = transferSubjectRevisionAvailable ? `
+         AND (
+           (proposal.subject_kind = 'next_action' AND EXISTS (
+             SELECT 1 FROM project_next_actions AS action
+             WHERE action.room_id = proposal.room_id AND action.id = proposal.subject_id
+               AND action.revision = proposal.subject_revision
+               AND action.status IN ('proposed','accepted','in_progress','delivered')
+           ))
+           OR (proposal.subject_kind IN ('blocker','open_question') AND EXISTS (
+             SELECT 1 FROM project_obstacles AS obstacle
+             WHERE obstacle.room_id = proposal.room_id AND obstacle.id = proposal.subject_id
+               AND obstacle.kind = proposal.subject_kind
+               AND obstacle.revision = proposal.subject_revision
+               AND obstacle.status IN ('open','deferred','cannot_answer')
+           ))
+         )` : "";
     const transfers = database.prepare(
       `SELECT proposal.id, proposal.room_id AS roomId, proposal.revision,
               proposal.subject_kind AS subjectKind, proposal.subject_id AS subjectId,
@@ -1730,6 +1831,7 @@ export function advanceProjectLoopTimedTransitionsInTransaction(database: Databa
        JOIN rooms AS room ON room.id = proposal.room_id
        WHERE proposal.status = 'pending' AND proposal.expires_at IS NOT NULL
          AND proposal.expires_at <= ? AND room.status = 'active'
+         ${currentTransferSubject}
        ORDER BY proposal.expires_at, proposal.room_id, proposal.id LIMIT ?`,
     ).all(input.now, remaining);
     for (const row of transfers) {

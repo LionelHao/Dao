@@ -95,6 +95,7 @@ function createDatabase(path = ":memory:"): DatabaseSync {
         subject_kind IN ('next_action', 'blocker', 'open_question')
       ),
       subject_id TEXT NOT NULL,
+      subject_revision INTEGER NOT NULL CHECK (subject_revision > 0),
       to_owner_kind TEXT NOT NULL CHECK (to_owner_kind IN ('human', 'agent')),
       to_owner_actor_id TEXT NOT NULL,
       principal_human_actor_id TEXT NOT NULL,
@@ -145,6 +146,10 @@ function insertCompleteResponsibilityFixture(database: DatabaseSync): void {
        'agent', 'agent-2', 'human-1', 'in_progress', 'message'),
       ('action-done', 'room-1', 'room-1', 'message-action-done', 2,
        'human', 'human-1', NULL, 'done', 'message'),
+      ('action-other', 'room-1', 'room-1', 'message-action-other', 1,
+       'human', 'human-target', NULL, 'accepted', 'message'),
+      ('action-agent', 'room-1', 'room-1', 'message-action-agent', 1,
+       'agent', 'agent-3', 'human-target', 'accepted', 'message'),
       ('action-legacy', 'room-1', 'room-1', 'legacy-action', 1,
        'human', 'human-1', NULL, 'in_progress', 'legacy_v14');
     INSERT INTO project_obstacles VALUES
@@ -158,13 +163,15 @@ function insertCompleteResponsibilityFixture(database: DatabaseSync): void {
        'blocker', 'human', 'human-1', 'open', 'legacy_v14');
     INSERT INTO project_transfer_proposals VALUES
       ('transfer-1', 'room-1', 'room-1', 'message-transfer', 8,
-       'next_action', 'action-other', 'human', 'human-1', 'human-1', 'pending', 'message'),
+       'next_action', 'action-other', 1, 'human', 'human-1', 'human-1', 'pending', 'message'),
       ('transfer-agent', 'room-1', 'room-1', 'message-transfer-agent', 2,
-       'next_action', 'action-agent', 'agent', 'agent-3', 'human-1', 'pending', 'message'),
+       'next_action', 'action-agent', 1, 'agent', 'agent-3', 'human-1', 'pending', 'message'),
+      ('transfer-stale', 'room-1', 'room-1', 'message-transfer-stale', 1,
+       'next_action', 'action-owned', 3, 'human', 'human-1', 'human-1', 'pending', 'message'),
       ('transfer-terminal', 'room-1', 'room-1', 'message-transfer-terminal', 1,
-       'blocker', 'blocker-other', 'human', 'human-1', 'human-1', 'rejected', 'message'),
+       'blocker', 'blocker-other', 1, 'human', 'human-1', 'human-1', 'rejected', 'message'),
       ('transfer-legacy', 'room-1', 'room-1', 'legacy-transfer', 1,
-       'blocker', 'legacy-blocker', 'human', 'human-1', 'human-1', 'pending', 'legacy_v14');
+       'blocker', 'legacy-blocker', 1, 'human', 'human-1', 'human-1', 'pending', 'legacy_v14');
     INSERT INTO project_fact_proposals VALUES
       ('proposal-confirmation', 'room-1', 'room-1', 'message-confirmation', 4);
     INSERT INTO project_confirmations VALUES
@@ -324,6 +331,8 @@ describe("FT-09A departure responsibility production aggregate", () => {
       expect(result.roomId).toBe("room-1");
       expect(result.targetHumanActorId).toBe("human-1");
       expect(result.conflicts).toHaveLength(10);
+      expect(result.conflicts.map((conflict) => conflict.subjectId))
+        .not.toContain("transfer-stale");
       expect(result.conflicts.map((conflict) => conflict.title).sort()).toEqual([
         "project.blocker.owner",
         "project.confirmation.pending",

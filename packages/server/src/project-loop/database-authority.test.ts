@@ -313,8 +313,15 @@ describe("Project Loop database authority", () => {
         { kind: "review", revision: 3 },
         { kind: "transfer", revision: 2 },
         { kind: "transfer", revision: 2 },
-        { kind: "transfer", revision: 2 },
       ]);
+      expect(database.prepare(
+        `SELECT audit.authority_kind AS authorityKind,
+                json_extract(audit.transition_json, '$.transferRevision') AS revision
+         FROM project_transition_audit AS audit
+         WHERE json_extract(audit.transition_json, '$.transition') =
+           'room_reopen_transfer_timer_rescheduled'
+           AND json_extract(audit.transition_json, '$.transferProposalId') = 'timer-transfer'`,
+      ).get()).toEqual({ authorityKind: "human", revision: 2 });
       expect(database.prepare(
         "SELECT COUNT(*) AS count FROM project_fact_checkpoints WHERE room_id = 'room-project' AND project_revision = ?",
       ).get(before + 6)).toEqual({ count: 1 });
@@ -349,6 +356,80 @@ describe("Project Loop database authority", () => {
         { id: "timer-review-current-transfer", status: "accepted" },
         { id: "timer-transfer", status: "pending" },
       ]);
+    });
+  });
+
+  it("rebinds only the current pending transfer when a deferred review becomes due", () => {
+    withDatabase((database) => {
+      const roomRevision = () => Number(database.prepare(
+        "SELECT revision FROM project_room_states WHERE room_id = 'room-project'",
+      ).get()?.revision ?? 0);
+      const createDeferred = (id: string, transferId: string, transferBeforeDefer: boolean) => {
+        executeProjectLoopAuthorityOperation(database, createFactProposal({
+          proposalId: `proposal-${id}`, factKind: "blocker", factId: id,
+          baseRevision: roomRevision(), payload: { title: id, description: "Await review",
+            impact: "Risk", resolutionCriteria: "Reviewed", question: null,
+            ownerKind: "human", ownerActorId: "human-member", dueAt: null, reviewAt: null },
+        }));
+        executeProjectLoopAuthorityOperation(database, resolveFactProposal(`proposal-${id}`, 1));
+        const proposeTransfer = (revision: number) => executeProjectLoopAuthorityOperation(database, {
+          type: "project-loop.fact.transition", context: humanContext(`propose-${transferId}`, "human-member"),
+          command: { roomId: "room-project", projectId: "room-project", factKind: "blocker",
+            factId: id, expectedRevision: revision, transition: "obstacle.transfer_propose",
+            payload: { transferProposalId: transferId, toOwnerKind: "human",
+              toOwnerActorId: "human-owner", reason: "Review handoff",
+              expiresAt: "2026-08-26T08:00:00.000Z" } }, now: NOW + revision,
+        });
+        if (transferBeforeDefer) proposeTransfer(1);
+        executeProjectLoopAuthorityOperation(database, {
+          type: "project-loop.fact.transition", context: humanContext(`defer-${id}`, "human-member"),
+          command: { roomId: "room-project", projectId: "room-project", factKind: "blocker",
+            factId: id, expectedRevision: 1, transition: "obstacle.defer",
+            payload: { reason: "Wait", reviewAt: "2026-08-25T09:00:00.000Z" } }, now: NOW + 2,
+        });
+        if (!transferBeforeDefer) proposeTransfer(2);
+      };
+      createDeferred("review-current", "review-current-transfer", false);
+      createDeferred("review-stale", "review-stale-transfer", true);
+
+      database.exec("BEGIN IMMEDIATE");
+      expect(advanceProjectLoopTimedTransitionsInTransaction(database, {
+        now: "2026-08-25T10:00:00.000Z", limit: 256,
+      })).toEqual({ reopenedReviews: 2, expiredTransfers: 0 });
+      database.exec("COMMIT");
+      expect(database.prepare(
+        `SELECT id, revision, subject_revision AS subjectRevision, status
+         FROM project_transfer_proposals
+         WHERE id IN ('review-current-transfer','review-stale-transfer') ORDER BY id`,
+      ).all()).toEqual([
+        { id: "review-current-transfer", revision: 2, subjectRevision: 3, status: "pending" },
+        { id: "review-stale-transfer", revision: 1, subjectRevision: 1, status: "pending" },
+      ]);
+      expect(database.prepare(
+        `SELECT project.authority_kind AS authorityKind, public.event_type AS publicType,
+                json_extract(public.payload_json, '$.transferProposalId') AS transferId,
+                json_extract(public.payload_json, '$.revision') AS revision
+         FROM project_events AS project JOIN events AS public ON public.event_id = project.event_id
+         WHERE json_extract(project.payload_json, '$.transition') = 'review_due_transfer_rebound'`,
+      ).all()).toEqual([{ authorityKind: "system_timer",
+        publicType: "project.transfer-proposal.changed",
+        transferId: "review-current-transfer", revision: 2 }]);
+      expect(database.prepare(
+        `SELECT source_id AS sourceId FROM project_ball_boundaries
+         WHERE source_kind = 'transfer' AND status = 'active' ORDER BY source_id`,
+      ).all()).toEqual([{ sourceId: "review-current-transfer" }]);
+      executeProjectLoopAuthorityOperation(database, {
+        type: "project-loop.fact.transition", context: humanContext("accept-current-review-transfer"),
+        command: { roomId: "room-project", projectId: "room-project", factKind: "blocker",
+          factId: "review-current", expectedRevision: 3, transition: "obstacle.transfer_accept",
+          payload: { transferProposalId: "review-current-transfer" } }, now: NOW + 10,
+      });
+      expect(() => executeProjectLoopAuthorityOperation(database, {
+        type: "project-loop.fact.transition", context: humanContext("reject-stale-review-transfer"),
+        command: { roomId: "room-project", projectId: "room-project", factKind: "blocker",
+          factId: "review-stale", expectedRevision: 3, transition: "obstacle.transfer_accept",
+          payload: { transferProposalId: "review-stale-transfer" } }, now: NOW + 11,
+      })).toThrowError(expect.objectContaining({ code: "permission_denied" }));
     });
   });
 
@@ -951,21 +1032,46 @@ describe("Project Loop database authority", () => {
       ).get()).toEqual({ kind: "review" });
       transition("reopen", 2, "obstacle.reopen", { reason: "Review arrived" });
       transition("cannot", 3, "obstacle.cannot_answer", { reason: "Needs escalation" });
-      transition("propose-transfer", 4, "obstacle.transfer_propose", {
+      const proposed = transition("propose-transfer", 4, "obstacle.transfer_propose", {
         transferProposalId: "transfer-blocker", toOwnerKind: "human",
         toOwnerActorId: "human-owner", reason: "Owner decides",
         expiresAt: "2026-08-26T08:00:00.000Z",
       });
+      expect(proposed).toMatchObject({ acceptedRevision: 6 });
+      expect(proposed.kind === "project-loop-mutation" ? proposed.eventIds : []).toHaveLength(1);
+      expect(database.prepare(
+        `SELECT event_type AS type, json_extract(payload_json, '$.status') AS status,
+                json_extract(payload_json, '$.revision') AS revision
+         FROM events ORDER BY stream_seq DESC LIMIT 1`,
+      ).get()).toEqual({ type: "project.transfer-proposal.changed", status: "pending", revision: 1 });
       const accepted = transition("accept-transfer", 4, "obstacle.transfer_accept", {
         transferProposalId: "transfer-blocker",
       });
-      expect(accepted).toMatchObject({ acceptedRevision: 7 });
+      expect(accepted).toMatchObject({ acceptedRevision: 8 });
+      expect(accepted.kind === "project-loop-mutation" ? accepted.eventIds : []).toHaveLength(2);
+      expect(database.prepare(
+        `SELECT event_type AS type, json_extract(payload_json, '$.status') AS status,
+                json_extract(payload_json, '$.revision') AS revision
+         FROM events ORDER BY stream_seq DESC LIMIT 2`,
+      ).all().reverse()).toEqual([
+        { type: "project.transfer-proposal.changed", status: "accepted", revision: 2 },
+        { type: "project.blocker.changed", status: "open", revision: 5 },
+      ]);
       expect(database.prepare(
         "SELECT status, escalation_emitted AS escalation FROM project_obstacles WHERE id = 'blocker-one'",
       ).get()).toEqual({ status: "open", escalation: 0 });
       expect(database.prepare(
         "SELECT to_owner_actor_id AS target FROM project_transfer_chain WHERE transfer_id = 'transfer-blocker'",
       ).get()).toEqual({ target: "human-owner" });
+      const repaired = readProjectLoopRepairSnapshotDatabaseQuery(database, {
+        roomId: "room-project", projectId: "room-project", watermark: 8,
+        afterEventSeq: 0, limit: 50,
+      });
+      expect(repaired.transferProposals).toEqual([expect.objectContaining({
+        transferProposalId: "transfer-blocker", revision: 2, status: "accepted",
+        subjectKind: "blocker", subjectId: "blocker-one", subjectRevision: 4,
+      })]);
+      expect(isProjectSnapshot(repaired)).toBe(true);
     });
   });
 
@@ -1342,7 +1448,8 @@ describe("Project Loop database authority", () => {
         .toEqual({ kind: "system_timer" });
       const timerDelivery = listPendingOutboxDatabaseQuery(
         database, 100, NOW + 2 * 86_400_000,
-      ).find((delivery) => delivery.event.type === "project.transfer-proposal.changed");
+      ).find((delivery) => delivery.event.type === "project.transfer-proposal.changed" &&
+        delivery.event.transitionAuthority.kind === "system_timer");
       expect(timerDelivery?.event).toMatchObject({
         transitionAuthority: { kind: "system_timer" },
         causalActor: null,
@@ -1350,8 +1457,27 @@ describe("Project Loop database authority", () => {
 
       transition("propose-action-transfer", "human-member", 2,
         "next_action.transfer_propose", "transfer-action-accepted");
-      transition("accept-action-transfer", "human-owner", 2,
+      const acceptedTransfer = transition("accept-action-transfer", "human-owner", 2,
         "next_action.transfer_accept", "transfer-action-accepted");
+      expect(acceptedTransfer.kind === "project-loop-mutation"
+        ? acceptedTransfer.eventIds : []).toHaveLength(2);
+      expect(database.prepare(
+        `SELECT event_type AS type, json_extract(payload_json, '$.revision') AS revision
+         FROM events ORDER BY stream_seq DESC LIMIT 2`,
+      ).all().reverse()).toEqual([
+        { type: "project.transfer-proposal.changed", revision: 2 },
+        { type: "project.next-action.changed", revision: 3 },
+      ]);
+      const acceptedRepair = readProjectLoopRepairSnapshotDatabaseQuery(database, {
+        roomId: "room-project", projectId: "room-project",
+        watermark: acceptedTransfer.kind === "project-loop-mutation"
+          ? acceptedTransfer.acceptedRevision : 0,
+        afterEventSeq: 0, limit: 100,
+      });
+      expect(acceptedRepair.transferProposals).toEqual(expect.arrayContaining([
+        expect.objectContaining({ transferProposalId: "transfer-action-accepted",
+          revision: 2, status: "accepted" }),
+      ]));
       expect(database.prepare(
         `SELECT revision, owner_actor_id AS owner, status, accepted_by_human_actor_id AS acceptedBy
          FROM project_next_actions WHERE id = 'transfer-action'`,

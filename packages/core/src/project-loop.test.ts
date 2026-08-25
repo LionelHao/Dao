@@ -377,6 +377,11 @@ describe("FT-09 Project Loop closed core contracts", () => {
     expect(balls.find((ball) => ball.sourceKind === "confirmation")?.holder).toEqual(human1);
     expect(balls.find((ball) => ball.sourceKind === "transfer")?.holder).toEqual(human1);
     expect(deriveProjectBallFacts({
+      roomId: "room-1", projectId: "room-1", requests: [],
+      nextActions: [{ ...humanAction, revision: 2 }], obstacles: [], proposals: [],
+      confirmations: [], transferProposals: [transferProposal],
+    }).some((ball) => ball.sourceKind === "transfer")).toBe(false);
+    expect(deriveProjectBallFacts({
       roomId: "room-1",
       projectId: "room-2",
       requests: [], nextActions: [], obstacles: [], proposals: [], confirmations: [], transferProposals: [],

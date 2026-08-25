@@ -1049,8 +1049,23 @@ export function deriveProjectBallFacts(input: ProjectBallDerivationInput): reado
       "Project confirmation awaits its named Human principal.", "pending_confirmation",
       `confirmation:${item.confirmationId}`, item.expiresAt, null);
   }
+  const currentTransferSubjects = new Set<string>();
+  for (const action of input.nextActions) {
+    if (action.status === "proposed" || action.status === "accepted" ||
+        action.status === "in_progress" || action.status === "delivered") {
+      currentTransferSubjects.add(`next_action\0${action.nextActionId}\0${action.revision}`);
+    }
+  }
+  for (const obstacle of input.obstacles) {
+    if (obstacle.status === "open" || obstacle.status === "deferred" ||
+        obstacle.status === "cannot_answer") {
+      currentTransferSubjects.add(`${obstacle.kind}\0${obstacle.obstacleId}\0${obstacle.revision}`);
+    }
+  }
   for (const transfer of input.transferProposals) {
-    if (transfer.status === "pending") appendBall(output, input.roomId, "transfer",
+    if (transfer.status === "pending" && currentTransferSubjects.has(
+      `${transfer.subjectKind}\0${transfer.subjectId}\0${transfer.subjectRevision}`,
+    )) appendBall(output, input.roomId, "transfer",
       transfer.transferProposalId, transfer.revision,
       { actorId: transfer.principalActorId, kind: "human" }, transfer.proposedAt,
       "Transfer proposal awaits target acceptance or Human principal confirmation.",

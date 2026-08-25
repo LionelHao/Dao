@@ -55,10 +55,49 @@ describe("authority SQLite v25 Project transition authority", () => {
           actor_kind,actor_id,transition_json,occurred_at
         ) VALUES ('audit-v24','room-v24','room-v24',1,'event-v24','fact.created','request',
                   'request-v24','human','human-v24','{}','2026-08-25T00:00:00.000Z');
+        INSERT INTO project_events (
+          event_id,room_id,project_id,event_seq,event_type,fact_kind,fact_id,fact_revision,
+          actor_kind,actor_id,source_room_id,source_id,source_kind,source_revision,
+          source_visibility,occurred_at,payload_json
+        ) VALUES
+          ('review-v24','room-v24','room-v24',2,'fact.transitioned','blocker','blocker-v24',2,
+           'human','human-v24','room-v24','source-v24','legacy',1,'room',
+           '2026-08-25T01:00:00.000Z','{"transition":"review_due","reason":"Review boundary reached"}'),
+          ('transfer-v24','room-v24','room-v24',3,'fact.transitioned','next_action','action-v24',4,
+           'human','human-v24','room-v24','source-v24','legacy',1,'room',
+           '2026-08-25T02:00:00.000Z','{"transition":"transfer_expired","transferProposalId":"transfer-old"}');
+        INSERT INTO project_transition_audit (
+          audit_id,room_id,project_id,project_revision,event_id,operation,fact_kind,fact_id,
+          actor_kind,actor_id,transition_json,occurred_at
+        ) VALUES
+          ('audit-review-v24','room-v24','room-v24',2,'review-v24','fact.transitioned',
+           'blocker','blocker-v24','human','human-v24',
+           '{"transition":"review_due","reason":"Review boundary reached"}',
+           '2026-08-25T01:00:00.000Z'),
+          ('audit-transfer-v24','room-v24','room-v24',3,'transfer-v24','fact.transitioned',
+           'next_action','action-v24','human','human-v24',
+           '{"transition":"transfer_expired","transferProposalId":"transfer-old"}',
+           '2026-08-25T02:00:00.000Z');
         INSERT INTO events (
           event_id,stream_kind,stream_id,stream_seq,room_id,actor_id,event_type,occurred_at,payload_json
         ) VALUES ('event-v24','room','room-v24',1,'room-v24','human-v24',
-                  'project.request.changed','2026-08-25T00:00:00.000Z','{}');
+           'project.request.changed','2026-08-25T00:00:00.000Z','{}');
+        UPDATE streams SET head_seq = 2 WHERE stream_kind = 'room' AND stream_id = 'room-v24';
+        INSERT INTO events (
+          event_id,stream_kind,stream_id,stream_seq,room_id,actor_id,event_type,occurred_at,payload_json
+        ) VALUES ('review-v24','room','room-v24',2,'room-v24','human-v24',
+           'project.blocker.changed','2026-08-25T01:00:00.000Z',
+           '{"obstacleId":"blocker-v24","revision":2}');
+        UPDATE streams SET head_seq = 3 WHERE stream_kind = 'room' AND stream_id = 'room-v24';
+        INSERT INTO events (
+          event_id,stream_kind,stream_id,stream_seq,room_id,actor_id,event_type,occurred_at,payload_json
+        ) VALUES ('transfer-v24','room','room-v24',3,'room-v24','human-v24',
+           'project.next-action.changed','2026-08-25T02:00:00.000Z',
+           '{"nextActionId":"action-v24","revision":4}');
+        INSERT INTO project_event_outbox (event_id,room_id,event_seq,available_at) VALUES
+          ('event-v24','room-v24',1,'2026-08-25T00:00:00.000Z'),
+          ('review-v24','room-v24',2,'2026-08-25T01:00:00.000Z'),
+          ('transfer-v24','room-v24',3,'2026-08-25T02:00:00.000Z');
       `);
       const history = database.prepare(
         "SELECT version, name, checksum FROM schema_migrations ORDER BY version",
@@ -89,6 +128,25 @@ describe("authority SQLite v25 Project transition authority", () => {
       ).get()).toEqual({ publicAuthority: "human", projectAuthority: "human",
         causalKind: "human", causalActorId: "human-v24", auditAuthority: "human",
         auditCausalActorId: "human-v24" });
+      expect(database.prepare(
+        `SELECT project.event_id AS eventId,
+                public.authority_kind AS publicAuthority, public.actor_id AS publicActor,
+                project.authority_kind AS projectAuthority, project.actor_id AS projectActor,
+                project.causal_actor_id AS causalActor,
+                audit.authority_kind AS auditAuthority, audit.actor_id AS auditActor,
+                audit.causal_actor_id AS auditCausal
+         FROM project_events AS project
+         JOIN events AS public ON public.event_id = project.event_id
+         JOIN project_transition_audit AS audit ON audit.event_id = project.event_id
+         WHERE project.event_id IN ('review-v24','transfer-v24') ORDER BY project.event_seq`,
+      ).all()).toEqual([
+        { eventId: "review-v24", publicAuthority: "system_timer", publicActor: null,
+          projectAuthority: "system_timer", projectActor: null, causalActor: null,
+          auditAuthority: "system_timer", auditActor: null, auditCausal: null },
+        { eventId: "transfer-v24", publicAuthority: "system_timer", publicActor: null,
+          projectAuthority: "system_timer", projectActor: null, causalActor: null,
+          auditAuthority: "system_timer", auditActor: null, auditCausal: null },
+      ]);
       expect(AUTHORITY_V25_MIGRATION_CHECKSUM_FOR_TEST).toMatch(/^[a-f0-9]{64}$/);
     });
   });
@@ -172,6 +230,34 @@ describe("authority SQLite v25 Project transition authority", () => {
          ) VALUES ('review-event','room','room-1',1,'room-1','system_timer',NULL,
                    'project.goal.changed','2026-08-25T00:00:00.000Z','{}')`,
       ).run()).toThrow(/event sequence is outside/i);
+      fresh.prepare(
+        `INSERT INTO events (
+           event_id,stream_kind,stream_id,stream_seq,room_id,authority_kind,actor_id,
+           event_type,occurred_at,payload_json
+         ) VALUES ('review-event','room','room-1',1,'room-1','system_timer',NULL,
+                   'project.blocker.changed','2026-08-25T00:00:00.000Z',
+                   '{"obstacleId":"blocker-1","revision":1}')`,
+      ).run();
+      expect(() => migrateAuthorityDatabase(fresh)).toThrow(
+        /Project events must retain closed Human, Agent, or system timer authority/i,
+      );
+      fresh.prepare(
+        `INSERT INTO project_transition_audit (
+           audit_id,room_id,project_id,project_revision,event_id,operation,fact_kind,fact_id,
+           authority_kind,actor_kind,actor_id,causal_actor_kind,causal_actor_id,
+           transition_json,occurred_at
+         ) VALUES ('audit-review-event','room-1','room-1',1,'review-event','fact.transitioned',
+                   'blocker','blocker-1','system_timer',NULL,NULL,NULL,NULL,
+                   '{"transition":"review_due"}','2026-08-25T00:00:00.000Z')`,
+      ).run();
+      expect(() => migrateAuthorityDatabase(fresh)).toThrow(
+        /Project events must retain closed Human, Agent, or system timer authority/i,
+      );
+      fresh.prepare(
+        `INSERT INTO project_event_outbox (event_id,room_id,event_seq,available_at)
+         VALUES ('review-event','room-1',1,'2026-08-25T00:00:00.000Z')`,
+      ).run();
+      expect(() => migrateAuthorityDatabase(fresh)).not.toThrow();
       expect(() => fresh.prepare(
         `INSERT INTO events (
            event_id,stream_kind,stream_id,stream_seq,room_id,authority_kind,actor_id,
