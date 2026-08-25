@@ -402,7 +402,8 @@ describe("FT-09 Project Loop closed core contracts", () => {
       streamSeq: 7,
       roomId: "room-1",
       projectId: "room-1",
-      actorId: "human-1",
+      transitionAuthority: { kind: "human" as const, actorId: "human-1" },
+      causalActor: { kind: "human" as const, actorId: "human-1" },
       occurredAt: at,
       type: "project.request.changed" as const,
       payload: pendingRequest,
@@ -424,6 +425,9 @@ describe("FT-09 Project Loop closed core contracts", () => {
       capturedAt: later,
     };
     expect(isProjectEvent(event)).toBe(true);
+    expect(isProjectEvent({ ...event, transitionAuthority: { kind: "system_timer" } })).toBe(true);
+    expect(isProjectEvent({ ...event,
+      transitionAuthority: { kind: "system_timer", actorId: "human-1" } })).toBe(false);
     expect(isProjectSnapshot(snapshot)).toBe(true);
     expect(isProjectRepairRecord({ kind: "project-loop", roomId: "room-1", value: snapshot }, "room-1")).toBe(true);
     expect(isProjectEvent({ ...event, streamId: "room-2" })).toBe(false);

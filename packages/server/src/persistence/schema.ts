@@ -7,7 +7,7 @@ import {
 } from "../access/room-cache-invalidation-port.js";
 import { OFFLINE_READ_LEASE_SCHEMA_STATEMENTS } from "../access/offline-lease-invalidation-port.js";
 
-export const AUTHORITY_SCHEMA_VERSION = 24 as const;
+export const AUTHORITY_SCHEMA_VERSION = 25 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -76,6 +76,7 @@ const SCHEMA_FINGERPRINTS = {
   22: "cbf4ccb27b52c3b88d61667f94811501d36a54795391e0044bbb0b2f41d3c7ce",
   23: "532b7c0589c5ae2f4cb96c43747b19e3a7c83c2f04fd9fea663191ea5a46aced",
   24: "ef4c3593ee4384350f57c1f92e6d229c523b4c99817f95222718c4abe10db896",
+  25: "f71a064e11a05f9543ac238ffc0c331cc609a68dd8e395dc8e5e5bbfe0d1cd1b",
 } as const;
 
 const V1_STATEMENTS = [
@@ -8425,6 +8426,208 @@ export const AUTHORITY_V24_MIGRATION_CHECKSUM_FOR_TEST = migrationChecksum(
   V24_STATEMENTS,
 );
 
+const V25_STATEMENTS = [
+  `DROP TRIGGER events_validate_insert`,
+  `DROP TRIGGER events_prevent_update`,
+  `DROP TRIGGER events_validate_delete`,
+  `DROP TRIGGER project_events_immutable_update_v23`,
+  `DROP TRIGGER project_events_immutable_delete_v23`,
+  `DROP TRIGGER project_transition_audit_immutable_update_v23`,
+  `DROP TRIGGER project_transition_audit_immutable_delete_v23`,
+  `PRAGMA legacy_alter_table = ON`,
+  `ALTER TABLE outbox_deliveries RENAME TO outbox_deliveries_v24`,
+  `ALTER TABLE project_event_outbox RENAME TO project_event_outbox_v24`,
+  `ALTER TABLE project_transition_audit RENAME TO project_transition_audit_v24`,
+  `ALTER TABLE events RENAME TO events_v24`,
+  `ALTER TABLE project_events RENAME TO project_events_v24`,
+  `CREATE TABLE events (
+    event_id TEXT PRIMARY KEY,
+    stream_kind TEXT NOT NULL CHECK (stream_kind IN ('room', 'identity')),
+    stream_id TEXT NOT NULL,
+    stream_seq INTEGER NOT NULL CHECK (stream_seq >= 1),
+    room_id TEXT REFERENCES rooms(id),
+    authority_kind TEXT NOT NULL DEFAULT 'actor'
+      CHECK (authority_kind IN ('actor', 'human', 'agent', 'system_timer')),
+    actor_id TEXT REFERENCES actors(id),
+    event_type TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    UNIQUE (stream_kind, stream_id, stream_seq),
+    UNIQUE (event_id, stream_seq),
+    FOREIGN KEY (stream_kind, stream_id) REFERENCES streams(stream_kind, stream_id),
+    CHECK (
+      (stream_kind = 'room' AND room_id IS NOT NULL AND room_id = stream_id)
+      OR (stream_kind = 'identity' AND room_id IS NULL)
+    ),
+    CHECK (
+      (authority_kind = 'system_timer' AND actor_id IS NULL AND event_type LIKE 'project.%')
+      OR (authority_kind <> 'system_timer' AND actor_id IS NOT NULL)
+    )
+  ) STRICT`,
+  `INSERT INTO events (
+     event_id, stream_kind, stream_id, stream_seq, room_id, authority_kind,
+     actor_id, event_type, occurred_at, payload_json
+   ) SELECT legacy.event_id, legacy.stream_kind, legacy.stream_id, legacy.stream_seq,
+            legacy.room_id,
+            CASE WHEN legacy.event_type LIKE 'project.%'
+              THEN COALESCE(project.actor_kind, actor.kind)
+              ELSE 'actor' END,
+            legacy.actor_id, legacy.event_type, legacy.occurred_at, legacy.payload_json
+     FROM events_v24 AS legacy
+     LEFT JOIN project_events_v24 AS project ON project.event_id = legacy.event_id
+     LEFT JOIN actors AS actor ON actor.id = legacy.actor_id`,
+  `CREATE TABLE project_events (
+    event_id TEXT PRIMARY KEY CHECK (length(trim(event_id)) BETWEEN 1 AND 192),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    project_id TEXT NOT NULL REFERENCES rooms(id) CHECK (project_id = room_id),
+    event_seq INTEGER NOT NULL CHECK (event_seq > 0),
+    event_type TEXT NOT NULL CHECK (event_type IN ('proposal.created', 'proposal.confirmed', 'proposal.rejected', 'fact.created', 'fact.transitioned')),
+    fact_kind TEXT NOT NULL CHECK (fact_kind IN ('goal', 'decision', 'request', 'next_action', 'blocker', 'open_question')),
+    fact_id TEXT NOT NULL,
+    fact_revision INTEGER NOT NULL CHECK (fact_revision > 0),
+    authority_kind TEXT NOT NULL CHECK (authority_kind IN ('human', 'agent', 'system_timer')),
+    actor_kind TEXT CHECK (actor_kind IN ('human', 'agent')),
+    actor_id TEXT REFERENCES actors(id),
+    causal_actor_kind TEXT NOT NULL CHECK (causal_actor_kind IN ('human', 'agent')),
+    causal_actor_id TEXT NOT NULL REFERENCES actors(id),
+    source_room_id TEXT NOT NULL REFERENCES rooms(id) CHECK (source_room_id = room_id),
+    source_id TEXT NOT NULL,
+    source_kind TEXT NOT NULL CHECK (source_kind IN ('message', 'attachment', 'agent_execution', 'memory', 'project_fact', 'legacy')),
+    source_revision INTEGER NOT NULL CHECK (source_revision > 0),
+    source_visibility TEXT NOT NULL CHECK (source_visibility = 'room'),
+    occurred_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json) AND json_type(payload_json) = 'object'),
+    UNIQUE (room_id, event_seq),
+    CHECK ((authority_kind = 'system_timer' AND actor_kind IS NULL AND actor_id IS NULL)
+      OR (authority_kind IN ('human','agent') AND actor_kind = authority_kind AND actor_id IS NOT NULL))
+  ) STRICT`,
+  `INSERT INTO project_events (
+     event_id, room_id, project_id, event_seq, event_type, fact_kind, fact_id,
+     fact_revision, authority_kind, actor_kind, actor_id, causal_actor_kind,
+     causal_actor_id, source_room_id, source_id, source_kind, source_revision,
+     source_visibility, occurred_at, payload_json
+   ) SELECT event_id, room_id, project_id, event_seq, event_type, fact_kind, fact_id,
+            fact_revision, actor_kind, actor_kind, actor_id, actor_kind, actor_id,
+            source_room_id, source_id, source_kind, source_revision, source_visibility,
+            occurred_at, payload_json FROM project_events_v24`,
+  `CREATE TABLE project_transition_audit (
+    audit_id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    project_id TEXT NOT NULL REFERENCES rooms(id) CHECK (project_id = room_id),
+    project_revision INTEGER NOT NULL CHECK (project_revision > 0),
+    event_id TEXT NOT NULL UNIQUE REFERENCES project_events(event_id),
+    operation TEXT NOT NULL,
+    fact_kind TEXT NOT NULL,
+    fact_id TEXT NOT NULL,
+    authority_kind TEXT NOT NULL CHECK (authority_kind IN ('human', 'agent', 'system_timer')),
+    actor_kind TEXT CHECK (actor_kind IN ('human', 'agent')),
+    actor_id TEXT REFERENCES actors(id),
+    causal_actor_kind TEXT NOT NULL CHECK (causal_actor_kind IN ('human', 'agent')),
+    causal_actor_id TEXT NOT NULL REFERENCES actors(id),
+    transition_json TEXT NOT NULL CHECK (json_valid(transition_json)),
+    occurred_at TEXT NOT NULL,
+    UNIQUE (room_id, project_revision),
+    CHECK ((authority_kind = 'system_timer' AND actor_kind IS NULL AND actor_id IS NULL)
+      OR (authority_kind IN ('human','agent') AND actor_kind = authority_kind AND actor_id IS NOT NULL))
+  ) STRICT`,
+  `INSERT INTO project_transition_audit (
+     audit_id, room_id, project_id, project_revision, event_id, operation, fact_kind,
+     fact_id, authority_kind, actor_kind, actor_id, causal_actor_kind, causal_actor_id,
+     transition_json, occurred_at
+   ) SELECT audit_id, room_id, project_id, project_revision, event_id, operation,
+            fact_kind, fact_id, actor_kind, actor_kind, actor_id, actor_kind, actor_id,
+            transition_json, occurred_at FROM project_transition_audit_v24`,
+  `CREATE TABLE outbox_deliveries (
+    id TEXT NOT NULL UNIQUE,
+    event_id TEXT NOT NULL REFERENCES events(event_id),
+    target_kind TEXT NOT NULL CHECK (target_kind IN ('room', 'principal', 'session-family')),
+    target_id TEXT NOT NULL CHECK (length(target_id) > 0),
+    stream_seq INTEGER NOT NULL CHECK (stream_seq >= 1),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'dispatched')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    available_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT,
+    PRIMARY KEY (event_id, target_kind, target_id),
+    FOREIGN KEY (event_id, stream_seq) REFERENCES events(event_id, stream_seq)
+  ) STRICT`,
+  `INSERT INTO outbox_deliveries SELECT * FROM outbox_deliveries_v24`,
+  `CREATE TABLE project_event_outbox (
+    event_id TEXT PRIMARY KEY REFERENCES project_events(event_id),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    event_seq INTEGER NOT NULL CHECK (event_seq > 0),
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'dispatched')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    available_at TEXT NOT NULL, dispatched_at TEXT,
+    UNIQUE (room_id, event_seq)
+  ) STRICT`,
+  `INSERT INTO project_event_outbox SELECT * FROM project_event_outbox_v24`,
+  `DROP TABLE outbox_deliveries_v24`,
+  `DROP TABLE project_event_outbox_v24`,
+  `DROP TABLE project_transition_audit_v24`,
+  `DROP TABLE project_events_v24`,
+  `DROP TABLE events_v24`,
+  `PRAGMA legacy_alter_table = OFF`,
+  `CREATE UNIQUE INDEX events_event_id_stream_seq ON events(event_id, stream_seq)`,
+  `CREATE INDEX project_events_stable_page_v25 ON project_events(room_id, event_seq, event_id)`,
+  `CREATE TRIGGER events_validate_insert BEFORE INSERT ON events
+   WHEN NOT EXISTS (
+     SELECT 1 FROM streams AS stream WHERE stream.stream_kind = NEW.stream_kind
+       AND stream.stream_id = NEW.stream_id AND NEW.stream_seq = stream.head_seq
+       AND NEW.stream_seq >= stream.retained_from_seq AND (
+         NEW.stream_seq = stream.retained_from_seq OR EXISTS (
+           SELECT 1 FROM events AS previous WHERE previous.stream_kind = NEW.stream_kind
+             AND previous.stream_id = NEW.stream_id AND previous.stream_seq = NEW.stream_seq - 1)))
+      OR (NEW.authority_kind IN ('human','agent') AND NOT EXISTS (
+        SELECT 1 FROM actors WHERE id = NEW.actor_id AND kind = NEW.authority_kind))
+      OR (NEW.authority_kind = 'system_timer' AND NEW.event_type NOT IN (
+        'project.goal.changed','project.decision.changed','project.request.changed',
+        'project.next-action.changed','project.blocker.changed','project.open-question.changed',
+        'project.proposal.changed','project.confirmation.changed',
+        'project.transfer-proposal.changed','project.ball.changed'))
+      OR (NEW.event_type IN (
+        'project.goal.changed','project.decision.changed','project.request.changed',
+        'project.next-action.changed','project.blocker.changed','project.open-question.changed',
+        'project.proposal.changed','project.confirmation.changed',
+        'project.transfer-proposal.changed','project.ball.changed') AND NOT EXISTS (
+        SELECT 1 FROM project_events AS project
+        WHERE project.event_id = NEW.event_id
+          AND project.authority_kind = NEW.authority_kind
+          AND project.actor_id IS NEW.actor_id))
+   BEGIN SELECT RAISE(ABORT, 'event sequence is outside the current stream window'); END`,
+  `CREATE TRIGGER events_prevent_update BEFORE UPDATE ON events
+   BEGIN SELECT RAISE(ABORT, 'events are immutable'); END`,
+  `CREATE TRIGGER events_validate_delete BEFORE DELETE ON events
+   WHEN EXISTS (SELECT 1 FROM streams AS stream WHERE stream.stream_kind = OLD.stream_kind
+     AND stream.stream_id = OLD.stream_id AND OLD.stream_seq >= stream.retained_from_seq
+     AND OLD.stream_seq <= stream.head_seq)
+   BEGIN SELECT RAISE(ABORT, 'event inside retained window cannot be deleted'); END`,
+  `CREATE TRIGGER project_events_v25_validate_insert BEFORE INSERT ON project_events
+   WHEN NOT EXISTS (SELECT 1 FROM actors WHERE id = NEW.causal_actor_id AND kind = NEW.causal_actor_kind)
+      OR (NEW.authority_kind IN ('human','agent') AND NOT EXISTS (
+        SELECT 1 FROM actors WHERE id = NEW.actor_id AND kind = NEW.authority_kind))
+      OR (NEW.authority_kind = 'system_timer' AND (
+        NEW.event_type <> 'fact.transitioned'
+        OR json_extract(NEW.payload_json, '$.transition') NOT IN ('review_due','transfer_expired')))
+   BEGIN SELECT RAISE(ABORT, 'Project event transition authority is invalid'); END`,
+  `CREATE TRIGGER project_events_immutable_update_v25 BEFORE UPDATE ON project_events
+   BEGIN SELECT RAISE(ABORT, 'Project event is immutable'); END`,
+  `CREATE TRIGGER project_events_immutable_delete_v25 BEFORE DELETE ON project_events
+   BEGIN SELECT RAISE(ABORT, 'Project event is immutable'); END`,
+  `CREATE TRIGGER project_transition_audit_v25_validate_insert BEFORE INSERT ON project_transition_audit
+   WHEN NOT EXISTS (SELECT 1 FROM actors WHERE id = NEW.causal_actor_id AND kind = NEW.causal_actor_kind)
+      OR (NEW.authority_kind IN ('human','agent') AND NOT EXISTS (
+        SELECT 1 FROM actors WHERE id = NEW.actor_id AND kind = NEW.authority_kind))
+   BEGIN SELECT RAISE(ABORT, 'Project audit transition authority is invalid'); END`,
+  `CREATE TRIGGER project_transition_audit_immutable_update_v25 BEFORE UPDATE ON project_transition_audit
+   BEGIN SELECT RAISE(ABORT, 'Project transition audit is immutable'); END`,
+  `CREATE TRIGGER project_transition_audit_immutable_delete_v25 BEFORE DELETE ON project_transition_audit
+   BEGIN SELECT RAISE(ABORT, 'Project transition audit is immutable'); END`,
+] as const;
+
+export const AUTHORITY_V25_STATEMENT_COUNT_FOR_TEST = V25_STATEMENTS.length;
+export const AUTHORITY_V25_MIGRATION_CHECKSUM_FOR_TEST = migrationChecksum(
+  25, "project-transition-authority", V25_STATEMENTS,
+);
+
 export const AUTHORITY_V22_STATEMENT_COUNT_FOR_TEST = V22_STATEMENTS.length;
 export const AUTHORITY_V22_TRIGGER_INVARIANT_STATEMENT_COUNT_FOR_TEST =
   V22_STATEMENTS.filter((statement) => statement.startsWith("CREATE TRIGGER ")).length;
@@ -8891,6 +9094,7 @@ const MIGRATIONS = [
     "project-boundary-agent-intent-lineage",
     V24_STATEMENTS,
   ),
+  defineMigration(25, "project-transition-authority", V25_STATEMENTS),
 ] as const satisfies readonly Migration[];
 
 const V1_SCHEMA_CONTRACT = {
@@ -9852,6 +10056,25 @@ const V24_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V25_SCHEMA_CONTRACT = {
+  ...V24_SCHEMA_CONTRACT,
+  events: [
+    "event_id", "stream_kind", "stream_id", "stream_seq", "room_id",
+    "authority_kind", "actor_id", "event_type", "occurred_at", "payload_json",
+  ],
+  project_events: [
+    "event_id", "room_id", "project_id", "event_seq", "event_type", "fact_kind",
+    "fact_id", "fact_revision", "authority_kind", "actor_kind", "actor_id",
+    "causal_actor_kind", "causal_actor_id", "source_room_id", "source_id",
+    "source_kind", "source_revision", "source_visibility", "occurred_at", "payload_json",
+  ],
+  project_transition_audit: [
+    "audit_id", "room_id", "project_id", "project_revision", "event_id", "operation",
+    "fact_kind", "fact_id", "authority_kind", "actor_kind", "actor_id",
+    "causal_actor_kind", "causal_actor_id", "transition_json", "occurred_at",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
@@ -9877,6 +10100,7 @@ const SCHEMA_CONTRACTS = {
   22: V22_SCHEMA_CONTRACT,
   23: V23_SCHEMA_CONTRACT,
   24: V24_SCHEMA_CONTRACT,
+  25: V25_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -11922,6 +12146,37 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
       "Project boundary context sources must retain exact checkpoint and execution lineage",
     );
   }
+  if (schemaVersion >= 25) {
+    requireNoRows(
+      database,
+      `SELECT 1 FROM project_events AS event
+       LEFT JOIN actors AS authority ON authority.id = event.actor_id
+       LEFT JOIN actors AS causal ON causal.id = event.causal_actor_id
+       JOIN events AS public ON public.event_id = event.event_id
+       WHERE causal.kind <> event.causal_actor_kind
+          OR (event.authority_kind = 'system_timer' AND (
+            event.actor_kind IS NOT NULL OR event.actor_id IS NOT NULL
+            OR event.event_type <> 'fact.transitioned'
+            OR json_extract(event.payload_json, '$.transition') NOT IN ('review_due','transfer_expired')
+            OR public.authority_kind <> 'system_timer' OR public.actor_id IS NOT NULL))
+          OR (event.authority_kind IN ('human','agent') AND (
+            event.actor_kind <> event.authority_kind OR authority.kind <> event.authority_kind
+            OR public.authority_kind <> event.authority_kind OR public.actor_id <> event.actor_id))
+       LIMIT 1`,
+      "Project events must retain closed Human, Agent, or system timer authority",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM project_transition_audit AS audit
+       JOIN project_events AS event ON event.event_id = audit.event_id
+       WHERE audit.authority_kind <> event.authority_kind
+          OR audit.actor_kind IS NOT event.actor_kind OR audit.actor_id IS NOT event.actor_id
+          OR audit.causal_actor_kind <> event.causal_actor_kind
+          OR audit.causal_actor_id <> event.causal_actor_id
+       LIMIT 1`,
+      "Project audit authority must match its immutable stored event",
+    );
+  }
 }
 
 function validateExistingSchema(database: DatabaseSync, currentVersion: number): void {
@@ -12118,6 +12373,7 @@ function migrateAuthorityDatabaseToVersion(
         );
       }
     }
+    database.exec("PRAGMA legacy_alter_table = OFF");
     throw error;
   }
 }

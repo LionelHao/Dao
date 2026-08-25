@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { isProjectSnapshot } from "@native-im/core";
 import { migrateAuthorityDatabase } from "../persistence/schema.js";
+import { listPendingOutboxDatabaseQuery } from "../persistence/authority-database-handler.js";
 import type { JsonValue } from "../persistence/contracts.js";
 import {
   advanceProjectLoopTimedTransitionsInTransaction,
@@ -14,6 +15,10 @@ import {
   readProjectLoopRepairSnapshotDatabaseQuery,
 } from "./database-authority.js";
 import type { ProjectLoopAuthorityOperation } from "./authority-protocol.js";
+import {
+  archiveProjectLoopBoundariesInTransaction,
+  reopenProjectLoopBoundariesInTransaction,
+} from "./boundary-authority.js";
 
 const NOW = Date.parse("2026-08-25T08:00:00.000Z");
 
@@ -167,6 +172,94 @@ function resolveFactProposal(proposalId: string, expectedRevision: number,
 }
 
 describe("Project Loop database authority", () => {
+  it("reschedules every canonical business timer with Human reopen events and new Ball revisions", () => {
+    withDatabase((database) => {
+      const roomRevision = () => Number(database.prepare(
+        "SELECT revision FROM project_room_states WHERE room_id = 'room-project'",
+      ).get()?.revision ?? 0);
+      executeProjectLoopAuthorityOperation(database, createFactProposal({
+        proposalId: "timer-action-proposal", factKind: "next_action", factId: "timer-action",
+        baseRevision: roomRevision(), payload: { title: "Timed action", description: "Ship",
+          ownerKind: "human", ownerActorId: "human-member", verifierHumanActorId: null,
+          dueAt: "2026-08-27T08:00:00.000Z", deliverable: "Artifact", acceptanceCriteria: [] },
+      }));
+      executeProjectLoopAuthorityOperation(database, resolveFactProposal("timer-action-proposal", 1));
+      executeProjectLoopAuthorityOperation(database, createFactProposal({
+        proposalId: "timer-blocker-proposal", factKind: "blocker", factId: "timer-blocker",
+        baseRevision: roomRevision(), payload: { title: "Timed blocker", description: "Wait",
+          impact: "Risk", resolutionCriteria: "Clear", question: null,
+          ownerKind: "human", ownerActorId: "human-member",
+          dueAt: "2026-08-28T08:00:00.000Z", reviewAt: null },
+      }));
+      executeProjectLoopAuthorityOperation(database, resolveFactProposal("timer-blocker-proposal", 1));
+      executeProjectLoopAuthorityOperation(database, {
+        type: "project-loop.fact.transition", context: humanContext("transfer-timer-blocker", "human-member"),
+        command: { roomId: "room-project", projectId: "room-project", factKind: "blocker",
+          factId: "timer-blocker", expectedRevision: 1, transition: "obstacle.transfer_propose",
+          payload: { transferProposalId: "timer-transfer", toOwnerKind: "human",
+            toOwnerActorId: "human-owner", reason: "Coverage",
+            expiresAt: "2026-08-30T08:00:00.000Z" } }, now: NOW + 10,
+      });
+      executeProjectLoopAuthorityOperation(database, {
+        type: "project-loop.fact.transition", context: humanContext("defer-timer-blocker", "human-member"),
+        command: { roomId: "room-project", projectId: "room-project", factKind: "blocker",
+          factId: "timer-blocker", expectedRevision: 1, transition: "obstacle.defer",
+          payload: { reason: "Wait", reviewAt: "2026-08-29T08:00:00.000Z" } }, now: NOW + 11,
+      });
+      const before = roomRevision();
+      database.prepare("UPDATE rooms SET status = 'archived', archive_generation = 1 WHERE id = 'room-project'").run();
+      archiveProjectLoopBoundariesInTransaction(database, { roomId: "room-project",
+        actorId: "human-owner", archiveGeneration: 1, previousLifecycleGeneration: 0,
+        occurredAt: "2026-08-25T08:00:00.000Z" });
+      database.prepare("UPDATE rooms SET status = 'active' WHERE id = 'room-project'").run();
+      reopenProjectLoopBoundariesInTransaction(database, { roomId: "room-project",
+        actorId: "human-owner", archiveGeneration: 1, previousLifecycleGeneration: 1,
+        occurredAt: "2026-09-25T08:00:00.000Z" });
+      expect(database.prepare(
+        "SELECT revision, due_at AS dueAt FROM project_next_actions WHERE id = 'timer-action'",
+      ).get()).toEqual({ revision: 2, dueAt: "2026-09-27T08:00:00.000Z" });
+      expect(database.prepare(
+        `SELECT revision, due_at AS dueAt, review_at AS reviewAt
+         FROM project_obstacles WHERE id = 'timer-blocker'`,
+      ).get()).toEqual({ revision: 3, dueAt: "2026-09-28T08:00:00.000Z",
+        reviewAt: "2026-09-29T08:00:00.000Z" });
+      expect(database.prepare(
+        "SELECT revision, expires_at AS expiresAt FROM project_transfer_proposals WHERE id = 'timer-transfer'",
+      ).get()).toEqual({ revision: 2, expiresAt: "2026-09-30T08:00:00.000Z" });
+      expect(roomRevision()).toBe(before + 3);
+      expect(database.prepare(
+        `SELECT authority_kind AS authorityKind, actor_id AS actorId, event_type AS type
+         FROM project_events WHERE event_seq > ? ORDER BY event_seq`,
+      ).all(before)).toEqual([
+        { authorityKind: "human", actorId: "human-owner", type: "fact.transitioned" },
+        { authorityKind: "human", actorId: "human-owner", type: "fact.transitioned" },
+        { authorityKind: "human", actorId: "human-owner", type: "fact.transitioned" },
+      ]);
+      expect(database.prepare(
+        `SELECT event_type AS type, json_extract(payload_json, '$.revision') AS revision
+         FROM events WHERE event_id IN (
+           SELECT event_id FROM project_events WHERE event_seq > ?
+         ) ORDER BY stream_seq`,
+      ).all(before)).toEqual([
+        { type: "project.next-action.changed", revision: 2 },
+        { type: "project.blocker.changed", revision: 3 },
+        { type: "project.transfer-proposal.changed", revision: 2 },
+      ]);
+      expect(database.prepare(
+        `SELECT source_kind AS kind, source_revision AS revision FROM project_ball_boundaries
+         WHERE status = 'active' AND source_id IN ('timer-action','timer-blocker','timer-transfer')
+         ORDER BY source_kind`,
+      ).all()).toEqual([
+        { kind: "next_action", revision: 2 },
+        { kind: "review", revision: 3 },
+        { kind: "transfer", revision: 2 },
+      ]);
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM project_fact_checkpoints WHERE room_id = 'room-project' AND project_revision = ?",
+      ).get(before + 3)).toEqual({ count: 1 });
+    });
+  });
+
   it("creates and confirms a proposal atomically, with replay-safe receipts", () => {
     withDatabase((database) => {
       const proposed = executeProjectLoopAuthorityOperation(database, proposalCreate());
@@ -648,7 +741,7 @@ describe("Project Loop database authority", () => {
     });
   });
 
-  it("lets only the current Request target transfer/respond and creates one linked responsibility atomically", () => {
+  it("lets the target respond, permits governance transfer only, and creates one linked responsibility atomically", () => {
     withDatabase((database) => {
       executeProjectLoopAuthorityOperation(database, createFactProposal({
         proposalId: "request-proposal", factKind: "request", factId: "request-one",
@@ -667,6 +760,18 @@ describe("Project Loop database authority", () => {
         `SELECT holder_actor_id AS holder, reason FROM project_ball_boundaries
          WHERE source_kind = 'request' AND status = 'active'`,
       ).get()).toEqual({ holder: "human-owner", reason: "pending_acceptance" });
+      database.exec(`
+        INSERT INTO actors (id, kind, display_name) VALUES ('human-peer', 'human', 'Peer');
+        INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+        VALUES ('identity', 'human-peer', 0, 1);
+        INSERT INTO room_memberships (
+          room_id, actor_id, kind, role, participation, tool_permissions_json,
+          joined_at, configured_at, access_revision
+        ) VALUES (
+          'room-project', 'human-peer', 'human', 'member', NULL, '[]',
+          CURRENT_TIMESTAMP, NULL, 1
+        );
+      `);
 
       const transfer = {
         type: "project-loop.fact.transition" as const,
@@ -677,26 +782,42 @@ describe("Project Loop database authority", () => {
           payload: { reason: "Owner will take it", targetHumanActorId: "human-owner" } },
         now: NOW + 2,
       };
-      expect(() => executeProjectLoopAuthorityOperation(database, transfer))
-        .toThrowError(expect.objectContaining({ code: "permission_denied" }));
-      const transferred = executeProjectLoopAuthorityOperation(database, {
-        ...transfer, context: humanContext("request-transfer", "human-member"),
-      });
+      expect(() => executeProjectLoopAuthorityOperation(database, {
+        ...transfer, context: humanContext("request-member-transfer", "human-peer"),
+      })).toThrowError(expect.objectContaining({ code: "permission_denied" }));
+      const transferred = executeProjectLoopAuthorityOperation(database, transfer);
       expect(transferred).toMatchObject({ acceptedRevision: 3,
       });
       expect(database.prepare(
         "SELECT revision, status, target_human_actor_id AS target FROM project_requests WHERE id = 'request-one'",
       ).get()).toEqual({ revision: 2, status: "pending_acceptance", target: "human-owner" });
 
+      expect(() => executeProjectLoopAuthorityOperation(database, {
+        type: "project-loop.fact.transition",
+        context: humanContext("request-admin-reject", "human-admin"),
+        command: { roomId: "room-project", projectId: "room-project", factKind: "request",
+          factId: "request-one", expectedRevision: 2, transition: "request.reject",
+          payload: { reason: "Governance cannot reject for the target" } },
+        now: NOW + 3,
+      })).toThrowError(expect.objectContaining({ code: "permission_denied" }));
+      const adminTransferred = executeProjectLoopAuthorityOperation(database, {
+        ...transfer,
+        context: humanContext("request-admin-transfer", "human-admin"),
+        command: { ...transfer.command, expectedRevision: 2,
+          payload: { reason: "Governance handoff", targetHumanActorId: "human-member" } },
+        now: NOW + 4,
+      });
+      expect(adminTransferred).toMatchObject({ acceptedRevision: 4 });
+
       const accepted = executeProjectLoopAuthorityOperation(database, {
         type: "project-loop.fact.transition",
-        context: humanContext("request-accept"),
+        context: humanContext("request-accept", "human-member"),
         command: { roomId: "room-project", projectId: "room-project", factKind: "request",
-          factId: "request-one", expectedRevision: 2, transition: "request.accept",
+          factId: "request-one", expectedRevision: 3, transition: "request.accept",
           payload: {} },
-        now: NOW + 3,
+        now: NOW + 5,
       });
-      expect(accepted).toMatchObject({ acceptedRevision: 5, replayed: false,
+      expect(accepted).toMatchObject({ acceptedRevision: 6, replayed: false,
       });
       expect(accepted.kind === "project-loop-mutation" ? accepted.eventIds : []).toHaveLength(2);
       expect(database.prepare(
@@ -1098,6 +1219,42 @@ describe("Project Loop database authority", () => {
          WHERE source_kind = 'transfer' AND source_id = 'transfer-action-timer-expired'
            AND status = 'active'`,
       ).get()).toEqual({ holder: "human-member", reason: "escalation" });
+      expect(database.prepare(
+        `SELECT project.authority_kind AS authorityKind, project.actor_id AS actorId,
+                project.causal_actor_kind AS causalKind,
+                project.causal_actor_id AS causalActorId,
+                public.authority_kind AS publicAuthorityKind,
+                public.actor_id AS publicActorId,
+                audit.authority_kind AS auditAuthorityKind,
+                audit.actor_id AS auditActorId,
+                public.event_type AS publicType,
+                json_extract(public.payload_json, '$.revision') AS publicRevision,
+                json_extract(audit.transition_json, '$.transferRevision') AS auditTransferRevision
+         FROM project_events AS project
+         JOIN events AS public ON public.event_id = project.event_id
+         JOIN project_transition_audit AS audit ON audit.event_id = project.event_id
+         WHERE json_extract(project.payload_json, '$.transition') = 'transfer_expired'`,
+      ).get()).toEqual({ authorityKind: "system_timer", actorId: null,
+        causalKind: "human", causalActorId: "human-owner",
+        publicAuthorityKind: "system_timer", publicActorId: null,
+        auditAuthorityKind: "system_timer", auditActorId: null,
+        publicType: "project.transfer-proposal.changed", publicRevision: 2,
+        auditTransferRevision: 2 });
+      const timerSnapshot = executeProjectLoopAuthorityOperation(database, {
+        type: "project-loop.snapshot.read", context: humanContext("read-timer-authority"),
+        roomId: "room-project", projectId: "room-project", afterEventSeq: 0,
+        limit: 100, now: NOW + 2 * 86_400_000,
+      });
+      expect(timerSnapshot.kind === "project-loop-snapshot"
+        ? timerSnapshot.events.at(-1)?.transitionAuthority : null)
+        .toEqual({ kind: "system_timer" });
+      const timerDelivery = listPendingOutboxDatabaseQuery(
+        database, 100, NOW + 2 * 86_400_000,
+      ).find((delivery) => delivery.event.type === "project.transfer-proposal.changed");
+      expect(timerDelivery?.event).toMatchObject({
+        transitionAuthority: { kind: "system_timer" },
+        causalActor: { kind: "human", actorId: "human-owner" },
+      });
 
       transition("propose-action-transfer", "human-member", 2,
         "next_action.transfer_propose", "transfer-action-accepted");

@@ -715,6 +715,7 @@ function isRepairRecord(value: unknown, expectedRoomId?: string): value is RoomR
 }
 
 function isPersistedRoomEventValue(value: unknown): value is PersistedRoomEvent {
+  if (isProjectEvent(value)) return true;
   if (!isRecord(value) || !exact(
     value,
     ["eventId", "streamKind", "streamId", "streamSeq", "roomId", "actorId", "occurredAt", "type", "payload"],
@@ -726,7 +727,6 @@ function isPersistedRoomEventValue(value: unknown): value is PersistedRoomEvent 
   if (isMessageAuthorityEvent(value)) return true;
   if (isAttachmentRoomEvent(value)) return true;
   if (isRoomMemoryEvent(value)) return true;
-  if (isProjectEvent(value)) return true;
   if (value.type === "room.created" || value.type === "room.renamed") {
     return exact(payload, ["room"]) && isManagedRoomValue(payload.room) && payload.room.id === value.roomId;
   }

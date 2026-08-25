@@ -162,7 +162,9 @@ describe("production Desktop authority cache", () => {
     const request = snapshot.requests[0]!;
     cache.applyRoomEvents("room-1", [{
       eventId: "project-event-8", streamKind: "room", streamId: "room-1", streamSeq: 8,
-      roomId: "room-1", projectId: "room-1", actorId: "human-2",
+      roomId: "room-1", projectId: "room-1",
+      transitionAuthority: { kind: "human", actorId: "human-2" },
+      causalActor: { kind: "human", actorId: "human-2" },
       occurredAt: "2026-08-25T03:03:04.005Z", type: "project.request.changed", payload: request,
     }], { version: 1, roomId: "room-1", afterSeq: 8 });
     expect(cache.roomRepairRecords("room-1")?.some((record) => record.kind === "project-loop")).toBe(false);

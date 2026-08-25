@@ -166,9 +166,9 @@ describe("FT-09 Project Loop lifecycle coordinator", () => {
         resumedBoundaryCount: 1, replacementBoundaryCount: 1 })),
     };
     const authority = createProjectLoopLifecycleAuthorityFromTransactionParticipant(participant);
-    await authority.archive({ roomId: "room-1", archiveGeneration: 5,
+    await authority.archive({ roomId: "room-1", actorId: "human-owner", archiveGeneration: 5,
       previousLifecycleGeneration: 4, occurredAt: archivedAt });
-    await authority.reopen({ roomId: "room-1", archiveGeneration: 5,
+    await authority.reopen({ roomId: "room-1", actorId: "human-owner", archiveGeneration: 5,
       previousLifecycleGeneration: 5, occurredAt: reopenedAt });
     expect(participant.archiveInTransaction).toHaveBeenCalledTimes(1);
     expect(participant.reopenInTransaction).toHaveBeenCalledTimes(1);
@@ -187,11 +187,11 @@ describe("FT-09 Project Loop lifecycle coordinator", () => {
       },
     });
     await expect(coordinator.archive({
-      roomId: "room-1", archiveGeneration: 5, previousLifecycleGeneration: 4,
+      roomId: "room-1", actorId: "human-owner", archiveGeneration: 5, previousLifecycleGeneration: 4,
       occurredAt: dueAt,
     })).resolves.toMatchObject({ state: "archived", lifecycleGeneration: 5 });
     await expect(coordinator.reopen({
-      roomId: "room-1", archiveGeneration: 5, previousLifecycleGeneration: 5,
+      roomId: "room-1", actorId: "human-owner", archiveGeneration: 5, previousLifecycleGeneration: 5,
       occurredAt: new Date(Date.parse(dueAt) + hour).toISOString(),
     })).resolves.toMatchObject({
       state: "active", lifecycleGeneration: 5, resumedBoundaryCount: 3,
@@ -213,10 +213,10 @@ describe("FT-09 Project Loop lifecycle coordinator", () => {
       },
     });
     await expect(coordinator.archive({
-      roomId: "room-1", archiveGeneration: 5, previousLifecycleGeneration: 4, occurredAt: dueAt,
+      roomId: "room-1", actorId: "human-owner", archiveGeneration: 5, previousLifecycleGeneration: 4, occurredAt: dueAt,
     })).rejects.toThrow("malformed");
     await expect(coordinator.reopen({
-      roomId: "room-1", archiveGeneration: 5, previousLifecycleGeneration: 5, occurredAt: dueAt,
+      roomId: "room-1", actorId: "human-owner", archiveGeneration: 5, previousLifecycleGeneration: 5, occurredAt: dueAt,
     })).rejects.toThrow("malformed");
   });
 });

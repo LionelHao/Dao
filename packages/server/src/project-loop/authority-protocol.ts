@@ -146,7 +146,10 @@ export type ProjectLoopStoredEvent = Readonly<{
   factKind: ProjectLoopFactKind;
   factId: string;
   factRevision: number;
-  actor: Readonly<{ kind: "human" | "agent"; actorId: string }>;
+  transitionAuthority:
+    | Readonly<{ kind: "human" | "agent"; actorId: string }>
+    | Readonly<{ kind: "system_timer" }>;
+  causalActor: Readonly<{ kind: "human" | "agent"; actorId: string }>;
   source: ProjectLoopSource;
   occurredAt: string;
   payload: Readonly<Record<string, JsonValue>>;

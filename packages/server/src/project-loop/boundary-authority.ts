@@ -4,8 +4,11 @@ import type { AuthorityTransactionView } from
 import { useAuthorityTransactionDatabase } from
   "../persistence/authority-transaction-database.js";
 import {
+  appendProjectLoopEventInTransaction,
   advanceProjectLoopTimedTransitionsInTransaction,
   ProjectLoopAuthorityError,
+  readProjectLoopFactInTransaction,
+  writeProjectLoopCheckpointInTransaction,
 } from "./database-authority.js";
 import type {
   PersistedProjectBoundary,
@@ -99,7 +102,8 @@ function sourceState(database: DatabaseSync, row: ReminderBoundaryRow):
       `SELECT revision, status FROM project_next_actions WHERE room_id = ? AND id = ?`,
     ).get(row.roomId, row.sourceId);
     return { kind: "next_action", current: fact?.revision === row.sourceRevision &&
-      (fact.status === "accepted" || fact.status === "in_progress" || fact.status === "delivered") };
+      (fact.status === "proposed" || fact.status === "accepted" ||
+        fact.status === "in_progress" || fact.status === "delivered") };
   }
   if (row.sourceKind === "request") {
     const fact = database.prepare(
@@ -620,10 +624,33 @@ function roomLifecycle(database: DatabaseSync, input: ProjectLoopLifecycleInput,
   }
 }
 
+function requireLifecycleGovernanceActor(database: DatabaseSync,
+  input: ProjectLoopLifecycleInput): void {
+  const authority = database.prepare(
+    `SELECT membership.kind, membership.role, room.owner_actor_id AS ownerActorId
+     FROM rooms AS room
+     JOIN room_memberships AS membership
+       ON membership.room_id = room.id AND membership.actor_id = ?
+     JOIN actors AS actor ON actor.id = membership.actor_id
+     WHERE room.id = ? AND membership.kind = 'human' AND actor.kind = 'human'`,
+  ).get(input.actorId, input.roomId);
+  if (authority === undefined ||
+      (authority.ownerActorId !== input.actorId && authority.role !== "admin" && authority.role !== "owner")) {
+    throw new ProjectLoopAuthorityError("permission_denied",
+      "Project lifecycle actor lacks Room governance authority");
+  }
+}
+
+function hasColumn(database: DatabaseSync, table: string, column: string): boolean {
+  return database.prepare(`SELECT 1 FROM pragma_table_info(?) WHERE name = ?`)
+    .get(table, column) !== undefined;
+}
+
 /** Must be called inside the same SQLite transaction that commits the Room archive. */
 export function archiveProjectLoopBoundariesInTransaction(database: DatabaseSync,
   input: ProjectLoopLifecycleInput): ProjectLoopArchiveResult {
   roomLifecycle(database, input, "archived");
+  requireLifecycleGovernanceActor(database, input);
   const prior = lifecycleRows(database, input.roomId, "active", input.previousLifecycleGeneration);
   const allActive = lifecycleRows(database, input.roomId, "active");
   if (allActive.length !== prior.length) {
@@ -660,6 +687,7 @@ export function archiveProjectLoopBoundariesInTransaction(database: DatabaseSync
 export function reopenProjectLoopBoundariesInTransaction(database: DatabaseSync,
   input: ProjectLoopLifecycleInput): ProjectLoopReopenResult {
   roomLifecycle(database, input, "active");
+  requireLifecycleGovernanceActor(database, input);
   const suspension = database.prepare(
     `SELECT suspended_at AS suspendedAt FROM project_archive_suspensions
      WHERE room_id = ? AND archive_generation = ? AND status = 'suspended'`,
@@ -678,36 +706,6 @@ export function reopenProjectLoopBoundariesInTransaction(database: DatabaseSync,
     }
     return new Date(reopenedAtMs + Math.max(0, Date.parse(scheduledAt) - suspendedAtMs)).toISOString();
   };
-  const reviewTimers = database.prepare(
-    `SELECT id, review_at AS scheduledAt FROM project_obstacles
-     WHERE room_id = ? AND status = 'deferred' AND review_at IS NOT NULL
-     ORDER BY id`,
-  ).all(input.roomId);
-  for (const timer of reviewTimers) {
-    if (typeof timer.id !== "string" || typeof timer.scheduledAt !== "string") {
-      throw new ProjectLoopAuthorityError("storage_unavailable", "Project review timer row is corrupt");
-    }
-    const scheduledAt = timer.scheduledAt;
-    database.prepare(
-      `UPDATE project_obstacles SET review_at = ?
-       WHERE room_id = ? AND id = ? AND status = 'deferred' AND review_at = ?`,
-    ).run(resumeTimer(scheduledAt), input.roomId, timer.id, scheduledAt);
-  }
-  const transferTimers = database.prepare(
-    `SELECT id, expires_at AS scheduledAt FROM project_transfer_proposals
-     WHERE room_id = ? AND status = 'pending' AND expires_at IS NOT NULL
-     ORDER BY id`,
-  ).all(input.roomId);
-  for (const timer of transferTimers) {
-    if (typeof timer.id !== "string" || typeof timer.scheduledAt !== "string") {
-      throw new ProjectLoopAuthorityError("storage_unavailable", "Project transfer timer row is corrupt");
-    }
-    const scheduledAt = timer.scheduledAt;
-    database.prepare(
-      `UPDATE project_transfer_proposals SET expires_at = ?
-       WHERE room_id = ? AND id = ? AND status = 'pending' AND expires_at = ?`,
-    ).run(resumeTimer(scheduledAt), input.roomId, timer.id, scheduledAt);
-  }
   const latest = new Map<string, LifecycleBoundaryRow>();
   for (const row of lifecycleRows(database, input.roomId, "superseded")) {
     if (row.lifecycleGeneration >= input.archiveGeneration || row.releasedAt !== suspension.suspendedAt ||
@@ -717,14 +715,155 @@ export function reopenProjectLoopBoundariesInTransaction(database: DatabaseSync,
     if (current === undefined || current.lifecycleGeneration < row.lifecycleGeneration) latest.set(key, row);
   }
   const prior = [...latest.values()].sort((left, right) => left.boundaryId.localeCompare(right.boundaryId));
+  let changedProjectFacts = 0;
+  const canonicalTimers = hasColumn(database, "project_next_actions", "due_at") &&
+    hasColumn(database, "project_obstacles", "source_kind") &&
+    hasColumn(database, "project_transfer_proposals", "source_kind") &&
+    hasColumn(database, "project_room_states", "event_head_seq");
+  if (canonicalTimers) {
+  const actions = database.prepare(
+    `SELECT id, revision, due_at AS dueAt FROM project_next_actions
+     WHERE room_id = ? AND source_kind <> 'legacy_v14' AND due_at IS NOT NULL
+       AND status IN ('proposed','accepted','in_progress','delivered') ORDER BY id`,
+  ).all(input.roomId);
+  for (const row of actions) {
+    if (typeof row.id !== "string" || typeof row.revision !== "number" || typeof row.dueAt !== "string") {
+      throw new ProjectLoopAuthorityError("storage_unavailable", "Project deadline row is corrupt");
+    }
+    const updated = database.prepare(
+      `UPDATE project_next_actions SET due_at = ?, revision = revision + 1, updated_at = ?
+       WHERE room_id = ? AND id = ? AND revision = ? AND due_at = ?`,
+    ).run(resumeTimer(row.dueAt), input.occurredAt, input.roomId, row.id, row.revision, row.dueAt);
+    if (updated.changes !== 1) throw new ProjectLoopAuthorityError("revision_conflict", "Project deadline changed");
+    const fact = readProjectLoopFactInTransaction(database, "next_action", row.id, input.roomId);
+    const state = database.prepare("SELECT revision FROM project_room_states WHERE room_id = ?")
+      .get(input.roomId);
+    if (typeof state?.revision !== "number") throw new ProjectLoopAuthorityError("storage_unavailable", "Project state is unavailable");
+    appendProjectLoopEventInTransaction(database, { roomId: input.roomId,
+      eventSeq: state.revision + 1, eventType: "fact.transitioned", factKind: "next_action",
+      factId: row.id, factRevision: fact.revision, actorKind: "human", actorId: input.actorId,
+      source: fact.source, occurredAt: input.occurredAt,
+      payload: Object.freeze({ transition: "room_reopen_deadline_rescheduled",
+        archiveGeneration: input.archiveGeneration }) });
+    changedProjectFacts += 1;
+  }
+  const obstacles = database.prepare(
+    `SELECT id, revision, kind, status, due_at AS dueAt, review_at AS reviewAt
+     FROM project_obstacles WHERE room_id = ? AND source_kind <> 'legacy_v14'
+       AND status IN ('open','deferred','cannot_answer')
+       AND (due_at IS NOT NULL OR (status = 'deferred' AND review_at IS NOT NULL)) ORDER BY id`,
+  ).all(input.roomId);
+  for (const row of obstacles) {
+    if (typeof row.id !== "string" || typeof row.revision !== "number" ||
+        (row.kind !== "blocker" && row.kind !== "open_question") ||
+        (row.dueAt !== null && typeof row.dueAt !== "string") ||
+        (row.reviewAt !== null && typeof row.reviewAt !== "string")) {
+      throw new ProjectLoopAuthorityError("storage_unavailable", "Project obstacle timer row is corrupt");
+    }
+    const dueAt = row.dueAt === null ? null : resumeTimer(row.dueAt);
+    const reviewAt = row.status === "deferred" && row.reviewAt !== null
+      ? resumeTimer(row.reviewAt) : row.reviewAt;
+    const updated = database.prepare(
+      `UPDATE project_obstacles SET due_at = ?, review_at = ?, revision = revision + 1, updated_at = ?
+       WHERE room_id = ? AND id = ? AND revision = ?`,
+    ).run(dueAt, reviewAt, input.occurredAt, input.roomId, row.id, row.revision);
+    if (updated.changes !== 1) throw new ProjectLoopAuthorityError("revision_conflict", "Project obstacle timer changed");
+    const fact = readProjectLoopFactInTransaction(database, row.kind, row.id, input.roomId);
+    const state = database.prepare("SELECT revision FROM project_room_states WHERE room_id = ?")
+      .get(input.roomId);
+    if (typeof state?.revision !== "number") throw new ProjectLoopAuthorityError("storage_unavailable", "Project state is unavailable");
+    appendProjectLoopEventInTransaction(database, { roomId: input.roomId,
+      eventSeq: state.revision + 1, eventType: "fact.transitioned", factKind: row.kind,
+      factId: row.id, factRevision: fact.revision, actorKind: "human", actorId: input.actorId,
+      source: fact.source, occurredAt: input.occurredAt,
+      payload: Object.freeze({ transition: "room_reopen_timer_rescheduled",
+        archiveGeneration: input.archiveGeneration }) });
+    changedProjectFacts += 1;
+  }
+  const transferTimers = database.prepare(
+    `SELECT id, revision, subject_kind AS subjectKind, subject_id AS subjectId,
+            expires_at AS scheduledAt FROM project_transfer_proposals
+     WHERE room_id = ? AND status = 'pending' AND expires_at IS NOT NULL
+     ORDER BY id`,
+  ).all(input.roomId);
+  for (const timer of transferTimers) {
+    if (typeof timer.id !== "string" || typeof timer.revision !== "number" ||
+        typeof timer.scheduledAt !== "string" || typeof timer.subjectId !== "string" ||
+        (timer.subjectKind !== "next_action" && timer.subjectKind !== "blocker" &&
+          timer.subjectKind !== "open_question")) {
+      throw new ProjectLoopAuthorityError("storage_unavailable", "Project transfer timer row is corrupt");
+    }
+    const scheduledAt = timer.scheduledAt;
+    const changed = database.prepare(
+      `UPDATE project_transfer_proposals SET expires_at = ?, revision = revision + 1, updated_at = ?
+       WHERE room_id = ? AND id = ? AND revision = ? AND status = 'pending' AND expires_at = ?`,
+    ).run(resumeTimer(scheduledAt), input.occurredAt, input.roomId, timer.id, timer.revision, scheduledAt);
+    if (changed.changes !== 1) {
+      throw new ProjectLoopAuthorityError("revision_conflict", "Project transfer timer changed");
+    }
+    const fact = readProjectLoopFactInTransaction(database, timer.subjectKind, timer.subjectId, input.roomId);
+    const state = database.prepare("SELECT revision FROM project_room_states WHERE room_id = ?")
+      .get(input.roomId);
+    if (typeof state?.revision !== "number") throw new ProjectLoopAuthorityError("storage_unavailable", "Project state is unavailable");
+    appendProjectLoopEventInTransaction(database, { roomId: input.roomId,
+      eventSeq: state.revision + 1, eventType: "fact.transitioned", factKind: timer.subjectKind,
+      factId: timer.subjectId, factRevision: fact.revision, actorKind: "human", actorId: input.actorId,
+      source: fact.source, occurredAt: input.occurredAt,
+      publicEntity: "transfer", publicEntityId: timer.id,
+      publicEntityRevision: timer.revision + 1,
+      payload: Object.freeze({ transition: "room_reopen_transfer_timer_rescheduled",
+        transferProposalId: timer.id, transferRevision: timer.revision + 1,
+        archiveGeneration: input.archiveGeneration }) });
+    changedProjectFacts += 1;
+  }
+  } else {
+    const reviewTimers = database.prepare(
+      `SELECT id, review_at AS scheduledAt FROM project_obstacles
+       WHERE room_id = ? AND status = 'deferred' AND review_at IS NOT NULL ORDER BY id`,
+    ).all(input.roomId);
+    for (const timer of reviewTimers) {
+      if (typeof timer.id !== "string" || typeof timer.scheduledAt !== "string") {
+        throw new ProjectLoopAuthorityError("storage_unavailable", "Project review timer row is corrupt");
+      }
+      database.prepare(
+        `UPDATE project_obstacles SET review_at = ?
+         WHERE room_id = ? AND id = ? AND status = 'deferred' AND review_at = ?`,
+      ).run(resumeTimer(timer.scheduledAt), input.roomId, timer.id, timer.scheduledAt);
+    }
+    const legacyTransfers = database.prepare(
+      `SELECT id, expires_at AS scheduledAt FROM project_transfer_proposals
+       WHERE room_id = ? AND status = 'pending' AND expires_at IS NOT NULL ORDER BY id`,
+    ).all(input.roomId);
+    for (const timer of legacyTransfers) {
+      if (typeof timer.id !== "string" || typeof timer.scheduledAt !== "string") {
+        throw new ProjectLoopAuthorityError("storage_unavailable", "Project transfer timer row is corrupt");
+      }
+      database.prepare(
+        `UPDATE project_transfer_proposals SET expires_at = ?
+         WHERE room_id = ? AND id = ? AND status = 'pending' AND expires_at = ?`,
+      ).run(resumeTimer(timer.scheduledAt), input.roomId, timer.id, timer.scheduledAt);
+    }
+  }
   let replacements = 0;
   for (const row of prior) {
+    if (row.sourceKind === "due") continue;
+    const sourceRevision = row.sourceKind === "transfer"
+      ? database.prepare("SELECT revision FROM project_transfer_proposals WHERE room_id = ? AND id = ?")
+        .get(input.roomId, row.sourceId)?.revision
+      : row.sourceKind === "next_action"
+        ? database.prepare("SELECT revision FROM project_next_actions WHERE room_id = ? AND id = ?")
+          .get(input.roomId, row.sourceId)?.revision
+        : row.sourceKind === "blocker" || row.sourceKind === "open_question" || row.sourceKind === "review"
+          ? database.prepare("SELECT revision FROM project_obstacles WHERE room_id = ? AND id = ?")
+            .get(input.roomId, row.sourceId)?.revision
+          : row.sourceRevision;
+    if (typeof sourceRevision !== "number") throw new ProjectLoopAuthorityError("storage_unavailable", "Project timer source revision is unavailable");
     const remaining = row.dueAt === null ? null :
       Math.max(0, Date.parse(row.dueAt) - Date.parse(suspension.suspendedAt));
     const resumedDueAt = remaining === null ? null :
       new Date(Date.parse(input.occurredAt) + remaining).toISOString();
     const boundaryId = `project-ball-${createHash("sha256")
-      .update(`${row.roomId}\0${row.sourceKind}\0${row.sourceId}\0${row.sourceRevision}` +
+      .update(`${row.roomId}\0${row.sourceKind}\0${row.sourceId}\0${sourceRevision}` +
         `\0${input.archiveGeneration}\0${row.holderKind}\0${row.holderActorId}`)
       .digest("hex")}`;
     database.prepare(
@@ -734,7 +873,7 @@ export function reopenProjectLoopBoundariesInTransaction(database: DatabaseSync,
          status, released_at
        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL)`,
     ).run(boundaryId, row.roomId, row.roomId, row.sourceKind, row.sourceId,
-      row.sourceRevision, input.archiveGeneration, row.holderKind, row.holderActorId,
+      sourceRevision, input.archiveGeneration, row.holderKind, row.holderActorId,
       row.reason, input.occurredAt, resumedDueAt);
     replacements += 1;
   }
@@ -742,6 +881,13 @@ export function reopenProjectLoopBoundariesInTransaction(database: DatabaseSync,
     `UPDATE project_archive_suspensions SET status = 'resumed', resumed_at = ?
      WHERE room_id = ? AND archive_generation = ? AND status = 'suspended'`,
   ).run(input.occurredAt, input.roomId, input.archiveGeneration);
+  if (changedProjectFacts > 0) {
+    const state = database.prepare("SELECT revision FROM project_room_states WHERE room_id = ?")
+      .get(input.roomId);
+    if (typeof state?.revision !== "number") throw new ProjectLoopAuthorityError("storage_unavailable", "Project state is unavailable");
+    writeProjectLoopCheckpointInTransaction(database, { roomId: input.roomId,
+      projectRevision: state.revision, occurredAt: input.occurredAt });
+  }
   return Object.freeze({ roomId: input.roomId, archiveGeneration: input.archiveGeneration,
     lifecycleGeneration: input.archiveGeneration, state: "active",
     resumedBoundaryCount: replacements, replacementBoundaryCount: replacements });

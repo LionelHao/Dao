@@ -19,7 +19,9 @@ describe("FT-09 Desktop Project Loop replica", () => {
     const replica = createProjectLoopReplica("room-1"); replica.replaceFromQuery(projectSnapshot());
     const request = projectSnapshot().requests[0]!;
     const event = { eventId: "event-8", streamKind: "room" as const, streamId: "room-1", streamSeq: 8,
-      roomId: "room-1", projectId: "room-1", actorId: "human-2",
+      roomId: "room-1", projectId: "room-1",
+      transitionAuthority: { kind: "human" as const, actorId: "human-2" },
+      causalActor: { kind: "human" as const, actorId: "human-2" },
       occurredAt: "2026-08-25T03:03:04.005Z", type: "project.request.changed" as const, payload: request };
     expect(replica.observeStableEvent(event)).toMatchObject({ needsRefresh: true, event });
     expect(replica.snapshot()?.watermark).toBe(7);

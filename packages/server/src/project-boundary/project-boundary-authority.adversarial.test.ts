@@ -653,13 +653,13 @@ describe("FT-09 pending confirmation Ball adversarial authority", () => {
       const archivedAt = new Date(Date.parse(NOW) + 2).toISOString();
       database.prepare("UPDATE rooms SET status = 'archived', archive_generation = 1 WHERE id = 'room-project'").run();
       expect(archiveProjectLoopBoundariesInTransaction(database, {
-        roomId: "room-project", archiveGeneration: 1, previousLifecycleGeneration: 0,
+        roomId: "room-project", actorId: "human-owner", archiveGeneration: 1, previousLifecycleGeneration: 0,
         occurredAt: archivedAt,
       })).toMatchObject({ suspendedBoundaryCount: 1 });
       const reopenedAt = new Date(Date.parse(NOW) + 3).toISOString();
       database.prepare("UPDATE rooms SET status = 'active' WHERE id = 'room-project'").run();
       expect(reopenProjectLoopBoundariesInTransaction(database, {
-        roomId: "room-project", archiveGeneration: 1, previousLifecycleGeneration: 1,
+        roomId: "room-project", actorId: "human-owner", archiveGeneration: 1, previousLifecycleGeneration: 1,
         occurredAt: reopenedAt,
       })).toMatchObject({ replacementBoundaryCount: 1 });
       expect(executeRuntimeAuthorityOperation(database, {

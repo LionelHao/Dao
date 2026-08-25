@@ -1574,6 +1574,27 @@ function parseRoomSyncEvent(
       occurredAt: row.occurredAt as string,
     }, messageId);
   }
+  if (row.streamKind === "room" && typeof row.eventType === "string" &&
+      row.eventType.startsWith("project.")) {
+    const transitionAuthority = row.authorityKind === "system_timer"
+      ? { kind: "system_timer" as const }
+      : { kind: row.authorityKind, actorId: row.authorityActorId };
+    const parsed = parsePersistedRoomEvent({
+      eventId: row.eventId,
+      streamKind: "room",
+      streamId: row.streamId,
+      streamSeq: row.streamSeq,
+      roomId: row.roomId,
+      projectId: row.roomId,
+      transitionAuthority,
+      causalActor: { kind: row.causalActorKind, actorId: row.causalActorId },
+      occurredAt: row.occurredAt,
+      type: row.eventType,
+      payload,
+    });
+    if (parsed.ok) return parsed.value;
+    return fail("storage_unavailable", "Stored Project outbox event is corrupt");
+  }
   const parsed = parsePersistedRoomEvent({
     eventId: row.eventId,
     streamKind: row.streamKind,
@@ -1650,14 +1671,20 @@ export function syncRoomDatabaseQuery(
 
     const limit = request.limit ?? ROOM_SYNC_DEFAULT_LIMIT;
     const rows = database.prepare(
-      `SELECT event_id AS eventId, stream_kind AS streamKind,
-              stream_id AS streamId, stream_seq AS streamSeq, room_id AS roomId,
-              actor_id AS actorId, event_type AS eventType,
-              occurred_at AS occurredAt, payload_json AS payloadJson
-       FROM events
-       WHERE stream_kind = 'room' AND stream_id = ?
-         AND stream_seq > ? AND stream_seq <= ?
-       ORDER BY stream_seq
+      `SELECT event.event_id AS eventId, event.stream_kind AS streamKind,
+              event.stream_id AS streamId, event.stream_seq AS streamSeq,
+              event.room_id AS roomId, event.actor_id AS actorId,
+              project.authority_kind AS authorityKind,
+              project.actor_id AS authorityActorId,
+              project.causal_actor_kind AS causalActorKind,
+              project.causal_actor_id AS causalActorId,
+              event.event_type AS eventType, event.occurred_at AS occurredAt,
+              event.payload_json AS payloadJson
+       FROM events AS event
+       LEFT JOIN project_events AS project ON project.event_id = event.event_id
+       WHERE event.stream_kind = 'room' AND event.stream_id = ?
+         AND event.stream_seq > ? AND event.stream_seq <= ?
+       ORDER BY event.stream_seq
        LIMIT ?`,
     ).all(request.roomId, request.cursor.afterSeq, watermark, limit);
     const events: PersistedRoomEvent[] = [];
@@ -1983,6 +2010,27 @@ function parseOutboxEvent(
       occurredAt: row.occurredAt as string,
     }, messageId);
   }
+  if (row.streamKind === "room" && typeof row.eventType === "string" &&
+      row.eventType.startsWith("project.")) {
+    const transitionAuthority = row.authorityKind === "system_timer"
+      ? { kind: "system_timer" as const }
+      : { kind: row.authorityKind, actorId: row.authorityActorId };
+    const parsed = parsePersistedRoomEvent({
+      eventId: row.eventId,
+      streamKind: "room",
+      streamId: row.streamId,
+      streamSeq: row.streamSeq,
+      roomId: row.roomId,
+      projectId: row.roomId,
+      transitionAuthority,
+      causalActor: { kind: row.causalActorKind, actorId: row.causalActorId },
+      occurredAt: row.occurredAt,
+      type: row.eventType,
+      payload,
+    });
+    if (parsed.ok) return parsed.value;
+    return fail("storage_unavailable", "Stored Project outbox event is corrupt");
+  }
   const envelope = {
     eventId: row.eventId,
     streamKind: row.streamKind,
@@ -2041,6 +2089,10 @@ export function listPendingOutboxDatabaseQuery(
          event.stream_id AS streamId,
          event.room_id AS roomId,
          event.actor_id AS actorId,
+         project.authority_kind AS authorityKind,
+         project.actor_id AS authorityActorId,
+         project.causal_actor_kind AS causalActorKind,
+         project.causal_actor_id AS causalActorId,
          event.event_type AS eventType,
          event.occurred_at AS occurredAt,
          event.payload_json AS payloadJson
@@ -2048,6 +2100,7 @@ export function listPendingOutboxDatabaseQuery(
        JOIN events AS event
          ON event.event_id = delivery.event_id
         AND event.stream_seq = delivery.stream_seq
+       LEFT JOIN project_events AS project ON project.event_id = event.event_id
        WHERE delivery.status = 'pending'
          AND delivery.available_at <= ?
        ORDER BY delivery.stream_seq, delivery.id
@@ -3755,6 +3808,7 @@ function executeClosedLifecycle(
         if (command.type === "room.archive") {
           archiveProjectLoopBoundariesInTransaction(database, {
             roomId: command.roomId,
+            actorId,
             archiveGeneration: result.governance.archiveGeneration,
             previousLifecycleGeneration: result.governance.archiveGeneration - 1,
             occurredAt: acceptedAt,
@@ -3762,6 +3816,7 @@ function executeClosedLifecycle(
         } else {
           reopenProjectLoopBoundariesInTransaction(database, {
             roomId: command.roomId,
+            actorId,
             archiveGeneration: result.governance.archiveGeneration,
             previousLifecycleGeneration: result.governance.archiveGeneration,
             occurredAt: acceptedAt,

@@ -406,8 +406,14 @@ export function readCanonicalProjectSnapshotDatabaseQuery(database: DatabaseSync
 }
 
 export function readCanonicalProjectEventPayloadDatabaseQuery(database: DatabaseSync, input: {
-  roomId: string; factKind: ProjectFact["kind"]; factId: string; entity: "fact" | "proposal";
-}): ProjectFact | ProjectProposal {
+  roomId: string; factKind: ProjectFact["kind"]; factId: string;
+  entity: "fact" | "proposal" | "transfer";
+}): ProjectFact | ProjectProposal | ProjectTransferProposal {
+  if (input.entity === "transfer") {
+    const transfer = mapTransfers(database, input.roomId)
+      .find((item) => item.transferProposalId === input.factId);
+    return transfer ?? fail("Canonical Project transfer event payload is missing");
+  }
   if (input.entity === "proposal") {
     const proposal = mapProposals(database, input.roomId).find((item) => item.targetId === input.factId &&
       item.targetKind === input.factKind);
@@ -428,20 +434,31 @@ export function readCanonicalProjectEventsDatabaseQuery(database: DatabaseSync, 
   roomId: string; afterStreamSeq: number; limit: number;
 }): readonly ProjectEvent[] {
   const rows = database.prepare(
-    `SELECT event_id AS eventId, stream_id AS streamId, stream_seq AS streamSeq,
-            room_id AS roomId, actor_id AS actorId, event_type AS type,
-            occurred_at AS occurredAt, payload_json AS payloadJson
-     FROM events WHERE stream_kind = 'room' AND stream_id = ? AND stream_seq > ?
-       AND event_type LIKE 'project.%'
-     ORDER BY stream_seq, event_id LIMIT ?`,
+    `SELECT event.event_id AS eventId, event.stream_id AS streamId,
+            event.stream_seq AS streamSeq, event.room_id AS roomId,
+            event.event_type AS type, event.occurred_at AS occurredAt,
+            event.payload_json AS payloadJson,
+            project.authority_kind AS authorityKind, project.actor_id AS authorityActorId,
+            project.causal_actor_kind AS causalActorKind,
+            project.causal_actor_id AS causalActorId, project.payload_json AS transitionJson
+     FROM events AS event
+     JOIN project_events AS project ON project.event_id = event.event_id
+     WHERE event.stream_kind = 'room' AND event.stream_id = ? AND event.stream_seq > ?
+       AND event.event_type LIKE 'project.%'
+     ORDER BY event.stream_seq, event.event_id LIMIT ?`,
   ).all(input.roomId, input.afterStreamSeq, input.limit) as Row[];
   return Object.freeze(rows.map((row) => {
     const roomId = required(row, "roomId");
-    const event: ProjectEvent = Object.freeze({ eventId: required(row, "eventId"),
+    const transitionAuthority = row.authorityKind === "system_timer"
+      ? Object.freeze({ kind: "system_timer" as const })
+      : Object.freeze({ kind: required(row, "authorityKind") as "human" | "agent",
+        actorId: required(row, "authorityActorId") });
+    const event = Object.freeze({ eventId: required(row, "eventId"),
       streamKind: "room", streamId: required(row, "streamId"), streamSeq: positive(row, "streamSeq"),
-      roomId, projectId: roomId, actorId: required(row, "actorId"),
+      roomId, projectId: roomId, transitionAuthority,
+      causalActor: actor(row.causalActorKind, row.causalActorId),
       occurredAt: required(row, "occurredAt"), type: required(row, "type") as ProjectEvent["type"],
-      payload: parseObject(row.payloadJson) as unknown as ProjectEvent["payload"] });
+      payload: parseObject(row.payloadJson) as unknown as ProjectEvent["payload"] }) as unknown as ProjectEvent;
     if (!isProjectEvent(event)) return fail("Canonical Project event invariant failed");
     return event;
   }));

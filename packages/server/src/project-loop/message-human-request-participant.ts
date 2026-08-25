@@ -482,13 +482,16 @@ export function createSqliteHumanRequestMessageParticipant(options: Readonly<{
         database.prepare(
           `INSERT INTO project_events (
              event_id, room_id, project_id, event_seq, event_type, fact_kind, fact_id,
-             fact_revision, actor_kind, actor_id, source_room_id, source_id, source_kind,
+             fact_revision, authority_kind, actor_kind, actor_id, causal_actor_kind,
+             causal_actor_id, source_room_id, source_id, source_kind,
              source_revision, source_visibility, occurred_at, payload_json
-           ) VALUES (?, ?, ?, ?, 'fact.created', 'request', ?, 1, 'human', ?, ?, ?,
+           ) VALUES (?, ?, ?, ?, 'fact.created', 'request', ?, 1,
+                     'human', 'human', ?, 'human', ?, ?, ?,
                      'message', ?, 'room', ?, ?)`,
         ).run(
           eventId, binding.roomId, binding.projectId, projectRevision, requestId,
-          binding.requesterHumanActorId, binding.roomId, binding.sourceMessageId,
+          binding.requesterHumanActorId, binding.requesterHumanActorId,
+          binding.roomId, binding.sourceMessageId,
           binding.sourceRevision, binding.occurredAt, payloadJson,
         );
         const sharedStream = database.prepare(
@@ -547,9 +550,9 @@ export function createSqliteHumanRequestMessageParticipant(options: Readonly<{
         ).run(sharedStreamSeq, binding.roomId, sharedStream.headSeq);
         database.prepare(
           `INSERT INTO events (
-             event_id, stream_kind, stream_id, stream_seq, room_id, actor_id,
+             event_id, stream_kind, stream_id, stream_seq, room_id, authority_kind, actor_id,
              event_type, occurred_at, payload_json
-           ) VALUES (?, 'room', ?, ?, ?, ?, 'project.request.changed', ?, ?)`,
+           ) VALUES (?, 'room', ?, ?, ?, 'human', ?, 'project.request.changed', ?, ?)`,
         ).run(
           eventId, binding.roomId, sharedStreamSeq, binding.roomId,
           binding.requesterHumanActorId, binding.occurredAt, canonical(sharedRequestProjection),
@@ -574,11 +577,14 @@ export function createSqliteHumanRequestMessageParticipant(options: Readonly<{
         database.prepare(
           `INSERT INTO project_transition_audit (
              audit_id, room_id, project_id, project_revision, event_id, operation,
-             fact_kind, fact_id, actor_kind, actor_id, transition_json, occurred_at
-           ) VALUES (?, ?, ?, ?, ?, 'fact.created', 'request', ?, 'human', ?, ?, ?)`,
+             fact_kind, fact_id, authority_kind, actor_kind, actor_id,
+             causal_actor_kind, causal_actor_id, transition_json, occurred_at
+           ) VALUES (?, ?, ?, ?, ?, 'fact.created', 'request', ?,
+                     'human', 'human', ?, 'human', ?, ?, ?)`,
         ).run(
           `audit:${eventId}`, binding.roomId, binding.projectId, projectRevision, eventId,
-          requestId, binding.requesterHumanActorId, payloadJson, binding.occurredAt,
+          requestId, binding.requesterHumanActorId, binding.requesterHumanActorId,
+          payloadJson, binding.occurredAt,
         );
         database.prepare(
           `INSERT INTO project_ball_boundaries (
@@ -703,12 +709,15 @@ export function createSqliteHumanRequestMessageParticipant(options: Readonly<{
           database.prepare(
             `INSERT INTO project_events (
                event_id, room_id, project_id, event_seq, event_type, fact_kind, fact_id,
-               fact_revision, actor_kind, actor_id, source_room_id, source_id, source_kind,
+               fact_revision, authority_kind, actor_kind, actor_id, causal_actor_kind,
+               causal_actor_id, source_room_id, source_id, source_kind,
                source_revision, source_visibility, occurred_at, payload_json
-             ) VALUES (?, ?, ?, ?, 'fact.transitioned', 'request', ?, ?, 'human', ?, ?, ?,
+             ) VALUES (?, ?, ?, ?, 'fact.transitioned', 'request', ?, ?,
+                       'human', 'human', ?, 'human', ?, ?, ?,
                        'message', ?, 'room', ?, ?)`,
           ).run(eventId, binding.roomId, binding.roomId, projectRevision, row.id, requestRevision,
-            binding.recalledByHumanActorId, binding.roomId, binding.sourceMessageId,
+            binding.recalledByHumanActorId, binding.recalledByHumanActorId,
+            binding.roomId, binding.sourceMessageId,
             row.sourceRevision, binding.occurredAt, transitionPayload);
           database.prepare(
             `INSERT INTO project_event_outbox (
@@ -718,10 +727,13 @@ export function createSqliteHumanRequestMessageParticipant(options: Readonly<{
           database.prepare(
             `INSERT INTO project_transition_audit (
                audit_id, room_id, project_id, project_revision, event_id, operation,
-               fact_kind, fact_id, actor_kind, actor_id, transition_json, occurred_at
-             ) VALUES (?, ?, ?, ?, ?, 'fact.transitioned', 'request', ?, 'human', ?, ?, ?)`,
+               fact_kind, fact_id, authority_kind, actor_kind, actor_id,
+               causal_actor_kind, causal_actor_id, transition_json, occurred_at
+             ) VALUES (?, ?, ?, ?, ?, 'fact.transitioned', 'request', ?,
+                       'human', 'human', ?, 'human', ?, ?, ?)`,
           ).run(`audit:${eventId}`, binding.roomId, binding.roomId, projectRevision, eventId,
-            row.id, binding.recalledByHumanActorId, transitionPayload, binding.occurredAt);
+            row.id, binding.recalledByHumanActorId, binding.recalledByHumanActorId,
+            transitionPayload, binding.occurredAt);
           const advanced = database.prepare(
             `UPDATE project_room_states
              SET revision = revision + 1, event_head_seq = event_head_seq + 1, updated_at = ?
@@ -805,9 +817,9 @@ export function createSqliteHumanRequestMessageParticipant(options: Readonly<{
           });
           database.prepare(
             `INSERT INTO events (
-               event_id, stream_kind, stream_id, stream_seq, room_id, actor_id,
+               event_id, stream_kind, stream_id, stream_seq, room_id, authority_kind, actor_id,
                event_type, occurred_at, payload_json
-             ) VALUES (?, 'room', ?, ?, ?, ?, 'project.request.changed', ?, ?)`,
+             ) VALUES (?, 'room', ?, ?, ?, 'human', ?, 'project.request.changed', ?, ?)`,
           ).run(eventId, binding.roomId, sharedSeq, binding.roomId,
             binding.recalledByHumanActorId, binding.occurredAt, canonical(projection));
           database.prepare(

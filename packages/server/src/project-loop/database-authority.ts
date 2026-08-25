@@ -338,24 +338,38 @@ function eventId(roomId: string, eventSeq: number): string {
   return `project-event-${digest}`;
 }
 
-function appendEvent(database: DatabaseSync, input: {
+export function appendProjectLoopEventInTransaction(database: DatabaseSync, input: {
   roomId: string; eventSeq: number; eventType: ProjectLoopStoredEvent["eventType"];
   factKind: ProjectLoopFactKind; factId: string; factRevision: number;
   actorKind: "human" | "agent"; actorId: string; source: ProjectLoopSource;
   occurredAt: string; payload: Readonly<Record<string, JsonValue>>;
+  transitionAuthority?: "system_timer";
+  publicEntity?: "fact" | "proposal" | "transfer";
+  publicEntityId?: string;
+  publicEntityRevision?: number;
 }): string {
   const id = eventId(input.roomId, input.eventSeq);
+  const transitionPayload = input.transitionAuthority === "system_timer"
+    ? Object.freeze({ ...input.payload,
+      transitionAuthority: Object.freeze({ kind: "system_timer" as const }) })
+    : input.payload;
+  const authorityKind = input.transitionAuthority === "system_timer"
+    ? "system_timer" as const : input.actorKind;
+  const authorityActorKind = input.transitionAuthority === "system_timer" ? null : input.actorKind;
+  const authorityActorId = input.transitionAuthority === "system_timer" ? null : input.actorId;
   database.prepare(
     `INSERT INTO project_events (
        event_id, room_id, project_id, event_seq, event_type, fact_kind, fact_id,
-       fact_revision, actor_kind, actor_id, source_room_id, source_id, source_kind,
+       fact_revision, authority_kind, actor_kind, actor_id, causal_actor_kind,
+       causal_actor_id, source_room_id, source_id, source_kind,
        source_revision, source_visibility, occurred_at, payload_json
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id, input.roomId, input.roomId, input.eventSeq, input.eventType, input.factKind,
-    input.factId, input.factRevision, input.actorKind, input.actorId, input.source.roomId,
-    input.source.sourceId, input.source.kind, input.source.sourceRevision,
-    input.source.visibility, input.occurredAt, JSON.stringify(input.payload),
+    input.factId, input.factRevision, authorityKind, authorityActorKind, authorityActorId,
+    input.actorKind, input.actorId, input.source.roomId, input.source.sourceId,
+    input.source.kind, input.source.sourceRevision,
+    input.source.visibility, input.occurredAt, JSON.stringify(transitionPayload),
   );
   database.prepare(
     `INSERT INTO project_event_outbox (event_id, room_id, event_seq, available_at)
@@ -364,11 +378,13 @@ function appendEvent(database: DatabaseSync, input: {
   database.prepare(
     `INSERT INTO project_transition_audit (
        audit_id, room_id, project_id, project_revision, event_id, operation,
-       fact_kind, fact_id, actor_kind, actor_id, transition_json, occurred_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       fact_kind, fact_id, authority_kind, actor_kind, actor_id, causal_actor_kind,
+       causal_actor_id, transition_json, occurred_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(`audit:${id}`, input.roomId, input.roomId, input.eventSeq, id, input.eventType,
-    input.factKind, input.factId, input.actorKind, input.actorId,
-    JSON.stringify(input.payload), input.occurredAt);
+    input.factKind, input.factId, authorityKind, authorityActorKind, authorityActorId,
+    input.actorKind, input.actorId,
+    JSON.stringify(transitionPayload), input.occurredAt);
   const stream = database.prepare(
     `SELECT head_seq AS headSeq FROM streams WHERE stream_kind = 'room' AND stream_id = ?`,
   ).get(input.roomId);
@@ -383,11 +399,21 @@ function appendEvent(database: DatabaseSync, input: {
   if (advanced.changes !== 1) {
     throw new ProjectLoopAuthorityError("revision_conflict", "Project Room stream changed concurrently");
   }
-  const entity = input.eventType.startsWith("proposal.") ? "proposal" as const : "fact" as const;
+  const entity = input.publicEntity ??
+    (input.eventType.startsWith("proposal.") ? "proposal" as const : "fact" as const);
   const eventPayload = readCanonicalProjectEventPayloadDatabaseQuery(database, {
-    roomId: input.roomId, factKind: input.factKind, factId: input.factId, entity,
+    roomId: input.roomId, factKind: input.factKind,
+    factId: input.publicEntityId ?? input.factId, entity,
   });
+  if (input.publicEntityRevision !== undefined &&
+      (!Number.isSafeInteger(input.publicEntityRevision) || input.publicEntityRevision < 1 ||
+       typeof eventPayload.revision !== "number" ||
+       eventPayload.revision !== input.publicEntityRevision)) {
+    throw new ProjectLoopAuthorityError("revision_conflict",
+      "Canonical Project public event revision changed concurrently");
+  }
   const publicType = entity === "proposal" ? "project.proposal.changed"
+    : entity === "transfer" ? "project.transfer-proposal.changed"
     : input.factKind === "goal" ? "project.goal.changed"
       : input.factKind === "decision" ? "project.decision.changed"
         : input.factKind === "request" ? "project.request.changed"
@@ -397,9 +423,9 @@ function appendEvent(database: DatabaseSync, input: {
   database.prepare(
     `INSERT INTO events (
        event_id, stream_kind, stream_id, stream_seq, room_id,
-       actor_id, event_type, occurred_at, payload_json
-     ) VALUES (?, 'room', ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(id, input.roomId, streamSeq, input.roomId, input.actorId, publicType,
+       authority_kind, actor_id, event_type, occurred_at, payload_json
+     ) VALUES (?, 'room', ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(id, input.roomId, streamSeq, input.roomId, authorityKind, authorityActorId, publicType,
     input.occurredAt, canonical(eventPayload as unknown as JsonValue));
   database.prepare(
     `INSERT INTO outbox_deliveries (
@@ -414,6 +440,8 @@ function appendEvent(database: DatabaseSync, input: {
   ).run(input.occurredAt, input.roomId);
   return id;
 }
+
+const appendEvent = appendProjectLoopEventInTransaction;
 
 function proposalFromRow(row: ProposalRow): ProjectLoopStoredProposal {
   if (typeof row.id !== "string" || typeof row.roomId !== "string" ||
@@ -803,12 +831,15 @@ function factSql(kind: ProjectLoopFactKind): string {
     FROM project_obstacles WHERE kind = '${kind}'`;
 }
 
-function readFact(database: DatabaseSync, kind: ProjectLoopFactKind, factId: string,
+export function readProjectLoopFactInTransaction(database: DatabaseSync,
+  kind: ProjectLoopFactKind, factId: string,
   roomId: string): ProjectLoopStoredFact {
   const row = database.prepare(`${factSql(kind)} AND id = ? AND room_id = ?`.replace("FROM project_goals AND", "FROM project_goals WHERE").replace("FROM project_decisions AND", "FROM project_decisions WHERE").replace("FROM project_requests AND", "FROM project_requests WHERE").replace("FROM project_next_actions AND", "FROM project_next_actions WHERE")).get(factId, roomId) as Record<string, unknown> | undefined;
   if (row === undefined) throw new ProjectLoopAuthorityError("project_fact_not_found", "Project fact was not found");
   return factFromRow(kind, row);
 }
+
+const readFact = readProjectLoopFactInTransaction;
 
 function createProposal(database: DatabaseSync,
   operation: Extract<ProjectLoopAuthorityOperation, { type: "project-loop.proposal.create" }>,
@@ -1095,9 +1126,14 @@ function transitionFact(database: DatabaseSync,
     const requester = String(fact.details.requesterActorId);
     const target = String(fact.details.targetActorId);
     const human = humanActorId(operation.context);
-    if (transition === "request.accept" || transition === "request.reject" ||
-        transition === "request.transfer") {
+    if (transition === "request.accept" || transition === "request.reject") {
       if (human !== target) throw new ProjectLoopAuthorityError("permission_denied", "Only the Request target may respond");
+    } else if (transition === "request.transfer") {
+      const governanceFallback = hasRoomOwnerOrAdminAuthority(database, fact.roomId, human);
+      if (human !== target && !governanceFallback) {
+        throw new ProjectLoopAuthorityError("permission_denied",
+          "Only the Request target or Room governance may transfer");
+      }
     } else if (human !== requester) {
       throw new ProjectLoopAuthorityError("permission_denied", "Only the Request requester may cancel");
     }
@@ -1670,7 +1706,8 @@ export function advanceProjectLoopTimedTransitionsInTransaction(database: Databa
       eventType: "fact.transitioned", factKind: row.kind, factId: row.id,
       factRevision: updated.revision, actorKind: row.ownerKind, actorId: row.ownerActorId,
       source: fact.source, occurredAt: input.now,
-      payload: Object.freeze({ transition: "review_due", reason: "Review boundary reached" }) });
+      payload: Object.freeze({ transition: "review_due", reason: "Review boundary reached" }),
+      transitionAuthority: "system_timer" });
     writeProjectLoopCheckpointInTransaction(database, { roomId: row.roomId,
       projectRevision: current.revision + 1, occurredAt: input.now });
     reopenedReviews += 1;
@@ -1713,7 +1750,11 @@ export function advanceProjectLoopTimedTransitionsInTransaction(database: Databa
         eventType: "fact.transitioned", factKind: row.subjectKind, factId: row.subjectId,
         factRevision: fact.revision, actorKind: "human", actorId: row.principalActorId,
         source: fact.source, occurredAt: input.now,
-        payload: Object.freeze({ transferProposalId: row.id, transition: "transfer_expired" }) });
+        publicEntity: "transfer", publicEntityId: row.id,
+        publicEntityRevision: row.revision + 1,
+        payload: Object.freeze({ transferProposalId: row.id,
+          transferRevision: row.revision + 1, transition: "transfer_expired" }),
+        transitionAuthority: "system_timer" });
       writeProjectLoopCheckpointInTransaction(database, { roomId: row.roomId,
         projectRevision: current.revision + 1, occurredAt: input.now });
       expiredTransfers += 1;

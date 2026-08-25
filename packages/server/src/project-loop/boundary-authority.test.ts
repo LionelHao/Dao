@@ -13,8 +13,13 @@ const now = "2026-08-25T08:00:00.000Z";
 function fixture(holderKind: "human" | "agent" = "human") {
   const database = new DatabaseSync(":memory:");
   database.exec(`
-    CREATE TABLE rooms (id TEXT PRIMARY KEY, status TEXT, archive_generation INTEGER);
-    CREATE TABLE room_memberships (room_id TEXT, actor_id TEXT, kind TEXT, participation TEXT);
+    CREATE TABLE actors (id TEXT PRIMARY KEY, kind TEXT);
+    CREATE TABLE rooms (
+      id TEXT PRIMARY KEY, status TEXT, archive_generation INTEGER, owner_actor_id TEXT
+    );
+    CREATE TABLE room_memberships (
+      room_id TEXT, actor_id TEXT, kind TEXT, participation TEXT, role TEXT
+    );
     CREATE TABLE agent_profiles (actor_id TEXT, status TEXT, capability_ceiling_json TEXT);
     CREATE TABLE room_agent_assignments (
       room_id TEXT, agent_actor_id TEXT, status TEXT, participation TEXT, paused INTEGER,
@@ -63,9 +68,11 @@ function fixture(holderKind: "human" | "agent" = "human") {
       id TEXT PRIMARY KEY, event_id TEXT, target_kind TEXT, target_id TEXT, stream_seq INTEGER,
       status TEXT, attempts INTEGER, available_at TEXT, delivered_at TEXT, last_error TEXT
     );
-    INSERT INTO rooms VALUES ('room-1','active',4);
+    INSERT INTO actors VALUES ('holder-1','${holderKind}'), ('lifecycle-owner','human');
+    INSERT INTO rooms VALUES ('room-1','active',4,'lifecycle-owner');
     INSERT INTO project_room_states VALUES ('room-1',7);
-    INSERT INTO room_memberships VALUES ('room-1','holder-1','${holderKind}','active');
+    INSERT INTO room_memberships VALUES ('room-1','holder-1','${holderKind}','active',NULL);
+    INSERT INTO room_memberships VALUES ('room-1','lifecycle-owner','human',NULL,'owner');
     INSERT INTO project_next_actions VALUES ('action-1','room-1',3,'accepted');
     INSERT INTO project_ball_boundaries VALUES (
       'boundary-parent','room-1','room-1','next_action','action-1',3,4,'${holderKind}','holder-1',
@@ -92,7 +99,9 @@ describe("FT-09 database reminder authority", () => {
   it("does not let more than 256 paused Agent candidates starve a later Human reminder", async () => {
     const database = fixture();
     try {
-      const membership = database.prepare("INSERT INTO room_memberships VALUES ('room-1', ?, 'agent', 'active')");
+      const membership = database.prepare(
+        "INSERT INTO room_memberships VALUES ('room-1', ?, 'agent', 'active', NULL)",
+      );
       const profile = database.prepare(
         `INSERT INTO agent_profiles VALUES
          (?, 'enabled', '["room.project.read","room.respond"]')`,
@@ -204,6 +213,23 @@ describe("FT-09 database reminder authority", () => {
 });
 
 describe("FT-09 database lifecycle participant", () => {
+  it("revalidates the trusted Human lifecycle actor as Room owner/admin inside the transaction", () => {
+    const database = fixture("human");
+    try {
+      database.prepare("UPDATE rooms SET status = 'archived', archive_generation = 5").run();
+      expect(() => archiveProjectLoopBoundariesInTransaction(database, {
+        roomId: "room-1", actorId: "holder-1", archiveGeneration: 5,
+        previousLifecycleGeneration: 4, occurredAt: now,
+      })).toThrowError(expect.objectContaining({ code: "permission_denied" }));
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM project_archive_suspensions",
+      ).get()).toEqual({ count: 0 });
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM project_ball_boundaries WHERE status = 'active'",
+      ).get()).toEqual({ count: 2 });
+    } finally { database.close(); }
+  });
+
   it("supersedes old generation, preserves remaining duration, and reopens without burst", async () => {
     const database = fixture();
     try {
@@ -212,12 +238,12 @@ describe("FT-09 database lifecycle participant", () => {
         .run("2026-08-27T08:00:00.000Z");
       database.prepare("UPDATE rooms SET status = 'archived', archive_generation = 5").run();
       expect(archiveProjectLoopBoundariesInTransaction(database, {
-        roomId: "room-1", archiveGeneration: 5, previousLifecycleGeneration: 4, occurredAt: now,
+        roomId: "room-1", actorId: "lifecycle-owner", archiveGeneration: 5, previousLifecycleGeneration: 4, occurredAt: now,
       })).toMatchObject({ lifecycleGeneration: 5, suspendedBoundaryCount: 1 });
       database.prepare("UPDATE rooms SET status = 'active'").run();
       const reopenedAt = "2026-09-25T08:00:00.000Z";
       expect(reopenProjectLoopBoundariesInTransaction(database, {
-        roomId: "room-1", archiveGeneration: 5, previousLifecycleGeneration: 5,
+        roomId: "room-1", actorId: "lifecycle-owner", archiveGeneration: 5, previousLifecycleGeneration: 5,
         occurredAt: reopenedAt,
       })).toMatchObject({ lifecycleGeneration: 5, replacementBoundaryCount: 1 });
       expect(database.prepare(
@@ -250,12 +276,12 @@ describe("FT-09 database lifecycle participant", () => {
       `);
       database.prepare("UPDATE rooms SET status = 'archived', archive_generation = 5").run();
       archiveProjectLoopBoundariesInTransaction(database, {
-        roomId: "room-1", archiveGeneration: 5, previousLifecycleGeneration: 4, occurredAt: now,
+        roomId: "room-1", actorId: "lifecycle-owner", archiveGeneration: 5, previousLifecycleGeneration: 4, occurredAt: now,
       });
       database.prepare("UPDATE rooms SET status = 'active'").run();
       const reopenedAt = "2026-09-25T08:00:00.000Z";
       reopenProjectLoopBoundariesInTransaction(database, {
-        roomId: "room-1", archiveGeneration: 5, previousLifecycleGeneration: 5,
+        roomId: "room-1", actorId: "lifecycle-owner", archiveGeneration: 5, previousLifecycleGeneration: 5,
         occurredAt: reopenedAt,
       });
       expect(database.prepare(
@@ -268,7 +294,7 @@ describe("FT-09 database lifecycle participant", () => {
         now: reopenedAt, limit: 256,
       })).toEqual({ reopenedReviews: 0, expiredTransfers: 0 });
       expect(() => reopenProjectLoopBoundariesInTransaction(database, {
-        roomId: "room-1", archiveGeneration: 5, previousLifecycleGeneration: 5,
+        roomId: "room-1", actorId: "lifecycle-owner", archiveGeneration: 5, previousLifecycleGeneration: 5,
         occurredAt: "2026-10-25T08:00:00.000Z",
       })).toThrowError(expect.objectContaining({ code: "revision_conflict" }));
       expect(database.prepare(
@@ -288,12 +314,12 @@ describe("FT-09 database lifecycle participant", () => {
       database.prepare("DELETE FROM project_ball_boundaries WHERE source_kind = 'due'").run();
       database.prepare("UPDATE rooms SET status = 'archived', archive_generation = 5").run();
       archiveProjectLoopBoundariesInTransaction(database, {
-        roomId: "room-1", archiveGeneration: 5, previousLifecycleGeneration: 4, occurredAt: now,
+        roomId: "room-1", actorId: "lifecycle-owner", archiveGeneration: 5, previousLifecycleGeneration: 4, occurredAt: now,
       });
       database.prepare("UPDATE project_next_actions SET status = 'done'").run();
       database.prepare("UPDATE rooms SET status = 'active'").run();
       expect(reopenProjectLoopBoundariesInTransaction(database, {
-        roomId: "room-1", archiveGeneration: 5, previousLifecycleGeneration: 5,
+        roomId: "room-1", actorId: "lifecycle-owner", archiveGeneration: 5, previousLifecycleGeneration: 5,
         occurredAt: "2026-09-25T08:00:00.000Z",
       })).toMatchObject({ resumedBoundaryCount: 0, replacementBoundaryCount: 0 });
       expect(database.prepare(

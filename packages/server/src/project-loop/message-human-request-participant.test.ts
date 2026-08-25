@@ -78,7 +78,8 @@ function database(): DatabaseSync {
     ) STRICT;
     CREATE TABLE events (
       event_id TEXT PRIMARY KEY, stream_kind TEXT NOT NULL, stream_id TEXT NOT NULL,
-      stream_seq INTEGER NOT NULL, room_id TEXT, actor_id TEXT NOT NULL,
+      stream_seq INTEGER NOT NULL, room_id TEXT, authority_kind TEXT NOT NULL,
+      actor_id TEXT,
       event_type TEXT NOT NULL, occurred_at TEXT NOT NULL, payload_json TEXT NOT NULL,
       UNIQUE(stream_kind, stream_id, stream_seq)
     ) STRICT;
@@ -120,8 +121,9 @@ function database(): DatabaseSync {
     CREATE TABLE project_events (
       event_id TEXT PRIMARY KEY, room_id TEXT NOT NULL, project_id TEXT NOT NULL,
       event_seq INTEGER NOT NULL, event_type TEXT NOT NULL, fact_kind TEXT NOT NULL,
-      fact_id TEXT NOT NULL, fact_revision INTEGER NOT NULL, actor_kind TEXT NOT NULL,
-      actor_id TEXT NOT NULL, source_room_id TEXT NOT NULL, source_id TEXT NOT NULL,
+      fact_id TEXT NOT NULL, fact_revision INTEGER NOT NULL, authority_kind TEXT NOT NULL,
+      actor_kind TEXT, actor_id TEXT, causal_actor_kind TEXT NOT NULL,
+      causal_actor_id TEXT NOT NULL, source_room_id TEXT NOT NULL, source_id TEXT NOT NULL,
       source_kind TEXT NOT NULL, source_revision INTEGER NOT NULL,
       source_visibility TEXT NOT NULL, occurred_at TEXT NOT NULL, payload_json TEXT NOT NULL,
       UNIQUE(room_id, event_seq)
@@ -135,7 +137,9 @@ function database(): DatabaseSync {
       audit_id TEXT PRIMARY KEY, room_id TEXT NOT NULL, project_id TEXT NOT NULL,
       project_revision INTEGER NOT NULL, event_id TEXT NOT NULL UNIQUE,
       operation TEXT NOT NULL, fact_kind TEXT NOT NULL, fact_id TEXT NOT NULL,
-      actor_kind TEXT NOT NULL, actor_id TEXT NOT NULL, transition_json TEXT NOT NULL,
+      authority_kind TEXT NOT NULL, actor_kind TEXT, actor_id TEXT,
+      causal_actor_kind TEXT NOT NULL, causal_actor_id TEXT NOT NULL,
+      transition_json TEXT NOT NULL,
       occurred_at TEXT NOT NULL, UNIQUE(room_id, project_revision)
     ) STRICT;
     CREATE TABLE project_ball_boundaries (

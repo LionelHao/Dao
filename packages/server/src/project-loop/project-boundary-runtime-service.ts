@@ -101,6 +101,7 @@ export type ProjectLoopReopenResult = Readonly<{
 
 export type ProjectLoopLifecycleInput = Readonly<{
   roomId: string;
+  actorId: string;
   archiveGeneration: number;
   previousLifecycleGeneration: number;
   occurredAt: string;
@@ -336,8 +337,8 @@ export async function scanCurrentProjectReminderBuckets(options: Readonly<{
 
 function lifecycleInput(value: unknown): value is ProjectLoopLifecycleInput {
   return isRecord(value) && exact(value, [
-    "roomId", "archiveGeneration", "previousLifecycleGeneration", "occurredAt",
-  ]) && identifier(value.roomId) && positive(value.archiveGeneration) &&
+    "roomId", "actorId", "archiveGeneration", "previousLifecycleGeneration", "occurredAt",
+  ]) && identifier(value.roomId) && identifier(value.actorId) && positive(value.archiveGeneration) &&
     nonnegative(value.previousLifecycleGeneration) &&
     (value.archiveGeneration === value.previousLifecycleGeneration ||
       value.archiveGeneration === value.previousLifecycleGeneration + 1) && timestamp(value.occurredAt);
