@@ -23,6 +23,21 @@ export interface ProjectBoundaryInvocationAuthorityPort {
   }>): Promise<ProjectBoundaryInvocationResult>;
 }
 
+export interface AuthoritativeProjectBoundaryInvocationPort {
+  /**
+   * The v23 adapter must atomically verify that the boundary is confirmed,
+   * active, current, unconsumed, Agent-held, lifecycle-active and assignment-
+   * eligible; claim it; and create the FT-08 invocation intent. Ineligible
+   * inputs return a durable suppression and must create zero execution/provider
+   * work.
+   */
+  claimConfirmedAgentBoundary(input: Readonly<{
+    request: ProjectBoundaryInvocationRequest;
+    requestSha256: string;
+    attemptedAt: string;
+  }>): Promise<ProjectBoundaryInvocationResult>;
+}
+
 export interface ProjectBoundaryInvocationProducer {
   consume(request: ProjectBoundaryInvocationRequest): Promise<ProjectBoundaryInvocationResult>;
 }
@@ -78,6 +93,34 @@ export function createFailClosedProjectBoundaryInvocationProducer(options: Reado
       if (!isProjectBoundaryInvocationResult(result) ||
           result.boundaryId !== request.boundaryId || result.roomId !== request.roomId ||
           result.status !== "suppressed" || result.reason !== "dependency_unavailable") {
+        throw new TypeError("Project boundary authority result was malformed");
+      }
+      return result;
+    },
+  });
+}
+
+export function createAuthoritativeProjectBoundaryInvocationProducer(options: Readonly<{
+  authority: AuthoritativeProjectBoundaryInvocationPort;
+  now?: () => number;
+}>): ProjectBoundaryInvocationProducer {
+  const now = options.now ?? Date.now;
+  return Object.freeze({
+    async consume(request: ProjectBoundaryInvocationRequest) {
+      if (!isProjectBoundaryInvocationRequest(request)) {
+        throw new TypeError("Project boundary invocation request was malformed");
+      }
+      const requestSha256 = createHash("sha256")
+        .update(canonicalJsonV1(request))
+        .digest("hex");
+      const attemptedAt = new Date(now()).toISOString();
+      const result = await options.authority.claimConfirmedAgentBoundary({
+        request,
+        requestSha256,
+        attemptedAt,
+      });
+      if (!isProjectBoundaryInvocationResult(result) ||
+          result.boundaryId !== request.boundaryId || result.roomId !== request.roomId) {
         throw new TypeError("Project boundary authority result was malformed");
       }
       return result;
