@@ -634,15 +634,16 @@ export function createSqliteHumanRequestMessageParticipant(options: Readonly<{
                   request.target_human_actor_id AS targetActorId,
                   request.source_request_intent_id AS requestIntentId,
                   request.source_target_id AS sourceTargetId,
-                  request.created_at AS createdAt
+                  request.created_at AS createdAt, request.revision,
+                  request.source_revision AS sourceRevision
            FROM project_requests AS request
            JOIN human_request_intents AS intent
              ON intent.id = request.source_request_intent_id
            WHERE request.room_id = ? AND request.source_id = ?
-             AND request.source_revision = ? AND request.source_kind = 'message'
+             AND request.source_kind = 'message'
              AND request.status = 'pending_acceptance' AND intent.status = 'cancelled'
            ORDER BY request.id`,
-        ).all(binding.roomId, binding.sourceMessageId, binding.sourceRevision);
+        ).all(binding.roomId, binding.sourceMessageId);
         const cancelledRequestIds: string[] = [];
         const eventIds: string[] = [];
         for (const row of rows) {
@@ -651,7 +652,9 @@ export function createSqliteHumanRequestMessageParticipant(options: Readonly<{
               !(row.requestKind === "next_action" || row.requestKind === "open_question" ||
                 row.requestKind === "blocker") || typeof row.requesterActorId !== "string" ||
               typeof row.targetActorId !== "string" || typeof row.requestIntentId !== "string" ||
-              typeof row.sourceTargetId !== "string" || typeof row.createdAt !== "string") {
+              typeof row.sourceTargetId !== "string" || typeof row.createdAt !== "string" ||
+              typeof row.revision !== "number" || row.revision < 1 ||
+              typeof row.sourceRevision !== "number" || row.sourceRevision < 1) {
             throw new HumanRequestMessageParticipantError(
               "storage_unavailable",
               "Pending Project Request recall row is corrupt",
@@ -669,11 +672,12 @@ export function createSqliteHumanRequestMessageParticipant(options: Readonly<{
           }
           const projectRevision = state.revision + 1;
           const eventId = projectEventId(binding.roomId, projectRevision);
+          const requestRevision = row.revision + 1;
           const updated = database.prepare(
             `UPDATE project_requests
-             SET status = 'cancelled', revision = 2, updated_at = ?
-             WHERE id = ? AND room_id = ? AND status = 'pending_acceptance' AND revision = 1`,
-          ).run(binding.occurredAt, row.id, binding.roomId);
+             SET status = 'cancelled', revision = revision + 1, updated_at = ?
+             WHERE id = ? AND room_id = ? AND status = 'pending_acceptance' AND revision = ?`,
+          ).run(binding.occurredAt, row.id, binding.roomId, row.revision);
           if (updated.changes !== 1) {
             throw new HumanRequestMessageParticipantError(
               "binding_conflict",
@@ -684,7 +688,7 @@ export function createSqliteHumanRequestMessageParticipant(options: Readonly<{
             `UPDATE project_ball_boundaries
              SET status = 'released', released_at = ?
              WHERE room_id = ? AND source_kind = 'request' AND source_id = ?
-               AND source_revision = 1 AND status = 'active'`,
+               AND status = 'active'`,
           ).run(binding.occurredAt, binding.roomId, row.id);
           const transitionPayload = canonical(Object.freeze({
             reason: "message_recalled",
@@ -695,11 +699,11 @@ export function createSqliteHumanRequestMessageParticipant(options: Readonly<{
                event_id, room_id, project_id, event_seq, event_type, fact_kind, fact_id,
                fact_revision, actor_kind, actor_id, source_room_id, source_id, source_kind,
                source_revision, source_visibility, occurred_at, payload_json
-             ) VALUES (?, ?, ?, ?, 'fact.transitioned', 'request', ?, 2, 'human', ?, ?, ?,
+             ) VALUES (?, ?, ?, ?, 'fact.transitioned', 'request', ?, ?, 'human', ?, ?, ?,
                        'message', ?, 'room', ?, ?)`,
-          ).run(eventId, binding.roomId, binding.roomId, projectRevision, row.id,
+          ).run(eventId, binding.roomId, binding.roomId, projectRevision, row.id, requestRevision,
             binding.recalledByHumanActorId, binding.roomId, binding.sourceMessageId,
-            binding.sourceRevision, binding.occurredAt, transitionPayload);
+            row.sourceRevision, binding.occurredAt, transitionPayload);
           database.prepare(
             `INSERT INTO project_event_outbox (
                event_id, room_id, event_seq, status, attempts, available_at, dispatched_at
@@ -742,10 +746,10 @@ export function createSqliteHumanRequestMessageParticipant(options: Readonly<{
             recordVersion: "project-loop.v1",
             roomId: binding.roomId,
             projectId: binding.roomId,
-            revision: 2,
+            revision: requestRevision,
             provenance: Object.freeze({
               source: Object.freeze({ kind: "message", sourceId: binding.sourceMessageId,
-                sourceRevision: binding.sourceRevision, roomId: binding.roomId, visibility: "room" }),
+                sourceRevision: row.sourceRevision, roomId: binding.roomId, visibility: "room" }),
               proposedBy: Object.freeze({ actorId: row.requesterActorId, kind: "human" }),
             }),
             createdAt: row.createdAt,
