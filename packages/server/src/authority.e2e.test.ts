@@ -2877,6 +2877,138 @@ describe("authoritative server real-process harness", () => {
     }
   }, 30_000);
 
+  it("keeps one real preview sentinel out of every durable and diagnostic surface", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-preview-sentinel-"));
+    const databasePath = join(directory, "authority.sqlite");
+    const sentinel = "FT08-PREVIEW-TRANSIENT-ONLY-7F41C9D2";
+    let started: Awaited<ReturnType<typeof spawnAuthorityChild>> | undefined;
+    let client: JsonWebSocketClient | undefined;
+    try {
+      const seeded = await spawnAuthorityChild({
+        directory,
+        actors: previewActors,
+        seedRuntimeRoomForTest: true,
+      });
+      const seedClient = await JsonWebSocketClient.connect(seeded.url);
+      await seedClient.login("preview-sentinel-seed-login");
+      const roomId = await discoverRoom(seedClient);
+      seedClient.close();
+      await stopChild(seeded.child);
+
+      const setup = new DatabaseSync(databasePath);
+      const profile = setup.prepare(
+        "SELECT id, revision FROM agent_profiles WHERE actor_id = 'agent-a' AND status = 'disabled'",
+      ).get();
+      if (typeof profile?.id !== "string" || typeof profile.revision !== "number") {
+        throw new Error("Preview sentinel fixture lacked the disabled static Agent Profile");
+      }
+      const profileRevision = profile.revision + 1;
+      setup.prepare(
+        `UPDATE agent_profiles
+         SET revision = ?, status = 'enabled', tool_ceiling_json = ?,
+             updated_at = ?, source_kind = 'administrator_command'
+         WHERE id = ? AND revision = ? AND status = 'disabled'`,
+      ).run(profileRevision, '["repository.git-status"]',
+        "2026-08-24T00:00:00.000Z", profile.id, profile.revision);
+      setup.prepare(
+        `INSERT INTO agent_profile_revisions (
+           profile_id, revision, actor_id, display_name, global_responsibility,
+           status, capability_ceiling_json, tool_ceiling_json,
+           changed_by_human_actor_id, changed_at, operation
+         ) SELECT id, revision, actor_id, display_name, global_responsibility,
+                  status, capability_ceiling_json, tool_ceiling_json,
+                  'human-a', updated_at, 'enable'
+           FROM agent_profiles WHERE id = ?`,
+      ).run(profile.id);
+      seedCanonicalRoomAssignmentFixture(setup, {
+        assignmentId: "preview-sentinel-assignment-agent-a",
+        roomId,
+        profileId: profile.id,
+        actorId: "agent-a",
+        participation: "active",
+        capabilitySubset: [],
+        toolSubset: ["repository.git-status"],
+      });
+      setup.close();
+
+      started = await spawnAuthorityChild({
+        directory,
+        actors: previewActors,
+        previewSentinelForTest: sentinel,
+      });
+      const child = started.child;
+      client = await JsonWebSocketClient.connect(started.url);
+      await client.login("preview-sentinel-login");
+      await client.request({
+        type: "room.subscribe.v2",
+        requestId: "preview-sentinel-subscribe",
+        roomId,
+        cursor: { version: 1, roomId, afterSeq: readRoomHeadSeq(directory, roomId) },
+      }, "room.subscribed.v2");
+
+      const messageId = "message-v2-preview-sentinel";
+      await client.request({
+        type: "message.send.v2",
+        requestId: "preview-sentinel-send",
+        message: {
+          messageId,
+          roomId,
+          body: "@Agent emit transient preview only",
+          mentionedTargets: [{
+            id: "preview-sentinel-target-agent-a",
+            kind: "agent-invocation",
+            targetActorId: "agent-a",
+            range: { startUtf16: 0, endUtf16: 6 },
+          }],
+          attachments: [],
+        },
+      }, "message.accepted");
+      await expect(client.waitFor((frame) => frame.type === "agent.execution.preview" &&
+        frame.delta === sentinel)).resolves.toMatchObject({
+          type: "agent.execution.preview",
+          roomId,
+          delta: sentinel,
+          authoritative: false,
+        });
+
+      const reset = client.waitFor((frame) => frame.type === "agent.execution.preview.reset" &&
+        frame.reason === "message_recalled");
+      const cancelled = client.waitFor((frame) => frame.type === "room.event" &&
+        frame.event.type === "agent.execution.changed" &&
+        frame.event.payload.status === "cancelled");
+      await client.request({
+        type: "message.recall",
+        requestId: "preview-sentinel-recall",
+        roomId,
+        messageId,
+        expectedRevision: 1,
+      }, "message.recall.accepted");
+      await expect(reset).resolves.toMatchObject({
+        type: "agent.execution.preview.reset",
+        roomId,
+        reason: "message_recalled",
+        authoritative: false,
+      });
+      await expect(cancelled).resolves.toMatchObject({
+        type: "room.event",
+        event: { type: "agent.execution.changed", payload: { status: "cancelled" } },
+      });
+
+      const repair = await repairRecords(client, roomId);
+      expect(jsonSentinelHits("repair", repair, [sentinel])).toEqual([]);
+      expect(authoritySentinelHits(databasePath, sentinel)).toEqual([]);
+      await stopChild(child);
+      started = undefined;
+      expect(byteSentinelHits(await readAuthorityCheckpointFiles(directory), [sentinel])).toEqual([]);
+      expect(jsonSentinelHits("stdout", childStdout.get(child) ?? "", [sentinel])).toEqual([]);
+      expect(jsonSentinelHits("stderr", unexpectedChildStderr(child), [sentinel])).toEqual([]);
+    } finally {
+      client?.close();
+      if (started !== undefined) await stopChild(started.child).catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("keeps public agent.invoke closed across restart with zero recovered runtime or Provider work", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-public-invoke-restart-"));
     const databasePath = join(directory, "authority.sqlite");

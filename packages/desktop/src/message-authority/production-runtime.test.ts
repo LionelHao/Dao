@@ -149,7 +149,7 @@ describe("production Desktop Message Authority runtime", () => {
 
     server.send({ type: "agent.execution.preview", roomId: "room-1",
       executionId: "execution-1", attemptSeq: 1, streamSeq: 1,
-      delta: "PREVIEW-WIRE-SENTINEL", authoritative: false });
+      delta: "FT08-PREVIEW-TRANSIENT-ONLY-7F41C9D2", authoritative: false });
     server.send({ type: "agent.execution.preview.reset", roomId: "room-1",
       executionId: "execution-1", attemptSeq: 1,
       reason: "human_cancelled", authoritative: false });
@@ -167,7 +167,8 @@ describe("production Desktop Message Authority runtime", () => {
     }));
     expect(inputs).toContainEqual({
       type: "agent.execution.preview", roomId: "room-1", executionId: "execution-1",
-      attemptSeq: 1, streamSeq: 1, delta: "PREVIEW-WIRE-SENTINEL", authoritative: false,
+      attemptSeq: 1, streamSeq: 1,
+      delta: "FT08-PREVIEW-TRANSIENT-ONLY-7F41C9D2", authoritative: false,
     });
     expect(inputs).toContainEqual({
       type: "agent.execution.preview.reset", roomId: "room-1", executionId: "execution-1",

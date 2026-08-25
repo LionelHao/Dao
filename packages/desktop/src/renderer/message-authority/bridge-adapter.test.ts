@@ -256,15 +256,16 @@ describe("Message Authority bridge renderer adapter", () => {
 
     authority.publish({ type: "agent.execution.preview", roomId: "room-1",
       executionId: "execution-1", attemptSeq: 1, streamSeq: 1,
-      delta: "PREVIEW-BRIDGE-SENTINEL", authoritative: false });
+      delta: "FT08-PREVIEW-TRANSIENT-ONLY-7F41C9D2", authoritative: false });
     await vi.waitFor(() => expect(root.querySelector("[data-agent-preview='execution-1']")?.textContent)
-      .toContain("PREVIEW-BRIDGE-SENTINEL"));
+      .toContain("FT08-PREVIEW-TRANSIENT-ONLY-7F41C9D2"));
     expect(root.querySelectorAll("[data-message-id]")).toHaveLength(1);
 
     authority.publish({ type: "agent.execution.preview.reset", roomId: "room-1",
       executionId: "execution-1", attemptSeq: 1,
       reason: "human_cancelled", authoritative: false });
     await vi.waitFor(() => expect(root.querySelector("[data-agent-preview='execution-1']")).toBeNull());
+    expect(root.textContent).not.toContain("FT08-PREVIEW-TRANSIENT-ONLY-7F41C9D2");
     authority.publish({ type: "agent.execution.preview", roomId: "room-1",
       executionId: "execution-1", attemptSeq: 2, streamSeq: 1,
       delta: "DISCONNECT-SENTINEL", authoritative: false });
