@@ -271,7 +271,7 @@ describe("production Desktop Governance loopback wire contract fixture", () => {
     dispose(); runtime.close();
   });
 
-  it("locks and purges without a real offline lease, reconnects on repair, and purges on revoke", async () => {
+  it("locks writes but retains the verified offline cache, reconnects on repair, and purges on revoke", async () => {
     const authority = await loopbackAuthority();
     let request = 0;
     const runtime = createDesktopGovernanceRuntime({
@@ -289,7 +289,9 @@ describe("production Desktop Governance loopback wire contract fixture", () => {
     await vi.waitFor(() => expect(runtime.controller.current("room-1")).toMatchObject({
       status: "locked", connection: { status: "offline" },
     }));
-    expect(runtime.cache.governanceProjection("room-1")).toBeUndefined();
+    expect(runtime.cache.governanceProjection("room-1")).toMatchObject({
+      roomId: "room-1", governanceRevision: 7,
+    });
     const countBeforeSubmit = authority.received.length;
     expect(() => runtime.controller.submit({
       roomId: "room-1", intent: { command: "room.archive", expectedGovernanceRevision: 7 },
