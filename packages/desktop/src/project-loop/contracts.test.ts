@@ -28,6 +28,12 @@ describe("FT-09 Desktop Project Loop closed bridge contracts", () => {
       eventIds: ["event-8"], replayed: false, fact: { forged: true } })).toBe(false);
     expect(isProjectLoopWireError({ type: "error", status: 429, code: "rate_limited",
       message: "wait", requestId: "q-2", retryAfterSeconds: 4 })).toBe(true);
+    expect(isProjectLoopWireError({ type: "error", status: 400, code: "invalid_request",
+      message: "invalid target", requestId: "q-3" })).toBe(true);
+    expect(isProjectLoopWireError({ type: "error", status: 404, code: "project_fact_not_found",
+      message: "missing", requestId: "q-4" })).toBe(true);
+    expect(isProjectLoopWireError({ type: "error", status: 410, code: "room_archived",
+      message: "archived", requestId: "q-5" })).toBe(true);
     expect(isProjectLoopWireError({ type: "error", status: 403, code: "revision_conflict",
       message: "mismatch", requestId: "q-2" })).toBe(false);
   });

@@ -42,7 +42,7 @@ interface RoomState {
 }
 
 function errorStatus(error: unknown): Readonly<{
-  status: 401 | 403 | 409 | 410 | 429 | 503;
+  status: 400 | 401 | 403 | 404 | 409 | 410 | 429 | 503;
   code: string;
   retryAfterSeconds?: number;
 }> {
@@ -53,7 +53,8 @@ function errorStatus(error: unknown): Readonly<{
     ? (error as { closedError?: { status?: unknown; code?: unknown; retryAfterSeconds?: unknown } }).closedError
     : undefined;
   const status = closed?.status;
-  const normalized = status === 401 || status === 403 || status === 409 || status === 410 ||
+  const normalized = status === 400 || status === 401 || status === 403 || status === 404 ||
+    status === 409 || status === 410 ||
     status === 429 || status === 503 ? status : 503;
   return Object.freeze({
     status: normalized,

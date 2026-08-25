@@ -18,7 +18,7 @@ export type ProjectLoopConnection =
   | { readonly status: "repairing" }
   | { readonly status: "repair_failed"; readonly code: string };
 
-export type ProjectLoopErrorStatus = 401 | 403 | 409 | 410 | 429 | 503;
+export type ProjectLoopErrorStatus = 400 | 401 | 403 | 404 | 409 | 410 | 429 | 503;
 export type ProjectLoopOperation =
   | { readonly status: "idle" }
   | { readonly status: "submitting"; readonly intentId: string }
@@ -81,8 +81,10 @@ function announcement(state: Extract<ProjectLoopRemoteState, { status: "ready" }
   if (state.operation.status === "acknowledged") return "服务端已接受项目意图，等待稳定事件或投影收敛。";
   if (state.operation.status === "failed") {
     const messages: Record<ProjectLoopErrorStatus, string> = {
+      400: "项目操作无效，请检查输入后重试。",
       401: "身份已失效，请重新登录。",
       403: "没有执行此项目操作的权限，当前事实仍可阅读。",
+      404: "项目事实或来源不存在，请刷新权威状态。",
       409: "项目版本已变化，请刷新后重新确认。",
       410: "Room 或项目来源已不可操作。",
       429: "操作过于频繁，请按服务端提示稍后重试。",

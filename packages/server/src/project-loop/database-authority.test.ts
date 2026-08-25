@@ -261,6 +261,52 @@ describe("Project Loop database authority", () => {
     });
   });
 
+  it("resolves by proposal revision and revalidates the pinned source at confirmation", () => {
+    withDatabase((database) => {
+      executeProjectLoopAuthorityOperation(database, proposalCreate());
+      executeProjectLoopAuthorityOperation(database, createFactProposal({
+        proposalId: "unrelated-decision", factKind: "decision", factId: "decision-unrelated",
+        baseRevision: 1, payload: { title: "Unrelated", rationale: "Advance the Project head",
+          statement: "Keep the source fence", supersedesDecisionId: null, affectedFactIds: [] },
+      }));
+      expect(() => executeProjectLoopAuthorityOperation(database, resolveFactProposal("proposal-goal", 1)))
+        .not.toThrow();
+    });
+    withDatabase((database) => {
+      executeProjectLoopAuthorityOperation(database, proposalCreate());
+      database.prepare(
+        `INSERT INTO message_revisions (message_id, revision, body, revised_at, revised_by_actor_id)
+         VALUES ('message-1', 2, 'Revised source', '2026-08-25T07:30:00.000Z', 'human-owner')`,
+      ).run();
+      database.prepare(
+        "UPDATE message_envelopes SET current_revision = 2, revision_count = 2 WHERE message_id = 'message-1'",
+      ).run();
+      expect(() => executeProjectLoopAuthorityOperation(database, resolveFactProposal("proposal-goal", 1)))
+        .toThrowError(expect.objectContaining({ code: "revision_conflict" }));
+      expect(database.prepare("SELECT COUNT(*) AS count FROM project_goals").get()).toEqual({ count: 0 });
+    });
+    withDatabase((database) => {
+      executeProjectLoopAuthorityOperation(database, proposalCreate());
+      database.prepare(
+        `INSERT INTO message_recall_fences (
+           fence_id, room_id, source_message_id, source_revision, scope_kind,
+           invocation_intent_id, execution_id, reason, created_at
+         ) VALUES (
+           'recall-fence-project-source', 'room-project', 'message-1', 1, 'message',
+           NULL, NULL, 'message_recalled', '2026-08-25T07:30:00.000Z'
+         )`,
+      ).run();
+      database.prepare(
+        `UPDATE message_envelopes SET lifecycle = 'recalled',
+           recalled_at = '2026-08-25T07:30:00.000Z', recalled_by_actor_id = 'human-owner'
+         WHERE message_id = 'message-1'`,
+      ).run();
+      expect(() => executeProjectLoopAuthorityOperation(database, resolveFactProposal("proposal-goal", 1)))
+        .toThrowError(expect.objectContaining({ code: "invalid_transition" }));
+      expect(database.prepare("SELECT COUNT(*) AS count FROM project_goals").get()).toEqual({ count: 0 });
+    });
+  });
+
   it("enforces one active goal, immutable confirmed decisions, and legal transitions", () => {
     withDatabase((database) => {
       executeProjectLoopAuthorityOperation(database, proposalCreate());
@@ -284,7 +330,7 @@ describe("Project Loop database authority", () => {
         type: "project-loop.proposal.resolve",
         context: humanContext("member-replacement-confirm", "human-member"),
         command: { proposalId: "proposal-member-replacement", roomId: "room-project",
-          projectId: "room-project", expectedRevision: 3, resolution: "confirmed", reason: null },
+          projectId: "room-project", expectedRevision: 1, resolution: "confirmed", reason: null },
         now: NOW + 2,
       })).toThrowError(expect.objectContaining({ code: "permission_denied" }));
       executeProjectLoopAuthorityOperation(database, {
@@ -373,7 +419,7 @@ describe("Project Loop database authority", () => {
       executeProjectLoopAuthorityOperation(database, {
         type: "project-loop.proposal.resolve", context: humanContext("goal-replacement-confirm"),
         command: { proposalId: "proposal-goal-replacement", roomId: "room-project",
-          projectId: "room-project", expectedRevision: 3, resolution: "confirmed", reason: null },
+          projectId: "room-project", expectedRevision: 1, resolution: "confirmed", reason: null },
         now: NOW + 3,
       });
       expect(database.prepare(
@@ -441,14 +487,14 @@ describe("Project Loop database authority", () => {
         baseRevision: 2, payload: { title: "Ship A", rationale: "First confirmed choice" },
       }));
       executeProjectLoopAuthorityOperation(database,
-        resolveFactProposal("decision-one-proposal", 3));
+        resolveFactProposal("decision-one-proposal", 1));
       executeProjectLoopAuthorityOperation(database, createFactProposal({
         proposalId: "decision-two-proposal", factKind: "decision", factId: "decision-two",
         baseRevision: 4, payload: { title: "Ship B", rationale: "Superseding choice",
           supersedesDecisionId: "decision-one" },
       }));
       executeProjectLoopAuthorityOperation(database,
-        resolveFactProposal("decision-two-proposal", 5));
+        resolveFactProposal("decision-two-proposal", 1));
 
       expect(database.prepare(
         `SELECT id, status, revision, superseded_by_decision_id AS supersededBy

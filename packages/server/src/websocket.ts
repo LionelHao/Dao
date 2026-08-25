@@ -677,6 +677,13 @@ function mappedError(
   return errorFrame(500, "internal_error", "Unable to process request", requestId);
 }
 
+function mappedProjectError(error: unknown, requestId: string): ProtocolErrorFrame {
+  if (isServiceErrorCode(error, "room_archived")) {
+    return errorFrame(410, "room_archived", "room_archived", requestId);
+  }
+  return mappedError(error, requestId);
+}
+
 async function revokeUnacknowledgedSession(
   auth: AuthenticationService,
   accessToken: string,
@@ -2484,7 +2491,7 @@ async function handleFrame(
         const response = await executeProjectLoopFrame(session, frame, options.projectLoopAuthority);
         sendCurrentGeneration(socket, response, generation, context);
       } catch (error: unknown) {
-        sendCurrentGeneration(socket, mappedError(error, frame.requestId), generation, context);
+        sendCurrentGeneration(socket, mappedProjectError(error, frame.requestId), generation, context);
       }
       return;
     }

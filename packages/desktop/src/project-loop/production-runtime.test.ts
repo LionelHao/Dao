@@ -173,6 +173,29 @@ describe("FT-09 Desktop Project Loop production runtime", () => {
     runtime.close();
   });
 
+  it.each([
+    [400, "invalid_request"], [404, "project_fact_not_found"], [410, "room_archived"],
+  ] as const)("preserves a %s Project authority failure without fabricating offline state", async (status, code) => {
+    const wire = createTransport(async () => {
+      throw Object.assign(new Error(code), { projectError: {
+        type: "error", status, code, message: code, requestId: "request-1",
+      } });
+    });
+    const cache = createCacheHarness([projectSnapshot()]);
+    const runtime = createDesktopProjectLoopRuntime({ session, transport: wire.transport,
+      authorityCache: cache.cache, repairRoom: (roomId) => cache.repairRoom(roomId),
+      restoreAuthorityCache: async () => false,
+      createRequestIdentity: () => ({ requestId: "request-1", idempotencyKey: "idem-1" }) });
+    await runtime.getSurface({ roomId: "room-1" });
+    await expect(runtime.submit({ roomId: "room-1", intent: { kind: "request.transition",
+      intentId: "cancel-request", factId: "request-1", expectedRevision: 3,
+      action: "cancel", reason: "No longer needed" } })).resolves.toMatchObject({
+        status: "ready", connection: { status: "online" },
+        operation: { status: "failed", error: { status, code } },
+      });
+    runtime.close();
+  });
+
   it("converges three Desktop clients after the same stable invalidation", async () => {
     const clients = Array.from({ length: 3 }, (_, index) => {
       const wire = createTransport(async () => { throw new Error("unexpected mutation"); });

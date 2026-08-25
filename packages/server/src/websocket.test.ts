@@ -156,6 +156,45 @@ describe("FT-09 Project Loop WebSocket", () => {
       await server.close();
     }
   });
+
+  it("preserves Project authority status and presents archived Rooms as 410", async () => {
+    const executeMutation = vi.fn<ProjectLoopAuthorityTransport["executeMutation"]>(async (_context, frame) => {
+      if (frame.proposalId === "proposal-archived") {
+        throw Object.assign(new Error("room_archived"), { status: 409, code: "room_archived" });
+      }
+      throw Object.assign(new Error("invalid_request"), { status: 400, code: "invalid_request" });
+    });
+    const server = await startMessageWebSocketServer({
+      auth: governanceAuthenticationService(), service: idleMessageService(),
+      projectLoopAuthority: { executeMutation, async executeQuery(_context, frame) {
+        return { type: "project.snapshot", requestId: frame.requestId, snapshot: {
+          recordVersion: "project-loop.v1", roomId: frame.roomId, projectId: frame.projectId,
+          watermark: 0, goals: [], decisions: [], requests: [], obstacles: [], nextActions: [],
+          proposals: [], confirmations: [], transferProposals: [], balls: [],
+          capturedAt: "2026-08-25T00:00:00.000Z",
+        }, events: [], nextEventSeq: 0 };
+      } },
+    });
+    const client = await LoopbackClient.connect(server.url);
+    try {
+      await client.login(humans[0], "project-error-login");
+      for (const [proposalId, status, code] of [
+        ["proposal-archived", 410, "room_archived"],
+        ["proposal-invalid", 400, "invalid_request"],
+      ] as const) {
+        const requestId = `resolve-${proposalId}`;
+        client.send({ type: "project.proposal.resolve", requestId,
+          idempotencyKey: `idem-${proposalId}`, roomId, projectId: roomId,
+          proposalId, expectedRevision: 1, resolution: "confirmed", reason: null });
+        await expect(client.waitForError(code, requestId)).resolves.toMatchObject({
+          frame: { type: "error", requestId, status, code },
+        });
+      }
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
 });
 
 const outsider = {

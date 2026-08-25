@@ -149,13 +149,41 @@ export function mountProjectLoopBridgeSurface(
     onNavigateSegment: options.onNavigateSegment,
     onOpenSource(source) {
       const host = root.closest(".room-authority-workspace") ?? root;
+      const compactSegment = source.kind === "message" || source.kind === "attachment"
+        ? "timeline" : "project";
+      const compactControl = host.querySelector<HTMLButtonElement>(
+        `[data-compact-segment-target="${compactSegment}"]`,
+      );
+      if (compactControl !== null) compactControl.click();
+      else options.onNavigateSegment(compactSegment);
+      const railTab = source.kind === "memory" ? "memory"
+        : source.kind === "agent_execution" ? "agent"
+          : source.kind === "project_fact" ? "project" : undefined;
+      if (railTab !== undefined) {
+        host.querySelector<HTMLButtonElement>(`[data-authority-rail-tab="${railTab}"]`)?.click();
+      }
+      if (source.kind === "project_fact" && current.status === "ready") {
+        const category = current.snapshot.goals.some((fact) => fact.goalId === source.sourceId &&
+            fact.revision === source.sourceRevision) ? "goals"
+          : current.snapshot.decisions.some((fact) => fact.decisionId === source.sourceId &&
+            fact.revision === source.sourceRevision) ? "decisions"
+          : current.snapshot.requests.some((fact) => fact.requestId === source.sourceId &&
+            fact.revision === source.sourceRevision) ? "requests"
+          : current.snapshot.obstacles.some((fact) => fact.obstacleId === source.sourceId &&
+            fact.revision === source.sourceRevision) ? "obstacles"
+          : current.snapshot.nextActions.some((fact) => fact.nextActionId === source.sourceId &&
+            fact.revision === source.sourceRevision) ? "next_actions" : undefined;
+        if (category !== undefined) {
+          root.querySelector<HTMLButtonElement>(`[data-category="${category}"]`)?.click();
+        }
+      }
       const candidates = source.kind === "message"
         ? host.querySelectorAll<HTMLElement>("[data-message-id]")
         : source.kind === "agent_execution"
           ? host.querySelectorAll<HTMLElement>("[data-execution-id]")
           : source.kind === "attachment"
             ? host.querySelectorAll<HTMLElement>("[data-attachment-id]")
-          : host.querySelectorAll<HTMLElement>("[data-source-id]");
+          : host.querySelectorAll<HTMLElement>("[data-source-id]:not(.project-loop__source)");
       const candidate = [...candidates].find((item) => {
         const id = source.kind === "message" ? item.dataset.messageId
           : source.kind === "agent_execution" ? item.dataset.executionId
@@ -168,15 +196,20 @@ export function mountProjectLoopBridgeSurface(
           item.dataset.sourceKind === source.kind;
         return id === source.sourceId && revision === String(source.sourceRevision) && kindMatches;
       }) ?? null;
+      const visibleCandidate = candidate?.closest("[hidden]") === null ? candidate : null;
       const panel = root.querySelector<HTMLElement>(".project-loop");
-      if (panel !== null) panel.dataset.projectSourceLookup = candidate === null ? "exact-source-unavailable" : "exact";
+      if (panel !== null) panel.dataset.projectSourceLookup = visibleCandidate === null
+        ? "exact-source-unavailable" : "exact";
       const status = root.querySelector<HTMLElement>(".project-loop__source-status");
-      if (status !== null) status.textContent = candidate === null
+      if (status !== null) status.textContent = visibleCandidate === null
         ? "无法定位精确的来源类型与版本；未打开其他对象。"
         : `已定位精确来源 ${source.kind}:${source.sourceId} r${source.sourceRevision}。`;
-      candidate?.scrollIntoView?.({ block: "center" });
-      if (candidate !== null) candidate.dataset.projectSourceHighlight = "exact-revision";
-      candidate?.focus();
+      visibleCandidate?.scrollIntoView?.({ block: "center" });
+      if (visibleCandidate !== null) {
+        visibleCandidate.dataset.projectSourceHighlight = "exact-revision";
+        visibleCandidate.tabIndex = -1;
+        visibleCandidate.focus();
+      }
     },
   }, { reducedMotion: options.reducedMotion }); renderTimelineRequests(); };
 

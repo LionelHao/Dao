@@ -3,6 +3,51 @@ import type { ProjectLoopBridge } from "../../project-loop/contracts.js";
 import { projectSnapshot } from "../../project-loop/test-fixture.js";
 import { mountProjectLoopBridgeSurface } from "./bridge-adapter.js";
 
+function productionWorkspace(): Readonly<{
+  workspace: HTMLElement;
+  timeline: HTMLElement;
+  project: HTMLElement;
+  memory: HTMLElement;
+  agent: HTMLElement;
+}> {
+  const workspace = document.createElement("main");
+  workspace.className = "room-authority-workspace";
+  workspace.dataset.compactSegment = "timeline";
+  const segments = document.createElement("nav");
+  for (const value of ["timeline", "project"] as const) {
+    const button = document.createElement("button");
+    button.dataset.compactSegmentTarget = value;
+    button.addEventListener("click", () => { workspace.dataset.compactSegment = value; });
+    segments.append(button);
+  }
+  const timeline = document.createElement("main");
+  timeline.className = "room-authority-workspace__timeline";
+  const rail = document.createElement("aside");
+  rail.className = "room-authority-workspace__rail";
+  const project = document.createElement("aside");
+  project.className = "room-authority-workspace__project";
+  const memory = document.createElement("aside");
+  memory.className = "room-authority-workspace__memory";
+  const agent = document.createElement("aside");
+  agent.className = "room-authority-workspace__invocations";
+  const panels = { project, memory, agent };
+  const tabs = document.createElement("nav");
+  for (const value of ["project", "memory", "agent"] as const) {
+    const button = document.createElement("button");
+    button.dataset.authorityRailTab = value;
+    button.addEventListener("click", () => {
+      rail.dataset.authorityRail = value;
+      for (const [key, panel] of Object.entries(panels)) panel.hidden = key !== value;
+    });
+    tabs.append(button);
+  }
+  memory.hidden = true; agent.hidden = true; rail.dataset.authorityRail = "project";
+  rail.append(tabs, project, memory, agent);
+  workspace.append(segments, timeline, rail);
+  document.body.append(workspace);
+  return { workspace, timeline, project, memory, agent };
+}
+
 describe("FT-09 Project Loop timeline integration", () => {
   it("anchors a structured Request card adjacent to its source without parsing message body", async () => {
     const workspace = document.createElement("main"); workspace.className = "room-authority-workspace";
@@ -176,4 +221,75 @@ describe("FT-09 Project Loop timeline integration", () => {
       dispose(); workspace.remove();
     },
   );
+
+  it("opens an exact message revision in the compact timeline segment", async () => {
+    const { workspace, timeline, project } = productionWorkspace();
+    workspace.dataset.compactSegment = "project";
+    const source = document.createElement("article");
+    source.dataset.messageId = "message-1"; source.dataset.messageRevision = "1";
+    timeline.append(source);
+    const ready = { status: "ready" as const, roomId: "room-1", snapshot: projectSnapshot(),
+      viewerActorId: "human-1", connection: { status: "online" as const }, operation: { status: "idle" as const } };
+    const bridge: ProjectLoopBridge = { getSurface: vi.fn(async () => ready), submit: vi.fn(async () => ready),
+      onStateChanged: () => () => {} };
+    const dispose = mountProjectLoopBridgeSurface(project, bridge, "room-1", { reducedMotion: true,
+      onSearch: vi.fn(), onNavigateSegment: vi.fn(), onReauthenticate: vi.fn() });
+    await vi.waitFor(() => expect(project.querySelector('[data-category="requests"]')).not.toBeNull());
+    project.querySelector<HTMLButtonElement>('[data-category="requests"]')?.click();
+    project.querySelector<HTMLButtonElement>(".project-loop__content .project-loop__source")?.click();
+    expect(workspace.dataset.compactSegment).toBe("timeline");
+    expect(document.activeElement).toBe(source);
+    expect(source.dataset.projectSourceHighlight).toBe("exact-revision");
+    dispose(); workspace.remove();
+  });
+
+  it("opens an exact Memory revision by selecting the compact rail and Memory tab", async () => {
+    const { workspace, project, memory } = productionWorkspace();
+    const source = document.createElement("article");
+    source.dataset.sourceId = "message-1"; source.dataset.sourceKind = "memory";
+    source.dataset.sourceRevision = "1"; memory.append(source);
+    const base = projectSnapshot();
+    const snapshot = { ...base, proposals: [{ ...base.proposals[0]!, provenance: {
+      ...base.proposals[0]!.provenance, source: { ...base.proposals[0]!.provenance.source, kind: "memory" as const },
+    } }] };
+    const ready = { status: "ready" as const, roomId: "room-1", snapshot,
+      viewerActorId: "human-1", connection: { status: "online" as const }, operation: { status: "idle" as const } };
+    const bridge: ProjectLoopBridge = { getSurface: vi.fn(async () => ready), submit: vi.fn(async () => ready),
+      onStateChanged: () => () => {} };
+    const dispose = mountProjectLoopBridgeSurface(project, bridge, "room-1", { reducedMotion: true,
+      onSearch: vi.fn(), onNavigateSegment: vi.fn(), onReauthenticate: vi.fn() });
+    await vi.waitFor(() => expect(project.querySelector("[data-proposal-id] .project-loop__source")).not.toBeNull());
+    project.querySelector<HTMLButtonElement>("[data-proposal-id] .project-loop__source")?.click();
+    expect(workspace.dataset.compactSegment).toBe("project");
+    expect(memory.hidden).toBe(false);
+    expect(memory.closest<HTMLElement>(".room-authority-workspace__rail")?.dataset.authorityRail).toBe("memory");
+    expect(document.activeElement).toBe(source);
+    dispose(); workspace.remove();
+  });
+
+  it("opens an exact Project fact by selecting its category before locating it", async () => {
+    const { workspace, project } = productionWorkspace();
+    const base = projectSnapshot();
+    const snapshot = { ...base, proposals: [{ ...base.proposals[0]!, provenance: {
+      ...base.proposals[0]!.provenance, source: { ...base.proposals[0]!.provenance.source,
+        kind: "project_fact" as const, sourceId: "request-1", sourceRevision: 3 },
+    } }] };
+    const ready = { status: "ready" as const, roomId: "room-1", snapshot,
+      viewerActorId: "human-1", connection: { status: "online" as const }, operation: { status: "idle" as const } };
+    const bridge: ProjectLoopBridge = { getSurface: vi.fn(async () => ready), submit: vi.fn(async () => ready),
+      onStateChanged: () => () => {} };
+    const dispose = mountProjectLoopBridgeSurface(project, bridge, "room-1", { reducedMotion: true,
+      onSearch: vi.fn(), onNavigateSegment: vi.fn(), onReauthenticate: vi.fn() });
+    await vi.waitFor(() => expect(project.querySelector("[data-proposal-id] .project-loop__source")).not.toBeNull());
+    project.querySelector<HTMLButtonElement>("[data-proposal-id] .project-loop__source")?.click();
+    const target = project.querySelector<HTMLElement>(
+      '[data-source-kind="project_fact"][data-source-id="request-1"][data-source-revision="3"]',
+    );
+    expect(workspace.dataset.compactSegment).toBe("project");
+    expect(project.hidden).toBe(false);
+    expect(project.querySelector('[data-category="requests"]')?.getAttribute("aria-selected")).toBe("true");
+    expect(target?.dataset.projectSourceHighlight).toBe("exact-revision");
+    expect(document.activeElement).toBe(target);
+    dispose(); workspace.remove();
+  });
 });

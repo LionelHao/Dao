@@ -80,8 +80,9 @@ export type ProjectMutationAckWireResponse = Readonly<{
 export type ProjectLoopWireResponse = ProjectSnapshotWireResponse | ProjectMutationAckWireResponse;
 export type ProjectLoopWireError = Readonly<{
   type: "error";
-  status: 401 | 403 | 404 | 409 | 410 | 429 | 503;
-  code: "unauthenticated" | "room_forbidden" | "permission_denied" | "project_fact_not_found" |
+  status: 400 | 401 | 403 | 404 | 409 | 410 | 429 | 503;
+  code: "invalid_request" | "unauthenticated" | "room_forbidden" | "permission_denied" |
+    "room_not_found" | "project_fact_not_found" |
     "revision_conflict" | "idempotency_conflict" | "invalid_transition" | "room_archived" |
     "rate_limited" | "dependency_unavailable" | "storage_unavailable" | "project_dependency_unavailable";
   message: string;
@@ -153,7 +154,8 @@ export function isProjectLoopRemoteState(value: unknown): value is ProjectLoopRe
     || operation.status === "failed" && exact(operation, ["status", "intentId", "error"]) &&
       id(operation.intentId) && record(operation.error) &&
       exact(operation.error, ["status", "code"], ["retryAfterSeconds"]) &&
-      [401, 403, 409, 410, 429, 503].includes(operation.error.status as number) && id(operation.error.code) &&
+      [400, 401, 403, 404, 409, 410, 429, 503].includes(operation.error.status as number) &&
+      id(operation.error.code) &&
       (operation.error.retryAfterSeconds === undefined || count(operation.error.retryAfterSeconds));
   return Boolean(connectionValid && operationValid);
 }
@@ -186,7 +188,8 @@ export function isProjectLoopWireError(value: unknown): value is ProjectLoopWire
     ["retryAfterSeconds"]) || value.type !== "error" || !id(value.requestId) ||
     typeof value.message !== "string" || value.message.length === 0) return false;
   const pairs = new Set([
-    "401:unauthenticated", "403:room_forbidden", "403:permission_denied",
+    "400:invalid_request", "401:unauthenticated", "403:room_forbidden", "403:permission_denied",
+    "404:room_not_found",
     "404:project_fact_not_found", "409:revision_conflict", "409:idempotency_conflict",
     "409:invalid_transition", "410:room_archived", "503:dependency_unavailable",
     "429:rate_limited", "503:storage_unavailable", "503:project_dependency_unavailable",

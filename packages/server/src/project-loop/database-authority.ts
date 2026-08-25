@@ -702,12 +702,12 @@ function resolveProposal(database: DatabaseSync,
   requireRoomAccess(database, operation.command.roomId, actorId, true);
   const timestamp = iso(operation.now);
   const current = state(database, operation.command.roomId, timestamp);
-  if (current.revision !== operation.command.expectedRevision) {
-    throw new ProjectLoopAuthorityError("revision_conflict", "Project revision is stale");
-  }
   const proposal = readProposal(database, operation.command.proposalId);
   if (proposal === undefined || proposal.roomId !== operation.command.roomId) {
     throw new ProjectLoopAuthorityError("project_fact_not_found", "Project proposal was not found");
+  }
+  if (proposal.revision !== operation.command.expectedRevision) {
+    throw new ProjectLoopAuthorityError("revision_conflict", "Project proposal revision is stale");
   }
   if (proposal.status !== "pending") throw new ProjectLoopAuthorityError("invalid_transition", "Project proposal is already resolved");
   const rawProposal = database.prepare(`${PROPOSAL_SELECT} WHERE id = ?`).get(proposal.id);
@@ -716,7 +716,10 @@ function resolveProposal(database: DatabaseSync,
     throw new ProjectLoopAuthorityError("permission_denied", "Project confirmation principal is invalid or expired");
   }
   let fact: ProjectLoopStoredFact | undefined;
-  if (operation.command.resolution === "confirmed") fact = createFact(database, proposal, actorId, timestamp);
+  if (operation.command.resolution === "confirmed") {
+    validateProjectSource(database, proposal.source);
+    fact = createFact(database, proposal, actorId, timestamp);
+  }
   database.prepare(
     `UPDATE project_fact_proposals SET status = ?, revision = revision + 1, updated_at = ?,
        resolved_at = ?, resolution_reason = ?
