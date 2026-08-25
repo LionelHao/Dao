@@ -281,6 +281,30 @@ function expectUnavailable(
 }
 
 describe("FT-09A departure responsibility production aggregate", () => {
+  it("treats an explicitly absent legacy Project schema as empty but fails closed for v24 corruption", () => {
+    const legacy = new DatabaseSync(":memory:");
+    try {
+      legacy.exec(`
+        CREATE TABLE project_requests (
+          id TEXT PRIMARY KEY,
+          room_id TEXT NOT NULL,
+          status TEXT NOT NULL
+        ) STRICT;
+      `);
+      expect(invokeDeparture(legacy)).toEqual({
+        roomId: "room-1",
+        targetHumanActorId: "human-1",
+        conflicts: [],
+      });
+
+      legacy.exec("PRAGMA user_version = 24");
+      expectUnavailable(() => invokeDeparture(legacy),
+        "departure-responsibility", "malformed_result");
+    } finally {
+      legacy.close();
+    }
+  });
+
   it("registers the exact production feature and reads every real non-empty responsibility class", () => {
     const database = createDatabase();
     try {

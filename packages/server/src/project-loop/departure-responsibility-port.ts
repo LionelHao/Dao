@@ -24,6 +24,14 @@ const PENDING_CONFIRMATION_FEATURE = "pending-confirmation-departure" as const;
 const REGISTRATION_ID = "dao.project-loop.departure-responsibility.v1";
 const PENDING_CONFIRMATION_REGISTRATION_ID =
   "dao.tool-safety.pending-confirmation-departure.v1";
+const PROJECT_DEPARTURE_TABLES = Object.freeze([
+  "project_requests",
+  "project_next_actions",
+  "project_obstacles",
+  "project_transfer_proposals",
+  "project_fact_proposals",
+  "project_confirmations",
+] as const);
 
 export type DepartureResponsibilityComposition = Readonly<{
   readonly pendingConfirmation:
@@ -137,6 +145,25 @@ function safeError(
       retryable: true as const,
     }),
   });
+}
+
+function hasProjectDepartureSchema(database: DatabaseSync): boolean {
+  const placeholders = PROJECT_DEPARTURE_TABLES.map(() => "?").join(", ");
+  const rows = database.prepare(
+    `SELECT name FROM sqlite_schema
+     WHERE type = 'table' AND name IN (${placeholders})`,
+  ).all(...PROJECT_DEPARTURE_TABLES) as unknown as readonly Readonly<{ name: unknown }>[];
+  const names = new Set(rows.map((row) => row.name));
+  if (PROJECT_DEPARTURE_TABLES.every((table) => names.has(table))) return true;
+
+  const version = database.prepare("PRAGMA user_version").get()?.user_version;
+  if (typeof version !== "number") {
+    throw new DepartureCollectionError("malformed_result");
+  }
+  if (version >= 23) {
+    throw new DepartureCollectionError("malformed_result");
+  }
+  return false;
 }
 
 function scopedPendingConfirmationManifest(enabled: boolean): FeatureEnablementManifest {
@@ -545,13 +572,14 @@ function listInTransaction(
   }
 
   try {
-    const conflicts = useAuthorityTransactionDatabase(transaction, (database) => [
-      ...collectRequests(database, input.roomId, input.targetHumanActorId),
-      ...collectNextActions(database, input.roomId, input.targetHumanActorId),
-      ...collectObstacles(database, input.roomId, input.targetHumanActorId),
-      ...collectTransferAcceptances(database, input.roomId, input.targetHumanActorId),
-      ...collectProjectConfirmations(database, input.roomId, input.targetHumanActorId),
-    ]);
+    const conflicts = useAuthorityTransactionDatabase(transaction, (database) =>
+      hasProjectDepartureSchema(database) ? [
+        ...collectRequests(database, input.roomId, input.targetHumanActorId),
+        ...collectNextActions(database, input.roomId, input.targetHumanActorId),
+        ...collectObstacles(database, input.roomId, input.targetHumanActorId),
+        ...collectTransferAcceptances(database, input.roomId, input.targetHumanActorId),
+        ...collectProjectConfirmations(database, input.roomId, input.targetHumanActorId),
+      ] : []);
 
     if (composition.enabled) {
       const pending = invokeAuthorityParticipant({
