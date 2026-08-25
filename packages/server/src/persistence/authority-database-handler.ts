@@ -5282,10 +5282,6 @@ function appendCanonicalInvocationIntentEvent(
   intentId: string,
   occurredAt: string,
   transition: string,
-  cancellation?: Readonly<{
-    status: "cancelled";
-    reason: "human_cancelled" | "source_ineligible";
-  }>,
 ): void {
   const row = database.prepare(
     `SELECT intent.id AS intentId, intent.lineage_id AS lineageId,
@@ -5294,14 +5290,16 @@ function appendCanonicalInvocationIntentEvent(
             intent.source_revision AS sourceRevision, intent.target_id AS targetId,
             intent.target_agent_id AS agentId,
             intent.message_transaction_id AS messageTransactionId,
-            intent.status, intent.created_at AS createdAt,
-            intent.claimed_at AS claimedAt, intent.cancelled_at AS cancelledAt,
-            intent.cancellation_reason AS cancellationReason,
+            runtime.public_status AS status, intent.created_at AS createdAt,
+            runtime.claimed_at AS claimedAt, runtime.cancelled_at AS cancelledAt,
+            runtime.cancellation_reason AS cancellationReason,
             intent.supersedes_intent_id AS supersedesIntentId,
             binding.profile_revision AS profileRevision,
             binding.assignment_revision AS assignmentRevision,
             binding.access_revision AS accessRevision
      FROM agent_invocation_intents AS intent
+     JOIN agent_invocation_intent_runtime_states AS runtime
+       ON runtime.intent_id = intent.id
      JOIN direct_agent_invocation_authority_bindings AS binding
        ON binding.intent_id = intent.id
      WHERE intent.id = ? AND intent.origin_kind = 'message_target'`,
@@ -5318,17 +5316,14 @@ function appendCanonicalInvocationIntentEvent(
       messageTransactionId: row.messageTransactionId, targetId: row.targetId },
     profileRevision: row.profileRevision, assignmentRevision: row.assignmentRevision,
     accessRevision: row.accessRevision,
-    status: cancellation?.status ?? row.status,
+    status: row.status,
     createdAt: row.createdAt,
-    ...(cancellation === undefined && typeof row.claimedAt === "string"
-      ? { claimedAt: row.claimedAt } : {}),
-    ...(cancellation !== undefined
-      ? { cancelledAt: occurredAt, cancellationReason: cancellation.reason }
-      : typeof row.cancelledAt === "string"
-        ? { cancelledAt: row.cancelledAt,
-            ...(typeof row.cancellationReason === "string"
-              ? { cancellationReason: row.cancellationReason } : {}) }
-        : {}),
+    ...(typeof row.claimedAt === "string" ? { claimedAt: row.claimedAt } : {}),
+    ...(typeof row.cancelledAt === "string"
+      ? { cancelledAt: row.cancelledAt,
+          ...(typeof row.cancellationReason === "string"
+            ? { cancellationReason: row.cancellationReason } : {}) }
+      : {}),
     ...(typeof row.supersedesIntentId === "string"
       ? { supersedesIntentId: row.supersedesIntentId } : {}),
   };
@@ -7103,6 +7098,8 @@ export function executeRuntimeAuthorityOperation(
                        AND assignment.id IS NOT NULL AND membership.actor_id IS NOT NULL
                      THEN 1 ELSE 0 END AS eligible
          FROM agent_invocation_intents AS intent
+         JOIN agent_invocation_intent_runtime_states AS intent_runtime
+           ON intent_runtime.intent_id = intent.id
          LEFT JOIN direct_agent_invocation_authority_bindings AS binding
            ON binding.intent_id = intent.id
          LEFT JOIN rooms AS room ON room.id = intent.room_id AND room.status = 'active'
@@ -7137,10 +7134,20 @@ export function executeRuntimeAuthorityOperation(
           AND membership.kind = 'agent'
           AND membership.access_revision = binding.access_revision
          WHERE intent.origin_kind = 'message_target'
-           AND intent.status = 'pending' AND intent.execution_id IS NULL
+           AND intent_runtime.public_status = 'pending' AND intent.execution_id IS NULL
            AND NOT EXISTS (
              SELECT 1 FROM invocation_scoped_cancellation_fences AS fence
              WHERE fence.intent_id = intent.id
+           )
+           AND (
+             binding.intent_id IS NULL OR room.id IS NULL OR source.id IS NULL
+             OR envelope.message_id IS NULL OR profile.id IS NULL
+             OR assignment.id IS NULL OR membership.actor_id IS NULL
+             OR (
+               SELECT COUNT(*) FROM agent_executions AS live_execution
+               WHERE live_execution.room_id = intent.room_id
+                 AND live_execution.status IN ('queued', 'running')
+             ) < 32
            )
          ORDER BY intent.created_at, intent.id
          LIMIT ?`,
@@ -7168,6 +7175,15 @@ export function executeRuntimeAuthorityOperation(
              ) VALUES (?, ?, 'intent', ?, NULL, 1, 'source_ineligible', NULL,
                        'runtime_supervisor', ?)`,
           ).run(fenceId, candidate.roomId, candidate.intentId, occurredAt);
+          const cancelledIntent = database.prepare(
+            `UPDATE agent_invocation_intent_runtime_states
+             SET public_status = 'cancelled', authority_version = authority_version + 1,
+                 cancelled_at = ?, cancellation_reason = 'source_ineligible', updated_at = ?
+             WHERE intent_id = ? AND public_status = 'pending' AND authority_version = 1`,
+          ).run(occurredAt, occurredAt, candidate.intentId);
+          if (cancelledIntent.changes !== 1) {
+            return fail("execution_conflict", "Pending direct invocation cancellation lost its CAS");
+          }
           const canonicalReceipt = {
             requestId, fenceId, roomId: candidate.roomId, lineageId: candidate.lineageId,
             scope: { kind: "intent" as const, intentId: candidate.intentId, expectedVersion: 1 },
@@ -7198,8 +7214,9 @@ export function executeRuntimeAuthorityOperation(
                status_code, response_json, committed_at
              ) VALUES (?, ?, NULL, ?, 200, ?, ?)`,
           ).run(requestId, fenceId, requestSha256, JSON.stringify(receipt), occurredAt);
-          appendCanonicalInvocationIntentEvent(database, candidate.intentId, occurredAt,
-            "source-ineligible", { status: "cancelled", reason: "source_ineligible" });
+          appendCanonicalInvocationIntentEvent(
+            database, candidate.intentId, occurredAt, "source-ineligible",
+          );
           appendCanonicalScopedCancellationEvent(
             database, canonicalReceipt, candidate.targetAgentId, occurredAt,
           );
@@ -7247,6 +7264,15 @@ export function executeRuntimeAuthorityOperation(
         if (claimed.changes !== 1) {
           return fail("execution_conflict", "Pending direct invocation changed concurrently");
         }
+        const canonicalClaimed = database.prepare(
+          `UPDATE agent_invocation_intent_runtime_states
+           SET public_status = 'claimed', authority_version = authority_version + 1,
+               claimed_at = ?, updated_at = ?
+           WHERE intent_id = ? AND public_status = 'pending' AND authority_version = 1`,
+        ).run(occurredAt, occurredAt, candidate.intentId);
+        if (canonicalClaimed.changes !== 1) {
+          return fail("execution_conflict", "Pending direct invocation authority changed concurrently");
+        }
         appendCanonicalInvocationIntentEvent(
           database, candidate.intentId, occurredAt, "claimed",
         );
@@ -7271,12 +7297,14 @@ export function executeRuntimeAuthorityOperation(
         });
       }
       const remaining = database.prepare(
-        `SELECT 1 AS present FROM agent_invocation_intents
-         WHERE origin_kind = 'message_target' AND status = 'pending'
-           AND execution_id IS NULL
+        `SELECT 1 AS present FROM agent_invocation_intents AS intent
+         JOIN agent_invocation_intent_runtime_states AS runtime
+           ON runtime.intent_id = intent.id
+         WHERE intent.origin_kind = 'message_target' AND runtime.public_status = 'pending'
+           AND intent.execution_id IS NULL
            AND NOT EXISTS (
              SELECT 1 FROM invocation_scoped_cancellation_fences AS fence
-             WHERE fence.intent_id = agent_invocation_intents.id
+             WHERE fence.intent_id = intent.id
            )
          LIMIT 1`,
       ).get();
@@ -7306,15 +7334,19 @@ export function executeRuntimeAuthorityOperation(
         return fail("permission_denied", "Target Agent membership was forbidden");
       }
       const existing = database.prepare(
-        `SELECT id,
+        `SELECT intent.id,
                 COALESCE(execution_id, (
                   SELECT link.execution_id FROM agent_execution_intent_links AS link
-                  WHERE link.intent_id = agent_invocation_intents.id
+                  WHERE link.intent_id = intent.id
                   ORDER BY link.execution_ordinal LIMIT 1
                 )) AS executionId,
-                intent_kind AS intentKind,
-                origin_kind AS originKind, status, requester_actor_id AS requesterActorId
-         FROM agent_invocation_intents WHERE source_message_id = ? AND target_agent_id = ?`,
+                intent.intent_kind AS intentKind,
+                intent.origin_kind AS originKind, runtime.public_status AS status,
+                intent.requester_actor_id AS requesterActorId
+         FROM agent_invocation_intents AS intent
+         JOIN agent_invocation_intent_runtime_states AS runtime
+           ON runtime.intent_id = intent.id
+         WHERE intent.source_message_id = ? AND intent.target_agent_id = ?`,
       ).get(operation.intent.sourceMessageId, operation.intent.targetAgentId);
       if (typeof existing?.executionId === "string") {
         if (existing.originKind !== "message_target") {
@@ -7345,7 +7377,7 @@ export function executeRuntimeAuthorityOperation(
         };
       }
       if (typeof existing?.id !== "string" || existing.originKind !== "message_target" ||
-          existing.status !== "pending" || existing.requesterActorId !== requesterId) {
+          existing.requesterActorId !== requesterId) {
         return fail("permission_denied", "Direct Agent invocation lacked a direct frozen handoff");
       }
       const cancellationFence = database.prepare(
@@ -7354,6 +7386,9 @@ export function executeRuntimeAuthorityOperation(
       ).get(existing.id);
       if (cancellationFence?.present === 1) {
         return fail("execution_conflict", "Direct Agent invocation was cancellation-fenced");
+      }
+      if (existing.status !== "pending") {
+        return fail("execution_conflict", "Direct Agent invocation authority was not pending");
       }
       const queued = database.prepare(
         `SELECT COUNT(*) AS count FROM agent_executions WHERE room_id = ? AND status = 'queued'`,
@@ -7412,6 +7447,16 @@ export function executeRuntimeAuthorityOperation(
       if (claimed.changes !== 1) {
         return fail("execution_conflict", "Direct Agent invocation handoff changed concurrently");
       }
+      const canonicalClaimed = database.prepare(
+        `UPDATE agent_invocation_intent_runtime_states
+         SET public_status = 'claimed', authority_version = authority_version + 1,
+             claimed_at = ?, updated_at = ?
+         WHERE intent_id = ? AND public_status = 'pending' AND authority_version = 1`,
+      ).run(occurredAt, occurredAt, existing.id);
+      if (canonicalClaimed.changes !== 1) {
+        return fail("execution_conflict", "Direct Agent invocation authority changed concurrently");
+      }
+      appendCanonicalInvocationIntentEvent(database, existing.id, occurredAt, "claimed");
       database.prepare(
         `INSERT INTO agent_execution_intent_links (
            intent_id, execution_id, execution_ordinal, retry_of_execution_id,
@@ -7821,10 +7866,17 @@ export function executeRuntimeAuthorityOperation(
         return { kind: "execution", execution: current };
       }
       const authority = database.prepare(
-        `SELECT intent_id AS intentId, authority_version AS authorityVersion
-         FROM agent_execution_runtime_states WHERE execution_id = ?`,
+        `SELECT runtime.intent_id AS intentId, runtime.authority_version AS authorityVersion,
+                intent.lineage_id AS lineageId,
+                intent.source_message_id AS sourceMessageId,
+                intent.source_revision AS sourceRevision
+         FROM agent_execution_runtime_states AS runtime
+         JOIN agent_invocation_intents AS intent ON intent.id = runtime.intent_id
+         WHERE runtime.execution_id = ?`,
       ).get(current.id);
-      if (typeof authority?.intentId !== "string" || typeof authority.authorityVersion !== "number") {
+      if (typeof authority?.intentId !== "string" || typeof authority.authorityVersion !== "number" ||
+          typeof authority.lineageId !== "string" || typeof authority.sourceMessageId !== "string" ||
+          typeof authority.sourceRevision !== "number") {
         return fail("execution_conflict", "Runtime shutdown authority was unavailable");
       }
       const requestId = `runtime-shutdown:${current.id}:${operation.attemptSeq}`;
@@ -7844,6 +7896,24 @@ export function executeRuntimeAuthorityOperation(
                    'runtime_supervisor', ?)`,
       ).run(fenceId, current.roomId, authority.intentId, current.id,
         authority.authorityVersion, occurredAt);
+      const confirmations = database.prepare(
+        `SELECT confirmation_id AS confirmationId, confirmation_state AS state
+         FROM tool_confirmations
+         WHERE execution_id = ? AND attempt_seq = ?
+         ORDER BY confirmation_id`,
+      ).all(current.id, current.currentAttemptSeq);
+      const grants = database.prepare(
+        `SELECT grant_id AS grantId, grant_state AS state
+         FROM agent_execution_grants
+         WHERE execution_id = ? AND attempt_seq = ?
+         ORDER BY grant_id`,
+      ).all(current.id, current.currentAttemptSeq);
+      const preservedDispatches = database.prepare(
+        `SELECT dispatch_id AS dispatchId, state
+         FROM tool_dispatches
+         WHERE execution_id = ? AND attempt_seq = ?
+         ORDER BY dispatch_id`,
+      ).all(current.id, current.currentAttemptSeq);
       database.prepare(
         `UPDATE tool_confirmations
          SET confirmation_state = 'rejected', confirmation_reason = 'runtime_shutdown',
@@ -7881,8 +7951,57 @@ export function executeRuntimeAuthorityOperation(
          ) VALUES (?, ?, ?, ?, ?)`,
       ).run(fenceId, current.id, current.currentAttemptSeq,
         authority.authorityVersion, authority.authorityVersion + 1);
+      database.prepare(
+        `UPDATE invocation_recovery_queue
+         SET state = 'closed', lease_owner = NULL, lease_expires_at = NULL,
+             failure_code = 'runtime_shutdown', updated_at = ?
+         WHERE execution_id = ? AND state IN ('pending', 'leased')`,
+      ).run(occurredAt, current.id);
       const cancelled = runtimeExecutionById(database, current.id);
-      const response = { kind: "execution" as const, execution: cancelled };
+      const rejectedConfirmationIds = confirmations.flatMap((row) =>
+        row.state === "pending" && typeof row.confirmationId === "string"
+          ? [row.confirmationId] : []);
+      const revokedGrantIds = grants.flatMap((row) =>
+        row.state === "active" && typeof row.grantId === "string" ? [row.grantId] : []);
+      const preservedDispatchIds = preservedDispatches.flatMap((row) =>
+        typeof row.dispatchId === "string" ? [row.dispatchId] : []);
+      const sideEffectState = preservedDispatches.some((row) => row.state === "outcome_unknown")
+        ? "outcome-unknown-retained" as const
+        : preservedDispatchIds.length > 0 ? "dispatched-retained" as const : "none" as const;
+      const confirmationDisposition = rejectedConfirmationIds.length > 0
+        ? "pending_rejected" as const
+        : confirmations.some((row) => row.state === "confirmed")
+          ? "confirmed_retained" as const : "none" as const;
+      const grantDisposition = revokedGrantIds.length > 0
+        ? "unclaimed_revoked" as const
+        : grants.some((row) => row.state === "claimed")
+          ? "claimed_retained" as const : "none" as const;
+      const canonicalReceipt = {
+        requestId, fenceId, roomId: current.roomId, lineageId: authority.lineageId,
+        scope: { kind: "execution" as const, executionId: current.id,
+          expectedVersion: authority.authorityVersion },
+        reason: "runtime_shutdown" as const,
+        intentOutcomes: [{ intentId: authority.intentId, outcome: "already_claimed" as const }],
+        executionOutcomes: [{ executionId: current.id, outcome: "cancelled" as const,
+          version: authority.authorityVersion + 1 }],
+        rejectedConfirmationIds, revokedGrantIds, preservedDispatchIds,
+        committedAt: occurredAt,
+      };
+      const storedReceipt = {
+        kind: "scoped-cancellation-committed" as const,
+        fenceId, roomId: current.roomId, producerId: "runtime-supervisor",
+        reason: "runtime_shutdown" as const, replayed: false,
+        receipt: canonicalReceipt,
+        effects: [{
+          sourceMessageId: authority.sourceMessageId,
+          sourceRevision: authority.sourceRevision,
+          invocationIntentId: authority.intentId,
+          executionId: current.id,
+          attemptSeq: current.currentAttemptSeq,
+          disposition: "execution_cancelled" as const,
+          confirmationDisposition, grantDisposition, sideEffectState,
+        }],
+      };
       database.prepare(
         `INSERT INTO invocation_cancellation_receipts (
            request_id, fence_id, principal_actor_id, request_sha256,
@@ -7890,9 +8009,12 @@ export function executeRuntimeAuthorityOperation(
          ) VALUES (?, ?, NULL, ?, 200, ?, ?)`,
       ).run(requestId, fenceId,
         createHash("sha256").update(requestId).digest("hex"),
-        JSON.stringify(response), occurredAt);
+        JSON.stringify(storedReceipt), occurredAt);
       appendRuntimeExecutionEvent(database, cancelled, occurredAt, "cancelled", "runtime_shutdown");
-      return response;
+      appendCanonicalScopedCancellationEvent(
+        database, canonicalReceipt, current.agentId, occurredAt,
+      );
+      return { kind: "execution", execution: cancelled };
     }
 
     if (operation.type === "runtime.cancel-scoped") {
@@ -7924,11 +8046,14 @@ export function executeRuntimeAuthorityOperation(
                   intent.source_message_id AS sourceMessageId,
                   intent.source_revision AS sourceRevision,
                   intent.requester_actor_id AS requesterActorId,
-                  intent.lineage_id AS lineageId, intent.status,
+                  intent.lineage_id AS lineageId, runtime.public_status AS status,
+                  runtime.authority_version AS authorityVersion,
                   room.status AS roomStatus, membership.actor_id AS controlActorId,
                   membership.role,
                   room.owner_actor_id = membership.actor_id AS isOwner
            FROM agent_invocation_intents AS intent
+           JOIN agent_invocation_intent_runtime_states AS runtime
+             ON runtime.intent_id = intent.id
            JOIN rooms AS room ON room.id = intent.room_id
            LEFT JOIN room_memberships AS membership
              ON membership.room_id = intent.room_id
@@ -7944,9 +8069,7 @@ export function executeRuntimeAuthorityOperation(
             (actorId !== intent.requesterActorId && intent.isOwner !== 1 && intent.role !== "admin")) {
           return fail("permission_denied", "Invocation intent control was forbidden");
         }
-        // Pending intents have one authoritative pre-claim state. Their source
-        // revision is frozen provenance, not the control object's CAS version.
-        if (target.expectedVersion !== 1) {
+        if (intent.authorityVersion !== target.expectedVersion) {
           return fail("execution_conflict", "Cancellation expectedVersion was stale");
         }
         if (intent.status !== "pending") {
@@ -7960,9 +8083,17 @@ export function executeRuntimeAuthorityOperation(
              internal_capability, committed_at
            ) VALUES (?, ?, 'intent', ?, NULL, ?, 'human_cancelled', ?, NULL, ?)`,
         ).run(fenceId, intent.roomId, target.intentId, target.expectedVersion, actorId, occurredAt);
+        const cancelledIntent = database.prepare(
+          `UPDATE agent_invocation_intent_runtime_states
+           SET public_status = 'cancelled', authority_version = authority_version + 1,
+               cancelled_at = ?, cancellation_reason = 'human_cancelled', updated_at = ?
+           WHERE intent_id = ? AND public_status = 'pending' AND authority_version = ?`,
+        ).run(occurredAt, occurredAt, target.intentId, target.expectedVersion);
+        if (cancelledIntent.changes !== 1) {
+          return fail("execution_conflict", "Cancellation lost the invocation intent CAS");
+        }
         appendCanonicalInvocationIntentEvent(
           database, target.intentId, occurredAt, "cancelled",
-          { status: "cancelled", reason: "human_cancelled" },
         );
         const canonicalReceipt = {
           requestId: operation.context.requestId,
@@ -10299,8 +10430,21 @@ export function recallHumanMessageDatabaseCommand(
         database.prepare(
           `UPDATE agent_invocation_intents
            SET status = 'cancelled', cancelled_at = ?, cancellation_reason = 'message_recalled'
-           WHERE source_message_id = ? AND status = 'pending'`,
+           WHERE source_message_id = ? AND status = 'pending'
+             AND EXISTS (
+               SELECT 1 FROM agent_invocation_intent_runtime_states AS runtime
+               WHERE runtime.intent_id = agent_invocation_intents.id
+                 AND runtime.public_status = 'pending'
+             )`,
         ).run(recalledAt, input.command.messageId);
+        database.prepare(
+          `UPDATE agent_invocation_intent_runtime_states
+           SET public_status = 'cancelled', authority_version = authority_version + 1,
+               cancelled_at = ?, cancellation_reason = 'message_recalled', updated_at = ?
+           WHERE public_status = 'pending' AND intent_id IN (
+             SELECT id FROM agent_invocation_intents WHERE source_message_id = ?
+           )`,
+        ).run(recalledAt, recalledAt, input.command.messageId);
         database.prepare(
           `INSERT INTO message_recall_fences (
              fence_id, room_id, source_message_id, source_revision, scope_kind,

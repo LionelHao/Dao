@@ -73,7 +73,7 @@ const SCHEMA_FINGERPRINTS = {
   19: "e458dedc7c0d85c04bca92dc2f6289b02367fb97fc7edbe1c7dba011470812b7",
   20: "1ca2a806a52cd2ce9632b02e215a25ba13bc3ebc4336f5152c48f21d60faa2a0",
   21: "dca0a24a346060b1e04b98ee5a73e016421796d6c13bd0bd2841179f405c44af",
-  22: "37a980d3d6edc37c843f8ea7f5dd0cd18ac40170efb8bd09ea4180f43f61324f",
+  22: "0ebe5369d32d37e0b758e0c36a67943b3cf48d16dfe05bf8ceedabb0ec5d4059",
 } as const;
 
 const V1_STATEMENTS = [
@@ -6845,6 +6845,34 @@ const V22_CANCELLATION_REASON_SQL = V22_CANCELLATION_REASONS
   .join(", ");
 
 const V22_STATEMENTS = [
+  `CREATE TABLE agent_invocation_intent_runtime_states (
+    intent_id TEXT PRIMARY KEY REFERENCES agent_invocation_intents(id),
+    public_status TEXT NOT NULL CHECK (public_status IN ('pending', 'claimed', 'cancelled')),
+    authority_version INTEGER NOT NULL DEFAULT 1 CHECK (authority_version >= 1),
+    claimed_at TEXT,
+    cancelled_at TEXT,
+    cancellation_reason TEXT CHECK (
+      cancellation_reason IS NULL OR cancellation_reason IN (${V22_CANCELLATION_REASON_SQL})
+    ),
+    updated_at TEXT NOT NULL,
+    CHECK (
+      (public_status = 'pending' AND claimed_at IS NULL AND cancelled_at IS NULL
+       AND cancellation_reason IS NULL)
+      OR (public_status = 'claimed' AND claimed_at IS NOT NULL AND cancelled_at IS NULL
+          AND cancellation_reason IS NULL)
+      OR (public_status = 'cancelled' AND cancelled_at IS NOT NULL
+          AND cancellation_reason IS NOT NULL)
+    )
+  ) STRICT`,
+  `INSERT INTO agent_invocation_intent_runtime_states (
+     intent_id, public_status, authority_version, claimed_at, cancelled_at,
+     cancellation_reason, updated_at
+   )
+   SELECT id, status, 1, claimed_at, cancelled_at, cancellation_reason,
+          COALESCE(cancelled_at, claimed_at, created_at)
+   FROM agent_invocation_intents`,
+  `CREATE INDEX agent_invocation_intent_runtime_states_pending_v22
+   ON agent_invocation_intent_runtime_states(public_status, updated_at, intent_id)`,
   `CREATE TABLE agent_execution_runtime_states (
     execution_id TEXT PRIMARY KEY REFERENCES agent_executions(id),
     intent_id TEXT REFERENCES agent_invocation_intents(id),
@@ -7125,6 +7153,16 @@ const V22_STATEMENTS = [
         'accepted', 'running', 'completed', 'failed', 'cancelled'
       ))
    BEGIN SELECT RAISE(ABORT, 'Invocation execution CAS or terminal transition is invalid'); END`,
+  `CREATE TRIGGER agent_invocation_intent_runtime_states_v22_validate_update
+   BEFORE UPDATE ON agent_invocation_intent_runtime_states
+   WHEN NEW.intent_id <> OLD.intent_id
+      OR NEW.authority_version <> OLD.authority_version + 1
+      OR OLD.public_status <> 'pending'
+      OR NEW.public_status NOT IN ('claimed', 'cancelled')
+   BEGIN SELECT RAISE(ABORT, 'Invocation intent CAS or terminal transition is invalid'); END`,
+  `CREATE TRIGGER agent_invocation_intent_runtime_states_v22_immutable_delete
+   BEFORE DELETE ON agent_invocation_intent_runtime_states
+   BEGIN SELECT RAISE(ABORT, 'Invocation intent authority is immutable'); END`,
   `CREATE TRIGGER agent_execution_runtime_states_v22_immutable_delete
    BEFORE DELETE ON agent_execution_runtime_states
    BEGIN SELECT RAISE(ABORT, 'Invocation execution authority is immutable'); END`,
@@ -7148,10 +7186,14 @@ const V22_STATEMENTS = [
    BEFORE INSERT ON invocation_scoped_cancellation_fences
    WHEN NOT EXISTS (
      SELECT 1 FROM agent_invocation_intents AS intent
+     JOIN agent_invocation_intent_runtime_states AS intent_runtime
+       ON intent_runtime.intent_id = intent.id
      LEFT JOIN agent_execution_runtime_states AS execution
        ON execution.execution_id = NEW.execution_id
      WHERE intent.id = NEW.intent_id AND intent.room_id = NEW.room_id
-       AND (NEW.execution_id IS NULL OR (
+       AND ((NEW.execution_id IS NULL
+             AND intent_runtime.authority_version = NEW.expected_authority_version
+             AND intent_runtime.public_status = 'pending') OR (
          execution.intent_id = intent.id
          AND execution.authority_version = NEW.expected_authority_version
          AND execution.public_status IN ('accepted', 'running')
@@ -7193,6 +7235,18 @@ const V22_STATEMENTS = [
   `CREATE TRIGGER legacy_room_wide_preemption_markers_v22_immutable_delete
    BEFORE DELETE ON legacy_room_wide_preemption_markers
    BEGIN SELECT RAISE(ABORT, 'Legacy broad-preemption marker is immutable'); END`,
+  `CREATE TRIGGER agent_invocation_intents_v22_create_runtime_state
+   AFTER INSERT ON agent_invocation_intents
+   BEGIN
+     INSERT INTO agent_invocation_intent_runtime_states (
+       intent_id, public_status, authority_version, claimed_at, cancelled_at,
+       cancellation_reason, updated_at
+     ) VALUES (
+       NEW.id, NEW.status, 1, NEW.claimed_at, NEW.cancelled_at,
+       NEW.cancellation_reason,
+       COALESCE(NEW.cancelled_at, NEW.claimed_at, NEW.created_at)
+     );
+   END`,
   `CREATE TRIGGER agent_execution_context_bindings_v22_create_runtime_state
    AFTER INSERT ON agent_execution_context_bindings
    WHEN NOT EXISTS (
@@ -7443,7 +7497,7 @@ const V22_STATEMENTS = [
 export const AUTHORITY_V22_STATEMENT_COUNT_FOR_TEST = V22_STATEMENTS.length;
 export const AUTHORITY_V22_TRIGGER_INVARIANT_STATEMENT_COUNT_FOR_TEST =
   V22_STATEMENTS.filter((statement) => statement.startsWith("CREATE TRIGGER ")).length;
-export const AUTHORITY_V22_STARTUP_INVARIANT_STATEMENT_COUNT_FOR_TEST = 6;
+export const AUTHORITY_V22_STARTUP_INVARIANT_STATEMENT_COUNT_FOR_TEST = 7;
 export const AUTHORITY_V22_INVARIANT_STATEMENT_COUNT_FOR_TEST =
   AUTHORITY_V22_TRIGGER_INVARIANT_STATEMENT_COUNT_FOR_TEST
   + AUTHORITY_V22_STARTUP_INVARIANT_STATEMENT_COUNT_FOR_TEST;
@@ -8669,6 +8723,10 @@ const V21_SCHEMA_CONTRACT = {
 
 const V22_SCHEMA_CONTRACT = {
   ...V21_SCHEMA_CONTRACT,
+  agent_invocation_intent_runtime_states: [
+    "intent_id", "public_status", "authority_version", "claimed_at",
+    "cancelled_at", "cancellation_reason", "updated_at",
+  ],
   agent_execution_runtime_states: [
     "execution_id", "intent_id", "lineage_id", "execution_ordinal",
     "retry_of_execution_id", "snapshot_id", "provider_id", "model_id",
@@ -10427,6 +10485,27 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
     );
   }
   if (schemaVersion >= 22) {
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_invocation_intents AS intent
+       LEFT JOIN agent_invocation_intent_runtime_states AS runtime
+         ON runtime.intent_id = intent.id
+       WHERE runtime.intent_id IS NULL
+          OR (runtime.public_status = 'pending' AND (
+            runtime.claimed_at IS NOT NULL OR runtime.cancelled_at IS NOT NULL
+            OR runtime.cancellation_reason IS NOT NULL
+          ))
+          OR (runtime.public_status = 'claimed' AND (
+            runtime.claimed_at IS NULL OR runtime.cancelled_at IS NOT NULL
+            OR runtime.cancellation_reason IS NOT NULL
+          ))
+          OR (runtime.public_status = 'cancelled' AND (
+            runtime.cancelled_at IS NULL OR runtime.cancellation_reason IS NULL
+          ))
+       LIMIT 1`,
+      "invocation intent runtime projection must retain one valid canonical state",
+    );
     requireNoRows(
       database,
       `SELECT 1

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
-import type { Actor } from "@native-im/core";
+import { isScopedCancellationReceipt, type Actor } from "@native-im/core";
 import { createSqliteAuthoritativeStore } from "../persistence/sqlite-authoritative-store.js";
 import { insertLegacyMessageAuthorityRecord } from "../persistence/message-authority-legacy-adapter.js";
 import { migrateAuthorityDatabase } from "../persistence/schema.js";
@@ -12,6 +12,7 @@ import {
   createWorkerDatabaseClient,
   type WorkerDatabaseClient,
 } from "../persistence/worker-database-client.js";
+import { createSnapshotWorkerClient } from "../persistence/snapshot-worker-client.js";
 import { registerMemoryCorpusSource } from "../room-memory/corpus-database-authority.js";
 import {
   createWorkerRuntimeAuthority,
@@ -360,14 +361,17 @@ describe("real AuthorityWorker runtime authority", () => {
       )).resolves.toMatchObject({ replayed: true, receipt: pendingCancellation.receipt });
       const cancellationDatabase = new DatabaseSync(databasePath, { readOnly: true });
       expect(cancellationDatabase.prepare(
-        `SELECT intent.status, fence.reason AS cancellationReason,
-                fence.committed_at AS cancelledAt
+        `SELECT runtime.public_status AS status,
+                runtime.authority_version AS authorityVersion,
+                runtime.cancellation_reason AS cancellationReason,
+                runtime.cancelled_at AS cancelledAt
          FROM agent_invocation_intents AS intent
-         JOIN invocation_scoped_cancellation_fences AS fence
-           ON fence.intent_id = intent.id AND fence.scope_kind = 'intent'
+         JOIN agent_invocation_intent_runtime_states AS runtime
+           ON runtime.intent_id = intent.id
          WHERE intent.id = ?`,
       ).get(pendingIntentId)).toMatchObject({
-        status: "pending",
+        status: "cancelled",
+        authorityVersion: 2,
         cancelledAt: expect.any(String),
         cancellationReason: "human_cancelled",
       });
@@ -721,6 +725,60 @@ describe("real AuthorityWorker runtime authority", () => {
         status: "cancelled",
         cancellationReason: "runtime_shutdown",
       });
+      const shutdownEvidence = new DatabaseSync(databasePath, { readOnly: true });
+      const shutdownStored = shutdownEvidence.prepare(
+        `SELECT response_json AS responseJson
+         FROM invocation_cancellation_receipts
+         WHERE request_id = ?`,
+      ).get(`runtime-shutdown:${shutdownCandidate.execution.id}:1`);
+      const shutdownReceipt = typeof shutdownStored?.responseJson === "string"
+        ? JSON.parse(shutdownStored.responseJson) as Record<string, unknown> : undefined;
+      expect(shutdownReceipt).toMatchObject({
+        kind: "scoped-cancellation-committed",
+        reason: "runtime_shutdown",
+        receipt: { reason: "runtime_shutdown" },
+      });
+      expect(isScopedCancellationReceipt(shutdownReceipt?.receipt)).toBe(true);
+      shutdownEvidence.close();
+      const snapshotClient = await createSnapshotWorkerClient({
+        authorityPath: databasePath,
+        cachePath: join(directory, "shutdown-repair-cache.sqlite"),
+        revalidate: async () => undefined,
+        clock: () => now + 1_000,
+        limits: { maxRecordsPerPage: 20 },
+      });
+      const repairContext = {
+        sessionId: directContext.sessionId,
+        sessionFamilyId: directContext.sessionFamilyId,
+        principal: directContext.principal,
+      };
+      const firstRepairPage = await snapshotClient.beginRoomRepair(
+        repairContext, "shutdown-repair-begin", "room-runtime",
+      );
+      if ("kind" in firstRepairPage && firstRepairPage.kind === "fallback") {
+        throw new Error("unexpected shutdown repair fallback");
+      }
+      const repairRecords = [...firstRepairPage.records];
+      let repairPage = firstRepairPage;
+      while (repairPage.hasMore) {
+        repairPage = await snapshotClient.readRoomRepairPage(
+          repairContext,
+          `shutdown-repair-${repairPage.page + 1}`,
+          firstRepairPage.snapshotId,
+          repairPage.page,
+        );
+        repairRecords.push(...repairPage.records);
+      }
+      expect(repairRecords).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          kind: "agent-scoped-cancellation",
+          value: expect.objectContaining({
+            requestId: `runtime-shutdown:${shutdownCandidate.execution.id}:1`,
+            reason: "runtime_shutdown",
+          }),
+        }),
+      ]));
+      await snapshotClient.close();
 
       const third = await authority.invoke(
         { ...context, requestId: "request-runtime-3", idempotencyKey: "key-runtime-3" },

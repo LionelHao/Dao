@@ -1134,16 +1134,15 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
               binding.profile_revision AS profileRevision,
               binding.assignment_revision AS assignmentRevision,
               binding.access_revision AS accessRevision,
-              CASE WHEN cancellation.fence_id IS NOT NULL THEN 'cancelled'
-                   ELSE intent.status END AS status,
-              intent.created_at AS createdAt, intent.claimed_at AS claimedAt,
-              COALESCE(intent.cancelled_at, cancellation.committed_at) AS cancelledAt,
-              COALESCE(intent.cancellation_reason, cancellation.reason) AS cancellationReason,
+              runtime.public_status AS status,
+              intent.created_at AS createdAt, runtime.claimed_at AS claimedAt,
+              runtime.cancelled_at AS cancelledAt,
+              runtime.cancellation_reason AS cancellationReason,
               intent.supersedes_intent_id AS supersedesIntentId
        FROM agent_invocation_intents AS intent
+       JOIN agent_invocation_intent_runtime_states AS runtime
+         ON runtime.intent_id = intent.id
        JOIN direct_agent_invocation_authority_bindings AS binding ON binding.intent_id = intent.id
-       LEFT JOIN invocation_scoped_cancellation_fences AS cancellation
-         ON cancellation.intent_id = intent.id AND cancellation.scope_kind = 'intent'
        WHERE intent.room_id = ? AND intent.origin_kind = 'message_target'
          AND binding.access_revision > 0`, "intent.id"),
     mapRow: (row: unknown) => invocationIntentRepairRecord(row as Record<string, unknown>),
