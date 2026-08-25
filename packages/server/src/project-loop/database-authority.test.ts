@@ -1044,6 +1044,12 @@ describe("Project Loop database authority", () => {
                 json_extract(payload_json, '$.revision') AS revision
          FROM events ORDER BY stream_seq DESC LIMIT 1`,
       ).get()).toEqual({ type: "project.transfer-proposal.changed", status: "pending", revision: 1 });
+      expect(database.prepare(
+        `SELECT proposal.revision AS proposalRevision, obstacle.revision AS subjectRevision
+         FROM project_transfer_proposals AS proposal
+         JOIN project_obstacles AS obstacle ON obstacle.id = proposal.subject_id
+         WHERE proposal.id = 'transfer-blocker'`,
+      ).get()).toEqual({ proposalRevision: 1, subjectRevision: 4 });
       const accepted = transition("accept-transfer", 4, "obstacle.transfer_accept", {
         transferProposalId: "transfer-blocker",
       });

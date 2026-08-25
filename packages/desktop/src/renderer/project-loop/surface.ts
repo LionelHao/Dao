@@ -8,6 +8,7 @@ import type {
   ProjectProposal,
   ProjectRequest,
   ProjectSourceRef,
+  ProjectTransferProposal,
 } from "@native-im/core";
 import { createProjectLoopViewModel, type ProjectLoopCategory, type ProjectLoopRemoteState } from "./view-model.js";
 
@@ -79,6 +80,16 @@ function requiredValue(input: HTMLInputElement, message: string): string | undef
   input.setCustomValidity(value.length === 0 ? message : "");
   if (value.length === 0) { input.reportValidity(); return undefined; }
   return value;
+}
+function currentTransferSubjectRevision(
+  vm: ReturnType<typeof createProjectLoopViewModel>,
+  transfer: ProjectTransferProposal,
+): number | undefined {
+  if (transfer.subjectKind === "next_action") {
+    return vm.nextActions.find((item) => item.nextActionId === transfer.subjectId)?.revision;
+  }
+  return vm.obstacles.find((item) => item.obstacleId === transfer.subjectId &&
+    item.kind === transfer.subjectKind)?.revision;
 }
 function renderLocked(root: HTMLElement, state: Extract<ProjectLoopRemoteState, { status: "locked" }>,
   actions: ProjectLoopSurfaceActions): void {
@@ -510,17 +521,28 @@ export function renderProjectLoopSurface(root: HTMLElement, state: ProjectLoopRe
     empty.textContent = "暂无 Ball 转交提案"; transfers.append(empty); }
   for (const transfer of vm.transferProposals) { const item = document.createElement("article");
     item.dataset.transferProposalId = transfer.transferProposalId;
+    const subjectRevision = currentTransferSubjectRevision(vm, transfer);
+    const currentSubject = subjectRevision === transfer.subjectRevision;
+    item.dataset.transferAuthority = currentSubject ? "current-subject" : "stale-subject";
     const summary = document.createElement("p");
     summary.textContent = `TRANSFER PROPOSAL · ${transfer.subjectKind}:${transfer.subjectId}` +
       ` · ${transfer.fromOwner.kind}:${transfer.fromOwner.actorId} → ${transfer.toOwner.kind}:${transfer.toOwner.actorId}` +
       ` · ${transfer.status} · revision r${transfer.revision}`;
     item.append(summary);
-    if (transfer.status === "pending" && transfer.principalActorId === state.viewerActorId) {
+    if (transfer.status === "pending" && !currentSubject) {
+      item.setAttribute("aria-disabled", "true");
+      const stale = document.createElement("p"); stale.dataset.projectTransferStale = "true";
+      stale.setAttribute("role", "status"); stale.setAttribute("aria-live", "polite");
+      stale.textContent = `只读：绑定的责任版本已变化（提案绑定 r${transfer.subjectRevision}` +
+        `，当前 ${subjectRevision === undefined ? "不可用" : `r${subjectRevision}`}）；接受与拒绝已禁用。`;
+      item.append(stale);
+    } else if (transfer.status === "pending" && transfer.principalActorId === state.viewerActorId &&
+        subjectRevision !== undefined) {
       const rejectReason = textInput(item, "拒绝转交原因", "transferRejectReason", transfer.transferProposalId);
       item.append(button("接受 Ball 转交", () => actions.onIntent({ kind: "transfer.resolve",
         intentId: `accept:${transfer.transferProposalId}:${transfer.revision}`,
         transferProposalId: transfer.transferProposalId, subjectKind: transfer.subjectKind,
-        subjectId: transfer.subjectId, expectedRevision: transfer.revision,
+        subjectId: transfer.subjectId, expectedRevision: subjectRevision,
         resolution: "accepted", reason: null }), vm.mutationDisabled,
       `transfer:${transfer.transferProposalId}:accept`));
       item.append(button("拒绝 Ball 转交", () => {
@@ -528,7 +550,7 @@ export function renderProjectLoopSurface(root: HTMLElement, state: ProjectLoopRe
         actions.onIntent({ kind: "transfer.resolve",
           intentId: `reject:${transfer.transferProposalId}:${transfer.revision}`,
           transferProposalId: transfer.transferProposalId, subjectKind: transfer.subjectKind,
-          subjectId: transfer.subjectId, expectedRevision: transfer.revision,
+          subjectId: transfer.subjectId, expectedRevision: subjectRevision,
           resolution: "rejected", reason });
       }, vm.mutationDisabled, `transfer:${transfer.transferProposalId}:reject`));
     }

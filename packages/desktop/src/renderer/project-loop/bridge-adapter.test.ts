@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { deriveProjectBallFacts } from "@native-im/core";
 import type { MessageAuthorityBridge } from "../../message-authority/contracts.js";
 import type { ProjectLoopBridge } from "../../project-loop/contracts.js";
 import { projectSnapshot } from "../../project-loop/test-fixture.js";
@@ -88,6 +89,48 @@ describe("FT-09 Project Loop timeline integration", () => {
     [...card.querySelectorAll<HTMLButtonElement>("button")].find((item) => item.textContent === "接受请求")?.click();
     expect(submit).toHaveBeenCalledWith({ roomId: "room-1", intent: expect.objectContaining({
       kind: "request.transition", action: "accept", factId: "request-1", expectedRevision: 3,
+    }) });
+    dispose(); workspace.remove();
+  });
+
+  it("submits transfer resolution with the current subject revision, not proposal revision", async () => {
+    const base = projectSnapshot(); const provenance = base.requests[0]!.provenance;
+    const question = { recordVersion: "project-loop.v1" as const, roomId: "room-1", projectId: "room-1",
+      revision: 4, provenance, createdAt: base.capturedAt, updatedAt: base.capturedAt,
+      kind: "open_question" as const, obstacleId: "question-transfer", title: "Route",
+      description: "Choose route", impact: "release",
+      owner: { kind: "human" as const, actorId: "human-1" }, status: "open" as const,
+      dueAt: null, reviewAt: null, statusReason: null, escalationBoundaryId: null,
+      resultSource: null, transferChain: [], resolutionCriteria: null, question: "Which route?" };
+    const transfer = { recordVersion: "project-loop.v1" as const,
+      transferProposalId: "transfer-resolution", roomId: "room-1", projectId: "room-1",
+      revision: 11, subjectKind: "open_question" as const, subjectId: question.obstacleId,
+      subjectRevision: 4, fromOwner: question.owner,
+      toOwner: { kind: "human" as const, actorId: "human-2" }, proposedBy: question.owner,
+      principalActorId: "human-2", reason: "handoff", status: "pending" as const,
+      proposedAt: base.capturedAt, expiresAt: "2026-08-29T00:00:00.000Z",
+      resolvedBy: null, resolvedAt: null, resolutionReason: null };
+    const snapshot = { ...base, obstacles: [question], transferProposals: [transfer],
+      balls: deriveProjectBallFacts({ roomId: "room-1", projectId: "room-1",
+        requests: base.requests, nextActions: [], obstacles: [question], proposals: base.proposals,
+        confirmations: [], transferProposals: [transfer] }) };
+    const ready = { status: "ready" as const, roomId: "room-1", snapshot,
+      viewerActorId: "human-2", connection: { status: "online" as const },
+      operation: { status: "idle" as const } };
+    const submit = vi.fn(async () => ready);
+    const bridge: ProjectLoopBridge = { getSurface: vi.fn(async () => ready), submit,
+      onStateChanged: () => () => {} };
+    const { workspace, project } = productionWorkspace(); document.body.append(workspace);
+    const dispose = mountProjectLoopBridgeSurface(project, bridge, "room-1", { reducedMotion: true,
+      onSearch: vi.fn(), onNavigateSegment: vi.fn(), onReauthenticate: vi.fn() });
+    await vi.waitFor(() => expect(project.querySelector(
+      '[data-project-control-id="transfer:transfer-resolution:accept"]',
+    )).not.toBeNull());
+    project.querySelector<HTMLButtonElement>(
+      '[data-project-control-id="transfer:transfer-resolution:accept"]',
+    )?.click();
+    expect(submit).toHaveBeenCalledWith({ roomId: "room-1", intent: expect.objectContaining({
+      kind: "transfer.resolve", transferProposalId: "transfer-resolution", expectedRevision: 4,
     }) });
     dispose(); workspace.remove();
   });

@@ -127,4 +127,18 @@ describe("Project Loop production Worker adapter", () => {
     expect(operations[0]).toMatchObject({ type: "project-loop.fact.transition", context,
       command: { roomId: "room-1", projectId: "room-1", expectedRevision: 2, ...command } });
   });
+
+  it("preserves the subject fact revision for transfer resolution when proposal revision differs", async () => {
+    const { operations, transport } = harness();
+    await transport.executeMutation(context, { ...base, type: "project.transfer.resolve",
+      transferProposalId: "transfer-revision-11", subjectKind: "next_action",
+      subjectId: "action-revision-4", expectedRevision: 4,
+      resolution: "accepted", reason: null });
+    expect(operations).toEqual([expect.objectContaining({
+      type: "project-loop.fact.transition", context,
+      command: expect.objectContaining({ factKind: "next_action", factId: "action-revision-4",
+        expectedRevision: 4, transition: "next_action.transfer_accept",
+        payload: { transferProposalId: "transfer-revision-11" } }),
+    })]);
+  });
 });

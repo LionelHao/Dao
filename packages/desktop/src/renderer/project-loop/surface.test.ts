@@ -129,17 +129,22 @@ describe("FT-09 J-04/J-06/J-07 Project surface", () => {
       title: "Network", owner: { kind: "human" as const, actorId: "human-2" },
       resolutionCriteria: null, question: "Which route?" };
     const transfer = { recordVersion: "project-loop.v1" as const, transferProposalId: "transfer-1",
-      roomId: "room-1", projectId: "room-1", revision: 1, subjectKind: "open_question" as const,
+      roomId: "room-1", projectId: "room-1", revision: 7, subjectKind: "open_question" as const,
       subjectId: "question-1", subjectRevision: 2, fromOwner: question.owner,
       toOwner: { kind: "human" as const, actorId: "human-1" }, proposedBy: { kind: "human" as const,
         actorId: "human-2" }, principalActorId: "human-1", reason: "handoff", status: "pending" as const,
       proposedAt: base.capturedAt, expiresAt: "2026-08-29T00:00:00.000Z", resolvedBy: null,
       resolvedAt: null, resolutionReason: null };
+    const staleQuestion = { ...question, obstacleId: "question-stale", revision: 3 };
+    const staleTransfer = { ...transfer, transferProposalId: "transfer-stale", revision: 9,
+      subjectId: "question-stale", subjectRevision: 2 };
     const root = document.createElement("main"); const ui = actions();
-    renderProjectLoopSurface(root, { ...ready(), snapshot: { ...base, obstacles: [blocker, question],
-      transferProposals: [transfer], balls: deriveProjectBallFacts({ roomId: "room-1", projectId: "room-1",
-        requests: base.requests, nextActions: [], obstacles: [blocker, question], proposals: base.proposals,
-        confirmations: [], transferProposals: [transfer] }) } }, ui, { activeCategory: "obstacles" });
+    renderProjectLoopSurface(root, { ...ready(), snapshot: { ...base,
+      obstacles: [blocker, question, staleQuestion], transferProposals: [transfer, staleTransfer],
+      balls: deriveProjectBallFacts({ roomId: "room-1", projectId: "room-1",
+        requests: base.requests, nextActions: [], obstacles: [blocker, question, staleQuestion],
+        proposals: base.proposals, confirmations: [], transferProposals: [transfer, staleTransfer] }) } },
+    ui, { activeCategory: "obstacles" });
     const visible = root.querySelector('[role="tabpanel"]')?.textContent ?? "";
     expect(visible).toContain("BLOCKER"); expect(visible).toContain("OPEN QUESTION");
     expect(root.querySelector('[data-project-obstacle-kind="blocker"]')?.getAttribute("aria-label"))
@@ -155,7 +160,16 @@ describe("FT-09 J-04/J-06/J-07 Project surface", () => {
       resultSource: expect.objectContaining({ sourceId: "message-result", roomId: "room-1" }) }));
     root.querySelector<HTMLButtonElement>('[data-project-control-id="transfer:transfer-1:accept"]')?.click();
     expect(ui.onIntent).toHaveBeenCalledWith(expect.objectContaining({ kind: "transfer.resolve",
-      transferProposalId: "transfer-1", resolution: "accepted", reason: null }));
+      transferProposalId: "transfer-1", expectedRevision: 2,
+      resolution: "accepted", reason: null }));
+    const stale = root.querySelector<HTMLElement>('[data-transfer-proposal-id="transfer-stale"]')!;
+    expect(stale.dataset.transferAuthority).toBe("stale-subject");
+    expect(stale.getAttribute("aria-disabled")).toBe("true");
+    expect(stale.querySelector<HTMLElement>('[data-project-transfer-stale]')?.getAttribute("role"))
+      .toBe("status");
+    expect(stale.textContent).toContain("绑定的责任版本已变化");
+    expect(stale.querySelector('[data-project-control-id="transfer:transfer-stale:accept"]')).toBeNull();
+    expect(stale.querySelector('[data-project-control-id="transfer:transfer-stale:reject"]')).toBeNull();
   });
 
   it("offers obstacle reopen and non-colour Agent transfer with a named Human principal", () => {

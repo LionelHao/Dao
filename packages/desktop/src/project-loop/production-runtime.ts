@@ -324,6 +324,20 @@ export function createDesktopProjectLoopRuntime(options: Readonly<{
   const rebasedIntent = (state: RoomState, intent: ProjectLoopIntent): ProjectLoopIntent | undefined => {
     if (state.remote.status !== "ready") return undefined;
     const snapshot = state.remote.snapshot;
+    if (intent.kind === "transfer.resolve") {
+      const proposal = snapshot.transferProposals.find((item) =>
+        item.transferProposalId === intent.transferProposalId);
+      if (proposal === undefined || proposal.status !== "pending" ||
+          proposal.subjectKind !== intent.subjectKind || proposal.subjectId !== intent.subjectId) {
+        return undefined;
+      }
+      const subjectRevision = intent.subjectKind === "next_action"
+        ? snapshot.nextActions.find((item) => item.nextActionId === intent.subjectId)?.revision
+        : snapshot.obstacles.find((item) => item.obstacleId === intent.subjectId &&
+            item.kind === intent.subjectKind)?.revision;
+      return subjectRevision === undefined || proposal.subjectRevision !== subjectRevision
+        ? undefined : { ...intent, expectedRevision: subjectRevision };
+    }
     const revision = intent.kind === "proposal.resolve"
       ? snapshot.proposals.find((item) => item.proposalId === intent.proposalId)?.revision
       : intent.kind === "request.transition"
@@ -332,10 +346,7 @@ export function createDesktopProjectLoopRuntime(options: Readonly<{
           ? snapshot.nextActions.find((item) => item.nextActionId === intent.factId)?.revision
           : intent.kind === "obstacle.transition"
             ? snapshot.obstacles.find((item) => item.obstacleId === intent.factId)?.revision
-            : intent.kind === "transfer.resolve"
-              ? snapshot.transferProposals.find((item) =>
-                  item.transferProposalId === intent.transferProposalId)?.revision
-              : intent.subjectKind === "next_action"
+            : intent.subjectKind === "next_action"
                 ? snapshot.nextActions.find((item) => item.nextActionId === intent.subjectId)?.revision
                 : snapshot.obstacles.find((item) => item.obstacleId === intent.subjectId &&
                     item.kind === intent.subjectKind)?.revision;
@@ -356,7 +367,10 @@ export function createDesktopProjectLoopRuntime(options: Readonly<{
     }
     if (status === 409) {
       const intent = rebasedIntent(state, pending.intent);
-      if (intent === undefined) return structuredClone(state.remote);
+      if (intent === undefined) {
+        state.pendingOperation = undefined;
+        return structuredClone(state.remote);
+      }
       return submit(state, intent, options.createRequestIdentity());
     }
     return submit(state, pending.intent, pending.identity);

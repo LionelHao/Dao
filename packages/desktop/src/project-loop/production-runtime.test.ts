@@ -382,6 +382,87 @@ describe("FT-09 Desktop Project Loop production runtime", () => {
     runtime.close();
   });
 
+  it("rebases transfer resolution to the current subject fact and refuses a stale proposal", async () => {
+    const transferSnapshot = (actionRevision: number, transferRevision: number,
+      subjectRevision: number, watermark: number): ProjectSnapshot => {
+      const base = projectSnapshot(); const provenance = base.requests[0]!.provenance;
+      const action = { recordVersion: "project-loop.v1" as const, roomId: "room-1", projectId: "room-1",
+        revision: actionRevision, provenance, createdAt: base.capturedAt, updatedAt: base.capturedAt,
+        kind: "next_action" as const, nextActionId: "action-transfer", title: "Transfer",
+        description: "Transfer safely", owner: { kind: "human" as const, actorId: "human-1" },
+        status: "accepted" as const, dueAt: null, deliverable: "release", acceptanceCriteria: [],
+        verifier: null, acceptedBy: { kind: "human" as const, actorId: "human-1" },
+        acceptedAt: base.capturedAt, delivery: null, completedBy: null, completedAt: null,
+        statusReason: null, reassignmentChain: [] };
+      const transfer = { recordVersion: "project-loop.v1" as const,
+        transferProposalId: "transfer-resolution", roomId: "room-1", projectId: "room-1",
+        revision: transferRevision, subjectKind: "next_action" as const,
+        subjectId: action.nextActionId, subjectRevision, fromOwner: action.owner,
+        toOwner: { kind: "human" as const, actorId: "human-2" }, proposedBy: action.owner,
+        principalActorId: "human-2", reason: "handoff", status: "pending" as const,
+        proposedAt: base.capturedAt, expiresAt: "2026-08-29T00:00:00.000Z",
+        resolvedBy: null, resolvedAt: null, resolutionReason: null };
+      return { ...base, watermark, nextActions: [action], transferProposals: [transfer],
+        balls: deriveProjectBallFacts({ roomId: "room-1", projectId: "room-1",
+          requests: base.requests, nextActions: [action], obstacles: [], proposals: base.proposals,
+          confirmations: [], transferProposals: [transfer] }) };
+    };
+    const initial = transferSnapshot(2, 1, 2, 7);
+    const rebound = transferSnapshot(4, 8, 4, 9);
+    const calls: ProjectLoopWireRequest[] = [];
+    const wire = createTransport(async (frame) => {
+      calls.push(frame);
+      if (calls.length === 1) throw Object.assign(new Error("conflict"), { projectError: {
+        type: "error", status: 409, code: "revision_conflict", message: "conflict",
+        requestId: frame.requestId,
+      } });
+      return { type: "project.mutation.ack", requestId: frame.requestId, roomId: frame.roomId,
+        projectId: frame.projectId, acceptedRevision: 10, eventIds: ["event-10"], replayed: false };
+    });
+    const cache = createCacheHarness([initial, rebound, { ...rebound, watermark: 10 }]);
+    let identity = 0;
+    const runtime = createDesktopProjectLoopRuntime({ session, transport: wire.transport,
+      authorityCache: cache.cache, repairRoom: (roomId) => cache.repairRoom(roomId),
+      restoreAuthorityCache: async () => false,
+      createRequestIdentity: () => ({ requestId: `transfer-request-${++identity}`,
+        idempotencyKey: `transfer-idem-${identity}` }) });
+    const intent = { kind: "transfer.resolve" as const, intentId: "accept-transfer-resolution",
+      transferProposalId: "transfer-resolution", subjectKind: "next_action" as const,
+      subjectId: "action-transfer", expectedRevision: 2, resolution: "accepted" as const,
+      reason: null };
+    await runtime.getSurface({ roomId: "room-1" });
+    await runtime.submit({ roomId: "room-1", intent });
+    await runtime.getSurface({ roomId: "room-1" });
+    expect(calls).toEqual([
+      expect.objectContaining({ type: "project.transfer.resolve", expectedRevision: 2 }),
+      expect.objectContaining({ type: "project.transfer.resolve", expectedRevision: 4 }),
+    ]);
+    runtime.close();
+
+    const staleCalls: ProjectLoopWireRequest[] = [];
+    const staleWire = createTransport(async (frame) => {
+      staleCalls.push(frame);
+      throw Object.assign(new Error("conflict"), { projectError: {
+        type: "error", status: 409, code: "revision_conflict", message: "conflict",
+        requestId: frame.requestId,
+      } });
+    });
+    const stale = transferSnapshot(4, 8, 2, 9);
+    const staleCache = createCacheHarness([initial, stale]);
+    const staleRuntime = createDesktopProjectLoopRuntime({ session, transport: staleWire.transport,
+      authorityCache: staleCache.cache, repairRoom: (roomId) => staleCache.repairRoom(roomId),
+      restoreAuthorityCache: async () => false,
+      createRequestIdentity: () => ({ requestId: "stale-request", idempotencyKey: "stale-idem" }) });
+    await staleRuntime.getSurface({ roomId: "room-1" });
+    await staleRuntime.submit({ roomId: "room-1", intent });
+    await expect(staleRuntime.getSurface({ roomId: "room-1" })).resolves.toMatchObject({
+      status: "ready", snapshot: { watermark: 9, nextActions: [{ revision: 4 }],
+        transferProposals: [{ revision: 8, subjectRevision: 2 }] },
+    });
+    expect(staleCalls).toHaveLength(1);
+    staleRuntime.close();
+  });
+
   it("wires every Desktop core-action family to the closed public Project protocol", async () => {
     const source = { kind: "message" as const, sourceId: "message-result", sourceRevision: 2,
       roomId: "room-1", visibility: "room" as const };
