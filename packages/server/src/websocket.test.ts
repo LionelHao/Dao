@@ -46,6 +46,7 @@ import {
 import {
   formatMessageWebSocketUrl,
   validateMessageWebSocketListener,
+  type AgentPreviewDeliveryAuthority,
   type RoomMemoryAuthorityTransport,
 } from "./websocket.js";
 
@@ -734,6 +735,17 @@ async function createFixture(options: {
 
 const fixtures: Array<Awaited<ReturnType<typeof createFixture>>> = [];
 
+function previewDeliveryAuthority(
+  authorize: (input: Parameters<AgentPreviewDeliveryAuthority["deliver"]>[0]) =>
+    Promise<Readonly<{ authorized: boolean; authorityEpoch: string }>>,
+): AgentPreviewDeliveryAuthority {
+  return {
+    async deliver(input, send) {
+      send(await authorize(input));
+    },
+  };
+}
+
 afterEach(async () => {
   await Promise.all(fixtures.splice(0).map((fixture) => fixture.close()));
 });
@@ -762,7 +774,7 @@ describe("authenticated message WebSocket service", () => {
       auth,
       service: idleMessageService(),
       outboxStore: idleOutboxStore(),
-      previewAuthority: { authorize },
+      previewAuthority: previewDeliveryAuthority(authorize),
     });
     const client = await LoopbackClient.connect(server.url);
     try {
@@ -824,12 +836,10 @@ describe("authenticated message WebSocket service", () => {
       auth,
       service: idleMessageService(),
       outboxStore: idleOutboxStore(),
-      previewAuthority: {
-        authorize() {
+      previewAuthority: previewDeliveryAuthority(async () => {
           authorizationStarted.resolve();
           return authorization.promise;
-        },
-      },
+      }),
     });
     const client = await LoopbackClient.connect(server.url);
     try {
@@ -866,13 +876,13 @@ describe("authenticated message WebSocket service", () => {
     };
     const server = await startMessageWebSocketServer({
       auth, service: idleMessageService(), outboxStore: idleOutboxStore(),
-      previewAuthority: { async authorize(input) {
+      previewAuthority: previewDeliveryAuthority(async (input) => {
         if (input.roomId === roomId) {
           roomOneCalls += 1;
           if (roomOneCalls === 1) { firstStarted.resolve(); await blocked.promise; }
         }
         return { authorized: true, authorityEpoch: "bounded:1" };
-      } },
+      }),
     });
     const client = await LoopbackClient.connect(server.url);
     try {
@@ -901,6 +911,71 @@ describe("authenticated message WebSocket service", () => {
     }
   });
 
+  it("retains bounded reset markers for two visible executions when the Room queue overflows", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "preview-multi-reset");
+    const blocked = deferred<void>();
+    const blockedStarted = deferred<void>();
+    let blockNext = false;
+    const auth: AuthenticationService = {
+      async login() { return session; }, async authenticate() { return principal; },
+      async authenticateSession() {
+        return { sessionId: session.accessToken, sessionFamilyId: "family-preview", principal };
+      },
+      async refresh() { return session; }, async revoke() {},
+    };
+    const server = await startMessageWebSocketServer({
+      auth, service: idleMessageService(), outboxStore: idleOutboxStore(),
+      previewAuthority: previewDeliveryAuthority(async () => {
+        if (blockNext) {
+          blockNext = false;
+          blockedStarted.resolve();
+          await blocked.promise;
+        }
+        return { authorized: true, authorityEpoch: "multi-reset:1" };
+      }),
+    });
+    const client = await LoopbackClient.connect(server.url);
+    try {
+      await client.login(humans[0]);
+      await client.subscribe(roomId);
+      await server.publishAgentPreview({ roomId, executionId: "visible-a", attemptSeq: 1,
+        streamSeq: 1, delta: "A" });
+      await server.publishAgentPreview({ roomId, executionId: "visible-b", attemptSeq: 1,
+        streamSeq: 1, delta: "B" });
+      await client.waitForFrame((frame) => hasType(frame, "agent.execution.preview") &&
+        frame.executionId === "visible-b", "second visible preview");
+
+      blockNext = true;
+      const deliveries = [server.publishAgentPreview({ roomId, executionId: "queued-0",
+        attemptSeq: 1, streamSeq: 1, delta: "x" })];
+      await blockedStarted.promise;
+      for (let index = 1; index < 32; index += 1) {
+        deliveries.push(server.publishAgentPreview({ roomId, executionId: `queued-${index}`,
+          attemptSeq: 1, streamSeq: 1, delta: "x" }));
+      }
+      await server.resetAgentPreview({ roomId, executionId: "visible-a", attemptSeq: 1,
+        reason: "execution_terminal" });
+      await server.resetAgentPreview({ roomId, executionId: "visible-b", attemptSeq: 1,
+        reason: "attempt_rolled_over" });
+      blocked.resolve();
+      await Promise.all(deliveries);
+
+      await expect(client.waitForFrame((frame) => hasType(frame, "agent.execution.preview.reset") &&
+        frame.executionId === "visible-a", "first overflow reset")).resolves.toMatchObject({
+          frame: { executionId: "visible-a", reason: "execution_terminal" },
+        });
+      await expect(client.waitForFrame((frame) => hasType(frame, "agent.execution.preview.reset") &&
+        frame.executionId === "visible-b", "second overflow reset")).resolves.toMatchObject({
+          frame: { executionId: "visible-b", reason: "attempt_rolled_over" },
+        });
+      expect(client.frameCount((frame) => hasType(frame, "agent.execution.preview.reset") &&
+        (frame.executionId === "visible-a" || frame.executionId === "visible-b"))).toBe(2);
+    } finally {
+      blocked.resolve(); await client.close(); await server.close();
+    }
+  });
+
   it("fences an authorized preview result to the captured subscription generation", async () => {
     const principal = { accountId: "account-human-1", actorId: humans[0].id };
     const session = issuedSession(principal, "preview-generation");
@@ -919,12 +994,10 @@ describe("authenticated message WebSocket service", () => {
       auth,
       service: idleMessageService(),
       outboxStore: idleOutboxStore(),
-      previewAuthority: {
-        authorize() {
+      previewAuthority: previewDeliveryAuthority(async () => {
           authorizationStarted.resolve();
           return authorization.promise;
-        },
-      },
+      }),
     });
     const client = await LoopbackClient.connect(server.url);
     try {

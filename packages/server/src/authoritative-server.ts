@@ -958,8 +958,8 @@ async function start(
       outboxPollIntervalMs: 10,
       agentRuntime: runtime,
       previewAuthority: {
-        async authorize(input) {
-          const result = await authorityWorker.executeRuntime({
+        async deliver(input, sendSynchronously) {
+          await authorityWorker.executeRuntimeWithSynchronousDelivery({
             type: "runtime.preview-authorize",
             context: input.context,
             roomId: input.roomId,
@@ -971,25 +971,27 @@ async function start(
               ? {}
               : { expectedAuthorityEpoch: input.expectedAuthorityEpoch }),
             now: Date.now(),
+          }, (result) => {
+            if (typeof result !== "object" || result === null ||
+                !("kind" in result) || result.kind !== "preview-authority" ||
+                !("subscriptionGeneration" in result) ||
+                result.subscriptionGeneration !== input.subscriptionGeneration ||
+                !("authorized" in result) ||
+                typeof result.authorized !== "boolean" ||
+                !("authorityEpoch" in result) ||
+                typeof result.authorityEpoch !== "string" ||
+                result.authorityEpoch.length === 0) {
+              throw new AgentRuntimeError(
+                "context_storage_unavailable",
+                "Preview delivery authority returned a malformed receipt",
+              );
+            }
+            sendSynchronously({
+              authorized: result.authorized,
+              authorityEpoch: result.authorityEpoch,
+            });
+            return undefined;
           });
-          if (typeof result !== "object" || result === null ||
-              !("kind" in result) || result.kind !== "preview-authority" ||
-              !("subscriptionGeneration" in result) ||
-              result.subscriptionGeneration !== input.subscriptionGeneration ||
-              !("authorized" in result) ||
-              typeof result.authorized !== "boolean" ||
-              !("authorityEpoch" in result) ||
-              typeof result.authorityEpoch !== "string" ||
-              result.authorityEpoch.length === 0) {
-            throw new AgentRuntimeError(
-              "context_storage_unavailable",
-              "Preview delivery authority returned a malformed receipt",
-            );
-          }
-          return {
-            authorized: result.authorized,
-            authorityEpoch: result.authorityEpoch,
-          };
         },
       },
       collaboration: primitives,
