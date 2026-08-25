@@ -253,8 +253,9 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
   let closePromise: Promise<void> | undefined;
   let recoveryPromise: Promise<void> | undefined;
 
-  const agentLane = (job: RuntimeJob): string =>
-    `${job.execution.roomId}\0${job.execution.agentId}`;
+  // A stable Agent is one execution lane across every Room. SQLite repeats
+  // this gate at claim time so a second runtime process cannot bypass it.
+  const agentLane = (job: RuntimeJob): string => job.execution.agentId;
 
   const admitted = (roomId: string): number => admittedByRoom.get(roomId) ?? 0;
   const reserved = (roomId: string): number => admissionReservations.get(roomId) ?? 0;
@@ -380,9 +381,12 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
   };
 
   const runAttempt = async (job: RuntimeJob, jobController: AbortController): Promise<void> => {
-    let claimed = job.execution.status === "queued"
-      ? await options.authority.claim(job.execution.id, job.execution.currentAttemptSeq)
-      : job.execution;
+    // Recovery of an already-running row must cross the same durable Agent
+    // reservation gate as a fresh queued claim (with self-exemption).
+    let claimed = await options.authority.claim(
+      job.execution.id,
+      job.execution.currentAttemptSeq,
+    );
     if (claimed.status !== "running") {
       throw new AgentRuntimeError("execution_conflict", "Agent attempt was not runnable");
     }
@@ -672,7 +676,15 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         const runtimeError = error instanceof AgentRuntimeError
           ? error
           : new AgentRuntimeError("provider_failure", "Agent runtime failed");
-        if (runtimeError.code === "execution_conflict") return;
+        if (runtimeError.code === "execution_conflict") {
+          // A durable cross-process Agent-busy race leaves the execution
+          // queued. Release this worker's recovery leases so the next scan can
+          // admit it as soon as the winning running execution is terminal.
+          if (options.recoveryAuthority?.release !== undefined) {
+            await options.recoveryAuthority.release().catch(() => undefined);
+          }
+          return;
+        }
         await options.authority.scheduleRetry(
           job.execution.id,
           job.execution.currentAttemptSeq,

@@ -94,12 +94,12 @@ const humanContext = {
   principal: { accountId: "account-1", actorId: "human-1" },
   requestId: "human-command", idempotencyKey: "human-command",
 } as const;
-function sendAgentSource(database: DatabaseSync, index: number): string {
+function sendAgentSource(database: DatabaseSync, index: number, roomId = "room-1"): string {
   const id = `message-agent-source-${index}`;
   executeHumanDatabaseCommand(database, {
     context: { ...humanContext, requestId: id, idempotencyKey: id },
-    command: { type: "message.send", roomId: "room-1", payload: {
-      id, roomId: "room-1", body: `source ${index}`,
+    command: { type: "message.send", roomId, payload: {
+      id, roomId, body: `source ${index}`,
       sentAt: new Date(t0 + index * 1_000).toISOString(),
     } },
     now: t0 + index * 1_000,
@@ -107,20 +107,26 @@ function sendAgentSource(database: DatabaseSync, index: number): string {
   return id;
 }
 
-function invoke(database: DatabaseSync, sourceMessageId: string, executionId: string, targetAgentId: string): void {
+function invoke(
+  database: DatabaseSync,
+  sourceMessageId: string,
+  executionId: string,
+  targetAgentId: string,
+  roomId = "room-1",
+): void {
   const authority = database.prepare(
     `SELECT profile.id AS profileId, profile.revision AS profileRevision,
             assignment.id AS assignmentId, assignment.revision AS assignmentRevision,
             membership.access_revision AS accessRevision
      FROM agent_profiles AS profile
      JOIN room_agent_assignments AS assignment
-       ON assignment.profile_id = profile.id AND assignment.room_id = 'room-1'
+       ON assignment.profile_id = profile.id AND assignment.room_id = ?
       AND assignment.agent_actor_id = profile.actor_id AND assignment.status = 'current'
      JOIN room_memberships AS membership
        ON membership.room_id = assignment.room_id
       AND membership.actor_id = assignment.agent_actor_id
      WHERE profile.actor_id = ?`,
-  ).get(targetAgentId) as {
+  ).get(roomId, targetAgentId) as {
     profileId: string; profileRevision: number; assignmentId: string;
     assignmentRevision: number; accessRevision: number;
   };
@@ -133,16 +139,16 @@ function invoke(database: DatabaseSync, sourceMessageId: string, executionId: st
       `INSERT INTO message_mentions (
          message_id, room_id, target_id, target_kind, target_actor_id,
          range_start_utf16, range_end_utf16, target_order
-       ) VALUES (?, 'room-1', ?, 'agent-invocation', ?, 0, 1, 0)`,
-    ).run(sourceMessageId, targetId, targetAgentId);
+       ) VALUES (?, ?, ?, 'agent-invocation', ?, 0, 1, 0)`,
+    ).run(sourceMessageId, roomId, targetId, targetAgentId);
     database.prepare(
       `INSERT INTO agent_invocation_intents (
          id, room_id, source_message_id, target_agent_id, requester_actor_id,
          intent_kind, execution_id, created_at, message_transaction_id, target_id,
          source_revision, lineage_id, turn_id, origin_kind, status
-       ) VALUES (?, 'room-1', ?, ?, 'human-1', 'direct_mention', NULL, ?, ?, ?,
+       ) VALUES (?, ?, ?, ?, 'human-1', 'direct_mention', NULL, ?, ?, ?,
                  1, ?, ?, 'message_target', 'pending')`,
-    ).run(intentId, sourceMessageId, targetAgentId, createdAt,
+    ).run(intentId, roomId, sourceMessageId, targetAgentId, createdAt,
       sourceMessageId, targetId, `lineage-${executionId}`, `turn-${executionId}`);
     database.prepare(
       `INSERT INTO direct_agent_invocation_authority_bindings (
@@ -155,9 +161,9 @@ function invoke(database: DatabaseSync, sourceMessageId: string, executionId: st
       `INSERT INTO message_target_outcomes (
          message_id, room_id, target_id, target_actor_id, target_kind, status,
          request_intent_id, invocation_intent_id, rejection_code, created_at
-       ) VALUES (?, 'room-1', ?, ?, 'agent-invocation', 'invocation-intent-created',
+       ) VALUES (?, ?, ?, ?, 'agent-invocation', 'invocation-intent-created',
                  NULL, ?, NULL, ?)`,
-    ).run(sourceMessageId, targetId, targetAgentId, intentId, createdAt);
+    ).run(sourceMessageId, roomId, targetId, targetAgentId, intentId, createdAt);
     database.exec("COMMIT");
   } catch (error) {
     database.exec("ROLLBACK");
@@ -167,7 +173,7 @@ function invoke(database: DatabaseSync, sourceMessageId: string, executionId: st
     type: "runtime.invoke", context: {
       ...humanContext, requestId: `invoke-${executionId}`, idempotencyKey: `invoke-${executionId}`,
     },
-    intent: { kind: "direct_mention", roomId: "room-1", sourceMessageId, targetAgentId },
+    intent: { kind: "direct_mention", roomId, sourceMessageId, targetAgentId },
     executionId, intentId, providerId: "provider", modelId: "model",
     now: t0 + 10_000,
   });
@@ -442,6 +448,72 @@ describe("real SQLite human-preemption authority", () => {
     expect(recalled).toMatchObject({ replayed: false, revision: 2, abortTargets: [] });
     expect(recallHumanMessageDatabaseCommand(database, recallInput))
       .toEqual({ ...recalled, replayed: true });
+    database.close();
+  });
+
+  it("projects one durable running reservation for the same Agent across Rooms", () => {
+    const database = fixture();
+    database.exec(`
+      INSERT INTO rooms (id, name, status, created_at, owner_actor_id, governance_revision)
+      VALUES ('room-2', 'Second Room', 'active', '2026-08-17T00:00:00.000Z', 'human-1', 1);
+      INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+      VALUES ('room', 'room-2', 0, 1);
+      INSERT INTO room_memberships (
+        room_id, actor_id, kind, role, participation, joined_at, configured_at,
+        access_revision
+      ) VALUES
+        ('room-2', 'human-1', 'human', 'owner', NULL,
+         '2026-08-17T00:00:00.000Z', NULL, 1),
+        ('room-2', 'agent-1', 'agent', NULL, 'active', NULL,
+         '2026-08-17T00:00:00.000Z', 1);
+    `);
+    const profileId = database.prepare(
+      "SELECT id FROM agent_profiles WHERE actor_id = 'agent-1'",
+    ).get()?.id;
+    if (typeof profileId !== "string") throw new Error("Agent Profile was missing");
+    seedCanonicalRoomAssignmentFixture(database, {
+      assignmentId: "assignment-agent-1-room-2", roomId: "room-2", profileId,
+      actorId: "agent-1", participation: "active",
+    });
+    const source1 = sendAgentSource(database, 180);
+    const source2 = sendAgentSource(database, 181, "room-2");
+    invoke(database, source1, "execution-agent-lane-room-1", "agent-1");
+    invoke(database, source2, "execution-agent-lane-room-2", "agent-1", "room-2");
+
+    expect(executeRuntimeAuthorityOperation(database, {
+      type: "runtime.claim", executionId: "execution-agent-lane-room-1", attemptSeq: 1,
+      now: t0 + 182_000,
+    })).toMatchObject({ kind: "execution", execution: { status: "running" } });
+    expect(executeRuntimeAuthorityOperation(database, {
+      type: "runtime.claim", executionId: "execution-agent-lane-room-1", attemptSeq: 1,
+      now: t0 + 182_001,
+    })).toMatchObject({ kind: "execution", execution: { status: "running" } });
+    expect(executeRuntimeAuthorityOperation(database, {
+      type: "runtime.claim", executionId: "execution-agent-lane-room-2", attemptSeq: 1,
+      now: t0 + 182_002,
+    })).toMatchObject({ kind: "execution", execution: { status: "queued" } });
+    expect(database.prepare(
+      `SELECT COUNT(*) AS count
+       FROM agent_execution_runtime_states AS runtime
+       JOIN agent_executions AS execution ON execution.id = runtime.execution_id
+       WHERE execution.agent_id = 'agent-1' AND runtime.public_status = 'running'`,
+    ).get()).toEqual({ count: 1 });
+
+    expect(executeRuntimeAuthorityOperation(database, {
+      type: "runtime.schedule-retry", executionId: "execution-agent-lane-room-1",
+      attemptSeq: 1, errorCode: "provider_timeout",
+      nextRetryAt: new Date(t0 + 183_000).toISOString(), now: t0 + 182_003,
+    })).toMatchObject({ kind: "execution", execution: { status: "queued" } });
+    expect(executeRuntimeAuthorityOperation(database, {
+      type: "runtime.claim", executionId: "execution-agent-lane-room-2", attemptSeq: 1,
+      now: t0 + 182_004,
+    })).toMatchObject({ kind: "execution", execution: { status: "running" } });
+    expect(database.prepare(
+      `SELECT execution.room_id AS roomId, runtime.public_status AS status
+       FROM agent_execution_runtime_states AS runtime
+       JOIN agent_executions AS execution ON execution.id = runtime.execution_id
+       WHERE execution.agent_id = 'agent-1' AND runtime.public_status = 'running'`,
+    ).all()).toEqual([{ roomId: "room-2", status: "running" }]);
     database.close();
   });
 

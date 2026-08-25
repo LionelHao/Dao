@@ -629,8 +629,7 @@ function readPreparationRow(
             ? AS frozenAccessRevision,
             membership.tool_permissions_json AS membershipToolsJson,
             (SELECT COUNT(*) FROM agent_executions AS running
-             WHERE running.room_id = execution.room_id
-               AND running.agent_id = execution.agent_id
+             WHERE running.agent_id = execution.agent_id
                AND running.status = 'running') AS runningExecutionCount,
             agent.catalog_revision AS toolCapabilityRevision,
             COALESCE(steward.memory_watermark, 0) AS memoryWatermark,

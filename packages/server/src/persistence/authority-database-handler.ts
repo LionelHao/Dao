@@ -5940,9 +5940,8 @@ function ensureRouteCandidateSnapshot(
             membership.tool_permissions_json AS membershipToolsJson,
             legacy.calibration_score AS calibrationScore, legacy.has_ball AS hasBall,
             (SELECT COUNT(*) FROM agent_executions AS execution
-             WHERE execution.room_id = route.room_id
-               AND execution.agent_id = legacy.agent_id
-               AND execution.status IN ('queued', 'running')) AS activeExecutionCount
+             WHERE execution.agent_id = legacy.agent_id
+               AND execution.status = 'running') AS activeExecutionCount
      FROM route_jobs AS route
      JOIN route_job_agents AS legacy ON legacy.route_job_id = route.id
      JOIN agent_profiles AS profile ON profile.actor_id = legacy.agent_id
@@ -6086,8 +6085,8 @@ function routeSelectionAuthorityRejection(
             membership.participation AS membershipParticipation,
             membership.access_revision AS currentAccessRevision,
             (SELECT COUNT(*) FROM agent_executions AS execution
-             WHERE execution.room_id = room.id AND execution.agent_id = ?
-               AND execution.status IN ('queued', 'running')) AS runningExecutionCount
+             WHERE execution.agent_id = ?
+               AND execution.status = 'running') AS runningExecutionCount
      FROM rooms AS room
      LEFT JOIN actors AS actor ON actor.id = ?
      LEFT JOIN messages AS source ON source.id = ? AND source.room_id = room.id
@@ -7801,7 +7800,8 @@ export function executeRuntimeAuthorityOperation(
 
     if (operation.type === "runtime.claim") {
       const current = runtimeExecutionById(database, operation.executionId);
-      if (current.status !== "queued" || current.currentAttemptSeq !== operation.attemptSeq) {
+      if ((current.status !== "queued" && current.status !== "running") ||
+          current.currentAttemptSeq !== operation.attemptSeq) {
         return fail("execution_conflict", "Agent attempt claim was stale");
       }
       requireExecutionRuntimeGenerationAllowed(
@@ -7812,6 +7812,46 @@ export function executeRuntimeAuthorityOperation(
       requireRuntimeFrozenHandoff(database, current.id);
       if (hasPendingHumanPreemptionAfterSource(database, current)) {
         return fail("execution_conflict", "Agent attempt is behind a durable human fence");
+      }
+      requireAgentCommandAuthority(database, current.agentId, current.roomId);
+      const runningWinner = database.prepare(
+        `SELECT execution.execution_id AS executionId
+         FROM agent_execution_runtime_states AS execution
+         JOIN agent_executions AS legacy ON legacy.id = execution.execution_id
+         WHERE legacy.agent_id = ? AND execution.public_status = 'running'
+         ORDER BY COALESCE(execution.started_at, execution.queued_at),
+                  execution.queued_at, execution.execution_id
+         LIMIT 1`,
+      ).get(current.agentId);
+      if (current.status === "queued" && typeof runningWinner?.executionId === "string") {
+        return { kind: "execution", execution: current };
+      }
+      if (current.status === "running") {
+        if (runningWinner?.executionId === current.id) {
+          return { kind: "execution", execution: current };
+        }
+        if (typeof runningWinner?.executionId !== "string") {
+          return fail("storage_unavailable", "Running Agent reservation projection was missing");
+        }
+        // v1-v21 could leave more than one cross-Room execution running. On
+        // first recovery, deterministically retain the oldest and return every
+        // later execution to the durable accepted queue before Provider work.
+        const deferred = database.prepare(
+          `UPDATE agent_executions
+           SET status = 'queued', started_at = NULL, next_retry_at = NULL, updated_at = ?
+           WHERE id = ? AND current_attempt_seq = ? AND status = 'running'`,
+        ).run(occurredAt, current.id, operation.attemptSeq);
+        if (deferred.changes !== 1) {
+          return fail("execution_conflict", "Agent busy recovery lost its CAS");
+        }
+        database.prepare(
+          `UPDATE agent_execution_attempts
+           SET status = 'queued', started_at = NULL, next_retry_at = NULL
+           WHERE execution_id = ? AND attempt_seq = ? AND status = 'running'`,
+        ).run(current.id, operation.attemptSeq);
+        const queued = runtimeExecutionById(database, current.id);
+        appendRuntimeExecutionEvent(database, queued, occurredAt, "agent-busy-deferred");
+        return { kind: "execution", execution: queued };
       }
       const updated = database.prepare(
         `UPDATE agent_executions
@@ -7830,7 +7870,6 @@ export function executeRuntimeAuthorityOperation(
          WHERE execution_id = ? AND state IN ('pending', 'leased')`,
       ).run(occurredAt, operation.executionId);
       const execution = runtimeExecutionById(database, operation.executionId);
-      requireAgentCommandAuthority(database, execution.agentId, execution.roomId);
       appendRuntimeExecutionEvent(database, execution, occurredAt, "started");
       return { kind: "execution", execution };
     }

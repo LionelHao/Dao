@@ -88,7 +88,11 @@ function authority(): RuntimeAuthority & { executions: Map<string, AgentExecutio
     enqueueFenceReplacements: vi.fn(),
     async claim(id, attemptSeq) {
       const value = executions.get(id)!;
-      if (value.currentAttemptSeq !== attemptSeq || value.status !== "queued") throw new AgentRuntimeError("execution_conflict", "stale");
+      if (value.currentAttemptSeq !== attemptSeq ||
+          (value.status !== "queued" && value.status !== "running")) {
+        throw new AgentRuntimeError("execution_conflict", "stale");
+      }
+      if (value.status === "running") return value;
       const running = { ...value, status: "running" as const, startedAt: value.queuedAt };
       executions.set(id, running);
       return running;
@@ -379,6 +383,41 @@ describe("bounded Agent runtime scheduler", () => {
     expect(complete.mock.calls.every((call) => call[2] === "ok" &&
       JSON.stringify(call[3]) === JSON.stringify(["ctx-0001"]))).toBe(true);
     expect([...runtimeAuthority.executions.values()].every((value) => value.status === "completed")).toBe(true);
+  });
+
+  it("keeps one stable Agent in a single lane across Rooms", async () => {
+    const runtimeAuthority = authority();
+    const started: string[] = [];
+    let sawFirst!: () => void;
+    let releaseFirst!: () => void;
+    const firstStarted = new Promise<void>((resolve) => { sawFirst = resolve; });
+    const firstRelease = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      provider: provider(async function* (input) {
+        started.push(input.invocation.sourceMessageId);
+        if (started.length === 1) {
+          sawFirst();
+          await firstRelease;
+        }
+        yield { type: "response_started", sequence: 1 };
+        yield { type: "agent_final", sequence: 2, body: "ok", citations: [] };
+      }),
+      modelId: "fake-model",
+      buildProviderInput: providerInput,
+      limits: { maxActive: 2, maxQueuedPerRoom: 2, maxPartialBytes: 1_024 },
+    });
+    const roomA = { ...intent("room-a", "cross-a"), targetAgentId: "agent-stable" };
+    const roomB = { ...intent("room-b", "cross-b"), targetAgentId: "agent-stable" };
+    await Promise.all([
+      runtime.invoke(context, roomA),
+      runtime.invoke({ ...context, requestId: "cross-b", idempotencyKey: "cross-b" }, roomB),
+    ]);
+    await firstStarted;
+    expect(started).toHaveLength(1);
+    releaseFirst();
+    await runtime.whenIdle();
+    expect(new Set(started)).toEqual(new Set(["cross-a", "cross-b"]));
   });
 
   it("runs different Agents from the same turn concurrently while keeping each Agent FIFO", async () => {
