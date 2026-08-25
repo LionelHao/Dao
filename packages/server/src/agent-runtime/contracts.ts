@@ -8,6 +8,8 @@ import type {
   RoomMemoryVersionProjection,
   ToolConfirmationInput,
   ToolDescriptor,
+  AgentExecutionRetryReceipt,
+  ScopedCancellationReceipt,
 } from "@native-im/core";
 import type { AuthenticatedCommandContext, InternalAgentCommandContext } from "../persistence/contracts.js";
 import type { ScopedCancellationCommitReceipt } from "../scoped-cancellation/scoped-cancellation-orchestrator.js";
@@ -133,7 +135,12 @@ export interface InvocationAccepted {
 
 export interface InvocationAcceptedWithIntent extends InvocationAccepted {
   readonly intent: AgentInvocationIntent;
+  readonly retryReceipt?: AgentExecutionRetryReceipt;
 }
+
+export type InvocationCancellationTarget =
+  | Readonly<{ executionId: string; expectedVersion: number }>
+  | Readonly<{ intentId: string; expectedVersion: number }>;
 
 export interface PreparedToolCall {
   readonly execution: AgentExecution;
@@ -256,8 +263,7 @@ export interface RuntimeAuthority {
   ): Promise<AgentExecution>;
   cancelScoped(
     context: AuthenticatedCommandContext,
-    executionId: string,
-    expectedVersion: number,
+    target: InvocationCancellationTarget,
     producerId: string,
   ): Promise<ScopedCancellationCommitReceipt>;
   retry(
@@ -318,15 +324,14 @@ export interface AgentRuntime {
   ): Promise<AgentExecution>;
   cancelInvocation(
     context: AuthenticatedCommandContext,
-    executionId: string,
-    expectedVersion: number,
-  ): Promise<ScopedCancellationCommitReceipt>;
+    target: InvocationCancellationTarget,
+  ): Promise<ScopedCancellationReceipt>;
   retry(context: AuthenticatedCommandContext, executionId: string): Promise<InvocationAccepted>;
   retryInvocation(
     context: AuthenticatedCommandContext,
     executionId: string,
     expectedVersion: number,
-  ): Promise<InvocationAccepted>;
+  ): Promise<InvocationAcceptedWithIntent & { readonly retryReceipt: AgentExecutionRetryReceipt }>;
   confirmTool(
     context: AuthenticatedCommandContext,
     confirmation: ToolConfirmationInput,

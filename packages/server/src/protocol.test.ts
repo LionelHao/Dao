@@ -602,6 +602,20 @@ describe("closed v2 recovery protocol", () => {
       },
     });
     expect(parse({
+      type: "invocation.cancel",
+      requestId: "cancel-pending-intent",
+      intentId: "intent-pending-1",
+      expectedVersion: 1,
+    })).toEqual({
+      ok: true,
+      frame: {
+        type: "invocation.cancel",
+        requestId: "cancel-pending-intent",
+        intentId: "intent-pending-1",
+        expectedVersion: 1,
+      },
+    });
+    expect(parse({
       type: "invocation.retry",
       requestId: "retry-vnext-1",
       executionId: "execution-1",
@@ -613,6 +627,8 @@ describe("closed v2 recovery protocol", () => {
       { type: "invocation.retry", requestId: "forged-model", executionId: "execution-1", expectedVersion: 4, modelId: "chosen-by-client" },
       { type: "invocation.retry", requestId: "missing-version", executionId: "execution-1" },
       { type: "invocation.cancel", requestId: "zero-version", executionId: "execution-1", expectedVersion: 0 },
+      { type: "invocation.cancel", requestId: "both-targets", executionId: "execution-1", intentId: "intent-1", expectedVersion: 4 },
+      { type: "invocation.cancel", requestId: "no-target", expectedVersion: 4 },
     ]) {
       expect(parse(forged)).toMatchObject({ ok: false, error: { code: "invalid_request" } });
     }

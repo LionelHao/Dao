@@ -25,6 +25,10 @@ const relatedCancellation: ScopedCancellationInput = {
 function committedReceipt(
   overrides: Partial<ScopedCancellationCommitReceipt> = {},
 ): ScopedCancellationCommitReceipt {
+  const fenceId = overrides.fenceId ?? "fence-1";
+  const roomId = overrides.roomId ?? "room-1";
+  const producerId = overrides.producerId ?? "cancel-command-1";
+  const reason = overrides.reason ?? "human_cancelled";
   return {
     kind: "scoped-cancellation-committed",
     fenceId: "fence-1",
@@ -32,6 +36,15 @@ function committedReceipt(
     producerId: "cancel-command-1",
     reason: "human_cancelled",
     replayed: false,
+    receipt: {
+      requestId: producerId, fenceId, roomId, lineageId: "lineage-1",
+      scope: { kind: "execution", executionId: "execution-1", expectedVersion: 4 },
+      reason,
+      intentOutcomes: [{ intentId: "intent-1", outcome: "already_claimed" }],
+      executionOutcomes: [{ executionId: "execution-1", outcome: "cancelled", version: 5 }],
+      rejectedConfirmationIds: ["confirmation-1"], revokedGrantIds: ["grant-1"],
+      preservedDispatchIds: [], committedAt: "2026-08-25T00:00:00.000Z",
+    },
     effects: [{
       sourceMessageId: "source-1",
       sourceRevision: 1,

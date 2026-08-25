@@ -282,10 +282,9 @@ export interface AgentExecutionAttempt {
   readonly nextRetryAt?: string;
 }
 
-export type InvocationCancelCommand = Readonly<{
+type InvocationCancelCommandBase = Readonly<{
   type: "invocation.cancel";
   requestId: string;
-  executionId: string;
   expectedVersion: number;
   reason?: never;
   agentId?: never;
@@ -295,6 +294,10 @@ export type InvocationCancelCommand = Readonly<{
   snapshotId?: never;
   attemptSeq?: never;
 }>;
+
+export type InvocationCancelCommand =
+  | Readonly<InvocationCancelCommandBase & { executionId: string; intentId?: never }>
+  | Readonly<InvocationCancelCommandBase & { intentId: string; executionId?: never }>;
 
 export type InvocationRetryCommand = Readonly<{
   type: "invocation.retry";
@@ -1240,9 +1243,15 @@ export function isAgentExecutionAttempt(value: unknown): value is AgentExecution
 }
 
 export function isInvocationCancelCommand(value: unknown): value is InvocationCancelCommand {
-  return isRecord(value) && hasExactKeys(value, ["type", "requestId", "executionId", "expectedVersion"]) &&
-    value.type === "invocation.cancel" && isNonEmptyString(value.requestId) &&
-    isNonEmptyString(value.executionId) && isPositiveSafeInteger(value.expectedVersion);
+  if (!isRecord(value) || value.type !== "invocation.cancel" ||
+      !isNonEmptyString(value.requestId) || !isPositiveSafeInteger(value.expectedVersion)) return false;
+  const executionTarget = hasExactKeys(value, [
+    "type", "requestId", "executionId", "expectedVersion",
+  ]) && isNonEmptyString(value.executionId);
+  const intentTarget = hasExactKeys(value, [
+    "type", "requestId", "intentId", "expectedVersion",
+  ]) && isNonEmptyString(value.intentId);
+  return executionTarget !== intentTarget;
 }
 
 export function isInvocationRetryCommand(value: unknown): value is InvocationRetryCommand {

@@ -2935,14 +2935,15 @@ async function handleFrame(
         requestId: frame.requestId,
         idempotencyKey: frame.type === "agent.tool.confirm"
             ? `${frame.type}:${frame.confirmation.confirmationId}`
-            : `${frame.type}:${frame.executionId}`,
+            : `${frame.type}:${"executionId" in frame ? frame.executionId : frame.intentId}`,
       };
       try {
         if (frame.type === "invocation.cancel") {
           const receipt = await options.agentRuntime.cancelInvocation(
             commandContext,
-            frame.executionId,
-            frame.expectedVersion,
+            "executionId" in frame
+              ? { executionId: frame.executionId, expectedVersion: frame.expectedVersion }
+              : { intentId: frame.intentId, expectedVersion: frame.expectedVersion },
           );
           sendFrame(socket, {
             type: "invocation.cancel.ack",
@@ -2958,7 +2959,7 @@ async function handleFrame(
           sendFrame(socket, {
             type: "invocation.retry.ack",
             requestId: frame.requestId,
-            execution: accepted.execution,
+            receipt: accepted.retryReceipt,
             replayed: accepted.replayed,
           });
         } else if (frame.type === "agent.tool.confirm") {

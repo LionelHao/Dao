@@ -185,6 +185,18 @@ const cancelWithAgent = {
 // @ts-expect-error Public cancellation cannot select an Agent identity.
 const invalidPublicCancelAgent: InvocationCancelCommand = cancelWithAgent;
 
+const pendingIntentCancel: InvocationCancelCommand = {
+  type: "invocation.cancel", requestId: "request-pending", intentId: "intent-pending",
+  expectedVersion: 1,
+};
+
+const cancelWithBothTargets = {
+  type: "invocation.cancel" as const, requestId: "request-both", intentId: "intent-1",
+  executionId: "execution-1", expectedVersion: 1,
+};
+// @ts-expect-error Public cancellation must select exactly one closed target.
+const invalidPublicCancelTargets: InvocationCancelCommand = cancelWithBothTargets;
+
 const projectBoundaryRequest: ProjectBoundaryInvocationRequest = {
   purpose: "project_boundary_invocation", boundaryId: "boundary-1", boundaryKind: "checkpoint",
   projectId: "room-1", roomId: "room-1", agentId: "agent-1",
@@ -227,6 +239,8 @@ void canonicalExecution;
 void invalidClientSelectedOrigin;
 void invalidPublicCancelReason;
 void invalidPublicCancelAgent;
+void pendingIntentCancel;
+void invalidPublicCancelTargets;
 void projectBoundaryRequest;
 void invalidPublicProjectBoundary;
 void invalidInternalCancel;

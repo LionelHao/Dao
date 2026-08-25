@@ -1,3 +1,8 @@
+import {
+  isScopedCancellationReceipt,
+  type ScopedCancellationReceipt,
+} from "@native-im/core";
+
 /**
  * Server-private FT-08 cancellation coordination.
  *
@@ -84,7 +89,7 @@ export type ScopedCancellationTrigger =
 export type ScopedCancellationInput =
   | Readonly<{
       kind: "related-cancellation";
-      roomId: string;
+      roomId?: string;
       producerId: string;
       target: ScopedCancellationTarget;
       trigger: ScopedCancellationTrigger;
@@ -96,7 +101,7 @@ export type ScopedCancellationInput =
     }>;
 
 export interface ScopedCancellationAuthorityRequest {
-  readonly roomId: string;
+  readonly roomId?: string;
   readonly producerId: string;
   readonly target: ScopedCancellationTarget;
   readonly trigger: ScopedCancellationTrigger;
@@ -142,6 +147,7 @@ export interface ScopedCancellationCommitReceipt {
   readonly producerId: string;
   readonly reason: ScopedCancellationReason;
   readonly replayed: boolean;
+  readonly receipt: ScopedCancellationReceipt;
   readonly effects: readonly ScopedCancellationCommitEffect[];
 }
 
@@ -324,8 +330,8 @@ function validInput(value: unknown): value is ScopedCancellationInput {
       identifier(value.roomId) && identifier(value.messageId);
   }
   if (value.kind !== "related-cancellation" ||
-      !exact(value, ["kind", "roomId", "producerId", "target", "trigger"]) ||
-      !identifier(value.roomId) || !identifier(value.producerId) ||
+      !exact(value, ["kind", "producerId", "target", "trigger"], ["roomId"]) ||
+      (value.roomId !== undefined && !identifier(value.roomId)) || !identifier(value.producerId) ||
       !validTarget(value.target) || !validTrigger(value.trigger)) {
     return false;
   }
@@ -378,10 +384,14 @@ function validReceipt(
   request: ScopedCancellationAuthorityRequest,
 ): value is ScopedCancellationCommitReceipt {
   if (!record(value) || !exact(value, [
-    "kind", "fenceId", "roomId", "producerId", "reason", "replayed", "effects",
+    "kind", "fenceId", "roomId", "producerId", "reason", "replayed", "receipt", "effects",
   ]) || value.kind !== "scoped-cancellation-committed" || !identifier(value.fenceId) ||
-      value.roomId !== request.roomId || value.producerId !== request.producerId ||
+      (request.roomId !== undefined && value.roomId !== request.roomId) ||
+      value.producerId !== request.producerId ||
       value.reason !== request.reason || typeof value.replayed !== "boolean" ||
+      !isScopedCancellationReceipt(value.receipt) || value.receipt.fenceId !== value.fenceId ||
+      value.receipt.roomId !== value.roomId || value.receipt.requestId !== value.producerId ||
+      value.receipt.reason !== value.reason ||
       !Array.isArray(value.effects) || value.effects.length > MAX_CANCELLATION_EFFECTS ||
       !value.effects.every(validEffect)) {
     return false;
@@ -434,7 +444,7 @@ export function createScopedCancellationOrchestrator(
       }
 
       const request: ScopedCancellationAuthorityRequest = {
-        roomId: input.roomId,
+        ...(input.roomId === undefined ? {} : { roomId: input.roomId }),
         producerId: input.producerId,
         target: input.target,
         trigger: input.trigger,

@@ -147,6 +147,13 @@ describe("canonical collaboration records", () => {
       type: "invocation.cancel", requestId: "request-1", executionId: "execution-1", expectedVersion: 3,
     })).toBe(true);
     expect(isInvocationCancelCommand({
+      type: "invocation.cancel", requestId: "request-intent", intentId: "intent-pending", expectedVersion: 1,
+    })).toBe(true);
+    expect(isInvocationCancelCommand({
+      type: "invocation.cancel", requestId: "request-both", executionId: "execution-1",
+      intentId: "intent-1", expectedVersion: 3,
+    })).toBe(false);
+    expect(isInvocationCancelCommand({
       type: "invocation.cancel", requestId: "request-1", executionId: "execution-1", expectedVersion: 3,
       reason: "free text",
     })).toBe(false);

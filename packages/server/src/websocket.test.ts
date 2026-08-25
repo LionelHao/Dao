@@ -5709,12 +5709,22 @@ describe("closed FT-02B/FT-02C WebSocket governance", () => {
     const interrupt = vi.fn();
     const retry = vi.fn();
     const cancelInvocation = vi.fn(async () => ({
-      kind: "scoped-cancellation-committed" as const,
-      fenceId: "fence-vnext", roomId, producerId: "cancel-vnext",
-      reason: "human_cancelled" as const, replayed: false, effects: [],
+      requestId: "cancel-vnext", fenceId: "fence-vnext", roomId, lineageId: "lineage-1",
+      scope: { kind: "execution" as const, executionId: "execution-1", expectedVersion: 7 },
+      reason: "human_cancelled" as const,
+      intentOutcomes: [{ intentId: "intent-1", outcome: "already_claimed" as const }],
+      executionOutcomes: [{ executionId: "execution-1", outcome: "cancelled" as const, version: 8 }],
+      rejectedConfirmationIds: [], revokedGrantIds: [], preservedDispatchIds: [],
+      committedAt: "2026-08-25T00:00:00.000Z",
     }));
     const retryInvocation = vi.fn(async () => ({
-      execution: { id: "execution-child" }, replayed: false,
+      execution: { id: "execution-child" }, intent: {}, replayed: false,
+      retryReceipt: {
+        requestId: "retry-vnext", sourceExecutionId: "execution-1",
+        executionId: "execution-child", intentId: "intent-1", lineageId: "lineage-1",
+        roomId, executionOrdinal: 2, snapshotId: "snapshot-1", status: "accepted" as const,
+        createdAt: "2026-08-25T00:00:01.000Z",
+      },
     }));
     const server = await startMessageWebSocketServer({
       auth: governanceAuthenticationService(),
@@ -5741,24 +5751,62 @@ describe("closed FT-02B/FT-02C WebSocket governance", () => {
         type: "invocation.cancel", requestId: "cancel-vnext",
         executionId: "execution-1", expectedVersion: 7,
       });
-      await client.waitForFrame(
+      const cancelAck = await client.waitForFrame(
         (frame) => hasType(frame, "invocation.cancel.ack") && frame.requestId === "cancel-vnext",
         "vNext cancellation acknowledgement",
       );
+      expect(cancelAck.frame).toEqual({
+        type: "invocation.cancel.ack",
+        requestId: "cancel-vnext",
+        receipt: await cancelInvocation.mock.results[0]!.value,
+      });
+      expect(JSON.stringify(cancelAck.frame)).not.toContain('"queued"');
       expect(cancelInvocation).toHaveBeenCalledWith(
         expect.objectContaining({ requestId: "cancel-vnext", kind: "human" }),
-        "execution-1",
-        7,
+        { executionId: "execution-1", expectedVersion: 7 },
+      );
+
+      cancelInvocation.mockResolvedValueOnce({
+        requestId: "cancel-pending", fenceId: "fence-pending", roomId,
+        lineageId: "lineage-pending",
+        scope: { kind: "intent", intentId: "intent-pending", expectedVersion: 1 },
+        reason: "human_cancelled", intentOutcomes: [
+          { intentId: "intent-pending", outcome: "cancelled" },
+        ],
+        executionOutcomes: [], rejectedConfirmationIds: [], revokedGrantIds: [],
+        preservedDispatchIds: [], committedAt: "2026-08-25T00:00:00.500Z",
+      });
+      client.send({
+        type: "invocation.cancel", requestId: "cancel-pending",
+        intentId: "intent-pending", expectedVersion: 1,
+      });
+      await expect(client.waitForFrame(
+        (frame) => hasType(frame, "invocation.cancel.ack") && frame.requestId === "cancel-pending",
+        "vNext pending intent cancellation acknowledgement",
+      )).resolves.toMatchObject({ frame: {
+        type: "invocation.cancel.ack", requestId: "cancel-pending",
+        receipt: { scope: { kind: "intent", intentId: "intent-pending", expectedVersion: 1 } },
+      } });
+      expect(cancelInvocation).toHaveBeenLastCalledWith(
+        expect.objectContaining({ requestId: "cancel-pending", kind: "human" }),
+        { intentId: "intent-pending", expectedVersion: 1 },
       );
 
       client.send({
         type: "invocation.retry", requestId: "retry-vnext",
         executionId: "execution-1", expectedVersion: 8,
       });
-      await client.waitForFrame(
+      const retryAck = await client.waitForFrame(
         (frame) => hasType(frame, "invocation.retry.ack") && frame.requestId === "retry-vnext",
         "vNext retry acknowledgement",
       );
+      expect(retryAck.frame).toEqual({
+        type: "invocation.retry.ack",
+        requestId: "retry-vnext",
+        receipt: await retryInvocation.mock.results[0]!.value.then((value) => value.retryReceipt),
+        replayed: false,
+      });
+      expect(JSON.stringify(retryAck.frame)).not.toContain('"queued"');
       expect(retryInvocation).toHaveBeenCalledWith(
         expect.objectContaining({ requestId: "retry-vnext", kind: "human" }),
         "execution-1",

@@ -26,6 +26,8 @@ import {
   type ToolAdapter,
 } from "./contracts.js";
 import type { ToolGateway } from "./tool-gateway.js";
+import { createScopedCancellationOrchestrator } from
+  "../scoped-cancellation/scoped-cancellation-orchestrator.js";
 
 interface RuntimeLimits {
   readonly maxActive: number;
@@ -843,40 +845,60 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
       signalIdle();
       return cancelled;
     },
-    async cancelInvocation(context, executionId, expectedVersion) {
+    async cancelInvocation(context, target) {
       if (closed) throw new AgentRuntimeError("agent_runtime_closed", "Agent runtime is closed");
-      const receipt = await options.authority.cancelScoped(
-        context,
-        executionId,
-        expectedVersion,
-        context.requestId,
-      );
-      for (const effect of receipt.effects) {
-        if (effect.disposition !== "execution_cancelled" ||
-            effect.executionId === undefined || effect.attemptSeq === undefined) continue;
-        removeQueuedJob(effect.executionId);
-        controllers.get(effect.executionId)?.abort("human_cancelled");
-        for (const [confirmationId, pending] of pendingConfirmations) {
-          if (pending.job.execution.id === effect.executionId) {
-            pendingConfirmations.delete(confirmationId);
+      const orchestrator = createScopedCancellationOrchestrator({
+        authority: {
+          commitScopedCancellation: () => options.authority.cancelScoped(
+            context, target, context.requestId,
+          ),
+        },
+        queue: {
+          removeAfterCommittedCancellation(effect) {
+            removeQueuedJob(effect.executionId!);
+            for (const [confirmationId, pending] of pendingConfirmations) {
+              if (pending.job.execution.id === effect.executionId) {
+                pendingConfirmations.delete(confirmationId);
+              }
+            }
+            const job = jobsByExecution.get(effect.executionId!);
+            if (job !== undefined && !controllers.has(effect.executionId!)) {
+              releaseAdmission(job);
+              jobsByExecution.delete(effect.executionId!);
+            }
+          },
+        },
+        controllers: {
+          abortAfterCommittedCancellation(effect) {
+            controllers.get(effect.executionId!)?.abort("human_cancelled");
+          },
+        },
+        preview: {
+          resetAfterCommittedCancellation(effect) {
+            options.resetPreview?.({
+              roomId: effect.roomId,
+              executionId: effect.executionId,
+              attemptSeq: effect.attemptSeq,
+              reason: "human_cancelled",
+            });
           }
-        }
-        const job = jobsByExecution.get(effect.executionId);
-        if (job !== undefined && !controllers.has(effect.executionId)) releaseAdmission(job);
-        jobsByExecution.delete(effect.executionId);
-        try {
-          options.resetPreview?.({
-            roomId: receipt.roomId,
-            executionId: effect.executionId,
-            attemptSeq: effect.attemptSeq,
-            reason: "human_cancelled",
-          });
-        } catch {
-          // The durable cancellation is authoritative; transient reset recovers on reconnect/repair.
-        }
+        },
+      });
+      const result = await orchestrator.handle({
+        kind: "related-cancellation",
+        producerId: context.requestId,
+        target: "executionId" in target
+          ? { kind: "execution", executionId: target.executionId,
+              expectedVersion: target.expectedVersion }
+          : { kind: "intent", invocationIntentId: target.intentId,
+              expectedVersion: target.expectedVersion },
+        trigger: { kind: "explicit-cancel", controllerPrincipalId: context.principal.actorId },
+      });
+      if (result.kind !== "scoped-cancellation-applied") {
+        throw new AgentRuntimeError("execution_conflict", "Cancellation was not related");
       }
       signalIdle();
-      return receipt;
+      return result.receipt.receipt;
     },
     async retry(context, executionId) {
       if (closed) throw new AgentRuntimeError("agent_runtime_closed", "Agent runtime is closed");
@@ -902,8 +924,13 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         throw new AgentRuntimeError("agent_configuration_missing", "Agent model authentication is not configured");
       }
       const accepted = await options.authority.retry(context, executionId, expectedVersion);
+      if (accepted.retryReceipt === undefined) {
+        throw new AgentRuntimeError("provider_failure", "Canonical Human retry receipt was unavailable");
+      }
       const prior = jobsByExecution.get(executionId);
-      if (accepted.replayed && prior !== undefined) return accepted;
+      if (accepted.replayed && prior !== undefined) {
+        return { ...accepted, retryReceipt: accepted.retryReceipt };
+      }
       const job: RuntimeJob = {
         execution: accepted.execution,
         intent: prior?.intent ?? accepted.intent,
@@ -912,7 +939,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         sideEffectDispatched: false,
       };
       enqueueCommitted(job);
-      return accepted;
+      return { ...accepted, retryReceipt: accepted.retryReceipt };
     },
     async confirmTool(context: AuthenticatedCommandContext, confirmation: ToolConfirmationInput) {
       let pending = pendingConfirmations.get(confirmation.confirmationId);

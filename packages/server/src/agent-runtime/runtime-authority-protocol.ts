@@ -10,9 +10,11 @@ import {
   type ProjectBoundaryInvocationResult,
   type ToolConfirmationInput,
   type ToolDescriptor,
+  type AgentExecutionRetryReceipt,
 } from "@native-im/core";
 import type {
   AgentRuntimeErrorCode,
+  InvocationCancellationTarget,
   RuntimeRecoveryRecord,
 } from "./contracts.js";
 import type {
@@ -109,8 +111,7 @@ export type RuntimeAuthorityOperation =
   | {
       readonly type: "runtime.cancel-scoped";
       readonly context: AuthenticatedCommandContext;
-      readonly executionId: string;
-      readonly expectedVersion: number;
+      readonly target: InvocationCancellationTarget;
       readonly producerId: string;
       readonly now: number;
     }
@@ -231,6 +232,7 @@ export type RuntimeAuthorityOperationResult =
       readonly execution: AgentExecution;
       readonly intent: AgentInvocationIntent;
       readonly replayed: boolean;
+      readonly retryReceipt?: AgentExecutionRetryReceipt;
     }
   | {
       readonly kind: "direct-intent-claims";
@@ -448,9 +450,13 @@ export function isRuntimeAuthorityOperation(value: unknown): value is RuntimeAut
   }
   if (value.type === "runtime.cancel-scoped") {
     return exact(value, [
-      "type", "context", "executionId", "expectedVersion", "producerId", "now",
-    ]) && humanContext(value.context) && text(value.executionId) &&
-      count(value.expectedVersion, 1) && text(value.producerId) && count(value.now);
+      "type", "context", "target", "producerId", "now",
+    ]) && humanContext(value.context) && record(value.target) &&
+      ((exact(value.target, ["executionId", "expectedVersion"]) &&
+        text(value.target.executionId) && count(value.target.expectedVersion, 1)) ||
+       (exact(value.target, ["intentId", "expectedVersion"]) &&
+        text(value.target.intentId) && count(value.target.expectedVersion, 1))) &&
+      text(value.producerId) && count(value.now);
   }
   if (value.type === "runtime.begin-compensation") {
     return exact(value, ["type", "context", "executionId", "newExecutionId", "grantId", "dispatchId", "now"]) &&

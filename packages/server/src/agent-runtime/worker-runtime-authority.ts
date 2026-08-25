@@ -4,6 +4,8 @@ import {
   isRoomMemoryProjection,
   isRoomMemoryRawDeltaPage,
   isRoomMemoryStatus,
+  isAgentExecutionRetryReceipt,
+  isScopedCancellationReceipt,
   type LegacyAgentExecution as AgentExecution,
   type LegacyAgentInvocationIntent as AgentInvocationIntent,
 } from "@native-im/core";
@@ -84,7 +86,15 @@ function invocationResult(value: unknown): InvocationAcceptedWithIntent {
       value.intent.targetAgentId !== value.execution.agentId) {
     throw new AgentRuntimeError("provider_failure", "Authority invocation result was malformed");
   }
-  return { execution: value.execution, intent: value.intent, replayed: value.replayed };
+  if (value.retryReceipt !== undefined && !isAgentExecutionRetryReceipt(value.retryReceipt)) {
+    throw new AgentRuntimeError("provider_failure", "Authority retry receipt was malformed");
+  }
+  return {
+    execution: value.execution,
+    intent: value.intent,
+    replayed: value.replayed,
+    ...(value.retryReceipt === undefined ? {} : { retryReceipt: value.retryReceipt }),
+  };
 }
 
 function fenceReplacementResult(
@@ -102,14 +112,17 @@ function scopedCancellationResult(value: unknown): ScopedCancellationCommitRecei
   if (!record(value) || value.kind !== "scoped-cancellation-committed" ||
       typeof value.fenceId !== "string" || typeof value.roomId !== "string" ||
       typeof value.producerId !== "string" || value.reason !== "human_cancelled" ||
-      typeof value.replayed !== "boolean" || !Array.isArray(value.effects) ||
+      typeof value.replayed !== "boolean" || !isScopedCancellationReceipt(value.receipt) ||
+      value.receipt.fenceId !== value.fenceId || value.receipt.roomId !== value.roomId ||
+      value.receipt.requestId !== value.producerId || !Array.isArray(value.effects) ||
       !value.effects.every((effect) => record(effect) &&
         typeof effect.sourceMessageId === "string" &&
         typeof effect.sourceRevision === "number" &&
         typeof effect.invocationIntentId === "string" &&
-        typeof effect.executionId === "string" &&
-        typeof effect.attemptSeq === "number" &&
-        (effect.disposition === "execution_cancelled" || effect.disposition === "already_terminal") &&
+        ((effect.disposition === "intent_cancelled" && effect.executionId === undefined &&
+          effect.attemptSeq === undefined) ||
+         ((effect.disposition === "execution_cancelled" || effect.disposition === "already_terminal") &&
+          typeof effect.executionId === "string" && typeof effect.attemptSeq === "number")) &&
         (effect.confirmationDisposition === "none" ||
           effect.confirmationDisposition === "pending_rejected" ||
           effect.confirmationDisposition === "confirmed_retained") &&
@@ -348,12 +361,11 @@ export function createWorkerRuntimeAuthority(
         now: Date.now(),
       }));
     },
-    async cancelScoped(context, executionId, expectedVersion, producerId) {
+    async cancelScoped(context, target, producerId) {
       return scopedCancellationResult(await execute({
         type: "runtime.cancel-scoped",
         context,
-        executionId,
-        expectedVersion,
+        target,
         producerId,
         now: Date.now(),
       }));

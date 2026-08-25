@@ -37,6 +37,8 @@ import {
   type AttachmentSourceEligibility,
   type RoomMemoryRequest,
   type RoomMemorySuccessFrame,
+  type ScopedCancellationReceipt,
+  type AgentExecutionRetryReceipt,
 } from "@native-im/core";
 import {
   parseAttachmentClientFrame,
@@ -57,7 +59,6 @@ import {
 } from "./persistence/contracts.js";
 import type { MessageErrorCode } from "./service.js";
 import type { MessageStoreErrorCode } from "./store.js";
-import type { ScopedCancellationCommitReceipt } from "./scoped-cancellation/scoped-cancellation-orchestrator.js";
 import {
   isFt07AgentSettingsFrameType,
   parseFt07AgentSettingsClientFrame,
@@ -122,6 +123,9 @@ const AGENT_INTENT_FIELDS = new Set(["kind", "roomId", "sourceMessageId", "targe
 const AGENT_CONTROL_FIELDS = new Set(["type", "requestId", "executionId"]);
 const INVOCATION_CONTROL_FIELDS = new Set([
   "type", "requestId", "executionId", "expectedVersion",
+]);
+const INVOCATION_CANCEL_INTENT_FIELDS = new Set([
+  "type", "requestId", "intentId", "expectedVersion",
 ]);
 const AGENT_INTERRUPT_FIELDS = new Set(["type", "requestId", "executionId", "reason"]);
 const AGENT_CONFIRM_FIELDS = new Set(["type", "requestId", "confirmation"]);
@@ -372,12 +376,19 @@ export interface AgentRetryFrame {
   readonly executionId: string;
 }
 
-export interface InvocationCancelFrame {
-  readonly type: "invocation.cancel";
-  readonly requestId: string;
-  readonly executionId: string;
-  readonly expectedVersion: number;
-}
+export type InvocationCancelFrame =
+  | Readonly<{
+      type: "invocation.cancel";
+      requestId: string;
+      executionId: string;
+      expectedVersion: number;
+    }>
+  | Readonly<{
+      type: "invocation.cancel";
+      requestId: string;
+      intentId: string;
+      expectedVersion: number;
+    }>;
 
 export interface InvocationRetryFrame {
   readonly type: "invocation.retry";
@@ -682,13 +693,13 @@ export interface AgentExecutionPreviewResetFrame {
 export interface InvocationCancelAckFrame {
   readonly type: "invocation.cancel.ack";
   readonly requestId: string;
-  readonly receipt: ScopedCancellationCommitReceipt;
+  readonly receipt: ScopedCancellationReceipt;
 }
 
 export interface InvocationRetryAckFrame {
   readonly type: "invocation.retry.ack";
   readonly requestId: string;
-  readonly execution: AgentExecution;
+  readonly receipt: AgentExecutionRetryReceipt;
   readonly replayed: boolean;
 }
 
@@ -1689,6 +1700,36 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
       }
       return { ok: true, frame: { type: "agent.retry", requestId, executionId: value.executionId } };
     case "invocation.cancel":
+      if (requestId === undefined || !isPositiveSafeInteger(value.expectedVersion)) {
+        return {
+          ok: false,
+          error: protocolError(
+            "invocation.cancel requires exactly one of executionId or intentId and positive expectedVersion",
+            requestId,
+          ),
+        };
+      }
+      if (hasOnlyFields(value, INVOCATION_CONTROL_FIELDS) &&
+          isBoundedString(value.executionId, PROTOCOL_FIELD_LIMITS.messageId)) {
+        return { ok: true, frame: {
+          type: "invocation.cancel", requestId, executionId: value.executionId,
+          expectedVersion: value.expectedVersion,
+        } };
+      }
+      if (hasOnlyFields(value, INVOCATION_CANCEL_INTENT_FIELDS) &&
+          isBoundedString(value.intentId, PROTOCOL_FIELD_LIMITS.messageId)) {
+        return { ok: true, frame: {
+          type: "invocation.cancel", requestId, intentId: value.intentId,
+          expectedVersion: value.expectedVersion,
+        } };
+      }
+      return {
+        ok: false,
+        error: protocolError(
+          "invocation.cancel requires exactly one of executionId or intentId and positive expectedVersion",
+          requestId,
+        ),
+      };
     case "invocation.retry":
       if (!hasOnlyFields(value, INVOCATION_CONTROL_FIELDS) || requestId === undefined ||
           !isBoundedString(value.executionId, PROTOCOL_FIELD_LIMITS.messageId) ||
@@ -1696,7 +1737,7 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
         return {
           ok: false,
           error: protocolError(
-            `${value.type} requires executionId and positive expectedVersion`,
+            "invocation.retry requires executionId and positive expectedVersion",
             requestId,
           ),
         };
@@ -1704,7 +1745,7 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
       return {
         ok: true,
         frame: {
-          type: value.type,
+          type: "invocation.retry",
           requestId,
           executionId: value.executionId,
           expectedVersion: value.expectedVersion,
