@@ -395,11 +395,20 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         throw new AgentRuntimeError("execution_conflict", "Agent job was cancelled");
       }
       timeout = setTimeout(() => {
-        timeoutSettlement = persistFailure(
-          job,
-          claimed,
-          new AgentRuntimeError("provider_timeout", "Provider attempt timed out"),
-        );
+        timeoutSettlement = (async () => {
+          while (true) {
+            try {
+              return await persistFailure(
+                job,
+                claimed,
+                new AgentRuntimeError("provider_timeout", "Provider attempt timed out"),
+              );
+            } catch (error: unknown) {
+              if (jobController.signal.aborted) throw error;
+              await clock.wait(1_000, jobController.signal);
+            }
+          }
+        })();
         void timeoutSettlement.then(
           () => {
             attemptController.abort("provider_timeout");

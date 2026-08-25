@@ -575,18 +575,30 @@ describe("bounded Agent runtime scheduler", () => {
     });
   });
 
-  it("does not abort a timed-out Provider when the authority transition was not persisted", async () => {
+  it("keeps a timed-out Provider live until a failed authority transition is retried and committed", async () => {
     const runtimeAuthority = authority();
-    runtimeAuthority.scheduleRetry = vi.fn(async () => {
-      throw new AgentRuntimeError("context_storage_unavailable", "authority unavailable");
+    const originalScheduleRetry = runtimeAuthority.scheduleRetry.bind(runtimeAuthority);
+    let persistenceCalls = 0;
+    runtimeAuthority.scheduleRetry = vi.fn(async (...args) => {
+      persistenceCalls += 1;
+      if (persistenceCalls === 1) {
+        throw new AgentRuntimeError("context_storage_unavailable", "authority unavailable");
+      }
+      return originalScheduleRetry(...args);
     });
-    let providerAborted = false;
+    const ordering: string[] = [];
+    const waits: number[] = [];
+    let dispatches = 0;
     const runtime = createAgentRuntimeService({
       authority: runtimeAuthority,
       provider: provider(async function* (_input, signal) {
-        signal.addEventListener("abort", () => { providerAborted = true; }, { once: true });
-        await new Promise<void>(() => undefined);
-        yield { type: "completed", sequence: 1 };
+        dispatches += 1;
+        if (dispatches === 1) {
+          signal.addEventListener("abort", () => { ordering.push("abort"); }, { once: true });
+          await new Promise<void>(() => undefined);
+        }
+        yield { type: "response_started", sequence: 1 };
+        yield { type: "agent_final", sequence: 2, body: "recovered", citations: [] };
       }),
       modelId: "fake-model",
       async buildProviderInput(value, invocationValue) {
@@ -595,14 +607,19 @@ describe("bounded Agent runtime scheduler", () => {
           limits: { ...(await providerInput(value, invocationValue)).limits, timeoutMs: 10 },
         };
       },
+      clock: {
+        now: () => Date.parse("2026-08-17T00:00:00.000Z"),
+        wait: vi.fn(async (milliseconds) => { waits.push(milliseconds); }),
+      },
     });
 
     const accepted = await runtime.invoke(context, intent("room-timeout-storage", "timeout-storage"));
     await runtime.whenIdle();
 
-    expect(providerAborted).toBe(false);
-    expect(runtimeAuthority.executions.get(accepted.execution.id)).toMatchObject({ status: "running" });
-    expect(runtimeAuthority.scheduleRetry).toHaveBeenCalled();
+    expect(ordering).toEqual(["abort"]);
+    expect(waits).toEqual([1_000, 1_000]);
+    expect(runtimeAuthority.scheduleRetry).toHaveBeenCalledTimes(2);
+    expect(runtimeAuthority.executions.get(accepted.execution.id)).toMatchObject({ status: "completed" });
   });
 
   it("rejects duplicate citation labels and mixed preview/final output before authority commit", async () => {
