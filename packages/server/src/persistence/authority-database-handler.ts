@@ -6944,6 +6944,61 @@ export function executeRuntimeAuthorityOperation(
       appendRuntimeExecutionEvent(database, execution, occurredAt, "queued");
       return { kind: "human-fence-replacements", executions: [execution], replayed: false };
     }
+    if (operation.type === "runtime.preview-authorize") {
+      const actorId = requireHumanSession(database, operation.context, operation.now);
+      const authority = database.prepare(
+        `SELECT room.status AS roomStatus,
+                room.archive_generation AS archiveGeneration,
+                membership.access_revision AS membershipAccessRevision,
+                COALESCE(access.access_revision, 0) AS roomAccessRevision,
+                COALESCE(access.lease_generation, 0) AS leaseGeneration,
+                execution.room_id AS executionRoomId,
+                execution.status AS executionStatus,
+                execution.current_attempt_seq AS currentAttemptSeq,
+                attempt.status AS attemptStatus
+         FROM rooms AS room
+         JOIN room_memberships AS membership
+           ON membership.room_id = room.id
+          AND membership.actor_id = ? AND membership.kind = 'human'
+         LEFT JOIN room_access_authority AS access ON access.room_id = room.id
+         LEFT JOIN agent_executions AS execution
+           ON execution.id = ? AND execution.room_id = room.id
+         LEFT JOIN agent_execution_attempts AS attempt
+           ON attempt.execution_id = execution.id AND attempt.attempt_seq = ?
+         WHERE room.id = ?`,
+      ).get(actorId, operation.executionId, operation.attemptSeq, operation.roomId);
+      const epoch = createHash("sha256").update(canonicalJson({
+        sessionId: operation.context.sessionId,
+        sessionFamilyId: operation.context.sessionFamilyId,
+        actorId,
+        roomId: operation.roomId,
+        archiveGeneration: authority?.archiveGeneration ?? -1,
+        membershipAccessRevision: authority?.membershipAccessRevision ?? -1,
+        roomAccessRevision: authority?.roomAccessRevision ?? -1,
+        leaseGeneration: authority?.leaseGeneration ?? -1,
+      })).digest("base64url");
+      const hasCurrentAccess = authority?.roomStatus === "active" &&
+        typeof authority.membershipAccessRevision === "number";
+      const executionAndAttemptMatch = authority?.executionRoomId === operation.roomId &&
+        typeof authority.currentAttemptSeq === "number" &&
+        typeof authority.attemptStatus === "string";
+      const currentAttemptSeq = typeof authority?.currentAttemptSeq === "number"
+        ? authority.currentAttemptSeq : undefined;
+      const lifecycleAllowsDelivery = operation.deliveryKind === "preview"
+        ? authority?.executionStatus === "running" &&
+          currentAttemptSeq === operation.attemptSeq &&
+          authority.attemptStatus === "running"
+        : executionAndAttemptMatch && currentAttemptSeq !== undefined &&
+          operation.attemptSeq <= currentAttemptSeq;
+      return {
+        kind: "preview-authority",
+        authorized: hasCurrentAccess && executionAndAttemptMatch && lifecycleAllowsDelivery &&
+          (operation.expectedAuthorityEpoch === undefined ||
+            operation.expectedAuthorityEpoch === epoch),
+        authorityEpoch: epoch,
+        subscriptionGeneration: operation.subscriptionGeneration,
+      };
+    }
     if (operation.type === "runtime.read-context") {
       const execution = runtimeExecutionById(database, operation.executionId);
       const frozenHandoff = requireRuntimeFrozenHandoff(database, execution.id);

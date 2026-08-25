@@ -739,6 +739,153 @@ afterEach(async () => {
 });
 
 describe("authenticated message WebSocket service", () => {
+  it("publishes transient preview/reset only through the current scoped authority receipt", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "preview-authorized");
+    const auth: AuthenticationService = {
+      async login() { return session; },
+      async authenticate() { return principal; },
+      async authenticateSession() {
+        return { sessionId: session.accessToken, sessionFamilyId: "family-preview", principal };
+      },
+      async refresh() { return session; },
+      async revoke() {},
+    };
+    const authorize = vi.fn(async () => ({ authorized: true, authorityEpoch: "access:1" }));
+    const server = await startMessageWebSocketServer({
+      auth,
+      service: idleMessageService(),
+      outboxStore: idleOutboxStore(),
+      previewAuthority: { authorize },
+    });
+    const client = await LoopbackClient.connect(server.url);
+    try {
+      await client.login(humans[0]);
+      await client.subscribe(roomId);
+      await server.publishAgentPreview({
+        roomId, executionId: "execution-preview-authorized", attemptSeq: 1,
+        streamSeq: 1, delta: "TRANSIENT",
+      });
+      await expect(client.waitForFrame(
+        (frame) => hasType(frame, "agent.execution.preview"),
+        "authorized preview",
+      )).resolves.toMatchObject({ frame: {
+        type: "agent.execution.preview", roomId,
+        executionId: "execution-preview-authorized", attemptSeq: 1,
+        streamSeq: 1, delta: "TRANSIENT", authoritative: false,
+      } });
+      await server.resetAgentPreview({
+        roomId, executionId: "execution-preview-authorized", attemptSeq: 1,
+        reason: "execution_terminal",
+      });
+      await expect(client.waitForFrame(
+        (frame) => hasType(frame, "agent.execution.preview.reset"),
+        "authorized preview reset",
+      )).resolves.toMatchObject({ frame: {
+        type: "agent.execution.preview.reset", roomId,
+        executionId: "execution-preview-authorized", attemptSeq: 1,
+        reason: "execution_terminal", authoritative: false,
+      } });
+      expect(authorize).toHaveBeenNthCalledWith(2, expect.objectContaining({
+        deliveryKind: "reset",
+        expectedAuthorityEpoch: "access:1",
+      }));
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("rechecks preview authority after a committed revoke and emits zero frames", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "preview-revoke");
+    const authorization = deferred<Readonly<{ authorized: boolean; authorityEpoch: string }>>();
+    const authorizationStarted = deferred<void>();
+    const auth: AuthenticationService = {
+      async login() { return session; },
+      async authenticate() { return principal; },
+      async authenticateSession() {
+        return { sessionId: session.accessToken, sessionFamilyId: "family-preview", principal };
+      },
+      async refresh() { return session; },
+      async revoke() {},
+    };
+    const server = await startMessageWebSocketServer({
+      auth,
+      service: idleMessageService(),
+      outboxStore: idleOutboxStore(),
+      previewAuthority: {
+        authorize() {
+          authorizationStarted.resolve();
+          return authorization.promise;
+        },
+      },
+    });
+    const client = await LoopbackClient.connect(server.url);
+    try {
+      await client.login(humans[0]);
+      await client.subscribe(roomId);
+      const delivery = server.publishAgentPreview({
+        roomId, executionId: "execution-preview-revoked", attemptSeq: 1,
+        streamSeq: 1, delta: "MUST-NOT-LEAK",
+      });
+      await authorizationStarted.promise;
+      authorization.resolve({ authorized: false, authorityEpoch: "revoked:2" });
+      await delivery;
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      expect(client.frameCount((frame) => hasType(frame, "agent.execution.preview"))).toBe(0);
+    } finally {
+      authorization.resolve({ authorized: false, authorityEpoch: "revoked:2" });
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("fences an authorized preview result to the captured subscription generation", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "preview-generation");
+    const authorization = deferred<Readonly<{ authorized: boolean; authorityEpoch: string }>>();
+    const authorizationStarted = deferred<void>();
+    const auth: AuthenticationService = {
+      async login() { return session; },
+      async authenticate() { return principal; },
+      async authenticateSession() {
+        return { sessionId: session.accessToken, sessionFamilyId: "family-preview", principal };
+      },
+      async refresh() { return session; },
+      async revoke() {},
+    };
+    const server = await startMessageWebSocketServer({
+      auth,
+      service: idleMessageService(),
+      outboxStore: idleOutboxStore(),
+      previewAuthority: {
+        authorize() {
+          authorizationStarted.resolve();
+          return authorization.promise;
+        },
+      },
+    });
+    const client = await LoopbackClient.connect(server.url);
+    try {
+      await client.login(humans[0]);
+      await client.subscribe(roomId, "subscribe-preview-old");
+      const delivery = server.publishAgentPreview({
+        roomId, executionId: "execution-preview-generation", attemptSeq: 1,
+        streamSeq: 1, delta: "OLD-SUBSCRIPTION",
+      });
+      await authorizationStarted.promise;
+      await client.subscribe(roomId, "subscribe-preview-new");
+      authorization.resolve({ authorized: true, authorityEpoch: "access:1" });
+      await delivery;
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      expect(client.frameCount((frame) => hasType(frame, "agent.execution.preview"))).toBe(0);
+    } finally {
+      authorization.resolve({ authorized: false, authorityEpoch: "closed" });
+      await client.close();
+      await server.close();
+    }
+  });
   it.each([false, true])(
     "revokes an unacknowledged login after post-commit validation fails (cleanup fails: %s)",
     async (cleanupFails) => {

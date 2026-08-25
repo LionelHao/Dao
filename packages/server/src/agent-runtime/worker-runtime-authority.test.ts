@@ -56,6 +56,26 @@ describe("real AuthorityWorker runtime authority", () => {
     expect(isRuntimeAuthorityOperation({
       ...valid, leaseExpiresAt: "2026-08-25T08:05:00.000+08:00",
     })).toBe(false);
+    const preview = {
+      type: "runtime.preview-authorize",
+      context: {
+        sessionId: "session-preview",
+        sessionFamilyId: "family-preview",
+        principal: { accountId: "account-preview", actorId: "human-runtime" },
+      },
+      roomId: "room-preview",
+      executionId: "execution-preview",
+      attemptSeq: 1,
+      deliveryKind: "preview",
+      subscriptionGeneration: 3,
+      now,
+    } as const;
+    expect(isRuntimeAuthorityOperation(preview)).toBe(true);
+    expect(isRuntimeAuthorityOperation({ ...preview, attemptSeq: 0 })).toBe(false);
+    expect(isRuntimeAuthorityOperation({ ...preview, deliveryKind: "durable" })).toBe(false);
+    expect(isRuntimeAuthorityOperation({
+      ...preview, expectedAuthorityEpoch: "",
+    })).toBe(false);
   });
 
   it("allows repeated post-commit recovery generations without re-fencing live running work", async () => {

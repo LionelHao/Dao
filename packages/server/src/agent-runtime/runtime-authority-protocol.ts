@@ -20,6 +20,7 @@ import type {
 import type {
   AgentWorkerCommandContext,
   AuthenticatedCommandContext,
+  AuthenticatedSessionContext,
   JsonValue,
 } from "../persistence/contracts.js";
 import type {
@@ -28,6 +29,17 @@ import type {
 
 export type RuntimeAuthorityOperation =
   | { readonly type: "runtime.read-context"; readonly executionId: string; readonly now: number }
+  | {
+      readonly type: "runtime.preview-authorize";
+      readonly context: AuthenticatedSessionContext;
+      readonly roomId: string;
+      readonly executionId: string;
+      readonly attemptSeq: number;
+      readonly deliveryKind: "preview" | "reset";
+      readonly subscriptionGeneration: number;
+      readonly expectedAuthorityEpoch?: string;
+      readonly now: number;
+    }
   | {
       readonly type: "runtime.read-memory-delta";
       readonly executionId: string;
@@ -243,6 +255,12 @@ export type RuntimeAuthorityOperationResult =
     }
   | { readonly kind: "memory-delta"; readonly rawDelta: RoomMemoryRawDeltaPage }
   | {
+      readonly kind: "preview-authority";
+      readonly authorized: boolean;
+      readonly authorityEpoch: string;
+      readonly subscriptionGeneration: number;
+    }
+  | {
       readonly kind: "invocation";
       readonly execution: AgentExecution;
       readonly intent: AgentInvocationIntent;
@@ -359,6 +377,13 @@ function humanContext(value: unknown): value is AuthenticatedCommandContext {
   return true;
 }
 
+function sessionContext(value: unknown): value is AuthenticatedSessionContext {
+  return record(value) && exact(value, ["sessionId", "sessionFamilyId", "principal"]) &&
+    text(value.sessionId) && text(value.sessionFamilyId) && record(value.principal) &&
+    exact(value.principal, ["accountId", "actorId"]) &&
+    text(value.principal.accountId) && text(value.principal.actorId);
+}
+
 function agentContext(value: unknown): value is AgentWorkerCommandContext {
   return record(value) && exact(value, ["kind", "agent", "requestId", "idempotencyKey"]) && value.kind === "agent" &&
     text(value.requestId) && text(value.idempotencyKey) && record(value.agent) &&
@@ -410,6 +435,19 @@ export function isRuntimeAuthorityOperation(value: unknown): value is RuntimeAut
   if (!record(value) || !text(value.type)) return false;
   if (value.type === "runtime.read-context") {
     return exact(value, ["type", "executionId", "now"]) && text(value.executionId) && count(value.now);
+  }
+  if (value.type === "runtime.preview-authorize") {
+    const optional = Object.hasOwn(value, "expectedAuthorityEpoch")
+      ? ["expectedAuthorityEpoch"] : [];
+    return exact(value, [
+      "type", "context", "roomId", "executionId", "attemptSeq", "deliveryKind",
+      "subscriptionGeneration", "now",
+    ], optional) && sessionContext(value.context) && text(value.roomId) &&
+      text(value.executionId) && count(value.attemptSeq, 1) &&
+      (value.deliveryKind === "preview" || value.deliveryKind === "reset") &&
+      count(value.subscriptionGeneration, 1) &&
+      (!Object.hasOwn(value, "expectedAuthorityEpoch") || text(value.expectedAuthorityEpoch)) &&
+      count(value.now);
   }
   if (value.type === "runtime.read-memory-delta") {
     return exact(value, ["type", "executionId", "cursor", "now"]) &&

@@ -383,6 +383,84 @@ describe("real SQLite human-preemption authority", () => {
     database.close();
   });
 
+  it("atomically authorizes only the current execution attempt and access epoch for preview delivery", () => {
+    const database = fixture();
+    const sourceMessageId = sendAgentSource(database, 90);
+    invoke(database, sourceMessageId, "execution-preview-authority", "agent-1");
+    makeRunning(database, "execution-preview-authority", "model_generation");
+    const context = {
+      sessionId: humanContext.sessionId,
+      sessionFamilyId: humanContext.sessionFamilyId,
+      principal: humanContext.principal,
+    };
+    const first = executeRuntimeAuthorityOperation(database, {
+      type: "runtime.preview-authorize",
+      context,
+      roomId: "room-1",
+      executionId: "execution-preview-authority",
+      attemptSeq: 1,
+      deliveryKind: "preview",
+      subscriptionGeneration: 7,
+      now: t0 + 12_000,
+    });
+    expect(first).toMatchObject({
+      kind: "preview-authority", authorized: true, subscriptionGeneration: 7,
+    });
+    if (first.kind !== "preview-authority") throw new Error("unexpected preview authority result");
+
+    const wrongAttempt = executeRuntimeAuthorityOperation(database, {
+      type: "runtime.preview-authorize",
+      context,
+      roomId: "room-1",
+      executionId: "execution-preview-authority",
+      attemptSeq: 2,
+      deliveryKind: "preview",
+      subscriptionGeneration: 7,
+      expectedAuthorityEpoch: first.authorityEpoch,
+      now: t0 + 12_001,
+    });
+    expect(wrongAttempt).toMatchObject({ kind: "preview-authority", authorized: false });
+
+    database.prepare(
+      `UPDATE room_memberships SET access_revision = access_revision + 1
+       WHERE room_id = 'room-1' AND actor_id = 'human-1'`,
+    ).run();
+    const staleEpoch = executeRuntimeAuthorityOperation(database, {
+      type: "runtime.preview-authorize",
+      context,
+      roomId: "room-1",
+      executionId: "execution-preview-authority",
+      attemptSeq: 1,
+      deliveryKind: "preview",
+      subscriptionGeneration: 7,
+      expectedAuthorityEpoch: first.authorityEpoch,
+      now: t0 + 12_002,
+    });
+    expect(staleEpoch).toMatchObject({ kind: "preview-authority", authorized: false });
+    if (staleEpoch.kind !== "preview-authority") throw new Error("unexpected preview authority result");
+    expect(staleEpoch.authorityEpoch).not.toBe(first.authorityEpoch);
+
+    database.prepare(
+      `UPDATE agent_execution_attempts SET status = 'completed', finished_at = ?
+       WHERE execution_id = 'execution-preview-authority' AND attempt_seq = 1`,
+    ).run(new Date(t0 + 12_003).toISOString());
+    database.prepare(
+      `UPDATE agent_executions SET status = 'completed', completed_at = ?, updated_at = ?
+       WHERE id = 'execution-preview-authority'`,
+    ).run(new Date(t0 + 12_003).toISOString(), new Date(t0 + 12_003).toISOString());
+    const terminalReset = executeRuntimeAuthorityOperation(database, {
+      type: "runtime.preview-authorize",
+      context,
+      roomId: "room-1",
+      executionId: "execution-preview-authority",
+      attemptSeq: 1,
+      deliveryKind: "reset",
+      subscriptionGeneration: 7,
+      expectedAuthorityEpoch: staleEpoch.authorityEpoch,
+      now: t0 + 12_004,
+    });
+    expect(terminalReset).toMatchObject({ kind: "preview-authority", authorized: true });
+  });
   it("drains 257/513/1025 durable recovery candidates by stable 256-row keysets", () => {
     const database = fixture();
     const sourceMessageId = "message-recovery-source";

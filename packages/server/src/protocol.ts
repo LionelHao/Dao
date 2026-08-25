@@ -686,7 +686,8 @@ export interface AgentExecutionPreviewResetFrame {
   readonly roomId: string;
   readonly executionId: string;
   readonly attemptSeq: number;
-  readonly reason: "human_cancelled" | "message_recalled" | "runtime_shutdown" | "repair" | "reconnect";
+  readonly reason: "human_cancelled" | "message_recalled" | "runtime_shutdown" | "repair" | "reconnect" |
+    "execution_terminal" | "attempt_rolled_over" | "access_revoked";
   readonly authoritative: false;
 }
 

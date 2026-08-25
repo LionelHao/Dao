@@ -502,6 +502,7 @@ describe("bounded Agent runtime scheduler", () => {
 
   it("retries only transient failures at 1s and 4s then dead-letters attempt 3", async () => {
     const runtimeAuthority = authority();
+    const resetPreview = vi.fn();
     const waits: number[] = [];
     const clock: RuntimeClock = {
       now: vi.fn(() => Date.parse("2026-08-17T00:00:00.000Z")),
@@ -516,6 +517,7 @@ describe("bounded Agent runtime scheduler", () => {
       modelId: "fake-model",
       buildProviderInput: providerInput,
       clock,
+      resetPreview,
     });
     const accepted = await runtime.invoke(context, intent("room-a", "a-1"));
     await runtime.whenIdle();
@@ -526,6 +528,11 @@ describe("bounded Agent runtime scheduler", () => {
       retryOrdinal: 3,
       terminalErrorCode: "provider_unavailable",
     });
+    expect(resetPreview.mock.calls.map(([reset]) => reset)).toEqual([
+      expect.objectContaining({ attemptSeq: 1, reason: "attempt_rolled_over" }),
+      expect.objectContaining({ attemptSeq: 2, reason: "attempt_rolled_over" }),
+      expect.objectContaining({ attemptSeq: 3, reason: "execution_terminal" }),
+    ]);
   });
 
   it("persists a timeout retry decision before aborting the Provider attempt", async () => {
@@ -696,6 +703,7 @@ describe("bounded Agent runtime scheduler", () => {
   it("sorts distinct provider citations before the authority final boundary", async () => {
     const runtimeAuthority = authority();
     const complete = vi.spyOn(runtimeAuthority, "complete");
+    const resetPreview = vi.fn();
     const runtime = createAgentRuntimeService({
       authority: runtimeAuthority,
       provider: provider(async function* () {
@@ -707,12 +715,16 @@ describe("bounded Agent runtime scheduler", () => {
       }),
       modelId: "fake-model",
       buildProviderInput: providerInput,
+      resetPreview,
     });
     await runtime.invoke(context, intent("room-a", "citation-order"));
     await runtime.whenIdle();
     expect(complete).toHaveBeenCalledWith(
       expect.any(String), 1, "answer", ["ctx-0001", "ctx-0002", "read:z-source"],
     );
+    expect(resetPreview).toHaveBeenCalledWith(expect.objectContaining({
+      roomId: "room-a", attemptSeq: 1, reason: "execution_terminal",
+    }));
   });
 
   it("uses the fixed 1s retry backoff even when a transient error suggests Retry-After", async () => {
@@ -1114,6 +1126,7 @@ describe("bounded Agent runtime scheduler", () => {
     let started!: () => void;
     const sawStart = new Promise<void>((resolve) => { started = resolve; });
     const complete = vi.spyOn(runtimeAuthority, "complete");
+    const resetPreview = vi.fn(() => ordering.push("source-preview-reset"));
     const runtime = createAgentRuntimeService({
       authority: runtimeAuthority,
       provider: provider(async function* (_input, signal) {
@@ -1127,6 +1140,7 @@ describe("bounded Agent runtime scheduler", () => {
       modelId: "fake-model",
       buildProviderInput: providerInput,
       limits: { maxActive: 1, maxQueuedPerRoom: 2, maxPartialBytes: 1_024 },
+      resetPreview,
     });
     const activeSourceMessageId = "message-source-active";
     const queuedSourceMessageId = "message-source-queued";
@@ -1151,8 +1165,14 @@ describe("bounded Agent runtime scheduler", () => {
       }],
     });
     await vi.waitFor(() => {
-      expect(ordering).toEqual(["source-cancel-committed", "source-abort-propagated"]);
+      expect(ordering).toEqual([
+        "source-cancel-committed", "source-preview-reset", "source-abort-propagated",
+      ]);
     });
+    expect(resetPreview).toHaveBeenCalledWith(expect.objectContaining({
+      roomId: "room-a", executionId: active.execution.id, attemptSeq: 1,
+      reason: "message_recalled",
+    }));
     expect(complete).not.toHaveBeenCalled();
     expect(runtimeAuthority.executions.get(queued.execution.id)?.status)
       .toMatch(/queued|running/);
@@ -1582,6 +1602,7 @@ describe("bounded Agent runtime scheduler", () => {
 
   it("bounds shutdown even when a Provider ignores AbortSignal", async () => {
     const runtimeAuthority = authority();
+    const resetPreview = vi.fn();
     let started!: () => void;
     const sawStart = new Promise<void>((resolve) => { started = resolve; });
     const runtime = createAgentRuntimeService({
@@ -1594,6 +1615,7 @@ describe("bounded Agent runtime scheduler", () => {
       modelId: "fake-model",
       buildProviderInput: providerInput,
       shutdownTimeoutMs: 10,
+      resetPreview,
     });
     await runtime.invoke(context, intent("room-close", "close"));
     await sawStart;
@@ -1606,6 +1628,10 @@ describe("bounded Agent runtime scheduler", () => {
       status: "cancelled",
       cancellationReason: "runtime_shutdown",
     });
+    expect(resetPreview).toHaveBeenCalledWith(expect.objectContaining({
+      roomId: "room-close", executionId: "execution-1", attemptSeq: 1,
+      reason: "runtime_shutdown",
+    }));
   });
 
   it("converges shutdown while a timed-out attempt is retrying unavailable authority", async () => {

@@ -64,7 +64,8 @@ export interface AgentRuntimeServiceOptions {
     readonly roomId: string;
     readonly executionId: string;
     readonly attemptSeq: number;
-    readonly reason: "human_cancelled";
+    readonly reason: "human_cancelled" | "message_recalled" | "runtime_shutdown" |
+      "execution_terminal" | "attempt_rolled_over" | "access_revoked";
   }) => void;
   readonly onMessageCommitted?: (execution: AgentExecution) => void;
   readonly proposeOpenItem?: (input: {
@@ -322,6 +323,24 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
     return undefined;
   };
 
+  const resetCommittedPreview = (
+    execution: Pick<AgentExecution, "roomId" | "id" | "currentAttemptSeq">,
+    attemptSeq: number,
+    reason: "message_recalled" | "runtime_shutdown" | "execution_terminal" |
+      "attempt_rolled_over" | "access_revoked",
+  ): void => {
+    try {
+      options.resetPreview?.({
+        roomId: execution.roomId,
+        executionId: execution.id,
+        attemptSeq,
+        reason,
+      });
+    } catch {
+      // A transient post-commit reset cannot alter the authoritative lifecycle.
+    }
+  };
+
   const persistFailure = async (
     job: RuntimeJob,
     claimed: AgentExecution,
@@ -332,6 +351,9 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         claimed.id, claimed.currentAttemptSeq, runtimeError.code, undefined,
       );
       job.execution = next;
+      resetCommittedPreview(next, claimed.currentAttemptSeq,
+        next.currentAttemptSeq > claimed.currentAttemptSeq
+          ? "attempt_rolled_over" : "execution_terminal");
       return { next };
     }
     const configuredRetryDelay = claimed.retryOrdinal < AGENT_RUNTIME_MAX_ATTEMPTS
@@ -345,6 +367,9 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
       claimed.id, claimed.currentAttemptSeq, runtimeError.code, nextRetryAt,
     );
     job.execution = next;
+    resetCommittedPreview(next, claimed.currentAttemptSeq,
+      next.currentAttemptSeq > claimed.currentAttemptSeq
+        ? "attempt_rolled_over" : "execution_terminal");
     return retryDelay === undefined ? { next } : { next, retryDelay };
   };
 
@@ -596,6 +621,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         finalDraft!.body,
         finalDraft!.citations,
       );
+      resetCommittedPreview(completed, claimed.currentAttemptSeq, "execution_terminal");
       try {
         options.onMessageCommitted?.(completed);
       } catch {
@@ -830,6 +856,14 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         }
       }
       for (const cancellation of input.cancellations) {
+        const committedJob = jobsByExecution.get(cancellation.executionId);
+        if (committedJob !== undefined) {
+          resetCommittedPreview(
+            committedJob.execution,
+            cancellation.attemptSeq,
+            "message_recalled",
+          );
+        }
         controllers.get(cancellation.executionId)?.abort("message_recalled");
         removeQueuedJob(cancellation.executionId);
         for (const [confirmationId, pending] of pendingConfirmations) {
@@ -1056,6 +1090,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
           begun.execution.currentAttemptSeq,
           "Compensation completed",
         );
+        resetCommittedPreview(completed, begun.execution.currentAttemptSeq, "execution_terminal");
         try {
           options.onMessageCommitted?.(completed);
         } catch {
@@ -1236,6 +1271,11 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
             );
           }
           job.execution = terminal;
+          resetCommittedPreview(
+            terminal,
+            job.execution.currentAttemptSeq,
+            "runtime_shutdown",
+          );
           durableOverflowJobs.delete(job.execution.id);
           removeQueuedJob(job.execution.id);
           controllers.get(job.execution.id)?.abort("runtime_shutdown");

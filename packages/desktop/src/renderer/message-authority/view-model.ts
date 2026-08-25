@@ -117,6 +117,7 @@ export interface AgentExecutionProjection {
   readonly agentId: string;
   readonly sourceInvocationIntentId: string;
   readonly status: "accepted" | "running" | "completed" | "failed" | "cancelled";
+  readonly currentAttemptSeq?: number;
   readonly failureCode?: string;
 }
 
@@ -578,6 +579,11 @@ function applyExecutionEvent(
     : `Agent执行状态：${input.execution.status}`;
   return withState(state, {
     executions,
+    previews: state.previews.filter((preview) =>
+      preview.executionId !== input.execution.executionId ||
+      ((input.execution.status === "accepted" || input.execution.status === "running") &&
+        (input.execution.currentAttemptSeq === undefined ||
+          preview.attemptSeq >= input.execution.currentAttemptSeq))),
     appliedEventIds: addEvent(state, input.eventId),
     announcement: stateText,
   });

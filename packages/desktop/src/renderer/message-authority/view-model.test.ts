@@ -345,6 +345,61 @@ describe("REQ-MSG-004/005/006/007/008 timeline authority", () => {
     expect(corrected.timeline.map((entry) => entry.messageId))
       .toEqual(["message-source", "message-agent-final", "message-agent-correction"]);
   });
+
+  it("clears a transient preview when the stable execution becomes terminal", () => {
+    const withPreview = applyMessageAuthorityInput(initial(), {
+      type: "agent.preview", executionId: "execution-1", attemptSeq: 2, streamSeq: 3,
+      delta: "STALE", authoritative: false,
+    });
+    const terminal = applyMessageAuthorityInput(withPreview, {
+      type: "execution.projection",
+      eventId: "execution-terminal-1",
+      execution: {
+        executionId: "execution-1",
+        agentId: "agent-search",
+        sourceInvocationIntentId: "invocation-intent-1",
+        status: "completed",
+        currentAttemptSeq: 2,
+      },
+    });
+    expect(terminal.previews).toEqual([]);
+  });
+
+  it("clears only an older-attempt preview when a stable execution rolls over", () => {
+    const withPreview = applyMessageAuthorityInput(initial(), {
+      type: "agent.preview", executionId: "execution-1", attemptSeq: 1, streamSeq: 3,
+      delta: "OLD-ATTEMPT", authoritative: false,
+    });
+    const rolled = applyMessageAuthorityInput(withPreview, {
+      type: "execution.projection",
+      eventId: "execution-rollover-1",
+      execution: {
+        executionId: "execution-1",
+        agentId: "agent-search",
+        sourceInvocationIntentId: "invocation-intent-1",
+        status: "accepted",
+        currentAttemptSeq: 2,
+      },
+    });
+    expect(rolled.previews).toEqual([]);
+
+    const currentPreview = applyMessageAuthorityInput(rolled, {
+      type: "agent.preview", executionId: "execution-1", attemptSeq: 2, streamSeq: 1,
+      delta: "CURRENT", authoritative: false,
+    });
+    const duplicateProjection = applyMessageAuthorityInput(currentPreview, {
+      type: "execution.projection",
+      eventId: "execution-running-2",
+      execution: {
+        executionId: "execution-1",
+        agentId: "agent-search",
+        sourceInvocationIntentId: "invocation-intent-1",
+        status: "running",
+        currentAttemptSeq: 2,
+      },
+    });
+    expect(duplicateProjection.previews).toEqual(currentPreview.previews);
+  });
 });
 
 describe("J-07 offline / repair / access authority", () => {

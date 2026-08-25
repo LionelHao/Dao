@@ -148,7 +148,8 @@ export type AgentExecutionPreviewResetInput = Readonly<{
   roomId: string;
   executionId: string;
   attemptSeq: number;
-  reason: "human_cancelled" | "message_recalled" | "runtime_shutdown" | "repair" | "reconnect";
+  reason: "human_cancelled" | "message_recalled" | "runtime_shutdown" | "repair" | "reconnect" |
+    "execution_terminal" | "attempt_rolled_over" | "access_revoked";
   authoritative: false;
 }>;
 
@@ -420,7 +421,9 @@ export function isMessageAuthorityPortInput(value: unknown): value is MessageAut
     ]) && text(value.roomId) && text(value.executionId) && positive(value.attemptSeq) &&
       (value.reason === "human_cancelled" || value.reason === "message_recalled" ||
         value.reason === "runtime_shutdown" || value.reason === "repair" ||
-        value.reason === "reconnect") && value.authoritative === false;
+        value.reason === "reconnect" || value.reason === "execution_terminal" ||
+        value.reason === "attempt_rolled_over" || value.reason === "access_revoked") &&
+      value.authoritative === false;
   }
   return value.type === "message.repair.completed" && keys(value, [
     "type", "roomId", "generation", "watermark", "messages", "eventIds",

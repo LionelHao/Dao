@@ -86,13 +86,14 @@ export interface MessageWebSocketServer {
     readonly attemptSeq: number;
     readonly streamSeq: number;
     readonly delta: string;
-  }): void;
+  }): Promise<void>;
   resetAgentPreview(preview: {
     readonly roomId: string;
     readonly executionId: string;
     readonly attemptSeq: number;
-    readonly reason: "human_cancelled" | "message_recalled" | "runtime_shutdown" | "repair" | "reconnect";
-  }): void;
+    readonly reason: "human_cancelled" | "message_recalled" | "runtime_shutdown" | "repair" | "reconnect" |
+      "execution_terminal" | "attempt_rolled_over" | "access_revoked";
+  }): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -174,6 +175,19 @@ export interface Ft07AgentSettingsAuthorityTransport {
   ): Promise<unknown>;
 }
 
+/** Server-private, AuthorityWorker-backed gate for every transient preview frame. */
+export interface AgentPreviewDeliveryAuthority {
+  authorize(input: Readonly<{
+    context: AuthenticatedSessionContext;
+    roomId: string;
+    executionId: string;
+    attemptSeq: number;
+    deliveryKind: "preview" | "reset";
+    subscriptionGeneration: number;
+    expectedAuthorityEpoch?: string;
+  }>): Promise<Readonly<{ authorized: boolean; authorityEpoch: string }>>;
+}
+
 export interface StartMessageWebSocketServerOptions {
   readonly auth: AuthenticationService;
   readonly service: MessageService;
@@ -203,6 +217,7 @@ export interface StartMessageWebSocketServerOptions {
   readonly memoryAuthority?: RoomMemoryAuthorityTransport;
   readonly attachmentAuthority?: AttachmentAuthorityCommandPort;
   readonly agentSettingsAuthority?: Ft07AgentSettingsAuthorityTransport;
+  readonly previewAuthority?: AgentPreviewDeliveryAuthority;
   readonly governance?: Pick<CommandStore, "executeHuman"> &
     Pick<SyncQueryStore, "readRoomGovernance"> &
     Partial<ClosedRoomGovernanceTransportStore>;
@@ -255,6 +270,10 @@ interface ConnectionContext {
   readonly unsubscribersByRoom: Map<string, () => void>;
   readonly identityUnsubscribers: Set<() => void>;
   readonly subscriptionGenerationsByRoom: Map<string, number>;
+  readonly previewAuthorityEpochsByRoom: Map<string, Readonly<{
+    subscriptionGeneration: number;
+    authorityEpoch: string;
+  }>>;
   readonly ownedStreamingSnapshots: Map<string, AuthenticatedSessionContext>;
   readonly connectionId: string;
   readonly v2GatesByRoom: Map<string, V2SubscriptionGate>;
@@ -1973,6 +1992,7 @@ async function handleSubscribe(
   }
   const generation = (context.subscriptionGenerationsByRoom.get(frame.roomId) ?? 0) + 1;
   context.subscriptionGenerationsByRoom.set(frame.roomId, generation);
+  context.previewAuthorityEpochsByRoom.delete(frame.roomId);
 
   const previousUnsubscribe = context.unsubscribersByRoom.get(frame.roomId);
   context.unsubscribersByRoom.delete(frame.roomId);
@@ -2150,6 +2170,7 @@ async function handleSubscribeV2(
   const subscriptionGeneration =
     (context.subscriptionGenerationsByRoom.get(frame.roomId) ?? 0) + 1;
   context.subscriptionGenerationsByRoom.set(frame.roomId, subscriptionGeneration);
+  context.previewAuthorityEpochsByRoom.delete(frame.roomId);
   const previousUnsubscribe = context.unsubscribersByRoom.get(frame.roomId);
   context.unsubscribersByRoom.delete(frame.roomId);
   safelyUnsubscribe(previousUnsubscribe);
@@ -3192,12 +3213,17 @@ export async function startMessageWebSocketServer(
         },
       });
   let closePromise: Promise<void> | undefined;
+  let previewDeliveryQueue = Promise.resolve();
 
   webSocketServer.on("connection", (socket) => {
     maxBufferedAmountBySocket.set(socket, maxBufferedAmountBytes);
     const unsubscribersByRoom = new Map<string, () => void>();
     const identityUnsubscribers = new Set<() => void>();
     const subscriptionGenerationsByRoom = new Map<string, number>();
+    const previewAuthorityEpochsByRoom = new Map<string, Readonly<{
+      subscriptionGeneration: number;
+      authorityEpoch: string;
+    }>>();
     const ownedStreamingSnapshots = new Map<string, AuthenticatedSessionContext>();
     const v2GatesByRoom = new Map<string, V2SubscriptionGate>();
     const clearRoomSubscriptions = () => {
@@ -3206,6 +3232,7 @@ export async function startMessageWebSocketServer(
       }
       unsubscribersByRoom.clear();
       subscriptionGenerationsByRoom.clear();
+      previewAuthorityEpochsByRoom.clear();
       for (const gate of v2GatesByRoom.values()) {
         safelyUnsubscribe(gate.unsubscribe);
       }
@@ -3249,6 +3276,7 @@ export async function startMessageWebSocketServer(
       unsubscribersByRoom,
       identityUnsubscribers,
       subscriptionGenerationsByRoom,
+      previewAuthorityEpochsByRoom,
       ownedStreamingSnapshots,
       connectionId,
       v2GatesByRoom,
@@ -3370,36 +3398,101 @@ export async function startMessageWebSocketServer(
     throw new Error("Message WebSocket server did not expose a TCP address");
   }
   outboxDispatcher?.start();
-  return {
-    url: formatMessageWebSocketUrl(host, address.port),
-    publishAgentPreview(preview): void {
-      for (const { socket, context } of liveConnections.values()) {
-        if (
-          context.closed ||
-          context.session === undefined ||
+
+  const deliverAuthorizedPreview = async (
+    deliveryKind: "preview" | "reset",
+    preview: Readonly<{
+      roomId: string;
+      executionId: string;
+      attemptSeq: number;
+      streamSeq?: number;
+      delta?: string;
+      reason?: "human_cancelled" | "message_recalled" | "runtime_shutdown" | "repair" | "reconnect" |
+        "execution_terminal" | "attempt_rolled_over" | "access_revoked";
+    }>,
+  ): Promise<void> => {
+    if (options.previewAuthority === undefined) return;
+    await Promise.all([...liveConnections.values()].map(async ({ socket, context }) => {
+      const session = context.session;
+      const credentialGeneration = context.credentialGeneration;
+      const subscriptionGeneration = context.subscriptionGenerationsByRoom.get(preview.roomId);
+      if (context.closed || session === undefined || subscriptionGeneration === undefined ||
           (!context.unsubscribersByRoom.has(preview.roomId) &&
-            !context.v2GatesByRoom.has(preview.roomId))
-        ) {
-          continue;
-        }
+            !context.v2GatesByRoom.has(preview.roomId))) return;
+      const priorEpoch = context.previewAuthorityEpochsByRoom.get(preview.roomId);
+      if (priorEpoch !== undefined &&
+          priorEpoch.subscriptionGeneration !== subscriptionGeneration) return;
+      let authority: Readonly<{ authorized: boolean; authorityEpoch: string }>;
+      try {
+        authority = await options.previewAuthority!.authorize({
+          context: session,
+          roomId: preview.roomId,
+          executionId: preview.executionId,
+          attemptSeq: preview.attemptSeq,
+          deliveryKind,
+          subscriptionGeneration,
+          ...(priorEpoch === undefined
+            ? {}
+            : { expectedAuthorityEpoch: priorEpoch.authorityEpoch }),
+        });
+      } catch {
+        return;
+      }
+      if (!authority.authorized || authority.authorityEpoch.length === 0 ||
+          context.closed || context.session === undefined ||
+          context.credentialGeneration !== credentialGeneration ||
+          context.session.sessionId !== session.sessionId ||
+          context.session.sessionFamilyId !== session.sessionFamilyId ||
+          !samePrincipal(context.session.principal, session.principal) ||
+          context.subscriptionGenerationsByRoom.get(preview.roomId) !== subscriptionGeneration ||
+          (!context.unsubscribersByRoom.has(preview.roomId) &&
+            !context.v2GatesByRoom.has(preview.roomId)) ||
+          (priorEpoch !== undefined && priorEpoch.authorityEpoch !== authority.authorityEpoch)) return;
+      context.previewAuthorityEpochsByRoom.set(preview.roomId, {
+        subscriptionGeneration,
+        authorityEpoch: authority.authorityEpoch,
+      });
+      if (deliveryKind === "preview") {
         sendFrame(socket, {
           type: "agent.execution.preview",
-          ...preview,
+          roomId: preview.roomId,
+          executionId: preview.executionId,
+          attemptSeq: preview.attemptSeq,
+          streamSeq: preview.streamSeq!,
+          delta: preview.delta!,
           authoritative: false,
         });
-      }
-    },
-    resetAgentPreview(preview): void {
-      for (const { socket, context } of liveConnections.values()) {
-        if (context.closed || context.session === undefined ||
-            (!context.unsubscribersByRoom.has(preview.roomId) &&
-              !context.v2GatesByRoom.has(preview.roomId))) continue;
+      } else {
         sendFrame(socket, {
           type: "agent.execution.preview.reset",
-          ...preview,
+          roomId: preview.roomId,
+          executionId: preview.executionId,
+          attemptSeq: preview.attemptSeq,
+          reason: preview.reason!,
           authoritative: false,
         });
       }
+    }));
+  };
+
+  const enqueuePreviewDelivery = (
+    deliveryKind: "preview" | "reset",
+    preview: Parameters<typeof deliverAuthorizedPreview>[1],
+  ): Promise<void> => {
+    const delivery = previewDeliveryQueue.then(() =>
+      deliverAuthorizedPreview(deliveryKind, preview),
+    );
+    previewDeliveryQueue = delivery.catch(() => undefined);
+    return delivery;
+  };
+
+  return {
+    url: formatMessageWebSocketUrl(host, address.port),
+    publishAgentPreview(preview): Promise<void> {
+      return enqueuePreviewDelivery("preview", preview);
+    },
+    resetAgentPreview(preview): Promise<void> {
+      return enqueuePreviewDelivery("reset", preview);
     },
     close(): Promise<void> {
       closePromise ??= (async () => {

@@ -610,7 +610,7 @@ async function start(
         sourceScopedRuntimeBoundary?.publishPreview(preview);
       },
       resetPreview(preview) {
-        transport?.resetAgentPreview(preview);
+        void transport?.resetAgentPreview(preview);
       },
       onMessageCommitted(execution) {
         if (execution.resultMessageId !== undefined) {
@@ -654,7 +654,7 @@ async function start(
       },
       preview: {
         publish(preview) {
-          transport?.publishAgentPreview({
+          void transport?.publishAgentPreview({
             roomId: preview.roomId,
             executionId: preview.executionId,
             attemptSeq: preview.attemptSeq,
@@ -903,6 +903,41 @@ async function start(
       outboxStore,
       outboxPollIntervalMs: 10,
       agentRuntime: runtime,
+      previewAuthority: {
+        async authorize(input) {
+          const result = await authorityWorker.executeRuntime({
+            type: "runtime.preview-authorize",
+            context: input.context,
+            roomId: input.roomId,
+            executionId: input.executionId,
+            attemptSeq: input.attemptSeq,
+            deliveryKind: input.deliveryKind,
+            subscriptionGeneration: input.subscriptionGeneration,
+            ...(input.expectedAuthorityEpoch === undefined
+              ? {}
+              : { expectedAuthorityEpoch: input.expectedAuthorityEpoch }),
+            now: Date.now(),
+          });
+          if (typeof result !== "object" || result === null ||
+              !("kind" in result) || result.kind !== "preview-authority" ||
+              !("subscriptionGeneration" in result) ||
+              result.subscriptionGeneration !== input.subscriptionGeneration ||
+              !("authorized" in result) ||
+              typeof result.authorized !== "boolean" ||
+              !("authorityEpoch" in result) ||
+              typeof result.authorityEpoch !== "string" ||
+              result.authorityEpoch.length === 0) {
+            throw new AgentRuntimeError(
+              "context_storage_unavailable",
+              "Preview delivery authority returned a malformed receipt",
+            );
+          }
+          return {
+            authorized: result.authorized,
+            authorityEpoch: result.authorityEpoch,
+          };
+        },
+      },
       collaboration: primitives,
       ballRuntime,
       messageAuthority,
