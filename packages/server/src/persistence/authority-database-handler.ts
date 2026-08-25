@@ -1566,6 +1566,8 @@ function parseRoomSyncEvent(
     streamId: row.streamId,
     streamSeq: row.streamSeq,
     roomId: row.roomId,
+    ...(typeof row.eventType === "string" && row.eventType.startsWith("project.")
+      ? { projectId: row.roomId } : {}),
     actorId: row.actorId,
     occurredAt: row.occurredAt,
     type: row.eventType,
@@ -1978,7 +1980,9 @@ function parseOutboxEvent(
     payload,
   };
   if (row.streamKind === "room") {
-    const parsed = parsePersistedRoomEvent({ ...envelope, roomId: row.roomId });
+    const parsed = parsePersistedRoomEvent({ ...envelope, roomId: row.roomId,
+      ...(typeof row.eventType === "string" && row.eventType.startsWith("project.")
+        ? { projectId: row.roomId } : {}) });
     if (parsed.ok) return parsed.value;
   } else if (row.streamKind === "identity") {
     const parsed = parsePersistedIdentityEvent(envelope);

@@ -85,6 +85,8 @@ import {
   createWorkerProjectBoundaryInvocationAuthority,
   type ProjectBoundaryInvocationProducer,
 } from "./project-boundary/project-boundary-invocation-producer.js";
+import { createProjectLoopWorkerAuthorityTransport } from
+  "./project-loop/worker-authority-adapter.js";
 
 export { createProductionSharedAuthorityParticipantComposition } from "./room-governance/production-participant-composition.js";
 
@@ -576,6 +578,7 @@ async function start(
     });
     const runtimeConfiguration = options.agentRuntime ?? {};
     const authorityWorker = worker as CompleteWorkerDatabaseClient;
+    const projectLoopAuthority = createProjectLoopWorkerAuthorityTransport(authorityWorker);
     const memoryAuthority = createWorkerMemoryAuthority({ worker, nowMs: Date.now });
     const provider = testOptions.agentRuntimeProviderForTest ?? createOpenAIResponsesProvider({
       endpoint: runtimeConfiguration.endpoint ?? "https://api.openai.com/v1/responses",
@@ -998,6 +1001,7 @@ async function start(
       ballRuntime,
       messageAuthority,
       memoryAuthority: publicMemoryAuthority,
+      projectLoopAuthority,
       agentSettingsAuthority: agentSettings,
       ...(attachmentAuthority === undefined ? {} : { attachmentAuthority }),
       governance: governanceStore,

@@ -120,7 +120,30 @@ import { executeAgentSettingsWorkerOperation } from
 import {
   executeProjectLoopAuthorityOperation,
   ProjectLoopAuthorityError,
+  writeProjectLoopCheckpointInTransaction,
 } from "../project-loop/database-authority.js";
+import { createSqliteHumanRequestMessageParticipant } from
+  "../project-loop/message-human-request-participant.js";
+import { createDefaultHumanRequestProjectPayload } from
+  "../project-loop/request-factory.js";
+
+const humanRequestParticipant = createSqliteHumanRequestMessageParticipant({
+  resolveCompanionPayload(binding) {
+    return createDefaultHumanRequestProjectPayload({
+      roomId: binding.roomId,
+      requestIntentId: binding.requestIntentId,
+      sourceTargetId: binding.sourceTargetId,
+      targetHumanActorId: binding.targetHumanActorId,
+    });
+  },
+  writeCheckpointInTransaction(database, roomId, projectRevision, occurredAt) {
+    writeProjectLoopCheckpointInTransaction(database, {
+      roomId,
+      projectRevision,
+      occurredAt,
+    });
+  },
+});
 
 interface AuthorityWorkerData {
   readonly databasePath: string;
@@ -2258,6 +2281,7 @@ function submitHumanMessage(request: AuthorityWorkerRequest): void {
         message: request.message,
         now: request.now,
         beforeApply: () => requireNoMessageRepairBarrier(request.message.roomId, request.now),
+        humanRequestParticipant,
       },
     );
     respond({ type: "authority.message-submitted", requestId: request.requestId, receipt });
@@ -2294,6 +2318,7 @@ function recallHumanMessage(request: AuthorityWorkerRequest): void {
         command: request.command,
         now: request.now,
         beforeApply: () => requireNoMessageRepairBarrier(request.command.roomId, request.now),
+        humanRequestParticipant,
       },
     );
     respond({ type: "authority.message-recalled", requestId: request.requestId, receipt });

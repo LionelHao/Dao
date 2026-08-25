@@ -2551,6 +2551,28 @@ describe("authoritative server real-process harness", () => {
         ],
       });
       if (replay.type !== "message.accepted") throw new TypeError("wrong replay ACK");
+      const projectSnapshot = await replayClient.request({
+        type: "project.snapshot.read",
+        requestId: "message-v2-project-snapshot",
+        roomId,
+        projectId: roomId,
+        afterEventSeq: 0,
+        limit: 64,
+      }, "project.snapshot");
+      expect(projectSnapshot).toMatchObject({
+        type: "project.snapshot",
+        requestId: "message-v2-project-snapshot",
+        snapshot: {
+          roomId,
+          projectId: roomId,
+          requests: [{
+            status: "pending_acceptance",
+            requester: { kind: "human", actorId: "human-a" },
+            target: { kind: "human", actorId: "human-b" },
+            provenance: { source: { sourceId: message.messageId, sourceRevision: 1 } },
+          }],
+        },
+      });
 
       const changedMessages = [
         { ...message, body: `${message.body}!` },
@@ -2620,6 +2642,7 @@ describe("authoritative server real-process harness", () => {
              (SELECT COUNT(*) FROM message_mentions WHERE message_id = ?) AS mentions,
              (SELECT COUNT(*) FROM message_target_outcomes WHERE message_id = ?) AS outcomes,
              (SELECT COUNT(*) FROM human_request_intents WHERE source_message_id = ?) AS humanIntents,
+             (SELECT COUNT(*) FROM project_requests WHERE source_id = ?) AS projectRequests,
              (SELECT COUNT(*) FROM agent_invocation_intents
                 WHERE source_message_id = ? AND origin_kind = 'message_target') AS agentIntents,
              (SELECT COUNT(*) FROM message_reply_links WHERE message_id = ?) AS replyLinks,
@@ -2628,6 +2651,7 @@ describe("authoritative server real-process harness", () => {
              (SELECT COUNT(*) FROM outbox_deliveries WHERE event_id = ?) AS outbox,
              (SELECT COUNT(*) FROM idempotency_records WHERE key = ?) AS receipts`,
         ).get(
+          message.messageId,
           message.messageId,
           message.messageId,
           message.messageId,
@@ -2647,6 +2671,7 @@ describe("authoritative server real-process harness", () => {
           mentions: 2,
           outcomes: 2,
           humanIntents: 1,
+          projectRequests: 1,
           agentIntents: 1,
           replyLinks: 1,
           attachments: 0,

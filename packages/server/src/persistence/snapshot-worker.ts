@@ -1335,7 +1335,7 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
   memoryRepairSegmentDescriptor,
   createProjectLoopRepairSegmentDescriptor((database, input) => {
     const result = readProjectLoopRepairSnapshotDatabaseQuery(database, input);
-    return { snapshot: result.snapshot };
+    return { snapshot: result };
   }),
 ] as const satisfies readonly RoomRepairSegmentDescriptor<RoomRepairKind, RoomRepairRecord>[]);
 

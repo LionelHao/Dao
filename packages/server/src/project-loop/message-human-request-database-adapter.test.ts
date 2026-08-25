@@ -4,15 +4,22 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { migrateAuthorityDatabase } from "../persistence/schema.js";
-import { submitHumanMessageDatabaseCommand } from
+import { listPendingOutboxDatabaseQuery, submitHumanMessageDatabaseCommand } from
   "../persistence/authority-database-handler.js";
 import { useAuthorityTransactionDatabase } from
   "../persistence/authority-transaction-database.js";
 import {
   HumanRequestMessageParticipantError,
+  createSqliteHumanRequestMessageParticipant,
   type HumanRequestMessageBinding,
   type HumanRequestMessageTransactionParticipant,
 } from "./message-human-request-participant.js";
+import { createDefaultHumanRequestProjectPayload } from "./request-factory.js";
+import {
+  readProjectLoopRepairSnapshotDatabaseQuery,
+  writeProjectLoopCheckpointInTransaction,
+} from "./database-authority.js";
+import { readCanonicalProjectEventsDatabaseQuery } from "./canonical-projection.js";
 
 const databases: DatabaseSync[] = [];
 const directories: string[] = [];
@@ -181,6 +188,10 @@ describe("message authority Project Request participant adapter", () => {
     ).all(message.messageId)).toEqual([{ status: "pending" }]);
     expect(database.prepare("SELECT COUNT(*) AS count FROM request_participant_proof").get())
       .toEqual({ count: 1 });
+    expect(listPendingOutboxDatabaseQuery(database, 16, now).map((delivery) =>
+      delivery.event.type)).toEqual([
+      "room.message.accepted",
+    ]);
   });
 
   it("replays the exact message receipt without re-entering or duplicating the participant", () => {
@@ -200,6 +211,52 @@ describe("message authority Project Request participant adapter", () => {
     expect(bindings).toHaveLength(1);
     expect(database.prepare("SELECT COUNT(*) AS count FROM request_participant_proof").get())
       .toEqual({ count: 1 });
+  });
+
+  it("materializes the production structured Request as a canonical Project snapshot", () => {
+    const database = fixture();
+    const participant = createSqliteHumanRequestMessageParticipant({
+      resolveCompanionPayload(binding) {
+        return createDefaultHumanRequestProjectPayload({
+          roomId: binding.roomId,
+          requestIntentId: binding.requestIntentId,
+          sourceTargetId: binding.sourceTargetId,
+          targetHumanActorId: binding.targetHumanActorId,
+        });
+      },
+      writeCheckpointInTransaction(database, roomId, projectRevision, occurredAt) {
+        writeProjectLoopCheckpointInTransaction(database, { roomId, projectRevision, occurredAt });
+      },
+    });
+    submitHumanMessageDatabaseCommand(database, {
+      context,
+      message: { ...message, mentionedTargets: [message.mentionedTargets[0]!] },
+      now,
+      humanRequestParticipant: participant,
+    });
+    expect(readProjectLoopRepairSnapshotDatabaseQuery(database, {
+      roomId: message.roomId,
+      projectId: message.roomId,
+      watermark: 2,
+      afterEventSeq: 0,
+      limit: 64,
+    })).toMatchObject({
+      requests: [{
+        status: "pending_acceptance",
+        requester: { kind: "human", actorId: "human-requester" },
+        target: { kind: "human", actorId: "human-target" },
+      }],
+    });
+    expect(readCanonicalProjectEventsDatabaseQuery(database, {
+      roomId: message.roomId,
+      afterStreamSeq: 0,
+      limit: 64,
+    })).toHaveLength(1);
+    expect(listPendingOutboxDatabaseQuery(database, 16, now).map((delivery) =>
+      delivery.event.type)).toEqual([
+      "room.message.accepted",
+      "project.request.changed",
+    ]);
   });
 
   it("rolls message, intent, target outcome, event and participant writes back together", () => {
