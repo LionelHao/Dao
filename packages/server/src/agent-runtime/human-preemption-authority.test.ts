@@ -12,6 +12,7 @@ import {
   executeRouteAuthorityOperation,
   executeRuntimeAuthorityOperation,
   recallHumanMessageDatabaseCommand,
+  submitHumanMessageDatabaseCommand,
 } from "../persistence/authority-database-handler.js";
 import { migrateAuthorityDatabase } from "../persistence/schema.js";
 import { createWorkerDatabaseClient } from "../persistence/worker-database-client.js";
@@ -287,6 +288,101 @@ function cloneQueuedInvocation(
 }
 
 describe("real SQLite human-preemption authority", () => {
+  it("does not let 256 older intents from a full Room starve an idle Room", () => {
+    const database = fixture();
+    database.exec(`
+      UPDATE actors SET readiness = 'ready' WHERE id IN ('agent-1', 'agent-2');
+      UPDATE room_memberships SET role = 'owner'
+      WHERE room_id = 'room-1' AND actor_id = 'human-1';
+      INSERT INTO rooms (id, name, status, created_at, owner_actor_id, governance_revision)
+      VALUES ('room-idle', 'Idle Room', 'active', '2026-08-17T00:00:00.000Z', 'human-1', 1);
+      INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+      VALUES ('room', 'room-idle', 0, 1);
+      INSERT INTO room_memberships (
+        room_id, actor_id, kind, role, participation, joined_at, configured_at,
+        access_revision
+      ) VALUES
+        ('room-idle', 'human-1', 'human', 'owner', NULL,
+         '2026-08-17T00:00:00.000Z', NULL, 1),
+        ('room-idle', 'agent-2', 'agent', NULL, 'active', NULL,
+         '2026-08-17T00:00:00.000Z', 1);
+    `);
+    const profileId = database.prepare(
+      "SELECT id FROM agent_profiles WHERE actor_id = 'agent-2'",
+    ).get()?.id;
+    if (typeof profileId !== "string") throw new Error("Idle Room profile fixture was missing");
+    seedCanonicalRoomAssignmentFixture(database, {
+      assignmentId: "assignment-agent-2-idle", roomId: "room-idle", profileId,
+      actorId: "agent-2", participation: "active",
+    });
+
+    for (let index = 0; index < 256; index += 1) {
+      submitHumanMessageDatabaseCommand(database, {
+        context: { ...humanContext, requestId: `full-room-${index}`,
+          idempotencyKey: `full-room-${index}` },
+        message: {
+          messageId: `full-room-message-${index}`,
+          roomId: "room-1",
+          body: "@Agent full Room",
+          mentionedTargets: [{ id: `full-room-target-${index}`, kind: "agent-invocation",
+            targetActorId: "agent-1", range: { startUtf16: 0, endUtf16: 6 } }],
+          attachments: [],
+        },
+        now: t0 + 100_000 + index,
+      });
+    }
+    const idle = submitHumanMessageDatabaseCommand(database, {
+      context: { ...humanContext, requestId: "idle-room-message",
+        idempotencyKey: "idle-room-message" },
+      message: {
+        messageId: "idle-room-message",
+        roomId: "room-idle",
+        body: "@Agent idle Room",
+        mentionedTargets: [{ id: "idle-room-target", kind: "agent-invocation",
+          targetActorId: "agent-2", range: { startUtf16: 0, endUtf16: 6 } }],
+        attachments: [],
+      },
+      now: t0 + 200_000,
+    });
+    const idleIntentId = idle.targetOutcomes[0]?.invocationIntentId;
+    if (idleIntentId === undefined) throw new Error("Idle Room invocation intent was missing");
+    for (let index = 0; index < 32; index += 1) {
+      database.prepare(
+        `INSERT INTO agent_executions (
+           id, room_id, room_archive_generation, agent_id, trigger_message_id, status,
+           started_at, requester_actor_id, tool_name, action_category,
+           current_attempt_seq, retry_cycle, retry_ordinal, recovery_cursor,
+           queued_at, updated_at
+         ) VALUES (?, 'room-1', 0, 'agent-1', 'full-room-message-0', 'queued',
+                   ?, 'human-1', 'model.generate', 'model_generation',
+                   1, 1, 1, 0, ?, ?)`,
+      ).run(`full-room-live-${index}`, new Date(t0 + 300_000 + index).toISOString(),
+        new Date(t0 + 300_000 + index).toISOString(),
+        new Date(t0 + 300_000 + index).toISOString());
+    }
+
+    const claimed = executeRuntimeAuthorityOperation(database, {
+      type: "runtime.claim-pending-direct-intents",
+      providerId: "provider", modelId: "model", limit: 256, now: t0 + 400_000,
+    });
+    expect(claimed).toMatchObject({
+      kind: "direct-intent-claims",
+      records: [{ execution: { roomId: "room-idle" }, outcome: "enqueue" }],
+      hasMore: true,
+    });
+    expect(database.prepare(
+      `SELECT public_status AS status
+       FROM agent_invocation_intent_runtime_states WHERE intent_id = ?`,
+    ).get(idleIntentId)).toEqual({ status: "claimed" });
+    expect(database.prepare(
+      `SELECT COUNT(*) AS count
+       FROM agent_invocation_intent_runtime_states AS runtime
+       JOIN agent_invocation_intents AS intent ON intent.id = runtime.intent_id
+       WHERE intent.room_id = 'room-1' AND runtime.public_status = 'claimed'`,
+    ).get()).toEqual({ count: 0 });
+    database.close();
+  });
+
   it("drains 257/513/1025 durable recovery candidates by stable 256-row keysets", () => {
     const database = fixture();
     const sourceMessageId = "message-recovery-source";
