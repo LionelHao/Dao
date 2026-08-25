@@ -7,11 +7,12 @@
 - 一句话结果：权威 intent/execution/attempt 生命周期、五态 projection、同 turn 多 Agent 并发、scoped cancellation、automatic/Human retry、keyset recovery、transient preview、fixed-watermark repair 与 Desktop execution presence 已进入 production composition；FT-09/10/13/14 的共享边界保持 server-private、closed、versioned、fail-closed。
 - 起始 `origin/main`：`82ef2231c86559ed8ad7941f8abe32d6cd32a68a`（FT-07 Stage 9 evidence，Authority schema v21，开始时无 open PR）。
 - FT-08 最终实现 `main` SHA：`eedd2d59d9a7a5659671d8573ba08ea6f7906ebe`（PR #71 squash merge，Authority schema v22）。
-- 本交付记录将以独立 PR 合入；其 squash merge 将成为 Stage 10 证据 tip。
+- 本交付记录：[PR #72 — docs(ft08): record Stage 10 delivery evidence](https://github.com/LionelHao/Dao/pull/72)；其 squash merge 将成为 Stage 10 证据 tip。
 
 | PR | 范围 | merge SHA | 必需 CI |
 | --- | --- | --- | --- |
 | [#71](https://github.com/LionelHao/Dao/pull/71) | FT-08 rebaseline、Core、schema v22、Authority/runtime、protocol/sync/repair、Desktop 与对抗加固 | `eedd2d59d9a7a5659671d8573ba08ea6f7906ebe` | [quality 32847791058](https://github.com/LionelHao/Dao/actions/runs/32847791058)：[Node 22.13.1](https://github.com/LionelHao/Dao/actions/runs/32847791058/job/97801436292)、[Node 22.x](https://github.com/LionelHao/Dao/actions/runs/32847791058/job/97801436634) 均 success |
+| [#72](https://github.com/LionelHao/Dao/pull/72) | Stage 10 delivery evidence（本文件） | 本PR的squash merge由GitHub记录为最终证据tip | 本PR页面保留最终双Node required checks |
 
 没有 force push、没有绕过 branch protection、没有弱化或 skip 失败测试。实现涉及 103 个文件、15195 行新增、699 行删除；Blueprint HTML/JSON 与 renderer 不在变更清单中。
 
