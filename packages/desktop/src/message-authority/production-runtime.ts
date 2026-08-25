@@ -44,6 +44,7 @@ interface RoomRuntimeState {
 
 export interface DesktopMessageAuthorityRuntime {
   readonly client: MessageAuthorityClientPort;
+  readonly transport: MessageAuthorityWireTransport;
   clearAndRestore(roomId: string): void;
   invalidateAuthorizedState(): void;
   close(): void;
@@ -456,6 +457,7 @@ export function createDesktopMessageAuthorityRuntime(options: {
 
   return Object.freeze({
     client,
+    transport,
     clearAndRestore(roomId: string) {
       const state = rooms.get(roomId);
       if (state === undefined) return;

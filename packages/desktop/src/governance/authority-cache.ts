@@ -67,6 +67,7 @@ function recordIdentity(record: RoomRepairRecord): string {
     case "memory": return record.value.recordType === "status"
       ? "memory\0status"
       : `memory\0projection\0${record.value.projection.memoryRecordId}`;
+    case "project-loop": return `project-loop\0${record.roomId}`;
   }
 }
 

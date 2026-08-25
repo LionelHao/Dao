@@ -5,6 +5,7 @@ import type { AttachmentAuthorityBridge } from "../attachment-authority/contract
 import type { MemoryAuthorityBridge } from "../memory-authority/contracts.js";
 import type { AgentSettingsBridge } from "../agent-profile-routing/contracts.js";
 import type { InvocationBridge } from "../invocation-runtime/contracts.js";
+import type { ProjectLoopBridge } from "../project-loop/contracts.js";
 import { mountAgentSettingsBridgeSurface } from "./agent-settings/bridge-adapter.js";
 import {
   mountGovernanceSurface,
@@ -20,6 +21,7 @@ import {
   type InvocationHostAction,
   type InvocationSurfaceActions,
 } from "./invocation-runtime/surface.js";
+import { mountProjectLoopBridgeSurface } from "./project-loop/bridge-adapter.js";
 
 export interface DesktopRendererEntryPorts {
   readonly renderM2PrimitivesPreview: (root: HTMLElement) => void;
@@ -47,6 +49,11 @@ export interface DesktopRendererEntryPorts {
     roomId: string) => () => void;
   readonly mountInvocationSurface?: (root: HTMLElement, bridge: InvocationBridge,
     roomId: string, actions: InvocationSurfaceActions) => () => void;
+  readonly mountProjectLoopSurface?: (
+    root: HTMLElement,
+    bridge: ProjectLoopBridge,
+    roomId: string,
+  ) => () => void;
 }
 
 const DEFAULT_PORTS: DesktopRendererEntryPorts = Object.freeze({
@@ -95,6 +102,20 @@ const DEFAULT_PORTS: DesktopRendererEntryPorts = Object.freeze({
     root, bridge, roomId, { reducedMotion: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false,
       onClose: () => history.back() }),
   mountInvocationSurface,
+  mountProjectLoopSurface: (root: HTMLElement, bridge: ProjectLoopBridge, roomId: string) => mountProjectLoopBridgeSurface(
+    root, bridge, roomId, {
+      reducedMotion: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false,
+      onSearch: () => root.querySelector<HTMLInputElement>("input[type='search']")?.focus(),
+      onNavigateSegment: (segment) => {
+        const selector = segment === "timeline" ? ".room-authority-workspace__timeline"
+          : segment === "project" ? ".room-authority-workspace__project"
+            : ".room-authority-workspace__memory";
+        const target = root.closest(".room-authority-workspace")?.querySelector<HTMLElement>(selector);
+        if (target !== null && target !== undefined) { target.tabIndex = -1; target.focus(); }
+      },
+      onReauthenticate: () => navigateRenderer(""),
+    },
+  ),
 });
 
 const encoder = new TextEncoder();
@@ -248,6 +269,7 @@ export function mountDesktopRendererEntry(
   memoryAuthority?: MemoryAuthorityBridge,
   agentSettings?: AgentSettingsBridge,
   invocation?: InvocationBridge,
+  projectLoop?: ProjectLoopBridge,
 ): (() => void) | undefined {
   const route = new URLSearchParams(search);
   root.dataset.governanceRouteContract = "closed-v1";
@@ -288,13 +310,21 @@ export function mountDesktopRendererEntry(
     const memory = document.createElement("aside");
     memory.className = "room-authority-workspace__memory";
     memory.setAttribute("aria-label", "Room 重要记忆");
+    const project = projectLoop === undefined || ports.mountProjectLoopSurface === undefined
+      ? undefined : document.createElement("aside");
+    if (project !== undefined) {
+      project.className = "room-authority-workspace__project";
+      project.setAttribute("aria-label", "Room Project");
+    }
     const executions = invocation === undefined || ports.mountInvocationSurface === undefined
       ? undefined : document.createElement("aside");
     if (executions !== undefined) {
       executions.className = "room-authority-workspace__invocations";
       executions.setAttribute("aria-label", "Agent 执行");
-      workspace.append(timeline, executions, memory);
-    } else workspace.append(timeline, memory);
+      if (project === undefined) workspace.append(timeline, executions, memory);
+      else workspace.append(timeline, executions, project, memory);
+    } else if (project === undefined) workspace.append(timeline, memory);
+    else workspace.append(timeline, project, memory);
     root.replaceChildren(workspace);
     const disposeMessage = ports.mountMessageAuthoritySurface(
       timeline,
@@ -304,6 +334,9 @@ export function mountDesktopRendererEntry(
       memoryAuthority,
     );
     const disposeMemory = ports.mountMemoryAuthoritySurface(memory, memoryAuthority, roomId);
+    const disposeProject = project === undefined || projectLoop === undefined ||
+      ports.mountProjectLoopSurface === undefined ? undefined
+      : ports.mountProjectLoopSurface(project, projectLoop, roomId);
     const disposeInvocations = executions === undefined || invocation === undefined ||
       ports.mountInvocationSurface === undefined ? undefined
       : ports.mountInvocationSurface(executions, invocation, roomId, {
@@ -322,6 +355,7 @@ export function mountDesktopRendererEntry(
       });
     return () => {
       disposeInvocations?.();
+      disposeProject?.();
       disposeMemory();
       disposeMessage();
     };

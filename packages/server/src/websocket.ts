@@ -73,6 +73,10 @@ import {
   type Ft07AgentSettingsServerFrame,
 } from "./ft07-agent-settings-protocol.js";
 import {
+  executeProjectLoopFrame,
+  type ProjectLoopAuthorityTransport,
+} from "./project-loop-websocket.js";
+import {
   createSubscriptionRegistry,
   type RegisteredConnection,
   type SubscriptionRegistry,
@@ -220,6 +224,7 @@ export interface StartMessageWebSocketServerOptions {
   readonly attachmentAuthority?: AttachmentAuthorityCommandPort;
   readonly agentSettingsAuthority?: Ft07AgentSettingsAuthorityTransport;
   readonly previewAuthority?: AgentPreviewDeliveryAuthority;
+  readonly projectLoopAuthority?: ProjectLoopAuthorityTransport;
   readonly governance?: Pick<CommandStore, "executeHuman"> &
     Pick<SyncQueryStore, "readRoomGovernance"> &
     Partial<ClosedRoomGovernanceTransportStore>;
@@ -640,6 +645,9 @@ function mappedError(
   requestId: string,
   departureScope?: DepartureScope,
 ): ProtocolErrorFrame {
+  if (isServiceErrorCode(error, "room_archived") && error.status === 410) {
+    return errorFrame(410, "room_archived", "room_archived", requestId);
+  }
   if (isServiceErrorCode(error, "departure_blocked")) {
     const details = closeDepartureConflictList(
       error.details,
@@ -758,6 +766,10 @@ const MAPPED_SERVICE_ERROR_STATUSES = new Map<GenericProtocolErrorCode, Protocol
   ["storage_unavailable", 503],
   ["memory_unavailable", 503],
   ["memory_dependency_unavailable", 503],
+  ["project_fact_not_found", 404],
+  ["revision_conflict", 409],
+  ["invalid_transition", 409],
+  ["project_dependency_unavailable", 503],
   ["scanner_unavailable", 503],
   ["extractor_unavailable", 503],
   ["ocr_unavailable", 503],
@@ -1450,7 +1462,15 @@ function isCorrelatedRecoveryResponse(
       | "room-agent-assignment.pause"
       | "room-agent-assignment.resume"
       | "room-agent-assignment.remove"
-      | "room-agent-assignment.repair";
+      | "room-agent-assignment.repair"
+      | "project.snapshot.read"
+      | "project.proposal.create"
+      | "project.proposal.resolve"
+      | "project.request.transition"
+      | "project.next-action.transition"
+      | "project.obstacle.transition"
+      | "project.transfer.propose"
+      | "project.transfer.resolve";
   }>,
   response: unknown,
 ): response is ServerFrame {
@@ -1587,7 +1607,15 @@ async function handleRecoveryFrame(
       | "room-agent-assignment.pause"
       | "room-agent-assignment.resume"
       | "room-agent-assignment.remove"
-      | "room-agent-assignment.repair";
+      | "room-agent-assignment.repair"
+      | "project.snapshot.read"
+      | "project.proposal.create"
+      | "project.proposal.resolve"
+      | "project.request.transition"
+      | "project.next-action.transition"
+      | "project.obstacle.transition"
+      | "project.transfer.propose"
+      | "project.transfer.resolve";
   }>,
   options: StartMessageWebSocketServerOptions,
   context: ConnectionContext,
@@ -2441,6 +2469,25 @@ async function handleFrame(
     return;
   }
   switch (frame.type) {
+    case "project.snapshot.read":
+    case "project.proposal.create":
+    case "project.proposal.resolve":
+    case "project.request.transition":
+    case "project.next-action.transition":
+    case "project.obstacle.transition":
+    case "project.transfer.propose":
+    case "project.transfer.resolve": {
+      const session = await requireSession(socket, frame.requestId, options, context);
+      if (session === undefined) return;
+      const generation = context.credentialGeneration;
+      try {
+        const response = await executeProjectLoopFrame(session, frame, options.projectLoopAuthority);
+        sendCurrentGeneration(socket, response, generation, context);
+      } catch (error: unknown) {
+        sendCurrentGeneration(socket, mappedError(error, frame.requestId), generation, context);
+      }
+      return;
+    }
     case "tenant-administrator.list":
     case "tenant-administrator.add":
     case "tenant-administrator.remove":

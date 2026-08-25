@@ -142,6 +142,7 @@ function renderHumanMessage(
 ): HTMLElement {
   const card = element("article", "message-authority__message message-authority__message--human");
   card.dataset.messageId = message.messageId;
+  card.dataset.messageRevision = String(message.revision);
   card.dataset.authority = "projection";
   card.append(text("p", `PROJ · HUMAN · ${actorLabel(state, message.authorId)}`, "message-authority__stamp"));
   if (message.replyToMessageId !== undefined) {
@@ -258,6 +259,7 @@ function renderTombstone(
 ): HTMLElement {
   const card = element("article", "message-authority__message message-authority__message--tombstone");
   card.dataset.messageId = message.messageId;
+  card.dataset.messageRevision = String(message.revisionCount);
   card.dataset.authority = "projection";
   card.append(text("p", `PROJ · TOMBSTONE · ${actorLabel(state, message.authorId)}`, "message-authority__stamp"));
   card.append(text("p", "消息已撤回", "message-authority__body"));

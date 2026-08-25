@@ -31,6 +31,8 @@ import {
   memoryRepairSegmentDescriptor,
   ROOM_MEMORY_REPAIR_KEYSET_LIMIT,
 } from "../room-memory/repair-descriptor.js";
+import { readProjectLoopRepairSnapshotDatabaseQuery } from "../project-loop/database-authority.js";
+import { createProjectLoopRepairSegmentDescriptor } from "../project-loop/repair-descriptor.js";
 import {
   readOperationalMessageRepairPage,
   readOperationalMessageRepairRecord,
@@ -668,6 +670,7 @@ const ROOM_REPAIR_KIND_MAP = Object.freeze({
   calibration: true,
   "legacy-unknown-calibration": true,
   memory: true,
+  "project-loop": true,
 } as const satisfies Readonly<Record<RoomRepairKind, true>>);
 
 const ROOM_REPAIR_KINDS = Object.freeze(
@@ -1330,6 +1333,10 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
       String(record.kind === "message" ? record.value.id : ""),
   },
   memoryRepairSegmentDescriptor,
+  createProjectLoopRepairSegmentDescriptor((database, input) => {
+    const result = readProjectLoopRepairSnapshotDatabaseQuery(database, input);
+    return { snapshot: result.snapshot };
+  }),
 ] as const satisfies readonly RoomRepairSegmentDescriptor<RoomRepairKind, RoomRepairRecord>[]);
 
 const ROOM_REPAIR_REGISTRY = createClosedRepairProjectionRegistry<

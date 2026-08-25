@@ -66,6 +66,12 @@ import {
   type RoomMemoryRepairRecord,
 } from "./room-memory.js";
 import {
+  isProjectEvent,
+  isProjectRepairRecord,
+  type ProjectEvent,
+  type ProjectRepairRecord,
+} from "./project-loop.js";
+import {
   isAgentProfileRecord,
   isCanonicalAgentCapabilitySet,
   isCanonicalAgentToolSet,
@@ -225,7 +231,8 @@ export type RoomRepairRecord =
       readonly value: LegacyUnknownCalibrationSignal }
   | OperationalMessageAuthorityRepairRecord
   | AttachmentRepairRecord
-  | RoomMemoryRepairRecord;
+  | RoomMemoryRepairRecord
+  | ProjectRepairRecord;
 
 export type SnapshotVersion =
   | { readonly kind: "room"; readonly roomId: string; readonly watermark: number }
@@ -367,6 +374,7 @@ export type PersistedRoomEvent =
   | MessageAuthorityEvent
   | AttachmentRoomEvent
   | RoomMemoryEvent
+  | ProjectEvent
   | RoomEvent<"room.human_read.recorded", HumanReadReceipt>
   | RoomEvent<"room.agent_judgment.recorded", AgentJudgement>
   | RoomEvent<"room.open_item.changed", OpenItem>
@@ -668,6 +676,7 @@ function isRepairRecord(value: unknown, expectedRoomId?: string): value is RoomR
   }
   if (value.kind === "attachment") return isAttachmentRepairRecord(value, expectedRoomId);
   if (value.kind === "memory") return isRoomMemoryRepairRecord(value, expectedRoomId);
+  if (value.kind === "project-loop") return isProjectRepairRecord(value, expectedRoomId);
   if (!exact(value, ["kind", "value"])) return false;
   if (value.kind === "human-read") return isHumanReadReceipt(value.value);
   if (value.kind === "agent-judgement") return isAgentJudgement(value.value);
@@ -717,6 +726,7 @@ function isPersistedRoomEventValue(value: unknown): value is PersistedRoomEvent 
   if (isMessageAuthorityEvent(value)) return true;
   if (isAttachmentRoomEvent(value)) return true;
   if (isRoomMemoryEvent(value)) return true;
+  if (isProjectEvent(value)) return true;
   if (value.type === "room.created" || value.type === "room.renamed") {
     return exact(payload, ["room"]) && isManagedRoomValue(payload.room) && payload.room.id === value.roomId;
   }

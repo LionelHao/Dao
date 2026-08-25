@@ -47,6 +47,7 @@ import {
   formatMessageWebSocketUrl,
   validateMessageWebSocketListener,
   type AgentPreviewDeliveryAuthority,
+  type ProjectLoopAuthorityTransport,
   type RoomMemoryAuthorityTransport,
 } from "./websocket.js";
 
@@ -106,6 +107,55 @@ const testLoginDevice = Object.freeze({
   id: "websocket-test-installation",
   label: "WebSocket test device",
   platform: "unknown" as const,
+});
+
+describe("FT-09 Project Loop WebSocket", () => {
+  it("requires authentication and injects the current session into mutations", async () => {
+    const executeMutation = vi.fn<ProjectLoopAuthorityTransport["executeMutation"]>(
+      async (context, frame) => ({
+        type: "project.mutation.ack", requestId: frame.requestId, roomId: frame.roomId,
+        projectId: frame.projectId, acceptedRevision: frame.expectedRevision + 1,
+        eventIds: ["event-project-1"], replayed: false,
+      }),
+    );
+    const server = await startMessageWebSocketServer({
+      auth: governanceAuthenticationService(),
+      service: idleMessageService(),
+      projectLoopAuthority: { executeMutation, async executeQuery(_context, frame) {
+        return { type: "project.snapshot", requestId: frame.requestId, snapshot: {
+          recordVersion: "project-loop.v1", roomId: frame.roomId, projectId: frame.projectId,
+          watermark: 0, goals: [], decisions: [], requests: [], obstacles: [],
+          nextActions: [], proposals: [], confirmations: [], transferProposals: [], balls: [],
+          capturedAt: "2026-08-25T00:00:00.000Z",
+        }, events: [], nextEventSeq: 0 };
+      } },
+    });
+    const client = await LoopbackClient.connect(server.url);
+    const command = {
+      type: "project.proposal.resolve", requestId: "project-confirm", idempotencyKey: "idem-project",
+      roomId, projectId: roomId, proposalId: "proposal-1", expectedRevision: 1,
+      resolution: "confirmed",
+      reason: null,
+    } as const;
+    try {
+      client.send(command);
+      await expect(client.waitForError("unauthenticated", command.requestId)).resolves.toBeDefined();
+      await client.login(humans[0], "project-login");
+      client.send(command);
+      await expect(client.waitForFrame(
+        (frame) => hasType(frame, "project.mutation.ack") && frame.requestId === command.requestId,
+        "project mutation ACK",
+      )).resolves.toMatchObject({ frame: { acceptedRevision: 2, replayed: false } });
+      expect(executeMutation).toHaveBeenCalledTimes(1);
+      expect(executeMutation.mock.calls[0]?.[0]).toMatchObject({
+        kind: "human", requestId: command.requestId, idempotencyKey: command.idempotencyKey,
+        principal: { actorId: humans[0].id },
+      });
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
 });
 
 const outsider = {

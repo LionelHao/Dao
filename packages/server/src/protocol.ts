@@ -65,6 +65,12 @@ import {
   type Ft07AgentSettingsClientFrame,
   type Ft07AgentSettingsServerFrame,
 } from "./ft07-agent-settings-protocol.js";
+import {
+  isProjectLoopFrameType,
+  parseProjectLoopClientFrame,
+  type ProjectLoopClientFrame,
+  type ProjectLoopServerFrame,
+} from "./project-loop-protocol.js";
 
 const AUTH_LOGIN_FIELDS = new Set(["type", "requestId", "accountId", "secret", "device"]);
 const AUTH_LOGIN_DEVICE_FIELDS = new Set(["id", "label", "platform"]);
@@ -499,7 +505,8 @@ export type ClientFrame =
   | LightTaskCriterionSetFrame
   | AttachmentClientFrame
   | RoomMemoryRequest
-  | Ft07AgentSettingsClientFrame;
+  | Ft07AgentSettingsClientFrame
+  | ProjectLoopClientFrame;
 
 export interface AuthenticatedFrame {
   readonly type: "auth.authenticated";
@@ -888,6 +895,10 @@ export type ProtocolErrorCode =
   | "memory_capacity_limited"
   | "memory_unavailable"
   | "memory_dependency_unavailable"
+  | "project_fact_not_found"
+  | "revision_conflict"
+  | "invalid_transition"
+  | "project_dependency_unavailable"
   | "side_effect_outcome_unknown"
   | "tool_failure"
   | "tool_target_busy"
@@ -950,6 +961,7 @@ export type ServerFrame =
   | AttachmentAuthorityServerFrame
   | RoomMemorySuccessFrame
   | Ft07AgentSettingsServerFrame
+  | ProjectLoopServerFrame
   | ProtocolErrorFrame;
 
 export type ClientFrameParseResult =
@@ -1117,6 +1129,16 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
             parsed.requestId,
           ),
         };
+  }
+  if (isProjectLoopFrameType(value.type)) {
+    const parsed = parseProjectLoopClientFrame(value);
+    return parsed.ok ? parsed : {
+      ok: false,
+      error: protocolError(
+        "FT-09 Project Loop request must use a closed authority frame",
+        parsed.requestId,
+      ),
+    };
   }
   if (typeof value.type === "string" && value.type.startsWith("room.memory.")) {
     if (requestId !== undefined && isRoomMemoryRequest(value)) {
