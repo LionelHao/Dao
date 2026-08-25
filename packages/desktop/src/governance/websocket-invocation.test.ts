@@ -63,6 +63,11 @@ describe("Invocation wire ACK decoder", () => {
       type: "invocation.retry.ack", requestId: "retry-1",
       receipt: { ...retryReceipt, status: "queued" }, replayed: false,
     }))).toBeUndefined();
+    expect(parseGovernanceServerFrame(JSON.stringify({
+      type: "error", requestId: "retry-rate-1", status: 429, code: "rate_limited",
+      message: "bounded", retryAfterSeconds: 7,
+    }))).toMatchObject({ requestId: "retry-rate-1",
+      error: { code: "rate_limited", status: 429, retryAfterSeconds: 7 } });
   });
 
   it("round-trips the canonical receipts over a real WebSocket", async () => {

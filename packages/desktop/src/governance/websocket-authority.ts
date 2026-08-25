@@ -55,6 +55,7 @@ export class GovernanceTransportError extends Error {
     readonly code: GovernanceTransportErrorCode,
     readonly status?: number,
     readonly details?: DepartureConflictList,
+    readonly retryAfterSeconds?: number,
   ) {
     super(`Governance transport failed: ${code}`);
     this.name = "GovernanceTransportError";
@@ -166,9 +167,15 @@ const commands = new Set<GovernanceCommand>([
 ]);
 const statuses = new Set([400, 401, 403, 404, 409, 410, 429, 500, 503]);
 
-function mappedError(status: number, code: string, details: unknown): GovernanceTransportError | undefined {
+function mappedError(
+  status: number,
+  code: string,
+  details: unknown,
+  retryAfterSeconds: unknown,
+): GovernanceTransportError | undefined {
   if (status === 409 && code === "departure_blocked" && isDepartureConflictList(details)) {
-    return new GovernanceTransportError("departure_blocked", 409, details);
+    return retryAfterSeconds === undefined
+      ? new GovernanceTransportError("departure_blocked", 409, details) : undefined;
   }
   const mapping: Record<string, GovernanceTransportErrorCode> = {
     unauthenticated: "authentication_required", invalid_token: "authentication_required",
@@ -185,7 +192,12 @@ function mappedError(status: number, code: string, details: unknown): Governance
     storage_unavailable: "service_unavailable", internal_error: "service_unavailable",
   };
   const closed = mapping[code];
-  return closed === undefined ? undefined : new GovernanceTransportError(closed, status);
+  if (closed === undefined || (retryAfterSeconds !== undefined &&
+      (status !== 429 || !Number.isSafeInteger(retryAfterSeconds) ||
+        (retryAfterSeconds as number) <= 0 ||
+        (retryAfterSeconds as number) > 86_400))) return undefined;
+  return new GovernanceTransportError(closed, status, undefined,
+    retryAfterSeconds as number | undefined);
 }
 
 export function parseGovernanceServerFrame(raw: string): ParsedFrame | undefined {
@@ -270,10 +282,12 @@ export function parseGovernanceServerFrame(raw: string): ParsedFrame | undefined
           }
         : undefined;
     case "error": {
-      if (!exact(value, ["type", "status", "code", "message"], ["requestId", "details"]) ||
+      if (!exact(value, ["type", "status", "code", "message"], [
+        "requestId", "details", "retryAfterSeconds",
+      ]) ||
           typeof value.status !== "number" || !statuses.has(value.status) || typeof value.code !== "string" ||
           !text(value.message, 512) || (value.requestId !== undefined && !text(value.requestId, 128))) return undefined;
-      const error = mappedError(value.status, value.code, value.details);
+      const error = mappedError(value.status, value.code, value.details, value.retryAfterSeconds);
       return error === undefined ? undefined : { type: "error",
         ...(value.requestId === undefined ? {} : { requestId: value.requestId }), error };
     }

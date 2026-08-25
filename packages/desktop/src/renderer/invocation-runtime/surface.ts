@@ -63,8 +63,16 @@ function renderExecution(
     review.dataset.invocationReview = execution.executionId;
     review.tabIndex = -1;
     review.setAttribute("role", "alert");
+    const unavailable = appendText(card, "p",
+      "审阅闭合命令尚未接入当前 Desktop bridge；请勿重试原 toolCall。等待 FT-10 review authority 接线。");
+    unavailable.dataset.reviewActionUnavailable = "true";
   } else if (execution.reviewState === "reviewed") {
     appendText(card, "p", "✓ 人工审阅已完成");
+  }
+  if (projection.sourceLifecycle === "revised") {
+    const revised = appendText(card, "p",
+      "SOURCE REVISED · 来源消息已有新 revision；本 execution 的冻结输入保持不变。");
+    revised.dataset.invocationSource = "revised";
   }
   if (projection.sourceLifecycle === "recalled") appendText(card, "p", "来源消息已撤回，重试已关闭。");
   if (projection.preservedDispatchIds.length > 0) {
@@ -84,15 +92,30 @@ function renderExecution(
   if (operation?.status === "failed") {
     const failure = appendText(card, "p", `${operation.error.status} · ${ERROR_LABEL[operation.error.status]}`);
     failure.setAttribute("role", "alert");
-    const recover = document.createElement("button");
-    recover.type = "button";
-    recover.textContent = operation.error.recovery === "reauthenticate" ? "重新登录"
-      : operation.error.recovery === "request-access" ? "申请访问"
-        : operation.error.recovery === "upgrade-client" ? "升级客户端"
-          : operation.error.recovery === "retry-later" ? "稍后重试"
-            : "刷新权威状态";
-    recover.addEventListener("click", repair);
-    card.append(recover);
+    failure.dataset.invocationError = operation.requestId;
+    failure.tabIndex = -1;
+    if (operation.error.recovery === "retry-later" ||
+        operation.error.recovery === "refresh-authority" ||
+        operation.error.recovery === "repair-room") {
+      const recover = document.createElement("button");
+      recover.type = "button";
+      recover.dataset.invocationRecovery = operation.error.recovery;
+      recover.textContent = operation.error.recovery === "retry-later"
+        ? operation.error.retryAfterSeconds === undefined ? "稍后重试"
+          : `${operation.error.retryAfterSeconds} 秒后重试`
+        : operation.error.recovery === "repair-room" ? "修复 Room 同步" : "刷新权威状态";
+      recover.addEventListener("click", operation.error.recovery === "retry-later"
+        ? () => submit(operation.kind, operation.executionId, operation.expectedVersion)
+        : repair);
+      card.append(recover);
+    } else {
+      const unavailable = appendText(card, "p", operation.error.recovery === "reauthenticate"
+        ? "请通过全局身份入口重新认证；execution bridge 不持有登录权限。"
+        : operation.error.recovery === "request-access"
+          ? "请通过 Room 访问管理申请权限；execution bridge 没有申请访问命令。"
+          : "请通过应用更新入口升级客户端；execution bridge 没有升级命令。");
+      unavailable.dataset.recoveryUnavailable = operation.error.recovery;
+    }
   }
   const controls = document.createElement("div");
   controls.className = "invocation-card__controls";
@@ -100,6 +123,7 @@ function renderExecution(
   const busy = operation?.status === "submitting" || operation?.status === "acknowledged";
   if (execution.status === "accepted" || execution.status === "running") {
     const cancel = document.createElement("button");
+    cancel.dataset.invocationAction = "cancel";
     cancel.type = "button"; cancel.textContent = busy ? "提交中…" : "取消本次执行";
     cancel.disabled = !online || busy;
     cancel.addEventListener("click", () => submit("cancel", execution.executionId, execution.version));
@@ -107,8 +131,10 @@ function renderExecution(
   }
   if (execution.status === "failed" || execution.status === "cancelled") {
     const retry = document.createElement("button");
+    retry.dataset.invocationAction = "retry";
     retry.type = "button"; retry.textContent = busy ? "提交中…" : "重试为新执行";
-    retry.disabled = !online || busy || projection.sourceLifecycle !== "active" ||
+    retry.disabled = !online || busy ||
+      (projection.sourceLifecycle !== "active" && projection.sourceLifecycle !== "revised") ||
       execution.reviewState === "needs_review";
     retry.addEventListener("click", () => submit("retry", execution.executionId, execution.version));
     controls.append(retry);
@@ -124,6 +150,7 @@ export function mountInvocationSurface(
 ): () => void {
   let disposed = false;
   const reviewRequired = new Set<string>();
+  const reportedFailures = new Set<string>();
   const load = async (): Promise<void> => {
     try { render(await bridge.getSurface({ roomId })); }
     catch { renderFailure("503 · 无法读取执行权威状态。写操作保持关闭。"); }
@@ -134,7 +161,9 @@ export function mountInvocationSurface(
     alert.className = "invocation-panel"; alert.setAttribute("role", "alert");
     appendText(alert, "h2", "Agent 执行"); appendText(alert, "p", message);
     const retry = document.createElement("button"); retry.type = "button"; retry.textContent = "修复同步";
+    retry.dataset.invocationRecovery = "repair-room";
     retry.addEventListener("click", () => void load()); alert.append(retry); root.replaceChildren(alert);
+    retry.focus();
   };
   const submit = async (kind: "cancel" | "retry", executionId: string, expectedVersion: number) => {
     try { render((await bridge[kind]({ roomId, executionId, expectedVersion })).state); }
@@ -142,6 +171,13 @@ export function mountInvocationSurface(
   };
   const render = (state: InvocationSurfaceState): void => {
     if (disposed || state.roomId !== roomId) return;
+    const active = root.contains(document.activeElement) && document.activeElement instanceof HTMLElement
+      ? document.activeElement : undefined;
+    const activeCard = active?.closest<HTMLElement>("[data-execution-id]");
+    const priorFocus = activeCard === null || activeCard === undefined ? undefined : {
+      executionId: activeCard.dataset.executionId!,
+      action: active?.dataset.invocationAction ?? active?.dataset.invocationRecovery,
+    };
     const panel = document.createElement("section");
     panel.className = "invocation-panel"; panel.dataset.invocationSurface = "true";
     panel.setAttribute("aria-label", "Agent 执行权威状态");
@@ -174,13 +210,44 @@ export function mountInvocationSurface(
     root.replaceChildren(panel);
     const newlyRequired = state.executions.find(({ execution }) =>
       execution.reviewState === "needs_review" && !reviewRequired.has(execution.executionId));
+    const newFailure = state.operations.find((operation) =>
+      operation.status === "failed" && !reportedFailures.has(operation.requestId));
     for (const { execution } of state.executions) {
       if (execution.reviewState === "needs_review") reviewRequired.add(execution.executionId);
+    }
+    for (const operation of state.operations) {
+      if (operation.status === "failed") reportedFailures.add(operation.requestId);
     }
     if (newlyRequired !== undefined) {
       announcement.textContent = `Agent ${newlyRequired.execution.agentId} 的执行结果需要人工审阅。`;
       [...panel.querySelectorAll<HTMLElement>("[data-invocation-review]")]
         .find((element) => element.dataset.invocationReview === newlyRequired.execution.executionId)?.focus();
+      return;
+    }
+    if (newFailure?.status === "failed") {
+      const failureCard = [...panel.querySelectorAll<HTMLElement>("[data-execution-id]")]
+        .find((element) => element.dataset.executionId === newFailure.executionId);
+      const recovery = [...(failureCard?.querySelectorAll<HTMLButtonElement>(
+        "[data-invocation-recovery]",
+      ) ?? [])].find((element) =>
+        element.dataset.invocationRecovery === newFailure.error.recovery);
+      const failure = [...(failureCard?.querySelectorAll<HTMLElement>(
+        "[data-invocation-error]",
+      ) ?? [])].find((element) => element.dataset.invocationError === newFailure.requestId);
+      (recovery ?? failure ?? failureCard)?.focus();
+      return;
+    }
+    if (priorFocus !== undefined) {
+      const card = [...panel.querySelectorAll<HTMLElement>("[data-execution-id]")]
+        .find((element) => element.dataset.executionId === priorFocus.executionId);
+      const action = priorFocus.action === undefined ? undefined
+        : [...(card?.querySelectorAll<HTMLElement>(
+          "[data-invocation-action], [data-invocation-recovery]",
+        ) ?? [])].find((element) =>
+          element.dataset.invocationAction === priorFocus.action ||
+          element.dataset.invocationRecovery === priorFocus.action);
+      if (action instanceof HTMLButtonElement && !action.disabled) action.focus();
+      else card?.focus();
     }
   };
   const unsubscribe = bridge.onStateChanged((envelope) => render(envelope.state));

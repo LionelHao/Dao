@@ -68,7 +68,7 @@ export type InvocationOperationState =
 export interface InvocationExecutionProjection {
   readonly execution: AgentExecution;
   readonly attempts: readonly AgentExecutionAttempt[];
-  readonly sourceLifecycle: "active" | "recalled" | "unknown";
+  readonly sourceLifecycle: "active" | "revised" | "recalled" | "unknown";
   readonly preservedDispatchIds: readonly string[];
 }
 
@@ -132,7 +132,8 @@ function isError(value: unknown): value is InvocationClosedError {
   ]);
   const expected = allowed.get(value.status);
   return expected?.[0] === value.code && expected[1] === value.recovery &&
-    (value.retryAfterSeconds === undefined || positive(value.retryAfterSeconds));
+    (value.retryAfterSeconds === undefined ||
+      (positive(value.retryAfterSeconds) && value.retryAfterSeconds <= 86_400));
 }
 function isConnection(value: unknown): value is InvocationConnectionState {
   if (!record(value) || typeof value.status !== "string") return false;
@@ -160,7 +161,8 @@ function isExecutionProjection(value: unknown): value is InvocationExecutionProj
   ]) && isAgentExecution(value.execution) && Array.isArray(value.attempts) &&
     value.attempts.every((attempt) => isAgentExecutionAttempt(attempt) &&
       attempt.executionId === (value.execution as AgentExecution).executionId) &&
-    (value.sourceLifecycle === "active" || value.sourceLifecycle === "recalled" ||
+    (value.sourceLifecycle === "active" || value.sourceLifecycle === "revised" ||
+      value.sourceLifecycle === "recalled" ||
       value.sourceLifecycle === "unknown") && Array.isArray(value.preservedDispatchIds) &&
     value.preservedDispatchIds.every(text) &&
     new Set(value.preservedDispatchIds).size === value.preservedDispatchIds.length;

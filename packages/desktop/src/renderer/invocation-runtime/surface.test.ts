@@ -28,11 +28,14 @@ describe("production Invocation surface", () => {
     document.body.append(root);
     mountInvocationSurface(root, bridge, "room-1");
     await vi.waitFor(() => expect(root.textContent).toContain("运行中 · 等待确认"));
-    root.querySelector<HTMLButtonElement>("button")!.click();
+    const cancelButton = root.querySelector<HTMLButtonElement>("[data-invocation-action='cancel']")!;
+    cancelButton.focus();
+    cancelButton.click();
     await vi.waitFor(() => expect(cancel).toHaveBeenCalledWith({ roomId: "room-1",
       executionId: "execution-1", expectedVersion: 2 }));
     expect(root.querySelector("[data-status='running']")).not.toBeNull();
     expect(root.textContent).toContain("等待 stable event / repair");
+    expect(document.activeElement).toBe(root.querySelector("[data-execution-id='execution-1']"));
     listener?.({ roomId: "room-1", state: state({ executions: [{ execution: { ...execution,
       status: "cancelled", phase: "cancelled", version: 3, updatedAt: "2026-08-25T00:00:01.000Z",
       completedAt: "2026-08-25T00:00:01.000Z", cancellationReason: "human_cancelled" },
@@ -40,6 +43,52 @@ describe("production Invocation surface", () => {
     expect(root.querySelector("[data-status='cancelled']")).not.toBeNull();
     expect(root.textContent).toContain("未宣称撤销");
     expect(root.querySelector<HTMLButtonElement>("button")?.textContent).toContain("重试为新执行");
+    expect(document.activeElement).toBe(root.querySelector("[data-execution-id='execution-1']"));
+    root.remove();
+  });
+
+  it("marks source revision without drifting the frozen execution input", async () => {
+    const revised = state({ executions: [{ execution, attempts: [], sourceLifecycle: "revised",
+      preservedDispatchIds: [] }] });
+    const bridge: InvocationBridge = { getSurface: vi.fn().mockResolvedValue(revised),
+      cancel: vi.fn(), retry: vi.fn(), onStateChanged: () => vi.fn() };
+    const root = document.createElement("div");
+    mountInvocationSurface(root, bridge, "room-1");
+    await vi.waitFor(() => expect(root.textContent).toContain("SOURCE REVISED"));
+    expect(root.textContent).toContain("冻结输入保持不变");
+  });
+
+  it("focuses actionable 429 recovery and does not forge unsupported 401/403/410 actions", async () => {
+    let listener: ((value: InvocationStateEnvelope) => void) | undefined;
+    const cancel = vi.fn().mockResolvedValue({ requestId: "retry-later-2", state: state() });
+    const bridge: InvocationBridge = { getSurface: vi.fn().mockResolvedValue(state()),
+      cancel, retry: vi.fn(), onStateChanged: (next) => { listener = next; return vi.fn(); } };
+    const root = document.createElement("div");
+    document.body.append(root);
+    mountInvocationSurface(root, bridge, "room-1");
+    await vi.waitFor(() => expect(root.textContent).toContain("运行中"));
+    listener?.({ roomId: "room-1", state: state({ operations: [{ status: "failed",
+      requestId: "rate-1", kind: "cancel", executionId: "execution-1", expectedVersion: 2,
+      error: { status: 429, code: "rate_limited", recovery: "retry-later",
+        retryAfterSeconds: 7 } }] }) });
+    const rateRecovery = root.querySelector<HTMLButtonElement>("[data-invocation-recovery='retry-later']");
+    expect(rateRecovery?.textContent).toBe("7 秒后重试");
+    expect(document.activeElement).toBe(rateRecovery);
+    rateRecovery?.click();
+    await vi.waitFor(() => expect(cancel).toHaveBeenCalledWith({ roomId: "room-1",
+      executionId: "execution-1", expectedVersion: 2 }));
+
+    for (const error of [
+      { status: 401, code: "authentication_required", recovery: "reauthenticate" },
+      { status: 403, code: "access_revoked", recovery: "request-access" },
+      { status: 410, code: "protocol_upgrade_required", recovery: "upgrade-client" },
+    ] as const) {
+      listener?.({ roomId: "room-1", state: state({ operations: [{ status: "failed",
+        requestId: `error-${error.status}`, kind: "cancel", executionId: "execution-1",
+        expectedVersion: 2, error }] }) });
+      expect(root.querySelector(`[data-recovery-unavailable='${error.recovery}']`)).not.toBeNull();
+      expect(root.querySelector(`[data-invocation-recovery='${error.recovery}']`)).toBeNull();
+    }
     root.remove();
   });
 
@@ -56,6 +105,8 @@ describe("production Invocation surface", () => {
     await vi.waitFor(() => expect(root.textContent).toContain("离线只读"));
     expect(root.textContent).toContain("! 失败");
     expect(root.textContent).toContain("需要人工审阅");
+    expect(root.textContent).toContain("审阅闭合命令尚未接入");
+    expect(root.querySelector("[data-review-action-unavailable='true']")).not.toBeNull();
     expect(root.querySelector<HTMLButtonElement>("button")?.disabled).toBe(true);
     expect(root.querySelector("[role='alert']")).toBe(document.activeElement);
     root.remove();

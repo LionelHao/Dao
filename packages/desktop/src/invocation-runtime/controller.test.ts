@@ -130,4 +130,25 @@ describe("Invocation production controller", () => {
       .state.operations[0]).toMatchObject({ error: { status: 409 } });
     expect(controlInvocation).not.toHaveBeenCalled();
   });
+
+  it("projects a revised source marker without invalidating the frozen execution", async () => {
+    const cache = await seeded();
+    const revised = {
+      id: "message-1", roomId: "room-1", authorId: "human-1", authorKind: "human" as const,
+      createdAt: at, lifecycle: "active" as const,
+      currentRevision: { messageId: "message-1", revision: 2, body: "revised source",
+        revisedAt: "2026-08-25T00:02:00.000Z", revisedByActorId: "human-1" },
+      revisionCount: 2, mentionedTargets: [], attachments: [], targetOutcomes: [],
+    };
+    cache.applyRoomEvents("room-1", [{ eventId: "event-revised-6", streamKind: "room",
+      streamId: "room-1", streamSeq: 6, roomId: "room-1", actorId: "human-1",
+      occurredAt: revised.currentRevision.revisedAt, type: "room.message.revised", payload: revised }],
+    { version: 1, roomId: "room-1", afterSeq: 6 });
+    const controller = createInvocationController({ cache, transport: { controlInvocation: vi.fn() },
+      repairRoom: vi.fn().mockResolvedValue(undefined), session: () => ({ actorId: "human-1",
+        sessionId: "session-1", accessToken: "secret", expiresAt: at }),
+      createRequestId: () => "request-1" });
+    expect((await controller.getSurface({ roomId: "room-1" })).executions[0])
+      .toMatchObject({ execution: { snapshotId: "snapshot-1" }, sourceLifecycle: "revised" });
+  });
 });

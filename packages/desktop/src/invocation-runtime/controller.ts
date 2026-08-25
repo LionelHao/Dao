@@ -35,7 +35,9 @@ function closedError(error: unknown): InvocationClosedError {
     case "snapshot_expired":
       return { status: 410, code: "protocol_upgrade_required", recovery: "upgrade-client" };
     case "rate_limited":
-      return { status: 429, code: "rate_limited", recovery: "retry-later" };
+      return { status: 429, code: "rate_limited", recovery: "retry-later",
+        ...(error.retryAfterSeconds === undefined
+          ? {} : { retryAfterSeconds: error.retryAfterSeconds }) };
     default:
       return { status: 503, code: "service_unavailable", recovery: "repair-room" };
   }
@@ -55,12 +57,17 @@ function recordsState(
   const cancellations = values.flatMap((record) => record.kind === "agent-scoped-cancellation"
     ? [record.value] : []);
   const timeline = new Map(values.flatMap((record) => record.kind === "timeline-message"
-    ? [[record.value.id, record.value.lifecycle] as const] : []));
+    ? [[record.value.id, record.value] as const] : []));
   const executions = values.flatMap((record) => {
     if (record.kind !== "agent-execution") return [];
     const intent = intents.get(record.value.intentId);
-    const sourceLifecycle = intent === undefined ? "unknown" as const
-      : timeline.get(intent.sourceMessageId) ?? "unknown" as const;
+    const source = intent === undefined ? undefined : timeline.get(intent.sourceMessageId);
+    const sourceLifecycle = source === undefined ? "unknown" as const
+      : source.lifecycle === "recalled" ? "recalled" as const
+        : source.authorKind !== "human" || intent === undefined ? "unknown" as const
+          : source.currentRevision.revision === intent.sourceRevision ? "active" as const
+            : source.currentRevision.revision > intent.sourceRevision ? "revised" as const
+              : "unknown" as const;
     const preservedDispatchIds = cancellations.flatMap((receipt) =>
       receipt.executionOutcomes.some((outcome) => outcome.executionId === record.value.executionId)
         ? receipt.preservedDispatchIds : []);
@@ -182,7 +189,8 @@ export function createInvocationController(options: {
     const eligible = kind === "cancel"
       ? current.value.status === "accepted" || current.value.status === "running"
       : (current.value.status === "failed" || current.value.status === "cancelled") &&
-        projection?.sourceLifecycle === "active" && current.value.reviewState !== "needs_review";
+        (projection?.sourceLifecycle === "active" || projection?.sourceLifecycle === "revised") &&
+        current.value.reviewState !== "needs_review";
     if (!eligible) {
       operations.set(input.executionId, {
         status: "failed", requestId, kind, executionId: input.executionId,
