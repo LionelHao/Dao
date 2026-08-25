@@ -26,6 +26,8 @@ The production slice is Goal / Decision / Request / Obstacle / NextAction author
 
 The v14 tables are deliberately insufficient as FT-09 authority. They do not model Goals or Decisions; their Request, Obstacle and NextAction shapes omit revisions, provenance, timestamps and confirmation/transition contracts; there is no project snapshot/event projection, command protocol, repair descriptor, or Desktop production surface. Project-boundary invocations are suppressed rather than converted into authoritative facts. Legacy `OpenItem`, `LightTask`, and `BallInCourt` are compatibility inputs and must not become the canonical Project Loop model.
 
+The shipped FT-03 structured Human mention contract contains a stable target and source range, but no separate Request title, acceptance mode, or responsibility factory. J-04 likewise does not introduce a second Request form. Stage 11 therefore freezes a closed, deterministic, server-owned compatibility payload for that existing path: a structured `@Human` mention creates a generic `open_question` Request and linked OpenQuestion factory containing only safe fixed copy, stable actor/source identifiers, and no message body, display name, attachment content, or model corpus. Accept consumes that already-persisted payload; it never accepts a new responsibility blob from the client. Explicit Project proposals remain capable of freezing `next_action`, `open_question`, or `blocker` payloads. This closes the actual predecessor gap without parsing natural language or adding an unreviewed UI step.
+
 ## State and design mapping
 
 | Journey / surface | FT | Visible transition | Source of truth |
@@ -61,4 +63,3 @@ All authoritative mutations follow: local intent → command/ACK → stable even
 - The four pre-existing untracked plan files in `/Users/leo/code/Dao` are protected and must retain their recorded hashes.
 - Design deviation: **none**.
 - A visible state absent from the formal review is not invented; unsupported demo behavior remains prototype-only.
-
