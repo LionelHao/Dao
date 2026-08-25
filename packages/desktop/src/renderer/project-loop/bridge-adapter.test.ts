@@ -220,6 +220,39 @@ describe("FT-09 Project Loop timeline integration", () => {
     dispose(); workspace.remove();
   });
 
+  it("discards an in-flight historical source when Room access is revoked", async () => {
+    const workspace = document.createElement("main"); workspace.className = "room-authority-workspace";
+    const timeline = document.createElement("section"); timeline.className = "room-authority-workspace__timeline";
+    const current = document.createElement("article"); current.dataset.messageId = "message-1";
+    current.dataset.messageRevision = "2"; timeline.append(current);
+    const project = document.createElement("aside"); project.className = "room-authority-workspace__project";
+    workspace.append(timeline, project); document.body.append(workspace);
+    const ready = { status: "ready" as const, roomId: "room-1", snapshot: projectSnapshot(),
+      viewerActorId: "human-1", connection: { status: "online" as const }, operation: { status: "idle" as const } };
+    let listener: Parameters<ProjectLoopBridge["onStateChanged"]>[0] | undefined;
+    const bridge: ProjectLoopBridge = { getSurface: vi.fn(async () => ready), submit: vi.fn(async () => ready),
+      onStateChanged(next) { listener = next; return () => {}; } };
+    let resolveQuery: ((value: Awaited<ReturnType<MessageAuthorityBridge["revisionsQuery"]>>) => void) | undefined;
+    const messageBridge = { revisionsQuery: vi.fn(() => new Promise((resolve) => { resolveQuery = resolve; }))
+    } as unknown as MessageAuthorityBridge;
+    const dispose = mountProjectLoopBridgeSurface(project, bridge, "room-1", { reducedMotion: true,
+      onSearch: vi.fn(), onNavigateSegment: vi.fn(), onReauthenticate: vi.fn(), messageBridge });
+    await vi.waitFor(() => expect(project.querySelector('[data-category="requests"]')).not.toBeNull());
+    project.querySelector<HTMLButtonElement>('[data-category="requests"]')?.click();
+    project.querySelector<HTMLButtonElement>(".project-loop__content .project-loop__source")?.click();
+    expect(messageBridge.revisionsQuery).toHaveBeenCalledOnce();
+    listener?.({ roomId: "room-1", state: { status: "locked", roomId: "room-1",
+      error: { status: 403, code: "access_revoked" } } });
+    resolveQuery?.({ type: "message.revisions", requestId: "revision-query-1", roomId: "room-1",
+      messageId: "message-1", revisions: [{ messageId: "message-1", revision: 1,
+        body: "must not reappear", revisedAt: "2026-08-25T01:02:03.004Z", revisedByActorId: "human-1" }],
+      hasMore: false });
+    await Promise.resolve(); await Promise.resolve();
+    expect(timeline.querySelector("[data-project-historical-source]")).toBeNull();
+    expect(timeline.textContent).not.toContain("must not reappear");
+    dispose(); workspace.remove();
+  });
+
   it.each(["agent_execution", "attachment", "memory", "project_fact"] as const)(
     "deep-links an exact %s source without crossing source kinds",
     async (kind) => {

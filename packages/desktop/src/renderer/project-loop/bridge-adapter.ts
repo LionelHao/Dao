@@ -267,6 +267,8 @@ export function mountProjectLoopBridgeSurface(
   const apply = (state: ProjectLoopRemoteState): void => {
     authoritySequence += 1;
     if (state.roomId !== roomId) return;
+    sourceLookupSequence += 1;
+    historicalSource?.remove(); historicalSource = undefined;
     current = state;
     render();
   };
