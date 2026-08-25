@@ -976,6 +976,53 @@ describe("authenticated message WebSocket service", () => {
     }
   });
 
+  it("fails closed when an overflow reset cannot fit the exact Room byte budget", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "preview-reset-byte-budget");
+    const blocked = deferred<void>();
+    const blockedStarted = deferred<void>();
+    let blockNext = false;
+    const auth: AuthenticationService = {
+      async login() { return session; }, async authenticate() { return principal; },
+      async authenticateSession() {
+        return { sessionId: session.accessToken, sessionFamilyId: "family-preview", principal };
+      },
+      async refresh() { return session; }, async revoke() {},
+    };
+    const server = await startMessageWebSocketServer({
+      auth, service: idleMessageService(), outboxStore: idleOutboxStore(),
+      previewAuthority: previewDeliveryAuthority(async () => {
+        if (blockNext) {
+          blockNext = false;
+          blockedStarted.resolve();
+          await blocked.promise;
+        }
+        return { authorized: true, authorityEpoch: "reset-byte-budget:1" };
+      }),
+    });
+    const client = await LoopbackClient.connect(server.url);
+    try {
+      await client.login(humans[0]);
+      await client.subscribe(roomId);
+      blockNext = true;
+      const delivery = server.publishAgentPreview({
+        roomId, executionId: "queued", attemptSeq: 1, streamSeq: 1, delta: "x",
+      });
+      await blockedStarted.promise;
+      await server.resetAgentPreview({
+        roomId,
+        executionId: "oversized-".padEnd(270 * 1_024, "x"),
+        attemptSeq: 1,
+        reason: "execution_terminal",
+      });
+      await client.waitForClose();
+      blocked.resolve();
+      await delivery;
+    } finally {
+      blocked.resolve(); await client.close(); await server.close();
+    }
+  });
+
   it("fences an authorized preview result to the captured subscription generation", async () => {
     const principal = { accountId: "account-human-1", actorId: humans[0].id };
     const session = issuedSession(principal, "preview-generation");

@@ -3221,12 +3221,16 @@ export async function startMessageWebSocketServer(
     bytes: number;
     generation: number;
     overflowResets: Map<string, Readonly<{
-      roomId: string;
-      executionId: string;
-      attemptSeq: number;
-      reason?: "human_cancelled" | "message_recalled" | "runtime_shutdown" | "repair" |
-        "reconnect" | "execution_terminal" | "attempt_rolled_over" | "access_revoked";
+      preview: Readonly<{
+        roomId: string;
+        executionId: string;
+        attemptSeq: number;
+        reason?: "human_cancelled" | "message_recalled" | "runtime_shutdown" | "repair" |
+          "reconnect" | "execution_terminal" | "attempt_rolled_over" | "access_revoked";
+      }>;
+      bytes: number;
     }>>;
+    overflowResetBytes: number;
     scheduledAttempts: Map<string, number>;
     failedClosed: boolean;
   }>();
@@ -3235,7 +3239,7 @@ export async function startMessageWebSocketServer(
   const maxPreviewDeliveryBytesPerRoom = 256 * 1_024;
   const maxQueuedPreviewFramesPerRoom = 32;
   const maxOverflowResetsPerRoom = maxPreviewDeliveryCountPerRoom - maxQueuedPreviewFramesPerRoom;
-  const previewResetBytes = 128;
+  const previewResetBytes = 4 * 1_024;
   const maxQueuedPreviewBytesPerRoom = maxPreviewDeliveryBytesPerRoom -
     maxOverflowResetsPerRoom * previewResetBytes;
 
@@ -3346,7 +3350,17 @@ export async function startMessageWebSocketServer(
     let queuedFrameCount = 0;
     let queuedFrameBytes = 0;
     const abort = () => {
+      const previewRooms = new Set([
+        ...context.unsubscribersByRoom.keys(),
+        ...context.v2GatesByRoom.keys(),
+      ]);
       abortConnection(context);
+      for (const roomId of previewRooms) {
+        const roomStillSubscribed = [...liveConnections.values()].some(({ context: candidate }) =>
+          !candidate.closed && (candidate.unsubscribersByRoom.has(roomId) ||
+            candidate.v2GatesByRoom.has(roomId)));
+        if (!roomStillSubscribed) visiblePreviewAttemptsByRoom.delete(roomId);
+      }
     };
 
     abortConnectionBySocket.set(socket, abort);
@@ -3528,12 +3542,28 @@ export async function startMessageWebSocketServer(
     deliveryKind: "preview" | "reset",
     preview: Parameters<typeof deliverAuthorizedPreview>[1],
   ): Promise<void> => {
-    const bytes = Buffer.byteLength(preview.delta ?? "", "utf8") + 128;
+    const bytes = Buffer.byteLength(JSON.stringify(deliveryKind === "preview" ? {
+      type: "agent.execution.preview",
+      roomId: preview.roomId,
+      executionId: preview.executionId,
+      attemptSeq: preview.attemptSeq,
+      streamSeq: preview.streamSeq!,
+      delta: preview.delta!,
+      authoritative: false,
+    } : {
+      type: "agent.execution.preview.reset",
+      roomId: preview.roomId,
+      executionId: preview.executionId,
+      attemptSeq: preview.attemptSeq,
+      reason: preview.reason!,
+      authoritative: false,
+    }), "utf8");
     const attemptKey = `${preview.executionId}\u0000${preview.attemptSeq}`;
     let queue = previewDeliveryQueues.get(preview.roomId);
     if (queue === undefined) {
       queue = { tail: Promise.resolve(), count: 0, bytes: 0, generation: 1,
-        overflowResets: new Map(), scheduledAttempts: new Map(), failedClosed: false };
+        overflowResets: new Map(), overflowResetBytes: 0,
+        scheduledAttempts: new Map(), failedClosed: false };
       previewDeliveryQueues.set(preview.roomId, queue);
     }
     if (queue.failedClosed) return Promise.resolve();
@@ -3555,6 +3585,7 @@ export async function startMessageWebSocketServer(
         // connection that could retain its transient state.
         queue.failedClosed = true;
         queue.overflowResets.clear();
+        queue.overflowResetBytes = 0;
         visiblePreviewAttemptsByRoom.delete(preview.roomId);
         for (const { socket, context } of liveConnections.values()) {
           if (context.unsubscribersByRoom.has(preview.roomId) ||
@@ -3562,12 +3593,32 @@ export async function startMessageWebSocketServer(
         }
         return Promise.resolve();
       }
-      queue.overflowResets.set(attemptKey, {
+      const resetPreview = {
         roomId: preview.roomId,
         executionId: preview.executionId,
         attemptSeq: preview.attemptSeq,
         reason: deliveryKind === "reset" ? preview.reason ?? "repair" : "repair",
-      });
+      } as const;
+      const resetBytes = Buffer.byteLength(JSON.stringify({
+        type: "agent.execution.preview.reset",
+        ...resetPreview,
+        authoritative: false,
+      }), "utf8");
+      const replacedResetBytes = queue.overflowResets.get(attemptKey)?.bytes ?? 0;
+      const nextOverflowResetBytes = queue.overflowResetBytes - replacedResetBytes + resetBytes;
+      if (queue.bytes + nextOverflowResetBytes > maxPreviewDeliveryBytesPerRoom) {
+        queue.failedClosed = true;
+        queue.overflowResets.clear();
+        queue.overflowResetBytes = 0;
+        visiblePreviewAttemptsByRoom.delete(preview.roomId);
+        for (const { socket, context } of liveConnections.values()) {
+          if (context.unsubscribersByRoom.has(preview.roomId) ||
+              context.v2GatesByRoom.has(preview.roomId)) abortAndTerminate(socket);
+        }
+        return Promise.resolve();
+      }
+      queue.overflowResets.set(attemptKey, { preview: resetPreview, bytes: resetBytes });
+      queue.overflowResetBytes = nextOverflowResetBytes;
       return Promise.resolve();
     }
     const generation = queue.generation;
@@ -3602,15 +3653,17 @@ export async function startMessageWebSocketServer(
       }
       while (queue!.count === 0 && queue!.overflowResets.size > 0 && !queue!.failedClosed) {
         const next = queue!.overflowResets.entries().next().value as
-          | [string, Readonly<{ roomId: string; executionId: string; attemptSeq: number;
-            reason?: "human_cancelled" | "message_recalled" | "runtime_shutdown" | "repair" |
-              "reconnect" | "execution_terminal" | "attempt_rolled_over" | "access_revoked" }>]
+          | [string, Readonly<{ preview: Readonly<{ roomId: string; executionId: string;
+            attemptSeq: number; reason?: "human_cancelled" | "message_recalled" |
+              "runtime_shutdown" | "repair" | "reconnect" | "execution_terminal" |
+              "attempt_rolled_over" | "access_revoked" }>; bytes: number }>]
           | undefined;
         if (next === undefined) break;
         const [resetKey, reset] = next;
-        const resetDelivered = await deliverAuthorizedPreview("reset", reset,
+        const resetDelivered = await deliverAuthorizedPreview("reset", reset.preview,
           () => queue!.generation === generation && !queue!.failedClosed);
         queue!.overflowResets.delete(resetKey);
+        queue!.overflowResetBytes -= reset.bytes;
         if (resetDelivered) {
           const visible = visiblePreviewAttemptsByRoom.get(preview.roomId);
           visible?.delete(resetKey);
