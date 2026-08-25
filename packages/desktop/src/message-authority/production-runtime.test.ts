@@ -133,6 +133,40 @@ describe("production Desktop Message Authority runtime", () => {
     runtime.close();
   });
 
+  it("forwards real preview/reset frames only as transient room inputs", async () => {
+    const server = await runtimeServer();
+    const runtime = createDesktopMessageAuthorityRuntime({
+      endpoint: server.endpoint, session,
+      webSocketFactory: (endpoint) =>
+        new WebSocket(endpoint) as unknown as MessageAuthorityWebSocketLike,
+      timeoutMs: 2_000, now: () => now,
+    });
+    const inputs: unknown[] = [];
+    runtime.client.subscribe((input) => inputs.push(input));
+    await runtime.client.historyV2({
+      type: "room.history.v2", requestId: "history-preview", roomId: "room-1",
+    });
+
+    server.send({ type: "agent.execution.preview", roomId: "room-1",
+      executionId: "execution-1", attemptSeq: 1, streamSeq: 1,
+      delta: "PREVIEW-WIRE-SENTINEL", authoritative: false });
+    server.send({ type: "agent.execution.preview.reset", roomId: "room-1",
+      executionId: "execution-1", attemptSeq: 1,
+      reason: "human_cancelled", authoritative: false });
+
+    await vi.waitFor(() => expect(inputs).toContainEqual({
+      type: "agent.execution.preview", roomId: "room-1", executionId: "execution-1",
+      attemptSeq: 1, streamSeq: 1, delta: "PREVIEW-WIRE-SENTINEL", authoritative: false,
+    }));
+    expect(inputs).toContainEqual({
+      type: "agent.execution.preview.reset", roomId: "room-1", executionId: "execution-1",
+      attemptSeq: 1, reason: "human_cancelled", authoritative: false,
+    });
+    expect(inputs.filter((input) => (input as { type?: string }).type === "room.event"))
+      .toHaveLength(0);
+    runtime.close();
+  });
+
   it("advances mixed Room cursors and publishes offline/revoked terminal states", async () => {
     const server = await runtimeServer();
     const runtime = createDesktopMessageAuthorityRuntime({

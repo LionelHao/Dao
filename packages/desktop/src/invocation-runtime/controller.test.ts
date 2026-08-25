@@ -47,7 +47,13 @@ describe("Invocation production controller", () => {
   it("keeps ACK transient and changes canonical status only after the stable event", async () => {
     const cache = await seeded();
     const controlInvocation = vi.fn().mockResolvedValue({ type: "invocation.cancel.ack",
-      requestId: "cancel-1", replayed: false });
+      requestId: "cancel-1", receipt: {
+        requestId: "cancel-1", fenceId: "fence-1", roomId: "room-1", lineageId: "lineage-1",
+        scope: { kind: "execution", executionId: "execution-1", expectedVersion: 2 },
+        reason: "human_cancelled", intentOutcomes: [{ intentId: "intent-1", outcome: "already_claimed" }],
+        executionOutcomes: [{ executionId: "execution-1", outcome: "cancelled", version: 3 }],
+        rejectedConfirmationIds: [], revokedGrantIds: [], preservedDispatchIds: [], committedAt: at,
+      } });
     const controller = createInvocationController({ cache, transport: { controlInvocation },
       repairRoom: vi.fn().mockResolvedValue(undefined), session: () => ({ actorId: "human-1",
         sessionId: "session-1", accessToken: "secret", expiresAt: at }),

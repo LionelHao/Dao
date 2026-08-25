@@ -287,14 +287,31 @@ describe("REQ-MSG-004/005/006/007/008 timeline authority", () => {
       type: "agent.preview",
       executionId: "execution-1",
       attemptSeq: 1,
-      agentId: "agent-search",
+      streamSeq: 1,
       delta: "PREVIEW-SENTINEL",
       authoritative: false,
     });
     expect(withPreview.timeline.map((entry) => JSON.stringify(entry)).join(" ")).not.toContain("PREVIEW-SENTINEL");
     expect(withPreview.previews[0]?.delta).toBe("PREVIEW-SENTINEL");
 
-    const final = applyMessageAuthorityInput(withPreview, {
+    const accumulated = applyMessageAuthorityInput(withPreview, {
+      type: "agent.preview", executionId: "execution-1", attemptSeq: 1, streamSeq: 2,
+      delta: "-NEXT", authoritative: false,
+    });
+    expect(accumulated.previews[0]).toMatchObject({
+      attemptSeq: 1, streamSeq: 2, delta: "PREVIEW-SENTINEL-NEXT",
+    });
+    const stale = applyMessageAuthorityInput(accumulated, {
+      type: "agent.preview", executionId: "execution-1", attemptSeq: 1, streamSeq: 1,
+      delta: "-STALE", authoritative: false,
+    });
+    expect(stale).toBe(accumulated);
+    const reset = applyMessageAuthorityInput(stale, {
+      type: "agent.preview.reset", executionId: "execution-1", attemptSeq: 1,
+    });
+    expect(reset.previews).toEqual([]);
+
+    const final = applyMessageAuthorityInput(accumulated, {
       type: "room.message.accepted",
       eventId: "event-final-1",
       message: {

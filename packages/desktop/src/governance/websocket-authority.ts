@@ -4,13 +4,16 @@ import {
   isRoomRepairPage,
   isSnapshotCompleted,
   isWorkspaceBootstrapPage,
-  isLegacyAgentExecution,
+  isAgentExecutionRetryReceipt,
+  isScopedCancellationReceipt,
+  type AgentExecutionRetryReceipt,
   type RoomCursor,
   type RoomGovernanceView,
   type RoomRepairPage,
   type RoomSyncRequest,
   type SnapshotCompleted,
   type SnapshotVersion,
+  type ScopedCancellationReceipt,
   type WorkspaceBootstrapPage,
 } from "@native-im/core";
 import type { IdentityAuthoritySession } from "../identity/controller.js";
@@ -74,11 +77,11 @@ export interface InvocationWireCommand {
   readonly expectedVersion: number;
 }
 
-export interface InvocationWireAck {
-  readonly type: "invocation.cancel.ack" | "invocation.retry.ack";
-  readonly requestId: string;
-  readonly replayed: boolean;
-}
+export type InvocationWireAck =
+  | Readonly<{ type: "invocation.cancel.ack"; requestId: string;
+      receipt: ScopedCancellationReceipt }>
+  | Readonly<{ type: "invocation.retry.ack"; requestId: string;
+      receipt: AgentExecutionRetryReceipt; replayed: boolean }>;
 
 export interface GovernanceAuthorityTransport extends SyncTransport {
   queryDepartureConflicts(input: {
@@ -139,28 +142,6 @@ function timestamp(value: unknown): value is string {
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
 }
-function scopedCancellationEffect(value: unknown): boolean {
-  if (!record(value) || !exact(value, [
-    "sourceMessageId", "sourceRevision", "invocationIntentId", "disposition",
-    "confirmationDisposition", "grantDisposition", "sideEffectState",
-  ], ["executionId", "attemptSeq"]) || !text(value.sourceMessageId) ||
-      !Number.isSafeInteger(value.sourceRevision) || (value.sourceRevision as number) <= 0 ||
-      !text(value.invocationIntentId) ||
-      !new Set(["intent_cancelled", "execution_cancelled", "already_terminal"]).has(value.disposition as string) ||
-      !new Set(["none", "pending_rejected", "confirmed_retained"]).has(value.confirmationDisposition as string) ||
-      !new Set(["none", "unclaimed_revoked", "claimed_retained"]).has(value.grantDisposition as string) ||
-      !new Set(["none", "dispatched-retained", "outcome-unknown-retained"]).has(value.sideEffectState as string)) {
-    return false;
-  }
-  if (value.disposition === "intent_cancelled") {
-    return value.executionId === undefined && value.attemptSeq === undefined &&
-      value.confirmationDisposition === "none" && value.grantDisposition === "none" &&
-      value.sideEffectState === "none";
-  }
-  return text(value.executionId) && Number.isSafeInteger(value.attemptSeq) &&
-    (value.attemptSeq as number) > 0;
-}
-
 type ParsedFrame =
   | { readonly type: "auth.authenticated"; readonly requestId: string; readonly actorId: string; readonly sessionId: string }
   | ({ readonly type: "room.governance.ack" } & GovernanceWireAck)
@@ -235,20 +216,17 @@ export function parseGovernanceServerFrame(raw: string): ParsedFrame | undefined
     }
     case "invocation.cancel.ack": {
       if (!exact(value, ["type", "requestId", "receipt"]) || !text(value.requestId, 128) ||
-          !record(value.receipt) || !exact(value.receipt, [
-            "kind", "fenceId", "roomId", "producerId", "reason", "replayed", "effects",
-          ]) || value.receipt.kind !== "scoped-cancellation-committed" ||
-          !text(value.receipt.fenceId) || !text(value.receipt.roomId) ||
-          !text(value.receipt.producerId) || value.receipt.reason !== "human_cancelled" ||
-          typeof value.receipt.replayed !== "boolean" || !Array.isArray(value.receipt.effects) ||
-          value.receipt.effects.length > 1_000 || !value.receipt.effects.every(scopedCancellationEffect)) return undefined;
-      return { type: value.type, requestId: value.requestId, replayed: value.receipt.replayed };
+          !isScopedCancellationReceipt(value.receipt) ||
+          value.receipt.requestId !== value.requestId) return undefined;
+      return { type: value.type, requestId: value.requestId,
+        receipt: structuredClone(value.receipt) };
     }
     case "invocation.retry.ack":
-      return exact(value, ["type", "requestId", "execution", "replayed"]) &&
-        text(value.requestId, 128) && isLegacyAgentExecution(value.execution) &&
-        typeof value.replayed === "boolean"
-        ? { type: value.type, requestId: value.requestId, replayed: value.replayed }
+      return exact(value, ["type", "requestId", "receipt", "replayed"]) &&
+        text(value.requestId, 128) && isAgentExecutionRetryReceipt(value.receipt) &&
+        value.receipt.requestId === value.requestId && typeof value.replayed === "boolean"
+        ? { type: value.type, requestId: value.requestId,
+          receipt: structuredClone(value.receipt), replayed: value.replayed }
         : undefined;
     case "room.departure.conflicts.result":
       return exact(value, ["type", "requestId", "conflicts"]) && text(value.requestId, 128) &&
@@ -585,7 +563,16 @@ export function createGovernanceWebSocketAuthority(options: {
       const responseType = command.type === "invocation.cancel"
         ? "invocation.cancel.ack" as const : "invocation.retry.ack" as const;
       const response = await exactRequest<InvocationWireAck>({ ...command }, responseType);
-      if (response.type !== responseType) throw new GovernanceTransportError("protocol_error");
+      if (response.type !== responseType ||
+          (response.type === "invocation.cancel.ack" &&
+            (response.receipt.scope.kind !== "execution" ||
+              response.receipt.scope.executionId !== command.executionId ||
+              response.receipt.scope.expectedVersion !== command.expectedVersion ||
+              response.receipt.reason !== "human_cancelled")) ||
+          (response.type === "invocation.retry.ack" &&
+            response.receipt.sourceExecutionId !== command.executionId)) {
+        throw new GovernanceTransportError("protocol_error");
+      }
       return response;
     },
     onTerminalRevoked(listener) { terminalListeners.add(listener); return () => terminalListeners.delete(listener); },

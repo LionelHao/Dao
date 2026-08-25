@@ -104,6 +104,28 @@ describe("Message Authority WebSocket transport", () => {
       event: acceptedEvent,
     }))).toMatchObject({ type: "room.event", event: acceptedEvent });
     expect(parseMessageAuthorityServerFrame(JSON.stringify({
+      type: "agent.execution.preview", roomId: "room-1", executionId: "execution-1",
+      attemptSeq: 1, streamSeq: 2, delta: "partial", authoritative: false,
+    }))).toEqual({
+      type: "agent.execution.preview", roomId: "room-1", executionId: "execution-1",
+      attemptSeq: 1, streamSeq: 2, delta: "partial", authoritative: false,
+    });
+    expect(parseMessageAuthorityServerFrame(JSON.stringify({
+      type: "agent.execution.preview.reset", roomId: "room-1", executionId: "execution-1",
+      attemptSeq: 1, reason: "human_cancelled", authoritative: false,
+    }))).toEqual({
+      type: "agent.execution.preview.reset", roomId: "room-1", executionId: "execution-1",
+      attemptSeq: 1, reason: "human_cancelled", authoritative: false,
+    });
+    expect(parseMessageAuthorityServerFrame(JSON.stringify({
+      type: "agent.execution.preview", roomId: "room-1", executionId: "execution-1",
+      attemptSeq: 1, streamSeq: 2, delta: "partial", authoritative: true,
+    }))).toBeUndefined();
+    expect(parseMessageAuthorityServerFrame(JSON.stringify({
+      type: "agent.execution.preview.reset", roomId: "room-1", executionId: "execution-1",
+      attemptSeq: 1, reason: "principal_revoked", authoritative: false,
+    }))).toBeUndefined();
+    expect(parseMessageAuthorityServerFrame(JSON.stringify({
       type: "error", requestId: "send-archived", status: 409,
       code: "room_archived", message: "must not be parsed by the UI",
     }))).toMatchObject({

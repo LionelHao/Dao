@@ -122,8 +122,8 @@ export interface AgentExecutionProjection {
 
 export interface AgentPreview {
   readonly executionId: string;
-  readonly agentId: string;
   readonly attemptSeq: number;
+  readonly streamSeq: number;
   readonly delta: string;
   readonly authoritative: false;
 }
@@ -211,6 +211,8 @@ export type MessageAuthorityInput =
   | { readonly type: "room.message.revised"; readonly eventId: string; readonly messageId: string; readonly revision: number; readonly body: string; readonly revisedAt: string }
   | { readonly type: "room.message.recalled"; readonly eventId: string; readonly tombstone: MessageTombstone }
   | ({ readonly type: "agent.preview" } & AgentPreview)
+  | { readonly type: "agent.preview.reset"; readonly executionId: string;
+      readonly attemptSeq: number }
   | { readonly type: "execution.projection"; readonly eventId: string; readonly execution: AgentExecutionProjection }
   | { readonly type: "repair.started"; readonly watermark: number };
 
@@ -596,17 +598,30 @@ export function applyMessageAuthorityInput(
     case "execution.projection": return applyExecutionEvent(state, input);
     case "agent.preview": {
       const index = state.previews.findIndex((entry) => entry.executionId === input.executionId);
+      const current = index < 0 ? undefined : state.previews[index];
+      if (current !== undefined && (current.attemptSeq > input.attemptSeq ||
+          (current.attemptSeq === input.attemptSeq && current.streamSeq >= input.streamSeq))) {
+        return state;
+      }
       const preview: AgentPreview = {
         executionId: input.executionId,
-        agentId: input.agentId,
         attemptSeq: input.attemptSeq,
-        delta: input.delta,
+        streamSeq: input.streamSeq,
+        delta: current?.attemptSeq === input.attemptSeq
+          ? `${current.delta}${input.delta}` : input.delta,
         authoritative: false,
       };
       const previews = [...state.previews];
       if (index < 0) previews.push(preview);
       else previews[index] = preview;
       return withState(state, { previews });
+    }
+    case "agent.preview.reset": {
+      const preview = state.previews.find((entry) => entry.executionId === input.executionId);
+      if (preview === undefined || preview.attemptSeq > input.attemptSeq) return state;
+      return withState(state, {
+        previews: state.previews.filter((entry) => entry.executionId !== input.executionId),
+      });
     }
     case "repair.started":
       return withState(state, {
