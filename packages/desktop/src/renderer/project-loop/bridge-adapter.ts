@@ -1,4 +1,5 @@
 import type { ProjectLoopBridge } from "../../project-loop/contracts.js";
+import type { MessageAuthorityBridge } from "../../message-authority/contracts.js";
 import type { ProjectLoopRemoteState } from "./view-model.js";
 import { renderProjectLoopSurface, type ProjectLoopSurfaceActions } from "./surface.js";
 
@@ -11,6 +12,7 @@ export function mountProjectLoopBridgeSurface(
     onSearch: () => void;
     onNavigateSegment: ProjectLoopSurfaceActions["onNavigateSegment"];
     onReauthenticate: () => void;
+    messageBridge?: MessageAuthorityBridge;
   }>,
 ): () => void {
   let active = true;
@@ -20,6 +22,8 @@ export function mountProjectLoopBridgeSurface(
   let observedTimeline: HTMLElement | undefined;
   let lastTimelineControlId: string | undefined;
   let lastTimelineRequestId: string | undefined;
+  let historicalSource: HTMLElement | undefined;
+  let sourceLookupSequence = 0;
   const timelineTransferDrafts = new Map<string, string>();
   const rememberTimelineFocus = (event: FocusEvent): void => {
     if (!(event.target instanceof HTMLElement)) return;
@@ -49,7 +53,10 @@ export function mountProjectLoopBridgeSurface(
     }
     timelineObserver?.disconnect();
     for (const prior of timeline.querySelectorAll("[data-project-request-card]")) prior.remove();
-    if (current.status !== "ready") return;
+    if (current.status !== "ready") {
+      historicalSource?.remove(); historicalSource = undefined;
+      return;
+    }
     for (const request of current.snapshot.requests) {
       const source = request.provenance.source;
       if (source.kind !== "message") continue;
@@ -148,6 +155,8 @@ export function mountProjectLoopBridgeSurface(
     onSearch: options.onSearch,
     onNavigateSegment: options.onNavigateSegment,
     onOpenSource(source) {
+      const lookupSequence = ++sourceLookupSequence;
+      historicalSource?.remove(); historicalSource = undefined;
       const host = root.closest(".room-authority-workspace") ?? root;
       const compactSegment = source.kind === "message" || source.kind === "attachment"
         ? "timeline" : "project";
@@ -196,20 +205,62 @@ export function mountProjectLoopBridgeSurface(
           item.dataset.sourceKind === source.kind;
         return id === source.sourceId && revision === String(source.sourceRevision) && kindMatches;
       }) ?? null;
+      const reveal = (target: HTMLElement | null, unavailable?: string): void => {
+        if (!active || lookupSequence !== sourceLookupSequence) return;
+        const visibleTarget = target?.closest("[hidden]") === null ? target : null;
+        const panel = root.querySelector<HTMLElement>(".project-loop");
+        if (panel !== null) panel.dataset.projectSourceLookup = visibleTarget === null
+          ? "exact-source-unavailable" : "exact";
+        const status = root.querySelector<HTMLElement>(".project-loop__source-status");
+        if (status !== null) status.textContent = visibleTarget === null
+          ? (unavailable ?? "无法定位精确的来源类型与版本；未打开其他对象。")
+          : `已定位精确来源 ${source.kind}:${source.sourceId} r${source.sourceRevision}。`;
+        visibleTarget?.scrollIntoView?.({ block: "center" });
+        if (visibleTarget !== null) {
+          visibleTarget.dataset.projectSourceHighlight = "exact-revision";
+          visibleTarget.tabIndex = -1;
+          visibleTarget.focus();
+        }
+      };
       const visibleCandidate = candidate?.closest("[hidden]") === null ? candidate : null;
-      const panel = root.querySelector<HTMLElement>(".project-loop");
-      if (panel !== null) panel.dataset.projectSourceLookup = visibleCandidate === null
-        ? "exact-source-unavailable" : "exact";
-      const status = root.querySelector<HTMLElement>(".project-loop__source-status");
-      if (status !== null) status.textContent = visibleCandidate === null
-        ? "无法定位精确的来源类型与版本；未打开其他对象。"
-        : `已定位精确来源 ${source.kind}:${source.sourceId} r${source.sourceRevision}。`;
-      visibleCandidate?.scrollIntoView?.({ block: "center" });
-      if (visibleCandidate !== null) {
-        visibleCandidate.dataset.projectSourceHighlight = "exact-revision";
-        visibleCandidate.tabIndex = -1;
-        visibleCandidate.focus();
+      if (visibleCandidate !== null || source.kind !== "message" || options.messageBridge === undefined) {
+        reveal(visibleCandidate); return;
       }
+      const timeline = host.querySelector<HTMLElement>(".room-authority-workspace__timeline");
+      const currentMessage = [...(timeline?.querySelectorAll<HTMLElement>("[data-message-id]") ?? [])]
+        .find((item) => item.dataset.messageId === source.sourceId);
+      if (currentMessage?.classList.contains("message-authority__message--tombstone") === true) {
+        reveal(null, "来源消息已撤回；未载入或显示历史正文。"); return;
+      }
+      const status = root.querySelector<HTMLElement>(".project-loop__source-status");
+      if (status !== null) status.textContent = `正在载入精确来源 message:${source.sourceId} r${source.sourceRevision}。`;
+      void options.messageBridge.revisionsQuery({
+        type: "message.revisions.query", roomId, messageId: source.sourceId,
+        afterRevision: source.sourceRevision - 1, limit: 1,
+      }).then((result) => {
+        if (!active || lookupSequence !== sourceLookupSequence) return;
+        if (result.type === "message.error") {
+          reveal(null, `无法载入精确来源；${result.status} ${result.code}。`); return;
+        }
+        const revision = result.roomId === roomId && result.messageId === source.sourceId
+          ? result.revisions.find((item) => item.messageId === source.sourceId &&
+              item.revision === source.sourceRevision) : undefined;
+        if (revision === undefined || timeline === null) { reveal(null); return; }
+        const historical = document.createElement("article");
+        historical.className = "project-loop__historical-message-source";
+        historical.dataset.projectHistoricalSource = "true";
+        historical.dataset.messageId = revision.messageId;
+        historical.dataset.messageRevision = String(revision.revision);
+        historical.setAttribute("aria-label", `消息 ${revision.messageId} 的历史版本 ${revision.revision}`);
+        const metadata = document.createElement("p");
+        metadata.textContent = `历史消息版本 r${revision.revision} · ${revision.revisedByActorId} · ${revision.revisedAt}`;
+        const body = document.createElement("p"); body.textContent = revision.body;
+        historical.append(metadata, body);
+        if (currentMessage === undefined) timeline.append(historical);
+        else currentMessage.insertAdjacentElement("beforebegin", historical);
+        historicalSource = historical;
+        reveal(historical);
+      }).catch(() => reveal(null, "无法载入精确来源；请重试。"));
     },
   }, { reducedMotion: options.reducedMotion }); renderTimelineRequests(); };
 
@@ -240,6 +291,8 @@ export function mountProjectLoopBridgeSurface(
     active = false;
     timelineObserver?.disconnect();
     observedTimeline?.removeEventListener("focusin", rememberTimelineFocus);
+    sourceLookupSequence += 1;
+    historicalSource?.remove(); historicalSource = undefined;
     unsubscribe();
   };
 }

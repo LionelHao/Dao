@@ -246,7 +246,9 @@ describe("Desktop renderer route entry", () => {
     expect(rail.contains(project)).toBe(true);
     expect(rail.contains(memory)).toBe(true);
     expect(rail.contains(executions)).toBe(true);
-    expect(renderers.mountProjectLoopSurface).toHaveBeenCalledWith(project, projectLoop, "room-1");
+    expect(renderers.mountProjectLoopSurface).toHaveBeenCalledWith(
+      project, projectLoop, "room-1", messageAuthority,
+    );
     expect(project.hidden).toBe(false);
     expect(memory.hidden).toBe(true);
     expect(executions.hidden).toBe(true);

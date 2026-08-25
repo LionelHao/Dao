@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import type { MessageAuthorityBridge } from "../../message-authority/contracts.js";
 import type { ProjectLoopBridge } from "../../project-loop/contracts.js";
 import { projectSnapshot } from "../../project-loop/test-fixture.js";
 import { mountProjectLoopBridgeSurface } from "./bridge-adapter.js";
@@ -185,6 +186,37 @@ describe("FT-09 Project Loop timeline integration", () => {
     expect(wrongRevision.dataset.projectSourceHighlight).toBeUndefined();
     expect(wrongKind.dataset.projectSourceHighlight).toBeUndefined();
     expect(project.querySelector(".project-loop__source-status")?.textContent).toContain("未打开其他对象");
+    dispose(); workspace.remove();
+  });
+
+  it("loads and highlights the exact historical message revision through authority", async () => {
+    const workspace = document.createElement("main"); workspace.className = "room-authority-workspace";
+    const timeline = document.createElement("section"); timeline.className = "room-authority-workspace__timeline";
+    const current = document.createElement("article"); current.dataset.messageId = "message-1";
+    current.dataset.messageRevision = "2"; current.textContent = "current revision"; timeline.append(current);
+    const project = document.createElement("aside"); project.className = "room-authority-workspace__project";
+    workspace.append(timeline, project); document.body.append(workspace);
+    const ready = { status: "ready" as const, roomId: "room-1", snapshot: projectSnapshot(),
+      viewerActorId: "human-1", connection: { status: "online" as const }, operation: { status: "idle" as const } };
+    const bridge: ProjectLoopBridge = { getSurface: vi.fn(async () => ready), submit: vi.fn(async () => ready),
+      onStateChanged: () => () => {} };
+    const revisionsQuery = vi.fn(async () => ({ type: "message.revisions" as const, requestId: "revision-query-1",
+      roomId: "room-1", messageId: "message-1", revisions: [{ messageId: "message-1", revision: 1,
+        body: "authoritative historical revision", revisedAt: "2026-08-25T01:02:03.004Z",
+        revisedByActorId: "human-1" }], hasMore: false }));
+    const messageBridge = { revisionsQuery } as unknown as MessageAuthorityBridge;
+    const dispose = mountProjectLoopBridgeSurface(project, bridge, "room-1", { reducedMotion: true,
+      onSearch: vi.fn(), onNavigateSegment: vi.fn(), onReauthenticate: vi.fn(), messageBridge });
+    await vi.waitFor(() => expect(project.querySelector('[data-category="requests"]')).not.toBeNull());
+    project.querySelector<HTMLButtonElement>('[data-category="requests"]')?.click();
+    project.querySelector<HTMLButtonElement>(".project-loop__content .project-loop__source")?.click();
+    await vi.waitFor(() => expect(timeline.querySelector<HTMLElement>(
+      '[data-project-historical-source][data-message-id="message-1"][data-message-revision="1"]',
+    )?.dataset.projectSourceHighlight).toBe("exact-revision"));
+    expect(revisionsQuery).toHaveBeenCalledWith({ type: "message.revisions.query", roomId: "room-1",
+      messageId: "message-1", afterRevision: 0, limit: 1 });
+    expect(timeline.textContent).toContain("authoritative historical revision");
+    expect(current.dataset.projectSourceHighlight).toBeUndefined();
     dispose(); workspace.remove();
   });
 

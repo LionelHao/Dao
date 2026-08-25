@@ -53,6 +53,7 @@ export interface DesktopRendererEntryPorts {
     root: HTMLElement,
     bridge: ProjectLoopBridge,
     roomId: string,
+    messageBridge?: MessageAuthorityBridge,
   ) => () => void;
 }
 
@@ -102,7 +103,8 @@ const DEFAULT_PORTS: DesktopRendererEntryPorts = Object.freeze({
     root, bridge, roomId, { reducedMotion: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false,
       onClose: () => history.back() }),
   mountInvocationSurface,
-  mountProjectLoopSurface: (root: HTMLElement, bridge: ProjectLoopBridge, roomId: string) => mountProjectLoopBridgeSurface(
+  mountProjectLoopSurface: (root: HTMLElement, bridge: ProjectLoopBridge, roomId: string,
+    messageBridge?: MessageAuthorityBridge) => mountProjectLoopBridgeSurface(
     root, bridge, roomId, {
       reducedMotion: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false,
       onSearch: () => root.querySelector<HTMLInputElement>("input[type='search']")?.focus(),
@@ -116,6 +118,7 @@ const DEFAULT_PORTS: DesktopRendererEntryPorts = Object.freeze({
         if (target !== null && target !== undefined) { target.tabIndex = -1; target.focus(); }
       },
       onReauthenticate: () => navigateRenderer(""),
+      ...(messageBridge === undefined ? {} : { messageBridge }),
     },
   ),
 });
@@ -406,7 +409,7 @@ export function mountDesktopRendererEntry(
     const disposeMemory = ports.mountMemoryAuthoritySurface(memory, memoryAuthority, roomId);
     const disposeProject = project === undefined || projectLoop === undefined ||
       ports.mountProjectLoopSurface === undefined ? undefined
-      : ports.mountProjectLoopSurface(project, projectLoop, roomId);
+      : ports.mountProjectLoopSurface(project, projectLoop, roomId, messageAuthority);
     const disposeInvocations = executions === undefined || invocation === undefined ||
       ports.mountInvocationSurface === undefined ? undefined
       : ports.mountInvocationSurface(executions, invocation, roomId, {

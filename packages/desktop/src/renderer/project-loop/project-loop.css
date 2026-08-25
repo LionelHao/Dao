@@ -82,6 +82,13 @@
 }
 [data-project-source-highlight="exact-revision"] { outline: 3px solid #e0b34a; outline-offset: 3px; }
 [data-project-source-highlight="revision-mismatch"] { outline: 3px dashed #b42318; outline-offset: 3px; }
+.project-loop__historical-message-source {
+  border: 1px solid #e0b34a;
+  border-left-width: 4px;
+  background: #fff8e8;
+  color: #172033;
+  padding: 10px 12px;
+}
 .project-loop[data-project-loop-status="offline"],
 .project-loop[data-project-loop-status="repair_failed"] { background: #fffaf0; }
 .project-loop[data-project-loop-status="repairing"] { background: #eef4ff; }
