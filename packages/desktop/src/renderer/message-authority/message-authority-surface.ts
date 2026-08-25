@@ -172,6 +172,7 @@ function renderHumanMessage(
     for (const attachment of message.attachments) {
       const item = element("li", "message-authority__attachment");
       item.dataset.attachmentId = attachment.attachmentId;
+      item.dataset.attachmentRevision = "1";
       const hydration = actions.attachmentHydration?.(
         attachment.attachmentId,
         message.messageId,

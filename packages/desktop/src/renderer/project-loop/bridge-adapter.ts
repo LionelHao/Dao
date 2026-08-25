@@ -112,13 +112,18 @@ export function mountProjectLoopBridgeSurface(
         ? host.querySelectorAll<HTMLElement>("[data-message-id]")
         : source.kind === "agent_execution"
           ? host.querySelectorAll<HTMLElement>("[data-execution-id]")
+          : source.kind === "attachment"
+            ? host.querySelectorAll<HTMLElement>("[data-attachment-id]")
           : host.querySelectorAll<HTMLElement>("[data-source-id]");
       const candidate = [...candidates].find((item) => {
         const id = source.kind === "message" ? item.dataset.messageId
-          : source.kind === "agent_execution" ? item.dataset.executionId : item.dataset.sourceId;
+          : source.kind === "agent_execution" ? item.dataset.executionId
+            : source.kind === "attachment" ? item.dataset.attachmentId : item.dataset.sourceId;
         const revision = source.kind === "message" ? item.dataset.messageRevision
-          : source.kind === "agent_execution" ? item.dataset.executionRevision : item.dataset.sourceRevision;
+          : source.kind === "agent_execution" ? item.dataset.executionRevision
+            : source.kind === "attachment" ? item.dataset.attachmentRevision : item.dataset.sourceRevision;
         const kindMatches = source.kind === "message" || source.kind === "agent_execution" ||
+          source.kind === "attachment" ||
           item.dataset.sourceKind === source.kind;
         return id === source.sourceId && revision === String(source.sourceRevision) && kindMatches;
       }) ?? null;

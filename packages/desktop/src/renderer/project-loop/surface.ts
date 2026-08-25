@@ -94,6 +94,8 @@ export function renderProjectLoopSurface(root: HTMLElement, state: ProjectLoopRe
   };
   const renderRequest = (list: HTMLUListElement, request: ProjectRequest): void => {
     const item = document.createElement("li"); item.dataset.projectFactKind = request.kind;
+    item.dataset.sourceId = request.requestId; item.dataset.sourceKind = "project_fact";
+    item.dataset.sourceRevision = String(request.revision);
     const summary = document.createElement("p");
     summary.textContent = `${request.title} · ${request.status} · requester ${request.requester.actorId} → target ${request.target.actorId}`;
     const authority = document.createElement("p"); authority.textContent = request.status === "pending_acceptance"
@@ -143,6 +145,11 @@ export function renderProjectLoopSurface(root: HTMLElement, state: ProjectLoopRe
     for (const entry of entries) {
       if ("kind" in entry && entry.kind === "request") { renderRequest(list, entry); continue; }
       const item = document.createElement("li"); item.dataset.projectFactKind = "kind" in entry ? entry.kind : entry.sourceKind;
+      if ("kind" in entry) {
+        item.dataset.sourceKind = "project_fact"; item.dataset.sourceRevision = String(entry.revision);
+        item.dataset.sourceId = entry.kind === "goal" ? entry.goalId : entry.kind === "decision" ? entry.decisionId
+          : entry.kind === "next_action" ? entry.nextActionId : entry.obstacleId;
+      }
       const summary = document.createElement("p");
       if ("title" in entry) summary.textContent = `${entry.title} · ${entry.status}` +
         `${"owner" in entry ? ` · owner ${entry.owner.kind}:${entry.owner.actorId}` : ""}` +

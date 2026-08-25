@@ -115,4 +115,38 @@ describe("FT-09 Project Loop timeline integration", () => {
     expect(project.querySelector(".project-loop__source-status")?.textContent).toContain("未打开其他对象");
     dispose(); workspace.remove();
   });
+
+  it.each(["agent_execution", "attachment", "memory", "project_fact"] as const)(
+    "deep-links an exact %s source without crossing source kinds",
+    async (kind) => {
+      const workspace = document.createElement("main"); workspace.className = "room-authority-workspace";
+      const timeline = document.createElement("section"); timeline.className = "room-authority-workspace__timeline";
+      const candidate = document.createElement("article"); candidate.tabIndex = -1;
+      if (kind === "agent_execution") {
+        candidate.dataset.executionId = "message-1"; candidate.dataset.executionRevision = "1";
+      } else if (kind === "attachment") {
+        candidate.dataset.attachmentId = "message-1"; candidate.dataset.attachmentRevision = "1";
+      } else {
+        candidate.dataset.sourceId = "message-1"; candidate.dataset.sourceKind = kind;
+        candidate.dataset.sourceRevision = "1";
+      }
+      timeline.append(candidate);
+      const project = document.createElement("aside"); project.className = "room-authority-workspace__project";
+      workspace.append(timeline, project); document.body.append(workspace);
+      const base = projectSnapshot();
+      const snapshot = { ...base, proposals: [{ ...base.proposals[0]!, provenance: {
+        ...base.proposals[0]!.provenance, source: { ...base.proposals[0]!.provenance.source, kind },
+      } }] };
+      const ready = { status: "ready" as const, roomId: "room-1", snapshot,
+        viewerActorId: "human-1", connection: { status: "online" as const }, operation: { status: "idle" as const } };
+      const bridge: ProjectLoopBridge = { getSurface: vi.fn(async () => ready), submit: vi.fn(async () => ready),
+        onStateChanged: () => () => {} };
+      const dispose = mountProjectLoopBridgeSurface(project, bridge, "room-1", { reducedMotion: false,
+        onSearch: vi.fn(), onNavigateSegment: vi.fn(), onReauthenticate: vi.fn() });
+      await vi.waitFor(() => expect(project.querySelector("[data-proposal-id] .project-loop__source")).not.toBeNull());
+      project.querySelector<HTMLButtonElement>("[data-proposal-id] .project-loop__source")?.click();
+      expect(candidate.dataset.projectSourceHighlight).toBe("exact-revision");
+      dispose(); workspace.remove();
+    },
+  );
 });
