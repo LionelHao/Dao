@@ -76,11 +76,22 @@ describe("production Invocation surface", () => {
     const rateRecovery = root.querySelector<HTMLButtonElement>("[data-invocation-recovery='retry-later']");
     expect(rateRecovery?.textContent).toBe("7 秒后重试");
     expect(rateRecovery?.disabled).toBe(true);
-    vi.advanceTimersByTime(7_000);
-    expect(rateRecovery?.disabled).toBe(false);
-    expect(rateRecovery?.textContent).toBe("重试控制意图");
-    expect(document.activeElement).toBe(rateRecovery);
-    rateRecovery?.click();
+    vi.advanceTimersByTime(3_000);
+    listener?.({ roomId: "room-1", state: state({ operations: [{ status: "failed",
+      requestId: "rate-1", kind: "cancel", executionId: "execution-1", expectedVersion: 2,
+      error: { status: 429, code: "rate_limited", recovery: "retry-later",
+        retryAfterSeconds: 7 } }] }) });
+    const rerenderedRecovery = root.querySelector<HTMLButtonElement>(
+      "[data-invocation-recovery='retry-later']",
+    );
+    expect(rerenderedRecovery?.textContent).toBe("4 秒后重试");
+    vi.advanceTimersByTime(3_999);
+    expect(rerenderedRecovery?.disabled).toBe(true);
+    vi.advanceTimersByTime(1);
+    expect(rerenderedRecovery?.disabled).toBe(false);
+    expect(rerenderedRecovery?.textContent).toBe("重试控制意图");
+    expect(document.activeElement).toBe(rerenderedRecovery);
+    rerenderedRecovery?.click();
     await vi.runAllTimersAsync();
     expect(cancel).toHaveBeenCalledWith({ roomId: "room-1",
       executionId: "execution-1", expectedVersion: 2 });
@@ -108,12 +119,13 @@ describe("production Invocation surface", () => {
   });
 
   it("renders offline/review/non-colour states and disables writes", async () => {
+    let listener: ((value: InvocationStateEnvelope) => void) | undefined;
     const review = state({ connection: { status: "offline", asOf: "2026-08-25T00:01:00.000Z" },
       executions: [{ execution: { ...execution, status: "failed", phase: "failed", version: 3,
         updatedAt: "2026-08-25T00:01:00.000Z", completedAt: "2026-08-25T00:01:00.000Z",
         reviewState: "needs_review" }, attempts: [], sourceLifecycle: "active", preservedDispatchIds: [] }] });
     const bridge: InvocationBridge = { getSurface: vi.fn().mockResolvedValue(review), cancel: vi.fn(),
-      retry: vi.fn(), onStateChanged: () => vi.fn() };
+      retry: vi.fn(), onStateChanged: (next) => { listener = next; return vi.fn(); } };
     const root = document.createElement("div");
     const hostAction = vi.fn();
     document.body.append(root);
@@ -130,6 +142,10 @@ describe("production Invocation surface", () => {
       roomId: "room-1", executionId: "execution-1",
     });
     expect(root.querySelector<HTMLButtonElement>("[data-invocation-action='retry']")?.disabled).toBe(true);
+    listener?.({ roomId: "room-1", state: review });
+    expect(document.activeElement).toBe(
+      root.querySelector<HTMLButtonElement>("[data-invocation-review-action]"),
+    );
     root.remove();
   });
 });

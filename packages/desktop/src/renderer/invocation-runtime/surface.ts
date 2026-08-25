@@ -57,7 +57,11 @@ function renderExecution(
   submit: (kind: "cancel" | "retry", executionId: string, expectedVersion: number) => void,
   repair: () => void,
   hostAction: (action: InvocationHostAction, executionId: string) => void,
-  scheduleRetry: (button: HTMLButtonElement, retryAfterSeconds: number) => void,
+  scheduleRetry: (
+    button: HTMLButtonElement,
+    retryAfterSeconds: number,
+    requestId: string,
+  ) => void,
 ): HTMLElement {
   const { execution } = projection;
   const card = document.createElement("article");
@@ -127,7 +131,7 @@ function renderExecution(
       if (operation.error.recovery === "retry-later" &&
           operation.error.retryAfterSeconds !== undefined) {
         recover.disabled = true;
-        scheduleRetry(recover, operation.error.retryAfterSeconds);
+        scheduleRetry(recover, operation.error.retryAfterSeconds, operation.requestId);
       }
       recover.addEventListener("click", operation.error.recovery === "retry-later"
         ? () => submit(operation.kind, operation.executionId, operation.expectedVersion)
@@ -183,6 +187,7 @@ export function mountInvocationSurface(
 ): () => void {
   let disposed = false;
   const retryTimers = new Set<ReturnType<typeof setTimeout>>();
+  const retryEligibleAtByRequestId = new Map<string, number>();
   const reviewRequired = new Set<string>();
   const reportedFailures = new Set<string>();
   const load = async (): Promise<void> => {
@@ -206,26 +211,55 @@ export function mountInvocationSurface(
   const hostAction = (action: InvocationHostAction, executionId: string): void => {
     actions.onHostAction(action, { roomId, executionId });
   };
-  const scheduleRetry = (button: HTMLButtonElement, retryAfterSeconds: number): void => {
-    const timer = setTimeout(() => {
-      retryTimers.delete(timer);
-      if (disposed || !button.isConnected) return;
-      button.disabled = false;
-      button.textContent = "重试控制意图";
-      button.focus();
-    }, retryAfterSeconds * 1_000);
-    retryTimers.add(timer);
+  const scheduleRetry = (
+    button: HTMLButtonElement,
+    retryAfterSeconds: number,
+    requestId: string,
+  ): void => {
+    const eligibleAt = retryEligibleAtByRequestId.get(requestId) ??
+      Date.now() + retryAfterSeconds * 1_000;
+    retryEligibleAtByRequestId.set(requestId, eligibleAt);
+    const update = (): void => {
+      if (disposed) return;
+      const remainingMs = eligibleAt - Date.now();
+      if (remainingMs <= 0) {
+        button.disabled = false;
+        button.textContent = "重试控制意图";
+        button.focus();
+        return;
+      }
+      button.disabled = true;
+      button.textContent = `${Math.ceil(remainingMs / 1_000)} 秒后重试`;
+      const timer = setTimeout(() => {
+        retryTimers.delete(timer);
+        update();
+      }, Math.min(remainingMs, 1_000));
+      retryTimers.add(timer);
+    };
+    update();
   };
   const render = (state: InvocationSurfaceState): void => {
     if (disposed || state.roomId !== roomId) return;
     for (const timer of retryTimers) clearTimeout(timer);
     retryTimers.clear();
+    const currentRateLimitedRequests = new Set(state.operations.flatMap((operation) =>
+      operation.status === "failed" && operation.error.status === 429 &&
+        operation.error.recovery === "retry-later" &&
+        operation.error.retryAfterSeconds !== undefined
+        ? [operation.requestId] : []));
+    for (const requestId of retryEligibleAtByRequestId.keys()) {
+      if (!currentRateLimitedRequests.has(requestId)) retryEligibleAtByRequestId.delete(requestId);
+    }
     const active = root.contains(document.activeElement) && document.activeElement instanceof HTMLElement
       ? document.activeElement : undefined;
     const activeCard = active?.closest<HTMLElement>("[data-execution-id]");
     const priorFocus = activeCard === null || activeCard === undefined ? undefined : {
       executionId: activeCard.dataset.executionId!,
-      action: active?.dataset.invocationAction ?? active?.dataset.invocationRecovery,
+      kind: active?.dataset.invocationAction !== undefined ? "action"
+        : active?.dataset.invocationRecovery !== undefined ? "recovery"
+          : active?.dataset.invocationReviewAction !== undefined ? "review" : undefined,
+      value: active?.dataset.invocationAction ?? active?.dataset.invocationRecovery ??
+        active?.dataset.invocationReviewAction,
     };
     const panel = document.createElement("section");
     panel.className = "invocation-panel"; panel.dataset.invocationSurface = "true";
@@ -294,12 +328,14 @@ export function mountInvocationSurface(
     if (priorFocus !== undefined) {
       const card = [...panel.querySelectorAll<HTMLElement>("[data-execution-id]")]
         .find((element) => element.dataset.executionId === priorFocus.executionId);
-      const action = priorFocus.action === undefined ? undefined
+      const action = priorFocus.kind === undefined || priorFocus.value === undefined ? undefined
         : [...(card?.querySelectorAll<HTMLElement>(
-          "[data-invocation-action], [data-invocation-recovery]",
+          "[data-invocation-action], [data-invocation-recovery], [data-invocation-review-action]",
         ) ?? [])].find((element) =>
-          element.dataset.invocationAction === priorFocus.action ||
-          element.dataset.invocationRecovery === priorFocus.action);
+          (priorFocus.kind === "action" && element.dataset.invocationAction === priorFocus.value) ||
+          (priorFocus.kind === "recovery" && element.dataset.invocationRecovery === priorFocus.value) ||
+          (priorFocus.kind === "review" &&
+            element.dataset.invocationReviewAction === priorFocus.value));
       if (action instanceof HTMLButtonElement && !action.disabled) action.focus();
       else card?.focus();
     }
@@ -310,6 +346,7 @@ export function mountInvocationSurface(
     disposed = true;
     for (const timer of retryTimers) clearTimeout(timer);
     retryTimers.clear();
+    retryEligibleAtByRequestId.clear();
     unsubscribe();
     root.replaceChildren();
   };
