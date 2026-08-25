@@ -262,13 +262,13 @@ describe("authority SQLite v17 Attachment Authority", () => {
   it("upgrades fresh and every immutable v1-v16 schema through v17 and restarts idempotently", () => {
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(22);
-      expect(readSchemaVersion(database)).toBe(22);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(23);
+      expect(readSchemaVersion(database)).toBe(23);
       expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get())
-        .toEqual({ count: 22 });
+        .toEqual({ count: 23 });
       expect(() => migrateAuthorityDatabase(database)).not.toThrow();
       expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get())
-        .toEqual({ count: 22 });
+        .toEqual({ count: 23 });
     });
 
     for (let version = 1; version <= 16; version += 1) {
@@ -276,17 +276,17 @@ describe("authority SQLite v17 Attachment Authority", () => {
         migrateAuthorityDatabaseToHistoricalVersionForTest(database, version);
         expect(readSchemaVersion(database)).toBe(version);
         migrateAuthorityDatabase(database);
-        expect(readSchemaVersion(database)).toBe(22);
+        expect(readSchemaVersion(database)).toBe(23);
         expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get())
-          .toEqual({ count: 22 });
+          .toEqual({ count: 23 });
       });
     }
 
     withRestartedDatabase((database) => {
       expect(() => migrateAuthorityDatabase(database)).not.toThrow();
-      expect(readSchemaVersion(database)).toBe(22);
+      expect(readSchemaVersion(database)).toBe(23);
       expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get())
-        .toEqual({ count: 22 });
+        .toEqual({ count: 23 });
     });
   }, 60_000);
 

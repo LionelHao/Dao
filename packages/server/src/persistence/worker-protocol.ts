@@ -119,6 +119,12 @@ import {
   type Ft07AgentSettingsClientFrame,
   type Ft07AgentSettingsServerFrame,
 } from "../ft07-agent-settings-protocol.js";
+import {
+  isProjectLoopAuthorityOperation,
+  isProjectLoopAuthorityResult,
+  type ProjectLoopAuthorityOperation,
+  type ProjectLoopAuthorityResult,
+} from "../project-loop/authority-protocol.js";
 
 export type ContextWorkerOperation = ContextSnapshotAuthorityOperation | {
   readonly type: "context.finalize-agent-message";
@@ -236,6 +242,8 @@ export type AuthorityWorkerErrorCode =
   | "profile_state_conflict"
   | "profile_fanout_capacity_limited"
   | "provider_configuration_unavailable"
+  | "project_fact_not_found"
+  | "invalid_transition"
   | "revision_conflict"
   | "session_revoked"
   | "session_not_found"
@@ -359,6 +367,8 @@ export function isAuthorityWorkerErrorCode(
     case "profile_state_conflict":
     case "profile_fanout_capacity_limited":
     case "provider_configuration_unavailable":
+    case "project_fact_not_found":
+    case "invalid_transition":
     case "revision_conflict":
     case "session_revoked":
     case "session_not_found":
@@ -691,18 +701,23 @@ export type AuthorityWorkerRequest =
       readonly requestId: string;
       readonly operation: MemoryAuthorityOperation;
     }
+  | {
+      readonly type: "authority.project-loop";
+      readonly requestId: string;
+      readonly operation: ProjectLoopAuthorityOperation;
+    }
   | { readonly type: "authority.close"; readonly requestId: string };
 
 export type AuthorityWorkerResponse =
   | {
       readonly type: "authority.ready";
       readonly requestId: string;
-      readonly schemaVersion: 22;
+      readonly schemaVersion: 23;
     }
   | {
       readonly type: "authority.schema";
       readonly requestId: string;
-      readonly schemaVersion: 22;
+      readonly schemaVersion: 23;
     }
   | {
       readonly type: "authority.legacy-imported";
@@ -911,6 +926,11 @@ export type AuthorityWorkerResponse =
       readonly type: "authority.memory-result";
       readonly requestId: string;
       readonly result: JsonValue;
+    }
+  | {
+      readonly type: "authority.project-loop-result";
+      readonly requestId: string;
+      readonly result: ProjectLoopAuthorityResult;
     }
   | { readonly type: "authority.closed"; readonly requestId: string }
   | {
@@ -1761,6 +1781,9 @@ export function isAuthorityWorkerRequest(value: unknown): value is AuthorityWork
     case "authority.memory":
       return hasExactKeys(value, ["type", "requestId", "operation"]) &&
         isMemoryAuthorityOperation(value.operation);
+    case "authority.project-loop":
+      return hasExactKeys(value, ["type", "requestId", "operation"]) &&
+        isProjectLoopAuthorityOperation(value.operation);
     default:
       return false;
   }
@@ -1778,7 +1801,7 @@ export function isAuthorityWorkerResponse(
     case "authority.schema":
       return (
         hasExactKeys(value, ["type", "requestId", "schemaVersion"]) &&
-        value.schemaVersion === 22
+        value.schemaVersion === 23
       );
     case "authority.closed":
       return hasExactKeys(value, ["type", "requestId"]);
@@ -1927,6 +1950,9 @@ export function isAuthorityWorkerResponse(
     case "authority.memory-result":
       return hasExactKeys(value, ["type", "requestId", "result"]) &&
         isJsonValue(value.result);
+    case "authority.project-loop-result":
+      return hasExactKeys(value, ["type", "requestId", "result"]) &&
+        isProjectLoopAuthorityResult(value.result);
     case "authority.legacy-imported":
       return (
         hasExactKeys(value, [

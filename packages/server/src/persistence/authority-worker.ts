@@ -117,6 +117,10 @@ import type { DeploymentProviderDisclosure } from
   "../tenant-administration/authority-service.js";
 import { executeAgentSettingsWorkerOperation } from
   "../agent-settings/worker-authority-operation.js";
+import {
+  executeProjectLoopAuthorityOperation,
+  ProjectLoopAuthorityError,
+} from "../project-loop/database-authority.js";
 
 interface AuthorityWorkerData {
   readonly databasePath: string;
@@ -2548,6 +2552,32 @@ function executeMemory(request: AuthorityWorkerRequest): void {
   }
 }
 
+function executeProjectLoop(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.project-loop") {
+    throw new TypeError("executeProjectLoop received the wrong request type");
+  }
+  try {
+    const result = executeProjectLoopAuthorityOperation(
+      requireAuthorityTransactionDatabase(),
+      request.operation,
+    );
+    respond({ type: "authority.project-loop-result", requestId: request.requestId, result });
+    const roomId = request.operation.type === "project-loop.snapshot.read"
+      ? undefined : request.operation.command.roomId;
+    if (roomId !== undefined) {
+      repairs.preemptAfterCommit({ roomIds: [roomId], catalogPrincipalIds: [], familyIds: [],
+        code: "snapshot_stale", now: request.operation.now });
+    }
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof ProjectLoopAuthorityError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithStorageFailure(request.requestId, error, "Authority Project Loop operation failed");
+  }
+}
+
 function readHistory(request: AuthorityWorkerRequest): void {
   if (request.type !== "authority.read-history") {
     throw new TypeError("readHistory received the wrong request type");
@@ -3033,6 +3063,9 @@ async function dispatch(value: unknown): Promise<void> {
       return;
     case "authority.memory":
       executeMemory(value);
+      return;
+    case "authority.project-loop":
+      executeProjectLoop(value);
       return;
     case "authority.read-history":
       readHistory(value);

@@ -157,17 +157,17 @@ describe("authority SQLite v19 Context Snapshot Authority", () => {
   it("upgrades fresh and every immutable v1-v18 schema and restarts idempotently", () => {
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(22);
-      expect(readSchemaVersion(database)).toBe(22);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(23);
+      expect(readSchemaVersion(database)).toBe(23);
       expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get())
-        .toEqual({ count: 22 });
+        .toEqual({ count: 23 });
       expect(() => migrateAuthorityDatabase(database)).not.toThrow();
     });
     for (let version = 1; version <= 18; version += 1) {
       withDatabase((database) => {
         migrateAuthorityDatabaseToHistoricalVersionForTest(database, version);
         migrateAuthorityDatabase(database);
-        expect(readSchemaVersion(database)).toBe(22);
+        expect(readSchemaVersion(database)).toBe(23);
       });
     }
   }, 120_000);

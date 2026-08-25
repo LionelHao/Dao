@@ -212,6 +212,7 @@ export type WorkerDatabaseClient = Omit<
   | "executeRoute"
   | "executeBall"
   | "executeMemory"
+  | "executeProjectLoop"
   | "executeAttachment"
   | "executeTenantAdministration"
   | "executeRoomAssignment"

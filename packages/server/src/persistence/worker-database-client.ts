@@ -62,6 +62,10 @@ import type {
   StreamingRepairLease,
   SnapshotRevalidationRequest,
 } from "./contracts.js";
+import type {
+  ProjectLoopAuthorityOperation,
+  ProjectLoopAuthorityResult,
+} from "../project-loop/authority-protocol.js";
 import type { DeploymentProviderDisclosure } from
   "../tenant-administration/authority-service.js";
 import type {
@@ -110,7 +114,7 @@ export interface CreateWorkerDatabaseClientOptions {
 }
 
 export interface AuthoritySchemaInspection {
-  readonly version: 22;
+  readonly version: 23;
 }
 
 export interface WorkerDatabaseClient {
@@ -287,6 +291,7 @@ export interface WorkerDatabaseClient {
   executeRoute(operation: RouteAuthorityOperation): Promise<unknown>;
   executeBall(operation: BallAuthorityOperation): Promise<unknown>;
   executeMemory(operation: MemoryAuthorityOperation): Promise<unknown>;
+  executeProjectLoop(operation: ProjectLoopAuthorityOperation): Promise<ProjectLoopAuthorityResult>;
   executeTenantAdministration(
     operation: TenantAdministrationOperation,
   ): Promise<TenantAdministrationResult>;
@@ -401,6 +406,7 @@ function authorityWorkerClientErrorStatus(
     case "profile_not_found":
     case "member_not_found":
     case "message_not_found":
+    case "project_fact_not_found":
     case "light_task_not_found":
     case "open_item_not_found":
     case "memory_not_found":
@@ -426,6 +432,7 @@ function authorityWorkerClientErrorStatus(
     case "last_administrator_required":
     case "profile_state_conflict":
     case "revision_conflict":
+    case "invalid_transition":
     case "attachment_already_bound":
     case "generation_conflict":
     case "attachment_not_ready":
@@ -1564,6 +1571,19 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
     return this.#send({ type: "authority.memory", operation }).then((response) => {
       if (response.type !== "authority.memory-result") {
         this.#failProtocol("Authority worker returned the wrong memory response");
+        throw this.#terminalError;
+      }
+      return response.result;
+    });
+  }
+
+  executeProjectLoop(operation: ProjectLoopAuthorityOperation): Promise<ProjectLoopAuthorityResult> {
+    if (this.#terminalError !== undefined) return this.#rejectTerminal();
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) return Promise.reject(unavailable);
+    return this.#send({ type: "authority.project-loop", operation }).then((response) => {
+      if (response.type !== "authority.project-loop-result") {
+        this.#failProtocol("Authority worker returned the wrong Project Loop response");
         throw this.#terminalError;
       }
       return response.result;
