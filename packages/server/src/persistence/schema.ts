@@ -73,7 +73,7 @@ const SCHEMA_FINGERPRINTS = {
   19: "e458dedc7c0d85c04bca92dc2f6289b02367fb97fc7edbe1c7dba011470812b7",
   20: "1ca2a806a52cd2ce9632b02e215a25ba13bc3ebc4336f5152c48f21d60faa2a0",
   21: "dca0a24a346060b1e04b98ee5a73e016421796d6c13bd0bd2841179f405c44af",
-  22: "5bbda2fdb36b57aff8147c9b09ad461681c65024b7a3a92d7905a51341d349d5",
+  22: "37a980d3d6edc37c843f8ea7f5dd0cd18ac40170efb8bd09ea4180f43f61324f",
 } as const;
 
 const V1_STATEMENTS = [
@@ -7029,6 +7029,9 @@ const V22_STATEMENTS = [
     FOREIGN KEY (execution_id, attempt_seq)
       REFERENCES agent_execution_attempt_runtime_states(execution_id, attempt_seq)
   ) STRICT`,
+  `CREATE UNIQUE INDEX invocation_scoped_cancellation_intent_terminal_v22
+   ON invocation_scoped_cancellation_fences(intent_id)
+   WHERE scope_kind = 'intent'`,
   `CREATE TABLE invocation_cancellation_receipts (
     request_id TEXT PRIMARY KEY,
     fence_id TEXT NOT NULL UNIQUE REFERENCES invocation_scoped_cancellation_fences(fence_id),

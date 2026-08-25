@@ -933,19 +933,8 @@ function retryRepairRecord(row: Record<string, unknown>): RoomRepairRecord {
 }
 
 function cancellationRepairRecord(row: Record<string, unknown>): RoomRepairRecord {
-  const rejected = parseJson(row.rejectedConfirmationIdsJson);
-  const revoked = parseJson(row.revokedGrantIdsJson);
-  const preserved = parseJson(row.preservedDispatchIdsJson);
-  const value = {
-    requestId: String(row.requestId), fenceId: String(row.fenceId), roomId: String(row.roomId),
-    lineageId: String(row.lineageId),
-    scope: { kind: "execution" as const, executionId: String(row.executionId), expectedVersion: Number(row.expectedVersion) },
-    reason: row.reason,
-    intentOutcomes: [{ intentId: String(row.intentId), outcome: "already_claimed" as const }],
-    executionOutcomes: [{ executionId: String(row.executionId), outcome: "cancelled" as const, version: Number(row.versionAfter) }],
-    rejectedConfirmationIds: rejected, revokedGrantIds: revoked, preservedDispatchIds: preserved,
-    committedAt: String(row.committedAt),
-  };
+  const stored = parseJson(row.responseJson);
+  const value = isRecord(stored) ? stored.receipt : undefined;
   if (!isScopedCancellationReceipt(value)) {
     throw new SnapshotBuildError("storage_unavailable", "Scoped cancellation repair projection is corrupt");
   }
@@ -1144,12 +1133,17 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
               intent.target_agent_id AS agentId, intent.message_transaction_id AS messageTransactionId,
               binding.profile_revision AS profileRevision,
               binding.assignment_revision AS assignmentRevision,
-              binding.access_revision AS accessRevision, intent.status,
+              binding.access_revision AS accessRevision,
+              CASE WHEN cancellation.fence_id IS NOT NULL THEN 'cancelled'
+                   ELSE intent.status END AS status,
               intent.created_at AS createdAt, intent.claimed_at AS claimedAt,
-              intent.cancelled_at AS cancelledAt, intent.cancellation_reason AS cancellationReason,
+              COALESCE(intent.cancelled_at, cancellation.committed_at) AS cancelledAt,
+              COALESCE(intent.cancellation_reason, cancellation.reason) AS cancellationReason,
               intent.supersedes_intent_id AS supersedesIntentId
        FROM agent_invocation_intents AS intent
        JOIN direct_agent_invocation_authority_bindings AS binding ON binding.intent_id = intent.id
+       LEFT JOIN invocation_scoped_cancellation_fences AS cancellation
+         ON cancellation.intent_id = intent.id AND cancellation.scope_kind = 'intent'
        WHERE intent.room_id = ? AND intent.origin_kind = 'message_target'
          AND binding.access_revision > 0`, "intent.id"),
     mapRow: (row: unknown) => invocationIntentRepairRecord(row as Record<string, unknown>),
@@ -1227,24 +1221,9 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
     descriptorId: "dao.repair.agent-scoped-cancellation.v1", descriptorVersion: 1,
     kind: "agent-scoped-cancellation", order: 104,
     readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
-      `SELECT receipt.request_id AS requestId, fence.fence_id AS fenceId,
-              fence.room_id AS roomId, runtime.lineage_id AS lineageId,
-              target.execution_id AS executionId, fence.intent_id AS intentId,
-              fence.expected_authority_version AS expectedVersion, fence.reason,
-              target.execution_version_after AS versionAfter,
-              receipt.committed_at AS committedAt,
-              COALESCE((SELECT json_group_array(confirmation_id) FROM tool_confirmations
-                WHERE execution_id = target.execution_id AND confirmation_state = 'rejected'
-                  AND confirmation_reason = fence.reason), '[]') AS rejectedConfirmationIdsJson,
-              COALESCE((SELECT json_group_array(grant_id) FROM agent_execution_grants
-                WHERE execution_id = target.execution_id AND grant_state = 'revoked'
-                  AND grant_reason = fence.reason), '[]') AS revokedGrantIdsJson,
-              COALESCE((SELECT json_group_array(dispatch_id) FROM tool_dispatches
-                WHERE execution_id = target.execution_id), '[]') AS preservedDispatchIdsJson
+      `SELECT receipt.request_id AS requestId, receipt.response_json AS responseJson
        FROM invocation_cancellation_receipts AS receipt
        JOIN invocation_scoped_cancellation_fences AS fence ON fence.fence_id = receipt.fence_id
-       JOIN invocation_scoped_cancellation_targets AS target ON target.fence_id = fence.fence_id
-       JOIN agent_execution_runtime_states AS runtime ON runtime.execution_id = target.execution_id
        WHERE fence.room_id = ?`, "receipt.request_id"),
     mapRow: (row: unknown) => cancellationRepairRecord(row as Record<string, unknown>),
     stableKey: (record: RoomRepairRecord) => record.kind === "agent-scoped-cancellation"

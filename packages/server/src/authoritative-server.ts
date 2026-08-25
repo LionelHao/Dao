@@ -858,6 +858,7 @@ async function start(
     kickDirectIntentConsumer();
     const runtimeRecoveryTimer = setInterval(() => {
       void runtime?.recover().catch(() => undefined);
+      kickDirectIntentConsumer();
     }, 1_000);
     runtimeRecoveryTimer.unref();
     stopRuntimeRecovery = () => clearInterval(runtimeRecoveryTimer);

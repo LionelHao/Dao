@@ -575,6 +575,36 @@ describe("bounded Agent runtime scheduler", () => {
     });
   });
 
+  it("does not abort a timed-out Provider when the authority transition was not persisted", async () => {
+    const runtimeAuthority = authority();
+    runtimeAuthority.scheduleRetry = vi.fn(async () => {
+      throw new AgentRuntimeError("context_storage_unavailable", "authority unavailable");
+    });
+    let providerAborted = false;
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      provider: provider(async function* (_input, signal) {
+        signal.addEventListener("abort", () => { providerAborted = true; }, { once: true });
+        await new Promise<void>(() => undefined);
+        yield { type: "completed", sequence: 1 };
+      }),
+      modelId: "fake-model",
+      async buildProviderInput(value, invocationValue) {
+        return {
+          ...(await providerInput(value, invocationValue)),
+          limits: { ...(await providerInput(value, invocationValue)).limits, timeoutMs: 10 },
+        };
+      },
+    });
+
+    const accepted = await runtime.invoke(context, intent("room-timeout-storage", "timeout-storage"));
+    await runtime.whenIdle();
+
+    expect(providerAborted).toBe(false);
+    expect(runtimeAuthority.executions.get(accepted.execution.id)).toMatchObject({ status: "running" });
+    expect(runtimeAuthority.scheduleRetry).toHaveBeenCalled();
+  });
+
   it("rejects duplicate citation labels and mixed preview/final output before authority commit", async () => {
     const malformedStreams = [
       provider(async function* () {

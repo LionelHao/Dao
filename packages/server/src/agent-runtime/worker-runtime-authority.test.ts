@@ -317,6 +317,38 @@ describe("real AuthorityWorker runtime authority", () => {
         { intentId: pendingIntentId, expectedVersion: 1 },
         pendingCancelContext.requestId,
       )).resolves.toMatchObject({ replayed: true, receipt: pendingCancellation.receipt });
+      const cancellationDatabase = new DatabaseSync(databasePath, { readOnly: true });
+      expect(cancellationDatabase.prepare(
+        `SELECT intent.status, fence.reason AS cancellationReason,
+                fence.committed_at AS cancelledAt
+         FROM agent_invocation_intents AS intent
+         JOIN invocation_scoped_cancellation_fences AS fence
+           ON fence.intent_id = intent.id AND fence.scope_kind = 'intent'
+         WHERE intent.id = ?`,
+      ).get(pendingIntentId)).toMatchObject({
+        status: "pending",
+        cancelledAt: expect.any(String),
+        cancellationReason: "human_cancelled",
+      });
+      expect(cancellationDatabase.prepare(
+        `SELECT COUNT(*) AS count FROM events
+         WHERE room_id = 'room-runtime'
+           AND event_type = 'agent.invocation.intent.changed'
+           AND json_extract(payload_json, '$.intentId') = ?
+           AND json_extract(payload_json, '$.status') = 'cancelled'`,
+      ).get(pendingIntentId)).toEqual({ count: 1 });
+      expect(cancellationDatabase.prepare(
+        `SELECT COUNT(*) AS count FROM events AS event
+         JOIN outbox_deliveries AS delivery ON delivery.event_id = event.event_id
+         WHERE event.room_id = 'room-runtime'
+           AND event.event_type = 'agent.invocation.scoped-cancellation.committed'
+           AND json_extract(event.payload_json, '$.requestId') = ?`,
+      ).get(pendingCancelContext.requestId)).toEqual({ count: 1 });
+      expect(cancellationDatabase.prepare(
+        `SELECT COUNT(*) AS count FROM agent_executions
+         WHERE trigger_message_id = 'message-runtime-pending-cancel'`,
+      ).get()).toEqual({ count: 0 });
+      cancellationDatabase.close();
       await expect(authority.invoke(
         { ...context, requestId: "request-claim-cancelled-intent",
           idempotencyKey: "key-claim-cancelled-intent" },
@@ -781,6 +813,14 @@ describe("real AuthorityWorker runtime authority", () => {
         signal: new AbortController().signal,
       })).rejects.toMatchObject({ code: "permission_denied" });
       expect(deniedExecute).not.toHaveBeenCalled();
+
+      await expect(client.executeRuntime({
+        type: "runtime.claim-pending-direct-intents",
+        providerId: "openai-responses",
+        modelId: "configured-model",
+        limit: 256,
+        now: now + 102,
+      })).resolves.toMatchObject({ kind: "direct-intent-claims", records: [], hasMore: false });
 
       const history = await client.readMessageHistory({
         sessionId: context.sessionId,

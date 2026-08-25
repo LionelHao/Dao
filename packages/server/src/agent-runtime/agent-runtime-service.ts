@@ -406,7 +406,6 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
             rejectTimeout(new AgentRuntimeError("provider_timeout", "Provider attempt timed out"));
           },
           (error: unknown) => {
-            attemptController.abort("provider_timeout_persist_failed");
             rejectTimeout(error);
           },
         );
