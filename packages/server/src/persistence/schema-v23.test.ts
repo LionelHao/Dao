@@ -215,6 +215,99 @@ describe("authority SQLite v23 Project Loop authority", () => {
     });
   });
 
+  it("requires explicit Goal supersede reasons without inventing one for the initial active Goal", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabase(database);
+      database.exec(`
+        INSERT INTO actors (id, kind, display_name) VALUES ('human-goal', 'human', 'Human');
+        INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+        VALUES ('identity', 'human-goal', 0, 1), ('room', 'room-goal', 0, 1);
+        INSERT INTO rooms (id, name, status, created_at, owner_actor_id)
+        VALUES ('room-goal', 'Room', 'active', '2026-08-25T00:00:00.000Z', 'human-goal');
+      `);
+      const insertGoal = database.prepare(
+        `INSERT INTO project_goals (
+           id, room_id, project_id, revision, title, description, status,
+           supersedes_goal_id, superseded_by_goal_id, supersede_reason,
+           source_room_id, source_id, source_kind, created_by_actor_id,
+           confirmed_by_human_actor_id, created_at, updated_at,
+           source_revision, visibility_room_id
+         ) VALUES (?, 'room-goal', 'room-goal', 1, ?, '', ?, ?, NULL, ?,
+                   'room-goal', 'message-goal', 'message', 'human-goal', ?,
+                   '2026-08-25T00:00:00.000Z', '2026-08-25T00:00:00.000Z', 1, 'room-goal')`,
+      );
+      expect(() => insertGoal.run(
+        "goal-invalid-initial", "Invalid", "active", null, "invented", "human-goal",
+      )).toThrow();
+      insertGoal.run("goal-initial", "Initial", "active", null, null, "human-goal");
+      insertGoal.run("goal-replacement", "Replacement", "proposed", "goal-initial", null, null);
+
+      expect(() => database.prepare(
+        `UPDATE project_goals SET status = 'superseded', superseded_by_goal_id = 'goal-replacement'
+         WHERE id = 'goal-initial'`,
+      ).run()).toThrow();
+      database.prepare(
+        `UPDATE project_goals SET status = 'superseded', superseded_by_goal_id = 'goal-replacement',
+           supersede_reason = 'The replacement narrows delivery scope.' WHERE id = 'goal-initial'`,
+      ).run();
+      expect(() => database.prepare(
+        `UPDATE project_goals SET status = 'active', confirmed_by_human_actor_id = 'human-goal'
+         WHERE id = 'goal-replacement'`,
+      ).run()).toThrow();
+      database.prepare(
+        `UPDATE project_goals SET status = 'active', confirmed_by_human_actor_id = 'human-goal',
+           supersede_reason = 'The replacement narrows delivery scope.' WHERE id = 'goal-replacement'`,
+      ).run();
+      expect(database.prepare(
+        `SELECT id, status, supersede_reason AS supersedeReason
+         FROM project_goals ORDER BY id`,
+      ).all()).toEqual([
+        { id: "goal-initial", status: "superseded",
+          supersedeReason: "The replacement narrows delivery scope." },
+        { id: "goal-replacement", status: "active",
+          supersedeReason: "The replacement narrows delivery scope." },
+      ]);
+    });
+  });
+
+  it("keys replacement Ball boundaries by explicit lifecycle generation", () => {
+    withDatabase((database) => {
+      migrateAuthorityDatabase(database);
+      database.exec(`
+        INSERT INTO actors (id, kind, display_name) VALUES ('human-boundary', 'human', 'Human');
+        INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
+        VALUES ('identity', 'human-boundary', 0, 1), ('room', 'room-boundary', 0, 1);
+        INSERT INTO rooms (id, name, status, created_at, owner_actor_id)
+        VALUES ('room-boundary', 'Room', 'active', '2026-08-25T00:00:00.000Z', 'human-boundary');
+      `);
+      const insertBoundary = database.prepare(
+        `INSERT INTO project_ball_boundaries (
+           boundary_id, room_id, project_id, source_kind, source_id, source_revision,
+           lifecycle_generation, holder_kind, holder_actor_id, reason, since, status, released_at
+         ) VALUES (?, 'room-boundary', 'room-boundary', 'next_action', 'action-1', 4,
+                   ?, 'human', 'human-boundary', 'Delivery is pending',
+                   '2026-08-25T00:00:00.000Z', ?, ?)`,
+      );
+      expect(() => insertBoundary.run("boundary-negative", -1, "active", null)).toThrow();
+      insertBoundary.run("boundary-generation-0", 0, "active", null);
+      database.prepare(
+        `UPDATE project_ball_boundaries SET status = 'released',
+           released_at = '2026-08-25T01:00:00.000Z' WHERE boundary_id = 'boundary-generation-0'`,
+      ).run();
+      insertBoundary.run("boundary-generation-1", 1, "active", null);
+      expect(() => insertBoundary.run(
+        "boundary-generation-1-duplicate", 1, "released", "2026-08-25T01:00:00.000Z",
+      )).toThrow();
+      expect(database.prepare(
+        `SELECT boundary_id AS boundaryId, lifecycle_generation AS lifecycleGeneration
+         FROM project_ball_boundaries ORDER BY lifecycle_generation`,
+      ).all()).toEqual([
+        { boundaryId: "boundary-generation-0", lifecycleGeneration: 0 },
+        { boundaryId: "boundary-generation-1", lifecycleGeneration: 1 },
+      ]);
+    });
+  });
+
   it("keeps fresh and v22-upgraded physical contracts equivalent and reopens under WAL", () => {
     let freshSql: unknown[] = [];
     withDatabase((database) => {

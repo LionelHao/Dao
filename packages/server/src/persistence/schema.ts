@@ -74,7 +74,7 @@ const SCHEMA_FINGERPRINTS = {
   20: "1ca2a806a52cd2ce9632b02e215a25ba13bc3ebc4336f5152c48f21d60faa2a0",
   21: "dca0a24a346060b1e04b98ee5a73e016421796d6c13bd0bd2841179f405c44af",
   22: "cbf4ccb27b52c3b88d61667f94811501d36a54795391e0044bbb0b2f41d3c7ce",
-  23: "857588e2bfae0a111b2c41910df1e1231b5014947d0e84de7b0cf7b6f4fca077",
+  23: "532b7c0589c5ae2f4cb96c43747b19e3a7c83c2f04fd9fea663191ea5a46aced",
 } as const;
 
 const V1_STATEMENTS = [
@@ -7563,6 +7563,9 @@ const V23_STATEMENTS = [
     status TEXT NOT NULL CHECK (status IN ('proposed', 'active', 'superseded', 'rejected')),
     supersedes_goal_id TEXT REFERENCES project_goals(id),
     superseded_by_goal_id TEXT REFERENCES project_goals(id),
+    supersede_reason TEXT CHECK (
+      supersede_reason IS NULL OR length(trim(supersede_reason)) BETWEEN 1 AND 8192
+    ),
     source_room_id TEXT NOT NULL REFERENCES rooms(id) CHECK (source_room_id = room_id),
     source_id TEXT NOT NULL CHECK (length(trim(source_id)) BETWEEN 1 AND 256),
     source_kind TEXT NOT NULL CHECK (source_kind IN ('message', 'attachment', 'agent_execution', 'memory', 'project_fact', 'legacy')),
@@ -7574,6 +7577,12 @@ const V23_STATEMENTS = [
       (status = 'active' AND confirmed_by_human_actor_id IS NOT NULL AND superseded_by_goal_id IS NULL)
       OR (status = 'superseded' AND confirmed_by_human_actor_id IS NOT NULL AND superseded_by_goal_id IS NOT NULL)
       OR (status IN ('proposed', 'rejected') AND confirmed_by_human_actor_id IS NULL)
+    ),
+    CHECK (
+      (status = 'active' AND supersedes_goal_id IS NULL AND supersede_reason IS NULL)
+      OR (status = 'active' AND supersedes_goal_id IS NOT NULL AND supersede_reason IS NOT NULL)
+      OR (status = 'superseded' AND supersede_reason IS NOT NULL)
+      OR status IN ('proposed', 'rejected')
     )
   ) STRICT`,
   `CREATE UNIQUE INDEX project_goals_one_active_v23
@@ -7876,6 +7885,7 @@ const V23_STATEMENTS = [
     )),
     source_id TEXT NOT NULL,
     source_revision INTEGER NOT NULL CHECK (source_revision > 0),
+    lifecycle_generation INTEGER NOT NULL DEFAULT 0 CHECK (lifecycle_generation >= 0),
     holder_kind TEXT NOT NULL CHECK (holder_kind IN ('human', 'agent')),
     holder_actor_id TEXT NOT NULL REFERENCES actors(id),
     reason TEXT NOT NULL CHECK (length(trim(reason)) BETWEEN 1 AND 2048),
@@ -7883,7 +7893,7 @@ const V23_STATEMENTS = [
     due_at TEXT,
     status TEXT NOT NULL CHECK (status IN ('active', 'released', 'superseded')),
     released_at TEXT,
-    UNIQUE (room_id, source_kind, source_id, source_revision),
+    UNIQUE (room_id, source_kind, source_id, source_revision, lifecycle_generation),
     CHECK ((status = 'active') = (released_at IS NULL))
   ) STRICT`,
   `CREATE UNIQUE INDEX project_ball_one_active_source_v23
@@ -9299,7 +9309,7 @@ const V23_SCHEMA_CONTRACT = {
   project_room_states: ["room_id", "project_id", "revision", "event_head_seq", "updated_at"],
   project_goals: [
     "id", "room_id", "project_id", "revision", "title", "description", "status",
-    "supersedes_goal_id", "superseded_by_goal_id", "source_room_id", "source_id",
+    "supersedes_goal_id", "superseded_by_goal_id", "supersede_reason", "source_room_id", "source_id",
     "source_kind", "created_by_actor_id", "confirmed_by_human_actor_id",
     "created_at", "updated_at", "source_revision", "visibility_room_id",
   ],
@@ -9338,7 +9348,7 @@ const V23_SCHEMA_CONTRACT = {
   ],
   project_ball_boundaries: [
     "boundary_id", "room_id", "project_id", "source_kind", "source_id",
-    "source_revision", "holder_kind", "holder_actor_id", "reason", "since",
+    "source_revision", "lifecycle_generation", "holder_kind", "holder_actor_id", "reason", "since",
     "due_at", "status", "released_at",
   ],
   project_due_reminder_claims: [
