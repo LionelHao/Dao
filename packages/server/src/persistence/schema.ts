@@ -7,7 +7,7 @@ import {
 } from "../access/room-cache-invalidation-port.js";
 import { OFFLINE_READ_LEASE_SCHEMA_STATEMENTS } from "../access/offline-lease-invalidation-port.js";
 
-export const AUTHORITY_SCHEMA_VERSION = 21 as const;
+export const AUTHORITY_SCHEMA_VERSION = 22 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -73,6 +73,7 @@ const SCHEMA_FINGERPRINTS = {
   19: "e458dedc7c0d85c04bca92dc2f6289b02367fb97fc7edbe1c7dba011470812b7",
   20: "1ca2a806a52cd2ce9632b02e215a25ba13bc3ebc4336f5152c48f21d60faa2a0",
   21: "dca0a24a346060b1e04b98ee5a73e016421796d6c13bd0bd2841179f405c44af",
+  22: "3683dad1ce312ff84e949085adeba5b934910768aab6499974b354d478f7cf03",
 } as const;
 
 const V1_STATEMENTS = [
@@ -6824,6 +6825,384 @@ export const AUTHORITY_V21_MIGRATION_CHECKSUM_FOR_TEST = migrationChecksum(
   V21_STATEMENTS,
 );
 
+const V22_CANCELLATION_REASONS = [
+  "human_cancelled",
+  "reply_superseded",
+  "correction_superseded",
+  "intent_superseded",
+  "message_recalled",
+  "room_archived",
+  "membership_revoked",
+  "assignment_revoked",
+  "profile_disabled",
+  "capability_revoked",
+  "source_ineligible",
+  "runtime_shutdown",
+] as const;
+
+const V22_CANCELLATION_REASON_SQL = V22_CANCELLATION_REASONS
+  .map((reason) => `'${reason}'`)
+  .join(", ");
+
+const V22_STATEMENTS = [
+  `CREATE TABLE agent_execution_runtime_states (
+    execution_id TEXT PRIMARY KEY REFERENCES agent_executions(id),
+    intent_id TEXT REFERENCES agent_invocation_intents(id),
+    lineage_id TEXT,
+    execution_ordinal INTEGER CHECK (execution_ordinal IS NULL OR execution_ordinal >= 1),
+    retry_of_execution_id TEXT REFERENCES agent_executions(id),
+    snapshot_id TEXT REFERENCES context_snapshots(snapshot_id),
+    provider_id TEXT,
+    model_id TEXT,
+    public_status TEXT NOT NULL CHECK (
+      public_status IN ('accepted', 'running', 'completed', 'failed', 'cancelled')
+    ),
+    phase TEXT NOT NULL CHECK (phase IN (
+      'queued', 'retry_scheduled', 'recovery_queued', 'awaiting_capacity',
+      'claiming', 'snapshot_frozen', 'model_generation', 'read_tool',
+      'waiting_confirmation', 'side_effect_claimed', 'final_committing',
+      'completed', 'failed', 'cancelled'
+    )),
+    current_attempt_seq INTEGER NOT NULL CHECK (current_attempt_seq >= 1),
+    authority_version INTEGER NOT NULL DEFAULT 1 CHECK (authority_version >= 1),
+    execution_generation INTEGER NOT NULL CHECK (execution_generation >= 1),
+    queued_at TEXT NOT NULL,
+    started_at TEXT,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    terminal_reason TEXT,
+    terminal_error_code TEXT,
+    review_state TEXT NOT NULL DEFAULT 'none' CHECK (
+      review_state IN ('none', 'needs_review', 'dead_letter', 'legacy_review_required')
+    ),
+    UNIQUE (intent_id, execution_ordinal),
+    CHECK (
+      (review_state = 'legacy_review_required') OR
+      (intent_id IS NOT NULL AND lineage_id IS NOT NULL AND execution_ordinal IS NOT NULL
+       AND snapshot_id IS NOT NULL AND provider_id IS NOT NULL AND model_id IS NOT NULL)
+    ),
+    CHECK (
+      (public_status = 'accepted' AND phase IN (
+        'queued', 'retry_scheduled', 'recovery_queued', 'awaiting_capacity'
+      ) AND completed_at IS NULL AND terminal_reason IS NULL)
+      OR (public_status = 'running' AND phase IN (
+        'claiming', 'snapshot_frozen', 'model_generation', 'read_tool',
+        'waiting_confirmation', 'side_effect_claimed', 'final_committing'
+      ) AND completed_at IS NULL AND terminal_reason IS NULL)
+      OR (public_status = 'completed' AND phase = 'completed'
+          AND completed_at IS NOT NULL AND terminal_reason IS NULL)
+      OR (public_status = 'failed' AND phase = 'failed'
+          AND completed_at IS NOT NULL AND terminal_error_code IS NOT NULL)
+      OR (public_status = 'cancelled' AND phase = 'cancelled'
+          AND completed_at IS NOT NULL AND terminal_reason IN (${V22_CANCELLATION_REASON_SQL}, 'legacy_interrupted'))
+    )
+  ) STRICT`,
+  `INSERT INTO agent_execution_runtime_states (
+     execution_id, intent_id, lineage_id, execution_ordinal, retry_of_execution_id,
+     snapshot_id, provider_id, model_id, public_status, phase,
+     current_attempt_seq, authority_version, execution_generation, queued_at,
+     started_at, updated_at, completed_at, terminal_reason, terminal_error_code,
+     review_state
+   )
+   SELECT execution.id, link.intent_id, intent.lineage_id, link.execution_ordinal,
+          link.retry_of_execution_id, context.snapshot_id, execution.provider_id,
+          execution.model_id,
+          CASE execution.status WHEN 'queued' THEN 'accepted' ELSE execution.status END,
+          CASE execution.status
+            WHEN 'queued' THEN 'queued'
+            WHEN 'running' THEN 'model_generation'
+            WHEN 'completed' THEN 'completed'
+            WHEN 'failed' THEN 'failed'
+            ELSE 'cancelled'
+          END,
+          execution.current_attempt_seq, 1, execution.execution_generation,
+          COALESCE(execution.queued_at, execution.started_at, CURRENT_TIMESTAMP),
+          CASE WHEN execution.status = 'running' THEN execution.started_at ELSE NULL END,
+          COALESCE(execution.updated_at, execution.completed_at,
+                   execution.started_at, CURRENT_TIMESTAMP),
+          CASE WHEN execution.status IN ('completed', 'failed', 'cancelled')
+               THEN COALESCE(execution.completed_at, execution.updated_at,
+                             execution.started_at, CURRENT_TIMESTAMP)
+               ELSE NULL END,
+          CASE WHEN execution.status = 'cancelled'
+               THEN CASE
+                 WHEN execution.cancellation_reason IN (${V22_CANCELLATION_REASON_SQL})
+                 THEN execution.cancellation_reason
+                 ELSE 'legacy_interrupted'
+               END
+               ELSE NULL END,
+          CASE WHEN execution.status = 'failed'
+               THEN COALESCE(execution.terminal_error_code, 'legacy_failure')
+               ELSE NULL END,
+          CASE WHEN link.intent_id IS NULL OR context.snapshot_id IS NULL
+                    OR execution.provider_id IS NULL OR execution.model_id IS NULL
+               THEN 'legacy_review_required' ELSE 'none' END
+   FROM agent_executions AS execution
+   LEFT JOIN agent_execution_intent_links AS link ON link.execution_id = execution.id
+   LEFT JOIN agent_invocation_intents AS intent ON intent.id = link.intent_id
+   LEFT JOIN agent_execution_context_bindings AS context
+     ON context.execution_id = execution.id`,
+  `CREATE INDEX agent_execution_runtime_states_admission_v22
+   ON agent_execution_runtime_states(public_status, phase, queued_at, execution_id)`,
+  `CREATE INDEX agent_execution_runtime_states_lineage_v22
+   ON agent_execution_runtime_states(intent_id, execution_ordinal, execution_id)`,
+  `CREATE TABLE agent_execution_attempt_runtime_states (
+    execution_id TEXT NOT NULL REFERENCES agent_execution_runtime_states(execution_id),
+    attempt_seq INTEGER NOT NULL CHECK (attempt_seq >= 1),
+    public_status TEXT NOT NULL CHECK (
+      public_status IN ('accepted', 'running', 'completed', 'failed', 'cancelled')
+    ),
+    phase TEXT NOT NULL CHECK (phase IN (
+      'queued', 'retry_scheduled', 'recovery_queued', 'awaiting_capacity',
+      'claiming', 'snapshot_frozen', 'model_generation', 'read_tool',
+      'waiting_confirmation', 'side_effect_claimed', 'final_committing',
+      'completed', 'failed', 'cancelled'
+    )),
+    attempt_version INTEGER NOT NULL DEFAULT 1 CHECK (attempt_version >= 1),
+    reuse_kind TEXT NOT NULL CHECK (
+      reuse_kind IN ('first', 'automatic_retry', 'crash_recovery', 'legacy_review')
+    ),
+    started_at TEXT,
+    finished_at TEXT,
+    error_code TEXT,
+    next_retry_at TEXT,
+    PRIMARY KEY (execution_id, attempt_seq),
+    FOREIGN KEY (execution_id, attempt_seq)
+      REFERENCES agent_execution_attempts(execution_id, attempt_seq),
+    CHECK (
+      (public_status IN ('accepted', 'running') AND finished_at IS NULL)
+      OR (public_status IN ('completed', 'failed', 'cancelled') AND finished_at IS NOT NULL)
+    )
+  ) STRICT`,
+  `INSERT INTO agent_execution_attempt_runtime_states (
+     execution_id, attempt_seq, public_status, phase, attempt_version, reuse_kind,
+     started_at, finished_at, error_code, next_retry_at
+   )
+   SELECT attempt.execution_id, attempt.attempt_seq,
+          CASE attempt.status WHEN 'queued' THEN 'accepted' ELSE attempt.status END,
+          CASE attempt.status
+            WHEN 'queued' THEN 'queued'
+            WHEN 'running' THEN 'model_generation'
+            WHEN 'completed' THEN 'completed'
+            WHEN 'failed' THEN 'failed'
+            ELSE 'cancelled'
+          END,
+          1, COALESCE(context.reuse_kind, 'legacy_review'), attempt.started_at,
+          CASE WHEN attempt.status IN ('completed', 'failed', 'cancelled')
+               THEN COALESCE(attempt.finished_at, CURRENT_TIMESTAMP) ELSE NULL END,
+          attempt.error_code, attempt.next_retry_at
+   FROM agent_execution_attempts AS attempt
+   LEFT JOIN agent_execution_context_attempts AS context
+     ON context.execution_id = attempt.execution_id
+    AND context.attempt_seq = attempt.attempt_seq`,
+  `CREATE TABLE invocation_scoped_cancellation_fences (
+    fence_id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    scope_kind TEXT NOT NULL CHECK (scope_kind IN ('intent', 'execution')),
+    intent_id TEXT NOT NULL REFERENCES agent_invocation_intents(id),
+    execution_id TEXT REFERENCES agent_execution_runtime_states(execution_id),
+    expected_authority_version INTEGER NOT NULL CHECK (expected_authority_version >= 1),
+    reason TEXT NOT NULL CHECK (reason IN (${V22_CANCELLATION_REASON_SQL})),
+    principal_human_actor_id TEXT REFERENCES actors(id),
+    internal_capability TEXT CHECK (
+      internal_capability IS NULL OR internal_capability IN (
+        'message_authority', 'room_authority', 'membership_authority',
+        'profile_authority', 'assignment_authority', 'runtime_supervisor'
+      )
+    ),
+    committed_at TEXT NOT NULL,
+    CHECK (
+      (scope_kind = 'intent' AND execution_id IS NULL) OR
+      (scope_kind = 'execution' AND execution_id IS NOT NULL)
+    ),
+    CHECK ((principal_human_actor_id IS NULL) <> (internal_capability IS NULL))
+  ) STRICT`,
+  `CREATE TABLE invocation_scoped_cancellation_targets (
+    fence_id TEXT NOT NULL REFERENCES invocation_scoped_cancellation_fences(fence_id),
+    execution_id TEXT NOT NULL REFERENCES agent_execution_runtime_states(execution_id),
+    attempt_seq INTEGER NOT NULL CHECK (attempt_seq >= 1),
+    execution_version_before INTEGER NOT NULL CHECK (execution_version_before >= 1),
+    execution_version_after INTEGER NOT NULL CHECK (
+      execution_version_after = execution_version_before + 1
+    ),
+    PRIMARY KEY (fence_id, execution_id),
+    FOREIGN KEY (execution_id, attempt_seq)
+      REFERENCES agent_execution_attempt_runtime_states(execution_id, attempt_seq)
+  ) STRICT`,
+  `CREATE TABLE invocation_cancellation_receipts (
+    request_id TEXT PRIMARY KEY,
+    fence_id TEXT NOT NULL UNIQUE REFERENCES invocation_scoped_cancellation_fences(fence_id),
+    principal_actor_id TEXT REFERENCES actors(id),
+    request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+    status_code INTEGER NOT NULL CHECK (status_code IN (200, 403, 404, 409, 410)),
+    response_json TEXT NOT NULL CHECK (json_valid(response_json)),
+    committed_at TEXT NOT NULL
+  ) STRICT`,
+  `CREATE TABLE invocation_recovery_queue (
+    recovery_key INTEGER PRIMARY KEY AUTOINCREMENT,
+    execution_id TEXT NOT NULL UNIQUE REFERENCES agent_execution_runtime_states(execution_id),
+    execution_version INTEGER NOT NULL CHECK (execution_version >= 1),
+    state TEXT NOT NULL CHECK (state IN ('pending', 'leased', 'closed', 'dead_letter')),
+    available_at TEXT NOT NULL,
+    lease_owner TEXT,
+    lease_expires_at TEXT,
+    failure_code TEXT,
+    review_required INTEGER NOT NULL DEFAULT 0 CHECK (review_required IN (0, 1)),
+    updated_at TEXT NOT NULL,
+    CHECK (
+      (state = 'leased' AND lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)
+      OR (state <> 'leased' AND lease_owner IS NULL AND lease_expires_at IS NULL)
+    ),
+    CHECK (state <> 'dead_letter' OR (failure_code IS NOT NULL AND review_required = 1))
+  ) STRICT`,
+  `CREATE INDEX invocation_recovery_queue_scan_v22
+   ON invocation_recovery_queue(state, available_at, recovery_key)`,
+  `CREATE TABLE invocation_recovery_cursors (
+    worker_scope TEXT PRIMARY KEY CHECK (worker_scope = 'invocation-runtime'),
+    last_recovery_key INTEGER NOT NULL DEFAULT 0 CHECK (last_recovery_key >= 0),
+    scan_generation INTEGER NOT NULL DEFAULT 1 CHECK (scan_generation >= 1),
+    updated_at TEXT NOT NULL
+  ) STRICT`,
+  `INSERT INTO invocation_recovery_cursors
+   VALUES ('invocation-runtime', 0, 1, CURRENT_TIMESTAMP)`,
+  `CREATE TABLE project_boundary_invocation_receipts (
+    boundary_id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    source_revision INTEGER NOT NULL CHECK (source_revision >= 1),
+    status TEXT NOT NULL CHECK (
+      status IN ('dependency_unavailable', 'suppressed', 'consumed')
+    ),
+    invocation_intent_id TEXT UNIQUE REFERENCES agent_invocation_intents(id),
+    request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+    recorded_at TEXT NOT NULL,
+    CHECK ((status = 'consumed') = (invocation_intent_id IS NOT NULL))
+  ) STRICT`,
+  `CREATE TABLE legacy_room_wide_preemption_markers (
+    source_kind TEXT NOT NULL CHECK (
+      source_kind IN ('human_preemption_fence', 'agent_human_fence')
+    ),
+    source_id TEXT NOT NULL,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    marked_at TEXT NOT NULL,
+    production_reachable INTEGER NOT NULL DEFAULT 0 CHECK (production_reachable = 0),
+    PRIMARY KEY (source_kind, source_id)
+  ) STRICT`,
+  `INSERT INTO legacy_room_wide_preemption_markers (
+     source_kind, source_id, room_id, marked_at, production_reachable
+   )
+   SELECT 'human_preemption_fence', source_human_message_id, room_id,
+          cancel_committed_at, 0 FROM human_preemption_fences`,
+  `INSERT INTO legacy_room_wide_preemption_markers (
+     source_kind, source_id, room_id, marked_at, production_reachable
+   )
+   SELECT 'agent_human_fence', fence_message_id || ':' || execution_id || ':' || old_attempt_seq,
+          execution.room_id, fence.cancelled_at, 0
+   FROM agent_human_fences AS fence
+   JOIN agent_executions AS execution ON execution.id = fence.execution_id`,
+  `CREATE TRIGGER agent_execution_runtime_states_v22_validate_update
+   BEFORE UPDATE ON agent_execution_runtime_states
+   WHEN NEW.execution_id <> OLD.execution_id
+      OR NEW.intent_id IS NOT OLD.intent_id
+      OR NEW.lineage_id IS NOT OLD.lineage_id
+      OR NEW.execution_ordinal IS NOT OLD.execution_ordinal
+      OR NEW.retry_of_execution_id IS NOT OLD.retry_of_execution_id
+      OR NEW.snapshot_id IS NOT OLD.snapshot_id
+      OR NEW.provider_id IS NOT OLD.provider_id
+      OR NEW.model_id IS NOT OLD.model_id
+      OR NEW.execution_generation <> OLD.execution_generation
+      OR NEW.authority_version <> OLD.authority_version + 1
+      OR OLD.public_status IN ('completed', 'failed', 'cancelled')
+      OR (OLD.public_status = 'accepted' AND NEW.public_status NOT IN (
+        'accepted', 'running', 'failed', 'cancelled'
+      ))
+      OR (OLD.public_status = 'running' AND NEW.public_status NOT IN (
+        'accepted', 'running', 'completed', 'failed', 'cancelled'
+      ))
+   BEGIN SELECT RAISE(ABORT, 'Invocation execution CAS or terminal transition is invalid'); END`,
+  `CREATE TRIGGER agent_execution_runtime_states_v22_immutable_delete
+   BEFORE DELETE ON agent_execution_runtime_states
+   BEGIN SELECT RAISE(ABORT, 'Invocation execution authority is immutable'); END`,
+  `CREATE TRIGGER agent_execution_attempt_runtime_states_v22_validate_update
+   BEFORE UPDATE ON agent_execution_attempt_runtime_states
+   WHEN NEW.execution_id <> OLD.execution_id OR NEW.attempt_seq <> OLD.attempt_seq
+      OR NEW.reuse_kind <> OLD.reuse_kind
+      OR NEW.attempt_version <> OLD.attempt_version + 1
+      OR OLD.public_status IN ('completed', 'failed', 'cancelled')
+      OR (OLD.public_status = 'accepted' AND NEW.public_status NOT IN (
+        'accepted', 'running', 'failed', 'cancelled'
+      ))
+      OR (OLD.public_status = 'running' AND NEW.public_status NOT IN (
+        'accepted', 'running', 'completed', 'failed', 'cancelled'
+      ))
+   BEGIN SELECT RAISE(ABORT, 'Invocation attempt CAS or terminal transition is invalid'); END`,
+  `CREATE TRIGGER agent_execution_attempt_runtime_states_v22_immutable_delete
+   BEFORE DELETE ON agent_execution_attempt_runtime_states
+   BEGIN SELECT RAISE(ABORT, 'Invocation attempt authority is immutable'); END`,
+  `CREATE TRIGGER invocation_scoped_cancellation_fences_v22_validate_insert
+   BEFORE INSERT ON invocation_scoped_cancellation_fences
+   WHEN NOT EXISTS (
+     SELECT 1 FROM agent_invocation_intents AS intent
+     LEFT JOIN agent_execution_runtime_states AS execution
+       ON execution.execution_id = NEW.execution_id
+     WHERE intent.id = NEW.intent_id AND intent.room_id = NEW.room_id
+       AND (NEW.execution_id IS NULL OR (
+         execution.intent_id = intent.id
+         AND execution.authority_version = NEW.expected_authority_version
+         AND execution.public_status IN ('accepted', 'running')
+       ))
+   ) OR (NEW.principal_human_actor_id IS NOT NULL AND NOT EXISTS (
+     SELECT 1 FROM actors AS actor
+     JOIN room_memberships AS membership ON membership.actor_id = actor.id
+     WHERE actor.id = NEW.principal_human_actor_id AND actor.kind = 'human'
+       AND membership.room_id = NEW.room_id AND membership.kind = 'human'
+   ))
+   BEGIN SELECT RAISE(ABORT, 'Scoped cancellation authority or version is invalid'); END`,
+  `CREATE TRIGGER invocation_scoped_cancellation_fences_v22_immutable_update
+   BEFORE UPDATE ON invocation_scoped_cancellation_fences
+   BEGIN SELECT RAISE(ABORT, 'Scoped cancellation fence is immutable'); END`,
+  `CREATE TRIGGER invocation_scoped_cancellation_fences_v22_immutable_delete
+   BEFORE DELETE ON invocation_scoped_cancellation_fences
+   BEGIN SELECT RAISE(ABORT, 'Scoped cancellation fence is immutable'); END`,
+  `CREATE TRIGGER invocation_scoped_cancellation_targets_v22_immutable_update
+   BEFORE UPDATE ON invocation_scoped_cancellation_targets
+   BEGIN SELECT RAISE(ABORT, 'Scoped cancellation target is immutable'); END`,
+  `CREATE TRIGGER invocation_scoped_cancellation_targets_v22_immutable_delete
+   BEFORE DELETE ON invocation_scoped_cancellation_targets
+   BEGIN SELECT RAISE(ABORT, 'Scoped cancellation target is immutable'); END`,
+  `CREATE TRIGGER invocation_cancellation_receipts_v22_immutable_update
+   BEFORE UPDATE ON invocation_cancellation_receipts
+   BEGIN SELECT RAISE(ABORT, 'Cancellation receipt is immutable'); END`,
+  `CREATE TRIGGER invocation_cancellation_receipts_v22_immutable_delete
+   BEFORE DELETE ON invocation_cancellation_receipts
+   BEGIN SELECT RAISE(ABORT, 'Cancellation receipt is immutable'); END`,
+  `CREATE TRIGGER project_boundary_invocation_receipts_v22_immutable_update
+   BEFORE UPDATE ON project_boundary_invocation_receipts
+   BEGIN SELECT RAISE(ABORT, 'Project boundary receipt is immutable'); END`,
+  `CREATE TRIGGER project_boundary_invocation_receipts_v22_immutable_delete
+   BEFORE DELETE ON project_boundary_invocation_receipts
+   BEGIN SELECT RAISE(ABORT, 'Project boundary receipt is immutable'); END`,
+  `CREATE TRIGGER legacy_room_wide_preemption_markers_v22_immutable_update
+   BEFORE UPDATE ON legacy_room_wide_preemption_markers
+   BEGIN SELECT RAISE(ABORT, 'Legacy broad-preemption marker is immutable'); END`,
+  `CREATE TRIGGER legacy_room_wide_preemption_markers_v22_immutable_delete
+   BEFORE DELETE ON legacy_room_wide_preemption_markers
+   BEGIN SELECT RAISE(ABORT, 'Legacy broad-preemption marker is immutable'); END`,
+] as const;
+
+export const AUTHORITY_V22_STATEMENT_COUNT_FOR_TEST = V22_STATEMENTS.length;
+export const AUTHORITY_V22_TRIGGER_INVARIANT_STATEMENT_COUNT_FOR_TEST =
+  V22_STATEMENTS.filter((statement) => statement.startsWith("CREATE TRIGGER ")).length;
+export const AUTHORITY_V22_STARTUP_INVARIANT_STATEMENT_COUNT_FOR_TEST = 5;
+export const AUTHORITY_V22_INVARIANT_STATEMENT_COUNT_FOR_TEST =
+  AUTHORITY_V22_TRIGGER_INVARIANT_STATEMENT_COUNT_FOR_TEST
+  + AUTHORITY_V22_STARTUP_INVARIANT_STATEMENT_COUNT_FOR_TEST;
+export const AUTHORITY_V22_ROLLBACK_ASSERTION_COUNT_FOR_TEST = V22_STATEMENTS.length;
+export const AUTHORITY_V22_MIGRATION_CHECKSUM_FOR_TEST = migrationChecksum(
+  22,
+  "invocation-runtime-authority",
+  V22_STATEMENTS,
+);
+
 const V2_STATEMENTS = [
   `ALTER TABLE actors
    ADD COLUMN catalog_revision INTEGER NOT NULL DEFAULT 0
@@ -7260,6 +7639,11 @@ const MIGRATIONS = [
     21,
     "direct-invocation-authority-binding",
     V21_STATEMENTS,
+  ),
+  defineMigration(
+    22,
+    "invocation-runtime-authority",
+    V22_STATEMENTS,
   ),
 ] as const satisfies readonly Migration[];
 
@@ -8032,6 +8416,48 @@ const V21_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V22_SCHEMA_CONTRACT = {
+  ...V21_SCHEMA_CONTRACT,
+  agent_execution_runtime_states: [
+    "execution_id", "intent_id", "lineage_id", "execution_ordinal",
+    "retry_of_execution_id", "snapshot_id", "provider_id", "model_id",
+    "public_status", "phase", "current_attempt_seq", "authority_version",
+    "execution_generation", "queued_at", "started_at", "updated_at",
+    "completed_at", "terminal_reason", "terminal_error_code", "review_state",
+  ],
+  agent_execution_attempt_runtime_states: [
+    "execution_id", "attempt_seq", "public_status", "phase", "attempt_version",
+    "reuse_kind", "started_at", "finished_at", "error_code", "next_retry_at",
+  ],
+  invocation_scoped_cancellation_fences: [
+    "fence_id", "room_id", "scope_kind", "intent_id", "execution_id",
+    "expected_authority_version", "reason", "principal_human_actor_id",
+    "internal_capability", "committed_at",
+  ],
+  invocation_scoped_cancellation_targets: [
+    "fence_id", "execution_id", "attempt_seq", "execution_version_before",
+    "execution_version_after",
+  ],
+  invocation_cancellation_receipts: [
+    "request_id", "fence_id", "principal_actor_id", "request_sha256",
+    "status_code", "response_json", "committed_at",
+  ],
+  invocation_recovery_queue: [
+    "recovery_key", "execution_id", "execution_version", "state", "available_at",
+    "lease_owner", "lease_expires_at", "failure_code", "review_required", "updated_at",
+  ],
+  invocation_recovery_cursors: [
+    "worker_scope", "last_recovery_key", "scan_generation", "updated_at",
+  ],
+  project_boundary_invocation_receipts: [
+    "boundary_id", "room_id", "source_revision", "status",
+    "invocation_intent_id", "request_sha256", "recorded_at",
+  ],
+  legacy_room_wide_preemption_markers: [
+    "source_kind", "source_id", "room_id", "marked_at", "production_reachable",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
@@ -8054,6 +8480,7 @@ const SCHEMA_CONTRACTS = {
   19: V19_SCHEMA_CONTRACT,
   20: V20_SCHEMA_CONTRACT,
   21: V21_SCHEMA_CONTRACT,
+  22: V22_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -9741,6 +10168,75 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
           OR assignment_revision.agent_actor_id <> intent.target_agent_id
        LIMIT 1`,
       "direct invocation bindings must retain exact immutable authority revisions",
+    );
+  }
+  if (schemaVersion >= 22) {
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_execution_runtime_states AS runtime
+       JOIN agent_executions AS execution ON execution.id = runtime.execution_id
+       LEFT JOIN agent_execution_intent_links AS link
+         ON link.execution_id = runtime.execution_id
+       LEFT JOIN agent_execution_context_bindings AS context
+         ON context.execution_id = runtime.execution_id
+       WHERE runtime.current_attempt_seq <> execution.current_attempt_seq
+          OR runtime.execution_generation <> execution.execution_generation
+          OR (runtime.review_state <> 'legacy_review_required' AND (
+            runtime.intent_id <> link.intent_id
+            OR runtime.lineage_id <> (
+              SELECT lineage_id FROM agent_invocation_intents WHERE id = runtime.intent_id
+            )
+            OR runtime.execution_ordinal <> link.execution_ordinal
+            OR runtime.retry_of_execution_id IS NOT link.retry_of_execution_id
+            OR runtime.snapshot_id <> context.snapshot_id
+            OR runtime.provider_id IS NOT execution.provider_id
+            OR runtime.model_id IS NOT execution.model_id
+          ))
+       LIMIT 1`,
+      "invocation execution projection must retain exact lineage and frozen authority",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM agent_execution_attempt_runtime_states AS runtime
+       JOIN agent_execution_attempts AS attempt
+         ON attempt.execution_id = runtime.execution_id
+        AND attempt.attempt_seq = runtime.attempt_seq
+       WHERE (attempt.status = 'queued' AND runtime.public_status <> 'accepted')
+          OR (attempt.status <> 'queued' AND runtime.public_status <> attempt.status)
+       LIMIT 1`,
+      "invocation attempt projection must map queued only to accepted",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM invocation_scoped_cancellation_targets AS target
+       JOIN invocation_scoped_cancellation_fences AS fence
+         ON fence.fence_id = target.fence_id
+       JOIN agent_execution_runtime_states AS execution
+         ON execution.execution_id = target.execution_id
+       WHERE fence.execution_id IS NOT NULL
+             AND fence.execution_id <> target.execution_id
+          OR execution.intent_id <> fence.intent_id
+          OR target.execution_version_after <> target.execution_version_before + 1
+       LIMIT 1`,
+      "scoped cancellation targets must remain inside their exact intent/execution scope",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM project_boundary_invocation_receipts
+       WHERE (status = 'consumed') <> (invocation_intent_id IS NOT NULL)
+       LIMIT 1`,
+      "project boundary dependency receipts must fail closed without a durable intent",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM legacy_room_wide_preemption_markers
+       WHERE production_reachable <> 0
+          OR source_kind NOT IN ('human_preemption_fence', 'agent_human_fence')
+       LIMIT 1`,
+      "legacy room-wide preemption history must remain read-only and production-unreachable",
     );
   }
 }
