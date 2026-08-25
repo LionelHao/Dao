@@ -81,10 +81,10 @@ export function mountProjectLoopBridgeSurface(
           render();
         });
       };
-      const action = (label: string, intent: Parameters<ProjectLoopBridge["submit"]>[0]["intent"]): HTMLButtonElement => {
+      const action = (label: string, intent: Extract<Parameters<ProjectLoopBridge["submit"]>[0]["intent"],
+        { kind: "request.transition" }>): HTMLButtonElement => {
         const value = document.createElement("button"); value.type = "button"; value.textContent = label;
-        value.dataset.projectControlId = `timeline:${request.requestId}:${intent.kind === "proposal.resolve"
-          ? intent.resolution : intent.action}`;
+        value.dataset.projectControlId = `timeline:${request.requestId}:${intent.action}`;
         value.disabled = mutationDisabled; value.addEventListener("click", () => submit(intent)); return value;
       };
       if (request.status === "pending_acceptance" && request.target.actorId === current.viewerActorId) {

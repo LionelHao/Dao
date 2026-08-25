@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isProjectLoopIntent, isProjectLoopRemoteState, isProjectLoopWireError,
+import { isProjectLoopIntent, isProjectLoopRemoteState, isProjectLoopSubmitCommand, isProjectLoopWireError,
   isProjectLoopWireResponse } from "./contracts.js";
 import { projectSnapshot } from "./test-fixture.js";
 
@@ -15,6 +15,26 @@ describe("FT-09 Desktop Project Loop closed bridge contracts", () => {
     expect(isProjectLoopIntent({ kind: "request.transition", intentId: "i-2", factId: "r-1",
       expectedRevision: 1, action: "transfer", target: { kind: "agent", actorId: "agent-1" },
       reason: "spoof" })).toBe(false);
+    expect(isProjectLoopIntent({ kind: "next_action.transition", intentId: "i-3", factId: "a-1",
+      expectedRevision: 2, action: "start" })).toBe(true);
+    expect(isProjectLoopIntent({ kind: "next_action.transition", intentId: "i-3b", factId: "a-1",
+      expectedRevision: 2, action: "complete", completionNote: "n".repeat(300),
+      criteriaSnapshot: [{ criterionId: "c-1", text: "c".repeat(300) }] })).toBe(true);
+    expect(isProjectLoopIntent({ kind: "obstacle.transition", intentId: "i-4", factId: "b-1",
+      expectedRevision: 2, obstacleKind: "blocker", action: "defer", reason: "wait",
+      reviewAt: "2026-08-28T00:00:00.000Z" })).toBe(true);
+    expect(isProjectLoopIntent({ kind: "transfer.resolve", intentId: "i-5",
+      transferProposalId: "t-1", subjectKind: "next_action", subjectId: "a-1",
+      expectedRevision: 2, resolution: "accepted", reason: null })).toBe(true);
+    expect(isProjectLoopIntent({ kind: "obstacle.transition", intentId: "i-6", factId: "b-1",
+      expectedRevision: 2, obstacleKind: "open_question", action: "resolve",
+      resultSource: { kind: "message", sourceId: "m-1", sourceRevision: 1,
+        roomId: "other-room", visibility: "room" }, reason: "done" })).toBe(true);
+    expect(isProjectLoopSubmitCommand({ roomId: "room-1", intent: {
+      kind: "obstacle.transition", intentId: "i-6", factId: "b-1", expectedRevision: 2,
+      obstacleKind: "open_question", action: "resolve", resultSource: { kind: "message",
+        sourceId: "m-1", sourceRevision: 1, roomId: "other-room", visibility: "room" }, reason: "done",
+    } })).toBe(false);
   });
 
   it("accepts only canonical snapshot/ACK and correlated closed error shapes", () => {

@@ -49,6 +49,92 @@ describe("FT-09 J-04/J-06/J-07 Project surface", () => {
       target: { kind: "human", actorId: "human-3" } }));
   });
 
+  it("offers Human-owned NextAction progress, completion, and transfer intents", () => {
+    const base = projectSnapshot(); const provenance = base.requests[0]!.provenance;
+    const action = { recordVersion: "project-loop.v1" as const, roomId: "room-1", projectId: "room-1",
+      revision: 2, provenance, createdAt: base.capturedAt, updatedAt: base.capturedAt,
+      kind: "next_action" as const, nextActionId: "action-1", title: "Ship", description: "Ship safely",
+      owner: { kind: "human" as const, actorId: "human-1" }, status: "accepted" as const,
+      dueAt: null, deliverable: "release", acceptanceCriteria: [{ criterionId: "c-1", text: "green" }],
+      verifier: null, acceptedBy: { kind: "human" as const, actorId: "human-1" },
+      acceptedAt: base.capturedAt, delivery: null, completedBy: null, completedAt: null,
+      statusReason: null, reassignmentChain: [] };
+    const root = document.createElement("main"); const ui = actions();
+    renderProjectLoopSurface(root, { ...ready(), snapshot: { ...base, nextActions: [action],
+      balls: deriveProjectBallFacts({ roomId: "room-1", projectId: "room-1", requests: base.requests,
+        nextActions: [action], obstacles: [], proposals: base.proposals, confirmations: [],
+        transferProposals: [] }) } }, ui, { activeCategory: "next_actions" });
+    root.querySelector<HTMLButtonElement>('[data-project-control-id="next-action:action-1:start"]')?.click();
+    expect(ui.onIntent).toHaveBeenCalledWith(expect.objectContaining({ kind: "next_action.transition",
+      factId: "action-1", action: "start", expectedRevision: 2 }));
+    const target = root.querySelector<HTMLInputElement>('[data-project-transfer-target="action-1"]')!;
+    target.value = "human-2";
+    root.querySelector<HTMLInputElement>('[data-project-transfer-reason="action-1"]')!.value = "handoff";
+    root.querySelector<HTMLButtonElement>('[data-project-control-id="next-action:action-1:transfer"]')?.click();
+    expect(ui.onIntent).toHaveBeenCalledWith(expect.objectContaining({ kind: "transfer.propose",
+      subjectKind: "next_action", subjectId: "action-1", toOwner: { kind: "human", actorId: "human-2" } }));
+  });
+
+  it("offers owner obstacle closure and named-principal transfer resolution", () => {
+    const base = projectSnapshot(); const provenance = base.requests[0]!.provenance;
+    const blocker = { recordVersion: "project-loop.v1" as const, roomId: "room-1", projectId: "room-1",
+      revision: 2, provenance, createdAt: base.capturedAt, updatedAt: base.capturedAt,
+      kind: "blocker" as const, obstacleId: "blocker-1", title: "Network", description: "Network down",
+      impact: "release", owner: { kind: "human" as const, actorId: "human-1" }, status: "open" as const,
+      dueAt: null, reviewAt: null, statusReason: null, escalationBoundaryId: null, resultSource: null,
+      transferChain: [], resolutionCriteria: "reachable", question: null };
+    const question = { ...blocker, kind: "open_question" as const, obstacleId: "question-1",
+      title: "Network", owner: { kind: "human" as const, actorId: "human-2" },
+      resolutionCriteria: null, question: "Which route?" };
+    const transfer = { recordVersion: "project-loop.v1" as const, transferProposalId: "transfer-1",
+      roomId: "room-1", projectId: "room-1", revision: 1, subjectKind: "open_question" as const,
+      subjectId: "question-1", subjectRevision: 2, fromOwner: question.owner,
+      toOwner: { kind: "human" as const, actorId: "human-1" }, proposedBy: { kind: "human" as const,
+        actorId: "human-2" }, principalActorId: "human-1", reason: "handoff", status: "pending" as const,
+      proposedAt: base.capturedAt, expiresAt: "2026-08-29T00:00:00.000Z", resolvedBy: null,
+      resolvedAt: null, resolutionReason: null };
+    const root = document.createElement("main"); const ui = actions();
+    renderProjectLoopSurface(root, { ...ready(), snapshot: { ...base, obstacles: [blocker, question],
+      transferProposals: [transfer], balls: deriveProjectBallFacts({ roomId: "room-1", projectId: "room-1",
+        requests: base.requests, nextActions: [], obstacles: [blocker, question], proposals: base.proposals,
+        confirmations: [], transferProposals: [transfer] }) } }, ui, { activeCategory: "obstacles" });
+    const visible = root.querySelector('[role="tabpanel"]')?.textContent ?? "";
+    expect(visible).toContain("BLOCKER"); expect(visible).toContain("OPEN QUESTION");
+    expect(root.querySelector('[data-project-obstacle-kind="blocker"]')?.getAttribute("aria-label"))
+      .toContain("阻塞 Blocker");
+    expect(root.querySelector('[data-project-obstacle-kind="open_question"]')?.getAttribute("aria-label"))
+      .toContain("待解问题 Open Question");
+    const sourceId = root.querySelector<HTMLInputElement>('[data-obstacle-result-source-id="blocker-1"]')!;
+    sourceId.value = "message-result";
+    root.querySelector<HTMLInputElement>('[data-obstacle-reason="blocker-1"]')!.value = "network restored";
+    root.querySelector<HTMLButtonElement>('[data-project-control-id="obstacle:blocker-1:resolve"]')?.click();
+    expect(ui.onIntent).toHaveBeenCalledWith(expect.objectContaining({ kind: "obstacle.transition",
+      obstacleKind: "blocker", factId: "blocker-1", action: "resolve",
+      resultSource: expect.objectContaining({ sourceId: "message-result", roomId: "room-1" }) }));
+    root.querySelector<HTMLButtonElement>('[data-project-control-id="transfer:transfer-1:accept"]')?.click();
+    expect(ui.onIntent).toHaveBeenCalledWith(expect.objectContaining({ kind: "transfer.resolve",
+      transferProposalId: "transfer-1", resolution: "accepted", reason: null }));
+  });
+
+  it("renders viewer-filtered NeedsAction separately from identifiable Room Ball ownership", () => {
+    const base = projectSnapshot();
+    const theirs = { ...base.requests[0]!, requestId: "request-other",
+      requester: { kind: "human" as const, actorId: "human-2" },
+      target: { kind: "human" as const, actorId: "human-3" } };
+    const requests = [base.requests[0]!, theirs];
+    const balls = deriveProjectBallFacts({ roomId: "room-1", projectId: "room-1", requests,
+      nextActions: base.nextActions, obstacles: base.obstacles, proposals: base.proposals,
+      confirmations: base.confirmations, transferProposals: base.transferProposals });
+    const root = document.createElement("main"); const ui = actions();
+    renderProjectLoopSurface(root, { ...ready(), snapshot: { ...base, requests, balls } }, ui,
+      { activeCategory: "ball" });
+    const needsAction = root.querySelector('[data-project-needs-action="viewer"]')?.textContent ?? "";
+    expect(needsAction).toContain("request-1"); expect(needsAction).not.toContain("request-other");
+    const ownership = root.querySelector('[data-project-ball-ownership="room"]')?.textContent ?? "";
+    expect(ownership).toContain("request-1"); expect(ownership).toContain("request-other");
+    expect(ownership).toContain("source request:request-other");
+  });
+
   it("renders proposal, confirmation, named confirmer, rejection and supersede audit", () => {
     const base = projectSnapshot(); const source = base.requests[0]!.provenance;
     const decision = { recordVersion: "project-loop.v1" as const, roomId: "room-1", projectId: "room-1",
@@ -85,7 +171,7 @@ describe("FT-09 J-04/J-06/J-07 Project surface", () => {
     expect(root.querySelector('[data-confirmation-id="confirmation-1"]')?.textContent)
       .toContain(`revision r2 · base new · digest sha256:${"a".repeat(64)}`);
     root.querySelector<HTMLButtonElement>('[data-category="ball"]')?.click();
-    expect(root.querySelector('[role="tabpanel"]')?.textContent).toContain("source r3");
+    expect(root.querySelector('[role="tabpanel"]')?.textContent).toContain("source request:request-1 r3");
     expect(root.querySelector('[data-proposal-id="proposal-1"]')?.textContent)
       .toContain("Rejected after source review");
   });

@@ -195,6 +195,26 @@ describe("FT-09 Project Loop WebSocket", () => {
       await server.close();
     }
   });
+
+  it("closes unexpected Project authority failures as a public 503", async () => {
+    const server = await startMessageWebSocketServer({
+      auth: governanceAuthenticationService(), service: idleMessageService(),
+      projectLoopAuthority: {
+        async executeMutation() { throw new Error("unexpected Project failure"); },
+        async executeQuery() { throw new Error("unexpected Project failure"); },
+      },
+    });
+    const client = await LoopbackClient.connect(server.url);
+    try {
+      await client.login(humans[0], "project-error-login");
+      client.send({ type: "project.snapshot.read", requestId: "project-unexpected",
+        roomId, projectId: roomId, afterEventSeq: 0, limit: 32 });
+      await expect(client.waitForError("project_dependency_unavailable", "project-unexpected"))
+        .resolves.toMatchObject({ frame: { status: 503 } });
+    } finally {
+      await client.close(); await server.close();
+    }
+  });
 });
 
 const outsider = {

@@ -66,6 +66,7 @@ export interface ProjectLoopViewModel {
   readonly proposals: readonly ProjectProposal[];
   readonly confirmations: readonly ProjectConfirmation[];
   readonly transferProposals: readonly ProjectTransferProposal[];
+  readonly needsActions: readonly ProjectBallFact[];
   readonly balls: readonly ProjectBallFact[];
   readonly confirmableProposals: readonly ProjectProposal[];
   readonly empty: boolean;
@@ -125,6 +126,8 @@ export function createProjectLoopViewModel(
     proposals: state.snapshot.proposals,
     confirmations: state.snapshot.confirmations,
     transferProposals: state.snapshot.transferProposals,
+    needsActions: state.snapshot.balls.filter((ball) => ball.holder.kind === "human" &&
+      ball.holder.actorId === state.viewerActorId),
     balls: state.snapshot.balls,
     confirmableProposals,
     empty: facts.length === 0 && state.snapshot.proposals.length === 0 &&

@@ -24,6 +24,8 @@ type ProjectAuthorityCache = Readonly<{
     roomId: string,
     records: readonly RoomRepairRecord[] | undefined,
   ) => void): () => void;
+  clearRoom(roomId: string): void;
+  clear(): void;
 }>;
 
 export interface DesktopProjectLoopRuntime {
@@ -51,15 +53,17 @@ function errorStatus(error: unknown): Readonly<{
     ? (error as { projectError?: { status?: unknown; code?: unknown; retryAfterSeconds?: unknown } }).projectError
     : typeof error === "object" && error !== null && "closedError" in error
     ? (error as { closedError?: { status?: unknown; code?: unknown; retryAfterSeconds?: unknown } }).closedError
+    : typeof error === "object" && error !== null && "status" in error && "code" in error
+    ? error as { status?: unknown; code?: unknown; retryAfterSeconds?: unknown }
     : undefined;
-  const status = closed?.status;
+  const rawCode = typeof closed?.code === "string" ? closed.code : undefined;
+  const status = rawCode === "session_revoked" ? 401 : closed?.status;
   const normalized = status === 400 || status === 401 || status === 403 || status === 404 ||
     status === 409 || status === 410 ||
     status === 429 || status === 503 ? status : 503;
   return Object.freeze({
     status: normalized,
-    code: typeof closed?.code === "string" && closed.code.length > 0
-      ? closed.code : "project_dependency_unavailable",
+    code: rawCode !== undefined && rawCode.length > 0 ? rawCode : "project_dependency_unavailable",
     ...(typeof closed?.retryAfterSeconds === "number" && Number.isSafeInteger(closed.retryAfterSeconds) &&
       closed.retryAfterSeconds >= 0 ? { retryAfterSeconds: closed.retryAfterSeconds } : {}),
   });
@@ -75,9 +79,11 @@ export function createDesktopProjectLoopRuntime(options: Readonly<{
   now?: () => string;
 }>): DesktopProjectLoopRuntime {
   const rooms = new Map<string, RoomState>();
+  const revokedRooms = new Set<string>();
   const listeners = new Set<Listener>();
   const now = options.now ?? (() => new Date().toISOString());
   let closed = false;
+  let revokedSessionId: string | undefined;
 
   const publish = (state: RoomState): void => {
     if (closed) return;
@@ -102,6 +108,19 @@ export function createDesktopProjectLoopRuntime(options: Readonly<{
     state.replica.clear();
     state.remote = { status: "locked", roomId: state.roomId, error: { status, code } };
     publish(state);
+  };
+  const revokeRoom = (state: RoomState, code: string): void => {
+    revokedRooms.add(state.roomId);
+    lock(state, 410, code);
+    options.authorityCache.clearRoom(state.roomId);
+  };
+  const revokeSession = (code: string): void => {
+    revokedSessionId = options.session()?.sessionId;
+    for (const state of rooms.values()) {
+      revokedRooms.add(state.roomId);
+      lock(state, 401, code);
+    }
+    options.authorityCache.clear();
   };
 
   const readCachedSnapshot = (state: RoomState): ProjectLoopRemoteState => {
@@ -146,8 +165,12 @@ export function createDesktopProjectLoopRuntime(options: Readonly<{
       return readCachedSnapshot(state);
     })().catch((error: unknown) => {
       const normalized = errorStatus(error);
-      if (normalized.status === 401) lock(state, 401, normalized.code);
-      else if (state.remote.status === "ready") {
+      if (normalized.status === 401) revokeSession(normalized.code);
+      else if (normalized.status === 403 && ["access_revoked", "room_forbidden", "identity_forbidden"]
+        .includes(normalized.code)) revokeRoom(state, normalized.code);
+      else if (normalized.status === 410 && normalized.code !== "room_archived") {
+        revokeRoom(state, normalized.code);
+      } else if (state.remote.status === "ready") {
         state.remote = { ...state.remote,
           connection: source === "repair"
             ? { status: "repair_failed", code: normalized.code }
@@ -181,26 +204,51 @@ export function createDesktopProjectLoopRuntime(options: Readonly<{
     publish(state);
     const identity = options.createRequestIdentity();
     try {
-      const response = await options.transport.projectRequest(intent.kind === "proposal.resolve" ? {
+      const common = { requestId: identity.requestId, idempotencyKey: identity.idempotencyKey,
+        roomId: state.roomId, projectId: state.roomId } as const;
+      const frame: ProjectLoopWireRequest = intent.kind === "proposal.resolve" ? {
         type: "project.proposal.resolve", requestId: identity.requestId,
         idempotencyKey: identity.idempotencyKey, roomId: state.roomId, projectId: state.roomId,
         proposalId: intent.proposalId, expectedRevision: intent.expectedRevision,
         resolution: intent.resolution, reason: intent.reason,
-      } : intent.action === "accept" ? {
+      } : intent.kind === "request.transition" && intent.action === "accept" ? {
         type: "project.request.transition", requestId: identity.requestId,
         idempotencyKey: identity.idempotencyKey, roomId: state.roomId, projectId: state.roomId,
         factId: intent.factId, expectedRevision: intent.expectedRevision, action: "accept",
-      } : intent.action === "transfer" ? {
+      } : intent.kind === "request.transition" && intent.action === "transfer" ? {
         type: "project.request.transition", requestId: identity.requestId,
         idempotencyKey: identity.idempotencyKey, roomId: state.roomId, projectId: state.roomId,
         factId: intent.factId, expectedRevision: intent.expectedRevision, action: "transfer",
         target: intent.target, reason: intent.reason,
-      } : {
+      } : intent.kind === "request.transition" ? {
         type: "project.request.transition", requestId: identity.requestId,
         idempotencyKey: identity.idempotencyKey, roomId: state.roomId, projectId: state.roomId,
         factId: intent.factId, expectedRevision: intent.expectedRevision,
         action: intent.action, reason: intent.reason,
-      });
+      } : intent.kind === "next_action.transition" ? {
+        ...common, type: "project.next-action.transition", factId: intent.factId,
+        expectedRevision: intent.expectedRevision, action: intent.action,
+        ...(intent.action === "complete" ? { completionNote: intent.completionNote,
+          criteriaSnapshot: intent.criteriaSnapshot }
+          : intent.action === "deliver" ? { source: intent.source, summary: intent.summary }
+            : intent.action === "reject" || intent.action === "cancel" || intent.action === "reopen"
+              ? { reason: intent.reason } : {}),
+      } as ProjectLoopWireRequest : intent.kind === "obstacle.transition" ? {
+        ...common, type: "project.obstacle.transition", factId: intent.factId,
+        expectedRevision: intent.expectedRevision, obstacleKind: intent.obstacleKind, action: intent.action,
+        ...(intent.action === "resolve" ? { resultSource: intent.resultSource, reason: intent.reason }
+          : intent.action === "defer" ? { reason: intent.reason, reviewAt: intent.reviewAt }
+            : { reason: intent.reason }),
+      } as ProjectLoopWireRequest : intent.kind === "transfer.propose" ? {
+        ...common, type: "project.transfer.propose", transferProposalId: intent.transferProposalId,
+        subjectKind: intent.subjectKind, subjectId: intent.subjectId,
+        expectedRevision: intent.expectedRevision, toOwner: intent.toOwner, reason: intent.reason,
+      } : {
+        ...common, type: "project.transfer.resolve", transferProposalId: intent.transferProposalId,
+        subjectKind: intent.subjectKind, subjectId: intent.subjectId,
+        expectedRevision: intent.expectedRevision, resolution: intent.resolution, reason: intent.reason,
+      };
+      const response = await options.transport.projectRequest(frame);
       if (!isProjectLoopWireResponse(response) || response.type !== "project.mutation.ack" ||
           response.requestId !== identity.requestId || response.roomId !== state.roomId) {
         throw new TypeError("Project Loop returned a malformed mutation ACK");
@@ -215,8 +263,12 @@ export function createDesktopProjectLoopRuntime(options: Readonly<{
       return await refresh(state);
     } catch (error: unknown) {
       const normalized = errorStatus(error);
-      if (normalized.status === 401) lock(state, 401, normalized.code);
-      else if (state.remote.status === "ready") {
+      if (normalized.status === 401) revokeSession(normalized.code);
+      else if (normalized.status === 403 && ["access_revoked", "room_forbidden", "identity_forbidden"]
+        .includes(normalized.code)) revokeRoom(state, normalized.code);
+      else if (normalized.status === 410 && normalized.code !== "room_archived") {
+        revokeRoom(state, normalized.code);
+      } else if (state.remote.status === "ready") {
         state.remote = { ...state.remote,
           ...(normalized.status === 503 ? { connection: { status: "offline" as const, asOf: now() } } : {}),
           operation: { status: "failed", intentId: intent.intentId, error: normalized },
@@ -228,13 +280,13 @@ export function createDesktopProjectLoopRuntime(options: Readonly<{
   };
 
   const stopTerminal = options.transport.onTerminalRevoked(() => {
-    for (const state of rooms.values()) lock(state, 401, "session_revoked");
+    revokeSession("session_revoked");
   });
   const stopAccess = options.transport.onRoomAccessChanged((roomId, change) => {
     const state = rooms.get(roomId);
     if (state === undefined) return;
-    if (change === "removed") lock(state, 410, "room_access_removed");
-    else void refresh(state, "repair");
+    if (change === "removed") revokeRoom(state, "room_access_removed");
+    else { revokedRooms.delete(roomId); void refresh(state, "repair"); }
   });
   const stopFailure = options.transport.onConnectionFailure(() => {
     for (const state of rooms.values()) {
@@ -247,6 +299,7 @@ export function createDesktopProjectLoopRuntime(options: Readonly<{
   const stopCache = options.authorityCache.subscribeRoomRecords((roomId, records) => {
     const state = rooms.get(roomId);
     if (closed || state === undefined) return;
+    if (revokedRooms.has(roomId)) return;
     if (records === undefined) {
       state.replica.clear();
       state.remote = { status: "loading", roomId };
@@ -272,6 +325,13 @@ export function createDesktopProjectLoopRuntime(options: Readonly<{
   return Object.freeze({
     async getSurface(query: ProjectLoopSurfaceQuery) {
       const state = room(query.roomId);
+      const activeSessionId = options.session()?.sessionId;
+      if (state.remote.status === "locked" && state.remote.error.status === 401 &&
+          activeSessionId !== undefined && activeSessionId !== revokedSessionId) {
+        revokedSessionId = undefined;
+        revokedRooms.clear();
+        state.remote = { status: "loading", roomId: state.roomId };
+      }
       return state.remote.status === "loading" || state.remote.status === "ready" &&
         (state.remote.connection.status === "offline" || state.remote.connection.status === "repair_failed")
         ? refresh(state, state.remote.status === "ready" ? "repair" : "query")
@@ -283,7 +343,7 @@ export function createDesktopProjectLoopRuntime(options: Readonly<{
       return () => listeners.delete(listener);
     },
     invalidateAuthorizedState() {
-      for (const state of rooms.values()) lock(state, 401, "identity_invalidated");
+      revokeSession("identity_invalidated");
     },
     close() {
       if (closed) return;

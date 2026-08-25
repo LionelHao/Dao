@@ -1,4 +1,6 @@
 import {
+  PROJECT_LOOP_LIMITS,
+  isProjectSourceRef,
   isProjectEvent,
   isProjectSnapshot,
   type ProjectEvent,
@@ -59,8 +61,40 @@ export type ProjectRequestTransitionFrame = Readonly<{
   | Readonly<{ action: "reject" | "cancel"; reason: string }>
   | Readonly<{ action: "transfer"; target: Readonly<{ kind: "human"; actorId: string }>; reason: string }>
 );
+export type ProjectNextActionTransitionFrame = Readonly<{
+  type: "project.next-action.transition"; requestId: string; idempotencyKey: string;
+  roomId: string; projectId: string; factId: string; expectedRevision: number;
+}> & (
+  | Readonly<{ action: "accept" | "start" }>
+  | Readonly<{ action: "complete"; completionNote: string;
+      criteriaSnapshot: readonly Readonly<{ criterionId: string; text: string }>[] }>
+  | Readonly<{ action: "reject" | "cancel" | "reopen"; reason: string }>
+  | Readonly<{ action: "deliver"; source: import("@native-im/core").ProjectSourceRef; summary: string }>
+);
+export type ProjectObstacleTransitionFrame = Readonly<{
+  type: "project.obstacle.transition"; requestId: string; idempotencyKey: string;
+  roomId: string; projectId: string; factId: string; expectedRevision: number;
+  obstacleKind: "blocker" | "open_question";
+}> & (
+  | Readonly<{ action: "resolve"; resultSource: import("@native-im/core").ProjectSourceRef; reason: string }>
+  | Readonly<{ action: "defer"; reason: string; reviewAt: string }>
+  | Readonly<{ action: "cannot_answer"; reason: string }>
+);
+export type ProjectTransferProposeFrame = Readonly<{
+  type: "project.transfer.propose"; requestId: string; idempotencyKey: string;
+  roomId: string; projectId: string; transferProposalId: string;
+  subjectKind: "next_action" | "blocker" | "open_question"; subjectId: string;
+  expectedRevision: number; toOwner: Readonly<{ kind: "human"; actorId: string }>; reason: string;
+}>;
+export type ProjectTransferResolveFrame = Readonly<{
+  type: "project.transfer.resolve"; requestId: string; idempotencyKey: string;
+  roomId: string; projectId: string; transferProposalId: string;
+  subjectKind: "next_action" | "blocker" | "open_question"; subjectId: string;
+  expectedRevision: number; resolution: "accepted" | "rejected"; reason: string | null;
+}>;
 export type ProjectLoopWireRequest = ProjectSnapshotReadFrame | ProjectProposalResolveFrame |
-  ProjectRequestTransitionFrame;
+  ProjectRequestTransitionFrame | ProjectNextActionTransitionFrame | ProjectObstacleTransitionFrame |
+  ProjectTransferProposeFrame | ProjectTransferResolveFrame;
 export type ProjectSnapshotWireResponse = Readonly<{
   type: "project.snapshot";
   requestId: string;
@@ -104,8 +138,23 @@ function id(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value === value.trim() &&
     encoder.encode(value).byteLength <= 256;
 }
+function nonemptyText(value: unknown, limit: number): value is string {
+  return typeof value === "string" && value.length > 0 && value === value.trim() &&
+    encoder.encode(value).byteLength <= limit;
+}
 function count(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+function timestamp(value: unknown): value is string {
+  return typeof value === "string" && Number.isFinite(Date.parse(value)) &&
+    new Date(Date.parse(value)).toISOString() === value;
+}
+function criteria(value: unknown): boolean {
+  return Array.isArray(value) && value.length <= PROJECT_LOOP_LIMITS.criteriaItems &&
+    value.every((item) => record(item) &&
+    exact(item, ["criterionId", "text"]) && id(item.criterionId) &&
+    nonemptyText(item.text, PROJECT_LOOP_LIMITS.descriptionUtf8)) &&
+    new Set(value.map((item) => (item as { criterionId: string }).criterionId)).size === value.length;
 }
 
 export function isProjectLoopSurfaceQuery(value: unknown): value is ProjectLoopSurfaceQuery {
@@ -116,20 +165,62 @@ export function isProjectLoopIntent(value: unknown): value is ProjectLoopIntent 
   if (value.kind === "proposal.resolve") return exact(value, [
     "kind", "intentId", "proposalId", "expectedRevision", "resolution", "reason",
   ]) && id(value.proposalId) && ((value.resolution === "confirmed" && value.reason === null) ||
-      (value.resolution === "rejected" && id(value.reason)));
-  if (value.kind !== "request.transition" || !id(value.factId)) return false;
-  const base = ["kind", "intentId", "factId", "expectedRevision", "action"];
-  if (value.action === "accept") return exact(value, base);
-  if (value.action === "reject" || value.action === "cancel") {
-    return exact(value, [...base, "reason"]) && id(value.reason);
+      (value.resolution === "rejected" && nonemptyText(value.reason, PROJECT_LOOP_LIMITS.reasonUtf8)));
+  if (value.kind === "request.transition" && id(value.factId)) {
+    const base = ["kind", "intentId", "factId", "expectedRevision", "action"];
+    if (value.action === "accept") return exact(value, base);
+    if (value.action === "reject" || value.action === "cancel") {
+      return exact(value, [...base, "reason"]) &&
+        nonemptyText(value.reason, PROJECT_LOOP_LIMITS.reasonUtf8);
+    }
+    return value.action === "transfer" && exact(value, [...base, "target", "reason"]) &&
+      nonemptyText(value.reason, PROJECT_LOOP_LIMITS.reasonUtf8) &&
+      record(value.target) && exact(value.target, ["kind", "actorId"]) && value.target.kind === "human" &&
+      id(value.target.actorId);
   }
-  return value.action === "transfer" && exact(value, [...base, "target", "reason"]) && id(value.reason) &&
-    record(value.target) && exact(value.target, ["kind", "actorId"]) && value.target.kind === "human" &&
-    id(value.target.actorId);
+  if (value.kind === "next_action.transition" && id(value.factId)) {
+    const base = ["kind", "intentId", "factId", "expectedRevision", "action"];
+    if (value.action === "accept" || value.action === "start") return exact(value, base);
+    if (value.action === "reject" || value.action === "cancel" || value.action === "reopen") {
+      return exact(value, [...base, "reason"]) &&
+        nonemptyText(value.reason, PROJECT_LOOP_LIMITS.reasonUtf8);
+    }
+    if (value.action === "complete") return exact(value, [...base, "completionNote", "criteriaSnapshot"]) &&
+      nonemptyText(value.completionNote, PROJECT_LOOP_LIMITS.descriptionUtf8) && criteria(value.criteriaSnapshot);
+    return value.action === "deliver" && exact(value, [...base, "source", "summary"]) &&
+      isProjectSourceRef(value.source) && nonemptyText(value.summary, PROJECT_LOOP_LIMITS.descriptionUtf8);
+  }
+  if (value.kind === "obstacle.transition" && id(value.factId) &&
+      (value.obstacleKind === "blocker" || value.obstacleKind === "open_question")) {
+    const base = ["kind", "intentId", "factId", "expectedRevision", "obstacleKind", "action"];
+    if (value.action === "resolve") return exact(value, [...base, "resultSource", "reason"]) &&
+      isProjectSourceRef(value.resultSource) && nonemptyText(value.reason, PROJECT_LOOP_LIMITS.reasonUtf8);
+    if (value.action === "defer") return exact(value, [...base, "reason", "reviewAt"]) &&
+      nonemptyText(value.reason, PROJECT_LOOP_LIMITS.reasonUtf8) && timestamp(value.reviewAt);
+    return value.action === "cannot_answer" && exact(value, [...base, "reason"]) &&
+      nonemptyText(value.reason, PROJECT_LOOP_LIMITS.reasonUtf8);
+  }
+  if (value.kind === "transfer.propose") return exact(value, ["kind", "intentId", "transferProposalId",
+    "subjectKind", "subjectId", "expectedRevision", "toOwner", "reason"]) &&
+    id(value.transferProposalId) && ["next_action", "blocker", "open_question"].includes(String(value.subjectKind)) &&
+    id(value.subjectId) && record(value.toOwner) && exact(value.toOwner, ["kind", "actorId"]) &&
+    value.toOwner.kind === "human" && id(value.toOwner.actorId) &&
+    nonemptyText(value.reason, PROJECT_LOOP_LIMITS.reasonUtf8);
+  return value.kind === "transfer.resolve" && exact(value, ["kind", "intentId", "transferProposalId",
+    "subjectKind", "subjectId", "expectedRevision", "resolution", "reason"]) &&
+    id(value.transferProposalId) && ["next_action", "blocker", "open_question"].includes(String(value.subjectKind)) &&
+    id(value.subjectId) && (value.resolution === "accepted" || value.resolution === "rejected") &&
+    (value.resolution === "accepted" ? value.reason === null :
+      nonemptyText(value.reason, PROJECT_LOOP_LIMITS.reasonUtf8));
 }
 export function isProjectLoopSubmitCommand(value: unknown): value is ProjectLoopSubmitCommand {
-  return record(value) && exact(value, ["roomId", "intent"]) && id(value.roomId) &&
-    isProjectLoopIntent(value.intent);
+  if (!record(value) || !exact(value, ["roomId", "intent"]) || !id(value.roomId) ||
+      !isProjectLoopIntent(value.intent)) return false;
+  return value.intent.kind === "next_action.transition" && value.intent.action === "deliver"
+    ? value.intent.source.roomId === value.roomId
+    : value.intent.kind === "obstacle.transition" && value.intent.action === "resolve"
+      ? value.intent.resultSource.roomId === value.roomId
+      : true;
 }
 export function isProjectLoopRemoteState(value: unknown): value is ProjectLoopRemoteState {
   if (!record(value) || !id(value.roomId) || typeof value.status !== "string") return false;

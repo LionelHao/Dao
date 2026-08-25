@@ -681,7 +681,10 @@ function mappedProjectError(error: unknown, requestId: string): ProtocolErrorFra
   if (isServiceErrorCode(error, "room_archived")) {
     return errorFrame(410, "room_archived", "room_archived", requestId);
   }
-  return mappedError(error, requestId);
+  const mapped = mappedError(error, requestId);
+  return mapped.status === 500
+    ? errorFrame(503, "project_dependency_unavailable", "project_dependency_unavailable", requestId)
+    : mapped;
 }
 
 async function revokeUnacknowledgedSession(

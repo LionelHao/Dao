@@ -1,4 +1,13 @@
-import type { ProjectHumanRef, ProjectProposal, ProjectRequest, ProjectSourceRef } from "@native-im/core";
+import type {
+  ProjectBallFact,
+  ProjectCriterion,
+  ProjectHumanRef,
+  ProjectNextAction,
+  ProjectObstacle,
+  ProjectProposal,
+  ProjectRequest,
+  ProjectSourceRef,
+} from "@native-im/core";
 import { createProjectLoopViewModel, type ProjectLoopCategory, type ProjectLoopRemoteState } from "./view-model.js";
 
 export type ProjectLoopIntent =
@@ -9,7 +18,27 @@ export type ProjectLoopIntent =
   | Readonly<{ kind: "request.transition"; intentId: string; factId: string; expectedRevision: number;
       action: "reject" | "cancel"; reason: string }>
   | Readonly<{ kind: "request.transition"; intentId: string; factId: string; expectedRevision: number;
-      action: "transfer"; target: ProjectHumanRef; reason: string }>;
+      action: "transfer"; target: ProjectHumanRef; reason: string }>
+  | Readonly<{ kind: "next_action.transition"; intentId: string; factId: string; expectedRevision: number;
+      action: "accept" | "start" }>
+  | Readonly<{ kind: "next_action.transition"; intentId: string; factId: string; expectedRevision: number;
+      action: "complete"; completionNote: string; criteriaSnapshot: readonly ProjectCriterion[] }>
+  | Readonly<{ kind: "next_action.transition"; intentId: string; factId: string; expectedRevision: number;
+      action: "reject" | "cancel" | "reopen"; reason: string }>
+  | Readonly<{ kind: "next_action.transition"; intentId: string; factId: string; expectedRevision: number;
+      action: "deliver"; source: ProjectSourceRef; summary: string }>
+  | Readonly<{ kind: "obstacle.transition"; intentId: string; factId: string; expectedRevision: number;
+      obstacleKind: "blocker" | "open_question"; action: "resolve"; resultSource: ProjectSourceRef; reason: string }>
+  | Readonly<{ kind: "obstacle.transition"; intentId: string; factId: string; expectedRevision: number;
+      obstacleKind: "blocker" | "open_question"; action: "defer"; reason: string; reviewAt: string }>
+  | Readonly<{ kind: "obstacle.transition"; intentId: string; factId: string; expectedRevision: number;
+      obstacleKind: "blocker" | "open_question"; action: "cannot_answer"; reason: string }>
+  | Readonly<{ kind: "transfer.propose"; intentId: string; transferProposalId: string;
+      subjectKind: "next_action" | "blocker" | "open_question"; subjectId: string; expectedRevision: number;
+      toOwner: ProjectHumanRef; reason: string }>
+  | Readonly<{ kind: "transfer.resolve"; intentId: string; transferProposalId: string;
+      subjectKind: "next_action" | "blocker" | "open_question"; subjectId: string; expectedRevision: number;
+      resolution: "accepted" | "rejected"; reason: string | null }>;
 
 export interface ProjectLoopSurfaceActions {
   onIntent(intent: ProjectLoopIntent): void;
@@ -37,6 +66,12 @@ function button(text: string, action: () => void, disabled = false, controlId?: 
 }
 function proposalTitle(proposal: ProjectProposal): string {
   return proposal.payload.kind === "decision" ? proposal.payload.statement : proposal.payload.title;
+}
+function requiredValue(input: HTMLInputElement, message: string): string | undefined {
+  const value = input.value.trim();
+  input.setCustomValidity(value.length === 0 ? message : "");
+  if (value.length === 0) { input.reportValidity(); return undefined; }
+  return value;
 }
 function renderLocked(root: HTMLElement, state: Extract<ProjectLoopRemoteState, { status: "locked" }>,
   actions: ProjectLoopSurfaceActions): void {
@@ -93,6 +128,155 @@ export function renderProjectLoopSurface(root: HTMLElement, state: ProjectLoopRe
       `source:${source.kind}:${source.sourceId}:r${source.sourceRevision}`);
     value.className = "project-loop__source"; return value;
   };
+  const textInput = (parent: HTMLElement, labelText: string, dataKey: string,
+    dataValue: string): HTMLInputElement => {
+    const label = document.createElement("label"); label.textContent = labelText;
+    const input = document.createElement("input"); input.type = "text"; input.autocomplete = "off";
+    input.dataset[dataKey] = dataValue; label.append(input); parent.append(label); return input;
+  };
+  const sourceEditor = (parent: HTMLElement, namespace: "nextActionDelivery" | "obstacleResult",
+    factId: string): (() => ProjectSourceRef | undefined) => {
+    const group = document.createElement("fieldset");
+    const legend = document.createElement("legend"); legend.textContent = "权威结果来源"; group.append(legend);
+    const kindLabel = document.createElement("label"); kindLabel.textContent = "来源类型";
+    const kind = document.createElement("select"); kind.dataset[`${namespace}SourceKind`] = factId;
+    for (const sourceKind of ["message", "attachment", "agent_execution", "memory", "project_fact"] as const) {
+      const option = document.createElement("option"); option.value = sourceKind; option.textContent = sourceKind;
+      kind.append(option);
+    }
+    kindLabel.append(kind); group.append(kindLabel);
+    const sourceId = textInput(group, "来源 ID", `${namespace}SourceId`, factId);
+    const revisionLabel = document.createElement("label"); revisionLabel.textContent = "来源 revision";
+    const sourceRevision = document.createElement("input"); sourceRevision.type = "number";
+    sourceRevision.min = "1"; sourceRevision.step = "1"; sourceRevision.value = "1";
+    sourceRevision.dataset[`${namespace}SourceRevision`] = factId;
+    revisionLabel.append(sourceRevision); group.append(revisionLabel); parent.append(group);
+    return () => {
+      const id = requiredValue(sourceId, "请输入权威来源 ID");
+      if (id === undefined) return undefined;
+      const revision = Number(sourceRevision.value);
+      if (!Number.isSafeInteger(revision) || revision < 1) {
+        sourceRevision.setCustomValidity("来源 revision 必须是正整数"); sourceRevision.reportValidity(); return undefined;
+      }
+      sourceRevision.setCustomValidity("");
+      return { kind: kind.value as ProjectSourceRef["kind"], sourceId: id,
+        sourceRevision: revision, roomId: vm.roomId, visibility: "room" };
+    };
+  };
+  const transferComposer = (parent: HTMLElement, subjectKind: "next_action" | "blocker" | "open_question",
+    subjectId: string, revision: number, prefix: "next-action" | "obstacle"): void => {
+    const target = textInput(parent, "转交给 Human actorId", "projectTransferTarget", subjectId);
+    const reason = textInput(parent, "转交原因", "projectTransferReason", subjectId);
+    parent.append(button("提交 Ball 转交提案", () => {
+      const actorId = requiredValue(target, "请输入目标 Human actorId");
+      const auditReason = requiredValue(reason, "请输入转交原因");
+      if (actorId === undefined || auditReason === undefined) return;
+      const transferProposalId = `transfer:${subjectKind}:${subjectId}:r${revision}:to:${actorId}`;
+      actions.onIntent({ kind: "transfer.propose", intentId: `propose:${transferProposalId}`,
+        transferProposalId, subjectKind, subjectId, expectedRevision: revision,
+        toOwner: { kind: "human", actorId }, reason: auditReason });
+    }, vm.mutationDisabled, `${prefix}:${subjectId}:transfer`));
+  };
+  const renderNextActionControls = (item: HTMLLIElement, fact: ProjectNextAction): void => {
+    const owner = fact.owner.kind === "human" && fact.owner.actorId === state.viewerActorId;
+    const verifier = fact.verifier?.actorId === state.viewerActorId;
+    const humanAuthority = owner || fact.owner.kind === "agent" && verifier;
+    const reason = humanAuthority || verifier
+      ? textInput(item, "操作原因（拒绝、取消或重开时必填）", "nextActionReason", fact.nextActionId)
+      : undefined;
+    const reasonIntent = (action: "reject" | "cancel" | "reopen"): void => {
+      if (reason === undefined) return;
+      const value = requiredValue(reason, "请输入操作原因"); if (value === undefined) return;
+      actions.onIntent({ kind: "next_action.transition",
+        intentId: `${action}:${fact.nextActionId}:${fact.revision}`, factId: fact.nextActionId,
+        expectedRevision: fact.revision, action, reason: value });
+    };
+    if (fact.status === "proposed" && humanAuthority) {
+      item.append(button("接受下一步", () => actions.onIntent({ kind: "next_action.transition",
+        intentId: `accept:${fact.nextActionId}:${fact.revision}`, factId: fact.nextActionId,
+        expectedRevision: fact.revision, action: "accept" }), vm.mutationDisabled,
+      `next-action:${fact.nextActionId}:accept`));
+      item.append(button("拒绝下一步", () => reasonIntent("reject"), vm.mutationDisabled,
+        `next-action:${fact.nextActionId}:reject`));
+    }
+    if (fact.status === "accepted" && owner) item.append(button("开始执行", () => actions.onIntent({
+      kind: "next_action.transition", intentId: `start:${fact.nextActionId}:${fact.revision}`,
+      factId: fact.nextActionId, expectedRevision: fact.revision, action: "start",
+    }), vm.mutationDisabled, `next-action:${fact.nextActionId}:start`));
+    const canComplete = fact.status === "in_progress" && owner && fact.verifier === null ||
+      fact.status === "delivered" && verifier;
+    if (canComplete) {
+      const completionNote = textInput(item, "完成说明", "nextActionCompletionNote", fact.nextActionId);
+      item.append(button("确认完成", () => {
+        const note = requiredValue(completionNote, "请输入完成说明"); if (note === undefined) return;
+        actions.onIntent({ kind: "next_action.transition",
+          intentId: `complete:${fact.nextActionId}:${fact.revision}`, factId: fact.nextActionId,
+          expectedRevision: fact.revision, action: "complete", completionNote: note,
+          criteriaSnapshot: fact.acceptanceCriteria });
+      }, vm.mutationDisabled, `next-action:${fact.nextActionId}:complete`));
+    }
+    if (fact.status === "in_progress" && owner && fact.verifier !== null) {
+      const readSource = sourceEditor(item, "nextActionDelivery", fact.nextActionId);
+      const summary = textInput(item, "交付摘要", "nextActionDeliverySummary", fact.nextActionId);
+      item.append(button("提交交付", () => {
+        const source = readSource(); const value = requiredValue(summary, "请输入交付摘要");
+        if (source === undefined || value === undefined) return;
+        actions.onIntent({ kind: "next_action.transition",
+          intentId: `deliver:${fact.nextActionId}:${fact.revision}`, factId: fact.nextActionId,
+          expectedRevision: fact.revision, action: "deliver", source, summary: value });
+      }, vm.mutationDisabled, `next-action:${fact.nextActionId}:deliver`));
+    }
+    if (fact.status === "delivered" && verifier || fact.status === "done" && (owner || verifier)) {
+      item.append(button("打回并重开", () => reasonIntent("reopen"), vm.mutationDisabled,
+        `next-action:${fact.nextActionId}:reopen`));
+    }
+    if (humanAuthority && ["proposed", "accepted", "in_progress", "delivered"].includes(fact.status)) {
+      item.append(button("取消下一步", () => reasonIntent("cancel"), vm.mutationDisabled,
+        `next-action:${fact.nextActionId}:cancel`));
+    }
+    if (humanAuthority && ["accepted", "in_progress", "delivered"].includes(fact.status)) {
+      transferComposer(item, "next_action", fact.nextActionId, fact.revision, "next-action");
+    }
+  };
+  const renderObstacleControls = (item: HTMLLIElement, obstacle: ProjectObstacle): void => {
+    if (obstacle.owner.kind !== "human" || obstacle.owner.actorId !== state.viewerActorId ||
+        obstacle.status === "resolved") return;
+    if (obstacle.status === "open" || obstacle.status === "cannot_answer") {
+      const readSource = sourceEditor(item, "obstacleResult", obstacle.obstacleId);
+      const reason = textInput(item, "处理原因", "obstacleReason", obstacle.obstacleId);
+      item.append(button("以来源闭合", () => {
+        const resultSource = readSource(); const value = requiredValue(reason, "请输入闭合原因");
+        if (resultSource === undefined || value === undefined) return;
+        actions.onIntent({ kind: "obstacle.transition",
+          intentId: `resolve:${obstacle.obstacleId}:${obstacle.revision}`, factId: obstacle.obstacleId,
+          expectedRevision: obstacle.revision, obstacleKind: obstacle.kind, action: "resolve",
+          resultSource, reason: value });
+      }, vm.mutationDisabled, `obstacle:${obstacle.obstacleId}:resolve`));
+      if (obstacle.status === "open") {
+        const reviewAt = textInput(item, "延期复核时间（ISO 8601）", "obstacleReviewAt", obstacle.obstacleId);
+        item.append(button("延期复核", () => {
+          const value = requiredValue(reason, "请输入延期原因");
+          const timestamp = requiredValue(reviewAt, "请输入 ISO 8601 复核时间");
+          if (value === undefined || timestamp === undefined) return;
+          if (!Number.isFinite(Date.parse(timestamp)) || new Date(Date.parse(timestamp)).toISOString() !== timestamp) {
+            reviewAt.setCustomValidity("请输入规范的 ISO 8601 时间"); reviewAt.reportValidity(); return;
+          }
+          reviewAt.setCustomValidity(""); actions.onIntent({ kind: "obstacle.transition",
+            intentId: `defer:${obstacle.obstacleId}:${obstacle.revision}`, factId: obstacle.obstacleId,
+            expectedRevision: obstacle.revision, obstacleKind: obstacle.kind, action: "defer",
+            reason: value, reviewAt: timestamp });
+        }, vm.mutationDisabled, `obstacle:${obstacle.obstacleId}:defer`));
+        item.append(button("标记无法回答", () => {
+          const value = requiredValue(reason, "请输入无法回答的原因"); if (value === undefined) return;
+          actions.onIntent({ kind: "obstacle.transition",
+            intentId: `cannot-answer:${obstacle.obstacleId}:${obstacle.revision}`, factId: obstacle.obstacleId,
+            expectedRevision: obstacle.revision, obstacleKind: obstacle.kind,
+            action: "cannot_answer", reason: value });
+        }, vm.mutationDisabled, `obstacle:${obstacle.obstacleId}:cannot-answer`));
+      }
+    }
+    transferComposer(item, obstacle.kind, obstacle.obstacleId, obstacle.revision, "obstacle");
+  };
   const renderRequest = (list: HTMLUListElement, request: ProjectRequest): void => {
     const item = document.createElement("li"); item.dataset.projectFactKind = request.kind;
     item.dataset.sourceId = request.requestId; item.dataset.sourceKind = "project_fact";
@@ -132,35 +316,69 @@ export function renderProjectLoopSurface(root: HTMLElement, state: ProjectLoopRe
     }
     list.append(item);
   };
+  const renderBallList = (parent: HTMLElement, values: readonly ProjectBallFact[], emptyText: string): void => {
+    if (values.length === 0) {
+      const empty = document.createElement("p"); empty.className = "project-loop__empty";
+      empty.textContent = emptyText; parent.append(empty); return;
+    }
+    const list = document.createElement("ul");
+    for (const ball of values) {
+      const item = document.createElement("li"); item.dataset.projectFactKind = "ball";
+      item.dataset.sourceKind = ball.sourceKind; item.dataset.sourceId = ball.sourceId;
+      item.dataset.sourceRevision = String(ball.sourceRevision);
+      item.textContent = `${ball.boundaryKind} · boundary ${ball.boundaryId} · ${ball.reason}` +
+        ` · holder ${ball.holder.kind}:${ball.holder.actorId}` +
+        ` · source ${ball.sourceKind}:${ball.sourceId} r${ball.sourceRevision}` +
+        `${ball.dueAt === null ? "" : ` · 截止 ${ball.dueAt}`}` +
+        `${ball.reviewAt === null ? "" : ` · 复核 ${ball.reviewAt}`}`;
+      item.append(sourceButton({ kind: "project_fact", sourceId: ball.sourceId,
+        sourceRevision: ball.sourceRevision, roomId: ball.roomId, visibility: "room" }));
+      list.append(item);
+    }
+    parent.append(list);
+  };
   const renderCategory = (): void => {
     content.replaceChildren(); content.dataset.category = activeCategory;
     content.id = `project-loop-${vm.roomId}-panel-${activeCategory}`; content.setAttribute("role", "tabpanel");
     content.setAttribute("aria-labelledby", `project-loop-${vm.roomId}-tab-${activeCategory}`);
     const title = document.createElement("h3"); title.textContent = LABELS[activeCategory]; content.append(title);
+    if (activeCategory === "ball") {
+      const needsAction = document.createElement("section"); needsAction.dataset.projectNeedsAction = "viewer";
+      needsAction.setAttribute("aria-label", `NeedsAction：${state.viewerActorId}`);
+      const needsHeading = document.createElement("h4"); needsHeading.textContent = "NeedsAction（仅当前 Human）";
+      needsAction.append(needsHeading); renderBallList(needsAction, vm.needsActions, "当前没有待你处理的 Ball");
+      const ownership = document.createElement("section"); ownership.dataset.projectBallOwnership = "room";
+      ownership.setAttribute("aria-label", "Room 全部 Ball 归属与来源");
+      const ownershipHeading = document.createElement("h4"); ownershipHeading.textContent = "Room Ball 全部归属";
+      ownership.append(ownershipHeading); renderBallList(ownership, vm.balls, "Room 当前没有 Ball");
+      content.append(needsAction, ownership); return;
+    }
     const entries = activeCategory === "goals" ? vm.goals : activeCategory === "decisions" ? vm.decisions
       : activeCategory === "requests" ? vm.requests : activeCategory === "obstacles" ? vm.obstacles
-        : activeCategory === "next_actions" ? vm.nextActions : vm.balls;
+        : vm.nextActions;
     if (entries.length === 0) { const empty = document.createElement("p"); empty.className = "project-loop__empty";
       empty.textContent = `暂无${LABELS[activeCategory]}事实`; content.append(empty); return; }
     const list = document.createElement("ul");
     for (const entry of entries) {
       if ("kind" in entry && entry.kind === "request") { renderRequest(list, entry); continue; }
-      const item = document.createElement("li"); item.dataset.projectFactKind = "kind" in entry ? entry.kind : entry.sourceKind;
-      if ("kind" in entry) {
-        item.dataset.sourceKind = "project_fact"; item.dataset.sourceRevision = String(entry.revision);
-        item.dataset.sourceId = entry.kind === "goal" ? entry.goalId : entry.kind === "decision" ? entry.decisionId
-          : entry.kind === "next_action" ? entry.nextActionId : entry.obstacleId;
-      }
+      const item = document.createElement("li"); item.dataset.projectFactKind = entry.kind;
+      item.dataset.sourceKind = "project_fact"; item.dataset.sourceRevision = String(entry.revision);
+      item.dataset.sourceId = entry.kind === "goal" ? entry.goalId : entry.kind === "decision" ? entry.decisionId
+        : entry.kind === "next_action" ? entry.nextActionId : entry.obstacleId;
       const summary = document.createElement("p");
+      if ("kind" in entry && (entry.kind === "blocker" || entry.kind === "open_question")) {
+        const kindLabel = document.createElement("strong"); kindLabel.className = "project-loop__obstacle-kind";
+        kindLabel.dataset.projectObstacleKind = entry.kind;
+        kindLabel.setAttribute("aria-label", entry.kind === "blocker" ? "类型：阻塞 Blocker" : "类型：待解问题 Open Question");
+        kindLabel.textContent = entry.kind === "blocker" ? "BLOCKER（阻塞）" : "OPEN QUESTION（待解问题）";
+        item.append(kindLabel);
+      }
       if ("title" in entry) summary.textContent = `${entry.title} · ${entry.status} · r${entry.revision}` +
         `${"owner" in entry ? ` · owner ${entry.owner.kind}:${entry.owner.actorId}` : ""}` +
         `${"verifier" in entry && entry.verifier !== null ? ` · verifier ${entry.verifier.actorId}` : ""}` +
         `${"dueAt" in entry && entry.dueAt !== null ? ` · 截止 ${entry.dueAt}` : ""}` +
         `${"reviewAt" in entry && entry.reviewAt !== null ? ` · 复核 ${entry.reviewAt}` : ""}`;
       else if ("statement" in entry) summary.textContent = `${entry.statement} · ${entry.status} · r${entry.revision}`;
-      else summary.textContent = `${entry.boundaryKind} · ${entry.reason} · ${entry.holder.kind}:${entry.holder.actorId}` +
-        ` · source r${entry.sourceRevision}` +
-        `${entry.dueAt === null ? "" : ` · 截止 ${entry.dueAt}`}${entry.reviewAt === null ? "" : ` · 复核 ${entry.reviewAt}`}`;
       item.append(summary);
       if ("kind" in entry && (entry.kind === "goal" || entry.kind === "decision")) {
         const audit = document.createElement("p"); audit.className = "project-loop__fact-audit";
@@ -176,7 +394,12 @@ export function renderProjectLoopSurface(root: HTMLElement, state: ProjectLoopRe
         ].filter((value): value is string => value !== null).join(" · ") || "尚无具名确认或替代审计";
         item.append(audit);
       }
-      if ("provenance" in entry) item.append(sourceButton(entry.provenance.source)); list.append(item);
+      if ("provenance" in entry) item.append(sourceButton(entry.provenance.source));
+      if ("kind" in entry && entry.kind === "next_action") renderNextActionControls(item, entry);
+      if ("kind" in entry && (entry.kind === "blocker" || entry.kind === "open_question")) {
+        renderObstacleControls(item, entry);
+      }
+      list.append(item);
     }
     content.append(list);
   };
@@ -240,10 +463,30 @@ export function renderProjectLoopSurface(root: HTMLElement, state: ProjectLoopRe
   const transferHeading = document.createElement("h3"); transferHeading.textContent = "Ball 转交提案"; transfers.append(transferHeading);
   if (vm.transferProposals.length === 0) { const empty = document.createElement("p");
     empty.textContent = "暂无 Ball 转交提案"; transfers.append(empty); }
-  for (const transfer of vm.transferProposals) { const item = document.createElement("p");
+  for (const transfer of vm.transferProposals) { const item = document.createElement("article");
     item.dataset.transferProposalId = transfer.transferProposalId;
-    item.textContent = `TRANSFER PROPOSAL · ${transfer.fromOwner.actorId} → ${transfer.toOwner.actorId}` +
+    const summary = document.createElement("p");
+    summary.textContent = `TRANSFER PROPOSAL · ${transfer.subjectKind}:${transfer.subjectId}` +
+      ` · ${transfer.fromOwner.kind}:${transfer.fromOwner.actorId} → ${transfer.toOwner.kind}:${transfer.toOwner.actorId}` +
       ` · ${transfer.status} · revision r${transfer.revision}`;
+    item.append(summary);
+    if (transfer.status === "pending" && transfer.principalActorId === state.viewerActorId) {
+      const rejectReason = textInput(item, "拒绝转交原因", "transferRejectReason", transfer.transferProposalId);
+      item.append(button("接受 Ball 转交", () => actions.onIntent({ kind: "transfer.resolve",
+        intentId: `accept:${transfer.transferProposalId}:${transfer.revision}`,
+        transferProposalId: transfer.transferProposalId, subjectKind: transfer.subjectKind,
+        subjectId: transfer.subjectId, expectedRevision: transfer.revision,
+        resolution: "accepted", reason: null }), vm.mutationDisabled,
+      `transfer:${transfer.transferProposalId}:accept`));
+      item.append(button("拒绝 Ball 转交", () => {
+        const reason = requiredValue(rejectReason, "请输入拒绝原因"); if (reason === undefined) return;
+        actions.onIntent({ kind: "transfer.resolve",
+          intentId: `reject:${transfer.transferProposalId}:${transfer.revision}`,
+          transferProposalId: transfer.transferProposalId, subjectKind: transfer.subjectKind,
+          subjectId: transfer.subjectId, expectedRevision: transfer.revision,
+          resolution: "rejected", reason });
+      }, vm.mutationDisabled, `transfer:${transfer.transferProposalId}:reject`));
+    }
     transfers.append(item); }
   if (state.operation.status === "failed") {
     if (state.operation.error.status === 403) { const denied = document.createElement("p"); denied.dataset.projectRecovery = "403";

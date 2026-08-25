@@ -20,6 +20,57 @@
 .project-loop__announcement { border: 1px solid #9aa8bd; border-radius: 6px; padding: 8px; }
 .project-loop__tabs button[aria-selected="true"] { border-bottom: 3px solid #175cd3; font-weight: 700; }
 .project-loop__empty { color: #526079; }
+.project-loop__content > ul,
+.project-loop__content section > ul {
+  display: grid;
+  gap: 10px;
+  padding: 0;
+  list-style: none;
+}
+.project-loop__content li,
+.project-loop__transfers article {
+  border: 1px solid #c8d1df;
+  border-radius: 8px;
+  padding: 12px;
+}
+.project-loop__content label,
+.project-loop__transfers label {
+  display: grid;
+  gap: 4px;
+  margin-block: 8px;
+  color: #344054;
+  font-size: .85rem;
+  font-weight: 650;
+}
+.project-loop__content input,
+.project-loop__content select,
+.project-loop__transfers input {
+  box-sizing: border-box;
+  width: min(100%, 34rem);
+  min-height: 36px;
+}
+.project-loop__content fieldset {
+  min-width: 0;
+  margin-block: 10px;
+  border: 1px solid #9aa8bd;
+  border-radius: 6px;
+}
+.project-loop__content button,
+.project-loop__transfers button { margin: 4px 8px 4px 0; }
+.project-loop__obstacle-kind {
+  display: inline-block;
+  border: 2px solid currentColor;
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: .78rem;
+  letter-spacing: .04em;
+}
+[data-project-needs-action="viewer"],
+[data-project-ball-ownership="room"] {
+  border-top: 1px solid #c8d1df;
+  margin-block-start: 12px;
+  padding-block-start: 8px;
+}
 .project-loop__proposals article { border: 1px dashed #9b6b16; border-radius: 8px; padding: 12px; margin-block: 8px; }
 .project-loop__proposals button { margin-inline-end: 8px; }
 .project-loop__timeline-request {

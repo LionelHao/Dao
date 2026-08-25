@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ProjectSnapshot, RoomRepairRecord } from "@native-im/core";
 import type { ProjectLoopWireRequest, ProjectLoopWireResponse } from "./contracts.js";
+import type { ProjectLoopIntent } from "../renderer/project-loop/surface.js";
+import { GovernanceTransportError } from "../governance/websocket-authority.js";
 import { createDesktopProjectLoopRuntime } from "./production-runtime.js";
 import { projectSnapshot } from "./test-fixture.js";
 
@@ -19,6 +21,11 @@ function createCacheHarness(snapshots: readonly ProjectSnapshot[]) {
       subscribeRoomRecords(listener: RecordsListener) {
         listeners.add(listener);
         return () => listeners.delete(listener);
+      },
+      clearRoom(roomId: string) { records.delete(roomId); publish(roomId); },
+      clear() {
+        const roomIds = [...records.keys()]; records.clear();
+        for (const roomId of roomIds) publish(roomId);
       },
     },
     async repairRoom(roomId: string) {
@@ -149,6 +156,126 @@ describe("FT-09 Desktop Project Loop production runtime", () => {
         asOf: "2026-08-25T05:00:00.000Z" },
     });
     runtime.close();
+  });
+
+  it("purges and locks a restored Room when central repair explicitly denies access", async () => {
+    const wire = createTransport(async () => { throw new Error("unexpected mutation"); });
+    const cache = createCacheHarness([]);
+    cache.seed("room-1", projectSnapshot());
+    const runtime = createDesktopProjectLoopRuntime({ session, transport: wire.transport,
+      authorityCache: cache.cache,
+      repairRoom: async () => { throw new GovernanceTransportError("access_revoked", 403); },
+      restoreAuthorityCache: async () => true,
+      createRequestIdentity: () => ({ requestId: "request-1", idempotencyKey: "idem-1" }) });
+    await expect(runtime.getSurface({ roomId: "room-1" })).resolves.toMatchObject({
+      status: "locked", error: { status: 410, code: "access_revoked" },
+    });
+    expect(cache.cache.roomRepairRecords("room-1")).toBeUndefined();
+    runtime.close();
+  });
+
+  it("purges every restored projection when a direct transport 401 revokes the session", async () => {
+    const wire = createTransport(async () => { throw new GovernanceTransportError("session_revoked", 401); });
+    const cache = createCacheHarness([projectSnapshot()]);
+    const runtime = createDesktopProjectLoopRuntime({ session, transport: wire.transport,
+      authorityCache: cache.cache, repairRoom: (roomId) => cache.repairRoom(roomId),
+      restoreAuthorityCache: async () => false,
+      createRequestIdentity: () => ({ requestId: "request-revoked", idempotencyKey: "idem-revoked" }) });
+    await runtime.getSurface({ roomId: "room-1" });
+    await expect(runtime.submit({ roomId: "room-1", intent: { kind: "request.transition",
+      intentId: "cancel-revoked", factId: "request-1", expectedRevision: 3,
+      action: "cancel", reason: "done" } })).resolves.toMatchObject({
+        status: "locked", error: { status: 401, code: "session_revoked" },
+      });
+    expect(cache.cache.roomRepairRecords("room-1")).toBeUndefined();
+    runtime.close();
+  });
+
+  it("distinguishes Room access revocation from an operation-only permission denial", async () => {
+    let code = "permission_denied";
+    const wire = createTransport(async () => { throw Object.assign(new Error(code), { projectError: {
+      type: "error", status: 403, code, message: code, requestId: "request-1",
+    } }); });
+    const cache = createCacheHarness([projectSnapshot()]);
+    const runtime = createDesktopProjectLoopRuntime({ session, transport: wire.transport,
+      authorityCache: cache.cache, repairRoom: (roomId) => cache.repairRoom(roomId),
+      restoreAuthorityCache: async () => false,
+      createRequestIdentity: () => ({ requestId: "request-1", idempotencyKey: "idem-1" }) });
+    await runtime.getSurface({ roomId: "room-1" });
+    const intent = { kind: "request.transition" as const, intentId: "cancel-request",
+      factId: "request-1", expectedRevision: 3, action: "cancel" as const, reason: "No longer needed" };
+    await expect(runtime.submit({ roomId: "room-1", intent })).resolves.toMatchObject({
+      status: "ready", operation: { status: "failed", error: { status: 403, code: "permission_denied" } },
+    });
+    expect(cache.cache.roomRepairRecords("room-1")).toBeDefined();
+    runtime.close();
+    code = "room_forbidden";
+    const revokedRuntime = createDesktopProjectLoopRuntime({ session, transport: wire.transport,
+      authorityCache: cache.cache, repairRoom: (roomId) => cache.repairRoom(roomId),
+      restoreAuthorityCache: async () => false,
+      createRequestIdentity: () => ({ requestId: "request-2", idempotencyKey: "idem-2" }) });
+    await revokedRuntime.getSurface({ roomId: "room-1" });
+    await expect(revokedRuntime.submit({ roomId: "room-1",
+      intent: { ...intent, intentId: "cancel-revoked" } }))
+      .resolves.toMatchObject({ status: "locked", error: { status: 410, code: "room_forbidden" } });
+    expect(cache.cache.roomRepairRecords("room-1")).toBeUndefined();
+    revokedRuntime.close();
+  });
+
+  it("wires every Desktop core-action family to the closed public Project protocol", async () => {
+    const source = { kind: "message" as const, sourceId: "message-result", sourceRevision: 2,
+      roomId: "room-1", visibility: "room" as const };
+    const cases: readonly Readonly<{ intent: ProjectLoopIntent; expected: Record<string, unknown> }>[] = [
+      { intent: { kind: "next_action.transition", intentId: "start-action", factId: "action-1",
+        expectedRevision: 2, action: "start" }, expected: {
+        type: "project.next-action.transition", factId: "action-1", action: "start" } },
+      { intent: { kind: "next_action.transition", intentId: "complete-action", factId: "action-1",
+        expectedRevision: 2, action: "complete", completionNote: "done",
+        criteriaSnapshot: [{ criterionId: "c-1", text: "green" }] }, expected: {
+        type: "project.next-action.transition", action: "complete", completionNote: "done",
+        criteriaSnapshot: [{ criterionId: "c-1", text: "green" }] } },
+      { intent: { kind: "next_action.transition", intentId: "deliver-action", factId: "action-1",
+        expectedRevision: 2, action: "deliver", source, summary: "ready" }, expected: {
+        type: "project.next-action.transition", action: "deliver", source, summary: "ready" } },
+      { intent: { kind: "obstacle.transition", intentId: "resolve-blocker", factId: "blocker-1",
+        expectedRevision: 2, obstacleKind: "blocker", action: "resolve", resultSource: source,
+        reason: "fixed" }, expected: { type: "project.obstacle.transition", obstacleKind: "blocker",
+        action: "resolve", resultSource: source, reason: "fixed" } },
+      { intent: { kind: "obstacle.transition", intentId: "defer-question", factId: "question-1",
+        expectedRevision: 2, obstacleKind: "open_question", action: "defer", reason: "waiting",
+        reviewAt: "2026-08-28T00:00:00.000Z" }, expected: { type: "project.obstacle.transition",
+        obstacleKind: "open_question", action: "defer", reason: "waiting",
+        reviewAt: "2026-08-28T00:00:00.000Z" } },
+      { intent: { kind: "transfer.propose", intentId: "propose-transfer",
+        transferProposalId: "transfer-1", subjectKind: "next_action", subjectId: "action-1",
+        expectedRevision: 2, toOwner: { kind: "human", actorId: "human-3" }, reason: "handoff" },
+        expected: { type: "project.transfer.propose", transferProposalId: "transfer-1",
+          subjectKind: "next_action", subjectId: "action-1",
+          toOwner: { kind: "human", actorId: "human-3" }, reason: "handoff" } },
+      { intent: { kind: "transfer.resolve", intentId: "accept-transfer",
+        transferProposalId: "transfer-1", subjectKind: "next_action", subjectId: "action-1",
+        expectedRevision: 1, resolution: "accepted", reason: null }, expected: {
+        type: "project.transfer.resolve", transferProposalId: "transfer-1",
+        resolution: "accepted", reason: null } },
+    ];
+    for (const { intent, expected } of cases) {
+      const calls: ProjectLoopWireRequest[] = [];
+      const wire = createTransport(async (frame) => {
+        calls.push(frame);
+        return { type: "project.mutation.ack", requestId: frame.requestId, roomId: frame.roomId,
+          projectId: frame.projectId, acceptedRevision: 8, eventIds: ["event-8"], replayed: false };
+      });
+      const cache = createCacheHarness([projectSnapshot(), projectSnapshot({ watermark: 8 })]);
+      const runtime = createDesktopProjectLoopRuntime({ session, transport: wire.transport,
+        authorityCache: cache.cache, repairRoom: (roomId) => cache.repairRoom(roomId),
+        restoreAuthorityCache: async () => false,
+        createRequestIdentity: () => ({ requestId: `request-${intent.intentId}`,
+          idempotencyKey: `idem-${intent.intentId}` }) });
+      await runtime.getSurface({ roomId: "room-1" });
+      await runtime.submit({ roomId: "room-1", intent });
+      expect(calls).toEqual([expect.objectContaining(expected)]);
+      runtime.close();
+    }
   });
 
   it("keeps an archived Room readable while disabling every Project mutation", async () => {
