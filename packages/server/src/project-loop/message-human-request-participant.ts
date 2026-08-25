@@ -675,9 +675,11 @@ export function createSqliteHumanRequestMessageParticipant(options: Readonly<{
           const requestRevision = row.revision + 1;
           const updated = database.prepare(
             `UPDATE project_requests
-             SET status = 'cancelled', revision = revision + 1, updated_at = ?
+             SET status = 'cancelled', revision = revision + 1, updated_at = ?,
+                 resolution_actor_kind = 'human', resolution_actor_id = ?, resolved_at = ?
              WHERE id = ? AND room_id = ? AND status = 'pending_acceptance' AND revision = ?`,
-          ).run(binding.occurredAt, row.id, binding.roomId, row.revision);
+          ).run(binding.occurredAt, binding.recalledByHumanActorId, binding.occurredAt,
+            row.id, binding.roomId, row.revision);
           if (updated.changes !== 1) {
             throw new HumanRequestMessageParticipantError(
               "binding_conflict",
@@ -742,6 +744,36 @@ export function createSqliteHumanRequestMessageParticipant(options: Readonly<{
             `UPDATE streams SET head_seq = ?
              WHERE stream_kind = 'room' AND stream_id = ? AND head_seq = ?`,
           ).run(sharedSeq, binding.roomId, sharedStream.headSeq);
+          const transferRows = database.prepare(
+            `SELECT from_owner_kind AS fromKind, from_owner_actor_id AS fromActorId,
+                    to_owner_kind AS toKind, to_owner_actor_id AS toActorId,
+                    accepted_by_human_actor_id AS initiatedByActorId,
+                    reason, transferred_at AS transferredAt
+             FROM project_transfer_chain
+             WHERE room_id = ? AND subject_kind = 'request' AND subject_id = ?
+             ORDER BY subject_revision, transfer_id`,
+          ).all(binding.roomId, row.id);
+          const transferChain = transferRows.map((transfer) => {
+            if (transfer.fromKind !== "human" || typeof transfer.fromActorId !== "string" ||
+                transfer.toKind !== "human" || typeof transfer.toActorId !== "string" ||
+                typeof transfer.initiatedByActorId !== "string" ||
+                typeof transfer.reason !== "string" || typeof transfer.transferredAt !== "string") {
+              throw new HumanRequestMessageParticipantError(
+                "storage_unavailable",
+                "Project Request transfer history is corrupt during recall",
+              );
+            }
+            return Object.freeze({
+              from: Object.freeze({ actorId: transfer.fromActorId, kind: "human" }),
+              to: Object.freeze({ actorId: transfer.toActorId, kind: "human" }),
+              initiatedBy: Object.freeze({
+                actorId: transfer.initiatedByActorId,
+                kind: "human",
+              }),
+              reason: transfer.reason,
+              transferredAt: transfer.transferredAt,
+            });
+          });
           const projection = Object.freeze({
             recordVersion: "project-loop.v1",
             roomId: binding.roomId,
@@ -765,7 +797,7 @@ export function createSqliteHumanRequestMessageParticipant(options: Readonly<{
             resolutionActor: Object.freeze({ actorId: binding.recalledByHumanActorId, kind: "human" }),
             resolvedAt: binding.occurredAt,
             responsibilityLink: null,
-            transferChain: Object.freeze([]),
+            transferChain: Object.freeze(transferChain),
           });
           database.prepare(
             `INSERT INTO events (

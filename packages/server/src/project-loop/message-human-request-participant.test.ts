@@ -107,7 +107,8 @@ function database(): DatabaseSync {
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL, source_revision INTEGER NOT NULL,
       visibility_room_id TEXT NOT NULL, source_request_intent_id TEXT,
       source_target_id TEXT, frozen_responsibility_json TEXT,
-      frozen_responsibility_sha256 TEXT,
+      frozen_responsibility_sha256 TEXT, resolution_actor_kind TEXT,
+      resolution_actor_id TEXT, resolved_at TEXT,
       UNIQUE(room_id, source_request_intent_id)
     ) STRICT;
     CREATE TABLE project_room_states (
@@ -141,6 +142,14 @@ function database(): DatabaseSync {
       holder_kind TEXT NOT NULL, holder_actor_id TEXT NOT NULL, reason TEXT NOT NULL,
       since TEXT NOT NULL, due_at TEXT, status TEXT NOT NULL, released_at TEXT
     ) STRICT;
+    CREATE TABLE project_transfer_chain (
+      transfer_id TEXT PRIMARY KEY, room_id TEXT NOT NULL, project_id TEXT NOT NULL,
+      subject_kind TEXT NOT NULL, subject_id TEXT NOT NULL, subject_revision INTEGER NOT NULL,
+      from_owner_kind TEXT NOT NULL, from_owner_actor_id TEXT NOT NULL,
+      to_owner_kind TEXT NOT NULL, to_owner_actor_id TEXT NOT NULL,
+      accepted_by_human_actor_id TEXT NOT NULL, reason TEXT NOT NULL,
+      transferred_at TEXT NOT NULL
+    ) STRICT;
     CREATE TABLE project_fact_checkpoints (
       checkpoint_id TEXT PRIMARY KEY, room_id TEXT NOT NULL, project_id TEXT NOT NULL,
       project_revision INTEGER NOT NULL, projection_json TEXT NOT NULL,
@@ -150,6 +159,7 @@ function database(): DatabaseSync {
   `);
   db.prepare("INSERT INTO actors VALUES (?, 'human')").run(binding.requesterHumanActorId);
   db.prepare("INSERT INTO actors VALUES (?, 'human')").run(binding.targetHumanActorId);
+  db.prepare("INSERT INTO actors VALUES ('human-next', 'human')").run();
   db.prepare("INSERT INTO rooms VALUES (?, 'active')").run(binding.roomId);
   db.prepare("INSERT INTO streams VALUES ('room', ?, 0, 1)").run(binding.roomId);
   db.prepare("INSERT INTO messages VALUES (?, ?, ?)").run(
@@ -324,6 +334,30 @@ describe("FT-03 structured @Human to canonical Request transaction participant",
     const created = withTransaction(db, (transaction) =>
       participant.createPendingInTransaction(transaction, binding),
     );
+    db.prepare(
+      `UPDATE project_requests
+       SET target_human_actor_id = 'human-next', revision = 2
+       WHERE id = ?`,
+    ).run(created.requestId);
+    db.prepare(
+      `UPDATE project_ball_boundaries
+       SET status = 'superseded', released_at = ? WHERE source_id = ?`,
+    ).run("2026-08-25T02:03:04.500Z", created.requestId);
+    db.prepare(
+      `INSERT INTO project_ball_boundaries VALUES (
+         'boundary-transfer', ?, ?, 'request', ?, 2, 'human', ?, 'pending_acceptance',
+         ?, NULL, 'active', NULL
+       )`,
+    ).run(binding.roomId, binding.roomId, created.requestId,
+      binding.requesterHumanActorId, "2026-08-25T02:03:04.500Z");
+    db.prepare(
+      `INSERT INTO project_transfer_chain VALUES (
+         'transfer-1', ?, ?, 'request', ?, 2, 'human', ?, 'human', 'human-next', ?,
+         'A different Human should answer', ?
+       )`,
+    ).run(binding.roomId, binding.roomId, created.requestId,
+      binding.targetHumanActorId, binding.targetHumanActorId,
+      "2026-08-25T02:03:04.500Z");
     db.prepare("UPDATE human_request_intents SET status = 'cancelled'").run();
     const cancelled = withTransaction(db, (transaction) =>
       participant.cancelPendingForRecallInTransaction(transaction, {
@@ -340,14 +374,34 @@ describe("FT-03 structured @Human to canonical Request transaction participant",
       cancelledRequestIds: [created.requestId],
       eventIds: [expect.stringMatching(/^project-event-/)],
     });
-    expect(db.prepare("SELECT status, revision FROM project_requests").get())
-      .toEqual({ status: "cancelled", revision: 2 });
     expect(db.prepare(
-      "SELECT status, released_at AS releasedAt FROM project_ball_boundaries",
+      `SELECT status, revision, resolution_actor_id AS resolutionActorId,
+              resolved_at AS resolvedAt FROM project_requests`,
+    ).get()).toEqual({ status: "cancelled", revision: 3,
+      resolutionActorId: binding.requesterHumanActorId,
+      resolvedAt: "2026-08-25T02:03:05.006Z" });
+    expect(db.prepare(
+      `SELECT status, released_at AS releasedAt FROM project_ball_boundaries
+       ORDER BY source_revision DESC LIMIT 1`,
     ).get()).toEqual({ status: "released", releasedAt: "2026-08-25T02:03:05.006Z" });
     expect(db.prepare("SELECT COUNT(*) AS count FROM project_events").get()).toEqual({ count: 2 });
     expect(db.prepare("SELECT COUNT(*) AS count FROM events").get()).toEqual({ count: 2 });
     expect(db.prepare("SELECT COUNT(*) AS count FROM project_fact_checkpoints").get())
       .toEqual({ count: 2 });
+    const shared = db.prepare(
+      `SELECT payload_json AS payloadJson FROM events
+       WHERE event_type = 'project.request.changed' ORDER BY stream_seq DESC LIMIT 1`,
+    ).get();
+    expect(typeof shared?.payloadJson === "string" ? JSON.parse(shared.payloadJson) : null)
+      .toMatchObject({
+        revision: 3,
+        target: { actorId: "human-next", kind: "human" },
+        transferChain: [{
+          from: { actorId: binding.targetHumanActorId, kind: "human" },
+          to: { actorId: "human-next", kind: "human" },
+          initiatedBy: { actorId: binding.targetHumanActorId, kind: "human" },
+          reason: "A different Human should answer",
+        }],
+      });
   });
 });

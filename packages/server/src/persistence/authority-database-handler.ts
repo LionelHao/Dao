@@ -132,6 +132,7 @@ import {
   "../message-authority/sqlite-operational-message-projection.js";
 import {
   HumanRequestMessageParticipantError,
+  type HumanRequestMessageBinding,
   type HumanRequestMessageTransactionParticipant,
 } from "../project-loop/message-human-request-participant.js";
 import { canStartRuntimeGenerationInTransaction } from "../agent-runtime/runtime-archive-fence-participant.js";
@@ -10287,6 +10288,7 @@ export function submitHumanMessageDatabaseCommand(
         insertLegacyMessageAuthorityRecord(database, baseMessage);
         input.onFaultPointForTest?.("after-message");
         const outcomes: MessageTargetOutcome[] = [];
+        const humanRequestBindings: HumanRequestMessageBinding[] = [];
         for (const [targetOrder, target] of input.message.mentionedTargets.entries()) {
           const actor = database.prepare("SELECT kind FROM actors WHERE id = ?").get(
             target.targetActorId,
@@ -10397,39 +10399,17 @@ export function submitHumanMessageDatabaseCommand(
               target.targetActorId,
               persistedAt,
             );
-            if (input.humanRequestParticipant !== undefined) {
-              try {
-                withDatabaseAuthorityTransactionView(
-                  database,
-                  input.message.roomId,
-                  stableId("message-human-request-participant", requestIntentId),
-                  (transaction) => input.humanRequestParticipant!.createPendingInTransaction(
-                    transaction,
-                    {
-                      roomId: input.message.roomId,
-                      projectId: input.message.roomId,
-                      requestIntentId,
-                      sourceMessageId: input.message.messageId,
-                      sourceRevision: 1,
-                      requesterHumanActorId: actorId,
-                      targetHumanActorId: target.targetActorId,
-                      sourceTargetId: target.id,
-                      occurredAt: persistedAt,
-                    },
-                  ),
-                );
-              } catch (error: unknown) {
-                if (error instanceof HumanRequestMessageParticipantError) {
-                  return fail(
-                    error.code === "binding_conflict" ? "idempotency_conflict" :
-                      error.code === "source_unavailable" ? "message_version_conflict" :
-                        "dependency_unavailable",
-                    "Canonical Project Request participant rejected the message target",
-                  );
-                }
-                throw error;
-              }
-            }
+            humanRequestBindings.push(Object.freeze({
+              roomId: input.message.roomId,
+              projectId: input.message.roomId,
+              requestIntentId,
+              sourceMessageId: input.message.messageId,
+              sourceRevision: 1,
+              requesterHumanActorId: actorId,
+              targetHumanActorId: target.targetActorId,
+              sourceTargetId: target.id,
+              occurredAt: persistedAt,
+            }));
             outcome = {
               targetId: target.id,
               targetActorId: target.targetActorId,
@@ -10546,6 +10526,31 @@ export function submitHumanMessageDatabaseCommand(
           input.message.messageId,
         );
         input.onFaultPointForTest?.("after-outbox");
+        if (input.humanRequestParticipant !== undefined) {
+          for (const binding of humanRequestBindings) {
+            try {
+              withDatabaseAuthorityTransactionView(
+                database,
+                input.message.roomId,
+                stableId("message-human-request-participant", binding.requestIntentId),
+                (transaction) => input.humanRequestParticipant!.createPendingInTransaction(
+                  transaction,
+                  binding,
+                ),
+              );
+            } catch (error: unknown) {
+              if (error instanceof HumanRequestMessageParticipantError) {
+                return fail(
+                  error.code === "binding_conflict" ? "idempotency_conflict" :
+                    error.code === "source_unavailable" ? "message_version_conflict" :
+                      "dependency_unavailable",
+                  "Canonical Project Request participant rejected the message target",
+                );
+              }
+              throw error;
+            }
+          }
+        }
         const attachmentIds: AttachmentAuthorityIdFactory = {
           nextUploadId() {
             throw new Error("Message attachment binding cannot allocate uploads");
