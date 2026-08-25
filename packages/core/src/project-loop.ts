@@ -119,6 +119,7 @@ export type ProjectReassignment = Readonly<{
   from: ProjectActorRef;
   to: ProjectActorRef;
   initiatedBy: ProjectActorRef;
+  confirmedBy: ProjectHumanRef;
   reason: string;
   reassignedAt: string;
 }>;
@@ -591,9 +592,13 @@ function isDelivery(value: unknown, roomId: string): value is ProjectDelivery {
 }
 
 function isReassignment(value: unknown): value is ProjectReassignment {
-  return isRecord(value) && hasExactKeys(value, ["from", "to", "initiatedBy", "reason", "reassignedAt"]) &&
+  return isRecord(value) && hasExactKeys(value, [
+    "from", "to", "initiatedBy", "confirmedBy", "reason", "reassignedAt",
+  ]) &&
     isProjectActorRef(value.from) && isProjectActorRef(value.to) && value.from.actorId !== value.to.actorId &&
-    isProjectActorRef(value.initiatedBy) && isText(value.reason, PROJECT_LOOP_LIMITS.reasonUtf8) &&
+    isProjectActorRef(value.initiatedBy) && isProjectHumanRef(value.confirmedBy) &&
+    (value.to.kind === "agent" || value.confirmedBy.actorId === value.to.actorId) &&
+    isText(value.reason, PROJECT_LOOP_LIMITS.reasonUtf8) &&
     isIsoTimestamp(value.reassignedAt);
 }
 
@@ -621,7 +626,7 @@ export function isProjectNextAction(value: unknown): value is ProjectNextAction 
   if (value.verifier?.actorId === value.owner.actorId) return false;
   if (value.reassignmentChain.length > 0) {
     const last = value.reassignmentChain[value.reassignmentChain.length - 1] as ProjectReassignment;
-    if (last.to.actorId !== value.owner.actorId || value.status !== "proposed") return false;
+    if (last.to.actorId !== value.owner.actorId) return false;
   }
   const unaccepted = value.acceptedBy === null && value.acceptedAt === null;
   const accepted = value.acceptedBy !== null && value.acceptedAt !== null;

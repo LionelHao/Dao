@@ -298,6 +298,25 @@ describe("FT-09 Project Loop closed core contracts", () => {
     expect(isProjectNextAction(deliveredAgentAction)).toBe(true);
     expect(isProjectNextAction({ ...deliveredAgentAction, verifier: null })).toBe(false);
     expect(isProjectNextAction({ ...deliveredAgentAction, status: "done", completedBy: agent1, completedAt: later })).toBe(false);
+
+    const reassignedAndAccepted = {
+      ...humanAction,
+      revision: 2,
+      owner: human1,
+      acceptedBy: human1,
+      acceptedAt: later,
+      status: "accepted" as const,
+      updatedAt: later,
+      reassignmentChain: [{
+        from: human2,
+        to: human1,
+        initiatedBy: human2,
+        confirmedBy: human1,
+        reason: "Move work to the available owner",
+        reassignedAt: at,
+      }],
+    };
+    expect(isProjectNextAction(reassignedAndAccepted)).toBe(true);
   });
 
   it("enumerates legal and illegal transitions, including the Human direct-done exception", () => {
