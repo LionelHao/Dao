@@ -15,6 +15,7 @@ import {
 } from "../persistence/authority-database-handler.js";
 import { migrateAuthorityDatabase } from "../persistence/schema.js";
 import { createWorkerDatabaseClient } from "../persistence/worker-database-client.js";
+import type { RuntimeRecoveryRecord } from "./contracts.js";
 
 const directories: string[] = [];
 const accessToken = Buffer.alloc(32, 11).toString("base64url");
@@ -305,7 +306,7 @@ describe("real SQLite human-preemption authority", () => {
     expect(typeof sourceIntentId).toBe("string");
 
     let seeded = 1;
-    for (const candidateCount of [257, 513, 1_025]) {
+    for (const [generation, candidateCount] of [257, 513, 1_025].entries()) {
       while (seeded < candidateCount) {
         cloneQueuedInvocation(
           database,
@@ -319,13 +320,18 @@ describe("real SQLite human-preemption authority", () => {
       const cursors: string[] = [];
       let scans = 0;
       let scanComplete = false;
+      const scanNow = t0 + 100_000 + generation * 20_000;
+      const leaseOwner = `recovery-worker-${generation}`;
+      const leaseExpiresAt = new Date(scanNow + 10_000).toISOString();
       while (!scanComplete) {
         const page = executeRuntimeAuthorityOperation(database, {
           type: "runtime.recovery-scan",
           ...(after === undefined ? {} : { after }),
           limit: 256,
           includeRunning: false,
-          now: t0 + 60_000,
+          leaseOwner,
+          leaseExpiresAt,
+          now: scanNow,
         });
         expect(page.kind).toBe("recovery-page");
         if (page.kind !== "recovery-page") throw new Error("unexpected recovery result");
@@ -340,18 +346,51 @@ describe("real SQLite human-preemption authority", () => {
       expect(scans).toBe(Math.ceil(candidateCount / 256) + 1);
     }
 
-    const firstPage = executeRuntimeAuthorityOperation(database, {
-      type: "runtime.recovery-scan", limit: 1, includeRunning: false, now: t0 + 60_000,
-    });
-    expect(firstPage.kind).toBe("recovery-page");
-    if (firstPage.kind !== "recovery-page") throw new Error("unexpected recovery result");
-    const poison = firstPage.candidates[0]!;
+    let finalAfter: string | undefined;
+    const finalCandidates: Array<{
+      cursor: string;
+      record: RuntimeRecoveryRecord;
+    }> = [];
+    do {
+      const page = executeRuntimeAuthorityOperation(database, {
+        type: "runtime.recovery-scan",
+        ...(finalAfter === undefined ? {} : { after: finalAfter }),
+        limit: 256,
+        includeRunning: false,
+        leaseOwner: "recovery-worker-final",
+        leaseExpiresAt: new Date(t0 + 170_000).toISOString(),
+        now: t0 + 160_000,
+      });
+      expect(page.kind).toBe("recovery-page");
+      if (page.kind !== "recovery-page") throw new Error("unexpected recovery result");
+      finalCandidates.push(...page.candidates);
+      finalAfter = page.candidates.at(-1)?.cursor;
+      if (page.candidates.length === 0) break;
+    } while (finalAfter !== undefined);
+    const success = finalCandidates.find(({ record }) =>
+      record.execution.id === "execution-recovery-1024")!;
+    const poison = finalCandidates.find(({ record }) =>
+      record.execution.id !== success.record.execution.id)!;
     executeRuntimeAuthorityOperation(database, {
       type: "runtime.recovery-isolate",
       cursor: poison.cursor,
       candidateId: poison.record.execution.id,
+      leaseOwner: "recovery-worker-final",
       reason: "recovery_candidate_invalid",
-      now: t0 + 60_001,
+      now: t0 + 160_001,
+    });
+    executeRuntimeAuthorityOperation(database, {
+      type: "runtime.claim",
+      executionId: success.record.execution.id,
+      attemptSeq: success.record.execution.currentAttemptSeq,
+      now: t0 + 160_002,
+    });
+    executeRuntimeAuthorityOperation(database, {
+      type: "runtime.recovery-settle",
+      cursor: success.cursor,
+      candidateId: success.record.execution.id,
+      leaseOwner: "recovery-worker-final",
+      now: t0 + 160_003,
     });
     expect(database.prepare(
       `SELECT state, failure_code AS failureCode, review_required AS reviewRequired
@@ -359,7 +398,149 @@ describe("real SQLite human-preemption authority", () => {
     ).get(poison.record.execution.id)).toEqual({
       state: "dead_letter", failureCode: "recovery_candidate_invalid", reviewRequired: 1,
     });
+    expect(database.prepare(
+      `SELECT state, lease_owner AS leaseOwner, lease_expires_at AS leaseExpiresAt
+       FROM invocation_recovery_queue WHERE execution_id = ?`,
+    ).get(success.record.execution.id)).toEqual({
+      state: "closed", leaseOwner: null, leaseExpiresAt: null,
+    });
   }, 15_000);
+
+  it("atomically leases disjoint pages across workers and reclaims only expired leases", () => {
+    const database = fixture();
+    const sourceMessageId = "message-recovery-concurrency";
+    executeHumanDatabaseCommand(database, {
+      context: { ...humanContext, requestId: sourceMessageId, idempotencyKey: sourceMessageId },
+      command: { type: "message.send", roomId: "room-1", payload: {
+        id: sourceMessageId, roomId: "room-1", body: "x".repeat(300),
+        sentAt: new Date(t0 + 90_000).toISOString(),
+      } },
+      now: t0 + 90_000,
+    });
+    invoke(database, sourceMessageId, "execution-recovery-0000", "agent-1");
+    const sourceIntentId = database.prepare(
+      "SELECT intent_id AS intentId FROM agent_execution_intent_links WHERE execution_id = ?",
+    ).get("execution-recovery-0000")?.intentId;
+    expect(typeof sourceIntentId).toBe("string");
+    for (let index = 1; index < 257; index += 1) {
+      cloneQueuedInvocation(database, "execution-recovery-0000", sourceIntentId as string, index);
+    }
+    const databasePath = database.prepare("PRAGMA database_list").get()?.file;
+    expect(typeof databasePath).toBe("string");
+    const secondWorker = new DatabaseSync(databasePath as string);
+    secondWorker.exec("PRAGMA foreign_keys = ON");
+    const scanNow = t0 + 100_000;
+    try {
+      const first = executeRuntimeAuthorityOperation(database, {
+        type: "runtime.recovery-scan", limit: 128, includeRunning: false,
+        leaseOwner: "worker-a", leaseExpiresAt: new Date(scanNow + 1_000).toISOString(),
+        now: scanNow,
+      });
+      const second = executeRuntimeAuthorityOperation(secondWorker, {
+        type: "runtime.recovery-scan", limit: 128, includeRunning: false,
+        leaseOwner: "worker-b", leaseExpiresAt: new Date(scanNow + 10_000).toISOString(),
+        now: scanNow,
+      });
+      expect(first.kind).toBe("recovery-page");
+      expect(second.kind).toBe("recovery-page");
+      if (first.kind !== "recovery-page" || second.kind !== "recovery-page") {
+        throw new Error("unexpected recovery result");
+      }
+      const firstIds = new Set(first.candidates.map(({ record }) => record.execution.id));
+      const secondIds = new Set(second.candidates.map(({ record }) => record.execution.id));
+      expect(firstIds.size).toBe(128);
+      expect(secondIds.size).toBe(128);
+      expect([...firstIds].filter((id) => secondIds.has(id))).toEqual([]);
+      const tail = executeRuntimeAuthorityOperation(database, {
+        type: "runtime.recovery-scan", after: second.candidates.at(-1)!.cursor,
+        limit: 1, includeRunning: false, leaseOwner: "worker-a",
+        leaseExpiresAt: new Date(scanNow + 1_000).toISOString(), now: scanNow,
+      });
+      expect(tail.kind).toBe("recovery-page");
+      if (tail.kind !== "recovery-page") throw new Error("unexpected recovery result");
+      expect(tail.candidates).toHaveLength(1);
+      expect(database.prepare(
+        `SELECT state, lease_owner AS leaseOwner, COUNT(*) AS candidateCount
+         FROM invocation_recovery_queue
+         GROUP BY state, lease_owner ORDER BY state, lease_owner`,
+      ).all()).toEqual([
+        { state: "leased", leaseOwner: "worker-a", candidateCount: 129 },
+        { state: "leased", leaseOwner: "worker-b", candidateCount: 128 },
+      ]);
+
+      const success = tail.candidates[0]!;
+      expect(() => executeRuntimeAuthorityOperation(secondWorker, {
+        type: "runtime.recovery-settle", cursor: success.cursor,
+        candidateId: success.record.execution.id, leaseOwner: "worker-b", now: scanNow + 1,
+      })).toThrow(/lease/i);
+      executeRuntimeAuthorityOperation(database, {
+        type: "runtime.claim", executionId: success.record.execution.id,
+        attemptSeq: success.record.execution.currentAttemptSeq, now: scanNow + 1,
+      });
+      executeRuntimeAuthorityOperation(database, {
+        type: "runtime.schedule-retry",
+        executionId: success.record.execution.id,
+        attemptSeq: 1,
+        errorCode: "provider_timeout",
+        nextRetryAt: new Date(scanNow + 3).toISOString(),
+        now: scanNow + 2,
+      });
+      const rescheduled = executeRuntimeAuthorityOperation(secondWorker, {
+        type: "runtime.recovery-scan", limit: 1, includeRunning: false,
+        leaseOwner: "worker-d", leaseExpiresAt: new Date(scanNow + 1_000).toISOString(),
+        now: scanNow + 4,
+      });
+      expect(rescheduled.kind).toBe("recovery-page");
+      if (rescheduled.kind !== "recovery-page") throw new Error("unexpected recovery result");
+      expect(rescheduled.candidates).toHaveLength(1);
+      expect(rescheduled.candidates[0]?.record.execution).toMatchObject({
+        id: success.record.execution.id,
+        status: "queued",
+        currentAttemptSeq: 2,
+      });
+      executeRuntimeAuthorityOperation(database, {
+        type: "runtime.claim", executionId: success.record.execution.id,
+        attemptSeq: 2, now: scanNow + 5,
+      });
+      const poison = first.candidates[0]!;
+      executeRuntimeAuthorityOperation(database, {
+        type: "runtime.recovery-isolate", cursor: poison.cursor,
+        candidateId: poison.record.execution.id, leaseOwner: "worker-a",
+        reason: "recovery_candidate_invalid", now: scanNow + 2,
+      });
+      const expired = first.candidates[1]!;
+      expect(() => executeRuntimeAuthorityOperation(database, {
+        type: "runtime.recovery-settle", cursor: expired.cursor,
+        candidateId: expired.record.execution.id, leaseOwner: "worker-a",
+        now: scanNow + 2_000,
+      })).toThrow(/lease/i);
+
+      const reclaimed = executeRuntimeAuthorityOperation(secondWorker, {
+        type: "runtime.recovery-scan", limit: 256, includeRunning: false,
+        leaseOwner: "worker-c", leaseExpiresAt: new Date(scanNow + 12_000).toISOString(),
+        now: scanNow + 2_000,
+      });
+      expect(reclaimed.kind).toBe("recovery-page");
+      if (reclaimed.kind !== "recovery-page") throw new Error("unexpected recovery result");
+      const reclaimedIds = new Set(reclaimed.candidates.map(({ record }) => record.execution.id));
+      expect(reclaimedIds.size).toBe(127);
+      expect(reclaimedIds.has(success.record.execution.id)).toBe(false);
+      expect(reclaimedIds.has(poison.record.execution.id)).toBe(false);
+      expect([...reclaimedIds].filter((id) => secondIds.has(id))).toEqual([]);
+      expect(database.prepare(
+        `SELECT state, lease_owner AS leaseOwner, COUNT(*) AS candidateCount
+         FROM invocation_recovery_queue
+         GROUP BY state, lease_owner ORDER BY state, lease_owner`,
+      ).all()).toEqual([
+        { state: "closed", leaseOwner: null, candidateCount: 1 },
+        { state: "dead_letter", leaseOwner: null, candidateCount: 1 },
+        { state: "leased", leaseOwner: "worker-b", candidateCount: 128 },
+        { state: "leased", leaseOwner: "worker-c", candidateCount: 127 },
+      ]);
+    } finally {
+      secondWorker.close();
+    }
+  }, 10_000);
 
   it("never rebuilds or claims legacy Room-wide routes from a recalled Human source", () => {
     const database = fixture();

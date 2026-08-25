@@ -1088,6 +1088,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
           cursor: string,
           value: unknown,
           isolate: RuntimeRecoveryAuthority["isolate"] | undefined,
+          settle: RuntimeRecoveryAuthority["settle"] | undefined,
         ): Promise<void> => {
           if (!runtimeRecoveryRecord(value)) {
             const candidateId = recoveryCandidateId(value);
@@ -1098,7 +1099,11 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
             });
             return;
           }
-          if (value.outcome !== "enqueue" || jobsByExecution.has(value.execution.id)) return;
+          if (value.outcome !== "enqueue") {
+            await settle?.({ cursor, candidateId: value.execution.id });
+            return;
+          }
+          if (jobsByExecution.has(value.execution.id)) return;
           const job: RuntimeJob = {
             execution: value.execution,
             intent: value.intent,
@@ -1111,7 +1116,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
               enqueue(job);
               durableOverflowJobs.delete(job.execution.id);
               pump();
-              return;
+              break;
             } catch (error: unknown) {
               if (!(error instanceof AgentRuntimeError) || error.code !== "agent_queue_full") {
                 await isolate?.({
@@ -1138,7 +1143,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         if (options.recoveryAuthority === undefined) {
           const records = await options.authority.recover();
           for (const [index, record] of records.entries()) {
-            await processCandidate(String(index), record, undefined);
+            await processCandidate(String(index), record, undefined, undefined);
           }
           return;
         }
@@ -1171,6 +1176,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
               candidate.cursor,
               candidate.record,
               options.recoveryAuthority.isolate.bind(options.recoveryAuthority),
+              options.recoveryAuthority.settle?.bind(options.recoveryAuthority),
             );
             after = candidate.cursor;
           }

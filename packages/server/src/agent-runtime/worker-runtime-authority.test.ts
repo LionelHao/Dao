@@ -17,6 +17,7 @@ import {
   createWorkerRuntimeAuthority,
   createWorkerRuntimeRecoveryAuthority,
 } from "./worker-runtime-authority.js";
+import { isRuntimeAuthorityOperation } from "./runtime-authority-protocol.js";
 import { createToolGateway } from "./tool-gateway.js";
 import { createRepositoryGitStatusAdapter } from "./tools/repository-git-status.js";
 import { createSandboxFileWriteAdapter } from "./tools/sandbox-file-write.js";
@@ -34,11 +35,34 @@ const actors = [
 ] as const satisfies readonly Actor[];
 
 describe("real AuthorityWorker runtime authority", () => {
+  it("rejects unowned, expired, and non-canonical recovery leases at the worker boundary", () => {
+    const now = Date.parse("2026-08-25T00:00:00.000Z");
+    const valid = {
+      type: "runtime.recovery-scan",
+      limit: 256,
+      includeRunning: false,
+      leaseOwner: "worker-a",
+      leaseExpiresAt: "2026-08-25T00:05:00.000Z",
+      now,
+    } as const;
+    expect(isRuntimeAuthorityOperation(valid)).toBe(true);
+    expect(isRuntimeAuthorityOperation({
+      ...valid, leaseOwner: "",
+    })).toBe(false);
+    expect(isRuntimeAuthorityOperation({
+      ...valid, leaseExpiresAt: "2026-08-24T23:59:59.999Z",
+    })).toBe(false);
+    expect(isRuntimeAuthorityOperation({
+      ...valid, leaseExpiresAt: "2026-08-25T08:05:00.000+08:00",
+    })).toBe(false);
+  });
+
   it("allows repeated post-commit recovery generations without re-fencing live running work", async () => {
-    const executeRuntime = vi.fn(async (operation: { type: string }) =>
-      operation.type === "runtime.recovery-isolate"
-        ? { kind: "recovery-isolated" }
-        : { kind: "recovery-page", candidates: [], hasMore: false });
+    const executeRuntime = vi.fn(async (operation: { type: string }) => {
+      if (operation.type === "runtime.recovery-isolate") return { kind: "recovery-isolated" };
+      if (operation.type === "runtime.recovery-settle") return { kind: "recovery-settled" };
+      return { kind: "recovery-page", candidates: [], hasMore: false };
+    });
     const recovery = createWorkerRuntimeRecoveryAuthority({
       executeRuntime,
     } as unknown as WorkerDatabaseClient);
@@ -50,18 +74,35 @@ describe("real AuthorityWorker runtime authority", () => {
       candidateId: "execution-poison",
       reason: "recovery_candidate_invalid",
     });
+    await recovery.settle?.({
+      cursor: "00000000000000000002",
+      candidateId: "execution-success",
+    });
 
     expect(executeRuntime.mock.calls[0]?.[0]).toMatchObject({
       type: "runtime.recovery-scan", includeRunning: true, limit: 256,
+      leaseOwner: expect.any(String), leaseExpiresAt: expect.any(String),
     });
     expect(executeRuntime.mock.calls[1]?.[0]).toMatchObject({
       type: "runtime.recovery-scan", includeRunning: false, limit: 256,
+      leaseOwner: expect.any(String), leaseExpiresAt: expect.any(String),
     });
     expect(executeRuntime.mock.calls[2]?.[0]).toMatchObject({
       type: "runtime.recovery-isolate",
       cursor: "00000000000000000001",
       candidateId: "execution-poison",
+      leaseOwner: expect.any(String),
     });
+    expect(executeRuntime.mock.calls[3]?.[0]).toMatchObject({
+      type: "runtime.recovery-settle",
+      cursor: "00000000000000000002",
+      candidateId: "execution-success",
+      leaseOwner: expect.any(String),
+    });
+    const leaseOwners = executeRuntime.mock.calls.map(([operation]) =>
+      "leaseOwner" in operation ? operation.leaseOwner : undefined).filter(Boolean);
+    expect(leaseOwners).toHaveLength(4);
+    expect(new Set(leaseOwners).size).toBe(1);
   });
 
   it("persists completion and recovers a running attempt after SQLite/worker restart", async () => {

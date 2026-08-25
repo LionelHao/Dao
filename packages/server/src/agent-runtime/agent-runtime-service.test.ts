@@ -745,9 +745,11 @@ describe("bounded Agent runtime scheduler", () => {
           hasMore: start + page.length < records.length,
         };
       });
+      const settle = vi.fn(async () => undefined);
       const recoveryAuthority: RuntimeRecoveryAuthority = {
         scan,
         isolate: vi.fn(async () => undefined),
+        settle,
       };
       const stream = vi.fn(async function* (): AsyncIterable<ProviderEvent> {
         yield { type: "response_started", sequence: 1 };
@@ -765,6 +767,7 @@ describe("bounded Agent runtime scheduler", () => {
       await runtime.whenIdle();
 
       expect(scan.mock.calls.length).toBe(Math.ceil(candidateCount / 256) + 1);
+      expect(settle).not.toHaveBeenCalled();
       expect(stream).toHaveBeenCalledTimes(candidateCount);
       expect([...runtimeAuthority.executions.values()].filter((value) => value.status === "completed"))
         .toHaveLength(candidateCount);
@@ -814,6 +817,50 @@ describe("bounded Agent runtime scheduler", () => {
     });
     expect(runtimeAuthority.executions.get(first.id)?.status).toBe("completed");
     expect(runtimeAuthority.executions.get(last.id)?.status).toBe("completed");
+  });
+
+  it("does not poison a terminal candidate when durable lease settlement is transiently unavailable", async () => {
+    const runtimeAuthority = authority();
+    const recoveredIntent = intent("room-recovery", "source-settle", "agent-settle");
+    const recoveredExecution = {
+      ...execution("recovered-settle", recoveredIntent.roomId),
+      sourceMessageId: recoveredIntent.sourceMessageId,
+      agentId: recoveredIntent.targetAgentId,
+      status: "failed" as const,
+      completedAt: "2026-08-17T00:00:01.000Z",
+      terminalErrorCode: "provider_failure",
+      deadLetteredAt: "2026-08-17T00:00:01.000Z",
+    };
+    runtimeAuthority.executions.set(recoveredExecution.id, recoveredExecution);
+    const isolate = vi.fn(async () => undefined);
+    const recoveryAuthority: RuntimeRecoveryAuthority = {
+      scan: vi.fn(async () => ({
+        candidates: [{
+          cursor: "001",
+          record: { execution: recoveredExecution, intent: recoveredIntent, outcome: "failed" },
+        }],
+        hasMore: false,
+      })),
+      isolate,
+      settle: vi.fn(async () => {
+        throw new AgentRuntimeError("provider_failure", "lease settlement unavailable");
+      }),
+    };
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      recoveryAuthority,
+      provider: provider(async function* () {
+        yield { type: "response_started", sequence: 1 };
+        yield { type: "agent_final", sequence: 2, body: "ok", citations: [] };
+      }),
+      modelId: "fake-model",
+      buildProviderInput: providerInput,
+    });
+
+    await expect(runtime.recover()).rejects.toThrow("lease settlement unavailable");
+    await runtime.whenIdle();
+    expect(isolate).not.toHaveBeenCalled();
+    expect(runtimeAuthority.executions.get(recoveredExecution.id)?.status).toBe("failed");
   });
 
   it("preserves all authoritative invocation kinds across restart recovery and manual retry", async () => {

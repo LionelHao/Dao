@@ -203,13 +203,23 @@ export type RuntimeAuthorityOperation =
       readonly after?: string;
       readonly limit: number;
       readonly includeRunning: boolean;
+      readonly leaseOwner: string;
+      readonly leaseExpiresAt: string;
       readonly now: number;
     }
   | {
       readonly type: "runtime.recovery-isolate";
       readonly cursor: string;
       readonly candidateId?: string;
+      readonly leaseOwner: string;
       readonly reason: "recovery_candidate_invalid" | "recovery_candidate_conflict";
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.recovery-settle";
+      readonly cursor: string;
+      readonly candidateId: string;
+      readonly leaseOwner: string;
       readonly now: number;
     }
   | { readonly type: "runtime.recover"; readonly now: number };
@@ -314,7 +324,8 @@ export type RuntimeAuthorityOperationResult =
       }>[];
       readonly hasMore: boolean;
     }
-  | { readonly kind: "recovery-isolated" };
+  | { readonly kind: "recovery-isolated" }
+  | { readonly kind: "recovery-settled" };
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -522,16 +533,31 @@ export function isRuntimeAuthorityOperation(value: unknown): value is RuntimeAut
   }
   if (value.type === "runtime.recovery-scan") {
     const optional = Object.hasOwn(value, "after") ? ["after"] : [];
-    return exact(value, ["type", "limit", "includeRunning", "now"], optional) &&
+    const leaseExpiresAt = typeof value.leaseExpiresAt === "string"
+      ? Date.parse(value.leaseExpiresAt)
+      : Number.NaN;
+    return exact(value, [
+      "type", "limit", "includeRunning", "leaseOwner", "leaseExpiresAt", "now",
+    ], optional) &&
       count(value.limit, 1) && value.limit <= 256 && typeof value.includeRunning === "boolean" &&
-      (!Object.hasOwn(value, "after") || text(value.after)) && count(value.now);
+      (!Object.hasOwn(value, "after") || text(value.after)) && text(value.leaseOwner) &&
+      Buffer.byteLength(value.leaseOwner, "utf8") <= 256 && count(value.now) &&
+      Number.isFinite(leaseExpiresAt) && leaseExpiresAt > value.now &&
+      leaseExpiresAt <= value.now + 10 * 60_000 &&
+      new Date(leaseExpiresAt).toISOString() === value.leaseExpiresAt;
   }
   if (value.type === "runtime.recovery-isolate") {
     const optional = Object.hasOwn(value, "candidateId") ? ["candidateId"] : [];
-    return exact(value, ["type", "cursor", "reason", "now"], optional) &&
+    return exact(value, ["type", "cursor", "leaseOwner", "reason", "now"], optional) &&
       text(value.cursor) && (!Object.hasOwn(value, "candidateId") || text(value.candidateId)) &&
+      text(value.leaseOwner) && Buffer.byteLength(value.leaseOwner, "utf8") <= 256 &&
       (value.reason === "recovery_candidate_invalid" ||
         value.reason === "recovery_candidate_conflict") && count(value.now);
+  }
+  if (value.type === "runtime.recovery-settle") {
+    return exact(value, ["type", "cursor", "candidateId", "leaseOwner", "now"]) &&
+      text(value.cursor) && text(value.candidateId) && text(value.leaseOwner) &&
+      Buffer.byteLength(value.leaseOwner, "utf8") <= 256 && count(value.now);
   }
   return value.type === "runtime.recover" && exact(value, ["type", "now"]) && count(value.now);
 }

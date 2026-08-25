@@ -205,6 +205,11 @@ export interface RuntimeRecoveryAuthority {
     readonly candidateId?: string;
     readonly reason: "recovery_candidate_invalid" | "recovery_candidate_conflict";
   }>): Promise<void>;
+  /** Acknowledges a candidate whose durable execution already left queued state. */
+  settle?(input: Readonly<{
+    readonly cursor: string;
+    readonly candidateId: string;
+  }>): Promise<void>;
 }
 
 export interface FenceReplacementAccepted {

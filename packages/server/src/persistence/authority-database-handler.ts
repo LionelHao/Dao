@@ -7590,6 +7590,12 @@ export function executeRuntimeAuthorityOperation(
         `UPDATE agent_execution_attempts SET status = 'running', started_at = ?, next_retry_at = NULL
          WHERE execution_id = ? AND attempt_seq = ? AND status = 'queued'`,
       ).run(occurredAt, operation.executionId, operation.attemptSeq);
+      database.prepare(
+        `UPDATE invocation_recovery_queue
+         SET state = 'closed', lease_owner = NULL, lease_expires_at = NULL,
+             failure_code = NULL, review_required = 0, updated_at = ?
+         WHERE execution_id = ? AND state IN ('pending', 'leased')`,
+      ).run(occurredAt, operation.executionId);
       const execution = runtimeExecutionById(database, operation.executionId);
       requireAgentCommandAuthority(database, execution.agentId, execution.roomId);
       appendRuntimeExecutionEvent(database, execution, occurredAt, "started");
@@ -8783,6 +8789,37 @@ export function executeRuntimeAuthorityOperation(
       return { kind: "checkpoint" };
     }
 
+    if (operation.type === "runtime.recovery-settle") {
+      const recoveryKey = parseRuntimeRecoveryCursor(operation.cursor);
+      const settled = database.prepare(
+        `UPDATE invocation_recovery_queue
+         SET state = 'closed', lease_owner = NULL, lease_expires_at = NULL,
+             failure_code = NULL, review_required = 0, updated_at = ?
+         WHERE recovery_key = ? AND execution_id = ?
+           AND state = 'leased' AND lease_owner = ? AND lease_expires_at > ?
+           AND EXISTS (
+             SELECT 1 FROM agent_executions AS execution
+             WHERE execution.id = invocation_recovery_queue.execution_id
+               AND execution.status <> 'queued'
+           )`,
+      ).run(occurredAt, recoveryKey, operation.candidateId, operation.leaseOwner, occurredAt);
+      if (settled.changes !== 1) {
+        const existing = database.prepare(
+          `SELECT execution_id AS executionId, state
+           FROM invocation_recovery_queue WHERE recovery_key = ?`,
+        ).get(recoveryKey);
+        if (existing?.state !== "closed" || existing.executionId !== operation.candidateId) {
+          return fail("execution_conflict", "Runtime recovery lease could not be settled");
+        }
+      }
+      database.prepare(
+        `UPDATE invocation_recovery_cursors
+         SET last_recovery_key = MAX(last_recovery_key, ?), updated_at = ?
+         WHERE worker_scope = 'invocation-runtime'`,
+      ).run(recoveryKey, occurredAt);
+      return { kind: "recovery-settled" };
+    }
+
     if (operation.type === "runtime.recovery-isolate") {
       const recoveryKey = parseRuntimeRecoveryCursor(operation.cursor);
       const isolated = database.prepare(
@@ -8791,9 +8828,10 @@ export function executeRuntimeAuthorityOperation(
              failure_code = ?, review_required = 1, updated_at = ?
          WHERE recovery_key = ?
            AND (? IS NULL OR execution_id = ?)
-           AND state <> 'dead_letter'`,
+           AND state = 'leased' AND lease_owner = ? AND lease_expires_at > ?`,
       ).run(operation.reason, occurredAt, recoveryKey,
-        operation.candidateId ?? null, operation.candidateId ?? null);
+        operation.candidateId ?? null, operation.candidateId ?? null,
+        operation.leaseOwner, occurredAt);
       if (isolated.changes !== 1) {
         const existing = database.prepare(
           `SELECT execution_id AS executionId, state
@@ -8815,6 +8853,12 @@ export function executeRuntimeAuthorityOperation(
     const keysetScan = operation.type === "runtime.recovery-scan";
     let recoverable: Record<string, unknown>[];
     if (keysetScan) {
+      const leaseExpiresAtMs = Date.parse(operation.leaseExpiresAt);
+      if (!Number.isFinite(leaseExpiresAtMs) || leaseExpiresAtMs <= operation.now ||
+          leaseExpiresAtMs > operation.now + 10 * 60_000 ||
+          new Date(leaseExpiresAtMs).toISOString() !== operation.leaseExpiresAt) {
+        return fail("invalid_parameters", "Runtime recovery lease expiry was invalid");
+      }
       const afterRecoveryKey = operation.after === undefined
         ? 0
         : parseRuntimeRecoveryCursor(operation.after);
@@ -8840,7 +8884,27 @@ export function executeRuntimeAuthorityOperation(
            AND execution.room_archive_generation = room.archive_generation
          ON CONFLICT(execution_id) DO UPDATE SET
            execution_version = excluded.execution_version,
+           state = CASE
+             WHEN invocation_recovery_queue.state = 'closed' THEN 'pending'
+             ELSE invocation_recovery_queue.state
+           END,
            available_at = excluded.available_at,
+           lease_owner = CASE
+             WHEN invocation_recovery_queue.state = 'closed' THEN NULL
+             ELSE invocation_recovery_queue.lease_owner
+           END,
+           lease_expires_at = CASE
+             WHEN invocation_recovery_queue.state = 'closed' THEN NULL
+             ELSE invocation_recovery_queue.lease_expires_at
+           END,
+           failure_code = CASE
+             WHEN invocation_recovery_queue.state = 'closed' THEN NULL
+             ELSE invocation_recovery_queue.failure_code
+           END,
+           review_required = CASE
+             WHEN invocation_recovery_queue.state = 'closed' THEN 0
+             ELSE invocation_recovery_queue.review_required
+           END,
            updated_at = excluded.updated_at
          WHERE invocation_recovery_queue.state <> 'dead_letter'`,
       ).run(occurredAt, operation.includeRunning ? 1 : 0);
@@ -8854,12 +8918,29 @@ export function executeRuntimeAuthorityOperation(
          WHERE recovery.state = 'pending'
            AND recovery.recovery_key > ?
            AND recovery.available_at <= ?
-           AND (execution.status = 'queued' OR (? = 1 AND execution.status = 'running'))
+           AND execution.status IN ('queued', 'running')
            AND room.status = 'active'
            AND execution.room_archive_generation = room.archive_generation
          ORDER BY recovery.recovery_key
          LIMIT ?`,
-      ).all(afterRecoveryKey, occurredAt, operation.includeRunning ? 1 : 0, operation.limit);
+      ).all(afterRecoveryKey, occurredAt, operation.limit);
+      const recoveryKeys = recoverable.map((row) => row.recoveryKey);
+      if (!recoveryKeys.every((key): key is number =>
+        typeof key === "number" && Number.isSafeInteger(key) && key >= 1)) {
+        return fail("storage_unavailable", "Runtime recovery key was corrupt");
+      }
+      if (recoveryKeys.length > 0) {
+        const leased = database.prepare(
+          `UPDATE invocation_recovery_queue
+           SET state = 'leased', lease_owner = ?, lease_expires_at = ?, updated_at = ?
+           WHERE state = 'pending' AND recovery_key IN (
+             ${recoveryKeys.map(() => "?").join(", ")}
+           )`,
+        ).run(operation.leaseOwner, operation.leaseExpiresAt, occurredAt, ...recoveryKeys);
+        if (leased.changes !== recoveryKeys.length) {
+          return fail("execution_conflict", "Runtime recovery lease claim lost its atomic CAS");
+        }
+      }
       database.prepare(
         `UPDATE invocation_recovery_cursors
          SET scan_generation = scan_generation + ?, updated_at = ?
@@ -9059,6 +9140,24 @@ export function executeRuntimeAuthorityOperation(
         }
         return { cursor: runtimeRecoveryCursor(recoveryKey), record };
       });
+      const terminalKeys = hydratedRecords.flatMap((record, index) =>
+        record.execution.status === "completed" || record.execution.status === "failed" ||
+        record.execution.status === "cancelled"
+          ? [recoverable[index]!.recoveryKey as number]
+          : []);
+      if (terminalKeys.length > 0) {
+        const closed = database.prepare(
+          `UPDATE invocation_recovery_queue
+           SET state = 'closed', lease_owner = NULL, lease_expires_at = NULL,
+               failure_code = NULL, review_required = 0, updated_at = ?
+           WHERE state = 'leased' AND lease_owner = ? AND recovery_key IN (
+             ${terminalKeys.map(() => "?").join(", ")}
+           )`,
+        ).run(occurredAt, operation.leaseOwner, ...terminalKeys);
+        if (closed.changes !== terminalKeys.length) {
+          return fail("execution_conflict", "Runtime recovery terminal lease closure lost its CAS");
+        }
+      }
       const lastRecoveryKey = recoverable.at(-1)?.recoveryKey;
       if (typeof lastRecoveryKey === "number") {
         database.prepare(

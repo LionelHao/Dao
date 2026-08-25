@@ -556,6 +556,8 @@ export function createWorkerRuntimeAuthority(
 export function createWorkerRuntimeRecoveryAuthority(
   worker: WorkerDatabaseClient,
 ): RuntimeRecoveryAuthority {
+  const leaseOwner = `invocation-runtime:${randomUUID()}`;
+  const leaseDurationMs = 5 * 60_000;
   let completedGenerations = 0;
   let includeRunningForGeneration = true;
   const execute = async (
@@ -572,12 +574,15 @@ export function createWorkerRuntimeRecoveryAuthority(
       if (after === undefined) {
         includeRunningForGeneration = completedGenerations === 0;
       }
+      const now = Date.now();
       const result = await execute({
         type: "runtime.recovery-scan",
         ...(after === undefined ? {} : { after }),
         limit,
         includeRunning: includeRunningForGeneration,
-        now: Date.now(),
+        leaseOwner,
+        leaseExpiresAt: new Date(now + leaseDurationMs).toISOString(),
+        now,
       });
       if (!record(result) || result.kind !== "recovery-page" ||
           typeof result.hasMore !== "boolean" || !Array.isArray(result.candidates) ||
@@ -594,11 +599,24 @@ export function createWorkerRuntimeRecoveryAuthority(
         type: "runtime.recovery-isolate",
         cursor,
         ...(candidateId === undefined ? {} : { candidateId }),
+        leaseOwner,
         reason,
         now: Date.now(),
       });
       if (!record(result) || result.kind !== "recovery-isolated") {
         throw new AgentRuntimeError("provider_failure", "Authority recovery isolation was malformed");
+      }
+    },
+    async settle({ cursor, candidateId }) {
+      const result = await execute({
+        type: "runtime.recovery-settle",
+        cursor,
+        candidateId,
+        leaseOwner,
+        now: Date.now(),
+      });
+      if (!record(result) || result.kind !== "recovery-settled") {
+        throw new AgentRuntimeError("provider_failure", "Authority recovery settlement was malformed");
       }
     },
   };
