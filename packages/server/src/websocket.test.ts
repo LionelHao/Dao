@@ -1023,6 +1023,64 @@ describe("authenticated message WebSocket service", () => {
     }
   });
 
+  it("counts an in-flight overflow reset against the exact Room byte budget", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "preview-inflight-reset-budget");
+    const headBlocked = deferred<void>();
+    const headStarted = deferred<void>();
+    const resetBlocked = deferred<void>();
+    const resetStarted = deferred<void>();
+    let blockHead = true;
+    const firstLargeExecutionId = "inflight-reset-one-".padEnd(140 * 1_024, "x");
+    const secondLargeExecutionId = "inflight-reset-two-".padEnd(140 * 1_024, "y");
+    const auth: AuthenticationService = {
+      async login() { return session; }, async authenticate() { return principal; },
+      async authenticateSession() {
+        return { sessionId: session.accessToken, sessionFamilyId: "family-preview", principal };
+      },
+      async refresh() { return session; }, async revoke() {},
+    };
+    const server = await startMessageWebSocketServer({
+      auth, service: idleMessageService(), outboxStore: idleOutboxStore(),
+      previewAuthority: previewDeliveryAuthority(async (input) => {
+        if (blockHead && input.deliveryKind === "preview") {
+          blockHead = false;
+          headStarted.resolve();
+          await headBlocked.promise;
+        } else if (input.deliveryKind === "reset" &&
+                   input.executionId === firstLargeExecutionId) {
+          resetStarted.resolve();
+          await resetBlocked.promise;
+        }
+        return { authorized: true, authorityEpoch: "inflight-reset-budget:1" };
+      }),
+    });
+    const client = await LoopbackClient.connect(server.url);
+    try {
+      await client.login(humans[0]);
+      await client.subscribe(roomId);
+      const deliveries = [server.publishAgentPreview({ roomId, executionId: "budget-head",
+        attemptSeq: 1, streamSeq: 1, delta: "x" })];
+      await headStarted.promise;
+      for (let index = 1; index < 32; index += 1) {
+        deliveries.push(server.publishAgentPreview({ roomId, executionId: `budget-${index}`,
+          attemptSeq: 1, streamSeq: 1, delta: "x" }));
+      }
+      await server.resetAgentPreview({ roomId, executionId: firstLargeExecutionId,
+        attemptSeq: 1, reason: "execution_terminal" });
+      headBlocked.resolve();
+      await resetStarted.promise;
+      await server.resetAgentPreview({ roomId, executionId: secondLargeExecutionId,
+        attemptSeq: 1, reason: "execution_terminal" });
+      await client.waitForClose();
+      resetBlocked.resolve();
+      await Promise.all(deliveries);
+    } finally {
+      headBlocked.resolve(); resetBlocked.resolve();
+      await client.close(); await server.close();
+    }
+  });
+
   it("delivers an idle lifecycle reset that uses the reserved reset byte budget", async () => {
     const principal = { accountId: "account-human-1", actorId: humans[0].id };
     const session = issuedSession(principal, "preview-idle-large-reset");

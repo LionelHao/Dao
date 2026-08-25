@@ -3266,6 +3266,8 @@ export async function startMessageWebSocketServer(
       publishedAtSubscriptionEpoch: number;
     }>>;
     overflowResetBytes: number;
+    drainingResetBytes: number;
+    drainingResetCount: number;
     scheduledAttempts: Map<string, number>;
     failedClosed: boolean;
   };
@@ -3618,9 +3620,17 @@ export async function startMessageWebSocketServer(
       // marker for the same attempt remains a distinct, newer lifecycle fact.
       queue.overflowResets.delete(resetKey);
       queue.overflowResetBytes -= reset.bytes;
-      const resetDelivered = await deliverAuthorizedPreview(
-        "reset", reset.preview, reset.publishedAtSubscriptionEpoch,
-        () => queue.generation === generation && !queue.failedClosed);
+      queue.drainingResetBytes += reset.bytes;
+      queue.drainingResetCount += 1;
+      let resetDelivered = false;
+      try {
+        resetDelivered = await deliverAuthorizedPreview(
+          "reset", reset.preview, reset.publishedAtSubscriptionEpoch,
+          () => queue.generation === generation && !queue.failedClosed);
+      } finally {
+        queue.drainingResetBytes -= reset.bytes;
+        queue.drainingResetCount -= 1;
+      }
       if (resetDelivered) {
         const visible = visiblePreviewAttemptsByRoom.get(roomId);
         visible?.delete(resetKey);
@@ -3655,13 +3665,15 @@ export async function startMessageWebSocketServer(
     if (queue === undefined) {
       queue = { tail: Promise.resolve(), count: 0, bytes: 0, generation: 1,
         overflowResets: new Map(), overflowResetBytes: 0,
+        drainingResetBytes: 0, drainingResetCount: 0,
         scheduledAttempts: new Map(), failedClosed: false };
       previewDeliveryQueues.set(preview.roomId, queue);
     }
     if (queue.failedClosed) return Promise.resolve();
-    const exceedsByteBudget = deliveryKind === "preview"
-      ? queue.bytes + bytes > maxQueuedPreviewBytesPerRoom
-      : queue.bytes + queue.overflowResetBytes + bytes > maxPreviewDeliveryBytesPerRoom;
+    const nextTotalBytes = queue.bytes + queue.overflowResetBytes +
+      queue.drainingResetBytes + bytes;
+    const exceedsByteBudget = nextTotalBytes > maxPreviewDeliveryBytesPerRoom ||
+      (deliveryKind === "preview" && queue.bytes + bytes > maxQueuedPreviewBytesPerRoom);
     if (queue.count >= maxQueuedPreviewFramesPerRoom ||
         exceedsByteBudget ||
         queue.overflowResets.size > 0) {
@@ -3674,7 +3686,7 @@ export async function startMessageWebSocketServer(
         visiblePreviewAttemptsByRoom.get(preview.roomId)?.has(attemptKey) === true;
       if (!resetRequired) return Promise.resolve();
       if (!queue.overflowResets.has(attemptKey) &&
-          queue.overflowResets.size >= maxOverflowResetsPerRoom) {
+          queue.overflowResets.size + queue.drainingResetCount >= maxOverflowResetsPerRoom) {
         // More than the admitted execution bound cannot be represented safely.
         // Fail closed: invalidate this Room's preview chain and disconnect every
         // connection that could retain its transient state.
@@ -3701,7 +3713,8 @@ export async function startMessageWebSocketServer(
       }), "utf8");
       const replacedResetBytes = queue.overflowResets.get(attemptKey)?.bytes ?? 0;
       const nextOverflowResetBytes = queue.overflowResetBytes - replacedResetBytes + resetBytes;
-      if (queue.bytes + nextOverflowResetBytes > maxPreviewDeliveryBytesPerRoom) {
+      if (queue.bytes + queue.drainingResetBytes + nextOverflowResetBytes >
+          maxPreviewDeliveryBytesPerRoom) {
         queue.failedClosed = true;
         queue.overflowResets.clear();
         queue.overflowResetBytes = 0;
