@@ -756,6 +756,119 @@ describe("Project Loop database authority", () => {
     });
   });
 
+  it("binds Agent-owned transfer proposals to the exact owner, verifier, or Room governance Human", () => {
+    withDatabase((database) => {
+      const currentRevision = () => Number(database.prepare(
+        "SELECT revision FROM project_room_states WHERE room_id = 'room-project'",
+      ).get()?.revision ?? 0);
+      const createAgentObstacle = (id: string) => {
+        executeProjectLoopAuthorityOperation(database, createFactProposal({
+          proposalId: `proposal-${id}`, factKind: "blocker", factId: id,
+          baseRevision: currentRevision(), payload: { title: "Agent blocker",
+            description: "Needs reassignment", impact: "Delivery risk",
+            resolutionCriteria: "New owner accepts", question: null,
+            ownerKind: "agent", ownerActorId: "agent-member", dueAt: null, reviewAt: null },
+        }));
+        executeProjectLoopAuthorityOperation(database, resolveFactProposal(`proposal-${id}`, 1));
+      };
+      const obstacleTransfer = (key: string, factId: string,
+        context: ReturnType<typeof humanContext> | ReturnType<typeof agentContext>,
+        toOwnerKind: "human" | "agent", toOwnerActorId: string) =>
+        executeProjectLoopAuthorityOperation(database, {
+          type: "project-loop.fact.transition", context: { ...context, idempotencyKey: key },
+          command: { roomId: "room-project", projectId: "room-project", factKind: "blocker",
+            factId, expectedRevision: 1, transition: "obstacle.transfer_propose",
+            payload: { transferProposalId: `transfer-${key}`, toOwnerKind, toOwnerActorId,
+              reason: "Reassign unavailable owner", expiresAt: "2026-08-26T08:00:00.000Z" } },
+          now: NOW + currentRevision(),
+        });
+
+      createAgentObstacle("agent-owned-obstacle");
+      expect(() => obstacleTransfer("member-cannot-transfer", "agent-owned-obstacle",
+        humanContext("member-cannot-transfer", "human-member"), "human", "human-owner"))
+        .toThrowError(expect.objectContaining({ code: "permission_denied" }));
+      obstacleTransfer("agent-owner-transfer", "agent-owned-obstacle",
+        agentContext("agent-owner-transfer"), "human", "human-member");
+      expect(database.prepare(
+        `SELECT created_by_actor_id AS proposer, principal_human_actor_id AS principal
+         FROM project_transfer_proposals WHERE id = 'transfer-agent-owner-transfer'`,
+      ).get()).toEqual({ proposer: "agent-member", principal: "human-member" });
+
+      createAgentObstacle("governance-transfer-obstacle");
+      obstacleTransfer("admin-transfer", "governance-transfer-obstacle",
+        humanContext("admin-transfer", "human-admin"), "human", "human-owner");
+      expect(database.prepare(
+        `SELECT created_by_actor_id AS proposer, principal_human_actor_id AS principal
+         FROM project_transfer_proposals WHERE id = 'transfer-admin-transfer'`,
+      ).get()).toEqual({ proposer: "human-admin", principal: "human-owner" });
+
+      executeProjectLoopAuthorityOperation(database, createFactProposal({
+        proposalId: "proposal-stale-agent-target", factKind: "blocker",
+        factId: "stale-agent-target", baseRevision: currentRevision(),
+        payload: { title: "Human blocker", description: "Needs specialist",
+          impact: "Delivery risk", resolutionCriteria: "Specialist accepts", question: null,
+          ownerKind: "human", ownerActorId: "human-member", dueAt: null, reviewAt: null },
+      }));
+      executeProjectLoopAuthorityOperation(database,
+        resolveFactProposal("proposal-stale-agent-target", 1));
+      obstacleTransfer("stale-agent-target", "stale-agent-target",
+        humanContext("stale-agent-target", "human-member"), "agent", "agent-member");
+      database.exec(`
+        UPDATE room_agent_assignments SET paused = 1, revision = revision + 1
+         WHERE id = 'assignment-agent-member';
+        UPDATE room_agent_assignment_revisions SET paused = 1
+         WHERE assignment_id = 'assignment-agent-member' AND revision = 2;
+      `);
+      expect(() => executeProjectLoopAuthorityOperation(database, {
+        type: "project-loop.fact.transition", context: humanContext("accept-stale-agent-target",
+          "human-member"),
+        command: { roomId: "room-project", projectId: "room-project", factKind: "blocker",
+          factId: "stale-agent-target", expectedRevision: 1,
+          transition: "obstacle.transfer_accept",
+          payload: { transferProposalId: "transfer-stale-agent-target" } }, now: NOW + 100,
+      })).toThrowError(expect.objectContaining({ code: "permission_denied" }));
+    });
+  });
+
+  it("uses the designated Human verifier, not an Agent owner, to propose NextAction reassignment", () => {
+    withDatabase((database) => {
+      executeProjectLoopAuthorityOperation(database, createFactProposal({
+        proposalId: "agent-reassign-proposal", factKind: "next_action",
+        factId: "agent-reassign-action", baseRevision: 0,
+        payload: { title: "Agent action", description: "Needs reassignment",
+          ownerKind: "agent", ownerActorId: "agent-member",
+          verifierHumanActorId: "human-owner", dueAt: null, deliverable: "Result",
+          acceptanceCriteria: [] },
+      }));
+      executeProjectLoopAuthorityOperation(database,
+        resolveFactProposal("agent-reassign-proposal", 1));
+      executeProjectLoopAuthorityOperation(database, {
+        type: "project-loop.fact.transition", context: humanContext("accept-agent-reassign"),
+        command: { roomId: "room-project", projectId: "room-project",
+          factKind: "next_action", factId: "agent-reassign-action", expectedRevision: 1,
+          transition: "next_action.accept", payload: {} }, now: NOW + 2,
+      });
+      const command = { roomId: "room-project", projectId: "room-project",
+        factKind: "next_action" as const, factId: "agent-reassign-action", expectedRevision: 2,
+        transition: "next_action.transfer_propose" as const,
+        payload: { transferProposalId: "agent-action-transfer", toOwnerKind: "human",
+          toOwnerActorId: "human-member", reason: "Verifier reassigns",
+          expiresAt: "2026-08-26T08:00:00.000Z" } };
+      expect(() => executeProjectLoopAuthorityOperation(database, {
+        type: "project-loop.fact.transition", context: agentContext("agent-self-reassign"),
+        command, now: NOW + 3,
+      })).toThrowError(expect.objectContaining({ code: "permission_denied" }));
+      executeProjectLoopAuthorityOperation(database, {
+        type: "project-loop.fact.transition", context: humanContext("verifier-reassign"),
+        command, now: NOW + 4,
+      });
+      expect(database.prepare(
+        `SELECT created_by_actor_id AS proposer, principal_human_actor_id AS principal
+         FROM project_transfer_proposals WHERE id = 'agent-action-transfer'`,
+      ).get()).toEqual({ proposer: "human-owner", principal: "human-member" });
+    });
+  });
+
   it("supports Agent delivery with Human acceptance/completion and no Agent done path", () => {
     withDatabase((database) => {
       executeProjectLoopAuthorityOperation(database, createFactProposal({

@@ -206,8 +206,8 @@ function requireAssignableActor(database: DatabaseSync, roomId: string, actorId:
   }
 }
 
-function requireSupersedeAuthority(database: DatabaseSync, roomId: string,
-  humanActorId: string): void {
+function hasRoomOwnerOrAdminAuthority(database: DatabaseSync, roomId: string,
+  humanActorId: string): boolean {
   const authority = database.prepare(
     `SELECT CASE WHEN room.owner_actor_id = ? OR membership.role = 'admin'
                  THEN 1 ELSE 0 END AS authorized
@@ -217,10 +217,32 @@ function requireSupersedeAuthority(database: DatabaseSync, roomId: string,
       AND membership.kind = 'human'
      WHERE room.id = ?`,
   ).get(humanActorId, humanActorId, roomId);
-  if (authority?.authorized !== 1) {
+  return authority?.authorized === 1;
+}
+
+function requireSupersedeAuthority(database: DatabaseSync, roomId: string,
+  humanActorId: string): void {
+  if (!hasRoomOwnerOrAdminAuthority(database, roomId, humanActorId)) {
     throw new ProjectLoopAuthorityError("permission_denied",
       "Only the Room owner or Room admin may supersede a Goal or Decision");
   }
+}
+
+function roomOwnerHumanActorId(database: DatabaseSync, roomId: string): string {
+  const owner = database.prepare(
+    `SELECT room.owner_actor_id AS actorId
+     FROM rooms AS room
+     JOIN room_memberships AS membership
+       ON membership.room_id = room.id AND membership.actor_id = room.owner_actor_id
+      AND membership.kind = 'human' AND membership.role = 'owner'
+     JOIN actors AS actor ON actor.id = room.owner_actor_id AND actor.kind = 'human'
+     WHERE room.id = ?`,
+  ).get(roomId);
+  if (typeof owner?.actorId !== "string") {
+    throw new ProjectLoopAuthorityError("storage_unavailable",
+      "Project Room owner authority is unavailable");
+  }
+  return owner.actorId;
 }
 
 function validateProjectSource(database: DatabaseSync, source: ProjectLoopSource): void {
@@ -1329,7 +1351,12 @@ function transitionFact(database: DatabaseSync,
     const ownerKind = String(fact.details.ownerKind);
     const ownerId = String(fact.details.ownerActorId);
     if (transition === "obstacle.transfer_propose") {
-      if (principal.actorId !== ownerId || operation.context.kind !== "human") {
+      const humanProposer = operation.context.kind === "human"
+        ? operation.context.principal.actorId : null;
+      const currentOwner = principal.actorId === ownerId;
+      const governanceFallback = humanProposer !== null &&
+        hasRoomOwnerOrAdminAuthority(database, fact.roomId, humanProposer);
+      if (!currentOwner && !governanceFallback) {
         throw new ProjectLoopAuthorityError("permission_denied", "Obstacle transfer proposer is invalid");
       }
       const toKind = stringField(payload, "toOwnerKind");
@@ -1338,7 +1365,8 @@ function transitionFact(database: DatabaseSync,
         throw new ProjectLoopAuthorityError("invalid_request", "Obstacle transfer target is invalid");
       }
       requireAssignableActor(database, fact.roomId, toId, toKind);
-      const principalHumanActorId = toKind === "human" ? toId : principal.actorId;
+      const principalHumanActorId = toKind === "human" ? toId :
+        humanProposer ?? roomOwnerHumanActorId(database, fact.roomId);
       const expiresAt = stringField(payload, "expiresAt");
       if (Date.parse(expiresAt) <= operation.now) {
         throw new ProjectLoopAuthorityError("invalid_request", "Obstacle transfer expiry is invalid");
@@ -1378,6 +1406,10 @@ function transitionFact(database: DatabaseSync,
       }
       const expired = Date.parse(transfer.expires_at) <= operation.now;
       const accepted = transition === "obstacle.transfer_accept";
+      if (accepted && !expired) {
+        requireAssignableActor(database, fact.roomId, transfer.to_owner_actor_id,
+          transfer.to_owner_kind);
+      }
       database.prepare(
         `UPDATE project_transfer_proposals SET status = ?, revision = revision + 1, updated_at = ?,
            resolved_by_human_actor_id = ?, resolved_at = ?, resolution_reason = ? WHERE id = ?`,
