@@ -130,6 +130,10 @@ import {
   readOperationalTimelineMessage,
 } from
   "../message-authority/sqlite-operational-message-projection.js";
+import {
+  HumanRequestMessageParticipantError,
+  type HumanRequestMessageTransactionParticipant,
+} from "../project-loop/message-human-request-participant.js";
 import { canStartRuntimeGenerationInTransaction } from "../agent-runtime/runtime-archive-fence-participant.js";
 import {
   commitInternalScopedProducerInTransaction,
@@ -10229,6 +10233,7 @@ export function submitHumanMessageDatabaseCommand(
     readonly context: AuthenticatedCommandContext;
     readonly message: HumanMessageSubmit;
     readonly now: number;
+    readonly humanRequestParticipant?: HumanRequestMessageTransactionParticipant;
     readonly beforeApply?: () => void;
     readonly onFaultPointForTest?: (point: MessageAuthoritySubmitFaultPointForTest) => void;
   },
@@ -10392,6 +10397,39 @@ export function submitHumanMessageDatabaseCommand(
               target.targetActorId,
               persistedAt,
             );
+            if (input.humanRequestParticipant !== undefined) {
+              try {
+                withDatabaseAuthorityTransactionView(
+                  database,
+                  input.message.roomId,
+                  stableId("message-human-request-participant", requestIntentId),
+                  (transaction) => input.humanRequestParticipant!.createPendingInTransaction(
+                    transaction,
+                    {
+                      roomId: input.message.roomId,
+                      projectId: input.message.roomId,
+                      requestIntentId,
+                      sourceMessageId: input.message.messageId,
+                      sourceRevision: 1,
+                      requesterHumanActorId: actorId,
+                      targetHumanActorId: target.targetActorId,
+                      sourceTargetId: target.id,
+                      occurredAt: persistedAt,
+                    },
+                  ),
+                );
+              } catch (error: unknown) {
+                if (error instanceof HumanRequestMessageParticipantError) {
+                  return fail(
+                    error.code === "binding_conflict" ? "idempotency_conflict" :
+                      error.code === "source_unavailable" ? "message_version_conflict" :
+                        "dependency_unavailable",
+                    "Canonical Project Request participant rejected the message target",
+                  );
+                }
+                throw error;
+              }
+            }
             outcome = {
               targetId: target.id,
               targetActorId: target.targetActorId,
@@ -10715,6 +10753,7 @@ export function recallHumanMessageDatabaseCommand(
     readonly context: AuthenticatedCommandContext;
     readonly command: MessageRecallCommand;
     readonly now: number;
+    readonly humanRequestParticipant?: HumanRequestMessageTransactionParticipant;
     readonly beforeApply?: () => void;
   },
 ): MessageRecallReceipt {
@@ -10763,6 +10802,35 @@ export function recallHumanMessageDatabaseCommand(
            SET status = 'cancelled', cancelled_at = ?, cancellation_reason = 'message_recalled'
            WHERE source_message_id = ? AND status = 'pending'`,
         ).run(recalledAt, input.command.messageId);
+        if (input.humanRequestParticipant !== undefined) {
+          try {
+            withDatabaseAuthorityTransactionView(
+              database,
+              input.command.roomId,
+              stableId("message-human-request-recall-participant", input.command.messageId,
+                String(input.command.expectedRevision)),
+              (transaction) => input.humanRequestParticipant!.cancelPendingForRecallInTransaction(
+                transaction,
+                {
+                  roomId: input.command.roomId,
+                  sourceMessageId: input.command.messageId,
+                  sourceRevision: input.command.expectedRevision,
+                  recalledByHumanActorId: actorId,
+                  occurredAt: recalledAt,
+                },
+              ),
+            );
+          } catch (error: unknown) {
+            if (error instanceof HumanRequestMessageParticipantError) {
+              return fail(
+                error.code === "binding_conflict" ? "message_version_conflict" :
+                  "dependency_unavailable",
+                "Canonical Project Request participant rejected source recall",
+              );
+            }
+            throw error;
+          }
+        }
         database.prepare(
           `UPDATE agent_invocation_intents
            SET status = 'cancelled', cancelled_at = ?, cancellation_reason = 'message_recalled'
