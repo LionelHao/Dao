@@ -194,7 +194,9 @@ function currentReminderBoundary(database: DatabaseSync, row: ReminderBoundaryRo
   });
 }
 
-function reminderRows(database: DatabaseSync, now: string): ReminderBoundaryRow[] {
+function reminderRows(database: DatabaseSync, input: Readonly<{
+  now: string; limit: number; agentProviderReady: boolean;
+}>): ReminderBoundaryRow[] {
   return database.prepare(
     `SELECT boundary.boundary_id AS boundaryId, boundary.room_id AS roomId,
             boundary.source_kind AS sourceKind, boundary.source_id AS sourceId,
@@ -206,6 +208,7 @@ function reminderRows(database: DatabaseSync, now: string): ReminderBoundaryRow[
      WHERE boundary.status = 'active' AND boundary.due_at IS NOT NULL
        AND boundary.source_kind IN ('due', 'review', 'confirmation', 'transfer')
        AND boundary.due_at <= ? AND room.status = 'active'
+       AND (? = 1 OR boundary.holder_kind = 'human')
        AND (
          (boundary.holder_kind = 'human' AND EXISTS (
            SELECT 1 FROM room_memberships AS membership
@@ -251,11 +254,12 @@ function reminderRows(database: DatabaseSync, now: string): ReminderBoundaryRow[
            END
        )
      ORDER BY boundary.due_at, boundary.boundary_id LIMIT ?`,
-  ).all(now, now, now, 4_096) as unknown as ReminderBoundaryRow[];
+  ).all(input.now, input.agentProviderReady ? 1 : 0, input.now, input.now,
+    input.limit) as unknown as ReminderBoundaryRow[];
 }
 
 function createReachedDueBoundariesInTransaction(database: DatabaseSync,
-  now: string, limit: number): number {
+  now: string, limit: number, agentProviderReady: boolean): number {
   const rows = database.prepare(
     `SELECT boundary.boundary_id AS boundaryId, boundary.room_id AS roomId,
             boundary.source_kind AS sourceKind, boundary.source_id AS sourceId,
@@ -268,6 +272,7 @@ function createReachedDueBoundariesInTransaction(database: DatabaseSync,
      WHERE boundary.status = 'active' AND boundary.due_at IS NOT NULL
        AND boundary.due_at <= ? AND room.status = 'active'
        AND boundary.source_kind NOT IN ('due', 'review', 'confirmation', 'transfer')
+       AND (? = 1 OR boundary.holder_kind = 'human')
        AND (
          (boundary.holder_kind = 'human' AND EXISTS (
            SELECT 1 FROM room_memberships AS membership
@@ -303,7 +308,7 @@ function createReachedDueBoundariesInTransaction(database: DatabaseSync,
            AND due.source_id = boundary.boundary_id AND due.status = 'active'
        )
      ORDER BY boundary.due_at, boundary.boundary_id LIMIT ?`,
-  ).all(now, 4_096);
+  ).all(now, agentProviderReady ? 1 : 0, limit);
   let created = 0;
   for (const row of rows) {
     if (typeof row.boundaryId !== "string" || typeof row.roomId !== "string" ||
@@ -313,8 +318,13 @@ function createReachedDueBoundariesInTransaction(database: DatabaseSync,
       throw new ProjectLoopAuthorityError("storage_unavailable", "Project due boundary row is corrupt");
     }
     const current = sourceState(database, row as ReminderBoundaryRow);
-    if (!current.current) continue;
-    if (created >= limit) break;
+    if (!current.current) {
+      database.prepare(
+        `UPDATE project_ball_boundaries SET status = 'superseded', released_at = ?
+         WHERE boundary_id = ? AND status = 'active'`,
+      ).run(now, row.boundaryId);
+      continue;
+    }
     const boundaryId = `project-ball-${createHash("sha256").update(
       `${row.roomId}\0due\0${row.boundaryId}\0${row.sourceRevision}` +
         `\0${row.lifecycleGeneration}\0${row.holderKind}\0${row.holderActorId}`,
@@ -331,6 +341,24 @@ function createReachedDueBoundariesInTransaction(database: DatabaseSync,
     created += 1;
   }
   return created;
+}
+
+function collectCurrentReminderBoundariesInTransaction(database: DatabaseSync, input: Readonly<{
+  now: string; limit: number; agentProviderReady: boolean;
+}>): PersistedProjectBoundary[] {
+  const current: PersistedProjectBoundary[] = [];
+  for (const row of reminderRows(database, input)) {
+    const candidate = currentReminderBoundary(database, row, input.now);
+    if (candidate !== undefined) {
+      current.push(candidate);
+      continue;
+    }
+    database.prepare(
+      `UPDATE project_ball_boundaries SET status = 'superseded', released_at = ?
+       WHERE boundary_id = ? AND status = 'active'`,
+    ).run(input.now, row.boundaryId);
+  }
+  return current;
 }
 
 export type ProjectReminderAgentIntentInput = Readonly<{
@@ -478,18 +506,14 @@ export function scanProjectReminderBucketsInTransaction(
   advanceProjectLoopTimedTransitionsInTransaction(database, {
     now: input.now, limit: input.limit,
   });
-  createReachedDueBoundariesInTransaction(database, input.now, input.limit);
-  const candidates = reminderRows(database, input.now)
-    .map((row) => currentReminderBoundary(database, row, input.now))
-    .filter((row): row is PersistedProjectBoundary => row !== undefined)
-    .slice(0, input.limit);
+  const agentProviderReady = input.agentProviderReady !== false;
+  createReachedDueBoundariesInTransaction(database, input.now, input.limit, agentProviderReady);
+  const candidates = collectCurrentReminderBoundariesInTransaction(database, {
+    now: input.now, limit: input.limit, agentProviderReady,
+  });
   const claims: ProjectReminderClaimResult[] = [];
   let ignoredCount = 0;
   for (const candidate of candidates) {
-    if (candidate.holder.kind === "agent" && input.agentProviderReady === false) {
-      ignoredCount += 1;
-      continue;
-    }
     const scheduled = candidate.boundaryKind === "review" ? candidate.reviewAt : candidate.dueAt;
     if (scheduled === null) { ignoredCount += 1; continue; }
     const ordinal = currentProjectReminderOrdinal(scheduled, input.now);
@@ -524,10 +548,17 @@ export function createProjectReminderDatabaseAuthorityPort(database: DatabaseSyn
     ) {
       if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 256 ||
           !Number.isFinite(Date.parse(input.now))) throw new TypeError("Project reminder scan is invalid");
-      return Object.freeze(reminderRows(database, input.now)
-        .map((row) => currentReminderBoundary(database, row, input.now))
-        .filter((row): row is PersistedProjectBoundary => row !== undefined)
-        .slice(0, input.limit));
+      database.exec("BEGIN IMMEDIATE");
+      try {
+        const result = Object.freeze(collectCurrentReminderBoundariesInTransaction(database, {
+          now: input.now, limit: input.limit, agentProviderReady: true,
+        }));
+        database.exec("COMMIT");
+        return result;
+      } catch (error) {
+        try { database.exec("ROLLBACK"); } catch { /* preserve original */ }
+        throw error;
+      }
     },
     async claimCurrentBucket(
       input: Parameters<ProjectReminderAuthorityPort["claimCurrentBucket"]>[0],
@@ -635,6 +666,47 @@ export function reopenProjectLoopBoundariesInTransaction(database: DatabaseSync,
   ).get(input.roomId, input.archiveGeneration);
   if (typeof suspension?.suspendedAt !== "string") {
     throw new ProjectLoopAuthorityError("revision_conflict", "Project archive suspension is unavailable");
+  }
+  const suspendedAtMs = Date.parse(suspension.suspendedAt);
+  const reopenedAtMs = Date.parse(input.occurredAt);
+  if (!Number.isFinite(suspendedAtMs) || reopenedAtMs < suspendedAtMs) {
+    throw new ProjectLoopAuthorityError("revision_conflict", "Project archive duration is invalid");
+  }
+  const resumeTimer = (scheduledAt: unknown): string => {
+    if (typeof scheduledAt !== "string" || !Number.isFinite(Date.parse(scheduledAt))) {
+      throw new ProjectLoopAuthorityError("storage_unavailable", "Project business timer is corrupt");
+    }
+    return new Date(reopenedAtMs + Math.max(0, Date.parse(scheduledAt) - suspendedAtMs)).toISOString();
+  };
+  const reviewTimers = database.prepare(
+    `SELECT id, review_at AS scheduledAt FROM project_obstacles
+     WHERE room_id = ? AND status = 'deferred' AND review_at IS NOT NULL
+     ORDER BY id`,
+  ).all(input.roomId);
+  for (const timer of reviewTimers) {
+    if (typeof timer.id !== "string" || typeof timer.scheduledAt !== "string") {
+      throw new ProjectLoopAuthorityError("storage_unavailable", "Project review timer row is corrupt");
+    }
+    const scheduledAt = timer.scheduledAt;
+    database.prepare(
+      `UPDATE project_obstacles SET review_at = ?
+       WHERE room_id = ? AND id = ? AND status = 'deferred' AND review_at = ?`,
+    ).run(resumeTimer(scheduledAt), input.roomId, timer.id, scheduledAt);
+  }
+  const transferTimers = database.prepare(
+    `SELECT id, expires_at AS scheduledAt FROM project_transfer_proposals
+     WHERE room_id = ? AND status = 'pending' AND expires_at IS NOT NULL
+     ORDER BY id`,
+  ).all(input.roomId);
+  for (const timer of transferTimers) {
+    if (typeof timer.id !== "string" || typeof timer.scheduledAt !== "string") {
+      throw new ProjectLoopAuthorityError("storage_unavailable", "Project transfer timer row is corrupt");
+    }
+    const scheduledAt = timer.scheduledAt;
+    database.prepare(
+      `UPDATE project_transfer_proposals SET expires_at = ?
+       WHERE room_id = ? AND id = ? AND status = 'pending' AND expires_at = ?`,
+    ).run(resumeTimer(scheduledAt), input.roomId, timer.id, scheduledAt);
   }
   const latest = new Map<string, LifecycleBoundaryRow>();
   for (const row of lifecycleRows(database, input.roomId, "superseded")) {

@@ -5,6 +5,7 @@ import {
   createProjectReminderDatabaseAuthorityPort,
   reopenProjectLoopBoundariesInTransaction,
 } from "./boundary-authority.js";
+import { advanceProjectLoopTimedTransitionsInTransaction } from "./database-authority.js";
 import { scanCurrentProjectReminderBuckets } from "./project-boundary-runtime-service.js";
 
 const now = "2026-08-25T08:00:00.000Z";
@@ -21,7 +22,14 @@ function fixture(holderKind: "human" | "agent" = "human") {
     );
     CREATE TABLE project_next_actions (id TEXT, room_id TEXT, revision INTEGER, status TEXT);
     CREATE TABLE project_requests (id TEXT, room_id TEXT, revision INTEGER, status TEXT);
-    CREATE TABLE project_obstacles (id TEXT, room_id TEXT, revision INTEGER, kind TEXT, status TEXT);
+    CREATE TABLE project_obstacles (
+      id TEXT, room_id TEXT, revision INTEGER, kind TEXT, status TEXT, review_at TEXT,
+      owner_kind TEXT, owner_actor_id TEXT
+    );
+    CREATE TABLE project_transfer_proposals (
+      id TEXT, room_id TEXT, revision INTEGER, status TEXT, expires_at TEXT,
+      subject_kind TEXT, subject_id TEXT, principal_human_actor_id TEXT
+    );
     CREATE TABLE project_ball_boundaries (
       boundary_id TEXT PRIMARY KEY, room_id TEXT, project_id TEXT, source_kind TEXT, source_id TEXT,
       source_revision INTEGER, lifecycle_generation INTEGER, holder_kind TEXT, holder_actor_id TEXT, reason TEXT,
@@ -224,6 +232,53 @@ describe("FT-09 database lifecycle participant", () => {
       });
       await expect(authority.listEligibleBoundaries({ now: reopenedAt, limit: 10 }))
         .resolves.toEqual([]);
+    } finally { database.close(); }
+  });
+
+  it("shifts canonical review and transfer timers by the full archive duration exactly once", () => {
+    const database = fixture();
+    try {
+      database.exec(`
+        INSERT INTO project_obstacles VALUES (
+          'obstacle-review', 'room-1', 1, 'blocker', 'deferred',
+          '2026-08-27T08:00:00.000Z', 'human', 'holder-1'
+        );
+        INSERT INTO project_transfer_proposals VALUES (
+          'transfer-pending', 'room-1', 1, 'pending', '2026-08-28T08:00:00.000Z',
+          'next_action', 'action-1', 'holder-1'
+        );
+      `);
+      database.prepare("UPDATE rooms SET status = 'archived', archive_generation = 5").run();
+      archiveProjectLoopBoundariesInTransaction(database, {
+        roomId: "room-1", archiveGeneration: 5, previousLifecycleGeneration: 4, occurredAt: now,
+      });
+      database.prepare("UPDATE rooms SET status = 'active'").run();
+      const reopenedAt = "2026-09-25T08:00:00.000Z";
+      reopenProjectLoopBoundariesInTransaction(database, {
+        roomId: "room-1", archiveGeneration: 5, previousLifecycleGeneration: 5,
+        occurredAt: reopenedAt,
+      });
+      expect(database.prepare(
+        "SELECT review_at AS reviewAt FROM project_obstacles WHERE id = 'obstacle-review'",
+      ).get()).toEqual({ reviewAt: "2026-09-27T08:00:00.000Z" });
+      expect(database.prepare(
+        "SELECT expires_at AS expiresAt FROM project_transfer_proposals WHERE id = 'transfer-pending'",
+      ).get()).toEqual({ expiresAt: "2026-09-28T08:00:00.000Z" });
+      expect(advanceProjectLoopTimedTransitionsInTransaction(database, {
+        now: reopenedAt, limit: 256,
+      })).toEqual({ reopenedReviews: 0, expiredTransfers: 0 });
+      expect(() => reopenProjectLoopBoundariesInTransaction(database, {
+        roomId: "room-1", archiveGeneration: 5, previousLifecycleGeneration: 5,
+        occurredAt: "2026-10-25T08:00:00.000Z",
+      })).toThrowError(expect.objectContaining({ code: "revision_conflict" }));
+      expect(database.prepare(
+        `SELECT review_at AS reviewAt,
+                (SELECT expires_at FROM project_transfer_proposals
+                 WHERE id = 'transfer-pending') AS expiresAt
+         FROM project_obstacles WHERE id = 'obstacle-review'`,
+      ).get()).toEqual({
+        reviewAt: "2026-09-27T08:00:00.000Z", expiresAt: "2026-09-28T08:00:00.000Z",
+      });
     } finally { database.close(); }
   });
 

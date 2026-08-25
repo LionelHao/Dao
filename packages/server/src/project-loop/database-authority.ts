@@ -518,6 +518,23 @@ function releaseTransferBoundary(database: DatabaseSync, roomId: string,
   ).run(now, roomId, transferId);
 }
 
+function transferEscalationHolder(fact: ProjectLoopStoredFact): string {
+  const ownerActorId = fact.details.ownerActorId;
+  if (typeof ownerActorId !== "string") {
+    throw new ProjectLoopAuthorityError("storage_unavailable",
+      "Transfer escalation owner is unavailable");
+  }
+  if (fact.kind !== "next_action" || fact.details.ownerKind === "human") {
+    return ownerActorId;
+  }
+  const verifierHumanActorId = fact.details.verifierHumanActorId;
+  if (typeof verifierHumanActorId !== "string") {
+    throw new ProjectLoopAuthorityError("storage_unavailable",
+      "NextAction escalation principal is unavailable");
+  }
+  return verifierHumanActorId;
+}
+
 function refreshBallBoundary(database: DatabaseSync, fact: ProjectLoopStoredFact, now: string): void {
   database.prepare(
     `UPDATE project_ball_boundaries SET status = 'superseded', released_at = ?
@@ -1180,11 +1197,7 @@ function transitionFact(database: DatabaseSync,
         expired ? "Transfer proposal expired" : accepted ? null : "Human rejected transfer", transferId);
       releaseTransferBoundary(database, fact.roomId, transferId, timestamp);
       if (expired) {
-        const escalationHolder = ownerKind === "human" ? ownerId : verifier;
-        if (typeof escalationHolder !== "string") {
-          throw new ProjectLoopAuthorityError("storage_unavailable",
-            "NextAction escalation principal is unavailable");
-        }
+        const escalationHolder = transferEscalationHolder(fact);
         refreshTransferBoundary(database, {
           roomId: fact.roomId, transferId, revision: Number(transfer.revision) + 1,
           holderActorId: escalationHolder, reason: "escalation",
@@ -1645,6 +1658,7 @@ export function advanceProjectLoopTimedTransitionsInTransaction(database: Databa
         throw new ProjectLoopAuthorityError("storage_unavailable", "Project transfer timer row is corrupt");
       }
       const fact = readFact(database, row.subjectKind, row.subjectId, row.roomId);
+      const escalationHolder = transferEscalationHolder(fact);
       const changed = database.prepare(
         `UPDATE project_transfer_proposals SET status = 'expired', revision = revision + 1,
            updated_at = ?, resolved_by_human_actor_id = NULL, resolved_at = ?,
@@ -1654,7 +1668,7 @@ export function advanceProjectLoopTimedTransitionsInTransaction(database: Databa
       if (changed.changes !== 1) continue;
       releaseTransferBoundary(database, row.roomId, row.id, input.now);
       refreshTransferBoundary(database, { roomId: row.roomId, transferId: row.id,
-        revision: row.revision + 1, holderActorId: row.principalActorId,
+        revision: row.revision + 1, holderActorId: escalationHolder,
         reason: "escalation", dueAt: input.now, now: input.now });
       const current = state(database, row.roomId, input.now);
       appendEvent(database, { roomId: row.roomId, eventSeq: current.revision + 1,

@@ -191,6 +191,32 @@ describe("FT-09 Project boundary adversarial authority", () => {
         type: "runtime.scan-project-agent-boundaries", providerId: "provider-one",
         modelId: "model-one", agentProviderReady: false, limit: 256, now: Date.parse(NOW),
       })).toMatchObject({ createdCount: 0, suppressedCount: 0 });
+      const insertAgentAction = database.prepare(`
+        INSERT INTO project_next_actions (
+          id, room_id, source_room_id, source_id, revision, owner_kind,
+          owner_actor_id, verifier_human_actor_id, status
+        ) VALUES (?, 'room-project', 'room-project', ?, 1, 'agent',
+                  'agent-one', 'human-owner', 'accepted')
+      `);
+      const insertAgentBoundary = database.prepare(`
+        INSERT INTO project_ball_boundaries (
+          boundary_id, room_id, project_id, source_kind, source_id, source_revision,
+          lifecycle_generation, holder_kind, holder_actor_id, reason, since, due_at,
+          status, released_at
+        ) VALUES (?, 'room-project', 'room-project', ?, ?, 1, 0, 'agent', 'agent-one',
+                  'due', ?, ?, 'active', NULL)
+      `);
+      database.exec("BEGIN IMMEDIATE");
+      for (let index = 0; index < 256; index += 1) {
+        const suffix = String(index).padStart(3, "0");
+        const actionId = `agent-noauth-action-${suffix}`;
+        const parentId = `agent-noauth-parent-${suffix}`;
+        insertAgentAction.run(actionId, `legacy-agent-noauth-${suffix}`);
+        insertAgentBoundary.run(parentId, "next_action", actionId, NOW, null);
+        insertAgentBoundary.run(`agent-noauth-due-${suffix}`, "due", parentId,
+          "2026-08-25T07:00:00.000Z", "2026-08-25T07:00:00.000Z");
+      }
+      database.exec("COMMIT");
       database.exec(`
         INSERT INTO project_next_actions (
           id, room_id, source_room_id, source_id, revision, owner_kind,
@@ -217,6 +243,67 @@ describe("FT-09 Project boundary adversarial authority", () => {
       expect(database.prepare(
         `SELECT COUNT(*) AS count FROM outbox_deliveries
          WHERE target_kind = 'principal' AND target_id = 'human-owner'`,
+      ).get()).toEqual({ count: 1 });
+    } finally {
+      close(database);
+    }
+  });
+
+  it("makes bounded progress through 4096 stale reminders and reaches later valid work", () => {
+    const database = fixture();
+    try {
+      database.prepare(
+        "UPDATE project_ball_boundaries SET status = 'superseded', released_at = ? WHERE boundary_id = 'boundary-one'",
+      ).run(NOW);
+      const insertStale = database.prepare(`
+        INSERT INTO project_ball_boundaries (
+          boundary_id, room_id, project_id, source_kind, source_id, source_revision,
+          lifecycle_generation, holder_kind, holder_actor_id, reason, since, due_at,
+          status, released_at
+        ) VALUES (?, 'room-project', 'room-project', 'due', ?, 1, 0, 'human',
+                  'human-owner', 'due', '2026-08-25T06:00:00.000Z',
+                  '2026-08-25T06:00:00.000Z', 'active', NULL)
+      `);
+      database.exec("BEGIN IMMEDIATE");
+      for (let index = 0; index < 4_096; index += 1) {
+        const suffix = String(index).padStart(4, "0");
+        insertStale.run(`a-stale-due-${suffix}`, `missing-parent-${suffix}`);
+      }
+      database.exec("COMMIT");
+      database.exec(`
+        INSERT INTO project_next_actions (
+          id, room_id, source_room_id, source_id, revision, owner_kind,
+          owner_actor_id, verifier_human_actor_id, status
+        ) VALUES (
+          'action-after-stale', 'room-project', 'room-project', 'legacy-after-stale', 1,
+          'human', 'human-owner', NULL, 'accepted'
+        );
+        INSERT INTO project_ball_boundaries (
+          boundary_id, room_id, project_id, source_kind, source_id, source_revision,
+          lifecycle_generation, holder_kind, holder_actor_id, reason, since, due_at,
+          status, released_at
+        ) VALUES
+          ('z-valid-parent', 'room-project', 'room-project', 'next_action',
+           'action-after-stale', 1, 0, 'human', 'human-owner', 'work', '${NOW}', NULL, 'active', NULL),
+          ('z-valid-due', 'room-project', 'room-project', 'due',
+           'z-valid-parent', 1, 0, 'human', 'human-owner', 'due', '${NOW}', '${NOW}', 'active', NULL);
+      `);
+
+      for (let scan = 0; scan < 16; scan += 1) {
+        expect(executeRuntimeAuthorityOperation(database, {
+          type: "runtime.scan-project-reminders", providerId: "provider-one",
+          modelId: "model-one", agentProviderReady: false, limit: 256, now: Date.parse(NOW),
+        })).toMatchObject({ kind: "project-reminder-scan", result: { scannedCount: 0, claimedCount: 0 } });
+        expect(database.prepare(
+          "SELECT COUNT(*) AS count FROM project_ball_boundaries WHERE boundary_id LIKE 'a-stale-due-%' AND status = 'active'",
+        ).get()).toEqual({ count: 4_096 - (scan + 1) * 256 });
+      }
+      expect(executeRuntimeAuthorityOperation(database, {
+        type: "runtime.scan-project-reminders", providerId: "provider-one",
+        modelId: "model-one", agentProviderReady: false, limit: 256, now: Date.parse(NOW),
+      })).toMatchObject({ kind: "project-reminder-scan", result: { scannedCount: 1, claimedCount: 1 } });
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM outbox_deliveries WHERE target_kind = 'principal' AND target_id = 'human-owner'",
       ).get()).toEqual({ count: 1 });
     } finally {
       close(database);

@@ -7,6 +7,7 @@ import { isProjectSnapshot } from "@native-im/core";
 import { migrateAuthorityDatabase } from "../persistence/schema.js";
 import type { JsonValue } from "../persistence/contracts.js";
 import {
+  advanceProjectLoopTimedTransitionsInTransaction,
   executeProjectLoopAuthorityOperation,
   claimDueProjectRemindersDatabaseCommand,
   ProjectLoopAuthorityError,
@@ -930,6 +931,23 @@ describe("Project Loop database authority", () => {
         `SELECT holder_actor_id AS holder, reason
          FROM project_ball_boundaries
          WHERE source_kind = 'transfer' AND source_id = 'transfer-action-expired'
+           AND status = 'active'`,
+      ).get()).toEqual({ holder: "human-member", reason: "escalation" });
+
+      transition("propose-action-transfer-timer-expired", "human-member", 2,
+        "next_action.transfer_propose", "transfer-action-timer-expired");
+      database.exec("BEGIN IMMEDIATE");
+      expect(advanceProjectLoopTimedTransitionsInTransaction(database, {
+        now: new Date(NOW + 2 * 86_400_000).toISOString(), limit: 256,
+      })).toMatchObject({ expiredTransfers: 1 });
+      database.exec("COMMIT");
+      expect(() => transition("accept-action-transfer-after-timer", "human-owner", 2,
+        "next_action.transfer_accept", "transfer-action-timer-expired", NOW + 2 * 86_400_000 + 1))
+        .toThrowError(expect.objectContaining({ code: "permission_denied" }));
+      expect(database.prepare(
+        `SELECT holder_actor_id AS holder, reason
+         FROM project_ball_boundaries
+         WHERE source_kind = 'transfer' AND source_id = 'transfer-action-timer-expired'
            AND status = 'active'`,
       ).get()).toEqual({ holder: "human-member", reason: "escalation" });
 
