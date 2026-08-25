@@ -23,9 +23,34 @@ type DomainUnderTest = {
   isRoomMemoryRequest?: (value: unknown) => boolean;
   isRoomMemoryProtocolFrame?: (value: unknown) => boolean;
   isRoomMemoryRepairRecord?: (value: unknown, expectedRoomId?: string) => boolean;
+  isAgentInvocationIntent?: (value: unknown) => boolean;
+  isAgentExecution?: (value: unknown) => boolean;
+  isAgentExecutionAttempt?: (value: unknown) => boolean;
+  isAgentExecutionRetryReceipt?: (value: unknown) => boolean;
+  isScopedCancellationReceipt?: (value: unknown) => boolean;
+  isProjectBoundaryInvocationResult?: (value: unknown) => boolean;
+  isProjectBoundaryInvocationRequest?: (value: unknown) => boolean;
+  isLegacyAgentExecution?: (value: unknown) => boolean;
+  isLegacyAgentInvocationIntent?: (value: unknown) => boolean;
+  isLegacyHumanPreemptionNotice?: (value: unknown) => boolean;
 };
 
 const domain = importedDomain as unknown as DomainUnderTest;
+
+describe("FT-08 root exports", () => {
+  it("exposes canonical lifecycle guards and explicitly named legacy readers", () => {
+    expect(domain.isAgentInvocationIntent).toBeTypeOf("function");
+    expect(domain.isAgentExecution).toBeTypeOf("function");
+    expect(domain.isAgentExecutionAttempt).toBeTypeOf("function");
+    expect(domain.isAgentExecutionRetryReceipt).toBeTypeOf("function");
+    expect(domain.isScopedCancellationReceipt).toBeTypeOf("function");
+    expect(domain.isProjectBoundaryInvocationResult).toBeTypeOf("function");
+    expect(domain.isProjectBoundaryInvocationRequest).toBeTypeOf("function");
+    expect(domain.isLegacyAgentExecution).toBeTypeOf("function");
+    expect(domain.isLegacyAgentInvocationIntent).toBeTypeOf("function");
+    expect(domain.isLegacyHumanPreemptionNotice).toBeTypeOf("function");
+  });
+});
 
 describe("room memory root exports", () => {
   it("exposes the FT-05 closed contract guards", () => {

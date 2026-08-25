@@ -11,27 +11,40 @@ import type {
 import { isRoomGovernanceView } from "./index.js";
 import {
   isAgentExecution,
+  isAgentExecutionAttempt,
+  isAgentExecutionRetryReceipt,
+  isAgentInvocationIntent,
   isAgentJudgement,
   isCalibrationSignal,
   isHumanReadReceipt,
-  isHumanPreemptionNotice,
+  isLegacyAgentExecution,
+  isLegacyHumanPreemptionNotice,
   isLightTask,
   isBallOverdueTrigger,
   isOpenItem,
   isOpenItemAgentFailure,
   isRouteJob,
   isRouteJudgment,
+  isProjectBoundaryInvocationResult,
+  isScopedCancellationReceipt,
   type AgentExecution,
+  type AgentExecutionAttempt,
+  type AgentExecutionRetryReceipt,
+  type AgentInvocationIntent,
   type AgentJudgement,
   type CalibrationSignal,
   type HumanReadReceipt,
-  type HumanPreemptionNotice,
+  type LegacyAgentExecution,
+  type LegacyAgentExecutionStatus,
+  type LegacyHumanPreemptionNotice,
   type LightTask,
   type BallOverdueTrigger,
   type OpenItem,
   type OpenItemAgentFailure,
   type RouteJob,
   type RouteJudgment,
+  type ProjectBoundaryInvocationResult,
+  type ScopedCancellationReceipt,
 } from "./collaboration.js";
 import {
   isAttachmentRepairRecord,
@@ -198,7 +211,13 @@ export type RoomRepairRecord =
   | { readonly kind: "open-item"; readonly value: OpenItem }
   | { readonly kind: "open-item-agent-failure"; readonly value: OpenItemAgentFailure }
   | { readonly kind: "light-task"; readonly value: LightTask }
+  | { readonly kind: "agent-invocation-intent"; readonly value: AgentInvocationIntent }
   | { readonly kind: "agent-execution"; readonly value: AgentExecution }
+  | { readonly kind: "agent-execution-attempt"; readonly value: AgentExecutionAttempt }
+  | { readonly kind: "agent-execution-retry"; readonly value: AgentExecutionRetryReceipt }
+  | { readonly kind: "agent-scoped-cancellation"; readonly value: ScopedCancellationReceipt }
+  | { readonly kind: "project-boundary-invocation"; readonly value: ProjectBoundaryInvocationResult }
+  | { readonly kind: "legacy-agent-execution"; readonly value: LegacyAgentExecution }
   | { readonly kind: "route-job"; readonly value: RouteJob }
   | { readonly kind: "route-judgment"; readonly value: RouteJudgment }
   | { readonly kind: "calibration"; readonly value: CalibrationSignal }
@@ -272,13 +291,13 @@ type RoomEvent<TType extends string, TPayload> = PersistedEventBase & {
   readonly payload: TPayload;
 };
 
-export interface AgentExecutionLifecyclePayload {
+export interface LegacyAgentExecutionLifecyclePayload {
   readonly executionId: string;
   readonly attemptSeq: number;
   readonly retryCycle: number;
   readonly retryOrdinal: 1 | 2 | 3;
-  readonly actionCategory: AgentExecution["actionCategory"];
-  readonly status: AgentExecution["status"];
+  readonly actionCategory: LegacyAgentExecution["actionCategory"];
+  readonly status: LegacyAgentExecutionStatus;
   readonly errorCode?: string;
   readonly nextRetryAt?: string;
 }
@@ -312,6 +331,25 @@ export interface RoomSecurityReducedEventPayload {
   readonly assignmentRevision: number;
 }
 
+export type LegacyRoomHumanPreemptionEvent = RoomEvent<
+  "room.human_preemption.applied",
+  LegacyHumanPreemptionNotice
+>;
+
+export type LegacyAgentExecutionEvent =
+  | RoomEvent<"room.agent_execution.changed", LegacyAgentExecution>
+  | RoomEvent<
+      | "agent.execution.queued"
+      | "agent.execution.started"
+      | "agent.execution.retry-scheduled"
+      | "agent.execution.completed"
+      | "agent.execution.failed"
+      | "agent.execution.cancelled"
+      | "agent.execution.dead-lettered"
+      | "agent.execution.recovered",
+      LegacyAgentExecutionLifecyclePayload
+    >;
+
 export type PersistedRoomEvent =
   | RoomEvent<"room.created" | "room.renamed", { readonly room: ManagedRoom }>
   | RoomEvent<"room.governance.changed", { readonly governance: RoomGovernanceView }>
@@ -335,8 +373,14 @@ export type PersistedRoomEvent =
   | RoomEvent<"room.open_item.agent_attempt_failed", OpenItemAgentFailure>
   | RoomEvent<"room.light_task.changed", LightTask>
   | RoomEvent<"room.ball.overdue", BallOverdueTrigger>
-  | RoomEvent<"room.human_preemption.applied", HumanPreemptionNotice>
-  | RoomEvent<"room.agent_execution.changed", AgentExecution>
+  | LegacyRoomHumanPreemptionEvent
+  | LegacyAgentExecutionEvent
+  | RoomEvent<"agent.invocation.intent.changed", AgentInvocationIntent>
+  | RoomEvent<"agent.execution.changed", AgentExecution>
+  | RoomEvent<"agent.execution.attempt.changed", AgentExecutionAttempt>
+  | RoomEvent<"agent.execution.retry.accepted", AgentExecutionRetryReceipt>
+  | RoomEvent<"agent.invocation.scoped-cancellation.committed", ScopedCancellationReceipt>
+  | RoomEvent<"project.boundary.invocation.decided", ProjectBoundaryInvocationResult>
   | RoomEvent<"room.route_judgment.recorded", RouteJudgment>
   | RoomEvent<
       | "route.queued"
@@ -346,17 +390,6 @@ export type PersistedRoomEvent =
       | "route.failed"
       | "route.recovered",
       RouteJob
-    >
-  | RoomEvent<
-      | "agent.execution.queued"
-      | "agent.execution.started"
-      | "agent.execution.retry-scheduled"
-      | "agent.execution.completed"
-      | "agent.execution.failed"
-      | "agent.execution.cancelled"
-      | "agent.execution.dead-lettered"
-      | "agent.execution.recovered",
-      AgentExecutionLifecyclePayload
     >
   | RoomEvent<"agent.tool.confirmation-required", ToolConfirmationRequiredPayload>
   | RoomEvent<"room.calibration.recorded", CalibrationSignal>;
@@ -641,7 +674,20 @@ function isRepairRecord(value: unknown, expectedRoomId?: string): value is RoomR
   if (value.kind === "open-item") return isOpenItem(value.value);
   if (value.kind === "open-item-agent-failure") return isOpenItemAgentFailure(value.value);
   if (value.kind === "light-task") return isLightTask(value.value);
-  if (value.kind === "agent-execution") return isAgentExecution(value.value);
+  if (value.kind === "agent-invocation-intent") return isAgentInvocationIntent(value.value) &&
+    (!expectedRoomId || value.value.roomId === expectedRoomId);
+  if (value.kind === "agent-execution") return isAgentExecution(value.value) &&
+    (!expectedRoomId || value.value.roomId === expectedRoomId);
+  if (value.kind === "agent-execution-attempt") return isAgentExecutionAttempt(value.value) &&
+    (!expectedRoomId || value.value.roomId === expectedRoomId);
+  if (value.kind === "agent-execution-retry") return isAgentExecutionRetryReceipt(value.value) &&
+    (!expectedRoomId || value.value.roomId === expectedRoomId);
+  if (value.kind === "agent-scoped-cancellation") return isScopedCancellationReceipt(value.value) &&
+    (!expectedRoomId || value.value.roomId === expectedRoomId);
+  if (value.kind === "project-boundary-invocation") return isProjectBoundaryInvocationResult(value.value) &&
+    (!expectedRoomId || value.value.roomId === expectedRoomId);
+  if (value.kind === "legacy-agent-execution") return isLegacyAgentExecution(value.value) &&
+    (!expectedRoomId || value.value.roomId === expectedRoomId);
   if (value.kind === "route-job") return isRouteJob(value.value);
   if (value.kind === "route-judgment") return isRouteJudgment(value.value);
   if (value.kind === "calibration") return isCalibrationSignal(value.value);
@@ -758,11 +804,29 @@ function isPersistedRoomEventValue(value: unknown): value is PersistedRoomEvent 
       payload.agentId === value.actorId;
   }
   if (value.type === "room.human_preemption.applied") {
-    return isHumanPreemptionNotice(payload) && payload.roomId === value.roomId &&
+    return isLegacyHumanPreemptionNotice(payload) && payload.roomId === value.roomId &&
       payload.occurredAt === value.occurredAt;
   }
   if (value.type === "room.agent_execution.changed") {
+    return isLegacyAgentExecution(payload) && payload.roomId === value.roomId && payload.agentId === value.actorId;
+  }
+  if (value.type === "agent.invocation.intent.changed") {
+    return isAgentInvocationIntent(payload) && payload.roomId === value.roomId;
+  }
+  if (value.type === "agent.execution.changed") {
     return isAgentExecution(payload) && payload.roomId === value.roomId && payload.agentId === value.actorId;
+  }
+  if (value.type === "agent.execution.attempt.changed") {
+    return isAgentExecutionAttempt(payload) && payload.roomId === value.roomId && payload.agentId === value.actorId;
+  }
+  if (value.type === "agent.execution.retry.accepted") {
+    return isAgentExecutionRetryReceipt(payload) && payload.roomId === value.roomId;
+  }
+  if (value.type === "agent.invocation.scoped-cancellation.committed") {
+    return isScopedCancellationReceipt(payload) && payload.roomId === value.roomId;
+  }
+  if (value.type === "project.boundary.invocation.decided") {
+    return isProjectBoundaryInvocationResult(payload) && payload.roomId === value.roomId;
   }
   if (value.type === "room.route_judgment.recorded") {
     return isRouteJudgment(payload) && payload.agentId === value.actorId;
