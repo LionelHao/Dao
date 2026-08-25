@@ -7360,6 +7360,18 @@ export function executeRuntimeAuthorityOperation(
           if (cancelledIntent.changes !== 1) {
             return fail("execution_conflict", "Pending direct invocation cancellation lost its CAS");
           }
+          // Keep the immutable v16 recall trigger satisfiable while v22 owns
+          // the real source_ineligible reason.
+          const compatibilityIntent = database.prepare(
+            `UPDATE agent_invocation_intents
+             SET status = 'cancelled', cancelled_at = ?,
+                 cancellation_reason = 'message_recalled'
+             WHERE id = ? AND status = 'pending'`,
+          ).run(occurredAt, candidate.intentId);
+          if (compatibilityIntent.changes !== 1) {
+            return fail("execution_conflict",
+              "Pending direct invocation compatibility cancellation lost its CAS");
+          }
           const canonicalReceipt = {
             requestId, fenceId, roomId: candidate.roomId, lineageId: candidate.lineageId,
             scope: { kind: "intent" as const, intentId: candidate.intentId, expectedVersion: 1 },

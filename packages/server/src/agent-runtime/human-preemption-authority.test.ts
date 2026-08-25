@@ -387,6 +387,64 @@ describe("real SQLite human-preemption authority", () => {
     database.close();
   });
 
+  it("keeps a revised pending source recallable after direct-consumer ineligibility", () => {
+    const database = fixture();
+    const sourceMessageId = "message-revised-pending-direct";
+    const submitted = submitHumanMessageDatabaseCommand(database, {
+      context: { ...humanContext, requestId: "submit-revised-pending-direct",
+        idempotencyKey: "submit-revised-pending-direct" },
+      message: {
+        messageId: sourceMessageId, roomId: "room-1", body: "@Agent revision one",
+        mentionedTargets: [{ id: "target-revised-pending-direct", kind: "agent-invocation",
+          targetActorId: "agent-1", range: { startUtf16: 0, endUtf16: 6 } }],
+        attachments: [],
+      },
+      now: t0 + 410_000,
+    });
+    const intentId = submitted.targetOutcomes[0]?.invocationIntentId;
+    if (intentId === undefined) throw new Error("Pending direct intent was missing");
+    reviseHumanMessageDatabaseCommand(database, {
+      context: { ...humanContext, requestId: "revise-pending-direct",
+        idempotencyKey: "revise-pending-direct" },
+      command: {
+        roomId: "room-1", messageId: sourceMessageId,
+        expectedRevision: 1, body: "@Agent revision two",
+      },
+      now: t0 + 410_001,
+    });
+    const claimed = executeRuntimeAuthorityOperation(database, {
+      type: "runtime.claim-pending-direct-intents",
+      providerId: "provider", modelId: "model", limit: 256, now: t0 + 410_002,
+    });
+    expect(claimed).toMatchObject({ kind: "direct-intent-claims", records: [] });
+    expect(database.prepare(
+      `SELECT intent.status AS compatibilityStatus,
+              intent.cancellation_reason AS compatibilityReason,
+              runtime.public_status AS canonicalStatus,
+              runtime.cancellation_reason AS canonicalReason
+       FROM agent_invocation_intents AS intent
+       JOIN agent_invocation_intent_runtime_states AS runtime ON runtime.intent_id = intent.id
+       WHERE intent.id = ?`,
+    ).get(intentId)).toEqual({
+      compatibilityStatus: "cancelled",
+      compatibilityReason: "message_recalled",
+      canonicalStatus: "cancelled",
+      canonicalReason: "source_ineligible",
+    });
+
+    const recallInput = {
+      context: { ...humanContext, requestId: "recall-revised-pending-direct",
+        idempotencyKey: "recall-revised-pending-direct" },
+      command: { roomId: "room-1", messageId: sourceMessageId, expectedRevision: 2 },
+      now: t0 + 410_003,
+    } as const;
+    const recalled = recallHumanMessageDatabaseCommand(database, recallInput);
+    expect(recalled).toMatchObject({ replayed: false, revision: 2, abortTargets: [] });
+    expect(recallHumanMessageDatabaseCommand(database, recallInput))
+      .toEqual({ ...recalled, replayed: true });
+    database.close();
+  });
+
   it("atomically authorizes only the current execution attempt and access epoch for preview delivery", () => {
     const database = fixture();
     const sourceMessageId = sendAgentSource(database, 90);
