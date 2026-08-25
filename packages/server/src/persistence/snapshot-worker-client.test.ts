@@ -570,8 +570,13 @@ describe("durable materialized snapshot worker", () => {
     const page5 = await client.readRoomRepairPage(
       context, "read-page-five", page0.snapshotId, 4,
     );
-    expect(page5).toMatchObject({ requestId: "read-page-five", page: 5, hasMore: false });
-    await expect(client.readRoomRepairPage(context, "past-end", page0.snapshotId, 5))
+    expect(page5).toMatchObject({ requestId: "read-page-five", page: 5, hasMore: true });
+    const page6 = await client.readRoomRepairPage(
+      context, "read-page-six", page0.snapshotId, 5,
+    );
+    expect(page6).toMatchObject({ requestId: "read-page-six", page: 6, hasMore: false });
+    expect(page6.records.map((record) => record.kind)).toEqual(["project-loop"]);
+    await expect(client.readRoomRepairPage(context, "past-end", page0.snapshotId, 6))
       .rejects.toMatchObject({ status: 400, code: "invalid_request" });
     await expect(client.readRoomRepairPage(context, "negative", page0.snapshotId, -1))
       .rejects.toMatchObject({ status: 400, code: "invalid_request" });
@@ -776,7 +781,7 @@ describe("durable materialized snapshot worker", () => {
       "timeline-message", "timeline-message", "message-revision", "attachment", "human-read",
       "agent-judgement", "open-item",
       "open-item-agent-failure", "light-task", "legacy-agent-execution", "calibration",
-      "memory",
+      "memory", "project-loop",
     ]);
     const timelineMessages = page.records.filter((record) =>
       record.kind === "timeline-message").map((record) => record.value);
@@ -954,7 +959,7 @@ describe("durable materialized snapshot worker", () => {
     expect(pages.every((entry) =>
       Buffer.byteLength(canonicalJsonForTest(entry), "utf8") <= maxPageBytes)).toBe(true);
     const records = pages.flatMap((entry) => entry.records);
-    expect(records).toHaveLength(10);
+    expect(records).toHaveLength(11);
     expect(records.filter((record) => record.kind === "message-revision")).toHaveLength(3);
     await client.close();
   });
@@ -1597,11 +1602,12 @@ describe("durable materialized snapshot worker", () => {
       expect(page.mode).toBe("streaming");
       records.push(...page.records);
     }
-    expect(records).toHaveLength(20_010);
+    expect(records).toHaveLength(20_011);
     expect(new Set(records.map((record) => record.kind))).toEqual(new Set([
       "room", "governance", "membership", "timeline-message", "message-revision",
       "human-read", "agent-judgement",
       "open-item", "light-task", "legacy-agent-execution", "calibration", "memory",
+      "project-loop",
     ]));
     expect(page0.snapshotChecksum).toBe(createHash("sha256")
       .update(canonicalJsonForTest({ kind: "room", values: records, version: 1 }), "utf8")
@@ -1796,11 +1802,12 @@ describe("durable materialized snapshot worker", () => {
         });
         records.push(...page.records);
       }
-      expect(records).toHaveLength(20_010);
+      expect(records).toHaveLength(20_011);
       expect(new Set(records.map((record) => record.kind))).toEqual(new Set([
         "room", "governance", "membership", "timeline-message", "message-revision",
         "human-read", "agent-judgement",
         "open-item", "light-task", "legacy-agent-execution", "calibration", "memory",
+        "project-loop",
       ]));
       expect(page0.snapshotChecksum).toBe(createHash("sha256")
         .update(canonicalJsonForTest({ kind: "room", values: records, version: 1 }), "utf8")

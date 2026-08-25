@@ -130,10 +130,33 @@ function requireRoomAccess(database: DatabaseSync, roomId: string, actorId: stri
   if (mutate && room.status === "archived") throw new ProjectLoopAuthorityError("room_archived", "Project Room is archived");
   if (mutate && membership.kind === "agent") {
     const assignment = database.prepare(
-      `SELECT 1 FROM room_agent_assignments
-       WHERE room_id = ? AND agent_actor_id = ? AND status = 'current' AND paused = 0`,
+      `SELECT 1
+       FROM room_agent_assignments AS assignment
+       JOIN agent_profiles AS profile ON profile.id = assignment.profile_id
+         AND profile.actor_id = assignment.agent_actor_id
+       JOIN room_agent_assignment_revisions AS assignment_revision
+         ON assignment_revision.assignment_id = assignment.id
+        AND assignment_revision.revision = assignment.revision
+       JOIN agent_profile_revisions AS profile_revision
+         ON profile_revision.profile_id = profile.id
+        AND profile_revision.revision = profile.revision
+       WHERE assignment.room_id = ? AND assignment.agent_actor_id = ?
+         AND assignment.status = 'current' AND assignment.participation = 'active'
+         AND assignment.paused = 0 AND profile.status = 'enabled'
+         AND assignment_revision.status = assignment.status
+         AND assignment_revision.participation = assignment.participation
+         AND assignment_revision.paused = assignment.paused
+         AND profile_revision.status = profile.status
+         AND EXISTS (SELECT 1 FROM json_each(assignment.capability_subset_json)
+                     WHERE value = 'room.project.read')
+         AND EXISTS (SELECT 1 FROM json_each(assignment.capability_subset_json)
+                     WHERE value = 'room.respond')
+         AND EXISTS (SELECT 1 FROM json_each(profile.capability_ceiling_json)
+                     WHERE value = 'room.project.read')
+         AND EXISTS (SELECT 1 FROM json_each(profile.capability_ceiling_json)
+                     WHERE value = 'room.respond')`,
     ).get(roomId, actorId);
-    if (assignment === undefined) {
+    if (membership.participation !== "active" || assignment === undefined) {
       throw new ProjectLoopAuthorityError("permission_denied", "Agent Project assignment is unavailable");
     }
   }
@@ -155,13 +178,48 @@ function requireAssignableActor(database: DatabaseSync, roomId: string, actorId:
       `SELECT 1 FROM room_agent_assignments AS assignment
        JOIN agent_profiles AS profile ON profile.id = assignment.profile_id
          AND profile.actor_id = assignment.agent_actor_id
+       JOIN room_agent_assignment_revisions AS assignment_revision
+         ON assignment_revision.assignment_id = assignment.id
+        AND assignment_revision.revision = assignment.revision
+       JOIN agent_profile_revisions AS profile_revision
+         ON profile_revision.profile_id = profile.id
+        AND profile_revision.revision = profile.revision
        WHERE assignment.room_id = ? AND assignment.agent_actor_id = ?
          AND assignment.status = 'current' AND assignment.paused = 0
-         AND profile.status = 'enabled'`,
+         AND assignment.participation = 'active' AND profile.status = 'enabled'
+         AND assignment_revision.status = assignment.status
+         AND assignment_revision.participation = assignment.participation
+         AND assignment_revision.paused = assignment.paused
+         AND profile_revision.status = profile.status
+         AND EXISTS (SELECT 1 FROM json_each(assignment.capability_subset_json)
+                     WHERE value = 'room.project.read')
+         AND EXISTS (SELECT 1 FROM json_each(assignment.capability_subset_json)
+                     WHERE value = 'room.respond')
+         AND EXISTS (SELECT 1 FROM json_each(profile.capability_ceiling_json)
+                     WHERE value = 'room.project.read')
+         AND EXISTS (SELECT 1 FROM json_each(profile.capability_ceiling_json)
+                     WHERE value = 'room.respond')`,
     ).get(roomId, actorId);
-    if (assignment === undefined) {
+    if (member.participation !== "active" || assignment === undefined) {
       throw new ProjectLoopAuthorityError("permission_denied", "Project Agent target is unavailable");
     }
+  }
+}
+
+function requireSupersedeAuthority(database: DatabaseSync, roomId: string,
+  humanActorId: string): void {
+  const authority = database.prepare(
+    `SELECT CASE WHEN room.owner_actor_id = ? OR membership.role = 'admin'
+                 THEN 1 ELSE 0 END AS authorized
+     FROM rooms AS room
+     LEFT JOIN room_memberships AS membership
+       ON membership.room_id = room.id AND membership.actor_id = ?
+      AND membership.kind = 'human'
+     WHERE room.id = ?`,
+  ).get(humanActorId, humanActorId, roomId);
+  if (authority?.authorized !== 1) {
+    throw new ProjectLoopAuthorityError("permission_denied",
+      "Only the Room owner or Room admin may supersede a Goal or Decision");
   }
 }
 
@@ -425,6 +483,41 @@ function createConfirmedCheckpointBoundary(database: DatabaseSync,
     input.projectRevision, lifecycle.generation, input.agentActorId, input.now);
 }
 
+function refreshTransferBoundary(database: DatabaseSync, input: Readonly<{
+  roomId: string; transferId: string; revision: number; holderActorId: string;
+  reason: "transfer_acceptance" | "escalation"; dueAt: string; now: string;
+}>): void {
+  database.prepare(
+    `UPDATE project_ball_boundaries SET status = 'superseded', released_at = ?
+     WHERE room_id = ? AND source_kind = 'transfer' AND source_id = ? AND status = 'active'`,
+  ).run(input.now, input.roomId, input.transferId);
+  const lifecycle = database.prepare(
+    "SELECT archive_generation AS generation FROM rooms WHERE id = ?",
+  ).get(input.roomId);
+  if (typeof lifecycle?.generation !== "number") {
+    throw new ProjectLoopAuthorityError("storage_unavailable", "Project lifecycle generation is unavailable");
+  }
+  const boundaryId = `project-ball-${createHash("sha256").update(
+    `${input.roomId}\0transfer\0${input.transferId}\0${input.revision}` +
+      `\0${lifecycle.generation}\0human\0${input.holderActorId}`,
+  ).digest("hex")}`;
+  database.prepare(
+    `INSERT INTO project_ball_boundaries (
+       boundary_id, room_id, project_id, source_kind, source_id, source_revision,
+       lifecycle_generation, holder_kind, holder_actor_id, reason, since, due_at, status
+     ) VALUES (?, ?, ?, 'transfer', ?, ?, ?, 'human', ?, ?, ?, ?, 'active')`,
+  ).run(boundaryId, input.roomId, input.roomId, input.transferId, input.revision,
+    lifecycle.generation, input.holderActorId, input.reason, input.now, input.dueAt);
+}
+
+function releaseTransferBoundary(database: DatabaseSync, roomId: string,
+  transferId: string, now: string): void {
+  database.prepare(
+    `UPDATE project_ball_boundaries SET status = 'superseded', released_at = ?
+     WHERE room_id = ? AND source_kind = 'transfer' AND source_id = ? AND status = 'active'`,
+  ).run(now, roomId, transferId);
+}
+
 function refreshBallBoundary(database: DatabaseSync, fact: ProjectLoopStoredFact, now: string): void {
   database.prepare(
     `UPDATE project_ball_boundaries SET status = 'superseded', released_at = ?
@@ -499,18 +592,7 @@ function createFact(database: DatabaseSync, proposal: ProjectLoopStoredProposal,
       throw new ProjectLoopAuthorityError("revision_conflict", "An active primary Goal already exists");
     }
     if (supersedes !== null) {
-      const authority = database.prepare(
-        `SELECT CASE WHEN room.owner_actor_id = ? OR administrator.human_actor_id IS NOT NULL
-                     THEN 1 ELSE 0 END AS authorized
-         FROM rooms AS room
-         LEFT JOIN tenant_administrators AS administrator
-           ON administrator.human_actor_id = ? AND administrator.status = 'active'
-         WHERE room.id = ?`,
-      ).get(confirmerId, confirmerId, proposal.roomId);
-      if (authority?.authorized !== 1) {
-        throw new ProjectLoopAuthorityError("permission_denied",
-          "Only the Room owner or an active tenant administrator may replace the primary Goal");
-      }
+      requireSupersedeAuthority(database, proposal.roomId, confirmerId);
       const updated = database.prepare(
         `UPDATE project_goals SET status = 'superseded', superseded_by_goal_id = ?, supersede_reason = ?,
            revision = revision + 1, updated_at = ?
@@ -531,6 +613,7 @@ function createFact(database: DatabaseSync, proposal: ProjectLoopStoredProposal,
   } else if (proposal.factKind === "decision") {
     const supersedes = optionalString(payload, "supersedesDecisionId");
     if (supersedes !== null) {
+      requireSupersedeAuthority(database, proposal.roomId, confirmerId);
       const updated = database.prepare(
         `UPDATE project_decisions SET status = 'superseded', superseded_by_decision_id = ?,
            revision = revision + 1, updated_at = ?
@@ -693,6 +776,11 @@ function createProposal(database: DatabaseSync,
 ): ProjectLoopAuthorityResult {
   const principal = actor(operation.context);
   requireRoomAccess(database, operation.command.roomId, principal.actorId, true);
+  if (principal.kind === "agent" && operation.command.factKind !== "goal" &&
+      operation.command.factKind !== "decision") {
+    throw new ProjectLoopAuthorityError("permission_denied",
+      "Agents may only propose a Goal or Decision");
+  }
   validateProjectSource(database, operation.command.source);
   const timestamp = iso(operation.now);
   const current = state(database, operation.command.roomId, timestamp);
@@ -1056,6 +1144,11 @@ function transitionFact(database: DatabaseSync,
       ).run(stringField(payload, "transferProposalId"), fact.roomId, fact.roomId, fact.id,
         fact.id, toKind, toId, ownerKind, ownerId, principalHumanActorId,
         stringField(payload, "reason"), human, timestamp, timestamp, fact.revision, expiresAt);
+      refreshTransferBoundary(database, {
+        roomId: fact.roomId, transferId: stringField(payload, "transferProposalId"),
+        revision: 1, holderActorId: principalHumanActorId,
+        reason: "transfer_acceptance", dueAt: timestamp, now: timestamp,
+      });
     } else if (transition === "next_action.transfer_accept" ||
         transition === "next_action.transfer_reject") {
       const human = humanActorId(operation.context);
@@ -1076,21 +1169,47 @@ function transitionFact(database: DatabaseSync,
       }
       const expired = Date.parse(transfer.expires_at) <= operation.now;
       const accepted = transition === "next_action.transfer_accept";
+      if (accepted && !expired) {
+        requireAssignableActor(database, fact.roomId, transfer.to_owner_actor_id,
+          transfer.to_owner_kind);
+      }
       database.prepare(
         `UPDATE project_transfer_proposals SET status = ?, revision = revision + 1, updated_at = ?,
            resolved_by_human_actor_id = ?, resolved_at = ?, resolution_reason = ? WHERE id = ?`,
       ).run(expired ? "expired" : accepted ? "accepted" : "rejected", timestamp, human, timestamp,
         expired ? "Transfer proposal expired" : accepted ? null : "Human rejected transfer", transferId);
+      releaseTransferBoundary(database, fact.roomId, transferId, timestamp);
+      if (expired) {
+        const escalationHolder = ownerKind === "human" ? ownerId : verifier;
+        if (typeof escalationHolder !== "string") {
+          throw new ProjectLoopAuthorityError("storage_unavailable",
+            "NextAction escalation principal is unavailable");
+        }
+        refreshTransferBoundary(database, {
+          roomId: fact.roomId, transferId, revision: Number(transfer.revision) + 1,
+          holderActorId: escalationHolder, reason: "escalation",
+          dueAt: timestamp, now: timestamp,
+        });
+      }
       if (accepted && !expired) {
         database.prepare(
           `UPDATE project_next_actions SET owner_kind = ?, owner_actor_id = ?,
              verifier_human_actor_id = CASE WHEN ? = 'human' AND verifier_human_actor_id = ?
                THEN NULL ELSE verifier_human_actor_id END,
-             accepted_by_human_actor_id = ?, accepted_at = ?,
+             status = CASE WHEN ? = 'human' THEN 'proposed' ELSE 'accepted' END,
+             accepted_by_human_actor_id = CASE WHEN ? = 'human' THEN NULL ELSE ? END,
+             accepted_at = CASE WHEN ? = 'human' THEN NULL ELSE ? END,
+             delivery_source_kind = NULL, delivery_source_id = NULL,
+             delivery_source_revision = NULL, delivery_source_room_id = NULL,
+             delivery_summary = NULL, verified_by_human_actor_id = NULL,
+             completed_by_human_actor_id = NULL, completed_at = NULL,
+             completion_note = NULL, completion_criteria_json = NULL, status_reason = NULL,
              revision = revision + 1, updated_at = ?
            WHERE id = ? AND room_id = ? AND revision = ?`,
         ).run(transfer.to_owner_kind, transfer.to_owner_actor_id,
-          transfer.to_owner_kind, transfer.to_owner_actor_id, human, timestamp, timestamp,
+          transfer.to_owner_kind, transfer.to_owner_actor_id,
+          transfer.to_owner_kind, transfer.to_owner_kind, human,
+          transfer.to_owner_kind, timestamp, timestamp,
           fact.id, fact.roomId, fact.revision);
         database.prepare(
           `INSERT INTO project_transfer_chain VALUES (?, ?, ?, 'next_action', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -1102,6 +1221,11 @@ function transitionFact(database: DatabaseSync,
       if (principal.actorId !== ownerId) throw new ProjectLoopAuthorityError("permission_denied", "Only the NextAction owner may progress delivery");
     } else if (transition === "next_action.complete") {
       const human = humanActorId(operation.context);
+      if (fact.status === "in_progress" &&
+          (ownerKind !== "human" || typeof verifier === "string")) {
+        throw new ProjectLoopAuthorityError("invalid_transition",
+          "Only a Human-owned NextAction without a verifier may complete before delivery");
+      }
       if ((typeof verifier === "string" && human !== verifier) ||
           (typeof verifier !== "string" && (ownerKind !== "human" || human !== ownerId))) {
         throw new ProjectLoopAuthorityError("permission_denied", "Only the designated Human may complete this NextAction");
@@ -1113,8 +1237,11 @@ function transitionFact(database: DatabaseSync,
       }
     } else if (transition === "next_action.reopen") {
       const human = humanActorId(operation.context);
-      if (typeof verifier !== "string" || human !== verifier) {
-        throw new ProjectLoopAuthorityError("permission_denied", "Only the verifier may reopen this NextAction");
+      const reopenAuthority = typeof verifier === "string" ? verifier
+        : ownerKind === "human" ? ownerId : null;
+      if (human !== reopenAuthority) {
+        throw new ProjectLoopAuthorityError("permission_denied",
+          "Only the designated Human may reopen this NextAction");
       }
     } else if (transition === "next_action.reject" || transition === "next_action.cancel") {
       const human = humanActorId(operation.context);
@@ -1145,30 +1272,43 @@ function transitionFact(database: DatabaseSync,
       `UPDATE project_next_actions SET status = ?,
          accepted_by_human_actor_id = CASE WHEN ? = 'next_action.accept' THEN ? ELSE accepted_by_human_actor_id END,
          accepted_at = CASE WHEN ? = 'next_action.accept' THEN ? ELSE accepted_at END,
-         delivery_source_kind = CASE WHEN ? = 'next_action.deliver' THEN ? ELSE delivery_source_kind END,
-         delivery_source_id = CASE WHEN ? = 'next_action.deliver' THEN ? ELSE delivery_source_id END,
-         delivery_source_revision = CASE WHEN ? = 'next_action.deliver' THEN ? ELSE delivery_source_revision END,
-         delivery_source_room_id = CASE WHEN ? = 'next_action.deliver' THEN ? ELSE delivery_source_room_id END,
-         delivery_summary = CASE WHEN ? = 'next_action.deliver' THEN ? ELSE delivery_summary END,
-         verified_by_human_actor_id = CASE WHEN ? = 'next_action.complete' THEN ? ELSE verified_by_human_actor_id END,
-         completed_by_human_actor_id = CASE WHEN ? = 'next_action.complete' THEN ? ELSE completed_by_human_actor_id END,
-         completed_at = CASE WHEN ? = 'next_action.complete' THEN ? ELSE completed_at END,
-         completion_note = CASE WHEN ? = 'next_action.complete' THEN ? ELSE completion_note END,
-         completion_criteria_json = CASE WHEN ? = 'next_action.complete' THEN ? ELSE completion_criteria_json END,
+         delivery_source_kind = CASE WHEN ? = 'next_action.reopen' THEN NULL
+           WHEN ? = 'next_action.deliver' THEN ? ELSE delivery_source_kind END,
+         delivery_source_id = CASE WHEN ? = 'next_action.reopen' THEN NULL
+           WHEN ? = 'next_action.deliver' THEN ? ELSE delivery_source_id END,
+         delivery_source_revision = CASE WHEN ? = 'next_action.reopen' THEN NULL
+           WHEN ? = 'next_action.deliver' THEN ? ELSE delivery_source_revision END,
+         delivery_source_room_id = CASE WHEN ? = 'next_action.reopen' THEN NULL
+           WHEN ? = 'next_action.deliver' THEN ? ELSE delivery_source_room_id END,
+         delivery_summary = CASE WHEN ? = 'next_action.reopen' THEN NULL
+           WHEN ? = 'next_action.deliver' THEN ? ELSE delivery_summary END,
+         verified_by_human_actor_id = CASE WHEN ? = 'next_action.reopen' THEN NULL
+           WHEN ? = 'next_action.complete' THEN ? ELSE verified_by_human_actor_id END,
+         completed_by_human_actor_id = CASE WHEN ? = 'next_action.reopen' THEN NULL
+           WHEN ? = 'next_action.complete' THEN ? ELSE completed_by_human_actor_id END,
+         completed_at = CASE WHEN ? = 'next_action.reopen' THEN NULL
+           WHEN ? = 'next_action.complete' THEN ? ELSE completed_at END,
+         completion_note = CASE WHEN ? = 'next_action.reopen' THEN NULL
+           WHEN ? = 'next_action.complete' THEN ? ELSE completion_note END,
+         completion_criteria_json = CASE WHEN ? = 'next_action.reopen' THEN NULL
+           WHEN ? = 'next_action.complete' THEN ? ELSE completion_criteria_json END,
          status_reason = CASE WHEN ? IN ('next_action.reject','next_action.cancel') THEN ?
            WHEN ? = 'next_action.reopen' THEN NULL ELSE status_reason END,
          revision = revision + 1, updated_at = ? WHERE id = ? AND room_id = ? AND revision = ?`,
     ).run(nextStatus, transition,
       operation.context.kind === "human" ? operation.context.principal.actorId : null,
       transition, timestamp,
-      transition, deliverySource === null ? null : stringField(deliverySource, "kind"),
-      transition, deliverySource === null ? null : stringField(deliverySource, "sourceId"),
-      transition, deliverySource === null ? null : deliverySource.sourceRevision as number,
-      transition, deliverySource === null ? null : stringField(deliverySource, "roomId"),
-      transition, transition === "next_action.deliver" ? stringField(payload, "summary") : null,
-      transition, operation.context.kind === "human" ? operation.context.principal.actorId : null,
-      transition, operation.context.kind === "human" ? operation.context.principal.actorId : null,
-      transition, timestamp, transition, completionNote, transition, completionCriteria,
+      transition, transition, deliverySource === null ? null : stringField(deliverySource, "kind"),
+      transition, transition, deliverySource === null ? null : stringField(deliverySource, "sourceId"),
+      transition, transition, deliverySource === null ? null : deliverySource.sourceRevision as number,
+      transition, transition, deliverySource === null ? null : stringField(deliverySource, "roomId"),
+      transition, transition, transition === "next_action.deliver" ? stringField(payload, "summary") : null,
+      transition, transition,
+      operation.context.kind === "human" ? operation.context.principal.actorId : null,
+      transition, transition,
+      operation.context.kind === "human" ? operation.context.principal.actorId : null,
+      transition, transition, timestamp, transition, transition, completionNote,
+      transition, transition, completionCriteria,
       transition, terminalReason, transition,
       timestamp, fact.id, fact.roomId, fact.revision);
     }
@@ -1201,6 +1341,11 @@ function transitionFact(database: DatabaseSync,
         operation.command.factKind, fact.id, toKind, toId, ownerKind, ownerId,
         principalHumanActorId, stringField(payload, "reason"),
         principal.actorId, timestamp, timestamp, fact.revision, expiresAt);
+      refreshTransferBoundary(database, {
+        roomId: fact.roomId, transferId: stringField(payload, "transferProposalId"),
+        revision: 1, holderActorId: principalHumanActorId,
+        reason: "transfer_acceptance", dueAt: timestamp, now: timestamp,
+      });
     } else if (transition === "obstacle.transfer_accept" || transition === "obstacle.transfer_reject") {
       const human = humanActorId(operation.context);
       const transferId = stringField(payload, "transferProposalId");
@@ -1225,6 +1370,12 @@ function transitionFact(database: DatabaseSync,
            resolved_by_human_actor_id = ?, resolved_at = ?, resolution_reason = ? WHERE id = ?`,
       ).run(expired ? "expired" : accepted ? "accepted" : "rejected", timestamp, human, timestamp,
         expired ? "Transfer proposal expired" : accepted ? null : "Human rejected transfer", transferId);
+      releaseTransferBoundary(database, fact.roomId, transferId, timestamp);
+      if (expired) refreshTransferBoundary(database, {
+        roomId: fact.roomId, transferId, revision: Number(transfer.revision) + 1,
+        holderActorId: ownerId, reason: "escalation",
+        dueAt: timestamp, now: timestamp,
+      });
       if (accepted && !expired) {
         database.prepare(
           `UPDATE project_obstacles SET owner_kind = ?, owner_actor_id = ?, status = 'open',
@@ -1419,6 +1570,104 @@ export function claimDueProjectRemindersDatabaseCommand(database: DatabaseSync, 
     if (error instanceof ProjectLoopAuthorityError) throw error;
     throw new ProjectLoopAuthorityError("storage_unavailable", "Project due claim failed");
   }
+}
+
+/** Advances business timers while the caller owns the AuthorityWorker transaction. */
+export function advanceProjectLoopTimedTransitionsInTransaction(database: DatabaseSync, input: {
+  now: string; limit: number;
+}): Readonly<{ reopenedReviews: number; expiredTransfers: number }> {
+  if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 256 ||
+      !Number.isFinite(Date.parse(input.now)) || new Date(Date.parse(input.now)).toISOString() !== input.now) {
+    throw new TypeError("Project timed transition scan is invalid");
+  }
+  let reopenedReviews = 0;
+  let expiredTransfers = 0;
+  const reviews = database.prepare(
+    `SELECT obstacle.id, obstacle.room_id AS roomId, obstacle.kind,
+            obstacle.revision, obstacle.owner_kind AS ownerKind,
+            obstacle.owner_actor_id AS ownerActorId
+     FROM project_obstacles AS obstacle
+     JOIN rooms AS room ON room.id = obstacle.room_id
+     WHERE obstacle.status = 'deferred' AND obstacle.review_at IS NOT NULL
+       AND obstacle.review_at <= ? AND room.status = 'active'
+     ORDER BY obstacle.review_at, obstacle.room_id, obstacle.id LIMIT ?`,
+  ).all(input.now, input.limit);
+  for (const row of reviews) {
+    if (typeof row.id !== "string" || typeof row.roomId !== "string" ||
+        (row.kind !== "blocker" && row.kind !== "open_question") ||
+        typeof row.revision !== "number" ||
+        (row.ownerKind !== "human" && row.ownerKind !== "agent") ||
+        typeof row.ownerActorId !== "string") {
+      throw new ProjectLoopAuthorityError("storage_unavailable", "Project review timer row is corrupt");
+    }
+    const fact = readFact(database, row.kind, row.id, row.roomId);
+    const changed = database.prepare(
+      `UPDATE project_obstacles SET status = 'open', review_at = NULL,
+         status_reason = NULL, revision = revision + 1, updated_at = ?
+       WHERE id = ? AND room_id = ? AND revision = ? AND status = 'deferred'`,
+    ).run(input.now, row.id, row.roomId, row.revision);
+    if (changed.changes !== 1) continue;
+    database.prepare(
+      `UPDATE project_ball_boundaries SET status = 'superseded', released_at = ?
+       WHERE room_id = ? AND source_kind = 'review' AND source_id = ?
+         AND source_revision = ? AND status = 'active'`,
+    ).run(input.now, row.roomId, row.id, row.revision);
+    const updated = readFact(database, row.kind, row.id, row.roomId);
+    refreshBallBoundary(database, updated, input.now);
+    const current = state(database, row.roomId, input.now);
+    appendEvent(database, { roomId: row.roomId, eventSeq: current.revision + 1,
+      eventType: "fact.transitioned", factKind: row.kind, factId: row.id,
+      factRevision: updated.revision, actorKind: row.ownerKind, actorId: row.ownerActorId,
+      source: fact.source, occurredAt: input.now,
+      payload: Object.freeze({ transition: "review_due", reason: "Review boundary reached" }) });
+    writeProjectLoopCheckpointInTransaction(database, { roomId: row.roomId,
+      projectRevision: current.revision + 1, occurredAt: input.now });
+    reopenedReviews += 1;
+  }
+  const remaining = input.limit - reopenedReviews;
+  if (remaining > 0) {
+    const transfers = database.prepare(
+      `SELECT proposal.id, proposal.room_id AS roomId, proposal.revision,
+              proposal.subject_kind AS subjectKind, proposal.subject_id AS subjectId,
+              proposal.principal_human_actor_id AS principalActorId
+       FROM project_transfer_proposals AS proposal
+       JOIN rooms AS room ON room.id = proposal.room_id
+       WHERE proposal.status = 'pending' AND proposal.expires_at IS NOT NULL
+         AND proposal.expires_at <= ? AND room.status = 'active'
+       ORDER BY proposal.expires_at, proposal.room_id, proposal.id LIMIT ?`,
+    ).all(input.now, remaining);
+    for (const row of transfers) {
+      if (typeof row.id !== "string" || typeof row.roomId !== "string" ||
+          typeof row.revision !== "number" ||
+          (row.subjectKind !== "next_action" && row.subjectKind !== "blocker" &&
+            row.subjectKind !== "open_question") || typeof row.subjectId !== "string" ||
+          typeof row.principalActorId !== "string") {
+        throw new ProjectLoopAuthorityError("storage_unavailable", "Project transfer timer row is corrupt");
+      }
+      const fact = readFact(database, row.subjectKind, row.subjectId, row.roomId);
+      const changed = database.prepare(
+        `UPDATE project_transfer_proposals SET status = 'expired', revision = revision + 1,
+           updated_at = ?, resolved_by_human_actor_id = NULL, resolved_at = ?,
+           resolution_reason = 'Transfer proposal expired'
+         WHERE id = ? AND room_id = ? AND revision = ? AND status = 'pending'`,
+      ).run(input.now, input.now, row.id, row.roomId, row.revision);
+      if (changed.changes !== 1) continue;
+      releaseTransferBoundary(database, row.roomId, row.id, input.now);
+      refreshTransferBoundary(database, { roomId: row.roomId, transferId: row.id,
+        revision: row.revision + 1, holderActorId: row.principalActorId,
+        reason: "escalation", dueAt: input.now, now: input.now });
+      const current = state(database, row.roomId, input.now);
+      appendEvent(database, { roomId: row.roomId, eventSeq: current.revision + 1,
+        eventType: "fact.transitioned", factKind: row.subjectKind, factId: row.subjectId,
+        factRevision: fact.revision, actorKind: "human", actorId: row.principalActorId,
+        source: fact.source, occurredAt: input.now,
+        payload: Object.freeze({ transferProposalId: row.id, transition: "transfer_expired" }) });
+      writeProjectLoopCheckpointInTransaction(database, { roomId: row.roomId,
+        projectRevision: current.revision + 1, occurredAt: input.now });
+      expiredTransfers += 1;
+    }
+  }
+  return Object.freeze({ reopenedReviews, expiredTransfers });
 }
 
 function replay(database: DatabaseSync, operation: Exclude<ProjectLoopAuthorityOperation,

@@ -90,7 +90,7 @@ function seedStructuredDirectIntent(database: DatabaseSync): {
 
 describe("authority SQLite v21 immutable direct invocation bindings", () => {
   it("upgrades fresh and every immutable v1-v20 schema without rewriting history", () => {
-    expect(AUTHORITY_SCHEMA_VERSION).toBe(23);
+    expect(AUTHORITY_SCHEMA_VERSION).toBe(24);
     for (let version = 1; version <= 20; version += 1) {
       withDatabase((database) => {
         migrateAuthorityDatabaseToHistoricalVersionForTest(database, version);
@@ -98,7 +98,7 @@ describe("authority SQLite v21 immutable direct invocation bindings", () => {
           "SELECT version, name, checksum FROM schema_migrations ORDER BY version",
         ).all();
         migrateAuthorityDatabase(database);
-        expect(readSchemaVersion(database)).toBe(23);
+        expect(readSchemaVersion(database)).toBe(24);
         expect(database.prepare(
           "SELECT version, name, checksum FROM schema_migrations WHERE version <= ? ORDER BY version",
         ).all(version)).toEqual(history);

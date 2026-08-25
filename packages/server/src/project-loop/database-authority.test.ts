@@ -40,11 +40,13 @@ function withDatabase(operation: (database: DatabaseSync) => void): void {
     database.exec(`
       INSERT INTO actors (id, kind, display_name) VALUES
         ('human-owner', 'human', 'Owner'),
+        ('human-admin', 'human', 'Room Admin'),
         ('human-member', 'human', 'Member'),
         ('human-outsider', 'human', 'Outsider'),
         ('agent-member', 'agent', 'Agent');
       INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq) VALUES
-        ('identity', 'human-owner', 0, 1), ('identity', 'human-member', 0, 1),
+        ('identity', 'human-owner', 0, 1), ('identity', 'human-admin', 0, 1),
+        ('identity', 'human-member', 0, 1),
         ('identity', 'human-outsider', 0, 1), ('identity', 'agent-member', 0, 1),
         ('room', 'room-project', 0, 1), ('room', 'room-other', 0, 1);
       INSERT INTO rooms (id, name, status, created_at, owner_actor_id) VALUES
@@ -55,6 +57,7 @@ function withDatabase(operation: (database: DatabaseSync) => void): void {
         joined_at, configured_at, access_revision
       ) VALUES
         ('room-project', 'human-owner', 'human', 'owner', NULL, '[]', CURRENT_TIMESTAMP, NULL, 1),
+        ('room-project', 'human-admin', 'human', 'admin', NULL, '[]', CURRENT_TIMESTAMP, NULL, 1),
         ('room-project', 'human-member', 'human', 'member', NULL, '[]', CURRENT_TIMESTAMP, NULL, 1),
         ('room-project', 'agent-member', 'agent', NULL, 'active', '[]', NULL, CURRENT_TIMESTAMP, 1),
         ('room-other', 'human-owner', 'human', 'owner', NULL, '[]', CURRENT_TIMESTAMP, NULL, 1);
@@ -88,6 +91,20 @@ function withDatabase(operation: (database: DatabaseSync) => void): void {
         'Deliver Project work', '2026-08-25T07:00:00.000Z',
         '2026-08-25T07:00:00.000Z', NULL, 'room_command'
       );
+      INSERT INTO agent_profile_revisions (
+        profile_id, revision, actor_id, display_name, global_responsibility, status,
+        capability_ceiling_json, tool_ceiling_json, changed_by_human_actor_id, changed_at, operation
+      ) SELECT id, revision, actor_id, display_name, global_responsibility, status,
+          capability_ceiling_json, tool_ceiling_json, NULL, updated_at, 'static_bootstrap'
+        FROM agent_profiles WHERE id = 'profile-agent-member';
+      INSERT INTO room_agent_assignment_revisions (
+        assignment_id, revision, room_id, profile_id, agent_actor_id, room_responsibility,
+        status, participation, paused, capability_subset_json, tool_subset_json,
+        changed_by_human_actor_id, changed_at, operation
+      ) SELECT id, revision, room_id, profile_id, agent_actor_id, room_responsibility,
+          status, participation, paused, capability_subset_json, tool_subset_json,
+          NULL, updated_at, 'legacy_migration'
+        FROM room_agent_assignments WHERE id = 'assignment-agent-member';
     `);
     operation(database);
   } finally {
@@ -506,6 +523,130 @@ describe("Project Loop database authority", () => {
     });
   });
 
+  it("allows only the Room owner/admin to supersede a Goal or Decision", () => {
+    withDatabase((database) => {
+      executeProjectLoopAuthorityOperation(database, proposalCreate());
+      executeProjectLoopAuthorityOperation(database, resolveFactProposal("proposal-goal", 1));
+      executeProjectLoopAuthorityOperation(database, {
+        ...proposalCreate("member-goal-replacement"),
+        context: humanContext("member-goal-replacement", "human-member"),
+        command: { ...proposalCreate().command, proposalId: "proposal-member-goal",
+          factId: "goal-member", baseRevision: 2, principalActorId: "human-member",
+          payload: { title: "Member Goal", description: "No governance authority",
+            supersedesGoalId: "goal-primary", reason: "Ordinary member attempted replacement" } },
+      });
+      expect(() => executeProjectLoopAuthorityOperation(database, {
+        ...resolveFactProposal("proposal-member-goal", 1),
+        context: humanContext("member-cannot-supersede-goal", "human-member"),
+      })).toThrowError(expect.objectContaining({ code: "permission_denied" }));
+      executeProjectLoopAuthorityOperation(database, {
+        ...resolveFactProposal("proposal-member-goal", 1, "rejected"),
+        context: humanContext("member-rejects-goal", "human-member"),
+      });
+      executeProjectLoopAuthorityOperation(database, {
+        ...proposalCreate("admin-goal-replacement"),
+        context: humanContext("admin-goal-replacement", "human-admin"),
+        command: { ...proposalCreate().command, proposalId: "proposal-admin-goal",
+          factId: "goal-admin", baseRevision: 4, principalActorId: "human-admin",
+          payload: { title: "Admin Goal", description: "Room governance",
+            supersedesGoalId: "goal-primary", reason: "Room Admin selected the replacement" } },
+      });
+      executeProjectLoopAuthorityOperation(database, {
+        ...resolveFactProposal("proposal-admin-goal", 1),
+        context: humanContext("admin-can-supersede-goal", "human-admin"),
+      });
+
+      executeProjectLoopAuthorityOperation(database, createFactProposal({
+        proposalId: "decision-governance-one", factKind: "decision", factId: "decision-governance-one",
+        baseRevision: 6, payload: { title: "Choice A", rationale: "Initial choice" },
+      }));
+      executeProjectLoopAuthorityOperation(database,
+        resolveFactProposal("decision-governance-one", 1));
+      executeProjectLoopAuthorityOperation(database, {
+        ...createFactProposal({ proposalId: "decision-governance-two", factKind: "decision",
+          factId: "decision-governance-member", baseRevision: 8,
+          payload: { title: "Choice B", rationale: "Replacement choice",
+            supersedesDecisionId: "decision-governance-one" } }),
+        context: humanContext("member-proposes-decision-replacement", "human-member"),
+        command: { ...createFactProposal({ proposalId: "decision-governance-two", factKind: "decision",
+          factId: "decision-governance-member", baseRevision: 8,
+          payload: { title: "Choice B", rationale: "Replacement choice",
+            supersedesDecisionId: "decision-governance-one" } }).command,
+          principalActorId: "human-member" },
+      });
+      expect(() => executeProjectLoopAuthorityOperation(database, {
+        ...resolveFactProposal("decision-governance-two", 1),
+        context: humanContext("member-cannot-supersede-decision", "human-member"),
+      })).toThrowError(expect.objectContaining({ code: "permission_denied" }));
+      executeProjectLoopAuthorityOperation(database, {
+        ...resolveFactProposal("decision-governance-two", 1, "rejected"),
+        context: humanContext("member-rejects-decision", "human-member"),
+      });
+      executeProjectLoopAuthorityOperation(database, {
+        ...createFactProposal({ proposalId: "decision-governance-admin", factKind: "decision",
+          factId: "decision-governance-two", baseRevision: 10,
+          payload: { title: "Choice B", rationale: "Replacement choice",
+            supersedesDecisionId: "decision-governance-one" } }),
+        context: humanContext("admin-proposes-decision-replacement", "human-admin"),
+        command: { ...createFactProposal({ proposalId: "decision-governance-admin", factKind: "decision",
+          factId: "decision-governance-two", baseRevision: 10,
+          payload: { title: "Choice B", rationale: "Replacement choice",
+            supersedesDecisionId: "decision-governance-one" } }).command,
+          principalActorId: "human-admin" },
+      });
+      executeProjectLoopAuthorityOperation(database, {
+        ...resolveFactProposal("decision-governance-admin", 1),
+        context: humanContext("admin-can-supersede-decision", "human-admin"),
+      });
+      expect(database.prepare(
+        "SELECT status FROM project_decisions WHERE id = 'decision-governance-two'",
+      ).get()).toEqual({ status: "confirmed" });
+    });
+  });
+
+  it("limits Agent proposals and mutations to a fully eligible Project assignment", () => {
+    withDatabase((database) => {
+      const agentGoal = {
+        ...proposalCreate("agent-goal"), context: agentContext("agent-goal"),
+        command: { ...proposalCreate().command, proposalId: "proposal-agent-goal",
+          factId: "goal-agent", principalActorId: "human-owner" },
+      } satisfies ProjectLoopAuthorityOperation;
+      executeProjectLoopAuthorityOperation(database, agentGoal);
+
+      const agentRequest = {
+        ...createFactProposal({ proposalId: "agent-request", factKind: "request",
+          factId: "request-agent", baseRevision: 1,
+          payload: { title: "No", description: "Agents cannot create Requests",
+            targetHumanActorId: "human-member", acceptanceMode: "open_question",
+            linkedFactKind: null, linkedFactId: null,
+            responsibility: { kind: "open_question", responsibilityId: "question-agent",
+              title: "No", description: "No", owner: { kind: "human", actorId: "human-member" },
+              dueAt: null, impact: "No", question: "No" } } }),
+        context: agentContext("agent-request"),
+        command: { ...createFactProposal({ proposalId: "agent-request", factKind: "request",
+          factId: "request-agent", baseRevision: 1,
+          payload: { title: "No", description: "Agents cannot create Requests",
+            targetHumanActorId: "human-member", acceptanceMode: "open_question",
+            linkedFactKind: null, linkedFactId: null,
+            responsibility: { kind: "open_question", responsibilityId: "question-agent",
+              title: "No", description: "No", owner: { kind: "human", actorId: "human-member" },
+              dueAt: null, impact: "No", question: "No" } } }).command,
+          principalActorId: "human-owner" },
+      } satisfies ProjectLoopAuthorityOperation;
+      expect(() => executeProjectLoopAuthorityOperation(database, agentRequest))
+        .toThrowError(expect.objectContaining({ code: "permission_denied" }));
+
+      database.prepare(
+        "UPDATE room_agent_assignments SET participation = 'on-mention', revision = revision + 1 WHERE id = 'assignment-agent-member'",
+      ).run();
+      expect(() => executeProjectLoopAuthorityOperation(database, {
+        ...agentGoal, context: agentContext("agent-ineligible"),
+        command: { ...agentGoal.command, proposalId: "proposal-agent-ineligible",
+          factId: "goal-agent-ineligible", baseRevision: 1 },
+      })).toThrowError(expect.objectContaining({ code: "permission_denied" }));
+    });
+  });
+
   it("lets only the current Request target transfer/respond and creates one linked responsibility atomically", () => {
     withDatabase((database) => {
       executeProjectLoopAuthorityOperation(database, createFactProposal({
@@ -659,6 +800,59 @@ describe("Project Loop database authority", () => {
     });
   });
 
+  it("enforces the Human NextAction completion/verifier contract and owner reopen", () => {
+    withDatabase((database) => {
+      executeProjectLoopAuthorityOperation(database, createFactProposal({
+        proposalId: "human-action-proposal", factKind: "next_action", factId: "human-action",
+        baseRevision: 0, payload: { title: "Human action", description: "Direct completion",
+          ownerKind: "human", ownerActorId: "human-member", verifierHumanActorId: null,
+          dueAt: null, deliverable: "Result", acceptanceCriteria: [] },
+      }));
+      executeProjectLoopAuthorityOperation(database, resolveFactProposal("human-action-proposal", 1));
+      const transition = (key: string, actorId: string, expectedRevision: number,
+        name: "next_action.accept" | "next_action.start" | "next_action.complete" | "next_action.reopen") =>
+        executeProjectLoopAuthorityOperation(database, {
+          type: "project-loop.fact.transition", context: humanContext(key, actorId),
+          command: { roomId: "room-project", projectId: "room-project", factKind: "next_action",
+            factId: "human-action", expectedRevision, transition: name,
+            payload: name === "next_action.complete" ? { completionNote: "Done", criteriaSnapshot: [] }
+              : name === "next_action.reopen" ? { reason: "More work is required" } : {} },
+          now: NOW + expectedRevision,
+        });
+      transition("accept-human-action", "human-member", 1, "next_action.accept");
+      transition("start-human-action", "human-member", 2, "next_action.start");
+      transition("complete-human-action", "human-member", 3, "next_action.complete");
+      transition("reopen-human-action", "human-member", 4, "next_action.reopen");
+      expect(database.prepare(
+        "SELECT status, status_reason AS reason FROM project_next_actions WHERE id = 'human-action'",
+      ).get()).toEqual({ status: "in_progress", reason: null });
+
+      executeProjectLoopAuthorityOperation(database, createFactProposal({
+        proposalId: "verified-action-proposal", factKind: "next_action", factId: "verified-action",
+        baseRevision: 6, payload: { title: "Verified action", description: "Needs verifier",
+          ownerKind: "human", ownerActorId: "human-member", verifierHumanActorId: "human-owner",
+          dueAt: null, deliverable: "Result", acceptanceCriteria: [] },
+      }));
+      executeProjectLoopAuthorityOperation(database, resolveFactProposal("verified-action-proposal", 1));
+      for (const [key, revision, name] of [
+        ["accept-verified", 1, "next_action.accept"],
+        ["start-verified", 2, "next_action.start"],
+      ] as const) executeProjectLoopAuthorityOperation(database, {
+        type: "project-loop.fact.transition", context: humanContext(key, "human-member"),
+        command: { roomId: "room-project", projectId: "room-project", factKind: "next_action",
+          factId: "verified-action", expectedRevision: revision, transition: name, payload: {} },
+        now: NOW + revision,
+      });
+      expect(() => executeProjectLoopAuthorityOperation(database, {
+        type: "project-loop.fact.transition", context: humanContext("premature-verify"),
+        command: { roomId: "room-project", projectId: "room-project", factKind: "next_action",
+          factId: "verified-action", expectedRevision: 3, transition: "next_action.complete",
+          payload: { completionNote: "Cannot skip delivery", criteriaSnapshot: [] } },
+        now: NOW + 3,
+      })).toThrowError(expect.objectContaining({ code: "invalid_transition" }));
+    });
+  });
+
   it("moves a NextAction owner and Ball only after the exact Human accepts its TransferProposal", () => {
     withDatabase((database) => {
       executeProjectLoopAuthorityOperation(database, createFactProposal({
@@ -719,6 +913,12 @@ describe("Project Loop database authority", () => {
 
       transition("propose-action-transfer-expired", "human-member", 2,
         "next_action.transfer_propose", "transfer-action-expired");
+      expect(database.prepare(
+        `SELECT holder_actor_id AS holder, reason
+         FROM project_ball_boundaries
+         WHERE source_kind = 'transfer' AND source_id = 'transfer-action-expired'
+           AND status = 'active'`,
+      ).get()).toEqual({ holder: "human-owner", reason: "transfer_acceptance" });
       transition("accept-action-transfer-expired", "human-owner", 2,
         "next_action.transfer_accept", "transfer-action-expired", NOW + 2 * 86_400_000);
       expect(database.prepare(
@@ -726,14 +926,21 @@ describe("Project Loop database authority", () => {
          FROM project_next_actions AS action JOIN project_transfer_proposals AS proposal
            ON proposal.id = 'transfer-action-expired' WHERE action.id = 'transfer-action'`,
       ).get()).toEqual({ revision: 2, owner: "human-member", status: "expired" });
+      expect(database.prepare(
+        `SELECT holder_actor_id AS holder, reason
+         FROM project_ball_boundaries
+         WHERE source_kind = 'transfer' AND source_id = 'transfer-action-expired'
+           AND status = 'active'`,
+      ).get()).toEqual({ holder: "human-member", reason: "escalation" });
 
       transition("propose-action-transfer", "human-member", 2,
         "next_action.transfer_propose", "transfer-action-accepted");
       transition("accept-action-transfer", "human-owner", 2,
         "next_action.transfer_accept", "transfer-action-accepted");
       expect(database.prepare(
-        "SELECT revision, owner_actor_id AS owner FROM project_next_actions WHERE id = 'transfer-action'",
-      ).get()).toEqual({ revision: 3, owner: "human-owner" });
+        `SELECT revision, owner_actor_id AS owner, status, accepted_by_human_actor_id AS acceptedBy
+         FROM project_next_actions WHERE id = 'transfer-action'`,
+      ).get()).toEqual({ revision: 3, owner: "human-owner", status: "proposed", acceptedBy: null });
       expect(database.prepare(
         `SELECT from_owner_actor_id AS oldOwner, to_owner_actor_id AS newOwner,
                 accepted_by_human_actor_id AS acceptedBy
@@ -744,6 +951,16 @@ describe("Project Loop database authority", () => {
         `SELECT holder_actor_id AS holder, source_revision AS revision
          FROM project_ball_boundaries WHERE source_id = 'transfer-action' AND status = 'active'`,
       ).get()).toEqual({ holder: "human-owner", revision: 3 });
+      executeProjectLoopAuthorityOperation(database, {
+        type: "project-loop.fact.transition",
+        context: humanContext("new-owner-accepts", "human-owner"),
+        command: { roomId: "room-project", projectId: "room-project", factKind: "next_action",
+          factId: "transfer-action", expectedRevision: 3, transition: "next_action.accept", payload: {} },
+        now: NOW + 11,
+      });
+      expect(database.prepare(
+        "SELECT revision, status FROM project_next_actions WHERE id = 'transfer-action'",
+      ).get()).toEqual({ revision: 4, status: "accepted" });
     });
   });
 });

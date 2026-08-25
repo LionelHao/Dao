@@ -79,7 +79,18 @@ interface TransferProposalRow {
   readonly subjectId: unknown;
   readonly toOwnerKind: unknown;
   readonly toOwnerActorId: unknown;
+  readonly principalHumanActorId: unknown;
   readonly status: unknown;
+}
+
+interface ProjectConfirmationRow {
+  readonly id: unknown;
+  readonly roomId: unknown;
+  readonly sourceRoomId: unknown;
+  readonly sourceId: unknown;
+  readonly revision: unknown;
+  readonly principalHumanActorId: unknown;
+  readonly state: unknown;
 }
 
 class DepartureCollectionError extends Error {
@@ -257,6 +268,7 @@ function collectRequests(
             target_human_actor_id AS targetHumanActorId, status
      FROM project_requests
      WHERE room_id = ? AND status = 'pending_acceptance'
+       AND source_kind <> 'legacy_v14'
        AND (requester_human_actor_id = ? OR target_human_actor_id = ?)
      ORDER BY id`,
   ).all(roomId, targetHumanActorId, targetHumanActorId) as unknown as readonly RequestRow[];
@@ -315,10 +327,12 @@ function collectNextActions(
             verifier_human_actor_id AS verifierHumanActorId, status
      FROM project_next_actions
      WHERE room_id = ?
+       AND source_kind <> 'legacy_v14'
        AND (
          (owner_kind = 'human' AND owner_actor_id = ?
           AND status IN ('proposed', 'accepted', 'in_progress'))
-         OR (verifier_human_actor_id = ? AND status = 'delivered')
+         OR (verifier_human_actor_id = ?
+             AND status IN ('proposed', 'accepted', 'in_progress', 'delivered'))
        )
      ORDER BY id`,
   ).all(roomId, targetHumanActorId, targetHumanActorId) as unknown as readonly NextActionRow[];
@@ -352,15 +366,18 @@ function collectNextActions(
         responsibilityRole: "owner",
       }));
     }
-    if (row.verifierHumanActorId === targetHumanActorId && row.status === "delivered") {
+    if (row.verifierHumanActorId === targetHumanActorId &&
+      (row.status === "proposed" || row.status === "accepted" ||
+        row.status === "in_progress" || row.status === "delivered")) {
       conflicts.push(conflict({
         roomId,
         targetHumanActorId,
         subjectId: row.id,
         kind: "next_action",
         title: "project.next_action.pending_verification",
-        state: "pending_verification",
-        allowedResolutions: ["complete", "transfer", "escalate"],
+        state: row.status === "delivered" ? "pending_verification" : row.status,
+        allowedResolutions: row.status === "delivered"
+          ? ["complete", "transfer", "escalate"] : ["transfer", "escalate"],
         sourceRoomId: row.sourceRoomId,
         sourceId: row.sourceId,
         revision: row.revision,
@@ -381,6 +398,7 @@ function collectObstacles(
             revision, kind, owner_kind AS ownerKind, owner_actor_id AS ownerActorId, status
      FROM project_obstacles
      WHERE room_id = ? AND owner_kind = 'human' AND owner_actor_id = ?
+       AND source_kind <> 'legacy_v14'
        AND status IN ('open', 'deferred', 'cannot_answer')
      ORDER BY kind, id`,
   ).all(roomId, targetHumanActorId) as unknown as readonly ObstacleRow[];
@@ -420,16 +438,21 @@ function collectTransferAcceptances(
   const rows = database.prepare(
     `SELECT id, room_id AS roomId, source_room_id AS sourceRoomId, source_id AS sourceId,
             revision, subject_kind AS subjectKind, subject_id AS subjectId,
-            to_owner_kind AS toOwnerKind, to_owner_actor_id AS toOwnerActorId, status
+            to_owner_kind AS toOwnerKind, to_owner_actor_id AS toOwnerActorId,
+            principal_human_actor_id AS principalHumanActorId, status
      FROM project_transfer_proposals
-     WHERE room_id = ? AND to_owner_kind = 'human' AND to_owner_actor_id = ?
+     WHERE room_id = ? AND source_kind <> 'legacy_v14'
+       AND ((to_owner_kind = 'human' AND to_owner_actor_id = ?)
+            OR (to_owner_kind = 'agent' AND principal_human_actor_id = ?))
        AND status = 'pending'
      ORDER BY id`,
-  ).all(roomId, targetHumanActorId) as unknown as readonly TransferProposalRow[];
+  ).all(roomId, targetHumanActorId, targetHumanActorId) as unknown as readonly TransferProposalRow[];
 
   return rows.map((row) => {
-    if (row.roomId !== roomId || row.toOwnerKind !== "human" ||
-      row.toOwnerActorId !== targetHumanActorId || row.status !== "pending" ||
+    if (row.roomId !== roomId ||
+      (row.toOwnerKind !== "human" && row.toOwnerKind !== "agent") ||
+      (row.toOwnerKind === "human" ? row.toOwnerActorId !== targetHumanActorId
+        : row.principalHumanActorId !== targetHumanActorId) || row.status !== "pending" ||
       !isNonEmptyString(row.subjectId) ||
       (row.subjectKind !== "next_action" && row.subjectKind !== "blocker" &&
         row.subjectKind !== "open_question")) {
@@ -449,6 +472,50 @@ function collectTransferAcceptances(
       sourceId: row.sourceId,
       revision: row.revision,
       responsibilityRole: `transfer_target:${row.subjectKind}`,
+    });
+  });
+}
+
+function collectProjectConfirmations(
+  database: DatabaseSync,
+  roomId: string,
+  targetHumanActorId: string,
+): readonly DepartureConflict[] {
+  const rows = database.prepare(
+    `SELECT confirmation.id, confirmation.room_id AS roomId,
+            proposal.source_room_id AS sourceRoomId, proposal.source_id AS sourceId,
+            confirmation.revision,
+            confirmation.principal_human_actor_id AS principalHumanActorId,
+            confirmation.state
+     FROM project_confirmations AS confirmation
+     JOIN project_fact_proposals AS proposal
+       ON proposal.id = confirmation.proposal_id
+      AND proposal.room_id = confirmation.room_id
+     WHERE confirmation.room_id = ?
+       AND confirmation.principal_human_actor_id = ?
+       AND confirmation.state = 'pending'
+     ORDER BY confirmation.id`,
+  ).all(roomId, targetHumanActorId) as unknown as readonly ProjectConfirmationRow[];
+
+  return rows.map((row) => {
+    if (row.roomId !== roomId || row.principalHumanActorId !== targetHumanActorId ||
+      row.state !== "pending") {
+      throw new DepartureCollectionError(
+        row.roomId !== roomId ? "cross_room_result" : "malformed_result",
+      );
+    }
+    return conflict({
+      roomId,
+      targetHumanActorId,
+      subjectId: row.id,
+      kind: "confirmation",
+      title: "project.confirmation.pending",
+      state: "pending",
+      allowedResolutions: ["reject_or_revoke"],
+      sourceRoomId: row.sourceRoomId,
+      sourceId: row.sourceId,
+      revision: row.revision,
+      responsibilityRole: "confirmer",
     });
   });
 }
@@ -483,6 +550,7 @@ function listInTransaction(
       ...collectNextActions(database, input.roomId, input.targetHumanActorId),
       ...collectObstacles(database, input.roomId, input.targetHumanActorId),
       ...collectTransferAcceptances(database, input.roomId, input.targetHumanActorId),
+      ...collectProjectConfirmations(database, input.roomId, input.targetHumanActorId),
     ]);
 
     if (composition.enabled) {
