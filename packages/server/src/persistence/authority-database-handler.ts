@@ -135,6 +135,10 @@ import {
   type HumanRequestMessageBinding,
   type HumanRequestMessageTransactionParticipant,
 } from "../project-loop/message-human-request-participant.js";
+import {
+  archiveProjectLoopBoundariesInTransaction,
+  reopenProjectLoopBoundariesInTransaction,
+} from "../project-loop/boundary-authority.js";
 import { canStartRuntimeGenerationInTransaction } from "../agent-runtime/runtime-archive-fence-participant.js";
 import {
   commitInternalScopedProducerInTransaction,
@@ -3736,6 +3740,22 @@ function executeClosedLifecycle(
             roomScopedInput,
             roomScopedPrepared.deferredExecutions,
           );
+        }
+
+        if (command.type === "room.archive") {
+          archiveProjectLoopBoundariesInTransaction(database, {
+            roomId: command.roomId,
+            archiveGeneration: result.governance.archiveGeneration,
+            previousLifecycleGeneration: result.governance.archiveGeneration - 1,
+            occurredAt: acceptedAt,
+          });
+        } else {
+          reopenProjectLoopBoundariesInTransaction(database, {
+            roomId: command.roomId,
+            archiveGeneration: result.governance.archiveGeneration,
+            previousLifecycleGeneration: result.governance.archiveGeneration,
+            occurredAt: acceptedAt,
+          });
         }
 
         const auditType = command.type === "room.archive" ? "room.archived" : "room.reopened";
