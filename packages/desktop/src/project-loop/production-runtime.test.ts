@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import type { ProjectSnapshot, RoomRepairRecord } from "@native-im/core";
+import { deriveProjectBallFacts, type ProjectSnapshot, type RoomRepairRecord } from "@native-im/core";
 import type { ProjectLoopWireRequest, ProjectLoopWireResponse } from "./contracts.js";
 import type { ProjectLoopIntent } from "../renderer/project-loop/surface.js";
+import type { ProjectLoopRemoteState } from "../renderer/project-loop/view-model.js";
 import { GovernanceTransportError } from "../governance/websocket-authority.js";
 import { createDesktopProjectLoopRuntime } from "./production-runtime.js";
 import { projectSnapshot } from "./test-fixture.js";
@@ -57,6 +58,7 @@ function createTransport(projectRequest: (frame: ProjectLoopWireRequest) => Prom
       onConnectionFailure(listener: () => void) { failed = listener; return () => { failed = undefined; }; },
     },
     revoke: () => revoked?.(), fail: () => failed?.(),
+    join: (roomId: string) => access?.(roomId, "joined"),
     remove: (roomId: string) => access?.(roomId, "removed"),
   };
 }
@@ -174,6 +176,82 @@ describe("FT-09 Desktop Project Loop production runtime", () => {
     runtime.close();
   });
 
+  it("discards a deferred repair that completes after Room access was revoked", async () => {
+    const wire = createTransport(async () => { throw new Error("unexpected mutation"); });
+    const cache = createCacheHarness([projectSnapshot()]);
+    let releaseRepair!: () => void;
+    let markRepairStarted!: () => void;
+    const repairStarted = new Promise<void>((resolve) => { markRepairStarted = resolve; });
+    const repairGate = new Promise<void>((resolve) => { releaseRepair = resolve; });
+    const runtime = createDesktopProjectLoopRuntime({ session, transport: wire.transport,
+      authorityCache: cache.cache,
+      repairRoom: async (roomId) => {
+        markRepairStarted();
+        await repairGate;
+        await cache.repairRoom(roomId);
+      },
+      restoreAuthorityCache: async () => false,
+      createRequestIdentity: () => ({ requestId: "request-race", idempotencyKey: "idem-race" }) });
+
+    const loading = runtime.getSurface({ roomId: "room-1" });
+    await repairStarted;
+    wire.remove("room-1");
+    await expect(runtime.getSurface({ roomId: "room-1" })).resolves.toMatchObject({
+      status: "locked", error: { status: 410, code: "room_access_removed" },
+    });
+    releaseRepair();
+
+    await expect(loading).resolves.toMatchObject({
+      status: "locked", error: { status: 410, code: "room_access_removed" },
+    });
+    expect(cache.cache.roomRepairRecords("room-1")).toBeUndefined();
+    runtime.close();
+  });
+
+  it("starts a new-generation repair after access is restored while the revoked repair is pending", async () => {
+    const wire = createTransport(async () => { throw new Error("unexpected mutation"); });
+    const cache = createCacheHarness([
+      projectSnapshot({ watermark: 8 }),
+      projectSnapshot({ watermark: 9 }),
+    ]);
+    let releaseFirstRepair!: () => void;
+    let markFirstRepairStarted!: () => void;
+    const firstRepairStarted = new Promise<void>((resolve) => { markFirstRepairStarted = resolve; });
+    const firstRepairGate = new Promise<void>((resolve) => { releaseFirstRepair = resolve; });
+    let repairCount = 0;
+    const runtime = createDesktopProjectLoopRuntime({ session, transport: wire.transport,
+      authorityCache: cache.cache,
+      repairRoom: async (roomId) => {
+        repairCount += 1;
+        if (repairCount === 1) {
+          markFirstRepairStarted();
+          await firstRepairGate;
+        }
+        await cache.repairRoom(roomId);
+      },
+      restoreAuthorityCache: async () => false,
+      createRequestIdentity: () => ({ requestId: "request-race", idempotencyKey: "idem-race" }) });
+    const states: ProjectLoopRemoteState[] = [];
+    runtime.subscribe(({ state }) => states.push(state));
+
+    const initial = runtime.getSurface({ roomId: "room-1" });
+    await firstRepairStarted;
+    wire.remove("room-1");
+    wire.join("room-1");
+    releaseFirstRepair();
+
+    await initial;
+    await vi.waitFor(() => expect(repairCount).toBe(2));
+    await expect(runtime.getSurface({ roomId: "room-1" })).resolves.toMatchObject({
+      status: "ready", snapshot: { watermark: 9 }, connection: { status: "online" },
+    });
+    expect(cache.cache.roomRepairRecords("room-1")).toEqual([
+      expect.objectContaining({ kind: "project-loop", value: expect.objectContaining({ watermark: 9 }) }),
+    ]);
+    expect(states.some((state) => state.status === "ready" && state.snapshot.watermark === 8)).toBe(false);
+    runtime.close();
+  });
+
   it("purges every restored projection when a direct transport 401 revokes the session", async () => {
     const wire = createTransport(async () => { throw new GovernanceTransportError("session_revoked", 401); });
     const cache = createCacheHarness([projectSnapshot()]);
@@ -222,6 +300,88 @@ describe("FT-09 Desktop Project Loop production runtime", () => {
     revokedRuntime.close();
   });
 
+  it.each([
+    ["429", 429, "rate_limited"],
+    ["503", 503, "project_dependency_unavailable"],
+    ["timeout", 503, "project_dependency_unavailable"],
+  ] as const)("retries %s with the frozen intent and the same request/idempotency identity",
+  async (failure, expectedStatus, code) => {
+    const calls: ProjectLoopWireRequest[] = [];
+    const wire = createTransport(async (frame) => {
+      calls.push(frame);
+      if (calls.length === 1) {
+        if (failure === "timeout") throw new Error("transport timed out");
+        throw Object.assign(new Error(code), { projectError: {
+          type: "error", status: expectedStatus, code, message: code, requestId: frame.requestId,
+          ...(failure === "429" ? { retryAfterSeconds: 2 } : {}),
+        } });
+      }
+      return { type: "project.mutation.ack", requestId: frame.requestId, roomId: frame.roomId,
+        projectId: frame.projectId, acceptedRevision: 8, eventIds: ["event-8"], replayed: true };
+    });
+    const cache = createCacheHarness([projectSnapshot(), projectSnapshot({ watermark: 8 })]);
+    const createRequestIdentity = vi.fn(() => ({ requestId: "request-frozen", idempotencyKey: "idem-frozen" }));
+    const runtime = createDesktopProjectLoopRuntime({ session, transport: wire.transport,
+      authorityCache: cache.cache, repairRoom: (roomId) => cache.repairRoom(roomId),
+      restoreAuthorityCache: async () => false, createRequestIdentity });
+    const intent = { kind: "request.transition" as const, intentId: "cancel-frozen",
+      factId: "request-1", expectedRevision: 3, action: "cancel" as const, reason: "No longer needed" };
+    await runtime.getSurface({ roomId: "room-1" });
+    await expect(runtime.submit({ roomId: "room-1", intent })).resolves.toMatchObject({
+      status: "ready", operation: { status: "failed", error: { status: expectedStatus, code } },
+    });
+
+    await expect(runtime.getSurface({ roomId: "room-1" })).resolves.toMatchObject({
+      status: "ready", operation: { status: "idle" }, snapshot: { watermark: 8 },
+    });
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toEqual(calls[0]);
+    expect(createRequestIdentity).toHaveBeenCalledTimes(1);
+    runtime.close();
+  });
+
+  it("uses the explicit recovery request to repair and replay a 409 intent at the latest revision", async () => {
+    const latest = projectSnapshot();
+    const requests = latest.requests.map((request) => ({ ...request, revision: 4 }));
+    const repaired = { ...latest, watermark: 8, requests, balls: deriveProjectBallFacts({
+      roomId: latest.roomId, projectId: latest.projectId, requests,
+      nextActions: latest.nextActions, obstacles: latest.obstacles, proposals: latest.proposals,
+      confirmations: latest.confirmations, transferProposals: latest.transferProposals,
+    }) };
+    const calls: ProjectLoopWireRequest[] = [];
+    const wire = createTransport(async (frame) => {
+      calls.push(frame);
+      if (calls.length === 1) throw Object.assign(new Error("conflict"), { projectError: {
+        type: "error", status: 409, code: "revision_conflict",
+        message: "conflict", requestId: frame.requestId,
+      } });
+      return { type: "project.mutation.ack", requestId: frame.requestId, roomId: frame.roomId,
+        projectId: frame.projectId, acceptedRevision: 9, eventIds: ["event-9"], replayed: false };
+    });
+    const cache = createCacheHarness([latest, repaired, { ...repaired, watermark: 9 }]);
+    let identity = 0;
+    const runtime = createDesktopProjectLoopRuntime({ session, transport: wire.transport,
+      authorityCache: cache.cache, repairRoom: (roomId) => cache.repairRoom(roomId),
+      restoreAuthorityCache: async () => false,
+      createRequestIdentity: () => ({ requestId: `request-${++identity}`, idempotencyKey: `idem-${identity}` }) });
+    const intent = { kind: "request.transition" as const, intentId: "cancel-conflict",
+      factId: "request-1", expectedRevision: 3, action: "cancel" as const, reason: "No longer needed" };
+    await runtime.getSurface({ roomId: "room-1" });
+    await expect(runtime.submit({ roomId: "room-1", intent })).resolves.toMatchObject({
+      status: "ready", operation: { status: "failed", error: { status: 409 } },
+    });
+
+    await expect(runtime.getSurface({ roomId: "room-1" })).resolves.toMatchObject({
+      status: "ready", operation: { status: "idle" }, snapshot: { watermark: 9 },
+    });
+    expect(calls).toEqual([
+      expect.objectContaining({ requestId: "request-1", idempotencyKey: "idem-1", expectedRevision: 3 }),
+      expect.objectContaining({ requestId: "request-2", idempotencyKey: "idem-2", expectedRevision: 4,
+        action: "cancel", reason: "No longer needed" }),
+    ]);
+    runtime.close();
+  });
+
   it("wires every Desktop core-action family to the closed public Project protocol", async () => {
     const source = { kind: "message" as const, sourceId: "message-result", sourceRevision: 2,
       roomId: "room-1", visibility: "room" as const };
@@ -246,12 +406,21 @@ describe("FT-09 Desktop Project Loop production runtime", () => {
         reviewAt: "2026-08-28T00:00:00.000Z" }, expected: { type: "project.obstacle.transition",
         obstacleKind: "open_question", action: "defer", reason: "waiting",
         reviewAt: "2026-08-28T00:00:00.000Z" } },
+      { intent: { kind: "obstacle.transition", intentId: "reopen-question", factId: "question-1",
+        expectedRevision: 3, obstacleKind: "open_question", action: "reopen", reason: "follow-up" },
+        expected: { type: "project.obstacle.transition", obstacleKind: "open_question",
+          action: "reopen", reason: "follow-up" } },
       { intent: { kind: "transfer.propose", intentId: "propose-transfer",
         transferProposalId: "transfer-1", subjectKind: "next_action", subjectId: "action-1",
         expectedRevision: 2, toOwner: { kind: "human", actorId: "human-3" }, reason: "handoff" },
         expected: { type: "project.transfer.propose", transferProposalId: "transfer-1",
           subjectKind: "next_action", subjectId: "action-1",
           toOwner: { kind: "human", actorId: "human-3" }, reason: "handoff" } },
+      { intent: { kind: "transfer.propose", intentId: "propose-agent-transfer",
+        transferProposalId: "transfer-agent", subjectKind: "blocker", subjectId: "blocker-1",
+        expectedRevision: 2, toOwner: { kind: "agent", actorId: "agent-2" }, reason: "specialist" },
+        expected: { type: "project.transfer.propose", transferProposalId: "transfer-agent",
+          subjectKind: "blocker", toOwner: { kind: "agent", actorId: "agent-2" }, reason: "specialist" } },
       { intent: { kind: "transfer.resolve", intentId: "accept-transfer",
         transferProposalId: "transfer-1", subjectKind: "next_action", subjectId: "action-1",
         expectedRevision: 1, resolution: "accepted", reason: null }, expected: {

@@ -23,6 +23,13 @@ describe("FT-09 Desktop Project Loop closed bridge contracts", () => {
     expect(isProjectLoopIntent({ kind: "obstacle.transition", intentId: "i-4", factId: "b-1",
       expectedRevision: 2, obstacleKind: "blocker", action: "defer", reason: "wait",
       reviewAt: "2026-08-28T00:00:00.000Z" })).toBe(true);
+    expect(isProjectLoopIntent({ kind: "obstacle.transition", intentId: "i-4b", factId: "b-1",
+      expectedRevision: 3, obstacleKind: "blocker", action: "reopen", reason: "Work resumed" }))
+      .toBe(true);
+    expect(isProjectLoopIntent({ kind: "transfer.propose", intentId: "i-4c",
+      transferProposalId: "t-agent", subjectKind: "blocker", subjectId: "b-1",
+      expectedRevision: 3, toOwner: { kind: "agent", actorId: "agent-1" }, reason: "Specialist" }))
+      .toBe(true);
     expect(isProjectLoopIntent({ kind: "transfer.resolve", intentId: "i-5",
       transferProposalId: "t-1", subjectKind: "next_action", subjectId: "a-1",
       expectedRevision: 2, resolution: "accepted", reason: null })).toBe(true);

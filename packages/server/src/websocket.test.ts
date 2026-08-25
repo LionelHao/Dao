@@ -114,7 +114,8 @@ describe("FT-09 Project Loop WebSocket", () => {
     const executeMutation = vi.fn<ProjectLoopAuthorityTransport["executeMutation"]>(
       async (context, frame) => ({
         type: "project.mutation.ack", requestId: frame.requestId, roomId: frame.roomId,
-        projectId: frame.projectId, acceptedRevision: frame.expectedRevision + 1,
+        projectId: frame.projectId,
+        acceptedRevision: "expectedRevision" in frame ? frame.expectedRevision + 1 : 1,
         eventIds: ["event-project-1"], replayed: false,
       }),
     );
@@ -151,6 +152,57 @@ describe("FT-09 Project Loop WebSocket", () => {
         kind: "human", requestId: command.requestId, idempotencyKey: command.idempotencyKey,
         principal: { actorId: humans[0].id },
       });
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("carries obstacle reopen and Agent transfer through the authenticated public socket", async () => {
+    const executeMutation = vi.fn<ProjectLoopAuthorityTransport["executeMutation"]>(
+      async (_context, frame) => ({
+        type: "project.mutation.ack", requestId: frame.requestId, roomId: frame.roomId,
+        projectId: frame.projectId,
+        acceptedRevision: "expectedRevision" in frame ? frame.expectedRevision + 1 : 1,
+        eventIds: [`event-${frame.requestId}`], replayed: false,
+      }),
+    );
+    const server = await startMessageWebSocketServer({
+      auth: governanceAuthenticationService(), service: idleMessageService(),
+      projectLoopAuthority: { executeMutation, async executeQuery(_context, frame) {
+        return { type: "project.snapshot", requestId: frame.requestId, snapshot: {
+          recordVersion: "project-loop.v1", roomId: frame.roomId, projectId: frame.projectId,
+          watermark: 0, goals: [], decisions: [], requests: [], obstacles: [], nextActions: [],
+          proposals: [], confirmations: [], transferProposals: [], balls: [],
+          capturedAt: "2026-08-25T00:00:00.000Z",
+        }, events: [], nextEventSeq: 0 };
+      } },
+    });
+    const client = await LoopbackClient.connect(server.url);
+    const reopen = { type: "project.obstacle.transition", requestId: "reopen-blocker",
+      idempotencyKey: "idem-reopen-blocker", roomId, projectId: roomId, factId: "blocker-1",
+      expectedRevision: 3, obstacleKind: "blocker", action: "reopen",
+      reason: "New evidence" } as const;
+    const transfer = { type: "project.transfer.propose", requestId: "transfer-agent",
+      idempotencyKey: "idem-transfer-agent", roomId, projectId: roomId,
+      transferProposalId: "transfer-agent-1", subjectKind: "blocker", subjectId: "blocker-1",
+      expectedRevision: 4, toOwner: { kind: "agent", actorId: "agent-2" },
+      reason: "Specialist required" } as const;
+    try {
+      await client.login(humans[0], "project-actions-login");
+      for (const command of [reopen, transfer]) {
+        client.send(command);
+        await expect(client.waitForFrame(
+          (frame) => hasType(frame, "project.mutation.ack") && frame.requestId === command.requestId,
+          `${command.requestId} ACK`,
+        )).resolves.toMatchObject({ frame: { acceptedRevision: command.expectedRevision + 1 } });
+      }
+      expect(executeMutation).toHaveBeenNthCalledWith(1,
+        expect.objectContaining({ kind: "human",
+          principal: expect.objectContaining({ actorId: "human-1" }) }), reopen);
+      expect(executeMutation).toHaveBeenNthCalledWith(2,
+        expect.objectContaining({ kind: "human",
+          principal: expect.objectContaining({ actorId: "human-1" }) }), transfer);
     } finally {
       await client.close();
       await server.close();

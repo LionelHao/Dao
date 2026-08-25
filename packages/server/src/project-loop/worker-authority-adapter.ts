@@ -138,7 +138,7 @@ function mutationOperation(
       ? "next_action.transfer_propose" : "obstacle.transfer_propose";
     transitionPayload = {
       transferProposalId: frame.transferProposalId,
-      toOwnerKind: "human",
+      toOwnerKind: frame.toOwner.kind,
       toOwnerActorId: frame.toOwner.actorId,
       reason: frame.reason,
       expiresAt: new Date(now + PUBLIC_PROPOSAL_EXPIRY_MS).toISOString(),

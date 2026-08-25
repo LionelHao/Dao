@@ -1,5 +1,6 @@
 import {
   PROJECT_LOOP_LIMITS,
+  isProjectActorRef,
   isProjectSourceRef,
   isProjectEvent,
   isProjectSnapshot,
@@ -78,13 +79,13 @@ export type ProjectObstacleTransitionFrame = Readonly<{
 }> & (
   | Readonly<{ action: "resolve"; resultSource: import("@native-im/core").ProjectSourceRef; reason: string }>
   | Readonly<{ action: "defer"; reason: string; reviewAt: string }>
-  | Readonly<{ action: "cannot_answer"; reason: string }>
+  | Readonly<{ action: "cannot_answer" | "reopen"; reason: string }>
 );
 export type ProjectTransferProposeFrame = Readonly<{
   type: "project.transfer.propose"; requestId: string; idempotencyKey: string;
   roomId: string; projectId: string; transferProposalId: string;
   subjectKind: "next_action" | "blocker" | "open_question"; subjectId: string;
-  expectedRevision: number; toOwner: Readonly<{ kind: "human"; actorId: string }>; reason: string;
+  expectedRevision: number; toOwner: import("@native-im/core").ProjectActorRef; reason: string;
 }>;
 export type ProjectTransferResolveFrame = Readonly<{
   type: "project.transfer.resolve"; requestId: string; idempotencyKey: string;
@@ -197,14 +198,14 @@ export function isProjectLoopIntent(value: unknown): value is ProjectLoopIntent 
       isProjectSourceRef(value.resultSource) && nonemptyText(value.reason, PROJECT_LOOP_LIMITS.reasonUtf8);
     if (value.action === "defer") return exact(value, [...base, "reason", "reviewAt"]) &&
       nonemptyText(value.reason, PROJECT_LOOP_LIMITS.reasonUtf8) && timestamp(value.reviewAt);
-    return value.action === "cannot_answer" && exact(value, [...base, "reason"]) &&
+    return (value.action === "cannot_answer" || value.action === "reopen") &&
+      exact(value, [...base, "reason"]) &&
       nonemptyText(value.reason, PROJECT_LOOP_LIMITS.reasonUtf8);
   }
   if (value.kind === "transfer.propose") return exact(value, ["kind", "intentId", "transferProposalId",
     "subjectKind", "subjectId", "expectedRevision", "toOwner", "reason"]) &&
     id(value.transferProposalId) && ["next_action", "blocker", "open_question"].includes(String(value.subjectKind)) &&
-    id(value.subjectId) && record(value.toOwner) && exact(value.toOwner, ["kind", "actorId"]) &&
-    value.toOwner.kind === "human" && id(value.toOwner.actorId) &&
+    id(value.subjectId) && isProjectActorRef(value.toOwner) &&
     nonemptyText(value.reason, PROJECT_LOOP_LIMITS.reasonUtf8);
   return value.kind === "transfer.resolve" && exact(value, ["kind", "intentId", "transferProposalId",
     "subjectKind", "subjectId", "expectedRevision", "resolution", "reason"]) &&

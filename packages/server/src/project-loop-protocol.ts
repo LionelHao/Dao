@@ -5,6 +5,7 @@ import {
   isProjectSnapshot,
   isProjectSourceRef,
   type ProjectCriterion,
+  type ProjectActorRef,
   type ProjectEvent,
   type ProjectHumanRef,
   type ProjectSnapshot,
@@ -44,8 +45,8 @@ export type ProjectLoopClientFrame =
   | (FactMutationBase & Readonly<{ type: "project.next-action.transition"; action: "deliver"; source: ProjectSourceRef; summary: string }>)
   | (FactMutationBase & Readonly<{ type: "project.obstacle.transition"; obstacleKind: "blocker" | "open_question"; action: "resolve"; resultSource: ProjectSourceRef; reason: string }>)
   | (FactMutationBase & Readonly<{ type: "project.obstacle.transition"; obstacleKind: "blocker" | "open_question"; action: "defer"; reason: string; reviewAt: string }>)
-  | (FactMutationBase & Readonly<{ type: "project.obstacle.transition"; obstacleKind: "blocker" | "open_question"; action: "cannot_answer"; reason: string }>)
-  | (MutationBase & Readonly<{ type: "project.transfer.propose"; transferProposalId: string; subjectKind: "next_action" | "blocker" | "open_question"; subjectId: string; expectedRevision: number; toOwner: ProjectHumanRef; reason: string }>)
+  | (FactMutationBase & Readonly<{ type: "project.obstacle.transition"; obstacleKind: "blocker" | "open_question"; action: "cannot_answer" | "reopen"; reason: string }>)
+  | (MutationBase & Readonly<{ type: "project.transfer.propose"; transferProposalId: string; subjectKind: "next_action" | "blocker" | "open_question"; subjectId: string; expectedRevision: number; toOwner: ProjectActorRef; reason: string }>)
   | (MutationBase & Readonly<{ type: "project.transfer.resolve"; transferProposalId: string; subjectKind: "next_action" | "blocker" | "open_question"; subjectId: string; expectedRevision: number; resolution: "accepted" | "rejected"; reason: string | null }>);
 
 export type ProjectLoopMutationFrame = Exclude<ProjectLoopClientFrame, ReadFrame>;
@@ -78,6 +79,7 @@ function text(value: unknown, limit: number): value is string {
 function identifier(value: unknown): value is string { return text(value, PROJECT_LOOP_PROTOCOL_LIMITS.id) && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/u.test(value); }
 function integer(value: unknown, positive = false): value is number { return typeof value === "number" && Number.isSafeInteger(value) && value >= (positive ? 1 : 0); }
 function timestamp(value: unknown): value is string { return typeof value === "string" && Number.isFinite(Date.parse(value)) && new Date(Date.parse(value)).toISOString() === value; }
+function actor(value: unknown): value is ProjectActorRef { return isProjectActorRef(value); }
 function human(value: unknown): value is ProjectHumanRef { return isProjectActorRef(value) && value.kind === "human"; }
 function mutation(value: UnknownRecord): boolean {
   return text(value.requestId, PROJECT_LOOP_PROTOCOL_LIMITS.requestId) && identifier(value.idempotencyKey) &&
@@ -148,9 +150,10 @@ export function parseProjectLoopClientFrame(value: unknown): ProjectLoopFramePar
       valid = identifier(value.factId) && integer(value.expectedRevision, true) && (value.obstacleKind === "blocker" || value.obstacleKind === "open_question") &&
         (value.action === "resolve" ? exact(value, [...base, "resultSource", "reason"]) && source(value.resultSource, value.roomId) && text(value.reason, PROJECT_LOOP_PROTOCOL_LIMITS.reason) :
           value.action === "defer" ? exact(value, [...base, "reason", "reviewAt"]) && text(value.reason, PROJECT_LOOP_PROTOCOL_LIMITS.reason) && timestamp(value.reviewAt) :
-            value.action === "cannot_answer" && exact(value, [...base, "reason"]) && text(value.reason, PROJECT_LOOP_PROTOCOL_LIMITS.reason)); break;
+            (value.action === "cannot_answer" || value.action === "reopen") &&
+              exact(value, [...base, "reason"]) && text(value.reason, PROJECT_LOOP_PROTOCOL_LIMITS.reason)); break;
     }
-    case "project.transfer.propose": valid = exact(value, ["type", "requestId", "idempotencyKey", "roomId", "projectId", "transferProposalId", "subjectKind", "subjectId", "expectedRevision", "toOwner", "reason"]) && identifier(value.transferProposalId) && (value.subjectKind === "next_action" || value.subjectKind === "blocker" || value.subjectKind === "open_question") && identifier(value.subjectId) && integer(value.expectedRevision, true) && human(value.toOwner) && text(value.reason, PROJECT_LOOP_PROTOCOL_LIMITS.reason); break;
+    case "project.transfer.propose": valid = exact(value, ["type", "requestId", "idempotencyKey", "roomId", "projectId", "transferProposalId", "subjectKind", "subjectId", "expectedRevision", "toOwner", "reason"]) && identifier(value.transferProposalId) && (value.subjectKind === "next_action" || value.subjectKind === "blocker" || value.subjectKind === "open_question") && identifier(value.subjectId) && integer(value.expectedRevision, true) && actor(value.toOwner) && text(value.reason, PROJECT_LOOP_PROTOCOL_LIMITS.reason); break;
     case "project.transfer.resolve": valid = exact(value, ["type", "requestId", "idempotencyKey", "roomId", "projectId", "transferProposalId", "subjectKind", "subjectId", "expectedRevision", "resolution", "reason"]) && identifier(value.transferProposalId) && (value.subjectKind === "next_action" || value.subjectKind === "blocker" || value.subjectKind === "open_question") && identifier(value.subjectId) && integer(value.expectedRevision, true) && (value.resolution === "accepted" || value.resolution === "rejected") && nullableText(value.reason, PROJECT_LOOP_PROTOCOL_LIMITS.reason) && (value.resolution === "accepted" ? value.reason === null : value.reason !== null); break;
   }
   return valid ? { ok: true, frame: value as ProjectLoopClientFrame } : fail(requestId);
