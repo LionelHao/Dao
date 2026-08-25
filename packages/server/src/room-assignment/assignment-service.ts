@@ -20,6 +20,10 @@ import {
   requireAssignmentExpansionAllowedInTransaction,
   requireAssignmentSecurityReductionAllowedInTransaction,
 } from "./assignment-security-reduction-participant.js";
+import { useAuthorityTransactionDatabase } from
+  "../persistence/authority-transaction-database.js";
+import { commitInternalScopedProducerInTransaction } from
+  "../agent-runtime/internal-scoped-producer-authority.js";
 
 export type RoomAssignmentServiceErrorCode =
   | "unauthenticated"
@@ -381,6 +385,28 @@ function execute(
   if (decision.securityReduction) {
     requireAssignmentSecurityReductionAllowedInTransaction(transaction, {
       roomId: request.roomId, expectedArchiveGeneration: room.archiveGeneration,
+    });
+    if (current === undefined) fail(503, "storage_unavailable");
+    const authority = request.kind === "remove"
+      ? { kind: "membership" as const, reason: "membership_revoked" as const,
+          capability: "membership_authority" as const }
+      : request.kind === "pause"
+        ? { kind: "assignment" as const, reason: "assignment_revoked" as const,
+            capability: "assignment_authority" as const }
+        : { kind: "capability" as const, reason: "capability_revoked" as const,
+            capability: "assignment_authority" as const };
+    useAuthorityTransactionDatabase(transaction, (database) => {
+      commitInternalScopedProducerInTransaction(database, {
+        producerId: "room-assignment-authority",
+        requestId: request.requestId,
+        capability: authority.capability,
+        actorId: context.principal.actorId,
+        roomId: request.roomId,
+        scope: { kind: "agent_authority", agentId: current!.actorId,
+          authority: authority.kind, authorityRevision: current!.revision + 1 },
+        reason: authority.reason,
+        occurredAt: timestamp(now),
+      });
     });
   } else if (!requireAssignmentExpansionAllowedInTransaction(transaction, {
     roomId: request.roomId, expectedArchiveGeneration: room.archiveGeneration,

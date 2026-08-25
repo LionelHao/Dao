@@ -314,7 +314,7 @@ export function renderAgentExecutionPreview(
     element.className = "agent-execution-preview";
     element.dataset.agentExecutionPreview = "true";
     element.dataset.authoritative = "false";
-    element.setAttribute("aria-live", "polite");
+    element.setAttribute("aria-live", "off");
     element.setAttribute("aria-label", "Agent 非权威临时预览");
     element.textContent = "";
   }
@@ -1425,41 +1425,44 @@ function appendAddressingPreview(
     section.append(lightTask);
   }
   const executionStatusLabels: Readonly<Record<AgentExecution["status"], string>> = {
-    queued: "已排队",
+    accepted: "已接受",
     running: "正在调用",
     completed: "已完成调用",
     failed: "调用失败",
     cancelled: "已取消",
   };
-  const executionActionLabels: Readonly<Record<AgentExecution["actionCategory"], string>> = {
+  const executionPhaseLabels: Readonly<Record<AgentExecution["phase"], string>> = {
+    queued: "排队中",
+    retry_scheduled: "等待重试",
+    recovery_queued: "等待恢复",
+    awaiting_capacity: "等待容量",
+    claiming: "正在领取",
+    snapshot_frozen: "上下文已冻结",
     model_generation: "正在生成",
-    tool_call: "正在调用工具",
-    waiting_upstream: "等待上游",
+    read_tool: "正在读取",
+    waiting_confirmation: "等待确认",
+    side_effect_claimed: "副作用已领取",
+    final_committing: "正在提交结果",
+    completed: "已完成",
+    failed: "失败",
+    cancelled: "已取消",
   };
   for (const record of records.agentExecutions) {
     const agentLabel = record.agentId === "agent-data" ? "数据 Agent" : record.agentId;
-    const humanPreempted = record.status === "cancelled" &&
-      record.cancellationReason?.startsWith("human_preempted:") === true;
-    const requeued = record.status === "queued" && record.supersedesExecutionIds !== undefined;
-    const executionState = humanPreempted
-      ? "因人类发言已取消"
-      : requeued
-        ? "已重新排队"
-        : executionStatusLabels[record.status];
+    const retried = record.retryOfExecutionId !== undefined;
+    const executionState = executionStatusLabels[record.status];
     const invocation = primitiveElement(
       "div",
       "agent-invocation",
-      `Agent 执行 · ${agentLabel} ${executionState} · ${executionActionLabels[record.actionCategory]} · attempt ${record.currentAttemptSeq} · ${record.toolName}`,
+      `Agent 执行 #${record.executionOrdinal} · ${agentLabel} ${executionState} · ${executionPhaseLabels[record.phase]} · attempt ${record.currentAttemptSeq}`,
     );
     invocation.dataset.agentInvocation = record.agentId;
+    invocation.dataset.executionId = record.executionId;
     invocation.dataset.executionStatus = record.status;
-    if (humanPreempted) {
-      invocation.classList.add("agent-invocation--human-preempted");
-      invocation.dataset.preemptedByMessageId = record.cancellationReason!.slice("human_preempted:".length);
-    }
-    if (requeued) {
+    invocation.dataset.executionPhase = record.phase;
+    if (retried) {
       invocation.classList.add("agent-invocation--requeued");
-      invocation.dataset.supersedesExecutionIds = record.supersedesExecutionIds!.join(",");
+      invocation.dataset.retryOfExecutionId = record.retryOfExecutionId;
     }
     const status = primitiveElement(
       "span",
@@ -1467,16 +1470,6 @@ function appendAddressingPreview(
       record.status === "running" ? "执行中" : "可用",
     );
     status.dataset.memberId = record.agentId;
-    if (record.status === "running") {
-      const interrupt = appendPrimitiveButton(invocation, "中断", "interrupt");
-      interrupt.dataset.testid = "interrupt-agent-execution";
-      interrupt.addEventListener("click", () => {
-        invocation.dataset.executionStatus = "cancelled";
-        invocation.firstChild!.textContent = `Agent 执行 · ${agentLabel} 已取消`;
-        status.textContent = "可用";
-        interrupt.remove();
-      });
-    }
     section.append(invocation, status);
   }
   section.append(audience);
@@ -1596,19 +1589,19 @@ const defaultRestoredPrimitiveRecords: RestoredPrimitivePreviewRecords = {
     deliveredAt: "2026-08-08T10:03:30.000Z",
   }],
   agentExecutions: [{
-    id: "preview-agent-execution",
+    executionId: "preview-agent-execution",
+    intentId: "preview-agent-intent",
+    lineageId: "preview-agent-lineage",
+    executionOrdinal: 1,
     roomId: "preview-room",
-    sourceMessageId: "preview-human-mention",
-    requesterId: "human-li",
     agentId: "agent-data",
-    toolName: "warehouse.query",
+    snapshotId: "preview-context-snapshot",
+    providerId: "openai",
+    modelId: "gpt-5",
     status: "running",
-    actionCategory: "tool_call",
-    toolDispatchPhase: "dispatched",
+    phase: "waiting_confirmation",
     currentAttemptSeq: 1,
-    retryCycle: 1,
-    retryOrdinal: 1,
-    recoveryCursor: 0,
+    version: 2,
     queuedAt: "2026-08-08T10:03:59.000Z",
     startedAt: "2026-08-08T10:04:00.000Z",
     updatedAt: "2026-08-08T10:04:00.000Z",
@@ -1647,8 +1640,9 @@ function validateRestoredPrimitiveRecords(records: RestoredPrimitivePreviewRecor
   const primitiveIds = [
     ...records.humanReads, ...records.agentJudgements, ...records.routeJudgments,
     ...records.openItems, ...records.lightTasks,
-    ...records.agentExecutions, ...records.socialReactions, ...records.calibrations,
+    ...records.socialReactions, ...records.calibrations,
   ].map((record) => record.id);
+  primitiveIds.push(...records.agentExecutions.map((record) => record.executionId));
   if (new Set(primitiveIds).size !== primitiveIds.length) {
     throw new TypeError("Restored collaboration records contain duplicate IDs");
   }
@@ -1665,8 +1659,7 @@ function validateRestoredPrimitiveRecords(records: RestoredPrimitivePreviewRecor
         isLightTask(record) && record.roomId === "preview-room" &&
         messageIds.has(record.sourceMessageId)) ||
       !records.agentExecutions.every((record) =>
-        isAgentExecution(record) && record.roomId === "preview-room" &&
-        messageIds.has(record.sourceMessageId)) ||
+        isAgentExecution(record) && record.roomId === "preview-room") ||
       !records.socialReactions.every((record) =>
         isSocialReaction(record) && messageIds.has(record.sourceMessageId)) ||
       !records.calibrations.every((record) =>

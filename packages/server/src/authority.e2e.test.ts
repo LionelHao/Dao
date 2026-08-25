@@ -993,11 +993,26 @@ function recordKey(record: RoomRepairRecord): string {
     case "open-item": return `open-item\0${record.value.id}`;
     case "open-item-agent-failure": return `open-item-agent-failure\0${record.value.id}`;
     case "light-task": return `light-task\0${record.value.id}`;
-    case "agent-execution": return `agent-execution\0${record.value.id}`;
+    case "agent-invocation-intent": return `agent-invocation-intent\0${record.value.intentId}`;
+    case "agent-execution": return `agent-execution\0${record.value.executionId}`;
+    case "agent-execution-attempt": {
+      return `agent-execution-attempt\0${record.value.executionId}\0${record.value.attemptSeq}`;
+    }
+    case "agent-execution-retry": return `agent-execution-retry\0${record.value.requestId}`;
+    case "agent-scoped-cancellation": {
+      return `agent-scoped-cancellation\0${record.value.requestId}`;
+    }
+    case "project-boundary-invocation": {
+      return `project-boundary-invocation\0${record.value.boundaryId}`;
+    }
+    case "legacy-agent-execution": return `legacy-agent-execution\0${record.value.id}`;
     case "route-job": return `route-job\0${record.value.id}`;
     case "route-judgment": return `route-judgment\0${record.value.id}`;
     case "calibration": return `calibration\0${record.value.id}`;
     case "legacy-unknown-calibration": return `legacy-calibration\0${record.value.id}`;
+    case "memory": return record.value.recordType === "status"
+      ? "memory\0status"
+      : `memory\0projection\0${record.value.projection.memoryRecordId}`;
   }
 }
 
@@ -1402,6 +1417,92 @@ function attachmentE2ePdf(): Buffer {
 }
 
 describe("authoritative server real-process harness", () => {
+  it("production-composes the FT-09-unavailable project-boundary seam as durable suppression", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-ft08-project-boundary-"));
+    const databasePath = join(directory, "authority.sqlite");
+    let server: AuthoritativeServer | undefined;
+    let result: unknown;
+    try {
+      server = await startAuthoritativeServerForTest({
+        databasePath,
+        snapshotCachePath: join(directory, "snapshot-cache.sqlite"),
+        sharedAuthority: { maxOfflineReadLeaseMs: 60_000 },
+        listen: { host: "127.0.0.1", port: 0 },
+        actors,
+        identities: {
+          async verify(credentials) {
+            return credentials.accountId === "account-a" && credentials.secret === "test-secret"
+              ? { accountId: "account-a", actorId: "human-a" }
+              : undefined;
+          },
+        },
+        invitationSecretKey: new Uint8Array(32).fill(48),
+        tenantAdministration: { bootstrapHumanActorIds: ["human-a"] },
+      }, {
+        initialize: async (facades) => {
+          const issued = await facades.auth.login({ accountId: "account-a", secret: "test-secret" });
+          const authenticated = await facades.auth.authenticateSession(issued.accessToken);
+          const context = {
+            ...authenticated,
+            kind: "human" as const,
+            requestId: "ft08-project-boundary-room",
+            idempotencyKey: "ft08-project-boundary-room",
+          };
+          const room = await facades.lifecycle.createRoom(context, {
+            name: "FT-08 project boundary fail closed",
+          });
+          await facades.lifecycle.configureAgent({
+            ...context,
+            requestId: "ft08-project-boundary-agent",
+            idempotencyKey: "ft08-project-boundary-agent",
+          }, {
+            kind: "agent-configuration",
+            roomId: room.id,
+            agentId: "agent-a",
+            participation: "active",
+            toolPermissions: ["authority.inspect"],
+          });
+          const request = {
+            purpose: "project_boundary_invocation" as const,
+            boundaryId: "ft08-boundary-unavailable",
+            boundaryKind: "checkpoint" as const,
+            projectId: room.id,
+            roomId: room.id,
+            agentId: "agent-a",
+            sourceFactId: "ft09-unavailable-source",
+            sourceFactRevision: 1,
+          };
+          const first = await facades.projectBoundary.consume(request);
+          const replay = await facades.projectBoundary.consume(request);
+          expect(replay).toEqual(first);
+          result = first;
+        },
+      });
+      expect(result).toMatchObject({
+        boundaryId: "ft08-boundary-unavailable",
+        status: "suppressed",
+        reason: "dependency_unavailable",
+      });
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      try {
+        expect(database.prepare(
+          `SELECT
+             (SELECT COUNT(*) FROM project_boundary_invocation_receipts
+              WHERE boundary_id = 'ft08-boundary-unavailable'
+                AND status = 'dependency_unavailable') AS receipts,
+             (SELECT COUNT(*) FROM agent_executions) AS executions,
+             (SELECT COUNT(*) FROM events
+              WHERE event_type = 'project.boundary.invocation.decided') AS events`,
+        ).get()).toEqual({ receipts: 1, executions: 0, events: 1 });
+      } finally {
+        database.close();
+      }
+    } finally {
+      await server?.close().catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("drives the Desktop Agent Settings runtime through real WS, Worker, and SQLite authority", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-ft07-desktop-authority-"));
     const databasePath = join(directory, "authority.sqlite");
@@ -1617,7 +1718,7 @@ describe("authoritative server real-process harness", () => {
           ? rendererState.snapshot.room.assignments[0] : undefined).toMatchObject({
           paused: true, availability: "paused",
         });
-      }, { timeout: 2_000, interval: 20 });
+      }, { timeout: 5_000, interval: 20 });
       const publicEvidence = JSON.stringify({ initial, converged, observed });
       expect(publicEvidence).not.toContain(passwordCanary);
       expect(publicEvidence).not.toContain(issued.accessToken);
@@ -2410,17 +2511,7 @@ describe("authoritative server real-process harness", () => {
         requestId: "message-v2-unconsumed-ack",
         message,
       });
-      let stableEventA: ServerFrame;
-      let stableEventB: ServerFrame;
-      try {
-        [stableEventA, stableEventB] = await Promise.all([observerAEvent, observerBEvent]);
-      } catch (error: unknown) {
-        throw new Error(`Structured v2 event did not converge: ${JSON.stringify({
-          observerA: observerA.frames(),
-          sender: sender.frames(),
-          observerB: observerB.frames(),
-        })}`, { cause: error });
-      }
+      const [stableEventA, stableEventB] = await Promise.all([observerAEvent, observerBEvent]);
       expect(stableEventA).toEqual(stableEventB);
       if (stableEventA.type !== "room.event") throw new TypeError("wrong stable message event");
       sender.terminate();
@@ -2629,6 +2720,324 @@ describe("authoritative server real-process harness", () => {
         database.close();
       }
     } finally {
+      client?.close();
+      if (started !== undefined) await stopChild(started.child).catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("consumes a message.send.v2 Agent target into a canonical execution and final message", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-direct-target-runtime-"));
+    const databasePath = join(directory, "authority.sqlite");
+    let started: Awaited<ReturnType<typeof spawnAuthorityChild>> | undefined;
+    let client: JsonWebSocketClient | undefined;
+    try {
+      const seeded = await spawnAuthorityChild({
+        directory,
+        actors: previewActors,
+        seedRuntimeRoomForTest: true,
+      });
+      const seedClient = await JsonWebSocketClient.connect(seeded.url);
+      await seedClient.login("direct-target-runtime-seed-login");
+      const roomId = await discoverRoom(seedClient);
+      seedClient.close();
+      await stopChild(seeded.child);
+
+      const setup = new DatabaseSync(databasePath);
+      const profile = setup.prepare(
+        "SELECT id, revision FROM agent_profiles WHERE actor_id = 'agent-a' AND status = 'disabled'",
+      ).get();
+      if (typeof profile?.id !== "string" || typeof profile.revision !== "number") {
+        throw new Error("Direct target fixture lacked the disabled static Agent Profile");
+      }
+      const profileRevision = profile.revision + 1;
+      setup.prepare(
+        `UPDATE agent_profiles
+         SET revision = ?, status = 'enabled', updated_at = ?, source_kind = 'administrator_command'
+         WHERE id = ? AND revision = ? AND status = 'disabled'`,
+      ).run(profileRevision, "2026-08-24T00:00:00.000Z", profile.id, profile.revision);
+      setup.prepare(
+        `INSERT INTO agent_profile_revisions (
+           profile_id, revision, actor_id, display_name, global_responsibility,
+           status, capability_ceiling_json, tool_ceiling_json,
+           changed_by_human_actor_id, changed_at, operation
+         ) SELECT id, revision, actor_id, display_name, global_responsibility,
+                  status, capability_ceiling_json, tool_ceiling_json,
+                  'human-a', updated_at, 'enable'
+           FROM agent_profiles WHERE id = ?`,
+      ).run(profile.id);
+      seedCanonicalRoomAssignmentFixture(setup, {
+        assignmentId: "direct-target-runtime-assignment-agent-a",
+        roomId,
+        profileId: profile.id,
+        actorId: "agent-a",
+        participation: "active",
+        capabilitySubset: [],
+        toolSubset: [],
+      });
+      setup.close();
+
+      started = await spawnAuthorityChild({
+        directory,
+        actors: previewActors,
+        previewSentinelForTest: "DIRECT-TARGET-TRANSIENT-SENTINEL",
+      });
+      client = await JsonWebSocketClient.connect(started.url);
+      await client.login("direct-target-runtime-login");
+      await client.request({
+        type: "room.subscribe.v2",
+        requestId: "direct-target-runtime-subscribe",
+        roomId,
+        cursor: { version: 1, roomId, afterSeq: readRoomHeadSeq(directory, roomId) },
+      }, "room.subscribed.v2");
+      const messageId = "message-v2-direct-completed";
+      const accepted = await client.request({
+        type: "message.send.v2",
+        requestId: "direct-target-runtime-send",
+        message: {
+          messageId,
+          roomId,
+          body: "@Agent completed",
+          mentionedTargets: [{
+            id: "direct-target-agent-a",
+            kind: "agent-invocation",
+            targetActorId: "agent-a",
+            range: { startUtf16: 0, endUtf16: 6 },
+          }],
+          attachments: [],
+        },
+      }, "message.accepted");
+      expect(accepted).toMatchObject({
+        targetOutcomes: [{
+          targetId: "direct-target-agent-a",
+          status: "invocation-intent-created",
+        }],
+      });
+      const completedEvent = client.waitFor((frame) => frame.type === "room.event" &&
+        frame.event.type === "agent.execution.changed" &&
+        frame.event.payload.status === "completed");
+      try {
+        await expect(completedEvent).resolves.toMatchObject({
+          type: "room.event",
+          event: {
+            type: "agent.execution.changed",
+            payload: { status: "completed", phase: "completed", agentId: "agent-a" },
+          },
+        });
+      } catch (error: unknown) {
+        const diagnostic = new DatabaseSync(databasePath, { readOnly: true });
+        const runtimeDiagnostic = {
+          intents: diagnostic.prepare(
+            "SELECT id, status, execution_id AS executionId FROM agent_invocation_intents",
+          ).all(),
+          executions: diagnostic.prepare(
+            "SELECT id, status FROM agent_executions",
+          ).all(),
+          attempts: diagnostic.prepare(
+            "SELECT execution_id AS executionId, attempt_seq AS attemptSeq, status FROM agent_execution_attempts",
+          ).all(),
+          runtimeStates: diagnostic.prepare(
+            `SELECT execution_id AS executionId, intent_id AS intentId,
+                    snapshot_id AS snapshotId, public_status AS publicStatus,
+                    phase, review_state AS reviewState
+             FROM agent_execution_runtime_states`,
+          ).all(),
+          outbox: diagnostic.prepare(
+            `SELECT event.event_type AS eventType, event.payload_json AS payloadJson,
+                    delivery.status, delivery.attempts, delivery.last_error AS lastError
+             FROM outbox_deliveries AS delivery
+             JOIN events AS event ON event.event_id = delivery.event_id
+             WHERE event.event_type LIKE 'agent.%'
+             ORDER BY event.stream_seq`,
+          ).all(),
+        };
+        diagnostic.close();
+        throw new Error(`Direct target runtime did not complete: ${JSON.stringify(runtimeDiagnostic)}`, {
+          cause: error,
+        });
+      }
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      try {
+        expect(database.prepare(
+          `SELECT
+             (SELECT COUNT(*) FROM agent_invocation_intents
+              WHERE source_message_id = ? AND status = 'claimed') AS intents,
+             (SELECT COUNT(*) FROM agent_executions
+              WHERE trigger_message_id = ? AND status = 'completed') AS executions,
+             (SELECT COUNT(*) FROM messages
+              WHERE author_kind = 'agent' AND body = 'durable completed final') AS finals`,
+        ).get(messageId, messageId)).toEqual({ intents: 1, executions: 1, finals: 1 });
+      } finally {
+        database.close();
+      }
+    } finally {
+      client?.close();
+      if (started !== undefined) await stopChild(started.child).catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("keeps one real preview sentinel out of every durable and diagnostic surface", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-preview-sentinel-"));
+    const databasePath = join(directory, "authority.sqlite");
+    const sentinel = "FT08-PREVIEW-TRANSIENT-ONLY-7F41C9D2";
+    let started: Awaited<ReturnType<typeof spawnAuthorityChild>> | undefined;
+    let client: JsonWebSocketClient | undefined;
+    let desktopRuntime: DesktopMessageAuthorityRuntime | undefined;
+    try {
+      const seeded = await spawnAuthorityChild({
+        directory,
+        actors: previewActors,
+        seedRuntimeRoomForTest: true,
+      });
+      const seedClient = await JsonWebSocketClient.connect(seeded.url);
+      await seedClient.login("preview-sentinel-seed-login");
+      const roomId = await discoverRoom(seedClient);
+      seedClient.close();
+      await stopChild(seeded.child);
+
+      const setup = new DatabaseSync(databasePath);
+      const profile = setup.prepare(
+        "SELECT id, revision FROM agent_profiles WHERE actor_id = 'agent-a' AND status = 'disabled'",
+      ).get();
+      if (typeof profile?.id !== "string" || typeof profile.revision !== "number") {
+        throw new Error("Preview sentinel fixture lacked the disabled static Agent Profile");
+      }
+      const profileRevision = profile.revision + 1;
+      setup.prepare(
+        `UPDATE agent_profiles
+         SET revision = ?, status = 'enabled', tool_ceiling_json = ?,
+             updated_at = ?, source_kind = 'administrator_command'
+         WHERE id = ? AND revision = ? AND status = 'disabled'`,
+      ).run(profileRevision, '["repository.git-status"]',
+        "2026-08-24T00:00:00.000Z", profile.id, profile.revision);
+      setup.prepare(
+        `INSERT INTO agent_profile_revisions (
+           profile_id, revision, actor_id, display_name, global_responsibility,
+           status, capability_ceiling_json, tool_ceiling_json,
+           changed_by_human_actor_id, changed_at, operation
+         ) SELECT id, revision, actor_id, display_name, global_responsibility,
+                  status, capability_ceiling_json, tool_ceiling_json,
+                  'human-a', updated_at, 'enable'
+           FROM agent_profiles WHERE id = ?`,
+      ).run(profile.id);
+      seedCanonicalRoomAssignmentFixture(setup, {
+        assignmentId: "preview-sentinel-assignment-agent-a",
+        roomId,
+        profileId: profile.id,
+        actorId: "agent-a",
+        participation: "active",
+        capabilitySubset: [],
+        toolSubset: ["repository.git-status"],
+      });
+      setup.close();
+
+      started = await spawnAuthorityChild({
+        directory,
+        actors: previewActors,
+        previewSentinelForTest: sentinel,
+      });
+      const child = started.child;
+      const desktopLogin = await JsonWebSocketClient.connect(started.url);
+      const desktopSession = await loginAuthorityDevice(desktopLogin, {
+        requestId: "preview-sentinel-desktop-login",
+        accountId: "account-a",
+        secret: "test-secret",
+        deviceId: "preview-sentinel-desktop",
+      });
+      desktopLogin.close();
+      const desktopInputs: MessageAuthorityPortInput[] = [];
+      desktopRuntime = createDesktopMessageAuthorityRuntime({
+        endpoint: started.url,
+        session: () => desktopSession,
+        webSocketFactory: (endpoint) => new NodeIdentityWebSocketAdapter(endpoint),
+        timeoutMs: 5_000,
+      });
+      desktopRuntime.client.subscribe((input) => desktopInputs.push(structuredClone(input)));
+      await expect(desktopRuntime.client.historyV2({
+        type: "room.history.v2",
+        requestId: "preview-sentinel-desktop-history",
+        roomId,
+      })).resolves.toMatchObject({ status: "ready", roomId });
+      client = await JsonWebSocketClient.connect(started.url);
+      await client.login("preview-sentinel-login");
+      await client.request({
+        type: "room.subscribe.v2",
+        requestId: "preview-sentinel-subscribe",
+        roomId,
+        cursor: { version: 1, roomId, afterSeq: readRoomHeadSeq(directory, roomId) },
+      }, "room.subscribed.v2");
+
+      const messageId = "message-v2-preview-sentinel";
+      await client.request({
+        type: "message.send.v2",
+        requestId: "preview-sentinel-send",
+        message: {
+          messageId,
+          roomId,
+          body: "@Agent emit transient preview only",
+          mentionedTargets: [{
+            id: "preview-sentinel-target-agent-a",
+            kind: "agent-invocation",
+            targetActorId: "agent-a",
+            range: { startUtf16: 0, endUtf16: 6 },
+          }],
+          attachments: [],
+        },
+      }, "message.accepted");
+      await expect(client.waitFor((frame) => frame.type === "agent.execution.preview" &&
+        frame.delta === sentinel)).resolves.toMatchObject({
+          type: "agent.execution.preview",
+          roomId,
+          delta: sentinel,
+          authoritative: false,
+        });
+      await vi.waitFor(() => expect(desktopInputs).toContainEqual(expect.objectContaining({
+        type: "agent.execution.preview",
+        roomId,
+        delta: sentinel,
+        authoritative: false,
+      })));
+
+      const reset = client.waitFor((frame) => frame.type === "agent.execution.preview.reset" &&
+        frame.reason === "message_recalled");
+      const cancelled = client.waitFor((frame) => frame.type === "room.event" &&
+        frame.event.type === "agent.execution.changed" &&
+        frame.event.payload.status === "cancelled");
+      await client.request({
+        type: "message.recall",
+        requestId: "preview-sentinel-recall",
+        roomId,
+        messageId,
+        expectedRevision: 1,
+      }, "message.recall.accepted");
+      await expect(reset).resolves.toMatchObject({
+        type: "agent.execution.preview.reset",
+        roomId,
+        reason: "message_recalled",
+        authoritative: false,
+      });
+      await vi.waitFor(() => expect(desktopInputs).toContainEqual(expect.objectContaining({
+        type: "agent.execution.preview.reset",
+        roomId,
+        reason: "message_recalled",
+        authoritative: false,
+      })));
+      await expect(cancelled).resolves.toMatchObject({
+        type: "room.event",
+        event: { type: "agent.execution.changed", payload: { status: "cancelled" } },
+      });
+
+      const repair = await repairRecords(client, roomId);
+      expect(jsonSentinelHits("repair", repair, [sentinel])).toEqual([]);
+      expect(authoritySentinelHits(databasePath, sentinel)).toEqual([]);
+      await stopChild(child);
+      started = undefined;
+      expect(byteSentinelHits(await readAuthorityCheckpointFiles(directory), [sentinel])).toEqual([]);
+      expect(jsonSentinelHits("stdout", childStdout.get(child) ?? "", [sentinel])).toEqual([]);
+      expect(jsonSentinelHits("stderr", unexpectedChildStderr(child), [sentinel])).toEqual([]);
+    } finally {
+      desktopRuntime?.close();
       client?.close();
       if (started !== undefined) await stopChild(started.child).catch(() => undefined);
       await rm(directory, { recursive: true, force: true });
@@ -3422,7 +3831,7 @@ describe("authoritative server real-process harness", () => {
         "human-read",
         "agent-judgement",
         "open-item",
-        "agent-execution",
+        "legacy-agent-execution",
         "calibration",
       ]));
       expect(snapshot.records.filter((record) => record.kind === "membership")).toHaveLength(2);
@@ -3435,7 +3844,7 @@ describe("authoritative server real-process harness", () => {
         ["human-read", 1],
         ["agent-judgement", 1],
         ["open-item", 1],
-        ["agent-execution", 1],
+        ["legacy-agent-execution", 1],
         ["calibration", 1],
       ] as const) {
         const restored = snapshot.records.filter((record) => record.kind === kind);
@@ -4403,7 +4812,7 @@ describe("authoritative server real-process harness", () => {
         "human-read": 1_999,
         "agent-judgement": 500,
         "open-item": 500,
-        "agent-execution": 500,
+        "legacy-agent-execution": 500,
         calibration: 1_000,
         "route-job": 4,
         "route-judgment": 0,

@@ -105,7 +105,7 @@ async function expectDatabasePathReusable(path: string): Promise<void> {
   const replacement = trackClient(
     await createWorkerDatabaseClient({ databasePath: path }),
   );
-  await expect(replacement.inspectSchema()).resolves.toEqual({ version: 21 });
+  await expect(replacement.inspectSchema()).resolves.toEqual({ version: 22 });
 }
 
 async function expectDatabasePathEventuallyReusable(path: string): Promise<void> {
@@ -144,7 +144,7 @@ function workerThatRuns(scriptBody: string): Worker {
         parentPort.postMessage({
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 21,
+          schemaVersion: 22,
         });
         return;
       }
@@ -210,7 +210,7 @@ class MessageErrorTransport extends EventEmitter implements AuthorityWorkerTrans
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 21,
+          schemaVersion: 22,
         } satisfies AuthorityWorkerResponse);
       });
       return;
@@ -231,7 +231,7 @@ class OperationStorageProbeTransport extends EventEmitter implements AuthorityWo
       queueMicrotask(() => this.emit("message", {
         type: "authority.ready",
         requestId: request.requestId,
-        schemaVersion: 21,
+        schemaVersion: 22,
       } satisfies AuthorityWorkerResponse));
       return;
     }
@@ -259,7 +259,7 @@ class OperationStorageProbeTransport extends EventEmitter implements AuthorityWo
     queueMicrotask(() => this.emit("message", {
       type: "authority.schema",
       requestId: request.requestId,
-      schemaVersion: 21,
+      schemaVersion: 22,
     } satisfies AuthorityWorkerResponse));
   }
 
@@ -277,7 +277,7 @@ class CapabilityProbeTransport extends EventEmitter implements AuthorityWorkerTr
       queueMicrotask(() => this.emit("message", {
         type: "authority.ready",
         requestId: request.requestId,
-        schemaVersion: 21,
+        schemaVersion: 22,
       } satisfies AuthorityWorkerResponse));
       return;
     }
@@ -312,7 +312,7 @@ class SyncResultProbeTransport extends EventEmitter implements AuthorityWorkerTr
       queueMicrotask(() => this.emit("message", {
         type: "authority.ready",
         requestId: request.requestId,
-        schemaVersion: 21,
+        schemaVersion: 22,
       } satisfies AuthorityWorkerResponse));
       return;
     }
@@ -343,7 +343,7 @@ class CompactionResultProbeTransport extends EventEmitter implements AuthorityWo
       queueMicrotask(() => this.emit("message", {
         type: "authority.ready",
         requestId: request.requestId,
-        schemaVersion: 21,
+        schemaVersion: 22,
       } satisfies AuthorityWorkerResponse));
       return;
     }
@@ -356,6 +356,56 @@ class CompactionResultProbeTransport extends EventEmitter implements AuthorityWo
   async terminate(): Promise<number> {
     return 0;
   }
+}
+
+class PreviewDeliveryBarrierProbeTransport extends EventEmitter implements AuthorityWorkerTransport {
+  readonly requests: AuthorityWorkerRequest[] = [];
+  #previewRequest: Extract<AuthorityWorkerRequest, { type: "authority.runtime" }> | undefined;
+
+  postMessage(request: AuthorityWorkerRequest): void {
+    this.requests.push(request);
+    if (request.type === "authority.initialize") {
+      queueMicrotask(() => this.emit("message", {
+        type: "authority.ready",
+        requestId: request.requestId,
+        schemaVersion: 22,
+      } satisfies AuthorityWorkerResponse));
+      return;
+    }
+    if (request.type === "authority.close") {
+      queueMicrotask(() => this.emit("message", {
+        type: "authority.closed",
+        requestId: request.requestId,
+      } satisfies AuthorityWorkerResponse));
+      return;
+    }
+    if (request.type !== "authority.runtime") throw new Error("unexpected barrier probe request");
+    if (request.operation.type === "runtime.preview-authorize") {
+      this.#previewRequest = request;
+      return;
+    }
+    queueMicrotask(() => this.emit("message", {
+      type: "authority.runtime-result",
+      requestId: request.requestId,
+      result: { kind: "runtime-recovery", records: [], hasMore: false },
+    } satisfies AuthorityWorkerResponse));
+  }
+
+  authorizePreview(): void {
+    if (this.#previewRequest === undefined) throw new Error("preview request was not posted");
+    this.emit("message", {
+      type: "authority.runtime-result",
+      requestId: this.#previewRequest.requestId,
+      result: {
+        kind: "preview-authority",
+        authorized: true,
+        authorityEpoch: "epoch:1",
+        subscriptionGeneration: 1,
+      },
+    } satisfies AuthorityWorkerResponse);
+  }
+
+  async terminate(): Promise<number> { return 0; }
 }
 
 class ThrowingPostTransport extends EventEmitter implements AuthorityWorkerTransport {
@@ -375,7 +425,7 @@ class ThrowingPostTransport extends EventEmitter implements AuthorityWorkerTrans
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 21,
+          schemaVersion: 22,
         } satisfies AuthorityWorkerResponse);
       });
     }
@@ -398,7 +448,7 @@ class DeferredTerminationTransport
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 21,
+          schemaVersion: 22,
         } satisfies AuthorityWorkerResponse);
       });
       return;
@@ -427,7 +477,7 @@ class RejectingTerminationTransport
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 21,
+          schemaVersion: 22,
         } satisfies AuthorityWorkerResponse);
       });
       return;
@@ -455,7 +505,7 @@ class CloseRaceTransport extends EventEmitter implements AuthorityWorkerTranspor
         this.emit("message", {
           type: "authority.ready",
           requestId: request.requestId,
-          schemaVersion: 21,
+          schemaVersion: 22,
         } satisfies AuthorityWorkerResponse);
       });
       return;
@@ -484,7 +534,7 @@ class CloseRaceTransport extends EventEmitter implements AuthorityWorkerTranspor
     this.emit("message", {
       type: "authority.schema",
       requestId: this.#inspectRequest.requestId,
-      schemaVersion: 21,
+      schemaVersion: 22,
     } satisfies AuthorityWorkerResponse);
   }
 
@@ -873,7 +923,7 @@ describe("AuthorityWorker closed protocol", () => {
       isAuthorityWorkerResponse({
         type: "authority.ready",
         requestId: "1",
-        schemaVersion: 21,
+        schemaVersion: 22,
       }),
     ).toBe(true);
     expect(isAuthorityWorkerResponse({
@@ -990,7 +1040,7 @@ describe("AuthorityWorker closed protocol", () => {
       isAuthorityWorkerResponse({
         type: "authority.schema",
         requestId: "2",
-        schemaVersion: 21,
+        schemaVersion: 22,
       }),
     ).toBe(true);
     expect(
@@ -1063,7 +1113,7 @@ describe("AuthorityWorker closed protocol", () => {
       isAuthorityWorkerResponse({
         type: "authority.schema",
         requestId: "5",
-        schemaVersion: 21,
+        schemaVersion: 22,
         rows: [],
       }),
     ).toBe(false);
@@ -1139,7 +1189,7 @@ describe("AuthorityWorker closed protocol", () => {
     let response = once(worker, "message");
     worker.postMessage({ type: "authority.initialize", requestId: "1" });
     await expect(response).resolves.toEqual([
-      { type: "authority.ready", requestId: "1", schemaVersion: 21 },
+      { type: "authority.ready", requestId: "1", schemaVersion: 22 },
     ]);
 
     response = once(worker, "message");
@@ -1156,7 +1206,7 @@ describe("AuthorityWorker closed protocol", () => {
     response = once(worker, "message");
     worker.postMessage({ type: "authority.inspect-schema", requestId: "2" });
     await expect(response).resolves.toEqual([
-      { type: "authority.schema", requestId: "2", schemaVersion: 21 },
+      { type: "authority.schema", requestId: "2", schemaVersion: 22 },
     ]);
   });
 });
@@ -1223,7 +1273,7 @@ describe("authority database coordinator registry", () => {
     const initialized = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
-    await expect(initialized.inspectSchema()).resolves.toEqual({ version: 21 });
+    await expect(initialized.inspectSchema()).resolves.toEqual({ version: 22 });
     await initialized.close();
     linkSync(path, aliasPath);
 
@@ -1254,7 +1304,7 @@ describe("authority database coordinator registry", () => {
     const replacement = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
-    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 21 });
+    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 22 });
   });
 
   it("rejects a hardlink added while the original database is live", async () => {
@@ -1263,7 +1313,7 @@ describe("authority database coordinator registry", () => {
     const original = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
-    await expect(original.inspectSchema()).resolves.toEqual({ version: 21 });
+    await expect(original.inspectSchema()).resolves.toEqual({ version: 22 });
     linkSync(path, aliasPath);
 
     let spawnCount = 0;
@@ -1282,7 +1332,7 @@ describe("authority database coordinator registry", () => {
     expect((aliasError as { cause?: unknown }).cause).toBeUndefined();
     expect(publicErrorSurface(aliasError)).not.toContain(path);
     expect(publicErrorSurface(aliasError)).not.toContain(aliasPath);
-    await expect(original.inspectSchema()).resolves.toEqual({ version: 21 });
+    await expect(original.inspectSchema()).resolves.toEqual({ version: 22 });
   });
 
   it("atomically reserves a dangling relative symlink chain with its future target", async () => {
@@ -1324,7 +1374,7 @@ describe("authority database coordinator registry", () => {
     const replacement = trackClient(
       await createWorkerDatabaseClient({ databasePath: otherPath }),
     );
-    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 21 });
+    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 22 });
   });
 
   it("rejects a symlink cycle with a stable path-free error", async () => {
@@ -1357,7 +1407,7 @@ describe("authority database coordinator registry", () => {
     const replacement = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
-    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 21 });
+    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 22 });
   });
 
   it("releases the path after initialization failure so a retry can succeed", async () => {
@@ -1397,7 +1447,7 @@ describe("authority database coordinator registry", () => {
       code: "storage_unavailable",
       status: 503,
     });
-    await expect(client.inspectSchema()).resolves.toEqual({ version: 21 });
+    await expect(client.inspectSchema()).resolves.toEqual({ version: 22 });
   });
 
   it("releases the path after a worker crash so a replacement can start", async () => {
@@ -1415,7 +1465,7 @@ describe("authority database coordinator registry", () => {
     const replacement = trackClient(
       await createWorkerDatabaseClient({ databasePath: path }),
     );
-    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 21 });
+    await expect(replacement.inspectSchema()).resolves.toEqual({ version: 22 });
   });
 
   it("keeps the path reserved until terminal transport teardown completes", async () => {
@@ -1511,7 +1561,7 @@ describe("authority database coordinator registry", () => {
 
     await expect(
       Promise.all([first.inspectSchema(), second.inspectSchema()]),
-    ).resolves.toEqual([{ version: 21 }, { version: 21 }]);
+    ).resolves.toEqual([{ version: 22 }, { version: 22 }]);
   });
 });
 
@@ -1590,6 +1640,74 @@ describe("public worker transport errors", () => {
 });
 
 describe("WorkerDatabaseClient", () => {
+  it("holds later authority mutations behind the synchronous preview delivery continuation", async () => {
+    const transport = new PreviewDeliveryBarrierProbeTransport();
+    const client = trackClient(await createWorkerDatabaseClientForTest(
+      { databasePath: databasePath() },
+      () => transport,
+    ));
+    const preview = client.executeRuntimeWithSynchronousDelivery({
+      type: "runtime.preview-authorize",
+      context: {
+        sessionId: "session-preview-barrier",
+        sessionFamilyId: "family-preview-barrier",
+        principal: { accountId: "account-human-1", actorId: "human-1" },
+      },
+      roomId: "room-1",
+      executionId: "execution-1",
+      attemptSeq: 1,
+      deliveryKind: "preview",
+      subscriptionGeneration: 1,
+      now: 1_755_000_000_000,
+    }, (result) => {
+      expect(result).toMatchObject({ kind: "preview-authority", authorized: true });
+      expect(transport.requests.filter(({ type }) => type === "authority.runtime")).toHaveLength(1);
+      return undefined;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(transport.requests.filter(({ type }) => type === "authority.runtime")).toHaveLength(1);
+
+    const laterTerminalMutation = client.executeRuntime({
+      type: "runtime.recover",
+      now: 1_755_000_000_001,
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(transport.requests.filter(({ type }) => type === "authority.runtime")).toHaveLength(1);
+
+    transport.authorizePreview();
+    await preview;
+    await laterTerminalMutation;
+    expect(transport.requests.filter(({ type }) => type === "authority.runtime")).toHaveLength(2);
+    expect(transport.requests.at(-1)).toMatchObject({
+      type: "authority.runtime",
+      operation: { type: "runtime.recover" },
+    });
+  });
+
+  it("releases the authority gate when the synchronous delivery continuation throws", async () => {
+    const transport = new PreviewDeliveryBarrierProbeTransport();
+    const client = trackClient(await createWorkerDatabaseClientForTest(
+      { databasePath: databasePath() },
+      () => transport,
+    ));
+    const preview = client.executeRuntimeWithSynchronousDelivery({
+      type: "runtime.preview-authorize",
+      context: {
+        sessionId: "session-preview-throw",
+        sessionFamilyId: "family-preview-throw",
+        principal: { accountId: "account-human-1", actorId: "human-1" },
+      },
+      roomId: "room-1", executionId: "execution-1", attemptSeq: 1,
+      deliveryKind: "preview", subscriptionGeneration: 1, now: 1_755_000_000_000,
+    }, () => { throw new Error("socket closed during synchronous delivery"); });
+    const laterMutation = client.executeRuntime({ type: "runtime.recover", now: 1_755_000_000_001 });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    transport.authorizePreview();
+
+    await expect(preview).rejects.toThrow("socket closed during synchronous delivery");
+    await expect(laterMutation).resolves.toMatchObject({ kind: "runtime-recovery" });
+  });
+
   it("maps the closed Profile fan-out capacity code to 429", () => {
     expect(isAuthorityWorkerErrorCode("profile_fanout_capacity_limited")).toBe(true);
     expect(new AuthorityWorkerClientError(
@@ -1907,7 +2025,7 @@ describe("WorkerDatabaseClient", () => {
 
     await expect(heartbeat).resolves.toBeUndefined();
     const client = trackClient(await opening);
-    await expect(client.inspectSchema()).resolves.toEqual({ version: 21 });
+    await expect(client.inspectSchema()).resolves.toEqual({ version: 22 });
   });
 
   it("correlates concurrent responses to monotonically increasing request IDs", async () => {
@@ -1934,7 +2052,7 @@ describe("WorkerDatabaseClient", () => {
         setImmediate(() => parentPort.postMessage({
           type: "authority.schema",
           requestId: first.requestId,
-          schemaVersion: 21,
+          schemaVersion: 22,
         }));
       }
     `);
@@ -1948,7 +2066,7 @@ describe("WorkerDatabaseClient", () => {
     const first = client.inspectSchema();
     const secondRejection = rejectionOf(client.inspectSchema());
 
-    await expect(first).resolves.toEqual({ version: 21 });
+    await expect(first).resolves.toEqual({ version: 22 });
     await expect(secondRejection).resolves.toMatchObject({
       code: "invalid_request",
       status: 400,
@@ -2016,7 +2134,7 @@ describe("WorkerDatabaseClient", () => {
       parentPort.postMessage({
         type: "authority.schema",
         requestId: request.requestId,
-        schemaVersion: 21,
+        schemaVersion: 22,
         extra: true,
       });
     `);

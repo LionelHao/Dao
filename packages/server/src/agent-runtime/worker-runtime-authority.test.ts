@@ -4,13 +4,21 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
-import type { Actor } from "@native-im/core";
+import { isScopedCancellationReceipt, type Actor } from "@native-im/core";
 import { createSqliteAuthoritativeStore } from "../persistence/sqlite-authoritative-store.js";
 import { insertLegacyMessageAuthorityRecord } from "../persistence/message-authority-legacy-adapter.js";
 import { migrateAuthorityDatabase } from "../persistence/schema.js";
-import { createWorkerDatabaseClient } from "../persistence/worker-database-client.js";
+import {
+  createWorkerDatabaseClient,
+  type WorkerDatabaseClient,
+} from "../persistence/worker-database-client.js";
+import { createSnapshotWorkerClient } from "../persistence/snapshot-worker-client.js";
 import { registerMemoryCorpusSource } from "../room-memory/corpus-database-authority.js";
-import { createWorkerRuntimeAuthority } from "./worker-runtime-authority.js";
+import {
+  createWorkerRuntimeAuthority,
+  createWorkerRuntimeRecoveryAuthority,
+} from "./worker-runtime-authority.js";
+import { isRuntimeAuthorityOperation } from "./runtime-authority-protocol.js";
 import { createToolGateway } from "./tool-gateway.js";
 import { createRepositoryGitStatusAdapter } from "./tools/repository-git-status.js";
 import { createSandboxFileWriteAdapter } from "./tools/sandbox-file-write.js";
@@ -28,6 +36,141 @@ const actors = [
 ] as const satisfies readonly Actor[];
 
 describe("real AuthorityWorker runtime authority", () => {
+  it("rejects unowned, expired, and non-canonical recovery leases at the worker boundary", () => {
+    const now = Date.parse("2026-08-25T00:00:00.000Z");
+    const valid = {
+      type: "runtime.recovery-scan",
+      limit: 256,
+      includeRunning: false,
+      leaseOwner: "worker-a",
+      leaseExpiresAt: "2026-08-25T00:05:00.000Z",
+      now,
+    } as const;
+    expect(isRuntimeAuthorityOperation(valid)).toBe(true);
+    expect(isRuntimeAuthorityOperation({
+      ...valid, leaseOwner: "",
+    })).toBe(false);
+    expect(isRuntimeAuthorityOperation({
+      ...valid, leaseExpiresAt: "2026-08-24T23:59:59.999Z",
+    })).toBe(false);
+    expect(isRuntimeAuthorityOperation({
+      ...valid, leaseExpiresAt: "2026-08-25T08:05:00.000+08:00",
+    })).toBe(false);
+    const preview = {
+      type: "runtime.preview-authorize",
+      context: {
+        sessionId: "session-preview",
+        sessionFamilyId: "family-preview",
+        principal: { accountId: "account-preview", actorId: "human-runtime" },
+      },
+      roomId: "room-preview",
+      executionId: "execution-preview",
+      attemptSeq: 1,
+      deliveryKind: "preview",
+      subscriptionGeneration: 3,
+      now,
+    } as const;
+    expect(isRuntimeAuthorityOperation(preview)).toBe(true);
+    expect(isRuntimeAuthorityOperation({ ...preview, attemptSeq: 0 })).toBe(false);
+    expect(isRuntimeAuthorityOperation({ ...preview, deliveryKind: "durable" })).toBe(false);
+    expect(isRuntimeAuthorityOperation({
+      ...preview, expectedAuthorityEpoch: "",
+    })).toBe(false);
+  });
+
+  it("allows repeated post-commit recovery generations without re-fencing live running work", async () => {
+    const executeRuntime = vi.fn(async (operation: { type: string }) => {
+      if (operation.type === "runtime.recovery-isolate") return { kind: "recovery-isolated" };
+      if (operation.type === "runtime.recovery-settle") return { kind: "recovery-settled" };
+      if (operation.type === "runtime.recovery-release") {
+        return { kind: "recovery-released", released: 224 };
+      }
+      return { kind: "recovery-page", candidates: [], hasMore: false };
+    });
+    const recovery = createWorkerRuntimeRecoveryAuthority({
+      executeRuntime,
+    } as unknown as WorkerDatabaseClient);
+
+    await recovery.scan({ limit: 256 });
+    await recovery.scan({ limit: 256 });
+    await recovery.isolate({
+      cursor: "00000000000000000001",
+      candidateId: "execution-poison",
+      reason: "recovery_candidate_invalid",
+    });
+    await recovery.settle?.({
+      cursor: "00000000000000000002",
+      candidateId: "execution-success",
+    });
+    await expect(recovery.release?.()).resolves.toBe(224);
+
+    expect(executeRuntime.mock.calls[0]?.[0]).toMatchObject({
+      type: "runtime.recovery-scan", includeRunning: true, limit: 256,
+      leaseOwner: expect.any(String), leaseExpiresAt: expect.any(String),
+    });
+    expect(executeRuntime.mock.calls[1]?.[0]).toMatchObject({
+      type: "runtime.recovery-scan", includeRunning: false, limit: 256,
+      leaseOwner: expect.any(String), leaseExpiresAt: expect.any(String),
+    });
+    expect(executeRuntime.mock.calls[2]?.[0]).toMatchObject({
+      type: "runtime.recovery-isolate",
+      cursor: "00000000000000000001",
+      candidateId: "execution-poison",
+      leaseOwner: expect.any(String),
+    });
+    expect(executeRuntime.mock.calls[3]?.[0]).toMatchObject({
+      type: "runtime.recovery-settle",
+      cursor: "00000000000000000002",
+      candidateId: "execution-success",
+      leaseOwner: expect.any(String),
+    });
+    expect(executeRuntime.mock.calls[4]?.[0]).toMatchObject({
+      type: "runtime.recovery-release",
+      leaseOwner: expect.any(String),
+    });
+    const leaseOwners = executeRuntime.mock.calls.map(([operation]) =>
+      "leaseOwner" in operation ? operation.leaseOwner : undefined).filter(Boolean);
+    expect(leaseOwners).toHaveLength(5);
+    expect(new Set(leaseOwners).size).toBe(1);
+  });
+
+  it("rejects a retry receipt whose full lineage binding differs from the durable reread", async () => {
+    const createdAt = "2026-08-25T00:00:00.000Z";
+    const receipt = {
+      requestId: "retry-binding-request", sourceExecutionId: "execution-source",
+      executionId: "execution-child", intentId: "intent-canonical",
+      lineageId: "lineage-canonical", roomId: "room-runtime", executionOrdinal: 2,
+      snapshotId: "snapshot-forged", status: "accepted" as const, createdAt,
+    };
+    const executeRuntime = vi.fn(async (operation: { type: string }) => {
+      if (operation.type === "runtime.validate-retry-receipt") {
+        return { kind: "retry-receipt-binding", receipt: {
+          ...receipt, snapshotId: "snapshot-canonical",
+        } };
+      }
+      return {
+        kind: "invocation", replayed: false,
+        execution: {
+          id: "execution-child", roomId: "room-runtime", sourceMessageId: "message-source",
+          requesterId: "human-runtime", agentId: "agent-runtime", toolName: "model.generate",
+          status: "queued", actionCategory: "model_generation", currentAttemptSeq: 1,
+          retryCycle: 1, retryOrdinal: 1, recoveryCursor: 0, queuedAt: createdAt,
+          updatedAt: createdAt, manualRetryOfExecutionId: "execution-source",
+        },
+        intent: { kind: "direct_mention", roomId: "room-runtime",
+          sourceMessageId: "message-source", targetAgentId: "agent-runtime" },
+        retryReceipt: receipt,
+      };
+    });
+    const authority = createWorkerRuntimeAuthority({ executeRuntime } as unknown as WorkerDatabaseClient);
+    await expect(authority.retry({
+      kind: "human", sessionId: "session-runtime", sessionFamilyId: "family-runtime",
+      principal: { accountId: "account-runtime", actorId: "human-runtime" },
+      requestId: receipt.requestId, idempotencyKey: receipt.requestId,
+    }, receipt.sourceExecutionId, 4)).rejects.toMatchObject({ code: "provider_failure" });
+    expect(executeRuntime).toHaveBeenCalledTimes(2);
+  });
+
   it("persists completion and recovers a running attempt after SQLite/worker restart", async () => {
     const directory = mkdtempSync(join(tmpdir(), "dao-runtime-worker-"));
     const databasePath = join(directory, "authority.sqlite");
@@ -63,9 +206,9 @@ describe("real AuthorityWorker runtime authority", () => {
           ('room-runtime', 'human-runtime', 'human', 'member', NULL, '[]',
            '2026-08-17T00:00:00.000Z', NULL, 0),
           ('room-runtime', 'agent-runtime', 'agent', NULL, 'active', '["sandbox-file.write"]',
-           NULL, '2026-08-17T00:00:00.000Z', 0),
+           NULL, '2026-08-17T00:00:00.000Z', 1),
           ('room-runtime', 'agent-git', 'agent', NULL, 'active', '["repository.git-status"]',
-           NULL, '2026-08-17T00:00:00.000Z', 0);
+           NULL, '2026-08-17T00:00:00.000Z', 1);
         UPDATE rooms SET owner_actor_id = 'human-runtime', governance_revision = 1
         WHERE id = 'room-runtime';
         UPDATE agent_profiles
@@ -115,7 +258,7 @@ describe("real AuthorityWorker runtime authority", () => {
       for (let index = 0; index < 70; index += 1) {
         const ordinal = index + 1;
         const directTarget = ordinal === 3 || ordinal === 4 ? "agent-git" : "agent-runtime";
-        if (ordinal <= 6) {
+        if (ordinal <= 9) {
           submitHumanMessageDatabaseCommand(database, {
             context: {
               ...directContext,
@@ -160,6 +303,28 @@ describe("real AuthorityWorker runtime authority", () => {
           occurredAt: new Date(Date.UTC(2026, 7, 17, 0, 0, ordinal)).toISOString(),
         });
       }
+      const pendingCancellationMessage = submitHumanMessageDatabaseCommand(database, {
+        context: {
+          ...directContext,
+          requestId: "runtime-direct-pending-cancel",
+          idempotencyKey: "runtime-direct-pending-cancel",
+        },
+        message: {
+          messageId: "message-runtime-pending-cancel",
+          roomId: "room-runtime",
+          body: "@Agent pending cancellation",
+          mentionedTargets: [{
+            id: "runtime-target-pending-cancel",
+            kind: "agent-invocation",
+            targetActorId: "agent-runtime",
+            range: { startUtf16: 0, endUtf16: 6 },
+          }],
+          attachments: [],
+        },
+        now: now + 100,
+      });
+      const pendingIntentId = pendingCancellationMessage.targetOutcomes[0]?.invocationIntentId;
+      if (pendingIntentId === undefined) throw new Error("Pending cancellation fixture lacked intent");
       database.exec(`
         INSERT INTO human_preemption_fences (
           source_human_message_id, room_id, human_actor_id, accepted_at,
@@ -168,7 +333,8 @@ describe("real AuthorityWorker runtime authority", () => {
           FROM messages
           WHERE id IN (
             'message-runtime-2', 'message-runtime-3', 'message-runtime-4',
-            'message-runtime-5', 'message-runtime-6'
+            'message-runtime-5', 'message-runtime-6', 'message-runtime-7',
+            'message-runtime-8', 'message-runtime-9'
           );
       `);
       insertLegacyMessageAuthorityRecord(database, {
@@ -228,6 +394,108 @@ describe("real AuthorityWorker runtime authority", () => {
         now: Date.now(),
       });
       let authority = createWorkerRuntimeAuthority(client);
+      await client.executeRuntime({
+        type: "runtime.create-route-for-human-message",
+        sourceHumanMessageId: "message-runtime-pending-cancel",
+        now: now + 101,
+      });
+      const pendingCancelContext = {
+        ...context,
+        requestId: "request-cancel-pending-intent",
+        idempotencyKey: "key-cancel-pending-intent",
+      };
+      const pendingCancellation = await authority.cancelScoped(
+        pendingCancelContext,
+        { intentId: pendingIntentId, expectedVersion: 1 },
+        pendingCancelContext.requestId,
+      );
+      expect(pendingCancellation).toMatchObject({
+        replayed: false,
+        receipt: {
+          requestId: pendingCancelContext.requestId,
+          scope: { kind: "intent", intentId: pendingIntentId, expectedVersion: 1 },
+          intentOutcomes: [{ intentId: pendingIntentId, outcome: "cancelled" }],
+          executionOutcomes: [],
+        },
+        effects: [{ invocationIntentId: pendingIntentId, disposition: "intent_cancelled" }],
+      });
+      await expect(authority.cancelScoped(
+        pendingCancelContext,
+        { intentId: pendingIntentId, expectedVersion: 1 },
+        pendingCancelContext.requestId,
+      )).resolves.toMatchObject({ replayed: true, receipt: pendingCancellation.receipt });
+      const recallContext = {
+        ...context,
+        requestId: "request-recall-cancelled-pending-source",
+        idempotencyKey: "key-recall-cancelled-pending-source",
+      };
+      const [firstRecall, replayedRecall] = await Promise.all([
+        client.recallHumanMessage(recallContext, {
+          roomId: "room-runtime",
+          messageId: "message-runtime-pending-cancel",
+          expectedRevision: 1,
+        }, now + 103),
+        client.recallHumanMessage(recallContext, {
+          roomId: "room-runtime",
+          messageId: "message-runtime-pending-cancel",
+          expectedRevision: 1,
+        }, now + 103),
+      ]);
+      expect([firstRecall.replayed, replayedRecall.replayed].sort()).toEqual([false, true]);
+      expect({ ...replayedRecall, replayed: firstRecall.replayed })
+        .toEqual(firstRecall);
+      expect(firstRecall).toMatchObject({
+        messageId: "message-runtime-pending-cancel",
+        revision: 1,
+        abortTargets: [],
+      });
+      const cancellationDatabase = new DatabaseSync(databasePath, { readOnly: true });
+      expect(cancellationDatabase.prepare(
+        `SELECT intent.status AS compatibilityStatus,
+                intent.cancellation_reason AS compatibilityReason,
+                runtime.public_status AS status,
+                runtime.authority_version AS authorityVersion,
+                runtime.cancellation_reason AS cancellationReason,
+                runtime.cancelled_at AS cancelledAt
+         FROM agent_invocation_intents AS intent
+         JOIN agent_invocation_intent_runtime_states AS runtime
+           ON runtime.intent_id = intent.id
+         WHERE intent.id = ?`,
+      ).get(pendingIntentId)).toMatchObject({
+        compatibilityStatus: "cancelled",
+        compatibilityReason: "message_recalled",
+        status: "cancelled",
+        authorityVersion: 2,
+        cancelledAt: expect.any(String),
+        cancellationReason: "human_cancelled",
+      });
+      expect(cancellationDatabase.prepare(
+        `SELECT COUNT(*) AS count FROM events
+         WHERE room_id = 'room-runtime'
+           AND event_type = 'agent.invocation.intent.changed'
+           AND json_extract(payload_json, '$.intentId') = ?
+           AND json_extract(payload_json, '$.status') = 'cancelled'`,
+      ).get(pendingIntentId)).toEqual({ count: 1 });
+      expect(cancellationDatabase.prepare(
+        `SELECT COUNT(*) AS count FROM events AS event
+         JOIN outbox_deliveries AS delivery ON delivery.event_id = event.event_id
+         WHERE event.room_id = 'room-runtime'
+           AND event.event_type = 'agent.invocation.scoped-cancellation.committed'
+           AND json_extract(event.payload_json, '$.requestId') = ?`,
+      ).get(pendingCancelContext.requestId)).toEqual({ count: 1 });
+      expect(cancellationDatabase.prepare(
+        `SELECT COUNT(*) AS count FROM agent_executions
+         WHERE trigger_message_id = 'message-runtime-pending-cancel'`,
+      ).get()).toEqual({ count: 0 });
+      cancellationDatabase.close();
+      await expect(authority.invoke(
+        { ...context, requestId: "request-claim-cancelled-intent",
+          idempotencyKey: "key-claim-cancelled-intent" },
+        { kind: "direct_mention", roomId: "room-runtime",
+          sourceMessageId: "message-runtime-pending-cancel", targetAgentId: "agent-runtime" },
+        "openai-responses",
+        "configured-model",
+      )).rejects.toMatchObject({ code: "execution_conflict" });
       const first = await authority.invoke(context, {
         kind: "direct_mention",
         roomId: "room-runtime",
@@ -252,7 +520,8 @@ describe("real AuthorityWorker runtime authority", () => {
         first.execution.id,
         firstContext.roomMemory.rawDelta.nextCursor!,
       );
-      expect(continuedDelta.entries.map(({ corpusSeq }) => corpusSeq)).toEqual([65, 66, 67, 68, 69, 70]);
+      expect(continuedDelta.entries.map(({ corpusSeq }) => corpusSeq))
+        .toEqual([65, 66, 67, 68, 69, 70, 71, 72]);
       expect(continuedDelta.hasMore).toBe(false);
       const runningFirst = await authority.claim(first.execution.id, 1);
       const completed = await authority.complete(runningFirst.id, 1, "durable answer");
@@ -441,6 +710,170 @@ describe("real AuthorityWorker runtime authority", () => {
       ]);
       gateway = createToolGateway({ authority, adapters: [sandboxAdapter, gitAdapter] });
 
+      const cancellable = await authority.invoke(
+        { ...context, requestId: "request-runtime-7", idempotencyKey: "key-runtime-7" },
+        { kind: "direct_mention", roomId: "room-runtime", sourceMessageId: "message-runtime-7", targetAgentId: "agent-runtime" },
+        "openai-responses",
+        "configured-model",
+      );
+      const runningCancellable = await authority.claim(cancellable.execution.id, 1);
+      const pendingCancellationTool = await authority.prepareTool(
+        runningCancellable.id,
+        1,
+        sandboxAdapter.descriptor,
+        parameters,
+        { ...context, requestId: "request-cancel-confirmation",
+          idempotencyKey: "key-cancel-confirmation" },
+        { callId: "provider-call-cancel", argumentsJson: JSON.stringify(parameters) },
+      );
+      const cancellationState = new DatabaseSync(databasePath, { readOnly: true });
+      const cancellationVersion = cancellationState.prepare(
+        `SELECT authority_version AS version
+         FROM agent_execution_runtime_states WHERE execution_id = ?`,
+      ).get(cancellable.execution.id)?.version;
+      cancellationState.close();
+      expect(cancellationVersion).toEqual(expect.any(Number));
+      const cancelContext = {
+        ...context,
+        requestId: "request-cancel-runtime-7",
+        idempotencyKey: "key-cancel-runtime-7",
+      };
+      const committedCancellation = await authority.cancelScoped(
+        cancelContext,
+        { executionId: cancellable.execution.id, expectedVersion: cancellationVersion as number },
+        cancelContext.requestId,
+      );
+      expect(committedCancellation).toMatchObject({
+        kind: "scoped-cancellation-committed",
+        roomId: "room-runtime",
+        reason: "human_cancelled",
+        replayed: false,
+        effects: [{
+          executionId: cancellable.execution.id,
+          attemptSeq: 1,
+          disposition: "execution_cancelled",
+          confirmationDisposition: "pending_rejected",
+          grantDisposition: "unclaimed_revoked",
+        }],
+        receipt: {
+          rejectedConfirmationIds: [pendingCancellationTool.confirmationId],
+          revokedGrantIds: [pendingCancellationTool.grantId],
+        },
+      });
+      await expect(authority.cancelScoped(
+        cancelContext,
+        { executionId: cancellable.execution.id, expectedVersion: cancellationVersion as number },
+        cancelContext.requestId,
+      )).resolves.toMatchObject({ replayed: true });
+      const claimedDispatchCandidate = await authority.invoke(
+        { ...context, requestId: "request-runtime-8", idempotencyKey: "key-runtime-8" },
+        { kind: "direct_mention", roomId: "room-runtime", sourceMessageId: "message-runtime-8", targetAgentId: "agent-runtime" },
+        "openai-responses",
+        "configured-model",
+      );
+      const runningClaimedDispatch = await authority.claim(claimedDispatchCandidate.execution.id, 1);
+      const claimedPrepared = await authority.prepareTool(
+        runningClaimedDispatch.id, 1, sandboxAdapter.descriptor, parameters,
+        { ...context, requestId: "request-claimed-confirmation",
+          idempotencyKey: "key-claimed-confirmation" },
+        { callId: "provider-call-claimed", argumentsJson: JSON.stringify(parameters) },
+      );
+      const claimedDispatch = await authority.claimTool(
+        runningClaimedDispatch.id,
+        1,
+        claimedPrepared.grantId,
+        parameters,
+        {
+          context: { ...context, requestId: "request-claimed-confirmation",
+            idempotencyKey: "key-claimed-confirmation" },
+          input: { confirmationId: claimedPrepared.confirmationId!,
+            executionId: runningClaimedDispatch.id },
+        },
+      );
+      const claimedState = new DatabaseSync(databasePath, { readOnly: true });
+      const claimedVersion = claimedState.prepare(
+        `SELECT authority_version AS version
+         FROM agent_execution_runtime_states WHERE execution_id = ?`,
+      ).get(runningClaimedDispatch.id)?.version;
+      claimedState.close();
+      expect(claimedVersion).toEqual(expect.any(Number));
+      const claimedCancelContext = { ...context, requestId: "request-cancel-runtime-8",
+        idempotencyKey: "key-cancel-runtime-8" };
+      await expect(authority.cancelScoped(
+        claimedCancelContext,
+        { executionId: runningClaimedDispatch.id, expectedVersion: claimedVersion as number },
+        claimedCancelContext.requestId,
+      )).resolves.toMatchObject({
+        effects: [{ grantDisposition: "claimed_retained",
+          sideEffectState: "dispatched-retained" }],
+        receipt: { preservedDispatchIds: [claimedDispatch.dispatchId] },
+      });
+      const shutdownCandidate = await authority.invoke(
+        { ...context, requestId: "request-runtime-9", idempotencyKey: "key-runtime-9" },
+        { kind: "direct_mention", roomId: "room-runtime", sourceMessageId: "message-runtime-9", targetAgentId: "agent-runtime" },
+        "openai-responses",
+        "configured-model",
+      );
+      await expect(authority.shutdown(shutdownCandidate.execution.id, 1)).resolves.toMatchObject({
+        id: shutdownCandidate.execution.id,
+        status: "cancelled",
+        cancellationReason: "runtime_shutdown",
+      });
+      const shutdownEvidence = new DatabaseSync(databasePath, { readOnly: true });
+      const shutdownStored = shutdownEvidence.prepare(
+        `SELECT response_json AS responseJson
+         FROM invocation_cancellation_receipts
+         WHERE request_id = ?`,
+      ).get(`runtime-shutdown:${shutdownCandidate.execution.id}:1`);
+      const shutdownReceipt = typeof shutdownStored?.responseJson === "string"
+        ? JSON.parse(shutdownStored.responseJson) as Record<string, unknown> : undefined;
+      expect(shutdownReceipt).toMatchObject({
+        kind: "scoped-cancellation-committed",
+        reason: "runtime_shutdown",
+        receipt: { reason: "runtime_shutdown" },
+      });
+      expect(isScopedCancellationReceipt(shutdownReceipt?.receipt)).toBe(true);
+      shutdownEvidence.close();
+      const snapshotClient = await createSnapshotWorkerClient({
+        authorityPath: databasePath,
+        cachePath: join(directory, "shutdown-repair-cache.sqlite"),
+        revalidate: async () => undefined,
+        clock: () => now + 1_000,
+        limits: { maxRecordsPerPage: 20 },
+      });
+      const repairContext = {
+        sessionId: directContext.sessionId,
+        sessionFamilyId: directContext.sessionFamilyId,
+        principal: directContext.principal,
+      };
+      const firstRepairPage = await snapshotClient.beginRoomRepair(
+        repairContext, "shutdown-repair-begin", "room-runtime",
+      );
+      if ("kind" in firstRepairPage && firstRepairPage.kind === "fallback") {
+        throw new Error("unexpected shutdown repair fallback");
+      }
+      const repairRecords = [...firstRepairPage.records];
+      let repairPage = firstRepairPage;
+      while (repairPage.hasMore) {
+        repairPage = await snapshotClient.readRoomRepairPage(
+          repairContext,
+          `shutdown-repair-${repairPage.page + 1}`,
+          firstRepairPage.snapshotId,
+          repairPage.page,
+        );
+        repairRecords.push(...repairPage.records);
+      }
+      expect(repairRecords).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          kind: "agent-scoped-cancellation",
+          value: expect.objectContaining({
+            requestId: `runtime-shutdown:${shutdownCandidate.execution.id}:1`,
+            reason: "runtime_shutdown",
+          }),
+        }),
+      ]));
+      await snapshotClient.close();
+
       const third = await authority.invoke(
         { ...context, requestId: "request-runtime-3", idempotencyKey: "key-runtime-3" },
         { kind: "direct_mention", roomId: "room-runtime", sourceMessageId: "message-runtime-3", targetAgentId: "agent-git" },
@@ -466,6 +899,7 @@ describe("real AuthorityWorker runtime authority", () => {
         signal: new AbortController().signal,
       });
       expect(gitOutcome.summary).toMatchObject({ exitCategory: "success" });
+      await authority.complete(runningThird.id, 1, "Repository status inspected");
 
       const openItem = await createSqliteAuthoritativeStore(client).executeHuman(
         { ...context, requestId: "request-open-item-failure", idempotencyKey: "key-open-item-failure" },
@@ -524,20 +958,16 @@ describe("real AuthorityWorker runtime authority", () => {
          WHERE event_type = 'room.open_item.agent_attempt_failed'`,
       ).get()).toEqual({ count: 1 });
       failedItem.close();
-      const manualRetry = await authority.retry(
+      await expect(authority.retry(
         { ...context, requestId: "request-manual-retry", idempotencyKey: "key-manual-retry" },
         deadLettered.id,
-      );
-      expect(manualRetry.execution).toMatchObject({
-        status: "queued",
-        manualRetryOfExecutionId: deadLettered.id,
-        currentAttemptSeq: 1,
-      });
-      expect(manualRetry.intent).toEqual({
-        kind: "direct_mention", roomId: "room-runtime",
-        sourceMessageId: "message-runtime-5", targetAgentId: "agent-runtime",
-      });
-      expect(manualRetry.execution.id).not.toBe(deadLettered.id);
+      )).rejects.toMatchObject({ code: "context_source_gone" });
+      const retryEvidence = new DatabaseSync(databasePath, { readOnly: true });
+      expect(retryEvidence.prepare(
+        `SELECT COUNT(*) AS count FROM agent_executions
+         WHERE manual_retry_of_execution_id = ?`,
+      ).get(deadLettered.id)).toEqual({ count: 0 });
+      retryEvidence.close();
 
       const fourth = await authority.invoke(
         { ...context, requestId: "request-runtime-4", idempotencyKey: "key-runtime-4" },
@@ -573,6 +1003,14 @@ describe("real AuthorityWorker runtime authority", () => {
         signal: new AbortController().signal,
       })).rejects.toMatchObject({ code: "permission_denied" });
       expect(deniedExecute).not.toHaveBeenCalled();
+
+      await expect(client.executeRuntime({
+        type: "runtime.claim-pending-direct-intents",
+        providerId: "openai-responses",
+        modelId: "configured-model",
+        limit: 256,
+        now: now + 102,
+      })).resolves.toMatchObject({ kind: "direct-intent-claims", records: [], hasMore: false });
 
       const history = await client.readMessageHistory({
         sessionId: context.sessionId,
@@ -644,5 +1082,5 @@ describe("real AuthorityWorker runtime authority", () => {
       await client.close().catch(() => undefined);
       rmSync(directory, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 });

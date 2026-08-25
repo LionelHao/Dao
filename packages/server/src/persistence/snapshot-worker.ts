@@ -4,17 +4,23 @@ import { DatabaseSync } from "node:sqlite";
 import { parentPort, workerData } from "node:worker_threads";
 import {
   isAttachmentRepairRecord,
+  isAgentExecution,
+  isAgentExecutionAttempt,
+  isAgentExecutionRetryReceipt,
+  isAgentInvocationIntent,
   isCalibrationSignal,
   isLightTask,
   isMessageAuthorityRepairRecord,
+  isProjectBoundaryInvocationResult,
   isRoomRepairPage,
   isRouteJob,
   isRouteJudgment,
+  isScopedCancellationReceipt,
   isSnapshotVersion,
   isWorkspaceBootstrapPage,
 } from "@native-im/core";
 import type {
-  AgentExecution,
+  LegacyAgentExecution,
   OpenItem,
   RoomRepairRecord,
   RoomSummary,
@@ -359,7 +365,7 @@ function parseJson(value: unknown): unknown {
   try { return JSON.parse(value) as unknown; } catch { throw new SnapshotBuildError("storage_unavailable", "Snapshot JSON is corrupt"); }
 }
 
-function canonicalLegacyExecution(row: Record<string, unknown>): AgentExecution {
+function canonicalLegacyExecution(row: Record<string, unknown>): LegacyAgentExecution {
   const startedAt = String(row.startedAt);
   const legacyStatus = row.status;
   const status = legacyStatus === "interrupted" ? "cancelled" : legacyStatus;
@@ -650,7 +656,13 @@ const ROOM_REPAIR_KIND_MAP = Object.freeze({
   "open-item": true,
   "open-item-agent-failure": true,
   "light-task": true,
+  "agent-invocation-intent": true,
   "agent-execution": true,
+  "agent-execution-attempt": true,
+  "agent-execution-retry": true,
+  "agent-scoped-cancellation": true,
+  "project-boundary-invocation": true,
+  "legacy-agent-execution": true,
   "route-job": true,
   "route-judgment": true,
   calibration: true,
@@ -826,6 +838,122 @@ function roomSegmentRows(
   );
 }
 
+function invocationIntentRepairRecord(row: Record<string, unknown>): RoomRepairRecord {
+  const value = {
+    intentId: String(row.intentId),
+    lineageId: String(row.lineageId),
+    turnId: String(row.turnId),
+    roomId: String(row.roomId),
+    sourceMessageId: String(row.sourceMessageId),
+    sourceRevision: Number(row.sourceRevision),
+    targetId: String(row.targetId),
+    agentId: String(row.agentId),
+    origin: {
+      kind: "message_target" as const,
+      messageTransactionId: String(row.messageTransactionId),
+      targetId: String(row.targetId),
+    },
+    profileRevision: Number(row.profileRevision),
+    assignmentRevision: Number(row.assignmentRevision),
+    accessRevision: Number(row.accessRevision),
+    status: row.status,
+    createdAt: String(row.createdAt),
+    ...(typeof row.claimedAt === "string" ? { claimedAt: row.claimedAt } : {}),
+    ...(typeof row.cancelledAt === "string" ? { cancelledAt: row.cancelledAt } : {}),
+    ...(typeof row.cancellationReason === "string" ? { cancellationReason: row.cancellationReason } : {}),
+    ...(typeof row.supersedesIntentId === "string" ? { supersedesIntentId: row.supersedesIntentId } : {}),
+  };
+  if (!isAgentInvocationIntent(value)) {
+    throw new SnapshotBuildError("storage_unavailable", "Invocation intent repair projection is corrupt");
+  }
+  return { kind: "agent-invocation-intent", value };
+}
+
+function canonicalExecutionRepairRecord(row: Record<string, unknown>): RoomRepairRecord {
+  const status = row.status;
+  const startedAt = typeof row.startedAt === "string" ? row.startedAt : String(row.updatedAt);
+  const value = {
+    executionId: String(row.executionId), intentId: String(row.intentId),
+    lineageId: String(row.lineageId), executionOrdinal: Number(row.executionOrdinal),
+    ...(typeof row.retryOfExecutionId === "string" ? { retryOfExecutionId: row.retryOfExecutionId } : {}),
+    roomId: String(row.roomId), agentId: String(row.agentId), snapshotId: String(row.snapshotId),
+    providerId: String(row.providerId), modelId: String(row.modelId), status,
+    phase: row.phase, currentAttemptSeq: Number(row.currentAttemptSeq), version: Number(row.version),
+    queuedAt: String(row.queuedAt), ...(status === "accepted" ? {} : { startedAt }),
+    updatedAt: String(row.updatedAt),
+    ...((status === "completed" || status === "failed" || status === "cancelled")
+      ? { completedAt: String(row.completedAt) } : {}),
+    ...(status === "cancelled" ? { cancellationReason: row.terminalReason } : {}),
+    ...(status === "failed" ? {
+      terminalErrorCode: row.terminalErrorCode,
+      reviewState: row.reviewState === "needs_review" ? "needs_review" as const : "not_required" as const,
+    } : {}),
+    ...(typeof row.deadLetteredAt === "string" ? { deadLetteredAt: row.deadLetteredAt } : {}),
+    ...(typeof row.resultMessageId === "string" ? { resultMessageId: row.resultMessageId } : {}),
+  };
+  if (!isAgentExecution(value)) {
+    throw new SnapshotBuildError("storage_unavailable", "Invocation execution repair projection is corrupt");
+  }
+  return { kind: "agent-execution", value };
+}
+
+function canonicalAttemptRepairRecord(row: Record<string, unknown>): RoomRepairRecord {
+  const status = row.status;
+  const value = {
+    executionId: String(row.executionId), intentId: String(row.intentId),
+    lineageId: String(row.lineageId), roomId: String(row.roomId), agentId: String(row.agentId),
+    attemptSeq: Number(row.attemptSeq), snapshotId: String(row.snapshotId),
+    providerId: String(row.providerId), modelId: String(row.modelId), status, phase: row.phase,
+    executionVersion: Number(row.executionVersion),
+    ...(status === "accepted" ? {} : { startedAt: String(row.startedAt ?? row.updatedAt) }),
+    updatedAt: String(row.updatedAt),
+    ...((status === "completed" || status === "failed" || status === "cancelled")
+      ? { finishedAt: String(row.finishedAt ?? row.updatedAt) } : {}),
+    ...(status === "failed" && typeof row.errorCode === "string" ? { errorCode: row.errorCode } : {}),
+    ...(status === "failed" && typeof row.nextRetryAt === "string" ? { nextRetryAt: row.nextRetryAt } : {}),
+  };
+  if (!isAgentExecutionAttempt(value)) {
+    throw new SnapshotBuildError("storage_unavailable", "Invocation attempt repair projection is corrupt");
+  }
+  return { kind: "agent-execution-attempt", value };
+}
+
+function retryRepairRecord(row: Record<string, unknown>): RoomRepairRecord {
+  const value = {
+    requestId: String(row.requestId), sourceExecutionId: String(row.sourceExecutionId),
+    executionId: String(row.executionId), intentId: String(row.intentId),
+    lineageId: String(row.lineageId), roomId: String(row.roomId),
+    executionOrdinal: Number(row.executionOrdinal), snapshotId: String(row.snapshotId),
+    status: "accepted" as const, createdAt: String(row.createdAt),
+  };
+  if (!isAgentExecutionRetryReceipt(value)) {
+    throw new SnapshotBuildError("storage_unavailable", "Invocation retry repair projection is corrupt");
+  }
+  return { kind: "agent-execution-retry", value };
+}
+
+function cancellationRepairRecord(row: Record<string, unknown>): RoomRepairRecord {
+  const stored = parseJson(row.responseJson);
+  const value = isRecord(stored) ? stored.receipt : undefined;
+  if (!isScopedCancellationReceipt(value)) {
+    throw new SnapshotBuildError("storage_unavailable", "Scoped cancellation repair projection is corrupt");
+  }
+  return { kind: "agent-scoped-cancellation", value };
+}
+
+function projectBoundaryRepairRecord(row: Record<string, unknown>): RoomRepairRecord {
+  const value = row.status === "consumed"
+    ? { boundaryId: String(row.boundaryId), roomId: String(row.roomId), status: "intent-created" as const,
+        intentId: String(row.intentId), consumedAt: String(row.recordedAt) }
+    : { boundaryId: String(row.boundaryId), roomId: String(row.roomId), status: "suppressed" as const,
+        reason: row.status === "dependency_unavailable" ? "dependency_unavailable" as const : "boundary_ineligible" as const,
+        decidedAt: String(row.recordedAt) };
+  if (!isProjectBoundaryInvocationResult(value)) {
+    throw new SnapshotBuildError("storage_unavailable", "Project boundary repair projection is corrupt");
+  }
+  return { kind: "project-boundary-invocation", value };
+}
+
 const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
   {
     descriptorId: "dao.repair.room.v1", descriptorVersion: 1, kind: "room", order: 0,
@@ -996,8 +1124,124 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
     stableKey: (record: RoomRepairRecord) => String(record.kind === "light-task" ? record.value.id : ""),
   },
   {
+    descriptorId: "dao.repair.agent-invocation-intent.v1", descriptorVersion: 1,
+    kind: "agent-invocation-intent", order: 100,
+    readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
+      `SELECT intent.id AS intentId, intent.lineage_id AS lineageId, intent.turn_id AS turnId,
+              intent.room_id AS roomId, intent.source_message_id AS sourceMessageId,
+              intent.source_revision AS sourceRevision, intent.target_id AS targetId,
+              intent.target_agent_id AS agentId, intent.message_transaction_id AS messageTransactionId,
+              binding.profile_revision AS profileRevision,
+              binding.assignment_revision AS assignmentRevision,
+              binding.access_revision AS accessRevision,
+              runtime.public_status AS status,
+              intent.created_at AS createdAt, runtime.claimed_at AS claimedAt,
+              runtime.cancelled_at AS cancelledAt,
+              runtime.cancellation_reason AS cancellationReason,
+              intent.supersedes_intent_id AS supersedesIntentId
+       FROM agent_invocation_intents AS intent
+       JOIN agent_invocation_intent_runtime_states AS runtime
+         ON runtime.intent_id = intent.id
+       JOIN direct_agent_invocation_authority_bindings AS binding ON binding.intent_id = intent.id
+       WHERE intent.room_id = ? AND intent.origin_kind = 'message_target'
+         AND binding.access_revision > 0`, "intent.id"),
+    mapRow: (row: unknown) => invocationIntentRepairRecord(row as Record<string, unknown>),
+    stableKey: (record: RoomRepairRecord) => record.kind === "agent-invocation-intent"
+      ? record.value.intentId : "",
+  },
+  {
+    descriptorId: "dao.repair.agent-execution-canonical.v1", descriptorVersion: 1,
+    kind: "agent-execution", order: 101,
+    readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
+      `SELECT runtime.execution_id AS executionId, runtime.intent_id AS intentId,
+              runtime.lineage_id AS lineageId, runtime.execution_ordinal AS executionOrdinal,
+              runtime.retry_of_execution_id AS retryOfExecutionId, execution.room_id AS roomId,
+              execution.agent_id AS agentId, runtime.snapshot_id AS snapshotId,
+              runtime.provider_id AS providerId, runtime.model_id AS modelId,
+              runtime.public_status AS status, runtime.phase,
+              runtime.current_attempt_seq AS currentAttemptSeq,
+              runtime.authority_version AS version, runtime.queued_at AS queuedAt,
+              runtime.started_at AS startedAt, runtime.updated_at AS updatedAt,
+              runtime.completed_at AS completedAt, runtime.terminal_reason AS terminalReason,
+              runtime.terminal_error_code AS terminalErrorCode, runtime.review_state AS reviewState,
+              execution.dead_lettered_at AS deadLetteredAt,
+              execution.result_message_id AS resultMessageId
+       FROM agent_execution_runtime_states AS runtime
+       JOIN agent_executions AS execution ON execution.id = runtime.execution_id
+       WHERE execution.room_id = ? AND runtime.review_state <> 'legacy_review_required'`,
+      "runtime.execution_id"),
+    mapRow: (row: unknown) => canonicalExecutionRepairRecord(row as Record<string, unknown>),
+    stableKey: (record: RoomRepairRecord) => record.kind === "agent-execution"
+      ? record.value.executionId : "",
+  },
+  {
+    descriptorId: "dao.repair.agent-execution-attempt.v1", descriptorVersion: 1,
+    kind: "agent-execution-attempt", order: 102,
+    readKeysetPage: (input: RepairKeysetPageInput) => keysetRows(input.database,
+      `SELECT attempt.execution_id AS executionId, execution.intent_id AS intentId,
+              execution.lineage_id AS lineageId, legacy.room_id AS roomId,
+              legacy.agent_id AS agentId, attempt.attempt_seq AS attemptSeq,
+              execution.snapshot_id AS snapshotId, execution.provider_id AS providerId,
+              execution.model_id AS modelId, attempt.public_status AS status,
+              attempt.phase, execution.authority_version AS executionVersion,
+              attempt.started_at AS startedAt, execution.updated_at AS updatedAt,
+              attempt.finished_at AS finishedAt, attempt.error_code AS errorCode,
+              attempt.next_retry_at AS nextRetryAt,
+              printf('%s:%020d', attempt.execution_id, attempt.attempt_seq) AS stable_key
+       FROM agent_execution_attempt_runtime_states AS attempt
+       JOIN agent_execution_runtime_states AS execution ON execution.execution_id = attempt.execution_id
+       JOIN agent_executions AS legacy ON legacy.id = attempt.execution_id
+       WHERE legacy.room_id = ? AND execution.review_state <> 'legacy_review_required'`,
+      [input.roomId], "stable_key", input.afterKey, input.limit),
+    mapRow: (row: unknown) => canonicalAttemptRepairRecord(row as Record<string, unknown>),
+    stableKey: (record: RoomRepairRecord) => record.kind === "agent-execution-attempt"
+      ? `${record.value.executionId}:${String(record.value.attemptSeq).padStart(20, "0")}` : "",
+  },
+  {
+    descriptorId: "dao.repair.agent-execution-retry.v1", descriptorVersion: 1,
+    kind: "agent-execution-retry", order: 103,
+    readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
+      `SELECT receipt.request_id AS requestId,
+              receipt.source_execution_id AS sourceExecutionId,
+              receipt.child_execution_id AS executionId, receipt.intent_id AS intentId,
+              runtime.lineage_id AS lineageId, execution.room_id AS roomId,
+              receipt.execution_ordinal AS executionOrdinal,
+              runtime.snapshot_id AS snapshotId, receipt.committed_at AS createdAt
+       FROM invocation_human_retry_receipts AS receipt
+       JOIN agent_execution_runtime_states AS runtime
+         ON runtime.execution_id = receipt.child_execution_id
+       JOIN agent_executions AS execution ON execution.id = receipt.child_execution_id
+       WHERE execution.room_id = ?`, "receipt.request_id"),
+    mapRow: (row: unknown) => retryRepairRecord(row as Record<string, unknown>),
+    stableKey: (record: RoomRepairRecord) => record.kind === "agent-execution-retry"
+      ? record.value.requestId : "",
+  },
+  {
+    descriptorId: "dao.repair.agent-scoped-cancellation.v1", descriptorVersion: 1,
+    kind: "agent-scoped-cancellation", order: 104,
+    readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
+      `SELECT receipt.request_id AS requestId, receipt.response_json AS responseJson
+       FROM invocation_cancellation_receipts AS receipt
+       JOIN invocation_scoped_cancellation_fences AS fence ON fence.fence_id = receipt.fence_id
+       WHERE fence.room_id = ?`, "receipt.request_id"),
+    mapRow: (row: unknown) => cancellationRepairRecord(row as Record<string, unknown>),
+    stableKey: (record: RoomRepairRecord) => record.kind === "agent-scoped-cancellation"
+      ? record.value.requestId : "",
+  },
+  {
+    descriptorId: "dao.repair.project-boundary-invocation.v1", descriptorVersion: 1,
+    kind: "project-boundary-invocation", order: 105,
+    readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
+      `SELECT boundary_id AS boundaryId, room_id AS roomId, status,
+              invocation_intent_id AS intentId, recorded_at AS recordedAt
+       FROM project_boundary_invocation_receipts WHERE room_id = ?`, "boundary_id"),
+    mapRow: (row: unknown) => projectBoundaryRepairRecord(row as Record<string, unknown>),
+    stableKey: (record: RoomRepairRecord) => record.kind === "project-boundary-invocation"
+      ? record.value.boundaryId : "",
+  },
+  {
     descriptorId: "dao.repair.agent-execution.v1", descriptorVersion: 1,
-    kind: "agent-execution", order: 11,
+    kind: "legacy-agent-execution", order: 11,
     readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
       `SELECT id, room_id AS roomId, trigger_message_id AS sourceMessageId,
               requester_actor_id AS requesterId, agent_id AS agentId, tool_name AS toolName,
@@ -1014,11 +1258,11 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
               supersedes_execution_ids_json AS supersedesExecutionIdsJson
        FROM agent_executions WHERE room_id = ?`, "id"),
     mapRow: (row: unknown) => ({
-      kind: "agent-execution",
+      kind: "legacy-agent-execution",
       value: canonicalLegacyExecution(row as Record<string, unknown>),
     }),
     stableKey: (record: RoomRepairRecord) =>
-      String(record.kind === "agent-execution" ? record.value.id : ""),
+      String(record.kind === "legacy-agent-execution" ? record.value.id : ""),
   },
   {
     descriptorId: "dao.repair.route-job.v1", descriptorVersion: 1, kind: "route-job", order: 12,

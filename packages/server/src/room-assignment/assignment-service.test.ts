@@ -611,7 +611,7 @@ describe("SQLite Room Assignment repository and service", () => {
         }),
       }));
     expect(gate()).toEqual({ current: true, availability: { eligible: true, availability: "ready" } });
-    database.prepare("INSERT INTO agent_executions VALUES ('execution-1','room-1','agent-1','queued')").run();
+    database.prepare("INSERT INTO agent_executions VALUES ('execution-1','room-1','agent-1','running')").run();
     expect(gate()).toEqual({ current: true, availability: { eligible: true, availability: "busy" } });
     database.exec("UPDATE room_agent_assignments SET paused=1 WHERE id=(SELECT id FROM room_agent_assignments)");
     expect(inTransaction(database, "room-1", (transaction) =>

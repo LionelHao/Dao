@@ -161,4 +161,83 @@ describe("production Desktop authority cache", () => {
       value: { recordType: "status", status: { health: { state: "degraded" } } },
     });
   });
+
+  it("projects every canonical invocation stable event onto the same identities used by repair", async () => {
+    const occurredAt = "2026-08-25T00:00:00.000Z";
+    const intent = {
+      intentId: "intent-1", lineageId: "lineage-1", turnId: "turn-1", roomId: "room-1",
+      sourceMessageId: "message-1", sourceRevision: 1, targetId: "target-1", agentId: "agent-1",
+      origin: { kind: "message_target" as const, messageTransactionId: "message-1", targetId: "target-1" },
+      profileRevision: 1, assignmentRevision: 1, accessRevision: 1,
+      status: "claimed" as const, createdAt: occurredAt, claimedAt: occurredAt,
+    };
+    const execution = {
+      executionId: "execution-1", intentId: intent.intentId, lineageId: intent.lineageId,
+      executionOrdinal: 1, roomId: intent.roomId, agentId: intent.agentId,
+      snapshotId: "snapshot-1", providerId: "provider-1", modelId: "model-1",
+      status: "running" as const, phase: "waiting_confirmation" as const,
+      currentAttemptSeq: 1, version: 2, queuedAt: occurredAt, startedAt: occurredAt,
+      updatedAt: occurredAt,
+    };
+    const attempt = {
+      executionId: execution.executionId, intentId: intent.intentId, lineageId: intent.lineageId,
+      roomId: intent.roomId, agentId: intent.agentId, attemptSeq: 1,
+      snapshotId: execution.snapshotId, providerId: execution.providerId, modelId: execution.modelId,
+      status: "running" as const, phase: "waiting_confirmation" as const,
+      executionVersion: 2, startedAt: occurredAt, updatedAt: occurredAt,
+    };
+    const retry = {
+      requestId: "retry-1", sourceExecutionId: execution.executionId,
+      executionId: "execution-2", intentId: intent.intentId, lineageId: intent.lineageId,
+      roomId: intent.roomId, executionOrdinal: 2, snapshotId: execution.snapshotId,
+      status: "accepted" as const, createdAt: occurredAt,
+    };
+    const cancellation = {
+      requestId: "cancel-1", fenceId: "fence-1", roomId: intent.roomId,
+      lineageId: intent.lineageId,
+      scope: { kind: "execution" as const, executionId: execution.executionId, expectedVersion: 2 },
+      reason: "human_cancelled" as const,
+      intentOutcomes: [{ intentId: intent.intentId, outcome: "already_claimed" as const }],
+      executionOutcomes: [{ executionId: execution.executionId, outcome: "cancelled" as const, version: 3 }],
+      rejectedConfirmationIds: ["confirmation-1"], revokedGrantIds: ["grant-1"],
+      preservedDispatchIds: [], committedAt: occurredAt,
+    };
+    const boundary = {
+      boundaryId: "boundary-1", roomId: intent.roomId, status: "suppressed" as const,
+      reason: "dependency_unavailable" as const, decidedAt: occurredAt,
+    };
+    const cache = createDesktopAuthorityCache();
+    const seed = page();
+    cache.beginRoom("room-1", seed.snapshotId);
+    cache.stageRoomPage(seed);
+    expect(await cache.finalizeRoom(seed.snapshotId, seed.snapshotChecksum)).toBe(true);
+    cache.commitRoom("room-1", seed.watermark, seed.snapshotChecksum);
+    const event = <T extends PersistedRoomEvent["type"]>(
+      streamSeq: number,
+      type: T,
+      payload: Extract<PersistedRoomEvent, { readonly type: T }>["payload"],
+    ): Extract<PersistedRoomEvent, { readonly type: T }> => ({
+      eventId: `event-${streamSeq}`, streamKind: "room", streamId: "room-1", streamSeq,
+      roomId: "room-1", actorId: type.startsWith("agent.execution") ? "agent-1" : "human-1",
+      occurredAt, type, payload,
+    } as Extract<PersistedRoomEvent, { readonly type: T }>);
+    const events = [
+      event(10, "agent.invocation.intent.changed", intent),
+      event(11, "agent.execution.changed", execution),
+      event(12, "agent.execution.attempt.changed", attempt),
+      event(13, "agent.execution.retry.accepted", retry),
+      event(14, "agent.invocation.scoped-cancellation.committed", cancellation),
+      event(15, "project.boundary.invocation.decided", boundary),
+    ];
+    cache.applyRoomEvents("room-1", events, { version: 1, roomId: "room-1", afterSeq: 15 });
+
+    expect(cache.roomRepairRecords("room-1")?.slice(-6)).toEqual([
+      { kind: "agent-invocation-intent", value: intent },
+      { kind: "agent-execution", value: execution },
+      { kind: "agent-execution-attempt", value: attempt },
+      { kind: "agent-execution-retry", value: retry },
+      { kind: "agent-scoped-cancellation", value: cancellation },
+      { kind: "project-boundary-invocation", value: boundary },
+    ]);
+  });
 });

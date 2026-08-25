@@ -4,12 +4,16 @@ import {
   isRoomRepairPage,
   isSnapshotCompleted,
   isWorkspaceBootstrapPage,
+  isAgentExecutionRetryReceipt,
+  isScopedCancellationReceipt,
+  type AgentExecutionRetryReceipt,
   type RoomCursor,
   type RoomGovernanceView,
   type RoomRepairPage,
   type RoomSyncRequest,
   type SnapshotCompleted,
   type SnapshotVersion,
+  type ScopedCancellationReceipt,
   type WorkspaceBootstrapPage,
 } from "@native-im/core";
 import type { IdentityAuthoritySession } from "../identity/controller.js";
@@ -42,7 +46,9 @@ export type GovernanceTransportErrorCode =
   | "role_forbidden" | "member_not_found" | "room_not_found"
   | "room_revision_conflict" | "ownership_transfer_required" | "room_archived"
   | "departure_blocked" | "snapshot_expired" | "snapshot_stale"
+  | "context_unavailable"
   | "rate_limited" | "dependency_unavailable" | "service_unavailable"
+  | "execution_conflict" | "protocol_upgrade_required"
   | "connection_unavailable" | "request_timeout" | "protocol_error" | "client_closed";
 
 export class GovernanceTransportError extends Error {
@@ -50,6 +56,7 @@ export class GovernanceTransportError extends Error {
     readonly code: GovernanceTransportErrorCode,
     readonly status?: number,
     readonly details?: DepartureConflictList,
+    readonly retryAfterSeconds?: number,
   ) {
     super(`Governance transport failed: ${code}`);
     this.name = "GovernanceTransportError";
@@ -65,6 +72,19 @@ export interface GovernanceWireAck {
   readonly replayed: boolean;
 }
 
+export interface InvocationWireCommand {
+  readonly type: "invocation.cancel" | "invocation.retry";
+  readonly requestId: string;
+  readonly executionId: string;
+  readonly expectedVersion: number;
+}
+
+export type InvocationWireAck =
+  | Readonly<{ type: "invocation.cancel.ack"; requestId: string;
+      receipt: ScopedCancellationReceipt }>
+  | Readonly<{ type: "invocation.retry.ack"; requestId: string;
+      receipt: AgentExecutionRetryReceipt; replayed: boolean }>;
+
 export interface GovernanceAuthorityTransport extends SyncTransport {
   queryDepartureConflicts(input: {
     readonly requestId: string;
@@ -73,6 +93,7 @@ export interface GovernanceAuthorityTransport extends SyncTransport {
     readonly expectedGovernanceRevision: number;
   }): Promise<DepartureConflictList>;
   execute(command: GovernanceAuthorityCommand): Promise<GovernanceWireAck>;
+  controlInvocation(command: InvocationWireCommand): Promise<InvocationWireAck>;
   onTerminalRevoked(listener: () => void): () => void;
   onRoomAccessChanged(listener: (
     roomId: string,
@@ -123,10 +144,10 @@ function timestamp(value: unknown): value is string {
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
 }
-
 type ParsedFrame =
   | { readonly type: "auth.authenticated"; readonly requestId: string; readonly actorId: string; readonly sessionId: string }
   | ({ readonly type: "room.governance.ack" } & GovernanceWireAck)
+  | InvocationWireAck
   | { readonly type: "room.departure.conflicts.result"; readonly requestId: string; readonly conflicts: DepartureConflictList }
   | WorkspaceBootstrapPage | RoomRepairPage | DesktopRoomSyncResult | SnapshotCompleted
   | { readonly type: "room.subscribed.v2"; readonly requestId: string; readonly roomId: string; readonly cursor: RoomCursor; readonly watermark: number }
@@ -147,23 +168,44 @@ const commands = new Set<GovernanceCommand>([
 ]);
 const statuses = new Set([400, 401, 403, 404, 409, 410, 429, 500, 503]);
 
-function mappedError(status: number, code: string, details: unknown): GovernanceTransportError | undefined {
+function mappedError(
+  status: number,
+  code: string,
+  details: unknown,
+  retryAfterSeconds: unknown,
+): GovernanceTransportError | undefined {
   if (status === 409 && code === "departure_blocked" && isDepartureConflictList(details)) {
-    return new GovernanceTransportError("departure_blocked", 409, details);
+    return retryAfterSeconds === undefined
+      ? new GovernanceTransportError("departure_blocked", 409, details) : undefined;
   }
   const mapping: Record<string, GovernanceTransportErrorCode> = {
     unauthenticated: "authentication_required", invalid_token: "authentication_required",
     token_expired: "authentication_required", session_revoked: "session_revoked",
     room_forbidden: "access_revoked", identity_forbidden: "access_revoked",
+    context_forbidden: "access_revoked", permission_denied: "access_revoked",
     role_forbidden: "role_forbidden", member_not_found: "member_not_found",
     room_not_found: "room_not_found", room_revision_conflict: "room_revision_conflict",
     ownership_transfer_required: "ownership_transfer_required", room_archived: "room_archived",
     snapshot_expired: "snapshot_expired", snapshot_stale: "snapshot_stale",
+    context_snapshot_invalidated: "context_unavailable",
+    context_source_gone: "context_unavailable",
+    context_generation_conflict: "execution_conflict",
+    context_snapshot_conflict: "execution_conflict",
     rate_limited: "rate_limited", dependency_unavailable: "dependency_unavailable",
+    context_capacity_limited: "rate_limited",
+    agent_queue_full: "rate_limited", execution_conflict: "execution_conflict",
+    protocol_upgrade_required: "protocol_upgrade_required",
+    agent_runtime_closed: "service_unavailable",
     storage_unavailable: "service_unavailable", internal_error: "service_unavailable",
+    context_storage_unavailable: "service_unavailable",
   };
   const closed = mapping[code];
-  return closed === undefined ? undefined : new GovernanceTransportError(closed, status);
+  if (closed === undefined || (retryAfterSeconds !== undefined &&
+      (status !== 429 || !Number.isSafeInteger(retryAfterSeconds) ||
+        (retryAfterSeconds as number) <= 0 ||
+        (retryAfterSeconds as number) > 86_400))) return undefined;
+  return new GovernanceTransportError(closed, status, undefined,
+    retryAfterSeconds as number | undefined);
 }
 
 export function parseGovernanceServerFrame(raw: string): ParsedFrame | undefined {
@@ -192,6 +234,20 @@ export function parseGovernanceServerFrame(raw: string): ParsedFrame | undefined
         result: inferred, governance: value.governance, replayed: value.replayed,
         eventIds: Object.freeze([...value.eventIds] as string[]) };
     }
+    case "invocation.cancel.ack": {
+      if (!exact(value, ["type", "requestId", "receipt"]) || !text(value.requestId, 128) ||
+          !isScopedCancellationReceipt(value.receipt) ||
+          value.receipt.requestId !== value.requestId) return undefined;
+      return { type: value.type, requestId: value.requestId,
+        receipt: structuredClone(value.receipt) };
+    }
+    case "invocation.retry.ack":
+      return exact(value, ["type", "requestId", "receipt", "replayed"]) &&
+        text(value.requestId, 128) && isAgentExecutionRetryReceipt(value.receipt) &&
+        value.receipt.requestId === value.requestId && typeof value.replayed === "boolean"
+        ? { type: value.type, requestId: value.requestId,
+          receipt: structuredClone(value.receipt), replayed: value.replayed }
+        : undefined;
     case "room.departure.conflicts.result":
       return exact(value, ["type", "requestId", "conflicts"]) && text(value.requestId, 128) &&
         isDepartureConflictList(value.conflicts)
@@ -234,10 +290,12 @@ export function parseGovernanceServerFrame(raw: string): ParsedFrame | undefined
           }
         : undefined;
     case "error": {
-      if (!exact(value, ["type", "status", "code", "message"], ["requestId", "details"]) ||
+      if (!exact(value, ["type", "status", "code", "message"], [
+        "requestId", "details", "retryAfterSeconds",
+      ]) ||
           typeof value.status !== "number" || !statuses.has(value.status) || typeof value.code !== "string" ||
           !text(value.message, 512) || (value.requestId !== undefined && !text(value.requestId, 128))) return undefined;
-      const error = mappedError(value.status, value.code, value.details);
+      const error = mappedError(value.status, value.code, value.details, value.retryAfterSeconds);
       return error === undefined ? undefined : { type: "error",
         ...(value.requestId === undefined ? {} : { requestId: value.requestId }), error };
     }
@@ -519,6 +577,22 @@ export function createGovernanceWebSocketAuthority(options: {
         ...(command.intent.targetActorId === undefined ? {} : { targetActorId: command.intent.targetActorId }),
       }, "room.governance.ack");
       if (response.command !== command.intent.command || response.governance.roomId !== command.roomId) {
+        throw new GovernanceTransportError("protocol_error");
+      }
+      return response;
+    },
+    async controlInvocation(command) {
+      const responseType = command.type === "invocation.cancel"
+        ? "invocation.cancel.ack" as const : "invocation.retry.ack" as const;
+      const response = await exactRequest<InvocationWireAck>({ ...command }, responseType);
+      if (response.type !== responseType ||
+          (response.type === "invocation.cancel.ack" &&
+            (response.receipt.scope.kind !== "execution" ||
+              response.receipt.scope.executionId !== command.executionId ||
+              response.receipt.scope.expectedVersion !== command.expectedVersion ||
+              response.receipt.reason !== "human_cancelled")) ||
+          (response.type === "invocation.retry.ack" &&
+            response.receipt.sourceExecutionId !== command.executionId)) {
         throw new GovernanceTransportError("protocol_error");
       }
       return response;

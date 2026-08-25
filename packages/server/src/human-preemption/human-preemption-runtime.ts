@@ -1,7 +1,7 @@
 import {
-  isAgentExecution,
+  isLegacyAgentExecution as isAgentExecution,
   isHumanPreemptionNotice,
-  type AgentExecution,
+  type LegacyAgentExecution as AgentExecution,
   type HumanPreemptionNotice,
 } from "@native-im/core";
 import type { AgentRuntimeService } from "../agent-runtime/agent-runtime-service.js";

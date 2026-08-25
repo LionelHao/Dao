@@ -221,33 +221,13 @@ export function createOpenAIResponsesProvider(
         max_output_tokens: input.limits.maxOutputTokens,
         parallel_tool_calls: false,
         input: buildProviderInput(input),
-        tools: [
-          ...input.availableTools.map((tool) => ({
-            type: "function",
-            name: functionName(tool.id),
-            description: tool.displayName,
-            strict: true,
-            parameters: functionParameters(tool),
-          })),
-          ...((input.openItemTargets?.length ?? 0) === 0 ? [] : [{
-            type: "function",
-            name: OPEN_ITEM_PROPOSAL_FUNCTION,
-            description: "Create a structured risk or challenge OpenItem for a current room member; never infer targets from prose.",
-            strict: true,
-            parameters: {
-              type: "object",
-              properties: {
-                proposalKind: { type: "string", enum: ["risk", "challenge"] },
-                targetActorId: { type: "string", enum: input.openItemTargets!.map((target) => target.actorId) },
-                sourceMessageId: { type: "string", enum: [input.invocation.sourceMessageId] },
-                reason: { type: "string", minLength: 1, maxLength: 2_048 },
-                content: { type: "string", minLength: 1, maxLength: 32_768 },
-              },
-              required: ["proposalKind", "targetActorId", "sourceMessageId", "reason", "content"],
-              additionalProperties: false,
-            },
-          }]),
-        ],
+        tools: input.availableTools.map((tool) => ({
+          type: "function",
+          name: functionName(tool.id),
+          description: tool.displayName,
+          strict: true,
+          parameters: functionParameters(tool),
+        })),
         text: {
           format: {
             type: "json_schema",

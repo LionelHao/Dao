@@ -50,7 +50,16 @@ function recordIdentity(record: RoomRepairRecord): string {
     case "open-item": return `open-item\0${record.value.id}`;
     case "open-item-agent-failure": return `open-item-agent-failure\0${record.value.id}`;
     case "light-task": return `light-task\0${record.value.id}`;
-    case "agent-execution": return `agent-execution\0${record.value.id}`;
+    case "agent-invocation-intent": return `agent-invocation-intent\0${record.value.intentId}`;
+    case "agent-execution": return `agent-execution\0${record.value.executionId}`;
+    case "agent-execution-attempt":
+      return `agent-execution-attempt\0${record.value.executionId}\0${record.value.attemptSeq}`;
+    case "agent-execution-retry": return `agent-execution-retry\0${record.value.requestId}`;
+    case "agent-scoped-cancellation":
+      return `agent-scoped-cancellation\0${record.value.fenceId}`;
+    case "project-boundary-invocation":
+      return `project-boundary-invocation\0${record.value.boundaryId}`;
+    case "legacy-agent-execution": return `legacy-agent-execution\0${record.value.id}`;
     case "route-job": return `route-job\0${record.value.id}`;
     case "route-judgment": return `route-judgment\0${record.value.id}`;
     case "calibration": return `calibration\0${record.value.id}`;
@@ -127,6 +136,33 @@ function applyProjectionEvent(records: RoomRepairRecord[], event: DesktopRoomEve
       if (index !== -1) records.splice(index, 1);
       return;
     }
+    case "room.message.accepted":
+      if ("lifecycle" in event.payload) {
+        replaceRecord(records, { kind: "timeline-message", value: event.payload });
+      }
+      return;
+    case "room.message.revised":
+    case "room.message.recalled":
+      replaceRecord(records, { kind: "timeline-message", value: event.payload });
+      return;
+    case "agent.invocation.intent.changed":
+      replaceRecord(records, { kind: "agent-invocation-intent", value: event.payload });
+      return;
+    case "agent.execution.changed":
+      replaceRecord(records, { kind: "agent-execution", value: event.payload });
+      return;
+    case "agent.execution.attempt.changed":
+      replaceRecord(records, { kind: "agent-execution-attempt", value: event.payload });
+      return;
+    case "agent.execution.retry.accepted":
+      replaceRecord(records, { kind: "agent-execution-retry", value: event.payload });
+      return;
+    case "agent.invocation.scoped-cancellation.committed":
+      replaceRecord(records, { kind: "agent-scoped-cancellation", value: event.payload });
+      return;
+    case "project.boundary.invocation.decided":
+      replaceRecord(records, { kind: "project-boundary-invocation", value: event.payload });
+      return;
     default:
       return;
   }
@@ -137,6 +173,10 @@ export interface DesktopAuthorityCache extends ClientAuthorityCache {
   roomIds(): readonly string[];
   updatedAt(roomId: string): string | undefined;
   roomRepairRecords(roomId: string): readonly RoomRepairRecord[] | undefined;
+  subscribeRoomRecords(listener: (
+    roomId: string,
+    records: readonly RoomRepairRecord[] | undefined,
+  ) => void): () => void;
   clearRoom(roomId: string): void;
 }
 
@@ -147,6 +187,17 @@ export function createDesktopAuthorityCache(
   let catalog: RoomSummary[] = [];
   const roomStages = new Map<string, RoomStage>();
   const rooms = new Map<string, LiveRoom>();
+  const roomListeners = new Set<(
+    roomId: string,
+    records: readonly RoomRepairRecord[] | undefined,
+  ) => void>();
+  const publishRoom = (roomId: string): void => {
+    const records = rooms.get(roomId)?.records;
+    for (const listener of [...roomListeners]) {
+      try { listener(roomId, records === undefined ? undefined : structuredClone(records)); }
+      catch { /* A projection observer cannot alter authoritative cache state. */ }
+    }
+  };
 
   return {
     roomCursor(roomId) {
@@ -199,6 +250,7 @@ export function createDesktopAuthorityCache(
         updatedAt: now(),
       });
       roomStages.delete(roomId);
+      publishRoom(roomId);
     },
     applyRoomEvents(roomId, events, cursor) {
       const room = rooms.get(roomId);
@@ -206,6 +258,7 @@ export function createDesktopAuthorityCache(
       for (const event of events) applyProjectionEvent(room.records, event);
       room.cursor = structuredClone(cursor);
       room.updatedAt = now();
+      publishRoom(roomId);
     },
     discardSnapshot(snapshotId) {
       if (catalogStage?.snapshotId === snapshotId) catalogStage = undefined;
@@ -214,10 +267,12 @@ export function createDesktopAuthorityCache(
       }
     },
     clear() {
+      const roomIds = [...rooms.keys()];
       catalogStage = undefined;
       catalog = [];
       roomStages.clear();
       rooms.clear();
+      for (const roomId of roomIds) publishRoom(roomId);
     },
     clearRoom(roomId) {
       if (catalogStage !== undefined) {
@@ -229,6 +284,7 @@ export function createDesktopAuthorityCache(
       catalog = catalog.filter((room) => room.roomId !== roomId);
       roomStages.delete(roomId);
       rooms.delete(roomId);
+      publishRoom(roomId);
     },
     governanceProjection(roomId) {
       const records = rooms.get(roomId)?.records;
@@ -276,6 +332,10 @@ export function createDesktopAuthorityCache(
     roomRepairRecords(roomId) {
       const records = rooms.get(roomId)?.records;
       return records === undefined ? undefined : structuredClone(records);
+    },
+    subscribeRoomRecords(listener) {
+      roomListeners.add(listener);
+      return () => roomListeners.delete(listener);
     },
   };
 }

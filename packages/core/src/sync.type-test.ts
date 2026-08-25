@@ -7,6 +7,14 @@ type MemoryVersionChangedEvent = Extract<
   { readonly type: "room.memory.version.changed" }
 >;
 type MemoryRepairRecord = Extract<RoomRepairRecord, { readonly kind: "memory" }>;
+type InvocationRepairRecord = Extract<
+  RoomRepairRecord,
+  { readonly kind: "agent-invocation-intent" }
+>;
+type ExecutionChangedEvent = Extract<
+  PersistedRoomEvent,
+  { readonly type: "agent.execution.changed" }
+>;
 
 const archived: ArchivedEvent = {
   eventId: "event-archived",
@@ -119,9 +127,54 @@ const memoryRepairWithProviderMetadata: MemoryRepairRecord = {
   providerMetadata: "must-not-cross-repair",
 };
 
+const invocationRepair: InvocationRepairRecord = {
+  kind: "agent-invocation-intent",
+  value: {
+    intentId: "intent-1", lineageId: "lineage-1", turnId: "turn-1", roomId: "room-1",
+    sourceMessageId: "message-1", sourceRevision: 1, targetId: "target-1", agentId: "agent-1",
+    origin: { kind: "message_target", messageTransactionId: "transaction-1", targetId: "target-1" },
+    profileRevision: 1, assignmentRevision: 1, accessRevision: 1,
+    status: "pending", createdAt: "2026-08-25T00:00:00.000Z",
+  },
+};
+
+const executionChanged: ExecutionChangedEvent = {
+  eventId: "event-execution", streamKind: "room", streamId: "room-1", streamSeq: 3,
+  roomId: "room-1", actorId: "agent-1", occurredAt: "2026-08-25T00:00:01.000Z",
+  type: "agent.execution.changed",
+  payload: {
+    executionId: "execution-1", intentId: "intent-1", lineageId: "lineage-1",
+    executionOrdinal: 1, roomId: "room-1", agentId: "agent-1", snapshotId: "snapshot-1",
+    providerId: "provider-1", modelId: "model-1", status: "accepted", phase: "queued",
+    currentAttemptSeq: 1, version: 1, queuedAt: "2026-08-25T00:00:01.000Z",
+    updatedAt: "2026-08-25T00:00:01.000Z",
+  },
+};
+
+const executionEventWithPreview: ExecutionChangedEvent = {
+  ...executionChanged,
+  payload: {
+    ...executionChanged.payload,
+    // @ts-expect-error Durable execution events never carry transient preview.
+    preview: "preview-sentinel",
+  },
+};
+
+const executionEventWithQueuedStatus: ExecutionChangedEvent = {
+  ...executionChanged,
+  payload: {
+    ...executionChanged.payload,
+    // @ts-expect-error queued is an internal accepted phase, not the public status.
+    status: "queued",
+  },
+};
+
 void reopenedFromArchive;
 void archivedWithSecret;
 void memoryEventWithDerivedText;
 void memoryEventWithRawBody;
 void memoryEventWithProviderOutput;
 void memoryRepairWithProviderMetadata;
+void invocationRepair;
+void executionEventWithPreview;
+void executionEventWithQueuedStatus;

@@ -1,17 +1,24 @@
 import { createHash } from "node:crypto";
 import type {
-  AgentExecution,
-  AgentInvocationIntent,
+  LegacyAgentExecution as AgentExecution,
+  LegacyAgentInvocationIntent as AgentInvocationIntent,
   AgentRuntimeProviderInput,
   ToolConfirmationInput,
   ToolDescriptor,
+  ScopedCancellationReceipt,
+} from "@native-im/core";
+import {
+  isLegacyAgentExecution as isAgentExecution,
+  isScopedCancellationReceipt,
 } from "@native-im/core";
 import type { AuthenticatedCommandContext, InternalAgentCommandContext } from "../persistence/contracts.js";
 import { canonicalJsonV1, compareUtf8 } from "../context-compiler/canonical-json.js";
 import {
   AGENT_RUNTIME_MAX_ACTIVE,
+  AGENT_RUNTIME_MAX_ADMITTED_PER_ROOM,
   AGENT_RUNTIME_MAX_ATTEMPTS,
   AGENT_RUNTIME_MAX_QUEUED_PER_ROOM,
+  AGENT_RUNTIME_RECOVERY_BATCH_SIZE,
   AGENT_RUNTIME_RETRY_DELAYS_MS,
   AgentRuntimeError,
   type AgentRuntime,
@@ -19,9 +26,12 @@ import {
   type ProviderAdapter,
   type RuntimeAuthority,
   type RuntimeClock,
+  type RuntimeRecoveryAuthority,
   type ToolAdapter,
 } from "./contracts.js";
 import type { ToolGateway } from "./tool-gateway.js";
+import { createScopedCancellationOrchestrator } from
+  "../scoped-cancellation/scoped-cancellation-orchestrator.js";
 
 interface RuntimeLimits {
   readonly maxActive: number;
@@ -29,7 +39,7 @@ interface RuntimeLimits {
   readonly maxPartialBytes: number;
 }
 
-interface AgentRuntimeServiceOptions {
+export interface AgentRuntimeServiceOptions {
   readonly authority: RuntimeAuthority;
   readonly provider: ProviderAdapter;
   readonly modelId: string;
@@ -43,6 +53,8 @@ interface AgentRuntimeServiceOptions {
   readonly toolGateway?: ToolGateway;
   readonly toolAdapters?: readonly ToolAdapter[];
   readonly clock?: RuntimeClock;
+  readonly recoveryAuthority?: RuntimeRecoveryAuthority;
+  readonly shutdownTimeoutMs?: number;
   readonly limits?: RuntimeLimits;
   readonly emitPreview?: (preview: {
     readonly roomId: string;
@@ -51,6 +63,13 @@ interface AgentRuntimeServiceOptions {
     readonly attemptSeq: number;
     readonly streamSeq: number;
     readonly delta: string;
+  }) => void;
+  readonly resetPreview?: (preview: {
+    readonly roomId: string;
+    readonly executionId: string;
+    readonly attemptSeq: number;
+    readonly reason: "human_cancelled" | "message_recalled" | "runtime_shutdown" |
+      "execution_terminal" | "attempt_rolled_over" | "access_revoked";
   }) => void;
   readonly onMessageCommitted?: (execution: AgentExecution) => void;
   readonly proposeOpenItem?: (input: {
@@ -96,6 +115,7 @@ export interface AgentRuntimeService extends AgentRuntime {
       sideEffectState: "none" | "dispatched-retained" | "outcome-unknown-retained";
     }>[];
   }>): void;
+  applyCommittedScopedProducerReceipt(receipt: ScopedCancellationReceipt): void;
   whenIdle(): Promise<void>;
   recover(): Promise<void>;
 }
@@ -167,6 +187,35 @@ function assertProviderInputBudget(input: AgentRuntimeProviderInput): void {
   }
 }
 
+function runtimeRecoveryRecord(value: unknown): value is Awaited<
+  ReturnType<RuntimeAuthority["recover"]>
+>[number] {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const invocation = record.intent;
+  if (!isAgentExecution(record.execution) || typeof invocation !== "object" ||
+      invocation === null || Array.isArray(invocation)) return false;
+  const invocationRecord = invocation as Record<string, unknown>;
+  return (record.outcome === "enqueue" || record.outcome === "failed" ||
+      record.outcome === "fail_outcome_unknown" || record.outcome === "wait_confirmation") &&
+    (invocationRecord.kind === "direct_mention" || invocationRecord.kind === "structured_help" ||
+      invocationRecord.kind === "routed_candidate") &&
+    typeof invocationRecord.roomId === "string" &&
+    typeof invocationRecord.sourceMessageId === "string" &&
+    typeof invocationRecord.targetAgentId === "string" &&
+    invocationRecord.roomId === record.execution.roomId &&
+    invocationRecord.sourceMessageId === record.execution.sourceMessageId &&
+    invocationRecord.targetAgentId === record.execution.agentId;
+}
+
+function recoveryCandidateId(value: unknown): string | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const execution = (value as Record<string, unknown>).execution;
+  if (typeof execution !== "object" || execution === null || Array.isArray(execution)) return undefined;
+  const id = (execution as Record<string, unknown>).id;
+  return typeof id === "string" && id.length > 0 && id.length <= 256 ? id : undefined;
+}
+
 export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): AgentRuntimeService {
   if (options.modelId.trim().length === 0) throw new TypeError("Agent runtime modelId must be non-empty");
   const limits = options.limits ?? {
@@ -175,11 +224,20 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
     maxPartialBytes: 64 * 1_024,
   };
   validateLimits(limits);
+  const shutdownTimeoutMs = options.shutdownTimeoutMs ?? 5_000;
+  if (!Number.isSafeInteger(shutdownTimeoutMs) || shutdownTimeoutMs < 1 || shutdownTimeoutMs > 30_000) {
+    throw new TypeError("Agent runtime shutdown timeout was invalid");
+  }
   const clock = options.clock ?? productionClock;
   const queues = new Map<string, RuntimeJob[]>();
-  const activeRooms = new Set<string>();
+  const activeAgents = new Set<string>();
   const controllers = new Map<string, AbortController>();
   const jobsByExecution = new Map<string, RuntimeJob>();
+  const appliedScopedProducerFences = new Set<string>();
+  const durableOverflowJobs = new Map<string, RuntimeJob>();
+  const admittedExecutions = new Set<string>();
+  const admittedByRoom = new Map<string, number>();
+  const admissionReservations = new Map<string, number>();
   const pendingConfirmations = new Map<string, {
     readonly job: RuntimeJob;
     readonly grantId: string;
@@ -189,9 +247,45 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
     readonly argumentsJson: string;
   }>();
   const idleWaiters = new Set<() => void>();
+  const capacityWaiters = new Set<() => void>();
   let active = 0;
   let closed = false;
   let closePromise: Promise<void> | undefined;
+  let recoveryPromise: Promise<void> | undefined;
+
+  // A stable Agent is one execution lane across every Room. SQLite repeats
+  // this gate at claim time so a second runtime process cannot bypass it.
+  const agentLane = (job: RuntimeJob): string => job.execution.agentId;
+
+  const admitted = (roomId: string): number => admittedByRoom.get(roomId) ?? 0;
+  const reserved = (roomId: string): number => admissionReservations.get(roomId) ?? 0;
+  const reserveAdmission = (roomId: string): void => {
+    if (admitted(roomId) + reserved(roomId) >= AGENT_RUNTIME_MAX_ADMITTED_PER_ROOM) {
+      throw new AgentRuntimeError("agent_queue_full", "Agent room admission is full", 1_000);
+    }
+    admissionReservations.set(roomId, reserved(roomId) + 1);
+  };
+  const releaseReservation = (roomId: string): void => {
+    const count = reserved(roomId);
+    if (count <= 1) admissionReservations.delete(roomId);
+    else admissionReservations.set(roomId, count - 1);
+  };
+  const admit = (job: RuntimeJob): void => {
+    if (admittedExecutions.has(job.execution.id)) return;
+    if (admitted(job.execution.roomId) >= AGENT_RUNTIME_MAX_ADMITTED_PER_ROOM) {
+      throw new AgentRuntimeError("agent_queue_full", "Agent room admission is full", 1_000);
+    }
+    admittedExecutions.add(job.execution.id);
+    admittedByRoom.set(job.execution.roomId, admitted(job.execution.roomId) + 1);
+  };
+  const releaseAdmission = (job: RuntimeJob): void => {
+    if (!admittedExecutions.delete(job.execution.id)) return;
+    const count = admitted(job.execution.roomId);
+    if (count <= 1) admittedByRoom.delete(job.execution.roomId);
+    else admittedByRoom.set(job.execution.roomId, count - 1);
+    for (const resolve of capacityWaiters) resolve();
+    capacityWaiters.clear();
+  };
 
   const exactOwnKeys = (value: object, keys: readonly string[]): boolean => {
     const allowed = new Set(keys);
@@ -202,7 +296,8 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
   const nonEmptyId = (value: unknown): value is string =>
     typeof value === "string" && value.length > 0 && value === value.trim() && value.length <= 256;
 
-  const isIdle = (): boolean => active === 0 && [...queues.values()].every((queue) => queue.length === 0);
+  const isIdle = (): boolean => active === 0 && durableOverflowJobs.size === 0 &&
+    [...queues.values()].every((queue) => queue.length === 0);
   const signalIdle = (): void => {
     if (!isIdle()) return;
     for (const resolve of idleWaiters) resolve();
@@ -214,19 +309,84 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
     if (queue.length >= limits.maxQueuedPerRoom) {
       throw new AgentRuntimeError("agent_queue_full", "Agent room queue is full", 1_000);
     }
+    admit(job);
     queue.push(job);
     queues.set(job.execution.roomId, queue);
     jobsByExecution.set(job.execution.id, job);
-    if (jobsByExecution.size > 1_024) {
-      const oldest = jobsByExecution.keys().next().value as string | undefined;
-      if (oldest !== undefined && !controllers.has(oldest)) jobsByExecution.delete(oldest);
+  };
+
+  const removeQueuedJob = (executionId: string): RuntimeJob | undefined => {
+    for (const [roomId, queue] of queues) {
+      const index = queue.findIndex((candidate) => candidate.execution.id === executionId);
+      if (index < 0) continue;
+      const [removed] = queue.splice(index, 1);
+      if (queue.length === 0) queues.delete(roomId);
+      if (removed !== undefined) {
+        releaseAdmission(removed);
+        jobsByExecution.delete(removed.execution.id);
+      }
+      return removed;
+    }
+    return undefined;
+  };
+
+  const resetCommittedPreview = (
+    execution: Pick<AgentExecution, "roomId" | "id" | "currentAttemptSeq">,
+    attemptSeq: number,
+    reason: "message_recalled" | "runtime_shutdown" | "execution_terminal" |
+      "attempt_rolled_over" | "access_revoked",
+  ): void => {
+    try {
+      options.resetPreview?.({
+        roomId: execution.roomId,
+        executionId: execution.id,
+        attemptSeq,
+        reason,
+      });
+    } catch {
+      // A transient post-commit reset cannot alter the authoritative lifecycle.
     }
   };
 
-  const runAttempt = async (job: RuntimeJob, controller: AbortController): Promise<void> => {
-    let claimed = job.execution.status === "queued"
-      ? await options.authority.claim(job.execution.id, job.execution.currentAttemptSeq)
-      : job.execution;
+  const persistFailure = async (
+    job: RuntimeJob,
+    claimed: AgentExecution,
+    runtimeError: AgentRuntimeError,
+  ): Promise<Readonly<{ next: AgentExecution; retryDelay?: number }>> => {
+    if (!transient(runtimeError.code) || job.sideEffectDispatched) {
+      const next = await options.authority.scheduleRetry(
+        claimed.id, claimed.currentAttemptSeq, runtimeError.code, undefined,
+      );
+      job.execution = next;
+      resetCommittedPreview(next, claimed.currentAttemptSeq,
+        next.currentAttemptSeq > claimed.currentAttemptSeq
+          ? "attempt_rolled_over" : "execution_terminal");
+      return { next };
+    }
+    const configuredRetryDelay = claimed.retryOrdinal < AGENT_RUNTIME_MAX_ATTEMPTS
+      ? AGENT_RUNTIME_RETRY_DELAYS_MS[claimed.retryOrdinal - 1]
+      : undefined;
+    const retryDelay = configuredRetryDelay;
+    const nextRetryAt = retryDelay === undefined
+      ? undefined
+      : new Date(clock.now() + retryDelay).toISOString();
+    const next = await options.authority.scheduleRetry(
+      claimed.id, claimed.currentAttemptSeq, runtimeError.code, nextRetryAt,
+    );
+    job.execution = next;
+    resetCommittedPreview(next, claimed.currentAttemptSeq,
+      next.currentAttemptSeq > claimed.currentAttemptSeq
+        ? "attempt_rolled_over" : "execution_terminal");
+    return retryDelay === undefined ? { next } : { next, retryDelay };
+  };
+
+  const runAttempt = async (job: RuntimeJob, jobController: AbortController): Promise<void> => {
+    // Recovery of an already-running row must cross the same durable Agent
+    // reservation gate as a fresh queued claim (with self-exemption).
+    let claimed = await options.authority.claim(
+      job.execution.id,
+      job.execution.currentAttemptSeq,
+    );
     if (claimed.status !== "running") {
       throw new AgentRuntimeError("execution_conflict", "Agent attempt was not runnable");
     }
@@ -238,6 +398,23 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
     let sawCompleted = false;
     let lastSequence = 0;
     const toolCalls = new Map<string, { toolName: string; argumentsJson: string }>();
+    const attemptController = new AbortController();
+    let rejectJobAbort!: (error: unknown) => void;
+    const jobAbortGate = new Promise<never>((_resolve, reject) => {
+      rejectJobAbort = reject;
+    });
+    void jobAbortGate.catch(() => undefined);
+    const relayJobAbort = (): void => {
+      attemptController.abort(jobController.signal.reason);
+      rejectJobAbort(new AgentRuntimeError("execution_conflict", "Agent job was cancelled"));
+    };
+    if (jobController.signal.aborted) relayJobAbort();
+    else jobController.signal.addEventListener("abort", relayJobAbort, { once: true });
+    let timeoutSettlement: Promise<Readonly<{ next: AgentExecution; retryDelay?: number }>> | undefined;
+    let rejectTimeout!: (error: unknown) => void;
+    const timeoutGate = new Promise<never>((_resolve, reject) => {
+      rejectTimeout = reject;
+    });
     try {
       const baseInput = await options.buildProviderInput(claimed, job.intent, job.context);
       const input: AgentRuntimeProviderInput = {
@@ -249,8 +426,42 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
           input.limits.timeoutMs > 30_000) {
         throw new AgentRuntimeError("invalid_parameters", "Provider timeout limit was invalid");
       }
-      timeout = setTimeout(() => controller.abort("provider_timeout"), input.limits.timeoutMs);
-      for await (const event of options.provider.stream(input, controller.signal)) {
+      if (jobController.signal.aborted) {
+        throw new AgentRuntimeError("execution_conflict", "Agent job was cancelled");
+      }
+      timeout = setTimeout(() => {
+        timeoutSettlement = (async () => {
+          while (true) {
+            try {
+              return await persistFailure(
+                job,
+                claimed,
+                new AgentRuntimeError("provider_timeout", "Provider attempt timed out"),
+              );
+            } catch (error: unknown) {
+              if (jobController.signal.aborted) throw error;
+              await clock.wait(1_000, jobController.signal);
+            }
+          }
+        })();
+        // Stop consuming the Provider stream at the timeout boundary. The
+        // Provider signal intentionally remains live until the authority has
+        // durably committed retry_scheduled/failed below.
+        rejectTimeout(new AgentRuntimeError("provider_timeout", "Provider attempt timed out"));
+        void timeoutSettlement.then(
+          () => {
+            attemptController.abort("provider_timeout");
+          },
+          (error: unknown) => {
+            rejectTimeout(error);
+          },
+        );
+      }, input.limits.timeoutMs);
+      const stream = options.provider.stream(input, attemptController.signal)[Symbol.asyncIterator]();
+      while (true) {
+        const iteration = await Promise.race([stream.next(), timeoutGate, jobAbortGate]);
+        if (iteration.done) break;
+        const event = iteration.value;
         if (event.sequence !== lastSequence + 1) {
           throw new AgentRuntimeError("provider_malformed", "Provider event sequence was invalid");
         }
@@ -314,7 +525,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
           sawCompleted = true;
         }
       }
-      if (!sawStarted || controller.signal.aborted ||
+      if (!sawStarted || attemptController.signal.aborted ||
           (toolCalls.size > 0 ? !sawCompleted || finalDraft !== undefined
             : finalDraft === undefined || sawCompleted)) {
         throw new AgentRuntimeError("provider_malformed", "Provider stream did not complete");
@@ -391,7 +602,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
             grantId: prepared.grantId,
             toolId: tool.id,
             parameters: parameters as Readonly<Record<string, unknown>>,
-            signal: controller.signal,
+            signal: attemptController.signal,
           });
           const stepSeq = job.toolContinuations.length + 1;
           await options.authority.checkpoint(
@@ -411,7 +622,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         }
         clearTimeout(timeout);
         partial = "";
-        await runAttempt(job, controller);
+        await runAttempt(job, jobController);
         return;
       }
       const completed = await options.authority.complete(
@@ -420,6 +631,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         finalDraft!.body,
         finalDraft!.citations,
       );
+      resetCommittedPreview(completed, claimed.currentAttemptSeq, "execution_terminal");
       try {
         options.onMessageCommitted?.(completed);
       } catch {
@@ -427,44 +639,29 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
       }
       return;
     } catch (error: unknown) {
-      if (controller.signal.aborted) return;
+      clearTimeout(timeout);
+      if (jobController.signal.aborted) return;
+      if (timeoutSettlement !== undefined) {
+        const persisted = await timeoutSettlement;
+        if (!attemptController.signal.aborted) attemptController.abort("provider_timeout");
+        if (persisted.next.status === "queued" && persisted.retryDelay !== undefined) {
+          await clock.wait(persisted.retryDelay, jobController.signal);
+          if (!jobController.signal.aborted) await runAttempt(job, jobController);
+        }
+        return;
+      }
       const runtimeError = error instanceof AgentRuntimeError
         ? error
         : new AgentRuntimeError("provider_failure", "Provider execution failed");
       if (runtimeError.code === "execution_conflict") return;
-      if (!transient(runtimeError.code)) {
-        await options.authority.scheduleRetry(claimed.id, claimed.currentAttemptSeq, runtimeError.code, undefined);
-        return;
-      }
-      const ordinal = claimed.retryOrdinal;
-      if (job.sideEffectDispatched) {
-        await options.authority.scheduleRetry(claimed.id, claimed.currentAttemptSeq, runtimeError.code, undefined);
-        return;
-      }
-      const configuredRetryDelay = ordinal < AGENT_RUNTIME_MAX_ATTEMPTS
-        ? AGENT_RUNTIME_RETRY_DELAYS_MS[ordinal - 1]
-        : undefined;
-      const retryDelay = configuredRetryDelay === undefined ? undefined
-        : Number.isSafeInteger(runtimeError.retryAfterMs) && runtimeError.retryAfterMs! >= 0
-          ? runtimeError.retryAfterMs
-          : configuredRetryDelay;
-      const nextRetryAt = retryDelay === undefined
-        ? undefined
-        : new Date(clock.now() + retryDelay).toISOString();
-      const next = await options.authority.scheduleRetry(
-        claimed.id,
-        claimed.currentAttemptSeq,
-        runtimeError.code,
-        nextRetryAt,
-      );
-      job.execution = next;
-      if (next.status === "queued" && retryDelay !== undefined) {
-        clearTimeout(timeout);
-        await clock.wait(retryDelay, controller.signal);
-        if (!controller.signal.aborted) await runAttempt(job, controller);
+      const persisted = await persistFailure(job, claimed, runtimeError);
+      if (persisted.next.status === "queued" && persisted.retryDelay !== undefined) {
+        await clock.wait(persisted.retryDelay, jobController.signal);
+        if (!jobController.signal.aborted) await runAttempt(job, jobController);
       }
     } finally {
       clearTimeout(timeout);
+      jobController.signal.removeEventListener("abort", relayJobAbort);
       partial = "";
     }
   };
@@ -479,7 +676,15 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         const runtimeError = error instanceof AgentRuntimeError
           ? error
           : new AgentRuntimeError("provider_failure", "Agent runtime failed");
-        if (runtimeError.code === "execution_conflict") return;
+        if (runtimeError.code === "execution_conflict") {
+          // A durable cross-process Agent-busy race leaves the execution
+          // queued. Release this worker's recovery leases so the next scan can
+          // admit it as soon as the winning running execution is terminal.
+          if (options.recoveryAuthority?.release !== undefined) {
+            await options.recoveryAuthority.release().catch(() => undefined);
+          }
+          return;
+        }
         await options.authority.scheduleRetry(
           job.execution.id,
           job.execution.currentAttemptSeq,
@@ -489,6 +694,12 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
       }
     } finally {
       controllers.delete(job.execution.id);
+      const waitingForConfirmation = [...pendingConfirmations.values()].some((pending) =>
+        pending.job.execution.id === job.execution.id);
+      if (!waitingForConfirmation) {
+        releaseAdmission(job);
+        jobsByExecution.delete(job.execution.id);
+      }
     }
   };
 
@@ -497,22 +708,44 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
       signalIdle();
       return;
     }
-    for (const [roomId, queue] of queues) {
-      if (active >= limits.maxActive) break;
-      if (activeRooms.has(roomId) || queue.length === 0) continue;
-      const job = queue.shift();
-      if (job === undefined) continue;
-      active += 1;
-      activeRooms.add(roomId);
-      void runJob(job).finally(() => {
-        active -= 1;
-        activeRooms.delete(roomId);
-        if (queue.length === 0) queues.delete(roomId);
-        pump();
-        signalIdle();
-      });
+    let madeProgress = true;
+    while (active < limits.maxActive && madeProgress) {
+      madeProgress = false;
+      for (const [roomId, queue] of queues) {
+        if (active >= limits.maxActive) break;
+        const index = queue.findIndex((candidate) => !activeAgents.has(agentLane(candidate)));
+        if (index < 0) continue;
+        const [job] = queue.splice(index, 1);
+        if (job === undefined) continue;
+        const lane = agentLane(job);
+        active += 1;
+        activeAgents.add(lane);
+        madeProgress = true;
+        void runJob(job).finally(() => {
+          active -= 1;
+          activeAgents.delete(lane);
+          if (queue.length === 0) queues.delete(roomId);
+          pump();
+          signalIdle();
+        });
+      }
     }
     signalIdle();
+  };
+
+  const enqueueCommitted = (job: RuntimeJob): void => {
+    if (jobsByExecution.has(job.execution.id) || durableOverflowJobs.has(job.execution.id) ||
+        job.execution.status !== "queued") return;
+    try {
+      enqueue(job);
+      pump();
+    } catch (error: unknown) {
+      if (!(error instanceof AgentRuntimeError) || error.code !== "agent_queue_full") throw error;
+      // The authority transaction already committed. Never turn its ACK into a
+      // local 429; the durable recovery scan owns re-admission after capacity drains.
+      durableOverflowJobs.set(job.execution.id, job);
+      queueMicrotask(() => void runtime.recover().catch(() => undefined));
+    }
   };
 
   const runtime: AgentRuntimeService = {
@@ -525,12 +758,20 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
       if (queue !== undefined && queue.length >= limits.maxQueuedPerRoom) {
         throw new AgentRuntimeError("agent_queue_full", "Agent room queue is full", 1_000);
       }
-      const accepted = await options.authority.invoke(context, intent, options.provider.id, options.modelId);
-      if (!accepted.replayed && accepted.execution.status === "queued") {
-        enqueue({ execution: accepted.execution, intent, context, toolContinuations: [], sideEffectDispatched: false });
-        pump();
+      reserveAdmission(intent.roomId);
+      try {
+        const accepted = await options.authority.invoke(context, intent, options.provider.id, options.modelId);
+        enqueueCommitted({
+          execution: accepted.execution,
+          intent: accepted.intent,
+          context,
+          toolContinuations: [],
+          sideEffectDispatched: false,
+        });
+        return accepted;
+      } finally {
+        releaseReservation(intent.roomId);
       }
-      return accepted;
     },
     async invokeRouted(routeJobId, intent): Promise<InvocationAccepted> {
       if (closed) throw new AgentRuntimeError("agent_runtime_closed", "Agent runtime is closed");
@@ -541,23 +782,25 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
       if (queue !== undefined && queue.length >= limits.maxQueuedPerRoom) {
         throw new AgentRuntimeError("agent_queue_full", "Agent room queue is full", 1_000);
       }
-      const accepted = await options.authority.invokeRouted(
-        routeJobId,
-        intent,
-        options.provider.id,
-        options.modelId,
-      );
-      if (!accepted.replayed && accepted.execution.status === "queued") {
-        enqueue({
-          execution: accepted.execution,
+      reserveAdmission(intent.roomId);
+      try {
+        const accepted = await options.authority.invokeRouted(
+          routeJobId,
           intent,
+          options.provider.id,
+          options.modelId,
+        );
+        enqueueCommitted({
+          execution: accepted.execution,
+          intent: accepted.intent,
           context: undefined,
           toolContinuations: [],
           sideEffectDispatched: false,
         });
-        pump();
+        return accepted;
+      } finally {
+        releaseReservation(intent.roomId);
       }
-      return accepted;
     },
     async invokeFenceReplacements(routeJobId, intent) {
       if (closed) throw new AgentRuntimeError("agent_runtime_closed", "Agent runtime is closed");
@@ -587,12 +830,13 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         controllers.get(cancelled.id)?.abort("human_preempted");
         const job = jobsByExecution.get(cancelled.id);
         if (job !== undefined) job.execution = cancelled;
-        for (const queue of queues.values()) {
-          const index = queue.findIndex((candidate) => candidate.execution.id === cancelled.id);
-          if (index >= 0) queue.splice(index, 1);
-        }
+        removeQueuedJob(cancelled.id);
         for (const [confirmationId, pending] of pendingConfirmations) {
           if (pending.job.execution.id === cancelled.id) pendingConfirmations.delete(confirmationId);
+        }
+        if (job !== undefined && !controllers.has(cancelled.id)) {
+          releaseAdmission(job);
+          jobsByExecution.delete(cancelled.id);
         }
       }
       signalIdle();
@@ -630,19 +874,61 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         }
       }
       for (const cancellation of input.cancellations) {
-        controllers.get(cancellation.executionId)?.abort("message_recalled");
-        for (const queue of queues.values()) {
-          const index = queue.findIndex((candidate) =>
-            candidate.execution.id === cancellation.executionId);
-          if (index >= 0) queue.splice(index, 1);
+        const committedJob = jobsByExecution.get(cancellation.executionId);
+        if (committedJob !== undefined) {
+          resetCommittedPreview(
+            committedJob.execution,
+            cancellation.attemptSeq,
+            "message_recalled",
+          );
         }
+        controllers.get(cancellation.executionId)?.abort("message_recalled");
+        removeQueuedJob(cancellation.executionId);
         for (const [confirmationId, pending] of pendingConfirmations) {
           if (pending.job.execution.id === cancellation.executionId) {
             pendingConfirmations.delete(confirmationId);
           }
         }
+        const job = jobsByExecution.get(cancellation.executionId);
+        if (job !== undefined && !controllers.has(cancellation.executionId)) releaseAdmission(job);
         jobsByExecution.delete(cancellation.executionId);
       }
+      signalIdle();
+    },
+    applyCommittedScopedProducerReceipt(receipt) {
+      if (!isScopedCancellationReceipt(receipt)) {
+        throw new TypeError("Committed scoped producer receipt was malformed");
+      }
+      if (appliedScopedProducerFences.has(receipt.fenceId)) return;
+      let applied = false;
+      for (const outcome of receipt.executionOutcomes) {
+        if (outcome.outcome !== "cancelled" && outcome.outcome !== "already_terminal") continue;
+        const job = jobsByExecution.get(outcome.executionId);
+        if (job === undefined || job.execution.roomId !== receipt.roomId) continue;
+        const scopeMatches = receipt.scope.kind === "room"
+          ? receipt.scope.roomId === job.execution.roomId
+          : receipt.scope.kind === "source_message"
+            ? receipt.scope.sourceMessageId === job.execution.sourceMessageId
+            : receipt.scope.kind === "agent_authority"
+              ? receipt.scope.agentId === job.execution.agentId
+              : receipt.scope.kind === "execution"
+                ? receipt.scope.executionId === job.execution.id
+                : true;
+        if (!scopeMatches || job.execution.currentAttemptSeq < 1) continue;
+        applied = true;
+        resetCommittedPreview(job.execution, job.execution.currentAttemptSeq,
+          receipt.reason === "message_recalled" ? "message_recalled" : "access_revoked");
+        controllers.get(outcome.executionId)?.abort(receipt.reason);
+        removeQueuedJob(outcome.executionId);
+        for (const [confirmationId, pending] of pendingConfirmations) {
+          if (pending.job.execution.id === outcome.executionId) {
+            pendingConfirmations.delete(confirmationId);
+          }
+        }
+        if (!controllers.has(outcome.executionId)) releaseAdmission(job);
+        jobsByExecution.delete(outcome.executionId);
+      }
+      if (applied) appliedScopedProducerFences.add(receipt.fenceId);
       signalIdle();
     },
     async interrupt(context, executionId, reason) {
@@ -650,12 +936,68 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
       controllers.get(executionId)?.abort("cancelled");
       const job = jobsByExecution.get(executionId);
       if (job !== undefined) job.execution = cancelled;
-      for (const queue of queues.values()) {
-        const index = queue.findIndex((candidate) => candidate.execution.id === executionId);
-        if (index >= 0) queue.splice(index, 1);
+      removeQueuedJob(executionId);
+      if (job !== undefined && !controllers.has(executionId)) {
+        releaseAdmission(job);
+        jobsByExecution.delete(executionId);
       }
       signalIdle();
       return cancelled;
+    },
+    async cancelInvocation(context, target) {
+      if (closed) throw new AgentRuntimeError("agent_runtime_closed", "Agent runtime is closed");
+      const orchestrator = createScopedCancellationOrchestrator({
+        authority: {
+          commitScopedCancellation: () => options.authority.cancelScoped(
+            context, target, context.requestId,
+          ),
+        },
+        queue: {
+          removeAfterCommittedCancellation(effect) {
+            removeQueuedJob(effect.executionId!);
+            for (const [confirmationId, pending] of pendingConfirmations) {
+              if (pending.job.execution.id === effect.executionId) {
+                pendingConfirmations.delete(confirmationId);
+              }
+            }
+            const job = jobsByExecution.get(effect.executionId!);
+            if (job !== undefined && !controllers.has(effect.executionId!)) {
+              releaseAdmission(job);
+              jobsByExecution.delete(effect.executionId!);
+            }
+          },
+        },
+        controllers: {
+          abortAfterCommittedCancellation(effect) {
+            controllers.get(effect.executionId!)?.abort("human_cancelled");
+          },
+        },
+        preview: {
+          resetAfterCommittedCancellation(effect) {
+            options.resetPreview?.({
+              roomId: effect.roomId,
+              executionId: effect.executionId,
+              attemptSeq: effect.attemptSeq,
+              reason: "human_cancelled",
+            });
+          }
+        },
+      });
+      const result = await orchestrator.handle({
+        kind: "related-cancellation",
+        producerId: context.requestId,
+        target: "executionId" in target
+          ? { kind: "execution", executionId: target.executionId,
+              expectedVersion: target.expectedVersion }
+          : { kind: "intent", invocationIntentId: target.intentId,
+              expectedVersion: target.expectedVersion },
+        trigger: { kind: "explicit-cancel", controllerPrincipalId: context.principal.actorId },
+      });
+      if (result.kind !== "scoped-cancellation-applied") {
+        throw new AgentRuntimeError("execution_conflict", "Cancellation was not related");
+      }
+      signalIdle();
+      return result.receipt.receipt;
     },
     async retry(context, executionId) {
       if (closed) throw new AgentRuntimeError("agent_runtime_closed", "Agent runtime is closed");
@@ -672,9 +1014,31 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         toolContinuations: [],
         sideEffectDispatched: false,
       };
-      enqueue(job);
-      pump();
+      enqueueCommitted(job);
       return accepted;
+    },
+    async retryInvocation(context, executionId, expectedVersion) {
+      if (closed) throw new AgentRuntimeError("agent_runtime_closed", "Agent runtime is closed");
+      if (options.readiness?.() === "noauth") {
+        throw new AgentRuntimeError("agent_configuration_missing", "Agent model authentication is not configured");
+      }
+      const accepted = await options.authority.retry(context, executionId, expectedVersion);
+      if (accepted.retryReceipt === undefined) {
+        throw new AgentRuntimeError("provider_failure", "Canonical Human retry receipt was unavailable");
+      }
+      const prior = jobsByExecution.get(executionId);
+      if (accepted.replayed && prior !== undefined) {
+        return { ...accepted, retryReceipt: accepted.retryReceipt };
+      }
+      const job: RuntimeJob = {
+        execution: accepted.execution,
+        intent: prior?.intent ?? accepted.intent,
+        context,
+        toolContinuations: [],
+        sideEffectDispatched: false,
+      };
+      enqueueCommitted(job);
+      return { ...accepted, retryReceipt: accepted.retryReceipt };
     },
     async confirmTool(context: AuthenticatedCommandContext, confirmation: ToolConfirmationInput) {
       let pending = pendingConfirmations.get(confirmation.confirmationId);
@@ -780,6 +1144,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
           begun.execution.currentAttemptSeq,
           "Compensation completed",
         );
+        resetCommittedPreview(completed, begun.execution.currentAttemptSeq, "execution_terminal");
         try {
           options.onMessageCommitted?.(completed);
         } catch {
@@ -809,31 +1174,181 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
       return new Promise<void>((resolve) => idleWaiters.add(resolve));
     },
     async recover() {
-      const records = await options.authority.recover();
-      for (const record of records) {
-        if (record.outcome !== "enqueue") continue;
-        const existing = jobsByExecution.get(record.execution.id);
-        if (existing !== undefined) continue;
-        enqueue({
-          execution: record.execution,
-          intent: record.intent,
-          context: undefined,
-          toolContinuations: [],
-          sideEffectDispatched: false,
-        });
-      }
-      pump();
+      if (closed) throw new AgentRuntimeError("agent_runtime_closed", "Agent runtime is closed");
+      recoveryPromise ??= (async () => {
+        const processCandidate = async (
+          cursor: string,
+          value: unknown,
+          isolate: RuntimeRecoveryAuthority["isolate"] | undefined,
+          settle: RuntimeRecoveryAuthority["settle"] | undefined,
+        ): Promise<void> => {
+          if (!runtimeRecoveryRecord(value)) {
+            const candidateId = recoveryCandidateId(value);
+            await isolate?.({
+              cursor,
+              ...(candidateId === undefined ? {} : { candidateId }),
+              reason: "recovery_candidate_invalid",
+            });
+            return;
+          }
+          if (value.outcome !== "enqueue") {
+            await settle?.({ cursor, candidateId: value.execution.id });
+            return;
+          }
+          if (jobsByExecution.has(value.execution.id)) return;
+          const job: RuntimeJob = {
+            execution: value.execution,
+            intent: value.intent,
+            context: undefined,
+            toolContinuations: [],
+            sideEffectDispatched: false,
+          };
+          while (!closed) {
+            try {
+              enqueue(job);
+              durableOverflowJobs.delete(job.execution.id);
+              pump();
+              break;
+            } catch (error: unknown) {
+              if (!(error instanceof AgentRuntimeError) || error.code !== "agent_queue_full") {
+                await isolate?.({
+                  cursor,
+                  candidateId: value.execution.id,
+                  reason: "recovery_candidate_conflict",
+                });
+                return;
+              }
+              pump();
+              await new Promise<void>((resolve) => {
+                capacityWaiters.add(resolve);
+                const queue = queues.get(job.execution.roomId);
+                if (admitted(job.execution.roomId) < AGENT_RUNTIME_MAX_ADMITTED_PER_ROOM &&
+                    (queue?.length ?? 0) < limits.maxQueuedPerRoom) {
+                  capacityWaiters.delete(resolve);
+                  resolve();
+                }
+              });
+            }
+          }
+        };
+
+        if (options.recoveryAuthority === undefined) {
+          const records = await options.authority.recover();
+          for (const [index, record] of records.entries()) {
+            await processCandidate(String(index), record, undefined, undefined);
+          }
+          return;
+        }
+
+        let after: string | undefined;
+        while (!closed) {
+          const page = await options.recoveryAuthority.scan({
+            ...(after === undefined ? {} : { after }),
+            limit: AGENT_RUNTIME_RECOVERY_BATCH_SIZE,
+          });
+          if (typeof page !== "object" || page === null || !Array.isArray(page.candidates) ||
+              typeof page.hasMore !== "boolean" ||
+              page.candidates.length > AGENT_RUNTIME_RECOVERY_BATCH_SIZE) {
+            throw new AgentRuntimeError("provider_failure", "Authority recovery page was malformed");
+          }
+          if (page.candidates.length === 0) {
+            if (page.hasMore) {
+              throw new AgentRuntimeError("provider_failure", "Authority recovery page was malformed");
+            }
+            return;
+          }
+          for (const candidate of page.candidates) {
+            if (typeof candidate !== "object" || candidate === null ||
+                typeof candidate.cursor !== "string" || candidate.cursor.length === 0 ||
+                candidate.cursor.length > 2_048 ||
+                (after !== undefined && compareUtf8(candidate.cursor, after) <= 0)) {
+              throw new AgentRuntimeError("provider_failure", "Authority recovery cursor was malformed");
+            }
+            await processCandidate(
+              candidate.cursor,
+              candidate.record,
+              options.recoveryAuthority.isolate.bind(options.recoveryAuthority),
+              options.recoveryAuthority.settle?.bind(options.recoveryAuthority),
+            );
+            after = candidate.cursor;
+          }
+        }
+      })().finally(() => {
+        recoveryPromise = undefined;
+      });
+      await recoveryPromise;
     },
     close() {
       closePromise ??= (async () => {
         closed = true;
-        for (const controller of controllers.values()) controller.abort("runtime_close");
-        for (const queue of queues.values()) queue.splice(0);
-        const drained = runtime.whenIdle();
-        await Promise.race([
-          drained,
-          new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
-        ]);
+        const deadline = Date.now() + shutdownTimeoutMs;
+        const withinDeadline = async <Value>(operation: Promise<Value>): Promise<Value> => {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) {
+            throw new AgentRuntimeError("provider_timeout", "Runtime shutdown authority timed out");
+          }
+          let timeout: ReturnType<typeof setTimeout> | undefined;
+          try {
+            return await Promise.race([
+              operation,
+              new Promise<never>((_resolve, reject) => {
+                timeout = setTimeout(() => reject(new AgentRuntimeError(
+                  "provider_timeout", "Runtime shutdown authority timed out",
+                )), remaining);
+              }),
+            ]);
+          } finally {
+            clearTimeout(timeout);
+          }
+        };
+        // A recovery page may already own up to 256 durable candidates while
+        // local admission is blocked at 32. Stop that producer before taking
+        // the shutdown snapshot, then return every unstarted lease after all
+        // locally admitted jobs have terminalized.
+        for (const resolve of capacityWaiters) resolve();
+        capacityWaiters.clear();
+        if (recoveryPromise !== undefined) await withinDeadline(recoveryPromise);
+        const jobs = [...new Map([
+          ...jobsByExecution,
+          ...durableOverflowJobs,
+        ]).values()];
+        for (const job of jobs) {
+          const terminal = await withinDeadline(options.authority.shutdown(
+            job.execution.id,
+            job.execution.currentAttemptSeq,
+          ));
+          if (terminal.id !== job.execution.id ||
+              (terminal.status !== "completed" && terminal.status !== "failed" &&
+               terminal.status !== "cancelled")) {
+            throw new AgentRuntimeError(
+              "execution_conflict", "Runtime shutdown authority did not return a terminal execution",
+            );
+          }
+          job.execution = terminal;
+          resetCommittedPreview(
+            terminal,
+            job.execution.currentAttemptSeq,
+            "runtime_shutdown",
+          );
+          durableOverflowJobs.delete(job.execution.id);
+          removeQueuedJob(job.execution.id);
+          controllers.get(job.execution.id)?.abort("runtime_shutdown");
+          for (const [confirmationId, pending] of pendingConfirmations) {
+            if (pending.job.execution.id === job.execution.id) {
+              pendingConfirmations.delete(confirmationId);
+            }
+          }
+          if (!controllers.has(job.execution.id)) {
+            releaseAdmission(job);
+            jobsByExecution.delete(job.execution.id);
+          }
+        }
+        if (options.recoveryAuthority?.release !== undefined) {
+          await withinDeadline(options.recoveryAuthority.release());
+        }
+        for (const resolve of capacityWaiters) resolve();
+        capacityWaiters.clear();
+        await withinDeadline(runtime.whenIdle());
       })();
       return closePromise;
     },

@@ -133,6 +133,26 @@ export type MessageAuthorityErrorInput = Readonly<{
   requestId: string;
 }> & MessageClosedError;
 
+export type AgentExecutionPreviewInput = Readonly<{
+  type: "agent.execution.preview";
+  roomId: string;
+  executionId: string;
+  attemptSeq: number;
+  streamSeq: number;
+  delta: string;
+  authoritative: false;
+}>;
+
+export type AgentExecutionPreviewResetInput = Readonly<{
+  type: "agent.execution.preview.reset";
+  roomId: string;
+  executionId: string;
+  attemptSeq: number;
+  reason: "human_cancelled" | "message_recalled" | "runtime_shutdown" | "repair" | "reconnect" |
+    "execution_terminal" | "attempt_rolled_over" | "access_revoked";
+  authoritative: false;
+}>;
+
 export type MessageAuthorityPortInput =
   | Readonly<{
       type: "room.event";
@@ -160,7 +180,9 @@ export type MessageAuthorityPortInput =
       watermark: number;
       messages: readonly TimelineMessage[];
       eventIds: readonly string[];
-    }>;
+    }>
+  | AgentExecutionPreviewInput
+  | AgentExecutionPreviewResetInput;
 
 export type MessageAuthorityBridgeInput =
   | MessageAcceptedResult
@@ -385,6 +407,23 @@ export function isMessageAuthorityPortInput(value: unknown): value is MessageAut
   if (value.type === "message.connection") {
     return keys(value, ["type", "roomId", "connection"]) && text(value.roomId) &&
       isMessageConnectionState(value.connection);
+  }
+  if (value.type === "agent.execution.preview") {
+    return keys(value, [
+      "type", "roomId", "executionId", "attemptSeq", "streamSeq", "delta", "authoritative",
+    ]) && text(value.roomId) && text(value.executionId) && positive(value.attemptSeq) &&
+      positive(value.streamSeq) && typeof value.delta === "string" && value.delta.length > 0 &&
+      new TextEncoder().encode(value.delta).byteLength <= 64 * 1_024 && value.authoritative === false;
+  }
+  if (value.type === "agent.execution.preview.reset") {
+    return keys(value, [
+      "type", "roomId", "executionId", "attemptSeq", "reason", "authoritative",
+    ]) && text(value.roomId) && text(value.executionId) && positive(value.attemptSeq) &&
+      (value.reason === "human_cancelled" || value.reason === "message_recalled" ||
+        value.reason === "runtime_shutdown" || value.reason === "repair" ||
+        value.reason === "reconnect" || value.reason === "execution_terminal" ||
+        value.reason === "attempt_rolled_over" || value.reason === "access_revoked") &&
+      value.authoritative === false;
   }
   return value.type === "message.repair.completed" && keys(value, [
     "type", "roomId", "generation", "watermark", "messages", "eventIds",

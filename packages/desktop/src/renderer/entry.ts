@@ -4,6 +4,7 @@ import type { MessageAuthorityBridge } from "../message-authority/contracts.js";
 import type { AttachmentAuthorityBridge } from "../attachment-authority/contracts.js";
 import type { MemoryAuthorityBridge } from "../memory-authority/contracts.js";
 import type { AgentSettingsBridge } from "../agent-profile-routing/contracts.js";
+import type { InvocationBridge } from "../invocation-runtime/contracts.js";
 import { mountAgentSettingsBridgeSurface } from "./agent-settings/bridge-adapter.js";
 import {
   mountGovernanceSurface,
@@ -14,6 +15,11 @@ import {
 import { mountIdentityApp } from "./identity.js";
 import { mountMessageAuthorityBridgeSurface } from "./message-authority/bridge-adapter.js";
 import { mountDesktopMemoryAuthoritySurface } from "./memory-authority/host-adapter.js";
+import {
+  mountInvocationSurface,
+  type InvocationHostAction,
+  type InvocationSurfaceActions,
+} from "./invocation-runtime/surface.js";
 
 export interface DesktopRendererEntryPorts {
   readonly renderM2PrimitivesPreview: (root: HTMLElement) => void;
@@ -39,6 +45,8 @@ export interface DesktopRendererEntryPorts {
   ) => () => void;
   readonly mountAgentSettingsSurface?: (root: HTMLElement, bridge: AgentSettingsBridge,
     roomId: string) => () => void;
+  readonly mountInvocationSurface?: (root: HTMLElement, bridge: InvocationBridge,
+    roomId: string, actions: InvocationSurfaceActions) => () => void;
 }
 
 const DEFAULT_PORTS: DesktopRendererEntryPorts = Object.freeze({
@@ -86,9 +94,101 @@ const DEFAULT_PORTS: DesktopRendererEntryPorts = Object.freeze({
   mountAgentSettingsSurface: (root: HTMLElement, bridge: AgentSettingsBridge, roomId: string) => mountAgentSettingsBridgeSurface(
     root, bridge, roomId, { reducedMotion: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false,
       onClose: () => history.back() }),
+  mountInvocationSurface,
 });
 
 const encoder = new TextEncoder();
+const ROUTE_FOCUS_SELECTORS = Object.freeze({
+  identity: [
+    "[data-identity-login] input:not(:disabled)",
+    ".identity-shell [role='alert']",
+    ".identity-shell h1",
+  ],
+  governance: [
+    ".dao-governance h1",
+    "[data-governance-locked] h1",
+    "[data-governance-route-locked] h1",
+  ],
+});
+
+function focusRouteEntry(
+  root: HTMLElement,
+  selectors: readonly string[],
+): () => void {
+  let stopped = false;
+  const focus = (): boolean => {
+    if (stopped) return false;
+    const target = selectors.map((selector) => root.querySelector<HTMLElement>(selector))
+      .find((element) => element !== null);
+    if (target === undefined || target === null) return false;
+    if (!(target instanceof HTMLInputElement) && !(target instanceof HTMLButtonElement) &&
+        !(target instanceof HTMLSelectElement) && !(target instanceof HTMLTextAreaElement) &&
+        !target.hasAttribute("tabindex")) target.tabIndex = -1;
+    target.focus();
+    return true;
+  };
+  const observer = new MutationObserver(() => {
+    if (focus()) observer.disconnect();
+  });
+  observer.observe(root, { childList: true, subtree: true });
+  queueMicrotask(() => {
+    if (focus()) observer.disconnect();
+  });
+  return () => {
+    stopped = true;
+    observer.disconnect();
+  };
+}
+
+function navigateRenderer(search: string): void {
+  const url = new URL(window.location.href);
+  url.search = search;
+  url.hash = "";
+  window.history.pushState(null, "", url);
+  window.dispatchEvent(new PopStateEvent("popstate", { state: window.history.state }));
+}
+
+function showInvocationHostHandoff(
+  workspace: HTMLElement,
+  executions: HTMLElement,
+  action: Extract<InvocationHostAction, "upgrade-client" | "review-required">,
+  executionId: string,
+): void {
+  let handoff = workspace.querySelector<HTMLElement>("[data-invocation-host-handoff]");
+  if (handoff === null) {
+    handoff = document.createElement("section");
+    handoff.className = "invocation-host-handoff";
+    handoff.dataset.invocationHostHandoff = action;
+    handoff.tabIndex = -1;
+    workspace.prepend(handoff);
+  }
+  handoff.dataset.invocationHostHandoff = action;
+  handoff.setAttribute("role", "alert");
+  const heading = document.createElement("h2");
+  const explanation = document.createElement("p");
+  if (action === "upgrade-client") {
+    heading.textContent = "需要更新客户端";
+    explanation.textContent =
+      "当前客户端不能安全消费此协议版本。请通过部署方批准的客户端更新渠道安装新版；此入口不会伪装成已经更新。";
+  } else {
+    heading.textContent = "人工审阅仍待权威入口接入";
+    explanation.textContent =
+      `执行 ${executionId} 仍保持 needs_review，原 toolCall 与普通重试继续关闭。` +
+      "当前 Desktop 不会伪造 FT-10 审阅结论；请等待权威 review 接线或联系 Room owner。";
+  }
+  const back = document.createElement("button");
+  back.type = "button";
+  back.textContent = "返回执行详情";
+  back.addEventListener("click", () => {
+    handoff?.remove();
+    const card = [...executions.querySelectorAll<HTMLElement>("[data-execution-id]")]
+      .find((element) => element.dataset.executionId === executionId);
+    card?.focus();
+  });
+  handoff.replaceChildren(heading, explanation, back);
+  handoff.focus();
+}
+
 function governanceRoomId(route: URLSearchParams): string | undefined {
   const values = route.getAll("governance-room");
   if (values.length !== 1 || [...route.keys()].length !== 1) return undefined;
@@ -147,6 +247,7 @@ export function mountDesktopRendererEntry(
   attachmentAuthority?: AttachmentAuthorityBridge,
   memoryAuthority?: MemoryAuthorityBridge,
   agentSettings?: AgentSettingsBridge,
+  invocation?: InvocationBridge,
 ): (() => void) | undefined {
   const route = new URLSearchParams(search);
   root.dataset.governanceRouteContract = "closed-v1";
@@ -187,7 +288,13 @@ export function mountDesktopRendererEntry(
     const memory = document.createElement("aside");
     memory.className = "room-authority-workspace__memory";
     memory.setAttribute("aria-label", "Room 重要记忆");
-    workspace.append(timeline, memory);
+    const executions = invocation === undefined || ports.mountInvocationSurface === undefined
+      ? undefined : document.createElement("aside");
+    if (executions !== undefined) {
+      executions.className = "room-authority-workspace__invocations";
+      executions.setAttribute("aria-label", "Agent 执行");
+      workspace.append(timeline, executions, memory);
+    } else workspace.append(timeline, memory);
     root.replaceChildren(workspace);
     const disposeMessage = ports.mountMessageAuthoritySurface(
       timeline,
@@ -197,7 +304,24 @@ export function mountDesktopRendererEntry(
       memoryAuthority,
     );
     const disposeMemory = ports.mountMemoryAuthoritySurface(memory, memoryAuthority, roomId);
+    const disposeInvocations = executions === undefined || invocation === undefined ||
+      ports.mountInvocationSurface === undefined ? undefined
+      : ports.mountInvocationSurface(executions, invocation, roomId, {
+        onHostAction(action, context) {
+          if (context.roomId !== roomId) return;
+          if (action === "reauthenticate") {
+            navigateRenderer("");
+            return;
+          }
+          if (action === "request-access") {
+            navigateRenderer(`?governance-room=${encodeURIComponent(roomId)}`);
+            return;
+          }
+          showInvocationHostHandoff(workspace, executions, action, context.executionId);
+        },
+      });
     return () => {
+      disposeInvocations?.();
       disposeMemory();
       disposeMessage();
     };
@@ -213,7 +337,12 @@ export function mountDesktopRendererEntry(
       renderGovernanceRouteFailure(root, "Desktop 治理桥未加载，Room 内容保持锁定。");
       return undefined;
     }
-    return ports.mountGovernanceSurface(root, governance, roomId);
+    const dispose = ports.mountGovernanceSurface(root, governance, roomId);
+    const stopFocus = focusRouteEntry(root, ROUTE_FOCUS_SELECTORS.governance);
+    return () => {
+      stopFocus();
+      dispose();
+    };
   }
 
   if (route.has("m2-primitives")) {
@@ -228,7 +357,14 @@ export function mountDesktopRendererEntry(
     ports.renderVisualSeparationPreview(root);
     return undefined;
   }
-  if (identity !== undefined) return ports.mountIdentityApp(root, identity);
+  if (identity !== undefined) {
+    const dispose = ports.mountIdentityApp(root, identity);
+    const stopFocus = focusRouteEntry(root, ROUTE_FOCUS_SELECTORS.identity);
+    return () => {
+      stopFocus();
+      dispose();
+    };
+  }
 
   const error = document.createElement("section");
   error.className = "identity-shell";

@@ -33,6 +33,7 @@ import { createDesktopMemoryAuthorityRuntime } from "./memory-authority/producti
 import { registerMemoryAuthorityIpc } from "./memory-authority/ipc.js";
 import { createDesktopAgentSettingsRuntime } from "./agent-profile-routing/production-runtime.js";
 import { registerAgentSettingsIpc } from "./agent-profile-routing/ipc.js";
+import { registerInvocationIpc } from "./invocation-runtime/ipc.js";
 import { createDesktopAttachmentAuthorityRuntime } from "./attachment-authority/production-runtime.js";
 import {
   createElectronAttachmentPorts,
@@ -53,6 +54,7 @@ async function createWindow(): Promise<void> {
   let identity: ReturnType<typeof createDesktopIdentityRuntime> | undefined;
   let governance: ReturnType<typeof createDesktopGovernanceRuntime> | undefined;
   let disposeGovernanceIpc: (() => void) | undefined;
+  let disposeInvocationIpc: (() => void) | undefined;
   let messageAuthorityRuntime: ReturnType<
     typeof createDesktopMessageAuthorityRuntime
   > | undefined;
@@ -140,6 +142,9 @@ async function createWindow(): Promise<void> {
       webContents: window.webContents,
       controller: governance.controller,
     });
+    disposeInvocationIpc = registerInvocationIpc({
+      ipcMain, webContents: window.webContents, controller: governance.invocations,
+    });
     agentSettings = createDesktopAgentSettingsRuntime({
       endpoint: process.env.NATIVE_IM_IDENTITY_WS_URL ?? "ws://127.0.0.1:8787",
       session: () => identity?.getCurrentAuthoritySession(),
@@ -190,6 +195,7 @@ async function createWindow(): Promise<void> {
     });
     window.once("closed", () => {
       disposeGovernanceIpc?.();
+      disposeInvocationIpc?.();
       disposeMessageAuthorityIpc?.();
       disposeMemoryAuthorityIpc?.();
       disposeAgentSettingsIpc?.();
@@ -212,6 +218,7 @@ async function createWindow(): Promise<void> {
         attachmentAuthorityMethods: Object.keys(globalThis.dao?.attachmentAuthority ?? {}).sort(),
         memoryAuthorityMethods: Object.keys(globalThis.dao?.memoryAuthority ?? {}).sort(),
         agentSettingsMethods: Object.keys(globalThis.dao?.agentSettings ?? {}).sort(),
+        invocationMethods: Object.keys(globalThis.dao?.invocation ?? {}).sort(),
         namespaces: Object.keys(globalThis.dao ?? {}).sort(),
         bridgeMissing: document.querySelector("[data-identity-bridge-missing]") !== null,
         governanceRouteContract: document.querySelector("#app")?.dataset.governanceRouteContract ?? "",
@@ -254,6 +261,7 @@ async function createWindow(): Promise<void> {
     ];
     const expectedMemoryAuthorityMethods = ["context", "onAuthorityInput", "request"];
     const expectedAgentSettingsMethods = ["getSnapshot", "onAuthorityMessage", "submit"];
+    const expectedInvocationMethods = ["cancel", "getSurface", "onStateChanged", "retry"];
     let startupProbe: unknown;
     try {
       startupProbe = typeof startupProbeJson === "string"
@@ -288,9 +296,11 @@ async function createWindow(): Promise<void> {
           (method, index) => method === expectedMemoryAuthorityMethods[index],
         ) || !("agentSettingsMethods" in startupProbe) || !Array.isArray(startupProbe.agentSettingsMethods) ||
         startupProbe.agentSettingsMethods.join(",") !== expectedAgentSettingsMethods.join(",") ||
+        !("invocationMethods" in startupProbe) || !Array.isArray(startupProbe.invocationMethods) ||
+        startupProbe.invocationMethods.join(",") !== expectedInvocationMethods.join(",") ||
         !("namespaces" in startupProbe) || !Array.isArray(startupProbe.namespaces) ||
         startupProbe.namespaces.join(",") !==
-          "agentSettings,attachmentAuthority,governance,identity,memoryAuthority,messageAuthority" ||
+          "agentSettings,attachmentAuthority,governance,identity,invocation,memoryAuthority,messageAuthority" ||
         !("governanceRouteContract" in startupProbe) ||
         startupProbe.governanceRouteContract !== "closed-v1" ||
         !("bridgeMissing" in startupProbe) || startupProbe.bridgeMissing !== false ||
@@ -311,6 +321,7 @@ async function createWindow(): Promise<void> {
     console.info("Native IM desktop Identity surface started.");
   } catch (error: unknown) {
     disposeGovernanceIpc?.();
+    disposeInvocationIpc?.();
     disposeMessageAuthorityIpc?.();
     disposeMemoryAuthorityIpc?.();
     disposeAgentSettingsIpc?.();

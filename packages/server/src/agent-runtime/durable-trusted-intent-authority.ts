@@ -544,9 +544,8 @@ function readClaimFacts(
             membership.kind AS membershipKind,
             membership.access_revision AS currentAccessRevision,
             (SELECT COUNT(*) FROM agent_executions AS execution
-             WHERE execution.room_id = intent.room_id
-               AND execution.agent_id = intent.target_agent_actor_id
-               AND execution.status IN ('queued', 'running')) AS runningExecutionCount,
+             WHERE execution.agent_id = intent.target_agent_actor_id
+               AND execution.status = 'running') AS runningExecutionCount,
             CASE WHEN decision.id IS NOT NULL AND decision.outcome = 'selected'
               AND snapshot.id IS NOT NULL AND snapshot.room_id = intent.room_id
               AND snapshot.source_message_id = intent.source_message_id

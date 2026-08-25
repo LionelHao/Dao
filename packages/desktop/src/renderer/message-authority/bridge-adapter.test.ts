@@ -245,6 +245,39 @@ function send(root: HTMLElement): HTMLButtonElement {
 }
 
 describe("Message Authority bridge renderer adapter", () => {
+  it("renders transient wire previews and removes them on reset without creating timeline facts", async () => {
+    const authority = authorityHarness();
+    const root = document.createElement("main");
+    const dispose = mountMessageAuthorityBridgeSurface(root, authority.bridge, "room-1", {
+      createMessageId: () => "message-new",
+      createTargetId: () => "target-new",
+    });
+    await vi.waitFor(() => expect(root.textContent).toContain("Existing authority message"));
+
+    authority.publish({ type: "agent.execution.preview", roomId: "room-1",
+      executionId: "execution-1", attemptSeq: 1, streamSeq: 1,
+      delta: "FT08-PREVIEW-TRANSIENT-ONLY-7F41C9D2", authoritative: false });
+    await vi.waitFor(() => expect(root.querySelector("[data-agent-preview='execution-1']")?.textContent)
+      .toContain("FT08-PREVIEW-TRANSIENT-ONLY-7F41C9D2"));
+    expect(root.querySelectorAll("[data-message-id]")).toHaveLength(1);
+
+    authority.publish({ type: "agent.execution.preview.reset", roomId: "room-1",
+      executionId: "execution-1", attemptSeq: 1,
+      reason: "human_cancelled", authoritative: false });
+    await vi.waitFor(() => expect(root.querySelector("[data-agent-preview='execution-1']")).toBeNull());
+    expect(root.textContent).not.toContain("FT08-PREVIEW-TRANSIENT-ONLY-7F41C9D2");
+    authority.publish({ type: "agent.execution.preview", roomId: "room-1",
+      executionId: "execution-1", attemptSeq: 2, streamSeq: 1,
+      delta: "DISCONNECT-SENTINEL", authoritative: false });
+    await vi.waitFor(() => expect(root.textContent).toContain("DISCONNECT-SENTINEL"));
+    authority.publish({ type: "message.connection", roomId: "room-1",
+      connection: { status: "offline", asOf: createdAt } });
+    await vi.waitFor(() => expect(root.querySelector("[data-agent-preview='execution-1']")).toBeNull());
+    expect(root.textContent).toContain("Existing authority message");
+    dispose();
+    authority.close();
+  });
+
   it("advances across non-message Room events without adding a timeline row", async () => {
     const authority = authorityHarness();
     const root = document.createElement("main");

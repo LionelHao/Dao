@@ -9,6 +9,63 @@ import {
 } from "./sync.js";
 
 describe("pure synchronization contracts", () => {
+  it("repairs and streams the canonical FT-08 lineage without preview or queued public state", () => {
+    const occurredAt = "2026-08-25T00:00:00.000Z";
+    const intent = {
+      intentId: "intent-1", lineageId: "lineage-1", turnId: "turn-1", roomId: "room-1",
+      sourceMessageId: "message-1", sourceRevision: 1, targetId: "target-1", agentId: "agent-1",
+      origin: { kind: "message_target", messageTransactionId: "transaction-1", targetId: "target-1" },
+      profileRevision: 1, assignmentRevision: 1, accessRevision: 1,
+      status: "claimed", createdAt: occurredAt, claimedAt: occurredAt,
+    } as const;
+    const execution = {
+      executionId: "execution-1", intentId: intent.intentId, lineageId: intent.lineageId,
+      executionOrdinal: 1, roomId: intent.roomId, agentId: intent.agentId,
+      snapshotId: "snapshot-1", providerId: "provider-1", modelId: "model-1",
+      status: "running", phase: "waiting_confirmation", currentAttemptSeq: 1, version: 2,
+      queuedAt: occurredAt, startedAt: occurredAt, updatedAt: occurredAt,
+    } as const;
+    const attempt = {
+      executionId: execution.executionId, intentId: intent.intentId, lineageId: intent.lineageId,
+      roomId: intent.roomId, agentId: intent.agentId,
+      attemptSeq: 1, snapshotId: execution.snapshotId, providerId: execution.providerId,
+      modelId: execution.modelId, status: "running", phase: "waiting_confirmation",
+      executionVersion: 2, startedAt: occurredAt, updatedAt: occurredAt,
+    } as const;
+    const repair = (records: readonly unknown[]) => ({
+      type: "room.repair.page", requestId: "request-repair", snapshotId: "repair-1",
+      roomId: "room-1", page: 0, records, watermark: 3,
+      snapshotChecksum: "sha256:ft08", hasMore: false, mode: "streaming",
+      idleExpiresAt: "2026-08-25T00:01:00.000Z",
+    });
+    expect(isRoomRepairPage(repair([
+      { kind: "agent-invocation-intent", value: intent },
+      { kind: "agent-execution", value: execution },
+      { kind: "agent-execution-attempt", value: attempt },
+    ]))).toBe(true);
+    expect(isRoomRepairPage(repair([
+      { kind: "agent-execution", value: { ...execution, status: "queued", phase: "queued" } },
+    ]))).toBe(false);
+    expect(isRoomRepairPage(repair([
+      { kind: "agent-execution", value: { ...execution, preview: "preview-sentinel" } },
+    ]))).toBe(false);
+
+    const event = (type: string, payload: unknown) => ({
+      eventId: `event-${type}`, streamKind: "room", streamId: "room-1", streamSeq: 1,
+      roomId: "room-1", actorId: "agent-1", occurredAt, type, payload,
+    });
+    const delta = (roomEvent: unknown) => ({
+      type: "room.sync.result", requestId: "request-sync", mode: "delta", events: [roomEvent],
+      nextCursor: { version: 1, roomId: "room-1", afterSeq: 1 }, watermark: 1, hasMore: false,
+    });
+    expect(isRoomSyncResult(delta(event("agent.invocation.intent.changed", intent)))).toBe(true);
+    expect(isRoomSyncResult(delta(event("agent.execution.changed", execution)))).toBe(true);
+    expect(isRoomSyncResult(delta(event("agent.execution.attempt.changed", attempt)))).toBe(true);
+    expect(isRoomSyncResult(delta(event("agent.execution.changed", {
+      ...execution, providerDiagnostics: "must-not-cross-sync",
+    })))).toBe(false);
+  });
+
   it("accepts closed Message Authority and Attachment events plus active operational repair records", () => {
     const currentRevision = {
       messageId: "message-v2-1", revision: 1, body: "hello",

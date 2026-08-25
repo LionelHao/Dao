@@ -1,8 +1,13 @@
 import type {
   AgentConfigurationRequest,
+  AgentExecution,
+  AgentExecutionStatus,
+  AgentInvocationIntent,
   AgentRoomMembership,
   HumanInvitationRequest,
-  HumanPreemptionNotice,
+  InvocationCancelCommand,
+  LegacyHumanPreemptionNotice,
+  ProjectBoundaryInvocationRequest,
   HumanRoomMembership,
   LightTask,
   BallInCourt,
@@ -138,13 +143,71 @@ const invalidBallHolderSet: BallInCourt = {
   holderIds: ["human-1", "human-2"],
 };
 
-const invalidConfigurablePreemption: HumanPreemptionNotice = {
+const invalidConfigurablePreemption: LegacyHumanPreemptionNotice = {
   roomId: "room-1", sourceHumanMessageId: "message-human-1",
   cancelledExecutionIds: [], rerouteStatus: "queued", occurredAt: "2026-08-17T00:00:00.000Z",
   // @ts-expect-error Human preemption is a hard rule and cannot carry an opt-out.
   enabled: false,
 };
 void invalidConfigurablePreemption;
+
+// @ts-expect-error queued is an internal accepted phase, never a public execution status.
+const invalidQueuedPublicStatus: AgentExecutionStatus = "queued";
+
+const canonicalExecution: AgentExecution = {
+  executionId: "execution-1", intentId: "intent-1", lineageId: "lineage-1",
+  executionOrdinal: 1, roomId: "room-1", agentId: "agent-1", snapshotId: "snapshot-1",
+  providerId: "provider-1", modelId: "model-1", status: "accepted", phase: "queued",
+  currentAttemptSeq: 1, version: 1, queuedAt: "2026-08-25T00:00:00.000Z",
+  updatedAt: "2026-08-25T00:00:00.000Z",
+};
+
+const intentWithClientOrigin = {
+  intentId: "intent-1", lineageId: "lineage-1", turnId: "turn-1", roomId: "room-1",
+  sourceMessageId: "message-1", sourceRevision: 1, targetId: "target-1", agentId: "agent-1",
+  origin: { kind: "routed_candidate" as const }, profileRevision: 1, assignmentRevision: 1,
+  accessRevision: 1, status: "pending" as const, createdAt: "2026-08-25T00:00:00.000Z",
+};
+// @ts-expect-error routed_candidate is not a canonical trusted invocation origin.
+const invalidClientSelectedOrigin: AgentInvocationIntent = intentWithClientOrigin;
+
+const cancelWithReason = {
+  type: "invocation.cancel" as const, requestId: "request-1", executionId: "execution-1",
+  expectedVersion: 1, reason: "free text",
+};
+// @ts-expect-error Public cancellation cannot choose a cancellation reason.
+const invalidPublicCancelReason: InvocationCancelCommand = cancelWithReason;
+
+const cancelWithAgent = {
+  type: "invocation.cancel" as const, requestId: "request-1", executionId: "execution-1",
+  expectedVersion: 1, agentId: "agent-1",
+};
+// @ts-expect-error Public cancellation cannot select an Agent identity.
+const invalidPublicCancelAgent: InvocationCancelCommand = cancelWithAgent;
+
+const pendingIntentCancel: InvocationCancelCommand = {
+  type: "invocation.cancel", requestId: "request-pending", intentId: "intent-pending",
+  expectedVersion: 1,
+};
+
+const cancelWithBothTargets = {
+  type: "invocation.cancel" as const, requestId: "request-both", intentId: "intent-1",
+  executionId: "execution-1", expectedVersion: 1,
+};
+// @ts-expect-error Public cancellation must select exactly one closed target.
+const invalidPublicCancelTargets: InvocationCancelCommand = cancelWithBothTargets;
+
+const projectBoundaryRequest: ProjectBoundaryInvocationRequest = {
+  purpose: "project_boundary_invocation", boundaryId: "boundary-1", boundaryKind: "checkpoint",
+  projectId: "room-1", roomId: "room-1", agentId: "agent-1",
+  sourceFactId: "checkpoint-1", sourceFactRevision: 1,
+};
+// @ts-expect-error A server-private project boundary cannot be used as a public cancel command.
+const invalidPublicProjectBoundary: InvocationCancelCommand = projectBoundaryRequest;
+const invalidInternalCancel: ProjectBoundaryInvocationRequest = {
+  // @ts-expect-error A public cancel command cannot be used as a trusted project-boundary producer input.
+  type: "invocation.cancel", requestId: "request-1", executionId: "execution-1", expectedVersion: 1,
+};
 
 declare const runtimeProviderInput: AgentRuntimeProviderInput;
 declare const routerProviderInput: RouterProviderInput;
@@ -171,3 +234,13 @@ void invalidBallHolderSet;
 void invalidRouterInput;
 void invalidRuntimeInput;
 void invalidLegacyConversation;
+void invalidQueuedPublicStatus;
+void canonicalExecution;
+void invalidClientSelectedOrigin;
+void invalidPublicCancelReason;
+void invalidPublicCancelAgent;
+void pendingIntentCancel;
+void invalidPublicCancelTargets;
+void projectBoundaryRequest;
+void invalidPublicProjectBoundary;
+void invalidInternalCancel;

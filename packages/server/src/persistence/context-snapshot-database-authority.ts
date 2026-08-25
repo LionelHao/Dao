@@ -629,8 +629,7 @@ function readPreparationRow(
             ? AS frozenAccessRevision,
             membership.tool_permissions_json AS membershipToolsJson,
             (SELECT COUNT(*) FROM agent_executions AS running
-             WHERE running.room_id = execution.room_id
-               AND running.agent_id = execution.agent_id
+             WHERE running.agent_id = execution.agent_id
                AND running.status = 'running') AS runningExecutionCount,
             agent.catalog_revision AS toolCapabilityRevision,
             COALESCE(steward.memory_watermark, 0) AS memoryWatermark,
@@ -2084,6 +2083,282 @@ function requireSnapshotReusable(
     hasRoomMemoryRead: agentTools.has("room-memory.read") &&
       membershipTools.has("room-memory.read"),
   };
+}
+
+/**
+ * Creates the immutable context binding for a Human manual-retry child before
+ * the retry ACK can commit. The child has its own snapshot identity and
+ * lineage, while the restricted provider payload, canonical manifest, source
+ * identities, and their hashes remain byte-for-byte equal to the eligible
+ * parent snapshot.
+ */
+export function cloneManualRetryContextInTransaction(
+  database: DatabaseSync,
+  input: {
+    readonly parentExecutionId: string;
+    readonly childExecutionId: string;
+    readonly childSnapshotId: string;
+    readonly childManifestId: string;
+    readonly boundAt: string;
+  },
+): ContextSnapshotRecord {
+  const parent = database.prepare(
+    `SELECT snapshot.snapshot_id AS snapshotId, snapshot.state,
+            snapshot.payload_retention_state AS payloadRetentionState,
+            snapshot.trigger_revision AS triggerRevision,
+            snapshot.room_lifecycle_generation AS roomLifecycleGeneration,
+            snapshot.membership_access_revision AS membershipAccessRevision,
+            snapshot.tool_capability_revision AS toolCapabilityRevision,
+            snapshot.memory_watermark AS memoryWatermark,
+            snapshot.corpus_head AS corpusHead,
+            snapshot.manifest_sha256 AS manifestSha256,
+            snapshot.envelope_sha256 AS envelopeSha256,
+            manifest.manifest_id AS manifestId,
+            manifest.manifest_sha256 AS storedManifestSha256,
+            manifest.canonical_manifest_json AS canonicalManifestJson,
+            manifest.item_count AS itemCount,
+            body.envelope_sha256 AS storedEnvelopeSha256,
+            body.canonical_envelope_json AS canonicalEnvelopeJson,
+            room.status AS roomStatus,
+            room.archive_generation AS currentRoomLifecycleGeneration,
+            trigger.lifecycle AS triggerLifecycle,
+            trigger.current_revision AS currentTriggerRevision,
+            membership.participation AS membershipParticipation,
+            membership.access_revision AS currentMembershipAccessRevision,
+            agent.catalog_revision AS currentToolCapabilityRevision,
+            COALESCE(steward.memory_watermark, 0) AS currentMemoryWatermark,
+            COALESCE(steward.corpus_head, 0) AS currentCorpusHead
+     FROM agent_execution_context_bindings AS binding
+     JOIN context_snapshots AS snapshot ON snapshot.snapshot_id = binding.snapshot_id
+     LEFT JOIN context_manifests AS manifest ON manifest.snapshot_id = snapshot.snapshot_id
+     LEFT JOIN context_snapshot_bodies AS body ON body.snapshot_id = snapshot.snapshot_id
+     LEFT JOIN rooms AS room ON room.id = snapshot.room_id
+     LEFT JOIN message_envelopes AS trigger
+       ON trigger.message_id = snapshot.trigger_message_id
+     LEFT JOIN room_memberships AS membership
+       ON membership.room_id = snapshot.room_id
+      AND membership.actor_id = snapshot.agent_id AND membership.kind = 'agent'
+     LEFT JOIN actors AS agent ON agent.id = snapshot.agent_id AND agent.kind = 'agent'
+     LEFT JOIN room_memory_stewards AS steward ON steward.room_id = snapshot.room_id
+     WHERE binding.execution_id = ?`,
+  ).get(input.parentExecutionId);
+  if (parent === undefined || !isText(parent.snapshotId)) {
+    return fail("context_source_gone", "Manual retry parent snapshot is unavailable");
+  }
+  if (parent.state !== "active") {
+    return fail("context_snapshot_invalidated", "Manual retry parent snapshot is no longer active");
+  }
+  if (parent.payloadRetentionState === "purged" || !isText(parent.manifestId) ||
+      typeof parent.canonicalManifestJson !== "string" ||
+      typeof parent.canonicalEnvelopeJson !== "string") {
+    return fail("context_source_gone", "Manual retry parent snapshot payload is unavailable");
+  }
+  if (!isSha256(parent.manifestSha256) || !isSha256(parent.envelopeSha256) ||
+      parent.storedManifestSha256 !== parent.manifestSha256 ||
+      parent.storedEnvelopeSha256 !== parent.envelopeSha256 ||
+      sha256(parent.canonicalManifestJson) !== parent.manifestSha256 ||
+      sha256(parent.canonicalEnvelopeJson) !== parent.envelopeSha256 ||
+      !isPositiveInteger(parent.itemCount)) {
+    return fail("context_storage_unavailable", "Manual retry parent canonical payload is corrupt");
+  }
+  if (parent.roomStatus !== "active" || parent.triggerLifecycle !== "active" ||
+      parent.currentTriggerRevision !== parent.triggerRevision) {
+    return fail("context_source_gone", "Manual retry source is no longer operational");
+  }
+  if ((parent.membershipParticipation !== "active" &&
+       parent.membershipParticipation !== "on-mention") ||
+      parent.currentRoomLifecycleGeneration !== parent.roomLifecycleGeneration ||
+      parent.currentMembershipAccessRevision !== parent.membershipAccessRevision ||
+      parent.currentToolCapabilityRevision !== parent.toolCapabilityRevision) {
+    return fail("context_forbidden", "Manual retry context authorization changed");
+  }
+  if (parent.currentMemoryWatermark !== parent.memoryWatermark ||
+      parent.currentCorpusHead !== parent.corpusHead) {
+    return fail("context_snapshot_invalidated", "Manual retry context facts are no longer current");
+  }
+  const items = database.prepare(
+    `SELECT ordinal, section, disposition, canonical_sort_key AS canonicalSortKey,
+            source_label_sha256 AS sourceLabelSha256, source_kind AS sourceKind,
+            source_id AS sourceId, source_revision AS sourceRevision,
+            content_sha256 AS contentSha256, original_bytes AS originalBytes,
+            included_bytes AS includedBytes, original_tokens AS originalTokens,
+            included_tokens AS includedTokens, reason_code AS reasonCode,
+            segment_json AS segmentJson, availability
+     FROM context_manifest_items WHERE snapshot_id = ? ORDER BY ordinal`,
+  ).all(parent.snapshotId);
+  if (items.length !== parent.itemCount) {
+    return fail("context_storage_unavailable", "Manual retry parent manifest is incomplete");
+  }
+  const sources = database.prepare(
+    `SELECT room_id AS roomId, source_kind AS sourceKind, source_id AS sourceId,
+            source_revision AS sourceRevision, source_label_sha256 AS sourceLabelSha256,
+            currently_required AS currentlyRequired,
+            authorization_revision AS authorizationRevision
+     FROM context_snapshot_sources WHERE snapshot_id = ?
+     ORDER BY source_kind, source_id, source_revision`,
+  ).all(parent.snapshotId);
+  if (sources.length < 1) {
+    return fail("context_storage_unavailable", "Manual retry parent source set is incomplete");
+  }
+  for (const source of sources) {
+    if (source.currentlyRequired === 1 || source.sourceKind === "message_tombstone") {
+      requireCurrentSource(database, {
+        roomId: String(source.roomId),
+        sourceKind: source.sourceKind as ContextSnapshotSourceKind,
+        sourceId: String(source.sourceId),
+        sourceRevision: Number(source.sourceRevision),
+        sourceLabel: source.sourceLabelSha256 === null
+          ? null : String(source.sourceLabelSha256),
+        currentlyRequired: source.currentlyRequired === 1,
+        authorizationRevision: Number(source.authorizationRevision),
+      });
+    }
+  }
+  const ranges = database.prepare(
+    `SELECT range.manifest_id AS manifestId, range.range_ordinal AS rangeOrdinal,
+            range.range_label_sha256 AS rangeLabelSha256,
+            range.corpus_seq AS corpusSeq, range.source_kind AS sourceKind,
+            range.source_id AS sourceId, range.source_revision AS sourceRevision,
+            range.source_index_sha256 AS sourceIndexSha256
+     FROM context_manifest_range_sources AS range
+     WHERE range.snapshot_id = ? ORDER BY range.range_ordinal, range.corpus_seq`,
+  ).all(parent.snapshotId);
+  const staleRange = database.prepare(
+    `SELECT 1 AS stale
+     FROM context_manifest_range_sources AS range
+     JOIN context_snapshots AS snapshot ON snapshot.snapshot_id = range.snapshot_id
+     LEFT JOIN room_memory_sources AS corpus
+       ON corpus.room_id = snapshot.room_id AND corpus.corpus_seq = range.corpus_seq
+      AND (corpus.source_id = range.source_id OR (
+        range.source_kind IN ('message_revision', 'message_tombstone')
+        AND json_extract(corpus.safe_metadata_json, '$.messageId') = range.source_id
+      ))
+      AND corpus.source_revision = range.source_revision
+      AND ((range.source_kind IN ('message_revision', 'message_tombstone')
+            AND corpus.source_kind IN ('message', 'message_revision', 'message_tombstone'))
+        OR corpus.source_kind = range.source_kind)
+     WHERE range.snapshot_id = ? AND corpus.corpus_seq IS NULL LIMIT 1`,
+  ).get(parent.snapshotId);
+  if (staleRange !== undefined) {
+    return fail("context_source_gone", "Manual retry delta source is no longer operational");
+  }
+
+  database.prepare(
+    `INSERT INTO context_snapshots (
+       snapshot_id, room_id, invocation_intent_id, agent_id, provider_id, model_id,
+       compiler_version, compiler_config_version, estimator_version,
+       preparation_sha256, trigger_message_id, trigger_revision, trigger_reason,
+       memory_watermark, corpus_head, raw_delta_from_exclusive,
+       raw_delta_to_inclusive, room_lifecycle_generation,
+       membership_access_revision, tool_capability_revision, budget_json,
+       manifest_sha256, envelope_sha256, state, snapshot_generation, created_at,
+       invalidated_at, invalidation_reason, superseded_at, retired_at,
+       retain_until, payload_retention_state
+     )
+     SELECT ?, room_id, invocation_intent_id, agent_id, provider_id, model_id,
+            compiler_version, compiler_config_version, estimator_version,
+            preparation_sha256, trigger_message_id, trigger_revision, trigger_reason,
+            memory_watermark, corpus_head, raw_delta_from_exclusive,
+            raw_delta_to_inclusive, room_lifecycle_generation,
+            membership_access_revision, tool_capability_revision, budget_json,
+            manifest_sha256, envelope_sha256, 'active', 1, ?,
+            NULL, NULL, NULL, NULL, NULL, 'required'
+     FROM context_snapshots WHERE snapshot_id = ?`,
+  ).run(input.childSnapshotId, input.boundAt, parent.snapshotId);
+  database.prepare(
+    `INSERT INTO context_manifests (
+       manifest_id, snapshot_id, manifest_version, manifest_sha256,
+       canonical_manifest_json, item_count, total_original_bytes,
+       total_included_bytes, total_original_tokens, total_included_tokens,
+       accounting_json, created_at
+     )
+     SELECT ?, ?, manifest_version, manifest_sha256, canonical_manifest_json,
+            item_count, total_original_bytes, total_included_bytes,
+            total_original_tokens, total_included_tokens, accounting_json, ?
+     FROM context_manifests WHERE snapshot_id = ?`,
+  ).run(input.childManifestId, input.childSnapshotId, input.boundAt, parent.snapshotId);
+  const insertItem = database.prepare(
+    `INSERT INTO context_manifest_items (
+       manifest_id, snapshot_id, ordinal, section, disposition,
+       canonical_sort_key, source_label_sha256, source_kind, source_id, source_revision,
+       content_sha256, original_bytes, included_bytes, original_tokens,
+       included_tokens, reason_code, segment_json, availability
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  for (const item of items) {
+    insertItem.run(
+      input.childManifestId, input.childSnapshotId, item.ordinal ?? null,
+      item.section ?? null, item.disposition ?? null, item.canonicalSortKey ?? null,
+      item.sourceLabelSha256 ?? null, item.sourceKind ?? null, item.sourceId ?? null,
+      item.sourceRevision ?? null, item.contentSha256 ?? null, item.originalBytes ?? null,
+      item.includedBytes ?? null, item.originalTokens ?? null,
+      item.includedTokens ?? null, item.reasonCode ?? null, item.segmentJson ?? null,
+      item.availability ?? null,
+    );
+  }
+  const insertSource = database.prepare(
+    `INSERT INTO context_snapshot_sources (
+       snapshot_id, room_id, source_kind, source_id, source_revision,
+       source_label_sha256, currently_required, authorization_revision, created_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  for (const source of sources) {
+    insertSource.run(
+      input.childSnapshotId, source.roomId ?? null, source.sourceKind ?? null,
+      source.sourceId ?? null, source.sourceRevision ?? null,
+      source.sourceLabelSha256 ?? null, source.currentlyRequired ?? null,
+      source.authorizationRevision ?? null, input.boundAt,
+    );
+  }
+  const insertRange = database.prepare(
+    `INSERT INTO context_manifest_range_sources (
+       manifest_id, snapshot_id, range_ordinal, range_label_sha256, corpus_seq,
+       source_kind, source_id, source_revision, source_index_sha256, created_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  for (const range of ranges) {
+    insertRange.run(
+      input.childManifestId, input.childSnapshotId, range.rangeOrdinal ?? null,
+      range.rangeLabelSha256 ?? null, range.corpusSeq ?? null,
+      range.sourceKind ?? null, range.sourceId ?? null, range.sourceRevision ?? null,
+      range.sourceIndexSha256 ?? null, input.boundAt,
+    );
+  }
+  database.prepare(
+    `INSERT INTO context_snapshot_bodies (
+       snapshot_id, envelope_schema_version, canonical_envelope_json,
+       envelope_sha256, byte_count, token_count, created_at
+     )
+     SELECT ?, envelope_schema_version, canonical_envelope_json,
+            envelope_sha256, byte_count, token_count, ?
+     FROM context_snapshot_bodies WHERE snapshot_id = ?`,
+  ).run(input.childSnapshotId, input.boundAt, parent.snapshotId);
+  database.prepare(
+    `INSERT INTO agent_execution_context_bindings (
+       execution_id, snapshot_id, invocation_intent_id, execution_generation, bound_at
+     )
+     SELECT ?, ?, link.intent_id, execution.execution_generation, ?
+     FROM agent_executions AS execution
+     JOIN agent_execution_intent_links AS link ON link.execution_id = execution.id
+     WHERE execution.id = ?`,
+  ).run(
+    input.childExecutionId, input.childSnapshotId, input.boundAt, input.childExecutionId,
+  );
+  database.prepare(
+    `INSERT INTO agent_execution_context_attempts (
+       execution_id, attempt_seq, snapshot_id, snapshot_generation, reuse_kind, bound_at
+     ) VALUES (?, 1, ?, 1, 'first', ?)`,
+  ).run(input.childExecutionId, input.childSnapshotId, input.boundAt);
+  database.prepare(
+    `INSERT INTO context_snapshot_lineage (
+       child_snapshot_id, parent_snapshot_id, child_execution_id,
+       parent_execution_id, relation, created_at
+     ) VALUES (?, ?, ?, ?, 'manual_retry', ?)`,
+  ).run(
+    input.childSnapshotId, parent.snapshotId, input.childExecutionId,
+    input.parentExecutionId, input.boundAt,
+  );
+  return readSnapshotRecord(database, input.childExecutionId);
 }
 
 export function bindContextAttemptInTransaction(

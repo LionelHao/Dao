@@ -775,7 +775,7 @@ describe("durable materialized snapshot worker", () => {
       "room", "governance", "membership", "membership", "timeline-message",
       "timeline-message", "timeline-message", "message-revision", "attachment", "human-read",
       "agent-judgement", "open-item",
-      "open-item-agent-failure", "light-task", "agent-execution", "calibration",
+      "open-item-agent-failure", "light-task", "legacy-agent-execution", "calibration",
       "memory",
     ]);
     const timelineMessages = page.records.filter((record) =>
@@ -1601,7 +1601,7 @@ describe("durable materialized snapshot worker", () => {
     expect(new Set(records.map((record) => record.kind))).toEqual(new Set([
       "room", "governance", "membership", "timeline-message", "message-revision",
       "human-read", "agent-judgement",
-      "open-item", "light-task", "agent-execution", "calibration", "memory",
+      "open-item", "light-task", "legacy-agent-execution", "calibration", "memory",
     ]));
     expect(page0.snapshotChecksum).toBe(createHash("sha256")
       .update(canonicalJsonForTest({ kind: "room", values: records, version: 1 }), "utf8")
@@ -1800,7 +1800,7 @@ describe("durable materialized snapshot worker", () => {
       expect(new Set(records.map((record) => record.kind))).toEqual(new Set([
         "room", "governance", "membership", "timeline-message", "message-revision",
         "human-read", "agent-judgement",
-        "open-item", "light-task", "agent-execution", "calibration", "memory",
+        "open-item", "light-task", "legacy-agent-execution", "calibration", "memory",
       ]));
       expect(page0.snapshotChecksum).toBe(createHash("sha256")
         .update(canonicalJsonForTest({ kind: "room", values: records, version: 1 }), "utf8")

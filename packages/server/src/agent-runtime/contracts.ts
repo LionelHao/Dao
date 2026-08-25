@@ -1,6 +1,6 @@
 import type {
-  AgentExecution,
-  AgentInvocationIntent,
+  LegacyAgentExecution as AgentExecution,
+  LegacyAgentInvocationIntent as AgentInvocationIntent,
   AgentRuntimeProviderInput,
   ProviderEvent,
   RoomMemoryRawDeltaPage,
@@ -8,11 +8,16 @@ import type {
   RoomMemoryVersionProjection,
   ToolConfirmationInput,
   ToolDescriptor,
+  AgentExecutionRetryReceipt,
+  ScopedCancellationReceipt,
 } from "@native-im/core";
 import type { AuthenticatedCommandContext, InternalAgentCommandContext } from "../persistence/contracts.js";
+import type { ScopedCancellationCommitReceipt } from "../scoped-cancellation/scoped-cancellation-orchestrator.js";
 
 export const AGENT_RUNTIME_MAX_ACTIVE = 8;
 export const AGENT_RUNTIME_MAX_QUEUED_PER_ROOM = 32;
+export const AGENT_RUNTIME_MAX_ADMITTED_PER_ROOM = 32;
+export const AGENT_RUNTIME_RECOVERY_BATCH_SIZE = 256;
 export const AGENT_RUNTIME_RETRY_DELAYS_MS = [1_000, 4_000] as const;
 export const AGENT_RUNTIME_MAX_ATTEMPTS = 3;
 
@@ -130,7 +135,12 @@ export interface InvocationAccepted {
 
 export interface InvocationAcceptedWithIntent extends InvocationAccepted {
   readonly intent: AgentInvocationIntent;
+  readonly retryReceipt?: AgentExecutionRetryReceipt;
 }
+
+export type InvocationCancellationTarget =
+  | Readonly<{ executionId: string; expectedVersion: number }>
+  | Readonly<{ intentId: string; expectedVersion: number }>;
 
 export interface PreparedToolCall {
   readonly execution: AgentExecution;
@@ -169,6 +179,39 @@ export interface RuntimeRecoveryRecord {
   readonly execution: AgentExecution;
   readonly intent: AgentInvocationIntent;
   readonly outcome: "enqueue" | "failed" | "fail_outcome_unknown" | "wait_confirmation";
+}
+
+/**
+ * Closed keyset-scanning port for FT-08 recovery. The persistence owner may
+ * implement this without exposing rows or SQL to the runtime scheduler. The
+ * scheduler always performs one final scan that returns an empty page, so a
+ * non-empty page never becomes an implicit batch tail.
+ */
+export interface RuntimeRecoveryAuthority {
+  scan(input: Readonly<{
+    /** Opaque, stable key returned by the preceding candidate. */
+    readonly after?: string;
+    readonly limit: number;
+  }>): Promise<Readonly<{
+    candidates: readonly Readonly<{
+      readonly cursor: string;
+      /** Deliberately unknown until the runtime boundary validates it. */
+      readonly record: unknown;
+    }>[];
+    readonly hasMore: boolean;
+  }>>;
+  isolate(input: Readonly<{
+    readonly cursor: string;
+    readonly candidateId?: string;
+    readonly reason: "recovery_candidate_invalid" | "recovery_candidate_conflict";
+  }>): Promise<void>;
+  /** Acknowledges a candidate whose durable execution already left queued state. */
+  settle?(input: Readonly<{
+    readonly cursor: string;
+    readonly candidateId: string;
+  }>): Promise<void>;
+  /** Returns every still-owned, unstarted candidate to durable pending state. */
+  release?(): Promise<number>;
 }
 
 export interface FenceReplacementAccepted {
@@ -219,14 +262,21 @@ export interface RuntimeAuthority {
     errorCode: AgentRuntimeErrorCode,
     nextRetryAt: string | undefined,
   ): Promise<AgentExecution>;
+  shutdown(executionId: string, attemptSeq: number): Promise<AgentExecution>;
   interrupt(
     context: AuthenticatedCommandContext,
     executionId: string,
     reason: string,
   ): Promise<AgentExecution>;
+  cancelScoped(
+    context: AuthenticatedCommandContext,
+    target: InvocationCancellationTarget,
+    producerId: string,
+  ): Promise<ScopedCancellationCommitReceipt>;
   retry(
     context: AuthenticatedCommandContext,
     executionId: string,
+    expectedVersion?: number,
   ): Promise<InvocationAcceptedWithIntent>;
   beginCompensation(
     context: AuthenticatedCommandContext,
@@ -279,7 +329,16 @@ export interface AgentRuntime {
     executionId: string,
     reason: string,
   ): Promise<AgentExecution>;
+  cancelInvocation(
+    context: AuthenticatedCommandContext,
+    target: InvocationCancellationTarget,
+  ): Promise<ScopedCancellationReceipt>;
   retry(context: AuthenticatedCommandContext, executionId: string): Promise<InvocationAccepted>;
+  retryInvocation(
+    context: AuthenticatedCommandContext,
+    executionId: string,
+    expectedVersion: number,
+  ): Promise<InvocationAcceptedWithIntent & { readonly retryReceipt: AgentExecutionRetryReceipt }>;
   confirmTool(
     context: AuthenticatedCommandContext,
     confirmation: ToolConfirmationInput,

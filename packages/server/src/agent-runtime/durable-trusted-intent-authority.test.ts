@@ -362,7 +362,7 @@ describe("durable trusted intent Authority transaction", () => {
     ["access stale", "UPDATE room_memberships SET access_revision = 6 WHERE room_id = 'room-1' AND actor_id = 'agent-a'", true,
       "access_revision_stale"],
     ["noauth", "SELECT 1", false, "noauth"],
-    ["busy", "INSERT INTO agent_executions VALUES ('execution-a', 'room-1', 'agent-a', 'queued')", true,
+    ["busy", "INSERT INTO agent_executions VALUES ('execution-a', 'room-1', 'agent-a', 'running')", true,
       "busy"],
   ])("cancels %s at claim without choosing a fallback", (_label, mutation, providerReady, reason) => {
     database.exec(mutation);

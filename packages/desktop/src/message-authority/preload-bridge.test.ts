@@ -65,6 +65,14 @@ describe("Message Authority preload bridge", () => {
       streamSeq: 5,
     });
     listeners.get(MESSAGE_AUTHORITY_IPC_CHANNELS.authorityInput)?.({}, {
+      type: "agent.execution.preview", roomId: "room-1", executionId: "execution-1",
+      attemptSeq: 1, streamSeq: 1, delta: "partial", authoritative: false,
+    });
+    expect(listener).toHaveBeenLastCalledWith({
+      type: "agent.execution.preview", roomId: "room-1", executionId: "execution-1",
+      attemptSeq: 1, streamSeq: 1, delta: "partial", authoritative: false,
+    });
+    listeners.get(MESSAGE_AUTHORITY_IPC_CHANNELS.authorityInput)?.({}, {
       type: "room.event", token: "leak",
     });
     listeners.get(MESSAGE_AUTHORITY_IPC_CHANNELS.authorityInput)?.({}, {
@@ -76,7 +84,11 @@ describe("Message Authority preload bridge", () => {
       streamSeq: 6,
       token: "leak",
     });
-    expect(listener).toHaveBeenCalledOnce();
+    listeners.get(MESSAGE_AUTHORITY_IPC_CHANNELS.authorityInput)?.({}, {
+      type: "agent.execution.preview", roomId: "room-1", executionId: "execution-1",
+      attemptSeq: 1, streamSeq: 2, delta: "open", authoritative: false, token: "leak",
+    });
+    expect(listener).toHaveBeenCalledTimes(2);
     dispose();
     dispose();
     expect(ipc.removeListener).toHaveBeenCalledOnce();

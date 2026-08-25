@@ -60,20 +60,36 @@ const authoritySession = (): IdentityAuthoritySession => ({
 
 async function listen(
   handle: (frame: Record<string, unknown>, send: (frame: unknown) => void) => void,
-): Promise<{ endpoint: string; received: Record<string, unknown>[] }> {
+): Promise<{
+  endpoint: string;
+  received: Record<string, unknown>[];
+  send(frame: unknown): void;
+  closeCodes: number[];
+}> {
   const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
   servers.push(server);
   await new Promise<void>((resolve) => server.once("listening", resolve));
   const address = server.address();
   if (typeof address === "string") throw new TypeError("Expected loopback TCP server");
   const received: Record<string, unknown>[] = [];
-  server.on("connection", (socket) => socket.on("message", (raw, binary) => {
-    if (binary) return socket.close(1002, "text only");
-    const frame = JSON.parse(raw.toString()) as Record<string, unknown>;
-    received.push(frame);
-    handle(frame, (response) => socket.send(JSON.stringify(response)));
-  }));
-  return { endpoint: `ws://127.0.0.1:${address.port}`, received };
+  const closeCodes: number[] = [];
+  server.on("connection", (socket) => {
+    socket.on("close", (code) => closeCodes.push(code));
+    socket.on("message", (raw, binary) => {
+      if (binary) return socket.close(1002, "text only");
+      const frame = JSON.parse(raw.toString()) as Record<string, unknown>;
+      received.push(frame);
+      handle(frame, (response) => socket.send(JSON.stringify(response)));
+    });
+  });
+  return {
+    endpoint: `ws://127.0.0.1:${address.port}`,
+    received,
+    send(frame) {
+      for (const client of server.clients) client.send(JSON.stringify(frame));
+    },
+    closeCodes,
+  };
 }
 
 describe("Message Authority WebSocket transport", () => {
@@ -104,6 +120,39 @@ describe("Message Authority WebSocket transport", () => {
       event: acceptedEvent,
     }))).toMatchObject({ type: "room.event", event: acceptedEvent });
     expect(parseMessageAuthorityServerFrame(JSON.stringify({
+      type: "agent.execution.preview", roomId: "room-1", executionId: "execution-1",
+      attemptSeq: 1, streamSeq: 2, delta: "partial", authoritative: false,
+    }))).toEqual({
+      type: "agent.execution.preview", roomId: "room-1", executionId: "execution-1",
+      attemptSeq: 1, streamSeq: 2, delta: "partial", authoritative: false,
+    });
+    expect(parseMessageAuthorityServerFrame(JSON.stringify({
+      type: "agent.execution.preview.reset", roomId: "room-1", executionId: "execution-1",
+      attemptSeq: 1, reason: "human_cancelled", authoritative: false,
+    }))).toEqual({
+      type: "agent.execution.preview.reset", roomId: "room-1", executionId: "execution-1",
+      attemptSeq: 1, reason: "human_cancelled", authoritative: false,
+    });
+    for (const reason of [
+      "execution_terminal", "attempt_rolled_over", "access_revoked",
+    ] as const) {
+      expect(parseMessageAuthorityServerFrame(JSON.stringify({
+        type: "agent.execution.preview.reset", roomId: "room-1", executionId: "execution-1",
+        attemptSeq: 1, reason, authoritative: false,
+      }))).toEqual({
+        type: "agent.execution.preview.reset", roomId: "room-1", executionId: "execution-1",
+        attemptSeq: 1, reason, authoritative: false,
+      });
+    }
+    expect(parseMessageAuthorityServerFrame(JSON.stringify({
+      type: "agent.execution.preview", roomId: "room-1", executionId: "execution-1",
+      attemptSeq: 1, streamSeq: 2, delta: "partial", authoritative: true,
+    }))).toBeUndefined();
+    expect(parseMessageAuthorityServerFrame(JSON.stringify({
+      type: "agent.execution.preview.reset", roomId: "room-1", executionId: "execution-1",
+      attemptSeq: 1, reason: "principal_revoked", authoritative: false,
+    }))).toBeUndefined();
+    expect(parseMessageAuthorityServerFrame(JSON.stringify({
       type: "error", requestId: "send-archived", status: 409,
       code: "room_archived", message: "must not be parsed by the UI",
     }))).toMatchObject({
@@ -125,6 +174,70 @@ describe("Message Authority WebSocket transport", () => {
       retryable: false,
     }))).toMatchObject({ type: "error", requestId: "memory-1",
       error: { memoryError: { code: "memory_version_conflict" } } });
+  });
+
+  it("dispatches every closed runtime reset without dropping the socket or Room subscription", async () => {
+    const authority = await listen((frame, send) => {
+      const requestId = frame.requestId as string;
+      if (frame.type === "auth.resume") {
+        send({ type: "auth.authenticated", requestId, accountId: "account-1",
+          actorId: "human-1", sessionId: "session-1" });
+      } else if (frame.type === "room.subscribe.v2") {
+        send({ type: "room.sync.result", requestId, mode: "delta", events: [],
+          nextCursor: { version: 1, roomId: "room-1", afterSeq: 0 },
+          watermark: 0, hasMore: false });
+        send({ type: "room.subscribed.v2", requestId, roomId: "room-1",
+          cursor: { version: 1, roomId: "room-1", afterSeq: 0 }, watermark: 0 });
+      }
+    });
+    const transport = createMessageAuthorityWebSocketTransport({
+      endpoint: authority.endpoint,
+      session: authoritySession,
+      webSocketFactory: (endpoint) =>
+        new WebSocket(endpoint) as unknown as MessageAuthorityWebSocketLike,
+      timeoutMs: 2_000,
+    });
+    const resets: unknown[] = [];
+    const failures: MessageAuthorityTransportError[] = [];
+    const events: string[] = [];
+    transport.onAgentPreview((input) => resets.push(input));
+    transport.onConnectionFailure((error) => failures.push(error));
+    const subscription = await transport.subscribeRoom("room-1", {
+      version: 1, roomId: "room-1", afterSeq: 0,
+    }, {
+      async events(batch) { events.push(...batch.map(({ eventId }) => eventId)); },
+      async retry() { throw new Error("not expected"); },
+    });
+
+    for (const reason of [
+      "execution_terminal", "attempt_rolled_over", "access_revoked",
+    ] as const) {
+      authority.send({
+        type: "agent.execution.preview.reset", roomId: "room-1",
+        executionId: `execution-${reason}`, attemptSeq: 1, reason, authoritative: false,
+      });
+    }
+    await vi.waitFor(() => expect(resets).toHaveLength(3));
+    expect(resets.map((reset) => (reset as { reason: string }).reason)).toEqual([
+      "execution_terminal", "attempt_rolled_over", "access_revoked",
+    ]);
+
+    authority.send({ type: "room.event", event: acceptedEvent });
+    await vi.waitFor(() => expect(events).toEqual(["event-message-1"]));
+    expect(subscription.cursor.afterSeq).toBe(1);
+    expect(failures).toEqual([]);
+    expect(authority.closeCodes).toEqual([]);
+
+    authority.send({
+      type: "agent.execution.preview.reset", roomId: "room-1",
+      executionId: "execution-unknown", attemptSeq: 1,
+      reason: "principal_revoked", authoritative: false,
+    });
+    await vi.waitFor(() => expect(failures).toHaveLength(1));
+    expect(failures[0]).toMatchObject({ code: "protocol_error" });
+    await vi.waitFor(() => expect(authority.closeCodes).toEqual([1002]));
+    expect(resets).toHaveLength(3);
+    transport.close();
   });
 
   it("authenticates once, sends the five exact operations, and delivers event-before-ACK", async () => {

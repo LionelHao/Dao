@@ -588,6 +588,51 @@ describe("closed v2 recovery protocol", () => {
       reason: "human_cancelled",
     })).toMatchObject({ ok: true, frame: { type: "agent.interrupt" } });
     expect(parse({
+      type: "invocation.cancel",
+      requestId: "cancel-vnext-1",
+      executionId: "execution-1",
+      expectedVersion: 4,
+    })).toEqual({
+      ok: true,
+      frame: {
+        type: "invocation.cancel",
+        requestId: "cancel-vnext-1",
+        executionId: "execution-1",
+        expectedVersion: 4,
+      },
+    });
+    expect(parse({
+      type: "invocation.cancel",
+      requestId: "cancel-pending-intent",
+      intentId: "intent-pending-1",
+      expectedVersion: 1,
+    })).toEqual({
+      ok: true,
+      frame: {
+        type: "invocation.cancel",
+        requestId: "cancel-pending-intent",
+        intentId: "intent-pending-1",
+        expectedVersion: 1,
+      },
+    });
+    expect(parse({
+      type: "invocation.retry",
+      requestId: "retry-vnext-1",
+      executionId: "execution-1",
+      expectedVersion: 5,
+    })).toMatchObject({ ok: true, frame: { type: "invocation.retry", expectedVersion: 5 } });
+    for (const forged of [
+      { type: "invocation.cancel", requestId: "forged-reason", executionId: "execution-1", expectedVersion: 4, reason: "anything" },
+      { type: "invocation.cancel", requestId: "forged-agent", executionId: "execution-1", expectedVersion: 4, agentId: "agent-1" },
+      { type: "invocation.retry", requestId: "forged-model", executionId: "execution-1", expectedVersion: 4, modelId: "chosen-by-client" },
+      { type: "invocation.retry", requestId: "missing-version", executionId: "execution-1" },
+      { type: "invocation.cancel", requestId: "zero-version", executionId: "execution-1", expectedVersion: 0 },
+      { type: "invocation.cancel", requestId: "both-targets", executionId: "execution-1", intentId: "intent-1", expectedVersion: 4 },
+      { type: "invocation.cancel", requestId: "no-target", expectedVersion: 4 },
+    ]) {
+      expect(parse(forged)).toMatchObject({ ok: false, error: { code: "invalid_request" } });
+    }
+    expect(parse({
       type: "agent.tool.confirm",
       requestId: "confirm-1",
       confirmation: { confirmationId: "confirmation-1", executionId: "execution-1" },

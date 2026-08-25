@@ -1,5 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import { ATTACHMENT_AUTHORITY_LIMITS, CONTEXT_COMPILER_LIMITS, type Actor } from "@native-im/core";
+import {
+  ATTACHMENT_AUTHORITY_LIMITS,
+  CONTEXT_COMPILER_LIMITS,
+  type Actor,
+} from "@native-im/core";
 import { isDeepStrictEqual } from "node:util";
 import { mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -26,7 +30,10 @@ import { createAgentRuntimeService, type AgentRuntimeService } from "./agent-run
 import { AgentRuntimeError, type ProviderAdapter } from "./agent-runtime/contracts.js";
 import { createEnvironmentSecretProvider } from "./agent-runtime/environment-secret-provider.js";
 import { createOpenAIResponsesProvider } from "./agent-runtime/openai-responses-provider.js";
-import { createWorkerRuntimeAuthority } from "./agent-runtime/worker-runtime-authority.js";
+import {
+  createWorkerRuntimeAuthority,
+  createWorkerRuntimeRecoveryAuthority,
+} from "./agent-runtime/worker-runtime-authority.js";
 import { createHttpJsonReadAdapter } from "./agent-runtime/tools/http-json-read.js";
 import { createRepositoryGitStatusAdapter } from "./agent-runtime/tools/repository-git-status.js";
 import { createSandboxFileWriteAdapter } from "./agent-runtime/tools/sandbox-file-write.js";
@@ -36,13 +43,8 @@ import { createWorkerCompiledContextBuilder } from "./context-compiler/worker-co
 import { createOpenAIRouterProvider } from "./route-runtime/openai-router-provider.js";
 import { createRouteRuntimeService, type RouteRuntimeService } from "./route-runtime/route-runtime-service.js";
 import { createWorkerRouteAuthority } from "./route-runtime/worker-route-authority.js";
-import { mintInternalAgentCommandContext } from "./persistence/contracts.js";
 import { createEmptyBlueprintBallProjectionPort, type BlueprintBallProjectionPort } from "./ball-runtime/contracts.js";
 import { createBallRuntimeService, type BallRuntimeService } from "./ball-runtime/ball-runtime-service.js";
-import {
-  createHumanPreemptionRuntime,
-  type HumanPreemptionRuntime,
-} from "./human-preemption/human-preemption-runtime.js";
 import { RoomCacheInvalidationPostCommitDispatcher } from "./access/room-cache-invalidation-port.js";
 import { createProductionSharedAuthorityParticipantComposition } from "./room-governance/production-participant-composition.js";
 import {
@@ -78,6 +80,11 @@ import {
   createMemoryStewardRuntime,
   type MemoryStewardRuntime,
 } from "./room-memory/memory-steward-runtime.js";
+import {
+  createFailClosedProjectBoundaryInvocationProducer,
+  createWorkerProjectBoundaryInvocationAuthority,
+  type ProjectBoundaryInvocationProducer,
+} from "./project-boundary/project-boundary-invocation-producer.js";
 
 export { createProductionSharedAuthorityParticipantComposition } from "./room-governance/production-participant-composition.js";
 
@@ -180,6 +187,7 @@ export interface AuthoritativeServerTestFacades {
   readonly lifecycle: ReturnType<typeof createAuthoritativeRoomLifecycleService>;
   readonly messages: ReturnType<typeof createMessageService>;
   readonly primitives: ReturnType<typeof createAuthoritativeCollaborationPrimitives>;
+  readonly projectBoundary: ProjectBoundaryInvocationProducer;
 }
 
 const AGENT_MODEL_CONTEXT_WINDOWS: Readonly<Record<string, number>> = Object.freeze({
@@ -262,10 +270,11 @@ async function start(
   let snapshots: Awaited<ReturnType<typeof createSnapshotWorkerClient>> | undefined;
   let transport: Awaited<ReturnType<typeof startMessageWebSocketServer>> | undefined;
   let runtime: AgentRuntimeService | undefined;
+  let kickDirectIntentConsumer: () => void = () => undefined;
+  let stopRuntimeRecovery: (() => void) | undefined;
   let sourceScopedRuntimeBoundary: SourceScopedRuntimeBoundary | undefined;
   let routeRuntime: RouteRuntimeService | undefined;
   let ballRuntime: BallRuntimeService | undefined;
-  let humanPreemptionRuntime: HumanPreemptionRuntime | undefined;
   let stopCacheInvalidationRecovery: (() => void) | undefined;
   let attachmentAuthority: AttachmentAuthorityCommandPort | undefined;
   let attachmentProcessing: AttachmentProcessingRuntime | undefined;
@@ -425,7 +434,52 @@ async function start(
       completeSnapshot: snapshotClient.completeSnapshot.bind(snapshotClient),
       releaseSnapshot: snapshotClient.releaseSnapshot.bind(snapshotClient),
     };
-    const agentSettings = new WorkerAgentSettingsAdapter(worker, Date.now);
+    let scopedReceiptCursor = 0;
+    let scopedReceiptDrain: Promise<void> | undefined;
+    const drainCommittedScopedProducerReceipts = (): Promise<void> => {
+      if (runtime === undefined) return Promise.resolve();
+      scopedReceiptDrain ??= (async () => {
+        let hasMore = true;
+        while (hasMore && runtime !== undefined && worker !== undefined) {
+          const result = await worker.executeRuntime({
+            type: "runtime.scan-internal-scoped-receipts",
+            afterRowId: scopedReceiptCursor,
+            limit: 256,
+            now: Date.now(),
+          });
+          if (typeof result !== "object" || result === null || !("kind" in result) ||
+              result.kind !== "internal-scoped-producer-receipts" ||
+              !("records" in result) || !Array.isArray(result.records) ||
+              !("hasMore" in result) || typeof result.hasMore !== "boolean") {
+            throw new Error("Internal scoped producer post-commit scan was malformed");
+          }
+          for (const record of result.records) {
+            if (typeof record !== "object" || record === null ||
+                !("committedAt" in record) || typeof record.committedAt !== "string" ||
+                !("requestId" in record) || typeof record.requestId !== "string" ||
+                !("rowId" in record) || typeof record.rowId !== "number" ||
+                !("receipt" in record)) {
+              throw new Error("Internal scoped producer post-commit record was malformed");
+            }
+            runtime.applyCommittedScopedProducerReceipt(record.receipt as never);
+            scopedReceiptCursor = record.rowId;
+          }
+          hasMore = result.hasMore;
+          if (hasMore && result.records.length === 0) {
+            throw new Error("Internal scoped producer post-commit cursor did not advance");
+          }
+        }
+      })().finally(() => { scopedReceiptDrain = undefined; });
+      return scopedReceiptDrain;
+    };
+    const afterCommittedProducerCommand = async (): Promise<void> => {
+      try { await drainCommittedScopedProducerReceipts(); } catch { /* recovery retries on next command */ }
+    };
+    const agentSettings = new WorkerAgentSettingsAdapter(
+      worker,
+      Date.now,
+      afterCommittedProducerCommand,
+    );
     const sync = createSyncService({ store: authority, snapshots: materializedSnapshots,
       agentSettings });
     const auth = createAuthenticationService({
@@ -441,8 +495,21 @@ async function start(
         async executeHuman(context, command) {
           try {
             const acknowledgement = await authority.executeHuman(context, command);
+            await afterCommittedProducerCommand();
             if (command.type === "message.send") {
-              await humanPreemptionRuntime?.handle(acknowledgement.aggregateId);
+              const route = await worker!.executeRuntime({
+                type: "runtime.create-route-for-human-message",
+                sourceHumanMessageId: acknowledgement.aggregateId,
+                now: Date.now(),
+              });
+              if (typeof route !== "object" || route === null ||
+                  !("kind" in route) || route.kind !== "human-message-route" ||
+                  !("roomId" in route) || typeof route.roomId !== "string" ||
+                  !("sourceHumanMessageId" in route) ||
+                  typeof route.sourceHumanMessageId !== "string") {
+                throw new Error("Authority human message route result was malformed");
+              }
+              routeRuntime?.notify(route.roomId, route.sourceHumanMessageId);
               memoryRuntime?.enqueue(command.roomId);
             }
             if (command.type === "open-item.create" || command.type === "open-item.transition" ||
@@ -479,7 +546,9 @@ async function start(
         ...args: Parameters<typeof authority.executeHumanGovernance>
       ) {
         try {
-          return await authority.executeHumanGovernance(...args);
+          const acknowledgement = await authority.executeHumanGovernance(...args);
+          await afterCommittedProducerCommand();
+          return acknowledgement;
         } catch (error: unknown) {
           if (transactionFault !== undefined) {
             process.exit(transactionFault === "after-domain-write" ? 81 : 82);
@@ -497,7 +566,14 @@ async function start(
       queryStore: authority,
     });
     const primitives = createAuthoritativeCollaborationPrimitives({ commandStore });
-    await testOptions.initialize?.({ auth, lifecycle, messages: service, primitives });
+    const projectBoundary = createFailClosedProjectBoundaryInvocationProducer({
+      authority: createWorkerProjectBoundaryInvocationAuthority(
+        worker as CompleteWorkerDatabaseClient,
+      ),
+    });
+    await testOptions.initialize?.({
+      auth, lifecycle, messages: service, primitives, projectBoundary,
+    });
     const runtimeConfiguration = options.agentRuntime ?? {};
     const authorityWorker = worker as CompleteWorkerDatabaseClient;
     const memoryAuthority = createWorkerMemoryAuthority({ worker, nowMs: Date.now });
@@ -538,6 +614,7 @@ async function start(
       authorityWorker,
       { contextWorker: authorityWorker },
     );
+    const runtimeRecoveryAuthority = createWorkerRuntimeRecoveryAuthority(authorityWorker);
     const contextBuilder = createWorkerCompiledContextBuilder({
       worker: authorityWorker,
       availableTools: runtimeTools.map((tool) => tool.descriptor),
@@ -568,6 +645,7 @@ async function start(
     const toolGateway = createToolGateway({ authority: runtimeAuthority, adapters: runtimeTools });
     runtime = createAgentRuntimeService({
       authority: runtimeAuthority,
+      recoveryAuthority: runtimeRecoveryAuthority,
       provider,
       modelId: runtimeModel,
       readiness: () => testOptions.agentRuntimeProviderForTest !== undefined ||
@@ -583,31 +661,43 @@ async function start(
       emitPreview(preview) {
         sourceScopedRuntimeBoundary?.publishPreview(preview);
       },
+      resetPreview(preview) {
+        void transport?.resetAgentPreview(preview);
+      },
       onMessageCommitted(execution) {
         if (execution.resultMessageId !== undefined) {
           memoryRuntime?.enqueue(execution.roomId);
         }
       },
-      async proposeOpenItem(input) {
-        const item = await primitives.proposeOpenItem(
-          mintInternalAgentCommandContext({
-            agentId: input.execution.agentId,
-            requestId: `runtime-open-item:${input.execution.id}:${input.callId}`,
-            idempotencyKey: `runtime-open-item:${input.execution.id}:${input.callId}`,
-          }),
-          input.execution.roomId,
-          {
-            proposalKind: input.proposalKind,
-            targetActorId: input.targetActorId,
-            sourceExecutionId: input.execution.id,
-            sourceMessageId: input.sourceMessageId,
-            reason: input.reason,
-            content: input.content,
-          },
-        );
-        return { id: item.id };
-      },
     });
+    let directIntentConsumer: Promise<void> | undefined;
+    const runtimeReady = (): boolean => testOptions.agentRuntimeProviderForTest !== undefined ||
+      secretProvider.getSecret("OPENAI_API_KEY") !== undefined;
+    kickDirectIntentConsumer = () => {
+      if (!runtimeReady() || directIntentConsumer !== undefined) return;
+      directIntentConsumer = (async () => {
+        while (runtime !== undefined && worker !== undefined) {
+          const result = await worker.executeRuntime({
+            type: "runtime.claim-pending-direct-intents",
+            providerId: provider.id,
+            modelId: runtimeModel,
+            limit: 256,
+            now: Date.now(),
+          });
+          if (typeof result !== "object" || result === null ||
+              !("kind" in result) || result.kind !== "direct-intent-claims" ||
+              !("records" in result) || !Array.isArray(result.records) ||
+              !("hasMore" in result) || typeof result.hasMore !== "boolean") {
+            throw new Error("Authority direct intent claim result was malformed");
+          }
+          if (result.records.length === 0) return;
+          await runtime.recover();
+          await runtime.whenIdle();
+        }
+      })().catch(() => undefined).finally(() => {
+        directIntentConsumer = undefined;
+      });
+    };
     sourceScopedRuntimeBoundary = createSourceScopedRuntimeBoundary({
       runtime: {
         applyCommittedMessageRecall(input) {
@@ -616,7 +706,7 @@ async function start(
       },
       preview: {
         publish(preview) {
-          transport?.publishAgentPreview({
+          void transport?.publishAgentPreview({
             roomId: preview.roomId,
             executionId: preview.executionId,
             attemptSeq: preview.attemptSeq,
@@ -647,13 +737,6 @@ async function start(
           secretProvider.getSecret("OPENAI_API_KEY") !== undefined
         ? "ready"
         : "noauth",
-    });
-    humanPreemptionRuntime = createHumanPreemptionRuntime({
-      worker,
-      runtime,
-      notifyRoute(roomId, sourceMessageId) {
-        return routeRuntime!.notify(roomId, sourceMessageId);
-      },
     });
     ballRuntime = createBallRuntimeService({
       worker,
@@ -686,6 +769,7 @@ async function start(
       async submitHumanMessage(...args: Parameters<typeof authority.submitHumanMessage>) {
         const receipt = await authority.submitHumanMessage(...args);
         memoryRuntime?.enqueue(args[1].roomId);
+        kickDirectIntentConsumer();
         return {
           messageId: receipt.messageId,
           persistedAt: receipt.persistedAt,
@@ -823,8 +907,16 @@ async function start(
       settleAttachmentReader(attachmentExtractionReader);
     }
     await runtime.recover();
+    await afterCommittedProducerCommand();
+    kickDirectIntentConsumer();
+    const runtimeRecoveryTimer = setInterval(() => {
+      void runtime?.recover().catch(() => undefined);
+      void afterCommittedProducerCommand();
+      kickDirectIntentConsumer();
+    }, 1_000);
+    runtimeRecoveryTimer.unref();
+    stopRuntimeRecovery = () => clearInterval(runtimeRecoveryTimer);
     await routeRuntime.recover();
-    await humanPreemptionRuntime.recover();
     await ballRuntime.recover();
     const memoryProvider = createOpenAIMemoryStewardProvider({
       endpoint: runtimeConfiguration.endpoint ?? "https://api.openai.com/v1/responses",
@@ -865,6 +957,43 @@ async function start(
       outboxStore,
       outboxPollIntervalMs: 10,
       agentRuntime: runtime,
+      previewAuthority: {
+        async deliver(input, sendSynchronously) {
+          await authorityWorker.executeRuntimeWithSynchronousDelivery({
+            type: "runtime.preview-authorize",
+            context: input.context,
+            roomId: input.roomId,
+            executionId: input.executionId,
+            attemptSeq: input.attemptSeq,
+            deliveryKind: input.deliveryKind,
+            subscriptionGeneration: input.subscriptionGeneration,
+            ...(input.expectedAuthorityEpoch === undefined
+              ? {}
+              : { expectedAuthorityEpoch: input.expectedAuthorityEpoch }),
+            now: Date.now(),
+          }, (result) => {
+            if (typeof result !== "object" || result === null ||
+                !("kind" in result) || result.kind !== "preview-authority" ||
+                !("subscriptionGeneration" in result) ||
+                result.subscriptionGeneration !== input.subscriptionGeneration ||
+                !("authorized" in result) ||
+                typeof result.authorized !== "boolean" ||
+                !("authorityEpoch" in result) ||
+                typeof result.authorityEpoch !== "string" ||
+                result.authorityEpoch.length === 0) {
+              throw new AgentRuntimeError(
+                "context_storage_unavailable",
+                "Preview delivery authority returned a malformed receipt",
+              );
+            }
+            sendSynchronously({
+              authorized: result.authorized,
+              authorityEpoch: result.authorityEpoch,
+            });
+            return undefined;
+          });
+        },
+      },
       collaboration: primitives,
       ballRuntime,
       messageAuthority,
@@ -876,6 +1005,7 @@ async function start(
   } catch (error: unknown) {
     settleAttachmentReader(undefined);
     stopCacheInvalidationRecovery?.();
+    stopRuntimeRecovery?.();
     stopAttachmentRecovery?.();
     stopMemoryRecovery?.();
     await transport?.close().catch(() => undefined);
@@ -896,6 +1026,7 @@ async function start(
     close() {
       closePromise ??= (async () => {
         stopCacheInvalidationRecovery?.();
+        stopRuntimeRecovery?.();
         stopAttachmentRecovery?.();
         stopMemoryRecovery?.();
         const failures: unknown[] = [];

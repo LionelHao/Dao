@@ -1,25 +1,53 @@
 import {
-  type AgentExecution,
-  type AgentInvocationIntent,
+  isAgentExecutionRetryReceipt,
+  isProjectBoundaryInvocationRequest,
+  type LegacyAgentExecution as AgentExecution,
+  type LegacyAgentInvocationIntent as AgentInvocationIntent,
   type HumanPreemptionNotice,
   type RoomMemoryRawDeltaPage,
   type RoomMemoryStatus,
   type RoomMemoryVersionProjection,
+  type ProjectBoundaryInvocationRequest,
+  type ProjectBoundaryInvocationResult,
   type ToolConfirmationInput,
   type ToolDescriptor,
+  type AgentExecutionRetryReceipt,
+  type ScopedCancellationReceipt,
 } from "@native-im/core";
 import type {
   AgentRuntimeErrorCode,
+  InvocationCancellationTarget,
   RuntimeRecoveryRecord,
 } from "./contracts.js";
 import type {
   AgentWorkerCommandContext,
   AuthenticatedCommandContext,
+  AuthenticatedSessionContext,
   JsonValue,
 } from "../persistence/contracts.js";
+import type {
+  ScopedCancellationCommitReceipt,
+} from "../scoped-cancellation/scoped-cancellation-orchestrator.js";
 
 export type RuntimeAuthorityOperation =
   | { readonly type: "runtime.read-context"; readonly executionId: string; readonly now: number }
+  | {
+      readonly type: "runtime.preview-authorize";
+      readonly context: AuthenticatedSessionContext;
+      readonly roomId: string;
+      readonly executionId: string;
+      readonly attemptSeq: number;
+      readonly deliveryKind: "preview" | "reset";
+      readonly subscriptionGeneration: number;
+      readonly expectedAuthorityEpoch?: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.scan-internal-scoped-receipts";
+      readonly afterRowId: number;
+      readonly limit: number;
+      readonly now: number;
+    }
   | {
       readonly type: "runtime.read-memory-delta";
       readonly executionId: string;
@@ -44,6 +72,21 @@ export type RuntimeAuthorityOperation =
       readonly intentId: string;
       readonly providerId: string;
       readonly modelId: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.claim-pending-direct-intents";
+      readonly providerId: string;
+      readonly modelId: string;
+      readonly limit: number;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.suppress-project-boundary";
+      readonly request: ProjectBoundaryInvocationRequest;
+      readonly requestSha256: string;
+      readonly reason: "dependency_unavailable";
+      readonly decidedAt: string;
       readonly now: number;
     }
   | { readonly type: "runtime.claim"; readonly executionId: string; readonly attemptSeq: number; readonly now: number }
@@ -71,11 +114,30 @@ export type RuntimeAuthorityOperation =
       readonly now: number;
     }
   | {
+      readonly type: "runtime.shutdown";
+      readonly executionId: string;
+      readonly attemptSeq: number;
+      readonly now: number;
+    }
+  | {
       readonly type: "runtime.manual-retry";
       readonly context: AuthenticatedCommandContext;
       readonly executionId: string;
       readonly newExecutionId: string;
       readonly newIntentId: string;
+      readonly expectedVersion?: number;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.validate-retry-receipt";
+      readonly receipt: AgentExecutionRetryReceipt;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.cancel-scoped";
+      readonly context: AuthenticatedCommandContext;
+      readonly target: InvocationCancellationTarget;
+      readonly producerId: string;
       readonly now: number;
     }
   | {
@@ -148,6 +210,11 @@ export type RuntimeAuthorityOperation =
       readonly now: number;
     }
   | {
+      readonly type: "runtime.create-route-for-human-message";
+      readonly sourceHumanMessageId: string;
+      readonly now: number;
+    }
+  | {
       readonly type: "runtime.enqueue-fence-replacements";
       readonly routeJobId: string;
       readonly targetAgentId: string;
@@ -156,6 +223,35 @@ export type RuntimeAuthorityOperation =
       readonly now: number;
     }
   | { readonly type: "runtime.list-pending-human-fences"; readonly now: number }
+  | {
+      readonly type: "runtime.recovery-scan";
+      readonly after?: string;
+      readonly limit: number;
+      readonly includeRunning: boolean;
+      readonly leaseOwner: string;
+      readonly leaseExpiresAt: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.recovery-isolate";
+      readonly cursor: string;
+      readonly candidateId?: string;
+      readonly leaseOwner: string;
+      readonly reason: "recovery_candidate_invalid" | "recovery_candidate_conflict";
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.recovery-settle";
+      readonly cursor: string;
+      readonly candidateId: string;
+      readonly leaseOwner: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.recovery-release";
+      readonly leaseOwner: string;
+      readonly now: number;
+    }
   | { readonly type: "runtime.recover"; readonly now: number };
 
 export type RuntimeAuthorityOperationResult =
@@ -172,11 +268,38 @@ export type RuntimeAuthorityOperationResult =
     }
   | { readonly kind: "memory-delta"; readonly rawDelta: RoomMemoryRawDeltaPage }
   | {
+      readonly kind: "preview-authority";
+      readonly authorized: boolean;
+      readonly authorityEpoch: string;
+      readonly subscriptionGeneration: number;
+    }
+  | {
+      readonly kind: "internal-scoped-producer-receipts";
+      readonly records: readonly Readonly<{
+        committedAt: string;
+        requestId: string;
+        rowId: number;
+        receipt: ScopedCancellationReceipt;
+      }>[];
+      readonly hasMore: boolean;
+    }
+  | {
       readonly kind: "invocation";
       readonly execution: AgentExecution;
       readonly intent: AgentInvocationIntent;
       readonly replayed: boolean;
+      readonly retryReceipt?: AgentExecutionRetryReceipt;
     }
+  | {
+      readonly kind: "direct-intent-claims";
+      readonly records: readonly RuntimeRecoveryRecord[];
+      readonly hasMore: boolean;
+    }
+  | {
+      readonly kind: "retry-receipt-binding";
+      readonly receipt: AgentExecutionRetryReceipt;
+    }
+  | { readonly kind: "project-boundary"; readonly result: ProjectBoundaryInvocationResult }
   | { readonly kind: "execution"; readonly execution: AgentExecution }
   | {
       readonly kind: "prepared-tool";
@@ -205,6 +328,7 @@ export type RuntimeAuthorityOperationResult =
     }
   | { readonly kind: "settled-tool" }
   | { readonly kind: "checkpoint" }
+  | ScopedCancellationCommitReceipt
   | {
       readonly kind: "human-fence-cancelled";
       readonly notice: HumanPreemptionNotice;
@@ -212,6 +336,13 @@ export type RuntimeAuthorityOperationResult =
     }
   | {
       readonly kind: "human-fence-route";
+      readonly roomId: string;
+      readonly sourceHumanMessageId: string;
+      readonly routeJobId: string;
+      readonly replayed: boolean;
+    }
+  | {
+      readonly kind: "human-message-route";
       readonly roomId: string;
       readonly sourceHumanMessageId: string;
       readonly routeJobId: string;
@@ -234,7 +365,18 @@ export type RuntimeAuthorityOperationResult =
       readonly sealedCompensation: string;
       readonly replayed: boolean;
     }
-  | { readonly kind: "recovery"; readonly records: readonly RuntimeRecoveryRecord[] };
+  | { readonly kind: "recovery"; readonly records: readonly RuntimeRecoveryRecord[] }
+  | {
+      readonly kind: "recovery-page";
+      readonly candidates: readonly Readonly<{
+        readonly cursor: string;
+        readonly record: RuntimeRecoveryRecord;
+      }>[];
+      readonly hasMore: boolean;
+    }
+  | { readonly kind: "recovery-isolated" }
+  | { readonly kind: "recovery-settled" }
+  | { readonly kind: "recovery-released"; readonly released: number };
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -260,6 +402,13 @@ function humanContext(value: unknown): value is AuthenticatedCommandContext {
       value.kind !== "human" || !text(value.sessionId) || !text(value.sessionFamilyId) || !text(value.requestId) || !text(value.idempotencyKey) ||
       !record(value.principal) || !exact(value.principal, ["accountId", "actorId"]) || !text(value.principal.accountId) || !text(value.principal.actorId)) return false;
   return true;
+}
+
+function sessionContext(value: unknown): value is AuthenticatedSessionContext {
+  return record(value) && exact(value, ["sessionId", "sessionFamilyId", "principal"]) &&
+    text(value.sessionId) && text(value.sessionFamilyId) && record(value.principal) &&
+    exact(value.principal, ["accountId", "actorId"]) &&
+    text(value.principal.accountId) && text(value.principal.actorId);
 }
 
 function agentContext(value: unknown): value is AgentWorkerCommandContext {
@@ -314,6 +463,24 @@ export function isRuntimeAuthorityOperation(value: unknown): value is RuntimeAut
   if (value.type === "runtime.read-context") {
     return exact(value, ["type", "executionId", "now"]) && text(value.executionId) && count(value.now);
   }
+  if (value.type === "runtime.preview-authorize") {
+    const optional = Object.hasOwn(value, "expectedAuthorityEpoch")
+      ? ["expectedAuthorityEpoch"] : [];
+    return exact(value, [
+      "type", "context", "roomId", "executionId", "attemptSeq", "deliveryKind",
+      "subscriptionGeneration", "now",
+    ], optional) && sessionContext(value.context) && text(value.roomId) &&
+      text(value.executionId) && count(value.attemptSeq, 1) &&
+      (value.deliveryKind === "preview" || value.deliveryKind === "reset") &&
+      count(value.subscriptionGeneration, 1) &&
+      (!Object.hasOwn(value, "expectedAuthorityEpoch") || text(value.expectedAuthorityEpoch)) &&
+      count(value.now);
+  }
+  if (value.type === "runtime.scan-internal-scoped-receipts") {
+    return exact(value, ["type", "afterRowId", "limit", "now"]) &&
+      count(value.afterRowId) && count(value.limit, 1) && value.limit <= 256 &&
+      count(value.now);
+  }
   if (value.type === "runtime.read-memory-delta") {
     return exact(value, ["type", "executionId", "cursor", "now"]) &&
       text(value.executionId) && text(value.cursor) &&
@@ -328,6 +495,17 @@ export function isRuntimeAuthorityOperation(value: unknown): value is RuntimeAut
     return exact(value, ["type", "routeJobId", "intent", "executionId", "intentId", "providerId", "modelId", "now"]) &&
       text(value.routeJobId) && invocationIntent(value.intent) && text(value.executionId) &&
       text(value.intentId) && text(value.providerId) && text(value.modelId) && count(value.now);
+  }
+  if (value.type === "runtime.claim-pending-direct-intents") {
+    return exact(value, ["type", "providerId", "modelId", "limit", "now"]) &&
+      text(value.providerId) && text(value.modelId) && count(value.limit, 1) &&
+      value.limit <= 256 && count(value.now);
+  }
+  if (value.type === "runtime.suppress-project-boundary") {
+    return exact(value, [
+      "type", "request", "requestSha256", "reason", "decidedAt", "now",
+    ]) && isProjectBoundaryInvocationRequest(value.request) && sha256(value.requestSha256) &&
+      value.reason === "dependency_unavailable" && text(value.decidedAt) && count(value.now);
   }
   if (value.type === "runtime.claim") {
     return exact(value, ["type", "executionId", "attemptSeq", "now"]) && text(value.executionId) && count(value.attemptSeq, 1) && count(value.now);
@@ -346,9 +524,30 @@ export function isRuntimeAuthorityOperation(value: unknown): value is RuntimeAut
     return exact(value, ["type", "context", "executionId", "reason", "now"]) && humanContext(value.context) &&
       text(value.executionId) && text(value.reason) && count(value.now);
   }
+  if (value.type === "runtime.shutdown") {
+    return exact(value, ["type", "executionId", "attemptSeq", "now"]) &&
+      text(value.executionId) && count(value.attemptSeq, 1) && count(value.now);
+  }
   if (value.type === "runtime.manual-retry") {
-    return exact(value, ["type", "context", "executionId", "newExecutionId", "newIntentId", "now"]) &&
-      humanContext(value.context) && text(value.executionId) && text(value.newExecutionId) && text(value.newIntentId) && count(value.now);
+    const optional = Object.hasOwn(value, "expectedVersion") ? ["expectedVersion"] : [];
+    return exact(value, ["type", "context", "executionId", "newExecutionId", "newIntentId", "now"], optional) &&
+      humanContext(value.context) && text(value.executionId) && text(value.newExecutionId) &&
+      text(value.newIntentId) && (!Object.hasOwn(value, "expectedVersion") ||
+        count(value.expectedVersion, 1)) && count(value.now);
+  }
+  if (value.type === "runtime.validate-retry-receipt") {
+    return exact(value, ["type", "receipt", "now"]) &&
+      isAgentExecutionRetryReceipt(value.receipt) && count(value.now);
+  }
+  if (value.type === "runtime.cancel-scoped") {
+    return exact(value, [
+      "type", "context", "target", "producerId", "now",
+    ]) && humanContext(value.context) && record(value.target) &&
+      ((exact(value.target, ["executionId", "expectedVersion"]) &&
+        text(value.target.executionId) && count(value.target.expectedVersion, 1)) ||
+       (exact(value.target, ["intentId", "expectedVersion"]) &&
+        text(value.target.intentId) && count(value.target.expectedVersion, 1))) &&
+      text(value.producerId) && count(value.now);
   }
   if (value.type === "runtime.begin-compensation") {
     return exact(value, ["type", "context", "executionId", "newExecutionId", "grantId", "dispatchId", "now"]) &&
@@ -399,7 +598,8 @@ export function isRuntimeAuthorityOperation(value: unknown): value is RuntimeAut
       (value.kind === "model" || value.kind === "tool") && sha256(value.inputSha256) && sha256(value.outputSha256) && count(value.now);
   }
   if (value.type === "runtime.cancel-for-human-fence" ||
-      value.type === "runtime.create-route-after-human-fence") {
+      value.type === "runtime.create-route-after-human-fence" ||
+      value.type === "runtime.create-route-for-human-message") {
     return exact(value, ["type", "sourceHumanMessageId", "now"]) &&
       text(value.sourceHumanMessageId) && count(value.now);
   }
@@ -410,6 +610,38 @@ export function isRuntimeAuthorityOperation(value: unknown): value is RuntimeAut
   }
   if (value.type === "runtime.list-pending-human-fences") {
     return exact(value, ["type", "now"]) && count(value.now);
+  }
+  if (value.type === "runtime.recovery-scan") {
+    const optional = Object.hasOwn(value, "after") ? ["after"] : [];
+    const leaseExpiresAt = typeof value.leaseExpiresAt === "string"
+      ? Date.parse(value.leaseExpiresAt)
+      : Number.NaN;
+    return exact(value, [
+      "type", "limit", "includeRunning", "leaseOwner", "leaseExpiresAt", "now",
+    ], optional) &&
+      count(value.limit, 1) && value.limit <= 256 && typeof value.includeRunning === "boolean" &&
+      (!Object.hasOwn(value, "after") || text(value.after)) && text(value.leaseOwner) &&
+      Buffer.byteLength(value.leaseOwner, "utf8") <= 256 && count(value.now) &&
+      Number.isFinite(leaseExpiresAt) && leaseExpiresAt > value.now &&
+      leaseExpiresAt <= value.now + 10 * 60_000 &&
+      new Date(leaseExpiresAt).toISOString() === value.leaseExpiresAt;
+  }
+  if (value.type === "runtime.recovery-isolate") {
+    const optional = Object.hasOwn(value, "candidateId") ? ["candidateId"] : [];
+    return exact(value, ["type", "cursor", "leaseOwner", "reason", "now"], optional) &&
+      text(value.cursor) && (!Object.hasOwn(value, "candidateId") || text(value.candidateId)) &&
+      text(value.leaseOwner) && Buffer.byteLength(value.leaseOwner, "utf8") <= 256 &&
+      (value.reason === "recovery_candidate_invalid" ||
+        value.reason === "recovery_candidate_conflict") && count(value.now);
+  }
+  if (value.type === "runtime.recovery-settle") {
+    return exact(value, ["type", "cursor", "candidateId", "leaseOwner", "now"]) &&
+      text(value.cursor) && text(value.candidateId) && text(value.leaseOwner) &&
+      Buffer.byteLength(value.leaseOwner, "utf8") <= 256 && count(value.now);
+  }
+  if (value.type === "runtime.recovery-release") {
+    return exact(value, ["type", "leaseOwner", "now"]) && text(value.leaseOwner) &&
+      Buffer.byteLength(value.leaseOwner, "utf8") <= 256 && count(value.now);
   }
   return value.type === "runtime.recover" && exact(value, ["type", "now"]) && count(value.now);
 }

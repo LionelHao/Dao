@@ -161,18 +161,241 @@ export interface BallProjectionInput {
   readonly lightTaskDeadlineMs: number;
 }
 
-export type AgentExecutionStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+export type AgentExecutionStatus = "accepted" | "running" | "completed" | "failed" | "cancelled";
+export type AgentExecutionAcceptedPhase =
+  | "queued"
+  | "retry_scheduled"
+  | "recovery_queued"
+  | "awaiting_capacity";
+export type AgentExecutionRunningPhase =
+  | "claiming"
+  | "snapshot_frozen"
+  | "model_generation"
+  | "read_tool"
+  | "waiting_confirmation"
+  | "side_effect_claimed"
+  | "final_committing";
+export type AgentExecutionTerminalPhase = "completed" | "failed" | "cancelled";
+export type AgentExecutionPhase =
+  | AgentExecutionAcceptedPhase
+  | AgentExecutionRunningPhase
+  | AgentExecutionTerminalPhase;
 export type AgentExecutionActionCategory = "model_generation" | "tool_call" | "waiting_upstream";
 export type AgentToolDispatchPhase = "not_started" | "dispatched" | "finished";
+export type AgentExecutionReviewState = "not_required" | "needs_review" | "reviewed";
+
+export type InvocationOrigin =
+  | Readonly<{
+      kind: "message_target";
+      messageTransactionId: string;
+      targetId: string;
+    }>
+  | Readonly<{
+      kind: "route_decision";
+      routeJobId: string;
+      judgmentId: string;
+    }>
+  | Readonly<{
+      kind: "project_boundary";
+      boundaryId: string;
+      boundaryKind: "checkpoint" | "due" | "blocker" | "agent_ball";
+    }>;
+
+export type InvocationCancellationReason =
+  | "human_cancelled"
+  | "reply_superseded"
+  | "correction_superseded"
+  | "intent_superseded"
+  | "message_recalled"
+  | "room_archived"
+  | "membership_revoked"
+  | "assignment_revoked"
+  | "profile_disabled"
+  | "capability_revoked"
+  | "source_ineligible"
+  | "runtime_shutdown";
+
+export interface AgentInvocationIntent {
+  readonly intentId: string;
+  readonly lineageId: string;
+  readonly turnId: string;
+  readonly roomId: string;
+  readonly sourceMessageId: string;
+  readonly sourceRevision: number;
+  readonly targetId: string;
+  readonly agentId: string;
+  readonly origin: InvocationOrigin;
+  readonly profileRevision: number;
+  readonly assignmentRevision: number;
+  readonly accessRevision: number;
+  readonly status: "pending" | "claimed" | "cancelled";
+  readonly createdAt: string;
+  readonly claimedAt?: string;
+  readonly cancelledAt?: string;
+  readonly cancellationReason?: InvocationCancellationReason;
+  readonly supersedesIntentId?: string;
+}
 
 export interface AgentExecution {
+  readonly executionId: string;
+  readonly intentId: string;
+  readonly lineageId: string;
+  readonly executionOrdinal: number;
+  readonly retryOfExecutionId?: string;
+  readonly roomId: string;
+  readonly agentId: string;
+  readonly snapshotId: string;
+  readonly providerId: string;
+  readonly modelId: string;
+  readonly status: AgentExecutionStatus;
+  readonly phase: AgentExecutionPhase;
+  readonly currentAttemptSeq: number;
+  readonly version: number;
+  readonly queuedAt: string;
+  readonly startedAt?: string;
+  readonly updatedAt: string;
+  readonly completedAt?: string;
+  readonly cancellationReason?: InvocationCancellationReason;
+  readonly terminalErrorCode?: string;
+  readonly deadLetteredAt?: string;
+  readonly resultMessageId?: string;
+  readonly reviewState?: AgentExecutionReviewState;
+}
+
+export interface AgentExecutionAttempt {
+  readonly executionId: string;
+  readonly intentId: string;
+  readonly lineageId: string;
+  readonly roomId: string;
+  readonly agentId: string;
+  readonly attemptSeq: number;
+  readonly snapshotId: string;
+  readonly providerId: string;
+  readonly modelId: string;
+  readonly status: AgentExecutionStatus;
+  readonly phase: AgentExecutionPhase;
+  readonly executionVersion: number;
+  readonly startedAt?: string;
+  readonly updatedAt: string;
+  readonly finishedAt?: string;
+  readonly errorCode?: string;
+  readonly nextRetryAt?: string;
+}
+
+type InvocationCancelCommandBase = Readonly<{
+  type: "invocation.cancel";
+  requestId: string;
+  expectedVersion: number;
+  reason?: never;
+  agentId?: never;
+  origin?: never;
+  providerId?: never;
+  modelId?: never;
+  snapshotId?: never;
+  attemptSeq?: never;
+}>;
+
+export type InvocationCancelCommand =
+  | Readonly<InvocationCancelCommandBase & { executionId: string; intentId?: never }>
+  | Readonly<InvocationCancelCommandBase & { intentId: string; executionId?: never }>;
+
+export type InvocationRetryCommand = Readonly<{
+  type: "invocation.retry";
+  requestId: string;
+  executionId: string;
+  expectedVersion: number;
+  agentId?: never;
+  origin?: never;
+  providerId?: never;
+  modelId?: never;
+  snapshotId?: never;
+  attemptSeq?: never;
+}>;
+
+export interface AgentExecutionRetryReceipt {
+  readonly requestId: string;
+  readonly sourceExecutionId: string;
+  readonly executionId: string;
+  readonly intentId: string;
+  readonly lineageId: string;
+  readonly roomId: string;
+  readonly executionOrdinal: number;
+  readonly snapshotId: string;
+  readonly status: "accepted";
+  readonly createdAt: string;
+}
+
+export type ScopedCancellationScope =
+  | Readonly<{ kind: "intent"; intentId: string; expectedVersion: number }>
+  | Readonly<{ kind: "execution"; executionId: string; expectedVersion: number }>
+  | Readonly<{ kind: "source_message"; sourceMessageId: string; sourceRevision: number }>
+  | Readonly<{ kind: "room"; roomId: string; archiveGeneration: number }>
+  | Readonly<{
+      kind: "agent_authority";
+      agentId: string;
+      authority: "membership" | "assignment" | "profile" | "capability";
+      authorityRevision: number;
+    }>;
+
+export interface ScopedCancellationReceipt {
+  readonly requestId: string;
+  readonly fenceId: string;
+  readonly roomId: string;
+  readonly lineageId: string;
+  readonly scope: ScopedCancellationScope;
+  readonly reason: InvocationCancellationReason;
+  readonly intentOutcomes: readonly Readonly<{
+    intentId: string;
+    outcome: "cancelled" | "already_claimed" | "already_cancelled";
+  }>[];
+  readonly executionOutcomes: readonly Readonly<{
+    executionId: string;
+    outcome: "cancelled" | "already_terminal";
+    version: number;
+  }>[];
+  readonly rejectedConfirmationIds: readonly string[];
+  readonly revokedGrantIds: readonly string[];
+  readonly preservedDispatchIds: readonly string[];
+  readonly committedAt: string;
+}
+
+export type ProjectBoundaryInvocationRequest = Readonly<{
+  purpose: "project_boundary_invocation";
+  boundaryId: string;
+  boundaryKind: "checkpoint" | "due" | "blocker" | "agent_ball";
+  projectId: string;
+  roomId: string;
+  agentId: string;
+  sourceFactId: string;
+  sourceFactRevision: number;
+}>;
+
+export type ProjectBoundaryInvocationResult =
+  | Readonly<{
+      boundaryId: string;
+      roomId: string;
+      status: "intent-created";
+      intentId: string;
+      consumedAt: string;
+    }>
+  | Readonly<{
+      boundaryId: string;
+      roomId: string;
+      status: "suppressed";
+      reason: "dependency_unavailable" | "boundary_ineligible" | "authority_unavailable";
+      decidedAt: string;
+    }>;
+
+export type LegacyAgentExecutionStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+
+export interface LegacyAgentExecution {
   readonly id: string;
   readonly roomId: string;
   readonly sourceMessageId: string;
   readonly requesterId: string;
   readonly agentId: string;
   readonly toolName: string;
-  readonly status: AgentExecutionStatus;
+  readonly status: LegacyAgentExecutionStatus;
   readonly actionCategory: AgentExecutionActionCategory;
   readonly toolDispatchPhase?: AgentToolDispatchPhase;
   readonly currentAttemptSeq: number;
@@ -195,20 +418,12 @@ export interface AgentExecution {
   readonly supersedesExecutionIds?: readonly string[];
 }
 
-export interface HumanPreemptionNotice {
-  readonly roomId: string;
-  readonly sourceHumanMessageId: string;
-  readonly cancelledExecutionIds: readonly string[];
-  readonly rerouteStatus: "queued";
-  readonly occurredAt: string;
-}
-
-export interface AgentExecutionAttempt {
+export interface LegacyAgentExecutionAttempt {
   readonly executionId: string;
   readonly attemptSeq: number;
   readonly retryCycle: number;
   readonly retryOrdinal: 1 | 2 | 3;
-  readonly status: AgentExecutionStatus;
+  readonly status: LegacyAgentExecutionStatus;
   readonly actionCategory: AgentExecutionActionCategory;
   readonly startedAt?: string;
   readonly finishedAt?: string;
@@ -217,10 +432,21 @@ export interface AgentExecutionAttempt {
   readonly recoveryCursor: number;
 }
 
-export type AgentInvocationIntentKind = "direct_mention" | "structured_help" | "routed_candidate";
+export interface LegacyHumanPreemptionNotice {
+  readonly roomId: string;
+  readonly sourceHumanMessageId: string;
+  readonly cancelledExecutionIds: readonly string[];
+  readonly rerouteStatus: "queued";
+  readonly occurredAt: string;
+}
 
-export interface AgentInvocationIntent {
-  readonly kind: AgentInvocationIntentKind;
+/** @deprecated v1-v21 audit reader only; production must not emit broad preemption. */
+export type HumanPreemptionNotice = LegacyHumanPreemptionNotice;
+
+export type LegacyAgentInvocationIntentKind = "direct_mention" | "structured_help" | "routed_candidate";
+
+export interface LegacyAgentInvocationIntent {
+  readonly kind: LegacyAgentInvocationIntentKind;
   readonly roomId: string;
   readonly sourceMessageId: string;
   readonly targetAgentId: string;
@@ -260,7 +486,7 @@ export interface AgentRuntimeProviderInput {
     configVersion: string;
     modelId: string;
   }>;
-  readonly invocation: AgentInvocationIntent;
+  readonly invocation: AgentInvocationIntent | LegacyAgentInvocationIntent;
   readonly trusted: Readonly<{
     system: readonly Readonly<{
       kind: "product_policy" | "safety_policy";
@@ -435,11 +661,15 @@ export interface RouteJudgment {
   readonly decidedAt: string;
 }
 
-export interface RouteInvocationIntent extends AgentInvocationIntent {
+export interface RouteInvocationIntent extends LegacyAgentInvocationIntent {
   readonly reasonCode: "direct_mention" | "structured_help" | "domain_match" | "risk_detected" | "ball_due";
   readonly reasonText: string;
   readonly priority: 1 | 2 | 3;
 }
+
+export type CanonicalRouteInvocationIntent = AgentInvocationIntent & Readonly<{
+  origin: Extract<InvocationOrigin, { readonly kind: "route_decision" }>;
+}>;
 
 export interface BallSummary {
   readonly agentId: string;
@@ -871,7 +1101,286 @@ export function projectLightTask(value: LightTask): LightTaskProjection {
   };
 }
 
+function isPositiveSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function isInvocationCancellationReason(value: unknown): value is InvocationCancellationReason {
+  return value === "human_cancelled" || value === "reply_superseded" ||
+    value === "correction_superseded" || value === "intent_superseded" ||
+    value === "message_recalled" || value === "room_archived" ||
+    value === "membership_revoked" || value === "assignment_revoked" ||
+    value === "profile_disabled" || value === "capability_revoked" ||
+    value === "source_ineligible" || value === "runtime_shutdown";
+}
+
+function isInvocationOrigin(value: unknown, targetId: string): value is InvocationOrigin {
+  if (!isRecord(value)) return false;
+  if (value.kind === "message_target") {
+    return hasExactKeys(value, ["kind", "messageTransactionId", "targetId"]) &&
+      isNonEmptyString(value.messageTransactionId) && value.targetId === targetId;
+  }
+  if (value.kind === "route_decision") {
+    return hasExactKeys(value, ["kind", "routeJobId", "judgmentId"]) &&
+      isNonEmptyString(value.routeJobId) && isNonEmptyString(value.judgmentId);
+  }
+  return value.kind === "project_boundary" &&
+    hasExactKeys(value, ["kind", "boundaryId", "boundaryKind"]) &&
+    isNonEmptyString(value.boundaryId) &&
+    (value.boundaryKind === "checkpoint" || value.boundaryKind === "due" ||
+      value.boundaryKind === "blocker" || value.boundaryKind === "agent_ball");
+}
+
+export function isAgentInvocationIntent(value: unknown): value is AgentInvocationIntent {
+  if (!isRecord(value) || !hasExactKeys(value, [
+    "intentId", "lineageId", "turnId", "roomId", "sourceMessageId", "sourceRevision",
+    "targetId", "agentId", "origin", "profileRevision", "assignmentRevision",
+    "accessRevision", "status", "createdAt",
+  ], ["claimedAt", "cancelledAt", "cancellationReason", "supersedesIntentId"]) ||
+      !isNonEmptyString(value.intentId) || !isNonEmptyString(value.lineageId) ||
+      !isNonEmptyString(value.turnId) || !isNonEmptyString(value.roomId) ||
+      !isNonEmptyString(value.sourceMessageId) || !isPositiveSafeInteger(value.sourceRevision) ||
+      !isNonEmptyString(value.targetId) || !isNonEmptyString(value.agentId) ||
+      !isInvocationOrigin(value.origin, value.targetId) ||
+      !isPositiveSafeInteger(value.profileRevision) ||
+      !isPositiveSafeInteger(value.assignmentRevision) ||
+      !isPositiveSafeInteger(value.accessRevision) || !isNonEmptyString(value.createdAt) ||
+      (Object.hasOwn(value, "supersedesIntentId") &&
+        (!isNonEmptyString(value.supersedesIntentId) || value.supersedesIntentId === value.intentId))) {
+    return false;
+  }
+  if (value.status === "pending") {
+    return !Object.hasOwn(value, "claimedAt") && !Object.hasOwn(value, "cancelledAt") &&
+      !Object.hasOwn(value, "cancellationReason");
+  }
+  if (value.status === "claimed") {
+    return isNonEmptyString(value.claimedAt) && !Object.hasOwn(value, "cancelledAt") &&
+      !Object.hasOwn(value, "cancellationReason");
+  }
+  return value.status === "cancelled" && isNonEmptyString(value.cancelledAt) &&
+    isInvocationCancellationReason(value.cancellationReason) && !Object.hasOwn(value, "claimedAt");
+}
+
+function isAcceptedPhase(value: unknown): value is AgentExecutionAcceptedPhase {
+  return value === "queued" || value === "retry_scheduled" || value === "recovery_queued" ||
+    value === "awaiting_capacity";
+}
+
+function isRunningPhase(value: unknown): value is AgentExecutionRunningPhase {
+  return value === "claiming" || value === "snapshot_frozen" || value === "model_generation" ||
+    value === "read_tool" || value === "waiting_confirmation" ||
+    value === "side_effect_claimed" || value === "final_committing";
+}
+
+function executionStatusMatchesPhase(status: unknown, phase: unknown): status is AgentExecutionStatus {
+  return (status === "accepted" && isAcceptedPhase(phase)) ||
+    (status === "running" && isRunningPhase(phase)) || status === phase &&
+      (status === "completed" || status === "failed" || status === "cancelled");
+}
+
 export function isAgentExecution(value: unknown): value is AgentExecution {
+  if (!isRecord(value) || !hasExactKeys(value, [
+    "executionId", "intentId", "lineageId", "executionOrdinal", "roomId", "agentId",
+    "snapshotId", "providerId", "modelId", "status", "phase", "currentAttemptSeq",
+    "version", "queuedAt", "updatedAt",
+  ], [
+    "retryOfExecutionId", "startedAt", "completedAt", "cancellationReason",
+    "terminalErrorCode", "deadLetteredAt", "resultMessageId", "reviewState",
+  ]) || !isNonEmptyString(value.executionId) || !isNonEmptyString(value.intentId) ||
+      !isNonEmptyString(value.lineageId) || !isPositiveSafeInteger(value.executionOrdinal) ||
+      !isNonEmptyString(value.roomId) || !isNonEmptyString(value.agentId) ||
+      !isNonEmptyString(value.snapshotId) || !isNonEmptyString(value.providerId) ||
+      !isNonEmptyString(value.modelId) || !executionStatusMatchesPhase(value.status, value.phase) ||
+      !isPositiveSafeInteger(value.currentAttemptSeq) || !isPositiveSafeInteger(value.version) ||
+      !isNonEmptyString(value.queuedAt) || !isNonEmptyString(value.updatedAt) ||
+      (Object.hasOwn(value, "retryOfExecutionId") &&
+        (!isNonEmptyString(value.retryOfExecutionId) || value.retryOfExecutionId === value.executionId)) ||
+      (value.executionOrdinal === 1 && Object.hasOwn(value, "retryOfExecutionId")) ||
+      (value.executionOrdinal > 1 && !isNonEmptyString(value.retryOfExecutionId))) {
+    return false;
+  }
+  const terminal = value.status === "completed" || value.status === "failed" || value.status === "cancelled";
+  if (value.status === "accepted") {
+    if (Object.hasOwn(value, "startedAt")) return false;
+  } else if (!isNonEmptyString(value.startedAt)) {
+    return false;
+  }
+  if (terminal !== isNonEmptyString(value.completedAt)) return false;
+  if ((value.status === "cancelled") !== isInvocationCancellationReason(value.cancellationReason)) return false;
+  if ((value.status === "failed") !== isNonEmptyString(value.terminalErrorCode)) return false;
+  if (Object.hasOwn(value, "deadLetteredAt") &&
+      (value.status !== "failed" || !isNonEmptyString(value.deadLetteredAt))) return false;
+  if (Object.hasOwn(value, "resultMessageId") &&
+      (value.status !== "completed" || !isNonEmptyString(value.resultMessageId))) return false;
+  if (Object.hasOwn(value, "reviewState")) {
+    if (value.status !== "failed" ||
+        (value.reviewState !== "not_required" && value.reviewState !== "needs_review" &&
+          value.reviewState !== "reviewed")) return false;
+  }
+  return true;
+}
+
+export function isAgentExecutionAttempt(value: unknown): value is AgentExecutionAttempt {
+  if (!isRecord(value) || !hasExactKeys(value, [
+    "executionId", "intentId", "lineageId", "roomId", "agentId", "attemptSeq", "snapshotId", "providerId",
+    "modelId", "status", "phase", "executionVersion", "updatedAt",
+  ], ["startedAt", "finishedAt", "errorCode", "nextRetryAt"]) ||
+      !isNonEmptyString(value.executionId) || !isNonEmptyString(value.intentId) ||
+      !isNonEmptyString(value.lineageId) || !isNonEmptyString(value.roomId) ||
+      !isNonEmptyString(value.agentId) || !isPositiveSafeInteger(value.attemptSeq) ||
+      !isNonEmptyString(value.snapshotId) || !isNonEmptyString(value.providerId) ||
+      !isNonEmptyString(value.modelId) || !executionStatusMatchesPhase(value.status, value.phase) ||
+      !isPositiveSafeInteger(value.executionVersion) || !isNonEmptyString(value.updatedAt)) return false;
+  const terminal = value.status === "completed" || value.status === "failed" || value.status === "cancelled";
+  if (value.status === "accepted") {
+    if (Object.hasOwn(value, "startedAt")) return false;
+  } else if (!isNonEmptyString(value.startedAt)) return false;
+  if (terminal !== isNonEmptyString(value.finishedAt)) return false;
+  if (Object.hasOwn(value, "errorCode") &&
+      (value.status !== "failed" || !isNonEmptyString(value.errorCode))) return false;
+  return !Object.hasOwn(value, "nextRetryAt") ||
+    (value.status === "failed" && isNonEmptyString(value.nextRetryAt));
+}
+
+export function isInvocationCancelCommand(value: unknown): value is InvocationCancelCommand {
+  if (!isRecord(value) || value.type !== "invocation.cancel" ||
+      !isNonEmptyString(value.requestId) || !isPositiveSafeInteger(value.expectedVersion)) return false;
+  const executionTarget = hasExactKeys(value, [
+    "type", "requestId", "executionId", "expectedVersion",
+  ]) && isNonEmptyString(value.executionId);
+  const intentTarget = hasExactKeys(value, [
+    "type", "requestId", "intentId", "expectedVersion",
+  ]) && isNonEmptyString(value.intentId);
+  return executionTarget !== intentTarget;
+}
+
+export function isInvocationRetryCommand(value: unknown): value is InvocationRetryCommand {
+  return isRecord(value) && hasExactKeys(value, ["type", "requestId", "executionId", "expectedVersion"]) &&
+    value.type === "invocation.retry" && isNonEmptyString(value.requestId) &&
+    isNonEmptyString(value.executionId) && isPositiveSafeInteger(value.expectedVersion);
+}
+
+export function isAgentExecutionRetryReceipt(value: unknown): value is AgentExecutionRetryReceipt {
+  return isRecord(value) && hasExactKeys(value, [
+    "requestId", "sourceExecutionId", "executionId", "intentId", "lineageId", "roomId",
+    "executionOrdinal", "snapshotId", "status", "createdAt",
+  ]) && isNonEmptyString(value.requestId) && isNonEmptyString(value.sourceExecutionId) &&
+    isNonEmptyString(value.executionId) && value.executionId !== value.sourceExecutionId &&
+    isNonEmptyString(value.intentId) && isNonEmptyString(value.lineageId) && isNonEmptyString(value.roomId) &&
+    isPositiveSafeInteger(value.executionOrdinal) && value.executionOrdinal >= 2 &&
+    isNonEmptyString(value.snapshotId) && value.status === "accepted" &&
+    isNonEmptyString(value.createdAt);
+}
+
+function isScopedCancellationScope(value: unknown): value is ScopedCancellationScope {
+  if (!isRecord(value)) return false;
+  if (value.kind === "intent") {
+    return hasExactKeys(value, ["kind", "intentId", "expectedVersion"]) &&
+      isNonEmptyString(value.intentId) && isPositiveSafeInteger(value.expectedVersion);
+  }
+  if (value.kind === "execution") {
+    return hasExactKeys(value, ["kind", "executionId", "expectedVersion"]) &&
+      isNonEmptyString(value.executionId) && isPositiveSafeInteger(value.expectedVersion);
+  }
+  if (value.kind === "source_message") {
+    return hasExactKeys(value, ["kind", "sourceMessageId", "sourceRevision"]) &&
+      isNonEmptyString(value.sourceMessageId) && isPositiveSafeInteger(value.sourceRevision);
+  }
+  if (value.kind === "room") {
+    return hasExactKeys(value, ["kind", "roomId", "archiveGeneration"]) &&
+      isNonEmptyString(value.roomId) && isPositiveSafeInteger(value.archiveGeneration);
+  }
+  return value.kind === "agent_authority" && hasExactKeys(value, [
+    "kind", "agentId", "authority", "authorityRevision",
+  ]) && isNonEmptyString(value.agentId) &&
+    (value.authority === "membership" || value.authority === "assignment" ||
+      value.authority === "profile" || value.authority === "capability") &&
+    isPositiveSafeInteger(value.authorityRevision);
+}
+
+function isUniqueIdentifiers(value: unknown): value is readonly string[] {
+  return Array.isArray(value) && value.length <= 256 && value.every(isNonEmptyString) &&
+    new Set(value).size === value.length;
+}
+
+export function isScopedCancellationReceipt(value: unknown): value is ScopedCancellationReceipt {
+  if (!isRecord(value) || !hasExactKeys(value, [
+    "requestId", "fenceId", "roomId", "lineageId", "scope", "reason", "intentOutcomes",
+    "executionOutcomes", "rejectedConfirmationIds", "revokedGrantIds", "preservedDispatchIds",
+    "committedAt",
+  ]) || !isNonEmptyString(value.requestId) || !isNonEmptyString(value.fenceId) ||
+      !isNonEmptyString(value.roomId) || !isNonEmptyString(value.lineageId) ||
+      !isScopedCancellationScope(value.scope) || !isInvocationCancellationReason(value.reason) ||
+      !Array.isArray(value.intentOutcomes) || !Array.isArray(value.executionOutcomes) ||
+      value.intentOutcomes.length > 256 || value.executionOutcomes.length > 256 ||
+      !isUniqueIdentifiers(value.rejectedConfirmationIds) ||
+      !isUniqueIdentifiers(value.revokedGrantIds) || !isUniqueIdentifiers(value.preservedDispatchIds) ||
+      !isNonEmptyString(value.committedAt)) return false;
+  if (value.scope.kind === "room" &&
+      (value.scope.roomId !== value.roomId || value.reason !== "room_archived")) return false;
+  if (value.scope.kind === "source_message" && value.reason !== "message_recalled") return false;
+  if (value.scope.kind === "agent_authority") {
+    const reasonByAuthority = {
+      membership: "membership_revoked",
+      assignment: "assignment_revoked",
+      profile: "profile_disabled",
+      capability: "capability_revoked",
+    } as const;
+    if (value.reason !== reasonByAuthority[value.scope.authority]) return false;
+  }
+  const intentIds = new Set<string>();
+  for (const outcome of value.intentOutcomes) {
+    if (!isRecord(outcome) || !hasExactKeys(outcome, ["intentId", "outcome"]) ||
+        !isNonEmptyString(outcome.intentId) || intentIds.has(outcome.intentId) ||
+        (outcome.outcome !== "cancelled" && outcome.outcome !== "already_claimed" &&
+          outcome.outcome !== "already_cancelled")) return false;
+    intentIds.add(outcome.intentId);
+  }
+  const executionIds = new Set<string>();
+  for (const outcome of value.executionOutcomes) {
+    if (!isRecord(outcome) || !hasExactKeys(outcome, ["executionId", "outcome", "version"]) ||
+        !isNonEmptyString(outcome.executionId) || executionIds.has(outcome.executionId) ||
+        (outcome.outcome !== "cancelled" && outcome.outcome !== "already_terminal") ||
+        !isPositiveSafeInteger(outcome.version)) return false;
+    executionIds.add(outcome.executionId);
+  }
+  return (value.scope.kind !== "intent" || intentIds.has(value.scope.intentId)) &&
+    (value.scope.kind !== "execution" || executionIds.has(value.scope.executionId));
+}
+
+export function isProjectBoundaryInvocationResult(value: unknown): value is ProjectBoundaryInvocationResult {
+  if (!isRecord(value) || !isNonEmptyString(value.boundaryId) || !isNonEmptyString(value.roomId)) return false;
+  if (value.status === "intent-created") {
+    return hasExactKeys(value, ["boundaryId", "roomId", "status", "intentId", "consumedAt"]) &&
+      isNonEmptyString(value.intentId) && isNonEmptyString(value.consumedAt);
+  }
+  return value.status === "suppressed" &&
+    hasExactKeys(value, ["boundaryId", "roomId", "status", "reason", "decidedAt"]) &&
+    (value.reason === "dependency_unavailable" || value.reason === "boundary_ineligible" ||
+      value.reason === "authority_unavailable") && isNonEmptyString(value.decidedAt);
+}
+
+export function isProjectBoundaryInvocationRequest(value: unknown): value is ProjectBoundaryInvocationRequest {
+  return isRecord(value) && hasExactKeys(value, [
+    "purpose", "boundaryId", "boundaryKind", "projectId", "roomId", "agentId",
+    "sourceFactId", "sourceFactRevision",
+  ]) && value.purpose === "project_boundary_invocation" && isNonEmptyString(value.boundaryId) &&
+    (value.boundaryKind === "checkpoint" || value.boundaryKind === "due" ||
+      value.boundaryKind === "blocker" || value.boundaryKind === "agent_ball") &&
+    isNonEmptyString(value.projectId) && isNonEmptyString(value.roomId) && value.projectId === value.roomId &&
+    isNonEmptyString(value.agentId) && isNonEmptyString(value.sourceFactId) &&
+    isPositiveSafeInteger(value.sourceFactRevision);
+}
+
+export function isLegacyAgentInvocationIntent(value: unknown): value is LegacyAgentInvocationIntent {
+  return isRecord(value) && hasExactKeys(value, [
+    "kind", "roomId", "sourceMessageId", "targetAgentId",
+  ]) && (value.kind === "direct_mention" || value.kind === "structured_help" ||
+    value.kind === "routed_candidate") && isNonEmptyString(value.roomId) &&
+    isNonEmptyString(value.sourceMessageId) && isNonEmptyString(value.targetAgentId);
+}
+
+export function isLegacyAgentExecution(value: unknown): value is LegacyAgentExecution {
   if (!isRecord(value) || !hasExactKeys(
     value,
     [
@@ -929,7 +1438,7 @@ export function isAgentExecution(value: unknown): value is AgentExecution {
   );
 }
 
-export function isHumanPreemptionNotice(value: unknown): value is HumanPreemptionNotice {
+export function isLegacyHumanPreemptionNotice(value: unknown): value is LegacyHumanPreemptionNotice {
   return isRecord(value) && hasExactKeys(value, [
     "roomId", "sourceHumanMessageId", "cancelledExecutionIds", "rerouteStatus", "occurredAt",
   ]) && isNonEmptyString(value.roomId) && isNonEmptyString(value.sourceHumanMessageId) &&
@@ -938,6 +1447,9 @@ export function isHumanPreemptionNotice(value: unknown): value is HumanPreemptio
     new Set(value.cancelledExecutionIds).size === value.cancelledExecutionIds.length &&
     value.rerouteStatus === "queued" && isNonEmptyString(value.occurredAt);
 }
+
+/** @deprecated v1-v21 audit reader only; production must not emit broad preemption. */
+export const isHumanPreemptionNotice = isLegacyHumanPreemptionNotice;
 
 export function isSocialReaction(value: unknown): value is SocialReaction {
   return isRecord(value) &&

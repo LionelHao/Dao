@@ -18,6 +18,7 @@ import {
   type GovernanceWebSocketLike,
 } from "./websocket-authority.js";
 import type { GovernanceClosedError } from "../renderer/governance/view-model.js";
+import { createInvocationController, type InvocationController } from "../invocation-runtime/controller.js";
 
 function closedError(error: unknown): GovernanceClosedError {
   if (!(error instanceof GovernanceTransportError)) {
@@ -41,6 +42,9 @@ function closedError(error: unknown): GovernanceClosedError {
     case "rate_limited": return { status: 429, code: "rate_limited" };
     case "dependency_unavailable": return { status: 503, code: "dependency_unavailable" };
     case "snapshot_stale":
+    case "context_unavailable":
+    case "execution_conflict":
+    case "protocol_upgrade_required":
     case "connection_unavailable":
     case "request_timeout":
     case "protocol_error":
@@ -72,6 +76,7 @@ function mergeAcknowledgedProjection(
 
 export interface DesktopGovernanceRuntime {
   readonly controller: GovernanceController;
+  readonly invocations: InvocationController;
   readonly cache: DesktopAuthorityCache;
   invalidateAuthorizedState(): void;
   close(): void;
@@ -95,6 +100,10 @@ export function createDesktopGovernanceRuntime(options: {
     ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
   });
   const replica = createClientSyncReplica({ transport, cache, governanceObserver: feed });
+  const invocations = createInvocationController({
+    cache, transport, repairRoom: (roomId) => replica.repairRoom(roomId),
+    session: options.session, createRequestId: (kind) => `invocation-${kind}-${randomUUID()}`, now,
+  });
   let closed = false;
 
   const authority: GovernanceAuthorityAdapter = {
@@ -165,11 +174,15 @@ export function createDesktopGovernanceRuntime(options: {
   const unsubscribeTerminal = transport.onTerminalRevoked(() => {
     const roomIds = cache.roomIds();
     cache.clear();
-    for (const roomId of roomIds) feed.revoked({ roomId, scope: "session", purgeCompleted: true });
+    for (const roomId of roomIds) {
+      invocations.markRevoked(roomId, "session");
+      feed.revoked({ roomId, scope: "session", purgeCompleted: true });
+    }
   });
   const unsubscribeRoomAccess = transport.onRoomAccessChanged((roomId, change) => {
     if (change === "removed") {
       cache.clearRoom(roomId);
+      invocations.markRevoked(roomId, "room");
       feed.revoked({ roomId, scope: "room", purgeCompleted: true });
       return;
     }
@@ -181,22 +194,30 @@ export function createDesktopGovernanceRuntime(options: {
   const unsubscribeFailure = transport.onConnectionFailure(() => {
     const roomIds = cache.roomIds();
     cache.clear();
-    for (const roomId of roomIds) feed.offline({ roomId, asOf: now() });
+    for (const roomId of roomIds) {
+      invocations.markOffline(roomId);
+      feed.offline({ roomId, asOf: now() });
+    }
   });
 
   return Object.freeze({
     controller,
+    invocations,
     cache,
     invalidateAuthorizedState() {
       const roomIds = cache.roomIds();
       cache.clear();
       transport.resetSession();
-      for (const roomId of roomIds) feed.revoked({ roomId, scope: "session", purgeCompleted: true });
+      for (const roomId of roomIds) {
+        invocations.markRevoked(roomId, "session");
+        feed.revoked({ roomId, scope: "session", purgeCompleted: true });
+      }
     },
     close() {
       if (closed) return;
       closed = true;
       unsubscribeTerminal(); unsubscribeRoomAccess(); unsubscribeFailure(); controller.close();
+      invocations.close();
       replica.close(); transport.close(); cache.clear();
     },
   });

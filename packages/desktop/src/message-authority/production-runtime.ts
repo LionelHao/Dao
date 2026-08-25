@@ -432,6 +432,11 @@ export function createDesktopMessageAuthorityRuntime(options: {
     }
   };
   const unsubscribeTerminal = transport.onTerminalRevoked(() => revokeAll("session"));
+  const unsubscribePreview = transport.onAgentPreview((input) => {
+    const state = rooms.get(input.roomId);
+    if (state === undefined || state.desynchronized) return;
+    publish(input);
+  });
   const unsubscribeAccess = transport.onRoomAccessChanged((roomId, change) => {
     if (change === "removed" || change === "archived") {
       revokeAll("room", roomId);
@@ -469,6 +474,7 @@ export function createDesktopMessageAuthorityRuntime(options: {
       if (closed) return;
       closed = true;
       unsubscribeTerminal();
+      unsubscribePreview();
       unsubscribeAccess();
       unsubscribeFailure();
       for (const state of rooms.values()) state.subscription?.close();

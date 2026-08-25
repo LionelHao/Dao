@@ -24,8 +24,8 @@ import {
   type SnapshotCompleted,
   type SnapshotVersion,
   type WorkspaceBootstrapPage,
-  type AgentExecution,
-  type AgentInvocationIntent,
+  type LegacyAgentExecution as AgentExecution,
+  type LegacyAgentInvocationIntent as AgentInvocationIntent,
   type LightTask,
   type BallInCourt,
   type DepartureConflictList,
@@ -37,6 +37,8 @@ import {
   type AttachmentSourceEligibility,
   type RoomMemoryRequest,
   type RoomMemorySuccessFrame,
+  type ScopedCancellationReceipt,
+  type AgentExecutionRetryReceipt,
 } from "@native-im/core";
 import {
   parseAttachmentClientFrame,
@@ -119,6 +121,12 @@ const MESSAGE_DRAFT_FIELDS = new Set(["id", "roomId", "body", "sentAt"]);
 const AGENT_INVOKE_FIELDS = new Set(["type", "requestId", "intent"]);
 const AGENT_INTENT_FIELDS = new Set(["kind", "roomId", "sourceMessageId", "targetAgentId"]);
 const AGENT_CONTROL_FIELDS = new Set(["type", "requestId", "executionId"]);
+const INVOCATION_CONTROL_FIELDS = new Set([
+  "type", "requestId", "executionId", "expectedVersion",
+]);
+const INVOCATION_CANCEL_INTENT_FIELDS = new Set([
+  "type", "requestId", "intentId", "expectedVersion",
+]);
 const AGENT_INTERRUPT_FIELDS = new Set(["type", "requestId", "executionId", "reason"]);
 const AGENT_CONFIRM_FIELDS = new Set(["type", "requestId", "confirmation"]);
 const AGENT_CONFIRMATION_FIELDS = new Set(["confirmationId", "executionId"]);
@@ -368,6 +376,27 @@ export interface AgentRetryFrame {
   readonly executionId: string;
 }
 
+export type InvocationCancelFrame =
+  | Readonly<{
+      type: "invocation.cancel";
+      requestId: string;
+      executionId: string;
+      expectedVersion: number;
+    }>
+  | Readonly<{
+      type: "invocation.cancel";
+      requestId: string;
+      intentId: string;
+      expectedVersion: number;
+    }>;
+
+export interface InvocationRetryFrame {
+  readonly type: "invocation.retry";
+  readonly requestId: string;
+  readonly executionId: string;
+  readonly expectedVersion: number;
+}
+
 export interface AgentToolConfirmFrame {
   readonly type: "agent.tool.confirm";
   readonly requestId: string;
@@ -459,6 +488,8 @@ export type ClientFrame =
   | AgentInvokeFrame
   | AgentInterruptFrame
   | AgentRetryFrame
+  | InvocationCancelFrame
+  | InvocationRetryFrame
   | AgentToolConfirmFrame
   | AgentCompensateFrame
   | OpenItemCreateFrame
@@ -650,6 +681,29 @@ export interface AgentExecutionPreviewFrame {
   readonly authoritative: false;
 }
 
+export interface AgentExecutionPreviewResetFrame {
+  readonly type: "agent.execution.preview.reset";
+  readonly roomId: string;
+  readonly executionId: string;
+  readonly attemptSeq: number;
+  readonly reason: "human_cancelled" | "message_recalled" | "runtime_shutdown" | "repair" | "reconnect" |
+    "execution_terminal" | "attempt_rolled_over" | "access_revoked";
+  readonly authoritative: false;
+}
+
+export interface InvocationCancelAckFrame {
+  readonly type: "invocation.cancel.ack";
+  readonly requestId: string;
+  readonly receipt: ScopedCancellationReceipt;
+}
+
+export interface InvocationRetryAckFrame {
+  readonly type: "invocation.retry.ack";
+  readonly requestId: string;
+  readonly receipt: AgentExecutionRetryReceipt;
+  readonly replayed: boolean;
+}
+
 export interface OpenItemAckFrame {
   readonly type: "open-item.ack";
   readonly requestId: string;
@@ -809,6 +863,13 @@ export type ProtocolErrorCode =
   | "agent_runtime_closed"
   | "execution_conflict"
   | "execution_not_found"
+  | "context_forbidden"
+  | "context_generation_conflict"
+  | "context_snapshot_conflict"
+  | "context_snapshot_invalidated"
+  | "context_source_gone"
+  | "context_capacity_limited"
+  | "context_storage_unavailable"
   | "light_task_not_found"
   | "open_item_not_found"
   | "invalid_parameters"
@@ -880,6 +941,9 @@ export type ServerFrame =
   | RoomSubscribeV2RetryFrame
   | AgentExecutionAckFrame
   | AgentExecutionPreviewFrame
+  | AgentExecutionPreviewResetFrame
+  | InvocationCancelAckFrame
+  | InvocationRetryAckFrame
   | OpenItemAckFrame
   | LightTaskAckFrame
   | BallQueryResultFrame
@@ -1643,6 +1707,58 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
         return { ok: false, error: protocolError("agent.retry requires executionId", requestId) };
       }
       return { ok: true, frame: { type: "agent.retry", requestId, executionId: value.executionId } };
+    case "invocation.cancel":
+      if (requestId === undefined || !isPositiveSafeInteger(value.expectedVersion)) {
+        return {
+          ok: false,
+          error: protocolError(
+            "invocation.cancel requires exactly one of executionId or intentId and positive expectedVersion",
+            requestId,
+          ),
+        };
+      }
+      if (hasOnlyFields(value, INVOCATION_CONTROL_FIELDS) &&
+          isBoundedString(value.executionId, PROTOCOL_FIELD_LIMITS.messageId)) {
+        return { ok: true, frame: {
+          type: "invocation.cancel", requestId, executionId: value.executionId,
+          expectedVersion: value.expectedVersion,
+        } };
+      }
+      if (hasOnlyFields(value, INVOCATION_CANCEL_INTENT_FIELDS) &&
+          isBoundedString(value.intentId, PROTOCOL_FIELD_LIMITS.messageId)) {
+        return { ok: true, frame: {
+          type: "invocation.cancel", requestId, intentId: value.intentId,
+          expectedVersion: value.expectedVersion,
+        } };
+      }
+      return {
+        ok: false,
+        error: protocolError(
+          "invocation.cancel requires exactly one of executionId or intentId and positive expectedVersion",
+          requestId,
+        ),
+      };
+    case "invocation.retry":
+      if (!hasOnlyFields(value, INVOCATION_CONTROL_FIELDS) || requestId === undefined ||
+          !isBoundedString(value.executionId, PROTOCOL_FIELD_LIMITS.messageId) ||
+          !isPositiveSafeInteger(value.expectedVersion)) {
+        return {
+          ok: false,
+          error: protocolError(
+            "invocation.retry requires executionId and positive expectedVersion",
+            requestId,
+          ),
+        };
+      }
+      return {
+        ok: true,
+        frame: {
+          type: "invocation.retry",
+          requestId,
+          executionId: value.executionId,
+          expectedVersion: value.expectedVersion,
+        },
+      };
     case "agent.compensate":
       if (!hasOnlyFields(value, AGENT_CONTROL_FIELDS) || requestId === undefined ||
           !isBoundedString(value.executionId, PROTOCOL_FIELD_LIMITS.messageId)) {

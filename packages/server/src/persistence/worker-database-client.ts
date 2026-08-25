@@ -110,7 +110,7 @@ export interface CreateWorkerDatabaseClientOptions {
 }
 
 export interface AuthoritySchemaInspection {
-  readonly version: 21;
+  readonly version: 22;
 }
 
 export interface WorkerDatabaseClient {
@@ -299,12 +299,25 @@ export interface WorkerDatabaseClient {
   close(): Promise<void>;
 }
 
-export type CompleteWorkerDatabaseClient = WorkerDatabaseClient &
-  MessageAuthorityWorkerDatabaseClient & ContextAuthorityWorkerDatabaseClient;
-
 export interface ContextAuthorityWorkerDatabaseClient {
   executeContext(operation: ContextWorkerOperation): Promise<unknown>;
 }
+
+export interface RuntimeDeliveryBarrierWorkerDatabaseClient {
+  /**
+   * Runs the authority read and a synchronous local delivery continuation in
+   * one client FIFO slot. Later AuthorityWorker mutations cannot commit until
+   * the continuation returns.
+   */
+  executeRuntimeWithSynchronousDelivery(
+    operation: Extract<RuntimeAuthorityOperation, { readonly type: "runtime.preview-authorize" }>,
+    deliver: (result: unknown) => undefined,
+  ): Promise<unknown>;
+}
+
+export type CompleteWorkerDatabaseClient = WorkerDatabaseClient &
+  MessageAuthorityWorkerDatabaseClient & ContextAuthorityWorkerDatabaseClient &
+  RuntimeDeliveryBarrierWorkerDatabaseClient;
 
 export interface AuthorityWorkerTransport {
   postMessage(message: AuthorityWorkerRequest): void;
@@ -883,6 +896,8 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
   #terminalError: AuthorityWorkerClientError | undefined;
   #closedError: AuthorityWorkerClientError | undefined;
   #closePromise: Promise<void> | undefined;
+  #authorityGateTail: Promise<void> | undefined;
+  readonly #authorityInFlight = new Set<Promise<AuthorityWorkerResponse>>();
 
   constructor(worker: AuthorityWorkerTransport, releaseCoordinator: () => void) {
     this.#worker = worker;
@@ -1433,6 +1448,31 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
     });
   }
 
+  executeRuntimeWithSynchronousDelivery(
+    operation: Extract<RuntimeAuthorityOperation, { readonly type: "runtime.preview-authorize" }>,
+    deliver: (result: unknown) => undefined,
+  ): Promise<unknown> {
+    if (this.#terminalError !== undefined) return this.#rejectTerminal();
+    const unavailable = this.#unavailableError();
+    if (unavailable !== undefined) return Promise.reject(unavailable);
+    return this.#enqueueAuthorityGate(async () => {
+      await Promise.all([...this.#authorityInFlight].map(async (pending) => {
+        try { await pending; } catch { /* the barrier rechecks terminal state below */ }
+      }));
+      const response = await this.#trackAuthorityRequest(
+        this.#sendUnsequenced({ type: "authority.runtime", operation }),
+      );
+      if (response.type !== "authority.runtime-result") {
+        this.#failProtocol("Authority worker returned the wrong runtime delivery response");
+        throw this.#terminalError;
+      }
+      if (deliver(response.result) !== undefined) {
+        throw new TypeError("Runtime delivery continuation must be synchronous");
+      }
+      return response.result;
+    });
+  }
+
   executeTenantAdministration(
     operation: TenantAdministrationOperation,
   ): Promise<TenantAdministrationResult> {
@@ -1908,6 +1948,36 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
   }
 
   #send(command: AuthorityWorkerCommand): Promise<AuthorityWorkerResponse> {
+    if (this.#authorityGateTail === undefined) {
+      return this.#trackAuthorityRequest(this.#sendUnsequenced(command));
+    }
+    let response: Promise<AuthorityWorkerResponse> | undefined;
+    const posted = this.#enqueueAuthorityGate(async () => {
+      response = this.#trackAuthorityRequest(this.#sendUnsequenced(command));
+    });
+    return posted.then(() => response!);
+  }
+
+  #enqueueAuthorityGate<Result>(operation: () => Promise<Result>): Promise<Result> {
+    const prior = this.#authorityGateTail ?? Promise.resolve();
+    const scheduled = prior.then(operation, operation);
+    const settled = scheduled.then(() => undefined, () => undefined);
+    this.#authorityGateTail = settled;
+    settled.then(() => {
+      if (this.#authorityGateTail === settled) this.#authorityGateTail = undefined;
+    }, () => undefined);
+    return scheduled;
+  }
+
+  #trackAuthorityRequest(
+    request: Promise<AuthorityWorkerResponse>,
+  ): Promise<AuthorityWorkerResponse> {
+    const tracked = request.finally(() => this.#authorityInFlight.delete(tracked));
+    this.#authorityInFlight.add(tracked);
+    return tracked;
+  }
+
+  #sendUnsequenced(command: AuthorityWorkerCommand): Promise<AuthorityWorkerResponse> {
     if (this.#terminalError !== undefined) {
       return this.#rejectTerminal();
     }

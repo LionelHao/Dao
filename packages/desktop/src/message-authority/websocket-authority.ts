@@ -26,6 +26,8 @@ import {
   cloneMessageAcceptedResult,
   cloneMessageRecallAcceptedResult,
   cloneMessageRevisionAcceptedResult,
+  type AgentExecutionPreviewInput,
+  type AgentExecutionPreviewResetInput,
   type MessageAcceptedResult,
   type MessageHistoryV2Command,
   type MessageRecallAcceptedResult,
@@ -98,6 +100,9 @@ export interface MessageAuthorityWireTransport {
     cursor: RoomCursor,
     observer: RoomSubscriptionObserver,
   ): Promise<RoomSubscription>;
+  onAgentPreview(listener: (
+    input: AgentExecutionPreviewInput | AgentExecutionPreviewResetInput,
+  ) => void): () => void;
   onTerminalRevoked(listener: () => void): () => void;
   onRoomAccessChanged(listener: (
     roomId: string,
@@ -191,6 +196,8 @@ type ParsedFrame =
       restartFrom: { readonly version: 1; readonly roomId: string; readonly afterSeq: number };
     }>
   | Readonly<{ type: "room.event"; event: DesktopRoomEvent }>
+  | AgentExecutionPreviewInput
+  | AgentExecutionPreviewResetInput
   | Readonly<{ type: "auth.session-revoked"; eventId: string }>
   | Readonly<{
       type: "identity.room-access.changed";
@@ -346,6 +353,26 @@ export function parseMessageAuthorityServerFrame(raw: string): ParsedFrame | und
       return exact(value, ["type", "event"]) && isDesktopRoomEvent(value.event)
         ? { type: value.type, event: structuredClone(value.event) }
         : undefined;
+    case "agent.execution.preview":
+      return exact(value, [
+        "type", "roomId", "executionId", "attemptSeq", "streamSeq", "delta", "authoritative",
+      ]) && text(value.roomId, 256) && text(value.executionId, 256) &&
+        count(value.attemptSeq) && value.attemptSeq > 0 && count(value.streamSeq) &&
+        value.streamSeq > 0 && text(value.delta, 64 * 1_024) && value.authoritative === false
+        ? structuredClone(value) as AgentExecutionPreviewInput
+        : undefined;
+    case "agent.execution.preview.reset":
+      return exact(value, [
+        "type", "roomId", "executionId", "attemptSeq", "reason", "authoritative",
+      ]) && text(value.roomId, 256) && text(value.executionId, 256) &&
+        count(value.attemptSeq) && value.attemptSeq > 0 &&
+        (value.reason === "human_cancelled" || value.reason === "message_recalled" ||
+          value.reason === "runtime_shutdown" || value.reason === "repair" ||
+          value.reason === "reconnect" || value.reason === "execution_terminal" ||
+          value.reason === "attempt_rolled_over" || value.reason === "access_revoked") &&
+        value.authoritative === false
+        ? structuredClone(value) as AgentExecutionPreviewResetInput
+        : undefined;
     case "auth.session-revoked":
       return exact(value, ["type", "eventId"]) && text(value.eventId)
         ? { type: value.type, eventId: value.eventId }
@@ -443,6 +470,9 @@ export function createMessageAuthorityWebSocketTransport(options: {
     roomId: string,
     change: "joined" | "updated" | "removed" | "archived",
   ) => void>();
+  const previewListeners = new Set<(
+    input: AgentExecutionPreviewInput | AgentExecutionPreviewResetInput,
+  ) => void>();
   const failureListeners = new Set<(error: MessageAuthorityTransportError) => void>();
 
   const rememberExpired = (requestId: string): void => {
@@ -536,6 +566,15 @@ export function createMessageAuthorityWebSocketTransport(options: {
         await live.observer.events([frame.event], cursor);
         live.cursor = cursor;
       });
+      return;
+    }
+    if (frame.type === "agent.execution.preview" ||
+        frame.type === "agent.execution.preview.reset") {
+      const live = subscriptions.get(frame.roomId);
+      if (live === undefined || live.closed) return;
+      for (const listener of [...previewListeners]) {
+        try { listener(structuredClone(frame)); } catch { /* observer failure is isolated */ }
+      }
       return;
     }
     if (frame.type === "room.sync.result") {
@@ -833,6 +872,10 @@ export function createMessageAuthorityWebSocketTransport(options: {
       terminalListeners.add(listener);
       return () => terminalListeners.delete(listener);
     },
+    onAgentPreview(listener) {
+      previewListeners.add(listener);
+      return () => previewListeners.delete(listener);
+    },
     onRoomAccessChanged(listener) {
       roomAccessListeners.add(listener);
       return () => roomAccessListeners.delete(listener);
@@ -857,6 +900,7 @@ export function createMessageAuthorityWebSocketTransport(options: {
       closeSubscriptions();
       terminalListeners.clear();
       roomAccessListeners.clear();
+      previewListeners.clear();
       failureListeners.clear();
       disposeSocket(1000, "client closed");
     },

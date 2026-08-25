@@ -3,34 +3,43 @@ import {
   isBallInCourt,
   isBlueprintBallFact,
   isAgentExecution,
+  isAgentExecutionAttempt,
+  isAgentExecutionRetryReceipt,
   isAgentJudgement,
+  isAgentInvocationIntent,
   isCalibrationSignal,
   isHumanReadReceipt,
-  isHumanPreemptionNotice,
+  isInvocationCancelCommand,
+  isInvocationRetryCommand,
+  isLegacyAgentExecution,
+  isLegacyHumanPreemptionNotice,
   isLightTask,
   isOpenItem,
   isOpenItemAgentFailure,
+  isProjectBoundaryInvocationResult,
+  isProjectBoundaryInvocationRequest,
   isRouteJob,
   isRouteJudgment,
   isRouterProviderInput,
   isRouterPlan,
   isSocialReaction,
+  isScopedCancellationReceipt,
   projectBallsInCourt,
 } from "./collaboration.js";
 
 describe("canonical collaboration records", () => {
-  it("keeps human preemption and replacement lineage closed and separate from failure", () => {
-    expect(isHumanPreemptionNotice({
+  it("keeps room-wide preemption and queued execution decoders explicitly legacy", () => {
+    expect(isLegacyHumanPreemptionNotice({
       roomId: "room-1", sourceHumanMessageId: "message-human-1",
       cancelledExecutionIds: ["execution-old-1", "execution-old-2"],
       rerouteStatus: "queued", occurredAt: "2026-08-17T00:00:01.000Z",
     })).toBe(true);
-    expect(isHumanPreemptionNotice({
+    expect(isLegacyHumanPreemptionNotice({
       roomId: "room-1", sourceHumanMessageId: "message-human-1",
       cancelledExecutionIds: ["execution-old-1", "execution-old-1"],
       rerouteStatus: "queued", occurredAt: "2026-08-17T00:00:01.000Z",
     })).toBe(false);
-    expect(isHumanPreemptionNotice({
+    expect(isLegacyHumanPreemptionNotice({
       roomId: "room-1", sourceHumanMessageId: "message-human-1",
       cancelledExecutionIds: [], rerouteStatus: "queued",
       occurredAt: "2026-08-17T00:00:01.000Z", humanWithdrawn: true,
@@ -43,10 +52,146 @@ describe("canonical collaboration records", () => {
       queuedAt: "2026-08-17T00:00:02.000Z", updatedAt: "2026-08-17T00:00:02.000Z",
       supersedesExecutionIds: ["execution-old-1"],
     } as const;
-    expect(isAgentExecution(replacement)).toBe(true);
-    expect(isAgentExecution({ ...replacement, supersedesExecutionIds: [] })).toBe(false);
-    expect(isAgentExecution({
+    expect(isLegacyAgentExecution(replacement)).toBe(true);
+    expect(isAgentExecution(replacement)).toBe(false);
+    expect(isLegacyAgentExecution({ ...replacement, supersedesExecutionIds: [] })).toBe(false);
+    expect(isLegacyAgentExecution({
       ...replacement, supersedesExecutionIds: ["execution-old-1", "execution-old-1"],
+    })).toBe(false);
+  });
+
+  it("closes the canonical invocation, execution, and attempt lineage", () => {
+    const intent = {
+      intentId: "intent-1", lineageId: "lineage-1", turnId: "turn-1", roomId: "room-1",
+      sourceMessageId: "message-1", sourceRevision: 2, targetId: "target-1", agentId: "agent-1",
+      origin: { kind: "message_target", messageTransactionId: "transaction-1", targetId: "target-1" },
+      profileRevision: 4, assignmentRevision: 7, accessRevision: 9,
+      status: "pending", createdAt: "2026-08-25T00:00:00.000Z",
+    } as const;
+    expect(isAgentInvocationIntent(intent)).toBe(true);
+    expect(isAgentInvocationIntent({ ...intent, kind: "direct_mention" })).toBe(false);
+    expect(isAgentInvocationIntent({
+      ...intent, origin: { ...intent.origin, targetId: "target-other" },
+    })).toBe(false);
+    expect(isAgentInvocationIntent({
+      ...intent, status: "claimed", claimedAt: "2026-08-25T00:00:01.000Z",
+    })).toBe(true);
+    expect(isAgentInvocationIntent({
+      ...intent, status: "cancelled", cancelledAt: "2026-08-25T00:00:01.000Z",
+      cancellationReason: "message_recalled",
+    })).toBe(true);
+
+    const execution = {
+      executionId: "execution-1", intentId: intent.intentId, lineageId: intent.lineageId,
+      executionOrdinal: 1, roomId: intent.roomId, agentId: intent.agentId,
+      snapshotId: "snapshot-1", providerId: "provider-1", modelId: "model-1",
+      status: "accepted", phase: "queued", currentAttemptSeq: 1, version: 1,
+      queuedAt: "2026-08-25T00:00:01.000Z", updatedAt: "2026-08-25T00:00:01.000Z",
+    } as const;
+    expect(isAgentExecution(execution)).toBe(true);
+    expect(isAgentExecution({ ...execution, status: "queued" })).toBe(false);
+    expect(isAgentExecution({ ...execution, phase: "waiting_confirmation" })).toBe(false);
+    expect(isAgentExecution({
+      ...execution, status: "running", phase: "waiting_confirmation",
+      startedAt: "2026-08-25T00:00:02.000Z",
+    })).toBe(true);
+    expect(isAgentExecution({
+      ...execution, status: "failed", phase: "failed",
+      startedAt: "2026-08-25T00:00:02.000Z", completedAt: "2026-08-25T00:00:03.000Z",
+      terminalErrorCode: "provider_timeout", reviewState: "not_required",
+    })).toBe(true);
+
+    const attempt = {
+      executionId: execution.executionId, intentId: intent.intentId, lineageId: intent.lineageId,
+      roomId: intent.roomId, agentId: intent.agentId,
+      attemptSeq: 1, snapshotId: execution.snapshotId, providerId: execution.providerId,
+      modelId: execution.modelId, status: "running", phase: "model_generation", executionVersion: 2,
+      startedAt: "2026-08-25T00:00:02.000Z", updatedAt: "2026-08-25T00:00:02.000Z",
+    } as const;
+    expect(isAgentExecutionAttempt(attempt)).toBe(true);
+    expect(isAgentExecutionAttempt({ ...attempt, snapshotId: "" })).toBe(false);
+    expect(isAgentExecutionAttempt({ ...attempt, status: "accepted", phase: "model_generation" })).toBe(false);
+  });
+
+  it("keeps retry and scoped cancellation receipts closed", () => {
+    const retry = {
+      requestId: "request-retry-1", sourceExecutionId: "execution-1", executionId: "execution-2",
+      intentId: "intent-1", lineageId: "lineage-1", roomId: "room-1", executionOrdinal: 2,
+      snapshotId: "snapshot-1", status: "accepted", createdAt: "2026-08-25T00:00:04.000Z",
+    } as const;
+    expect(isAgentExecutionRetryReceipt(retry)).toBe(true);
+    expect(isAgentExecutionRetryReceipt({ ...retry, executionId: retry.sourceExecutionId })).toBe(false);
+    expect(isAgentExecutionRetryReceipt({ ...retry, status: "queued" })).toBe(false);
+
+    const cancellation = {
+      requestId: "request-cancel-1", fenceId: "fence-1", roomId: "room-1", lineageId: "lineage-1",
+      scope: { kind: "execution", executionId: "execution-1", expectedVersion: 3 },
+      reason: "human_cancelled",
+      intentOutcomes: [{ intentId: "intent-1", outcome: "already_claimed" }],
+      executionOutcomes: [{ executionId: "execution-1", outcome: "cancelled", version: 4 }],
+      rejectedConfirmationIds: ["confirmation-1"], revokedGrantIds: ["grant-1"],
+      preservedDispatchIds: [], committedAt: "2026-08-25T00:00:05.000Z",
+    } as const;
+    expect(isScopedCancellationReceipt(cancellation)).toBe(true);
+    expect(isScopedCancellationReceipt({
+      ...cancellation, executionOutcomes: [...cancellation.executionOutcomes, cancellation.executionOutcomes[0]],
+    })).toBe(false);
+    expect(isScopedCancellationReceipt({ ...cancellation, reason: "because I said so" })).toBe(false);
+    expect(isScopedCancellationReceipt({
+      ...cancellation, scope: { kind: "execution", executionId: "execution-other", expectedVersion: 3 },
+    })).toBe(false);
+  });
+
+  it("keeps public controls narrow and the project-boundary seam fail closed", () => {
+    expect(isInvocationCancelCommand({
+      type: "invocation.cancel", requestId: "request-1", executionId: "execution-1", expectedVersion: 3,
+    })).toBe(true);
+    expect(isInvocationCancelCommand({
+      type: "invocation.cancel", requestId: "request-intent", intentId: "intent-pending", expectedVersion: 1,
+    })).toBe(true);
+    expect(isInvocationCancelCommand({
+      type: "invocation.cancel", requestId: "request-both", executionId: "execution-1",
+      intentId: "intent-1", expectedVersion: 3,
+    })).toBe(false);
+    expect(isInvocationCancelCommand({
+      type: "invocation.cancel", requestId: "request-1", executionId: "execution-1", expectedVersion: 3,
+      reason: "free text",
+    })).toBe(false);
+    expect(isInvocationRetryCommand({
+      type: "invocation.retry", requestId: "request-2", executionId: "execution-1", expectedVersion: 3,
+    })).toBe(true);
+    expect(isInvocationRetryCommand({
+      type: "invocation.retry", requestId: "request-2", executionId: "execution-1", expectedVersion: 3,
+      snapshotId: "snapshot-client-selected",
+    })).toBe(false);
+
+    expect(isProjectBoundaryInvocationRequest({
+      purpose: "project_boundary_invocation", boundaryId: "boundary-1", boundaryKind: "due",
+      projectId: "room-1", roomId: "room-1", agentId: "agent-1",
+      sourceFactId: "next-action-1", sourceFactRevision: 2,
+    })).toBe(true);
+    expect(isProjectBoundaryInvocationRequest({
+      purpose: "project_boundary_invocation", boundaryId: "boundary-1", boundaryKind: "due",
+      projectId: "room-1", roomId: "room-1", agentId: "agent-1",
+      sourceFactId: "next-action-1", sourceFactRevision: 2, providerId: "client-selected",
+    })).toBe(false);
+    expect(isProjectBoundaryInvocationRequest({
+      purpose: "project_boundary_invocation", boundaryId: "boundary-1", boundaryKind: "due",
+      projectId: "project-other", roomId: "room-1", agentId: "agent-1",
+      sourceFactId: "next-action-1", sourceFactRevision: 2,
+    })).toBe(false);
+
+    expect(isProjectBoundaryInvocationResult({
+      boundaryId: "boundary-1", roomId: "room-1", status: "suppressed",
+      reason: "dependency_unavailable", decidedAt: "2026-08-25T00:00:00.000Z",
+    })).toBe(true);
+    expect(isProjectBoundaryInvocationResult({
+      boundaryId: "boundary-1", roomId: "room-1", status: "intent-created",
+      intentId: "intent-1", consumedAt: "2026-08-25T00:00:00.000Z",
+    })).toBe(true);
+    expect(isProjectBoundaryInvocationResult({
+      boundaryId: "boundary-1", roomId: "room-1", status: "intent-created",
+      intentId: "intent-1", consumedAt: "2026-08-25T00:00:00.000Z", providerCalled: true,
     })).toBe(false);
   });
 
@@ -310,7 +455,7 @@ describe("canonical collaboration records", () => {
       reasonCode: "provider_timeout",
       failedAt: "2026-08-10T00:03:00.000Z",
     })).toBe(false);
-    expect(isAgentExecution({
+    expect(isLegacyAgentExecution({
       id: "execution-1",
       roomId: "room-1",
       sourceMessageId: "message-1",
@@ -328,9 +473,9 @@ describe("canonical collaboration records", () => {
       startedAt: "2026-08-10T00:00:01.000Z",
       updatedAt: "2026-08-10T00:01:00.000Z",
       completedAt: "2026-08-10T00:01:00.000Z",
-      cancellationReason: "requested_by_human",
+      cancellationReason: "human_cancelled",
     })).toBe(true);
-    expect(isAgentExecution({
+    expect(isLegacyAgentExecution({
       id: "execution-1",
       roomId: "room-1",
       sourceMessageId: "message-1",
@@ -348,7 +493,7 @@ describe("canonical collaboration records", () => {
       updatedAt: "2026-08-10T00:00:00.000Z",
       result: undefined,
     })).toBe(false);
-    expect(isAgentExecution({
+    expect(isLegacyAgentExecution({
       id: "execution-legacy-interrupted",
       roomId: "room-1",
       sourceMessageId: "message-1",

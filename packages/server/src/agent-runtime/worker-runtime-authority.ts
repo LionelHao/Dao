@@ -1,11 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
-  isAgentExecution,
+  isLegacyAgentExecution as isAgentExecution,
   isRoomMemoryProjection,
   isRoomMemoryRawDeltaPage,
   isRoomMemoryStatus,
-  type AgentExecution,
-  type AgentInvocationIntent,
+  isAgentExecutionRetryReceipt,
+  isScopedCancellationReceipt,
+  type LegacyAgentExecution as AgentExecution,
+  type LegacyAgentInvocationIntent as AgentInvocationIntent,
 } from "@native-im/core";
 import type { AuthenticatedCommandContext, InternalAgentCommandContext } from "../persistence/contracts.js";
 import { toAgentWorkerCommandContext } from "../persistence/contracts.js";
@@ -14,12 +16,14 @@ import {
   type WorkerDatabaseClient,
 } from "../persistence/worker-database-client.js";
 import type { ContextAuthorityWorkerDatabaseClient } from "../persistence/worker-database-client.js";
+import type { ScopedCancellationCommitReceipt } from "../scoped-cancellation/scoped-cancellation-orchestrator.js";
 import { canonicalJsonV1 } from "../context-compiler/canonical-json.js";
 import {
   AgentRuntimeError,
   type AgentRuntimeErrorCode,
   type InvocationAcceptedWithIntent,
   type RuntimeAuthority,
+  type RuntimeRecoveryAuthority,
 } from "./contracts.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -74,7 +78,14 @@ function invocationIntent(value: unknown): value is AgentInvocationIntent {
     typeof value.targetAgentId === "string";
 }
 
-function invocationResult(value: unknown): InvocationAcceptedWithIntent {
+function invocationResult(
+  value: unknown,
+  expectedRetry?: Readonly<{
+    requestId: string;
+    sourceExecutionId: string;
+    receiptRequired: boolean;
+  }>,
+): InvocationAcceptedWithIntent {
   if (!record(value) || value.kind !== "invocation" || typeof value.replayed !== "boolean" ||
       !isAgentExecution(value.execution) || !invocationIntent(value.intent) ||
       value.intent.roomId !== value.execution.roomId ||
@@ -82,7 +93,37 @@ function invocationResult(value: unknown): InvocationAcceptedWithIntent {
       value.intent.targetAgentId !== value.execution.agentId) {
     throw new AgentRuntimeError("provider_failure", "Authority invocation result was malformed");
   }
-  return { execution: value.execution, intent: value.intent, replayed: value.replayed };
+  if (value.retryReceipt !== undefined && !isAgentExecutionRetryReceipt(value.retryReceipt)) {
+    throw new AgentRuntimeError("provider_failure", "Authority retry receipt was malformed");
+  }
+  if (expectedRetry !== undefined &&
+      ((expectedRetry.receiptRequired && value.retryReceipt === undefined) ||
+       (value.retryReceipt !== undefined &&
+        (value.retryReceipt.requestId !== expectedRetry.requestId ||
+         value.retryReceipt.sourceExecutionId !== expectedRetry.sourceExecutionId ||
+         value.retryReceipt.executionId !== value.execution.id ||
+         value.retryReceipt.roomId !== value.execution.roomId ||
+         value.retryReceipt.createdAt !== value.execution.queuedAt ||
+         value.execution.manualRetryOfExecutionId !== expectedRetry.sourceExecutionId)))) {
+    throw new AgentRuntimeError("provider_failure", "Authority retry receipt binding was malformed");
+  }
+  return {
+    execution: value.execution,
+    intent: value.intent,
+    replayed: value.replayed,
+    ...(value.retryReceipt === undefined ? {} : { retryReceipt: value.retryReceipt }),
+  };
+}
+
+function retryReceiptBindingResult(
+  value: unknown,
+  expected: NonNullable<InvocationAcceptedWithIntent["retryReceipt"]>,
+): void {
+  if (!record(value) || value.kind !== "retry-receipt-binding" ||
+      !isAgentExecutionRetryReceipt(value.receipt) ||
+      canonicalJsonV1(value.receipt) !== canonicalJsonV1(expected)) {
+    throw new AgentRuntimeError("provider_failure", "Authority retry receipt binding was malformed");
+  }
 }
 
 function fenceReplacementResult(
@@ -94,6 +135,33 @@ function fenceReplacementResult(
     throw new AgentRuntimeError("provider_failure", "Authority fence replacement result was malformed");
   }
   return { executions: value.executions, replayed: value.replayed };
+}
+
+function scopedCancellationResult(value: unknown): ScopedCancellationCommitReceipt {
+  if (!record(value) || value.kind !== "scoped-cancellation-committed" ||
+      typeof value.fenceId !== "string" || typeof value.roomId !== "string" ||
+      typeof value.producerId !== "string" || value.reason !== "human_cancelled" ||
+      typeof value.replayed !== "boolean" || !isScopedCancellationReceipt(value.receipt) ||
+      value.receipt.fenceId !== value.fenceId || value.receipt.roomId !== value.roomId ||
+      value.receipt.requestId !== value.producerId || !Array.isArray(value.effects) ||
+      !value.effects.every((effect) => record(effect) &&
+        typeof effect.sourceMessageId === "string" &&
+        typeof effect.sourceRevision === "number" &&
+        typeof effect.invocationIntentId === "string" &&
+        ((effect.disposition === "intent_cancelled" && effect.executionId === undefined &&
+          effect.attemptSeq === undefined) ||
+         ((effect.disposition === "execution_cancelled" || effect.disposition === "already_terminal") &&
+          typeof effect.executionId === "string" && typeof effect.attemptSeq === "number")) &&
+        (effect.confirmationDisposition === "none" ||
+          effect.confirmationDisposition === "pending_rejected" ||
+          effect.confirmationDisposition === "confirmed_retained") &&
+        (effect.grantDisposition === "none" || effect.grantDisposition === "unclaimed_revoked" ||
+          effect.grantDisposition === "claimed_retained") &&
+        (effect.sideEffectState === "none" || effect.sideEffectState === "dispatched-retained" ||
+          effect.sideEffectState === "outcome-unknown-retained"))) {
+    throw new AgentRuntimeError("provider_failure", "Authority cancellation receipt was malformed");
+  }
+  return value as unknown as ScopedCancellationCommitReceipt;
 }
 
 function preparedToolResult(value: unknown): ReturnType<RuntimeAuthority["prepareTool"]> extends Promise<infer Result> ? Result : never {
@@ -305,6 +373,14 @@ export function createWorkerRuntimeAuthority(
         now: Date.now(),
       })));
     },
+    async shutdown(executionId, attemptSeq) {
+      return remember(executionResult(await execute({
+        type: "runtime.shutdown",
+        executionId,
+        attemptSeq,
+        now: Date.now(),
+      })));
+    },
     async interrupt(context: AuthenticatedCommandContext, executionId, reason) {
       return executionResult(await execute({
         type: "runtime.interrupt",
@@ -314,15 +390,36 @@ export function createWorkerRuntimeAuthority(
         now: Date.now(),
       }));
     },
-    async retry(context: AuthenticatedCommandContext, executionId) {
+    async cancelScoped(context, target, producerId) {
+      return scopedCancellationResult(await execute({
+        type: "runtime.cancel-scoped",
+        context,
+        target,
+        producerId,
+        now: Date.now(),
+      }));
+    },
+    async retry(context: AuthenticatedCommandContext, executionId, expectedVersion) {
       const result = invocationResult(await execute({
         type: "runtime.manual-retry",
         context,
         executionId,
         newExecutionId: `execution-${randomUUID()}`,
         newIntentId: `intent-${randomUUID()}`,
+        ...(expectedVersion === undefined ? {} : { expectedVersion }),
         now: Date.now(),
-      }));
+      }), {
+        requestId: context.requestId,
+        sourceExecutionId: executionId,
+        receiptRequired: expectedVersion !== undefined,
+      });
+      if (expectedVersion !== undefined && result.retryReceipt !== undefined) {
+        retryReceiptBindingResult(await execute({
+          type: "runtime.validate-retry-receipt",
+          receipt: result.retryReceipt,
+          now: Date.now(),
+        }), result.retryReceipt);
+      }
       remember(result.execution);
       return result;
     },
@@ -488,6 +585,95 @@ export function createWorkerRuntimeAuthority(
     },
   };
   return Object.freeze(authority);
+}
+
+/**
+ * Production durable recovery adapter. A process's first complete generation
+ * also fences stale running attempts left by a crash. Later generations are
+ * deliberately queued-only so a post-commit rescan can be triggered at any
+ * time without treating this process's live attempts as crashed.
+ */
+export function createWorkerRuntimeRecoveryAuthority(
+  worker: WorkerDatabaseClient,
+): RuntimeRecoveryAuthority {
+  const leaseOwner = `invocation-runtime:${randomUUID()}`;
+  const leaseDurationMs = 5 * 60_000;
+  let completedGenerations = 0;
+  let includeRunningForGeneration = true;
+  const execute = async (
+    operation: Parameters<WorkerDatabaseClient["executeRuntime"]>[0],
+  ): Promise<unknown> => {
+    try {
+      return await worker.executeRuntime(operation);
+    } catch (error: unknown) {
+      throw mappedError(error);
+    }
+  };
+  const recoveryAuthority: RuntimeRecoveryAuthority = {
+    async scan({ after, limit }) {
+      if (after === undefined) {
+        includeRunningForGeneration = completedGenerations === 0;
+      }
+      const now = Date.now();
+      const result = await execute({
+        type: "runtime.recovery-scan",
+        ...(after === undefined ? {} : { after }),
+        limit,
+        includeRunning: includeRunningForGeneration,
+        leaseOwner,
+        leaseExpiresAt: new Date(now + leaseDurationMs).toISOString(),
+        now,
+      });
+      if (!record(result) || result.kind !== "recovery-page" ||
+          typeof result.hasMore !== "boolean" || !Array.isArray(result.candidates) ||
+          !result.candidates.every((candidate) => record(candidate) &&
+            typeof candidate.cursor === "string" && candidate.cursor.length > 0 &&
+            Object.hasOwn(candidate, "record"))) {
+        throw new AgentRuntimeError("provider_failure", "Authority recovery page was malformed");
+      }
+      if (result.candidates.length === 0) completedGenerations += 1;
+      return result as Awaited<ReturnType<RuntimeRecoveryAuthority["scan"]>>;
+    },
+    async isolate({ cursor, candidateId, reason }) {
+      const result = await execute({
+        type: "runtime.recovery-isolate",
+        cursor,
+        ...(candidateId === undefined ? {} : { candidateId }),
+        leaseOwner,
+        reason,
+        now: Date.now(),
+      });
+      if (!record(result) || result.kind !== "recovery-isolated") {
+        throw new AgentRuntimeError("provider_failure", "Authority recovery isolation was malformed");
+      }
+    },
+    async settle({ cursor, candidateId }) {
+      const result = await execute({
+        type: "runtime.recovery-settle",
+        cursor,
+        candidateId,
+        leaseOwner,
+        now: Date.now(),
+      });
+      if (!record(result) || result.kind !== "recovery-settled") {
+        throw new AgentRuntimeError("provider_failure", "Authority recovery settlement was malformed");
+      }
+    },
+    async release() {
+      const result = await execute({
+        type: "runtime.recovery-release",
+        leaseOwner,
+        now: Date.now(),
+      });
+      if (!record(result) || result.kind !== "recovery-released" ||
+          typeof result.released !== "number" || !Number.isSafeInteger(result.released) ||
+          result.released < 0) {
+        throw new AgentRuntimeError("provider_failure", "Authority recovery release was malformed");
+      }
+      return result.released;
+    },
+  };
+  return Object.freeze(recoveryAuthority);
 }
 
 export type WorkerRuntimeAuthorityContext = AuthenticatedCommandContext | InternalAgentCommandContext;

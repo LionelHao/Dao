@@ -467,6 +467,7 @@ export function mountMessageAuthorityBridgeSurface(
       if (replica.mode === "online") replica = markMessageAuthorityOfflineReadOnly(replica);
       state = replaceState(state, {
         connection,
+        previews: [],
         announcement: "当前离线；显示旧完整缓存，消息写入已禁用",
       });
     } else if (connection.status === "repairing") {
@@ -474,10 +475,12 @@ export function mountMessageAuthorityBridgeSurface(
         type: "repair.started",
         watermark: connection.watermark,
       });
+      state = replaceState(state, { previews: [] });
     } else if (connection.status === "repair-failed") {
       state = state.connection.status === "repairing"
         ? failRepairGeneration(state, connection.errorCode)
         : replaceState(state, { connection });
+      state = replaceState(state, { previews: [] });
     } else {
       replica = createMessageAuthorityReplica(roomId, {
         generation: replica.generation,
@@ -569,6 +572,25 @@ export function mountMessageAuthorityBridgeSurface(
     }
     if (input.type === "message.repair.completed") {
       applyRepair(input);
+      return;
+    }
+    if (input.type === "agent.execution.preview") {
+      if (input.roomId !== roomId || input.authoritative !== false) return;
+      state = applyMessageAuthorityInput(state, {
+        type: "agent.preview", executionId: input.executionId,
+        attemptSeq: input.attemptSeq, streamSeq: input.streamSeq,
+        delta: input.delta, authoritative: false,
+      });
+      render();
+      return;
+    }
+    if (input.type === "agent.execution.preview.reset") {
+      if (input.roomId !== roomId || input.authoritative !== false) return;
+      state = applyMessageAuthorityInput(state, {
+        type: "agent.preview.reset", executionId: input.executionId,
+        attemptSeq: input.attemptSeq,
+      });
+      render();
       return;
     }
     if (awaitingReceipt !== undefined) {
