@@ -45,6 +45,7 @@ const AUTHORITY_TABLES = [
   "agent_executions",
   "agent_fence_replacements",
   "agent_human_fences",
+  "agent_invocation_intent_runtime_states",
   "agent_invocation_intents",
   "agent_judgments",
   "agent_message_citations",
