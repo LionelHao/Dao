@@ -5544,6 +5544,13 @@ describe("SQLite authoritative sessions", () => {
       { ...message, body: `${message.body}!` },
     )).rejects.toMatchObject({ status: 409, code: "idempotency_conflict" });
 
+    const acceptedHeadDatabase = new DatabaseSync(databasePath, { readOnly: true });
+    const acceptedHead = acceptedHeadDatabase.prepare(
+      `SELECT head_seq AS headSeq FROM streams
+       WHERE stream_kind = 'room' AND stream_id = ?`,
+    ).get(message.roomId) as { readonly headSeq: number };
+    acceptedHeadDatabase.close();
+
     const revised = await fixture.store.reviseHumanMessage(
       { ...fixture.contexts.owner, requestId: "revision-first", idempotencyKey: "revision-v2-1" },
       {
@@ -5613,7 +5620,7 @@ describe("SQLite authoritative sessions", () => {
       cursor: {
         version: 1,
         roomId: message.roomId,
-        afterSeq: beforeMessageHead.headSeq + 1,
+        afterSeq: acceptedHead.headSeq,
       },
     });
     expect(revisedDelta).toMatchObject({
