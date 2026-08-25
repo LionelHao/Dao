@@ -1,4 +1,5 @@
 import {
+  isAgentExecutionRetryReceipt,
   isProjectBoundaryInvocationRequest,
   type LegacyAgentExecution as AgentExecution,
   type LegacyAgentInvocationIntent as AgentInvocationIntent,
@@ -125,6 +126,11 @@ export type RuntimeAuthorityOperation =
       readonly newExecutionId: string;
       readonly newIntentId: string;
       readonly expectedVersion?: number;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.validate-retry-receipt";
+      readonly receipt: AgentExecutionRetryReceipt;
       readonly now: number;
     }
   | {
@@ -288,6 +294,10 @@ export type RuntimeAuthorityOperationResult =
       readonly kind: "direct-intent-claims";
       readonly records: readonly RuntimeRecoveryRecord[];
       readonly hasMore: boolean;
+    }
+  | {
+      readonly kind: "retry-receipt-binding";
+      readonly receipt: AgentExecutionRetryReceipt;
     }
   | { readonly kind: "project-boundary"; readonly result: ProjectBoundaryInvocationResult }
   | { readonly kind: "execution"; readonly execution: AgentExecution }
@@ -524,6 +534,10 @@ export function isRuntimeAuthorityOperation(value: unknown): value is RuntimeAut
       humanContext(value.context) && text(value.executionId) && text(value.newExecutionId) &&
       text(value.newIntentId) && (!Object.hasOwn(value, "expectedVersion") ||
         count(value.expectedVersion, 1)) && count(value.now);
+  }
+  if (value.type === "runtime.validate-retry-receipt") {
+    return exact(value, ["type", "receipt", "now"]) &&
+      isAgentExecutionRetryReceipt(value.receipt) && count(value.now);
   }
   if (value.type === "runtime.cancel-scoped") {
     return exact(value, [

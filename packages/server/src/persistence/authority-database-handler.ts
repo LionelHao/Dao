@@ -8564,6 +8564,29 @@ export function executeRuntimeAuthorityOperation(
       return { kind: "execution", execution };
     }
 
+    if (operation.type === "runtime.validate-retry-receipt") {
+      const stored = database.prepare(
+        `SELECT response_json AS responseJson
+         FROM invocation_human_retry_receipts WHERE request_id = ?`,
+      ).get(operation.receipt.requestId);
+      if (typeof stored?.responseJson !== "string") {
+        return fail("context_storage_unavailable", "Human retry receipt was not durable");
+      }
+      let storedReceipt: unknown;
+      try {
+        const response = JSON.parse(stored.responseJson) as unknown;
+        storedReceipt = typeof response === "object" && response !== null &&
+          "retryReceipt" in response ? response.retryReceipt : undefined;
+      } catch {
+        return fail("context_storage_unavailable", "Human retry receipt JSON was corrupt");
+      }
+      if (!isAgentExecutionRetryReceipt(storedReceipt) ||
+          canonicalJson(storedReceipt) !== canonicalJson(operation.receipt)) {
+        return fail("context_storage_unavailable", "Human retry receipt binding changed");
+      }
+      return { kind: "retry-receipt-binding", receipt: storedReceipt };
+    }
+
     if (operation.type === "runtime.manual-retry") {
       const principalActorId = requireHumanSession(database, operation.context, operation.now);
       const old = runtimeExecutionById(database, operation.executionId);

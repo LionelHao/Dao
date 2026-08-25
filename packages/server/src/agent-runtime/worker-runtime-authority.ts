@@ -115,6 +115,17 @@ function invocationResult(
   };
 }
 
+function retryReceiptBindingResult(
+  value: unknown,
+  expected: NonNullable<InvocationAcceptedWithIntent["retryReceipt"]>,
+): void {
+  if (!record(value) || value.kind !== "retry-receipt-binding" ||
+      !isAgentExecutionRetryReceipt(value.receipt) ||
+      canonicalJsonV1(value.receipt) !== canonicalJsonV1(expected)) {
+    throw new AgentRuntimeError("provider_failure", "Authority retry receipt binding was malformed");
+  }
+}
+
 function fenceReplacementResult(
   value: unknown,
 ): Awaited<ReturnType<RuntimeAuthority["enqueueFenceReplacements"]>> {
@@ -402,6 +413,13 @@ export function createWorkerRuntimeAuthority(
         sourceExecutionId: executionId,
         receiptRequired: expectedVersion !== undefined,
       });
+      if (expectedVersion !== undefined && result.retryReceipt !== undefined) {
+        retryReceiptBindingResult(await execute({
+          type: "runtime.validate-retry-receipt",
+          receipt: result.retryReceipt,
+          now: Date.now(),
+        }), result.retryReceipt);
+      }
       remember(result.execution);
       return result;
     },

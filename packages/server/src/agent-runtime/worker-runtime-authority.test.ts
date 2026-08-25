@@ -134,6 +134,43 @@ describe("real AuthorityWorker runtime authority", () => {
     expect(new Set(leaseOwners).size).toBe(1);
   });
 
+  it("rejects a retry receipt whose full lineage binding differs from the durable reread", async () => {
+    const createdAt = "2026-08-25T00:00:00.000Z";
+    const receipt = {
+      requestId: "retry-binding-request", sourceExecutionId: "execution-source",
+      executionId: "execution-child", intentId: "intent-canonical",
+      lineageId: "lineage-canonical", roomId: "room-runtime", executionOrdinal: 2,
+      snapshotId: "snapshot-forged", status: "accepted" as const, createdAt,
+    };
+    const executeRuntime = vi.fn(async (operation: { type: string }) => {
+      if (operation.type === "runtime.validate-retry-receipt") {
+        return { kind: "retry-receipt-binding", receipt: {
+          ...receipt, snapshotId: "snapshot-canonical",
+        } };
+      }
+      return {
+        kind: "invocation", replayed: false,
+        execution: {
+          id: "execution-child", roomId: "room-runtime", sourceMessageId: "message-source",
+          requesterId: "human-runtime", agentId: "agent-runtime", toolName: "model.generate",
+          status: "queued", actionCategory: "model_generation", currentAttemptSeq: 1,
+          retryCycle: 1, retryOrdinal: 1, recoveryCursor: 0, queuedAt: createdAt,
+          updatedAt: createdAt, manualRetryOfExecutionId: "execution-source",
+        },
+        intent: { kind: "direct_mention", roomId: "room-runtime",
+          sourceMessageId: "message-source", targetAgentId: "agent-runtime" },
+        retryReceipt: receipt,
+      };
+    });
+    const authority = createWorkerRuntimeAuthority({ executeRuntime } as unknown as WorkerDatabaseClient);
+    await expect(authority.retry({
+      kind: "human", sessionId: "session-runtime", sessionFamilyId: "family-runtime",
+      principal: { accountId: "account-runtime", actorId: "human-runtime" },
+      requestId: receipt.requestId, idempotencyKey: receipt.requestId,
+    }, receipt.sourceExecutionId, 4)).rejects.toMatchObject({ code: "provider_failure" });
+    expect(executeRuntime).toHaveBeenCalledTimes(2);
+  });
+
   it("persists completion and recovers a running attempt after SQLite/worker restart", async () => {
     const directory = mkdtempSync(join(tmpdir(), "dao-runtime-worker-"));
     const databasePath = join(directory, "authority.sqlite");
