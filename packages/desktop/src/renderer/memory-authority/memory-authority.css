@@ -1,6 +1,6 @@
 .room-authority-workspace {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(18rem, 24rem);
+  grid-template-columns: minmax(0, 1fr) minmax(17rem, 21rem) minmax(18rem, 24rem);
   gap: 1rem;
   width: 100%;
   min-height: 100%;
@@ -8,6 +8,7 @@
 }
 
 .room-authority-workspace__timeline,
+.room-authority-workspace__invocations,
 .room-authority-workspace__memory {
   min-width: 0;
 }
@@ -116,6 +117,8 @@
     position: static;
     max-height: none;
   }
+
+  .room-authority-workspace__invocations { position: static; }
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -2,6 +2,7 @@
 @import "./memory-authority/memory-authority.css";
 @import "./attachment-authority/attachment-authority.css";
 @import "./agent-settings/agent-settings.css";
+@import "./invocation-runtime/invocation-runtime.css";
 
 :root {
   --app-background: #f8fafc;

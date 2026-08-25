@@ -4,6 +4,7 @@ import {
   isRoomRepairPage,
   isSnapshotCompleted,
   isWorkspaceBootstrapPage,
+  isLegacyAgentExecution,
   type RoomCursor,
   type RoomGovernanceView,
   type RoomRepairPage,
@@ -43,6 +44,7 @@ export type GovernanceTransportErrorCode =
   | "room_revision_conflict" | "ownership_transfer_required" | "room_archived"
   | "departure_blocked" | "snapshot_expired" | "snapshot_stale"
   | "rate_limited" | "dependency_unavailable" | "service_unavailable"
+  | "execution_conflict" | "protocol_upgrade_required"
   | "connection_unavailable" | "request_timeout" | "protocol_error" | "client_closed";
 
 export class GovernanceTransportError extends Error {
@@ -65,6 +67,19 @@ export interface GovernanceWireAck {
   readonly replayed: boolean;
 }
 
+export interface InvocationWireCommand {
+  readonly type: "invocation.cancel" | "invocation.retry";
+  readonly requestId: string;
+  readonly executionId: string;
+  readonly expectedVersion: number;
+}
+
+export interface InvocationWireAck {
+  readonly type: "invocation.cancel.ack" | "invocation.retry.ack";
+  readonly requestId: string;
+  readonly replayed: boolean;
+}
+
 export interface GovernanceAuthorityTransport extends SyncTransport {
   queryDepartureConflicts(input: {
     readonly requestId: string;
@@ -73,6 +88,7 @@ export interface GovernanceAuthorityTransport extends SyncTransport {
     readonly expectedGovernanceRevision: number;
   }): Promise<DepartureConflictList>;
   execute(command: GovernanceAuthorityCommand): Promise<GovernanceWireAck>;
+  controlInvocation(command: InvocationWireCommand): Promise<InvocationWireAck>;
   onTerminalRevoked(listener: () => void): () => void;
   onRoomAccessChanged(listener: (
     roomId: string,
@@ -123,10 +139,32 @@ function timestamp(value: unknown): value is string {
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
 }
+function scopedCancellationEffect(value: unknown): boolean {
+  if (!record(value) || !exact(value, [
+    "sourceMessageId", "sourceRevision", "invocationIntentId", "disposition",
+    "confirmationDisposition", "grantDisposition", "sideEffectState",
+  ], ["executionId", "attemptSeq"]) || !text(value.sourceMessageId) ||
+      !Number.isSafeInteger(value.sourceRevision) || (value.sourceRevision as number) <= 0 ||
+      !text(value.invocationIntentId) ||
+      !new Set(["intent_cancelled", "execution_cancelled", "already_terminal"]).has(value.disposition as string) ||
+      !new Set(["none", "pending_rejected", "confirmed_retained"]).has(value.confirmationDisposition as string) ||
+      !new Set(["none", "unclaimed_revoked", "claimed_retained"]).has(value.grantDisposition as string) ||
+      !new Set(["none", "dispatched-retained", "outcome-unknown-retained"]).has(value.sideEffectState as string)) {
+    return false;
+  }
+  if (value.disposition === "intent_cancelled") {
+    return value.executionId === undefined && value.attemptSeq === undefined &&
+      value.confirmationDisposition === "none" && value.grantDisposition === "none" &&
+      value.sideEffectState === "none";
+  }
+  return text(value.executionId) && Number.isSafeInteger(value.attemptSeq) &&
+    (value.attemptSeq as number) > 0;
+}
 
 type ParsedFrame =
   | { readonly type: "auth.authenticated"; readonly requestId: string; readonly actorId: string; readonly sessionId: string }
   | ({ readonly type: "room.governance.ack" } & GovernanceWireAck)
+  | InvocationWireAck
   | { readonly type: "room.departure.conflicts.result"; readonly requestId: string; readonly conflicts: DepartureConflictList }
   | WorkspaceBootstrapPage | RoomRepairPage | DesktopRoomSyncResult | SnapshotCompleted
   | { readonly type: "room.subscribed.v2"; readonly requestId: string; readonly roomId: string; readonly cursor: RoomCursor; readonly watermark: number }
@@ -160,6 +198,9 @@ function mappedError(status: number, code: string, details: unknown): Governance
     ownership_transfer_required: "ownership_transfer_required", room_archived: "room_archived",
     snapshot_expired: "snapshot_expired", snapshot_stale: "snapshot_stale",
     rate_limited: "rate_limited", dependency_unavailable: "dependency_unavailable",
+    agent_queue_full: "rate_limited", execution_conflict: "execution_conflict",
+    protocol_upgrade_required: "protocol_upgrade_required",
+    agent_runtime_closed: "service_unavailable",
     storage_unavailable: "service_unavailable", internal_error: "service_unavailable",
   };
   const closed = mapping[code];
@@ -192,6 +233,23 @@ export function parseGovernanceServerFrame(raw: string): ParsedFrame | undefined
         result: inferred, governance: value.governance, replayed: value.replayed,
         eventIds: Object.freeze([...value.eventIds] as string[]) };
     }
+    case "invocation.cancel.ack": {
+      if (!exact(value, ["type", "requestId", "receipt"]) || !text(value.requestId, 128) ||
+          !record(value.receipt) || !exact(value.receipt, [
+            "kind", "fenceId", "roomId", "producerId", "reason", "replayed", "effects",
+          ]) || value.receipt.kind !== "scoped-cancellation-committed" ||
+          !text(value.receipt.fenceId) || !text(value.receipt.roomId) ||
+          !text(value.receipt.producerId) || value.receipt.reason !== "human_cancelled" ||
+          typeof value.receipt.replayed !== "boolean" || !Array.isArray(value.receipt.effects) ||
+          value.receipt.effects.length > 1_000 || !value.receipt.effects.every(scopedCancellationEffect)) return undefined;
+      return { type: value.type, requestId: value.requestId, replayed: value.receipt.replayed };
+    }
+    case "invocation.retry.ack":
+      return exact(value, ["type", "requestId", "execution", "replayed"]) &&
+        text(value.requestId, 128) && isLegacyAgentExecution(value.execution) &&
+        typeof value.replayed === "boolean"
+        ? { type: value.type, requestId: value.requestId, replayed: value.replayed }
+        : undefined;
     case "room.departure.conflicts.result":
       return exact(value, ["type", "requestId", "conflicts"]) && text(value.requestId, 128) &&
         isDepartureConflictList(value.conflicts)
@@ -521,6 +579,13 @@ export function createGovernanceWebSocketAuthority(options: {
       if (response.command !== command.intent.command || response.governance.roomId !== command.roomId) {
         throw new GovernanceTransportError("protocol_error");
       }
+      return response;
+    },
+    async controlInvocation(command) {
+      const responseType = command.type === "invocation.cancel"
+        ? "invocation.cancel.ack" as const : "invocation.retry.ack" as const;
+      const response = await exactRequest<InvocationWireAck>({ ...command }, responseType);
+      if (response.type !== responseType) throw new GovernanceTransportError("protocol_error");
       return response;
     },
     onTerminalRevoked(listener) { terminalListeners.add(listener); return () => terminalListeners.delete(listener); },

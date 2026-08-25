@@ -298,6 +298,7 @@ describe("ephemeral Agent execution preview", () => {
     const preview = root.querySelector<HTMLElement>("[data-agent-execution-preview]");
     expect(preview?.textContent).toBe("partial");
     expect(preview?.dataset.authoritative).toBe("false");
+    expect(preview?.getAttribute("aria-live")).toBe("off");
     expect(preview?.classList.contains("typing")).toBe(false);
     render(root, undefined);
     expect(root.childElementCount).toBe(0);
@@ -565,14 +566,13 @@ describe("verified collaboration primitive renderer", () => {
     expect(root.querySelectorAll("[data-message-kind='agent'] > .agent-judgement")).toHaveLength(0);
   });
 
-  it("T-0013 distinguishes request and invocation mentions and keeps preview cancellation fail-closed", () => {
+  it("T-0013 distinguishes request and invocation mentions and leaves controls to production authority", () => {
     const root = document.createElement("main");
 
     app.renderM2PrimitivesPreview?.(root);
 
     const humanMention = root.querySelector(".mention--human");
     const agentMention = root.querySelector(".mention--agent");
-    const cancel = root.querySelector<HTMLButtonElement>("[data-testid='cancel-agent-execution']");
     expect(humanMention?.classList.contains("mention--agent")).toBe(false);
     expect(agentMention?.classList.contains("mention--human")).toBe(false);
     expect(root.querySelector("[data-open-item-status='transferred']")?.textContent).toContain("周安全 → 陈研发");
@@ -585,8 +585,7 @@ describe("verified collaboration primitive renderer", () => {
       .toContain("来源：手动标记未完");
     expect(root.querySelectorAll("[data-agent-invocation] .human-request-action")).toHaveLength(0);
 
-    expect(cancel?.disabled).toBe(true);
-    cancel?.click();
+    expect(root.querySelector("[data-testid='cancel-agent-execution']")).toBeNull();
     expect(root.querySelector("[data-agent-invocation]")?.getAttribute("data-execution-status")).toBe("running");
     expect(root.querySelector("[data-member-id='agent-data']")?.textContent).toBe("执行中");
   });

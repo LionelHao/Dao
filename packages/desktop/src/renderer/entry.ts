@@ -4,6 +4,7 @@ import type { MessageAuthorityBridge } from "../message-authority/contracts.js";
 import type { AttachmentAuthorityBridge } from "../attachment-authority/contracts.js";
 import type { MemoryAuthorityBridge } from "../memory-authority/contracts.js";
 import type { AgentSettingsBridge } from "../agent-profile-routing/contracts.js";
+import type { InvocationBridge } from "../invocation-runtime/contracts.js";
 import { mountAgentSettingsBridgeSurface } from "./agent-settings/bridge-adapter.js";
 import {
   mountGovernanceSurface,
@@ -14,6 +15,7 @@ import {
 import { mountIdentityApp } from "./identity.js";
 import { mountMessageAuthorityBridgeSurface } from "./message-authority/bridge-adapter.js";
 import { mountDesktopMemoryAuthoritySurface } from "./memory-authority/host-adapter.js";
+import { mountInvocationSurface } from "./invocation-runtime/surface.js";
 
 export interface DesktopRendererEntryPorts {
   readonly renderM2PrimitivesPreview: (root: HTMLElement) => void;
@@ -38,6 +40,8 @@ export interface DesktopRendererEntryPorts {
     roomId: string,
   ) => () => void;
   readonly mountAgentSettingsSurface?: (root: HTMLElement, bridge: AgentSettingsBridge,
+    roomId: string) => () => void;
+  readonly mountInvocationSurface?: (root: HTMLElement, bridge: InvocationBridge,
     roomId: string) => () => void;
 }
 
@@ -86,6 +90,7 @@ const DEFAULT_PORTS: DesktopRendererEntryPorts = Object.freeze({
   mountAgentSettingsSurface: (root: HTMLElement, bridge: AgentSettingsBridge, roomId: string) => mountAgentSettingsBridgeSurface(
     root, bridge, roomId, { reducedMotion: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false,
       onClose: () => history.back() }),
+  mountInvocationSurface,
 });
 
 const encoder = new TextEncoder();
@@ -147,6 +152,7 @@ export function mountDesktopRendererEntry(
   attachmentAuthority?: AttachmentAuthorityBridge,
   memoryAuthority?: MemoryAuthorityBridge,
   agentSettings?: AgentSettingsBridge,
+  invocation?: InvocationBridge,
 ): (() => void) | undefined {
   const route = new URLSearchParams(search);
   root.dataset.governanceRouteContract = "closed-v1";
@@ -187,7 +193,13 @@ export function mountDesktopRendererEntry(
     const memory = document.createElement("aside");
     memory.className = "room-authority-workspace__memory";
     memory.setAttribute("aria-label", "Room 重要记忆");
-    workspace.append(timeline, memory);
+    const executions = invocation === undefined || ports.mountInvocationSurface === undefined
+      ? undefined : document.createElement("aside");
+    if (executions !== undefined) {
+      executions.className = "room-authority-workspace__invocations";
+      executions.setAttribute("aria-label", "Agent 执行");
+      workspace.append(timeline, executions, memory);
+    } else workspace.append(timeline, memory);
     root.replaceChildren(workspace);
     const disposeMessage = ports.mountMessageAuthoritySurface(
       timeline,
@@ -197,7 +209,11 @@ export function mountDesktopRendererEntry(
       memoryAuthority,
     );
     const disposeMemory = ports.mountMemoryAuthoritySurface(memory, memoryAuthority, roomId);
+    const disposeInvocations = executions === undefined || invocation === undefined ||
+      ports.mountInvocationSurface === undefined ? undefined
+      : ports.mountInvocationSurface(executions, invocation, roomId);
     return () => {
+      disposeInvocations?.();
       disposeMemory();
       disposeMessage();
     };

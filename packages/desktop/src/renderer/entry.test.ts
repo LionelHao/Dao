@@ -5,6 +5,7 @@ import type { MessageAuthorityBridge } from "../message-authority/contracts.js";
 import type { AttachmentAuthorityBridge } from "../attachment-authority/contracts.js";
 import type { MemoryAuthorityBridge } from "../memory-authority/contracts.js";
 import type { AgentSettingsBridge } from "../agent-profile-routing/contracts.js";
+import type { InvocationBridge } from "../invocation-runtime/contracts.js";
 import { mountDesktopRendererEntry } from "./entry.js";
 
 const bridge = {} as IdentityBridge;
@@ -13,6 +14,7 @@ const messageAuthority = {} as MessageAuthorityBridge;
 const attachmentAuthority = {} as AttachmentAuthorityBridge;
 const memoryAuthority = {} as MemoryAuthorityBridge;
 const agentSettings = {} as AgentSettingsBridge;
+const invocation = {} as InvocationBridge;
 
 function ports() {
   return {
@@ -24,6 +26,7 @@ function ports() {
     mountMessageAuthoritySurface: vi.fn(() => vi.fn()),
     mountMemoryAuthoritySurface: vi.fn(() => vi.fn()),
     mountAgentSettingsSurface: vi.fn(() => vi.fn()),
+    mountInvocationSurface: vi.fn(() => vi.fn()),
   };
 }
 
@@ -173,6 +176,20 @@ describe("Desktop renderer route entry", () => {
     dispose?.();
     expect(disposeMemory).toHaveBeenCalledOnce();
     expect(disposeMessage).toHaveBeenCalledOnce();
+  });
+
+  it("mounts the production Invocation authority beside the current Room timeline", () => {
+    const root = document.createElement("main"); const renderers = ports();
+    const disposeInvocation = vi.fn();
+    renderers.mountInvocationSurface.mockReturnValue(disposeInvocation);
+    const dispose = mountDesktopRendererEntry(
+      root, "?message-room=room-1", bridge, governance, messageAuthority, renderers,
+      undefined, memoryAuthority, agentSettings, invocation,
+    );
+    const executionRail = root.querySelector<HTMLElement>(".room-authority-workspace__invocations")!;
+    expect(renderers.mountInvocationSurface).toHaveBeenCalledWith(executionRail, invocation, "room-1");
+    dispose?.();
+    expect(disposeInvocation).toHaveBeenCalledOnce();
   });
 
   it.each([

@@ -314,7 +314,7 @@ export function renderAgentExecutionPreview(
     element.className = "agent-execution-preview";
     element.dataset.agentExecutionPreview = "true";
     element.dataset.authoritative = "false";
-    element.setAttribute("aria-live", "polite");
+    element.setAttribute("aria-live", "off");
     element.setAttribute("aria-label", "Agent 非权威临时预览");
     element.textContent = "";
   }
@@ -1470,12 +1470,6 @@ function appendAddressingPreview(
       record.status === "running" ? "执行中" : "可用",
     );
     status.dataset.memberId = record.agentId;
-    if (record.status === "running") {
-      const cancel = appendPrimitiveButton(invocation, "取消（预览不可用）", "cancel");
-      cancel.dataset.testid = "cancel-agent-execution";
-      cancel.disabled = true;
-      cancel.title = "取消只在已连接并取得权威 execution version 后可用";
-    }
     section.append(invocation, status);
   }
   section.append(audience);

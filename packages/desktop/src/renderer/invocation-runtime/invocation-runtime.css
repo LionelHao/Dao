@@ -1,0 +1,17 @@
+.room-authority-workspace__invocations { min-width: 0; }
+.invocation-panel { box-sizing: border-box; display: grid; gap: .75rem; padding: 1rem; border: 1px solid #cbd5e1; border-radius: .875rem; background: #f8fafc; }
+.invocation-panel *, .invocation-panel *::before, .invocation-panel *::after { box-sizing: border-box; }
+.invocation-panel h2, .invocation-panel h3, .invocation-panel p { margin: 0; }
+.invocation-panel__announcement:empty { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+.invocation-panel__offline { padding: .75rem; border: 2px solid #b54708; border-radius: .5rem; background: #fffaeb; }
+.invocation-panel__list { display: grid; gap: .75rem; }
+.invocation-card { display: grid; gap: .5rem; padding: .875rem; border: 2px solid #64748b; border-radius: .75rem; background: #fff; overflow-wrap: anywhere; }
+.invocation-card--completed { border-color: #027a48; }
+.invocation-card--failed, .invocation-card--cancelled { border-style: dashed; border-color: #b42318; }
+.invocation-card__status { font-weight: 800; }
+.invocation-card__controls { display: flex; flex-wrap: wrap; gap: .5rem; }
+.invocation-panel button { min-height: 2.75rem; padding: .625rem .875rem; border: 1px solid #64748b; border-radius: .5rem; background: #fff; color: #172033; font: inherit; }
+.invocation-panel button:disabled { cursor: not-allowed; color: #64748b; background: #eef2f7; }
+.invocation-panel :focus-visible { outline: 3px solid #1d4ed8; outline-offset: 3px; }
+@media (max-width: 840px) { .room-authority-workspace__invocations { order: 2; } }
+@media (prefers-reduced-motion: reduce) { .invocation-panel *, .invocation-panel *::before, .invocation-panel *::after { scroll-behavior: auto !important; transition-duration: .001ms !important; animation-duration: .001ms !important; animation-iteration-count: 1 !important; } }
