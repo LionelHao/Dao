@@ -6,6 +6,7 @@ import {
   type ProviderAdapter,
   type RuntimeAuthority,
   type RuntimeClock,
+  type RuntimeRecoveryAuthority,
   type ToolAdapter,
 } from "./contracts.js";
 import { createAgentRuntimeService } from "./agent-runtime-service.js";
@@ -21,8 +22,12 @@ const context: AuthenticatedCommandContext = {
   idempotencyKey: "key-1",
 };
 
-function intent(roomId: string, sourceMessageId: string): AgentInvocationIntent {
-  return { kind: "direct_mention", roomId, sourceMessageId, targetAgentId: `agent-${roomId}` };
+function intent(
+  roomId: string,
+  sourceMessageId: string,
+  targetAgentId = `agent-${roomId}`,
+): AgentInvocationIntent {
+  return { kind: "direct_mention", roomId, sourceMessageId, targetAgentId };
 }
 
 function execution(id: string, roomId: string, attempt = 1, retryOrdinal: 1 | 2 | 3 = 1): AgentExecution {
@@ -75,7 +80,7 @@ function authority(): RuntimeAuthority & { executions: Map<string, AgentExecutio
     async invoke(_context, invocation) {
       next += 1;
       const value = { ...execution(`execution-${next}`, invocation.roomId),
-        sourceMessageId: invocation.sourceMessageId };
+        sourceMessageId: invocation.sourceMessageId, agentId: invocation.targetAgentId };
       executions.set(value.id, value);
       return { execution: value, intent: invocation, replayed: false };
     },
@@ -267,6 +272,68 @@ describe("bounded Agent runtime scheduler", () => {
     expect([...runtimeAuthority.executions.values()].every((value) => value.status === "completed")).toBe(true);
   });
 
+  it("runs different Agents from the same turn concurrently while keeping each Agent FIFO", async () => {
+    const runtimeAuthority = authority();
+    const started: string[] = [];
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      provider: provider(async function* (input) {
+        started.push(input.invocation.targetAgentId);
+        if (started.length < 2) await blocked;
+        else release();
+        yield { type: "response_started", sequence: 1 };
+        yield { type: "agent_final", sequence: 2, body: "ok", citations: [] };
+      }),
+      modelId: "fake-model",
+      buildProviderInput: providerInput,
+      limits: { maxActive: 2, maxQueuedPerRoom: 4, maxPartialBytes: 1_024 },
+    });
+
+    await Promise.all([
+      runtime.invoke(context, intent("room-a", "same-turn", "agent-a")),
+      runtime.invoke(
+        { ...context, requestId: "same-turn-2", idempotencyKey: "same-turn-2" },
+        intent("room-a", "same-turn", "agent-b"),
+      ),
+    ]);
+    await runtime.whenIdle();
+
+    expect(started).toEqual(["agent-a", "agent-b"]);
+    expect([...runtimeAuthority.executions.values()].every((value) => value.status === "completed"))
+      .toBe(true);
+  });
+
+  it("caps default global Provider concurrency at eight", async () => {
+    const runtimeAuthority = authority();
+    const started: string[] = [];
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      provider: provider(async function* (input) {
+        started.push(input.invocation.sourceMessageId);
+        await blocked;
+        yield { type: "response_started", sequence: 1 };
+        yield { type: "agent_final", sequence: 2, body: "ok", citations: [] };
+      }),
+      modelId: "fake-model",
+      buildProviderInput: providerInput,
+    });
+
+    await Promise.all(Array.from({ length: 9 }, (_, index) => runtime.invoke(
+      { ...context, requestId: `global-${index}`, idempotencyKey: `global-${index}` },
+      intent(`room-global-${index}`, `source-${index}`, `agent-${index}`),
+    )));
+    await vi.waitFor(() => expect(started).toHaveLength(8));
+    expect(started).toHaveLength(8);
+
+    release();
+    await runtime.whenIdle();
+    expect(started).toHaveLength(9);
+  });
+
   it("returns a closed 429 before creating an execution when the room queue is full", async () => {
     const runtimeAuthority = authority();
     let release!: () => void;
@@ -289,6 +356,37 @@ describe("bounded Agent runtime scheduler", () => {
       intent("room-a", "a-3"),
     )).rejects.toMatchObject({ code: "agent_queue_full", status: 429, retryAfterMs: 1_000 });
     expect(runtimeAuthority.executions.size).toBe(2);
+    release();
+    await runtime.whenIdle();
+  });
+
+  it("caps durable per-Room admission at 32 including active work", async () => {
+    const runtimeAuthority = authority();
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      provider: provider(async function* () {
+        await blocked;
+        yield { type: "response_started", sequence: 1 };
+        yield { type: "agent_final", sequence: 2, body: "ok", citations: [] };
+      }),
+      modelId: "fake-model",
+      buildProviderInput: providerInput,
+    });
+
+    for (let index = 0; index < 32; index += 1) {
+      await runtime.invoke(
+        { ...context, requestId: `admission-${index}`, idempotencyKey: `admission-${index}` },
+        intent("room-admission", `source-${index}`, `agent-${index}`),
+      );
+    }
+    await expect(runtime.invoke(
+      { ...context, requestId: "admission-overflow", idempotencyKey: "admission-overflow" },
+      intent("room-admission", "source-overflow", "agent-overflow"),
+    )).rejects.toMatchObject({ code: "agent_queue_full", status: 429 });
+    expect(runtimeAuthority.executions.size).toBe(32);
+
     release();
     await runtime.whenIdle();
   });
@@ -318,6 +416,53 @@ describe("bounded Agent runtime scheduler", () => {
       currentAttemptSeq: 3,
       retryOrdinal: 3,
       terminalErrorCode: "provider_unavailable",
+    });
+  });
+
+  it("persists a timeout retry decision before aborting the Provider attempt", async () => {
+    const runtimeAuthority = authority();
+    const ordering: string[] = [];
+    const originalScheduleRetry = runtimeAuthority.scheduleRetry.bind(runtimeAuthority);
+    runtimeAuthority.scheduleRetry = vi.fn(async (...args) => {
+      ordering.push(`persist:${args[1]}`);
+      return originalScheduleRetry(...args);
+    });
+    const waits: number[] = [];
+    const clock: RuntimeClock = {
+      now: () => Date.parse("2026-08-17T00:00:00.000Z"),
+      wait: vi.fn(async (milliseconds) => { waits.push(milliseconds); }),
+    };
+    let dispatches = 0;
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      provider: provider(async function* (_input, signal) {
+        dispatches += 1;
+        if (dispatches === 1) {
+          signal.addEventListener("abort", () => {
+            ordering.push("abort:1");
+          }, { once: true });
+          await new Promise<void>(() => undefined);
+        }
+        yield { type: "response_started", sequence: 1 };
+        yield { type: "agent_final", sequence: 2, body: "recovered", citations: [] };
+      }),
+      modelId: "fake-model",
+      async buildProviderInput(value, invocationValue) {
+        return {
+          ...(await providerInput(value, invocationValue)),
+          limits: { ...(await providerInput(value, invocationValue)).limits, timeoutMs: 10 },
+        };
+      },
+      clock,
+    });
+
+    const accepted = await runtime.invoke(context, intent("room-timeout", "timeout"));
+    await runtime.whenIdle();
+
+    expect(ordering.slice(0, 2)).toEqual(["persist:1", "abort:1"]);
+    expect(waits).toEqual([1_000]);
+    expect(runtimeAuthority.executions.get(accepted.execution.id)).toMatchObject({
+      status: "completed", currentAttemptSeq: 2,
     });
   });
 
@@ -415,6 +560,106 @@ describe("bounded Agent runtime scheduler", () => {
     });
   });
 
+  it.each([257, 513, 1_025])(
+    "keyset-recovers all %i candidates across full room admission windows",
+    async (candidateCount) => {
+      const runtimeAuthority = authority();
+      const records = Array.from({ length: candidateCount }, (_, index) => {
+        const recoveredIntent = intent("room-recovery", `source-${index}`, `agent-${index}`);
+        const recoveredExecution = {
+          ...execution(`recovered-${index}`, recoveredIntent.roomId),
+          sourceMessageId: recoveredIntent.sourceMessageId,
+          agentId: recoveredIntent.targetAgentId,
+        };
+        runtimeAuthority.executions.set(recoveredExecution.id, recoveredExecution);
+        return {
+          execution: recoveredExecution,
+          intent: recoveredIntent,
+          outcome: "enqueue" as const,
+        };
+      });
+      const scan = vi.fn<RuntimeRecoveryAuthority["scan"]>(async ({ after, limit }) => {
+        const start = after === undefined ? 0 : Number(after) + 1;
+        const page = records.slice(start, start + limit);
+        return {
+          candidates: page.map((record, offset) => ({
+            cursor: String(start + offset).padStart(6, "0"),
+            record,
+          })),
+          hasMore: start + page.length < records.length,
+        };
+      });
+      const recoveryAuthority: RuntimeRecoveryAuthority = {
+        scan,
+        isolate: vi.fn(async () => undefined),
+      };
+      const stream = vi.fn(async function* (): AsyncIterable<ProviderEvent> {
+        yield { type: "response_started", sequence: 1 };
+        yield { type: "agent_final", sequence: 2, body: "recovered", citations: [] };
+      });
+      const runtime = createAgentRuntimeService({
+        authority: runtimeAuthority,
+        recoveryAuthority,
+        provider: provider(stream),
+        modelId: "fake-model",
+        buildProviderInput: providerInput,
+      });
+
+      await runtime.recover();
+      await runtime.whenIdle();
+
+      expect(scan.mock.calls.length).toBe(Math.ceil(candidateCount / 256) + 1);
+      expect(stream).toHaveBeenCalledTimes(candidateCount);
+      expect([...runtimeAuthority.executions.values()].filter((value) => value.status === "completed"))
+        .toHaveLength(candidateCount);
+    },
+  );
+
+  it("isolates a poison recovery candidate without blocking larger stable keys", async () => {
+    const runtimeAuthority = authority();
+    const firstIntent = intent("room-recovery", "source-first", "agent-first");
+    const lastIntent = intent("room-recovery", "source-last", "agent-last");
+    const first = { ...execution("recovered-first", "room-recovery"),
+      sourceMessageId: firstIntent.sourceMessageId, agentId: firstIntent.targetAgentId };
+    const last = { ...execution("recovered-last", "room-recovery"),
+      sourceMessageId: lastIntent.sourceMessageId, agentId: lastIntent.targetAgentId };
+    runtimeAuthority.executions.set(first.id, first);
+    runtimeAuthority.executions.set(last.id, last);
+    const isolate = vi.fn(async () => undefined);
+    const recoveryAuthority: RuntimeRecoveryAuthority = {
+      scan: vi.fn(async ({ after }) => after === undefined ? ({
+          candidates: [
+            { cursor: "001", record: { execution: first, intent: firstIntent, outcome: "enqueue" } },
+            { cursor: "002", record: { execution: { id: "poison" }, raw: "must-not-leak" } },
+            { cursor: "003", record: { execution: last, intent: lastIntent, outcome: "enqueue" } },
+          ],
+          hasMore: false,
+        }) : ({ candidates: [], hasMore: false })),
+      isolate,
+    };
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      recoveryAuthority,
+      provider: provider(async function* () {
+        yield { type: "response_started", sequence: 1 };
+        yield { type: "agent_final", sequence: 2, body: "ok", citations: [] };
+      }),
+      modelId: "fake-model",
+      buildProviderInput: providerInput,
+    });
+
+    await runtime.recover();
+    await runtime.whenIdle();
+
+    expect(isolate).toHaveBeenCalledWith({
+      cursor: "002",
+      candidateId: "poison",
+      reason: "recovery_candidate_invalid",
+    });
+    expect(runtimeAuthority.executions.get(first.id)?.status).toBe("completed");
+    expect(runtimeAuthority.executions.get(last.id)?.status).toBe("completed");
+  });
+
   it("preserves all authoritative invocation kinds across restart recovery and manual retry", async () => {
     const kinds = ["direct_mention", "structured_help", "routed_candidate"] as const;
     for (const kind of kinds) {
@@ -496,11 +741,10 @@ describe("bounded Agent runtime scheduler", () => {
         yield { type: "response_started", sequence: 1 };
         yield { type: "text_delta", sequence: 2, delta: "partial" };
         started();
-        await new Promise<void>((resolve) => signal.addEventListener("abort", () => {
+        signal.addEventListener("abort", () => {
           ordering.push("abort-propagated");
-          resolve();
-        }, { once: true }));
-        throw new AgentRuntimeError("provider_timeout", "aborted");
+        }, { once: true });
+        await new Promise<void>(() => undefined);
       }),
       modelId: "fake-model",
       buildProviderInput: providerInput,
@@ -1037,5 +1281,29 @@ describe("bounded Agent runtime scheduler", () => {
     expect(runtimeAuthority.readPendingConfirmation).toHaveBeenCalledTimes(1);
     expect(execute).toHaveBeenCalledTimes(1);
     expect(runtimeAuthority.executions.get(accepted.execution.id)?.status).toBe("completed");
+  });
+
+  it("bounds shutdown even when a Provider ignores AbortSignal", async () => {
+    const runtimeAuthority = authority();
+    let started!: () => void;
+    const sawStart = new Promise<void>((resolve) => { started = resolve; });
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      provider: provider(async function* () {
+        started();
+        await new Promise<void>(() => undefined);
+        yield { type: "response_started", sequence: 1 };
+      }),
+      modelId: "fake-model",
+      buildProviderInput: providerInput,
+      shutdownTimeoutMs: 10,
+    });
+    await runtime.invoke(context, intent("room-close", "close"));
+    await sawStart;
+
+    const before = Date.now();
+    await runtime.close();
+
+    expect(Date.now() - before).toBeLessThan(250);
   });
 });

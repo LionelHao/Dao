@@ -13,6 +13,8 @@ import type { AuthenticatedCommandContext, InternalAgentCommandContext } from ".
 
 export const AGENT_RUNTIME_MAX_ACTIVE = 8;
 export const AGENT_RUNTIME_MAX_QUEUED_PER_ROOM = 32;
+export const AGENT_RUNTIME_MAX_ADMITTED_PER_ROOM = 32;
+export const AGENT_RUNTIME_RECOVERY_BATCH_SIZE = 256;
 export const AGENT_RUNTIME_RETRY_DELAYS_MS = [1_000, 4_000] as const;
 export const AGENT_RUNTIME_MAX_ATTEMPTS = 3;
 
@@ -169,6 +171,32 @@ export interface RuntimeRecoveryRecord {
   readonly execution: AgentExecution;
   readonly intent: AgentInvocationIntent;
   readonly outcome: "enqueue" | "failed" | "fail_outcome_unknown" | "wait_confirmation";
+}
+
+/**
+ * Closed keyset-scanning port for FT-08 recovery. The persistence owner may
+ * implement this without exposing rows or SQL to the runtime scheduler. The
+ * scheduler always performs one final scan that returns an empty page, so a
+ * non-empty page never becomes an implicit batch tail.
+ */
+export interface RuntimeRecoveryAuthority {
+  scan(input: Readonly<{
+    /** Opaque, stable key returned by the preceding candidate. */
+    readonly after?: string;
+    readonly limit: number;
+  }>): Promise<Readonly<{
+    candidates: readonly Readonly<{
+      readonly cursor: string;
+      /** Deliberately unknown until the runtime boundary validates it. */
+      readonly record: unknown;
+    }>[];
+    readonly hasMore: boolean;
+  }>>;
+  isolate(input: Readonly<{
+    readonly cursor: string;
+    readonly candidateId?: string;
+    readonly reason: "recovery_candidate_invalid" | "recovery_candidate_conflict";
+  }>): Promise<void>;
 }
 
 export interface FenceReplacementAccepted {
