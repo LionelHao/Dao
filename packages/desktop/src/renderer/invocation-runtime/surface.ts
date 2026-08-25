@@ -179,7 +179,7 @@ export function mountInvocationSurface(
   root: HTMLElement,
   bridge: InvocationBridge,
   roomId: string,
-  actions?: InvocationSurfaceActions,
+  actions: InvocationSurfaceActions,
 ): () => void {
   let disposed = false;
   const retryTimers = new Set<ReturnType<typeof setTimeout>>();
@@ -204,14 +204,7 @@ export function mountInvocationSurface(
     catch { renderFailure("503 · 控制意图未能提交。权威执行状态未改变。"); }
   };
   const hostAction = (action: InvocationHostAction, executionId: string): void => {
-    if (actions !== undefined) {
-      actions.onHostAction(action, { roomId, executionId });
-      return;
-    }
-    root.dispatchEvent(new CustomEvent("dao:invocation-host-action", {
-      bubbles: true,
-      detail: { action, roomId, executionId },
-    }));
+    actions.onHostAction(action, { roomId, executionId });
   };
   const scheduleRetry = (button: HTMLButtonElement, retryAfterSeconds: number): void => {
     const timer = setTimeout(() => {

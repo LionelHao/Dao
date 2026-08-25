@@ -66,7 +66,9 @@ describe("Desktop renderer route entry", () => {
     );
 
     expect(renderers.mountIdentityApp).toHaveBeenCalledWith(root, bridge);
-    expect(dispose).toBe(expectedDispose);
+    expect(dispose).toEqual(expect.any(Function));
+    dispose?.();
+    expect(expectedDispose).toHaveBeenCalledOnce();
   });
 
   it("fails closed on the default route when the preload bridge is absent", () => {
@@ -96,7 +98,9 @@ describe("Desktop renderer route entry", () => {
     expect(renderers.mountGovernanceSurface).toHaveBeenCalledWith(root, governance, "room-1");
     expect(renderers.mountIdentityApp).not.toHaveBeenCalled();
     expect(root.dataset.governanceRouteContract).toBe("closed-v1");
-    expect(dispose).toBe(expectedDispose);
+    expect(dispose).toEqual(expect.any(Function));
+    dispose?.();
+    expect(expectedDispose).toHaveBeenCalledOnce();
   });
 
   it.each([
@@ -178,8 +182,9 @@ describe("Desktop renderer route entry", () => {
     expect(disposeMessage).toHaveBeenCalledOnce();
   });
 
-  it("mounts the production Invocation authority beside the current Room timeline", () => {
+  it("mounts production Invocation authority with reachable host actions", () => {
     const root = document.createElement("main"); const renderers = ports();
+    document.body.append(root);
     const disposeInvocation = vi.fn();
     renderers.mountInvocationSurface.mockReturnValue(disposeInvocation);
     const dispose = mountDesktopRendererEntry(
@@ -187,9 +192,90 @@ describe("Desktop renderer route entry", () => {
       undefined, memoryAuthority, agentSettings, invocation,
     );
     const executionRail = root.querySelector<HTMLElement>(".room-authority-workspace__invocations")!;
-    expect(renderers.mountInvocationSurface).toHaveBeenCalledWith(executionRail, invocation, "room-1");
+    expect(renderers.mountInvocationSurface).toHaveBeenCalledWith(
+      executionRail, invocation, "room-1", expect.objectContaining({ onHostAction: expect.any(Function) }),
+    );
+    const actions = renderers.mountInvocationSurface.mock.calls[0]![3]!;
+    actions.onHostAction("review-required", { roomId: "room-1", executionId: "execution-1" });
+    const review = root.querySelector<HTMLElement>(
+      "[data-invocation-host-handoff='review-required']",
+    )!;
+    expect(review.getAttribute("role")).toBe("alert");
+    expect(review.textContent).toContain("原 toolCall 与普通重试继续关闭");
+    expect(review.textContent).toContain("不会伪造 FT-10 审阅结论");
+    expect(document.activeElement).toBe(review);
+
+    actions.onHostAction("upgrade-client", { roomId: "room-1", executionId: "execution-1" });
+    const update = root.querySelector<HTMLElement>("[data-invocation-host-handoff='upgrade-client']")!;
+    expect(update.getAttribute("role")).toBe("alert");
+    expect(update.textContent).toContain("部署方批准的客户端更新渠道");
+    expect(document.activeElement).toBe(update);
+
+    const popstate = vi.fn();
+    window.addEventListener("popstate", popstate);
+    actions.onHostAction("request-access", { roomId: "room-1", executionId: "execution-1" });
+    expect(window.location.search).toBe("?governance-room=room-1");
+    expect(popstate).toHaveBeenCalledOnce();
+    actions.onHostAction("reauthenticate", { roomId: "room-1", executionId: "execution-1" });
+    expect(window.location.search).toBe("");
+    expect(popstate).toHaveBeenCalledTimes(2);
+    window.removeEventListener("popstate", popstate);
     dispose?.();
     expect(disposeInvocation).toHaveBeenCalledOnce();
+    root.remove();
+  });
+
+  it("remounts the existing Identity and Governance views with route-entry focus", async () => {
+    const root = document.createElement("main");
+    document.body.append(root);
+    const renderers = ports();
+    renderers.mountIdentityApp.mockImplementation((identityRoot) => {
+      const form = document.createElement("form");
+      form.dataset.identityLogin = "true";
+      const account = document.createElement("input");
+      form.append(account);
+      identityRoot.replaceChildren(form);
+      return vi.fn();
+    });
+    renderers.mountGovernanceSurface.mockImplementation((governanceRoot) => {
+      const shell = document.createElement("section");
+      shell.className = "dao-governance";
+      const heading = document.createElement("h1");
+      heading.textContent = "Room 访问管理";
+      shell.append(heading);
+      governanceRoot.replaceChildren(shell);
+      return vi.fn();
+    });
+    let actions: Parameters<NonNullable<typeof renderers.mountInvocationSurface>>[3] | undefined;
+    renderers.mountInvocationSurface.mockImplementation((_root, _bridge, _roomId, next) => {
+      actions = next;
+      return vi.fn();
+    });
+    let dispose: (() => void) | undefined;
+    const render = () => {
+      dispose?.();
+      dispose = mountDesktopRendererEntry(
+        root, window.location.search, bridge, governance, messageAuthority, renderers,
+        undefined, memoryAuthority, agentSettings, invocation,
+      );
+    };
+    window.history.replaceState(null, "", "?message-room=room-1");
+    window.addEventListener("popstate", render);
+    render();
+
+    actions?.onHostAction("request-access", { roomId: "room-1", executionId: "execution-1" });
+    await Promise.resolve();
+    expect(renderers.mountGovernanceSurface).toHaveBeenCalledWith(root, governance, "room-1");
+    expect(document.activeElement).toBe(root.querySelector(".dao-governance h1"));
+
+    actions?.onHostAction("reauthenticate", { roomId: "room-1", executionId: "execution-1" });
+    await Promise.resolve();
+    expect(renderers.mountIdentityApp).toHaveBeenCalledWith(root, bridge);
+    expect(document.activeElement).toBe(root.querySelector("[data-identity-login] input"));
+
+    window.removeEventListener("popstate", render);
+    dispose?.();
+    root.remove();
   });
 
   it.each([
@@ -220,6 +306,7 @@ describe("Desktop renderer route entry", () => {
     expect(source).toContain("window.dao?.messageAuthority");
     expect(source).toContain("window.dao?.attachmentAuthority");
     expect(source).toContain("window.dao?.memoryAuthority");
+    expect(source).toContain('window.addEventListener("popstate", render)');
     expect(source).toContain("mountDesktopRendererEntry");
     expect(source).not.toMatch(/WebSocket|accessToken|ipcRenderer/u);
   });

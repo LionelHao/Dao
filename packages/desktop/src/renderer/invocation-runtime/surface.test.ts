@@ -26,7 +26,7 @@ describe("production Invocation surface", () => {
       retry: vi.fn(), onStateChanged: (next) => { listener = next; return vi.fn(); } };
     const root = document.createElement("div");
     document.body.append(root);
-    mountInvocationSurface(root, bridge, "room-1");
+    mountInvocationSurface(root, bridge, "room-1", { onHostAction: vi.fn() });
     await vi.waitFor(() => expect(root.textContent).toContain("运行中 · 等待确认"));
     const cancelButton = root.querySelector<HTMLButtonElement>("[data-invocation-action='cancel']")!;
     cancelButton.focus();
@@ -53,7 +53,7 @@ describe("production Invocation surface", () => {
     const bridge: InvocationBridge = { getSurface: vi.fn().mockResolvedValue(revised),
       cancel: vi.fn(), retry: vi.fn(), onStateChanged: () => vi.fn() };
     const root = document.createElement("div");
-    mountInvocationSurface(root, bridge, "room-1");
+    mountInvocationSurface(root, bridge, "room-1", { onHostAction: vi.fn() });
     await vi.waitFor(() => expect(root.textContent).toContain("SOURCE REVISED"));
     expect(root.textContent).toContain("冻结输入保持不变");
   });
@@ -116,9 +116,8 @@ describe("production Invocation surface", () => {
       retry: vi.fn(), onStateChanged: () => vi.fn() };
     const root = document.createElement("div");
     const hostAction = vi.fn();
-    root.addEventListener("dao:invocation-host-action", hostAction);
     document.body.append(root);
-    mountInvocationSurface(root, bridge, "room-1");
+    mountInvocationSurface(root, bridge, "room-1", { onHostAction: hostAction });
     await vi.waitFor(() => expect(root.textContent).toContain("离线只读"));
     expect(root.textContent).toContain("! 失败");
     expect(root.textContent).toContain("需要人工审阅");
@@ -127,7 +126,9 @@ describe("production Invocation surface", () => {
     expect(reviewAction?.textContent).toBe("打开人工审阅入口");
     expect(reviewAction).toBe(document.activeElement);
     reviewAction?.click();
-    expect(hostAction).toHaveBeenCalledOnce();
+    expect(hostAction).toHaveBeenCalledWith("review-required", {
+      roomId: "room-1", executionId: "execution-1",
+    });
     expect(root.querySelector<HTMLButtonElement>("[data-invocation-action='retry']")?.disabled).toBe(true);
     root.remove();
   });

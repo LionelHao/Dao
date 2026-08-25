@@ -6,18 +6,26 @@ if (root === null) {
   throw new Error("Desktop renderer requires an #app root element.");
 }
 
-const dispose = mountDesktopRendererEntry(
-  root,
-  window.location.search,
-  window.dao?.identity,
-  window.dao?.governance,
-  window.dao?.messageAuthority,
-  undefined,
-  window.dao?.attachmentAuthority,
-  window.dao?.memoryAuthority,
-  window.dao?.agentSettings,
-  window.dao?.invocation,
-);
-if (dispose !== undefined) {
-  window.addEventListener("beforeunload", dispose, { once: true });
-}
+let dispose: (() => void) | undefined;
+const render = (): void => {
+  dispose?.();
+  dispose = mountDesktopRendererEntry(
+    root,
+    window.location.search,
+    window.dao?.identity,
+    window.dao?.governance,
+    window.dao?.messageAuthority,
+    undefined,
+    window.dao?.attachmentAuthority,
+    window.dao?.memoryAuthority,
+    window.dao?.agentSettings,
+    window.dao?.invocation,
+  );
+};
+
+window.addEventListener("popstate", render);
+window.addEventListener("beforeunload", () => {
+  window.removeEventListener("popstate", render);
+  dispose?.();
+}, { once: true });
+render();
