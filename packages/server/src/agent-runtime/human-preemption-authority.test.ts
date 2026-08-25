@@ -47,11 +47,12 @@ function fixture(): DatabaseSync {
       ('identity', 'agent-2', 0, 1),
       ('room', 'room-1', 0, 1);
     INSERT INTO room_memberships (
-      room_id, actor_id, kind, role, participation, joined_at, configured_at
+      room_id, actor_id, kind, role, participation, joined_at, configured_at,
+      access_revision
     ) VALUES
-      ('room-1', 'human-1', 'human', 'member', NULL, '2026-08-17T00:00:00.000Z', NULL),
-      ('room-1', 'agent-1', 'agent', NULL, 'active', NULL, '2026-08-17T00:00:00.000Z'),
-      ('room-1', 'agent-2', 'agent', NULL, 'active', NULL, '2026-08-17T00:00:00.000Z');
+      ('room-1', 'human-1', 'human', 'member', NULL, '2026-08-17T00:00:00.000Z', NULL, 1),
+      ('room-1', 'agent-1', 'agent', NULL, 'active', NULL, '2026-08-17T00:00:00.000Z', 1),
+      ('room-1', 'agent-2', 'agent', NULL, 'active', NULL, '2026-08-17T00:00:00.000Z', 1);
     UPDATE rooms SET owner_actor_id = 'human-1', governance_revision = 1 WHERE id = 'room-1';
   `);
   const profile1 = seedCanonicalAgentProfileFixture(database, {
