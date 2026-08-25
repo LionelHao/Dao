@@ -3,7 +3,10 @@ import type { AuthorityTransactionView } from
   "../room-governance/private-participant-contracts.js";
 import { useAuthorityTransactionDatabase } from
   "../persistence/authority-transaction-database.js";
-import { ProjectLoopAuthorityError } from "./database-authority.js";
+import {
+  advanceProjectLoopTimedTransitionsInTransaction,
+  ProjectLoopAuthorityError,
+} from "./database-authority.js";
 import type {
   PersistedProjectBoundary,
   ProjectLoopArchiveResult,
@@ -115,6 +118,13 @@ function sourceState(database: DatabaseSync, row: ReminderBoundaryRow):
       (fact.status === "open" || fact.status === "deferred" || fact.status === "cannot_answer") };
   }
   if (row.sourceKind === "confirmation") {
+    if (row.sourceId.startsWith("project-checkpoint:")) {
+      const checkpoint = database.prepare(
+        `SELECT project_revision AS revision FROM project_fact_checkpoints
+         WHERE room_id = ? AND checkpoint_id = ?`,
+      ).get(row.roomId, row.sourceId);
+      return { kind: "confirmation", current: checkpoint?.revision === row.sourceRevision };
+    }
     const proposalId = row.sourceId.startsWith("confirmation:")
       ? row.sourceId.slice("confirmation:".length) : row.sourceId;
     const proposal = database.prepare(
@@ -122,6 +132,27 @@ function sourceState(database: DatabaseSync, row: ReminderBoundaryRow):
     ).get(row.roomId, proposalId);
     return { kind: "confirmation", current: proposal?.revision === row.sourceRevision &&
       proposal.status === "pending" };
+  }
+  if (row.sourceKind === "transfer") {
+    const proposal = database.prepare(
+      `SELECT revision, status FROM project_transfer_proposals WHERE room_id = ? AND id = ?`,
+    ).get(row.roomId, row.sourceId);
+    return { kind: "transfer", current: proposal?.revision === row.sourceRevision &&
+      (proposal.status === "pending" || proposal.status === "expired") };
+  }
+  if (row.sourceKind === "due") {
+    const parent = database.prepare(
+      `SELECT boundary_id AS boundaryId, room_id AS roomId, source_kind AS sourceKind,
+              source_id AS sourceId, source_revision AS sourceRevision,
+              holder_kind AS holderKind, holder_actor_id AS holderActorId,
+              reason, since, due_at AS dueAt, lifecycle_generation AS lifecycleGeneration,
+              status
+       FROM project_ball_boundaries WHERE boundary_id = ? AND room_id = ?`,
+    ).get(row.sourceId, row.roomId) as (ReminderBoundaryRow & { status: string }) | undefined;
+    return { kind: "due", current: parent !== undefined && parent.status === "active" &&
+      parent.sourceRevision === row.sourceRevision && parent.holderKind === row.holderKind &&
+      parent.holderActorId === row.holderActorId && parent.sourceKind !== "due" &&
+      sourceState(database, parent).current };
   }
   return { kind: "next_action", current: false };
 }
@@ -150,6 +181,7 @@ function currentReminderBoundary(database: DatabaseSync, row: ReminderBoundaryRo
     roomId: row.roomId, projectId: row.roomId,
     boundaryKind: row.sourceKind === "review" ? "review" :
       row.sourceKind === "confirmation" ? "checkpoint" :
+      row.sourceKind === "due" || row.sourceKind === "transfer" ? "due" :
       row.holderKind === "agent" ? "agent_ball" : source.kind === "blocker" ||
         source.kind === "open_question" ? "blocker" : "due",
     sourceKind: source.kind, sourceId: row.sourceId, sourceRevision: row.sourceRevision,
@@ -162,7 +194,7 @@ function currentReminderBoundary(database: DatabaseSync, row: ReminderBoundaryRo
   });
 }
 
-function reminderRows(database: DatabaseSync, now: string, limit: number): ReminderBoundaryRow[] {
+function reminderRows(database: DatabaseSync, now: string, _limit: number): ReminderBoundaryRow[] {
   return database.prepare(
     `SELECT boundary.boundary_id AS boundaryId, boundary.room_id AS roomId,
             boundary.source_kind AS sourceKind, boundary.source_id AS sourceId,
@@ -172,7 +204,37 @@ function reminderRows(database: DatabaseSync, now: string, limit: number): Remin
      FROM project_ball_boundaries AS boundary
      JOIN rooms AS room ON room.id = boundary.room_id
      WHERE boundary.status = 'active' AND boundary.due_at IS NOT NULL
+       AND boundary.source_kind IN ('due', 'review', 'confirmation', 'transfer')
        AND boundary.due_at <= ? AND room.status = 'active'
+       AND (
+         (boundary.holder_kind = 'human' AND EXISTS (
+           SELECT 1 FROM room_memberships AS membership
+           WHERE membership.room_id = boundary.room_id
+             AND membership.actor_id = boundary.holder_actor_id
+             AND membership.kind = 'human'
+         )) OR
+         (boundary.holder_kind = 'agent' AND EXISTS (
+           SELECT 1 FROM room_memberships AS membership
+           JOIN agent_profiles AS profile
+             ON profile.actor_id = membership.actor_id AND profile.status = 'enabled'
+           JOIN room_agent_assignments AS assignment
+             ON assignment.room_id = membership.room_id
+            AND assignment.agent_actor_id = membership.actor_id
+            AND assignment.status = 'current' AND assignment.participation = 'active'
+            AND assignment.paused = 0
+           WHERE membership.room_id = boundary.room_id
+             AND membership.actor_id = boundary.holder_actor_id
+             AND membership.kind = 'agent' AND membership.participation = 'active'
+             AND EXISTS (SELECT 1 FROM json_each(assignment.capability_subset_json)
+                         WHERE value = 'room.project.read')
+             AND EXISTS (SELECT 1 FROM json_each(assignment.capability_subset_json)
+                         WHERE value = 'room.respond')
+             AND EXISTS (SELECT 1 FROM json_each(profile.capability_ceiling_json)
+                         WHERE value = 'room.project.read')
+             AND EXISTS (SELECT 1 FROM json_each(profile.capability_ceiling_json)
+                         WHERE value = 'room.respond')
+         ))
+       )
        AND NOT EXISTS (
          SELECT 1 FROM project_due_reminder_claims AS claim
          WHERE claim.room_id = boundary.room_id
@@ -189,7 +251,86 @@ function reminderRows(database: DatabaseSync, now: string, limit: number): Remin
            END
        )
      ORDER BY boundary.due_at, boundary.boundary_id LIMIT ?`,
-  ).all(now, now, now, limit) as unknown as ReminderBoundaryRow[];
+  ).all(now, now, now, 4_096) as unknown as ReminderBoundaryRow[];
+}
+
+function createReachedDueBoundariesInTransaction(database: DatabaseSync,
+  now: string, limit: number): number {
+  const rows = database.prepare(
+    `SELECT boundary.boundary_id AS boundaryId, boundary.room_id AS roomId,
+            boundary.source_kind AS sourceKind, boundary.source_id AS sourceId,
+            boundary.source_revision AS sourceRevision, boundary.reason, boundary.since,
+            boundary.lifecycle_generation AS lifecycleGeneration,
+            boundary.holder_kind AS holderKind, boundary.holder_actor_id AS holderActorId,
+            boundary.due_at AS dueAt
+     FROM project_ball_boundaries AS boundary
+     JOIN rooms AS room ON room.id = boundary.room_id
+     WHERE boundary.status = 'active' AND boundary.due_at IS NOT NULL
+       AND boundary.due_at <= ? AND room.status = 'active'
+       AND boundary.source_kind NOT IN ('due', 'review', 'confirmation', 'transfer')
+       AND (
+         (boundary.holder_kind = 'human' AND EXISTS (
+           SELECT 1 FROM room_memberships AS membership
+           WHERE membership.room_id = boundary.room_id
+             AND membership.actor_id = boundary.holder_actor_id
+             AND membership.kind = 'human'
+         )) OR
+         (boundary.holder_kind = 'agent' AND EXISTS (
+           SELECT 1 FROM room_memberships AS membership
+           JOIN agent_profiles AS profile
+             ON profile.actor_id = membership.actor_id AND profile.status = 'enabled'
+           JOIN room_agent_assignments AS assignment
+             ON assignment.room_id = membership.room_id
+            AND assignment.agent_actor_id = membership.actor_id
+            AND assignment.status = 'current' AND assignment.participation = 'active'
+            AND assignment.paused = 0
+           WHERE membership.room_id = boundary.room_id
+             AND membership.actor_id = boundary.holder_actor_id
+             AND membership.kind = 'agent' AND membership.participation = 'active'
+             AND EXISTS (SELECT 1 FROM json_each(assignment.capability_subset_json)
+                         WHERE value = 'room.project.read')
+             AND EXISTS (SELECT 1 FROM json_each(assignment.capability_subset_json)
+                         WHERE value = 'room.respond')
+             AND EXISTS (SELECT 1 FROM json_each(profile.capability_ceiling_json)
+                         WHERE value = 'room.project.read')
+             AND EXISTS (SELECT 1 FROM json_each(profile.capability_ceiling_json)
+                         WHERE value = 'room.respond')
+         ))
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM project_ball_boundaries AS due
+         WHERE due.room_id = boundary.room_id AND due.source_kind = 'due'
+           AND due.source_id = boundary.boundary_id AND due.status = 'active'
+       )
+     ORDER BY boundary.due_at, boundary.boundary_id LIMIT ?`,
+  ).all(now, 4_096);
+  let created = 0;
+  for (const row of rows) {
+    if (typeof row.boundaryId !== "string" || typeof row.roomId !== "string" ||
+        typeof row.sourceRevision !== "number" || typeof row.lifecycleGeneration !== "number" ||
+        (row.holderKind !== "human" && row.holderKind !== "agent") ||
+        typeof row.holderActorId !== "string" || typeof row.dueAt !== "string") {
+      throw new ProjectLoopAuthorityError("storage_unavailable", "Project due boundary row is corrupt");
+    }
+    const current = sourceState(database, row as ReminderBoundaryRow);
+    if (!current.current) continue;
+    if (created >= limit) break;
+    const boundaryId = `project-ball-${createHash("sha256").update(
+      `${row.roomId}\0due\0${row.boundaryId}\0${row.sourceRevision}` +
+        `\0${row.lifecycleGeneration}\0${row.holderKind}\0${row.holderActorId}`,
+    ).digest("hex")}`;
+    database.prepare(
+      `INSERT INTO project_ball_boundaries (
+         boundary_id, room_id, project_id, source_kind, source_id, source_revision,
+         lifecycle_generation, holder_kind, holder_actor_id, reason, since, due_at, status
+       ) VALUES (?, ?, ?, 'due', ?, ?, ?, ?, ?, 'due', ?, ?, 'active')
+       ON CONFLICT(room_id, source_kind, source_id, source_revision, lifecycle_generation)
+       DO NOTHING`,
+    ).run(boundaryId, row.roomId, row.roomId, row.boundaryId, row.sourceRevision,
+      row.lifecycleGeneration, row.holderKind, row.holderActorId, now, row.dueAt);
+    created += 1;
+  }
+  return created;
 }
 
 export type ProjectReminderAgentIntentInput = Readonly<{
@@ -326,7 +467,7 @@ export function claimProjectReminderBucketInTransaction(
 /** Bounded global scan executed within one AuthorityWorker-owned transaction. */
 export function scanProjectReminderBucketsInTransaction(
   database: DatabaseSync,
-  input: Readonly<{ now: string; limit: number }>,
+  input: Readonly<{ now: string; limit: number; agentProviderReady?: boolean }>,
   writeAgentInvocationIntentInTransaction: ProjectReminderAgentIntentWriter,
 ): ProjectReminderScanResult {
   if (!Number.isSafeInteger(input.limit) || input.limit < 1 ||
@@ -334,12 +475,21 @@ export function scanProjectReminderBucketsInTransaction(
       !Number.isFinite(Date.parse(input.now)) || new Date(Date.parse(input.now)).toISOString() !== input.now) {
     throw new TypeError("Project reminder Worker operation input was invalid");
   }
+  advanceProjectLoopTimedTransitionsInTransaction(database, {
+    now: input.now, limit: input.limit,
+  });
+  createReachedDueBoundariesInTransaction(database, input.now, input.limit);
   const candidates = reminderRows(database, input.now, input.limit)
     .map((row) => currentReminderBoundary(database, row, input.now))
-    .filter((row): row is PersistedProjectBoundary => row !== undefined);
+    .filter((row): row is PersistedProjectBoundary => row !== undefined)
+    .slice(0, input.limit);
   const claims: ProjectReminderClaimResult[] = [];
   let ignoredCount = 0;
   for (const candidate of candidates) {
+    if (candidate.holder.kind === "agent" && input.agentProviderReady === false) {
+      ignoredCount += 1;
+      continue;
+    }
     const scheduled = candidate.boundaryKind === "review" ? candidate.reviewAt : candidate.dueAt;
     if (scheduled === null) { ignoredCount += 1; continue; }
     const ordinal = currentProjectReminderOrdinal(scheduled, input.now);
@@ -376,7 +526,8 @@ export function createProjectReminderDatabaseAuthorityPort(database: DatabaseSyn
           !Number.isFinite(Date.parse(input.now))) throw new TypeError("Project reminder scan is invalid");
       return Object.freeze(reminderRows(database, input.now, input.limit)
         .map((row) => currentReminderBoundary(database, row, input.now))
-        .filter((row): row is PersistedProjectBoundary => row !== undefined));
+        .filter((row): row is PersistedProjectBoundary => row !== undefined)
+        .slice(0, input.limit));
     },
     async claimCurrentBucket(
       input: Parameters<ProjectReminderAuthorityPort["claimCurrentBucket"]>[0],

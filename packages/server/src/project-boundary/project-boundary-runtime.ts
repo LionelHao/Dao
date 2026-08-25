@@ -80,7 +80,8 @@ function providerInvocation(value: ClaimedProjectBoundaryExecution): ProjectBoun
   });
 }
 
-function providerInput(value: ClaimedProjectBoundaryExecution): AgentRuntimeProviderInput {
+function providerInput(value: ClaimedProjectBoundaryExecution,
+  providerTimeoutMs: number): AgentRuntimeProviderInput {
   let checkpoint: unknown;
   try {
     checkpoint = JSON.parse(value.checkpointProjectionJson);
@@ -148,7 +149,7 @@ function providerInput(value: ClaimedProjectBoundaryExecution): AgentRuntimeProv
       maxContextInputTokens: 16_384,
       maxOutputTokens: 2_048,
       maxOutputBytes: 64 * 1_024,
-      timeoutMs: PROVIDER_TIMEOUT_MS,
+      timeoutMs: providerTimeoutMs,
     }),
   };
   return Object.freeze(input);
@@ -170,14 +171,21 @@ export function createProjectBoundaryRuntime(options: Readonly<{
   provider: ProviderAdapter;
   now?: () => number;
   batchSize?: number;
+  providerTimeoutMs?: number;
 }>): ProjectBoundaryRuntime {
   const now = options.now ?? Date.now;
   const batchSize = options.batchSize ?? DEFAULT_BATCH_SIZE;
+  const providerTimeoutMs = options.providerTimeoutMs ?? PROVIDER_TIMEOUT_MS;
   if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 256) {
     throw new TypeError("Project boundary runtime batch size was invalid");
   }
+  if (!Number.isSafeInteger(providerTimeoutMs) || providerTimeoutMs < 1 ||
+      providerTimeoutMs > PROVIDER_TIMEOUT_MS) {
+    throw new TypeError("Project boundary Provider timeout was invalid");
+  }
   let closed = false;
   let active: Promise<void> | undefined;
+  const controllers = new Set<AbortController>();
 
   const finish = async (value: ClaimedProjectBoundaryExecution,
     outcome: "completed" | "failed", failure?: string): Promise<void> => {
@@ -205,10 +213,24 @@ export function createProjectBoundaryRuntime(options: Readonly<{
     }));
     if (begun === null) return;
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), PROVIDER_TIMEOUT_MS);
+    controllers.add(controller);
+    const timeout = setTimeout(() => controller.abort(), providerTimeoutMs);
     try {
+      const aborted = new Promise<never>((_resolve, reject) => {
+        controller.signal.addEventListener("abort", () => {
+          const error = new Error("Project boundary Provider timed out");
+          error.name = "AbortError";
+          reject(error);
+        }, { once: true });
+      });
+      const iterator = options.provider.stream(
+        providerInput(begun, providerTimeoutMs), controller.signal,
+      )[Symbol.asyncIterator]();
       let completed = false;
-      for await (const event of options.provider.stream(providerInput(begun), controller.signal)) {
+      while (true) {
+        const next = await Promise.race([iterator.next(), aborted]);
+        if (next.done) break;
+        const event = next.value;
         const providerEvent = event as ProviderEvent;
         if (providerEvent.type === "tool_call_started" || providerEvent.type === "tool_call_delta") {
           throw new Error("Project boundary Provider attempted a forbidden tool call");
@@ -216,11 +238,17 @@ export function createProjectBoundaryRuntime(options: Readonly<{
         if (providerEvent.type === "completed" || providerEvent.type === "agent_final") completed = true;
       }
       if (!completed) throw new Error("Project boundary Provider did not complete");
+      if (controller.signal.aborted) {
+        const error = new Error("Project boundary Provider timed out");
+        error.name = "AbortError";
+        throw error;
+      }
       await finish(begun, "completed");
     } catch (error: unknown) {
       await finish(begun, "failed", errorCode(error));
     } finally {
       clearTimeout(timeout);
+      controllers.delete(controller);
     }
   };
 
@@ -241,6 +269,10 @@ export function createProjectBoundaryRuntime(options: Readonly<{
   return Object.freeze({
     scan: startScan,
     async whenIdle() { await active; },
-    async close() { closed = true; await active; },
+    async close() {
+      closed = true;
+      for (const controller of controllers) controller.abort();
+      await active;
+    },
   });
 }

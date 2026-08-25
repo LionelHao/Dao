@@ -147,6 +147,8 @@ import {
   scanProjectReminderBucketsInTransaction,
 } from "../project-loop/boundary-authority.js";
 import { readProjectRouteFactsInTransaction } from "../project-loop/route-project-facts.js";
+import { advanceProjectLoopTimedTransitionsInTransaction } from
+  "../project-loop/database-authority.js";
 import { canStartRuntimeGenerationInTransaction } from "../agent-runtime/runtime-archive-fence-participant.js";
 import {
   commitInternalScopedProducerInTransaction,
@@ -7319,7 +7321,8 @@ export function executeRuntimeAuthorityOperation(
     if (operation.type === "runtime.scan-project-reminders") {
       return { kind: "project-reminder-scan", result: scanProjectReminderBucketsInTransaction(
         database,
-        { now: occurredAt, limit: operation.limit },
+        { now: occurredAt, limit: operation.limit,
+          agentProviderReady: operation.agentProviderReady },
         (transaction, intent) => {
           const request = {
             purpose: "project_boundary_invocation" as const,
@@ -7347,6 +7350,13 @@ export function executeRuntimeAuthorityOperation(
       ) };
     }
     if (operation.type === "runtime.scan-project-agent-boundaries") {
+      if (!operation.agentProviderReady) {
+        return { kind: "project-agent-boundary-scan", scannedCount: 0,
+          createdCount: 0, suppressedCount: 0 };
+      }
+      advanceProjectLoopTimedTransitionsInTransaction(database, {
+        now: occurredAt, limit: operation.limit,
+      });
       const rows = database.prepare(
         `SELECT boundary.boundary_id AS boundaryId, boundary.room_id AS roomId,
                 boundary.project_id AS projectId, boundary.source_kind AS sourceKind,
@@ -7354,8 +7364,27 @@ export function executeRuntimeAuthorityOperation(
                 boundary.holder_actor_id AS agentId, boundary.due_at AS dueAt
          FROM project_ball_boundaries AS boundary
          JOIN rooms AS room ON room.id = boundary.room_id
+         JOIN room_memberships AS membership
+           ON membership.room_id = boundary.room_id
+          AND membership.actor_id = boundary.holder_actor_id
+          AND membership.kind = 'agent' AND membership.participation = 'active'
+         JOIN agent_profiles AS profile
+           ON profile.actor_id = boundary.holder_actor_id AND profile.status = 'enabled'
+         JOIN room_agent_assignments AS assignment
+           ON assignment.room_id = boundary.room_id
+          AND assignment.agent_actor_id = boundary.holder_actor_id
+          AND assignment.status = 'current' AND assignment.participation = 'active'
+          AND assignment.paused = 0
          WHERE boundary.status = 'active' AND boundary.holder_kind = 'agent'
            AND room.status = 'active'
+           AND EXISTS (SELECT 1 FROM json_each(assignment.capability_subset_json)
+                       WHERE value = 'room.project.read')
+           AND EXISTS (SELECT 1 FROM json_each(assignment.capability_subset_json)
+                       WHERE value = 'room.respond')
+           AND EXISTS (SELECT 1 FROM json_each(profile.capability_ceiling_json)
+                       WHERE value = 'room.project.read')
+           AND EXISTS (SELECT 1 FROM json_each(profile.capability_ceiling_json)
+                       WHERE value = 'room.respond')
            AND NOT (boundary.source_kind = 'review' AND
              (boundary.due_at IS NULL OR boundary.due_at > ?))
            AND NOT EXISTS (
@@ -7378,12 +7407,13 @@ export function executeRuntimeAuthorityOperation(
             typeof row.sourceId !== "string" || typeof row.sourceRevision !== "number" ||
             typeof row.agentId !== "string" ||
             !(row.dueAt === null || typeof row.dueAt === "string")) {
-          throw new Error("Project Agent boundary scan row was corrupt");
+          suppressedCount += 1;
+          continue;
         }
         const boundaryKind = row.sourceKind === "confirmation" ? "checkpoint" as const :
           row.sourceKind === "blocker" || row.sourceKind === "open_question" ||
             row.sourceKind === "review" ? "blocker" as const :
-            row.dueAt !== null && row.dueAt <= occurredAt ? "due" as const : "agent_ball" as const;
+            row.sourceKind === "due" ? "due" as const : "agent_ball" as const;
         const request = {
           purpose: "project_boundary_invocation" as const,
           boundaryId: row.boundaryId,
@@ -7395,12 +7425,21 @@ export function executeRuntimeAuthorityOperation(
           sourceFactRevision: row.sourceRevision,
         };
         const requestSha256 = createHash("sha256").update(canonicalJson(request)).digest("hex");
-        const result = claimProjectBoundaryInvocationInTransaction(database, {
-          request, requestSha256, attemptedAt: occurredAt,
-          providerId: operation.providerId, modelId: operation.modelId,
-        });
-        if (result.status === "intent-created") createdCount += 1;
-        else suppressedCount += 1;
+        const savepoint = `project_agent_boundary_candidate_${createdCount + suppressedCount}`;
+        database.exec(`SAVEPOINT ${savepoint}`);
+        try {
+          const result = claimProjectBoundaryInvocationInTransaction(database, {
+            request, requestSha256, attemptedAt: occurredAt,
+            providerId: operation.providerId, modelId: operation.modelId,
+          });
+          database.exec(`RELEASE SAVEPOINT ${savepoint}`);
+          if (result.status === "intent-created") createdCount += 1;
+          else suppressedCount += 1;
+        } catch {
+          database.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+          database.exec(`RELEASE SAVEPOINT ${savepoint}`);
+          suppressedCount += 1;
+        }
       }
       return { kind: "project-agent-boundary-scan", scannedCount: rows.length,
         createdCount, suppressedCount };

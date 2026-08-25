@@ -384,6 +384,16 @@ export type ProjectBoundaryInvocationResult =
       status: "suppressed";
       reason: "dependency_unavailable" | "boundary_ineligible" | "authority_unavailable";
       decidedAt: string;
+    }>
+  | Readonly<{
+      boundaryId: string;
+      roomId: string;
+      status: "execution-state";
+      intentId: string;
+      executionId: string;
+      agentId: string;
+      executionStatus: "accepted" | "running" | "completed" | "failed" | "cancelled";
+      occurredAt: string;
     }>;
 
 /**
@@ -1373,6 +1383,14 @@ export function isProjectBoundaryInvocationResult(value: unknown): value is Proj
   if (value.status === "intent-created") {
     return hasExactKeys(value, ["boundaryId", "roomId", "status", "intentId", "consumedAt"]) &&
       isNonEmptyString(value.intentId) && isNonEmptyString(value.consumedAt);
+  }
+  if (value.status === "execution-state") {
+    return hasExactKeys(value, ["boundaryId", "roomId", "status", "intentId", "executionId",
+      "agentId", "executionStatus", "occurredAt"]) && isNonEmptyString(value.intentId) &&
+      isNonEmptyString(value.executionId) && isNonEmptyString(value.agentId) &&
+      (value.executionStatus === "accepted" || value.executionStatus === "running" ||
+        value.executionStatus === "completed" || value.executionStatus === "failed" ||
+        value.executionStatus === "cancelled") && isNonEmptyString(value.occurredAt);
   }
   return value.status === "suppressed" &&
     hasExactKeys(value, ["boundaryId", "roomId", "status", "reason", "decidedAt"]) &&

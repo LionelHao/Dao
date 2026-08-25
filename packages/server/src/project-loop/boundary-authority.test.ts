@@ -13,9 +13,11 @@ function fixture(holderKind: "human" | "agent" = "human") {
   const database = new DatabaseSync(":memory:");
   database.exec(`
     CREATE TABLE rooms (id TEXT PRIMARY KEY, status TEXT, archive_generation INTEGER);
-    CREATE TABLE room_memberships (room_id TEXT, actor_id TEXT, kind TEXT);
+    CREATE TABLE room_memberships (room_id TEXT, actor_id TEXT, kind TEXT, participation TEXT);
+    CREATE TABLE agent_profiles (actor_id TEXT, status TEXT, capability_ceiling_json TEXT);
     CREATE TABLE room_agent_assignments (
-      room_id TEXT, agent_actor_id TEXT, status TEXT, paused INTEGER
+      room_id TEXT, agent_actor_id TEXT, status TEXT, participation TEXT, paused INTEGER,
+      capability_subset_json TEXT
     );
     CREATE TABLE project_next_actions (id TEXT, room_id TEXT, revision INTEGER, status TEXT);
     CREATE TABLE project_requests (id TEXT, room_id TEXT, revision INTEGER, status TEXT);
@@ -55,21 +57,68 @@ function fixture(holderKind: "human" | "agent" = "human") {
     );
     INSERT INTO rooms VALUES ('room-1','active',4);
     INSERT INTO project_room_states VALUES ('room-1',7);
-    INSERT INTO room_memberships VALUES ('room-1','holder-1','${holderKind}');
+    INSERT INTO room_memberships VALUES ('room-1','holder-1','${holderKind}','active');
     INSERT INTO project_next_actions VALUES ('action-1','room-1',3,'accepted');
     INSERT INTO project_ball_boundaries VALUES (
-      'boundary-1','room-1','room-1','next_action','action-1',3,4,'${holderKind}','holder-1',
+      'boundary-parent','room-1','room-1','next_action','action-1',3,4,'${holderKind}','holder-1',
+      'due','2026-08-24T08:00:00.000Z','${now}','active',NULL
+    );
+    INSERT INTO project_ball_boundaries VALUES (
+      'boundary-1','room-1','room-1','due','boundary-parent',3,4,'${holderKind}','holder-1',
       'due','2026-08-24T08:00:00.000Z','${now}','active',NULL
     );
     INSERT INTO streams VALUES ('identity','holder-1',0);
   `);
   if (holderKind === "agent") {
-    database.exec("INSERT INTO room_agent_assignments VALUES ('room-1','holder-1','current',0)");
+    database.exec(`
+      INSERT INTO agent_profiles VALUES
+        ('holder-1','enabled','["room.project.read","room.respond"]');
+      INSERT INTO room_agent_assignments VALUES
+        ('room-1','holder-1','current','active',0,'["room.project.read","room.respond"]')
+    `);
   }
   return database;
 }
 
 describe("FT-09 database reminder authority", () => {
+  it("does not let more than 256 paused Agent candidates starve a later Human reminder", async () => {
+    const database = fixture();
+    try {
+      const membership = database.prepare("INSERT INTO room_memberships VALUES ('room-1', ?, 'agent', 'active')");
+      const profile = database.prepare(
+        `INSERT INTO agent_profiles VALUES
+         (?, 'enabled', '["room.project.read","room.respond"]')`,
+      );
+      const assignment = database.prepare(
+        `INSERT INTO room_agent_assignments VALUES
+         ('room-1', ?, 'current', 'active', 1, '["room.project.read","room.respond"]')`,
+      );
+      const action = database.prepare(
+        "INSERT INTO project_next_actions VALUES (?, 'room-1', 1, 'accepted')",
+      );
+      const boundary = database.prepare(
+        `INSERT INTO project_ball_boundaries VALUES
+         (?, 'room-1', 'room-1', ?, ?, 1, 4, 'agent', ?, 'due',
+          '2026-08-23T08:00:00.000Z', ?, 'active', NULL)`,
+      );
+      for (let index = 0; index < 300; index += 1) {
+        const suffix = String(index).padStart(3, "0");
+        const actorId = `agent-paused-${suffix}`;
+        const actionId = `action-paused-${suffix}`;
+        const parentId = `a-parent-paused-${suffix}`;
+        membership.run(actorId); profile.run(actorId); assignment.run(actorId); action.run(actionId);
+        boundary.run(parentId, "next_action", actionId, actorId, now);
+        boundary.run(`a-due-paused-${suffix}`, "due", parentId, actorId, now);
+      }
+      const authority = createProjectReminderDatabaseAuthorityPort(database, {
+        writeAgentInvocationIntentInTransaction: vi.fn(),
+      });
+      await expect(authority.listEligibleBoundaries({ now, limit: 1 })).resolves.toEqual([
+        expect.objectContaining({ boundaryId: "boundary-1", holder: { kind: "human", actorId: "holder-1" } }),
+      ]);
+    } finally { database.close(); }
+  });
+
   it("globally scans, atomically writes a Human outbox, and deduplicates recovery", async () => {
     const database = fixture();
     try {
@@ -150,6 +199,7 @@ describe("FT-09 database lifecycle participant", () => {
   it("supersedes old generation, preserves remaining duration, and reopens without burst", async () => {
     const database = fixture();
     try {
+      database.prepare("DELETE FROM project_ball_boundaries WHERE source_kind = 'due'").run();
       database.prepare("UPDATE project_ball_boundaries SET due_at = ?")
         .run("2026-08-27T08:00:00.000Z");
       database.prepare("UPDATE rooms SET status = 'archived', archive_generation = 5").run();
@@ -180,6 +230,7 @@ describe("FT-09 database lifecycle participant", () => {
   it("does not revive a responsibility that became terminal while archived", () => {
     const database = fixture();
     try {
+      database.prepare("DELETE FROM project_ball_boundaries WHERE source_kind = 'due'").run();
       database.prepare("UPDATE rooms SET status = 'archived', archive_generation = 5").run();
       archiveProjectLoopBoundariesInTransaction(database, {
         roomId: "room-1", archiveGeneration: 5, previousLifecycleGeneration: 4, occurredAt: now,

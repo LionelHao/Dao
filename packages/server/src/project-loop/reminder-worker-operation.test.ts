@@ -11,9 +11,11 @@ function fixture(): DatabaseSync {
   const database = new DatabaseSync(":memory:");
   database.exec(`
     CREATE TABLE rooms (id TEXT PRIMARY KEY, status TEXT, archive_generation INTEGER);
-    CREATE TABLE room_memberships (room_id TEXT, actor_id TEXT, kind TEXT);
+    CREATE TABLE room_memberships (room_id TEXT, actor_id TEXT, kind TEXT, participation TEXT);
+    CREATE TABLE agent_profiles (actor_id TEXT, status TEXT, capability_ceiling_json TEXT);
     CREATE TABLE room_agent_assignments (
-      room_id TEXT, agent_actor_id TEXT, status TEXT, paused INTEGER
+      room_id TEXT, agent_actor_id TEXT, status TEXT, participation TEXT, paused INTEGER,
+      capability_subset_json TEXT
     );
     CREATE TABLE project_next_actions (id TEXT, room_id TEXT, revision INTEGER, status TEXT);
     CREATE TABLE project_requests (id TEXT, room_id TEXT, revision INTEGER, status TEXT);
@@ -49,14 +51,22 @@ function fixture(): DatabaseSync {
     CREATE TABLE ft08_intents (id TEXT PRIMARY KEY, boundary_id TEXT, created_at TEXT);
     INSERT INTO rooms VALUES ('room-agent','active',3), ('room-human','active',1);
     INSERT INTO room_memberships VALUES
-      ('room-agent','agent-1','agent'), ('room-human','human-1','human');
-    INSERT INTO room_agent_assignments VALUES ('room-agent','agent-1','current',0);
+      ('room-agent','agent-1','agent','active'), ('room-human','human-1','human','active');
+    INSERT INTO agent_profiles VALUES
+      ('agent-1','enabled','["room.project.read","room.respond"]');
+    INSERT INTO room_agent_assignments VALUES
+      ('room-agent','agent-1','current','active',0,'["room.project.read","room.respond"]');
     INSERT INTO project_next_actions VALUES
       ('action-agent','room-agent',2,'accepted'), ('action-human','room-human',4,'accepted');
     INSERT INTO project_ball_boundaries VALUES
-      ('boundary-agent','room-agent','room-agent','next_action','action-agent',2,3,
+      ('parent-agent','room-agent','room-agent','next_action','action-agent',2,3,
        'agent','agent-1','due','2026-08-24T08:00:00.000Z', '${now}', 'active',NULL),
-      ('boundary-human','room-human','room-human','next_action','action-human',4,1,
+      ('parent-human','room-human','room-human','next_action','action-human',4,1,
+       'human','human-1','due','2026-08-24T08:00:00.000Z', '${now}', 'active',NULL);
+    INSERT INTO project_ball_boundaries VALUES
+      ('boundary-agent','room-agent','room-agent','due','parent-agent',2,3,
+       'agent','agent-1','due','2026-08-24T08:00:00.000Z', '${now}', 'active',NULL),
+      ('boundary-human','room-human','room-human','due','parent-human',4,1,
        'human','human-1','due','2026-08-24T08:00:00.000Z', '${now}', 'active',NULL);
     INSERT INTO streams VALUES ('identity','human-1',0);
   `);

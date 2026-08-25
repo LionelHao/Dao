@@ -16,6 +16,22 @@ function state(overrides: Partial<InvocationSurfaceState> = {}): InvocationSurfa
 }
 
 describe("production Invocation surface", () => {
+  it("renders every authoritative Project boundary execution state", async () => {
+    const statuses = ["accepted", "running", "completed", "failed", "cancelled"] as const;
+    const projectBoundaries = statuses.map((executionStatus, index) => ({
+      boundaryId: `boundary-${index}`, roomId: "room-1", status: "execution-state" as const,
+      intentId: `intent-${index}`, executionId: `project-execution-${index}`, agentId: "agent-1",
+      executionStatus, occurredAt: `2026-08-25T00:00:0${index}.000Z`,
+    }));
+    const bridge: InvocationBridge = { getSurface: vi.fn().mockResolvedValue(state({ projectBoundaries })),
+      cancel: vi.fn(), retry: vi.fn(), onStateChanged: () => vi.fn() };
+    const root = document.createElement("div");
+    mountInvocationSurface(root, bridge, "room-1", { onHostAction: vi.fn() });
+    await vi.waitFor(() => expect(root.querySelectorAll("[data-project-boundary-execution-status]"))
+      .toHaveLength(5));
+    for (const status of statuses) expect(root.textContent).toContain(`项目边界执行：${status}`);
+  });
+
   it("submits scoped expectedVersion control but waits for authority state before changing the card", async () => {
     let listener: ((value: InvocationStateEnvelope) => void) | undefined;
     const cancel = vi.fn().mockResolvedValue({ requestId: "cancel-1", state: state({ operations: [{

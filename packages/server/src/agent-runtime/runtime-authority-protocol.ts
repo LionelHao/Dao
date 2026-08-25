@@ -112,6 +112,7 @@ export type RuntimeAuthorityOperation =
       readonly type: "runtime.scan-project-reminders";
       readonly providerId: string;
       readonly modelId: string;
+      readonly agentProviderReady: boolean;
       readonly limit: number;
       readonly now: number;
     }
@@ -119,6 +120,7 @@ export type RuntimeAuthorityOperation =
       readonly type: "runtime.scan-project-agent-boundaries";
       readonly providerId: string;
       readonly modelId: string;
+      readonly agentProviderReady: boolean;
       readonly limit: number;
       readonly now: number;
     }
@@ -584,14 +586,14 @@ export function isRuntimeAuthorityOperation(value: unknown): value is RuntimeAut
       value.limit <= 256 && count(value.now);
   }
   if (value.type === "runtime.scan-project-reminders") {
-    return exact(value, ["type", "providerId", "modelId", "limit", "now"]) &&
+    return exact(value, ["type", "providerId", "modelId", "agentProviderReady", "limit", "now"]) &&
       text(value.providerId) && text(value.modelId) && count(value.limit, 1) &&
-      value.limit <= 256 && count(value.now);
+      typeof value.agentProviderReady === "boolean" && value.limit <= 256 && count(value.now);
   }
   if (value.type === "runtime.scan-project-agent-boundaries") {
-    return exact(value, ["type", "providerId", "modelId", "limit", "now"]) &&
+    return exact(value, ["type", "providerId", "modelId", "agentProviderReady", "limit", "now"]) &&
       text(value.providerId) && text(value.modelId) && count(value.limit, 1) &&
-      value.limit <= 256 && count(value.now);
+      typeof value.agentProviderReady === "boolean" && value.limit <= 256 && count(value.now);
   }
   if (value.type === "runtime.read-project-route-facts") {
     return exact(value, ["type", "roomId", "now"]) && text(value.roomId) && count(value.now);

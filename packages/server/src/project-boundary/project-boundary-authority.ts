@@ -115,46 +115,74 @@ function sourceIsCurrent(database: DatabaseSync, row: Row, attemptedAt: string):
     return proposal !== undefined && proposal.revision === sourceRevision &&
       proposal.status === "pending";
   }
+  if (row.sourceKind === "due") {
+    const parent = database.prepare(
+      `SELECT boundary.room_id AS roomId, boundary.source_kind AS sourceKind,
+              boundary.source_id AS sourceId, boundary.source_revision AS sourceRevision,
+              boundary.holder_actor_id AS agentId, boundary.status AS boundaryStatus,
+              boundary.due_at AS dueAt
+       FROM project_ball_boundaries AS boundary
+       WHERE boundary.boundary_id = ? AND boundary.room_id = ?`,
+    ).get(sourceId, roomId) as Row | undefined;
+    return parent !== undefined && parent.boundaryStatus === "active" &&
+      parent.sourceKind !== "due" && parent.sourceRevision === sourceRevision &&
+      parent.agentId === agentId && sourceIsCurrent(database, parent, attemptedAt);
+  }
   return false;
 }
 
 function boundaryKindMatches(row: Row, request: ProjectBoundaryInvocationRequest,
-  attemptedAt: string): boolean {
+  _attemptedAt: string): boolean {
   const expected = row.sourceKind === "confirmation" ? "checkpoint" :
     row.sourceKind === "blocker" || row.sourceKind === "open_question" ||
       row.sourceKind === "review" ? "blocker" :
-      typeof row.dueAt === "string" && row.dueAt <= attemptedAt ? "due" : "agent_ball";
+      row.sourceKind === "due" ? "due" : "agent_ball";
   return request.boundaryKind === expected;
 }
 
-function appendDecisionEvent(database: DatabaseSync, request: ProjectBoundaryInvocationRequest,
-  result: ProjectBoundaryInvocationResult, occurredAt: string): void {
+function appendInvocationEvent(database: DatabaseSync, identity: Readonly<{
+  boundaryId: string; roomId: string; agentId: string;
+}>, result: ProjectBoundaryInvocationResult, occurredAt: string): void {
   const stream = database.prepare(
     `SELECT head_seq AS headSeq FROM streams
      WHERE stream_kind = 'room' AND stream_id = ?`,
-  ).get(request.roomId);
+  ).get(identity.roomId);
   if (typeof stream?.headSeq !== "number") throw new Error("Project boundary stream is unavailable");
   const streamSeq = stream.headSeq + 1;
   const advanced = database.prepare(
     `UPDATE streams SET head_seq = ?
      WHERE stream_kind = 'room' AND stream_id = ? AND head_seq = ?`,
-  ).run(streamSeq, request.roomId, stream.headSeq);
+  ).run(streamSeq, identity.roomId, stream.headSeq);
   if (advanced.changes !== 1) throw new Error("Project boundary stream compare-and-set failed");
-  const eventId = `project-boundary-event:${digest(request.boundaryId,
-    String(request.sourceFactRevision), JSON.stringify(result))}`;
+  const eventId = `project-boundary-event:${digest(identity.boundaryId, JSON.stringify(result))}`;
   database.prepare(
     `INSERT INTO events (
        event_id, stream_kind, stream_id, stream_seq, room_id, actor_id,
        event_type, occurred_at, payload_json
      ) VALUES (?, 'room', ?, ?, ?, ?, 'project.boundary.invocation.decided', ?, ?)`,
-  ).run(eventId, request.roomId, streamSeq, request.roomId, request.agentId,
+  ).run(eventId, identity.roomId, streamSeq, identity.roomId, identity.agentId,
     occurredAt, JSON.stringify(result as unknown as JsonValue));
   database.prepare(
     `INSERT INTO outbox_deliveries (
        id, event_id, target_kind, target_id, stream_seq, status,
        attempts, available_at, delivered_at, last_error
      ) VALUES (?, ?, 'room', ?, ?, 'pending', 0, ?, NULL, NULL)`,
-  ).run(`outbox:${eventId}`, eventId, request.roomId, streamSeq, occurredAt);
+  ).run(`outbox:${eventId}`, eventId, identity.roomId, streamSeq, occurredAt);
+}
+
+function appendDecisionEvent(database: DatabaseSync, request: ProjectBoundaryInvocationRequest,
+  result: ProjectBoundaryInvocationResult, occurredAt: string): void {
+  appendInvocationEvent(database, request, result, occurredAt);
+}
+
+function appendExecutionStateEvent(database: DatabaseSync,
+  execution: ClaimedProjectBoundaryExecution, occurredAt: string): void {
+  appendInvocationEvent(database, execution, Object.freeze({
+    boundaryId: execution.boundaryId, roomId: execution.roomId,
+    status: "execution-state" as const, intentId: execution.intentId,
+    executionId: execution.executionId, agentId: execution.agentId,
+    executionStatus: execution.status, occurredAt,
+  }), occurredAt);
 }
 
 function priorDecision(database: DatabaseSync, request: ProjectBoundaryInvocationRequest,
@@ -211,6 +239,7 @@ export function claimProjectBoundaryInvocationInTransaction(database: DatabaseSy
             membership.access_revision AS accessRevision,
             profile.id AS profileId, profile.revision AS profileRevision,
             profile.status AS profileStatus,
+            profile.capability_ceiling_json AS capabilityCeilingJson,
             assignment.id AS assignmentId, assignment.revision AS assignmentRevision,
             assignment.status AS assignmentStatus,
             assignment.participation AS assignmentParticipation,
@@ -239,22 +268,34 @@ export function claimProjectBoundaryInvocationInTransaction(database: DatabaseSy
      WHERE boundary.boundary_id = ?`,
   ).get(input.request.boundaryId) as Row | undefined;
   let capabilities: unknown = null;
+  let capabilityCeiling: unknown = null;
   try { capabilities = typeof row?.capabilitiesJson === "string"
     ? JSON.parse(row.capabilitiesJson) : null; } catch { capabilities = null; }
-  const eligible = row !== undefined && row.roomId === input.request.roomId &&
+  try { capabilityCeiling = typeof row?.capabilityCeilingJson === "string"
+    ? JSON.parse(row.capabilityCeilingJson) : null; } catch { capabilityCeiling = null; }
+  const structurallyCurrent = row !== undefined && row.roomId === input.request.roomId &&
     row.projectId === input.request.projectId && row.sourceId === input.request.sourceFactId &&
     row.sourceRevision === input.request.sourceFactRevision && row.agentId === input.request.agentId &&
     row.holderKind === "agent" && row.boundaryStatus === "active" && row.roomStatus === "active" &&
-    row.archiveGeneration === row.lifecycleGeneration && row.membershipKind === "agent" &&
+    row.archiveGeneration === row.lifecycleGeneration &&
+    boundaryKindMatches(row, input.request, input.attemptedAt) &&
+    sourceIsCurrent(database, row, input.attemptedAt);
+  const eligible = structurallyCurrent && row.membershipKind === "agent" &&
     row.membershipParticipation === "active" && row.profileStatus === "enabled" &&
     row.assignmentStatus === "current" && row.assignmentParticipation === "active" &&
     row.assignmentPaused === 0 && Array.isArray(capabilities) &&
     capabilities.includes("room.project.read") && capabilities.includes("room.respond") &&
+    Array.isArray(capabilityCeiling) && capabilityCeiling.includes("room.project.read") &&
+    capabilityCeiling.includes("room.respond") &&
     typeof row.checkpointId === "string" && typeof row.checkpointRevision === "number" &&
-    typeof row.checkpointSha256 === "string" && typeof row.checkpointProjectionJson === "string" &&
-    boundaryKindMatches(row, input.request, input.attemptedAt) &&
-    sourceIsCurrent(database, row, input.attemptedAt);
+    typeof row.checkpointSha256 === "string" && typeof row.checkpointProjectionJson === "string";
   if (!eligible) {
+    const result = Object.freeze({ boundaryId: input.request.boundaryId,
+      roomId: input.request.roomId, status: "suppressed" as const,
+      reason: "boundary_ineligible" as const, decidedAt: input.attemptedAt });
+    // Membership/Profile/Assignment/Provider prerequisites are recoverable. Do not
+    // consume the stable boundary merely because one scan observed a transient gate.
+    if (structurallyCurrent) return result;
     database.prepare(
       `INSERT INTO project_boundary_invocation_receipts (
          boundary_id, room_id, source_revision, status, invocation_intent_id,
@@ -262,9 +303,6 @@ export function claimProjectBoundaryInvocationInTransaction(database: DatabaseSy
        ) VALUES (?, ?, ?, 'suppressed', NULL, ?, ?)`,
     ).run(input.request.boundaryId, input.request.roomId, input.request.sourceFactRevision,
       input.requestSha256, input.attemptedAt);
-    const result = Object.freeze({ boundaryId: input.request.boundaryId,
-      roomId: input.request.roomId, status: "suppressed" as const,
-      reason: "boundary_ineligible" as const, decidedAt: input.attemptedAt });
     appendDecisionEvent(database, input.request, result, input.attemptedAt);
     return result;
   }
@@ -347,6 +385,9 @@ export function claimProjectBoundaryInvocationInTransaction(database: DatabaseSy
     roomId: input.request.roomId, status: "intent-created" as const, intentId,
     consumedAt: input.attemptedAt });
   appendDecisionEvent(database, input.request, result, input.attemptedAt);
+  const accepted = executionRow(database, executionId);
+  if (accepted === undefined) throw new Error("Project boundary execution was not persisted");
+  appendExecutionStateEvent(database, publicExecution(accepted), input.attemptedAt);
   return result;
 }
 
@@ -496,12 +537,16 @@ export function beginProjectBoundaryExecutionInTransaction(database: DatabaseSyn
   const row = executionRow(database, input.executionId);
   if (row === undefined || row.version !== input.expectedVersion || row.status !== "accepted") return null;
   if (!executionIsCurrent(database, row, input.now)) {
-    database.prepare(
+    const changed = database.prepare(
       `UPDATE project_boundary_agent_executions
        SET public_status = 'cancelled', phase = 'cancelled', authority_version = authority_version + 1,
            completed_at = ?, cancellation_reason = 'source_ineligible', updated_at = ?
        WHERE execution_id = ? AND authority_version = ? AND public_status = 'accepted'`,
     ).run(input.now, input.now, input.executionId, input.expectedVersion);
+    if (changed.changes === 1) {
+      const cancelled = executionRow(database, input.executionId);
+      if (cancelled !== undefined) appendExecutionStateEvent(database, publicExecution(cancelled), input.now);
+    }
     return null;
   }
   const changed = database.prepare(
@@ -512,7 +557,10 @@ export function beginProjectBoundaryExecutionInTransaction(database: DatabaseSyn
   ).run(input.now, input.now, input.executionId, input.expectedVersion);
   if (changed.changes !== 1) return null;
   const current = executionRow(database, input.executionId);
-  return current === undefined ? null : publicExecution(current);
+  if (current === undefined) return null;
+  const result = publicExecution(current);
+  appendExecutionStateEvent(database, result, input.now);
+  return result;
 }
 
 export function finishProjectBoundaryExecutionInTransaction(database: DatabaseSync, input: Readonly<{
@@ -525,12 +573,16 @@ export function finishProjectBoundaryExecutionInTransaction(database: DatabaseSy
   const row = executionRow(database, input.executionId);
   if (row === undefined || row.version !== input.expectedVersion || row.status !== "running") return null;
   if (!executionIsCurrent(database, row, input.now)) {
-    database.prepare(
+    const changed = database.prepare(
       `UPDATE project_boundary_agent_executions
        SET public_status = 'cancelled', phase = 'cancelled', authority_version = authority_version + 1,
            completed_at = ?, cancellation_reason = 'source_ineligible', updated_at = ?
        WHERE execution_id = ? AND authority_version = ? AND public_status = 'running'`,
     ).run(input.now, input.now, input.executionId, input.expectedVersion);
+    if (changed.changes === 1) {
+      const cancelled = executionRow(database, input.executionId);
+      if (cancelled !== undefined) appendExecutionStateEvent(database, publicExecution(cancelled), input.now);
+    }
     return null;
   }
   const errorCode = input.outcome === "failed" ? input.errorCode ?? "provider_failure" : null;
@@ -543,5 +595,8 @@ export function finishProjectBoundaryExecutionInTransaction(database: DatabaseSy
     input.executionId, input.expectedVersion);
   if (changed.changes !== 1) return null;
   const current = executionRow(database, input.executionId);
-  return current === undefined ? null : publicExecution(current);
+  if (current === undefined) return null;
+  const result = publicExecution(current);
+  appendExecutionStateEvent(database, result, input.now);
+  return result;
 }

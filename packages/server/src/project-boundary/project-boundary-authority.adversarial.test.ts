@@ -8,6 +8,10 @@ import { migrateAuthorityDatabase } from "../persistence/schema.js";
 import { executeRuntimeAuthorityOperation } from "../persistence/authority-database-handler.js";
 import { executeProjectLoopAuthorityOperation } from "../project-loop/database-authority.js";
 import {
+  archiveProjectLoopBoundariesInTransaction,
+  reopenProjectLoopBoundariesInTransaction,
+} from "../project-loop/boundary-authority.js";
+import {
   beginProjectBoundaryExecutionInTransaction,
   claimProjectBoundaryInvocationInTransaction,
   finishProjectBoundaryExecutionInTransaction,
@@ -156,6 +160,69 @@ function counts(database: DatabaseSync) {
 }
 
 describe("FT-09 Project boundary adversarial authority", () => {
+  it("does not receipt a transient checkpoint outage and admits the boundary after recovery", () => {
+    const database = fixture();
+    try {
+      database.prepare("DELETE FROM project_fact_checkpoints WHERE checkpoint_id = 'checkpoint-one'").run();
+      expect(claim(database)).toMatchObject({ status: "suppressed", reason: "boundary_ineligible" });
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM project_boundary_invocation_receipts",
+      ).get()).toEqual({ count: 0 });
+      database.exec(`
+        INSERT INTO project_fact_checkpoints (
+          checkpoint_id, room_id, project_id, project_revision, projection_json,
+          projection_sha256, created_at
+        ) VALUES (
+          'checkpoint-one', 'room-project', 'room-project', 9,
+          '{"recordVersion":"project-loop.v1"}', '${CHECKPOINT_HASH}', '${NOW}'
+        )
+      `);
+      expect(claim(database)).toMatchObject({ status: "intent-created" });
+      expect(counts(database).executions).toEqual({ count: 1 });
+    } finally {
+      close(database);
+    }
+  });
+
+  it("keeps no-provider scans from claiming Agent work while still delivering Human due reminders", () => {
+    const database = fixture();
+    try {
+      expect(executeRuntimeAuthorityOperation(database, {
+        type: "runtime.scan-project-agent-boundaries", providerId: "provider-one",
+        modelId: "model-one", agentProviderReady: false, limit: 256, now: Date.parse(NOW),
+      })).toMatchObject({ createdCount: 0, suppressedCount: 0 });
+      database.exec(`
+        INSERT INTO project_next_actions (
+          id, room_id, source_room_id, source_id, revision, owner_kind,
+          owner_actor_id, verifier_human_actor_id, status
+        ) VALUES (
+          'action-human', 'room-project', 'room-project', 'legacy-human-source', 1,
+          'human', 'human-owner', NULL, 'accepted'
+        );
+        INSERT INTO project_ball_boundaries (
+          boundary_id, room_id, project_id, source_kind, source_id, source_revision,
+          lifecycle_generation, holder_kind, holder_actor_id, reason, since, due_at,
+          status, released_at
+        ) VALUES
+          ('boundary-human-parent', 'room-project', 'room-project', 'next_action',
+           'action-human', 1, 0, 'human', 'human-owner', 'work', '${NOW}', '${NOW}', 'active', NULL),
+          ('boundary-human-due', 'room-project', 'room-project', 'due',
+           'boundary-human-parent', 1, 0, 'human', 'human-owner', 'due', '${NOW}', '${NOW}', 'active', NULL);
+      `);
+      expect(executeRuntimeAuthorityOperation(database, {
+        type: "runtime.scan-project-reminders", providerId: "provider-one",
+        modelId: "model-one", agentProviderReady: false, limit: 256, now: Date.parse(NOW),
+      })).toMatchObject({ kind: "project-reminder-scan", result: { claimedCount: 1 } });
+      expect(counts(database).intents).toEqual({ count: 0 });
+      expect(database.prepare(
+        `SELECT COUNT(*) AS count FROM outbox_deliveries
+         WHERE target_kind = 'principal' AND target_id = 'human-owner'`,
+      ).get()).toEqual({ count: 1 });
+    } finally {
+      close(database);
+    }
+  });
+
   it("creates one message-independent execution, exact-replays it, and closes its CAS state machine", () => {
     const database = fixture();
     try {
@@ -194,6 +261,13 @@ describe("FT-09 Project boundary adversarial authority", () => {
       })).toBeNull();
       expect(listRunnableProjectBoundaryExecutions(database, 10)).toEqual([]);
       expect(counts(database).messages).toEqual({ count: 0 });
+      expect(database.prepare(
+        `SELECT json_extract(payload_json, '$.executionStatus') AS status
+         FROM events
+         WHERE event_type = 'project.boundary.invocation.decided'
+           AND json_extract(payload_json, '$.status') = 'execution-state'
+         ORDER BY stream_seq`,
+      ).all()).toEqual([{ status: "accepted" }, { status: "running" }, { status: "completed" }]);
     } finally {
       close(database);
     }
@@ -278,9 +352,21 @@ describe("FT-09 Project boundary adversarial authority", () => {
   it("admits one due execution only after the exact due boundary is reached", () => {
     const database = fixture();
     try {
-      database.prepare("UPDATE project_ball_boundaries SET due_at = ? WHERE boundary_id = 'boundary-one'")
-        .run("2026-08-25T07:59:59.000Z");
-      expect(claim(database, request({ boundaryKind: "due" })))
+      database.exec(`
+        UPDATE project_ball_boundaries SET due_at = '2026-08-25T07:59:59.000Z'
+        WHERE boundary_id = 'boundary-one';
+        INSERT INTO project_ball_boundaries (
+          boundary_id, room_id, project_id, source_kind, source_id, source_revision,
+          lifecycle_generation, holder_kind, holder_actor_id, reason, since, due_at,
+          status, released_at
+        ) VALUES (
+          'boundary-due', 'room-project', 'room-project', 'due', 'boundary-one', 4,
+          0, 'agent', 'agent-one', 'due', '${NOW}',
+          '2026-08-25T07:59:59.000Z', 'active', NULL
+        )
+      `);
+      expect(claim(database, request({ boundaryId: "boundary-due", boundaryKind: "due",
+        sourceFactId: "boundary-one" })))
         .toMatchObject({ status: "intent-created" });
       expect(counts(database)).toEqual({
         intents: { count: 1 }, executions: { count: 1 }, messages: { count: 0 },
@@ -331,10 +417,15 @@ describe("FT-09 Project boundary adversarial authority", () => {
         WHERE boundary_id = 'boundary-one';
         INSERT INTO project_obstacles (
           id, room_id, source_room_id, source_id, revision, kind,
-          owner_kind, owner_actor_id, status, review_at
+          owner_kind, owner_actor_id, status, review_at,
+          title, description, impact, resolution_criteria,
+          source_kind, source_revision, created_by_actor_id, visibility_room_id,
+          created_at, updated_at
         ) VALUES (
           'obstacle-future', 'room-project', 'room-project', 'legacy-obstacle-source', 2,
-          'blocker', 'agent', 'agent-one', 'deferred', '2026-08-25T09:00:00.000Z'
+          'blocker', 'agent', 'agent-one', 'deferred', '2026-08-25T09:00:00.000Z',
+          'Future blocker', 'Wait for review', 'Blocks delivery', 'Resolve it',
+          'message', 1, 'human-owner', 'room-project', '${NOW}', '${NOW}'
         );
         INSERT INTO project_ball_boundaries (
           boundary_id, room_id, project_id, source_kind, source_id, source_revision,
@@ -347,44 +438,61 @@ describe("FT-09 Project boundary adversarial authority", () => {
         );
       `);
       expect(executeRuntimeAuthorityOperation(database, {
-        type: "runtime.scan-project-agent-boundaries", providerId: "provider-one",
+        type: "runtime.scan-project-agent-boundaries", providerId: "provider-one", agentProviderReady: true,
         modelId: "model-one", limit: 10, now: Date.parse(NOW),
       })).toMatchObject({ createdCount: 0, suppressedCount: 0 });
       expect(database.prepare(
         "SELECT COUNT(*) AS count FROM project_boundary_invocation_receipts",
       ).get()).toEqual({ count: 0 });
       expect(executeRuntimeAuthorityOperation(database, {
-        type: "runtime.scan-project-agent-boundaries", providerId: "provider-one",
+        type: "runtime.scan-project-agent-boundaries", providerId: "provider-one", agentProviderReady: true,
         modelId: "model-one", limit: 10, now: Date.parse("2026-08-25T09:00:00.000Z"),
-      })).toMatchObject({ createdCount: 1, suppressedCount: 0 });
+      })).toMatchObject({ createdCount: 1 });
       expect(counts(database).executions).toEqual({ count: 1 });
+      expect(database.prepare(
+        "SELECT status, revision, review_at AS reviewAt FROM project_obstacles WHERE id = 'obstacle-future'",
+      ).get()).toEqual({ status: "open", revision: 3, reviewAt: null });
+      expect(database.prepare(
+        `SELECT source_kind AS sourceKind, source_revision AS sourceRevision, status
+         FROM project_ball_boundaries WHERE source_id = 'obstacle-future'
+         ORDER BY source_revision`,
+      ).all()).toEqual([
+        { sourceKind: "review", sourceRevision: 2, status: "superseded" },
+        { sourceKind: "blocker", sourceRevision: 3, status: "active" },
+      ]);
     } finally {
       close(database);
     }
   });
 
-  it("converges a later due reminder on the prior Agent-Ball intent without a hash conflict or chain", () => {
+  it("creates an independent due execution after the earlier Agent-Ball execution", () => {
     const database = fixture();
     try {
       database.prepare(
         "UPDATE project_ball_boundaries SET due_at = ? WHERE boundary_id = 'boundary-one'",
       ).run("2026-08-25T09:00:00.000Z");
       expect(executeRuntimeAuthorityOperation(database, {
-        type: "runtime.scan-project-agent-boundaries", providerId: "provider-one",
+        type: "runtime.scan-project-agent-boundaries", providerId: "provider-one", agentProviderReady: true,
         modelId: "model-one", limit: 10, now: Date.parse(NOW),
       })).toMatchObject({ createdCount: 1, suppressedCount: 0 });
       expect(executeRuntimeAuthorityOperation(database, {
-        type: "runtime.scan-project-reminders", providerId: "provider-one",
+        type: "runtime.scan-project-reminders", providerId: "provider-one", agentProviderReady: true,
         modelId: "model-one", limit: 10, now: Date.parse("2026-08-25T09:00:00.000Z"),
       })).toMatchObject({
         kind: "project-reminder-scan",
         result: { claimedCount: 1, duplicateCount: 0 },
       });
-      expect(counts(database).executions).toEqual({ count: 1 });
+      expect(counts(database).executions).toEqual({ count: 2 });
       expect(database.prepare(
-        `SELECT status FROM project_due_reminder_claims
-         WHERE boundary_id = 'boundary-one' AND reminder_ordinal = 0`,
+        `SELECT claim.status FROM project_due_reminder_claims AS claim
+         JOIN project_ball_boundaries AS boundary ON boundary.boundary_id = claim.boundary_id
+         WHERE boundary.source_kind = 'due' AND boundary.source_id = 'boundary-one'
+           AND claim.reminder_ordinal = 0`,
       ).get()).toEqual({ status: "dispatched" });
+      expect(database.prepare(
+        `SELECT boundary_kind AS boundaryKind FROM project_boundary_agent_invocation_intents
+         ORDER BY created_at, intent_id`,
+      ).all()).toEqual([{ boundaryKind: "agent_ball" }, { boundaryKind: "due" }]);
     } finally {
       close(database);
     }
@@ -455,9 +563,21 @@ describe("FT-09 pending confirmation Ball adversarial authority", () => {
       ).get()).toEqual({
         status: "superseded", releasedAt: new Date(Date.parse(NOW) + 1).toISOString(),
       });
+      const archivedAt = new Date(Date.parse(NOW) + 2).toISOString();
+      database.prepare("UPDATE rooms SET status = 'archived', archive_generation = 1 WHERE id = 'room-project'").run();
+      expect(archiveProjectLoopBoundariesInTransaction(database, {
+        roomId: "room-project", archiveGeneration: 1, previousLifecycleGeneration: 0,
+        occurredAt: archivedAt,
+      })).toMatchObject({ suspendedBoundaryCount: 1 });
+      const reopenedAt = new Date(Date.parse(NOW) + 3).toISOString();
+      database.prepare("UPDATE rooms SET status = 'active' WHERE id = 'room-project'").run();
+      expect(reopenProjectLoopBoundariesInTransaction(database, {
+        roomId: "room-project", archiveGeneration: 1, previousLifecycleGeneration: 1,
+        occurredAt: reopenedAt,
+      })).toMatchObject({ replacementBoundaryCount: 1 });
       expect(executeRuntimeAuthorityOperation(database, {
-        type: "runtime.scan-project-agent-boundaries", providerId: "provider-one",
-        modelId: "model-one", limit: 10, now: Date.parse(NOW) + 2,
+        type: "runtime.scan-project-agent-boundaries", providerId: "provider-one", agentProviderReady: true,
+        modelId: "model-one", limit: 10, now: Date.parse(NOW) + 4,
       })).toMatchObject({ createdCount: 1, suppressedCount: 0 });
       expect(database.prepare(
         `SELECT intent.boundary_kind AS boundaryKind, intent.source_id AS sourceId,

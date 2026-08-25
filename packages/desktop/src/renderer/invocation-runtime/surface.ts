@@ -290,7 +290,13 @@ export function mountInvocationSurface(
       for (const boundary of state.projectBoundaries) {
         const item = document.createElement("li");
         item.textContent = boundary.status === "intent-created" ? "项目边界已创建调用意图"
-          : `项目边界已关闭：${boundary.reason}`;
+          : boundary.status === "execution-state"
+            ? `项目边界执行：${boundary.executionStatus}`
+            : `项目边界已关闭：${boundary.reason}`;
+        if (boundary.status === "execution-state") {
+          item.dataset.projectBoundaryExecutionStatus = boundary.executionStatus;
+          item.dataset.projectBoundaryExecutionId = boundary.executionId;
+        }
         boundaries.append(item);
       }
       panel.append(boundaries);

@@ -92,4 +92,65 @@ describe("Project boundary runtime", () => {
       type: "runtime.finish-project-boundary-execution", errorCode: "runtime_restarted",
     }));
   });
+
+  it("fails within the configured deadline when Provider ignores abort and discards a late final", async () => {
+    const operations: Record<string, unknown>[] = [];
+    const authority = { executeRuntime: vi.fn(async (operation: Record<string, unknown>) => {
+      operations.push(operation);
+      if (operation.type === "runtime.scan-project-boundary-executions") {
+        return { kind: "project-boundary-executions", records: [execution] };
+      }
+      if (operation.type === "runtime.begin-project-boundary-execution") {
+        return { kind: "project-boundary-execution", execution: { ...execution,
+          status: "running", version: 2 } };
+      }
+      return { kind: "project-boundary-execution", execution: { ...execution,
+        status: "failed", version: 3 } };
+    }) };
+    let release!: () => void;
+    const late = new Promise<void>((resolve) => { release = resolve; });
+    const provider = { id: "provider-1", async *stream(): AsyncIterable<ProviderEvent> {
+      await late;
+      yield { type: "agent_final", sequence: 1, body: "too late", citations: [] };
+    } };
+    const runtime = createProjectBoundaryRuntime({ authority, provider, providerTimeoutMs: 5 });
+    await runtime.scan();
+    expect(operations.at(-1)).toEqual(expect.objectContaining({
+      type: "runtime.finish-project-boundary-execution", outcome: "failed",
+      errorCode: "provider_timeout",
+    }));
+    release();
+    await Promise.resolve();
+    expect(operations.filter((operation) =>
+      operation.type === "runtime.finish-project-boundary-execution")).toHaveLength(1);
+  });
+
+  it("bounds close even while Provider ignores its AbortSignal", async () => {
+    let providerStarted!: () => void;
+    const started = new Promise<void>((resolve) => { providerStarted = resolve; });
+    const authority = { executeRuntime: vi.fn(async (operation: Record<string, unknown>) => {
+      if (operation.type === "runtime.scan-project-boundary-executions") {
+        return { kind: "project-boundary-executions", records: [execution] };
+      }
+      if (operation.type === "runtime.begin-project-boundary-execution") {
+        return { kind: "project-boundary-execution", execution: { ...execution,
+          status: "running", version: 2 } };
+      }
+      return { kind: "project-boundary-execution", execution: { ...execution,
+        status: "failed", version: 3 } };
+    }) };
+    const provider = { id: "provider-1", async *stream(): AsyncIterable<ProviderEvent> {
+      providerStarted();
+      await new Promise<never>(() => undefined);
+    } };
+    const runtime = createProjectBoundaryRuntime({ authority, provider });
+    const scan = runtime.scan();
+    await started;
+    await runtime.close();
+    await scan;
+    expect(authority.executeRuntime).toHaveBeenLastCalledWith(expect.objectContaining({
+      type: "runtime.finish-project-boundary-execution", outcome: "failed",
+      errorCode: "provider_timeout",
+    }));
+  });
 });
