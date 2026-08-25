@@ -42,6 +42,7 @@ function closedError(error: unknown): GovernanceClosedError {
     case "rate_limited": return { status: 429, code: "rate_limited" };
     case "dependency_unavailable": return { status: 503, code: "dependency_unavailable" };
     case "snapshot_stale":
+    case "context_unavailable":
     case "execution_conflict":
     case "protocol_upgrade_required":
     case "connection_unavailable":

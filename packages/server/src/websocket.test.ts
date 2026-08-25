@@ -6139,6 +6139,24 @@ describe("closed FT-02B/FT-02C WebSocket governance", () => {
         "execution-1",
         8,
       );
+
+      retryInvocation.mockRejectedValueOnce(Object.assign(
+        new Error("Frozen context is no longer operational"),
+        { status: 410, code: "context_snapshot_invalidated" },
+      ));
+      client.send({
+        type: "invocation.retry", requestId: "retry-invalid-context",
+        executionId: "execution-1", expectedVersion: 8,
+      });
+      await expect(client.waitForError(
+        "context_snapshot_invalidated",
+        "retry-invalid-context",
+      )).resolves.toMatchObject({ frame: {
+        status: 410,
+        code: "context_snapshot_invalidated",
+        message: "context_snapshot_invalidated",
+        requestId: "retry-invalid-context",
+      } });
     } finally {
       await client.close();
       await server.close();

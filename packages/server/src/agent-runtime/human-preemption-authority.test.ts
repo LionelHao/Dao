@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -177,6 +178,122 @@ function invoke(
     executionId, intentId, providerId: "provider", modelId: "model",
     now: t0 + 10_000,
   });
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function bindFrozenContextAndFail(
+  database: DatabaseSync,
+  executionId: string,
+  sourceMessageId: string,
+): { readonly snapshotId: string; readonly expectedVersion: number } {
+  const snapshotId = `snapshot-${executionId}`;
+  const manifestId = `manifest-${executionId}`;
+  const createdAt = new Date(t0 + 10_500).toISOString();
+  const canonicalManifest = JSON.stringify({ version: 1, frozen: "parent-manifest" });
+  const canonicalEnvelope = JSON.stringify({ version: 1, frozen: "parent-provider-input" });
+  const manifestSha256 = sha256(canonicalManifest);
+  const envelopeSha256 = sha256(canonicalEnvelope);
+  const sourceLabelSha256 = sha256(`source:${sourceMessageId}:1`);
+  const toolCapabilityRevision = database.prepare(
+    "SELECT catalog_revision AS revision FROM actors WHERE id = 'agent-1'",
+  ).get()?.revision;
+  if (typeof toolCapabilityRevision !== "number") {
+    throw new Error("Agent capability revision fixture was missing");
+  }
+  database.prepare(
+    `INSERT INTO context_snapshots (
+       snapshot_id, room_id, invocation_intent_id, agent_id, provider_id, model_id,
+       compiler_version, compiler_config_version, estimator_version,
+       preparation_sha256, trigger_message_id, trigger_revision, trigger_reason,
+       memory_watermark, corpus_head, raw_delta_from_exclusive,
+       raw_delta_to_inclusive, room_lifecycle_generation,
+       membership_access_revision, tool_capability_revision, budget_json,
+       manifest_sha256, envelope_sha256, state, snapshot_generation, created_at,
+       invalidated_at, invalidation_reason, superseded_at, retired_at,
+       retain_until, payload_retention_state
+     )
+     SELECT ?, execution.room_id, link.intent_id, execution.agent_id,
+            execution.provider_id, execution.model_id,
+            'compiler-v1', 'config-v1', 'deterministic_utf8_v1', ?,
+            execution.trigger_message_id, 1, 'direct_mention',
+            0, 0, 0, 0, execution.room_archive_generation, 1, ?, '{}',
+            ?, ?, 'active', 1, ?, NULL, NULL, NULL, NULL, NULL, 'required'
+     FROM agent_executions AS execution
+     JOIN agent_execution_intent_links AS link ON link.execution_id = execution.id
+     WHERE execution.id = ?`,
+  ).run(
+    snapshotId, sha256(`preparation:${executionId}`), toolCapabilityRevision,
+    manifestSha256, envelopeSha256, createdAt, executionId,
+  );
+  database.prepare(
+    `INSERT INTO context_manifests (
+       manifest_id, snapshot_id, manifest_version, manifest_sha256,
+       canonical_manifest_json, item_count, total_original_bytes,
+       total_included_bytes, total_original_tokens, total_included_tokens,
+       accounting_json, created_at
+     ) VALUES (?, ?, 'manifest-v1', ?, ?, 1, 16, 16, 16, 16, '{}', ?)`,
+  ).run(manifestId, snapshotId, manifestSha256, canonicalManifest, createdAt);
+  database.prepare(
+    `INSERT INTO context_manifest_items (
+       manifest_id, snapshot_id, ordinal, section, disposition,
+       canonical_sort_key, source_label_sha256, source_kind, source_id,
+       source_revision, content_sha256, original_bytes, included_bytes,
+       original_tokens, included_tokens, reason_code, segment_json, availability
+     ) VALUES (?, ?, 0, 'trigger', 'included', 'trigger:0001', ?, 'trigger', ?,
+               1, ?, 16, 16, 16, 16, 'included', NULL, 'readable')`,
+  ).run(manifestId, snapshotId, sourceLabelSha256, sourceMessageId, sha256("source body"));
+  database.prepare(
+    `INSERT INTO context_snapshot_sources (
+       snapshot_id, room_id, source_kind, source_id, source_revision,
+       source_label_sha256, currently_required, authorization_revision, created_at
+     ) VALUES (?, 'room-1', 'message_revision', ?, 1, ?, 1, 1, ?)`,
+  ).run(snapshotId, sourceMessageId, sourceLabelSha256, createdAt);
+  database.prepare(
+    `INSERT INTO context_snapshot_bodies (
+       snapshot_id, envelope_schema_version, canonical_envelope_json,
+       envelope_sha256, byte_count, token_count, created_at
+     ) VALUES (?, 'envelope-v1', ?, ?, ?, 16, ?)`,
+  ).run(
+    snapshotId, canonicalEnvelope, envelopeSha256,
+    Buffer.byteLength(canonicalEnvelope, "utf8"), createdAt,
+  );
+  database.prepare(
+    `INSERT INTO agent_execution_context_bindings (
+       execution_id, snapshot_id, invocation_intent_id, execution_generation, bound_at
+     )
+     SELECT execution.id, ?, link.intent_id, execution.execution_generation, ?
+     FROM agent_executions AS execution
+     JOIN agent_execution_intent_links AS link ON link.execution_id = execution.id
+     WHERE execution.id = ?`,
+  ).run(snapshotId, createdAt, executionId);
+  database.prepare(
+    `INSERT INTO agent_execution_context_attempts (
+       execution_id, attempt_seq, snapshot_id, snapshot_generation, reuse_kind, bound_at
+     ) VALUES (?, 1, ?, 1, 'first', ?)`,
+  ).run(executionId, snapshotId, createdAt);
+  const finishedAt = new Date(t0 + 11_000).toISOString();
+  database.prepare(
+    `UPDATE agent_execution_attempts
+     SET status = 'failed', finished_at = ?, error_code = 'provider_failure'
+     WHERE execution_id = ? AND attempt_seq = 1`,
+  ).run(finishedAt, executionId);
+  database.prepare(
+    `UPDATE agent_executions
+     SET status = 'failed', completed_at = ?, updated_at = ?,
+         terminal_error_code = 'provider_failure'
+     WHERE id = ?`,
+  ).run(finishedAt, finishedAt, executionId);
+  const expectedVersion = database.prepare(
+    `SELECT authority_version AS version FROM agent_execution_runtime_states
+     WHERE execution_id = ?`,
+  ).get(executionId)?.version;
+  if (typeof expectedVersion !== "number") {
+    throw new Error("Terminal execution authority version was missing");
+  }
+  return { snapshotId, expectedVersion };
 }
 
 function makeRunning(
@@ -516,6 +633,269 @@ describe("real SQLite human-preemption authority", () => {
     ).all()).toEqual([{ roomId: "room-2", status: "running" }]);
     database.close();
   });
+
+  it("commits an exact frozen context clone before Human retry ACK and replays by principal and payload", () => {
+    const database = fixture();
+    const sourceMessageId = sendAgentSource(database, 183);
+    const sourceExecutionId = "execution-manual-retry-parent";
+    invoke(database, sourceMessageId, sourceExecutionId, "agent-1");
+    const parent = bindFrozenContextAndFail(database, sourceExecutionId, sourceMessageId);
+    const context = {
+      ...humanContext,
+      requestId: "manual-retry-exact",
+      idempotencyKey: "manual-retry-exact",
+    } as const;
+    const accepted = executeRuntimeAuthorityOperation(database, {
+      type: "runtime.manual-retry",
+      context,
+      executionId: sourceExecutionId,
+      newExecutionId: "execution-manual-retry-child",
+      newIntentId: "unused-manual-retry-child-intent",
+      expectedVersion: parent.expectedVersion,
+      now: t0 + 184_000,
+    });
+    expect(accepted).toMatchObject({
+      kind: "invocation",
+      execution: { id: "execution-manual-retry-child", status: "queued" },
+      replayed: false,
+      retryReceipt: {
+        requestId: "manual-retry-exact",
+        sourceExecutionId,
+        executionId: "execution-manual-retry-child",
+        snapshotId: expect.any(String),
+        status: "accepted",
+      },
+    });
+    if (accepted.kind !== "invocation" || accepted.retryReceipt === undefined) {
+      throw new Error("Canonical Human retry receipt was missing");
+    }
+    const childSnapshotId = accepted.retryReceipt.snapshotId;
+    expect(childSnapshotId).not.toBe(parent.snapshotId);
+    expect(database.prepare(
+      `SELECT binding.snapshot_id AS snapshotId, runtime.snapshot_id AS runtimeSnapshotId
+       FROM agent_execution_context_bindings AS binding
+       JOIN agent_execution_runtime_states AS runtime
+         ON runtime.execution_id = binding.execution_id
+       WHERE binding.execution_id = 'execution-manual-retry-child'`,
+    ).get()).toEqual({ snapshotId: childSnapshotId, runtimeSnapshotId: childSnapshotId });
+    const canonicalSnapshot = (snapshotId: string): unknown => database.prepare(
+      `SELECT snapshot.preparation_sha256 AS preparationSha256,
+              snapshot.budget_json AS budgetJson,
+              snapshot.manifest_sha256 AS manifestSha256,
+              snapshot.envelope_sha256 AS envelopeSha256,
+              manifest.canonical_manifest_json AS canonicalManifestJson,
+              manifest.accounting_json AS accountingJson,
+              body.canonical_envelope_json AS canonicalEnvelopeJson,
+              body.byte_count AS byteCount, body.token_count AS tokenCount
+       FROM context_snapshots AS snapshot
+       JOIN context_manifests AS manifest ON manifest.snapshot_id = snapshot.snapshot_id
+       JOIN context_snapshot_bodies AS body ON body.snapshot_id = snapshot.snapshot_id
+       WHERE snapshot.snapshot_id = ?`,
+    ).get(snapshotId);
+    expect(canonicalSnapshot(childSnapshotId)).toEqual(canonicalSnapshot(parent.snapshotId));
+    const sourceHashes = (snapshotId: string): unknown[] => database.prepare(
+      `SELECT source_kind AS sourceKind, source_id AS sourceId,
+              source_revision AS sourceRevision, source_label_sha256 AS sourceLabelSha256,
+              currently_required AS currentlyRequired,
+              authorization_revision AS authorizationRevision
+       FROM context_snapshot_sources WHERE snapshot_id = ?
+       ORDER BY source_kind, source_id, source_revision`,
+    ).all(snapshotId);
+    expect(sourceHashes(childSnapshotId)).toEqual(sourceHashes(parent.snapshotId));
+    expect(database.prepare(
+      `SELECT lineage.parent_snapshot_id AS parentSnapshotId,
+              lineage.child_snapshot_id AS childSnapshotId,
+              receipt.principal_actor_id AS principalActorId,
+              json_extract(receipt.response_json, '$.retryReceipt.snapshotId') AS receiptSnapshotId
+       FROM context_snapshot_lineage AS lineage
+       JOIN invocation_human_retry_receipts AS receipt
+         ON receipt.child_execution_id = lineage.child_execution_id
+       WHERE lineage.child_execution_id = 'execution-manual-retry-child'`,
+    ).get()).toEqual({
+      parentSnapshotId: parent.snapshotId,
+      childSnapshotId,
+      principalActorId: "human-1",
+      receiptSnapshotId: childSnapshotId,
+    });
+
+    recallHumanMessageDatabaseCommand(database, {
+      context: { ...humanContext, requestId: "recall-after-retry",
+        idempotencyKey: "recall-after-retry" },
+      command: { roomId: "room-1", messageId: sourceMessageId, expectedRevision: 1 },
+      now: t0 + 184_001,
+    });
+    const replayed = executeRuntimeAuthorityOperation(database, {
+      type: "runtime.manual-retry",
+      context,
+      executionId: sourceExecutionId,
+      newExecutionId: "execution-manual-retry-must-not-exist",
+      newIntentId: "unused-manual-retry-replay-intent",
+      expectedVersion: parent.expectedVersion,
+      now: t0 + 184_002,
+    });
+    expect(replayed).toEqual({ ...accepted, replayed: true });
+    expect(database.prepare(
+      `SELECT COUNT(*) AS count FROM agent_executions
+       WHERE manual_retry_of_execution_id = ?`,
+    ).get(sourceExecutionId)).toEqual({ count: 1 });
+    expect(() => executeRuntimeAuthorityOperation(database, {
+      type: "runtime.manual-retry",
+      context,
+      executionId: sourceExecutionId,
+      newExecutionId: "execution-manual-retry-changed-payload",
+      newIntentId: "unused-manual-retry-changed-payload",
+      expectedVersion: parent.expectedVersion + 1,
+      now: t0 + 184_003,
+    })).toThrowError(expect.objectContaining({ code: "execution_conflict" }));
+    const otherAccessToken = Buffer.alloc(32, 21).toString("base64url");
+    const otherRefreshToken = Buffer.alloc(32, 22).toString("base64url");
+    const otherFamilyToken = Buffer.alloc(32, 23).toString("base64url");
+    database.exec(`
+      INSERT INTO actors (id, kind, display_name, tool_permissions_json, readiness)
+      VALUES ('human-2', 'human', 'Human Two', '[]', 'ready');
+      INSERT INTO room_memberships (
+        room_id, actor_id, kind, role, participation, joined_at, configured_at,
+        access_revision
+      ) VALUES (
+        'room-1', 'human-2', 'human', 'member', NULL,
+        '2026-08-17T00:00:00.000Z', NULL, 1
+      );
+    `);
+    database.prepare(
+      `INSERT INTO session_families (
+         family_id, public_id, account_id, actor_id, device_id, device_label,
+         platform, created_at, refresh_expires_at, revoked_at
+       ) VALUES (?, ?, 'account-2', 'human-2', 'test-2', 'Test 2', 'unknown', ?, ?, NULL)`,
+    ).run(otherFamilyToken, `test_${otherFamilyToken}`, t0, t0 + 7_200_000);
+    database.prepare(
+      `INSERT INTO sessions (
+         family_id, account_id, actor_id, access_token_hash, refresh_token_hash,
+         access_expires_at, refresh_expires_at
+       ) VALUES (?, 'account-2', 'human-2', ?, ?, ?, ?)`,
+    ).run(
+      otherFamilyToken, otherAccessToken, otherRefreshToken,
+      t0 + 3_600_000, t0 + 7_200_000,
+    );
+    expect(() => executeRuntimeAuthorityOperation(database, {
+      type: "runtime.manual-retry",
+      context: {
+        kind: "human", sessionId: otherAccessToken, sessionFamilyId: otherFamilyToken,
+        principal: { accountId: "account-2", actorId: "human-2" },
+        requestId: context.requestId, idempotencyKey: context.idempotencyKey,
+      },
+      executionId: sourceExecutionId,
+      newExecutionId: "execution-manual-retry-other-principal",
+      newIntentId: "unused-manual-retry-other-principal",
+      expectedVersion: parent.expectedVersion,
+      now: t0 + 184_004,
+    })).toThrowError(expect.objectContaining({ code: "permission_denied" }));
+    database.close();
+  });
+
+  it.each([
+    ["recalled", "context_snapshot_invalidated"],
+    ["revised", "context_snapshot_invalidated"],
+    ["disputed", "context_snapshot_invalidated"],
+    ["memory-advanced", "context_snapshot_invalidated"],
+    ["access-revoked", "permission_denied"],
+  ] as const)(
+    "rejects %s manual-retry context before ACK with zero child",
+    (ineligibility, expectedCode) => {
+      const database = fixture();
+      const sourceMessageId = `message-manual-retry-${ineligibility}`;
+      executeHumanDatabaseCommand(database, {
+        context: { ...humanContext, requestId: sourceMessageId, idempotencyKey: sourceMessageId },
+        command: { type: "message.send", roomId: "room-1", payload: {
+          id: sourceMessageId, roomId: "room-1", body: `source ${ineligibility}`,
+          sentAt: new Date(t0 + 185_000).toISOString(),
+        } },
+        now: t0 + 185_000,
+      });
+      const sourceExecutionId = `execution-manual-retry-${ineligibility}`;
+      invoke(database, sourceMessageId, sourceExecutionId, "agent-1");
+      const parent = bindFrozenContextAndFail(database, sourceExecutionId, sourceMessageId);
+      if (ineligibility === "recalled") {
+        recallHumanMessageDatabaseCommand(database, {
+          context: { ...humanContext, requestId: `recall-${ineligibility}`,
+            idempotencyKey: `recall-${ineligibility}` },
+          command: { roomId: "room-1", messageId: sourceMessageId, expectedRevision: 1 },
+          now: t0 + 185_001,
+        });
+      } else if (ineligibility === "revised") {
+        reviseHumanMessageDatabaseCommand(database, {
+          context: { ...humanContext, requestId: `revise-${ineligibility}`,
+            idempotencyKey: `revise-${ineligibility}` },
+          command: { roomId: "room-1", messageId: sourceMessageId,
+            expectedRevision: 1, body: "eligible revised source remains visible" },
+          now: t0 + 185_001,
+        });
+        expect(database.prepare(
+          `SELECT envelope.current_revision AS currentRevision,
+                  snapshot.trigger_revision AS frozenRevision,
+                  snapshot.invalidation_reason AS invalidationReason,
+                  body.canonical_envelope_json AS frozenBody
+           FROM message_envelopes AS envelope
+           JOIN context_snapshots AS snapshot ON snapshot.snapshot_id = ?
+           JOIN context_snapshot_bodies AS body ON body.snapshot_id = snapshot.snapshot_id
+           WHERE envelope.message_id = ?`,
+        ).get(parent.snapshotId, sourceMessageId)).toMatchObject({
+          currentRevision: 2,
+          frozenRevision: 1,
+          invalidationReason: "message_revised",
+          frozenBody: JSON.stringify({ version: 1, frozen: "parent-provider-input" }),
+        });
+      } else if (ineligibility === "disputed") {
+        database.prepare(
+          `UPDATE context_snapshots
+           SET state = 'invalidated', snapshot_generation = snapshot_generation + 1,
+               invalidated_at = ?, invalidation_reason = 'memory_invalidated'
+           WHERE snapshot_id = ?`,
+        ).run(new Date(t0 + 185_001).toISOString(), parent.snapshotId);
+      } else if (ineligibility === "memory-advanced") {
+        database.prepare(
+          `INSERT INTO room_memory_sources (
+             room_id, corpus_seq, source_kind, source_id, source_revision,
+             server_stream_seq, eligibility, availability, source_actor_id,
+             safe_metadata_json, read_reference, occurred_at, updated_at
+           ) VALUES (
+             'room-1', 1, 'message', ?, 1, 1, 'eligible', 'readable', 'human-1',
+             ?, 'memory-advance', ?, ?
+           )`,
+        ).run(
+          sourceMessageId,
+          JSON.stringify({ messageId: sourceMessageId }),
+          new Date(t0 + 185_001).toISOString(),
+          new Date(t0 + 185_001).toISOString(),
+        );
+      } else {
+        database.prepare(
+          `UPDATE room_memberships SET access_revision = access_revision + 1
+           WHERE room_id = 'room-1' AND actor_id = 'agent-1'`,
+        ).run();
+      }
+      expect(() => executeRuntimeAuthorityOperation(database, {
+        type: "runtime.manual-retry",
+        context: { ...humanContext, requestId: `retry-${ineligibility}`,
+          idempotencyKey: `retry-${ineligibility}` },
+        executionId: sourceExecutionId,
+        newExecutionId: `execution-child-${ineligibility}`,
+        newIntentId: `unused-child-intent-${ineligibility}`,
+        expectedVersion: parent.expectedVersion,
+        now: t0 + 185_002,
+      })).toThrowError(expect.objectContaining({ code: expectedCode }));
+      expect(database.prepare(
+        `SELECT (SELECT COUNT(*) FROM agent_executions
+                 WHERE manual_retry_of_execution_id = ?) AS children,
+                (SELECT COUNT(*) FROM invocation_human_retry_receipts
+                 WHERE source_execution_id = ?) AS receipts,
+                (SELECT COUNT(*) FROM context_snapshot_lineage
+                 WHERE parent_execution_id = ?) AS lineage`,
+      ).get(sourceExecutionId, sourceExecutionId, sourceExecutionId)).toEqual({
+        children: 0, receipts: 0, lineage: 0,
+      });
+      database.close();
+    },
+  );
 
   it("atomically authorizes only the current execution attempt and access epoch for preview delivery", () => {
     const database = fixture();

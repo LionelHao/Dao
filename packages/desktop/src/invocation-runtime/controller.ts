@@ -31,6 +31,8 @@ function closedError(error: unknown): InvocationClosedError {
     case "execution_conflict":
     case "room_archived":
       return { status: 409, code: "execution_conflict", recovery: "refresh-authority" };
+    case "context_unavailable":
+      return { status: 410, code: "context_unavailable", recovery: "refresh-authority" };
     case "protocol_upgrade_required":
     case "snapshot_expired":
       return { status: 410, code: "protocol_upgrade_required", recovery: "upgrade-client" };

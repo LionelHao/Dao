@@ -79,6 +79,7 @@ describe("Invocation production controller", () => {
   it.each([
     ["authentication_required", 401, "reauthenticate"], ["access_revoked", 403, "request-access"],
     ["execution_conflict", 409, "refresh-authority"], ["protocol_upgrade_required", 410, "upgrade-client"],
+    ["context_unavailable", 410, "refresh-authority"],
     ["rate_limited", 429, "retry-later"], ["service_unavailable", 503, "repair-room"],
   ] as const)("maps %s to a closed recovery without mutating execution", async (code, status, recovery) => {
     const cache = await seeded();

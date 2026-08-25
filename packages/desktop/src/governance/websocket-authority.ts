@@ -46,6 +46,7 @@ export type GovernanceTransportErrorCode =
   | "role_forbidden" | "member_not_found" | "room_not_found"
   | "room_revision_conflict" | "ownership_transfer_required" | "room_archived"
   | "departure_blocked" | "snapshot_expired" | "snapshot_stale"
+  | "context_unavailable"
   | "rate_limited" | "dependency_unavailable" | "service_unavailable"
   | "execution_conflict" | "protocol_upgrade_required"
   | "connection_unavailable" | "request_timeout" | "protocol_error" | "client_closed";
@@ -181,15 +182,22 @@ function mappedError(
     unauthenticated: "authentication_required", invalid_token: "authentication_required",
     token_expired: "authentication_required", session_revoked: "session_revoked",
     room_forbidden: "access_revoked", identity_forbidden: "access_revoked",
+    context_forbidden: "access_revoked",
     role_forbidden: "role_forbidden", member_not_found: "member_not_found",
     room_not_found: "room_not_found", room_revision_conflict: "room_revision_conflict",
     ownership_transfer_required: "ownership_transfer_required", room_archived: "room_archived",
     snapshot_expired: "snapshot_expired", snapshot_stale: "snapshot_stale",
+    context_snapshot_invalidated: "context_unavailable",
+    context_source_gone: "context_unavailable",
+    context_generation_conflict: "execution_conflict",
+    context_snapshot_conflict: "execution_conflict",
     rate_limited: "rate_limited", dependency_unavailable: "dependency_unavailable",
+    context_capacity_limited: "rate_limited",
     agent_queue_full: "rate_limited", execution_conflict: "execution_conflict",
     protocol_upgrade_required: "protocol_upgrade_required",
     agent_runtime_closed: "service_unavailable",
     storage_unavailable: "service_unavailable", internal_error: "service_unavailable",
+    context_storage_unavailable: "service_unavailable",
   };
   const closed = mapping[code];
   if (closed === undefined || (retryAfterSeconds !== undefined &&

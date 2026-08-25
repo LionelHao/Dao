@@ -68,6 +68,11 @@ describe("Invocation wire ACK decoder", () => {
       message: "bounded", retryAfterSeconds: 7,
     }))).toMatchObject({ requestId: "retry-rate-1",
       error: { code: "rate_limited", status: 429, retryAfterSeconds: 7 } });
+    expect(parseGovernanceServerFrame(JSON.stringify({
+      type: "error", requestId: "retry-context-1", status: 410,
+      code: "context_snapshot_invalidated", message: "closed",
+    }))).toMatchObject({ requestId: "retry-context-1",
+      error: { code: "context_unavailable", status: 410 } });
   });
 
   it("round-trips the canonical receipts over a real WebSocket", async () => {

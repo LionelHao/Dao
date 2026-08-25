@@ -96,7 +96,9 @@ import {
 import type { AuthorityWorkerErrorCode } from "./worker-protocol.js";
 import {
   bindContextAttemptInTransaction,
+  cloneManualRetryContextInTransaction,
   commitFinalContextCitationsInTransaction,
+  ContextSnapshotDatabaseError,
 } from "./context-snapshot-database-authority.js";
 import type {
   RepairMutationImpact,
@@ -8563,12 +8565,8 @@ export function executeRuntimeAuthorityOperation(
     }
 
     if (operation.type === "runtime.manual-retry") {
+      const principalActorId = requireHumanSession(database, operation.context, operation.now);
       const old = runtimeExecutionById(database, operation.executionId);
-      requireRuntimeFrozenHandoff(database, old.id);
-      requireRuntimeHumanAuthority(database, operation.context, old, operation.now);
-      if (old.status !== "failed" && old.status !== "cancelled") {
-        return fail("execution_conflict", "Only terminal Agent executions can be retried");
-      }
       const retryRequestSha256 = createHash("sha256").update(canonicalJson({
         type: operation.type,
         executionId: operation.executionId,
@@ -8578,10 +8576,14 @@ export function executeRuntimeAuthorityOperation(
       })).digest("hex");
       if (operation.expectedVersion !== undefined) {
         const replay = database.prepare(
-          `SELECT request_sha256 AS requestSha256, response_json AS responseJson
+          `SELECT principal_actor_id AS principalActorId,
+                  request_sha256 AS requestSha256, response_json AS responseJson
            FROM invocation_human_retry_receipts WHERE request_id = ?`,
         ).get(operation.context.requestId);
         if (typeof replay?.responseJson === "string") {
+          if (replay.principalActorId !== principalActorId) {
+            return fail("permission_denied", "Retry receipt principal did not match");
+          }
           if (replay.requestSha256 !== retryRequestSha256) {
             return fail("execution_conflict", "Retry requestId was reused with another payload");
           }
@@ -8591,6 +8593,13 @@ export function executeRuntimeAuthorityOperation(
           >;
           return { ...stored, replayed: true };
         }
+      }
+      requireRuntimeFrozenHandoff(database, old.id);
+      requireRuntimeHumanAuthority(database, operation.context, old, operation.now);
+      if (old.status !== "failed" && old.status !== "cancelled") {
+        return fail("execution_conflict", "Only terminal Agent executions can be retried");
+      }
+      if (operation.expectedVersion !== undefined) {
         const canonical = database.prepare(
           `SELECT authority_version AS authorityVersion, public_status AS publicStatus,
                   review_state AS reviewState
@@ -8648,6 +8657,27 @@ export function executeRuntimeAuthorityOperation(
            execution_id, attempt_seq, retry_cycle, retry_ordinal, status, action_category, recovery_cursor
          ) VALUES (?, 1, 1, 1, 'queued', 'model_generation', 0)`,
       ).run(operation.newExecutionId);
+      const childSnapshotId = stableId(
+        "runtime-manual-retry-snapshot",
+        operation.newExecutionId,
+      );
+      try {
+        cloneManualRetryContextInTransaction(database, {
+          parentExecutionId: old.id,
+          childExecutionId: operation.newExecutionId,
+          childSnapshotId,
+          childManifestId: stableId(
+            "runtime-manual-retry-manifest",
+            operation.newExecutionId,
+          ),
+          boundAt: occurredAt,
+        });
+      } catch (error) {
+        if (error instanceof ContextSnapshotDatabaseError) {
+          return fail(error.code, error.message);
+        }
+        throw error;
+      }
       const execution = runtimeExecutionById(database, operation.newExecutionId);
       requireRuntimeFrozenHandoff(database, execution.id);
       appendRuntimeExecutionEvent(database, execution, occurredAt, "manual-retry-queued");
@@ -8659,10 +8689,12 @@ export function executeRuntimeAuthorityOperation(
         const lineage = database.prepare(
           `SELECT link.intent_id AS intentId, link.execution_ordinal AS executionOrdinal,
                   source_runtime.lineage_id AS lineageId,
-                  source_runtime.snapshot_id AS snapshotId
+                  child_runtime.snapshot_id AS snapshotId
            FROM agent_execution_intent_links AS link
            JOIN agent_execution_runtime_states AS source_runtime
              ON source_runtime.execution_id = ?
+           JOIN agent_execution_runtime_states AS child_runtime
+             ON child_runtime.execution_id = link.execution_id
            WHERE link.execution_id = ?`,
         ).get(old.id, execution.id);
         if (typeof lineage?.intentId !== "string" ||
@@ -8686,11 +8718,11 @@ export function executeRuntimeAuthorityOperation(
         database.prepare(
           `INSERT INTO invocation_human_retry_receipts (
              request_id, source_execution_id, source_expected_version,
-             child_execution_id, intent_id, execution_ordinal, request_sha256,
-             response_json, committed_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             child_execution_id, intent_id, execution_ordinal, principal_actor_id,
+             request_sha256, response_json, committed_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         ).run(operation.context.requestId, old.id, operation.expectedVersion,
-          execution.id, lineage.intentId, lineage.executionOrdinal,
+          execution.id, lineage.intentId, lineage.executionOrdinal, principalActorId,
           retryRequestSha256, JSON.stringify(response), occurredAt);
         appendCanonicalExecutionRetryEvent(
           database, retryReceipt, operation.context.principal.actorId, occurredAt,

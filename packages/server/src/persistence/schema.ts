@@ -73,7 +73,7 @@ const SCHEMA_FINGERPRINTS = {
   19: "e458dedc7c0d85c04bca92dc2f6289b02367fb97fc7edbe1c7dba011470812b7",
   20: "1ca2a806a52cd2ce9632b02e215a25ba13bc3ebc4336f5152c48f21d60faa2a0",
   21: "dca0a24a346060b1e04b98ee5a73e016421796d6c13bd0bd2841179f405c44af",
-  22: "0ebe5369d32d37e0b758e0c36a67943b3cf48d16dfe05bf8ceedabb0ec5d4059",
+  22: "7ebc93d38a8c5dfeaa8d9b40c86d6362fc43af0da578aab641850d0ee6a15c8a",
 } as const;
 
 const V1_STATEMENTS = [
@@ -7413,6 +7413,7 @@ const V22_STATEMENTS = [
     child_execution_id TEXT NOT NULL UNIQUE REFERENCES agent_executions(id),
     intent_id TEXT NOT NULL REFERENCES agent_invocation_intents(id),
     execution_ordinal INTEGER NOT NULL CHECK (execution_ordinal >= 2),
+    principal_actor_id TEXT NOT NULL REFERENCES actors(id),
     request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
     response_json TEXT NOT NULL CHECK (json_valid(response_json)),
     committed_at TEXT NOT NULL,
@@ -7420,6 +7421,23 @@ const V22_STATEMENTS = [
   ) STRICT`,
   `CREATE INDEX invocation_human_retry_receipts_source_v22
    ON invocation_human_retry_receipts(source_execution_id, committed_at, request_id)`,
+  `CREATE TRIGGER invocation_human_retry_receipts_v22_validate_insert
+   BEFORE INSERT ON invocation_human_retry_receipts
+   WHEN NOT EXISTS (
+     SELECT 1
+     FROM actors AS principal
+     JOIN agent_execution_intent_links AS link
+       ON link.execution_id = NEW.child_execution_id
+     JOIN agent_execution_runtime_states AS runtime
+       ON runtime.execution_id = NEW.child_execution_id
+     WHERE principal.id = NEW.principal_actor_id AND principal.kind = 'human'
+       AND link.intent_id = NEW.intent_id
+       AND link.execution_ordinal = NEW.execution_ordinal
+       AND link.retry_of_execution_id = NEW.source_execution_id
+       AND runtime.snapshot_id IS NOT NULL
+       AND json_extract(NEW.response_json, '$.retryReceipt.snapshotId') = runtime.snapshot_id
+   )
+   BEGIN SELECT RAISE(ABORT, 'Human retry receipt authority is inconsistent'); END`,
   `CREATE TRIGGER invocation_human_retry_receipts_v22_immutable_update
    BEFORE UPDATE ON invocation_human_retry_receipts
    BEGIN SELECT RAISE(ABORT, 'Human retry receipt is immutable'); END`,
@@ -8753,8 +8771,8 @@ const V22_SCHEMA_CONTRACT = {
   ],
   invocation_human_retry_receipts: [
     "request_id", "source_execution_id", "source_expected_version",
-    "child_execution_id", "intent_id", "execution_ordinal", "request_sha256",
-    "response_json", "committed_at",
+    "child_execution_id", "intent_id", "execution_ordinal", "principal_actor_id",
+    "request_sha256", "response_json", "committed_at",
   ],
   invocation_recovery_queue: [
     "recovery_key", "execution_id", "execution_version", "state", "available_at",
@@ -10571,11 +10589,18 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
        FROM invocation_human_retry_receipts AS receipt
        LEFT JOIN agent_execution_intent_links AS link
          ON link.execution_id = receipt.child_execution_id
+       LEFT JOIN agent_execution_runtime_states AS runtime
+         ON runtime.execution_id = receipt.child_execution_id
+       LEFT JOIN actors AS principal ON principal.id = receipt.principal_actor_id
        WHERE link.intent_id IS NULL OR link.intent_id <> receipt.intent_id
           OR link.execution_ordinal <> receipt.execution_ordinal
           OR link.retry_of_execution_id <> receipt.source_execution_id
+          OR principal.kind IS NOT 'human'
+          OR runtime.snapshot_id IS NULL
+          OR json_extract(receipt.response_json, '$.retryReceipt.snapshotId')
+             IS NOT runtime.snapshot_id
        LIMIT 1`,
-      "Human retry receipts must retain exact request-scoped child lineage",
+      "Human retry receipts must retain exact principal, child lineage, and snapshot binding",
     );
     requireNoRows(
       database,

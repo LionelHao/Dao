@@ -33,6 +33,7 @@ export interface InvocationClosedError {
     | "authentication_required"
     | "access_revoked"
     | "execution_conflict"
+    | "context_unavailable"
     | "protocol_upgrade_required"
     | "rate_limited"
     | "service_unavailable";
@@ -122,16 +123,16 @@ function positive(value: unknown): value is number {
 function isError(value: unknown): value is InvocationClosedError {
   if (!record(value) || !exact(value, ["status", "code", "recovery"], ["retryAfterSeconds"]) ||
       !positive(value.status) || !text(value.code) || !text(value.recovery)) return false;
-  const allowed = new Map<number, readonly [string, InvocationRecoveryAction]>([
-    [401, ["authentication_required", "reauthenticate"]],
-    [403, ["access_revoked", "request-access"]],
-    [409, ["execution_conflict", "refresh-authority"]],
-    [410, ["protocol_upgrade_required", "upgrade-client"]],
-    [429, ["rate_limited", "retry-later"]],
-    [503, ["service_unavailable", "repair-room"]],
+  const allowed = new Set<string>([
+    "401:authentication_required:reauthenticate",
+    "403:access_revoked:request-access",
+    "409:execution_conflict:refresh-authority",
+    "410:context_unavailable:refresh-authority",
+    "410:protocol_upgrade_required:upgrade-client",
+    "429:rate_limited:retry-later",
+    "503:service_unavailable:repair-room",
   ]);
-  const expected = allowed.get(value.status);
-  return expected?.[0] === value.code && expected[1] === value.recovery &&
+  return allowed.has(`${value.status}:${value.code}:${value.recovery}`) &&
     (value.retryAfterSeconds === undefined ||
       (positive(value.retryAfterSeconds) && value.retryAfterSeconds <= 86_400));
 }
