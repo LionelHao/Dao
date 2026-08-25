@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { dirname } from "node:path";
-import type { CredentialEncryption } from "../identity/credential-vault.js";
+import { nodeCredentialFileSystem, type CredentialEncryption } from "../identity/credential-vault.js";
 
 export interface AuthorityCachePersistence {
   load(): Promise<unknown | undefined>;
@@ -24,7 +24,7 @@ export function createEncryptedAuthorityCachePersistence(options: Readonly<{
     if (!options.encryption.isEncryptionAvailable()) throw new Error("authority_cache_encryption_unavailable");
   };
   const remove = async (): Promise<void> => {
-    try { await unlink(options.filePath); }
+    try { await unlink(options.filePath); await nodeCredentialFileSystem.syncDirectory(directory); }
     catch (error: unknown) { if (!hasCode(error, "ENOENT")) throw error; }
   };
   return Object.freeze({
@@ -62,6 +62,7 @@ export function createEncryptedAuthorityCachePersistence(options: Readonly<{
           finally { await handle.close(); }
           await rename(temporaryPath, options.filePath);
           renamed = true;
+          await nodeCredentialFileSystem.syncDirectory(directory);
         } finally {
           if (!renamed) await unlink(temporaryPath).catch(() => undefined);
         }

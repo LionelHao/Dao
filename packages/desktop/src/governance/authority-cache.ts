@@ -399,6 +399,7 @@ export function createDesktopAuthorityCache(
             authoritySnapshotChecksum("room", item.records) !== item.checksum ||
             !isRoomCursor(item.cursor) || item.cursor.roomId !== item.roomId ||
             typeof item.updatedAt !== "string" || !Number.isFinite(Date.parse(item.updatedAt)) ||
+            new Date(Date.parse(item.updatedAt)).toISOString() !== item.updatedAt ||
             !isRoomRepairPage({ type: "room.repair.page", requestId: "cache-restore",
               snapshotId: `cache:${item.roomId}`, roomId: item.roomId, page: 0,
               records: item.records, watermark: item.cursor.afterSeq,
