@@ -1,5 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import { ATTACHMENT_AUTHORITY_LIMITS, CONTEXT_COMPILER_LIMITS, type Actor } from "@native-im/core";
+import {
+  ATTACHMENT_AUTHORITY_LIMITS,
+  CONTEXT_COMPILER_LIMITS,
+  type Actor,
+} from "@native-im/core";
 import { isDeepStrictEqual } from "node:util";
 import { mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -430,7 +434,52 @@ async function start(
       completeSnapshot: snapshotClient.completeSnapshot.bind(snapshotClient),
       releaseSnapshot: snapshotClient.releaseSnapshot.bind(snapshotClient),
     };
-    const agentSettings = new WorkerAgentSettingsAdapter(worker, Date.now);
+    let scopedReceiptCursor = 0;
+    let scopedReceiptDrain: Promise<void> | undefined;
+    const drainCommittedScopedProducerReceipts = (): Promise<void> => {
+      if (runtime === undefined) return Promise.resolve();
+      scopedReceiptDrain ??= (async () => {
+        let hasMore = true;
+        while (hasMore && runtime !== undefined && worker !== undefined) {
+          const result = await worker.executeRuntime({
+            type: "runtime.scan-internal-scoped-receipts",
+            afterRowId: scopedReceiptCursor,
+            limit: 256,
+            now: Date.now(),
+          });
+          if (typeof result !== "object" || result === null || !("kind" in result) ||
+              result.kind !== "internal-scoped-producer-receipts" ||
+              !("records" in result) || !Array.isArray(result.records) ||
+              !("hasMore" in result) || typeof result.hasMore !== "boolean") {
+            throw new Error("Internal scoped producer post-commit scan was malformed");
+          }
+          for (const record of result.records) {
+            if (typeof record !== "object" || record === null ||
+                !("committedAt" in record) || typeof record.committedAt !== "string" ||
+                !("requestId" in record) || typeof record.requestId !== "string" ||
+                !("rowId" in record) || typeof record.rowId !== "number" ||
+                !("receipt" in record)) {
+              throw new Error("Internal scoped producer post-commit record was malformed");
+            }
+            runtime.applyCommittedScopedProducerReceipt(record.receipt as never);
+            scopedReceiptCursor = record.rowId;
+          }
+          hasMore = result.hasMore;
+          if (hasMore && result.records.length === 0) {
+            throw new Error("Internal scoped producer post-commit cursor did not advance");
+          }
+        }
+      })().finally(() => { scopedReceiptDrain = undefined; });
+      return scopedReceiptDrain;
+    };
+    const afterCommittedProducerCommand = async (): Promise<void> => {
+      try { await drainCommittedScopedProducerReceipts(); } catch { /* recovery retries on next command */ }
+    };
+    const agentSettings = new WorkerAgentSettingsAdapter(
+      worker,
+      Date.now,
+      afterCommittedProducerCommand,
+    );
     const sync = createSyncService({ store: authority, snapshots: materializedSnapshots,
       agentSettings });
     const auth = createAuthenticationService({
@@ -446,6 +495,7 @@ async function start(
         async executeHuman(context, command) {
           try {
             const acknowledgement = await authority.executeHuman(context, command);
+            await afterCommittedProducerCommand();
             if (command.type === "message.send") {
               const route = await worker!.executeRuntime({
                 type: "runtime.create-route-for-human-message",
@@ -496,7 +546,9 @@ async function start(
         ...args: Parameters<typeof authority.executeHumanGovernance>
       ) {
         try {
-          return await authority.executeHumanGovernance(...args);
+          const acknowledgement = await authority.executeHumanGovernance(...args);
+          await afterCommittedProducerCommand();
+          return acknowledgement;
         } catch (error: unknown) {
           if (transactionFault !== undefined) {
             process.exit(transactionFault === "after-domain-write" ? 81 : 82);
@@ -855,9 +907,11 @@ async function start(
       settleAttachmentReader(attachmentExtractionReader);
     }
     await runtime.recover();
+    await afterCommittedProducerCommand();
     kickDirectIntentConsumer();
     const runtimeRecoveryTimer = setInterval(() => {
       void runtime?.recover().catch(() => undefined);
+      void afterCommittedProducerCommand();
       kickDirectIntentConsumer();
     }, 1_000);
     runtimeRecoveryTimer.unref();

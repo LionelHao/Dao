@@ -12,6 +12,7 @@ import {
   executeRouteAuthorityOperation,
   executeRuntimeAuthorityOperation,
   recallHumanMessageDatabaseCommand,
+  reviseHumanMessageDatabaseCommand,
   submitHumanMessageDatabaseCommand,
   runAuthorityImmediateTransaction,
 } from "../persistence/authority-database-handler.js";
@@ -464,16 +465,55 @@ describe("real SQLite human-preemption authority", () => {
     });
     expect(terminalReset).toMatchObject({ kind: "preview-authority", authorized: true });
   });
+
+  it("fences every old-revision preview and execution after revise then current recall", () => {
+    const database = fixture();
+    const sourceMessageId = sendAgentSource(database, 91);
+    invoke(database, sourceMessageId, "execution-preview-old-revision", "agent-1");
+    makeRunning(database, "execution-preview-old-revision", "model_generation");
+    reviseHumanMessageDatabaseCommand(database, {
+      context: { ...humanContext, requestId: "revise-preview-source",
+        idempotencyKey: "revise-preview-source" },
+      command: { roomId: "room-1", messageId: sourceMessageId,
+        expectedRevision: 1, body: "source revision two" },
+      now: t0 + 92_000,
+    });
+    const stalePreview = executeRuntimeAuthorityOperation(database, {
+      type: "runtime.preview-authorize",
+      context: { sessionId: humanContext.sessionId,
+        sessionFamilyId: humanContext.sessionFamilyId, principal: humanContext.principal },
+      roomId: "room-1", executionId: "execution-preview-old-revision", attemptSeq: 1,
+      deliveryKind: "preview", subscriptionGeneration: 8, now: t0 + 92_001,
+    });
+    expect(stalePreview).toMatchObject({ kind: "preview-authority", authorized: false });
+
+    const recalled = recallHumanMessageDatabaseCommand(database, {
+      context: { ...humanContext, requestId: "recall-preview-source",
+        idempotencyKey: "recall-preview-source" },
+      command: { roomId: "room-1", messageId: sourceMessageId, expectedRevision: 2 },
+      now: t0 + 92_002,
+    });
+    expect(recalled.abortTargets).toEqual([expect.objectContaining({
+      sourceMessageId, sourceRevision: 1,
+      executionId: "execution-preview-old-revision", attemptSeq: 1,
+    })]);
+    expect(database.prepare(
+      `SELECT public_status AS status, terminal_reason AS reason
+       FROM agent_execution_runtime_states WHERE execution_id = ?`,
+    ).get("execution-preview-old-revision")).toEqual({
+      status: "cancelled", reason: "message_recalled",
+    });
+  });
   it.each([
-    ["message", "message_recalled", "message_authority"],
-    ["room", "room_archived", "room_authority"],
-    ["membership", "membership_revoked", "membership_authority"],
-    ["assignment", "assignment_revoked", "assignment_authority"],
-    ["profile", "profile_disabled", "profile_authority"],
-    ["capability", "capability_revoked", "assignment_authority"],
+    ["message", "message_recalled", "message_authority", "message-authority"],
+    ["room", "room_archived", "room_authority", "room-authority"],
+    ["membership", "membership_revoked", "membership_authority", "room-assignment-authority"],
+    ["assignment", "assignment_revoked", "assignment_authority", "room-assignment-authority"],
+    ["profile", "profile_disabled", "profile_authority", "agent-profile-authority"],
+    ["capability", "capability_revoked", "assignment_authority", "room-assignment-authority"],
   ] as const)(
     "commits the %s producer as one canonical scoped SQLite transaction",
-    (authorityKind, reason, capability) => {
+    (authorityKind, reason, capability, producerId) => {
       const database = fixture();
       const sourceMessageId = sendAgentSource(database, 1);
       invoke(database, sourceMessageId, `execution-producer-${authorityKind}`, "agent-1");
@@ -486,7 +526,7 @@ describe("real SQLite human-preemption authority", () => {
 
       const committed = runAuthorityImmediateTransaction(database, () =>
         commitInternalScopedProducerInTransaction(database, {
-          producerId: `${authorityKind}-producer`,
+          producerId,
           requestId: `${authorityKind}-request`,
           capability,
           actorId: authorityKind === "message" || authorityKind === "room"
@@ -530,12 +570,20 @@ describe("real SQLite human-preemption authority", () => {
       ).get()).toEqual({
         eventType: "agent.invocation.scoped-cancellation.committed", status: "pending",
       });
+      const postCommit = executeRuntimeAuthorityOperation(database, {
+        type: "runtime.scan-internal-scoped-receipts", afterRowId: 0,
+        limit: 256, now: t0 + 50_000,
+      });
+      expect(postCommit).toMatchObject({
+        kind: "internal-scoped-producer-receipts", hasMore: false,
+        records: [{ receipt: { fenceId: committed.receipts[0]!.fenceId, reason } }],
+      });
 
       // A racing/replayed producer observes the terminal CAS and performs zero
       // Adapter or authority writes; the canonical committed evidence remains singular.
       const replay = runAuthorityImmediateTransaction(database, () =>
         commitInternalScopedProducerInTransaction(database, {
-          producerId: `${authorityKind}-producer`, requestId: `${authorityKind}-request`,
+          producerId, requestId: `${authorityKind}-request`,
           capability, actorId: "agent-1", roomId: "room-1", scope, reason,
           occurredAt: new Date(t0 + 50_001).toISOString(),
         }));

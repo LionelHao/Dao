@@ -7006,6 +7006,36 @@ export function executeRuntimeAuthorityOperation(
       appendRuntimeExecutionEvent(database, execution, occurredAt, "queued");
       return { kind: "human-fence-replacements", executions: [execution], replayed: false };
     }
+    if (operation.type === "runtime.scan-internal-scoped-receipts") {
+      const rows = database.prepare(
+        `SELECT rowid AS rowId, request_id AS requestId, committed_at AS committedAt,
+                response_json AS responseJson
+         FROM invocation_cancellation_receipts
+         WHERE principal_actor_id IS NULL
+           AND json_extract(response_json, '$.producerId') IN (
+             'message-authority', 'room-authority', 'membership-capability-authority',
+             'room-assignment-authority', 'agent-profile-authority'
+           )
+           AND rowid > ?
+         ORDER BY rowid LIMIT ?`,
+      ).all(operation.afterRowId, operation.limit + 1);
+      const hasMore = rows.length > operation.limit;
+      const records = rows.slice(0, operation.limit).map((row) => {
+        if (typeof row.rowId !== "number" || typeof row.requestId !== "string" ||
+            typeof row.committedAt !== "string" ||
+            typeof row.responseJson !== "string") {
+          throw new Error("Internal scoped producer receipt cursor was corrupt");
+        }
+        const stored: unknown = JSON.parse(row.responseJson);
+        if (typeof stored !== "object" || stored === null || !("receipt" in stored) ||
+            !isScopedCancellationReceipt(stored.receipt)) {
+          throw new Error("Internal scoped producer receipt was corrupt");
+        }
+        return Object.freeze({ rowId: row.rowId, requestId: row.requestId, committedAt: row.committedAt,
+          receipt: stored.receipt });
+      });
+      return { kind: "internal-scoped-producer-receipts", records: Object.freeze(records), hasMore };
+    }
     if (operation.type === "runtime.preview-authorize") {
       const actorId = requireHumanSession(database, operation.context, operation.now);
       const authority = database.prepare(
@@ -7017,7 +7047,20 @@ export function executeRuntimeAuthorityOperation(
                 execution.room_id AS executionRoomId,
                 execution.status AS executionStatus,
                 execution.current_attempt_seq AS currentAttemptSeq,
-                attempt.status AS attemptStatus
+                attempt.status AS attemptStatus,
+                intent.source_message_id AS sourceMessageId,
+                intent.source_revision AS sourceRevision,
+                envelope.lifecycle AS sourceLifecycle,
+                envelope.current_revision AS sourceCurrentRevision,
+                EXISTS (
+                  SELECT 1 FROM message_recall_fences AS recall
+                  WHERE recall.source_message_id = intent.source_message_id
+                ) AS sourceRecalled,
+                EXISTS (
+                  SELECT 1 FROM invocation_scoped_cancellation_fences AS fence
+                  WHERE fence.intent_id = intent.id
+                    AND (fence.execution_id IS NULL OR fence.execution_id = execution.id)
+                ) AS sourceFenced
          FROM rooms AS room
          JOIN room_memberships AS membership
            ON membership.room_id = room.id
@@ -7027,6 +7070,10 @@ export function executeRuntimeAuthorityOperation(
            ON execution.id = ? AND execution.room_id = room.id
          LEFT JOIN agent_execution_attempts AS attempt
            ON attempt.execution_id = execution.id AND attempt.attempt_seq = ?
+         LEFT JOIN agent_execution_intent_links AS link ON link.execution_id = execution.id
+         LEFT JOIN agent_invocation_intents AS intent ON intent.id = link.intent_id
+         LEFT JOIN message_envelopes AS envelope
+           ON envelope.message_id = intent.source_message_id AND envelope.room_id = room.id
          WHERE room.id = ?`,
       ).get(actorId, operation.executionId, operation.attemptSeq, operation.roomId);
       const epoch = createHash("sha256").update(canonicalJson({
@@ -7038,8 +7085,16 @@ export function executeRuntimeAuthorityOperation(
         membershipAccessRevision: authority?.membershipAccessRevision ?? -1,
         roomAccessRevision: authority?.roomAccessRevision ?? -1,
         leaseGeneration: authority?.leaseGeneration ?? -1,
+        sourceMessageId: authority?.sourceMessageId ?? "",
+        sourceRevision: authority?.sourceRevision ?? -1,
+        sourceCurrentRevision: authority?.sourceCurrentRevision ?? -1,
+        sourceLifecycle: authority?.sourceLifecycle ?? "missing",
+        sourceRecalled: authority?.sourceRecalled ?? 1,
+        sourceFenced: authority?.sourceFenced ?? 1,
       })).digest("base64url");
-      const hasCurrentAccess = authority?.roomStatus === "active" &&
+      const hasCurrentAccess =
+        (authority?.roomStatus === "active" ||
+          (operation.deliveryKind === "reset" && authority?.roomStatus === "archived")) &&
         typeof authority.membershipAccessRevision === "number";
       const executionAndAttemptMatch = authority?.executionRoomId === operation.roomId &&
         typeof authority.currentAttemptSeq === "number" &&
@@ -7049,7 +7104,11 @@ export function executeRuntimeAuthorityOperation(
       const lifecycleAllowsDelivery = operation.deliveryKind === "preview"
         ? authority?.executionStatus === "running" &&
           currentAttemptSeq === operation.attemptSeq &&
-          authority.attemptStatus === "running"
+          authority.attemptStatus === "running" &&
+          authority.sourceLifecycle === "active" &&
+          typeof authority.sourceRevision === "number" &&
+          authority.sourceCurrentRevision === authority.sourceRevision &&
+          authority.sourceRecalled === 0 && authority.sourceFenced === 0
         : executionAndAttemptMatch && currentAttemptSeq !== undefined &&
           operation.attemptSeq <= currentAttemptSeq;
       return {
@@ -10673,7 +10732,7 @@ export function recallHumanMessageDatabaseCommand(
           if (scopedEffect?.executionId !== undefined && scopedEffect.attemptSeq !== undefined) {
             abortTargets.push({
               sourceMessageId: input.command.messageId,
-              sourceRevision: input.command.expectedRevision,
+              sourceRevision: scopedEffect.sourceRevision,
               invocationIntentId: execution.intentId,
               executionId: execution.executionId,
               attemptSeq: execution.attemptSeq,

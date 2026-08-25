@@ -1191,6 +1191,51 @@ describe("bounded Agent runtime scheduler", () => {
     await runtime.close();
   });
 
+  it("applies one committed internal producer receipt to only its exact local target", async () => {
+    const runtimeAuthority = authority();
+    let started!: () => void;
+    const sawStart = new Promise<void>((resolve) => { started = resolve; });
+    const resetPreview = vi.fn();
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      provider: provider(async function* (_input, signal) {
+        started();
+        await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(),
+          { once: true }));
+        yield { type: "response_started", sequence: 1 };
+      }),
+      modelId: "fake-model", buildProviderInput: providerInput,
+      limits: { maxActive: 1, maxQueuedPerRoom: 2, maxPartialBytes: 1_024 }, resetPreview,
+    });
+    const active = await runtime.invoke(context, intent("room-a", "source-target"));
+    const unrelated = await runtime.invoke(
+      { ...context, requestId: "producer-unrelated", idempotencyKey: "producer-unrelated" },
+      intent("room-a", "source-unrelated"),
+    );
+    await sawStart;
+    const receipt = {
+      requestId: "producer-receipt", fenceId: "producer-fence", roomId: "room-a",
+      lineageId: "lineage-target",
+      scope: { kind: "agent_authority" as const, agentId: "agent-room-a",
+        authority: "assignment" as const, authorityRevision: 2 },
+      reason: "assignment_revoked" as const,
+      intentOutcomes: [{ intentId: "intent-target", outcome: "already_claimed" as const }],
+      executionOutcomes: [{ executionId: active.execution.id, outcome: "cancelled" as const,
+        version: 2 }],
+      rejectedConfirmationIds: [], revokedGrantIds: [], preservedDispatchIds: [],
+      committedAt: "2026-08-17T00:00:02.000Z",
+    };
+    runtime.applyCommittedScopedProducerReceipt(receipt);
+    await vi.waitFor(() => expect(resetPreview).toHaveBeenCalledTimes(1));
+    expect(resetPreview).toHaveBeenCalledWith(expect.objectContaining({
+      executionId: active.execution.id, reason: "access_revoked",
+    }));
+    expect(runtimeAuthority.executions.get(unrelated.execution.id)?.status).toMatch(/queued|running/);
+    runtime.applyCommittedScopedProducerReceipt(receipt);
+    expect(resetPreview).toHaveBeenCalledTimes(1);
+    await runtime.close();
+  });
+
   it("executes a closed provider tool plan and continues with only bounded tool output", async () => {
     const runtimeAuthority = authority();
     runtimeAuthority.prepareTool = vi.fn(async (executionId, _attempt, tool) => {

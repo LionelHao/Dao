@@ -11,6 +11,7 @@ import {
   type ToolConfirmationInput,
   type ToolDescriptor,
   type AgentExecutionRetryReceipt,
+  type ScopedCancellationReceipt,
 } from "@native-im/core";
 import type {
   AgentRuntimeErrorCode,
@@ -38,6 +39,12 @@ export type RuntimeAuthorityOperation =
       readonly deliveryKind: "preview" | "reset";
       readonly subscriptionGeneration: number;
       readonly expectedAuthorityEpoch?: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.scan-internal-scoped-receipts";
+      readonly afterRowId: number;
+      readonly limit: number;
       readonly now: number;
     }
   | {
@@ -261,6 +268,16 @@ export type RuntimeAuthorityOperationResult =
       readonly subscriptionGeneration: number;
     }
   | {
+      readonly kind: "internal-scoped-producer-receipts";
+      readonly records: readonly Readonly<{
+        committedAt: string;
+        requestId: string;
+        rowId: number;
+        receipt: ScopedCancellationReceipt;
+      }>[];
+      readonly hasMore: boolean;
+    }
+  | {
       readonly kind: "invocation";
       readonly execution: AgentExecution;
       readonly intent: AgentInvocationIntent;
@@ -447,6 +464,11 @@ export function isRuntimeAuthorityOperation(value: unknown): value is RuntimeAut
       (value.deliveryKind === "preview" || value.deliveryKind === "reset") &&
       count(value.subscriptionGeneration, 1) &&
       (!Object.hasOwn(value, "expectedAuthorityEpoch") || text(value.expectedAuthorityEpoch)) &&
+      count(value.now);
+  }
+  if (value.type === "runtime.scan-internal-scoped-receipts") {
+    return exact(value, ["type", "afterRowId", "limit", "now"]) &&
+      count(value.afterRowId) && count(value.limit, 1) && value.limit <= 256 &&
       count(value.now);
   }
   if (value.type === "runtime.read-memory-delta") {

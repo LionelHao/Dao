@@ -751,7 +751,13 @@ describe("authenticated message WebSocket service", () => {
       async refresh() { return session; },
       async revoke() {},
     };
-    const authorize = vi.fn(async () => ({ authorized: true, authorityEpoch: "access:1" }));
+    let authorizationCall = 0;
+    const authorize = vi.fn(async () => {
+      authorizationCall += 1;
+      return authorizationCall === 2
+        ? { authorized: false, authorityEpoch: "access:2" }
+        : { authorized: true, authorityEpoch: authorizationCall >= 3 ? "access:2" : "access:1" };
+    });
     const server = await startMessageWebSocketServer({
       auth,
       service: idleMessageService(),
@@ -789,6 +795,10 @@ describe("authenticated message WebSocket service", () => {
       expect(authorize).toHaveBeenNthCalledWith(2, expect.objectContaining({
         deliveryKind: "reset",
         expectedAuthorityEpoch: "access:1",
+      }));
+      expect(authorize).toHaveBeenNthCalledWith(3, expect.objectContaining({
+        deliveryKind: "reset",
+        expectedAuthorityEpoch: "access:2",
       }));
     } finally {
       await client.close();
@@ -838,6 +848,56 @@ describe("authenticated message WebSocket service", () => {
       authorization.resolve({ authorized: false, authorityEpoch: "revoked:2" });
       await client.close();
       await server.close();
+    }
+  });
+
+  it("bounds blocked preview authority work per Room without blocking another Room", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "preview-bounded");
+    const blocked = deferred<void>();
+    const firstStarted = deferred<void>();
+    let roomOneCalls = 0;
+    const auth: AuthenticationService = {
+      async login() { return session; }, async authenticate() { return principal; },
+      async authenticateSession() {
+        return { sessionId: session.accessToken, sessionFamilyId: "family-preview", principal };
+      },
+      async refresh() { return session; }, async revoke() {},
+    };
+    const server = await startMessageWebSocketServer({
+      auth, service: idleMessageService(), outboxStore: idleOutboxStore(),
+      previewAuthority: { async authorize(input) {
+        if (input.roomId === roomId) {
+          roomOneCalls += 1;
+          if (roomOneCalls === 1) { firstStarted.resolve(); await blocked.promise; }
+        }
+        return { authorized: true, authorityEpoch: "bounded:1" };
+      } },
+    });
+    const client = await LoopbackClient.connect(server.url);
+    try {
+      await client.login(humans[0]);
+      await client.subscribe(roomId, "subscribe-bounded-one");
+      await client.subscribe("room-2", "subscribe-bounded-two");
+      const deliveries = [server.publishAgentPreview({ roomId, executionId: "blocked-0",
+        attemptSeq: 1, streamSeq: 1, delta: "x" })];
+      await firstStarted.promise;
+      for (let index = 1; index < 200; index += 1) {
+        deliveries.push(server.publishAgentPreview({ roomId, executionId: `blocked-${index}`,
+          attemptSeq: 1, streamSeq: index + 1, delta: "x" }));
+      }
+      await server.publishAgentPreview({ roomId: "room-2", executionId: "isolated",
+        attemptSeq: 1, streamSeq: 1, delta: "ROOM-TWO" });
+      await expect(client.waitForFrame((frame) => hasType(frame, "agent.execution.preview") &&
+        frame.roomId === "room-2", "isolated Room preview")).resolves.toMatchObject({ frame: {
+          roomId: "room-2", delta: "ROOM-TWO",
+        } });
+      expect(roomOneCalls).toBe(1);
+      blocked.resolve();
+      await Promise.all(deliveries);
+      await vi.waitFor(() => expect(roomOneCalls).toBeLessThanOrEqual(64));
+    } finally {
+      blocked.resolve(); await client.close(); await server.close();
     }
   });
 

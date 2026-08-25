@@ -5,8 +5,12 @@ import type {
   AgentRuntimeProviderInput,
   ToolConfirmationInput,
   ToolDescriptor,
+  ScopedCancellationReceipt,
 } from "@native-im/core";
-import { isLegacyAgentExecution as isAgentExecution } from "@native-im/core";
+import {
+  isLegacyAgentExecution as isAgentExecution,
+  isScopedCancellationReceipt,
+} from "@native-im/core";
 import type { AuthenticatedCommandContext, InternalAgentCommandContext } from "../persistence/contracts.js";
 import { canonicalJsonV1, compareUtf8 } from "../context-compiler/canonical-json.js";
 import {
@@ -111,6 +115,7 @@ export interface AgentRuntimeService extends AgentRuntime {
       sideEffectState: "none" | "dispatched-retained" | "outcome-unknown-retained";
     }>[];
   }>): void;
+  applyCommittedScopedProducerReceipt(receipt: ScopedCancellationReceipt): void;
   whenIdle(): Promise<void>;
   recover(): Promise<void>;
 }
@@ -228,6 +233,7 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
   const activeAgents = new Set<string>();
   const controllers = new Map<string, AbortController>();
   const jobsByExecution = new Map<string, RuntimeJob>();
+  const appliedScopedProducerFences = new Set<string>();
   const durableOverflowJobs = new Map<string, RuntimeJob>();
   const admittedExecutions = new Set<string>();
   const admittedByRoom = new Map<string, number>();
@@ -875,6 +881,42 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         if (job !== undefined && !controllers.has(cancellation.executionId)) releaseAdmission(job);
         jobsByExecution.delete(cancellation.executionId);
       }
+      signalIdle();
+    },
+    applyCommittedScopedProducerReceipt(receipt) {
+      if (!isScopedCancellationReceipt(receipt)) {
+        throw new TypeError("Committed scoped producer receipt was malformed");
+      }
+      if (appliedScopedProducerFences.has(receipt.fenceId)) return;
+      let applied = false;
+      for (const outcome of receipt.executionOutcomes) {
+        if (outcome.outcome !== "cancelled" && outcome.outcome !== "already_terminal") continue;
+        const job = jobsByExecution.get(outcome.executionId);
+        if (job === undefined || job.execution.roomId !== receipt.roomId) continue;
+        const scopeMatches = receipt.scope.kind === "room"
+          ? receipt.scope.roomId === job.execution.roomId
+          : receipt.scope.kind === "source_message"
+            ? receipt.scope.sourceMessageId === job.execution.sourceMessageId
+            : receipt.scope.kind === "agent_authority"
+              ? receipt.scope.agentId === job.execution.agentId
+              : receipt.scope.kind === "execution"
+                ? receipt.scope.executionId === job.execution.id
+                : true;
+        if (!scopeMatches || job.execution.currentAttemptSeq < 1) continue;
+        applied = true;
+        resetCommittedPreview(job.execution, job.execution.currentAttemptSeq,
+          receipt.reason === "message_recalled" ? "message_recalled" : "access_revoked");
+        controllers.get(outcome.executionId)?.abort(receipt.reason);
+        removeQueuedJob(outcome.executionId);
+        for (const [confirmationId, pending] of pendingConfirmations) {
+          if (pending.job.execution.id === outcome.executionId) {
+            pendingConfirmations.delete(confirmationId);
+          }
+        }
+        if (!controllers.has(outcome.executionId)) releaseAdmission(job);
+        jobsByExecution.delete(outcome.executionId);
+      }
+      if (applied) appliedScopedProducerFences.add(receipt.fenceId);
       signalIdle();
     },
     async interrupt(context, executionId, reason) {

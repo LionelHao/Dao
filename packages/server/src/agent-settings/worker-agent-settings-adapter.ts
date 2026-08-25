@@ -8,6 +8,7 @@ export class WorkerAgentSettingsAdapter implements
   constructor(
     private readonly worker: Pick<CompleteWorkerDatabaseClient, "executeAgentSettings">,
     private readonly nowMs: () => number = Date.now,
+    private readonly afterCommittedMutation?: () => void | Promise<void>,
   ) {}
 
   executeQuery(context: Parameters<Ft07AgentSettingsAuthorityTransport["executeQuery"]>[0],
@@ -15,9 +16,11 @@ export class WorkerAgentSettingsAdapter implements
     return this.worker.executeAgentSettings(context, frame, this.nowMs());
   }
 
-  executeMutation(context: Parameters<Ft07AgentSettingsAuthorityTransport["executeMutation"]>[0],
+  async executeMutation(context: Parameters<Ft07AgentSettingsAuthorityTransport["executeMutation"]>[0],
     frame: Parameters<Ft07AgentSettingsAuthorityTransport["executeMutation"]>[1]) {
-    return this.worker.executeAgentSettings(context, frame, this.nowMs());
+    const result = await this.worker.executeAgentSettings(context, frame, this.nowMs());
+    await this.afterCommittedMutation?.();
+    return result;
   }
 
   syncAgentProfiles(context: Parameters<AgentSettingsProjectionSyncStore["syncAgentProfiles"]>[0],

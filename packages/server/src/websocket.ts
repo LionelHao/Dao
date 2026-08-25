@@ -3213,7 +3213,22 @@ export async function startMessageWebSocketServer(
         },
       });
   let closePromise: Promise<void> | undefined;
-  let previewDeliveryQueue = Promise.resolve();
+  const previewDeliveryQueues = new Map<string, {
+    tail: Promise<void>;
+    count: number;
+    bytes: number;
+    generation: number;
+    overflowReset: Readonly<{
+      roomId: string;
+      executionId: string;
+      attemptSeq: number;
+      reason?: "human_cancelled" | "message_recalled" | "runtime_shutdown" | "repair" |
+        "reconnect" | "execution_terminal" | "attempt_rolled_over" | "access_revoked";
+    }> | undefined;
+    resetScheduled?: boolean;
+  }>();
+  const maxPreviewDeliveryCountPerRoom = 64;
+  const maxPreviewDeliveryBytesPerRoom = 256 * 1_024;
 
   webSocketServer.on("connection", (socket) => {
     maxBufferedAmountBySocket.set(socket, maxBufferedAmountBytes);
@@ -3410,8 +3425,9 @@ export async function startMessageWebSocketServer(
       reason?: "human_cancelled" | "message_recalled" | "runtime_shutdown" | "repair" | "reconnect" |
         "execution_terminal" | "attempt_rolled_over" | "access_revoked";
     }>,
+    isCurrent: () => boolean = () => true,
   ): Promise<void> => {
-    if (options.previewAuthority === undefined) return;
+    if (options.previewAuthority === undefined || !isCurrent()) return;
     await Promise.all([...liveConnections.values()].map(async ({ socket, context }) => {
       const session = context.session;
       const credentialGeneration = context.credentialGeneration;
@@ -3438,16 +3454,41 @@ export async function startMessageWebSocketServer(
       } catch {
         return;
       }
-      if (!authority.authorized || authority.authorityEpoch.length === 0 ||
-          context.closed || context.session === undefined ||
-          context.credentialGeneration !== credentialGeneration ||
-          context.session.sessionId !== session.sessionId ||
-          context.session.sessionFamilyId !== session.sessionFamilyId ||
-          !samePrincipal(context.session.principal, session.principal) ||
-          context.subscriptionGenerationsByRoom.get(preview.roomId) !== subscriptionGeneration ||
-          (!context.unsubscribersByRoom.has(preview.roomId) &&
-            !context.v2GatesByRoom.has(preview.roomId)) ||
-          (priorEpoch !== undefined && priorEpoch.authorityEpoch !== authority.authorityEpoch)) return;
+      const connectionStillCurrent = () => isCurrent() && !context.closed &&
+        context.session !== undefined &&
+        context.credentialGeneration === credentialGeneration &&
+        context.session.sessionId === session.sessionId &&
+        context.session.sessionFamilyId === session.sessionFamilyId &&
+        samePrincipal(context.session.principal, session.principal) &&
+        context.subscriptionGenerationsByRoom.get(preview.roomId) === subscriptionGeneration &&
+        (context.unsubscribersByRoom.has(preview.roomId) ||
+          context.v2GatesByRoom.has(preview.roomId));
+      if (authority.authorityEpoch.length === 0 || !connectionStillCurrent()) return;
+      if (!authority.authorized) {
+        // Rotate the cached epoch, then perform exactly one same-frame check.
+        // This lets a benign access epoch change deliver a terminal reset while
+        // revoke/archive/source fences remain false on the bounded recheck.
+        context.previewAuthorityEpochsByRoom.set(preview.roomId, {
+          subscriptionGeneration,
+          authorityEpoch: authority.authorityEpoch,
+        });
+        try {
+          authority = await options.previewAuthority!.authorize({
+            context: session,
+            roomId: preview.roomId,
+            executionId: preview.executionId,
+            attemptSeq: preview.attemptSeq,
+            deliveryKind,
+            subscriptionGeneration,
+            expectedAuthorityEpoch: authority.authorityEpoch,
+          });
+        } catch {
+          return;
+        }
+        if (!authority.authorized || authority.authorityEpoch.length === 0 ||
+            !connectionStillCurrent()) return;
+      }
+      if (!connectionStillCurrent()) return;
       context.previewAuthorityEpochsByRoom.set(preview.roomId, {
         subscriptionGeneration,
         authorityEpoch: authority.authorityEpoch,
@@ -3479,10 +3520,60 @@ export async function startMessageWebSocketServer(
     deliveryKind: "preview" | "reset",
     preview: Parameters<typeof deliverAuthorizedPreview>[1],
   ): Promise<void> => {
-    const delivery = previewDeliveryQueue.then(() =>
-      deliverAuthorizedPreview(deliveryKind, preview),
-    );
-    previewDeliveryQueue = delivery.catch(() => undefined);
+    const bytes = Buffer.byteLength(preview.delta ?? "", "utf8") + 128;
+    let queue = previewDeliveryQueues.get(preview.roomId);
+    if (queue === undefined) {
+      queue = { tail: Promise.resolve(), count: 0, bytes: 0, generation: 1,
+        overflowReset: undefined };
+      previewDeliveryQueues.set(preview.roomId, queue);
+    }
+    if (queue.count >= maxPreviewDeliveryCountPerRoom - 1 ||
+        queue.bytes + bytes > maxPreviewDeliveryBytesPerRoom - 128) {
+      // Preview is transient. Drop/merge overload into one bounded reset marker;
+      // never detach the still-running authority chain or lose its accounting.
+      queue.overflowReset = {
+        roomId: preview.roomId,
+        executionId: preview.executionId,
+        attemptSeq: preview.attemptSeq,
+        reason: deliveryKind === "reset" ? preview.reason ?? "repair" : "repair",
+      };
+      if (queue.count === 0 && queue.resetScheduled !== true) {
+        const reset = queue.overflowReset;
+        queue.overflowReset = undefined;
+        queue.resetScheduled = true;
+        queueMicrotask(() => {
+          queue!.resetScheduled = false;
+          void enqueuePreviewDelivery("reset", reset!);
+        });
+      }
+      return Promise.resolve();
+    }
+    const generation = queue.generation;
+    const effectiveBytes = bytes;
+    queue.count += 1;
+    queue.bytes += effectiveBytes;
+    const delivery = queue.tail.then(() =>
+      deliverAuthorizedPreview(deliveryKind, preview,
+        () => queue!.generation === generation),
+    ).finally(() => {
+      if (queue!.generation !== generation) return;
+      queue!.count -= 1;
+      queue!.bytes -= effectiveBytes;
+      if (queue!.count !== 0) return;
+      const reset = queue!.overflowReset;
+      if (reset === undefined) {
+        previewDeliveryQueues.delete(preview.roomId);
+        return;
+      }
+      queue!.overflowReset = undefined;
+      if (queue!.resetScheduled === true) return;
+      queue!.resetScheduled = true;
+      queueMicrotask(() => {
+        queue!.resetScheduled = false;
+        void enqueuePreviewDelivery("reset", reset);
+      });
+    });
+    queue.tail = delivery.catch(() => undefined);
     return delivery;
   };
 

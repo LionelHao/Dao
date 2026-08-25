@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import {
+  isAgentExecution,
+  isAgentExecutionAttempt,
   isScopedCancellationReceipt,
   type InvocationCancellationReason,
   type ScopedCancellationReceipt,
@@ -86,7 +88,9 @@ function selector(input: InternalScopedProducerInput): Readonly<{
   parameters: readonly (string | number)[];
 }> {
   if (input.scope.kind === "source_message") {
-    return { sql: "intent.source_message_id = ? AND intent.source_revision = ?",
+    // Recalling the current revision fences every still-live invocation frozen
+    // from that source, including executions created from an earlier revision.
+    return { sql: "intent.source_message_id = ? AND intent.source_revision <= ?",
       parameters: [input.scope.sourceMessageId, input.scope.sourceRevision] };
   }
   if (input.scope.kind === "room") {
@@ -133,6 +137,135 @@ function appendCanonicalEvent(
      ) VALUES (?, ?, 'room', ?, ?, 'pending', 0, ?, NULL, NULL)`,
   ).run(stableId("outbox", "internal-scoped-producer", receipt.requestId, eventId,
     "room", receipt.roomId), eventId, receipt.roomId, streamSeq, occurredAt);
+}
+
+function appendCanonicalTerminalProjection(
+  database: DatabaseSync,
+  executionId: string,
+  occurredAt: string,
+  transition: string,
+): void {
+  const row = database.prepare(
+    `SELECT runtime.execution_id AS executionId, runtime.intent_id AS intentId,
+            runtime.lineage_id AS lineageId, runtime.execution_ordinal AS executionOrdinal,
+            runtime.retry_of_execution_id AS retryOfExecutionId,
+            runtime.snapshot_id AS snapshotId, runtime.provider_id AS providerId,
+            runtime.model_id AS modelId, runtime.public_status AS status, runtime.phase,
+            runtime.current_attempt_seq AS currentAttemptSeq,
+            runtime.authority_version AS version, runtime.queued_at AS queuedAt,
+            runtime.started_at AS startedAt, runtime.updated_at AS updatedAt,
+            runtime.completed_at AS completedAt, runtime.terminal_reason AS terminalReason,
+            runtime.terminal_error_code AS terminalErrorCode, runtime.review_state AS reviewState,
+            legacy.room_id AS roomId, legacy.agent_id AS agentId,
+            legacy.dead_lettered_at AS deadLetteredAt,
+            legacy.result_message_id AS resultMessageId
+     FROM agent_execution_runtime_states AS runtime
+     JOIN agent_executions AS legacy ON legacy.id = runtime.execution_id
+     WHERE runtime.execution_id = ? AND runtime.review_state <> 'legacy_review_required'`,
+  ).get(executionId);
+  if (typeof row?.executionId !== "string" || typeof row.intentId !== "string" ||
+      typeof row.lineageId !== "string" || typeof row.executionOrdinal !== "number" ||
+      typeof row.snapshotId !== "string" || typeof row.providerId !== "string" ||
+      typeof row.modelId !== "string" || typeof row.version !== "number" ||
+      typeof row.queuedAt !== "string" || typeof row.updatedAt !== "string" ||
+      typeof row.roomId !== "string" || typeof row.agentId !== "string") {
+    // Legacy-review executions are intentionally excluded from stable v22
+    // projection; repair owns their disclosure. Current production executions
+    // always satisfy the canonical binding below.
+    return;
+  }
+  const status = row.status;
+  const terminal = status === "completed" || status === "failed" || status === "cancelled";
+  const execution = {
+    executionId: row.executionId, intentId: row.intentId, lineageId: row.lineageId,
+    executionOrdinal: row.executionOrdinal,
+    ...(typeof row.retryOfExecutionId === "string" ? { retryOfExecutionId: row.retryOfExecutionId } : {}),
+    roomId: row.roomId, agentId: row.agentId, snapshotId: row.snapshotId,
+    providerId: row.providerId, modelId: row.modelId, status, phase: row.phase,
+    currentAttemptSeq: row.currentAttemptSeq, version: row.version, queuedAt: row.queuedAt,
+    ...(status === "accepted" ? {} : { startedAt: row.startedAt ?? row.updatedAt }),
+    updatedAt: row.updatedAt,
+    ...(terminal ? { completedAt: row.completedAt ?? row.updatedAt } : {}),
+    ...(status === "cancelled" ? { cancellationReason: row.terminalReason } : {}),
+    ...(status === "failed" ? {
+      terminalErrorCode: row.terminalErrorCode,
+      reviewState: row.reviewState === "needs_review" ? "needs_review" : "not_required",
+    } : {}),
+    ...(typeof row.deadLetteredAt === "string" ? { deadLetteredAt: row.deadLetteredAt } : {}),
+    ...(typeof row.resultMessageId === "string" ? { resultMessageId: row.resultMessageId } : {}),
+  };
+  if (!isAgentExecution(execution)) {
+    throw new Error("Internal scoped producer execution projection was not canonical");
+  }
+  const executionEventId = stableId("runtime-canonical", executionId,
+    String(execution.currentAttemptSeq), transition);
+  const stream = database.prepare(
+    `SELECT head_seq AS headSeq FROM streams
+     WHERE stream_kind = 'room' AND stream_id = ?`,
+  ).get(execution.roomId);
+  if (typeof stream?.headSeq !== "number") throw new Error("Runtime producer room stream is missing");
+  const executionSeq = stream.headSeq + 1;
+  database.prepare(
+    `UPDATE streams SET head_seq = ? WHERE stream_kind = 'room' AND stream_id = ?`,
+  ).run(executionSeq, execution.roomId);
+  database.prepare(
+    `INSERT INTO events (event_id, stream_kind, stream_id, stream_seq, room_id,
+       actor_id, event_type, occurred_at, payload_json)
+     VALUES (?, 'room', ?, ?, ?, ?, 'agent.execution.changed', ?, ?)`,
+  ).run(executionEventId, execution.roomId, executionSeq, execution.roomId,
+    execution.agentId, occurredAt, canonicalJson(execution));
+  database.prepare(
+    `INSERT INTO outbox_deliveries (id, event_id, target_kind, target_id, stream_seq,
+       status, attempts, available_at, delivered_at, last_error)
+     VALUES (?, ?, 'room', ?, ?, 'pending', 0, ?, NULL, NULL)`,
+  ).run(stableId("outbox", "runtime-canonical", transition, executionEventId), executionEventId,
+    execution.roomId, executionSeq, occurredAt);
+
+  const attemptRow = database.prepare(
+    `SELECT public_status AS status, phase, started_at AS startedAt,
+            finished_at AS finishedAt, error_code AS errorCode, next_retry_at AS nextRetryAt
+     FROM agent_execution_attempt_runtime_states
+     WHERE execution_id = ? AND attempt_seq = ?`,
+  ).get(executionId, execution.currentAttemptSeq);
+  const attempt = {
+    executionId: execution.executionId, intentId: execution.intentId,
+    lineageId: execution.lineageId, roomId: execution.roomId, agentId: execution.agentId,
+    attemptSeq: execution.currentAttemptSeq, snapshotId: execution.snapshotId,
+    providerId: execution.providerId, modelId: execution.modelId,
+    status: attemptRow?.status, phase: attemptRow?.phase, executionVersion: execution.version,
+    ...(attemptRow?.status === "accepted" ? {} : {
+      startedAt: attemptRow?.startedAt ?? execution.updatedAt,
+    }),
+    updatedAt: execution.updatedAt,
+    ...((attemptRow?.status === "completed" || attemptRow?.status === "failed" ||
+      attemptRow?.status === "cancelled")
+      ? { finishedAt: attemptRow.finishedAt ?? execution.updatedAt } : {}),
+    ...(attemptRow?.status === "failed" && typeof attemptRow.errorCode === "string"
+      ? { errorCode: attemptRow.errorCode } : {}),
+    ...(attemptRow?.status === "failed" && typeof attemptRow.nextRetryAt === "string"
+      ? { nextRetryAt: attemptRow.nextRetryAt } : {}),
+  };
+  if (!isAgentExecutionAttempt(attempt)) {
+    throw new Error("Internal scoped producer attempt projection was not canonical");
+  }
+  const attemptEventId = stableId("runtime-canonical-attempt", executionId,
+    String(execution.currentAttemptSeq), transition);
+  const attemptSeq = executionSeq + 1;
+  database.prepare(
+    `UPDATE streams SET head_seq = ? WHERE stream_kind = 'room' AND stream_id = ?`,
+  ).run(attemptSeq, execution.roomId);
+  database.prepare(
+    `INSERT INTO events (event_id, stream_kind, stream_id, stream_seq, room_id,
+       actor_id, event_type, occurred_at, payload_json)
+     VALUES (?, 'room', ?, ?, ?, ?, 'agent.execution.attempt.changed', ?, ?)`,
+  ).run(attemptEventId, execution.roomId, attemptSeq, execution.roomId,
+    execution.agentId, occurredAt, canonicalJson(attempt));
+  database.prepare(
+    `INSERT INTO outbox_deliveries (id, event_id, target_kind, target_id, stream_seq,
+       status, attempts, available_at, delivered_at, last_error)
+     VALUES (?, ?, 'room', ?, ?, 'pending', 0, ?, NULL, NULL)`,
+  ).run(stableId("outbox", "runtime-canonical-attempt", transition, attemptEventId),
+    attemptEventId, execution.roomId, attemptSeq, occurredAt);
 }
 
 function dispositions(database: DatabaseSync, executionId: string, attemptSeq: number, reason: string,
@@ -374,6 +507,8 @@ export function commitInternalScopedProducerInTransaction(
       preservedDispatchIds: disposition.preservedDispatchIds,
       committedAt: input.occurredAt,
     };
+    appendCanonicalTerminalProjection(database, executionId, input.occurredAt,
+      `internal-scoped:${fenceId}`);
     receipts.push(storeReceipt(database, input, row, canonicalReceipt, effect));
     effects.push(effect);
   }
@@ -453,6 +588,8 @@ export function finalizeInternalScopedProducerInTransaction(
       preservedDispatchIds: deferred.preservedDispatchIds,
       committedAt: input.occurredAt,
     };
+    appendCanonicalTerminalProjection(database, row.executionId, input.occurredAt,
+      `internal-scoped:${deferred.fenceId}`);
     receipts.push(storeReceipt(database, input, row, canonicalReceipt, effect));
     effects.push(effect);
   }
