@@ -27,7 +27,11 @@ import {
   type WorkerDatabaseClient,
 } from "./persistence/worker-database-client.js";
 import { createAgentRuntimeService, type AgentRuntimeService } from "./agent-runtime/agent-runtime-service.js";
-import { AgentRuntimeError, type ProviderAdapter } from "./agent-runtime/contracts.js";
+import {
+  AgentRuntimeError,
+  type ProviderAdapter,
+  type SecretProvider,
+} from "./agent-runtime/contracts.js";
 import { createEnvironmentSecretProvider } from "./agent-runtime/environment-secret-provider.js";
 import { createOpenAIResponsesProvider } from "./agent-runtime/openai-responses-provider.js";
 import {
@@ -200,6 +204,14 @@ export interface AuthoritativeServerTestFacades {
 const AGENT_MODEL_CONTEXT_WINDOWS: Readonly<Record<string, number>> = Object.freeze({
   "gpt-5-mini": 400_000,
 });
+
+export function createAgentProviderReadinessProbe(input: Readonly<{
+  providerConfigured: boolean;
+  secretProvider: Pick<SecretProvider, "getSecret">;
+}>): () => boolean {
+  return () => input.providerConfigured ||
+    input.secretProvider.getSecret("OPENAI_API_KEY") !== undefined;
+}
 
 export function assertAgentRuntimeModelContextCapability(input: Readonly<{
   model: string;
@@ -582,8 +594,10 @@ async function start(
       model: runtimeModel,
       secretProvider,
     });
-    const agentProviderReady = testOptions.agentRuntimeProviderForTest !== undefined ||
-      secretProvider.getSecret("OPENAI_API_KEY") !== undefined;
+    const agentProviderReady = createAgentProviderReadinessProbe({
+      providerConfigured: testOptions.agentRuntimeProviderForTest !== undefined,
+      secretProvider,
+    });
     projectBoundaryRuntime = createProjectBoundaryRuntime({
       authority: authorityWorker,
       provider,
@@ -597,7 +611,7 @@ async function start(
     const projectBoundary: ProjectBoundaryInvocationProducer = Object.freeze({
       async consume(request: Parameters<ProjectBoundaryInvocationProducer["consume"]>[0]) {
         const result = await authoritativeProjectBoundary.consume(request);
-        if (result.status === "intent-created" && agentProviderReady) {
+        if (result.status === "intent-created" && agentProviderReady()) {
           await projectBoundaryRuntime?.scan();
         }
         return result;
@@ -610,11 +624,12 @@ async function start(
     const scanProjectBoundaries = (): Promise<void> => {
       projectBoundaryScan ??= (async () => {
         const now = Date.now();
+        const ready = agentProviderReady();
         const agentScan = await authorityWorker.executeRuntime({
           type: "runtime.scan-project-agent-boundaries",
           providerId: provider.id,
           modelId: runtimeModel,
-          agentProviderReady,
+          agentProviderReady: ready,
           limit: 256,
           now,
         });
@@ -626,7 +641,7 @@ async function start(
           type: "runtime.scan-project-reminders",
           providerId: provider.id,
           modelId: runtimeModel,
-          agentProviderReady,
+          agentProviderReady: ready,
           limit: 256,
           now,
         });
@@ -634,7 +649,7 @@ async function start(
             !("kind" in reminderScan) || reminderScan.kind !== "project-reminder-scan") {
           throw new Error("Project reminder scan result was malformed");
         }
-        if (agentProviderReady) {
+        if (ready) {
           await projectBoundaryRuntime?.scan();
         }
       })().finally(() => { projectBoundaryScan = undefined; });

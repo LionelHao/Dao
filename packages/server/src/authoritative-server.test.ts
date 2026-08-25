@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { AUTHORITY_PARTICIPANT_FEATURES } from "./room-governance/private-participant-contracts.js";
 import {
   assertAgentRuntimeModelContextCapability,
+  createAgentProviderReadinessProbe,
   createProductionSharedAuthorityParticipantComposition,
 } from "./authoritative-server.js";
 
@@ -53,5 +54,22 @@ describe("production shared-authority participant composition", () => {
     expect(assertAgentRuntimeModelContextCapability({
       model: "deployment-model", configuredContextWindowTokens: 65_536,
     })).toBe(65_536);
+  });
+
+  it("rechecks Project Agent Provider readiness after credential rotation", () => {
+    let credential: string | undefined;
+    const readiness = createAgentProviderReadinessProbe({
+      providerConfigured: false,
+      secretProvider: { getSecret: () => credential },
+    });
+    expect(readiness()).toBe(false);
+    credential = "injected-after-startup";
+    expect(readiness()).toBe(true);
+    credential = undefined;
+    expect(readiness()).toBe(false);
+    expect(createAgentProviderReadinessProbe({
+      providerConfigured: true,
+      secretProvider: { getSecret: () => undefined },
+    })()).toBe(true);
   });
 });
