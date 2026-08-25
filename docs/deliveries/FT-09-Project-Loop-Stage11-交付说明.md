@@ -9,7 +9,7 @@
 - 实现合入后的远端 `main`：`11a73baea42707a7efb12bb9eda01fdd695ea5ef`（Authority schema v25）。
 - 实现 PR：[PR #73 — FT-09: deliver authoritative Project Loop](https://github.com/LionelHao/Dao/pull/73)，squash merge SHA `11a73baea42707a7efb12bb9eda01fdd695ea5ef`。
 - 实现 CI：[quality 32891609467](https://github.com/LionelHao/Dao/actions/runs/32891609467)：[Node 22.13.1](https://github.com/LionelHao/Dao/actions/runs/32891609467/job/97944591202) 与 [Node 22.x](https://github.com/LionelHao/Dao/actions/runs/32891609467/job/97944590913) 均 success。
-- 证据 PR：[PR #74 — docs(ft09): record Stage 11 delivery evidence](https://github.com/LionelHao/Dao/pull/74)；PR 页面保留最终双 Node required checks，最终 squash merge SHA 由 GitHub 在本 PR 合入时记录。
+- 证据 PR：[PR #74 — docs(ft09): record evidence and stabilize real-Worker CI](https://github.com/LionelHao/Dao/pull/74)；PR 页面保留最终双 Node required checks，最终 squash merge SHA 由 GitHub 在本 PR 合入时记录。
 
 实现 PR 共变更 124 个文件，新增 21,981 行、删除 241 行；没有 Blueprint HTML/JSON、Grand Blueprint 数据或 renderer 变更。仓库禁止 merge commit，因此实现 PR 按 branch protection 允许的 squash 方式合入；没有 force push 或绕过 required checks。
 
@@ -103,7 +103,7 @@ corepack pnpm --filter @native-im/desktop smoke
 git diff --check
 ```
 
-- 全量：236 files（233 passed / 3 skipped / 0 failed）；2523 tests（2520 passed / 3 skipped / 0 failed）；本地 `pnpm test` 700.73s。
+- 全量：236 files（233 passed / 3 skipped / 0 failed）；2523 tests（2520 passed / 3 skipped / 0 failed）；实现候选本地 `pnpm test` 700.73s，证据候选经下述编排修正后为 736.74s。
 - Core：11 files / 107 passed。
 - Desktop：72 files / 576 passed。
 - Server：153 files（150 passed + 3 skipped）/ 1840 tests（1837 passed + 3 skipped）。
@@ -116,6 +116,8 @@ git diff --check
 - Core boundary：无 I/O dependency/import；Desktop boundary：27 个 production renderer source 无 Node/Electron authority；真实 Electron smoke通过 native selection、secure preview 与 app bridge。
 - CI run 32891609467：Node 22.x 17m21s success；Node 22.13.1 18m55s success。唯一 annotation 是 GitHub Actions 自身 Node 20 action runtime deprecation，不是产品或测试失败。
 
+证据 PR 的初始 Node 22.13.1 全量运行在通用 jsdom 并行池中先后使两个不同的真实 Worker/SQLite 旧用例超过默认 5s 上限（5.688s 与 5.022s），两次其余 2519 tests 均通过。同一 Node 22.13.1 下隔离重复分别 10/10 与 5/5 通过；根因是真实 Worker 文件与 200+ 文件的跨文件 CPU/I/O 竞争。`vitest.config.ts` 因此只将 `worker-database-client.test.ts` 和 `context-snapshot-database-authority.test.ts` 收入仓库已有的 single-fork `worker-persistence` 组；未修改测试代码、断言、计数或 5s 上限。Node 22.13.1 下该组 16 files / 223 tests 全通过，随后全量 236 files / 2523 tests 也全通过；修正仅隔离真实持久化资源竞争，没有放宽任何门禁。
+
 三个 OpenAI opt-in live suites（Agent、Router、Memory）因没有显式启用 live flag 和/或 secret 安全跳过。没有读取、打印、hash、比较或记录 secret 的值、长度、前后缀、Authorization header或可识别派生值；fake runtime、SSE parser、timeout/cancel、noauth、provider error与secret sentinel覆盖未降低。
 
 ## 8. 独立对抗审阅与已知风险
@@ -124,7 +126,7 @@ git diff --check
 
 最终结论：**无剩余 P0、P1 或 P2；无交付 blocker。** 最后生产变更 `2ea4da3` 经 Desktop reviewer复审无 P0/P1/P2；最后仅测试 fixture 提交 `fd9c027` 的 real-process E2E 29/29 与全量 2520/2520 passed，再由 CI 双 Node matrix复验。
 
-已知非阻塞风险/运营项：GitHub marketplace actions仍声明旧 Node action runtime并产生 deprecation annotation，属于 CI dependency维护，不影响 Node 22.13.1/22.x 项目矩阵；三个真实 OpenAI live suites保持显式 opt-in，当前以 fake/provider parser/noauth/sentinel和边界 zero-call 证明替代，不把跳过写成通过。
+已知非阻塞风险/运营项：GitHub marketplace actions仍声明旧 Node action runtime并产生 deprecation annotation，属于 CI dependency维护，不影响 Node 22.13.1/22.x 项目矩阵；三个真实 OpenAI live suites保持显式 opt-in，当前以 fake/provider parser/noauth/sentinel和边界 zero-call 证明替代，不把跳过写成通过。真实 Worker 跨文件资源竞争已通过上述测试编排修正闭合，不作为剩余缺陷或被忽略的 flake。
 
 ## 9. Git、保护文件、Blueprint 与 worktree
 
