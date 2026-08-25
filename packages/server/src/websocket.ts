@@ -87,6 +87,12 @@ export interface MessageWebSocketServer {
     readonly streamSeq: number;
     readonly delta: string;
   }): void;
+  resetAgentPreview(preview: {
+    readonly roomId: string;
+    readonly executionId: string;
+    readonly attemptSeq: number;
+    readonly reason: "human_cancelled" | "message_recalled" | "runtime_shutdown" | "repair" | "reconnect";
+  }): void;
   close(): Promise<void>;
 }
 
@@ -1367,6 +1373,8 @@ function isCorrelatedRecoveryResponse(
       | "agent.invoke"
       | "agent.interrupt"
       | "agent.retry"
+      | "invocation.cancel"
+      | "invocation.retry"
       | "agent.tool.confirm"
       | "agent.compensate"
       | "open-item.create"
@@ -1502,6 +1510,8 @@ async function handleRecoveryFrame(
       | "agent.invoke"
       | "agent.interrupt"
       | "agent.retry"
+      | "invocation.cancel"
+      | "invocation.retry"
       | "agent.tool.confirm"
       | "agent.compensate"
       | "open-item.create"
@@ -2898,7 +2908,19 @@ async function handleFrame(
       return;
     }
     case "agent.interrupt":
-    case "agent.retry":
+    case "agent.retry": {
+      const session = await requireSession(socket, frame.requestId, options, context);
+      if (session === undefined) return;
+      sendFrame(socket, errorFrame(
+        410,
+        "protocol_upgrade_required",
+        "protocol_upgrade_required",
+        frame.requestId,
+      ));
+      return;
+    }
+    case "invocation.cancel":
+    case "invocation.retry":
     case "agent.tool.confirm":
     case "agent.compensate": {
       const session = await requireSession(socket, frame.requestId, options, context);
@@ -2916,22 +2938,25 @@ async function handleFrame(
             : `${frame.type}:${frame.executionId}`,
       };
       try {
-        if (frame.type === "agent.interrupt") {
-          const execution = await options.agentRuntime.interrupt(
+        if (frame.type === "invocation.cancel") {
+          const receipt = await options.agentRuntime.cancelInvocation(
             commandContext,
             frame.executionId,
-            frame.reason,
+            frame.expectedVersion,
           );
           sendFrame(socket, {
-            type: "agent.execution.ack",
+            type: "invocation.cancel.ack",
             requestId: frame.requestId,
-            execution,
-            replayed: false,
+            receipt,
           });
-        } else if (frame.type === "agent.retry") {
-          const accepted = await options.agentRuntime.retry(commandContext, frame.executionId);
+        } else if (frame.type === "invocation.retry") {
+          const accepted = await options.agentRuntime.retryInvocation(
+            commandContext,
+            frame.executionId,
+            frame.expectedVersion,
+          );
           sendFrame(socket, {
-            type: "agent.execution.ack",
+            type: "invocation.retry.ack",
             requestId: frame.requestId,
             execution: accepted.execution,
             replayed: accepted.replayed,
@@ -3358,6 +3383,18 @@ export async function startMessageWebSocketServer(
         }
         sendFrame(socket, {
           type: "agent.execution.preview",
+          ...preview,
+          authoritative: false,
+        });
+      }
+    },
+    resetAgentPreview(preview): void {
+      for (const { socket, context } of liveConnections.values()) {
+        if (context.closed || context.session === undefined ||
+            (!context.unsubscribersByRoom.has(preview.roomId) &&
+              !context.v2GatesByRoom.has(preview.roomId))) continue;
+        sendFrame(socket, {
+          type: "agent.execution.preview.reset",
           ...preview,
           authoritative: false,
         });

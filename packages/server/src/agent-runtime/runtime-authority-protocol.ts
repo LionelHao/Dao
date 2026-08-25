@@ -1,6 +1,6 @@
 import {
-  type AgentExecution,
-  type AgentInvocationIntent,
+  type LegacyAgentExecution as AgentExecution,
+  type LegacyAgentInvocationIntent as AgentInvocationIntent,
   type HumanPreemptionNotice,
   type RoomMemoryRawDeltaPage,
   type RoomMemoryStatus,
@@ -17,6 +17,9 @@ import type {
   AuthenticatedCommandContext,
   JsonValue,
 } from "../persistence/contracts.js";
+import type {
+  ScopedCancellationCommitReceipt,
+} from "../scoped-cancellation/scoped-cancellation-orchestrator.js";
 
 export type RuntimeAuthorityOperation =
   | { readonly type: "runtime.read-context"; readonly executionId: string; readonly now: number }
@@ -71,11 +74,26 @@ export type RuntimeAuthorityOperation =
       readonly now: number;
     }
   | {
+      readonly type: "runtime.shutdown";
+      readonly executionId: string;
+      readonly attemptSeq: number;
+      readonly now: number;
+    }
+  | {
       readonly type: "runtime.manual-retry";
       readonly context: AuthenticatedCommandContext;
       readonly executionId: string;
       readonly newExecutionId: string;
       readonly newIntentId: string;
+      readonly expectedVersion?: number;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.cancel-scoped";
+      readonly context: AuthenticatedCommandContext;
+      readonly executionId: string;
+      readonly expectedVersion: number;
+      readonly producerId: string;
       readonly now: number;
     }
   | {
@@ -148,6 +166,11 @@ export type RuntimeAuthorityOperation =
       readonly now: number;
     }
   | {
+      readonly type: "runtime.create-route-for-human-message";
+      readonly sourceHumanMessageId: string;
+      readonly now: number;
+    }
+  | {
       readonly type: "runtime.enqueue-fence-replacements";
       readonly routeJobId: string;
       readonly targetAgentId: string;
@@ -205,6 +228,7 @@ export type RuntimeAuthorityOperationResult =
     }
   | { readonly kind: "settled-tool" }
   | { readonly kind: "checkpoint" }
+  | ScopedCancellationCommitReceipt
   | {
       readonly kind: "human-fence-cancelled";
       readonly notice: HumanPreemptionNotice;
@@ -212,6 +236,13 @@ export type RuntimeAuthorityOperationResult =
     }
   | {
       readonly kind: "human-fence-route";
+      readonly roomId: string;
+      readonly sourceHumanMessageId: string;
+      readonly routeJobId: string;
+      readonly replayed: boolean;
+    }
+  | {
+      readonly kind: "human-message-route";
       readonly roomId: string;
       readonly sourceHumanMessageId: string;
       readonly routeJobId: string;
@@ -346,9 +377,22 @@ export function isRuntimeAuthorityOperation(value: unknown): value is RuntimeAut
     return exact(value, ["type", "context", "executionId", "reason", "now"]) && humanContext(value.context) &&
       text(value.executionId) && text(value.reason) && count(value.now);
   }
+  if (value.type === "runtime.shutdown") {
+    return exact(value, ["type", "executionId", "attemptSeq", "now"]) &&
+      text(value.executionId) && count(value.attemptSeq, 1) && count(value.now);
+  }
   if (value.type === "runtime.manual-retry") {
-    return exact(value, ["type", "context", "executionId", "newExecutionId", "newIntentId", "now"]) &&
-      humanContext(value.context) && text(value.executionId) && text(value.newExecutionId) && text(value.newIntentId) && count(value.now);
+    const optional = Object.hasOwn(value, "expectedVersion") ? ["expectedVersion"] : [];
+    return exact(value, ["type", "context", "executionId", "newExecutionId", "newIntentId", "now"], optional) &&
+      humanContext(value.context) && text(value.executionId) && text(value.newExecutionId) &&
+      text(value.newIntentId) && (!Object.hasOwn(value, "expectedVersion") ||
+        count(value.expectedVersion, 1)) && count(value.now);
+  }
+  if (value.type === "runtime.cancel-scoped") {
+    return exact(value, [
+      "type", "context", "executionId", "expectedVersion", "producerId", "now",
+    ]) && humanContext(value.context) && text(value.executionId) &&
+      count(value.expectedVersion, 1) && text(value.producerId) && count(value.now);
   }
   if (value.type === "runtime.begin-compensation") {
     return exact(value, ["type", "context", "executionId", "newExecutionId", "grantId", "dispatchId", "now"]) &&
@@ -399,7 +443,8 @@ export function isRuntimeAuthorityOperation(value: unknown): value is RuntimeAut
       (value.kind === "model" || value.kind === "tool") && sha256(value.inputSha256) && sha256(value.outputSha256) && count(value.now);
   }
   if (value.type === "runtime.cancel-for-human-fence" ||
-      value.type === "runtime.create-route-after-human-fence") {
+      value.type === "runtime.create-route-after-human-fence" ||
+      value.type === "runtime.create-route-for-human-message") {
     return exact(value, ["type", "sourceHumanMessageId", "now"]) &&
       text(value.sourceHumanMessageId) && count(value.now);
   }

@@ -78,7 +78,7 @@ describe("canonical collaboration records", () => {
     })).toBe(true);
     expect(isAgentInvocationIntent({
       ...intent, status: "cancelled", cancelledAt: "2026-08-25T00:00:01.000Z",
-      cancellationReason: "source_recalled",
+      cancellationReason: "message_recalled",
     })).toBe(true);
 
     const execution = {
@@ -126,7 +126,7 @@ describe("canonical collaboration records", () => {
     const cancellation = {
       requestId: "request-cancel-1", fenceId: "fence-1", roomId: "room-1", lineageId: "lineage-1",
       scope: { kind: "execution", executionId: "execution-1", expectedVersion: 3 },
-      reason: "requested_by_human",
+      reason: "human_cancelled",
       intentOutcomes: [{ intentId: "intent-1", outcome: "already_claimed" }],
       executionOutcomes: [{ executionId: "execution-1", outcome: "cancelled", version: 4 }],
       rejectedConfirmationIds: ["confirmation-1"], revokedGrantIds: ["grant-1"],
@@ -466,7 +466,7 @@ describe("canonical collaboration records", () => {
       startedAt: "2026-08-10T00:00:01.000Z",
       updatedAt: "2026-08-10T00:01:00.000Z",
       completedAt: "2026-08-10T00:01:00.000Z",
-      cancellationReason: "requested_by_human",
+      cancellationReason: "human_cancelled",
     })).toBe(true);
     expect(isLegacyAgentExecution({
       id: "execution-1",

@@ -1,11 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
-  isAgentExecution,
+  isLegacyAgentExecution as isAgentExecution,
   isRoomMemoryProjection,
   isRoomMemoryRawDeltaPage,
   isRoomMemoryStatus,
-  type AgentExecution,
-  type AgentInvocationIntent,
+  type LegacyAgentExecution as AgentExecution,
+  type LegacyAgentInvocationIntent as AgentInvocationIntent,
 } from "@native-im/core";
 import type { AuthenticatedCommandContext, InternalAgentCommandContext } from "../persistence/contracts.js";
 import { toAgentWorkerCommandContext } from "../persistence/contracts.js";
@@ -14,6 +14,7 @@ import {
   type WorkerDatabaseClient,
 } from "../persistence/worker-database-client.js";
 import type { ContextAuthorityWorkerDatabaseClient } from "../persistence/worker-database-client.js";
+import type { ScopedCancellationCommitReceipt } from "../scoped-cancellation/scoped-cancellation-orchestrator.js";
 import { canonicalJsonV1 } from "../context-compiler/canonical-json.js";
 import {
   AgentRuntimeError,
@@ -94,6 +95,30 @@ function fenceReplacementResult(
     throw new AgentRuntimeError("provider_failure", "Authority fence replacement result was malformed");
   }
   return { executions: value.executions, replayed: value.replayed };
+}
+
+function scopedCancellationResult(value: unknown): ScopedCancellationCommitReceipt {
+  if (!record(value) || value.kind !== "scoped-cancellation-committed" ||
+      typeof value.fenceId !== "string" || typeof value.roomId !== "string" ||
+      typeof value.producerId !== "string" || value.reason !== "human_cancelled" ||
+      typeof value.replayed !== "boolean" || !Array.isArray(value.effects) ||
+      !value.effects.every((effect) => record(effect) &&
+        typeof effect.sourceMessageId === "string" &&
+        typeof effect.sourceRevision === "number" &&
+        typeof effect.invocationIntentId === "string" &&
+        typeof effect.executionId === "string" &&
+        typeof effect.attemptSeq === "number" &&
+        (effect.disposition === "execution_cancelled" || effect.disposition === "already_terminal") &&
+        (effect.confirmationDisposition === "none" ||
+          effect.confirmationDisposition === "pending_rejected" ||
+          effect.confirmationDisposition === "confirmed_retained") &&
+        (effect.grantDisposition === "none" || effect.grantDisposition === "unclaimed_revoked" ||
+          effect.grantDisposition === "claimed_retained") &&
+        (effect.sideEffectState === "none" || effect.sideEffectState === "dispatched-retained" ||
+          effect.sideEffectState === "outcome-unknown-retained"))) {
+    throw new AgentRuntimeError("provider_failure", "Authority cancellation receipt was malformed");
+  }
+  return value as unknown as ScopedCancellationCommitReceipt;
 }
 
 function preparedToolResult(value: unknown): ReturnType<RuntimeAuthority["prepareTool"]> extends Promise<infer Result> ? Result : never {
@@ -305,6 +330,14 @@ export function createWorkerRuntimeAuthority(
         now: Date.now(),
       })));
     },
+    async shutdown(executionId, attemptSeq) {
+      return remember(executionResult(await execute({
+        type: "runtime.shutdown",
+        executionId,
+        attemptSeq,
+        now: Date.now(),
+      })));
+    },
     async interrupt(context: AuthenticatedCommandContext, executionId, reason) {
       return executionResult(await execute({
         type: "runtime.interrupt",
@@ -314,13 +347,24 @@ export function createWorkerRuntimeAuthority(
         now: Date.now(),
       }));
     },
-    async retry(context: AuthenticatedCommandContext, executionId) {
+    async cancelScoped(context, executionId, expectedVersion, producerId) {
+      return scopedCancellationResult(await execute({
+        type: "runtime.cancel-scoped",
+        context,
+        executionId,
+        expectedVersion,
+        producerId,
+        now: Date.now(),
+      }));
+    },
+    async retry(context: AuthenticatedCommandContext, executionId, expectedVersion) {
       const result = invocationResult(await execute({
         type: "runtime.manual-retry",
         context,
         executionId,
         newExecutionId: `execution-${randomUUID()}`,
         newIntentId: `intent-${randomUUID()}`,
+        ...(expectedVersion === undefined ? {} : { expectedVersion }),
         now: Date.now(),
       }));
       remember(result.execution);

@@ -1,6 +1,6 @@
 import {
   isActor,
-  isAgentExecution,
+  isLegacyAgentExecution,
   isAgentJudgement,
   isCalibrationSignal,
   isHumanReadReceipt,
@@ -425,7 +425,7 @@ function seedMixedRoomRecords(databasePath: string, roomId: string): Record<stri
           currentAttemptSeq: 1, retryCycle: 1, retryOrdinal: 1 as const,
           recoveryCursor: 0, queuedAt: "t", startedAt: "t", updatedAt: "t" };
         if (!isAgentJudgement(judgment) || !isOpenItem(item) ||
-            !isAgentExecution(execution)) {
+            !isLegacyAgentExecution(execution)) {
           throw new TypeError("Mixed collaboration fixture is not closed");
         }
         insertJudgement.run(judgment.id, roomId, messageId,
@@ -496,7 +496,7 @@ function seedMixedRoomRecords(databasePath: string, roomId: string): Record<stri
       "human-read": count("human_read_receipts"),
       "agent-judgement": count("agent_judgments"),
       "open-item": count("open_items"),
-      "agent-execution": count("agent_executions"),
+      "legacy-agent-execution": count("agent_executions"),
       calibration: count("calibration_signals"),
       "route-job": count("route_jobs"),
       // Legacy static route_job_agents are no longer an authority candidate set.

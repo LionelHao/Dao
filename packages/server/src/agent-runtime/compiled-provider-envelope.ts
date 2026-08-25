@@ -1,5 +1,5 @@
 import type {
-  AgentInvocationIntent,
+  LegacyAgentInvocationIntent as AgentInvocationIntent,
   AgentRuntimeProviderInput,
   ProviderNeutralCheckpoint,
   ToolDescriptor,

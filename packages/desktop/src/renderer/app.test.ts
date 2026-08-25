@@ -304,8 +304,8 @@ describe("ephemeral Agent execution preview", () => {
   });
 });
 
-describe("human preemption presentation", () => {
-  it("renders a separate notice and cancelled/requeued execution states without withdrawal or failure", () => {
+describe("historical preemption and canonical retry presentation", () => {
+  it("keeps the legacy notice read-only and renders cancelled/retry executions as separate canonical cards", () => {
     const noticeRoot = document.createElement("div");
     app.renderHumanPreemptionNotice?.(noticeRoot, {
       roomId: "preview-room",
@@ -323,29 +323,29 @@ describe("human preemption presentation", () => {
       socialReactions: [], calibrations: [],
       agentExecutions: [
         {
-          id: "execution-old", roomId: "preview-room", sourceMessageId: "preview-agent-data",
-          requesterId: "human-li", agentId: "agent-data", toolName: "model.generate",
-          status: "cancelled", actionCategory: "waiting_upstream", currentAttemptSeq: 1,
-          retryCycle: 1, retryOrdinal: 1, recoveryCursor: 1,
+          executionId: "execution-old", intentId: "intent-1", lineageId: "lineage-1",
+          executionOrdinal: 1, roomId: "preview-room", agentId: "agent-data",
+          snapshotId: "snapshot-1", providerId: "openai", modelId: "gpt-5",
+          status: "cancelled", phase: "cancelled", currentAttemptSeq: 1, version: 3,
           queuedAt: "2026-08-17T00:00:00.000Z", startedAt: "2026-08-17T00:00:01.000Z",
           updatedAt: "2026-08-17T00:00:02.000Z", completedAt: "2026-08-17T00:00:02.000Z",
-          cancellationReason: "human_preempted:preview-human-mention",
+          cancellationReason: "human_cancelled",
         },
         {
-          id: "execution-new", roomId: "preview-room", sourceMessageId: "preview-human-mention",
-          requesterId: "human-li", agentId: "agent-data", toolName: "model.generate",
-          status: "queued", actionCategory: "model_generation", currentAttemptSeq: 1,
-          retryCycle: 1, retryOrdinal: 1, recoveryCursor: 0,
+          executionId: "execution-new", intentId: "intent-1", lineageId: "lineage-1",
+          executionOrdinal: 2, retryOfExecutionId: "execution-old",
+          roomId: "preview-room", agentId: "agent-data", snapshotId: "snapshot-2",
+          providerId: "openai", modelId: "gpt-5", status: "accepted", phase: "queued",
+          currentAttemptSeq: 1, version: 1,
           queuedAt: "2026-08-17T00:00:03.000Z", updatedAt: "2026-08-17T00:00:03.000Z",
-          supersedesExecutionIds: ["execution-old"],
         },
       ],
     });
 
-    expect(root.querySelector(".agent-invocation--human-preempted")?.textContent)
-      .toContain("因人类发言已取消");
-    expect(root.querySelector(".agent-invocation--requeued")?.textContent).toContain("已重新排队");
-    expect(root.querySelector(".agent-invocation--requeued")?.getAttribute("data-supersedes-execution-ids"))
+    expect(root.querySelector("[data-execution-id='execution-old']")?.getAttribute("data-execution-status"))
+      .toBe("cancelled");
+    expect(root.querySelector(".agent-invocation--requeued")?.textContent).toContain("Agent 执行 #2");
+    expect(root.querySelector(".agent-invocation--requeued")?.getAttribute("data-retry-of-execution-id"))
       .toBe("execution-old");
     const executionText = [...root.querySelectorAll(".agent-invocation")]
       .map((element) => element.textContent).join(" ");
@@ -467,18 +467,19 @@ describe("verified collaboration primitive renderer", () => {
       }],
       lightTasks: [],
       agentExecutions: [{
-        id: "execution-restored",
+        executionId: "execution-restored",
+        intentId: "intent-restored",
+        lineageId: "lineage-restored",
+        executionOrdinal: 1,
         roomId: "preview-room",
-        sourceMessageId: "preview-human-mention",
-        requesterId: "恢复请求者",
         agentId: "恢复 Agent",
-        toolName: "restore.inspect",
+        snapshotId: "snapshot-restored",
+        providerId: "openai",
+        modelId: "gpt-5",
         status: "running",
-        actionCategory: "model_generation",
+        phase: "model_generation",
         currentAttemptSeq: 1,
-        retryCycle: 1,
-        retryOrdinal: 1,
-        recoveryCursor: 0,
+        version: 2,
         queuedAt: "2026-08-12T13:00:02.900Z",
         startedAt: "2026-08-12T13:00:03.000Z",
         updatedAt: "2026-08-12T13:00:03.000Z",
@@ -525,7 +526,7 @@ describe("verified collaboration primitive renderer", () => {
     expect(openItem?.getAttribute("data-source-message-id")).toBe("preview-agent-data");
     expect(openItem?.querySelectorAll(".human-request-action")).toHaveLength(3);
     expect(agentExecution?.textContent).toContain("恢复 Agent 正在调用");
-    expect(agentExecution?.textContent).toContain("restore.inspect");
+    expect(agentExecution?.textContent).toContain("正在生成");
     expect(agentExecution?.textContent).toContain("Agent 执行");
     expect(social?.textContent).toContain("🎉 纯社交");
     expect(calibration?.textContent).toContain("👍 校准：影响后续发言判定");
@@ -564,14 +565,14 @@ describe("verified collaboration primitive renderer", () => {
     expect(root.querySelectorAll("[data-message-kind='agent'] > .agent-judgement")).toHaveLength(0);
   });
 
-  it("T-0013 distinguishes request and invocation mentions and exposes interruption", () => {
+  it("T-0013 distinguishes request and invocation mentions and keeps preview cancellation fail-closed", () => {
     const root = document.createElement("main");
 
     app.renderM2PrimitivesPreview?.(root);
 
     const humanMention = root.querySelector(".mention--human");
     const agentMention = root.querySelector(".mention--agent");
-    const interrupt = root.querySelector<HTMLButtonElement>("[data-testid='interrupt-agent-execution']");
+    const cancel = root.querySelector<HTMLButtonElement>("[data-testid='cancel-agent-execution']");
     expect(humanMention?.classList.contains("mention--agent")).toBe(false);
     expect(agentMention?.classList.contains("mention--human")).toBe(false);
     expect(root.querySelector("[data-open-item-status='transferred']")?.textContent).toContain("周安全 → 陈研发");
@@ -584,10 +585,10 @@ describe("verified collaboration primitive renderer", () => {
       .toContain("来源：手动标记未完");
     expect(root.querySelectorAll("[data-agent-invocation] .human-request-action")).toHaveLength(0);
 
-    interrupt?.click();
-
-    expect(root.querySelector("[data-agent-invocation]")?.getAttribute("data-execution-status")).toBe("cancelled");
-    expect(root.querySelector("[data-member-id='agent-data']")?.textContent).toBe("可用");
+    expect(cancel?.disabled).toBe(true);
+    cancel?.click();
+    expect(root.querySelector("[data-agent-invocation]")?.getAttribute("data-execution-status")).toBe("running");
+    expect(root.querySelector("[data-member-id='agent-data']")?.textContent).toBe("执行中");
   });
 
   it("renders D-01 content, unique owner, source, four states, and active human actions", () => {

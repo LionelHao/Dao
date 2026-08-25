@@ -1,6 +1,6 @@
 import type {
-  AgentExecution,
-  AgentInvocationIntent,
+  LegacyAgentExecution as AgentExecution,
+  LegacyAgentInvocationIntent as AgentInvocationIntent,
   AgentRuntimeProviderInput,
   ProviderEvent,
   RoomMemoryRawDeltaPage,
@@ -10,6 +10,7 @@ import type {
   ToolDescriptor,
 } from "@native-im/core";
 import type { AuthenticatedCommandContext, InternalAgentCommandContext } from "../persistence/contracts.js";
+import type { ScopedCancellationCommitReceipt } from "../scoped-cancellation/scoped-cancellation-orchestrator.js";
 
 export const AGENT_RUNTIME_MAX_ACTIVE = 8;
 export const AGENT_RUNTIME_MAX_QUEUED_PER_ROOM = 32;
@@ -247,14 +248,22 @@ export interface RuntimeAuthority {
     errorCode: AgentRuntimeErrorCode,
     nextRetryAt: string | undefined,
   ): Promise<AgentExecution>;
+  shutdown(executionId: string, attemptSeq: number): Promise<AgentExecution>;
   interrupt(
     context: AuthenticatedCommandContext,
     executionId: string,
     reason: string,
   ): Promise<AgentExecution>;
+  cancelScoped(
+    context: AuthenticatedCommandContext,
+    executionId: string,
+    expectedVersion: number,
+    producerId: string,
+  ): Promise<ScopedCancellationCommitReceipt>;
   retry(
     context: AuthenticatedCommandContext,
     executionId: string,
+    expectedVersion?: number,
   ): Promise<InvocationAcceptedWithIntent>;
   beginCompensation(
     context: AuthenticatedCommandContext,
@@ -307,7 +316,17 @@ export interface AgentRuntime {
     executionId: string,
     reason: string,
   ): Promise<AgentExecution>;
+  cancelInvocation(
+    context: AuthenticatedCommandContext,
+    executionId: string,
+    expectedVersion: number,
+  ): Promise<ScopedCancellationCommitReceipt>;
   retry(context: AuthenticatedCommandContext, executionId: string): Promise<InvocationAccepted>;
+  retryInvocation(
+    context: AuthenticatedCommandContext,
+    executionId: string,
+    expectedVersion: number,
+  ): Promise<InvocationAccepted>;
   confirmTool(
     context: AuthenticatedCommandContext,
     confirmation: ToolConfirmationInput,

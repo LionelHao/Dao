@@ -50,7 +50,16 @@ function recordIdentity(record: RoomRepairRecord): string {
     case "open-item": return `open-item\0${record.value.id}`;
     case "open-item-agent-failure": return `open-item-agent-failure\0${record.value.id}`;
     case "light-task": return `light-task\0${record.value.id}`;
-    case "agent-execution": return `agent-execution\0${record.value.id}`;
+    case "agent-invocation-intent": return `agent-invocation-intent\0${record.value.intentId}`;
+    case "agent-execution": return `agent-execution\0${record.value.executionId}`;
+    case "agent-execution-attempt":
+      return `agent-execution-attempt\0${record.value.executionId}\0${record.value.attemptSeq}`;
+    case "agent-execution-retry": return `agent-execution-retry\0${record.value.requestId}`;
+    case "agent-scoped-cancellation":
+      return `agent-scoped-cancellation\0${record.value.fenceId}`;
+    case "project-boundary-invocation":
+      return `project-boundary-invocation\0${record.value.boundaryId}`;
+    case "legacy-agent-execution": return `legacy-agent-execution\0${record.value.id}`;
     case "route-job": return `route-job\0${record.value.id}`;
     case "route-judgment": return `route-judgment\0${record.value.id}`;
     case "calibration": return `calibration\0${record.value.id}`;

@@ -86,6 +86,7 @@ const AUTHORITY_TABLES = [
   "human_request_intents",
   "idempotency_records",
   "invocation_cancellation_receipts",
+  "invocation_human_retry_receipts",
   "invocation_recovery_cursors",
   "invocation_recovery_queue",
   "invocation_scoped_cancellation_fences",

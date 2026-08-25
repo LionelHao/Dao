@@ -1,6 +1,6 @@
 import {
   isActor,
-  isAgentExecution,
+  isLegacyAgentExecution as isAgentExecution,
   isAgentJudgement,
   isAgentRoomMembership,
   isAttachmentPrivateEvent,
@@ -22,7 +22,7 @@ import {
   isRouteJudgment,
 } from "@native-im/core";
 import type {
-  AgentExecutionStatus,
+  LegacyAgentExecutionStatus as AgentExecutionStatus,
   AgentJudgementOutcome,
   AgentParticipation,
   Actor,

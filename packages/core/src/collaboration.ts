@@ -202,16 +202,18 @@ export type InvocationOrigin =
     }>;
 
 export type InvocationCancellationReason =
-  | "requested_by_human"
-  | "human_rejected"
-  | "superseded"
-  | "source_recalled"
-  | "context_invalidated"
+  | "human_cancelled"
+  | "reply_superseded"
+  | "correction_superseded"
+  | "intent_superseded"
+  | "message_recalled"
   | "room_archived"
   | "membership_revoked"
   | "assignment_revoked"
   | "profile_disabled"
-  | "capability_revoked";
+  | "capability_revoked"
+  | "source_ineligible"
+  | "runtime_shutdown";
 
 export interface AgentInvocationIntent {
   readonly intentId: string;
@@ -413,6 +415,20 @@ export interface LegacyAgentExecution {
   readonly supersedesExecutionIds?: readonly string[];
 }
 
+export interface LegacyAgentExecutionAttempt {
+  readonly executionId: string;
+  readonly attemptSeq: number;
+  readonly retryCycle: number;
+  readonly retryOrdinal: 1 | 2 | 3;
+  readonly status: LegacyAgentExecutionStatus;
+  readonly actionCategory: AgentExecutionActionCategory;
+  readonly startedAt?: string;
+  readonly finishedAt?: string;
+  readonly errorCode?: string;
+  readonly nextRetryAt?: string;
+  readonly recoveryCursor: number;
+}
+
 export interface LegacyHumanPreemptionNotice {
   readonly roomId: string;
   readonly sourceHumanMessageId: string;
@@ -420,6 +436,9 @@ export interface LegacyHumanPreemptionNotice {
   readonly rerouteStatus: "queued";
   readonly occurredAt: string;
 }
+
+/** @deprecated v1-v21 audit reader only; production must not emit broad preemption. */
+export type HumanPreemptionNotice = LegacyHumanPreemptionNotice;
 
 export type LegacyAgentInvocationIntentKind = "direct_mention" | "structured_help" | "routed_candidate";
 
@@ -464,7 +483,7 @@ export interface AgentRuntimeProviderInput {
     configVersion: string;
     modelId: string;
   }>;
-  readonly invocation: AgentInvocationIntent;
+  readonly invocation: AgentInvocationIntent | LegacyAgentInvocationIntent;
   readonly trusted: Readonly<{
     system: readonly Readonly<{
       kind: "product_policy" | "safety_policy";
@@ -639,7 +658,13 @@ export interface RouteJudgment {
   readonly decidedAt: string;
 }
 
-export type RouteInvocationIntent = AgentInvocationIntent & Readonly<{
+export interface RouteInvocationIntent extends LegacyAgentInvocationIntent {
+  readonly reasonCode: "direct_mention" | "structured_help" | "domain_match" | "risk_detected" | "ball_due";
+  readonly reasonText: string;
+  readonly priority: 1 | 2 | 3;
+}
+
+export type CanonicalRouteInvocationIntent = AgentInvocationIntent & Readonly<{
   origin: Extract<InvocationOrigin, { readonly kind: "route_decision" }>;
 }>;
 
@@ -1078,11 +1103,12 @@ function isPositiveSafeInteger(value: unknown): value is number {
 }
 
 function isInvocationCancellationReason(value: unknown): value is InvocationCancellationReason {
-  return value === "requested_by_human" || value === "human_rejected" ||
-    value === "superseded" || value === "source_recalled" ||
-    value === "context_invalidated" || value === "room_archived" ||
+  return value === "human_cancelled" || value === "reply_superseded" ||
+    value === "correction_superseded" || value === "intent_superseded" ||
+    value === "message_recalled" || value === "room_archived" ||
     value === "membership_revoked" || value === "assignment_revoked" ||
-    value === "profile_disabled" || value === "capability_revoked";
+    value === "profile_disabled" || value === "capability_revoked" ||
+    value === "source_ineligible" || value === "runtime_shutdown";
 }
 
 function isInvocationOrigin(value: unknown, targetId: string): value is InvocationOrigin {
@@ -1283,7 +1309,7 @@ export function isScopedCancellationReceipt(value: unknown): value is ScopedCanc
       !isNonEmptyString(value.committedAt)) return false;
   if (value.scope.kind === "room" &&
       (value.scope.roomId !== value.roomId || value.reason !== "room_archived")) return false;
-  if (value.scope.kind === "source_message" && value.reason !== "source_recalled") return false;
+  if (value.scope.kind === "source_message" && value.reason !== "message_recalled") return false;
   if (value.scope.kind === "agent_authority") {
     const reasonByAuthority = {
       membership: "membership_revoked",
@@ -1412,6 +1438,9 @@ export function isLegacyHumanPreemptionNotice(value: unknown): value is LegacyHu
     new Set(value.cancelledExecutionIds).size === value.cancelledExecutionIds.length &&
     value.rerouteStatus === "queued" && isNonEmptyString(value.occurredAt);
 }
+
+/** @deprecated v1-v21 audit reader only; production must not emit broad preemption. */
+export const isHumanPreemptionNotice = isLegacyHumanPreemptionNotice;
 
 export function isSocialReaction(value: unknown): value is SocialReaction {
   return isRecord(value) &&

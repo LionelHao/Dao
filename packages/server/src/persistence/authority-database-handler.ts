@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type {
-  AgentExecution,
-  AgentInvocationIntent,
+  LegacyAgentExecution as AgentExecution,
+  LegacyAgentInvocationIntent as AgentInvocationIntent,
   Actor,
   HumanMessageSubmit,
   MessageTargetOutcome,
@@ -41,6 +41,8 @@ import type {
   RuntimeAuthorityOperation,
   RuntimeAuthorityOperationResult,
 } from "../agent-runtime/runtime-authority-protocol.js";
+import type { ScopedCancellationCommitReceipt } from
+  "../scoped-cancellation/scoped-cancellation-orchestrator.js";
 import type {
   RouteAuthorityOperation,
   RouteAuthorityOperationResult,
@@ -5157,6 +5159,100 @@ export function readContextFinalExecution(
   return runtimeExecutionById(database, executionId);
 }
 
+function appendCanonicalRuntimeEvents(
+  database: DatabaseSync,
+  execution: AgentExecution,
+  occurredAt: string,
+  transition: string,
+): void {
+  const row = database.prepare(
+    `SELECT runtime.execution_id AS executionId, runtime.intent_id AS intentId,
+            runtime.lineage_id AS lineageId, runtime.execution_ordinal AS executionOrdinal,
+            runtime.retry_of_execution_id AS retryOfExecutionId,
+            runtime.snapshot_id AS snapshotId, runtime.provider_id AS providerId,
+            runtime.model_id AS modelId, runtime.public_status AS status, runtime.phase,
+            runtime.current_attempt_seq AS currentAttemptSeq,
+            runtime.authority_version AS version, runtime.queued_at AS queuedAt,
+            runtime.started_at AS startedAt, runtime.updated_at AS updatedAt,
+            runtime.completed_at AS completedAt, runtime.terminal_reason AS terminalReason,
+            runtime.terminal_error_code AS terminalErrorCode, runtime.review_state AS reviewState,
+            legacy.dead_lettered_at AS deadLetteredAt,
+            legacy.result_message_id AS resultMessageId
+     FROM agent_execution_runtime_states AS runtime
+     JOIN agent_executions AS legacy ON legacy.id = runtime.execution_id
+     WHERE runtime.execution_id = ? AND runtime.review_state <> 'legacy_review_required'`,
+  ).get(execution.id);
+  if (typeof row?.executionId !== "string" || typeof row.intentId !== "string" ||
+      typeof row.lineageId !== "string" || typeof row.executionOrdinal !== "number" ||
+      typeof row.snapshotId !== "string" || typeof row.providerId !== "string" ||
+      typeof row.modelId !== "string" || typeof row.version !== "number" ||
+      typeof row.queuedAt !== "string" || typeof row.updatedAt !== "string") return;
+  const status = row.status;
+  const terminal = status === "completed" || status === "failed" || status === "cancelled";
+  const canonicalExecution = {
+    executionId: row.executionId, intentId: row.intentId, lineageId: row.lineageId,
+    executionOrdinal: row.executionOrdinal,
+    ...(typeof row.retryOfExecutionId === "string" ? { retryOfExecutionId: row.retryOfExecutionId } : {}),
+    roomId: execution.roomId, agentId: execution.agentId, snapshotId: row.snapshotId,
+    providerId: row.providerId, modelId: row.modelId, status, phase: row.phase,
+    currentAttemptSeq: row.currentAttemptSeq, version: row.version, queuedAt: row.queuedAt,
+    ...(status === "accepted" ? {} : { startedAt: row.startedAt ?? row.updatedAt }),
+    updatedAt: row.updatedAt,
+    ...(terminal ? { completedAt: row.completedAt ?? row.updatedAt } : {}),
+    ...(status === "cancelled" ? { cancellationReason: row.terminalReason } : {}),
+    ...(status === "failed" ? {
+      terminalErrorCode: row.terminalErrorCode,
+      reviewState: row.reviewState === "needs_review" ? "needs_review" : "not_required",
+    } : {}),
+    ...(typeof row.deadLetteredAt === "string" ? { deadLetteredAt: row.deadLetteredAt } : {}),
+    ...(typeof row.resultMessageId === "string" ? { resultMessageId: row.resultMessageId } : {}),
+  };
+  const eventId = stableId("runtime-canonical", execution.id,
+    String(execution.currentAttemptSeq), transition);
+  const streamSeq = appendRoomEvent(database, {
+    eventId, roomId: execution.roomId, actorId: execution.agentId,
+    eventType: "agent.execution.changed", occurredAt,
+    payload: canonicalExecution as unknown as JsonValue,
+  });
+  appendRoomOutbox(database, eventId, execution.roomId, streamSeq, occurredAt,
+    "runtime-canonical", transition);
+
+  const attempt = database.prepare(
+    `SELECT attempt.public_status AS status, attempt.phase,
+            attempt.started_at AS startedAt, attempt.finished_at AS finishedAt,
+            attempt.error_code AS errorCode, attempt.next_retry_at AS nextRetryAt
+     FROM agent_execution_attempt_runtime_states AS attempt
+     WHERE attempt.execution_id = ? AND attempt.attempt_seq = ?`,
+  ).get(execution.id, execution.currentAttemptSeq);
+  if (attempt === undefined) return;
+  const attemptStatus = attempt.status;
+  const attemptTerminal = attemptStatus === "completed" || attemptStatus === "failed" ||
+    attemptStatus === "cancelled";
+  const attemptPayload = {
+    executionId: row.executionId, intentId: row.intentId, lineageId: row.lineageId,
+    roomId: execution.roomId, agentId: execution.agentId,
+    attemptSeq: execution.currentAttemptSeq, snapshotId: row.snapshotId,
+    providerId: row.providerId, modelId: row.modelId,
+    status: attemptStatus, phase: attempt.phase, executionVersion: row.version,
+    ...(attemptStatus === "accepted" ? {} : { startedAt: attempt.startedAt ?? row.updatedAt }),
+    updatedAt: row.updatedAt,
+    ...(attemptTerminal ? { finishedAt: attempt.finishedAt ?? row.updatedAt } : {}),
+    ...(attemptStatus === "failed" && typeof attempt.errorCode === "string"
+      ? { errorCode: attempt.errorCode } : {}),
+    ...(attemptStatus === "failed" && typeof attempt.nextRetryAt === "string"
+      ? { nextRetryAt: attempt.nextRetryAt } : {}),
+  };
+  const attemptEventId = stableId("runtime-canonical-attempt", execution.id,
+    String(execution.currentAttemptSeq), transition);
+  const attemptStreamSeq = appendRoomEvent(database, {
+    eventId: attemptEventId, roomId: execution.roomId, actorId: execution.agentId,
+    eventType: "agent.execution.attempt.changed", occurredAt,
+    payload: attemptPayload as unknown as JsonValue,
+  });
+  appendRoomOutbox(database, attemptEventId, execution.roomId, attemptStreamSeq,
+    occurredAt, "runtime-canonical-attempt", transition);
+}
+
 function appendRuntimeExecutionEvent(
   database: DatabaseSync,
   execution: AgentExecution,
@@ -5164,6 +5260,7 @@ function appendRuntimeExecutionEvent(
   transition: string,
   errorCode?: string,
 ): void {
+  appendCanonicalRuntimeEvents(database, execution, occurredAt, transition);
   const eventId = stableId("runtime", execution.id, String(execution.currentAttemptSeq), transition);
   const streamSeq = appendRoomEvent(database, {
     eventId,
@@ -6477,6 +6574,48 @@ export function executeRuntimeAuthorityOperation(
         "human-preemption", source.id);
       return { kind: "human-fence-cancelled", notice, cancelledExecutions };
     }
+    if (operation.type === "runtime.create-route-for-human-message") {
+      const row = database.prepare(
+        `SELECT message.room_id AS roomId, message.author_id AS humanActorId,
+                revision.body, message.sent_at AS sentAt, route.id AS routeJobId
+         FROM messages AS message
+         JOIN message_envelopes AS envelope
+           ON envelope.message_id = message.id
+          AND envelope.room_id = message.room_id
+          AND envelope.message_kind = 'human'
+          AND envelope.lifecycle = 'active'
+         JOIN message_revisions AS revision
+           ON revision.message_id = envelope.message_id
+          AND revision.revision = envelope.current_revision
+         LEFT JOIN route_jobs AS route ON route.source_message_id = message.id
+         WHERE message.id = ? AND message.author_kind = 'human'`,
+      ).get(operation.sourceHumanMessageId);
+      if (typeof row?.roomId !== "string" || typeof row.humanActorId !== "string" ||
+          typeof row.body !== "string" || typeof row.sentAt !== "string") {
+        return fail("execution_conflict", "Human route source was no longer active");
+      }
+      if (typeof row.routeJobId === "string") {
+        return {
+          kind: "human-message-route", roomId: row.roomId,
+          sourceHumanMessageId: operation.sourceHumanMessageId,
+          routeJobId: row.routeJobId, replayed: true,
+        };
+      }
+      const message: Message = {
+        id: operation.sourceHumanMessageId,
+        roomId: row.roomId,
+        authorId: row.humanActorId,
+        authorKind: "human",
+        body: row.body,
+        sentAt: row.sentAt,
+      };
+      enqueueRouteJobForMessage(database, message, occurredAt);
+      return {
+        kind: "human-message-route", roomId: message.roomId,
+        sourceHumanMessageId: message.id,
+        routeJobId: stableId("route-job", message.id), replayed: false,
+      };
+    }
     if (operation.type === "runtime.create-route-after-human-fence") {
       const fence = database.prepare(
         `SELECT fence.room_id AS roomId, fence.human_actor_id AS humanActorId,
@@ -7265,6 +7404,241 @@ export function executeRuntimeAuthorityOperation(
       return { kind: "execution", execution };
     }
 
+    if (operation.type === "runtime.shutdown") {
+      const current = runtimeExecutionById(database, operation.executionId);
+      if (current.currentAttemptSeq !== operation.attemptSeq) {
+        return fail("execution_conflict", "Runtime shutdown targeted a stale attempt");
+      }
+      if (current.status === "completed" || current.status === "failed" || current.status === "cancelled") {
+        return { kind: "execution", execution: current };
+      }
+      const authority = database.prepare(
+        `SELECT intent_id AS intentId, authority_version AS authorityVersion
+         FROM agent_execution_runtime_states WHERE execution_id = ?`,
+      ).get(current.id);
+      if (typeof authority?.intentId !== "string" || typeof authority.authorityVersion !== "number") {
+        return fail("execution_conflict", "Runtime shutdown authority was unavailable");
+      }
+      const requestId = `runtime-shutdown:${current.id}:${operation.attemptSeq}`;
+      const replay = database.prepare(
+        "SELECT 1 AS present FROM invocation_cancellation_receipts WHERE request_id = ?",
+      ).get(requestId);
+      if (replay?.present === 1) {
+        return { kind: "execution", execution: runtimeExecutionById(database, current.id) };
+      }
+      const fenceId = stableId("runtime-shutdown", current.id, String(operation.attemptSeq));
+      database.prepare(
+        `INSERT INTO invocation_scoped_cancellation_fences (
+           fence_id, room_id, scope_kind, intent_id, execution_id,
+           expected_authority_version, reason, principal_human_actor_id,
+           internal_capability, committed_at
+         ) VALUES (?, ?, 'execution', ?, ?, ?, 'runtime_shutdown', NULL,
+                   'runtime_supervisor', ?)`,
+      ).run(fenceId, current.roomId, authority.intentId, current.id,
+        authority.authorityVersion, occurredAt);
+      database.prepare(
+        `UPDATE tool_confirmations
+         SET confirmation_state = 'rejected', confirmation_reason = 'runtime_shutdown',
+             confirmation_revision = confirmation_revision + 1,
+             confirmation_changed_at = ?, consumed_at = ?
+         WHERE execution_id = ? AND attempt_seq = ?
+           AND confirmation_state = 'pending' AND consumed_at IS NULL`,
+      ).run(occurredAt, occurredAt, current.id, current.currentAttemptSeq);
+      database.prepare(
+        `UPDATE agent_execution_grants
+         SET grant_state = 'revoked', grant_reason = 'runtime_shutdown',
+             grant_revision = grant_revision + 1, grant_changed_at = ?, consumed_at = ?
+         WHERE execution_id = ? AND attempt_seq = ?
+           AND grant_state = 'active' AND consumed_at IS NULL`,
+      ).run(occurredAt, occurredAt, current.id, current.currentAttemptSeq);
+      const attemptUpdated = database.prepare(
+        `UPDATE agent_execution_attempts
+         SET status = 'cancelled', finished_at = ?, error_code = 'runtime_shutdown',
+             next_retry_at = NULL
+         WHERE execution_id = ? AND attempt_seq = ? AND status IN ('queued', 'running')`,
+      ).run(occurredAt, current.id, current.currentAttemptSeq);
+      const executionUpdated = database.prepare(
+        `UPDATE agent_executions
+         SET status = 'cancelled', cancellation_reason = 'runtime_shutdown',
+             completed_at = ?, updated_at = ?, next_retry_at = NULL
+         WHERE id = ? AND current_attempt_seq = ? AND status IN ('queued', 'running')`,
+      ).run(occurredAt, occurredAt, current.id, current.currentAttemptSeq);
+      if (attemptUpdated.changes !== 1 || executionUpdated.changes !== 1) {
+        return fail("execution_conflict", "Runtime shutdown lost its terminal CAS");
+      }
+      database.prepare(
+        `INSERT INTO invocation_scoped_cancellation_targets (
+           fence_id, execution_id, attempt_seq, execution_version_before,
+           execution_version_after
+         ) VALUES (?, ?, ?, ?, ?)`,
+      ).run(fenceId, current.id, current.currentAttemptSeq,
+        authority.authorityVersion, authority.authorityVersion + 1);
+      const cancelled = runtimeExecutionById(database, current.id);
+      const response = { kind: "execution" as const, execution: cancelled };
+      database.prepare(
+        `INSERT INTO invocation_cancellation_receipts (
+           request_id, fence_id, principal_actor_id, request_sha256,
+           status_code, response_json, committed_at
+         ) VALUES (?, ?, NULL, ?, 200, ?, ?)`,
+      ).run(requestId, fenceId,
+        createHash("sha256").update(requestId).digest("hex"),
+        JSON.stringify(response), occurredAt);
+      appendRuntimeExecutionEvent(database, cancelled, occurredAt, "cancelled", "runtime_shutdown");
+      return response;
+    }
+
+    if (operation.type === "runtime.cancel-scoped") {
+      const current = runtimeExecutionById(database, operation.executionId);
+      requireRuntimeHumanAuthority(database, operation.context, current, operation.now);
+      const requestSha256 = createHash("sha256").update(canonicalJson({
+        type: operation.type,
+        executionId: operation.executionId,
+        expectedVersion: operation.expectedVersion,
+      })).digest("hex");
+      const replay = database.prepare(
+        `SELECT request_sha256 AS requestSha256, response_json AS responseJson
+         FROM invocation_cancellation_receipts WHERE request_id = ?`,
+      ).get(operation.context.requestId);
+      if (typeof replay?.responseJson === "string") {
+        if (replay.requestSha256 !== requestSha256) {
+          return fail("execution_conflict", "Cancellation requestId was reused with another payload");
+        }
+        const stored = JSON.parse(replay.responseJson) as ScopedCancellationCommitReceipt;
+        return { ...stored, replayed: true };
+      }
+      const authority = database.prepare(
+        `SELECT runtime.intent_id AS intentId, runtime.authority_version AS authorityVersion,
+                runtime.public_status AS publicStatus, intent.source_message_id AS sourceMessageId,
+                intent.source_revision AS sourceRevision, intent.lineage_id AS lineageId
+         FROM agent_execution_runtime_states AS runtime
+         JOIN agent_invocation_intents AS intent ON intent.id = runtime.intent_id
+         WHERE runtime.execution_id = ?`,
+      ).get(operation.executionId);
+      if (typeof authority?.intentId !== "string" || typeof authority.sourceMessageId !== "string" ||
+          typeof authority.sourceRevision !== "number" || typeof authority.lineageId !== "string" ||
+          typeof authority.authorityVersion !== "number") {
+        return fail("execution_conflict", "Execution has no canonical invocation authority");
+      }
+      if (authority.authorityVersion !== operation.expectedVersion) {
+        return fail("execution_conflict", "Cancellation expectedVersion was stale");
+      }
+      if (authority.publicStatus === "completed" || authority.publicStatus === "failed" ||
+          authority.publicStatus === "cancelled") {
+        return fail("execution_conflict", "Terminal Agent execution cannot be cancelled");
+      }
+      const fenceId = stableId("scoped-cancellation", operation.context.requestId);
+      database.prepare(
+        `INSERT INTO invocation_scoped_cancellation_fences (
+           fence_id, room_id, scope_kind, intent_id, execution_id,
+           expected_authority_version, reason, principal_human_actor_id,
+           internal_capability, committed_at
+         ) VALUES (?, ?, 'execution', ?, ?, ?, 'human_cancelled', ?, NULL, ?)`,
+      ).run(fenceId, current.roomId, authority.intentId, current.id,
+        operation.expectedVersion, operation.context.principal.actorId, occurredAt);
+
+      const confirmation = database.prepare(
+        `SELECT confirmation_id AS confirmationId, confirmation_state AS state
+         FROM tool_confirmations
+         WHERE execution_id = ? AND attempt_seq = ?
+         ORDER BY confirmation_id LIMIT 1`,
+      ).get(current.id, current.currentAttemptSeq);
+      let confirmationDisposition: "none" | "pending_rejected" | "confirmed_retained" = "none";
+      if (confirmation?.state === "pending" && typeof confirmation.confirmationId === "string") {
+        database.prepare(
+          `UPDATE tool_confirmations
+           SET confirmation_state = 'rejected', confirmation_reason = 'human_cancelled',
+               confirmation_revision = confirmation_revision + 1,
+               confirmation_changed_at = ?, consumed_at = ?
+           WHERE confirmation_id = ? AND confirmation_state = 'pending'`,
+        ).run(occurredAt, occurredAt, confirmation.confirmationId);
+        confirmationDisposition = "pending_rejected";
+      } else if (confirmation?.state === "confirmed") {
+        confirmationDisposition = "confirmed_retained";
+      }
+      const grant = database.prepare(
+        `SELECT grant_id AS grantId, grant_state AS state
+         FROM agent_execution_grants
+         WHERE execution_id = ? AND attempt_seq = ?
+         ORDER BY grant_id LIMIT 1`,
+      ).get(current.id, current.currentAttemptSeq);
+      let grantDisposition: "none" | "unclaimed_revoked" | "claimed_retained" = "none";
+      if (grant?.state === "active" && typeof grant.grantId === "string") {
+        database.prepare(
+          `UPDATE agent_execution_grants
+           SET grant_state = 'revoked', grant_reason = 'human_cancelled',
+               grant_revision = grant_revision + 1, grant_changed_at = ?, consumed_at = ?
+           WHERE grant_id = ? AND grant_state = 'active'`,
+        ).run(occurredAt, occurredAt, grant.grantId);
+        grantDisposition = "unclaimed_revoked";
+      } else if (grant?.state === "claimed") {
+        grantDisposition = "claimed_retained";
+      }
+      const dispatch = database.prepare(
+        `SELECT state FROM tool_dispatches
+         WHERE execution_id = ? AND attempt_seq = ?
+         ORDER BY dispatched_at DESC LIMIT 1`,
+      ).get(current.id, current.currentAttemptSeq);
+      const sideEffectState = dispatch?.state === "outcome_unknown"
+        ? "outcome-unknown-retained" as const
+        : typeof dispatch?.state === "string" ? "dispatched-retained" as const : "none" as const;
+
+      const executionUpdated = database.prepare(
+        `UPDATE agent_executions
+         SET status = 'cancelled', cancellation_reason = 'human_cancelled',
+             completed_at = ?, updated_at = ?, next_retry_at = NULL
+         WHERE id = ? AND current_attempt_seq = ? AND status IN ('queued', 'running')`,
+      ).run(occurredAt, occurredAt, current.id, current.currentAttemptSeq);
+      if (executionUpdated.changes !== 1) {
+        return fail("execution_conflict", "Cancellation lost the execution terminal CAS");
+      }
+      const attemptUpdated = database.prepare(
+        `UPDATE agent_execution_attempts
+         SET status = 'cancelled', finished_at = ?, error_code = 'human_cancelled',
+             next_retry_at = NULL
+         WHERE execution_id = ? AND attempt_seq = ? AND status IN ('queued', 'running')`,
+      ).run(occurredAt, current.id, current.currentAttemptSeq);
+      if (attemptUpdated.changes !== 1) {
+        return fail("execution_conflict", "Cancellation lost the attempt terminal CAS");
+      }
+      database.prepare(
+        `INSERT INTO invocation_scoped_cancellation_targets (
+           fence_id, execution_id, attempt_seq, execution_version_before,
+           execution_version_after
+         ) VALUES (?, ?, ?, ?, ?)`,
+      ).run(fenceId, current.id, current.currentAttemptSeq,
+        operation.expectedVersion, operation.expectedVersion + 1);
+      const cancelled = runtimeExecutionById(database, current.id);
+      appendRuntimeExecutionEvent(database, cancelled, occurredAt, "cancelled", "human_cancelled");
+      const receipt = {
+        kind: "scoped-cancellation-committed" as const,
+        fenceId,
+        roomId: current.roomId,
+        producerId: operation.producerId,
+        reason: "human_cancelled" as const,
+        replayed: false,
+        effects: [{
+          sourceMessageId: authority.sourceMessageId,
+          sourceRevision: authority.sourceRevision,
+          invocationIntentId: authority.intentId,
+          executionId: current.id,
+          attemptSeq: current.currentAttemptSeq,
+          disposition: "execution_cancelled" as const,
+          confirmationDisposition,
+          grantDisposition,
+          sideEffectState,
+        }],
+      };
+      const responseJson = JSON.stringify(receipt);
+      database.prepare(
+        `INSERT INTO invocation_cancellation_receipts (
+           request_id, fence_id, principal_actor_id, request_sha256,
+           status_code, response_json, committed_at
+         ) VALUES (?, ?, ?, ?, 200, ?, ?)`,
+      ).run(operation.context.requestId, fenceId, operation.context.principal.actorId,
+        requestSha256, responseJson, occurredAt);
+      return receipt;
+    }
+
     if (operation.type === "runtime.interrupt") {
       const current = runtimeExecutionById(database, operation.executionId);
       requireRuntimeHumanAuthority(database, operation.context, current, operation.now);
@@ -7293,9 +7667,44 @@ export function executeRuntimeAuthorityOperation(
       if (old.status !== "failed" && old.status !== "cancelled") {
         return fail("execution_conflict", "Only terminal Agent executions can be retried");
       }
-      const existing = database.prepare(
+      const retryRequestSha256 = createHash("sha256").update(canonicalJson({
+        type: operation.type,
+        executionId: operation.executionId,
+        ...(operation.expectedVersion === undefined ? {} : {
+          expectedVersion: operation.expectedVersion,
+        }),
+      })).digest("hex");
+      if (operation.expectedVersion !== undefined) {
+        const replay = database.prepare(
+          `SELECT request_sha256 AS requestSha256, response_json AS responseJson
+           FROM invocation_human_retry_receipts WHERE request_id = ?`,
+        ).get(operation.context.requestId);
+        if (typeof replay?.responseJson === "string") {
+          if (replay.requestSha256 !== retryRequestSha256) {
+            return fail("execution_conflict", "Retry requestId was reused with another payload");
+          }
+          const stored = JSON.parse(replay.responseJson) as Extract<
+            RuntimeAuthorityOperationResult,
+            { readonly kind: "invocation" }
+          >;
+          return { ...stored, replayed: true };
+        }
+        const canonical = database.prepare(
+          `SELECT authority_version AS authorityVersion, public_status AS publicStatus,
+                  review_state AS reviewState
+           FROM agent_execution_runtime_states WHERE execution_id = ?`,
+        ).get(old.id);
+        if (canonical?.authorityVersion !== operation.expectedVersion) {
+          return fail("execution_conflict", "Retry expectedVersion was stale");
+        }
+        if ((canonical.publicStatus !== "failed" && canonical.publicStatus !== "cancelled") ||
+            canonical.reviewState !== "none") {
+          return fail("execution_conflict", "Execution is not eligible for Human retry");
+        }
+      }
+      const existing = operation.expectedVersion === undefined ? database.prepare(
         `SELECT id FROM agent_executions WHERE manual_retry_of_execution_id = ? ORDER BY queued_at LIMIT 1`,
-      ).get(old.id);
+      ).get(old.id) : undefined;
       if (typeof existing?.id === "string") {
         requireExecutionRuntimeGenerationAllowed(
           database,
@@ -7340,10 +7749,30 @@ export function executeRuntimeAuthorityOperation(
       const execution = runtimeExecutionById(database, operation.newExecutionId);
       requireRuntimeFrozenHandoff(database, execution.id);
       appendRuntimeExecutionEvent(database, execution, occurredAt, "manual-retry-queued");
-      return {
-        kind: "invocation", execution,
+      const response = {
+        kind: "invocation" as const, execution,
         intent: runtimeInvocationIntentByExecution(database, execution.id), replayed: false,
       };
+      if (operation.expectedVersion !== undefined) {
+        const lineage = database.prepare(
+          `SELECT intent_id AS intentId, execution_ordinal AS executionOrdinal
+           FROM agent_execution_intent_links WHERE execution_id = ?`,
+        ).get(execution.id);
+        if (typeof lineage?.intentId !== "string" ||
+            typeof lineage.executionOrdinal !== "number" || lineage.executionOrdinal < 2) {
+          return fail("storage_unavailable", "Human retry lineage receipt was corrupt");
+        }
+        database.prepare(
+          `INSERT INTO invocation_human_retry_receipts (
+             request_id, source_execution_id, source_expected_version,
+             child_execution_id, intent_id, execution_ordinal, request_sha256,
+             response_json, committed_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(operation.context.requestId, old.id, operation.expectedVersion,
+          execution.id, lineage.intentId, lineage.executionOrdinal,
+          retryRequestSha256, JSON.stringify(response), occurredAt);
+      }
+      return response;
     }
 
     if (operation.type === "runtime.begin-compensation") {

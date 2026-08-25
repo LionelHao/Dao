@@ -1,5 +1,5 @@
 import {
-  isAgentExecution,
+  isLegacyAgentExecution as isAgentExecution,
   isAgentJudgement,
   isCalibrationSignal,
   isHumanReadReceipt,
@@ -10,8 +10,8 @@ import {
 import type {
   Actor,
   AgentActor,
-  AgentExecution,
-  AgentExecutionStatus,
+  LegacyAgentExecution as AgentExecution,
+  LegacyAgentExecutionStatus as AgentExecutionStatus,
   AgentJudgement,
   AgentJudgementOutcome,
   AgentReadiness,
@@ -36,8 +36,8 @@ import type {
 } from "./persistence/contracts.js";
 
 export type {
-  AgentExecution,
-  AgentExecutionStatus,
+  LegacyAgentExecution as AgentExecution,
+  LegacyAgentExecutionStatus as AgentExecutionStatus,
   AgentJudgement,
   AgentJudgementOutcome,
   CalibrationSignal,

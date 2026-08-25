@@ -36,13 +36,8 @@ import { createWorkerCompiledContextBuilder } from "./context-compiler/worker-co
 import { createOpenAIRouterProvider } from "./route-runtime/openai-router-provider.js";
 import { createRouteRuntimeService, type RouteRuntimeService } from "./route-runtime/route-runtime-service.js";
 import { createWorkerRouteAuthority } from "./route-runtime/worker-route-authority.js";
-import { mintInternalAgentCommandContext } from "./persistence/contracts.js";
 import { createEmptyBlueprintBallProjectionPort, type BlueprintBallProjectionPort } from "./ball-runtime/contracts.js";
 import { createBallRuntimeService, type BallRuntimeService } from "./ball-runtime/ball-runtime-service.js";
-import {
-  createHumanPreemptionRuntime,
-  type HumanPreemptionRuntime,
-} from "./human-preemption/human-preemption-runtime.js";
 import { RoomCacheInvalidationPostCommitDispatcher } from "./access/room-cache-invalidation-port.js";
 import { createProductionSharedAuthorityParticipantComposition } from "./room-governance/production-participant-composition.js";
 import {
@@ -265,7 +260,6 @@ async function start(
   let sourceScopedRuntimeBoundary: SourceScopedRuntimeBoundary | undefined;
   let routeRuntime: RouteRuntimeService | undefined;
   let ballRuntime: BallRuntimeService | undefined;
-  let humanPreemptionRuntime: HumanPreemptionRuntime | undefined;
   let stopCacheInvalidationRecovery: (() => void) | undefined;
   let attachmentAuthority: AttachmentAuthorityCommandPort | undefined;
   let attachmentProcessing: AttachmentProcessingRuntime | undefined;
@@ -442,7 +436,19 @@ async function start(
           try {
             const acknowledgement = await authority.executeHuman(context, command);
             if (command.type === "message.send") {
-              await humanPreemptionRuntime?.handle(acknowledgement.aggregateId);
+              const route = await worker!.executeRuntime({
+                type: "runtime.create-route-for-human-message",
+                sourceHumanMessageId: acknowledgement.aggregateId,
+                now: Date.now(),
+              });
+              if (typeof route !== "object" || route === null ||
+                  !("kind" in route) || route.kind !== "human-message-route" ||
+                  !("roomId" in route) || typeof route.roomId !== "string" ||
+                  !("sourceHumanMessageId" in route) ||
+                  typeof route.sourceHumanMessageId !== "string") {
+                throw new Error("Authority human message route result was malformed");
+              }
+              routeRuntime?.notify(route.roomId, route.sourceHumanMessageId);
               memoryRuntime?.enqueue(command.roomId);
             }
             if (command.type === "open-item.create" || command.type === "open-item.transition" ||
@@ -583,29 +589,13 @@ async function start(
       emitPreview(preview) {
         sourceScopedRuntimeBoundary?.publishPreview(preview);
       },
+      resetPreview(preview) {
+        transport?.resetAgentPreview(preview);
+      },
       onMessageCommitted(execution) {
         if (execution.resultMessageId !== undefined) {
           memoryRuntime?.enqueue(execution.roomId);
         }
-      },
-      async proposeOpenItem(input) {
-        const item = await primitives.proposeOpenItem(
-          mintInternalAgentCommandContext({
-            agentId: input.execution.agentId,
-            requestId: `runtime-open-item:${input.execution.id}:${input.callId}`,
-            idempotencyKey: `runtime-open-item:${input.execution.id}:${input.callId}`,
-          }),
-          input.execution.roomId,
-          {
-            proposalKind: input.proposalKind,
-            targetActorId: input.targetActorId,
-            sourceExecutionId: input.execution.id,
-            sourceMessageId: input.sourceMessageId,
-            reason: input.reason,
-            content: input.content,
-          },
-        );
-        return { id: item.id };
       },
     });
     sourceScopedRuntimeBoundary = createSourceScopedRuntimeBoundary({
@@ -647,13 +637,6 @@ async function start(
           secretProvider.getSecret("OPENAI_API_KEY") !== undefined
         ? "ready"
         : "noauth",
-    });
-    humanPreemptionRuntime = createHumanPreemptionRuntime({
-      worker,
-      runtime,
-      notifyRoute(roomId, sourceMessageId) {
-        return routeRuntime!.notify(roomId, sourceMessageId);
-      },
     });
     ballRuntime = createBallRuntimeService({
       worker,
@@ -824,7 +807,6 @@ async function start(
     }
     await runtime.recover();
     await routeRuntime.recover();
-    await humanPreemptionRuntime.recover();
     await ballRuntime.recover();
     const memoryProvider = createOpenAIMemoryStewardProvider({
       endpoint: runtimeConfiguration.endpoint ?? "https://api.openai.com/v1/responses",

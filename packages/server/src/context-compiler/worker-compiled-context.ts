@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import {
   isContextCompilerInputV1,
-  type AgentExecution,
-  type AgentInvocationIntent,
+  type LegacyAgentExecution as AgentExecution,
+  type LegacyAgentInvocationIntent as AgentInvocationIntent,
   type AgentRuntimeProviderInput,
   type ContextCompileResultV1,
   type ContextManifestEntryV1,

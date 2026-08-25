@@ -5705,6 +5705,71 @@ describe("closed FT-02B/FT-02C WebSocket governance", () => {
     },
   );
 
+  it("closes legacy interrupt/retry and routes only versioned vNext controls", async () => {
+    const interrupt = vi.fn();
+    const retry = vi.fn();
+    const cancelInvocation = vi.fn(async () => ({
+      kind: "scoped-cancellation-committed" as const,
+      fenceId: "fence-vnext", roomId, producerId: "cancel-vnext",
+      reason: "human_cancelled" as const, replayed: false, effects: [],
+    }));
+    const retryInvocation = vi.fn(async () => ({
+      execution: { id: "execution-child" }, replayed: false,
+    }));
+    const server = await startMessageWebSocketServer({
+      auth: governanceAuthenticationService(),
+      service: idleMessageService(),
+      agentRuntime: {
+        invoke: vi.fn(), interrupt, retry, cancelInvocation, retryInvocation,
+        confirmTool: vi.fn(), compensate: vi.fn(), close: vi.fn(),
+      } as never,
+    });
+    const client = await LoopbackClient.connect(server.url);
+    try {
+      await client.login(humans[0], "vnext-control-login");
+      client.send({
+        type: "agent.interrupt", requestId: "legacy-interrupt",
+        executionId: "execution-1", reason: "free text",
+      });
+      client.send({ type: "agent.retry", requestId: "legacy-retry", executionId: "execution-1" });
+      await client.waitForError("protocol_upgrade_required", "legacy-interrupt");
+      await client.waitForError("protocol_upgrade_required", "legacy-retry");
+      expect(interrupt).not.toHaveBeenCalled();
+      expect(retry).not.toHaveBeenCalled();
+
+      client.send({
+        type: "invocation.cancel", requestId: "cancel-vnext",
+        executionId: "execution-1", expectedVersion: 7,
+      });
+      await client.waitForFrame(
+        (frame) => hasType(frame, "invocation.cancel.ack") && frame.requestId === "cancel-vnext",
+        "vNext cancellation acknowledgement",
+      );
+      expect(cancelInvocation).toHaveBeenCalledWith(
+        expect.objectContaining({ requestId: "cancel-vnext", kind: "human" }),
+        "execution-1",
+        7,
+      );
+
+      client.send({
+        type: "invocation.retry", requestId: "retry-vnext",
+        executionId: "execution-1", expectedVersion: 8,
+      });
+      await client.waitForFrame(
+        (frame) => hasType(frame, "invocation.retry.ack") && frame.requestId === "retry-vnext",
+        "vNext retry acknowledgement",
+      );
+      expect(retryInvocation).toHaveBeenCalledWith(
+        expect.objectContaining({ requestId: "retry-vnext", kind: "human" }),
+        "execution-1",
+        8,
+      );
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
   it("fails unauthenticated and missing dependency paths closed without calling a legacy mutation", async () => {
     const executeHuman = vi.fn(async () => ({
       aggregateId: roomId,

@@ -24,8 +24,8 @@ import {
   type SnapshotCompleted,
   type SnapshotVersion,
   type WorkspaceBootstrapPage,
-  type AgentExecution,
-  type AgentInvocationIntent,
+  type LegacyAgentExecution as AgentExecution,
+  type LegacyAgentInvocationIntent as AgentInvocationIntent,
   type LightTask,
   type BallInCourt,
   type DepartureConflictList,
@@ -57,6 +57,7 @@ import {
 } from "./persistence/contracts.js";
 import type { MessageErrorCode } from "./service.js";
 import type { MessageStoreErrorCode } from "./store.js";
+import type { ScopedCancellationCommitReceipt } from "./scoped-cancellation/scoped-cancellation-orchestrator.js";
 import {
   isFt07AgentSettingsFrameType,
   parseFt07AgentSettingsClientFrame,
@@ -119,6 +120,9 @@ const MESSAGE_DRAFT_FIELDS = new Set(["id", "roomId", "body", "sentAt"]);
 const AGENT_INVOKE_FIELDS = new Set(["type", "requestId", "intent"]);
 const AGENT_INTENT_FIELDS = new Set(["kind", "roomId", "sourceMessageId", "targetAgentId"]);
 const AGENT_CONTROL_FIELDS = new Set(["type", "requestId", "executionId"]);
+const INVOCATION_CONTROL_FIELDS = new Set([
+  "type", "requestId", "executionId", "expectedVersion",
+]);
 const AGENT_INTERRUPT_FIELDS = new Set(["type", "requestId", "executionId", "reason"]);
 const AGENT_CONFIRM_FIELDS = new Set(["type", "requestId", "confirmation"]);
 const AGENT_CONFIRMATION_FIELDS = new Set(["confirmationId", "executionId"]);
@@ -368,6 +372,20 @@ export interface AgentRetryFrame {
   readonly executionId: string;
 }
 
+export interface InvocationCancelFrame {
+  readonly type: "invocation.cancel";
+  readonly requestId: string;
+  readonly executionId: string;
+  readonly expectedVersion: number;
+}
+
+export interface InvocationRetryFrame {
+  readonly type: "invocation.retry";
+  readonly requestId: string;
+  readonly executionId: string;
+  readonly expectedVersion: number;
+}
+
 export interface AgentToolConfirmFrame {
   readonly type: "agent.tool.confirm";
   readonly requestId: string;
@@ -459,6 +477,8 @@ export type ClientFrame =
   | AgentInvokeFrame
   | AgentInterruptFrame
   | AgentRetryFrame
+  | InvocationCancelFrame
+  | InvocationRetryFrame
   | AgentToolConfirmFrame
   | AgentCompensateFrame
   | OpenItemCreateFrame
@@ -648,6 +668,28 @@ export interface AgentExecutionPreviewFrame {
   readonly streamSeq: number;
   readonly delta: string;
   readonly authoritative: false;
+}
+
+export interface AgentExecutionPreviewResetFrame {
+  readonly type: "agent.execution.preview.reset";
+  readonly roomId: string;
+  readonly executionId: string;
+  readonly attemptSeq: number;
+  readonly reason: "human_cancelled" | "message_recalled" | "runtime_shutdown" | "repair" | "reconnect";
+  readonly authoritative: false;
+}
+
+export interface InvocationCancelAckFrame {
+  readonly type: "invocation.cancel.ack";
+  readonly requestId: string;
+  readonly receipt: ScopedCancellationCommitReceipt;
+}
+
+export interface InvocationRetryAckFrame {
+  readonly type: "invocation.retry.ack";
+  readonly requestId: string;
+  readonly execution: AgentExecution;
+  readonly replayed: boolean;
 }
 
 export interface OpenItemAckFrame {
@@ -880,6 +922,9 @@ export type ServerFrame =
   | RoomSubscribeV2RetryFrame
   | AgentExecutionAckFrame
   | AgentExecutionPreviewFrame
+  | AgentExecutionPreviewResetFrame
+  | InvocationCancelAckFrame
+  | InvocationRetryAckFrame
   | OpenItemAckFrame
   | LightTaskAckFrame
   | BallQueryResultFrame
@@ -1643,6 +1688,28 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
         return { ok: false, error: protocolError("agent.retry requires executionId", requestId) };
       }
       return { ok: true, frame: { type: "agent.retry", requestId, executionId: value.executionId } };
+    case "invocation.cancel":
+    case "invocation.retry":
+      if (!hasOnlyFields(value, INVOCATION_CONTROL_FIELDS) || requestId === undefined ||
+          !isBoundedString(value.executionId, PROTOCOL_FIELD_LIMITS.messageId) ||
+          !isPositiveSafeInteger(value.expectedVersion)) {
+        return {
+          ok: false,
+          error: protocolError(
+            `${value.type} requires executionId and positive expectedVersion`,
+            requestId,
+          ),
+        };
+      }
+      return {
+        ok: true,
+        frame: {
+          type: value.type,
+          requestId,
+          executionId: value.executionId,
+          expectedVersion: value.expectedVersion,
+        },
+      };
     case "agent.compensate":
       if (!hasOnlyFields(value, AGENT_CONTROL_FIELDS) || requestId === undefined ||
           !isBoundedString(value.executionId, PROTOCOL_FIELD_LIMITS.messageId)) {

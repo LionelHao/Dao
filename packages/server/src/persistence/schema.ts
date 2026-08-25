@@ -73,7 +73,7 @@ const SCHEMA_FINGERPRINTS = {
   19: "e458dedc7c0d85c04bca92dc2f6289b02367fb97fc7edbe1c7dba011470812b7",
   20: "1ca2a806a52cd2ce9632b02e215a25ba13bc3ebc4336f5152c48f21d60faa2a0",
   21: "dca0a24a346060b1e04b98ee5a73e016421796d6c13bd0bd2841179f405c44af",
-  22: "3683dad1ce312ff84e949085adeba5b934910768aab6499974b354d478f7cf03",
+  22: "5bbda2fdb36b57aff8147c9b09ad461681c65024b7a3a92d7905a51341d349d5",
 } as const;
 
 const V1_STATEMENTS = [
@@ -7106,7 +7106,10 @@ const V22_STATEMENTS = [
       OR NEW.lineage_id IS NOT OLD.lineage_id
       OR NEW.execution_ordinal IS NOT OLD.execution_ordinal
       OR NEW.retry_of_execution_id IS NOT OLD.retry_of_execution_id
-      OR NEW.snapshot_id IS NOT OLD.snapshot_id
+      OR (NEW.snapshot_id IS NOT OLD.snapshot_id AND NOT (
+        OLD.snapshot_id IS NULL AND NEW.snapshot_id IS NOT NULL
+        AND OLD.review_state = 'legacy_review_required' AND NEW.review_state = 'none'
+      ))
       OR NEW.provider_id IS NOT OLD.provider_id
       OR NEW.model_id IS NOT OLD.model_id
       OR NEW.execution_generation <> OLD.execution_generation
@@ -7187,12 +7190,257 @@ const V22_STATEMENTS = [
   `CREATE TRIGGER legacy_room_wide_preemption_markers_v22_immutable_delete
    BEFORE DELETE ON legacy_room_wide_preemption_markers
    BEGIN SELECT RAISE(ABORT, 'Legacy broad-preemption marker is immutable'); END`,
+  `CREATE TRIGGER agent_execution_context_bindings_v22_create_runtime_state
+   AFTER INSERT ON agent_execution_context_bindings
+   WHEN NOT EXISTS (
+     SELECT 1 FROM agent_execution_runtime_states WHERE execution_id = NEW.execution_id
+   )
+   BEGIN
+     INSERT INTO agent_execution_runtime_states (
+       execution_id, intent_id, lineage_id, execution_ordinal, retry_of_execution_id,
+       snapshot_id, provider_id, model_id, public_status, phase,
+       current_attempt_seq, authority_version, execution_generation, queued_at,
+       started_at, updated_at, completed_at, terminal_reason, terminal_error_code,
+       review_state
+     )
+     SELECT execution.id, link.intent_id, intent.lineage_id, link.execution_ordinal,
+            link.retry_of_execution_id, NEW.snapshot_id, execution.provider_id,
+            execution.model_id,
+            CASE execution.status WHEN 'queued' THEN 'accepted' ELSE execution.status END,
+            CASE execution.status
+              WHEN 'queued' THEN 'queued'
+              WHEN 'running' THEN 'snapshot_frozen'
+              WHEN 'completed' THEN 'completed'
+              WHEN 'failed' THEN 'failed'
+              ELSE 'cancelled'
+            END,
+            execution.current_attempt_seq, 1, execution.execution_generation,
+            COALESCE(execution.queued_at, execution.started_at, CURRENT_TIMESTAMP),
+            CASE WHEN execution.status = 'running' THEN execution.started_at ELSE NULL END,
+            COALESCE(execution.updated_at, execution.started_at, CURRENT_TIMESTAMP),
+            CASE WHEN execution.status IN ('completed', 'failed', 'cancelled')
+                 THEN COALESCE(execution.completed_at, execution.updated_at, CURRENT_TIMESTAMP)
+                 ELSE NULL END,
+            CASE WHEN execution.status = 'cancelled' THEN
+              CASE WHEN execution.cancellation_reason IN (${V22_CANCELLATION_REASON_SQL})
+                   THEN execution.cancellation_reason ELSE 'source_ineligible' END
+              ELSE NULL END,
+            CASE WHEN execution.status = 'failed'
+                 THEN COALESCE(execution.terminal_error_code, 'legacy_failure') ELSE NULL END,
+            'none'
+     FROM agent_executions AS execution
+     JOIN agent_execution_intent_links AS link ON link.execution_id = execution.id
+     JOIN agent_invocation_intents AS intent ON intent.id = link.intent_id
+     WHERE execution.id = NEW.execution_id;
+
+     INSERT INTO agent_execution_attempt_runtime_states (
+       execution_id, attempt_seq, public_status, phase, attempt_version, reuse_kind,
+       started_at, finished_at, error_code, next_retry_at
+     )
+     SELECT attempt.execution_id, attempt.attempt_seq,
+            CASE attempt.status WHEN 'queued' THEN 'accepted' ELSE attempt.status END,
+            CASE attempt.status
+              WHEN 'queued' THEN 'queued'
+              WHEN 'running' THEN 'snapshot_frozen'
+              WHEN 'completed' THEN 'completed'
+              WHEN 'failed' THEN 'failed'
+              ELSE 'cancelled'
+            END,
+            1, COALESCE(context.reuse_kind, 'first'), attempt.started_at,
+            CASE WHEN attempt.status IN ('completed', 'failed', 'cancelled')
+                 THEN COALESCE(attempt.finished_at, CURRENT_TIMESTAMP) ELSE NULL END,
+            attempt.error_code, attempt.next_retry_at
+     FROM agent_execution_attempts AS attempt
+     LEFT JOIN agent_execution_context_attempts AS context
+       ON context.execution_id = attempt.execution_id
+      AND context.attempt_seq = attempt.attempt_seq
+     WHERE attempt.execution_id = NEW.execution_id;
+   END`,
+  `CREATE TRIGGER agent_execution_attempts_v22_create_runtime_state
+   AFTER INSERT ON agent_execution_attempts
+   WHEN EXISTS (
+     SELECT 1 FROM agent_execution_runtime_states WHERE execution_id = NEW.execution_id
+   ) AND NOT EXISTS (
+     SELECT 1 FROM agent_execution_attempt_runtime_states
+     WHERE execution_id = NEW.execution_id AND attempt_seq = NEW.attempt_seq
+   )
+   BEGIN
+     INSERT INTO agent_execution_attempt_runtime_states (
+       execution_id, attempt_seq, public_status, phase, attempt_version, reuse_kind,
+       started_at, finished_at, error_code, next_retry_at
+     ) VALUES (
+       NEW.execution_id, NEW.attempt_seq,
+       CASE NEW.status WHEN 'queued' THEN 'accepted' ELSE NEW.status END,
+       CASE NEW.status
+         WHEN 'queued' THEN 'queued' WHEN 'running' THEN 'claiming'
+         WHEN 'completed' THEN 'completed' WHEN 'failed' THEN 'failed' ELSE 'cancelled'
+       END,
+       1, CASE WHEN NEW.attempt_seq = 1 THEN 'first' ELSE 'automatic_retry' END,
+       NEW.started_at,
+       CASE WHEN NEW.status IN ('completed', 'failed', 'cancelled')
+            THEN COALESCE(NEW.finished_at, CURRENT_TIMESTAMP) ELSE NULL END,
+       NEW.error_code, NEW.next_retry_at
+     );
+   END`,
+  `CREATE TRIGGER agent_executions_v22_sync_runtime_state
+   AFTER UPDATE ON agent_executions
+   WHEN EXISTS (
+     SELECT 1 FROM agent_execution_runtime_states WHERE execution_id = NEW.id
+   )
+   BEGIN
+     UPDATE agent_execution_runtime_states
+     SET public_status = CASE NEW.status WHEN 'queued' THEN 'accepted' ELSE NEW.status END,
+         phase = CASE NEW.status
+           WHEN 'queued' THEN CASE WHEN NEW.next_retry_at IS NULL
+             THEN 'queued' ELSE 'retry_scheduled' END
+           WHEN 'running' THEN CASE
+             WHEN EXISTS (
+               SELECT 1 FROM tool_confirmations
+               WHERE execution_id = NEW.id AND attempt_seq = NEW.current_attempt_seq
+                 AND confirmation_state = 'pending'
+             ) THEN 'waiting_confirmation'
+             WHEN NEW.action_category = 'model_generation' THEN 'model_generation'
+             WHEN NEW.action_category = 'tool_call' AND NEW.tool_dispatch_phase = 'dispatched'
+               THEN 'side_effect_claimed'
+             WHEN NEW.action_category = 'tool_call' THEN 'read_tool'
+             ELSE 'claiming' END
+           WHEN 'completed' THEN 'completed'
+           WHEN 'failed' THEN 'failed'
+           ELSE 'cancelled' END,
+         current_attempt_seq = NEW.current_attempt_seq,
+         authority_version = authority_version + 1,
+         started_at = CASE WHEN NEW.status = 'queued' THEN NULL ELSE NEW.started_at END,
+         updated_at = COALESCE(NEW.updated_at, CURRENT_TIMESTAMP),
+         completed_at = CASE WHEN NEW.status IN ('completed', 'failed', 'cancelled')
+           THEN COALESCE(NEW.completed_at, NEW.updated_at, CURRENT_TIMESTAMP) ELSE NULL END,
+         terminal_reason = CASE WHEN NEW.status = 'cancelled' THEN
+           CASE WHEN NEW.cancellation_reason IN (${V22_CANCELLATION_REASON_SQL})
+                THEN NEW.cancellation_reason ELSE 'source_ineligible' END ELSE NULL END,
+         terminal_error_code = CASE WHEN NEW.status = 'failed'
+           THEN COALESCE(NEW.terminal_error_code, 'runtime_failure') ELSE NULL END,
+         review_state = CASE WHEN snapshot_id IS NULL THEN 'legacy_review_required' WHEN EXISTS (
+           SELECT 1 FROM tool_dispatches
+           WHERE execution_id = NEW.id AND state = 'outcome_unknown'
+         ) THEN 'needs_review' WHEN NEW.dead_lettered_at IS NOT NULL
+           THEN 'dead_letter' ELSE review_state END
+     WHERE execution_id = NEW.id;
+   END`,
+  `CREATE TRIGGER agent_execution_attempts_v22_sync_runtime_state
+   AFTER UPDATE ON agent_execution_attempts
+   WHEN EXISTS (
+     SELECT 1 FROM agent_execution_attempt_runtime_states
+     WHERE execution_id = NEW.execution_id AND attempt_seq = NEW.attempt_seq
+   )
+   BEGIN
+     UPDATE agent_execution_attempt_runtime_states
+     SET public_status = CASE NEW.status WHEN 'queued' THEN 'accepted' ELSE NEW.status END,
+         phase = CASE NEW.status
+           WHEN 'queued' THEN CASE WHEN NEW.next_retry_at IS NULL
+             THEN 'queued' ELSE 'retry_scheduled' END
+           WHEN 'running' THEN 'model_generation'
+           WHEN 'completed' THEN 'completed'
+           WHEN 'failed' THEN 'failed'
+           ELSE 'cancelled' END,
+         attempt_version = attempt_version + 1,
+         started_at = NEW.started_at,
+         finished_at = CASE WHEN NEW.status IN ('completed', 'failed', 'cancelled')
+           THEN COALESCE(NEW.finished_at, CURRENT_TIMESTAMP) ELSE NULL END,
+         error_code = NEW.error_code,
+         next_retry_at = NEW.next_retry_at
+     WHERE execution_id = NEW.execution_id AND attempt_seq = NEW.attempt_seq;
+   END`,
+  `CREATE TABLE invocation_human_retry_receipts (
+    request_id TEXT PRIMARY KEY,
+    source_execution_id TEXT NOT NULL REFERENCES agent_execution_runtime_states(execution_id),
+    source_expected_version INTEGER NOT NULL CHECK (source_expected_version >= 1),
+    child_execution_id TEXT NOT NULL UNIQUE REFERENCES agent_executions(id),
+    intent_id TEXT NOT NULL REFERENCES agent_invocation_intents(id),
+    execution_ordinal INTEGER NOT NULL CHECK (execution_ordinal >= 2),
+    request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+    response_json TEXT NOT NULL CHECK (json_valid(response_json)),
+    committed_at TEXT NOT NULL,
+    UNIQUE (intent_id, execution_ordinal)
+  ) STRICT`,
+  `CREATE INDEX invocation_human_retry_receipts_source_v22
+   ON invocation_human_retry_receipts(source_execution_id, committed_at, request_id)`,
+  `CREATE TRIGGER invocation_human_retry_receipts_v22_immutable_update
+   BEFORE UPDATE ON invocation_human_retry_receipts
+   BEGIN SELECT RAISE(ABORT, 'Human retry receipt is immutable'); END`,
+  `CREATE TRIGGER invocation_human_retry_receipts_v22_immutable_delete
+   BEFORE DELETE ON invocation_human_retry_receipts
+   BEGIN SELECT RAISE(ABORT, 'Human retry receipt is immutable'); END`,
+  `CREATE TRIGGER agent_execution_intent_links_v22_create_runtime_state
+   AFTER INSERT ON agent_execution_intent_links
+   WHEN NOT EXISTS (
+     SELECT 1 FROM agent_execution_runtime_states WHERE execution_id = NEW.execution_id
+   )
+   BEGIN
+     INSERT INTO agent_execution_runtime_states (
+       execution_id, intent_id, lineage_id, execution_ordinal, retry_of_execution_id,
+       snapshot_id, provider_id, model_id, public_status, phase,
+       current_attempt_seq, authority_version, execution_generation, queued_at,
+       started_at, updated_at, completed_at, terminal_reason, terminal_error_code,
+       review_state
+     )
+     SELECT execution.id, NEW.intent_id, intent.lineage_id, NEW.execution_ordinal,
+            NEW.retry_of_execution_id, NULL, execution.provider_id, execution.model_id,
+            CASE execution.status WHEN 'queued' THEN 'accepted' ELSE execution.status END,
+            CASE execution.status
+              WHEN 'queued' THEN 'queued' WHEN 'running' THEN 'claiming'
+              WHEN 'completed' THEN 'completed' WHEN 'failed' THEN 'failed' ELSE 'cancelled' END,
+            execution.current_attempt_seq, 1, execution.execution_generation,
+            COALESCE(execution.queued_at, execution.started_at, CURRENT_TIMESTAMP),
+            CASE WHEN execution.status = 'running' THEN execution.started_at ELSE NULL END,
+            COALESCE(execution.updated_at, execution.started_at, CURRENT_TIMESTAMP),
+            CASE WHEN execution.status IN ('completed', 'failed', 'cancelled')
+                 THEN COALESCE(execution.completed_at, execution.updated_at, CURRENT_TIMESTAMP)
+                 ELSE NULL END,
+            CASE WHEN execution.status = 'cancelled' THEN
+              CASE WHEN execution.cancellation_reason IN (${V22_CANCELLATION_REASON_SQL})
+                   THEN execution.cancellation_reason ELSE 'source_ineligible' END
+              ELSE NULL END,
+            CASE WHEN execution.status = 'failed'
+                 THEN COALESCE(execution.terminal_error_code, 'legacy_failure') ELSE NULL END,
+            'legacy_review_required'
+     FROM agent_executions AS execution
+     JOIN agent_invocation_intents AS intent ON intent.id = NEW.intent_id
+     WHERE execution.id = NEW.execution_id;
+
+     INSERT INTO agent_execution_attempt_runtime_states (
+       execution_id, attempt_seq, public_status, phase, attempt_version, reuse_kind,
+       started_at, finished_at, error_code, next_retry_at
+     )
+     SELECT attempt.execution_id, attempt.attempt_seq,
+            CASE attempt.status WHEN 'queued' THEN 'accepted' ELSE attempt.status END,
+            CASE attempt.status
+              WHEN 'queued' THEN 'queued' WHEN 'running' THEN 'claiming'
+              WHEN 'completed' THEN 'completed' WHEN 'failed' THEN 'failed' ELSE 'cancelled' END,
+            1, CASE WHEN attempt.attempt_seq = 1 THEN 'first' ELSE 'automatic_retry' END,
+            attempt.started_at,
+            CASE WHEN attempt.status IN ('completed', 'failed', 'cancelled')
+                 THEN COALESCE(attempt.finished_at, CURRENT_TIMESTAMP) ELSE NULL END,
+            attempt.error_code, attempt.next_retry_at
+     FROM agent_execution_attempts AS attempt WHERE attempt.execution_id = NEW.execution_id;
+   END`,
+  `CREATE TRIGGER agent_execution_context_bindings_v22_enrich_runtime_state
+   AFTER INSERT ON agent_execution_context_bindings
+   WHEN EXISTS (
+     SELECT 1 FROM agent_execution_runtime_states
+     WHERE execution_id = NEW.execution_id AND snapshot_id IS NULL
+       AND review_state = 'legacy_review_required'
+   )
+   BEGIN
+     UPDATE agent_execution_runtime_states
+     SET snapshot_id = NEW.snapshot_id, authority_version = authority_version + 1,
+         review_state = 'none', updated_at = NEW.bound_at
+     WHERE execution_id = NEW.execution_id;
+   END`,
 ] as const;
 
 export const AUTHORITY_V22_STATEMENT_COUNT_FOR_TEST = V22_STATEMENTS.length;
 export const AUTHORITY_V22_TRIGGER_INVARIANT_STATEMENT_COUNT_FOR_TEST =
   V22_STATEMENTS.filter((statement) => statement.startsWith("CREATE TRIGGER ")).length;
-export const AUTHORITY_V22_STARTUP_INVARIANT_STATEMENT_COUNT_FOR_TEST = 5;
+export const AUTHORITY_V22_STARTUP_INVARIANT_STATEMENT_COUNT_FOR_TEST = 6;
 export const AUTHORITY_V22_INVARIANT_STATEMENT_COUNT_FOR_TEST =
   AUTHORITY_V22_TRIGGER_INVARIANT_STATEMENT_COUNT_FOR_TEST
   + AUTHORITY_V22_STARTUP_INVARIANT_STATEMENT_COUNT_FOR_TEST;
@@ -8441,6 +8689,11 @@ const V22_SCHEMA_CONTRACT = {
   invocation_cancellation_receipts: [
     "request_id", "fence_id", "principal_actor_id", "request_sha256",
     "status_code", "response_json", "committed_at",
+  ],
+  invocation_human_retry_receipts: [
+    "request_id", "source_execution_id", "source_expected_version",
+    "child_execution_id", "intent_id", "execution_ordinal", "request_sha256",
+    "response_json", "committed_at",
   ],
   invocation_recovery_queue: [
     "recovery_key", "execution_id", "execution_version", "state", "available_at",
@@ -10229,6 +10482,18 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
        WHERE (status = 'consumed') <> (invocation_intent_id IS NOT NULL)
        LIMIT 1`,
       "project boundary dependency receipts must fail closed without a durable intent",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM invocation_human_retry_receipts AS receipt
+       LEFT JOIN agent_execution_intent_links AS link
+         ON link.execution_id = receipt.child_execution_id
+       WHERE link.intent_id IS NULL OR link.intent_id <> receipt.intent_id
+          OR link.execution_ordinal <> receipt.execution_ordinal
+          OR link.retry_of_execution_id <> receipt.source_execution_id
+       LIMIT 1`,
+      "Human retry receipts must retain exact request-scoped child lineage",
     );
     requireNoRows(
       database,

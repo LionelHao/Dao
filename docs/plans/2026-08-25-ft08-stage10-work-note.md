@@ -1,7 +1,7 @@
 # FT-08 Stage 10 工作笔记
 
 > 日期：2026-08-25（Asia/Shanghai）  
-> 状态：实施中；仅记录可复核事实
+> 状态：实现与本地验证完成，待独立审查/PR/CI；仅记录可复核事实
 
 ## 起始基线
 
@@ -42,3 +42,23 @@
 
 - `corepack pnpm install --frozen-lockfile`：lockfile无变化，212 packages全部本地复用，pnpm 10.14.0。
 - Stage 9独占基线复跑：197 passed / 3 skipped / 0 failed test files（200）；2170 passed / 3 skipped / 0 failed tests（2173），266.94s。计数与Stage 9交付证据完全一致；三个skip仍是opt-in Agent/Router/Memory OpenAI live suites。
+- v22实现后最终本地全量：203 passed / 0 failed test files；2199 passed / 3 skipped / 0 failed tests。分包为Core 9 files / 99 passed，Desktop 61 files / 480 passed，Server 133 files / 1620 passed / 3 skipped。JSON证据由Vitest最终报告生成；三个skip仍为显式opt-in live suites，本机无`OPENAI_API_KEY`，未伪造live通过。
+- `pnpm typecheck`、`pnpm lint`、`pnpm build`、Core boundary、Desktop renderer boundary全部通过。
+- Desktop Electron smoke通过：app bridge、native selection、secure preview均加载。
+
+## 实现收口事实
+
+- Core公开模型已冻结为`accepted/running/completed/failed/cancelled`五态，`queued/retrying/waiting_confirmation/finalizing`仅作为phase/action；canonical intent/execution/attempt、lineage、Human retry receipt、scoped cancellation receipt与project boundary result均有closed guard/type-test。
+- schema v22以reader-first方式追加runtime state/attempt state、scoped fence/target/receipt、recovery cursor、Human retry receipt、project boundary receipt与legacy marker；fresh、v1…v21 upgrade、rollback、tamper、future-version拒绝、WAL reopen和startup invariants已纳入测试。
+- scheduler现为Room+Agent lane：同turn不同Agent可并发、单Agent保持有序；global active=8、Room durable admission=32；自动retry固定1s/4s且最多3 attempts，timeout/shutdown均先持久化再abort；recovery用稳定keyset和poison isolation证明257/513/1025尾部收敛。
+- public `invocation.cancel`/`invocation.retry`均要求`expectedVersion`并由Authority transaction线性化；取消只影响指定execution lineage，原子reject pending confirmation、revoke unclaimed grant、保留claimed dispatch证据，receipt replay返回同一事实，commit后才清理本地队列/preview并abort。
+- production不再装配legacy room-wide HumanPreemptionRuntime，也不再从任意Human message触发room-wide cancel/replacement。FT-07路由从该旧路径拆为独立的`runtime.create-route-for-human-message`原子入队，保留消息路由且不产生broad cancellation。
+- Provider `open-item.propose`旧工具和production回调已退出；project boundary producer保持server-private、exactly-once receipt、FT-09 dependency unavailable时fail-closed且Provider零调用。
+- sync/repair已注册canonical intent/execution/attempt/retry/cancel/project records，并把历史execution显式隔离为`legacy-agent-execution`；真实进程cache closed registry同步覆盖所有kind，fixed-watermark checksum恢复通过。
+- Desktop execution card只呈现权威五态和phase，取消/重试只提交命令；preview sentinel/reset不进入SQLite、event/outbox/snapshot/cache或最终消息。
+
+## 设计与权威状态映射
+
+- Requirement与J-03/J-05/J-07映射沿用本阶段rebaseline第6节；本次实现未偏离批准设计，偏离：**无**。
+- local transient：preview、focus、command submitting；server ACK：intent/cancel/retry commit；stable event：execution/attempt terminal与confirmation/grant/dispatch；projection/repair：availability、source revision/recall、canonical runtime与receipt。
+- loading/empty/401/403/409/410/429/503/offline/repair/retry以及keyboard/focus/non-color/aria-live/200% zoom/reduced-motion继续由正式设计和既有Desktop合同覆盖；本阶段触及的execution card与control path测试均按该映射验证。

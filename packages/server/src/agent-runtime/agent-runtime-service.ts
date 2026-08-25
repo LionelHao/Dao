@@ -1,12 +1,12 @@
 import { createHash } from "node:crypto";
 import type {
-  AgentExecution,
-  AgentInvocationIntent,
+  LegacyAgentExecution as AgentExecution,
+  LegacyAgentInvocationIntent as AgentInvocationIntent,
   AgentRuntimeProviderInput,
   ToolConfirmationInput,
   ToolDescriptor,
 } from "@native-im/core";
-import { isAgentExecution } from "@native-im/core";
+import { isLegacyAgentExecution as isAgentExecution } from "@native-im/core";
 import type { AuthenticatedCommandContext, InternalAgentCommandContext } from "../persistence/contracts.js";
 import { canonicalJsonV1, compareUtf8 } from "../context-compiler/canonical-json.js";
 import {
@@ -57,6 +57,12 @@ export interface AgentRuntimeServiceOptions {
     readonly attemptSeq: number;
     readonly streamSeq: number;
     readonly delta: string;
+  }) => void;
+  readonly resetPreview?: (preview: {
+    readonly roomId: string;
+    readonly executionId: string;
+    readonly attemptSeq: number;
+    readonly reason: "human_cancelled";
   }) => void;
   readonly onMessageCommitted?: (execution: AgentExecution) => void;
   readonly proposeOpenItem?: (input: {
@@ -823,12 +829,66 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
       signalIdle();
       return cancelled;
     },
+    async cancelInvocation(context, executionId, expectedVersion) {
+      if (closed) throw new AgentRuntimeError("agent_runtime_closed", "Agent runtime is closed");
+      const receipt = await options.authority.cancelScoped(
+        context,
+        executionId,
+        expectedVersion,
+        context.requestId,
+      );
+      for (const effect of receipt.effects) {
+        if (effect.disposition !== "execution_cancelled" ||
+            effect.executionId === undefined || effect.attemptSeq === undefined) continue;
+        removeQueuedJob(effect.executionId);
+        controllers.get(effect.executionId)?.abort("human_cancelled");
+        for (const [confirmationId, pending] of pendingConfirmations) {
+          if (pending.job.execution.id === effect.executionId) {
+            pendingConfirmations.delete(confirmationId);
+          }
+        }
+        const job = jobsByExecution.get(effect.executionId);
+        if (job !== undefined && !controllers.has(effect.executionId)) releaseAdmission(job);
+        jobsByExecution.delete(effect.executionId);
+        try {
+          options.resetPreview?.({
+            roomId: receipt.roomId,
+            executionId: effect.executionId,
+            attemptSeq: effect.attemptSeq,
+            reason: "human_cancelled",
+          });
+        } catch {
+          // The durable cancellation is authoritative; transient reset recovers on reconnect/repair.
+        }
+      }
+      signalIdle();
+      return receipt;
+    },
     async retry(context, executionId) {
       if (closed) throw new AgentRuntimeError("agent_runtime_closed", "Agent runtime is closed");
       if (options.readiness?.() === "noauth") {
         throw new AgentRuntimeError("agent_configuration_missing", "Agent model authentication is not configured");
       }
       const accepted = await options.authority.retry(context, executionId);
+      const prior = jobsByExecution.get(executionId);
+      if (accepted.replayed && prior !== undefined) return accepted;
+      const job: RuntimeJob = {
+        execution: accepted.execution,
+        intent: prior?.intent ?? accepted.intent,
+        context,
+        toolContinuations: [],
+        sideEffectDispatched: false,
+      };
+      enqueue(job);
+      pump();
+      return accepted;
+    },
+    async retryInvocation(context, executionId, expectedVersion) {
+      if (closed) throw new AgentRuntimeError("agent_runtime_closed", "Agent runtime is closed");
+      if (options.readiness?.() === "noauth") {
+        throw new AgentRuntimeError("agent_configuration_missing", "Agent model authentication is not configured");
+      }
+      const accepted = await options.authority.retry(context, executionId, expectedVersion);
       const prior = jobsByExecution.get(executionId);
       if (accepted.replayed && prior !== undefined) return accepted;
       const job: RuntimeJob = {
@@ -1075,7 +1135,19 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
     close() {
       closePromise ??= (async () => {
         closed = true;
-        for (const controller of controllers.values()) controller.abort("runtime_close");
+        const convergence = Promise.allSettled([...controllers.keys()].map(async (executionId) => {
+          const job = jobsByExecution.get(executionId);
+          if (job === undefined) return;
+          job.execution = await options.authority.shutdown(
+            executionId,
+            job.execution.currentAttemptSeq,
+          );
+        }));
+        await Promise.race([
+          convergence,
+          new Promise<void>((resolve) => setTimeout(resolve, shutdownTimeoutMs)),
+        ]);
+        for (const controller of controllers.values()) controller.abort("runtime_shutdown");
         for (const queue of queues.values()) {
           for (const job of queue) {
             releaseAdmission(job);

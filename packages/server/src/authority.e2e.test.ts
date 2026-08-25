@@ -993,11 +993,26 @@ function recordKey(record: RoomRepairRecord): string {
     case "open-item": return `open-item\0${record.value.id}`;
     case "open-item-agent-failure": return `open-item-agent-failure\0${record.value.id}`;
     case "light-task": return `light-task\0${record.value.id}`;
-    case "agent-execution": return `agent-execution\0${record.value.id}`;
+    case "agent-invocation-intent": return `agent-invocation-intent\0${record.value.intentId}`;
+    case "agent-execution": return `agent-execution\0${record.value.executionId}`;
+    case "agent-execution-attempt": {
+      return `agent-execution-attempt\0${record.value.executionId}\0${record.value.attemptSeq}`;
+    }
+    case "agent-execution-retry": return `agent-execution-retry\0${record.value.requestId}`;
+    case "agent-scoped-cancellation": {
+      return `agent-scoped-cancellation\0${record.value.requestId}`;
+    }
+    case "project-boundary-invocation": {
+      return `project-boundary-invocation\0${record.value.boundaryId}`;
+    }
+    case "legacy-agent-execution": return `legacy-agent-execution\0${record.value.id}`;
     case "route-job": return `route-job\0${record.value.id}`;
     case "route-judgment": return `route-judgment\0${record.value.id}`;
     case "calibration": return `calibration\0${record.value.id}`;
     case "legacy-unknown-calibration": return `legacy-calibration\0${record.value.id}`;
+    case "memory": return record.value.recordType === "status"
+      ? "memory\0status"
+      : `memory\0projection\0${record.value.projection.memoryRecordId}`;
   }
 }
 
@@ -3422,7 +3437,7 @@ describe("authoritative server real-process harness", () => {
         "human-read",
         "agent-judgement",
         "open-item",
-        "agent-execution",
+        "legacy-agent-execution",
         "calibration",
       ]));
       expect(snapshot.records.filter((record) => record.kind === "membership")).toHaveLength(2);
@@ -3435,7 +3450,7 @@ describe("authoritative server real-process harness", () => {
         ["human-read", 1],
         ["agent-judgement", 1],
         ["open-item", 1],
-        ["agent-execution", 1],
+        ["legacy-agent-execution", 1],
         ["calibration", 1],
       ] as const) {
         const restored = snapshot.records.filter((record) => record.kind === kind);
@@ -4403,7 +4418,7 @@ describe("authoritative server real-process harness", () => {
         "human-read": 1_999,
         "agent-judgement": 500,
         "open-item": 500,
-        "agent-execution": 500,
+        "legacy-agent-execution": 500,
         calibration: 1_000,
         "route-job": 4,
         "route-judgment": 0,

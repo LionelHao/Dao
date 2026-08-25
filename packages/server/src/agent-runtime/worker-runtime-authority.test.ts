@@ -115,7 +115,7 @@ describe("real AuthorityWorker runtime authority", () => {
       for (let index = 0; index < 70; index += 1) {
         const ordinal = index + 1;
         const directTarget = ordinal === 3 || ordinal === 4 ? "agent-git" : "agent-runtime";
-        if (ordinal <= 6) {
+        if (ordinal <= 8) {
           submitHumanMessageDatabaseCommand(database, {
             context: {
               ...directContext,
@@ -168,7 +168,8 @@ describe("real AuthorityWorker runtime authority", () => {
           FROM messages
           WHERE id IN (
             'message-runtime-2', 'message-runtime-3', 'message-runtime-4',
-            'message-runtime-5', 'message-runtime-6'
+            'message-runtime-5', 'message-runtime-6', 'message-runtime-7',
+            'message-runtime-8'
           );
       `);
       insertLegacyMessageAuthorityRecord(database, {
@@ -440,6 +441,51 @@ describe("real AuthorityWorker runtime authority", () => {
         }),
       ]);
       gateway = createToolGateway({ authority, adapters: [sandboxAdapter, gitAdapter] });
+
+      const cancellable = await authority.invoke(
+        { ...context, requestId: "request-runtime-7", idempotencyKey: "key-runtime-7" },
+        { kind: "direct_mention", roomId: "room-runtime", sourceMessageId: "message-runtime-7", targetAgentId: "agent-runtime" },
+        "openai-responses",
+        "configured-model",
+      );
+      const cancelContext = {
+        ...context,
+        requestId: "request-cancel-runtime-7",
+        idempotencyKey: "key-cancel-runtime-7",
+      };
+      await expect(authority.cancelScoped(
+        cancelContext,
+        cancellable.execution.id,
+        1,
+        cancelContext.requestId,
+      )).resolves.toMatchObject({
+        kind: "scoped-cancellation-committed",
+        roomId: "room-runtime",
+        reason: "human_cancelled",
+        replayed: false,
+        effects: [{
+          executionId: cancellable.execution.id,
+          attemptSeq: 1,
+          disposition: "execution_cancelled",
+        }],
+      });
+      await expect(authority.cancelScoped(
+        cancelContext,
+        cancellable.execution.id,
+        1,
+        cancelContext.requestId,
+      )).resolves.toMatchObject({ replayed: true });
+      const shutdownCandidate = await authority.invoke(
+        { ...context, requestId: "request-runtime-8", idempotencyKey: "key-runtime-8" },
+        { kind: "direct_mention", roomId: "room-runtime", sourceMessageId: "message-runtime-8", targetAgentId: "agent-runtime" },
+        "openai-responses",
+        "configured-model",
+      );
+      await expect(authority.shutdown(shutdownCandidate.execution.id, 1)).resolves.toMatchObject({
+        id: shutdownCandidate.execution.id,
+        status: "cancelled",
+        cancellationReason: "runtime_shutdown",
+      });
 
       const third = await authority.invoke(
         { ...context, requestId: "request-runtime-3", idempotencyKey: "key-runtime-3" },

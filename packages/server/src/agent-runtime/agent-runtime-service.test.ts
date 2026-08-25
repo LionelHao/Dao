@@ -125,6 +125,19 @@ function authority(): RuntimeAuthority & { executions: Map<string, AgentExecutio
       executions.set(id, cancelled);
       return cancelled;
     },
+    cancelScoped: vi.fn(),
+    async shutdown(id, attemptSeq) {
+      const value = executions.get(id)!;
+      if (value.currentAttemptSeq !== attemptSeq) throw new AgentRuntimeError("execution_conflict", "stale");
+      const cancelled = {
+        ...value,
+        status: "cancelled" as const,
+        completedAt: value.queuedAt,
+        cancellationReason: "runtime_shutdown",
+      };
+      executions.set(id, cancelled);
+      return cancelled;
+    },
     retry: vi.fn(), prepareTool: vi.fn(), claimTool: vi.fn(), settleTool: vi.fn(),
     checkpoint: vi.fn(), recover: vi.fn(async () => []),
   };
@@ -1305,5 +1318,9 @@ describe("bounded Agent runtime scheduler", () => {
     await runtime.close();
 
     expect(Date.now() - before).toBeLessThan(250);
+    expect(runtimeAuthority.executions.get("execution-1")).toMatchObject({
+      status: "cancelled",
+      cancellationReason: "runtime_shutdown",
+    });
   });
 });
