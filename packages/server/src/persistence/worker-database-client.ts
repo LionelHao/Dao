@@ -2178,6 +2178,8 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
         responseType === "authority.ball-result") ||
       (requestType === "authority.memory" &&
         responseType === "authority.memory-result") ||
+      (requestType === "authority.project-loop" &&
+        responseType === "authority.project-loop-result") ||
       (requestType === "authority.read-history" &&
         responseType === "authority.history") ||
       (requestType === "authority.read-actor" && responseType === "authority.actor") ||

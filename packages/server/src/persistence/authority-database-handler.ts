@@ -136,8 +136,15 @@ import {
   type HumanRequestMessageTransactionParticipant,
 } from "../project-loop/message-human-request-participant.js";
 import {
+  beginProjectBoundaryExecutionInTransaction,
+  claimProjectBoundaryInvocationInTransaction,
+  finishProjectBoundaryExecutionInTransaction,
+  listRunnableProjectBoundaryExecutions,
+} from "../project-boundary/project-boundary-authority.js";
+import {
   archiveProjectLoopBoundariesInTransaction,
   reopenProjectLoopBoundariesInTransaction,
+  scanProjectReminderBucketsInTransaction,
 } from "../project-loop/boundary-authority.js";
 import { canStartRuntimeGenerationInTransaction } from "../agent-runtime/runtime-archive-fence-participant.js";
 import {
@@ -7290,6 +7297,130 @@ export function executeRuntimeAuthorityOperation(
         "project-boundary-invocation", operation.request.boundaryId,
       );
       return { kind: "project-boundary", result };
+    }
+    if (operation.type === "runtime.claim-project-boundary") {
+      return { kind: "project-boundary", result: claimProjectBoundaryInvocationInTransaction(
+        database,
+        {
+          request: operation.request,
+          requestSha256: operation.requestSha256,
+          attemptedAt: operation.attemptedAt,
+          providerId: operation.providerId,
+          modelId: operation.modelId,
+          ...(operation.intentId === undefined ? {} : { intentId: operation.intentId }),
+        },
+      ) };
+    }
+    if (operation.type === "runtime.scan-project-boundary-executions") {
+      return { kind: "project-boundary-executions",
+        records: listRunnableProjectBoundaryExecutions(database, operation.limit) };
+    }
+    if (operation.type === "runtime.scan-project-reminders") {
+      return { kind: "project-reminder-scan", result: scanProjectReminderBucketsInTransaction(
+        database,
+        { now: occurredAt, limit: operation.limit },
+        (transaction, intent) => {
+          const request = {
+            purpose: "project_boundary_invocation" as const,
+            boundaryId: intent.boundaryId,
+            boundaryKind: intent.boundaryKind,
+            projectId: intent.roomId,
+            roomId: intent.roomId,
+            agentId: intent.agentActorId,
+            sourceFactId: intent.sourceId,
+            sourceFactRevision: intent.sourceRevision,
+          };
+          const requestSha256 = createHash("sha256").update(canonicalJson(request)).digest("hex");
+          const result = claimProjectBoundaryInvocationInTransaction(transaction, {
+            request,
+            requestSha256,
+            attemptedAt: intent.createdAt,
+            providerId: operation.providerId,
+            modelId: operation.modelId,
+            intentId: intent.intentId,
+          });
+          if (result.status !== "intent-created" || result.intentId !== intent.intentId) {
+            throw new Error("Agent reminder failed to create its Project boundary intent");
+          }
+        },
+      ) };
+    }
+    if (operation.type === "runtime.scan-project-agent-boundaries") {
+      const rows = database.prepare(
+        `SELECT boundary.boundary_id AS boundaryId, boundary.room_id AS roomId,
+                boundary.project_id AS projectId, boundary.source_kind AS sourceKind,
+                boundary.source_id AS sourceId, boundary.source_revision AS sourceRevision,
+                boundary.holder_actor_id AS agentId, boundary.due_at AS dueAt
+         FROM project_ball_boundaries AS boundary
+         JOIN rooms AS room ON room.id = boundary.room_id
+         WHERE boundary.status = 'active' AND boundary.holder_kind = 'agent'
+           AND room.status = 'active'
+           AND NOT (boundary.source_kind = 'review' AND
+             (boundary.due_at IS NULL OR boundary.due_at > ?))
+           AND NOT EXISTS (
+             SELECT 1 FROM project_boundary_agent_invocation_intents AS intent
+             WHERE intent.boundary_id = boundary.boundary_id
+               AND intent.source_revision = boundary.source_revision
+               AND intent.lifecycle_generation = boundary.lifecycle_generation
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM project_boundary_invocation_receipts AS receipt
+             WHERE receipt.boundary_id = boundary.boundary_id
+           )
+         ORDER BY boundary.since, boundary.boundary_id LIMIT ?`,
+      ).all(occurredAt, operation.limit);
+      let createdCount = 0;
+      let suppressedCount = 0;
+      for (const row of rows) {
+        if (typeof row.boundaryId !== "string" || typeof row.roomId !== "string" ||
+            typeof row.projectId !== "string" || typeof row.sourceKind !== "string" ||
+            typeof row.sourceId !== "string" || typeof row.sourceRevision !== "number" ||
+            typeof row.agentId !== "string" ||
+            !(row.dueAt === null || typeof row.dueAt === "string")) {
+          throw new Error("Project Agent boundary scan row was corrupt");
+        }
+        const boundaryKind = row.sourceKind === "confirmation" ? "checkpoint" as const :
+          row.sourceKind === "blocker" || row.sourceKind === "open_question" ||
+            row.sourceKind === "review" ? "blocker" as const :
+            row.dueAt !== null && row.dueAt <= occurredAt ? "due" as const : "agent_ball" as const;
+        const request = {
+          purpose: "project_boundary_invocation" as const,
+          boundaryId: row.boundaryId,
+          boundaryKind,
+          projectId: row.projectId,
+          roomId: row.roomId,
+          agentId: row.agentId,
+          sourceFactId: row.sourceId,
+          sourceFactRevision: row.sourceRevision,
+        };
+        const requestSha256 = createHash("sha256").update(canonicalJson(request)).digest("hex");
+        const result = claimProjectBoundaryInvocationInTransaction(database, {
+          request, requestSha256, attemptedAt: occurredAt,
+          providerId: operation.providerId, modelId: operation.modelId,
+        });
+        if (result.status === "intent-created") createdCount += 1;
+        else suppressedCount += 1;
+      }
+      return { kind: "project-agent-boundary-scan", scannedCount: rows.length,
+        createdCount, suppressedCount };
+    }
+    if (operation.type === "runtime.begin-project-boundary-execution") {
+      return { kind: "project-boundary-execution",
+        execution: beginProjectBoundaryExecutionInTransaction(database, {
+          executionId: operation.executionId,
+          expectedVersion: operation.expectedVersion,
+          now: occurredAt,
+        }) };
+    }
+    if (operation.type === "runtime.finish-project-boundary-execution") {
+      return { kind: "project-boundary-execution",
+        execution: finishProjectBoundaryExecutionInTransaction(database, {
+          executionId: operation.executionId,
+          expectedVersion: operation.expectedVersion,
+          outcome: operation.outcome,
+          ...(operation.errorCode === undefined ? {} : { errorCode: operation.errorCode }),
+          now: occurredAt,
+        }) };
     }
     if (operation.type === "runtime.claim-pending-direct-intents") {
       const candidates = database.prepare(

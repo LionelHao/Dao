@@ -9,11 +9,7 @@ import { canonicalJsonV1 } from "../context-compiler/canonical-json.js";
 import type { RuntimeAuthorityOperation } from
   "../agent-runtime/runtime-authority-protocol.js";
 
-/**
- * FT-08's server-private handoff. FT-09 will supply the versioned Project fact
- * reader and intent creator; until then production installs only the durable
- * fail-closed authority port below.
- */
+/** Legacy fail-closed port retained for explicit dependency-outage tests. */
 export interface ProjectBoundaryInvocationAuthorityPort {
   recordSuppressed(input: Readonly<{
     request: ProjectBoundaryInvocationRequest;
@@ -25,7 +21,7 @@ export interface ProjectBoundaryInvocationAuthorityPort {
 
 export interface AuthoritativeProjectBoundaryInvocationPort {
   /**
-   * The v23 adapter must atomically verify that the boundary is confirmed,
+   * The v24 adapter must atomically verify that the boundary is confirmed,
    * active, current, unconsumed, Agent-held, lifecycle-active and assignment-
    * eligible; claim it; and create the FT-08 invocation intent. Ineligible
    * inputs return a durable suppression and must create zero execution/provider
@@ -60,6 +56,33 @@ export function createWorkerProjectBoundaryInvocationAuthority(
         reason: input.reason,
         decidedAt: input.decidedAt,
         now: Date.parse(input.decidedAt),
+      });
+      if (typeof result !== "object" || result === null || !("kind" in result) ||
+          result.kind !== "project-boundary" || !("result" in result) ||
+          !isProjectBoundaryInvocationResult(result.result)) {
+        throw new TypeError("Project boundary worker result was malformed");
+      }
+      return result.result;
+    },
+  });
+}
+
+export function createWorkerAuthoritativeProjectBoundaryInvocationAuthority(
+  worker: ProjectBoundaryRuntimeOperationExecutor,
+  options: Readonly<{ providerId: string; modelId: string }>,
+): AuthoritativeProjectBoundaryInvocationPort {
+  return Object.freeze({
+    async claimConfirmedAgentBoundary(
+      input: Parameters<AuthoritativeProjectBoundaryInvocationPort["claimConfirmedAgentBoundary"]>[0],
+    ) {
+      const result = await worker.executeRuntime({
+        type: "runtime.claim-project-boundary",
+        request: input.request,
+        requestSha256: input.requestSha256,
+        attemptedAt: input.attemptedAt,
+        providerId: options.providerId,
+        modelId: options.modelId,
+        now: Date.parse(input.attemptedAt),
       });
       if (typeof result !== "object" || result === null || !("kind" in result) ||
           result.kind !== "project-boundary" || !("result" in result) ||

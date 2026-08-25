@@ -378,6 +378,53 @@ function readProposal(database: DatabaseSync, proposalId: string): ProjectLoopSt
   return row === undefined ? undefined : proposalFromRow(row);
 }
 
+function createPendingConfirmationBoundary(database: DatabaseSync,
+  proposal: Readonly<{ roomId: string; proposalId: string; revision: number;
+    principalHumanActorId: string; expiresAt: string }>, now: string): void {
+  const lifecycle = database.prepare(
+    "SELECT archive_generation AS generation FROM rooms WHERE id = ?",
+  ).get(proposal.roomId);
+  if (typeof lifecycle?.generation !== "number") {
+    throw new ProjectLoopAuthorityError("storage_unavailable", "Project lifecycle generation is unavailable");
+  }
+  const boundaryId = `project-ball-${createHash("sha256").update(
+    `${proposal.roomId}\0confirmation\0${proposal.proposalId}\0${proposal.revision}` +
+      `\0${lifecycle.generation}\0human\0${proposal.principalHumanActorId}`,
+  ).digest("hex")}`;
+  database.prepare(
+    `INSERT INTO project_ball_boundaries (
+       boundary_id, room_id, project_id, source_kind, source_id, source_revision,
+       lifecycle_generation, holder_kind, holder_actor_id, reason, since, due_at, status
+     ) VALUES (?, ?, ?, 'confirmation', ?, ?, ?, 'human', ?,
+               'pending_confirmation', ?, ?, 'active')`,
+  ).run(boundaryId, proposal.roomId, proposal.roomId, `confirmation:${proposal.proposalId}`,
+    proposal.revision, lifecycle.generation, proposal.principalHumanActorId,
+    now, proposal.expiresAt);
+}
+
+function createConfirmedCheckpointBoundary(database: DatabaseSync,
+  input: Readonly<{ roomId: string; checkpointId: string; projectRevision: number;
+    agentActorId: string; now: string }>): void {
+  const lifecycle = database.prepare(
+    "SELECT archive_generation AS generation FROM rooms WHERE id = ?",
+  ).get(input.roomId);
+  if (typeof lifecycle?.generation !== "number") {
+    throw new ProjectLoopAuthorityError("storage_unavailable", "Project lifecycle generation is unavailable");
+  }
+  const boundaryId = `project-ball-${createHash("sha256").update(
+    `${input.roomId}\0confirmation\0${input.checkpointId}\0${input.projectRevision}` +
+      `\0${lifecycle.generation}\0agent\0${input.agentActorId}`,
+  ).digest("hex")}`;
+  database.prepare(
+    `INSERT INTO project_ball_boundaries (
+       boundary_id, room_id, project_id, source_kind, source_id, source_revision,
+       lifecycle_generation, holder_kind, holder_actor_id, reason, since, due_at, status
+     ) VALUES (?, ?, ?, 'confirmation', ?, ?, ?, 'agent', ?,
+               'confirmed_checkpoint', ?, NULL, 'active')`,
+  ).run(boundaryId, input.roomId, input.roomId, input.checkpointId,
+    input.projectRevision, lifecycle.generation, input.agentActorId, input.now);
+}
+
 function refreshBallBoundary(database: DatabaseSync, fact: ProjectLoopStoredFact, now: string): void {
   database.prepare(
     `UPDATE project_ball_boundaries SET status = 'superseded', released_at = ?
@@ -687,6 +734,13 @@ function createProposal(database: DatabaseSync,
     operation.command.projectId, operation.command.proposalId,
     operation.command.principalActorId, operation.command.baseRevision, payloadDigest,
     source.roomId, source.sourceId, timestamp, operation.command.expiresAt);
+  createPendingConfirmationBoundary(database, {
+    roomId: operation.command.roomId,
+    proposalId: operation.command.proposalId,
+    revision: 1,
+    principalHumanActorId: operation.command.principalActorId,
+    expiresAt: operation.command.expiresAt,
+  }, timestamp);
   const id = appendEvent(database, { roomId: operation.command.roomId, eventSeq: revision,
     eventType: "proposal.created", factKind: operation.command.factKind,
     factId: operation.command.factId, factRevision: 1, actorKind: principal.kind,
@@ -720,6 +774,11 @@ function resolveProposal(database: DatabaseSync,
     validateProjectSource(database, proposal.source);
     fact = createFact(database, proposal, actorId, timestamp);
   }
+  database.prepare(
+    `UPDATE project_ball_boundaries SET status = 'superseded', released_at = ?
+     WHERE room_id = ? AND source_kind = 'confirmation' AND source_id = ?
+       AND source_revision = ? AND status = 'active'`,
+  ).run(timestamp, proposal.roomId, `confirmation:${proposal.id}`, proposal.revision);
   database.prepare(
     `UPDATE project_fact_proposals SET status = ?, revision = revision + 1, updated_at = ?,
        resolved_at = ?, resolution_reason = ?
@@ -1395,8 +1454,44 @@ function mutate(database: DatabaseSync, operation: Exclude<ProjectLoopAuthorityO
     }
     const identity = commandIdentity(operation.context);
     const roomId = operation.command.roomId;
-    writeProjectLoopCheckpointInTransaction(database, { roomId,
+    const checkpoint = writeProjectLoopCheckpointInTransaction(database, { roomId,
       projectRevision: result.acceptedRevision, occurredAt: iso(operation.now) });
+    if (operation.type === "project-loop.proposal.resolve" &&
+        operation.command.resolution === "confirmed") {
+      const proposer = database.prepare(
+        `SELECT proposed_by_kind AS kind, proposed_by_actor_id AS actorId
+         FROM project_fact_proposals WHERE id = ? AND room_id = ?`,
+      ).get(operation.command.proposalId, roomId);
+      const preferredAgentId = proposer?.kind === "agent" && typeof proposer.actorId === "string"
+        ? proposer.actorId : "";
+      const checkpointAgent = database.prepare(
+        `SELECT assignment.agent_actor_id AS actorId
+         FROM room_agent_assignments AS assignment
+         JOIN agent_profiles AS profile ON profile.id = assignment.profile_id
+           AND profile.actor_id = assignment.agent_actor_id
+           AND profile.status = 'enabled'
+         JOIN room_memberships AS membership ON membership.room_id = assignment.room_id
+           AND membership.actor_id = assignment.agent_actor_id
+           AND membership.kind = 'agent' AND membership.participation = 'active'
+         WHERE assignment.room_id = ? AND assignment.status = 'current'
+           AND assignment.participation = 'active' AND assignment.paused = 0
+           AND EXISTS (SELECT 1 FROM json_each(assignment.capability_subset_json)
+             WHERE value = 'room.project.read')
+           AND EXISTS (SELECT 1 FROM json_each(assignment.capability_subset_json)
+             WHERE value = 'room.respond')
+         ORDER BY CASE WHEN assignment.agent_actor_id = ? THEN 0 ELSE 1 END,
+                  assignment.agent_actor_id LIMIT 1`,
+      ).get(roomId, preferredAgentId);
+      if (typeof checkpointAgent?.actorId === "string") {
+        createConfirmedCheckpointBoundary(database, {
+          roomId,
+          checkpointId: checkpoint.checkpointId,
+          projectRevision: result.acceptedRevision,
+          agentActorId: checkpointAgent.actorId,
+          now: iso(operation.now),
+        });
+      }
+    }
     database.prepare(
       `INSERT INTO project_command_receipts (
          actor_id, idempotency_key, room_id, request_sha256, response_json, committed_at

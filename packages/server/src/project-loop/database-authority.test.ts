@@ -591,7 +591,8 @@ describe("Project Loop database authority", () => {
         reason: "Wait for review", reviewAt: "2026-08-27T08:00:00.000Z",
       });
       expect(database.prepare(
-        "SELECT source_kind AS kind FROM project_ball_boundaries WHERE status = 'active'",
+        `SELECT source_kind AS kind FROM project_ball_boundaries
+         WHERE status = 'active' AND source_id = 'blocker-one'`,
       ).get()).toEqual({ kind: "review" });
       transition("reopen", 2, "obstacle.reopen", { reason: "Review arrived" });
       transition("cannot", 3, "obstacle.cannot_answer", { reason: "Needs escalation" });

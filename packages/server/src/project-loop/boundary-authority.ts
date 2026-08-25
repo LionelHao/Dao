@@ -11,6 +11,12 @@ import type {
   ProjectLoopLifecycleTransactionParticipant,
   ProjectLoopReopenResult,
   ProjectReminderAuthorityPort,
+  ProjectReminderClaimResult,
+  ProjectReminderScanResult,
+} from "./project-boundary-runtime-service.js";
+import {
+  currentProjectReminderOrdinal,
+  PROJECT_REMINDER_SCAN_LIMITS,
 } from "./project-boundary-runtime-service.js";
 import { createHash } from "node:crypto";
 
@@ -108,6 +114,15 @@ function sourceState(database: DatabaseSync, row: ReminderBoundaryRow):
     return { kind, current: fact?.revision === row.sourceRevision &&
       (fact.status === "open" || fact.status === "deferred" || fact.status === "cannot_answer") };
   }
+  if (row.sourceKind === "confirmation") {
+    const proposalId = row.sourceId.startsWith("confirmation:")
+      ? row.sourceId.slice("confirmation:".length) : row.sourceId;
+    const proposal = database.prepare(
+      `SELECT revision, status FROM project_fact_proposals WHERE room_id = ? AND id = ?`,
+    ).get(row.roomId, proposalId);
+    return { kind: "confirmation", current: proposal?.revision === row.sourceRevision &&
+      proposal.status === "pending" };
+  }
   return { kind: "next_action", current: false };
 }
 
@@ -134,6 +149,7 @@ function currentReminderBoundary(database: DatabaseSync, row: ReminderBoundaryRo
     recordVersion: "project-boundary.v1", boundaryId: row.boundaryId,
     roomId: row.roomId, projectId: row.roomId,
     boundaryKind: row.sourceKind === "review" ? "review" :
+      row.sourceKind === "confirmation" ? "checkpoint" :
       row.holderKind === "agent" ? "agent_ball" : source.kind === "blocker" ||
         source.kind === "open_question" ? "blocker" : "due",
     sourceKind: source.kind, sourceId: row.sourceId, sourceRevision: row.sourceRevision,
@@ -157,13 +173,30 @@ function reminderRows(database: DatabaseSync, now: string, limit: number): Remin
      JOIN rooms AS room ON room.id = boundary.room_id
      WHERE boundary.status = 'active' AND boundary.due_at IS NOT NULL
        AND boundary.due_at <= ? AND room.status = 'active'
+       AND NOT EXISTS (
+         SELECT 1 FROM project_due_reminder_claims AS claim
+         WHERE claim.room_id = boundary.room_id
+           AND claim.boundary_id = boundary.boundary_id
+           AND claim.recipient_actor_id = boundary.holder_actor_id
+           AND claim.reminder_ordinal = CAST(
+             (julianday(?) - julianday(boundary.due_at)) AS INTEGER
+           )
+           AND claim.reminder_kind = CASE
+             WHEN boundary.source_kind = 'review' THEN 'review'
+             WHEN CAST((julianday(?) - julianday(boundary.due_at)) AS INTEGER) = 0
+               THEN 'initial_due'
+             ELSE 'repeat_24h'
+           END
+       )
      ORDER BY boundary.due_at, boundary.boundary_id LIMIT ?`,
-  ).all(now, limit) as unknown as ReminderBoundaryRow[];
+  ).all(now, now, now, limit) as unknown as ReminderBoundaryRow[];
 }
 
 export type ProjectReminderAgentIntentInput = Readonly<{
   intentId: string; roomId: string; boundaryId: string; sourceKind: string;
-  sourceId: string; sourceRevision: number; agentActorId: string; createdAt: string;
+  sourceId: string; sourceRevision: number;
+  boundaryKind: "due" | "blocker" | "agent_ball";
+  agentActorId: string; createdAt: string;
 }>;
 
 export type ProjectReminderAgentIntentWriter = (
@@ -175,6 +208,162 @@ export type ProjectReminderDatabaseAdapterOptions = Readonly<{
   /** FT-08-owned writer. It runs synchronously inside this adapter's SQLite transaction. */
   writeAgentInvocationIntentInTransaction: ProjectReminderAgentIntentWriter;
 }>;
+
+type ProjectReminderClaimInput = Parameters<ProjectReminderAuthorityPort["claimCurrentBucket"]>[0];
+
+/** The caller owns the surrounding AuthorityWorker transaction. */
+export function claimProjectReminderBucketInTransaction(
+  database: DatabaseSync,
+  input: ProjectReminderClaimInput,
+  writeAgentInvocationIntentInTransaction: ProjectReminderAgentIntentWriter,
+): ProjectReminderClaimResult {
+  const base = { roomId: input.roomId, boundaryId: input.boundaryId,
+    reminderOrdinal: input.reminderOrdinal, recipientActorId: input.recipientActorId };
+  const raw = database.prepare(
+    `SELECT boundary.boundary_id AS boundaryId, boundary.room_id AS roomId,
+            boundary.source_kind AS sourceKind, boundary.source_id AS sourceId,
+            boundary.source_revision AS sourceRevision, boundary.holder_kind AS holderKind,
+            boundary.holder_actor_id AS holderActorId, boundary.reason, boundary.since,
+            boundary.due_at AS dueAt, boundary.lifecycle_generation AS lifecycleGeneration
+     FROM project_ball_boundaries AS boundary JOIN rooms AS room ON room.id = boundary.room_id
+     WHERE boundary.boundary_id = ? AND boundary.room_id = ? AND boundary.status = 'active'`,
+  ).get(input.boundaryId, input.roomId) as ReminderBoundaryRow | undefined;
+  const current = raw === undefined ? undefined : currentReminderBoundary(database, raw, input.claimedAt);
+  const scheduled = current?.boundaryKind === "review" ? current.reviewAt : current?.dueAt;
+  const exactOrdinal = scheduled === null || scheduled === undefined ? -1 :
+    currentProjectReminderOrdinal(scheduled, input.claimedAt) ?? -1;
+  if (current === undefined || current.sourceRevision !== input.sourceRevision ||
+      current.lifecycleGeneration !== input.lifecycleGeneration ||
+      current.holder.actorId !== input.recipientActorId ||
+      (current.holder.kind === "human") !== (input.reminderKind === "human_reminder") ||
+      exactOrdinal !== input.reminderOrdinal) {
+    return Object.freeze({ status: "ineligible" as const, ...base });
+  }
+  if (scheduled === null || scheduled === undefined) {
+    throw new Error("Current Project reminder boundary has no schedule");
+  }
+  const reminderKind = current.boundaryKind === "review" ? "review" :
+    input.reminderOrdinal === 0 ? "initial_due" : "repeat_24h";
+  const claimId = `project-reminder-${createHash("sha256").update(
+    `${input.roomId}\0${input.boundaryId}\0${input.sourceRevision}\0${input.lifecycleGeneration}` +
+    `\0${reminderKind}\0${input.reminderOrdinal}\0${input.recipientActorId}`,
+  ).digest("hex")}`;
+  const inserted = database.prepare(
+    `INSERT INTO project_due_reminder_claims (
+       claim_id, room_id, boundary_id, source_revision, reminder_kind, reminder_ordinal,
+       boundary_at, holder_kind, holder_actor_id, recipient_actor_id, status, claimed_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'claimed', ?)
+     ON CONFLICT(room_id, boundary_id, reminder_kind, reminder_ordinal, recipient_actor_id)
+     DO NOTHING`,
+  ).run(claimId, input.roomId, input.boundaryId, input.sourceRevision, reminderKind,
+    input.reminderOrdinal, scheduled, current.holder.kind, current.holder.actorId,
+    input.recipientActorId, input.claimedAt);
+  if (inserted.changes === 0) {
+    return Object.freeze({ status: "duplicate" as const, ...base });
+  }
+  if (current.holder.kind === "human") {
+    const stream = database.prepare(
+      `SELECT head_seq AS headSeq FROM streams WHERE stream_kind = 'identity' AND stream_id = ?`,
+    ).get(input.recipientActorId);
+    if (typeof stream?.headSeq !== "number") throw new Error("Human reminder stream is unavailable");
+    const seq = stream.headSeq + 1;
+    const advanced = database.prepare(
+      `UPDATE streams SET head_seq = ? WHERE stream_kind = 'identity' AND stream_id = ?
+         AND head_seq = ?`,
+    ).run(seq, input.recipientActorId, stream.headSeq);
+    if (advanced.changes !== 1) throw new Error("Human reminder stream compare-and-set failed");
+    database.prepare(
+      `INSERT INTO events (event_id, stream_kind, stream_id, stream_seq, room_id, actor_id,
+         event_type, occurred_at, payload_json)
+       VALUES (?, 'identity', ?, ?, NULL, ?, 'project.reminder.due', ?, json(?))`,
+    ).run(claimId, input.recipientActorId, seq, input.recipientActorId, input.claimedAt,
+      JSON.stringify({ roomId: input.roomId, boundaryId: input.boundaryId,
+        sourceKind: current.sourceKind, sourceId: current.sourceId,
+        sourceRevision: current.sourceRevision, reminderOrdinal: input.reminderOrdinal }));
+    const outboxId = `outbox:${claimId}`;
+    database.prepare(
+      `INSERT INTO outbox_deliveries (id, event_id, target_kind, target_id, stream_seq,
+         status, attempts, available_at, delivered_at, last_error)
+       VALUES (?, ?, 'principal', ?, ?, 'pending', 0, ?, NULL, NULL)`,
+    ).run(outboxId, claimId, input.recipientActorId, seq, input.claimedAt);
+    database.prepare(
+      `UPDATE project_due_reminder_claims SET status = 'dispatched', dispatched_at = ?
+       WHERE claim_id = ?`,
+    ).run(input.claimedAt, claimId);
+    return Object.freeze({ status: "claimed" as const, ...base,
+      dispatch: Object.freeze({ kind: "human_notification" as const, outboxId }) });
+  }
+  const intentId = `project-boundary-intent:${createHash("sha256").update(
+    `${input.roomId}\0${input.boundaryId}\0${input.sourceRevision}` +
+    `\0${input.lifecycleGeneration}\0${input.recipientActorId}`,
+  ).digest("hex")}`;
+  const existingIntent = database.prepare(
+    `SELECT intent_id AS intentId FROM project_boundary_agent_invocation_intents
+     WHERE boundary_id = ? AND source_revision = ? AND lifecycle_generation = ?
+       AND target_agent_actor_id = ?`,
+  ).get(input.boundaryId, input.sourceRevision, input.lifecycleGeneration,
+    input.recipientActorId);
+  if (existingIntent === undefined) {
+    writeAgentInvocationIntentInTransaction(database, {
+      intentId, roomId: input.roomId, boundaryId: input.boundaryId,
+      sourceKind: current.sourceKind, sourceId: current.sourceId,
+      sourceRevision: current.sourceRevision, agentActorId: input.recipientActorId,
+      boundaryKind: current.sourceKind === "blocker" || current.sourceKind === "open_question"
+          ? "blocker" : "due",
+      createdAt: input.claimedAt,
+    });
+  } else if (existingIntent.intentId !== intentId) {
+    throw new Error("Current Project reminder boundary intent identity is corrupt");
+  }
+  database.prepare(
+    `UPDATE project_due_reminder_claims SET status = 'dispatched', dispatched_at = ?
+     WHERE claim_id = ?`,
+  ).run(input.claimedAt, claimId);
+  return Object.freeze({ status: "claimed" as const, ...base,
+    dispatch: Object.freeze({ kind: "agent_invocation" as const, intentId }) });
+}
+
+/** Bounded global scan executed within one AuthorityWorker-owned transaction. */
+export function scanProjectReminderBucketsInTransaction(
+  database: DatabaseSync,
+  input: Readonly<{ now: string; limit: number }>,
+  writeAgentInvocationIntentInTransaction: ProjectReminderAgentIntentWriter,
+): ProjectReminderScanResult {
+  if (!Number.isSafeInteger(input.limit) || input.limit < 1 ||
+      input.limit > PROJECT_REMINDER_SCAN_LIMITS.maxBoundaries ||
+      !Number.isFinite(Date.parse(input.now)) || new Date(Date.parse(input.now)).toISOString() !== input.now) {
+    throw new TypeError("Project reminder Worker operation input was invalid");
+  }
+  const candidates = reminderRows(database, input.now, input.limit)
+    .map((row) => currentReminderBoundary(database, row, input.now))
+    .filter((row): row is PersistedProjectBoundary => row !== undefined);
+  const claims: ProjectReminderClaimResult[] = [];
+  let ignoredCount = 0;
+  for (const candidate of candidates) {
+    const scheduled = candidate.boundaryKind === "review" ? candidate.reviewAt : candidate.dueAt;
+    if (scheduled === null) { ignoredCount += 1; continue; }
+    const ordinal = currentProjectReminderOrdinal(scheduled, input.now);
+    if (ordinal === null) { ignoredCount += 1; continue; }
+    claims.push(claimProjectReminderBucketInTransaction(database, {
+      roomId: candidate.roomId,
+      boundaryId: candidate.boundaryId,
+      sourceRevision: candidate.sourceRevision,
+      lifecycleGeneration: candidate.lifecycleGeneration,
+      reminderKind: candidate.holder.kind === "human" ? "human_reminder" : "agent_invocation",
+      reminderOrdinal: ordinal,
+      recipientActorId: candidate.holder.actorId,
+      scheduledAt: new Date(Date.parse(scheduled) + ordinal * 24 * 60 * 60 * 1_000).toISOString(),
+      claimedAt: input.now,
+    }, writeAgentInvocationIntentInTransaction));
+  }
+  return Object.freeze({
+    scannedCount: candidates.length,
+    claimedCount: claims.filter((claim) => claim.status === "claimed").length,
+    duplicateCount: claims.filter((claim) => claim.status === "duplicate").length,
+    ignoredCount: ignoredCount + claims.filter((claim) => claim.status === "ineligible").length,
+    claims: Object.freeze(claims),
+  });
+}
 
 /** Production SQLite adapter; provider invocation is deliberately outside this transaction seam. */
 export function createProjectReminderDatabaseAuthorityPort(database: DatabaseSync,
@@ -192,102 +381,13 @@ export function createProjectReminderDatabaseAuthorityPort(database: DatabaseSyn
     async claimCurrentBucket(
       input: Parameters<ProjectReminderAuthorityPort["claimCurrentBucket"]>[0],
     ) {
-      const base = { roomId: input.roomId, boundaryId: input.boundaryId,
-        reminderOrdinal: input.reminderOrdinal, recipientActorId: input.recipientActorId };
       database.exec("BEGIN IMMEDIATE");
       try {
-        const raw = database.prepare(
-          `SELECT boundary.boundary_id AS boundaryId, boundary.room_id AS roomId,
-                  boundary.source_kind AS sourceKind, boundary.source_id AS sourceId,
-                  boundary.source_revision AS sourceRevision, boundary.holder_kind AS holderKind,
-                  boundary.holder_actor_id AS holderActorId, boundary.reason, boundary.since,
-                  boundary.due_at AS dueAt, boundary.lifecycle_generation AS lifecycleGeneration
-           FROM project_ball_boundaries AS boundary JOIN rooms AS room ON room.id = boundary.room_id
-           WHERE boundary.boundary_id = ? AND boundary.room_id = ? AND boundary.status = 'active'`,
-        ).get(input.boundaryId, input.roomId) as ReminderBoundaryRow | undefined;
-        const current = raw === undefined ? undefined :
-          currentReminderBoundary(database, raw, input.claimedAt);
-        const scheduled = current?.boundaryKind === "review" ? current.reviewAt : current?.dueAt;
-        const exactOrdinal = scheduled === null || scheduled === undefined ? -1 :
-          Math.max(0, Math.floor((Date.parse(input.claimedAt) - Date.parse(scheduled)) /
-            (24 * 60 * 60 * 1_000)));
-        if (current === undefined || current.sourceRevision !== input.sourceRevision ||
-            current.lifecycleGeneration !== input.lifecycleGeneration ||
-            current.holder.actorId !== input.recipientActorId ||
-            (current.holder.kind === "human") !== (input.reminderKind === "human_reminder") ||
-            exactOrdinal !== input.reminderOrdinal) {
-          database.exec("COMMIT");
-          return Object.freeze({ status: "ineligible" as const, ...base });
-        }
-        if (scheduled === null || scheduled === undefined) {
-          throw new Error("Current Project reminder boundary has no schedule");
-        }
-        const reminderKind = current.boundaryKind === "review" ? "review" :
-          input.reminderOrdinal === 0 ? "initial_due" : "repeat_24h";
-        const claimId = `project-reminder-${createHash("sha256").update(
-          `${input.roomId}\0${input.boundaryId}\0${input.sourceRevision}\0${input.lifecycleGeneration}` +
-          `\0${reminderKind}\0${input.reminderOrdinal}\0${input.recipientActorId}`,
-        ).digest("hex")}`;
-        const inserted = database.prepare(
-          `INSERT INTO project_due_reminder_claims (
-             claim_id, room_id, boundary_id, source_revision, reminder_kind, reminder_ordinal,
-             boundary_at, holder_kind, holder_actor_id, recipient_actor_id, status, claimed_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'claimed', ?)
-           ON CONFLICT(room_id, boundary_id, reminder_kind, reminder_ordinal, recipient_actor_id)
-           DO NOTHING`,
-        ).run(claimId, input.roomId, input.boundaryId, input.sourceRevision, reminderKind,
-          input.reminderOrdinal, scheduled, current.holder.kind, current.holder.actorId,
-          input.recipientActorId, input.claimedAt);
-        if (inserted.changes === 0) {
-          database.exec("COMMIT");
-          return Object.freeze({ status: "duplicate" as const, ...base });
-        }
-        if (current.holder.kind === "human") {
-          const stream = database.prepare(
-            `SELECT head_seq AS headSeq FROM streams WHERE stream_kind = 'identity' AND stream_id = ?`,
-          ).get(input.recipientActorId);
-          if (typeof stream?.headSeq !== "number") throw new Error("Human reminder stream is unavailable");
-          const seq = stream.headSeq + 1;
-          database.prepare(
-            `UPDATE streams SET head_seq = ? WHERE stream_kind = 'identity' AND stream_id = ?
-               AND head_seq = ?`,
-          ).run(seq, input.recipientActorId, stream.headSeq);
-          database.prepare(
-            `INSERT INTO events (event_id, stream_kind, stream_id, stream_seq, room_id, actor_id,
-               event_type, occurred_at, payload_json)
-             VALUES (?, 'identity', ?, ?, NULL, ?, 'project.reminder.due', ?, json(?))`,
-          ).run(claimId, input.recipientActorId, seq, input.recipientActorId, input.claimedAt,
-            JSON.stringify({ roomId: input.roomId, boundaryId: input.boundaryId,
-              sourceKind: current.sourceKind, sourceId: current.sourceId,
-              sourceRevision: current.sourceRevision, reminderOrdinal: input.reminderOrdinal }));
-          const outboxId = `outbox:${claimId}`;
-          database.prepare(
-            `INSERT INTO outbox_deliveries (id, event_id, target_kind, target_id, stream_seq,
-               status, attempts, available_at, delivered_at, last_error)
-             VALUES (?, ?, 'principal', ?, ?, 'pending', 0, ?, NULL, NULL)`,
-          ).run(outboxId, claimId, input.recipientActorId, seq, input.claimedAt);
-          database.prepare(
-            `UPDATE project_due_reminder_claims SET status = 'dispatched', dispatched_at = ?
-             WHERE claim_id = ?`,
-          ).run(input.claimedAt, claimId);
-          database.exec("COMMIT");
-          return Object.freeze({ status: "claimed" as const, ...base,
-            dispatch: Object.freeze({ kind: "human_notification" as const, outboxId }) });
-        }
-        const intentId = `project-boundary-intent:${claimId}`;
-        options.writeAgentInvocationIntentInTransaction(database, {
-          intentId, roomId: input.roomId, boundaryId: input.boundaryId,
-          sourceKind: current.sourceKind, sourceId: current.sourceId,
-          sourceRevision: current.sourceRevision, agentActorId: input.recipientActorId,
-          createdAt: input.claimedAt,
-        });
-        database.prepare(
-          `UPDATE project_due_reminder_claims SET status = 'dispatched', dispatched_at = ?
-           WHERE claim_id = ?`,
-        ).run(input.claimedAt, claimId);
+        const result = claimProjectReminderBucketInTransaction(
+          database, input, options.writeAgentInvocationIntentInTransaction,
+        );
         database.exec("COMMIT");
-        return Object.freeze({ status: "claimed" as const, ...base,
-          dispatch: Object.freeze({ kind: "agent_invocation" as const, intentId }) });
+        return result;
       } catch (error) {
         try { database.exec("ROLLBACK"); } catch { /* preserve original */ }
         throw error;

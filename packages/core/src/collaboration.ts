@@ -386,6 +386,25 @@ export type ProjectBoundaryInvocationResult =
       decidedAt: string;
     }>;
 
+/**
+ * Provider-visible identity for a Project Loop boundary execution. Unlike the
+ * message runtime intent, this deliberately has no sourceMessageId: a timer or
+ * Agent-held Project boundary is an independently authoritative source.
+ */
+export interface ProjectBoundaryProviderInvocation {
+  readonly kind: "project_boundary";
+  readonly intentId: string;
+  readonly executionId: string;
+  readonly roomId: string;
+  readonly projectId: string;
+  readonly boundaryId: string;
+  readonly boundaryKind: "checkpoint" | "due" | "blocker" | "agent_ball";
+  readonly sourceFactId: string;
+  readonly sourceFactRevision: number;
+  readonly targetAgentId: string;
+  readonly lifecycleGeneration: number;
+}
+
 export type LegacyAgentExecutionStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 
 export interface LegacyAgentExecution {
@@ -486,7 +505,8 @@ export interface AgentRuntimeProviderInput {
     configVersion: string;
     modelId: string;
   }>;
-  readonly invocation: AgentInvocationIntent | LegacyAgentInvocationIntent;
+  readonly invocation: AgentInvocationIntent | LegacyAgentInvocationIntent |
+    ProjectBoundaryProviderInvocation;
   readonly trusted: Readonly<{
     system: readonly Readonly<{
       kind: "product_policy" | "safety_policy";

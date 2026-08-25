@@ -31,6 +31,10 @@ function fixture(): DatabaseSync {
       dispatched_at TEXT,
       UNIQUE(room_id,boundary_id,reminder_kind,reminder_ordinal,recipient_actor_id)
     );
+    CREATE TABLE project_boundary_agent_invocation_intents (
+      intent_id TEXT PRIMARY KEY, boundary_id TEXT, source_revision INTEGER,
+      lifecycle_generation INTEGER, target_agent_actor_id TEXT
+    );
     CREATE TABLE streams (
       stream_kind TEXT, stream_id TEXT, head_seq INTEGER, PRIMARY KEY(stream_kind,stream_id)
     );
@@ -95,7 +99,7 @@ describe("FT-09 global Project reminder Worker operation", () => {
       const operation = createProjectReminderWorkerOperation(database, durableWriter);
       await operation.execute({ now, limit: 10 });
       await expect(operation.execute({ now, limit: 10 })).resolves.toMatchObject({
-        scannedCount: 2, claimedCount: 0, duplicateCount: 2, ignoredCount: 0,
+        scannedCount: 0, claimedCount: 0, duplicateCount: 0, ignoredCount: 0,
       });
       expect(durableWriter).toHaveBeenCalledTimes(1);
     } finally { database.close(); }

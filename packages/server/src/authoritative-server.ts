@@ -81,10 +81,14 @@ import {
   type MemoryStewardRuntime,
 } from "./room-memory/memory-steward-runtime.js";
 import {
-  createFailClosedProjectBoundaryInvocationProducer,
-  createWorkerProjectBoundaryInvocationAuthority,
+  createAuthoritativeProjectBoundaryInvocationProducer,
+  createWorkerAuthoritativeProjectBoundaryInvocationAuthority,
   type ProjectBoundaryInvocationProducer,
 } from "./project-boundary/project-boundary-invocation-producer.js";
+import {
+  createProjectBoundaryRuntime,
+  type ProjectBoundaryRuntime,
+} from "./project-boundary/project-boundary-runtime.js";
 import { createProjectLoopWorkerAuthorityTransport } from
   "./project-loop/worker-authority-adapter.js";
 
@@ -174,6 +178,7 @@ interface AuthoritativeServerTestOptions {
     | "attachment-processing"
     | "memory"
     | "route"
+    | "project-boundary"
     | "runtime"
     | "ball"
     | "snapshots"
@@ -274,6 +279,7 @@ async function start(
   let runtime: AgentRuntimeService | undefined;
   let kickDirectIntentConsumer: () => void = () => undefined;
   let stopRuntimeRecovery: (() => void) | undefined;
+  let projectBoundaryRuntime: ProjectBoundaryRuntime | undefined;
   let sourceScopedRuntimeBoundary: SourceScopedRuntimeBoundary | undefined;
   let routeRuntime: RouteRuntimeService | undefined;
   let ballRuntime: BallRuntimeService | undefined;
@@ -568,22 +574,81 @@ async function start(
       queryStore: authority,
     });
     const primitives = createAuthoritativeCollaborationPrimitives({ commandStore });
-    const projectBoundary = createFailClosedProjectBoundaryInvocationProducer({
-      authority: createWorkerProjectBoundaryInvocationAuthority(
-        worker as CompleteWorkerDatabaseClient,
-      ),
-    });
-    await testOptions.initialize?.({
-      auth, lifecycle, messages: service, primitives, projectBoundary,
-    });
     const runtimeConfiguration = options.agentRuntime ?? {};
     const authorityWorker = worker as CompleteWorkerDatabaseClient;
-    const projectLoopAuthority = createProjectLoopWorkerAuthorityTransport(authorityWorker);
     const memoryAuthority = createWorkerMemoryAuthority({ worker, nowMs: Date.now });
     const provider = testOptions.agentRuntimeProviderForTest ?? createOpenAIResponsesProvider({
       endpoint: runtimeConfiguration.endpoint ?? "https://api.openai.com/v1/responses",
       model: runtimeModel,
       secretProvider,
+    });
+    projectBoundaryRuntime = createProjectBoundaryRuntime({
+      authority: authorityWorker,
+      provider,
+    });
+    const authoritativeProjectBoundary = createAuthoritativeProjectBoundaryInvocationProducer({
+      authority: createWorkerAuthoritativeProjectBoundaryInvocationAuthority(authorityWorker, {
+        providerId: provider.id,
+        modelId: runtimeModel,
+      }),
+    });
+    const projectBoundary: ProjectBoundaryInvocationProducer = Object.freeze({
+      async consume(request: Parameters<ProjectBoundaryInvocationProducer["consume"]>[0]) {
+        const result = await authoritativeProjectBoundary.consume(request);
+        if (result.status === "intent-created" &&
+            (testOptions.agentRuntimeProviderForTest !== undefined ||
+              secretProvider.getSecret("OPENAI_API_KEY") !== undefined)) {
+          await projectBoundaryRuntime?.scan();
+        }
+        return result;
+      },
+    });
+    await testOptions.initialize?.({
+      auth, lifecycle, messages: service, primitives, projectBoundary,
+    });
+    let projectBoundaryScan: Promise<void> | undefined;
+    const scanProjectBoundaries = (): Promise<void> => {
+      projectBoundaryScan ??= (async () => {
+        const now = Date.now();
+        const agentScan = await authorityWorker.executeRuntime({
+          type: "runtime.scan-project-agent-boundaries",
+          providerId: provider.id,
+          modelId: runtimeModel,
+          limit: 256,
+          now,
+        });
+        if (typeof agentScan !== "object" || agentScan === null ||
+            !("kind" in agentScan) || agentScan.kind !== "project-agent-boundary-scan") {
+          throw new Error("Project Agent boundary scan result was malformed");
+        }
+        const reminderScan = await authorityWorker.executeRuntime({
+          type: "runtime.scan-project-reminders",
+          providerId: provider.id,
+          modelId: runtimeModel,
+          limit: 256,
+          now,
+        });
+        if (typeof reminderScan !== "object" || reminderScan === null ||
+            !("kind" in reminderScan) || reminderScan.kind !== "project-reminder-scan") {
+          throw new Error("Project reminder scan result was malformed");
+        }
+        if (testOptions.agentRuntimeProviderForTest !== undefined ||
+            secretProvider.getSecret("OPENAI_API_KEY") !== undefined) {
+          await projectBoundaryRuntime?.scan();
+        }
+      })().finally(() => { projectBoundaryScan = undefined; });
+      return projectBoundaryScan;
+    };
+    const baseProjectLoopAuthority = createProjectLoopWorkerAuthorityTransport(authorityWorker);
+    const projectLoopAuthority = Object.freeze({
+      executeQuery: baseProjectLoopAuthority.executeQuery,
+      async executeMutation(
+        ...args: Parameters<typeof baseProjectLoopAuthority.executeMutation>
+      ) {
+        const result = await baseProjectLoopAuthority.executeMutation(...args);
+        void scanProjectBoundaries().catch(() => undefined);
+        return result;
+      },
     });
     const sandboxRoot = resolve(
       runtimeConfiguration.sandboxRoot ?? resolve(dirname(options.databasePath), "agent-sandbox"),
@@ -912,10 +977,12 @@ async function start(
     await runtime.recover();
     await afterCommittedProducerCommand();
     kickDirectIntentConsumer();
+    await scanProjectBoundaries();
     const runtimeRecoveryTimer = setInterval(() => {
       void runtime?.recover().catch(() => undefined);
       void afterCommittedProducerCommand();
       kickDirectIntentConsumer();
+      void scanProjectBoundaries().catch(() => undefined);
     }, 1_000);
     runtimeRecoveryTimer.unref();
     stopRuntimeRecovery = () => clearInterval(runtimeRecoveryTimer);
@@ -1018,6 +1085,7 @@ async function start(
     await attachmentProcessing?.close().catch(() => undefined);
     await routeRuntime?.close().catch(() => undefined);
     await ballRuntime?.close().catch(() => undefined);
+    await projectBoundaryRuntime?.close().catch(() => undefined);
     await runtime?.close().catch(() => undefined);
     await snapshots?.close().catch(() => undefined);
     await worker?.close().catch(() => undefined);
@@ -1040,6 +1108,7 @@ async function start(
           ["attachment-processing", async () => attachmentProcessing?.close()],
           ["memory", async () => memoryRuntime?.stop()],
           ["route", () => routeRuntime!.close()],
+          ["project-boundary", () => projectBoundaryRuntime!.close()],
           ["runtime", () => runtime!.close()],
           ["ball", () => ballRuntime!.close()],
           ["snapshots", () => snapshots.close()],

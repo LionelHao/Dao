@@ -697,6 +697,9 @@ function createPreviewSentinelProvider(
   databasePath: string,
 ): ProviderAdapter {
   const verifyCommittedRecall = (input: AgentRuntimeProviderInput): void => {
+    if (!("sourceMessageId" in input.invocation)) {
+      throw new Error("Preview sentinel does not accept Project boundary invocations");
+    }
     const database = new DatabaseSync(databasePath, { readOnly: true });
     try {
       const execution = database.prepare(
@@ -718,6 +721,9 @@ function createPreviewSentinelProvider(
       input: AgentRuntimeProviderInput,
       signal: AbortSignal,
     ): AsyncIterable<ProviderEvent> {
+      if (!("sourceMessageId" in input.invocation)) {
+        throw new Error("Preview sentinel does not accept Project boundary invocations");
+      }
       if (input.invocation.sourceMessageId.includes("completed")) {
         yield { type: "response_started", sequence: 1 };
         yield { type: "agent_final", sequence: 2, body: "durable completed final", citations: [] };

@@ -16,7 +16,8 @@ export type PersistedProjectBoundary = Readonly<{
   roomId: string;
   projectId: string;
   boundaryKind: "checkpoint" | "due" | "blocker" | "agent_ball" | "review";
-  sourceKind: "goal" | "decision" | "request" | "next_action" | "blocker" | "open_question";
+  sourceKind: "goal" | "decision" | "request" | "next_action" | "blocker" | "open_question" |
+    "confirmation";
   sourceId: string;
   sourceRevision: number;
   holder: ProjectActorRef;
@@ -159,7 +160,8 @@ export function isPersistedProjectBoundary(value: unknown): value is PersistedPr
       value.boundaryKind === "review") &&
     (value.sourceKind === "goal" || value.sourceKind === "decision" || value.sourceKind === "request" ||
       value.sourceKind === "next_action" || value.sourceKind === "blocker" ||
-      value.sourceKind === "open_question") && identifier(value.sourceId) && positive(value.sourceRevision) &&
+      value.sourceKind === "open_question" || value.sourceKind === "confirmation") &&
+    identifier(value.sourceId) && positive(value.sourceRevision) &&
     actor(value.holder) && nonnegative(value.lifecycleGeneration) &&
     (value.status === "active" || value.status === "suspended" || value.status === "revoked" ||
       value.status === "consumed" || value.status === "stale" || value.status === "resolved" ||

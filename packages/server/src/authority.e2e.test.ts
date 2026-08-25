@@ -1417,7 +1417,7 @@ function attachmentE2ePdf(): Buffer {
 }
 
 describe("authoritative server real-process harness", () => {
-  it("production-composes the FT-09-unavailable project-boundary seam as durable suppression", async () => {
+  it("production-composes FT-09 project-boundary authority and rejects an ineligible boundary durably", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-ft08-project-boundary-"));
     const databasePath = join(directory, "authority.sqlite");
     let server: AuthoritativeServer | undefined;
@@ -1449,7 +1449,7 @@ describe("authoritative server real-process harness", () => {
             idempotencyKey: "ft08-project-boundary-room",
           };
           const room = await facades.lifecycle.createRoom(context, {
-            name: "FT-08 project boundary fail closed",
+            name: "FT-09 project boundary authority",
           });
           await facades.lifecycle.configureAgent({
             ...context,
@@ -1481,7 +1481,7 @@ describe("authoritative server real-process harness", () => {
       expect(result).toMatchObject({
         boundaryId: "ft08-boundary-unavailable",
         status: "suppressed",
-        reason: "dependency_unavailable",
+        reason: "boundary_ineligible",
       });
       const database = new DatabaseSync(databasePath, { readOnly: true });
       try {
@@ -1489,7 +1489,7 @@ describe("authoritative server real-process harness", () => {
           `SELECT
              (SELECT COUNT(*) FROM project_boundary_invocation_receipts
               WHERE boundary_id = 'ft08-boundary-unavailable'
-                AND status = 'dependency_unavailable') AS receipts,
+                AND status = 'suppressed') AS receipts,
              (SELECT COUNT(*) FROM agent_executions) AS executions,
              (SELECT COUNT(*) FROM events
               WHERE event_type = 'project.boundary.invocation.decided') AS events`,

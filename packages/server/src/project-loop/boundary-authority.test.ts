@@ -32,6 +32,10 @@ function fixture(holderKind: "human" | "agent" = "human") {
       dispatched_at TEXT,
       UNIQUE(room_id,boundary_id,reminder_kind,reminder_ordinal,recipient_actor_id)
     );
+    CREATE TABLE project_boundary_agent_invocation_intents (
+      intent_id TEXT PRIMARY KEY, boundary_id TEXT, source_revision INTEGER,
+      lifecycle_generation INTEGER, target_agent_actor_id TEXT
+    );
     CREATE TABLE project_room_states (room_id TEXT PRIMARY KEY, revision INTEGER);
     CREATE TABLE project_archive_suspensions (
       room_id TEXT, project_id TEXT, archive_generation INTEGER,
@@ -77,7 +81,7 @@ describe("FT-09 database reminder authority", () => {
       await expect(scanCurrentProjectReminderBuckets({ authority, now, limit: 10 }))
         .resolves.toMatchObject({ scannedCount: 1, claimedCount: 1 });
       await expect(scanCurrentProjectReminderBuckets({ authority, now, limit: 10 }))
-        .resolves.toMatchObject({ claimedCount: 0, duplicateCount: 1 });
+        .resolves.toMatchObject({ scannedCount: 0, claimedCount: 0, duplicateCount: 0 });
       expect(database.prepare(
         `SELECT event.event_type AS type, delivery.target_kind AS targetKind,
                 delivery.target_id AS targetId
@@ -121,7 +125,7 @@ describe("FT-09 database reminder authority", () => {
       await expect(scanCurrentProjectReminderBuckets({ authority, now, limit: 10 }))
         .resolves.toMatchObject({ claimedCount: 1, duplicateCount: 0 });
       await expect(scanCurrentProjectReminderBuckets({ authority, now, limit: 10 }))
-        .resolves.toMatchObject({ claimedCount: 0, duplicateCount: 1 });
+        .resolves.toMatchObject({ scannedCount: 0, claimedCount: 0, duplicateCount: 0 });
       expect(writeIntent).toHaveBeenCalledTimes(1);
       expect(database.prepare("SELECT COUNT(*) AS count FROM ft08_intents").get())
         .toEqual({ count: 1 });

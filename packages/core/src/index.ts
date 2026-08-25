@@ -515,6 +515,7 @@ export type {
   ProviderNeutralCheckpoint,
   ProjectBoundaryInvocationRequest,
   ProjectBoundaryInvocationResult,
+  ProjectBoundaryProviderInvocation,
   RouterProviderInput,
   RouterCandidate,
   RouterPlan,
