@@ -99,9 +99,9 @@ describe("real AuthorityWorker runtime authority", () => {
           ('room-runtime', 'human-runtime', 'human', 'member', NULL, '[]',
            '2026-08-17T00:00:00.000Z', NULL, 0),
           ('room-runtime', 'agent-runtime', 'agent', NULL, 'active', '["sandbox-file.write"]',
-           NULL, '2026-08-17T00:00:00.000Z', 0),
+           NULL, '2026-08-17T00:00:00.000Z', 1),
           ('room-runtime', 'agent-git', 'agent', NULL, 'active', '["repository.git-status"]',
-           NULL, '2026-08-17T00:00:00.000Z', 0);
+           NULL, '2026-08-17T00:00:00.000Z', 1);
         UPDATE rooms SET owner_actor_id = 'human-runtime', governance_revision = 1
         WHERE id = 'room-runtime';
         UPDATE agent_profiles

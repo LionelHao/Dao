@@ -258,7 +258,23 @@ describe("bounded Agent runtime scheduler", () => {
     };
     runtimeAuthority.retry = vi.fn(async () => {
       runtimeAuthority.executions.set(childExecution.id, childExecution);
-      return { execution: childExecution, intent: childIntent, replayed: false };
+      return {
+        execution: childExecution,
+        intent: childIntent,
+        replayed: false,
+        retryReceipt: {
+          requestId: context.requestId,
+          sourceExecutionId: "terminal-parent",
+          executionId: childExecution.id,
+          intentId: "intent-durable-retry",
+          lineageId: "lineage-durable-retry",
+          roomId: childExecution.roomId,
+          executionOrdinal: 2,
+          snapshotId: "snapshot-durable-retry",
+          status: "accepted",
+          createdAt: childExecution.queuedAt,
+        },
+      };
     });
     const runtime = createAgentRuntimeService({
       authority: runtimeAuthority,
