@@ -1,7 +1,7 @@
 # FT-08 Stage 10 工作笔记
 
 > 日期：2026-08-25（Asia/Shanghai）  
-> 状态：实现与本地验证完成，待独立审查/PR/CI；仅记录可复核事实
+> 状态：实现、本地验证与独立审查完成，待 PR/CI；仅记录可复核事实
 
 ## 起始基线
 
@@ -42,9 +42,11 @@
 
 - `corepack pnpm install --frozen-lockfile`：lockfile无变化，212 packages全部本地复用，pnpm 10.14.0。
 - Stage 9独占基线复跑：197 passed / 3 skipped / 0 failed test files（200）；2170 passed / 3 skipped / 0 failed tests（2173），266.94s。计数与Stage 9交付证据完全一致；三个skip仍是opt-in Agent/Router/Memory OpenAI live suites。
-- v22实现后最终本地全量：203 passed / 0 failed test files；2199 passed / 3 skipped / 0 failed tests。分包为Core 9 files / 99 passed，Desktop 61 files / 480 passed，Server 133 files / 1620 passed / 3 skipped。JSON证据由Vitest最终报告生成；三个skip仍为显式opt-in live suites，本机无`OPENAI_API_KEY`，未伪造live通过。
+- v22最终候选本地全量：205 passed / 3 skipped / 0 failed test files（208）；2281 passed / 3 skipped / 0 failed tests（2284），295.33s。分包为Core 9 files / 99 passed，Desktop 66 files / 507 passed，Server 130 files / 1675 passed / 3 skipped。三个skip仍为显式opt-in Agent/Router/Memory OpenAI live suites，本机无`OPENAI_API_KEY`，未伪造live通过。
 - `pnpm typecheck`、`pnpm lint`、`pnpm build`、Core boundary、Desktop renderer boundary全部通过。
 - Desktop Electron smoke通过：app bridge、native selection、secure preview均加载。
+- WebSocket 135项、真实进程preview sentinel路径连续3轮通过；Worker runtime authority 4项连续3轮通过，未观察到flake。
+- 两名独立只读reviewer复核最终候选`8414513`，覆盖scoped cancellation、preview/reset与subscription generation、队列/在途字节边界、manual retry frozen context及ACK前durable receipt重读，结论均为无剩余P0/P1。
 
 ## 实现收口事实
 
