@@ -13,6 +13,8 @@ import type {
   TenantAdministratorRegistry,
 } from "./authority-service.js";
 import { TenantAdministrationError } from "./authority-service.js";
+import { commitInternalScopedProducerInTransaction } from
+  "../agent-runtime/internal-scoped-producer-authority.js";
 
 export interface SqliteTenantAdministrationRepositoryOptions {
   readonly database: DatabaseSync;
@@ -602,6 +604,10 @@ export function createSqliteTenantAdministrationRepository(
               }
               const targets: AssignmentFanoutTarget[] = [];
               let invalidatedContextCount = 0;
+              const profileDisabled = previous.status === "enabled" && profile.status === "disabled";
+              const ceilingReduced = previous.capabilityCeiling.some((capability) =>
+                !profile.capabilityCeiling.includes(capability)) || previous.toolCeiling.some((tool) =>
+                !profile.toolCeiling.includes(tool));
               for (const row of rows) {
                 if (!nonEmpty(row.assignmentId) || !nonEmpty(row.roomId) ||
                     row.profileId !== profile.profileId || row.actorId !== profile.actorId ||
@@ -617,6 +623,20 @@ export function createSqliteTenantAdministrationRepository(
                       : row.membershipToolsJson !== null) ||
                     !nonNegativeInteger(row.runningExecutionCount)) {
                   throw new Error("Profile Assignment fan-out authority is corrupt");
+                }
+                if (profileDisabled || ceilingReduced) {
+                  commitInternalScopedProducerInTransaction(database, {
+                    producerId: "agent-profile-authority",
+                    requestId: `profile-runtime:${profile.profileId}:${String(profile.revision)}`,
+                    capability: "profile_authority",
+                    actorId: currentSession.principal.actorId,
+                    roomId: row.roomId,
+                    scope: { kind: "agent_authority", agentId: profile.actorId,
+                      authority: profileDisabled ? "profile" : "capability",
+                      authorityRevision: profile.revision },
+                    reason: profileDisabled ? "profile_disabled" : "capability_revoked",
+                    occurredAt: profile.updatedAt,
+                  });
                 }
                 const capabilitySubset = intersect(
                   parseCanonicalSet(row.capabilitySubsetJson), profile.capabilityCeiling,

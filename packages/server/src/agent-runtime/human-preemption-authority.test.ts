@@ -13,10 +13,13 @@ import {
   executeRuntimeAuthorityOperation,
   recallHumanMessageDatabaseCommand,
   submitHumanMessageDatabaseCommand,
+  runAuthorityImmediateTransaction,
 } from "../persistence/authority-database-handler.js";
 import { migrateAuthorityDatabase } from "../persistence/schema.js";
 import { createWorkerDatabaseClient } from "../persistence/worker-database-client.js";
 import type { RuntimeRecoveryRecord } from "./contracts.js";
+import { commitInternalScopedProducerInTransaction } from
+  "./internal-scoped-producer-authority.js";
 
 const directories: string[] = [];
 const accessToken = Buffer.alloc(32, 11).toString("base64url");
@@ -461,6 +464,93 @@ describe("real SQLite human-preemption authority", () => {
     });
     expect(terminalReset).toMatchObject({ kind: "preview-authority", authorized: true });
   });
+  it.each([
+    ["message", "message_recalled", "message_authority"],
+    ["room", "room_archived", "room_authority"],
+    ["membership", "membership_revoked", "membership_authority"],
+    ["assignment", "assignment_revoked", "assignment_authority"],
+    ["profile", "profile_disabled", "profile_authority"],
+    ["capability", "capability_revoked", "assignment_authority"],
+  ] as const)(
+    "commits the %s producer as one canonical scoped SQLite transaction",
+    (authorityKind, reason, capability) => {
+      const database = fixture();
+      const sourceMessageId = sendAgentSource(database, 1);
+      invoke(database, sourceMessageId, `execution-producer-${authorityKind}`, "agent-1");
+      const scope = authorityKind === "message"
+        ? { kind: "source_message" as const, sourceMessageId, sourceRevision: 1 }
+        : authorityKind === "room"
+          ? { kind: "room" as const, roomId: "room-1", archiveGeneration: 1 }
+          : { kind: "agent_authority" as const, agentId: "agent-1",
+              authority: authorityKind, authorityRevision: 2 };
+
+      const committed = runAuthorityImmediateTransaction(database, () =>
+        commitInternalScopedProducerInTransaction(database, {
+          producerId: `${authorityKind}-producer`,
+          requestId: `${authorityKind}-request`,
+          capability,
+          actorId: authorityKind === "message" || authorityKind === "room"
+            ? "human-1" : "agent-1",
+          roomId: "room-1",
+          scope,
+          reason,
+          occurredAt: new Date(t0 + 50_000).toISOString(),
+        }));
+
+      expect(committed.receipts).toHaveLength(1);
+      expect(committed.effects).toEqual([expect.objectContaining({
+        executionId: `execution-producer-${authorityKind}`,
+        disposition: "execution_cancelled",
+        confirmationDisposition: "none",
+        grantDisposition: "none",
+        sideEffectState: "none",
+      })]);
+      expect(database.prepare(
+        `SELECT fence.scope_kind AS scopeKind, fence.reason, fence.internal_capability AS capability,
+                target.execution_version_after AS versionAfter
+         FROM invocation_scoped_cancellation_fences AS fence
+         JOIN invocation_scoped_cancellation_targets AS target ON target.fence_id = fence.fence_id`,
+      ).get()).toEqual({ scopeKind: "execution", reason, capability, versionAfter: 2 });
+      const stored = database.prepare(
+        "SELECT response_json AS responseJson FROM invocation_cancellation_receipts",
+      ).get();
+      expect(typeof stored?.responseJson).toBe("string");
+      expect(JSON.parse(stored!.responseJson as string)).toMatchObject({
+        kind: "scoped-cancellation-committed",
+        reason,
+        receipt: { scope, reason, executionOutcomes: [{
+          executionId: `execution-producer-${authorityKind}`,
+          outcome: "cancelled", version: 2,
+        }] },
+      });
+      expect(database.prepare(
+        `SELECT event.event_type AS eventType, delivery.status
+         FROM events AS event JOIN outbox_deliveries AS delivery ON delivery.event_id = event.event_id
+         WHERE event.event_type = 'agent.invocation.scoped-cancellation.committed'`,
+      ).get()).toEqual({
+        eventType: "agent.invocation.scoped-cancellation.committed", status: "pending",
+      });
+
+      // A racing/replayed producer observes the terminal CAS and performs zero
+      // Adapter or authority writes; the canonical committed evidence remains singular.
+      const replay = runAuthorityImmediateTransaction(database, () =>
+        commitInternalScopedProducerInTransaction(database, {
+          producerId: `${authorityKind}-producer`, requestId: `${authorityKind}-request`,
+          capability, actorId: "agent-1", roomId: "room-1", scope, reason,
+          occurredAt: new Date(t0 + 50_001).toISOString(),
+        }));
+      expect(replay).toEqual({ receipts: [], effects: [] });
+      expect(database.prepare(
+        `SELECT (SELECT COUNT(*) FROM invocation_cancellation_receipts) AS receipts,
+                (SELECT COUNT(*) FROM events
+                 WHERE event_type = 'agent.invocation.scoped-cancellation.committed') AS events,
+                (SELECT COUNT(*) FROM outbox_deliveries AS delivery
+                 JOIN events AS event ON event.event_id = delivery.event_id
+                 WHERE event.event_type = 'agent.invocation.scoped-cancellation.committed') AS outbox`,
+      ).get()).toEqual({ receipts: 1, events: 1, outbox: 1 });
+    },
+  );
+
   it("drains 257/513/1025 durable recovery candidates by stable 256-row keysets", () => {
     const database = fixture();
     const sourceMessageId = "message-recovery-source";

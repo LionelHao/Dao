@@ -130,6 +130,13 @@ import {
   "../message-authority/sqlite-operational-message-projection.js";
 import { canStartRuntimeGenerationInTransaction } from "../agent-runtime/runtime-archive-fence-participant.js";
 import {
+  commitInternalScopedProducerInTransaction,
+  finalizeInternalScopedProducerInTransaction,
+  type InternalScopedProducerInput,
+  type InternalScopedProducerResult,
+} from
+  "../agent-runtime/internal-scoped-producer-authority.js";
+import {
   FrozenRuntimeAuthorityError,
   requireFrozenRuntimeAuthority,
   type FrozenRuntimeAuthorityHandoff,
@@ -2888,13 +2895,35 @@ function executeAgentConfigure(
   }
   const existing = database
     .prepare(
-      `SELECT access_revision AS accessRevision
+      `SELECT access_revision AS accessRevision, participation,
+              tool_permissions_json AS toolPermissionsJson
        FROM room_memberships WHERE room_id = ? AND actor_id = ?`,
     )
     .get(command.roomId, command.payload.agentId);
   const accessRevision = typeof existing?.accessRevision === "number"
     ? existing.accessRevision + 1
     : 1;
+  if (typeof existing?.accessRevision === "number" &&
+      typeof existing.toolPermissionsJson === "string") {
+    const priorTools: unknown = JSON.parse(existing.toolPermissionsJson);
+    const reducesTools = Array.isArray(priorTools) && priorTools.some((tool) =>
+      typeof tool === "string" && !command.payload.toolPermissions.includes(tool));
+    const reducesParticipation = existing.participation === "active" &&
+      command.payload.participation === "on-mention";
+    if (reducesTools || reducesParticipation) {
+      commitInternalScopedProducerInTransaction(database, {
+        producerId: "membership-capability-authority",
+        requestId: stableId("agent-capability-reduction", scope, key),
+        capability: "membership_authority",
+        actorId,
+        roomId: command.roomId,
+        scope: { kind: "agent_authority", agentId: command.payload.agentId,
+          authority: "capability", authorityRevision: accessRevision },
+        reason: "capability_revoked",
+        occurredAt: acceptedAt,
+      });
+    }
+  }
   database
     .prepare(
       `INSERT INTO room_memberships (
@@ -3653,6 +3682,32 @@ function executeClosedLifecycle(
           expectedGovernanceRevision: command.payload.expectedGovernanceRevision,
           occurredAt: acceptedAt,
         };
+        let roomScopedInput: InternalScopedProducerInput | undefined;
+        let roomScopedPrepared: InternalScopedProducerResult | undefined;
+        if (command.type === "room.archive") {
+          const room = database.prepare(
+            "SELECT status, archive_generation AS archiveGeneration FROM rooms WHERE id = ?",
+          ).get(command.roomId);
+          if ((room?.status !== "active" && room?.status !== "archived") ||
+              typeof room.archiveGeneration !== "number") {
+            return fail("storage_unavailable", "Room archive runtime authority was corrupt");
+          }
+          if (room.status === "active") {
+            roomScopedInput = {
+              producerId: "room-authority",
+              requestId: stableId("room-archive-runtime", scope, key),
+              capability: "room_authority",
+              actorId,
+              roomId: command.roomId,
+              scope: { kind: "room", roomId: command.roomId,
+                archiveGeneration: room.archiveGeneration + 1 },
+              reason: "room_archived",
+              occurredAt: acceptedAt,
+              deferExecutionTerminalization: true,
+            };
+            roomScopedPrepared = commitInternalScopedProducerInTransaction(database, roomScopedInput);
+          }
+        }
         const result = command.type === "room.archive"
           ? coordinateArchiveInTransaction(transaction, coordinatorInput, composition)
           : coordinateReopenInTransaction(transaction, coordinatorInput, composition);
@@ -3663,6 +3718,13 @@ function executeClosedLifecycle(
             acceptedAt,
             result: { governance: result.governance } as unknown as JsonValue,
           };
+        }
+        if (roomScopedInput !== undefined && roomScopedPrepared?.deferredExecutions !== undefined) {
+          finalizeInternalScopedProducerInTransaction(
+            database,
+            roomScopedInput,
+            roomScopedPrepared.deferredExecutions,
+          );
         }
 
         const auditType = command.type === "room.archive" ? "room.archived" : "room.reopened";
@@ -10502,6 +10564,18 @@ export function recallHumanMessageDatabaseCommand(
             authority.currentRevision !== input.command.expectedRevision) {
           return fail("message_version_conflict", "Message recall compare-and-set failed");
         }
+        const scopedRuntime = commitInternalScopedProducerInTransaction(database, {
+          producerId: "message-authority",
+          requestId: stableId("message-recall-runtime", input.command.messageId,
+            String(input.command.expectedRevision)),
+          capability: "message_authority",
+          actorId,
+          roomId: input.command.roomId,
+          scope: { kind: "source_message", sourceMessageId: input.command.messageId,
+            sourceRevision: input.command.expectedRevision },
+          reason: "message_recalled",
+          occurredAt: recalledAt,
+        });
         database.prepare(
           `UPDATE human_request_intents
            SET status = 'cancelled', cancelled_at = ?, cancellation_reason = 'message_recalled'
@@ -10593,45 +10667,10 @@ export function recallHumanMessageDatabaseCommand(
             execution.executionId,
             recalledAt,
           );
-          if (execution.status === "queued" || execution.status === "running") {
-            const dispatch = database.prepare(
-              `SELECT state FROM tool_dispatches
-               WHERE execution_id = ? AND attempt_seq = ?
-               ORDER BY rowid DESC LIMIT 1`,
-            ).get(execution.executionId, execution.attemptSeq);
-            const sideEffectState = dispatch?.state === "outcome_unknown"
-              ? "outcome-unknown-retained" as const
-              : dispatch?.state === "dispatched" || dispatch?.state === "succeeded"
-                ? "dispatched-retained" as const
-                : "none" as const;
-            const cancelled = database.prepare(
-              `UPDATE agent_executions
-               SET status = 'cancelled', cancellation_reason = 'message_recalled',
-                   completed_at = ?, updated_at = ?, next_retry_at = NULL
-               WHERE id = ? AND current_attempt_seq = ? AND status IN ('queued', 'running')`,
-            ).run(
-              recalledAt,
-              recalledAt,
-              execution.executionId,
-              execution.attemptSeq,
-            );
-            if (cancelled.changes !== 1) {
-              return fail("execution_conflict", "Message recall execution cancellation was stale");
-            }
-            database.prepare(
-              `UPDATE agent_execution_attempts
-               SET status = 'cancelled', finished_at = ?, error_code = 'message_recalled',
-                   next_retry_at = NULL
-               WHERE execution_id = ? AND attempt_seq = ? AND status IN ('queued', 'running')`,
-            ).run(recalledAt, execution.executionId, execution.attemptSeq);
-            const cancelledExecution = runtimeExecutionById(database, execution.executionId);
-            appendRuntimeExecutionEvent(
-              database,
-              cancelledExecution,
-              recalledAt,
-              "cancelled",
-              "message_recalled",
-            );
+          const scopedEffect = scopedRuntime.effects.find((effect) =>
+            effect.executionId === execution.executionId &&
+            effect.attemptSeq === execution.attemptSeq);
+          if (scopedEffect?.executionId !== undefined && scopedEffect.attemptSeq !== undefined) {
             abortTargets.push({
               sourceMessageId: input.command.messageId,
               sourceRevision: input.command.expectedRevision,
@@ -10639,7 +10678,7 @@ export function recallHumanMessageDatabaseCommand(
               executionId: execution.executionId,
               attemptSeq: execution.attemptSeq,
               cancellationReason: "message_recalled",
-              sideEffectState,
+              sideEffectState: scopedEffect.sideEffectState,
             });
           }
         }
