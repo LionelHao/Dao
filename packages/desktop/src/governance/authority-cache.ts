@@ -1,11 +1,15 @@
 import { createHash } from "node:crypto";
-import type {
-  RoomCursor,
-  RoomRepairRecord,
-  RoomSummary,
+import {
+  isRoomCursor,
+  isRoomRepairPage,
+  type RoomCursor,
+  type RoomRepairRecord,
+  type RoomSummary,
 } from "@native-im/core";
+import { isProjectEvent } from "@native-im/core";
 import type { ClientAuthorityCache, DesktopRoomEvent } from "../sync/client-sync-replica.js";
 import type { GovernanceProjection } from "../renderer/governance/view-model.js";
+import type { AuthorityCachePersistence } from "./encrypted-authority-cache.js";
 
 interface CatalogStage { readonly snapshotId: string; readonly rooms: RoomSummary[] }
 interface RoomStage { readonly snapshotId: string; readonly records: RoomRepairRecord[] }
@@ -67,6 +71,7 @@ function recordIdentity(record: RoomRepairRecord): string {
     case "memory": return record.value.recordType === "status"
       ? "memory\0status"
       : `memory\0projection\0${record.value.projection.memoryRecordId}`;
+    case "project-loop": return `project-loop\0${record.roomId}`;
   }
 }
 
@@ -78,6 +83,12 @@ function replaceRecord(records: RoomRepairRecord[], next: RoomRepairRecord): voi
 }
 
 function applyProjectionEvent(records: RoomRepairRecord[], event: DesktopRoomEvent): void {
+  if (isProjectEvent(event)) {
+    const index = records.findIndex((record) => record.kind === "project-loop" &&
+      record.roomId === event.roomId);
+    if (index !== -1) records.splice(index, 1);
+    return;
+  }
   switch (event.type) {
     case "room.archived":
     case "room.reopened": {
@@ -178,15 +189,20 @@ export interface DesktopAuthorityCache extends ClientAuthorityCache {
     records: readonly RoomRepairRecord[] | undefined,
   ) => void): () => void;
   clearRoom(roomId: string): void;
+  waitForPersistence(): Promise<void>;
+  restore(actorId: string): Promise<boolean>;
 }
 
 export function createDesktopAuthorityCache(
   now: () => string = () => new Date().toISOString(),
+  persistence?: AuthorityCachePersistence,
 ): DesktopAuthorityCache {
   let catalogStage: CatalogStage | undefined;
   let catalog: RoomSummary[] = [];
   const roomStages = new Map<string, RoomStage>();
   const rooms = new Map<string, LiveRoom>();
+  let activeActorId: string | undefined;
+  let persistenceWork = Promise.resolve();
   const roomListeners = new Set<(
     roomId: string,
     records: readonly RoomRepairRecord[] | undefined,
@@ -197,6 +213,21 @@ export function createDesktopAuthorityCache(
       try { listener(roomId, records === undefined ? undefined : structuredClone(records)); }
       catch { /* A projection observer cannot alter authoritative cache state. */ }
     }
+  };
+  const schedulePersistence = (operation: () => Promise<void>): void => {
+    persistenceWork = persistenceWork.catch(() => undefined).then(operation);
+    void persistenceWork.catch(() => undefined);
+  };
+  const persist = (): void => {
+    if (persistence === undefined || activeActorId === undefined) return;
+    const value = {
+      version: 1,
+      actorId: activeActorId,
+      rooms: [...rooms].map(([roomId, room]) => ({ roomId, records: structuredClone(room.records),
+        cursor: structuredClone(room.cursor), updatedAt: room.updatedAt,
+        checksum: authoritySnapshotChecksum("room", room.records) })),
+    };
+    schedulePersistence(() => persistence.save(value));
   };
 
   return {
@@ -251,6 +282,7 @@ export function createDesktopAuthorityCache(
       });
       roomStages.delete(roomId);
       publishRoom(roomId);
+      persist();
     },
     applyRoomEvents(roomId, events, cursor) {
       const room = rooms.get(roomId);
@@ -259,6 +291,7 @@ export function createDesktopAuthorityCache(
       room.cursor = structuredClone(cursor);
       room.updatedAt = now();
       publishRoom(roomId);
+      persist();
     },
     discardSnapshot(snapshotId) {
       if (catalogStage?.snapshotId === snapshotId) catalogStage = undefined;
@@ -273,6 +306,8 @@ export function createDesktopAuthorityCache(
       roomStages.clear();
       rooms.clear();
       for (const roomId of roomIds) publishRoom(roomId);
+      activeActorId = undefined;
+      if (persistence !== undefined) schedulePersistence(() => persistence.clear());
     },
     clearRoom(roomId) {
       if (catalogStage !== undefined) {
@@ -285,7 +320,9 @@ export function createDesktopAuthorityCache(
       roomStages.delete(roomId);
       rooms.delete(roomId);
       publishRoom(roomId);
+      persist();
     },
+    waitForPersistence() { return persistenceWork; },
     governanceProjection(roomId) {
       const records = rooms.get(roomId)?.records;
       if (records === undefined) return undefined;
@@ -336,6 +373,57 @@ export function createDesktopAuthorityCache(
     subscribeRoomRecords(listener) {
       roomListeners.add(listener);
       return () => roomListeners.delete(listener);
+    },
+    async restore(actorId) {
+      if (activeActorId === actorId) return rooms.size > 0;
+      if (activeActorId !== undefined && activeActorId !== actorId) {
+        const priorRoomIds = [...rooms.keys()];
+        rooms.clear();
+        for (const roomId of priorRoomIds) publishRoom(roomId);
+      }
+      if (persistence === undefined) { activeActorId = actorId; return false; }
+      await persistenceWork;
+      const value = await persistence.load();
+      if (typeof value !== "object" || value === null || Array.isArray(value) ||
+          Reflect.ownKeys(value).length !== 3 ||
+          (value as { version?: unknown }).version !== 1 ||
+          (value as { actorId?: unknown }).actorId !== actorId ||
+          !Array.isArray((value as { rooms?: unknown }).rooms) ||
+          (value as { rooms: unknown[] }).rooms.length > 512) {
+        await persistence.clear().catch(() => undefined);
+        activeActorId = actorId;
+        return false;
+      }
+      const restored = new Map<string, LiveRoom>();
+      for (const candidate of (value as { rooms: unknown[] }).rooms) {
+        if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate) ||
+            Reflect.ownKeys(candidate).length !== 5) {
+          await persistence.clear().catch(() => undefined); activeActorId = actorId; return false;
+        }
+        const item = candidate as { roomId?: unknown; records?: unknown; cursor?: unknown;
+          updatedAt?: unknown; checksum?: unknown };
+        if (typeof item.roomId !== "string" || item.roomId.length === 0 ||
+            !Array.isArray(item.records) || typeof item.checksum !== "string" ||
+            authoritySnapshotChecksum("room", item.records) !== item.checksum ||
+            !isRoomCursor(item.cursor) || item.cursor.roomId !== item.roomId ||
+            typeof item.updatedAt !== "string" || !Number.isFinite(Date.parse(item.updatedAt)) ||
+            new Date(Date.parse(item.updatedAt)).toISOString() !== item.updatedAt ||
+            !isRoomRepairPage({ type: "room.repair.page", requestId: "cache-restore",
+              snapshotId: `cache:${item.roomId}`, roomId: item.roomId, page: 0,
+              records: item.records, watermark: item.cursor.afterSeq,
+              snapshotChecksum: item.checksum, hasMore: false, mode: "materialized",
+              expiresAt: "2099-01-01T00:00:00.000Z" })) {
+          await persistence.clear().catch(() => undefined); activeActorId = actorId; return false;
+        }
+        restored.set(item.roomId, { records: structuredClone(item.records) as RoomRepairRecord[],
+          cursor: structuredClone(item.cursor), updatedAt: item.updatedAt });
+      }
+      const priorRoomIds = new Set(rooms.keys());
+      rooms.clear();
+      for (const [roomId, room] of restored) { rooms.set(roomId, room); priorRoomIds.add(roomId); }
+      activeActorId = actorId;
+      for (const roomId of priorRoomIds) publishRoom(roomId);
+      return restored.size > 0;
     },
   };
 }

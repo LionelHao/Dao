@@ -1,6 +1,7 @@
 import type { PersistedRoomEvent, RoomRepairPage, RoomRepairRecord } from "@native-im/core";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { authoritySnapshotChecksum, createDesktopAuthorityCache } from "./authority-cache.js";
+import { projectSnapshot } from "../project-loop/test-fixture.js";
 
 const records: readonly RoomRepairRecord[] = [
   {
@@ -36,6 +37,54 @@ function page(): RoomRepairPage {
 }
 
 describe("production Desktop authority cache", () => {
+  it("exposes the durability fence for an asynchronous authorized-state purge", async () => {
+    let releaseClear: (() => void) | undefined;
+    const clearGate = new Promise<void>((resolve) => { releaseClear = resolve; });
+    const persistence = { async load() { return undefined; }, async save() {}, async clear() { await clearGate; } };
+    const cache = createDesktopAuthorityCache(() => "2026-08-25T05:00:00.000Z", persistence);
+    cache.clear();
+    let durable = false;
+    const fence = cache.waitForPersistence().then(() => { durable = true; });
+    await Promise.resolve();
+    expect(durable).toBe(false);
+    releaseClear?.();
+    await fence;
+    expect(durable).toBe(true);
+  });
+
+  it("restores only a complete encrypted actor-bound cache and purges it on revocation", async () => {
+    let stored: unknown;
+    let clearCount = 0;
+    const persistence = {
+      async load() { return structuredClone(stored); },
+      async save(value: unknown) { stored = structuredClone(value); },
+      async clear() { stored = undefined; clearCount += 1; },
+    };
+    const snapshot = projectSnapshot();
+    const persistedRecords: readonly RoomRepairRecord[] = [
+      ...records, { kind: "project-loop", roomId: "room-1", value: snapshot },
+    ];
+    const checksum = authoritySnapshotChecksum("room", persistedRecords);
+    const first = createDesktopAuthorityCache(() => "2026-08-25T05:00:00.000Z", persistence);
+    await first.restore("human-1");
+    first.beginRoom("room-1", "snapshot-persist");
+    first.stageRoomPage({ ...page(), snapshotId: "snapshot-persist", records: persistedRecords,
+      watermark: snapshot.watermark, snapshotChecksum: checksum });
+    expect(await first.finalizeRoom("snapshot-persist", checksum)).toBe(true);
+    first.commitRoom("room-1", snapshot.watermark, checksum);
+    await vi.waitFor(() => expect(stored).toBeDefined());
+
+    const restarted = createDesktopAuthorityCache(() => "2026-08-25T05:01:00.000Z", persistence);
+    await expect(restarted.restore("human-1")).resolves.toBe(true);
+    expect(restarted.roomCursor("room-1")?.afterSeq).toBe(snapshot.watermark);
+    expect(restarted.roomRepairRecords("room-1")?.find((record) => record.kind === "project-loop"))
+      .toEqual({ kind: "project-loop", roomId: "room-1", value: snapshot });
+    restarted.clear();
+    await restarted.waitForPersistence();
+    expect(clearCount).toBeGreaterThan(0);
+    expect(stored).toBeUndefined();
+  });
+
   it("commits only verified repair records and builds a closed actorId-fallback projection", async () => {
     const cache = createDesktopAuthorityCache(() => "2026-08-19T00:00:10.000Z");
     const repair = page();
@@ -95,6 +144,30 @@ describe("production Desktop authority cache", () => {
     expect(cache.governanceProjection("room-1")).toMatchObject({
       lifecycle: "active", governanceRevision: 9, archiveGeneration: 1,
     });
+  });
+
+  it("invalidates the Project repair record on a stable Project event for fixed-watermark repair", async () => {
+    const snapshot = projectSnapshot();
+    const projectRecords: readonly RoomRepairRecord[] = [
+      ...records, { kind: "project-loop", roomId: "room-1", value: snapshot },
+    ];
+    const checksum = authoritySnapshotChecksum("room", projectRecords);
+    const cache = createDesktopAuthorityCache();
+    cache.beginRoom("room-1", "project-snapshot");
+    cache.stageRoomPage({ ...page(), snapshotId: "project-snapshot", records: projectRecords,
+      snapshotChecksum: checksum });
+    expect(await cache.finalizeRoom("project-snapshot", checksum)).toBe(true);
+    cache.commitRoom("room-1", snapshot.watermark, checksum);
+    expect(cache.roomRepairRecords("room-1")?.some((record) => record.kind === "project-loop")).toBe(true);
+    const request = snapshot.requests[0]!;
+    cache.applyRoomEvents("room-1", [{
+      eventId: "project-event-8", streamKind: "room", streamId: "room-1", streamSeq: 8,
+      roomId: "room-1", projectId: "room-1",
+      transitionAuthority: { kind: "human", actorId: "human-2" },
+      causalActor: { kind: "human", actorId: "human-2" },
+      occurredAt: "2026-08-25T03:03:04.005Z", type: "project.request.changed", payload: request,
+    }], { version: 1, roomId: "room-1", afterSeq: 8 });
+    expect(cache.roomRepairRecords("room-1")?.some((record) => record.kind === "project-loop")).toBe(false);
   });
 
   it("keeps memory repair identities distinct and invalidates stale projections on minimal events", async () => {

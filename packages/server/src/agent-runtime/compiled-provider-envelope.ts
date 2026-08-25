@@ -1,6 +1,7 @@
 import type {
   LegacyAgentInvocationIntent as AgentInvocationIntent,
   AgentRuntimeProviderInput,
+  ProjectBoundaryProviderInvocation,
   ProviderNeutralCheckpoint,
   ToolDescriptor,
 } from "@native-im/core";
@@ -76,7 +77,7 @@ export interface CompiledProviderEnvelopeV1 {
   readonly purpose: "agent_runtime";
   readonly schemaVersion: "compiled-context-envelope.v1";
   readonly snapshot: CompiledProviderSnapshotV1;
-  readonly invocation: AgentInvocationIntent;
+  readonly invocation: AgentInvocationIntent | ProjectBoundaryProviderInvocation;
   readonly trusted: Readonly<{
     system: readonly CompiledTrustedSystemBlockV1[];
     developer: readonly CompiledTrustedDeveloperBlockV1[];
@@ -142,8 +143,22 @@ const sourceKinds = new Set<CompiledGroupContentBlockV1["source"]["kind"]>([
   "project_fact_checkpoint",
 ]);
 
-function isInvocation(value: unknown): value is AgentInvocationIntent {
-  return record(value) && exact(value, ["kind", "roomId", "sourceMessageId", "targetAgentId"]) &&
+function isInvocation(
+  value: unknown,
+): value is AgentInvocationIntent | ProjectBoundaryProviderInvocation {
+  if (!record(value)) return false;
+  if (value.kind === "project_boundary") {
+    return exact(value, [
+      "kind", "intentId", "executionId", "roomId", "projectId", "boundaryId",
+      "boundaryKind", "sourceFactId", "sourceFactRevision", "targetAgentId",
+      "lifecycleGeneration",
+    ]) && text(value.intentId) && text(value.executionId) && text(value.roomId) &&
+      text(value.projectId) && text(value.boundaryId) &&
+      ["checkpoint", "due", "blocker", "agent_ball"].includes(String(value.boundaryKind)) &&
+      text(value.sourceFactId) && positive(value.sourceFactRevision) &&
+      text(value.targetAgentId) && positive(value.lifecycleGeneration);
+  }
+  return exact(value, ["kind", "roomId", "sourceMessageId", "targetAgentId"]) &&
     (value.kind === "direct_mention" || value.kind === "structured_help" || value.kind === "routed_candidate") &&
     text(value.roomId) && text(value.sourceMessageId) && text(value.targetAgentId);
 }

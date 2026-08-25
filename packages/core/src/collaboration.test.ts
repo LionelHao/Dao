@@ -190,6 +190,11 @@ describe("canonical collaboration records", () => {
       intentId: "intent-1", consumedAt: "2026-08-25T00:00:00.000Z",
     })).toBe(true);
     expect(isProjectBoundaryInvocationResult({
+      boundaryId: "boundary-1", roomId: "room-1", status: "execution-state",
+      intentId: "intent-1", executionId: "execution-1", agentId: "agent-1",
+      executionStatus: "running", occurredAt: "2026-08-25T00:00:01.000Z",
+    })).toBe(true);
+    expect(isProjectBoundaryInvocationResult({
       boundaryId: "boundary-1", roomId: "room-1", status: "intent-created",
       intentId: "intent-1", consumedAt: "2026-08-25T00:00:00.000Z", providerCalled: true,
     })).toBe(false);

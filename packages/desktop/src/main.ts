@@ -34,6 +34,9 @@ import { registerMemoryAuthorityIpc } from "./memory-authority/ipc.js";
 import { createDesktopAgentSettingsRuntime } from "./agent-profile-routing/production-runtime.js";
 import { registerAgentSettingsIpc } from "./agent-profile-routing/ipc.js";
 import { registerInvocationIpc } from "./invocation-runtime/ipc.js";
+import { createDesktopProjectLoopRuntime } from "./project-loop/production-runtime.js";
+import { registerProjectLoopIpc } from "./project-loop/ipc.js";
+import { createEncryptedAuthorityCachePersistence } from "./governance/encrypted-authority-cache.js";
 import { createDesktopAttachmentAuthorityRuntime } from "./attachment-authority/production-runtime.js";
 import {
   createElectronAttachmentPorts,
@@ -62,6 +65,8 @@ async function createWindow(): Promise<void> {
   let disposeMessageAuthorityIpc: (() => void) | undefined;
   let memoryAuthorityRuntime: ReturnType<typeof createDesktopMemoryAuthorityRuntime> | undefined;
   let disposeMemoryAuthorityIpc: (() => void) | undefined;
+  let projectLoop: ReturnType<typeof createDesktopProjectLoopRuntime> | undefined;
+  let disposeProjectLoopIpc: (() => void) | undefined;
   let disposeAttachmentGovernanceState: (() => void) | undefined;
   let agentSettings: ReturnType<typeof createDesktopAgentSettingsRuntime> | undefined;
   let disposeAgentSettingsIpc: (() => void) | undefined;
@@ -103,17 +108,18 @@ async function createWindow(): Promise<void> {
   try {
     installWindowSecurityPolicy(window);
     const identityPlatform = identityPlatformFromNode(process.platform);
+    const desktopEncryption = createSafeStorageEncryption({
+      isEncryptionAvailable: () => safeStorage.isEncryptionAvailable(),
+      getSelectedStorageBackend: () => safeStorage.getSelectedStorageBackend(),
+      encryptString: (plaintext) => safeStorage.encryptString(plaintext),
+      decryptString: (ciphertext) => safeStorage.decryptString(Buffer.from(ciphertext)),
+    }, identityPlatform);
     identity = createDesktopIdentityRuntime({
       dataDirectory: app.getPath("userData"),
       deviceLabel: createIdentityDeviceLabel(app.getName(), hostname()),
       platform: identityPlatform,
       endpoint: process.env.NATIVE_IM_IDENTITY_WS_URL ?? "ws://127.0.0.1:8787",
-      encryption: createSafeStorageEncryption({
-        isEncryptionAvailable: () => safeStorage.isEncryptionAvailable(),
-        getSelectedStorageBackend: () => safeStorage.getSelectedStorageBackend(),
-        encryptString: (plaintext) => safeStorage.encryptString(plaintext),
-        decryptString: (ciphertext) => safeStorage.decryptString(Buffer.from(ciphertext)),
-      }, identityPlatform),
+      encryption: desktopEncryption,
       webSocketFactory: (endpoint) => new WebSocket(endpoint),
       ipcMain,
       webContents: window.webContents,
@@ -123,6 +129,7 @@ async function createWindow(): Promise<void> {
           agentSettings?.invalidateAuthorizedState();
           messageAuthorityRuntime?.invalidateAuthorizedState();
           memoryAuthorityRuntime?.invalidateAuthorizedState();
+          projectLoop?.invalidateAuthorizedState();
           attachmentRuntimeHost.invalidateIdentity();
         },
       },
@@ -135,6 +142,10 @@ async function createWindow(): Promise<void> {
       createRequestIdentity: () => ({
         requestId: `governance-${randomUUID()}`,
         idempotencyKey: randomUUID(),
+      }),
+      cachePersistence: createEncryptedAuthorityCachePersistence({
+        filePath: join(app.getPath("userData"), "authority-cache.v1.enc"),
+        encryption: desktopEncryption,
       }),
     });
     disposeGovernanceIpc = registerGovernanceIpc({
@@ -193,11 +204,28 @@ async function createWindow(): Promise<void> {
       webContents: window.webContents,
       runtime: memoryAuthorityRuntime,
     });
+    projectLoop = createDesktopProjectLoopRuntime({
+      session: () => identity?.getCurrentAuthoritySession(),
+      transport: messageAuthorityRuntime.transport,
+      authorityCache: governance.cache,
+      repairRoom: (roomId) => governance!.repairRoom(roomId),
+      restoreAuthorityCache: (actorId) => governance!.restoreCache(actorId),
+      createRequestIdentity: () => ({
+        requestId: `project-loop-${randomUUID()}`,
+        idempotencyKey: randomUUID(),
+      }),
+    });
+    disposeProjectLoopIpc = registerProjectLoopIpc({
+      ipcMain,
+      webContents: window.webContents,
+      runtime: projectLoop,
+    });
     window.once("closed", () => {
       disposeGovernanceIpc?.();
       disposeInvocationIpc?.();
       disposeMessageAuthorityIpc?.();
       disposeMemoryAuthorityIpc?.();
+      disposeProjectLoopIpc?.();
       disposeAgentSettingsIpc?.();
       disposeAttachmentGovernanceState?.();
       attachmentRuntimeHost.close();
@@ -206,6 +234,7 @@ async function createWindow(): Promise<void> {
       messageAuthority?.close();
       messageAuthorityRuntime?.close();
       memoryAuthorityRuntime?.close();
+      projectLoop?.close();
       agentSettings?.close();
     });
 
@@ -219,6 +248,7 @@ async function createWindow(): Promise<void> {
         memoryAuthorityMethods: Object.keys(globalThis.dao?.memoryAuthority ?? {}).sort(),
         agentSettingsMethods: Object.keys(globalThis.dao?.agentSettings ?? {}).sort(),
         invocationMethods: Object.keys(globalThis.dao?.invocation ?? {}).sort(),
+        projectLoopMethods: Object.keys(globalThis.dao?.projectLoop ?? {}).sort(),
         namespaces: Object.keys(globalThis.dao ?? {}).sort(),
         bridgeMissing: document.querySelector("[data-identity-bridge-missing]") !== null,
         governanceRouteContract: document.querySelector("#app")?.dataset.governanceRouteContract ?? "",
@@ -262,6 +292,7 @@ async function createWindow(): Promise<void> {
     const expectedMemoryAuthorityMethods = ["context", "onAuthorityInput", "request"];
     const expectedAgentSettingsMethods = ["getSnapshot", "onAuthorityMessage", "submit"];
     const expectedInvocationMethods = ["cancel", "getSurface", "onStateChanged", "retry"];
+    const expectedProjectLoopMethods = ["getSurface", "onStateChanged", "submit"];
     let startupProbe: unknown;
     try {
       startupProbe = typeof startupProbeJson === "string"
@@ -298,9 +329,11 @@ async function createWindow(): Promise<void> {
         startupProbe.agentSettingsMethods.join(",") !== expectedAgentSettingsMethods.join(",") ||
         !("invocationMethods" in startupProbe) || !Array.isArray(startupProbe.invocationMethods) ||
         startupProbe.invocationMethods.join(",") !== expectedInvocationMethods.join(",") ||
+        !("projectLoopMethods" in startupProbe) || !Array.isArray(startupProbe.projectLoopMethods) ||
+        startupProbe.projectLoopMethods.join(",") !== expectedProjectLoopMethods.join(",") ||
         !("namespaces" in startupProbe) || !Array.isArray(startupProbe.namespaces) ||
         startupProbe.namespaces.join(",") !==
-          "agentSettings,attachmentAuthority,governance,identity,invocation,memoryAuthority,messageAuthority" ||
+          "agentSettings,attachmentAuthority,governance,identity,invocation,memoryAuthority,messageAuthority,projectLoop" ||
         !("governanceRouteContract" in startupProbe) ||
         startupProbe.governanceRouteContract !== "closed-v1" ||
         !("bridgeMissing" in startupProbe) || startupProbe.bridgeMissing !== false ||
@@ -324,6 +357,7 @@ async function createWindow(): Promise<void> {
     disposeInvocationIpc?.();
     disposeMessageAuthorityIpc?.();
     disposeMemoryAuthorityIpc?.();
+    disposeProjectLoopIpc?.();
     disposeAgentSettingsIpc?.();
     disposeAttachmentGovernanceState?.();
     attachmentRuntimeHost.close();
@@ -332,6 +366,7 @@ async function createWindow(): Promise<void> {
     messageAuthority?.close();
     messageAuthorityRuntime?.close();
     memoryAuthorityRuntime?.close();
+    projectLoop?.close();
     agentSettings?.close();
     if (!window.isDestroyed()) window.destroy();
     throw error;

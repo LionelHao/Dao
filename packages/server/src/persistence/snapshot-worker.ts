@@ -31,6 +31,8 @@ import {
   memoryRepairSegmentDescriptor,
   ROOM_MEMORY_REPAIR_KEYSET_LIMIT,
 } from "../room-memory/repair-descriptor.js";
+import { readProjectLoopRepairSnapshotDatabaseQuery } from "../project-loop/database-authority.js";
+import { createProjectLoopRepairSegmentDescriptor } from "../project-loop/repair-descriptor.js";
 import {
   readOperationalMessageRepairPage,
   readOperationalMessageRepairRecord,
@@ -668,6 +670,7 @@ const ROOM_REPAIR_KIND_MAP = Object.freeze({
   calibration: true,
   "legacy-unknown-calibration": true,
   memory: true,
+  "project-loop": true,
 } as const satisfies Readonly<Record<RoomRepairKind, true>>);
 
 const ROOM_REPAIR_KINDS = Object.freeze(
@@ -942,7 +945,13 @@ function cancellationRepairRecord(row: Record<string, unknown>): RoomRepairRecor
 }
 
 function projectBoundaryRepairRecord(row: Record<string, unknown>): RoomRepairRecord {
-  const value = row.status === "consumed"
+  const value = row.recordKind === "execution"
+    ? { boundaryId: String(row.boundaryId), roomId: String(row.roomId),
+        status: "execution-state" as const, intentId: String(row.intentId),
+        executionId: String(row.executionId), agentId: String(row.agentId),
+        executionStatus: row.executionStatus,
+        occurredAt: String(row.recordedAt) }
+    : row.status === "consumed"
     ? { boundaryId: String(row.boundaryId), roomId: String(row.roomId), status: "intent-created" as const,
         intentId: String(row.intentId), consumedAt: String(row.recordedAt) }
     : { boundaryId: String(row.boundaryId), roomId: String(row.roomId), status: "suppressed" as const,
@@ -1232,9 +1241,29 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
     descriptorId: "dao.repair.project-boundary-invocation.v1", descriptorVersion: 1,
     kind: "project-boundary-invocation", order: 105,
     readKeysetPage: (input: RepairKeysetPageInput) => roomSegmentRows(input,
-      `SELECT boundary_id AS boundaryId, room_id AS roomId, status,
-              invocation_intent_id AS intentId, recorded_at AS recordedAt
-       FROM project_boundary_invocation_receipts WHERE room_id = ?`, "boundary_id"),
+      `SELECT boundaryId, roomId, recordKind, status, intentId, executionId,
+              agentId, executionStatus, recordedAt
+       FROM (
+         SELECT intent.boundary_id AS boundaryId, intent.room_id AS roomId,
+                'execution' AS recordKind, NULL AS status, intent.intent_id AS intentId,
+                execution.execution_id AS executionId,
+                intent.target_agent_actor_id AS agentId,
+                execution.public_status AS executionStatus,
+                execution.updated_at AS recordedAt
+         FROM project_boundary_agent_invocation_intents AS intent
+         JOIN project_boundary_agent_executions AS execution
+           ON execution.intent_id = intent.intent_id
+         UNION ALL
+         SELECT receipt.boundary_id AS boundaryId, receipt.room_id AS roomId,
+                'legacy' AS recordKind, receipt.status,
+                receipt.invocation_intent_id AS intentId, NULL AS executionId,
+                NULL AS agentId, NULL AS executionStatus, receipt.recorded_at AS recordedAt
+         FROM project_boundary_invocation_receipts AS receipt
+         WHERE NOT EXISTS (
+           SELECT 1 FROM project_boundary_agent_invocation_intents AS intent
+           WHERE intent.boundary_id = receipt.boundary_id
+         )
+       ) AS project_boundary_records WHERE roomId = ?`, "boundaryId"),
     mapRow: (row: unknown) => projectBoundaryRepairRecord(row as Record<string, unknown>),
     stableKey: (record: RoomRepairRecord) => record.kind === "project-boundary-invocation"
       ? record.value.boundaryId : "",
@@ -1330,6 +1359,10 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
       String(record.kind === "message" ? record.value.id : ""),
   },
   memoryRepairSegmentDescriptor,
+  createProjectLoopRepairSegmentDescriptor((database, input) => {
+    const result = readProjectLoopRepairSnapshotDatabaseQuery(database, input);
+    return { snapshot: result };
+  }),
 ] as const satisfies readonly RoomRepairSegmentDescriptor<RoomRepairKind, RoomRepairRecord>[]);
 
 const ROOM_REPAIR_REGISTRY = createClosedRepairProjectionRegistry<

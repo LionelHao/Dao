@@ -1417,7 +1417,7 @@ function attachmentE2ePdf(): Buffer {
 }
 
 describe("authoritative server real-process harness", () => {
-  it("production-composes the FT-09-unavailable project-boundary seam as durable suppression", async () => {
+  it("production-composes FT-09 project-boundary authority and rejects an ineligible boundary durably", async () => {
     const directory = await mkdtemp(join(tmpdir(), "native-im-ft08-project-boundary-"));
     const databasePath = join(directory, "authority.sqlite");
     let server: AuthoritativeServer | undefined;
@@ -1449,7 +1449,7 @@ describe("authoritative server real-process harness", () => {
             idempotencyKey: "ft08-project-boundary-room",
           };
           const room = await facades.lifecycle.createRoom(context, {
-            name: "FT-08 project boundary fail closed",
+            name: "FT-09 project boundary authority",
           });
           await facades.lifecycle.configureAgent({
             ...context,
@@ -1481,7 +1481,7 @@ describe("authoritative server real-process harness", () => {
       expect(result).toMatchObject({
         boundaryId: "ft08-boundary-unavailable",
         status: "suppressed",
-        reason: "dependency_unavailable",
+        reason: "boundary_ineligible",
       });
       const database = new DatabaseSync(databasePath, { readOnly: true });
       try {
@@ -1489,7 +1489,7 @@ describe("authoritative server real-process harness", () => {
           `SELECT
              (SELECT COUNT(*) FROM project_boundary_invocation_receipts
               WHERE boundary_id = 'ft08-boundary-unavailable'
-                AND status = 'dependency_unavailable') AS receipts,
+                AND status = 'suppressed') AS receipts,
              (SELECT COUNT(*) FROM agent_executions) AS executions,
              (SELECT COUNT(*) FROM events
               WHERE event_type = 'project.boundary.invocation.decided') AS events`,
@@ -2551,6 +2551,28 @@ describe("authoritative server real-process harness", () => {
         ],
       });
       if (replay.type !== "message.accepted") throw new TypeError("wrong replay ACK");
+      const projectSnapshot = await replayClient.request({
+        type: "project.snapshot.read",
+        requestId: "message-v2-project-snapshot",
+        roomId,
+        projectId: roomId,
+        afterEventSeq: 0,
+        limit: 64,
+      }, "project.snapshot");
+      expect(projectSnapshot).toMatchObject({
+        type: "project.snapshot",
+        requestId: "message-v2-project-snapshot",
+        snapshot: {
+          roomId,
+          projectId: roomId,
+          requests: [{
+            status: "pending_acceptance",
+            requester: { kind: "human", actorId: "human-a" },
+            target: { kind: "human", actorId: "human-b" },
+            provenance: { source: { sourceId: message.messageId, sourceRevision: 1 } },
+          }],
+        },
+      });
 
       const changedMessages = [
         { ...message, body: `${message.body}!` },
@@ -2620,6 +2642,7 @@ describe("authoritative server real-process harness", () => {
              (SELECT COUNT(*) FROM message_mentions WHERE message_id = ?) AS mentions,
              (SELECT COUNT(*) FROM message_target_outcomes WHERE message_id = ?) AS outcomes,
              (SELECT COUNT(*) FROM human_request_intents WHERE source_message_id = ?) AS humanIntents,
+             (SELECT COUNT(*) FROM project_requests WHERE source_id = ?) AS projectRequests,
              (SELECT COUNT(*) FROM agent_invocation_intents
                 WHERE source_message_id = ? AND origin_kind = 'message_target') AS agentIntents,
              (SELECT COUNT(*) FROM message_reply_links WHERE message_id = ?) AS replyLinks,
@@ -2628,6 +2651,7 @@ describe("authoritative server real-process harness", () => {
              (SELECT COUNT(*) FROM outbox_deliveries WHERE event_id = ?) AS outbox,
              (SELECT COUNT(*) FROM idempotency_records WHERE key = ?) AS receipts`,
         ).get(
+          message.messageId,
           message.messageId,
           message.messageId,
           message.messageId,
@@ -2647,6 +2671,7 @@ describe("authoritative server real-process harness", () => {
           mentions: 2,
           outcomes: 2,
           humanIntents: 1,
+          projectRequests: 1,
           agentIntents: 1,
           replyLinks: 1,
           attachments: 0,
@@ -4243,9 +4268,13 @@ describe("authoritative server real-process harness", () => {
         setup.prepare(
           `INSERT INTO project_next_actions (
              id, room_id, source_room_id, source_id, revision, owner_kind,
-             owner_actor_id, verifier_human_actor_id, status
-           ) VALUES (?, ?, ?, ?, 1, 'human', 'human-c', NULL, 'in_progress')`,
-        ).run("governance-conflict-action", roomId, roomId, "governance-source");
+             owner_actor_id, verifier_human_actor_id, status, source_kind,
+             source_revision, visibility_room_id, created_by_actor_id, created_at, updated_at
+           ) VALUES (
+             ?, ?, ?, ?, 1, 'human', 'human-c', NULL, 'in_progress', 'message',
+             1, ?, 'human-a', '2026-08-19T00:00:03.000Z', '2026-08-19T00:00:03.000Z'
+           )`,
+        ).run("governance-conflict-action", roomId, roomId, "governance-source", roomId);
         setup.exec("COMMIT");
       } catch (error: unknown) {
         setup.exec("ROLLBACK");
@@ -4765,8 +4794,9 @@ describe("authoritative server real-process harness", () => {
         observeMaterializedLastPage = resolve;
       });
       let materializedLastPageObserved = false;
-      // The mixed fixture count excludes the singleton governance and Memory status records.
-      const expectedRepairTotal = mixed.total + 2;
+      // The mixed fixture count excludes the singleton governance, Memory status,
+      // and Project Loop snapshot records.
+      const expectedRepairTotal = mixed.total + 3;
       transportC.beforeMaterializedLastPageReturn = async (page, receivedRecordCount) => {
         materializedLastPageObserved = true;
         observeMaterializedLastPage();

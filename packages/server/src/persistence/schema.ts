@@ -7,7 +7,7 @@ import {
 } from "../access/room-cache-invalidation-port.js";
 import { OFFLINE_READ_LEASE_SCHEMA_STATEMENTS } from "../access/offline-lease-invalidation-port.js";
 
-export const AUTHORITY_SCHEMA_VERSION = 22 as const;
+export const AUTHORITY_SCHEMA_VERSION = 25 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -74,6 +74,9 @@ const SCHEMA_FINGERPRINTS = {
   20: "1ca2a806a52cd2ce9632b02e215a25ba13bc3ebc4336f5152c48f21d60faa2a0",
   21: "dca0a24a346060b1e04b98ee5a73e016421796d6c13bd0bd2841179f405c44af",
   22: "cbf4ccb27b52c3b88d61667f94811501d36a54795391e0044bbb0b2f41d3c7ce",
+  23: "532b7c0589c5ae2f4cb96c43747b19e3a7c83c2f04fd9fea663191ea5a46aced",
+  24: "ef4c3593ee4384350f57c1f92e6d229c523b4c99817f95222718c4abe10db896",
+  25: "e0cd0a610c4777209877535e0d5651498984681bf9b3c3f825724f4946191815",
 } as const;
 
 const V1_STATEMENTS = [
@@ -7544,6 +7547,1153 @@ const V22_STATEMENTS = [
    END`,
 ] as const;
 
+const V23_STATEMENTS = [
+  `CREATE TABLE project_room_states (
+    room_id TEXT PRIMARY KEY REFERENCES rooms(id),
+    project_id TEXT NOT NULL REFERENCES rooms(id) CHECK (project_id = room_id),
+    revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+    event_head_seq INTEGER NOT NULL DEFAULT 0 CHECK (event_head_seq >= 0),
+    updated_at TEXT NOT NULL CHECK (length(trim(updated_at)) > 0)
+  ) STRICT`,
+  `CREATE TABLE project_goals (
+    id TEXT PRIMARY KEY CHECK (length(trim(id)) BETWEEN 1 AND 128),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    project_id TEXT NOT NULL REFERENCES rooms(id) CHECK (project_id = room_id),
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    title TEXT NOT NULL CHECK (length(trim(title)) BETWEEN 1 AND 512),
+    description TEXT NOT NULL CHECK (length(description) <= 8192),
+    status TEXT NOT NULL CHECK (status IN ('proposed', 'active', 'superseded', 'rejected')),
+    supersedes_goal_id TEXT REFERENCES project_goals(id),
+    superseded_by_goal_id TEXT REFERENCES project_goals(id),
+    supersede_reason TEXT CHECK (
+      supersede_reason IS NULL OR length(trim(supersede_reason)) BETWEEN 1 AND 8192
+    ),
+    source_room_id TEXT NOT NULL REFERENCES rooms(id) CHECK (source_room_id = room_id),
+    source_id TEXT NOT NULL CHECK (length(trim(source_id)) BETWEEN 1 AND 256),
+    source_kind TEXT NOT NULL CHECK (source_kind IN ('message', 'attachment', 'agent_execution', 'memory', 'project_fact', 'legacy')),
+    created_by_actor_id TEXT NOT NULL REFERENCES actors(id),
+    confirmed_by_human_actor_id TEXT REFERENCES actors(id),
+    created_at TEXT NOT NULL CHECK (length(trim(created_at)) > 0),
+    updated_at TEXT NOT NULL CHECK (length(trim(updated_at)) > 0),
+    CHECK (
+      (status = 'active' AND confirmed_by_human_actor_id IS NOT NULL AND superseded_by_goal_id IS NULL)
+      OR (status = 'superseded' AND confirmed_by_human_actor_id IS NOT NULL AND superseded_by_goal_id IS NOT NULL)
+      OR (status IN ('proposed', 'rejected') AND confirmed_by_human_actor_id IS NULL)
+    ),
+    CHECK (
+      (status = 'active' AND supersedes_goal_id IS NULL AND supersede_reason IS NULL)
+      OR (status = 'active' AND supersedes_goal_id IS NOT NULL AND supersede_reason IS NOT NULL)
+      OR (status = 'superseded' AND supersede_reason IS NOT NULL)
+      OR status IN ('proposed', 'rejected')
+    )
+  ) STRICT`,
+  `CREATE UNIQUE INDEX project_goals_one_active_v23
+   ON project_goals(room_id) WHERE status = 'active'`,
+  `CREATE TABLE project_decisions (
+    id TEXT PRIMARY KEY CHECK (length(trim(id)) BETWEEN 1 AND 128),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    project_id TEXT NOT NULL REFERENCES rooms(id) CHECK (project_id = room_id),
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    title TEXT NOT NULL CHECK (length(trim(title)) BETWEEN 1 AND 512),
+    rationale TEXT NOT NULL CHECK (length(rationale) <= 8192),
+    status TEXT NOT NULL CHECK (status IN ('proposed', 'confirmed', 'rejected', 'superseded')),
+    supersedes_decision_id TEXT REFERENCES project_decisions(id),
+    superseded_by_decision_id TEXT REFERENCES project_decisions(id),
+    source_room_id TEXT NOT NULL REFERENCES rooms(id) CHECK (source_room_id = room_id),
+    source_id TEXT NOT NULL CHECK (length(trim(source_id)) BETWEEN 1 AND 256),
+    source_kind TEXT NOT NULL CHECK (source_kind IN ('message', 'attachment', 'agent_execution', 'memory', 'project_fact', 'legacy')),
+    created_by_actor_id TEXT NOT NULL REFERENCES actors(id),
+    confirmed_by_human_actor_id TEXT REFERENCES actors(id),
+    created_at TEXT NOT NULL CHECK (length(trim(created_at)) > 0),
+    updated_at TEXT NOT NULL CHECK (length(trim(updated_at)) > 0),
+    CHECK (
+      (status = 'confirmed' AND confirmed_by_human_actor_id IS NOT NULL AND superseded_by_decision_id IS NULL)
+      OR (status = 'superseded' AND confirmed_by_human_actor_id IS NOT NULL AND superseded_by_decision_id IS NOT NULL)
+      OR (status IN ('proposed', 'rejected') AND confirmed_by_human_actor_id IS NULL)
+    )
+  ) STRICT`,
+  `ALTER TABLE project_requests ADD COLUMN title TEXT NOT NULL DEFAULT 'Legacy Request'
+   CHECK (length(trim(title)) BETWEEN 1 AND 512)`,
+  `ALTER TABLE project_requests ADD COLUMN description TEXT NOT NULL DEFAULT ''
+   CHECK (length(description) <= 8192)`,
+  `ALTER TABLE project_requests ADD COLUMN request_kind TEXT NOT NULL DEFAULT 'legacy'
+   CHECK (request_kind IN ('legacy', 'next_action', 'open_question', 'blocker'))`,
+  `ALTER TABLE project_requests ADD COLUMN linked_fact_kind TEXT
+   CHECK (linked_fact_kind IS NULL OR linked_fact_kind IN ('next_action', 'blocker', 'open_question'))`,
+  `ALTER TABLE project_requests ADD COLUMN linked_fact_id TEXT`,
+  `ALTER TABLE project_requests ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'legacy_v14'
+   CHECK (source_kind IN ('legacy_v14', 'message', 'attachment', 'agent_execution', 'memory', 'project_fact', 'legacy'))`,
+  `ALTER TABLE project_requests ADD COLUMN created_by_actor_id TEXT REFERENCES actors(id)`,
+  `ALTER TABLE project_requests ADD COLUMN created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z'`,
+  `ALTER TABLE project_requests ADD COLUMN updated_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z'`,
+  `UPDATE project_requests SET created_by_actor_id = requester_human_actor_id`,
+  `ALTER TABLE project_next_actions ADD COLUMN title TEXT NOT NULL DEFAULT 'Legacy NextAction'
+   CHECK (length(trim(title)) BETWEEN 1 AND 512)`,
+  `ALTER TABLE project_next_actions ADD COLUMN description TEXT NOT NULL DEFAULT ''
+   CHECK (length(description) <= 8192)`,
+  `ALTER TABLE project_next_actions ADD COLUMN due_at TEXT`,
+  `ALTER TABLE project_next_actions ADD COLUMN acceptance_criteria TEXT NOT NULL DEFAULT ''
+   CHECK (length(acceptance_criteria) <= 8192)`,
+  `ALTER TABLE project_next_actions ADD COLUMN deliverable TEXT
+   CHECK (deliverable IS NULL OR length(deliverable) <= 8192)`,
+  `ALTER TABLE project_next_actions ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'legacy_v14'
+   CHECK (source_kind IN ('legacy_v14', 'message', 'attachment', 'agent_execution', 'memory', 'project_fact', 'legacy'))`,
+  `ALTER TABLE project_next_actions ADD COLUMN created_by_actor_id TEXT REFERENCES actors(id)`,
+  `ALTER TABLE project_next_actions ADD COLUMN accepted_by_human_actor_id TEXT REFERENCES actors(id)`,
+  `ALTER TABLE project_next_actions ADD COLUMN verified_by_human_actor_id TEXT REFERENCES actors(id)`,
+  `ALTER TABLE project_next_actions ADD COLUMN created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z'`,
+  `ALTER TABLE project_next_actions ADD COLUMN updated_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z'`,
+  `ALTER TABLE project_next_actions ADD COLUMN accepted_at TEXT`,
+  `ALTER TABLE project_next_actions ADD COLUMN delivery_source_kind TEXT
+   CHECK (delivery_source_kind IS NULL OR delivery_source_kind IN (
+     'message', 'attachment', 'agent_execution', 'memory', 'project_fact', 'legacy'
+   ))`,
+  `ALTER TABLE project_next_actions ADD COLUMN delivery_source_id TEXT`,
+  `ALTER TABLE project_next_actions ADD COLUMN delivery_source_revision INTEGER
+   CHECK (delivery_source_revision IS NULL OR delivery_source_revision > 0)`,
+  `ALTER TABLE project_next_actions ADD COLUMN delivery_source_room_id TEXT REFERENCES rooms(id)`,
+  `ALTER TABLE project_next_actions ADD COLUMN delivery_summary TEXT`,
+  `ALTER TABLE project_next_actions ADD COLUMN completed_by_human_actor_id TEXT REFERENCES actors(id)`,
+  `ALTER TABLE project_next_actions ADD COLUMN completed_at TEXT`,
+  `ALTER TABLE project_next_actions ADD COLUMN status_reason TEXT`,
+  `ALTER TABLE project_next_actions ADD COLUMN completion_note TEXT`,
+  `ALTER TABLE project_next_actions ADD COLUMN completion_criteria_json TEXT
+   CHECK (completion_criteria_json IS NULL OR json_valid(completion_criteria_json))`,
+  `UPDATE project_next_actions SET created_by_actor_id = owner_actor_id`,
+  `ALTER TABLE project_obstacles ADD COLUMN title TEXT NOT NULL DEFAULT 'Legacy Obstacle'
+   CHECK (length(trim(title)) BETWEEN 1 AND 512)`,
+  `ALTER TABLE project_obstacles ADD COLUMN description TEXT NOT NULL DEFAULT ''
+   CHECK (length(description) <= 8192)`,
+  `ALTER TABLE project_obstacles ADD COLUMN impact TEXT NOT NULL DEFAULT ''
+   CHECK (length(impact) <= 8192)`,
+  `ALTER TABLE project_obstacles ADD COLUMN due_at TEXT`,
+  `ALTER TABLE project_obstacles ADD COLUMN review_at TEXT`,
+  `ALTER TABLE project_obstacles ADD COLUMN resolution_criteria TEXT`,
+  `ALTER TABLE project_obstacles ADD COLUMN question TEXT`,
+  `ALTER TABLE project_obstacles ADD COLUMN result_source_kind TEXT
+   CHECK (result_source_kind IS NULL OR result_source_kind IN (
+     'message', 'attachment', 'agent_execution', 'memory', 'project_fact', 'legacy'
+   ))`,
+  `ALTER TABLE project_obstacles ADD COLUMN result_source_id TEXT`,
+  `ALTER TABLE project_obstacles ADD COLUMN result_source_revision INTEGER
+   CHECK (result_source_revision IS NULL OR result_source_revision > 0)`,
+  `ALTER TABLE project_obstacles ADD COLUMN result_source_room_id TEXT REFERENCES rooms(id)`,
+  `ALTER TABLE project_obstacles ADD COLUMN escalation_boundary_id TEXT`,
+  `ALTER TABLE project_obstacles ADD COLUMN status_reason TEXT`,
+  `ALTER TABLE project_obstacles ADD COLUMN escalation_emitted INTEGER NOT NULL DEFAULT 0
+   CHECK (escalation_emitted IN (0, 1))`,
+  `ALTER TABLE project_obstacles ADD COLUMN transfer_chain_json TEXT NOT NULL DEFAULT '[]'
+   CHECK (json_valid(transfer_chain_json) AND json_type(transfer_chain_json) = 'array')`,
+  `ALTER TABLE project_obstacles ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'legacy_v14'
+   CHECK (source_kind IN ('legacy_v14', 'message', 'attachment', 'agent_execution', 'memory', 'project_fact', 'legacy'))`,
+  `ALTER TABLE project_obstacles ADD COLUMN created_by_actor_id TEXT REFERENCES actors(id)`,
+  `ALTER TABLE project_obstacles ADD COLUMN created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z'`,
+  `ALTER TABLE project_obstacles ADD COLUMN updated_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z'`,
+  `UPDATE project_obstacles SET created_by_actor_id = owner_actor_id`,
+  `ALTER TABLE project_transfer_proposals ADD COLUMN from_owner_kind TEXT
+   CHECK (from_owner_kind IS NULL OR from_owner_kind IN ('human', 'agent'))`,
+  `ALTER TABLE project_transfer_proposals ADD COLUMN from_owner_actor_id TEXT REFERENCES actors(id)`,
+  `ALTER TABLE project_transfer_proposals ADD COLUMN principal_human_actor_id TEXT REFERENCES actors(id)`,
+  `ALTER TABLE project_transfer_proposals ADD COLUMN reason TEXT NOT NULL DEFAULT 'Legacy transfer'
+   CHECK (length(trim(reason)) BETWEEN 1 AND 2048)`,
+  `ALTER TABLE project_transfer_proposals ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'legacy_v14'
+   CHECK (source_kind IN ('legacy_v14', 'message', 'attachment', 'agent_execution', 'memory', 'project_fact', 'legacy'))`,
+  `ALTER TABLE project_transfer_proposals ADD COLUMN created_by_actor_id TEXT REFERENCES actors(id)`,
+  `ALTER TABLE project_transfer_proposals ADD COLUMN created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z'`,
+  `ALTER TABLE project_transfer_proposals ADD COLUMN updated_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z'`,
+  `ALTER TABLE project_transfer_proposals ADD COLUMN subject_revision INTEGER
+   CHECK (subject_revision IS NULL OR subject_revision > 0)`,
+  `ALTER TABLE project_transfer_proposals ADD COLUMN expires_at TEXT`,
+  `ALTER TABLE project_transfer_proposals ADD COLUMN resolved_by_human_actor_id TEXT REFERENCES actors(id)`,
+  `ALTER TABLE project_transfer_proposals ADD COLUMN resolved_at TEXT`,
+  `ALTER TABLE project_transfer_proposals ADD COLUMN resolution_reason TEXT`,
+  `CREATE TABLE project_fact_proposals (
+    id TEXT PRIMARY KEY CHECK (length(trim(id)) BETWEEN 1 AND 128),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    project_id TEXT NOT NULL REFERENCES rooms(id) CHECK (project_id = room_id),
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    fact_kind TEXT NOT NULL CHECK (fact_kind IN ('goal', 'decision', 'request', 'next_action', 'blocker', 'open_question')),
+    fact_id TEXT NOT NULL CHECK (length(trim(fact_id)) BETWEEN 1 AND 128),
+    base_revision INTEGER NOT NULL CHECK (base_revision >= 0),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'confirmed', 'rejected', 'cancelled', 'expired')),
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json) AND json_type(payload_json) = 'object'),
+    source_room_id TEXT NOT NULL REFERENCES rooms(id) CHECK (source_room_id = room_id),
+    source_id TEXT NOT NULL CHECK (length(trim(source_id)) BETWEEN 1 AND 256),
+    source_kind TEXT NOT NULL CHECK (source_kind IN ('message', 'attachment', 'agent_execution', 'memory', 'project_fact', 'legacy')),
+    proposed_by_kind TEXT NOT NULL CHECK (proposed_by_kind IN ('human', 'agent')),
+    proposed_by_actor_id TEXT NOT NULL REFERENCES actors(id),
+    principal_human_actor_id TEXT NOT NULL REFERENCES actors(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    resolved_at TEXT,
+    resolution_reason TEXT,
+    UNIQUE (room_id, fact_kind, fact_id, status)
+  ) STRICT`,
+  `CREATE INDEX project_fact_proposals_pending_v23
+   ON project_fact_proposals(room_id, status, revision, id)`,
+  `CREATE TABLE project_confirmations (
+    id TEXT PRIMARY KEY CHECK (length(trim(id)) BETWEEN 1 AND 160),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    project_id TEXT NOT NULL REFERENCES rooms(id) CHECK (project_id = room_id),
+    proposal_id TEXT NOT NULL UNIQUE REFERENCES project_fact_proposals(id),
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    principal_human_actor_id TEXT NOT NULL REFERENCES actors(id),
+    base_revision INTEGER NOT NULL CHECK (base_revision >= 0),
+    payload_digest TEXT NOT NULL CHECK (payload_digest GLOB 'sha256:[0-9a-f]*' AND length(payload_digest) = 71),
+    state TEXT NOT NULL CHECK (state IN ('pending', 'confirmed', 'rejected', 'expired')),
+    source_room_id TEXT NOT NULL REFERENCES rooms(id) CHECK (source_room_id = room_id),
+    source_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    resolved_by_human_actor_id TEXT REFERENCES actors(id),
+    resolved_at TEXT,
+    resolution_reason TEXT,
+    CHECK (
+      (state = 'pending' AND resolved_by_human_actor_id IS NULL AND resolved_at IS NULL AND resolution_reason IS NULL)
+      OR (state = 'confirmed' AND resolved_by_human_actor_id = principal_human_actor_id AND resolved_at IS NOT NULL)
+      OR (state = 'rejected' AND resolved_by_human_actor_id = principal_human_actor_id AND resolved_at IS NOT NULL AND resolution_reason IS NOT NULL)
+      OR (state = 'expired' AND resolved_by_human_actor_id IS NULL AND resolved_at IS NOT NULL AND resolution_reason IS NOT NULL)
+    )
+  ) STRICT`,
+  `CREATE TABLE project_events (
+    event_id TEXT PRIMARY KEY CHECK (length(trim(event_id)) BETWEEN 1 AND 192),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    project_id TEXT NOT NULL REFERENCES rooms(id) CHECK (project_id = room_id),
+    event_seq INTEGER NOT NULL CHECK (event_seq > 0),
+    event_type TEXT NOT NULL CHECK (event_type IN ('proposal.created', 'proposal.confirmed', 'proposal.rejected', 'fact.created', 'fact.transitioned')),
+    fact_kind TEXT NOT NULL CHECK (fact_kind IN ('goal', 'decision', 'request', 'next_action', 'blocker', 'open_question')),
+    fact_id TEXT NOT NULL,
+    fact_revision INTEGER NOT NULL CHECK (fact_revision > 0),
+    actor_kind TEXT NOT NULL CHECK (actor_kind IN ('human', 'agent')),
+    actor_id TEXT NOT NULL REFERENCES actors(id),
+    source_room_id TEXT NOT NULL REFERENCES rooms(id) CHECK (source_room_id = room_id),
+    source_id TEXT NOT NULL,
+    source_kind TEXT NOT NULL CHECK (source_kind IN ('message', 'attachment', 'agent_execution', 'memory', 'project_fact', 'legacy')),
+    source_revision INTEGER NOT NULL CHECK (source_revision > 0),
+    source_visibility TEXT NOT NULL CHECK (source_visibility = 'room'),
+    occurred_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json) AND json_type(payload_json) = 'object'),
+    UNIQUE (room_id, event_seq)
+  ) STRICT`,
+  `CREATE INDEX project_events_stable_page_v23 ON project_events(room_id, event_seq, event_id)`,
+  `CREATE TRIGGER project_events_immutable_update_v23 BEFORE UPDATE ON project_events
+   BEGIN SELECT RAISE(ABORT, 'Project event is immutable'); END`,
+  `CREATE TRIGGER project_events_immutable_delete_v23 BEFORE DELETE ON project_events
+   BEGIN SELECT RAISE(ABORT, 'Project event is immutable'); END`,
+  `CREATE TABLE project_command_receipts (
+    actor_id TEXT NOT NULL REFERENCES actors(id),
+    idempotency_key TEXT NOT NULL CHECK (length(trim(idempotency_key)) BETWEEN 1 AND 256),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+    response_json TEXT NOT NULL CHECK (json_valid(response_json) AND json_type(response_json) = 'object'),
+    committed_at TEXT NOT NULL,
+    PRIMARY KEY (actor_id, idempotency_key)
+  ) STRICT`,
+  `CREATE TRIGGER project_room_states_revision_update_v23
+   BEFORE UPDATE OF revision, event_head_seq ON project_room_states
+   WHEN NEW.revision <> OLD.revision + 1 OR NEW.event_head_seq <> OLD.event_head_seq + 1
+   BEGIN SELECT RAISE(ABORT, 'Project authority revision must advance atomically'); END`,
+  `ALTER TABLE project_goals ADD COLUMN source_revision INTEGER NOT NULL DEFAULT 1
+   CHECK (source_revision > 0)`,
+  `ALTER TABLE project_goals ADD COLUMN visibility_room_id TEXT REFERENCES rooms(id)`,
+  `UPDATE project_goals SET visibility_room_id = room_id`,
+  `ALTER TABLE project_decisions ADD COLUMN source_revision INTEGER NOT NULL DEFAULT 1
+   CHECK (source_revision > 0)`,
+  `ALTER TABLE project_decisions ADD COLUMN visibility_room_id TEXT REFERENCES rooms(id)`,
+  `UPDATE project_decisions SET visibility_room_id = room_id`,
+  `ALTER TABLE project_requests ADD COLUMN source_revision INTEGER
+   CHECK (source_revision IS NULL OR source_revision > 0)`,
+  `ALTER TABLE project_requests ADD COLUMN visibility_room_id TEXT REFERENCES rooms(id)`,
+  `ALTER TABLE project_requests ADD COLUMN source_request_intent_id TEXT
+   REFERENCES human_request_intents(id)`,
+  `ALTER TABLE project_requests ADD COLUMN source_target_id TEXT`,
+  `ALTER TABLE project_requests ADD COLUMN frozen_responsibility_json TEXT
+   CHECK (frozen_responsibility_json IS NULL OR (
+     json_valid(frozen_responsibility_json) AND json_type(frozen_responsibility_json) = 'object'
+   ))`,
+  `ALTER TABLE project_requests ADD COLUMN frozen_responsibility_sha256 TEXT
+   CHECK (frozen_responsibility_sha256 IS NULL OR (
+     length(frozen_responsibility_sha256) = 64
+     AND frozen_responsibility_sha256 NOT GLOB '*[^0-9a-f]*'
+   ))`,
+  `ALTER TABLE project_requests ADD COLUMN resolution_actor_kind TEXT
+   CHECK (resolution_actor_kind IS NULL OR resolution_actor_kind IN ('human', 'agent'))`,
+  `ALTER TABLE project_requests ADD COLUMN resolution_actor_id TEXT REFERENCES actors(id)`,
+  `ALTER TABLE project_requests ADD COLUMN resolved_at TEXT`,
+  `CREATE UNIQUE INDEX project_requests_source_intent_v23
+   ON project_requests(room_id, source_request_intent_id)
+   WHERE source_request_intent_id IS NOT NULL`,
+  `CREATE TRIGGER project_requests_source_intent_insert_v23
+   BEFORE INSERT ON project_requests
+   WHEN (NEW.source_request_intent_id IS NULL) <> (NEW.source_target_id IS NULL)
+      OR (NEW.source_request_intent_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM human_request_intents AS intent
+        WHERE intent.id = NEW.source_request_intent_id
+          AND intent.room_id = NEW.room_id
+          AND intent.source_message_id = NEW.source_id
+          AND intent.target_id = NEW.source_target_id
+          AND intent.source_revision = NEW.source_revision
+          AND intent.requester_human_actor_id = NEW.requester_human_actor_id
+          AND intent.target_human_actor_id = NEW.target_human_actor_id
+      ))
+   BEGIN SELECT RAISE(ABORT, 'Project Request source intent binding is invalid'); END`,
+  `CREATE TRIGGER project_requests_source_intent_update_v23
+   BEFORE UPDATE OF source_request_intent_id, source_target_id, source_id, source_revision,
+                    requester_human_actor_id ON project_requests
+   WHEN NEW.source_request_intent_id IS NOT OLD.source_request_intent_id
+      OR NEW.source_target_id IS NOT OLD.source_target_id
+      OR NEW.source_id <> OLD.source_id
+      OR NEW.source_revision IS NOT OLD.source_revision
+      OR NEW.requester_human_actor_id <> OLD.requester_human_actor_id
+   BEGIN SELECT RAISE(ABORT, 'Project Request source intent binding is immutable'); END`,
+  `ALTER TABLE project_next_actions ADD COLUMN source_revision INTEGER
+   CHECK (source_revision IS NULL OR source_revision > 0)`,
+  `ALTER TABLE project_next_actions ADD COLUMN visibility_room_id TEXT REFERENCES rooms(id)`,
+  `ALTER TABLE project_obstacles ADD COLUMN source_revision INTEGER
+   CHECK (source_revision IS NULL OR source_revision > 0)`,
+  `ALTER TABLE project_obstacles ADD COLUMN visibility_room_id TEXT REFERENCES rooms(id)`,
+  `ALTER TABLE project_fact_proposals ADD COLUMN source_revision INTEGER NOT NULL DEFAULT 1
+   CHECK (source_revision > 0)`,
+  `ALTER TABLE project_fact_proposals ADD COLUMN visibility_room_id TEXT REFERENCES rooms(id)`,
+  `UPDATE project_fact_proposals SET visibility_room_id = room_id`,
+  `CREATE TABLE project_transfer_chain (
+    transfer_id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    project_id TEXT NOT NULL REFERENCES rooms(id) CHECK (project_id = room_id),
+    subject_kind TEXT NOT NULL CHECK (subject_kind IN ('request', 'next_action', 'blocker', 'open_question')),
+    subject_id TEXT NOT NULL,
+    subject_revision INTEGER NOT NULL CHECK (subject_revision > 0),
+    from_owner_kind TEXT NOT NULL CHECK (from_owner_kind IN ('human', 'agent')),
+    from_owner_actor_id TEXT NOT NULL REFERENCES actors(id),
+    to_owner_kind TEXT NOT NULL CHECK (to_owner_kind IN ('human', 'agent')),
+    to_owner_actor_id TEXT NOT NULL REFERENCES actors(id),
+    accepted_by_human_actor_id TEXT NOT NULL REFERENCES actors(id),
+    reason TEXT NOT NULL CHECK (length(trim(reason)) BETWEEN 1 AND 2048),
+    transferred_at TEXT NOT NULL,
+    UNIQUE (room_id, subject_kind, subject_id, subject_revision)
+  ) STRICT`,
+  `CREATE TRIGGER project_transfer_chain_immutable_update_v23 BEFORE UPDATE ON project_transfer_chain
+   BEGIN SELECT RAISE(ABORT, 'Project transfer chain is immutable'); END`,
+  `CREATE TRIGGER project_transfer_chain_immutable_delete_v23 BEFORE DELETE ON project_transfer_chain
+   BEGIN SELECT RAISE(ABORT, 'Project transfer chain is immutable'); END`,
+  `CREATE TABLE project_ball_boundaries (
+    boundary_id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    project_id TEXT NOT NULL REFERENCES rooms(id) CHECK (project_id = room_id),
+    source_kind TEXT NOT NULL CHECK (source_kind IN (
+      'request', 'next_action', 'blocker', 'open_question',
+      'confirmation', 'transfer', 'review', 'due'
+    )),
+    source_id TEXT NOT NULL,
+    source_revision INTEGER NOT NULL CHECK (source_revision > 0),
+    lifecycle_generation INTEGER NOT NULL DEFAULT 0 CHECK (lifecycle_generation >= 0),
+    holder_kind TEXT NOT NULL CHECK (holder_kind IN ('human', 'agent')),
+    holder_actor_id TEXT NOT NULL REFERENCES actors(id),
+    reason TEXT NOT NULL CHECK (length(trim(reason)) BETWEEN 1 AND 2048),
+    since TEXT NOT NULL,
+    due_at TEXT,
+    status TEXT NOT NULL CHECK (status IN ('active', 'released', 'superseded')),
+    released_at TEXT,
+    UNIQUE (room_id, source_kind, source_id, source_revision, lifecycle_generation),
+    CHECK ((status = 'active') = (released_at IS NULL))
+  ) STRICT`,
+  `CREATE UNIQUE INDEX project_ball_one_active_source_v23
+   ON project_ball_boundaries(room_id, source_kind, source_id) WHERE status = 'active'`,
+  `CREATE TABLE project_due_reminder_claims (
+    claim_id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    boundary_id TEXT NOT NULL REFERENCES project_ball_boundaries(boundary_id),
+    source_revision INTEGER NOT NULL CHECK (source_revision > 0),
+    reminder_kind TEXT NOT NULL CHECK (reminder_kind IN ('initial_due', 'repeat_24h', 'review')),
+    reminder_ordinal INTEGER NOT NULL CHECK (reminder_ordinal >= 0),
+    boundary_at TEXT NOT NULL,
+    holder_kind TEXT NOT NULL CHECK (holder_kind IN ('human', 'agent')),
+    holder_actor_id TEXT NOT NULL REFERENCES actors(id),
+    recipient_actor_id TEXT NOT NULL REFERENCES actors(id),
+    status TEXT NOT NULL CHECK (status IN ('claimed', 'dispatched', 'cancelled')),
+    claimed_at TEXT NOT NULL,
+    dispatched_at TEXT,
+    UNIQUE (room_id, boundary_id, reminder_kind, reminder_ordinal, recipient_actor_id)
+  ) STRICT`,
+  `CREATE TABLE project_event_outbox (
+    event_id TEXT PRIMARY KEY REFERENCES project_events(event_id),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    event_seq INTEGER NOT NULL CHECK (event_seq > 0),
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'dispatched')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    available_at TEXT NOT NULL,
+    dispatched_at TEXT,
+    UNIQUE (room_id, event_seq)
+  ) STRICT`,
+  `CREATE TABLE project_transition_audit (
+    audit_id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    project_id TEXT NOT NULL REFERENCES rooms(id) CHECK (project_id = room_id),
+    project_revision INTEGER NOT NULL CHECK (project_revision > 0),
+    event_id TEXT NOT NULL UNIQUE REFERENCES project_events(event_id),
+    operation TEXT NOT NULL,
+    fact_kind TEXT NOT NULL,
+    fact_id TEXT NOT NULL,
+    actor_kind TEXT NOT NULL CHECK (actor_kind IN ('human', 'agent')),
+    actor_id TEXT NOT NULL REFERENCES actors(id),
+    transition_json TEXT NOT NULL CHECK (json_valid(transition_json)),
+    occurred_at TEXT NOT NULL,
+    UNIQUE (room_id, project_revision)
+  ) STRICT`,
+  `CREATE TRIGGER project_transition_audit_immutable_update_v23 BEFORE UPDATE ON project_transition_audit
+   BEGIN SELECT RAISE(ABORT, 'Project transition audit is immutable'); END`,
+  `CREATE TRIGGER project_transition_audit_immutable_delete_v23 BEFORE DELETE ON project_transition_audit
+   BEGIN SELECT RAISE(ABORT, 'Project transition audit is immutable'); END`,
+  `CREATE TABLE project_fact_checkpoints (
+    checkpoint_id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    project_id TEXT NOT NULL REFERENCES rooms(id) CHECK (project_id = room_id),
+    project_revision INTEGER NOT NULL CHECK (project_revision >= 0),
+    projection_json TEXT NOT NULL CHECK (json_valid(projection_json) AND json_type(projection_json) = 'object'),
+    projection_sha256 TEXT NOT NULL CHECK (length(projection_sha256) = 64),
+    created_at TEXT NOT NULL,
+    UNIQUE (room_id, project_revision)
+  ) STRICT`,
+  `CREATE TABLE project_archive_suspensions (
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    project_id TEXT NOT NULL REFERENCES rooms(id) CHECK (project_id = room_id),
+    archive_generation INTEGER NOT NULL CHECK (archive_generation > 0),
+    suspended_project_revision INTEGER NOT NULL CHECK (suspended_project_revision >= 0),
+    suspended_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('suspended', 'resumed')),
+    resumed_at TEXT,
+    PRIMARY KEY (room_id, archive_generation),
+    CHECK ((status = 'resumed') = (resumed_at IS NOT NULL))
+  ) STRICT`,
+  `CREATE TABLE project_agent_boundary_claims (
+    boundary_id TEXT NOT NULL REFERENCES project_ball_boundaries(boundary_id),
+    source_revision INTEGER NOT NULL CHECK (source_revision > 0),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    holder_agent_actor_id TEXT NOT NULL REFERENCES actors(id),
+    request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+    status TEXT NOT NULL CHECK (status IN ('claimed', 'consumed', 'cancelled')),
+    attempted_at TEXT NOT NULL,
+    consumed_at TEXT,
+    PRIMARY KEY (boundary_id, source_revision),
+    CHECK ((status = 'consumed') = (consumed_at IS NOT NULL))
+  ) STRICT`,
+] as const;
+
+export const AUTHORITY_V23_STATEMENT_COUNT_FOR_TEST = V23_STATEMENTS.length;
+export const AUTHORITY_V23_MIGRATION_CHECKSUM_FOR_TEST = migrationChecksum(
+  23,
+  "project-loop-authority",
+  V23_STATEMENTS,
+);
+
+const V24_STATEMENTS = [
+  `CREATE UNIQUE INDEX project_ball_boundaries_invocation_binding_v24
+   ON project_ball_boundaries (
+     boundary_id, room_id, project_id, source_kind, source_id, source_revision,
+     lifecycle_generation, holder_actor_id
+   )`,
+  `CREATE TABLE project_boundary_agent_invocation_intents (
+    intent_id TEXT PRIMARY KEY CHECK (length(trim(intent_id)) BETWEEN 1 AND 256),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    project_id TEXT NOT NULL REFERENCES rooms(id) CHECK (project_id = room_id),
+    boundary_id TEXT NOT NULL REFERENCES project_ball_boundaries(boundary_id),
+    boundary_kind TEXT NOT NULL CHECK (
+      boundary_kind IN ('checkpoint', 'due', 'blocker', 'agent_ball')
+    ),
+    source_kind TEXT NOT NULL CHECK (source_kind IN (
+      'request', 'next_action', 'blocker', 'open_question',
+      'confirmation', 'transfer', 'review', 'due'
+    )),
+    source_id TEXT NOT NULL CHECK (length(trim(source_id)) BETWEEN 1 AND 256),
+    source_revision INTEGER NOT NULL CHECK (source_revision > 0),
+    lifecycle_generation INTEGER NOT NULL CHECK (lifecycle_generation >= 0),
+    target_agent_actor_id TEXT NOT NULL REFERENCES actors(id),
+    profile_id TEXT NOT NULL REFERENCES agent_profiles(id),
+    profile_revision INTEGER NOT NULL CHECK (profile_revision > 0),
+    assignment_id TEXT NOT NULL REFERENCES room_agent_assignments(id),
+    assignment_revision INTEGER NOT NULL CHECK (assignment_revision > 0),
+    access_revision INTEGER NOT NULL CHECK (access_revision >= 0),
+    lineage_id TEXT NOT NULL CHECK (length(trim(lineage_id)) BETWEEN 1 AND 256),
+    turn_id TEXT NOT NULL CHECK (length(trim(turn_id)) BETWEEN 1 AND 256),
+    request_sha256 TEXT NOT NULL CHECK (
+      length(request_sha256) = 64 AND request_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'claimed', 'cancelled')),
+    authority_version INTEGER NOT NULL CHECK (authority_version >= 1),
+    created_at TEXT NOT NULL CHECK (length(trim(created_at)) > 0),
+    claimed_at TEXT,
+    cancelled_at TEXT,
+    cancellation_reason TEXT CHECK (
+      cancellation_reason IS NULL OR cancellation_reason IN (
+        'room_archived', 'membership_revoked', 'assignment_revoked',
+        'profile_disabled', 'capability_revoked', 'source_ineligible',
+        'runtime_shutdown', 'boundary_superseded', 'boundary_resolved'
+      )
+    ),
+    updated_at TEXT NOT NULL CHECK (length(trim(updated_at)) > 0),
+    UNIQUE (boundary_id, source_revision, lifecycle_generation),
+    UNIQUE (intent_id, source_revision, lifecycle_generation),
+    FOREIGN KEY (
+      boundary_id, room_id, project_id, source_kind, source_id, source_revision,
+      lifecycle_generation, target_agent_actor_id
+    ) REFERENCES project_ball_boundaries (
+      boundary_id, room_id, project_id, source_kind, source_id, source_revision,
+      lifecycle_generation, holder_actor_id
+    ),
+    FOREIGN KEY (boundary_id, source_revision)
+      REFERENCES project_agent_boundary_claims(boundary_id, source_revision),
+    FOREIGN KEY (profile_id, profile_revision)
+      REFERENCES agent_profile_revisions(profile_id, revision),
+    FOREIGN KEY (assignment_id, assignment_revision)
+      REFERENCES room_agent_assignment_revisions(assignment_id, revision),
+    CHECK (
+      (status = 'pending' AND claimed_at IS NULL AND cancelled_at IS NULL
+       AND cancellation_reason IS NULL)
+      OR (status = 'claimed' AND claimed_at IS NOT NULL AND cancelled_at IS NULL
+          AND cancellation_reason IS NULL)
+      OR (status = 'cancelled' AND cancelled_at IS NOT NULL
+          AND cancellation_reason IS NOT NULL)
+    )
+  ) STRICT`,
+  `CREATE INDEX project_boundary_agent_invocation_pending_v24
+   ON project_boundary_agent_invocation_intents (
+     status, created_at, intent_id
+   )`,
+  `CREATE TRIGGER project_boundary_agent_invocation_intents_v24_validate_insert
+   BEFORE INSERT ON project_boundary_agent_invocation_intents
+   WHEN NEW.authority_version <> 1
+      OR NOT EXISTS (
+        SELECT 1
+        FROM project_ball_boundaries AS boundary
+        JOIN project_agent_boundary_claims AS claim
+          ON claim.boundary_id = boundary.boundary_id
+         AND claim.source_revision = boundary.source_revision
+        JOIN rooms AS room ON room.id = boundary.room_id
+        JOIN actors AS actor ON actor.id = boundary.holder_actor_id
+        JOIN room_memberships AS membership
+          ON membership.room_id = boundary.room_id
+         AND membership.actor_id = boundary.holder_actor_id
+        JOIN agent_profiles AS profile ON profile.id = NEW.profile_id
+        JOIN agent_profile_revisions AS profile_revision
+          ON profile_revision.profile_id = NEW.profile_id
+         AND profile_revision.revision = NEW.profile_revision
+        JOIN room_agent_assignments AS assignment ON assignment.id = NEW.assignment_id
+        JOIN room_agent_assignment_revisions AS assignment_revision
+          ON assignment_revision.assignment_id = NEW.assignment_id
+         AND assignment_revision.revision = NEW.assignment_revision
+        WHERE boundary.boundary_id = NEW.boundary_id
+          AND boundary.room_id = NEW.room_id
+          AND boundary.project_id = NEW.project_id
+          AND boundary.source_kind = NEW.source_kind
+          AND boundary.source_id = NEW.source_id
+          AND boundary.source_revision = NEW.source_revision
+          AND boundary.lifecycle_generation = NEW.lifecycle_generation
+          AND boundary.holder_kind = 'agent'
+          AND boundary.holder_actor_id = NEW.target_agent_actor_id
+          AND boundary.status = 'active'
+          AND room.status = 'active'
+          AND room.archive_generation = NEW.lifecycle_generation
+          AND actor.kind = 'agent'
+          AND membership.kind = 'agent'
+          AND membership.participation = 'active'
+          AND membership.access_revision = NEW.access_revision
+          AND profile.actor_id = NEW.target_agent_actor_id
+          AND profile.revision = NEW.profile_revision
+          AND profile.status = 'enabled'
+          AND profile_revision.actor_id = NEW.target_agent_actor_id
+          AND profile_revision.status = 'enabled'
+          AND assignment.room_id = NEW.room_id
+          AND assignment.profile_id = NEW.profile_id
+          AND assignment.agent_actor_id = NEW.target_agent_actor_id
+          AND assignment.revision = NEW.assignment_revision
+          AND assignment.status = 'current'
+          AND assignment.participation = 'active'
+          AND assignment.paused = 0
+          AND assignment_revision.room_id = NEW.room_id
+          AND assignment_revision.profile_id = NEW.profile_id
+          AND assignment_revision.agent_actor_id = NEW.target_agent_actor_id
+          AND assignment_revision.status = 'current'
+          AND assignment_revision.participation = 'active'
+          AND assignment_revision.paused = 0
+          AND EXISTS (
+            SELECT 1 FROM json_each(assignment.capability_subset_json)
+            WHERE value = 'room.project.read'
+          )
+          AND EXISTS (
+            SELECT 1 FROM json_each(assignment.capability_subset_json)
+            WHERE value = 'room.respond'
+          )
+          AND claim.room_id = NEW.room_id
+          AND claim.holder_agent_actor_id = NEW.target_agent_actor_id
+          AND claim.request_sha256 = NEW.request_sha256
+          AND claim.status IN ('claimed', 'consumed')
+      )
+   BEGIN
+     SELECT RAISE(ABORT, 'Project boundary Agent invocation authority is invalid or stale');
+   END`,
+  `CREATE TRIGGER project_boundary_agent_invocation_intents_v24_validate_update
+   BEFORE UPDATE ON project_boundary_agent_invocation_intents
+   WHEN NEW.intent_id <> OLD.intent_id
+      OR NEW.room_id <> OLD.room_id
+      OR NEW.project_id <> OLD.project_id
+      OR NEW.boundary_id <> OLD.boundary_id
+      OR NEW.boundary_kind <> OLD.boundary_kind
+      OR NEW.source_kind <> OLD.source_kind
+      OR NEW.source_id <> OLD.source_id
+      OR NEW.source_revision <> OLD.source_revision
+      OR NEW.lifecycle_generation <> OLD.lifecycle_generation
+      OR NEW.target_agent_actor_id <> OLD.target_agent_actor_id
+      OR NEW.profile_id <> OLD.profile_id
+      OR NEW.profile_revision <> OLD.profile_revision
+      OR NEW.assignment_id <> OLD.assignment_id
+      OR NEW.assignment_revision <> OLD.assignment_revision
+      OR NEW.access_revision <> OLD.access_revision
+      OR NEW.lineage_id <> OLD.lineage_id
+      OR NEW.turn_id <> OLD.turn_id
+      OR NEW.request_sha256 <> OLD.request_sha256
+      OR NEW.created_at <> OLD.created_at
+      OR NEW.authority_version <> OLD.authority_version + 1
+      OR OLD.status = 'cancelled'
+      OR (OLD.status = 'pending' AND NEW.status NOT IN ('claimed', 'cancelled'))
+      OR (OLD.status = 'claimed' AND NEW.status <> 'cancelled')
+      OR (OLD.status = 'pending' AND NEW.status = 'claimed'
+          AND (NEW.claimed_at IS NULL OR NEW.cancelled_at IS NOT NULL
+               OR NEW.cancellation_reason IS NOT NULL))
+      OR (OLD.status = 'pending' AND NEW.status = 'cancelled'
+          AND NEW.claimed_at IS NOT NULL)
+      OR (OLD.status = 'claimed' AND NEW.claimed_at IS NOT OLD.claimed_at)
+   BEGIN
+     SELECT RAISE(ABORT, 'Project boundary Agent invocation transition is invalid');
+   END`,
+  `CREATE TRIGGER project_boundary_agent_invocation_intents_v24_immutable_delete
+   BEFORE DELETE ON project_boundary_agent_invocation_intents
+   BEGIN SELECT RAISE(ABORT, 'Project boundary Agent invocation intent is immutable'); END`,
+  `CREATE TABLE project_boundary_agent_executions (
+    execution_id TEXT PRIMARY KEY CHECK (length(trim(execution_id)) BETWEEN 1 AND 256),
+    intent_id TEXT NOT NULL REFERENCES project_boundary_agent_invocation_intents(intent_id),
+    lineage_id TEXT NOT NULL CHECK (length(trim(lineage_id)) BETWEEN 1 AND 256),
+    execution_ordinal INTEGER NOT NULL CHECK (execution_ordinal >= 1),
+    retry_of_execution_id TEXT REFERENCES project_boundary_agent_executions(execution_id),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    project_id TEXT NOT NULL REFERENCES rooms(id) CHECK (project_id = room_id),
+    agent_actor_id TEXT NOT NULL REFERENCES actors(id),
+    source_revision INTEGER NOT NULL CHECK (source_revision > 0),
+    lifecycle_generation INTEGER NOT NULL CHECK (lifecycle_generation >= 0),
+    provider_id TEXT NOT NULL CHECK (length(trim(provider_id)) BETWEEN 1 AND 128),
+    model_id TEXT NOT NULL CHECK (length(trim(model_id)) BETWEEN 1 AND 256),
+    public_status TEXT NOT NULL CHECK (
+      public_status IN ('accepted', 'running', 'completed', 'failed', 'cancelled')
+    ),
+    phase TEXT NOT NULL CHECK (phase IN (
+      'queued', 'retry_scheduled', 'recovery_queued', 'awaiting_capacity',
+      'claiming', 'snapshot_frozen', 'model_generation', 'read_tool',
+      'waiting_confirmation', 'side_effect_claimed', 'final_committing',
+      'completed', 'failed', 'cancelled'
+    )),
+    current_attempt_seq INTEGER NOT NULL CHECK (current_attempt_seq >= 1),
+    authority_version INTEGER NOT NULL CHECK (authority_version >= 1),
+    queued_at TEXT NOT NULL CHECK (length(trim(queued_at)) > 0),
+    started_at TEXT,
+    updated_at TEXT NOT NULL CHECK (length(trim(updated_at)) > 0),
+    completed_at TEXT,
+    cancellation_reason TEXT CHECK (
+      cancellation_reason IS NULL OR cancellation_reason IN (
+        'room_archived', 'membership_revoked', 'assignment_revoked',
+        'profile_disabled', 'capability_revoked', 'source_ineligible',
+        'runtime_shutdown', 'boundary_superseded', 'boundary_resolved'
+      )
+    ),
+    terminal_error_code TEXT CHECK (
+      terminal_error_code IS NULL OR length(trim(terminal_error_code)) BETWEEN 1 AND 128
+    ),
+    result_message_id TEXT REFERENCES messages(id),
+    UNIQUE (intent_id, execution_ordinal),
+    UNIQUE (
+      intent_id, execution_id, execution_ordinal, source_revision, lifecycle_generation
+    ),
+    FOREIGN KEY (intent_id, source_revision, lifecycle_generation)
+      REFERENCES project_boundary_agent_invocation_intents(
+        intent_id, source_revision, lifecycle_generation
+      ),
+    CHECK (
+      (execution_ordinal = 1 AND retry_of_execution_id IS NULL)
+      OR (execution_ordinal > 1 AND retry_of_execution_id IS NOT NULL)
+    ),
+    CHECK (
+      (public_status = 'accepted'
+       AND phase IN ('queued', 'retry_scheduled', 'recovery_queued', 'awaiting_capacity')
+       AND completed_at IS NULL AND cancellation_reason IS NULL
+       AND terminal_error_code IS NULL)
+      OR (public_status = 'running'
+          AND phase IN ('claiming', 'snapshot_frozen', 'model_generation', 'read_tool',
+                        'waiting_confirmation', 'side_effect_claimed', 'final_committing')
+          AND started_at IS NOT NULL AND completed_at IS NULL
+          AND cancellation_reason IS NULL AND terminal_error_code IS NULL)
+      OR (public_status = 'completed' AND phase = 'completed'
+          AND started_at IS NOT NULL AND completed_at IS NOT NULL
+          AND cancellation_reason IS NULL AND terminal_error_code IS NULL)
+      OR (public_status = 'failed' AND phase = 'failed'
+          AND started_at IS NOT NULL AND completed_at IS NOT NULL
+          AND cancellation_reason IS NULL AND terminal_error_code IS NOT NULL)
+      OR (public_status = 'cancelled' AND phase = 'cancelled'
+          AND completed_at IS NOT NULL AND cancellation_reason IS NOT NULL
+          AND terminal_error_code IS NULL)
+    )
+  ) STRICT`,
+  `CREATE TRIGGER project_boundary_agent_executions_v24_validate_insert
+   BEFORE INSERT ON project_boundary_agent_executions
+   WHEN NEW.authority_version <> 1
+      OR NEW.current_attempt_seq <> 1
+      OR NEW.public_status <> 'accepted'
+      OR NOT EXISTS (
+        SELECT 1 FROM project_boundary_agent_invocation_intents AS intent
+        WHERE intent.intent_id = NEW.intent_id
+          AND intent.status = 'claimed'
+          AND intent.lineage_id = NEW.lineage_id
+          AND intent.room_id = NEW.room_id
+          AND intent.project_id = NEW.project_id
+          AND intent.target_agent_actor_id = NEW.agent_actor_id
+          AND intent.source_revision = NEW.source_revision
+          AND intent.lifecycle_generation = NEW.lifecycle_generation
+      )
+      OR NEW.execution_ordinal <> COALESCE((
+        SELECT MAX(execution_ordinal) + 1
+        FROM project_boundary_agent_executions
+        WHERE intent_id = NEW.intent_id
+      ), 1)
+      OR (NEW.retry_of_execution_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM project_boundary_agent_executions AS parent
+        WHERE parent.intent_id = NEW.intent_id
+          AND parent.execution_id = NEW.retry_of_execution_id
+          AND parent.execution_ordinal < NEW.execution_ordinal
+          AND parent.public_status IN ('failed', 'cancelled')
+      ))
+   BEGIN
+     SELECT RAISE(ABORT, 'Project boundary Agent execution authority is invalid');
+   END`,
+  `CREATE TRIGGER project_boundary_agent_executions_v24_validate_update
+   BEFORE UPDATE ON project_boundary_agent_executions
+   WHEN NEW.execution_id <> OLD.execution_id
+      OR NEW.intent_id <> OLD.intent_id
+      OR NEW.lineage_id <> OLD.lineage_id
+      OR NEW.execution_ordinal <> OLD.execution_ordinal
+      OR NEW.retry_of_execution_id IS NOT OLD.retry_of_execution_id
+      OR NEW.room_id <> OLD.room_id
+      OR NEW.project_id <> OLD.project_id
+      OR NEW.agent_actor_id <> OLD.agent_actor_id
+      OR NEW.source_revision <> OLD.source_revision
+      OR NEW.lifecycle_generation <> OLD.lifecycle_generation
+      OR NEW.provider_id <> OLD.provider_id
+      OR NEW.model_id <> OLD.model_id
+      OR NEW.queued_at <> OLD.queued_at
+      OR NEW.authority_version <> OLD.authority_version + 1
+      OR OLD.public_status IN ('completed', 'failed', 'cancelled')
+      OR (OLD.public_status = 'accepted'
+          AND NEW.public_status NOT IN ('accepted', 'running', 'failed', 'cancelled'))
+      OR (OLD.public_status = 'running'
+          AND NEW.public_status NOT IN ('running', 'completed', 'failed', 'cancelled'))
+      OR NEW.current_attempt_seq < OLD.current_attempt_seq
+   BEGIN
+     SELECT RAISE(ABORT, 'Project boundary Agent execution transition is invalid');
+   END`,
+  `CREATE TRIGGER project_boundary_agent_executions_v24_immutable_delete
+   BEFORE DELETE ON project_boundary_agent_executions
+   BEGIN SELECT RAISE(ABORT, 'Project boundary Agent execution is immutable'); END`,
+  `CREATE TABLE project_boundary_agent_execution_links (
+    intent_id TEXT NOT NULL REFERENCES project_boundary_agent_invocation_intents(intent_id),
+    execution_id TEXT NOT NULL UNIQUE REFERENCES project_boundary_agent_executions(execution_id),
+    execution_ordinal INTEGER NOT NULL CHECK (execution_ordinal >= 1),
+    retry_of_execution_id TEXT REFERENCES project_boundary_agent_executions(execution_id),
+    source_revision INTEGER NOT NULL CHECK (source_revision > 0),
+    lifecycle_generation INTEGER NOT NULL CHECK (lifecycle_generation >= 0),
+    linked_at TEXT NOT NULL CHECK (length(trim(linked_at)) > 0),
+    PRIMARY KEY (intent_id, execution_ordinal),
+    UNIQUE (
+      intent_id, execution_id, execution_ordinal, source_revision, lifecycle_generation
+    ),
+    FOREIGN KEY (intent_id, source_revision, lifecycle_generation)
+      REFERENCES project_boundary_agent_invocation_intents(
+        intent_id, source_revision, lifecycle_generation
+      ),
+    CHECK (
+      (execution_ordinal = 1 AND retry_of_execution_id IS NULL)
+      OR (execution_ordinal > 1 AND retry_of_execution_id IS NOT NULL)
+    )
+  ) STRICT`,
+  `CREATE TRIGGER project_boundary_agent_execution_links_v24_validate_insert
+   BEFORE INSERT ON project_boundary_agent_execution_links
+   WHEN NEW.execution_ordinal <> COALESCE((
+          SELECT MAX(execution_ordinal) + 1
+          FROM project_boundary_agent_execution_links
+          WHERE intent_id = NEW.intent_id
+        ), 1)
+      OR NOT EXISTS (
+        SELECT 1
+        FROM project_boundary_agent_invocation_intents AS intent
+        JOIN project_boundary_agent_executions AS execution
+          ON execution.execution_id = NEW.execution_id
+        WHERE intent.intent_id = NEW.intent_id
+          AND intent.status = 'claimed'
+          AND execution.intent_id = NEW.intent_id
+          AND intent.room_id = execution.room_id
+          AND intent.target_agent_actor_id = execution.agent_actor_id
+          AND intent.lifecycle_generation = execution.lifecycle_generation
+      )
+      OR (NEW.retry_of_execution_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM project_boundary_agent_execution_links AS parent
+        WHERE parent.intent_id = NEW.intent_id
+          AND parent.execution_id = NEW.retry_of_execution_id
+          AND parent.execution_ordinal < NEW.execution_ordinal
+      ))
+   BEGIN
+     SELECT RAISE(ABORT, 'Project boundary Agent execution lineage is invalid');
+   END`,
+  `CREATE TRIGGER project_boundary_agent_execution_links_v24_immutable_update
+   BEFORE UPDATE ON project_boundary_agent_execution_links
+   BEGIN SELECT RAISE(ABORT, 'Project boundary Agent execution lineage is immutable'); END`,
+  `CREATE TRIGGER project_boundary_agent_execution_links_v24_immutable_delete
+   BEFORE DELETE ON project_boundary_agent_execution_links
+   BEGIN SELECT RAISE(ABORT, 'Project boundary Agent execution lineage is immutable'); END`,
+  `CREATE UNIQUE INDEX project_fact_checkpoints_context_binding_v24
+   ON project_fact_checkpoints (
+     checkpoint_id, room_id, project_id, project_revision, projection_sha256
+   )`,
+  `CREATE TABLE project_boundary_context_sources (
+    context_source_id TEXT PRIMARY KEY CHECK (
+      length(trim(context_source_id)) BETWEEN 1 AND 256
+    ),
+    intent_id TEXT NOT NULL,
+    execution_id TEXT NOT NULL UNIQUE REFERENCES project_boundary_agent_executions(execution_id),
+    execution_ordinal INTEGER NOT NULL CHECK (execution_ordinal >= 1),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    project_id TEXT NOT NULL REFERENCES rooms(id) CHECK (project_id = room_id),
+    checkpoint_id TEXT NOT NULL REFERENCES project_fact_checkpoints(checkpoint_id),
+    checkpoint_project_revision INTEGER NOT NULL CHECK (checkpoint_project_revision >= 0),
+    checkpoint_projection_sha256 TEXT NOT NULL CHECK (
+      length(checkpoint_projection_sha256) = 64
+      AND checkpoint_projection_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    source_kind TEXT NOT NULL CHECK (source_kind IN (
+      'request', 'next_action', 'blocker', 'open_question',
+      'confirmation', 'transfer', 'review', 'due'
+    )),
+    source_id TEXT NOT NULL CHECK (length(trim(source_id)) BETWEEN 1 AND 256),
+    source_revision INTEGER NOT NULL CHECK (source_revision > 0),
+    lifecycle_generation INTEGER NOT NULL CHECK (lifecycle_generation >= 0),
+    created_at TEXT NOT NULL CHECK (length(trim(created_at)) > 0),
+    UNIQUE (intent_id, execution_ordinal),
+    FOREIGN KEY (
+      intent_id, execution_id, execution_ordinal, source_revision, lifecycle_generation
+    ) REFERENCES project_boundary_agent_execution_links (
+      intent_id, execution_id, execution_ordinal, source_revision, lifecycle_generation
+    ),
+    FOREIGN KEY (
+      checkpoint_id, room_id, project_id, checkpoint_project_revision,
+      checkpoint_projection_sha256
+    ) REFERENCES project_fact_checkpoints (
+      checkpoint_id, room_id, project_id, project_revision, projection_sha256
+    )
+  ) STRICT`,
+  `CREATE TRIGGER project_boundary_context_sources_v24_validate_insert
+   BEFORE INSERT ON project_boundary_context_sources
+   WHEN NOT EXISTS (
+     SELECT 1 FROM project_boundary_agent_invocation_intents AS intent
+     WHERE intent.intent_id = NEW.intent_id
+       AND intent.room_id = NEW.room_id
+       AND intent.project_id = NEW.project_id
+       AND intent.source_kind = NEW.source_kind
+       AND intent.source_id = NEW.source_id
+       AND intent.source_revision = NEW.source_revision
+       AND intent.lifecycle_generation = NEW.lifecycle_generation
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'Project boundary context source is not bound to its invocation');
+   END`,
+  `CREATE TRIGGER project_boundary_context_sources_v24_immutable_update
+   BEFORE UPDATE ON project_boundary_context_sources
+   BEGIN SELECT RAISE(ABORT, 'Project boundary context source is immutable'); END`,
+  `CREATE TRIGGER project_boundary_context_sources_v24_immutable_delete
+   BEFORE DELETE ON project_boundary_context_sources
+   BEGIN SELECT RAISE(ABORT, 'Project boundary context source is immutable'); END`,
+] as const;
+
+export const AUTHORITY_V24_STATEMENT_COUNT_FOR_TEST = V24_STATEMENTS.length;
+export const AUTHORITY_V24_ROLLBACK_ASSERTION_COUNT_FOR_TEST = V24_STATEMENTS.length;
+export const AUTHORITY_V24_MIGRATION_CHECKSUM_FOR_TEST = migrationChecksum(
+  24,
+  "project-boundary-agent-intent-lineage",
+  V24_STATEMENTS,
+);
+
+const V25_STATEMENTS = [
+  `DROP TRIGGER events_validate_insert`,
+  `DROP TRIGGER events_prevent_update`,
+  `DROP TRIGGER events_validate_delete`,
+  `DROP TRIGGER project_events_immutable_update_v23`,
+  `DROP TRIGGER project_events_immutable_delete_v23`,
+  `DROP TRIGGER project_transition_audit_immutable_update_v23`,
+  `DROP TRIGGER project_transition_audit_immutable_delete_v23`,
+  `PRAGMA legacy_alter_table = ON`,
+  `ALTER TABLE outbox_deliveries RENAME TO outbox_deliveries_v24`,
+  `ALTER TABLE project_event_outbox RENAME TO project_event_outbox_v24`,
+  `ALTER TABLE project_transition_audit RENAME TO project_transition_audit_v24`,
+  `ALTER TABLE events RENAME TO events_v24`,
+  `ALTER TABLE project_events RENAME TO project_events_v24`,
+  `CREATE TABLE events (
+    event_id TEXT PRIMARY KEY,
+    stream_kind TEXT NOT NULL CHECK (stream_kind IN ('room', 'identity')),
+    stream_id TEXT NOT NULL,
+    stream_seq INTEGER NOT NULL CHECK (stream_seq >= 1),
+    room_id TEXT REFERENCES rooms(id),
+    authority_kind TEXT NOT NULL DEFAULT 'actor'
+      CHECK (authority_kind IN ('actor', 'human', 'agent', 'system_timer')),
+    actor_id TEXT REFERENCES actors(id),
+    event_type TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    UNIQUE (stream_kind, stream_id, stream_seq),
+    UNIQUE (event_id, stream_seq),
+    FOREIGN KEY (stream_kind, stream_id) REFERENCES streams(stream_kind, stream_id),
+    CHECK (
+      (stream_kind = 'room' AND room_id IS NOT NULL AND room_id = stream_id)
+      OR (stream_kind = 'identity' AND room_id IS NULL)
+    ),
+    CHECK (
+      (authority_kind = 'system_timer' AND actor_id IS NULL AND event_type LIKE 'project.%')
+      OR (authority_kind <> 'system_timer' AND actor_id IS NOT NULL)
+    )
+  ) STRICT`,
+  `INSERT INTO events (
+     event_id, stream_kind, stream_id, stream_seq, room_id, authority_kind,
+     actor_id, event_type, occurred_at, payload_json
+   ) SELECT legacy.event_id, legacy.stream_kind, legacy.stream_id, legacy.stream_seq,
+            legacy.room_id,
+            CASE WHEN legacy.event_type LIKE 'project.%' AND
+                json_extract(project.payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN 'system_timer'
+              WHEN legacy.event_type LIKE 'project.%'
+              THEN COALESCE(project.actor_kind, actor.kind)
+              ELSE 'actor' END,
+            CASE WHEN legacy.event_type LIKE 'project.%' AND
+                json_extract(project.payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN NULL ELSE legacy.actor_id END,
+            legacy.event_type, legacy.occurred_at, legacy.payload_json
+     FROM events_v24 AS legacy
+     LEFT JOIN project_events_v24 AS project ON project.event_id = legacy.event_id
+     LEFT JOIN actors AS actor ON actor.id = legacy.actor_id`,
+  `CREATE TABLE project_events (
+    event_id TEXT PRIMARY KEY CHECK (length(trim(event_id)) BETWEEN 1 AND 192),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    project_id TEXT NOT NULL REFERENCES rooms(id) CHECK (project_id = room_id),
+    event_seq INTEGER NOT NULL CHECK (event_seq > 0),
+    event_type TEXT NOT NULL CHECK (event_type IN ('proposal.created', 'proposal.confirmed', 'proposal.rejected', 'fact.created', 'fact.transitioned')),
+    fact_kind TEXT NOT NULL CHECK (fact_kind IN ('goal', 'decision', 'request', 'next_action', 'blocker', 'open_question')),
+    fact_id TEXT NOT NULL,
+    fact_revision INTEGER NOT NULL CHECK (fact_revision > 0),
+    authority_kind TEXT NOT NULL CHECK (authority_kind IN ('human', 'agent', 'system_timer')),
+    actor_kind TEXT CHECK (actor_kind IN ('human', 'agent')),
+    actor_id TEXT REFERENCES actors(id),
+    causal_actor_kind TEXT CHECK (causal_actor_kind IN ('human', 'agent')),
+    causal_actor_id TEXT REFERENCES actors(id),
+    source_room_id TEXT NOT NULL REFERENCES rooms(id) CHECK (source_room_id = room_id),
+    source_id TEXT NOT NULL,
+    source_kind TEXT NOT NULL CHECK (source_kind IN ('message', 'attachment', 'agent_execution', 'memory', 'project_fact', 'legacy')),
+    source_revision INTEGER NOT NULL CHECK (source_revision > 0),
+    source_visibility TEXT NOT NULL CHECK (source_visibility = 'room'),
+    occurred_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json) AND json_type(payload_json) = 'object'),
+    UNIQUE (room_id, event_seq),
+    CHECK ((authority_kind = 'system_timer' AND actor_kind IS NULL AND actor_id IS NULL
+        AND causal_actor_kind IS NULL AND causal_actor_id IS NULL)
+      OR (authority_kind IN ('human','agent') AND actor_kind = authority_kind
+        AND actor_id IS NOT NULL AND causal_actor_kind IS NOT NULL AND causal_actor_id IS NOT NULL))
+  ) STRICT`,
+  `INSERT INTO project_events (
+     event_id, room_id, project_id, event_seq, event_type, fact_kind, fact_id,
+     fact_revision, authority_kind, actor_kind, actor_id, causal_actor_kind,
+     causal_actor_id, source_room_id, source_id, source_kind, source_revision,
+     source_visibility, occurred_at, payload_json
+   ) SELECT event_id, room_id, project_id, event_seq, event_type, fact_kind, fact_id,
+            fact_revision,
+            CASE WHEN json_extract(payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN 'system_timer' ELSE actor_kind END,
+            CASE WHEN json_extract(payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN NULL ELSE actor_kind END,
+            CASE WHEN json_extract(payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN NULL ELSE actor_id END,
+            CASE WHEN json_extract(payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN NULL ELSE actor_kind END,
+            CASE WHEN json_extract(payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN NULL ELSE actor_id END,
+            source_room_id, source_id, source_kind, source_revision, source_visibility,
+            occurred_at,
+            CASE WHEN json_extract(payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN json_set(payload_json, '$.migratedFromV24', json('true')) ELSE payload_json END
+     FROM project_events_v24`,
+  `CREATE TABLE project_transition_audit (
+    audit_id TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    project_id TEXT NOT NULL REFERENCES rooms(id) CHECK (project_id = room_id),
+    project_revision INTEGER NOT NULL CHECK (project_revision > 0),
+    event_id TEXT NOT NULL UNIQUE REFERENCES project_events(event_id),
+    operation TEXT NOT NULL,
+    fact_kind TEXT NOT NULL,
+    fact_id TEXT NOT NULL,
+    authority_kind TEXT NOT NULL CHECK (authority_kind IN ('human', 'agent', 'system_timer')),
+    actor_kind TEXT CHECK (actor_kind IN ('human', 'agent')),
+    actor_id TEXT REFERENCES actors(id),
+    causal_actor_kind TEXT CHECK (causal_actor_kind IN ('human', 'agent')),
+    causal_actor_id TEXT REFERENCES actors(id),
+    transition_json TEXT NOT NULL CHECK (json_valid(transition_json)),
+    occurred_at TEXT NOT NULL,
+    UNIQUE (room_id, project_revision),
+    CHECK ((authority_kind = 'system_timer' AND actor_kind IS NULL AND actor_id IS NULL
+        AND causal_actor_kind IS NULL AND causal_actor_id IS NULL)
+      OR (authority_kind IN ('human','agent') AND actor_kind = authority_kind
+        AND actor_id IS NOT NULL AND causal_actor_kind IS NOT NULL AND causal_actor_id IS NOT NULL))
+  ) STRICT`,
+  `INSERT INTO project_transition_audit (
+     audit_id, room_id, project_id, project_revision, event_id, operation, fact_kind,
+     fact_id, authority_kind, actor_kind, actor_id, causal_actor_kind, causal_actor_id,
+     transition_json, occurred_at
+   ) SELECT legacy.audit_id, legacy.room_id, legacy.project_id, legacy.project_revision,
+            legacy.event_id, legacy.operation, legacy.fact_kind, legacy.fact_id,
+            CASE WHEN json_extract(event.payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN 'system_timer' ELSE legacy.actor_kind END,
+            CASE WHEN json_extract(event.payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN NULL ELSE legacy.actor_kind END,
+            CASE WHEN json_extract(event.payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN NULL ELSE legacy.actor_id END,
+            CASE WHEN json_extract(event.payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN NULL ELSE legacy.actor_kind END,
+            CASE WHEN json_extract(event.payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN NULL ELSE legacy.actor_id END,
+            CASE WHEN json_extract(event.payload_json, '$.transition') IN ('review_due','transfer_expired')
+              THEN json_set(legacy.transition_json, '$.migratedFromV24', json('true'))
+              ELSE legacy.transition_json END,
+            legacy.occurred_at
+     FROM project_transition_audit_v24 AS legacy
+     JOIN project_events_v24 AS event ON event.event_id = legacy.event_id`,
+  `CREATE TABLE outbox_deliveries (
+    id TEXT NOT NULL UNIQUE,
+    event_id TEXT NOT NULL REFERENCES events(event_id),
+    target_kind TEXT NOT NULL CHECK (target_kind IN ('room', 'principal', 'session-family')),
+    target_id TEXT NOT NULL CHECK (length(target_id) > 0),
+    stream_seq INTEGER NOT NULL CHECK (stream_seq >= 1),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'dispatched')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    available_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT,
+    PRIMARY KEY (event_id, target_kind, target_id),
+    FOREIGN KEY (event_id, stream_seq) REFERENCES events(event_id, stream_seq)
+  ) STRICT`,
+  `INSERT INTO outbox_deliveries SELECT * FROM outbox_deliveries_v24`,
+  `CREATE TABLE project_event_outbox (
+    event_id TEXT PRIMARY KEY REFERENCES project_events(event_id),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    event_seq INTEGER NOT NULL CHECK (event_seq > 0),
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'dispatched')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    available_at TEXT NOT NULL, dispatched_at TEXT,
+    UNIQUE (room_id, event_seq)
+  ) STRICT`,
+  `INSERT INTO project_event_outbox SELECT * FROM project_event_outbox_v24`,
+  `DROP TABLE outbox_deliveries_v24`,
+  `DROP TABLE project_event_outbox_v24`,
+  `DROP TABLE project_transition_audit_v24`,
+  `DROP TABLE project_events_v24`,
+  `DROP TABLE events_v24`,
+  `PRAGMA legacy_alter_table = OFF`,
+  `CREATE UNIQUE INDEX events_event_id_stream_seq ON events(event_id, stream_seq)`,
+  `CREATE INDEX project_events_stable_page_v25 ON project_events(room_id, event_seq, event_id)`,
+  `CREATE TRIGGER events_validate_insert BEFORE INSERT ON events
+   WHEN NOT EXISTS (
+     SELECT 1 FROM streams AS stream WHERE stream.stream_kind = NEW.stream_kind
+       AND stream.stream_id = NEW.stream_id AND NEW.stream_seq = stream.head_seq
+       AND NEW.stream_seq >= stream.retained_from_seq AND (
+         NEW.stream_seq = stream.retained_from_seq OR EXISTS (
+           SELECT 1 FROM events AS previous WHERE previous.stream_kind = NEW.stream_kind
+             AND previous.stream_id = NEW.stream_id AND previous.stream_seq = NEW.stream_seq - 1)))
+      OR (NEW.authority_kind IN ('human','agent') AND NOT EXISTS (
+        SELECT 1 FROM actors WHERE id = NEW.actor_id AND kind = NEW.authority_kind))
+      OR (NEW.authority_kind = 'system_timer' AND NEW.event_type NOT IN (
+        'project.goal.changed','project.decision.changed','project.request.changed',
+        'project.next-action.changed','project.blocker.changed','project.open-question.changed',
+        'project.proposal.changed','project.confirmation.changed',
+        'project.transfer-proposal.changed','project.ball.changed'))
+      OR (NEW.event_type IN (
+        'project.goal.changed','project.decision.changed','project.request.changed',
+        'project.next-action.changed','project.blocker.changed','project.open-question.changed',
+        'project.proposal.changed','project.confirmation.changed',
+        'project.transfer-proposal.changed','project.ball.changed') AND NOT EXISTS (
+        SELECT 1 FROM project_events AS project
+        WHERE project.event_id = NEW.event_id
+          AND project.authority_kind = NEW.authority_kind
+          AND project.actor_id IS NEW.actor_id
+          AND (project.authority_kind <> 'system_timer'
+            OR (json_extract(project.payload_json, '$.transition') = 'review_due' AND (
+              (project.fact_kind = 'blocker' AND NEW.event_type = 'project.blocker.changed')
+              OR (project.fact_kind = 'open_question' AND NEW.event_type = 'project.open-question.changed'))
+              AND json_extract(NEW.payload_json, '$.obstacleId') = project.fact_id
+              AND json_extract(NEW.payload_json, '$.revision') = project.fact_revision)
+            OR (json_extract(project.payload_json, '$.transition') IN (
+                  'transfer_expired','review_due_transfer_rebound')
+              AND NEW.event_type = 'project.transfer-proposal.changed'
+              AND json_extract(NEW.payload_json, '$.transferProposalId') =
+                  json_extract(project.payload_json, '$.transferProposalId')
+              AND json_extract(NEW.payload_json, '$.revision') =
+                  json_extract(project.payload_json, '$.transferRevision')))))
+   BEGIN SELECT RAISE(ABORT, 'event sequence is outside the current stream window'); END`,
+  `CREATE TRIGGER events_prevent_update BEFORE UPDATE ON events
+   BEGIN SELECT RAISE(ABORT, 'events are immutable'); END`,
+  `CREATE TRIGGER events_validate_delete BEFORE DELETE ON events
+   WHEN EXISTS (SELECT 1 FROM streams AS stream WHERE stream.stream_kind = OLD.stream_kind
+     AND stream.stream_id = OLD.stream_id AND OLD.stream_seq >= stream.retained_from_seq
+     AND OLD.stream_seq <= stream.head_seq)
+   BEGIN SELECT RAISE(ABORT, 'event inside retained window cannot be deleted'); END`,
+  `CREATE TRIGGER project_events_v25_validate_insert BEFORE INSERT ON project_events
+   WHEN (NEW.authority_kind IN ('human','agent') AND (
+        NOT EXISTS (SELECT 1 FROM actors WHERE id = NEW.causal_actor_id AND kind = NEW.causal_actor_kind)
+        OR NOT EXISTS (SELECT 1 FROM actors WHERE id = NEW.actor_id AND kind = NEW.authority_kind)))
+      OR (NEW.authority_kind = 'system_timer' AND (
+        NEW.event_type <> 'fact.transitioned'
+        OR NEW.actor_kind IS NOT NULL OR NEW.actor_id IS NOT NULL
+        OR NEW.causal_actor_kind IS NOT NULL OR NEW.causal_actor_id IS NOT NULL
+        OR json_type(NEW.payload_json, '$.transition') IS NOT 'text'
+        OR (json_extract(NEW.payload_json, '$.transition') = 'review_due'
+          AND NEW.fact_kind NOT IN ('blocker','open_question'))
+        OR (json_extract(NEW.payload_json, '$.transition') IN (
+              'transfer_expired','review_due_transfer_rebound') AND (
+          NEW.fact_kind NOT IN ('next_action','blocker','open_question')
+          OR json_type(NEW.payload_json, '$.transferProposalId') IS NOT 'text'
+          OR json_type(NEW.payload_json, '$.transferRevision') IS NOT 'integer'))
+        OR json_extract(NEW.payload_json, '$.transition') NOT IN (
+          'review_due','transfer_expired','review_due_transfer_rebound')
+        OR json_extract(NEW.payload_json, '$.migratedFromV24') IS NOT NULL))
+   BEGIN SELECT RAISE(ABORT, 'Project event transition authority is invalid'); END`,
+  `CREATE TRIGGER project_events_immutable_update_v25 BEFORE UPDATE ON project_events
+   BEGIN SELECT RAISE(ABORT, 'Project event is immutable'); END`,
+  `CREATE TRIGGER project_events_immutable_delete_v25 BEFORE DELETE ON project_events
+   BEGIN SELECT RAISE(ABORT, 'Project event is immutable'); END`,
+  `CREATE TRIGGER project_transition_audit_v25_validate_insert BEFORE INSERT ON project_transition_audit
+   WHEN (NEW.authority_kind IN ('human','agent') AND (
+        NOT EXISTS (SELECT 1 FROM actors WHERE id = NEW.causal_actor_id AND kind = NEW.causal_actor_kind)
+        OR NOT EXISTS (SELECT 1 FROM actors WHERE id = NEW.actor_id AND kind = NEW.authority_kind)))
+      OR (NEW.authority_kind = 'system_timer' AND (
+        NEW.actor_kind IS NOT NULL OR NEW.actor_id IS NOT NULL
+        OR NEW.causal_actor_kind IS NOT NULL OR NEW.causal_actor_id IS NOT NULL))
+   BEGIN SELECT RAISE(ABORT, 'Project audit transition authority is invalid'); END`,
+  `CREATE TRIGGER project_transition_audit_immutable_update_v25 BEFORE UPDATE ON project_transition_audit
+   BEGIN SELECT RAISE(ABORT, 'Project transition audit is immutable'); END`,
+  `CREATE TRIGGER project_transition_audit_immutable_delete_v25 BEFORE DELETE ON project_transition_audit
+   BEGIN SELECT RAISE(ABORT, 'Project transition audit is immutable'); END`,
+] as const;
+
+export const AUTHORITY_V25_STATEMENT_COUNT_FOR_TEST = V25_STATEMENTS.length;
+export const AUTHORITY_V25_MIGRATION_CHECKSUM_FOR_TEST = migrationChecksum(
+  25, "project-transition-authority", V25_STATEMENTS,
+);
+
 export const AUTHORITY_V22_STATEMENT_COUNT_FOR_TEST = V22_STATEMENTS.length;
 export const AUTHORITY_V22_TRIGGER_INVARIANT_STATEMENT_COUNT_FOR_TEST =
   V22_STATEMENTS.filter((statement) => statement.startsWith("CREATE TRIGGER ")).length;
@@ -8000,6 +9150,17 @@ const MIGRATIONS = [
     "invocation-runtime-authority",
     V22_STATEMENTS,
   ),
+  defineMigration(
+    23,
+    "project-loop-authority",
+    V23_STATEMENTS,
+  ),
+  defineMigration(
+    24,
+    "project-boundary-agent-intent-lineage",
+    V24_STATEMENTS,
+  ),
+  defineMigration(25, "project-transition-authority", V25_STATEMENTS),
 ] as const satisfies readonly Migration[];
 
 const V1_SCHEMA_CONTRACT = {
@@ -8822,6 +9983,164 @@ const V22_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V23_SCHEMA_CONTRACT = {
+  ...V22_SCHEMA_CONTRACT,
+  project_requests: [
+    "id", "room_id", "source_room_id", "source_id", "revision",
+    "requester_human_actor_id", "target_human_actor_id", "status",
+    "title", "description", "request_kind", "linked_fact_kind", "linked_fact_id",
+    "source_kind", "created_by_actor_id", "created_at", "updated_at",
+    "source_revision", "visibility_room_id", "source_request_intent_id", "source_target_id",
+    "frozen_responsibility_json", "frozen_responsibility_sha256",
+    "resolution_actor_kind", "resolution_actor_id", "resolved_at",
+  ],
+  project_next_actions: [
+    "id", "room_id", "source_room_id", "source_id", "revision", "owner_kind",
+    "owner_actor_id", "verifier_human_actor_id", "status", "title", "description",
+    "due_at", "acceptance_criteria", "deliverable", "source_kind",
+    "created_by_actor_id", "accepted_by_human_actor_id", "verified_by_human_actor_id",
+    "created_at", "updated_at",
+    "accepted_at", "delivery_source_kind", "delivery_source_id", "delivery_source_revision",
+    "delivery_source_room_id", "delivery_summary", "completed_by_human_actor_id",
+    "completed_at", "status_reason", "completion_note", "completion_criteria_json",
+    "source_revision", "visibility_room_id",
+  ],
+  project_obstacles: [
+    "id", "room_id", "source_room_id", "source_id", "revision", "kind",
+    "owner_kind", "owner_actor_id", "status", "title", "description", "impact",
+    "due_at", "review_at", "resolution_criteria", "question", "result_source_kind",
+    "result_source_id", "result_source_revision", "result_source_room_id",
+    "escalation_boundary_id", "status_reason", "escalation_emitted",
+    "transfer_chain_json", "source_kind", "created_by_actor_id", "created_at", "updated_at",
+    "source_revision", "visibility_room_id",
+  ],
+  project_transfer_proposals: [
+    "id", "room_id", "source_room_id", "source_id", "revision", "subject_kind",
+    "subject_id", "to_owner_kind", "to_owner_actor_id", "status", "from_owner_kind",
+    "from_owner_actor_id", "principal_human_actor_id", "reason", "source_kind",
+    "created_by_actor_id", "created_at", "updated_at", "subject_revision", "expires_at",
+    "resolved_by_human_actor_id", "resolved_at", "resolution_reason",
+  ],
+  project_room_states: ["room_id", "project_id", "revision", "event_head_seq", "updated_at"],
+  project_goals: [
+    "id", "room_id", "project_id", "revision", "title", "description", "status",
+    "supersedes_goal_id", "superseded_by_goal_id", "supersede_reason", "source_room_id", "source_id",
+    "source_kind", "created_by_actor_id", "confirmed_by_human_actor_id",
+    "created_at", "updated_at", "source_revision", "visibility_room_id",
+  ],
+  project_decisions: [
+    "id", "room_id", "project_id", "revision", "title", "rationale", "status",
+    "supersedes_decision_id", "superseded_by_decision_id", "source_room_id", "source_id",
+    "source_kind", "created_by_actor_id", "confirmed_by_human_actor_id",
+    "created_at", "updated_at", "source_revision", "visibility_room_id",
+  ],
+  project_fact_proposals: [
+    "id", "room_id", "project_id", "revision", "fact_kind", "fact_id", "base_revision",
+    "status", "payload_json", "source_room_id", "source_id", "source_kind",
+    "proposed_by_kind", "proposed_by_actor_id", "principal_human_actor_id",
+    "created_at", "updated_at", "expires_at", "resolved_at", "resolution_reason",
+    "source_revision", "visibility_room_id",
+  ],
+  project_confirmations: [
+    "id", "room_id", "project_id", "proposal_id", "revision",
+    "principal_human_actor_id", "base_revision", "payload_digest", "state",
+    "source_room_id", "source_id", "created_at", "expires_at",
+    "resolved_by_human_actor_id", "resolved_at", "resolution_reason",
+  ],
+  project_events: [
+    "event_id", "room_id", "project_id", "event_seq", "event_type", "fact_kind",
+    "fact_id", "fact_revision", "actor_kind", "actor_id", "source_room_id",
+    "source_id", "source_kind", "source_revision", "source_visibility",
+    "occurred_at", "payload_json",
+  ],
+  project_command_receipts: [
+    "actor_id", "idempotency_key", "room_id", "request_sha256", "response_json", "committed_at",
+  ],
+  project_transfer_chain: [
+    "transfer_id", "room_id", "project_id", "subject_kind", "subject_id",
+    "subject_revision", "from_owner_kind", "from_owner_actor_id", "to_owner_kind",
+    "to_owner_actor_id", "accepted_by_human_actor_id", "reason", "transferred_at",
+  ],
+  project_ball_boundaries: [
+    "boundary_id", "room_id", "project_id", "source_kind", "source_id",
+    "source_revision", "lifecycle_generation", "holder_kind", "holder_actor_id", "reason", "since",
+    "due_at", "status", "released_at",
+  ],
+  project_due_reminder_claims: [
+    "claim_id", "room_id", "boundary_id", "source_revision", "reminder_kind",
+    "reminder_ordinal", "boundary_at", "holder_kind", "holder_actor_id",
+    "recipient_actor_id", "status", "claimed_at", "dispatched_at",
+  ],
+  project_event_outbox: [
+    "event_id", "room_id", "event_seq", "status", "attempts", "available_at", "dispatched_at",
+  ],
+  project_transition_audit: [
+    "audit_id", "room_id", "project_id", "project_revision", "event_id", "operation",
+    "fact_kind", "fact_id", "actor_kind", "actor_id", "transition_json", "occurred_at",
+  ],
+  project_fact_checkpoints: [
+    "checkpoint_id", "room_id", "project_id", "project_revision", "projection_json",
+    "projection_sha256", "created_at",
+  ],
+  project_archive_suspensions: [
+    "room_id", "project_id", "archive_generation", "suspended_project_revision",
+    "suspended_at", "status", "resumed_at",
+  ],
+  project_agent_boundary_claims: [
+    "boundary_id", "source_revision", "room_id", "holder_agent_actor_id",
+    "request_sha256", "status", "attempted_at", "consumed_at",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
+const V24_SCHEMA_CONTRACT = {
+  ...V23_SCHEMA_CONTRACT,
+  project_boundary_agent_invocation_intents: [
+    "intent_id", "room_id", "project_id", "boundary_id", "boundary_kind",
+    "source_kind", "source_id", "source_revision", "lifecycle_generation",
+    "target_agent_actor_id", "profile_id", "profile_revision", "assignment_id",
+    "assignment_revision", "access_revision", "lineage_id", "turn_id",
+    "request_sha256", "status", "authority_version", "created_at", "claimed_at",
+    "cancelled_at", "cancellation_reason", "updated_at",
+  ],
+  project_boundary_agent_executions: [
+    "execution_id", "intent_id", "lineage_id", "execution_ordinal",
+    "retry_of_execution_id", "room_id", "project_id", "agent_actor_id",
+    "source_revision", "lifecycle_generation", "provider_id", "model_id",
+    "public_status", "phase", "current_attempt_seq", "authority_version",
+    "queued_at", "started_at", "updated_at", "completed_at", "cancellation_reason",
+    "terminal_error_code", "result_message_id",
+  ],
+  project_boundary_agent_execution_links: [
+    "intent_id", "execution_id", "execution_ordinal", "retry_of_execution_id",
+    "source_revision", "lifecycle_generation", "linked_at",
+  ],
+  project_boundary_context_sources: [
+    "context_source_id", "intent_id", "execution_id", "execution_ordinal",
+    "room_id", "project_id", "checkpoint_id", "checkpoint_project_revision",
+    "checkpoint_projection_sha256", "source_kind", "source_id", "source_revision",
+    "lifecycle_generation", "created_at",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
+const V25_SCHEMA_CONTRACT = {
+  ...V24_SCHEMA_CONTRACT,
+  events: [
+    "event_id", "stream_kind", "stream_id", "stream_seq", "room_id",
+    "authority_kind", "actor_id", "event_type", "occurred_at", "payload_json",
+  ],
+  project_events: [
+    "event_id", "room_id", "project_id", "event_seq", "event_type", "fact_kind",
+    "fact_id", "fact_revision", "authority_kind", "actor_kind", "actor_id",
+    "causal_actor_kind", "causal_actor_id", "source_room_id", "source_id",
+    "source_kind", "source_revision", "source_visibility", "occurred_at", "payload_json",
+  ],
+  project_transition_audit: [
+    "audit_id", "room_id", "project_id", "project_revision", "event_id", "operation",
+    "fact_kind", "fact_id", "authority_kind", "actor_kind", "actor_id",
+    "causal_actor_kind", "causal_actor_id", "transition_json", "occurred_at",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
@@ -8845,6 +10164,9 @@ const SCHEMA_CONTRACTS = {
   20: V20_SCHEMA_CONTRACT,
   21: V21_SCHEMA_CONTRACT,
   22: V22_SCHEMA_CONTRACT,
+  23: V23_SCHEMA_CONTRACT,
+  24: V24_SCHEMA_CONTRACT,
+  25: V25_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -9091,7 +10413,9 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
       AND stream.stream_id = event.stream_id
      LEFT JOIN actors AS actor ON actor.id = event.actor_id
      WHERE stream.stream_id IS NULL
-        OR actor.id IS NULL
+        OR ${schemaVersion >= 25
+          ? "(event.authority_kind <> 'system_timer' AND actor.id IS NULL)"
+          : "actor.id IS NULL"}
         OR event.stream_seq < 1
         OR event.stream_seq < stream.retained_from_seq
         OR event.stream_seq > stream.head_seq
@@ -10679,6 +12003,283 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
       "legacy room-wide preemption history must remain read-only and production-unreachable",
     );
   }
+  if (schemaVersion >= 23) {
+    requireNoRows(
+      database,
+      `SELECT 1 FROM project_room_states
+       WHERE room_id <> project_id OR revision <> event_head_seq
+          OR event_head_seq <> COALESCE((
+            SELECT MAX(event_seq) FROM project_events
+            WHERE project_events.room_id = project_room_states.room_id
+          ), 0)
+       LIMIT 1`,
+      "Project room revisions must match their immutable event head",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM (
+         SELECT room_id, project_id, source_room_id FROM project_goals
+         UNION ALL SELECT room_id, project_id, source_room_id FROM project_decisions
+         UNION ALL SELECT room_id, project_id, source_room_id FROM project_fact_proposals
+         UNION ALL SELECT room_id, project_id, source_room_id FROM project_confirmations
+         UNION ALL SELECT room_id, project_id, source_room_id FROM project_events
+       ) AS scoped
+       WHERE scoped.room_id <> scoped.project_id OR scoped.room_id <> scoped.source_room_id
+       LIMIT 1`,
+      "Project Loop authority must remain inside the Room-equals-Project boundary",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM project_fact_proposals AS proposal
+       JOIN actors AS proposer ON proposer.id = proposal.proposed_by_actor_id
+       LEFT JOIN actors AS principal ON principal.id = proposal.principal_human_actor_id
+       WHERE proposer.kind <> proposal.proposed_by_kind
+          OR (proposal.principal_human_actor_id IS NOT NULL AND principal.kind <> 'human')
+       LIMIT 1`,
+      "Project proposals must retain proposer and Human principal authority",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM project_confirmations AS confirmation
+       JOIN actors AS principal ON principal.id = confirmation.principal_human_actor_id
+       LEFT JOIN actors AS resolver ON resolver.id = confirmation.resolved_by_human_actor_id
+       JOIN project_fact_proposals AS proposal ON proposal.id = confirmation.proposal_id
+       WHERE principal.kind <> 'human' OR confirmation.room_id <> proposal.room_id
+          OR confirmation.revision <> proposal.revision
+          OR confirmation.base_revision <> proposal.base_revision
+          OR confirmation.state <> proposal.status
+          OR (confirmation.resolved_by_human_actor_id IS NOT NULL AND resolver.kind <> 'human')
+       LIMIT 1`,
+      "Project confirmations must bind pending and terminal Human authority to the proposal revision",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM (
+         SELECT room_id, source_kind, source_revision, visibility_room_id FROM project_requests
+         UNION ALL SELECT room_id, source_kind, source_revision, visibility_room_id FROM project_next_actions
+         UNION ALL SELECT room_id, source_kind, source_revision, visibility_room_id FROM project_obstacles
+       ) AS fact
+       WHERE (fact.source_kind = 'legacy_v14' AND
+              (fact.source_revision IS NOT NULL OR fact.visibility_room_id IS NOT NULL))
+          OR (fact.source_kind <> 'legacy_v14' AND
+              (fact.source_revision IS NULL OR fact.visibility_room_id <> fact.room_id))
+       LIMIT 1`,
+      "legacy Project skeleton rows must remain compatibility-only without invented provenance",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM project_requests
+       WHERE (source_kind = 'legacy_v14' AND
+              (frozen_responsibility_json IS NOT NULL OR frozen_responsibility_sha256 IS NOT NULL))
+          OR (source_kind <> 'legacy_v14' AND
+              (frozen_responsibility_json IS NULL OR frozen_responsibility_sha256 IS NULL))
+       LIMIT 1`,
+      "canonical Project Requests must retain an explicit frozen responsibility factory",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM project_requests AS request
+       LEFT JOIN actors AS resolver ON resolver.id = request.resolution_actor_id
+       WHERE (request.status = 'pending_acceptance' AND
+              (request.resolution_actor_kind IS NOT NULL OR request.resolution_actor_id IS NOT NULL
+               OR request.resolved_at IS NOT NULL))
+          OR (request.status <> 'pending_acceptance' AND request.source_kind <> 'legacy_v14' AND
+              (request.resolution_actor_kind IS NULL OR request.resolution_actor_id IS NULL
+               OR request.resolved_at IS NULL OR resolver.kind <> request.resolution_actor_kind))
+       LIMIT 1`,
+      "canonical Project Request resolution authority must be explicit",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM project_requests AS request
+       LEFT JOIN human_request_intents AS intent
+         ON intent.id = request.source_request_intent_id
+       WHERE (request.source_request_intent_id IS NULL) <> (request.source_target_id IS NULL)
+          OR (request.source_request_intent_id IS NOT NULL AND (
+            intent.id IS NULL OR intent.room_id <> request.room_id
+            OR intent.source_message_id <> request.source_id
+            OR intent.target_id <> request.source_target_id
+            OR intent.source_revision <> request.source_revision
+            OR intent.requester_human_actor_id <> request.requester_human_actor_id
+          ))
+       LIMIT 1`,
+      "Project Requests must retain their exact structured Human Request intent source",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM project_ball_boundaries AS boundary
+       JOIN actors AS holder ON holder.id = boundary.holder_actor_id
+       WHERE holder.kind <> boundary.holder_kind
+          OR boundary.room_id <> boundary.project_id
+       LIMIT 1`,
+      "Project Ball boundaries must retain one same-Room actor-kind holder",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM project_due_reminder_claims AS claim
+       JOIN project_ball_boundaries AS boundary ON boundary.boundary_id = claim.boundary_id
+       WHERE claim.room_id <> boundary.room_id
+          OR claim.source_revision <> boundary.source_revision
+          OR claim.holder_kind <> boundary.holder_kind
+          OR claim.holder_actor_id <> boundary.holder_actor_id
+          OR claim.recipient_actor_id <> claim.holder_actor_id
+          OR (claim.reminder_ordinal = 0 AND claim.reminder_kind <> 'initial_due')
+          OR (claim.reminder_ordinal > 0 AND claim.reminder_kind <> 'repeat_24h')
+       LIMIT 1`,
+      "Project reminder claims must retain exact boundary bucket and recipient authority",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM project_event_outbox AS delivery
+       JOIN project_events AS event ON event.event_id = delivery.event_id
+       WHERE delivery.room_id <> event.room_id OR delivery.event_seq <> event.event_seq
+       LIMIT 1`,
+      "Project outbox records must retain immutable event identity",
+    );
+  }
+  if (schemaVersion >= 24) {
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM project_boundary_agent_invocation_intents AS intent
+       JOIN project_ball_boundaries AS boundary ON boundary.boundary_id = intent.boundary_id
+       JOIN project_agent_boundary_claims AS claim
+         ON claim.boundary_id = intent.boundary_id
+        AND claim.source_revision = intent.source_revision
+       JOIN agent_profile_revisions AS profile_revision
+         ON profile_revision.profile_id = intent.profile_id
+        AND profile_revision.revision = intent.profile_revision
+       JOIN room_agent_assignment_revisions AS assignment_revision
+         ON assignment_revision.assignment_id = intent.assignment_id
+        AND assignment_revision.revision = intent.assignment_revision
+       WHERE intent.room_id <> intent.project_id
+          OR boundary.room_id <> intent.room_id
+          OR boundary.project_id <> intent.project_id
+          OR boundary.source_kind <> intent.source_kind
+          OR boundary.source_id <> intent.source_id
+          OR boundary.source_revision <> intent.source_revision
+          OR boundary.lifecycle_generation <> intent.lifecycle_generation
+          OR boundary.holder_kind <> 'agent'
+          OR boundary.holder_actor_id <> intent.target_agent_actor_id
+          OR claim.room_id <> intent.room_id
+          OR claim.holder_agent_actor_id <> intent.target_agent_actor_id
+          OR claim.request_sha256 <> intent.request_sha256
+          OR profile_revision.actor_id <> intent.target_agent_actor_id
+          OR assignment_revision.room_id <> intent.room_id
+          OR assignment_revision.profile_id <> intent.profile_id
+          OR assignment_revision.agent_actor_id <> intent.target_agent_actor_id
+       LIMIT 1`,
+      "Project boundary Agent intents must retain exact frozen authority and source lineage",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM project_boundary_agent_execution_links AS link
+       JOIN project_boundary_agent_invocation_intents AS intent
+         ON intent.intent_id = link.intent_id
+       JOIN project_boundary_agent_executions AS execution
+         ON execution.execution_id = link.execution_id
+       WHERE link.source_revision <> intent.source_revision
+          OR link.lifecycle_generation <> intent.lifecycle_generation
+          OR execution.room_id <> intent.room_id
+          OR execution.project_id <> intent.project_id
+          OR execution.agent_actor_id <> intent.target_agent_actor_id
+          OR execution.lifecycle_generation <> intent.lifecycle_generation
+       LIMIT 1`,
+      "Project boundary executions must retain message-independent frozen lineage",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM project_boundary_context_sources AS source
+       JOIN project_boundary_agent_invocation_intents AS intent
+         ON intent.intent_id = source.intent_id
+       JOIN project_boundary_agent_execution_links AS link
+         ON link.intent_id = source.intent_id
+        AND link.execution_id = source.execution_id
+        AND link.execution_ordinal = source.execution_ordinal
+       JOIN project_fact_checkpoints AS checkpoint
+         ON checkpoint.checkpoint_id = source.checkpoint_id
+       WHERE source.room_id <> intent.room_id
+          OR source.project_id <> intent.project_id
+          OR source.source_kind <> intent.source_kind
+          OR source.source_id <> intent.source_id
+          OR source.source_revision <> intent.source_revision
+          OR source.lifecycle_generation <> intent.lifecycle_generation
+          OR checkpoint.room_id <> source.room_id
+          OR checkpoint.project_id <> source.project_id
+          OR checkpoint.project_revision <> source.checkpoint_project_revision
+          OR checkpoint.projection_sha256 <> source.checkpoint_projection_sha256
+       LIMIT 1`,
+      "Project boundary context sources must retain exact checkpoint and execution lineage",
+    );
+  }
+  if (schemaVersion >= 25) {
+    requireNoRows(
+      database,
+      `SELECT 1 FROM project_events AS event
+       LEFT JOIN actors AS authority ON authority.id = event.actor_id
+       LEFT JOIN actors AS causal ON causal.id = event.causal_actor_id
+       LEFT JOIN events AS public ON public.event_id = event.event_id
+       LEFT JOIN project_transition_audit AS audit ON audit.event_id = event.event_id
+       LEFT JOIN project_event_outbox AS delivery ON delivery.event_id = event.event_id
+       WHERE audit.event_id IS NULL OR delivery.event_id IS NULL
+          OR delivery.room_id <> event.room_id OR delivery.event_seq <> event.event_seq
+          OR (event.authority_kind = 'system_timer' AND (
+            event.actor_kind IS NOT NULL OR event.actor_id IS NOT NULL
+            OR event.causal_actor_kind IS NOT NULL OR event.causal_actor_id IS NOT NULL
+            OR event.event_type <> 'fact.transitioned'
+            OR json_type(event.payload_json, '$.transition') IS NOT 'text'
+            OR (json_extract(event.payload_json, '$.transition') = 'review_due' AND (
+              event.fact_kind NOT IN ('blocker','open_question')
+              OR public.event_type <> CASE event.fact_kind WHEN 'blocker'
+                THEN 'project.blocker.changed' ELSE 'project.open-question.changed' END
+              OR json_extract(public.payload_json, '$.obstacleId') IS NOT event.fact_id
+              OR json_extract(public.payload_json, '$.revision') IS NOT event.fact_revision))
+            OR (json_extract(event.payload_json, '$.transition') IN (
+                  'transfer_expired','review_due_transfer_rebound') AND (
+              event.fact_kind NOT IN ('next_action','blocker','open_question')
+              OR json_type(event.payload_json, '$.transferProposalId') IS NOT 'text'
+              OR (json_extract(event.payload_json, '$.migratedFromV24') IS TRUE AND (
+                json_extract(event.payload_json, '$.transition') <> 'transfer_expired'
+                OR public.event_type <> CASE event.fact_kind
+                  WHEN 'next_action' THEN 'project.next-action.changed'
+                  WHEN 'blocker' THEN 'project.blocker.changed'
+                  ELSE 'project.open-question.changed' END
+                OR json_extract(public.payload_json,
+                     CASE event.fact_kind WHEN 'next_action' THEN '$.nextActionId'
+                       ELSE '$.obstacleId' END) IS NOT event.fact_id
+                OR json_extract(public.payload_json, '$.revision') IS NOT event.fact_revision))
+              OR (json_extract(event.payload_json, '$.migratedFromV24') IS NOT TRUE AND (
+                json_type(event.payload_json, '$.transferRevision') IS NOT 'integer'
+                OR public.event_type <> 'project.transfer-proposal.changed'
+                OR json_extract(public.payload_json, '$.transferProposalId') IS NOT
+                    json_extract(event.payload_json, '$.transferProposalId')
+                OR json_extract(public.payload_json, '$.revision') IS NOT
+                    json_extract(event.payload_json, '$.transferRevision')))))
+            OR json_extract(event.payload_json, '$.transition') NOT IN (
+              'review_due','transfer_expired','review_due_transfer_rebound')
+            OR public.event_id IS NULL OR public.authority_kind <> 'system_timer'
+            OR public.actor_id IS NOT NULL))
+          OR (event.authority_kind IN ('human','agent') AND (
+            public.event_id IS NULL OR causal.kind <> event.causal_actor_kind
+            OR event.actor_kind <> event.authority_kind OR authority.kind <> event.authority_kind
+            OR public.authority_kind <> event.authority_kind OR public.actor_id <> event.actor_id))
+       LIMIT 1`,
+      "Project events must retain closed Human, Agent, or system timer authority",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1 FROM project_transition_audit AS audit
+       JOIN project_events AS event ON event.event_id = audit.event_id
+       WHERE audit.authority_kind <> event.authority_kind
+          OR audit.actor_kind IS NOT event.actor_kind OR audit.actor_id IS NOT event.actor_id
+          OR audit.causal_actor_kind IS NOT event.causal_actor_kind
+          OR audit.causal_actor_id IS NOT event.causal_actor_id
+       LIMIT 1`,
+      "Project audit authority must match its immutable stored event",
+    );
+  }
 }
 
 function validateExistingSchema(database: DatabaseSync, currentVersion: number): void {
@@ -10875,6 +12476,7 @@ function migrateAuthorityDatabaseToVersion(
         );
       }
     }
+    database.exec("PRAGMA legacy_alter_table = OFF");
     throw error;
   }
 }

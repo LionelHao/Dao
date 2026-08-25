@@ -96,7 +96,7 @@ describe("Memory Authority production renderer bridge", () => {
     }, { onNavigateSource: navigate });
     await vi.waitFor(() => expect(root.textContent).toContain("Review the attached migration report."));
 
-    root.querySelector<HTMLButtonElement>("[data-source-id]")?.click();
+    root.querySelector<HTMLButtonElement>("button[data-source-id]")?.click();
     expect(navigate).toHaveBeenCalledWith({
       roomId: "room-1", accessEpoch: 3,
       navigation: { kind: "attachment", attachmentId: "attachment-1" },

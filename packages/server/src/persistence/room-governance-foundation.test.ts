@@ -285,6 +285,14 @@ describe("FT-02A room governance foundation", () => {
       { eventType: "room.security.reduced" },
       { eventType: "room.reopened" },
     ]);
+    expect(database.prepare(
+      `SELECT archive_generation AS archiveGeneration, status, resumed_at AS resumedAt
+       FROM project_archive_suspensions WHERE room_id = ?`,
+    ).get(value.roomId)).toEqual({
+      archiveGeneration: 1,
+      status: "resumed",
+      resumedAt: expect.any(String),
+    });
     database.close();
     await value.client.close();
   });

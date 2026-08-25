@@ -27,7 +27,11 @@ import {
   type WorkerDatabaseClient,
 } from "./persistence/worker-database-client.js";
 import { createAgentRuntimeService, type AgentRuntimeService } from "./agent-runtime/agent-runtime-service.js";
-import { AgentRuntimeError, type ProviderAdapter } from "./agent-runtime/contracts.js";
+import {
+  AgentRuntimeError,
+  type ProviderAdapter,
+  type SecretProvider,
+} from "./agent-runtime/contracts.js";
 import { createEnvironmentSecretProvider } from "./agent-runtime/environment-secret-provider.js";
 import { createOpenAIResponsesProvider } from "./agent-runtime/openai-responses-provider.js";
 import {
@@ -81,10 +85,16 @@ import {
   type MemoryStewardRuntime,
 } from "./room-memory/memory-steward-runtime.js";
 import {
-  createFailClosedProjectBoundaryInvocationProducer,
-  createWorkerProjectBoundaryInvocationAuthority,
+  createAuthoritativeProjectBoundaryInvocationProducer,
+  createWorkerAuthoritativeProjectBoundaryInvocationAuthority,
   type ProjectBoundaryInvocationProducer,
 } from "./project-boundary/project-boundary-invocation-producer.js";
+import {
+  createProjectBoundaryRuntime,
+  type ProjectBoundaryRuntime,
+} from "./project-boundary/project-boundary-runtime.js";
+import { createProjectLoopWorkerAuthorityTransport } from
+  "./project-loop/worker-authority-adapter.js";
 
 export { createProductionSharedAuthorityParticipantComposition } from "./room-governance/production-participant-composition.js";
 
@@ -172,6 +182,7 @@ interface AuthoritativeServerTestOptions {
     | "attachment-processing"
     | "memory"
     | "route"
+    | "project-boundary"
     | "runtime"
     | "ball"
     | "snapshots"
@@ -193,6 +204,14 @@ export interface AuthoritativeServerTestFacades {
 const AGENT_MODEL_CONTEXT_WINDOWS: Readonly<Record<string, number>> = Object.freeze({
   "gpt-5-mini": 400_000,
 });
+
+export function createAgentProviderReadinessProbe(input: Readonly<{
+  providerConfigured: boolean;
+  secretProvider: Pick<SecretProvider, "getSecret">;
+}>): () => boolean {
+  return () => input.providerConfigured ||
+    input.secretProvider.getSecret("OPENAI_API_KEY") !== undefined;
+}
 
 export function assertAgentRuntimeModelContextCapability(input: Readonly<{
   model: string;
@@ -272,6 +291,7 @@ async function start(
   let runtime: AgentRuntimeService | undefined;
   let kickDirectIntentConsumer: () => void = () => undefined;
   let stopRuntimeRecovery: (() => void) | undefined;
+  let projectBoundaryRuntime: ProjectBoundaryRuntime | undefined;
   let sourceScopedRuntimeBoundary: SourceScopedRuntimeBoundary | undefined;
   let routeRuntime: RouteRuntimeService | undefined;
   let ballRuntime: BallRuntimeService | undefined;
@@ -566,14 +586,6 @@ async function start(
       queryStore: authority,
     });
     const primitives = createAuthoritativeCollaborationPrimitives({ commandStore });
-    const projectBoundary = createFailClosedProjectBoundaryInvocationProducer({
-      authority: createWorkerProjectBoundaryInvocationAuthority(
-        worker as CompleteWorkerDatabaseClient,
-      ),
-    });
-    await testOptions.initialize?.({
-      auth, lifecycle, messages: service, primitives, projectBoundary,
-    });
     const runtimeConfiguration = options.agentRuntime ?? {};
     const authorityWorker = worker as CompleteWorkerDatabaseClient;
     const memoryAuthority = createWorkerMemoryAuthority({ worker, nowMs: Date.now });
@@ -581,6 +593,78 @@ async function start(
       endpoint: runtimeConfiguration.endpoint ?? "https://api.openai.com/v1/responses",
       model: runtimeModel,
       secretProvider,
+    });
+    const agentProviderReady = createAgentProviderReadinessProbe({
+      providerConfigured: testOptions.agentRuntimeProviderForTest !== undefined,
+      secretProvider,
+    });
+    projectBoundaryRuntime = createProjectBoundaryRuntime({
+      authority: authorityWorker,
+      provider,
+    });
+    const authoritativeProjectBoundary = createAuthoritativeProjectBoundaryInvocationProducer({
+      authority: createWorkerAuthoritativeProjectBoundaryInvocationAuthority(authorityWorker, {
+        providerId: provider.id,
+        modelId: runtimeModel,
+      }),
+    });
+    const projectBoundary: ProjectBoundaryInvocationProducer = Object.freeze({
+      async consume(request: Parameters<ProjectBoundaryInvocationProducer["consume"]>[0]) {
+        const result = await authoritativeProjectBoundary.consume(request);
+        if (result.status === "intent-created" && agentProviderReady()) {
+          await projectBoundaryRuntime?.scan();
+        }
+        return result;
+      },
+    });
+    await testOptions.initialize?.({
+      auth, lifecycle, messages: service, primitives, projectBoundary,
+    });
+    let projectBoundaryScan: Promise<void> | undefined;
+    const scanProjectBoundaries = (): Promise<void> => {
+      projectBoundaryScan ??= (async () => {
+        const now = Date.now();
+        const ready = agentProviderReady();
+        const agentScan = await authorityWorker.executeRuntime({
+          type: "runtime.scan-project-agent-boundaries",
+          providerId: provider.id,
+          modelId: runtimeModel,
+          agentProviderReady: ready,
+          limit: 256,
+          now,
+        });
+        if (typeof agentScan !== "object" || agentScan === null ||
+            !("kind" in agentScan) || agentScan.kind !== "project-agent-boundary-scan") {
+          throw new Error("Project Agent boundary scan result was malformed");
+        }
+        const reminderScan = await authorityWorker.executeRuntime({
+          type: "runtime.scan-project-reminders",
+          providerId: provider.id,
+          modelId: runtimeModel,
+          agentProviderReady: ready,
+          limit: 256,
+          now,
+        });
+        if (typeof reminderScan !== "object" || reminderScan === null ||
+            !("kind" in reminderScan) || reminderScan.kind !== "project-reminder-scan") {
+          throw new Error("Project reminder scan result was malformed");
+        }
+        if (ready) {
+          await projectBoundaryRuntime?.scan();
+        }
+      })().finally(() => { projectBoundaryScan = undefined; });
+      return projectBoundaryScan;
+    };
+    const baseProjectLoopAuthority = createProjectLoopWorkerAuthorityTransport(authorityWorker);
+    const projectLoopAuthority = Object.freeze({
+      executeQuery: baseProjectLoopAuthority.executeQuery,
+      async executeMutation(
+        ...args: Parameters<typeof baseProjectLoopAuthority.executeMutation>
+      ) {
+        const result = await baseProjectLoopAuthority.executeMutation(...args);
+        void scanProjectBoundaries().catch(() => undefined);
+        return result;
+      },
     });
     const sandboxRoot = resolve(
       runtimeConfiguration.sandboxRoot ?? resolve(dirname(options.databasePath), "agent-sandbox"),
@@ -727,10 +811,30 @@ async function start(
       provider: routerProvider,
       memoryReadiness: { read: memoryAuthority.readReadiness },
       projectFacts: {
-        async read() {
-          // FT-09 owns versioned Goal/checkpoint/due/Blocker facts. Until that
-          // authority is installed, proactive routing must stop before Provider.
-          return { status: "dependency_unavailable" } as const;
+        async read(roomId) {
+          const result = await authorityWorker.executeRuntime({
+            type: "runtime.read-project-route-facts", roomId, now: Date.now(),
+          });
+          if (typeof result !== "object" || result === null || !("kind" in result) ||
+              result.kind !== "project-route-facts" || !("result" in result)) {
+            throw new Error("Project route facts result was malformed");
+          }
+          const facts = result.result;
+          if (typeof facts !== "object" || facts === null || !("status" in facts)) {
+            throw new Error("Project route facts result was malformed");
+          }
+          if (facts.status === "dependency_unavailable") {
+            return { status: "dependency_unavailable" } as const;
+          }
+          if (facts.status !== "ready" || !("goalRevision" in facts) ||
+              !("projectRevision" in facts) || typeof facts.goalRevision !== "number" ||
+              !Number.isSafeInteger(facts.goalRevision) || facts.goalRevision < 1 ||
+              typeof facts.projectRevision !== "number" ||
+              !Number.isSafeInteger(facts.projectRevision) || facts.projectRevision < 1) {
+            throw new Error("Project route facts result was malformed");
+          }
+          return { status: "ready", goalRevision: facts.goalRevision,
+            projectRevision: facts.projectRevision } as const;
         },
       },
       agentReadiness: () => testOptions.agentRuntimeProviderForTest !== undefined ||
@@ -909,10 +1013,12 @@ async function start(
     await runtime.recover();
     await afterCommittedProducerCommand();
     kickDirectIntentConsumer();
+    await scanProjectBoundaries();
     const runtimeRecoveryTimer = setInterval(() => {
       void runtime?.recover().catch(() => undefined);
       void afterCommittedProducerCommand();
       kickDirectIntentConsumer();
+      void scanProjectBoundaries().catch(() => undefined);
     }, 1_000);
     runtimeRecoveryTimer.unref();
     stopRuntimeRecovery = () => clearInterval(runtimeRecoveryTimer);
@@ -998,6 +1104,7 @@ async function start(
       ballRuntime,
       messageAuthority,
       memoryAuthority: publicMemoryAuthority,
+      projectLoopAuthority,
       agentSettingsAuthority: agentSettings,
       ...(attachmentAuthority === undefined ? {} : { attachmentAuthority }),
       governance: governanceStore,
@@ -1014,6 +1121,7 @@ async function start(
     await attachmentProcessing?.close().catch(() => undefined);
     await routeRuntime?.close().catch(() => undefined);
     await ballRuntime?.close().catch(() => undefined);
+    await projectBoundaryRuntime?.close().catch(() => undefined);
     await runtime?.close().catch(() => undefined);
     await snapshots?.close().catch(() => undefined);
     await worker?.close().catch(() => undefined);
@@ -1036,6 +1144,7 @@ async function start(
           ["attachment-processing", async () => attachmentProcessing?.close()],
           ["memory", async () => memoryRuntime?.stop()],
           ["route", () => routeRuntime!.close()],
+          ["project-boundary", () => projectBoundaryRuntime!.close()],
           ["runtime", () => runtime!.close()],
           ["ball", () => ballRuntime!.close()],
           ["snapshots", () => snapshots.close()],

@@ -67,6 +67,7 @@ function renderExecution(
   const card = document.createElement("article");
   card.className = `invocation-card invocation-card--${execution.status}`;
   card.dataset.executionId = execution.executionId;
+  card.dataset.executionRevision = String(execution.version);
   card.dataset.status = execution.status;
   card.dataset.phase = execution.phase;
   card.tabIndex = -1;
@@ -289,7 +290,13 @@ export function mountInvocationSurface(
       for (const boundary of state.projectBoundaries) {
         const item = document.createElement("li");
         item.textContent = boundary.status === "intent-created" ? "项目边界已创建调用意图"
-          : `项目边界已关闭：${boundary.reason}`;
+          : boundary.status === "execution-state"
+            ? `项目边界执行：${boundary.executionStatus}`
+            : `项目边界已关闭：${boundary.reason}`;
+        if (boundary.status === "execution-state") {
+          item.dataset.projectBoundaryExecutionStatus = boundary.executionStatus;
+          item.dataset.projectBoundaryExecutionId = boundary.executionId;
+        }
         boundaries.append(item);
       }
       panel.append(boundaries);

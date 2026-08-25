@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { IdentityBridge } from "../identity/contracts.js";
 import type { GovernanceBridge } from "../governance/contracts.js";
@@ -6,6 +8,7 @@ import type { AttachmentAuthorityBridge } from "../attachment-authority/contract
 import type { MemoryAuthorityBridge } from "../memory-authority/contracts.js";
 import type { AgentSettingsBridge } from "../agent-profile-routing/contracts.js";
 import type { InvocationBridge } from "../invocation-runtime/contracts.js";
+import type { ProjectLoopBridge } from "../project-loop/contracts.js";
 import { mountDesktopRendererEntry } from "./entry.js";
 
 const bridge = {} as IdentityBridge;
@@ -15,6 +18,7 @@ const attachmentAuthority = {} as AttachmentAuthorityBridge;
 const memoryAuthority = {} as MemoryAuthorityBridge;
 const agentSettings = {} as AgentSettingsBridge;
 const invocation = {} as InvocationBridge;
+const projectLoop = {} as ProjectLoopBridge;
 
 function ports() {
   return {
@@ -27,6 +31,7 @@ function ports() {
     mountMemoryAuthoritySurface: vi.fn(() => vi.fn()),
     mountAgentSettingsSurface: vi.fn(() => vi.fn()),
     mountInvocationSurface: vi.fn(() => vi.fn()),
+    mountProjectLoopSurface: vi.fn(() => vi.fn()),
   };
 }
 
@@ -222,6 +227,53 @@ describe("Desktop renderer route entry", () => {
     window.removeEventListener("popstate", popstate);
     dispose?.();
     expect(disposeInvocation).toHaveBeenCalledOnce();
+    root.remove();
+  });
+
+  it("mounts one tabbed authority rail and keeps the 840px Project segment non-overlapping", () => {
+    const root = document.createElement("main"); const renderers = ports();
+    document.body.append(root);
+    const dispose = mountDesktopRendererEntry(
+      root, "?message-room=room-1", bridge, governance, messageAuthority, renderers,
+      undefined, memoryAuthority, agentSettings, invocation, projectLoop,
+    );
+    const workspace = root.querySelector<HTMLElement>(".room-authority-workspace")!;
+    const timeline = workspace.querySelector<HTMLElement>(".room-authority-workspace__timeline")!;
+    const project = workspace.querySelector<HTMLElement>(".room-authority-workspace__project")!;
+    const memory = workspace.querySelector<HTMLElement>(".room-authority-workspace__memory")!;
+    const executions = workspace.querySelector<HTMLElement>(".room-authority-workspace__invocations")!;
+    const rail = workspace.querySelector<HTMLElement>(".room-authority-workspace__rail")!;
+    expect(rail.contains(project)).toBe(true);
+    expect(rail.contains(memory)).toBe(true);
+    expect(rail.contains(executions)).toBe(true);
+    expect(renderers.mountProjectLoopSurface).toHaveBeenCalledWith(
+      project, projectLoop, "room-1", messageAuthority,
+    );
+    expect(project.hidden).toBe(false);
+    expect(memory.hidden).toBe(true);
+    expect(executions.hidden).toBe(true);
+    const memoryTab = rail.querySelector<HTMLButtonElement>('[data-authority-rail-tab="memory"]')!;
+    memoryTab.click();
+    expect(project.hidden).toBe(true);
+    expect(memory.hidden).toBe(false);
+    expect(executions.hidden).toBe(true);
+    rail.querySelector<HTMLButtonElement>('[data-authority-rail-tab="project"]')?.click();
+    expect(workspace.dataset.compactSegment).toBe("timeline");
+    const projectSegment = workspace.querySelector<HTMLButtonElement>(
+      '[data-compact-segment-target="project"]',
+    )!;
+    projectSegment.click();
+    expect(workspace.dataset.compactSegment).toBe("project");
+    expect(projectSegment.getAttribute("aria-pressed")).toBe("true");
+    expect(document.activeElement).toBe(rail);
+    expect(workspace.querySelector('[data-compact-segment-target="timeline"]')?.textContent).toBe("时间线");
+    expect(timeline.className).toContain("timeline");
+    const css = readFileSync(resolve(process.cwd().endsWith("packages/desktop") ? "src" : "packages/desktop/src",
+      "renderer/memory-authority/memory-authority.css"), "utf8");
+    expect(css).toContain("grid-template-columns: minmax(0, 1fr) minmax(18rem, 24rem)");
+    expect(css).toContain('[data-compact-segment="timeline"] .room-authority-workspace__rail');
+    expect(css).not.toContain(".room-authority-workspace__project,\n  .room-authority-workspace__memory { grid-column: 1; grid-row: 2; }");
+    dispose?.();
     root.remove();
   });
 

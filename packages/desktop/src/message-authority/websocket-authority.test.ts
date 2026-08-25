@@ -160,6 +160,20 @@ describe("Message Authority WebSocket transport", () => {
       error: { closedError: { status: 403, code: "room_forbidden" } },
     });
     expect(parseMessageAuthorityServerFrame(JSON.stringify({
+      type: "error", requestId: "project-archived", status: 410,
+      code: "room_archived", message: "archived",
+    }))).toMatchObject({
+      type: "error", requestId: "project-archived",
+      error: { projectError: { status: 410, code: "room_archived" } },
+    });
+    expect(parseMessageAuthorityServerFrame(JSON.stringify({
+      type: "error", requestId: "project-invalid", status: 400,
+      code: "invalid_request", message: "invalid",
+    }))).toMatchObject({
+      type: "error", requestId: "project-invalid",
+      error: { projectError: { status: 400, code: "invalid_request" } },
+    });
+    expect(parseMessageAuthorityServerFrame(JSON.stringify({
       type: "room.memory.status.v1",
       requestId: "memory-status-1",
       roomId: "room-1",

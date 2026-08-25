@@ -130,6 +130,25 @@ import {
   readOperationalTimelineMessage,
 } from
   "../message-authority/sqlite-operational-message-projection.js";
+import {
+  HumanRequestMessageParticipantError,
+  type HumanRequestMessageBinding,
+  type HumanRequestMessageTransactionParticipant,
+} from "../project-loop/message-human-request-participant.js";
+import {
+  beginProjectBoundaryExecutionInTransaction,
+  claimProjectBoundaryInvocationInTransaction,
+  finishProjectBoundaryExecutionInTransaction,
+  listRunnableProjectBoundaryExecutions,
+} from "../project-boundary/project-boundary-authority.js";
+import {
+  archiveProjectLoopBoundariesInTransaction,
+  reopenProjectLoopBoundariesInTransaction,
+  scanProjectReminderBucketsInTransaction,
+} from "../project-loop/boundary-authority.js";
+import { readProjectRouteFactsInTransaction } from "../project-loop/route-project-facts.js";
+import { advanceProjectLoopTimedTransitionsInTransaction } from
+  "../project-loop/database-authority.js";
 import { canStartRuntimeGenerationInTransaction } from "../agent-runtime/runtime-archive-fence-participant.js";
 import {
   commitInternalScopedProducerInTransaction,
@@ -1555,12 +1574,36 @@ function parseRoomSyncEvent(
       occurredAt: row.occurredAt as string,
     }, messageId);
   }
+  if (row.streamKind === "room" && typeof row.eventType === "string" &&
+      row.eventType.startsWith("project.")) {
+    const transitionAuthority = row.authorityKind === "system_timer"
+      ? { kind: "system_timer" as const }
+      : { kind: row.authorityKind, actorId: row.authorityActorId };
+    const parsed = parsePersistedRoomEvent({
+      eventId: row.eventId,
+      streamKind: "room",
+      streamId: row.streamId,
+      streamSeq: row.streamSeq,
+      roomId: row.roomId,
+      projectId: row.roomId,
+      transitionAuthority,
+      causalActor: row.authorityKind === "system_timer"
+        ? null : { kind: row.causalActorKind, actorId: row.causalActorId },
+      occurredAt: row.occurredAt,
+      type: row.eventType,
+      payload,
+    });
+    if (parsed.ok) return parsed.value;
+    return fail("storage_unavailable", "Stored Project outbox event is corrupt");
+  }
   const parsed = parsePersistedRoomEvent({
     eventId: row.eventId,
     streamKind: row.streamKind,
     streamId: row.streamId,
     streamSeq: row.streamSeq,
     roomId: row.roomId,
+    ...(typeof row.eventType === "string" && row.eventType.startsWith("project.")
+      ? { projectId: row.roomId } : {}),
     actorId: row.actorId,
     occurredAt: row.occurredAt,
     type: row.eventType,
@@ -1629,14 +1672,20 @@ export function syncRoomDatabaseQuery(
 
     const limit = request.limit ?? ROOM_SYNC_DEFAULT_LIMIT;
     const rows = database.prepare(
-      `SELECT event_id AS eventId, stream_kind AS streamKind,
-              stream_id AS streamId, stream_seq AS streamSeq, room_id AS roomId,
-              actor_id AS actorId, event_type AS eventType,
-              occurred_at AS occurredAt, payload_json AS payloadJson
-       FROM events
-       WHERE stream_kind = 'room' AND stream_id = ?
-         AND stream_seq > ? AND stream_seq <= ?
-       ORDER BY stream_seq
+      `SELECT event.event_id AS eventId, event.stream_kind AS streamKind,
+              event.stream_id AS streamId, event.stream_seq AS streamSeq,
+              event.room_id AS roomId, event.actor_id AS actorId,
+              project.authority_kind AS authorityKind,
+              project.actor_id AS authorityActorId,
+              project.causal_actor_kind AS causalActorKind,
+              project.causal_actor_id AS causalActorId,
+              event.event_type AS eventType, event.occurred_at AS occurredAt,
+              event.payload_json AS payloadJson
+       FROM events AS event
+       LEFT JOIN project_events AS project ON project.event_id = event.event_id
+       WHERE event.stream_kind = 'room' AND event.stream_id = ?
+         AND event.stream_seq > ? AND event.stream_seq <= ?
+       ORDER BY event.stream_seq
        LIMIT ?`,
     ).all(request.roomId, request.cursor.afterSeq, watermark, limit);
     const events: PersistedRoomEvent[] = [];
@@ -1962,6 +2011,28 @@ function parseOutboxEvent(
       occurredAt: row.occurredAt as string,
     }, messageId);
   }
+  if (row.streamKind === "room" && typeof row.eventType === "string" &&
+      row.eventType.startsWith("project.")) {
+    const transitionAuthority = row.authorityKind === "system_timer"
+      ? { kind: "system_timer" as const }
+      : { kind: row.authorityKind, actorId: row.authorityActorId };
+    const parsed = parsePersistedRoomEvent({
+      eventId: row.eventId,
+      streamKind: "room",
+      streamId: row.streamId,
+      streamSeq: row.streamSeq,
+      roomId: row.roomId,
+      projectId: row.roomId,
+      transitionAuthority,
+      causalActor: row.authorityKind === "system_timer"
+        ? null : { kind: row.causalActorKind, actorId: row.causalActorId },
+      occurredAt: row.occurredAt,
+      type: row.eventType,
+      payload,
+    });
+    if (parsed.ok) return parsed.value;
+    return fail("storage_unavailable", "Stored Project outbox event is corrupt");
+  }
   const envelope = {
     eventId: row.eventId,
     streamKind: row.streamKind,
@@ -1973,7 +2044,9 @@ function parseOutboxEvent(
     payload,
   };
   if (row.streamKind === "room") {
-    const parsed = parsePersistedRoomEvent({ ...envelope, roomId: row.roomId });
+    const parsed = parsePersistedRoomEvent({ ...envelope, roomId: row.roomId,
+      ...(typeof row.eventType === "string" && row.eventType.startsWith("project.")
+        ? { projectId: row.roomId } : {}) });
     if (parsed.ok) return parsed.value;
   } else if (row.streamKind === "identity") {
     const parsed = parsePersistedIdentityEvent(envelope);
@@ -2018,6 +2091,10 @@ export function listPendingOutboxDatabaseQuery(
          event.stream_id AS streamId,
          event.room_id AS roomId,
          event.actor_id AS actorId,
+         project.authority_kind AS authorityKind,
+         project.actor_id AS authorityActorId,
+         project.causal_actor_kind AS causalActorKind,
+         project.causal_actor_id AS causalActorId,
          event.event_type AS eventType,
          event.occurred_at AS occurredAt,
          event.payload_json AS payloadJson
@@ -2025,6 +2102,7 @@ export function listPendingOutboxDatabaseQuery(
        JOIN events AS event
          ON event.event_id = delivery.event_id
         AND event.stream_seq = delivery.stream_seq
+       LEFT JOIN project_events AS project ON project.event_id = event.event_id
        WHERE delivery.status = 'pending'
          AND delivery.available_at <= ?
        ORDER BY delivery.stream_seq, delivery.id
@@ -3727,6 +3805,24 @@ function executeClosedLifecycle(
             roomScopedInput,
             roomScopedPrepared.deferredExecutions,
           );
+        }
+
+        if (command.type === "room.archive") {
+          archiveProjectLoopBoundariesInTransaction(database, {
+            roomId: command.roomId,
+            actorId,
+            archiveGeneration: result.governance.archiveGeneration,
+            previousLifecycleGeneration: result.governance.archiveGeneration - 1,
+            occurredAt: acceptedAt,
+          });
+        } else {
+          reopenProjectLoopBoundariesInTransaction(database, {
+            roomId: command.roomId,
+            actorId,
+            archiveGeneration: result.governance.archiveGeneration,
+            previousLifecycleGeneration: result.governance.archiveGeneration,
+            occurredAt: acceptedAt,
+          });
         }
 
         const auditType = command.type === "room.archive" ? "room.archived" : "room.reopened";
@@ -7262,6 +7358,171 @@ export function executeRuntimeAuthorityOperation(
       );
       return { kind: "project-boundary", result };
     }
+    if (operation.type === "runtime.claim-project-boundary") {
+      return { kind: "project-boundary", result: claimProjectBoundaryInvocationInTransaction(
+        database,
+        {
+          request: operation.request,
+          requestSha256: operation.requestSha256,
+          attemptedAt: operation.attemptedAt,
+          providerId: operation.providerId,
+          modelId: operation.modelId,
+          ...(operation.intentId === undefined ? {} : { intentId: operation.intentId }),
+        },
+      ) };
+    }
+    if (operation.type === "runtime.scan-project-boundary-executions") {
+      return { kind: "project-boundary-executions",
+        records: listRunnableProjectBoundaryExecutions(database, operation.limit) };
+    }
+    if (operation.type === "runtime.scan-project-reminders") {
+      return { kind: "project-reminder-scan", result: scanProjectReminderBucketsInTransaction(
+        database,
+        { now: occurredAt, limit: operation.limit,
+          agentProviderReady: operation.agentProviderReady },
+        (transaction, intent) => {
+          const request = {
+            purpose: "project_boundary_invocation" as const,
+            boundaryId: intent.boundaryId,
+            boundaryKind: intent.boundaryKind,
+            projectId: intent.roomId,
+            roomId: intent.roomId,
+            agentId: intent.agentActorId,
+            sourceFactId: intent.sourceId,
+            sourceFactRevision: intent.sourceRevision,
+          };
+          const requestSha256 = createHash("sha256").update(canonicalJson(request)).digest("hex");
+          const result = claimProjectBoundaryInvocationInTransaction(transaction, {
+            request,
+            requestSha256,
+            attemptedAt: intent.createdAt,
+            providerId: operation.providerId,
+            modelId: operation.modelId,
+            intentId: intent.intentId,
+          });
+          if (result.status !== "intent-created" || result.intentId !== intent.intentId) {
+            throw new Error("Agent reminder failed to create its Project boundary intent");
+          }
+        },
+      ) };
+    }
+    if (operation.type === "runtime.scan-project-agent-boundaries") {
+      if (!operation.agentProviderReady) {
+        return { kind: "project-agent-boundary-scan", scannedCount: 0,
+          createdCount: 0, suppressedCount: 0 };
+      }
+      advanceProjectLoopTimedTransitionsInTransaction(database, {
+        now: occurredAt, limit: operation.limit,
+      });
+      const rows = database.prepare(
+        `SELECT boundary.boundary_id AS boundaryId, boundary.room_id AS roomId,
+                boundary.project_id AS projectId, boundary.source_kind AS sourceKind,
+                boundary.source_id AS sourceId, boundary.source_revision AS sourceRevision,
+                boundary.holder_actor_id AS agentId, boundary.due_at AS dueAt
+         FROM project_ball_boundaries AS boundary
+         JOIN rooms AS room ON room.id = boundary.room_id
+         JOIN room_memberships AS membership
+           ON membership.room_id = boundary.room_id
+          AND membership.actor_id = boundary.holder_actor_id
+          AND membership.kind = 'agent' AND membership.participation = 'active'
+         JOIN agent_profiles AS profile
+           ON profile.actor_id = boundary.holder_actor_id AND profile.status = 'enabled'
+         JOIN room_agent_assignments AS assignment
+           ON assignment.room_id = boundary.room_id
+          AND assignment.agent_actor_id = boundary.holder_actor_id
+          AND assignment.status = 'current' AND assignment.participation = 'active'
+          AND assignment.paused = 0
+         WHERE boundary.status = 'active' AND boundary.holder_kind = 'agent'
+           AND room.status = 'active'
+           AND EXISTS (SELECT 1 FROM json_each(assignment.capability_subset_json)
+                       WHERE value = 'room.project.read')
+           AND EXISTS (SELECT 1 FROM json_each(assignment.capability_subset_json)
+                       WHERE value = 'room.respond')
+           AND EXISTS (SELECT 1 FROM json_each(profile.capability_ceiling_json)
+                       WHERE value = 'room.project.read')
+           AND EXISTS (SELECT 1 FROM json_each(profile.capability_ceiling_json)
+                       WHERE value = 'room.respond')
+           AND NOT (boundary.source_kind = 'review' AND
+             (boundary.due_at IS NULL OR boundary.due_at > ?))
+           AND NOT EXISTS (
+             SELECT 1 FROM project_boundary_agent_invocation_intents AS intent
+             WHERE intent.boundary_id = boundary.boundary_id
+               AND intent.source_revision = boundary.source_revision
+               AND intent.lifecycle_generation = boundary.lifecycle_generation
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM project_boundary_invocation_receipts AS receipt
+             WHERE receipt.boundary_id = boundary.boundary_id
+           )
+         ORDER BY boundary.since, boundary.boundary_id LIMIT ?`,
+      ).all(occurredAt, operation.limit);
+      let createdCount = 0;
+      let suppressedCount = 0;
+      for (const row of rows) {
+        if (typeof row.boundaryId !== "string" || typeof row.roomId !== "string" ||
+            typeof row.projectId !== "string" || typeof row.sourceKind !== "string" ||
+            typeof row.sourceId !== "string" || typeof row.sourceRevision !== "number" ||
+            typeof row.agentId !== "string" ||
+            !(row.dueAt === null || typeof row.dueAt === "string")) {
+          suppressedCount += 1;
+          continue;
+        }
+        const boundaryKind = row.sourceKind === "confirmation" ? "checkpoint" as const :
+          row.sourceKind === "blocker" || row.sourceKind === "open_question" ||
+            row.sourceKind === "review" ? "blocker" as const :
+            row.sourceKind === "due" ? "due" as const : "agent_ball" as const;
+        const request = {
+          purpose: "project_boundary_invocation" as const,
+          boundaryId: row.boundaryId,
+          boundaryKind,
+          projectId: row.projectId,
+          roomId: row.roomId,
+          agentId: row.agentId,
+          sourceFactId: row.sourceId,
+          sourceFactRevision: row.sourceRevision,
+        };
+        const requestSha256 = createHash("sha256").update(canonicalJson(request)).digest("hex");
+        const savepoint = `project_agent_boundary_candidate_${createdCount + suppressedCount}`;
+        database.exec(`SAVEPOINT ${savepoint}`);
+        try {
+          const result = claimProjectBoundaryInvocationInTransaction(database, {
+            request, requestSha256, attemptedAt: occurredAt,
+            providerId: operation.providerId, modelId: operation.modelId,
+          });
+          database.exec(`RELEASE SAVEPOINT ${savepoint}`);
+          if (result.status === "intent-created") createdCount += 1;
+          else suppressedCount += 1;
+        } catch {
+          database.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+          database.exec(`RELEASE SAVEPOINT ${savepoint}`);
+          suppressedCount += 1;
+        }
+      }
+      return { kind: "project-agent-boundary-scan", scannedCount: rows.length,
+        createdCount, suppressedCount };
+    }
+    if (operation.type === "runtime.read-project-route-facts") {
+      return { kind: "project-route-facts",
+        result: readProjectRouteFactsInTransaction(database, operation.roomId) };
+    }
+    if (operation.type === "runtime.begin-project-boundary-execution") {
+      return { kind: "project-boundary-execution",
+        execution: beginProjectBoundaryExecutionInTransaction(database, {
+          executionId: operation.executionId,
+          expectedVersion: operation.expectedVersion,
+          now: occurredAt,
+        }) };
+    }
+    if (operation.type === "runtime.finish-project-boundary-execution") {
+      return { kind: "project-boundary-execution",
+        execution: finishProjectBoundaryExecutionInTransaction(database, {
+          executionId: operation.executionId,
+          expectedVersion: operation.expectedVersion,
+          outcome: operation.outcome,
+          ...(operation.errorCode === undefined ? {} : { errorCode: operation.errorCode }),
+          now: occurredAt,
+        }) };
+    }
     if (operation.type === "runtime.claim-pending-direct-intents") {
       const candidates = database.prepare(
         `SELECT intent.id AS intentId, intent.room_id AS roomId,
@@ -10229,6 +10490,7 @@ export function submitHumanMessageDatabaseCommand(
     readonly context: AuthenticatedCommandContext;
     readonly message: HumanMessageSubmit;
     readonly now: number;
+    readonly humanRequestParticipant?: HumanRequestMessageTransactionParticipant;
     readonly beforeApply?: () => void;
     readonly onFaultPointForTest?: (point: MessageAuthoritySubmitFaultPointForTest) => void;
   },
@@ -10282,6 +10544,7 @@ export function submitHumanMessageDatabaseCommand(
         insertLegacyMessageAuthorityRecord(database, baseMessage);
         input.onFaultPointForTest?.("after-message");
         const outcomes: MessageTargetOutcome[] = [];
+        const humanRequestBindings: HumanRequestMessageBinding[] = [];
         for (const [targetOrder, target] of input.message.mentionedTargets.entries()) {
           const actor = database.prepare("SELECT kind FROM actors WHERE id = ?").get(
             target.targetActorId,
@@ -10392,6 +10655,17 @@ export function submitHumanMessageDatabaseCommand(
               target.targetActorId,
               persistedAt,
             );
+            humanRequestBindings.push(Object.freeze({
+              roomId: input.message.roomId,
+              projectId: input.message.roomId,
+              requestIntentId,
+              sourceMessageId: input.message.messageId,
+              sourceRevision: 1,
+              requesterHumanActorId: actorId,
+              targetHumanActorId: target.targetActorId,
+              sourceTargetId: target.id,
+              occurredAt: persistedAt,
+            }));
             outcome = {
               targetId: target.id,
               targetActorId: target.targetActorId,
@@ -10508,6 +10782,31 @@ export function submitHumanMessageDatabaseCommand(
           input.message.messageId,
         );
         input.onFaultPointForTest?.("after-outbox");
+        if (input.humanRequestParticipant !== undefined) {
+          for (const binding of humanRequestBindings) {
+            try {
+              withDatabaseAuthorityTransactionView(
+                database,
+                input.message.roomId,
+                stableId("message-human-request-participant", binding.requestIntentId),
+                (transaction) => input.humanRequestParticipant!.createPendingInTransaction(
+                  transaction,
+                  binding,
+                ),
+              );
+            } catch (error: unknown) {
+              if (error instanceof HumanRequestMessageParticipantError) {
+                return fail(
+                  error.code === "binding_conflict" ? "idempotency_conflict" :
+                    error.code === "source_unavailable" ? "message_version_conflict" :
+                      "dependency_unavailable",
+                  "Canonical Project Request participant rejected the message target",
+                );
+              }
+              throw error;
+            }
+          }
+        }
         const attachmentIds: AttachmentAuthorityIdFactory = {
           nextUploadId() {
             throw new Error("Message attachment binding cannot allocate uploads");
@@ -10715,6 +11014,7 @@ export function recallHumanMessageDatabaseCommand(
     readonly context: AuthenticatedCommandContext;
     readonly command: MessageRecallCommand;
     readonly now: number;
+    readonly humanRequestParticipant?: HumanRequestMessageTransactionParticipant;
     readonly beforeApply?: () => void;
   },
 ): MessageRecallReceipt {
@@ -10763,6 +11063,35 @@ export function recallHumanMessageDatabaseCommand(
            SET status = 'cancelled', cancelled_at = ?, cancellation_reason = 'message_recalled'
            WHERE source_message_id = ? AND status = 'pending'`,
         ).run(recalledAt, input.command.messageId);
+        if (input.humanRequestParticipant !== undefined) {
+          try {
+            withDatabaseAuthorityTransactionView(
+              database,
+              input.command.roomId,
+              stableId("message-human-request-recall-participant", input.command.messageId,
+                String(input.command.expectedRevision)),
+              (transaction) => input.humanRequestParticipant!.cancelPendingForRecallInTransaction(
+                transaction,
+                {
+                  roomId: input.command.roomId,
+                  sourceMessageId: input.command.messageId,
+                  sourceRevision: input.command.expectedRevision,
+                  recalledByHumanActorId: actorId,
+                  occurredAt: recalledAt,
+                },
+              ),
+            );
+          } catch (error: unknown) {
+            if (error instanceof HumanRequestMessageParticipantError) {
+              return fail(
+                error.code === "binding_conflict" ? "message_version_conflict" :
+                  "dependency_unavailable",
+                "Canonical Project Request participant rejected source recall",
+              );
+            }
+            throw error;
+          }
+        }
         database.prepare(
           `UPDATE agent_invocation_intents
            SET status = 'cancelled', cancelled_at = ?, cancellation_reason = 'message_recalled'

@@ -11,6 +11,7 @@ import {
   type GovernanceController,
 } from "./controller.js";
 import { createDesktopAuthorityCache, type DesktopAuthorityCache } from "./authority-cache.js";
+import type { AuthorityCachePersistence } from "./encrypted-authority-cache.js";
 import {
   GovernanceTransportError,
   createGovernanceWebSocketAuthority,
@@ -78,6 +79,8 @@ export interface DesktopGovernanceRuntime {
   readonly controller: GovernanceController;
   readonly invocations: InvocationController;
   readonly cache: DesktopAuthorityCache;
+  repairRoom(roomId: string): Promise<void>;
+  restoreCache(actorId: string): Promise<boolean>;
   invalidateAuthorizedState(): void;
   close(): void;
 }
@@ -89,9 +92,10 @@ export function createDesktopGovernanceRuntime(options: {
   readonly createRequestIdentity: () => { readonly requestId: string; readonly idempotencyKey: string };
   readonly now?: () => string;
   readonly timeoutMs?: number;
+  readonly cachePersistence?: AuthorityCachePersistence;
 }): DesktopGovernanceRuntime {
   const now = options.now ?? (() => new Date().toISOString());
-  const cache = createDesktopAuthorityCache(now);
+  const cache = createDesktopAuthorityCache(now, options.cachePersistence);
   const feed = createGovernanceReplicaFeed();
   const transport = createGovernanceWebSocketAuthority({
     endpoint: options.endpoint,
@@ -105,13 +109,34 @@ export function createDesktopGovernanceRuntime(options: {
     session: options.session, createRequestId: (kind) => `invocation-${kind}-${randomUUID()}`, now,
   });
   let closed = false;
+  const completePurge = (
+    roomIds: readonly string[],
+    scope: "room" | "session",
+    clear: () => void,
+  ): void => {
+    clear();
+    for (const roomId of roomIds) {
+      invocations.markRevoked(roomId, scope);
+      feed.revoked({ roomId, scope, purgeCompleted: false });
+    }
+    void cache.waitForPersistence().then(() => {
+      if (closed) return;
+      for (const roomId of roomIds) feed.revoked({ roomId, scope, purgeCompleted: true });
+    }).catch(() => {
+      if (closed) return;
+      for (const roomId of roomIds) feed.fatal({ roomId, errorCode: "authorized_cache_purge_failed" });
+    });
+  };
 
   const authority: GovernanceAuthorityAdapter = {
     async querySurface({ roomId }) {
       const session = options.session();
       if (session === undefined) {
+        cache.clear();
+        let purgeCompleted = false;
+        try { await cache.waitForPersistence(); purgeCompleted = true; } catch { /* fail closed below */ }
         return { status: "locked", roomId, connection: {
-          status: "revoked", scope: "session", purgeCompleted: true,
+          status: "revoked", scope: "session", purgeCompleted,
         } };
       }
       try {
@@ -127,13 +152,14 @@ export function createDesktopGovernanceRuntime(options: {
       } catch (error: unknown) {
         const authorityError = closedError(error);
         if (authorityError.status === 503) {
-          cache.clear();
           return { status: "locked", roomId, connection: { status: "offline", asOf: now() } };
         }
         if (authorityError.status === 401 || authorityError.status === 403) {
-          cache.clear();
+          if (authorityError.status === 401) cache.clear(); else cache.clearRoom(roomId);
+          let purgeCompleted = false;
+          try { await cache.waitForPersistence(); purgeCompleted = true; } catch { /* fail closed below */ }
           return { status: "locked", roomId, connection: {
-            status: "revoked", scope: authorityError.status === 401 ? "session" : "room", purgeCompleted: true,
+            status: "revoked", scope: authorityError.status === 401 ? "session" : "room", purgeCompleted,
           } };
         }
         return { status: "locked", roomId, connection: {
@@ -173,17 +199,11 @@ export function createDesktopGovernanceRuntime(options: {
   });
   const unsubscribeTerminal = transport.onTerminalRevoked(() => {
     const roomIds = cache.roomIds();
-    cache.clear();
-    for (const roomId of roomIds) {
-      invocations.markRevoked(roomId, "session");
-      feed.revoked({ roomId, scope: "session", purgeCompleted: true });
-    }
+    completePurge(roomIds, "session", () => cache.clear());
   });
   const unsubscribeRoomAccess = transport.onRoomAccessChanged((roomId, change) => {
     if (change === "removed") {
-      cache.clearRoom(roomId);
-      invocations.markRevoked(roomId, "room");
-      feed.revoked({ roomId, scope: "room", purgeCompleted: true });
+      completePurge([roomId], "room", () => cache.clearRoom(roomId));
       return;
     }
     void replica.repairRoom(roomId).catch(() => {
@@ -193,7 +213,6 @@ export function createDesktopGovernanceRuntime(options: {
   });
   const unsubscribeFailure = transport.onConnectionFailure(() => {
     const roomIds = cache.roomIds();
-    cache.clear();
     for (const roomId of roomIds) {
       invocations.markOffline(roomId);
       feed.offline({ roomId, asOf: now() });
@@ -204,21 +223,19 @@ export function createDesktopGovernanceRuntime(options: {
     controller,
     invocations,
     cache,
+    repairRoom(roomId: string) { return replica.repairRoom(roomId); },
+    restoreCache(actorId: string) { return cache.restore(actorId); },
     invalidateAuthorizedState() {
       const roomIds = cache.roomIds();
-      cache.clear();
       transport.resetSession();
-      for (const roomId of roomIds) {
-        invocations.markRevoked(roomId, "session");
-        feed.revoked({ roomId, scope: "session", purgeCompleted: true });
-      }
+      completePurge(roomIds, "session", () => cache.clear());
     },
     close() {
       if (closed) return;
       closed = true;
       unsubscribeTerminal(); unsubscribeRoomAccess(); unsubscribeFailure(); controller.close();
       invocations.close();
-      replica.close(); transport.close(); cache.clear();
+      replica.close(); transport.close();
     },
   });
 }

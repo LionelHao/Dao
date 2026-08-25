@@ -20,6 +20,7 @@ const render = (): void => {
     window.dao?.memoryAuthority,
     window.dao?.agentSettings,
     window.dao?.invocation,
+    window.dao?.projectLoop,
   );
 };
 

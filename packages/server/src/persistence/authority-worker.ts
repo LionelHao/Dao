@@ -117,6 +117,33 @@ import type { DeploymentProviderDisclosure } from
   "../tenant-administration/authority-service.js";
 import { executeAgentSettingsWorkerOperation } from
   "../agent-settings/worker-authority-operation.js";
+import {
+  executeProjectLoopAuthorityOperation,
+  ProjectLoopAuthorityError,
+  writeProjectLoopCheckpointInTransaction,
+} from "../project-loop/database-authority.js";
+import { createSqliteHumanRequestMessageParticipant } from
+  "../project-loop/message-human-request-participant.js";
+import { createDefaultHumanRequestProjectPayload } from
+  "../project-loop/request-factory.js";
+
+const humanRequestParticipant = createSqliteHumanRequestMessageParticipant({
+  resolveCompanionPayload(binding) {
+    return createDefaultHumanRequestProjectPayload({
+      roomId: binding.roomId,
+      requestIntentId: binding.requestIntentId,
+      sourceTargetId: binding.sourceTargetId,
+      targetHumanActorId: binding.targetHumanActorId,
+    });
+  },
+  writeCheckpointInTransaction(database, roomId, projectRevision, occurredAt) {
+    writeProjectLoopCheckpointInTransaction(database, {
+      roomId,
+      projectRevision,
+      occurredAt,
+    });
+  },
+});
 
 interface AuthorityWorkerData {
   readonly databasePath: string;
@@ -2254,6 +2281,7 @@ function submitHumanMessage(request: AuthorityWorkerRequest): void {
         message: request.message,
         now: request.now,
         beforeApply: () => requireNoMessageRepairBarrier(request.message.roomId, request.now),
+        humanRequestParticipant,
       },
     );
     respond({ type: "authority.message-submitted", requestId: request.requestId, receipt });
@@ -2290,6 +2318,7 @@ function recallHumanMessage(request: AuthorityWorkerRequest): void {
         command: request.command,
         now: request.now,
         beforeApply: () => requireNoMessageRepairBarrier(request.command.roomId, request.now),
+        humanRequestParticipant,
       },
     );
     respond({ type: "authority.message-recalled", requestId: request.requestId, receipt });
@@ -2545,6 +2574,32 @@ function executeMemory(request: AuthorityWorkerRequest): void {
       return;
     }
     respondWithStorageFailure(request.requestId, error, "Authority memory operation failed");
+  }
+}
+
+function executeProjectLoop(request: AuthorityWorkerRequest): void {
+  if (request.type !== "authority.project-loop") {
+    throw new TypeError("executeProjectLoop received the wrong request type");
+  }
+  try {
+    const result = executeProjectLoopAuthorityOperation(
+      requireAuthorityTransactionDatabase(),
+      request.operation,
+    );
+    respond({ type: "authority.project-loop-result", requestId: request.requestId, result });
+    const roomId = request.operation.type === "project-loop.snapshot.read"
+      ? undefined : request.operation.command.roomId;
+    if (roomId !== undefined) {
+      repairs.preemptAfterCommit({ roomIds: [roomId], catalogPrincipalIds: [], familyIds: [],
+        code: "snapshot_stale", now: request.operation.now });
+    }
+  } catch (error: unknown) {
+    if (handleRollbackFatal(request.requestId, error)) return;
+    if (error instanceof ProjectLoopAuthorityError) {
+      respondWithError(request.requestId, error.code, error.message);
+      return;
+    }
+    respondWithStorageFailure(request.requestId, error, "Authority Project Loop operation failed");
   }
 }
 
@@ -3033,6 +3088,9 @@ async function dispatch(value: unknown): Promise<void> {
       return;
     case "authority.memory":
       executeMemory(value);
+      return;
+    case "authority.project-loop":
+      executeProjectLoop(value);
       return;
     case "authority.read-history":
       readHistory(value);

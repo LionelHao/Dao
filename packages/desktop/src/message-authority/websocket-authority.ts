@@ -40,6 +40,13 @@ import {
 } from "./contracts.js";
 import type { MessageClosedError } from "../renderer/message-authority/view-model.js";
 import type { MessageActorOption } from "../renderer/message-authority/view-model.js";
+import {
+  isProjectLoopWireError,
+  isProjectLoopWireResponse,
+  type ProjectLoopWireError,
+  type ProjectLoopWireRequest,
+  type ProjectLoopWireResponse,
+} from "../project-loop/contracts.js";
 
 type SocketEvent = "open" | "message" | "close" | "error";
 
@@ -72,6 +79,7 @@ export class MessageAuthorityTransportError extends Error {
       watermark: number;
     }>,
     readonly memoryError?: RoomMemoryError,
+    readonly projectError?: ProjectLoopWireError,
   ) {
     super(`Message Authority transport failed: ${code}`);
     this.name = "MessageAuthorityTransportError";
@@ -95,6 +103,7 @@ export interface MessageAuthorityWireTransport {
   revise(command: MessageReviseCommand): Promise<MessageRevisionAcceptedResult>;
   recall(command: MessageRecallCommand): Promise<MessageRecallAcceptedResult>;
   memoryRequest(command: RoomMemoryRequest): Promise<RoomMemorySuccessFrame | RoomMemoryError>;
+  projectRequest(command: ProjectLoopWireRequest): Promise<ProjectLoopWireResponse>;
   subscribeRoom(
     roomId: string,
     cursor: RoomCursor,
@@ -180,6 +189,7 @@ type ParsedFrame =
   | MessageHistoryV2WireResult
   | MessageRevisionsResult
   | RoomMemorySuccessFrame
+  | ProjectLoopWireResponse
   | DesktopRoomSyncResult
   | Readonly<{
       type: "room.subscribed.v2";
@@ -285,6 +295,8 @@ export function parseMessageAuthorityServerFrame(raw: string): ParsedFrame | und
     return undefined;
   }
   if (!record(value) || typeof value.type !== "string") return undefined;
+  if ((value.type === "project.snapshot" || value.type === "project.mutation.ack") &&
+      isProjectLoopWireResponse(value)) return structuredClone(value);
   if (value.type !== "error" && isRoomMemoryProtocolFrame(value) &&
       !isRoomMemoryRequest(value)) {
     return structuredClone(value) as RoomMemorySuccessFrame;
@@ -393,6 +405,20 @@ export function parseMessageAuthorityServerFrame(raw: string): ParsedFrame | und
           roomId: value.payload.roomId, change: value.payload.change }
         : undefined;
     case "error": {
+      if (isProjectLoopWireError(value)) {
+        return {
+          type: "error",
+          requestId: value.requestId,
+          error: new MessageAuthorityTransportError(
+            value.status === 401 ? "authentication_required"
+              : value.status === 403 || value.status === 410 ? "access_revoked" : "protocol_error",
+            undefined,
+            undefined,
+            undefined,
+            structuredClone(value),
+          ),
+        };
+      }
       if (isRoomMemoryError(value)) {
         return {
           type: "error",
@@ -831,6 +857,17 @@ export function createMessageAuthorityWebSocketTransport(options: {
         }
         throw error;
       }
+    },
+    async projectRequest(command) {
+      if (command.projectId !== command.roomId) {
+        throw new MessageAuthorityTransportError("protocol_error");
+      }
+      const expected = command.type === "project.snapshot.read"
+        ? "project.snapshot" as const : "project.mutation.ack" as const;
+      return structuredClone(await exactRequest<ProjectLoopWireResponse>(
+        { ...command },
+        expected,
+      ));
     },
     async subscribeRoom(roomId, cursor, observer) {
       if (!isRoomCursor(cursor) || cursor.roomId !== roomId) {

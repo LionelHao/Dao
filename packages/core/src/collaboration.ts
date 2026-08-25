@@ -384,7 +384,36 @@ export type ProjectBoundaryInvocationResult =
       status: "suppressed";
       reason: "dependency_unavailable" | "boundary_ineligible" | "authority_unavailable";
       decidedAt: string;
+    }>
+  | Readonly<{
+      boundaryId: string;
+      roomId: string;
+      status: "execution-state";
+      intentId: string;
+      executionId: string;
+      agentId: string;
+      executionStatus: "accepted" | "running" | "completed" | "failed" | "cancelled";
+      occurredAt: string;
     }>;
+
+/**
+ * Provider-visible identity for a Project Loop boundary execution. Unlike the
+ * message runtime intent, this deliberately has no sourceMessageId: a timer or
+ * Agent-held Project boundary is an independently authoritative source.
+ */
+export interface ProjectBoundaryProviderInvocation {
+  readonly kind: "project_boundary";
+  readonly intentId: string;
+  readonly executionId: string;
+  readonly roomId: string;
+  readonly projectId: string;
+  readonly boundaryId: string;
+  readonly boundaryKind: "checkpoint" | "due" | "blocker" | "agent_ball";
+  readonly sourceFactId: string;
+  readonly sourceFactRevision: number;
+  readonly targetAgentId: string;
+  readonly lifecycleGeneration: number;
+}
 
 export type LegacyAgentExecutionStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 
@@ -486,7 +515,8 @@ export interface AgentRuntimeProviderInput {
     configVersion: string;
     modelId: string;
   }>;
-  readonly invocation: AgentInvocationIntent | LegacyAgentInvocationIntent;
+  readonly invocation: AgentInvocationIntent | LegacyAgentInvocationIntent |
+    ProjectBoundaryProviderInvocation;
   readonly trusted: Readonly<{
     system: readonly Readonly<{
       kind: "product_policy" | "safety_policy";
@@ -1353,6 +1383,14 @@ export function isProjectBoundaryInvocationResult(value: unknown): value is Proj
   if (value.status === "intent-created") {
     return hasExactKeys(value, ["boundaryId", "roomId", "status", "intentId", "consumedAt"]) &&
       isNonEmptyString(value.intentId) && isNonEmptyString(value.consumedAt);
+  }
+  if (value.status === "execution-state") {
+    return hasExactKeys(value, ["boundaryId", "roomId", "status", "intentId", "executionId",
+      "agentId", "executionStatus", "occurredAt"]) && isNonEmptyString(value.intentId) &&
+      isNonEmptyString(value.executionId) && isNonEmptyString(value.agentId) &&
+      (value.executionStatus === "accepted" || value.executionStatus === "running" ||
+        value.executionStatus === "completed" || value.executionStatus === "failed" ||
+        value.executionStatus === "cancelled") && isNonEmptyString(value.occurredAt);
   }
   return value.status === "suppressed" &&
     hasExactKeys(value, ["boundaryId", "roomId", "status", "reason", "decidedAt"]) &&

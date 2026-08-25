@@ -1,6 +1,6 @@
 .room-authority-workspace {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(17rem, 21rem) minmax(18rem, 24rem);
+  grid-template-columns: minmax(0, 1fr) minmax(18rem, 24rem);
   gap: 1rem;
   width: 100%;
   min-height: 100%;
@@ -9,15 +9,52 @@
 
 .room-authority-workspace__timeline,
 .room-authority-workspace__invocations,
+.room-authority-workspace__project,
 .room-authority-workspace__memory {
   min-width: 0;
 }
 
-.room-authority-workspace__memory {
+.room-authority-workspace__timeline { grid-column: 1; grid-row: 1; }
+.room-authority-workspace__rail {
+  grid-column: 2;
+  grid-row: 1;
   position: sticky;
   top: 1rem;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-width: 0;
   max-height: calc(100vh - 2rem);
+  overflow: hidden;
+  border-left: 1px solid #d8dee9;
+  background: #fff;
+}
+.room-authority-workspace__segments { display: none; }
+
+.room-authority-workspace__rail > [role="tabpanel"] {
   overflow: auto;
+}
+
+.room-authority-workspace__rail-tabs {
+  display: flex;
+  gap: .125rem;
+  padding: .625rem .75rem 0;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.room-authority-workspace__rail-tabs button {
+  min-height: 2.75rem;
+  padding: .5rem .625rem;
+  border: 0;
+  border-bottom: 3px solid transparent;
+  background: transparent;
+  color: #526079;
+  font: inherit;
+}
+
+.room-authority-workspace__rail-tabs button[aria-selected="true"] {
+  border-bottom-color: #172033;
+  color: #172033;
+  font-weight: 700;
 }
 
 .memory-authority-panel {
@@ -113,12 +150,44 @@
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .room-authority-workspace__memory {
+  .room-authority-workspace__segments {
+    display: grid;
+    grid-column: 1;
+    grid-row: 1;
+    grid-template-columns: 1fr 1fr;
+    gap: .25rem;
+    padding: .25rem;
+    border: 1px solid #cbd5e1;
+    border-radius: .625rem;
+    background: #f1f5f9;
+  }
+
+  .room-authority-workspace__segments button {
+    min-height: 2.75rem;
+    border: 0;
+    border-radius: .45rem;
+    background: transparent;
+    font: inherit;
+  }
+
+  .room-authority-workspace__segments button[aria-pressed="true"] {
+    background: #fff;
+    box-shadow: 0 1px 3px rgb(15 23 42 / 16%);
+    font-weight: 700;
+  }
+
+  .room-authority-workspace__timeline,
+  .room-authority-workspace__rail { grid-column: 1; grid-row: 2; }
+
+  .room-authority-workspace[data-compact-segment="timeline"] .room-authority-workspace__rail,
+  .room-authority-workspace[data-compact-segment="project"] .room-authority-workspace__timeline {
+    display: none;
+  }
+
+  .room-authority-workspace__rail {
     position: static;
     max-height: none;
   }
-
-  .room-authority-workspace__invocations { position: static; }
 }
 
 @media (prefers-reduced-motion: reduce) {

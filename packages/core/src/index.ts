@@ -1,5 +1,7 @@
 export type ActorKind = "human" | "agent";
 
+export * from "./project-loop.js";
+
 export type HumanReachability = "online" | "dnd" | "offline";
 export type AgentReadiness = "ready" | "busy" | "paused" | "noauth";
 
@@ -513,6 +515,7 @@ export type {
   ProviderNeutralCheckpoint,
   ProjectBoundaryInvocationRequest,
   ProjectBoundaryInvocationResult,
+  ProjectBoundaryProviderInvocation,
   RouterProviderInput,
   RouterCandidate,
   RouterPlan,

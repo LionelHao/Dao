@@ -1221,7 +1221,7 @@ describe("SQLite authoritative sessions", () => {
       accountId: "account-li",
       actorId: "human-li",
     });
-    await expect(client.inspectSchema()).resolves.toEqual({ version: 22 });
+    await expect(client.inspectSchema()).resolves.toEqual({ version: 25 });
     await client.close();
   });
 
@@ -4762,7 +4762,25 @@ describe("SQLite authoritative sessions", () => {
         submission = submit();
         authorityCut = cutAuthority();
       }
-      await Promise.all([submission, authorityCut]);
+      const departureBlocked = targetKind === "human" && order === "send-first";
+      if (departureBlocked) {
+        await expect(authorityCut).rejects.toMatchObject({
+          status: 409,
+          code: "departure_blocked",
+          details: {
+            roomId: fixture.contexts.roomId,
+            targetActorId: targetActorId,
+            conflicts: [expect.objectContaining({
+              kind: "acceptance",
+              title: "project.request.pending_acceptance.target",
+              state: "pending_acceptance",
+              revision: 1,
+            })],
+          },
+        });
+      } else {
+        await Promise.all([submission, authorityCut]);
+      }
       const receipt = await submission;
       const targetWasInvalidatedBeforeSend = order === "authority-cut-first";
       expect(receipt.targetOutcomes).toEqual([targetWasInvalidatedBeforeSend
@@ -4830,8 +4848,14 @@ describe("SQLite authoritative sessions", () => {
         `SELECT role, participation FROM room_memberships
          WHERE room_id = ? AND actor_id = ?`,
       ).get(fixture.contexts.roomId, targetActorId)).toEqual(targetKind === "human"
-        ? undefined
+        ? departureBlocked ? { role: "member", participation: null } : undefined
         : { role: null, participation: "on-mention" });
+      if (departureBlocked) {
+        expect(database.prepare(
+          `SELECT status, target_human_actor_id AS targetActorId
+           FROM project_requests WHERE source_target_id = ?`,
+        ).get(targetId)).toEqual({ status: "pending_acceptance", targetActorId });
+      }
       database.close();
     },
   );

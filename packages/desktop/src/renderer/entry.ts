@@ -5,6 +5,7 @@ import type { AttachmentAuthorityBridge } from "../attachment-authority/contract
 import type { MemoryAuthorityBridge } from "../memory-authority/contracts.js";
 import type { AgentSettingsBridge } from "../agent-profile-routing/contracts.js";
 import type { InvocationBridge } from "../invocation-runtime/contracts.js";
+import type { ProjectLoopBridge } from "../project-loop/contracts.js";
 import { mountAgentSettingsBridgeSurface } from "./agent-settings/bridge-adapter.js";
 import {
   mountGovernanceSurface,
@@ -20,6 +21,7 @@ import {
   type InvocationHostAction,
   type InvocationSurfaceActions,
 } from "./invocation-runtime/surface.js";
+import { mountProjectLoopBridgeSurface } from "./project-loop/bridge-adapter.js";
 
 export interface DesktopRendererEntryPorts {
   readonly renderM2PrimitivesPreview: (root: HTMLElement) => void;
@@ -47,6 +49,12 @@ export interface DesktopRendererEntryPorts {
     roomId: string) => () => void;
   readonly mountInvocationSurface?: (root: HTMLElement, bridge: InvocationBridge,
     roomId: string, actions: InvocationSurfaceActions) => () => void;
+  readonly mountProjectLoopSurface?: (
+    root: HTMLElement,
+    bridge: ProjectLoopBridge,
+    roomId: string,
+    messageBridge?: MessageAuthorityBridge,
+  ) => () => void;
 }
 
 const DEFAULT_PORTS: DesktopRendererEntryPorts = Object.freeze({
@@ -95,6 +103,24 @@ const DEFAULT_PORTS: DesktopRendererEntryPorts = Object.freeze({
     root, bridge, roomId, { reducedMotion: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false,
       onClose: () => history.back() }),
   mountInvocationSurface,
+  mountProjectLoopSurface: (root: HTMLElement, bridge: ProjectLoopBridge, roomId: string,
+    messageBridge?: MessageAuthorityBridge) => mountProjectLoopBridgeSurface(
+    root, bridge, roomId, {
+      reducedMotion: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false,
+      onSearch: () => root.querySelector<HTMLInputElement>("input[type='search']")?.focus(),
+      onNavigateSegment: (segment) => {
+        const selector = segment === "timeline" ? ".room-authority-workspace__timeline"
+          : segment === "project" ? ".room-authority-workspace__project"
+            : ".room-authority-workspace__memory";
+        const workspace = root.closest<HTMLElement>(".room-authority-workspace");
+        if (workspace !== null) workspace.dataset.compactSegment = segment === "timeline" ? "timeline" : "project";
+        const target = workspace?.querySelector<HTMLElement>(selector);
+        if (target !== null && target !== undefined) { target.tabIndex = -1; target.focus(); }
+      },
+      onReauthenticate: () => navigateRenderer(""),
+      ...(messageBridge === undefined ? {} : { messageBridge }),
+    },
+  ),
 });
 
 const encoder = new TextEncoder();
@@ -248,6 +274,7 @@ export function mountDesktopRendererEntry(
   memoryAuthority?: MemoryAuthorityBridge,
   agentSettings?: AgentSettingsBridge,
   invocation?: InvocationBridge,
+  projectLoop?: ProjectLoopBridge,
 ): (() => void) | undefined {
   const route = new URLSearchParams(search);
   root.dataset.governanceRouteContract = "closed-v1";
@@ -288,13 +315,89 @@ export function mountDesktopRendererEntry(
     const memory = document.createElement("aside");
     memory.className = "room-authority-workspace__memory";
     memory.setAttribute("aria-label", "Room 重要记忆");
+    let authorityRail: HTMLElement | undefined;
+    const project = projectLoop === undefined || ports.mountProjectLoopSurface === undefined
+      ? undefined : document.createElement("aside");
+    if (project !== undefined) {
+      project.className = "room-authority-workspace__project";
+      project.setAttribute("aria-label", "Room Project");
+      workspace.dataset.compactSegment = "timeline";
+      const segments = document.createElement("nav");
+      segments.className = "room-authority-workspace__segments";
+      segments.setAttribute("aria-label", "最小窗口内容分段");
+      for (const [value, label] of [["timeline", "时间线"], ["project", "项目"]] as const) {
+        const segment = document.createElement("button"); segment.type = "button"; segment.textContent = label;
+        segment.dataset.compactSegmentTarget = value;
+        segment.setAttribute("aria-pressed", String(value === "timeline"));
+        segment.addEventListener("click", () => {
+          workspace.dataset.compactSegment = value;
+          for (const candidate of segments.querySelectorAll<HTMLButtonElement>("button")) {
+            candidate.setAttribute("aria-pressed", String(candidate === segment));
+          }
+          const destination = workspace.querySelector<HTMLElement>(value === "timeline"
+            ? ".room-authority-workspace__timeline" : ".room-authority-workspace__rail");
+          if (destination !== null) { destination.tabIndex = -1; destination.focus(); }
+        });
+        segments.append(segment);
+      }
+      workspace.append(segments);
+    }
     const executions = invocation === undefined || ports.mountInvocationSurface === undefined
       ? undefined : document.createElement("aside");
     if (executions !== undefined) {
       executions.className = "room-authority-workspace__invocations";
       executions.setAttribute("aria-label", "Agent 执行");
-      workspace.append(timeline, executions, memory);
-    } else workspace.append(timeline, memory);
+      if (project === undefined) workspace.append(timeline, executions, memory);
+    } else if (project === undefined) workspace.append(timeline, memory);
+    if (project !== undefined) {
+      authorityRail = document.createElement("aside");
+      authorityRail.className = "room-authority-workspace__rail";
+      authorityRail.dataset.authorityRail = "project";
+      authorityRail.setAttribute("aria-label", "项目、记忆与 Agent 面板");
+      authorityRail.tabIndex = -1;
+      const railTabs = document.createElement("div");
+      railTabs.className = "room-authority-workspace__rail-tabs";
+      railTabs.setAttribute("role", "tablist");
+      railTabs.setAttribute("aria-label", "Room 权威面板");
+      const panels: Array<readonly ["project" | "memory" | "agent", string, HTMLElement]> = [
+        ["project", "项目", project],
+        ["memory", "记忆", memory],
+      ];
+      if (executions !== undefined) panels.push(["agent", "Agent", executions]);
+      const selectRail = (selected: string, focus = false): void => {
+        authorityRail!.dataset.authorityRail = selected;
+        for (const [value, , panel] of panels) {
+          const active = value === selected;
+          panel.hidden = !active;
+          panel.setAttribute("aria-hidden", String(!active));
+        }
+        for (const candidate of railTabs.querySelectorAll<HTMLButtonElement>("[role='tab']")) {
+          const active = candidate.dataset.authorityRailTab === selected;
+          candidate.setAttribute("aria-selected", String(active)); candidate.tabIndex = active ? 0 : -1;
+          if (active && focus) candidate.focus();
+        }
+      };
+      for (const [value, label, panel] of panels) {
+        panel.id = `room-authority-${roomId}-${value}`;
+        panel.setAttribute("role", "tabpanel");
+        const tab = document.createElement("button"); tab.type = "button"; tab.textContent = label;
+        tab.dataset.authorityRailTab = value; tab.id = `${panel.id}-tab`; tab.setAttribute("role", "tab");
+        tab.setAttribute("aria-controls", panel.id); panel.setAttribute("aria-labelledby", tab.id);
+        tab.addEventListener("click", () => selectRail(value)); railTabs.append(tab);
+      }
+      railTabs.addEventListener("keydown", (event) => {
+        const tabs = [...railTabs.querySelectorAll<HTMLButtonElement>("[role='tab']")];
+        const current = tabs.indexOf(document.activeElement as HTMLButtonElement);
+        if (current < 0) return;
+        const next = event.key === "ArrowLeft" ? (current - 1 + tabs.length) % tabs.length
+          : event.key === "ArrowRight" ? (current + 1) % tabs.length : event.key === "Home" ? 0
+            : event.key === "End" ? tabs.length - 1 : -1;
+        if (next >= 0) { event.preventDefault(); tabs[next]?.click(); tabs[next]?.focus(); }
+      });
+      authorityRail.append(railTabs, ...panels.map(([, , panel]) => panel));
+      selectRail("project");
+      workspace.append(timeline, authorityRail);
+    }
     root.replaceChildren(workspace);
     const disposeMessage = ports.mountMessageAuthoritySurface(
       timeline,
@@ -304,6 +407,9 @@ export function mountDesktopRendererEntry(
       memoryAuthority,
     );
     const disposeMemory = ports.mountMemoryAuthoritySurface(memory, memoryAuthority, roomId);
+    const disposeProject = project === undefined || projectLoop === undefined ||
+      ports.mountProjectLoopSurface === undefined ? undefined
+      : ports.mountProjectLoopSurface(project, projectLoop, roomId, messageAuthority);
     const disposeInvocations = executions === undefined || invocation === undefined ||
       ports.mountInvocationSurface === undefined ? undefined
       : ports.mountInvocationSurface(executions, invocation, roomId, {
@@ -322,6 +428,7 @@ export function mountDesktopRendererEntry(
       });
     return () => {
       disposeInvocations?.();
+      disposeProject?.();
       disposeMemory();
       disposeMessage();
     };

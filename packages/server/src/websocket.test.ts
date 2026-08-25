@@ -47,6 +47,7 @@ import {
   formatMessageWebSocketUrl,
   validateMessageWebSocketListener,
   type AgentPreviewDeliveryAuthority,
+  type ProjectLoopAuthorityTransport,
   type RoomMemoryAuthorityTransport,
 } from "./websocket.js";
 
@@ -106,6 +107,166 @@ const testLoginDevice = Object.freeze({
   id: "websocket-test-installation",
   label: "WebSocket test device",
   platform: "unknown" as const,
+});
+
+describe("FT-09 Project Loop WebSocket", () => {
+  it("requires authentication and injects the current session into mutations", async () => {
+    const executeMutation = vi.fn<ProjectLoopAuthorityTransport["executeMutation"]>(
+      async (context, frame) => ({
+        type: "project.mutation.ack", requestId: frame.requestId, roomId: frame.roomId,
+        projectId: frame.projectId,
+        acceptedRevision: "expectedRevision" in frame ? frame.expectedRevision + 1 : 1,
+        eventIds: ["event-project-1"], replayed: false,
+      }),
+    );
+    const server = await startMessageWebSocketServer({
+      auth: governanceAuthenticationService(),
+      service: idleMessageService(),
+      projectLoopAuthority: { executeMutation, async executeQuery(_context, frame) {
+        return { type: "project.snapshot", requestId: frame.requestId, snapshot: {
+          recordVersion: "project-loop.v1", roomId: frame.roomId, projectId: frame.projectId,
+          watermark: 0, goals: [], decisions: [], requests: [], obstacles: [],
+          nextActions: [], proposals: [], confirmations: [], transferProposals: [], balls: [],
+          capturedAt: "2026-08-25T00:00:00.000Z",
+        }, events: [], nextEventSeq: 0 };
+      } },
+    });
+    const client = await LoopbackClient.connect(server.url);
+    const command = {
+      type: "project.proposal.resolve", requestId: "project-confirm", idempotencyKey: "idem-project",
+      roomId, projectId: roomId, proposalId: "proposal-1", expectedRevision: 1,
+      resolution: "confirmed",
+      reason: null,
+    } as const;
+    try {
+      client.send(command);
+      await expect(client.waitForError("unauthenticated", command.requestId)).resolves.toBeDefined();
+      await client.login(humans[0], "project-login");
+      client.send(command);
+      await expect(client.waitForFrame(
+        (frame) => hasType(frame, "project.mutation.ack") && frame.requestId === command.requestId,
+        "project mutation ACK",
+      )).resolves.toMatchObject({ frame: { acceptedRevision: 2, replayed: false } });
+      expect(executeMutation).toHaveBeenCalledTimes(1);
+      expect(executeMutation.mock.calls[0]?.[0]).toMatchObject({
+        kind: "human", requestId: command.requestId, idempotencyKey: command.idempotencyKey,
+        principal: { actorId: humans[0].id },
+      });
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("carries obstacle reopen and Agent transfer through the authenticated public socket", async () => {
+    const executeMutation = vi.fn<ProjectLoopAuthorityTransport["executeMutation"]>(
+      async (_context, frame) => ({
+        type: "project.mutation.ack", requestId: frame.requestId, roomId: frame.roomId,
+        projectId: frame.projectId,
+        acceptedRevision: "expectedRevision" in frame ? frame.expectedRevision + 1 : 1,
+        eventIds: [`event-${frame.requestId}`], replayed: false,
+      }),
+    );
+    const server = await startMessageWebSocketServer({
+      auth: governanceAuthenticationService(), service: idleMessageService(),
+      projectLoopAuthority: { executeMutation, async executeQuery(_context, frame) {
+        return { type: "project.snapshot", requestId: frame.requestId, snapshot: {
+          recordVersion: "project-loop.v1", roomId: frame.roomId, projectId: frame.projectId,
+          watermark: 0, goals: [], decisions: [], requests: [], obstacles: [], nextActions: [],
+          proposals: [], confirmations: [], transferProposals: [], balls: [],
+          capturedAt: "2026-08-25T00:00:00.000Z",
+        }, events: [], nextEventSeq: 0 };
+      } },
+    });
+    const client = await LoopbackClient.connect(server.url);
+    const reopen = { type: "project.obstacle.transition", requestId: "reopen-blocker",
+      idempotencyKey: "idem-reopen-blocker", roomId, projectId: roomId, factId: "blocker-1",
+      expectedRevision: 3, obstacleKind: "blocker", action: "reopen",
+      reason: "New evidence" } as const;
+    const transfer = { type: "project.transfer.propose", requestId: "transfer-agent",
+      idempotencyKey: "idem-transfer-agent", roomId, projectId: roomId,
+      transferProposalId: "transfer-agent-1", subjectKind: "blocker", subjectId: "blocker-1",
+      expectedRevision: 4, toOwner: { kind: "agent", actorId: "agent-2" },
+      reason: "Specialist required" } as const;
+    try {
+      await client.login(humans[0], "project-actions-login");
+      for (const command of [reopen, transfer]) {
+        client.send(command);
+        await expect(client.waitForFrame(
+          (frame) => hasType(frame, "project.mutation.ack") && frame.requestId === command.requestId,
+          `${command.requestId} ACK`,
+        )).resolves.toMatchObject({ frame: { acceptedRevision: command.expectedRevision + 1 } });
+      }
+      expect(executeMutation).toHaveBeenNthCalledWith(1,
+        expect.objectContaining({ kind: "human",
+          principal: expect.objectContaining({ actorId: "human-1" }) }), reopen);
+      expect(executeMutation).toHaveBeenNthCalledWith(2,
+        expect.objectContaining({ kind: "human",
+          principal: expect.objectContaining({ actorId: "human-1" }) }), transfer);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("preserves Project authority status and presents archived Rooms as 410", async () => {
+    const executeMutation = vi.fn<ProjectLoopAuthorityTransport["executeMutation"]>(async (_context, frame) => {
+      if (frame.proposalId === "proposal-archived") {
+        throw Object.assign(new Error("room_archived"), { status: 409, code: "room_archived" });
+      }
+      throw Object.assign(new Error("invalid_request"), { status: 400, code: "invalid_request" });
+    });
+    const server = await startMessageWebSocketServer({
+      auth: governanceAuthenticationService(), service: idleMessageService(),
+      projectLoopAuthority: { executeMutation, async executeQuery(_context, frame) {
+        return { type: "project.snapshot", requestId: frame.requestId, snapshot: {
+          recordVersion: "project-loop.v1", roomId: frame.roomId, projectId: frame.projectId,
+          watermark: 0, goals: [], decisions: [], requests: [], obstacles: [], nextActions: [],
+          proposals: [], confirmations: [], transferProposals: [], balls: [],
+          capturedAt: "2026-08-25T00:00:00.000Z",
+        }, events: [], nextEventSeq: 0 };
+      } },
+    });
+    const client = await LoopbackClient.connect(server.url);
+    try {
+      await client.login(humans[0], "project-error-login");
+      for (const [proposalId, status, code] of [
+        ["proposal-archived", 410, "room_archived"],
+        ["proposal-invalid", 400, "invalid_request"],
+      ] as const) {
+        const requestId = `resolve-${proposalId}`;
+        client.send({ type: "project.proposal.resolve", requestId,
+          idempotencyKey: `idem-${proposalId}`, roomId, projectId: roomId,
+          proposalId, expectedRevision: 1, resolution: "confirmed", reason: null });
+        await expect(client.waitForError(code, requestId)).resolves.toMatchObject({
+          frame: { type: "error", requestId, status, code },
+        });
+      }
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("closes unexpected Project authority failures as a public 503", async () => {
+    const server = await startMessageWebSocketServer({
+      auth: governanceAuthenticationService(), service: idleMessageService(),
+      projectLoopAuthority: {
+        async executeMutation() { throw new Error("unexpected Project failure"); },
+        async executeQuery() { throw new Error("unexpected Project failure"); },
+      },
+    });
+    const client = await LoopbackClient.connect(server.url);
+    try {
+      await client.login(humans[0], "project-error-login");
+      client.send({ type: "project.snapshot.read", requestId: "project-unexpected",
+        roomId, projectId: roomId, afterEventSeq: 0, limit: 32 });
+      await expect(client.waitForError("project_dependency_unavailable", "project-unexpected"))
+        .resolves.toMatchObject({ frame: { status: 503 } });
+    } finally {
+      await client.close(); await server.close();
+    }
+  });
 });
 
 const outsider = {

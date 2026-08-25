@@ -25,6 +25,7 @@ import {
   isRouteJob,
   isRouteJudgment,
   isProjectBoundaryInvocationResult,
+  isProjectEvent,
   isScopedCancellationReceipt,
 } from "@native-im/core";
 import type {
@@ -1267,6 +1268,9 @@ export function parsePersistedRoomEvent(
   value: unknown,
 ): ContractParseResult<PersistedRoomEvent, "invalid_event"> {
   if (isRoomMemoryEvent(value)) {
+    return { ok: true, value };
+  }
+  if (isProjectEvent(value)) {
     return { ok: true, value };
   }
   if (isMessageAuthorityEvent(value)) {

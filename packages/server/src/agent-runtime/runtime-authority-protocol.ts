@@ -28,6 +28,10 @@ import type {
 import type {
   ScopedCancellationCommitReceipt,
 } from "../scoped-cancellation/scoped-cancellation-orchestrator.js";
+import type { ClaimedProjectBoundaryExecution } from
+  "../project-boundary/project-boundary-authority.js";
+import type { ProjectReminderScanResult } from
+  "../project-loop/project-boundary-runtime-service.js";
 
 export type RuntimeAuthorityOperation =
   | { readonly type: "runtime.read-context"; readonly executionId: string; readonly now: number }
@@ -87,6 +91,56 @@ export type RuntimeAuthorityOperation =
       readonly requestSha256: string;
       readonly reason: "dependency_unavailable";
       readonly decidedAt: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.claim-project-boundary";
+      readonly request: ProjectBoundaryInvocationRequest;
+      readonly requestSha256: string;
+      readonly attemptedAt: string;
+      readonly providerId: string;
+      readonly modelId: string;
+      readonly intentId?: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.scan-project-boundary-executions";
+      readonly limit: number;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.scan-project-reminders";
+      readonly providerId: string;
+      readonly modelId: string;
+      readonly agentProviderReady: boolean;
+      readonly limit: number;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.scan-project-agent-boundaries";
+      readonly providerId: string;
+      readonly modelId: string;
+      readonly agentProviderReady: boolean;
+      readonly limit: number;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.read-project-route-facts";
+      readonly roomId: string;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.begin-project-boundary-execution";
+      readonly executionId: string;
+      readonly expectedVersion: number;
+      readonly now: number;
+    }
+  | {
+      readonly type: "runtime.finish-project-boundary-execution";
+      readonly executionId: string;
+      readonly expectedVersion: number;
+      readonly outcome: "completed" | "failed";
+      readonly errorCode?: string;
       readonly now: number;
     }
   | { readonly type: "runtime.claim"; readonly executionId: string; readonly attemptSeq: number; readonly now: number }
@@ -300,6 +354,18 @@ export type RuntimeAuthorityOperationResult =
       readonly receipt: AgentExecutionRetryReceipt;
     }
   | { readonly kind: "project-boundary"; readonly result: ProjectBoundaryInvocationResult }
+  | { readonly kind: "project-boundary-executions";
+      readonly records: readonly ClaimedProjectBoundaryExecution[] }
+  | { readonly kind: "project-reminder-scan";
+      readonly result: ProjectReminderScanResult }
+  | { readonly kind: "project-agent-boundary-scan";
+      readonly scannedCount: number; readonly createdCount: number; readonly suppressedCount: number }
+  | { readonly kind: "project-route-facts";
+      readonly result: { readonly status: "dependency_unavailable" } |
+        { readonly status: "ready"; readonly goalRevision: number;
+          readonly projectRevision: number } }
+  | { readonly kind: "project-boundary-execution";
+      readonly execution: ClaimedProjectBoundaryExecution | null }
   | { readonly kind: "execution"; readonly execution: AgentExecution }
   | {
       readonly kind: "prepared-tool";
@@ -506,6 +572,43 @@ export function isRuntimeAuthorityOperation(value: unknown): value is RuntimeAut
       "type", "request", "requestSha256", "reason", "decidedAt", "now",
     ]) && isProjectBoundaryInvocationRequest(value.request) && sha256(value.requestSha256) &&
       value.reason === "dependency_unavailable" && text(value.decidedAt) && count(value.now);
+  }
+  if (value.type === "runtime.claim-project-boundary") {
+    return exact(value, [
+      "type", "request", "requestSha256", "attemptedAt", "providerId", "modelId", "now",
+    ], Object.hasOwn(value, "intentId") ? ["intentId"] : []) &&
+      isProjectBoundaryInvocationRequest(value.request) && sha256(value.requestSha256) &&
+      text(value.attemptedAt) && text(value.providerId) && text(value.modelId) &&
+      (!Object.hasOwn(value, "intentId") || text(value.intentId)) && count(value.now);
+  }
+  if (value.type === "runtime.scan-project-boundary-executions") {
+    return exact(value, ["type", "limit", "now"]) && count(value.limit, 1) &&
+      value.limit <= 256 && count(value.now);
+  }
+  if (value.type === "runtime.scan-project-reminders") {
+    return exact(value, ["type", "providerId", "modelId", "agentProviderReady", "limit", "now"]) &&
+      text(value.providerId) && text(value.modelId) && count(value.limit, 1) &&
+      typeof value.agentProviderReady === "boolean" && value.limit <= 256 && count(value.now);
+  }
+  if (value.type === "runtime.scan-project-agent-boundaries") {
+    return exact(value, ["type", "providerId", "modelId", "agentProviderReady", "limit", "now"]) &&
+      text(value.providerId) && text(value.modelId) && count(value.limit, 1) &&
+      typeof value.agentProviderReady === "boolean" && value.limit <= 256 && count(value.now);
+  }
+  if (value.type === "runtime.read-project-route-facts") {
+    return exact(value, ["type", "roomId", "now"]) && text(value.roomId) && count(value.now);
+  }
+  if (value.type === "runtime.begin-project-boundary-execution") {
+    return exact(value, ["type", "executionId", "expectedVersion", "now"]) &&
+      text(value.executionId) && count(value.expectedVersion, 1) && count(value.now);
+  }
+  if (value.type === "runtime.finish-project-boundary-execution") {
+    return exact(value, ["type", "executionId", "expectedVersion", "outcome", "now"],
+      Object.hasOwn(value, "errorCode") ? ["errorCode"] : []) && text(value.executionId) &&
+      count(value.expectedVersion, 1) &&
+      (value.outcome === "completed" || value.outcome === "failed") &&
+      (value.outcome === "failed" ? text(value.errorCode) : !Object.hasOwn(value, "errorCode")) &&
+      count(value.now);
   }
   if (value.type === "runtime.claim") {
     return exact(value, ["type", "executionId", "attemptSeq", "now"]) && text(value.executionId) && count(value.attemptSeq, 1) && count(value.now);

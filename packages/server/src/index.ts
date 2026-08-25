@@ -212,6 +212,7 @@ export type WorkerDatabaseClient = Omit<
   | "executeRoute"
   | "executeBall"
   | "executeMemory"
+  | "executeProjectLoop"
   | "executeAttachment"
   | "executeTenantAdministration"
   | "executeRoomAssignment"
@@ -266,6 +267,26 @@ export {
   parsePersistedRoomEvent,
   parsePersistentCommand,
 } from "./persistence/contracts.js";
+export {
+  isProjectLoopFrameType,
+  isProjectLoopServerFrame,
+  parseProjectLoopClientFrame,
+  PROJECT_LOOP_PROTOCOL_LIMITS,
+} from "./project-loop-protocol.js";
+export type {
+  ProjectLoopClientFrame,
+  ProjectLoopFrameParseResult,
+  ProjectLoopMutationFrame,
+  ProjectLoopServerFrame,
+  PublicProjectProposalPayload,
+} from "./project-loop-protocol.js";
+export {
+  executeProjectLoopFrame,
+  ProjectLoopTransportError,
+} from "./project-loop-websocket.js";
+export type { ProjectLoopAuthorityTransport } from "./project-loop-websocket.js";
+export { createProjectLoopRepairSegmentDescriptor } from "./project-loop/repair-descriptor.js";
+export type { ProjectLoopRepairSnapshotReader } from "./project-loop/repair-descriptor.js";
 export type {
   AgentCollaborationCommand,
   AgentPrincipal,

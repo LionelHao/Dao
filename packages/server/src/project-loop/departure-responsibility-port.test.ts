@@ -50,7 +50,8 @@ function createDatabase(path = ":memory:"): DatabaseSync {
       target_human_actor_id TEXT NOT NULL,
       status TEXT NOT NULL CHECK (
         status IN ('pending_acceptance', 'accepted', 'rejected', 'cancelled')
-      )
+      ),
+      source_kind TEXT NOT NULL DEFAULT 'message'
     ) STRICT;
     CREATE TABLE project_next_actions (
       id TEXT PRIMARY KEY,
@@ -67,6 +68,7 @@ function createDatabase(path = ":memory:"): DatabaseSync {
           'cancelled'
         )
       ),
+      source_kind TEXT NOT NULL DEFAULT 'message',
       CHECK (owner_kind = 'human' OR verifier_human_actor_id IS NOT NULL)
     ) STRICT;
     CREATE TABLE project_obstacles (
@@ -80,7 +82,8 @@ function createDatabase(path = ":memory:"): DatabaseSync {
       owner_actor_id TEXT NOT NULL,
       status TEXT NOT NULL CHECK (
         status IN ('open', 'resolved', 'deferred', 'cannot_answer')
-      )
+      ),
+      source_kind TEXT NOT NULL DEFAULT 'message'
     ) STRICT;
     CREATE TABLE project_transfer_proposals (
       id TEXT PRIMARY KEY,
@@ -92,11 +95,29 @@ function createDatabase(path = ":memory:"): DatabaseSync {
         subject_kind IN ('next_action', 'blocker', 'open_question')
       ),
       subject_id TEXT NOT NULL,
+      subject_revision INTEGER NOT NULL CHECK (subject_revision > 0),
       to_owner_kind TEXT NOT NULL CHECK (to_owner_kind IN ('human', 'agent')),
       to_owner_actor_id TEXT NOT NULL,
+      principal_human_actor_id TEXT NOT NULL,
       status TEXT NOT NULL CHECK (
         status IN ('pending', 'accepted', 'rejected', 'cancelled', 'expired')
-      )
+      ),
+      source_kind TEXT NOT NULL DEFAULT 'message'
+    ) STRICT;
+    CREATE TABLE project_fact_proposals (
+      id TEXT PRIMARY KEY,
+      room_id TEXT NOT NULL,
+      source_room_id TEXT NOT NULL CHECK (source_room_id = room_id),
+      source_id TEXT NOT NULL,
+      revision INTEGER NOT NULL CHECK (revision > 0)
+    ) STRICT;
+    CREATE TABLE project_confirmations (
+      id TEXT PRIMARY KEY,
+      room_id TEXT NOT NULL,
+      proposal_id TEXT NOT NULL,
+      revision INTEGER NOT NULL CHECK (revision > 0),
+      principal_human_actor_id TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('pending', 'confirmed', 'rejected', 'expired'))
     ) STRICT;
     CREATE TABLE departure_write_probes (
       id TEXT PRIMARY KEY
@@ -109,30 +130,52 @@ function insertCompleteResponsibilityFixture(database: DatabaseSync): void {
   database.exec(`
     INSERT INTO project_requests VALUES
       ('request-target', 'room-1', 'room-1', 'message-request-target', 2,
-       'human-requester', 'human-1', 'pending_acceptance'),
+       'human-requester', 'human-1', 'pending_acceptance', 'message'),
       ('request-requester', 'room-1', 'room-1', 'message-request-requester', 3,
-       'human-1', 'human-target', 'pending_acceptance'),
+       'human-1', 'human-target', 'pending_acceptance', 'message'),
       ('request-terminal', 'room-1', 'room-1', 'message-request-terminal', 1,
-       'human-1', 'human-target', 'accepted');
+       'human-1', 'human-target', 'accepted', 'message'),
+      ('request-legacy', 'room-1', 'room-1', 'legacy-request', 1,
+       'human-1', 'human-target', 'pending_acceptance', 'legacy_v14');
     INSERT INTO project_next_actions VALUES
       ('action-owned', 'room-1', 'room-1', 'message-action-owned', 4,
-       'human', 'human-1', NULL, 'in_progress'),
+       'human', 'human-1', NULL, 'in_progress', 'message'),
       ('action-verification', 'room-1', 'room-1', 'execution-action', 5,
-       'agent', 'agent-1', 'human-1', 'delivered'),
+       'agent', 'agent-1', 'human-1', 'delivered', 'agent_execution'),
+      ('action-verifier-active', 'room-1', 'room-1', 'message-agent-active', 3,
+       'agent', 'agent-2', 'human-1', 'in_progress', 'message'),
       ('action-done', 'room-1', 'room-1', 'message-action-done', 2,
-       'human', 'human-1', NULL, 'done');
+       'human', 'human-1', NULL, 'done', 'message'),
+      ('action-other', 'room-1', 'room-1', 'message-action-other', 1,
+       'human', 'human-target', NULL, 'accepted', 'message'),
+      ('action-agent', 'room-1', 'room-1', 'message-action-agent', 1,
+       'agent', 'agent-3', 'human-target', 'accepted', 'message'),
+      ('action-legacy', 'room-1', 'room-1', 'legacy-action', 1,
+       'human', 'human-1', NULL, 'in_progress', 'legacy_v14');
     INSERT INTO project_obstacles VALUES
       ('blocker-1', 'room-1', 'room-1', 'message-blocker', 6,
-       'blocker', 'human', 'human-1', 'open'),
+       'blocker', 'human', 'human-1', 'open', 'message'),
       ('question-1', 'room-1', 'room-1', 'message-question', 7,
-       'open_question', 'human', 'human-1', 'deferred'),
+       'open_question', 'human', 'human-1', 'deferred', 'message'),
       ('obstacle-resolved', 'room-1', 'room-1', 'message-resolved', 1,
-       'blocker', 'human', 'human-1', 'resolved');
+       'blocker', 'human', 'human-1', 'resolved', 'message'),
+      ('obstacle-legacy', 'room-1', 'room-1', 'legacy-obstacle', 1,
+       'blocker', 'human', 'human-1', 'open', 'legacy_v14');
     INSERT INTO project_transfer_proposals VALUES
       ('transfer-1', 'room-1', 'room-1', 'message-transfer', 8,
-       'next_action', 'action-other', 'human', 'human-1', 'pending'),
+       'next_action', 'action-other', 1, 'human', 'human-1', 'human-1', 'pending', 'message'),
+      ('transfer-agent', 'room-1', 'room-1', 'message-transfer-agent', 2,
+       'next_action', 'action-agent', 1, 'agent', 'agent-3', 'human-1', 'pending', 'message'),
+      ('transfer-stale', 'room-1', 'room-1', 'message-transfer-stale', 1,
+       'next_action', 'action-owned', 3, 'human', 'human-1', 'human-1', 'pending', 'message'),
       ('transfer-terminal', 'room-1', 'room-1', 'message-transfer-terminal', 1,
-       'blocker', 'blocker-other', 'human', 'human-1', 'rejected');
+       'blocker', 'blocker-other', 1, 'human', 'human-1', 'human-1', 'rejected', 'message'),
+      ('transfer-legacy', 'room-1', 'room-1', 'legacy-transfer', 1,
+       'blocker', 'legacy-blocker', 1, 'human', 'human-1', 'human-1', 'pending', 'legacy_v14');
+    INSERT INTO project_fact_proposals VALUES
+      ('proposal-confirmation', 'room-1', 'room-1', 'message-confirmation', 4);
+    INSERT INTO project_confirmations VALUES
+      ('confirmation-project', 'room-1', 'proposal-confirmation', 2, 'human-1', 'pending');
   `);
 }
 
@@ -245,6 +288,30 @@ function expectUnavailable(
 }
 
 describe("FT-09A departure responsibility production aggregate", () => {
+  it("treats an explicitly absent legacy Project schema as empty but fails closed for v24 corruption", () => {
+    const legacy = new DatabaseSync(":memory:");
+    try {
+      legacy.exec(`
+        CREATE TABLE project_requests (
+          id TEXT PRIMARY KEY,
+          room_id TEXT NOT NULL,
+          status TEXT NOT NULL
+        ) STRICT;
+      `);
+      expect(invokeDeparture(legacy)).toEqual({
+        roomId: "room-1",
+        targetHumanActorId: "human-1",
+        conflicts: [],
+      });
+
+      legacy.exec("PRAGMA user_version = 24");
+      expectUnavailable(() => invokeDeparture(legacy),
+        "departure-responsibility", "malformed_result");
+    } finally {
+      legacy.close();
+    }
+  });
+
   it("registers the exact production feature and reads every real non-empty responsibility class", () => {
     const database = createDatabase();
     try {
@@ -263,21 +330,29 @@ describe("FT-09A departure responsibility production aggregate", () => {
       const result = invokeDeparture(database);
       expect(result.roomId).toBe("room-1");
       expect(result.targetHumanActorId).toBe("human-1");
-      expect(result.conflicts).toHaveLength(7);
+      expect(result.conflicts).toHaveLength(10);
+      expect(result.conflicts.map((conflict) => conflict.subjectId))
+        .not.toContain("transfer-stale");
       expect(result.conflicts.map((conflict) => conflict.title).sort()).toEqual([
         "project.blocker.owner",
+        "project.confirmation.pending",
         "project.next_action.owner",
+        "project.next_action.pending_verification",
         "project.next_action.pending_verification",
         "project.open_question.owner",
         "project.request.pending_acceptance.requester",
         "project.request.pending_acceptance.target",
         "project.transfer.pending_acceptance",
+        "project.transfer.pending_acceptance",
       ]);
       expect(result.conflicts.map((conflict) => conflict.kind).sort()).toEqual([
         "acceptance",
         "acceptance",
+        "acceptance",
         "blocker_or_open_question",
         "blocker_or_open_question",
+        "confirmation",
+        "next_action",
         "next_action",
         "next_action",
         "request",
@@ -291,11 +366,14 @@ describe("FT-09A departure responsibility production aggregate", () => {
       expect(result.conflicts.map((conflict) => conflict.sourceId).sort()).toEqual([
         "execution-action",
         "message-action-owned",
+        "message-agent-active",
         "message-blocker",
+        "message-confirmation",
         "message-question",
         "message-request-requester",
         "message-request-target",
         "message-transfer",
+        "message-transfer-agent",
       ]);
       expect(JSON.stringify(result)).not.toContain("body");
       expect(JSON.stringify(result)).not.toContain("parameter");
@@ -314,7 +392,10 @@ describe("FT-09A departure responsibility production aggregate", () => {
     try {
       database.exec("BEGIN IMMEDIATE");
       database.prepare(
-        `INSERT INTO project_requests VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO project_requests (
+           id, room_id, source_room_id, source_id, revision,
+           requester_human_actor_id, target_human_actor_id, status
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         "request-transaction", "room-1", "room-1", "message-transaction", 1,
         "human-requester", "human-1", "pending_acceptance",
@@ -341,7 +422,10 @@ describe("FT-09A departure responsibility production aggregate", () => {
       const restartedAfterRollback = new DatabaseSync(path);
       expect(invokeDeparture(restartedAfterRollback).conflicts).toEqual([]);
       restartedAfterRollback.prepare(
-        `INSERT INTO project_requests VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO project_requests (
+           id, room_id, source_room_id, source_id, revision,
+           requester_human_actor_id, target_human_actor_id, status
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         "request-transaction", "room-1", "room-1", "message-transaction", 1,
         "human-requester", "human-1", "pending_acceptance",
@@ -415,7 +499,10 @@ describe("FT-09A departure responsibility production aggregate", () => {
     try {
       database.exec("PRAGMA ignore_check_constraints = ON");
       database.prepare(
-        `INSERT INTO project_requests VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO project_requests (
+           id, room_id, source_room_id, source_id, revision,
+           requester_human_actor_id, target_human_actor_id, status
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         "request-cross-room", "room-1", "room-2", "message-room-2", 1,
         "human-requester", "human-1", "pending_acceptance",

@@ -177,6 +177,32 @@ function createDatabase(): DatabaseSync {
   return database;
 }
 
+function installProjectDepartureSchema(database: DatabaseSync): void {
+  database.exec(`
+    ALTER TABLE project_requests ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'message';
+    ALTER TABLE project_next_actions ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'message';
+    ALTER TABLE project_obstacles ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'message';
+    ALTER TABLE project_transfer_proposals
+      ADD COLUMN principal_human_actor_id TEXT NOT NULL DEFAULT 'human-owner';
+    ALTER TABLE project_transfer_proposals ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'message';
+    CREATE TABLE project_fact_proposals (
+      id TEXT PRIMARY KEY,
+      room_id TEXT NOT NULL,
+      source_room_id TEXT NOT NULL,
+      source_id TEXT NOT NULL,
+      revision INTEGER NOT NULL
+    ) STRICT;
+    CREATE TABLE project_confirmations (
+      id TEXT PRIMARY KEY,
+      room_id TEXT NOT NULL,
+      proposal_id TEXT NOT NULL,
+      revision INTEGER NOT NULL,
+      principal_human_actor_id TEXT NOT NULL,
+      state TEXT NOT NULL
+    ) STRICT;
+  `);
+}
+
 function productionComposition(): DepartureGovernanceComposition {
   return Object.freeze({
     manifest: manifest(),
@@ -259,8 +285,12 @@ function customComposition(
 describe("FT-02B departure governance", () => {
   it("returns an authorized, read-only, closed preflight from the real aggregate provider", () => {
     const database = createDatabase();
+    installProjectDepartureSchema(database);
     database.prepare(
-      `INSERT INTO project_requests VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO project_requests (
+         id, room_id, source_room_id, source_id, revision,
+         requester_human_actor_id, target_human_actor_id, status
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       "request-1", "room-1", "room-1", "message-1", 3,
       "human-owner", "human-member", "pending_acceptance",
@@ -381,6 +411,7 @@ describe("FT-02B departure governance", () => {
 
   it("rechecks immediately before the commit callback and returns the latest 409 conflicts", () => {
     const database = createDatabase();
+    installProjectDepartureSchema(database);
     const coordinator = createDepartureGovernanceCoordinator(productionComposition());
     const commit = vi.fn();
 
@@ -394,7 +425,10 @@ describe("FT-02B departure governance", () => {
       });
       useAuthorityTransactionDatabase(transaction, (txDatabase) => {
         txDatabase.prepare(
-          `INSERT INTO project_next_actions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO project_next_actions (
+             id, room_id, source_room_id, source_id, revision, owner_kind,
+             owner_actor_id, verifier_human_actor_id, status
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         ).run(
           "action-new", "room-1", "room-1", "message-new", 1,
           "human", "human-member", null, "in_progress",

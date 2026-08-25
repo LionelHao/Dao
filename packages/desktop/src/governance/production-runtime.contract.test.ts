@@ -70,6 +70,7 @@ async function loopbackAuthority(): Promise<{
   readonly received: readonly Record<string, unknown>[];
   disconnect(): void;
   removeRoomAccess(): void;
+  revokeSession(): void;
 }> {
   const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
   servers.push(server);
@@ -175,6 +176,11 @@ async function loopbackAuthority(): Promise<{
         type: "identity.room-access.changed", payload: { roomId: "room-1", change: "removed" },
       }));
     },
+    revokeSession() {
+      for (const client of server.clients) client.send(JSON.stringify({
+        type: "auth.session-revoked", eventId: "session-revoked-1",
+      }));
+    },
   };
 }
 
@@ -271,7 +277,7 @@ describe("production Desktop Governance loopback wire contract fixture", () => {
     dispose(); runtime.close();
   });
 
-  it("locks and purges without a real offline lease, reconnects on repair, and purges on revoke", async () => {
+  it("locks writes but retains the verified offline cache, reconnects on repair, and purges on revoke", async () => {
     const authority = await loopbackAuthority();
     let request = 0;
     const runtime = createDesktopGovernanceRuntime({
@@ -289,7 +295,9 @@ describe("production Desktop Governance loopback wire contract fixture", () => {
     await vi.waitFor(() => expect(runtime.controller.current("room-1")).toMatchObject({
       status: "locked", connection: { status: "offline" },
     }));
-    expect(runtime.cache.governanceProjection("room-1")).toBeUndefined();
+    expect(runtime.cache.governanceProjection("room-1")).toMatchObject({
+      roomId: "room-1", governanceRevision: 7,
+    });
     const countBeforeSubmit = authority.received.length;
     expect(() => runtime.controller.submit({
       roomId: "room-1", intent: { command: "room.archive", expectedGovernanceRevision: 7 },
@@ -309,5 +317,53 @@ describe("production Desktop Governance loopback wire contract fixture", () => {
       connection: { status: "revoked", scope: "room", purgeCompleted: true },
     });
     runtime.close();
+  });
+
+  it("publishes terminal purge completion only after durable deletion and preserves cache on ordinary close", async () => {
+    const authority = await loopbackAuthority();
+    let releaseClear: (() => void) | undefined;
+    const clearGate = new Promise<void>((resolve) => { releaseClear = resolve; });
+    const clear = vi.fn(async () => clearGate);
+    const persistence = { async load() { return undefined; }, async save() {}, clear };
+    let request = 0;
+    const runtime = createDesktopGovernanceRuntime({
+      endpoint: authority.endpoint,
+      session: () => ({ actorId: "owner-1", sessionId: "session-1", accessToken: "main-only-token",
+        expiresAt: "2026-08-19T12:00:00.000Z" }),
+      webSocketFactory: (endpoint) => new WebSocket(endpoint) as unknown as GovernanceWebSocketLike,
+      createRequestIdentity: () => ({ requestId: `purge-${++request}`, idempotencyKey: `key-${request}` }),
+      cachePersistence: persistence,
+      timeoutMs: 2_000,
+    });
+    await runtime.controller.getSurface({ roomId: "room-1" });
+    authority.revokeSession();
+    await vi.waitFor(() => expect(runtime.controller.current("room-1")).toMatchObject({
+      status: "locked", connection: { status: "revoked", scope: "session", purgeCompleted: false },
+    }));
+    expect(clear).toHaveBeenCalledOnce();
+    releaseClear?.();
+    await vi.waitFor(() => expect(runtime.controller.current("room-1")).toMatchObject({
+      status: "locked", connection: { status: "revoked", scope: "session", purgeCompleted: true },
+    }));
+    runtime.close();
+    expect(clear).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the durable authority cache across an ordinary runtime close", async () => {
+    const authority = await loopbackAuthority();
+    const clear = vi.fn(async () => {});
+    let request = 0;
+    const runtime = createDesktopGovernanceRuntime({
+      endpoint: authority.endpoint,
+      session: () => ({ actorId: "owner-1", sessionId: "session-1", accessToken: "main-only-token",
+        expiresAt: "2026-08-19T12:00:00.000Z" }),
+      webSocketFactory: (endpoint) => new WebSocket(endpoint) as unknown as GovernanceWebSocketLike,
+      createRequestIdentity: () => ({ requestId: `close-${++request}`, idempotencyKey: `key-${request}` }),
+      cachePersistence: { async load() { return undefined; }, async save() {}, clear },
+      timeoutMs: 2_000,
+    });
+    await runtime.controller.getSurface({ roomId: "room-1" });
+    runtime.close();
+    expect(clear).not.toHaveBeenCalled();
   });
 });

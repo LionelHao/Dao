@@ -137,6 +137,9 @@ export function renderMemoryAuthoritySurface(
   for (const card of model.cards) {
     const article = element("article", "memory-card");
     article.dataset.memoryRecordId = card.memoryRecordId;
+    article.dataset.sourceId = card.memoryRecordId;
+    article.dataset.sourceKind = "memory";
+    article.dataset.sourceRevision = String(card.version);
     if (card.memoryVersionId !== undefined) article.dataset.memoryVersionId = card.memoryVersionId;
     article.dataset.injectable = String(card.injectable);
     article.setAttribute("role", "listitem");
