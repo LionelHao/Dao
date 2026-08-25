@@ -78,7 +78,14 @@ function invocationIntent(value: unknown): value is AgentInvocationIntent {
     typeof value.targetAgentId === "string";
 }
 
-function invocationResult(value: unknown): InvocationAcceptedWithIntent {
+function invocationResult(
+  value: unknown,
+  expectedRetry?: Readonly<{
+    requestId: string;
+    sourceExecutionId: string;
+    receiptRequired: boolean;
+  }>,
+): InvocationAcceptedWithIntent {
   if (!record(value) || value.kind !== "invocation" || typeof value.replayed !== "boolean" ||
       !isAgentExecution(value.execution) || !invocationIntent(value.intent) ||
       value.intent.roomId !== value.execution.roomId ||
@@ -88,6 +95,17 @@ function invocationResult(value: unknown): InvocationAcceptedWithIntent {
   }
   if (value.retryReceipt !== undefined && !isAgentExecutionRetryReceipt(value.retryReceipt)) {
     throw new AgentRuntimeError("provider_failure", "Authority retry receipt was malformed");
+  }
+  if (expectedRetry !== undefined &&
+      ((expectedRetry.receiptRequired && value.retryReceipt === undefined) ||
+       (value.retryReceipt !== undefined &&
+        (value.retryReceipt.requestId !== expectedRetry.requestId ||
+         value.retryReceipt.sourceExecutionId !== expectedRetry.sourceExecutionId ||
+         value.retryReceipt.executionId !== value.execution.id ||
+         value.retryReceipt.roomId !== value.execution.roomId ||
+         value.retryReceipt.createdAt !== value.execution.queuedAt ||
+         value.execution.manualRetryOfExecutionId !== expectedRetry.sourceExecutionId)))) {
+    throw new AgentRuntimeError("provider_failure", "Authority retry receipt binding was malformed");
   }
   return {
     execution: value.execution,
@@ -379,7 +397,11 @@ export function createWorkerRuntimeAuthority(
         newIntentId: `intent-${randomUUID()}`,
         ...(expectedVersion === undefined ? {} : { expectedVersion }),
         now: Date.now(),
-      }));
+      }), {
+        requestId: context.requestId,
+        sourceExecutionId: executionId,
+        receiptRequired: expectedVersion !== undefined,
+      });
       remember(result.execution);
       return result;
     },

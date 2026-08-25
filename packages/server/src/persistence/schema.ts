@@ -73,7 +73,7 @@ const SCHEMA_FINGERPRINTS = {
   19: "e458dedc7c0d85c04bca92dc2f6289b02367fb97fc7edbe1c7dba011470812b7",
   20: "1ca2a806a52cd2ce9632b02e215a25ba13bc3ebc4336f5152c48f21d60faa2a0",
   21: "dca0a24a346060b1e04b98ee5a73e016421796d6c13bd0bd2841179f405c44af",
-  22: "7ebc93d38a8c5dfeaa8d9b40c86d6362fc43af0da578aab641850d0ee6a15c8a",
+  22: "cbf4ccb27b52c3b88d61667f94811501d36a54795391e0044bbb0b2f41d3c7ce",
 } as const;
 
 const V1_STATEMENTS = [
@@ -7430,12 +7430,44 @@ const V22_STATEMENTS = [
        ON link.execution_id = NEW.child_execution_id
      JOIN agent_execution_runtime_states AS runtime
        ON runtime.execution_id = NEW.child_execution_id
+     JOIN agent_execution_runtime_states AS source_runtime
+       ON source_runtime.execution_id = NEW.source_execution_id
+     JOIN agent_executions AS execution
+       ON execution.id = NEW.child_execution_id
+     JOIN agent_invocation_intents AS intent
+       ON intent.id = NEW.intent_id
      WHERE principal.id = NEW.principal_actor_id AND principal.kind = 'human'
        AND link.intent_id = NEW.intent_id
        AND link.execution_ordinal = NEW.execution_ordinal
        AND link.retry_of_execution_id = NEW.source_execution_id
        AND runtime.snapshot_id IS NOT NULL
+       AND json_extract(NEW.response_json, '$.kind') = 'invocation'
+       AND json_extract(NEW.response_json, '$.replayed') = 0
+       AND json_extract(NEW.response_json, '$.execution.id') = NEW.child_execution_id
+       AND json_extract(NEW.response_json, '$.execution.manualRetryOfExecutionId') =
+           NEW.source_execution_id
+       AND json_extract(NEW.response_json, '$.execution.roomId') = execution.room_id
+       AND json_extract(NEW.response_json, '$.execution.queuedAt') = execution.queued_at
+       AND json_extract(NEW.response_json, '$.intent.kind') = intent.intent_kind
+       AND json_extract(NEW.response_json, '$.intent.roomId') = intent.room_id
+       AND json_extract(NEW.response_json, '$.intent.sourceMessageId') =
+           intent.source_message_id
+       AND json_extract(NEW.response_json, '$.intent.targetAgentId') =
+           intent.target_agent_id
+       AND json_extract(NEW.response_json, '$.retryReceipt.requestId') = NEW.request_id
+       AND json_extract(NEW.response_json, '$.retryReceipt.sourceExecutionId') =
+           NEW.source_execution_id
+       AND json_extract(NEW.response_json, '$.retryReceipt.executionId') =
+           NEW.child_execution_id
+       AND json_extract(NEW.response_json, '$.retryReceipt.intentId') = NEW.intent_id
+       AND json_extract(NEW.response_json, '$.retryReceipt.lineageId') =
+           source_runtime.lineage_id
+       AND json_extract(NEW.response_json, '$.retryReceipt.roomId') = execution.room_id
+       AND json_extract(NEW.response_json, '$.retryReceipt.executionOrdinal') =
+           NEW.execution_ordinal
        AND json_extract(NEW.response_json, '$.retryReceipt.snapshotId') = runtime.snapshot_id
+       AND json_extract(NEW.response_json, '$.retryReceipt.status') = 'accepted'
+       AND json_extract(NEW.response_json, '$.retryReceipt.createdAt') = execution.queued_at
    )
    BEGIN SELECT RAISE(ABORT, 'Human retry receipt authority is inconsistent'); END`,
   `CREATE TRIGGER invocation_human_retry_receipts_v22_immutable_update
@@ -10591,14 +10623,50 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
          ON link.execution_id = receipt.child_execution_id
        LEFT JOIN agent_execution_runtime_states AS runtime
          ON runtime.execution_id = receipt.child_execution_id
+       LEFT JOIN agent_execution_runtime_states AS source_runtime
+         ON source_runtime.execution_id = receipt.source_execution_id
+       LEFT JOIN agent_executions AS execution
+         ON execution.id = receipt.child_execution_id
+       LEFT JOIN agent_invocation_intents AS intent ON intent.id = receipt.intent_id
        LEFT JOIN actors AS principal ON principal.id = receipt.principal_actor_id
        WHERE link.intent_id IS NULL OR link.intent_id <> receipt.intent_id
           OR link.execution_ordinal <> receipt.execution_ordinal
           OR link.retry_of_execution_id <> receipt.source_execution_id
           OR principal.kind IS NOT 'human'
           OR runtime.snapshot_id IS NULL
+          OR json_extract(receipt.response_json, '$.kind') IS NOT 'invocation'
+          OR json_extract(receipt.response_json, '$.replayed') IS NOT 0
+          OR json_extract(receipt.response_json, '$.execution.id')
+             IS NOT receipt.child_execution_id
+          OR json_extract(receipt.response_json, '$.execution.manualRetryOfExecutionId')
+             IS NOT receipt.source_execution_id
+          OR json_extract(receipt.response_json, '$.execution.roomId') IS NOT execution.room_id
+          OR json_extract(receipt.response_json, '$.execution.queuedAt') IS NOT execution.queued_at
+          OR json_extract(receipt.response_json, '$.intent.kind') IS NOT intent.intent_kind
+          OR json_extract(receipt.response_json, '$.intent.roomId') IS NOT intent.room_id
+          OR json_extract(receipt.response_json, '$.intent.sourceMessageId')
+             IS NOT intent.source_message_id
+          OR json_extract(receipt.response_json, '$.intent.targetAgentId')
+             IS NOT intent.target_agent_id
+          OR json_extract(receipt.response_json, '$.retryReceipt.requestId')
+             IS NOT receipt.request_id
+          OR json_extract(receipt.response_json, '$.retryReceipt.sourceExecutionId')
+             IS NOT receipt.source_execution_id
+          OR json_extract(receipt.response_json, '$.retryReceipt.executionId')
+             IS NOT receipt.child_execution_id
+          OR json_extract(receipt.response_json, '$.retryReceipt.intentId')
+             IS NOT receipt.intent_id
+          OR json_extract(receipt.response_json, '$.retryReceipt.lineageId')
+             IS NOT source_runtime.lineage_id
+          OR json_extract(receipt.response_json, '$.retryReceipt.roomId')
+             IS NOT execution.room_id
+          OR json_extract(receipt.response_json, '$.retryReceipt.executionOrdinal')
+             IS NOT receipt.execution_ordinal
           OR json_extract(receipt.response_json, '$.retryReceipt.snapshotId')
              IS NOT runtime.snapshot_id
+          OR json_extract(receipt.response_json, '$.retryReceipt.status') IS NOT 'accepted'
+          OR json_extract(receipt.response_json, '$.retryReceipt.createdAt')
+             IS NOT execution.queued_at
        LIMIT 1`,
       "Human retry receipts must retain exact principal, child lineage, and snapshot binding",
     );

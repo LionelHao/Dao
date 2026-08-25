@@ -73,6 +73,11 @@ describe("Invocation wire ACK decoder", () => {
       code: "context_snapshot_invalidated", message: "closed",
     }))).toMatchObject({ requestId: "retry-context-1",
       error: { code: "context_unavailable", status: 410 } });
+    expect(parseGovernanceServerFrame(JSON.stringify({
+      type: "error", requestId: "retry-access-1", status: 403,
+      code: "permission_denied", message: "closed",
+    }))).toMatchObject({ requestId: "retry-access-1",
+      error: { code: "access_revoked", status: 403 } });
   });
 
   it("round-trips the canonical receipts over a real WebSocket", async () => {
@@ -91,6 +96,11 @@ describe("Invocation wire ACK decoder", () => {
         socket.send(JSON.stringify({ type: "invocation.cancel.ack", requestId,
           receipt: cancellationReceipt }));
       } else if (frame.type === "invocation.retry") {
+        if (requestId === "retry-denied") {
+          socket.send(JSON.stringify({ type: "error", requestId, status: 403,
+            code: "permission_denied", message: "permission_denied" }));
+          return;
+        }
         socket.send(JSON.stringify({ type: "invocation.retry.ack", requestId,
           receipt: retryReceipt, replayed: false }));
       }
@@ -108,6 +118,10 @@ describe("Invocation wire ACK decoder", () => {
       executionId: "execution-1", expectedVersion: 4 })).resolves.toEqual({
       type: "invocation.retry.ack", requestId: "retry-1", receipt: retryReceipt, replayed: false,
     });
+    await expect(transport.controlInvocation({ type: "invocation.retry", requestId: "retry-denied",
+      executionId: "execution-1", expectedVersion: 4 })).rejects.toMatchObject({
+        code: "access_revoked", status: 403,
+      });
     transport.close();
   });
 });

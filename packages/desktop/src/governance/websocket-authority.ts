@@ -182,7 +182,7 @@ function mappedError(
     unauthenticated: "authentication_required", invalid_token: "authentication_required",
     token_expired: "authentication_required", session_revoked: "session_revoked",
     room_forbidden: "access_revoked", identity_forbidden: "access_revoked",
-    context_forbidden: "access_revoked",
+    context_forbidden: "access_revoked", permission_denied: "access_revoked",
     role_forbidden: "role_forbidden", member_not_found: "member_not_found",
     room_not_found: "room_not_found", room_revision_conflict: "room_revision_conflict",
     ownership_transfer_required: "ownership_transfer_required", room_archived: "room_archived",

@@ -2883,6 +2883,7 @@ describe("authoritative server real-process harness", () => {
     const sentinel = "FT08-PREVIEW-TRANSIENT-ONLY-7F41C9D2";
     let started: Awaited<ReturnType<typeof spawnAuthorityChild>> | undefined;
     let client: JsonWebSocketClient | undefined;
+    let desktopRuntime: DesktopMessageAuthorityRuntime | undefined;
     try {
       const seeded = await spawnAuthorityChild({
         directory,
@@ -2937,6 +2938,27 @@ describe("authoritative server real-process harness", () => {
         previewSentinelForTest: sentinel,
       });
       const child = started.child;
+      const desktopLogin = await JsonWebSocketClient.connect(started.url);
+      const desktopSession = await loginAuthorityDevice(desktopLogin, {
+        requestId: "preview-sentinel-desktop-login",
+        accountId: "account-a",
+        secret: "test-secret",
+        deviceId: "preview-sentinel-desktop",
+      });
+      desktopLogin.close();
+      const desktopInputs: MessageAuthorityPortInput[] = [];
+      desktopRuntime = createDesktopMessageAuthorityRuntime({
+        endpoint: started.url,
+        session: () => desktopSession,
+        webSocketFactory: (endpoint) => new NodeIdentityWebSocketAdapter(endpoint),
+        timeoutMs: 5_000,
+      });
+      desktopRuntime.client.subscribe((input) => desktopInputs.push(structuredClone(input)));
+      await expect(desktopRuntime.client.historyV2({
+        type: "room.history.v2",
+        requestId: "preview-sentinel-desktop-history",
+        roomId,
+      })).resolves.toMatchObject({ status: "ready", roomId });
       client = await JsonWebSocketClient.connect(started.url);
       await client.login("preview-sentinel-login");
       await client.request({
@@ -2970,6 +2992,12 @@ describe("authoritative server real-process harness", () => {
           delta: sentinel,
           authoritative: false,
         });
+      await vi.waitFor(() => expect(desktopInputs).toContainEqual(expect.objectContaining({
+        type: "agent.execution.preview",
+        roomId,
+        delta: sentinel,
+        authoritative: false,
+      })));
 
       const reset = client.waitFor((frame) => frame.type === "agent.execution.preview.reset" &&
         frame.reason === "message_recalled");
@@ -2989,6 +3017,12 @@ describe("authoritative server real-process harness", () => {
         reason: "message_recalled",
         authoritative: false,
       });
+      await vi.waitFor(() => expect(desktopInputs).toContainEqual(expect.objectContaining({
+        type: "agent.execution.preview.reset",
+        roomId,
+        reason: "message_recalled",
+        authoritative: false,
+      })));
       await expect(cancelled).resolves.toMatchObject({
         type: "room.event",
         event: { type: "agent.execution.changed", payload: { status: "cancelled" } },
@@ -3003,6 +3037,7 @@ describe("authoritative server real-process harness", () => {
       expect(jsonSentinelHits("stdout", childStdout.get(child) ?? "", [sentinel])).toEqual([]);
       expect(jsonSentinelHits("stderr", unexpectedChildStderr(child), [sentinel])).toEqual([]);
     } finally {
+      desktopRuntime?.close();
       client?.close();
       if (started !== undefined) await stopChild(started.child).catch(() => undefined);
       await rm(directory, { recursive: true, force: true });

@@ -272,6 +272,10 @@ interface ConnectionContext {
   readonly unsubscribersByRoom: Map<string, () => void>;
   readonly identityUnsubscribers: Set<() => void>;
   readonly subscriptionGenerationsByRoom: Map<string, number>;
+  readonly previewSubscriptionEpochsByRoom: Map<string, number>;
+  readonly beginPreviewSubscription: (roomId: string) => void;
+  readonly refreshPreviewSubscriptionEpochs: () => void;
+  readonly clearPreviewVisibilityIfOrphaned: (roomId: string) => void;
   readonly previewAuthorityEpochsByRoom: Map<string, Readonly<{
     subscriptionGeneration: number;
     authorityEpoch: string;
@@ -943,8 +947,13 @@ function canonicalEventBytes(event: PersistedRoomEvent): number {
   return Buffer.byteLength(JSON.stringify(event), "utf8");
 }
 
-function cleanupV2Gate(context: ConnectionContext, gate: V2SubscriptionGate): void {
-  if (context.v2GatesByRoom.get(gate.roomId) === gate) {
+function cleanupV2Gate(
+  context: ConnectionContext,
+  gate: V2SubscriptionGate,
+  clearPreviewVisibility = true,
+): void {
+  const wasCurrent = context.v2GatesByRoom.get(gate.roomId) === gate;
+  if (wasCurrent && clearPreviewVisibility) {
     context.v2GatesByRoom.delete(gate.roomId);
   }
   if (context.unsubscribersByRoom.get(gate.roomId) === gate.unsubscribe) {
@@ -952,6 +961,10 @@ function cleanupV2Gate(context: ConnectionContext, gate: V2SubscriptionGate): vo
   }
   safelyUnsubscribe(gate.unsubscribe);
   gate.unsubscribe = undefined;
+  if (wasCurrent) {
+    context.previewSubscriptionEpochsByRoom.delete(gate.roomId);
+    context.clearPreviewVisibilityIfOrphaned(gate.roomId);
+  }
 }
 
 function unsubscribeV2Gate(context: ConnectionContext, gate: V2SubscriptionGate): void {
@@ -1088,6 +1101,7 @@ function installAuthentication(
     return false;
   }
   context.credentialGeneration += 1;
+  context.refreshPreviewSubscriptionEpochs();
   for (const gate of [...context.v2GatesByRoom.values()]) {
     if (gate.active) {
       gate.credentialGeneration = context.credentialGeneration;
@@ -2008,14 +2022,20 @@ async function handleSubscribe(
   safelyUnsubscribe(previousUnsubscribe);
   const previousGate = context.v2GatesByRoom.get(frame.roomId);
   if (previousGate !== undefined) {
-    cleanupV2Gate(context, previousGate);
+    cleanupV2Gate(context, previousGate, false);
   }
+  context.beginPreviewSubscription(frame.roomId);
 
   if (options.outboxStore !== undefined) {
     const session = context.session;
     const connection = context.registeredConnection;
     const registry = options.subscriptionRegistry;
     if (session === undefined || connection === undefined || registry === undefined) {
+      if (context.subscriptionGenerationsByRoom.get(frame.roomId) === generation) {
+        context.subscriptionGenerationsByRoom.delete(frame.roomId);
+        context.previewSubscriptionEpochsByRoom.delete(frame.roomId);
+        context.clearPreviewVisibilityIfOrphaned(frame.roomId);
+      }
       sendFrame(socket, errorFrame(
         401,
         "unauthenticated",
@@ -2064,7 +2084,11 @@ async function handleSubscribe(
       if (context.unsubscribersByRoom.get(frame.roomId) === unsubscribe) {
         context.unsubscribersByRoom.delete(frame.roomId);
       }
-      context.subscriptionGenerationsByRoom.delete(frame.roomId);
+      if (context.subscriptionGenerationsByRoom.get(frame.roomId) === generation) {
+        context.subscriptionGenerationsByRoom.delete(frame.roomId);
+        context.previewSubscriptionEpochsByRoom.delete(frame.roomId);
+        context.clearPreviewVisibilityIfOrphaned(frame.roomId);
+      }
       if (!context.closed) {
         sendFrame(socket, mappedError(error, frame.requestId));
       }
@@ -2147,6 +2171,8 @@ async function handleSubscribe(
       context.unsubscribersByRoom.delete(frame.roomId);
     }
     context.subscriptionGenerationsByRoom.delete(frame.roomId);
+    context.previewSubscriptionEpochsByRoom.delete(frame.roomId);
+    context.clearPreviewVisibilityIfOrphaned(frame.roomId);
     sendFrame(socket, mappedError(error, frame.requestId));
   }
 }
@@ -2185,8 +2211,9 @@ async function handleSubscribeV2(
   safelyUnsubscribe(previousUnsubscribe);
   const previousGate = context.v2GatesByRoom.get(frame.roomId);
   if (previousGate !== undefined) {
-    cleanupV2Gate(context, previousGate);
+    cleanupV2Gate(context, previousGate, false);
   }
+  context.beginPreviewSubscription(frame.roomId);
   const gate: V2SubscriptionGate = {
     requestId: frame.requestId,
     roomId: frame.roomId,
@@ -3236,12 +3263,14 @@ export async function startMessageWebSocketServer(
           "reconnect" | "execution_terminal" | "attempt_rolled_over" | "access_revoked";
       }>;
       bytes: number;
+      publishedAtSubscriptionEpoch: number;
     }>>;
     overflowResetBytes: number;
     scheduledAttempts: Map<string, number>;
     failedClosed: boolean;
   }>();
   const visiblePreviewAttemptsByRoom = new Map<string, Set<string>>();
+  let nextPreviewSubscriptionEpoch = 0;
   const maxPreviewDeliveryCountPerRoom = 64;
   const maxPreviewDeliveryBytesPerRoom = 256 * 1_024;
   const maxQueuedPreviewFramesPerRoom = 32;
@@ -3255,6 +3284,7 @@ export async function startMessageWebSocketServer(
     const unsubscribersByRoom = new Map<string, () => void>();
     const identityUnsubscribers = new Set<() => void>();
     const subscriptionGenerationsByRoom = new Map<string, number>();
+    const previewSubscriptionEpochsByRoom = new Map<string, number>();
     const previewAuthorityEpochsByRoom = new Map<string, Readonly<{
       subscriptionGeneration: number;
       authorityEpoch: string;
@@ -3262,16 +3292,27 @@ export async function startMessageWebSocketServer(
     const ownedStreamingSnapshots = new Map<string, AuthenticatedSessionContext>();
     const v2GatesByRoom = new Map<string, V2SubscriptionGate>();
     const clearRoomSubscriptions = () => {
+      const previewRooms = new Set([
+        ...unsubscribersByRoom.keys(),
+        ...v2GatesByRoom.keys(),
+      ]);
       for (const unsubscribe of unsubscribersByRoom.values()) {
         safelyUnsubscribe(unsubscribe);
       }
       unsubscribersByRoom.clear();
       subscriptionGenerationsByRoom.clear();
+      previewSubscriptionEpochsByRoom.clear();
       previewAuthorityEpochsByRoom.clear();
       for (const gate of v2GatesByRoom.values()) {
         safelyUnsubscribe(gate.unsubscribe);
       }
       v2GatesByRoom.clear();
+      for (const roomId of previewRooms) {
+        const roomStillSubscribed = [...liveConnections.values()].some(({ context: candidate }) =>
+          !candidate.closed && (candidate.unsubscribersByRoom.has(roomId) ||
+            candidate.v2GatesByRoom.has(roomId)));
+        if (!roomStillSubscribed) visiblePreviewAttemptsByRoom.delete(roomId);
+      }
     };
     const clearLiveSubscriptions = () => {
       clearRoomSubscriptions();
@@ -3311,6 +3352,23 @@ export async function startMessageWebSocketServer(
       unsubscribersByRoom,
       identityUnsubscribers,
       subscriptionGenerationsByRoom,
+      previewSubscriptionEpochsByRoom,
+      beginPreviewSubscription(roomId) {
+        nextPreviewSubscriptionEpoch += 1;
+        previewSubscriptionEpochsByRoom.set(roomId, nextPreviewSubscriptionEpoch);
+      },
+      refreshPreviewSubscriptionEpochs() {
+        for (const roomId of previewSubscriptionEpochsByRoom.keys()) {
+          nextPreviewSubscriptionEpoch += 1;
+          previewSubscriptionEpochsByRoom.set(roomId, nextPreviewSubscriptionEpoch);
+        }
+      },
+      clearPreviewVisibilityIfOrphaned(roomId) {
+        const roomStillSubscribed = [...liveConnections.values()].some(({ context: candidate }) =>
+          !candidate.closed && (candidate.unsubscribersByRoom.has(roomId) ||
+            candidate.v2GatesByRoom.has(roomId)));
+        if (!roomStillSubscribed) visiblePreviewAttemptsByRoom.delete(roomId);
+      },
       previewAuthorityEpochsByRoom,
       ownedStreamingSnapshots,
       connectionId,
@@ -3356,19 +3414,7 @@ export async function startMessageWebSocketServer(
     let frameQueue = Promise.resolve();
     let queuedFrameCount = 0;
     let queuedFrameBytes = 0;
-    const abort = () => {
-      const previewRooms = new Set([
-        ...context.unsubscribersByRoom.keys(),
-        ...context.v2GatesByRoom.keys(),
-      ]);
-      abortConnection(context);
-      for (const roomId of previewRooms) {
-        const roomStillSubscribed = [...liveConnections.values()].some(({ context: candidate }) =>
-          !candidate.closed && (candidate.unsubscribersByRoom.has(roomId) ||
-            candidate.v2GatesByRoom.has(roomId)));
-        if (!roomStillSubscribed) visiblePreviewAttemptsByRoom.delete(roomId);
-      }
-    };
+    const abort = () => abortConnection(context);
 
     abortConnectionBySocket.set(socket, abort);
     activeSockets.add(socket);
@@ -3455,6 +3501,7 @@ export async function startMessageWebSocketServer(
       reason?: "human_cancelled" | "message_recalled" | "runtime_shutdown" | "repair" | "reconnect" |
         "execution_terminal" | "attempt_rolled_over" | "access_revoked";
     }>,
+    publishedAtSubscriptionEpoch: number,
     isCurrent: () => boolean = () => true,
   ): Promise<boolean> => {
     if (options.previewAuthority === undefined || !isCurrent()) return false;
@@ -3462,12 +3509,19 @@ export async function startMessageWebSocketServer(
       const session = context.session;
       const credentialGeneration = context.credentialGeneration;
       const subscriptionGeneration = context.subscriptionGenerationsByRoom.get(preview.roomId);
+      const previewSubscriptionEpoch =
+        context.previewSubscriptionEpochsByRoom.get(preview.roomId);
       if (context.closed || session === undefined || subscriptionGeneration === undefined ||
+          previewSubscriptionEpoch === undefined ||
+          previewSubscriptionEpoch > publishedAtSubscriptionEpoch ||
           (!context.unsubscribersByRoom.has(preview.roomId) &&
             !context.v2GatesByRoom.has(preview.roomId))) return false;
-      const priorEpoch = context.previewAuthorityEpochsByRoom.get(preview.roomId);
+      let priorEpoch = context.previewAuthorityEpochsByRoom.get(preview.roomId);
       if (priorEpoch !== undefined &&
-          priorEpoch.subscriptionGeneration !== subscriptionGeneration) return false;
+          priorEpoch.subscriptionGeneration !== subscriptionGeneration) {
+        context.previewAuthorityEpochsByRoom.delete(preview.roomId);
+        priorEpoch = undefined;
+      }
       const connectionStillCurrent = () => isCurrent() && !context.closed &&
         context.session !== undefined &&
         context.credentialGeneration === credentialGeneration &&
@@ -3475,6 +3529,8 @@ export async function startMessageWebSocketServer(
         context.session.sessionFamilyId === session.sessionFamilyId &&
         samePrincipal(context.session.principal, session.principal) &&
         context.subscriptionGenerationsByRoom.get(preview.roomId) === subscriptionGeneration &&
+        context.previewSubscriptionEpochsByRoom.get(preview.roomId) ===
+          previewSubscriptionEpoch &&
         (context.unsubscribersByRoom.has(preview.roomId) ||
           context.v2GatesByRoom.has(preview.roomId));
       const authorizeAndSend = async (expectedAuthorityEpoch?: string): Promise<Readonly<{
@@ -3520,7 +3576,7 @@ export async function startMessageWebSocketServer(
                 authoritative: false,
               });
             }
-            delivered = true;
+            delivered = connectionStillCurrent();
             return undefined;
           });
         } catch {
@@ -3531,6 +3587,7 @@ export async function startMessageWebSocketServer(
       let attempt = await authorizeAndSend(priorEpoch?.authorityEpoch);
       if (attempt === undefined) return false;
       if (!attempt.authority.authorized) {
+        if (!connectionStillCurrent()) return false;
         // Rotate the cached epoch, then perform exactly one same-frame check.
         // This lets a benign access epoch change deliver a terminal reset while
         // revoke/archive/source fences remain false on the bounded recheck.
@@ -3549,6 +3606,7 @@ export async function startMessageWebSocketServer(
     deliveryKind: "preview" | "reset",
     preview: Parameters<typeof deliverAuthorizedPreview>[1],
   ): Promise<void> => {
+    const publishedAtSubscriptionEpoch = nextPreviewSubscriptionEpoch;
     const bytes = Buffer.byteLength(JSON.stringify(deliveryKind === "preview" ? {
       type: "agent.execution.preview",
       roomId: preview.roomId,
@@ -3574,8 +3632,11 @@ export async function startMessageWebSocketServer(
       previewDeliveryQueues.set(preview.roomId, queue);
     }
     if (queue.failedClosed) return Promise.resolve();
+    const exceedsByteBudget = deliveryKind === "preview"
+      ? queue.bytes + bytes > maxQueuedPreviewBytesPerRoom
+      : queue.bytes + queue.overflowResetBytes + bytes > maxPreviewDeliveryBytesPerRoom;
     if (queue.count >= maxQueuedPreviewFramesPerRoom ||
-        queue.bytes + bytes > maxQueuedPreviewBytesPerRoom ||
+        exceedsByteBudget ||
         queue.overflowResets.size > 0) {
       // A dropped delta only needs a reset when this exact execution/attempt was
       // already visible or is scheduled ahead of the drop. Lifecycle resets are
@@ -3624,7 +3685,13 @@ export async function startMessageWebSocketServer(
         }
         return Promise.resolve();
       }
-      queue.overflowResets.set(attemptKey, { preview: resetPreview, bytes: resetBytes });
+      queue.overflowResets.set(attemptKey, {
+        preview: resetPreview,
+        bytes: resetBytes,
+        publishedAtSubscriptionEpoch:
+          queue.overflowResets.get(attemptKey)?.publishedAtSubscriptionEpoch ??
+          publishedAtSubscriptionEpoch,
+      });
       queue.overflowResetBytes = nextOverflowResetBytes;
       return Promise.resolve();
     }
@@ -3635,7 +3702,8 @@ export async function startMessageWebSocketServer(
     queue.scheduledAttempts.set(attemptKey,
       (queue.scheduledAttempts.get(attemptKey) ?? 0) + 1);
     const delivery = queue.tail.then(async () => {
-      const delivered = await deliverAuthorizedPreview(deliveryKind, preview,
+      const delivered = await deliverAuthorizedPreview(
+        deliveryKind, preview, publishedAtSubscriptionEpoch,
         () => queue!.generation === generation && !queue!.failedClosed);
       if (!delivered) return;
       if (deliveryKind === "preview") {
@@ -3663,14 +3731,16 @@ export async function startMessageWebSocketServer(
           | [string, Readonly<{ preview: Readonly<{ roomId: string; executionId: string;
             attemptSeq: number; reason?: "human_cancelled" | "message_recalled" |
               "runtime_shutdown" | "repair" | "reconnect" | "execution_terminal" |
-              "attempt_rolled_over" | "access_revoked" }>; bytes: number }>]
+              "attempt_rolled_over" | "access_revoked" }>; bytes: number;
+            publishedAtSubscriptionEpoch: number }>]
           | undefined;
         if (next === undefined) break;
         const [resetKey, reset] = next;
-        const resetDelivered = await deliverAuthorizedPreview("reset", reset.preview,
-          () => queue!.generation === generation && !queue!.failedClosed);
         queue!.overflowResets.delete(resetKey);
         queue!.overflowResetBytes -= reset.bytes;
+        const resetDelivered = await deliverAuthorizedPreview(
+          "reset", reset.preview, reset.publishedAtSubscriptionEpoch,
+          () => queue!.generation === generation && !queue!.failedClosed);
         if (resetDelivered) {
           const visible = visiblePreviewAttemptsByRoom.get(preview.roomId);
           visible?.delete(resetKey);

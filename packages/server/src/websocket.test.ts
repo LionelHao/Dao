@@ -1023,6 +1023,203 @@ describe("authenticated message WebSocket service", () => {
     }
   });
 
+  it("delivers an idle lifecycle reset that uses the reserved reset byte budget", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "preview-idle-large-reset");
+    const auth: AuthenticationService = {
+      async login() { return session; }, async authenticate() { return principal; },
+      async authenticateSession() {
+        return { sessionId: session.accessToken, sessionFamilyId: "family-preview", principal };
+      },
+      async refresh() { return session; }, async revoke() {},
+    };
+    const server = await startMessageWebSocketServer({
+      auth, service: idleMessageService(), outboxStore: idleOutboxStore(),
+      previewAuthority: previewDeliveryAuthority(async () => ({
+        authorized: true, authorityEpoch: "idle-large-reset:1",
+      })),
+    });
+    const client = await LoopbackClient.connect(server.url);
+    try {
+      await client.login(humans[0]);
+      await client.subscribe(roomId);
+      const executionId = "idle-large-reset-".padEnd(140 * 1_024, "x");
+      await server.resetAgentPreview({
+        roomId, executionId, attemptSeq: 1, reason: "execution_terminal",
+      });
+      await expect(client.waitForFrame((frame) => hasType(frame, "agent.execution.preview.reset") &&
+        frame.executionId === executionId, "idle large reset")).resolves.toMatchObject({ frame: {
+          executionId, reason: "execution_terminal",
+        } });
+    } finally {
+      await client.close(); await server.close();
+    }
+  });
+
+  it("does not deliver queued transient work to a later connection generation", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "preview-publish-generation");
+    const blocked = deferred<void>();
+    const blockedStarted = deferred<void>();
+    let calls = 0;
+    const auth: AuthenticationService = {
+      async login() { return session; }, async authenticate() { return principal; },
+      async authenticateSession() {
+        return { sessionId: session.accessToken, sessionFamilyId: "family-preview", principal };
+      },
+      async refresh() { return session; }, async revoke() {},
+    };
+    const server = await startMessageWebSocketServer({
+      auth, service: idleMessageService(), outboxStore: idleOutboxStore(),
+      previewAuthority: previewDeliveryAuthority(async () => {
+        calls += 1;
+        if (calls === 1) { blockedStarted.resolve(); await blocked.promise; }
+        return { authorized: false, authorityEpoch: "publish-generation:closed" };
+      }),
+    });
+    const first = await LoopbackClient.connect(server.url);
+    let second: LoopbackClient | undefined;
+    try {
+      await first.login(humans[0]);
+      await first.subscribe(roomId, "subscribe-publish-generation-old");
+      const head = server.publishAgentPreview({
+        roomId, executionId: "publish-generation-head", attemptSeq: 1,
+        streamSeq: 1, delta: "HEAD",
+      });
+      await blockedStarted.promise;
+      const queued = server.publishAgentPreview({
+        roomId, executionId: "publish-generation-stale", attemptSeq: 1,
+        streamSeq: 1, delta: "MUST-NOT-CROSS-CONNECTION",
+      });
+      await first.close();
+      second = await LoopbackClient.connect(server.url);
+      await second.login(humans[0], "login-publish-generation-new");
+      await second.subscribe(roomId, "subscribe-publish-generation-new");
+      blocked.resolve();
+      await Promise.all([head, queued]);
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      expect(second.frameCount((frame) => hasType(frame, "agent.execution.preview") &&
+        frame.executionId === "publish-generation-stale")).toBe(0);
+    } finally {
+      blocked.resolve(); await first.close(); await second?.close(); await server.close();
+    }
+  });
+
+  it("clears orphaned visible preview state when a registered connection is revoked", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "preview-revoked-visible-cleanup");
+    const blocked = deferred<void>();
+    const blockedStarted = deferred<void>();
+    let blockNext = false;
+    const auth: AuthenticationService = {
+      async login() { return session; }, async authenticate() { return principal; },
+      async authenticateSession() {
+        return { sessionId: session.accessToken, sessionFamilyId: "family-preview", principal };
+      },
+      async refresh() { return session; }, async revoke() {},
+    };
+    const registry = createSubscriptionRegistry();
+    const server = await startMessageWebSocketServer({
+      auth, service: idleMessageService(), outboxStore: idleOutboxStore(),
+      subscriptionRegistry: registry,
+      previewAuthority: previewDeliveryAuthority(async () => {
+        if (blockNext) {
+          blockNext = false;
+          blockedStarted.resolve();
+          await blocked.promise;
+        }
+        return { authorized: true, authorityEpoch: "revoked-visible-cleanup:1" };
+      }),
+    });
+    const first = await LoopbackClient.connect(server.url);
+    let second: LoopbackClient | undefined;
+    try {
+      await first.login(humans[0]);
+      await first.subscribe(roomId, "subscribe-revoked-visible-old");
+      await server.publishAgentPreview({ roomId, executionId: "revoked-visible",
+        attemptSeq: 1, streamSeq: 1, delta: "VISIBLE-ONLY-ON-OLD-CONNECTION" });
+      await first.waitForFrame((frame) => hasType(frame, "agent.execution.preview") &&
+        frame.executionId === "revoked-visible", "old visible preview");
+      registry.candidates({ targetKind: "room", targetId: roomId })[0]!.revoke();
+      await first.waitForClose();
+
+      second = await LoopbackClient.connect(server.url);
+      await second.login(humans[0], "login-revoked-visible-new");
+      await second.subscribe(roomId, "subscribe-revoked-visible-new");
+      blockNext = true;
+      const deliveries = [server.publishAgentPreview({ roomId, executionId: "cleanup-head",
+        attemptSeq: 1, streamSeq: 1, delta: "x" })];
+      await blockedStarted.promise;
+      for (let index = 1; index < 32; index += 1) {
+        deliveries.push(server.publishAgentPreview({ roomId, executionId: `cleanup-${index}`,
+          attemptSeq: 1, streamSeq: 1, delta: "x" }));
+      }
+      await server.publishAgentPreview({ roomId, executionId: "revoked-visible",
+        attemptSeq: 1, streamSeq: 2, delta: "DROPPED-WITHOUT-STALE-RESET" });
+      blocked.resolve();
+      await Promise.all(deliveries);
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      expect(second.frameCount((frame) => hasType(frame, "agent.execution.preview.reset") &&
+        frame.executionId === "revoked-visible")).toBe(0);
+    } finally {
+      blocked.resolve(); await first.close(); await second?.close(); await server.close();
+    }
+  });
+
+  it("retains visible preview state across an in-place replacement subscription", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "preview-replacement-visible");
+    const blocked = deferred<void>();
+    const blockedStarted = deferred<void>();
+    let blockNext = false;
+    const auth: AuthenticationService = {
+      async login() { return session; }, async authenticate() { return principal; },
+      async authenticateSession() {
+        return { sessionId: session.accessToken, sessionFamilyId: "family-preview", principal };
+      },
+      async refresh() { return session; }, async revoke() {},
+    };
+    const server = await startMessageWebSocketServer({
+      auth, service: idleMessageService(), outboxStore: idleOutboxStore(),
+      previewAuthority: previewDeliveryAuthority(async () => {
+        if (blockNext) {
+          blockNext = false;
+          blockedStarted.resolve();
+          await blocked.promise;
+        }
+        return { authorized: true, authorityEpoch: "replacement-visible:1" };
+      }),
+    });
+    const client = await LoopbackClient.connect(server.url);
+    try {
+      await client.login(humans[0]);
+      await client.subscribe(roomId, "subscribe-replacement-visible-old");
+      await server.publishAgentPreview({ roomId, executionId: "replacement-visible",
+        attemptSeq: 1, streamSeq: 1, delta: "VISIBLE-BEFORE-RESUBSCRIBE" });
+      await client.waitForFrame((frame) => hasType(frame, "agent.execution.preview") &&
+        frame.executionId === "replacement-visible", "visible before replacement");
+      await client.subscribe(roomId, "subscribe-replacement-visible-new");
+
+      blockNext = true;
+      const deliveries = [server.publishAgentPreview({ roomId, executionId: "replacement-head",
+        attemptSeq: 1, streamSeq: 1, delta: "x" })];
+      await blockedStarted.promise;
+      for (let index = 1; index < 32; index += 1) {
+        deliveries.push(server.publishAgentPreview({ roomId, executionId: `replacement-${index}`,
+          attemptSeq: 1, streamSeq: 1, delta: "x" }));
+      }
+      await server.publishAgentPreview({ roomId, executionId: "replacement-visible",
+        attemptSeq: 1, streamSeq: 2, delta: "DROPPED-REQUIRES-RESET" });
+      blocked.resolve();
+      await Promise.all(deliveries);
+      await expect(client.waitForFrame((frame) => hasType(frame, "agent.execution.preview.reset") &&
+        frame.executionId === "replacement-visible", "replacement repair reset"))
+        .resolves.toMatchObject({ frame: { reason: "repair" } });
+    } finally {
+      blocked.resolve(); await client.close(); await server.close();
+    }
+  });
+
   it("fences an authorized preview result to the captured subscription generation", async () => {
     const principal = { accountId: "account-human-1", actorId: humans[0].id };
     const session = issuedSession(principal, "preview-generation");
@@ -1064,6 +1261,61 @@ describe("authenticated message WebSocket service", () => {
       authorization.resolve({ authorized: false, authorityEpoch: "closed" });
       await client.close();
       await server.close();
+    }
+  });
+
+  it("does not let a stale false authority result poison a replacement subscription", async () => {
+    const principal = { accountId: "account-human-1", actorId: humans[0].id };
+    const session = issuedSession(principal, "preview-false-generation");
+    const blocked = deferred<void>();
+    const blockedStarted = deferred<void>();
+    let calls = 0;
+    const auth: AuthenticationService = {
+      async login() { return session; }, async authenticate() { return principal; },
+      async authenticateSession() {
+        return { sessionId: session.accessToken, sessionFamilyId: "family-preview", principal };
+      },
+      async refresh() { return session; }, async revoke() {},
+    };
+    const server = await startMessageWebSocketServer({
+      auth, service: idleMessageService(), outboxStore: idleOutboxStore(),
+      previewAuthority: previewDeliveryAuthority(async () => {
+        calls += 1;
+        if (calls === 2) {
+          blockedStarted.resolve();
+          await blocked.promise;
+          return { authorized: false, authorityEpoch: "false-generation:2" };
+        }
+        return { authorized: true, authorityEpoch: `false-generation:${calls}` };
+      }),
+    });
+    const client = await LoopbackClient.connect(server.url);
+    try {
+      await client.login(humans[0]);
+      await client.subscribe(roomId, "subscribe-false-generation-old");
+      await server.publishAgentPreview({
+        roomId, executionId: "false-generation-initial", attemptSeq: 1,
+        streamSeq: 1, delta: "INITIAL",
+      });
+      await client.waitForFrame((frame) => hasType(frame, "agent.execution.preview") &&
+        frame.executionId === "false-generation-initial", "initial generation preview");
+      const stale = server.publishAgentPreview({
+        roomId, executionId: "false-generation-stale", attemptSeq: 1,
+        streamSeq: 1, delta: "STALE",
+      });
+      await blockedStarted.promise;
+      await client.subscribe(roomId, "subscribe-false-generation-new");
+      blocked.resolve();
+      await stale;
+      await server.publishAgentPreview({
+        roomId, executionId: "false-generation-current", attemptSeq: 1,
+        streamSeq: 1, delta: "CURRENT",
+      });
+      await expect(client.waitForFrame((frame) => hasType(frame, "agent.execution.preview") &&
+        frame.executionId === "false-generation-current", "replacement generation preview"))
+        .resolves.toMatchObject({ frame: { delta: "CURRENT" } });
+    } finally {
+      blocked.resolve(); await client.close(); await server.close();
     }
   });
   it.each([false, true])(
