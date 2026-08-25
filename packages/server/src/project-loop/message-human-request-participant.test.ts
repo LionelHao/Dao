@@ -69,7 +69,9 @@ function database(): DatabaseSync {
   db.exec(`
     PRAGMA foreign_keys = ON;
     CREATE TABLE actors (id TEXT PRIMARY KEY, kind TEXT NOT NULL) STRICT;
-    CREATE TABLE rooms (id TEXT PRIMARY KEY, status TEXT NOT NULL) STRICT;
+    CREATE TABLE rooms (
+      id TEXT PRIMARY KEY, status TEXT NOT NULL, archive_generation INTEGER NOT NULL DEFAULT 0
+    ) STRICT;
     CREATE TABLE streams (
       stream_kind TEXT NOT NULL, stream_id TEXT NOT NULL, head_seq INTEGER NOT NULL,
       retained_from_seq INTEGER NOT NULL, PRIMARY KEY(stream_kind, stream_id)
@@ -139,6 +141,7 @@ function database(): DatabaseSync {
     CREATE TABLE project_ball_boundaries (
       boundary_id TEXT PRIMARY KEY, room_id TEXT NOT NULL, project_id TEXT NOT NULL,
       source_kind TEXT NOT NULL, source_id TEXT NOT NULL, source_revision INTEGER NOT NULL,
+      lifecycle_generation INTEGER NOT NULL,
       holder_kind TEXT NOT NULL, holder_actor_id TEXT NOT NULL, reason TEXT NOT NULL,
       since TEXT NOT NULL, due_at TEXT, status TEXT NOT NULL, released_at TEXT
     ) STRICT;
@@ -160,7 +163,7 @@ function database(): DatabaseSync {
   db.prepare("INSERT INTO actors VALUES (?, 'human')").run(binding.requesterHumanActorId);
   db.prepare("INSERT INTO actors VALUES (?, 'human')").run(binding.targetHumanActorId);
   db.prepare("INSERT INTO actors VALUES ('human-next', 'human')").run();
-  db.prepare("INSERT INTO rooms VALUES (?, 'active')").run(binding.roomId);
+  db.prepare("INSERT INTO rooms VALUES (?, 'active', 0)").run(binding.roomId);
   db.prepare("INSERT INTO streams VALUES ('room', ?, 0, 1)").run(binding.roomId);
   db.prepare("INSERT INTO messages VALUES (?, ?, ?)").run(
     binding.sourceMessageId, binding.roomId, binding.requesterHumanActorId,
@@ -345,7 +348,7 @@ describe("FT-03 structured @Human to canonical Request transaction participant",
     ).run("2026-08-25T02:03:04.500Z", created.requestId);
     db.prepare(
       `INSERT INTO project_ball_boundaries VALUES (
-         'boundary-transfer', ?, ?, 'request', ?, 2, 'human', ?, 'pending_acceptance',
+         'boundary-transfer', ?, ?, 'request', ?, 2, 0, 'human', ?, 'pending_acceptance',
          ?, NULL, 'active', NULL
        )`,
     ).run(binding.roomId, binding.roomId, created.requestId,

@@ -417,16 +417,23 @@ function refreshBallBoundary(database: DatabaseSync, fact: ProjectLoopStoredFact
     }
   }
   if (holderKind === undefined || holderId === undefined) return;
+  const lifecycle = database.prepare(
+    "SELECT archive_generation AS generation FROM rooms WHERE id = ?",
+  ).get(fact.roomId);
+  if (typeof lifecycle?.generation !== "number") {
+    throw new ProjectLoopAuthorityError("storage_unavailable", "Project lifecycle generation is unavailable");
+  }
   const boundaryId = `project-ball-${createHash("sha256")
-    .update(`${fact.roomId}\0${sourceKind}\0${fact.id}\0${fact.revision}\0${holderKind}\0${holderId}`)
+    .update(`${fact.roomId}\0${sourceKind}\0${fact.id}\0${fact.revision}\0${lifecycle.generation}` +
+      `\0${holderKind}\0${holderId}`)
     .digest("hex")}`;
   database.prepare(
     `INSERT INTO project_ball_boundaries (
-       boundary_id, room_id, project_id, source_kind, source_id, source_revision,
+       boundary_id, room_id, project_id, source_kind, source_id, source_revision, lifecycle_generation,
        holder_kind, holder_actor_id, reason, since, due_at, status
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
   ).run(boundaryId, fact.roomId, fact.roomId, sourceKind, fact.id, fact.revision,
-    holderKind, holderId, reason, now, dueAt);
+    lifecycle.generation, holderKind, holderId, reason, now, dueAt);
 }
 
 function createFact(database: DatabaseSync, proposal: ProjectLoopStoredProposal, confirmerId: string,
@@ -438,27 +445,40 @@ function createFact(database: DatabaseSync, proposal: ProjectLoopStoredProposal,
   const common = [proposal.factId, proposal.roomId, proposal.roomId, 1, title] as SQLInputValue[];
   if (proposal.factKind === "goal") {
     const supersedes = optionalString(payload, "supersedesGoalId");
+    const supersedeReason = supersedes === null ? null : stringField(payload, "reason");
     const active = database.prepare("SELECT id FROM project_goals WHERE room_id = ? AND status = 'active'")
       .get(proposal.roomId);
     if (active !== undefined && (typeof active.id !== "string" || supersedes !== active.id)) {
       throw new ProjectLoopAuthorityError("revision_conflict", "An active primary Goal already exists");
     }
     if (supersedes !== null) {
+      const authority = database.prepare(
+        `SELECT CASE WHEN room.owner_actor_id = ? OR administrator.human_actor_id IS NOT NULL
+                     THEN 1 ELSE 0 END AS authorized
+         FROM rooms AS room
+         LEFT JOIN tenant_administrators AS administrator
+           ON administrator.human_actor_id = ? AND administrator.status = 'active'
+         WHERE room.id = ?`,
+      ).get(confirmerId, confirmerId, proposal.roomId);
+      if (authority?.authorized !== 1) {
+        throw new ProjectLoopAuthorityError("permission_denied",
+          "Only the Room owner or an active tenant administrator may replace the primary Goal");
+      }
       const updated = database.prepare(
-        `UPDATE project_goals SET status = 'superseded', superseded_by_goal_id = ?,
+        `UPDATE project_goals SET status = 'superseded', superseded_by_goal_id = ?, supersede_reason = ?,
            revision = revision + 1, updated_at = ?
          WHERE id = ? AND room_id = ? AND status = 'active'`,
-      ).run(proposal.factId, now, supersedes, proposal.roomId);
+      ).run(proposal.factId, supersedeReason, now, supersedes, proposal.roomId);
       if (updated.changes !== 1) throw new ProjectLoopAuthorityError("revision_conflict", "Superseded Goal is not current");
     }
     database.prepare(
       `INSERT INTO project_goals (
          id, room_id, project_id, revision, title, description, status,
-         supersedes_goal_id, source_room_id, source_id, source_kind,
+         supersedes_goal_id, supersede_reason, source_room_id, source_id, source_kind,
          created_by_actor_id, confirmed_by_human_actor_id, created_at, updated_at
          , source_revision, visibility_room_id
-       ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(...common, description, supersedes, proposal.roomId,
+       ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(...common, description, supersedes, supersedeReason, proposal.roomId,
       proposal.source.sourceId, proposal.source.kind, proposal.proposedBy.actorId, confirmerId, now, now,
       proposal.source.sourceRevision, proposal.roomId);
   } else if (proposal.factKind === "decision") {
@@ -702,7 +722,7 @@ function resolveProposal(database: DatabaseSync,
        resolved_at = ?, resolution_reason = ?
      WHERE id = ? AND revision = ? AND status = 'pending'`,
   ).run(operation.command.resolution, timestamp, timestamp,
-    operation.command.resolution === "rejected" ? "human_rejected" : null,
+    operation.command.reason,
     proposal.id, proposal.revision);
   database.prepare(
     `UPDATE project_confirmations
@@ -710,7 +730,7 @@ function resolveProposal(database: DatabaseSync,
          resolved_at = ?, resolution_reason = ?
      WHERE proposal_id = ? AND revision = ? AND state = 'pending'`,
   ).run(operation.command.resolution, actorId, timestamp,
-    operation.command.resolution === "rejected" ? "human_rejected" : null,
+    operation.command.reason,
     proposal.id, proposal.revision);
   const revision = current.revision + 1;
   const id = appendEvent(database, { roomId: proposal.roomId, eventSeq: revision,
@@ -829,6 +849,15 @@ function targetStatus(kind: ProjectLoopFactKind, current: string, transition: st
     "next_action:delivered:next_action.reopen": "in_progress",
     "next_action:delivered:next_action.cancel": "cancelled",
     "next_action:done:next_action.reopen": "in_progress",
+    "next_action:accepted:next_action.transfer_propose": "accepted",
+    "next_action:in_progress:next_action.transfer_propose": "in_progress",
+    "next_action:delivered:next_action.transfer_propose": "delivered",
+    "next_action:accepted:next_action.transfer_accept": "accepted",
+    "next_action:in_progress:next_action.transfer_accept": "in_progress",
+    "next_action:delivered:next_action.transfer_accept": "delivered",
+    "next_action:accepted:next_action.transfer_reject": "accepted",
+    "next_action:in_progress:next_action.transfer_reject": "in_progress",
+    "next_action:delivered:next_action.transfer_reject": "delivered",
     "blocker:open:obstacle.resolve": "resolved",
     "open_question:open:obstacle.resolve": "resolved",
     "blocker:open:obstacle.defer": "deferred",
@@ -934,7 +963,80 @@ function transitionFact(database: DatabaseSync,
     const ownerKind = String(fact.details.ownerKind);
     const ownerId = String(fact.details.ownerActorId);
     const verifier = fact.details.verifierHumanActorId;
-    if (transition === "next_action.start" || transition === "next_action.deliver") {
+    if (transition === "next_action.transfer_propose") {
+      const human = humanActorId(operation.context);
+      const transferAuthority = ownerKind === "human" ? ownerId : verifier;
+      if (human !== transferAuthority) {
+        throw new ProjectLoopAuthorityError("permission_denied", "NextAction transfer proposer is invalid");
+      }
+      const toKind = stringField(payload, "toOwnerKind");
+      const toId = stringField(payload, "toOwnerActorId");
+      if (toKind !== "human" && toKind !== "agent") {
+        throw new ProjectLoopAuthorityError("invalid_request", "NextAction transfer target is invalid");
+      }
+      requireAssignableActor(database, fact.roomId, toId, toKind);
+      const principalHumanActorId = toKind === "human" ? toId : verifier;
+      if (typeof principalHumanActorId !== "string") {
+        throw new ProjectLoopAuthorityError("invalid_request", "Agent transfer requires a designated Human principal");
+      }
+      const expiresAt = stringField(payload, "expiresAt");
+      if (Date.parse(expiresAt) <= operation.now) {
+        throw new ProjectLoopAuthorityError("invalid_request", "NextAction transfer expiry is invalid");
+      }
+      database.prepare(
+        `INSERT INTO project_transfer_proposals (
+           id, room_id, source_room_id, source_id, revision, subject_kind, subject_id,
+           to_owner_kind, to_owner_actor_id, status, from_owner_kind, from_owner_actor_id,
+           principal_human_actor_id, reason, source_kind, created_by_actor_id, created_at, updated_at,
+           subject_revision, expires_at
+         ) VALUES (?, ?, ?, ?, 1, 'next_action', ?, ?, ?, 'pending', ?, ?, ?, ?,
+                   'project_fact', ?, ?, ?, ?, ?)`,
+      ).run(stringField(payload, "transferProposalId"), fact.roomId, fact.roomId, fact.id,
+        fact.id, toKind, toId, ownerKind, ownerId, principalHumanActorId,
+        stringField(payload, "reason"), human, timestamp, timestamp, fact.revision, expiresAt);
+    } else if (transition === "next_action.transfer_accept" ||
+        transition === "next_action.transfer_reject") {
+      const human = humanActorId(operation.context);
+      const transferId = stringField(payload, "transferProposalId");
+      const transfer = database.prepare(
+        `SELECT * FROM project_transfer_proposals WHERE id = ? AND room_id = ?
+           AND subject_kind = 'next_action' AND subject_id = ? AND subject_revision = ?
+           AND status = 'pending'`,
+      ).get(transferId, fact.roomId, fact.id, fact.revision);
+      if (transfer === undefined || transfer.principal_human_actor_id !== human ||
+          (transfer.to_owner_kind === "human" && transfer.to_owner_actor_id !== human)) {
+        throw new ProjectLoopAuthorityError("permission_denied", "NextAction transfer principal is invalid");
+      }
+      if ((transfer.to_owner_kind !== "human" && transfer.to_owner_kind !== "agent") ||
+          typeof transfer.to_owner_actor_id !== "string" || typeof transfer.reason !== "string" ||
+          typeof transfer.expires_at !== "string") {
+        throw new ProjectLoopAuthorityError("storage_unavailable", "NextAction transfer row is corrupt");
+      }
+      const expired = Date.parse(transfer.expires_at) <= operation.now;
+      const accepted = transition === "next_action.transfer_accept";
+      database.prepare(
+        `UPDATE project_transfer_proposals SET status = ?, revision = revision + 1, updated_at = ?,
+           resolved_by_human_actor_id = ?, resolved_at = ?, resolution_reason = ? WHERE id = ?`,
+      ).run(expired ? "expired" : accepted ? "accepted" : "rejected", timestamp, human, timestamp,
+        expired ? "Transfer proposal expired" : accepted ? null : "Human rejected transfer", transferId);
+      if (accepted && !expired) {
+        database.prepare(
+          `UPDATE project_next_actions SET owner_kind = ?, owner_actor_id = ?,
+             verifier_human_actor_id = CASE WHEN ? = 'human' AND verifier_human_actor_id = ?
+               THEN NULL ELSE verifier_human_actor_id END,
+             accepted_by_human_actor_id = ?, accepted_at = ?,
+             revision = revision + 1, updated_at = ?
+           WHERE id = ? AND room_id = ? AND revision = ?`,
+        ).run(transfer.to_owner_kind, transfer.to_owner_actor_id,
+          transfer.to_owner_kind, transfer.to_owner_actor_id, human, timestamp, timestamp,
+          fact.id, fact.roomId, fact.revision);
+        database.prepare(
+          `INSERT INTO project_transfer_chain VALUES (?, ?, ?, 'next_action', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(transferId, fact.roomId, fact.roomId, fact.id, fact.revision + 1,
+          ownerKind, ownerId, transfer.to_owner_kind, transfer.to_owner_actor_id,
+          human, transfer.reason, timestamp);
+      }
+    } else if (transition === "next_action.start" || transition === "next_action.deliver") {
       if (principal.actorId !== ownerId) throw new ProjectLoopAuthorityError("permission_denied", "Only the NextAction owner may progress delivery");
     } else if (transition === "next_action.complete") {
       const human = humanActorId(operation.context);
@@ -959,6 +1061,11 @@ function transitionFact(database: DatabaseSync,
         throw new ProjectLoopAuthorityError("permission_denied", "NextAction terminal authority is invalid");
       }
     }
+    if (transition === "next_action.transfer_propose" ||
+        transition === "next_action.transfer_accept" || transition === "next_action.transfer_reject") {
+      // Transfer proposals are their own authority record. Pending/rejected proposals never
+      // revise the responsibility; acceptance above is the only owner mutation.
+    } else {
     let deliverySource: Readonly<Record<string, JsonValue>> | null = null;
     if (transition === "next_action.deliver") {
       if (!isRecord(payload.source)) {
@@ -1002,6 +1109,7 @@ function transitionFact(database: DatabaseSync,
       transition, timestamp, transition, completionNote, transition, completionCriteria,
       transition, terminalReason, transition,
       timestamp, fact.id, fact.roomId, fact.revision);
+    }
   } else {
     const ownerKind = String(fact.details.ownerKind);
     const ownerId = String(fact.details.ownerActorId);
@@ -1036,23 +1144,26 @@ function transitionFact(database: DatabaseSync,
       const transferId = stringField(payload, "transferProposalId");
       const transfer = database.prepare(
         `SELECT * FROM project_transfer_proposals WHERE id = ? AND room_id = ?
-           AND subject_id = ? AND status = 'pending'`,
-      ).get(transferId, fact.roomId, fact.id);
+           AND subject_kind = ? AND subject_id = ? AND subject_revision = ?
+           AND status = 'pending'`,
+      ).get(transferId, fact.roomId, operation.command.factKind, fact.id, fact.revision);
       if (transfer === undefined || (transfer.to_owner_kind === "human"
           ? transfer.to_owner_actor_id !== human : transfer.principal_human_actor_id !== human)) {
         throw new ProjectLoopAuthorityError("permission_denied", "Obstacle transfer principal is invalid");
       }
       if ((transfer.to_owner_kind !== "human" && transfer.to_owner_kind !== "agent") ||
-          typeof transfer.to_owner_actor_id !== "string" || typeof transfer.reason !== "string") {
+          typeof transfer.to_owner_actor_id !== "string" || typeof transfer.reason !== "string" ||
+          typeof transfer.expires_at !== "string") {
         throw new ProjectLoopAuthorityError("storage_unavailable", "Obstacle transfer row is corrupt");
       }
+      const expired = Date.parse(transfer.expires_at) <= operation.now;
       const accepted = transition === "obstacle.transfer_accept";
       database.prepare(
         `UPDATE project_transfer_proposals SET status = ?, revision = revision + 1, updated_at = ?,
            resolved_by_human_actor_id = ?, resolved_at = ?, resolution_reason = ? WHERE id = ?`,
-      ).run(accepted ? "accepted" : "rejected", timestamp, human, timestamp,
-        accepted ? null : "Human rejected transfer", transferId);
-      if (accepted) {
+      ).run(expired ? "expired" : accepted ? "accepted" : "rejected", timestamp, human, timestamp,
+        expired ? "Transfer proposal expired" : accepted ? null : "Human rejected transfer", transferId);
+      if (accepted && !expired) {
         database.prepare(
           `UPDATE project_obstacles SET owner_kind = ?, owner_actor_id = ?, status = 'open',
              status_reason = NULL, review_at = NULL, escalation_emitted = 0,
@@ -1099,15 +1210,9 @@ function transitionFact(database: DatabaseSync,
         transition, resultSource === null ? null : stringField(resultSource, "roomId"),
         timestamp, fact.id, fact.roomId, fact.revision);
     }
-    if (transition === "obstacle.transfer_propose" || transition === "obstacle.transfer_reject") {
-      database.prepare(
-        `UPDATE project_obstacles SET revision = revision + 1, updated_at = ?
-         WHERE id = ? AND room_id = ? AND revision = ?`,
-      ).run(timestamp, fact.id, fact.roomId, fact.revision);
-    }
   }
   let updated = readFact(database, operation.command.factKind, fact.id, fact.roomId);
-  refreshBallBoundary(database, updated, timestamp);
+  if (updated.revision !== fact.revision) refreshBallBoundary(database, updated, timestamp);
   if (transition === "obstacle.cannot_answer") {
     const escalation = database.prepare(
       `SELECT boundary_id AS boundaryId FROM project_ball_boundaries

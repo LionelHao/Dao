@@ -54,6 +54,7 @@ export type ProjectLoopProposalResolveCommand = Readonly<{
   projectId: string;
   expectedRevision: number;
   resolution: "confirmed" | "rejected";
+  reason: string | null;
 }>;
 
 export type ProjectLoopFactTransitionCommand = Readonly<{
@@ -66,7 +67,8 @@ export type ProjectLoopFactTransitionCommand = Readonly<{
     | "request.accept" | "request.reject" | "request.cancel" | "request.transfer"
     | "next_action.accept" | "next_action.start" | "next_action.deliver"
     | "next_action.complete" | "next_action.reopen" | "next_action.cancel"
-    | "next_action.reject"
+    | "next_action.reject" | "next_action.transfer_propose"
+    | "next_action.transfer_accept" | "next_action.transfer_reject"
     | "obstacle.resolve" | "obstacle.defer" | "obstacle.cannot_answer"
     | "obstacle.reopen" | "obstacle.transfer_propose" | "obstacle.transfer_accept"
     | "obstacle.transfer_reject";
@@ -224,6 +226,12 @@ function transitionPayload(kind: ProjectLoopFactKind, transition: unknown,
     return (transition === "request.reject" || transition === "request.cancel") && exactPayload(["reason"]);
   }
   if (kind === "next_action") {
+    if (transition === "next_action.transfer_propose") {
+      return exactPayload(["expiresAt", "reason", "toOwnerActorId", "toOwnerKind", "transferProposalId"]);
+    }
+    if (transition === "next_action.transfer_accept" || transition === "next_action.transfer_reject") {
+      return exactPayload(["transferProposalId"]);
+    }
     if (transition === "next_action.deliver") return exactPayload(["source", "summary"]) &&
       isSource(payload.source, roomId) && text(payload.summary, PROJECT_LOOP_AUTHORITY_LIMITS.textBytes);
     if (transition === "next_action.complete") return exactPayload(["completionNote", "criteriaSnapshot"]) &&
@@ -304,11 +312,13 @@ export function isProjectLoopAuthorityOperation(value: unknown): value is Projec
   if (value.type === "project-loop.proposal.resolve") {
     return exact(value, ["type", "context", "command", "now"]) && isHumanContext(value.context) &&
       isRecord(value.command) && exact(value.command, [
-        "proposalId", "roomId", "projectId", "expectedRevision", "resolution",
+        "proposalId", "roomId", "projectId", "expectedRevision", "resolution", "reason",
       ]) && text(value.command.proposalId, PROJECT_LOOP_AUTHORITY_LIMITS.idBytes) &&
       text(value.command.roomId, PROJECT_LOOP_AUTHORITY_LIMITS.idBytes) &&
       value.command.projectId === value.command.roomId && integer(value.command.expectedRevision) &&
-      (value.command.resolution === "confirmed" || value.command.resolution === "rejected");
+      ((value.command.resolution === "confirmed" && value.command.reason === null) ||
+        (value.command.resolution === "rejected" &&
+          text(value.command.reason, PROJECT_LOOP_AUTHORITY_LIMITS.textBytes)));
   }
   return value.type === "project-loop.fact.transition" &&
     exact(value, ["type", "context", "command", "now"]) && isActorContext(value.context) &&

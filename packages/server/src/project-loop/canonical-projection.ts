@@ -126,8 +126,7 @@ function mapGoals(database: DatabaseSync, roomId: string): readonly ProjectGoal[
       confirmedBy, confirmedAt: required(row, "created_at"), rejectedBy: null,
       rejectedAt: null, rejectionReason: null, supersedesGoalId: nullable(row, "supersedes_goal_id"),
       supersededByGoalId: nullable(row, "superseded_by_goal_id"),
-      supersedeReason: row.status === "superseded" ? "Superseded by a confirmed Goal." :
-        row.supersedes_goal_id === null ? null : "Supersedes the prior active Goal." });
+      supersedeReason: nullable(row, "supersede_reason") });
     return value;
   }));
 }
@@ -181,7 +180,8 @@ function mapDecisions(database: DatabaseSync, roomId: string): readonly ProjectD
       rejectedBy: null, rejectedAt: null, rejectionReason: null,
       supersedesDecisionId: nullable(row, "supersedes_decision_id"),
       supersededByDecisionId: nullable(row, "superseded_by_decision_id"),
-      supersedeReason: row.status === "superseded" ? "Superseded by a confirmed Decision." : null,
+      supersedeReason: row.status === "superseded" || row.supersedes_decision_id !== null
+        ? "Superseded by a confirmed Decision." : null,
       affectedFactIds: Object.freeze(Array.isArray(raw.affectedFactIds)
         ? raw.affectedFactIds.filter((item): item is string => typeof item === "string") : []) });
   }));
@@ -227,6 +227,24 @@ function mapRequests(database: DatabaseSync, roomId: string): readonly ProjectRe
   }));
 }
 
+function nextActionTransfers(database: DatabaseSync, roomId: string, id: string) {
+  return Object.freeze((database.prepare(
+    `SELECT chain.*, proposal.created_by_actor_id AS initiated_by_actor_id,
+            initiator.kind AS initiated_by_kind
+     FROM project_transfer_chain AS chain
+     JOIN project_transfer_proposals AS proposal ON proposal.id = chain.transfer_id
+     JOIN actors AS initiator ON initiator.id = proposal.created_by_actor_id
+     WHERE chain.room_id = ? AND chain.subject_kind = 'next_action'
+       AND chain.subject_id = ? ORDER BY chain.subject_revision`,
+  ).all(roomId, id) as Row[]).map((row) => Object.freeze({
+    from: actor(row.from_owner_kind, row.from_owner_actor_id),
+    to: actor(row.to_owner_kind, row.to_owner_actor_id),
+    initiatedBy: actor(row.initiated_by_kind, row.initiated_by_actor_id),
+    confirmedBy: human(row.accepted_by_human_actor_id), reason: required(row, "reason"),
+    reassignedAt: required(row, "transferred_at"),
+  })));
+}
+
 function mapNextActions(database: DatabaseSync, roomId: string): readonly ProjectNextAction[] {
   return Object.freeze((database.prepare(
     `SELECT action.*, creator.kind AS created_by_kind FROM project_next_actions AS action
@@ -253,7 +271,7 @@ function mapNextActions(database: DatabaseSync, roomId: string): readonly Projec
       delivery, completedBy: row.completed_by_human_actor_id === null ? null :
         human(row.completed_by_human_actor_id), completedAt: nullable(row, "completed_at"),
       statusReason: nullable(row, "status_reason"),
-      reassignmentChain: Object.freeze([]) });
+      reassignmentChain: nextActionTransfers(database, roomId, required(row, "id")) });
   }));
 }
 

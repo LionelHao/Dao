@@ -175,9 +175,53 @@ function eligible(boundary: PersistedProjectBoundary): boolean {
 export function currentProjectReminderOrdinal(dueAt: string, now: string): number | null {
   if (!timestamp(dueAt) || !timestamp(now)) return null;
   const elapsed = Date.parse(now) - Date.parse(dueAt);
-  if (elapsed < 0) return null;
-  const ordinal = Math.floor(elapsed / DAY_MS);
+  const ordinal = Math.max(0, Math.floor(elapsed / DAY_MS));
   return ordinal <= PROJECT_REMINDER_SCAN_LIMITS.maxOrdinal ? ordinal : null;
+}
+
+export type FrozenProjectBoundaryTimer = Readonly<{
+  boundaryId: string;
+  sourceRevision: number;
+  lifecycleGeneration: number;
+  remainingBusinessMs: number;
+}>;
+
+/**
+ * Production persistence seam for the room lifecycle transaction. Implementations must persist
+ * each frozen timer before archive ACK, then replace it with a generation-bound boundary before
+ * reopen ACK. Returning from either callback without durable rows is a contract violation.
+ */
+export interface ProjectLoopLifecycleTransactionParticipant {
+  archiveInTransaction(input: ProjectLoopLifecycleInput): ProjectLoopArchiveResult;
+  reopenInTransaction(input: ProjectLoopLifecycleInput): ProjectLoopReopenResult;
+}
+
+export function remainingProjectBusinessDuration(dueAt: string, archivedAt: string): number {
+  if (!timestamp(dueAt) || !timestamp(archivedAt)) {
+    throw new TypeError("Project lifecycle timer input was invalid");
+  }
+  return Math.max(0, Date.parse(dueAt) - Date.parse(archivedAt));
+}
+
+export function resumedProjectBusinessDueAt(remainingBusinessMs: number, reopenedAt: string): string {
+  if (!nonnegative(remainingBusinessMs) || !timestamp(reopenedAt)) {
+    throw new TypeError("Project lifecycle timer input was invalid");
+  }
+  return new Date(Date.parse(reopenedAt) + remainingBusinessMs).toISOString();
+}
+
+/** Adapts a synchronous, transaction-bound lifecycle participant to the runtime coordinator. */
+export function createProjectLoopLifecycleAuthorityFromTransactionParticipant(
+  participant: ProjectLoopLifecycleTransactionParticipant,
+): ProjectLoopLifecycleAuthorityPort {
+  return Object.freeze({
+    async archive(input: ProjectLoopLifecycleInput) {
+      return participant.archiveInTransaction(input);
+    },
+    async reopen(input: ProjectLoopLifecycleInput) {
+      return participant.reopenInTransaction(input);
+    },
+  });
 }
 
 function claimResult(
@@ -291,7 +335,9 @@ function lifecycleInput(value: unknown): value is ProjectLoopLifecycleInput {
   return isRecord(value) && exact(value, [
     "roomId", "archiveGeneration", "previousLifecycleGeneration", "occurredAt",
   ]) && identifier(value.roomId) && positive(value.archiveGeneration) &&
-    nonnegative(value.previousLifecycleGeneration) && timestamp(value.occurredAt);
+    nonnegative(value.previousLifecycleGeneration) &&
+    (value.archiveGeneration === value.previousLifecycleGeneration ||
+      value.archiveGeneration === value.previousLifecycleGeneration + 1) && timestamp(value.occurredAt);
 }
 
 function archiveResult(value: unknown, input: ProjectLoopLifecycleInput): value is ProjectLoopArchiveResult {
@@ -299,7 +345,7 @@ function archiveResult(value: unknown, input: ProjectLoopLifecycleInput): value 
     "roomId", "archiveGeneration", "lifecycleGeneration", "state", "suspendedBoundaryCount",
     "terminalBoundaryCount",
   ]) && value.roomId === input.roomId && value.archiveGeneration === input.archiveGeneration &&
-    value.lifecycleGeneration === input.previousLifecycleGeneration + 1 && value.state === "archived" &&
+    value.lifecycleGeneration === input.archiveGeneration && value.state === "archived" &&
     nonnegative(value.suspendedBoundaryCount) && nonnegative(value.terminalBoundaryCount);
 }
 
@@ -308,7 +354,7 @@ function reopenResult(value: unknown, input: ProjectLoopLifecycleInput): value i
     "roomId", "archiveGeneration", "lifecycleGeneration", "state", "resumedBoundaryCount",
     "replacementBoundaryCount",
   ]) && value.roomId === input.roomId && value.archiveGeneration === input.archiveGeneration &&
-    value.lifecycleGeneration === input.previousLifecycleGeneration + 1 && value.state === "active" &&
+    value.lifecycleGeneration === input.archiveGeneration && value.state === "active" &&
     nonnegative(value.resumedBoundaryCount) && nonnegative(value.replacementBoundaryCount) &&
     value.replacementBoundaryCount === value.resumedBoundaryCount;
 }

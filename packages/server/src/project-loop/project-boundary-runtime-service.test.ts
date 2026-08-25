@@ -2,7 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 import {
   PROJECT_REMINDER_SCAN_LIMITS,
   createProjectLoopLifecycleCoordinator,
+  createProjectLoopLifecycleAuthorityFromTransactionParticipant,
   currentProjectReminderOrdinal,
+  remainingProjectBusinessDuration,
+  resumedProjectBusinessDueAt,
   scanCurrentProjectReminderBuckets,
 } from "./project-boundary-runtime-service.js";
 
@@ -35,7 +38,7 @@ function boundary(overrides: Record<string, unknown> = {}) {
 describe("FT-09 persisted Project boundaries and reminder buckets", () => {
   it("computes only the current due bucket at due, +24h, and after a long restart", () => {
     expect(currentProjectReminderOrdinal(dueAt, new Date(Date.parse(dueAt) - 1).toISOString()))
-      .toBeNull();
+      .toBe(0);
     expect(currentProjectReminderOrdinal(dueAt, dueAt)).toBe(0);
     expect(currentProjectReminderOrdinal(dueAt, new Date(Date.parse(dueAt) + day).toISOString()))
       .toBe(1);
@@ -142,28 +145,56 @@ describe("FT-09 persisted Project boundaries and reminder buckets", () => {
 });
 
 describe("FT-09 Project Loop lifecycle coordinator", () => {
+  it("freezes remaining duration and reopens from the new time without a reminder burst", async () => {
+    const archivedAt = "2026-08-25T00:00:00.000Z";
+    const originalDue = "2026-08-27T12:00:00.000Z";
+    const reopenedAt = "2026-09-25T00:00:00.000Z";
+    const remaining = remainingProjectBusinessDuration(originalDue, archivedAt);
+    expect(remaining).toBe(60 * hour);
+    expect(resumedProjectBusinessDueAt(remaining, reopenedAt))
+      .toBe("2026-09-27T12:00:00.000Z");
+    expect(currentProjectReminderOrdinal(
+      resumedProjectBusinessDueAt(remaining, reopenedAt), reopenedAt,
+    )).toBe(0);
+
+    const participant = {
+      archiveInTransaction: vi.fn(() => ({ roomId: "room-1", archiveGeneration: 5,
+        lifecycleGeneration: 5, state: "archived" as const,
+        suspendedBoundaryCount: 1, terminalBoundaryCount: 0 })),
+      reopenInTransaction: vi.fn(() => ({ roomId: "room-1", archiveGeneration: 5,
+        lifecycleGeneration: 5, state: "active" as const,
+        resumedBoundaryCount: 1, replacementBoundaryCount: 1 })),
+    };
+    const authority = createProjectLoopLifecycleAuthorityFromTransactionParticipant(participant);
+    await authority.archive({ roomId: "room-1", archiveGeneration: 5,
+      previousLifecycleGeneration: 4, occurredAt: archivedAt });
+    await authority.reopen({ roomId: "room-1", archiveGeneration: 5,
+      previousLifecycleGeneration: 5, occurredAt: reopenedAt });
+    expect(participant.archiveInTransaction).toHaveBeenCalledTimes(1);
+    expect(participant.reopenInTransaction).toHaveBeenCalledTimes(1);
+  });
   it("requires monotonic lifecycle generations and returns validated archive/reopen facts", async () => {
     const coordinator = createProjectLoopLifecycleCoordinator({
       authority: {
         archive: vi.fn(async () => ({
-          roomId: "room-1", archiveGeneration: 2, lifecycleGeneration: 5,
+          roomId: "room-1", archiveGeneration: 5, lifecycleGeneration: 5,
           state: "archived" as const, suspendedBoundaryCount: 3, terminalBoundaryCount: 2,
         })),
         reopen: vi.fn(async () => ({
-          roomId: "room-1", archiveGeneration: 2, lifecycleGeneration: 6,
+          roomId: "room-1", archiveGeneration: 5, lifecycleGeneration: 5,
           state: "active" as const, resumedBoundaryCount: 3, replacementBoundaryCount: 3,
         })),
       },
     });
     await expect(coordinator.archive({
-      roomId: "room-1", archiveGeneration: 2, previousLifecycleGeneration: 4,
+      roomId: "room-1", archiveGeneration: 5, previousLifecycleGeneration: 4,
       occurredAt: dueAt,
     })).resolves.toMatchObject({ state: "archived", lifecycleGeneration: 5 });
     await expect(coordinator.reopen({
-      roomId: "room-1", archiveGeneration: 2, previousLifecycleGeneration: 5,
+      roomId: "room-1", archiveGeneration: 5, previousLifecycleGeneration: 5,
       occurredAt: new Date(Date.parse(dueAt) + hour).toISOString(),
     })).resolves.toMatchObject({
-      state: "active", lifecycleGeneration: 6, resumedBoundaryCount: 3,
+      state: "active", lifecycleGeneration: 5, resumedBoundaryCount: 3,
       replacementBoundaryCount: 3,
     });
   });
@@ -172,20 +203,20 @@ describe("FT-09 Project Loop lifecycle coordinator", () => {
     const coordinator = createProjectLoopLifecycleCoordinator({
       authority: {
         archive: vi.fn(async () => ({
-          roomId: "room-2", archiveGeneration: 2, lifecycleGeneration: 5,
+          roomId: "room-2", archiveGeneration: 5, lifecycleGeneration: 5,
           state: "archived" as const, suspendedBoundaryCount: 0, terminalBoundaryCount: 0,
         })),
         reopen: vi.fn(async () => ({
-          roomId: "room-1", archiveGeneration: 2, lifecycleGeneration: 5,
+          roomId: "room-1", archiveGeneration: 5, lifecycleGeneration: 4,
           state: "active" as const, resumedBoundaryCount: 0, replacementBoundaryCount: 0,
         })),
       },
     });
     await expect(coordinator.archive({
-      roomId: "room-1", archiveGeneration: 2, previousLifecycleGeneration: 4, occurredAt: dueAt,
+      roomId: "room-1", archiveGeneration: 5, previousLifecycleGeneration: 4, occurredAt: dueAt,
     })).rejects.toThrow("malformed");
     await expect(coordinator.reopen({
-      roomId: "room-1", archiveGeneration: 2, previousLifecycleGeneration: 5, occurredAt: dueAt,
+      roomId: "room-1", archiveGeneration: 5, previousLifecycleGeneration: 5, occurredAt: dueAt,
     })).rejects.toThrow("malformed");
   });
 });

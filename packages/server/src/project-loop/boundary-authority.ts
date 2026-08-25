@@ -4,6 +4,15 @@ import type { AuthorityTransactionView } from
 import { useAuthorityTransactionDatabase } from
   "../persistence/authority-transaction-database.js";
 import { ProjectLoopAuthorityError } from "./database-authority.js";
+import type {
+  PersistedProjectBoundary,
+  ProjectLoopArchiveResult,
+  ProjectLoopLifecycleInput,
+  ProjectLoopLifecycleTransactionParticipant,
+  ProjectLoopReopenResult,
+  ProjectReminderAuthorityPort,
+} from "./project-boundary-runtime-service.js";
+import { createHash } from "node:crypto";
 
 export type EligibleProjectBoundary = Readonly<{
   boundaryId: string;
@@ -66,6 +75,364 @@ export function listConfirmedProjectCheckpointsDatabaseQuery(database: DatabaseS
     checkpointId: string; projectRevision: number; projectionJson: string;
     projectionSha256: string; createdAt: string;
   }>[]);
+}
+
+type ReminderBoundaryRow = Readonly<{
+  boundaryId: string; roomId: string; sourceKind: string; sourceId: string;
+  sourceRevision: number; holderKind: "human" | "agent"; holderActorId: string;
+  reason: string; since: string; dueAt: string; lifecycleGeneration: number;
+}>;
+
+function sourceState(database: DatabaseSync, row: ReminderBoundaryRow):
+  Readonly<{ kind: PersistedProjectBoundary["sourceKind"]; current: boolean }> {
+  if (row.sourceKind === "next_action") {
+    const fact = database.prepare(
+      `SELECT revision, status FROM project_next_actions WHERE room_id = ? AND id = ?`,
+    ).get(row.roomId, row.sourceId);
+    return { kind: "next_action", current: fact?.revision === row.sourceRevision &&
+      (fact.status === "accepted" || fact.status === "in_progress" || fact.status === "delivered") };
+  }
+  if (row.sourceKind === "request") {
+    const fact = database.prepare(
+      `SELECT revision, status FROM project_requests WHERE room_id = ? AND id = ?`,
+    ).get(row.roomId, row.sourceId);
+    return { kind: "request", current: fact?.revision === row.sourceRevision &&
+      fact.status === "pending_acceptance" };
+  }
+  if (row.sourceKind === "blocker" || row.sourceKind === "open_question" ||
+      row.sourceKind === "review") {
+    const fact = database.prepare(
+      `SELECT revision, kind, status FROM project_obstacles WHERE room_id = ? AND id = ?`,
+    ).get(row.roomId, row.sourceId);
+    const kind = fact?.kind === "open_question" ? "open_question" as const : "blocker" as const;
+    return { kind, current: fact?.revision === row.sourceRevision &&
+      (fact.status === "open" || fact.status === "deferred" || fact.status === "cannot_answer") };
+  }
+  return { kind: "next_action", current: false };
+}
+
+function currentReminderBoundary(database: DatabaseSync, row: ReminderBoundaryRow,
+  now: string): PersistedProjectBoundary | undefined {
+  const authority = database.prepare(
+    `SELECT room.status AS roomStatus, membership.kind AS membershipKind,
+            assignment.status AS assignmentStatus, assignment.paused AS assignmentPaused
+     FROM rooms AS room
+     LEFT JOIN room_memberships AS membership
+       ON membership.room_id = room.id AND membership.actor_id = ?
+     LEFT JOIN room_agent_assignments AS assignment
+       ON assignment.room_id = room.id AND assignment.agent_actor_id = ?
+          AND assignment.status = 'current'
+     WHERE room.id = ? AND room.archive_generation = ?`,
+  ).get(row.holderActorId, row.holderActorId, row.roomId, row.lifecycleGeneration);
+  if (authority?.roomStatus !== "active" || authority.membershipKind !== row.holderKind ||
+      (row.holderKind === "agent" &&
+        (authority.assignmentStatus !== "current" || authority.assignmentPaused !== 0))) return undefined;
+  if (row.dueAt > now) return undefined;
+  const source = sourceState(database, row);
+  if (!source.current) return undefined;
+  return Object.freeze({
+    recordVersion: "project-boundary.v1", boundaryId: row.boundaryId,
+    roomId: row.roomId, projectId: row.roomId,
+    boundaryKind: row.sourceKind === "review" ? "review" :
+      row.holderKind === "agent" ? "agent_ball" : source.kind === "blocker" ||
+        source.kind === "open_question" ? "blocker" : "due",
+    sourceKind: source.kind, sourceId: row.sourceId, sourceRevision: row.sourceRevision,
+    holder: Object.freeze({ kind: row.holderKind, actorId: row.holderActorId }),
+    lifecycleGeneration: row.lifecycleGeneration, status: "active",
+    confirmed: true, consumed: false,
+    dueAt: row.sourceKind === "review" ? null : row.dueAt,
+    reviewAt: row.sourceKind === "review" ? row.dueAt : null,
+    createdAt: row.since,
+  });
+}
+
+function reminderRows(database: DatabaseSync, now: string, limit: number): ReminderBoundaryRow[] {
+  return database.prepare(
+    `SELECT boundary.boundary_id AS boundaryId, boundary.room_id AS roomId,
+            boundary.source_kind AS sourceKind, boundary.source_id AS sourceId,
+            boundary.source_revision AS sourceRevision, boundary.holder_kind AS holderKind,
+            boundary.holder_actor_id AS holderActorId, boundary.reason, boundary.since,
+            boundary.due_at AS dueAt, boundary.lifecycle_generation AS lifecycleGeneration
+     FROM project_ball_boundaries AS boundary
+     JOIN rooms AS room ON room.id = boundary.room_id
+     WHERE boundary.status = 'active' AND boundary.due_at IS NOT NULL
+       AND boundary.due_at <= ? AND room.status = 'active'
+     ORDER BY boundary.due_at, boundary.boundary_id LIMIT ?`,
+  ).all(now, limit) as unknown as ReminderBoundaryRow[];
+}
+
+export type ProjectReminderAgentIntentInput = Readonly<{
+  intentId: string; roomId: string; boundaryId: string; sourceKind: string;
+  sourceId: string; sourceRevision: number; agentActorId: string; createdAt: string;
+}>;
+
+export type ProjectReminderAgentIntentWriter = (
+  database: DatabaseSync,
+  input: ProjectReminderAgentIntentInput,
+) => void;
+
+export type ProjectReminderDatabaseAdapterOptions = Readonly<{
+  /** FT-08-owned writer. It runs synchronously inside this adapter's SQLite transaction. */
+  writeAgentInvocationIntentInTransaction: ProjectReminderAgentIntentWriter;
+}>;
+
+/** Production SQLite adapter; provider invocation is deliberately outside this transaction seam. */
+export function createProjectReminderDatabaseAuthorityPort(database: DatabaseSync,
+  options: ProjectReminderDatabaseAdapterOptions): ProjectReminderAuthorityPort {
+  return Object.freeze({
+    async listEligibleBoundaries(
+      input: Parameters<ProjectReminderAuthorityPort["listEligibleBoundaries"]>[0],
+    ) {
+      if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 256 ||
+          !Number.isFinite(Date.parse(input.now))) throw new TypeError("Project reminder scan is invalid");
+      return Object.freeze(reminderRows(database, input.now, input.limit)
+        .map((row) => currentReminderBoundary(database, row, input.now))
+        .filter((row): row is PersistedProjectBoundary => row !== undefined));
+    },
+    async claimCurrentBucket(
+      input: Parameters<ProjectReminderAuthorityPort["claimCurrentBucket"]>[0],
+    ) {
+      const base = { roomId: input.roomId, boundaryId: input.boundaryId,
+        reminderOrdinal: input.reminderOrdinal, recipientActorId: input.recipientActorId };
+      database.exec("BEGIN IMMEDIATE");
+      try {
+        const raw = database.prepare(
+          `SELECT boundary.boundary_id AS boundaryId, boundary.room_id AS roomId,
+                  boundary.source_kind AS sourceKind, boundary.source_id AS sourceId,
+                  boundary.source_revision AS sourceRevision, boundary.holder_kind AS holderKind,
+                  boundary.holder_actor_id AS holderActorId, boundary.reason, boundary.since,
+                  boundary.due_at AS dueAt, boundary.lifecycle_generation AS lifecycleGeneration
+           FROM project_ball_boundaries AS boundary JOIN rooms AS room ON room.id = boundary.room_id
+           WHERE boundary.boundary_id = ? AND boundary.room_id = ? AND boundary.status = 'active'`,
+        ).get(input.boundaryId, input.roomId) as ReminderBoundaryRow | undefined;
+        const current = raw === undefined ? undefined :
+          currentReminderBoundary(database, raw, input.claimedAt);
+        const scheduled = current?.boundaryKind === "review" ? current.reviewAt : current?.dueAt;
+        const exactOrdinal = scheduled === null || scheduled === undefined ? -1 :
+          Math.max(0, Math.floor((Date.parse(input.claimedAt) - Date.parse(scheduled)) /
+            (24 * 60 * 60 * 1_000)));
+        if (current === undefined || current.sourceRevision !== input.sourceRevision ||
+            current.lifecycleGeneration !== input.lifecycleGeneration ||
+            current.holder.actorId !== input.recipientActorId ||
+            (current.holder.kind === "human") !== (input.reminderKind === "human_reminder") ||
+            exactOrdinal !== input.reminderOrdinal) {
+          database.exec("COMMIT");
+          return Object.freeze({ status: "ineligible" as const, ...base });
+        }
+        if (scheduled === null || scheduled === undefined) {
+          throw new Error("Current Project reminder boundary has no schedule");
+        }
+        const reminderKind = current.boundaryKind === "review" ? "review" :
+          input.reminderOrdinal === 0 ? "initial_due" : "repeat_24h";
+        const claimId = `project-reminder-${createHash("sha256").update(
+          `${input.roomId}\0${input.boundaryId}\0${input.sourceRevision}\0${input.lifecycleGeneration}` +
+          `\0${reminderKind}\0${input.reminderOrdinal}\0${input.recipientActorId}`,
+        ).digest("hex")}`;
+        const inserted = database.prepare(
+          `INSERT INTO project_due_reminder_claims (
+             claim_id, room_id, boundary_id, source_revision, reminder_kind, reminder_ordinal,
+             boundary_at, holder_kind, holder_actor_id, recipient_actor_id, status, claimed_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'claimed', ?)
+           ON CONFLICT(room_id, boundary_id, reminder_kind, reminder_ordinal, recipient_actor_id)
+           DO NOTHING`,
+        ).run(claimId, input.roomId, input.boundaryId, input.sourceRevision, reminderKind,
+          input.reminderOrdinal, scheduled, current.holder.kind, current.holder.actorId,
+          input.recipientActorId, input.claimedAt);
+        if (inserted.changes === 0) {
+          database.exec("COMMIT");
+          return Object.freeze({ status: "duplicate" as const, ...base });
+        }
+        if (current.holder.kind === "human") {
+          const stream = database.prepare(
+            `SELECT head_seq AS headSeq FROM streams WHERE stream_kind = 'identity' AND stream_id = ?`,
+          ).get(input.recipientActorId);
+          if (typeof stream?.headSeq !== "number") throw new Error("Human reminder stream is unavailable");
+          const seq = stream.headSeq + 1;
+          database.prepare(
+            `UPDATE streams SET head_seq = ? WHERE stream_kind = 'identity' AND stream_id = ?
+               AND head_seq = ?`,
+          ).run(seq, input.recipientActorId, stream.headSeq);
+          database.prepare(
+            `INSERT INTO events (event_id, stream_kind, stream_id, stream_seq, room_id, actor_id,
+               event_type, occurred_at, payload_json)
+             VALUES (?, 'identity', ?, ?, NULL, ?, 'project.reminder.due', ?, json(?))`,
+          ).run(claimId, input.recipientActorId, seq, input.recipientActorId, input.claimedAt,
+            JSON.stringify({ roomId: input.roomId, boundaryId: input.boundaryId,
+              sourceKind: current.sourceKind, sourceId: current.sourceId,
+              sourceRevision: current.sourceRevision, reminderOrdinal: input.reminderOrdinal }));
+          const outboxId = `outbox:${claimId}`;
+          database.prepare(
+            `INSERT INTO outbox_deliveries (id, event_id, target_kind, target_id, stream_seq,
+               status, attempts, available_at, delivered_at, last_error)
+             VALUES (?, ?, 'principal', ?, ?, 'pending', 0, ?, NULL, NULL)`,
+          ).run(outboxId, claimId, input.recipientActorId, seq, input.claimedAt);
+          database.prepare(
+            `UPDATE project_due_reminder_claims SET status = 'dispatched', dispatched_at = ?
+             WHERE claim_id = ?`,
+          ).run(input.claimedAt, claimId);
+          database.exec("COMMIT");
+          return Object.freeze({ status: "claimed" as const, ...base,
+            dispatch: Object.freeze({ kind: "human_notification" as const, outboxId }) });
+        }
+        const intentId = `project-boundary-intent:${claimId}`;
+        options.writeAgentInvocationIntentInTransaction(database, {
+          intentId, roomId: input.roomId, boundaryId: input.boundaryId,
+          sourceKind: current.sourceKind, sourceId: current.sourceId,
+          sourceRevision: current.sourceRevision, agentActorId: input.recipientActorId,
+          createdAt: input.claimedAt,
+        });
+        database.prepare(
+          `UPDATE project_due_reminder_claims SET status = 'dispatched', dispatched_at = ?
+           WHERE claim_id = ?`,
+        ).run(input.claimedAt, claimId);
+        database.exec("COMMIT");
+        return Object.freeze({ status: "claimed" as const, ...base,
+          dispatch: Object.freeze({ kind: "agent_invocation" as const, intentId }) });
+      } catch (error) {
+        try { database.exec("ROLLBACK"); } catch { /* preserve original */ }
+        throw error;
+      }
+    },
+  });
+}
+
+type LifecycleBoundaryRow = Readonly<{
+  boundaryId: string; roomId: string; sourceKind: string; sourceId: string;
+  sourceRevision: number; lifecycleGeneration: number; holderKind: "human" | "agent";
+  holderActorId: string; reason: string; since: string; dueAt: string | null;
+  releasedAt: string | null;
+}>;
+
+function lifecycleRows(database: DatabaseSync, roomId: string, status: "active" | "superseded",
+  lifecycleGeneration?: number): LifecycleBoundaryRow[] {
+  const suffix = lifecycleGeneration === undefined ? "" : " AND lifecycle_generation = ?";
+  const statement = database.prepare(
+    `SELECT boundary_id AS boundaryId, room_id AS roomId, source_kind AS sourceKind,
+            source_id AS sourceId, source_revision AS sourceRevision,
+            lifecycle_generation AS lifecycleGeneration, holder_kind AS holderKind,
+            holder_actor_id AS holderActorId, reason, since, due_at AS dueAt,
+            released_at AS releasedAt
+     FROM project_ball_boundaries WHERE room_id = ? AND status = ?${suffix}
+     ORDER BY boundary_id`,
+  );
+  return (lifecycleGeneration === undefined
+    ? statement.all(roomId, status)
+    : statement.all(roomId, status, lifecycleGeneration)) as unknown as LifecycleBoundaryRow[];
+}
+
+function lifecycleSourceCurrent(database: DatabaseSync, row: LifecycleBoundaryRow): boolean {
+  if (row.dueAt === null) {
+    const reminderShape = { ...row, dueAt: "1970-01-01T00:00:00.000Z" } as ReminderBoundaryRow;
+    return sourceState(database, reminderShape).current;
+  }
+  return sourceState(database, row as ReminderBoundaryRow).current;
+}
+
+function roomLifecycle(database: DatabaseSync, input: ProjectLoopLifecycleInput,
+  expectedStatus: "active" | "archived"): void {
+  const room = database.prepare(
+    "SELECT status, archive_generation AS generation FROM rooms WHERE id = ?",
+  ).get(input.roomId);
+  if (room?.status !== expectedStatus || room.generation !== input.archiveGeneration) {
+    throw new ProjectLoopAuthorityError("revision_conflict", "Project Room lifecycle changed");
+  }
+}
+
+/** Must be called inside the same SQLite transaction that commits the Room archive. */
+export function archiveProjectLoopBoundariesInTransaction(database: DatabaseSync,
+  input: ProjectLoopLifecycleInput): ProjectLoopArchiveResult {
+  roomLifecycle(database, input, "archived");
+  const prior = lifecycleRows(database, input.roomId, "active", input.previousLifecycleGeneration);
+  const allActive = lifecycleRows(database, input.roomId, "active");
+  if (allActive.length !== prior.length) {
+    throw new ProjectLoopAuthorityError("revision_conflict",
+      "Project boundary lifecycle generation changed during archive");
+  }
+  const suspended = prior.filter((row) => lifecycleSourceCurrent(database, row));
+  const state = database.prepare(
+    "SELECT revision FROM project_room_states WHERE room_id = ?",
+  ).get(input.roomId);
+  const projectRevision = typeof state?.revision === "number" ? state.revision : 0;
+  database.prepare(
+    `INSERT INTO project_archive_suspensions (
+       room_id, project_id, archive_generation, suspended_project_revision,
+       suspended_at, status, resumed_at
+     ) VALUES (?, ?, ?, ?, ?, 'suspended', NULL)`,
+  ).run(input.roomId, input.roomId, input.archiveGeneration, projectRevision, input.occurredAt);
+  for (const row of prior) {
+    const updated = database.prepare(
+      `UPDATE project_ball_boundaries SET status = 'superseded', released_at = ?
+       WHERE boundary_id = ? AND status = 'active' AND lifecycle_generation = ?`,
+    ).run(input.occurredAt, row.boundaryId, input.previousLifecycleGeneration);
+    if (updated.changes !== 1) {
+      throw new ProjectLoopAuthorityError("revision_conflict", "Project boundary changed during archive");
+    }
+  }
+  return Object.freeze({ roomId: input.roomId, archiveGeneration: input.archiveGeneration,
+    lifecycleGeneration: input.archiveGeneration, state: "archived",
+    suspendedBoundaryCount: suspended.length,
+    terminalBoundaryCount: prior.length - suspended.length });
+}
+
+/** Must be called inside the same SQLite transaction that commits the Room reopen. */
+export function reopenProjectLoopBoundariesInTransaction(database: DatabaseSync,
+  input: ProjectLoopLifecycleInput): ProjectLoopReopenResult {
+  roomLifecycle(database, input, "active");
+  const suspension = database.prepare(
+    `SELECT suspended_at AS suspendedAt FROM project_archive_suspensions
+     WHERE room_id = ? AND archive_generation = ? AND status = 'suspended'`,
+  ).get(input.roomId, input.archiveGeneration);
+  if (typeof suspension?.suspendedAt !== "string") {
+    throw new ProjectLoopAuthorityError("revision_conflict", "Project archive suspension is unavailable");
+  }
+  const latest = new Map<string, LifecycleBoundaryRow>();
+  for (const row of lifecycleRows(database, input.roomId, "superseded")) {
+    if (row.lifecycleGeneration >= input.archiveGeneration || row.releasedAt !== suspension.suspendedAt ||
+        !lifecycleSourceCurrent(database, row)) continue;
+    const key = `${row.sourceKind}\0${row.sourceId}\0${row.sourceRevision}`;
+    const current = latest.get(key);
+    if (current === undefined || current.lifecycleGeneration < row.lifecycleGeneration) latest.set(key, row);
+  }
+  const prior = [...latest.values()].sort((left, right) => left.boundaryId.localeCompare(right.boundaryId));
+  let replacements = 0;
+  for (const row of prior) {
+    const remaining = row.dueAt === null ? null :
+      Math.max(0, Date.parse(row.dueAt) - Date.parse(suspension.suspendedAt));
+    const resumedDueAt = remaining === null ? null :
+      new Date(Date.parse(input.occurredAt) + remaining).toISOString();
+    const boundaryId = `project-ball-${createHash("sha256")
+      .update(`${row.roomId}\0${row.sourceKind}\0${row.sourceId}\0${row.sourceRevision}` +
+        `\0${input.archiveGeneration}\0${row.holderKind}\0${row.holderActorId}`)
+      .digest("hex")}`;
+    database.prepare(
+      `INSERT INTO project_ball_boundaries (
+         boundary_id, room_id, project_id, source_kind, source_id, source_revision,
+         lifecycle_generation, holder_kind, holder_actor_id, reason, since, due_at,
+         status, released_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL)`,
+    ).run(boundaryId, row.roomId, row.roomId, row.sourceKind, row.sourceId,
+      row.sourceRevision, input.archiveGeneration, row.holderKind, row.holderActorId,
+      row.reason, input.occurredAt, resumedDueAt);
+    replacements += 1;
+  }
+  database.prepare(
+    `UPDATE project_archive_suspensions SET status = 'resumed', resumed_at = ?
+     WHERE room_id = ? AND archive_generation = ? AND status = 'suspended'`,
+  ).run(input.occurredAt, input.roomId, input.archiveGeneration);
+  return Object.freeze({ roomId: input.roomId, archiveGeneration: input.archiveGeneration,
+    lifecycleGeneration: input.archiveGeneration, state: "active",
+    resumedBoundaryCount: replacements, replacementBoundaryCount: replacements });
+}
+
+export function createProjectLoopLifecycleDatabaseTransactionParticipant(
+  database: DatabaseSync,
+): ProjectLoopLifecycleTransactionParticipant {
+  return Object.freeze({
+    archiveInTransaction: (input: ProjectLoopLifecycleInput) =>
+      archiveProjectLoopBoundariesInTransaction(database, input),
+    reopenInTransaction: (input: ProjectLoopLifecycleInput) =>
+      reopenProjectLoopBoundariesInTransaction(database, input),
+  });
 }
 
 export function listCanonicalResponsibilitiesInTransaction(transaction: AuthorityTransactionView,

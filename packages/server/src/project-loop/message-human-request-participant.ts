@@ -425,10 +425,13 @@ export function createSqliteHumanRequestMessageParticipant(options: Readonly<{
            ) VALUES (?, ?, 0, 0, ?) ON CONFLICT(room_id) DO NOTHING`,
         ).run(binding.roomId, binding.projectId, binding.occurredAt);
         const state = database.prepare(
-          `SELECT revision, event_head_seq AS eventHeadSeq
-           FROM project_room_states WHERE room_id = ?`,
+          `SELECT state.revision, state.event_head_seq AS eventHeadSeq,
+                  room.archive_generation AS lifecycleGeneration
+           FROM project_room_states AS state JOIN rooms AS room ON room.id = state.room_id
+           WHERE state.room_id = ?`,
         ).get(binding.roomId);
         if (typeof state?.revision !== "number" || typeof state.eventHeadSeq !== "number" ||
+            typeof state.lifecycleGeneration !== "number" ||
             state.revision !== state.eventHeadSeq || state.revision < 0) {
           throw new HumanRequestMessageParticipantError(
             "storage_unavailable",
@@ -442,6 +445,7 @@ export function createSqliteHumanRequestMessageParticipant(options: Readonly<{
           "request",
           requestId,
           "1",
+          String(state.lifecycleGeneration),
           "human",
           binding.requesterHumanActorId,
         )}`;
@@ -579,11 +583,11 @@ export function createSqliteHumanRequestMessageParticipant(options: Readonly<{
         database.prepare(
           `INSERT INTO project_ball_boundaries (
              boundary_id, room_id, project_id, source_kind, source_id, source_revision,
-             holder_kind, holder_actor_id, reason, since, due_at, status, released_at
-           ) VALUES (?, ?, ?, 'request', ?, 1, 'human', ?, 'pending_acceptance', ?,
+             lifecycle_generation, holder_kind, holder_actor_id, reason, since, due_at, status, released_at
+           ) VALUES (?, ?, ?, 'request', ?, 1, ?, 'human', ?, 'pending_acceptance', ?,
                      NULL, 'active', NULL)`,
         ).run(
-          boundaryId, binding.roomId, binding.projectId, requestId,
+          boundaryId, binding.roomId, binding.projectId, requestId, state.lifecycleGeneration,
           binding.requesterHumanActorId, binding.occurredAt,
         );
         const advanced = database.prepare(
