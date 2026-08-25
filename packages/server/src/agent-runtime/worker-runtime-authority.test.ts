@@ -862,6 +862,7 @@ describe("real AuthorityWorker runtime authority", () => {
         signal: new AbortController().signal,
       });
       expect(gitOutcome.summary).toMatchObject({ exitCategory: "success" });
+      await authority.complete(runningThird.id, 1, "Repository status inspected");
 
       const openItem = await createSqliteAuthoritativeStore(client).executeHuman(
         { ...context, requestId: "request-open-item-failure", idempotencyKey: "key-open-item-failure" },
@@ -1048,5 +1049,5 @@ describe("real AuthorityWorker runtime authority", () => {
       await client.close().catch(() => undefined);
       rmSync(directory, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 });

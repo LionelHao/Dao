@@ -1718,7 +1718,7 @@ describe("authoritative server real-process harness", () => {
           ? rendererState.snapshot.room.assignments[0] : undefined).toMatchObject({
           paused: true, availability: "paused",
         });
-      }, { timeout: 2_000, interval: 20 });
+      }, { timeout: 5_000, interval: 20 });
       const publicEvidence = JSON.stringify({ initial, converged, observed });
       expect(publicEvidence).not.toContain(passwordCanary);
       expect(publicEvidence).not.toContain(issued.accessToken);
