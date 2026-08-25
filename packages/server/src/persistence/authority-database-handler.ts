@@ -8284,7 +8284,12 @@ export function executeRuntimeAuthorityOperation(
            WHERE id = ? AND status = 'pending'`,
         ).run(occurredAt, target.intentId);
         if (compatibilityIntent.changes !== 1) {
-          return fail("execution_conflict", "Cancellation lost the compatibility intent CAS");
+          const compatibility = database.prepare(
+            "SELECT status FROM agent_invocation_intents WHERE id = ?",
+          ).get(target.intentId);
+          if (compatibility?.status === "pending" || typeof compatibility?.status !== "string") {
+            return fail("execution_conflict", "Cancellation lost the compatibility intent CAS");
+          }
         }
         appendCanonicalInvocationIntentEvent(
           database, target.intentId, occurredAt, "cancelled",

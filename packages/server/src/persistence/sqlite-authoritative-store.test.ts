@@ -4803,7 +4803,9 @@ describe("SQLite authoritative sessions", () => {
         : "agent_invocation_intents";
       expect(database.prepare(
         `SELECT status FROM ${intentTable} WHERE source_message_id = ?`,
-      ).all(messageId)).toEqual(targetWasInvalidatedBeforeSend ? [] : [{ status: "pending" }]);
+      ).all(messageId)).toEqual(targetWasInvalidatedBeforeSend
+        ? []
+        : [{ status: targetKind === "agent" ? "cancelled" : "pending" }]);
       if (targetKind === "agent" && !targetWasInvalidatedBeforeSend) {
         expect(database.prepare(
           `SELECT binding.profile_id AS profileId,

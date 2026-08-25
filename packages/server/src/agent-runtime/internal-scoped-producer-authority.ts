@@ -167,6 +167,15 @@ function appendCanonicalIntentProjection(
        ON binding.intent_id = intent.id
      WHERE intent.id = ? AND intent.origin_kind = 'message_target'`,
   ).get(intentId);
+  if (typeof row?.intentId !== "string" || typeof row.lineageId !== "string" ||
+      typeof row.turnId !== "string" || typeof row.roomId !== "string" ||
+      typeof row.sourceMessageId !== "string" || typeof row.targetId !== "string" ||
+      typeof row.agentId !== "string" || typeof row.messageTransactionId !== "string") {
+    // Historical/legacy-review intents without a v21 direct authority binding
+    // remain cancellable, but are deliberately excluded from canonical v22
+    // stable projection. Repair exposes them through the legacy record kind.
+    return;
+  }
   const projection = {
     intentId: row?.intentId, lineageId: row?.lineageId, turnId: row?.turnId,
     roomId: row?.roomId, sourceMessageId: row?.sourceMessageId,
@@ -504,7 +513,12 @@ export function commitInternalScopedProducerInTransaction(
            cancellation_reason = 'message_recalled' WHERE id = ? AND status = 'pending'`,
       ).run(input.occurredAt, row.intentId);
       if (compatibilityIntent.changes !== 1) {
-        throw new Error("Internal intent cancellation lost its compatibility CAS");
+        const compatibility = database.prepare(
+          "SELECT status FROM agent_invocation_intents WHERE id = ?",
+        ).get(row.intentId);
+        if (compatibility?.status === "pending" || typeof compatibility?.status !== "string") {
+          throw new Error("Internal intent cancellation lost its compatibility CAS");
+        }
       }
       const effect: ScopedCancellationCommitEffect = {
         sourceMessageId: row.sourceMessageId,
