@@ -131,8 +131,7 @@ function sourceIsCurrent(database: DatabaseSync, row: Row, attemptedAt: string):
   return false;
 }
 
-function boundaryKindMatches(row: Row, request: ProjectBoundaryInvocationRequest,
-  _attemptedAt: string): boolean {
+function boundaryKindMatches(row: Row, request: ProjectBoundaryInvocationRequest): boolean {
   const expected = row.sourceKind === "confirmation" ? "checkpoint" :
     row.sourceKind === "blocker" || row.sourceKind === "open_question" ||
       row.sourceKind === "review" ? "blocker" :
@@ -278,7 +277,7 @@ export function claimProjectBoundaryInvocationInTransaction(database: DatabaseSy
     row.sourceRevision === input.request.sourceFactRevision && row.agentId === input.request.agentId &&
     row.holderKind === "agent" && row.boundaryStatus === "active" && row.roomStatus === "active" &&
     row.archiveGeneration === row.lifecycleGeneration &&
-    boundaryKindMatches(row, input.request, input.attemptedAt) &&
+    boundaryKindMatches(row, input.request) &&
     sourceIsCurrent(database, row, input.attemptedAt);
   const eligible = structurallyCurrent && row.membershipKind === "agent" &&
     row.membershipParticipation === "active" && row.profileStatus === "enabled" &&

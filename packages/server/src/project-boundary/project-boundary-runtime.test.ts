@@ -141,7 +141,7 @@ describe("Project boundary runtime", () => {
     }) };
     const provider = { id: "provider-1", async *stream(): AsyncIterable<ProviderEvent> {
       providerStarted();
-      await new Promise<never>(() => undefined);
+      yield* await new Promise<AsyncIterable<ProviderEvent>>(() => undefined);
     } };
     const runtime = createProjectBoundaryRuntime({ authority, provider });
     const scan = runtime.scan();

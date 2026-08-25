@@ -194,7 +194,7 @@ function currentReminderBoundary(database: DatabaseSync, row: ReminderBoundaryRo
   });
 }
 
-function reminderRows(database: DatabaseSync, now: string, _limit: number): ReminderBoundaryRow[] {
+function reminderRows(database: DatabaseSync, now: string): ReminderBoundaryRow[] {
   return database.prepare(
     `SELECT boundary.boundary_id AS boundaryId, boundary.room_id AS roomId,
             boundary.source_kind AS sourceKind, boundary.source_id AS sourceId,
@@ -479,7 +479,7 @@ export function scanProjectReminderBucketsInTransaction(
     now: input.now, limit: input.limit,
   });
   createReachedDueBoundariesInTransaction(database, input.now, input.limit);
-  const candidates = reminderRows(database, input.now, input.limit)
+  const candidates = reminderRows(database, input.now)
     .map((row) => currentReminderBoundary(database, row, input.now))
     .filter((row): row is PersistedProjectBoundary => row !== undefined)
     .slice(0, input.limit);
@@ -524,7 +524,7 @@ export function createProjectReminderDatabaseAuthorityPort(database: DatabaseSyn
     ) {
       if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 256 ||
           !Number.isFinite(Date.parse(input.now))) throw new TypeError("Project reminder scan is invalid");
-      return Object.freeze(reminderRows(database, input.now, input.limit)
+      return Object.freeze(reminderRows(database, input.now)
         .map((row) => currentReminderBoundary(database, row, input.now))
         .filter((row): row is PersistedProjectBoundary => row !== undefined)
         .slice(0, input.limit));
