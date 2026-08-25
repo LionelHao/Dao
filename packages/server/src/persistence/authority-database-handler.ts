@@ -146,6 +146,7 @@ import {
   reopenProjectLoopBoundariesInTransaction,
   scanProjectReminderBucketsInTransaction,
 } from "../project-loop/boundary-authority.js";
+import { readProjectRouteFactsInTransaction } from "../project-loop/route-project-facts.js";
 import { canStartRuntimeGenerationInTransaction } from "../agent-runtime/runtime-archive-fence-participant.js";
 import {
   commitInternalScopedProducerInTransaction,
@@ -7403,6 +7404,10 @@ export function executeRuntimeAuthorityOperation(
       }
       return { kind: "project-agent-boundary-scan", scannedCount: rows.length,
         createdCount, suppressedCount };
+    }
+    if (operation.type === "runtime.read-project-route-facts") {
+      return { kind: "project-route-facts",
+        result: readProjectRouteFactsInTransaction(database, operation.roomId) };
     }
     if (operation.type === "runtime.begin-project-boundary-execution") {
       return { kind: "project-boundary-execution",

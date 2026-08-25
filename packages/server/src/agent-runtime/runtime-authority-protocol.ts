@@ -123,6 +123,11 @@ export type RuntimeAuthorityOperation =
       readonly now: number;
     }
   | {
+      readonly type: "runtime.read-project-route-facts";
+      readonly roomId: string;
+      readonly now: number;
+    }
+  | {
       readonly type: "runtime.begin-project-boundary-execution";
       readonly executionId: string;
       readonly expectedVersion: number;
@@ -353,6 +358,10 @@ export type RuntimeAuthorityOperationResult =
       readonly result: ProjectReminderScanResult }
   | { readonly kind: "project-agent-boundary-scan";
       readonly scannedCount: number; readonly createdCount: number; readonly suppressedCount: number }
+  | { readonly kind: "project-route-facts";
+      readonly result: { readonly status: "dependency_unavailable" } |
+        { readonly status: "ready"; readonly goalRevision: number;
+          readonly projectRevision: number } }
   | { readonly kind: "project-boundary-execution";
       readonly execution: ClaimedProjectBoundaryExecution | null }
   | { readonly kind: "execution"; readonly execution: AgentExecution }
@@ -583,6 +592,9 @@ export function isRuntimeAuthorityOperation(value: unknown): value is RuntimeAut
     return exact(value, ["type", "providerId", "modelId", "limit", "now"]) &&
       text(value.providerId) && text(value.modelId) && count(value.limit, 1) &&
       value.limit <= 256 && count(value.now);
+  }
+  if (value.type === "runtime.read-project-route-facts") {
+    return exact(value, ["type", "roomId", "now"]) && text(value.roomId) && count(value.now);
   }
   if (value.type === "runtime.begin-project-boundary-execution") {
     return exact(value, ["type", "executionId", "expectedVersion", "now"]) &&

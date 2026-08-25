@@ -795,10 +795,30 @@ async function start(
       provider: routerProvider,
       memoryReadiness: { read: memoryAuthority.readReadiness },
       projectFacts: {
-        async read() {
-          // FT-09 owns versioned Goal/checkpoint/due/Blocker facts. Until that
-          // authority is installed, proactive routing must stop before Provider.
-          return { status: "dependency_unavailable" } as const;
+        async read(roomId) {
+          const result = await authorityWorker.executeRuntime({
+            type: "runtime.read-project-route-facts", roomId, now: Date.now(),
+          });
+          if (typeof result !== "object" || result === null || !("kind" in result) ||
+              result.kind !== "project-route-facts" || !("result" in result)) {
+            throw new Error("Project route facts result was malformed");
+          }
+          const facts = result.result;
+          if (typeof facts !== "object" || facts === null || !("status" in facts)) {
+            throw new Error("Project route facts result was malformed");
+          }
+          if (facts.status === "dependency_unavailable") {
+            return { status: "dependency_unavailable" } as const;
+          }
+          if (facts.status !== "ready" || !("goalRevision" in facts) ||
+              !("projectRevision" in facts) || typeof facts.goalRevision !== "number" ||
+              !Number.isSafeInteger(facts.goalRevision) || facts.goalRevision < 1 ||
+              typeof facts.projectRevision !== "number" ||
+              !Number.isSafeInteger(facts.projectRevision) || facts.projectRevision < 1) {
+            throw new Error("Project route facts result was malformed");
+          }
+          return { status: "ready", goalRevision: facts.goalRevision,
+            projectRevision: facts.projectRevision } as const;
         },
       },
       agentReadiness: () => testOptions.agentRuntimeProviderForTest !== undefined ||
