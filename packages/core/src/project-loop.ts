@@ -517,7 +517,8 @@ export function isProjectDecision(value: unknown): value is ProjectDecision {
   const rejected = value.rejectedBy !== null && value.rejectedAt !== null && value.rejectionReason !== null;
   switch (value.status) {
     case "proposed": return noConfirmation && noRejection && value.supersededByDecisionId === null && value.supersedeReason === null;
-    case "confirmed": return confirmed && noRejection && value.supersededByDecisionId === null && value.supersedeReason === null;
+    case "confirmed": return confirmed && noRejection && value.supersededByDecisionId === null &&
+      (value.supersedesDecisionId === null ? value.supersedeReason === null : value.supersedeReason !== null);
     case "rejected": return noConfirmation && rejected && value.supersedesDecisionId === null &&
       value.supersededByDecisionId === null && value.supersedeReason === null;
     case "superseded": return confirmed && noRejection && value.supersededByDecisionId !== null && value.supersedeReason !== null;

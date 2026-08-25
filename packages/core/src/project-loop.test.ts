@@ -233,6 +233,10 @@ describe("FT-09 Project Loop closed core contracts", () => {
       confirmedAt: null,
     })).toBe(true);
     expect(isProjectDecision(proposedDecision)).toBe(true);
+    expect(isProjectDecision({ ...proposedDecision, status: "confirmed", confirmedBy: human1,
+      confirmedAt: at, supersedesDecisionId: "decision-0", supersedeReason: "New evidence" })).toBe(true);
+    expect(isProjectDecision({ ...proposedDecision, status: "confirmed", confirmedBy: human1,
+      confirmedAt: at, supersedesDecisionId: "decision-0", supersedeReason: null })).toBe(false);
     expect(isProjectRequest(pendingRequest)).toBe(true);
     expect(isProjectNextAction(humanAction)).toBe(true);
     expect(isProjectObstacle(blocker)).toBe(true);
