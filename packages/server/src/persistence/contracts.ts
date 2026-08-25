@@ -1,5 +1,9 @@
 import {
   isActor,
+  isAgentExecution as isCanonicalAgentExecution,
+  isAgentExecutionAttempt,
+  isAgentExecutionRetryReceipt,
+  isAgentInvocationIntent,
   isLegacyAgentExecution as isAgentExecution,
   isAgentJudgement,
   isAgentRoomMembership,
@@ -20,6 +24,8 @@ import {
   isRoomAgentAssignmentProjection,
   isRouteJob,
   isRouteJudgment,
+  isProjectBoundaryInvocationResult,
+  isScopedCancellationReceipt,
 } from "@native-im/core";
 import type {
   LegacyAgentExecutionStatus as AgentExecutionStatus,
@@ -1217,6 +1223,26 @@ function validRoomEventPayload(
   }
   if (type === "room.agent_execution.changed") {
     return isAgentExecution(payload) && payload.roomId === roomId && payload.agentId === eventActorId;
+  }
+  if (type === "agent.invocation.intent.changed") {
+    return isAgentInvocationIntent(payload) && payload.roomId === roomId;
+  }
+  if (type === "agent.execution.changed") {
+    return isCanonicalAgentExecution(payload) && payload.roomId === roomId &&
+      payload.agentId === eventActorId;
+  }
+  if (type === "agent.execution.attempt.changed") {
+    return isAgentExecutionAttempt(payload) && payload.roomId === roomId &&
+      payload.agentId === eventActorId;
+  }
+  if (type === "agent.execution.retry.accepted") {
+    return isAgentExecutionRetryReceipt(payload) && payload.roomId === roomId;
+  }
+  if (type === "agent.invocation.scoped-cancellation.committed") {
+    return isScopedCancellationReceipt(payload) && payload.roomId === roomId;
+  }
+  if (type === "project.boundary.invocation.decided") {
+    return isProjectBoundaryInvocationResult(payload) && payload.roomId === roomId;
   }
   if (
     type === "agent.execution.queued" || type === "agent.execution.started" ||

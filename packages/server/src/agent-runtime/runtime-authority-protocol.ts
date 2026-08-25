@@ -49,6 +49,13 @@ export type RuntimeAuthorityOperation =
       readonly modelId: string;
       readonly now: number;
     }
+  | {
+      readonly type: "runtime.claim-pending-direct-intents";
+      readonly providerId: string;
+      readonly modelId: string;
+      readonly limit: number;
+      readonly now: number;
+    }
   | { readonly type: "runtime.claim"; readonly executionId: string; readonly attemptSeq: number; readonly now: number }
   | {
       readonly type: "runtime.complete";
@@ -199,6 +206,11 @@ export type RuntimeAuthorityOperationResult =
       readonly execution: AgentExecution;
       readonly intent: AgentInvocationIntent;
       readonly replayed: boolean;
+    }
+  | {
+      readonly kind: "direct-intent-claims";
+      readonly records: readonly RuntimeRecoveryRecord[];
+      readonly hasMore: boolean;
     }
   | { readonly kind: "execution"; readonly execution: AgentExecution }
   | {
@@ -359,6 +371,11 @@ export function isRuntimeAuthorityOperation(value: unknown): value is RuntimeAut
     return exact(value, ["type", "routeJobId", "intent", "executionId", "intentId", "providerId", "modelId", "now"]) &&
       text(value.routeJobId) && invocationIntent(value.intent) && text(value.executionId) &&
       text(value.intentId) && text(value.providerId) && text(value.modelId) && count(value.now);
+  }
+  if (value.type === "runtime.claim-pending-direct-intents") {
+    return exact(value, ["type", "providerId", "modelId", "limit", "now"]) &&
+      text(value.providerId) && text(value.modelId) && count(value.limit, 1) &&
+      value.limit <= 256 && count(value.now);
   }
   if (value.type === "runtime.claim") {
     return exact(value, ["type", "executionId", "attemptSeq", "now"]) && text(value.executionId) && count(value.attemptSeq, 1) && count(value.now);

@@ -22,6 +22,7 @@ import type {
 } from "@native-im/core";
 import {
   isLightTask,
+  isAgentInvocationIntent,
   isAgentFinalMessage,
   isHumanMessageSubmit,
   isMessageRevision,
@@ -41,6 +42,7 @@ import type {
   RuntimeAuthorityOperation,
   RuntimeAuthorityOperationResult,
 } from "../agent-runtime/runtime-authority-protocol.js";
+import type { RuntimeRecoveryRecord } from "../agent-runtime/contracts.js";
 import type { ScopedCancellationCommitReceipt } from
   "../scoped-cancellation/scoped-cancellation-orchestrator.js";
 import type {
@@ -5253,6 +5255,63 @@ function appendCanonicalRuntimeEvents(
     occurredAt, "runtime-canonical-attempt", transition);
 }
 
+function appendCanonicalInvocationIntentEvent(
+  database: DatabaseSync,
+  intentId: string,
+  occurredAt: string,
+  transition: string,
+): void {
+  const row = database.prepare(
+    `SELECT intent.id AS intentId, intent.lineage_id AS lineageId,
+            intent.turn_id AS turnId, intent.room_id AS roomId,
+            intent.source_message_id AS sourceMessageId,
+            intent.source_revision AS sourceRevision, intent.target_id AS targetId,
+            intent.target_agent_id AS agentId,
+            intent.message_transaction_id AS messageTransactionId,
+            intent.status, intent.created_at AS createdAt,
+            intent.claimed_at AS claimedAt, intent.cancelled_at AS cancelledAt,
+            intent.cancellation_reason AS cancellationReason,
+            intent.supersedes_intent_id AS supersedesIntentId,
+            binding.profile_revision AS profileRevision,
+            binding.assignment_revision AS assignmentRevision,
+            binding.access_revision AS accessRevision
+     FROM agent_invocation_intents AS intent
+     JOIN direct_agent_invocation_authority_bindings AS binding
+       ON binding.intent_id = intent.id
+     WHERE intent.id = ? AND intent.origin_kind = 'message_target'`,
+  ).get(intentId);
+  if (typeof row?.intentId !== "string" || typeof row.lineageId !== "string" ||
+      typeof row.turnId !== "string" || typeof row.roomId !== "string" ||
+      typeof row.sourceMessageId !== "string" || typeof row.targetId !== "string" ||
+      typeof row.agentId !== "string" || typeof row.messageTransactionId !== "string") return;
+  const intent = {
+    intentId: row.intentId, lineageId: row.lineageId, turnId: row.turnId,
+    roomId: row.roomId, sourceMessageId: row.sourceMessageId,
+    sourceRevision: row.sourceRevision, targetId: row.targetId, agentId: row.agentId,
+    origin: { kind: "message_target" as const,
+      messageTransactionId: row.messageTransactionId, targetId: row.targetId },
+    profileRevision: row.profileRevision, assignmentRevision: row.assignmentRevision,
+    accessRevision: row.accessRevision, status: row.status, createdAt: row.createdAt,
+    ...(typeof row.claimedAt === "string" ? { claimedAt: row.claimedAt } : {}),
+    ...(typeof row.cancelledAt === "string" ? { cancelledAt: row.cancelledAt } : {}),
+    ...(typeof row.cancellationReason === "string"
+      ? { cancellationReason: row.cancellationReason } : {}),
+    ...(typeof row.supersedesIntentId === "string"
+      ? { supersedesIntentId: row.supersedesIntentId } : {}),
+  };
+  if (!isAgentInvocationIntent(intent)) {
+    return fail("storage_unavailable", "Canonical invocation intent projection was corrupt");
+  }
+  const eventId = stableId("runtime-canonical-intent", intentId, transition);
+  const streamSeq = appendRoomEvent(database, {
+    eventId, roomId: intent.roomId, actorId: intent.agentId,
+    eventType: "agent.invocation.intent.changed", occurredAt,
+    payload: intent as unknown as JsonValue,
+  });
+  appendRoomOutbox(database, eventId, intent.roomId, streamSeq, occurredAt,
+    "runtime-canonical-intent", transition);
+}
+
 function appendRuntimeExecutionEvent(
   database: DatabaseSync,
   execution: AgentExecution,
@@ -6886,6 +6945,134 @@ export function executeRuntimeAuthorityOperation(
           cursor: operation.cursor,
         }).rawDelta,
       };
+    }
+    if (operation.type === "runtime.claim-pending-direct-intents") {
+      const candidates = database.prepare(
+        `SELECT intent.id AS intentId, intent.room_id AS roomId,
+                intent.source_message_id AS sourceMessageId,
+                intent.target_agent_id AS targetAgentId,
+                intent.requester_actor_id AS requesterActorId,
+                intent.intent_kind AS intentKind
+         FROM agent_invocation_intents AS intent
+         JOIN direct_agent_invocation_authority_bindings AS binding
+           ON binding.intent_id = intent.id
+         JOIN rooms AS room ON room.id = intent.room_id AND room.status = 'active'
+         JOIN messages AS source
+           ON source.id = intent.source_message_id
+          AND source.room_id = intent.room_id
+          AND source.author_id = intent.requester_actor_id
+          AND source.author_kind = 'human'
+         JOIN message_envelopes AS envelope
+           ON envelope.message_id = source.id
+          AND envelope.room_id = source.room_id
+          AND envelope.message_kind = 'human'
+          AND envelope.lifecycle = 'active'
+          AND envelope.current_revision = intent.source_revision
+         JOIN agent_profiles AS profile
+           ON profile.id = binding.profile_id
+          AND profile.actor_id = intent.target_agent_id
+          AND profile.revision = binding.profile_revision
+          AND profile.status = 'enabled'
+         JOIN room_agent_assignments AS assignment
+           ON assignment.id = binding.assignment_id
+          AND assignment.room_id = intent.room_id
+          AND assignment.agent_actor_id = intent.target_agent_id
+          AND assignment.profile_id = binding.profile_id
+          AND assignment.revision = binding.assignment_revision
+          AND assignment.status = 'current'
+          AND assignment.paused = 0
+          AND assignment.participation IN ('active', 'on-mention')
+         JOIN room_memberships AS membership
+           ON membership.room_id = intent.room_id
+          AND membership.actor_id = intent.target_agent_id
+          AND membership.kind = 'agent'
+          AND membership.access_revision = binding.access_revision
+         WHERE intent.origin_kind = 'message_target'
+           AND intent.status = 'pending' AND intent.execution_id IS NULL
+         ORDER BY intent.created_at, intent.id
+         LIMIT ?`,
+      ).all(operation.limit);
+      const records: RuntimeRecoveryRecord[] = [];
+      for (const candidate of candidates) {
+        if (typeof candidate.intentId !== "string" || typeof candidate.roomId !== "string" ||
+            typeof candidate.sourceMessageId !== "string" ||
+            typeof candidate.targetAgentId !== "string" ||
+            typeof candidate.requesterActorId !== "string" ||
+            (candidate.intentKind !== "direct_mention" &&
+              candidate.intentKind !== "structured_help")) {
+          return fail("storage_unavailable", "Pending direct invocation candidate was corrupt");
+        }
+        const live = database.prepare(
+          `SELECT COUNT(*) AS count FROM agent_executions
+           WHERE room_id = ? AND status IN ('queued', 'running')`,
+        ).get(candidate.roomId);
+        if (typeof live?.count !== "number") {
+          return fail("storage_unavailable", "Direct invocation admission count was corrupt");
+        }
+        if (live.count >= 32) continue;
+        const executionId = stableId("direct-runtime-execution", candidate.intentId, "1");
+        const roomArchiveGeneration = currentRoomArchiveGeneration(database, candidate.roomId);
+        requireRuntimeGenerationAllowed(
+          database, candidate.roomId, roomArchiveGeneration,
+          stableId("direct-intent-consumer-generation", candidate.intentId),
+        );
+        database.prepare(
+          `INSERT INTO agent_executions (
+             id, room_id, room_archive_generation, agent_id, trigger_message_id, status,
+             started_at, completed_at, result_json, requester_actor_id, tool_name,
+             action_category, tool_dispatch_phase, current_attempt_seq, retry_cycle,
+             retry_ordinal, provider_id, model_id, recovery_cursor, queued_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, 'queued', ?, NULL, NULL, ?, 'model.generate',
+                     'model_generation', NULL, 1, 1, 1, ?, ?, 0, ?, ?)`,
+        ).run(
+          executionId, candidate.roomId, roomArchiveGeneration, candidate.targetAgentId,
+          candidate.sourceMessageId, occurredAt, candidate.requesterActorId,
+          operation.providerId, operation.modelId, occurredAt, occurredAt,
+        );
+        database.prepare(
+          `INSERT INTO agent_execution_attempts (
+             execution_id, attempt_seq, retry_cycle, retry_ordinal, status,
+             action_category, started_at, finished_at, error_code, next_retry_at,
+             recovery_cursor
+           ) VALUES (?, 1, 1, 1, 'queued', 'model_generation', NULL, NULL, NULL, NULL, 0)`,
+        ).run(executionId);
+        const claimed = database.prepare(
+          `UPDATE agent_invocation_intents SET status = 'claimed', claimed_at = ?
+           WHERE id = ? AND origin_kind = 'message_target'
+             AND status = 'pending' AND execution_id IS NULL`,
+        ).run(occurredAt, candidate.intentId);
+        if (claimed.changes !== 1) {
+          return fail("execution_conflict", "Pending direct invocation changed concurrently");
+        }
+        appendCanonicalInvocationIntentEvent(
+          database, candidate.intentId, occurredAt, "claimed",
+        );
+        database.prepare(
+          `INSERT INTO agent_execution_intent_links (
+             intent_id, execution_id, execution_ordinal, retry_of_execution_id,
+             source_revision, linked_at
+           ) VALUES (?, ?, 1, NULL, 1, ?)`,
+        ).run(candidate.intentId, executionId, occurredAt);
+        const execution = runtimeExecutionById(database, executionId);
+        requireRuntimeFrozenHandoff(database, execution.id);
+        appendRuntimeExecutionEvent(database, execution, occurredAt, "queued");
+        records.push({
+          execution,
+          intent: {
+            kind: candidate.intentKind,
+            roomId: candidate.roomId,
+            sourceMessageId: candidate.sourceMessageId,
+            targetAgentId: candidate.targetAgentId,
+          },
+          outcome: "enqueue",
+        });
+      }
+      const remaining = database.prepare(
+        `SELECT 1 AS present FROM agent_invocation_intents
+         WHERE origin_kind = 'message_target' AND status = 'pending'
+           AND execution_id IS NULL LIMIT 1`,
+      ).get();
+      return { kind: "direct-intent-claims", records, hasMore: remaining?.present === 1 };
     }
     if (operation.type === "runtime.invoke") {
       const requesterId = operation.context.kind === "human"
@@ -9242,6 +9429,9 @@ export function submitHumanMessageDatabaseCommand(
               directAuthority!.assignmentRevision as number,
               membership.accessRevision as number,
             );
+            appendCanonicalInvocationIntentEvent(
+              database, invocationIntentId, persistedAt, "pending",
+            );
             outcome = {
               targetId: target.id,
               targetActorId: target.targetActorId,
@@ -10246,6 +10436,12 @@ export function commitAgentMessageDatabaseCommand(
         appendRoomOutbox(
           database, eventId, input.command.roomId, streamSeq, persistedAt,
           scope, input.command.messageId,
+        );
+        appendRuntimeExecutionEvent(
+          database,
+          runtimeExecutionById(database, input.context.executionId),
+          persistedAt,
+          "completed",
         );
         return {
           messageId: input.command.messageId,

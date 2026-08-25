@@ -257,6 +257,7 @@ async function start(
   let snapshots: Awaited<ReturnType<typeof createSnapshotWorkerClient>> | undefined;
   let transport: Awaited<ReturnType<typeof startMessageWebSocketServer>> | undefined;
   let runtime: AgentRuntimeService | undefined;
+  let kickDirectIntentConsumer: () => void = () => undefined;
   let sourceScopedRuntimeBoundary: SourceScopedRuntimeBoundary | undefined;
   let routeRuntime: RouteRuntimeService | undefined;
   let ballRuntime: BallRuntimeService | undefined;
@@ -598,6 +599,34 @@ async function start(
         }
       },
     });
+    let directIntentConsumer: Promise<void> | undefined;
+    const runtimeReady = (): boolean => testOptions.agentRuntimeProviderForTest !== undefined ||
+      secretProvider.getSecret("OPENAI_API_KEY") !== undefined;
+    kickDirectIntentConsumer = () => {
+      if (!runtimeReady() || directIntentConsumer !== undefined) return;
+      directIntentConsumer = (async () => {
+        while (runtime !== undefined && worker !== undefined) {
+          const result = await worker.executeRuntime({
+            type: "runtime.claim-pending-direct-intents",
+            providerId: provider.id,
+            modelId: runtimeModel,
+            limit: 256,
+            now: Date.now(),
+          });
+          if (typeof result !== "object" || result === null ||
+              !("kind" in result) || result.kind !== "direct-intent-claims" ||
+              !("records" in result) || !Array.isArray(result.records) ||
+              !("hasMore" in result) || typeof result.hasMore !== "boolean") {
+            throw new Error("Authority direct intent claim result was malformed");
+          }
+          if (result.records.length === 0) return;
+          await runtime.recover();
+          await runtime.whenIdle();
+        }
+      })().catch(() => undefined).finally(() => {
+        directIntentConsumer = undefined;
+      });
+    };
     sourceScopedRuntimeBoundary = createSourceScopedRuntimeBoundary({
       runtime: {
         applyCommittedMessageRecall(input) {
@@ -669,6 +698,7 @@ async function start(
       async submitHumanMessage(...args: Parameters<typeof authority.submitHumanMessage>) {
         const receipt = await authority.submitHumanMessage(...args);
         memoryRuntime?.enqueue(args[1].roomId);
+        kickDirectIntentConsumer();
         return {
           messageId: receipt.messageId,
           persistedAt: receipt.persistedAt,
@@ -806,6 +836,7 @@ async function start(
       settleAttachmentReader(attachmentExtractionReader);
     }
     await runtime.recover();
+    kickDirectIntentConsumer();
     await routeRuntime.recover();
     await ballRuntime.recover();
     const memoryProvider = createOpenAIMemoryStewardProvider({
