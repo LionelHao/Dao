@@ -582,6 +582,8 @@ async function start(
       model: runtimeModel,
       secretProvider,
     });
+    const agentProviderReady = testOptions.agentRuntimeProviderForTest !== undefined ||
+      secretProvider.getSecret("OPENAI_API_KEY") !== undefined;
     projectBoundaryRuntime = createProjectBoundaryRuntime({
       authority: authorityWorker,
       provider,
@@ -595,9 +597,7 @@ async function start(
     const projectBoundary: ProjectBoundaryInvocationProducer = Object.freeze({
       async consume(request: Parameters<ProjectBoundaryInvocationProducer["consume"]>[0]) {
         const result = await authoritativeProjectBoundary.consume(request);
-        if (result.status === "intent-created" &&
-            (testOptions.agentRuntimeProviderForTest !== undefined ||
-              secretProvider.getSecret("OPENAI_API_KEY") !== undefined)) {
+        if (result.status === "intent-created" && agentProviderReady) {
           await projectBoundaryRuntime?.scan();
         }
         return result;
@@ -614,6 +614,7 @@ async function start(
           type: "runtime.scan-project-agent-boundaries",
           providerId: provider.id,
           modelId: runtimeModel,
+          agentProviderReady,
           limit: 256,
           now,
         });
@@ -625,6 +626,7 @@ async function start(
           type: "runtime.scan-project-reminders",
           providerId: provider.id,
           modelId: runtimeModel,
+          agentProviderReady,
           limit: 256,
           now,
         });
@@ -632,8 +634,7 @@ async function start(
             !("kind" in reminderScan) || reminderScan.kind !== "project-reminder-scan") {
           throw new Error("Project reminder scan result was malformed");
         }
-        if (testOptions.agentRuntimeProviderForTest !== undefined ||
-            secretProvider.getSecret("OPENAI_API_KEY") !== undefined) {
+        if (agentProviderReady) {
           await projectBoundaryRuntime?.scan();
         }
       })().finally(() => { projectBoundaryScan = undefined; });
