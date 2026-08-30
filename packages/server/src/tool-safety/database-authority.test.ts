@@ -12,7 +12,12 @@ import {
   seedCanonicalRoomAssignmentFixture,
 } from "../fixtures/agent-authority-fixture.js";
 import type { AuthenticatedCommandContext } from "../persistence/contracts.js";
+import {
+  mintDatabaseAuthorityTransactionView,
+  releaseDatabaseAuthorityTransactionView,
+} from "../persistence/authority-transaction-database.js";
 import { migrateAuthorityDatabase } from "../persistence/schema.js";
+import { createArchiveToolSafetyParticipant } from "./archive-tool-safety-participant.js";
 import {
   executeToolSafetyAuthorityOperationInTransaction,
   settleToolSafetyExecutionFenceInTransaction,
@@ -862,6 +867,18 @@ describe("FT-10 SQLite tool-safety authority", () => {
         },
         now: NOW + 4_000,
       })).toMatchObject({ kind: "handoff", state: "accepted", version: 2 });
+      const repairedConfirmation = database.prepare(
+        `SELECT version, projection_json AS projectionJson
+         FROM tool_safety_repair_records_v2
+         WHERE kind = 'tool-confirmation' AND record_id = 'confirmation-handoff'`,
+      ).get() as { version: number; projectionJson: string };
+      expect(repairedConfirmation.version).toBe(2);
+      expect(JSON.parse(repairedConfirmation.projectionJson)).toMatchObject({
+        confirmationId: "confirmation-handoff",
+        state: "pending",
+        version: 2,
+        namedHumanDisplayRef: "Human FT10 B",
+      });
       expect(transact(database, {
         type: "tool-safety.handoff-read",
         context: context("accept-handoff", secondHuman),
@@ -887,6 +904,16 @@ describe("FT-10 SQLite tool-safety authority", () => {
         grantExpiresAt: new Date(NOW + 30_000).toISOString(),
         now: NOW + 6_000,
       })).toMatchObject({ kind: "confirmation-decision", state: "confirmed", version: 3 });
+      expect(() => transact(database, {
+        type: "tool-safety.confirmation-decide",
+        context: context("cross-session-duplicate", secondHuman),
+        confirmationId: "confirmation-handoff",
+        expectedVersion: 3,
+        decision: "confirm",
+        grantId: "grant-handoff-duplicate",
+        grantExpiresAt: new Date(NOW + 31_000).toISOString(),
+        now: NOW + 6_500,
+      })).toThrow(/already terminal/i);
       expect(transact(database, {
         type: "tool-safety.recover-execution",
         executionId: "execution-ft10",
@@ -901,6 +928,97 @@ describe("FT-10 SQLite tool-safety authority", () => {
           bindingGeneration: 2,
         },
       });
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("archives v2 pending authority with a stable event and outbox delivery in one transaction", () => {
+    const fixture = testDatabase();
+    const { database } = fixture;
+    try {
+      seedAuthority(database);
+      const parameters = parseToolParameters({
+        toolId: "sandbox-file.write",
+        argumentsJson: JSON.stringify({
+          path: "notes/archive.txt",
+          content: "archive",
+          expectedCurrentSha256: EMPTY_SHA256,
+        }),
+      });
+      const binding = transact(database, {
+        type: "tool-safety.read-prepare-binding",
+        executionId: "execution-ft10",
+        attemptSeq: 1,
+        toolId: "sandbox-file.write",
+        now: NOW + 1_000,
+      });
+      if (binding.kind !== "prepare-binding") throw new Error("missing binding");
+      transact(database, {
+        type: "tool-safety.prepare",
+        toolCallId: "tool-call-archive",
+        invocationId: binding.invocationId,
+        executionId: binding.executionId,
+        attemptSeq: binding.attemptSeq,
+        expectedExecutionVersion: binding.executionVersion,
+        toolId: "sandbox-file.write",
+        canonicalParameterSha256: parameters.canonicalParameterSha256,
+        parameterSchemaVersion: parameters.schemaVersion,
+        canonicalizerVersion: parameters.canonicalizerVersion,
+        safePreview: parameters.safePreview,
+        sealedPayload: {
+          ciphertext: "sealed-archive",
+          keyVersion: "test-key-v1",
+          expiresAt: new Date(NOW + 240_000).toISOString(),
+        },
+        confirmation: {
+          confirmationId: "confirmation-archive",
+          context: context("prepare-archive"),
+          bindingGeneration: 1,
+        },
+        now: NOW + 1_000,
+      });
+      const occurredAt = new Date(NOW + 2_000).toISOString();
+      database.exec("BEGIN IMMEDIATE");
+      const transaction = mintDatabaseAuthorityTransactionView(
+        database, "room-ft10", "archive-tool-safety-v2",
+      );
+      try {
+        database.prepare(
+          `UPDATE rooms SET status = 'archived', archive_generation = 1, archived_at = ?
+           WHERE id = 'room-ft10' AND status = 'active'`,
+        ).run(occurredAt);
+        const result = createArchiveToolSafetyParticipant().settleUndispatched(transaction, {
+          roomId: "room-ft10",
+          archiveGeneration: 1,
+          now: occurredAt,
+        });
+        expect(result).toMatchObject({ ok: true, result: { rejectedPendingCount: 1 } });
+        database.exec("COMMIT");
+      } catch (error) {
+        database.exec("ROLLBACK");
+        throw error;
+      } finally {
+        releaseDatabaseAuthorityTransactionView(transaction);
+      }
+      expect(database.prepare(
+        `SELECT state, reason FROM tool_confirmations_v2
+         WHERE confirmation_id = 'confirmation-archive'`,
+      ).get()).toEqual({ state: "rejected", reason: "room_archived" });
+      expect(database.prepare(
+        `SELECT COUNT(*) AS count FROM events
+         WHERE event_type = 'tool.safety.changed'
+           AND json_extract(payload_json, '$.kind') = 'tool-confirmation'
+           AND json_extract(payload_json, '$.value.confirmationId') = 'confirmation-archive'
+           AND json_extract(payload_json, '$.value.state') = 'rejected'`,
+      ).get()).toEqual({ count: 1 });
+      expect(database.prepare(
+        `SELECT COUNT(*) AS count FROM outbox_deliveries AS delivery
+         JOIN events AS event ON event.event_id = delivery.event_id
+         WHERE event.event_type = 'tool.safety.changed'
+           AND json_extract(event.payload_json, '$.value.confirmationId') = 'confirmation-archive'
+           AND json_extract(event.payload_json, '$.value.state') = 'rejected'`,
+      ).get()).toEqual({ count: 1 });
     } finally {
       fixture.close();
     }

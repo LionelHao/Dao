@@ -174,7 +174,7 @@ describe("Tool Safety production bridge", () => {
     runtime.close();
   });
 
-  it("purges authority and revokes the live surface on terminal and Room access loss", async () => {
+  it("preserves archived facts read-only, then purges authority on terminal and Room access loss", async () => {
     let terminal: (() => void) | undefined;
     let access: ((roomId: string, change: "removed" | "archived" | "restored") => void) | undefined;
     const clear = vi.fn();
@@ -190,12 +190,49 @@ describe("Tool Safety production bridge", () => {
       transport, authorityCache: cache, repairRoom: vi.fn(), createRequestId: () => "request-revoked" });
     runtime.start();
     expect((await runtime.getSurface({ roomId: "room-1" })).cards).toHaveLength(1);
+    access?.("room-1", "archived");
+    const archived = await runtime.getSurface({ roomId: "room-1" });
+    expect(archived.connection.status).toBe("archived");
+    expect(archived.cards).toHaveLength(1);
+    expect(transport.toolSafetyCommand).not.toHaveBeenCalled();
     access?.("room-1", "removed");
     expect((await runtime.getSurface({ roomId: "room-1" })).connection.status).toBe("revoked");
     expect(clearRoom).toHaveBeenCalledWith("room-1");
     terminal?.();
     expect(clear).toHaveBeenCalledOnce();
     expect((await runtime.getSurface({ roomId: "room-1" })).cards).toEqual([]);
+    runtime.close();
+  });
+
+  it("derives compensation states from current confirmation, grant and dispatch facts", async () => {
+    const compensationCall = { ...call, value: { ...call.value, toolCallId: "call-compensation" } } as const;
+    const confirmation = { ...pending, value: { ...pending.value, confirmationId: "confirmation-compensation",
+      toolCallId: "call-compensation", state: "confirmed" as const, version: 2 } };
+    const lineage = { kind: "tool-compensation", value: { lineageId: "lineage-1",
+      originalDispatchId: "dispatch-original", compensationInvocationId: "invocation-2",
+      compensationExecutionId: "execution-2", compensationToolCallId: "call-compensation",
+      state: "pending", version: 1 } } as const;
+    let records: readonly unknown[] = [compensationCall, confirmation, lineage];
+    const cache = { roomRepairRecords: () => records,
+      governanceProjection: () => ({ lifecycle: "active" }), roomIds: () => ["room-1"],
+      subscribeRoomRecords: () => () => undefined, clear: vi.fn(), clearRoom: vi.fn() } as unknown as DesktopAuthorityCache;
+    const transport = { toolSafetyCommand: vi.fn(), onTerminalRevoked: () => () => undefined,
+      onRoomAccessChanged: () => () => undefined, onConnectionFailure: () => () => undefined } as unknown as MessageAuthorityWireTransport;
+    const runtime = createDesktopToolSafetyRuntime({ session: () => ({ actorId: "human-1" }) as never,
+      transport, authorityCache: cache, repairRoom: vi.fn(), createRequestId: () => "request-compensation" });
+    runtime.start();
+    expect((await runtime.getSurface({ roomId: "room-1" })).cards[0]?.state).toBe("compensation-confirmed");
+    records = [...records, { kind: "tool-dispatch", value: { dispatchId: "dispatch-compensation",
+      toolCallId: "call-compensation", state: "claimed", reasonCode: null, version: 2 } }];
+    expect((await runtime.getSurface({ roomId: "room-1" })).cards[0]?.state).toBe("compensation-dispatched");
+    records = records.map((entry) => (entry as { kind?: string }).kind === "tool-dispatch"
+      ? { kind: "tool-dispatch", value: { dispatchId: "dispatch-compensation",
+        toolCallId: "call-compensation", state: "outcome_unknown", reasonCode: "adapter_ambiguous", version: 3 } }
+      : entry);
+    records = [...records, { kind: "tool-review", value: { reviewId: "review-compensation",
+      dispatchId: "dispatch-compensation", resolution: "accepted_risk", evidenceSummary: "checked",
+      namedHumanDisplayRef: "Human A", compensationToolCallId: null, version: 4 } }];
+    expect((await runtime.getSurface({ roomId: "room-1" })).cards[0]?.state).toBe("reviewed");
     runtime.close();
   });
 });

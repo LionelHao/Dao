@@ -1,6 +1,7 @@
 export type ToolSafetyConnection =
   | { readonly status: "online" }
   | { readonly status: "offline" }
+  | { readonly status: "archived" }
   | { readonly status: "repairing" }
   | { readonly status: "repair-failed"; readonly errorCode: string }
   | { readonly status: "revoked" };
@@ -321,6 +322,7 @@ export function renderToolSafetySurface(
     state.card.state === "compensation-outcome-unknown" ||
     state.card.state === "principal-revoked" ? "alert" : "status");
   if (state.connection.status === "offline") status.textContent = "离线只读；所有写操作已关闭，未建立离线队列";
+  else if (state.connection.status === "archived") status.textContent = "Room 已归档；保留工具安全事实，只读显示且所有写操作已关闭";
   else if (state.connection.status === "repairing") status.textContent = "repair 进行中；保留上一份完整只读 projection";
   else if (state.connection.status === "repair-failed") status.textContent = `repair 失败：${state.connection.errorCode}；保留上一份完整只读 projection`;
   else if (state.connection.status === "revoked") status.textContent = "Room 权限已撤销；敏感预览必须清除并重新认证";

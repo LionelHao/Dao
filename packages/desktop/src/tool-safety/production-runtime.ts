@@ -35,7 +35,7 @@ type ToolRecord =
       readonly compensationToolCallId: string | null; readonly version: number } }
   | { readonly kind: "tool-handoff"; readonly value: { readonly handoffId: string; readonly confirmationId: string;
       readonly state: "offered" | "accepted" | "rejected" | "expired";
-      readonly targetNamedHumanDisplayRef: string; readonly version: number } }
+      readonly targetActorId: string; readonly targetNamedHumanDisplayRef: string; readonly version: number } }
   | { readonly kind: "tool-compensation"; readonly value: { readonly lineageId: string;
       readonly originalDispatchId: string; readonly compensationInvocationId: string;
       readonly compensationExecutionId: string; readonly compensationToolCallId: string;
@@ -84,7 +84,7 @@ function isToolRecord(value: unknown): value is ToolRecord {
     (payload.compensationToolCallId === null || text(payload.compensationToolCallId)) && version(payload.version);
   if (value.kind === "tool-handoff") return text(payload.handoffId) && text(payload.confirmationId) &&
     ["offered", "accepted", "rejected", "expired"].includes(String(payload.state)) &&
-    text(payload.targetNamedHumanDisplayRef) && version(payload.version);
+    text(payload.targetActorId) && text(payload.targetNamedHumanDisplayRef) && version(payload.version);
   return value.kind === "tool-compensation" && text(payload.lineageId) && text(payload.originalDispatchId) &&
     text(payload.compensationInvocationId) && text(payload.compensationExecutionId) &&
     text(payload.compensationToolCallId) && ["pending", "rejected", "expired", "claimed", "dispatched",
@@ -133,7 +133,8 @@ function buildCards(records: readonly unknown[], viewerActorId: string): readonl
     const review = dispatch === undefined ? undefined : reviews.find((entry) =>
       entry.value.dispatchId === dispatch.value.dispatchId);
     const handoff = confirmation === undefined ? undefined : handoffs.find((entry) =>
-      entry.value.confirmationId === confirmation.value.confirmationId && entry.value.state === "offered");
+      entry.value.confirmationId === confirmation.value.confirmationId && entry.value.state === "offered" &&
+      entry.value.targetActorId === viewerActorId);
     const lineage = compensations.find((entry) => entry.value.compensationToolCallId === call.value.toolCallId);
     const originalLineage = dispatch === undefined ? undefined : compensations.find((entry) =>
       entry.value.originalDispatchId === dispatch.value.dispatchId);
@@ -142,9 +143,24 @@ function buildCards(records: readonly unknown[], viewerActorId: string): readonl
     if (preview === undefined) continue;
     let state: ToolSafetyCardProjection["state"];
     let currentVersion: number;
-    if (lineage !== undefined) {
+    if (lineage !== undefined && (review !== undefined || dispatch?.value.state === "reviewed")) {
+      state = "reviewed"; currentVersion = review?.value.version ?? dispatch!.value.version;
+    } else if (lineage !== undefined && dispatch !== undefined) {
+      const mapping = { prepared: "compensation-dispatched", claimed: "compensation-dispatched",
+        dispatched: "compensation-dispatched", known_succeeded: "compensation-known-succeeded",
+        known_failed: "compensation-known-failed", outcome_unknown: "compensation-outcome-unknown" } as const;
+      state = mapping[dispatch.value.state as keyof typeof mapping]; currentVersion = dispatch.value.version;
+    } else if (lineage !== undefined && grant?.value.state === "revoked") {
+      state = "grant-revoked"; currentVersion = grant.value.version;
+    } else if (lineage !== undefined && grant?.value.state === "expired") {
+      state = "expired"; currentVersion = grant.value.version;
+    } else if (lineage !== undefined && confirmation !== undefined) {
+      const mapping = { pending: "compensation-pending", confirmed: "compensation-confirmed",
+        rejected: "rejected", expired: "expired" } as const;
+      state = mapping[confirmation.value.state]; currentVersion = confirmation.value.version;
+    } else if (lineage !== undefined) {
       const mapping = {
-        pending: "compensation-pending", rejected: "rejected", expired: "expired",
+        pending: "compensation-proposed", rejected: "rejected", expired: "expired",
         claimed: "compensation-dispatched", dispatched: "compensation-dispatched",
         known_succeeded: "compensation-known-succeeded", known_failed: "compensation-known-failed",
         outcome_unknown: "compensation-outcome-unknown", reviewed: "reviewed",
@@ -156,8 +172,10 @@ function buildCards(records: readonly unknown[], viewerActorId: string): readonl
       const mapping = { prepared: "dispatched", claimed: "dispatched", dispatched: "dispatched",
         known_succeeded: "known-succeeded", known_failed: "known-failed", outcome_unknown: "outcome-unknown" } as const;
       state = mapping[dispatch.value.state as keyof typeof mapping]; currentVersion = dispatch.value.version;
-    } else if (grant?.value.state === "revoked" || grant?.value.state === "expired") {
+    } else if (grant?.value.state === "revoked") {
       state = "grant-revoked"; currentVersion = grant.value.version;
+    } else if (grant?.value.state === "expired") {
+      state = "expired"; currentVersion = grant.value.version;
     } else {
       const mapping = { pending: "pending", confirmed: "confirmed", rejected: "rejected", expired: "expired" } as const;
       state = mapping[confirmation!.value.state]; currentVersion = confirmation!.value.version;
@@ -223,8 +241,10 @@ export function createDesktopToolSafetyRuntime(options: Readonly<{
     const session = options.session();
     const records = options.authorityCache.roomRepairRecords(roomId);
     const governance = options.authorityCache.governanceProjection(roomId);
-    const connection = session === undefined || governance?.lifecycle === "archived"
-      ? { status: "revoked" as const } : connections.get(roomId) ??
+    const connection = session === undefined
+      ? { status: "revoked" as const }
+      : governance?.lifecycle === "archived"
+        ? { status: "archived" as const } : connections.get(roomId) ??
         (records === undefined ? { status: "repairing" as const } : { status: "online" as const });
     const cards = session === undefined || connection.status === "revoked" || records === undefined
       ? [] : buildCards(records as readonly unknown[], session.actorId).map((card) => {
@@ -268,7 +288,8 @@ export function createDesktopToolSafetyRuntime(options: Readonly<{
   });
   const unsubscribeAccess = options.transport.onRoomAccessChanged((roomId, change) => {
     if (change === "removed" || change === "archived") {
-      connections.set(roomId, { status: "revoked" }); operations.set(roomId, { status: "idle" }); emit(roomId);
+      connections.set(roomId, { status: change === "removed" ? "revoked" : "archived" });
+      operations.set(roomId, { status: "idle" }); emit(roomId);
       if (change === "removed") options.authorityCache.clearRoom(roomId);
     } else void repair(roomId);
   });
@@ -309,7 +330,20 @@ export function createDesktopToolSafetyRuntime(options: Readonly<{
       operations.set(request.roomId, { status: "submitting", requestId, action: commandAction });
       emit(request.roomId);
       try {
-        await options.transport.toolSafetyCommand({ ...request.command, requestId });
+        const acknowledgement = await options.transport.toolSafetyCommand({ ...request.command, requestId });
+        if (acknowledgement.replayed) {
+          if (commandCard !== undefined) {
+            const overrides = displayOverrides.get(request.roomId) ?? new Map();
+            overrides.set(commandCard.toolCallId, { state: "duplicate", version: commandCard.version });
+            displayOverrides.set(request.roomId, overrides);
+          }
+          operations.set(request.roomId, { status: "error", requestId, action: commandAction,
+            statusCode: 409, code: "confirmation_replayed" });
+          await repair(request.roomId);
+          operations.set(request.roomId, { status: "error", requestId, action: commandAction,
+            statusCode: 409, code: "confirmation_replayed" });
+          return emit(request.roomId);
+        }
         operations.set(request.roomId, { status: "acknowledged", requestId, action: commandAction });
         emit(request.roomId);
         const repaired = await repair(request.roomId);
@@ -332,7 +366,7 @@ export function createDesktopToolSafetyRuntime(options: Readonly<{
           catch { connections.set(request.roomId, { status: "repair-failed", errorCode: "repair_unavailable" }); }
         }
         if (failure.status === 409 && commandCard !== undefined &&
-            ["tool_already_terminal", "confirmation_already_terminal", "already_handled"]
+            ["tool_already_terminal", "confirmation_already_terminal", "confirmation_replayed", "already_handled"]
               .includes(failure.code)) {
           const overrides = displayOverrides.get(request.roomId) ?? new Map();
           overrides.set(commandCard.toolCallId, { state: "duplicate", version: commandCard.version });

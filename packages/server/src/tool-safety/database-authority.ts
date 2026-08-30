@@ -360,6 +360,7 @@ function writeRepair(
     publicValue = database.prepare(
       `SELECT handoff.handoff_id AS handoffId,
               handoff.confirmation_id AS confirmationId, handoff.state,
+              handoff.to_principal_human_actor_id AS targetActorId,
               actor.display_name AS targetNamedHumanDisplayRef,
               CASE handoff.state WHEN 'offered' THEN 1 ELSE 2 END AS version
        FROM tool_confirmation_handoffs_v2 AS handoff
@@ -474,6 +475,20 @@ function writeRepair(
        ) VALUES (?, ?, 'room', ?, ?, 'pending', 0, ?, NULL, NULL)`,
     ).run(stableId("tool-safety-outbox", eventId), eventId, roomId, streamSeq, occurredAt);
   }
+}
+
+/** Shared transaction-local writer for lifecycle participants that terminalize FT-10 facts. */
+export function writeToolSafetyProjectionInTransaction(
+  database: DatabaseSync,
+  kind: "tool-call" | "tool-confirmation" | "tool-grant" | "tool-dispatch" |
+    "tool-review" | "tool-handoff" | "tool-compensation",
+  id: string,
+  roomId: string,
+  version: number,
+  projection: Readonly<Record<string, unknown>>,
+  occurredAt: string,
+): void {
+  writeRepair(database, kind, id, roomId, version, projection, occurredAt);
 }
 
 function prepare(
@@ -726,15 +741,6 @@ function decide(
   }
   requireHumanMembership(database, row.roomId as string, actorId);
   if (row.state !== "pending") {
-    const requested = operation.decision === "confirm" ? "confirmed" : "rejected";
-    if (row.state === requested) {
-      const grant = database.prepare(
-        "SELECT grant_id AS id FROM tool_grants_v2 WHERE tool_call_id = ?",
-      ).get(row.toolCallId as string);
-      return { kind: "confirmation-decision", confirmationId: operation.confirmationId,
-        state: requested, version: row.version as number,
-        ...(typeof grant?.id === "string" ? { grantId: grant.id } : {}), replayed: true };
-    }
     return fail("confirmation_replayed", "Tool confirmation is already terminal");
   }
   if (row.version !== operation.expectedVersion) {
@@ -1429,6 +1435,11 @@ function acceptHandoff(
      SET state = 'accepted', accepted_by_human_actor_id = ?, resolved_at = ?
      WHERE handoff_id = ? AND state = 'offered'`,
   ).run(actorId, occurredAt, operation.handoffId);
+  writeRepair(database, "tool-confirmation", row.confirmationId as string,
+    row.roomId as string, nextVersion, {
+      confirmationId: row.confirmationId, toolCallId: row.toolCallId,
+      state: "pending", version: nextVersion,
+    }, occurredAt);
   writeRepair(database, "tool-handoff", operation.handoffId, row.roomId as string, 2,
     { handoffId: operation.handoffId, confirmationId: row.confirmationId,
       state: "accepted", targetActorId: actorId, version: 2 }, occurredAt);
