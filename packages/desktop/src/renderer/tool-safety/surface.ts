@@ -273,7 +273,8 @@ export function renderToolSafetySurface(
     }));
   }
   if ((state.card.state === "outcome-unknown" || state.card.state === "compensation-outcome-unknown") &&
-      state.card.dispatchId !== undefined) {
+      state.card.dispatchId !== undefined &&
+      state.card.canDecide === true) {
     const label = document.createElement("label");
     label.textContent = "Human 审查证据摘要";
     const evidence = document.createElement("textarea");

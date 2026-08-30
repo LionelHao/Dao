@@ -320,6 +320,15 @@ describe("FT-10 J-05 tool-safety surface", () => {
 
     importedApp.renderToolSafetySurface(root, {
       connection: { status: "online" },
+      card: { ...card("outcome-unknown"), canDecide: false },
+      operation: { status: "idle" },
+    }, unknownActions);
+    expect(root.querySelector("[data-tool-safety-evidence]")).toBeNull();
+    expect(root.querySelector("[data-tool-safety-action='review']")).toBeNull();
+    expect(root.querySelector("[data-tool-safety-action='compensate']")).toBeNull();
+
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" },
       card: { ...card("outcome-unknown"), compensationKnownSucceeded: true,
         evidenceSummary: "Compensation dispatch is known_succeeded." },
       operation: { status: "idle" },

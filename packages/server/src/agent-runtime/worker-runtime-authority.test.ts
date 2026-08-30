@@ -613,12 +613,14 @@ describe("real AuthorityWorker runtime authority", () => {
         root: directory,
         compensationKey: new Uint8Array(32).fill(9),
         maxContentBytes: 1_024,
+        testOnlyAllowPathFallback: process.platform !== "linux",
       });
       const gitAdapter = createRepositoryGitStatusAdapter({
         binaryPath: "/usr/bin/git",
         repositoryRoot: process.cwd(),
         maxOutputBytes: 256 * 1_024,
         timeoutMs: 5_000,
+        testOnlyAllowPathFallback: process.platform !== "linux",
       });
       let gateway = createToolGateway({ authority, adapters: [sandboxAdapter, gitAdapter] });
       const writeOutcome = await gateway.execute({

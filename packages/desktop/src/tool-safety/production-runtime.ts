@@ -111,7 +111,11 @@ function action(command: ToolSafetyCommand): ToolSafetyAction {
   return "compensate";
 }
 
-function buildCards(records: readonly unknown[], viewerActorId: string): readonly ToolSafetyCardProjection[] {
+function buildCards(
+  records: readonly unknown[],
+  viewerActorId: string,
+  roomOwnerActorId: string | undefined,
+): readonly ToolSafetyCardProjection[] {
   const tools = records.filter(isToolRecord);
   const calls = tools.filter((entry): entry is Extract<ToolRecord, { kind: "tool-call" }> => entry.kind === "tool-call");
   const confirmations = tools.filter((entry): entry is Extract<ToolRecord, { kind: "tool-confirmation" }> =>
@@ -187,6 +191,11 @@ function buildCards(records: readonly unknown[], viewerActorId: string): readonl
           confirmation!.value.reasonCode ?? "")) state = "params-changed";
       }
     }
+    if (lineage === undefined && originalLineage?.value.state === "pending" &&
+        dispatch?.value.state === "outcome_unknown") {
+      state = "compensation-proposed";
+      currentVersion = dispatch.value.version;
+    }
     const reasonCode = dispatch?.value.reasonCode ?? confirmation?.value.reasonCode ?? grant?.value.reasonCode;
     cards.push({
       toolCallId: call.value.toolCallId,
@@ -195,12 +204,14 @@ function buildCards(records: readonly unknown[], viewerActorId: string): readonl
       version: currentVersion, state, toolId: call.value.toolId, safeTarget: preview.target,
       parameterSummary: preview.summary, impact: preview.impact,
       reversibility: preview.reversibility,
-      expiresAt: confirmation?.value.expiresAt ?? grant?.value.expiresAt ?? "",
+      expiresAt: grant?.value.expiresAt ?? confirmation?.value.expiresAt ?? "",
       sourceRef: confirmation?.value.sourceRef ?? call.value.sourceRef,
       ...(typeof reasonCode === "string" ? { reasonCode } : {}),
       ...(confirmation?.value.namedHumanDisplayRef === null || confirmation?.value.namedHumanDisplayRef === undefined
         ? {} : { namedHumanDisplayRef: confirmation.value.namedHumanDisplayRef }),
-      ...(confirmation === undefined ? {} : { canDecide: confirmation.value.principalActorId === viewerActorId }),
+      canDecide: confirmation === undefined
+        ? dispatch !== undefined && roomOwnerActorId === viewerActorId
+        : confirmation.value.principalActorId === viewerActorId,
       ...(review === undefined ? {} : { reviewResolution: review.value.resolution,
         evidenceSummary: review.value.evidenceSummary }),
       ...(confirmation?.value.state === "pending" ? { handoffCandidates: candidates } : {}),
@@ -249,9 +260,13 @@ export function createDesktopToolSafetyRuntime(options: Readonly<{
         ? { status: "archived" as const } : connections.get(roomId) ??
         (records === undefined ? { status: "repairing" as const } : { status: "online" as const });
     const cards = session === undefined || connection.status === "revoked" || records === undefined
-      ? [] : buildCards(records as readonly unknown[], session.actorId).map((card) => {
+      ? [] : buildCards(records as readonly unknown[], session.actorId, governance?.ownerActorId).map((card) => {
         const override = displayOverrides.get(roomId)?.get(card.toolCallId);
-        return override?.version === card.version ? { ...card, state: override.state } : card;
+        const decisionSurface = ["pending", "confirmed", "rejected", "expired", "principal-revoked",
+          "params-changed", "duplicate"].includes(card.state);
+        if (override?.version === card.version && decisionSurface) return { ...card, state: override.state };
+        if (override !== undefined && !decisionSurface) displayOverrides.get(roomId)?.delete(card.toolCallId);
+        return card;
       });
     return cloneToolSafetyRemoteState({ roomId, connection, cards,
       operation: operations.get(roomId) ?? { status: "idle" } });

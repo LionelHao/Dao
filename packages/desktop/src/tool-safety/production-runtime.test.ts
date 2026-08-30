@@ -170,6 +170,10 @@ describe("Tool Safety production bridge", () => {
     expect((await submit()).cards[0]?.state).toBe("params-changed");
     mode = "duplicate"; records = [call, pending];
     expect((await submit()).cards[0]?.state).toBe("duplicate");
+    records = [call, { ...pending, value: { ...pending.value, state: "confirmed" as const, version: 2 } },
+      { kind: "tool-dispatch", value: { dispatchId: "dispatch-1", toolCallId: "call-1",
+        state: "claimed", reasonCode: null, version: 2 } }];
+    expect((await runtime.getSurface({ roomId: "room-1" })).cards[0]?.state).toBe("dispatched");
     expect(clearRoom).not.toHaveBeenCalled();
     runtime.close();
   });
@@ -233,6 +237,41 @@ describe("Tool Safety production bridge", () => {
       dispatchId: "dispatch-compensation", resolution: "accepted_risk", evidenceSummary: "checked",
       namedHumanDisplayRef: "Human A", compensationToolCallId: null, version: 4 } }];
     expect((await runtime.getSurface({ roomId: "room-1" })).cards[0]?.state).toBe("reviewed");
+    runtime.close();
+  });
+
+  it("projects compensation proposal, exact grant expiry, and the designated unknown reviewer", async () => {
+    const grant = { kind: "tool-grant", value: { grantId: "grant-1", toolCallId: "call-1",
+      state: "expired", reasonCode: "grant_expired", expiresAt: "2026-08-30T08:01:00.000Z",
+      version: 3 } } as const;
+    const unknown = { kind: "tool-dispatch", value: { dispatchId: "dispatch-1", toolCallId: "call-1",
+      state: "outcome_unknown", reasonCode: "adapter_ambiguous", version: 4 } } as const;
+    const lineage = { kind: "tool-compensation", value: { lineageId: "lineage-1",
+      originalDispatchId: "dispatch-1", compensationInvocationId: "invocation-2",
+      compensationExecutionId: "execution-2", compensationToolCallId: "call-compensation",
+      state: "pending", version: 1 } } as const;
+    let records: readonly unknown[] = [call, pending, grant];
+    let viewer = "human-1";
+    const cache = { roomRepairRecords: () => records,
+      governanceProjection: () => ({ lifecycle: "active", ownerActorId: "human-owner" }),
+      roomIds: () => ["room-1"], subscribeRoomRecords: () => () => undefined,
+      clear: vi.fn(), clearRoom: vi.fn() } as unknown as DesktopAuthorityCache;
+    const runtime = createDesktopToolSafetyRuntime({ session: () => ({ actorId: viewer }) as never,
+      transport: { toolSafetyCommand: vi.fn(), onTerminalRevoked: () => () => undefined,
+        onRoomAccessChanged: () => () => undefined,
+        onConnectionFailure: () => () => undefined } as unknown as MessageAuthorityWireTransport,
+      authorityCache: cache, repairRoom: vi.fn(), createRequestId: () => "request-projection" });
+    runtime.start();
+    const expired = (await runtime.getSurface({ roomId: "room-1" })).cards[0]!;
+    expect(expired).toMatchObject({ state: "expired", reasonCode: "grant_expired",
+      expiresAt: "2026-08-30T08:01:00.000Z", canDecide: true });
+    records = [call, unknown];
+    expect((await runtime.getSurface({ roomId: "room-1" })).cards[0]?.canDecide).toBe(false);
+    viewer = "human-owner";
+    expect((await runtime.getSurface({ roomId: "room-1" })).cards[0]?.canDecide).toBe(true);
+    records = [call, pending, unknown, lineage];
+    expect((await runtime.getSurface({ roomId: "room-1" })).cards[0]?.state)
+      .toBe("compensation-proposed");
     runtime.close();
   });
 });
