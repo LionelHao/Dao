@@ -41,12 +41,25 @@ function stableId(...parts: readonly string[]): string {
   return createHash("sha256").update(parts.join("\0")).digest("base64url");
 }
 
-function context(idempotencyKey: string): AuthenticatedCommandContext {
+function context(
+  idempotencyKey: string,
+  identity: Readonly<{
+    actorId: string;
+    accountId: string;
+    familyId: string;
+    sessionId: string;
+  }> = {
+    actorId: "human-ft10",
+    accountId: "account-ft10",
+    familyId: "family-ft10",
+    sessionId: "access-ft10",
+  },
+): AuthenticatedCommandContext {
   return {
     kind: "human",
-    sessionId: "access-ft10",
-    sessionFamilyId: "family-ft10",
-    principal: { accountId: "account-ft10", actorId: "human-ft10" },
+    sessionId: identity.sessionId,
+    sessionFamilyId: identity.familyId,
+    principal: { accountId: identity.accountId, actorId: identity.actorId },
     requestId: `request-${idempotencyKey}`,
     idempotencyKey,
   };
@@ -72,9 +85,11 @@ function seedAuthority(database: DatabaseSync): void {
   database.exec(`
     INSERT INTO actors (id, kind, display_name, tool_permissions_json, readiness)
     VALUES ('human-ft10', 'human', 'Human FT10', '[]', 'ready'),
+           ('human-ft10-b', 'human', 'Human FT10 B', '[]', 'ready'),
            ('agent-ft10', 'agent', 'Agent FT10', '["sandbox-file.write"]', 'busy');
     INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
     VALUES ('identity', 'human-ft10', 0, 1),
+           ('identity', 'human-ft10-b', 0, 1),
            ('identity', 'agent-ft10', 0, 1),
            ('room', 'room-ft10', 0, 1);
     INSERT INTO rooms (id, name, status, created_at, owner_actor_id)
@@ -84,18 +99,23 @@ function seedAuthority(database: DatabaseSync): void {
       joined_at, configured_at, access_revision
     ) VALUES
       ('room-ft10', 'human-ft10', 'human', 'owner', NULL, '[]', '${NOW_ISO}', NULL, 0),
+      ('room-ft10', 'human-ft10-b', 'human', 'member', NULL, '[]', '${NOW_ISO}', NULL, 0),
       ('room-ft10', 'agent-ft10', 'agent', NULL, 'active',
        '["sandbox-file.write"]', NULL, '${NOW_ISO}', 0);
     INSERT INTO session_families (
       family_id, public_id, account_id, actor_id, device_id, device_label,
       platform, created_at, refresh_expires_at, revoked_at
     ) VALUES ('family-ft10', 'public-ft10', 'account-ft10', 'human-ft10',
-              'device-ft10', 'Test device', 'unknown', ${NOW}, ${NOW + 3_600_000}, NULL);
+              'device-ft10', 'Test device', 'unknown', ${NOW}, ${NOW + 3_600_000}, NULL),
+             ('family-ft10-b', 'public-ft10-b', 'account-ft10-b', 'human-ft10-b',
+              'device-ft10-b', 'Test device B', 'unknown', ${NOW}, ${NOW + 3_600_000}, NULL);
     INSERT INTO sessions (
       family_id, account_id, actor_id, access_token_hash, refresh_token_hash,
       access_expires_at, refresh_expires_at
     ) VALUES ('family-ft10', 'account-ft10', 'human-ft10', 'access-ft10',
-              'refresh-ft10', ${NOW + 1_800_000}, ${NOW + 3_600_000});
+              'refresh-ft10', ${NOW + 1_800_000}, ${NOW + 3_600_000}),
+             ('family-ft10-b', 'account-ft10-b', 'human-ft10-b', 'access-ft10-b',
+              'refresh-ft10-b', ${NOW + 1_800_000}, ${NOW + 3_600_000});
     INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
     VALUES ('message-ft10', 'room-ft10', 'human-ft10', 'human', 'run the tool', '${NOW_ISO}');
     INSERT INTO message_revisions (
@@ -606,6 +626,132 @@ describe("FT-10 SQLite tool-safety authority", () => {
         state: "reviewed",
         reviewer: "human-ft10",
         evidenceSha256,
+      });
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("hands a pending confirmation to one exact authenticated Human binding", () => {
+    const fixture = testDatabase();
+    const { database } = fixture;
+    const secondHuman = {
+      actorId: "human-ft10-b",
+      accountId: "account-ft10-b",
+      familyId: "family-ft10-b",
+      sessionId: "access-ft10-b",
+    } as const;
+    try {
+      seedAuthority(database);
+      const parameters = parseToolParameters({
+        toolId: "sandbox-file.write",
+        argumentsJson: JSON.stringify({
+          path: "notes/handoff.txt",
+          content: "handoff",
+          expectedCurrentSha256: EMPTY_SHA256,
+        }),
+      });
+      const binding = transact(database, {
+        type: "tool-safety.read-prepare-binding",
+        executionId: "execution-ft10",
+        attemptSeq: 1,
+        toolId: "sandbox-file.write",
+        now: NOW + 1_000,
+      });
+      if (binding.kind !== "prepare-binding") throw new Error("missing binding");
+      expect(transact(database, {
+        type: "tool-safety.prepare",
+        toolCallId: "tool-call-handoff",
+        invocationId: binding.invocationId,
+        executionId: binding.executionId,
+        attemptSeq: binding.attemptSeq,
+        expectedExecutionVersion: binding.executionVersion,
+        toolId: "sandbox-file.write",
+        canonicalParameterSha256: parameters.canonicalParameterSha256,
+        parameterSchemaVersion: parameters.schemaVersion,
+        canonicalizerVersion: parameters.canonicalizerVersion,
+        safePreview: parameters.safePreview,
+        sealedPayload: {
+          ciphertext: "sealed-handoff-original",
+          keyVersion: "test-key-v1",
+          expiresAt: new Date(NOW + 240_000).toISOString(),
+        },
+        confirmation: {
+          confirmationId: "confirmation-handoff",
+          context: context("prepare-handoff"),
+          bindingGeneration: 1,
+        },
+        now: NOW + 1_000,
+      })).toMatchObject({ kind: "prepared", confirmationId: "confirmation-handoff" });
+
+      expect(transact(database, {
+        type: "tool-safety.handoff-offer",
+        context: context("offer-handoff"),
+        confirmationId: "confirmation-handoff",
+        expectedVersion: 1,
+        targetActorId: secondHuman.actorId,
+        handoffId: "handoff-ft10",
+        now: NOW + 2_000,
+      })).toMatchObject({ kind: "handoff", state: "offered", replayed: false });
+      expect(transact(database, {
+        type: "tool-safety.handoff-read",
+        context: context("read-handoff", secondHuman),
+        handoffId: "handoff-ft10",
+        expectedVersion: 1,
+        now: NOW + 3_000,
+      })).toMatchObject({
+        kind: "handoff-binding",
+        toPrincipalActorId: secondHuman.actorId,
+        toSessionFamilyId: secondHuman.familyId,
+        claimBinding: {
+          principalActorId: "human-ft10",
+          sessionFamilyId: "family-ft10",
+          bindingGeneration: 1,
+        },
+      });
+      expect(transact(database, {
+        type: "tool-safety.handoff-accept",
+        context: context("accept-handoff", secondHuman),
+        handoffId: "handoff-ft10",
+        expectedVersion: 1,
+        resealedPayload: {
+          ciphertext: "sealed-handoff-target",
+          keyVersion: "test-key-v1",
+          expiresAt: new Date(NOW + 240_000).toISOString(),
+        },
+        now: NOW + 4_000,
+      })).toMatchObject({ kind: "handoff", state: "accepted", version: 2 });
+      expect(() => transact(database, {
+        type: "tool-safety.confirmation-decide",
+        context: context("stale-original-human"),
+        confirmationId: "confirmation-handoff",
+        expectedVersion: 2,
+        decision: "reject",
+        now: NOW + 5_000,
+      })).toThrow(/principal.*forbidden/i);
+      expect(transact(database, {
+        type: "tool-safety.confirmation-decide",
+        context: context("confirm-handoff", secondHuman),
+        confirmationId: "confirmation-handoff",
+        expectedVersion: 2,
+        decision: "confirm",
+        grantId: "grant-handoff",
+        grantExpiresAt: new Date(NOW + 30_000).toISOString(),
+        now: NOW + 6_000,
+      })).toMatchObject({ kind: "confirmation-decision", state: "confirmed", version: 3 });
+      expect(transact(database, {
+        type: "tool-safety.recover-execution",
+        executionId: "execution-ft10",
+        now: NOW + 7_000,
+      })).toMatchObject({
+        kind: "recovery",
+        state: "confirmed_active",
+        grantId: "grant-handoff",
+        claimBinding: {
+          principalActorId: secondHuman.actorId,
+          sessionFamilyId: secondHuman.familyId,
+          bindingGeneration: 2,
+        },
       });
     } finally {
       fixture.close();
