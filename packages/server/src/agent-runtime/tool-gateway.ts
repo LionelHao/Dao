@@ -187,6 +187,7 @@ export type ToolDispatchClaimResult =
 
 export type ToolDispatchSettlement = Readonly<{
   dispatchId: string;
+  expectedVersion: number;
   state: "known_succeeded" | "known_failed" | "outcome_unknown";
   summary: Readonly<Record<string, string | number | boolean>>;
   sealedCompensation?: string;
@@ -488,6 +489,7 @@ export function createToolSafetyGateway(options: ToolSafetyGatewayOptions): Tool
       abort: () => physicalController.abort("tool_gateway_shutdown"),
       settleUnknown: () => settle({
         dispatchId: claim.dispatchId,
+        expectedVersion: 2,
         state: "outcome_unknown",
         summary: Object.freeze({ outcome: "unknown" }),
       }),
@@ -506,6 +508,7 @@ export function createToolSafetyGateway(options: ToolSafetyGatewayOptions): Tool
     if (consumedPermit === undefined) {
       await settle({
         dispatchId: claim.dispatchId,
+        expectedVersion: 2,
         state: "outcome_unknown",
         summary: Object.freeze({ outcome: "unknown" }),
       });
@@ -519,6 +522,7 @@ export function createToolSafetyGateway(options: ToolSafetyGatewayOptions): Tool
     if (closed || input.signal.aborted) {
       await settle({
         dispatchId: claim.dispatchId,
+        expectedVersion: 2,
         state: "outcome_unknown",
         summary: Object.freeze({ outcome: "unknown" }),
       });
@@ -562,6 +566,7 @@ export function createToolSafetyGateway(options: ToolSafetyGatewayOptions): Tool
     if (outcome.state === "known_succeeded") {
       await settle({
         dispatchId: claim.dispatchId,
+        expectedVersion: 2,
         state: "known_succeeded",
         summary: outcome.summary,
         ...(outcome.compensationToken === undefined ? {} : {
@@ -581,6 +586,7 @@ export function createToolSafetyGateway(options: ToolSafetyGatewayOptions): Tool
     if (outcome.state === "known_failed") {
       await settle({
         dispatchId: claim.dispatchId,
+        expectedVersion: 2,
         state: "known_failed",
         summary: outcome.summary,
       });
@@ -590,6 +596,7 @@ export function createToolSafetyGateway(options: ToolSafetyGatewayOptions): Tool
 
     await settle({
       dispatchId: claim.dispatchId,
+      expectedVersion: 2,
       state: "outcome_unknown",
       summary: outcome.summary,
     });

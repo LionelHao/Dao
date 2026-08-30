@@ -346,6 +346,7 @@ describe("FT-10 SQLite tool-safety authority", () => {
       expect(transact(database, {
         type: "tool-safety.settle",
         dispatchId: claim.dispatchId,
+        expectedVersion: 2,
         state: "known_succeeded",
         summary: { outcome: "written" },
         sealedCompensation: "opaque-compensation-token",
@@ -374,6 +375,45 @@ describe("FT-10 SQLite tool-safety authority", () => {
     }
   });
 
+  it("atomically freezes a live parent when a side-effect settlement is outcome unknown", () => {
+    const fixture = testDatabase();
+    const { database } = fixture;
+    try {
+      seedAuthority(database);
+      const claim = prepareAndClaim(database);
+      expect(transact(database, {
+        type: "tool-safety.settle",
+        dispatchId: claim.dispatchId,
+        expectedVersion: 2,
+        state: "outcome_unknown",
+        summary: { outcome: "unknown" },
+        now: NOW + 5_000,
+      })).toMatchObject({ kind: "settled", state: "outcome_unknown", version: 3 });
+      expect(database.prepare(
+        `SELECT execution.status, execution.terminal_error_code AS terminalErrorCode,
+                attempt.status AS attemptStatus, attempt.error_code AS attemptErrorCode,
+                runtime.public_status AS publicStatus, runtime.phase,
+                runtime.review_state AS reviewState,
+                attempt_runtime.public_status AS attemptPublicStatus,
+                attempt_runtime.phase AS attemptPhase
+         FROM agent_executions AS execution
+         JOIN agent_execution_attempts AS attempt
+           ON attempt.execution_id = execution.id AND attempt.attempt_seq = 1
+         JOIN agent_execution_runtime_states AS runtime ON runtime.execution_id = execution.id
+         JOIN agent_execution_attempt_runtime_states AS attempt_runtime
+           ON attempt_runtime.execution_id = execution.id AND attempt_runtime.attempt_seq = 1
+         WHERE execution.id = 'execution-ft10'`,
+      ).get()).toEqual({
+        status: "failed", terminalErrorCode: "side_effect_outcome_unknown",
+        attemptStatus: "failed", attemptErrorCode: "side_effect_outcome_unknown",
+        publicStatus: "failed", phase: "failed", reviewState: "needs_review",
+        attemptPublicStatus: "failed", attemptPhase: "failed",
+      });
+    } finally {
+      fixture.close();
+    }
+  });
+
   it("creates compensation as a new execution and toolCall without mutating the original dispatch", () => {
     const fixture = testDatabase();
     const { database } = fixture;
@@ -383,6 +423,7 @@ describe("FT-10 SQLite tool-safety authority", () => {
       expect(transact(database, {
         type: "tool-safety.settle",
         dispatchId: original.dispatchId,
+        expectedVersion: 2,
         state: "known_succeeded",
         summary: { outcome: "written" },
         sealedCompensation: "opaque-compensation-token",
@@ -490,6 +531,7 @@ describe("FT-10 SQLite tool-safety authority", () => {
       expect(transact(database, {
         type: "tool-safety.settle",
         dispatchId: compensationClaim.dispatchId,
+        expectedVersion: 2,
         state: "known_succeeded",
         summary: { outcome: "restored" },
         now: NOW + 9_000,
@@ -543,6 +585,38 @@ describe("FT-10 SQLite tool-safety authority", () => {
       expect(database.prepare(
         "SELECT state, reason FROM tool_dispatches_v2",
       ).get()).toEqual({ state: "outcome_unknown", reason: "execution_cancelled" });
+      expect(database.prepare(
+        `SELECT execution.status, execution.terminal_error_code AS terminalErrorCode,
+                runtime.public_status AS publicStatus, runtime.phase,
+                runtime.review_state AS reviewState
+         FROM agent_executions AS execution
+         JOIN agent_execution_runtime_states AS runtime ON runtime.execution_id = execution.id
+         WHERE execution.id = 'execution-ft10'`,
+      ).get()).toEqual({
+        status: "failed", terminalErrorCode: "side_effect_outcome_unknown",
+        publicStatus: "failed", phase: "failed", reviewState: "needs_review",
+      });
+      const dispatchId = executionFence.preservedDispatchIds[0]!;
+      expect(transact(database, {
+        type: "tool-safety.settle",
+        dispatchId,
+        expectedVersion: 2,
+        state: "known_succeeded",
+        summary: { outcome: "late_known" },
+        sealedCompensation: "opaque-late-compensation",
+        now: NOW + 6_000,
+      })).toMatchObject({ kind: "settled", state: "known_succeeded", version: 4 });
+      expect(database.prepare(
+        `SELECT dispatch.state, execution.status,
+                runtime.public_status AS publicStatus, runtime.phase
+         FROM tool_dispatches_v2 AS dispatch
+         JOIN tool_calls_v2 AS call ON call.tool_call_id = dispatch.tool_call_id
+         JOIN agent_executions AS execution ON execution.id = call.execution_id
+         JOIN agent_execution_runtime_states AS runtime ON runtime.execution_id = execution.id
+         WHERE dispatch.dispatch_id = ?`,
+      ).get(dispatchId)).toEqual({
+        state: "known_succeeded", status: "failed", publicStatus: "failed", phase: "failed",
+      });
 
       const secondFixture = testDatabase();
       const { database: second } = secondFixture;
@@ -649,6 +723,37 @@ describe("FT-10 SQLite tool-safety authority", () => {
         state: "reviewed",
         reviewer: "human-ft10",
         evidenceSha256,
+      });
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("repairs a historical outcome_unknown whose parent closure did not commit", () => {
+    const fixture = testDatabase();
+    const { database } = fixture;
+    try {
+      seedAuthority(database);
+      const claim = prepareAndClaim(database);
+      const changedAt = new Date(NOW + 4_000).toISOString();
+      database.prepare(
+        `UPDATE tool_dispatches_v2 SET state = 'outcome_unknown', reason = 'adapter_ambiguous',
+           settled_at = ?, version = 3, changed_at = ? WHERE dispatch_id = ?`,
+      ).run(changedAt, changedAt, claim.dispatchId);
+
+      expect(transact(database, {
+        type: "tool-safety.recover-execution", executionId: "execution-ft10", now: NOW + 5_000,
+      })).toMatchObject({ kind: "recovery", state: "outcome_unknown", dispatchId: claim.dispatchId });
+      expect(database.prepare(
+        `SELECT execution.status, execution.terminal_error_code AS terminalErrorCode,
+                runtime.public_status AS publicStatus, runtime.phase,
+                runtime.review_state AS reviewState
+         FROM agent_executions AS execution
+         JOIN agent_execution_runtime_states AS runtime ON runtime.execution_id = execution.id
+         WHERE execution.id = 'execution-ft10'`,
+      ).get()).toEqual({
+        status: "failed", terminalErrorCode: "side_effect_outcome_unknown",
+        publicStatus: "failed", phase: "failed", reviewState: "needs_review",
       });
     } finally {
       fixture.close();

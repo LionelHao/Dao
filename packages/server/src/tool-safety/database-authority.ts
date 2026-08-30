@@ -1027,6 +1027,88 @@ function claim(
     }) };
 }
 
+function freezeParentForUnknownOutcome(
+  database: DatabaseSync,
+  executionId: string,
+  attemptSeq: number,
+  occurredAt: string,
+): void {
+  const current = database.prepare(
+    `SELECT execution.status, execution.current_attempt_seq AS currentAttemptSeq,
+            execution.terminal_error_code AS terminalErrorCode,
+            attempt.status AS attemptStatus, attempt.error_code AS attemptErrorCode,
+            runtime.public_status AS publicStatus, runtime.phase,
+            runtime.review_state AS reviewState,
+            attempt_runtime.public_status AS attemptPublicStatus,
+            attempt_runtime.phase AS attemptPhase
+     FROM agent_executions AS execution
+     JOIN agent_execution_attempts AS attempt
+       ON attempt.execution_id = execution.id AND attempt.attempt_seq = ?
+     JOIN agent_execution_runtime_states AS runtime ON runtime.execution_id = execution.id
+     JOIN agent_execution_attempt_runtime_states AS attempt_runtime
+       ON attempt_runtime.execution_id = execution.id AND attempt_runtime.attempt_seq = ?
+     WHERE execution.id = ?`,
+  ).get(attemptSeq, attemptSeq, executionId);
+  if (current === undefined || current.currentAttemptSeq !== attemptSeq ||
+      current.status === "completed" || current.attemptStatus === "completed") {
+    return fail("execution_conflict", "Unknown side-effect parent binding was stale");
+  }
+  if (current.status === "failed" && current.terminalErrorCode === "side_effect_outcome_unknown" &&
+      current.attemptStatus === "failed" && current.attemptErrorCode === "side_effect_outcome_unknown" &&
+      current.publicStatus === "failed" && current.phase === "failed" &&
+      current.reviewState === "needs_review" && current.attemptPublicStatus === "failed" &&
+      current.attemptPhase === "failed") return;
+
+  database.prepare(
+    `UPDATE agent_execution_runtime_states
+     SET review_state = 'needs_review', authority_version = authority_version + 1,
+         updated_at = ?
+     WHERE execution_id = ? AND public_status IN ('running','failed','cancelled')
+       AND phase IN ('side_effect_claimed','failed','cancelled')
+       AND review_state <> 'needs_review'`,
+  ).run(occurredAt, executionId);
+  const attemptClosed = database.prepare(
+    `UPDATE agent_execution_attempts
+     SET status = 'failed', finished_at = ?, error_code = 'side_effect_outcome_unknown',
+         next_retry_at = NULL
+     WHERE execution_id = ? AND attempt_seq = ?
+       AND status IN ('running','failed','cancelled')`,
+  ).run(occurredAt, executionId, attemptSeq);
+  const executionClosed = database.prepare(
+    `UPDATE agent_executions
+     SET status = 'failed', cancellation_reason = NULL, completed_at = ?, updated_at = ?,
+         terminal_error_code = 'side_effect_outcome_unknown', dead_lettered_at = NULL,
+         next_retry_at = NULL,
+         tool_dispatch_phase = CASE WHEN action_category = 'tool_call'
+           THEN 'finished' ELSE tool_dispatch_phase END
+     WHERE id = ? AND current_attempt_seq = ?
+       AND status IN ('running','failed','cancelled')`,
+  ).run(occurredAt, occurredAt, executionId, attemptSeq);
+  const closed = database.prepare(
+    `SELECT execution.status, execution.terminal_error_code AS terminalErrorCode,
+            attempt.status AS attemptStatus, attempt.error_code AS attemptErrorCode,
+            runtime.public_status AS publicStatus, runtime.phase,
+            runtime.review_state AS reviewState,
+            attempt_runtime.public_status AS attemptPublicStatus,
+            attempt_runtime.phase AS attemptPhase
+     FROM agent_executions AS execution
+     JOIN agent_execution_attempts AS attempt
+       ON attempt.execution_id = execution.id AND attempt.attempt_seq = ?
+     JOIN agent_execution_runtime_states AS runtime ON runtime.execution_id = execution.id
+     JOIN agent_execution_attempt_runtime_states AS attempt_runtime
+       ON attempt_runtime.execution_id = execution.id AND attempt_runtime.attempt_seq = ?
+     WHERE execution.id = ?`,
+  ).get(attemptSeq, attemptSeq, executionId);
+  if (attemptClosed.changes !== 1 || executionClosed.changes !== 1 ||
+      closed?.status !== "failed" || closed.terminalErrorCode !== "side_effect_outcome_unknown" ||
+      closed.attemptStatus !== "failed" || closed.attemptErrorCode !== "side_effect_outcome_unknown" ||
+      closed.publicStatus !== "failed" || closed.phase !== "failed" ||
+      closed.reviewState !== "needs_review" || closed.attemptPublicStatus !== "failed" ||
+      closed.attemptPhase !== "failed") {
+    return fail("execution_conflict", "Unknown side-effect parent closure lost its CAS");
+  }
+}
+
 function settle(
   database: DatabaseSync,
   operation: Extract<ToolSafetyAuthorityOperation, { type: "tool-safety.settle" }>,
@@ -1041,42 +1123,56 @@ function settle(
     return fail("invalid_parameters", "Tool compensation settlement binding was rejected");
   }
   const dispatch = database.prepare(
-    `SELECT dispatch.state, dispatch.version, call.room_id AS roomId,
-            dispatch.tool_call_id AS toolCallId,
+    `SELECT dispatch.state, dispatch.reason, dispatch.version, call.room_id AS roomId,
+            dispatch.tool_call_id AS toolCallId, call.execution_id AS executionId,
+            call.attempt_seq AS attemptSeq, call.tool_id AS toolId,
             confirmation.principal_human_actor_id AS confirmationPrincipalActorId,
-            room.owner_actor_id AS roomOwnerActorId
+            room.owner_actor_id AS roomOwnerActorId,
+            review.review_id AS reviewId
      FROM tool_dispatches_v2 AS dispatch
      JOIN tool_calls_v2 AS call ON call.tool_call_id = dispatch.tool_call_id
      JOIN rooms AS room ON room.id = call.room_id
      LEFT JOIN tool_grants_v2 AS grant ON grant.grant_id = dispatch.grant_id
      LEFT JOIN tool_confirmations_v2 AS confirmation
        ON confirmation.confirmation_id = grant.confirmation_id
+     LEFT JOIN tool_reviews_v2 AS review ON review.dispatch_id = dispatch.dispatch_id
      WHERE dispatch.dispatch_id = ?`,
   ).get(operation.dispatchId);
   if (dispatch === undefined) return fail("execution_conflict", "Tool dispatch was not found");
-  if (dispatch.state === operation.state) {
+  if (dispatch.state === operation.state && (dispatch.version as number) >= operation.expectedVersion) {
     return { kind: "settled", dispatchId: operation.dispatchId, state: operation.state,
       version: dispatch.version as number, replayed: true };
   }
-  if (dispatch.state !== "claimed" && dispatch.state !== "dispatched") {
+  const lateKnownAfterFence = dispatch.state === "outcome_unknown" &&
+    operation.state !== "outcome_unknown" && dispatch.reviewId === null &&
+    (dispatch.reason === "execution_cancelled" || dispatch.reason === "source_recalled" ||
+      dispatch.reason === "principal_revoked") &&
+    dispatch.version === operation.expectedVersion + 1;
+  if (!lateKnownAfterFence &&
+      ((dispatch.state !== "claimed" && dispatch.state !== "dispatched") ||
+       dispatch.version !== operation.expectedVersion)) {
     return fail("execution_conflict", "Tool dispatch settlement was terminal");
   }
   const occurredAt = new Date(operation.now).toISOString();
   const nextVersion = (dispatch.version as number) + 1;
-  database.prepare(
+  const dispatchSettled = database.prepare(
     `UPDATE tool_dispatches_v2 SET state = ?, reason = ?, safe_summary_json = ?,
        sealed_compensation_ciphertext = ?,
-       settled_at = ?, version = ?, changed_at = ? WHERE dispatch_id = ?`,
+       settled_at = ?, version = ?, changed_at = ?
+     WHERE dispatch_id = ? AND state = ? AND version = ?`,
   ).run(operation.state, operation.state === "outcome_unknown" ? "adapter_ambiguous" : null,
     summaryJson, operation.sealedCompensation ?? null, occurredAt, nextVersion, occurredAt,
-    operation.dispatchId);
+    operation.dispatchId, dispatch.state as string, dispatch.version as number);
+  if (dispatchSettled.changes !== 1) {
+    return fail("execution_conflict", "Tool dispatch settlement lost its version CAS");
+  }
   database.prepare(
     `INSERT INTO tool_dispatch_transitions_v2 (
        transition_id, dispatch_id, from_state, to_state, reason,
        safe_summary_sha256, transition_version, occurred_at
      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(stableId("tool-dispatch-settle", operation.dispatchId, String(nextVersion)),
-    operation.dispatchId, dispatch.state, operation.state,
+    operation.dispatchId, dispatch.state as string, operation.state,
     operation.state === "outcome_unknown" ? "adapter_ambiguous" : null,
     createHash("sha256").update(summaryJson).digest("hex"), nextVersion, occurredAt);
   writeRepair(database, "tool-dispatch", operation.dispatchId, dispatch.roomId as string,
@@ -1093,7 +1189,12 @@ function settle(
      JOIN tool_calls_v2 AS call ON call.tool_call_id = lineage.compensation_tool_call_id
      WHERE lineage.compensation_tool_call_id = ?`,
   ).get(dispatch.toolCallId as string);
-  if (compensation !== undefined) {
+  if (dispatch.toolId === "sandbox-file.write" && operation.state === "outcome_unknown" &&
+      compensation === undefined) {
+    freezeParentForUnknownOutcome(database, dispatch.executionId as string,
+      dispatch.attemptSeq as number, occurredAt);
+  }
+  if (compensation !== undefined && dispatch.state !== "outcome_unknown") {
     const succeeded = operation.state === "known_succeeded";
     const errorCode = operation.state === "outcome_unknown"
       ? "side_effect_outcome_unknown" : "tool_failure";
@@ -1824,8 +1925,13 @@ function recoverExecution(
     return { kind: "recovery", state: "outcome_unknown", toolCallId: row.toolCallId as string,
       dispatchId: row.dispatchId as string };
   }
-  if (["outcome_unknown", "known_succeeded", "known_failed", "reviewed"].includes(
-    String(row.dispatchState))) {
+  if (row.dispatchState === "outcome_unknown") {
+    freezeParentForUnknownOutcome(database, operation.executionId,
+      row.attemptSeq as number, new Date(operation.now).toISOString());
+    return { kind: "recovery", state: "outcome_unknown",
+      toolCallId: row.toolCallId as string, dispatchId: row.dispatchId as string };
+  }
+  if (["known_succeeded", "known_failed", "reviewed"].includes(String(row.dispatchState))) {
     return { kind: "recovery", state: row.dispatchState as "outcome_unknown" |
       "known_succeeded" | "known_failed" | "reviewed", toolCallId: row.toolCallId as string,
       dispatchId: row.dispatchId as string };
@@ -1955,7 +2061,8 @@ export function settleToolSafetyExecutionFenceInTransaction(
   }
   const dispatches = database.prepare(
     `SELECT dispatch.dispatch_id AS dispatchId, dispatch.tool_call_id AS toolCallId,
-            dispatch.state, dispatch.version, call.room_id AS roomId
+            dispatch.state, dispatch.version, call.room_id AS roomId,
+            call.execution_id AS executionId, call.attempt_seq AS attemptSeq
      FROM tool_dispatches_v2 AS dispatch
      JOIN tool_calls_v2 AS call ON call.tool_call_id = dispatch.tool_call_id
      WHERE call.execution_id = ? AND dispatch.state IN ('claimed','dispatched')
@@ -1981,6 +2088,8 @@ export function settleToolSafetyExecutionFenceInTransaction(
     writeRepair(database, "tool-dispatch", dispatchId, row.roomId as string, version,
       { dispatchId, toolCallId: row.toolCallId, state: "outcome_unknown",
         reason, version }, occurredAt);
+    freezeParentForUnknownOutcome(database, row.executionId as string,
+      row.attemptSeq as number, occurredAt);
     preservedDispatchIds.push(dispatchId);
   }
   return Object.freeze({ rejectedConfirmationIds: Object.freeze(rejectedConfirmationIds),

@@ -173,6 +173,21 @@ describe("FT-10 production adapter security", () => {
     await expect(deadline.execute(invocation("http-json.read", { path: "record" })))
       .rejects.toMatchObject({ outcome: "known_failed" });
     expect(observedAbort).toBe(true);
+
+    const fetchAfterDns = vi.fn();
+    const hungDns = createHttpJsonReadAdapter({
+      origin: "https://data.example.test",
+      pathPrefix: "/v1/",
+      maxResponseBytes: 128,
+      timeoutMs: 100,
+      fetch: fetchAfterDns,
+      resolveHost: async () => await new Promise<never>(() => undefined),
+    });
+    const before = Date.now();
+    await expect(hungDns.execute(invocation("http-json.read", { path: "record" })))
+      .rejects.toMatchObject({ outcome: "known_failed" });
+    expect(Date.now() - before).toBeLessThan(500);
+    expect(fetchAfterDns).not.toHaveBeenCalled();
   });
 
   it("pins Git root identity and returns bounded parsed records instead of raw output", async () => {
@@ -344,6 +359,28 @@ describe("FT-10 production adapter security", () => {
         path: "abort.txt", content: "never", expectedCurrentSha256: absentHash,
       }, controller.signal))).rejects.toMatchObject({ outcome: "known_failed" });
       expect(() => readFileSync(join(root, "abort.txt"))).toThrow();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("applies the sandbox real-time deadline before a hung pre-rename boundary can mutate", async () => {
+    const root = mkdtempSync(join(tmpdir(), "dao-sandbox-deadline-"));
+    try {
+      const adapter = createSandboxFileWriteAdapter({
+        root,
+        compensationKey: randomBytes(32),
+        maxContentBytes: 1_024,
+        timeoutMs: 100,
+        testOnlyAllowPathFallback: process.platform !== "linux",
+        testHooks: { beforeRename: async () => await new Promise<void>(() => undefined) },
+      });
+      const before = Date.now();
+      await expect(adapter.execute(invocation("sandbox-file.write", {
+        path: "deadline.txt", content: "never", expectedCurrentSha256: absentHash,
+      }))).rejects.toMatchObject({ outcome: "ambiguous" });
+      expect(Date.now() - before).toBeLessThan(500);
+      expect(() => readFileSync(join(root, "deadline.txt"))).toThrow();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

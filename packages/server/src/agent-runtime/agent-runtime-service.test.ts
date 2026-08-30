@@ -1797,6 +1797,13 @@ describe("bounded Agent runtime scheduler", () => {
   it("bounds shutdown even when a Provider ignores AbortSignal", async () => {
     const runtimeAuthority = authority();
     const resetPreview = vi.fn();
+    const ordering: string[] = [];
+    const originalShutdown = runtimeAuthority.shutdown.bind(runtimeAuthority);
+    runtimeAuthority.shutdown = vi.fn(async (...args) => {
+      ordering.push("parent-fence");
+      return await originalShutdown(...args);
+    });
+    const gatewayClose = vi.fn(async () => { ordering.push("gateway-fence"); });
     let started!: () => void;
     const sawStart = new Promise<void>((resolve) => { started = resolve; });
     const runtime = createAgentRuntimeService({
@@ -1810,6 +1817,10 @@ describe("bounded Agent runtime scheduler", () => {
       buildProviderInput: providerInput,
       shutdownTimeoutMs: 10,
       resetPreview,
+      toolSafety: {
+        coordinator: {} as never,
+        gateway: { execute: vi.fn(), close: gatewayClose },
+      },
     });
     await runtime.invoke(context, intent("room-close", "close"));
     await sawStart;
@@ -1818,6 +1829,8 @@ describe("bounded Agent runtime scheduler", () => {
     await runtime.close();
 
     expect(Date.now() - before).toBeLessThan(250);
+    expect(gatewayClose).toHaveBeenCalledTimes(1);
+    expect(ordering).toEqual(["gateway-fence", "parent-fence"]);
     expect(runtimeAuthority.executions.get("execution-1")).toMatchObject({
       status: "cancelled",
       cancellationReason: "runtime_shutdown",

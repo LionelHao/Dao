@@ -21,6 +21,7 @@ interface SandboxFileWriteOptions {
   readonly root: string;
   readonly compensationKey: Uint8Array;
   readonly maxContentBytes: number;
+  readonly timeoutMs?: number;
   readonly maxPreimageBytes?: number;
   readonly maxCompensationBytes?: number;
   /** Deep-test seam for platforms where Node has no descriptor-relative child traversal. */
@@ -291,6 +292,36 @@ async function atomicReplace(
   }
 }
 
+async function withinSandboxDeadline<T>(
+  timeoutMs: number,
+  upstreamSignal: AbortSignal,
+  operation: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  if (upstreamSignal.aborted) {
+    throw knownFailure("tool_failure", "Sandbox operation was cancelled before mutation");
+  }
+  const controller = new AbortController();
+  const abort = (): void => controller.abort(upstreamSignal.reason);
+  upstreamSignal.addEventListener("abort", abort, { once: true });
+  const timer = setTimeout(() => controller.abort(new Error("deadline")), timeoutMs);
+  const work = operation(controller.signal);
+  const interrupted = new Promise<never>((_resolve, reject) => {
+    const rejectUnknown = (): void => reject(ambiguousFailure(
+      "Sandbox operation exceeded its real-time deadline; outcome is unknown",
+    ));
+    controller.signal.addEventListener("abort", rejectUnknown, { once: true });
+    work.finally(() => controller.signal.removeEventListener("abort", rejectUnknown))
+      .catch(() => undefined);
+  });
+  try {
+    return await Promise.race([work, interrupted]);
+  } finally {
+    clearTimeout(timer);
+    upstreamSignal.removeEventListener("abort", abort);
+    void work.catch(() => undefined);
+  }
+}
+
 export function createSandboxFileWriteAdapter(options: SandboxFileWriteOptions): ToolAdapter {
   if (!isAbsolute(options.root) || options.compensationKey.byteLength !== 32 ||
       !Number.isSafeInteger(options.maxContentBytes) || options.maxContentBytes < 1 || options.maxContentBytes > 1_048_576) {
@@ -310,8 +341,10 @@ export function createSandboxFileWriteAdapter(options: SandboxFileWriteOptions):
   if (!probe.isDirectory()) throw new TypeError("Sandbox root identity was rejected");
   const maxPreimageBytes = options.maxPreimageBytes ?? options.maxContentBytes;
   const maxCompensationBytes = options.maxCompensationBytes ?? Math.min(1_048_576, Math.max(4_096, maxPreimageBytes * 2));
+  const timeoutMs = options.timeoutMs ?? 10_000;
   if (!Number.isSafeInteger(maxPreimageBytes) || maxPreimageBytes < 1 || maxPreimageBytes > 1_048_576 ||
-      !Number.isSafeInteger(maxCompensationBytes) || maxCompensationBytes < 256 || maxCompensationBytes > 1_048_576) {
+      !Number.isSafeInteger(maxCompensationBytes) || maxCompensationBytes < 256 || maxCompensationBytes > 1_048_576 ||
+      !Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 30_000) {
     throw new TypeError("Sandbox compensation bounds were invalid");
   }
   const key = new Uint8Array(options.compensationKey);
@@ -321,64 +354,68 @@ export function createSandboxFileWriteAdapter(options: SandboxFileWriteOptions):
     descriptor: Object.freeze({ id: "sandbox-file.write", displayName: "Sandbox file write", effect: "side-effecting", reversibility: "compensatable" }),
     async execute(invocation): Promise<ToolOutcome> {
       const parameters = parseParameters(invocation.parameters, options.maxContentBytes);
-      const segments = parsePath(parameters.path);
-      const opened = await openParent(root, rootIdentity, descriptorChildrenReady ? fdRoot : "", segments);
-      try {
-        const targetPath = `${fdBase(descriptorChildrenReady ? fdRoot : "", opened.parent, opened.parentPath)}/${opened.targetName}`;
-        const before = await readBoundedFile(targetPath, maxPreimageBytes);
-        if (sha256(before ?? "") !== parameters.expectedCurrentSha256) throw knownFailure("execution_conflict", "Sandbox target hash changed");
-        const content = new TextEncoder().encode(parameters.content);
-        const postHash = sha256(content);
-        const token = seal({
-          path: parameters.path,
-          beforeBase64: before === undefined ? null : Buffer.from(before).toString("base64"),
-          expectedPostSha256: postHash,
-        }, key, maxCompensationBytes);
-        // Recheck immediately at the descriptor-anchored rename boundary.
-        const current = await readBoundedFile(targetPath, maxPreimageBytes);
-        if (sha256(current ?? "") !== parameters.expectedCurrentSha256) throw knownFailure("execution_conflict", "Sandbox target hash changed");
-        await atomicReplace(opened.parent, opened.parentPath, descriptorChildrenReady ? fdRoot : "", opened.targetName, content, invocation.signal, options.testHooks);
-        const postimage = await readBoundedFile(targetPath, options.maxContentBytes);
-        if (postimage === undefined || sha256(postimage) !== postHash) throw ambiguousFailure("Sandbox postimage could not be proven");
-        return {
-          outcome: "known_succeeded" as const,
-          summary: { operation: before === undefined ? "created" : "replaced", byteCount: content.byteLength, postSha256: postHash },
-          modelInput: JSON.stringify({ written: true, path: parameters.path, postSha256: postHash }),
-          compensationToken: token,
-        };
-      } finally { await closeHandles(opened.handles); }
+      return await withinSandboxDeadline(timeoutMs, invocation.signal, async (signal) => {
+        const segments = parsePath(parameters.path);
+        const opened = await openParent(root, rootIdentity, descriptorChildrenReady ? fdRoot : "", segments);
+        try {
+          const targetPath = `${fdBase(descriptorChildrenReady ? fdRoot : "", opened.parent, opened.parentPath)}/${opened.targetName}`;
+          const before = await readBoundedFile(targetPath, maxPreimageBytes);
+          if (sha256(before ?? "") !== parameters.expectedCurrentSha256) throw knownFailure("execution_conflict", "Sandbox target hash changed");
+          const content = new TextEncoder().encode(parameters.content);
+          const postHash = sha256(content);
+          const token = seal({
+            path: parameters.path,
+            beforeBase64: before === undefined ? null : Buffer.from(before).toString("base64"),
+            expectedPostSha256: postHash,
+          }, key, maxCompensationBytes);
+          // Recheck immediately at the descriptor-anchored rename boundary.
+          const current = await readBoundedFile(targetPath, maxPreimageBytes);
+          if (sha256(current ?? "") !== parameters.expectedCurrentSha256) throw knownFailure("execution_conflict", "Sandbox target hash changed");
+          await atomicReplace(opened.parent, opened.parentPath, descriptorChildrenReady ? fdRoot : "", opened.targetName, content, signal, options.testHooks);
+          const postimage = await readBoundedFile(targetPath, options.maxContentBytes);
+          if (postimage === undefined || sha256(postimage) !== postHash) throw ambiguousFailure("Sandbox postimage could not be proven");
+          return {
+            outcome: "known_succeeded" as const,
+            summary: { operation: before === undefined ? "created" : "replaced", byteCount: content.byteLength, postSha256: postHash },
+            modelInput: JSON.stringify({ written: true, path: parameters.path, postSha256: postHash }),
+            compensationToken: token,
+          };
+        } finally { await closeHandles(opened.handles); }
+      });
     },
     async compensate(token, signal): Promise<ToolOutcome> {
       const record = unseal(token, key, maxCompensationBytes);
-      const segments = parsePath(record.path);
-      const opened = await openParent(root, rootIdentity, descriptorChildrenReady ? fdRoot : "", segments);
-      try {
-        const targetPath = `${fdBase(descriptorChildrenReady ? fdRoot : "", opened.parent, opened.parentPath)}/${opened.targetName}`;
-        const current = await readBoundedFile(targetPath, options.maxContentBytes);
-        if (current === undefined || sha256(current) !== record.expectedPostSha256) {
-          throw knownFailure("execution_conflict", "Sandbox compensation hash fence failed");
-        }
-        if (signal.aborted) throw knownFailure("tool_failure", "Sandbox compensation was cancelled before mutation");
-        if (record.beforeBase64 === null) {
-          try {
-            await unlink(targetPath);
-            if (signal.aborted) throw ambiguousFailure("Sandbox compensation was cancelled after delete");
-            await opened.parent.sync();
-          } catch (error: unknown) {
-            if (typeof error === "object" && error !== null && "outcome" in error) throw error;
-            throw ambiguousFailure("Sandbox compensation delete may have completed");
+      return await withinSandboxDeadline(timeoutMs, signal, async (operationSignal) => {
+        const segments = parsePath(record.path);
+        const opened = await openParent(root, rootIdentity, descriptorChildrenReady ? fdRoot : "", segments);
+        try {
+          const targetPath = `${fdBase(descriptorChildrenReady ? fdRoot : "", opened.parent, opened.parentPath)}/${opened.targetName}`;
+          const current = await readBoundedFile(targetPath, options.maxContentBytes);
+          if (current === undefined || sha256(current) !== record.expectedPostSha256) {
+            throw knownFailure("execution_conflict", "Sandbox compensation hash fence failed");
           }
-        } else {
-          const before = Buffer.from(record.beforeBase64, "base64");
-          if (before.byteLength > maxPreimageBytes) throw knownFailure("invalid_parameters", "Compensation preimage was rejected");
-          await atomicReplace(opened.parent, opened.parentPath, descriptorChildrenReady ? fdRoot : "", opened.targetName, before, signal, options.testHooks);
-        }
-        return {
-          outcome: "known_succeeded" as const,
-          summary: { operation: record.beforeBase64 === null ? "deleted" : "restored", compensated: true },
-          modelInput: JSON.stringify({ compensated: true, path: record.path }),
-        };
-      } finally { await closeHandles(opened.handles); }
+          if (operationSignal.aborted) throw knownFailure("tool_failure", "Sandbox compensation was cancelled before mutation");
+          if (record.beforeBase64 === null) {
+            try {
+              await unlink(targetPath);
+              if (operationSignal.aborted) throw ambiguousFailure("Sandbox compensation was cancelled after delete");
+              await opened.parent.sync();
+            } catch (error: unknown) {
+              if (typeof error === "object" && error !== null && "outcome" in error) throw error;
+              throw ambiguousFailure("Sandbox compensation delete may have completed");
+            }
+          } else {
+            const before = Buffer.from(record.beforeBase64, "base64");
+            if (before.byteLength > maxPreimageBytes) throw knownFailure("invalid_parameters", "Compensation preimage was rejected");
+            await atomicReplace(opened.parent, opened.parentPath, descriptorChildrenReady ? fdRoot : "", opened.targetName, before, operationSignal, options.testHooks);
+          }
+          return {
+            outcome: "known_succeeded" as const,
+            summary: { operation: record.beforeBase64 === null ? "deleted" : "restored", compensated: true },
+            modelInput: JSON.stringify({ compensated: true, path: record.path }),
+          };
+        } finally { await closeHandles(opened.handles); }
+      });
     },
   };
   return Object.freeze(adapter);
