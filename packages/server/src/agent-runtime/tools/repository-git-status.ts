@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, realpathSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import type { ToolAdapter, ToolInvocation } from "../contracts.js";
@@ -50,6 +50,26 @@ function parsePorcelain(stdout: string): Readonly<{ records: readonly string[]; 
   return Object.freeze({ records: Object.freeze(records), omitted });
 }
 
+function probeDescriptorCwd(fdRoot: string, rootFd: number, expected: FileIdentity): boolean {
+  try {
+    const observed = execFileSync(
+      process.execPath,
+      ["-e", "const s=require('node:fs').statSync('.',{bigint:true});process.stdout.write(`${s.dev}:${s.ino}`)"],
+      {
+        cwd: `${fdRoot}/${rootFd}`,
+        encoding: "utf8",
+        env: { LANG: "C", LC_ALL: "C", PATH: "/usr/bin:/bin" },
+        maxBuffer: 128,
+        timeout: 2_000,
+        windowsHide: true,
+      },
+    );
+    return observed === `${expected.dev}:${expected.ino}`;
+  } catch {
+    return false;
+  }
+}
+
 function runGit(
   binaryPath: string,
   repositoryRoot: string,
@@ -66,7 +86,7 @@ function runGit(
     let overflow = false;
     const child = execFile(
       binaryPath,
-      ["status", "--porcelain=v1", "--untracked-files=no"],
+      ["-c", "core.fsmonitor=false", "status", "--porcelain=v1", "--untracked-files=no"],
       {
         cwd: repositoryRoot,
         encoding: "utf8",
@@ -115,7 +135,10 @@ export function createRepositoryGitStatusAdapter(options: RepositoryGitStatusOpt
   const rootIdentity = identity(repositoryRoot, "directory");
   const fdRoot = existsSync("/proc/self/fd") ? "/proc/self/fd" : existsSync("/dev/fd") ? "/dev/fd" : undefined;
   if (fdRoot === undefined) throw new TypeError("Git descriptor-anchored repository access is unavailable");
-  const descriptorCwdReady = process.platform === "linux" && fdRoot === "/proc/self/fd";
+  const probeFd = openSync(repositoryRoot, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  let descriptorCwdReady: boolean;
+  try { descriptorCwdReady = probeDescriptorCwd(fdRoot, probeFd, rootIdentity); }
+  finally { closeSync(probeFd); }
   if (!descriptorCwdReady && options.testOnlyAllowPathFallback !== true) {
     throw new TypeError("Git descriptor-anchored repository cwd is unavailable; startup refused");
   }

@@ -29,9 +29,28 @@ function closedParameters(value: Readonly<Record<string, unknown>>): string {
   return value.path;
 }
 
+function parseIpv6Words(address: string): readonly number[] | undefined {
+  if (address.includes("%") || isIP(address) !== 6) return undefined;
+  let source = address.toLowerCase();
+  const dotted = /(?:^|:)(\d+\.\d+\.\d+\.\d+)$/.exec(source)?.[1];
+  if (dotted !== undefined) {
+    const octets = dotted.split(".").map(Number);
+    if (octets.length !== 4 || octets.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return undefined;
+    source = `${source.slice(0, -dotted.length)}${((octets[0]! << 8) | octets[1]!).toString(16)}:${((octets[2]! << 8) | octets[3]!).toString(16)}`;
+  }
+  const halves = source.split("::");
+  if (halves.length > 2) return undefined;
+  const left = halves[0] === "" ? [] : halves[0]!.split(":");
+  const right = halves.length === 1 || halves[1] === "" ? [] : halves[1]!.split(":");
+  const missing = 8 - left.length - right.length;
+  if ((halves.length === 1 && missing !== 0) || (halves.length === 2 && missing < 1)) return undefined;
+  const words = [...left, ...Array.from({ length: missing }, () => "0"), ...right].map((part) => Number.parseInt(part, 16));
+  return words.length === 8 && words.every((part) => Number.isInteger(part) && part >= 0 && part <= 0xffff)
+    ? words
+    : undefined;
+}
+
 function isPublicAddress(address: string): boolean {
-  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(address)?.[1];
-  if (mapped !== undefined) return isPublicAddress(mapped);
   if (isIP(address) === 4) {
     const [a = 0, b = 0, c = 0] = address.split(".").map(Number);
     return !(a === 0 || a === 10 || a === 127 || a >= 224 ||
@@ -40,17 +59,32 @@ function isPublicAddress(address: string): boolean {
       (a === 192 && b === 168) || (a === 198 && (b === 18 || b === 19)) ||
       (a === 198 && b === 51 && c === 100) || (a === 203 && b === 0 && c === 113));
   }
-  if (isIP(address) !== 6) return false;
-  const normalized = address.toLowerCase();
-  return !(normalized === "::" || normalized === "::1" ||
-    normalized.startsWith("fc") || normalized.startsWith("fd") ||
-    /^fe[89ab]/.test(normalized) || normalized.startsWith("ff") ||
-    normalized.startsWith("2001:db8:"));
+  const words = parseIpv6Words(address);
+  if (words === undefined) return false;
+  const [a, b, c, d, e, f] = words;
+  const dotted = /(?:^|:)(\d+\.\d+\.\d+\.\d+)$/.exec(address)?.[1];
+  if (dotted !== undefined && !isPublicAddress(dotted)) return false;
+  return !(
+    a === 0 || // unspecified, loopback, IPv4-compatible, translated, and mapped forms
+    (a === 0x0064 && b === 0xff9b &&
+      ((c === 0 && d === 0 && e === 0 && f === 0) || c === 1)) || // both standardized NAT64 prefixes
+    (a === 0x0100 && b === 0 && c === 0 && d === 0) || // discard-only
+    (a === 0x2001 && b! <= 0x01ff) || // IETF protocol assignments, including Teredo
+    (a === 0x2001 && b === 0x0db8) || // documentation
+    a === 0x2002 || // 6to4 embeds an IPv4 target
+    (a! & 0xfff0) === 0x3ff0 || // documentation
+    a === 0x5f00 || // segment-routing special-purpose block
+    (a! & 0xfe00) === 0xfc00 || // unique local
+    (a! & 0xffc0) === 0xfe80 || // link local
+    (a! & 0xffc0) === 0xfec0 || // deprecated site local
+    (a! & 0xff00) === 0xff00 || // multicast
+    (a === 0x2620 && b === 0x004f && c === 0x8000) // special-purpose AS112 service prefix
+  );
 }
 
 function validateAddresses(addresses: readonly ResolvedAddress[]): readonly ResolvedAddress[] {
   if (addresses.length === 0 || addresses.length > 32 ||
-      addresses.some(({ address, family }) => (family !== 4 && family !== 6) || !isPublicAddress(address))) {
+      addresses.some(({ address, family }) => isIP(address) !== family || !isPublicAddress(address))) {
     throw knownFailure("tool_failure", "HTTP JSON DNS target was rejected");
   }
   return [...new Map(addresses.map((entry) => [`${entry.family}:${entry.address}`, entry])).values()];

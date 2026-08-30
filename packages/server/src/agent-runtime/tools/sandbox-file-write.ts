@@ -1,5 +1,17 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
-import { closeSync, constants, existsSync, lstatSync, openSync, realpathSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  realpathSync,
+  renameSync,
+  rmdirSync,
+  unlinkSync,
+} from "node:fs";
 import { mkdir, open, rename, rm, unlink, type FileHandle } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import type { ToolAdapter, ToolOutcome } from "../contracts.js";
@@ -113,7 +125,59 @@ function unseal(token: string, key: Uint8Array, limit: number): CompensationReco
 }
 
 function fdBase(fdRoot: string, handle: FileHandle, fallbackPath: string): string {
-  return process.platform === "linux" ? `${fdRoot}/${handle.fd}` : fallbackPath;
+  return fdRoot === "" ? fallbackPath : `${fdRoot}/${handle.fd}`;
+}
+
+function probeDescriptorChildren(root: string, rootIdentity: Identity, fdRoot: string): boolean {
+  const probeName = `.dao-capability-${randomUUID()}`;
+  const renamedName = `${probeName}.renamed`;
+  let rootFd: number | undefined;
+  let childFd: number | undefined;
+  let fileFd: number | undefined;
+  let fileCreated = false;
+  let fileRenamed = false;
+  let directoryCreated = false;
+  try {
+    rootFd = openSync(root, DIRECTORY_FLAGS);
+    const rootStat = fstatSync(rootFd, { bigint: true });
+    if (!rootStat.isDirectory() || rootStat.dev !== rootIdentity.dev || rootStat.ino !== rootIdentity.ino) return false;
+    const base = `${fdRoot}/${rootFd}`;
+    const descriptorStat = lstatSync(`${base}/.`, { bigint: true });
+    if (!descriptorStat.isDirectory() || descriptorStat.dev !== rootIdentity.dev || descriptorStat.ino !== rootIdentity.ino) return false;
+
+    mkdirSync(`${base}/${probeName}`, { mode: 0o700 });
+    directoryCreated = true;
+    childFd = openSync(`${base}/${probeName}`, DIRECTORY_FLAGS);
+    if (!fstatSync(childFd).isDirectory()) return false;
+    rmdirSync(`${base}/${probeName}`);
+    directoryCreated = false;
+    closeSync(childFd);
+    childFd = undefined;
+
+    fileFd = openSync(`${base}/${probeName}`, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    fileCreated = true;
+    if (!fstatSync(fileFd).isFile()) return false;
+    closeSync(fileFd);
+    fileFd = undefined;
+    renameSync(`${base}/${probeName}`, `${base}/${renamedName}`);
+    fileCreated = false;
+    fileRenamed = true;
+    unlinkSync(`${base}/${renamedName}`);
+    fileRenamed = false;
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (fileFd !== undefined) closeSync(fileFd);
+    if (childFd !== undefined) closeSync(childFd);
+    if (rootFd !== undefined) {
+      const base = `${fdRoot}/${rootFd}`;
+      if (fileCreated) try { unlinkSync(`${base}/${probeName}`); } catch { /* fail closed below */ }
+      if (fileRenamed) try { unlinkSync(`${base}/${renamedName}`); } catch { /* fail closed below */ }
+      if (directoryCreated) try { rmdirSync(`${base}/${probeName}`); } catch { /* fail closed below */ }
+      closeSync(rootFd);
+    }
+  }
 }
 
 async function openParent(
@@ -238,14 +302,7 @@ export function createSandboxFileWriteAdapter(options: SandboxFileWriteOptions):
   const rootIdentity = { dev: rootMetadata.dev, ino: rootMetadata.ino };
   const fdRoot = existsSync("/proc/self/fd") ? "/proc/self/fd" : existsSync("/dev/fd") ? "/dev/fd" : undefined;
   if (fdRoot === undefined) throw new TypeError("Sandbox descriptor-relative filesystem access is unavailable");
-  let descriptorChildrenReady = false;
-  if (process.platform === "linux" && fdRoot === "/proc/self/fd") {
-    const probeFd = openSync(root, DIRECTORY_FLAGS);
-    try {
-      descriptorChildrenReady = lstatSync(`${fdRoot}/${probeFd}/.`).isDirectory();
-    } catch { descriptorChildrenReady = false; }
-    finally { closeSync(probeFd); }
-  }
+  const descriptorChildrenReady = probeDescriptorChildren(root, rootIdentity, fdRoot);
   if (!descriptorChildrenReady && options.testOnlyAllowPathFallback !== true) {
     throw new TypeError("Sandbox descriptor-relative child traversal is unavailable; startup refused");
   }
@@ -265,9 +322,9 @@ export function createSandboxFileWriteAdapter(options: SandboxFileWriteOptions):
     async execute(invocation): Promise<ToolOutcome> {
       const parameters = parseParameters(invocation.parameters, options.maxContentBytes);
       const segments = parsePath(parameters.path);
-      const opened = await openParent(root, rootIdentity, fdRoot, segments);
+      const opened = await openParent(root, rootIdentity, descriptorChildrenReady ? fdRoot : "", segments);
       try {
-        const targetPath = `${fdBase(fdRoot, opened.parent, opened.parentPath)}/${opened.targetName}`;
+        const targetPath = `${fdBase(descriptorChildrenReady ? fdRoot : "", opened.parent, opened.parentPath)}/${opened.targetName}`;
         const before = await readBoundedFile(targetPath, maxPreimageBytes);
         if (sha256(before ?? "") !== parameters.expectedCurrentSha256) throw knownFailure("execution_conflict", "Sandbox target hash changed");
         const content = new TextEncoder().encode(parameters.content);
@@ -280,7 +337,7 @@ export function createSandboxFileWriteAdapter(options: SandboxFileWriteOptions):
         // Recheck immediately at the descriptor-anchored rename boundary.
         const current = await readBoundedFile(targetPath, maxPreimageBytes);
         if (sha256(current ?? "") !== parameters.expectedCurrentSha256) throw knownFailure("execution_conflict", "Sandbox target hash changed");
-        await atomicReplace(opened.parent, opened.parentPath, fdRoot, opened.targetName, content, invocation.signal, options.testHooks);
+        await atomicReplace(opened.parent, opened.parentPath, descriptorChildrenReady ? fdRoot : "", opened.targetName, content, invocation.signal, options.testHooks);
         const postimage = await readBoundedFile(targetPath, options.maxContentBytes);
         if (postimage === undefined || sha256(postimage) !== postHash) throw ambiguousFailure("Sandbox postimage could not be proven");
         return {
@@ -294,9 +351,9 @@ export function createSandboxFileWriteAdapter(options: SandboxFileWriteOptions):
     async compensate(token, signal): Promise<ToolOutcome> {
       const record = unseal(token, key, maxCompensationBytes);
       const segments = parsePath(record.path);
-      const opened = await openParent(root, rootIdentity, fdRoot, segments);
+      const opened = await openParent(root, rootIdentity, descriptorChildrenReady ? fdRoot : "", segments);
       try {
-        const targetPath = `${fdBase(fdRoot, opened.parent, opened.parentPath)}/${opened.targetName}`;
+        const targetPath = `${fdBase(descriptorChildrenReady ? fdRoot : "", opened.parent, opened.parentPath)}/${opened.targetName}`;
         const current = await readBoundedFile(targetPath, options.maxContentBytes);
         if (current === undefined || sha256(current) !== record.expectedPostSha256) {
           throw knownFailure("execution_conflict", "Sandbox compensation hash fence failed");
@@ -314,7 +371,7 @@ export function createSandboxFileWriteAdapter(options: SandboxFileWriteOptions):
         } else {
           const before = Buffer.from(record.beforeBase64, "base64");
           if (before.byteLength > maxPreimageBytes) throw knownFailure("invalid_parameters", "Compensation preimage was rejected");
-          await atomicReplace(opened.parent, opened.parentPath, fdRoot, opened.targetName, before, signal, options.testHooks);
+          await atomicReplace(opened.parent, opened.parentPath, descriptorChildrenReady ? fdRoot : "", opened.targetName, before, signal, options.testHooks);
         }
         return {
           outcome: "known_succeeded" as const,

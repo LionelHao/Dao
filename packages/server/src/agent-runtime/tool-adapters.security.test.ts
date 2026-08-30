@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import {
+  chmodSync,
   linkSync,
   mkdirSync,
   mkdtempSync,
@@ -92,6 +93,50 @@ describe("FT-10 production adapter security", () => {
       .rejects.toMatchObject({ outcome: "known_failed" });
   });
 
+  it("conservatively rejects IPv6 transition, embedded, scoped, and special-purpose targets", async () => {
+    const rejected = [
+      "::192.168.1.1", // deprecated IPv4-compatible
+      "::ffff:c0a8:101", // hexadecimal IPv4-mapped
+      "64:ff9b::c0a8:101", // well-known NAT64
+      "64:ff9b:1::c0a8:101", // local-use NAT64
+      "2002:c0a8:0101::", // 6to4
+      "2001::c0a8:101", // Teredo / IETF protocol assignment
+      "100::1", // discard-only
+      "3fff::1", // documentation
+      "5f00::1", // segment-routing special-purpose block
+      "fec0::1", // deprecated site-local
+      "2620:4f:8000::1", // special-purpose AS112 service prefix
+      "fe80::1%lo0", // scoped link-local
+    ] as const;
+    for (const address of rejected) {
+      const adapter = createHttpJsonReadAdapter({
+        origin: "https://data.example.test",
+        pathPrefix: "/v1/",
+        maxResponseBytes: 1_024,
+        fetch: async () => new Response('{"ok":true}', {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+        resolveHost: async () => [{ address, family: 6 }],
+      });
+      await expect(adapter.execute(invocation("http-json.read", { path: "record" })), address)
+        .rejects.toMatchObject({ outcome: "known_failed" });
+    }
+
+    const publicIpv6 = createHttpJsonReadAdapter({
+      origin: "https://data.example.test",
+      pathPrefix: "/v1/",
+      maxResponseBytes: 1_024,
+      fetch: async () => new Response('{"ok":true}', {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+      resolveHost: async () => [{ address: "2606:4700:4700::1111", family: 6 }],
+    });
+    await expect(publicIpv6.execute(invocation("http-json.read", { path: "record" })))
+      .resolves.toMatchObject({ outcome: "known_succeeded" });
+  });
+
   it("bounds declared and streamed HTTP bytes and applies one total abort deadline", async () => {
     const declared = createHttpJsonReadAdapter({
       origin: "https://data.example.test",
@@ -168,6 +213,35 @@ describe("FT-10 production adapter security", () => {
       else expect(construct).toThrow(/descriptor-anchored repository cwd.*startup refused/i);
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("overrides repository-local core.fsmonitor so Git cannot launch an arbitrary process", async () => {
+    const parent = mkdtempSync(join(tmpdir(), "dao-git-fsmonitor-"));
+    const root = join(parent, "repo");
+    const monitor = join(parent, "malicious-fsmonitor.sh");
+    const marker = join(parent, "fsmonitor-ran");
+    try {
+      mkdirSync(root);
+      execFileSync("/usr/bin/git", ["-C", root, "init", "--quiet"]);
+      writeFileSync(monitor, `#!/bin/sh\ntouch '${marker}'\nprintf '\\0'\n`);
+      chmodSync(monitor, 0o700);
+      execFileSync("/usr/bin/git", ["-C", root, "config", "core.fsmonitor", monitor]);
+      execFileSync("/usr/bin/git", ["-C", root, "status", "--porcelain=v1", "--untracked-files=no"]);
+      expect(readFileSync(marker, "utf8")).toBe("");
+      rmSync(marker);
+      const adapter = createRepositoryGitStatusAdapter({
+        binaryPath: "/usr/bin/git",
+        repositoryRoot: root,
+        maxOutputBytes: 8_192,
+        timeoutMs: 2_000,
+        testOnlyAllowPathFallback: process.platform !== "linux",
+      });
+      await expect(adapter.execute(invocation("repository.git-status", {})))
+        .resolves.toMatchObject({ outcome: "known_succeeded" });
+      expect(() => readFileSync(marker)).toThrow();
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
     }
   });
 
