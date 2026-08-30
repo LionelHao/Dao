@@ -13,6 +13,8 @@ import type {
   ScopedCancellationCommitEffect,
   ScopedCancellationCommitReceipt,
 } from "../scoped-cancellation/scoped-cancellation-orchestrator.js";
+import { settleToolSafetyExecutionFenceInTransaction } from
+  "../tool-safety/database-authority.js";
 
 export type InternalScopedProducerCapability =
   | "message_authority"
@@ -372,11 +374,15 @@ function dispositions(database: DatabaseSync, executionId: string, attemptSeq: n
     `SELECT dispatch_id AS id, state FROM tool_dispatches
      WHERE execution_id = ? AND attempt_seq = ? ORDER BY dispatch_id`,
   ).all(executionId, attemptSeq);
-  const rejectedConfirmationIds = confirmations.flatMap((row) =>
+  const legacyRejectedConfirmationIds = confirmations.flatMap((row) =>
     row.state === "pending" && typeof row.id === "string" ? [row.id] : []);
-  const revokedGrantIds = grants.flatMap((row) =>
+  const legacyRevokedGrantIds = grants.flatMap((row) =>
     row.state === "active" && typeof row.id === "string" ? [row.id] : []);
-  const preservedDispatchIds = dispatches.flatMap((row) => typeof row.id === "string" ? [row.id] : []);
+  const legacyPreservedDispatchIds = dispatches.flatMap((row) =>
+    typeof row.id === "string" ? [row.id] : []);
+  let v2RejectedConfirmationIds: readonly string[] = [];
+  let v2RevokedGrantIds: readonly string[] = [];
+  let v2PreservedDispatchIds: readonly string[] = [];
   if (apply) {
     database.prepare(
       `UPDATE tool_confirmations SET confirmation_state = 'rejected', confirmation_reason = ?,
@@ -388,7 +394,30 @@ function dispositions(database: DatabaseSync, executionId: string, attemptSeq: n
          grant_revision = grant_revision + 1, grant_changed_at = ?
        WHERE execution_id = ? AND attempt_seq = ? AND grant_state = 'active'`,
     ).run(reason, occurredAt, executionId, attemptSeq);
+    const hasToolSafetyV2 = database.prepare(
+      `SELECT COUNT(*) AS count FROM sqlite_master
+       WHERE type = 'table' AND name IN (
+         'tool_calls_v2','tool_confirmations_v2','tool_grants_v2','tool_dispatches_v2'
+       )`,
+    ).get()?.count === 4;
+    if (hasToolSafetyV2) {
+      const fenceReason = reason === "message_recalled" ? "source_recalled"
+        : reason === "membership_revoked" ? "principal_revoked" : "execution_cancelled";
+      const v2 = settleToolSafetyExecutionFenceInTransaction(
+        database, executionId, fenceReason, occurredAt,
+      );
+      v2RejectedConfirmationIds = v2.rejectedConfirmationIds;
+      v2RevokedGrantIds = v2.revokedGrantIds;
+      v2PreservedDispatchIds = v2.preservedDispatchIds;
+    }
   }
+  const rejectedConfirmationIds = [...new Set([
+    ...legacyRejectedConfirmationIds, ...v2RejectedConfirmationIds,
+  ])];
+  const revokedGrantIds = [...new Set([...legacyRevokedGrantIds, ...v2RevokedGrantIds])];
+  const preservedDispatchIds = [...new Set([
+    ...legacyPreservedDispatchIds, ...v2PreservedDispatchIds,
+  ])];
   return {
     rejectedConfirmationIds,
     revokedGrantIds,
@@ -397,7 +426,8 @@ function dispositions(database: DatabaseSync, executionId: string, attemptSeq: n
       : confirmations.some((row) => row.state === "confirmed") ? "confirmed_retained" : "none",
     grantDisposition: revokedGrantIds.length > 0 ? "unclaimed_revoked"
       : grants.some((row) => row.state === "claimed") ? "claimed_retained" : "none",
-    sideEffectState: dispatches.some((row) => row.state === "outcome_unknown")
+    sideEffectState: v2PreservedDispatchIds.length > 0 ||
+      dispatches.some((row) => row.state === "outcome_unknown")
       ? "outcome-unknown-retained" : preservedDispatchIds.length > 0 ? "dispatched-retained" : "none",
   };
 }

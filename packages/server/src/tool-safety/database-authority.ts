@@ -476,6 +476,20 @@ function writeRepair(
   }
 }
 
+/** Shared transaction-local writer for lifecycle participants that terminalize FT-10 facts. */
+export function writeToolSafetyProjectionInTransaction(
+  database: DatabaseSync,
+  kind: "tool-call" | "tool-confirmation" | "tool-grant" | "tool-dispatch" |
+    "tool-review" | "tool-handoff" | "tool-compensation",
+  id: string,
+  roomId: string,
+  version: number,
+  projection: Readonly<Record<string, unknown>>,
+  occurredAt: string,
+): void {
+  writeRepair(database, kind, id, roomId, version, projection, occurredAt);
+}
+
 function prepare(
   database: DatabaseSync,
   operation: Extract<ToolSafetyAuthorityOperation, { type: "tool-safety.prepare" }>,

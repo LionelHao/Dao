@@ -9,6 +9,7 @@ import {
   type AuthorityTransactionView,
   type ParticipantRegistration,
 } from "../room-governance/private-participant-contracts.js";
+import { writeToolSafetyProjectionInTransaction } from "./database-authority.js";
 
 const FEATURE = "archive-settlement" as const;
 const REGISTRATION_ID = "dao.tool-safety.archive-settlement.v1";
@@ -375,6 +376,12 @@ function settleDatabase(
   validateConfirmationBindings(database, input.roomId);
   validateGrantBindings(database, input.roomId);
   const dispatches = validateDispatches(database, input.roomId);
+  const hasToolSafetyV2 = database.prepare(
+    `SELECT COUNT(*) AS count FROM sqlite_master
+     WHERE type = 'table' AND name IN (
+       'tool_calls_v2','tool_confirmations_v2','tool_grants_v2','tool_dispatches_v2'
+     )`,
+  ).get()?.count === 4;
   const waitingRows = database.prepare(
     `SELECT execution.id AS executionId,
             execution.current_attempt_seq AS currentAttemptSeq,
@@ -400,11 +407,11 @@ function settleDatabase(
          SELECT 1 FROM tool_dispatches AS dispatch
          WHERE dispatch.execution_id = execution.id
        )
-       AND NOT EXISTS (
+       ${hasToolSafetyV2 ? `AND NOT EXISTS (
          SELECT 1 FROM tool_dispatches_v2 AS dispatch
          JOIN tool_calls_v2 AS call ON call.tool_call_id = dispatch.tool_call_id
          WHERE call.execution_id = execution.id
-       )
+       )` : ""}
      ORDER BY execution.id`,
   ).all(input.roomId) as unknown as readonly WaitingExecutionRow[];
   for (const row of waitingRows) {
@@ -449,18 +456,18 @@ function settleDatabase(
     });
   }
 
-  const pendingV2 = database.prepare(
+  const pendingV2 = hasToolSafetyV2 ? database.prepare(
     `SELECT confirmation.confirmation_id AS confirmationId,
             confirmation.tool_call_id AS toolCallId,
             confirmation.binding_generation AS bindingGeneration,
             confirmation.principal_human_actor_id AS principalActorId,
             confirmation.session_family_id AS sessionFamilyId,
-            confirmation.version, call.safe_preview_json AS safePreviewJson
+            confirmation.version
      FROM tool_confirmations_v2 AS confirmation
      JOIN tool_calls_v2 AS call ON call.tool_call_id = confirmation.tool_call_id
      WHERE call.room_id = ? AND confirmation.state = 'pending'
      ORDER BY confirmation.confirmation_id`,
-  ).all(input.roomId) as unknown as readonly Record<string, unknown>[];
+  ).all(input.roomId) as unknown as readonly Record<string, unknown>[] : [];
   for (const row of pendingV2) {
     const confirmationId = row.confirmationId as string;
     const nextVersion = (row.version as number) + 1;
@@ -479,16 +486,9 @@ function settleDatabase(
     ).run(`archive-decision:${input.archiveGeneration}:${confirmationId}`, confirmationId,
       row.toolCallId as string, row.bindingGeneration as number, row.principalActorId as string,
       row.sessionFamilyId as string, nextVersion, input.now);
-    database.prepare(
-      `INSERT INTO tool_safety_repair_records_v2 (
-         kind, record_id, room_id, stable_key, version, projection_json, updated_at
-       ) VALUES ('tool-confirmation', ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(kind, record_id) DO UPDATE SET version = excluded.version,
-         projection_json = excluded.projection_json, updated_at = excluded.updated_at`,
-    ).run(confirmationId, input.roomId, `tool-confirmation:${confirmationId}`, nextVersion,
-      JSON.stringify({ confirmationId, toolCallId: row.toolCallId, state: "rejected",
-        reason: "room_archived", version: nextVersion,
-        safePreview: JSON.parse(row.safePreviewJson as string) as unknown }), input.now);
+    writeToolSafetyProjectionInTransaction(database, "tool-confirmation", confirmationId,
+      input.roomId, nextVersion, { confirmationId, toolCallId: row.toolCallId,
+        state: "rejected", reason: "room_archived", version: nextVersion }, input.now);
     insertMember(database, { ...input, subjectKind: "confirmation",
       subjectId: confirmationId, disposition: "rejected_pending" });
   }
@@ -515,13 +515,13 @@ function settleDatabase(
     });
   }
 
-  const activeGrantsV2 = database.prepare(
+  const activeGrantsV2 = hasToolSafetyV2 ? database.prepare(
     `SELECT grant.grant_id AS grantId, grant.version, grant.tool_call_id AS toolCallId
      FROM tool_grants_v2 AS grant
      JOIN tool_calls_v2 AS call ON call.tool_call_id = grant.tool_call_id
      WHERE call.room_id = ? AND grant.state = 'active'
      ORDER BY grant.grant_id`,
-  ).all(input.roomId) as unknown as readonly Record<string, unknown>[];
+  ).all(input.roomId) as unknown as readonly Record<string, unknown>[] : [];
   for (const row of activeGrantsV2) {
     const grantId = row.grantId as string;
     const nextVersion = (row.version as number) + 1;
@@ -537,15 +537,9 @@ function settleDatabase(
          transition_version, occurred_at
        ) VALUES (?, ?, 'active', 'revoked', 'room_archived', ?, ?)`,
     ).run(`archive-grant:${input.archiveGeneration}:${grantId}`, grantId, nextVersion, input.now);
-    database.prepare(
-      `INSERT INTO tool_safety_repair_records_v2 (
-         kind, record_id, room_id, stable_key, version, projection_json, updated_at
-       ) VALUES ('tool-grant', ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(kind, record_id) DO UPDATE SET version = excluded.version,
-         projection_json = excluded.projection_json, updated_at = excluded.updated_at`,
-    ).run(grantId, input.roomId, `tool-grant:${grantId}`, nextVersion,
-      JSON.stringify({ grantId, toolCallId: row.toolCallId, state: "revoked",
-        reason: "room_archived", version: nextVersion }), input.now);
+    writeToolSafetyProjectionInTransaction(database, "tool-grant", grantId,
+      input.roomId, nextVersion, { grantId, toolCallId: row.toolCallId,
+        state: "revoked", reason: "room_archived", version: nextVersion }, input.now);
     insertMember(database, { ...input, subjectKind: "grant", subjectId: grantId,
       disposition: "revoked_unclaimed" });
   }
@@ -584,7 +578,7 @@ function settleDatabase(
       disposition: "preserved_dispatched",
     });
   }
-  const dispatchesV2 = database.prepare(
+  const dispatchesV2 = hasToolSafetyV2 ? database.prepare(
     `SELECT dispatch.dispatch_id AS dispatchId
      FROM tool_dispatches_v2 AS dispatch
      JOIN tool_calls_v2 AS call ON call.tool_call_id = dispatch.tool_call_id
@@ -592,7 +586,7 @@ function settleDatabase(
        SELECT 1 FROM tool_dispatches AS legacy
        WHERE legacy.dispatch_id = dispatch.dispatch_id
      ) ORDER BY dispatch.dispatch_id`,
-  ).all(input.roomId) as unknown as readonly { readonly dispatchId: string }[];
+  ).all(input.roomId) as unknown as readonly { readonly dispatchId: string }[] : [];
   for (const row of dispatchesV2) {
     insertMember(database, { ...input, subjectKind: "dispatch", subjectId: row.dispatchId,
       disposition: "preserved_dispatched" });
