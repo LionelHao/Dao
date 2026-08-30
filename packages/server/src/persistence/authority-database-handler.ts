@@ -5374,7 +5374,13 @@ function appendCanonicalRuntimeEvents(
             runtime.completed_at AS completedAt, runtime.terminal_reason AS terminalReason,
             runtime.terminal_error_code AS terminalErrorCode, runtime.review_state AS reviewState,
             legacy.dead_lettered_at AS deadLetteredAt,
-            legacy.result_message_id AS resultMessageId
+            legacy.result_message_id AS resultMessageId,
+            EXISTS (
+              SELECT 1 FROM tool_dispatches_v2 AS dispatch
+              JOIN tool_calls_v2 AS call ON call.tool_call_id = dispatch.tool_call_id
+              WHERE call.execution_id = runtime.execution_id
+                AND dispatch.state = 'outcome_unknown'
+            ) AS unresolvedReview
      FROM agent_execution_runtime_states AS runtime
      JOIN agent_executions AS legacy ON legacy.id = runtime.execution_id
      WHERE runtime.execution_id = ? AND runtime.review_state <> 'legacy_review_required'`,
@@ -5399,7 +5405,9 @@ function appendCanonicalRuntimeEvents(
     ...(status === "cancelled" ? { cancellationReason: row.terminalReason } : {}),
     ...(status === "failed" ? {
       terminalErrorCode: row.terminalErrorCode,
-      reviewState: row.reviewState === "needs_review" ? "needs_review" : "not_required",
+      reviewState: row.reviewState === "needs_review"
+        ? row.unresolvedReview === 1 ? "needs_review" : "reviewed"
+        : "not_required",
     } : {}),
     ...(typeof row.deadLetteredAt === "string" ? { deadLetteredAt: row.deadLetteredAt } : {}),
     ...(typeof row.resultMessageId === "string" ? { resultMessageId: row.resultMessageId } : {}),
@@ -8985,8 +8993,16 @@ export function executeRuntimeAuthorityOperation(
         if (canonical?.authorityVersion !== operation.expectedVersion) {
           return fail("execution_conflict", "Retry expectedVersion was stale");
         }
+        const unresolvedReview = canonical.reviewState === "needs_review" && database.prepare(
+          `SELECT 1 AS present
+           FROM tool_dispatches_v2 AS dispatch
+           JOIN tool_calls_v2 AS call ON call.tool_call_id = dispatch.tool_call_id
+           WHERE call.execution_id = ? AND dispatch.state = 'outcome_unknown'
+           LIMIT 1`,
+        ).get(old.id)?.present === 1;
         if ((canonical.publicStatus !== "failed" && canonical.publicStatus !== "cancelled") ||
-            canonical.reviewState !== "none") {
+            (canonical.reviewState !== "none" && !
+             (canonical.reviewState === "needs_review" && !unresolvedReview))) {
           return fail("execution_conflict", "Execution is not eligible for Human retry");
         }
       }

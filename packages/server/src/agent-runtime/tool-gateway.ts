@@ -361,6 +361,8 @@ export function createToolSafetyGateway(options: ToolSafetyGatewayOptions): Tool
     settleUnknown(): Promise<void>;
   }>>();
   let closed = false;
+  let closeComplete = false;
+  let closeAttempt: Promise<void> | undefined;
 
   const run = async (input: ToolSafetyGatewayExecutionInput): Promise<ToolOutcome> => {
     if (closed) throw new AgentRuntimeError("agent_runtime_closed", "Tool gateway is shutting down");
@@ -460,6 +462,14 @@ export function createToolSafetyGateway(options: ToolSafetyGatewayOptions): Tool
       state: ToolDispatchSettlement["state"];
       result: Promise<void>;
     }> | undefined;
+    let physicalComplete = false;
+    const markPhysicalComplete = (): void => {
+      physicalComplete = true;
+      if (terminalSettlement !== undefined) {
+        void terminalSettlement.result.then(() => claimedInFlight.delete(claim.dispatchId),
+          () => undefined);
+      }
+    };
     const settle = async (settlement: ToolDispatchSettlement): Promise<void> => {
       terminalSettlement ??= Object.freeze({
         state: settlement.state,
@@ -467,7 +477,7 @@ export function createToolSafetyGateway(options: ToolSafetyGatewayOptions): Tool
           .then(() => options.authority.settleDispatch(settlement))
           .then(() => {
             latch.settle(claim.dispatchId);
-            claimedInFlight.delete(claim.dispatchId);
+            if (physicalComplete) claimedInFlight.delete(claim.dispatchId);
           }),
       });
       try {
@@ -506,6 +516,7 @@ export function createToolSafetyGateway(options: ToolSafetyGatewayOptions): Tool
       );
     }
     if (consumedPermit === undefined) {
+      markPhysicalComplete();
       await settle({
         dispatchId: claim.dispatchId,
         expectedVersion: 2,
@@ -520,6 +531,7 @@ export function createToolSafetyGateway(options: ToolSafetyGatewayOptions): Tool
     // The claim is conservatively terminalized as unknown and cannot be
     // cancelled, retried, or re-dispatched.
     if (closed || input.signal.aborted) {
+      markPhysicalComplete();
       await settle({
         dispatchId: claim.dispatchId,
         expectedVersion: 2,
@@ -562,6 +574,7 @@ export function createToolSafetyGateway(options: ToolSafetyGatewayOptions): Tool
     } catch {
       outcome = Object.freeze({ state: "ambiguous", summary: Object.freeze({ outcome: "unknown" }) });
     }
+    markPhysicalComplete();
 
     if (outcome.state === "known_succeeded") {
       await settle({
@@ -617,28 +630,45 @@ export function createToolSafetyGateway(options: ToolSafetyGatewayOptions): Tool
         inFlight.delete(operation);
       }
     },
-    async close(): Promise<void> {
-      if (closed) return;
+    close(): Promise<void> {
+      if (closeComplete) return Promise.resolve();
+      if (closeAttempt !== undefined) return closeAttempt;
       closed = true;
       latch.close();
-      const deadline = Date.now() + shutdownWaitMs;
-      const waitBounded = async (operation: Promise<unknown>): Promise<void> => {
-        const remaining = deadline - Date.now();
-        if (remaining <= 0) return;
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        await Promise.race([
-          operation,
-          new Promise<void>((resolve) => { timer = setTimeout(resolve, remaining); }),
-        ]);
-        if (timer !== undefined) clearTimeout(timer);
-      };
-      const claimed = [...claimedInFlight.values()];
-      // Attempt the durable unknown settlement first. Only then abort the
-      // physical boundary; a timeout retains the latch and still cannot make
-      // the same dispatch replayable.
-      await waitBounded(Promise.allSettled(claimed.map((operation) => operation.settleUnknown())));
-      for (const operation of claimed) operation.abort();
-      if (inFlight.size > 0) await waitBounded(Promise.allSettled([...inFlight]));
+      closeAttempt = (async () => {
+        const deadline = Date.now() + shutdownWaitMs;
+        const waitBounded = async (operation: Promise<unknown>): Promise<void> => {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) {
+            throw new AgentRuntimeError("provider_timeout", "Tool gateway safety settlement timed out");
+          }
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            await Promise.race([
+              operation,
+              new Promise<never>((_resolve, reject) => {
+                timer = setTimeout(() => reject(new AgentRuntimeError(
+                  "provider_timeout", "Tool gateway safety settlement timed out",
+                )), remaining);
+              }),
+            ]);
+          } finally {
+            clearTimeout(timer);
+          }
+        };
+        const claimed = [...claimedInFlight.values()];
+        // No physical abort may happen until every claimed permit has a
+        // durably acknowledged outcome_unknown settlement. A timeout rejects
+        // close and leaves the adapter running so a later close can retry the
+        // same settlement promise without inventing physical truth.
+        await waitBounded(Promise.all(claimed.map((operation) => operation.settleUnknown())));
+        for (const operation of claimed) operation.abort();
+        if (inFlight.size > 0) await waitBounded(Promise.allSettled([...inFlight]));
+        closeComplete = true;
+      })().finally(() => {
+        closeAttempt = undefined;
+      });
+      return closeAttempt;
     },
   });
 }

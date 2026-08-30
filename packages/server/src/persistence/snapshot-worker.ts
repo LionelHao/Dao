@@ -907,7 +907,9 @@ function canonicalExecutionRepairRecord(row: Record<string, unknown>): RoomRepai
     ...(status === "cancelled" ? { cancellationReason: row.terminalReason } : {}),
     ...(status === "failed" ? {
       terminalErrorCode: row.terminalErrorCode,
-      reviewState: row.reviewState === "needs_review" ? "needs_review" as const : "not_required" as const,
+      reviewState: row.reviewState === "needs_review"
+        ? row.unresolvedReview === 1 ? "needs_review" as const : "reviewed" as const
+        : "not_required" as const,
     } : {}),
     ...(typeof row.deadLetteredAt === "string" ? { deadLetteredAt: row.deadLetteredAt } : {}),
     ...(typeof row.resultMessageId === "string" ? { resultMessageId: row.resultMessageId } : {}),
@@ -1192,7 +1194,13 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
               runtime.completed_at AS completedAt, runtime.terminal_reason AS terminalReason,
               runtime.terminal_error_code AS terminalErrorCode, runtime.review_state AS reviewState,
               execution.dead_lettered_at AS deadLetteredAt,
-              execution.result_message_id AS resultMessageId
+              execution.result_message_id AS resultMessageId,
+              EXISTS (
+                SELECT 1 FROM tool_dispatches_v2 AS dispatch
+                JOIN tool_calls_v2 AS call ON call.tool_call_id = dispatch.tool_call_id
+                WHERE call.execution_id = runtime.execution_id
+                  AND dispatch.state = 'outcome_unknown'
+              ) AS unresolvedReview
        FROM agent_execution_runtime_states AS runtime
        JOIN agent_executions AS execution ON execution.id = runtime.execution_id
        WHERE execution.room_id = ? AND runtime.review_state <> 'legacy_review_required'`,
