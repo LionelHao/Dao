@@ -547,4 +547,68 @@ describe("FT-10 SQLite tool-safety authority", () => {
       fixture.close();
     }
   });
+
+  it("recovers a crash-after-claim as review-only unknown and validates exact Human evidence", () => {
+    const fixture = testDatabase();
+    const { database } = fixture;
+    try {
+      seedAuthority(database);
+      const claim = prepareAndClaim(database);
+      expect(transact(database, {
+        type: "tool-safety.recover-execution",
+        executionId: "execution-ft10",
+        now: NOW + 5_000,
+      })).toEqual({
+        kind: "recovery",
+        state: "outcome_unknown",
+        toolCallId: "tool-call-ft10",
+        dispatchId: claim.dispatchId,
+      });
+      expect(database.prepare(
+        "SELECT state, version FROM tool_dispatches_v2 WHERE dispatch_id = ?",
+      ).get(claim.dispatchId)).toEqual({ state: "outcome_unknown", version: 3 });
+
+      const evidenceSummary = "Human checked the target and confirmed no durable write exists.";
+      expect(() => transact(database, {
+        type: "tool-safety.outcome-review",
+        context: context("review-invalid-hash"),
+        dispatchId: claim.dispatchId,
+        expectedVersion: 3,
+        resolution: "known_failed",
+        evidenceSummary,
+        evidenceSha256: "0".repeat(64),
+        now: NOW + 6_000,
+      })).toThrow(/evidence/i);
+      const evidenceSha256 = createHash("sha256").update(evidenceSummary).digest("hex");
+      expect(transact(database, {
+        type: "tool-safety.outcome-review",
+        context: context("review-known-failed"),
+        dispatchId: claim.dispatchId,
+        expectedVersion: 3,
+        resolution: "known_failed",
+        evidenceSummary,
+        evidenceSha256,
+        now: NOW + 7_000,
+      })).toMatchObject({
+        kind: "reviewed",
+        dispatchId: claim.dispatchId,
+        resolution: "known_failed",
+        version: 4,
+        replayed: false,
+      });
+      expect(database.prepare(
+        `SELECT dispatch.state, review.principal_human_actor_id AS reviewer,
+                review.evidence_sha256 AS evidenceSha256
+         FROM tool_dispatches_v2 AS dispatch
+         JOIN tool_reviews_v2 AS review ON review.dispatch_id = dispatch.dispatch_id
+         WHERE dispatch.dispatch_id = ?`,
+      ).get(claim.dispatchId)).toEqual({
+        state: "reviewed",
+        reviewer: "human-ft10",
+        evidenceSha256,
+      });
+    } finally {
+      fixture.close();
+    }
+  });
 });
