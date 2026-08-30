@@ -43,8 +43,8 @@
 - implementation ready head: `67c87a4f3426a5a701c8d128ee07484cb5120c58`。
 - implementation CI: [quality 33316611639](https://github.com/LionelHao/Dao/actions/runs/33316611639)；Node 22.13.1 job `99271114499` success，Node 22.x job `99271114606` success。
 - implementation merge SHA: `1913218519c1cdbc968e60e6e2a3db8e448dbbab`。
-- evidence PR: 本证据分支创建后回填真实编号；最终 required checks 和 merge SHA 由 GitHub PR 记录。
-- evidence CI: PR创建后回填已完成的真实 run；最终 head checks 以 PR 页面为准。
+- evidence PR: [#76](https://github.com/LionelHao/Dao/pull/76)；最终 required checks 和 merge SHA 由 GitHub PR 记录。
+- evidence CI: [quality 33317789807 attempt 2](https://github.com/LionelHao/Dao/actions/runs/33317789807)；Node 22.13.1 job `99277444166` success，Node 22.x job `99277445137` success。首轮固定 runner 的多项目资源退化保留在 attempt 历史；最终 metadata head checks 仍以 PR 页面为准。
 - evidence merge SHA / final origin main: 证据 PR 合入后由 GitHub/`origin/main` 记录，当前不预填未来值。
 - exact test counts: 255 files（252 passed + 3 live skipped）；2693 tests（2690 passed + 3 skipped）；Core 13/116，Desktop 74/624，Server 168 files / 1953 tests。
 - migration statement/invariant/rollback/backfill/quarantine counts: v26 74/27/74；2 legacy grants + 2 confirmations；1 quarantine；migration adapter/event/outbox/repair=0。

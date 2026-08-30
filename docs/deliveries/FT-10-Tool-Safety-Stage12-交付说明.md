@@ -10,7 +10,8 @@
 - 实现 PR：[PR #75 — FT-10: deliver authoritative tool safety](https://github.com/LionelHao/Dao/pull/75)，squash merge SHA `1913218519c1cdbc968e60e6e2a3db8e448dbbab`。
 - 实现 PR 最终 head：`67c87a4f3426a5a701c8d128ee07484cb5120c58`；148 个文件，新增 15,342 行、删除 607 行。
 - 实现 CI：[quality 33316611639](https://github.com/LionelHao/Dao/actions/runs/33316611639)：[Node 22.13.1](https://github.com/LionelHao/Dao/actions/runs/33316611639/job/99271114499) 21m45s success；[Node 22.x](https://github.com/LionelHao/Dao/actions/runs/33316611639/job/99271114606) 19m43s success。
-- 证据 PR：本证据分支创建后回填真实编号；PR 页面将保留最终 required checks，最终 squash merge SHA 由 GitHub 在本 PR 合入时记录。
+- 证据 PR：[PR #76 — docs(ft10): record Stage 12 delivery evidence](https://github.com/LionelHao/Dao/pull/76)；PR 页面保留最终 metadata head 的 required checks，最终 squash merge SHA 由 GitHub 在本 PR 合入时记录。
+- 证据内容提交 CI：[quality 33317789807 attempt 2](https://github.com/LionelHao/Dao/actions/runs/33317789807)：[Node 22.13.1](https://github.com/LionelHao/Dao/actions/runs/33317789807/job/99277444166) 20m51s success；[Node 22.x](https://github.com/LionelHao/Dao/actions/runs/33317789807/job/99277445137) 19m52s success。
 
 仓库禁止 merge commit，因此实现 PR 按 branch protection 允许的 squash 方式合入；没有 force push、绕过 required checks 或修改 Blueprint。
 
@@ -123,6 +124,8 @@ CI 修复过程完整保留：
 3. run `33312459018` 的 Node 22.x 通过；Node 22.13.1 的 Human recovery keyset 用例在共享资源尾部触及 15s，隔离重复约 3.5s。
 4. run `33313911053` 在 v26 四个 rollback断言全部通过后出现 `onTaskUpdate`；run `33315252869` 再次证明单个 80s v26 worker仍会 RPC timeout，而另一 runner 在共享 persistence末端触及 Human keyset 15s。
 5. 最终将 schema foundations/recent/integrity、legacy、四个 v26 range、Human authority 与其余 persistence 分配到有界 fresh single-fork 生命周期；保留原 `worker-persistence` single-fork、测试数量、断言和全部 timeout。最终 run `33316611639` 双 Node success。
+
+证据 PR #76 的内容提交 run `33317789807` 首次执行中，Node 22.x 全绿；固定 Node runner 同时在 schema-v15、context snapshot、Human authority 与 authority E2E 四个已隔离项目出现 5 个分散的 5s/15s timeout，另有一次 `onTaskUpdate`，总时长异常扩大到 1445.19s。该 head 与实现 merge 完全相同且无生产代码差异；因此保留失败 attempt，并只执行 GitHub failed-job rerun。attempt 2 仍运行固定 Node 整个 255 files / 2693 tests，20m51s success；没有挑选单文件、修改代码、放宽断言或增加 timeout。最终 metadata head 仍须再次通过 PR required checks，才允许合并证据 PR。
 
 没有提高默认 15s测试超时，没有放宽或删除既有测试，没有把真实 AuthorityWorker/SQLite/adapter改成 fake。CI 的唯一 annotation 是 GitHub Actions 自身 Node 20 action runtime deprecation，不是产品或测试失败。
 
