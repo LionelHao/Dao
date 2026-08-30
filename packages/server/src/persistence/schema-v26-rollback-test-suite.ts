@@ -4,7 +4,6 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import {
-  AUTHORITY_V26_STATEMENT_COUNT_FOR_TEST,
   listAuthorityTables,
   migrateAuthorityDatabase,
   migrateAuthorityDatabaseToPreviousVersionForTest,
@@ -45,23 +44,14 @@ function snapshot(database: DatabaseSync): LogicalSnapshot {
   return { schemaVersion: readSchemaVersion(database), tables };
 }
 
-describe("v26 tool-safety migration rollback matrix", () => {
-  const chunkSize = 20;
-  const chunks = Array.from(
-    { length: Math.ceil(AUTHORITY_V26_STATEMENT_COUNT_FOR_TEST / chunkSize) },
-    (_, index) => ({
-      first: index * chunkSize + 1,
-      last: Math.min((index + 1) * chunkSize, AUTHORITY_V26_STATEMENT_COUNT_FOR_TEST),
-    }),
-  );
-
-  for (const chunk of chunks) {
+export function defineV26RollbackRangeTest(first: number, last: number): void {
+  describe("v26 tool-safety migration rollback matrix", () => {
     it(
-      `rolls statements ${chunk.first}-${chunk.last} back with v25 history intact`,
+      `rolls statements ${first}-${last} back with v25 history intact`,
       () => {
         for (
-          let failAfterStatement = chunk.first;
-          failAfterStatement <= chunk.last;
+          let failAfterStatement = first;
+          failAfterStatement <= last;
           failAfterStatement += 1
         ) {
           withDatabase((database) => {
@@ -77,5 +67,5 @@ describe("v26 tool-safety migration rollback matrix", () => {
       },
       30_000,
     );
-  }
-});
+  });
+}
