@@ -22,7 +22,8 @@ type ToolRecord =
   | { readonly kind: "tool-confirmation"; readonly value: { readonly confirmationId: string;
       readonly toolCallId: string; readonly toolId: string; readonly state: "pending" | "confirmed" | "rejected" | "expired";
       readonly safePreview: string; readonly reasonCode: string | null; readonly expiresAt: string;
-      readonly version: number; readonly namedHumanDisplayRef: string | null; readonly sourceRef: string } }
+      readonly version: number; readonly principalActorId: string;
+      readonly namedHumanDisplayRef: string | null; readonly sourceRef: string } }
   | { readonly kind: "tool-grant"; readonly value: { readonly grantId: string; readonly toolCallId: string;
       readonly state: "active" | "claimed" | "revoked" | "expired"; readonly reasonCode: string | null;
       readonly expiresAt: string; readonly version: number } }
@@ -69,7 +70,7 @@ function isToolRecord(value: unknown): value is ToolRecord {
   if (value.kind === "tool-confirmation") return text(payload.confirmationId) && text(payload.toolCallId) &&
     text(payload.toolId) && ["pending", "confirmed", "rejected", "expired"].includes(String(payload.state)) &&
     typeof payload.safePreview === "string" && (payload.reasonCode === null || text(payload.reasonCode)) &&
-    text(payload.expiresAt) && version(payload.version) &&
+    text(payload.expiresAt) && version(payload.version) && text(payload.principalActorId) &&
     (payload.namedHumanDisplayRef === null || text(payload.namedHumanDisplayRef)) && text(payload.sourceRef);
   if (value.kind === "tool-grant") return text(payload.grantId) && text(payload.toolCallId) &&
     ["active", "claimed", "revoked", "expired"].includes(String(payload.state)) &&
@@ -199,6 +200,7 @@ function buildCards(records: readonly unknown[], viewerActorId: string): readonl
       ...(typeof reasonCode === "string" ? { reasonCode } : {}),
       ...(confirmation?.value.namedHumanDisplayRef === null || confirmation?.value.namedHumanDisplayRef === undefined
         ? {} : { namedHumanDisplayRef: confirmation.value.namedHumanDisplayRef }),
+      ...(confirmation === undefined ? {} : { canDecide: confirmation.value.principalActorId === viewerActorId }),
       ...(review === undefined ? {} : { reviewResolution: review.value.resolution,
         evidenceSummary: review.value.evidenceSummary }),
       ...(confirmation?.value.state === "pending" ? { handoffCandidates: candidates } : {}),
@@ -332,14 +334,17 @@ export function createDesktopToolSafetyRuntime(options: Readonly<{
       try {
         const acknowledgement = await options.transport.toolSafetyCommand({ ...request.command, requestId });
         if (acknowledgement.replayed) {
-          if (commandCard !== undefined) {
-            const overrides = displayOverrides.get(request.roomId) ?? new Map();
-            overrides.set(commandCard.toolCallId, { state: "duplicate", version: commandCard.version });
-            displayOverrides.set(request.roomId, overrides);
-          }
           operations.set(request.roomId, { status: "error", requestId, action: commandAction,
             statusCode: 409, code: "confirmation_replayed" });
           await repair(request.roomId);
+          if (commandCard !== undefined) {
+            const repairedCard = state(request.roomId).cards.find((card) =>
+              card.toolCallId === commandCard.toolCallId);
+            const overrides = displayOverrides.get(request.roomId) ?? new Map();
+            overrides.set(commandCard.toolCallId, { state: "duplicate",
+              version: repairedCard?.version ?? commandCard.version });
+            displayOverrides.set(request.roomId, overrides);
+          }
           operations.set(request.roomId, { status: "error", requestId, action: commandAction,
             statusCode: 409, code: "confirmation_replayed" });
           return emit(request.roomId);
@@ -369,12 +374,18 @@ export function createDesktopToolSafetyRuntime(options: Readonly<{
             ["tool_already_terminal", "confirmation_already_terminal", "confirmation_replayed", "already_handled"]
               .includes(failure.code)) {
           const overrides = displayOverrides.get(request.roomId) ?? new Map();
-          overrides.set(commandCard.toolCallId, { state: "duplicate", version: commandCard.version });
+          const repairedCard = state(request.roomId).cards.find((card) =>
+            card.toolCallId === commandCard.toolCallId);
+          overrides.set(commandCard.toolCallId, { state: "duplicate",
+            version: repairedCard?.version ?? commandCard.version });
           displayOverrides.set(request.roomId, overrides);
         } else if (failure.status === 409 && commandCard !== undefined &&
             ["tool_parameters_changed", "params_changed"].includes(failure.code)) {
           const overrides = displayOverrides.get(request.roomId) ?? new Map();
-          overrides.set(commandCard.toolCallId, { state: "params-changed", version: commandCard.version });
+          const repairedCard = state(request.roomId).cards.find((card) =>
+            card.toolCallId === commandCard.toolCallId);
+          overrides.set(commandCard.toolCallId, { state: "params-changed",
+            version: repairedCard?.version ?? commandCard.version });
           displayOverrides.set(request.roomId, overrides);
         }
         return emit(request.roomId);

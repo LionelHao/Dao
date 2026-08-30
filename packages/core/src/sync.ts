@@ -216,7 +216,7 @@ export type ToolSafetyRepairRecord =
       confirmationId: string; toolCallId: string; toolId: string;
       state: "pending" | "confirmed" | "rejected" | "expired";
       safePreview: string; reasonCode: string | null; expiresAt: string;
-      version: number; namedHumanDisplayRef: string | null; sourceRef: string;
+      version: number; principalActorId: string; namedHumanDisplayRef: string | null; sourceRef: string;
     }> }
   | { readonly kind: "tool-grant"; readonly value: Readonly<{
       grantId: string; toolCallId: string;
@@ -775,11 +775,11 @@ export function isToolSafetyRepairRecord(value: unknown): value is ToolSafetyRep
   }
   if (value.kind === "tool-confirmation") {
     return exact(payload, ["confirmationId", "toolCallId", "toolId", "state", "safePreview",
-      "reasonCode", "expiresAt", "version", "namedHumanDisplayRef", "sourceRef"]) &&
+      "reasonCode", "expiresAt", "version", "principalActorId", "namedHumanDisplayRef", "sourceRef"]) &&
       text(payload.confirmationId) && text(payload.toolCallId) && text(payload.toolId) &&
       ["pending", "confirmed", "rejected", "expired"].includes(String(payload.state)) &&
       typeof payload.safePreview === "string" && text(payload.expiresAt) && count(payload.version) &&
-      (payload.reasonCode === null || text(payload.reasonCode)) &&
+      (payload.reasonCode === null || text(payload.reasonCode)) && text(payload.principalActorId) &&
       (payload.namedHumanDisplayRef === null || text(payload.namedHumanDisplayRef)) &&
       text(payload.sourceRef);
   }

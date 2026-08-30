@@ -35,6 +35,7 @@ export interface ToolSafetyCardProjection {
   readonly sourceRef: string;
   readonly reasonCode?: string;
   readonly namedHumanDisplayRef?: string;
+  readonly canDecide?: boolean;
   readonly reviewResolution?: "known_succeeded" | "known_failed" | "compensated" | "accepted_risk";
   readonly evidenceSummary?: string;
   readonly handoffCandidates?: readonly Readonly<{ actorId: string; displayRef: string }>[];
@@ -157,7 +158,7 @@ function isCard(value: unknown): value is ToolSafetyCardProjection {
     "toolCallId", "confirmationId", "version", "state", "toolId", "safeTarget", "parameterSummary",
     "impact", "reversibility", "expiresAt", "sourceRef",
   ], ["dispatchId", "reasonCode", "namedHumanDisplayRef", "reviewResolution", "evidenceSummary",
-    "handoffCandidates", "handoffId", "handoffVersion", "compensationKnownSucceeded"])) return false;
+    "handoffCandidates", "handoffId", "handoffVersion", "compensationKnownSucceeded", "canDecide"])) return false;
   if (!text(value.toolCallId) || typeof value.confirmationId !== "string" || !version(value.version) ||
       !CARD_STATES.has(value.state as ToolSafetyCardState) || !text(value.toolId) ||
       !text(value.safeTarget) || !text(value.parameterSummary) || !text(value.impact) ||
@@ -170,7 +171,8 @@ function isCard(value: unknown): value is ToolSafetyCardProjection {
   return ["dispatchId", "reasonCode", "namedHumanDisplayRef", "reviewResolution", "evidenceSummary",
     "handoffId"].every((key) => value[key] === undefined || text(value[key])) &&
     (value.handoffVersion === undefined || version(value.handoffVersion)) &&
-    (value.compensationKnownSucceeded === undefined || typeof value.compensationKnownSucceeded === "boolean");
+    (value.compensationKnownSucceeded === undefined || typeof value.compensationKnownSucceeded === "boolean") &&
+    (value.canDecide === undefined || typeof value.canDecide === "boolean");
 }
 
 export function isToolSafetySurfaceQuery(value: unknown): value is ToolSafetySurfaceQuery {

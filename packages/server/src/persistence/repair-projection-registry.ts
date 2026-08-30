@@ -87,6 +87,7 @@ export type PublicToolSafetyRepairRecord =
         reasonCode: string | null;
         expiresAt: string;
         version: number;
+        principalActorId: string;
         namedHumanDisplayRef: string | null;
         sourceRef: string;
       }>;
@@ -130,7 +131,7 @@ export type PublicToolSafetyRepairRecord =
       value: Readonly<{
         handoffId: string; confirmationId: string;
         state: "offered" | "accepted" | "rejected" | "expired";
-        targetNamedHumanDisplayRef: string; version: number;
+        targetActorId: string; targetNamedHumanDisplayRef: string; version: number;
       }>;
     }>
   | Readonly<{
@@ -184,11 +185,11 @@ export function isPublicToolSafetyRepairRecord(value: unknown): value is PublicT
   if (value.kind === "tool-confirmation") {
     return hasExactKeys(body, [
       "confirmationId", "toolCallId", "toolId", "state", "safePreview", "reasonCode",
-      "expiresAt", "version", "namedHumanDisplayRef", "sourceRef",
+      "expiresAt", "version", "principalActorId", "namedHumanDisplayRef", "sourceRef",
     ]) && safeText(body.confirmationId) && safeText(body.toolCallId) && safeText(body.toolId) &&
       ["pending", "confirmed", "rejected", "expired"].includes(body.state as string) &&
       safeText(body.safePreview) && (body.reasonCode === null || safeText(body.reasonCode, 256)) &&
-      safeText(body.expiresAt, 64) && positiveVersion(body.version) &&
+      safeText(body.expiresAt, 64) && positiveVersion(body.version) && safeText(body.principalActorId) &&
       (body.namedHumanDisplayRef === null || safeText(body.namedHumanDisplayRef, 256)) &&
       safeText(body.sourceRef, 512);
   }
@@ -217,10 +218,11 @@ export function isPublicToolSafetyRepairRecord(value: unknown): value is PublicT
       positiveVersion(body.version);
   }
   if (value.kind === "tool-handoff") {
-    return hasExactKeys(body, ["handoffId", "confirmationId", "state",
+    return hasExactKeys(body, ["handoffId", "confirmationId", "state", "targetActorId",
       "targetNamedHumanDisplayRef", "version"]) && safeText(body.handoffId) &&
       safeText(body.confirmationId) && ["offered", "accepted", "rejected", "expired"]
-        .includes(body.state as string) && safeText(body.targetNamedHumanDisplayRef, 256) &&
+        .includes(body.state as string) && safeText(body.targetActorId) &&
+      safeText(body.targetNamedHumanDisplayRef, 256) &&
       positiveVersion(body.version);
   }
   return value.kind === "tool-compensation" && hasExactKeys(body,

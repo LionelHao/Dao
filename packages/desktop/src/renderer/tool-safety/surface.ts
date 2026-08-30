@@ -42,6 +42,7 @@ export interface ToolSafetyCardProjection {
   readonly sourceRef: string;
   readonly reasonCode?: string;
   readonly namedHumanDisplayRef?: string;
+  readonly canDecide?: boolean;
   readonly reviewResolution?: "known_succeeded" | "known_failed" | "compensated" | "accepted_risk";
   readonly evidenceSummary?: string;
   readonly handoffTargetActorId?: string;
@@ -211,7 +212,8 @@ export function renderToolSafetySurface(
   const controls = document.createElement("div");
   controls.className = "tool-safety-actions";
 
-  if (state.card.state === "pending" || state.card.state === "compensation-pending") {
+  if ((state.card.state === "pending" || state.card.state === "compensation-pending") &&
+      state.card.canDecide === true) {
     controls.append(
       actionButton("确认执行一次", "confirm", connectionLocked || operationLocked, () => {
         if (connectionLocked || operationLocked) return;
@@ -261,13 +263,14 @@ export function renderToolSafetySurface(
             targetActorId: select.value });
         }));
     }
-    if (state.card.handoffId !== undefined) {
-      controls.append(actionButton("接受精确转交", "handoff-accept", connectionLocked || operationLocked, () => {
-        if (connectionLocked || operationLocked) return;
-        actions.submit({ type: "tool.confirmation.handoff.accept", handoffId: state.card.handoffId!,
-          expectedVersion: state.card.handoffVersion ?? state.card.version });
-      }));
-    }
+  }
+  if ((state.card.state === "pending" || state.card.state === "compensation-pending") &&
+      state.card.handoffId !== undefined) {
+    controls.append(actionButton("接受精确转交", "handoff-accept", connectionLocked || operationLocked, () => {
+      if (connectionLocked || operationLocked) return;
+      actions.submit({ type: "tool.confirmation.handoff.accept", handoffId: state.card.handoffId!,
+        expectedVersion: state.card.handoffVersion ?? state.card.version });
+    }));
   }
   if ((state.card.state === "outcome-unknown" || state.card.state === "compensation-outcome-unknown") &&
       state.card.dispatchId !== undefined) {

@@ -735,7 +735,7 @@ export type DesktopToolSafetyProjection =
       confirmationId: string; toolCallId: string; toolId: string;
       state: "pending" | "confirmed" | "rejected" | "expired";
       safePreview: string; reasonCode: string | null; expiresAt: string;
-      version: number; namedHumanDisplayRef: string | null; sourceRef: string;
+      version: number; principalActorId: string; namedHumanDisplayRef: string | null; sourceRef: string;
     }> }>
   | Readonly<{ kind: "tool-grant"; value: Readonly<{
       grantId: string; toolCallId: string;
@@ -757,7 +757,7 @@ export type DesktopToolSafetyProjection =
   | Readonly<{ kind: "tool-handoff"; value: Readonly<{
       handoffId: string; confirmationId: string;
       state: "offered" | "accepted" | "rejected" | "expired";
-      targetNamedHumanDisplayRef: string; version: number;
+      targetActorId: string; targetNamedHumanDisplayRef: string; version: number;
     }> }>
   | Readonly<{ kind: "tool-compensation"; value: Readonly<{
       lineageId: string; originalDispatchId: string; compensationInvocationId: string;
@@ -799,10 +799,11 @@ function validToolSafetyProjection(value: unknown): value is DesktopToolSafetyPr
         payload.state === "prepared" && positiveVersion(payload.version) && text(payload.sourceRef);
     case "tool-confirmation":
       return exact(payload, ["confirmationId", "toolCallId", "toolId", "state", "safePreview", "reasonCode",
-        "expiresAt", "version", "namedHumanDisplayRef", "sourceRef"]) && text(payload.confirmationId) &&
+        "expiresAt", "version", "principalActorId", "namedHumanDisplayRef", "sourceRef"]) && text(payload.confirmationId) &&
         text(payload.toolCallId) && text(payload.toolId) && CONFIRMATION_STATES.has(String(payload.state)) &&
         boundedSafeText(payload.safePreview) && nullableText(payload.reasonCode) && text(payload.expiresAt) &&
-        positiveVersion(payload.version) && nullableText(payload.namedHumanDisplayRef) && text(payload.sourceRef);
+        positiveVersion(payload.version) && text(payload.principalActorId) &&
+        nullableText(payload.namedHumanDisplayRef) && text(payload.sourceRef);
     case "tool-grant":
       return exact(payload, ["grantId", "toolCallId", "state", "reasonCode", "expiresAt", "version"]) &&
         text(payload.grantId) && text(payload.toolCallId) && GRANT_STATES.has(String(payload.state)) &&
@@ -818,9 +819,10 @@ function validToolSafetyProjection(value: unknown): value is DesktopToolSafetyPr
         text(payload.namedHumanDisplayRef) && nullableText(payload.compensationToolCallId) &&
         positiveVersion(payload.version);
     case "tool-handoff":
-      return exact(payload, ["handoffId", "confirmationId", "state", "targetNamedHumanDisplayRef", "version"]) &&
+      return exact(payload, ["handoffId", "confirmationId", "state", "targetActorId",
+        "targetNamedHumanDisplayRef", "version"]) &&
         text(payload.handoffId) && text(payload.confirmationId) && HANDOFF_STATES.has(String(payload.state)) &&
-        text(payload.targetNamedHumanDisplayRef) && positiveVersion(payload.version);
+        text(payload.targetActorId) && text(payload.targetNamedHumanDisplayRef) && positiveVersion(payload.version);
     case "tool-compensation":
       return exact(payload, ["lineageId", "originalDispatchId", "compensationInvocationId",
         "compensationExecutionId", "compensationToolCallId", "state", "version"]) &&

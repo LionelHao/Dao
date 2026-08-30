@@ -18,7 +18,7 @@ const call = { kind: "tool-call", value: { toolCallId: "call-1", toolId: "sandbo
 const pending = { kind: "tool-confirmation", value: { confirmationId: "confirmation-1",
   toolCallId: "call-1", toolId: "sandbox-file.write", state: "pending", safePreview: preview,
   reasonCode: null, expiresAt: "2026-08-30T08:10:00.000Z", version: 1,
-  namedHumanDisplayRef: "Human A", sourceRef: "message-1" } } as const;
+  principalActorId: "human-1", namedHumanDisplayRef: "Human A", sourceRef: "message-1" } } as const;
 
 describe("Tool Safety production bridge", () => {
   it("is registered and explicitly started by the production main process", () => {

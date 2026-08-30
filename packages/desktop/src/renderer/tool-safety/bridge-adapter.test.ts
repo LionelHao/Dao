@@ -8,7 +8,7 @@ const ready = (statusCode?: 409 | 410): ToolSafetyRemoteState => ({
     state: statusCode === 409 ? "params-changed" : statusCode === 410 ? "expired" : "pending",
     toolId: "sandbox-file.write", safeTarget: "notes/release.txt", parameterSummary: "12 bytes",
     impact: "write one file", reversibility: "compensatable", expiresAt: "2026-08-30T08:10:00.000Z",
-    sourceRef: "message-1" }],
+    sourceRef: "message-1", canDecide: true }],
   operation: statusCode === undefined ? { status: "idle" } : { status: "error",
     requestId: `request-${statusCode}`, action: "confirm", statusCode,
     code: statusCode === 409 ? "tool_parameters_changed" : "tool_confirmation_expired" },

@@ -1076,7 +1076,7 @@ describe("FT-10 tool-safety projection replica", () => {
       confirmationId: "confirmation-1", toolCallId: "tool-call-1", toolId: "sandbox-file.write",
       state: "pending", safePreview: "Write config.json (12 bytes)", reasonCode: null,
       expiresAt: "2026-08-30T08:10:00.000Z", version: 1,
-      namedHumanDisplayRef: "Human A", sourceRef: "message-1",
+      principalActorId: "human-1", namedHumanDisplayRef: "Human A", sourceRef: "message-1",
     },
   } as const;
 
@@ -1114,7 +1114,7 @@ describe("FT-10 tool-safety projection replica", () => {
         namedHumanDisplayRef: "Human A", compensationToolCallId: null, version: 1 },
     }, {
       kind: "tool-handoff", value: { handoffId: "handoff-1", confirmationId: "confirmation-1",
-        state: "offered", targetNamedHumanDisplayRef: "Human B", version: 1 },
+        state: "offered", targetActorId: "human-2", targetNamedHumanDisplayRef: "Human B", version: 1 },
     }, {
       kind: "tool-compensation", value: { lineageId: "lineage-1", originalDispatchId: "dispatch-1",
         compensationInvocationId: "invocation-2", compensationExecutionId: "execution-2",

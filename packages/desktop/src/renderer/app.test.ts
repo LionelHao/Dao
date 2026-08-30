@@ -123,7 +123,7 @@ describe("FT-10 J-05 tool-safety surface", () => {
     parameterSummary: "replace · 12 bytes · expected abc123…", impact: "更新 sandbox 文件",
     reversibility: "compensatable", expiresAt: "2026-08-30T08:10:00.000Z",
     sourceRef: "message-1", reasonCode: state.includes("revoked") ? "permission_reduced" : undefined,
-    namedHumanDisplayRef: "Human A",
+    namedHumanDisplayRef: "Human A", canDecide: true,
     ...(state === "reviewed" ? {
       reviewResolution: "accepted_risk" as const,
       evidenceSummary: "Human inspected the configured target.",
@@ -336,17 +336,27 @@ describe("FT-10 J-05 tool-safety surface", () => {
     const handoffActions = actions();
     importedApp.renderToolSafetySurface(root, {
       connection: { status: "online" },
-      card: { ...card("pending"), handoffTargetActorId: "human-2", handoffId: "handoff-1" },
+      card: { ...card("pending"), handoffTargetActorId: "human-2" },
       operation: { status: "idle" },
     }, handoffActions);
     root.querySelector<HTMLButtonElement>("[data-tool-safety-action='handoff-offer']")!.click();
-    root.querySelector<HTMLButtonElement>("[data-tool-safety-action='handoff-accept']")!.click();
-    expect(handoffActions.submit).toHaveBeenNthCalledWith(1, {
+    expect(root.querySelector("[data-tool-safety-action='handoff-accept']")).toBeNull();
+    expect(handoffActions.submit).toHaveBeenCalledWith({
       type: "tool.confirmation.handoff.offer", confirmationId: "confirmation-1",
       expectedVersion: 4, targetActorId: "human-2",
     });
-    expect(handoffActions.submit).toHaveBeenNthCalledWith(2, {
-      type: "tool.confirmation.handoff.accept", handoffId: "handoff-1", expectedVersion: 4,
+    handoffActions.submit.mockClear();
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" },
+      card: { ...card("pending"), canDecide: false, handoffId: "handoff-1", handoffVersion: 1 },
+      operation: { status: "idle" },
+    }, handoffActions);
+    expect(root.querySelector("[data-tool-safety-action='confirm']")).toBeNull();
+    expect(root.querySelector("[data-tool-safety-action='reject']")).toBeNull();
+    expect(root.querySelector("[data-tool-safety-action='handoff-offer']")).toBeNull();
+    root.querySelector<HTMLButtonElement>("[data-tool-safety-action='handoff-accept']")!.click();
+    expect(handoffActions.submit).toHaveBeenCalledWith({
+      type: "tool.confirmation.handoff.accept", handoffId: "handoff-1", expectedVersion: 1,
     });
   });
 
@@ -625,7 +635,7 @@ describe("side-effect confirmation renderer", () => {
         confirmationId: "confirmation-1", version: 3, state: "pending", toolId: "sandbox-file.write",
         safeTarget: "workspace/config.json", parameterSummary: "replace · 12 bytes",
         impact: "bounded-side-effect", reversibility: "compensatable",
-        expiresAt: "2026-08-17T00:05:00.000Z", sourceRef: "message-1",
+        expiresAt: "2026-08-17T00:05:00.000Z", sourceRef: "message-1", canDecide: true,
       },
     }, ui);
     expect(root.querySelector("[data-tool-safety-state='pending']")).not.toBeNull();

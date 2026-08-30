@@ -1405,7 +1405,9 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
               call.tool_call_id AS toolCallId, call.tool_id AS toolId,
               confirmation.state, call.safe_preview_json AS safePreview,
               confirmation.reason AS reasonCode, confirmation.expires_at AS expiresAt,
-              confirmation.version, actor.display_name AS namedHumanDisplayRef,
+              confirmation.version,
+              confirmation.principal_human_actor_id AS principalActorId,
+              actor.display_name AS namedHumanDisplayRef,
               COALESCE(execution.trigger_message_id, call.execution_id) AS sourceRef
        FROM tool_confirmations_v2 AS confirmation
        JOIN tool_calls_v2 AS call ON call.tool_call_id = confirmation.tool_call_id
@@ -1473,6 +1475,7 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
     readKeysetPage: (input) => input.database.prepare(
       `SELECT handoff.handoff_id AS handoffId,
               handoff.confirmation_id AS confirmationId, handoff.state,
+              handoff.to_principal_human_actor_id AS targetActorId,
               actor.display_name AS targetNamedHumanDisplayRef,
               CASE handoff.state WHEN 'offered' THEN 1 ELSE 2 END AS version
        FROM tool_confirmation_handoffs_v2 AS handoff
