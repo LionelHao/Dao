@@ -198,6 +198,8 @@ interface AuthoritativeServerTestOptions {
   >>;
   readonly blueprintBallProjectionPort?: BlueprintBallProjectionPort;
   readonly agentRuntimeProviderForTest?: ProviderAdapter;
+  /** Test-only cross-platform seam; production startup remains descriptor fail-closed. */
+  readonly toolAdapterPathFallbackForTest?: true;
 }
 
 export interface AuthoritativeServerTestFacades {
@@ -688,11 +690,15 @@ async function start(
         repositoryRoot: resolve(runtimeConfiguration.repositoryRoot ?? process.cwd()),
         maxOutputBytes: 256 * 1_024,
         timeoutMs: 5_000,
+        ...(testOptions.toolAdapterPathFallbackForTest === true
+          ? { testOnlyAllowPathFallback: true } : {}),
       }),
       createSandboxFileWriteAdapter({
         root: sandboxRoot,
         compensationKey: new Uint8Array(options.invitationSecretKey),
         maxContentBytes: 256 * 1_024,
+        ...(testOptions.toolAdapterPathFallbackForTest === true
+          ? { testOnlyAllowPathFallback: true } : {}),
       }),
     ] as const;
     const roomMemoryRead = createWorkerRoomMemoryReadAdapter({

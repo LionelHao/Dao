@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
-import { startAuthoritativeServer, type AuthoritativeServer } from "../authoritative-server.js";
+import { startAuthoritativeServerForTest, type AuthoritativeServer } from "../authoritative-server.js";
 
 const directories: string[] = [];
 const servers: AuthoritativeServer[] = [];
@@ -53,7 +53,7 @@ describe("authoritative server FT-07 production composition", () => {
   it("serves real multi-client WS query/mutation/sync/repair instead of the closed 503 fallback", async () => {
     const directory = await mkdtemp(join(tmpdir(), "dao-ft07-production-ws-"));
     directories.push(directory);
-    const server = await startAuthoritativeServer({
+    const server = await startAuthoritativeServerForTest({
       databasePath: join(directory, "authority.sqlite"),
       snapshotCachePath: join(directory, "snapshots.sqlite"),
       listen: { host: "127.0.0.1", port: 0 },
@@ -66,7 +66,7 @@ describe("authoritative server FT-07 production composition", () => {
       invitationSecretKey: new Uint8Array(32).fill(19),
       sharedAuthority: { maxOfflineReadLeaseMs: 60_000 },
       tenantAdministration: { bootstrapHumanActorIds: ["human-owner"] },
-    });
+    }, { toolAdapterPathFallbackForTest: true });
     servers.push(server);
     const writer = await connect(server.url);
     const reader = await connect(server.url);
