@@ -1007,6 +1007,54 @@ describe("bounded Agent runtime scheduler", () => {
     expect(runtimeAuthority.executions.get(recoveredExecution.id)?.status).toBe("failed");
   });
 
+  it("settles outcome-unknown recovery for review without provider or tool re-dispatch", async () => {
+    const runtimeAuthority = authority();
+    runtimeAuthority.scheduleRetry = vi.fn(runtimeAuthority.scheduleRetry.bind(runtimeAuthority));
+    const recoveredIntent = intent("room-recovery", "source-unknown", "agent-unknown");
+    const recoveredExecution = {
+      ...execution("recovered-unknown", recoveredIntent.roomId),
+      sourceMessageId: recoveredIntent.sourceMessageId,
+      agentId: recoveredIntent.targetAgentId,
+      status: "failed" as const,
+      completedAt: "2026-08-17T00:00:01.000Z",
+      terminalErrorCode: "side_effect_outcome_unknown" as const,
+      deadLetteredAt: "2026-08-17T00:00:01.000Z",
+    };
+    runtimeAuthority.executions.set(recoveredExecution.id, recoveredExecution);
+    const settle = vi.fn(async () => undefined);
+    const stream = vi.fn<ProviderAdapter["stream"]>();
+    const toolExecute = vi.fn();
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      recoveryAuthority: {
+        scan: vi.fn(async ({ after }) => after === undefined ? ({
+            candidates: [{
+              cursor: "001",
+              record: {
+                execution: recoveredExecution, intent: recoveredIntent,
+                outcome: "fail_outcome_unknown" as const,
+              },
+            }],
+            hasMore: false,
+          }) : ({ candidates: [], hasMore: false })),
+        isolate: vi.fn(async () => undefined),
+        settle,
+      },
+      provider: provider(stream),
+      modelId: "fake-model",
+      buildProviderInput: providerInput,
+      toolGateway: { execute: toolExecute },
+    });
+
+    await runtime.recover();
+    await runtime.whenIdle();
+
+    expect(settle).toHaveBeenCalledWith({ cursor: "001", candidateId: recoveredExecution.id });
+    expect(stream).not.toHaveBeenCalled();
+    expect(toolExecute).not.toHaveBeenCalled();
+    expect(runtimeAuthority.scheduleRetry).not.toHaveBeenCalled();
+  });
+
   it("preserves all authoritative invocation kinds across restart recovery and manual retry", async () => {
     const kinds = ["direct_mention", "structured_help", "routed_candidate"] as const;
     for (const kind of kinds) {
@@ -1589,6 +1637,68 @@ describe("bounded Agent runtime scheduler", () => {
     expect(runtimeAuthority.checkpoint).toHaveBeenCalledTimes(1);
     expect(rounds).toBe(2);
     expect(runtimeAuthority.executions.get(accepted.execution.id)?.status).toBe("completed");
+  });
+
+  it("freezes a live outcome_unknown confirmation on the same attempt without automatic retry", async () => {
+    const runtimeAuthority = authority();
+    const waiting = {
+      ...execution("execution-live-unknown", "room-a"),
+      status: "running" as const,
+      actionCategory: "waiting_upstream" as const,
+      currentAttemptSeq: 1,
+      startedAt: "2026-08-17T00:00:00.000Z",
+    };
+    runtimeAuthority.executions.set(waiting.id, waiting);
+    runtimeAuthority.readPendingConfirmation = vi.fn(async () => ({
+      execution: waiting,
+      intent: intent("room-a", waiting.sourceMessageId),
+      grantId: "grant-live-unknown",
+      toolId: "sandbox-file.write" as const,
+      parameters: { path: "a.txt", content: "bounded" },
+      callId: "call-live-unknown",
+      argumentsJson: "{\"path\":\"a.txt\",\"content\":\"bounded\"}",
+    }));
+    runtimeAuthority.scheduleRetry = vi.fn(runtimeAuthority.scheduleRetry.bind(runtimeAuthority));
+    const toolExecute = vi.fn(async () => {
+      throw new AgentRuntimeError(
+        "side_effect_outcome_unknown",
+        "Committed dispatch requires review",
+      );
+    });
+    const stream = vi.fn<ProviderAdapter["stream"]>();
+    const tool = {
+      id: "sandbox-file.write" as const,
+      displayName: "Sandbox write",
+      effect: "side-effecting" as const,
+      reversibility: "compensatable" as const,
+    };
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      provider: provider(stream),
+      modelId: "fake-model",
+      buildProviderInput: providerInputWithTools([tool]),
+      tools: [tool],
+      toolGateway: { execute: toolExecute },
+    });
+
+    await expect(runtime.confirmTool(context, {
+      confirmationId: "confirmation-live-unknown",
+      executionId: waiting.id,
+    })).rejects.toMatchObject({ code: "side_effect_outcome_unknown" });
+
+    expect(toolExecute).toHaveBeenCalledTimes(1);
+    expect(stream).not.toHaveBeenCalled();
+    expect(runtimeAuthority.scheduleRetry).toHaveBeenCalledWith(
+      waiting.id,
+      waiting.currentAttemptSeq,
+      "side_effect_outcome_unknown",
+      undefined,
+    );
+    expect(runtimeAuthority.executions.get(waiting.id)).toMatchObject({
+      status: "failed",
+      currentAttemptSeq: waiting.currentAttemptSeq,
+      terminalErrorCode: "side_effect_outcome_unknown",
+    });
   });
 
   it("resumes a persisted side-effect confirmation after runtime restart", async () => {

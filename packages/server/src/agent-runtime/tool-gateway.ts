@@ -12,7 +12,10 @@ import {
   type RoomMemoryReadToolAdapter,
 } from "./room-memory-read-tool.js";
 import { createDispatchOnceLatch } from "./dispatch-once-latch.js";
-import { createDispatchPermitIssuer } from "./dispatch-permit.js";
+import type {
+  DispatchPermit,
+  DispatchPermitBinding,
+} from "./dispatch-permit.js";
 import {
   runtimeErrorCodeForToolDispatchRejection,
   type ToolDispatchRejectionReason,
@@ -171,11 +174,14 @@ export type ToolDispatchClaimResult =
       parameters: Readonly<Record<string, unknown>>;
       compensationToken?: string;
       compensationOfDispatchId?: string;
+      permit: DispatchPermit;
+      permitBinding: DispatchPermitBinding;
     }>
   | Readonly<{ kind: "rejected"; reason: ToolDispatchRejectionReason }>
   | Readonly<{
       kind: "not_replayable";
-      state: "claimed" | "dispatched" | "outcome_unknown";
+      state: "claimed" | "dispatched" | "known_succeeded" | "known_failed" |
+        "outcome_unknown" | "reviewed";
       dispatchId: string;
     }>;
 
@@ -188,6 +194,10 @@ export type ToolDispatchSettlement = Readonly<{
 
 export interface ToolSafetyAuthority {
   claimDispatch(input: ToolDispatchClaimInput): Promise<ToolDispatchClaimResult>;
+  consumeDispatchPermit(
+    permit: DispatchPermit,
+    expected: DispatchPermitBinding,
+  ): DispatchPermitBinding | undefined;
   settleDispatch(input: ToolDispatchSettlement): Promise<void>;
 }
 
@@ -309,6 +319,33 @@ function normalizeTypedAdapterOutcome(value: unknown): ToolAdapterTypedOutcome {
   return Object.freeze({ state: "ambiguous", summary: Object.freeze({ outcome: "unknown" }) });
 }
 
+function permitBindingMatchesClaim(
+  binding: unknown,
+  claim: Extract<ToolDispatchClaimResult, { kind: "claimed" }>,
+  input: ToolSafetyGatewayExecutionInput,
+): binding is DispatchPermitBinding {
+  if (typeof binding !== "object" || binding === null || Array.isArray(binding)) return false;
+  const candidate = binding as Partial<DispatchPermitBinding>;
+  return candidate.dispatchId === claim.dispatchId && candidate.grantId === input.grantId &&
+    candidate.toolCallId === input.toolCallId && candidate.invocationId === input.invocationId &&
+    candidate.executionId === input.executionId && candidate.attemptSeq === input.attemptSeq &&
+    candidate.executionVersion === input.expectedExecutionVersion && candidate.roomId === input.roomId &&
+    candidate.agentId === input.agentId && candidate.toolId === input.toolId &&
+    candidate.canonicalParameterSha256 === input.canonicalParameterSha256 &&
+    candidate.canonicalizerVersion === input.canonicalizerVersion &&
+    candidate.sourceSnapshotId === input.sourceSnapshotId &&
+    candidate.accessRevision === input.expectedAccessRevision &&
+    candidate.roomLifecycleGeneration === input.expectedRoomLifecycleGeneration &&
+    candidate.profileId === input.profileId &&
+    candidate.profileRevision === input.expectedProfileRevision &&
+    candidate.assignmentId === input.assignmentId &&
+    candidate.assignmentRevision === input.expectedAssignmentRevision &&
+    candidate.principalActorId === input.principalActorId &&
+    candidate.sessionFamilyId === input.sessionFamilyId &&
+    candidate.bindingGeneration === input.bindingGeneration &&
+    candidate.compensationOfDispatchId === input.compensationOfDispatchId;
+}
+
 export function createToolSafetyGateway(options: ToolSafetyGatewayOptions): ToolSafetyGateway {
   const dispatchCapacity = options.dispatchCapacity ?? 65_536;
   const shutdownWaitMs = options.shutdownWaitMs ?? 15_000;
@@ -317,8 +354,11 @@ export function createToolSafetyGateway(options: ToolSafetyGatewayOptions): Tool
   }
   const adapters = validateToolSafetyCatalog(options.adapters);
   const latch = createDispatchOnceLatch({ capacity: dispatchCapacity });
-  const permits = createDispatchPermitIssuer();
   const inFlight = new Set<Promise<unknown>>();
+  const claimedInFlight = new Map<string, Readonly<{
+    abort(): void;
+    settleUnknown(): Promise<void>;
+  }>>();
   let closed = false;
 
   const run = async (input: ToolSafetyGatewayExecutionInput): Promise<ToolOutcome> => {
@@ -359,8 +399,21 @@ export function createToolSafetyGateway(options: ToolSafetyGatewayOptions): Tool
           bindingGeneration: input.bindingGeneration,
         }),
         ...(input.parameters === undefined ? {} : { parameters: input.parameters }),
+        ...(input.compensationOfDispatchId === undefined ? {} : {
+          compensationOfDispatchId: input.compensationOfDispatchId,
+        }),
       });
     } catch (error: unknown) {
+      if (adapter.descriptor.effect === "side-effect") {
+        // A thrown claim acknowledgement cannot prove that the durable claim
+        // did not commit. Retain the slot and require recovery/review instead
+        // of allowing this process to retry the physical action.
+        latch.retainUnknown(reservation);
+        throw new AgentRuntimeError(
+          "side_effect_outcome_unknown",
+          "Tool dispatch claim outcome requires review",
+        );
+      }
       latch.release(reservation);
       if (error instanceof AgentRuntimeError) throw error;
       throw rejectionError("authority_unavailable");
@@ -378,45 +431,103 @@ export function createToolSafetyGateway(options: ToolSafetyGatewayOptions): Tool
     }
     if (claim.dispatchId.length === 0 || claim.toolId !== input.toolId ||
         typeof claim.parameters !== "object" || claim.parameters === null ||
-        Array.isArray(claim.parameters)) {
+        Array.isArray(claim.parameters) || !permitBindingMatchesClaim(claim.permitBinding, claim, input)) {
+      if (adapter.descriptor.effect === "side-effect") {
+        latch.retainUnknown(reservation);
+        throw new AgentRuntimeError(
+          "side_effect_outcome_unknown",
+          "Claimed tool dispatch binding requires review",
+        );
+      }
       latch.release(reservation);
       throw new AgentRuntimeError("execution_conflict", "Claimed tool dispatch binding changed");
     }
     if (!latch.enter(reservation, claim.dispatchId)) {
-      throw new AgentRuntimeError("execution_conflict", "Tool dispatch was already entered in this process");
+      throw new AgentRuntimeError(
+        adapter.descriptor.effect === "side-effect"
+          ? "side_effect_outcome_unknown"
+          : "execution_conflict",
+        "Tool dispatch was already entered in this process",
+      );
     }
 
-    const permitBinding = Object.freeze({
-      dispatchId: claim.dispatchId,
-      toolId: claim.toolId,
-      toolCallId: input.toolCallId,
-      executionId: input.executionId,
-      attemptSeq: input.attemptSeq,
-      executionVersion: input.expectedExecutionVersion,
-      roomId: input.roomId,
-      agentId: input.agentId,
-      canonicalParameterSha256: input.canonicalParameterSha256,
-      canonicalizerVersion: input.canonicalizerVersion,
-      sourceSnapshotId: input.sourceSnapshotId,
-      accessRevision: input.expectedAccessRevision,
-      roomLifecycleGeneration: input.expectedRoomLifecycleGeneration,
-      profileId: input.profileId,
-      profileRevision: input.expectedProfileRevision,
-      assignmentId: input.assignmentId,
-      assignmentRevision: input.expectedAssignmentRevision,
-      ...(input.principalActorId === undefined ? {} : {
-        principalActorId: input.principalActorId,
-      }),
-      ...(input.sessionFamilyId === undefined ? {} : {
-        sessionFamilyId: input.sessionFamilyId,
-      }),
-      ...(input.bindingGeneration === undefined ? {} : {
-        bindingGeneration: input.bindingGeneration,
+    const physicalController = new AbortController();
+    const relayInputAbort = (): void => physicalController.abort(input.signal.reason);
+    if (input.signal.aborted) relayInputAbort();
+    else input.signal.addEventListener("abort", relayInputAbort, { once: true });
+    let terminalSettlement: Readonly<{
+      state: ToolDispatchSettlement["state"];
+      result: Promise<void>;
+    }> | undefined;
+    const settle = async (settlement: ToolDispatchSettlement): Promise<void> => {
+      terminalSettlement ??= Object.freeze({
+        state: settlement.state,
+        result: Promise.resolve()
+          .then(() => options.authority.settleDispatch(settlement))
+          .then(() => {
+            latch.settle(claim.dispatchId);
+            claimedInFlight.delete(claim.dispatchId);
+          }),
+      });
+      try {
+        await terminalSettlement.result;
+      } catch {
+        throw new AgentRuntimeError(
+          adapter.descriptor.effect === "side-effect" ? "side_effect_outcome_unknown" : "tool_failure",
+          "Tool dispatch settlement was not acknowledged",
+        );
+      }
+      if (terminalSettlement.state !== settlement.state) {
+        throw new AgentRuntimeError(
+          adapter.descriptor.effect === "side-effect" ? "side_effect_outcome_unknown" : "tool_failure",
+          "A different terminal tool settlement won the shutdown race",
+        );
+      }
+    };
+    const claimedOperation = Object.freeze({
+      abort: () => physicalController.abort("tool_gateway_shutdown"),
+      settleUnknown: () => settle({
+        dispatchId: claim.dispatchId,
+        state: "outcome_unknown",
+        summary: Object.freeze({ outcome: "unknown" }),
       }),
     });
-    const permit = permits.issue(permitBinding);
-    if (permits.consume(permit, permitBinding) === undefined) {
+    claimedInFlight.set(claim.dispatchId, claimedOperation);
+
+    let consumedPermit: DispatchPermitBinding | undefined;
+    try {
+      consumedPermit = options.authority.consumeDispatchPermit(claim.permit, claim.permitBinding);
+    } catch {
+      throw new AgentRuntimeError(
+        adapter.descriptor.effect === "side-effect" ? "side_effect_outcome_unknown" : "tool_failure",
+        "Dispatch permit verification failed",
+      );
+    }
+    if (consumedPermit === undefined) {
+      await settle({
+        dispatchId: claim.dispatchId,
+        state: "outcome_unknown",
+        summary: Object.freeze({ outcome: "unknown" }),
+      });
+      input.signal.removeEventListener("abort", relayInputAbort);
       throw new AgentRuntimeError("side_effect_outcome_unknown", "Dispatch permit could not be consumed");
+    }
+
+    // close()/abort never crosses the physical boundary after a durable claim.
+    // The claim is conservatively terminalized as unknown and cannot be
+    // cancelled, retried, or re-dispatched.
+    if (closed || input.signal.aborted) {
+      await settle({
+        dispatchId: claim.dispatchId,
+        state: "outcome_unknown",
+        summary: Object.freeze({ outcome: "unknown" }),
+      });
+      claimedOperation.abort();
+      input.signal.removeEventListener("abort", relayInputAbort);
+      throw new AgentRuntimeError(
+        adapter.descriptor.effect === "side-effect" ? "side_effect_outcome_unknown" : "tool_failure",
+        "Tool dispatch claim committed during shutdown",
+      );
     }
 
     let outcome: ToolAdapterTypedOutcome;
@@ -428,7 +539,7 @@ export function createToolSafetyGateway(options: ToolSafetyGatewayOptions): Tool
           throw new AgentRuntimeError("execution_conflict", "Compensation dispatch binding changed");
         }
         outcome = normalizeTypedAdapterOutcome(
-          await adapter.compensate(claim.compensationToken, input.signal),
+          await adapter.compensate(claim.compensationToken, physicalController.signal),
         );
       } else {
         outcome = normalizeTypedAdapterOutcome(await adapter.execute({
@@ -441,23 +552,12 @@ export function createToolSafetyGateway(options: ToolSafetyGatewayOptions): Tool
           grantId: input.grantId,
           toolId: input.toolId,
           parameters: claim.parameters,
-          signal: input.signal,
+          signal: physicalController.signal,
         }));
       }
     } catch {
       outcome = Object.freeze({ state: "ambiguous", summary: Object.freeze({ outcome: "unknown" }) });
     }
-
-    const settle = async (settlement: ToolDispatchSettlement): Promise<void> => {
-      try {
-        await options.authority.settleDispatch(settlement);
-      } catch {
-        throw new AgentRuntimeError(
-          adapter.descriptor.effect === "side-effect" ? "side_effect_outcome_unknown" : "tool_failure",
-          "Tool dispatch settlement was not acknowledged",
-        );
-      }
-    };
 
     if (outcome.state === "known_succeeded") {
       await settle({
@@ -468,6 +568,7 @@ export function createToolSafetyGateway(options: ToolSafetyGatewayOptions): Tool
           sealedCompensation: outcome.compensationToken,
         }),
       });
+      input.signal.removeEventListener("abort", relayInputAbort);
       return Object.freeze({
         summary: outcome.summary,
         modelInput: outcome.modelInput,
@@ -483,6 +584,7 @@ export function createToolSafetyGateway(options: ToolSafetyGatewayOptions): Tool
         state: "known_failed",
         summary: outcome.summary,
       });
+      input.signal.removeEventListener("abort", relayInputAbort);
       throw new AgentRuntimeError(outcome.errorCode, "Tool adapter returned a known failure");
     }
 
@@ -491,6 +593,7 @@ export function createToolSafetyGateway(options: ToolSafetyGatewayOptions): Tool
       state: "outcome_unknown",
       summary: outcome.summary,
     });
+    input.signal.removeEventListener("abort", relayInputAbort);
     throw new AgentRuntimeError(
       adapter.descriptor.effect === "side-effect" ? "side_effect_outcome_unknown" : "tool_failure",
       "Tool adapter outcome is ambiguous",
@@ -511,13 +614,24 @@ export function createToolSafetyGateway(options: ToolSafetyGatewayOptions): Tool
       if (closed) return;
       closed = true;
       latch.close();
-      if (inFlight.size === 0) return;
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      await Promise.race([
-        Promise.allSettled([...inFlight]),
-        new Promise<void>((resolve) => { timer = setTimeout(resolve, shutdownWaitMs); }),
-      ]);
-      if (timer !== undefined) clearTimeout(timer);
+      const deadline = Date.now() + shutdownWaitMs;
+      const waitBounded = async (operation: Promise<unknown>): Promise<void> => {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          operation,
+          new Promise<void>((resolve) => { timer = setTimeout(resolve, remaining); }),
+        ]);
+        if (timer !== undefined) clearTimeout(timer);
+      };
+      const claimed = [...claimedInFlight.values()];
+      // Attempt the durable unknown settlement first. Only then abort the
+      // physical boundary; a timeout retains the latch and still cannot make
+      // the same dispatch replayable.
+      await waitBounded(Promise.allSettled(claimed.map((operation) => operation.settleUnknown())));
+      for (const operation of claimed) operation.abort();
+      if (inFlight.size > 0) await waitBounded(Promise.allSettled([...inFlight]));
     },
   });
 }

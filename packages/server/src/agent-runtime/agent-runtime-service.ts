@@ -1282,12 +1282,21 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         const runtimeError = error instanceof AgentRuntimeError
           ? error
           : new AgentRuntimeError("side_effect_outcome_unknown", "Side-effect outcome requires review");
-        await options.authority.scheduleRetry(
+        const terminal = await options.authority.scheduleRetry(
           execution.id,
           execution.currentAttemptSeq,
           runtimeError.code,
           undefined,
-        ).catch(() => undefined);
+        );
+        pending.job.execution = terminal;
+        if (runtimeError.code === "side_effect_outcome_unknown" &&
+            (terminal.status !== "failed" || terminal.currentAttemptSeq !== execution.currentAttemptSeq ||
+             terminal.terminalErrorCode !== "side_effect_outcome_unknown")) {
+          throw new AgentRuntimeError(
+            "side_effect_outcome_unknown",
+            "Side-effect parent did not enter its required review terminal",
+          );
+        }
         throw runtimeError;
       }
       pending.job.sideEffectDispatched = true;
@@ -1349,12 +1358,20 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
           "outcome_unknown",
           { outcome: "unknown" },
         ).catch(() => undefined);
-        await options.authority.scheduleRetry(
+        const terminal = await options.authority.scheduleRetry(
           begun.execution.id,
           begun.execution.currentAttemptSeq,
           "side_effect_outcome_unknown",
           undefined,
-        ).catch(() => undefined);
+        );
+        if (terminal.status !== "failed" ||
+            terminal.currentAttemptSeq !== begun.execution.currentAttemptSeq ||
+            terminal.terminalErrorCode !== "side_effect_outcome_unknown") {
+          throw new AgentRuntimeError(
+            "side_effect_outcome_unknown",
+            "Compensation parent did not enter its required review terminal",
+          );
+        }
         if (error instanceof AgentRuntimeError) throw error;
         throw new AgentRuntimeError("side_effect_outcome_unknown", "Compensation outcome requires review");
       } finally {
