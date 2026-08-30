@@ -12,6 +12,7 @@ export default defineConfig({
           exclude: [
             ...configDefaults.exclude,
             "packages/server/src/authority.e2e.test.ts",
+            "packages/server/src/agent-runtime/human-preemption-authority.test.ts",
             "packages/server/src/persistence/legacy-importer.test.ts",
             "packages/server/src/persistence/context-snapshot-database-authority.test.ts",
             "packages/server/src/persistence/schema*.test.ts",
@@ -67,6 +68,7 @@ export default defineConfig({
           name: "worker-persistence",
           environment: "jsdom",
           include: [
+            "packages/server/src/agent-runtime/human-preemption-authority.test.ts",
             "packages/server/src/persistence/context-snapshot-database-authority.test.ts",
             "packages/server/src/persistence/schema-v*.test.ts",
             "packages/server/src/persistence/worker-database-client.test.ts",
