@@ -800,6 +800,8 @@ const MAPPED_SERVICE_ERROR_STATUSES = new Map<GenericProtocolErrorCode, Protocol
   ["archive_bomb", 422],
   ["image_bomb", 422],
   ["confirmation_rejected", 409],
+  ["confirmation_replayed", 409],
+  ["confirmation_expired", 410],
   ["grant_revoked", 409],
   ["dependency_unavailable", 503],
   ["snapshot_stale", 409],

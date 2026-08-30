@@ -458,7 +458,7 @@ export interface ToolOutcomeReviewFrame {
   readonly requestId: string;
   readonly dispatchId: string;
   readonly expectedVersion: number;
-  readonly resolution: "known_succeeded" | "known_failed" | "accepted_risk";
+  readonly resolution: "known_succeeded" | "known_failed" | "compensated" | "accepted_risk";
   readonly evidenceSummary: string;
 }
 
@@ -933,6 +933,8 @@ export type ProtocolErrorCode =
   | "protocol_upgrade_required"
   | "departure_blocked"
   | "confirmation_rejected"
+  | "confirmation_replayed"
+  | "confirmation_expired"
   | "content_too_large"
   | "grant_revoked"
   | "dependency_unavailable"
@@ -1918,7 +1920,7 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
           !isBoundedText(value.dispatchId, PROTOCOL_FIELD_LIMITS.messageId) ||
           !isPositiveSafeInteger(value.expectedVersion) ||
           (value.resolution !== "known_succeeded" && value.resolution !== "known_failed" &&
-            value.resolution !== "accepted_risk") ||
+            value.resolution !== "compensated" && value.resolution !== "accepted_risk") ||
           !isBoundedText(value.evidenceSummary, 2_048)) {
         return { ok: false, error: protocolError("tool.outcome.review requires a closed bounded review", requestId) };
       }

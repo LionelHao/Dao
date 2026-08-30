@@ -718,6 +718,9 @@ describe("closed v2 recovery protocol", () => {
     for (const frame of frames) {
       expect(parse(frame)).toEqual({ ok: true, frame });
     }
+    expect(parse({ ...frames[3], resolution: "compensated" })).toMatchObject({
+      ok: true, frame: { type: "tool.outcome.review", resolution: "compensated" },
+    });
 
     const forbiddenFields = [
       "roomId", "principalId", "sessionFamilyId", "agentId", "attemptSeq",
@@ -739,7 +742,7 @@ describe("closed v2 recovery protocol", () => {
       { ...frames[0], decision: "approve" },
       { ...frames[1], targetActorId: "" },
       { ...frames[2], handoffId: "" },
-      { ...frames[3], resolution: "compensated" },
+      { ...frames[3], resolution: "undo" },
       { ...frames[3], evidenceSummary: "" },
       { ...frames[4], dispatchId: "" },
     ]) {

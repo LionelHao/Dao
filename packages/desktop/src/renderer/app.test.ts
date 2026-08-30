@@ -235,6 +235,18 @@ describe("FT-10 J-05 tool-safety surface", () => {
       type: "tool.compensation.propose", dispatchId: "dispatch-1", expectedVersion: 4,
     });
     expect(root.textContent).toContain("新的补偿动作");
+
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" },
+      card: { ...card("outcome-unknown"), compensationKnownSucceeded: true,
+        evidenceSummary: "Compensation dispatch is known_succeeded." },
+      operation: { status: "idle" },
+    }, unknownActions);
+    root.querySelectorAll<HTMLButtonElement>("[data-tool-safety-action='review']")[3]!.click();
+    expect(unknownActions.submit).toHaveBeenCalledWith({
+      type: "tool.outcome.review", dispatchId: "dispatch-1", expectedVersion: 4,
+      resolution: "compensated", evidenceSummary: "Compensation dispatch is known_succeeded.",
+    });
   });
 
   it("offers and accepts only target-specific confirmation handoff commands", () => {

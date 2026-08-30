@@ -36,6 +36,7 @@ export interface ToolSafetyCardProjection {
   readonly evidenceSummary?: string;
   readonly handoffTargetActorId?: string;
   readonly handoffId?: string;
+  readonly compensationKnownSucceeded?: boolean;
 }
 
 export type ToolSafetySurfaceOperation =
@@ -57,7 +58,8 @@ export type ToolSafetySurfaceCommand =
   | Readonly<{ type: "tool.confirmation.handoff.accept"; handoffId: string;
       expectedVersion: number }>
   | Readonly<{ type: "tool.outcome.review"; dispatchId: string; expectedVersion: number;
-      resolution: "known_succeeded" | "known_failed" | "accepted_risk"; evidenceSummary: string }>
+      resolution: "known_succeeded" | "known_failed" | "compensated" | "accepted_risk";
+      evidenceSummary: string }>
   | Readonly<{ type: "tool.compensation.propose"; dispatchId: string; expectedVersion: number }>;
 
 export interface ToolSafetySurfaceState {
@@ -223,6 +225,14 @@ export function renderToolSafetySurface(
         if (connectionLocked || operationLocked || evidence.value.trim().length === 0) return;
         actions.submit({ type: "tool.outcome.review", dispatchId: state.card.dispatchId!,
           expectedVersion: state.card.version, resolution, evidenceSummary: evidence.value.trim() });
+      }));
+    }
+    if (state.card.compensationKnownSucceeded === true) {
+      controls.append(actionButton("补偿已知成功，闭合审查", "review", connectionLocked || operationLocked, () => {
+        if (connectionLocked || operationLocked || evidence.value.trim().length === 0) return;
+        actions.submit({ type: "tool.outcome.review", dispatchId: state.card.dispatchId!,
+          expectedVersion: state.card.version, resolution: "compensated",
+          evidenceSummary: evidence.value.trim() });
       }));
     }
     controls.append(actionButton("提出新的补偿动作", "compensate", connectionLocked || operationLocked, () => {
