@@ -1,7 +1,7 @@
 # FT-10 Tool Safety · Stage 12 work note
 
 > 日期：2026-08-30  
-> 状态：实施中；最终结论只能在实现PR、证据PR、双Node CI、远端merge与worktree清理后填写。
+> 状态：实现已合入远端 `main`；证据 PR 与 Stage 12 worktree 清理进行中。owner 尚未验收，未标记 verified。
 
 ## 1. 起始核验
 
@@ -37,19 +37,19 @@
 7. Desktop J-05全部状态、offline/error/focus/ARIA/zoom/reduced-motion和真实Electron链。
 8. sentinel/capacity、全量workspace门禁。
 
-## 4. 交付追踪（产生真实结果后填写）
+## 4. 交付追踪
 
-- implementation PR: pending
-- implementation ready head: pending
-- implementation CI: pending
-- implementation merge SHA: pending
-- evidence PR: pending
-- evidence CI: pending
-- evidence merge SHA / final origin main: pending
-- exact test counts: pending
-- migration statement/invariant/rollback/backfill/quarantine counts: pending
-- live OpenAI smoke: pending；仅在flag+secret同时存在时运行，否则安全skip且不读取secret属性。
-- independent reviewer conclusion: pending
+- implementation PR: [#75](https://github.com/LionelHao/Dao/pull/75)，148 files，+15,342 / −607。
+- implementation ready head: `67c87a4f3426a5a701c8d128ee07484cb5120c58`。
+- implementation CI: [quality 33316611639](https://github.com/LionelHao/Dao/actions/runs/33316611639)；Node 22.13.1 job `99271114499` success，Node 22.x job `99271114606` success。
+- implementation merge SHA: `1913218519c1cdbc968e60e6e2a3db8e448dbbab`。
+- evidence PR: 本证据分支创建后回填真实编号；最终 required checks 和 merge SHA 由 GitHub PR 记录。
+- evidence CI: PR创建后回填已完成的真实 run；最终 head checks 以 PR 页面为准。
+- evidence merge SHA / final origin main: 证据 PR 合入后由 GitHub/`origin/main` 记录，当前不预填未来值。
+- exact test counts: 255 files（252 passed + 3 live skipped）；2693 tests（2690 passed + 3 skipped）；Core 13/116，Desktop 74/624，Server 168 files / 1953 tests。
+- migration statement/invariant/rollback/backfill/quarantine counts: v26 74/27/74；2 legacy grants + 2 confirmations；1 quarantine；migration adapter/event/outbox/repair=0。
+- live OpenAI smoke: 3个suite因flag+secret未同时存在而安全skip；未读取secret属性，不把skip写成pass。
+- independent reviewer conclusion: schema、runtime、Desktop 三方向最终 P0=0、P1=0，无交付 blocker。
 
 ## 5. 不变量
 
@@ -57,4 +57,3 @@
 - 不扩大到FT-12/13/14完整实现、发布包、新工具平台或BYOK。
 - 不在事实产生前填写PR/CI/SHA/测试数/reviewer结果。
 - 实现合入后从最新main创建独立evidence worktree；证据PR合入后按根AGENTS清理所有Stage12临时worktree并复核四个protected hash。
-
