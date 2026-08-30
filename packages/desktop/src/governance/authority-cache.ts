@@ -90,31 +90,8 @@ function replaceRecord(records: RoomRepairRecord[], next: RoomRepairRecord): voi
 }
 
 function applyProjectionEvent(records: RoomRepairRecord[], event: DesktopRoomEvent): void {
-  const candidate = event as unknown as { readonly type?: unknown; readonly payload?: unknown };
-  if (candidate.type === "tool.safety.changed" && typeof candidate.payload === "object" &&
-      candidate.payload !== null && "kind" in candidate.payload && "value" in candidate.payload &&
-      typeof candidate.payload.value === "object" && candidate.payload.value !== null) {
-    const payload = candidate.payload as { readonly kind: string; readonly value: Record<string, unknown> };
-    const idKey = ({ "tool-call": "toolCallId", "tool-confirmation": "confirmationId",
-      "tool-grant": "grantId", "tool-dispatch": "dispatchId", "tool-review": "reviewId",
-      "tool-handoff": "handoffId", "tool-compensation": "lineageId" } as const)[
-        payload.kind as "tool-call"];
-    if (idKey === undefined || typeof payload.value[idKey] !== "string" ||
-        !Number.isSafeInteger(payload.value.version) || (payload.value.version as number) <= 0) return;
-    const identity = `${payload.kind}\0${payload.value[idKey]}`;
-    const toolIdentity = (value: unknown): string | undefined => {
-      if (typeof value !== "object" || value === null || !("kind" in value) || !("value" in value) ||
-          typeof value.kind !== "string" || typeof value.value !== "object" || value.value === null) return undefined;
-      const key = ({ "tool-call": "toolCallId", "tool-confirmation": "confirmationId",
-        "tool-grant": "grantId", "tool-dispatch": "dispatchId", "tool-review": "reviewId",
-        "tool-handoff": "handoffId", "tool-compensation": "lineageId" } as const)[
-          value.kind as "tool-call"];
-      return key === undefined ? undefined : `${value.kind}\0${(value.value as Record<string, unknown>)[key]}`;
-    };
-    const generic = records as unknown as unknown[];
-    const index = generic.findIndex((value) => toolIdentity(value) === identity);
-    if (index < 0) generic.push(structuredClone(candidate.payload));
-    else generic[index] = structuredClone(candidate.payload);
+  if (event.type === "tool.safety.changed") {
+    replaceRecord(records, event.payload);
     return;
   }
   if (isProjectEvent(event)) {
