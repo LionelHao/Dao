@@ -724,19 +724,93 @@ export const DESKTOP_TOOL_SAFETY_KINDS = Object.freeze([
 
 export type DesktopToolSafetyKind = typeof DESKTOP_TOOL_SAFETY_KINDS[number];
 
-export interface DesktopToolSafetyProjection {
-  readonly kind: DesktopToolSafetyKind;
-  readonly objectId: string;
-  readonly version: number;
-  readonly state: string;
-  readonly safeSummary: string;
+/** Structural mirror of Core ToolSafetyRepairRecord; no Desktop-only flat wire shape is accepted. */
+export type DesktopToolSafetyProjection =
+  | Readonly<{ kind: "tool-confirmation"; value: Readonly<{
+      confirmationId: string; toolCallId: string; toolId: string;
+      state: "pending" | "confirmed" | "rejected" | "expired";
+      safePreview: string; reasonCode: string | null; expiresAt: string;
+      version: number; namedHumanDisplayRef: string | null; sourceRef: string;
+    }> }>
+  | Readonly<{ kind: "tool-grant"; value: Readonly<{
+      grantId: string; toolCallId: string;
+      state: "active" | "claimed" | "revoked" | "expired";
+      reasonCode: string | null; expiresAt: string; version: number;
+    }> }>
+  | Readonly<{ kind: "tool-dispatch"; value: Readonly<{
+      dispatchId: string; toolCallId: string;
+      state: "prepared" | "claimed" | "dispatched" | "known_succeeded" |
+        "known_failed" | "outcome_unknown" | "reviewed";
+      reasonCode: string | null; version: number;
+    }> }>
+  | Readonly<{ kind: "tool-review"; value: Readonly<{
+      reviewId: string; dispatchId: string;
+      resolution: "known_succeeded" | "known_failed" | "compensated" | "accepted_risk";
+      evidenceSummary: string; namedHumanDisplayRef: string;
+      compensationToolCallId: string | null; version: number;
+    }> }>;
+
+const CONFIRMATION_STATES = new Set(["pending", "confirmed", "rejected", "expired"]);
+const GRANT_STATES = new Set(["active", "claimed", "revoked", "expired"]);
+const DISPATCH_STATES = new Set([
+  "prepared", "claimed", "dispatched", "known_succeeded", "known_failed", "outcome_unknown", "reviewed",
+]);
+const REVIEW_RESOLUTIONS = new Set(["known_succeeded", "known_failed", "compensated", "accepted_risk"]);
+
+function nullableText(value: unknown): value is string | null {
+  return value === null || text(value);
+}
+
+function boundedSafeText(value: unknown): value is string {
+  return typeof value === "string" && Buffer.byteLength(value, "utf8") <= 8_192;
+}
+
+function positiveVersion(value: unknown): value is number {
+  return count(value) && value > 0;
 }
 
 function validToolSafetyProjection(value: unknown): value is DesktopToolSafetyProjection {
-  return record(value) && exact(value, ["kind", "objectId", "version", "state", "safeSummary"]) &&
-    DESKTOP_TOOL_SAFETY_KINDS.includes(value.kind as DesktopToolSafetyKind) &&
-    text(value.objectId) && count(value.version) && value.version > 0 && text(value.state) &&
-    typeof value.safeSummary === "string" && Buffer.byteLength(value.safeSummary, "utf8") <= 8_192;
+  if (!record(value) || !exact(value, ["kind", "value"]) || !record(value.value)) return false;
+  const payload = value.value;
+  switch (value.kind) {
+    case "tool-confirmation":
+      return exact(payload, ["confirmationId", "toolCallId", "toolId", "state", "safePreview", "reasonCode",
+        "expiresAt", "version", "namedHumanDisplayRef", "sourceRef"]) && text(payload.confirmationId) &&
+        text(payload.toolCallId) && text(payload.toolId) && CONFIRMATION_STATES.has(String(payload.state)) &&
+        boundedSafeText(payload.safePreview) && nullableText(payload.reasonCode) && text(payload.expiresAt) &&
+        positiveVersion(payload.version) && nullableText(payload.namedHumanDisplayRef) && text(payload.sourceRef);
+    case "tool-grant":
+      return exact(payload, ["grantId", "toolCallId", "state", "reasonCode", "expiresAt", "version"]) &&
+        text(payload.grantId) && text(payload.toolCallId) && GRANT_STATES.has(String(payload.state)) &&
+        nullableText(payload.reasonCode) && text(payload.expiresAt) && positiveVersion(payload.version);
+    case "tool-dispatch":
+      return exact(payload, ["dispatchId", "toolCallId", "state", "reasonCode", "version"]) &&
+        text(payload.dispatchId) && text(payload.toolCallId) && DISPATCH_STATES.has(String(payload.state)) &&
+        nullableText(payload.reasonCode) && positiveVersion(payload.version);
+    case "tool-review":
+      return exact(payload, ["reviewId", "dispatchId", "resolution", "evidenceSummary", "namedHumanDisplayRef",
+        "compensationToolCallId", "version"]) && text(payload.reviewId) && text(payload.dispatchId) &&
+        REVIEW_RESOLUTIONS.has(String(payload.resolution)) && boundedSafeText(payload.evidenceSummary) &&
+        text(payload.namedHumanDisplayRef) && nullableText(payload.compensationToolCallId) &&
+        positiveVersion(payload.version);
+    default:
+      return false;
+  }
+}
+
+function toolSafetyProjectionIdentity(value: DesktopToolSafetyProjection): Readonly<{
+  objectId: string; version: number;
+}> {
+  switch (value.kind) {
+    case "tool-confirmation": return { objectId: value.value.confirmationId, version: value.value.version };
+    case "tool-grant": return { objectId: value.value.grantId, version: value.value.version };
+    case "tool-dispatch": return { objectId: value.value.dispatchId, version: value.value.version };
+    case "tool-review": return { objectId: value.value.reviewId, version: value.value.version };
+  }
+}
+
+function freezeToolSafetyProjection(value: DesktopToolSafetyProjection): DesktopToolSafetyProjection {
+  return Object.freeze({ ...value, value: Object.freeze({ ...value.value }) }) as DesktopToolSafetyProjection;
 }
 
 /** Atomic fixed-watermark tool projection cache; staging is never readable or writable. */
@@ -761,11 +835,15 @@ export class DesktopToolSafetyReplica {
       throw invalid("Tool-safety repair page was invalid");
     }
     for (const value of records as readonly DesktopToolSafetyProjection[]) {
-      const previous = stage.values.get(value.objectId);
-      if (previous !== undefined && (previous.kind !== value.kind || previous.version !== value.version)) {
+      const identity = toolSafetyProjectionIdentity(value);
+      const key = `${value.kind}:${identity.objectId}`;
+      const previous = stage.values.get(key);
+      const previousIdentity = previous === undefined ? undefined : toolSafetyProjectionIdentity(previous);
+      if (previous !== undefined && (previousIdentity?.version !== identity.version ||
+          JSON.stringify(previous) !== JSON.stringify(value))) {
         throw invalid("Tool-safety repair contained conflicting objects");
       }
-      stage.values.set(value.objectId, Object.freeze({ ...value }));
+      stage.values.set(key, freezeToolSafetyProjection(value));
     }
   }
 
@@ -791,9 +869,11 @@ export class DesktopToolSafetyReplica {
     const seen = this.#eventIds.get(roomId) ?? new Set<string>();
     if (seen.has(eventId)) return false;
     const next = new Map(this.#current.get(roomId) ?? []);
-    const previous = next.get(value.objectId);
-    if (previous === undefined || value.version > previous.version) {
-      next.set(value.objectId, Object.freeze({ ...value }));
+    const identity = toolSafetyProjectionIdentity(value);
+    const key = `${value.kind}:${identity.objectId}`;
+    const previous = next.get(key);
+    if (previous === undefined || identity.version > toolSafetyProjectionIdentity(previous).version) {
+      next.set(key, freezeToolSafetyProjection(value));
       this.#current.set(roomId, next);
     }
     seen.add(eventId);

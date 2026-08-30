@@ -29,8 +29,6 @@ import {
   type OpenItem,
   type RouteJudgment,
   type SocialReaction,
-  type ToolConfirmationInput,
-  type ToolConfirmationRequiredPayload,
   type RoomGovernanceView,
   type ManagedRoom,
 } from "@native-im/core";
@@ -44,6 +42,11 @@ import type {
   GovernanceDialog,
   GovernanceSurfaceState,
 } from "./governance/view-model.js";
+import {
+  renderToolSafetySurface as renderToolSafetyFeatureSurface,
+  type ToolSafetySurfaceActions,
+  type ToolSafetySurfaceState,
+} from "./tool-safety/surface.js";
 export {
   renderToolSafetySurface,
   type ToolSafetyAction,
@@ -358,27 +361,10 @@ export function renderHumanPreemptionNotice(
 
 export function renderToolConfirmation(
   root: HTMLElement,
-  confirmation: ToolConfirmationRequiredPayload,
-  onConfirm: (input: ToolConfirmationInput) => void,
+  state: ToolSafetySurfaceState,
+  actions: ToolSafetySurfaceActions,
 ): void {
-  const card = document.createElement("section");
-  card.className = "agent-tool-confirmation";
-  card.dataset.toolConfirmation = confirmation.confirmationId;
-  card.setAttribute("aria-label", "Agent 工具副作用确认");
-  const details = document.createElement("p");
-  details.textContent = `目标：${confirmation.target} · 影响：${confirmation.impact} · 可逆性：${confirmation.reversibility} · 过期：${confirmation.expiresAt}`;
-  const confirm = document.createElement("button");
-  confirm.type = "button";
-  confirm.textContent = "确认执行一次";
-  confirm.addEventListener("click", () => {
-    confirm.disabled = true;
-    onConfirm({
-      confirmationId: confirmation.confirmationId,
-      executionId: confirmation.executionId,
-    });
-  }, { once: true });
-  card.append(details, confirm);
-  root.replaceChildren(card);
+  renderToolSafetyFeatureSurface(root, state, actions);
 }
 
 export interface RoomJoinControlOptions {

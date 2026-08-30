@@ -14,7 +14,16 @@ export type ToolSafetyCardState =
   | "confirmed"
   | "grant-revoked"
   | "dispatched"
+  | "known-succeeded"
+  | "known-failed"
   | "outcome-unknown"
+  | "compensation-proposed"
+  | "compensation-pending"
+  | "compensation-confirmed"
+  | "compensation-dispatched"
+  | "compensation-known-succeeded"
+  | "compensation-known-failed"
+  | "compensation-outcome-unknown"
   | "reviewed"
   | "expired";
 
@@ -67,6 +76,7 @@ export interface ToolSafetySurfaceState {
   readonly card: ToolSafetyCardProjection;
   readonly operation: ToolSafetySurfaceOperation;
   readonly focusStateHeading?: boolean;
+  readonly reviewDraft?: Readonly<{ evidenceSummary: string; focusEvidence?: boolean }>;
 }
 
 export interface ToolSafetySurfaceActions {
@@ -74,6 +84,7 @@ export interface ToolSafetySurfaceActions {
   repair(): void;
   reauthenticate(): void;
   newInvocation(): void;
+  openSource(sourceRef: string): void;
 }
 
 const STATE_LABELS: Readonly<Record<ToolSafetyCardState, string>> = {
@@ -85,7 +96,16 @@ const STATE_LABELS: Readonly<Record<ToolSafetyCardState, string>> = {
   confirmed: "Human 决定已记录 · 尚未执行",
   "grant-revoked": "授权已撤销 · 未执行",
   dispatched: "已越过 dispatch 安全分界",
+  "known-succeeded": "工具结果已知成功",
+  "known-failed": "工具结果已知失败",
   "outcome-unknown": "OUTCOME UNKNOWN · 需要 Human 审查",
+  "compensation-proposed": "新的补偿动作已提出",
+  "compensation-pending": "新的补偿动作等待精确 Human 确认",
+  "compensation-confirmed": "补偿确认已记录 · 尚未执行",
+  "compensation-dispatched": "补偿动作已越过 dispatch 安全分界",
+  "compensation-known-succeeded": "补偿动作结果已知成功",
+  "compensation-known-failed": "补偿动作结果已知失败",
+  "compensation-outcome-unknown": "补偿动作 OUTCOME UNKNOWN · 需要 Human 审查",
   reviewed: "审查已闭合",
   expired: "已过期 · 未执行",
 };
@@ -149,7 +169,14 @@ export function renderToolSafetySurface(
     appendText(details, "p", `影响：${state.card.impact}`);
     appendText(details, "p", `可逆性：${state.card.reversibility}`);
     appendText(details, "p", `过期：${state.card.expiresAt}`);
-    appendText(details, "p", `来源：${state.card.sourceRef}`);
+    const source = document.createElement("button");
+    source.type = "button";
+    source.dataset.toolSafetySource = state.card.sourceRef;
+    source.textContent = "查看来源";
+    source.setAttribute("aria-label", `查看工具调用来源 ${state.card.sourceRef}`);
+    source.addEventListener("click", () => actions.openSource(state.card.sourceRef));
+    const sourceRow = appendText(details, "p", `来源：${state.card.sourceRef} · `);
+    sourceRow.append(source);
   }
   if (state.card.reasonCode !== undefined) appendText(details, "p", `原因：${state.card.reasonCode}`);
   if (state.card.namedHumanDisplayRef !== undefined) {
@@ -169,7 +196,7 @@ export function renderToolSafetySurface(
   const controls = document.createElement("div");
   controls.className = "tool-safety-actions";
 
-  if (state.card.state === "pending") {
+  if (state.card.state === "pending" || state.card.state === "compensation-pending") {
     controls.append(
       actionButton("确认执行一次", "confirm", connectionLocked || operationLocked, () => {
         if (connectionLocked || operationLocked) return;
@@ -206,14 +233,16 @@ export function renderToolSafetySurface(
       }));
     }
   }
-  if (state.card.state === "outcome-unknown" && state.card.dispatchId !== undefined) {
+  if ((state.card.state === "outcome-unknown" || state.card.state === "compensation-outcome-unknown") &&
+      state.card.dispatchId !== undefined) {
     const label = document.createElement("label");
     label.textContent = "Human 审查证据摘要";
     const evidence = document.createElement("textarea");
     evidence.dataset.toolSafetyEvidence = "true";
     evidence.maxLength = 2_048;
-    evidence.value = state.operation.status === "error"
-      ? state.operation.retainedEvidenceSummary ?? "" : state.card.evidenceSummary ?? "";
+    evidence.value = state.reviewDraft?.evidenceSummary ?? (state.operation.status === "error"
+      ? state.operation.retainedEvidenceSummary ?? "" : state.card.evidenceSummary ?? "");
+    evidence.disabled = connectionLocked || operationLocked;
     label.append(evidence);
     controls.append(label);
     for (const [resolution, labelText] of [
@@ -242,7 +271,9 @@ export function renderToolSafetySurface(
     }));
   }
   if (["rejected", "params-changed", "grant-revoked", "expired"].includes(state.card.state)) {
-    const next = actionButton("创建新 invocation", "compensate", false, actions.newInvocation);
+    const next = actionButton("创建新 invocation", "compensate", connectionLocked || operationLocked, () => {
+      if (!connectionLocked && !operationLocked) actions.newInvocation();
+    });
     next.dataset.recoveryAction = "new-invocation";
     controls.append(next);
   }
@@ -252,12 +283,15 @@ export function renderToolSafetySurface(
   status.className = "tool-safety-status";
   status.setAttribute("aria-live", "polite");
   status.setAttribute("role", state.card.state === "outcome-unknown" ||
+    state.card.state === "compensation-outcome-unknown" ||
     state.card.state === "principal-revoked" ? "alert" : "status");
   if (state.connection.status === "offline") status.textContent = "离线只读；所有写操作已关闭，未建立离线队列";
   else if (state.connection.status === "repairing") status.textContent = "repair 进行中；保留上一份完整只读 projection";
   else if (state.connection.status === "repair-failed") status.textContent = `repair 失败：${state.connection.errorCode}；保留上一份完整只读 projection`;
   else if (state.connection.status === "revoked") status.textContent = "Room 权限已撤销；敏感预览必须清除并重新认证";
-  else if (state.operation.status === "submitting") status.textContent = "正在提交 Human 决定；等待匹配 ACK";
+  else if (state.operation.status === "submitting") status.textContent = state.operation.action === "review"
+    ? "正在提交 Human 审查结论；保留证据草稿并等待匹配 ACK"
+    : "正在提交 Human 决定；等待匹配 ACK";
   else if (state.operation.status === "acknowledged") status.textContent = "服务器已确认 authority transaction；这不表示工具执行成功，等待 stable event / repair projection";
   else if (state.operation.status === "error") status.textContent = recoveryFor(state.operation);
   else status.textContent = "当前显示来自 stable event 或 repair projection";
@@ -275,7 +309,10 @@ export function renderToolSafetySurface(
     next.type = "button";
     next.dataset.recoveryAction = "new-invocation";
     next.textContent = "创建新 invocation";
-    next.addEventListener("click", actions.newInvocation);
+    next.disabled = connectionLocked || operationLocked;
+    next.addEventListener("click", () => {
+      if (!connectionLocked && !operationLocked) actions.newInvocation();
+    });
     section.append(next);
   } else if (state.connection.status === "repair-failed" ||
       (state.operation.status === "error" && [403, 409, 503].includes(state.operation.statusCode))) {
@@ -288,5 +325,8 @@ export function renderToolSafetySurface(
   }
 
   root.replaceChildren(section);
-  if (state.focusStateHeading) heading.focus({ preventScroll: true });
+  if (state.reviewDraft?.focusEvidence === true &&
+      (state.card.state === "outcome-unknown" || state.card.state === "compensation-outcome-unknown")) {
+    controls.querySelector<HTMLTextAreaElement>("[data-tool-safety-evidence]")?.focus({ preventScroll: true });
+  } else if (state.focusStateHeading) heading.focus({ preventScroll: true });
 }

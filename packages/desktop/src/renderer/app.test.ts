@@ -32,17 +32,8 @@ interface RestoredPrimitivePreviewRecords {
 type RendererUnderTest = {
   renderToolConfirmation?: (
     root: HTMLElement,
-    confirmation: {
-      readonly confirmationId: string;
-      readonly executionId: string;
-      readonly attemptSeq: number;
-      readonly toolId: string;
-      readonly target: string;
-      readonly impact: string;
-      readonly reversibility: "compensatable" | "irreversible";
-      readonly expiresAt: string;
-    },
-    onConfirm: (input: { readonly confirmationId: string; readonly executionId: string }) => void,
+    state: importedApp.ToolSafetySurfaceState,
+    actions: importedApp.ToolSafetySurfaceActions,
   ) => void;
   renderAgentExecutionPreview?: (
     root: HTMLElement,
@@ -139,7 +130,7 @@ describe("FT-10 J-05 tool-safety surface", () => {
     } : {}),
   });
   const actions = () => ({
-    submit: vi.fn(), repair: vi.fn(), reauthenticate: vi.fn(), newInvocation: vi.fn(),
+    submit: vi.fn(), repair: vi.fn(), reauthenticate: vi.fn(), newInvocation: vi.fn(), openSource: vi.fn(),
   });
 
   it.each([
@@ -151,7 +142,16 @@ describe("FT-10 J-05 tool-safety surface", () => {
     ["confirmed", "尚未执行"],
     ["grant-revoked", "授权已撤销 · 未执行"],
     ["dispatched", "dispatch 安全分界"],
+    ["known-succeeded", "工具结果已知成功"],
+    ["known-failed", "工具结果已知失败"],
     ["outcome-unknown", "OUTCOME UNKNOWN"],
+    ["compensation-proposed", "新的补偿动作已提出"],
+    ["compensation-pending", "补偿动作等待精确 Human 确认"],
+    ["compensation-confirmed", "补偿确认已记录"],
+    ["compensation-dispatched", "补偿动作已越过 dispatch"],
+    ["compensation-known-succeeded", "补偿动作结果已知成功"],
+    ["compensation-known-failed", "补偿动作结果已知失败"],
+    ["compensation-outcome-unknown", "补偿动作 OUTCOME UNKNOWN"],
     ["reviewed", "审查已闭合"],
     ["expired", "已过期 · 未执行"],
   ] as const)("renders authoritative %s without internal data", (state, label) => {
@@ -169,6 +169,31 @@ describe("FT-10 J-05 tool-safety surface", () => {
       expect(root.textContent).toContain("安全目标：workspace/config.json");
     }
     expect(root.textContent).not.toMatch(/sealedPayload|grantCapability|dispatchPermit|canonicalParameterSha256/);
+  });
+
+  it("opens the explicit source deep link with an accessible name", () => {
+    const root = document.createElement("main");
+    const ui = actions();
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" }, card: card("pending"), operation: { status: "idle" },
+    }, ui);
+    const source = root.querySelector<HTMLButtonElement>("[data-tool-safety-source='message-1']")!;
+    expect(source.getAttribute("aria-label")).toContain("message-1");
+    source.click();
+    expect(ui.openSource).toHaveBeenCalledWith("message-1");
+  });
+
+  it("routes a compensation confirmation through the same exact CAS decision gate", () => {
+    const root = document.createElement("main");
+    const ui = actions();
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" }, card: card("compensation-pending"), operation: { status: "idle" },
+    }, ui);
+    root.querySelector<HTMLButtonElement>("[data-tool-safety-action='confirm']")!.click();
+    expect(ui.submit).toHaveBeenCalledWith({
+      type: "tool.confirmation.decide", confirmationId: "confirmation-1", expectedVersion: 4,
+      decision: "confirm",
+    });
   });
 
   it("submits exact object decisions online and performs zero writes offline or during repair", () => {
@@ -205,6 +230,48 @@ describe("FT-10 J-05 tool-safety surface", () => {
       expect(locked.submit).not.toHaveBeenCalled();
       expect(root.textContent).toMatch(/只读|repair/);
     }
+
+    for (const connection of [
+      { status: "offline" as const }, { status: "repairing" as const },
+      { status: "repair-failed" as const, errorCode: "checksum_mismatch" },
+    ]) {
+      const locked = actions();
+      importedApp.renderToolSafetySurface(root, {
+        connection, card: card("rejected"), operation: { status: "idle" },
+      }, locked);
+      const next = root.querySelector<HTMLButtonElement>("[data-recovery-action='new-invocation']")!;
+      expect(next.disabled).toBe(true);
+      next.click();
+      expect(locked.newInvocation).not.toHaveBeenCalled();
+    }
+  });
+
+  it("retains and locks the review draft while submitting, then restores evidence focus", () => {
+    const root = document.createElement("main");
+    document.body.append(root);
+    const ui = actions();
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" }, card: card("outcome-unknown"),
+      reviewDraft: { evidenceSummary: "Inspected target before submit." },
+      operation: { status: "submitting", requestId: "review-1", action: "review" },
+    }, ui);
+    const submitting = root.querySelector<HTMLTextAreaElement>("[data-tool-safety-evidence]")!;
+    expect(submitting.value).toBe("Inspected target before submit.");
+    expect(submitting.disabled).toBe(true);
+    expect([...root.querySelectorAll<HTMLButtonElement>("[data-tool-safety-action]")]
+      .every((button) => button.disabled)).toBe(true);
+
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" }, card: card("outcome-unknown"),
+      reviewDraft: { evidenceSummary: "Inspected target before submit.", focusEvidence: true },
+      operation: { status: "error", requestId: "review-1", action: "review", statusCode: 503,
+        code: "authority_unavailable", retainedEvidenceSummary: "Inspected target before submit." },
+    }, ui);
+    const restored = root.querySelector<HTMLTextAreaElement>("[data-tool-safety-evidence]")!;
+    expect(restored.value).toBe("Inspected target before submit.");
+    expect(restored.disabled).toBe(false);
+    expect(document.activeElement).toBe(restored);
+    root.remove();
   });
 
   it("keeps ACK distinct from execution success and makes unknown review explicit", () => {
@@ -532,28 +599,30 @@ describe("historical preemption and canonical retry presentation", () => {
 });
 
 describe("side-effect confirmation renderer", () => {
-  it("shows target, impact, reversibility, and expiry and emits one closed confirmation", () => {
+  it("delegates the renderer entry to the authoritative J-05 command surface", () => {
     const root = document.createElement("div");
-    const confirmations: Array<{ readonly confirmationId: string; readonly executionId: string }> = [];
+    const ui = {
+      submit: vi.fn(), repair: vi.fn(), reauthenticate: vi.fn(), newInvocation: vi.fn(), openSource: vi.fn(),
+    };
     app.renderToolConfirmation?.(root, {
-      confirmationId: "confirmation-1",
-      executionId: "execution-1",
-      attemptSeq: 2,
-      toolId: "sandbox-file.write",
-      target: "sandbox-file.write",
-      impact: "bounded-side-effect",
-      reversibility: "compensatable",
-      expiresAt: "2026-08-17T00:05:00.000Z",
-    }, (input) => confirmations.push(input));
-    expect(root.textContent).toContain("目标：sandbox-file.write");
+      connection: { status: "online" }, operation: { status: "idle" },
+      card: {
+        confirmationId: "confirmation-1", version: 3, state: "pending", toolId: "sandbox-file.write",
+        safeTarget: "workspace/config.json", parameterSummary: "replace · 12 bytes",
+        impact: "bounded-side-effect", reversibility: "compensatable",
+        expiresAt: "2026-08-17T00:05:00.000Z", sourceRef: "message-1",
+      },
+    }, ui);
+    expect(root.querySelector("[data-tool-safety-state='pending']")).not.toBeNull();
+    expect(root.textContent).toContain("安全目标：workspace/config.json");
     expect(root.textContent).toContain("影响：bounded-side-effect");
     expect(root.textContent).toContain("可逆性：compensatable");
     expect(root.textContent).toContain("过期：2026-08-17T00:05:00.000Z");
-    const button = root.querySelector<HTMLButtonElement>("button");
-    button?.click();
-    button?.click();
-    expect(confirmations).toEqual([{ confirmationId: "confirmation-1", executionId: "execution-1" }]);
-    expect(button?.disabled).toBe(true);
+    root.querySelector<HTMLButtonElement>("[data-tool-safety-action='confirm']")?.click();
+    expect(ui.submit).toHaveBeenCalledWith({
+      type: "tool.confirmation.decide", confirmationId: "confirmation-1", expectedVersion: 3,
+      decision: "confirm",
+    });
   });
 });
 
