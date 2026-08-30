@@ -8513,7 +8513,7 @@ export function executeRuntimeAuthorityOperation(
            execution_version_after
          ) VALUES (?, ?, ?, ?, ?)`,
       ).run(fenceId, current.id, current.currentAttemptSeq,
-        authority.authorityVersion, terminalVersion);
+        claimedUnknown ? terminalVersion - 1 : authority.authorityVersion, terminalVersion);
       const rejectedConfirmationIds = [...v2Settlement.rejectedConfirmationIds,
         ...confirmations.flatMap((row) =>
         row.state === "pending" && typeof row.confirmationId === "string"
@@ -8837,7 +8837,7 @@ export function executeRuntimeAuthorityOperation(
            execution_version_after
          ) VALUES (?, ?, ?, ?, ?)`,
       ).run(fenceId, current.id, current.currentAttemptSeq,
-        target.expectedVersion, terminalVersion);
+        claimedUnknown ? terminalVersion - 1 : target.expectedVersion, terminalVersion);
       appendRuntimeExecutionEvent(database, terminal, occurredAt,
         claimedUnknown ? "dead-lettered" : "cancelled",
         claimedUnknown ? "side_effect_outcome_unknown" : "human_cancelled");

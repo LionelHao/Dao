@@ -250,6 +250,28 @@ async function readBoundedFile(path: string, limit: number): Promise<Uint8Array 
   } finally { await handle.close(); }
 }
 
+async function waitForSandboxHook(
+  hook: (() => void | Promise<void>) | undefined,
+  signal: AbortSignal,
+  mutationMayHaveOccurred: boolean,
+): Promise<void> {
+  if (hook === undefined) return;
+  if (signal.aborted) {
+    if (mutationMayHaveOccurred) throw ambiguousFailure("Sandbox operation was interrupted after mutation");
+    throw knownFailure("tool_failure", "Sandbox operation was interrupted before mutation");
+  }
+  const work = Promise.resolve().then(hook);
+  await new Promise<void>((resolve, reject) => {
+    const aborted = (): void => reject(mutationMayHaveOccurred
+      ? ambiguousFailure("Sandbox operation was interrupted after mutation")
+      : knownFailure("tool_failure", "Sandbox operation was interrupted before mutation"));
+    signal.addEventListener("abort", aborted, { once: true });
+    work.then(resolve, reject).finally(() => signal.removeEventListener("abort", aborted))
+      .catch(() => undefined);
+  });
+  void work.catch(() => undefined);
+}
+
 async function atomicReplace(
   parent: FileHandle,
   parentPath: string,
@@ -273,13 +295,13 @@ async function atomicReplace(
   } finally { await handle.close(); }
   try {
     if (signal.aborted) throw knownFailure("tool_failure", "Sandbox write was cancelled before rename");
-    await hooks?.beforeRename?.();
+    await waitForSandboxHook(hooks?.beforeRename, signal, false);
     if (signal.aborted) throw knownFailure("tool_failure", "Sandbox write was cancelled before rename");
     await rename(temporaryPath, targetPath);
     renamed = true;
-    await hooks?.afterRename?.();
+    await waitForSandboxHook(hooks?.afterRename, signal, true);
     if (signal.aborted) throw ambiguousFailure("Sandbox write was cancelled after rename");
-    await hooks?.beforeDirectorySync?.();
+    await waitForSandboxHook(hooks?.beforeDirectorySync, signal, true);
     await parent.sync();
   } catch (error: unknown) {
     if (renamed) {

@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { TOOL_CANONICALIZER_VERSION } from "@native-im/core";
+import { commitInternalScopedProducerInTransaction } from
+  "../agent-runtime/internal-scoped-producer-authority.js";
 import { parseToolParameters } from "../agent-runtime/tool-parameters.js";
 import {
   seedCanonicalAgentProfileFixture,
@@ -413,6 +415,49 @@ describe("FT-10 SQLite tool-safety authority", () => {
         attemptStatus: "failed", attemptErrorCode: "side_effect_outcome_unknown",
         publicStatus: "failed", phase: "failed", reviewState: "needs_review",
         attemptPublicStatus: "failed", attemptPhase: "failed",
+      });
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("keeps a scoped cancellation from overwriting a claimed unknown parent", () => {
+    const fixture = testDatabase();
+    const { database } = fixture;
+    try {
+      seedAuthority(database);
+      prepareAndClaim(database);
+      database.exec("BEGIN IMMEDIATE");
+      const result = commitInternalScopedProducerInTransaction(database, {
+        producerId: "message-authority",
+        requestId: "message-recall-ft10",
+        capability: "message_authority",
+        actorId: "human-ft10",
+        roomId: "room-ft10",
+        scope: { kind: "source_message", sourceMessageId: "message-ft10", sourceRevision: 1 },
+        reason: "message_recalled",
+        occurredAt: new Date(NOW + 5_000).toISOString(),
+      });
+      database.exec("COMMIT");
+      expect(result.effects).toEqual([expect.objectContaining({
+        executionId: "execution-ft10",
+        disposition: "already_terminal",
+        sideEffectState: "outcome-unknown-retained",
+      })]);
+      expect(result.receipts[0]?.receipt.executionOutcomes).toEqual([{
+        executionId: "execution-ft10", outcome: "already_terminal", version: 7,
+      }]);
+      expect(database.prepare(
+        `SELECT execution.status, execution.cancellation_reason AS cancellationReason,
+                execution.terminal_error_code AS terminalErrorCode,
+                runtime.public_status AS publicStatus, runtime.review_state AS reviewState
+         FROM agent_executions AS execution
+         JOIN agent_execution_runtime_states AS runtime ON runtime.execution_id = execution.id
+         WHERE execution.id = 'execution-ft10'`,
+      ).get()).toEqual({
+        status: "failed", cancellationReason: null,
+        terminalErrorCode: "side_effect_outcome_unknown",
+        publicStatus: "failed", reviewState: "needs_review",
       });
     } finally {
       fixture.close();
