@@ -548,7 +548,8 @@ function seedV11SessionCapacity(
   }
 }
 
-describe("authority SQLite schema", () => {
+export function registerRecentAuthoritySchemaTests(): void {
+describe("authority SQLite schema — recent migrations", () => {
   it("upgrades v13 archived rooms with a durable message gate and leaves active rooms ungated", () => {
     withDatabase((database) => {
       migrateAuthorityDatabaseToVersion13ForTest(database);
@@ -1216,6 +1217,11 @@ describe("authority SQLite schema", () => {
       );
     });
   });
+});
+}
+
+export function registerFoundationAuthoritySchemaTests(): void {
+describe("authority SQLite schema — foundations", () => {
   it("configures and verifies the durability and concurrency pragmas", () => {
     withDatabase((database) => {
       database.exec("PRAGMA foreign_keys = OFF");
@@ -2205,7 +2211,11 @@ describe("authority SQLite schema", () => {
       expect(tableColumns(database, "actors")).not.toContain("catalog_revision");
     });
   });
+});
+}
 
+export function registerIntegrityAuthoritySchemaTests(): void {
+describe("authority SQLite schema — integrity", () => {
   it("owns transaction state without requiring post-22.13 DatabaseSync APIs", () => {
     withDatabase((database) => {
       createV1Fixture(database);
@@ -2772,7 +2782,9 @@ describe("authority SQLite schema", () => {
     });
   });
 });
+}
 
+export function registerDerivedSnapshotSchemaTests(): void {
 describe("derived snapshot cache schema", () => {
   it("creates independent v2 WAL/FULL tables without changing authority v16", () => {
     withDatabase((database) => {
@@ -2842,3 +2854,4 @@ describe("derived snapshot cache schema", () => {
     });
   });
 });
+}
