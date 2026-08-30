@@ -1562,6 +1562,12 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         for (const resolve of capacityWaiters) resolve();
         capacityWaiters.clear();
         if (recoveryPromise !== undefined) await withinDeadline(recoveryPromise);
+        // Stop dispatch admission and durably settle every claimed permit before
+        // parent shutdown/abort. This must not sit behind whenIdle: a provider
+        // that ignores AbortSignal cannot be allowed to skip the unknown fence.
+        if (options.toolSafety !== undefined) {
+          await withinDeadline(options.toolSafety.gateway.close());
+        }
         const jobs = [...new Map([
           ...jobsByExecution,
           ...durableOverflowJobs,
@@ -1603,9 +1609,6 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         for (const resolve of capacityWaiters) resolve();
         capacityWaiters.clear();
         await withinDeadline(runtime.whenIdle());
-        if (options.toolSafety !== undefined) {
-          await withinDeadline(options.toolSafety.gateway.close());
-        }
       })();
       return closePromise;
     },

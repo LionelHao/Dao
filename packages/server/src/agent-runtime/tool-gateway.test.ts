@@ -326,6 +326,7 @@ describe("FT-10 tool safety gateway", () => {
     expect(execute).toHaveBeenCalledTimes(1);
     expect(authority.settleDispatch).toHaveBeenCalledWith({
       dispatchId: "dispatch-1",
+      expectedVersion: 2,
       state: "known_succeeded",
       summary: { byteCount: 7 },
     });
@@ -371,7 +372,8 @@ describe("FT-10 tool safety gateway", () => {
     });
     expect(execute).not.toHaveBeenCalled();
     expect(authority.settleDispatch).toHaveBeenCalledWith({
-      dispatchId: "dispatch-forged", state: "outcome_unknown", summary: { outcome: "unknown" },
+      dispatchId: "dispatch-forged", expectedVersion: 2,
+      state: "outcome_unknown", summary: { outcome: "unknown" },
     });
   });
 
@@ -419,7 +421,8 @@ describe("FT-10 tool safety gateway", () => {
       await close;
       expect(execute).not.toHaveBeenCalled();
       expect(authority.settleDispatch).toHaveBeenCalledWith({
-        dispatchId: `dispatch-${race}`, state: "outcome_unknown", summary: { outcome: "unknown" },
+        dispatchId: `dispatch-${race}`, expectedVersion: 2,
+        state: "outcome_unknown", summary: { outcome: "unknown" },
       });
     },
   );
@@ -475,7 +478,7 @@ describe("FT-10 tool safety gateway", () => {
 
     await expect(gateway.execute(safetyInput)).rejects.toMatchObject({ code: "execution_conflict" });
     expect(authority.settleDispatch).toHaveBeenCalledWith({
-      dispatchId: "dispatch-1", state: "known_failed",
+      dispatchId: "dispatch-1", expectedVersion: 2, state: "known_failed",
       summary: { outcome: "precondition_failed" },
     });
   });
@@ -497,7 +500,8 @@ describe("FT-10 tool safety gateway", () => {
     await expect(gateway.execute(safetyInput)).rejects.toBeInstanceOf(AgentRuntimeError);
     expect(execute).toHaveBeenCalledTimes(1);
     expect(authority.settleDispatch).toHaveBeenCalledWith({
-      dispatchId: "dispatch-1", state: "outcome_unknown", summary: { outcome: "unknown" },
+      dispatchId: "dispatch-1", expectedVersion: 2,
+      state: "outcome_unknown", summary: { outcome: "unknown" },
     });
   });
 
@@ -513,7 +517,8 @@ describe("FT-10 tool safety gateway", () => {
       code: "side_effect_outcome_unknown",
     });
     expect(authority.settleDispatch).toHaveBeenCalledWith({
-      dispatchId: "dispatch-1", state: "outcome_unknown", summary: { outcome: "unknown" },
+      dispatchId: "dispatch-1", expectedVersion: 2,
+      state: "outcome_unknown", summary: { outcome: "unknown" },
     });
   });
 

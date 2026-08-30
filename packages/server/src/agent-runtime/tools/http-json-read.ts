@@ -174,6 +174,15 @@ async function pinnedFetch(url: URL, addresses: readonly ResolvedAddress[], sign
   });
 }
 
+async function waitForSignalBound<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) throw signal.reason;
+  return await new Promise<T>((resolve, reject) => {
+    const aborted = (): void => reject(signal.reason);
+    signal.addEventListener("abort", aborted, { once: true });
+    operation.then(resolve, reject).finally(() => signal.removeEventListener("abort", aborted));
+  });
+}
+
 export function createHttpJsonReadAdapter(options: HttpJsonReadOptions): ToolAdapter {
   const origin = new URL(options.origin);
   if (origin.protocol !== "https:" || origin.pathname !== "/" || origin.search !== "" || origin.hash !== "" ||
@@ -210,7 +219,10 @@ export function createHttpJsonReadAdapter(options: HttpJsonReadOptions): ToolAda
       invocation.signal.addEventListener("abort", abort, { once: true });
       const timer = setTimeout(() => controller.abort(new Error("deadline")), timeoutMs);
       try {
-        const addresses = validateAddresses(await resolveHost(origin.hostname));
+        const addresses = validateAddresses(await waitForSignalBound(
+          resolveHost(origin.hostname),
+          controller.signal,
+        ));
         const response = options.fetch === undefined
           ? await pinnedFetch(url, addresses, controller.signal)
           : await options.fetch(url.toString(), {

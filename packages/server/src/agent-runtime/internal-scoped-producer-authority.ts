@@ -361,6 +361,7 @@ function dispositions(database: DatabaseSync, executionId: string, attemptSeq: n
     confirmationDisposition: ScopedCancellationCommitEffect["confirmationDisposition"];
     grantDisposition: ScopedCancellationCommitEffect["grantDisposition"];
     sideEffectState: ScopedCancellationCommitEffect["sideEffectState"];
+    parentOutcomeUnknown: boolean;
   }> {
   const confirmations = database.prepare(
     `SELECT confirmation_id AS id, confirmation_state AS state FROM tool_confirmations
@@ -429,6 +430,7 @@ function dispositions(database: DatabaseSync, executionId: string, attemptSeq: n
     sideEffectState: v2PreservedDispatchIds.length > 0 ||
       dispatches.some((row) => row.state === "outcome_unknown")
       ? "outcome-unknown-retained" : preservedDispatchIds.length > 0 ? "dispatched-retained" : "none",
+    parentOutcomeUnknown: v2PreservedDispatchIds.length > 0,
   };
 }
 
@@ -589,21 +591,39 @@ export function commitInternalScopedProducerInTransaction(
     const executionUpdated = database.prepare(
       `UPDATE agent_executions SET status = 'cancelled', cancellation_reason = ?,
          completed_at = ?, updated_at = ?, next_retry_at = NULL
-       WHERE id = ? AND current_attempt_seq = ? AND status IN ('queued', 'running')`,
-    ).run(input.reason, input.occurredAt, input.occurredAt, executionId, attemptSeq);
+       WHERE id = ? AND current_attempt_seq = ? AND status IN ('queued', 'running')
+         AND ? = 0`,
+    ).run(input.reason, input.occurredAt, input.occurredAt, executionId, attemptSeq,
+      disposition.parentOutcomeUnknown ? 1 : 0);
     const attemptUpdated = database.prepare(
       `UPDATE agent_execution_attempts SET status = 'cancelled', finished_at = ?,
          error_code = ?, next_retry_at = NULL
-       WHERE execution_id = ? AND attempt_seq = ? AND status IN ('queued', 'running')`,
-    ).run(input.occurredAt, input.reason, executionId, attemptSeq);
-    if (executionUpdated.changes !== 1 || attemptUpdated.changes !== 1) {
+       WHERE execution_id = ? AND attempt_seq = ? AND status IN ('queued', 'running')
+         AND ? = 0`,
+    ).run(input.occurredAt, input.reason, executionId, attemptSeq,
+      disposition.parentOutcomeUnknown ? 1 : 0);
+    if ((!disposition.parentOutcomeUnknown &&
+         (executionUpdated.changes !== 1 || attemptUpdated.changes !== 1)) ||
+        (disposition.parentOutcomeUnknown &&
+         (executionUpdated.changes !== 0 || attemptUpdated.changes !== 0))) {
       throw new Error("Internal execution cancellation lost its CAS");
+    }
+    const terminal = database.prepare(
+      `SELECT public_status AS publicStatus, authority_version AS authorityVersion
+       FROM agent_execution_runtime_states WHERE execution_id = ?`,
+    ).get(executionId);
+    if (typeof terminal?.authorityVersion !== "number" ||
+        (disposition.parentOutcomeUnknown
+          ? terminal.publicStatus !== "failed" : terminal.publicStatus !== "cancelled")) {
+      throw new Error("Internal execution parent terminal was invalid");
     }
     database.prepare(
       `INSERT INTO invocation_scoped_cancellation_targets (
          fence_id, execution_id, attempt_seq, execution_version_before, execution_version_after
        ) VALUES (?, ?, ?, ?, ?)`,
-    ).run(fenceId, executionId, attemptSeq, row.authorityVersion, row.authorityVersion + 1);
+    ).run(fenceId, executionId, attemptSeq,
+      disposition.parentOutcomeUnknown ? terminal.authorityVersion - 1 : row.authorityVersion,
+      terminal.authorityVersion);
     database.prepare(
       `UPDATE invocation_recovery_queue SET state = 'closed', lease_owner = NULL,
          lease_expires_at = NULL, failure_code = ?, updated_at = ?
@@ -614,7 +634,7 @@ export function commitInternalScopedProducerInTransaction(
       sourceRevision: row.sourceRevision,
       invocationIntentId: row.intentId,
       executionId, attemptSeq,
-      disposition: "execution_cancelled",
+      disposition: disposition.parentOutcomeUnknown ? "already_terminal" : "execution_cancelled",
       confirmationDisposition: disposition.confirmationDisposition,
       grantDisposition: disposition.grantDisposition,
       sideEffectState: disposition.sideEffectState,
@@ -623,7 +643,9 @@ export function commitInternalScopedProducerInTransaction(
       requestId, fenceId, roomId: input.roomId, lineageId: row.lineageId,
       scope: input.scope, reason: input.reason,
       intentOutcomes: [{ intentId: row.intentId, outcome: "already_claimed" }],
-      executionOutcomes: [{ executionId, outcome: "cancelled", version: row.authorityVersion + 1 }],
+      executionOutcomes: [{ executionId,
+        outcome: disposition.parentOutcomeUnknown ? "already_terminal" : "cancelled",
+        version: terminal.authorityVersion }],
       rejectedConfirmationIds: disposition.rejectedConfirmationIds,
       revokedGrantIds: disposition.revokedGrantIds,
       preservedDispatchIds: disposition.preservedDispatchIds,
@@ -663,13 +685,21 @@ export function finalizeInternalScopedProducerInTransaction(
        FROM agent_execution_runtime_states WHERE execution_id = ?`,
     ).get(row.executionId);
     if ((runtime?.publicStatus !== "cancelled" && runtime?.publicStatus !== "failed") ||
-        runtime.authorityVersion !== row.authorityVersion + 1) {
+        typeof runtime.authorityVersion !== "number" ||
+        runtime.authorityVersion <= row.authorityVersion) {
       throw new Error("Deferred scoped producer terminal authority was not committed");
     }
     const dispatches = database.prepare(
       `SELECT state FROM tool_dispatches WHERE execution_id = ? AND attempt_seq = ?`,
     ).all(row.executionId, row.attemptSeq);
-    const sideEffectState = dispatches.some((dispatch) => dispatch.state === "outcome_unknown")
+    const v2Dispatches = database.prepare(
+      `SELECT dispatch.state
+       FROM tool_dispatches_v2 AS dispatch
+       JOIN tool_calls_v2 AS call ON call.tool_call_id = dispatch.tool_call_id
+       WHERE call.execution_id = ? AND call.attempt_seq = ?`,
+    ).all(row.executionId, row.attemptSeq);
+    const sideEffectState = v2Dispatches.some((dispatch) => dispatch.state === "outcome_unknown") ||
+      dispatches.some((dispatch) => dispatch.state === "outcome_unknown")
       ? "outcome-unknown-retained" as const
       : deferred.preservedDispatchIds.length > 0 ? "dispatched-retained" as const : "none" as const;
     database.prepare(
@@ -677,7 +707,7 @@ export function finalizeInternalScopedProducerInTransaction(
          fence_id, execution_id, attempt_seq, execution_version_before, execution_version_after
        ) VALUES (?, ?, ?, ?, ?)`,
     ).run(deferred.fenceId, row.executionId, row.attemptSeq,
-      row.authorityVersion, row.authorityVersion + 1);
+      runtime.authorityVersion - 1, runtime.authorityVersion);
     database.prepare(
       `UPDATE invocation_recovery_queue SET state = 'closed', lease_owner = NULL,
          lease_expires_at = NULL, failure_code = ?, updated_at = ?
@@ -704,7 +734,7 @@ export function finalizeInternalScopedProducerInTransaction(
       intentOutcomes: [{ intentId: row.intentId, outcome: "already_claimed" }],
       executionOutcomes: [{ executionId: row.executionId,
         outcome: runtime.publicStatus === "cancelled" ? "cancelled" : "already_terminal",
-        version: row.authorityVersion + 1 }],
+        version: runtime.authorityVersion }],
       rejectedConfirmationIds: deferred.rejectedConfirmationIds,
       revokedGrantIds: deferred.revokedGrantIds,
       preservedDispatchIds: deferred.preservedDispatchIds,

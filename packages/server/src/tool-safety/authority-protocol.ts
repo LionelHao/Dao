@@ -100,6 +100,7 @@ export type ToolSafetyAuthorityOperation =
   | Readonly<{
       type: "tool-safety.settle";
       dispatchId: string;
+      expectedVersion: number;
       state: "known_succeeded" | "known_failed" | "outcome_unknown";
       summary: Readonly<Record<string, string | number | boolean>>;
       sealedCompensation?: string;
@@ -388,8 +389,9 @@ export function isToolSafetyAuthorityOperation(value: unknown): value is ToolSaf
   }
   if (value.type === "tool-safety.settle") {
     const optional = Object.hasOwn(value, "sealedCompensation") ? ["sealedCompensation"] : [];
-    return exact(value, ["type", "dispatchId", "state", "summary", "now"], optional) &&
-      text(value.dispatchId) && ["known_succeeded", "known_failed", "outcome_unknown"].includes(String(value.state)) &&
+    return exact(value, ["type", "dispatchId", "expectedVersion", "state", "summary", "now"], optional) &&
+      text(value.dispatchId) && integer(value.expectedVersion, 1) &&
+      ["known_succeeded", "known_failed", "outcome_unknown"].includes(String(value.state)) &&
       jsonObject(value.summary, 8_192) && Object.values(value.summary).every((entry) =>
         typeof entry === "string" || typeof entry === "boolean" ||
         (typeof entry === "number" && Number.isFinite(entry))) &&
