@@ -1841,6 +1841,35 @@ describe("bounded Agent runtime scheduler", () => {
     }));
   });
 
+  it("does not continue parent Authority shutdown when gateway safety settlement fails", async () => {
+    const runtimeAuthority = authority();
+    runtimeAuthority.shutdown = vi.fn();
+    const runtime = createAgentRuntimeService({
+      authority: runtimeAuthority,
+      provider: provider(async function* () {
+        await new Promise<void>(() => undefined);
+        yield { type: "response_started", sequence: 1 };
+      }),
+      modelId: "fake-model",
+      buildProviderInput: providerInput,
+      shutdownTimeoutMs: 100,
+      resetPreview: vi.fn(),
+      toolSafety: {
+        coordinator: {} as never,
+        gateway: {
+          execute: vi.fn(),
+          close: vi.fn(async () => {
+            throw new AgentRuntimeError("provider_timeout", "unknown settlement was not durable");
+          }),
+        },
+      },
+    });
+    await runtime.invoke(context, intent("room-close-failed", "close-failed"));
+
+    await expect(runtime.close()).rejects.toMatchObject({ code: "provider_timeout" });
+    expect(runtimeAuthority.shutdown).not.toHaveBeenCalled();
+  });
+
   it("converges shutdown while a timed-out attempt is retrying unavailable authority", async () => {
     const runtimeAuthority = authority();
     const originalShutdown = runtimeAuthority.shutdown.bind(runtimeAuthority);

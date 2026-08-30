@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import { TOOL_CANONICALIZER_VERSION, type ToolId } from "@native-im/core";
+import {
+  isAgentExecution,
+  isAgentExecutionAttempt,
+  TOOL_CANONICALIZER_VERSION,
+  type ToolId,
+} from "@native-im/core";
 import { parseToolParameters } from "../agent-runtime/tool-parameters.js";
 import {
   FrozenRuntimeAuthorityError,
@@ -42,6 +47,136 @@ function fail(code: ToolSafetyDatabaseError["code"], message: string): never {
 
 function stableId(...parts: readonly string[]): string {
   return createHash("sha256").update(parts.join("\0")).digest("base64url");
+}
+
+function appendCanonicalParentProjection(
+  database: DatabaseSync,
+  executionId: string,
+  occurredAt: string,
+  transition: string,
+): void {
+  const row = database.prepare(
+    `SELECT runtime.execution_id AS executionId, runtime.intent_id AS intentId,
+            runtime.lineage_id AS lineageId, runtime.execution_ordinal AS executionOrdinal,
+            runtime.retry_of_execution_id AS retryOfExecutionId,
+            runtime.snapshot_id AS snapshotId, runtime.provider_id AS providerId,
+            runtime.model_id AS modelId, runtime.public_status AS status, runtime.phase,
+            runtime.current_attempt_seq AS currentAttemptSeq,
+            runtime.authority_version AS version, runtime.queued_at AS queuedAt,
+            runtime.started_at AS startedAt, runtime.updated_at AS updatedAt,
+            runtime.completed_at AS completedAt, runtime.terminal_reason AS terminalReason,
+            runtime.terminal_error_code AS terminalErrorCode, runtime.review_state AS reviewState,
+            legacy.room_id AS roomId, legacy.agent_id AS agentId,
+            legacy.dead_lettered_at AS deadLetteredAt,
+            legacy.result_message_id AS resultMessageId,
+            EXISTS (
+              SELECT 1 FROM tool_dispatches_v2 AS dispatch
+              JOIN tool_calls_v2 AS call ON call.tool_call_id = dispatch.tool_call_id
+              WHERE call.execution_id = runtime.execution_id
+                AND dispatch.state = 'outcome_unknown'
+            ) AS unresolvedReview
+     FROM agent_execution_runtime_states AS runtime
+     JOIN agent_executions AS legacy ON legacy.id = runtime.execution_id
+     WHERE runtime.execution_id = ? AND runtime.review_state <> 'legacy_review_required'`,
+  ).get(executionId);
+  if (typeof row?.executionId !== "string" || typeof row.intentId !== "string" ||
+      typeof row.lineageId !== "string" || typeof row.executionOrdinal !== "number" ||
+      typeof row.snapshotId !== "string" || typeof row.providerId !== "string" ||
+      typeof row.modelId !== "string" || typeof row.version !== "number" ||
+      typeof row.queuedAt !== "string" || typeof row.updatedAt !== "string" ||
+      typeof row.roomId !== "string" || typeof row.agentId !== "string") return;
+  const status = row.status;
+  const terminal = status === "completed" || status === "failed" || status === "cancelled";
+  const effectiveReviewState = row.reviewState === "needs_review"
+    ? row.unresolvedReview === 1 ? "needs_review" as const : "reviewed" as const
+    : "not_required" as const;
+  const execution = {
+    executionId: row.executionId, intentId: row.intentId, lineageId: row.lineageId,
+    executionOrdinal: row.executionOrdinal,
+    ...(typeof row.retryOfExecutionId === "string" ? { retryOfExecutionId: row.retryOfExecutionId } : {}),
+    roomId: row.roomId, agentId: row.agentId, snapshotId: row.snapshotId,
+    providerId: row.providerId, modelId: row.modelId, status, phase: row.phase,
+    currentAttemptSeq: row.currentAttemptSeq, version: row.version, queuedAt: row.queuedAt,
+    ...(status === "accepted" ? {} : { startedAt: row.startedAt ?? row.updatedAt }),
+    updatedAt: row.updatedAt,
+    ...(terminal ? { completedAt: row.completedAt ?? row.updatedAt } : {}),
+    ...(status === "cancelled" ? { cancellationReason: row.terminalReason } : {}),
+    ...(status === "failed" ? {
+      terminalErrorCode: row.terminalErrorCode,
+      reviewState: effectiveReviewState,
+    } : {}),
+    ...(typeof row.deadLetteredAt === "string" ? { deadLetteredAt: row.deadLetteredAt } : {}),
+    ...(typeof row.resultMessageId === "string" ? { resultMessageId: row.resultMessageId } : {}),
+  };
+  if (!isAgentExecution(execution)) {
+    return fail("storage_unavailable", "Tool parent execution projection was corrupt");
+  }
+  const attemptRow = database.prepare(
+    `SELECT public_status AS status, phase, started_at AS startedAt,
+            finished_at AS finishedAt, error_code AS errorCode, next_retry_at AS nextRetryAt
+     FROM agent_execution_attempt_runtime_states
+     WHERE execution_id = ? AND attempt_seq = ?`,
+  ).get(executionId, execution.currentAttemptSeq);
+  const attempt = {
+    executionId: execution.executionId, intentId: execution.intentId,
+    lineageId: execution.lineageId, roomId: execution.roomId, agentId: execution.agentId,
+    attemptSeq: execution.currentAttemptSeq, snapshotId: execution.snapshotId,
+    providerId: execution.providerId, modelId: execution.modelId,
+    status: attemptRow?.status, phase: attemptRow?.phase, executionVersion: execution.version,
+    ...(attemptRow?.status === "accepted" ? {} : {
+      startedAt: attemptRow?.startedAt ?? execution.updatedAt,
+    }),
+    updatedAt: execution.updatedAt,
+    ...((attemptRow?.status === "completed" || attemptRow?.status === "failed" ||
+      attemptRow?.status === "cancelled")
+      ? { finishedAt: attemptRow.finishedAt ?? execution.updatedAt } : {}),
+    ...(attemptRow?.status === "failed" && typeof attemptRow.errorCode === "string"
+      ? { errorCode: attemptRow.errorCode } : {}),
+    ...(attemptRow?.status === "failed" && typeof attemptRow.nextRetryAt === "string"
+      ? { nextRetryAt: attemptRow.nextRetryAt } : {}),
+  };
+  if (!isAgentExecutionAttempt(attempt)) {
+    return fail("storage_unavailable", "Tool parent attempt projection was corrupt");
+  }
+  for (const event of [
+    { eventId: stableId("tool-parent-execution", executionId, transition),
+      eventType: "agent.execution.changed", payload: execution },
+    { eventId: stableId("tool-parent-attempt", executionId,
+      String(execution.currentAttemptSeq), transition),
+      eventType: "agent.execution.attempt.changed", payload: attempt },
+  ] as const) {
+    if (database.prepare("SELECT 1 AS present FROM events WHERE event_id = ?")
+      .get(event.eventId)?.present === 1) continue;
+    const stream = database.prepare(
+      `SELECT head_seq AS headSeq FROM streams
+       WHERE stream_kind = 'room' AND stream_id = ?`,
+    ).get(execution.roomId);
+    if (typeof stream?.headSeq !== "number") {
+      return fail("storage_unavailable", "Tool parent Room stream was unavailable");
+    }
+    const streamSeq = stream.headSeq + 1;
+    const advanced = database.prepare(
+      `UPDATE streams SET head_seq = ?
+       WHERE stream_kind = 'room' AND stream_id = ? AND head_seq = ?`,
+    ).run(streamSeq, execution.roomId, stream.headSeq);
+    if (advanced.changes !== 1) {
+      return fail("storage_unavailable", "Tool parent Room stream CAS was stale");
+    }
+    database.prepare(
+      `INSERT INTO events (
+         event_id, stream_kind, stream_id, stream_seq, room_id,
+         actor_id, event_type, occurred_at, payload_json
+       ) VALUES (?, 'room', ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(event.eventId, execution.roomId, streamSeq, execution.roomId,
+      execution.agentId, event.eventType, occurredAt, JSON.stringify(event.payload));
+    database.prepare(
+      `INSERT INTO outbox_deliveries (
+         id, event_id, target_kind, target_id, stream_seq, status,
+         attempts, available_at, delivered_at, last_error
+       ) VALUES (?, ?, 'room', ?, ?, 'pending', 0, ?, NULL, NULL)`,
+    ).run(stableId("tool-parent-outbox", event.eventId), event.eventId,
+      execution.roomId, streamSeq, occurredAt);
+  }
 }
 
 type ToolSafetyCommandKind = "confirmation_decide" | "handoff_offer" | "handoff_accept" |
@@ -1065,7 +1200,12 @@ function freezeParentForUnknownOutcome(
       current.attemptStatus === "failed" && current.attemptErrorCode === "side_effect_outcome_unknown" &&
       current.publicStatus === "failed" && current.phase === "failed" &&
       current.reviewState === "needs_review" && current.attemptPublicStatus === "failed" &&
-      current.attemptPhase === "failed") return;
+      current.attemptPhase === "failed") {
+    appendCanonicalParentProjection(
+      database, executionId, occurredAt, "side-effect-outcome-unknown",
+    );
+    return;
+  }
 
   database.prepare(
     `UPDATE agent_execution_runtime_states
@@ -1115,6 +1255,9 @@ function freezeParentForUnknownOutcome(
       closed.attemptPhase !== "failed") {
     return fail("execution_conflict", "Unknown side-effect parent closure lost its CAS");
   }
+  appendCanonicalParentProjection(
+    database, executionId, occurredAt, "side-effect-outcome-unknown",
+  );
 }
 
 function settle(
@@ -1186,6 +1329,10 @@ function settle(
   writeRepair(database, "tool-dispatch", operation.dispatchId, dispatch.roomId as string,
     nextVersion, { dispatchId: operation.dispatchId, toolCallId: dispatch.toolCallId,
       state: operation.state, summary: operation.summary, version: nextVersion }, occurredAt);
+  if (lateKnownAfterFence) {
+    appendCanonicalParentProjection(database, dispatch.executionId as string, occurredAt,
+      `side-effect-review-closed:${operation.dispatchId}:${nextVersion}`);
+  }
   const compensation = database.prepare(
     `SELECT lineage.lineage_id AS lineageId,
             lineage.original_dispatch_id AS originalDispatchId,
@@ -1555,6 +1702,17 @@ function review(
   writeRepair(database, "tool-dispatch", operation.dispatchId, dispatch.roomId as string,
     version, { dispatchId: operation.dispatchId, toolCallId: dispatch.toolCallId,
       state: "reviewed", reviewId, resolution: operation.resolution, version }, occurredAt);
+  const parent = database.prepare(
+    `SELECT call.execution_id AS executionId
+     FROM tool_dispatches_v2 AS dispatch
+     JOIN tool_calls_v2 AS call ON call.tool_call_id = dispatch.tool_call_id
+     WHERE dispatch.dispatch_id = ?`,
+  ).get(operation.dispatchId);
+  if (typeof parent?.executionId !== "string") {
+    return fail("storage_unavailable", "Tool review parent execution was unavailable");
+  }
+  appendCanonicalParentProjection(database, parent.executionId, occurredAt,
+    `side-effect-review-closed:${operation.dispatchId}:${version}`);
   return { kind: "reviewed", dispatchId: operation.dispatchId, reviewId,
     resolution: operation.resolution, version, replayed: false };
 }

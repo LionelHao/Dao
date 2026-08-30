@@ -1215,9 +1215,10 @@ async function start(
     await routeRuntime?.close().catch(() => undefined);
     await ballRuntime?.close().catch(() => undefined);
     await projectBoundaryRuntime?.close().catch(() => undefined);
-    await runtime?.close().catch(() => undefined);
+    let runtimeSafetySettled = true;
+    await runtime?.close().catch(() => { runtimeSafetySettled = false; });
     await snapshots?.close().catch(() => undefined);
-    await worker?.close().catch(() => undefined);
+    if (runtimeSafetySettled) await worker?.close().catch(() => undefined);
     throw error;
   }
 
@@ -1225,12 +1226,14 @@ async function start(
   return {
     url: transport.url,
     close() {
-      closePromise ??= (async () => {
+      if (closePromise !== undefined) return closePromise;
+      const attempt = (async () => {
         stopCacheInvalidationRecovery?.();
         stopRuntimeRecovery?.();
         stopAttachmentRecovery?.();
         stopMemoryRecovery?.();
         const failures: unknown[] = [];
+        let runtimeSafetySettled = true;
         for (const [stage, close] of [
           ["transport", () => transport.close()],
           ["attachment-authority", async () => attachmentAuthority?.close()],
@@ -1243,17 +1246,24 @@ async function start(
           ["snapshots", () => snapshots.close()],
           ["worker", () => worker.close()],
         ] as const) {
+          if (stage === "worker" && !runtimeSafetySettled) continue;
           try {
             await close();
             testOptions.afterCloseForTest?.[stage]?.();
           } catch (error: unknown) {
             failures.push(error);
+            if (stage === "runtime") runtimeSafetySettled = false;
           }
         }
         if (failures.length > 0) {
           throw new AggregateError(failures, "Authoritative server cleanup failed");
         }
       })();
+      const retryable = attempt.catch((error: unknown) => {
+        if (closePromise === retryable) closePromise = undefined;
+        throw error;
+      });
+      closePromise = retryable;
       return closePromise;
     },
   };

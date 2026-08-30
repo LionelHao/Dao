@@ -14,6 +14,8 @@ import {
   seedCanonicalRoomAssignmentFixture,
 } from "../fixtures/agent-authority-fixture.js";
 import type { AuthenticatedCommandContext } from "../persistence/contracts.js";
+import { executeRuntimeAuthorityOperation } from
+  "../persistence/authority-database-handler.js";
 import {
   mintDatabaseAuthorityTransactionView,
   releaseDatabaseAuthorityTransactionView,
@@ -31,12 +33,16 @@ const NOW = Date.parse("2026-08-30T08:00:00.000Z");
 const NOW_ISO = new Date(NOW).toISOString();
 const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const HASH = "a".repeat(64);
+const EMPTY_JSON_SHA256 = createHash("sha256").update("{}").digest("hex");
 
 function testDatabase() {
   const directory = mkdtempSync(join(tmpdir(), "dao-ft10-authority-"));
-  const database = new DatabaseSync(join(directory, "authority.sqlite"));
+  const databasePath = join(directory, "authority.sqlite");
+  const database = new DatabaseSync(databasePath);
   return {
     database,
+    databasePath,
+    directory,
     close(): void {
       database.close();
       rmSync(directory, { recursive: true, force: true });
@@ -209,7 +215,8 @@ function seedAuthority(database: DatabaseSync): void {
     ) VALUES ('snapshot-ft10', 'room-ft10', 'intent-ft10', 'agent-ft10',
               'provider-ft10', 'model-ft10', 'compiler-v1', 'config-v1',
               'deterministic_utf8_v1', '${HASH}', 'message-ft10', 1, 'direct_mention',
-              0, 0, 0, 0, 0, 0, 0, '{}', '${HASH}', '${HASH}', 'active', 1,
+              0, 0, 0, 0, 0, 0, 0, '{}', '${EMPTY_JSON_SHA256}',
+              '${EMPTY_JSON_SHA256}', 'active', 1,
               '${NOW_ISO}', 'required');
     INSERT INTO agent_execution_context_bindings (
       execution_id, snapshot_id, invocation_intent_id, execution_generation, bound_at
@@ -217,6 +224,31 @@ function seedAuthority(database: DatabaseSync): void {
     INSERT INTO agent_execution_context_attempts (
       execution_id, attempt_seq, snapshot_id, snapshot_generation, reuse_kind, bound_at
     ) VALUES ('execution-ft10', 1, 'snapshot-ft10', 1, 'first', '${NOW_ISO}');
+    INSERT INTO context_manifests (
+      manifest_id, snapshot_id, manifest_version, manifest_sha256,
+      canonical_manifest_json, item_count, total_original_bytes,
+      total_included_bytes, total_original_tokens, total_included_tokens,
+      accounting_json, created_at
+    ) VALUES ('manifest-ft10', 'snapshot-ft10', 'manifest-v1', '${EMPTY_JSON_SHA256}',
+              '{}', 1, 16, 16, 16, 16, '{}', '${NOW_ISO}');
+    INSERT INTO context_manifest_items (
+      manifest_id, snapshot_id, ordinal, section, disposition,
+      canonical_sort_key, source_label_sha256, source_kind, source_id,
+      source_revision, content_sha256, original_bytes, included_bytes,
+      original_tokens, included_tokens, reason_code, segment_json, availability
+    ) VALUES ('manifest-ft10', 'snapshot-ft10', 0, 'trigger', 'included',
+              'trigger:0001', '${HASH}', 'trigger', 'message-ft10', 1, '${HASH}',
+              16, 16, 16, 16, 'included', NULL, 'readable');
+    INSERT INTO context_snapshot_sources (
+      snapshot_id, room_id, source_kind, source_id, source_revision,
+      source_label_sha256, currently_required, authorization_revision, created_at
+    ) VALUES ('snapshot-ft10', 'room-ft10', 'message_revision', 'message-ft10', 1,
+              '${HASH}', 1, 0, '${NOW_ISO}');
+    INSERT INTO context_snapshot_bodies (
+      snapshot_id, envelope_schema_version, canonical_envelope_json,
+      envelope_sha256, byte_count, token_count, created_at
+    ) VALUES ('snapshot-ft10', 'envelope-v1', '{}', '${EMPTY_JSON_SHA256}', 2, 1,
+              '${NOW_ISO}');
     UPDATE agent_execution_runtime_states
     SET phase = 'model_generation', authority_version = authority_version + 1,
         updated_at = '${NOW_ISO}'
@@ -416,6 +448,21 @@ describe("FT-10 SQLite tool-safety authority", () => {
         publicStatus: "failed", phase: "failed", reviewState: "needs_review",
         attemptPublicStatus: "failed", attemptPhase: "failed",
       });
+      expect(database.prepare(
+        `SELECT event_type AS eventType, json_extract(payload_json, '$.status') AS status,
+                json_extract(payload_json, '$.reviewState') AS reviewState
+         FROM events
+         WHERE event_type IN ('agent.execution.changed','agent.execution.attempt.changed')
+         ORDER BY stream_seq`,
+      ).all()).toEqual([
+        { eventType: "agent.execution.changed", status: "failed", reviewState: "needs_review" },
+        { eventType: "agent.execution.attempt.changed", status: "failed", reviewState: null },
+      ]);
+      expect(database.prepare(
+        `SELECT COUNT(*) AS count FROM outbox_deliveries AS delivery
+         JOIN events AS event ON event.event_id = delivery.event_id
+         WHERE event.event_type IN ('agent.execution.changed','agent.execution.attempt.changed')`,
+      ).get()).toEqual({ count: 2 });
     } finally {
       fixture.close();
     }
@@ -667,6 +714,11 @@ describe("FT-10 SQLite tool-safety authority", () => {
       ).get(dispatchId)).toEqual({
         state: "known_succeeded", status: "failed", publicStatus: "failed", phase: "failed",
       });
+      expect(database.prepare(
+        `SELECT json_extract(payload_json, '$.reviewState') AS reviewState
+         FROM events WHERE event_type = 'agent.execution.changed'
+         ORDER BY stream_seq DESC LIMIT 1`,
+      ).get()).toEqual({ reviewState: "reviewed" });
 
       const secondFixture = testDatabase();
       const { database: second } = secondFixture;
@@ -774,6 +826,34 @@ describe("FT-10 SQLite tool-safety authority", () => {
         reviewer: "human-ft10",
         evidenceSha256,
       });
+      expect(database.prepare(
+        `SELECT json_extract(payload_json, '$.reviewState') AS reviewState
+         FROM events WHERE event_type = 'agent.execution.changed'
+         ORDER BY stream_seq DESC LIMIT 1`,
+      ).get()).toEqual({ reviewState: "reviewed" });
+      expect(database.prepare(
+        `SELECT COUNT(*) AS count
+         FROM tool_dispatches_v2 AS dispatch
+         JOIN tool_calls_v2 AS call ON call.tool_call_id = dispatch.tool_call_id
+         WHERE call.execution_id = 'execution-ft10' AND dispatch.state = 'outcome_unknown'`,
+      ).get()).toEqual({ count: 0 });
+      const reviewedParentVersion = database.prepare(
+        `SELECT authority_version AS authorityVersion
+         FROM agent_execution_runtime_states WHERE execution_id = 'execution-ft10'`,
+      ).get()?.authorityVersion;
+      expect(typeof reviewedParentVersion).toBe("number");
+      expect(executeRuntimeAuthorityOperation(database, {
+        type: "runtime.manual-retry",
+        context: context("reviewed-parent-retry"),
+        executionId: "execution-ft10",
+        newExecutionId: "execution-ft10-reviewed-retry",
+        newIntentId: "unused-reviewed-retry-intent",
+        expectedVersion: reviewedParentVersion as number,
+        now: NOW + 8_000,
+      })).toMatchObject({
+        kind: "invocation",
+        execution: { id: "execution-ft10-reviewed-retry", status: "queued" },
+      });
     } finally {
       fixture.close();
     }
@@ -782,6 +862,7 @@ describe("FT-10 SQLite tool-safety authority", () => {
   it("repairs a historical outcome_unknown whose parent closure did not commit", () => {
     const fixture = testDatabase();
     const { database } = fixture;
+    let restarted: DatabaseSync | undefined;
     try {
       seedAuthority(database);
       const claim = prepareAndClaim(database);
@@ -790,11 +871,13 @@ describe("FT-10 SQLite tool-safety authority", () => {
         `UPDATE tool_dispatches_v2 SET state = 'outcome_unknown', reason = 'adapter_ambiguous',
            settled_at = ?, version = 3, changed_at = ? WHERE dispatch_id = ?`,
       ).run(changedAt, changedAt, claim.dispatchId);
+      database.close();
+      restarted = new DatabaseSync(fixture.databasePath);
 
-      expect(transact(database, {
+      expect(transact(restarted, {
         type: "tool-safety.recover-execution", executionId: "execution-ft10", now: NOW + 5_000,
       })).toMatchObject({ kind: "recovery", state: "outcome_unknown", dispatchId: claim.dispatchId });
-      expect(database.prepare(
+      expect(restarted.prepare(
         `SELECT execution.status, execution.terminal_error_code AS terminalErrorCode,
                 runtime.public_status AS publicStatus, runtime.phase,
                 runtime.review_state AS reviewState
@@ -805,8 +888,21 @@ describe("FT-10 SQLite tool-safety authority", () => {
         status: "failed", terminalErrorCode: "side_effect_outcome_unknown",
         publicStatus: "failed", phase: "failed", reviewState: "needs_review",
       });
+      expect(restarted.prepare(
+        `SELECT COUNT(*) AS count FROM events
+         WHERE event_type IN ('agent.execution.changed','agent.execution.attempt.changed')`,
+      ).get()).toEqual({ count: 2 });
+      expect(restarted.prepare(
+        `SELECT COUNT(*) AS count FROM outbox_deliveries AS delivery
+         JOIN events AS event ON event.event_id = delivery.event_id
+         WHERE event.event_type IN ('agent.execution.changed','agent.execution.attempt.changed')`,
+      ).get()).toEqual({ count: 2 });
     } finally {
-      fixture.close();
+      if (restarted === undefined) fixture.close();
+      else {
+        restarted.close();
+        rmSync(fixture.directory, { recursive: true, force: true });
+      }
     }
   });
 

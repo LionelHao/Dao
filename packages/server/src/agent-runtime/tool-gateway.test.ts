@@ -464,6 +464,45 @@ describe("FT-10 tool safety gateway", () => {
     expect(authority.settleDispatch).toHaveBeenCalledTimes(1);
   });
 
+  it("does not abort a claimed adapter or report close success when unknown settlement hangs", async () => {
+    const order: string[] = [];
+    let adapterEntered!: () => void;
+    const entered = new Promise<void>((resolve) => { adapterEntered = resolve; });
+    let releaseSettlement!: () => void;
+    const settlement = new Promise<void>((resolve) => { releaseSettlement = resolve; });
+    const execute = vi.fn<ToolSafetyAdapter["execute"]>(async ({ signal }) => {
+      adapterEntered();
+      await new Promise<void>((_resolve, reject) => signal.addEventListener("abort", () => {
+        order.push("adapter-aborted");
+        reject(new Error("aborted after durable settlement"));
+      }, { once: true }));
+      throw new Error("unreachable");
+    });
+    const authority = safetyAuthority(
+      async () => ({
+        kind: "claimed", dispatchId: "dispatch-hung-settlement",
+        toolId: "sandbox-file.write", parameters: { path: "a.txt", content: "bounded" },
+      }),
+      vi.fn(async () => {
+        await settlement;
+        order.push("settlement-acked");
+      }),
+    );
+    const gateway = createToolSafetyGateway({
+      authority, adapters: safetyAdapters(execute), shutdownWaitMs: 100,
+    });
+    const operation = gateway.execute(safetyInput);
+    await entered;
+
+    await expect(gateway.close()).rejects.toMatchObject({ code: "provider_timeout" });
+    expect(order).toEqual([]);
+
+    releaseSettlement();
+    await gateway.close();
+    await expect(operation).rejects.toMatchObject({ code: "side_effect_outcome_unknown" });
+    expect(order).toEqual(["settlement-acked", "adapter-aborted"]);
+  });
+
   it("settles typed known_failed without guessing from a throw", async () => {
     const execute = vi.fn(async () => ({
       state: "known_failed" as const,
