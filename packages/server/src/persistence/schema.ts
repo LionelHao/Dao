@@ -8702,7 +8702,9 @@ const V26_STATEMENTS = [
   `DROP TRIGGER agent_profiles_ceiling_update_v14`,
   `DROP TRIGGER agent_profile_revisions_v20_immutable_update`,
   `DROP TRIGGER room_agent_assignment_revisions_v20_immutable_update`,
+  `DROP TRIGGER deployment_agent_profile_repair_v20_validate_update`,
   `DROP TRIGGER deployment_agent_profile_events_v20_immutable_update`,
+  `DROP TRIGGER events_prevent_update`,
   `UPDATE agent_profiles
    SET capability_ceiling_json = COALESCE((
          SELECT json_group_array(value) FROM (
@@ -8867,6 +8869,31 @@ const V26_STATEMENTS = [
   `CREATE TRIGGER deployment_agent_profile_events_v20_immutable_update
    BEFORE UPDATE ON deployment_agent_profile_events
    BEGIN SELECT RAISE(ABORT, 'Deployment Profile event is immutable'); END`,
+  `CREATE TRIGGER deployment_agent_profile_repair_v20_validate_update
+   BEFORE UPDATE ON deployment_agent_profile_repair_records
+   WHEN NEW.profile_id <> OLD.profile_id OR NEW.record_version <> OLD.record_version
+      OR NEW.profile_revision <= OLD.profile_revision OR NEW.stream_seq <= OLD.stream_seq
+      OR NOT EXISTS (
+        SELECT 1 FROM deployment_agent_profile_events AS event
+        JOIN agent_profiles AS profile ON profile.id = event.profile_id
+        WHERE event.event_id = NEW.event_id AND event.stream_seq = NEW.stream_seq
+          AND event.profile_id = NEW.profile_id
+          AND event.profile_revision = NEW.profile_revision
+          AND profile.revision = NEW.profile_revision
+      )
+      OR COALESCE(json_extract(NEW.projection_json, '$.profileId'), '') <> NEW.profile_id
+      OR COALESCE(json_extract(NEW.projection_json, '$.revision'), 0) <> NEW.profile_revision
+      OR EXISTS (
+        SELECT 1 FROM json_tree(NEW.projection_json)
+        WHERE lower(COALESCE(key, '')) IN (
+          'roomid', 'roomname', 'message', 'messages', 'member', 'members',
+          'goal', 'ball', 'assignment', 'secret', 'secretvalue', 'credential',
+          'apikey', 'authorization', 'token'
+        )
+      )
+   BEGIN SELECT RAISE(ABORT, 'Deployment Profile repair transition is invalid'); END`,
+  `CREATE TRIGGER events_prevent_update BEFORE UPDATE ON events
+   BEGIN SELECT RAISE(ABORT, 'events are immutable'); END`,
   `CREATE TRIGGER agent_profiles_v20_validate_update
    BEFORE UPDATE ON agent_profiles
    WHEN NEW.id <> OLD.id OR NEW.actor_id <> OLD.actor_id

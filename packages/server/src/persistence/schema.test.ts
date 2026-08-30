@@ -775,6 +775,42 @@ describe("authority SQLite schema", () => {
         ).run(sha256(row.json), row.id);
       }
       for (const trigger of triggers) database.exec(trigger.sql);
+      const roomStream = database.prepare(
+        `SELECT head_seq AS headSeq FROM streams
+         WHERE stream_kind = 'room' AND stream_id = 'room-1'`,
+      ).get() as { readonly headSeq: number };
+      const assignmentPayload = JSON.stringify({
+        assignment: {
+          agentActorId: "agent-1",
+          capabilityCeiling: [],
+          capabilitySubset: [],
+          effectiveCapabilities: [],
+          toolCeiling: ["room-memory.read"],
+          toolSubset: ["room-memory.read"],
+          effectiveTools: ["room-memory.read"],
+        },
+      });
+      database.exec("BEGIN IMMEDIATE");
+      try {
+        database.prepare(
+          `UPDATE streams SET head_seq = ?
+           WHERE stream_kind = 'room' AND stream_id = 'room-1'`,
+        ).run(roomStream.headSeq + 1);
+        database.prepare(
+          `INSERT INTO events (
+             event_id, stream_kind, stream_id, stream_seq, room_id,
+             authority_kind, actor_id, event_type, occurred_at, payload_json
+           ) VALUES (
+             'v25-room-memory-assignment-event', 'room', 'room-1', ?, 'room-1',
+             'human', 'human-1', 'room.agent-assignment.changed',
+             '2026-08-30T00:00:00.000Z', ?
+           )`,
+        ).run(roomStream.headSeq + 1, assignmentPayload);
+        database.exec("COMMIT");
+      } catch (error: unknown) {
+        database.exec("ROLLBACK");
+        throw error;
+      }
 
       expect(database.prepare(
         "SELECT tool_ceiling_json AS tools FROM agent_profiles WHERE actor_id = 'agent-1'",
@@ -822,6 +858,22 @@ describe("authority SQLite schema", () => {
              AND payload_json LIKE '%room-memory.read%'
          ) AS count`,
       ).get()).toEqual({ count: 0 });
+      expect(database.prepare(
+        `SELECT COUNT(*) AS count FROM events
+         WHERE event_id = 'v25-room-memory-assignment-event'
+           AND EXISTS (
+             SELECT 1 FROM json_each(payload_json, '$.assignment.capabilityCeiling')
+             WHERE value = 'room.memory.read'
+           )
+           AND EXISTS (
+             SELECT 1 FROM json_each(payload_json, '$.assignment.capabilitySubset')
+             WHERE value = 'room.memory.read'
+           )
+           AND EXISTS (
+             SELECT 1 FROM json_each(payload_json, '$.assignment.effectiveCapabilities')
+             WHERE value = 'room.memory.read'
+           )`,
+      ).get()).toEqual({ count: 1 });
 
       expectSqlRejected(database,
         `UPDATE agent_profiles SET tool_ceiling_json = '["room-memory.read"]'

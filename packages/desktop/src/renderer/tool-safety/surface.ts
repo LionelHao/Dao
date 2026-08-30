@@ -209,6 +209,8 @@ export function renderToolSafetySurface(
   const connectionLocked = state.connection.status !== "online";
   const operationLocked = state.operation.status === "submitting" ||
     state.operation.status === "acknowledged";
+  const compensationLocked = operationLocked ||
+    (state.operation.status === "error" && state.operation.statusCode === 503);
   const controls = document.createElement("div");
   controls.className = "tool-safety-actions";
 
@@ -304,8 +306,8 @@ export function renderToolSafetySurface(
           evidenceSummary: evidence.value.trim() });
       }));
     }
-    controls.append(actionButton("提出新的补偿动作", "compensate", connectionLocked || operationLocked, () => {
-      if (connectionLocked || operationLocked) return;
+    controls.append(actionButton("提出新的补偿动作", "compensate", connectionLocked || compensationLocked, () => {
+      if (connectionLocked || compensationLocked) return;
       actions.submit({ type: "tool.compensation.propose", dispatchId: state.card.dispatchId!,
         expectedVersion: state.card.version });
     }));
@@ -313,8 +315,8 @@ export function renderToolSafetySurface(
   if ((state.card.state === "known-succeeded" || state.card.state === "compensation-known-succeeded") &&
       state.card.reversibility === "compensatable" && state.card.dispatchId !== undefined &&
       state.card.canDecide === true) {
-    controls.append(actionButton("提出新的补偿动作", "compensate", connectionLocked || operationLocked, () => {
-      if (connectionLocked || operationLocked) return;
+    controls.append(actionButton("提出新的补偿动作", "compensate", connectionLocked || compensationLocked, () => {
+      if (connectionLocked || compensationLocked) return;
       actions.submit({ type: "tool.compensation.propose", dispatchId: state.card.dispatchId!,
         expectedVersion: state.card.version });
     }));

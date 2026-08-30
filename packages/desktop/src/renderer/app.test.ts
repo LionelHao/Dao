@@ -285,6 +285,12 @@ describe("FT-10 J-05 tool-safety surface", () => {
     const restored = root.querySelector<HTMLTextAreaElement>("[data-tool-safety-evidence]")!;
     expect(restored.value).toBe("Inspected target before submit.");
     expect(restored.disabled).toBe(false);
+    const compensation = root.querySelector<HTMLButtonElement>(
+      "[data-tool-safety-action='compensate']",
+    )!;
+    expect(compensation.disabled).toBe(true);
+    compensation.click();
+    expect(ui.submit).not.toHaveBeenCalled();
     expect(document.activeElement).toBe(restored);
     root.remove();
   });
@@ -334,6 +340,18 @@ describe("FT-10 J-05 tool-safety surface", () => {
     expect(unknownActions.submit).toHaveBeenCalledWith({
       type: "tool.compensation.propose", dispatchId: "dispatch-1", expectedVersion: 4,
     });
+    unknownActions.submit.mockClear();
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" }, card: card("known-succeeded"),
+      operation: { status: "error", requestId: "compensation-503", action: "compensate",
+        statusCode: 503, code: "authority_unavailable" },
+    }, unknownActions);
+    const compensationAfter503 = root.querySelector<HTMLButtonElement>(
+      "[data-tool-safety-action='compensate']",
+    )!;
+    expect(compensationAfter503.disabled).toBe(true);
+    compensationAfter503.click();
+    expect(unknownActions.submit).not.toHaveBeenCalled();
 
     importedApp.renderToolSafetySurface(root, {
       connection: { status: "online" },
