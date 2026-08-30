@@ -176,6 +176,9 @@ export function createToolSafetyRuntimeCoordinator(input: Readonly<{
       const now = input.now();
       const binding = await input.authority.execute({ type: "tool-safety.handoff-read",
         ...command, now });
+      if (binding.kind === "handoff" && binding.state === "accepted" && binding.replayed) {
+        return binding;
+      }
       if (binding.kind !== "handoff-binding") {
         throw new Error("Tool handoff binding was malformed");
       }

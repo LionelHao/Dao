@@ -420,6 +420,29 @@ describe("FT-10 SQLite tool-safety authority", () => {
         version: 1,
       });
       if (proposal.kind !== "compensation-proposed") throw new Error("missing compensation");
+      expect(transact(database, {
+        type: "tool-safety.compensation-propose",
+        context: proposalContext,
+        dispatchId: original.dispatchId,
+        expectedVersion: 3,
+        invocationId: `tool-compensation-invocation-${suffix}`,
+        executionId: `tool-compensation-execution-${suffix}`,
+        toolCallId: `tool-compensation-call-${suffix}`,
+        confirmationId: `tool-compensation-confirmation-${suffix}`,
+        canonicalParameterSha256: createHash("sha256").update(canonicalReference).digest("hex"),
+        sealedReference: {
+          ciphertext: createHash("sha256")
+            .update(`reference\0${canonicalReference}`).digest("base64url"),
+          keyVersion: "dao-compensation-reference.v1",
+          expiresAt: new Date(NOW + 245_000).toISOString(),
+        },
+        now: NOW + 6_500,
+      })).toMatchObject({
+        kind: "compensation-proposed",
+        originalDispatchId: original.dispatchId,
+        version: 1,
+        replayed: true,
+      });
       const compensationGrantId = "grant-ft10-compensation";
       expect(transact(database, {
         type: "tool-safety.confirmation-decide",
@@ -684,6 +707,14 @@ describe("FT-10 SQLite tool-safety authority", () => {
         now: NOW + 1_000,
       })).toMatchObject({ kind: "prepared", confirmationId: "confirmation-handoff" });
 
+      database.prepare(
+        `INSERT INTO tool_safety_command_receipts_v2 (
+           principal_actor_id, command_kind, idempotency_key, request_sha256,
+           response_json, committed_at, expires_at
+         ) VALUES ('human-ft10', 'handoff_offer', 'offer-handoff', ?, '{}', ?, ?)`,
+      ).run("0".repeat(64), new Date(NOW - 2_000).toISOString(),
+        new Date(NOW - 1_000).toISOString());
+
       expect(transact(database, {
         type: "tool-safety.handoff-offer",
         context: context("offer-handoff"),
@@ -693,6 +724,11 @@ describe("FT-10 SQLite tool-safety authority", () => {
         handoffId: "handoff-ft10",
         now: NOW + 2_000,
       })).toMatchObject({ kind: "handoff", state: "offered", replayed: false });
+      expect(database.prepare(
+        `SELECT COUNT(*) AS count FROM tool_safety_command_receipts_v2
+         WHERE principal_actor_id = 'human-ft10' AND command_kind = 'handoff_offer'
+           AND idempotency_key = 'offer-handoff' AND expires_at > ?`,
+      ).get(new Date(NOW + 2_000).toISOString())).toEqual({ count: 1 });
       expect(transact(database, {
         type: "tool-safety.handoff-read",
         context: context("read-handoff", secondHuman),
@@ -721,6 +757,13 @@ describe("FT-10 SQLite tool-safety authority", () => {
         },
         now: NOW + 4_000,
       })).toMatchObject({ kind: "handoff", state: "accepted", version: 2 });
+      expect(transact(database, {
+        type: "tool-safety.handoff-read",
+        context: context("accept-handoff", secondHuman),
+        handoffId: "handoff-ft10",
+        expectedVersion: 1,
+        now: NOW + 4_500,
+      })).toMatchObject({ kind: "handoff", state: "accepted", version: 2, replayed: true });
       expect(() => transact(database, {
         type: "tool-safety.confirmation-decide",
         context: context("stale-original-human"),

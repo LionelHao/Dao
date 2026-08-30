@@ -48,15 +48,81 @@ type ToolSafetyCommandKind = "confirmation_decide" | "handoff_offer" | "handoff_
   "outcome_review" | "compensation_propose";
 
 function commandRequestSha256(operation: ToolSafetyAuthorityOperation): string {
+  let payload: Readonly<Record<string, unknown>>;
+  switch (operation.type) {
+    case "tool-safety.confirmation-decide":
+      payload = { type: operation.type, confirmationId: operation.confirmationId,
+        expectedVersion: operation.expectedVersion, decision: operation.decision };
+      break;
+    case "tool-safety.handoff-offer":
+      payload = { type: operation.type, confirmationId: operation.confirmationId,
+        expectedVersion: operation.expectedVersion, targetActorId: operation.targetActorId };
+      break;
+    case "tool-safety.handoff-read":
+    case "tool-safety.handoff-accept":
+      payload = { type: "tool-safety.handoff-accept", handoffId: operation.handoffId,
+        expectedVersion: operation.expectedVersion };
+      break;
+    case "tool-safety.outcome-review":
+      payload = { type: operation.type, dispatchId: operation.dispatchId,
+        expectedVersion: operation.expectedVersion, resolution: operation.resolution,
+        evidenceSummary: operation.evidenceSummary };
+      break;
+    case "tool-safety.compensation-propose":
+      payload = { type: operation.type, dispatchId: operation.dispatchId,
+        expectedVersion: operation.expectedVersion };
+      break;
+    default:
+      return fail("invalid_parameters", "Tool safety receipt operation was not public");
+  }
   const request = {
     sessionFamilyId: "context" in operation ? operation.context.sessionFamilyId : undefined,
-    payload: Object.fromEntries(Object.entries(operation)
-    .filter(([key]) => key !== "now" && key !== "context" && key !== "grantId" &&
-      key !== "grantExpiresAt" && key !== "evidenceSha256" &&
-      key !== "compensationToolCallId")
-    .sort(([left], [right]) => left.localeCompare(right))),
+    payload,
   };
   return createHash("sha256").update(JSON.stringify(request)).digest("hex");
+}
+
+function removeExpiredCommandReceipts(database: DatabaseSync, nowIso: string): void {
+  database.prepare(
+    `DELETE FROM tool_safety_command_receipts_v2
+     WHERE rowid IN (
+       SELECT rowid FROM tool_safety_command_receipts_v2
+       WHERE expires_at <= ? ORDER BY expires_at, rowid LIMIT 100
+     )`,
+  ).run(nowIso);
+}
+
+function replayCommandReceipt(
+  database: DatabaseSync,
+  operation: ToolSafetyAuthorityOperation & { readonly context: AuthenticatedCommandContext },
+  commandKind: ToolSafetyCommandKind,
+): ToolSafetyAuthorityResult | undefined {
+  const nowIso = new Date(operation.now).toISOString();
+  database.prepare(
+    `DELETE FROM tool_safety_command_receipts_v2
+     WHERE principal_actor_id = ? AND command_kind = ? AND idempotency_key = ?
+       AND expires_at <= ?`,
+  ).run(operation.context.principal.actorId, commandKind,
+    operation.context.idempotencyKey, nowIso);
+  removeExpiredCommandReceipts(database, nowIso);
+  const requestSha256 = commandRequestSha256(operation);
+  const existing = database.prepare(
+    `SELECT request_sha256 AS requestSha256, response_json AS responseJson
+     FROM tool_safety_command_receipts_v2
+     WHERE principal_actor_id = ? AND command_kind = ? AND idempotency_key = ?
+       AND expires_at > ?`,
+  ).get(operation.context.principal.actorId, commandKind, operation.context.idempotencyKey,
+    nowIso);
+  if (existing === undefined) return undefined;
+  if (existing.requestSha256 !== requestSha256 || typeof existing.responseJson !== "string") {
+    return fail("execution_conflict", "Tool safety idempotency payload changed");
+  }
+  try {
+    const parsed = JSON.parse(existing.responseJson) as ToolSafetyAuthorityResult;
+    return "replayed" in parsed ? { ...parsed, replayed: true } : parsed;
+  } catch {
+    return fail("storage_unavailable", "Tool safety receipt was corrupt");
+  }
 }
 
 function withCommandReceipt(
@@ -66,25 +132,9 @@ function withCommandReceipt(
   execute: () => ToolSafetyAuthorityResult,
 ): ToolSafetyAuthorityResult {
   requireHumanSession(database, operation.context, operation.now);
+  const replay = replayCommandReceipt(database, operation, commandKind);
+  if (replay !== undefined) return replay;
   const requestSha256 = commandRequestSha256(operation);
-  const existing = database.prepare(
-    `SELECT request_sha256 AS requestSha256, response_json AS responseJson
-     FROM tool_safety_command_receipts_v2
-     WHERE principal_actor_id = ? AND command_kind = ? AND idempotency_key = ?
-       AND expires_at > ?`,
-  ).get(operation.context.principal.actorId, commandKind, operation.context.idempotencyKey,
-    new Date(operation.now).toISOString());
-  if (existing !== undefined) {
-    if (existing.requestSha256 !== requestSha256 || typeof existing.responseJson !== "string") {
-      return fail("execution_conflict", "Tool safety idempotency payload changed");
-    }
-    try {
-      const parsed = JSON.parse(existing.responseJson) as ToolSafetyAuthorityResult;
-      return "replayed" in parsed ? { ...parsed, replayed: true } : parsed;
-    } catch {
-      return fail("storage_unavailable", "Tool safety receipt was corrupt");
-    }
-  }
   const result = execute();
   database.prepare(
     `INSERT INTO tool_safety_command_receipts_v2 (
@@ -1168,6 +1218,8 @@ function readHandoffBinding(
   operation: Extract<ToolSafetyAuthorityOperation, { type: "tool-safety.handoff-read" }>,
 ): ToolSafetyAuthorityResult {
   const actorId = requireHumanSession(database, operation.context, operation.now);
+  const replay = replayCommandReceipt(database, operation, "handoff_accept");
+  if (replay !== undefined) return replay;
   const row = database.prepare(
     `SELECT handoff.confirmation_id AS confirmationId,
             handoff.to_principal_human_actor_id AS toPrincipalActorId,
