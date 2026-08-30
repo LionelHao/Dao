@@ -17,6 +17,7 @@ import {
   isRoomCursor,
   isRoomGovernanceView,
   isRoomMemoryEvent,
+  isToolSafetyRepairRecord,
   isHumanRoomMembership,
   isMessage,
   isOpenItem,
@@ -1134,6 +1135,9 @@ function validRoomEventPayload(
   eventActorId: string,
   occurredAt: string,
 ): boolean {
+  if (type === "tool.safety.changed") {
+    return isToolSafetyRepairRecord(payload);
+  }
   if (type === "room.created" || type === "room.renamed") {
     return exact(payload, ["room"]) && strictManagedRoom(payload.room) &&
       (payload.room as { readonly id: string }).id === roomId;

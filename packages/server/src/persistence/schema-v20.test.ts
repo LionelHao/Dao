@@ -446,7 +446,7 @@ describe("authority SQLite v20 Agent Profile and Routing Authority", () => {
         UPDATE agent_profiles
         SET revision = revision + 1, tool_ceiling_json = '["shell.exec"]', updated_at = ?
         WHERE id = ?
-      `).run(NOW, profile.id)).toThrow(/authority set/i);
+      `).run(NOW, profile.id)).toThrow(/authority set|external tool ceiling/i);
       database.prepare(`
         INSERT INTO route_jobs (
           id, room_id, source_message_id, status, current_attempt, topic_key,

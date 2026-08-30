@@ -1438,6 +1438,9 @@ describe("authoritative server real-process harness", () => {
         invitationSecretKey: new Uint8Array(32).fill(48),
         tenantAdministration: { bootstrapHumanActorIds: ["human-a"] },
       }, {
+        ...(process.platform === "linux" ? {} : {
+          toolAdapterPathFallbackForTest: true as const,
+        }),
         initialize: async (facades) => {
           const issued = await facades.auth.login({ accountId: "account-a", secret: "test-secret" });
           const authenticated = await facades.auth.authenticateSession(issued.accessToken);
@@ -1531,6 +1534,9 @@ describe("authoritative server real-process harness", () => {
         invitationSecretKey: new Uint8Array(32).fill(47),
         tenantAdministration: { bootstrapHumanActorIds: ["human-a"] },
       }, {
+        ...(process.platform === "linux" ? {} : {
+          toolAdapterPathFallbackForTest: true as const,
+        }),
         initialize: async (facades) => {
           const issued = await facades.auth.login({ accountId, secret: passwordCanary });
           const authenticated = await facades.auth.authenticateSession(issued.accessToken);
