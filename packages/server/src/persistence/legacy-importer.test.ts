@@ -726,7 +726,7 @@ describe("LegacyStateImporter", () => {
       message: "Authority database initialization failed",
     });
     expect(existsSync(databasePath)).toBe(false);
-    expect(readFileSync(stagingPath)).toEqual(stagingBytes);
+    expect(readFileSync(stagingPath).equals(stagingBytes)).toBe(true);
     expect(readFileSync(recoveryPath)).toEqual(manifestBytes);
   }, WORKER_INITIALIZATION_TEST_TIMEOUT_MS);
 
@@ -814,7 +814,7 @@ describe("LegacyStateImporter", () => {
       messages: 2,
     });
     await restarted.close();
-    expect(readFileSync(databasePath)).toEqual(before);
+    expect(readFileSync(databasePath).equals(before)).toBe(true);
     expect(existsSync(join(directory, recoveryFileName!))).toBe(false);
     for (const [path, bytes] of fixture.originalBytes) {
       expect(readFileSync(path)).toEqual(bytes);
@@ -928,7 +928,7 @@ describe("LegacyStateImporter", () => {
       code: "storage_unavailable",
       message: "Authority database initialization failed",
     });
-    expect(readFileSync(databasePath)).toEqual(before);
+    expect(readFileSync(databasePath).equals(before)).toBe(true);
     expect(existsSync(stagingPath)).toBe(true);
     expect(existsSync(recoveryPath)).toBe(true);
   }, WORKER_INITIALIZATION_TEST_TIMEOUT_MS);
@@ -949,7 +949,7 @@ describe("LegacyStateImporter", () => {
     });
     await importer.close();
 
-    expect(readFileSync(databasePath)).toEqual(before);
+    expect(readFileSync(databasePath).equals(before)).toBe(true);
   }, WORKER_INITIALIZATION_TEST_TIMEOUT_MS);
 
   it("closes successfully without opening or creating the authority database", async () => {

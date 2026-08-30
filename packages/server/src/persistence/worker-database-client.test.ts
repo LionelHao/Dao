@@ -1429,7 +1429,7 @@ describe("authority database coordinator registry", () => {
     );
     expect(firstError).toMatchObject({ code: "storage_unavailable" });
 
-    await expectDatabasePathEventuallyReusable(path);
+    await expectDatabasePathReusable(path);
   });
 
   it("keeps the worker usable after an operation-level storage outage", async () => {
