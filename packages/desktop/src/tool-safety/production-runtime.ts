@@ -286,6 +286,7 @@ export function createDesktopToolSafetyRuntime(options: Readonly<{
     try {
       await options.repairRoom(roomId);
       connections.set(roomId, { status: "online" });
+      operations.set(roomId, { status: "idle" });
     } catch {
       connections.set(roomId, { status: "repair-failed", errorCode: "repair_unavailable" });
     }

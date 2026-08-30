@@ -135,8 +135,52 @@ describe("Tool Safety production bridge", () => {
     expect(offline.connection.status).toBe("offline");
     const failed = await runtime.repair({ roomId: "room-1" });
     expect(failed.connection).toEqual({ status: "repair-failed", errorCode: "repair_unavailable" });
+    expect(failed.operation).toMatchObject({ status: "error", statusCode: 503 });
     expect(failed.cards).toHaveLength(1);
     expect(failed.cards[0]?.safeTarget).toBe("notes/release.txt");
+    runtime.close();
+  });
+
+  it("unlocks compensation only after a successful 503 repair proves no lineage committed", async () => {
+    const knownSucceeded = { kind: "tool-dispatch", value: {
+      dispatchId: "dispatch-1", toolCallId: "call-1", state: "known_succeeded",
+      reasonCode: null, version: 3,
+    } } as const;
+    const cache = {
+      roomRepairRecords: () => [call, knownSucceeded],
+      governanceProjection: () => ({ lifecycle: "active", ownerActorId: "human-1" }),
+      roomIds: () => ["room-1"], subscribeRoomRecords: () => () => undefined,
+      clear: vi.fn(), clearRoom: vi.fn(),
+    } as unknown as DesktopAuthorityCache;
+    const transport = {
+      async toolSafetyCommand() {
+        throw new MessageAuthorityTransportError(
+          "protocol_error", undefined, undefined, undefined, undefined,
+          { status: 503, code: "dependency_unavailable" },
+        );
+      },
+      onTerminalRevoked: () => () => undefined,
+      onRoomAccessChanged: () => () => undefined,
+      onConnectionFailure: () => () => undefined,
+    } as unknown as MessageAuthorityWireTransport;
+    const repairRoom = vi.fn(async () => undefined);
+    const runtime = createDesktopToolSafetyRuntime({
+      session: () => ({ actorId: "human-1" }) as never,
+      transport, authorityCache: cache, repairRoom,
+      createRequestId: () => "request-compensation-503",
+    });
+    runtime.start();
+
+    const failed = await runtime.submit({ roomId: "room-1", command: {
+      type: "tool.compensation.propose", dispatchId: "dispatch-1", expectedVersion: 3,
+    } });
+    expect(failed.operation).toMatchObject({ status: "error", statusCode: 503 });
+
+    const repaired = await runtime.repair({ roomId: "room-1" });
+    expect(repairRoom).toHaveBeenCalledOnce();
+    expect(repaired.connection).toEqual({ status: "online" });
+    expect(repaired.operation).toEqual({ status: "idle" });
+    expect(repaired.cards[0]?.state).toBe("known-succeeded");
     runtime.close();
   });
 

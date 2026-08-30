@@ -1533,7 +1533,8 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
       await recoveryPromise;
     },
     close() {
-      closePromise ??= (async () => {
+      if (closePromise !== undefined) return closePromise;
+      const operation = (async () => {
         closed = true;
         const deadline = Date.now() + shutdownTimeoutMs;
         const withinDeadline = async <Value>(operation: Promise<Value>): Promise<Value> => {
@@ -1610,7 +1611,11 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         capacityWaiters.clear();
         await withinDeadline(runtime.whenIdle());
       })();
-      return closePromise;
+      closePromise = operation;
+      void operation.catch(() => {
+        if (closePromise === operation) closePromise = undefined;
+      });
+      return operation;
     },
   };
   return Object.freeze(runtime);
