@@ -65,7 +65,7 @@ describe("WorkerAgentSettingsAdapter production composition", () => {
     const profileCommand = { type: "agent-profile.create" as const,
       requestId: "profile-create", idempotencyKey: "profile-key", expectedProfileRevision: 0 as const,
       displayName: "Researcher", globalResponsibility: "Verify evidence",
-      capabilityCeiling: ["room.respond"] as const, toolCeiling: ["room-memory.read"] as const };
+      capabilityCeiling: ["room.respond"] as const, toolCeiling: ["repository.git-status"] as const };
     const profileAck = await adapter.executeMutation({ ...owner, kind: "human",
       requestId: profileCommand.requestId, idempotencyKey: profileCommand.idempotencyKey }, profileCommand);
     expect(profileAck).toMatchObject({ type: "agent-settings.ack", operation: "agent-profile.create",
@@ -85,7 +85,7 @@ describe("WorkerAgentSettingsAdapter production composition", () => {
       requestId: "assignment-create", idempotencyKey: "assignment-key", roomId: room.aggregateId,
       profileId: profile.profileId, expectedRoomRevision: governance.governanceRevision,
       roomResponsibility: "Review this Room", participation: "on-mention" as const,
-      capabilitySubset: ["room.respond"] as const, toolSubset: ["room-memory.read"] as const };
+      capabilitySubset: ["room.respond"] as const, toolSubset: ["repository.git-status"] as const };
     const assignmentAck = await adapter.executeMutation({ ...owner, kind: "human",
       requestId: assignmentCommand.requestId, idempotencyKey: assignmentCommand.idempotencyKey },
     assignmentCommand);
@@ -151,7 +151,7 @@ describe("WorkerAgentSettingsAdapter production composition", () => {
     await expect(policyRestricted.executeQuery(owner, {
       type: "room-agent-assignment.list", requestId: "membership-tool-policy", roomId: room.aggregateId,
     })).resolves.toMatchObject({ assignments: [{
-      toolCeiling: ["room-memory.read"], toolSubset: ["room-memory.read"], effectiveTools: [],
+      toolCeiling: ["repository.git-status"], toolSubset: ["repository.git-status"], effectiveTools: [],
     }] });
   });
 });

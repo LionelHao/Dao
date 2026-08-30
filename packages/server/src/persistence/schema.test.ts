@@ -1,5 +1,6 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
@@ -706,6 +707,132 @@ describe("authority SQLite schema", () => {
       });
     }
   }, 30_000);
+
+  it("moves the legacy internal Room-memory seam out of every public v25 tool projection", () => {
+    withDatabase((database) => {
+      createV1Fixture(database);
+      seedV1History(database);
+      migrateAuthorityDatabaseToHistoricalVersionForTest(database, 25);
+
+      const affectedTables = [
+        "agent_profiles",
+        "agent_profile_revisions",
+        "room_agent_assignments",
+        "room_agent_assignment_revisions",
+        "deployment_agent_profile_events",
+        "deployment_agent_profile_repair_records",
+        "events",
+      ] as const;
+      const triggers = database.prepare(
+        `SELECT name, sql FROM sqlite_schema
+         WHERE type = 'trigger' AND tbl_name IN (${affectedTables.map(() => "?").join(",")})
+         ORDER BY name`,
+      ).all(...affectedTables) as { readonly name: string; readonly sql: string }[];
+      for (const trigger of triggers) database.exec(`DROP TRIGGER "${trigger.name}"`);
+      database.exec(`
+        UPDATE actors SET tool_permissions_json = '["room-memory.read"]'
+        WHERE id = 'agent-1';
+        UPDATE room_memberships SET tool_permissions_json = '["room-memory.read"]'
+        WHERE room_id = 'room-1' AND actor_id = 'agent-1';
+        UPDATE agent_profiles SET tool_ceiling_json = '["room-memory.read"]'
+        WHERE actor_id = 'agent-1';
+        UPDATE agent_profile_revisions SET tool_ceiling_json = '["room-memory.read"]'
+        WHERE actor_id = 'agent-1';
+        UPDATE room_agent_assignments SET tool_subset_json = '["room-memory.read"]'
+        WHERE agent_actor_id = 'agent-1';
+        UPDATE room_agent_assignment_revisions SET tool_subset_json = '["room-memory.read"]'
+        WHERE agent_actor_id = 'agent-1';
+        UPDATE deployment_agent_profile_events SET payload_json = json_set(
+          payload_json, '$.profile.toolCeiling', json('["room-memory.read"]')
+        ) WHERE profile_id = (SELECT id FROM agent_profiles WHERE actor_id = 'agent-1');
+        UPDATE deployment_agent_profile_repair_records SET projection_json = json_set(
+          projection_json, '$.toolCeiling', json('["room-memory.read"]')
+        ) WHERE profile_id = (SELECT id FROM agent_profiles WHERE actor_id = 'agent-1');
+        UPDATE events SET payload_json = json_set(
+          payload_json,
+          '$.assignment.toolCeiling', json('["room-memory.read"]'),
+          '$.assignment.toolSubset', json('["room-memory.read"]'),
+          '$.assignment.effectiveTools', json('["room-memory.read"]')
+        ) WHERE event_type = 'room.agent-assignment.changed'
+          AND json_extract(payload_json, '$.assignment.agentActorId') = 'agent-1';
+      `);
+      const sha256 = (value: string): string =>
+        createHash("sha256").update(value, "utf8").digest("hex");
+      for (const row of database.prepare(
+        `SELECT event_id AS id, payload_json AS json FROM deployment_agent_profile_events
+         WHERE profile_id = (SELECT id FROM agent_profiles WHERE actor_id = 'agent-1')`,
+      ).all() as { readonly id: string; readonly json: string }[]) {
+        database.prepare(
+          "UPDATE deployment_agent_profile_events SET payload_sha256 = ? WHERE event_id = ?",
+        ).run(sha256(row.json), row.id);
+      }
+      for (const row of database.prepare(
+        `SELECT profile_id AS id, projection_json AS json
+         FROM deployment_agent_profile_repair_records
+         WHERE profile_id = (SELECT id FROM agent_profiles WHERE actor_id = 'agent-1')`,
+      ).all() as { readonly id: string; readonly json: string }[]) {
+        database.prepare(
+          `UPDATE deployment_agent_profile_repair_records
+           SET projection_sha256 = ? WHERE profile_id = ?`,
+        ).run(sha256(row.json), row.id);
+      }
+      for (const trigger of triggers) database.exec(trigger.sql);
+
+      expect(database.prepare(
+        "SELECT tool_ceiling_json AS tools FROM agent_profiles WHERE actor_id = 'agent-1'",
+      ).get()).toEqual({ tools: '["room-memory.read"]' });
+      expect(database.prepare(
+        "SELECT tool_subset_json AS tools FROM room_agent_assignments WHERE agent_actor_id = 'agent-1'",
+      ).get()).toEqual({ tools: '["room-memory.read"]' });
+
+      migrateAuthorityDatabase(database);
+
+      expect(database.prepare(
+        `SELECT capability_ceiling_json AS capabilities, tool_ceiling_json AS tools
+         FROM agent_profiles WHERE actor_id = 'agent-1'`,
+      ).get()).toEqual({ capabilities: '["room.memory.read"]', tools: '[]' });
+      expect(database.prepare(
+        `SELECT capability_subset_json AS capabilities, tool_subset_json AS tools
+         FROM room_agent_assignments WHERE agent_actor_id = 'agent-1'`,
+      ).get()).toEqual({ capabilities: '["room.memory.read"]', tools: '[]' });
+      expect(database.prepare(
+        `SELECT tool_permissions_json AS actorTools,
+                (SELECT tool_permissions_json FROM room_memberships
+                 WHERE room_id = 'room-1' AND actor_id = 'agent-1') AS membershipTools
+         FROM actors WHERE id = 'agent-1'`,
+      ).get()).toEqual({ actorTools: '[]', membershipTools: '[]' });
+      expect(database.prepare(
+        `SELECT COUNT(*) AS count FROM agent_profile_revisions
+         WHERE tool_ceiling_json LIKE '%room-memory.read%'
+            OR capability_ceiling_json NOT LIKE '%room.memory.read%'`,
+      ).get()).toEqual({ count: 0 });
+      expect(database.prepare(
+        `SELECT COUNT(*) AS count FROM room_agent_assignment_revisions
+         WHERE tool_subset_json LIKE '%room-memory.read%'
+            OR capability_subset_json NOT LIKE '%room.memory.read%'`,
+      ).get()).toEqual({ count: 0 });
+      expect(database.prepare(
+        `SELECT (
+           SELECT COUNT(*) FROM deployment_agent_profile_events
+           WHERE payload_json LIKE '%room-memory.read%'
+         ) + (
+           SELECT COUNT(*) FROM deployment_agent_profile_repair_records
+           WHERE projection_json LIKE '%room-memory.read%'
+         ) + (
+           SELECT COUNT(*) FROM events
+           WHERE event_type = 'room.agent-assignment.changed'
+             AND payload_json LIKE '%room-memory.read%'
+         ) AS count`,
+      ).get()).toEqual({ count: 0 });
+
+      expectSqlRejected(database,
+        `UPDATE agent_profiles SET tool_ceiling_json = '["room-memory.read"]'
+         WHERE actor_id = 'agent-1'`);
+      expectSqlRejected(database,
+        `UPDATE room_agent_assignments SET tool_subset_json = '["room-memory.read"]'
+         WHERE agent_actor_id = 'agent-1'`);
+    });
+  });
 
   it("rolls every v14 migration statement back with v13 schema and history intact", () => {
     for (

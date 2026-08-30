@@ -16,8 +16,8 @@ function assignment(overrides: Partial<RoomAgentAssignmentProjection> = {}): Roo
     globalResponsibility: "跨 Room 的资料检索与来源核验", roomResponsibility: "核对迁移资料与引用",
     participation: "on-mention", availability: "ready", paused: false,
     capabilityCeiling: ["room.conversation.read", "room.memory.read"], capabilitySubset: ["room.memory.read"],
-    effectiveCapabilities: ["room.memory.read"], toolCeiling: ["http-json.read", "room-memory.read"],
-    toolSubset: ["room-memory.read"], effectiveTools: ["room-memory.read"], profileRevision: 4,
+    effectiveCapabilities: ["room.memory.read"], toolCeiling: ["repository.git-status"],
+    toolSubset: ["repository.git-status"], effectiveTools: ["repository.git-status"], profileRevision: 4,
     assignmentRevision: 8, accessRevision: 6, ...overrides,
   };
 }
@@ -30,7 +30,7 @@ function snapshot(overrides: Partial<AgentSettingsSnapshot> = {}): AgentSettings
     profileCatalog: { status: "available", revision: 4, profiles: [{
       recordVersion: "agent-profile.v1", profileId: "profile-research", actorId: "agent-research",
       displayName: "检索员", globalResponsibility: "跨 Room 的资料检索与来源核验", status: "enabled",
-      capabilityCeiling: ["room.conversation.read", "room.memory.read"], toolCeiling: ["http-json.read", "room-memory.read"],
+      capabilityCeiling: ["room.conversation.read", "room.memory.read"], toolCeiling: ["repository.git-status"],
       revision: 4, createdAt: "2026-08-20T08:00:00.000Z", updatedAt: "2026-08-24T08:00:00.000Z",
     }] },
     room: { status: "available", roomId: "room-dao", roomName: "Dao 交付", lifecycle: "active", roomRevision: 12, assignments: [assignment()] },

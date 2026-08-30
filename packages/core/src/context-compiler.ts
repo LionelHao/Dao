@@ -404,8 +404,11 @@ export function isContextCompilerInputV1(value: unknown): value is ContextCompil
   if (!project(value.project, roomId)) return false;
   if (!dense(value.tools) || !value.tools.every(toolDescriptor)) return false;
   const toolIds = [...new Set(value.tools.map((tool) => tool.id))].sort();
-  if (toolIds.length !== agent.effectiveTools.length ||
-      toolIds.some((toolId, index) => toolId !== agent.effectiveTools[index])) return false;
+  const authorizedToolIds = [...agent.effectiveTools,
+    ...(agent.effectiveCapabilities.includes("room.memory.read") ? ["room-memory.read"] : []),
+  ].sort();
+  if (toolIds.length !== authorizedToolIds.length ||
+      toolIds.some((toolId, index) => toolId !== authorizedToolIds[index])) return false;
   if (!exact(value.trusted, ["system", "developerPolicy"]) || !text(value.trusted.system) || !text(value.trusted.developerPolicy)) return false;
   const memoryWatermark = Number(value.memoryWatermark);
   const corpusHead = Number(value.corpusHead);

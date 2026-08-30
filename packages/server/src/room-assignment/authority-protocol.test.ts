@@ -18,7 +18,7 @@ describe("Room Assignment authority protocol", () => {
         kind: "create", requestId: "request-1", idempotencyKey: "key-1",
         roomId: "room-1", expectedRoomRevision: 1, profileId: "profile-1",
         participation: "on-mention", roomResponsibility: "Review evidence",
-        capabilitySubset: ["room.respond"], toolSubset: ["room-memory.read"],
+        capabilitySubset: ["room.respond"], toolSubset: ["repository.git-status"],
       },
     } as const;
     expect(isRoomAssignmentOperation(create)).toBe(true);

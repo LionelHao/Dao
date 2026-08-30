@@ -28,7 +28,7 @@ const authority: AssignmentMutationAuthority = {
   roomRevision: 4,
   profileStatus: "enabled",
   capabilityCeiling: ["room.project.read", "room.respond"],
-  toolCeiling: ["repository.git-status", "room-memory.read"],
+  toolCeiling: ["repository.git-status"],
   currentAssignment: null,
 };
 
@@ -106,7 +106,7 @@ describe("Room Assignment request and authority policy", () => {
       currentAssignment: {
         revision: 3, participation: "active", roomResponsibility: "Reviewer", paused: false,
         capabilitySubset: ["room.project.read", "room.respond"],
-        toolSubset: ["repository.git-status", "room-memory.read"],
+        toolSubset: ["repository.git-status"],
       },
     };
     const base = {
@@ -127,7 +127,7 @@ describe("Room Assignment request and authority policy", () => {
     expect(evaluateAssignmentMutation({
       kind: "update", ...base, participation: "active", roomResponsibility: "Reviewer",
       capabilitySubset: ["room.project.read", "room.respond"],
-      toolSubset: ["repository.git-status", "room-memory.read"],
+      toolSubset: ["repository.git-status"],
     }, archived)).toEqual({ allowed: false, reason: "archived_expansion_forbidden" });
     expect(evaluateAssignmentMutation({
       kind: "update", ...base, participation: "active", roomResponsibility: "Changed role",
@@ -136,7 +136,7 @@ describe("Room Assignment request and authority policy", () => {
     expect(evaluateAssignmentMutation({
       kind: "update", ...base, participation: "active", roomResponsibility: "Reviewer",
       capabilitySubset: ["room.project.read", "room.respond"],
-      toolSubset: ["repository.git-status", "room-memory.read", "sandbox-file.write"],
+      toolSubset: ["repository.git-status", "sandbox-file.write"],
     }, { ...archived, toolCeiling: [...archived.toolCeiling, "sandbox-file.write"] }))
       .toEqual({ allowed: false, reason: "archived_expansion_forbidden" });
   });
@@ -188,8 +188,8 @@ describe("Assignment availability and execution gate", () => {
       profileCapabilities: ["room.project.read", "room.respond"],
       assignmentCapabilities: ["room.project.read", "room.respond"],
       membershipCapabilities: ["room.respond"],
-      profileTools: ["repository.git-status", "room-memory.read"],
-      assignmentTools: ["repository.git-status", "room-memory.read"],
+      profileTools: ["repository.git-status"],
+      assignmentTools: ["repository.git-status"],
       membershipTools: ["repository.git-status"],
     });
     expect(result).toEqual({
@@ -207,8 +207,8 @@ describe("Assignment availability and execution gate", () => {
       participation: "on-mention" as const,
       origin: "routed" as const,
       profileCapabilities: ["room.respond"], assignmentCapabilities: ["room.respond"],
-      membershipCapabilities: ["room.respond"], profileTools: ["room-memory.read"],
-      assignmentTools: ["room-memory.read"], membershipTools: ["room-memory.read"],
+      membershipCapabilities: ["room.respond"], profileTools: ["repository.git-status"],
+      assignmentTools: ["repository.git-status"], membershipTools: ["repository.git-status"],
     };
     expect(evaluateAssignmentExecutionGate(base).allowed).toBe(false);
     const busyDirect = evaluateAssignmentExecutionGate({
@@ -218,7 +218,7 @@ describe("Assignment availability and execution gate", () => {
       allowed: true,
       admission: "queue",
       effectiveCapabilities: ["room.respond"],
-      effectiveTools: ["room-memory.read"],
+      effectiveTools: ["repository.git-status"],
     });
     expect(evaluateAssignmentExecutionGate({
       ...base, participation: "active", origin: "routed", durableRunningExecutionCount: 1,
@@ -239,8 +239,8 @@ describe("Assignment availability and execution gate", () => {
       participation: "on-mention" as const,
       origin: "direct" as const,
       profileCapabilities: ["room.respond"], assignmentCapabilities: ["room.respond"],
-      membershipCapabilities: ["room.respond"], profileTools: ["room-memory.read"],
-      assignmentTools: ["room-memory.read"], membershipTools: ["room-memory.read"],
+      membershipCapabilities: ["room.respond"], profileTools: ["repository.git-status"],
+      assignmentTools: ["repository.git-status"], membershipTools: ["repository.git-status"],
     };
     expect(evaluateAssignmentExecutionGate({ ...base, durablePaused: true }).allowed).toBe(false);
     expect(evaluateAssignmentExecutionGate({ ...base, providerAuthenticated: false }).allowed).toBe(false);

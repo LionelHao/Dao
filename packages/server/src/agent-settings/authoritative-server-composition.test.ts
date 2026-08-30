@@ -78,7 +78,7 @@ describe("authoritative server FT-07 production composition", () => {
     const command = { type: "agent-profile.create", requestId: "profile-create",
       idempotencyKey: "profile-key", expectedProfileRevision: 0,
       displayName: "Researcher", globalResponsibility: "Verify production composition",
-      capabilityCeiling: ["room.respond"], toolCeiling: ["room-memory.read"] } as const;
+      capabilityCeiling: ["room.respond"], toolCeiling: ["repository.git-status"] } as const;
     const accepted = await request(writer, command);
     expect(accepted).toMatchObject({ type: "agent-settings.ack",
       operation: "agent-profile.create", acceptedRevision: 1,

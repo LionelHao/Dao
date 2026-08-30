@@ -234,12 +234,12 @@ function renderCreateProfile(model: AgentSettingsViewModel, actions: AgentSettin
   const responsibilityLabel = element("label"); responsibilityLabel.append(text("span", "全局职责"), responsibility);
   const submit = button("创建 Global Profile", "profile.create", model.writeLocked);
   submit.type = "submit";
-  form.append(nameLabel, responsibilityLabel, text("p", "默认最小上限 · room.respond / room-memory.read"), submit);
+  form.append(nameLabel, responsibilityLabel, text("p", "默认最小上限 · room.respond / room.memory.read"), submit);
   form.addEventListener("submit", (event) => { event.preventDefault();
     if (!form.reportValidity()) return;
     actions.onIntent({ command: "profile.create", displayName: name.value.trim(),
-      globalResponsibility: responsibility.value.trim(), capabilityCeiling: ["room.respond"],
-      toolCeiling: ["room-memory.read"] });
+      globalResponsibility: responsibility.value.trim(),
+      capabilityCeiling: ["room.memory.read", "room.respond"], toolCeiling: [] });
   });
   return form;
 }

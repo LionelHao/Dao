@@ -77,7 +77,7 @@ const SCHEMA_FINGERPRINTS = {
   23: "532b7c0589c5ae2f4cb96c43747b19e3a7c83c2f04fd9fea663191ea5a46aced",
   24: "ef4c3593ee4384350f57c1f92e6d229c523b4c99817f95222718c4abe10db896",
   25: "e0cd0a610c4777209877535e0d5651498984681bf9b3c3f825724f4946191815",
-  26: "1926de1d516cafc857e99f0925d648e16008f833774736d075c3a1f590573429",
+  26: "a5c6c02245dfab5a054e5035898f6a81ee805424901bb57ff96eb8eeac74f6cb",
 } as const;
 
 const V1_STATEMENTS = [
@@ -8696,6 +8696,311 @@ export const AUTHORITY_V25_MIGRATION_CHECKSUM_FOR_TEST = migrationChecksum(
 );
 
 const V26_STATEMENTS = [
+  `DROP TRIGGER agent_profiles_v20_validate_update`,
+  `DROP TRIGGER room_agent_assignments_v20_validate_update`,
+  `DROP TRIGGER room_agent_assignments_authority_update_v14`,
+  `DROP TRIGGER agent_profiles_ceiling_update_v14`,
+  `DROP TRIGGER agent_profile_revisions_v20_immutable_update`,
+  `DROP TRIGGER room_agent_assignment_revisions_v20_immutable_update`,
+  `DROP TRIGGER deployment_agent_profile_events_v20_immutable_update`,
+  `UPDATE agent_profiles
+   SET capability_ceiling_json = COALESCE((
+         SELECT json_group_array(value) FROM (
+           SELECT DISTINCT value FROM json_each(agent_profiles.capability_ceiling_json)
+           UNION SELECT 'room.memory.read'
+             WHERE EXISTS (SELECT 1 FROM json_each(agent_profiles.tool_ceiling_json)
+                           WHERE value = 'room-memory.read')
+           ORDER BY value
+         )
+       ), '[]'),
+       tool_ceiling_json = COALESCE((
+         SELECT json_group_array(value) FROM (
+           SELECT DISTINCT value FROM json_each(agent_profiles.tool_ceiling_json)
+           WHERE value <> 'room-memory.read' ORDER BY value
+         )
+       ), '[]')
+   WHERE EXISTS (SELECT 1 FROM json_each(tool_ceiling_json)
+                 WHERE value = 'room-memory.read')`,
+  `UPDATE agent_profile_revisions
+   SET capability_ceiling_json = COALESCE((
+         SELECT json_group_array(value) FROM (
+           SELECT DISTINCT value FROM json_each(agent_profile_revisions.capability_ceiling_json)
+           UNION SELECT 'room.memory.read'
+           ORDER BY value
+         )
+       ), '[]'),
+       tool_ceiling_json = COALESCE((
+         SELECT json_group_array(value) FROM (
+           SELECT DISTINCT value FROM json_each(agent_profile_revisions.tool_ceiling_json)
+           WHERE value <> 'room-memory.read' ORDER BY value
+         )
+       ), '[]')
+   WHERE EXISTS (SELECT 1 FROM json_each(tool_ceiling_json)
+                 WHERE value = 'room-memory.read')`,
+  `UPDATE room_agent_assignments
+   SET capability_subset_json = COALESCE((
+         SELECT json_group_array(value) FROM (
+           SELECT DISTINCT value FROM json_each(room_agent_assignments.capability_subset_json)
+           UNION SELECT 'room.memory.read'
+             WHERE EXISTS (SELECT 1 FROM json_each(room_agent_assignments.tool_subset_json)
+                           WHERE value = 'room-memory.read')
+           ORDER BY value
+         )
+       ), '[]'),
+       tool_subset_json = COALESCE((
+         SELECT json_group_array(value) FROM (
+           SELECT DISTINCT value FROM json_each(room_agent_assignments.tool_subset_json)
+           WHERE value <> 'room-memory.read' ORDER BY value
+         )
+       ), '[]')
+   WHERE EXISTS (SELECT 1 FROM json_each(tool_subset_json)
+                 WHERE value = 'room-memory.read')`,
+  `UPDATE room_agent_assignment_revisions
+   SET capability_subset_json = COALESCE((
+         SELECT json_group_array(value) FROM (
+           SELECT DISTINCT value FROM json_each(room_agent_assignment_revisions.capability_subset_json)
+           UNION SELECT 'room.memory.read'
+           ORDER BY value
+         )
+       ), '[]'),
+       tool_subset_json = COALESCE((
+         SELECT json_group_array(value) FROM (
+           SELECT DISTINCT value FROM json_each(room_agent_assignment_revisions.tool_subset_json)
+           WHERE value <> 'room-memory.read' ORDER BY value
+         )
+       ), '[]')
+   WHERE EXISTS (SELECT 1 FROM json_each(tool_subset_json)
+                 WHERE value = 'room-memory.read')`,
+  `UPDATE actors SET tool_permissions_json = COALESCE((
+     SELECT json_group_array(value) FROM (
+       SELECT DISTINCT value FROM json_each(actors.tool_permissions_json)
+       WHERE value <> 'room-memory.read' ORDER BY value
+     )
+   ), '[]') WHERE kind = 'agent' AND EXISTS (
+     SELECT 1 FROM json_each(tool_permissions_json) WHERE value = 'room-memory.read'
+   )`,
+  `UPDATE room_memberships SET tool_permissions_json = COALESCE((
+     SELECT json_group_array(value) FROM (
+       SELECT DISTINCT value FROM json_each(room_memberships.tool_permissions_json)
+       WHERE value <> 'room-memory.read' ORDER BY value
+     )
+   ), '[]') WHERE kind = 'agent' AND EXISTS (
+     SELECT 1 FROM json_each(tool_permissions_json) WHERE value = 'room-memory.read'
+   )`,
+  `UPDATE deployment_agent_profile_repair_records AS repair
+   SET projection_json = json_set(
+     repair.projection_json,
+     '$.capabilityCeiling', json((SELECT revision.capability_ceiling_json
+       FROM agent_profile_revisions AS revision
+       WHERE revision.profile_id = repair.profile_id
+         AND revision.revision = repair.profile_revision)),
+     '$.toolCeiling', json((SELECT revision.tool_ceiling_json
+       FROM agent_profile_revisions AS revision
+       WHERE revision.profile_id = repair.profile_id
+         AND revision.revision = repair.profile_revision))
+   )`,
+  `UPDATE deployment_agent_profile_repair_records
+   SET projection_sha256 = dao_migration_sha256(projection_json)`,
+  `UPDATE deployment_agent_profile_events AS event
+   SET payload_json = json_set(
+     event.payload_json,
+     '$.profile.capabilityCeiling', json((SELECT revision.capability_ceiling_json
+       FROM agent_profile_revisions AS revision
+       WHERE revision.profile_id = event.profile_id
+         AND revision.revision = event.profile_revision)),
+     '$.profile.toolCeiling', json((SELECT revision.tool_ceiling_json
+       FROM agent_profile_revisions AS revision
+       WHERE revision.profile_id = event.profile_id
+         AND revision.revision = event.profile_revision))
+   )`,
+  `UPDATE deployment_agent_profile_events
+   SET payload_sha256 = dao_migration_sha256(payload_json)`,
+  `UPDATE events SET payload_json = json_set(
+     payload_json,
+     '$.assignment.capabilityCeiling', json(COALESCE((
+       SELECT json_group_array(value) FROM (
+         SELECT DISTINCT value FROM json_each(json_extract(events.payload_json, '$.assignment.capabilityCeiling'))
+         UNION SELECT 'room.memory.read' WHERE EXISTS (
+           SELECT 1 FROM json_each(json_extract(events.payload_json, '$.assignment.toolCeiling'))
+           WHERE value = 'room-memory.read'
+         ) ORDER BY value
+       )
+     ), '[]')),
+     '$.assignment.capabilitySubset', json(COALESCE((
+       SELECT json_group_array(value) FROM (
+         SELECT DISTINCT value FROM json_each(json_extract(events.payload_json, '$.assignment.capabilitySubset'))
+         UNION SELECT 'room.memory.read' WHERE EXISTS (
+           SELECT 1 FROM json_each(json_extract(events.payload_json, '$.assignment.toolSubset'))
+           WHERE value = 'room-memory.read'
+         ) ORDER BY value
+       )
+     ), '[]')),
+     '$.assignment.effectiveCapabilities', json(COALESCE((
+       SELECT json_group_array(value) FROM (
+         SELECT DISTINCT value FROM json_each(json_extract(events.payload_json, '$.assignment.effectiveCapabilities'))
+         UNION SELECT 'room.memory.read' WHERE EXISTS (
+           SELECT 1 FROM json_each(json_extract(events.payload_json, '$.assignment.effectiveTools'))
+           WHERE value = 'room-memory.read'
+         ) ORDER BY value
+       )
+     ), '[]')),
+     '$.assignment.toolCeiling', json(COALESCE((SELECT json_group_array(value) FROM (
+       SELECT DISTINCT value FROM json_each(json_extract(events.payload_json, '$.assignment.toolCeiling'))
+       WHERE value <> 'room-memory.read' ORDER BY value
+     )), '[]')),
+     '$.assignment.toolSubset', json(COALESCE((SELECT json_group_array(value) FROM (
+       SELECT DISTINCT value FROM json_each(json_extract(events.payload_json, '$.assignment.toolSubset'))
+       WHERE value <> 'room-memory.read' ORDER BY value
+     )), '[]')),
+     '$.assignment.effectiveTools', json(COALESCE((SELECT json_group_array(value) FROM (
+       SELECT DISTINCT value FROM json_each(json_extract(events.payload_json, '$.assignment.effectiveTools'))
+       WHERE value <> 'room-memory.read' ORDER BY value
+     )), '[]'))
+   ) WHERE event_type = 'room.agent-assignment.changed'
+     AND json_type(payload_json, '$.assignment') = 'object'`,
+  `CREATE TRIGGER agent_profile_revisions_v20_immutable_update
+   BEFORE UPDATE ON agent_profile_revisions
+   BEGIN SELECT RAISE(ABORT, 'Agent Profile revisions are immutable'); END`,
+  `CREATE TRIGGER room_agent_assignment_revisions_v20_immutable_update
+   BEFORE UPDATE ON room_agent_assignment_revisions
+   BEGIN SELECT RAISE(ABORT, 'Room Assignment revisions are immutable'); END`,
+  `CREATE TRIGGER deployment_agent_profile_events_v20_immutable_update
+   BEFORE UPDATE ON deployment_agent_profile_events
+   BEGIN SELECT RAISE(ABORT, 'Deployment Profile event is immutable'); END`,
+  `CREATE TRIGGER agent_profiles_v20_validate_update
+   BEFORE UPDATE ON agent_profiles
+   WHEN NEW.id <> OLD.id OR NEW.actor_id <> OLD.actor_id
+      OR NEW.created_at <> OLD.created_at
+      OR (NEW.source_kind <> OLD.source_kind AND NOT (
+        OLD.source_kind IN ('legacy_v20_migration', 'static_bootstrap')
+        AND NEW.source_kind = 'administrator_command'
+      ))
+      OR NEW.revision <> OLD.revision + 1
+      OR EXISTS (
+        SELECT 1 FROM json_each(NEW.capability_ceiling_json)
+        WHERE typeof(value) <> 'text' OR value NOT IN (
+          'room.conversation.read', 'room.memory.read', 'room.project.read', 'room.respond'
+        )
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(NEW.tool_ceiling_json)
+        WHERE typeof(value) <> 'text' OR value NOT IN (
+          'http-json.read', 'repository.git-status', 'room-memory.read', 'sandbox-file.write'
+        )
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(NEW.capability_ceiling_json) AS entry
+        JOIN json_each(NEW.capability_ceiling_json) AS successor
+          ON CAST(successor.key AS INTEGER) = CAST(entry.key AS INTEGER) + 1
+        WHERE entry.value >= successor.value
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(NEW.tool_ceiling_json) AS entry
+        JOIN json_each(NEW.tool_ceiling_json) AS successor
+          ON CAST(successor.key AS INTEGER) = CAST(entry.key AS INTEGER) + 1
+        WHERE entry.value >= successor.value
+      )
+   BEGIN SELECT RAISE(ABORT, 'Agent Profile transition or authority set is invalid'); END`,
+  `CREATE TRIGGER room_agent_assignments_v20_validate_update
+   BEFORE UPDATE ON room_agent_assignments
+   WHEN NEW.id <> OLD.id OR NEW.room_id <> OLD.room_id
+      OR NEW.profile_id <> OLD.profile_id OR NEW.agent_actor_id <> OLD.agent_actor_id
+      OR NEW.created_at <> OLD.created_at
+      OR (NEW.source_kind <> OLD.source_kind AND NOT (
+        OLD.source_kind IN ('legacy_v20_migration', 'static_bootstrap')
+        AND NEW.source_kind = 'room_command'
+      ))
+      OR NEW.revision <> OLD.revision + 1 OR OLD.status = 'removed'
+      OR (NEW.status = 'removed' AND (NEW.paused <> 1 OR NEW.removed_at IS NULL))
+      OR (NEW.status = 'current' AND NEW.removed_at IS NOT NULL)
+      OR EXISTS (
+        SELECT 1 FROM json_each(NEW.capability_subset_json)
+        WHERE typeof(value) <> 'text' OR value NOT IN (
+          'room.conversation.read', 'room.memory.read', 'room.project.read', 'room.respond'
+        )
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(NEW.tool_subset_json)
+        WHERE typeof(value) <> 'text' OR value NOT IN (
+          'http-json.read', 'repository.git-status', 'room-memory.read', 'sandbox-file.write'
+        )
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(NEW.capability_subset_json) AS entry
+        JOIN json_each(NEW.capability_subset_json) AS successor
+          ON CAST(successor.key AS INTEGER) = CAST(entry.key AS INTEGER) + 1
+        WHERE entry.value >= successor.value
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(NEW.tool_subset_json) AS entry
+        JOIN json_each(NEW.tool_subset_json) AS successor
+          ON CAST(successor.key AS INTEGER) = CAST(entry.key AS INTEGER) + 1
+        WHERE entry.value >= successor.value
+      )
+   BEGIN SELECT RAISE(ABORT, 'Room Assignment transition or authority set is invalid'); END`,
+  `CREATE TRIGGER room_agent_assignments_authority_update_v14
+   BEFORE UPDATE OF profile_id, agent_actor_id, capability_subset_json, tool_subset_json
+     ON room_agent_assignments
+   WHEN COALESCE((SELECT kind FROM actors WHERE id = NEW.agent_actor_id), '') <> 'agent'
+     OR COALESCE((SELECT actor_id FROM agent_profiles WHERE id = NEW.profile_id), '')
+       <> NEW.agent_actor_id
+     OR EXISTS (
+       SELECT value FROM json_each(NEW.capability_subset_json)
+       EXCEPT SELECT value FROM json_each((
+         SELECT capability_ceiling_json FROM agent_profiles WHERE id = NEW.profile_id
+       ))
+     )
+     OR EXISTS (
+       SELECT value FROM json_each(NEW.tool_subset_json)
+       EXCEPT SELECT value FROM json_each((
+         SELECT tool_ceiling_json FROM agent_profiles WHERE id = NEW.profile_id
+       ))
+     )
+   BEGIN
+     SELECT RAISE(ABORT, 'Room Assignment exceeds its Agent Profile authority');
+   END`,
+  `CREATE TRIGGER agent_profiles_ceiling_update_v14
+   BEFORE UPDATE OF actor_id, capability_ceiling_json, tool_ceiling_json ON agent_profiles
+   WHEN EXISTS (
+     SELECT 1 FROM room_agent_assignments AS assignment
+     WHERE assignment.profile_id = OLD.id AND assignment.status = 'current'
+       AND (
+         assignment.agent_actor_id <> NEW.actor_id
+         OR EXISTS (
+           SELECT value FROM json_each(assignment.capability_subset_json)
+           EXCEPT SELECT value FROM json_each(NEW.capability_ceiling_json)
+         )
+         OR EXISTS (
+           SELECT value FROM json_each(assignment.tool_subset_json)
+           EXCEPT SELECT value FROM json_each(NEW.tool_ceiling_json)
+         )
+       )
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'Agent Profile update would exceed current Room Assignment authority');
+   END`,
+  `CREATE TRIGGER agent_profiles_v26_external_tools_insert
+   BEFORE INSERT ON agent_profiles WHEN EXISTS (
+     SELECT 1 FROM json_each(NEW.tool_ceiling_json)
+     WHERE typeof(value) <> 'text' OR value NOT IN (
+       'http-json.read','repository.git-status','sandbox-file.write'
+     )
+   ) BEGIN SELECT RAISE(ABORT, 'Agent Profile external tool ceiling is invalid'); END`,
+  `CREATE TRIGGER agent_profiles_v26_external_tools_update
+   BEFORE UPDATE OF tool_ceiling_json ON agent_profiles WHEN EXISTS (
+     SELECT 1 FROM json_each(NEW.tool_ceiling_json)
+     WHERE typeof(value) <> 'text' OR value NOT IN (
+       'http-json.read','repository.git-status','sandbox-file.write'
+     )
+   ) BEGIN SELECT RAISE(ABORT, 'Agent Profile external tool ceiling is invalid'); END`,
+  `CREATE TRIGGER room_assignments_v26_external_tools_insert
+   BEFORE INSERT ON room_agent_assignments WHEN EXISTS (
+     SELECT 1 FROM json_each(NEW.tool_subset_json)
+     WHERE typeof(value) <> 'text' OR value NOT IN (
+       'http-json.read','repository.git-status','sandbox-file.write'
+     )
+   ) BEGIN SELECT RAISE(ABORT, 'Room Assignment external tool subset is invalid'); END`,
+  `CREATE TRIGGER room_assignments_v26_external_tools_update
+   BEFORE UPDATE OF tool_subset_json ON room_agent_assignments WHEN EXISTS (
+     SELECT 1 FROM json_each(NEW.tool_subset_json)
+     WHERE typeof(value) <> 'text' OR value NOT IN (
+       'http-json.read','repository.git-status','sandbox-file.write'
+     )
+   ) BEGIN SELECT RAISE(ABORT, 'Room Assignment external tool subset is invalid'); END`,
   `CREATE TABLE tool_calls_v2 (
     tool_call_id TEXT PRIMARY KEY CHECK (length(trim(tool_call_id)) BETWEEN 1 AND 192),
     invocation_id TEXT NOT NULL CHECK (length(trim(invocation_id)) BETWEEN 1 AND 192),
@@ -12195,7 +12500,9 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
           ) OR EXISTS (
             SELECT 1 FROM json_each(profile.tool_ceiling_json)
             WHERE typeof(value) <> 'text' OR value NOT IN (
-              'http-json.read', 'repository.git-status', 'room-memory.read', 'sandbox-file.write'
+              'http-json.read', 'repository.git-status',
+              ${schemaVersion < 26 ? "'room-memory.read'," : ""}
+              'sandbox-file.write'
             )
           )
        LIMIT 1`,
@@ -13029,6 +13336,8 @@ function migrateAuthorityDatabaseToVersion(
     throw new TypeError("targetVersion must name a supported authority schema");
   }
   configureAuthorityConnection(database);
+  database.function("dao_migration_sha256", { deterministic: true }, (value: unknown) =>
+    createHash("sha256").update(String(value), "utf8").digest("hex"));
 
   let statementCount = 0;
   // Node 22.13 has no DatabaseSync.isTransaction; this module owns the transaction.

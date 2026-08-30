@@ -328,6 +328,14 @@ describe("FT-10 J-05 tool-safety surface", () => {
     expect(root.querySelector("[data-tool-safety-action='compensate']")).toBeNull();
 
     importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" }, card: card("known-succeeded"), operation: { status: "idle" },
+    }, unknownActions);
+    root.querySelector<HTMLButtonElement>("[data-tool-safety-action='compensate']")!.click();
+    expect(unknownActions.submit).toHaveBeenCalledWith({
+      type: "tool.compensation.propose", dispatchId: "dispatch-1", expectedVersion: 4,
+    });
+
+    importedApp.renderToolSafetySurface(root, {
       connection: { status: "online" },
       card: { ...card("outcome-unknown"), compensationKnownSucceeded: true,
         evidenceSummary: "Compensation dispatch is known_succeeded." },

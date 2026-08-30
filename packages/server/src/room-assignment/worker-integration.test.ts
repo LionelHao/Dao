@@ -64,7 +64,7 @@ describe("Room Assignment AuthorityWorker integration", () => {
         idempotencyKey: "profile-key" },
       expectedRevision: 0, displayName: "Reviewer",
       globalResponsibility: "Review durable evidence",
-      capabilityCeiling: ["room.respond"], toolCeiling: ["room-memory.read"], now: NOW,
+      capabilityCeiling: ["room.respond"], toolCeiling: ["repository.git-status"], now: NOW,
     });
     if (profile.kind !== "agent-profile") throw new Error("Profile was not created");
     const governance = await client.readRoomGovernance(session, roomId, NOW);
@@ -75,7 +75,7 @@ describe("Room Assignment AuthorityWorker integration", () => {
         roomId, expectedRoomRevision: governance.governanceRevision,
         profileId: profile.profile.profileId, participation: "on-mention" as const,
         roomResponsibility: "Review this Room", capabilitySubset: ["room.respond"],
-        toolSubset: ["room-memory.read"],
+        toolSubset: ["repository.git-status"],
       },
     };
     const created = await client.executeRoomAssignment(operation);
@@ -87,7 +87,7 @@ describe("Room Assignment AuthorityWorker integration", () => {
       version: 1, type: "room-assignment.get", context: session, roomId,
       assignmentId: created.acknowledgement.assignmentId, now: NOW,
     })).resolves.toMatchObject({ kind: "room-assignment",
-      assignment: { participation: "on-mention", toolSubset: ["room-memory.read"] } });
+      assignment: { participation: "on-mention", toolSubset: ["repository.git-status"] } });
     await expect(client.executeRoomAssignment({
       version: 1, type: "room-assignment.list", context: session, roomId, now: NOW,
     })).resolves.toMatchObject({ kind: "room-assignments", assignments: [{

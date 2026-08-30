@@ -310,6 +310,15 @@ export function renderToolSafetySurface(
         expectedVersion: state.card.version });
     }));
   }
+  if ((state.card.state === "known-succeeded" || state.card.state === "compensation-known-succeeded") &&
+      state.card.reversibility === "compensatable" && state.card.dispatchId !== undefined &&
+      state.card.canDecide === true) {
+    controls.append(actionButton("提出新的补偿动作", "compensate", connectionLocked || operationLocked, () => {
+      if (connectionLocked || operationLocked) return;
+      actions.submit({ type: "tool.compensation.propose", dispatchId: state.card.dispatchId!,
+        expectedVersion: state.card.version });
+    }));
+  }
   if (["rejected", "params-changed", "grant-revoked", "expired"].includes(state.card.state)) {
     const next = actionButton("创建新 invocation", "compensate", connectionLocked || operationLocked, () => {
       if (!connectionLocked && !operationLocked) actions.newInvocation();

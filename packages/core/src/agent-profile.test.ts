@@ -81,6 +81,7 @@ describe("FT-07 closed Agent Profile contracts", () => {
     expect(isCanonicalAgentCapabilitySet(["unknown.read"])).toBe(false);
     expect(isCanonicalAgentToolSet(["http-json.read", "repository.git-status"])).toBe(true);
     expect(isCanonicalAgentToolSet(["repository.git-status", "http-json.read"])).toBe(false);
+    expect(isCanonicalAgentToolSet(["room-memory.read"])).toBe(false);
     expect(isCanonicalAgentToolSet(["shell.exec"])).toBe(false);
     expect(canonicalizeAgentCapabilities([
       "room.respond", "room.conversation.read", "room.respond",

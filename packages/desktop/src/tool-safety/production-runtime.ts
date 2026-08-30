@@ -192,7 +192,7 @@ function buildCards(
       }
     }
     if (lineage === undefined && originalLineage?.value.state === "pending" &&
-        dispatch?.value.state === "outcome_unknown") {
+        (dispatch?.value.state === "outcome_unknown" || dispatch?.value.state === "known_succeeded")) {
       state = "compensation-proposed";
       currentVersion = dispatch.value.version;
     }
@@ -262,10 +262,11 @@ export function createDesktopToolSafetyRuntime(options: Readonly<{
     const cards = session === undefined || connection.status === "revoked" || records === undefined
       ? [] : buildCards(records as readonly unknown[], session.actorId, governance?.ownerActorId).map((card) => {
         const override = displayOverrides.get(roomId)?.get(card.toolCallId);
-        const decisionSurface = ["pending", "confirmed", "rejected", "expired", "principal-revoked",
-          "params-changed", "duplicate"].includes(card.state);
-        if (override?.version === card.version && decisionSurface) return { ...card, state: override.state };
-        if (override !== undefined && !decisionSurface) displayOverrides.get(roomId)?.delete(card.toolCallId);
+        const overrideApplicable = override?.state === "duplicate"
+          ? ["pending", "confirmed", "rejected", "duplicate"].includes(card.state)
+          : ["pending", "confirmed", "rejected", "params-changed"].includes(card.state);
+        if (override?.version === card.version && overrideApplicable) return { ...card, state: override.state };
+        if (override !== undefined && !overrideApplicable) displayOverrides.get(roomId)?.delete(card.toolCallId);
         return card;
       });
     return cloneToolSafetyRemoteState({ roomId, connection, cards,

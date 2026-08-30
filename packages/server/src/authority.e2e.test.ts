@@ -1608,7 +1608,7 @@ describe("authoritative server real-process harness", () => {
           displayName: "FT-07 Research Agent",
           globalResponsibility: "Research authoritative sources for the Room.",
           capabilityCeiling: ["room.conversation.read", "room.memory.read", "room.respond"],
-          toolCeiling: ["room-memory.read"],
+          toolCeiling: ["repository.git-status"],
         },
       })).resolves.toMatchObject({
         type: "ack", requestId: "renderer-profile-create", command: "profile.create",
@@ -1632,7 +1632,7 @@ describe("authoritative server real-process harness", () => {
           roomResponsibility: "Answer only when mentioned and cite Room memory.",
           participation: "on-mention",
           capabilitySubset: ["room.conversation.read", "room.memory.read", "room.respond"],
-          toolSubset: ["room-memory.read"],
+          toolSubset: ["repository.git-status"],
         },
       })).resolves.toMatchObject({
         type: "ack", requestId: "renderer-assignment-create", command: "assignment.create",
@@ -1648,7 +1648,7 @@ describe("authoritative server real-process harness", () => {
           profileId: profile.profileId,
           participation: "on-mention",
           availability: "noauth",
-          effectiveTools: ["room-memory.read"],
+          effectiveTools: ["repository.git-status"],
           profileRevision: 1,
           assignmentRevision: 1,
         }],

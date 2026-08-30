@@ -87,7 +87,7 @@ function fixture(options: Readonly<{
       credentialReadiness: options.credentialReadiness ?? "noauth",
     }),
     capabilities: ["room.project.read", "room.respond"],
-    tools: ["repository.git-status", "room-memory.read"],
+    tools: ["repository.git-status"],
     clock: () => NOW,
     profileIdFactory: () => `profile-${++profileSequence}`,
     actorIdFactory: () => `agent-${profileSequence}`,
@@ -106,7 +106,7 @@ async function createProfile(f: ReturnType<typeof fixture>) {
     displayName: "Researcher",
     globalResponsibility: "Verify source evidence",
     capabilityCeiling: ["room.project.read", "room.respond"],
-    toolCeiling: ["repository.git-status", "room-memory.read"],
+    toolCeiling: ["repository.git-status"],
   });
 }
 
@@ -214,7 +214,7 @@ describe("SQLite Tenant Administrator and Global Profile repository", () => {
       displayName: "Researcher",
       globalResponsibility: "Verify source evidence",
       capabilityCeiling: ["room.project.read", "room.respond"],
-      toolCeiling: ["repository.git-status", "room-memory.read"],
+      toolCeiling: ["repository.git-status"],
     };
     const created = await authority.createProfile(context("create"), input);
     const replay = await authority.createProfile(context("create"), input);
@@ -222,7 +222,7 @@ describe("SQLite Tenant Administrator and Global Profile repository", () => {
     const updated = await authority.updateProfile(context("update"), {
       profileId: created.profile.profileId, expectedRevision: 1,
       displayName: "Evidence Researcher", globalResponsibility: "Verify durable evidence",
-      capabilityCeiling: ["room.project.read"], toolCeiling: ["room-memory.read"],
+      capabilityCeiling: ["room.project.read"], toolCeiling: ["repository.git-status"],
     });
     await authority.disableProfile(context("disable"), {
       profileId: updated.profile.profileId, expectedRevision: 2,
@@ -350,7 +350,7 @@ describe("SQLite Tenant Administrator and Global Profile repository", () => {
       displayName: "Bounded Researcher",
       globalResponsibility: "Verify bounded durable evidence",
       capabilityCeiling: ["room.project.read"],
-      toolCeiling: ["room-memory.read"],
+      toolCeiling: ["repository.git-status"],
     });
     if (!succeeds) {
       await expect(operation).rejects.toMatchObject({
@@ -410,7 +410,7 @@ describe("SQLite Tenant Administrator and Global Profile repository", () => {
       displayName: "Evidence Researcher",
       globalResponsibility: "Verify durable evidence",
       capabilityCeiling: ["room.project.read"],
-      toolCeiling: ["room-memory.read"],
+      toolCeiling: ["repository.git-status"],
     });
     expect(updated.profile).toMatchObject({ revision: 2, actorId: created.profile.actorId });
     expect(f.database.prepare(
@@ -419,9 +419,9 @@ describe("SQLite Tenant Administrator and Global Profile repository", () => {
        FROM room_agent_assignments ORDER BY id`,
     ).all()).toEqual([
       { id: "assignment-1", revision: 2, capabilities: '["room.project.read"]',
-        tools: '["room-memory.read"]', updatedAt: NOW },
+        tools: '["repository.git-status"]', updatedAt: NOW },
       { id: "assignment-2", revision: 2, capabilities: '["room.project.read"]',
-        tools: '["room-memory.read"]', updatedAt: NOW },
+        tools: '["repository.git-status"]', updatedAt: NOW },
     ]);
     expect(f.database.prepare(
       `SELECT assignment_id AS assignmentId, revision, operation
@@ -455,9 +455,9 @@ describe("SQLite Tenant Administrator and Global Profile repository", () => {
           capabilityCeiling: ["room.project.read"],
           capabilitySubset: ["room.project.read"],
           effectiveCapabilities: ["room.project.read"],
-          toolCeiling: ["room-memory.read"],
-          toolSubset: ["room-memory.read"],
-          effectiveTools: ["room-memory.read"],
+          toolCeiling: ["repository.git-status"],
+          toolSubset: ["repository.git-status"],
+          effectiveTools: ["repository.git-status"],
           profileRevision: 2,
           assignmentRevision: 2,
           accessRevision: index + 1,
@@ -473,7 +473,7 @@ describe("SQLite Tenant Administrator and Global Profile repository", () => {
     const created = await createProfile(f);
     seedAssignments(f.database, created.profile, 2);
     f.database.prepare(
-      `UPDATE room_memberships SET tool_permissions_json = '["room-memory.read"]'
+      `UPDATE room_memberships SET tool_permissions_json = '["repository.git-status"]'
        WHERE room_id = 'room-1' AND actor_id = ?`,
     ).run(created.profile.actorId);
     const renameCommand = {
@@ -517,7 +517,7 @@ describe("SQLite Tenant Administrator and Global Profile repository", () => {
         actorId: created.profile.actorId, displayName: "Renamed Researcher",
         availability: "noauth", profileRevision: 2, assignmentRevision: 2,
         effectiveTools: roomId === "room-1"
-          ? ["room-memory.read"] : ["repository.git-status", "room-memory.read"],
+          ? ["repository.git-status"] : ["repository.git-status"],
       } });
       expect(roomChanges[1]).toMatchObject({
         actorId: created.profile.actorId, assignmentRevision: 3,
@@ -549,7 +549,7 @@ describe("SQLite Tenant Administrator and Global Profile repository", () => {
       displayName: "Must Roll Back",
       globalResponsibility: "Must roll back every authority fact",
       capabilityCeiling: ["room.project.read"],
-      toolCeiling: ["room-memory.read"],
+      toolCeiling: ["repository.git-status"],
     })).rejects.toThrow(/injected profile room outbox failure/i);
     expect(f.database.prepare(
       "SELECT revision, display_name AS displayName FROM agent_profiles WHERE id = ?",
@@ -559,7 +559,7 @@ describe("SQLite Tenant Administrator and Global Profile repository", () => {
               tool_subset_json AS tools FROM room_agent_assignments`,
     ).get()).toEqual({ revision: 1,
       capabilities: '["room.project.read","room.respond"]',
-      tools: '["repository.git-status","room-memory.read"]' });
+      tools: '["repository.git-status"]' });
     expect(f.database.prepare(
       "SELECT COUNT(*) AS count FROM room_agent_assignment_revisions",
     ).get()).toEqual({ count: 1 });
@@ -596,7 +596,7 @@ describe("SQLite Tenant Administrator and Global Profile repository", () => {
       displayName: "Restarted Researcher",
       globalResponsibility: "Survive WAL restart",
       capabilityCeiling: ["room.project.read"],
-      toolCeiling: ["room-memory.read"],
+      toolCeiling: ["repository.git-status"],
     });
     const trackedIndex = databases.indexOf(f.database);
     if (trackedIndex >= 0) databases.splice(trackedIndex, 1);

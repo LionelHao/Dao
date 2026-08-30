@@ -9,14 +9,14 @@ const profileFields = {
   displayName: "Research",
   globalResponsibility: "Review evidence",
   capabilityCeiling: ["room.conversation.read", "room.respond"],
-  toolCeiling: ["room-memory.read"],
+  toolCeiling: ["repository.git-status"],
 };
 
 const assignmentFields = {
   roomResponsibility: "Review this Room",
   participation: "on-mention",
   capabilitySubset: ["room.conversation.read"],
-  toolSubset: ["room-memory.read"],
+  toolSubset: ["repository.git-status"],
 };
 
 describe("FT-07 Agent Settings protocol", () => {

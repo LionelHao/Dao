@@ -793,6 +793,7 @@ const serverOptions: StartAuthoritativeServerOptions = {
 };
 const closeCounts = { transport: 0, runtime: 0, snapshots: 0, worker: 0 };
 const testOptions = {
+  ...(process.platform === "linux" ? {} : { toolAdapterPathFallbackForTest: true as const }),
   ...(command.faultPoint === undefined ? {} : { faultPoint: command.faultPoint }),
   ...(command.forceSnapshotFallback === true ? { snapshotCacheQuotaBytes: 1 } : {}),
   ...(command.snapshotRecordsPerPage === undefined
@@ -834,7 +835,11 @@ if (command.closeCleanupProbe === true) {
   const first = server.close();
   const samePromise = server.close() === first;
   const failure = await first.catch((error: unknown) => error);
-  const reopened = await startAuthoritativeServer(serverOptions);
+  const reopened = process.platform === "linux"
+    ? await startAuthoritativeServer(serverOptions)
+    : await startAuthoritativeServerForTest(serverOptions, {
+        toolAdapterPathFallbackForTest: true,
+      });
   await reopened.close();
   await attachmentFixture?.close();
   process.stdout.write(`${JSON.stringify({

@@ -174,6 +174,11 @@ describe("Tool Safety production bridge", () => {
       { kind: "tool-dispatch", value: { dispatchId: "dispatch-1", toolCallId: "call-1",
         state: "claimed", reasonCode: null, version: 2 } }];
     expect((await runtime.getSurface({ roomId: "room-1" })).cards[0]?.state).toBe("dispatched");
+    records = [call, { ...pending, value: { ...pending.value, state: "confirmed" as const, version: 2 } },
+      { kind: "tool-grant", value: { grantId: "grant-1", toolCallId: "call-1",
+        state: "expired", reasonCode: "grant_expired", expiresAt: "2026-08-30T08:01:00.000Z",
+        version: 2 } }];
+    expect((await runtime.getSurface({ roomId: "room-1" })).cards[0]?.state).toBe("expired");
     expect(clearRoom).not.toHaveBeenCalled();
     runtime.close();
   });
@@ -270,6 +275,9 @@ describe("Tool Safety production bridge", () => {
     viewer = "human-owner";
     expect((await runtime.getSurface({ roomId: "room-1" })).cards[0]?.canDecide).toBe(true);
     records = [call, pending, unknown, lineage];
+    expect((await runtime.getSurface({ roomId: "room-1" })).cards[0]?.state)
+      .toBe("compensation-proposed");
+    records = [call, pending, { ...unknown, value: { ...unknown.value, state: "known_succeeded" } }, lineage];
     expect((await runtime.getSurface({ roomId: "room-1" })).cards[0]?.state)
       .toBe("compensation-proposed");
     runtime.close();

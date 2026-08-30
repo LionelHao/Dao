@@ -17,7 +17,6 @@ export type AgentCapabilityId =
 export type AgentToolId =
   | "http-json.read"
   | "repository.git-status"
-  | "room-memory.read"
   | "sandbox-file.write";
 
 export interface AgentProfileProjection {
@@ -230,7 +229,7 @@ const capabilities = new Set<AgentCapabilityId>([
   "room.conversation.read", "room.memory.read", "room.project.read", "room.respond",
 ]);
 const tools = new Set<AgentToolId>([
-  "http-json.read", "repository.git-status", "room-memory.read", "sandbox-file.write",
+  "http-json.read", "repository.git-status", "sandbox-file.write",
 ]);
 const commands = new Set<AgentSettingsCommand>([
   "profile.create", "profile.update", "profile.disable", "profile.enable",
