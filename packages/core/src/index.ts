@@ -549,6 +549,7 @@ export {
   isRoomSyncResult,
   isSnapshotCompleted,
   isSnapshotVersion,
+  isToolSafetyRepairRecord,
   isWorkspaceBootstrapPage,
 } from "./sync.js";
 export type {
@@ -567,6 +568,8 @@ export type {
   RoomArchivedEventPayload,
   RoomRepairPage,
   RoomRepairRecord,
+  ToolSafetyEvent,
+  ToolSafetyRepairRecord,
   RoomAgentAssignmentChangedPayload,
   RoomAgentAssignmentProjection,
   RoomAgentAssignmentRepairSnapshot,

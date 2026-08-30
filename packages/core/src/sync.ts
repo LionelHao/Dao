@@ -207,6 +207,49 @@ export interface LegacyUnknownCalibrationSignal {
 
 type OperationalMessageAuthorityRepairRecord = MessageAuthorityRepairRecord;
 
+export type ToolSafetyRepairRecord =
+  | { readonly kind: "tool-call"; readonly value: Readonly<{
+      toolCallId: string; toolId: string; safePreview: string;
+      state: "prepared"; version: number; sourceRef: string;
+    }> }
+  | { readonly kind: "tool-confirmation"; readonly value: Readonly<{
+      confirmationId: string; toolCallId: string; toolId: string;
+      state: "pending" | "confirmed" | "rejected" | "expired";
+      safePreview: string; reasonCode: string | null; expiresAt: string;
+      version: number; namedHumanDisplayRef: string | null; sourceRef: string;
+    }> }
+  | { readonly kind: "tool-grant"; readonly value: Readonly<{
+      grantId: string; toolCallId: string;
+      state: "active" | "claimed" | "revoked" | "expired";
+      reasonCode: string | null; expiresAt: string; version: number;
+    }> }
+  | { readonly kind: "tool-dispatch"; readonly value: Readonly<{
+      dispatchId: string; toolCallId: string;
+      state: "prepared" | "claimed" | "dispatched" | "known_succeeded" |
+        "known_failed" | "outcome_unknown" | "reviewed";
+      reasonCode: string | null; version: number;
+    }> }
+  | { readonly kind: "tool-review"; readonly value: Readonly<{
+      reviewId: string; dispatchId: string;
+      resolution: "known_succeeded" | "known_failed" | "compensated" | "accepted_risk";
+      evidenceSummary: string; namedHumanDisplayRef: string;
+      compensationToolCallId: string | null; version: number;
+    }> }
+  | { readonly kind: "tool-handoff"; readonly value: Readonly<{
+      handoffId: string; confirmationId: string;
+      state: "offered" | "accepted" | "rejected" | "expired";
+      targetNamedHumanDisplayRef: string; version: number;
+    }> }
+  | { readonly kind: "tool-compensation"; readonly value: Readonly<{
+      lineageId: string; originalDispatchId: string; compensationInvocationId: string;
+      compensationExecutionId: string; compensationToolCallId: string;
+      state: "pending" | "rejected" | "expired" | "claimed" | "dispatched" |
+        "known_succeeded" | "known_failed" | "outcome_unknown" | "reviewed";
+      version: number;
+    }> };
+
+export type ToolSafetyEvent = RoomEvent<"tool.safety.changed", ToolSafetyRepairRecord>;
+
 export type RoomRepairRecord =
   | { readonly kind: "room"; readonly value: Omit<ManagedRoom, "members"> }
   | { readonly kind: "governance"; readonly value: RoomGovernanceView }
@@ -232,6 +275,7 @@ export type RoomRepairRecord =
   | OperationalMessageAuthorityRepairRecord
   | AttachmentRepairRecord
   | RoomMemoryRepairRecord
+  | ToolSafetyRepairRecord
   | ProjectRepairRecord;
 
 export type SnapshotVersion =
@@ -375,6 +419,7 @@ export type PersistedRoomEvent =
   | AttachmentRoomEvent
   | RoomMemoryEvent
   | ProjectEvent
+  | ToolSafetyEvent
   | RoomEvent<"room.human_read.recorded", HumanReadReceipt>
   | RoomEvent<"room.agent_judgment.recorded", AgentJudgement>
   | RoomEvent<"room.open_item.changed", OpenItem>
@@ -677,6 +722,10 @@ function isRepairRecord(value: unknown, expectedRoomId?: string): value is RoomR
   if (value.kind === "attachment") return isAttachmentRepairRecord(value, expectedRoomId);
   if (value.kind === "memory") return isRoomMemoryRepairRecord(value, expectedRoomId);
   if (value.kind === "project-loop") return isProjectRepairRecord(value, expectedRoomId);
+  if (value.kind === "tool-confirmation" || value.kind === "tool-grant" ||
+      value.kind === "tool-dispatch" || value.kind === "tool-review") {
+    return isToolSafetyRepairRecord(value);
+  }
   if (!exact(value, ["kind", "value"])) return false;
   if (value.kind === "human-read") return isHumanReadReceipt(value.value);
   if (value.kind === "agent-judgement") return isAgentJudgement(value.value);
@@ -714,6 +763,65 @@ function isRepairRecord(value: unknown, expectedRoomId?: string): value is RoomR
   return value.kind === "message" && isMessageValue(value.value);
 }
 
+export function isToolSafetyRepairRecord(value: unknown): value is ToolSafetyRepairRecord {
+  if (!isRecord(value) || !exact(value, ["kind", "value"]) || !isRecord(value.value)) return false;
+  const payload = value.value;
+  if (value.kind === "tool-call") {
+    return exact(payload, ["toolCallId", "toolId", "safePreview", "state", "version", "sourceRef"]) &&
+      text(payload.toolCallId) && text(payload.toolId) && typeof payload.safePreview === "string" &&
+      payload.state === "prepared" && count(payload.version) && text(payload.sourceRef);
+  }
+  if (value.kind === "tool-confirmation") {
+    return exact(payload, ["confirmationId", "toolCallId", "toolId", "state", "safePreview",
+      "reasonCode", "expiresAt", "version", "namedHumanDisplayRef", "sourceRef"]) &&
+      text(payload.confirmationId) && text(payload.toolCallId) && text(payload.toolId) &&
+      ["pending", "confirmed", "rejected", "expired"].includes(String(payload.state)) &&
+      typeof payload.safePreview === "string" && text(payload.expiresAt) && count(payload.version) &&
+      (payload.reasonCode === null || text(payload.reasonCode)) &&
+      (payload.namedHumanDisplayRef === null || text(payload.namedHumanDisplayRef)) &&
+      text(payload.sourceRef);
+  }
+  if (value.kind === "tool-grant") {
+    return exact(payload, ["grantId", "toolCallId", "state", "reasonCode", "expiresAt", "version"]) &&
+      text(payload.grantId) && text(payload.toolCallId) &&
+      ["active", "claimed", "revoked", "expired"].includes(String(payload.state)) &&
+      (payload.reasonCode === null || text(payload.reasonCode)) && text(payload.expiresAt) &&
+      count(payload.version);
+  }
+  if (value.kind === "tool-dispatch") {
+    return exact(payload, ["dispatchId", "toolCallId", "state", "reasonCode", "version"]) &&
+      text(payload.dispatchId) && text(payload.toolCallId) &&
+      ["prepared", "claimed", "dispatched", "known_succeeded", "known_failed",
+        "outcome_unknown", "reviewed"].includes(String(payload.state)) &&
+      (payload.reasonCode === null || text(payload.reasonCode)) && count(payload.version);
+  }
+  if (value.kind === "tool-review") {
+    return exact(payload, ["reviewId", "dispatchId", "resolution", "evidenceSummary",
+      "namedHumanDisplayRef", "compensationToolCallId", "version"]) &&
+      text(payload.reviewId) && text(payload.dispatchId) &&
+      ["known_succeeded", "known_failed", "compensated", "accepted_risk"].includes(
+        String(payload.resolution)) && typeof payload.evidenceSummary === "string" &&
+      text(payload.namedHumanDisplayRef) &&
+      (payload.compensationToolCallId === null || text(payload.compensationToolCallId)) &&
+      count(payload.version);
+  }
+  if (value.kind === "tool-handoff") {
+    return exact(payload, ["handoffId", "confirmationId", "state",
+      "targetNamedHumanDisplayRef", "version"]) && text(payload.handoffId) &&
+      text(payload.confirmationId) && ["offered", "accepted", "rejected", "expired"]
+        .includes(String(payload.state)) && text(payload.targetNamedHumanDisplayRef) &&
+      count(payload.version);
+  }
+  return value.kind === "tool-compensation" && exact(payload,
+    ["lineageId", "originalDispatchId", "compensationInvocationId",
+      "compensationExecutionId", "compensationToolCallId", "state", "version"]) &&
+    text(payload.lineageId) && text(payload.originalDispatchId) &&
+    text(payload.compensationInvocationId) && text(payload.compensationExecutionId) &&
+    text(payload.compensationToolCallId) && ["pending", "rejected", "expired", "claimed",
+      "dispatched", "known_succeeded", "known_failed", "outcome_unknown", "reviewed"]
+      .includes(String(payload.state)) && count(payload.version);
+}
+
 function isPersistedRoomEventValue(value: unknown): value is PersistedRoomEvent {
   if (isProjectEvent(value)) return true;
   if (!isRecord(value) || !exact(
@@ -727,6 +835,7 @@ function isPersistedRoomEventValue(value: unknown): value is PersistedRoomEvent 
   if (isMessageAuthorityEvent(value)) return true;
   if (isAttachmentRoomEvent(value)) return true;
   if (isRoomMemoryEvent(value)) return true;
+  if (value.type === "tool.safety.changed") return isToolSafetyRepairRecord(value.payload);
   if (value.type === "room.created" || value.type === "room.renamed") {
     return exact(payload, ["room"]) && isManagedRoomValue(payload.room) && payload.room.id === value.roomId;
   }

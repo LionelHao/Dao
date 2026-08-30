@@ -45,6 +45,10 @@ import type {
   RuntimeAuthorityOperationResult,
 } from "../agent-runtime/runtime-authority-protocol.js";
 import type { RuntimeRecoveryRecord } from "../agent-runtime/contracts.js";
+import {
+  executeToolSafetyAuthorityOperationInTransaction,
+  ToolSafetyDatabaseError,
+} from "../tool-safety/database-authority.js";
 import type { ScopedCancellationCommitReceipt } from
   "../scoped-cancellation/scoped-cancellation-orchestrator.js";
 import type {
@@ -6711,6 +6715,19 @@ export function executeRuntimeAuthorityOperation(
   operation: RuntimeAuthorityOperation,
 ): RuntimeAuthorityOperationResult {
   return runAuthorityImmediateTransaction(database, () => {
+    if (operation.type.startsWith("tool-safety.")) {
+      try {
+        return executeToolSafetyAuthorityOperationInTransaction(
+          database,
+          operation as Extract<RuntimeAuthorityOperation, { type: `tool-safety.${string}` }>,
+        );
+      } catch (error) {
+        if (error instanceof ToolSafetyDatabaseError) {
+          return fail(error.code, error.message);
+        }
+        throw error;
+      }
+    }
     const occurredAt = new Date(operation.now).toISOString();
     if (operation.type === "runtime.list-pending-human-fences") {
       const rows = database.prepare(

@@ -57,15 +57,25 @@ export interface ClosedRepairProjectionRegistry<
 }
 
 export const TOOL_SAFETY_REPAIR_KINDS = Object.freeze([
+  "tool-call",
   "tool-confirmation",
   "tool-grant",
   "tool-dispatch",
   "tool-review",
+  "tool-handoff",
+  "tool-compensation",
 ] as const);
 
 export type ToolSafetyRepairKind = typeof TOOL_SAFETY_REPAIR_KINDS[number];
 
 export type PublicToolSafetyRepairRecord =
+  | Readonly<{
+      kind: "tool-call";
+      value: Readonly<{
+        toolCallId: string; toolId: string; safePreview: string;
+        state: "prepared"; version: number; sourceRef: string;
+      }>;
+    }>
   | Readonly<{
       kind: "tool-confirmation";
       value: Readonly<{
@@ -114,6 +124,24 @@ export type PublicToolSafetyRepairRecord =
         compensationToolCallId: string | null;
         version: number;
       }>;
+    }>
+  | Readonly<{
+      kind: "tool-handoff";
+      value: Readonly<{
+        handoffId: string; confirmationId: string;
+        state: "offered" | "accepted" | "rejected" | "expired";
+        targetNamedHumanDisplayRef: string; version: number;
+      }>;
+    }>
+  | Readonly<{
+      kind: "tool-compensation";
+      value: Readonly<{
+        lineageId: string; originalDispatchId: string; compensationInvocationId: string;
+        compensationExecutionId: string; compensationToolCallId: string;
+        state: "pending" | "rejected" | "expired" | "claimed" | "dispatched" |
+          "known_succeeded" | "known_failed" | "outcome_unknown" | "reviewed";
+        version: number;
+      }>;
     }>;
 
 const TOOL_SAFETY_FORBIDDEN_PUBLIC_KEYS = new Set([
@@ -148,6 +176,11 @@ export function isPublicToolSafetyRepairRecord(value: unknown): value is PublicT
   if (!publicObject(value) || !publicObject(value.value) ||
       !TOOL_SAFETY_REPAIR_KINDS.includes(value.kind as ToolSafetyRepairKind)) return false;
   const body = value.value;
+  if (value.kind === "tool-call") {
+    return hasExactKeys(body, ["toolCallId", "toolId", "safePreview", "state", "version", "sourceRef"]) &&
+      safeText(body.toolCallId) && safeText(body.toolId) && safeText(body.safePreview) &&
+      body.state === "prepared" && positiveVersion(body.version) && safeText(body.sourceRef, 512);
+  }
   if (value.kind === "tool-confirmation") {
     return hasExactKeys(body, [
       "confirmationId", "toolCallId", "toolId", "state", "safePreview", "reasonCode",
@@ -173,14 +206,31 @@ export function isPublicToolSafetyRepairRecord(value: unknown): value is PublicT
         "outcome_unknown", "reviewed"].includes(body.state as string) &&
       (body.reasonCode === null || safeText(body.reasonCode, 256)) && positiveVersion(body.version);
   }
-  return value.kind === "tool-review" && hasExactKeys(body, [
-    "reviewId", "dispatchId", "resolution", "evidenceSummary", "namedHumanDisplayRef",
-    "compensationToolCallId", "version",
-  ]) && safeText(body.reviewId) && safeText(body.dispatchId) &&
-    ["known_succeeded", "known_failed", "compensated", "accepted_risk"].includes(body.resolution as string) &&
-    safeText(body.evidenceSummary, 2_048) && safeText(body.namedHumanDisplayRef, 256) &&
-    (body.compensationToolCallId === null || safeText(body.compensationToolCallId)) &&
-    positiveVersion(body.version);
+  if (value.kind === "tool-review") {
+    return hasExactKeys(body, [
+      "reviewId", "dispatchId", "resolution", "evidenceSummary", "namedHumanDisplayRef",
+      "compensationToolCallId", "version",
+    ]) && safeText(body.reviewId) && safeText(body.dispatchId) &&
+      ["known_succeeded", "known_failed", "compensated", "accepted_risk"].includes(body.resolution as string) &&
+      safeText(body.evidenceSummary, 2_048) && safeText(body.namedHumanDisplayRef, 256) &&
+      (body.compensationToolCallId === null || safeText(body.compensationToolCallId)) &&
+      positiveVersion(body.version);
+  }
+  if (value.kind === "tool-handoff") {
+    return hasExactKeys(body, ["handoffId", "confirmationId", "state",
+      "targetNamedHumanDisplayRef", "version"]) && safeText(body.handoffId) &&
+      safeText(body.confirmationId) && ["offered", "accepted", "rejected", "expired"]
+        .includes(body.state as string) && safeText(body.targetNamedHumanDisplayRef, 256) &&
+      positiveVersion(body.version);
+  }
+  return value.kind === "tool-compensation" && hasExactKeys(body,
+    ["lineageId", "originalDispatchId", "compensationInvocationId",
+      "compensationExecutionId", "compensationToolCallId", "state", "version"]) &&
+    safeText(body.lineageId) && safeText(body.originalDispatchId) &&
+    safeText(body.compensationInvocationId) && safeText(body.compensationExecutionId) &&
+    safeText(body.compensationToolCallId) && ["pending", "rejected", "expired", "claimed",
+      "dispatched", "known_succeeded", "known_failed", "outcome_unknown", "reviewed"]
+      .includes(body.state as string) && positiveVersion(body.version);
 }
 
 export function createToolSafetyRepairProjectionRegistry(

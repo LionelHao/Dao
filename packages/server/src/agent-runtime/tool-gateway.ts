@@ -154,6 +154,10 @@ export interface ToolSafetyGatewayExecutionInput {
   readonly principalActorId?: string;
   readonly sessionFamilyId?: string;
   readonly bindingGeneration?: number;
+  /** Server-private parsed parameters; never exposed through public protocol or repair. */
+  readonly parameters?: Readonly<Record<string, unknown>>;
+  /** Server-private compensation lineage. Public commands can never provide this field. */
+  readonly compensationOfDispatchId?: string;
   readonly signal: AbortSignal;
 }
 
@@ -165,6 +169,8 @@ export type ToolDispatchClaimResult =
       dispatchId: string;
       toolId: ExternalPhysicalToolId;
       parameters: Readonly<Record<string, unknown>>;
+      compensationToken?: string;
+      compensationOfDispatchId?: string;
     }>
   | Readonly<{ kind: "rejected"; reason: ToolDispatchRejectionReason }>
   | Readonly<{
@@ -216,10 +222,12 @@ export interface ToolSafetyAdapter {
     attemptSeq: number;
     roomId: string;
     agentId: string;
+    grantId: string;
     toolId: ExternalPhysicalToolId;
     parameters: Readonly<Record<string, unknown>>;
     signal: AbortSignal;
   }>): Promise<ToolAdapterTypedOutcome>;
+  compensate?(token: string, signal: AbortSignal): Promise<ToolAdapterTypedOutcome>;
 }
 
 export interface ToolSafetyGateway {
@@ -350,6 +358,7 @@ export function createToolSafetyGateway(options: ToolSafetyGatewayOptions): Tool
         ...(input.bindingGeneration === undefined ? {} : {
           bindingGeneration: input.bindingGeneration,
         }),
+        ...(input.parameters === undefined ? {} : { parameters: input.parameters }),
       });
     } catch (error: unknown) {
       latch.release(reservation);
@@ -412,17 +421,29 @@ export function createToolSafetyGateway(options: ToolSafetyGatewayOptions): Tool
 
     let outcome: ToolAdapterTypedOutcome;
     try {
-      outcome = normalizeTypedAdapterOutcome(await adapter.execute({
-        dispatchId: claim.dispatchId,
-        toolCallId: input.toolCallId,
-        executionId: input.executionId,
-        attemptSeq: input.attemptSeq,
-        roomId: input.roomId,
-        agentId: input.agentId,
-        toolId: input.toolId,
-        parameters: claim.parameters,
-        signal: input.signal,
-      }));
+      if (claim.compensationToken !== undefined) {
+        if (input.compensationOfDispatchId === undefined ||
+            claim.compensationOfDispatchId !== input.compensationOfDispatchId ||
+            adapter.compensate === undefined) {
+          throw new AgentRuntimeError("execution_conflict", "Compensation dispatch binding changed");
+        }
+        outcome = normalizeTypedAdapterOutcome(
+          await adapter.compensate(claim.compensationToken, input.signal),
+        );
+      } else {
+        outcome = normalizeTypedAdapterOutcome(await adapter.execute({
+          dispatchId: claim.dispatchId,
+          toolCallId: input.toolCallId,
+          executionId: input.executionId,
+          attemptSeq: input.attemptSeq,
+          roomId: input.roomId,
+          agentId: input.agentId,
+          grantId: input.grantId,
+          toolId: input.toolId,
+          parameters: claim.parameters,
+          signal: input.signal,
+        }));
+      }
     } catch {
       outcome = Object.freeze({ state: "ambiguous", summary: Object.freeze({ outcome: "unknown" }) });
     }

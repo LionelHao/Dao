@@ -59,6 +59,7 @@ import {
 } from "./schema.js";
 import {
   createClosedRepairProjectionRegistry,
+  isPublicToolSafetyRepairRecord,
   type RepairKeysetPageInput,
   type RoomRepairSegmentDescriptor,
 } from "./repair-projection-registry.js";
@@ -643,6 +644,16 @@ function lightTaskRecord(row: Record<string, unknown>): RoomRepairRecord {
   return { kind: "light-task", value: task };
 }
 
+function toolSafetyRepairRecord(kind: "tool-call" | "tool-confirmation" | "tool-grant" |
+  "tool-dispatch" | "tool-review" | "tool-handoff" | "tool-compensation",
+  row: Record<string, unknown>): RoomRepairRecord {
+  const record = { kind, value: row };
+  if (!isPublicToolSafetyRepairRecord(record)) {
+    throw new SnapshotBuildError("storage_unavailable", "Tool safety repair record is corrupt");
+  }
+  return record as RoomRepairRecord;
+}
+
 type RoomRepairKind = RoomRepairRecord["kind"];
 
 const ROOM_REPAIR_KIND_MAP = Object.freeze({
@@ -671,6 +682,13 @@ const ROOM_REPAIR_KIND_MAP = Object.freeze({
   "legacy-unknown-calibration": true,
   memory: true,
   "project-loop": true,
+  "tool-call": true,
+  "tool-confirmation": true,
+  "tool-grant": true,
+  "tool-dispatch": true,
+  "tool-review": true,
+  "tool-handoff": true,
+  "tool-compensation": true,
 } as const satisfies Readonly<Record<RoomRepairKind, true>>);
 
 const ROOM_REPAIR_KINDS = Object.freeze(
@@ -1363,6 +1381,139 @@ const ROOM_REPAIR_DESCRIPTORS = Object.freeze([
     const result = readProjectLoopRepairSnapshotDatabaseQuery(database, input);
     return { snapshot: result };
   }),
+  {
+    descriptorId: "dao.repair.tool-call.v1", descriptorVersion: 1,
+    kind: "tool-call", order: 19,
+    readKeysetPage: (input) => input.database.prepare(
+      `SELECT call.tool_call_id AS toolCallId, call.tool_id AS toolId,
+              call.safe_preview_json AS safePreview, 'prepared' AS state,
+              call.current_version AS version,
+              COALESCE(execution.trigger_message_id, call.execution_id) AS sourceRef
+       FROM tool_calls_v2 AS call
+       JOIN agent_executions AS execution ON execution.id = call.execution_id
+       WHERE call.room_id = ? AND call.tool_call_id > ?
+       ORDER BY call.tool_call_id LIMIT ?`,
+    ).all(input.roomId, input.afterKey ?? "", input.limit),
+    mapRow: (row) => toolSafetyRepairRecord("tool-call", row as Record<string, unknown>),
+    stableKey: (record) => String(record.kind === "tool-call" ? record.value.toolCallId : ""),
+  },
+  {
+    descriptorId: "dao.repair.tool-confirmation.v1", descriptorVersion: 1,
+    kind: "tool-confirmation", order: 20,
+    readKeysetPage: (input) => input.database.prepare(
+      `SELECT confirmation.confirmation_id AS confirmationId,
+              call.tool_call_id AS toolCallId, call.tool_id AS toolId,
+              confirmation.state, call.safe_preview_json AS safePreview,
+              confirmation.reason AS reasonCode, confirmation.expires_at AS expiresAt,
+              confirmation.version, actor.display_name AS namedHumanDisplayRef,
+              COALESCE(execution.trigger_message_id, call.execution_id) AS sourceRef
+       FROM tool_confirmations_v2 AS confirmation
+       JOIN tool_calls_v2 AS call ON call.tool_call_id = confirmation.tool_call_id
+       JOIN agent_executions AS execution ON execution.id = call.execution_id
+       JOIN actors AS actor ON actor.id = confirmation.principal_human_actor_id
+       WHERE call.room_id = ? AND confirmation.confirmation_id > ?
+       ORDER BY confirmation.confirmation_id LIMIT ?`,
+    ).all(input.roomId, input.afterKey ?? "", input.limit),
+    mapRow: (row) => toolSafetyRepairRecord("tool-confirmation", row as Record<string, unknown>),
+    stableKey: (record) => String(record.kind === "tool-confirmation"
+      ? record.value.confirmationId : ""),
+  },
+  {
+    descriptorId: "dao.repair.tool-grant.v1", descriptorVersion: 1,
+    kind: "tool-grant", order: 21,
+    readKeysetPage: (input) => input.database.prepare(
+      `SELECT grant.grant_id AS grantId, grant.tool_call_id AS toolCallId,
+              grant.state, grant.reason AS reasonCode, grant.expires_at AS expiresAt,
+              grant.version
+       FROM tool_grants_v2 AS grant
+       JOIN tool_calls_v2 AS call ON call.tool_call_id = grant.tool_call_id
+       WHERE call.room_id = ? AND grant.grant_id > ?
+       ORDER BY grant.grant_id LIMIT ?`,
+    ).all(input.roomId, input.afterKey ?? "", input.limit),
+    mapRow: (row) => toolSafetyRepairRecord("tool-grant", row as Record<string, unknown>),
+    stableKey: (record) => String(record.kind === "tool-grant" ? record.value.grantId : ""),
+  },
+  {
+    descriptorId: "dao.repair.tool-dispatch.v1", descriptorVersion: 1,
+    kind: "tool-dispatch", order: 22,
+    readKeysetPage: (input) => input.database.prepare(
+      `SELECT dispatch.dispatch_id AS dispatchId,
+              dispatch.tool_call_id AS toolCallId, dispatch.state,
+              dispatch.reason AS reasonCode, dispatch.version
+       FROM tool_dispatches_v2 AS dispatch
+       JOIN tool_calls_v2 AS call ON call.tool_call_id = dispatch.tool_call_id
+       WHERE call.room_id = ? AND dispatch.dispatch_id > ?
+       ORDER BY dispatch.dispatch_id LIMIT ?`,
+    ).all(input.roomId, input.afterKey ?? "", input.limit),
+    mapRow: (row) => toolSafetyRepairRecord("tool-dispatch", row as Record<string, unknown>),
+    stableKey: (record) => String(record.kind === "tool-dispatch" ? record.value.dispatchId : ""),
+  },
+  {
+    descriptorId: "dao.repair.tool-review.v1", descriptorVersion: 1,
+    kind: "tool-review", order: 23,
+    readKeysetPage: (input) => input.database.prepare(
+      `SELECT review.review_id AS reviewId, review.dispatch_id AS dispatchId,
+              review.resolution, review.evidence_summary AS evidenceSummary,
+              actor.display_name AS namedHumanDisplayRef,
+              review.compensation_tool_call_id AS compensationToolCallId,
+              review.version
+       FROM tool_reviews_v2 AS review
+       JOIN tool_dispatches_v2 AS dispatch ON dispatch.dispatch_id = review.dispatch_id
+       JOIN tool_calls_v2 AS call ON call.tool_call_id = dispatch.tool_call_id
+       JOIN actors AS actor ON actor.id = review.principal_human_actor_id
+       WHERE call.room_id = ? AND review.review_id > ?
+       ORDER BY review.review_id LIMIT ?`,
+    ).all(input.roomId, input.afterKey ?? "", input.limit),
+    mapRow: (row) => toolSafetyRepairRecord("tool-review", row as Record<string, unknown>),
+    stableKey: (record) => String(record.kind === "tool-review" ? record.value.reviewId : ""),
+  },
+  {
+    descriptorId: "dao.repair.tool-handoff.v1", descriptorVersion: 1,
+    kind: "tool-handoff", order: 24,
+    readKeysetPage: (input) => input.database.prepare(
+      `SELECT handoff.handoff_id AS handoffId,
+              handoff.confirmation_id AS confirmationId, handoff.state,
+              actor.display_name AS targetNamedHumanDisplayRef,
+              CASE handoff.state WHEN 'offered' THEN 1 ELSE 2 END AS version
+       FROM tool_confirmation_handoffs_v2 AS handoff
+       JOIN tool_confirmations_v2 AS confirmation
+         ON confirmation.confirmation_id = handoff.confirmation_id
+       JOIN tool_calls_v2 AS call ON call.tool_call_id = confirmation.tool_call_id
+       JOIN actors AS actor ON actor.id = handoff.to_principal_human_actor_id
+       WHERE call.room_id = ? AND handoff.handoff_id > ?
+       ORDER BY handoff.handoff_id LIMIT ?`,
+    ).all(input.roomId, input.afterKey ?? "", input.limit),
+    mapRow: (row) => toolSafetyRepairRecord("tool-handoff", row as Record<string, unknown>),
+    stableKey: (record) => String(record.kind === "tool-handoff" ? record.value.handoffId : ""),
+  },
+  {
+    descriptorId: "dao.repair.tool-compensation.v1", descriptorVersion: 1,
+    kind: "tool-compensation", order: 25,
+    readKeysetPage: (input) => input.database.prepare(
+      `SELECT lineage.lineage_id AS lineageId,
+              lineage.original_dispatch_id AS originalDispatchId,
+              lineage.compensation_invocation_id AS compensationInvocationId,
+              lineage.compensation_execution_id AS compensationExecutionId,
+              lineage.compensation_tool_call_id AS compensationToolCallId,
+              CASE
+                WHEN dispatch.state IS NOT NULL THEN dispatch.state
+                WHEN confirmation.state IN ('rejected','expired') THEN confirmation.state
+                ELSE 'pending'
+              END AS state,
+              COALESCE(dispatch.version, confirmation.version, 1) AS version
+       FROM tool_compensation_lineage_v2 AS lineage
+       JOIN tool_calls_v2 AS call ON call.tool_call_id = lineage.compensation_tool_call_id
+       LEFT JOIN tool_dispatches_v2 AS dispatch
+         ON dispatch.tool_call_id = lineage.compensation_tool_call_id
+       LEFT JOIN tool_confirmations_v2 AS confirmation
+         ON confirmation.tool_call_id = lineage.compensation_tool_call_id
+       WHERE call.room_id = ? AND lineage.lineage_id > ?
+       ORDER BY lineage.lineage_id LIMIT ?`,
+    ).all(input.roomId, input.afterKey ?? "", input.limit),
+    mapRow: (row) => toolSafetyRepairRecord("tool-compensation", row as Record<string, unknown>),
+    stableKey: (record) => String(record.kind === "tool-compensation"
+      ? record.value.lineageId : ""),
+  },
 ] as const satisfies readonly RoomRepairSegmentDescriptor<RoomRepairKind, RoomRepairRecord>[]);
 
 const ROOM_REPAIR_REGISTRY = createClosedRepairProjectionRegistry<

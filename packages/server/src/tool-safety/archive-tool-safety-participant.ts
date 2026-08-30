@@ -400,6 +400,11 @@ function settleDatabase(
          SELECT 1 FROM tool_dispatches AS dispatch
          WHERE dispatch.execution_id = execution.id
        )
+       AND NOT EXISTS (
+         SELECT 1 FROM tool_dispatches_v2 AS dispatch
+         JOIN tool_calls_v2 AS call ON call.tool_call_id = dispatch.tool_call_id
+         WHERE call.execution_id = execution.id
+       )
      ORDER BY execution.id`,
   ).all(input.roomId) as unknown as readonly WaitingExecutionRow[];
   for (const row of waitingRows) {
@@ -444,6 +449,50 @@ function settleDatabase(
     });
   }
 
+  const pendingV2 = database.prepare(
+    `SELECT confirmation.confirmation_id AS confirmationId,
+            confirmation.tool_call_id AS toolCallId,
+            confirmation.binding_generation AS bindingGeneration,
+            confirmation.principal_human_actor_id AS principalActorId,
+            confirmation.session_family_id AS sessionFamilyId,
+            confirmation.version, call.safe_preview_json AS safePreviewJson
+     FROM tool_confirmations_v2 AS confirmation
+     JOIN tool_calls_v2 AS call ON call.tool_call_id = confirmation.tool_call_id
+     WHERE call.room_id = ? AND confirmation.state = 'pending'
+     ORDER BY confirmation.confirmation_id`,
+  ).all(input.roomId) as unknown as readonly Record<string, unknown>[];
+  for (const row of pendingV2) {
+    const confirmationId = row.confirmationId as string;
+    const nextVersion = (row.version as number) + 1;
+    const transition = database.prepare(
+      `UPDATE tool_confirmations_v2
+       SET state = 'rejected', reason = 'room_archived', version = ?, changed_at = ?
+       WHERE confirmation_id = ? AND state = 'pending' AND version = ?`,
+    ).run(nextVersion, input.now, confirmationId, row.version as number);
+    if (transition.changes !== 1) throw new Error("Pending v2 confirmation archive CAS was stale");
+    database.prepare(
+      `INSERT INTO tool_confirmation_decisions_v2 (
+         decision_id, confirmation_id, tool_call_id, binding_generation,
+         principal_human_actor_id, session_family_id, decision, reason,
+         decision_version, decided_at
+       ) VALUES (?, ?, ?, ?, ?, ?, 'rejected', 'room_archived', ?, ?)`,
+    ).run(`archive-decision:${input.archiveGeneration}:${confirmationId}`, confirmationId,
+      row.toolCallId as string, row.bindingGeneration as number, row.principalActorId as string,
+      row.sessionFamilyId as string, nextVersion, input.now);
+    database.prepare(
+      `INSERT INTO tool_safety_repair_records_v2 (
+         kind, record_id, room_id, stable_key, version, projection_json, updated_at
+       ) VALUES ('tool-confirmation', ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(kind, record_id) DO UPDATE SET version = excluded.version,
+         projection_json = excluded.projection_json, updated_at = excluded.updated_at`,
+    ).run(confirmationId, input.roomId, `tool-confirmation:${confirmationId}`, nextVersion,
+      JSON.stringify({ confirmationId, toolCallId: row.toolCallId, state: "rejected",
+        reason: "room_archived", version: nextVersion,
+        safePreview: JSON.parse(row.safePreviewJson as string) as unknown }), input.now);
+    insertMember(database, { ...input, subjectKind: "confirmation",
+      subjectId: confirmationId, disposition: "rejected_pending" });
+  }
+
   const activeGrants = database.prepare(
     `SELECT grant_id AS grantId
      FROM agent_execution_grants
@@ -464,6 +513,41 @@ function settleDatabase(
       subjectId: row.grantId,
       disposition: "revoked_unclaimed",
     });
+  }
+
+  const activeGrantsV2 = database.prepare(
+    `SELECT grant.grant_id AS grantId, grant.version, grant.tool_call_id AS toolCallId
+     FROM tool_grants_v2 AS grant
+     JOIN tool_calls_v2 AS call ON call.tool_call_id = grant.tool_call_id
+     WHERE call.room_id = ? AND grant.state = 'active'
+     ORDER BY grant.grant_id`,
+  ).all(input.roomId) as unknown as readonly Record<string, unknown>[];
+  for (const row of activeGrantsV2) {
+    const grantId = row.grantId as string;
+    const nextVersion = (row.version as number) + 1;
+    const transition = database.prepare(
+      `UPDATE tool_grants_v2
+       SET state = 'revoked', reason = 'room_archived', version = ?, changed_at = ?
+       WHERE grant_id = ? AND state = 'active' AND version = ?`,
+    ).run(nextVersion, input.now, grantId, row.version as number);
+    if (transition.changes !== 1) throw new Error("Active v2 grant archive CAS was stale");
+    database.prepare(
+      `INSERT INTO tool_grant_transitions_v2 (
+         transition_id, grant_id, from_state, to_state, reason,
+         transition_version, occurred_at
+       ) VALUES (?, ?, 'active', 'revoked', 'room_archived', ?, ?)`,
+    ).run(`archive-grant:${input.archiveGeneration}:${grantId}`, grantId, nextVersion, input.now);
+    database.prepare(
+      `INSERT INTO tool_safety_repair_records_v2 (
+         kind, record_id, room_id, stable_key, version, projection_json, updated_at
+       ) VALUES ('tool-grant', ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(kind, record_id) DO UPDATE SET version = excluded.version,
+         projection_json = excluded.projection_json, updated_at = excluded.updated_at`,
+    ).run(grantId, input.roomId, `tool-grant:${grantId}`, nextVersion,
+      JSON.stringify({ grantId, toolCallId: row.toolCallId, state: "revoked",
+        reason: "room_archived", version: nextVersion }), input.now);
+    insertMember(database, { ...input, subjectKind: "grant", subjectId: grantId,
+      disposition: "revoked_unclaimed" });
   }
 
   for (const row of waitingRows) {
@@ -499,6 +583,19 @@ function settleDatabase(
       subjectId: row.dispatchId as string,
       disposition: "preserved_dispatched",
     });
+  }
+  const dispatchesV2 = database.prepare(
+    `SELECT dispatch.dispatch_id AS dispatchId
+     FROM tool_dispatches_v2 AS dispatch
+     JOIN tool_calls_v2 AS call ON call.tool_call_id = dispatch.tool_call_id
+     WHERE call.room_id = ? AND NOT EXISTS (
+       SELECT 1 FROM tool_dispatches AS legacy
+       WHERE legacy.dispatch_id = dispatch.dispatch_id
+     ) ORDER BY dispatch.dispatch_id`,
+  ).all(input.roomId) as unknown as readonly { readonly dispatchId: string }[];
+  for (const row of dispatchesV2) {
+    insertMember(database, { ...input, subjectKind: "dispatch", subjectId: row.dispatchId,
+      disposition: "preserved_dispatched" });
   }
 
   const counts = database.prepare(
