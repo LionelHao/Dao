@@ -28,7 +28,6 @@ import {
 } from "../../desktop/src/identity/websocket-client.js";
 import { createScryptIdentityAdapter, MAX_ACTIVE_SESSION_FAMILIES } from "./auth.js";
 import {
-  startAuthoritativeServer,
   startAuthoritativeServerForTest,
   type AuthoritativeServer,
 } from "./authoritative-server.js";
@@ -3425,7 +3424,8 @@ describe("authoritative server real-process harness", () => {
     let server: AuthoritativeServer | undefined;
 
     try {
-      server = await startAuthoritativeServer(serverOptions);
+      server = await startAuthoritativeServerForTest(
+        serverOptions, { toolAdapterPathFallbackForTest: true });
       const controllerA = createIdentitySessionController({
         vault: profileA.vault,
         deviceIdentity: createMemoryDevice("installation-a", "FT01 Device A"),
@@ -3588,7 +3588,8 @@ describe("authoritative server real-process harness", () => {
         database.close();
       }
 
-      server = await startAuthoritativeServer(serverOptions);
+      server = await startAuthoritativeServerForTest(
+        serverOptions, { toolAdapterPathFallbackForTest: true });
       const restoredA = createIdentitySessionController({
         vault: profileA.vault,
         deviceIdentity: createMemoryDevice("installation-a", "FT01 Device A"),

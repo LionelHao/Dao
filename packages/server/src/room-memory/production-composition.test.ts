@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { startAuthoritativeServer, type AuthoritativeServer } from "../authoritative-server.js";
+import { startAuthoritativeServerForTest, type AuthoritativeServer } from "../authoritative-server.js";
 import { insertLegacyMessageAuthorityRecord } from "../persistence/message-authority-legacy-adapter.js";
 import { migrateAuthorityDatabase } from "../persistence/schema.js";
 import { registerMemoryCorpusSource } from "./corpus-database-authority.js";
@@ -66,7 +66,7 @@ describe("FT-05 production composition sentinel", () => {
     vi.stubEnv("OPENAI_API_KEY", "");
     const fetch = vi.fn<typeof globalThis.fetch>();
     vi.stubGlobal("fetch", fetch);
-    server = await startAuthoritativeServer({
+    server = await startAuthoritativeServerForTest({
       databasePath,
       snapshotCachePath: join(directory, "snapshot-cache.sqlite"),
       listen: { host: "127.0.0.1", port: 0 },
@@ -75,7 +75,7 @@ describe("FT-05 production composition sentinel", () => {
       invitationSecretKey: new Uint8Array(32).fill(23),
       sharedAuthority: { maxOfflineReadLeaseMs: 60_000 },
       agentRuntime: { sandboxRoot: join(directory, "agent-sandbox") },
-    });
+    }, { toolAdapterPathFallbackForTest: true });
 
     await vi.waitFor(() => {
       const inspection = new DatabaseSync(databasePath, { readOnly: true });
