@@ -157,17 +157,17 @@ describe("authority SQLite v19 Context Snapshot Authority", () => {
   it("upgrades fresh and every immutable v1-v18 schema and restarts idempotently", () => {
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(25);
-      expect(readSchemaVersion(database)).toBe(25);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(26);
+      expect(readSchemaVersion(database)).toBe(26);
       expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get())
-        .toEqual({ count: 25 });
+        .toEqual({ count: 26 });
       expect(() => migrateAuthorityDatabase(database)).not.toThrow();
     });
     for (let version = 1; version <= 18; version += 1) {
       withDatabase((database) => {
         migrateAuthorityDatabaseToHistoricalVersionForTest(database, version);
         migrateAuthorityDatabase(database);
-        expect(readSchemaVersion(database)).toBe(25);
+        expect(readSchemaVersion(database)).toBe(26);
       });
     }
   }, 120_000);
@@ -230,7 +230,7 @@ describe("authority SQLite v19 Context Snapshot Authority", () => {
 
   it("refuses future, history, and physical v19 tamper", () => {
     withDatabase((database) => {
-      database.exec("PRAGMA user_version = 26");
+      database.exec("PRAGMA user_version = 27");
       expect(() => migrateAuthorityDatabase(database)).toThrow(/future schema/i);
     });
     withDatabase((database) => {

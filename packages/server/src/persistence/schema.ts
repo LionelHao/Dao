@@ -7,7 +7,7 @@ import {
 } from "../access/room-cache-invalidation-port.js";
 import { OFFLINE_READ_LEASE_SCHEMA_STATEMENTS } from "../access/offline-lease-invalidation-port.js";
 
-export const AUTHORITY_SCHEMA_VERSION = 25 as const;
+export const AUTHORITY_SCHEMA_VERSION = 26 as const;
 
 export interface MigrationFaultOptions {
   readonly failAfterStatement?: number;
@@ -77,6 +77,7 @@ const SCHEMA_FINGERPRINTS = {
   23: "532b7c0589c5ae2f4cb96c43747b19e3a7c83c2f04fd9fea663191ea5a46aced",
   24: "ef4c3593ee4384350f57c1f92e6d229c523b4c99817f95222718c4abe10db896",
   25: "e0cd0a610c4777209877535e0d5651498984681bf9b3c3f825724f4946191815",
+  26: "a5c6c02245dfab5a054e5035898f6a81ee805424901bb57ff96eb8eeac74f6cb",
 } as const;
 
 const V1_STATEMENTS = [
@@ -8694,6 +8695,780 @@ export const AUTHORITY_V25_MIGRATION_CHECKSUM_FOR_TEST = migrationChecksum(
   25, "project-transition-authority", V25_STATEMENTS,
 );
 
+const V26_STATEMENTS = [
+  `DROP TRIGGER agent_profiles_v20_validate_update`,
+  `DROP TRIGGER room_agent_assignments_v20_validate_update`,
+  `DROP TRIGGER room_agent_assignments_authority_update_v14`,
+  `DROP TRIGGER agent_profiles_ceiling_update_v14`,
+  `DROP TRIGGER agent_profile_revisions_v20_immutable_update`,
+  `DROP TRIGGER room_agent_assignment_revisions_v20_immutable_update`,
+  `DROP TRIGGER deployment_agent_profile_repair_v20_validate_update`,
+  `DROP TRIGGER deployment_agent_profile_events_v20_immutable_update`,
+  `DROP TRIGGER events_prevent_update`,
+  `UPDATE agent_profiles
+   SET capability_ceiling_json = COALESCE((
+         SELECT json_group_array(value) FROM (
+           SELECT DISTINCT value FROM json_each(agent_profiles.capability_ceiling_json)
+           UNION SELECT 'room.memory.read'
+             WHERE EXISTS (SELECT 1 FROM json_each(agent_profiles.tool_ceiling_json)
+                           WHERE value = 'room-memory.read')
+           ORDER BY value
+         )
+       ), '[]'),
+       tool_ceiling_json = COALESCE((
+         SELECT json_group_array(value) FROM (
+           SELECT DISTINCT value FROM json_each(agent_profiles.tool_ceiling_json)
+           WHERE value <> 'room-memory.read' ORDER BY value
+         )
+       ), '[]')
+   WHERE EXISTS (SELECT 1 FROM json_each(tool_ceiling_json)
+                 WHERE value = 'room-memory.read')`,
+  `UPDATE agent_profile_revisions
+   SET capability_ceiling_json = COALESCE((
+         SELECT json_group_array(value) FROM (
+           SELECT DISTINCT value FROM json_each(agent_profile_revisions.capability_ceiling_json)
+           UNION SELECT 'room.memory.read'
+           ORDER BY value
+         )
+       ), '[]'),
+       tool_ceiling_json = COALESCE((
+         SELECT json_group_array(value) FROM (
+           SELECT DISTINCT value FROM json_each(agent_profile_revisions.tool_ceiling_json)
+           WHERE value <> 'room-memory.read' ORDER BY value
+         )
+       ), '[]')
+   WHERE EXISTS (SELECT 1 FROM json_each(tool_ceiling_json)
+                 WHERE value = 'room-memory.read')`,
+  `UPDATE room_agent_assignments
+   SET capability_subset_json = COALESCE((
+         SELECT json_group_array(value) FROM (
+           SELECT DISTINCT value FROM json_each(room_agent_assignments.capability_subset_json)
+           UNION SELECT 'room.memory.read'
+             WHERE EXISTS (SELECT 1 FROM json_each(room_agent_assignments.tool_subset_json)
+                           WHERE value = 'room-memory.read')
+           ORDER BY value
+         )
+       ), '[]'),
+       tool_subset_json = COALESCE((
+         SELECT json_group_array(value) FROM (
+           SELECT DISTINCT value FROM json_each(room_agent_assignments.tool_subset_json)
+           WHERE value <> 'room-memory.read' ORDER BY value
+         )
+       ), '[]')
+   WHERE EXISTS (SELECT 1 FROM json_each(tool_subset_json)
+                 WHERE value = 'room-memory.read')`,
+  `UPDATE room_agent_assignment_revisions
+   SET capability_subset_json = COALESCE((
+         SELECT json_group_array(value) FROM (
+           SELECT DISTINCT value FROM json_each(room_agent_assignment_revisions.capability_subset_json)
+           UNION SELECT 'room.memory.read'
+           ORDER BY value
+         )
+       ), '[]'),
+       tool_subset_json = COALESCE((
+         SELECT json_group_array(value) FROM (
+           SELECT DISTINCT value FROM json_each(room_agent_assignment_revisions.tool_subset_json)
+           WHERE value <> 'room-memory.read' ORDER BY value
+         )
+       ), '[]')
+   WHERE EXISTS (SELECT 1 FROM json_each(tool_subset_json)
+                 WHERE value = 'room-memory.read')`,
+  `UPDATE actors SET tool_permissions_json = COALESCE((
+     SELECT json_group_array(value) FROM (
+       SELECT DISTINCT value FROM json_each(actors.tool_permissions_json)
+       WHERE value <> 'room-memory.read' ORDER BY value
+     )
+   ), '[]') WHERE kind = 'agent' AND EXISTS (
+     SELECT 1 FROM json_each(tool_permissions_json) WHERE value = 'room-memory.read'
+   )`,
+  `UPDATE room_memberships SET tool_permissions_json = COALESCE((
+     SELECT json_group_array(value) FROM (
+       SELECT DISTINCT value FROM json_each(room_memberships.tool_permissions_json)
+       WHERE value <> 'room-memory.read' ORDER BY value
+     )
+   ), '[]') WHERE kind = 'agent' AND EXISTS (
+     SELECT 1 FROM json_each(tool_permissions_json) WHERE value = 'room-memory.read'
+   )`,
+  `UPDATE deployment_agent_profile_repair_records AS repair
+   SET projection_json = json_set(
+     repair.projection_json,
+     '$.capabilityCeiling', json((SELECT revision.capability_ceiling_json
+       FROM agent_profile_revisions AS revision
+       WHERE revision.profile_id = repair.profile_id
+         AND revision.revision = repair.profile_revision)),
+     '$.toolCeiling', json((SELECT revision.tool_ceiling_json
+       FROM agent_profile_revisions AS revision
+       WHERE revision.profile_id = repair.profile_id
+         AND revision.revision = repair.profile_revision))
+   )`,
+  `UPDATE deployment_agent_profile_repair_records
+   SET projection_sha256 = dao_migration_sha256(projection_json)`,
+  `UPDATE deployment_agent_profile_events AS event
+   SET payload_json = json_set(
+     event.payload_json,
+     '$.profile.capabilityCeiling', json((SELECT revision.capability_ceiling_json
+       FROM agent_profile_revisions AS revision
+       WHERE revision.profile_id = event.profile_id
+         AND revision.revision = event.profile_revision)),
+     '$.profile.toolCeiling', json((SELECT revision.tool_ceiling_json
+       FROM agent_profile_revisions AS revision
+       WHERE revision.profile_id = event.profile_id
+         AND revision.revision = event.profile_revision))
+   )`,
+  `UPDATE deployment_agent_profile_events
+   SET payload_sha256 = dao_migration_sha256(payload_json)`,
+  `UPDATE events SET payload_json = json_set(
+     payload_json,
+     '$.assignment.capabilityCeiling', json(COALESCE((
+       SELECT json_group_array(value) FROM (
+         SELECT DISTINCT value FROM json_each(json_extract(events.payload_json, '$.assignment.capabilityCeiling'))
+         UNION SELECT 'room.memory.read' WHERE EXISTS (
+           SELECT 1 FROM json_each(json_extract(events.payload_json, '$.assignment.toolCeiling'))
+           WHERE value = 'room-memory.read'
+         ) ORDER BY value
+       )
+     ), '[]')),
+     '$.assignment.capabilitySubset', json(COALESCE((
+       SELECT json_group_array(value) FROM (
+         SELECT DISTINCT value FROM json_each(json_extract(events.payload_json, '$.assignment.capabilitySubset'))
+         UNION SELECT 'room.memory.read' WHERE EXISTS (
+           SELECT 1 FROM json_each(json_extract(events.payload_json, '$.assignment.toolSubset'))
+           WHERE value = 'room-memory.read'
+         ) ORDER BY value
+       )
+     ), '[]')),
+     '$.assignment.effectiveCapabilities', json(COALESCE((
+       SELECT json_group_array(value) FROM (
+         SELECT DISTINCT value FROM json_each(json_extract(events.payload_json, '$.assignment.effectiveCapabilities'))
+         UNION SELECT 'room.memory.read' WHERE EXISTS (
+           SELECT 1 FROM json_each(json_extract(events.payload_json, '$.assignment.effectiveTools'))
+           WHERE value = 'room-memory.read'
+         ) ORDER BY value
+       )
+     ), '[]')),
+     '$.assignment.toolCeiling', json(COALESCE((SELECT json_group_array(value) FROM (
+       SELECT DISTINCT value FROM json_each(json_extract(events.payload_json, '$.assignment.toolCeiling'))
+       WHERE value <> 'room-memory.read' ORDER BY value
+     )), '[]')),
+     '$.assignment.toolSubset', json(COALESCE((SELECT json_group_array(value) FROM (
+       SELECT DISTINCT value FROM json_each(json_extract(events.payload_json, '$.assignment.toolSubset'))
+       WHERE value <> 'room-memory.read' ORDER BY value
+     )), '[]')),
+     '$.assignment.effectiveTools', json(COALESCE((SELECT json_group_array(value) FROM (
+       SELECT DISTINCT value FROM json_each(json_extract(events.payload_json, '$.assignment.effectiveTools'))
+       WHERE value <> 'room-memory.read' ORDER BY value
+     )), '[]'))
+   ) WHERE event_type = 'room.agent-assignment.changed'
+     AND json_type(payload_json, '$.assignment') = 'object'`,
+  `CREATE TRIGGER agent_profile_revisions_v20_immutable_update
+   BEFORE UPDATE ON agent_profile_revisions
+   BEGIN SELECT RAISE(ABORT, 'Agent Profile revisions are immutable'); END`,
+  `CREATE TRIGGER room_agent_assignment_revisions_v20_immutable_update
+   BEFORE UPDATE ON room_agent_assignment_revisions
+   BEGIN SELECT RAISE(ABORT, 'Room Assignment revisions are immutable'); END`,
+  `CREATE TRIGGER deployment_agent_profile_events_v20_immutable_update
+   BEFORE UPDATE ON deployment_agent_profile_events
+   BEGIN SELECT RAISE(ABORT, 'Deployment Profile event is immutable'); END`,
+  `CREATE TRIGGER deployment_agent_profile_repair_v20_validate_update
+   BEFORE UPDATE ON deployment_agent_profile_repair_records
+   WHEN NEW.profile_id <> OLD.profile_id OR NEW.record_version <> OLD.record_version
+      OR NEW.profile_revision <= OLD.profile_revision OR NEW.stream_seq <= OLD.stream_seq
+      OR NOT EXISTS (
+        SELECT 1 FROM deployment_agent_profile_events AS event
+        JOIN agent_profiles AS profile ON profile.id = event.profile_id
+        WHERE event.event_id = NEW.event_id AND event.stream_seq = NEW.stream_seq
+          AND event.profile_id = NEW.profile_id
+          AND event.profile_revision = NEW.profile_revision
+          AND profile.revision = NEW.profile_revision
+      )
+      OR COALESCE(json_extract(NEW.projection_json, '$.profileId'), '') <> NEW.profile_id
+      OR COALESCE(json_extract(NEW.projection_json, '$.revision'), 0) <> NEW.profile_revision
+      OR EXISTS (
+        SELECT 1 FROM json_tree(NEW.projection_json)
+        WHERE lower(COALESCE(key, '')) IN (
+          'roomid', 'roomname', 'message', 'messages', 'member', 'members',
+          'goal', 'ball', 'assignment', 'secret', 'secretvalue', 'credential',
+          'apikey', 'authorization', 'token'
+        )
+      )
+   BEGIN SELECT RAISE(ABORT, 'Deployment Profile repair transition is invalid'); END`,
+  `CREATE TRIGGER events_prevent_update BEFORE UPDATE ON events
+   BEGIN SELECT RAISE(ABORT, 'events are immutable'); END`,
+  `CREATE TRIGGER agent_profiles_v20_validate_update
+   BEFORE UPDATE ON agent_profiles
+   WHEN NEW.id <> OLD.id OR NEW.actor_id <> OLD.actor_id
+      OR NEW.created_at <> OLD.created_at
+      OR (NEW.source_kind <> OLD.source_kind AND NOT (
+        OLD.source_kind IN ('legacy_v20_migration', 'static_bootstrap')
+        AND NEW.source_kind = 'administrator_command'
+      ))
+      OR NEW.revision <> OLD.revision + 1
+      OR EXISTS (
+        SELECT 1 FROM json_each(NEW.capability_ceiling_json)
+        WHERE typeof(value) <> 'text' OR value NOT IN (
+          'room.conversation.read', 'room.memory.read', 'room.project.read', 'room.respond'
+        )
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(NEW.tool_ceiling_json)
+        WHERE typeof(value) <> 'text' OR value NOT IN (
+          'http-json.read', 'repository.git-status', 'room-memory.read', 'sandbox-file.write'
+        )
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(NEW.capability_ceiling_json) AS entry
+        JOIN json_each(NEW.capability_ceiling_json) AS successor
+          ON CAST(successor.key AS INTEGER) = CAST(entry.key AS INTEGER) + 1
+        WHERE entry.value >= successor.value
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(NEW.tool_ceiling_json) AS entry
+        JOIN json_each(NEW.tool_ceiling_json) AS successor
+          ON CAST(successor.key AS INTEGER) = CAST(entry.key AS INTEGER) + 1
+        WHERE entry.value >= successor.value
+      )
+   BEGIN SELECT RAISE(ABORT, 'Agent Profile transition or authority set is invalid'); END`,
+  `CREATE TRIGGER room_agent_assignments_v20_validate_update
+   BEFORE UPDATE ON room_agent_assignments
+   WHEN NEW.id <> OLD.id OR NEW.room_id <> OLD.room_id
+      OR NEW.profile_id <> OLD.profile_id OR NEW.agent_actor_id <> OLD.agent_actor_id
+      OR NEW.created_at <> OLD.created_at
+      OR (NEW.source_kind <> OLD.source_kind AND NOT (
+        OLD.source_kind IN ('legacy_v20_migration', 'static_bootstrap')
+        AND NEW.source_kind = 'room_command'
+      ))
+      OR NEW.revision <> OLD.revision + 1 OR OLD.status = 'removed'
+      OR (NEW.status = 'removed' AND (NEW.paused <> 1 OR NEW.removed_at IS NULL))
+      OR (NEW.status = 'current' AND NEW.removed_at IS NOT NULL)
+      OR EXISTS (
+        SELECT 1 FROM json_each(NEW.capability_subset_json)
+        WHERE typeof(value) <> 'text' OR value NOT IN (
+          'room.conversation.read', 'room.memory.read', 'room.project.read', 'room.respond'
+        )
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(NEW.tool_subset_json)
+        WHERE typeof(value) <> 'text' OR value NOT IN (
+          'http-json.read', 'repository.git-status', 'room-memory.read', 'sandbox-file.write'
+        )
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(NEW.capability_subset_json) AS entry
+        JOIN json_each(NEW.capability_subset_json) AS successor
+          ON CAST(successor.key AS INTEGER) = CAST(entry.key AS INTEGER) + 1
+        WHERE entry.value >= successor.value
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(NEW.tool_subset_json) AS entry
+        JOIN json_each(NEW.tool_subset_json) AS successor
+          ON CAST(successor.key AS INTEGER) = CAST(entry.key AS INTEGER) + 1
+        WHERE entry.value >= successor.value
+      )
+   BEGIN SELECT RAISE(ABORT, 'Room Assignment transition or authority set is invalid'); END`,
+  `CREATE TRIGGER room_agent_assignments_authority_update_v14
+   BEFORE UPDATE OF profile_id, agent_actor_id, capability_subset_json, tool_subset_json
+     ON room_agent_assignments
+   WHEN COALESCE((SELECT kind FROM actors WHERE id = NEW.agent_actor_id), '') <> 'agent'
+     OR COALESCE((SELECT actor_id FROM agent_profiles WHERE id = NEW.profile_id), '')
+       <> NEW.agent_actor_id
+     OR EXISTS (
+       SELECT value FROM json_each(NEW.capability_subset_json)
+       EXCEPT SELECT value FROM json_each((
+         SELECT capability_ceiling_json FROM agent_profiles WHERE id = NEW.profile_id
+       ))
+     )
+     OR EXISTS (
+       SELECT value FROM json_each(NEW.tool_subset_json)
+       EXCEPT SELECT value FROM json_each((
+         SELECT tool_ceiling_json FROM agent_profiles WHERE id = NEW.profile_id
+       ))
+     )
+   BEGIN
+     SELECT RAISE(ABORT, 'Room Assignment exceeds its Agent Profile authority');
+   END`,
+  `CREATE TRIGGER agent_profiles_ceiling_update_v14
+   BEFORE UPDATE OF actor_id, capability_ceiling_json, tool_ceiling_json ON agent_profiles
+   WHEN EXISTS (
+     SELECT 1 FROM room_agent_assignments AS assignment
+     WHERE assignment.profile_id = OLD.id AND assignment.status = 'current'
+       AND (
+         assignment.agent_actor_id <> NEW.actor_id
+         OR EXISTS (
+           SELECT value FROM json_each(assignment.capability_subset_json)
+           EXCEPT SELECT value FROM json_each(NEW.capability_ceiling_json)
+         )
+         OR EXISTS (
+           SELECT value FROM json_each(assignment.tool_subset_json)
+           EXCEPT SELECT value FROM json_each(NEW.tool_ceiling_json)
+         )
+       )
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'Agent Profile update would exceed current Room Assignment authority');
+   END`,
+  `CREATE TRIGGER agent_profiles_v26_external_tools_insert
+   BEFORE INSERT ON agent_profiles WHEN EXISTS (
+     SELECT 1 FROM json_each(NEW.tool_ceiling_json)
+     WHERE typeof(value) <> 'text' OR value NOT IN (
+       'http-json.read','repository.git-status','sandbox-file.write'
+     )
+   ) BEGIN SELECT RAISE(ABORT, 'Agent Profile external tool ceiling is invalid'); END`,
+  `CREATE TRIGGER agent_profiles_v26_external_tools_update
+   BEFORE UPDATE OF tool_ceiling_json ON agent_profiles WHEN EXISTS (
+     SELECT 1 FROM json_each(NEW.tool_ceiling_json)
+     WHERE typeof(value) <> 'text' OR value NOT IN (
+       'http-json.read','repository.git-status','sandbox-file.write'
+     )
+   ) BEGIN SELECT RAISE(ABORT, 'Agent Profile external tool ceiling is invalid'); END`,
+  `CREATE TRIGGER room_assignments_v26_external_tools_insert
+   BEFORE INSERT ON room_agent_assignments WHEN EXISTS (
+     SELECT 1 FROM json_each(NEW.tool_subset_json)
+     WHERE typeof(value) <> 'text' OR value NOT IN (
+       'http-json.read','repository.git-status','sandbox-file.write'
+     )
+   ) BEGIN SELECT RAISE(ABORT, 'Room Assignment external tool subset is invalid'); END`,
+  `CREATE TRIGGER room_assignments_v26_external_tools_update
+   BEFORE UPDATE OF tool_subset_json ON room_agent_assignments WHEN EXISTS (
+     SELECT 1 FROM json_each(NEW.tool_subset_json)
+     WHERE typeof(value) <> 'text' OR value NOT IN (
+       'http-json.read','repository.git-status','sandbox-file.write'
+     )
+   ) BEGIN SELECT RAISE(ABORT, 'Room Assignment external tool subset is invalid'); END`,
+  `CREATE TABLE tool_calls_v2 (
+    tool_call_id TEXT PRIMARY KEY CHECK (length(trim(tool_call_id)) BETWEEN 1 AND 192),
+    invocation_id TEXT NOT NULL CHECK (length(trim(invocation_id)) BETWEEN 1 AND 192),
+    execution_id TEXT NOT NULL REFERENCES agent_executions(id),
+    attempt_seq INTEGER NOT NULL CHECK (attempt_seq > 0),
+    execution_version INTEGER NOT NULL CHECK (execution_version > 0),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    agent_id TEXT NOT NULL REFERENCES actors(id),
+    tool_id TEXT NOT NULL CHECK (tool_id IN (
+      'http-json.read','repository.git-status','sandbox-file.write'
+    )),
+    canonical_parameter_sha256 TEXT NOT NULL CHECK (
+      length(canonical_parameter_sha256) = 64
+      AND canonical_parameter_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    parameter_schema_version TEXT NOT NULL CHECK (
+      length(trim(parameter_schema_version)) BETWEEN 1 AND 96
+    ),
+    canonicalizer_version TEXT NOT NULL CHECK (length(trim(canonicalizer_version)) BETWEEN 1 AND 64),
+    source_snapshot_id TEXT NOT NULL CHECK (length(trim(source_snapshot_id)) BETWEEN 1 AND 192),
+    profile_revision INTEGER NOT NULL CHECK (profile_revision >= 0),
+    assignment_revision INTEGER NOT NULL CHECK (assignment_revision >= 0),
+    access_revision INTEGER NOT NULL CHECK (access_revision >= 0),
+    safe_preview_json TEXT NOT NULL CHECK (
+      json_valid(safe_preview_json) AND json_type(safe_preview_json) = 'object'
+      AND length(CAST(safe_preview_json AS BLOB)) <= 8192
+    ),
+    sealed_payload_ciphertext TEXT,
+    sealed_payload_key_version TEXT,
+    sealed_payload_expires_at TEXT,
+    binding_generation INTEGER NOT NULL DEFAULT 1 CHECK (binding_generation > 0),
+    current_version INTEGER NOT NULL DEFAULT 1 CHECK (current_version > 0),
+    created_at TEXT NOT NULL,
+    legacy_origin TEXT CHECK (legacy_origin IN ('v6','stage12')),
+    UNIQUE (execution_id, attempt_seq, tool_call_id),
+    CHECK ((sealed_payload_ciphertext IS NULL AND sealed_payload_key_version IS NULL
+      AND sealed_payload_expires_at IS NULL) OR (tool_id = 'sandbox-file.write'
+      AND sealed_payload_ciphertext IS NOT NULL AND sealed_payload_key_version IS NOT NULL
+      AND sealed_payload_expires_at IS NOT NULL)),
+    FOREIGN KEY (execution_id, attempt_seq)
+      REFERENCES agent_execution_attempts(execution_id, attempt_seq)
+  ) STRICT`,
+  `CREATE TABLE tool_confirmations_v2 (
+    confirmation_id TEXT PRIMARY KEY,
+    tool_call_id TEXT NOT NULL UNIQUE REFERENCES tool_calls_v2(tool_call_id),
+    principal_human_actor_id TEXT NOT NULL REFERENCES actors(id),
+    session_family_id TEXT NOT NULL,
+    binding_generation INTEGER NOT NULL CHECK (binding_generation > 0),
+    state TEXT NOT NULL CHECK (state IN ('pending','confirmed','rejected','expired')),
+    reason TEXT,
+    expires_at TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK (version > 0),
+    created_at TEXT NOT NULL,
+    changed_at TEXT NOT NULL
+  ) STRICT`,
+  `CREATE TABLE tool_confirmation_decisions_v2 (
+    decision_id TEXT PRIMARY KEY,
+    confirmation_id TEXT NOT NULL REFERENCES tool_confirmations_v2(confirmation_id),
+    tool_call_id TEXT NOT NULL REFERENCES tool_calls_v2(tool_call_id),
+    binding_generation INTEGER NOT NULL CHECK (binding_generation > 0),
+    principal_human_actor_id TEXT NOT NULL REFERENCES actors(id),
+    session_family_id TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK (decision IN ('confirmed','rejected','expired')),
+    reason TEXT,
+    decision_version INTEGER NOT NULL CHECK (decision_version > 0),
+    decided_at TEXT NOT NULL,
+    UNIQUE (confirmation_id, binding_generation)
+  ) STRICT`,
+  `CREATE TABLE tool_confirmation_handoffs_v2 (
+    handoff_id TEXT PRIMARY KEY,
+    confirmation_id TEXT NOT NULL REFERENCES tool_confirmations_v2(confirmation_id),
+    from_binding_generation INTEGER NOT NULL CHECK (from_binding_generation > 0),
+    to_binding_generation INTEGER NOT NULL CHECK (to_binding_generation = from_binding_generation + 1),
+    from_principal_human_actor_id TEXT NOT NULL REFERENCES actors(id),
+    to_principal_human_actor_id TEXT NOT NULL REFERENCES actors(id),
+    offered_by_human_actor_id TEXT NOT NULL REFERENCES actors(id),
+    accepted_by_human_actor_id TEXT REFERENCES actors(id),
+    state TEXT NOT NULL CHECK (state IN ('offered','accepted','rejected','expired')),
+    offered_at TEXT NOT NULL,
+    resolved_at TEXT,
+    UNIQUE (confirmation_id, from_binding_generation)
+  ) STRICT`,
+  `CREATE TABLE tool_grants_v2 (
+    grant_id TEXT PRIMARY KEY,
+    tool_call_id TEXT NOT NULL UNIQUE REFERENCES tool_calls_v2(tool_call_id),
+    confirmation_id TEXT REFERENCES tool_confirmations_v2(confirmation_id),
+    state TEXT NOT NULL CHECK (state IN ('active','claimed','revoked','expired')),
+    reason TEXT,
+    issued_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    claimed_at TEXT,
+    version INTEGER NOT NULL CHECK (version > 0),
+    changed_at TEXT NOT NULL,
+    CHECK ((state = 'claimed' AND claimed_at IS NOT NULL)
+      OR (state <> 'claimed' AND claimed_at IS NULL))
+  ) STRICT`,
+  `CREATE TABLE tool_grant_transitions_v2 (
+    transition_id TEXT PRIMARY KEY,
+    grant_id TEXT NOT NULL REFERENCES tool_grants_v2(grant_id),
+    from_state TEXT CHECK (from_state IN ('active','claimed','revoked','expired')),
+    to_state TEXT NOT NULL CHECK (to_state IN ('active','claimed','revoked','expired')),
+    reason TEXT,
+    transition_version INTEGER NOT NULL CHECK (transition_version > 0),
+    occurred_at TEXT NOT NULL,
+    UNIQUE (grant_id, transition_version)
+  ) STRICT`,
+  `CREATE TABLE tool_dispatches_v2 (
+    dispatch_id TEXT PRIMARY KEY,
+    tool_call_id TEXT NOT NULL UNIQUE REFERENCES tool_calls_v2(tool_call_id),
+    grant_id TEXT NOT NULL UNIQUE REFERENCES tool_grants_v2(grant_id),
+    state TEXT NOT NULL CHECK (state IN (
+      'prepared','claimed','dispatched','known_succeeded','known_failed','outcome_unknown','reviewed'
+    )),
+    reason TEXT,
+    safe_summary_json TEXT CHECK (safe_summary_json IS NULL OR (
+      json_valid(safe_summary_json) AND json_type(safe_summary_json) = 'object'
+      AND length(CAST(safe_summary_json AS BLOB)) <= 8192
+    )),
+    sealed_compensation_ciphertext TEXT,
+    prepared_at TEXT NOT NULL,
+    claimed_at TEXT,
+    dispatched_at TEXT,
+    settled_at TEXT,
+    version INTEGER NOT NULL CHECK (version > 0),
+    changed_at TEXT NOT NULL,
+    CHECK (state = 'prepared' OR claimed_at IS NOT NULL),
+    CHECK (state NOT IN ('dispatched','known_succeeded','known_failed','outcome_unknown','reviewed')
+      OR dispatched_at IS NOT NULL)
+  ) STRICT`,
+  `CREATE TABLE tool_dispatch_transitions_v2 (
+    transition_id TEXT PRIMARY KEY,
+    dispatch_id TEXT NOT NULL REFERENCES tool_dispatches_v2(dispatch_id),
+    from_state TEXT CHECK (from_state IN (
+      'prepared','claimed','dispatched','known_succeeded','known_failed','outcome_unknown','reviewed'
+    )),
+    to_state TEXT NOT NULL CHECK (to_state IN (
+      'prepared','claimed','dispatched','known_succeeded','known_failed','outcome_unknown','reviewed'
+    )),
+    reason TEXT,
+    safe_summary_sha256 TEXT CHECK (safe_summary_sha256 IS NULL OR length(safe_summary_sha256) = 64),
+    transition_version INTEGER NOT NULL CHECK (transition_version > 0),
+    occurred_at TEXT NOT NULL,
+    UNIQUE (dispatch_id, transition_version)
+  ) STRICT`,
+  `CREATE TABLE tool_reviews_v2 (
+    review_id TEXT PRIMARY KEY,
+    dispatch_id TEXT NOT NULL UNIQUE REFERENCES tool_dispatches_v2(dispatch_id),
+    principal_human_actor_id TEXT NOT NULL REFERENCES actors(id),
+    resolution TEXT NOT NULL CHECK (resolution IN (
+      'known_succeeded','known_failed','compensated','accepted_risk'
+    )),
+    evidence_summary TEXT NOT NULL CHECK (length(CAST(evidence_summary AS BLOB)) <= 8192),
+    evidence_sha256 TEXT NOT NULL CHECK (length(evidence_sha256) = 64),
+    compensation_tool_call_id TEXT REFERENCES tool_calls_v2(tool_call_id),
+    version INTEGER NOT NULL CHECK (version > 0),
+    reviewed_at TEXT NOT NULL,
+    CHECK ((resolution = 'compensated' AND compensation_tool_call_id IS NOT NULL)
+      OR (resolution <> 'compensated' AND compensation_tool_call_id IS NULL))
+  ) STRICT`,
+  `CREATE TABLE tool_compensation_lineage_v2 (
+    lineage_id TEXT PRIMARY KEY,
+    original_dispatch_id TEXT NOT NULL REFERENCES tool_dispatches_v2(dispatch_id),
+    compensation_invocation_id TEXT NOT NULL,
+    compensation_execution_id TEXT NOT NULL REFERENCES agent_executions(id),
+    compensation_tool_call_id TEXT NOT NULL UNIQUE REFERENCES tool_calls_v2(tool_call_id),
+    proposed_by_human_actor_id TEXT NOT NULL REFERENCES actors(id),
+    profile_id TEXT NOT NULL REFERENCES agent_profiles(id),
+    profile_revision INTEGER NOT NULL CHECK (profile_revision > 0),
+    assignment_id TEXT NOT NULL REFERENCES room_agent_assignments(id),
+    assignment_revision INTEGER NOT NULL CHECK (assignment_revision > 0),
+    access_revision INTEGER NOT NULL CHECK (access_revision >= 0),
+    proposed_at TEXT NOT NULL,
+    UNIQUE (original_dispatch_id, compensation_execution_id),
+    CHECK (original_dispatch_id <> compensation_tool_call_id),
+    FOREIGN KEY (profile_id, profile_revision)
+      REFERENCES agent_profile_revisions(profile_id, revision),
+    FOREIGN KEY (assignment_id, assignment_revision)
+      REFERENCES room_agent_assignment_revisions(assignment_id, revision)
+  ) STRICT`,
+  `CREATE TABLE tool_safety_quarantine_v2 (
+    quarantine_id TEXT PRIMARY KEY,
+    legacy_subject_kind TEXT NOT NULL CHECK (legacy_subject_kind IN ('grant','confirmation','dispatch')),
+    legacy_subject_id TEXT NOT NULL,
+    execution_id TEXT NOT NULL REFERENCES agent_executions(id),
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    reason TEXT NOT NULL CHECK (reason IN ('legacy_needs_review','legacy_binding_corrupt')),
+    review_required INTEGER NOT NULL CHECK (review_required = 1),
+    quarantined_at TEXT NOT NULL,
+    UNIQUE (legacy_subject_kind, legacy_subject_id)
+  ) STRICT`,
+  `CREATE TABLE tool_safety_command_receipts_v2 (
+    principal_actor_id TEXT NOT NULL REFERENCES actors(id),
+    command_kind TEXT NOT NULL CHECK (command_kind IN (
+      'confirmation_decide','handoff_offer','handoff_accept','outcome_review','compensation_propose'
+    )),
+    idempotency_key TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+    response_json TEXT NOT NULL CHECK (json_valid(response_json)),
+    committed_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    PRIMARY KEY (principal_actor_id, command_kind, idempotency_key)
+  ) STRICT`,
+  `CREATE TABLE tool_safety_repair_records_v2 (
+    kind TEXT NOT NULL CHECK (kind IN (
+      'tool-call','tool-confirmation','tool-grant','tool-dispatch','tool-review','tool-handoff',
+      'tool-compensation','tool-quarantine'
+    )),
+    record_id TEXT NOT NULL,
+    room_id TEXT NOT NULL REFERENCES rooms(id),
+    stable_key TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK (version > 0),
+    projection_json TEXT NOT NULL CHECK (
+      json_valid(projection_json) AND json_type(projection_json) = 'object'
+      AND length(CAST(projection_json AS BLOB)) <= 8192
+    ),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (kind, record_id),
+    UNIQUE (room_id, stable_key)
+  ) STRICT`,
+  `INSERT INTO tool_calls_v2 (
+     tool_call_id, invocation_id, execution_id, attempt_seq, execution_version,
+     room_id, agent_id, tool_id, canonical_parameter_sha256,
+     parameter_schema_version, canonicalizer_version, source_snapshot_id,
+     profile_revision, assignment_revision, access_revision, safe_preview_json,
+     binding_generation, current_version, created_at, legacy_origin
+   ) SELECT 'legacy-tool-call:' || grant.grant_id,
+            COALESCE(intent.id, 'legacy-invocation:' || grant.execution_id),
+            grant.execution_id, grant.attempt_seq,
+            COALESCE(runtime.authority_version, 1), grant.room_id, grant.agent_id,
+            grant.tool_id, grant.parameter_sha256, 'legacy.parameters.v1', 'legacy.v1',
+            COALESCE(runtime.snapshot_id, 'legacy-snapshot:' || grant.execution_id),
+            COALESCE(binding.profile_revision, 0),
+            COALESCE(binding.assignment_revision, 0),
+            COALESCE(binding.access_revision, 0),
+            CASE WHEN confirmation.confirmation_id IS NULL
+              THEN json_object('toolId', grant.tool_id, 'legacy', 1)
+              ELSE json_object('toolId', grant.tool_id, 'target', confirmation.target,
+                'impact', confirmation.impact, 'reversibility', confirmation.reversibility,
+                'legacy', 1) END,
+            1, 1, grant.issued_at, 'v6'
+     FROM agent_execution_grants AS grant
+     LEFT JOIN agent_invocation_intents AS intent ON intent.execution_id = grant.execution_id
+     LEFT JOIN agent_execution_runtime_states AS runtime ON runtime.execution_id = grant.execution_id
+     LEFT JOIN direct_agent_invocation_authority_bindings AS binding
+       ON binding.intent_id = runtime.intent_id
+     LEFT JOIN tool_confirmations AS confirmation
+       ON confirmation.execution_id = grant.execution_id
+      AND confirmation.attempt_seq = grant.attempt_seq
+      AND confirmation.tool_id = grant.tool_id
+      AND confirmation.parameter_sha256 = grant.parameter_sha256
+     WHERE grant.tool_id IN (
+       'http-json.read','repository.git-status','sandbox-file.write'
+     )`,
+  `INSERT INTO tool_confirmations_v2 (
+     confirmation_id, tool_call_id, principal_human_actor_id, session_family_id,
+     binding_generation, state, reason, expires_at, version, created_at, changed_at
+   ) SELECT confirmation.confirmation_id, 'legacy-tool-call:' || grant.grant_id,
+            confirmation.human_principal_id, confirmation.session_family_id, 1,
+            CASE WHEN dispatch.dispatch_id IS NOT NULL THEN 'confirmed'
+              WHEN confirmation.confirmation_state = 'pending' THEN 'rejected'
+              ELSE confirmation.confirmation_state END,
+            CASE WHEN dispatch.dispatch_id IS NULL AND confirmation.confirmation_state = 'pending'
+              THEN 'legacy_unbound' ELSE confirmation.confirmation_reason END,
+            confirmation.expires_at, MAX(1, confirmation.confirmation_revision + 1),
+            COALESCE(confirmation.confirmation_changed_at, grant.issued_at),
+            COALESCE(confirmation.confirmation_changed_at, grant.issued_at)
+     FROM tool_confirmations AS confirmation
+     JOIN agent_execution_grants AS grant
+       ON grant.execution_id = confirmation.execution_id
+      AND grant.attempt_seq = confirmation.attempt_seq
+      AND grant.tool_id = confirmation.tool_id
+      AND grant.parameter_sha256 = confirmation.parameter_sha256
+     LEFT JOIN tool_dispatches AS dispatch ON dispatch.grant_id = grant.grant_id
+     WHERE grant.tool_id IN (
+       'http-json.read','repository.git-status','sandbox-file.write'
+     )`,
+  `INSERT INTO tool_confirmation_decisions_v2 (
+     decision_id, confirmation_id, tool_call_id, binding_generation,
+     principal_human_actor_id, session_family_id, decision, reason,
+     decision_version, decided_at
+   ) SELECT 'legacy-decision:' || confirmation.confirmation_id,
+            confirmation.confirmation_id, confirmation.tool_call_id, 1,
+            confirmation.principal_human_actor_id, confirmation.session_family_id,
+            confirmation.state, confirmation.reason, confirmation.version,
+            confirmation.changed_at
+     FROM tool_confirmations_v2 AS confirmation
+     WHERE confirmation.state <> 'pending'`,
+  `INSERT INTO tool_grants_v2 (
+     grant_id, tool_call_id, confirmation_id, state, reason, issued_at, expires_at,
+     claimed_at, version, changed_at
+   ) SELECT grant.grant_id, 'legacy-tool-call:' || grant.grant_id,
+            confirmation.confirmation_id,
+            CASE WHEN dispatch.dispatch_id IS NOT NULL THEN 'claimed'
+              WHEN grant.grant_state = 'claimed' THEN 'claimed'
+              WHEN grant.tool_id = 'sandbox-file.write' THEN 'revoked'
+              ELSE 'expired' END,
+            CASE WHEN dispatch.dispatch_id IS NULL AND grant.grant_state <> 'claimed'
+              THEN 'legacy_unbound' ELSE grant.grant_reason END,
+            grant.issued_at, grant.expires_at,
+            CASE WHEN dispatch.dispatch_id IS NOT NULL OR grant.grant_state = 'claimed'
+              THEN COALESCE(grant.consumed_at, dispatch.dispatched_at, grant.grant_changed_at)
+              ELSE NULL END,
+            MAX(1, grant.grant_revision + 1),
+            COALESCE(grant.grant_changed_at, grant.issued_at)
+     FROM agent_execution_grants AS grant
+     LEFT JOIN tool_confirmations_v2 AS confirmation
+       ON confirmation.tool_call_id = 'legacy-tool-call:' || grant.grant_id
+     LEFT JOIN tool_dispatches AS dispatch ON dispatch.grant_id = grant.grant_id
+     WHERE grant.tool_id IN (
+       'http-json.read','repository.git-status','sandbox-file.write'
+     )`,
+  `INSERT INTO tool_grant_transitions_v2 (
+     transition_id, grant_id, from_state, to_state, reason, transition_version, occurred_at
+   ) SELECT 'legacy-grant-transition:' || grant.grant_id, grant.grant_id, NULL,
+            grant.state, grant.reason, grant.version, grant.changed_at
+     FROM tool_grants_v2 AS grant`,
+  `INSERT INTO tool_dispatches_v2 (
+     dispatch_id, tool_call_id, grant_id, state, reason, safe_summary_json,
+     prepared_at, claimed_at, dispatched_at, settled_at, version, changed_at
+     ) SELECT dispatch.dispatch_id, 'legacy-tool-call:' || dispatch.grant_id,
+            dispatch.grant_id,
+            CASE dispatch.state WHEN 'succeeded' THEN 'known_succeeded'
+              WHEN 'failed' THEN 'known_failed' ELSE dispatch.state END,
+            CASE WHEN dispatch.state = 'outcome_unknown' THEN 'legacy_outcome_unknown' END,
+            dispatch.closed_summary_json, dispatch.dispatched_at, dispatch.dispatched_at,
+            dispatch.dispatched_at, dispatch.settled_at, 1,
+            COALESCE(dispatch.settled_at, dispatch.dispatched_at)
+     FROM tool_dispatches AS dispatch
+     JOIN agent_execution_grants AS grant ON grant.grant_id = dispatch.grant_id
+     WHERE grant.tool_id IN (
+       'http-json.read','repository.git-status','sandbox-file.write'
+     )`,
+  `INSERT INTO tool_dispatch_transitions_v2 (
+     transition_id, dispatch_id, from_state, to_state, reason,
+     safe_summary_sha256, transition_version, occurred_at
+   ) SELECT 'legacy-dispatch-transition:' || dispatch.dispatch_id, dispatch.dispatch_id,
+            NULL, dispatch.state, dispatch.reason,
+            NULL,
+            dispatch.version, dispatch.changed_at
+     FROM tool_dispatches_v2 AS dispatch`,
+  `INSERT INTO tool_safety_quarantine_v2 (
+     quarantine_id, legacy_subject_kind, legacy_subject_id, execution_id,
+     room_id, reason, review_required, quarantined_at
+   ) SELECT 'legacy-quarantine:' || grant.grant_id, 'grant', grant.grant_id,
+            grant.execution_id, grant.room_id, 'legacy_needs_review', 1,
+            COALESCE(grant.grant_changed_at, grant.issued_at)
+     FROM agent_execution_grants AS grant
+     LEFT JOIN tool_dispatches AS dispatch ON dispatch.grant_id = grant.grant_id
+     WHERE grant.grant_state = 'claimed' AND dispatch.dispatch_id IS NULL
+       AND grant.tool_id IN (
+         'http-json.read','repository.git-status','sandbox-file.write'
+       )`,
+  `INSERT INTO tool_safety_quarantine_v2 (
+     quarantine_id, legacy_subject_kind, legacy_subject_id, execution_id,
+     room_id, reason, review_required, quarantined_at
+   ) SELECT 'legacy-quarantine-unsupported:' || grant.grant_id, 'grant', grant.grant_id,
+            grant.execution_id, grant.room_id, 'legacy_binding_corrupt', 1,
+            COALESCE(grant.grant_changed_at, grant.issued_at)
+     FROM agent_execution_grants AS grant
+     WHERE grant.tool_id NOT IN (
+       'http-json.read','repository.git-status','sandbox-file.write'
+     )`,
+  `CREATE INDEX tool_calls_v2_execution ON tool_calls_v2(execution_id, attempt_seq, current_version)`,
+  `CREATE INDEX tool_confirmations_v2_room_state ON tool_confirmations_v2(state, expires_at, confirmation_id)`,
+  `CREATE INDEX tool_grants_v2_state_expiry ON tool_grants_v2(state, expires_at, grant_id)`,
+  `CREATE INDEX tool_dispatches_v2_state ON tool_dispatches_v2(state, changed_at, dispatch_id)`,
+  `CREATE INDEX tool_quarantine_v2_recovery ON tool_safety_quarantine_v2(review_required, quarantined_at, quarantine_id)`,
+  `CREATE TRIGGER tool_confirmations_v2_validate_family_insert
+   BEFORE INSERT ON tool_confirmations_v2
+   WHEN NOT EXISTS (
+     SELECT 1 FROM session_families AS family
+     WHERE family.family_id = NEW.session_family_id
+       AND family.actor_id = NEW.principal_human_actor_id
+   )
+   BEGIN SELECT RAISE(ABORT, 'tool confirmation session family binding is invalid'); END`,
+  `CREATE TRIGGER tool_confirmations_v2_binding_immutable
+   BEFORE UPDATE OF tool_call_id, created_at ON tool_confirmations_v2
+   BEGIN SELECT RAISE(ABORT, 'tool confirmation binding is immutable'); END`,
+  `CREATE TRIGGER tool_confirmations_v2_validate_family_update
+   BEFORE UPDATE OF principal_human_actor_id, session_family_id, binding_generation
+   ON tool_confirmations_v2
+   WHEN NOT EXISTS (
+     SELECT 1 FROM session_families AS family
+     WHERE family.family_id = NEW.session_family_id
+       AND family.actor_id = NEW.principal_human_actor_id
+   )
+   BEGIN SELECT RAISE(ABORT, 'tool confirmation session family binding is invalid'); END`,
+  `CREATE TRIGGER tool_grants_v2_validate_insert BEFORE INSERT ON tool_grants_v2
+   WHEN NOT EXISTS (
+     SELECT 1 FROM tool_calls_v2 AS call
+     WHERE call.tool_call_id = NEW.tool_call_id
+       AND ((call.tool_id = 'sandbox-file.write' AND NEW.confirmation_id IS NOT NULL)
+         OR (call.tool_id <> 'sandbox-file.write' AND NEW.confirmation_id IS NULL))
+   ) OR (NEW.confirmation_id IS NOT NULL AND NOT EXISTS (
+     SELECT 1 FROM tool_confirmations_v2 AS confirmation
+     WHERE confirmation.confirmation_id = NEW.confirmation_id
+       AND confirmation.tool_call_id = NEW.tool_call_id
+       AND confirmation.state = 'confirmed'
+   ))
+   BEGIN SELECT RAISE(ABORT, 'tool grant confirmation binding is invalid'); END`,
+  `CREATE TRIGGER tool_grants_v2_binding_immutable BEFORE UPDATE OF
+     tool_call_id, confirmation_id, issued_at, expires_at ON tool_grants_v2
+   BEGIN SELECT RAISE(ABORT, 'tool grant binding is immutable'); END`,
+  `CREATE TRIGGER tool_calls_v2_binding_immutable BEFORE UPDATE OF
+     invocation_id, execution_id, attempt_seq, execution_version, room_id, agent_id,
+     tool_id, canonical_parameter_sha256, parameter_schema_version,
+     canonicalizer_version, source_snapshot_id, profile_revision, assignment_revision,
+     access_revision, created_at ON tool_calls_v2
+   BEGIN SELECT RAISE(ABORT, 'tool call binding is immutable'); END`,
+  `CREATE TRIGGER tool_confirmation_decisions_v2_immutable_update
+   BEFORE UPDATE ON tool_confirmation_decisions_v2
+   BEGIN SELECT RAISE(ABORT, 'tool confirmation decision is immutable'); END`,
+  `CREATE TRIGGER tool_confirmation_decisions_v2_immutable_delete
+   BEFORE DELETE ON tool_confirmation_decisions_v2
+   BEGIN SELECT RAISE(ABORT, 'tool confirmation decision is immutable'); END`,
+  `CREATE TRIGGER tool_grant_transitions_v2_immutable_update
+   BEFORE UPDATE ON tool_grant_transitions_v2
+   BEGIN SELECT RAISE(ABORT, 'tool grant transition is immutable'); END`,
+  `CREATE TRIGGER tool_grant_transitions_v2_immutable_delete
+   BEFORE DELETE ON tool_grant_transitions_v2
+   BEGIN SELECT RAISE(ABORT, 'tool grant transition is immutable'); END`,
+  `CREATE TRIGGER tool_dispatch_transitions_v2_immutable_update
+   BEFORE UPDATE ON tool_dispatch_transitions_v2
+   BEGIN SELECT RAISE(ABORT, 'tool dispatch transition is immutable'); END`,
+  `CREATE TRIGGER tool_dispatch_transitions_v2_immutable_delete
+   BEFORE DELETE ON tool_dispatch_transitions_v2
+   BEGIN SELECT RAISE(ABORT, 'tool dispatch transition is immutable'); END`,
+  `CREATE TRIGGER tool_reviews_v2_immutable_update BEFORE UPDATE ON tool_reviews_v2
+   BEGIN SELECT RAISE(ABORT, 'tool review is immutable'); END`,
+  `CREATE TRIGGER tool_reviews_v2_immutable_delete BEFORE DELETE ON tool_reviews_v2
+   BEGIN SELECT RAISE(ABORT, 'tool review is immutable'); END`,
+] as const;
+
+export const AUTHORITY_V26_STATEMENT_COUNT_FOR_TEST = V26_STATEMENTS.length;
+export const AUTHORITY_V26_TRIGGER_INVARIANT_STATEMENT_COUNT_FOR_TEST =
+  V26_STATEMENTS.filter((statement) => statement.startsWith("CREATE TRIGGER ")).length;
+export const AUTHORITY_V26_ROLLBACK_ASSERTION_COUNT_FOR_TEST = V26_STATEMENTS.length;
+export const AUTHORITY_V26_MIGRATION_CHECKSUM_FOR_TEST = migrationChecksum(
+  26, "tool-safety-authority", V26_STATEMENTS,
+);
+
 export const AUTHORITY_V22_STATEMENT_COUNT_FOR_TEST = V22_STATEMENTS.length;
 export const AUTHORITY_V22_TRIGGER_INVARIANT_STATEMENT_COUNT_FOR_TEST =
   V22_STATEMENTS.filter((statement) => statement.startsWith("CREATE TRIGGER ")).length;
@@ -9161,6 +9936,7 @@ const MIGRATIONS = [
     V24_STATEMENTS,
   ),
   defineMigration(25, "project-transition-authority", V25_STATEMENTS),
+  defineMigration(26, "tool-safety-authority", V26_STATEMENTS),
 ] as const satisfies readonly Migration[];
 
 const V1_SCHEMA_CONTRACT = {
@@ -10141,6 +10917,69 @@ const V25_SCHEMA_CONTRACT = {
   ],
 } as const satisfies Readonly<Record<string, readonly string[]>>;
 
+const V26_SCHEMA_CONTRACT = {
+  ...V25_SCHEMA_CONTRACT,
+  tool_calls_v2: [
+    "tool_call_id", "invocation_id", "execution_id", "attempt_seq", "execution_version",
+    "room_id", "agent_id", "tool_id", "canonical_parameter_sha256",
+    "parameter_schema_version", "canonicalizer_version", "source_snapshot_id",
+    "profile_revision", "assignment_revision", "access_revision", "safe_preview_json",
+    "sealed_payload_ciphertext", "sealed_payload_key_version", "sealed_payload_expires_at",
+    "binding_generation", "current_version", "created_at", "legacy_origin",
+  ],
+  tool_confirmations_v2: [
+    "confirmation_id", "tool_call_id", "principal_human_actor_id", "session_family_id",
+    "binding_generation", "state", "reason", "expires_at", "version", "created_at", "changed_at",
+  ],
+  tool_confirmation_decisions_v2: [
+    "decision_id", "confirmation_id", "tool_call_id", "binding_generation",
+    "principal_human_actor_id", "session_family_id", "decision", "reason",
+    "decision_version", "decided_at",
+  ],
+  tool_confirmation_handoffs_v2: [
+    "handoff_id", "confirmation_id", "from_binding_generation", "to_binding_generation",
+    "from_principal_human_actor_id", "to_principal_human_actor_id",
+    "offered_by_human_actor_id", "accepted_by_human_actor_id", "state", "offered_at", "resolved_at",
+  ],
+  tool_grants_v2: [
+    "grant_id", "tool_call_id", "confirmation_id", "state", "reason", "issued_at",
+    "expires_at", "claimed_at", "version", "changed_at",
+  ],
+  tool_grant_transitions_v2: [
+    "transition_id", "grant_id", "from_state", "to_state", "reason", "transition_version", "occurred_at",
+  ],
+  tool_dispatches_v2: [
+    "dispatch_id", "tool_call_id", "grant_id", "state", "reason", "safe_summary_json",
+    "sealed_compensation_ciphertext", "prepared_at", "claimed_at", "dispatched_at",
+    "settled_at", "version", "changed_at",
+  ],
+  tool_dispatch_transitions_v2: [
+    "transition_id", "dispatch_id", "from_state", "to_state", "reason",
+    "safe_summary_sha256", "transition_version", "occurred_at",
+  ],
+  tool_reviews_v2: [
+    "review_id", "dispatch_id", "principal_human_actor_id", "resolution", "evidence_summary",
+    "evidence_sha256", "compensation_tool_call_id", "version", "reviewed_at",
+  ],
+  tool_compensation_lineage_v2: [
+    "lineage_id", "original_dispatch_id", "compensation_invocation_id",
+    "compensation_execution_id", "compensation_tool_call_id", "proposed_by_human_actor_id",
+    "profile_id", "profile_revision", "assignment_id", "assignment_revision",
+    "access_revision", "proposed_at",
+  ],
+  tool_safety_quarantine_v2: [
+    "quarantine_id", "legacy_subject_kind", "legacy_subject_id", "execution_id", "room_id",
+    "reason", "review_required", "quarantined_at",
+  ],
+  tool_safety_command_receipts_v2: [
+    "principal_actor_id", "command_kind", "idempotency_key", "request_sha256", "response_json",
+    "committed_at", "expires_at",
+  ],
+  tool_safety_repair_records_v2: [
+    "kind", "record_id", "room_id", "stable_key", "version", "projection_json", "updated_at",
+  ],
+} as const satisfies Readonly<Record<string, readonly string[]>>;
+
 const SCHEMA_CONTRACTS = {
   1: V1_SCHEMA_CONTRACT,
   2: V2_SCHEMA_CONTRACT,
@@ -10167,6 +11006,7 @@ const SCHEMA_CONTRACTS = {
   23: V23_SCHEMA_CONTRACT,
   24: V24_SCHEMA_CONTRACT,
   25: V25_SCHEMA_CONTRACT,
+  26: V26_SCHEMA_CONTRACT,
 } as const;
 
 function readPragmaNumber(database: DatabaseSync, pragma: string, field: string): number {
@@ -11687,7 +12527,9 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
           ) OR EXISTS (
             SELECT 1 FROM json_each(profile.tool_ceiling_json)
             WHERE typeof(value) <> 'text' OR value NOT IN (
-              'http-json.read', 'repository.git-status', 'room-memory.read', 'sandbox-file.write'
+              'http-json.read', 'repository.git-status',
+              ${schemaVersion < 26 ? "'room-memory.read'," : ""}
+              'sandbox-file.write'
             )
           )
        LIMIT 1`,
@@ -11891,17 +12733,23 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
          ON context.execution_id = runtime.execution_id
        WHERE runtime.current_attempt_seq <> execution.current_attempt_seq
           OR runtime.execution_generation <> execution.execution_generation
-          OR (runtime.review_state <> 'legacy_review_required' AND (
-            runtime.intent_id <> link.intent_id
-            OR runtime.lineage_id <> (
-              SELECT lineage_id FROM agent_invocation_intents WHERE id = runtime.intent_id
-            )
-            OR runtime.execution_ordinal <> link.execution_ordinal
-            OR runtime.retry_of_execution_id IS NOT link.retry_of_execution_id
-            OR runtime.snapshot_id <> context.snapshot_id
-            OR runtime.provider_id IS NOT execution.provider_id
-            OR runtime.model_id IS NOT execution.model_id
-          ))
+          OR (runtime.review_state <> 'legacy_review_required'
+              ${schemaVersion >= 26 ? `AND NOT EXISTS (
+                SELECT 1 FROM tool_compensation_lineage_v2 AS compensation
+                WHERE compensation.compensation_execution_id = runtime.execution_id
+              )` : ""}
+              AND (
+                runtime.intent_id <> link.intent_id
+                OR runtime.lineage_id <> (
+                  SELECT lineage_id FROM agent_invocation_intents WHERE id = runtime.intent_id
+                )
+                OR runtime.execution_ordinal <> link.execution_ordinal
+                OR runtime.retry_of_execution_id IS NOT link.retry_of_execution_id
+                OR context.execution_id IS NULL
+                OR runtime.snapshot_id <> context.snapshot_id
+                OR runtime.provider_id IS NOT execution.provider_id
+                OR runtime.model_id IS NOT execution.model_id
+              ))
        LIMIT 1`,
       "invocation execution projection must retain exact lineage and frozen authority",
     );
@@ -12280,6 +13128,109 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
       "Project audit authority must match its immutable stored event",
     );
   }
+  if (schemaVersion >= 26) {
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM tool_calls_v2 AS call
+       JOIN agent_executions AS execution ON execution.id = call.execution_id
+       JOIN actors AS agent ON agent.id = call.agent_id
+       LEFT JOIN agent_execution_runtime_states AS runtime
+         ON runtime.execution_id = call.execution_id
+       WHERE agent.kind <> 'agent'
+          OR execution.room_id <> call.room_id
+          OR execution.agent_id <> call.agent_id
+          OR (runtime.execution_id IS NOT NULL AND (
+            runtime.snapshot_id <> call.source_snapshot_id
+            OR runtime.authority_version < call.execution_version))
+       LIMIT 1`,
+      "tool calls must retain exact Agent, room, snapshot, and execution authority bindings",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM tool_confirmations_v2 AS confirmation
+       JOIN tool_calls_v2 AS call ON call.tool_call_id = confirmation.tool_call_id
+       JOIN actors AS principal ON principal.id = confirmation.principal_human_actor_id
+       LEFT JOIN session_families AS family
+         ON family.family_id = confirmation.session_family_id
+       WHERE (confirmation.state = 'pending' OR EXISTS (
+              SELECT 1 FROM tool_grants_v2 AS grant
+              WHERE grant.confirmation_id = confirmation.confirmation_id
+                AND grant.state = 'active'
+            )) AND (
+          principal.kind <> 'human'
+          OR family.family_id IS NULL
+          OR family.actor_id <> confirmation.principal_human_actor_id
+          OR confirmation.binding_generation <> call.binding_generation)
+       LIMIT 1`,
+      "tool confirmations must remain exactly bound to one Human session family and call generation",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM tool_grants_v2 AS grant
+       JOIN tool_calls_v2 AS call ON call.tool_call_id = grant.tool_call_id
+       LEFT JOIN tool_confirmations_v2 AS confirmation
+         ON confirmation.confirmation_id = grant.confirmation_id
+       WHERE (call.tool_id = 'sandbox-file.write'
+              AND grant.state IN ('active','claimed') AND (
+              confirmation.confirmation_id IS NULL
+              OR confirmation.tool_call_id <> call.tool_call_id
+              OR confirmation.state <> 'confirmed'))
+          OR (call.tool_id <> 'sandbox-file.write' AND grant.confirmation_id IS NOT NULL)
+       LIMIT 1`,
+      "tool grants must preserve the closed physical-tool confirmation policy",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM tool_dispatches_v2 AS dispatch
+       JOIN tool_grants_v2 AS grant ON grant.grant_id = dispatch.grant_id
+       WHERE dispatch.tool_call_id <> grant.tool_call_id
+          OR (dispatch.state <> 'prepared' AND grant.state <> 'claimed')
+          OR (dispatch.state IN ('known_succeeded','known_failed','outcome_unknown','reviewed')
+              AND dispatch.settled_at IS NULL)
+       LIMIT 1`,
+      "tool dispatches must retain a single claimed permit and closed settlement",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM tool_compensation_lineage_v2 AS lineage
+       JOIN tool_dispatches_v2 AS original
+         ON original.dispatch_id = lineage.original_dispatch_id
+       JOIN tool_calls_v2 AS original_call
+         ON original_call.tool_call_id = original.tool_call_id
+       JOIN tool_calls_v2 AS compensation_call
+         ON compensation_call.tool_call_id = lineage.compensation_tool_call_id
+       JOIN agent_executions AS execution
+         ON execution.id = lineage.compensation_execution_id
+       JOIN agent_execution_runtime_states AS runtime
+         ON runtime.execution_id = execution.id
+       JOIN agent_execution_intent_links AS link
+         ON link.execution_id = execution.id
+       JOIN agent_invocation_intents AS intent ON intent.id = link.intent_id
+       LEFT JOIN agent_execution_context_bindings AS context
+         ON context.execution_id = execution.id
+       WHERE context.execution_id IS NOT NULL
+          OR execution.compensates_execution_id <> original_call.execution_id
+          OR execution.room_id <> original_call.room_id
+          OR execution.agent_id <> original_call.agent_id
+          OR runtime.intent_id <> lineage.compensation_invocation_id
+          OR runtime.lineage_id <> lineage.compensation_invocation_id
+          OR runtime.snapshot_id <> original_call.source_snapshot_id
+          OR runtime.review_state = 'legacy_review_required'
+          OR intent.id <> lineage.compensation_invocation_id
+          OR intent.execution_id <> execution.id
+          OR compensation_call.execution_id <> execution.id
+          OR compensation_call.invocation_id <> intent.id
+          OR compensation_call.parameter_schema_version <>
+             'sandbox-file.write.compensation.v1'
+       LIMIT 1`,
+      "tool compensation must retain a new execution over the original frozen snapshot",
+    );
+  }
 }
 
 function validateExistingSchema(database: DatabaseSync, currentVersion: number): void {
@@ -12412,6 +13363,8 @@ function migrateAuthorityDatabaseToVersion(
     throw new TypeError("targetVersion must name a supported authority schema");
   }
   configureAuthorityConnection(database);
+  database.function("dao_migration_sha256", { deterministic: true }, (value: unknown) =>
+    createHash("sha256").update(String(value), "utf8").digest("hex"));
 
   let statementCount = 0;
   // Node 22.13 has no DatabaseSync.isTransaction; this module owns the transaction.

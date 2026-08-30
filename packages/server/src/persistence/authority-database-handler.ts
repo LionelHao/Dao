@@ -45,6 +45,12 @@ import type {
   RuntimeAuthorityOperationResult,
 } from "../agent-runtime/runtime-authority-protocol.js";
 import type { RuntimeRecoveryRecord } from "../agent-runtime/contracts.js";
+import {
+  executeToolSafetyAuthorityOperationInTransaction,
+  settleToolSafetyExecutionFenceInTransaction,
+  settleToolSafetyPrincipalFenceInTransaction,
+  ToolSafetyDatabaseError,
+} from "../tool-safety/database-authority.js";
 import type { ScopedCancellationCommitReceipt } from
   "../scoped-cancellation/scoped-cancellation-orchestrator.js";
 import type {
@@ -3611,6 +3617,13 @@ function commitClosedDeparture(
       "Target member access revocation dependency was unavailable",
     );
   }
+  settleToolSafetyPrincipalFenceInTransaction(
+    database,
+    targetActorId,
+    undefined,
+    acceptedAt,
+    authorization.roomId,
+  );
   const removed = database.prepare(
         `DELETE FROM room_memberships
          WHERE room_id = ? AND actor_id = ? AND kind = 'human'`,
@@ -5361,7 +5374,13 @@ function appendCanonicalRuntimeEvents(
             runtime.completed_at AS completedAt, runtime.terminal_reason AS terminalReason,
             runtime.terminal_error_code AS terminalErrorCode, runtime.review_state AS reviewState,
             legacy.dead_lettered_at AS deadLetteredAt,
-            legacy.result_message_id AS resultMessageId
+            legacy.result_message_id AS resultMessageId,
+            EXISTS (
+              SELECT 1 FROM tool_dispatches_v2 AS dispatch
+              JOIN tool_calls_v2 AS call ON call.tool_call_id = dispatch.tool_call_id
+              WHERE call.execution_id = runtime.execution_id
+                AND dispatch.state = 'outcome_unknown'
+            ) AS unresolvedReview
      FROM agent_execution_runtime_states AS runtime
      JOIN agent_executions AS legacy ON legacy.id = runtime.execution_id
      WHERE runtime.execution_id = ? AND runtime.review_state <> 'legacy_review_required'`,
@@ -5386,7 +5405,9 @@ function appendCanonicalRuntimeEvents(
     ...(status === "cancelled" ? { cancellationReason: row.terminalReason } : {}),
     ...(status === "failed" ? {
       terminalErrorCode: row.terminalErrorCode,
-      reviewState: row.reviewState === "needs_review" ? "needs_review" : "not_required",
+      reviewState: row.reviewState === "needs_review"
+        ? row.unresolvedReview === 1 ? "needs_review" : "reviewed"
+        : "not_required",
     } : {}),
     ...(typeof row.deadLetteredAt === "string" ? { deadLetteredAt: row.deadLetteredAt } : {}),
     ...(typeof row.resultMessageId === "string" ? { resultMessageId: row.resultMessageId } : {}),
@@ -6711,6 +6732,19 @@ export function executeRuntimeAuthorityOperation(
   operation: RuntimeAuthorityOperation,
 ): RuntimeAuthorityOperationResult {
   return runAuthorityImmediateTransaction(database, () => {
+    if (operation.type.startsWith("tool-safety.")) {
+      try {
+        return executeToolSafetyAuthorityOperationInTransaction(
+          database,
+          operation as Extract<RuntimeAuthorityOperation, { type: `tool-safety.${string}` }>,
+        );
+      } catch (error) {
+        if (error instanceof ToolSafetyDatabaseError) {
+          return fail(error.code, error.message);
+        }
+        throw error;
+      }
+    }
     const occurredAt = new Date(operation.now).toISOString();
     if (operation.type === "runtime.list-pending-human-fences") {
       const rows = database.prepare(
@@ -6805,6 +6839,13 @@ export function executeRuntimeAuthorityOperation(
       for (const candidate of candidates) {
         const current = runtimeExecutionById(database, candidate.id as string);
         const cancellationReason = `human_preempted:${source.id}`;
+        const v2Settlement = settleToolSafetyExecutionFenceInTransaction(
+          database,
+          current.id,
+          "execution_cancelled",
+          occurredAt,
+        );
+        const claimedUnknown = v2Settlement.preservedDispatchIds.length > 0;
         const updated = database.prepare(
           `UPDATE agent_executions
            SET status = 'cancelled', cancellation_reason = ?, completed_at = ?,
@@ -6814,22 +6855,31 @@ export function executeRuntimeAuthorityOperation(
              OR (status = 'running' AND action_category = 'waiting_upstream')
              OR (status = 'running' AND action_category = 'tool_call'
                  AND tool_dispatch_phase = 'not_started')
-           )`,
-        ).run(cancellationReason, occurredAt, occurredAt, current.id, current.currentAttemptSeq);
-        if (updated.changes !== 1) return fail("execution_conflict", "Human fence cancellation was stale");
+           ) AND ? = 0`,
+        ).run(cancellationReason, occurredAt, occurredAt, current.id,
+          current.currentAttemptSeq, claimedUnknown ? 1 : 0);
+        if ((!claimedUnknown && updated.changes !== 1) || (claimedUnknown && updated.changes !== 0)) {
+          return fail("execution_conflict", "Human fence cancellation was stale");
+        }
         database.prepare(
           `UPDATE agent_execution_attempts
            SET status = 'cancelled', finished_at = ?, error_code = 'human_preempted', next_retry_at = NULL
-           WHERE execution_id = ? AND attempt_seq = ? AND status IN ('queued', 'running')`,
-        ).run(occurredAt, current.id, current.currentAttemptSeq);
+           WHERE execution_id = ? AND attempt_seq = ? AND status IN ('queued', 'running')
+             AND ? = 0`,
+        ).run(occurredAt, current.id, current.currentAttemptSeq, claimedUnknown ? 1 : 0);
         database.prepare(
           `INSERT INTO agent_human_fences (
              fence_message_id, execution_id, old_attempt_seq, cancelled_at
            ) VALUES (?, ?, ?, ?)`,
         ).run(source.id, current.id, current.currentAttemptSeq, occurredAt);
-        const cancelled = runtimeExecutionById(database, current.id);
-        appendRuntimeExecutionEvent(database, cancelled, occurredAt, "cancelled", "human_preempted");
-        cancelledExecutions.push(cancelled);
+        const terminal = runtimeExecutionById(database, current.id);
+        if (claimedUnknown ? terminal.status !== "failed" : terminal.status !== "cancelled") {
+          return fail("execution_conflict", "Human fence parent terminal was invalid");
+        }
+        appendRuntimeExecutionEvent(database, terminal, occurredAt,
+          claimedUnknown ? "dead-lettered" : "cancelled",
+          claimedUnknown ? "side_effect_outcome_unknown" : "human_preempted");
+        cancelledExecutions.push(terminal);
       }
       database.prepare(
         `INSERT INTO human_preemption_fences (
@@ -8392,6 +8442,13 @@ export function executeRuntimeAuthorityOperation(
                    'runtime_supervisor', ?)`,
       ).run(fenceId, current.roomId, authority.intentId, current.id,
         authority.authorityVersion, occurredAt);
+      const v2Settlement = settleToolSafetyExecutionFenceInTransaction(
+        database,
+        current.id,
+        "execution_cancelled",
+        occurredAt,
+      );
+      const claimedUnknown = v2Settlement.preservedDispatchIds.length > 0;
       const confirmations = database.prepare(
         `SELECT confirmation_id AS confirmationId, confirmation_state AS state
          FROM tool_confirmations
@@ -8429,16 +8486,34 @@ export function executeRuntimeAuthorityOperation(
         `UPDATE agent_execution_attempts
          SET status = 'cancelled', finished_at = ?, error_code = 'runtime_shutdown',
              next_retry_at = NULL
-         WHERE execution_id = ? AND attempt_seq = ? AND status IN ('queued', 'running')`,
-      ).run(occurredAt, current.id, current.currentAttemptSeq);
+         WHERE execution_id = ? AND attempt_seq = ? AND status IN ('queued', 'running')
+           AND ? = 0`,
+      ).run(occurredAt, current.id, current.currentAttemptSeq, claimedUnknown ? 1 : 0);
       const executionUpdated = database.prepare(
         `UPDATE agent_executions
          SET status = 'cancelled', cancellation_reason = 'runtime_shutdown',
              completed_at = ?, updated_at = ?, next_retry_at = NULL
-         WHERE id = ? AND current_attempt_seq = ? AND status IN ('queued', 'running')`,
-      ).run(occurredAt, occurredAt, current.id, current.currentAttemptSeq);
-      if (attemptUpdated.changes !== 1 || executionUpdated.changes !== 1) {
+         WHERE id = ? AND current_attempt_seq = ? AND status IN ('queued', 'running')
+           AND ? = 0`,
+      ).run(occurredAt, occurredAt, current.id, current.currentAttemptSeq,
+        claimedUnknown ? 1 : 0);
+      if ((!claimedUnknown && (attemptUpdated.changes !== 1 || executionUpdated.changes !== 1)) ||
+          (claimedUnknown && (attemptUpdated.changes !== 0 || executionUpdated.changes !== 0))) {
         return fail("execution_conflict", "Runtime shutdown lost its terminal CAS");
+      }
+      database.prepare(
+        `UPDATE invocation_recovery_queue
+         SET state = 'closed', lease_owner = NULL, lease_expires_at = NULL,
+             failure_code = NULL, review_required = 0, updated_at = ?
+         WHERE execution_id = ? AND state IN ('pending', 'leased')`,
+      ).run(occurredAt, current.id);
+      const terminal = runtimeExecutionById(database, current.id);
+      const terminalVersion = database.prepare(
+        "SELECT authority_version AS authorityVersion FROM agent_execution_runtime_states WHERE execution_id = ?",
+      ).get(current.id)?.authorityVersion;
+      if (typeof terminalVersion !== "number" ||
+          (claimedUnknown ? terminal.status !== "failed" : terminal.status !== "cancelled")) {
+        return fail("execution_conflict", "Runtime shutdown parent terminal was invalid");
       }
       database.prepare(
         `INSERT INTO invocation_scoped_cancellation_targets (
@@ -8446,22 +8521,18 @@ export function executeRuntimeAuthorityOperation(
            execution_version_after
          ) VALUES (?, ?, ?, ?, ?)`,
       ).run(fenceId, current.id, current.currentAttemptSeq,
-        authority.authorityVersion, authority.authorityVersion + 1);
-      database.prepare(
-        `UPDATE invocation_recovery_queue
-         SET state = 'closed', lease_owner = NULL, lease_expires_at = NULL,
-             failure_code = NULL, review_required = 0, updated_at = ?
-         WHERE execution_id = ? AND state IN ('pending', 'leased')`,
-      ).run(occurredAt, current.id);
-      const cancelled = runtimeExecutionById(database, current.id);
-      const rejectedConfirmationIds = confirmations.flatMap((row) =>
+        claimedUnknown ? terminalVersion - 1 : authority.authorityVersion, terminalVersion);
+      const rejectedConfirmationIds = [...v2Settlement.rejectedConfirmationIds,
+        ...confirmations.flatMap((row) =>
         row.state === "pending" && typeof row.confirmationId === "string"
-          ? [row.confirmationId] : []);
-      const revokedGrantIds = grants.flatMap((row) =>
-        row.state === "active" && typeof row.grantId === "string" ? [row.grantId] : []);
-      const preservedDispatchIds = preservedDispatches.flatMap((row) =>
-        typeof row.dispatchId === "string" ? [row.dispatchId] : []);
-      const sideEffectState = preservedDispatches.some((row) => row.state === "outcome_unknown")
+          ? [row.confirmationId] : [])];
+      const revokedGrantIds = [...v2Settlement.revokedGrantIds, ...grants.flatMap((row) =>
+        row.state === "active" && typeof row.grantId === "string" ? [row.grantId] : [])];
+      const preservedDispatchIds = [...v2Settlement.preservedDispatchIds,
+        ...preservedDispatches.flatMap((row) =>
+        typeof row.dispatchId === "string" ? [row.dispatchId] : [])];
+      const sideEffectState = v2Settlement.preservedDispatchIds.length > 0 ||
+        preservedDispatches.some((row) => row.state === "outcome_unknown")
         ? "outcome-unknown-retained" as const
         : preservedDispatchIds.length > 0 ? "dispatched-retained" as const : "none" as const;
       const confirmationDisposition = rejectedConfirmationIds.length > 0
@@ -8478,8 +8549,9 @@ export function executeRuntimeAuthorityOperation(
           expectedVersion: authority.authorityVersion },
         reason: "runtime_shutdown" as const,
         intentOutcomes: [{ intentId: authority.intentId, outcome: "already_claimed" as const }],
-        executionOutcomes: [{ executionId: current.id, outcome: "cancelled" as const,
-          version: authority.authorityVersion + 1 }],
+        executionOutcomes: [{ executionId: current.id,
+          outcome: claimedUnknown ? "already_terminal" as const : "cancelled" as const,
+          version: terminalVersion }],
         rejectedConfirmationIds, revokedGrantIds, preservedDispatchIds,
         committedAt: occurredAt,
       };
@@ -8506,11 +8578,13 @@ export function executeRuntimeAuthorityOperation(
       ).run(requestId, fenceId,
         createHash("sha256").update(requestId).digest("hex"),
         JSON.stringify(storedReceipt), occurredAt);
-      appendRuntimeExecutionEvent(database, cancelled, occurredAt, "cancelled", "runtime_shutdown");
+      appendRuntimeExecutionEvent(database, terminal, occurredAt,
+        claimedUnknown ? "dead-lettered" : "cancelled",
+        claimedUnknown ? "side_effect_outcome_unknown" : "runtime_shutdown");
       appendCanonicalScopedCancellationEvent(
         database, canonicalReceipt, current.agentId, occurredAt,
       );
-      return { kind: "execution", execution: cancelled };
+      return { kind: "execution", execution: terminal };
     }
 
     if (operation.type === "runtime.cancel-scoped") {
@@ -8679,6 +8753,13 @@ export function executeRuntimeAuthorityOperation(
       ).run(fenceId, current.roomId, authority.intentId, current.id,
         target.expectedVersion, operation.context.principal.actorId, occurredAt);
 
+      const v2Settlement = settleToolSafetyExecutionFenceInTransaction(
+        database,
+        current.id,
+        "execution_cancelled",
+        occurredAt,
+      );
+
       const confirmation = database.prepare(
         `SELECT confirmation_id AS confirmationId, confirmation_state AS state
          FROM tool_confirmations
@@ -8721,27 +8802,42 @@ export function executeRuntimeAuthorityOperation(
          WHERE execution_id = ? AND attempt_seq = ?
          ORDER BY dispatched_at DESC LIMIT 1`,
       ).get(current.id, current.currentAttemptSeq);
-      const sideEffectState = dispatch?.state === "outcome_unknown"
+      const sideEffectState = v2Settlement.preservedDispatchIds.length > 0 ||
+        dispatch?.state === "outcome_unknown"
         ? "outcome-unknown-retained" as const
         : typeof dispatch?.state === "string" ? "dispatched-retained" as const : "none" as const;
+      const claimedUnknown = v2Settlement.preservedDispatchIds.length > 0;
 
       const executionUpdated = database.prepare(
         `UPDATE agent_executions
          SET status = 'cancelled', cancellation_reason = 'human_cancelled',
              completed_at = ?, updated_at = ?, next_retry_at = NULL
-         WHERE id = ? AND current_attempt_seq = ? AND status IN ('queued', 'running')`,
-      ).run(occurredAt, occurredAt, current.id, current.currentAttemptSeq);
-      if (executionUpdated.changes !== 1) {
+         WHERE id = ? AND current_attempt_seq = ? AND status IN ('queued', 'running')
+           AND ? = 0`,
+      ).run(occurredAt, occurredAt, current.id, current.currentAttemptSeq,
+        claimedUnknown ? 1 : 0);
+      if ((!claimedUnknown && executionUpdated.changes !== 1) ||
+          (claimedUnknown && executionUpdated.changes !== 0)) {
         return fail("execution_conflict", "Cancellation lost the execution terminal CAS");
       }
       const attemptUpdated = database.prepare(
         `UPDATE agent_execution_attempts
          SET status = 'cancelled', finished_at = ?, error_code = 'human_cancelled',
              next_retry_at = NULL
-         WHERE execution_id = ? AND attempt_seq = ? AND status IN ('queued', 'running')`,
-      ).run(occurredAt, current.id, current.currentAttemptSeq);
-      if (attemptUpdated.changes !== 1) {
+         WHERE execution_id = ? AND attempt_seq = ? AND status IN ('queued', 'running')
+           AND ? = 0`,
+      ).run(occurredAt, current.id, current.currentAttemptSeq, claimedUnknown ? 1 : 0);
+      if ((!claimedUnknown && attemptUpdated.changes !== 1) ||
+          (claimedUnknown && attemptUpdated.changes !== 0)) {
         return fail("execution_conflict", "Cancellation lost the attempt terminal CAS");
+      }
+      const terminal = runtimeExecutionById(database, current.id);
+      const terminalVersion = database.prepare(
+        "SELECT authority_version AS authorityVersion FROM agent_execution_runtime_states WHERE execution_id = ?",
+      ).get(current.id)?.authorityVersion;
+      if (typeof terminalVersion !== "number" ||
+          (claimedUnknown ? terminal.status !== "failed" : terminal.status !== "cancelled")) {
+        return fail("execution_conflict", "Cancellation parent terminal was invalid");
       }
       database.prepare(
         `INSERT INTO invocation_scoped_cancellation_targets (
@@ -8749,9 +8845,10 @@ export function executeRuntimeAuthorityOperation(
            execution_version_after
          ) VALUES (?, ?, ?, ?, ?)`,
       ).run(fenceId, current.id, current.currentAttemptSeq,
-        target.expectedVersion, target.expectedVersion + 1);
-      const cancelled = runtimeExecutionById(database, current.id);
-      appendRuntimeExecutionEvent(database, cancelled, occurredAt, "cancelled", "human_cancelled");
+        claimedUnknown ? terminalVersion - 1 : target.expectedVersion, terminalVersion);
+      appendRuntimeExecutionEvent(database, terminal, occurredAt,
+        claimedUnknown ? "dead-lettered" : "cancelled",
+        claimedUnknown ? "side_effect_outcome_unknown" : "human_cancelled");
       const canonicalReceipt = {
         requestId: operation.context.requestId,
         fenceId,
@@ -8761,13 +8858,17 @@ export function executeRuntimeAuthorityOperation(
           expectedVersion: target.expectedVersion },
         reason: "human_cancelled" as const,
         intentOutcomes: [{ intentId: authority.intentId, outcome: "already_claimed" as const }],
-        executionOutcomes: [{ executionId: current.id, outcome: "cancelled" as const,
-          version: target.expectedVersion + 1 }],
-        rejectedConfirmationIds: confirmationDisposition === "pending_rejected" &&
-          typeof confirmation?.confirmationId === "string" ? [confirmation.confirmationId] : [],
-        revokedGrantIds: grantDisposition === "unclaimed_revoked" &&
-          typeof grant?.grantId === "string" ? [grant.grantId] : [],
-        preservedDispatchIds: typeof dispatch?.dispatchId === "string" ? [dispatch.dispatchId] : [],
+        executionOutcomes: [{ executionId: current.id,
+          outcome: claimedUnknown ? "already_terminal" as const : "cancelled" as const,
+          version: terminalVersion }],
+        rejectedConfirmationIds: [...v2Settlement.rejectedConfirmationIds,
+          ...(confirmationDisposition === "pending_rejected" &&
+          typeof confirmation?.confirmationId === "string" ? [confirmation.confirmationId] : [])],
+        revokedGrantIds: [...v2Settlement.revokedGrantIds,
+          ...(grantDisposition === "unclaimed_revoked" &&
+          typeof grant?.grantId === "string" ? [grant.grantId] : [])],
+        preservedDispatchIds: [...v2Settlement.preservedDispatchIds,
+          ...(typeof dispatch?.dispatchId === "string" ? [dispatch.dispatchId] : [])],
         committedAt: occurredAt,
       };
       const receipt = {
@@ -8892,8 +8993,16 @@ export function executeRuntimeAuthorityOperation(
         if (canonical?.authorityVersion !== operation.expectedVersion) {
           return fail("execution_conflict", "Retry expectedVersion was stale");
         }
+        const unresolvedReview = canonical.reviewState === "needs_review" && database.prepare(
+          `SELECT 1 AS present
+           FROM tool_dispatches_v2 AS dispatch
+           JOIN tool_calls_v2 AS call ON call.tool_call_id = dispatch.tool_call_id
+           WHERE call.execution_id = ? AND dispatch.state = 'outcome_unknown'
+           LIMIT 1`,
+        ).get(old.id)?.present === 1;
         if ((canonical.publicStatus !== "failed" && canonical.publicStatus !== "cancelled") ||
-            canonical.reviewState !== "none") {
+            (canonical.reviewState !== "none" && !
+             (canonical.reviewState === "needs_review" && !unresolvedReview))) {
           return fail("execution_conflict", "Execution is not eligible for Human retry");
         }
       }
@@ -11176,6 +11285,12 @@ export function recallHumanMessageDatabaseCommand(
             input.command.expectedRevision,
             execution.intentId,
             execution.executionId,
+            recalledAt,
+          );
+          settleToolSafetyExecutionFenceInTransaction(
+            database,
+            execution.executionId,
+            "source_recalled",
             recalledAt,
           );
           const scopedEffect = scopedRuntime.effects.find((effect) =>

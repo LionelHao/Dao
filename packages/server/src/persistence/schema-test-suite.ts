@@ -1,5 +1,6 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
@@ -10,6 +11,7 @@ import {
   configureAuthorityConnection,
   listAuthorityTables,
   migrateAuthorityDatabase,
+  migrateAuthorityDatabaseToHistoricalVersionForTest,
   migrateAuthorityDatabaseToVersion14ForTest,
   migrateAuthorityDatabaseToVersion13ForTest,
   migrateAuthorityDatabaseToVersion12ForTest,
@@ -179,8 +181,21 @@ const AUTHORITY_TABLES = [
   "tenant_administrators",
   "tool_archive_settlement_members",
   "tool_archive_settlements",
+  "tool_calls_v2",
+  "tool_compensation_lineage_v2",
+  "tool_confirmation_decisions_v2",
+  "tool_confirmation_handoffs_v2",
   "tool_confirmations",
+  "tool_confirmations_v2",
+  "tool_dispatch_transitions_v2",
   "tool_dispatches",
+  "tool_dispatches_v2",
+  "tool_grant_transitions_v2",
+  "tool_grants_v2",
+  "tool_reviews_v2",
+  "tool_safety_command_receipts_v2",
+  "tool_safety_quarantine_v2",
+  "tool_safety_repair_records_v2",
 ] as const;
 const V1_MIGRATION_CHECKSUM =
   "34117e7de4fb7c8eb36b5363bc178e45a82b08c668ca712a7b7e5e82343a6358";
@@ -533,7 +548,8 @@ function seedV11SessionCapacity(
   }
 }
 
-describe("authority SQLite schema", () => {
+export function registerRecentAuthoritySchemaTests(): void {
+describe("authority SQLite schema — recent migrations", () => {
   it("upgrades v13 archived rooms with a durable message gate and leaves active rooms ungated", () => {
     withDatabase((database) => {
       migrateAuthorityDatabaseToVersion13ForTest(database);
@@ -617,7 +633,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(25);
+      expect(readSchemaVersion(database)).toBe(26);
       expect(database.prepare(
         `SELECT room_id AS roomId, gate_generation AS gateGeneration,
                 blocked_at AS blockedAt
@@ -642,6 +658,230 @@ describe("authority SQLite schema", () => {
         { id: "v14-confirmation-consumed", state: "confirmed", reason: null },
         { id: "v14-confirmation-pending", state: "rejected", reason: "legacy_unbound" },
       ]);
+      expect(database.prepare(
+        `SELECT call.tool_call_id AS toolCallId, confirmation.state AS confirmationState,
+                grant.state AS grantState
+         FROM tool_calls_v2 AS call
+         JOIN tool_grants_v2 AS grant ON grant.tool_call_id = call.tool_call_id
+         LEFT JOIN tool_confirmations_v2 AS confirmation
+           ON confirmation.tool_call_id = call.tool_call_id
+         ORDER BY call.tool_call_id`,
+      ).all()).toEqual([
+        { toolCallId: "legacy-tool-call:v14-grant-consumed",
+          confirmationState: "confirmed", grantState: "claimed" },
+        { toolCallId: "legacy-tool-call:v14-grant-pending",
+          confirmationState: "rejected", grantState: "revoked" },
+      ]);
+      expect(database.prepare(
+        `SELECT legacy_subject_kind AS kind, legacy_subject_id AS id, reason,
+                review_required AS reviewRequired
+         FROM tool_safety_quarantine_v2`,
+      ).all()).toEqual([{
+        kind: "grant", id: "v14-grant-consumed",
+        reason: "legacy_needs_review", reviewRequired: 1,
+      }]);
+      expect(database.prepare(
+        `SELECT COUNT(*) AS count FROM events WHERE event_type = 'tool.safety.changed'`,
+      ).get()).toEqual({ count: 0 });
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM tool_safety_repair_records_v2",
+      ).get()).toEqual({ count: 0 });
+    });
+  });
+
+  it("upgrades every historical v13-v25 contract to v26 without rewriting its history", () => {
+    expect(AUTHORITY_SCHEMA_VERSION).toBe(26);
+    for (let version = 13; version <= 25; version += 1) {
+      withDatabase((database) => {
+        migrateAuthorityDatabaseToHistoricalVersionForTest(database, version);
+        const history = database.prepare(
+          "SELECT version, name, checksum FROM schema_migrations ORDER BY version",
+        ).all();
+        migrateAuthorityDatabase(database);
+        expect(readSchemaVersion(database)).toBe(26);
+        expect(database.prepare(
+          `SELECT version, name, checksum FROM schema_migrations
+           WHERE version <= ? ORDER BY version`,
+        ).all(version)).toEqual(history);
+      });
+    }
+  }, 30_000);
+
+  it("moves the legacy internal Room-memory seam out of every public v25 tool projection", () => {
+    withDatabase((database) => {
+      createV1Fixture(database);
+      seedV1History(database);
+      migrateAuthorityDatabaseToHistoricalVersionForTest(database, 25);
+
+      const affectedTables = [
+        "agent_profiles",
+        "agent_profile_revisions",
+        "room_agent_assignments",
+        "room_agent_assignment_revisions",
+        "deployment_agent_profile_events",
+        "deployment_agent_profile_repair_records",
+        "events",
+      ] as const;
+      const triggers = database.prepare(
+        `SELECT name, sql FROM sqlite_schema
+         WHERE type = 'trigger' AND tbl_name IN (${affectedTables.map(() => "?").join(",")})
+         ORDER BY name`,
+      ).all(...affectedTables) as { readonly name: string; readonly sql: string }[];
+      for (const trigger of triggers) database.exec(`DROP TRIGGER "${trigger.name}"`);
+      database.exec(`
+        UPDATE actors SET tool_permissions_json = '["room-memory.read"]'
+        WHERE id = 'agent-1';
+        UPDATE room_memberships SET tool_permissions_json = '["room-memory.read"]'
+        WHERE room_id = 'room-1' AND actor_id = 'agent-1';
+        UPDATE agent_profiles SET tool_ceiling_json = '["room-memory.read"]'
+        WHERE actor_id = 'agent-1';
+        UPDATE agent_profile_revisions SET tool_ceiling_json = '["room-memory.read"]'
+        WHERE actor_id = 'agent-1';
+        UPDATE room_agent_assignments SET tool_subset_json = '["room-memory.read"]'
+        WHERE agent_actor_id = 'agent-1';
+        UPDATE room_agent_assignment_revisions SET tool_subset_json = '["room-memory.read"]'
+        WHERE agent_actor_id = 'agent-1';
+        UPDATE deployment_agent_profile_events SET payload_json = json_set(
+          payload_json, '$.profile.toolCeiling', json('["room-memory.read"]')
+        ) WHERE profile_id = (SELECT id FROM agent_profiles WHERE actor_id = 'agent-1');
+        UPDATE deployment_agent_profile_repair_records SET projection_json = json_set(
+          projection_json, '$.toolCeiling', json('["room-memory.read"]')
+        ) WHERE profile_id = (SELECT id FROM agent_profiles WHERE actor_id = 'agent-1');
+        UPDATE events SET payload_json = json_set(
+          payload_json,
+          '$.assignment.toolCeiling', json('["room-memory.read"]'),
+          '$.assignment.toolSubset', json('["room-memory.read"]'),
+          '$.assignment.effectiveTools', json('["room-memory.read"]')
+        ) WHERE event_type = 'room.agent-assignment.changed'
+          AND json_extract(payload_json, '$.assignment.agentActorId') = 'agent-1';
+      `);
+      const sha256 = (value: string): string =>
+        createHash("sha256").update(value, "utf8").digest("hex");
+      for (const row of database.prepare(
+        `SELECT event_id AS id, payload_json AS json FROM deployment_agent_profile_events
+         WHERE profile_id = (SELECT id FROM agent_profiles WHERE actor_id = 'agent-1')`,
+      ).all() as { readonly id: string; readonly json: string }[]) {
+        database.prepare(
+          "UPDATE deployment_agent_profile_events SET payload_sha256 = ? WHERE event_id = ?",
+        ).run(sha256(row.json), row.id);
+      }
+      for (const row of database.prepare(
+        `SELECT profile_id AS id, projection_json AS json
+         FROM deployment_agent_profile_repair_records
+         WHERE profile_id = (SELECT id FROM agent_profiles WHERE actor_id = 'agent-1')`,
+      ).all() as { readonly id: string; readonly json: string }[]) {
+        database.prepare(
+          `UPDATE deployment_agent_profile_repair_records
+           SET projection_sha256 = ? WHERE profile_id = ?`,
+        ).run(sha256(row.json), row.id);
+      }
+      for (const trigger of triggers) database.exec(trigger.sql);
+      const roomStream = database.prepare(
+        `SELECT head_seq AS headSeq FROM streams
+         WHERE stream_kind = 'room' AND stream_id = 'room-1'`,
+      ).get() as { readonly headSeq: number };
+      const assignmentPayload = JSON.stringify({
+        assignment: {
+          agentActorId: "agent-1",
+          capabilityCeiling: [],
+          capabilitySubset: [],
+          effectiveCapabilities: [],
+          toolCeiling: ["room-memory.read"],
+          toolSubset: ["room-memory.read"],
+          effectiveTools: ["room-memory.read"],
+        },
+      });
+      database.exec("BEGIN IMMEDIATE");
+      try {
+        database.prepare(
+          `UPDATE streams SET head_seq = ?
+           WHERE stream_kind = 'room' AND stream_id = 'room-1'`,
+        ).run(roomStream.headSeq + 1);
+        database.prepare(
+          `INSERT INTO events (
+             event_id, stream_kind, stream_id, stream_seq, room_id,
+             authority_kind, actor_id, event_type, occurred_at, payload_json
+           ) VALUES (
+             'v25-room-memory-assignment-event', 'room', 'room-1', ?, 'room-1',
+             'human', 'human-1', 'room.agent-assignment.changed',
+             '2026-08-30T00:00:00.000Z', ?
+           )`,
+        ).run(roomStream.headSeq + 1, assignmentPayload);
+        database.exec("COMMIT");
+      } catch (error: unknown) {
+        database.exec("ROLLBACK");
+        throw error;
+      }
+
+      expect(database.prepare(
+        "SELECT tool_ceiling_json AS tools FROM agent_profiles WHERE actor_id = 'agent-1'",
+      ).get()).toEqual({ tools: '["room-memory.read"]' });
+      expect(database.prepare(
+        "SELECT tool_subset_json AS tools FROM room_agent_assignments WHERE agent_actor_id = 'agent-1'",
+      ).get()).toEqual({ tools: '["room-memory.read"]' });
+
+      migrateAuthorityDatabase(database);
+
+      expect(database.prepare(
+        `SELECT capability_ceiling_json AS capabilities, tool_ceiling_json AS tools
+         FROM agent_profiles WHERE actor_id = 'agent-1'`,
+      ).get()).toEqual({ capabilities: '["room.memory.read"]', tools: '[]' });
+      expect(database.prepare(
+        `SELECT capability_subset_json AS capabilities, tool_subset_json AS tools
+         FROM room_agent_assignments WHERE agent_actor_id = 'agent-1'`,
+      ).get()).toEqual({ capabilities: '["room.memory.read"]', tools: '[]' });
+      expect(database.prepare(
+        `SELECT tool_permissions_json AS actorTools,
+                (SELECT tool_permissions_json FROM room_memberships
+                 WHERE room_id = 'room-1' AND actor_id = 'agent-1') AS membershipTools
+         FROM actors WHERE id = 'agent-1'`,
+      ).get()).toEqual({ actorTools: '[]', membershipTools: '[]' });
+      expect(database.prepare(
+        `SELECT COUNT(*) AS count FROM agent_profile_revisions
+         WHERE tool_ceiling_json LIKE '%room-memory.read%'
+            OR capability_ceiling_json NOT LIKE '%room.memory.read%'`,
+      ).get()).toEqual({ count: 0 });
+      expect(database.prepare(
+        `SELECT COUNT(*) AS count FROM room_agent_assignment_revisions
+         WHERE tool_subset_json LIKE '%room-memory.read%'
+            OR capability_subset_json NOT LIKE '%room.memory.read%'`,
+      ).get()).toEqual({ count: 0 });
+      expect(database.prepare(
+        `SELECT (
+           SELECT COUNT(*) FROM deployment_agent_profile_events
+           WHERE payload_json LIKE '%room-memory.read%'
+         ) + (
+           SELECT COUNT(*) FROM deployment_agent_profile_repair_records
+           WHERE projection_json LIKE '%room-memory.read%'
+         ) + (
+           SELECT COUNT(*) FROM events
+           WHERE event_type = 'room.agent-assignment.changed'
+             AND payload_json LIKE '%room-memory.read%'
+         ) AS count`,
+      ).get()).toEqual({ count: 0 });
+      expect(database.prepare(
+        `SELECT COUNT(*) AS count FROM events
+         WHERE event_id = 'v25-room-memory-assignment-event'
+           AND EXISTS (
+             SELECT 1 FROM json_each(payload_json, '$.assignment.capabilityCeiling')
+             WHERE value = 'room.memory.read'
+           )
+           AND EXISTS (
+             SELECT 1 FROM json_each(payload_json, '$.assignment.capabilitySubset')
+             WHERE value = 'room.memory.read'
+           )
+           AND EXISTS (
+             SELECT 1 FROM json_each(payload_json, '$.assignment.effectiveCapabilities')
+             WHERE value = 'room.memory.read'
+           )`,
+      ).get()).toEqual({ count: 1 });
+
+      expectSqlRejected(database,
+        `UPDATE agent_profiles SET tool_ceiling_json = '["room-memory.read"]'
+         WHERE actor_id = 'agent-1'`);
+      expectSqlRejected(database,
+        `UPDATE room_agent_assignments SET tool_subset_json = '["room-memory.read"]'
+         WHERE agent_actor_id = 'agent-1'`);
     });
   });
 
@@ -731,7 +971,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(25);
+      expect(readSchemaVersion(database)).toBe(26);
       expect(database.prepare(
         `SELECT id, owner_actor_id AS ownerActorId, governance_revision AS governanceRevision,
                 archive_generation AS archiveGeneration, archived_at AS archivedAt
@@ -854,8 +1094,8 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(25);
-      expect(readSchemaVersion(database)).toBe(25);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(26);
+      expect(readSchemaVersion(database)).toBe(26);
       expect(tableColumns(database, "session_families")).toEqual([
         "family_id", "public_id", "account_id", "actor_id", "device_id",
         "device_label", "platform", "created_at", "refresh_expires_at", "revoked_at",
@@ -921,7 +1161,7 @@ describe("authority SQLite schema", () => {
       seedV11SessionCapacity(database, 97, 0);
 
       expect(() => migrateAuthorityDatabase(database)).not.toThrow();
-      expect(readSchemaVersion(database)).toBe(25);
+      expect(readSchemaVersion(database)).toBe(26);
       expect(database.prepare("SELECT COUNT(*) AS count FROM session_families").get())
         .toEqual({ count: 97 });
     });
@@ -977,6 +1217,11 @@ describe("authority SQLite schema", () => {
       );
     });
   });
+});
+}
+
+export function registerFoundationAuthoritySchemaTests(): void {
+describe("authority SQLite schema — foundations", () => {
   it("configures and verifies the durability and concurrency pragmas", () => {
     withDatabase((database) => {
       database.exec("PRAGMA foreign_keys = OFF");
@@ -1002,8 +1247,8 @@ describe("authority SQLite schema", () => {
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
 
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(25);
-      expect(readSchemaVersion(database)).toBe(25);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(26);
+      expect(readSchemaVersion(database)).toBe(26);
       expect(listAuthorityTables(database)).toEqual(AUTHORITY_TABLES);
       expect(
         database
@@ -1162,6 +1407,12 @@ describe("authority SQLite schema", () => {
           checksum: expect.stringMatching(/^[a-f0-9]{64}$/),
           applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
         },
+        {
+          version: 26,
+          name: "tool-safety-authority",
+          checksum: expect.stringMatching(/^[a-f0-9]{64}$/),
+          applied_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+        },
       ]);
       expect(tableColumns(database, "actors")).toContain("catalog_revision");
       expect(tableColumns(database, "room_memberships")).toContain(
@@ -1216,8 +1467,8 @@ describe("authority SQLite schema", () => {
       expect(readSchemaVersion(database)).toBe(4);
       migrateAuthorityDatabase(database);
 
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(25);
-      expect(readSchemaVersion(database)).toBe(25);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(26);
+      expect(readSchemaVersion(database)).toBe(26);
       expect(
         database
           .prepare(
@@ -1341,7 +1592,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(25);
+      expect(readSchemaVersion(database)).toBe(26);
       expect(database.prepare(
         `SELECT id, status, action_category AS actionCategory,
                 tool_dispatch_phase AS toolDispatchPhase,
@@ -1418,7 +1669,7 @@ describe("authority SQLite schema", () => {
       expect(snapshot(database)).toEqual(before);
 
       migrateAuthorityDatabase(database);
-      expect(readSchemaVersion(database)).toBe(25);
+      expect(readSchemaVersion(database)).toBe(26);
       expect(tableColumns(database, "route_jobs")).toEqual([
         "id", "room_id", "source_message_id", "status", "current_attempt", "topic_key",
         "embedding_model_version", "window_size", "cosine_threshold", "room_phase",
@@ -1476,7 +1727,7 @@ describe("authority SQLite schema", () => {
       expect(snapshot(database)).toEqual(before);
 
       migrateAuthorityDatabase(database);
-      expect(readSchemaVersion(database)).toBe(25);
+      expect(readSchemaVersion(database)).toBe(26);
       expect(database.prepare(
         `SELECT id, current_owner_actor_id AS currentOwnerId, status,
                 requester_actor_id AS requesterId, origin_kind AS originKind,
@@ -1615,7 +1866,7 @@ describe("authority SQLite schema", () => {
       expect(listAuthorityTables(database)).not.toContain("ball_boundary_claims");
 
       migrateAuthorityDatabase(database);
-      expect(readSchemaVersion(database)).toBe(25);
+      expect(readSchemaVersion(database)).toBe(26);
       expect(tableColumns(database, "ball_boundary_claims")).toEqual([
         "id", "room_id", "source_kind", "source_id", "holder_actor_id", "holder_kind",
         "reason", "since_at", "deadline_at", "boundary_kind", "claimed_at", "route_consumed_at",
@@ -1680,7 +1931,7 @@ describe("authority SQLite schema", () => {
       expect(tableColumns(database, "agent_executions")).not.toContain("supersedes_execution_ids_json");
 
       migrateAuthorityDatabase(database);
-      expect(readSchemaVersion(database)).toBe(25);
+      expect(readSchemaVersion(database)).toBe(26);
       expect(tableColumns(database, "human_preemption_fences")).toEqual([
         "source_human_message_id", "room_id", "human_actor_id", "accepted_at",
         "cancelled_count", "cancel_committed_at", "route_job_id", "route_created_at",
@@ -1707,7 +1958,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(25);
+      expect(readSchemaVersion(database)).toBe(26);
       expect(tableColumns(database, "open_items")).toEqual(
         expect.arrayContaining([
           "requester_actor_id",
@@ -1747,7 +1998,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(25);
+      expect(readSchemaVersion(database)).toBe(26);
       expect(database.prepare(
         `SELECT source_message_id AS sourceMessageId, actor_id AS actorId
          FROM calibration_signals WHERE id = 'signal-v3'`,
@@ -1800,7 +2051,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(25);
+      expect(readSchemaVersion(database)).toBe(26);
       expect(
         database.prepare("SELECT id, catalog_revision FROM actors ORDER BY id").all(),
       ).toEqual([
@@ -1880,7 +2131,7 @@ describe("authority SQLite schema", () => {
 
       migrateAuthorityDatabase(database);
 
-      expect(readSchemaVersion(database)).toBe(25);
+      expect(readSchemaVersion(database)).toBe(26);
       expect(
         database
           .prepare(
@@ -1960,7 +2211,11 @@ describe("authority SQLite schema", () => {
       expect(tableColumns(database, "actors")).not.toContain("catalog_revision");
     });
   });
+});
+}
 
+export function registerIntegrityAuthoritySchemaTests(): void {
+describe("authority SQLite schema — integrity", () => {
   it("owns transaction state without requiring post-22.13 DatabaseSync APIs", () => {
     withDatabase((database) => {
       createV1Fixture(database);
@@ -2471,9 +2726,9 @@ describe("authority SQLite schema", () => {
     });
 
     withDatabase((database) => {
-      database.exec("PRAGMA user_version = 26");
+      database.exec("PRAGMA user_version = 27");
       expect(() => migrateAuthorityDatabase(database)).toThrow(/future schema/i);
-      expect(readSchemaVersion(database)).toBe(26);
+      expect(readSchemaVersion(database)).toBe(27);
     });
   });
 
@@ -2527,7 +2782,9 @@ describe("authority SQLite schema", () => {
     });
   });
 });
+}
 
+export function registerDerivedSnapshotSchemaTests(): void {
 describe("derived snapshot cache schema", () => {
   it("creates independent v2 WAL/FULL tables without changing authority v16", () => {
     withDatabase((database) => {
@@ -2545,7 +2802,7 @@ describe("derived snapshot cache schema", () => {
         .toBe(SNAPSHOT_CACHE_BUSY_TIMEOUT_MS);
       expect(() => validateSnapshotCacheSchema(database)).not.toThrow();
     });
-    expect(AUTHORITY_SCHEMA_VERSION).toBe(25);
+    expect(AUTHORITY_SCHEMA_VERSION).toBe(26);
   });
 
   it("fails closed on version-two corruption and refuses future versions", () => {
@@ -2597,3 +2854,4 @@ describe("derived snapshot cache schema", () => {
     });
   });
 });
+}

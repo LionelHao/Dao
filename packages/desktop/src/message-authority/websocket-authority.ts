@@ -47,6 +47,7 @@ import {
   type ProjectLoopWireRequest,
   type ProjectLoopWireResponse,
 } from "../project-loop/contracts.js";
+import type { ToolSafetyCommand } from "../tool-safety/contracts.js";
 
 type SocketEvent = "open" | "message" | "close" | "error";
 
@@ -80,6 +81,11 @@ export class MessageAuthorityTransportError extends Error {
     }>,
     readonly memoryError?: RoomMemoryError,
     readonly projectError?: ProjectLoopWireError,
+    readonly toolSafetyError?: Readonly<{
+      status: 401 | 403 | 409 | 410 | 429 | 503;
+      code: string;
+      retryAfterSeconds?: number;
+    }>,
   ) {
     super(`Message Authority transport failed: ${code}`);
     this.name = "MessageAuthorityTransportError";
@@ -104,6 +110,14 @@ export interface MessageAuthorityWireTransport {
   recall(command: MessageRecallCommand): Promise<MessageRecallAcceptedResult>;
   memoryRequest(command: RoomMemoryRequest): Promise<RoomMemorySuccessFrame | RoomMemoryError>;
   projectRequest(command: ProjectLoopWireRequest): Promise<ProjectLoopWireResponse>;
+  toolSafetyCommand(command: ToolSafetyCommand & Readonly<{ requestId: string }>): Promise<Readonly<{
+    type: "tool.safety.command.ack";
+    requestId: string;
+    operation: ToolSafetyCommand["type"];
+    objectId: string;
+    version: number;
+    replayed: boolean;
+  }>>;
   subscribeRoom(
     roomId: string,
     cursor: RoomCursor,
@@ -190,6 +204,14 @@ type ParsedFrame =
   | MessageRevisionsResult
   | RoomMemorySuccessFrame
   | ProjectLoopWireResponse
+  | Readonly<{
+      type: "tool.safety.command.ack";
+      requestId: string;
+      operation: ToolSafetyCommand["type"];
+      objectId: string;
+      version: number;
+      replayed: boolean;
+    }>
   | DesktopRoomSyncResult
   | Readonly<{
       type: "room.subscribed.v2";
@@ -312,6 +334,15 @@ export function parseMessageAuthorityServerFrame(raw: string): ParsedFrame | und
     case "message.accepted": return parseAccepted(value);
     case "message.revision.accepted": return parseRevisionAccepted(value);
     case "message.recall.accepted": return parseRecallAccepted(value);
+    case "tool.safety.command.ack":
+      return exact(value, ["type", "requestId", "operation", "objectId", "version", "replayed"]) &&
+        text(value.requestId, 128) && [
+          "tool.confirmation.decide", "tool.confirmation.handoff.offer",
+          "tool.confirmation.handoff.accept", "tool.outcome.review", "tool.compensation.propose",
+        ].includes(String(value.operation)) && text(value.objectId, 512) && count(value.version) &&
+        value.version > 0 && typeof value.replayed === "boolean"
+        ? structuredClone(value) as Extract<ParsedFrame, { type: "tool.safety.command.ack" }>
+        : undefined;
     case "room.history.v2":
       return exact(value, [
         "type", "requestId", "roomId", "messages", "hasMore", "lifecycle", "actors",
@@ -435,14 +466,23 @@ export function parseMessageAuthorityServerFrame(raw: string): ParsedFrame | und
       if (!exact(value, ["type", "status", "code", "message"], ["requestId", "details"]) ||
           typeof value.status !== "number" || !text(value.code, 128) || !text(value.message) ||
           (value.requestId !== undefined && !text(value.requestId, 128))) return undefined;
+      const toolStatus = [401, 403, 409, 410, 429, 503].includes(value.status)
+        ? value.status as 401 | 403 | 409 | 410 | 429 | 503 : undefined;
+      const retryAfterSeconds = record(value.details) && count(value.details.retryAfterSeconds) &&
+        value.details.retryAfterSeconds > 0 ? value.details.retryAfterSeconds : undefined;
+      const toolSafetyError = toolStatus === undefined ? undefined : {
+        status: toolStatus, code: value.code,
+        ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }),
+      };
       const closedError = closedWireError(value.status, value.code);
-      if (closedError === undefined) return undefined;
-      const code: MessageAuthorityTransportErrorCode = closedError.status === 401
-        ? closedError.code === "identity_forbidden" ? "session_revoked" : "authentication_required"
-        : closedError.status === 403 ? "access_revoked" : "protocol_error";
+      if (closedError === undefined && toolSafetyError === undefined) return undefined;
+      const code: MessageAuthorityTransportErrorCode = (closedError?.status ?? toolSafetyError?.status) === 401
+        ? closedError?.code === "identity_forbidden" ? "session_revoked" : "authentication_required"
+        : (closedError?.status ?? toolSafetyError?.status) === 403 ? "access_revoked" : "protocol_error";
       return { type: "error",
         ...(value.requestId === undefined ? {} : { requestId: value.requestId }),
-        error: new MessageAuthorityTransportError(code, closedError) };
+        error: new MessageAuthorityTransportError(code, closedError, undefined, undefined, undefined,
+          toolSafetyError) };
     }
     default: return undefined;
   }
@@ -868,6 +908,15 @@ export function createMessageAuthorityWebSocketTransport(options: {
         { ...command },
         expected,
       ));
+    },
+    async toolSafetyCommand(command) {
+      const response = await exactRequest<Extract<ParsedFrame, {
+        type: "tool.safety.command.ack";
+      }>>({ ...command }, "tool.safety.command.ack");
+      if (response.operation !== command.type) {
+        throw new MessageAuthorityTransportError("protocol_error");
+      }
+      return structuredClone(response);
     },
     async subscribeRoom(roomId, cursor, observer) {
       if (!isRoomCursor(cursor) || cursor.roomId !== roomId) {

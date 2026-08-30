@@ -30,8 +30,8 @@ function compilerInput(): ContextCompilerInputV1 {
       roomResponsibility: "Own releases",
       participation: "on-mention",
       availability: "ready",
-      effectiveCapabilities: ["room.conversation.read", "room.respond"],
-      effectiveTools: ["room-memory.read"],
+      effectiveCapabilities: ["room.conversation.read", "room.memory.read", "room.respond"],
+      effectiveTools: [],
       revisions: { profile: 2, assignment: 3, access: 4 },
     },
     room: {

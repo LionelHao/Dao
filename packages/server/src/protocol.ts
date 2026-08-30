@@ -136,6 +136,21 @@ const INVOCATION_CANCEL_INTENT_FIELDS = new Set([
 const AGENT_INTERRUPT_FIELDS = new Set(["type", "requestId", "executionId", "reason"]);
 const AGENT_CONFIRM_FIELDS = new Set(["type", "requestId", "confirmation"]);
 const AGENT_CONFIRMATION_FIELDS = new Set(["confirmationId", "executionId"]);
+const TOOL_CONFIRMATION_DECIDE_FIELDS = new Set([
+  "type", "requestId", "confirmationId", "expectedVersion", "decision",
+]);
+const TOOL_HANDOFF_OFFER_FIELDS = new Set([
+  "type", "requestId", "confirmationId", "expectedVersion", "targetActorId",
+]);
+const TOOL_HANDOFF_ACCEPT_FIELDS = new Set([
+  "type", "requestId", "handoffId", "expectedVersion",
+]);
+const TOOL_OUTCOME_REVIEW_FIELDS = new Set([
+  "type", "requestId", "dispatchId", "expectedVersion", "resolution", "evidenceSummary",
+]);
+const TOOL_COMPENSATION_PROPOSE_FIELDS = new Set([
+  "type", "requestId", "dispatchId", "expectedVersion",
+]);
 const OPEN_ITEM_CREATE_FIELDS = new Set([
   "type", "requestId", "roomId", "creationKind", "sourceMessageId", "targetActorId", "content",
 ]);
@@ -415,6 +430,61 @@ export interface AgentCompensateFrame {
   readonly executionId: string;
 }
 
+export interface ToolConfirmationDecideFrame {
+  readonly type: "tool.confirmation.decide";
+  readonly requestId: string;
+  readonly confirmationId: string;
+  readonly expectedVersion: number;
+  readonly decision: "confirm" | "reject";
+}
+
+export interface ToolConfirmationHandoffOfferFrame {
+  readonly type: "tool.confirmation.handoff.offer";
+  readonly requestId: string;
+  readonly confirmationId: string;
+  readonly expectedVersion: number;
+  readonly targetActorId: string;
+}
+
+export interface ToolConfirmationHandoffAcceptFrame {
+  readonly type: "tool.confirmation.handoff.accept";
+  readonly requestId: string;
+  readonly handoffId: string;
+  readonly expectedVersion: number;
+}
+
+export interface ToolOutcomeReviewFrame {
+  readonly type: "tool.outcome.review";
+  readonly requestId: string;
+  readonly dispatchId: string;
+  readonly expectedVersion: number;
+  readonly resolution: "known_succeeded" | "known_failed" | "compensated" | "accepted_risk";
+  readonly evidenceSummary: string;
+}
+
+export interface ToolCompensationProposeFrame {
+  readonly type: "tool.compensation.propose";
+  readonly requestId: string;
+  readonly dispatchId: string;
+  readonly expectedVersion: number;
+}
+
+export type ToolSafetyClientFrame =
+  | ToolConfirmationDecideFrame
+  | ToolConfirmationHandoffOfferFrame
+  | ToolConfirmationHandoffAcceptFrame
+  | ToolOutcomeReviewFrame
+  | ToolCompensationProposeFrame;
+
+export interface ToolSafetyCommandAckFrame {
+  readonly type: "tool.safety.command.ack";
+  readonly requestId: string;
+  readonly operation: ToolSafetyClientFrame["type"];
+  readonly objectId: string;
+  readonly version: number;
+  readonly replayed: boolean;
+}
+
 export interface OpenItemCreateFrame {
   readonly type: "open-item.create";
   readonly requestId: string;
@@ -498,6 +568,7 @@ export type ClientFrame =
   | InvocationRetryFrame
   | AgentToolConfirmFrame
   | AgentCompensateFrame
+  | ToolSafetyClientFrame
   | OpenItemCreateFrame
   | OpenItemTransitionFrame
   | LightTaskCreateFrame
@@ -862,6 +933,8 @@ export type ProtocolErrorCode =
   | "protocol_upgrade_required"
   | "departure_blocked"
   | "confirmation_rejected"
+  | "confirmation_replayed"
+  | "confirmation_expired"
   | "content_too_large"
   | "grant_revoked"
   | "dependency_unavailable"
@@ -902,6 +975,15 @@ export type ProtocolErrorCode =
   | "side_effect_outcome_unknown"
   | "tool_failure"
   | "tool_target_busy"
+  | "tool_confirmation_not_found"
+  | "tool_parameters_changed"
+  | "stale_tool_call"
+  | "tool_already_terminal"
+  | "tool_confirmation_expired"
+  | "tool_grant_expired"
+  | "tool_source_gone"
+  | "tool_needs_review"
+  | "tool_capacity_limited"
   | "internal_error";
 
 export type ProtocolErrorFrame =
@@ -955,6 +1037,7 @@ export type ServerFrame =
   | AgentExecutionPreviewResetFrame
   | InvocationCancelAckFrame
   | InvocationRetryAckFrame
+  | ToolSafetyCommandAckFrame
   | OpenItemAckFrame
   | LightTaskAckFrame
   | BallQueryResultFrame
@@ -1798,6 +1881,64 @@ export function parseClientFrame(raw: string): ClientFrameParseResult {
         confirmationId: value.confirmation.confirmationId,
         executionId: value.confirmation.executionId,
       } } };
+    case "tool.confirmation.decide":
+      if (!hasOnlyFields(value, TOOL_CONFIRMATION_DECIDE_FIELDS) || requestId === undefined ||
+          !isBoundedText(value.confirmationId, PROTOCOL_FIELD_LIMITS.messageId) ||
+          !isPositiveSafeInteger(value.expectedVersion) ||
+          (value.decision !== "confirm" && value.decision !== "reject")) {
+        return { ok: false, error: protocolError("tool.confirmation.decide requires a closed CAS decision", requestId) };
+      }
+      return { ok: true, frame: {
+        type: "tool.confirmation.decide", requestId,
+        confirmationId: value.confirmationId, expectedVersion: value.expectedVersion,
+        decision: value.decision,
+      } };
+    case "tool.confirmation.handoff.offer":
+      if (!hasOnlyFields(value, TOOL_HANDOFF_OFFER_FIELDS) || requestId === undefined ||
+          !isBoundedText(value.confirmationId, PROTOCOL_FIELD_LIMITS.messageId) ||
+          !isPositiveSafeInteger(value.expectedVersion) ||
+          !isBoundedText(value.targetActorId, PROTOCOL_FIELD_LIMITS.accountId)) {
+        return { ok: false, error: protocolError("tool.confirmation.handoff.offer requires a closed target-specific CAS offer", requestId) };
+      }
+      return { ok: true, frame: {
+        type: "tool.confirmation.handoff.offer", requestId,
+        confirmationId: value.confirmationId, expectedVersion: value.expectedVersion,
+        targetActorId: value.targetActorId,
+      } };
+    case "tool.confirmation.handoff.accept":
+      if (!hasOnlyFields(value, TOOL_HANDOFF_ACCEPT_FIELDS) || requestId === undefined ||
+          !isBoundedText(value.handoffId, PROTOCOL_FIELD_LIMITS.messageId) ||
+          !isPositiveSafeInteger(value.expectedVersion)) {
+        return { ok: false, error: protocolError("tool.confirmation.handoff.accept requires a closed CAS acceptance", requestId) };
+      }
+      return { ok: true, frame: {
+        type: "tool.confirmation.handoff.accept", requestId,
+        handoffId: value.handoffId, expectedVersion: value.expectedVersion,
+      } };
+    case "tool.outcome.review":
+      if (!hasOnlyFields(value, TOOL_OUTCOME_REVIEW_FIELDS) || requestId === undefined ||
+          !isBoundedText(value.dispatchId, PROTOCOL_FIELD_LIMITS.messageId) ||
+          !isPositiveSafeInteger(value.expectedVersion) ||
+          (value.resolution !== "known_succeeded" && value.resolution !== "known_failed" &&
+            value.resolution !== "compensated" && value.resolution !== "accepted_risk") ||
+          !isBoundedText(value.evidenceSummary, 2_048)) {
+        return { ok: false, error: protocolError("tool.outcome.review requires a closed bounded review", requestId) };
+      }
+      return { ok: true, frame: {
+        type: "tool.outcome.review", requestId, dispatchId: value.dispatchId,
+        expectedVersion: value.expectedVersion, resolution: value.resolution,
+        evidenceSummary: value.evidenceSummary,
+      } };
+    case "tool.compensation.propose":
+      if (!hasOnlyFields(value, TOOL_COMPENSATION_PROPOSE_FIELDS) || requestId === undefined ||
+          !isBoundedText(value.dispatchId, PROTOCOL_FIELD_LIMITS.messageId) ||
+          !isPositiveSafeInteger(value.expectedVersion)) {
+        return { ok: false, error: protocolError("tool.compensation.propose requires a closed CAS proposal", requestId) };
+      }
+      return { ok: true, frame: {
+        type: "tool.compensation.propose", requestId,
+        dispatchId: value.dispatchId, expectedVersion: value.expectedVersion,
+      } };
     case "open-item.create":
       if (!hasOnlyFields(value, OPEN_ITEM_CREATE_FIELDS) || requestId === undefined ||
           !isBoundedString(value.roomId, PROTOCOL_FIELD_LIMITS.roomId) ||

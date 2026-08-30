@@ -23,7 +23,7 @@ describe("Tenant administration worker protocol", () => {
       expectedRevision: 0 as const, displayName: "Researcher",
       globalResponsibility: "Verify sources",
       capabilityCeiling: ["room.project.read", "room.respond"],
-      toolCeiling: ["repository.git-status", "room-memory.read"], now: 1_000,
+      toolCeiling: ["repository.git-status"], now: 1_000,
     };
     expect(isTenantAdministrationOperation(create)).toBe(true);
     for (const injected of [
@@ -45,7 +45,7 @@ describe("Tenant administration worker protocol", () => {
     const profile = {
       profileId: "profile-1", actorId: "agent-1", displayName: "Researcher",
       globalResponsibility: "Verify sources", status: "enabled" as const,
-      capabilityCeiling: ["room.project.read"], toolCeiling: ["room-memory.read"],
+      capabilityCeiling: ["room.project.read"], toolCeiling: ["repository.git-status"],
       revision: 1, createdAt: "2026-08-24T00:00:00.000Z",
       updatedAt: "2026-08-24T00:00:00.000Z",
     };

@@ -63,7 +63,7 @@ function compilerInput(): ContextCompilerInputV1 {
       globalResponsibility: "Exercise authoritative Agent behavior in a closed test fixture.",
       roomResponsibility: "Exercise authoritative Room behavior in a closed test fixture.",
       participation: "on-mention", availability: "busy",
-      effectiveCapabilities: ["room.conversation.read", "room.respond"], effectiveTools: ["room-memory.read"],
+      effectiveCapabilities: ["room.conversation.read", "room.memory.read", "room.respond"], effectiveTools: [],
       revisions: { profile: 1, assignment: 1, access: 0 },
     },
     room: {
@@ -196,7 +196,7 @@ function seedExecution(
   database.exec(`
     INSERT INTO actors (id, kind, display_name, tool_permissions_json, readiness)
     VALUES ('context-human', 'human', 'Human', '[]', 'ready'),
-           ('context-agent', 'agent', 'Agent', '["room-memory.read"]', 'busy');
+           ('context-agent', 'agent', 'Agent', '[]', 'busy');
     INSERT INTO streams (stream_kind, stream_id, head_seq, retained_from_seq)
     VALUES ('identity', 'context-human', 0, 1),
            ('identity', 'context-agent', 0, 1),
@@ -209,7 +209,7 @@ function seedExecution(
     ) VALUES
       ('context-room', 'context-human', 'human', 'owner', NULL, '[]', '${NOW}', NULL, 0),
       ('context-room', 'context-agent', 'agent', NULL, '${participation}',
-       '["room-memory.read"]', NULL, '${NOW}', 0);
+       '[]', NULL, '${NOW}', 0);
     INSERT INTO messages (id, room_id, author_id, author_kind, body, sent_at)
     VALUES ('context-trigger', 'context-room', 'context-human', 'human',
       'frozen trigger', '${NOW}');
@@ -225,8 +225,8 @@ function seedExecution(
   const profileId = seedCanonicalAgentProfileFixture(database, {
     actorId: "context-agent",
     displayName: "Agent",
-    capabilityCeiling: ["room.conversation.read", "room.respond"],
-    toolCeiling: ["room-memory.read"],
+    capabilityCeiling: ["room.conversation.read", "room.memory.read", "room.respond"],
+    toolCeiling: [],
     now: NOW,
   });
   seedCanonicalRoomAssignmentFixture(database, {
@@ -235,8 +235,8 @@ function seedExecution(
     profileId,
     actorId: "context-agent",
     participation,
-    capabilitySubset: ["room.conversation.read", "room.respond"],
-    toolSubset: ["room-memory.read"],
+    capabilitySubset: ["room.conversation.read", "room.memory.read", "room.respond"],
+    toolSubset: [],
     now: NOW,
   });
   if (intentKind === "direct_mention") {
@@ -712,7 +712,9 @@ describe("v19 Context Snapshot database authority", () => {
       ).run();
       const prepared = preparation(database);
       expect(prepared.compilerInputFacts.agent.effectiveTools).toEqual([]);
-      expect(prepared.compilerInputFacts.tools).toEqual([]);
+      expect(prepared.compilerInputFacts.tools).toEqual([expect.objectContaining({
+        id: "room-memory.read",
+      })]);
       const operation = commitInput(
         prepared.preparationSha256, {}, prepared.compilerInputFacts,
       );

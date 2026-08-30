@@ -691,6 +691,65 @@ describe("closed v2 recovery protocol", () => {
     }
   });
 
+  it("accepts only exact FT-10 Human tool-safety commands", () => {
+    const frames = [
+      {
+        type: "tool.confirmation.decide", requestId: "tool-decide",
+        confirmationId: "confirmation-1", expectedVersion: 1, decision: "confirm",
+      },
+      {
+        type: "tool.confirmation.handoff.offer", requestId: "tool-offer",
+        confirmationId: "confirmation-1", expectedVersion: 1, targetActorId: "human-2",
+      },
+      {
+        type: "tool.confirmation.handoff.accept", requestId: "tool-accept",
+        handoffId: "handoff-1", expectedVersion: 2,
+      },
+      {
+        type: "tool.outcome.review", requestId: "tool-review",
+        dispatchId: "dispatch-1", expectedVersion: 3,
+        resolution: "accepted_risk", evidenceSummary: "Human checked the target.",
+      },
+      {
+        type: "tool.compensation.propose", requestId: "tool-compensate",
+        dispatchId: "dispatch-1", expectedVersion: 3,
+      },
+    ] as const;
+    for (const frame of frames) {
+      expect(parse(frame)).toEqual({ ok: true, frame });
+    }
+    expect(parse({ ...frames[3], resolution: "compensated" })).toMatchObject({
+      ok: true, frame: { type: "tool.outcome.review", resolution: "compensated" },
+    });
+
+    const forbiddenFields = [
+      "roomId", "principalId", "sessionFamilyId", "agentId", "attemptSeq",
+      "toolId", "canonicalParameterSha256", "rawParameters", "grantId",
+      "dispatchPermit", "capability", "provider", "model", "url", "headers",
+      "pathRoot", "sealedPayload",
+    ] as const;
+    for (const field of forbiddenFields) {
+      const parsed = parse({ ...frames[0], [field]: `${field}-canary` });
+      expect(parsed).toMatchObject({
+        ok: false,
+        error: { status: 400, code: "invalid_request", requestId: "tool-decide" },
+      });
+      expect(JSON.stringify(parsed)).not.toContain(`${field}-canary`);
+    }
+
+    for (const invalid of [
+      { ...frames[0], expectedVersion: 0 },
+      { ...frames[0], decision: "approve" },
+      { ...frames[1], targetActorId: "" },
+      { ...frames[2], handoffId: "" },
+      { ...frames[3], resolution: "undo" },
+      { ...frames[3], evidenceSummary: "" },
+      { ...frames[4], dispatchId: "" },
+    ]) {
+      expect(parse(invalid)).toMatchObject({ ok: false, error: { code: "invalid_request" } });
+    }
+  });
+
   it("accepts only explicit closed T-0018 LightTask frames", () => {
     expect(parse({
       type: "light-task.intent", requestId: "task-intent", roomId: "room-1",

@@ -36,6 +36,8 @@ import { registerAgentSettingsIpc } from "./agent-profile-routing/ipc.js";
 import { registerInvocationIpc } from "./invocation-runtime/ipc.js";
 import { createDesktopProjectLoopRuntime } from "./project-loop/production-runtime.js";
 import { registerProjectLoopIpc } from "./project-loop/ipc.js";
+import { createDesktopToolSafetyRuntime } from "./tool-safety/production-runtime.js";
+import { registerToolSafetyIpc } from "./tool-safety/ipc.js";
 import { createEncryptedAuthorityCachePersistence } from "./governance/encrypted-authority-cache.js";
 import { createDesktopAttachmentAuthorityRuntime } from "./attachment-authority/production-runtime.js";
 import {
@@ -67,6 +69,8 @@ async function createWindow(): Promise<void> {
   let disposeMemoryAuthorityIpc: (() => void) | undefined;
   let projectLoop: ReturnType<typeof createDesktopProjectLoopRuntime> | undefined;
   let disposeProjectLoopIpc: (() => void) | undefined;
+  let toolSafety: ReturnType<typeof createDesktopToolSafetyRuntime> | undefined;
+  let disposeToolSafetyIpc: (() => void) | undefined;
   let disposeAttachmentGovernanceState: (() => void) | undefined;
   let agentSettings: ReturnType<typeof createDesktopAgentSettingsRuntime> | undefined;
   let disposeAgentSettingsIpc: (() => void) | undefined;
@@ -125,6 +129,7 @@ async function createWindow(): Promise<void> {
       webContents: window.webContents,
       authorizedState: {
         invalidate: () => {
+          toolSafety?.invalidateAuthorizedState();
           governance?.invalidateAuthorizedState();
           agentSettings?.invalidateAuthorizedState();
           messageAuthorityRuntime?.invalidateAuthorizedState();
@@ -220,12 +225,24 @@ async function createWindow(): Promise<void> {
       webContents: window.webContents,
       runtime: projectLoop,
     });
+    toolSafety = createDesktopToolSafetyRuntime({
+      session: () => identity?.getCurrentAuthoritySession(),
+      transport: messageAuthorityRuntime.transport,
+      authorityCache: governance.cache,
+      repairRoom: (roomId) => governance!.repairRoom(roomId),
+      createRequestId: () => `tool-safety-${randomUUID()}`,
+    });
+    toolSafety.start();
+    disposeToolSafetyIpc = registerToolSafetyIpc({
+      ipcMain, webContents: window.webContents, runtime: toolSafety,
+    });
     window.once("closed", () => {
       disposeGovernanceIpc?.();
       disposeInvocationIpc?.();
       disposeMessageAuthorityIpc?.();
       disposeMemoryAuthorityIpc?.();
       disposeProjectLoopIpc?.();
+      disposeToolSafetyIpc?.();
       disposeAgentSettingsIpc?.();
       disposeAttachmentGovernanceState?.();
       attachmentRuntimeHost.close();
@@ -235,6 +252,7 @@ async function createWindow(): Promise<void> {
       messageAuthorityRuntime?.close();
       memoryAuthorityRuntime?.close();
       projectLoop?.close();
+      toolSafety?.close();
       agentSettings?.close();
     });
 
@@ -249,6 +267,7 @@ async function createWindow(): Promise<void> {
         agentSettingsMethods: Object.keys(globalThis.dao?.agentSettings ?? {}).sort(),
         invocationMethods: Object.keys(globalThis.dao?.invocation ?? {}).sort(),
         projectLoopMethods: Object.keys(globalThis.dao?.projectLoop ?? {}).sort(),
+        toolSafetyMethods: Object.keys(globalThis.dao?.toolSafety ?? {}).sort(),
         namespaces: Object.keys(globalThis.dao ?? {}).sort(),
         bridgeMissing: document.querySelector("[data-identity-bridge-missing]") !== null,
         governanceRouteContract: document.querySelector("#app")?.dataset.governanceRouteContract ?? "",
@@ -293,6 +312,7 @@ async function createWindow(): Promise<void> {
     const expectedAgentSettingsMethods = ["getSnapshot", "onAuthorityMessage", "submit"];
     const expectedInvocationMethods = ["cancel", "getSurface", "onStateChanged", "retry"];
     const expectedProjectLoopMethods = ["getSurface", "onStateChanged", "submit"];
+    const expectedToolSafetyMethods = ["getSurface", "onStateChanged", "repair", "submit"];
     let startupProbe: unknown;
     try {
       startupProbe = typeof startupProbeJson === "string"
@@ -331,9 +351,11 @@ async function createWindow(): Promise<void> {
         startupProbe.invocationMethods.join(",") !== expectedInvocationMethods.join(",") ||
         !("projectLoopMethods" in startupProbe) || !Array.isArray(startupProbe.projectLoopMethods) ||
         startupProbe.projectLoopMethods.join(",") !== expectedProjectLoopMethods.join(",") ||
+        !("toolSafetyMethods" in startupProbe) || !Array.isArray(startupProbe.toolSafetyMethods) ||
+        startupProbe.toolSafetyMethods.join(",") !== expectedToolSafetyMethods.join(",") ||
         !("namespaces" in startupProbe) || !Array.isArray(startupProbe.namespaces) ||
         startupProbe.namespaces.join(",") !==
-          "agentSettings,attachmentAuthority,governance,identity,invocation,memoryAuthority,messageAuthority,projectLoop" ||
+          "agentSettings,attachmentAuthority,governance,identity,invocation,memoryAuthority,messageAuthority,projectLoop,toolSafety" ||
         !("governanceRouteContract" in startupProbe) ||
         startupProbe.governanceRouteContract !== "closed-v1" ||
         !("bridgeMissing" in startupProbe) || startupProbe.bridgeMissing !== false ||
@@ -358,6 +380,7 @@ async function createWindow(): Promise<void> {
     disposeMessageAuthorityIpc?.();
     disposeMemoryAuthorityIpc?.();
     disposeProjectLoopIpc?.();
+    disposeToolSafetyIpc?.();
     disposeAgentSettingsIpc?.();
     disposeAttachmentGovernanceState?.();
     attachmentRuntimeHost.close();
@@ -367,6 +390,7 @@ async function createWindow(): Promise<void> {
     messageAuthorityRuntime?.close();
     memoryAuthorityRuntime?.close();
     projectLoop?.close();
+    toolSafety?.close();
     agentSettings?.close();
     if (!window.isDestroyed()) window.destroy();
     throw error;

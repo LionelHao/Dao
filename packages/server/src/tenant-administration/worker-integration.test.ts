@@ -71,7 +71,7 @@ describe("Tenant administration AuthorityWorker integration", () => {
       expectedRevision: 0 as const, displayName: "Researcher",
       globalResponsibility: "Verify source evidence",
       capabilityCeiling: ["room.project.read", "room.respond"],
-      toolCeiling: ["repository.git-status", "room-memory.read"], now: NOW,
+      toolCeiling: ["repository.git-status"], now: NOW,
     };
     const created = await client.executeTenantAdministration(operation);
     await expect(client.executeTenantAdministration(operation)).resolves.toEqual(created);
@@ -83,7 +83,7 @@ describe("Tenant administration AuthorityWorker integration", () => {
         idempotencyKey: "profile-update-key" },
       profileId: created.profile.profileId, expectedRevision: 1,
       displayName: "Evidence Researcher", globalResponsibility: "Verify durable evidence",
-      capabilityCeiling: ["room.project.read"], toolCeiling: ["room-memory.read"], now: NOW,
+      capabilityCeiling: ["room.project.read"], toolCeiling: ["repository.git-status"], now: NOW,
     });
     expect(updated).toMatchObject({ kind: "agent-profile",
       profile: { revision: 2, status: "enabled" },

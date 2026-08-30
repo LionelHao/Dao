@@ -28,7 +28,6 @@ import {
 } from "../../desktop/src/identity/websocket-client.js";
 import { createScryptIdentityAdapter, MAX_ACTIVE_SESSION_FAMILIES } from "./auth.js";
 import {
-  startAuthoritativeServer,
   startAuthoritativeServerForTest,
   type AuthoritativeServer,
 } from "./authoritative-server.js";
@@ -1439,6 +1438,9 @@ describe("authoritative server real-process harness", () => {
         invitationSecretKey: new Uint8Array(32).fill(48),
         tenantAdministration: { bootstrapHumanActorIds: ["human-a"] },
       }, {
+        ...(process.platform === "linux" ? {} : {
+          toolAdapterPathFallbackForTest: true as const,
+        }),
         initialize: async (facades) => {
           const issued = await facades.auth.login({ accountId: "account-a", secret: "test-secret" });
           const authenticated = await facades.auth.authenticateSession(issued.accessToken);
@@ -1532,6 +1534,9 @@ describe("authoritative server real-process harness", () => {
         invitationSecretKey: new Uint8Array(32).fill(47),
         tenantAdministration: { bootstrapHumanActorIds: ["human-a"] },
       }, {
+        ...(process.platform === "linux" ? {} : {
+          toolAdapterPathFallbackForTest: true as const,
+        }),
         initialize: async (facades) => {
           const issued = await facades.auth.login({ accountId, secret: passwordCanary });
           const authenticated = await facades.auth.authenticateSession(issued.accessToken);
@@ -1609,7 +1614,7 @@ describe("authoritative server real-process harness", () => {
           displayName: "FT-07 Research Agent",
           globalResponsibility: "Research authoritative sources for the Room.",
           capabilityCeiling: ["room.conversation.read", "room.memory.read", "room.respond"],
-          toolCeiling: ["room-memory.read"],
+          toolCeiling: ["repository.git-status"],
         },
       })).resolves.toMatchObject({
         type: "ack", requestId: "renderer-profile-create", command: "profile.create",
@@ -1633,7 +1638,7 @@ describe("authoritative server real-process harness", () => {
           roomResponsibility: "Answer only when mentioned and cite Room memory.",
           participation: "on-mention",
           capabilitySubset: ["room.conversation.read", "room.memory.read", "room.respond"],
-          toolSubset: ["room-memory.read"],
+          toolSubset: ["repository.git-status"],
         },
       })).resolves.toMatchObject({
         type: "ack", requestId: "renderer-assignment-create", command: "assignment.create",
@@ -1649,7 +1654,7 @@ describe("authoritative server real-process harness", () => {
           profileId: profile.profileId,
           participation: "on-mention",
           availability: "noauth",
-          effectiveTools: ["room-memory.read"],
+          effectiveTools: ["repository.git-status"],
           profileRevision: 1,
           assignmentRevision: 1,
         }],
@@ -3425,7 +3430,8 @@ describe("authoritative server real-process harness", () => {
     let server: AuthoritativeServer | undefined;
 
     try {
-      server = await startAuthoritativeServer(serverOptions);
+      server = await startAuthoritativeServerForTest(
+        serverOptions, { toolAdapterPathFallbackForTest: true });
       const controllerA = createIdentitySessionController({
         vault: profileA.vault,
         deviceIdentity: createMemoryDevice("installation-a", "FT01 Device A"),
@@ -3588,7 +3594,8 @@ describe("authoritative server real-process harness", () => {
         database.close();
       }
 
-      server = await startAuthoritativeServer(serverOptions);
+      server = await startAuthoritativeServerForTest(
+        serverOptions, { toolAdapterPathFallbackForTest: true });
       const restoredA = createIdentitySessionController({
         vault: profileA.vault,
         deviceIdentity: createMemoryDevice("installation-a", "FT01 Device A"),

@@ -1,6 +1,7 @@
 export type ActorKind = "human" | "agent";
 
 export * from "./project-loop.js";
+export * from "./tool-safety.js";
 
 export type HumanReachability = "online" | "dnd" | "offline";
 export type AgentReadiness = "ready" | "busy" | "paused" | "noauth";
@@ -548,6 +549,7 @@ export {
   isRoomSyncResult,
   isSnapshotCompleted,
   isSnapshotVersion,
+  isToolSafetyRepairRecord,
   isWorkspaceBootstrapPage,
 } from "./sync.js";
 export type {
@@ -566,6 +568,8 @@ export type {
   RoomArchivedEventPayload,
   RoomRepairPage,
   RoomRepairRecord,
+  ToolSafetyEvent,
+  ToolSafetyRepairRecord,
   RoomAgentAssignmentChangedPayload,
   RoomAgentAssignmentProjection,
   RoomAgentAssignmentRepairSnapshot,

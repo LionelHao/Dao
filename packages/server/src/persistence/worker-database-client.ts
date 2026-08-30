@@ -114,7 +114,7 @@ export interface CreateWorkerDatabaseClientOptions {
 }
 
 export interface AuthoritySchemaInspection {
-  readonly version: 25;
+  readonly version: 26;
 }
 
 export interface WorkerDatabaseClient {
@@ -903,6 +903,7 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
   #terminalError: AuthorityWorkerClientError | undefined;
   #closedError: AuthorityWorkerClientError | undefined;
   #closePromise: Promise<void> | undefined;
+  #terminationPromise: Promise<boolean> | undefined;
   #authorityGateTail: Promise<void> | undefined;
   readonly #authorityInFlight = new Set<Promise<AuthorityWorkerResponse>>();
 
@@ -947,6 +948,10 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
       throw this.#terminalError;
     }
     this.#state = "open";
+  }
+
+  async disposeAfterInitializationFailure(): Promise<void> {
+    await this.#terminateAndRelease();
   }
 
   inspectSchema(): Promise<AuthoritySchemaInspection> {
@@ -2253,12 +2258,16 @@ class WorkerDatabaseClientImplementation implements CompleteWorkerDatabaseClient
     for (const request of pending) {
       request.reject(error);
     }
-    void terminateTransport(this.#worker).then((terminated) => {
-      if (terminated) {
-        this.#releaseCoordinator();
-      }
-    });
+    void this.#terminateAndRelease();
     return error;
+  }
+
+  #terminateAndRelease(): Promise<boolean> {
+    this.#terminationPromise ??= terminateTransport(this.#worker).then((terminated) => {
+      if (terminated) this.#releaseCoordinator();
+      return terminated;
+    });
+    return this.#terminationPromise;
   }
 }
 
@@ -2317,11 +2326,9 @@ async function createClient(
     await client.initialize();
     return client;
   } catch (error: unknown) {
+    await client.disposeAfterInitializationFailure();
     if (error instanceof AuthorityWorkerClientError) {
       throw error;
-    }
-    if (await terminateTransport(worker)) {
-      reservation.release();
     }
     throw new AuthorityWorkerClientError(
       "authority_worker_error",

@@ -137,8 +137,8 @@ function assignment(revision: number, paused = false): Record<string, unknown> {
     globalResponsibility: "Verify evidence", roomResponsibility: "Review this Room",
     participation: "active", availability: paused ? "paused" : "ready", paused,
     capabilityCeiling: ["room.respond"], capabilitySubset: ["room.respond"],
-    effectiveCapabilities: ["room.respond"], toolCeiling: ["room-memory.read"],
-    toolSubset: ["room-memory.read"], effectiveTools: ["room-memory.read"],
+    effectiveCapabilities: ["room.respond"], toolCeiling: ["repository.git-status"],
+    toolSubset: ["repository.git-status"], effectiveTools: ["repository.git-status"],
     profileRevision: 1, assignmentRevision: revision, accessRevision: 1,
     updatedAt: "2026-08-25T00:00:00.000Z",
   };

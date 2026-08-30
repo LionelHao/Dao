@@ -13,6 +13,8 @@ import type {
   ScopedCancellationCommitEffect,
   ScopedCancellationCommitReceipt,
 } from "../scoped-cancellation/scoped-cancellation-orchestrator.js";
+import { settleToolSafetyExecutionFenceInTransaction } from
+  "../tool-safety/database-authority.js";
 
 export type InternalScopedProducerCapability =
   | "message_authority"
@@ -241,7 +243,13 @@ function appendCanonicalTerminalProjection(
             runtime.terminal_error_code AS terminalErrorCode, runtime.review_state AS reviewState,
             legacy.room_id AS roomId, legacy.agent_id AS agentId,
             legacy.dead_lettered_at AS deadLetteredAt,
-            legacy.result_message_id AS resultMessageId
+            legacy.result_message_id AS resultMessageId,
+            EXISTS (
+              SELECT 1 FROM tool_dispatches_v2 AS dispatch
+              JOIN tool_calls_v2 AS call ON call.tool_call_id = dispatch.tool_call_id
+              WHERE call.execution_id = runtime.execution_id
+                AND dispatch.state = 'outcome_unknown'
+            ) AS unresolvedReview
      FROM agent_execution_runtime_states AS runtime
      JOIN agent_executions AS legacy ON legacy.id = runtime.execution_id
      WHERE runtime.execution_id = ? AND runtime.review_state <> 'legacy_review_required'`,
@@ -272,7 +280,9 @@ function appendCanonicalTerminalProjection(
     ...(status === "cancelled" ? { cancellationReason: row.terminalReason } : {}),
     ...(status === "failed" ? {
       terminalErrorCode: row.terminalErrorCode,
-      reviewState: row.reviewState === "needs_review" ? "needs_review" : "not_required",
+      reviewState: row.reviewState === "needs_review"
+        ? row.unresolvedReview === 1 ? "needs_review" : "reviewed"
+        : "not_required",
     } : {}),
     ...(typeof row.deadLetteredAt === "string" ? { deadLetteredAt: row.deadLetteredAt } : {}),
     ...(typeof row.resultMessageId === "string" ? { resultMessageId: row.resultMessageId } : {}),
@@ -359,6 +369,7 @@ function dispositions(database: DatabaseSync, executionId: string, attemptSeq: n
     confirmationDisposition: ScopedCancellationCommitEffect["confirmationDisposition"];
     grantDisposition: ScopedCancellationCommitEffect["grantDisposition"];
     sideEffectState: ScopedCancellationCommitEffect["sideEffectState"];
+    parentOutcomeUnknown: boolean;
   }> {
   const confirmations = database.prepare(
     `SELECT confirmation_id AS id, confirmation_state AS state FROM tool_confirmations
@@ -372,11 +383,15 @@ function dispositions(database: DatabaseSync, executionId: string, attemptSeq: n
     `SELECT dispatch_id AS id, state FROM tool_dispatches
      WHERE execution_id = ? AND attempt_seq = ? ORDER BY dispatch_id`,
   ).all(executionId, attemptSeq);
-  const rejectedConfirmationIds = confirmations.flatMap((row) =>
+  const legacyRejectedConfirmationIds = confirmations.flatMap((row) =>
     row.state === "pending" && typeof row.id === "string" ? [row.id] : []);
-  const revokedGrantIds = grants.flatMap((row) =>
+  const legacyRevokedGrantIds = grants.flatMap((row) =>
     row.state === "active" && typeof row.id === "string" ? [row.id] : []);
-  const preservedDispatchIds = dispatches.flatMap((row) => typeof row.id === "string" ? [row.id] : []);
+  const legacyPreservedDispatchIds = dispatches.flatMap((row) =>
+    typeof row.id === "string" ? [row.id] : []);
+  let v2RejectedConfirmationIds: readonly string[] = [];
+  let v2RevokedGrantIds: readonly string[] = [];
+  let v2PreservedDispatchIds: readonly string[] = [];
   if (apply) {
     database.prepare(
       `UPDATE tool_confirmations SET confirmation_state = 'rejected', confirmation_reason = ?,
@@ -388,7 +403,30 @@ function dispositions(database: DatabaseSync, executionId: string, attemptSeq: n
          grant_revision = grant_revision + 1, grant_changed_at = ?
        WHERE execution_id = ? AND attempt_seq = ? AND grant_state = 'active'`,
     ).run(reason, occurredAt, executionId, attemptSeq);
+    const hasToolSafetyV2 = database.prepare(
+      `SELECT COUNT(*) AS count FROM sqlite_master
+       WHERE type = 'table' AND name IN (
+         'tool_calls_v2','tool_confirmations_v2','tool_grants_v2','tool_dispatches_v2'
+       )`,
+    ).get()?.count === 4;
+    if (hasToolSafetyV2) {
+      const fenceReason = reason === "message_recalled" ? "source_recalled"
+        : reason === "membership_revoked" ? "principal_revoked" : "execution_cancelled";
+      const v2 = settleToolSafetyExecutionFenceInTransaction(
+        database, executionId, fenceReason, occurredAt,
+      );
+      v2RejectedConfirmationIds = v2.rejectedConfirmationIds;
+      v2RevokedGrantIds = v2.revokedGrantIds;
+      v2PreservedDispatchIds = v2.preservedDispatchIds;
+    }
   }
+  const rejectedConfirmationIds = [...new Set([
+    ...legacyRejectedConfirmationIds, ...v2RejectedConfirmationIds,
+  ])];
+  const revokedGrantIds = [...new Set([...legacyRevokedGrantIds, ...v2RevokedGrantIds])];
+  const preservedDispatchIds = [...new Set([
+    ...legacyPreservedDispatchIds, ...v2PreservedDispatchIds,
+  ])];
   return {
     rejectedConfirmationIds,
     revokedGrantIds,
@@ -397,8 +435,10 @@ function dispositions(database: DatabaseSync, executionId: string, attemptSeq: n
       : confirmations.some((row) => row.state === "confirmed") ? "confirmed_retained" : "none",
     grantDisposition: revokedGrantIds.length > 0 ? "unclaimed_revoked"
       : grants.some((row) => row.state === "claimed") ? "claimed_retained" : "none",
-    sideEffectState: dispatches.some((row) => row.state === "outcome_unknown")
+    sideEffectState: v2PreservedDispatchIds.length > 0 ||
+      dispatches.some((row) => row.state === "outcome_unknown")
       ? "outcome-unknown-retained" : preservedDispatchIds.length > 0 ? "dispatched-retained" : "none",
+    parentOutcomeUnknown: v2PreservedDispatchIds.length > 0,
   };
 }
 
@@ -559,21 +599,39 @@ export function commitInternalScopedProducerInTransaction(
     const executionUpdated = database.prepare(
       `UPDATE agent_executions SET status = 'cancelled', cancellation_reason = ?,
          completed_at = ?, updated_at = ?, next_retry_at = NULL
-       WHERE id = ? AND current_attempt_seq = ? AND status IN ('queued', 'running')`,
-    ).run(input.reason, input.occurredAt, input.occurredAt, executionId, attemptSeq);
+       WHERE id = ? AND current_attempt_seq = ? AND status IN ('queued', 'running')
+         AND ? = 0`,
+    ).run(input.reason, input.occurredAt, input.occurredAt, executionId, attemptSeq,
+      disposition.parentOutcomeUnknown ? 1 : 0);
     const attemptUpdated = database.prepare(
       `UPDATE agent_execution_attempts SET status = 'cancelled', finished_at = ?,
          error_code = ?, next_retry_at = NULL
-       WHERE execution_id = ? AND attempt_seq = ? AND status IN ('queued', 'running')`,
-    ).run(input.occurredAt, input.reason, executionId, attemptSeq);
-    if (executionUpdated.changes !== 1 || attemptUpdated.changes !== 1) {
+       WHERE execution_id = ? AND attempt_seq = ? AND status IN ('queued', 'running')
+         AND ? = 0`,
+    ).run(input.occurredAt, input.reason, executionId, attemptSeq,
+      disposition.parentOutcomeUnknown ? 1 : 0);
+    if ((!disposition.parentOutcomeUnknown &&
+         (executionUpdated.changes !== 1 || attemptUpdated.changes !== 1)) ||
+        (disposition.parentOutcomeUnknown &&
+         (executionUpdated.changes !== 0 || attemptUpdated.changes !== 0))) {
       throw new Error("Internal execution cancellation lost its CAS");
+    }
+    const terminal = database.prepare(
+      `SELECT public_status AS publicStatus, authority_version AS authorityVersion
+       FROM agent_execution_runtime_states WHERE execution_id = ?`,
+    ).get(executionId);
+    if (typeof terminal?.authorityVersion !== "number" ||
+        (disposition.parentOutcomeUnknown
+          ? terminal.publicStatus !== "failed" : terminal.publicStatus !== "cancelled")) {
+      throw new Error("Internal execution parent terminal was invalid");
     }
     database.prepare(
       `INSERT INTO invocation_scoped_cancellation_targets (
          fence_id, execution_id, attempt_seq, execution_version_before, execution_version_after
        ) VALUES (?, ?, ?, ?, ?)`,
-    ).run(fenceId, executionId, attemptSeq, row.authorityVersion, row.authorityVersion + 1);
+    ).run(fenceId, executionId, attemptSeq,
+      disposition.parentOutcomeUnknown ? terminal.authorityVersion - 1 : row.authorityVersion,
+      terminal.authorityVersion);
     database.prepare(
       `UPDATE invocation_recovery_queue SET state = 'closed', lease_owner = NULL,
          lease_expires_at = NULL, failure_code = ?, updated_at = ?
@@ -584,7 +642,7 @@ export function commitInternalScopedProducerInTransaction(
       sourceRevision: row.sourceRevision,
       invocationIntentId: row.intentId,
       executionId, attemptSeq,
-      disposition: "execution_cancelled",
+      disposition: disposition.parentOutcomeUnknown ? "already_terminal" : "execution_cancelled",
       confirmationDisposition: disposition.confirmationDisposition,
       grantDisposition: disposition.grantDisposition,
       sideEffectState: disposition.sideEffectState,
@@ -593,7 +651,9 @@ export function commitInternalScopedProducerInTransaction(
       requestId, fenceId, roomId: input.roomId, lineageId: row.lineageId,
       scope: input.scope, reason: input.reason,
       intentOutcomes: [{ intentId: row.intentId, outcome: "already_claimed" }],
-      executionOutcomes: [{ executionId, outcome: "cancelled", version: row.authorityVersion + 1 }],
+      executionOutcomes: [{ executionId,
+        outcome: disposition.parentOutcomeUnknown ? "already_terminal" : "cancelled",
+        version: terminal.authorityVersion }],
       rejectedConfirmationIds: disposition.rejectedConfirmationIds,
       revokedGrantIds: disposition.revokedGrantIds,
       preservedDispatchIds: disposition.preservedDispatchIds,
@@ -633,13 +693,21 @@ export function finalizeInternalScopedProducerInTransaction(
        FROM agent_execution_runtime_states WHERE execution_id = ?`,
     ).get(row.executionId);
     if ((runtime?.publicStatus !== "cancelled" && runtime?.publicStatus !== "failed") ||
-        runtime.authorityVersion !== row.authorityVersion + 1) {
+        typeof runtime.authorityVersion !== "number" ||
+        runtime.authorityVersion <= row.authorityVersion) {
       throw new Error("Deferred scoped producer terminal authority was not committed");
     }
     const dispatches = database.prepare(
       `SELECT state FROM tool_dispatches WHERE execution_id = ? AND attempt_seq = ?`,
     ).all(row.executionId, row.attemptSeq);
-    const sideEffectState = dispatches.some((dispatch) => dispatch.state === "outcome_unknown")
+    const v2Dispatches = database.prepare(
+      `SELECT dispatch.state
+       FROM tool_dispatches_v2 AS dispatch
+       JOIN tool_calls_v2 AS call ON call.tool_call_id = dispatch.tool_call_id
+       WHERE call.execution_id = ? AND call.attempt_seq = ?`,
+    ).all(row.executionId, row.attemptSeq);
+    const sideEffectState = v2Dispatches.some((dispatch) => dispatch.state === "outcome_unknown") ||
+      dispatches.some((dispatch) => dispatch.state === "outcome_unknown")
       ? "outcome-unknown-retained" as const
       : deferred.preservedDispatchIds.length > 0 ? "dispatched-retained" as const : "none" as const;
     database.prepare(
@@ -647,7 +715,7 @@ export function finalizeInternalScopedProducerInTransaction(
          fence_id, execution_id, attempt_seq, execution_version_before, execution_version_after
        ) VALUES (?, ?, ?, ?, ?)`,
     ).run(deferred.fenceId, row.executionId, row.attemptSeq,
-      row.authorityVersion, row.authorityVersion + 1);
+      runtime.authorityVersion - 1, runtime.authorityVersion);
     database.prepare(
       `UPDATE invocation_recovery_queue SET state = 'closed', lease_owner = NULL,
          lease_expires_at = NULL, failure_code = ?, updated_at = ?
@@ -674,7 +742,7 @@ export function finalizeInternalScopedProducerInTransaction(
       intentOutcomes: [{ intentId: row.intentId, outcome: "already_claimed" }],
       executionOutcomes: [{ executionId: row.executionId,
         outcome: runtime.publicStatus === "cancelled" ? "cancelled" : "already_terminal",
-        version: row.authorityVersion + 1 }],
+        version: runtime.authorityVersion }],
       rejectedConfirmationIds: deferred.rejectedConfirmationIds,
       revokedGrantIds: deferred.revokedGrantIds,
       preservedDispatchIds: deferred.preservedDispatchIds,

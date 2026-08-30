@@ -36,8 +36,9 @@ function makeInput(): ContextCompilerInputV1 {
       intent: { kind: "direct_mention", sourceMessageId: "trigger", targetAgentId: "agent-1", reasonCode: "direct_mention", reasonText: "direct mandatory address" } },
     agent: { agentId: "agent-1", profileId: "profile-1", assignmentId: "assignment-1",
       displayName: "Build Agent", globalResponsibility: "Build engineering", roomResponsibility: "Own releases",
-      participation: "on-mention", availability: "ready", effectiveCapabilities: ["room.conversation.read", "room.respond"],
-      effectiveTools: ["repository.git-status", "room-memory.read"], revisions: { profile: 2, assignment: 3, access: 4 } },
+      participation: "on-mention", availability: "ready",
+      effectiveCapabilities: ["room.conversation.read", "room.memory.read", "room.respond"],
+      effectiveTools: ["repository.git-status"], revisions: { profile: 2, assignment: 3, access: 4 } },
     room: { roomId: "room-1", name: "Release room", goal: { availability: "unavailable", reason: "ft09_not_delivered" } },
     trigger: {
       triggerType: "message",
@@ -124,7 +125,7 @@ describe("compileContextV1", () => {
     expect(first.manifest.manifestHash).toMatch(/^[0-9a-f]{64}$/);
     expect(first.envelopeSha256).toMatch(/^[0-9a-f]{64}$/);
     expect(first.manifestSha256).toMatch(/^[0-9a-f]{64}$/);
-    expect(first.envelopeSha256).toBe("01af78b315eef321806bb03820b77d1a413437640f004996d134d920b331accc");
+    expect(first.envelopeSha256).toBe("9b8ae8de7a23f6888aced00f424db031054b583286c8aa582b2ed72dd4799490");
     expect(first.manifestSha256).toBe("cd44fe4da1b2a2c7f79abaf7bc2822d6e113d25a2b39b106fc460ac072975a95");
     expect(first.envelope.trusted.developer.agent).toMatchObject({
       profileId: "profile-1",

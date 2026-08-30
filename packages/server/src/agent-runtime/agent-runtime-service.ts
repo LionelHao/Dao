@@ -3,6 +3,7 @@ import type {
   LegacyAgentExecution as AgentExecution,
   LegacyAgentInvocationIntent as AgentInvocationIntent,
   AgentRuntimeProviderInput,
+  ExternalToolDescriptor,
   ToolConfirmationInput,
   ToolDescriptor,
   ScopedCancellationReceipt,
@@ -29,7 +30,11 @@ import {
   type RuntimeRecoveryAuthority,
   type ToolAdapter,
 } from "./contracts.js";
-import type { ToolGateway } from "./tool-gateway.js";
+import type { ToolGateway, ToolSafetyGateway } from "./tool-gateway.js";
+import type {
+  createToolSafetyRuntimeCoordinator,
+  PreparedRuntimeTool,
+} from "../tool-safety/runtime-coordinator.js";
 import { createScopedCancellationOrchestrator } from
   "../scoped-cancellation/scoped-cancellation-orchestrator.js";
 
@@ -51,6 +56,10 @@ export interface AgentRuntimeServiceOptions {
   readonly readiness?: () => "ready" | "noauth";
   readonly tools?: readonly ToolDescriptor[];
   readonly toolGateway?: ToolGateway;
+  readonly toolSafety?: Readonly<{
+    coordinator: ReturnType<typeof createToolSafetyRuntimeCoordinator>;
+    gateway: ToolSafetyGateway;
+  }>;
   readonly toolAdapters?: readonly ToolAdapter[];
   readonly clock?: RuntimeClock;
   readonly recoveryAuthority?: RuntimeRecoveryAuthority;
@@ -118,6 +127,17 @@ export interface AgentRuntimeService extends AgentRuntime {
   applyCommittedScopedProducerReceipt(receipt: ScopedCancellationReceipt): void;
   whenIdle(): Promise<void>;
   recover(): Promise<void>;
+  decideToolSafetyConfirmation(
+    context: AuthenticatedCommandContext,
+    confirmationId: string,
+    expectedVersion: number,
+    decision: "confirm" | "reject",
+  ): Promise<Readonly<{
+    confirmationId: string;
+    state: "confirmed" | "rejected";
+    version: number;
+    replayed: boolean;
+  }>>;
 }
 
 const productionClock: RuntimeClock = {
@@ -187,6 +207,19 @@ function assertProviderInputBudget(input: AgentRuntimeProviderInput): void {
   }
 }
 
+function externalToolDescriptor(tool: ToolDescriptor): ExternalToolDescriptor | undefined {
+  if ((tool.id === "http-json.read" || tool.id === "repository.git-status") &&
+      tool.effect === "read-only") {
+    return Object.freeze({ scope: "external", id: tool.id, effect: "read-only" });
+  }
+  if (tool.id === "sandbox-file.write" && tool.effect === "side-effecting" &&
+      tool.reversibility === "compensatable") {
+    return Object.freeze({ scope: "external", id: tool.id, effect: "side-effect",
+      reversibility: "compensatable" });
+  }
+  return undefined;
+}
+
 function runtimeRecoveryRecord(value: unknown): value is Awaited<
   ReturnType<RuntimeAuthority["recover"]>
 >[number] {
@@ -240,11 +273,12 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
   const admissionReservations = new Map<string, number>();
   const pendingConfirmations = new Map<string, {
     readonly job: RuntimeJob;
-    readonly grantId: string;
+    readonly grantId?: string;
     readonly callId: string;
     readonly tool: ToolDescriptor;
     readonly parameters: Readonly<Record<string, unknown>>;
     readonly argumentsJson: string;
+    readonly toolSafetyPrepared?: PreparedRuntimeTool;
   }>();
   const idleWaiters = new Set<() => void>();
   const capacityWaiters = new Set<() => void>();
@@ -531,7 +565,8 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         throw new AgentRuntimeError("provider_malformed", "Provider stream did not complete");
       }
       if (toolCalls.size > 0) {
-        if (options.toolGateway === undefined || options.tools === undefined) {
+        if ((options.toolGateway === undefined && options.toolSafety === undefined) ||
+            options.tools === undefined) {
           throw new AgentRuntimeError("provider_malformed", "Provider requested an unavailable tool");
         }
         const toolsByName = new Map(input.availableTools.map((tool) => [
@@ -568,6 +603,58 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
           const tool = toolsByName.get(call.toolName);
           if (tool === undefined || typeof parameters !== "object" || parameters === null || Array.isArray(parameters)) {
             throw new AgentRuntimeError("provider_malformed", "Provider tool plan was rejected");
+          }
+          const safetyDescriptor = externalToolDescriptor(tool);
+          if (safetyDescriptor !== undefined && options.toolSafety !== undefined) {
+            const safetyPrepared = await options.toolSafety.coordinator.prepare({
+              executionId: claimed.id,
+              attemptSeq: claimed.currentAttemptSeq,
+              descriptor: safetyDescriptor,
+              providerCallId: callId,
+              argumentsJson: call.argumentsJson,
+              ...(job.context?.kind === "human" ? { confirmationContext: job.context } : {}),
+            });
+            if (safetyDescriptor.effect === "side-effect") {
+              if (safetyPrepared.confirmationId === undefined) {
+                throw new AgentRuntimeError("provider_failure", "Tool confirmation authority was malformed");
+              }
+              pendingConfirmations.set(safetyPrepared.confirmationId, {
+                job,
+                callId,
+                tool,
+                parameters: parameters as Readonly<Record<string, unknown>>,
+                argumentsJson: call.argumentsJson,
+                toolSafetyPrepared: safetyPrepared,
+              });
+              return;
+            }
+            if (safetyPrepared.grantId === undefined) {
+              throw new AgentRuntimeError("provider_failure", "Read tool grant authority was malformed");
+            }
+            const outcome = await options.toolSafety.gateway.execute({
+              ...safetyPrepared.claim,
+              grantId: safetyPrepared.grantId,
+              signal: attemptController.signal,
+            });
+            const stepSeq = job.toolContinuations.length + 1;
+            await options.authority.checkpoint(
+              claimed.id,
+              claimed.currentAttemptSeq,
+              stepSeq,
+              "tool",
+              createHash("sha256").update(call.argumentsJson).digest("hex"),
+              createHash("sha256").update(outcome.modelInput).digest("hex"),
+            );
+            job.toolContinuations.push({
+              callId,
+              toolId: tool.id,
+              argumentsJson: call.argumentsJson,
+              modelInput: outcome.modelInput,
+            });
+            continue;
+          }
+          if (options.toolGateway === undefined) {
+            throw new AgentRuntimeError("provider_malformed", "Provider requested an unavailable tool");
           }
           const prepared = await options.authority.prepareTool(
             claimed.id,
@@ -1040,6 +1127,108 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
       enqueueCommitted(job);
       return { ...accepted, retryReceipt: accepted.retryReceipt };
     },
+    async decideToolSafetyConfirmation(context, confirmationId, expectedVersion, decision) {
+      if (closed) throw new AgentRuntimeError("agent_runtime_closed", "Agent runtime is closed");
+      if (options.toolSafety === undefined) {
+        throw new AgentRuntimeError("execution_not_found", "Tool safety authority is unavailable");
+      }
+      const result = await options.toolSafety.coordinator.decideConfirmation({
+        context, confirmationId, expectedVersion, decision,
+      });
+      if (result.kind !== "confirmation-decision" ||
+          (result.state !== "confirmed" && result.state !== "rejected")) {
+        throw new AgentRuntimeError("execution_conflict", "Tool confirmation result was malformed");
+      }
+      const pending = pendingConfirmations.get(confirmationId);
+      let recoveredPrepared: PreparedRuntimeTool | undefined;
+      if (result.state === "confirmed" && pending !== undefined &&
+          pending.toolSafetyPrepared === undefined) {
+        const recovered = await options.toolSafety.coordinator.recoverExecution(
+          pending.job.execution.id,
+        );
+        if (recovered.state === "confirmed_active" && recovered.claim !== undefined &&
+            recovered.grantId !== undefined && recovered.toolCallId !== undefined) {
+          recoveredPrepared = Object.freeze({ toolCallId: recovered.toolCallId,
+            confirmationId, grantId: recovered.grantId,
+            safePreview: Object.freeze({ schemaVersion: "tool-safe-preview.v1",
+              target: "Recovered sandbox target", summary: "Sealed parameters recovered",
+              impact: "Writes one sandbox file", reversibility: "compensatable" }),
+            claim: recovered.claim });
+        }
+      }
+      if (pending !== undefined && (!result.replayed || recoveredPrepared !== undefined)) {
+        if (result.state === "rejected") {
+          pendingConfirmations.delete(confirmationId);
+          queueMicrotask(() => {
+            releaseAdmission(pending.job);
+            jobsByExecution.delete(pending.job.execution.id);
+            signalIdle();
+          });
+        } else if ((result.grantId ?? recoveredPrepared?.grantId) !== undefined &&
+            (pending.toolSafetyPrepared ?? recoveredPrepared) !== undefined) {
+          const prepared = pending.toolSafetyPrepared ?? recoveredPrepared!;
+          const grantId = result.grantId ?? recoveredPrepared!.grantId!;
+          queueMicrotask(() => void (async () => {
+            const execution = pending.job.execution;
+            const controller = new AbortController();
+            controllers.set(execution.id, controller);
+            try {
+              const outcome = await options.toolSafety!.gateway.execute({
+                ...prepared.claim,
+                grantId,
+                signal: controller.signal,
+              });
+              pending.job.sideEffectDispatched = true;
+              if (prepared.claim.compensationOfDispatchId !== undefined) {
+                pendingConfirmations.delete(confirmationId);
+                releaseAdmission(pending.job);
+                jobsByExecution.delete(execution.id);
+                return;
+              }
+              const stepSeq = pending.job.toolContinuations.length + 1;
+              await options.authority.checkpoint(
+                execution.id,
+                execution.currentAttemptSeq,
+                stepSeq,
+                "tool",
+                createHash("sha256").update(pending.argumentsJson).digest("hex"),
+                createHash("sha256").update(outcome.modelInput).digest("hex"),
+              );
+              pending.job.toolContinuations.push({
+                callId: pending.callId,
+                toolId: pending.tool.id,
+                argumentsJson: pending.argumentsJson,
+                modelInput: outcome.modelInput,
+              });
+              pendingConfirmations.delete(confirmationId);
+              enqueue(pending.job);
+              pump();
+            } catch (error: unknown) {
+              pendingConfirmations.delete(confirmationId);
+              const runtimeError = error instanceof AgentRuntimeError ? error :
+                new AgentRuntimeError("side_effect_outcome_unknown", "Side-effect outcome requires review");
+              if ((pending.toolSafetyPrepared ?? recoveredPrepared)?.claim
+                  .compensationOfDispatchId === undefined) {
+                await options.authority.scheduleRetry(
+                  execution.id, execution.currentAttemptSeq, runtimeError.code, undefined,
+                ).catch(() => undefined);
+              }
+              releaseAdmission(pending.job);
+              jobsByExecution.delete(execution.id);
+            } finally {
+              controllers.delete(execution.id);
+              signalIdle();
+            }
+          })());
+        }
+      }
+      return Object.freeze({
+        confirmationId: result.confirmationId,
+        state: result.state,
+        version: result.version,
+        replayed: result.replayed,
+      });
+    },
     async confirmTool(context: AuthenticatedCommandContext, confirmation: ToolConfirmationInput) {
       let pending = pendingConfirmations.get(confirmation.confirmationId);
       if (pending === undefined) {
@@ -1071,6 +1260,9 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
       }
       const controller = new AbortController();
       const execution = pending.job.execution;
+      if (pending.grantId === undefined) {
+        throw new AgentRuntimeError("execution_not_found", "Legacy tool confirmation is not pending");
+      }
       let outcome;
       try {
         outcome = await options.toolGateway.execute({
@@ -1090,12 +1282,21 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         const runtimeError = error instanceof AgentRuntimeError
           ? error
           : new AgentRuntimeError("side_effect_outcome_unknown", "Side-effect outcome requires review");
-        await options.authority.scheduleRetry(
+        const terminal = await options.authority.scheduleRetry(
           execution.id,
           execution.currentAttemptSeq,
           runtimeError.code,
           undefined,
-        ).catch(() => undefined);
+        );
+        pending.job.execution = terminal;
+        if (runtimeError.code === "side_effect_outcome_unknown" &&
+            (terminal.status !== "failed" || terminal.currentAttemptSeq !== execution.currentAttemptSeq ||
+             terminal.terminalErrorCode !== "side_effect_outcome_unknown")) {
+          throw new AgentRuntimeError(
+            "side_effect_outcome_unknown",
+            "Side-effect parent did not enter its required review terminal",
+          );
+        }
         throw runtimeError;
       }
       pending.job.sideEffectDispatched = true;
@@ -1157,12 +1358,20 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
           "outcome_unknown",
           { outcome: "unknown" },
         ).catch(() => undefined);
-        await options.authority.scheduleRetry(
+        const terminal = await options.authority.scheduleRetry(
           begun.execution.id,
           begun.execution.currentAttemptSeq,
           "side_effect_outcome_unknown",
           undefined,
-        ).catch(() => undefined);
+        );
+        if (terminal.status !== "failed" ||
+            terminal.currentAttemptSeq !== begun.execution.currentAttemptSeq ||
+            terminal.terminalErrorCode !== "side_effect_outcome_unknown") {
+          throw new AgentRuntimeError(
+            "side_effect_outcome_unknown",
+            "Compensation parent did not enter its required review terminal",
+          );
+        }
         if (error instanceof AgentRuntimeError) throw error;
         throw new AgentRuntimeError("side_effect_outcome_unknown", "Compensation outcome requires review");
       } finally {
@@ -1189,6 +1398,51 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
               ...(candidateId === undefined ? {} : { candidateId }),
               reason: "recovery_candidate_invalid",
             });
+            return;
+          }
+          if (value.outcome === "wait_confirmation" && options.toolSafety !== undefined) {
+            const recovered = await options.toolSafety.coordinator.recoverExecution(value.execution.id);
+            const tool = options.tools?.find((candidate) => candidate.id === "sandbox-file.write");
+            if (tool === undefined) {
+              await isolate?.({ cursor, candidateId: value.execution.id,
+                reason: "recovery_candidate_conflict" });
+              return;
+            }
+            const job: RuntimeJob = { execution: value.execution, intent: value.intent,
+              context: undefined, toolContinuations: [], sideEffectDispatched: false };
+            if (recovered.state === "pending" && recovered.confirmationId !== undefined &&
+                recovered.toolCallId !== undefined) {
+              admit(job);
+              jobsByExecution.set(job.execution.id, job);
+              pendingConfirmations.set(recovered.confirmationId, { job,
+                callId: recovered.toolCallId, tool, parameters: {}, argumentsJson: "{}" });
+              await settle?.({ cursor, candidateId: value.execution.id });
+              return;
+            }
+            if (recovered.state === "confirmed_active" && recovered.claim !== undefined &&
+                recovered.grantId !== undefined && recovered.toolCallId !== undefined) {
+              admit(job);
+              jobsByExecution.set(job.execution.id, job);
+              const argumentsJson = JSON.stringify(recovered.claim.parameters ?? {});
+              try {
+                const outcome = await options.toolSafety.gateway.execute({ ...recovered.claim,
+                  grantId: recovered.grantId, signal: new AbortController().signal });
+                await options.authority.checkpoint(value.execution.id,
+                  value.execution.currentAttemptSeq, 1, "tool",
+                  createHash("sha256").update(argumentsJson).digest("hex"),
+                  createHash("sha256").update(outcome.modelInput).digest("hex"));
+                job.toolContinuations.push({ callId: recovered.toolCallId,
+                  toolId: "sandbox-file.write", argumentsJson, modelInput: outcome.modelInput });
+                enqueue(job);
+                pump();
+              } catch {
+                releaseAdmission(job);
+                jobsByExecution.delete(job.execution.id);
+              }
+              await settle?.({ cursor, candidateId: value.execution.id });
+              return;
+            }
+            await settle?.({ cursor, candidateId: value.execution.id });
             return;
           }
           if (value.outcome !== "enqueue") {
@@ -1279,7 +1533,8 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
       await recoveryPromise;
     },
     close() {
-      closePromise ??= (async () => {
+      if (closePromise !== undefined) return closePromise;
+      const operation = (async () => {
         closed = true;
         const deadline = Date.now() + shutdownTimeoutMs;
         const withinDeadline = async <Value>(operation: Promise<Value>): Promise<Value> => {
@@ -1308,6 +1563,12 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         for (const resolve of capacityWaiters) resolve();
         capacityWaiters.clear();
         if (recoveryPromise !== undefined) await withinDeadline(recoveryPromise);
+        // Stop dispatch admission and durably settle every claimed permit before
+        // parent shutdown/abort. This must not sit behind whenIdle: a provider
+        // that ignores AbortSignal cannot be allowed to skip the unknown fence.
+        if (options.toolSafety !== undefined) {
+          await withinDeadline(options.toolSafety.gateway.close());
+        }
         const jobs = [...new Map([
           ...jobsByExecution,
           ...durableOverflowJobs,
@@ -1350,7 +1611,11 @@ export function createAgentRuntimeService(options: AgentRuntimeServiceOptions): 
         capacityWaiters.clear();
         await withinDeadline(runtime.whenIdle());
       })();
-      return closePromise;
+      closePromise = operation;
+      void operation.catch(() => {
+        if (closePromise === operation) closePromise = undefined;
+      });
+      return operation;
     },
   };
   return Object.freeze(runtime);

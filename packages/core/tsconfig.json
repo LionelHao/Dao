@@ -17,7 +17,8 @@
     "src/attachment-authority.ts",
     "src/room-memory.ts",
     "src/context-compiler.ts",
-    "src/project-loop.ts"
+    "src/project-loop.ts",
+    "src/tool-safety.ts"
   ],
   "exclude": ["src/**/*.test.ts", "src/**/*.type-test.ts"]
 }

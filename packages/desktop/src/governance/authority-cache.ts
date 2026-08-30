@@ -72,6 +72,13 @@ function recordIdentity(record: RoomRepairRecord): string {
       ? "memory\0status"
       : `memory\0projection\0${record.value.projection.memoryRecordId}`;
     case "project-loop": return `project-loop\0${record.roomId}`;
+    case "tool-call": return `tool-call\0${record.value.toolCallId}`;
+    case "tool-confirmation": return `tool-confirmation\0${record.value.confirmationId}`;
+    case "tool-grant": return `tool-grant\0${record.value.grantId}`;
+    case "tool-dispatch": return `tool-dispatch\0${record.value.dispatchId}`;
+    case "tool-review": return `tool-review\0${record.value.reviewId}`;
+    case "tool-handoff": return `tool-handoff\0${record.value.handoffId}`;
+    case "tool-compensation": return `tool-compensation\0${record.value.lineageId}`;
   }
 }
 
@@ -83,6 +90,10 @@ function replaceRecord(records: RoomRepairRecord[], next: RoomRepairRecord): voi
 }
 
 function applyProjectionEvent(records: RoomRepairRecord[], event: DesktopRoomEvent): void {
+  if (event.type === "tool.safety.changed") {
+    replaceRecord(records, event.payload);
+    return;
+  }
   if (isProjectEvent(event)) {
     const index = records.findIndex((record) => record.kind === "project-loop" &&
       record.roomId === event.roomId);

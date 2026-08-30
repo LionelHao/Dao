@@ -146,6 +146,32 @@ describe("production Desktop authority cache", () => {
     });
   });
 
+  it("applies canonical Tool Safety stable records and publishes the repaired projection", async () => {
+    const cache = createDesktopAuthorityCache();
+    const repair = page();
+    cache.beginRoom("room-1", repair.snapshotId);
+    cache.stageRoomPage(repair);
+    expect(await cache.finalizeRoom(repair.snapshotId, repair.snapshotChecksum)).toBe(true);
+    cache.commitRoom("room-1", 9, repair.snapshotChecksum);
+    const published = vi.fn();
+    cache.subscribeRoomRecords(published);
+    const confirmation = { kind: "tool-confirmation", value: {
+      confirmationId: "confirmation-1", toolCallId: "call-1", toolId: "sandbox-file.write",
+      state: "confirmed", safePreview: JSON.stringify({ schemaVersion: "tool-safe-preview.v1",
+        target: "notes/release.txt", summary: "12 bytes", impact: "write one file",
+        reversibility: "compensatable" }), reasonCode: null,
+      expiresAt: "2026-08-30T08:10:00.000Z", version: 2,
+      namedHumanDisplayRef: "Human A", sourceRef: "message-1",
+    } };
+    cache.applyRoomEvents("room-1", [{
+      eventId: "tool-event-10", streamKind: "room", streamId: "room-1", streamSeq: 10,
+      roomId: "room-1", actorId: "tool-safety", occurredAt: "2026-08-30T08:00:00.000Z",
+      type: "tool.safety.changed", payload: confirmation,
+    } as unknown as PersistedRoomEvent], { version: 1, roomId: "room-1", afterSeq: 10 });
+    expect(cache.roomRepairRecords("room-1")).toContainEqual(confirmation);
+    expect(published).toHaveBeenCalledWith("room-1", expect.arrayContaining([confirmation]));
+  });
+
   it("invalidates the Project repair record on a stable Project event for fixed-watermark repair", async () => {
     const snapshot = projectSnapshot();
     const projectRecords: readonly RoomRepairRecord[] = [

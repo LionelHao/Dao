@@ -32,7 +32,7 @@ const profile: AgentProfileRecord = {
   globalResponsibility: "Review correctness and safety.",
   status: "enabled",
   capabilityCeiling: ["room.conversation.read", "room.respond"],
-  toolCeiling: ["repository.git-status", "room-memory.read"],
+  toolCeiling: ["http-json.read", "repository.git-status"],
   revision: 2,
   createdAt: NOW,
   updatedAt: NOW,
@@ -73,21 +73,22 @@ describe("FT-07 closed Agent Profile contracts", () => {
       "room.conversation.read", "room.memory.read", "room.project.read", "room.respond",
     ]);
     expect(AGENT_TOOL_IDS).toEqual([
-      "http-json.read", "repository.git-status", "room-memory.read", "sandbox-file.write",
+      "http-json.read", "repository.git-status", "sandbox-file.write",
     ]);
     expect(isCanonicalAgentCapabilitySet(["room.memory.read", "room.respond"])).toBe(true);
     expect(isCanonicalAgentCapabilitySet(["room.respond", "room.memory.read"])).toBe(false);
     expect(isCanonicalAgentCapabilitySet(["room.respond", "room.respond"])).toBe(false);
     expect(isCanonicalAgentCapabilitySet(["unknown.read"])).toBe(false);
-    expect(isCanonicalAgentToolSet(["repository.git-status", "room-memory.read"])).toBe(true);
-    expect(isCanonicalAgentToolSet(["room-memory.read", "repository.git-status"])).toBe(false);
+    expect(isCanonicalAgentToolSet(["http-json.read", "repository.git-status"])).toBe(true);
+    expect(isCanonicalAgentToolSet(["repository.git-status", "http-json.read"])).toBe(false);
+    expect(isCanonicalAgentToolSet(["room-memory.read"])).toBe(false);
     expect(isCanonicalAgentToolSet(["shell.exec"])).toBe(false);
     expect(canonicalizeAgentCapabilities([
       "room.respond", "room.conversation.read", "room.respond",
     ])).toEqual(["room.conversation.read", "room.respond"]);
     expect(canonicalizeAgentTools([
-      "room-memory.read", "repository.git-status", "room-memory.read",
-    ])).toEqual(["repository.git-status", "room-memory.read"]);
+      "repository.git-status", "http-json.read", "repository.git-status",
+    ])).toEqual(["http-json.read", "repository.git-status"]);
   });
 
   it("rejects Assignment authority expansion and computes the three-way intersection", () => {

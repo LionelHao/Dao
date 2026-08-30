@@ -28,7 +28,7 @@ function withDatabase(operation: (database: DatabaseSync) => void): void {
 
 describe("authority SQLite v22 invocation runtime authority", () => {
   it("upgrades fresh and every immutable v1-v21 schema without rewriting history", () => {
-    expect(AUTHORITY_SCHEMA_VERSION).toBe(25);
+    expect(AUTHORITY_SCHEMA_VERSION).toBe(26);
     for (let version = 1; version <= 21; version += 1) {
       withDatabase((database) => {
         migrateAuthorityDatabaseToHistoricalVersionForTest(database, version);
@@ -36,7 +36,7 @@ describe("authority SQLite v22 invocation runtime authority", () => {
           "SELECT version, name, checksum FROM schema_migrations ORDER BY version",
         ).all();
         migrateAuthorityDatabase(database);
-        expect(readSchemaVersion(database)).toBe(25);
+        expect(readSchemaVersion(database)).toBe(26);
         expect(database.prepare(
           "SELECT version, name, checksum FROM schema_migrations WHERE version <= ? ORDER BY version",
         ).all(version)).toEqual(history);

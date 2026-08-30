@@ -93,6 +93,35 @@ async function listen(
 }
 
 describe("Message Authority WebSocket transport", () => {
+  it("sends all closed FT-10 commands and accepts only the matching authority ACK", async () => {
+    const authority = await listen((frame, send) => {
+      if (frame.type === "auth.resume") return send({ type: "auth.authenticated",
+        requestId: frame.requestId, accountId: "account-1", actorId: "human-1", sessionId: "session-1" });
+      send({ type: "tool.safety.command.ack", requestId: frame.requestId, operation: frame.type,
+        objectId: "object-1", version: 2, replayed: false });
+    });
+    const transport = createMessageAuthorityWebSocketTransport({ endpoint: authority.endpoint,
+      session: authoritySession, webSocketFactory: (endpoint) => new WebSocket(endpoint) as unknown as MessageAuthorityWebSocketLike });
+    const commands = [
+      { type: "tool.confirmation.decide" as const, requestId: "tool-1", confirmationId: "c-1",
+        expectedVersion: 1, decision: "confirm" as const },
+      { type: "tool.confirmation.handoff.offer" as const, requestId: "tool-2", confirmationId: "c-1",
+        expectedVersion: 1, targetActorId: "human-2" },
+      { type: "tool.confirmation.handoff.accept" as const, requestId: "tool-3", handoffId: "h-1",
+        expectedVersion: 1 },
+      { type: "tool.outcome.review" as const, requestId: "tool-4", dispatchId: "d-1", expectedVersion: 1,
+        resolution: "accepted_risk" as const, evidenceSummary: "Human inspected target." },
+      { type: "tool.compensation.propose" as const, requestId: "tool-5", dispatchId: "d-1", expectedVersion: 1 },
+    ];
+    for (const command of commands) {
+      await expect(transport.toolSafetyCommand(command)).resolves.toMatchObject({
+        requestId: command.requestId, operation: command.type, version: 2, replayed: false,
+      });
+    }
+    expect(authority.received.filter((frame) => String(frame.type).startsWith("tool."))).toEqual(commands);
+    transport.close();
+  });
+
   it("validates loopback endpoints and parses only exact closed server frames", () => {
     expect(() => validateMessageAuthorityWebSocketEndpoint("wss://authority.example.test"))
       .toThrow("endpoint is not allowed");

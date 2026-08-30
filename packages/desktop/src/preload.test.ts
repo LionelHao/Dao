@@ -23,7 +23,7 @@ describe("Desktop preload entry", () => {
     expect(name).toBe("dao");
     expect(Object.keys(value as object)).toEqual([
       "identity", "governance", "messageAuthority", "attachmentAuthority", "memoryAuthority",
-      "agentSettings", "invocation", "projectLoop",
+      "agentSettings", "invocation", "projectLoop", "toolSafety",
     ]);
     expect(Object.isFrozen(value)).toBe(true);
     expect(Object.keys((value as { identity: object }).identity).sort()).toEqual([
@@ -55,6 +55,9 @@ describe("Desktop preload entry", () => {
     ]);
     expect(Object.keys((value as { projectLoop: object }).projectLoop).sort()).toEqual([
       "getSurface", "onStateChanged", "submit",
+    ]);
+    expect(Object.keys((value as { toolSafety: object }).toolSafety).sort()).toEqual([
+      "getSurface", "onStateChanged", "repair", "submit",
     ]);
     expect(JSON.stringify(value)).not.toMatch(/token|secret|idempotency|ipcRenderer|shell|filesystem|websocket/iu);
   });

@@ -62,6 +62,7 @@ describe("production tool adapters", () => {
         repositoryRoot: root,
         maxOutputBytes: 8_192,
         timeoutMs: 2_000,
+        testOnlyAllowPathFallback: process.platform !== "linux",
       });
       const outcome = await adapter.execute({ ...invocation, parameters: {} });
       expect(outcome.summary).toEqual(expect.objectContaining({ exitCategory: "success", lineCount: 1 }));
@@ -78,6 +79,7 @@ describe("production tool adapters", () => {
         root,
         compensationKey: randomBytes(32),
         maxContentBytes: 1_024,
+        testOnlyAllowPathFallback: process.platform !== "linux",
       });
       const absentHash = createHash("sha256").update("").digest("hex");
       const outcome = await adapter.execute({

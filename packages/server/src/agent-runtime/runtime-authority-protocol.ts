@@ -32,8 +32,14 @@ import type { ClaimedProjectBoundaryExecution } from
   "../project-boundary/project-boundary-authority.js";
 import type { ProjectReminderScanResult } from
   "../project-loop/project-boundary-runtime-service.js";
+import {
+  isToolSafetyAuthorityOperation,
+  type ToolSafetyAuthorityOperation,
+  type ToolSafetyAuthorityResult,
+} from "../tool-safety/authority-protocol.js";
 
 export type RuntimeAuthorityOperation =
+  | ToolSafetyAuthorityOperation
   | { readonly type: "runtime.read-context"; readonly executionId: string; readonly now: number }
   | {
       readonly type: "runtime.preview-authorize";
@@ -309,6 +315,7 @@ export type RuntimeAuthorityOperation =
   | { readonly type: "runtime.recover"; readonly now: number };
 
 export type RuntimeAuthorityOperationResult =
+  | ToolSafetyAuthorityResult
   | {
       readonly kind: "context";
       readonly visibleConversation: readonly { readonly messageId: string; readonly authorId: string; readonly body: string }[];
@@ -526,6 +533,7 @@ const errorCodes = new Set<AgentRuntimeErrorCode>([
 
 export function isRuntimeAuthorityOperation(value: unknown): value is RuntimeAuthorityOperation {
   if (!record(value) || !text(value.type)) return false;
+  if (value.type.startsWith("tool-safety.")) return isToolSafetyAuthorityOperation(value);
   if (value.type === "runtime.read-context") {
     return exact(value, ["type", "executionId", "now"]) && text(value.executionId) && count(value.now);
   }

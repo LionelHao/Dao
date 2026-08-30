@@ -6849,6 +6849,163 @@ describe("closed FT-02B/FT-02C WebSocket governance", () => {
     }
   });
 
+  it("routes exact FT-10 Human commands only through the narrow authority port", async () => {
+    const confirmTool = vi.fn();
+    const compensate = vi.fn();
+    const executePublicCommand = vi.fn(async (_context, command: {
+      readonly type: string;
+      readonly confirmationId?: string;
+      readonly handoffId?: string;
+      readonly dispatchId?: string;
+    }) => ({
+      operation: command.type,
+      objectId: command.confirmationId ?? command.handoffId ?? command.dispatchId ?? "missing",
+      version: 9,
+      replayed: false,
+    }));
+    const server = await startMessageWebSocketServer({
+      auth: governanceAuthenticationService(),
+      service: idleMessageService(),
+      agentRuntime: {
+        invoke: vi.fn(), interrupt: vi.fn(), retry: vi.fn(), confirmTool, compensate,
+        close: vi.fn(),
+      } as never,
+      toolSafetyAuthority: { executePublicCommand } as never,
+    });
+    const client = await LoopbackClient.connect(server.url);
+    try {
+      await client.login(humans[0], "tool-safety-login");
+      const frames = [
+        {
+          type: "tool.confirmation.decide", requestId: "tool-decide",
+          confirmationId: "confirmation-1", expectedVersion: 1, decision: "reject",
+        },
+        {
+          type: "tool.confirmation.handoff.offer", requestId: "tool-offer",
+          confirmationId: "confirmation-1", expectedVersion: 1, targetActorId: "human-2",
+        },
+        {
+          type: "tool.confirmation.handoff.accept", requestId: "tool-accept",
+          handoffId: "handoff-1", expectedVersion: 1,
+        },
+        {
+          type: "tool.outcome.review", requestId: "tool-review",
+          dispatchId: "dispatch-1", expectedVersion: 1,
+          resolution: "known_failed", evidenceSummary: "Target did not change.",
+        },
+        {
+          type: "tool.compensation.propose", requestId: "tool-compensation",
+          dispatchId: "dispatch-1", expectedVersion: 1,
+        },
+      ] as const;
+      for (const frame of frames) {
+        client.send(frame);
+        await expect(client.waitForFrame(
+          (candidate) => hasType(candidate, "tool.safety.command.ack") &&
+            candidate.requestId === frame.requestId,
+          `tool safety ${frame.type}`,
+        )).resolves.toMatchObject({ frame: {
+          operation: frame.type, version: 9, replayed: false,
+        } });
+      }
+      expect(executePublicCommand).toHaveBeenCalledTimes(frames.length);
+      expect(executePublicCommand).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "human", requestId: "tool-decide" }),
+        frames[0],
+      );
+
+      client.send({
+        type: "agent.tool.confirm", requestId: "legacy-tool-confirm",
+        confirmation: { confirmationId: "confirmation-1", executionId: "execution-1" },
+      });
+      client.send({
+        type: "agent.compensate", requestId: "legacy-tool-compensate",
+        executionId: "execution-1",
+      });
+      await client.waitForError("protocol_upgrade_required", "legacy-tool-confirm");
+      await client.waitForError("protocol_upgrade_required", "legacy-tool-compensate");
+      expect(confirmTool).not.toHaveBeenCalled();
+      expect(compensate).not.toHaveBeenCalled();
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("returns dependency_unavailable when the FT-10 authority port is absent or malformed", async () => {
+    const exercise = async (toolSafetyAuthority: unknown, suffix: string): Promise<void> => {
+      const server = await startMessageWebSocketServer({
+        auth: governanceAuthenticationService(), service: idleMessageService(),
+        ...(toolSafetyAuthority === undefined ? {} : { toolSafetyAuthority: toolSafetyAuthority as never }),
+      });
+      const client = await LoopbackClient.connect(server.url);
+      try {
+        await client.login(humans[0], `tool-dependency-login-${suffix}`);
+        client.send({
+          type: "tool.confirmation.decide", requestId: `tool-dependency-${suffix}`,
+          confirmationId: "confirmation-1", expectedVersion: 1, decision: "confirm",
+        });
+        await expect(client.waitForError(
+          "dependency_unavailable",
+          `tool-dependency-${suffix}`,
+        )).resolves.toMatchObject({ frame: { status: 503 } });
+      } finally {
+        await client.close();
+        await server.close();
+      }
+    };
+    await exercise(undefined, "absent");
+    await exercise({ executePublicCommand: vi.fn(async () => ({
+      operation: "tool.confirmation.decide",
+      objectId: "confirmation-1",
+      version: 1,
+      replayed: false,
+      sealedPayload: "sealed-canary",
+    })) }, "malformed");
+  });
+
+  it("maps FT-10 authority failures to closed 403/409/410/429/503 responses", async () => {
+    const errors = new Map([
+      ["tool.confirmation.decide", { code: "permission_denied", status: 403 }],
+      ["tool.confirmation.handoff.offer", { code: "stale_tool_call", status: 409 }],
+      ["tool.confirmation.handoff.accept", { code: "tool_confirmation_expired", status: 410 }],
+      ["tool.outcome.review", { code: "tool_capacity_limited", status: 429 }],
+      ["tool.compensation.propose", { code: "dependency_unavailable", status: 503 }],
+    ] as const);
+    const server = await startMessageWebSocketServer({
+      auth: governanceAuthenticationService(), service: idleMessageService(),
+      toolSafetyAuthority: {
+        async executePublicCommand(_context, command) {
+          const mapped = errors.get(command.type)!;
+          throw Object.assign(new Error("private-tool-authority-cause"), {
+            ...mapped, sealedPayload: "sealed-canary",
+          });
+        },
+      },
+    });
+    const client = await LoopbackClient.connect(server.url);
+    try {
+      await client.login(humans[0], "tool-errors-login");
+      const frames = [
+        { type: "tool.confirmation.decide", requestId: "tool-error-decide", confirmationId: "c-1", expectedVersion: 1, decision: "confirm" },
+        { type: "tool.confirmation.handoff.offer", requestId: "tool-error-offer", confirmationId: "c-1", expectedVersion: 1, targetActorId: "human-2" },
+        { type: "tool.confirmation.handoff.accept", requestId: "tool-error-accept", handoffId: "h-1", expectedVersion: 1 },
+        { type: "tool.outcome.review", requestId: "tool-error-review", dispatchId: "d-1", expectedVersion: 1, resolution: "known_failed", evidenceSummary: "Checked." },
+        { type: "tool.compensation.propose", requestId: "tool-error-compensation", dispatchId: "d-1", expectedVersion: 1 },
+      ] as const;
+      for (const frame of frames) {
+        client.send(frame);
+        const expected = errors.get(frame.type)!;
+        const received = await client.waitForError(expected.code, frame.requestId);
+        expect(received.frame).toMatchObject({ ...expected, message: expected.code });
+        expect(JSON.stringify(received.frame)).not.toMatch(/private-tool-authority|sealed-canary/);
+      }
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
   it("fails unauthenticated and missing dependency paths closed without calling a legacy mutation", async () => {
     const executeHuman = vi.fn(async () => ({
       aggregateId: roomId,
@@ -7301,9 +7458,9 @@ describe("closed FT-07 Agent Settings WebSocket authority", () => {
     capabilityCeiling: ["room.conversation.read", "room.respond"],
     capabilitySubset: ["room.conversation.read"],
     effectiveCapabilities: ["room.conversation.read"],
-    toolCeiling: ["room-memory.read"],
-    toolSubset: ["room-memory.read"],
-    effectiveTools: ["room-memory.read"],
+    toolCeiling: ["repository.git-status"],
+    toolSubset: ["repository.git-status"],
+    effectiveTools: ["repository.git-status"],
     profileRevision: 2,
     assignmentRevision: 3,
     accessRevision: 4,

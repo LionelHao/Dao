@@ -375,6 +375,21 @@ const acceptedRoomEvents: readonly unknown[] = [
       createdAt: "2026-08-10T00:00:00.000Z",
     },
   },
+  {
+    ...roomEventBase,
+    actorId: "agent-1",
+    type: "tool.safety.changed",
+    payload: {
+      kind: "tool-dispatch",
+      value: {
+        dispatchId: "dispatch-1",
+        toolCallId: "tool-call-1",
+        state: "claimed",
+        reasonCode: null,
+        version: 2,
+      },
+    },
+  },
 ];
 
 const acceptedIdentityEvents: readonly unknown[] = [

@@ -108,7 +108,7 @@ function fixture() {
       providerId: "openai-responses", modelId: "gpt-5", credentialReadiness: "ready",
     }),
     capabilities: ["project.read", "route.participate"],
-    tools: ["repository.git-status", "room-memory.read"],
+    tools: ["repository.git-status"],
     clock: () => NOW,
     profileIdFactory: () => `profile-${++id}`,
     actorIdFactory: () => `agent-${id}`,
@@ -202,7 +202,7 @@ describe("Global Agent Profile authority", () => {
     const created = await f.authority.createProfile(command(), {
       expectedRevision: 0, displayName: "Researcher", globalResponsibility: "Verify sources",
       capabilityCeiling: ["project.read", "route.participate"],
-      toolCeiling: ["repository.git-status", "room-memory.read"],
+      toolCeiling: ["repository.git-status"],
     });
     expect(created.profile).toMatchObject({ profileId: "profile-1", actorId: "agent-1",
       revision: 1, status: "enabled", displayName: "Researcher" });
@@ -210,14 +210,14 @@ describe("Global Agent Profile authority", () => {
     const replay = await f.authority.createProfile(command(), {
       expectedRevision: 0, displayName: "Researcher", globalResponsibility: "Verify sources",
       capabilityCeiling: ["project.read", "route.participate"],
-      toolCeiling: ["repository.git-status", "room-memory.read"],
+      toolCeiling: ["repository.git-status"],
     });
     expect(replay).toEqual(created);
 
     const updated = await f.authority.updateProfile(command({ idempotencyKey: "profile-update" }), {
       profileId: created.profile.profileId, expectedRevision: 1, displayName: "Evidence",
       globalResponsibility: "Verify durable evidence", capabilityCeiling: ["project.read"],
-      toolCeiling: ["room-memory.read"],
+      toolCeiling: ["repository.git-status"],
     });
     expect(updated.profile).toMatchObject({ actorId: "agent-1", revision: 2,
       displayName: "Evidence", capabilityCeiling: ["project.read"] });

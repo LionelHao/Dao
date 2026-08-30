@@ -812,4 +812,28 @@ describe("pure synchronization contracts", () => {
       version: { kind: "catalog", roomId: "room-1", catalogRevision: 3 },
     })).toBe(false);
   });
+
+  it("accepts every closed Tool Safety record in a fixed-watermark repair page", () => {
+    const page = (record: unknown) => ({
+      type: "room.repair.page", requestId: "request-tool", snapshotId: "snapshot-tool",
+      roomId: "room-1", page: 0, records: [record], watermark: 7,
+      snapshotChecksum: "sha256:tool", hasMore: false, mode: "streaming",
+      idleExpiresAt: "2026-08-30T08:01:00.000Z",
+    });
+    const preview = JSON.stringify({ schemaVersion: "tool-safe-preview.v1", target: "notes/a.txt",
+      summary: "12 UTF-8 bytes", impact: "Writes one sandbox file", reversibility: "compensatable" });
+    const records = [
+      { kind: "tool-call", value: { toolCallId: "call-1", toolId: "sandbox-file.write",
+        safePreview: preview, state: "prepared", version: 1, sourceRef: "message-1" } },
+      { kind: "tool-handoff", value: { handoffId: "handoff-1", confirmationId: "confirmation-1",
+        state: "offered", targetActorId: "human-2", targetNamedHumanDisplayRef: "Human B", version: 1 } },
+      { kind: "tool-compensation", value: { lineageId: "lineage-1", originalDispatchId: "dispatch-1",
+        compensationInvocationId: "invocation-2", compensationExecutionId: "execution-2",
+        compensationToolCallId: "call-2", state: "pending", version: 1 } },
+    ];
+    for (const repairRecord of records) expect(isRoomRepairPage(page(repairRecord))).toBe(true);
+    expect(isRoomRepairPage(page({ ...records[1], value: {
+      ...(records[1] as { value: Record<string, unknown> }).value, targetActorId: undefined,
+    } }))).toBe(false);
+  });
 });

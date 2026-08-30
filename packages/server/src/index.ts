@@ -158,6 +158,13 @@ export type {
   RoomSyncRequestFrame,
   ServerFrame,
   SnapshotCompleteRequestFrame,
+  ToolCompensationProposeFrame,
+  ToolConfirmationDecideFrame,
+  ToolConfirmationHandoffAcceptFrame,
+  ToolConfirmationHandoffOfferFrame,
+  ToolOutcomeReviewFrame,
+  ToolSafetyClientFrame,
+  ToolSafetyCommandAckFrame,
   WorkspaceBootstrapPageRequestFrame,
   WorkspaceBootstrapRequestFrame,
 } from "./protocol.js";
@@ -170,7 +177,11 @@ export {
   MESSAGE_WEBSOCKET_V2_GATE_MAX_EVENTS,
   startMessageWebSocketServer,
 } from "./websocket.js";
-export type { MessageWebSocketServer, StartMessageWebSocketServerOptions } from "./websocket.js";
+export type {
+  MessageWebSocketServer,
+  StartMessageWebSocketServerOptions,
+  ToolSafetyAuthorityTransport,
+} from "./websocket.js";
 export {
   CollaborationPrimitiveError,
   createAuthoritativeCollaborationPrimitives,

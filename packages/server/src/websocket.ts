@@ -64,6 +64,7 @@ import {
   type ClientFrame,
   type ProtocolErrorFrame,
   type ServerFrame,
+  type ToolSafetyClientFrame,
 } from "./protocol.js";
 import {
   FT07_AGENT_SETTINGS_MUTATIONS,
@@ -194,6 +195,19 @@ export interface AgentPreviewDeliveryAuthority {
   ) => undefined): Promise<void>;
 }
 
+/** Public Human commands only. Runtime permits, grants, hashes and sealed data never cross this port. */
+export interface ToolSafetyAuthorityTransport {
+  executePublicCommand(
+    context: AuthenticatedCommandContext,
+    command: ToolSafetyClientFrame,
+  ): Promise<Readonly<{
+    operation: ToolSafetyClientFrame["type"];
+    objectId: string;
+    version: number;
+    replayed: boolean;
+  }>>;
+}
+
 export interface StartMessageWebSocketServerOptions {
   readonly auth: AuthenticationService;
   readonly service: MessageService;
@@ -210,6 +224,7 @@ export interface StartMessageWebSocketServerOptions {
   readonly v2GateMaxEvents?: number;
   readonly v2GateMaxBytes?: number;
   readonly agentRuntime?: AgentRuntime;
+  readonly toolSafetyAuthority?: ToolSafetyAuthorityTransport;
   readonly collaboration?: Pick<
     AuthoritativeCollaborationPrimitives,
     | "createOpenItem"
@@ -626,6 +641,27 @@ function errorFrame(
   return { type: "error", status, code, message, requestId };
 }
 
+function closeToolSafetyReceipt(
+  value: unknown,
+  operation: ToolSafetyClientFrame["type"],
+): Readonly<{ operation: ToolSafetyClientFrame["type"]; objectId: string; version: number; replayed: boolean }> | undefined {
+  if (!isObjectRecord(value) ||
+      !hasOnlyOwnFields(value, ["operation", "objectId", "version", "replayed"]) ||
+      value.operation !== operation ||
+      typeof value.objectId !== "string" || value.objectId.trim().length === 0 ||
+      Buffer.byteLength(value.objectId, "utf8") > PROTOCOL_FIELD_LIMITS.messageId ||
+      typeof value.version !== "number" || !Number.isSafeInteger(value.version) || value.version <= 0 ||
+      typeof value.replayed !== "boolean") {
+    return undefined;
+  }
+  return {
+    operation,
+    objectId: value.objectId,
+    version: value.version,
+    replayed: value.replayed,
+  };
+}
+
 function departureBlockedFrame(
   requestId: string,
   details: DepartureConflictList,
@@ -764,6 +800,8 @@ const MAPPED_SERVICE_ERROR_STATUSES = new Map<GenericProtocolErrorCode, Protocol
   ["archive_bomb", 422],
   ["image_bomb", 422],
   ["confirmation_rejected", 409],
+  ["confirmation_replayed", 409],
+  ["confirmation_expired", 410],
   ["grant_revoked", 409],
   ["dependency_unavailable", 503],
   ["snapshot_stale", 409],
@@ -809,6 +847,15 @@ const MAPPED_SERVICE_ERROR_STATUSES = new Map<GenericProtocolErrorCode, Protocol
   ["side_effect_outcome_unknown", 409],
   ["tool_failure", 503],
   ["tool_target_busy", 503],
+  ["tool_confirmation_not_found", 404],
+  ["tool_parameters_changed", 409],
+  ["stale_tool_call", 409],
+  ["tool_already_terminal", 409],
+  ["tool_confirmation_expired", 410],
+  ["tool_grant_expired", 410],
+  ["tool_source_gone", 410],
+  ["tool_needs_review", 409],
+  ["tool_capacity_limited", 429],
 ]);
 
 const STORAGE_UNAVAILABLE_ERROR_CODES = new Set([
@@ -1480,7 +1527,12 @@ function isCorrelatedRecoveryResponse(
       | "project.next-action.transition"
       | "project.obstacle.transition"
       | "project.transfer.propose"
-      | "project.transfer.resolve";
+      | "project.transfer.resolve"
+      | "tool.confirmation.decide"
+      | "tool.confirmation.handoff.offer"
+      | "tool.confirmation.handoff.accept"
+      | "tool.outcome.review"
+      | "tool.compensation.propose";
   }>,
   response: unknown,
 ): response is ServerFrame {
@@ -1625,7 +1677,12 @@ async function handleRecoveryFrame(
       | "project.next-action.transition"
       | "project.obstacle.transition"
       | "project.transfer.propose"
-      | "project.transfer.resolve";
+      | "project.transfer.resolve"
+      | "tool.confirmation.decide"
+      | "tool.confirmation.handoff.offer"
+      | "tool.confirmation.handoff.accept"
+      | "tool.outcome.review"
+      | "tool.compensation.propose";
   }>,
   options: StartMessageWebSocketServerOptions,
   context: ConnectionContext,
@@ -3034,9 +3091,7 @@ async function handleFrame(
       return;
     }
     case "invocation.cancel":
-    case "invocation.retry":
-    case "agent.tool.confirm":
-    case "agent.compensate": {
+    case "invocation.retry": {
       const session = await requireSession(socket, frame.requestId, options, context);
       if (session === undefined) return;
       if (options.agentRuntime === undefined) {
@@ -3047,9 +3102,7 @@ async function handleFrame(
         ...session,
         kind: "human" as const,
         requestId: frame.requestId,
-        idempotencyKey: frame.type === "agent.tool.confirm"
-            ? `${frame.type}:${frame.confirmation.confirmationId}`
-            : `${frame.type}:${"executionId" in frame ? frame.executionId : frame.intentId}`,
+        idempotencyKey: `${frame.type}:${"executionId" in frame ? frame.executionId : frame.intentId}`,
       };
       try {
         if (frame.type === "invocation.cancel") {
@@ -3064,7 +3117,7 @@ async function handleFrame(
             requestId: frame.requestId,
             receipt,
           });
-        } else if (frame.type === "invocation.retry") {
+        } else {
           const accepted = await options.agentRuntime.retryInvocation(
             commandContext,
             frame.executionId,
@@ -3076,25 +3129,70 @@ async function handleFrame(
             receipt: accepted.retryReceipt,
             replayed: accepted.replayed,
           });
-        } else if (frame.type === "agent.tool.confirm") {
-          const execution = await options.agentRuntime.confirmTool(commandContext, frame.confirmation);
-          sendFrame(socket, {
-            type: "agent.execution.ack",
-            requestId: frame.requestId,
-            execution,
-            replayed: false,
-          });
-        } else {
-          const accepted = await options.agentRuntime.compensate(commandContext, frame.executionId);
-          sendFrame(socket, {
-            type: "agent.execution.ack",
-            requestId: frame.requestId,
-            execution: accepted.execution,
-            replayed: accepted.replayed,
-          });
         }
       } catch (error: unknown) {
         sendFrame(socket, mappedError(error, frame.requestId));
+      }
+      return;
+    }
+    case "agent.tool.confirm":
+    case "agent.compensate": {
+      const session = await requireSession(socket, frame.requestId, options, context);
+      if (session === undefined) return;
+      sendFrame(socket, errorFrame(
+        410,
+        "protocol_upgrade_required",
+        "protocol_upgrade_required",
+        frame.requestId,
+      ));
+      return;
+    }
+    case "tool.confirmation.decide":
+    case "tool.confirmation.handoff.offer":
+    case "tool.confirmation.handoff.accept":
+    case "tool.outcome.review":
+    case "tool.compensation.propose": {
+      const session = await requireSession(socket, frame.requestId, options, context);
+      if (session === undefined) return;
+      if (options.toolSafetyAuthority === undefined) {
+        sendFrame(socket, errorFrame(
+          503,
+          "dependency_unavailable",
+          "dependency_unavailable",
+          frame.requestId,
+        ));
+        return;
+      }
+      const commandContext: AuthenticatedCommandContext = {
+        ...session,
+        kind: "human",
+        requestId: frame.requestId,
+        idempotencyKey: `${frame.type}:${frame.requestId}`,
+      };
+      try {
+        const result = closeToolSafetyReceipt(
+          await options.toolSafetyAuthority.executePublicCommand(commandContext, frame),
+          frame.type,
+        );
+        if (result === undefined) {
+          sendFrame(socket, errorFrame(
+            503,
+            "dependency_unavailable",
+            "dependency_unavailable",
+            frame.requestId,
+          ));
+          return;
+        }
+        sendFrame(socket, {
+          type: "tool.safety.command.ack",
+          requestId: frame.requestId,
+          ...result,
+        });
+      } catch (error: unknown) {
+        const mapped = mappedError(error, frame.requestId);
+        sendFrame(socket, mapped.status === 500
+          ? errorFrame(503, "dependency_unavailable", "dependency_unavailable", frame.requestId)
+          : mapped);
       }
       return;
     }

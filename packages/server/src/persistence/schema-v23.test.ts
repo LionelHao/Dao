@@ -63,8 +63,8 @@ describe("authority SQLite v23 Project Loop authority", () => {
         "SELECT version, name, checksum FROM schema_migrations ORDER BY version",
       ).all();
       migrateAuthorityDatabase(database);
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(25);
-      expect(readSchemaVersion(database)).toBe(25);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(26);
+      expect(readSchemaVersion(database)).toBe(26);
       expect(database.prepare(
         "SELECT version, name, checksum FROM schema_migrations WHERE version <= 22 ORDER BY version",
       ).all()).toEqual(history);
@@ -81,7 +81,7 @@ describe("authority SQLite v23 Project Loop authority", () => {
   });
 
   it("upgrades every immutable v1-v22 contract without rewriting history", () => {
-    expect(AUTHORITY_SCHEMA_VERSION).toBe(25);
+    expect(AUTHORITY_SCHEMA_VERSION).toBe(26);
     for (let version = 1; version <= 22; version += 1) {
       withDatabase((database) => {
         migrateAuthorityDatabaseToHistoricalVersionForTest(database, version);
@@ -89,7 +89,7 @@ describe("authority SQLite v23 Project Loop authority", () => {
           "SELECT version, name, checksum FROM schema_migrations ORDER BY version",
         ).all();
         migrateAuthorityDatabase(database);
-        expect(readSchemaVersion(database)).toBe(25);
+        expect(readSchemaVersion(database)).toBe(26);
         expect(database.prepare(
           "SELECT version, name, checksum FROM schema_migrations WHERE version <= ? ORDER BY version",
         ).all(version)).toEqual(history);
@@ -107,7 +107,7 @@ describe("authority SQLite v23 Project Loop authority", () => {
       expect(database.prepare(
         "SELECT version, name, checksum FROM schema_migrations ORDER BY version",
       ).all()).toEqual(history);
-      database.exec("PRAGMA user_version = 26");
+      database.exec("PRAGMA user_version = 27");
       expect(() => migrateAuthorityDatabase(database)).toThrow(/future schema version/i);
     });
     withDatabase((database) => {
@@ -336,7 +336,7 @@ describe("authority SQLite v23 Project Loop authority", () => {
       database = new DatabaseSync(path);
       expect(database.prepare("PRAGMA journal_mode").get()).toEqual({ journal_mode: "wal" });
       migrateAuthorityDatabase(database);
-      expect(readSchemaVersion(database)).toBe(25);
+      expect(readSchemaVersion(database)).toBe(26);
       database.close();
     } finally {
       rmSync(directory, { recursive: true, force: true });

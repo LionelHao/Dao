@@ -12,6 +12,7 @@ export default defineConfig({
           exclude: [
             ...configDefaults.exclude,
             "packages/server/src/authority.e2e.test.ts",
+            "packages/server/src/agent-runtime/human-preemption-authority.test.ts",
             "packages/server/src/persistence/legacy-importer.test.ts",
             "packages/server/src/persistence/context-snapshot-database-authority.test.ts",
             "packages/server/src/persistence/schema*.test.ts",
@@ -24,17 +25,109 @@ export default defineConfig({
       }),
       defineProject({
         test: {
+          name: "authority-schema-recent",
+          environment: "jsdom",
+          include: ["packages/server/src/persistence/schema-recent.test.ts"],
+          pool: "forks",
+          poolOptions: { forks: { singleFork: true } },
+          sequence: { groupOrder: 1 },
+        },
+      }),
+      defineProject({
+        test: {
+          name: "authority-schema-foundations",
+          environment: "jsdom",
+          include: ["packages/server/src/persistence/schema-foundations.test.ts"],
+          pool: "forks",
+          poolOptions: { forks: { singleFork: true } },
+          sequence: { groupOrder: 2 },
+        },
+      }),
+      defineProject({
+        test: {
+          name: "authority-schema-integrity",
+          environment: "jsdom",
+          include: ["packages/server/src/persistence/schema-integrity.test.ts"],
+          pool: "forks",
+          poolOptions: { forks: { singleFork: true } },
+          sequence: { groupOrder: 3 },
+        },
+      }),
+      defineProject({
+        test: {
+          name: "legacy-importer",
+          environment: "jsdom",
+          include: ["packages/server/src/persistence/legacy-importer.test.ts"],
+          pool: "forks",
+          poolOptions: { forks: { singleFork: true } },
+          sequence: { groupOrder: 4 },
+        },
+      }),
+      defineProject({
+        test: {
+          name: "authority-schema-v26-rollback-01",
+          environment: "jsdom",
+          include: ["packages/server/src/persistence/schema-v26-rollback-01.test.ts"],
+          pool: "forks",
+          poolOptions: { forks: { singleFork: true } },
+          sequence: { groupOrder: 5 },
+        },
+      }),
+      defineProject({
+        test: {
+          name: "authority-schema-v26-rollback-02",
+          environment: "jsdom",
+          include: ["packages/server/src/persistence/schema-v26-rollback-02.test.ts"],
+          pool: "forks",
+          poolOptions: { forks: { singleFork: true } },
+          sequence: { groupOrder: 6 },
+        },
+      }),
+      defineProject({
+        test: {
+          name: "authority-schema-v26-rollback-03",
+          environment: "jsdom",
+          include: ["packages/server/src/persistence/schema-v26-rollback-03.test.ts"],
+          pool: "forks",
+          poolOptions: { forks: { singleFork: true } },
+          sequence: { groupOrder: 7 },
+        },
+      }),
+      defineProject({
+        test: {
+          name: "authority-schema-v26-rollback-04",
+          environment: "jsdom",
+          include: ["packages/server/src/persistence/schema-v26-rollback-04.test.ts"],
+          pool: "forks",
+          poolOptions: { forks: { singleFork: true } },
+          sequence: { groupOrder: 8 },
+        },
+      }),
+      defineProject({
+        test: {
+          name: "authority-human-preemption",
+          environment: "jsdom",
+          include: [
+            "packages/server/src/agent-runtime/human-preemption-authority.test.ts",
+          ],
+          pool: "forks",
+          poolOptions: { forks: { singleFork: true } },
+          sequence: { groupOrder: 9 },
+        },
+      }),
+      defineProject({
+        test: {
           name: "worker-persistence",
           environment: "jsdom",
           include: [
             "packages/server/src/persistence/context-snapshot-database-authority.test.ts",
-            "packages/server/src/persistence/legacy-importer.test.ts",
-            "packages/server/src/persistence/schema*.test.ts",
+            "packages/server/src/persistence/schema-v*.test.ts",
             "packages/server/src/persistence/worker-database-client.test.ts",
           ],
+          exclude: ["packages/server/src/persistence/schema-v26-rollback-*.test.ts"],
           pool: "forks",
           poolOptions: { forks: { singleFork: true } },
-          sequence: { groupOrder: 1 },
+          sequence: { groupOrder: 10 },
         },
       }),
       defineProject({
@@ -45,7 +138,7 @@ export default defineConfig({
           pool: "forks",
           poolOptions: { forks: { singleFork: true } },
           testTimeout: 15_000,
-          sequence: { groupOrder: 2 },
+          sequence: { groupOrder: 11 },
         },
       }),
       defineProject({
@@ -56,7 +149,7 @@ export default defineConfig({
           pool: "forks",
           poolOptions: { forks: { singleFork: true } },
           testTimeout: 15_000,
-          sequence: { groupOrder: 3 },
+          sequence: { groupOrder: 12 },
         },
       }),
       defineProject({
@@ -67,7 +160,7 @@ export default defineConfig({
           pool: "forks",
           poolOptions: { forks: { singleFork: true } },
           testTimeout: 15_000,
-          sequence: { groupOrder: 4 },
+          sequence: { groupOrder: 13 },
         },
       }),
     ],

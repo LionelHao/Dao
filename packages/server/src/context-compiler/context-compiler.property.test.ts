@@ -83,7 +83,7 @@ describe("compileContextV1 deterministic properties", () => {
       input.retrieval = [input.delta[0]!, { ...input.delta[0]! }];
       input.attachments = [attachment, { ...attachment }];
       input.tools = [tool, { ...tool }];
-      input.agent.effectiveTools = ["room-memory.read"];
+      input.agent.effectiveCapabilities = ["room.conversation.read", "room.memory.read", "room.respond"];
       const baseline = compileContextV1(input, CONTEXT_COMPILER_CONFIG_V1);
       expect(baseline.ok).toBe(true);
       for (let run = 0; run < RUNS_PER_SEED; run += 1) {

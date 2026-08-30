@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
-import { startAuthoritativeServer } from "../authoritative-server.js";
+import { startAuthoritativeServerForTest } from "../authoritative-server.js";
 
 const directories: string[] = [];
 
@@ -35,9 +35,11 @@ describe("authoritative server Tenant Administrator bootstrap composition", () =
     const directory = await mkdtemp(join(tmpdir(), "dao-ft07-admin-bootstrap-"));
     directories.push(directory);
 
-    const first = await startAuthoritativeServer(options(directory, ["human-owner"]));
+    const first = await startAuthoritativeServerForTest(
+      options(directory, ["human-owner"]), { toolAdapterPathFallbackForTest: true });
     await first.close();
-    const replay = await startAuthoritativeServer(options(directory, ["human-owner"]));
+    const replay = await startAuthoritativeServerForTest(
+      options(directory, ["human-owner"]), { toolAdapterPathFallbackForTest: true });
     await replay.close();
 
     const database = new DatabaseSync(join(directory, "authority.sqlite"));
@@ -59,14 +61,16 @@ describe("authoritative server Tenant Administrator bootstrap composition", () =
       database.close();
     }
 
-    await expect(startAuthoritativeServer(options(directory, ["human-other"])))
+    await expect(startAuthoritativeServerForTest(
+      options(directory, ["human-other"]), { toolAdapterPathFallbackForTest: true }))
       .rejects.toMatchObject({ code: "bootstrap_conflict", status: 409 });
   });
 
   it("fails closed when deployment bootstrap names an Agent principal", async () => {
     const directory = await mkdtemp(join(tmpdir(), "dao-ft07-agent-admin-bootstrap-"));
     directories.push(directory);
-    await expect(startAuthoritativeServer(options(directory, ["agent-helper"])))
+    await expect(startAuthoritativeServerForTest(
+      options(directory, ["agent-helper"]), { toolAdapterPathFallbackForTest: true }))
       .rejects.toMatchObject({ code: "identity_forbidden", status: 403 });
   });
 });

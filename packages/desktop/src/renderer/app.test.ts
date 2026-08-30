@@ -32,17 +32,8 @@ interface RestoredPrimitivePreviewRecords {
 type RendererUnderTest = {
   renderToolConfirmation?: (
     root: HTMLElement,
-    confirmation: {
-      readonly confirmationId: string;
-      readonly executionId: string;
-      readonly attemptSeq: number;
-      readonly toolId: string;
-      readonly target: string;
-      readonly impact: string;
-      readonly reversibility: "compensatable" | "irreversible";
-      readonly expiresAt: string;
-    },
-    onConfirm: (input: { readonly confirmationId: string; readonly executionId: string }) => void,
+    state: importedApp.ToolSafetySurfaceState,
+    actions: importedApp.ToolSafetySurfaceActions,
   ) => void;
   renderAgentExecutionPreview?: (
     root: HTMLElement,
@@ -122,6 +113,318 @@ describe("empty group chat renderer", () => {
     expect(root.querySelector("[data-testid='empty-group-chat']")).not.toBeNull();
     expect(root.textContent).toContain("还没有消息");
     expect(root.textContent).toContain("邀请真人或编制 agent 后开始协作");
+  });
+});
+
+describe("FT-10 J-05 tool-safety surface", () => {
+  const card = (state: importedApp.ToolSafetyCardState): importedApp.ToolSafetyCardProjection => ({
+    confirmationId: "confirmation-1", dispatchId: "dispatch-1", version: 4, state,
+    toolId: "sandbox-file.write", safeTarget: "workspace/config.json",
+    parameterSummary: "replace · 12 bytes · expected abc123…", impact: "更新 sandbox 文件",
+    reversibility: "compensatable", expiresAt: "2026-08-30T08:10:00.000Z",
+    sourceRef: "message-1", reasonCode: state.includes("revoked") ? "permission_reduced" : undefined,
+    namedHumanDisplayRef: "Human A", canDecide: true,
+    ...(state === "reviewed" ? {
+      reviewResolution: "accepted_risk" as const,
+      evidenceSummary: "Human inspected the configured target.",
+    } : {}),
+  });
+  const actions = () => ({
+    submit: vi.fn(), repair: vi.fn(), reauthenticate: vi.fn(), newInvocation: vi.fn(), openSource: vi.fn(),
+  });
+
+  it.each([
+    ["pending", "等待精确 Human 确认"],
+    ["rejected", "已拒绝 · 未执行"],
+    ["duplicate", "已由另一 session 处理"],
+    ["params-changed", "参数已变化"],
+    ["principal-revoked", "确认主体已撤销"],
+    ["confirmed", "尚未执行"],
+    ["grant-revoked", "授权已撤销 · 未执行"],
+    ["dispatched", "dispatch 安全分界"],
+    ["known-succeeded", "工具结果已知成功"],
+    ["known-failed", "工具结果已知失败"],
+    ["outcome-unknown", "OUTCOME UNKNOWN"],
+    ["compensation-proposed", "新的补偿动作已提出"],
+    ["compensation-pending", "补偿动作等待精确 Human 确认"],
+    ["compensation-confirmed", "补偿确认已记录"],
+    ["compensation-dispatched", "补偿动作已越过 dispatch"],
+    ["compensation-known-succeeded", "补偿动作结果已知成功"],
+    ["compensation-known-failed", "补偿动作结果已知失败"],
+    ["compensation-outcome-unknown", "补偿动作 OUTCOME UNKNOWN"],
+    ["reviewed", "审查已闭合"],
+    ["expired", "已过期 · 未执行"],
+  ] as const)("renders authoritative %s without internal data", (state, label) => {
+    const root = document.createElement("main");
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" }, card: card(state), operation: { status: "idle" },
+    }, actions());
+    expect(root.querySelector("[data-tool-safety-state]")?.getAttribute("data-tool-safety-state")).toBe(state);
+    expect(root.querySelector("[data-tool-safety-state]")?.textContent).toContain(label);
+    expect(root.querySelector(".tool-safety-details")?.getAttribute("aria-live")).toBe("off");
+    if (state === "principal-revoked") {
+      expect(root.textContent).toContain("敏感预览已移除");
+      expect(root.textContent).not.toContain("workspace/config.json");
+    } else {
+      expect(root.textContent).toContain("安全目标：workspace/config.json");
+    }
+    expect(root.textContent).not.toMatch(/sealedPayload|grantCapability|dispatchPermit|canonicalParameterSha256/);
+  });
+
+  it("opens the explicit source deep link with an accessible name", () => {
+    const root = document.createElement("main");
+    const ui = actions();
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" }, card: card("pending"), operation: { status: "idle" },
+    }, ui);
+    const source = root.querySelector<HTMLButtonElement>("[data-tool-safety-source='message-1']")!;
+    expect(source.getAttribute("aria-label")).toContain("message-1");
+    source.click();
+    expect(ui.openSource).toHaveBeenCalledWith("message-1");
+  });
+
+  it("closes only the disclosure on Escape without sending an authority command", () => {
+    const root = document.createElement("main"); document.body.append(root);
+    const ui = actions();
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" }, card: card("pending"), operation: { status: "idle" },
+    }, ui);
+    const details = root.querySelector<HTMLDetailsElement>(".tool-safety-details")!;
+    expect(details.open).toBe(true);
+    details.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    expect(details.open).toBe(false);
+    expect(document.activeElement).toBe(details.querySelector("summary"));
+    expect(ui.submit).not.toHaveBeenCalled();
+    root.remove();
+  });
+
+  it("routes a compensation confirmation through the same exact CAS decision gate", () => {
+    const root = document.createElement("main");
+    const ui = actions();
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" }, card: card("compensation-pending"), operation: { status: "idle" },
+    }, ui);
+    root.querySelector<HTMLButtonElement>("[data-tool-safety-action='confirm']")!.click();
+    expect(ui.submit).toHaveBeenCalledWith({
+      type: "tool.confirmation.decide", confirmationId: "confirmation-1", expectedVersion: 4,
+      decision: "confirm",
+    });
+  });
+
+  it("submits exact object decisions online and performs zero writes offline or during repair", () => {
+    const root = document.createElement("main");
+    const online = actions();
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" }, card: card("pending"), operation: { status: "idle" },
+    }, online);
+    const controls = [...root.querySelectorAll<HTMLButtonElement>("[data-tool-safety-action]")];
+    expect(controls.map((button) => button.textContent)).toEqual(["确认执行一次", "拒绝，不执行"]);
+    expect(controls.every((button) => button.type === "button")).toBe(true);
+    controls[0]!.click();
+    controls[1]!.click();
+    expect(online.submit).toHaveBeenNthCalledWith(1, {
+      type: "tool.confirmation.decide", confirmationId: "confirmation-1",
+      expectedVersion: 4, decision: "confirm",
+    });
+    expect(online.submit).toHaveBeenNthCalledWith(2, {
+      type: "tool.confirmation.decide", confirmationId: "confirmation-1",
+      expectedVersion: 4, decision: "reject",
+    });
+
+    for (const connection of [
+      { status: "offline" as const }, { status: "repairing" as const },
+      { status: "repair-failed" as const, errorCode: "checksum_mismatch" },
+    ]) {
+      const locked = actions();
+      importedApp.renderToolSafetySurface(root, {
+        connection, card: card("pending"), operation: { status: "idle" },
+      }, locked);
+      const disabled = [...root.querySelectorAll<HTMLButtonElement>("[data-tool-safety-action]")];
+      expect(disabled.every((button) => button.disabled)).toBe(true);
+      disabled.forEach((button) => button.click());
+      expect(locked.submit).not.toHaveBeenCalled();
+      expect(root.textContent).toMatch(/只读|repair/);
+    }
+
+    for (const connection of [
+      { status: "offline" as const }, { status: "repairing" as const },
+      { status: "repair-failed" as const, errorCode: "checksum_mismatch" },
+    ]) {
+      const locked = actions();
+      importedApp.renderToolSafetySurface(root, {
+        connection, card: card("rejected"), operation: { status: "idle" },
+      }, locked);
+      const next = root.querySelector<HTMLButtonElement>("[data-recovery-action='new-invocation']")!;
+      expect(next.disabled).toBe(true);
+      next.click();
+      expect(locked.newInvocation).not.toHaveBeenCalled();
+    }
+  });
+
+  it("retains and locks the review draft while submitting, then restores evidence focus", () => {
+    const root = document.createElement("main");
+    document.body.append(root);
+    const ui = actions();
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" }, card: card("outcome-unknown"),
+      reviewDraft: { evidenceSummary: "Inspected target before submit." },
+      operation: { status: "submitting", requestId: "review-1", action: "review" },
+    }, ui);
+    const submitting = root.querySelector<HTMLTextAreaElement>("[data-tool-safety-evidence]")!;
+    expect(submitting.value).toBe("Inspected target before submit.");
+    expect(submitting.disabled).toBe(true);
+    expect([...root.querySelectorAll<HTMLButtonElement>("[data-tool-safety-action]")]
+      .every((button) => button.disabled)).toBe(true);
+
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" }, card: card("outcome-unknown"),
+      reviewDraft: { evidenceSummary: "Inspected target before submit.", focusEvidence: true },
+      operation: { status: "error", requestId: "review-1", action: "review", statusCode: 503,
+        code: "authority_unavailable", retainedEvidenceSummary: "Inspected target before submit." },
+    }, ui);
+    const restored = root.querySelector<HTMLTextAreaElement>("[data-tool-safety-evidence]")!;
+    expect(restored.value).toBe("Inspected target before submit.");
+    expect(restored.disabled).toBe(false);
+    const compensation = root.querySelector<HTMLButtonElement>(
+      "[data-tool-safety-action='compensate']",
+    )!;
+    expect(compensation.disabled).toBe(true);
+    compensation.click();
+    expect(ui.submit).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(restored);
+    root.remove();
+  });
+
+  it("keeps ACK distinct from execution success and makes unknown review explicit", () => {
+    const root = document.createElement("main");
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" }, card: card("confirmed"),
+      operation: { status: "acknowledged", requestId: "request-1", action: "confirm" },
+    }, actions());
+    expect(root.querySelector("[role='status']")?.textContent).toContain("不表示工具执行成功");
+    expect(root.textContent).toContain("等待 stable event / repair projection");
+
+    const unknownActions = actions();
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" }, card: card("outcome-unknown"), operation: { status: "idle" },
+    }, unknownActions);
+    expect(root.querySelector("[role='alert']")).not.toBeNull();
+    expect(root.textContent).not.toMatch(/重试工具|再次执行原动作|撤销副作用/);
+    const evidence = root.querySelector<HTMLTextAreaElement>("[data-tool-safety-evidence]")!;
+    evidence.value = "Target inspected; accepting residual risk.";
+    const reviewButtons = root.querySelectorAll<HTMLButtonElement>("[data-tool-safety-action='review']");
+    reviewButtons[2]!.click();
+    expect(unknownActions.submit).toHaveBeenCalledWith({
+      type: "tool.outcome.review", dispatchId: "dispatch-1", expectedVersion: 4,
+      resolution: "accepted_risk", evidenceSummary: "Target inspected; accepting residual risk.",
+    });
+    root.querySelector<HTMLButtonElement>("[data-tool-safety-action='compensate']")!.click();
+    expect(unknownActions.submit).toHaveBeenCalledWith({
+      type: "tool.compensation.propose", dispatchId: "dispatch-1", expectedVersion: 4,
+    });
+    expect(root.textContent).toContain("新的补偿动作");
+
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" },
+      card: { ...card("outcome-unknown"), canDecide: false },
+      operation: { status: "idle" },
+    }, unknownActions);
+    expect(root.querySelector("[data-tool-safety-evidence]")).toBeNull();
+    expect(root.querySelector("[data-tool-safety-action='review']")).toBeNull();
+    expect(root.querySelector("[data-tool-safety-action='compensate']")).toBeNull();
+
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" }, card: card("known-succeeded"), operation: { status: "idle" },
+    }, unknownActions);
+    root.querySelector<HTMLButtonElement>("[data-tool-safety-action='compensate']")!.click();
+    expect(unknownActions.submit).toHaveBeenCalledWith({
+      type: "tool.compensation.propose", dispatchId: "dispatch-1", expectedVersion: 4,
+    });
+    unknownActions.submit.mockClear();
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" }, card: card("known-succeeded"),
+      operation: { status: "error", requestId: "compensation-503", action: "compensate",
+        statusCode: 503, code: "authority_unavailable" },
+    }, unknownActions);
+    const compensationAfter503 = root.querySelector<HTMLButtonElement>(
+      "[data-tool-safety-action='compensate']",
+    )!;
+    expect(compensationAfter503.disabled).toBe(true);
+    compensationAfter503.click();
+    expect(unknownActions.submit).not.toHaveBeenCalled();
+
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" },
+      card: { ...card("outcome-unknown"), compensationKnownSucceeded: true,
+        evidenceSummary: "Compensation dispatch is known_succeeded." },
+      operation: { status: "idle" },
+    }, unknownActions);
+    root.querySelectorAll<HTMLButtonElement>("[data-tool-safety-action='review']")[3]!.click();
+    expect(unknownActions.submit).toHaveBeenCalledWith({
+      type: "tool.outcome.review", dispatchId: "dispatch-1", expectedVersion: 4,
+      resolution: "compensated", evidenceSummary: "Compensation dispatch is known_succeeded.",
+    });
+  });
+
+  it("offers and accepts only target-specific confirmation handoff commands", () => {
+    const root = document.createElement("main");
+    const handoffActions = actions();
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" },
+      card: { ...card("pending"), handoffTargetActorId: "human-2" },
+      operation: { status: "idle" },
+    }, handoffActions);
+    root.querySelector<HTMLButtonElement>("[data-tool-safety-action='handoff-offer']")!.click();
+    expect(root.querySelector("[data-tool-safety-action='handoff-accept']")).toBeNull();
+    expect(handoffActions.submit).toHaveBeenCalledWith({
+      type: "tool.confirmation.handoff.offer", confirmationId: "confirmation-1",
+      expectedVersion: 4, targetActorId: "human-2",
+    });
+    handoffActions.submit.mockClear();
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" },
+      card: { ...card("pending"), canDecide: false, handoffId: "handoff-1", handoffVersion: 1 },
+      operation: { status: "idle" },
+    }, handoffActions);
+    expect(root.querySelector("[data-tool-safety-action='confirm']")).toBeNull();
+    expect(root.querySelector("[data-tool-safety-action='reject']")).toBeNull();
+    expect(root.querySelector("[data-tool-safety-action='handoff-offer']")).toBeNull();
+    root.querySelector<HTMLButtonElement>("[data-tool-safety-action='handoff-accept']")!.click();
+    expect(handoffActions.submit).toHaveBeenCalledWith({
+      type: "tool.confirmation.handoff.accept", handoffId: "handoff-1", expectedVersion: 1,
+    });
+  });
+
+  it("maps 401/403/409/410/429/503 recovery, retains review input, and restores focus", () => {
+    const expected = new Map<number, RegExp>([
+      [401, /重新认证/], [403, /权限或主体已失效/], [409, /载入最新 projection/],
+      [410, /创建新 invocation/], [429, /17s 后可手动重试/], [503, /服务暂不可用/],
+    ]);
+    for (const statusCode of [401, 403, 409, 410, 429, 503] as const) {
+      const root = document.createElement("main");
+      document.body.append(root);
+      importedApp.renderToolSafetySurface(root, {
+        connection: { status: "online" }, card: card("outcome-unknown"), focusStateHeading: true,
+        operation: { status: "error", requestId: `error-${statusCode}`, action: "review",
+          statusCode, code: `error_${statusCode}`, retryAfterSeconds: 17,
+          retainedEvidenceSummary: "Retained Human input." },
+      }, actions());
+      expect(root.querySelector(".tool-safety-status")?.textContent).toMatch(expected.get(statusCode)!);
+      expect(root.querySelector<HTMLTextAreaElement>("[data-tool-safety-evidence]")?.value)
+        .toBe("Retained Human input.");
+      expect(document.activeElement).toBe(root.querySelector("[data-tool-safety-state-heading]"));
+      root.remove();
+    }
+  });
+
+  it("ships explicit 840px reflow, 200% zoom-safe sizing, focus ring, and reduced motion CSS", () => {
+    const css = readFileSync(resolve(import.meta.dirname, "styles.css"), "utf8");
+    expect(css).toContain(".dao-tool-safety");
+    expect(css).toContain("@media (max-width: 52.5rem)");
+    expect(css).toContain("min-inline-size: 0");
+    expect(css).toContain("overflow-wrap: anywhere");
+    expect(css).toContain("@media (prefers-reduced-motion: reduce)");
+    expect(css).toContain(".dao-tool-safety :focus-visible");
   });
 });
 
@@ -356,28 +659,30 @@ describe("historical preemption and canonical retry presentation", () => {
 });
 
 describe("side-effect confirmation renderer", () => {
-  it("shows target, impact, reversibility, and expiry and emits one closed confirmation", () => {
+  it("delegates the renderer entry to the authoritative J-05 command surface", () => {
     const root = document.createElement("div");
-    const confirmations: Array<{ readonly confirmationId: string; readonly executionId: string }> = [];
+    const ui = {
+      submit: vi.fn(), repair: vi.fn(), reauthenticate: vi.fn(), newInvocation: vi.fn(), openSource: vi.fn(),
+    };
     app.renderToolConfirmation?.(root, {
-      confirmationId: "confirmation-1",
-      executionId: "execution-1",
-      attemptSeq: 2,
-      toolId: "sandbox-file.write",
-      target: "sandbox-file.write",
-      impact: "bounded-side-effect",
-      reversibility: "compensatable",
-      expiresAt: "2026-08-17T00:05:00.000Z",
-    }, (input) => confirmations.push(input));
-    expect(root.textContent).toContain("目标：sandbox-file.write");
+      connection: { status: "online" }, operation: { status: "idle" },
+      card: {
+        confirmationId: "confirmation-1", version: 3, state: "pending", toolId: "sandbox-file.write",
+        safeTarget: "workspace/config.json", parameterSummary: "replace · 12 bytes",
+        impact: "bounded-side-effect", reversibility: "compensatable",
+        expiresAt: "2026-08-17T00:05:00.000Z", sourceRef: "message-1", canDecide: true,
+      },
+    }, ui);
+    expect(root.querySelector("[data-tool-safety-state='pending']")).not.toBeNull();
+    expect(root.textContent).toContain("安全目标：workspace/config.json");
     expect(root.textContent).toContain("影响：bounded-side-effect");
     expect(root.textContent).toContain("可逆性：compensatable");
     expect(root.textContent).toContain("过期：2026-08-17T00:05:00.000Z");
-    const button = root.querySelector<HTMLButtonElement>("button");
-    button?.click();
-    button?.click();
-    expect(confirmations).toEqual([{ confirmationId: "confirmation-1", executionId: "execution-1" }]);
-    expect(button?.disabled).toBe(true);
+    root.querySelector<HTMLButtonElement>("[data-tool-safety-action='confirm']")?.click();
+    expect(ui.submit).toHaveBeenCalledWith({
+      type: "tool.confirmation.decide", confirmationId: "confirmation-1", expectedVersion: 3,
+      decision: "confirm",
+    });
   });
 });
 

@@ -18,6 +18,7 @@ import { createGovernanceReplicaFeed } from "../governance/controller.js";
 
 import {
   ClientSyncReplicaError,
+  DesktopToolSafetyReplica,
   SnapshotCompletionOutcomeUnknownError,
   createClientSyncReplica,
   type ClientAuthorityCache,
@@ -1065,5 +1066,92 @@ describe("ClientSyncReplica", () => {
 
     expect(cache.hasStaging()).toBe(false);
     expect(cache.liveCatalog()).toEqual([]);
+  });
+});
+
+describe("FT-10 tool-safety projection replica", () => {
+  const pending = {
+    kind: "tool-confirmation",
+    value: {
+      confirmationId: "confirmation-1", toolCallId: "tool-call-1", toolId: "sandbox-file.write",
+      state: "pending", safePreview: "Write config.json (12 bytes)", reasonCode: null,
+      expiresAt: "2026-08-30T08:10:00.000Z", version: 1,
+      principalActorId: "human-1", namedHumanDisplayRef: "Human A", sourceRef: "message-1",
+    },
+  } as const;
+
+  it("atomically swaps a complete repair and keeps the old projection on repair failure", () => {
+    const replica = new DesktopToolSafetyReplica();
+    expect(replica.applyStableEvent("room-1", "event-1", pending)).toBe(true);
+    replica.beginRepair("room-1", 7);
+    const confirmed = { ...pending, value: { ...pending.value, version: 2, state: "confirmed" as const } };
+    replica.stageRepair("room-1", 7, [confirmed]);
+    expect(replica.read("room-1")).toEqual([pending]);
+    replica.failRepair("room-1", 7);
+    expect(replica.read("room-1")).toEqual([pending]);
+
+    replica.beginRepair("room-1", 8);
+    replica.stageRepair("room-1", 8, [confirmed]);
+    replica.commitRepair("room-1", 8);
+    expect(replica.read("room-1")).toEqual([confirmed]);
+  });
+
+  it("accepts all seven canonical nested Core repair kinds", () => {
+    const replica = new DesktopToolSafetyReplica();
+    replica.beginRepair("room-1", 1);
+    replica.stageRepair("room-1", 1, [{
+      kind: "tool-call", value: { toolCallId: "tool-call-1", toolId: "sandbox-file.write",
+        safePreview: "safe JSON", state: "prepared", version: 1, sourceRef: "message-1" },
+    }, pending, {
+      kind: "tool-grant", value: { grantId: "grant-1", toolCallId: "tool-call-1", state: "active",
+        reasonCode: null, expiresAt: "2026-08-30T08:10:00.000Z", version: 1 },
+    }, {
+      kind: "tool-dispatch", value: { dispatchId: "dispatch-1", toolCallId: "tool-call-1",
+        state: "outcome_unknown", reasonCode: "adapter_timeout", version: 3 },
+    }, {
+      kind: "tool-review", value: { reviewId: "review-1", dispatchId: "dispatch-1",
+        resolution: "accepted_risk", evidenceSummary: "Human inspected the target.",
+        namedHumanDisplayRef: "Human A", compensationToolCallId: null, version: 1 },
+    }, {
+      kind: "tool-handoff", value: { handoffId: "handoff-1", confirmationId: "confirmation-1",
+        state: "offered", targetActorId: "human-2", targetNamedHumanDisplayRef: "Human B", version: 1 },
+    }, {
+      kind: "tool-compensation", value: { lineageId: "lineage-1", originalDispatchId: "dispatch-1",
+        compensationInvocationId: "invocation-2", compensationExecutionId: "execution-2",
+        compensationToolCallId: "tool-call-2", state: "pending", version: 1 },
+    }]);
+    replica.commitRepair("room-1", 1);
+    expect(replica.read("room-1")).toHaveLength(7);
+  });
+
+  it("rejects conflicting canonical objects even when a repair page repeats the same version", () => {
+    const replica = new DesktopToolSafetyReplica();
+    replica.beginRepair("room-1", 2);
+    expect(() => replica.stageRepair("room-1", 2, [pending, {
+      ...pending, value: { ...pending.value, safePreview: "Conflicting safe preview" },
+    }])).toThrow(ClientSyncReplicaError);
+    replica.failRepair("room-1", 2);
+    expect(replica.read("room-1")).toEqual([]);
+  });
+
+  it("deduplicates canonical stable events, ignores stale versions, rejects flat/internal fields, and purges revoke", () => {
+    const replica = new DesktopToolSafetyReplica();
+    expect(replica.applyStableEvent("room-1", "event-1", pending)).toBe(true);
+    expect(replica.applyStableEvent("room-1", "event-1", {
+      ...pending, value: { ...pending.value, version: 2 },
+    })).toBe(false);
+    expect(replica.applyStableEvent("room-1", "event-2", {
+      ...pending, value: { ...pending.value, state: "expired" },
+    })).toBe(true);
+    expect(replica.read("room-1")).toEqual([pending]);
+    expect(() => replica.applyStableEvent("room-1", "event-3", {
+      ...pending, value: { ...pending.value, version: 2, sealedPayload: "sealed-canary" },
+    })).toThrow(ClientSyncReplicaError);
+    expect(() => replica.applyStableEvent("room-1", "event-4", {
+      kind: "tool-confirmation", objectId: "confirmation-1", version: 2,
+      state: "confirmed", safeSummary: "obsolete flat shape",
+    })).toThrow(ClientSyncReplicaError);
+    replica.revoke("room-1");
+    expect(replica.read("room-1")).toEqual([]);
   });
 });

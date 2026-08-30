@@ -83,6 +83,8 @@ import type { BallDeadlinePolicy } from "../ball-runtime/ball-authority-protocol
 import { archivedMessageGateRegistration } from "../message-authority/archived-message-gate.js";
 import { createBusinessTimerSuspensionProductionRegistration } from "../business-timers/business-timer-suspension-participant.js";
 import { archiveToolSafetyParticipantRegistration } from "../tool-safety/archive-tool-safety-participant.js";
+import { settleToolSafetyPrincipalFenceInTransaction } from
+  "../tool-safety/database-authority.js";
 import { assignmentSecurityReductionParticipantRegistration } from "../room-assignment/assignment-security-reduction-participant.js";
 import { roomCacheInvalidationRegistration } from "../access/room-cache-invalidation-port.js";
 import { createOfflineLeaseInvalidationRegistration } from "../access/offline-lease-invalidation-port.js";
@@ -1178,6 +1180,12 @@ function revokeSessionFamily(
   session: SessionAuthorityRow,
   now: number,
 ): void {
+  settleToolSafetyPrincipalFenceInTransaction(
+    openedDatabase,
+    session.actorId,
+    session.familyId,
+    new Date(now).toISOString(),
+  );
   openedDatabase
     .prepare(
       `UPDATE session_families

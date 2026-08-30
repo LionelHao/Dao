@@ -38,7 +38,7 @@ function createRequest(requestId = "create-1", profileId = "profile-1") {
     participation: "active" as const,
     roomResponsibility: "Review delivery risk",
     capabilitySubset: ["room.project.read", "room.respond"],
-    toolSubset: ["repository.git-status", "room-memory.read"],
+    toolSubset: ["repository.git-status"],
   };
 }
 
@@ -245,12 +245,12 @@ function fixture(filename = ":memory:"): DatabaseSync {
   database.prepare("INSERT INTO agent_profiles VALUES (?, ?, ?, ?, 2, 'enabled', ?, ?)").run(
     "profile-1", "agent-1", "Review Agent", "Review delivery",
     JSON.stringify(["room.project.read", "room.respond"]),
-    JSON.stringify(["repository.git-status", "room-memory.read"]),
+    JSON.stringify(["repository.git-status"]),
   );
   database.prepare("INSERT INTO agent_profiles VALUES (?, ?, ?, ?, 4, 'disabled', ?, ?)").run(
     "profile-2", "agent-2", "Disabled Agent", "Disabled",
     JSON.stringify(["room.respond"]),
-    JSON.stringify(["room-memory.read"]),
+    JSON.stringify(["repository.git-status"]),
   );
   return database;
 }
@@ -357,7 +357,7 @@ describe("SQLite Room Assignment repository and service", () => {
        FROM room_memberships WHERE room_id='room-1' AND actor_id='agent-1'`,
     ).get()).toEqual({
       kind: "agent", participation: "on-mention",
-      tools: '["repository.git-status","room-memory.read"]', accessRevision: 0,
+      tools: '["repository.git-status"]', accessRevision: 0,
     });
     const event = database.prepare(
       "SELECT payload_json AS payloadJson FROM events WHERE event_id = ?",
@@ -521,7 +521,7 @@ describe("SQLite Room Assignment repository and service", () => {
         assignmentId: created.assignmentId,
         expectedRoomRevision: 2, expectedAssignmentRevision: 1,
         participation: "on-mention", roomResponsibility: "Review delivery risk",
-        capabilitySubset: ["room.respond"], toolSubset: ["room-memory.read"],
+        capabilitySubset: ["room.respond"], toolSubset: ["repository.git-status"],
       }, now + 2));
     expect(inTransaction(database, "room-1", (transaction) => getRoomAssignmentInTransaction(
       transaction, context("owner"), "room-1", created.assignmentId, now + 2,
@@ -531,7 +531,7 @@ describe("SQLite Room Assignment repository and service", () => {
     expect(database.prepare(
       `SELECT participation, tool_permissions_json AS tools
        FROM room_memberships WHERE room_id='room-1' AND actor_id='agent-1'`,
-    ).get()).toEqual({ participation: "on-mention", tools: '["room-memory.read"]' });
+    ).get()).toEqual({ participation: "on-mention", tools: '["repository.git-status"]' });
     expect(errorCode(() => inTransaction(database, "room-1", (transaction) =>
       executeRoomAssignmentCommandInTransaction(transaction, context("owner"), {
         kind: "update", requestId: "archived-expand", idempotencyKey: "archived-expand-key", roomId: "room-1",
@@ -539,7 +539,7 @@ describe("SQLite Room Assignment repository and service", () => {
         expectedRoomRevision: 3, expectedAssignmentRevision: 2,
         participation: "active", roomResponsibility: "Review delivery risk",
         capabilitySubset: ["room.project.read", "room.respond"],
-        toolSubset: ["repository.git-status", "room-memory.read"],
+        toolSubset: ["repository.git-status"],
       }, now + 3)))).toBe("conflict");
     const paused = inTransaction(database, "room-1", (transaction) =>
       executeRoomAssignmentCommandInTransaction(transaction, context("owner"), {

@@ -74,17 +74,17 @@ describe("authority SQLite v20 Agent Profile and Routing Authority", () => {
   it("upgrades fresh and every immutable v1-v19 schema and restarts idempotently", () => {
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(25);
-      expect(readSchemaVersion(database)).toBe(25);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(26);
+      expect(readSchemaVersion(database)).toBe(26);
       expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get())
-        .toEqual({ count: 25 });
+        .toEqual({ count: 26 });
       expect(() => migrateAuthorityDatabase(database)).not.toThrow();
     });
     for (let version = 1; version <= 19; version += 1) {
       withDatabase((database) => {
         migrateAuthorityDatabaseToHistoricalVersionForTest(database, version);
         migrateAuthorityDatabase(database);
-        expect(readSchemaVersion(database)).toBe(25);
+        expect(readSchemaVersion(database)).toBe(26);
       });
     }
   }, 150_000);
@@ -446,7 +446,7 @@ describe("authority SQLite v20 Agent Profile and Routing Authority", () => {
         UPDATE agent_profiles
         SET revision = revision + 1, tool_ceiling_json = '["shell.exec"]', updated_at = ?
         WHERE id = ?
-      `).run(NOW, profile.id)).toThrow(/authority set/i);
+      `).run(NOW, profile.id)).toThrow(/authority set|external tool ceiling/i);
       database.prepare(`
         INSERT INTO route_jobs (
           id, room_id, source_message_id, status, current_attempt, topic_key,
@@ -513,7 +513,7 @@ describe("authority SQLite v20 Agent Profile and Routing Authority", () => {
 
   it("refuses future, migration-history, and physical-contract tamper", () => {
     withDatabase((database) => {
-      database.exec("PRAGMA user_version = 26");
+      database.exec("PRAGMA user_version = 27");
       expect(() => migrateAuthorityDatabase(database)).toThrow(/future schema/i);
     });
     withDatabase((database) => {

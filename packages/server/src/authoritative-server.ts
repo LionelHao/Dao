@@ -16,7 +16,10 @@ import { createMessageService } from "./service.js";
 import { createAuthoritativeRoomLifecycleService } from "./room-lifecycle.js";
 import { createAuthoritativeCollaborationPrimitives } from "./primitives.js";
 import { createSyncService } from "./sync-service.js";
-import { startMessageWebSocketServer } from "./websocket.js";
+import {
+  startMessageWebSocketServer,
+  type ToolSafetyAuthorityTransport,
+} from "./websocket.js";
 import { createSnapshotWorkerClient } from "./persistence/snapshot-worker-client.js";
 import { createSqliteAuthoritativeStore } from "./persistence/sqlite-authoritative-store.js";
 import {
@@ -41,7 +44,11 @@ import {
 import { createHttpJsonReadAdapter } from "./agent-runtime/tools/http-json-read.js";
 import { createRepositoryGitStatusAdapter } from "./agent-runtime/tools/repository-git-status.js";
 import { createSandboxFileWriteAdapter } from "./agent-runtime/tools/sandbox-file-write.js";
-import { createToolGateway } from "./agent-runtime/tool-gateway.js";
+import { createToolGateway, createToolSafetyGateway } from "./agent-runtime/tool-gateway.js";
+import { bridgePhysicalToolAdapter } from "./agent-runtime/physical-tool-adapter-bridge.js";
+import { createWorkerToolSafetyAuthority } from "./tool-safety/worker-authority.js";
+import { createToolSafetyRuntimeCoordinator } from "./tool-safety/runtime-coordinator.js";
+import { ToolParameterSealer } from "./tool-safety/tool-parameter-sealer.js";
 import { createWorkerRoomMemoryReadAdapter } from "./agent-runtime/worker-room-memory-read-adapter.js";
 import { createWorkerCompiledContextBuilder } from "./context-compiler/worker-compiled-context.js";
 import { createOpenAIRouterProvider } from "./route-runtime/openai-router-provider.js";
@@ -191,6 +198,8 @@ interface AuthoritativeServerTestOptions {
   >>;
   readonly blueprintBallProjectionPort?: BlueprintBallProjectionPort;
   readonly agentRuntimeProviderForTest?: ProviderAdapter;
+  /** Test-only cross-platform seam; production startup remains descriptor fail-closed. */
+  readonly toolAdapterPathFallbackForTest?: true;
 }
 
 export interface AuthoritativeServerTestFacades {
@@ -681,11 +690,15 @@ async function start(
         repositoryRoot: resolve(runtimeConfiguration.repositoryRoot ?? process.cwd()),
         maxOutputBytes: 256 * 1_024,
         timeoutMs: 5_000,
+        ...(testOptions.toolAdapterPathFallbackForTest === true
+          ? { testOnlyAllowPathFallback: true } : {}),
       }),
       createSandboxFileWriteAdapter({
         root: sandboxRoot,
         compensationKey: new Uint8Array(options.invitationSecretKey),
         maxContentBytes: 256 * 1_024,
+        ...(testOptions.toolAdapterPathFallbackForTest === true
+          ? { testOnlyAllowPathFallback: true } : {}),
       }),
     ] as const;
     const roomMemoryRead = createWorkerRoomMemoryReadAdapter({
@@ -726,7 +739,26 @@ async function start(
         return result.roomAccessRevision;
       },
     });
-    const toolGateway = createToolGateway({ authority: runtimeAuthority, adapters: runtimeTools });
+    const toolGateway = createToolGateway({ authority: runtimeAuthority, adapters: [roomMemoryRead] });
+    const toolSafetyAuthority = createWorkerToolSafetyAuthority({ worker: authorityWorker, now: Date.now });
+    const toolParameterKey = Object.freeze({
+      version: "dao-ft10-parameter-key.v1",
+      bytes: new Uint8Array(options.invitationSecretKey),
+    });
+    const toolParameterSealer = new ToolParameterSealer((version) =>
+      version === undefined || version === toolParameterKey.version ? toolParameterKey : undefined);
+    if (toolParameterSealer.readiness() !== "ready") {
+      throw new TypeError("FT-10 parameter sealing key is unavailable");
+    }
+    const toolSafetyCoordinator = createToolSafetyRuntimeCoordinator({
+      authority: toolSafetyAuthority,
+      sealer: toolParameterSealer,
+      now: Date.now,
+    });
+    const toolSafetyGateway = createToolSafetyGateway({
+      authority: toolSafetyAuthority,
+      adapters: tools.map(bridgePhysicalToolAdapter),
+    });
     runtime = createAgentRuntimeService({
       authority: runtimeAuthority,
       recoveryAuthority: runtimeRecoveryAuthority,
@@ -738,7 +770,8 @@ async function start(
         : "noauth",
       tools: runtimeTools.map((tool) => tool.descriptor),
       toolGateway,
-      toolAdapters: runtimeTools,
+      toolAdapters: [roomMemoryRead],
+      toolSafety: { coordinator: toolSafetyCoordinator, gateway: toolSafetyGateway },
       async buildProviderInput(execution, invocation) {
         return contextBuilder.build(execution, invocation);
       },
@@ -1054,6 +1087,71 @@ async function start(
         return frame;
       },
     };
+    const publicToolSafetyAuthority: ToolSafetyAuthorityTransport = Object.freeze({
+      async executePublicCommand(
+        context: Parameters<ToolSafetyAuthorityTransport["executePublicCommand"]>[0],
+        command: Parameters<ToolSafetyAuthorityTransport["executePublicCommand"]>[1],
+      ) {
+        if (command.type === "tool.confirmation.decide") {
+          const result = await runtime!.decideToolSafetyConfirmation(
+            context, command.confirmationId, command.expectedVersion, command.decision,
+          );
+          return Object.freeze({ operation: command.type,
+            objectId: result.confirmationId, version: result.version, replayed: result.replayed });
+        }
+        if (command.type === "tool.outcome.review") {
+          const evidenceSummary = command.evidenceSummary.trim();
+          const result = await toolSafetyAuthority.execute({
+            type: "tool-safety.outcome-review",
+            context,
+            dispatchId: command.dispatchId,
+            expectedVersion: command.expectedVersion,
+            resolution: command.resolution,
+            evidenceSummary,
+            evidenceSha256: createHash("sha256").update(evidenceSummary).digest("hex"),
+            now: Date.now(),
+          });
+          if (result.kind !== "reviewed") {
+            throw new AgentRuntimeError("execution_conflict", "Tool review result was malformed");
+          }
+          return Object.freeze({ operation: command.type,
+            objectId: result.reviewId, version: result.version, replayed: result.replayed });
+        }
+        if (command.type === "tool.confirmation.handoff.offer") {
+          const result = await toolSafetyCoordinator.offerHandoff({ context,
+            confirmationId: command.confirmationId, expectedVersion: command.expectedVersion,
+            targetActorId: command.targetActorId });
+          if (result.kind !== "handoff" || result.state !== "offered") {
+            throw new AgentRuntimeError("execution_conflict", "Tool handoff offer was malformed");
+          }
+          return Object.freeze({ operation: command.type, objectId: result.handoffId,
+            version: result.version, replayed: result.replayed });
+        }
+        if (command.type === "tool.confirmation.handoff.accept") {
+          const result = await toolSafetyCoordinator.acceptHandoff({ context,
+            handoffId: command.handoffId, expectedVersion: command.expectedVersion });
+          if (result.kind !== "handoff" || result.state !== "accepted") {
+            throw new AgentRuntimeError("execution_conflict", "Tool handoff accept was malformed");
+          }
+          return Object.freeze({ operation: command.type, objectId: result.handoffId,
+            version: result.version, replayed: result.replayed });
+        }
+        if (command.type === "tool.compensation.propose") {
+          const result = await toolSafetyCoordinator.proposeCompensation({ context,
+            dispatchId: command.dispatchId, expectedVersion: command.expectedVersion });
+          if (result.kind !== "compensation-proposed") {
+            throw new AgentRuntimeError("execution_conflict", "Tool compensation proposal was malformed");
+          }
+          await runtime!.recover();
+          return Object.freeze({ operation: command.type, objectId: result.lineageId,
+            version: result.version, replayed: result.replayed });
+        }
+        throw new AgentRuntimeError(
+          "execution_conflict",
+          "Tool safety operation requires an authoritative transition not yet available",
+        );
+      },
+    });
     transport = await startMessageWebSocketServer({
       auth,
       service,
@@ -1063,6 +1161,7 @@ async function start(
       outboxStore,
       outboxPollIntervalMs: 10,
       agentRuntime: runtime,
+      toolSafetyAuthority: publicToolSafetyAuthority,
       previewAuthority: {
         async deliver(input, sendSynchronously) {
           await authorityWorker.executeRuntimeWithSynchronousDelivery({
@@ -1122,9 +1221,10 @@ async function start(
     await routeRuntime?.close().catch(() => undefined);
     await ballRuntime?.close().catch(() => undefined);
     await projectBoundaryRuntime?.close().catch(() => undefined);
-    await runtime?.close().catch(() => undefined);
+    let runtimeSafetySettled = true;
+    await runtime?.close().catch(() => { runtimeSafetySettled = false; });
     await snapshots?.close().catch(() => undefined);
-    await worker?.close().catch(() => undefined);
+    if (runtimeSafetySettled) await worker?.close().catch(() => undefined);
     throw error;
   }
 
@@ -1132,12 +1232,14 @@ async function start(
   return {
     url: transport.url,
     close() {
-      closePromise ??= (async () => {
+      if (closePromise !== undefined) return closePromise;
+      const attempt = (async () => {
         stopCacheInvalidationRecovery?.();
         stopRuntimeRecovery?.();
         stopAttachmentRecovery?.();
         stopMemoryRecovery?.();
         const failures: unknown[] = [];
+        let runtimeSafetySettled = true;
         for (const [stage, close] of [
           ["transport", () => transport.close()],
           ["attachment-authority", async () => attachmentAuthority?.close()],
@@ -1150,17 +1252,24 @@ async function start(
           ["snapshots", () => snapshots.close()],
           ["worker", () => worker.close()],
         ] as const) {
+          if (stage === "worker" && !runtimeSafetySettled) continue;
           try {
             await close();
             testOptions.afterCloseForTest?.[stage]?.();
           } catch (error: unknown) {
             failures.push(error);
+            if (stage === "runtime") runtimeSafetySettled = false;
           }
         }
         if (failures.length > 0) {
           throw new AggregateError(failures, "Authoritative server cleanup failed");
         }
       })();
+      const retryable = attempt.catch((error: unknown) => {
+        if (closePromise === retryable) closePromise = undefined;
+        throw error;
+      });
+      closePromise = retryable;
       return closePromise;
     },
   };

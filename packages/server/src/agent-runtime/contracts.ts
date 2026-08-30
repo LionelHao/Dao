@@ -117,6 +117,8 @@ export interface ToolInvocation {
 }
 
 export interface ToolOutcome {
+  /** Physical adapter outcome; legacy internal reads omit this until FT-10 migration completes. */
+  readonly outcome?: "known_succeeded" | "known_failed" | "ambiguous";
   readonly summary: Readonly<Record<string, string | number | boolean>>;
   readonly modelInput: string;
   readonly compensationToken?: string;
