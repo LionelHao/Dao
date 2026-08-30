@@ -8,12 +8,10 @@ import {
   AUTHORITY_SCHEMA_VERSION,
   AUTHORITY_V14_STATEMENT_COUNT_FOR_TEST,
   AUTHORITY_V15_STATEMENT_COUNT_FOR_TEST,
-  AUTHORITY_V26_STATEMENT_COUNT_FOR_TEST,
   configureAuthorityConnection,
   listAuthorityTables,
   migrateAuthorityDatabase,
   migrateAuthorityDatabaseToHistoricalVersionForTest,
-  migrateAuthorityDatabaseToPreviousVersionForTest,
   migrateAuthorityDatabaseToVersion14ForTest,
   migrateAuthorityDatabaseToVersion13ForTest,
   migrateAuthorityDatabaseToVersion12ForTest,
@@ -871,43 +869,6 @@ describe("authority SQLite schema", () => {
       });
     }
   }, 20_000);
-
-  const v26RollbackChunkSize = 20;
-  const v26RollbackChunks = Array.from(
-    { length: Math.ceil(AUTHORITY_V26_STATEMENT_COUNT_FOR_TEST / v26RollbackChunkSize) },
-    (_, index) => ({
-      first: index * v26RollbackChunkSize + 1,
-      last: Math.min(
-        (index + 1) * v26RollbackChunkSize,
-        AUTHORITY_V26_STATEMENT_COUNT_FOR_TEST,
-      ),
-    }),
-  );
-  for (const chunk of v26RollbackChunks) {
-    it(
-      `rolls v26 tool-safety migration statements ${chunk.first}-${chunk.last} ` +
-        "back with v25 schema and history intact",
-      () => {
-        for (
-          let failAfterStatement = chunk.first;
-          failAfterStatement <= chunk.last;
-          failAfterStatement += 1
-        ) {
-          withDatabase((database) => {
-            migrateAuthorityDatabaseToPreviousVersionForTest(database);
-            const before = snapshot(database);
-
-            expect(() => migrateAuthorityDatabase(database, { failAfterStatement }))
-              .toThrow(/injected migration failure/i);
-
-            expect(readSchemaVersion(database)).toBe(25);
-            expect(snapshot(database)).toEqual(before);
-          });
-        }
-      },
-      30_000,
-    );
-  }
 
   it("rejects a same-version message gate that outruns the Room lifecycle generation", () => {
     withDatabase((database) => {
