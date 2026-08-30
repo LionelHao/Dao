@@ -39,19 +39,32 @@ export function mountToolSafetyBridgeSurface(
       const empty = document.createElement("p");
       empty.textContent = state.connection.status === "revoked"
         ? "Room 或 session 权限已撤销；工具安全 projection 已清除。"
+        : state.connection.status === "archived" ? "Room 已归档；当前没有需要显示的工具调用。"
         : state.connection.status === "repairing" ? "正在 repair 工具安全 projection。"
           : "当前没有需要显示的工具调用。";
       empty.setAttribute("role", state.connection.status === "revoked" ? "alert" : "status");
       panel.append(empty);
+      if (state.operation.status === "error" && state.operation.statusCode === 401) {
+        const reauthenticate = document.createElement("button");
+        reauthenticate.type = "button";
+        reauthenticate.dataset.recoveryAction = "reauthenticate";
+        reauthenticate.textContent = "重新认证";
+        reauthenticate.addEventListener("click", host.reauthenticate);
+        panel.append(reauthenticate);
+      }
     }
     let focus: Readonly<{ toolCallId: string; kind: "heading" | "recovery" | "evidence" }> | undefined;
     if (pendingFocusToolCallId !== undefined && state.operation.status === "error" &&
         !focusedErrorRequests.has(state.operation.requestId)) {
       focusedErrorRequests.add(state.operation.requestId);
       awaitingAuthorityCompletion = false;
-      focus = { toolCallId: pendingFocusToolCallId,
-        kind: state.operation.statusCode === 409 || state.operation.statusCode === 410 ? "recovery"
-          : state.operation.action === "review" ? "evidence" : "heading" };
+      if (!["confirmation_replayed", "tool_already_terminal", "confirmation_already_terminal",
+        "already_handled"].includes(state.operation.code)) {
+        focus = { toolCallId: pendingFocusToolCallId,
+          kind: state.operation.statusCode === 409 || state.operation.statusCode === 410 ? "recovery"
+            : state.operation.action === "review" ? "evidence" : "heading" };
+      }
+      pendingFocusToolCallId = undefined;
     } else if (pendingFocusToolCallId !== undefined && state.operation.status === "idle" &&
         awaitingAuthorityCompletion) {
       focus = { toolCallId: pendingFocusToolCallId, kind: "heading" };

@@ -8,6 +8,7 @@ export const TOOL_SAFETY_IPC_CHANNELS = Object.freeze({
 export type ToolSafetyConnectionState =
   | Readonly<{ status: "online" }>
   | Readonly<{ status: "offline" }>
+  | Readonly<{ status: "archived" }>
   | Readonly<{ status: "repairing" }>
   | Readonly<{ status: "repair-failed"; errorCode: string }>
   | Readonly<{ status: "revoked" }>;
@@ -131,7 +132,7 @@ export function isToolSafetyCommand(value: unknown): value is ToolSafetyCommand 
 
 function isConnection(value: unknown): value is ToolSafetyConnectionState {
   if (!record(value)) return false;
-  if (["online", "offline", "repairing", "revoked"].includes(String(value.status))) {
+  if (["online", "offline", "archived", "repairing", "revoked"].includes(String(value.status))) {
     return exact(value, ["status"]);
   }
   return value.status === "repair-failed" && exact(value, ["status", "errorCode"]) && text(value.errorCode);

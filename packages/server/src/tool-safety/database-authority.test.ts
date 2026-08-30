@@ -762,6 +762,18 @@ describe("FT-10 SQLite tool-safety authority", () => {
         },
         now: NOW + 4_000,
       })).toMatchObject({ kind: "handoff", state: "accepted", version: 2 });
+      const repairedConfirmation = database.prepare(
+        `SELECT version, projection_json AS projectionJson
+         FROM tool_safety_repair_records_v2
+         WHERE kind = 'tool-confirmation' AND record_id = 'confirmation-handoff'`,
+      ).get() as { version: number; projectionJson: string };
+      expect(repairedConfirmation.version).toBe(2);
+      expect(JSON.parse(repairedConfirmation.projectionJson)).toMatchObject({
+        confirmationId: "confirmation-handoff",
+        state: "pending",
+        version: 2,
+        namedHumanDisplayRef: "Human FT10 B",
+      });
       expect(transact(database, {
         type: "tool-safety.handoff-read",
         context: context("accept-handoff", secondHuman),
@@ -787,6 +799,16 @@ describe("FT-10 SQLite tool-safety authority", () => {
         grantExpiresAt: new Date(NOW + 30_000).toISOString(),
         now: NOW + 6_000,
       })).toMatchObject({ kind: "confirmation-decision", state: "confirmed", version: 3 });
+      expect(() => transact(database, {
+        type: "tool-safety.confirmation-decide",
+        context: context("cross-session-duplicate", secondHuman),
+        confirmationId: "confirmation-handoff",
+        expectedVersion: 3,
+        decision: "confirm",
+        grantId: "grant-handoff-duplicate",
+        grantExpiresAt: new Date(NOW + 31_000).toISOString(),
+        now: NOW + 6_500,
+      })).toThrow(/already terminal/i);
       expect(transact(database, {
         type: "tool-safety.recover-execution",
         executionId: "execution-ft10",

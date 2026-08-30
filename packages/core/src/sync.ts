@@ -237,7 +237,7 @@ export type ToolSafetyRepairRecord =
     }> }
   | { readonly kind: "tool-handoff"; readonly value: Readonly<{
       handoffId: string; confirmationId: string;
-      state: "offered" | "accepted" | "rejected" | "expired";
+      state: "offered" | "accepted" | "rejected" | "expired"; targetActorId: string;
       targetNamedHumanDisplayRef: string; version: number;
     }> }
   | { readonly kind: "tool-compensation"; readonly value: Readonly<{
@@ -722,8 +722,10 @@ function isRepairRecord(value: unknown, expectedRoomId?: string): value is RoomR
   if (value.kind === "attachment") return isAttachmentRepairRecord(value, expectedRoomId);
   if (value.kind === "memory") return isRoomMemoryRepairRecord(value, expectedRoomId);
   if (value.kind === "project-loop") return isProjectRepairRecord(value, expectedRoomId);
-  if (value.kind === "tool-confirmation" || value.kind === "tool-grant" ||
-      value.kind === "tool-dispatch" || value.kind === "tool-review") {
+  if (value.kind === "tool-call" || value.kind === "tool-confirmation" ||
+      value.kind === "tool-grant" || value.kind === "tool-dispatch" ||
+      value.kind === "tool-review" || value.kind === "tool-handoff" ||
+      value.kind === "tool-compensation") {
     return isToolSafetyRepairRecord(value);
   }
   if (!exact(value, ["kind", "value"])) return false;
@@ -806,10 +808,11 @@ export function isToolSafetyRepairRecord(value: unknown): value is ToolSafetyRep
       count(payload.version);
   }
   if (value.kind === "tool-handoff") {
-    return exact(payload, ["handoffId", "confirmationId", "state",
+    return exact(payload, ["handoffId", "confirmationId", "state", "targetActorId",
       "targetNamedHumanDisplayRef", "version"]) && text(payload.handoffId) &&
       text(payload.confirmationId) && ["offered", "accepted", "rejected", "expired"]
-        .includes(String(payload.state)) && text(payload.targetNamedHumanDisplayRef) &&
+        .includes(String(payload.state)) && text(payload.targetActorId) &&
+      text(payload.targetNamedHumanDisplayRef) &&
       count(payload.version);
   }
   return value.kind === "tool-compensation" && exact(payload,
