@@ -1,9 +1,13 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { AUTHORITY_PARTICIPANT_FEATURES } from "./room-governance/private-participant-contracts.js";
 import {
   assertAgentRuntimeModelContextCapability,
   createAgentProviderReadinessProbe,
   createProductionSharedAuthorityParticipantComposition,
+  startAuthoritativeServerForTest,
 } from "./authoritative-server.js";
 
 const EXPECTED_REGISTRATIONS = [
@@ -34,6 +38,46 @@ describe("production shared-authority participant composition", () => {
       (registration as { readonly registrationId: string }).registrationId,
     )).toEqual(EXPECTED_REGISTRATIONS);
     expect(new Set(EXPECTED_REGISTRATIONS).size).toBe(EXPECTED_REGISTRATIONS.length);
+  });
+
+  it("keeps AuthorityWorker alive after runtime safety cleanup fails and retries close", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-im-runtime-close-fence-"));
+    const closedStages: string[] = [];
+    let rejectRuntimeStage = true;
+    try {
+      const server = await startAuthoritativeServerForTest({
+        databasePath: join(directory, "authority.sqlite"),
+        snapshotCachePath: join(directory, "snapshot-cache.sqlite"),
+        sharedAuthority: { maxOfflineReadLeaseMs: 60_000 },
+        listen: { host: "127.0.0.1", port: 0 },
+        actors: [
+          { id: "human-a", kind: "human", displayName: "Human A", reachability: "online" },
+          { id: "agent-a", kind: "agent", displayName: "Agent A", readiness: "ready",
+            toolPermissions: ["authority.inspect"] },
+        ],
+        identities: { verify: async () => undefined },
+        invitationSecretKey: new Uint8Array(32).fill(17),
+      }, {
+        toolAdapterPathFallbackForTest: true,
+        afterCloseForTest: {
+          runtime() {
+            closedStages.push("runtime");
+            if (rejectRuntimeStage) {
+              rejectRuntimeStage = false;
+              throw new Error("runtime safety settlement timed out");
+            }
+          },
+          worker() { closedStages.push("worker"); },
+        },
+      });
+
+      await expect(server.close()).rejects.toThrow(/cleanup failed/u);
+      expect(closedStages).toEqual(["runtime"]);
+      await expect(server.close()).resolves.toBeUndefined();
+      expect(closedStages).toEqual(["runtime", "runtime", "worker"]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it("fails closed when deployment lease policy is missing or invalid", () => {

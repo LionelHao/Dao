@@ -2058,41 +2058,11 @@ function recoverExecution(
        ) VALUES (?, ?, ?, 'outcome_unknown', 'shutdown', ?, ?)`,
     ).run(stableId("tool-dispatch-recovered-unknown", row.dispatchId as string),
       row.dispatchId as string, row.dispatchState as string, version, occurredAt);
-    const reviewMarked = database.prepare(
-      `UPDATE agent_execution_runtime_states
-       SET review_state = 'needs_review', authority_version = authority_version + 1,
-           updated_at = ?
-       WHERE execution_id = ? AND public_status = 'running'
-         AND phase = 'side_effect_claimed' AND review_state = 'none'`,
-    ).run(occurredAt, operation.executionId);
-    const attemptClosed = database.prepare(
-      `UPDATE agent_execution_attempts SET status = 'failed', finished_at = ?,
-         error_code = 'side_effect_outcome_unknown', next_retry_at = NULL
-       WHERE execution_id = ? AND attempt_seq = ? AND status = 'running'`,
-    ).run(occurredAt, operation.executionId, row.attemptSeq as number);
-    const executionClosed = database.prepare(
-      `UPDATE agent_executions SET status = 'failed', completed_at = ?, updated_at = ?,
-         terminal_error_code = 'side_effect_outcome_unknown', next_retry_at = NULL
-       WHERE id = ? AND status = 'running'`,
-    ).run(occurredAt, occurredAt, operation.executionId);
-    const runtime = database.prepare(
-      `SELECT public_status AS publicStatus, phase, review_state AS reviewState
-       FROM agent_execution_runtime_states WHERE execution_id = ?`,
-    ).get(operation.executionId);
-    const attemptRuntime = database.prepare(
-      `SELECT public_status AS publicStatus, phase
-       FROM agent_execution_attempt_runtime_states
-       WHERE execution_id = ? AND attempt_seq = ?`,
-    ).get(operation.executionId, row.attemptSeq as number);
-    if (reviewMarked.changes !== 1 || attemptClosed.changes !== 1 ||
-        executionClosed.changes !== 1 || runtime?.publicStatus !== "failed" ||
-        runtime.phase !== "failed" || runtime.reviewState !== "needs_review" ||
-        attemptRuntime?.publicStatus !== "failed" || attemptRuntime.phase !== "failed") {
-      return fail("execution_conflict", "Recovered unknown parent closure lost its CAS");
-    }
     writeRepair(database, "tool-dispatch", row.dispatchId as string, row.roomId as string,
       version, { dispatchId: row.dispatchId, toolCallId: row.toolCallId,
         state: "outcome_unknown", reason: "shutdown", version }, occurredAt);
+    freezeParentForUnknownOutcome(database, operation.executionId,
+      row.attemptSeq as number, occurredAt);
     return { kind: "recovery", state: "outcome_unknown", toolCallId: row.toolCallId as string,
       dispatchId: row.dispatchId as string };
   }

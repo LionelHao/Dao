@@ -786,6 +786,22 @@ describe("FT-10 SQLite tool-safety authority", () => {
       expect(database.prepare(
         "SELECT state, version FROM tool_dispatches_v2 WHERE dispatch_id = ?",
       ).get(claim.dispatchId)).toEqual({ state: "outcome_unknown", version: 3 });
+      expect(database.prepare(
+        `SELECT event_type AS eventType,
+                json_extract(payload_json, '$.status') AS status,
+                json_extract(payload_json, '$.reviewState') AS reviewState
+         FROM events
+         WHERE event_type IN ('agent.execution.changed','agent.execution.attempt.changed')
+         ORDER BY stream_seq`,
+      ).all()).toEqual([
+        { eventType: "agent.execution.changed", status: "failed", reviewState: "needs_review" },
+        { eventType: "agent.execution.attempt.changed", status: "failed", reviewState: null },
+      ]);
+      expect(database.prepare(
+        `SELECT COUNT(*) AS count FROM outbox_deliveries AS delivery
+         JOIN events AS event ON event.event_id = delivery.event_id
+         WHERE event.event_type IN ('agent.execution.changed','agent.execution.attempt.changed')`,
+      ).get()).toEqual({ count: 2 });
 
       const evidenceSummary = "Human checked the target and confirmed no durable write exists.";
       expect(() => transact(database, {
