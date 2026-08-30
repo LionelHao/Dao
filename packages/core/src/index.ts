@@ -1,6 +1,7 @@
 export type ActorKind = "human" | "agent";
 
 export * from "./project-loop.js";
+export * from "./tool-safety.js";
 
 export type HumanReachability = "online" | "dnd" | "offline";
 export type AgentReadiness = "ready" | "busy" | "paused" | "noauth";

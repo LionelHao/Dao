@@ -20,7 +20,6 @@ export type AgentCapabilityId = typeof AGENT_CAPABILITY_IDS[number];
 export const AGENT_TOOL_IDS = [
   "http-json.read",
   "repository.git-status",
-  "room-memory.read",
   "sandbox-file.write",
 ] as const;
 
