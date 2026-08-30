@@ -18,6 +18,7 @@ import { createGovernanceReplicaFeed } from "../governance/controller.js";
 
 import {
   ClientSyncReplicaError,
+  DesktopToolSafetyReplica,
   SnapshotCompletionOutcomeUnknownError,
   createClientSyncReplica,
   type ClientAuthorityCache,
@@ -1065,5 +1066,40 @@ describe("ClientSyncReplica", () => {
 
     expect(cache.hasStaging()).toBe(false);
     expect(cache.liveCatalog()).toEqual([]);
+  });
+});
+
+describe("FT-10 tool-safety projection replica", () => {
+  const pending = {
+    kind: "tool-confirmation", objectId: "confirmation-1", version: 1,
+    state: "pending", safeSummary: "Write config.json (12 bytes)",
+  } as const;
+
+  it("atomically swaps a complete repair and keeps the old projection on repair failure", () => {
+    const replica = new DesktopToolSafetyReplica();
+    expect(replica.applyStableEvent("room-1", "event-1", pending)).toBe(true);
+    replica.beginRepair("room-1", 7);
+    replica.stageRepair("room-1", 7, [{ ...pending, version: 2, state: "confirmed" }]);
+    expect(replica.read("room-1")).toEqual([pending]);
+    replica.failRepair("room-1", 7);
+    expect(replica.read("room-1")).toEqual([pending]);
+
+    replica.beginRepair("room-1", 8);
+    replica.stageRepair("room-1", 8, [{ ...pending, version: 2, state: "confirmed" }]);
+    replica.commitRepair("room-1", 8);
+    expect(replica.read("room-1")).toEqual([{ ...pending, version: 2, state: "confirmed" }]);
+  });
+
+  it("deduplicates stable events, ignores stale versions, rejects internal fields, and purges revoke", () => {
+    const replica = new DesktopToolSafetyReplica();
+    expect(replica.applyStableEvent("room-1", "event-1", pending)).toBe(true);
+    expect(replica.applyStableEvent("room-1", "event-1", { ...pending, version: 2 })).toBe(false);
+    expect(replica.applyStableEvent("room-1", "event-2", { ...pending, version: 1, state: "expired" })).toBe(true);
+    expect(replica.read("room-1")).toEqual([pending]);
+    expect(() => replica.applyStableEvent("room-1", "event-3", {
+      ...pending, version: 2, sealedPayload: "sealed-canary",
+    })).toThrow(ClientSyncReplicaError);
+    replica.revoke("room-1");
+    expect(replica.read("room-1")).toEqual([]);
   });
 });

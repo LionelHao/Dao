@@ -3,7 +3,12 @@ import { describe, expect, it } from "vitest";
 import {
   RepairProjectionRegistryError,
   createClosedRepairProjectionRegistry,
+  createToolSafetyRepairProjectionRegistry,
+  isPublicToolSafetyRepairRecord,
+  TOOL_SAFETY_REPAIR_KINDS,
+  type PublicToolSafetyRepairRecord,
   type RoomRepairSegmentDescriptor,
+  type ToolSafetyRepairKind,
 } from "./repair-projection-registry.js";
 
 type Kind = "lifecycle" | "message";
@@ -156,5 +161,80 @@ describe("closed repair projection registry", () => {
     } finally {
       database.close();
     }
+  });
+});
+
+describe("FT-10 public-safe repair registry", () => {
+  const records = {
+    "tool-confirmation": {
+      kind: "tool-confirmation",
+      value: {
+        confirmationId: "confirmation-1", toolCallId: "tool-call-1",
+        toolId: "sandbox-file.write", state: "pending", safePreview: "Write config.json (12 bytes)",
+        reasonCode: null, expiresAt: "2026-08-30T08:10:00.000Z", version: 1,
+        namedHumanDisplayRef: "Human A", sourceRef: "message-1",
+      },
+    },
+    "tool-grant": {
+      kind: "tool-grant",
+      value: {
+        grantId: "grant-1", toolCallId: "tool-call-1", state: "active",
+        reasonCode: null, expiresAt: "2026-08-30T08:06:00.000Z", version: 1,
+      },
+    },
+    "tool-dispatch": {
+      kind: "tool-dispatch",
+      value: {
+        dispatchId: "dispatch-1", toolCallId: "tool-call-1",
+        state: "outcome_unknown", reasonCode: "adapter_timeout", version: 3,
+      },
+    },
+    "tool-review": {
+      kind: "tool-review",
+      value: {
+        reviewId: "review-1", dispatchId: "dispatch-1", resolution: "accepted_risk",
+        evidenceSummary: "Human inspected the configured target.",
+        namedHumanDisplayRef: "Human A", compensationToolCallId: null, version: 1,
+      },
+    },
+  } as const satisfies Readonly<Record<ToolSafetyRepairKind, PublicToolSafetyRepairRecord>>;
+
+  it("registers exactly confirmation/grant/dispatch/review and validates mapped public rows", () => {
+    const descriptors = TOOL_SAFETY_REPAIR_KINDS.map((kind, index) => ({
+      descriptorId: `dao.repair.${kind}.v1`, descriptorVersion: 1 as const,
+      kind, order: 100 + index,
+      readKeysetPage: () => [records[kind]],
+      mapRow: (row: unknown) => row as PublicToolSafetyRepairRecord,
+      stableKey: (record: PublicToolSafetyRepairRecord) =>
+        "confirmationId" in record.value ? record.value.confirmationId
+          : "grantId" in record.value ? record.value.grantId
+            : "reviewId" in record.value ? record.value.reviewId : record.value.dispatchId,
+    })) satisfies readonly RoomRepairSegmentDescriptor<ToolSafetyRepairKind, PublicToolSafetyRepairRecord>[];
+    const registry = createToolSafetyRepairProjectionRegistry(descriptors);
+    expect(registry.descriptors.map(({ kind }) => kind)).toEqual(TOOL_SAFETY_REPAIR_KINDS);
+    for (const kind of TOOL_SAFETY_REPAIR_KINDS) {
+      expect(registry.readStablePage({
+        database: new DatabaseSync(":memory:"), roomId: "room-1", watermark: 7,
+        kind, afterKey: undefined, limit: 1,
+      })).toEqual([records[kind]]);
+    }
+  });
+
+  it("rejects internal capability, hashes, sealed/raw data and unbounded previews", () => {
+    for (const field of [
+      "rawParameters", "canonicalParameterSha256", "sealedPayload", "grantCapability",
+      "dispatchPermit", "compensationToken", "credential", "headers", "body", "stdout",
+      "stderr", "reasoning",
+    ]) {
+      expect(isPublicToolSafetyRepairRecord({
+        ...records["tool-confirmation"],
+        value: { ...records["tool-confirmation"].value, [field]: `${field}-canary` },
+      })).toBe(false);
+    }
+    expect(isPublicToolSafetyRepairRecord({
+      ...records["tool-confirmation"],
+      value: { ...records["tool-confirmation"].value, safePreview: "x".repeat(8_193) },
+    })).toBe(false);
+    expect(isPublicToolSafetyRepairRecord(records["tool-review"])).toBe(true);
   });
 });

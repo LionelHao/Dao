@@ -717,3 +717,93 @@ export function createClientSyncReplica(options: {
     },
   };
 }
+
+export const DESKTOP_TOOL_SAFETY_KINDS = Object.freeze([
+  "tool-confirmation", "tool-grant", "tool-dispatch", "tool-review",
+] as const);
+
+export type DesktopToolSafetyKind = typeof DESKTOP_TOOL_SAFETY_KINDS[number];
+
+export interface DesktopToolSafetyProjection {
+  readonly kind: DesktopToolSafetyKind;
+  readonly objectId: string;
+  readonly version: number;
+  readonly state: string;
+  readonly safeSummary: string;
+}
+
+function validToolSafetyProjection(value: unknown): value is DesktopToolSafetyProjection {
+  return record(value) && exact(value, ["kind", "objectId", "version", "state", "safeSummary"]) &&
+    DESKTOP_TOOL_SAFETY_KINDS.includes(value.kind as DesktopToolSafetyKind) &&
+    text(value.objectId) && count(value.version) && value.version > 0 && text(value.state) &&
+    typeof value.safeSummary === "string" && Buffer.byteLength(value.safeSummary, "utf8") <= 8_192;
+}
+
+/** Atomic fixed-watermark tool projection cache; staging is never readable or writable. */
+export class DesktopToolSafetyReplica {
+  readonly #current = new Map<string, ReadonlyMap<string, DesktopToolSafetyProjection>>();
+  readonly #staging = new Map<string, { generation: number; values: Map<string, DesktopToolSafetyProjection> }>();
+  readonly #eventIds = new Map<string, Set<string>>();
+
+  read(roomId: string): readonly DesktopToolSafetyProjection[] {
+    return Object.freeze([...(this.#current.get(roomId)?.values() ?? [])]);
+  }
+
+  beginRepair(roomId: string, generation: number): void {
+    if (!text(roomId) || !count(generation)) throw invalid("Tool-safety repair generation was invalid");
+    this.#staging.set(roomId, { generation, values: new Map() });
+  }
+
+  stageRepair(roomId: string, generation: number, records: readonly unknown[]): void {
+    const stage = this.#staging.get(roomId);
+    if (stage === undefined || stage.generation !== generation || !Array.isArray(records) ||
+        records.some((value) => !validToolSafetyProjection(value))) {
+      throw invalid("Tool-safety repair page was invalid");
+    }
+    for (const value of records as readonly DesktopToolSafetyProjection[]) {
+      const previous = stage.values.get(value.objectId);
+      if (previous !== undefined && (previous.kind !== value.kind || previous.version !== value.version)) {
+        throw invalid("Tool-safety repair contained conflicting objects");
+      }
+      stage.values.set(value.objectId, Object.freeze({ ...value }));
+    }
+  }
+
+  commitRepair(roomId: string, generation: number): void {
+    const stage = this.#staging.get(roomId);
+    if (stage === undefined || stage.generation !== generation) {
+      throw invalid("Tool-safety repair generation did not match");
+    }
+    this.#current.set(roomId, new Map(stage.values));
+    this.#staging.delete(roomId);
+    this.#eventIds.set(roomId, new Set());
+  }
+
+  failRepair(roomId: string, generation: number): void {
+    const stage = this.#staging.get(roomId);
+    if (stage?.generation === generation) this.#staging.delete(roomId);
+  }
+
+  applyStableEvent(roomId: string, eventId: string, value: unknown): boolean {
+    if (!text(roomId) || !text(eventId) || !validToolSafetyProjection(value)) {
+      throw invalid("Tool-safety stable event was invalid");
+    }
+    const seen = this.#eventIds.get(roomId) ?? new Set<string>();
+    if (seen.has(eventId)) return false;
+    const next = new Map(this.#current.get(roomId) ?? []);
+    const previous = next.get(value.objectId);
+    if (previous === undefined || value.version > previous.version) {
+      next.set(value.objectId, Object.freeze({ ...value }));
+      this.#current.set(roomId, next);
+    }
+    seen.add(eventId);
+    this.#eventIds.set(roomId, seen);
+    return true;
+  }
+
+  revoke(roomId: string): void {
+    this.#current.delete(roomId);
+    this.#staging.delete(roomId);
+    this.#eventIds.delete(roomId);
+  }
+}

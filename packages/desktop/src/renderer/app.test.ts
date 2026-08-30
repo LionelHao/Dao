@@ -125,6 +125,170 @@ describe("empty group chat renderer", () => {
   });
 });
 
+describe("FT-10 J-05 tool-safety surface", () => {
+  const card = (state: importedApp.ToolSafetyCardState): importedApp.ToolSafetyCardProjection => ({
+    confirmationId: "confirmation-1", dispatchId: "dispatch-1", version: 4, state,
+    toolId: "sandbox-file.write", safeTarget: "workspace/config.json",
+    parameterSummary: "replace · 12 bytes · expected abc123…", impact: "更新 sandbox 文件",
+    reversibility: "compensatable", expiresAt: "2026-08-30T08:10:00.000Z",
+    sourceRef: "message-1", reasonCode: state.includes("revoked") ? "permission_reduced" : undefined,
+    namedHumanDisplayRef: "Human A",
+    ...(state === "reviewed" ? {
+      reviewResolution: "accepted_risk" as const,
+      evidenceSummary: "Human inspected the configured target.",
+    } : {}),
+  });
+  const actions = () => ({
+    submit: vi.fn(), repair: vi.fn(), reauthenticate: vi.fn(), newInvocation: vi.fn(),
+  });
+
+  it.each([
+    ["pending", "等待精确 Human 确认"],
+    ["rejected", "已拒绝 · 未执行"],
+    ["duplicate", "已由另一 session 处理"],
+    ["params-changed", "参数已变化"],
+    ["principal-revoked", "确认主体已撤销"],
+    ["confirmed", "尚未执行"],
+    ["grant-revoked", "授权已撤销 · 未执行"],
+    ["dispatched", "dispatch 安全分界"],
+    ["outcome-unknown", "OUTCOME UNKNOWN"],
+    ["reviewed", "审查已闭合"],
+    ["expired", "已过期 · 未执行"],
+  ] as const)("renders authoritative %s without internal data", (state, label) => {
+    const root = document.createElement("main");
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" }, card: card(state), operation: { status: "idle" },
+    }, actions());
+    expect(root.querySelector("[data-tool-safety-state]")?.getAttribute("data-tool-safety-state")).toBe(state);
+    expect(root.querySelector("[data-tool-safety-state]")?.textContent).toContain(label);
+    expect(root.querySelector(".tool-safety-details")?.getAttribute("aria-live")).toBe("off");
+    if (state === "principal-revoked") {
+      expect(root.textContent).toContain("敏感预览已移除");
+      expect(root.textContent).not.toContain("workspace/config.json");
+    } else {
+      expect(root.textContent).toContain("安全目标：workspace/config.json");
+    }
+    expect(root.textContent).not.toMatch(/sealedPayload|grantCapability|dispatchPermit|canonicalParameterSha256/);
+  });
+
+  it("submits exact object decisions online and performs zero writes offline or during repair", () => {
+    const root = document.createElement("main");
+    const online = actions();
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" }, card: card("pending"), operation: { status: "idle" },
+    }, online);
+    const controls = [...root.querySelectorAll<HTMLButtonElement>("[data-tool-safety-action]")];
+    expect(controls.map((button) => button.textContent)).toEqual(["确认执行一次", "拒绝，不执行"]);
+    expect(controls.every((button) => button.type === "button")).toBe(true);
+    controls[0]!.click();
+    controls[1]!.click();
+    expect(online.submit).toHaveBeenNthCalledWith(1, {
+      type: "tool.confirmation.decide", confirmationId: "confirmation-1",
+      expectedVersion: 4, decision: "confirm",
+    });
+    expect(online.submit).toHaveBeenNthCalledWith(2, {
+      type: "tool.confirmation.decide", confirmationId: "confirmation-1",
+      expectedVersion: 4, decision: "reject",
+    });
+
+    for (const connection of [
+      { status: "offline" as const }, { status: "repairing" as const },
+      { status: "repair-failed" as const, errorCode: "checksum_mismatch" },
+    ]) {
+      const locked = actions();
+      importedApp.renderToolSafetySurface(root, {
+        connection, card: card("pending"), operation: { status: "idle" },
+      }, locked);
+      const disabled = [...root.querySelectorAll<HTMLButtonElement>("[data-tool-safety-action]")];
+      expect(disabled.every((button) => button.disabled)).toBe(true);
+      disabled.forEach((button) => button.click());
+      expect(locked.submit).not.toHaveBeenCalled();
+      expect(root.textContent).toMatch(/只读|repair/);
+    }
+  });
+
+  it("keeps ACK distinct from execution success and makes unknown review explicit", () => {
+    const root = document.createElement("main");
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" }, card: card("confirmed"),
+      operation: { status: "acknowledged", requestId: "request-1", action: "confirm" },
+    }, actions());
+    expect(root.querySelector("[role='status']")?.textContent).toContain("不表示工具执行成功");
+    expect(root.textContent).toContain("等待 stable event / repair projection");
+
+    const unknownActions = actions();
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" }, card: card("outcome-unknown"), operation: { status: "idle" },
+    }, unknownActions);
+    expect(root.querySelector("[role='alert']")).not.toBeNull();
+    expect(root.textContent).not.toMatch(/重试工具|再次执行原动作|撤销副作用/);
+    const evidence = root.querySelector<HTMLTextAreaElement>("[data-tool-safety-evidence]")!;
+    evidence.value = "Target inspected; accepting residual risk.";
+    const reviewButtons = root.querySelectorAll<HTMLButtonElement>("[data-tool-safety-action='review']");
+    reviewButtons[2]!.click();
+    expect(unknownActions.submit).toHaveBeenCalledWith({
+      type: "tool.outcome.review", dispatchId: "dispatch-1", expectedVersion: 4,
+      resolution: "accepted_risk", evidenceSummary: "Target inspected; accepting residual risk.",
+    });
+    root.querySelector<HTMLButtonElement>("[data-tool-safety-action='compensate']")!.click();
+    expect(unknownActions.submit).toHaveBeenCalledWith({
+      type: "tool.compensation.propose", dispatchId: "dispatch-1", expectedVersion: 4,
+    });
+    expect(root.textContent).toContain("新的补偿动作");
+  });
+
+  it("offers and accepts only target-specific confirmation handoff commands", () => {
+    const root = document.createElement("main");
+    const handoffActions = actions();
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" },
+      card: { ...card("pending"), handoffTargetActorId: "human-2", handoffId: "handoff-1" },
+      operation: { status: "idle" },
+    }, handoffActions);
+    root.querySelector<HTMLButtonElement>("[data-tool-safety-action='handoff-offer']")!.click();
+    root.querySelector<HTMLButtonElement>("[data-tool-safety-action='handoff-accept']")!.click();
+    expect(handoffActions.submit).toHaveBeenNthCalledWith(1, {
+      type: "tool.confirmation.handoff.offer", confirmationId: "confirmation-1",
+      expectedVersion: 4, targetActorId: "human-2",
+    });
+    expect(handoffActions.submit).toHaveBeenNthCalledWith(2, {
+      type: "tool.confirmation.handoff.accept", handoffId: "handoff-1", expectedVersion: 4,
+    });
+  });
+
+  it("maps 401/403/409/410/429/503 recovery, retains review input, and restores focus", () => {
+    const expected = new Map<number, RegExp>([
+      [401, /重新认证/], [403, /权限或主体已失效/], [409, /载入最新 projection/],
+      [410, /创建新 invocation/], [429, /17s 后可手动重试/], [503, /服务暂不可用/],
+    ]);
+    for (const statusCode of [401, 403, 409, 410, 429, 503] as const) {
+      const root = document.createElement("main");
+      document.body.append(root);
+      importedApp.renderToolSafetySurface(root, {
+        connection: { status: "online" }, card: card("outcome-unknown"), focusStateHeading: true,
+        operation: { status: "error", requestId: `error-${statusCode}`, action: "review",
+          statusCode, code: `error_${statusCode}`, retryAfterSeconds: 17,
+          retainedEvidenceSummary: "Retained Human input." },
+      }, actions());
+      expect(root.querySelector(".tool-safety-status")?.textContent).toMatch(expected.get(statusCode)!);
+      expect(root.querySelector<HTMLTextAreaElement>("[data-tool-safety-evidence]")?.value)
+        .toBe("Retained Human input.");
+      expect(document.activeElement).toBe(root.querySelector("[data-tool-safety-state-heading]"));
+      root.remove();
+    }
+  });
+
+  it("ships explicit 840px reflow, 200% zoom-safe sizing, focus ring, and reduced motion CSS", () => {
+    const css = readFileSync(resolve(import.meta.dirname, "styles.css"), "utf8");
+    expect(css).toContain(".dao-tool-safety");
+    expect(css).toContain("@media (max-width: 52.5rem)");
+    expect(css).toContain("min-inline-size: 0");
+    expect(css).toContain("overflow-wrap: anywhere");
+    expect(css).toContain("@media (prefers-reduced-motion: reduce)");
+    expect(css).toContain(".dao-tool-safety :focus-visible");
+  });
+});
+
 describe("room governance projection", () => {
   it("shows the authoritative owner and the owner/admin management matrix without colour-only cues", () => {
     const root = document.createElement("main");

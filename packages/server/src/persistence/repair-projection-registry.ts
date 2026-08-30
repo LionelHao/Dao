@@ -56,6 +56,149 @@ export interface ClosedRepairProjectionRegistry<
   readStablePage(input: ReadRegisteredRepairPageInput<TKind>): readonly TRecord[];
 }
 
+export const TOOL_SAFETY_REPAIR_KINDS = Object.freeze([
+  "tool-confirmation",
+  "tool-grant",
+  "tool-dispatch",
+  "tool-review",
+] as const);
+
+export type ToolSafetyRepairKind = typeof TOOL_SAFETY_REPAIR_KINDS[number];
+
+export type PublicToolSafetyRepairRecord =
+  | Readonly<{
+      kind: "tool-confirmation";
+      value: Readonly<{
+        confirmationId: string;
+        toolCallId: string;
+        toolId: string;
+        state: "pending" | "confirmed" | "rejected" | "expired";
+        safePreview: string;
+        reasonCode: string | null;
+        expiresAt: string;
+        version: number;
+        namedHumanDisplayRef: string | null;
+        sourceRef: string;
+      }>;
+    }>
+  | Readonly<{
+      kind: "tool-grant";
+      value: Readonly<{
+        grantId: string;
+        toolCallId: string;
+        state: "active" | "claimed" | "revoked" | "expired";
+        reasonCode: string | null;
+        expiresAt: string;
+        version: number;
+      }>;
+    }>
+  | Readonly<{
+      kind: "tool-dispatch";
+      value: Readonly<{
+        dispatchId: string;
+        toolCallId: string;
+        state: "prepared" | "claimed" | "dispatched" | "known_succeeded" |
+          "known_failed" | "outcome_unknown" | "reviewed";
+        reasonCode: string | null;
+        version: number;
+      }>;
+    }>
+  | Readonly<{
+      kind: "tool-review";
+      value: Readonly<{
+        reviewId: string;
+        dispatchId: string;
+        resolution: "known_succeeded" | "known_failed" | "compensated" | "accepted_risk";
+        evidenceSummary: string;
+        namedHumanDisplayRef: string;
+        compensationToolCallId: string | null;
+        version: number;
+      }>;
+    }>;
+
+const TOOL_SAFETY_FORBIDDEN_PUBLIC_KEYS = new Set([
+  "rawParameters", "parameters", "canonicalParameterSha256", "parameterHash",
+  "sealedPayload", "sealedParameters", "grantCapability", "capability", "dispatchPermit",
+  "compensationToken", "credential", "headers", "body", "stdout", "stderr", "reasoning",
+]);
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Reflect.ownKeys(value);
+  return actual.length === keys.length && actual.every((key) =>
+    typeof key === "string" && keys.includes(key));
+}
+
+function safeText(value: unknown, maximumBytes = 8_192): value is string {
+  return typeof value === "string" && value.trim().length > 0 &&
+    Buffer.byteLength(value, "utf8") <= maximumBytes;
+}
+
+function positiveVersion(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function publicObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value) &&
+    !Reflect.ownKeys(value).some((key) => typeof key !== "string" ||
+      TOOL_SAFETY_FORBIDDEN_PUBLIC_KEYS.has(key));
+}
+
+/** Exact wire/repair guard; it intentionally has no escape hatch for internal fields. */
+export function isPublicToolSafetyRepairRecord(value: unknown): value is PublicToolSafetyRepairRecord {
+  if (!publicObject(value) || !publicObject(value.value) ||
+      !TOOL_SAFETY_REPAIR_KINDS.includes(value.kind as ToolSafetyRepairKind)) return false;
+  const body = value.value;
+  if (value.kind === "tool-confirmation") {
+    return hasExactKeys(body, [
+      "confirmationId", "toolCallId", "toolId", "state", "safePreview", "reasonCode",
+      "expiresAt", "version", "namedHumanDisplayRef", "sourceRef",
+    ]) && safeText(body.confirmationId) && safeText(body.toolCallId) && safeText(body.toolId) &&
+      ["pending", "confirmed", "rejected", "expired"].includes(body.state as string) &&
+      safeText(body.safePreview) && (body.reasonCode === null || safeText(body.reasonCode, 256)) &&
+      safeText(body.expiresAt, 64) && positiveVersion(body.version) &&
+      (body.namedHumanDisplayRef === null || safeText(body.namedHumanDisplayRef, 256)) &&
+      safeText(body.sourceRef, 512);
+  }
+  if (value.kind === "tool-grant") {
+    return hasExactKeys(body, ["grantId", "toolCallId", "state", "reasonCode", "expiresAt", "version"]) &&
+      safeText(body.grantId) && safeText(body.toolCallId) &&
+      ["active", "claimed", "revoked", "expired"].includes(body.state as string) &&
+      (body.reasonCode === null || safeText(body.reasonCode, 256)) &&
+      safeText(body.expiresAt, 64) && positiveVersion(body.version);
+  }
+  if (value.kind === "tool-dispatch") {
+    return hasExactKeys(body, ["dispatchId", "toolCallId", "state", "reasonCode", "version"]) &&
+      safeText(body.dispatchId) && safeText(body.toolCallId) &&
+      ["prepared", "claimed", "dispatched", "known_succeeded", "known_failed",
+        "outcome_unknown", "reviewed"].includes(body.state as string) &&
+      (body.reasonCode === null || safeText(body.reasonCode, 256)) && positiveVersion(body.version);
+  }
+  return value.kind === "tool-review" && hasExactKeys(body, [
+    "reviewId", "dispatchId", "resolution", "evidenceSummary", "namedHumanDisplayRef",
+    "compensationToolCallId", "version",
+  ]) && safeText(body.reviewId) && safeText(body.dispatchId) &&
+    ["known_succeeded", "known_failed", "compensated", "accepted_risk"].includes(body.resolution as string) &&
+    safeText(body.evidenceSummary, 2_048) && safeText(body.namedHumanDisplayRef, 256) &&
+    (body.compensationToolCallId === null || safeText(body.compensationToolCallId)) &&
+    positiveVersion(body.version);
+}
+
+export function createToolSafetyRepairProjectionRegistry(
+  descriptors: readonly RoomRepairSegmentDescriptor<ToolSafetyRepairKind, PublicToolSafetyRepairRecord>[],
+): ClosedRepairProjectionRegistry<ToolSafetyRepairKind, PublicToolSafetyRepairRecord> {
+  return createClosedRepairProjectionRegistry({
+    knownKinds: TOOL_SAFETY_REPAIR_KINDS,
+    descriptors: descriptors.map((descriptor) => ({
+      ...descriptor,
+      mapRow(row: unknown): PublicToolSafetyRepairRecord {
+        const record = descriptor.mapRow(row);
+        if (!isPublicToolSafetyRepairRecord(record)) reject("malformed_descriptor");
+        return record;
+      },
+    })),
+  });
+}
+
 function reject(reason: RepairProjectionRegistryFailureReason): never {
   throw new RepairProjectionRegistryError(reason);
 }

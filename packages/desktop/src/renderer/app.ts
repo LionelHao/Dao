@@ -44,6 +44,17 @@ import type {
   GovernanceDialog,
   GovernanceSurfaceState,
 } from "./governance/view-model.js";
+export {
+  renderToolSafetySurface,
+  type ToolSafetyAction,
+  type ToolSafetyCardProjection,
+  type ToolSafetyCardState,
+  type ToolSafetyConnection,
+  type ToolSafetySurfaceActions,
+  type ToolSafetySurfaceCommand,
+  type ToolSafetySurfaceOperation,
+  type ToolSafetySurfaceState,
+} from "./tool-safety/surface.js";
 
 function renderLockedGovernance(root: HTMLElement, state: Extract<GovernanceRemoteState, { status: "locked" }>): void {
   const locked = document.createElement("section");
