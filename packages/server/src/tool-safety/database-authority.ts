@@ -351,6 +351,12 @@ function writeRepair(
        updated_at = excluded.updated_at`,
   ).run(kind, id, roomId, `${kind}:${id}`, version, projectionJson, occurredAt);
   if (publicValue !== undefined) {
+    const eventId = stableId("tool-safety-event", kind, id, String(version));
+    if (database.prepare(
+      "SELECT 1 AS present FROM events WHERE event_id = ?",
+    ).get(eventId)?.present === 1) {
+      return;
+    }
     const stream = database.prepare(
       `SELECT head_seq AS headSeq FROM streams
        WHERE stream_kind = 'room' AND stream_id = ?`,
@@ -367,14 +373,22 @@ function writeRepair(
       return fail("storage_unavailable", "Tool safety Room stream CAS was stale");
     }
     const causal = database.prepare(
-      `SELECT call.agent_id AS actorId
-       FROM tool_calls_v2 AS call
-       LEFT JOIN tool_confirmations_v2 AS confirmation
-         ON confirmation.tool_call_id = call.tool_call_id
-       LEFT JOIN tool_grants_v2 AS grant ON grant.tool_call_id = call.tool_call_id
-       LEFT JOIN tool_dispatches_v2 AS dispatch ON dispatch.tool_call_id = call.tool_call_id
-       LEFT JOIN tool_reviews_v2 AS review ON review.dispatch_id = dispatch.dispatch_id
-       WHERE call.tool_call_id = COALESCE(
+      `SELECT actor.id AS actorId, actor.kind AS actorKind
+       FROM actors AS actor
+       WHERE actor.id = COALESCE(
+         (SELECT principal_human_actor_id FROM tool_reviews_v2 WHERE review_id = ?),
+         (SELECT COALESCE(accepted_by_human_actor_id, offered_by_human_actor_id)
+          FROM tool_confirmation_handoffs_v2 WHERE handoff_id = ?),
+         (SELECT proposed_by_human_actor_id FROM tool_compensation_lineage_v2
+          WHERE lineage_id = ?),
+         (SELECT principal_human_actor_id FROM tool_confirmation_decisions_v2
+          WHERE confirmation_id = ? ORDER BY decision_version DESC LIMIT 1),
+         (SELECT confirmation.principal_human_actor_id
+          FROM tool_grants_v2 AS grant
+          JOIN tool_confirmations_v2 AS confirmation
+            ON confirmation.confirmation_id = grant.confirmation_id
+          WHERE grant.grant_id = ?),
+         (SELECT call.agent_id FROM tool_calls_v2 AS call WHERE call.tool_call_id = COALESCE(
          (SELECT tool_call_id FROM tool_calls_v2 WHERE tool_call_id = ?),
          (SELECT tool_call_id FROM tool_confirmations_v2 WHERE confirmation_id = ?),
          (SELECT tool_call_id FROM tool_grants_v2 WHERE grant_id = ?),
@@ -389,18 +403,19 @@ function writeRepair(
           WHERE handoff.handoff_id = ?),
          (SELECT compensation_tool_call_id FROM tool_compensation_lineage_v2
           WHERE lineage_id = ?)
+         ))
        ) LIMIT 1`,
-    ).get(id, id, id, id, id, id, id);
-    if (typeof causal?.actorId !== "string") {
+    ).get(id, id, id, id, id, id, id, id, id, id, id, id);
+    if (typeof causal?.actorId !== "string" ||
+        (causal.actorKind !== "human" && causal.actorKind !== "agent")) {
       return fail("storage_unavailable", "Tool safety event actor was unavailable");
     }
-    const eventId = stableId("tool-safety-event", kind, id, String(version));
     database.prepare(
       `INSERT INTO events (
          event_id, stream_kind, stream_id, stream_seq, room_id,
          authority_kind, actor_id, event_type, occurred_at, payload_json
-       ) VALUES (?, 'room', ?, ?, ?, 'agent', ?, 'tool.safety.changed', ?, ?)`,
-    ).run(eventId, roomId, streamSeq, roomId, causal.actorId, occurredAt,
+       ) VALUES (?, 'room', ?, ?, ?, ?, ?, 'tool.safety.changed', ?, ?)`,
+    ).run(eventId, roomId, streamSeq, roomId, causal.actorKind, causal.actorId, occurredAt,
       JSON.stringify({ kind, value: publicValue }));
     database.prepare(
       `INSERT INTO outbox_deliveries (
@@ -1032,25 +1047,18 @@ function settle(
     const succeeded = operation.state === "known_succeeded";
     const errorCode = operation.state === "outcome_unknown"
       ? "side_effect_outcome_unknown" : "tool_failure";
-    const runtimeClosed = database.prepare(
-      `UPDATE agent_execution_runtime_states
-       SET public_status = ?, phase = ?, authority_version = authority_version + 1,
-           completed_at = ?, updated_at = ?, terminal_reason = NULL,
-           terminal_error_code = ?, review_state = ?
-       WHERE execution_id = ? AND public_status = 'running'
-         AND phase = 'side_effect_claimed'`,
-    ).run(succeeded ? "completed" : "failed", succeeded ? "completed" : "failed",
-      occurredAt, occurredAt, succeeded ? null : errorCode,
-      operation.state === "outcome_unknown" ? "needs_review" : "none",
-      compensation.executionId as string);
-    const attemptRuntimeClosed = database.prepare(
-      `UPDATE agent_execution_attempt_runtime_states
-       SET public_status = ?, phase = ?, attempt_version = attempt_version + 1,
-           finished_at = ?, error_code = ?, next_retry_at = NULL
-       WHERE execution_id = ? AND attempt_seq = ? AND public_status = 'running'`,
-    ).run(succeeded ? "completed" : "failed", succeeded ? "completed" : "failed",
-      occurredAt, succeeded ? null : errorCode, compensation.executionId as string,
-      compensation.attemptSeq as number);
+    if (operation.state === "outcome_unknown") {
+      const reviewMarked = database.prepare(
+        `UPDATE agent_execution_runtime_states
+         SET authority_version = authority_version + 1, review_state = 'needs_review',
+             updated_at = ?
+         WHERE execution_id = ? AND public_status = 'running'
+           AND phase = 'side_effect_claimed' AND review_state = 'none'`,
+      ).run(occurredAt, compensation.executionId as string);
+      if (reviewMarked.changes !== 1) {
+        return fail("execution_conflict", "Compensation review fence lost its CAS");
+      }
+    }
     const attemptClosed = database.prepare(
       `UPDATE agent_execution_attempts
        SET status = ?, finished_at = ?, error_code = ?, next_retry_at = NULL
@@ -1064,8 +1072,20 @@ function settle(
        WHERE id = ? AND status = 'running'`,
     ).run(succeeded ? "completed" : "failed", occurredAt, occurredAt,
       succeeded ? null : errorCode, compensation.executionId as string);
-    if (runtimeClosed.changes !== 1 || attemptRuntimeClosed.changes !== 1 ||
-        attemptClosed.changes !== 1 || executionClosed.changes !== 1) {
+    const runtime = database.prepare(
+      `SELECT public_status AS publicStatus, phase, review_state AS reviewState
+       FROM agent_execution_runtime_states WHERE execution_id = ?`,
+    ).get(compensation.executionId as string);
+    const attemptRuntime = database.prepare(
+      `SELECT public_status AS publicStatus, phase
+       FROM agent_execution_attempt_runtime_states
+       WHERE execution_id = ? AND attempt_seq = ?`,
+    ).get(compensation.executionId as string, compensation.attemptSeq as number);
+    const expectedTerminal = succeeded ? "completed" : "failed";
+    if (attemptClosed.changes !== 1 || executionClosed.changes !== 1 ||
+        runtime?.publicStatus !== expectedTerminal || runtime.phase !== expectedTerminal ||
+        attemptRuntime?.publicStatus !== expectedTerminal || attemptRuntime.phase !== expectedTerminal ||
+        (operation.state === "outcome_unknown" && runtime.reviewState !== "needs_review")) {
       return fail("execution_conflict", "Compensation parent closure lost its CAS");
     }
     writeRepair(database, "tool-compensation", compensation.lineageId as string,
@@ -1459,7 +1479,7 @@ function proposeCompensation(
        requester_actor_id, tool_name, action_category, tool_dispatch_phase,
        current_attempt_seq, retry_cycle, retry_ordinal, provider_id, model_id, recovery_cursor,
        queued_at, updated_at, compensates_execution_id
-     ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, 'sandbox-file.write', 'waiting_upstream',
+     ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, 'sandbox-file.write', 'tool_call',
                'not_started', 1, 1, 1, ?, ?, 0, ?, ?, ?)`,
   ).run(operation.executionId, original.roomId, original.archiveGeneration,
     original.agentId, original.sourceMessageId, occurredAt, actorId,
@@ -1469,7 +1489,7 @@ function proposeCompensation(
     `INSERT INTO agent_execution_attempts (
        execution_id, attempt_seq, retry_cycle, retry_ordinal, status,
        action_category, started_at, recovery_cursor
-     ) VALUES (?, 1, 1, 1, 'running', 'waiting_upstream', ?, 0)`,
+     ) VALUES (?, 1, 1, 1, 'running', 'tool_call', ?, 0)`,
   ).run(operation.executionId, occurredAt);
   database.prepare(
     `INSERT INTO agent_invocation_intents (
@@ -1488,23 +1508,23 @@ function proposeCompensation(
        source_revision, linked_at
      ) VALUES (?, ?, 1, NULL, 1, ?)`,
   ).run(operation.invocationId, operation.executionId, occurredAt);
-  database.prepare(
-    `INSERT INTO agent_execution_runtime_states (
-       execution_id, intent_id, lineage_id, execution_ordinal, retry_of_execution_id,
-       snapshot_id, provider_id, model_id, public_status, phase,
-       current_attempt_seq, authority_version, execution_generation, queued_at,
-       started_at, updated_at, completed_at, terminal_reason, terminal_error_code, review_state
-     ) VALUES (?, ?, ?, 1, NULL, ?, ?, ?, 'running', 'waiting_confirmation',
-               1, 1, 1, ?, ?, ?, NULL, NULL, NULL, 'none')`,
-  ).run(operation.executionId, operation.invocationId, operation.invocationId,
-    original.sourceSnapshotId, original.providerId ?? null, original.modelId ?? null,
-    occurredAt, occurredAt, occurredAt);
-  database.prepare(
-    `INSERT INTO agent_execution_attempt_runtime_states (
-       execution_id, attempt_seq, public_status, phase, attempt_version, reuse_kind,
-       started_at, finished_at, error_code, next_retry_at
-     ) VALUES (?, 1, 'running', 'waiting_confirmation', 1, 'first', ?, NULL, NULL, NULL)`,
-  ).run(operation.executionId, occurredAt);
+  const runtimePrepared = database.prepare(
+    `UPDATE agent_execution_runtime_states
+     SET snapshot_id = ?, phase = 'waiting_confirmation', authority_version = 2,
+         review_state = 'none', updated_at = ?
+     WHERE execution_id = ? AND public_status = 'running' AND phase = 'claiming'
+       AND authority_version = 1 AND snapshot_id IS NULL
+       AND review_state = 'legacy_review_required'`,
+  ).run(original.sourceSnapshotId, occurredAt, operation.executionId);
+  const attemptPrepared = database.prepare(
+    `UPDATE agent_execution_attempt_runtime_states
+     SET phase = 'waiting_confirmation', attempt_version = 2
+     WHERE execution_id = ? AND attempt_seq = 1 AND public_status = 'running'
+       AND phase = 'claiming' AND attempt_version = 1`,
+  ).run(operation.executionId);
+  if (runtimePrepared.changes !== 1 || attemptPrepared.changes !== 1) {
+    return fail("execution_conflict", "Compensation runtime preparation lost its CAS");
+  }
   const safePreview = Object.freeze({
     schemaVersion: "tool-safe-preview.v1",
     target: `原工具调用 ${operation.dispatchId}`,
@@ -1520,7 +1540,7 @@ function proposeCompensation(
        profile_revision, assignment_revision, access_revision, safe_preview_json,
        sealed_payload_ciphertext, sealed_payload_key_version, sealed_payload_expires_at,
        binding_generation, current_version, created_at, legacy_origin
-     ) VALUES (?, ?, ?, 1, 1, ?, ?, 'sandbox-file.write', ?,
+     ) VALUES (?, ?, ?, 1, 2, ?, ?, 'sandbox-file.write', ?,
                'sandbox-file.write.compensation.v1', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, 'stage12')`,
   ).run(operation.toolCallId, operation.invocationId, operation.executionId,
     original.roomId, original.agentId, operation.canonicalParameterSha256,
@@ -1783,6 +1803,161 @@ function recoverExecution(
       sessionFamilyId: row.sessionFamilyId as string,
       bindingGeneration: row.bindingGeneration as number,
     } };
+}
+
+export type ToolSafetyFenceReason = "execution_cancelled" | "source_recalled" |
+  "principal_revoked";
+
+export interface ToolSafetyFenceSettlement {
+  readonly rejectedConfirmationIds: readonly string[];
+  readonly revokedGrantIds: readonly string[];
+  readonly preservedDispatchIds: readonly string[];
+}
+
+/** Transaction-local cancellation/revocation participant for FT-08/Room/session authorities. */
+export function settleToolSafetyExecutionFenceInTransaction(
+  database: DatabaseSync,
+  executionId: string,
+  reason: ToolSafetyFenceReason,
+  occurredAt: string,
+): ToolSafetyFenceSettlement {
+  const rejectedConfirmationIds: string[] = [];
+  const revokedGrantIds: string[] = [];
+  const preservedDispatchIds: string[] = [];
+  const confirmations = database.prepare(
+    `SELECT confirmation.confirmation_id AS confirmationId,
+            confirmation.tool_call_id AS toolCallId,
+            confirmation.binding_generation AS bindingGeneration,
+            confirmation.principal_human_actor_id AS principalActorId,
+            confirmation.session_family_id AS sessionFamilyId,
+            confirmation.version, call.room_id AS roomId
+     FROM tool_confirmations_v2 AS confirmation
+     JOIN tool_calls_v2 AS call ON call.tool_call_id = confirmation.tool_call_id
+     WHERE call.execution_id = ? AND confirmation.state = 'pending'
+     ORDER BY confirmation.confirmation_id`,
+  ).all(executionId);
+  for (const row of confirmations) {
+    const confirmationId = row.confirmationId as string;
+    const version = (row.version as number) + 1;
+    const changed = database.prepare(
+      `UPDATE tool_confirmations_v2
+       SET state = 'rejected', reason = ?, version = ?, changed_at = ?
+       WHERE confirmation_id = ? AND state = 'pending' AND version = ?`,
+    ).run(reason, version, occurredAt, confirmationId, row.version as number);
+    if (changed.changes !== 1) return fail("execution_conflict", "Tool fence lost confirmation CAS");
+    database.prepare(
+      `INSERT INTO tool_confirmation_decisions_v2 (
+         decision_id, confirmation_id, tool_call_id, binding_generation,
+         principal_human_actor_id, session_family_id, decision, reason,
+         decision_version, decided_at
+       ) VALUES (?, ?, ?, ?, ?, ?, 'rejected', ?, ?, ?)`,
+    ).run(stableId("tool-fence-confirmation", confirmationId, reason), confirmationId,
+      row.toolCallId as string, row.bindingGeneration as number, row.principalActorId as string,
+      row.sessionFamilyId as string, reason, version, occurredAt);
+    writeRepair(database, "tool-confirmation", confirmationId, row.roomId as string,
+      version, { confirmationId, toolCallId: row.toolCallId, state: "rejected",
+        reason, version }, occurredAt);
+    rejectedConfirmationIds.push(confirmationId);
+  }
+  const grants = database.prepare(
+    `SELECT grant.grant_id AS grantId, grant.tool_call_id AS toolCallId,
+            grant.version, call.room_id AS roomId
+     FROM tool_grants_v2 AS grant
+     JOIN tool_calls_v2 AS call ON call.tool_call_id = grant.tool_call_id
+     WHERE call.execution_id = ? AND grant.state = 'active'
+     ORDER BY grant.grant_id`,
+  ).all(executionId);
+  for (const row of grants) {
+    const grantId = row.grantId as string;
+    const version = (row.version as number) + 1;
+    const changed = database.prepare(
+      `UPDATE tool_grants_v2
+       SET state = 'revoked', reason = ?, version = ?, changed_at = ?
+       WHERE grant_id = ? AND state = 'active' AND version = ?`,
+    ).run(reason, version, occurredAt, grantId, row.version as number);
+    if (changed.changes !== 1) return fail("execution_conflict", "Tool fence lost grant CAS");
+    database.prepare(
+      `INSERT INTO tool_grant_transitions_v2 (
+         transition_id, grant_id, from_state, to_state, reason,
+         transition_version, occurred_at
+       ) VALUES (?, ?, 'active', 'revoked', ?, ?, ?)`,
+    ).run(stableId("tool-fence-grant", grantId, reason), grantId, reason, version, occurredAt);
+    writeRepair(database, "tool-grant", grantId, row.roomId as string, version,
+      { grantId, toolCallId: row.toolCallId, state: "revoked", reason, version }, occurredAt);
+    revokedGrantIds.push(grantId);
+  }
+  const dispatches = database.prepare(
+    `SELECT dispatch.dispatch_id AS dispatchId, dispatch.tool_call_id AS toolCallId,
+            dispatch.state, dispatch.version, call.room_id AS roomId
+     FROM tool_dispatches_v2 AS dispatch
+     JOIN tool_calls_v2 AS call ON call.tool_call_id = dispatch.tool_call_id
+     WHERE call.execution_id = ? AND dispatch.state IN ('claimed','dispatched')
+     ORDER BY dispatch.dispatch_id`,
+  ).all(executionId);
+  for (const row of dispatches) {
+    const dispatchId = row.dispatchId as string;
+    const version = (row.version as number) + 1;
+    const changed = database.prepare(
+      `UPDATE tool_dispatches_v2
+       SET state = 'outcome_unknown', reason = ?, settled_at = ?,
+           version = ?, changed_at = ?
+       WHERE dispatch_id = ? AND state IN ('claimed','dispatched') AND version = ?`,
+    ).run(reason, occurredAt, version, occurredAt, dispatchId, row.version as number);
+    if (changed.changes !== 1) return fail("execution_conflict", "Tool fence lost dispatch CAS");
+    database.prepare(
+      `INSERT INTO tool_dispatch_transitions_v2 (
+         transition_id, dispatch_id, from_state, to_state, reason,
+         transition_version, occurred_at
+       ) VALUES (?, ?, ?, 'outcome_unknown', ?, ?, ?)`,
+    ).run(stableId("tool-fence-dispatch", dispatchId, reason), dispatchId,
+      row.state as string, reason, version, occurredAt);
+    writeRepair(database, "tool-dispatch", dispatchId, row.roomId as string, version,
+      { dispatchId, toolCallId: row.toolCallId, state: "outcome_unknown",
+        reason, version }, occurredAt);
+    preservedDispatchIds.push(dispatchId);
+  }
+  return Object.freeze({ rejectedConfirmationIds: Object.freeze(rejectedConfirmationIds),
+    revokedGrantIds: Object.freeze(revokedGrantIds),
+    preservedDispatchIds: Object.freeze(preservedDispatchIds) });
+}
+
+export function settleToolSafetyPrincipalFenceInTransaction(
+  database: DatabaseSync,
+  actorId: string,
+  sessionFamilyId: string | undefined,
+  occurredAt: string,
+  roomId?: string,
+): ToolSafetyFenceSettlement {
+  const rows = database.prepare(
+    `SELECT DISTINCT call.execution_id AS executionId
+     FROM tool_confirmations_v2 AS confirmation
+     JOIN tool_calls_v2 AS call ON call.tool_call_id = confirmation.tool_call_id
+     LEFT JOIN tool_grants_v2 AS grant ON grant.confirmation_id = confirmation.confirmation_id
+     LEFT JOIN tool_dispatches_v2 AS dispatch ON dispatch.tool_call_id = call.tool_call_id
+     WHERE confirmation.principal_human_actor_id = ?
+       AND (? IS NULL OR confirmation.session_family_id = ?)
+       AND (? IS NULL OR call.room_id = ?)
+       AND (confirmation.state = 'pending' OR grant.state = 'active'
+            OR dispatch.state IN ('claimed','dispatched'))
+     ORDER BY call.execution_id`,
+  ).all(actorId, sessionFamilyId ?? null, sessionFamilyId ?? null,
+    roomId ?? null, roomId ?? null);
+  const aggregate = { rejectedConfirmationIds: [] as string[], revokedGrantIds: [] as string[],
+    preservedDispatchIds: [] as string[] };
+  for (const row of rows) {
+    if (typeof row.executionId !== "string") {
+      return fail("storage_unavailable", "Tool principal fence execution was corrupt");
+    }
+    const settled = settleToolSafetyExecutionFenceInTransaction(
+      database, row.executionId, "principal_revoked", occurredAt,
+    );
+    aggregate.rejectedConfirmationIds.push(...settled.rejectedConfirmationIds);
+    aggregate.revokedGrantIds.push(...settled.revokedGrantIds);
+    aggregate.preservedDispatchIds.push(...settled.preservedDispatchIds);
+  }
+  return Object.freeze({ rejectedConfirmationIds: Object.freeze(aggregate.rejectedConfirmationIds),
+    revokedGrantIds: Object.freeze(aggregate.revokedGrantIds),
+    preservedDispatchIds: Object.freeze(aggregate.preservedDispatchIds) });
 }
 
 export function executeToolSafetyAuthorityOperationInTransaction(

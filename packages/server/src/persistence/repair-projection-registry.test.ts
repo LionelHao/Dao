@@ -166,6 +166,12 @@ describe("closed repair projection registry", () => {
 
 describe("FT-10 public-safe repair registry", () => {
   const records = {
+    "tool-call": {
+      kind: "tool-call",
+      value: { toolCallId: "tool-call-1", toolId: "sandbox-file.write",
+        safePreview: "Write config.json (12 bytes)", state: "prepared", version: 1,
+        sourceRef: "message-1" },
+    },
     "tool-confirmation": {
       kind: "tool-confirmation",
       value: {
@@ -197,18 +203,32 @@ describe("FT-10 public-safe repair registry", () => {
         namedHumanDisplayRef: "Human A", compensationToolCallId: null, version: 1,
       },
     },
+    "tool-handoff": {
+      kind: "tool-handoff",
+      value: { handoffId: "handoff-1", confirmationId: "confirmation-1",
+        state: "offered", targetNamedHumanDisplayRef: "Human B", version: 1 },
+    },
+    "tool-compensation": {
+      kind: "tool-compensation",
+      value: { lineageId: "lineage-1", originalDispatchId: "dispatch-1",
+        compensationInvocationId: "invocation-2", compensationExecutionId: "execution-2",
+        compensationToolCallId: "tool-call-2", state: "pending", version: 1 },
+    },
   } as const satisfies Readonly<Record<ToolSafetyRepairKind, PublicToolSafetyRepairRecord>>;
 
-  it("registers exactly confirmation/grant/dispatch/review and validates mapped public rows", () => {
+  it("registers the complete FT-10 public-safe inventory and validates mapped rows", () => {
     const descriptors = TOOL_SAFETY_REPAIR_KINDS.map((kind, index) => ({
       descriptorId: `dao.repair.${kind}.v1`, descriptorVersion: 1 as const,
       kind, order: 100 + index,
       readKeysetPage: () => [records[kind]],
       mapRow: (row: unknown) => row as PublicToolSafetyRepairRecord,
       stableKey: (record: PublicToolSafetyRepairRecord) =>
-        "confirmationId" in record.value ? record.value.confirmationId
+        "lineageId" in record.value ? record.value.lineageId
+          : "handoffId" in record.value ? record.value.handoffId
+          : "confirmationId" in record.value ? record.value.confirmationId
           : "grantId" in record.value ? record.value.grantId
-            : "reviewId" in record.value ? record.value.reviewId : record.value.dispatchId,
+            : "reviewId" in record.value ? record.value.reviewId
+              : "dispatchId" in record.value ? record.value.dispatchId : record.value.toolCallId,
     })) satisfies readonly RoomRepairSegmentDescriptor<ToolSafetyRepairKind, PublicToolSafetyRepairRecord>[];
     const registry = createToolSafetyRepairProjectionRegistry(descriptors);
     expect(registry.descriptors.map(({ kind }) => kind)).toEqual(TOOL_SAFETY_REPAIR_KINDS);

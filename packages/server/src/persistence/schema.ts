@@ -12399,17 +12399,23 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
          ON context.execution_id = runtime.execution_id
        WHERE runtime.current_attempt_seq <> execution.current_attempt_seq
           OR runtime.execution_generation <> execution.execution_generation
-          OR (runtime.review_state <> 'legacy_review_required' AND (
-            runtime.intent_id <> link.intent_id
-            OR runtime.lineage_id <> (
-              SELECT lineage_id FROM agent_invocation_intents WHERE id = runtime.intent_id
-            )
-            OR runtime.execution_ordinal <> link.execution_ordinal
-            OR runtime.retry_of_execution_id IS NOT link.retry_of_execution_id
-            OR runtime.snapshot_id <> context.snapshot_id
-            OR runtime.provider_id IS NOT execution.provider_id
-            OR runtime.model_id IS NOT execution.model_id
-          ))
+          OR (runtime.review_state <> 'legacy_review_required'
+              ${schemaVersion >= 26 ? `AND NOT EXISTS (
+                SELECT 1 FROM tool_compensation_lineage_v2 AS compensation
+                WHERE compensation.compensation_execution_id = runtime.execution_id
+              )` : ""}
+              AND (
+                runtime.intent_id <> link.intent_id
+                OR runtime.lineage_id <> (
+                  SELECT lineage_id FROM agent_invocation_intents WHERE id = runtime.intent_id
+                )
+                OR runtime.execution_ordinal <> link.execution_ordinal
+                OR runtime.retry_of_execution_id IS NOT link.retry_of_execution_id
+                OR context.execution_id IS NULL
+                OR runtime.snapshot_id <> context.snapshot_id
+                OR runtime.provider_id IS NOT execution.provider_id
+                OR runtime.model_id IS NOT execution.model_id
+              ))
        LIMIT 1`,
       "invocation execution projection must retain exact lineage and frozen authority",
     );
@@ -12814,10 +12820,15 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
        JOIN actors AS principal ON principal.id = confirmation.principal_human_actor_id
        LEFT JOIN session_families AS family
          ON family.family_id = confirmation.session_family_id
-       WHERE principal.kind <> 'human'
+       WHERE (confirmation.state = 'pending' OR EXISTS (
+              SELECT 1 FROM tool_grants_v2 AS grant
+              WHERE grant.confirmation_id = confirmation.confirmation_id
+                AND grant.state = 'active'
+            )) AND (
+          principal.kind <> 'human'
           OR family.family_id IS NULL
           OR family.actor_id <> confirmation.principal_human_actor_id
-          OR confirmation.binding_generation <> call.binding_generation
+          OR confirmation.binding_generation <> call.binding_generation)
        LIMIT 1`,
       "tool confirmations must remain exactly bound to one Human session family and call generation",
     );
@@ -12848,6 +12859,42 @@ function validateAuthorityData(database: DatabaseSync, schemaVersion: number): v
               AND dispatch.settled_at IS NULL)
        LIMIT 1`,
       "tool dispatches must retain a single claimed permit and closed settlement",
+    );
+    requireNoRows(
+      database,
+      `SELECT 1
+       FROM tool_compensation_lineage_v2 AS lineage
+       JOIN tool_dispatches_v2 AS original
+         ON original.dispatch_id = lineage.original_dispatch_id
+       JOIN tool_calls_v2 AS original_call
+         ON original_call.tool_call_id = original.tool_call_id
+       JOIN tool_calls_v2 AS compensation_call
+         ON compensation_call.tool_call_id = lineage.compensation_tool_call_id
+       JOIN agent_executions AS execution
+         ON execution.id = lineage.compensation_execution_id
+       JOIN agent_execution_runtime_states AS runtime
+         ON runtime.execution_id = execution.id
+       JOIN agent_execution_intent_links AS link
+         ON link.execution_id = execution.id
+       JOIN agent_invocation_intents AS intent ON intent.id = link.intent_id
+       LEFT JOIN agent_execution_context_bindings AS context
+         ON context.execution_id = execution.id
+       WHERE context.execution_id IS NOT NULL
+          OR execution.compensates_execution_id <> original_call.execution_id
+          OR execution.room_id <> original_call.room_id
+          OR execution.agent_id <> original_call.agent_id
+          OR runtime.intent_id <> lineage.compensation_invocation_id
+          OR runtime.lineage_id <> lineage.compensation_invocation_id
+          OR runtime.snapshot_id <> original_call.source_snapshot_id
+          OR runtime.review_state = 'legacy_review_required'
+          OR intent.id <> lineage.compensation_invocation_id
+          OR intent.execution_id <> execution.id
+          OR compensation_call.execution_id <> execution.id
+          OR compensation_call.invocation_id <> intent.id
+          OR compensation_call.parameter_schema_version <>
+             'sandbox-file.write.compensation.v1'
+       LIMIT 1`,
+      "tool compensation must retain a new execution over the original frozen snapshot",
     );
   }
 }

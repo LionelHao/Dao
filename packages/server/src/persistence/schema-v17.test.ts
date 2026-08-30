@@ -262,8 +262,8 @@ describe("authority SQLite v17 Attachment Authority", () => {
   it("upgrades fresh and every immutable v1-v16 schema through v17 and restarts idempotently", () => {
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(25);
-      expect(readSchemaVersion(database)).toBe(25);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(26);
+      expect(readSchemaVersion(database)).toBe(26);
       expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get())
         .toEqual({ count: 25 });
       expect(() => migrateAuthorityDatabase(database)).not.toThrow();
@@ -276,7 +276,7 @@ describe("authority SQLite v17 Attachment Authority", () => {
         migrateAuthorityDatabaseToHistoricalVersionForTest(database, version);
         expect(readSchemaVersion(database)).toBe(version);
         migrateAuthorityDatabase(database);
-        expect(readSchemaVersion(database)).toBe(25);
+        expect(readSchemaVersion(database)).toBe(26);
         expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get())
           .toEqual({ count: 25 });
       });
@@ -284,7 +284,7 @@ describe("authority SQLite v17 Attachment Authority", () => {
 
     withRestartedDatabase((database) => {
       expect(() => migrateAuthorityDatabase(database)).not.toThrow();
-      expect(readSchemaVersion(database)).toBe(25);
+      expect(readSchemaVersion(database)).toBe(26);
       expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get())
         .toEqual({ count: 25 });
     });

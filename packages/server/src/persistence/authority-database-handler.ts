@@ -47,6 +47,8 @@ import type {
 import type { RuntimeRecoveryRecord } from "../agent-runtime/contracts.js";
 import {
   executeToolSafetyAuthorityOperationInTransaction,
+  settleToolSafetyExecutionFenceInTransaction,
+  settleToolSafetyPrincipalFenceInTransaction,
   ToolSafetyDatabaseError,
 } from "../tool-safety/database-authority.js";
 import type { ScopedCancellationCommitReceipt } from
@@ -3615,6 +3617,13 @@ function commitClosedDeparture(
       "Target member access revocation dependency was unavailable",
     );
   }
+  settleToolSafetyPrincipalFenceInTransaction(
+    database,
+    targetActorId,
+    undefined,
+    acceptedAt,
+    authorization.roomId,
+  );
   const removed = database.prepare(
         `DELETE FROM room_memberships
          WHERE room_id = ? AND actor_id = ? AND kind = 'human'`,
@@ -6822,6 +6831,12 @@ export function executeRuntimeAuthorityOperation(
       for (const candidate of candidates) {
         const current = runtimeExecutionById(database, candidate.id as string);
         const cancellationReason = `human_preempted:${source.id}`;
+        settleToolSafetyExecutionFenceInTransaction(
+          database,
+          current.id,
+          "execution_cancelled",
+          occurredAt,
+        );
         const updated = database.prepare(
           `UPDATE agent_executions
            SET status = 'cancelled', cancellation_reason = ?, completed_at = ?,
@@ -8409,6 +8424,12 @@ export function executeRuntimeAuthorityOperation(
                    'runtime_supervisor', ?)`,
       ).run(fenceId, current.roomId, authority.intentId, current.id,
         authority.authorityVersion, occurredAt);
+      const v2Settlement = settleToolSafetyExecutionFenceInTransaction(
+        database,
+        current.id,
+        "execution_cancelled",
+        occurredAt,
+      );
       const confirmations = database.prepare(
         `SELECT confirmation_id AS confirmationId, confirmation_state AS state
          FROM tool_confirmations
@@ -8471,14 +8492,17 @@ export function executeRuntimeAuthorityOperation(
          WHERE execution_id = ? AND state IN ('pending', 'leased')`,
       ).run(occurredAt, current.id);
       const cancelled = runtimeExecutionById(database, current.id);
-      const rejectedConfirmationIds = confirmations.flatMap((row) =>
+      const rejectedConfirmationIds = [...v2Settlement.rejectedConfirmationIds,
+        ...confirmations.flatMap((row) =>
         row.state === "pending" && typeof row.confirmationId === "string"
-          ? [row.confirmationId] : []);
-      const revokedGrantIds = grants.flatMap((row) =>
-        row.state === "active" && typeof row.grantId === "string" ? [row.grantId] : []);
-      const preservedDispatchIds = preservedDispatches.flatMap((row) =>
-        typeof row.dispatchId === "string" ? [row.dispatchId] : []);
-      const sideEffectState = preservedDispatches.some((row) => row.state === "outcome_unknown")
+          ? [row.confirmationId] : [])];
+      const revokedGrantIds = [...v2Settlement.revokedGrantIds, ...grants.flatMap((row) =>
+        row.state === "active" && typeof row.grantId === "string" ? [row.grantId] : [])];
+      const preservedDispatchIds = [...v2Settlement.preservedDispatchIds,
+        ...preservedDispatches.flatMap((row) =>
+        typeof row.dispatchId === "string" ? [row.dispatchId] : [])];
+      const sideEffectState = v2Settlement.preservedDispatchIds.length > 0 ||
+        preservedDispatches.some((row) => row.state === "outcome_unknown")
         ? "outcome-unknown-retained" as const
         : preservedDispatchIds.length > 0 ? "dispatched-retained" as const : "none" as const;
       const confirmationDisposition = rejectedConfirmationIds.length > 0
@@ -8696,6 +8720,13 @@ export function executeRuntimeAuthorityOperation(
       ).run(fenceId, current.roomId, authority.intentId, current.id,
         target.expectedVersion, operation.context.principal.actorId, occurredAt);
 
+      const v2Settlement = settleToolSafetyExecutionFenceInTransaction(
+        database,
+        current.id,
+        "execution_cancelled",
+        occurredAt,
+      );
+
       const confirmation = database.prepare(
         `SELECT confirmation_id AS confirmationId, confirmation_state AS state
          FROM tool_confirmations
@@ -8738,7 +8769,8 @@ export function executeRuntimeAuthorityOperation(
          WHERE execution_id = ? AND attempt_seq = ?
          ORDER BY dispatched_at DESC LIMIT 1`,
       ).get(current.id, current.currentAttemptSeq);
-      const sideEffectState = dispatch?.state === "outcome_unknown"
+      const sideEffectState = v2Settlement.preservedDispatchIds.length > 0 ||
+        dispatch?.state === "outcome_unknown"
         ? "outcome-unknown-retained" as const
         : typeof dispatch?.state === "string" ? "dispatched-retained" as const : "none" as const;
 
@@ -8780,11 +8812,14 @@ export function executeRuntimeAuthorityOperation(
         intentOutcomes: [{ intentId: authority.intentId, outcome: "already_claimed" as const }],
         executionOutcomes: [{ executionId: current.id, outcome: "cancelled" as const,
           version: target.expectedVersion + 1 }],
-        rejectedConfirmationIds: confirmationDisposition === "pending_rejected" &&
-          typeof confirmation?.confirmationId === "string" ? [confirmation.confirmationId] : [],
-        revokedGrantIds: grantDisposition === "unclaimed_revoked" &&
-          typeof grant?.grantId === "string" ? [grant.grantId] : [],
-        preservedDispatchIds: typeof dispatch?.dispatchId === "string" ? [dispatch.dispatchId] : [],
+        rejectedConfirmationIds: [...v2Settlement.rejectedConfirmationIds,
+          ...(confirmationDisposition === "pending_rejected" &&
+          typeof confirmation?.confirmationId === "string" ? [confirmation.confirmationId] : [])],
+        revokedGrantIds: [...v2Settlement.revokedGrantIds,
+          ...(grantDisposition === "unclaimed_revoked" &&
+          typeof grant?.grantId === "string" ? [grant.grantId] : [])],
+        preservedDispatchIds: [...v2Settlement.preservedDispatchIds,
+          ...(typeof dispatch?.dispatchId === "string" ? [dispatch.dispatchId] : [])],
         committedAt: occurredAt,
       };
       const receipt = {
@@ -11193,6 +11228,12 @@ export function recallHumanMessageDatabaseCommand(
             input.command.expectedRevision,
             execution.intentId,
             execution.executionId,
+            recalledAt,
+          );
+          settleToolSafetyExecutionFenceInTransaction(
+            database,
+            execution.executionId,
+            "source_recalled",
             recalledAt,
           );
           const scopedEffect = scopedRuntime.effects.find((effect) =>

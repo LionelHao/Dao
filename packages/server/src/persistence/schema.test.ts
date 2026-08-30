@@ -11,6 +11,7 @@ import {
   configureAuthorityConnection,
   listAuthorityTables,
   migrateAuthorityDatabase,
+  migrateAuthorityDatabaseToHistoricalVersionForTest,
   migrateAuthorityDatabaseToPreviousVersionForTest,
   migrateAuthorityDatabaseToVersion14ForTest,
   migrateAuthorityDatabaseToVersion13ForTest,
@@ -657,8 +658,54 @@ describe("authority SQLite schema", () => {
         { id: "v14-confirmation-consumed", state: "confirmed", reason: null },
         { id: "v14-confirmation-pending", state: "rejected", reason: "legacy_unbound" },
       ]);
+      expect(database.prepare(
+        `SELECT call.tool_call_id AS toolCallId, confirmation.state AS confirmationState,
+                grant.state AS grantState
+         FROM tool_calls_v2 AS call
+         JOIN tool_grants_v2 AS grant ON grant.tool_call_id = call.tool_call_id
+         LEFT JOIN tool_confirmations_v2 AS confirmation
+           ON confirmation.tool_call_id = call.tool_call_id
+         ORDER BY call.tool_call_id`,
+      ).all()).toEqual([
+        { toolCallId: "legacy-tool-call:v14-grant-consumed",
+          confirmationState: "confirmed", grantState: "claimed" },
+        { toolCallId: "legacy-tool-call:v14-grant-pending",
+          confirmationState: "rejected", grantState: "revoked" },
+      ]);
+      expect(database.prepare(
+        `SELECT legacy_subject_kind AS kind, legacy_subject_id AS id, reason,
+                review_required AS reviewRequired
+         FROM tool_safety_quarantine_v2`,
+      ).all()).toEqual([{
+        kind: "grant", id: "v14-grant-consumed",
+        reason: "legacy_needs_review", reviewRequired: 1,
+      }]);
+      expect(database.prepare(
+        `SELECT COUNT(*) AS count FROM events WHERE event_type = 'tool.safety.changed'`,
+      ).get()).toEqual({ count: 0 });
+      expect(database.prepare(
+        "SELECT COUNT(*) AS count FROM tool_safety_repair_records_v2",
+      ).get()).toEqual({ count: 0 });
     });
   });
+
+  it("upgrades every historical v13-v25 contract to v26 without rewriting its history", () => {
+    expect(AUTHORITY_SCHEMA_VERSION).toBe(26);
+    for (let version = 13; version <= 25; version += 1) {
+      withDatabase((database) => {
+        migrateAuthorityDatabaseToHistoricalVersionForTest(database, version);
+        const history = database.prepare(
+          "SELECT version, name, checksum FROM schema_migrations ORDER BY version",
+        ).all();
+        migrateAuthorityDatabase(database);
+        expect(readSchemaVersion(database)).toBe(26);
+        expect(database.prepare(
+          `SELECT version, name, checksum FROM schema_migrations
+           WHERE version <= ? ORDER BY version`,
+        ).all(version)).toEqual(history);
+      });
+    }
+  }, 30_000);
 
   it("rolls every v14 migration statement back with v13 schema and history intact", () => {
     for (

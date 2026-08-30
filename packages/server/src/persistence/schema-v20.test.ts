@@ -74,8 +74,8 @@ describe("authority SQLite v20 Agent Profile and Routing Authority", () => {
   it("upgrades fresh and every immutable v1-v19 schema and restarts idempotently", () => {
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
-      expect(AUTHORITY_SCHEMA_VERSION).toBe(25);
-      expect(readSchemaVersion(database)).toBe(25);
+      expect(AUTHORITY_SCHEMA_VERSION).toBe(26);
+      expect(readSchemaVersion(database)).toBe(26);
       expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get())
         .toEqual({ count: 25 });
       expect(() => migrateAuthorityDatabase(database)).not.toThrow();
@@ -84,7 +84,7 @@ describe("authority SQLite v20 Agent Profile and Routing Authority", () => {
       withDatabase((database) => {
         migrateAuthorityDatabaseToHistoricalVersionForTest(database, version);
         migrateAuthorityDatabase(database);
-        expect(readSchemaVersion(database)).toBe(25);
+        expect(readSchemaVersion(database)).toBe(26);
       });
     }
   }, 150_000);
