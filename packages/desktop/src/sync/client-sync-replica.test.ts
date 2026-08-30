@@ -1096,10 +1096,13 @@ describe("FT-10 tool-safety projection replica", () => {
     expect(replica.read("room-1")).toEqual([confirmed]);
   });
 
-  it("accepts every canonical nested Core repair kind", () => {
+  it("accepts all seven canonical nested Core repair kinds", () => {
     const replica = new DesktopToolSafetyReplica();
     replica.beginRepair("room-1", 1);
-    replica.stageRepair("room-1", 1, [pending, {
+    replica.stageRepair("room-1", 1, [{
+      kind: "tool-call", value: { toolCallId: "tool-call-1", toolId: "sandbox-file.write",
+        safePreview: "safe JSON", state: "prepared", version: 1, sourceRef: "message-1" },
+    }, pending, {
       kind: "tool-grant", value: { grantId: "grant-1", toolCallId: "tool-call-1", state: "active",
         reasonCode: null, expiresAt: "2026-08-30T08:10:00.000Z", version: 1 },
     }, {
@@ -1109,9 +1112,16 @@ describe("FT-10 tool-safety projection replica", () => {
       kind: "tool-review", value: { reviewId: "review-1", dispatchId: "dispatch-1",
         resolution: "accepted_risk", evidenceSummary: "Human inspected the target.",
         namedHumanDisplayRef: "Human A", compensationToolCallId: null, version: 1 },
+    }, {
+      kind: "tool-handoff", value: { handoffId: "handoff-1", confirmationId: "confirmation-1",
+        state: "offered", targetNamedHumanDisplayRef: "Human B", version: 1 },
+    }, {
+      kind: "tool-compensation", value: { lineageId: "lineage-1", originalDispatchId: "dispatch-1",
+        compensationInvocationId: "invocation-2", compensationExecutionId: "execution-2",
+        compensationToolCallId: "tool-call-2", state: "pending", version: 1 },
     }]);
     replica.commitRepair("room-1", 1);
-    expect(replica.read("room-1")).toHaveLength(4);
+    expect(replica.read("room-1")).toHaveLength(7);
   });
 
   it("rejects conflicting canonical objects even when a repair page repeats the same version", () => {

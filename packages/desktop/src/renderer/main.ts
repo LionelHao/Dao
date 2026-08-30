@@ -21,6 +21,7 @@ const render = (): void => {
     window.dao?.agentSettings,
     window.dao?.invocation,
     window.dao?.projectLoop,
+    window.dao?.toolSafety,
   );
 };
 

@@ -6,6 +6,7 @@ import type { MemoryAuthorityBridge } from "../memory-authority/contracts.js";
 import type { AgentSettingsBridge } from "../agent-profile-routing/contracts.js";
 import type { InvocationBridge } from "../invocation-runtime/contracts.js";
 import type { ProjectLoopBridge } from "../project-loop/contracts.js";
+import type { ToolSafetyBridge } from "../tool-safety/contracts.js";
 
 declare global {
   interface Window {
@@ -18,6 +19,7 @@ declare global {
       readonly agentSettings: AgentSettingsBridge;
       readonly invocation: InvocationBridge;
       readonly projectLoop: ProjectLoopBridge;
+      readonly toolSafety: ToolSafetyBridge;
     }>;
   }
 }

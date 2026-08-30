@@ -6,6 +6,7 @@ import type { MemoryAuthorityBridge } from "../memory-authority/contracts.js";
 import type { AgentSettingsBridge } from "../agent-profile-routing/contracts.js";
 import type { InvocationBridge } from "../invocation-runtime/contracts.js";
 import type { ProjectLoopBridge } from "../project-loop/contracts.js";
+import type { ToolSafetyBridge } from "../tool-safety/contracts.js";
 import { mountAgentSettingsBridgeSurface } from "./agent-settings/bridge-adapter.js";
 import {
   mountGovernanceSurface,
@@ -22,6 +23,7 @@ import {
   type InvocationSurfaceActions,
 } from "./invocation-runtime/surface.js";
 import { mountProjectLoopBridgeSurface } from "./project-loop/bridge-adapter.js";
+import { mountToolSafetyBridgeSurface } from "./tool-safety/bridge-adapter.js";
 
 export interface DesktopRendererEntryPorts {
   readonly renderM2PrimitivesPreview: (root: HTMLElement) => void;
@@ -54,6 +56,12 @@ export interface DesktopRendererEntryPorts {
     bridge: ProjectLoopBridge,
     roomId: string,
     messageBridge?: MessageAuthorityBridge,
+  ) => () => void;
+  readonly mountToolSafetySurface?: (
+    root: HTMLElement,
+    bridge: ToolSafetyBridge,
+    roomId: string,
+    actions: { openSource(sourceRef: string): void; newInvocation(): void; reauthenticate(): void },
   ) => () => void;
 }
 
@@ -120,7 +128,8 @@ const DEFAULT_PORTS: DesktopRendererEntryPorts = Object.freeze({
       onReauthenticate: () => navigateRenderer(""),
       ...(messageBridge === undefined ? {} : { messageBridge }),
     },
-  ),
+    ),
+  mountToolSafetySurface: mountToolSafetyBridgeSurface,
 });
 
 const encoder = new TextEncoder();
@@ -275,6 +284,7 @@ export function mountDesktopRendererEntry(
   agentSettings?: AgentSettingsBridge,
   invocation?: InvocationBridge,
   projectLoop?: ProjectLoopBridge,
+  toolSafety?: ToolSafetyBridge,
 ): (() => void) | undefined {
   const route = new URLSearchParams(search);
   root.dataset.governanceRouteContract = "closed-v1";
@@ -344,6 +354,12 @@ export function mountDesktopRendererEntry(
     }
     const executions = invocation === undefined || ports.mountInvocationSurface === undefined
       ? undefined : document.createElement("aside");
+    const tools = toolSafety === undefined || ports.mountToolSafetySurface === undefined
+      ? undefined : document.createElement("aside");
+    if (tools !== undefined) {
+      tools.className = "room-authority-workspace__tools";
+      tools.setAttribute("aria-label", "Agent 工具安全");
+    }
     if (executions !== undefined) {
       executions.className = "room-authority-workspace__invocations";
       executions.setAttribute("aria-label", "Agent 执行");
@@ -359,11 +375,12 @@ export function mountDesktopRendererEntry(
       railTabs.className = "room-authority-workspace__rail-tabs";
       railTabs.setAttribute("role", "tablist");
       railTabs.setAttribute("aria-label", "Room 权威面板");
-      const panels: Array<readonly ["project" | "memory" | "agent", string, HTMLElement]> = [
+      const panels: Array<readonly ["project" | "memory" | "agent" | "tool", string, HTMLElement]> = [
         ["project", "项目", project],
         ["memory", "记忆", memory],
       ];
       if (executions !== undefined) panels.push(["agent", "Agent", executions]);
+      if (tools !== undefined) panels.push(["tool", "工具安全", tools]);
       const selectRail = (selected: string, focus = false): void => {
         authorityRail!.dataset.authorityRail = selected;
         for (const [value, , panel] of panels) {
@@ -410,6 +427,23 @@ export function mountDesktopRendererEntry(
     const disposeProject = project === undefined || projectLoop === undefined ||
       ports.mountProjectLoopSurface === undefined ? undefined
       : ports.mountProjectLoopSurface(project, projectLoop, roomId, messageAuthority);
+    const openSource = (sourceRef: string): void => {
+      const source = [...timeline.querySelectorAll<HTMLElement>("[data-message-id]")]
+        .find((candidate) => candidate.dataset.messageId === sourceRef) ?? null;
+      if (source !== null) { source.tabIndex = -1; source.focus(); source.dataset.sourceHighlighted = "true"; }
+      else {
+        const notice = document.createElement("p"); notice.setAttribute("role", "alert");
+        notice.textContent = `来源 ${sourceRef} 当前不可见；请在时间线中加载该权威版本。`; timeline.prepend(notice);
+        notice.tabIndex = -1; notice.focus();
+      }
+    };
+    const disposeTools = tools === undefined || toolSafety === undefined ||
+      ports.mountToolSafetySurface === undefined ? undefined
+      : ports.mountToolSafetySurface(tools, toolSafety, roomId, {
+        openSource,
+        newInvocation: () => timeline.querySelector<HTMLTextAreaElement>("textarea")?.focus(),
+        reauthenticate: () => navigateRenderer(""),
+      });
     const disposeInvocations = executions === undefined || invocation === undefined ||
       ports.mountInvocationSurface === undefined ? undefined
       : ports.mountInvocationSurface(executions, invocation, roomId, {
@@ -423,11 +457,20 @@ export function mountDesktopRendererEntry(
             navigateRenderer(`?governance-room=${encodeURIComponent(roomId)}`);
             return;
           }
+          if (action === "review-required" && tools !== undefined) {
+            tools.hidden = false; tools.setAttribute("aria-hidden", "false");
+            const toolTab = authorityRail?.querySelector<HTMLButtonElement>("[data-authority-rail-tab='tool']");
+            toolTab?.click();
+            const target = tools.querySelector<HTMLElement>("h2, [role='alert']");
+            if (target !== null) { target.tabIndex = -1; target.focus(); }
+            return;
+          }
           showInvocationHostHandoff(workspace, executions, action, context.executionId);
         },
       });
     return () => {
       disposeInvocations?.();
+      disposeTools?.();
       disposeProject?.();
       disposeMemory();
       disposeMessage();

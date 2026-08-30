@@ -183,6 +183,21 @@ describe("FT-10 J-05 tool-safety surface", () => {
     expect(ui.openSource).toHaveBeenCalledWith("message-1");
   });
 
+  it("closes only the disclosure on Escape without sending an authority command", () => {
+    const root = document.createElement("main"); document.body.append(root);
+    const ui = actions();
+    importedApp.renderToolSafetySurface(root, {
+      connection: { status: "online" }, card: card("pending"), operation: { status: "idle" },
+    }, ui);
+    const details = root.querySelector<HTMLDetailsElement>(".tool-safety-details")!;
+    expect(details.open).toBe(true);
+    details.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    expect(details.open).toBe(false);
+    expect(document.activeElement).toBe(details.querySelector("summary"));
+    expect(ui.submit).not.toHaveBeenCalled();
+    root.remove();
+  });
+
   it("routes a compensation confirmation through the same exact CAS decision gate", () => {
     const root = document.createElement("main");
     const ui = actions();

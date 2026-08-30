@@ -36,7 +36,7 @@ export interface ToolSafetyCardProjection {
   readonly safeTarget: string;
   readonly parameterSummary: string;
   readonly impact: string;
-  readonly reversibility: "compensatable" | "irreversible";
+  readonly reversibility: "none" | "compensatable" | "unknown";
   readonly expiresAt: string;
   readonly sourceRef: string;
   readonly reasonCode?: string;
@@ -44,7 +44,9 @@ export interface ToolSafetyCardProjection {
   readonly reviewResolution?: "known_succeeded" | "known_failed" | "compensated" | "accepted_risk";
   readonly evidenceSummary?: string;
   readonly handoffTargetActorId?: string;
+  readonly handoffCandidates?: readonly Readonly<{ actorId: string; displayRef: string }>[];
   readonly handoffId?: string;
+  readonly handoffVersion?: number;
   readonly compensationKnownSucceeded?: boolean;
 }
 
@@ -76,6 +78,7 @@ export interface ToolSafetySurfaceState {
   readonly card: ToolSafetyCardProjection;
   readonly operation: ToolSafetySurfaceOperation;
   readonly focusStateHeading?: boolean;
+  readonly focusRecoveryAction?: boolean;
   readonly reviewDraft?: Readonly<{ evidenceSummary: string; focusEvidence?: boolean }>;
 }
 
@@ -156,9 +159,20 @@ export function renderToolSafetySurface(
   heading.textContent = STATE_LABELS[state.card.state];
   section.append(heading);
 
-  const details = document.createElement("div");
+  const details = document.createElement("details");
+  details.open = true;
   details.className = "tool-safety-details";
   details.setAttribute("aria-live", "off");
+  const detailSummary = document.createElement("summary");
+  detailSummary.textContent = "工具调用详情";
+  details.append(detailSummary);
+  details.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || !details.open) return;
+    event.preventDefault();
+    event.stopPropagation();
+    details.open = false;
+    detailSummary.focus();
+  });
   const redactPreview = state.card.state === "principal-revoked" || state.connection.status === "revoked";
   if (redactPreview) {
     appendText(details, "p", "敏感预览已移除；重新认证后只载入当前权威 projection");
@@ -225,11 +239,32 @@ export function renderToolSafetySurface(
         },
       ));
     }
+    if (state.card.handoffCandidates !== undefined && state.card.handoffCandidates.length > 0) {
+      const handoffLabel = document.createElement("label");
+      handoffLabel.textContent = "转交精确 Human";
+      const select = document.createElement("select");
+      select.dataset.toolSafetyHandoffTarget = "true";
+      for (const candidate of state.card.handoffCandidates) {
+        const option = document.createElement("option");
+        option.value = candidate.actorId;
+        option.textContent = `${candidate.displayRef} · ${candidate.actorId}`;
+        select.append(option);
+      }
+      select.disabled = connectionLocked || operationLocked;
+      handoffLabel.append(select);
+      controls.append(handoffLabel, actionButton("提出精确转交", "handoff-offer",
+        connectionLocked || operationLocked, () => {
+          if (connectionLocked || operationLocked || select.value.length === 0) return;
+          actions.submit({ type: "tool.confirmation.handoff.offer",
+            confirmationId: state.card.confirmationId, expectedVersion: state.card.version,
+            targetActorId: select.value });
+        }));
+    }
     if (state.card.handoffId !== undefined) {
       controls.append(actionButton("接受精确转交", "handoff-accept", connectionLocked || operationLocked, () => {
         if (connectionLocked || operationLocked) return;
         actions.submit({ type: "tool.confirmation.handoff.accept", handoffId: state.card.handoffId!,
-          expectedVersion: state.card.version });
+          expectedVersion: state.card.handoffVersion ?? state.card.version });
       }));
     }
   }
@@ -325,7 +360,9 @@ export function renderToolSafetySurface(
   }
 
   root.replaceChildren(section);
-  if (state.reviewDraft?.focusEvidence === true &&
+  if (state.focusRecoveryAction === true) {
+    section.querySelector<HTMLElement>("[data-recovery-action]")?.focus({ preventScroll: true });
+  } else if (state.reviewDraft?.focusEvidence === true &&
       (state.card.state === "outcome-unknown" || state.card.state === "compensation-outcome-unknown")) {
     controls.querySelector<HTMLTextAreaElement>("[data-tool-safety-evidence]")?.focus({ preventScroll: true });
   } else if (state.focusStateHeading) heading.focus({ preventScroll: true });

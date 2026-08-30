@@ -9,6 +9,7 @@ import type { MemoryAuthorityBridge } from "../memory-authority/contracts.js";
 import type { AgentSettingsBridge } from "../agent-profile-routing/contracts.js";
 import type { InvocationBridge } from "../invocation-runtime/contracts.js";
 import type { ProjectLoopBridge } from "../project-loop/contracts.js";
+import type { ToolSafetyBridge } from "../tool-safety/contracts.js";
 import { mountDesktopRendererEntry } from "./entry.js";
 
 const bridge = {} as IdentityBridge;
@@ -19,6 +20,7 @@ const memoryAuthority = {} as MemoryAuthorityBridge;
 const agentSettings = {} as AgentSettingsBridge;
 const invocation = {} as InvocationBridge;
 const projectLoop = {} as ProjectLoopBridge;
+const toolSafety = {} as ToolSafetyBridge;
 
 function ports() {
   return {
@@ -32,6 +34,7 @@ function ports() {
     mountAgentSettingsSurface: vi.fn(() => vi.fn()),
     mountInvocationSurface: vi.fn(() => vi.fn()),
     mountProjectLoopSurface: vi.fn(() => vi.fn()),
+    mountToolSafetySurface: vi.fn(() => vi.fn()),
   };
 }
 
@@ -275,6 +278,33 @@ describe("Desktop renderer route entry", () => {
     expect(css).not.toContain(".room-authority-workspace__project,\n  .room-authority-workspace__memory { grid-column: 1; grid-row: 2; }");
     dispose?.();
     root.remove();
+  });
+
+  it("mounts J-05 as a production authority tab and routes needs_review into it", () => {
+    const root = document.createElement("main"); const renderers = ports();
+    document.body.append(root);
+    renderers.mountToolSafetySurface.mockImplementation((toolRoot) => {
+      const heading = document.createElement("h2"); heading.textContent = "工具安全"; toolRoot.append(heading);
+      return vi.fn();
+    });
+    const dispose = mountDesktopRendererEntry(
+      root, "?message-room=room-1", bridge, governance, messageAuthority, renderers,
+      undefined, memoryAuthority, agentSettings, invocation, projectLoop, toolSafety,
+    );
+    const toolPanel = root.querySelector<HTMLElement>(".room-authority-workspace__tools")!;
+    expect(renderers.mountToolSafetySurface).toHaveBeenCalledWith(
+      toolPanel, toolSafety, "room-1", expect.objectContaining({ openSource: expect.any(Function),
+        newInvocation: expect.any(Function), reauthenticate: expect.any(Function) }),
+    );
+    const toolTab = root.querySelector<HTMLButtonElement>("[data-authority-rail-tab='tool']")!;
+    expect(toolPanel.hidden).toBe(true);
+    const invocationActions = renderers.mountInvocationSurface.mock.calls[0]![3]!;
+    invocationActions.onHostAction("review-required", { roomId: "room-1", executionId: "execution-1" });
+    expect(toolPanel.hidden).toBe(false);
+    expect(toolTab.getAttribute("aria-selected")).toBe("true");
+    expect(document.activeElement).toBe(toolPanel.querySelector("h2"));
+    expect(root.querySelector("[data-invocation-host-handoff='review-required']")).toBeNull();
+    dispose?.(); root.remove();
   });
 
   it("remounts the existing Identity and Governance views with route-entry focus", async () => {
