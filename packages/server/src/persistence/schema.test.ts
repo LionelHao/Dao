@@ -872,24 +872,42 @@ describe("authority SQLite schema", () => {
     }
   }, 20_000);
 
-  it("rolls every v26 tool-safety migration statement back with v25 schema and history intact", () => {
-    for (
-      let failAfterStatement = 1;
-      failAfterStatement <= AUTHORITY_V26_STATEMENT_COUNT_FOR_TEST;
-      failAfterStatement += 1
-    ) {
-      withDatabase((database) => {
-        migrateAuthorityDatabaseToPreviousVersionForTest(database);
-        const before = snapshot(database);
+  const v26RollbackChunkSize = 20;
+  const v26RollbackChunks = Array.from(
+    { length: Math.ceil(AUTHORITY_V26_STATEMENT_COUNT_FOR_TEST / v26RollbackChunkSize) },
+    (_, index) => ({
+      first: index * v26RollbackChunkSize + 1,
+      last: Math.min(
+        (index + 1) * v26RollbackChunkSize,
+        AUTHORITY_V26_STATEMENT_COUNT_FOR_TEST,
+      ),
+    }),
+  );
+  for (const chunk of v26RollbackChunks) {
+    it(
+      `rolls v26 tool-safety migration statements ${chunk.first}-${chunk.last} ` +
+        "back with v25 schema and history intact",
+      () => {
+        for (
+          let failAfterStatement = chunk.first;
+          failAfterStatement <= chunk.last;
+          failAfterStatement += 1
+        ) {
+          withDatabase((database) => {
+            migrateAuthorityDatabaseToPreviousVersionForTest(database);
+            const before = snapshot(database);
 
-        expect(() => migrateAuthorityDatabase(database, { failAfterStatement }))
-          .toThrow(/injected migration failure/i);
+            expect(() => migrateAuthorityDatabase(database, { failAfterStatement }))
+              .toThrow(/injected migration failure/i);
 
-        expect(readSchemaVersion(database)).toBe(25);
-        expect(snapshot(database)).toEqual(before);
-      });
-    }
-  }, 60_000);
+            expect(readSchemaVersion(database)).toBe(25);
+            expect(snapshot(database)).toEqual(before);
+          });
+        }
+      },
+      30_000,
+    );
+  }
 
   it("rejects a same-version message gate that outruns the Room lifecycle generation", () => {
     withDatabase((database) => {
