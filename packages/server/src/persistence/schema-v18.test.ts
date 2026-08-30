@@ -294,10 +294,10 @@ describe("authority SQLite v18 Room Memory Authority & Steward", () => {
       expect(AUTHORITY_SCHEMA_VERSION).toBe(26);
       expect(readSchemaVersion(database)).toBe(26);
       expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get())
-        .toEqual({ count: 25 });
+        .toEqual({ count: 26 });
       expect(() => migrateAuthorityDatabase(database)).not.toThrow();
       expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get())
-        .toEqual({ count: 25 });
+        .toEqual({ count: 26 });
     });
 
     for (let version = 1; version <= 17; version += 1) {
@@ -313,7 +313,7 @@ describe("authority SQLite v18 Room Memory Authority & Steward", () => {
       expect(() => migrateAuthorityDatabase(database)).not.toThrow();
       expect(readSchemaVersion(database)).toBe(26);
       expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get())
-        .toEqual({ count: 25 });
+        .toEqual({ count: 26 });
     });
   }, 90_000);
 
@@ -682,9 +682,9 @@ describe("authority SQLite v18 Room Memory Authority & Steward", () => {
 
   it("refuses future, migration-history tamper, and physical v18 schema tamper", () => {
     withDatabase((database) => {
-      database.exec("PRAGMA user_version = 26");
+      database.exec("PRAGMA user_version = 27");
       expect(() => migrateAuthorityDatabase(database)).toThrow(/future schema/i);
-      expect(readSchemaVersion(database)).toBe(26);
+      expect(readSchemaVersion(database)).toBe(27);
     });
     withDatabase((database) => {
       migrateAuthorityDatabase(database);
