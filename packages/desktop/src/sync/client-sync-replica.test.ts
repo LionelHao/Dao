@@ -770,6 +770,36 @@ describe("ClientSyncReplica", () => {
     expect(cache.roomCursor("room-1")?.afterSeq).toBe(10);
   });
 
+  it("rejects the same eventId at a different sequence instead of swallowing it as a duplicate", async () => {
+    const transport = new FakeTransport();
+    const cache = new MemoryCache();
+    const replica = createClientSyncReplica({ transport, cache });
+    await replica.restoreWorkspace();
+    await transport.observer!.events([event(10, "stable-id")], {
+      version: 1, roomId: "room-1", afterSeq: 10,
+    });
+
+    await expect(transport.observer!.events([event(11, "stable-id")], {
+      version: 1, roomId: "room-1", afterSeq: 11,
+    })).rejects.toBeInstanceOf(ClientSyncReplicaError);
+    expect(cache.roomCursor("room-1")?.afterSeq).toBe(10);
+  });
+
+  it("rejects a different eventId at an already mapped sequence", async () => {
+    const transport = new FakeTransport();
+    const cache = new MemoryCache();
+    const replica = createClientSyncReplica({ transport, cache });
+    await replica.restoreWorkspace();
+    await transport.observer!.events([event(10, "first-id")], {
+      version: 1, roomId: "room-1", afterSeq: 10,
+    });
+
+    await expect(transport.observer!.events([event(10, "second-id")], {
+      version: 1, roomId: "room-1", afterSeq: 10,
+    })).rejects.toBeInstanceOf(ClientSyncReplicaError);
+    expect(cache.liveRoom("room-1")?.events.map((item) => item.eventId)).toEqual(["first-id"]);
+  });
+
   it("ignores a late observer after its subscription was replaced", async () => {
     const transport = new FakeTransport();
     const cache = new MemoryCache();

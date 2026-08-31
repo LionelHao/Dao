@@ -110,6 +110,10 @@ class AuthoritySocket implements AgentSettingsWebSocketLike {
     this.emit("message", { data: JSON.stringify(frame) });
   }
 
+  disconnect(): void {
+    this.emit("close", {});
+  }
+
   hasHeldAssignmentRepair(): boolean {
     return this.#heldAssignmentRepair !== undefined;
   }
@@ -378,6 +382,20 @@ describe("Desktop Agent Settings production authority invalidation", () => {
     fixture.runtime.onAuthorityMessage((message) => observed.push(message));
     await fixture.runtime.getSnapshot({ roomId: "room-1" });
     fixture.socket().authorityFrame({ type: "auth.session-revoked", eventId: "session-event" });
+    expect(observed.at(-1)).toEqual({ type: "access-revoked", scope: "session",
+      purgeCompleted: true });
+    fixture.runtime.close();
+  });
+
+  it("fails closed on disconnect instead of minting a local offline lease", async () => {
+    const fixture = runtimeFixture({ assignments: [assignment(1)] });
+    const observed: unknown[] = [];
+    fixture.runtime.onAuthorityMessage((message) => observed.push(message));
+    await fixture.runtime.getSnapshot({ roomId: "room-1" });
+
+    fixture.socket().disconnect();
+
+    expect(observed).not.toContainEqual(expect.objectContaining({ type: "offline" }));
     expect(observed.at(-1)).toEqual({ type: "access-revoked", scope: "session",
       purgeCompleted: true });
     fixture.runtime.close();
