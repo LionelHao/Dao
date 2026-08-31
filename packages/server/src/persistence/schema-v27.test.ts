@@ -28,10 +28,13 @@ function columns(database: DatabaseSync, table: string): readonly string[] {
 }
 
 describe("v27 sync reliability lifecycle schema", () => {
-  it("migrates fresh and every supported historical schema to immutable v27", () => {
+  it.each([
+    { range: "v1-v13", firstVersion: 1, lastVersion: 13 },
+    { range: "v14-v26", firstVersion: 14, lastVersion: 26 },
+  ])("migrates historical $range to immutable v27", ({ firstVersion, lastVersion }) => {
     expect(AUTHORITY_SCHEMA_VERSION).toBe(27);
     expect(AUTHORITY_V27_MIGRATION_CHECKSUM_FOR_TEST).toMatch(/^[0-9a-f]{64}$/);
-    for (let version = 1; version <= 26; version += 1) {
+    for (let version = firstVersion; version <= lastVersion; version += 1) {
       withDatabase((database) => {
         migrateAuthorityDatabaseToHistoricalVersionForTest(database, version);
         migrateAuthorityDatabase(database);
