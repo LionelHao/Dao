@@ -687,6 +687,39 @@ describe("AuthorityWorker closed protocol", () => {
     expect(isAuthorityWorkerRequest(nonEnumerableExtra)).toBe(false);
   });
 
+  it("accepts a bound device in authenticated commands without weakening exact keys", () => {
+    const request = {
+      type: "authority.message-submit" as const,
+      requestId: "message-submit-device-bound",
+      context: {
+        kind: "human" as const,
+        sessionId: createHash("sha256").update("device-session").digest("base64url"),
+        sessionFamilyId: createHash("sha256").update("device-family").digest("base64url"),
+        deviceId: "desktop-installation-01",
+        principal: { accountId: "account-1", actorId: "human-1" },
+        requestId: "device-bound-command",
+        idempotencyKey: "device-bound-command",
+      },
+      message: {
+        messageId: "message-device-bound",
+        roomId: "room-device-bound",
+        body: "hello",
+        mentionedTargets: [],
+        attachments: [],
+      },
+      now: 1_000,
+    };
+    expect(isAuthorityWorkerRequest(request)).toBe(true);
+    expect(isAuthorityWorkerRequest({
+      ...request,
+      context: { ...request.context, deviceId: undefined },
+    })).toBe(false);
+    expect(isAuthorityWorkerRequest({
+      ...request,
+      context: { ...request.context, unexpectedBinding: "forged" },
+    })).toBe(false);
+  });
+
   it("accepts only exact request variants", () => {
     const repairContext = {
       sessionId: createHash("sha256").update("repair-session").digest("base64url"),

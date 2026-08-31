@@ -1231,6 +1231,7 @@ function isAuthenticatedCommandContext(
       "kind",
       "sessionId",
       "sessionFamilyId",
+      ...(Object.hasOwn(value, "deviceId") ? ["deviceId"] : []),
       "principal",
       "requestId",
       "idempotencyKey",
@@ -1238,6 +1239,7 @@ function isAuthenticatedCommandContext(
     value.kind === "human" &&
     isTokenHash(value.sessionId) &&
     isTokenHash(value.sessionFamilyId) &&
+    (!Object.hasOwn(value, "deviceId") || isText(value.deviceId)) &&
     isPrincipal(value.principal) &&
     isText(value.requestId) &&
     isText(value.idempotencyKey)
