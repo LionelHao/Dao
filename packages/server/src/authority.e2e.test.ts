@@ -4742,16 +4742,9 @@ describe("authoritative server real-process harness", () => {
         observeFixedWatermark();
         await fixedWatermarkRelease;
       };
-      // A reconnect starts from the persisted generation without retaining the old
-      // WebSocket subscription, so the paused snapshot has one unambiguous delta path.
-      firstReplicas[2]!.close();
-      const repairingReplica = createClientSyncReplica({
-        transport: transports[2]!,
-        cache: opened[2]!.cache,
-      });
-      replicas.push(repairingReplica);
-      firstReplicas[2] = repairingReplica;
-      const fixedRepair = repairingReplica.repairRoom(roomId);
+      // Explicit repair must invalidate the existing live observer before the fixed
+      // snapshot starts; W+1 is then consumed only through the post-repair delta path.
+      const fixedRepair = firstReplicas[2]!.repairRoom(roomId);
       await fixedWatermarkObserved;
       const duringRepairId = "ft13-message-during-fixed-repair";
       await firstClients[0]!.request({
