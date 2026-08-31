@@ -1,10 +1,12 @@
 import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import type { CredentialEncryption } from "../identity/credential-vault.js";
 import {
   EncryptedGenerationStoreError,
+  authorityGenerationChecksum,
   createEncryptedAuthorityGenerationStore,
 } from "./encrypted-generation-store.js";
 
@@ -43,7 +45,7 @@ const newRecords = [{ identity: "record-identity-secret",
 function install(store: ReturnType<typeof createEncryptedAuthorityGenerationStore>, input: Readonly<{
   snapshotId: string; watermark: number; records: typeof oldRecords;
 }>): void {
-  const checksum = "f".repeat(64);
+  const checksum = authorityGenerationChecksum("room", input.records.map((record) => record.value));
   store.beginRoomGeneration({ roomId: "room-secret", snapshotId: input.snapshotId,
     watermark: input.watermark, expectedCount: input.records.length, checksum });
   store.stageRoomRecords("room-secret", input.snapshotId, input.records);
@@ -55,13 +57,14 @@ describe("encrypted Desktop authority generation store", () => {
   it("keeps staging invisible and atomically flips only a complete generation", async () => {
     const { store } = await fixture();
     install(store, { snapshotId: "old", watermark: 9, records: oldRecords });
+    const nextChecksum = authorityGenerationChecksum("room", newRecords.map((record) => record.value));
     store.beginRoomGeneration({ roomId: "room-secret", snapshotId: "next", watermark: 12,
-      expectedCount: 1, checksum: "next-sum" });
+      expectedCount: 1, checksum: nextChecksum });
     store.stageRoomRecords("room-secret", "next", newRecords);
     expect(store.readActiveRoom("room-secret")).toMatchObject({ records: oldRecords,
       cursor: { afterSeq: 9 } });
     store.commitRoomGeneration({ roomId: "room-secret", snapshotId: "next", watermark: 12,
-      expectedCount: 1, checksum: "next-sum" });
+      expectedCount: 1, checksum: nextChecksum });
     expect(store.readActiveRoom("room-secret")).toMatchObject({ records: newRecords,
       cursor: { afterSeq: 12 } });
     store.close();
@@ -75,12 +78,13 @@ describe("encrypted Desktop authority generation store", () => {
         if (armed && point === failurePoint) throw new Error(`crash:${point}`);
       });
       install(store, { snapshotId: "old", watermark: 9, records: oldRecords });
+      const nextChecksum = authorityGenerationChecksum("room", newRecords.map((record) => record.value));
       store.beginRoomGeneration({ roomId: "room-secret", snapshotId: "next", watermark: 12,
-        expectedCount: 1, checksum: "next-sum" });
+        expectedCount: 1, checksum: nextChecksum });
       store.stageRoomRecords("room-secret", "next", newRecords);
       armed = true;
       expect(() => store.commitRoomGeneration({ roomId: "room-secret", snapshotId: "next",
-        watermark: 12, expectedCount: 1, checksum: "next-sum" })).toThrow(`crash:${failurePoint}`);
+        watermark: 12, expectedCount: 1, checksum: nextChecksum })).toThrow(`crash:${failurePoint}`);
       store.close();
       const reopened = createEncryptedAuthorityGenerationStore({
         databasePath, accountId: "account-secret", encryption: wrapping,
@@ -90,6 +94,59 @@ describe("encrypted Desktop authority generation store", () => {
       reopened.close();
     },
   );
+
+  it("decrypts and canonically verifies staged disk rows before flipping the active head", async () => {
+    const { databasePath, store } = await fixture();
+    install(store, { snapshotId: "old", watermark: 9, records: oldRecords });
+    const nextChecksum = authorityGenerationChecksum("room", newRecords.map((record) => record.value));
+    store.beginRoomGeneration({ roomId: "room-secret", snapshotId: "next", watermark: 12,
+      expectedCount: 1, checksum: nextChecksum });
+    store.stageRoomRecords("room-secret", "next", newRecords);
+
+    const tamper = new DatabaseSync(databasePath);
+    tamper.prepare(`
+      UPDATE cache_records SET sealed_record = randomblob(64)
+      WHERE generation_id = (
+        SELECT generation_id FROM cache_generations WHERE generation_state = 'staging'
+      )
+    `).run();
+    tamper.close();
+
+    expect(() => store.commitRoomGeneration({ roomId: "room-secret", snapshotId: "next",
+      watermark: 12, expectedCount: 1, checksum: nextChecksum }))
+      .toThrowError(expect.objectContaining({ code: "integrity_failed" }));
+    expect(store.readActiveRoom("room-secret")).toMatchObject({ records: oldRecords,
+      cursor: { afterSeq: 9 } });
+    store.close();
+  });
+
+  it("rejects a staged canonical-checksum mismatch while preserving the previous active generation", async () => {
+    const { store } = await fixture();
+    install(store, { snapshotId: "old", watermark: 9, records: oldRecords });
+    const wrongChecksum = authorityGenerationChecksum("room", oldRecords.map((record) => record.value));
+    store.beginRoomGeneration({ roomId: "room-secret", snapshotId: "next", watermark: 12,
+      expectedCount: 1, checksum: wrongChecksum });
+    store.stageRoomRecords("room-secret", "next", newRecords);
+    expect(() => store.commitRoomGeneration({ roomId: "room-secret", snapshotId: "next",
+      watermark: 12, expectedCount: 1, checksum: wrongChecksum }))
+      .toThrowError(expect.objectContaining({ code: "integrity_failed" }));
+    expect(store.readActiveRoom("room-secret")).toMatchObject({ records: oldRecords,
+      cursor: { afterSeq: 9 } });
+    store.close();
+  });
+
+  it("recovers encrypted Room discovery without a legacy cache catalog after restart", async () => {
+    const { databasePath, store } = await fixture();
+    install(store, { snapshotId: "old", watermark: 9, records: oldRecords });
+    expect(store.listActiveRoomIds()).toEqual(["room-secret"]);
+    store.close();
+    const reopened = createEncryptedAuthorityGenerationStore({
+      databasePath, accountId: "account-secret", encryption: wrapping,
+    });
+    expect(reopened.listActiveRoomIds()).toEqual(["room-secret"]);
+    expect(reopened.readActiveRoom("room-secret")).toMatchObject({ records: oldRecords });
+    reopened.close();
+  });
 
   it("persists the dual event ledger and applies ledger, projection and cursor atomically", async () => {
     const { databasePath, store } = await fixture();
@@ -191,11 +248,14 @@ describe("encrypted Desktop authority generation store", () => {
     const { directory, store } = await fixture();
     install(store, { snapshotId: "room-one", watermark: 9, records: oldRecords });
     store.beginRoomGeneration({ roomId: "room-two", snapshotId: "room-two-snapshot",
-      watermark: 4, expectedCount: 1, checksum: "e".repeat(64) });
-    store.stageRoomRecords("room-two", "room-two-snapshot", [{ identity: "other-record",
-      value: { roomId: "room-two", body: "other-corpus" } }]);
+      watermark: 4, expectedCount: 1, checksum: authorityGenerationChecksum("room",
+        [{ roomId: "room-two", body: "other-corpus" }]) });
+    const roomTwoRecords = [{ identity: "other-record",
+      value: { roomId: "room-two", body: "other-corpus" } }];
+    store.stageRoomRecords("room-two", "room-two-snapshot", roomTwoRecords);
     store.commitRoomGeneration({ roomId: "room-two", snapshotId: "room-two-snapshot",
-      watermark: 4, expectedCount: 1, checksum: "e".repeat(64) });
+      watermark: 4, expectedCount: 1,
+      checksum: authorityGenerationChecksum("room", roomTwoRecords.map((record) => record.value)) });
 
     store.clearRoom("room-secret");
     expect(store.readActiveRoom("room-secret")).toBeUndefined();

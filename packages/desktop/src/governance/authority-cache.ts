@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import {
   isRoomCursor,
   isRoomRepairPage,
@@ -10,7 +9,10 @@ import { isProjectEvent } from "@native-im/core";
 import type { ClientAuthorityCache, DesktopRoomEvent } from "../sync/client-sync-replica.js";
 import type { GovernanceProjection } from "../renderer/governance/view-model.js";
 import type { AuthorityCachePersistence } from "./encrypted-authority-cache.js";
-import type { EncryptedAuthorityGenerationStore } from "./encrypted-generation-store.js";
+import {
+  authorityGenerationChecksum,
+  type EncryptedAuthorityGenerationStore,
+} from "./encrypted-generation-store.js";
 import {
   isDesktopOfflineReadLeaseClaims,
   type DesktopOfflineReadLeaseClaims,
@@ -24,25 +26,11 @@ interface LiveRoom {
   updatedAt: string;
 }
 
-function canonicalJson(value: unknown): string {
-  if (value === null || typeof value === "boolean" || typeof value === "number" ||
-      typeof value === "string") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  if (typeof value === "object") {
-    const record = value as Record<string, unknown>;
-    return `{${Object.keys(record).sort().map((key) =>
-      `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
-  }
-  throw new TypeError("Authority cache cannot canonicalize this value");
-}
-
 export function authoritySnapshotChecksum(
   kind: "catalog" | "room",
   values: readonly unknown[],
 ): string {
-  return createHash("sha256")
-    .update(canonicalJson({ kind, values, version: 1 }), "utf8")
-    .digest("hex");
+  return authorityGenerationChecksum(kind, values);
 }
 
 function recordIdentity(record: RoomRepairRecord): string {
@@ -232,6 +220,9 @@ export interface DesktopAuthorityCache extends ClientAuthorityCache {
     token: string;
     claims: DesktopOfflineReadLeaseClaims;
   }> | undefined;
+  authorizeOfflineRead(roomId: string, expiresAtMs: number): void;
+  isOfflineReadAuthorized(roomId: string, nowMs?: number): boolean;
+  revokeOfflineRead(roomId: string): void;
   close(): void;
 }
 
@@ -248,6 +239,7 @@ export function createDesktopAuthorityCache(
     token: string;
     claims: DesktopOfflineReadLeaseClaims;
   }>>();
+  const offlineReadAuthorizations = new Map<string, number>();
   let activeActorId: string | undefined;
   let generationStore: EncryptedAuthorityGenerationStore | undefined;
   let persistenceWork = Promise.resolve();
@@ -389,6 +381,7 @@ export function createDesktopAuthorityCache(
       roomStages.clear();
       rooms.clear();
       offlineLeases.clear();
+      offlineReadAuthorizations.clear();
       for (const roomId of roomIds) publishRoom(roomId);
       activeActorId = undefined;
       generationStore?.clearAccount();
@@ -406,6 +399,7 @@ export function createDesktopAuthorityCache(
       roomStages.delete(roomId);
       rooms.delete(roomId);
       offlineLeases.delete(roomId);
+      offlineReadAuthorizations.delete(roomId);
       generationStore?.clearRoom(roomId);
       publishRoom(roomId);
       persist();
@@ -472,71 +466,112 @@ export function createDesktopAuthorityCache(
       const lease = offlineLeases.get(roomId);
       return lease === undefined ? undefined : structuredClone(lease);
     },
+    authorizeOfflineRead(roomId, expiresAtMs) {
+      if (!rooms.has(roomId) || !Number.isSafeInteger(expiresAtMs) || expiresAtMs <= 0) {
+        throw new TypeError("Offline read authorization is invalid");
+      }
+      offlineReadAuthorizations.set(roomId, expiresAtMs);
+    },
+    isOfflineReadAuthorized(roomId, nowMs = Date.now()) {
+      if (!Number.isFinite(nowMs)) return false;
+      const expiresAtMs = offlineReadAuthorizations.get(roomId);
+      if (expiresAtMs === undefined) return false;
+      if (nowMs >= expiresAtMs || !rooms.has(roomId)) {
+        offlineReadAuthorizations.delete(roomId);
+        return false;
+      }
+      return true;
+    },
+    revokeOfflineRead(roomId) {
+      offlineReadAuthorizations.delete(roomId);
+    },
     async restore(actorId) {
       if (activeActorId === actorId) return rooms.size > 0;
       if (activeActorId !== undefined && activeActorId !== actorId) {
         const priorRoomIds = [...rooms.keys()];
         rooms.clear();
+        offlineLeases.clear();
+        offlineReadAuthorizations.clear();
         for (const roomId of priorRoomIds) publishRoom(roomId);
       }
-      if (persistence === undefined) { activeActorId = actorId; return false; }
       generationStore ??= generationStoreFactory?.(actorId);
-      await persistenceWork;
-      const value = await persistence.load();
-      if (typeof value !== "object" || value === null || Array.isArray(value) ||
-          Reflect.ownKeys(value).length !== 3 ||
-          (value as { version?: unknown }).version !== 1 ||
-          (value as { actorId?: unknown }).actorId !== actorId ||
-          !Array.isArray((value as { rooms?: unknown }).rooms) ||
-          (value as { rooms: unknown[] }).rooms.length > 512) {
-        await persistence.clear().catch(() => undefined);
+      if (persistence === undefined && generationStore === undefined) {
         activeActorId = actorId;
         return false;
       }
+      await persistenceWork;
+      const value = await persistence?.load();
+      const legacyRooms = new Map<string, LiveRoom>();
+      let legacyValid = typeof value === "object" && value !== null && !Array.isArray(value) &&
+        Reflect.ownKeys(value).length === 3 &&
+        (value as { version?: unknown }).version === 1 &&
+        (value as { actorId?: unknown }).actorId === actorId &&
+        Array.isArray((value as { rooms?: unknown }).rooms) &&
+        (value as { rooms: unknown[] }).rooms.length <= 512;
+      if (legacyValid) {
+        for (const candidate of (value as { rooms: unknown[] }).rooms) {
+          if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate) ||
+              Reflect.ownKeys(candidate).length !== 5) {
+            legacyValid = false;
+            break;
+          }
+          const item = candidate as { roomId?: unknown; records?: unknown; cursor?: unknown;
+            updatedAt?: unknown; checksum?: unknown };
+          if (typeof item.roomId !== "string" || item.roomId.length === 0 ||
+              !Array.isArray(item.records) || typeof item.checksum !== "string" ||
+              authoritySnapshotChecksum("room", item.records) !== item.checksum ||
+              !isRoomCursor(item.cursor) || item.cursor.roomId !== item.roomId ||
+              typeof item.updatedAt !== "string" || !Number.isFinite(Date.parse(item.updatedAt)) ||
+              new Date(Date.parse(item.updatedAt)).toISOString() !== item.updatedAt ||
+              !isRoomRepairPage({ type: "room.repair.page", requestId: "cache-restore",
+                snapshotId: `cache:${item.roomId}`, roomId: item.roomId, page: 0,
+                records: item.records, watermark: item.cursor.afterSeq,
+                snapshotChecksum: item.checksum, hasMore: false, mode: "materialized",
+                expiresAt: "2099-01-01T00:00:00.000Z" })) {
+            legacyValid = false;
+            break;
+          }
+          legacyRooms.set(item.roomId, {
+            records: structuredClone(item.records as RoomRepairRecord[]),
+            cursor: structuredClone(item.cursor),
+            updatedAt: item.updatedAt,
+          });
+        }
+      }
+      if (!legacyValid) {
+        legacyRooms.clear();
+        await persistence?.clear().catch(() => undefined);
+      }
+
       const restored = new Map<string, LiveRoom>();
-      for (const candidate of (value as { rooms: unknown[] }).rooms) {
-        if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate) ||
-            Reflect.ownKeys(candidate).length !== 5) {
-          await persistence.clear().catch(() => undefined); activeActorId = actorId; return false;
-        }
-        const item = candidate as { roomId?: unknown; records?: unknown; cursor?: unknown;
-          updatedAt?: unknown; checksum?: unknown };
-        if (typeof item.roomId !== "string" || item.roomId.length === 0 ||
-            !Array.isArray(item.records) || typeof item.checksum !== "string" ||
-            authoritySnapshotChecksum("room", item.records) !== item.checksum ||
-            !isRoomCursor(item.cursor) || item.cursor.roomId !== item.roomId ||
-            typeof item.updatedAt !== "string" || !Number.isFinite(Date.parse(item.updatedAt)) ||
-            new Date(Date.parse(item.updatedAt)).toISOString() !== item.updatedAt ||
-            !isRoomRepairPage({ type: "room.repair.page", requestId: "cache-restore",
-              snapshotId: `cache:${item.roomId}`, roomId: item.roomId, page: 0,
-              records: item.records, watermark: item.cursor.afterSeq,
-              snapshotChecksum: item.checksum, hasMore: false, mode: "materialized",
-              expiresAt: "2099-01-01T00:00:00.000Z" })) {
-          await persistence.clear().catch(() => undefined); activeActorId = actorId; return false;
-        }
-        const durable = generationStore?.readActiveRoom(item.roomId);
+      const roomIds = generationStore === undefined
+        ? [...legacyRooms.keys()]
+        : [...generationStore.listActiveRoomIds()];
+      for (const roomId of roomIds) {
+        const durable = generationStore?.readActiveRoom(roomId);
         const durableRecords = durable?.records.map((record) => record.value);
         if (generationStore !== undefined && (durable === undefined ||
-            !Array.isArray(durableRecords) || durable.cursor.afterSeq !== item.cursor.afterSeq ||
-            authoritySnapshotChecksum("room", durableRecords) !== item.checksum ||
+            !Array.isArray(durableRecords) ||
             !isRoomRepairPage({ type: "room.repair.page", requestId: "cache-durable-restore",
-              snapshotId: `cache:${item.roomId}`, roomId: item.roomId, page: 0,
+              snapshotId: `cache:${roomId}`, roomId, page: 0,
               records: durableRecords, watermark: durable.cursor.afterSeq,
-              snapshotChecksum: item.checksum, hasMore: false, mode: "materialized",
+              snapshotChecksum: durable.checksum, hasMore: false, mode: "materialized",
               expiresAt: "2099-01-01T00:00:00.000Z" }))) {
-          generationStore.clearAccount(); generationStore = undefined;
-          await persistence.clear().catch(() => undefined); activeActorId = actorId; return false;
+          throw new TypeError("Durable authority generation is invalid");
         }
-        restored.set(item.roomId, {
-          records: structuredClone((durableRecords ?? item.records) as RoomRepairRecord[]),
-          cursor: structuredClone(durable?.cursor ?? item.cursor), updatedAt: item.updatedAt,
+        const legacy = legacyRooms.get(roomId);
+        if (durable === undefined && legacy === undefined) continue;
+        restored.set(roomId, durable === undefined ? structuredClone(legacy!) : {
+          records: structuredClone(durableRecords as RoomRepairRecord[]),
+          cursor: structuredClone(durable.cursor),
+          updatedAt: legacy?.updatedAt ?? now(),
         });
-        const lease = generationStore?.readOfflineLease(item.roomId);
+        const lease = generationStore?.readOfflineLease(roomId);
         if (lease !== undefined && typeof lease === "object" && lease !== null &&
             "token" in lease && typeof lease.token === "string" && lease.token.length > 0 &&
             "claims" in lease && isDesktopOfflineReadLeaseClaims(lease.claims) &&
-            lease.claims.actorId === actorId && lease.claims.room.roomId === item.roomId) {
-          offlineLeases.set(item.roomId, structuredClone(lease) as Readonly<{
+            lease.claims.actorId === actorId && lease.claims.room.roomId === roomId) {
+          offlineLeases.set(roomId, structuredClone(lease) as Readonly<{
             token: string; claims: DesktopOfflineReadLeaseClaims;
           }>);
         }
@@ -549,6 +584,7 @@ export function createDesktopAuthorityCache(
       return restored.size > 0;
     },
     close() {
+      offlineReadAuthorizations.clear();
       generationStore?.close();
       generationStore = undefined;
     },

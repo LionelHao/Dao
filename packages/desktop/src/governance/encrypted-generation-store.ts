@@ -1,6 +1,7 @@
 import {
   createCipheriv,
   createDecipheriv,
+  createHash,
   createHmac,
   randomBytes,
   randomUUID,
@@ -62,7 +63,9 @@ export interface EncryptedAuthorityGenerationStore {
     generationId: string;
     records: readonly EncryptedGenerationRecord[];
     cursor: Readonly<{ version: 1; roomId: string; afterSeq: number }>;
+    checksum: string;
   }> | undefined;
+  listActiveRoomIds(): readonly string[];
   applyRoomEventBatch(input: Readonly<{
     roomId: string;
     events: readonly EncryptedGenerationEvent[];
@@ -126,6 +129,10 @@ const SCHEMA = `
     room_hash TEXT PRIMARY KEY,
     active_generation_id TEXT NOT NULL UNIQUE
       REFERENCES cache_generations(generation_id) ON DELETE CASCADE
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS cache_room_catalog (
+    room_hash TEXT PRIMARY KEY REFERENCES cache_room_heads(room_hash) ON DELETE CASCADE,
+    sealed_room_id BLOB NOT NULL
   ) STRICT;
   CREATE TABLE IF NOT EXISTS cache_records (
     generation_id TEXT NOT NULL REFERENCES cache_generations(generation_id) ON DELETE CASCADE,
@@ -199,6 +206,27 @@ function count(value: unknown): number {
     throw new EncryptedGenerationStoreError("invalid_store", "Generation store count is invalid");
   }
   return value;
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === "boolean" || typeof value === "number" ||
+      typeof value === "string") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) =>
+      `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
+  }
+  throw new EncryptedGenerationStoreError("integrity_failed", "Generation cannot be canonicalized");
+}
+
+export function authorityGenerationChecksum(
+  kind: "catalog" | "room",
+  values: readonly unknown[],
+): string {
+  return createHash("sha256")
+    .update(canonicalJson({ kind, values, version: 1 }), "utf8")
+    .digest("hex");
 }
 
 function wrapKey(encryption: CredentialEncryption, key: Buffer): Buffer {
@@ -411,11 +439,54 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
   };
 
   const active = (roomId: string) => database.prepare(`
-    SELECT g.generation_id, g.watermark, g.cursor
+    SELECT g.generation_id, g.watermark, g.cursor, g.expected_count, g.checksum
     FROM cache_room_heads h
     JOIN cache_generations g ON g.generation_id = h.active_generation_id
     WHERE h.room_hash = ? AND g.generation_state = 'active'
   `).get(roomHash(roomId)) as Record<string, unknown> | undefined;
+
+  const readGenerationRecords = (
+    room: string,
+    generationId: string,
+  ): readonly EncryptedGenerationRecord[] => {
+    const rows = database.prepare(`
+      SELECT identity_hash, sealed_record FROM cache_records
+      WHERE generation_id = ? ORDER BY ordinal ASC
+    `).all(generationId) as Record<string, unknown>[];
+    const identities = new Set<string>();
+    return rows.map((row) => {
+      if (typeof row.identity_hash !== "string") {
+        throw new EncryptedGenerationStoreError("integrity_failed", "Record identity is invalid");
+      }
+      const result = openRecord(dataKey,
+        recordAad(accountHash, room, generationId, row.identity_hash),
+        blob(row.sealed_record), limits.maxRecordBytes);
+      if (identityHash(result.identity) !== row.identity_hash || identities.has(result.identity)) {
+        throw new EncryptedGenerationStoreError("integrity_failed", "Record identity binding failed");
+      }
+      identities.add(result.identity);
+      return result;
+    });
+  };
+
+  const sealRoomId = (roomId: string, room: string): Buffer => {
+    const identity = identifierHash(dataKey, "record", "room-catalog-binding");
+    return sealRecord(dataKey, recordAad(accountHash, room, "room-catalog", identity), {
+      identity: "room-catalog-binding",
+      value: roomId,
+    }, limits.maxRecordBytes);
+  };
+
+  const openRoomId = (room: string, sealed: unknown): string => {
+    const identity = identifierHash(dataKey, "record", "room-catalog-binding");
+    const record = openRecord(dataKey,
+      recordAad(accountHash, room, "room-catalog", identity), blob(sealed), limits.maxRecordBytes);
+    if (record.identity !== "room-catalog-binding" || typeof record.value !== "string" ||
+        roomHash(record.value) !== room) {
+      throw new EncryptedGenerationStoreError("integrity_failed", "Room catalog binding failed");
+    }
+    return record.value;
+  };
 
   const api: EncryptedAuthorityGenerationStore = {
     beginRoomGeneration(input) {
@@ -472,19 +543,25 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
     commitRoomGeneration(input) {
       requireOpen();
       const room = roomHash(input.roomId);
-      const stage = generation(input.roomId, input.snapshotId, "staging");
-      if (stage === undefined || typeof stage.generation_id !== "string" ||
-          stage.watermark !== input.watermark ||
-          (stage.expected_count !== 0 && stage.expected_count !== input.expectedCount) ||
-          stage.checksum !== input.checksum) {
-        throw new EncryptedGenerationStoreError("invalid_generation", "Generation completion did not match");
-      }
-      const total = database.prepare("SELECT COUNT(*) AS total FROM cache_records WHERE generation_id = ?")
-        .get(stage.generation_id) as { total?: unknown };
-      if (count(total.total) !== input.expectedCount) {
-        throw new EncryptedGenerationStoreError("invalid_generation", "Generation record count did not match");
-      }
       transaction(database, () => {
+        const stage = generation(input.roomId, input.snapshotId, "staging");
+        if (stage === undefined || typeof stage.generation_id !== "string" ||
+            stage.watermark !== input.watermark ||
+            (stage.expected_count !== 0 && stage.expected_count !== input.expectedCount) ||
+            stage.checksum !== input.checksum) {
+          throw new EncryptedGenerationStoreError(
+            "invalid_generation",
+            "Generation completion did not match",
+          );
+        }
+        const records = readGenerationRecords(room, stage.generation_id);
+        if (records.length !== input.expectedCount ||
+            authorityGenerationChecksum("room", records.map((record) => record.value)) !== input.checksum) {
+          throw new EncryptedGenerationStoreError(
+            "integrity_failed",
+            "Staged generation failed canonical disk verification",
+          );
+        }
         const oldHead = active(input.roomId);
         options.fault?.("before-active-flip");
         database.prepare(
@@ -495,6 +572,10 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
           INSERT INTO cache_room_heads(room_hash, active_generation_id) VALUES (?, ?)
           ON CONFLICT(room_hash) DO UPDATE SET active_generation_id = excluded.active_generation_id
         `).run(room, stage.generation_id as string);
+        database.prepare(`
+          INSERT INTO cache_room_catalog(room_hash, sealed_room_id) VALUES (?, ?)
+          ON CONFLICT(room_hash) DO UPDATE SET sealed_room_id = excluded.sealed_room_id
+        `).run(room, sealRoomId(input.roomId, room));
         options.fault?.("after-active-flip");
         if (oldHead !== undefined && typeof oldHead.generation_id === "string" &&
             oldHead.generation_id !== stage.generation_id) {
@@ -515,27 +596,35 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
       const head = active(roomId);
       if (head === undefined || typeof head.generation_id !== "string") return undefined;
       const room = roomHash(roomId);
-      const rows = database.prepare(`
-        SELECT identity_hash, sealed_record FROM cache_records
-        WHERE generation_id = ? ORDER BY ordinal ASC
-      `).all(head.generation_id) as Record<string, unknown>[];
-      const records = rows.map((row) => {
-        if (typeof row.identity_hash !== "string") {
-          throw new EncryptedGenerationStoreError("integrity_failed", "Record identity is invalid");
-        }
-        const result = openRecord(dataKey,
-          recordAad(accountHash, room, head.generation_id as string, row.identity_hash),
-          blob(row.sealed_record), limits.maxRecordBytes);
-        if (identityHash(result.identity) !== row.identity_hash) {
-          throw new EncryptedGenerationStoreError("integrity_failed", "Record identity binding failed");
-        }
-        return result;
-      });
+      const records = readGenerationRecords(room, head.generation_id);
+      if (records.length !== count(head.expected_count)) {
+        throw new EncryptedGenerationStoreError("integrity_failed", "Active generation count is invalid");
+      }
+      const checksum = authorityGenerationChecksum("room", records.map((record) => record.value));
+      if (typeof head.checksum !== "string" || checksum !== head.checksum) {
+        throw new EncryptedGenerationStoreError("integrity_failed", "Active generation checksum is invalid");
+      }
       return Object.freeze({
         generationId: head.generation_id,
         records: Object.freeze(records),
         cursor: Object.freeze({ version: 1 as const, roomId, afterSeq: count(head.cursor) }),
+        checksum,
       });
+    },
+    listActiveRoomIds() {
+      requireOpen();
+      const rows = database.prepare(`
+        SELECT catalog.room_hash, catalog.sealed_room_id
+        FROM cache_room_catalog AS catalog
+        JOIN cache_room_heads AS head ON head.room_hash = catalog.room_hash
+        ORDER BY catalog.room_hash ASC
+      `).all() as Record<string, unknown>[];
+      return Object.freeze(rows.map((row) => {
+        if (typeof row.room_hash !== "string") {
+          throw new EncryptedGenerationStoreError("integrity_failed", "Room catalog hash is invalid");
+        }
+        return openRoomId(row.room_hash, row.sealed_room_id);
+      }));
     },
     applyRoomEventBatch(input) {
       requireOpen();
@@ -636,8 +725,14 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
           if (count(total.total) > limits.maxRecordsPerRoom) {
             throw new EncryptedGenerationStoreError("bound_exceeded", "Room record bound was exceeded");
           }
-          database.prepare("UPDATE cache_generations SET cursor = ? WHERE generation_id = ?")
-            .run(input.nextCursor, head.generation_id as string);
+          const records = readGenerationRecords(room, head.generation_id as string);
+          database.prepare(`
+            UPDATE cache_generations
+            SET cursor = ?, expected_count = ?, checksum = ?
+            WHERE generation_id = ?
+          `).run(input.nextCursor, records.length,
+            authorityGenerationChecksum("room", records.map((record) => record.value)),
+            head.generation_id as string);
         }
       });
       return Object.freeze({
@@ -723,6 +818,7 @@ export function createEncryptedAuthorityGenerationStore(options: Readonly<{
       transaction(database, () => {
         database.exec(`
           DELETE FROM cache_room_heads;
+          DELETE FROM cache_room_catalog;
           DELETE FROM cache_offline_leases;
           DELETE FROM cache_event_ledger;
           DELETE FROM cache_records;

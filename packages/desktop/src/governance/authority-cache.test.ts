@@ -1,6 +1,11 @@
 import type { PersistedRoomEvent, RoomRepairPage, RoomRepairRecord } from "@native-im/core";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { authoritySnapshotChecksum, createDesktopAuthorityCache } from "./authority-cache.js";
+import { createEncryptedAuthorityGenerationStore } from "./encrypted-generation-store.js";
+import type { CredentialEncryption } from "../identity/credential-vault.js";
 import { projectSnapshot } from "../project-loop/test-fixture.js";
 
 const records: readonly RoomRepairRecord[] = [
@@ -26,6 +31,12 @@ const records: readonly RoomRepairRecord[] = [
     value: { kind: "human", actorId: "member-1", role: "member", joinedAt: "2026-08-19T00:00:00.000Z" },
   },
 ];
+
+const wrapping: CredentialEncryption = {
+  isEncryptionAvailable: () => true,
+  encryptString: (value) => Uint8Array.from(Buffer.from(value, "utf8")).reverse(),
+  decryptString: (value) => Buffer.from(Uint8Array.from(value).reverse()).toString("utf8"),
+};
 
 function page(): RoomRepairPage {
   return {
@@ -83,6 +94,87 @@ describe("production Desktop authority cache", () => {
     await restarted.waitForPersistence();
     expect(clearCount).toBeGreaterThan(0);
     expect(stored).toBeUndefined();
+  });
+
+  it("restores the committed SQLite generation after a crash before stale legacy save", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "dao-ft13-authority-cache-"));
+    const databasePath = join(directory, "authority-cache.sqlite");
+    let stored: unknown;
+    let rejectSave = false;
+    const persistence = {
+      async load() { return structuredClone(stored); },
+      async save(value: unknown) {
+        if (rejectSave) throw new Error("simulated legacy save crash");
+        stored = structuredClone(value);
+      },
+      async clear() { stored = undefined; },
+    };
+    const factory = (actorId: string) => createEncryptedAuthorityGenerationStore({
+      databasePath, accountId: actorId, encryption: wrapping,
+    });
+    try {
+      const first = createDesktopAuthorityCache(
+        () => "2026-08-31T10:00:00.000Z", persistence, factory,
+      );
+      await expect(first.restore("human-1")).resolves.toBe(false);
+      const oldPage = page();
+      first.beginRoom("room-1", oldPage.snapshotId);
+      first.stageRoomPage(oldPage);
+      expect(await first.finalizeRoom(oldPage.snapshotId, oldPage.snapshotChecksum)).toBe(true);
+      first.commitRoom("room-1", oldPage.watermark, oldPage.snapshotChecksum);
+      await first.waitForPersistence();
+
+      const nextRecords = records.map((record) => record.kind === "room"
+        ? { ...record, value: { ...record.value, name: "SQLite wins" } }
+        : record) as readonly RoomRepairRecord[];
+      const nextChecksum = authoritySnapshotChecksum("room", nextRecords);
+      rejectSave = true;
+      first.beginRoom("room-1", "snapshot-after-crash");
+      first.stageRoomPage({ ...page(), snapshotId: "snapshot-after-crash", records: nextRecords,
+        watermark: 10, snapshotChecksum: nextChecksum });
+      expect(await first.finalizeRoom("snapshot-after-crash", nextChecksum)).toBe(true);
+      first.commitRoom("room-1", 10, nextChecksum);
+      await expect(first.waitForPersistence()).rejects.toThrow("simulated legacy save crash");
+      first.close();
+
+      rejectSave = false;
+      const restarted = createDesktopAuthorityCache(
+        () => "2026-08-31T10:01:00.000Z", persistence, factory,
+      );
+      await expect(restarted.restore("human-1")).resolves.toBe(true);
+      expect(restarted.roomCursor("room-1")?.afterSeq).toBe(10);
+      expect(restarted.governanceProjection("room-1")?.roomName).toBe("SQLite wins");
+      restarted.close();
+
+      stored = undefined;
+      const withoutLegacy = createDesktopAuthorityCache(
+        () => "2026-08-31T10:02:00.000Z", persistence, factory,
+      );
+      await expect(withoutLegacy.restore("human-1")).resolves.toBe(true);
+      expect(withoutLegacy.governanceProjection("room-1")?.roomName).toBe("SQLite wins");
+      withoutLegacy.close();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps verified offline-read authorization process-local, expiring, and revocable", async () => {
+    const cache = createDesktopAuthorityCache();
+    const repair = page();
+    cache.beginRoom("room-1", repair.snapshotId);
+    cache.stageRoomPage(repair);
+    expect(await cache.finalizeRoom(repair.snapshotId, repair.snapshotChecksum)).toBe(true);
+    cache.commitRoom("room-1", repair.watermark, repair.snapshotChecksum);
+
+    cache.authorizeOfflineRead("room-1", 2_000);
+    expect(cache.isOfflineReadAuthorized("room-1", 1_999)).toBe(true);
+    expect(cache.isOfflineReadAuthorized("room-1", 2_000)).toBe(false);
+    cache.authorizeOfflineRead("room-1", 3_000);
+    cache.revokeOfflineRead("room-1");
+    expect(cache.isOfflineReadAuthorized("room-1", 2_500)).toBe(false);
+    cache.authorizeOfflineRead("room-1", 3_000);
+    cache.clearRoom("room-1");
+    expect(cache.isOfflineReadAuthorized("room-1", 2_500)).toBe(false);
   });
 
   it("commits only verified repair records and builds a closed actorId-fallback projection", async () => {
