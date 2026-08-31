@@ -131,6 +131,47 @@ describe("encrypted Desktop authority generation store", () => {
     rebuilt.close();
   });
 
+  it.each([
+    "after-rebuild-marker",
+    "after-rebuild-sidecars",
+    "after-rebuild-main",
+    "after-rebuild-initialize",
+  ] as const)("resumes an interrupted derived-cache rebuild at %s without accepting the old lease",
+    async (failurePoint) => {
+      const { databasePath, store } = await fixture();
+      install(store, { snapshotId: "old-authorized", watermark: 9, records: oldRecords });
+      store.bindActiveGeneration("room-secret", {
+        lifecycleGeneration: 2, accessRevision: 7, leaseGeneration: 11,
+      });
+      store.writeOfflineLease("room-secret", { token: "must-never-return-after-rebuild" });
+      store.close();
+      await writeFile(`${databasePath}.rebuild`, "dao-authority-cache-rebuild-v1\n", "utf8");
+
+      expect(() => createRecoverableEncryptedAuthorityGenerationStore({
+        databasePath, accountId: "account-secret", encryption: wrapping,
+        recoveryFault(point) {
+          if (point === failurePoint) throw new Error(`rebuild-crash:${point}`);
+        },
+      })).toThrow(`rebuild-crash:${failurePoint}`);
+
+      const recovered = createRecoverableEncryptedAuthorityGenerationStore({
+        databasePath, accountId: "account-secret", encryption: wrapping,
+      });
+      expect(recovered.listActiveRoomIds()).toEqual([]);
+      expect(recovered.readOfflineLease("room-secret")).toBeUndefined();
+      expect(recovered.readActiveGenerationBinding("room-secret")).toBeUndefined();
+      install(recovered, { snapshotId: "authority-resync", watermark: 12, records: newRecords });
+      recovered.close();
+
+      const reopened = createRecoverableEncryptedAuthorityGenerationStore({
+        databasePath, accountId: "account-secret", encryption: wrapping,
+      });
+      expect(reopened.readActiveRoom("room-secret")).toMatchObject({
+        records: newRecords, cursor: { afterSeq: 12 },
+      });
+      reopened.close();
+    });
+
   it("keeps staging invisible and atomically flips only a complete generation", async () => {
     const { store } = await fixture();
     install(store, { snapshotId: "old", watermark: 9, records: oldRecords });

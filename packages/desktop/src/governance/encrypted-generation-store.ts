@@ -6,7 +6,17 @@ import {
   randomBytes,
   randomUUID,
 } from "node:crypto";
-import { chmodSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  rmSync,
+  writeSync,
+} from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { CredentialEncryption } from "../identity/credential-vault.js";
@@ -19,11 +29,12 @@ type StoreErrorCode =
   | "invalid_generation"
   | "bound_exceeded"
   | "repair_required"
+  | "close_failed"
   | "closed";
 
 export class EncryptedGenerationStoreError extends Error {
-  constructor(readonly code: StoreErrorCode, message: string) {
-    super(message);
+  constructor(readonly code: StoreErrorCode, message: string, options?: ErrorOptions) {
+    super(message, options);
     this.name = "EncryptedGenerationStoreError";
   }
 }
@@ -365,9 +376,46 @@ type EncryptedGenerationStoreOptions = Readonly<{
   encryption: CredentialEncryption;
   limits?: Partial<Limits>;
   fault?: (point: "before-active-flip" | "after-active-flip") => void;
+  recoveryFault?: (point:
+    | "after-rebuild-marker"
+    | "after-rebuild-sidecars"
+    | "after-rebuild-main"
+    | "after-rebuild-initialize"
+  ) => void;
 }>;
 
-function removeGenerationStoreFiles(databasePath: string): void {
+function syncDirectory(directory: string): void {
+  if (process.platform === "win32") return;
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(directory, "r");
+    fsyncSync(descriptor);
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+function rebuildMarkerPath(databasePath: string): string {
+  return `${databasePath}.rebuild`;
+}
+
+function ensureRebuildMarker(databasePath: string): void {
+  const marker = rebuildMarkerPath(databasePath);
+  if (existsSync(marker)) return;
+  const descriptor = openSync(marker, "wx", 0o600);
+  try {
+    writeSync(descriptor, "dao-authority-cache-rebuild-v1\n", undefined, "utf8");
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+  syncDirectory(dirname(databasePath));
+}
+
+function removeGenerationStoreFiles(
+  databasePath: string,
+  fault?: EncryptedGenerationStoreOptions["recoveryFault"],
+): void {
   validateText(databasePath, "databasePath");
   const directory = dirname(databasePath);
   const file = basename(databasePath);
@@ -380,10 +428,14 @@ function removeGenerationStoreFiles(databasePath: string): void {
   if (targets.length > 4_096) {
     throw new EncryptedGenerationStoreError("bound_exceeded", "Too many cache residuals");
   }
-  // Sidecars go first and the main database last. An interrupted rebuild therefore leaves either
-  // a recognizable old database for the next attempt or no SQLite authority cache at all.
-  targets.sort((left, right) => Number(left === file) - Number(right === file));
-  for (const entry of targets) rmSync(join(directory, entry), { force: true });
+  for (const entry of targets.filter((entry) => entry !== file)) {
+    rmSync(join(directory, entry), { force: true });
+  }
+  syncDirectory(directory);
+  fault?.("after-rebuild-sidecars");
+  rmSync(databasePath, { force: true });
+  syncDirectory(directory);
+  fault?.("after-rebuild-main");
 }
 
 export function createEncryptedAuthorityGenerationStore(
@@ -460,7 +512,14 @@ export function createEncryptedAuthorityGenerationStore(
     }
     if (process.platform !== "win32") chmodSync(options.databasePath, 0o600);
   } catch (cause: unknown) {
-    database.close();
+    try { database.close(); }
+    catch (closeCause: unknown) {
+      throw new EncryptedGenerationStoreError(
+        "close_failed",
+        "Generation metadata failed and its database handle could not be closed",
+        { cause: new AggregateError([cause, closeCause], "metadata and close failure") },
+      );
+    }
     if (cause instanceof EncryptedGenerationStoreError) throw cause;
     throw new EncryptedGenerationStoreError("invalid_store", "Generation metadata is invalid");
   }
@@ -945,16 +1004,36 @@ export function createEncryptedAuthorityGenerationStore(
         `);
       });
       dataKey.fill(0);
+      try { database.close(); }
+      catch (cause: unknown) {
+        throw new EncryptedGenerationStoreError(
+          "close_failed", "Generation store account purge could not close its database", { cause },
+        );
+      }
       closed = true;
-      database.close();
-      api.destroy();
+      removeGenerationStoreFiles(options.databasePath);
     },
     close() {
       if (closed) return;
+      let checkpointCause: unknown;
+      try { database.exec("PRAGMA wal_checkpoint(TRUNCATE)"); }
+      catch (cause: unknown) { checkpointCause = cause; }
+      try { database.close(); }
+      catch (closeCause: unknown) {
+        throw new EncryptedGenerationStoreError(
+          "close_failed",
+          "Generation store database handle could not be closed",
+          { cause: checkpointCause === undefined
+            ? closeCause
+            : new AggregateError([checkpointCause, closeCause], "checkpoint and close failure") },
+        );
+      }
       closed = true;
-      try { database.exec("PRAGMA wal_checkpoint(TRUNCATE)"); } finally {
-        database.close();
-        dataKey.fill(0);
+      dataKey.fill(0);
+      if (checkpointCause !== undefined) {
+        throw new EncryptedGenerationStoreError(
+          "invalid_store", "Generation store checkpoint failed during close", { cause: checkpointCause },
+        );
       }
     },
     destroy() {
@@ -974,6 +1053,25 @@ export function createEncryptedAuthorityGenerationStore(
 export function createRecoverableEncryptedAuthorityGenerationStore(
   options: EncryptedGenerationStoreOptions,
 ): EncryptedAuthorityGenerationStore {
+  const rebuild = (): EncryptedAuthorityGenerationStore => {
+    ensureRebuildMarker(options.databasePath);
+    options.recoveryFault?.("after-rebuild-marker");
+    removeGenerationStoreFiles(options.databasePath, options.recoveryFault);
+    const store = createEncryptedAuthorityGenerationStore(options);
+    try { options.recoveryFault?.("after-rebuild-initialize"); }
+    catch (cause: unknown) {
+      try { store.close(); }
+      catch (closeCause: unknown) {
+        throw new AggregateError([cause, closeCause], "Rebuild fault and close failure");
+      }
+      throw cause;
+    }
+    rmSync(rebuildMarkerPath(options.databasePath), { force: true });
+    syncDirectory(dirname(options.databasePath));
+    return store;
+  };
+
+  if (existsSync(rebuildMarkerPath(options.databasePath))) return rebuild();
   try {
     return createEncryptedAuthorityGenerationStore(options);
   } catch (cause: unknown) {
@@ -981,7 +1079,6 @@ export function createRecoverableEncryptedAuthorityGenerationStore(
         !["integrity_failed", "key_unwrap_failed", "invalid_store"].includes(cause.code)) {
       throw cause;
     }
-    removeGenerationStoreFiles(options.databasePath);
-    return createEncryptedAuthorityGenerationStore(options);
+    return rebuild();
   }
 }

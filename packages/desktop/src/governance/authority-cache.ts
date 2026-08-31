@@ -573,13 +573,23 @@ export function createDesktopAuthorityCache(
       for (const roomId of roomIds) publishRoom(roomId);
       activeActorId = undefined;
       const store = generationStore;
-      generationStore = undefined;
       if (store !== undefined) {
-        try { store.clearAccount(); }
-        catch {
+        try {
+          store.clearAccount();
+          generationStore = undefined;
+        } catch (clearCause: unknown) {
           // This is a derived cache. Physical removal is the fail-closed recovery when its
           // own schema or metadata is too damaged to perform the logical account purge.
-          store.destroy();
+          try {
+            store.destroy();
+            generationStore = undefined;
+          } catch (destroyCause: unknown) {
+            generationStore = store;
+            throw new AggregateError(
+              [clearCause, destroyCause],
+              "Authority cache account purge and physical cleanup both failed",
+            );
+          }
         }
       }
       if (persistence !== undefined) schedulePersistence(() => persistence.clear());
